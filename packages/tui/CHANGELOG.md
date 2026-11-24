@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `estimateContextToolSchemaTokens()` takes the agent (`ToolDeclarationSource`) instead of its tool array, and counts the tool definitions its next request declares: the roster and each tool taken off it that a kept declaration still sends (`declaredTools()`), from its sent definition, counted again only when that definition changes. It reads the prune mode from the agent (`prunesToolDescriptions()`), so its options take only `sourceRevision`
+
 ### Added
 
 - A task `SingleResult` now carries `workerLost` when the worker thread that ran the subagent died before the run settled ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
@@ -39,6 +43,7 @@
 - Task results from a structured subagent that replied without calling `yield` now show the missing-yield warning line in both task views; without an output schema such a result still succeeds, shows a warning badge and counts as succeeded, while with an output schema (or with empty output) it fails and counts as failed, as before; report text that only looks like that warning is shown as ordinary output ([#16928](https://github.com/can1357/oh-my-pi/pull/16928) by [@sjawhar](https://github.com/sjawhar))
 - Fixed long Markdown files and skills being slow to appear in read previews: a collapsed preview now renders only the start of the document, so its footer gives the rows it hides as a minimum (`… 45+ more lines`) ([#13840](https://github.com/can1357/oh-my-pi/pull/13840) by [@sjawhar](https://github.com/sjawhar)).
 - The composer's own exit (Ctrl+C twice, Ctrl+D on an empty draft, before a host installs its handlers) and the debug socket's `quit` op run postmortem's cleanup before the process exits, still past the extension-load guard; they skipped it, or did not wait for it, before.
+- `computeNonMessageTokens()` and `computeNonMessageBreakdown()` count a tool taken off the roster that the source's agent still declares, so the status line and the compaction figures built on them no longer count too low on a model that keeps its tool declaration
 
 ## [18.18.6] - 2026-11-09
 
@@ -2536,64 +2541,4 @@
 
 - Fixed Ghostty's first inline image in a fresh TUI session sometimes rendering as an empty placeholder block by holding the initial Kitty graphics paint until the terminal startup settle window has passed. Direct Kitty placements also keep their zero-width reservation rows non-plain so image-only transcript blocks do not collapse when blank-edge trimming runs.
 
-## [15.10.8] - 2026-06-09
-
-### Fixed
-
-- Fixed TUI renders repeatedly clearing terminal scrollback after content filled the viewport. Unknown viewport probes no longer let foreground-streaming offscreen growth take the destructive `historyRebuild` path on every frame; newly appended tail rows stay reachable while stale history waits for a safe checkpoint. ([#2154](https://github.com/can1357/oh-my-pi/issues/2154))
-
-## [15.10.6] - 2026-06-08
-
-### Added
-
-- Added `TUI.getFocused()` accessor and `Input.pasteText(text)` method so callers consuming non-bracketed paste transports (e.g. kitty's OSC 5522 enhanced clipboard) can route a paste payload to the currently focused modal Input rather than always to the primary editor. Mirrors the existing `Editor.pasteText` semantics: newlines stripped, tabs normalized, NFC normalization applied. ([#2127](https://github.com/can1357/oh-my-pi/issues/2127))
-
-### Fixed
-
-- Fixed tmux/screen/zellij rewind/branch (`requestRender(true, { clearScrollback: true })`) permanently anchoring the input box to the pane top and overlaying scrollback after a streamed reply had grown past the viewport. `#emitFullPaint` only reset `#scrollbackHighWater` inside the `clearScrollback` branch and otherwise raised it monotonically, so inside multiplexers (where `\x1b[3J` is a no-op and `clearScrollback` is forced off) the streaming peak survived the rewind; on the next frame `#planLiveRegionPinnedRender` saw the stale high-water and anchored `renderViewportTop` past the actual content, repainting every visible row blank and parking the cursor at screen row 0 for the rest of the session. A full repaint with `clearViewport: true` re-emits the entire transcript from row 0, so `#scrollbackHighWater` is now assigned (not max-clamped) to the natural push count regardless of whether ED 3 was issued ([#2130](https://github.com/can1357/oh-my-pi/issues/2130)).
-
-## [15.10.5] - 2026-06-08
-
-### Added
-
-- Added `atomicTokenPattern` to `Editor`: when set to a global regex matching placeholder tokens such as `[Image #1, 800x600]` or `[Paste #2, +30 lines]`, a single backspace or forward-delete landing anywhere on a token removes the whole token instead of corrupting it into stray text.
-
-### Changed
-
-- Changed the large-paste placeholder label from `[paste #N +X lines]`/`[paste #N Y chars]` to `[Paste #N, +X lines]`/`[Paste #N, Y chars]`.
-
-### Fixed
-
-- Fixed pasting large text lagging the prompt for hundreds of milliseconds before the `[paste #N …]` placeholder appeared. `StdinBuffer` assembled bracketed pastes by re-concatenating and re-scanning the entire accumulated buffer on every incoming stdin chunk (`#pasteBuffer += chunk; indexOf(END)`), which is O(n²) in the paste size and dominates when the terminal/PTY delivers the paste in many small reads (SSH, tmux, slow hosts) — a 1 MB paste at 1 KB chunks cost ~33 ms and 5 MB ~740 ms. Chunks are now collected in an array and joined once when the end marker arrives, with a short overlap tail carried across chunk boundaries so a marker split between two reads is still detected without rescanning, making assembly O(n) (~1 ms for 5 MB). The `Editor` paste cleaner also dropped its `split("").filter().join("")` per-code-unit array allocation in favor of a single control-character regex pass (~20× faster on large pastes).
-
-## [15.10.4] - 2026-06-08
-
-### Fixed
-
-- Fixed Windows ConPTY session-resume painting the transcript with the last several rows truncated below the viewport until Alt+Tab forced a host repaint. After `sessionReplace`/`historyRebuild`/`overlayRebuild` paints that scroll-push content into native scrollback, the renderer now arms a 150 ms ConPTY settle window that coalesces spinner/blink-driven `requestRender(false)` calls into a single trailing render — Windows Terminal's viewport-follow logic no longer falls further behind the cursor on every tick of the post-paint storm. The arm also reclaims any render request queued *during* the in-flight composition (notably `ImageBudget.endPass()` calling `requestRender()` synchronously when a frame trips the live-graphics cap): without that, the queued request sat on the standard 30 Hz throttle and fired at ~33 ms — well inside the 150 ms quiet window — defeating the coalescing. Bumped the ConPTY per-`WriteFile` chunk cap from 8 KiB to 16 KiB so a multi-megabyte resume paint emits half as many writes (still well under the ~32 KiB threshold from #2034 that the original cap defends against), and made the cap measure encoded UTF-8 bytes instead of JS code units so a CJK-heavy transcript can't silently inflate a 16-KiB-of-code-units chunk into ~48 KiB of `WriteFile` traffic and reintroduce the #2034 viewport bug ([#2095](https://github.com/can1357/oh-my-pi/issues/2095)).
-
-## [15.10.3] - 2026-06-08
-
-### Fixed
-
-- Fixed DEC 2048 in-band resize reports (`CSI 48;rows;cols;hpx;wpx t`) leaking into the focused editor as literal text during a rapid resize. When the window is resized quickly the event loop stays busy long enough for the `StdinBuffer` flush timeout to fire mid-report; the `\x1b[48;…` prefix was emitted as one event and the tail (e.g. `8;125;1156;1125t`) arrived as bare printable characters that the editor inserted. `ProcessTerminal` now reassembles a split in-band report (including a split at the bare `\x1b[4` type field) until its terminator and then drives the resize. A reassembled sequence that turns out not to be a resize report — such as a split kitty key like `\x1b[48;5u` (codepoint 48 = `0`) — is forwarded to the input handler as a single escape sequence rather than dropped or leaked.
-- Coalesced terminal-multiplexer SIGWINCH events into a single forced render once the pane stops resizing so closing/dragging a tmux/screen/zellij split no longer flashes the viewport blank before the new geometry repaints ([#2088](https://github.com/can1357/oh-my-pi/issues/2088)).
-
-## [15.10.2] - 2026-06-08
-
-### Added
-
-- Added exported `canonicalKeyId` and `addKeyAliases` keybinding helpers so consumers can share the same canonical shortcut matching semantics as `KeybindingsManager`.
-- Added `super` modifier support to native key parsing/matching and bound `super+alt+backspace` / `super+alt+delete` (and `super+alt+d`) into the word-delete defaults so Ghostty's default macOS Option+Backspace wire (`ESC [127;11u` — kitty modifier 11 = super|alt) deletes a word instead of falling through to single-char delete ([#2064](https://github.com/can1357/oh-my-pi/issues/2064)).
-
-### Fixed
-
-- Fixed focus-changing in-place menus leaving stale Working/menu rows and parking the hardware cursor in the old menu viewport on terminals without a scroll-position oracle.
-- Fixed redundant terminal cursor updates so repeated renders that do not change the cursor row, column, or visibility no longer emit ANSI move/hide sequences
-- Fixed repeated cursor updates during no-op re-renders by reusing the last known cursor state, preventing unnecessary cursor position changes and hide/show sequences
-- Fixed the kitty keyboard progressive-enhancement probe to honor the `CSI ? <flags> u` reply even when the terminal answers the DA1 sentinel first. Previously the kitty reply was discarded once the DA1-driven `modifyOtherKeys` fallback engaged, so terminals like Superset/xterm-on-Electron stayed on the fallback and delivered Shift+Enter as a bare `\r` ([#2042](https://github.com/can1357/oh-my-pi/issues/2042)).
-- Bounded TUI line fitting for oversized raw rows so ANSI-heavy subagent output and zero-width-heavy text cannot grow render buffers independently of the viewport or hide visible suffix text ([#2045](https://github.com/can1357/oh-my-pi/issues/2045)).
-- Fixed tmux offscreen-shrink frames to skip repainting when the visible tail is unchanged, avoiding intermittent blank/refresh flashes in pane terminals ([#2046](https://github.com/can1357/oh-my-pi/issues/2046)).
-- Fixed Windows ConPTY hosts (Windows Terminal, Tabby, Hyper, VS Code) parking the viewport at the top of a full paint after a `/resume` or any long-session repaint. `ProcessTerminal#safeWrite` now splits oversized writes into ≤ 8 KiB pieces at line boundaries on `win32` and inside WSL (where stdout still crosses ConPTY at the `wslhost` boundary) so each underlying `WriteFile` stays below the ~32 KiB threshold where ConPTY stops tracking the cursor; the data was always delivered, but the host UI's scroll position would not follow until any focus event forced a re-query. ([#2034](https://github.com/can1357/oh-my-pi/issues/2034))
-
-Older entries are archived in [packages/tui/CHANGELOG.md@bdbb5c920f69](https://github.com/can1357/oh-my-pi/blob/bdbb5c920f693caff287c50996c116e42e37992b/packages/tui/CHANGELOG.md).
+Older entries are archived in [packages/tui/CHANGELOG.md@c60b9b7ef540](https://github.com/cybermonklabs/oh-my-pi/blob/c60b9b7ef5407b3fd0b875fa73799f18d24f1c68/packages/tui/CHANGELOG.md).

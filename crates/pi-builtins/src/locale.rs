@@ -2092,10 +2092,11 @@ fn live_member(number: libc::pid_t, group: libc::pid_t) -> bool {
 }
 
 /// The number of threads `/proc/<number>/status` gives the process, or
-/// `None` when it cannot be read.
+/// `None` when it cannot be read. The file is read as bytes: its first line
+/// is the process's name, which may be no UTF-8.
 #[cfg(target_os = "linux")]
 fn process_threads(number: libc::pid_t) -> Option<u32> {
-	let status = std::fs::read_to_string(format!("/proc/{number}/status")).ok()?;
+	let status = crate::proc_snapshot::sys::read_lossy(format!("/proc/{number}/status"))?;
 	status.lines().find_map(|line| line.strip_prefix("Threads:")).and_then(|count| count.trim().parse().ok())
 }
 

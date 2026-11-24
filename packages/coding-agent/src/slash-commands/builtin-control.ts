@@ -180,6 +180,8 @@ export const BUILTIN_CONTROL_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		icon: "voice",
 		description: "Realtime voice mode: the terminal's /live opens it; on, off or status where a host runs calls",
 		acpInputHint: "on|off|status",
+		// ACP runs no live call and answers /live as not available, so it is not offered there.
+		acpHidden: true,
 		handle: (command, runtime) => handleLiveText(command.args, runtime),
 		handleTui: async (_command, runtime) => {
 			clearSubmittedText(runtime);

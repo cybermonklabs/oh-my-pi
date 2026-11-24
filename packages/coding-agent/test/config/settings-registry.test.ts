@@ -209,6 +209,52 @@ describe("settings registry", () => {
 		expect(restored.grantAuthority().getModelRole("review")).toBe(derived ? undefined : "mock/target");
 	});
 
+	it("checks each restored overlay setting as overlay() checks its overrides", () => {
+		const parent = Settings.isolated();
+		const layers = { global: {}, overrides: {}, derived: true };
+		expect(() => parent.restoreOverlay({ ...layers, overrides: { nope: { nope: 1 } } })).toThrow(
+			'Unknown setting "nope.nope"',
+		);
+		expect(() => parent.restoreOverlay({ ...layers, global: { temperature: "hot" } })).toThrow(
+			"Invalid value for temperature",
+		);
+		expect(cfgTemperature.get(parent.restoreOverlay({ ...layers, overrides: { temperature: 0.2 } }))).toBe(0.2);
+	});
+
+	it("keeps only the given settings of stored overlay layers and reports a value of any other", () => {
+		const kept = Settings.isolated().keptOverlayLayers(
+			{
+				global: { advisor: { enabled: false } },
+				overrides: { compaction: { thresholdPercent: 80, midTurnEnabled: true }, temperature: 0.2 },
+				derived: true,
+			},
+			["compaction.thresholdPercent", "advisor.enabled"],
+		);
+		expect(kept).toEqual({
+			layers: {
+				global: { advisor: { enabled: false } },
+				overrides: { compaction: { thresholdPercent: 80 } },
+				derived: true,
+			},
+			dropped: true,
+		});
+	});
+
+	it("reports no dropped value where every stored value is one of the given settings", () => {
+		const layers = { global: {}, overrides: { compaction: { thresholdPercent: 80 } }, derived: false };
+		expect(Settings.isolated().keptOverlayLayers(layers, ["compaction.thresholdPercent"])).toEqual({
+			layers,
+			dropped: false,
+		});
+	});
+
+	it("refuses stored layers holding a value its setting rejects, even of a setting it would not keep", () => {
+		const layers = { global: {}, overrides: { temperature: "hot" }, derived: true };
+		expect(() => Settings.isolated().keptOverlayLayers(layers, ["compaction.thresholdPercent"])).toThrow(
+			"Invalid value for temperature",
+		);
+	});
+
 	it("preserves a derived view's host authority when cloning for cwd", async () => {
 		const operator = Settings.isolated();
 		const host = operator.overlay({ modelRoles: { review: "mock/target" } });

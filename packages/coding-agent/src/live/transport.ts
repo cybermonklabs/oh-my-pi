@@ -166,6 +166,11 @@ export class CodexLiveTransport {
 		return this.#sdpAnswer;
 	}
 
+	/** Whether the call is up: signaled, its media channel open and its sideband attached. */
+	get connected(): boolean {
+		return this.#state === "connected";
+	}
+
 	/** Establish the media peer, perform Codex signaling, and wait for the data channel or sideband. */
 	connect(): Promise<void> {
 		if (this.#state === "connected") return Promise.resolve();

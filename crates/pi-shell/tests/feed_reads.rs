@@ -5,6 +5,9 @@
 
 #![cfg(unix)]
 
+mod pty_support;
+mod real_bash;
+
 use std::{
 	io::BufRead,
 	path::Path,
@@ -16,19 +19,23 @@ use std::{
 /// A wait that only names a hang.
 const HANG: Duration = Duration::from_secs(30);
 
-/// obash, and `/bin/bash` as the control where it is bash 4 or later (macOS's
-/// `/bin/bash` is 3.2, which has no `coproc`).
+/// obash, and the real bash ([`real_bash::real_bash`]) as the control where it
+/// is bash 4 or later (macOS's `/bin/bash` is 3.2, which has no `coproc`).
 fn shells() -> Vec<(&'static str, String)> {
-	let mut shells = vec![("obash", env!("CARGO_BIN_EXE_obash").to_owned())];
-	let major = Command::new("/bin/bash")
+	let mut shells = vec![("obash", pty_support::obash().to_owned())];
+	let Some(bash) = real_bash::real_bash() else {
+		eprintln!("no bash control: no bash");
+		return shells;
+	};
+	let major = Command::new(&bash)
 		.args(["-c", "echo ${BASH_VERSINFO[0]}"])
 		.output()
 		.ok()
 		.and_then(|o| String::from_utf8(o.stdout).ok())
 		.and_then(|v| v.trim().parse::<u32>().ok());
 	match major {
-		Some(major) if major >= 4 => shells.push(("bash", "/bin/bash".to_owned())),
-		other => eprintln!("no bash control: /bin/bash major version {other:?}"),
+		Some(major) if major >= 4 => shells.push(("bash", bash)),
+		other => eprintln!("no bash control: {bash} major version {other:?}"),
 	}
 	shells
 }
@@ -223,7 +230,6 @@ kill $h 2>/dev/null
 	sleep 1
 	read -r v
 	echo "v=$v"
-	exec 6> "$D/fifo"
 } < <(printf 'z\n'; read -r _ < "$D/gate")"#,
 		"v=z",
 	),

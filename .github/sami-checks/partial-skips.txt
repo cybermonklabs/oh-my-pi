@@ -1,0 +1,9 @@
+# Sub-cases a test may skip and still pass. A passing test that printed a skip marker reads PASS,
+# listed in the summary as "partial: N sub-cases skipped (reason)", only when each of its skip lines
+# is printed by a literal named here for that test AND its output holds the entry's witness: a line
+# that shows the skipped sub-cases ran elsewhere in the same test. With no witness, or with any other
+# skip line, the test skipped itself (UNKNOWN unless it passed as the other user). skip-forms reads
+# these literals as it reads any other, and fails on an entry whose literal the tree no longer prints.
+# One per line, tab-separated: <test as the summary names it> <format literal as in the source, each
+# {...} any text> <witness, a regex over the test's output, ^ and $ at each line> <reason>.
+pi-iso::cow::tests::a_destination_with_other_links_is_cloned_into	{case}: skipped, this filesystem does not clone	^the temporary directory: FICLONE says yes$	the /dev/shm (tmpfs) rows can never clone; the planted rows run in the temp dir on hosts whose temp dir clones

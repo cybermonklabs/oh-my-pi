@@ -13,10 +13,18 @@ use crate::obash_support::{obash, output};
 
 const LOOP: &str = "for i in 1 2; do echo $i; done";
 
+/// An events fixture. Under cargo the compile-time manifest dir exists at
+/// runtime; under Bazel the compile-time sandbox path is gone, so fall back to
+/// the runfiles-relative layout (test cwd is the workspace runfiles root and
+/// the fixtures ride along as `data`).
 fn events_fixture(name: &str) -> PathBuf {
-	PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-		.join("src/testkit/fixtures/events")
-		.join(name)
+	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/testkit/fixtures/events");
+	let root = if manifest.is_dir() {
+		manifest
+	} else {
+		PathBuf::from("crates/pi-shell/src/testkit/fixtures/events")
+	};
+	root.join(name)
 }
 
 #[test]
@@ -76,18 +84,22 @@ wait; echo "status $?""#;
 }
 
 /// `OBASH_BLESS=1` rewrites the golden from the actual stream (review the
-/// diff).
+/// diff). Standard output is a regular file, which takes each write at once
+/// on every platform: on macOS and Windows a pipe's writes go to the
+/// descriptor's writer thread, and the shell parks until the thread has
+/// written them or not (`Blocked` and `Unblocked` on `Write { fd: 1 }`), as
+/// the thread's timing falls.
 #[test]
 fn events_golden() {
 	let dir = tempfile::tempdir().unwrap();
 	let path = dir.path().join("events.jsonl");
-	let out = output(obash().args([
-		"--events=jsonl",
-		&format!("--events-out={}", path.display()),
-		"-c",
-		LOOP,
-	]));
-	assert_eq!(out.stdout, b"1\n2\n");
+	let stdout = dir.path().join("stdout");
+	output(
+		obash()
+			.args(["--events=jsonl", &format!("--events-out={}", path.display()), "-c", LOOP])
+			.stdout(fs::File::create(&stdout).unwrap()),
+	);
+	assert_eq!(fs::read(&stdout).unwrap(), b"1\n2\n");
 	let actual =
 		golden::normalize(&golden::parse_jsonl(&fs::read_to_string(&path).unwrap()).unwrap());
 	let golden_path = events_fixture("for-loop.jsonl");

@@ -134,7 +134,7 @@ const OBASH_WITH_VALUE: &[&str] = &[
 ];
 
 /// Split `args` (program name first) into obash's own options (for clap)
-/// and bash's command line (for [`ShellArgs::parse`]). obash's options are
+/// and bash's command line (for `ShellArgs::parse`). obash's options are
 /// taken from the leading options only, where bash's parser would stop at
 /// them; the values of `-o`/`-O`/`--rcfile`/`--init-file` are skipped.
 fn split_args(args: Vec<OsString>) -> (Vec<OsString>, Vec<BString>) {

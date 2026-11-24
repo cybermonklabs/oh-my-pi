@@ -15,9 +15,9 @@ use super::{
 	expand::{self, Expander, Stop},
 	is_ident, probe,
 	proc::{
-		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
-		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		AssignValue, Atom, Bang, BangStage, Coproc, DebugSkip, Depths, Frame, FrameKind, InlineStage,
+		LastBg, LoopKind, LoopRec, ParseSnapshot, PendingBreak, PendingSub, PendingWrite, Probe,
+		ProbeResult, Run, Saved, Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -26,6 +26,7 @@ use crate::bash::{
 	diag::Diag,
 	event::{CompiledUnit, Construct, EventData, NodeKind, Origin, WaitKey, assign_preview},
 	fd::FdRef,
+	fs::FsOp,
 	host::{ResolveCtx, Resolved, Via},
 	ids::{Dialect, ModeId, UnitId, Vpid},
 	ir::{self, ComsubForm, Op, Opcode, SpawnKind, Unit},
@@ -87,7 +88,13 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				None => unblock(k, cx, vp),
 			}
 		}
-		if vp.pending_traps != crate::bash::signal::SigSet::EMPTY && !vp.waiting_foreground() {
+		// A builtin parked on its take-in (`Kernel::asking`) is still in its
+		// command, with the command's redirections: a trap waits until the
+		// command is over, as bash runs a trap between commands.
+		if vp.pending_traps != crate::bash::signal::SigSet::EMPTY
+			&& !vp.waiting_foreground()
+			&& !k.asking(vp.vpid)
+		{
 			let pending = vp.pending_traps.iter().find(|sig| {
 				!vp.frames.iter().any(|frame| {
 					matches!(frame.kind, FrameKind::Script {
@@ -169,6 +176,16 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		let unit = held.as_ref().expect("just set");
 		let op = unit.ops[frame.pc as usize];
 		let fi = vp.frames.len() - 1;
+		// A `break` or `continue` that ran inside `${ }` or `${| }` waits
+		// for a loop (bash's `breaking`): the command holding it has
+		// finished, and no other command runs before a loop takes it.
+		if vp.pending_break.is_some()
+			&& vp.frames[fi].scratch.is_none()
+			&& unit.mode.dialect() == Dialect::Bash
+			&& pending_break(k, vp, cx)
+		{
+			continue;
+		}
 		// Control flow of a bash unit: it starts no command, cannot fail as
 		// one or block, and keeps the clock, so none of the bookkeeping
 		// below applies to it.
@@ -199,6 +216,46 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			frame.debug_pc = None;
 			frame.pc += 1;
 			continue;
+		}
+		// bash runs the DEBUG trap of a background simple command, and of
+		// each simple stage of a pipeline (also a background one), in the
+		// shell before it forks: every stage's trap first, then the fork
+		// ([`spawn`] marks each stage's command as having run it).
+		if op.code == Opcode::Spawn
+			&& unit.mode.dialect() == Dialect::Bash
+			&& vp.frames[fi].scratch.is_none()
+			&& vp.frames[fi].debug_pc != Some(vp.frames[fi].pc)
+			&& pseudo_trap_maybe(k, cx, TrapKey::Debug)
+		{
+			let done = spawn_debug_done(vp.frames[fi].debug_pc);
+			// A new run of this Spawn's stage traps: a skip list this vproc
+			// left at this frame or deeper (its `Spawn` never ran, as after
+			// a trap's `return`) is stale, and bash keeps a skip only for the
+			// command whose trap failed. Dropped also when this Spawn has no
+			// simple stage (each stage compound, no trap runs here), whose
+			// `Spawn` would otherwise take that list; kept for the pipeline a
+			// background job is, which takes the list the shell recorded for
+			// it ([`shell_ran_stage_traps`]). This runs also once the trap is
+			// gone: `pseudo_trap_maybe` keeps answering yes after a DEBUG
+			// trap was set, and no skip list exists before one was.
+			if done == 0 && !shell_ran_stage_traps(k, vp, unit, op, vp.frames[fi].pc) {
+				drop_debug_skips(k, vp.vpid, fi);
+			}
+			let next = shell_debug_stages(k, vp, unit, op, vp.frames[fi].pc)
+				.into_iter()
+				.enumerate()
+				.nth(done);
+			if let Some((i, entry)) = next {
+				vp.frames[fi].debug_pc = Some(SPAWN_DEBUG - u32::try_from(i + 1).unwrap_or(MAX_STAGES));
+				let stage_op = unit.ops[entry as usize];
+				note_command(vp, unit, stage_op);
+				let line = line_of(vp, stage_op.node);
+				if start_trap(k, vp, cx, TrapKey::Debug) {
+					set_trap_line(vp, line);
+				}
+				continue;
+			}
+			vp.frames[fi].debug_pc = Some(vp.frames[fi].pc);
 		}
 		let starts = starts_command(unit, op);
 		let fresh = vp.frames[fi].scratch.is_none();
@@ -426,7 +483,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			Flow::Break { n, cont } if unit.mode.dialect() == Dialect::Zsh => {
 				zsh_break(k, vp, cx, n, cont);
 			},
-			Flow::Break { n, cont } => break_loops(k, vp, cx, n, cont, op),
+			Flow::Break { n, cont } => break_loops(k, vp, cx, n, cont),
 			Flow::Exit(status) if unit.mode.dialect() == Dialect::Zsh => zsh_exit(k, vp, cx, status),
 			Flow::Exit(status) => exit_shell(k, vp, cx, status),
 			Flow::Discard(status) if unit.mode.dialect() == Dialect::Zsh => {
@@ -515,6 +572,7 @@ fn zsh_return_flow(
 	} else if run_always(k, vp, cx, target.unwrap_or(0), TryEnd::Return(status)) {
 		// The always-list runs first; it resumes the return.
 	} else if let Some(i) = target {
+		mark_trap_return(vp, i);
 		zsh_leave(k, vp, cx, i);
 	} else if let Some(i) = vp
 		.frames
@@ -546,6 +604,22 @@ fn zsh_return_flow(
 	}
 }
 
+/// zsh `return` from function frame `target`: when a `TRAPNAL` function's
+/// trap frame is just below it, that frame records the `return`
+/// ([`ScriptKind::Trap`]'s `returned`), so a non-zero status ends the
+/// interrupted code.
+fn mark_trap_return(vp: &mut Vproc, target: usize) {
+	if let Some(Frame {
+		kind: FrameKind::Script { what: ScriptKind::Trap { returned, .. }, .. },
+		..
+	}) = target
+		.checked_sub(1)
+		.and_then(|below| vp.frames.get_mut(below))
+	{
+		*returned = true;
+	}
+}
+
 /// The trap just started exits the shell when it ends (`set -e` after the
 /// ERR trap): its frame is the innermost trap frame (a zsh `TRAPZERR`
 /// function runs above it).
@@ -569,13 +643,15 @@ pub fn set_trap_line(vp: &mut Vproc, line: u32) {
 
 /// Record the command `op` starts (a simple command, `[[ ]]` or `(( ))`:
 /// the caller checked [`starts_command`]) as `BASH_COMMAND`; not while a
-/// trap action runs (bash keeps the trapped command).
+/// trap action runs, nor in a DEBUG trap action's command substitution
+/// (bash keeps the trapped command).
 fn note_command(vp: &mut Vproc, unit: &Arc<Unit>, op: Op) {
-	if vp.trap_frames == 0
-		|| !vp
-			.frames
-			.iter()
-			.any(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }))
+	if !runs_no_debug_trap(vp)
+		&& (vp.trap_frames == 0
+			|| !vp
+				.frames
+				.iter()
+				.any(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. })))
 	{
 		if let Some((u, node)) = &mut vp.command
 			&& Arc::ptr_eq(u, unit)
@@ -588,10 +664,12 @@ fn note_command(vp: &mut Vproc, unit: &Arc<Unit>, op: Op) {
 }
 
 /// Whether `op` starts a command bash reports on its own (`BASH_COMMAND`,
-/// the ERR trap): a simple command, `[[ ]]` or `(( ))`.
+/// the ERR trap): a simple command, `[[ ]]` or `(( ))`. The `< file` of a
+/// `$(< file)` ([`Op::CAT`]) is none: bash reads the file without running
+/// a command (no DEBUG trap, `BASH_COMMAND` stays the outer command's).
 fn starts_command(unit: &Unit, op: Op) -> bool {
 	match op.code {
-		Opcode::Exec => true,
+		Opcode::Exec => op.flags & Op::CAT == 0,
 		Opcode::Enter => unit
 			.nodes
 			.get(op.node as usize)
@@ -738,16 +816,18 @@ pub(crate) fn fork_message(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line
 
 /// Whether the expansion stopped at `stop` for a substitution that needs a
 /// vproc, and no vpid is left for one ([`Kernel::vpids_left`]): a `$( )`
-/// that forks, a zsh `$(…)` that is not a hook call run in the shell, or a
-/// process substitution that already found none ([`Stop::ForkFailed`]).
-/// The interactive reader fails such a prompt expansion instead of
-/// starting it ([`super::zle::reader`]).
-pub(crate) const fn no_vpid_for(k: &Kernel, stop: &Stop) -> bool {
+/// that forks (not a `$(< file)`, which [`start_sub`] reads in the shell), a
+/// zsh `$(…)` that is not a hook call run in the shell, or a process
+/// substitution that already found none ([`Stop::ForkFailed`]). The
+/// interactive reader fails such a prompt expansion instead of starting it
+/// ([`super::zle::reader`]).
+pub(crate) fn no_vpid_for(k: &Kernel, stop: &Stop) -> bool {
 	match stop {
 		Stop::ForkFailed => true,
-		Stop::Sub { form: ComsubForm::Fork, .. } | Stop::ZshSub { here: false, .. } => {
-			k.vpids_left() == 0
+		Stop::Sub { form: ComsubForm::Fork, unit, entry, .. } => {
+			unit.cat_exec(*entry).is_none() && k.vpids_left() == 0
 		},
+		Stop::ZshSub { here: false, .. } => k.vpids_left() == 0,
 		_ => false,
 	}
 }
@@ -847,7 +927,10 @@ fn run_boundary(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bool {
 	if let FrameKind::Script { stdin, .. } = &mut kind {
 		*stdin = from_stdin;
 	}
-	vp.frames.push(Frame::new(None, 0, kind));
+	let mut frame = Frame::new(None, 0, kind);
+	// A callout's subshell stands for an external program: no DEBUG trap.
+	frame.flags.set_no_debug_trap(run.callout);
+	vp.frames.push(frame);
 	// zsh `parseargs`: commands read from standard input set `shinstdin`.
 	if from_stdin
 		&& vp.image.is_none()
@@ -1255,13 +1338,15 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			}
 		}
 		let frame = top_frame(vp);
-		let (status, source, cancel, return_target, exit) = match frame.kind {
+		let (status, source, cancel, return_target, exit, returned) = match frame.kind {
 			FrameKind::Script {
-				what: ScriptKind::Trap { status, cancel, return_target, exit, .. },
+				what: ScriptKind::Trap { status, cancel, return_target, exit, returned, .. },
 				..
-			} => (Some(status), false, cancel, return_target, exit),
-			FrameKind::Script { what: ScriptKind::Source, .. } => (None, true, None, None, false),
-			_ => (None, false, None, None, false),
+			} => (Some(status), false, cancel, return_target, exit, returned),
+			FrameKind::Script { what: ScriptKind::Source, .. } => {
+				(None, true, None, None, false, false)
+			},
+			_ => (None, false, None, None, false, false),
 		};
 		let debug = matches!(frame.kind, FrameKind::Script {
 			what: ScriptKind::Trap { key: TrapKey::Debug, .. },
@@ -1298,9 +1383,11 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			&& exit
 		{
 			exit_shell(k, vp, cx, status);
-		} else if func_trap && trap_status != 0 && vp.mode.dialect() == Dialect::Zsh {
-			// zsh `dotrapargs`: a function trap returning non-zero forces
-			// a return from the interrupted code, with the error flag set.
+		} else if func_trap && returned && trap_status != 0 && vp.mode.dialect() == Dialect::Zsh {
+			// zsh `dotrapargs`: a function trap that `return`s non-zero
+			// forces a return from the interrupted code, with the error flag
+			// set; one that falls off its end with a non-zero status does
+			// not (`trapreturn` is set only by `return`).
 			zsh_discard(k, vp, cx, trap_status);
 		} else if let Some(status) = status {
 			vp.status = status;
@@ -1313,16 +1400,43 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 				// `extdebug`: a failing DEBUG trap skips the command; at a
 				// function's entry, the whole body (and its RETURN trap).
 				let f = top_frame(vp);
-				let skippable = f
+				let at = f
 					.unit
 					.as_ref()
-					.and_then(|u| u.ops.get(f.pc as usize))
-					.is_some_and(|op| {
-						!matches!(op.code, Opcode::ForIn | Opcode::ForNext | Opcode::CaseWord)
+					.and_then(|u| Some((u.ops.get(f.pc as usize).copied()?, u)));
+				let skippable = at.is_some_and(|(op, _)| {
+					!matches!(op.code, Opcode::ForIn | Opcode::ForNext | Opcode::CaseWord)
+				});
+				// A stage's trap run in the shell before the fork, as bash's: a
+				// lone background command's skips the job (no job, `$!` and
+				// `PIPESTATUS` as they were), with status 0, or 1 for `! cmd &`;
+				// a pipeline stage's skips that stage alone (bash forks no
+				// process for it, [`DebugSkip`]), also in the pipeline a
+				// background job is.
+				let done = spawn_debug_done(f.debug_pc);
+				let spawn_skip = at
+					.filter(|(op, _)| op.code == Opcode::Spawn && done != 0)
+					.map(|(op, u)| {
+						let (entries, lone) = debug_stage_entries(u, op);
+						let entry = entries.get(done - 1).copied();
+						let negated = entry.is_some_and(|e| {
+							u.ops
+								.get(e as usize + 1)
+								.is_some_and(|o| o.code == Opcode::Not)
+						});
+						(lone.then_some(u.spawns[op.a as usize].end), entry, negated)
 					});
 				if f.debug_pc == Some(ENTRY_DEBUG) {
 					pop_frame(&mut k.root, cx.store, vp);
 					vp.status = trap_status;
+				} else if let Some((end, entry, negated)) = spawn_skip {
+					if let Some(end) = end {
+						f.pc = end;
+						f.debug_pc = None;
+						vp.status = i32::from(negated);
+					} else if let Some(entry) = entry {
+						note_debug_skip(k, vp, entry);
+					}
 				} else if f.debug_pc == Some(f.pc) && skippable {
 					f.pc += 1;
 					f.debug_pc = None;
@@ -1791,7 +1905,9 @@ fn end_unit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 				pop_frame(&mut k.root, cx.store, vp);
 			}
 		},
-		FrameKind::NoFork | FrameKind::Stage => pop_frame(&mut k.root, cx.store, vp),
+		FrameKind::NoFork | FrameKind::Stage | FrameKind::Cat { .. } => {
+			pop_frame(&mut k.root, cx.store, vp);
+		},
 		FrameKind::Subshell | FrameKind::Job { .. } => {
 			unwind(&mut k.root, cx.store, vp, 0);
 			start_exit_trap_once(k, vp, cx);
@@ -2103,13 +2219,176 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 	}
 }
 
-fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool, op: Op) {
-	let mut remaining = n.max(1);
+/// Whether a bash `break`/`continue` reaches through a frame of `kind` to
+/// the loops below it in the same vproc: `eval`, `${ ;}`, a `lastpipe`
+/// stage and `$(< file)` run inside their caller's loops. Any other frame
+/// stops it (a function call: bash zeroes `loop_level` there), as does a
+/// vproc's first frame, below which come the forking shell's loops.
+const fn bash_loop_frame(kind: &FrameKind) -> bool {
+	matches!(
+		kind,
+		FrameKind::Script { what: ScriptKind::Eval, .. }
+			| FrameKind::NoFork
+			| FrameKind::Stage
+			| FrameKind::Cat { .. }
+	)
+}
+
+/// The loops a bash `break`/`continue` in `vp` may leave (bash's
+/// `loop_level`): those of its frames from the top down through the ones
+/// [`bash_loop_frame`] passes and, when that reaches the vproc's first
+/// frame, its forking shell's ([`Vproc::outer_loops`]). A `${ }` or
+/// `$(< file)` in a `( … )`'s own redirection stops it there too
+/// ([`subshell_redirection`]).
+pub fn bash_loop_count(vp: &Vproc) -> u32 {
+	let mut n = 0u32;
+	for (i, f) in vp.frames.iter().enumerate().rev() {
+		n = n.saturating_add(u32::try_from(f.loops.len()).unwrap_or(u32::MAX));
+		if i == 0 {
+			return n.saturating_add(u32::from(vp.outer_loops));
+		}
+		if !bash_loop_frame(&f.kind) || subshell_redirection(&vp.frames[i - 1]) {
+			break;
+		}
+	}
+	n
+}
+
+/// Whether frame `f` is applying a `( … )`'s own redirections: its op is
+/// the `Redir` that [`ir`] lowers just before the subshell's `Enter` and
+/// `Spawn`. bash expands those words in the forked child, after
+/// `execute_in_subshell` zeroes `loop_level`, so a `break` there, or in a
+/// substitution started there, sees no loop; this shell expands them in
+/// the parent, before the `Spawn`.
+pub(super) fn subshell_redirection(f: &Frame) -> bool {
+	f.unit
+		.as_deref()
+		.is_some_and(|unit| subshell_redirection_at(unit, f.pc))
+}
+
+/// Whether the op at `at` is a `( … )`'s own `Redir`: the subshell's
+/// `Enter` and `Spawn` follow it.
+fn subshell_redirection_at(unit: &Unit, at: u32) -> bool {
+	let op = |at: u32| unit.ops.get(at as usize);
+	op(at).is_some_and(|r| r.code == Opcode::Redir)
+		&& op(at + 1).is_some_and(|e| e.code == Opcode::Enter)
+		&& op(at + 2).is_some_and(|s| {
+			s.code == Opcode::Spawn
+				&& unit
+					.spawns
+					.get(s.a as usize)
+					.is_some_and(|info| info.kind == SpawnKind::Subshell)
+		})
+}
+
+/// Whether the op at frame `f`'s pc starts a `( … )` that has its own
+/// redirection (its `Enter` or `Spawn`, after that `Redir` is applied):
+/// bash expands the redirection in the forked child, so a trap that a
+/// `kill $$` there sets off waits for the child, not for these ops.
+pub(super) fn redirected_subshell_starts(f: &Frame) -> bool {
+	let Some(unit) = f.unit.as_deref() else {
+		return false;
+	};
+	let redir = match unit.ops.get(f.pc as usize).map(|op| op.code) {
+		Some(Opcode::Enter) => f.pc.checked_sub(1),
+		Some(Opcode::Spawn) => f.pc.checked_sub(2),
+		_ => None,
+	};
+	redir.is_some_and(|at| subshell_redirection_at(unit, at))
+}
+
+/// The loops a child forked from `vp` runs inside ([`Vproc::outer_loops`]):
+/// a zsh fork keeps all of them (zsh's `loops`); bash keeps them
+/// (`loop_level`) only when `keeps`, a fork made without
+/// `execute_in_subshell`: a simple command run as a pipeline element or a
+/// job of one pipeline, a command or process substitution. bash zeroes the
+/// level for `( … )`, a compound element, an and-or, compound or timed job
+/// and a coprocess, and so for a substitution in a `( … )`'s own
+/// redirection, which bash forks from that child ([`subshell_redirection`]).
+pub fn fork_loops(vp: &Vproc, keeps: bool) -> u16 {
+	let n = if vp.mode.dialect() == Dialect::Zsh {
+		zsh_loop_count(vp)
+	} else if keeps && !vp.frames.last().is_some_and(subshell_redirection) {
+		bash_loop_count(vp)
+	} else {
+		0
+	};
+	// Past `u16::MAX` loops the count saturates ([`Vproc::outer_loops`]).
+	u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// The first op at or after `at` that is not the jump over a command or
+/// process substitution's body: [`ir`] lowers a `$( )`, backtick or
+/// `<( )` word's body in place, ahead of its command's own op, as a `Jmp`
+/// to just past the body's `SubExit` (a child of its own runs it).
+fn skip_blocks(unit: &Unit, mut at: u32) -> u32 {
+	while let Some(op) = unit.ops.get(at as usize)
+		&& op.code == Opcode::Jmp
+		&& op.a > at
+		&& unit
+			.ops
+			.get(op.a as usize - 1)
+			.is_some_and(|end| end.code == Opcode::SubExit)
+	{
+		at = op.a;
+	}
+	at
+}
+
+/// Whether bash forks the job whose body starts at `entry` without
+/// `execute_in_subshell`, so that it keeps the loop level ([`fork_loops`]):
+/// a body of one pipeline, with or without `!`, whose simple commands bash
+/// forks from the shell itself. An and-or list, a compound command or a
+/// timed pipeline is run as a subshell (`CMD_FORCE_SUBSHELL`).
+fn bash_job_keeps(unit: &Unit, entry: u32) -> bool {
+	let entry = skip_blocks(unit, entry);
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	let after = match unit.ops.get(entry as usize) {
+		Some(op) if op.code == Opcode::Exec => entry + 1,
+		Some(op) if op.code == Opcode::Spawn => match unit.spawns.get(op.a as usize) {
+			Some(s) if s.kind == SpawnKind::Pipeline => s.end,
+			_ => return false,
+		},
+		_ => return false,
+	};
+	let after = if code(after) == Some(Opcode::Not) {
+		after + 1
+	} else {
+		after
+	};
+	code(after) == Some(Opcode::SubExit)
+}
+
+/// A `break`/`continue` that leaves this vproc's own loops for its forking
+/// shell's ([`Vproc::outer_loops`]): as bash's `breaking` and zsh's
+/// `breaks` skip the rest of a forked child's code, the vproc ends as at
+/// the end of its code, with the builtin's status. zsh runs its EXIT trap
+/// then (`zsh`); bash starts it too, but `breaking`, still set, skips each
+/// of its commands, so it does nothing.
+fn leave_outer_loop(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, zsh: bool) {
+	unwind(&mut k.root, cx.store, vp, 0);
+	if zsh {
+		start_exit_trap_once(k, vp, cx);
+	}
+}
+
+/// bash `break N` / `continue N`: leave N - 1 loops, at most as many as
+/// [`bash_loop_count`] reaches (bash caps N at `loop_level`), then break
+/// or continue the next; an `eval`, `lastpipe` stage or `$(< file)` in the
+/// way is left with them, a `${ }` ends and holds the rest
+/// ([`pending_break`]), and past the vproc's own loops it ends
+/// ([`leave_outer_loop`]). The builtin answers a `break` with no loop in
+/// reach itself and transfers nothing, so a loop is always in reach here.
+fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool) {
+	let reach = bash_loop_count(vp);
+	debug_assert!(reach > 0, "`break_` transfers only with a loop in reach");
+	let mut remaining = n.min(reach).max(1);
 	loop {
 		let f = top_frame(vp);
 		if let Some(rec) = f.loops.last().cloned() {
-			// More levels than loops: the outermost loop ends.
-			if remaining > 1 && f.loops.len() > 1 {
+			// A level beyond this loop: it ends, and the next one out goes on
+			// with the count.
+			if remaining > 1 {
 				f.loops.pop();
 				truncate(vp, rec.depth);
 				remaining -= 1;
@@ -2117,7 +2396,8 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 			}
 			truncate(vp, rec.depth);
 			// The status is the builtin's: 0, or 1 for `break 0` (which
-			// leaves every loop).
+			// leaves every loop); for a `break` that waited in a `${ }`,
+			// the status of the command that held it.
 			let status = vp.status;
 			let f = top_frame(vp);
 			// `continue` ends the body with its status too: the loop's
@@ -2128,11 +2408,32 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 			f.pc = if cont { rec.cont } else { rec.exit };
 			return;
 		}
-		let crossable = matches!(
-			f.kind,
-			FrameKind::Script { what: ScriptKind::Eval, .. } | FrameKind::NoFork | FrameKind::Stage
-		);
-		if crossable && vp.frames.len() > 1 {
+		if f.kind == FrameKind::NoFork {
+			// bash's `break` only sets `breaking`: the body of `${ }` or
+			// `${| }` ends here as at its end (`REPLY` passed on), the
+			// command holding it runs, and a loop takes the levels left
+			// after it ([`pending_break`]).
+			pop_frame(&mut k.root, cx.store, vp);
+			let depth = vp
+				.frames
+				.iter()
+				.rposition(|f| !matches!(f.kind, FrameKind::Cat { .. }))
+				.map_or(0, |i| i + 1);
+			// A `${ }` in a redirection word or here-document of the command
+			// now on top (see `PendingBreak::redir`).
+			let in_redir = vp
+				.frames
+				.last()
+				.and_then(|f| f.scratch.as_ref())
+				.and_then(|s| s.exec.as_deref())
+				.is_some_and(|e| e.stage == super::proc::Stage::Redirect);
+			let redir = if in_redir { vp.frames.len() as u32 } else { 0 };
+			vp.pending_break =
+				Some(Box::new(PendingBreak { levels: remaining, cont, depth: depth as u32, redir }));
+			return;
+		}
+		let passes = bash_loop_frame(&f.kind);
+		if passes && vp.frames.len() > 1 {
 			pop_frame(&mut k.root, cx.store, vp);
 			// The caller's op (`eval`) is abandoned with the loop.
 			clear_scratch(&mut k.root, cx.store, vp);
@@ -2140,15 +2441,238 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 		}
 		break;
 	}
-	// bash's `check_loop_level` complains only outside posix mode.
-	if !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
-		let line = line_of(vp, op.node);
-		let name = if cont { "continue" } else { "break" };
-		let diag = Diag::Usage { msg: "only meaningful in a `for', `while', or `until' loop".into() };
-		k.diag(cx, vp, line, diag.by(name));
+	leave_outer_loop(k, vp, cx, false);
+}
+
+/// bash's `breaking` ([`Vproc::pending_break`]) at an op that would start:
+/// `true` when it moved control (a loop took it, or a frame the waiting
+/// command entered ended), `false` to run the op.
+fn pending_break(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bool {
+	let Some(p) = vp.pending_break.as_deref().copied() else {
+		return false;
+	};
+	let top = vp.frames.len() - 1;
+	if vp.frames.len() > p.depth as usize {
+		let kind = &vp.frames[top].kind;
+		if matches!(kind, FrameKind::Cat { .. }) {
+			// The command's own `$(< file)`: it reads its file and ends, and
+			// the command finishes with its value.
+			return false;
+		}
+		if matches!(kind, FrameKind::Function { .. }) {
+			// A function the command called runs none of its commands (nor
+			// its RETURN trap).
+			unwind(&mut k.root, cx.store, vp, top);
+			return true;
+		}
+		let frame = &mut vp.frames[top];
+		if let FrameKind::Script { src, pos, stdin, .. } = &mut frame.kind {
+			// Nor does an `eval` or `.` it started: its text ends here.
+			pos.0 = src.len() as u32;
+			*stdin = false;
+			frame.unit = None;
+			return true;
+		}
+		vp.pending_break = None;
+		return false;
 	}
-	vp.status = 0;
-	top_frame(vp).pc += 1;
+	if vp.frames.len() == p.depth as usize {
+		match own_loop(&vp.frames[top]) {
+			OwnLoop::None => {},
+			OwnLoop::Header => return false,
+			OwnLoop::Test { until } => return own_loop_takes(k, vp, cx, p, Some(until)),
+			OwnLoop::ArithTest => return own_loop_takes(k, vp, cx, p, None),
+		}
+	}
+	vp.pending_break = None;
+	if bash_loop_count(vp) > 0 {
+		break_loops(k, vp, cx, p.levels, p.cont);
+		return true;
+	}
+	// No loop is left to take it (a `return` carried it out of every
+	// loop): bash would skip each command after it; this shell goes on.
+	false
+}
+
+/// Where the op on top of frame `f` stands in a loop command whose own
+/// redirection held a waiting `break` or `continue` ([`pending_break`]).
+/// bash expands a compound command's redirections before it runs the
+/// command, and a loop counts itself in `loop_level` only as it starts
+/// (`execute_while_or_until` and its siblings), so the break waits through
+/// the loop's header and the loop takes it: one level, with its first test
+/// or body skipped.
+#[derive(Clone, Copy)]
+enum OwnLoop {
+	/// Not such a loop's header, nor where it takes the break.
+	None,
+	/// The loop's header, which runs first: its `Enter`, record and words
+	/// (a `for` binds its first word and a `select` reads its first line
+	/// before bash's loop looks at `breaking`), and an arithmetic `for`'s
+	/// first and test expressions. A `for` or `select` out of words or
+	/// input at once ends without taking the break, which goes on out.
+	Header,
+	/// The first test of a `while` (`until`: true), which bash skips.
+	Test { until: bool },
+	/// The branch after an arithmetic `for`'s first test.
+	ArithTest,
+}
+
+/// [`OwnLoop`] of the op at frame `f`'s pc, from the ops before it: only
+/// the loop's own header lies between its `Redir` and the op, and a
+/// waiting break reaches no op of it but through that `Redir`. A `for`'s
+/// `ForNext` just after its `ForIn` runs too: a break in its words waits
+/// for the first word as bash's does, as bash counts the loop before it
+/// expands them. The bodies of the substitutions in a `for`'s or
+/// `select`'s words lie in its header too ([`before_blocks`]); the jump
+/// over one is the header's, and the break never runs one: [`start_sub`]
+/// expands each to nothing, as bash runs no command while `breaking`.
+fn own_loop(f: &Frame) -> OwnLoop {
+	let Some(unit) = f.unit.as_deref() else {
+		return OwnLoop::None;
+	};
+	let pc = f.pc;
+	let Some(&op) = unit.ops.get(pc as usize) else {
+		return OwnLoop::None;
+	};
+	if op.code == Opcode::LoopExit {
+		return match f.loops.last() {
+			Some(rec)
+				if rec.exit == pc
+					&& matches!(rec.kind, LoopKind::For { .. } | LoopKind::Select { .. }) =>
+			{
+				OwnLoop::Header
+			},
+			_ => OwnLoop::None,
+		};
+	}
+	let Some(prev_at) = before_blocks(unit, pc) else {
+		return OwnLoop::None;
+	};
+	let prev = unit.ops[prev_at as usize];
+	if op.code == Opcode::ForNext && prev.code == Opcode::ForIn && prev.node == op.node {
+		return OwnLoop::Header;
+	}
+	let node = prev.node;
+	let mut at = prev_at;
+	loop {
+		let o = unit.ops[at as usize];
+		if o.node != node {
+			return OwnLoop::None;
+		}
+		match o.code {
+			Opcode::Redir => break,
+			Opcode::Enter | Opcode::Arith | Opcode::LoopEnter | Opcode::ForIn | Opcode::SetStatus => {
+			},
+			_ => return OwnLoop::None,
+		}
+		let Some(before) = before_blocks(unit, at) else {
+			return OwnLoop::None;
+		};
+		at = before;
+	}
+	let ours = op.node == node;
+	match unit.nodes.get(node as usize).map(|n| n.kind) {
+		Some(NodeKind::While | NodeKind::Until)
+			if ours && matches!(op.code, Opcode::Enter | Opcode::LoopEnter) =>
+		{
+			OwnLoop::Header
+		},
+		Some(kind @ (NodeKind::While | NodeKind::Until)) if prev.code == Opcode::LoopEnter => {
+			OwnLoop::Test { until: kind == NodeKind::Until }
+		},
+		Some(NodeKind::For | NodeKind::Select)
+			if (ours && matches!(op.code, Opcode::Enter | Opcode::ForIn)) || block_at(unit, pc) =>
+		{
+			OwnLoop::Header
+		},
+		Some(NodeKind::ArithFor)
+			if ours
+				&& matches!(
+					op.code,
+					Opcode::Enter | Opcode::Arith | Opcode::LoopEnter | Opcode::SetStatus
+				) =>
+		{
+			OwnLoop::Header
+		},
+		Some(NodeKind::ArithFor) if ours && op.code == Opcode::BrFail => OwnLoop::ArithTest,
+		_ => OwnLoop::None,
+	}
+}
+
+/// Whether the op at `pc` is the jump over a substitution's body, as
+/// [`ir`] lowers a `$( )`, `${ }`, `${| }` or `<( )` in a word (`block`):
+/// a `Jmp` of node 0 to the op after the body's `SubExit`.
+fn block_at(unit: &Unit, pc: u32) -> bool {
+	unit.ops.get(pc as usize).is_some_and(|op| {
+		op.code == Opcode::Jmp
+			&& op.node == 0
+			&& op.a > pc + 1
+			&& unit
+				.ops
+				.get(op.a as usize - 1)
+				.is_some_and(|end| end.code == Opcode::SubExit && end.node == 0)
+	})
+}
+
+/// The pc of the op before `pc`, past the substitution bodies
+/// ([`block_at`]) that end just before it, an outer body with the bodies
+/// it holds; `None` at the unit's start.
+fn before_blocks(unit: &Unit, pc: u32) -> Option<u32> {
+	let mut at = pc.checked_sub(1)?;
+	loop {
+		let end = unit.ops[at as usize];
+		if end.code != Opcode::SubExit || end.node != 0 {
+			return Some(at);
+		}
+		let after = at + 1;
+		let jump = (0..at)
+			.rev()
+			.find(|&j| block_at(unit, j) && unit.ops[j as usize].a == after)?;
+		at = jump.checked_sub(1)?;
+	}
+}
+
+/// The loop whose own redirection held the waiting break `p` takes it, as
+/// bash's loop does on its first pass: a `while` (`until`: `Some(true)`)
+/// at its first test, which bash skips with the status `$?` has; an
+/// arithmetic `for` (`None`) after its first test. A `continue` of one
+/// level lets the loop go on (a `while` whose skipped test succeeds, an
+/// `until` whose skipped test fails: its body is skipped too; an
+/// arithmetic `for`'s test decides, as on any pass); anything else ends
+/// the loop, with the status bash's returns, and the levels left go to the
+/// loops around it ([`break_loops`]).
+fn own_loop_takes(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	p: PendingBreak,
+	until: Option<bool>,
+) -> bool {
+	vp.pending_break = None;
+	let skipped = vp.status;
+	if p.cont && p.levels == 1 {
+		match until {
+			Some(until) if (skipped == 0) != until => {
+				// The body bash skipped is the loop's last one so far.
+				if let Some(rec) = top_frame(vp).loops.last_mut() {
+					rec.status = skipped;
+				}
+				return false;
+			},
+			None => return false,
+			Some(_) => {
+				vp.status = 0;
+				break_loops(k, vp, cx, 1, false);
+				return true;
+			},
+		}
+	}
+	// An `until` returns its skipped body's status (the skipped test's when
+	// that failed, 0 when it ended the loop); a `while` and an arithmetic
+	// `for` return 0, no body having run.
+	vp.status = if until == Some(true) { skipped } else { 0 };
+	break_loops(k, vp, cx, p.levels, p.cont);
+	true
 }
 
 /// The top frame's scratch, created from the vproc's spare if absent.
@@ -2258,6 +2782,17 @@ fn stopped(
 			// Answered: log it and run the op again (it replays).
 			let flow = match settle_probe(k, cx, vp, &mut sc, slot, &p) {
 				Ok(()) => Flow::Call,
+				// zsh's `$(< word)` reads the file in the shell: an open that
+				// waits (a FIFO without its other end) decides the background
+				// job this vproc decides on its virtual pid, as a zsh
+				// redirection's does ([`redir::apply`]), so a reader of `$!`
+				// never waits on that rendezvous, which may need the reader.
+				Err(key @ WaitKey::Fs { op: FsOp::Open, .. })
+					if matches!(p, Probe::Read { .. }) && !k.bangs.is_empty() =>
+				{
+					k.settle_bang(vp.vpid, None);
+					Flow::Block(key)
+				},
 				Err(key) => Flow::Block(key),
 			};
 			top_frame(vp).scratch = Some(sc);
@@ -2339,12 +2874,12 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			{
 				return Flow::Exit(status);
 			}
-			// bash exits 127 from a `-c` string (`run_one_command`), 1 from a
-			// script and from a subshell (`execute_in_subshell` keeps the
-			// failure status); a nested shell (depth 0) is its own `-c` shell.
-			// zsh exits 1 from any of them (`errflag` ends `loop` with 1).
+			// bash exits 127 when the error reaches the command loop of a `-c`
+			// string (`run_one_command`), 1 from a script and from a nearer
+			// `top_level` ([`fatal_reaches_command_loop`]). zsh exits 1 from
+			// any of them (`errflag` ends `loop` with 1).
 			let command = vp.mode.dialect() != Dialect::Zsh
-				&& super::subshell_depth(vp) == 0
+				&& fatal_reaches_command_loop(vp)
 				&& matches!(
 					state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
 					Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
@@ -2356,6 +2891,94 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			Flow::Discard(1)
 		},
 	}
+}
+
+/// Whether a fatal error here ends at bash's command loop rather than at a
+/// nearer `top_level`: a subshell and a substitution set their own
+/// (`execute_in_subshell`, `command_substitute`), and so does a builtin that
+/// a forked simple command runs (`execute_subshell_builtin_or_function`). A
+/// forked pipeline element's or async command's own expansion, and a
+/// function it runs, reach the `top_level` its fork copied from its forking
+/// shell ([`super::proc::FrameFlags::command_loop`] of its base frame, this
+/// answer for the forking shell when it forked): the command loop only when the
+/// forking shell's error would reach it too, so not for an element forked
+/// inside `( … )`, `$( )` or `<( )`. So do a negated simple job (`! f &`) and
+/// the own redirection of a compound that is a whole element or job
+/// (`{ :; } 2>"$w" | cat`, `{ :; } 2>"$w" &`, a job's timed or negated
+/// too: `time { :; } 2>"$w" &`): bash forks that compound itself
+/// (`execute_command_internal`), and its child expands the compound's
+/// redirections (`execute_in_subshell`) before it sets a `top_level` of its
+/// own. Not a compound that is only the first command of a job's and-or
+/// list (`{ :; } 2>"$w" && : &`, timed too): bash forks the whole list
+/// (`execute_connection`), and that child sets its `top_level` before the
+/// list runs the compound (1). A background job that is one async pipeline
+/// passes its stored answer on: bash forks that pipeline's elements from
+/// the shell itself ([`async_pipeline`]), so obash's job vproc stands for no
+/// fork of bash's. A nested shell (depth 0) is its own shell.
+pub fn fatal_reaches_command_loop(vp: &Vproc) -> bool {
+	let Some(base) = vp.frames.first() else {
+		return super::subshell_depth(vp) == 0;
+	};
+	if vp.parent.is_some()
+		&& let Some(unit) = base.unit.as_deref()
+	{
+		let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+		let pc = base.pc;
+		let forked_simple = simple_stage(unit, pc).is_some_and(|si| {
+			matches!(unit.spawns[si].kind, SpawnKind::Pipeline | SpawnKind::Background)
+		});
+		// `! f &`: the job's simple command, then its `Not`.
+		let negated_job = code(pc) == Some(Opcode::Exec)
+			&& code(pc + 1) == Some(Opcode::Not)
+			&& code(pc + 2) == Some(Opcode::SubExit)
+			&& unit.spawns.iter().any(|s| {
+				s.kind == SpawnKind::Background
+					&& s
+						.stages
+						.first()
+						.is_some_and(|st| stage_command(unit, st.entry) == pc)
+			});
+		if forked_simple || negated_job {
+			return base.flags.command_loop()
+				&& vp
+					.frames
+					.get(1)
+					.is_none_or(|f| matches!(f.kind, FrameKind::Function { .. }));
+		}
+		// The stage's first op past its words' substitution bodies, and
+		// past a `time` of the job's whole body (`[TimeStart] Redir Enter …`).
+		let first = |entry: u32| {
+			let at = skip_blocks(unit, entry);
+			if code(at) == Some(Opcode::TimeStart) {
+				skip_blocks(unit, at + 1)
+			} else {
+				at
+			}
+		};
+		// The compound whose redirection is at `pc` must be the stage's whole
+		// command ([`ends_stage`] past the `Redir`'s `b`, just past its
+		// `PopRedir`), not the first command of an and-or list.
+		let own_redir = vp.frames.len() == 1
+			&& code(pc) == Some(Opcode::Redir)
+			&& ends_stage(unit, unit.ops[pc as usize].b)
+			&& unit.spawns.iter().any(|s| {
+				matches!(s.kind, SpawnKind::Pipeline | SpawnKind::Background)
+					&& s.stages.iter().any(|st| first(st.entry) == pc)
+			});
+		let async_job = vp.frames.len() == 1
+			&& unit.ops.get(pc as usize).is_some_and(|op| {
+				op.code == Opcode::Spawn
+					&& unit
+						.spawns
+						.get(op.a as usize)
+						.is_some_and(|s| s.kind == SpawnKind::Pipeline)
+					&& async_pipeline(unit, op.a as usize)
+			});
+		if own_redir || async_job {
+			return base.flags.command_loop();
+		}
+	}
+	super::subshell_depth(vp) == 0
 }
 
 /// Answer the expansion probe `p` ([`Stop::Probe`]) of the op whose scratch
@@ -2380,7 +3003,8 @@ pub fn settle_probe(
 /// The logged form of an expansion probe's answer: a PATH search's path
 /// (`None`: not found); an access check's success as an empty string; a
 /// filesystem request's ([`super::fsprobe`]) bytes, names (a list), other
-/// success (empty) or failure (`None`).
+/// success (empty) or failure (`None`); a file read's contents, or its
+/// failure's `strerror` text as a one-item list.
 pub fn probe_atom(answer: ProbeResult) -> Atom {
 	use super::fsprobe::FsAns;
 	Atom::Str(match answer {
@@ -2393,6 +3017,10 @@ pub fn probe_atom(answer: ProbeResult) -> Atom {
 		},
 		ProbeResult::Fs(Ok(FsAns::Bytes(b))) => Some(b),
 		ProbeResult::Fs(Ok(_)) => Some(BString::default()),
+		// A file read ([`Probe::Read`], zsh's `$(< word)`): its contents, or
+		// the `strerror` text of the failure as a one-item list.
+		ProbeResult::Bytes(Ok(b)) => Some(b),
+		ProbeResult::Bytes(Err(err)) => return Atom::List(vec![err]),
 		_ => None,
 	})
 }
@@ -2420,6 +3048,13 @@ pub fn start_sub(
 	sc: &mut Scratch,
 	sub: Sub,
 ) -> Flow {
+	// bash's `breaking`: while a `break` in an earlier `${ }` or `${| }` of
+	// the command waits for its loop, no later substitution runs a command
+	// (`execute_command_internal` returns at once); each expands to nothing.
+	if vp.pending_break.is_some() {
+		sc.sub = Some(PendingSub::NoFork { capture: Capture::default(), value: false });
+		return Flow::Call;
+	}
 	let Sub { unit, entry, form, text, line } = sub;
 	let first = unit
 		.ops
@@ -2437,6 +3072,24 @@ pub fn start_sub(
 	let inherit =
 		posix || state::option(&mut k.root, cx.store, vp, OptId::InheritErrexit).unwrap_or(false);
 	match form {
+		// `$(< file)`: bash reads the file in the shell itself, with no
+		// subshell (`optimize_cat_file`): the redirection's word expands as
+		// the shell's own (`set -u` ends the shell; no DEBUG trap, xtrace or
+		// ERR trap for the `< file`, which is no command bash runs). The body
+		// runs here in a frame of its own ([`FrameKind::Cat`]) that holds the
+		// capture; its `Exec` ([`ir::Op::CAT`]) appends the file to it. The
+		// shell's fds are left alone, so what the word's expansion writes
+		// (`${| cmd; }`) and an EXIT trap a fatal error in it runs write
+		// where the shell does. A failure inside does not count for `set -e`.
+		ComsubForm::Fork if unit.cat_exec(entry).is_some() => {
+			let kind = FrameKind::Cat { capture: capture.clone() };
+			let mut frame = Frame::new(Some(unit), entry, kind);
+			frame.line_shift = shift;
+			frame.ignore_errexit = true;
+			vp.frames.push(frame);
+			sc.sub = Some(PendingSub::NoFork { capture, value: false });
+			Flow::Call
+		},
 		ComsubForm::Fork => {
 			if let Some(flow) = fork_failed(k, vp, cx, 1, line) {
 				return flow;
@@ -2448,15 +3101,8 @@ pub fn start_sub(
 			// numbering its lines from the line the shell is at: at top
 			// level, where the whole command ends.
 			let base = top_level_end_line(vp).unwrap_or(line);
-			// `$(< file)` keeps its compiled form ([`ir::Op::CAT`]).
-			let cat = unit
-				.ops
-				.get(entry as usize)
-				.is_some_and(|op| op.flags & ir::Op::CAT != 0);
 			let reparse = text.and_then(|i| unit.strs.get(i as usize)).filter(|_| {
-				!posix
-					&& !cat
-					&& (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))
+				!posix && (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))
 			});
 			let mut child = if let Some(src) = reparse {
 				vp.child_text(k, cx.store, src, base, fds)
@@ -2480,6 +3126,7 @@ pub fn start_sub(
 				child.trace_base += 1;
 				child
 			};
+			k.bang_kin_add(vp.vpid, child.vpid);
 			// With `-e` already off in the parent the child sees it off and
 			// `SHELLOPTS` is already right: nothing to reset.
 			if !inherit && state::option(&mut k.root, cx.store, vp, OptId::Errexit).unwrap_or(true) {
@@ -2497,6 +3144,9 @@ pub fn start_sub(
 			// bash keeps job control and the job list in `$( )`: `jobs`
 			// lists the parent's jobs, `fg` finds no current job.
 			child.jobs = inherited_jobs(vp, vp.jobs.subshell);
+			// bash and zsh keep the loop level: a `break` ends the substitution.
+			child.outer_loops = fork_loops(vp, true);
+			sub_runs_no_debug_trap(vp, &mut child);
 			// Its externals stay in the shell's process group.
 			super::jobctl::set_leader(k, child.vpid, None);
 			let vpid = child.vpid;
@@ -2573,7 +3223,10 @@ pub fn start_zsh_sub(
 	let mut fds = vp.fds.clone();
 	fds.set(1, Some(FdRef::mem(capture.clone())));
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
+	k.bang_kin_add(vp.vpid, child.vpid);
 	child.jobs = inherited_jobs(vp, vp.jobs.subshell);
+	child.outer_loops = fork_loops(vp, true);
+	sub_runs_no_debug_trap(vp, &mut child);
 	// Its externals stay in the shell's process group (zsh
 	// `ESUB_NOMONITOR`).
 	super::jobctl::set_leader(k, child.vpid, None);
@@ -2621,6 +3274,8 @@ pub fn start_zsh_procsub(
 	fds.set(their_fd, Some(theirs));
 	let line = line_of(vp, 0);
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
+	child.outer_loops = fork_loops(vp, true);
+	sub_runs_no_debug_trap(vp, &mut child);
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}
@@ -2777,7 +3432,10 @@ pub fn start_procsub(
 			fds.set(sibling, None);
 		}
 	}
-	let child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	// bash keeps the loop level in a process substitution.
+	child.outer_loops = fork_loops(vp, true);
+	sub_runs_no_debug_trap(vp, &mut child);
 	let vpid = child.vpid;
 	// Not a job: its externals stay in the shell's group, without the
 	// terminal.
@@ -3015,14 +3673,13 @@ fn plain_arith(
 			let line = line_of(vp, op.node);
 			k.diag(cx, vp, line, d);
 			vp.status = 1;
-			// `((…))` continues; an arith-for header error leaves the loop
-			// (approximated by discarding the command).
+			// `((…))` continues; an arith-for header error leaves the loop.
 			if unit
 				.nodes
 				.get(op.node as usize)
 				.is_some_and(|n| n.kind == NodeKind::ArithFor)
 			{
-				Flow::Discard(1)
+				arith_for_failed(vp, unit, op)
 			} else {
 				Flow::Next
 			}
@@ -3036,6 +3693,54 @@ fn plain_arith(
 			stop_flow(k, vp, cx, line, Stop::Fail(d))
 		},
 	})
+}
+
+/// The flow after an arith-`for` header expression failed (its message
+/// shown, `$?` 1): bash's `execute_arith_for_command` leaves the loop with
+/// status 1, and the commands after it run. A failed first expression ends
+/// it before its record is pushed; a failed test or step drops the record.
+/// A `break` or `continue` that waits for a loop
+/// ([`Vproc::pending_break`], from the loop's own redirection or the
+/// test's substitution) loses one level to the loop at a failed test, as
+/// bash's loop checks `breaking` and `continuing` after the test; the
+/// levels left go on to the loops around it. It is no ERR trap point
+/// (the loop's status is no failed command's).
+fn arith_for_failed(vp: &mut Vproc, unit: &Unit, op: Op) -> Flow {
+	let frame = top_frame(vp);
+	frame.err_reported = true;
+	let pc = frame.pc;
+	let next = unit
+		.ops
+		.get(pc as usize + 1)
+		.copied()
+		.filter(|n| n.node == op.node);
+	if let Some(enter) = next.filter(|n| n.code == Opcode::LoopEnter) {
+		// The first expression: `LoopEnter`'s target is the loop's
+		// `LoopExit`, which would pop a record this loop has not pushed.
+		return Flow::Jump(enter.a + 1);
+	}
+	let Some(rec) = top_frame(vp).loops.pop() else {
+		// Every test and step runs with the loop's record pushed.
+		return Flow::Next;
+	};
+	let test = next.is_some_and(|n| n.code == Opcode::BrFail);
+	let depth = vp.frames.len();
+	if test
+		&& vp
+			.pending_break
+			.as_deref()
+			.is_some_and(|p| p.depth as usize == depth)
+	{
+		let left = vp
+			.pending_break
+			.as_deref()
+			.map_or(0, |p| p.levels.saturating_sub(1));
+		match vp.pending_break.as_deref_mut() {
+			Some(p) if left > 0 => p.levels = left,
+			_ => vp.pending_break = None,
+		}
+	}
+	Flow::Jump(rec.exit + 1)
 }
 
 /// Whether `op` (an `Enter`/`Leave`) brackets a zsh `[[ ]]` traced by
@@ -3217,7 +3922,10 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		},
 		Opcode::Spawn => spawn(k, vp, cx, unit, op),
 		Opcode::SubExit => {
-			if matches!(top_frame(vp).kind, FrameKind::NoFork | FrameKind::Stage) {
+			if matches!(
+				top_frame(vp).kind,
+				FrameKind::NoFork | FrameKind::Stage | FrameKind::Cat { .. }
+			) {
 				pop_frame(&mut k.root, cx.store, vp);
 			} else {
 				// A subshell, pipeline stage or job ends: its EXIT trap runs.
@@ -3291,13 +3999,9 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					k.diag(cx, vp, line, d);
 					vp.status = 1;
 					// `((…))` continues; an arith-for header error leaves the
-					// loop (approximated by discarding the command).
-					if unit
-						.nodes
-						.get(op.node as usize)
-						.is_some_and(|n| n.kind == NodeKind::ArithFor)
-					{
-						Flow::Discard(1)
+					// loop.
+					if arith_for {
+						arith_for_failed(vp, unit, op)
 					} else {
 						Flow::Next
 					}
@@ -4088,29 +4792,167 @@ fn bash_case_hit(
 }
 
 /// bash's `subshell_level` step for a pipeline stage or (`background`) an
-/// async command starting at `entry`: a `( … )` counts once, at its own
-/// `Spawn`; a simple command in a pipeline expands at the parent's level
-/// (bash's "not for pipes yet"); anything else is one more.
-fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
-	let ops = unit.ops.get(entry as usize..).unwrap_or_default();
-	let ops = match ops.first() {
-		Some(op) if op.code == Opcode::Redir => &ops[1..],
-		_ => ops,
-	};
-	match ops {
-		[enter, spawn, ..]
-			if enter.code == Opcode::Enter
-				&& spawn.code == Opcode::Spawn
-				&& unit
-					.spawns
-					.get(spawn.a as usize)
-					.is_some_and(|s| s.kind == SpawnKind::Subshell) =>
-		{
-			0
-		},
-		[exec, ..] if exec.code == Opcode::Exec && !background => 0,
-		_ => 1,
+/// async command starting at `entry`: a `( … )` that is the stage's whole
+/// command counts once, at its own `Spawn` (a job's `time` or `!` around it
+/// too: bash forks the `( … )` as the job); a simple command in a pipeline
+/// expands at the parent's level (bash's "not for pipes yet":
+/// [`raise_element_level`] counts it when it runs a builtin or function);
+/// anything else is one more, so too an and-or job that starts with a
+/// `( … )`: bash forks the whole list (`execute_connection`) and the
+/// `( … )` again. In `zsh`, `entersubsh` counts every element it forks, a
+/// `( … )` that starts a job counts once however the job goes on, and a
+/// timed `( … )` job twice. The bodies of its substitutions come first
+/// ([`skip_blocks`]).
+fn stage_level(unit: &Unit, entry: u32, background: bool, zsh: bool) -> u32 {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	let mut at = skip_blocks(unit, entry);
+	// A job's `time` of its whole body (`TimeStart … TimeEnd`).
+	if background && !zsh && code(at) == Some(Opcode::TimeStart) {
+		at = skip_blocks(unit, at + 1);
 	}
+	// Past a compound's own redirection: its `Redir`'s `b` is just past the
+	// `PopRedir` that follows the compound.
+	let (start, end) = match unit.ops.get(at as usize) {
+		Some(op) if op.code == Opcode::Redir => (at + 1, Some(op.b)),
+		_ => (at, None),
+	};
+	// A `( … )`, whose `Leave` is at its spawn's end.
+	if code(start) == Some(Opcode::Enter)
+		&& let Some(op) = unit.ops.get(start as usize + 1)
+		&& op.code == Opcode::Spawn
+		&& let Some(s) = unit.spawns.get(op.a as usize)
+		&& s.kind == SpawnKind::Subshell
+		&& (zsh || ends_stage(unit, end.unwrap_or(s.end + 1)))
+	{
+		return 0;
+	}
+	if code(start) == Some(Opcode::Exec) && !background {
+		return u32::from(zsh);
+	}
+	1
+}
+
+/// Whether only its pipeline's `!` and a job's `time` (`Not`, `TimeEnd`)
+/// come between `at`, just past a stage's first command, and the stage's
+/// `SubExit`: that command is the stage's whole command, not the first of
+/// an and-or list (`{ :; } 2>"$w" && : &`, a list bash forks whole).
+fn ends_stage(unit: &Unit, mut at: u32) -> bool {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	for wrap in [Opcode::Not, Opcode::TimeEnd] {
+		if code(at) == Some(wrap) {
+			at += 1;
+		}
+	}
+	code(at) == Some(Opcode::SubExit)
+}
+
+/// bash's `execute_subshell_builtin_or_function`: a forked pipeline
+/// element that runs a builtin or a function is one subshell level down
+/// once its words are expanded (at the parent's level, [`stage_level`]),
+/// so a function, `eval`, `.` or a builtin's callback sees one more than
+/// its parent's `$BASH_SUBSHELL`. Not for an element of an async pipeline,
+/// which bash forks as an async command, counted at the fork
+/// ([`async_pipeline`]). Called as the element's own simple command (the
+/// vproc's only frame) starts a builtin or function.
+pub fn raise_element_level(vp: &mut Vproc) {
+	if vp.frames.len() != 1 || vp.parent.is_none() || vp.mode.dialect() != Dialect::Bash {
+		return;
+	}
+	let f = &vp.frames[0];
+	let Some(unit) = f.unit.as_deref() else {
+		return;
+	};
+	let Some(si) = simple_stage(unit, f.pc) else {
+		return;
+	};
+	if unit.spawns[si].kind == SpawnKind::Pipeline && !async_pipeline(unit, si) {
+		let depth = super::subshell_depth(vp) + 1;
+		super::set_subshell_depth(vp, depth);
+	}
+}
+
+/// The spawn whose stage's own simple command is the op at `pc`: the op
+/// before the stage's closing `SubExit`, after its words' substitution
+/// bodies and a redirection ([`stage_command`]). `None` for an op in a
+/// substitution's body (which ends at a `SubExit` of its own) or in a
+/// compound stage.
+///
+/// The stage needs no end test: only a simple command lowers to an `Exec`
+/// (a compound's first op is `Enter`, `Spawn`, `FuncDef` or `CallAnon`),
+/// and its `Exec` is its last op. So when a stage's own command is the
+/// `Exec` at `pc` and a `SubExit` follows it, that `SubExit` is the
+/// stage's: the stage ends at `pc + 2`.
+fn simple_stage(unit: &Unit, pc: u32) -> Option<usize> {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	if code(pc) != Some(Opcode::Exec) || code(pc + 1) != Some(Opcode::SubExit) {
+		return None;
+	}
+	unit.spawns.iter().position(|s| {
+		s.stages
+			.iter()
+			.any(|st| stage_command(unit, st.entry) == pc)
+	})
+}
+
+/// The op of the stage starting at `entry` that runs its own command: past
+/// its words' substitution bodies ([`skip_blocks`]) and a redirection.
+fn stage_command(unit: &Unit, entry: u32) -> u32 {
+	let at = skip_blocks(unit, entry);
+	if unit
+		.ops
+		.get(at as usize)
+		.is_some_and(|op| op.code == Opcode::Redir)
+	{
+		at + 1
+	} else {
+		at
+	}
+}
+
+/// Whether pipeline spawn `si` is the whole body of a background job
+/// (with or without `!`, [`bash_job_keeps`]): bash runs it as an async
+/// pipeline and zsh forks it element by element, so the job's own fork
+/// stands for each element's and every element, a compound or `( … )` one
+/// too, sits at the job's subshell level.
+fn async_pipeline(unit: &Unit, si: usize) -> bool {
+	let Some(s) = unit.spawns.get(si) else {
+		return false;
+	};
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	let after = if code(s.end) == Some(Opcode::Not) {
+		s.end + 1
+	} else {
+		s.end
+	};
+	code(after) == Some(Opcode::SubExit)
+		&& unit.spawns.iter().any(|b| {
+			b.kind == SpawnKind::Background
+				&& b.stages.first().is_some_and(|st| {
+					unit
+						.ops
+						.get(skip_blocks(unit, st.entry) as usize)
+						.is_some_and(|op| op.code == Opcode::Spawn && op.a as usize == si)
+				})
+		})
+}
+
+/// Whether the subshell `Spawn` at `at` is the `( … )` that an element of
+/// an async pipeline runs as its own command ([`async_pipeline`]): forked
+/// once, as the element.
+fn async_element_subshell(unit: &Unit, at: u32) -> bool {
+	at > 0
+		&& unit
+			.ops
+			.get(at as usize - 1)
+			.is_some_and(|op| op.code == Opcode::Enter)
+		&& unit.spawns.iter().enumerate().any(|(si, s)| {
+			s.kind == SpawnKind::Pipeline
+				&& s
+					.stages
+					.iter()
+					.any(|st| stage_command(unit, st.entry) + 1 == at)
+				&& async_pipeline(unit, si)
+		})
 }
 
 /// Whether the background job whose body starts at `entry` may be known by
@@ -4121,30 +4963,11 @@ fn stage_level(unit: &Unit, entry: u32, background: bool) -> u32 {
 /// keeps its virtual pid at once: its readers never wait.
 fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
-	if code(entry) == Some(Opcode::Exec) && code(entry + 1) == Some(Opcode::SubExit) {
+	if simple_body(unit, entry) {
 		return Some(BangStage::Lone);
 	}
-	// `time` and `!` wrap the pipeline's spawn: `[TimeStart] Spawn …
-	// [Not] [TimeEnd]`, then the job's `SubExit`.
-	let at = if code(entry) == Some(Opcode::TimeStart) {
-		entry + 1
-	} else {
-		entry
-	};
-	if let Some(op) = unit.ops.get(at as usize)
-		&& op.code == Opcode::Spawn
-		&& let Some(spawn) = unit.spawns.get(op.a as usize)
-		&& spawn.kind == SpawnKind::Pipeline
-	{
-		let mut end = spawn.end;
-		for wrap in [Opcode::Not, Opcode::TimeEnd] {
-			if code(end) == Some(wrap) {
-				end += 1;
-			}
-		}
-		if code(end) == Some(Opcode::SubExit) {
-			return Some(BangStage::Pipeline);
-		}
+	if body_pipeline(unit, entry).is_some() {
+		return Some(BangStage::Pipeline);
 	}
 	let group = [Opcode::Enter, Opcode::Exec, Opcode::Leave, Opcode::SubExit]
 		.iter()
@@ -4161,6 +4984,132 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 			|w| matches!(w.parts.as_slice(), [ir::Part::Lit(name)] if name.as_slice() == b"exec"),
 		);
 	(group && exec).then_some(BangStage::Exec)
+}
+
+/// A stage whose body is one simple command: an `Exec`, then the stage's
+/// end.
+fn simple_body(unit: &Unit, entry: u32) -> bool {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	code(entry) == Some(Opcode::Exec) && code(entry + 1) == Some(Opcode::SubExit)
+}
+
+/// A background job's body that is one simple command, maybe negated
+/// (`cmd &`, `! cmd &`): an `Exec`, `[Not]`, then the job's end. bash runs
+/// its DEBUG trap in the shell before it forks.
+fn lone_simple(unit: &Unit, entry: u32) -> bool {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	code(entry) == Some(Opcode::Exec)
+		&& match code(entry + 1) {
+			Some(Opcode::SubExit) => true,
+			Some(Opcode::Not) => code(entry + 2) == Some(Opcode::SubExit),
+			_ => false,
+		}
+}
+
+/// The pipeline spawn (its index in [`Unit::spawns`]) a job body starting
+/// at `entry` is: `time` and `!` wrap it as `[TimeStart] Spawn …
+/// [Not] [TimeEnd]`, then the job's `SubExit`.
+fn body_pipeline(unit: &Unit, entry: u32) -> Option<usize> {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	let at = if code(entry) == Some(Opcode::TimeStart) {
+		entry + 1
+	} else {
+		entry
+	};
+	let op = unit
+		.ops
+		.get(at as usize)
+		.filter(|op| op.code == Opcode::Spawn)?;
+	let spawn = unit
+		.spawns
+		.get(op.a as usize)
+		.filter(|s| s.kind == SpawnKind::Pipeline)?;
+	let mut end = spawn.end;
+	for wrap in [Opcode::Not, Opcode::TimeEnd] {
+		if code(end) == Some(wrap) {
+			end += 1;
+		}
+	}
+	(code(end) == Some(Opcode::SubExit)).then_some(op.a as usize)
+}
+
+/// The entries of the simple commands whose DEBUG trap bash runs in the
+/// shell before spawn `op` forks, and whether they are a lone background
+/// command's (one whose failing trap skips the whole job under
+/// `extdebug`): a background job's lone command (`cmd &`, `! cmd &`), or
+/// each simple stage of a pipeline, also of the pipeline a background job
+/// is. bash forks a `time`d job first (`time a | b &`), and the job runs
+/// those traps itself under `set -T`, as a `time`d pipeline in it does.
+fn debug_stage_entries(unit: &Unit, op: Op) -> (Vec<u32>, bool) {
+	let simple = |spawn: usize| -> Vec<u32> {
+		unit.spawns[spawn]
+			.stages
+			.iter()
+			.map(|s| s.entry)
+			.filter(|&entry| simple_body(unit, entry))
+			.collect()
+	};
+	let info = &unit.spawns[op.a as usize];
+	match info.kind {
+		SpawnKind::Background => {
+			let entry = info.stages[0].entry;
+			let timed = unit
+				.ops
+				.get(entry as usize)
+				.is_some_and(|o| o.code == Opcode::TimeStart);
+			if lone_simple(unit, entry) {
+				(vec![entry], true)
+			} else if timed {
+				(Vec::new(), false)
+			} else {
+				(body_pipeline(unit, entry).map_or_else(Vec::new, simple), false)
+			}
+		},
+		SpawnKind::Pipeline => (simple(op.a as usize), false),
+		_ => (Vec::new(), false),
+	}
+}
+
+/// [`debug_stage_entries`] the shell runs now: none for the pipeline a
+/// background job is, whose traps the shell ran before it forked the job
+/// ([`shell_ran_stage_traps`]).
+fn shell_debug_stages(k: &Kernel, vp: &Vproc, unit: &Unit, op: Op, pc: u32) -> Vec<u32> {
+	if shell_ran_stage_traps(k, vp, unit, op, pc) {
+		return Vec::new();
+	}
+	debug_stage_entries(unit, op).0
+}
+
+/// Whether this `Spawn` is the pipeline a background job is, whose stage
+/// traps the shell ran before it forked the job (its [`Bang`] still waits
+/// on the pipeline), unless the job forked first for its `time` (the
+/// `TimeStart` before `pc`). Such a job carries the skip list the shell
+/// recorded for it ([`DebugSkip`]).
+fn shell_ran_stage_traps(k: &Kernel, vp: &Vproc, unit: &Unit, op: Op, pc: u32) -> bool {
+	let info = &unit.spawns[op.a as usize];
+	let timed = pc
+		.checked_sub(1)
+		.and_then(|at| unit.ops.get(at as usize))
+		.is_some_and(|o| o.code == Opcode::TimeStart);
+	info.kind == SpawnKind::Pipeline
+		&& !timed
+		&& k
+			.bangs
+			.iter()
+			.any(|b| b.vproc == vp.vpid && b.stage == BangStage::Pipeline)
+}
+
+/// The shell ran the DEBUG trap of the simple command a child starts with
+/// at `entry` ([`shell_debug_stages`]): the child does not run it again.
+/// In zsh mode the mark is never read: only bash's trap points (a command,
+/// a `Spawn`) compare `debug_pc` with an `Exec`'s pc, and zsh's trap runs
+/// at its list markers (`Nop`), which `lone_simple`'s `entry` never is.
+fn mark_debug_done(unit: &Unit, frames: &mut [Frame], entry: u32) {
+	if lone_simple(unit, entry)
+		&& let Some(frame) = frames.last_mut()
+	{
+		frame.debug_pc = Some(entry);
+	}
 }
 
 /// The pipeline a background job's body is ([`BangStage::Pipeline`])
@@ -4230,21 +5179,23 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		if let Some(flow) = fork_failed(k, vp, cx, needed, line_of(vp, op.node)) {
 			return flow;
 		}
-		// A job that forks (a subshell, pipeline, job or coprocess of its
-		// own) is not just one program: it keeps its virtual pid. The
-		// pipeline a job's body is passes the decision to its last stage
-		// ([`retarget_bang`]).
-		let own_pipeline = info.kind == SpawnKind::Pipeline
-			&& k
-				.bangs
-				.iter()
-				.any(|b| b.vproc == vp.vpid && b.stage == BangStage::Pipeline);
-		if !k.bangs.is_empty() && !own_pipeline {
-			k.settle_bang(vp.vpid, None);
-		}
 		let mut children = Vec::with_capacity(info.stages.len());
 		match info.kind {
 			SpawnKind::Subshell | SpawnKind::Background => {
+				// `extdebug` skipped every stage of the pipeline a background job
+				// is: no job, status 0, `$!` and `PIPESTATUS` as they were (bash).
+				let skip = if info.kind == SpawnKind::Background {
+					take_debug_skip(k, vp)
+				} else {
+					None
+				};
+				if skip
+					.as_deref()
+					.is_some_and(|s| skips_whole_pipeline(unit, info.stages[0].entry, s))
+				{
+					vp.status = 0;
+					return Flow::Jump(info.end);
+				}
 				let mut fds = vp.fds.clone();
 				let control = info.kind == SpawnKind::Background && job_control(k, cx, vp);
 				// An async command reads `/dev/null` without job control, unless
@@ -4269,14 +5220,36 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					fds.set(0, Some(null.clone()));
 				}
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				let keeps =
+					info.kind == SpawnKind::Background && bash_job_keeps(unit, info.stages[0].entry);
+				child.outer_loops = fork_loops(vp, keeps);
+				// The shell ran a background simple command's DEBUG trap, or
+				// the traps of the pipeline the job is: under `extdebug` the
+				// job's pipeline skips the stages whose trap failed.
+				if info.kind == SpawnKind::Background {
+					mark_debug_done(unit, &mut child.frames, info.stages[0].entry);
+					if let Some(entries) = skip {
+						let frame = child.frames.len().saturating_sub(1) as u32;
+						k.debug_skips
+							.push(DebugSkip { vproc: child.vpid, frame, entries });
+					}
+				}
 				if info.kind == SpawnKind::Background && !control {
 					ignore_async_signals(k, cx, &mut child);
 				}
+				// The `( … )` of an async pipeline's element: bash and zsh fork
+				// it once, as the element ([`async_element_subshell`]).
+				if info.kind == SpawnKind::Subshell && async_element_subshell(unit, top_frame(vp).pc) {
+					super::set_subshell_depth(&mut child, super::subshell_depth(vp));
+				}
 				if info.kind == SpawnKind::Background {
-					let level = stage_level(unit, info.stages[0].entry, true);
+					let zsh = unit.mode.dialect() == Dialect::Zsh;
+					let level = stage_level(unit, info.stages[0].entry, true, zsh);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// A job of its own: its processes get their own group.
 					super::jobctl::own_job(k, child.vpid);
+				} else {
+					k.bang_kin_add(vp.vpid, child.vpid);
 				}
 				children.push(child.vpid);
 				let vpid = child.vpid;
@@ -4315,13 +5288,25 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				let tap = cx.host.pipe_tap();
 				let lastpipe = last_stage_here(k, cx, vp, unit);
 				let mut stdin = vp.fds.get(0).cloned();
+				// An async pipeline's elements sit at the job's level.
+				let async_elements = async_pipeline(unit, op.a as usize);
+				let zsh = unit.mode.dialect() == Dialect::Zsh;
+				// `extdebug`: a stage whose DEBUG trap failed in the shell is not
+				// started, as bash forks no process for it: its input closes,
+				// the next stage reads end of input, and `PIPESTATUS` has no
+				// entry for it.
+				let skip = take_debug_skip(k, vp);
+				let skipped = |entry: u32| skip.as_ref().is_some_and(|s| s.contains(&entry));
+				// The entry of each child's stage, for [`retarget_bang`].
+				let mut entries = Vec::with_capacity(n);
 				for (i, stage) in info.stages.iter().enumerate() {
-					if lastpipe && i + 1 == n {
+					let skip_stage = unit.mode.dialect() == Dialect::Bash && skipped(stage.entry);
+					if lastpipe && i + 1 == n && !skip_stage {
 						if !k.bangs.is_empty() {
 							let stages: Vec<(Vpid, u32)> = children
 								.iter()
-								.zip(&info.stages)
-								.map(|(&child, s)| (child, s.entry))
+								.copied()
+								.zip(entries.iter().copied())
 								.chain([(vp.vpid, stage.entry)])
 								.collect();
 							retarget_bang(k, vp.vpid, unit, &stages);
@@ -4332,6 +5317,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						sc.children = children.into_iter().map(|v| (v, None)).collect();
 						sc.inline = Some(InlineStage::Running);
 						let mut frame = Frame::new(Some(Arc::clone(unit)), stage.entry, FrameKind::Stage);
+						if unit.mode.dialect() == Dialect::Bash && simple_body(unit, stage.entry) {
+							frame.debug_pc = Some(stage.entry);
+						}
 						frame.line_shift = line_shift;
 						let prev = vp.fds.get(0).cloned();
 						vp.fds.set(0, stdin.take());
@@ -4358,22 +5346,41 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						}
 						stdin = Some(FdRef::mem(r));
 					}
+					if skip_stage {
+						// Dropping `fds` closes this stage's ends of its pipes.
+						continue;
+					}
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
-					let level = stage_level(unit, stage.entry, false);
+					// The shell ran a simple stage's DEBUG trap.
+					mark_debug_done(unit, &mut child.frames, stage.entry);
+					// bash keeps the loop level in a simple command it forks
+					// (its words' substitution bodies come first).
+					let simple = unit
+						.ops
+						.get(skip_blocks(unit, stage.entry) as usize)
+						.is_some_and(|op| op.code == Opcode::Exec);
+					child.outer_loops = fork_loops(vp, simple);
+					let level = if async_elements {
+						0
+					} else {
+						stage_level(unit, stage.entry, false, zsh)
+					};
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline
 					// stage (`jobs -p | xargs kill`).
 					if !vp.jobs.is_empty() && runs_jobs(unit, stage.entry) {
 						child.jobs = inherited_jobs(vp, true);
 					}
+					k.bang_kin_add(vp.vpid, child.vpid);
 					children.push(child.vpid);
+					entries.push(stage.entry);
 					k.spawned.push(Box::new(child));
 				}
 				if !k.bangs.is_empty() {
 					let stages: Vec<(Vpid, u32)> = children
 						.iter()
-						.zip(&info.stages)
-						.map(|(&child, s)| (child, s.entry))
+						.copied()
+						.zip(entries.iter().copied())
 						.collect();
 					retarget_bang(k, vp.vpid, unit, &stages);
 				}
@@ -4415,7 +5422,11 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 	} else {
 		statuses.last().copied().unwrap_or(0)
 	};
-	vp.pipestatus = statuses;
+	// Every stage skipped under `extdebug`: status 0, and `PIPESTATUS` as it
+	// was (bash waited for no process).
+	if !statuses.is_empty() {
+		vp.pipestatus = statuses;
+	}
 	Flow::Jump(info.end)
 }
 
@@ -4569,7 +5580,7 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 /// Whether the pipeline stage starting at `entry` is a simple command
 /// named `jobs` (bash keeps the job list only for that builtin).
 fn runs_jobs(unit: &Unit, entry: u32) -> bool {
-	let Some(op) = unit.ops.get(entry as usize) else {
+	let Some(op) = unit.ops.get(skip_blocks(unit, entry) as usize) else {
 		return false;
 	};
 	let text = node_text(unit, op.node);
@@ -4611,6 +5622,7 @@ fn start_coproc(
 	fds.set(0, Some(FdRef::mem(in_r)));
 	fds.set(1, Some(FdRef::mem(out_w)));
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	child.outer_loops = fork_loops(vp, false);
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}
@@ -4879,6 +5891,16 @@ fn zsh_debug_done(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 
 /// Run a configured trap in the interrupted shell, without re-entering it.
 pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey) -> bool {
+	// A DEBUG trap action's command substitution runs none, nor a host
+	// callout's subshell, which stands for an external program.
+	if key == TrapKey::Debug && runs_no_debug_trap(vp) {
+		return false;
+	}
+	// bash's `breaking`: while a `break` from `${ }` waits for its loop, a
+	// trap's action runs none of its commands (an EXIT trap too).
+	if vp.pending_break.is_some() {
+		return false;
+	}
 	// A subshell lists its parent's EXIT trap but runs only its own.
 	if key == TrapKey::Exit && vp.parent.is_some() && !vp.own_traps.has(key) {
 		return false;
@@ -4928,12 +5950,7 @@ pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey)
 	}
 	// No trap runs inside its own action; a function called from the
 	// DEBUG trap loses the RETURN trap (bash's `execute_function`).
-	if vp.trap_frames != 0
-		&& vp.frames.iter().any(|f| {
-			matches!(f.kind,
-		FrameKind::Script { what: ScriptKind::Trap { key: active, .. }, .. }
-			if active == key || (key == TrapKey::Return && active == TrapKey::Debug))
-		}) {
+	if in_trap_action(vp, key) || (key == TrapKey::Return && in_trap_action(vp, TrapKey::Debug)) {
 		return false;
 	}
 	let (action, trap_mode) = match state::record(cx.store, vp, Key::Trap(key)) {
@@ -4953,6 +5970,16 @@ pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey)
 		state::store_record(&mut k.root, cx.store, vp, KeyBuf::Trap(key), None);
 	}
 	started
+}
+
+/// Whether `vp` runs the action of its `key` trap (a frame of it is on
+/// the stack).
+fn in_trap_action(vp: &Vproc, key: TrapKey) -> bool {
+	vp.trap_frames != 0
+		&& vp.frames.iter().any(|f| {
+			matches!(f.kind,
+				FrameKind::Script { what: ScriptKind::Trap { key: active, .. }, .. } if active == key)
+		})
 }
 
 /// Push the frame of trap `key` running `action` set in `trap_mode`
@@ -5014,6 +6041,7 @@ fn push_trap(
 		cancel: None,
 		return_target: None,
 		exit: false,
+		returned: false,
 	});
 	if let Some(saved) = restore {
 		super::mode::set_mode(&mut k.root, cx.store, vp, trap_mode);
@@ -5096,6 +6124,93 @@ fn note_pseudo_traps(k: &mut Kernel, cx: &mut Cx<'_>) {
 /// [`Frame::debug_pc`] of a function frame whose DEBUG trap at entry is
 /// running: under `extdebug` a failing trap skips the whole body.
 pub const ENTRY_DEBUG: u32 = u32::MAX;
+
+/// [`Frame::debug_pc`] of a `Spawn` while the shell runs the DEBUG traps
+/// of its simple stages ([`shell_debug_stages`]): `SPAWN_DEBUG - n` once
+/// the first `n` have run (`Some(pc)` once all have). Far above any pc,
+/// and below [`ENTRY_DEBUG`].
+pub const SPAWN_DEBUG: u32 = u32::MAX - 1;
+
+/// More stages than a [`SPAWN_DEBUG`] count holds.
+const MAX_STAGES: u32 = 1 << 16;
+
+/// How many stages' DEBUG traps a `Spawn` whose frame has `debug_pc` has
+/// run ([`SPAWN_DEBUG`]).
+fn spawn_debug_done(debug_pc: Option<u32>) -> usize {
+	match debug_pc {
+		Some(at) if (SPAWN_DEBUG - MAX_STAGES..SPAWN_DEBUG).contains(&at) => {
+			(SPAWN_DEBUG - at) as usize
+		},
+		_ => 0,
+	}
+}
+
+/// `vp` runs no DEBUG trap ([`super::proc::FrameFlags::no_debug_trap`] of its
+/// base frame).
+fn runs_no_debug_trap(vp: &Vproc) -> bool {
+	vp.frames.first().is_some_and(|f| f.flags.no_debug_trap())
+}
+
+/// A command or process substitution (bash's or zsh's) a DEBUG trap action
+/// starts runs no DEBUG trap and keeps `BASH_COMMAND`, as bash's and zsh's
+/// do (they run no trap inside a trap), so a trap that substitutes does not
+/// run itself again; nor does one a vproc that runs none starts. A subshell
+/// the action starts runs the trap again, in bash too.
+fn sub_runs_no_debug_trap(vp: &Vproc, child: &mut Vproc) {
+	if (runs_no_debug_trap(vp) || in_trap_action(vp, TrapKey::Debug))
+		&& let Some(base) = child.frames.first_mut()
+	{
+		base.flags.set_no_debug_trap(true);
+	}
+}
+
+/// `extdebug`: drop the skip lists `vpid` left at frame `from` or deeper,
+/// whose `Spawn` never ran ([`note_debug_skip`]).
+fn drop_debug_skips(k: &mut Kernel, vpid: Vpid, from: usize) {
+	k.debug_skips
+		.retain(|s| !(s.vproc == vpid && s.frame as usize >= from));
+}
+
+/// `extdebug`: the DEBUG trap the shell ran for the pipeline stage at
+/// `entry`, before the `Spawn` of `vp`'s top frame forks it, failed: that
+/// stage is not started ([`DebugSkip`]). Each frame keeps a list of its
+/// own: a pipeline a later stage's trap action runs (a frame deeper) takes
+/// none of it.
+fn note_debug_skip(k: &mut Kernel, vp: &Vproc, entry: u32) {
+	let frame = vp.frames.len().saturating_sub(1) as u32;
+	match k
+		.debug_skips
+		.iter_mut()
+		.find(|s| s.vproc == vp.vpid && s.frame == frame)
+	{
+		Some(skip) => skip.entries.push(entry),
+		None => k
+			.debug_skips
+			.push(DebugSkip { vproc: vp.vpid, frame, entries: vec![entry] }),
+	}
+}
+
+/// The stages `vp`'s top-frame `Spawn` skips ([`note_debug_skip`]), taken;
+/// another frame's list stays.
+fn take_debug_skip(k: &mut Kernel, vp: &Vproc) -> Option<Vec<u32>> {
+	let frame = vp.frames.len().saturating_sub(1) as u32;
+	let i = k
+		.debug_skips
+		.iter()
+		.position(|s| s.vproc == vp.vpid && s.frame == frame)?;
+	Some(k.debug_skips.swap_remove(i).entries)
+}
+
+/// Whether `skip` names every stage of the pipeline a background job's
+/// body at `entry` is: `extdebug` skipped them all, and bash starts no job.
+fn skips_whole_pipeline(unit: &Unit, entry: u32, skip: &[u32]) -> bool {
+	body_pipeline(unit, entry).is_some_and(|spawn| {
+		unit.spawns[spawn]
+			.stages
+			.iter()
+			.all(|s| skip.contains(&s.entry))
+	})
+}
 
 /// Start the RETURN trap of function or `.` frame `target`, the frames
 /// above it to unwind when it ends. Its `$LINENO` is the function body's
@@ -5385,9 +6500,12 @@ fn run_always(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, floor: usize, end
 	true
 }
 
-/// zsh `return N` (`bin_break` with `retflag`): leave the innermost
-/// function, `${ ;}` or `.` file, running the always-lists in the way;
-/// outside any, leave the shell (`zexit`). Also zsh `ERR_RETURN`.
+/// zsh `ERR_RETURN` (`execlist`'s `retflag` after a failed command): leave
+/// the innermost function, `${ ;}` or `.` file, running the always-lists in
+/// the way; outside any, leave the shell (`zexit`). An explicit `return`
+/// goes through [`zsh_return_flow`]; this one does not mark a trap frame
+/// below ([`mark_trap_return`]): in zsh only an explicit `return N` from a
+/// `TRAPNAL` function ends the code the trap interrupted.
 #[inline(never)]
 pub fn zsh_return(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	vp.status = status;
@@ -5466,16 +6584,21 @@ fn restore_local_specials(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 
 /// The loops a zsh `break`/`continue` may leave (zsh's `loops`): every
 /// loop running in this vproc, across function calls and `eval`, up to the
-/// `.` file, trap action or script that runs them (which start at zero).
+/// `.` file, trap action or script that runs them (which start at zero),
+/// and, when that reaches the vproc's first frame, its forking shell's
+/// ([`Vproc::outer_loops`]: a zsh fork keeps `loops`).
 pub fn zsh_loop_count(vp: &Vproc) -> u32 {
 	let mut n = 0u32;
-	for f in vp.frames.iter().rev() {
+	for (i, f) in vp.frames.iter().enumerate().rev() {
 		let here = f
 			.loops
 			.iter()
 			.filter(|r| !matches!(r.kind, LoopKind::Try { .. }))
 			.count();
 		n = n.saturating_add(u32::try_from(here).unwrap_or(u32::MAX));
+		if i == 0 {
+			return n.saturating_add(u32::from(vp.outer_loops));
+		}
 		if !matches!(
 			f.kind,
 			FrameKind::Function { .. }
@@ -5492,7 +6615,8 @@ pub fn zsh_loop_count(vp: &Vproc) -> u32 {
 /// zsh `break N` / `continue N` (`bin_break`, the loops' `breaks`
 /// handling): leave N loops (at most as many as run), across function
 /// calls unless `localloops` is set when the function returns; a try-list
-/// in the way runs its always-list first.
+/// in the way runs its always-list first; past the vproc's own loops it
+/// ends ([`leave_outer_loop`]).
 #[inline(never)]
 fn zsh_break(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool) {
 	let mut remaining = n.min(zsh_loop_count(vp)).max(1);
@@ -5558,7 +6682,12 @@ fn zsh_break(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool
 		// The caller's op (the call, `eval`) is abandoned with the loop.
 		clear_scratch(&mut k.root, cx.store, vp);
 	}
-	top_frame(vp).pc += 1;
+	// Past this vproc's own loops: the rest are its forking shell's.
+	if vp.frames.len() == 1 && vp.outer_loops > 0 {
+		leave_outer_loop(k, vp, cx, true);
+	} else {
+		top_frame(vp).pc += 1;
+	}
 }
 
 /// zsh `exit N` (`bin_break`): inside a function the functions return one

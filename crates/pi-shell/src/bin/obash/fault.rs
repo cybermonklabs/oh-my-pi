@@ -1025,7 +1025,7 @@ mod os {
 		Ok(bytes)
 	}
 
-	/// `exec` the running binary (same argv[0]) with `args`; returns only
+	/// `exec` the running binary (same `argv[0]`) with `args`; returns only
 	/// on failure. Linux re-executes `/proc/self/exe`, so a binary replaced
 	/// on disk meanwhile does not take over.
 	pub fn exec(args: &[OsString]) -> io::Error {

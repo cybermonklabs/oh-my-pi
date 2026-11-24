@@ -22,7 +22,7 @@ fn zsh(script: &str) -> (String, String, i32) {
 	cmd.arg0("zsh");
 	let out = output(
 		cmd.current_dir(dir.path())
-			.env("SH", env!("CARGO_BIN_EXE_obash"))
+			.env("SH", obash_support::obash_path())
 			.args(["-f", "-c", script]),
 	);
 	(

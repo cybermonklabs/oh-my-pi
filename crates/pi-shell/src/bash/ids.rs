@@ -497,7 +497,7 @@ pub enum IntrinsicId {
 	/// no module of the engine defines: running it loads the module, which
 	/// fails to define it. Never looked up by name (no command word has a
 	/// `/` and resolves as a builtin);
-	/// [`crate::bash::vm::builtins::misc::usable`] returns it.
+	/// `crate::bash::vm::builtins::misc::usable` returns it.
 	#[strum(serialize = "zsh/module-stub")]
 	ModuleStub,
 }

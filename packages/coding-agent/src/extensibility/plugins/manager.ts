@@ -15,6 +15,7 @@ import {
 import { JSONC } from "bun";
 import { resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import { loadExtensions } from "../extensions/loader";
+import type { ExtensionPathEntry } from "../extensions/types";
 import { runBunCli } from "./bun-cli";
 import { refreshBunGitCache } from "./bun-git-cache";
 import { linkPluginDirectory } from "./directory-link";
@@ -458,12 +459,13 @@ export class PluginManager {
 		}
 
 		const errors: string[] = [];
-		const loadable: string[] = [];
+		// Installs land in the user's plugin directory.
+		const loadable: ExtensionPathEntry[] = [];
 		for (const { entry, resolvedPath } of declaredEntries) {
 			if (resolvedPath === null) {
 				errors.push(`${entry}: declared extension entry not found on disk`);
 			} else {
-				loadable.push(resolvedPath);
+				loadable.push({ path: resolvedPath, scope: "user" });
 			}
 		}
 

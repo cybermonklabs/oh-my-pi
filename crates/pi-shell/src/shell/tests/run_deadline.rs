@@ -14,7 +14,9 @@
 use super::*;
 
 /// Ten lines of seven bytes each.
+#[cfg(target_os = "linux")]
 const TEN_LINES: &str = "for i in 0 1 2 3 4 5 6 7 8 9; do echo chunk$i; done";
+#[cfg(target_os = "linux")]
 const LINE_LEN: usize = "chunk0\n".len();
 
 /// The deadline of every run here.
@@ -25,8 +27,10 @@ fn deadline() -> CancelToken {
 }
 
 /// Reads of this thread's output pipes take one line each while it lives.
+#[cfg(target_os = "linux")]
 struct OneReadPerLine;
 
+#[cfg(target_os = "linux")]
 impl OneReadPerLine {
 	fn new() -> Self {
 		READ_LEN.set(LINE_LEN);
@@ -34,6 +38,7 @@ impl OneReadPerLine {
 	}
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for OneReadPerLine {
 	fn drop(&mut self) {
 		READ_LEN.set(usize::MAX);
@@ -41,6 +46,7 @@ impl Drop for OneReadPerLine {
 }
 
 /// A consumer that takes a chunk, then works on it for a second.
+#[cfg(target_os = "linux")]
 fn slow_consumer<T: Send + 'static>(rx: flume::Receiver<T>) -> tokio::task::JoinHandle<Vec<T>> {
 	tokio::spawn(async move {
 		let mut taken = Vec::new();
@@ -52,6 +58,7 @@ fn slow_consumer<T: Send + 'static>(rx: flume::Receiver<T>) -> tokio::task::Join
 	})
 }
 
+#[cfg(target_os = "linux")]
 fn ten_chunks() -> Vec<String> {
 	(0..10).map(|i| format!("chunk{i}\n")).collect()
 }
@@ -59,6 +66,14 @@ fn ten_chunks() -> Vec<String> {
 /// The reviewer's case: a command that ends at once, a 1.5 s deadline, and a
 /// consumer that takes its ten chunks a second apart. The drain outlasts the
 /// deadline; the run reports the command's status and every chunk.
+///
+/// Linux only: on macOS and Windows each write to the run's output pipe goes
+/// to the descriptor's writer thread (`sys::fs::BlockingWriter`), a thread
+/// the paused clock does not wait for. While the shell waits for it to write
+/// a line, every task may be waiting, and the runtime then moves its clock
+/// on to the next timer: the deadline comes before the command has ended,
+/// and the run reads as timed out.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn a_slow_consumer_past_the_deadline_keeps_the_status_and_every_chunk() {
 	let _lines = OneReadPerLine::new();
@@ -83,10 +98,10 @@ async fn a_slow_consumer_past_the_deadline_keeps_the_status_and_every_chunk() {
 	assert!(ran >= Duration::from_secs(9), "the run ended after {ran:?}");
 }
 
-/// The same through `execute_shell_streams`' byte readers. Unix only: on
-/// Windows the stderr reader's blocking read of its empty pipe stays in
-/// flight, and the paused clock does not move while it does.
-#[cfg(unix)]
+/// The same through `execute_shell_streams`' byte readers. Linux only, as
+/// above; on Windows, too, the stderr reader's blocking read of its empty
+/// pipe stays in flight, and the paused clock does not move while it does.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn streams_with_a_slow_consumer_past_the_deadline_keep_the_status_and_every_chunk() {
 	let _lines = OneReadPerLine::new();

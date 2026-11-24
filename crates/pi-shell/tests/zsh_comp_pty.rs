@@ -58,8 +58,18 @@ enum Record {
 	Colours,
 }
 
+/// A snapshot file. Under cargo the compile-time manifest dir exists at
+/// runtime; under Bazel the compile-time sandbox path is gone, so fall back to
+/// the runfiles-relative layout (test cwd is the workspace runfiles root and
+/// the fixtures ride along as `data`).
 fn snapshot_path(name: &str) -> PathBuf {
-	PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/zsh_comp_pty/{name}.txt"))
+	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/zsh_comp_pty");
+	let root = if manifest.is_dir() {
+		manifest
+	} else {
+		PathBuf::from("crates/pi-shell/tests/fixtures/zsh_comp_pty")
+	};
+	root.join(format!("{name}.txt"))
 }
 
 /// Type `keys` and wait for the output to settle.

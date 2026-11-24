@@ -1,0 +1,45 @@
+# Tests that pass and print, for the rust_test jobs in
+# .github/workflows/sami-rust-test.yml. A passing test's output can be a skip in
+# words the skip scan does not know ("nothing to test"), so the job fails for
+# every passing test that prints and is not named here. A test that prints
+# the skip marker `skipped: <reason>` (or a word the scan knows) skipped
+# itself, named here or not. Add a line only after reading the test: what it
+# prints, and why that is no skip. A named test that prints nothing gets a
+# notice.
+# One per line: <bazel test target> <libtest test name>  <what it prints; why it is no skip>.
+//crates/pi-ast:pi-ast_test block::tests::pruned_walk_matches_unpruned_on_full_repo_corpus  the number of files and comparisons of its sweep, after asserting more than 3000 files (run alone with --ignored, .github/sami/rust-test-ignored.txt)
+//crates/pi-builtins:pi-builtins_test find::tests::delete_removes_nothing_through_an_operand_swapped_for_a_symlink  the count of its 2000 swap runs and of files removed outside the tree; it asserts that count is 0
+//crates/pi-builtins:pi-builtins_test locale::tests::a_child_handed_to_a_task_already_read_is_still_caught  the panic message of the catch_unwind its child expects, which own_process passes on (#92)
+//crates/pi-builtins:pi-builtins_test mv::tests::the_moved_tree_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink  the count of its 2000 swap runs and of files removed outside the tree; it asserts that count is 0
+//crates/pi-builtins:pi-builtins_test own_process::tests::a_call_off_the_test_thread_fails  the panic of the thread it starts on purpose, whose message it asserts
+//crates/pi-builtins:pi-builtins_test rm::tests::recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink  the count of its 2000 swap runs, of files removed outside the tree (asserted 0) and of refused swaps
+//crates/pi-builtins:pi-builtins_test rm::tests::recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink  the count of its 2000 swap runs, of files removed outside the tree (asserted 0) and of refused swaps
+//crates/pi-builtins:pi-builtins_test sed::script_char_provider::tests::test_current_panics_out_of_bounds  the panic its #[should_panic] expects
+//crates/pi-iso:pi-iso_test cow::tests::a_clone_refused_for_a_device_leaves_nothing  (as root, rust-test-root-alone.txt) FICLONE's answer for a character device, which it asserts is a refusal
+//crates/pi-iso:pi-iso_test cow::tests::a_destination_with_other_links_is_cloned_into  FICLONE's answer in each place it tries (the temporary directory, /dev/shm) and, for /dev/shm, which does not clone, that its planted rows are skipped there; every row it runs asserts, and the planted rows run in the temporary directory, which the job keeps on a reflink XFS (its precondition step checks FICLONE there)
+//crates/pi-iso:pi-iso_test cow::tests::clone_file_answers_as_ficlone_does  FICLONE's answer in each case (one directory, one directory on /dev/shm, two filesystems); it asserts clone_file gives the same answer in each
+//crates/pi-natives:pi_natives_test desktop::macos::release_guard::tests::a_panicking_request_leaves_its_open_presses_to_the_helper  (macOS) the panic it raises on purpose inside catch_unwind, which it asserts
+//crates/pi-natives:pi_natives_test desktop::macos::release_guard::tests::a_request_waits_for_its_helper_to_exit_with_or_without_presses_open  (macOS) the panic it raises on purpose inside catch_unwind, which it asserts
+//crates/pi-natives:pi_natives_test vcs::tests::catch_panic_converts_native_panics_into_backend_errors  the panic it raises on purpose, which catch_panic must turn into an error it asserts
+//crates/pi-shell:pi-shell_test sys::spawn::unix::tests::abandoned_external_is_killed_after_a_short_grace  the grace and the KILL step the escalation took, after it asserted KILL came after the grace; the macOS job's skip-scan canary
+//crates/pi-shell:pi-shell_test sys::spawn::unix::tests::abandoned_external_is_killed_after_the_default_grace  the grace and the KILL step the escalation took, after it asserted KILL came after the grace
+//crates/pi-shell:pi-shell_test sys::suites::cancel_externals::cancel_term_kills_a_group_ignoring_term_after_the_default_grace  the cancel-to-done time and the KILL step, after its escalation asserts (and "still waiting for" when a wait is slow)
+//crates/pi-shell:pi-shell_test sys::suites::cancel_externals::cancel_term_reaches_the_externals_whole_group_at_once  the cancel-to-done time and the KILL step, after its escalation asserts (and "still waiting for" when a wait is slow)
+//crates/pi-shell:pi-shell_test sys::suites::cancel_externals::cancel_term_sweeps_a_grandchild_that_outlives_its_leader  the cancel-to-done time and the KILL step, after its escalation asserts (and "still waiting for" when a wait is slow)
+//crates/pi-shell:pi-shell_test sys::suites::cancel_externals::cancel_term_with_a_shell_trap_runs_it_and_still_kills_the_external_group  the cancel-to-done time and the KILL step, after its escalation asserts (and "still waiting for" when a wait is slow)
+//crates/pi-shell:pi-shell_test sys::suites::cancel_externals::inherit_cancel_reaches_only_the_external_itself  the cancel-to-done time and the KILL step, after its escalation asserts (and "still waiting for" when a wait is slow)
+//crates/pi-shell:pi-shell_test testkit::suites::cancel_latency::cancel_term_ends_a_busy_loop  the latency percentiles of its 300 cancels, printed and never asserted; each cancel's status 143 and no leak are
+//crates/pi-shell:pi-shell_test testkit::suites::cancel_latency::cancel_term_with_a_trap_unwinds_depth_3_and_background_vprocs  the latency percentiles of its 300 cancels, printed and never asserted; each cancel's status 143 and no leak are
+//crates/pi-vcs:pi-vcs_integration_tests_tests/worktree_add_failure_test an_add_into_an_empty_directory_someone_else_owns_succeeds  (run alone with --ignored) which clone backend the add used and its clone error, if any; it asserts the add succeeded and the directory kept its mode
+//crates/pi-vcs:pi-vcs_integration_tests_tests/worktree_interrupt_test an_add_refuses_a_directory_made_again_in_a_killed_adds_place  whether the directory made again got the old inode (true or false); the refusal it asserts holds either way
+//crates/pi-vcs:pi-vcs_test git::mutate::tests::reclaim_refuses_a_directory_without_the_adds_token  whether the directory made again got the old inode (true or false); the refusal it asserts holds either way, and its first half makes the same-inode case on purpose
+//crates/pi-vcs:pi-vcs_test git::open::tests::git_version_refuses_an_answer_without_one  the panic its #[should_panic(expected = "not a git version")] expects
+//crates/pi-vfs:pi-vfs_test dir_handle::tests::unix::a_release_holds_no_end_of_a_fifo_that_replaced_the_one_its_open_started_on  in how many of its tries the new FIFO got the old one's inode number; it asserts that number is 0
+//crates/pi-vfs:pi-vfs_test dir_handle::tests::unix::a_release_holds_no_end_of_a_fifo_that_replaced_the_one_its_open_started_on_by_name  in how many of its tries the new FIFO got the old one's inode number; it asserts that number is 0
+//crates/pi-walker:pi-walker_test exec::tests::input_panics_resume_in_the_consumer  the panic it raises in an input on purpose, which must reach the consumer
+//crates/pi-walker:pi-walker_test exec::tests::outputs_end_when_every_worker_panicked_and_the_input_waits  the panic (work boom) it raises in its worker on purpose; it asserts the outputs end while the input still waits
+//crates/pi-walker:pi-walker_test exec::tests::panics_resume_in_the_consumer  the panic it raises in the work on purpose, which must reach the consumer
+//crates/pi-walker:pi-walker_test walk::tests::a_panicking_visitor_ends_the_walk_on_every_worker  the panic (visitor boom) its visitor raises on purpose; it asserts the walk ends on every worker
+//crates/vendor/grep-searcher:grep-searcher_test searcher::glue::tests::scratch  the lines it matches in a fixed text (upstream ripgrep's scratch test)
+sdk/rust/omp-rpc:test:smoke smoke_real_server  what it reads from the server as it goes (the ready message, the protocol version it asserts is 2, the session state, command counts)
+sdk/rust/omp-rpc:test:smoke smoke_scripted_model  the scripted model server's READY line (asserted) and what the session returns as it goes

@@ -25,8 +25,10 @@ const NOT_MOUNTED = "xd:// is not mounted in this session.";
  * Approval tier for `write xd://<device>`: the mounted tool's own
  * (argument-dependent) approval for the decoded JSON payload. The resolution
  * devices finalize a staged, already-previewed action, so they stay at read
- * tier. Unresolved devices, malformed or non-object payloads, and approval
- * functions that throw fail closed to `exec`.
+ * tier. A device a held settings change disabled is denied with the hold's
+ * reason, so the gate refuses it without asking the user. Other unresolved
+ * devices, malformed or non-object payloads, and approval functions that throw
+ * fail closed to `exec`.
  */
 function deviceWriteTier(
 	url: InternalUrl,
@@ -38,6 +40,8 @@ function deviceWriteTier(
 		const name = target?.name;
 		if (name === REPORT_ISSUE_DEVICE_NAME) return "write";
 		if (name && isResolutionDeviceName(name)) return "read";
+		const heldRefusal = name ? session?.heldToolRefusal?.(name) : undefined;
+		if (heldRefusal) return { tier: "read", policy: "deny", reason: heldRefusal };
 		const inst = name && session?.xdev ? resolveXdevTool(session.xdev, name) : undefined;
 		if (!name || !inst) return "exec";
 		if (typeof content !== "string") return "exec";
@@ -68,6 +72,11 @@ export class XdProtocolHandler implements ProtocolHandler {
 		if (!session) throw new ToolError(NOT_MOUNTED);
 		const topic = parseXdTopicUrl(url.href);
 		const device = topic ? null : parseXdUrl(url.href);
+		// A tool a held settings change disabled stays in the system prompt until the rebuild; a read of its docs or of
+		// one of its doc topics gives the reason a call to it is refused.
+		const name = topic?.name ?? device?.name;
+		const heldRefusal = name ? session.heldToolRefusal?.(name) : undefined;
+		if (heldRefusal) throw new ToolError(heldRefusal);
 		let content: string;
 		if (topic) content = this.#topic(session, topic.name, topic.topic);
 		else if (device) content = this.#usage(session, device.name);
@@ -92,6 +101,10 @@ export class XdProtocolHandler implements ProtocolHandler {
 		const xdev = session.xdev;
 		if (!xdev) throw new ToolError(NOT_MOUNTED);
 		if (!name) throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${xdevListing(xdev)}`);
+		// A device a held settings change disabled stays in the system prompt until the rebuild; a call to it is refused
+		// as a direct call to the tool is, with the reason.
+		const heldRefusal = session.heldToolRefusal?.(name);
+		if (heldRefusal) throw new ToolError(heldRefusal);
 		const toolCall = context.toolCall;
 		if (!toolCall) throw new ToolError(`xd://${name} can only be written by the write tool.`);
 		const { result, xdev: dispatch } = await dispatchXdevTool(
@@ -120,7 +133,8 @@ export class XdProtocolHandler implements ProtocolHandler {
 		if (name && isResolutionDeviceName(name)) return resolutionDeviceUsage(name);
 		const xdev = session.xdev;
 		if (!xdev) throw new ToolError(NOT_MOUNTED);
-		return name === null ? xdevListing(xdev) : xdevDocs(xdev, name);
+		if (name === null) return xdevListing(xdev);
+		return xdevDocs(xdev, name);
 	}
 
 	/** `read xd://<tool>/<topic>`: one named doc topic of a tool. */

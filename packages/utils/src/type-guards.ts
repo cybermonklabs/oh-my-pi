@@ -2,6 +2,11 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+/** Whether `value` is an array of strings (an empty one included). */
+export function isStringList(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every(item => typeof item === "string");
+}
+
 /** Reads an own string-valued property without invoking accessors. */
 export function stringProperty(value: object, key: string): string | undefined {
 	const field = Object.getOwnPropertyDescriptor(value, key)?.value;

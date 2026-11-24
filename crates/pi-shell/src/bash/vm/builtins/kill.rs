@@ -40,8 +40,12 @@ fn parse_signal(spec: &[u8], platform: Platform) -> Option<Send> {
 
 /// Why a target could not be signalled.
 pub(super) enum TargetError {
-	/// `%n` names no live job.
+	/// `%n` names no live job (zsh), or no job (bash).
 	NoSuchJob,
+	/// bash: `%n` names a finished job started under job control, whose
+	/// process group (this pid) is gone (bash's `killpg` fails with
+	/// `ESRCH`).
+	GroupGone(u32),
 	/// zsh `getjob` already reported the bad spec.
 	Reported,
 	/// Neither a number nor a job spec.
@@ -108,6 +112,16 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		return done(2);
 	}
 	let mut status = 0;
+	// The job a `%n` names is judged by its state, and a pid by whether that
+	// process ended: the exits already available count first, as in bash,
+	// whose job states follow its children's exits at once. A program's
+	// process is gone only once its vproc took its exit in (the waiter does
+	// not reap it), so a pid `kill` finds gone is one whose end the job's
+	// vprocs take in now: also a pipeline's first program, whose stage
+	// vproc has ended and no longer names it.
+	if args[i..].iter().any(|a| a.starts_with(b"%") || is_pid(a)) {
+		super::jobs::take_in_exits(ctx)?;
+	}
 	for arg in &args[i..] {
 		match target(ctx, arg, send, None) {
 			Ok(Some(target)) => {
@@ -128,6 +142,7 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 						format!("`{}': not a pid or valid job spec", arg.as_bstr())
 					},
 					TargetError::NoSuchProcess => format!("({}) - No such process", arg.as_bstr()),
+					TargetError::GroupGone(pid) => format!("({pid}) - No such process"),
 					TargetError::Host(e) => {
 						format!("({}) - {}", arg.as_bstr(), crate::bash::diag::strerror(&e))
 					},
@@ -138,6 +153,14 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		}
 	}
 	done(status)
+}
+
+/// Whether `arg` is a pid operand (digits, with a leading `-` for a process
+/// group): `kill` takes in the exits already available before it signals
+/// one.
+fn is_pid(arg: &[u8]) -> bool {
+	let digits = arg.strip_prefix(b"-").unwrap_or(arg);
+	!digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
 }
 
 /// Resolve one operand: a virtual process to signal on the bus
@@ -155,12 +178,27 @@ pub(super) fn target(
 			None => super::jobs::spec(ctx, arg).map_err(|_| TargetError::NoSuchJob)?,
 		};
 		let job = ctx.vp.jobs.get_mut(number).ok_or(TargetError::NoSuchJob)?;
+		// bash `kill_pid`: the job's state is news again (`jobs -n` lists
+		// it).
+		if zsh.is_none() {
+			job.notified = false;
+		}
 		if matches!(job.state, JobState::Done(_))
 			|| matches!(
 				ctx.k.proc_state(ctx.cx.store, job.vpid),
 				Some(crate::bash::vm::ProcState::Exited(_))
 			) {
-			return Err(TargetError::NoSuchJob);
+			if zsh.is_some() {
+				return Err(TargetError::NoSuchJob);
+			}
+			// bash 5.3 `kill_pid` of a finished job still listed: without job
+			// control it signals none of its processes (all gone) and
+			// succeeds; with it `killpg` finds no process group.
+			return if job.control {
+				Err(TargetError::GroupGone(job.pid()))
+			} else {
+				Ok(None)
+			};
 		}
 		// bash `kill_pid`: continuing a stopped job by `kill` acts like `bg`
 		// (the job runs, the current job stays).
@@ -184,11 +222,13 @@ pub(super) fn target(
 		.map(|p| ctx.k.pid_owner(p).unwrap_or_else(|| ctx.vp.vpid_of(p)));
 	let live = named.filter(|&v| {
 		let st = ctx.k.proc_state(ctx.cx.store, v);
-		// `$!` of a job disowned before the scheduler adopted it is known
-		// only by `$!` (as `wait`'s `is_child`).
+		// `$!` of a job the scheduler has not adopted yet (one `disown`
+		// dropped in the same turn) has no record yet. Once adopted, a
+		// child with no record is gone: its status was collected (`wait`)
+		// or kept for `wait PID` when its job left the table.
 		(ctx.vp.jobs.by_vpid(v).is_some()
 			|| st == Some(crate::bash::vm::ProcState::Running)
-			|| (st.is_none() && ctx.vp.last_bg.is(v)))
+			|| (st.is_none() && ctx.vp.last_bg.is(v) && ctx.k.spawned.iter().any(|p| p.vpid == v)))
 			&& !matches!(st, Some(crate::bash::vm::ProcState::Exited(_)))
 	});
 	match u32::try_from(pid) {

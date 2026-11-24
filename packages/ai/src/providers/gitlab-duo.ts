@@ -129,6 +129,25 @@ function directAccessAtWire(
 	return Object.assign(authorized, base.preconnect ? { preconnect: base.preconnect } : {});
 }
 
+/**
+ * The model a GitLab Duo request on `model` goes out as: the model of the API its route names, under the upstream id
+ * the alias stands for, at the AI Gateway proxy; undefined for an id with no identity or route.
+ */
+export function gitLabDuoUpstreamModel(model: Model<Api>): Model<Api> | undefined {
+	const identity = resolveGitLabDuoModelIdentity(model.id);
+	const api = apiRouteFor("gitlab-duo", model.id)?.api;
+	if (!identity || (api !== "anthropic-messages" && api !== "openai-responses" && api !== "openai-completions")) {
+		return undefined;
+	}
+	return buildModel({
+		...model,
+		id: identity.upstreamModelId,
+		api,
+		baseUrl: api === "anthropic-messages" ? ANTHROPIC_PROXY_URL : OPENAI_PROXY_URL,
+		compat: model.compatConfig,
+	} as ModelSpec<typeof api>);
+}
+
 export function streamGitLabDuo(
 	model: Model<Api>,
 	context: Context,
@@ -146,16 +165,11 @@ export function streamGitLabDuo(
 				);
 			}
 
-			const identity = resolveGitLabDuoModelIdentity(model.id);
-			if (!identity) {
+			if (!resolveGitLabDuoModelIdentity(model.id)) {
 				throw new AIError.ConfigurationError(`Unsupported GitLab Duo model: ${model.id}`);
 			}
-			const route = apiRouteFor("gitlab-duo", model.id);
-			if (
-				route?.api !== "anthropic-messages" &&
-				route?.api !== "openai-responses" &&
-				route?.api !== "openai-completions"
-			) {
+			const upstreamModel = gitLabDuoUpstreamModel(model);
+			if (!upstreamModel) {
 				throw new AIError.ConfigurationError(`Missing GitLab Duo API route for model: ${model.id}`);
 			}
 
@@ -179,19 +193,70 @@ export function streamGitLabDuo(
 				options.disableReasoning || options.forceReasoningOff ? undefined : options.reasoning;
 
 			const inner =
-				route.api === "anthropic-messages"
-					? streamAnthropic(
-							buildModel({
-								...model,
-								id: identity.upstreamModelId,
-								api: "anthropic-messages",
-								baseUrl: ANTHROPIC_PROXY_URL,
-								compat: model.compatConfig,
-							} as ModelSpec<"anthropic-messages">),
-							context,
-							{
+				upstreamModel.api === "anthropic-messages"
+					? streamAnthropic(upstreamModel as Model<"anthropic-messages">, context, {
+							apiKey: directAccess.token,
+							isOAuth: true,
+							temperature: options.temperature,
+							topP: options.topP,
+							topK: options.topK,
+							minP: options.minP,
+							presencePenalty: options.presencePenalty,
+							repetitionPenalty: options.repetitionPenalty,
+							maxTokens: options.maxTokens ?? model.maxTokens ?? undefined,
+							signal: options.signal,
+							cacheRetention: options.cacheRetention,
+							headers,
+							maxRetryDelayMs: options.maxRetryDelayMs,
+							metadata: options.metadata,
+							sessionId: options.sessionId,
+							parentSessionId: options.parentSessionId,
+							promptCacheKey: options.promptCacheKey,
+							providerSessionState: options.providerSessionState,
+							onPayload: options.onPayload,
+							onResponse: options.onResponse,
+							onSseEvent: options.onSseEvent,
+							fetch: wireFetch,
+							thinkingEnabled: Boolean(anthropicReasoningEffort) && model.reasoning,
+							thinkingBudgetTokens: anthropicReasoningEffort
+								? (options.thinkingBudgets?.[anthropicReasoningEffort] ??
+									ANTHROPIC_THINKING[anthropicReasoningEffort])
+								: undefined,
+							reasoning: anthropicReasoningEffort,
+							toolChoice: mapAnthropicToolChoice(options.toolChoice),
+							waitForTerminalDrain: options.waitForTerminalDrain,
+						})
+					: upstreamModel.api === "openai-responses"
+						? streamOpenAIResponses(upstreamModel as Model<"openai-responses">, context, {
 								apiKey: directAccess.token,
-								isOAuth: true,
+								temperature: options.temperature,
+								topP: options.topP,
+								topK: options.topK,
+								minP: options.minP,
+								presencePenalty: options.presencePenalty,
+								repetitionPenalty: options.repetitionPenalty,
+								maxTokens: options.maxTokens ?? model.maxTokens ?? undefined,
+								signal: options.signal,
+								cacheRetention: options.cacheRetention,
+								headers,
+								maxRetryDelayMs: options.maxRetryDelayMs,
+								metadata: options.metadata,
+								sessionId: options.sessionId,
+								parentSessionId: options.parentSessionId,
+								promptCacheKey: options.promptCacheKey,
+								statefulResponses: options.statefulResponses,
+								providerSessionState: options.providerSessionState,
+								onPayload: options.onPayload,
+								onResponse: options.onResponse,
+								onSseEvent: options.onSseEvent,
+								fetch: wireFetch,
+								reasoning: reasoningEffort,
+								disableReasoning: options.disableReasoning,
+								forceReasoningOff: options.forceReasoningOff,
+								toolChoice: options.toolChoice,
+							} satisfies OpenAIResponsesOptions)
+						: streamOpenAICompletions(upstreamModel as Model<"openai-completions">, context, {
+								apiKey: directAccess.token,
 								temperature: options.temperature,
 								topP: options.topP,
 								topK: options.topK,
@@ -212,94 +277,13 @@ export function streamGitLabDuo(
 								onResponse: options.onResponse,
 								onSseEvent: options.onSseEvent,
 								fetch: wireFetch,
-								thinkingEnabled: Boolean(anthropicReasoningEffort) && model.reasoning,
-								thinkingBudgetTokens: anthropicReasoningEffort
-									? (options.thinkingBudgets?.[anthropicReasoningEffort] ??
-										ANTHROPIC_THINKING[anthropicReasoningEffort])
-									: undefined,
-								reasoning: anthropicReasoningEffort,
-								toolChoice: mapAnthropicToolChoice(options.toolChoice),
+								reasoning: reasoningEffort,
+								// OpenAICompletionsOptions carries no forceReasoningOff; fold it
+								// like the azure-openai-responses mapping does.
+								disableReasoning: options.disableReasoning || options.forceReasoningOff,
+								toolChoice: options.toolChoice,
 								waitForTerminalDrain: options.waitForTerminalDrain,
-							},
-						)
-					: route.api === "openai-responses"
-						? streamOpenAIResponses(
-								buildModel({
-									...model,
-									id: identity.upstreamModelId,
-									api: "openai-responses",
-									baseUrl: OPENAI_PROXY_URL,
-									compat: model.compatConfig,
-								} as ModelSpec<"openai-responses">),
-								context,
-								{
-									apiKey: directAccess.token,
-									temperature: options.temperature,
-									topP: options.topP,
-									topK: options.topK,
-									minP: options.minP,
-									presencePenalty: options.presencePenalty,
-									repetitionPenalty: options.repetitionPenalty,
-									maxTokens: options.maxTokens ?? model.maxTokens ?? undefined,
-									signal: options.signal,
-									cacheRetention: options.cacheRetention,
-									headers,
-									maxRetryDelayMs: options.maxRetryDelayMs,
-									metadata: options.metadata,
-									sessionId: options.sessionId,
-									parentSessionId: options.parentSessionId,
-									promptCacheKey: options.promptCacheKey,
-									statefulResponses: options.statefulResponses,
-									providerSessionState: options.providerSessionState,
-									onPayload: options.onPayload,
-									onResponse: options.onResponse,
-									onSseEvent: options.onSseEvent,
-									fetch: wireFetch,
-									reasoning: reasoningEffort,
-									disableReasoning: options.disableReasoning,
-									forceReasoningOff: options.forceReasoningOff,
-									toolChoice: options.toolChoice,
-								} satisfies OpenAIResponsesOptions,
-							)
-						: streamOpenAICompletions(
-								buildModel({
-									...model,
-									id: identity.upstreamModelId,
-									api: "openai-completions",
-									baseUrl: OPENAI_PROXY_URL,
-									compat: model.compatConfig,
-								} as ModelSpec<"openai-completions">),
-								context,
-								{
-									apiKey: directAccess.token,
-									temperature: options.temperature,
-									topP: options.topP,
-									topK: options.topK,
-									minP: options.minP,
-									presencePenalty: options.presencePenalty,
-									repetitionPenalty: options.repetitionPenalty,
-									maxTokens: options.maxTokens ?? model.maxTokens ?? undefined,
-									signal: options.signal,
-									cacheRetention: options.cacheRetention,
-									headers,
-									maxRetryDelayMs: options.maxRetryDelayMs,
-									metadata: options.metadata,
-									sessionId: options.sessionId,
-									parentSessionId: options.parentSessionId,
-									promptCacheKey: options.promptCacheKey,
-									providerSessionState: options.providerSessionState,
-									onPayload: options.onPayload,
-									onResponse: options.onResponse,
-									onSseEvent: options.onSseEvent,
-									fetch: wireFetch,
-									reasoning: reasoningEffort,
-									// OpenAICompletionsOptions carries no forceReasoningOff; fold it
-									// like the azure-openai-responses mapping does.
-									disableReasoning: options.disableReasoning || options.forceReasoningOff,
-									toolChoice: options.toolChoice,
-									waitForTerminalDrain: options.waitForTerminalDrain,
-								} satisfies OpenAICompletionsOptions,
-							);
+							} satisfies OpenAICompletionsOptions);
 
 			for await (const event of inner) {
 				stream.push(event);

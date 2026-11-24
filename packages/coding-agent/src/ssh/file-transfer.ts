@@ -23,6 +23,17 @@ const DIRECTORY_MAX_BYTES = 1024 * 1024;
 const REMOTE_FILE_TYPES = new Set<string>(Object.values(ShellFsFileType));
 
 /**
+ * Each transfer's ssh runs in a process group of its own on POSIX, so an
+ * abort holds and reads that tree before it signals it, and waits until the
+ * whole group is gone (`Process.terminate` with `group`): a process the
+ * command forks while the tree is read no longer outlives the abort. A
+ * group of its own also means a session of its own, with no controlling
+ * terminal; these ssh calls run with `BatchMode=yes`, so none ever asks for
+ * a password there. Windows has no process groups.
+ */
+const TRANSFER_SPAWN = { detached: process.platform !== "win32" } as const;
+
+/**
  * Ensure the ControlMaster connection and pick the verified POSIX shell to
  * run transfer commands under. Returns the shell name so the caller can
  * wrap its snippet in `<shell> -c '…'`; OpenSSH otherwise hands the command
@@ -81,6 +92,7 @@ export async function remoteHomeDirectory(
 	const shell = await ensurePosixRemote(target);
 	const args = await buildRemoteCommand(target, wrapInPosixShell(shell, `printf '%s' "$HOME"`));
 	using child = ptree.spawn(["ssh", ...args], {
+		...TRANSFER_SPAWN,
 		signal: ptree.combineSignals(opts.signal, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
 	});
 	const home = new TextDecoder("utf-8", { fatal: true }).decode(await child.bytes());
@@ -117,6 +129,7 @@ export async function readRemoteFile(
 		`if [ ! -e ${p} ] && [ ! -L ${p} ]; then exit ${REMOTE_MISSING_EXIT}; fi; exit $s; }`;
 	const args = await buildRemoteCommand(target, wrapInPosixShell(shell, command));
 	using child = ptree.spawn(["ssh", ...args], {
+		...TRANSFER_SPAWN,
 		signal: ptree.combineSignals(opts.signal, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
 	});
 	// Drain stdout before awaiting exit so a full pipe can't deadlock the child.
@@ -190,6 +203,7 @@ export async function writeRemoteFile(
 		`}`;
 	const args = await buildRemoteCommand(target, wrapInPosixShell(shell, command), { allowStdin: true });
 	using child = ptree.spawn(["ssh", ...args], {
+		...TRANSFER_SPAWN,
 		stdin: content,
 		signal: ptree.combineSignals(opts.signal, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
 	});
@@ -213,6 +227,7 @@ export async function statRemotePath(
 	const command = `if [ -d ${p} ]; then echo directory; elif [ -f ${p} ]; then echo file; elif [ -e ${p} ]; then echo other; else echo missing; fi`;
 	const args = await buildRemoteCommand(target, wrapInPosixShell(shell, command));
 	using child = ptree.spawn(["ssh", ...args], {
+		...TRANSFER_SPAWN,
 		signal: ptree.combineSignals(opts.signal, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
 	});
 	const out = new TextDecoder().decode(await child.bytes()).trim();
@@ -245,6 +260,7 @@ export async function listRemoteDir(
 		`LC_ALL=C find . ! -name . -prune -exec ${shell} -c ${quotePosixArgument(classify)} ${shell} {} +`;
 	const args = await buildRemoteCommand(target, wrapInPosixShell(shell, command));
 	using child = ptree.spawn(["ssh", ...args], {
+		...TRANSFER_SPAWN,
 		signal: ptree.combineSignals(opts.signal, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
 	});
 	const buffer = new ConcatSink();

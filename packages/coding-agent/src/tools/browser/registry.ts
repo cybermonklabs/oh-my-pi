@@ -357,7 +357,8 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		try {
 			await waitForCdp(cdpUrl, 30_000, opts.signal);
 		} catch (err) {
-			await gracefulKillTreeOnce(child.pid).catch(() => undefined);
+			// Only while the app has not exited: an exited app's pid may be another process's now.
+			if (child.exitCode === null) await gracefulKillTreeOnce(child.pid).catch(() => undefined);
 			if (err instanceof ToolAbortError) throw err;
 			if (err instanceof Error && err.name === "AbortError") throw err;
 			throw new ToolError(`Failed to attach to ${path.basename(exe)} on ${cdpUrl}: ${(err as Error).message}`);
@@ -373,7 +374,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		});
 	} catch (err) {
-		if (subprocess) await gracefulKillTreeOnce(subprocess.pid);
+		if (subprocess && subprocess.exitCode === null) await gracefulKillTreeOnce(subprocess.pid);
 		throw new ToolError(`Connected to ${cdpUrl} but puppeteer.connect failed: ${(err as Error).message}`);
 	}
 	return {

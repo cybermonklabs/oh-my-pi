@@ -27,7 +27,8 @@ pub struct CompleteCommand {
 	/// The commands: node `root` (a `List`) of `tree`.
 	pub tree:                 crate::bash::syntax::tree::Tree,
 	pub root:                 crate::bash::syntax::tree::Id<crate::bash::syntax::tree::shape::List>,
-	/// Number of [`NodeId`]s assigned in this unit (ids are `0..node_count`).
+	/// Number of [`NodeId`](crate::bash::syntax::NodeId)s assigned in this unit
+	/// (ids are `0..node_count`).
 	pub node_count:           u32,
 	/// Alias substitutions applied while parsing, in order; replaying them
 	/// reproduces the same tree and ids.

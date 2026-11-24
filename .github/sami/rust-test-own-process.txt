@@ -1,0 +1,10 @@
+# Tests the rust_test job in .github/workflows/sami-rust-test.yml runs in a process
+# of their own, after the other tests: the main invocation passes each to every
+# test binary as `--skip <name>`, and a later invocation runs the named target
+# with `--exact <name>`. The job fails unless each name matches exactly one
+# test, in the named target, which did not run in the main invocation, and its
+# own invocation reports and runs exactly that test (not #[ignore]d). It still
+# fails, like any other test, when that test fails.
+# One per line: <bazel test target> <libtest test path>  <why>.
+//crates/pi-builtins:pi-builtins_test rsync::conformance::local_transfers_match_reference  compares 150 local transfers with rsync 3.5.1's; beside the crate's other tests in one process, 3 scenarios differed (runs 44803069963 and 44807499064)
+//crates/pi-shell:pi-shell_test sys::relay::tests::held_bytes_are_flushed_before_the_next_command  beside the binary's other tests under gVisor and load, a forked child holds the relay's pipe past its 50 ms hold grace and the next command's output overtakes the held bytes (7 of 38 runs; 0 of 32 alone); temporary: the relay fix, PR #78, removes this line once a release carries it

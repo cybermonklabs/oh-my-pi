@@ -95,6 +95,15 @@ pub struct Vproc {
 	/// nested shell). A field, not an image record: a record would cost
 	/// every subshell a ~530-byte map allocation (idle vproc ≤ 2 KiB).
 	pub subshell:      u32,
+	/// Loops of the shell that forked this vproc that its code runs inside
+	/// (bash's inherited `loop_level`, zsh's `loops`), set by
+	/// [`super::exec::fork_loops`]: a `break` or `continue` that reaches
+	/// past this vproc's own loops ends the vproc, as the end of its code
+	/// would. Zero for the shell itself and for a fork bash runs through
+	/// `execute_in_subshell`, which zeroes the level. A `u16` (saturating
+	/// past 65,535 loops) that shares `trap_frames`'s former 4 bytes, so
+	/// `Vproc` keeps its size.
+	pub outer_loops:   u16,
 	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
@@ -112,8 +121,14 @@ pub struct Vproc {
 	/// the per-op checks (cancellation, `BASH_COMMAND`, a trap inside its
 	/// own action) skip their frame scans. Kept by
 	/// [`super::exec::push_script`], [`super::exec::pop_frame`] and the
-	/// frame restore; never serialized (recounted from the frames).
-	pub trap_frames:   u32,
+	/// frame restore; never serialized (recounted from the frames). A trap
+	/// never runs inside its own action, so they nest at most once per trap
+	/// kind, far below `u16::MAX`.
+	pub trap_frames:   u16,
+	/// A `break` or `continue` run inside `${ }` or `${| }` that no loop
+	/// has taken yet (bash's `breaking` or `continuing`); boxed, as it is
+	/// rare and an idle vproc pays 8 B for it.
+	pub pending_break: Option<Box<PendingBreak>>,
 	/// Current mode: the emulation its code runs under, set by
 	/// `emulate`, a mode-switching function call (restored on return) and
 	/// a run's explicit mode; inherited by children. The root's is written
@@ -127,6 +142,43 @@ pub struct Vproc {
 	/// Inherited (copied) by children; never serialized: a restored shell
 	/// starts with zsh's defaults and no line in progress.
 	pub zle:           Option<Box<super::zle::Zle>>,
+}
+
+/// A `break` or `continue` that ran inside `${ }` or `${| }`
+/// ([`Vproc::pending_break`]). bash's `break` only sets `breaking`: the
+/// substitution's body ends there, later substitutions of its command run
+/// nothing, the command itself runs, and the next loop out takes the
+/// levels left ([`super::exec`]'s `pending_break`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingBreak {
+	/// Loop levels left.
+	pub levels: u32,
+	/// `continue` instead of `break`.
+	pub cont:   bool,
+	/// The frame count of the command holding the substitution. A deeper
+	/// frame is one that command entered: its `$(< file)` frame runs on;
+	/// a function, `eval` or `.` runs none of its commands.
+	pub depth:  u32,
+	/// The frame count of the command whose redirections were being expanded
+	/// when the `break` ran (0: not in a redirection). bash expands the
+	/// redirections of a program it runs (an external, a command it cannot
+	/// find) in the forked child, so the break is lost with that child: it is
+	/// dropped once that command's name resolves to one ([`super::command`]'s
+	/// `drop_childs_break`).
+	pub redir:  u32,
+}
+
+/// `extdebug`: the stages of the `Spawn` at frame `frame` of vproc `vproc`
+/// whose DEBUG trap, run in the shell before the fork, failed (their
+/// entries): bash forks no process for such a stage. Moved to the job's
+/// vproc when the pipeline is a background job's. Kept by the kernel
+/// ([`super::Kernel::debug_skips`]), not the vproc or frame (each at its
+/// idle-size bound), and only while a skip waits for its `Spawn`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugSkip {
+	pub vproc:   Vpid,
+	pub frame:   u32,
+	pub entries: Vec<u32>,
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's
@@ -372,6 +424,32 @@ pub struct JobTable {
 	/// it without job control and with an empty job table. A command
 	/// substitution keeps both (it lists its parent's jobs).
 	pub subshell: bool,
+	/// The statuses of background jobs that left the table (bash's bgp
+	/// list: `delete_job`'s `bgp_add`), oldest first, at most [`BGP_MAX`]:
+	/// `wait PID` finds one once its job left the table. The root's is in
+	/// the store too ([`crate::bash::store::Key::BgPid`]). Boxed and `None`
+	/// while empty: one pointer per idle vproc.
+	#[expect(clippy::box_collection, reason = "one pointer per idle vproc; a `VecDeque` is four")]
+	pub bgp:      Option<Box<VecDeque<SavedStatus>>>,
+}
+
+/// How many statuses [`JobTable::bgp`] keeps: bash's `MAX_CHILD_MAX`, the
+/// most `js.c_childmax` takes. Past it the oldest kept goes, as bash's
+/// circular `bgpids.storage` overwrites its oldest cell.
+pub const BGP_MAX: usize = 32_768;
+
+/// A status kept for a job that left the table ([`JobTable::bgp`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedStatus {
+	/// The child vproc.
+	pub vpid:   Vpid,
+	/// The pid `$!` and `jobs -p` showed for it ([`Job::pid`]).
+	pub pid:    u32,
+	/// How it ended (128 plus the signal's number for one a signal killed).
+	pub status: i32,
+	/// Its place in the list: kept later than every smaller one (a store
+	/// image keeps the order by it).
+	pub seq:    u64,
 }
 
 /// What a job spec names (bash `get_job_spec`), without its `%`.
@@ -473,6 +551,70 @@ impl JobTable {
 		if reset {
 			self.reset_current();
 		}
+	}
+
+	/// The status kept for child `vpid` (bash `bgp_search`).
+	pub fn bgp_search(&self, vpid: Vpid) -> Option<i32> {
+		self.bgp_saved(vpid).map(|s| s.status)
+	}
+
+	/// The entry kept for child `vpid`, the latest.
+	pub fn bgp_saved(&self, vpid: Vpid) -> Option<&SavedStatus> {
+		self
+			.bgp
+			.iter()
+			.flat_map(|list| list.iter().rev())
+			.find(|s| s.vpid == vpid)
+	}
+
+	/// The child whose kept status `pid` names (its shown pid or vpid).
+	pub fn bgp_named(&self, pid: u32) -> Option<Vpid> {
+		self
+			.bgp
+			.iter()
+			.flat_map(|list| list.iter().rev())
+			.find(|s| s.pid == pid || s.vpid.0 == pid)
+			.map(|s| s.vpid)
+	}
+
+	/// Keep `status` for child `vpid`, shown as `pid` (bash `bgp_add`), as
+	/// the latest, in place of one kept for the same child; past
+	/// [`BGP_MAX`] the oldest goes. The entry kept, and the one gone.
+	pub fn bgp_add(
+		&mut self,
+		vpid: Vpid,
+		pid: u32,
+		status: i32,
+	) -> (SavedStatus, Option<SavedStatus>) {
+		let list = self.bgp.get_or_insert_with(Box::default);
+		if let Some(i) = list.iter().position(|s| s.vpid == vpid) {
+			list.remove(i);
+		}
+		let seq = list.back().map_or(0, |s| s.seq + 1);
+		let saved = SavedStatus { vpid, pid, status, seq };
+		list.push_back(saved);
+		let gone = if list.len() > BGP_MAX {
+			list.pop_front()
+		} else {
+			None
+		};
+		(saved, gone)
+	}
+
+	/// Forget the status kept for child `vpid` (bash `bgp_delete`).
+	pub fn bgp_delete(&mut self, vpid: Vpid) -> Option<SavedStatus> {
+		let list = self.bgp.as_mut()?;
+		let i = list.iter().position(|s| s.vpid == vpid)?;
+		let gone = list.remove(i);
+		if list.is_empty() {
+			self.bgp = None;
+		}
+		gone
+	}
+
+	/// Forget every status kept (bash `bgp_clear`), returned.
+	pub fn bgp_clear(&mut self) -> VecDeque<SavedStatus> {
+		self.bgp.take().map_or_else(VecDeque::new, |list| *list)
 	}
 
 	fn state(&self, number: Option<u32>) -> Option<JobState> {
@@ -651,13 +793,20 @@ impl LastBg {
 }
 
 /// A background job whose pid is still to be settled, kept by the kernel
-/// ([`super::Kernel::bangs`]) for the vproc that may settle it. The first
-/// command that vproc dispatches decides: the external spawned as the job's
-/// lone command (or `exec`'d, or a pipeline's last stage's) makes the job
-/// known by that program's OS pid ([`Job::os_pid`], `$!`); anything else
-/// (a builtin, a native task, a subshell, a non-`exec` external in a
-/// compound body, the vproc's end) leaves its virtual pid. Readers of the
-/// pid (`$!`, `jobs -l`/`-p`/`-x`) wait for the decision.
+/// ([`super::Kernel::bangs`]) for the vproc that may settle it. The
+/// external spawned as the job's lone command (or `exec`'d, or a
+/// pipeline's last stage's) makes the job known by that program's OS pid
+/// ([`Job::os_pid`], `$!`). Another program (or callout) the job runs,
+/// also in a command substitution, subshell or pipeline stage of its own
+/// ([`super::Kernel::bang_kin`]), keeps its virtual pid: the job waits for
+/// it, and it may wait for the shell. Builtins, loops, command
+/// substitutions and subshells decide nothing, as bash's forked child may
+/// still `exec` its program after them. The job keeps its virtual pid when
+/// it ends, when a redirection or `.` would wait on a FIFO or pipe, or
+/// once it would make a reader of the pid (`$!`, `jobs -l`/`-p`/`-x`), who
+/// waits for the decision, wait: it is stopped or waits for something
+/// outside itself, or has run a scheduler slice since the reader parked
+/// (`Shell::decide_waited_bangs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bang {
 	/// The vproc that decides: the job's own, or the subshell a callout of
@@ -718,22 +867,26 @@ pub enum BusySpawn {
 
 impl Vproc {
 	/// The vproc a pid operand (`kill`, `wait`, `disown`) names here: a
-	/// job's or `$!`'s OS pid maps to its vproc; any other number is taken
-	/// as a virtual pid.
+	/// job's, `$!`'s or a kept status's ([`JobTable::bgp`]) OS pid maps to
+	/// its vproc; any other number is taken as a virtual pid.
 	pub fn vpid_of(&self, pid: u32) -> Vpid {
 		match self.jobs.by_pid(pid) {
 			Some(job) => job.vpid,
-			None => self.last_bg.named_by(pid).unwrap_or(Vpid(pid)),
+			None => self
+				.last_bg
+				.named_by(pid)
+				.or_else(|| self.jobs.bgp_named(pid))
+				.unwrap_or(Vpid(pid)),
 		}
 	}
 
-	/// The pid the user knows the child `v` by (`wait -p`): its job's or
-	/// `$!`'s OS pid, else its virtual pid.
+	/// The pid the user knows the child `v` by (`wait -p`): its job's,
+	/// `$!`'s or its kept status's OS pid, else its virtual pid.
 	pub fn shown_pid(&self, v: Vpid) -> u32 {
 		match self.jobs.by_vpid(v) {
 			Some(job) => job.pid(),
 			None if self.last_bg.is(v) => self.last_bg.os().unwrap_or(v.0),
-			None => v.0,
+			None => self.jobs.bgp_saved(v).map_or(v.0, |s| s.pid),
 		}
 	}
 }
@@ -742,7 +895,8 @@ impl Vproc {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BangStage {
 	/// The job's body is one simple command: its external is the program
-	/// (bash's subshell `exec`s it).
+	/// (bash's subshell `exec`s it). `eval`, `.` and `source` as that
+	/// command run their text at this stage.
 	Lone,
 	/// Only an `exec`'d external is (`{ exec cmd; } &`, a function called
 	/// as the lone command).
@@ -787,17 +941,44 @@ impl Vproc {
 	}
 
 	/// Bash defers trapped signals while waiting for a foreground command.
+	/// Not between the commands of a `${ ;}` or `${| ;}` body that bash runs
+	/// in the shell itself (in a simple command's words, a compound
+	/// command's own redirection): bash runs a pending trap as each command
+	/// there ends (`run_pending_traps`), before a later `break` can leave the
+	/// trap nothing to run. bash expands a program's redirections, and a
+	/// `( … )`'s, in its forked child, so a trap set off there waits for
+	/// that child; this shell expands a simple command's redirections before
+	/// its name resolves, so it holds a trap from them back whatever the
+	/// name runs.
 	pub fn waiting_foreground(&self) -> bool {
-		self.frames.iter().any(|frame| {
-			frame.scratch.as_ref().is_some_and(|scratch| {
-				!scratch.children.is_empty()
-					|| scratch.sub.is_some()
-					|| matches!(
-						scratch.exec.as_ref().and_then(|exec| exec.waiting),
-						Some(Awaited::Call(_) | Awaited::Task(_) | Awaited::Ext { .. })
-					)
+		self
+			.frames
+			.last()
+			.is_some_and(super::exec::redirected_subshell_starts)
+			|| self.frames.iter().enumerate().any(|(i, frame)| {
+				frame.scratch.as_ref().is_some_and(|scratch| {
+					!scratch.children.is_empty()
+						|| match scratch.sub {
+							Some(PendingSub::NoFork { .. }) => {
+								!self
+									.frames
+									.get(i + 1)
+									.is_some_and(|above| above.kind == FrameKind::NoFork)
+									|| scratch
+										.exec
+										.as_deref()
+										.is_some_and(|exec| exec.stage == Stage::Redirect)
+									|| super::exec::subshell_redirection(frame)
+							},
+							Some(_) => true,
+							None => false,
+						}
+						|| matches!(
+							scratch.exec.as_ref().and_then(|exec| exec.waiting),
+							Some(Awaited::Call(_) | Awaited::Task(_) | Awaited::Ext { .. })
+						)
+				})
 			})
-		})
 	}
 }
 
@@ -835,6 +1016,10 @@ pub struct Run {
 	pub too_long_to_host:  bool,
 	/// [`Script::refusals_to_host`](super::Script::refusals_to_host).
 	pub refusals_to_host:  bool,
+	/// A host callout's subshell runs it (`nohup`, `timeout`, `xargs`,
+	/// `find -exec`): it stands for the external program the callout runs,
+	/// so its frame runs no DEBUG trap ([`FrameFlags::no_debug_trap`]).
+	pub callout:           bool,
 }
 
 /// What kind of activation a frame is.
@@ -876,6 +1061,16 @@ pub enum FrameKind {
 	/// The last stage of a pipeline run in the current shell (`lastpipe`):
 	/// `SubExit` pops, and the `Spawn` op collects its status.
 	Stage,
+	/// The body of a bash `$(< file)` run in the current shell (bash
+	/// `optimize_cat_file`): its `< file` reads the file into `capture`,
+	/// the substitution's own buffer, and leaves the shell's fds alone;
+	/// `SubExit` pops.
+	Cat {
+		/// The substitution's buffer. The frames image keeps it by its memory
+		/// object (`FrameImage::capture`), not here.
+		#[serde(skip)]
+		capture: crate::bash::mem::Capture,
+	},
 	/// The base frame of a job the shell suspended
 	/// ([`super::jobctl::suspend`]): a subshell frame that also ends its
 	/// vproc when its pc reaches `stop_at` (the end of the top-level
@@ -931,6 +1126,11 @@ pub enum ScriptKind {
 		/// An ERR trap run by `set -e`: the shell exits with `status` when
 		/// the trap ends.
 		exit:          bool,
+		/// zsh: the `TRAPNAL` function this frame called ended by `return`
+		/// (zsh's `trapreturn`). Only such a non-zero status ends the
+		/// interrupted code; a function that falls off its end with one
+		/// does not.
+		returned:      bool,
 	},
 	/// Shell code a builtin runs as zsh's `execode`/`execstring` do with
 	/// a context name (`zstyle -e` values, `zregexparse` guards and
@@ -976,6 +1176,56 @@ impl FrameKind {
 	}
 }
 
+/// Bits of a [`Frame`] that only a vproc's base frame or a run's first frame
+/// sets, two in one byte ([`Frame::flags`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameFlags(u8);
+
+impl FrameFlags {
+	const COMMAND_LOOP: u8 = 1;
+	const NO_DEBUG_TRAP: u8 = 2;
+
+	/// The base frame of a fork: a fatal error in it, run as a forked
+	/// simple command, reaches bash's command loop when its forking
+	/// shell's would have when it forked (bash's fork copies `top_level`).
+	/// Set from [`super::exec::fatal_reaches_command_loop`] of the forking
+	/// shell and read there.
+	#[must_use]
+	pub const fn command_loop(self) -> bool {
+		self.0 & Self::COMMAND_LOOP != 0
+	}
+
+	/// The base frame of a vproc that runs no DEBUG trap and keeps
+	/// `BASH_COMMAND`: a command or process substitution (bash's or zsh's) a
+	/// DEBUG trap action started (or one such substitution started), as
+	/// bash's and zsh's, so a trap that substitutes does not run itself again
+	/// without end (a subshell it starts runs the trap again, as bash's
+	/// does); and a host callout's subshell ([`Run::callout`]), which stands
+	/// for an external program.
+	#[must_use]
+	pub const fn no_debug_trap(self) -> bool {
+		self.0 & Self::NO_DEBUG_TRAP != 0
+	}
+
+	/// Sets [`Self::command_loop`].
+	pub const fn set_command_loop(&mut self, on: bool) {
+		self.set(Self::COMMAND_LOOP, on);
+	}
+
+	/// Sets [`Self::no_debug_trap`].
+	pub const fn set_no_debug_trap(&mut self, on: bool) {
+		self.set(Self::NO_DEBUG_TRAP, on);
+	}
+
+	const fn set(&mut self, bit: u8, on: bool) {
+		if on {
+			self.0 |= bit;
+		} else {
+			self.0 &= !bit;
+		}
+	}
+}
+
 /// One activation: a unit, a pc and its loop, case, time and redirection
 /// stacks.
 pub struct Frame {
@@ -998,7 +1248,8 @@ pub struct Frame {
 	/// command substitution by re-parsing its text from the line of the
 	/// command that runs it, so its first command reports that line.
 	pub line_shift:        u32,
-	/// Exec op whose DEBUG trap has already run.
+	/// Exec op whose DEBUG trap has already run (for a `Spawn`, see
+	/// [`super::exec::SPAWN_DEBUG`]).
 	pub debug_pc:          Option<u32>,
 	/// Pseudo-traps installed in this function rather than inherited.
 	pub debug_trap_local:  bool,
@@ -1017,6 +1268,10 @@ pub struct Frame {
 	/// `set -e` is ignored: an `if`/`while`/`until` condition, a `&&`/`||`
 	/// list except its last command, a `!` pipeline.
 	pub ignore_errexit:    bool,
+	/// Bits of a base frame ([`FrameFlags`]). One byte: it takes the padding
+	/// byte after `Frame`'s fields smaller than 8 B (two `u32`s, two
+	/// `Option<u32>`s and seven `bool`s: 31 B), so `Frame` keeps its size.
+	pub flags:             FrameFlags,
 	/// The base frame of a `( … )` child: the line bash reports for errors
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
@@ -1050,6 +1305,7 @@ impl Frame {
 			debug_errexit: false,
 			err_reported: false,
 			ignore_errexit: false,
+			flags: FrameFlags(0),
 			subshell_line: None,
 			getopts: None,
 		}
@@ -1605,6 +1861,10 @@ pub struct ExecState {
 	pub resume:      bool,
 	/// Times the builtin ran again after a frame it pushed returned.
 	pub resumed:     u32,
+	/// A forked pipeline element's builtin or function was put one
+	/// subshell level down ([`super::exec::raise_element_level`]), once.
+	#[serde(default)]
+	pub raised:      bool,
 }
 
 /// Options of `exec [-cl] [-a name] command`.
@@ -1829,8 +2089,13 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B.
-const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
+// that to at most 1,840 B. The forking shell's loop count
+// (`Vproc::outer_loops`) is a `u16` beside a `u16` `Vproc::trap_frames`,
+// in the 4 bytes `trap_frames` had; a `break` waiting in `${ }`
+// (`Vproc::pending_break`, boxed, 8 B) brings it to at most 1,848 B, and
+// bash's kept statuses (`JobTable::bgp`, one pointer, `None` while empty)
+// to at most 1,856 B.
+const _: () = assert!(size_of::<Vproc>() <= 688, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
@@ -1852,4 +2117,33 @@ pub const fn vproc_layout() -> [(&'static str, usize); 5] {
 		("ScratchIo", size_of::<ScratchIo>()),
 		("ExecState", size_of::<ExecState>()),
 	]
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{BGP_MAX, JobTable};
+	use crate::bash::ids::Vpid;
+
+	// Failure mode: past `BGP_MAX` the status of the smallest vproc number
+	// went, not the oldest kept (bash's circular `bgpids.storage` overwrites
+	// its oldest cell).
+	#[test]
+	fn the_oldest_kept_status_goes_first() {
+		let mut jobs = JobTable::default();
+		// Kept largest vproc first: the oldest kept has the largest number.
+		let top = u32::try_from(BGP_MAX).expect("BGP_MAX fits u32") + 100;
+		for n in 0..u32::try_from(BGP_MAX).expect("BGP_MAX fits u32") {
+			assert_eq!(jobs.bgp_add(Vpid(top - n), top - n, 1).1, None);
+		}
+		let (_, gone) = jobs.bgp_add(Vpid(1), 1, 2);
+		assert_eq!(gone.map(|s| s.vpid), Some(Vpid(top)), "the oldest kept goes");
+		assert_eq!(jobs.bgp_search(Vpid(top)), None);
+		assert_eq!(jobs.bgp_search(Vpid(1)), Some(2));
+		// Kept again, a status is the latest: the next to go is the one after.
+		assert_eq!(jobs.bgp_add(Vpid(top - 1), top - 1, 3).1, None);
+		let (_, gone) = jobs.bgp_add(Vpid(2), 2, 4);
+		assert_eq!(gone.map(|s| s.vpid), Some(Vpid(top - 2)));
+		assert_eq!(jobs.bgp_search(Vpid(top - 1)), Some(3));
+		assert_eq!(jobs.bgp.as_ref().map_or(0, |list| list.len()), BGP_MAX);
+	}
 }

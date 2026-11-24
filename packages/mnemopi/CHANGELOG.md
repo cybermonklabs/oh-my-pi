@@ -5,10 +5,12 @@
 ### Added
 
 - `MnemopiOptions.beforeDispatch`, awaited before every remote completion and embedding attempt and handed to a custom completion function, and `RecallOptions.signal`, which cancels a recall's query embedding ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
+- Added `bankDbPathIn()` to `@oh-my-pi/pi-mnemopi/core/banks`: the database file a bank lives in under a data directory, as `BankManager` lays banks out, without creating the `banks` directory a `BankManager` creates
 
 ### Changed
 
 - When `OMP_CONFIG_ROOT` is set, mnemopi keeps its data, blobs, plugins and cost log under `<OMP_CONFIG_ROOT>/mnemopi` and never copies in the legacy `~/.hermes` triples database; downloaded models stay in the home directory
+- The default extraction prompt records an `instructions` item as who asked for what, when and why, not as a bare command
 
 ### Fixed
 

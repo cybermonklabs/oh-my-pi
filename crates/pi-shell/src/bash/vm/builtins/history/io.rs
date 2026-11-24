@@ -7,8 +7,8 @@
 //! once every step it needs has an answer. Each step is a
 //! [`Probe::Hist`] carrying its position in the sequence, so asking for the
 //! same operation twice (a lock retried after a sleep) is two probes.
-//! [`perform`] carries a step out through the pollable [`Fs`] and the host
-//! clock without blocking.
+//! [`perform`] carries a step out through the pollable [`Fs`](crate::bash::Fs)
+//! and the host clock without blocking.
 
 use std::{
 	io,

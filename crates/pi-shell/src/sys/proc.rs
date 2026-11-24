@@ -759,7 +759,7 @@ mod tests {
 			return;
 		}
 		// SAFETY: a handler for a signal only this process sends itself.
-		unsafe { libc::signal(libc::SIGUSR1, end_this_thread as libc::sighandler_t) };
+		unsafe { libc::signal(libc::SIGUSR1, end_this_thread as *const () as libc::sighandler_t) };
 		let me = std::process::id() as i32;
 		// SAFETY: plain syscall; the leader's thread id is the process id.
 		unsafe { libc::syscall(libc::SYS_tgkill, me, me, libc::SIGUSR1) };

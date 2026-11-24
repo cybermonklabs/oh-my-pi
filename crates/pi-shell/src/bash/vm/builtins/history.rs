@@ -7,7 +7,7 @@
 //!
 //! zsh's list ([`model`]) is driven by the reader through [`zsh`] (`hbegin`,
 //! history expansion, `hend`, the startup read and the exit save), its file
-//! is [`file`], its expansion [`bang`], its builtins [`zfc`].
+//! is [`file`](mod@file), its expansion [`bang`], its builtins [`zfc`].
 
 pub mod bang;
 pub mod bash;

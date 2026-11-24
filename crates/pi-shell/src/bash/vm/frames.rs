@@ -58,7 +58,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 32;
+pub const FRAMES_VERSION: u32 = 36;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -73,29 +73,44 @@ struct Header {
 
 #[derive(Serialize, Deserialize)]
 struct Image {
-	seq:       u64,
-	next_run:  u64,
-	next_call: u64,
-	next_cmd:  u64,
-	paused:    bool,
-	mask:      u64,
-	rr:        u32,
+	seq:         u64,
+	next_run:    u64,
+	next_call:   u64,
+	next_cmd:    u64,
+	paused:      bool,
+	mask:        u64,
+	rr:          u32,
 	/// The scheduler's unfinished slice (vproc, ops left).
-	slice:     Option<(Vpid, u32)>,
+	slice:       Option<(Vpid, u32)>,
 	/// The control's wake count (the `at` marks of blocked vprocs refer
 	/// to it).
-	wakes:     u64,
-	done:      Vec<(RunId, i32)>,
-	results:   Vec<(CallId, CallOutcome)>,
-	procs:     Vec<ProcImage>,
+	wakes:       u64,
+	done:        Vec<(RunId, i32)>,
+	results:     Vec<(CallId, CallOutcome)>,
+	procs:       Vec<ProcImage>,
 	/// Fd objects, referred to by index.
-	fd_objs:   Vec<FdObjImage>,
+	fd_objs:     Vec<FdObjImage>,
 	/// Engine memory objects, referred to by index.
-	mems:      Vec<MemImage>,
+	mems:        Vec<MemImage>,
 	/// Background jobs still deciding on their pid ([`Kernel::bangs`]).
-	bangs:     Vec<super::proc::Bang>,
+	bangs:       Vec<super::proc::Bang>,
 	/// Their commands' redirections still deciding ([`Kernel::deferrals`]).
-	deferrals: Vec<super::proc::Deferral>,
+	deferrals:   Vec<super::proc::Deferral>,
+	/// `extdebug` stages waiting to be skipped ([`Kernel::debug_skips`]).
+	debug_skips: Vec<super::proc::DebugSkip>,
+	/// The take-in's state ([`Kernel::exits_asked`], [`Kernel::exits_taken`],
+	/// `Shell::taking_in`, `Shell::fresh`): a builtin that asked stays
+	/// parked across a snapshot, so its ask and its answer go with it.
+	take_in:     TakeInImage,
+}
+
+/// The take-in's state, as the image keeps it ([`Image::take_in`]).
+#[derive(Serialize, Deserialize)]
+struct TakeInImage {
+	asked: Vec<Vpid>,
+	taken: Vec<Vpid>,
+	asks:  Vec<super::TakeIn>,
+	fresh: Vec<Vpid>,
 }
 
 /// One fd object.
@@ -259,6 +274,8 @@ struct ProcImage {
 	trace_base:    u32,
 	/// `$BASH_SUBSHELL`.
 	subshell:      u32,
+	/// The forking shell's loops it runs inside (`Vproc::outer_loops`).
+	outer_loops:   u16,
 	/// `BASH_COMMAND`: the unit (written to the store) and syntax node; a
 	/// trap action that runs after the restore still names the trapped
 	/// command.
@@ -267,6 +284,9 @@ struct ProcImage {
 	calls:         Vec<super::callstack::Call>,
 	/// The pseudo-signal traps the vproc set itself.
 	own_traps:     super::proc::OwnTraps,
+	/// A `break` from `${ }` or `${| }` waiting for its loop: its command
+	/// may be parked.
+	pending_break: Option<super::proc::PendingBreak>,
 	/// Current mode (the root's is also `MiscKey::Mode`).
 	mode:          ModeId,
 	/// zsh state (sticky emulation, frames' restores).
@@ -325,6 +345,7 @@ struct FrameImage {
 	scratch:           Option<ScratchImage>,
 	line_shift:        u32,
 	debug_pc:          Option<u32>,
+	no_debug_trap:     bool,
 	debug_trap_local:  bool,
 	err_trap_local:    bool,
 	return_trap_local: bool,
@@ -332,8 +353,11 @@ struct FrameImage {
 	debug_errexit:     bool,
 	err_reported:      bool,
 	ignore_errexit:    bool,
+	command_loop:      bool,
 	subshell_line:     Option<u32>,
 	getopts:           super::proc::GetoptsState,
+	/// A [`FrameKind::Cat`] frame's capture: its memory object.
+	capture:           Option<u32>,
 }
 
 /// A saved fd: the fd object it held.
@@ -564,6 +588,7 @@ impl Shell {
 					scratch,
 					line_shift: f.line_shift,
 					debug_pc: f.debug_pc,
+					no_debug_trap: f.flags.no_debug_trap(),
 					debug_trap_local: f.debug_trap_local,
 					err_trap_local: f.err_trap_local,
 					return_trap_local: f.return_trap_local,
@@ -571,8 +596,13 @@ impl Shell {
 					debug_errexit: f.debug_errexit,
 					err_reported: f.err_reported,
 					ignore_errexit: f.ignore_errexit,
+					command_loop: f.flags.command_loop(),
 					subshell_line: f.subshell_line,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
+					capture: match &f.kind {
+						FrameKind::Cat { capture } => Some(fds.capture(capture)),
+						_ => None,
+					},
 				});
 			}
 			for (fd, h) in p.fds.iter() {
@@ -628,9 +658,11 @@ impl Shell {
 				restore_opts: p.restore_opts.clone(),
 				trace_base: p.trace_base,
 				subshell: p.subshell,
+				outer_loops: p.outer_loops,
 				command,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
+				pending_break: p.pending_break.as_deref().copied(),
 				mode: p.mode,
 				zsh: p.zsh.clone(),
 				lineage: p.lineage,
@@ -662,6 +694,13 @@ impl Shell {
 			mems: fds.mems,
 			bangs: k.bangs.clone(),
 			deferrals: k.deferrals.clone(),
+			debug_skips: k.debug_skips.clone(),
+			take_in: TakeInImage {
+				asked: k.exits_asked.clone(),
+				taken: k.exits_taken.clone(),
+				asks:  self.taking_in.clone(),
+				fresh: self.fresh.clone(),
+			},
 		};
 		let mut bytes = postcard::to_stdvec(&header).map_err(ExtError::Encode)?;
 		bytes.extend_from_slice(&postcard::to_stdvec(&image).map_err(ExtError::Encode)?);
@@ -752,6 +791,8 @@ impl Shell {
 			slice: None,
 			gone: Vec::new(),
 			orphans: Vec::new(),
+			taking_in: Vec::new(),
+			fresh: Vec::new(),
 		};
 		let mut report = RestoreReport::default();
 		let mut restored = false;
@@ -830,6 +871,11 @@ impl Shell {
 			.into_iter()
 			.filter(|d| img.procs.iter().any(|p| p.vpid == d.vproc))
 			.collect();
+		k.debug_skips = img
+			.debug_skips
+			.into_iter()
+			.filter(|s| img.procs.iter().any(|p| p.vpid == s.vproc))
+			.collect();
 		let built = (0..img.fd_objs.len()).map(|_| None).collect();
 		let mut objs = FdRebuild {
 			objs: img.fd_objs,
@@ -886,8 +932,10 @@ impl Shell {
 			vp.restore_opts = p.restore_opts;
 			vp.trace_base = p.trace_base;
 			vp.subshell = p.subshell;
+			vp.outer_loops = p.outer_loops;
 			vp.calls = p.calls;
 			vp.own_traps = p.own_traps;
+			vp.pending_break = p.pending_break.map(Box::new);
 			vp.mode = p.mode;
 			vp.zsh = p.zsh;
 			vp.lineage = p.lineage;
@@ -937,6 +985,12 @@ impl Shell {
 					// survive a restore.
 					too_long_to_host:  false,
 					refusals_to_host:  false,
+					// Not in the image: a run starts its first frame from this flag
+					// (`FrameFlags::no_debug_trap`, which is imaged). Only obash's
+					// fault injector, the testkit and the benches take images
+					// (`Shell::externalize`), and none with a callout's subshell
+					// still queued.
+					callout:           false,
 				});
 			}
 			report.runs += vp.runs.len() as u32;
@@ -1059,7 +1113,13 @@ impl Shell {
 					.into_iter()
 					.map(|r| objs.saved(cx.host, r))
 					.collect();
-				let mut frame = Frame::new(unit, f.pc, f.kind);
+				let mut kind = f.kind;
+				// The capture is the substitution's own buffer: the same memory
+				// object as its `PendingSub::NoFork`.
+				if let (FrameKind::Cat { capture }, Some(i)) = (&mut kind, f.capture) {
+					*capture = objs.capture(i);
+				}
+				let mut frame = Frame::new(unit, f.pc, kind);
 				frame.loops = f.loops;
 				frame.enters = f.enters;
 				frame.cases = f.cases;
@@ -1068,6 +1128,7 @@ impl Shell {
 				frame.scratch = scratch;
 				frame.line_shift = f.line_shift;
 				frame.debug_pc = f.debug_pc;
+				frame.flags.set_no_debug_trap(f.no_debug_trap);
 				frame.debug_trap_local = f.debug_trap_local;
 				frame.err_trap_local = f.err_trap_local;
 				frame.return_trap_local = f.return_trap_local;
@@ -1075,6 +1136,7 @@ impl Shell {
 				frame.debug_errexit = f.debug_errexit;
 				frame.err_reported = f.err_reported;
 				frame.ignore_errexit = f.ignore_errexit;
+				frame.flags.set_command_loop(f.command_loop);
 				frame.subshell_line = f.subshell_line;
 				frame.getopts =
 					(f.getopts != super::proc::GetoptsState::default()).then(|| Box::new(f.getopts));
@@ -1093,6 +1155,18 @@ impl Shell {
 		self.procs = procs;
 		self.rr = (img.rr as usize).min(self.procs.len() - 1);
 		self.slice = img.slice;
+		// The take-in of the vprocs restored: a builtin parked on its ask is
+		// answered as it would have been without the snapshot.
+		let restored = |v: &Vpid| self.procs.iter().any(|p| p.vpid == *v);
+		let ti = img.take_in;
+		let asked = ti.asked.into_iter().filter(|v| restored(v)).collect();
+		let taken = ti.taken.into_iter().filter(|v| restored(v)).collect();
+		let asks = ti.asks.into_iter().filter(|t| restored(&t.asker)).collect();
+		let fresh = ti.fresh.into_iter().filter(|v| restored(v)).collect();
+		self.k.exits_asked = asked;
+		self.k.exits_taken = taken;
+		self.taking_in = asks;
+		self.fresh = fresh;
 		Ok(())
 	}
 

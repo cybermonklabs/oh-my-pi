@@ -29,6 +29,14 @@ use obash_support::{obash, output};
 /// A row: its name, its script, and the stdout, stderr and status wanted.
 type Row = (&'static str, &'static str, &'static str, &'static str, i32);
 
+/// What `cat` says of a standard input that is a directory: GNU cat names
+/// it `-`, macOS's (BSD) cat `stdin`.
+const CAT_DIR: &str = if cfg!(target_os = "macos") {
+	"cat: stdin: Is a directory\n"
+} else {
+	"cat: -: Is a directory\n"
+};
+
 /// The directory a row runs in: `in`, `sub/`, the FIFO `fifo` and `x`, an
 /// executable whose `#!` line names no interpreter.
 fn files(dir: &Path) {
@@ -490,7 +498,7 @@ const BASH: &[Row] = &[
 		"./s.sh: line 1: nosuch: No such file or directory\n",
 		0,
 	),
-	("dir", "cat < sub; echo \"s=$?\"", "s=1\n", "cat: -: Is a directory\n", 0),
+	("dir", "cat < sub; echo \"s=$?\"", "s=1\n", CAT_DIR, 0),
 ];
 
 /// Rows: zsh 5.9's (`zsh -f`).
@@ -829,7 +837,7 @@ const ZSH: &[Row] = &[
 		"./s.sh:1: no such file or directory: nosuch\n",
 		0,
 	),
-	("dir", "cat < sub; echo \"s=$?\"", "s=1\n", "cat: -: Is a directory\n", 0),
+	("dir", "cat < sub; echo \"s=$?\"", "s=1\n", CAT_DIR, 0),
 ];
 
 /// Rows: zsh 5.9's with `-c`: from a script file zsh names a failed `.` by the

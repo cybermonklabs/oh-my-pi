@@ -5,6 +5,9 @@
 
 #![cfg(unix)]
 
+mod pty_support;
+mod real_bash;
+
 use std::{
 	io::{BufRead, BufReader, Write},
 	path::Path,
@@ -18,9 +21,9 @@ use std::{
 const HANG: Duration = Duration::from_secs(30);
 
 fn shells() -> Vec<(&'static str, String)> {
-	let mut shells = vec![("obash", env!("CARGO_BIN_EXE_obash").to_owned())];
-	if Path::new("/bin/bash").exists() {
-		shells.push(("bash", "/bin/bash".to_owned()));
+	let mut shells = vec![("obash", pty_support::obash().to_owned())];
+	if let Some(bash) = real_bash::real_bash() {
+		shells.push(("bash", bash));
 	}
 	shells
 }
@@ -192,7 +195,11 @@ fn a_child_waiting_in_a_fifo_open_holds_no_other_jobs_pipe() {
 /// redirections itself) until the foreground opens the other end. The
 /// function rows name their programs through `PATH`: an absolute path in a
 /// background function whose open waits is reported not found, a separate
-/// defect with its own fix.
+/// defect with its own fix. The `>&-` row asks whether fd 1 is closed with
+/// a dup of it (`exec 3>&1`), which fails on a closed fd under every
+/// `/bin/sh`: a write there would not do, since a failed `echo` keeps its
+/// bytes in the stdio buffer of macOS's `/bin/sh` (bash 3.2), and its next
+/// write to fd 1 sends them out.
 const ROWS: &[(&str, &str, &str)] = &[
 	(
 		"dup 3<&4",
@@ -226,7 +233,7 @@ const ROWS: &[(&str, &str, &str)] = &[
 	),
 	(
 		">&-",
-		r#"/bin/sh -c 'echo x 2>/dev/null || echo closed >&2' >&- 2> "$D/err" < "$D/fifo" & exec 6> "$D/fifo"; wait; exec 6>&-; cat "$D/err""#,
+		r#"/bin/sh -c 'if (exec 3>&1) 2>&-; then echo open >&2; else echo closed >&2; fi' >&- 2> "$D/err" < "$D/fifo" & exec 6> "$D/fifo"; wait; exec 6>&-; cat "$D/err""#,
 		"closed\n",
 	),
 	(
@@ -253,9 +260,10 @@ const ROWS: &[(&str, &str, &str)] = &[
 ];
 
 /// One run of `script` under `shell`, in a directory `$D` holding a FIFO
-/// `fifo` and a file `in`. A run that does not end within [`HANG`] is
-/// killed with its process group ([`Owned`]); its `Err` lists those
-/// processes and their fds first ([`processes`]), so the hang can be traced.
+/// `fifo` and a file `in`. `Err` only for a run that does not end within
+/// [`HANG`]: it is killed with its process group ([`Owned`]), and the `Err`
+/// lists those processes and their fds first ([`processes`]), so the hang
+/// can be traced.
 fn run(shell: &str, script: &str) -> Result<std::process::Output, String> {
 	let dir = tempfile::tempdir().unwrap();
 	mkfifo(&dir.path().join("fifo"));
@@ -264,15 +272,22 @@ fn run(shell: &str, script: &str) -> Result<std::process::Output, String> {
 	let group = owned.group;
 	let (tx, done) = mpsc::channel();
 	std::thread::spawn(move || tx.send(owned.end()));
-	let Ok(out) = done.recv_timeout(HANG) else {
-		let held = processes(group);
-		eprintln!("{shell}: no end within {HANG:?}; its processes:\n{held}");
-		// The shell is not reaped yet: `end` waits for it.
-		kill_group(group);
-		let _ = done.recv_timeout(HANG);
-		return Err(format!("no end within {HANG:?}; its processes:\n{held}"));
-	};
-	Ok(out)
+	match done.recv_timeout(HANG) {
+		Ok(out) => Ok(out),
+		Err(mpsc::RecvTimeoutError::Timeout) => {
+			let held = processes(group);
+			eprintln!("{shell}: no end within {HANG:?}; its processes:\n{held}");
+			// The shell is not reaped yet: `end` waits for it.
+			kill_group(group);
+			let _ = done.recv_timeout(HANG);
+			Err(format!("no end within {HANG:?}; its processes:\n{held}"))
+		},
+		// `end` panicked (the reap failed, or a pipe's reader thread did not
+		// start or panicked): no hang.
+		Err(mpsc::RecvTimeoutError::Disconnected) => {
+			panic!("{shell}: the thread that waits for the shell ended with no result")
+		},
+	}
 }
 
 /// The processes of process group `group`, each with its state, kernel
@@ -354,43 +369,65 @@ fn processes(group: libc::pid_t) -> String {
 	format!("UNKNOWN: no /proc here to list group {group}")
 }
 
-/// One run of `script` under `shell` ([`run`]): `Err` names what differs
-/// from `want`, or the hang.
-fn run_row(shell: &str, script: &str, want: &str) -> Result<(), String> {
-	let out = run(shell, script)?;
+/// How a run of a row failed.
+enum Failure {
+	/// The run did not end within [`HANG`] ([`run`]).
+	Hang(String),
+	/// The run ended with another output or status than the row's.
+	Wrong(String),
+}
+
+/// One run of `script` under `shell` ([`run`]): `Err` names the hang, or
+/// what differs from `want`.
+fn run_row(shell: &str, script: &str, want: &str) -> Result<(), Failure> {
+	let out = run(shell, script).map_err(Failure::Hang)?;
 	let got = String::from_utf8_lossy(&out.stdout);
 	if got != want || !out.status.success() {
-		return Err(format!(
+		return Err(Failure::Wrong(format!(
 			"{got:?} {}, want {want:?}; stderr {:?}",
 			out.status,
 			String::from_utf8_lossy(&out.stderr)
-		));
+		)));
 	}
 	Ok(())
 }
 
-/// Each row runs once under obash, so an obash run that does not end fails
-/// the test. Under bash, the reference, a row that fails runs again, up to
-/// three times: under gVisor bash now and then never ends on the process
-/// substitution row (bash 5.2.21 run alone, not through this test: 6 of 600
-/// runs; the same row with no FIFO open: none of 600; on runc: none of 300).
-/// obash has hung on that row too, more rarely (on gVisor as uid 1000, once
-/// in 1,200 runs), which this test reports as a failure. A run that does not
-/// end prints its processes and their fds before they are killed ([`run`]).
+/// [`run_row`] once under obash, so an obash run that does not end fails
+/// the test. Under bash, the reference, a run that does not end runs again,
+/// up to three runs in all: bash now and then never ends on a row whose
+/// shell or child waits in a FIFO open (each test's note gives the counts).
+/// A bash run that ends with another output or status fails the row at
+/// once. Each retry is printed to stderr, which the test's output shows when
+/// it fails, or when the run keeps passing tests' output.
+fn run_row_as(name: &str, shell: &str, script: &str, want: &str) -> Result<(), String> {
+	let tries = if name == "bash" { 3 } else { 1 };
+	let mut n = 1;
+	loop {
+		match run_row(shell, script, want) {
+			Ok(()) => return Ok(()),
+			Err(Failure::Hang(e)) if n < tries => {
+				eprintln!("bash retry: try {n} of {tries} failed: {e}");
+				n += 1;
+			},
+			Err(Failure::Hang(e) | Failure::Wrong(e)) => return Err(e),
+		}
+	}
+}
+
+/// Each row runs once under obash, and under bash up to three times while a
+/// run does not end ([`run_row_as`]): under gVisor bash now and then never
+/// ends on the process substitution row (bash 5.2.21 run alone, not through
+/// this test: 6 of 600 runs; the same row with no FIFO open: none of 600; on
+/// runc: none of 300). obash has hung on that row too, more rarely (on gVisor
+/// as uid 1000, once in 1,200 runs), which this test reports as a failure. A
+/// run that does not end prints its processes and their fds before they are
+/// killed ([`run`]).
 #[test]
 fn deferred_redirections_read_the_descriptors_bash_gives_them() {
 	let mut wrong = Vec::new();
 	for (name, shell) in shells() {
-		let tries = if name == "bash" { 3 } else { 1 };
 		for (row, script, want) in ROWS {
-			let mut last = Ok(());
-			for _ in 0..tries {
-				last = run_row(&shell, script, want);
-				if last.is_ok() {
-					break;
-				}
-			}
-			if let Err(e) = last {
+			if let Err(e) = run_row_as(name, &shell, script, want) {
 				wrong.push(format!("{name} {row}: {e}"));
 			}
 		}
@@ -405,19 +442,20 @@ fn deferred_redirections_read_the_descriptors_bash_gives_them() {
 /// end of file, and the job's status is 1; it stops there, so no word of a
 /// redirection after it is expanded. The engine knows these are bad before
 /// the child exists; refused in the shell, the FIFO's open never happens,
-/// and its reader waits for ever. The message after `line N: ` is bash's,
+/// and its reader waits for ever. The message after `line N: ` is bash's
+/// (bash 3.2, macOS's `/bin/bash`, names no line, so `$0: ` goes too),
 /// but for `/dev/fd/900`: bash opens the path (`No such file or
 /// directory`), and the engine reads it as a dup of fd 900 (`Bad file
 /// descriptor`), as in the foreground.
 const FAILS: &[(&str, &str, &str)] = &[
 	(
 		"3<&900",
-		r#"/bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3<&900 & cat "$D/fifo"; wait $!; echo "status $?"; sed 's/^.*line [0-9]*: //' "$D/err""#,
+		r#"/bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3<&900 & cat "$D/fifo"; wait $!; echo "status $?"; sed -e 's/^.*line [0-9]*: //' -e "s#^$0: ##" "$D/err""#,
 		"status 1\n900: Bad file descriptor\n",
 	),
 	(
 		"3<&- 4<&3",
-		r#"/bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3<&- 4<&3 & cat "$D/fifo"; wait $!; echo "status $?"; sed 's/^.*line [0-9]*: //' "$D/err""#,
+		r#"/bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3<&- 4<&3 & cat "$D/fifo"; wait $!; echo "status $?"; sed -e 's/^.*line [0-9]*: //' -e "s#^$0: ##" "$D/err""#,
 		"status 1\n3: Bad file descriptor\n",
 	),
 	(
@@ -432,7 +470,7 @@ const FAILS: &[(&str, &str, &str)] = &[
 	),
 	(
 		"a target of two words",
-		r#"two='a b'; /bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3> $two & cat "$D/fifo"; wait $!; echo "status $?"; sed 's/^.*line [0-9]*: //' "$D/err""#,
+		r#"two='a b'; /bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3> $two & cat "$D/fifo"; wait $!; echo "status $?"; sed -e 's/^.*line [0-9]*: //' -e "s#^$0: ##" "$D/err""#,
 		"status 1\n$two: ambiguous redirect\n",
 	),
 	(
@@ -442,17 +480,26 @@ const FAILS: &[(&str, &str, &str)] = &[
 	),
 	(
 		"a missing file (control)",
-		r#"/bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3< "$D/missing" & cat "$D/fifo"; wait $!; echo "status $?"; sed -e 's/^.*line [0-9]*: //' -e "s#$D/##" "$D/err""#,
+		r#"/bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3< "$D/missing" & cat "$D/fifo"; wait $!; echo "status $?"; sed -e 's/^.*line [0-9]*: //' -e "s#^$0: ##" -e "s#$D/##" "$D/err""#,
 		"status 1\nmissing: No such file or directory\n",
 	),
 ];
 
+/// Each row runs once under obash, and under bash up to three times while a
+/// run does not end ([`run_row_as`]): on macOS, bash 5.3.20 now and then
+/// never ends on the row where the shell reads the FIFO itself (run alone, 8
+/// at once: 265 of 4,000 runs; obash and bash 3.2: none of 4,000; the same
+/// row with the child ending 1 s later: none of 400). bash 4.2 and later
+/// restarts an `open` that `SIGCHLD` interrupts, and macOS's FIFO open,
+/// though its writer woke it, returns to be restarted when a signal is
+/// pending: when the child has already ended, the open waits again for a
+/// writer that is gone.
 #[test]
 fn a_redirection_the_child_fails_after_its_fifo_open_lets_the_reader_end() {
 	let mut wrong = Vec::new();
 	for (name, shell) in shells() {
 		for (row, script, want) in FAILS {
-			if let Err(e) = run_row(&shell, script, want) {
+			if let Err(e) = run_row_as(name, &shell, script, want) {
 				wrong.push(format!("{name} {row}: {e}"));
 			}
 		}
@@ -465,7 +512,10 @@ fn a_redirection_the_child_fails_after_its_fifo_open_lets_the_reader_end() {
 /// a deferred spawn's redirection fails with `EBADF`, as for a closed fd:
 /// the process fails it after its FIFO open, so it never takes the host's
 /// object, and the FIFO's reader still gets end of file. obash only: bash
-/// has no host descriptors besides its own fds.
+/// has no host descriptors besides its own fds. Linux only: the script finds
+/// a host descriptor in `/proc/$$/fd`, which macOS lacks, and its
+/// `/dev/fd/N` names the shell's own fd N, not the host's.
+#[cfg(target_os = "linux")]
 const DEV_FD: &str = r#"
 n=
 for f in /proc/$$/fd/*; do
@@ -491,9 +541,10 @@ sed -e "s#/dev/fd/$n#/dev/fd/N#" -e "s/line [0-9]*:/line L:/" "$D/host.err"
 sed -e "s#/dev/fd/900#/dev/fd/N#" -e "s/line [0-9]*:/line L:/" "$D/closed.err"
 "#;
 
+#[cfg(target_os = "linux")]
 #[test]
 fn a_dev_fd_redirection_naming_a_host_descriptor_fails_as_a_closed_fd() {
-	let out = run(env!("CARGO_BIN_EXE_obash"), DEV_FD)
+	let out = run(pty_support::obash(), DEV_FD)
 		.unwrap_or_else(|e| panic!("the redirection of a host descriptor: {e}"));
 	let got = String::from_utf8_lossy(&out.stdout);
 	let lines: Vec<&str> = got.lines().collect();

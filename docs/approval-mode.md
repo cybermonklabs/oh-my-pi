@@ -84,7 +84,7 @@ capped with a deterministic hash suffix; use the final capped name rather than t
 
 The sanitizer lowercases names and retains letters, digits, and underscores. For MCP names changed by the older digit-stripping sanitizer, a legacy `deny` or `prompt` key is inherited only when no current-name policy applies; legacy `allow` is never inherited.
 
-A decision's `policyKey` selects `tools.approval.<policyKey>` first, falling back to the invoking tool's policy when the keyed policy is missing or invalid. For example, `write` to a mounted `xd://lsp` device consults `tools.approval.lsp` before `tools.approval.write` and uses the device operation's tier.
+A decision's `policyKey` selects `tools.approval.<policyKey>` first, falling back to the invoking tool's policy when the keyed policy is missing or invalid. For example, `write` to a mounted `xd://lsp` device consults `tools.approval.lsp` before `tools.approval.write` and uses the device operation's tier. A `write` to a device that a held settings change disabled (see [config usage](./config-usage.md)) gets a tool `deny` carrying the hold's reason, in every mode, so nobody is asked to approve a call that cannot run.
 
 Resolution per tool call:
 

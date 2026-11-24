@@ -320,6 +320,11 @@ impl Capture {
 		std::mem::take(&mut *self.0.lock())
 	}
 
+	/// Append `bytes`, as a write to it does.
+	pub fn append(&self, bytes: &[u8]) {
+		self.0.lock().extend_from_slice(bytes);
+	}
+
 	/// Identity of the shared buffer.
 	pub fn key(&self) -> usize {
 		Arc::as_ptr(&self.0).addr()
@@ -328,6 +333,21 @@ impl Capture {
 	/// Image of the shared buffer.
 	pub fn image(&self) -> MemImage {
 		MemImage::Capture { data: self.0.lock().clone() }
+	}
+}
+
+/// Two captures are equal when they are the same buffer.
+impl PartialEq for Capture {
+	fn eq(&self, other: &Self) -> bool {
+		Arc::ptr_eq(&self.0, &other.0)
+	}
+}
+
+impl Eq for Capture {}
+
+impl std::fmt::Debug for Capture {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "Capture({:#x})", self.key())
 	}
 }
 

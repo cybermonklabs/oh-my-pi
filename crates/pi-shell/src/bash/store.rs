@@ -216,6 +216,9 @@ pub enum Table {
 	/// [`Record::Alias`]); regular aliases are [`Table::Alias`] in every
 	/// dialect.
 	ZshAlias,
+	/// The statuses the root shell keeps for background jobs that left the
+	/// table (bash's bgp list; [`Key::BgPid`]).
+	BgPid,
 }
 
 crate::bash::packed_names::packed_names!(Table, Display);
@@ -263,6 +266,11 @@ pub enum Key<'a> {
 		/// Alias name or suffix.
 		name:   &'a BStr,
 	},
+	/// A status the root shell keeps for a background job that left the
+	/// table, `Record::Misc` `STATUS:PID:SEQ` (decimal; `PID` as `$!` showed
+	/// it; `SEQ` its place in the kept order, oldest first): `wait PID`
+	/// finds it (bash `bgp_search`).
+	BgPid(Vpid),
 }
 
 impl Key<'_> {
@@ -283,13 +291,14 @@ impl Key<'_> {
 			Self::Local { .. } => Table::Local,
 			Self::ZshOpt(_) => Table::ZshOpt,
 			Self::ZshAlias { .. } => Table::ZshAlias,
+			Self::BgPid(_) => Table::BgPid,
 		}
 	}
 
 	/// Whether a fork copies this record into the child's
 	/// [`crate::bash::Image`] (see [`MiscKey::forked`]). The process table,
-	/// the root's job table (a field of each vproc) and the root's scopes
-	/// are not.
+	/// the root's job table and kept statuses (fields of each vproc) and the
+	/// root's scopes are not.
 	pub const fn forked(&self) -> bool {
 		match self {
 			Self::Var(_)
@@ -302,7 +311,9 @@ impl Key<'_> {
 			| Self::ZshOpt(_)
 			| Self::ZshAlias { .. } => true,
 			Self::Misc(m) => m.forked(),
-			Self::Job(_) | Self::Proc(_) | Self::Scope(_) | Self::Local { .. } => false,
+			Self::Job(_) | Self::Proc(_) | Self::Scope(_) | Self::Local { .. } | Self::BgPid(_) => {
+				false
+			},
 		}
 	}
 
@@ -323,6 +334,7 @@ impl Key<'_> {
 			Self::Local { depth, name } => KeyBuf::Local { depth, name: name.into() },
 			Self::ZshOpt(o) => KeyBuf::ZshOpt(o),
 			Self::ZshAlias { suffix, name } => KeyBuf::ZshAlias { suffix, name: name.into() },
+			Self::BgPid(p) => KeyBuf::BgPid(p),
 		}
 	}
 }
@@ -378,6 +390,8 @@ pub enum KeyBuf {
 		/// Alias name or suffix.
 		name:   BString,
 	},
+	/// See [`Key::BgPid`].
+	BgPid(Vpid),
 }
 
 impl KeyBuf {
@@ -400,6 +414,7 @@ impl KeyBuf {
 			Self::ZshAlias { suffix, name } => {
 				Key::ZshAlias { suffix: *suffix, name: BStr::new(name) }
 			},
+			Self::BgPid(p) => Key::BgPid(*p),
 		}
 	}
 }
@@ -1240,7 +1255,7 @@ pub enum MiscKey {
 	/// count (decimal), then one name and one value per entry in zsh's
 	/// iteration order, the value being a flags byte (`ND_USERNAME`,
 	/// `ND_NOABBREV`) followed by the directory
-	/// ([`crate::bash::vm::zsh::nameddir`]).
+	/// (`crate::bash::vm::zsh::nameddir`).
 	ZshNamedDirs,
 	/// bash's `current_command_number` (decimal; absent: 1), the prompt's
 	/// `\#`: an interactive reader adds one per top-level command it runs.
@@ -1251,7 +1266,7 @@ pub enum MiscKey {
 	/// zsh's module tables (`modulestab`, autoloadable builtins,
 	/// conditions, math functions and parameters) when they differ from
 	/// the ones zsh boots with (`Record::Misc`, postcard;
-	/// [`crate::bash::vm::builtins::zsh_module`]).
+	/// `crate::bash::vm::builtins::zsh_module`).
 	ZshModules,
 	/// zsh/mathfunc's `signgam`: the sign of Γ the last `lgamma()` left
 	/// (`Record::Misc`, decimal; absent: 0).
@@ -1259,7 +1274,7 @@ pub enum MiscKey {
 	/// zsh/net/tcp's session table (`ztcp_sessions`, `Record::Words`):
 	/// one entry per session in creation order, `FD TYPE LOCALIP LOCALPORT
 	/// PEERIP PEERPORT` with `TYPE` one of `L` (listener), `I` (inbound),
-	/// `O` (outbound), `Z` (zftp) ([`crate::bash::vm::builtins`]'s
+	/// `O` (outbound), `Z` (zftp) (`crate::bash::vm::builtins`'s
 	/// `zsh_mod_tcp`).
 	ZshTcpSessions,
 	/// zsh's `procsubstpid`: the vproc id of the last process
@@ -1297,11 +1312,11 @@ pub enum MiscKey {
 	/// zsh/pcre's compiled pattern (`pcre_compile`): `Record::Words` of
 	/// the PCRE option bits (decimal) and the pattern; absent when none
 	/// was compiled or the last compile failed
-	/// ([`crate::bash::vm::builtins::zsh_mod_pcre`]).
+	/// (`crate::bash::vm::builtins::zsh_mod_pcre`).
 	ZshPcre,
 	/// zsh/zftp's sessions and connection state between commands
 	/// (`Record::Misc`, postcard;
-	/// [`crate::bash::vm::builtins::zsh_mod_zftp`]).
+	/// `crate::bash::vm::builtins::zsh_mod_zftp`).
 	Zftp,
 	/// zsh/zftp's status files shared with subshells (zsh's `zfstatfd`;
 	/// `Record::Misc`, postcard), kept in the root store.
@@ -1312,11 +1327,11 @@ pub enum MiscKey {
 	/// and `${(k)termcap}` list (`Record::Misc`: a byte telling how ncurses
 	/// set it up, `S` `setupterm` only, `T` `tgetent`, `F` `tgetent` then a
 	/// failed one, then the terminal name;
-	/// [`crate::bash::vm::builtins::zsh_mod_terminfo`]).
+	/// `crate::bash::vm::builtins::zsh_mod_terminfo`).
 	ZshCurTerm,
 	/// `unset mapfile` left zsh/mapfile's special unset (zsh's `PM_UNSET`)
 	/// until the next assignment to it or a module unload (`Record::Misc`,
-	/// `1`; [`crate::bash::vm::builtins::zsh_mod_mapfile`]).
+	/// `1`; `crate::bash::vm::builtins::zsh_mod_mapfile`).
 	ZshMapfileUnset,
 	/// zsh/computil's `compdescribe` state between `-i`/`-I` and the `-g`
 	/// calls (`cd_state`; `Record::Misc`, postcard;
@@ -1347,7 +1362,7 @@ pub enum MiscKey {
 	/// per function, newest first as zsh lists them: the name, `s` for a
 	/// string function (`-Ms`) or empty, the fewest and most arguments
 	/// (decimal, -1 for no limit), and the shell function it calls (empty:
-	/// the same name) ([`crate::bash::vm::zsh::arith`]).
+	/// the same name) (`crate::bash::vm::zsh::arith`).
 	ZshMathFuncs,
 	/// The `PATH` whose directories zsh's command table holds every
 	/// command of (zsh `pathchecked` at the end of `path`, after
@@ -1785,6 +1800,7 @@ mod tests {
 			Key::Local { depth: 1, name: BStr::new("x") },
 			Key::ZshOpt(ZshOpt::Extendedglob),
 			Key::ZshAlias { suffix: true, name: BStr::new("txt") },
+			Key::BgPid(Vpid(9)),
 		];
 		for key in keys {
 			assert_eq!(s.hash_one(key), s.hash_one(key.to_buf()), "{key:?}");

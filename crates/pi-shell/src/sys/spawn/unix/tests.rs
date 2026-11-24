@@ -1297,11 +1297,11 @@ fn waiting_open_holds_no_host_descriptor(sweep: Sweep) {
 	drop(writer);
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
-	let a = argv(&["/bin/true"]);
+	let a = argv(&["/usr/bin/true"]);
 	let mut sp = spec(&a, &env, NEW);
 	sp.redirs = Some(ChildRedirs {
 		list:      vec![child_open(&[0], &fifo, OpenFlags::READ)],
-		exec_diag: BString::from("test: /bin/true: "),
+		exec_diag: BString::from("test: /usr/bin/true: "),
 	});
 	super::force_sweep(sweep);
 	let spawned = s.spawn(sp);
@@ -1386,11 +1386,11 @@ fn a_number_reused_between_the_list_and_the_fork_is_not_kept() {
 	});
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
-	let a = argv(&["/bin/true"]);
+	let a = argv(&["/usr/bin/true"]);
 	let mut sp = spec(&a, &env, NEW);
 	sp.redirs = Some(ChildRedirs {
 		list:      vec![child_open(&[0], &fifo, OpenFlags::READ)],
-		exec_diag: BString::from("test: /bin/true: "),
+		exec_diag: BString::from("test: /usr/bin/true: "),
 	});
 	let mut p = s.spawn(sp).expect("spawn");
 	// SAFETY: `n` is this test's copy of the write end now, owned here.
@@ -2408,6 +2408,270 @@ fn signal_the_host_ignores_after_a_spawn_is_reset_in_later_children() {
 		ExitStatus::Signaled(Signal::Usr2),
 		"the host's new SIG_IGN leaked into the child"
 	);
+}
+
+/// glibc's own signals, 32 and 33 (`super::internal`): an external gets
+/// them as bash's fork and exec leaves them, on each of the three paths.
+/// Each test changes them for its whole process, so it runs again in
+/// processes of its own ([`glibc_signals::isolated`]).
+#[cfg(all(
+	target_os = "linux",
+	target_env = "gnu",
+	any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod glibc_signals {
+	use std::{io, os::unix::process::CommandExt as _, sync::atomic::Ordering};
+
+	use super::{
+		super::internal::{self, IGNORED_AT_LOAD, READ, SIGNALS},
+		NEW, process_umask, sh, spec, wait,
+	};
+	use crate::{
+		bash::{ChildRedirs, EnvView, ExitStatus, SigSet},
+		sys::spawn::NativeSpawner,
+	};
+
+	/// Set in the processes [`isolated`] starts.
+	const CHILD: &str = "PI_SHELL_GLIBC_SIGNALS_CHILD";
+
+	/// Run test `name` of this module again, alone, in a process of its own
+	/// that starts with both signals' handler `entry`: once as the host
+	/// starts processes, and once under a seccomp filter that answers
+	/// `clone3` with `ENOSYS` ([`refuse_clone3`]), so that glibc's
+	/// `posix_spawn` takes the path that sets both to `SIG_IGN` on any
+	/// machine. True in those processes: the caller runs its body there.
+	fn isolated(name: &str, entry: libc::sighandler_t) -> bool {
+		if let Some(how) = std::env::var_os(CHILD) {
+			assert!(how != "refused" || internal::spawn_ignores(), "clone3 is not refused");
+			return true;
+		}
+		let entry = internal::with_handler(entry);
+		for refused in [false, true] {
+			let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+			cmd.arg("--exact")
+				.arg(format!("sys::spawn::unix::tests::glibc_signals::{name}"))
+				.env(CHILD, if refused { "refused" } else { "host" });
+			// SAFETY: this runs after fork, before exec, and makes only
+			// system calls on data prepared before the fork.
+			unsafe {
+				cmd.pre_exec(move || {
+					for sig in SIGNALS {
+						internal::action(sig, Some(&entry))?;
+					}
+					if refused {
+						refuse_clone3()?;
+					}
+					Ok(())
+				});
+			}
+			let output = cmd.output().unwrap();
+			let out = String::from_utf8_lossy(&output.stdout);
+			let err = String::from_utf8_lossy(&output.stderr);
+			assert!(output.status.success(), "clone3 refused: {refused}\n{out}{err}");
+			assert!(out.contains("1 passed"), "the process ran no test: {out}");
+		}
+		false
+	}
+
+	/// Install a seccomp filter that answers `clone3` with `ENOSYS` and
+	/// lets every other call through. Async-signal-safe.
+	fn refuse_clone3() -> io::Result<()> {
+		#[cfg(target_arch = "x86_64")]
+		const ARCH: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
+		#[cfg(target_arch = "aarch64")]
+		const ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
+		const CLONE3: u32 = 435;
+		// Classic BPF (linux/filter.h): load a word of `seccomp_data`, jump
+		// when equal, return; and the seccomp actions.
+		const LOAD: u16 = 0x20;
+		const JEQ: u16 = 0x15;
+		const RET: u16 = 0x06;
+		const ALLOW: u32 = 0x7fff_0000;
+		const ERRNO: u32 = 0x0005_0000;
+		let op = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
+		let mut filter = [
+			op(LOAD, 0, 0, 4), // the architecture
+			op(JEQ, 1, 0, ARCH),
+			op(RET, 0, 0, ALLOW),
+			op(LOAD, 0, 0, 0), // the call's number
+			op(JEQ, 0, 1, CLONE3),
+			op(RET, 0, 0, ERRNO | libc::ENOSYS as u32),
+			op(RET, 0, 0, ALLOW),
+		];
+		let prog = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_mut_ptr() };
+		// SAFETY: plain prctl calls; `prog` points at `filter`, which the
+		// kernel copies during the call.
+		let rc = unsafe {
+			if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 {
+				libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const prog)
+			} else {
+				-1
+			}
+		};
+		if rc == 0 {
+			Ok(())
+		} else {
+			Err(io::Error::last_os_error())
+		}
+	}
+
+	/// Set both signals' handler to `handler` in this process (with the
+	/// system call: glibc refuses).
+	fn set_actions(handler: libc::sighandler_t) {
+		for sig in SIGNALS {
+			internal::action(sig, Some(&internal::with_handler(handler))).unwrap();
+		}
+		crate::sys::dispositions_changed();
+	}
+
+	/// The ways an external starts, each forced but the first.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	enum Path {
+		/// The spec as given: `posix_spawn` where it can express it.
+		Given,
+		/// std's fork: a umask the process does not have.
+		Fork,
+		/// The bare fork: redirections left to the process.
+		BareFork,
+	}
+
+	const PATHS: [Path; 3] = [Path::Given, Path::Fork, Path::BareFork];
+
+	/// `sh -c "kill -s SIG $$; exit 7"` started by `path`: its status.
+	fn kill_self(s: &NativeSpawner, path: Path, sig: i32) -> ExitStatus {
+		let env = EnvView::default();
+		let a = sh(&format!("kill -s {sig} $$; exit 7"));
+		let mut sp = spec(&a, &env, NEW);
+		match path {
+			Path::Given => {},
+			Path::Fork => sp.umask = if sp.umask == 0o077 { 0o022 } else { 0o077 },
+			Path::BareFork => {
+				sp.redirs = Some(ChildRedirs { list: Vec::new(), exec_diag: "test: sh: ".into() });
+			},
+		}
+		wait(&mut s.spawn(sp).unwrap())
+	}
+
+	/// Whether the spec as given takes `posix_spawn`.
+	fn by_posix_spawn(s: &NativeSpawner) -> bool {
+		let state = &s.shared.state;
+		state.add_chdir.is_some() && state.posix_eligible(process_umask().unwrap(), SigSet::EMPTY)
+	}
+
+	/// Each path and signal with `status(path, signal)`.
+	fn rows(mut status: impl FnMut(Path, i32) -> ExitStatus) -> Vec<(Path, i32, ExitStatus)> {
+		PATHS
+			.into_iter()
+			.flat_map(|path| SIGNALS.map(|sig| (path, sig)))
+			.map(|(path, sig)| (path, sig, status(path, sig)))
+			.collect()
+	}
+
+	/// A glibc `posix_spawn` child that does not use `clone3` (glibc before
+	/// 2.38, or `clone3` refused) set both signals to `SIG_IGN` before the
+	/// exec, so `sh` outlived `kill -s 33 $$`. Each path leaves them at
+	/// their default when this process does not ignore them.
+	#[test]
+	fn a_child_gets_glibc_signals_at_their_default() {
+		if !isolated("a_child_gets_glibc_signals_at_their_default", libc::SIG_DFL) {
+			return;
+		}
+		let s = NativeSpawner::default();
+		assert!(by_posix_spawn(&s), "the spec as given takes posix_spawn");
+		let got = rows(|path, sig| kill_self(&s, path, sig));
+		assert_eq!(got, rows(|_, sig| ExitStatus::SignaledRaw(sig)));
+	}
+
+	/// Ones this process ignores stay ignored, as bash passes on a signal
+	/// ignored on entry.
+	#[test]
+	fn glibc_signals_the_process_ignores_stay_ignored() {
+		if !isolated("glibc_signals_the_process_ignores_stay_ignored", libc::SIG_DFL) {
+			return;
+		}
+		set_actions(libc::SIG_IGN);
+		let s = NativeSpawner::default();
+		assert!(by_posix_spawn(&s), "the spec as given takes posix_spawn");
+		let got = rows(|path, sig| kill_self(&s, path, sig));
+		assert_eq!(got, rows(|_, _| ExitStatus::Exited(7)));
+	}
+
+	/// Entered with both signals ignored, as glibc's `posix_spawn` hands
+	/// them on where it does not use `clone3`. On glibc 2.34 or later the
+	/// reading at load sees them ignored, and every child still gets them
+	/// ignored after glibc gave `SIGSETXID` a handler of its own at this
+	/// process's first thread. On glibc 2.33 and older, libpthread's preinit
+	/// installs both handlers before the reading, so it sees nothing and the
+	/// children get both at the default (the stated limit). Either way,
+	/// where glibc's child ignores them itself, the spec as given takes
+	/// `posix_spawn`.
+	#[test]
+	fn glibc_signals_ignored_when_the_process_started_stay_ignored() {
+		if !isolated("glibc_signals_ignored_when_the_process_started_stay_ignored", libc::SIG_IGN) {
+			return;
+		}
+		let seen = internal::glibc_at_least(2, 34);
+		let at_load = if seen { READ | 0b11 } else { READ };
+		assert_eq!(IGNORED_AT_LOAD.load(Ordering::Relaxed), at_load, "the reading at load");
+		std::thread::spawn(|| {}).join().unwrap();
+		let s = NativeSpawner::default();
+		assert_eq!(by_posix_spawn(&s), internal::spawn_ignores(), "posix_spawn when it can");
+		let got = rows(|path, sig| kill_self(&s, path, sig));
+		let want = if seen {
+			rows(|_, _| ExitStatus::Exited(7))
+		} else {
+			rows(|_, sig| ExitStatus::SignaledRaw(sig))
+		};
+		assert_eq!(got, want);
+	}
+
+	/// One with a handler stays ignored in a child when the process ignored
+	/// it at load (by a fork where glibc's `posix_spawn` would reset it),
+	/// and goes to its default when the process did not.
+	#[test]
+	fn a_glibc_signal_under_a_handler_stays_ignored_only_if_ignored_at_load() {
+		/// Stands in for glibc's handler.
+		extern "C" fn stand_in(_: libc::c_int) {}
+		if !isolated(
+			"a_glibc_signal_under_a_handler_stays_ignored_only_if_ignored_at_load",
+			libc::SIG_DFL,
+		) {
+			return;
+		}
+		let stand_in: extern "C" fn(libc::c_int) = stand_in;
+		set_actions(stand_in as libc::sighandler_t);
+		let s = NativeSpawner::default();
+		let run = |ignored_at_load: bool| {
+			IGNORED_AT_LOAD.store(if ignored_at_load { READ | 0b11 } else { READ }, Ordering::Relaxed);
+			crate::sys::dispositions_changed();
+			// glibc's own child ignores them where it does not use clone3.
+			let posix = !ignored_at_load || internal::spawn_ignores();
+			assert_eq!(by_posix_spawn(&s), posix, "posix_spawn when it can");
+			rows(|path, sig| kill_self(&s, path, sig))
+		};
+		assert_eq!(run(true), rows(|_, _| ExitStatus::Exited(7)), "ignored at load");
+		assert_eq!(run(false), rows(|_, sig| ExitStatus::SignaledRaw(sig)), "not ignored at load");
+	}
+
+	/// The bits set are the ones glibc's own `sigismember` reads as 32 and
+	/// 33, and no other.
+	#[test]
+	fn glibc_signal_bits_are_the_ones_glibc_reads() {
+		if !isolated("glibc_signal_bits_are_the_ones_glibc_reads", libc::SIG_DFL) {
+			return;
+		}
+		set_actions(libc::SIG_DFL);
+		// SAFETY: sigset_t is plain data, initialized by sigemptyset.
+		let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+		// SAFETY: `set` is a valid, writable sigset_t.
+		unsafe { libc::sigemptyset(&raw mut set) };
+		internal::add_defaults(&mut set);
+		let members: Vec<i32> = (1..65)
+			// SAFETY: `set` is initialized.
+			.filter(|&n| unsafe { libc::sigismember(&raw const set, n) } == 1)
+			.collect();
+		assert_eq!(members, SIGNALS);
+	}
 }
 
 #[test]

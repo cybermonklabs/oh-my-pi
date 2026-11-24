@@ -21,7 +21,7 @@ fn run(program: &str, args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
 }
 
 fn obash(args: &[&str]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
-	run(env!("CARGO_BIN_EXE_obash"), args)
+	run(pty_support::obash(), args)
 }
 
 fn have_zsh() -> bool {
@@ -55,7 +55,7 @@ fn interactive_prompt_defaults_preserve_imported_values_and_stay_out_of_scripts(
 		(true, Some(""), "<>\n"),
 		(false, None, "<unset>\n"),
 	] {
-		let mut command = Command::new(env!("CARGO_BIN_EXE_obash"));
+		let mut command = Command::new(pty_support::obash());
 		command
 			.arg0("bash")
 			.args(["--noprofile", "--norc"])
@@ -133,7 +133,7 @@ fn command_strings_and_exit_statuses_match_zsh() {
 #[test]
 fn a_standalone_exit_ends_running_background_externals() {
 	let sleep = pi_shell::testkit::child::on_path("sleep");
-	let out = Command::new(env!("CARGO_BIN_EXE_obash"))
+	let out = Command::new(pty_support::obash())
 		.arg("-c")
 		.arg(format!("{sleep} 600 >/dev/null 2>&1 </dev/null & echo $!"))
 		.output()

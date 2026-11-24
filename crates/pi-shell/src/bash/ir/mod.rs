@@ -203,8 +203,9 @@ pub struct Op {
 const _: () = assert!(size_of::<Op>() == 16);
 
 impl Op {
-	/// Flag on `Exec`: the whole body of a `$( )` is `< file`, which
-	/// outputs the file (bash's `$(< file)`).
+	/// Flag on `Exec`: the whole body of a `$( )` is `< file` (or
+	/// `0< file`), which outputs the file (bash's `$(< file)`); the shell
+	/// reads it itself ([`Unit::cat_exec`]).
 	pub const CAT: u8 = 1 << 4;
 	/// Flag: inside a condition (`if`/`while` test, left of `&&`/`||`, `!`).
 	pub const COND: u8 = 1;
@@ -296,6 +297,41 @@ pub struct Unit {
 }
 
 impl Unit {
+	/// The `Exec` of the `$(< file)` body at `entry`: the body's lone simple
+	/// command, past the blocks of substitutions in its redirection's word
+	/// (`$(< "$(cmd)")`, lowered before the command), when it has no words,
+	/// no assignments and one `<` on fd 0 (`< f` or `0< f`), as bash's
+	/// `can_optimize_cat_file`. The lowering flags it [`Op::CAT`].
+	pub(crate) fn cat_exec(&self, entry: u32) -> Option<u32> {
+		let mut pc = entry;
+		// A substitution's block: a `Jmp` past it to the op after its
+		// `SubExit`.
+		while let Some(op) = self.ops.get(pc as usize)
+			&& op.code == Opcode::Jmp
+			&& op.a > pc
+			&& self
+				.ops
+				.get(op.a as usize - 1)
+				.is_some_and(|end| end.code == Opcode::SubExit)
+		{
+			pc = op.a;
+		}
+		let (op, next) = (self.ops.get(pc as usize)?, self.ops.get(pc as usize + 1)?);
+		if op.code != Opcode::Exec || next.code != Opcode::SubExit {
+			return None;
+		}
+		let cmd = self.cmds.get(op.a as usize)?;
+		let lone_input = cmd
+			.redirs
+			.and_then(|l| self.redirs.get(l as usize))
+			.is_some_and(|rs| {
+				matches!(rs.as_slice(), [r] if r.op == RedirKind::In
+					&& matches!(r.fd, RedirFdIr::Default | RedirFdIr::Num(0)))
+			});
+		let no_words = self.lists.get(cmd.words as usize).is_none_or(Vec::is_empty);
+		(lone_input && no_words && cmd.assigns.is_empty()).then_some(pc)
+	}
+
 	/// The message of a syntax-error `Abort` in the code (a brace
 	/// expansion over the limit), for units whose code does not run as a
 	/// whole: a compound value's words are expanded, not executed.
@@ -630,7 +666,7 @@ pub enum Part {
 	/// expanded, so the code points convert to the locale's charset.
 	AnsiC(BString),
 	/// zsh dialect: a whole word in zsh's tokenized, metafied form
-	/// ([`crate::bash::syntax::WordPart::Zsh`]), expanded at run time by the zsh
+	/// ([`crate::bash::syntax::Part::Zsh`]), expanded at run time by the zsh
 	/// expander (zsh `subst.c`), which also runs its substitutions.
 	Zsh(BString),
 }

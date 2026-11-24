@@ -1454,6 +1454,10 @@ export function buildHarborEnv(
 	// Drop any stale OMP_BENCH_FORWARD_ENV inherited from the caller's shell before
 	// the agent-type early return, so it never leaks (incl. into the dry-run dump).
 	delete env.OMP_BENCH_FORWARD_ENV;
+	// Harbor sends each job's model names, dataset names, cost and commands to
+	// PostHog unless HARBOR_TELEMETRY turns it off. Default it off for every
+	// harbor process this runner starts; a non-blank value the caller set is kept.
+	if (!env.HARBOR_TELEMETRY?.trim()) env.HARBOR_TELEMETRY = "0";
 	if (!MANAGED_AGENTS[cfg.agent]) return env;
 	const prepend = (k: string, v: string): void => {
 		env[k] = env[k] ? `${v}:${env[k]}` : v;
@@ -1608,7 +1612,7 @@ interface BenchmarkRun {
 	reportPath: string | null;
 }
 
-async function runBenchmark(cfg: Config): Promise<BenchmarkRun> {
+export async function runBenchmark(cfg: Config): Promise<BenchmarkRun> {
 	if (!which("harbor")) {
 		throw new Error("harbor not found on PATH. Install with: uv tool install harbor");
 	}
@@ -1674,7 +1678,7 @@ async function runBenchmark(cfg: Config): Promise<BenchmarkRun> {
 	const logPath = path.join(benchDir, "harbor.log");
 	if (cfg.dryRun) {
 		process.stdout.write(bold("\nharbor command:\n"));
-		process.stdout.write(`harbor ${harborArgs.join(" ")}\n\n`);
+		process.stdout.write(`HARBOR_TELEMETRY=${harborEnv.HARBOR_TELEMETRY} harbor ${harborArgs.join(" ")}\n\n`);
 		if (modelsYaml) {
 			process.stdout.write(bold("models.yml:\n"));
 			process.stdout.write(`${fs.readFileSync(modelsYaml, "utf8")}\n`);

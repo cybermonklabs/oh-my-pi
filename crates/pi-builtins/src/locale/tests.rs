@@ -1064,8 +1064,8 @@ fn a_member_whose_main_thread_exited_is_ended_before_linux_6_9() {
 	let utility = Command::new("/bin/sh").args(["-c", "exec sleep 30"]).process_group(0).spawn().unwrap();
 	let group = libc::pid_t::try_from(utility.id()).unwrap();
 	let mut children = Children { utility, forked: Vec::new() };
-	let member = children.fork_into(group, true);
-	let zombie = children.fork_into(group, false);
+	let member = children.fork_into(group, true, None);
+	let zombie = children.fork_into(group, false, None);
 	// The premise, as `/proc` shows it: both read `Z`, and only the member
 	// has a thread left.
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1090,9 +1090,52 @@ fn a_member_whose_main_thread_exited_is_ended_before_linux_6_9() {
 	assert_eq!(ended, Some(libc::SIGKILL), "the member whose main thread exited outlived end_group");
 }
 
-/// What [`a_member_whose_main_thread_exited_is_ended_before_linux_6_9`]
-/// started: on drop, whatever is not reaped yet is killed and reaped, so a
-/// failure leaves nothing holding the output its own process is read by.
+/// A member whose main thread exited while another of its threads runs
+/// reads as live, and a true zombie as gone, whatever their names: `status`,
+/// where the thread count is read, carries the name on its first line, and a
+/// name that is no UTF-8 (the kernel cuts it at 15 bytes, inside a character
+/// too) must not hide the count. Both are this test's children, named
+/// `\xe8x`, in the group of a stand-in utility.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn a_member_whose_name_is_no_utf8_is_read() {
+	use std::os::unix::process::CommandExt as _;
+
+	if !crate::own_process::own_process() {
+		return;
+	}
+	let name = std::ffi::CStr::from_bytes_with_nul(b"\xe8x\0").unwrap();
+	let utility = Command::new("/bin/sh").args(["-c", "exec sleep 30"]).process_group(0).spawn().unwrap();
+	let group = libc::pid_t::try_from(utility.id()).unwrap();
+	let mut children = Children { utility, forked: Vec::new() };
+	let member = children.fork_into(group, true, Some(name));
+	let zombie = children.fork_into(group, false, Some(name));
+	let named = |number: libc::pid_t| fs::read(format!("/proc/{number}/comm")).ok().as_deref() == Some(&b"\xe8x\n"[..]);
+	// The premise, as `/proc` shows it: both are named so and read `Z`, and
+	// only the member has a thread left.
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+	while !named(member)
+		|| !named(zombie)
+		|| (state_and_threads(member), state_and_threads(zombie)) != ((b'Z', 2), (b'Z', 1))
+	{
+		assert!(
+			std::time::Instant::now() < deadline,
+			"premise: member {:?} named {}, zombie {:?} named {}",
+			state_and_threads(member),
+			named(member),
+			state_and_threads(zombie),
+			named(zombie)
+		);
+		std::thread::sleep(std::time::Duration::from_millis(10));
+	}
+	assert!(super::live_member(member, group), "the member named \\xe8x whose main thread exited reads as gone");
+	assert!(!super::live_member(zombie, group), "the true zombie named \\xe8x reads as live");
+}
+
+/// What [`a_member_whose_main_thread_exited_is_ended_before_linux_6_9`] and
+/// [`a_member_whose_name_is_no_utf8_is_read`] started: on drop, whatever is
+/// not reaped yet is killed and reaped, so a failure leaves nothing holding
+/// the output its own process is read by.
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 struct Children {
 	utility: std::process::Child,
@@ -1103,6 +1146,7 @@ struct Children {
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 impl Children {
 	/// Forks a child of this test into the process group `group`. With
+	/// `name`, the child first names itself so (`PR_SET_NAME`). With
 	/// `main_thread_exits`, the child starts a thread that sleeps and then
 	/// ends its main thread alone with the raw `exit` system call (not
 	/// `exit_group`), which leaves the process as `pthread_exit` would;
@@ -1111,7 +1155,12 @@ impl Children {
 	/// a zombie until this test reaps it. The child makes only
 	/// async-signal-safe calls and `pthread_create`, which glibc's `fork`
 	/// leaves usable, and never returns into this test.
-	fn fork_into(&mut self, group: libc::pid_t, main_thread_exits: bool) -> libc::pid_t {
+	fn fork_into(
+		&mut self,
+		group: libc::pid_t,
+		main_thread_exits: bool,
+		name: Option<&std::ffi::CStr>,
+	) -> libc::pid_t {
 		extern "C" fn sleeper(_: *mut libc::c_void) -> *mut libc::c_void {
 			loop {
 				// SAFETY: `pause` only waits for a signal.
@@ -1126,6 +1175,11 @@ impl Children {
 			unsafe {
 				if libc::setpgid(0, group) != 0 {
 					libc::_exit(3);
+				}
+				if let Some(name) = name
+					&& libc::prctl(libc::PR_SET_NAME, name.as_ptr()) != 0
+				{
+					libc::_exit(6);
 				}
 				if !main_thread_exits {
 					libc::_exit(0);
@@ -1194,10 +1248,13 @@ fn state_and_threads(number: libc::pid_t) -> (u8, u32) {
 		.ok()
 		.and_then(|stat| stat.iter().rposition(|byte| *byte == b')').and_then(|end| stat.get(end + 2).copied()))
 		.unwrap_or(b'?');
-	let threads = fs::read_to_string(format!("/proc/{number}/status"))
+	let threads = fs::read(format!("/proc/{number}/status"))
 		.ok()
 		.and_then(|status| {
-			status.lines().find_map(|line| line.strip_prefix("Threads:")).and_then(|count| count.trim().parse().ok())
+			String::from_utf8_lossy(&status)
+				.lines()
+				.find_map(|line| line.strip_prefix("Threads:"))
+				.and_then(|count| count.trim().parse().ok())
 		})
 		.unwrap_or(0);
 	(state, threads)

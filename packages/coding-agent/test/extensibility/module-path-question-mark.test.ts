@@ -106,7 +106,7 @@ describe.skipIf(process.platform === "win32")("a module under a path that contai
 	it("is reported by an extension's load", async () => {
 		const { questionDir } = await makeQuestionRoot();
 		const entry = await writeModule(path.join(questionDir, "ext", "index.ts"));
-		const loaded = await importExtensionModule(entry, path.dirname(entry));
+		const loaded = await importExtensionModule({ path: entry, scope: "explicit" }, path.dirname(entry));
 		expect(loaded.error).toBe(`Failed to load extension: ${message(entry)}`);
 	});
 

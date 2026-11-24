@@ -8,15 +8,17 @@ import { tryEnforceStrictSchema } from "./normalize";
  * comparing strict vs non-strict outputs).
  *
  * Honored by every provider that emits `strict: true` on its function tools —
- * see `openai-completions`, `openai-responses`, `openai-codex-responses`, and
- * the strict candidate selection in `anthropic`.
+ * `openai-completions`, `openai-responses` and `openai-codex-responses` through
+ * `openAIFunctionTools` (`providers/openai-tool-strict`), and the strict
+ * candidate selection in `anthropic`.
  */
 export const NO_STRICT = $flag("PI_NO_STRICT");
 
 /**
  * Consolidated helper for OpenAI-style strict schema enforcement.
  *
- * Each provider computes its own `strict` boolean (logic differs), then calls
+ * Each provider computes its own `strict` boolean (for the OpenAI ones,
+ * `openAIFunctionTools` does), then calls
  * this to handle the tryEnforceStrictSchema dance uniformly:
  * - Draft-07-shaped inputs are upgraded to draft 2020-12 first.
  * - If `strict` is false, passes the upgraded schema through unchanged.

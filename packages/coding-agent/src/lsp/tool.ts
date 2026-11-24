@@ -112,6 +112,7 @@ import {
 	uriToFile,
 } from "./utils";
 import { formatGroupedDiagnosticMessages } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { Memo } from "@oh-my-pi/pi-tui/native/memo";
 import { runWorkspaceDiagnostics } from "./workspace-diagnostics";
 
 import { cfgToolsMaxTimeout } from "../tools/settings";
@@ -200,17 +201,19 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 	readonly summary = "Query LSP (language server) for diagnostics, hover info, and references";
 	readonly parameters = lspSchema;
 	readonly strict = true;
+	readonly #description = new Memo<string>();
 
 	constructor(private readonly session: ToolSession) {}
 
 	get description(): string {
 		const maxTimeout = cfgToolsMaxTimeout.get(this.session.settings);
 		const defaults = resolveLspTimeouts(undefined, cfgLspRequestTimeout.get(this.session.settings), maxTimeout);
-		return prompt.render(lspDescription, {
-			defaultTimeoutSec: defaults.call,
-			defaultWaitSec: defaults.wait,
-			maxTimeoutSec: clampTimeout("lsp", TOOL_TIMEOUTS.lsp.max, maxTimeout),
-		});
+		const defaultTimeoutSec = defaults.call;
+		const defaultWaitSec = defaults.wait;
+		const maxTimeoutSec = clampTimeout("lsp", TOOL_TIMEOUTS.lsp.max, maxTimeout);
+		return this.#description.get([defaultTimeoutSec, defaultWaitSec, maxTimeoutSec], () =>
+			prompt.render(lspDescription, { defaultTimeoutSec, defaultWaitSec, maxTimeoutSec }),
+		);
 	}
 
 	static createIf(session: ToolSession): LspTool | null {

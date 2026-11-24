@@ -7,12 +7,23 @@ description: >
    baked into the template; GitHub-hosted runners use the stock actions/cache
    backend.
 
+inputs:
+   cache:
+      description: >
+         "false" restores and saves no GitHub Actions cache, so the job reads
+         no bun store that another job of its ref could have written: a job
+         that runs test code with sudo can read the runner's token and save
+         any key for its ref. Off-infra only; vmon's baked store is unchanged.
+      default: "true"
+
 runs:
    using: composite
    steps:
       - name: Detect environment
         id: env
         shell: bash
+        env:
+           CACHE_INPUT: ${{ inputs.cache }}
         run: |
            # bun is baked into the vmon omp-ci template — reuse it only when it
            # satisfies the repo pin (package.json "packageManager"). The pin is
@@ -55,10 +66,13 @@ runs:
            # Their omp-ci template bakes the bun store, warmed from a pinned
            # checkout, at the default cache path: a lockfile change since the
            # template build downloads only the delta. Elsewhere actions/cache
-           # restores it.
+           # restores it, unless the caller asks for none (inputs.cache).
            if [ "${VMON_CI:-}" = 1 ]; then
              echo "cache=baked" >> "$GITHUB_OUTPUT"
              echo "bun cache backend: omp-ci template store (${HOME}/.bun/install/cache)"
+           elif [ "$CACHE_INPUT" = false ]; then
+             echo "cache=none" >> "$GITHUB_OUTPUT"
+             echo "bun cache backend: none (cache: false); the install downloads every package"
            else
              echo "cache=gha" >> "$GITHUB_OUTPUT"
              echo "bun cache backend: GitHub Actions cache"

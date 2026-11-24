@@ -11,7 +11,7 @@
 //! Words print as the text bash stores for them: `\newline` removed, `$'…'`
 //! decoded and single-quoted, `$"…"` as `"…"`, command substitutions as
 //! bash re-prints them (`Comsub.text`), compound assignments with single
-//! spaces. zsh words ([`WordPart::Zsh`]) print as their untokenized,
+//! spaces. zsh words ([`Part::Zsh`]) print as their untokenized,
 //! unmetafied text; zsh-only constructs (`repeat`, `always`, anonymous
 //! functions, `&|`, `>>|`) print in zsh syntax.
 

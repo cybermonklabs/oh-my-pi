@@ -2,9 +2,43 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `TtyWriter.discard()`, which drops terminal output that was queued but not yet written; the chunk already being written still finishes ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
+- Added `readFileBeneath()`, which reads a file a `glob` listed below the directory the glob walked without following a symlink the walk did not list; one open checks the size against `maxBytes`, probes the first `binaryProbeBytes` bytes for a NUL byte, and returns the bytes (only the first `prefixBytes` when set), reading each byte once. A file whose size the allocator refuses (beyond the address space, or above memory where overcommit is limited) and that no `maxBytes` skips is rejected with `out of memory`
+- Added `GlobMatch.symlink`, set when the listing shows a symbolic link at the match (reported as `Symlink`, or as its target under a `File` or `Dir` filter); pass it to `readFileBeneath()` as `followSymlink`, which then follows that listed link wherever it points when the file is read, inside the walked directory or out of it
+
+### Changed
+
+- A directory walk that does not follow symlinks no longer reads a `.gitignore`, `.ignore` or `.git/info/exclude` inside the walked directory that is a symbolic link, as git reads no symlinked `.gitignore`; git does follow a symlinked `.git/info/exclude`, so there the walk now differs from git
+- Fixed the bash tool's built-in `rsync -K` (`--keep-dirlinks`) reporting `Operation not supported (95)` where rsync 3.5.1 reports `Too many levels of symbolic links (40)`: when the destination name of a directory is a symlink to a directory and the modes differ, rsync refuses to set the mode through the symlink with `ELOOP` (exit 23), and the built-in now refuses it the same way. A symlink's own mode is still set with lchmod where the platform can
+- An empty word used as a file name (`cat < ""`, `exec 3< ""`, `echo x > ""`, `. ""`) now fails with `No such file or directory`, as bash and zsh do, instead of naming the working directory; `<& ""` and `>& ""` are a bad file descriptor, bash's `cd ""` is `null directory` and `history -r ""` is `empty filename`, as in bash 5.3; in zsh mode `exec ""`, `""` and a directory on `$PATH` are `permission denied` (126).
+- A program a shell session has just written no longer fails at random with "Text file busy" when another session of the same process starts a program at that moment: the bash and zsh shells try such a program again after short waits (about 1 s in all) on the session's own timers, so its other commands, timers, timeout and cancel go on meanwhile. A background job's `$!` is known at once, as in bash: the job's own process waits for its program, and only a use of the job, such as `wait $!`, waits with it (a script without a `#!` line excepted: `$!` waits until it runs). A program that something keeps open for writing still fails with "Text file busy", after those waits rather than at once.
+- A command substitution in an interactive shell's prompt (bash `PS1`/`PS2`, zsh `PS1`/`RPS1`/`PS2` with `promptsubst`) no longer sets `$?`: the next command and the shell's exit status see the last command's status, as in bash and zsh (`PS1='$(exit 3)> '; false`, then `echo $?` printed 3)
+- A background command whose redirection open waits no longer takes a descriptor its own redirections close or replace before anything reads it (`4<&-`, `4< file`, `4>&1`): when that descriptor was a process substitution, the shell's own `read` of it found nothing until the command ended, where bash reads the line at once.
+- A background command whose redirection open waits (a FIFO with no other end yet) no longer holds the shell's other pipes while it waits: the child the bash and zsh shells fork for it closes the descriptors its exec would close (the shell's own, all close-on-exec) before its redirections, so another job's reader gets end of file when its writer ends, as in bash.
+- A background command whose redirection open waits for a FIFO's other end, and whose later redirection is bad (a dup of a closed fd such as `3<&9` or `3< /dev/fd/9`, or a target that expands to two words), no longer leaves the FIFO's reader waiting for ever: the child opens the FIFO and then fails that redirection, as bash's child does. The shell refused it before the child existed, so the FIFO was never opened.
+- `$(< file)` reads the file in the shell itself, as bash and zsh do, instead of in a subshell. The file name may hold a substitution (`$(< "$(cmd)")` was empty), and `$(0< file)` is read too (it was empty). `set -u` ends the shell on an unset name in it. No DEBUG trap, `BASH_COMMAND`, trace line or `PIPESTATUS` change is made for the `< file`. A directory reads as empty with status 0 in bash, and as zsh's `error when reading NAME: is a directory`. In zsh, a successful read leaves `$?` alone, and the name is not globbed.
+- bash: a `break` or `continue` inside `${| …; }` or `${ …; }` ends the substitution's body and waits, as bash 5.3's does: the command holding it still runs (with the substitution empty, and any later substitution of that command empty too), then the loop ends or goes on. A function, `eval` or trap the command reaches runs none of its commands meanwhile, and a `return` carries the wait to the caller's loops. With no loop, the message is printed and the command runs; before, the command was dropped. A `break N` or `continue N` with more levels than the loops inside an `eval` or `${ }` goes on to the loops around it. One in the redirections of a program (an external, a pi utility, a name not found), such as a here-document of `cat`, leaves no loop: bash expands those redirections in the forked child, so the `break` ends with it.
+- bash: a `break` or `continue` in `${| …; }` or `${ …; }` in a `( … )`'s own redirection prints the `only meaningful in a loop` message and the rest of the substitution runs, as bash expands those redirections in the subshell, which has no loop (a `$( )` or `<( )` there has none either); before, it ended the loop around the `( … )`. One in a loop's own redirection is taken by that loop, which bash counts only as it starts: the loop runs no pass for it (a `for` binds its first word and a `select` reads its first line first, an arithmetic `for` evaluates its first two expressions, and a `while`'s skipped test has the status `$?` has, which a `continue` goes by), a count is capped at the loops around it, and the levels left go on out; before, the loop around it took the break. A `break` in a `for`'s own words also waits for its first word, and a substitution in a `for`'s or `select`'s words runs nothing while the break waits and gives nothing, as in bash; before, the loop around it took the break. A trap that a command in `${| …; }` or `${ …; }` sets off, in a command's words or a compound command's own redirection, runs before the next command there, as bash runs a pending trap as each command ends; it ran after the whole command, and was lost when a `break` waited. In a program's or a `( … )`'s own redirection it waits for that command, as bash expands those in the child. In a builtin's or a function's redirection it still waits too, where bash runs it at once.
+- bash: an error in an arithmetic `for`'s header (`for (( j=; j<2; j++ ))`, a division by 0) ends that loop with status 1 and the commands after it run, as in bash; its message goes where the loop's own redirections send it. Before, the whole command was dropped. An error in the first expression ends the loop before it starts; an error in the test also takes one level of a `break` or `continue` that waits for the loop. No ERR trap runs for it, and `set -e` does not exit.
+- bash: `ambiguous redirect` names the word as bash stores it: each command substitution as the parser re-prints it (`$(  true;false  )` is named `$(true; false)`, `${| return 3; }` is named `${|return 3; }`), `$'…'` decoded in single quotes, and `$"…"` as `"…"`.
+- `$BASHPID` is `$$` in the shell itself (at the top level, in a function, `eval`, a group and a `lastpipe` stage), as in bash; it was a virtual pid no process has
+- A shell refuses an engine whose first virtual pid is below the system's pid limit (Linux `pid_max`, macOS 100 000): a virtual pid there would name a real process to `kill`, `wait` and the user's tools
+- A shell that has handed out its last virtual pid (2 147 483 647) no longer hands out numbers past it or wraps around to numbers an OS process can have: a command that needs one fails as when bash cannot fork (`fork: Resource temporarily unavailable`, status 254; zsh: `fork failed: …`, status 1; `zpty`: `can't create pty command`, status 1). A script then ends as it does after `exit 254` (zsh: with status 1), a failure inside a subshell ends only that subshell, and an interactive shell drops the command and reads the next one. A prompt whose command substitution needs a virtual pid then fails as an expansion: the message once, the prompt empty, and the line is read, as zsh does (bash retries the prompt every 15 s and reads nothing). An engine whose first virtual pid is the last one or above it, which leaves none for a child, is refused
+- A bash command substitution that has no command (`$()`, `$( )`, only comments) runs nothing and leaves `$?` as it was, as in bash: `false; echo "$( )" $?` printed `0`
+- A cancelled or timed-out `Shell.run` no longer ends the `&` jobs earlier runs left running, and the shell keeps its session (variables, working directory, jobs) for the next run; only what the cancelled run started is stopped
+- `kill $!` of a `( list ) &` job reaches the subshell that runs the list, as in bash, which runs such a job as one process. Only the job's own vproc died: `wait $!` answered at once with its status, the subshell's trap of the signal never ran, and without `end_orphan_jobs` (obash, the engine's default) `( while :; do :; done ) & sleep 1; kill $!` left the loop running for the life of the shell. Now the subshell's trap runs, `kill -STOP $!` and `kill -CONT $!` stop and continue it, and `wait $!` returns the subshell's status. The same holds for a job with redirections (`( list ) >file &`, `( list ) 2>&1 &`) and for a `( … )` that is a subshell's whole body (`( ( list ) ) &`), which bash also runs as one process, but not for a `( … )` after another command (`( :; ( list ) ) &`, `true && ( list ) &`), for which bash forks a second process that the signal does not reach. `kill %1` already reached the subshell; for a job with redirections, `wait` after it now returns the status the subshell's trap exits with, not 143.
+
 ### Fixed
 
 - Fixed the embedded shell losing up to 64 KiB written through a zsh multios redirection (`{ ... } >&1 >/dev/null`, `exec >&1 >/dev/null`) by `syswrite`, `sysread -o` or a builtin whose output went out at once: the tee only queued the bytes, the writer counted them as written, and the queue was dropped when the redirection or the run ended. Each write through the tee now ends once every target of the tee has it
+- Once the last program of a background pipeline is gone (`kill -0 $!` fails) and its other programs have ended, `jobs` (also `-r`, `-n`, `%1`), `$(jobs)`, `fg`, `bg`, `disown -r` and `kill %1` see the job done, as bash does: `jobs` no longer lists it `Running`, `fg`/`bg` say `job has terminated` instead of waiting for it or calling it already in the background. The builtins that report or decide by a job's state, zsh's too, first take in the exits already available, so the end of a pipeline's stage reaches its job before such a builtin reads it. `kill %1` of a finished job no longer says `no such job`: as bash 5.3 does, it succeeds and signals nothing without job control, and reports `(pid) - No such process` with it.
+- `wait PID` of a background job that `jobs` reported and forgot returns its status, as bash's list of saved statuses does, where it said `not a child of this shell`; a second `wait PID` of a job returns its status again. A plain `wait` and `disown -a` forget those statuses, and a posix-mode `wait PID` forgets the one it returned, also while the job's pid is still `$!`. A job `disown` dropped is no longer waited for: `wait` returns at once, and `wait $!` answers at once (0 after `disown` or `disown %1`, `not a child` after `disown -a` or `-r`); its end still runs a `CHLD` trap, as bash counts every child it reaps. `kill %1` makes the job's state news again for `jobs -n`, and `kill PID` first takes in the exits already available, as `kill %1` does. Taking in exits runs no process out of its turn: the shell's own commands keep running beside background loops that start subshells.
+- A snapshot taken while `jobs`, `kill` or `wait` waited for the exits already available to be taken in no longer loses that wait: the shell restored from it answers the builtin as the shell without the snapshot does. `kill` of a running in-engine job (`{ while :; do :; done; } & kill -KILL $!`) never sent when a snapshot came between its ask and the answer, and the shell ran on for ever.
+- A trap no longer runs inside a builtin that waits for the exits already available to be taken in (`jobs`, `kill`, `fg`, `bg`, `disown`, zsh's `jobs` and `kill`). It ran with that builtin's redirections, so in `trap 'echo chld >&2' CHLD; /bin/sh -c 'exit 3' & while kill -0 $! 2>/dev/null; do :; done` the trap's error output went to `/dev/null`, and with `jobs` the trap's output came before the job it listed. The trap now runs once the builtin's command is over, before the next command, as bash runs a trap between commands.
+- `$!` of a background job is there at once, as in bash and zsh, when the job runs a builtin whose output waits for the shell (`printf … &`, also as a function's command or a pipeline's last stage), a loop that never ends, a command substitution or a `set -T` DEBUG trap action that waits for the shell, `eval`, `.` or `source` again without end, or (zsh) a redirection whose FIFO open waits: reading `$!`, or `kill`, `wait` or `jobs -p` of it, no longer waits for the job to end. A job that `exec`s its program after builtins, loops, command substitutions or subshells that waited for nothing (`f() { cd /; exec prog; }; f &`) has the program's pid in `$!`, as in bash. A job that runs another program before its `exec`, or reads a pipe, or (read while it waits) runs past a scheduler slice or opens a FIFO in zsh, keeps its own pid, which the `kill` and `wait` builtins accept but `ps`, `/bin/kill` and `/proc` cannot find.
+- The DEBUG trap of a background simple command (also a negated one, `! cmd &`), and of each simple stage of a pipeline, runs in the shell before it forks, as in bash, with or without `set -T`: it ran in the job with `set -T` (a variable it set never reached the shell, and `$!` could wait for it) and not at all without. A `time`d background pipeline forks first and runs its stages' traps itself under `set -T`, as in bash. `extdebug` now skips such a lone job before it forks (status 1 for `! cmd &`), and in a pipeline only the stage whose trap failed, with no process for it; a background pipeline whose stages are all skipped starts no job, as in bash. A command or process substitution a DEBUG trap action starts (bash's and zsh's), and the command `nohup`, `timeout`, `xargs` or `find -exec` runs, run no DEBUG trap: `set -T` with `trap 'x=$(echo y)' DEBUG`, `trap 'cat <(echo y)' DEBUG` or `trap 'nohup cmd' DEBUG` no longer recurses without end. zsh: a trap function (any `TRAPNAL`, such as `TRAPDEBUG` or `TRAPZERR`) whose last command fails, or that `ERR_RETURN` returns from, no longer ends the code it interrupted; only an explicit `return N` does, as in zsh.
 - Fixed `history -w` and `history -a` to a FIFO, a pipe or a socket writing the history again on every poll, without end; the write now counts the bytes it wrote instead of reading the file's position, which such a file does not have
 - Fixed omp freezing for seconds to minutes on WSL2 while saving sessions: Linux `FileLock` now locks a sidecar file instead of binding a socket, which takes about 10 ms per call there. Older omp versions still running do not see these locks, so restart them after updating ([#19704](https://github.com/can1357/oh-my-pi/pull/19704) by [@turgaybulut](https://github.com/turgaybulut))
 - `EditSession.apply` takes the tool call's abort signal (`signal` in its request). Before, a cancelled edit could still write its files after the abort was reported. Once the signal fires, `apply` stops waiting on URL resolution or missing-path recovery and hands no further write to the host writer; a call stopped that way ends as an error of kind `cancelled` whose message names what the call's earlier writes changed (a move by its source and destination, a delete as deleted). `apply` does not interrupt a write the host has already begun, and the call ends as that write's result: if the host fails it, `write_failed` with the host's error, naming no earlier file; if it succeeds, it is named by the cancel at the next write, or, as the call's last write, the call succeeds. A write handed to the host just before the abort can still reach the writer after it: a writer that must start nothing after the abort checks its own signal and returns `cancelled: true`.
@@ -80,28 +114,19 @@
 - The bash tool's `cp` makes a new file as GNU cp does: with the source's permission bits, less its group and other bits while `-p` or `--preserve=ownership` may still change its owner, and its final mode is set after its owner, where it was readable by the group and others of the user running cp while it copied. A file made through a symbolic link that led nowhere (`POSIXLY_CORRECT`) gets the mode and owner a new file gets. A non-directory over a directory is refused with GNU's message after `-n`, `-i` and `-u`, also in a tree, where `-a` dropped the failure; with a backup the directory keeps its name.
 - The bash tool's `cp` sets the owner, mode, times and extended attributes of a file it copied, cloned (`--reflink`) or opened under `--attributes-only` through that file's own descriptor, as GNU's `fchown`, `fchmod`, `futimens` and `fsetxattr` do, where it set them by name: a name replaced with a link after the copy wrote the file sent them to the link's target. Under `--attributes-only`, `-n` and `-i` decide first, so what they keep is kept. A new file made where a link was gets its final mode. Copying a tree with hard links onto its own earlier copy with `-a -f` exits 0, as GNU's does, where it failed with `cannot create hard link ... File exists`.
 - The bash tool's `mv -i` answered no prints GNU's prompt alone, where it printed `mv: ` after it; `mv -T` of a non-directory onto a directory names the source in its refusal, as GNU 9.7's does; and `mv -v` across filesystems says what GNU's does: `copied 'a' -> 'b'` (with its backup, if any) and `removed 'a'` for a file; `created directory`, `copied` and rm's `removed` lines for a directory, whose entries are copied in GNU's order (by inode number), where it said `renamed` for each.
-
-### Added
-
-- Added `TtyWriter.discard()`, which drops terminal output that was queued but not yet written; the chunk already being written still finishes ([#13794](https://github.com/can1357/oh-my-pi/pull/13794) by [@sjawhar](https://github.com/sjawhar)).
-- Added `readFileBeneath()`, which reads a file a `glob` listed below the directory the glob walked without following a symlink the walk did not list; one open checks the size against `maxBytes`, probes the first `binaryProbeBytes` bytes for a NUL byte, and returns the bytes (only the first `prefixBytes` when set), reading each byte once. A file whose size the allocator refuses (beyond the address space, or above memory where overcommit is limited) and that no `maxBytes` skips is rejected with `out of memory`
-- Added `GlobMatch.symlink`, set when the listing shows a symbolic link at the match (reported as `Symlink`, or as its target under a `File` or `Dir` filter); pass it to `readFileBeneath()` as `followSymlink`, which then follows that listed link wherever it points when the file is read, inside the walked directory or out of it
-
-### Changed
-
-- A directory walk that does not follow symlinks no longer reads a `.gitignore`, `.ignore` or `.git/info/exclude` inside the walked directory that is a symbolic link, as git reads no symlinked `.gitignore`; git does follow a symlinked `.git/info/exclude`, so there the walk now differs from git
-- Fixed the bash tool's built-in `rsync -K` (`--keep-dirlinks`) reporting `Operation not supported (95)` where rsync 3.5.1 reports `Too many levels of symbolic links (40)`: when the destination name of a directory is a symlink to a directory and the modes differ, rsync refuses to set the mode through the symlink with `ELOOP` (exit 23), and the built-in now refuses it the same way. A symlink's own mode is still set with lchmod where the platform can
-- An empty word used as a file name (`cat < ""`, `exec 3< ""`, `echo x > ""`, `. ""`) now fails with `No such file or directory`, as bash and zsh do, instead of naming the working directory; `<& ""` and `>& ""` are a bad file descriptor, bash's `cd ""` is `null directory` and `history -r ""` is `empty filename`, as in bash 5.3; in zsh mode `exec ""`, `""` and a directory on `$PATH` are `permission denied` (126).
-- A program a shell session has just written no longer fails at random with "Text file busy" when another session of the same process starts a program at that moment: the bash and zsh shells try such a program again after short waits (about 1 s in all) on the session's own timers, so its other commands, timers, timeout and cancel go on meanwhile. A background job's `$!` is known at once, as in bash: the job's own process waits for its program, and only a use of the job, such as `wait $!`, waits with it (a script without a `#!` line excepted: `$!` waits until it runs). A program that something keeps open for writing still fails with "Text file busy", after those waits rather than at once.
-- A command substitution in an interactive shell's prompt (bash `PS1`/`PS2`, zsh `PS1`/`RPS1`/`PS2` with `promptsubst`) no longer sets `$?`: the next command and the shell's exit status see the last command's status, as in bash and zsh (`PS1='$(exit 3)> '; false`, then `echo $?` printed 3)
-- A background command whose redirection open waits no longer takes a descriptor its own redirections close or replace before anything reads it (`4<&-`, `4< file`, `4>&1`): when that descriptor was a process substitution, the shell's own `read` of it found nothing until the command ended, where bash reads the line at once.
-- A background command whose redirection open waits (a FIFO with no other end yet) no longer holds the shell's other pipes while it waits: the child the bash and zsh shells fork for it closes the descriptors its exec would close (the shell's own, all close-on-exec) before its redirections, so another job's reader gets end of file when its writer ends, as in bash.
-- A background command whose redirection open waits for a FIFO's other end, and whose later redirection is bad (a dup of a closed fd such as `3<&9` or `3< /dev/fd/9`, or a target that expands to two words), no longer leaves the FIFO's reader waiting for ever: the child opens the FIFO and then fails that redirection, as bash's child does. The shell refused it before the child existed, so the FIFO was never opened.
-- `$BASHPID` is `$$` in the shell itself (at the top level, in a function, `eval`, a group and a `lastpipe` stage), as in bash; it was a virtual pid no process has
-- A shell refuses an engine whose first virtual pid is below the system's pid limit (Linux `pid_max`, macOS 100 000): a virtual pid there would name a real process to `kill`, `wait` and the user's tools
-- A shell that has handed out its last virtual pid (2 147 483 647) no longer hands out numbers past it or wraps around to numbers an OS process can have: a command that needs one fails as when bash cannot fork (`fork: Resource temporarily unavailable`, status 254; zsh: `fork failed: …`, status 1; `zpty`: `can't create pty command`, status 1). A script then ends as it does after `exit 254` (zsh: with status 1), a failure inside a subshell ends only that subshell, and an interactive shell drops the command and reads the next one. A prompt whose command substitution needs a virtual pid then fails as an expansion: the message once, the prompt empty, and the line is read, as zsh does (bash retries the prompt every 15 s and reads nothing). An engine whose first virtual pid is the last one or above it, which leaves none for a child, is refused
-- A bash command substitution that has no command (`$()`, `$( )`, only comments) runs nothing and leaves `$?` as it was, as in bash: `false; echo "$( )" $?` printed `0`
-- A cancelled or timed-out `Shell.run` no longer ends the `&` jobs earlier runs left running, and the shell keeps its session (variables, working directory, jobs) for the next run; only what the cancelled run started is stopped
+- `break` and `continue` in a forked pipeline element, a command or process substitution or a background simple command now act as bash and zsh run them: inside a loop they end that child without the `only meaningful in a loop` message (bash: a simple command, `$( )` and `<( )`; zsh: every fork), a count reaches loops past `eval`, and outside a loop the message is printed under the command's redirections, before its count is read, without dropping the rest of a `${ ;}` or `lastpipe` stage
+- A pipeline element or background job that is a simple command with a `$( )`, backtick or `<( )` word is run as the simple command it is: it keeps bash's loop level (a `break` there ends only it), a builtin or external pipeline element's words see its parent's `$BASH_SUBSHELL`, and a `jobs` element keeps the job list
+- A pipeline element that runs a function or a builtin is one subshell level down once its words are expanded, as in bash: a function, `eval` or `.` element (`f | cat`, `eval 'echo $BASH_SUBSHELL' | cat`) prints one more than its parent's `$BASH_SUBSHELL`, which it printed as its parent's; a substitution in its words is not raised with it
+- The elements of a background pipeline (`f | cat &`, `{ …; } | cat &`, `( … ) | cat &`) are one subshell level down, as bash and zsh fork each element of an async pipeline once, not two; and zsh counts every pipeline element it forks (`$ZSH_SUBSHELL` is 1 in `echo $ZSH_SUBSHELL | cat`), a simple command too
+- In bash mode a timed `( … )` job is one subshell level down, not two (`time ( echo $BASH_SUBSHELL ) &` prints 1), as bash forks the `( … )` once, as the job; and an and-or job that starts with a `( … )` is two down, not one (`( echo $BASH_SUBSHELL ) && : &` prints 2), as bash forks the whole list and then the `( … )`. zsh's counts, which differ in both, stay as they were
+- A fatal error (an unset `${x?}`, `set -u`) in a pipeline element or background command of a `-c` string exits as bash's does: 127 from the command's own words, from a function it runs, from the own redirection of a compound that is the whole element or job (a timed one too: `time { :; } 2>"$w" &`) and from a negated job (`! f &`), when the shell that forked it would reach the command loop too; 1 from a builtin it runs (`eval`, `.`), a subshell, a list inside a compound element or a substitution, from the own redirection of a compound that is only the first command of a job's and-or list (`{ :; } 2>"$w" && : &`, timed or not), and from an element forked inside one of them (`x=$(f | cat)`, `( f | cat )`)
+- `Process.terminate()` on Linux no longer leaves running a child that a process of a tree in a process group of its own (`ptree.spawn` with `detached`) forks while the tree is being read: each wave stops that tree, top-down, before it reads it and resumes it once signalled, so that child is signalled with its parent instead of outliving it under init (an aborted `ptree.spawn` command could keep its output pipe open until such a child ended). A tree in the caller's own process group is not stopped and keeps the walk and its race as before: on gVisor before google/gvisor 553528ee a stopped member of the caller's group brings SIGHUP to the caller as another member is reaped. A stopped process that blocks the wave's signal is let run, one step at a time, until it unblocks it, so a child it forks in that window is read too: dash blocks every signal around each vfork, and `sh -c 'sleep 30'` stopped there used to leave `sleep` running. Stepping one process ends after 100 ms, so a process that blocks the signal and runs or sleeps longer than that before it forks still leaves its child running, and one that waits for the signal with it blocked (tini, a `sigwaitinfo` or signalfd reader) takes those 100 ms in the polite wave; a call with no grace period (`gracefulMs` below 0) steps no process; where the system shows no signal masks (gVisor) a stopped process is not stepped, so one stopped while it blocks the signal forks on after the wave resumes it, and those children outlive the termination unless `group` ends them: `fork` in glibc 2.41 and later blocks every signal around its `clone`, so a forking process stopped in that window makes one more child. The walk holds a pidfd for each process it reads, and a child whose pidfd cannot be opened (out of descriptors) leaves the walk incomplete, as any process it cannot read does. Each level of the tree waits up to 100 ms for its processes to stop, and one that has not stopped by then is read as it runs.
+- `Process.terminate()` sends its polite wave even when its abort signal has already fired, and its hard wave also kills every process the polite wave signalled that still runs, and the tree under it: a child that ignores TERM, or was stopped, no longer outlives its parent's TERM under init, nor do the children it forked since. A process that was stopped before the walk is left stopped, not resumed. Without `group`, a process that forks during the grace period and then exits (in a TERM handler, say) still leaves its child out of reach: the child moves to the nearest subreaper or to init before the hard wave reads the tree. A caller that needs that child ended runs the command in a process group of its own (`group`, below), or under a subreaper (`ptree.spawn` with `subreaper: true`)
+- `Process.terminate()` with `group` (`ptree.spawn` with `detached`) waits, through its grace period and its hard wave, until no process of the group is left, and sends the group its KILL again on each 50 ms tick while one is (a group whose members cannot be read counts as alive): a member that left the tree before the walk, or that a process of the tree forked during the grace period and then left, no longer outlives the termination under init. The grace period now runs in full while any member of the group ignores TERM, and the call returns `false` if a member is still running at the end of the hard wave's wait
+- `Process.terminate()` whose polite walk could not read the whole tree (no descriptor left, say) now kills the process group the root led and fails even when the root and every process the walk read ended at TERM: a process it could not read, which ignored TERM, kept running while the call returned `true`. The group an incomplete walk signals is the one the root led when the call began, so a root that already ended, or that the hard wave's KILL ends first, no longer keeps it from being signalled
+- `Process.terminate()` reads a process whose name is not UTF-8 (the kernel cuts a name at 15 bytes, inside a character too, and writes it into `/proc/<pid>/stat` and `status` unescaped): one such process anywhere on the machine no longer makes the group wait read every group as alive (group-mode `terminate` waited its whole bound and returned `false`), a child with such a name is pinned and ended like any other, and its stopped state and blocked signals read right
+- External commands a shell starts on Linux with glibc no longer start with signals 32 and 33 ignored when the shell does not ignore them. Where `posix_spawn` does not use `clone3` (glibc before 2.38, or a seccomp profile that answers `clone3` with `ENOSYS`), glibc sets these two, its own signals, to `SIG_IGN` in the child before the exec, so `kill -s 33` could not end such a command; bash leaves them at their default. A shell program (`obash`) on glibc 2.34 or later that was started with them ignored passes that on, as bash does. This addon is the exception: it loads into a process that already runs threads, where glibc has replaced an inherited ignore of 33 with its own handler, so its commands get 33 at the default. On glibc 2.33 or older, glibc replaces both before any other code runs, so the commands of `obash` and of this addon get both at the default.
+- The bash tool's `ps -M` lists a thread whose name is not UTF-8 (the kernel cuts a name at 15 bytes, inside a character too, and writes it into the thread's `/proc/<pid>/task/<tid>/stat` unescaped; a process's threads take its name); it left such a thread out, so a process of such a name had no thread lines. The end of a `locale` utility's process group counts a member whose main thread exited while another of its threads runs as live whatever its name, where a name that is not UTF-8 made it read as gone, so the end could stop while that thread ran. Both now read those files as bytes.
 
 ## [18.18.6] - 2026-11-09
 
@@ -1996,357 +2021,4 @@
 - Removed `src/bindings.ts` and `src/index.ts` entry points
 - Removed `src/search-db.ts` and `src/search-db-types.ts`
 
-## [13.16.1] - 2026-03-27
-
-### Added
-
-- Exported `SearchDb` class from main package entry point for direct instantiation
-- Added `SearchDb` class for stateful shared search database instances to improve performance across multiple search operations
-- Added optional `db` parameter to `grep()`, `glob()`, and `fuzzyFind()` functions to enable database-backed searching
-
-### Changed
-
-- Updated `grep()`, `glob()`, and `fuzzyFind()` function signatures to accept optional `db` parameter for database-backed searching
-
-## [13.12.0] - 2026-03-14
-
-### Breaking Changes
-
-- Changed `abort()` method signature: removed optional `reason` parameter and changed return type from `void` to `Promise<void>`
-
-## [13.4.0] - 2026-03-01
-
-### Breaking Changes
-
-- Changed `AstFindOptions.pattern` to `patterns` (now accepts array of strings instead of single string)
-- Replaced `AstReplaceOptions.pattern` and `rewrite` with single `rewrites` option (Record<string, string>)
-
-### Added
-
-- `astGrep` now accepts multiple patterns in a single call; results from all patterns are merged and sorted by file path then position before offset/limit are applied
-- `astEdit` now accepts a `rewrites` map (`Record<string, string>`) and applies all patterns per file in a single pass, compiling them once upfront
-- Result ordering in `astGrep` is now deterministic: sorted by path, line, column using `BTreeSet`/`BTreeMap`
-
-## [13.3.8] - 2026-02-28
-
-### Added
-
-- Added `astFind()` function for structural code search using AST patterns with support for language-specific matching, selectors, and meta-variable extraction
-- Added `astReplace()` function for structural code rewriting with dry-run mode, replacement limits, and parse error handling
-- Added `./ast` export path for accessing AST search and rewrite functionality
-
-## [12.18.0] - 2026-02-21
-
-### Changed
-
-- Replaced custom `TextDecoder` usage with native `toString('utf-8')` for buffer decoding
-- Replaced custom debug logging with structured `logger.time()` calls for startup performance tracking
-
-## [12.17.1] - 2026-02-21
-
-### Added
-
-- Expanded package exports to support subpath imports for clipboard, glob, grep, highlight, html, image, keys, ps, pty, shell, text, and work modules
-- Added wildcard export patterns (`./*`) for all submodules to enable flexible import paths
-
-### Changed
-
-- Updated package description to clarify native bindings for grep, clipboard, image processing, syntax highlighting, PTY, and shell operations
-- Expanded package keywords to include clipboard, image, pty, shell, and syntax-highlighting for better discoverability
-- Added README.md to package distribution files
-
-## [12.10.0] - 2026-02-18
-
-### Changed
-
-- Updated addon filename resolution to include default filename fallback in both modern and baseline variant paths
-
-## [12.8.2] - 2026-02-17
-
-### Breaking Changes
-
-- Removed `getSystemInfo()` and `SystemInfo` from package exports, breaking consumers that imported system info APIs from this package
-
-## [12.8.0] - 2026-02-16
-
-### Added
-
-- Added support for x64 CPU variant selection with `TARGET_VARIANT` environment variable (modern/baseline) during build to optimize for specific ISA levels
-- Added automatic AVX2 detection on Linux, macOS, and Windows to select optimal native addon variant at runtime
-- Added `PI_NATIVE_VARIANT` environment variable to override CPU variant selection at runtime
-- Added support for multiple native addon variants per platform (modern with AVX2, baseline without AVX2) for improved performance portability
-
-### Changed
-
-- Changed native addon filename scheme to include CPU variant suffix for x64 builds (e.g., `pi_natives.linux-x64-modern.node`)
-- Changed embedded addon structure to support multiple variant files per platform instead of single file
-- Changed native addon loader to automatically select appropriate variant based on CPU capabilities or explicit override
-- Changed build output to include variant information in console messages
-
-### Removed
-
-- Removed fallback untagged `pi_natives.node` binary creation for native builds; platform-tagged variants are now required
-
-### Fixed
-
-- Fixed regex patterns containing literal braces (e.g. `${platform}`) failing with "repetition quantifier expects a valid decimal" by escaping `{`/`}` that don't form valid repetition quantifiers
-
-## [12.5.0] - 2026-02-15
-
-### Added
-
-- Added `recursive` option to `GlobOptions` to control whether simple patterns match recursively (defaults to true)
-
-### Changed
-
-- Changed default glob pattern behavior to always use recursive matching for simple patterns instead of requiring explicit `**/` prefix
-- Updated `fileType` filter documentation to clarify that symlinks match file/dir filters based on their target type
-
-## [12.4.0] - 2026-02-14
-
-### Added
-
-- Exported `sanitizeText` function to strip ANSI codes, remove binary garbage, and normalize line endings in text output
-
-## [12.1.0] - 2026-02-13
-
-### Added
-
-- Added `cache` option to `glob()`, `grep()`, and `fuzzyFind()` to enable shared filesystem scan caching
-- Added `invalidateFsScanCache()` function to manually invalidate filesystem scan cache entries
-
-## [11.14.0] - 2026-02-12
-
-### Added
-
-- Added `PtySession` class for PTY-backed interactive command execution with streaming output
-- Added `PtyStartOptions` interface to configure pseudo-terminal sessions with command, working directory, environment variables, and terminal dimensions
-- Added `PtyRunResult` interface to report command exit code, cancellation, and timeout status
-- Added `write()` method to send raw input to PTY stdin
-- Added `resize()` method to dynamically adjust PTY column and row dimensions
-- Added `kill()` method to force-terminate active commands
-
-## [11.3.0] - 2026-02-06
-
-### Added
-
-- OSC 52 fallback for clipboard operations over SSH/mosh connections
-- Termux support with `termux-clipboard-set` integration
-- Headless environment guards to prevent clipboard errors when no display server is available
-- Async clipboard API with improved error handling and fallback strategies
-
-### Changed
-
-- OSC 52 clipboard emission now only occurs in real terminal environments (when stdout is a TTY), preventing unnecessary output in piped or headless contexts
-- Improved error handling for OSC 52 writes to gracefully handle EPIPE errors when stdout is closed or piped to processes that exit early
-- Clipboard functions now return promises for better async handling
-- Native clipboard operations are now best-effort with graceful degradation
-
-## [11.0.0] - 2026-02-05
-
-### Removed
-
-- Removed legacy type aliases `WasmMatch` and `WasmSearchResult`
-
-## [10.6.0] - 2026-02-04
-
-### Changed
-
-- Added separate grep context before/after options in bindings
-
-## [10.2.2] - 2026-02-02
-
-### Added
-
-- Exported `getWorkProfile` function and `WorkProfile` type for work profiling capabilities
-
-## [10.2.0] - 2026-02-02
-
-### Breaking Changes
-
-- Replaced `find()` with `glob()` - update imports and function calls
-- Changed file type filtering from string values to `FileType` enum
-- Removed `abortShellExecution()` function - use `Shell.abort()` method instead
-- Removed `RequestOptions` parameter from `htmlToMarkdown()` - pass options directly
-
-### Added
-
-- Added `glob()` function for file discovery with glob pattern matching and .gitignore support
-- Added `Cancellable` interface for timeout and abort signal support across async operations
-- Added `FileType` enum to filter glob results by file type (File, Dir, Symlink)
-- Added `signal` parameter to shell operations for cancellation via AbortSignal
-
-### Changed
-
-- Renamed `find()` to `glob()` for file discovery operations
-- Renamed `FindMatch` to `GlobMatch` and `FindOptions` to `GlobOptions`
-- Moved timeout and abort signal handling into unified `Cancellable` interface across grep, glob, and shell modules
-- Updated `Shell.abort()` to accept optional abort reason parameter
-- Simplified `htmlToMarkdown()` signature by removing `RequestOptions` parameter
-
-### Removed
-
-- Removed `RequestOptions` type and `wrapRequestOptions()` utility function
-- Removed `abortShellExecution()` function; use `Shell.abort()` instead
-- Removed `executionId` parameter from `ShellExecuteOptions`
-
-## [10.1.0] - 2026-02-01
-
-### Breaking Changes
-
-- Changed `executionId` parameter type from `string` to `number` in `abortShellExecution()` and `ShellExecuteOptions`
-- Removed `sessionKey` field from `ShellExecuteOptions`
-
-### Added
-
-- Added `getWorkProfile()` function to retrieve work scheduling profiling data from a circular buffer of recent activity
-- Added `WorkProfile` type with folded stack format, markdown summary, SVG flamegraph, and sample metrics for profiling results
-
-## [9.8.0] - 2026-02-01
-
-### Breaking Changes
-
-- Removed `resize()` function; use `PhotonImage.resize()` method instead
-- Removed `terminateImageWorker()` function
-- Changed `PhotonImage.new_from_byteslice()` to `PhotonImage.parse()`
-- Changed `PhotonImage.get_bytes()` to `encode(ImageFormat.PNG, 100)`
-- Changed `PhotonImage.get_bytes_jpeg(quality)` to `encode(ImageFormat.JPEG, quality)`
-- Removed `get_width()` and `get_height()` methods; use `width` and `height` properties instead
-- Removed manual resource management via `free()` and `Symbol.dispose`
-
-### Added
-
-- Added automatic extraction of embedded native addon to `~/.omp/natives/<version>` on first run for compiled binaries
-- Added `embed:native` build script to embed platform-specific native addon payloads into compiled binaries
-- Exported `Shell` class for creating persistent shell sessions with `run()` method and session options
-- Exported `ShellOptions`, `ShellRunOptions`, and `ShellRunResult` types for shell session management
-- Exported `find()` function for file discovery with glob patterns and .gitignore support
-- Exported `FindOptions`, `FindMatch`, and `FindResult` types for file search operations
-- Exported `ImageFormat` enum for specifying output formats (PNG, JPEG, WEBP, GIF) in image encoding
-- Added `ImageFormat` enum for specifying output format (PNG, JPEG, WEBP, GIF) in `encode()` method
-- Added `SamplingFilter` as exported enum instead of object
-- Added `Shell` class with persistent session options (`sessionEnv`, `snapshotPath`) and a `run()` command API
-- Exported `getSystemInfo()` function and `SystemInfo` type for retrieving system information including distro, kernel, CPU, and disk details
-- Exported `copyToClipboard()` and `readImageFromClipboard()` functions for clipboard operations
-- Exported `ClipboardImage` type for clipboard image data with MIME type information
-- Added `wrapTextWithAnsi()` function to wrap text to a visible width while preserving ANSI escape codes across line breaks
-- Added native clipboard helpers for copying text and reading images via arboard
-
-### Changed
-
-- Enhanced native addon loading to prioritize extracted embedded addon for compiled binaries before falling back to system paths
-- Improved error messages to provide platform-specific guidance for addon loading failures, including manual download instructions for compiled binaries
-- Reorganized native bindings into modular type files with declaration merging via `NativeBindings` interface
-- Moved type definitions from implementation files to dedicated `types.ts` modules for better separation of concerns
-- Enhanced `SystemInfo` type with additional fields: `os`, `arch`, `hostname`, `shell`, `terminal`, `de`, `wm`, and `gpu`
-- Refactored module exports to use direct destructuring from native bindings instead of wrapper functions
-- Changed `PhotonImage` API to use instance methods (`resize()`, `encode()`) instead of standalone functions
-- Changed `PhotonImage` to use property accessors for `width` and `height` instead of getter methods
-- Embedded native addon payload for compiled binaries and extract to `~/.omp/natives/<version>` on first run
-
-## [9.7.0] - 2026-02-01
-
-### Added
-
-- Exported `killTree` function to kill a process and all its descendants using platform-native APIs
-- Exported `listDescendants` function to list all descendant PIDs of a process
-- Added `dev:native` npm script to build debug native binaries with `--dev` flag
-- Added `OMP_DEV` environment variable support for loading and debugging development native builds
-- Exported keyboard parsing and matching functions: `parseKey`, `parseKittySequence`, `matchesLegacySequence`, and `matchesKey` for terminal input handling
-- Exported `KeyEventType` enum and `ParsedKittyResult` type for Kitty keyboard protocol support
-- Added `parseKey` function to parse terminal input and return normalized key identifiers (e.g., "ctrl+c", "shift+tab")
-- Added `parseKittySequence` function to parse Kitty keyboard protocol sequences with codepoint, modifier, and event type information
-- Added `matchesLegacySequence` function to match legacy escape sequences for specific keys
-- Added `matchesKey` function to match input against key identifiers with support for modifiers and Kitty protocol
-
-### Changed
-
-- Modified native binary build process to support both debug and release builds via `--dev` flag
-- Updated native binary search to prioritize platform-tagged builds and separate debug/release candidates
-- Changed debug builds to output to `pi_natives.dev.node` instead of mixing with release artifacts
-- Improved native binary installation to use atomic rename operations and better fallback handling for Windows DLLs
-- Reordered native binary search candidates to prioritize platform-tagged builds and avoid loading stale cross-compiled binaries
-- Enhanced cross-compilation detection to prevent installing wrong-platform fallback binaries during cross-compilation builds
-
-### Fixed
-
-- Fixed potential issue where cross-compiled binaries could overwrite platform-specific native builds with incorrect architecture binaries
-
-## [9.6.4] - 2026-02-01
-
-### Breaking Changes
-
-- Changed callback signature for `find()` and `grep()` streaming callbacks to receive `(error, match)` instead of `(match)` for proper error handling
-
-## [9.6.2] - 2026-02-01
-
-### Breaking Changes
-
-- Renamed `EllipsisKind` enum to `Ellipsis`
-- Changed `TextInput` type parameter to `string` in `truncateToWidth()`, `visibleWidth()`, `sliceWithWidth()`, and `extractSegments()` functions—Uint8Array is no longer accepted
-- Removed `TextInput` type export from public API
-
-### Added
-
-- Added `visibleWidth()` function to measure the visible width of text, excluding ANSI codes
-
-### Changed
-
-- Reordered native module search paths to prioritize repository build artifacts
-- Improved JSDoc documentation for `truncateToWidth()` with clearer parameter descriptions and behavior details
-- Added early return optimization in `truncateToWidth()` to skip native call when text fits within maxWidth and padding is not requested
-- Added early return optimization in `sliceWithWidth()` to return empty result when length is zero or negative
-
-### Removed
-
-- Removed validation checks for `PhotonImage` and `SamplingFilter` native exports
-- Removed early return optimization in `truncateToWidth()` when text fits within maxWidth
-
-## [9.6.1] - 2026-02-01
-
-### Added
-
-- Added `matchesKittySequence` function to match Kitty protocol sequences for codepoint and modifier
-
-### Removed
-
-- Removed `visibleWidth` function from text utilities
-
-## [9.6.0] - 2026-02-01
-
-### Added
-
-- Support for cross-compilation via `CARGO_BUILD_TARGET` environment variable
-- Support for overriding platform and architecture detection via `TARGET_PLATFORM` and `TARGET_ARCH` environment variables
-
-### Changed
-
-- Native build script now searches for release artifacts in target-specific directories when cross-compiling
-
-## [9.5.0] - 2026-02-01
-
-### Added
-
-- Added `sortByMtime` option to `FindOptions` to sort results by modification time (most recent first) before applying limit
-- Added streaming callback support to `grep()` function via optional `onMatch` parameter for real-time match notifications
-- Exported `RequestOptions` type for timeout and abort signal configuration across native APIs
-- Exported `fuzzyFind` function for fuzzy file path search with gitignore support
-- Exported `FuzzyFindOptions`, `FuzzyFindMatch`, and `FuzzyFindResult` types for fuzzy search API
-- Added `fuzzyFind` export for fuzzy file path search with gitignore support
-
-### Changed
-
-- Changed `grep()` and `fuzzyFind()` to support timeout and abort signal handling via `RequestOptions`
-- Updated `GrepOptions` and `FuzzyFindOptions` to extend `RequestOptions` for consistent timeout/cancellation support
-- Refactored `htmlToMarkdown()` to support timeout and abort signal handling
-
-### Removed
-
-- Removed `grepDirect()` function (use `grep()` instead)
-- Removed `grepPool()` function (use `grep()` instead)
-- Removed `terminate()` export from grep module
-- Removed `terminateHtmlWorker` export from html module
-
-### Fixed
-
-- Fixed potential crashes when updating native binaries by using safe copy strategy that avoids overwriting in-memory binaries
+Older entries are archived in [packages/natives/CHANGELOG.md@85936bf7f9b0](https://github.com/cybermonklabs/oh-my-pi/blob/85936bf7f9b063ed4480929e97f6ad326b1677ec/packages/natives/CHANGELOG.md).

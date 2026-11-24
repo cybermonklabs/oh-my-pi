@@ -705,6 +705,7 @@ mod exit_order {
 				lineage:     Lineage::default(),
 				redirs:      None,
 				ctty:        None,
+				on_busy:     crate::bash::OnBusy::Retry,
 			})
 			.unwrap();
 		let waker = Waker::from(Arc::clone(&wakes));

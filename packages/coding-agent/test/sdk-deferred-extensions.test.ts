@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { type ExtensionPathEntry, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import {
 	partitionStartupExtensions,
 	recordStartupVerdicts,
@@ -77,20 +77,21 @@ describe("startup-deferred extensions", () => {
 		});
 		fs.writeFileSync(neverLoaded, `export default function() {}`);
 
-		const loaded = await loadExtensions([toolOnly, withShortcut, ...drawingPaths], tempDir.path());
+		const entry = (file: string): ExtensionPathEntry => ({ path: file, scope: "explicit" });
+		const loaded = await loadExtensions([toolOnly, withShortcut, ...drawingPaths].map(entry), tempDir.path());
 		expect(loaded.errors).toEqual([]);
 		await recordStartupVerdicts(storage, loaded.extensions);
 
-		const paths = [toolOnly, withShortcut, ...drawingPaths, neverLoaded];
+		const paths = [toolOnly, withShortcut, ...drawingPaths, neverLoaded].map(entry);
 		expect(await partitionStartupExtensions(storage, paths, tempDir.path())).toEqual({
-			eager: [withShortcut, ...drawingPaths, neverLoaded],
-			deferred: [toolOnly],
+			eager: [withShortcut, ...drawingPaths, neverLoaded].map(entry),
+			deferred: [entry(toolOnly)],
 		});
 
 		// An edited source may now register something startup needs: load it eagerly again.
 		fs.appendFileSync(toolOnly, "\n// edited\n");
 		expect(await partitionStartupExtensions(storage, paths, tempDir.path())).toEqual({
-			eager: [toolOnly, withShortcut, ...drawingPaths, neverLoaded],
+			eager: paths,
 			deferred: [],
 		});
 	});
@@ -109,11 +110,12 @@ describe("startup-deferred extensions", () => {
 			}`,
 		);
 
-		const loaded = await loadExtensions([contributor], tempDir.path());
+		const entry: ExtensionPathEntry = { path: contributor, scope: "explicit" };
+		const loaded = await loadExtensions([entry], tempDir.path());
 		await recordStartupVerdicts(storage, loaded.extensions);
 
-		expect(await partitionStartupExtensions(storage, [contributor], tempDir.path())).toEqual({
-			eager: [contributor],
+		expect(await partitionStartupExtensions(storage, [entry], tempDir.path())).toEqual({
+			eager: [entry],
 			deferred: [],
 		});
 	});
@@ -132,7 +134,7 @@ describe("startup-deferred extensions", () => {
 		fs.writeFileSync(deferredPath, DEFERRED_TOOL_EXTENSION(logPath));
 
 		const eventBus = new EventBus();
-		const preloaded = await loadExtensions([eagerPath], tempDir.path(), eventBus);
+		const preloaded = await loadExtensions([{ path: eagerPath, scope: "explicit" }], tempDir.path(), eventBus);
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
@@ -141,7 +143,7 @@ describe("startup-deferred extensions", () => {
 			settings: Settings.isolated(),
 			eventBus,
 			preloadedExtensions: preloaded,
-			deferredExtensionPaths: [deferredPath],
+			deferredExtensionPaths: [{ path: deferredPath, scope: "explicit" }],
 			enableLsp: false,
 			enableMCP: false,
 			skipPythonPreflight: true,
@@ -166,7 +168,7 @@ describe("startup-deferred extensions", () => {
 			expect(session.getEnabledToolNames()).toContain("deferred_probe");
 			expect(fs.readFileSync(logPath, "utf8")).toBe("eager\ndeferred\n");
 			// Subagents and forks inherit the deferred source like an eager one.
-			expect(session.extensionPaths).toContain(deferredPath);
+			expect(session.extensionPaths?.map(entry => entry.path)).toContain(deferredPath);
 		} finally {
 			await session.dispose();
 		}

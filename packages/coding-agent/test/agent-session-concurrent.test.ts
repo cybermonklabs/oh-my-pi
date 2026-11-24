@@ -30,6 +30,7 @@ import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
+	type CustomMessage,
 	convertToLlm,
 	isUserInterruptAbort,
 	shouldRenderAbortReason,
@@ -1056,6 +1057,54 @@ describe("AgentSession TTSR resume gate", () => {
 			rules: ["no-unwrap"],
 			matched: { "no-unwrap": "let val = result.unwrap(" },
 		});
+	});
+
+	it("stores a TTSR injection under the timestamp it was sent with", async () => {
+		collapseSchedulerSettleDelays();
+		// The clock the agent stamps messages with runs a second ahead of the one the session's entries are dated by,
+		// as when a millisecond passes between taking the injection and storing it.
+		const wallNow = Date.now.bind(Date);
+		vi.spyOn(Date, "now").mockImplementation(() => wallNow() + 1_000);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "always",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(testRule);
+		let requests = 0;
+		const sessionManager = SessionManager.inMemory();
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: (_model, _context, options) => {
+				const stream = new AssistantMessageEventStream();
+				if (++requests === 1) pushAbortableTtsrStream(stream, options?.signal);
+				else pushContinuationStream(stream, () => {});
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: sharedModelRegistry,
+			ttsrManager,
+		});
+
+		await session.prompt("Write some Rust code");
+
+		const isInjection = (message: AgentMessage): message is CustomMessage =>
+			message.role === "custom" && message.customType === "ttsr-injection";
+		const sent = session.agent.state.messages.find(isInjection);
+		if (!sent) throw new Error("Expected the TTSR injection in agent state");
+		// A session read again from its entries names each turn by its role and timestamp (the image clamp's drops,
+		// the date/cwd reminder's placements): it must find the turn the agent sent.
+		const reread = sessionManager.buildSessionContext().messages.find(isInjection);
+		expect(reread?.timestamp).toBe(sent.timestamp);
 	});
 
 	it("marks extension agent_end willContinue for TTSR abort and not ordinary abort", async () => {

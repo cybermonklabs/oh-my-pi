@@ -21,7 +21,7 @@ mnemopi:
 With this backend enabled, the coding agent:
 
 1. Opens one or more local Mnemopi SQLite databases according to the configured bank scoping.
-2. Recalls relevant memories into a `<memories>` block for the first model turn of a session and refreshes the base prompt if recall happens from the `agent_start` listener.
+2. Recalls relevant memories into a `<memories>` block for the first model turn of a session and refreshes the base prompt if recall happens from the `agent_start` listener. On a model that binds its thinking to the cached prompt (such as Claude Opus 5.5) the `agent_start` listener recalls nothing, since that run's request is already on its way: the next turn recalls again, and a recall that lands after the model answered goes out as a hidden message after the turn's newest content ([memory](./memory.md)).
 3. Retains completed conversation turns into the retain bank after agent turns, no more often than `mnemopi.retainEveryNTurns`.
 4. Adds recalled memory as extra compaction context when compaction asks the memory backend for `preCompactionContext`.
 5. Uses the normal `/memory view`, `/memory stats`, `/memory diagnose`, `/memory clear`, and `/memory enqueue` commands through the shared memory backend interface.
@@ -33,13 +33,15 @@ Recalled memory is background context, not instructions. Current user messages a
 Selecting Mnemopi makes these discoverable tools available:
 
 - `recall` — search scoped memories. Results are previews and include memory IDs.
-- `retain` — store durable facts explicitly.
+- `retain` — record what was said or done, by whom, when and why.
 - `reflect` — synthesize an answer across recalled memories.
 - `memory_edit` — `update`, `forget`, or `invalidate` an editable memory by ID. Fact-table rows are read-only.
 
 Read the full content and metadata for a recalled result with `read memory://<memory-id>` before replacing it; clipped recall previews are not safe update payloads. The optional `learn` tool is also able to retain into Mnemopi when `autolearn.enabled: true`.
 
-The first-turn recall is part of the transcript's history and is stored in the session file as a `memory_recall` entry. Resuming, switching to, or forking the session sends that block unchanged instead of recalling again, so the system prompt (and the provider prompt cache built on it) stays the same across processes. If a recalled memory was since deleted, invalidated, expired, or its recall preview changed (including by `/memory clear` or `memory_edit`), the next turn started from a prompt carries a one-time hidden note listing what changed; the original block is not rewritten. The session recalls afresh after a context reset, from a different memory database, and on a branch that edits the first prompt. Recalled text stays in the session file even after the memory is deleted from the store.
+The first-turn recall is part of the transcript's history and is stored in the session file as a `memory_recall` entry. Resuming, switching to, or forking the session sends that block unchanged instead of recalling again, so the system prompt (and the provider prompt cache built on it) stays the same across processes. Every build of the system prompt lays the block out as the first request sent it: the delivered text, cut to the budget of that request, as the prompt's own last block after the memory instructions, which then leave the recall out, so a later rebuild (a settings change, a resumed process's own build) neither moves it nor cuts it again to the budget of the moment. If a recalled memory was since deleted, invalidated, expired, or its recall preview changed (including by `/memory clear` or `memory_edit`), the next turn started from a prompt carries a hidden note listing what changed; the original block is not rewritten. The note and the ones earlier processes delivered for the same recall stay with the conversation: a later request whose context no longer holds one (a compaction summarized it, between the tool calls of a run included, or a `/tree` move to a branch without it) sends it again, once, after its newest content, and a request that holds it adds nothing. The session recalls afresh after a context reset, from a different memory database, and on a branch that edits the first prompt. Recalled text stays in the session file even after the memory is deleted from the store.
+
+The entry names the banks and databases the recall read. A resumed session reuses it, and the reports of what changed in it, only while the live configuration reads the same ones; a recall another backend (Hindsight) or another bank recorded is not sent again under Mnemopi, which recalls afresh.
 
 ## Settings
 

@@ -266,8 +266,27 @@ Rules and constraints:
 ## Load order and precedence
 
 `discoverAndLoadExtensions()` composes `discoverExtensionPaths()` and `loadExtensions()`.
-The SDK normally discovers paths first and can reuse imported/prepared factories
-for child sessions.
+`discoverExtensionPaths()` returns one `{ path, scope }` entry per extension source,
+`loadExtensions()` takes such entries, and each prepared extension keeps its
+entry's `scope`. The SDK normally discovers entries first and can reuse
+imported/prepared factories for child sessions, which receive each entry with its scope.
+
+The scope says where discovery found the source:
+
+- `project`: the project's own native module or hook, a hook of its `.claude/hooks/pre/`, `.claude/hooks/post/` or `.codex/hooks/`, or a plugin installed at project scope.
+- `user`: a native module or hook of the agent directory, a hook of `hooks/pre/` or `hooks/post/` under Claude's user directory (`~/.claude` by default) or of `~/.codex/hooks/`, a plugin installed at user scope, or a hook of a plugin loaded with `--plugin-dir`.
+- `explicit`: a path given with `--extension`, `additionalExtensionPaths` or the `extensions` setting, or a hook of such a package root.
+- `inline`: a factory the host passes in code.
+
+A hook of another provider's directory keeps that directory's level. Of the
+`claude` provider's hook directories, every `.ts`/`.js` file loads; of the
+`codex` provider's, only `pre-<tool>.{ts,js}` and `post-<tool>.{ts,js}` files.
+
+`loadExtensions()`, `importExtensionModule()` and the `preloadedExtensionPaths` of the
+SDK and of the task executor (`runSubprocess`) also take a bare path string, which they
+read as an `explicit` entry. A prepared extension given to `bindPreparedExtensions()`,
+in `preloadedPreparedExtensions` (SDK or task executor) or in the SDK's
+`preloadedExtensions` without a `scope` is read as `explicit` too.
 
 Order:
 
@@ -283,16 +302,15 @@ In `sdk.ts`, configured order is:
 
 De-duplication:
 
-- absolute path based
-- first seen path wins
-- later duplicates are ignored
+- by real file: a symlink and its target are one entry; a missing path keeps its absolute spelling
+- the first entry keeps its position and path; later duplicates add no entry
+- a file found first at project level and again at another level takes that level's scope, so a project module also passed with `--extension` is `explicit`
 
 Implication: if the same module path is both auto-discovered and explicitly configured, it is loaded once at the first position (auto-discovered stage).
 
-De-duplication does not use realpaths: different symlink spellings can remain
-distinct discovery entries. Module evaluation runs concurrently, so top-level
-module side effects have no path-order guarantee. Factory invocation and
-registration remain sequential in the discovered order.
+Module evaluation runs concurrently, so top-level module side effects have no
+path-order guarantee. Factory invocation and registration remain sequential in
+the discovered order.
 
 ---
 

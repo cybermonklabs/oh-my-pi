@@ -54,9 +54,10 @@ import { RETRY_CANCELLED, toolReplayAnchor } from "../session/turn-recovery";
 import type { EventBus } from "../utils/event-bus";
 import { yieldEndsRun } from "../tools/yield";
 import { runSubagentFollowUpTurn, softRequestBudgetFor } from "./executor";
-import { persistedAgentDefinition, persistedAgentName } from "./persisted-revive";
+import { persistedAgentDefinition, persistedAgentName, tighterLimit } from "./persisted-revive";
 import { formatTaskResultSummary } from "./result-summary";
 import { cfgTaskMaxRuntimeMs } from "./settings";
+import { readSpawnSpec } from "./spawn-spec";
 import { readDiscardedLaunch } from "./speculative-launch";
 
 /** Where restored subagents' lifecycle and progress frames go, as a live run's do. */
@@ -232,6 +233,9 @@ async function restoreSubagents(
 		const sessionFileOfRef = ref.sessionFile;
 		const agentName = persistedAgentName(ref.displayName, init);
 		const structured = init.tools.includes("yield");
+		// The spawn's own wake inputs where the record stores them, its wake limit never looser than the live
+		// setting; a record an older omp wrote keeps the runtime-neutral agent and the live wake limit.
+		const wake = readSpawnSpec(init).wake;
 		const restoreSkipped = skippedByCallOf(key);
 		manager.register(
 			"task",
@@ -239,10 +243,13 @@ async function restoreSubagents(
 			async ({ signal }) => {
 				const result = await runSubagentFollowUpTurn({
 					id,
-					agent: persistedAgentDefinition(ref.displayName, init),
+					agent: wake?.agent ?? persistedAgentDefinition(ref.displayName, init),
 					message: init.task,
 					restore: true,
 					restoreSkipped,
+					index: wake?.index,
+					description: wake?.description,
+					parentToolCallId: wake?.parentToolCallId,
 					structured,
 					workPoolYieldItems: init.workPoolYieldItems,
 					outputSchema: init.outputSchema,
@@ -252,7 +259,7 @@ async function restoreSubagents(
 					subagentEventBus: options.subagentEventBus,
 					artifactsDir: path.dirname(sessionFileOfRef),
 					storeMaskCwd: session.settings.getCwd(),
-					maxRuntimeMs: cfgTaskMaxRuntimeMs.get(session.settings),
+					maxRuntimeMs: tighterLimit(wake?.maxRuntimeMs, cfgTaskMaxRuntimeMs.get(session.settings)),
 					...softRequestBudgetFor(agentName, session.settings),
 				});
 				const text = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });

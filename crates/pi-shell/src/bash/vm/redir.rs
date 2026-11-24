@@ -131,7 +131,21 @@ pub fn apply(
 		};
 		let before = io(vp).saved.len();
 		if zsh {
-			zsh_install(k, vp, cx, r, &target, line, multios)?;
+			match zsh_install(k, vp, cx, r, &target, line, multios) {
+				// The open waits (a FIFO without its other end): the
+				// background job this vproc decides keeps its virtual pid, so
+				// a reader of `$!` never waits on that rendezvous, which may
+				// need the reader. (zsh's `$!` names its forked child, which
+				// opens the FIFO; a bash lone external leaves the open to its
+				// process ([`defer`]), which zsh's redirections do not.)
+				Err(Halt::Flow(Flow::Block(WaitKey::Fs { op: FsOp::Open, path })))
+					if !k.bangs.is_empty() =>
+				{
+					k.settle_bang(vp.vpid, None);
+					return Err(Halt::Flow(Flow::Block(WaitKey::Fs { op: FsOp::Open, path })));
+				},
+				res => res?,
+			}
 		} else if collecting(k, vp) {
 			if !collect(k, vp, cx, r, &target, line) {
 				end_collect(vp, redirs.len());
@@ -212,20 +226,53 @@ const fn default_fd(op: RedirKind) -> i32 {
 	}
 }
 
-/// Source text of word `w` (for `ambiguous redirect`).
+/// The text bash stores for word `w`, which `ambiguous redirect` names:
+/// the source, with each command substitution as the parser re-prints it
+/// (`$(  true;false  )` is `$(true; false)`, `${| return 3; }` is
+/// `${|return 3; }`), `$'…'` decoded in single quotes and `$"…"` as `"…"`
+/// ([`crate::bash::syntax::word_text`]). The unit's syntax is parsed again
+/// for it (an error path); a zsh word, or one that syntax does not hold at
+/// the word's span, is named by its source text.
 fn word_text(unit: &Unit, w: u32) -> BString {
 	let node = unit.words[w as usize].node;
-	unit
-		.nodes
-		.get(node as usize)
-		.map_or_else(BString::default, |n| {
-			BString::from(
-				unit
-					.source
-					.get(n.lo as usize..n.hi as usize)
-					.unwrap_or_default(),
-			)
-		})
+	let Some(info) = unit.nodes.get(node as usize) else {
+		return BString::default();
+	};
+	let source = || {
+		BString::from(
+			unit
+				.source
+				.get(info.lo as usize..info.hi as usize)
+				.unwrap_or_default(),
+		)
+	};
+	if unit.mode.dialect() != Dialect::Bash {
+		return source();
+	}
+	let syntax = match unit.trace_syntax.get() {
+		Some(s) => Arc::clone(s),
+		None => match crate::bash::trace::syntax::UnitSyntax::restore(unit) {
+			Some(s) => Arc::new(s),
+			None => return source(),
+		},
+	};
+	let tree = &syntax.tree.tree;
+	// The word is the node of its preorder id ([`crate::bash::syntax::NodeId`])
+	// at its span: unit-relative (a re-parsed unit) or from the offset the
+	// syntax keeps (a deferred function body).
+	let at = tree.nodes.iter().position(|n| {
+		n.kind == crate::bash::syntax::tree::K::Word
+			&& n.id == node
+			&& ((n.lo, n.hi) == (info.lo, info.hi)
+				|| (n.lo.checked_sub(syntax.offset), n.hi.checked_sub(syntax.offset))
+					== (Some(info.lo), Some(info.hi)))
+	});
+	let Some(at) = at else {
+		return source();
+	};
+	let mut out = Vec::new();
+	crate::bash::syntax::word_text(crate::bash::syntax::Word::at(tree, at as u32), &mut out);
+	BString::from(out)
 }
 
 /// The expanded target (a path, an fd number, or document bytes). `Ok(Err(d))`:
@@ -2626,5 +2673,133 @@ mod tests {
 		});
 		assert_eq!(wrote.ok(), Some(100));
 		assert_eq!(state.lock().got, bytes, "the target's bytes");
+	}
+
+	/// What a [`Held`] target took, and the marks of its chunks.
+	#[derive(Default)]
+	struct HeldState {
+		got:   Vec<u8>,
+		marks: Vec<Mark>,
+		waker: Option<Waker>,
+	}
+
+	/// A tee target that takes every write at once into its writer thread's
+	/// hand, as a host file does, and writes it out only when the test says
+	/// so ([`write_out`]): its chunks' marks stay not done until then.
+	struct Held(Arc<parking_lot::Mutex<HeldState>>);
+
+	impl File for Held {
+		fn poll_read(
+			&mut self,
+			_cx: &mut Context<'_>,
+			_buf: &mut [u8],
+		) -> Poll<std::io::Result<usize>> {
+			Poll::Ready(Ok(0))
+		}
+
+		fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+			self.poll_write_marked(cx, buf).map_ok(|(n, _)| n)
+		}
+
+		fn poll_write_marked(
+			&mut self,
+			_cx: &mut Context<'_>,
+			buf: &[u8],
+		) -> Poll<std::io::Result<(usize, Option<Mark>)>> {
+			let mark = Mark::new();
+			let mut s = self.0.lock();
+			s.got.extend_from_slice(buf);
+			s.marks.push(mark.clone());
+			Poll::Ready(Ok((buf.len(), Some(mark))))
+		}
+
+		fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+			let marks = self.0.lock().marks.clone();
+			self.poll_settle_marked(cx, &marks)
+		}
+
+		fn poll_settle_marked(
+			&mut self,
+			cx: &mut Context<'_>,
+			marks: &[Mark],
+		) -> Poll<std::io::Result<()>> {
+			if marks.iter().all(Mark::is_done) {
+				return Poll::Ready(marks.iter().try_for_each(Mark::take_error));
+			}
+			self.0.lock().waker = Some(cx.waker().clone());
+			Poll::Pending
+		}
+
+		fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+			Err(std::io::ErrorKind::Unsupported.into())
+		}
+
+		fn kind(&self) -> FileKind {
+			FileKind::Pipe
+		}
+
+		fn os_handle(&self) -> Option<OsHandle> {
+			None
+		}
+
+		fn dup(&self) -> std::io::Result<Box<dyn File>> {
+			Ok(Box::new(Self(Arc::clone(&self.0))))
+		}
+	}
+
+	/// The [`Held`] target's writer thread writes out every chunk it holds.
+	fn write_out(state: &parking_lot::Mutex<HeldState>) {
+		let waker = {
+			let mut s = state.lock();
+			for mark in &s.marks {
+				mark.finish(Ok(()));
+			}
+			s.waker.take()
+		};
+		if let Some(w) = waker {
+			w.wake();
+		}
+	}
+
+	// Failure mode: a tee's write counted as done while a target had taken
+	// the chunk into its writer thread's hand and not written it out (the
+	// tee moved that target on without settling the chunk), or once one
+	// target, not every one, had the write. Of two targets, one writes as
+	// it takes and the other holds what it took: the write is done only
+	// once the second has written its chunk out.
+	#[test]
+	fn a_tee_write_is_done_only_once_a_target_holding_it_has_written_it_out() {
+		let (writes, wrote) = Gate::closed();
+		open(&wrote);
+		let held = Arc::new(parking_lot::Mutex::new(HeldState::default()));
+		let mut tee = Tee::new(vec![
+			FdRef::from_file(Box::new(writes)),
+			FdRef::from_file(Box::new(Held(Arc::clone(&held)))),
+		]);
+		let bytes = vec![b'A'; 100];
+		let took = once(|cx| tee.poll_write_marked(cx, &bytes));
+		let Poll::Ready(Ok((100, Some(mark)))) = took else {
+			panic!("the tee took {took:?}");
+		};
+		for _ in 0..3 {
+			let settled = once(|cx| tee.poll_settle_marked(cx, std::slice::from_ref(&mark)));
+			assert!(settled.is_pending(), "settled with the second target's chunk in its hand");
+		}
+		assert_eq!(wrote.lock().got, bytes, "the first target wrote the write");
+		assert_eq!(held.lock().got, bytes, "the second target took the write into its hand");
+		assert!(
+			!mark.is_done(),
+			"the write was done while the second target had not written its chunk out"
+		);
+		write_out(&held);
+		let settled = ready("the write once the second target wrote its chunk out", |cx| {
+			tee.poll_settle_marked(cx, std::slice::from_ref(&mark))
+		});
+		assert!(settled.is_ok(), "{settled:?}");
+		assert_eq!(held.lock().got, bytes, "the second target's bytes, once");
 	}
 }

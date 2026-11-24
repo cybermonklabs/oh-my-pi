@@ -1,19 +1,19 @@
 //! Control-flow builtins: `eval`, `source`, `return`, `exit`, `break`,
 //! `continue`, `wait`.
 
-use bstr::{BString, ByteSlice};
+use bstr::{BStr, BString, ByteSlice};
 
 use super::{Control, Ctx, Outcome, R, Wait, done, number, opts};
 use crate::bash::{
 	diag::Diag,
 	event::EventData,
-	fs::StatKind,
+	fs::{FileKind, FsPoll, StatKind},
 	ids::Vpid,
 	store::{Key, KeyBuf, MiscKey, OptId, Record},
 	vm::{
 		exec::push_script,
 		locale,
-		probe::{absolute, candidates},
+		probe::{absolute, candidates, dev_fd},
 		proc::{Probe, ProbeResult, ScriptKind},
 		quote,
 	},
@@ -99,6 +99,7 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	// bash's `_evalfile` names the file it found.
 	let shown = path.clone().unwrap_or_else(|| file.clone());
 	let path = path.unwrap_or_else(|| absolute(&ctx.vp.cwd, file));
+	bang_before_read(ctx, &path);
 	let text = match ctx.probe(Probe::Read { path: path.clone() })? {
 		ProbeResult::Bytes(Ok(text)) => text,
 		ProbeResult::Bytes(Err(msg)) if msg.as_slice() == b"Is a directory" => {
@@ -147,6 +148,31 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	ctx.k
 		.emit_op(ctx.cx, ctx.vp, 0, EventData::SourceEnter { path: path.as_bstr() });
 	Ok(Outcome { status: 0, control: Control::Frame })
+}
+
+/// `.` and `source` read the whole file before they run any of it. A file
+/// that is not a regular file (a FIFO, a pipe as `/dev/stdin`, which is
+/// the shell's own fd 0) may wait for what the shell does after it reads
+/// `$!`, so a background job this vproc decides keeps its virtual pid
+/// before that read, as it does before a redirection's open of a FIFO.
+fn bang_before_read(ctx: &mut Ctx<'_, '_>, path: &BString) {
+	if !ctx.k.bangs.iter().any(|b| b.vproc == ctx.vp.vpid) {
+		return;
+	}
+	let regular = match dev_fd(path) {
+		Some(fd) => ctx
+			.vp
+			.fds
+			.get(fd)
+			.is_some_and(|h| h.kind() == Some(FileKind::Regular)),
+		None => matches!(
+			ctx.cx.host.fs().stat(BStr::new(path), true),
+			FsPoll::Ready(Ok(st)) if st.kind == StatKind::File
+		),
+	};
+	if !regular {
+		ctx.k.settle_bang(ctx.vp.vpid, None);
+	}
 }
 
 /// zsh `. file [args]` / `source file [args]` (`bin_dot`): `source` tries
@@ -210,6 +236,7 @@ pub fn zsh_source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		}
 		return done(127);
 	};
+	bang_before_read(ctx, &path);
 	let ProbeResult::Bytes(Ok(text)) = ctx.probe(Probe::Read { path: path.clone() })? else {
 		ctx.err(Diag::NoSuchFile { name: file.clone() });
 		return done(127);
@@ -396,10 +423,19 @@ fn bash_logout(ctx: &mut Ctx<'_, '_>, status: i32) -> Result<Option<Outcome>, su
 	Ok(Some(Outcome { status, control: Control::Frame }))
 }
 
-/// `break [n]` / `continue [n]`. A count below 1 is reported and leaves
-/// every loop (status 1); a non-numeric one ends the (non-interactive)
-/// shell.
+/// `break [n]` / `continue [n]`. With no loop in reach (bash
+/// `check_loop_level`, before the count is read) it complains outside
+/// posix mode and succeeds. A count below 1 is reported and leaves every
+/// loop (status 1); a non-numeric one ends the (non-interactive) shell.
 pub fn break_(ctx: &mut Ctx<'_, '_>, args: &[BString], cont: bool) -> R {
+	if crate::bash::vm::exec::bash_loop_count(ctx.vp) == 0 {
+		if !ctx.option(OptId::Posix)? {
+			ctx.err(Diag::Usage {
+				msg: "only meaningful in a `for', `while', or `until' loop".into(),
+			});
+		}
+		return done(0);
+	}
 	let n = match numeric_arg(ctx, args) {
 		Ok(None) => 1,
 		Ok(Some(n)) if n >= 1 => u32::try_from(n).unwrap_or(u32::MAX),
@@ -632,10 +668,16 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 }
 
 /// Whether `pid` is a child this shell can wait for: a job of its own, a
-/// finished child whose status is kept (bash's `bgpids`), or the running
-/// process substitution or coprocess `$!` names.
+/// child whose job left the table with its status kept (bash's bgp list,
+/// [`crate::bash::vm::proc::JobTable::bgp`]), a finished child whose
+/// record is not collected yet, or the running process substitution or
+/// coprocess `$!` names. A job `disown` dropped is none of these (its
+/// record names no parent).
 fn is_child(ctx: &mut Ctx<'_, '_>, pid: Vpid) -> bool {
 	if ctx.vp.jobs.by_vpid(pid).is_some_and(|j| !j.inherited) {
+		return true;
+	}
+	if ctx.vp.jobs.bgp_search(pid).is_some() {
 		return true;
 	}
 	// A subshell copies `$!`, not its parent's children.
@@ -704,13 +746,12 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 		// status is kept.
 		let kept = args.iter().find_map(|a| {
 			let pid = ctx.vp.vpid_of(u32::try_from(number(a)?).ok()?);
-			(ctx.vp.jobs.by_vpid(pid).is_none()
-				&& matches!(
+			let kept = ctx.vp.jobs.bgp_search(pid).is_some()
+				|| (matches!(
 					ctx.k.proc_state(ctx.cx.store, pid),
 					Some(crate::bash::vm::ProcState::Exited(_))
-				)
-				&& ctx.k.started(ctx.cx.store, ctx.vp.vpid, pid))
-			.then_some(pid)
+				) && ctx.k.started(ctx.cx.store, ctx.vp.vpid, pid));
+			(ctx.vp.jobs.by_vpid(pid).is_none() && kept).then_some(pid)
 		});
 		if let Some(pid) = kept {
 			let wait = Wait { children: vec![pid], all: false, any: true, into, force: true };

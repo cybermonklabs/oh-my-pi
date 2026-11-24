@@ -3093,6 +3093,14 @@ describe("AgentSession message pipeline", () => {
 		setMnemopiSessionState(session, {
 			aliasOf: undefined,
 			setSessionId(_sessionId: string) {},
+			conversationTracking() {
+				return {
+					lastRetainedTurn: 0,
+					retentionCursorLoaded: false,
+					hasRecalledForFirstTurn: remembered,
+					lastRecallSnippet: undefined,
+				};
+			},
 			resetConversationTracking() {
 				remembered = false;
 			},

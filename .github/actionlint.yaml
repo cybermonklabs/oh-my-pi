@@ -4,3 +4,11 @@
 self-hosted-runner:
    labels:
       - vmon-large/from=omp-ci
+# actionlint 1.7.12 does not know the jobs context's `result`, which GitHub
+# documents for a reusable workflow's outputs (contexts reference, "jobs
+# context": jobs.<job_id>.result). sami-rust-test.yml gives its two jobs'
+# results to sami-checks' summary that way.
+paths:
+   .github/workflows/sami-rust-test.yml:
+      ignore:
+         - 'property "result" is not defined in object type \{outputs: \{\}\}'

@@ -1,0 +1,7 @@
+# #[ignore]d tests that need root, which the rust_test job in
+# .github/workflows/sami-rust-test.yml runs anyway: each alone, last, as root
+# (`sudo -E`, outside linux-sandbox, which maps one uid), with `--ignored
+# --exact <name>` and a 1200 s bound. The job fails unless each runs there
+# (exactly that test, not still ignored), and when it fails, like any test.
+# One per line: <bazel test target> <libtest test name>  <why it needs root>.
+//crates/pi-builtins:pi-builtins_test rm::tests::reports_a_directory_that_is_its_own_ancestor  bind-mounts a directory into itself to make a cycle rm must report

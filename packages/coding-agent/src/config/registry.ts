@@ -23,6 +23,7 @@
  * Declaration order is significant: the settings panel lists a tab's settings in registration order
  * (sections follow `TAB_GROUPS`), and `config/all-settings.ts` imports every domain in that order.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { logger, parseFlag } from "@oh-my-pi/pi-utils";
 import type { AnyUiMetadata, SubmenuOption, UiBase } from "@oh-my-pi/pi-tui/overlays/settings-defs";
 import type { SettingProvenance, Settings } from "./settings";
@@ -217,6 +218,47 @@ function settingsOf(scope: ScopeLike): Settings {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Read tracking
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** What {@link trackSettingsReads} collects in its async context: the instance it watches and each leaf read. */
+interface SettingsReadLog {
+	readonly settings: Settings;
+	readonly read: Map<AnySetting, unknown>;
+}
+
+const settingsReadLogs = new AsyncLocalStorage<SettingsReadLog>();
+/** {@link trackSettingsReads} calls running; a read looks for its log only while one runs. */
+let trackedReadRuns = 0;
+
+/**
+ * Runs `run` and gives its value with each leaf setting a handle read from `settings` in its async context, with the
+ * value it read first: a derived value counts as a read of each of its leaves, memoized or not. A read through another
+ * instance, such as a proxy over `settings`, does not count.
+ */
+export async function trackSettingsReads<T>(
+	settings: Settings,
+	run: () => Promise<T>,
+): Promise<{ value: T; read: ReadonlyMap<AnySetting, unknown> }> {
+	const read = new Map<AnySetting, unknown>();
+	trackedReadRuns++;
+	try {
+		const value = await settingsReadLogs.run({ settings, read }, run);
+		// A copy: work the run left running still reads into the log.
+		return { value, read: new Map(read) };
+	} finally {
+		trackedReadRuns--;
+	}
+}
+
+/** The log of the {@link trackSettingsReads} running here when it watches `settings`; undefined otherwise. */
+function settingsReadLog(settings: Settings): SettingsReadLog | undefined {
+	if (trackedReadRuns === 0) return undefined;
+	const log = settingsReadLogs.getStore();
+	return log?.settings === settings ? log : undefined;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Handles
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -259,6 +301,10 @@ export abstract class Derived<T> {
 	/** Latest value in `scope`. */
 	get(scope: ScopeLike): T {
 		const settings = settingsOf(scope);
+		// A tracked read counts each leaf, memoized or not; a leaf records itself ({@link trackSettingsReads}).
+		if (settingsReadLog(settings)) {
+			for (const source of this.sources) if (source !== (this as Derived<unknown>)) source.get(settings);
+		}
 		const revision = settings.revision;
 		const cached = settings.valueCache[this.slot];
 		if (cached?.revision === revision) return cached.value as T;
@@ -325,6 +371,32 @@ export abstract class Derived<T> {
 		if ("settings" in scope) scope.addDisposer?.(unsubscribe);
 		return unsubscribe;
 	}
+
+	/**
+	 * {@link listen} for a caller that needs what changed: `onChange` receives each leaf setting of this
+	 * value whose effective value differs from the previous call (or the subscription), with that earlier value.
+	 */
+	listenChanges(scope: ScopeLike, onChange: (changes: readonly SettingChange[]) => void | Promise<void>): () => void {
+		const settings = settingsOf(scope);
+		const sources = this.sources;
+		const seen = sources.map(source => source.get(settings));
+		return this.listen(scope, () => {
+			const changes: SettingChange[] = [];
+			for (let i = 0; i < sources.length; i++) {
+				const value = sources[i].get(settings);
+				if (settingValuesEqual(value, seen[i])) continue;
+				changes.push({ setting: sources[i], previous: seen[i] });
+				seen[i] = value;
+			}
+			return onChange(changes);
+		});
+	}
+}
+
+/** A leaf setting whose effective value changed, with its value before the change ({@link Derived.listenChanges}). */
+export interface SettingChange {
+	readonly setting: AnySetting;
+	readonly previous: unknown;
 }
 
 /**
@@ -542,7 +614,10 @@ export class Setting<T, Id extends string = string> extends Derived<T> {
 	}
 
 	override get(scope: ScopeLike): T {
-		return this.#effectiveEnv(scope) ?? super.get(scope);
+		const value = this.#effectiveEnv(scope) ?? super.get(scope);
+		const log = settingsReadLog(settingsOf(scope));
+		if (log && !log.read.has(this)) log.read.set(this, value);
+		return value;
 	}
 
 	/**
@@ -834,6 +909,21 @@ export function lookup(id: string): AnySetting | undefined {
 /** Every registered setting, in declaration order. */
 export function all(): readonly AnySetting[] {
 	return ordered;
+}
+
+/** {@link everySetting} and the number of registered settings it combines. */
+let everySettingValue: { count: number; value: Derived<unknown> } | undefined;
+
+/**
+ * Every registered setting as one value, built again when more have registered since: its
+ * {@link Derived.listenChanges} hears a change of any setting, each changed one with its earlier value.
+ */
+export function everySetting(): Derived<unknown> {
+	if (everySettingValue?.count !== ordered.length) {
+		const parts = Object.fromEntries(ordered.map(setting => [setting.id, setting]));
+		everySettingValue = { count: ordered.length, value: combine(parts) };
+	}
+	return everySettingValue.value;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

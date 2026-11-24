@@ -4703,7 +4703,7 @@ describe("ACP extension session_start/resources_discover sends (PR #9379 round-6
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -4806,7 +4806,7 @@ describe("ACP extension session_start/resources_discover sends (PR #9379 round-6
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -4913,7 +4913,7 @@ describe("ACP extension session_start/resources_discover sends (PR #9379 round-6
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");

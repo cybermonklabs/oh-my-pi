@@ -250,7 +250,7 @@ pub mod sys {
 	/// `path` read whole, with bytes that are no UTF-8 replaced: a process
 	/// name (`comm`, cut by the kernel at 15 bytes) may be anything, and
 	/// must not hide the fields after it.
-	pub(crate) fn read_lossy(path: &str) -> Option<String> {
+	pub(crate) fn read_lossy(path: impl AsRef<std::path::Path>) -> Option<String> {
 		let bytes = fs::read(path).ok()?;
 		Some(String::from_utf8_lossy(&bytes).into_owned())
 	}
@@ -511,7 +511,7 @@ mod proc_snapshot {
 		};
 		entries
 			.flatten()
-			.filter_map(|entry| parse_stat(&fs::read_to_string(entry.path().join("stat")).ok()?))
+			.filter_map(|entry| parse_stat(&sys::read_lossy(entry.path().join("stat"))?))
 			.map(|stat| {
 				let seconds = |value: u64| ticks.map(|ticks| Duration::from_secs_f64(value as f64 / ticks));
 				// A thread started within the current clock tick has no elapsed time
@@ -2462,6 +2462,82 @@ mod tests {
 		let _ = child.wait();
 		let found = found.expect("the process named p\\377q is in the snapshot");
 		assert_eq!((found.ppid(), start.is_some()), (Some(i32::try_from(std::process::id()).unwrap()), true));
+	}
+
+	/// The threads of a process whose name is no UTF-8 are listed (`ps -M`):
+	/// each thread's `stat` carries its name, and it must not hide the
+	/// thread. Run as a child test process named `p\377q` with three more
+	/// threads, all named so, the listing has a row for each entry of its
+	/// `/proc/<pid>/task`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn the_threads_of_a_process_whose_name_is_no_utf8_are_listed() {
+		use std::os::unix::{ffi::OsStrExt as _, process::CommandExt as _};
+
+		let dir = tempfile::tempdir().unwrap();
+		let link = dir.path().join(std::ffi::OsStr::from_bytes(b"p\xffq"));
+		std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &link).unwrap();
+		// The kernel names the process after the path it runs (`p\377q`);
+		// libtest wants a UTF-8 `argv[0]`.
+		let mut child = std::process::Command::new(&link)
+			.arg0("threads")
+			.args(["--ignored", "--exact", "proc_snapshot::tests::threads_of_a_process_named_p_377q"])
+			.env("PI_THREADS_NAMED", "1")
+			.stdout(std::process::Stdio::null())
+			.stderr(std::process::Stdio::null())
+			.spawn()
+			.unwrap();
+		let pid = i32::try_from(child.id()).unwrap();
+		let tasks = || std::fs::read_dir(format!("/proc/{pid}/task")).map_or(0, Iterator::count);
+		let all_named = || {
+			std::fs::read_dir(format!("/proc/{pid}/task")).is_ok_and(|entries| {
+				entries
+					.flatten()
+					.all(|task| std::fs::read(task.path().join("comm")).ok().as_deref() == Some(b"p\xffq\n"))
+			})
+		};
+		// Until its three threads run and every thread is named `p\377q`;
+		// the bound only keeps a broken helper from hanging the suite.
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+		while tasks() < 4 || !all_named() {
+			if std::time::Instant::now() >= deadline {
+				let _ = child.kill();
+				let _ = child.wait();
+				panic!("the process named p\\377q did not start its three threads, all named so, in 30 s");
+			}
+			std::thread::sleep(std::time::Duration::from_millis(10));
+		}
+		let before = tasks();
+		let listed = ProcInfo::all()
+			.into_iter()
+			.find(|process| process.pid() == pid)
+			.and_then(|process| super::threads_by_pid(std::slice::from_ref(&process)).remove(&pid))
+			.map(|threads| threads.len());
+		let after = tasks();
+		let _ = child.kill();
+		let _ = child.wait();
+		assert_eq!(before, after, "the threads of the process named p\\377q changed while they were listed");
+		assert_eq!(listed, Some(before), "the threads listed of the process named p\\377q");
+	}
+
+	/// Run by [`the_threads_of_a_process_whose_name_is_no_utf8_are_listed`]
+	/// as a process named `p\377q`: names its own thread so (libtest named
+	/// it after the test), then starts three more threads, which take that
+	/// name and sleep until the test kills the process.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "run as a child process by the_threads_of_a_process_whose_name_is_no_utf8_are_listed"]
+	fn threads_of_a_process_named_p_377q() {
+		if std::env::var_os("PI_THREADS_NAMED").is_none() {
+			return;
+		}
+		// SAFETY: PR_SET_NAME reads the NUL-terminated name passed; it names
+		// the calling thread only.
+		unsafe { libc::prctl(libc::PR_SET_NAME, b"p\xffq\0".as_ptr()) };
+		for _ in 0..3 {
+			std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_secs(600)));
+		}
+		std::thread::sleep(std::time::Duration::from_secs(600));
 	}
 
 	/// The case presence alone cannot catch: our recorded parent exited and its pid
