@@ -6,13 +6,15 @@
   sc.py ts-small                   the small TypeScript suites, one "unit<TAB>dir<TAB>bound<TAB>args" a line
   sc.py libtest LOG EXIT SECS ROW UNIT WHO   one libtest binary's result (JSON on stdout)
   sc.py nextest JUNIT EXIT SECS ROW UNIT WHO one nextest run's result
-  sc.py gv-libtest ..., gv-nextest ...       the same for a gVisor row, with GV_ENVIRONMENT's tests set apart
   sc.py gv-control LOG EXIT SECS ROW UNIT WHO the map-limit control: gv-libtest, UNKNOWN unless each ORPHAN_CONTROL_TESTS test ran
   sc.py bun JUNIT LOG EXIT SECS ROW UNIT     one `bun test` run's result
   sc.py plain EXIT SECS ROW UNIT LOG         a command whose exit is its verdict (check:ts)
   sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout; exit 1 unless every row passed
   sc.py skip-forms TREE NOT_MARKERS        each print of TREE/crates that says skip is read or named (JSON)
   sc.py skip-lines RESULTS NOT_MARKERS     each skip line a passing test printed is read or named (JSON)
+  sc.py flaky-failed RESULT KNOWN          the failed tests of one result with a `flaky: ` entry, one a line
+  sc.py retried RESULT TEST REPORT SHAPE   adds one retry of the whole unit (pass, partial, skip or fail) to RESULT
+  sc.py junit-merge OUT JUNIT...           one JUnit report of several (nextest.sh's two passes)
   sc.py selftest                           the counters and the summary against hand-made inputs
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
@@ -21,10 +23,11 @@ with no JUnit report or no summary line, a command the time bound or a signal en
 the plan expects that no job reported, or that two jobs reported, are UNKNOWN, and so is every row
 they belong to. A test that passed after printing a skip marker compared nothing: it is counted
 apart, named, and its unit is UNKNOWN, unless each of its skip lines is a sub-case that
-partial-skips.txt lets that test skip and the entry's witness line is in its output; then it
-passes and is listed as partial. A test that started and never ended is named. In a gVisor
-row only, a test GV_ENVIRONMENT names (one gVisor cannot pass) is listed with its line and reason
-apart from the tree's failures, and does not count in its unit's verdict.
+partial-skips.txt lets that test skip and the entry's witness line is in its output (then it
+passes and is listed as partial), it passed as the other user, or known-failures.txt names each of
+its skip lines for that row and user (`skips: `; then it reads KNOWN). A test that started and
+never ended is named. A failure with a `flaky: ` entry reads KNOWN only when the test passed in
+a retry of its whole unit in the same job (the unit's command again, at most twice).
 """
 
 import json
@@ -53,11 +56,6 @@ PI_SHELL = "pi-shell"
 # under nextest, each in a runsc container, as uid 1000 and as root.
 GV_SET_SHARDS = 4
 GV_WHO = ("uid1000", "root")
-# Tests a gVisor row cannot pass for a reason in gVisor, not in the tree: test name -> the reason.
-# In a gVisor unit their failures and self-skips do not count in the verdict; the summary lists
-# each one, with the line it printed, apart from the tree's failures. Each entry needs evidence.
-BUSY_EXEC = ("gVisor runs a program held open for writing (no ETXTBSY), so there is no busy exec to retry; the test "
-             "says NOT-RUN (spawn/unix/tests.rs busy_exec_refused); the policy tests cover the retry")
 # The map-limit control (gvisor-run.sh) runs the lib's orphan_jobs module at 4 threads. A filter that
 # selects nothing (the module renamed or moved) lets libtest exit 0 having run nothing, so the control
 # needs each of the module's tests by name: these, its #[test] functions at 509a2d77 and a72018dd.
@@ -71,22 +69,6 @@ ORPHAN_CONTROL_TESTS = tuple(f"testkit::suites::orphan_jobs::{t}" for t in (
     "orphans_are_found_again_after_a_restore",
     "without_the_knob_orphaned_jobs_run_on",
 ))
-GV_ENVIRONMENT = {
-    "sys::fs::fifo::tests::an_open_that_may_create_is_refused_in_a_sticky_directory_as_the_plain_open_is":
-        "gVisor has no /proc/sys/fs/protected_fifos (its procfs fs/ lists only aio-max-nr, aio-nr, file-max, "
-        "file-nr, mount-max, nr_open, pipe-max-size), so the test checks nothing",
-    "pi-builtins::cp::tests::a_read_only_file_cp_wrote_gets_its_attributes":
-        "the test skips itself under gVisor, where an attribute set after the mode changed is refused in some runs "
-        "(its own skip line)",
-    "sys::spawn::unix::tests::a_background_jobs_pid_is_known_while_its_program_is_busy": BUSY_EXEC,
-    "sys::spawn::unix::tests::a_background_program_that_stays_busy_fails_as_in_the_foreground": BUSY_EXEC,
-    "sys::spawn::unix::tests::a_busy_background_script_without_a_shebang_still_runs_as_a_script": BUSY_EXEC,
-    "sys::spawn::unix::tests::a_busy_program_runs_once_its_holder_lets_go": BUSY_EXEC,
-    "sys::spawn::unix::tests::a_busy_spawn_leaves_its_thread_to_other_tasks": BUSY_EXEC,
-    "sys::spawn::unix::tests::a_program_that_stays_busy_fails_after_the_waits": BUSY_EXEC,
-    "sys::spawn::unix::tests::a_timeout_ends_a_run_whose_program_is_busy": BUSY_EXEC,
-    "sys::spawn::unix::tests::an_abort_ends_a_run_whose_program_is_busy": BUSY_EXEC,
-}
 # Seconds a pi-shell binary is assumed to take when the weights file does not name it.
 DEFAULT_WEIGHT = 5.0
 # What a test prints when it returns early having checked nothing: a passing test that prints one
@@ -117,7 +99,7 @@ SKIP_WORD = re.compile(
     re.I,
 )
 # A NOT-RUN line a test writes past libtest's capture, to stderr (parse_libtest matches it to its test).
-NOT_RUN = re.compile(r"NOT-RUN ([A-Za-z0-9_]+): ")
+NOT_RUN = re.compile(r"NOT-RUN ([A-Za-z0-9_]+): [^\n]*")
 
 ROWS = (
     ("pi-shell set (runner)", "set-runner"),
@@ -261,7 +243,7 @@ def cmd_shard(who, n, k, meta, weights_path):
 
 
 def result(row, unit, who, status, exit_code, secs, passed=0, failed=0, ignored=0, failures=(), tests=(),
-           note="", self_skipped=(), partial=()):
+           note="", self_skipped=(), partial=(), skip_lines=None):
     return {
         "row": row,
         "unit": unit,
@@ -273,6 +255,9 @@ def result(row, unit, who, status, exit_code, secs, passed=0, failed=0, ignored=
         "failed": failed,
         "ignored": ignored,
         "self_skipped": list(self_skipped),
+        # The skip lines of each test in self_skipped (at most 20), which known-failures.txt's
+        # `skips: ` entries match.
+        "skip_lines": {n: list(ls[:20]) for n, ls in (skip_lines or {}).items()},
         "partial": [list(p) for p in partial],
         "failures": list(failures),
         "tests": [[n, round(t, 3)] for n, t in tests],
@@ -312,9 +297,9 @@ def partial_rules(path=PARTIAL_SKIPS):
 
 
 def skip_reading(name, out, rules):
-    """How a passing test's output reads: None when no line of it holds a skip marker; else (the
-    number of skip lines, the reason) when each skip line is printed by a literal the partial-skip list
-    lets this test skip and that entry's witness is in the output (a partial pass), else (n, None)."""
+    """How a passing test's output reads: None when no line of it holds a skip marker; else (its
+    skip lines, the reason) when each skip line is printed by a literal the partial-skip list lets
+    this test skip and that entry's witness is in the output (a partial pass), else (lines, None)."""
     lines = [l.strip() for l in out.splitlines() if SKIP_MARKER.search(l)]
     if not lines:
         return None
@@ -323,10 +308,10 @@ def skip_reading(name, out, rules):
     for l in lines:
         why = next((r for p, r in live if p.fullmatch(l)), None)
         if why is None:
-            return len(lines), None
+            return lines, None
         if why not in used:
             used.append(why)
-    return len(lines), "; ".join(used)
+    return lines, "; ".join(used)
 
 
 def skip_verdict(res):
@@ -364,7 +349,7 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
     """libtest's JSON events (-Z unstable-options --format json --report-time, --show-output).
     Text that is not an event (a child's or a thread's own writes) is ignored. libtest's
     `timeout` event is its 60 s warning, not a verdict: the test's own ok or failed comes later."""
-    started, ended, slow, times, failures, skipped, partial, oks = set(), set(), set(), {}, [], [], [], set()
+    started, ended, slow, times, failures, skipped, partial, skip_lines, oks = set(), set(), set(), {}, [], [], [], {}, set()
     passed = failed = ignored = 0
     suite_end = None
     rules = partial_rules(partial_path)
@@ -392,9 +377,10 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
                     oks.add(name)
                     k = skip_reading(name, ev.get("stdout") or "", rules)
                     if k and k[1]:
-                        partial.append((name, k[0], k[1]))
+                        partial.append((name, len(k[0]), k[1]))
                     elif k:
                         skipped.append(name)
+                        skip_lines[name] = k[0]
                 elif e == "ignored":
                     ignored += 1
                 else:
@@ -413,17 +399,21 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
     # to the one passing test whose name ends in that name. A line that names no passing test, or
     # more than one, makes the unit UNKNOWN.
     unmatched = []
-    for nr in sorted(set(NOT_RUN.findall("\n".join(lines)))):
+    for m in NOT_RUN.finditer("\n".join(lines)):
+        nr = m.group(1)
         hit = [t for t in oks if t == nr or t.endswith("::" + nr)]
         if len(hit) == 1:
             if hit[0] not in skipped:
                 skipped.append(hit[0])
-        else:
+            # The known-skip entries match a test's skip lines (known_skip).
+            if m.group(0).strip() not in skip_lines.setdefault(hit[0], []):
+                skip_lines[hit[0]].append(m.group(0).strip())
+        elif nr not in unmatched:
             unmatched.append(nr)
 
     def r(status, note=""):
         return result(row, unit, who, status, exit_code, secs, passed, failed, ignored, failures, tests, note, skipped,
-                      partial)
+                      partial, skip_lines)
 
     if code not in (0, 101):
         note = f"exit {exit_code}: the binary did not finish"
@@ -447,88 +437,10 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
     return skip_verdict(res)
 
 
-def libtest_slow(path):
-    """The tests libtest warned about at 60 s (its `timeout` event), sorted."""
-    slow = set()
-    try:
-        for line in open(path, encoding="utf-8", errors="replace"):
-            if line.startswith("{") and '"timeout"' in line:
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                if ev.get("type") == "test" and ev.get("event") == "timeout":
-                    slow.add(ev.get("name", "?"))
-    except OSError:
-        pass
-    return sorted(slow)
-
-
-def test_outputs(path, kind):
-    """{test: what it printed} from a libtest JSON log (kind libtest) or a nextest JUnit report."""
-    out = {}
-    try:
-        if kind == "libtest":
-            for line in open(path, encoding="utf-8", errors="replace"):
-                if line.startswith("{"):
-                    try:
-                        ev = json.loads(line)
-                    except ValueError:
-                        continue
-                    if ev.get("type") == "test" and ev.get("event") in ("ok", "failed"):
-                        out[ev.get("name", "?")] = ev.get("stdout") or ""
-            text = open(path, encoding="utf-8", errors="replace").read()
-            for m in re.finditer(r"NOT-RUN ([A-Za-z0-9_]+): [^\n]*", text):
-                hit = [t for t in out if t == m.group(1) or t.endswith("::" + m.group(1))]
-                if len(hit) == 1:
-                    out[hit[0]] = m.group(0) + "\n" + out[hit[0]]
-        else:
-            for name, _, _, text in junit_cases(path):
-                out[name] = text
-    except (OSError, ET.ParseError):
-        pass
-    return out
-
-
-def why_line(text):
-    """The line that says why: a skip marker, else a panic's message, else the first line."""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    for line in lines:
-        if SKIP_MARKER.search(line):
-            return line[:300]
-    for i, line in enumerate(lines):
-        if "panicked at" in line:
-            return (lines[i + 1] if i + 1 < len(lines) else line)[:300]
-    return lines[0][:300] if lines else "(it printed nothing)"
-
-
-def gv_environment(res, outputs, slow=()):
-    """A gVisor unit's GV_ENVIRONMENT tests leave its failures and self-skips for its `environment`
-    list (each with its line and reason); the unit gets the verdict the rest of its tests give.
-    `slow`: the tests libtest warned about at 60 s, for the note a re-judged unit gets back."""
-    env = []
-    for kind, key in (("failed", "failures"), ("skipped itself", "self_skipped")):
-        for t in [t for t in res[key] if t in GV_ENVIRONMENT]:
-            res[key].remove(t)
-            if key == "failures":
-                res["failed"] -= 1
-            env.append({"test": t, "kind": kind, "line": why_line(outputs.get(t, "")), "reason": GV_ENVIRONMENT[t]})
-    res["environment"] = env
-    # Re-judge only a unit whose FAIL or skip-marker UNKNOWN came from set-apart tests alone (an
-    # UNKNOWN for its exit or its counts stays). As skip_verdict does: a self-skip left keeps it UNKNOWN.
-    if env and not res["failures"] and (res["status"] == "FAIL" or
-                                        (res["status"] == "UNKNOWN" and "printed a skip marker" in res["note"])):
-        res["status"], res["note"] = "PASS", ("past 60 s: " + ", ".join(list(slow)[:10]) if slow else "")
-        res["passed"] += len(res["self_skipped"])
-        res.pop("skip_only", None)
-        skip_verdict(res)
-    return res
-
-
 def gv_control(log, exit_code, secs, row, unit, who):
-    """The map-limit control's result: the gVisor libtest result, UNKNOWN unless every test of
+    """The map-limit control's result: libtest's result, UNKNOWN unless every test of
     ORPHAN_CONTROL_TESTS ran to a verdict; the ones that did not are named."""
-    res = gv_environment(parse_libtest(log, exit_code, secs, row, unit, who), test_outputs(log, "libtest"), libtest_slow(log))
+    res = parse_libtest(log, exit_code, secs, row, unit, who)
     ran = {n for n, _ in res["tests"]} | set(res["failures"])
     missing = [t for t in ORPHAN_CONTROL_TESTS if t not in ran]
     if missing:
@@ -540,8 +452,9 @@ def gv_control(log, exit_code, secs, row, unit, who):
 
 
 def junit_cases(path):
-    """Each <testcase> once. bun nests a <testsuite> per describe block, so walking every suite's
-    cases would count a nested case once per enclosing suite."""
+    """(full name, ok/failed/skipped, seconds, output) of each <testcase> once. bun nests a
+    <testsuite> per describe block, so walking every suite's cases would count a nested case once
+    per enclosing suite."""
     root = ET.parse(path).getroot()
     parent = {c: p for p in root.iter() for c in p}
     for case in root.iter("testcase"):
@@ -562,6 +475,20 @@ def junit_cases(path):
         yield full, kind, t, out
 
 
+def junit_merge(out, paths):
+    """One JUnit report of several (nextest.sh's two passes): every <testsuite> of each under one
+    <testsuites>. Each input must exist and parse; else nothing is written, and the unit has no
+    report (UNKNOWN). Returns the number of test cases written."""
+    if os.path.exists(out):
+        os.remove(out)
+    merged = ET.Element("testsuites")
+    for p in paths:
+        root = ET.parse(p).getroot()
+        merged.extend(root.findall("testsuite") if root.tag == "testsuites" else [root])
+    ET.ElementTree(merged).write(out, encoding="unicode")
+    return sum(1 for _ in merged.iter("testcase"))
+
+
 def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits, partial_path=PARTIAL_SKIPS):
     try:
         code = int(exit_code)
@@ -577,18 +504,19 @@ def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits, pa
     failures = [c[0] for c in cases if c[1] == "failed"]
     ignored = sum(1 for c in cases if c[1] == "skipped")
     rules = partial_rules(partial_path)
-    skipped, partial = [], []
+    skipped, partial, skip_lines = [], [], {}
     for c in cases:
         k = skip_reading(c[0], c[3], rules) if c[1] == "ok" else None
         if k and k[1]:
-            partial.append((c[0], k[0], k[1]))
+            partial.append((c[0], len(k[0]), k[1]))
         elif k:
             skipped.append(c[0])
+            skip_lines[c[0]] = k[0]
     tests = [(c[0], c[2]) for c in cases if c[1] != "skipped"]
 
     def r(s, note=""):
         return result(row, unit, who, s, exit_code, secs, passed, len(failures), ignored, failures, tests, note, skipped,
-                      partial)
+                      partial, skip_lines)
 
     if code not in ok_exits + fail_exits:
         return r("UNKNOWN", f"exit {exit_code}: the run did not finish")
@@ -685,18 +613,42 @@ def fmt_secs(s):
     return f"{s / 60:.1f} min" if s >= 90 else f"{s:.0f} s"
 
 
-def read_known(path):
-    """known-failures.txt: (row, user, unit, test) -> reason. A unit of `*` is any unit of the row."""
-    known = {}
+# The rows whose units are shards a test moves between (ts-ca: files by sorted index; workspace:
+# nextest's count partitions), where a known-failure entry may name `*` for any unit. On the other
+# rows a unit is a binary or a suite, and a test's name is unique only inside it.
+ANY_UNIT_ROWS = ("ts-ca", "workspace")
+
+
+def known_rows(path):
+    """known-failures.txt's entries as lists of fields: five, or six for a `skips: ` entry."""
+    rows = []
     if path and os.path.exists(path):
         for line in open(path, encoding="utf-8"):
             if not line.strip() or line.startswith("#"):
                 continue
             f = line.rstrip("\n").split("\t")
-            if len(f) != 5:
-                sys.exit(f"known-failures.txt: not five tab-separated fields: {line!r}")
-            known[tuple(f[:4])] = f[4]
-    return known
+            if len(f) != (6 if len(f) > 4 and f[4].startswith("skips: ") else 5):
+                sys.exit(f"known-failures.txt: not five tab-separated fields (six for `skips: `): {line!r}")
+            if f[2] == "*" and f[0] not in ANY_UNIT_ROWS:
+                sys.exit(f"known-failures.txt: unit `*` only on the rows {', '.join(ANY_UNIT_ROWS)}: {line!r}")
+            rows.append(f)
+    return rows
+
+
+def read_known(path):
+    """known-failures.txt's failures: (row, user, unit, test) -> reason. A unit of `*` is any unit
+    of the row (ANY_UNIT_ROWS only)."""
+    return {tuple(f[:4]): f[4] for f in known_rows(path) if len(f) == 5}
+
+
+def read_known_skips(path):
+    """known-failures.txt's known self-skips: (row, user, unit, test) -> [(the skip line's start as
+    a pattern, each `{...}` any text; the reason; the start as written)]."""
+    skips = {}
+    for f in known_rows(path):
+        if len(f) == 6:
+            skips.setdefault(tuple(f[:4]), []).append((literal_pattern(f[5]), f[4][len("skips: "):], f[5]))
+    return skips
 
 
 def known_reason(known, row, who, unit, test):
@@ -705,6 +657,23 @@ def known_reason(known, row, who, unit, test):
     moves to another shard when a file is added before it). None when the list does not name it."""
     why = known.get((row, who, unit, test))
     return why if why is not None else known.get((row, who, "*", test))
+
+
+def known_skip(skips, row, who, unit, test, lines):
+    """The reason the known-failure list gives for a test that skipped itself: each of its skip lines
+    starts as one of the test's `skips: ` entries for this row and user (unit or `*`) says. None when
+    a line matches none, or no skip line was kept."""
+    entries = skips.get((row, who, unit, test), []) + skips.get((row, who, "*", test), [])
+    if not entries or not lines:
+        return None
+    used = []
+    for line in lines:
+        why = next((w for p, w, _ in entries if p.match(line)), None)
+        if why is None:
+            return None
+        if why not in used:
+            used.append(why)
+    return "; ".join(used)
 
 
 def rust_literals(text):
@@ -891,8 +860,81 @@ def cmd_skip_lines(results_dir, exceptions_path):
     return result("skipforms", "runtime", "runner", status, 0, 0, int(status == "PASS"), len(fails), failures=fails, note=note)
 
 
+def flaky_failed(result_path, known_path):
+    """The failed tests of one result that the known-failure list names `flaky: ` for its row,
+    user and unit (or `*`): the job runs the whole unit again, at most twice, while one is left."""
+    r = json.load(open(result_path, encoding="utf-8"))
+    known = read_known(known_path)
+    return [f for f in r["failures"]
+            if (known_reason(known, r["row"], r["who"], r["unit"], f) or "").startswith("flaky: ")]
+
+
+def record_retry(result_path, test, report, shape):
+    """Reads one retry of the whole unit (its command again: the same binary or filter, the same
+    threads, the same user; a libtest log, or a JUnit report of nextest or bun) and adds to the
+    result's `retries` for `test`: the outcome, how many of the unit's tests the retry ran, and
+    `shape`, the script's words for how it ran. The outcome is `pass`, `partial` (it passed in a
+    retry that did not run every test the unit ran: a test alone or at another size is not the
+    same race), `skip` (it passed after a skip marker, or was skipped) or `fail` (it failed, did
+    not end, or is not in the report). Returns the outcome."""
+    outcome, ran = "fail", set()
+    if report.endswith(".xml"):
+        try:
+            for name, kind, _, out in junit_cases(report):
+                if kind != "skipped":
+                    ran.add(name)
+                if name == test:
+                    outcome = ("fail" if kind == "failed" else "skip" if kind == "skipped" or SKIP_MARKER.search(out)
+                               else "pass")
+        except (OSError, ET.ParseError):
+            pass
+    else:
+        try:
+            lines = open(report, encoding="utf-8", errors="replace").read().splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            ev = libtest_event(line)
+            if ev and ev.get("type") == "test" and ev.get("event") in ("ok", "failed"):
+                ran.add(ev.get("name"))
+                if ev.get("name") == test:
+                    outcome = "fail" if ev["event"] == "failed" else "skip" if SKIP_MARKER.search(ev.get("stdout") or "") else "pass"
+    r = json.load(open(result_path, encoding="utf-8"))
+    unit = {n for n, _ in r["tests"]} | set(r["failures"])
+    of = len(unit)
+    n = len(ran & unit)
+    if outcome == "pass" and n < of:
+        outcome = "partial"
+    r.setdefault("retries", {}).setdefault(test, []).append({"outcome": outcome, "ran": n, "of": of, "shape": shape})
+    json.dump(r, open(result_path, "w", encoding="utf-8"))
+    return outcome
+
+
 def cmd_summary(results_dir, build_dir, known_path=None):
     known = read_known(known_path)
+    skips = read_known_skips(known_path)
+
+    def failure_reason(r, row, f):
+        """(the reason, how the summary shows it) for failure f of result r; no reason when the
+        failure is NEW. A flaky entry gives its reason only when the test passed in a retry of the
+        whole unit in the same job (set.sh, nextest.sh, ts.sh: the unit's command again, at most
+        twice): a retry of the test alone does not show the race of the full run."""
+        why = known_reason(known, row, r["who"], r["unit"], f)
+        if why is None:
+            return None, "**NEW**"
+        if not why.startswith("flaky: "):
+            return why, f"KNOWN ({why})"
+        tries = r.get("retries", {}).get(f, [])
+        outcomes = [t["outcome"] for t in tries]
+        if "pass" in outcomes:
+            t = tries[outcomes.index("pass")]
+            return why, (f"KNOWN ({why}; it passed on retry {outcomes.index('pass') + 1} of {len(tries)}, "
+                         f"the whole unit again: {t['ran']} of {t['of']} tests, {t['shape']})")
+        if not tries:
+            return None, f"**NEW** (listed as `{why}`, but no retry of its unit ran)"
+        seen = ", ".join(f"{t['outcome']} ({t['ran']} of {t['of']} tests, {t['shape']})" for t in tries)
+        return None, f"**NEW** (listed as `{why}`, but no retry of the whole unit passed it: {seen})"
+
     results = load_results(results_dir)
     got, dup = {}, set()
     for r in results:
@@ -921,7 +963,9 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                  "passing test printed a skip marker and passed as no other user (even when every failure of the "
                  "unit is known), or when no job (or more than one) reported it; its row is then UNKNOWN too. A test "
                  "whose only skip lines are sub-cases the partial-skip list names for it, with that entry's witness "
-                 "line in its output, passes and is listed as partial.")
+                 "line in its output, passes and is listed as partial. A self-skip the known-failure list names "
+                 "(`skips: `, for that row and user) reads KNOWN; a failure with a `flaky: ` entry reads KNOWN "
+                 "only when a retry of the test in the same job passed.")
     lines.append("")
     lines.append("| Row | Verdict | Units: pass / known / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
@@ -932,25 +976,36 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         rs = []
         for e in units:
             r = got.get(e)
-            open_ = []
+            unlisted = []
             if r is None:
                 r = result(key, e[1], e[2], "UNKNOWN", "-", 0, note="no result: its job reported nothing (it failed before its upload, did not run, or its upload was planted away)")
             elif e in dup:
                 r = dict(r, status="UNKNOWN", note="two jobs reported this unit")
             else:
+                # A self-skip is covered when the same test passed as the other user on the same runtime, and known when
+                # each of its skip lines is a `skips: ` entry of this row and user.
                 others = [w for w in (GV_WHO if runtime(key) == "gvisor" else SET_WHO) if w != r["who"]]
                 open_ = [s for s in r.get("self_skipped", []) if not any(s in passed_as.get((runtime(key), r["unit"], w), ()) for w in others)]
+                listed = {}
+                for s in open_:
+                    why = known_skip(skips, key, r["who"], r["unit"], s, r.get("skip_lines", {}).get(s))
+                    if why is not None:
+                        listed[s] = why
+                unlisted = [s for s in open_ if s not in listed]
+                r = dict(r, known_skips=listed)
                 if r.get("skip_only") and r["status"] == "UNKNOWN":
-                    if open_:
-                        r = dict(r, note=f"{len(open_)} test(s) skipped themselves here and passed as no other user: " + ", ".join(open_[:12]))
+                    if unlisted:
+                        r["note"] = f"{len(unlisted)} test(s) skipped themselves here and passed as no other user: " + ", ".join(unlisted[:12])
+                    elif listed:
+                        r.update(status="KNOWN", note=f"{len(listed)} test(s) skipped themselves as the known-failure list says")
                     else:
-                        r = dict(r, status="PASS", note=f"{len(r['self_skipped'])} test(s) skipped themselves as {r['who']} and passed as {', '.join(others)}")
+                        r.update(status="PASS", note=f"{len(r['self_skipped'])} test(s) skipped themselves as {r['who']} and passed as {', '.join(others)}")
             # Known failures make a unit KNOWN only when nothing else is open: a test that skipped
-            # itself here and passed as no other user makes it UNKNOWN.
-            if r["status"] == "FAIL" and r["failures"] and all(known_reason(known, key, r["who"], r["unit"], f) is not None for f in r["failures"]):
-                if open_:
-                    r = dict(r, status="UNKNOWN", note=f"every failure is known, but {len(open_)} test(s) skipped themselves here "
-                                                       "and passed as no other user: " + ", ".join(open_[:12]))
+            # itself here, passed as no other user and is not a known skip makes it UNKNOWN.
+            if r["status"] == "FAIL" and r["failures"] and all(failure_reason(r, key, f)[0] for f in r["failures"]):
+                if unlisted:
+                    r = dict(r, status="UNKNOWN", note=f"every failure is known, but {len(unlisted)} test(s) skipped themselves here "
+                                                       "and passed as no other user: " + ", ".join(unlisted[:12]))
                 else:
                     r = dict(r, status="KNOWN")
             rs.append(r)
@@ -974,33 +1029,26 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
             for f in r["failures"]:
-                why = known_reason(known, key, r["who"], r["unit"], f)
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: "
-                               + (f"KNOWN ({why})" if why is not None else "**NEW**"))
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}")
             for f in r.get("self_skipped", []):
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`")
+                why = r.get("known_skips", {}).get(f)
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`" + (f": KNOWN ({why})" if why else ""))
             for f, n, why in r.get("partial", []):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): `{f}`: partial: {n} sub-cases skipped ({why})")
     lines.append("")
-    env = [(r, e) for r in results for e in r.get("environment", [])]
-    if env:
-        lines.append("### gVisor: tests gVisor cannot pass (the environment, not the tree; not in the verdicts)")
-        lines.append("")
-        for r, e in sorted(env, key=lambda x: (x[0]["row"], x[1]["test"])):
-            lines.append(f"- {r['row']} `{r['unit']}` ({r['who']}): {e['kind']} `{e['test']}`: \"{e['line']}\" ({e['reason']})")
-        lines.append("")
     # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
     # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
     # neither: it stays, and so does a `*` entry while any unit of its row did not report. A flaky
-    # entry (its reason starts `flaky: `) is not listed when its test passed.
+    # entry (its reason starts `flaky: `) is not listed when its test passed. A `skips: ` entry is
+    # listed when its test ran without skipping itself, or printed no skip line that starts so.
+    def entry_results(row, who, unit):
+        if unit == "*":
+            return [got.get(e) for e in exp if e[0] == row and e[2] == who], "its row"
+        return [got.get((row, unit, who))], "its unit"
+
     stale = []
     for (row, who, unit, test), why in sorted(known.items()):
-        if unit == "*":
-            rs = [got.get(e) for e in exp if e[0] == row and e[2] == who]
-            where = "its row"
-        else:
-            rs = [got.get((row, unit, who))]
-            where = "its unit"
+        rs, where = entry_results(row, who, unit)
         if not rs or any(r is None or r["status"] == "UNKNOWN" or test in r["failures"] for r in rs):
             continue
         names = {n for r in rs for n, _ in r["tests"]}
@@ -1008,9 +1056,26 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             continue
         stale.append(f"- `{unit}` ({who}) `{test}`: " + ("passed" if test in names else f"no longer in {where}")
                      + f" (listed for: {why})")
+    for (row, who, unit, test), entries in sorted(skips.items()):
+        rs, where = entry_results(row, who, unit)
+        if not rs or any(r is None or (r["status"] == "UNKNOWN" and not r.get("skip_only")) or test in r["failures"]
+                         for r in rs):
+            continue
+        names = {n for r in rs for n, _ in r["tests"]}
+        printed = [line for r in rs for line in r.get("skip_lines", {}).get(test, [])]
+        for pattern, why, start in entries:
+            if test not in names:
+                gone = f"no longer in {where}"
+            elif not printed:
+                gone = "ran without skipping itself"
+            elif not any(pattern.match(line) for line in printed):
+                gone = "printed no skip line that starts so"
+            else:
+                continue
+            stale.append(f"- `{unit}` ({who}) `{test}`: {gone} (listed: skips `{start}`: {why})")
     if stale:
         all_ok = False
-        lines.append("### Known-failure entries to remove (their test did not fail)")
+        lines.append("### Known-failure entries to remove (their test did not fail or skip itself so)")
         lines.append("")
         lines.extend(stale)
         lines.append("")
@@ -1097,14 +1162,8 @@ def selftest():
     check("a NOT-RUN line on stderr is that test's self-skip", (r["status"], r["self_skipped"]), ("UNKNOWN", [busy_t]))
     r = lt([s0, a_s, a_ok, nr_s, nr_ok, nr_end], 0, "NOT-RUN no_such_test: why\n")
     check("a NOT-RUN line that names no test is UNKNOWN", (r["status"], "no_such_test" in r["note"]), ("UNKNOWN", True))
-    p = os.path.join(d, "lt.log")
-    with open(p, "w") as f:
-        f.write(nr_line)
-        for e in [s0, a_s, a_ok, nr_s, nr_ok, nr_end]:
-            f.write(json.dumps(e) + "\n")
-    r = gv_environment(parse_libtest(p, "0", 1, "gv-set-root", "pi-shell", "root"), test_outputs(p, "libtest"), libtest_slow(p))
-    check("a GV_ENVIRONMENT NOT-RUN test is set apart with its line", (r["status"], r["environment"][0]["line"][:28]),
-          ("PASS", "NOT-RUN a_busy_program_runs_"))
+    r = lt([s0, a_s, a_ok, nr_s, nr_ok, nr_end], 0, nr_line)
+    check("a NOT-RUN line is kept as that test's skip line", r["skip_lines"].get(busy_t), [nr_line.strip()])
     # A child that shares the binary's stdout left `test x ... ` unfinished, and the next event came
     # after it on the same line (run 45287678343, pi-shell lib): the event still counts.
     p = os.path.join(d, "glued.log")
@@ -1139,6 +1198,16 @@ def selftest():
                 'name="b" time="1"/></testsuite></testsuite></testsuite></testsuites>')
     r = parse_junit(jn, "100", 1, "b", "u", "r", (0,), (100,))
     check("JUnit nested suites count each case once", (r["passed"], r["failed"], r["failures"]), (1, 1, ["outer::a"]))
+    # nextest.sh's two passes: one report of both, and none when a pass left no report.
+    jm = os.path.join(d, "merged.xml")
+    r = parse_junit(jm, "100", 1, "b", "u", "r", (0,), (100,)) if junit_merge(jm, [ju, js]) == 4 else {}
+    check("JUnit merge of two passes", (r.get("failures"), r.get("ignored"), r.get("self_skipped")),
+          (["pi-builtins::t2"], 1, ["p::t1"]))
+    try:
+        junit_merge(jm, [ju, os.path.join(d, "no-pass2.xml")])
+    except OSError:
+        pass
+    check("JUnit merge with a missing pass writes nothing", os.path.exists(jm), False)
     blog = os.path.join(d, "b.log")
     with open(blog, "w") as f:
         f.write("(pass) x\n")
@@ -1317,18 +1386,133 @@ def selftest():
     open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tp\tfixed since\n")
     rc, out = summary()
     check("a listed test that passed is to be removed", ("`p`: passed (listed for: fixed since)" in out, rc), (True, 1))
-    # A flaky entry (its reason starts `flaky: `) is KNOWN when its test fails and is not listed for
-    # removal when it passes; it is listed when its test is no longer in its unit.
+    # A flaky entry (its reason starts `flaky: `): its failure reads KNOWN only when the test passed in
+    # a retry of its whole unit in the same job (the unit's command again: the same binary or filter,
+    # threads and user), and NEW when no retry ran, every retry failed, or it passed only in a retry
+    # that did not run the whole unit (CiReview at 55a3d02c and at ee06226f: a race that fails at 4
+    # threads and passes alone read KNOWN). It is not listed for removal when its test passed, and is
+    # when its test is no longer in its unit.
+    def rt(outcome, ran=2, of=2, shape="the binary again, --test-threads=4"):
+        return {"outcome": outcome, "ran": ran, "of": of, "shape": shape}
+
     open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tflaky: a race\n"
                                 "set-runner\trunner\tpi-shell::zle_pty\tp\tflaky: a race\n")
     rc, out = summary()
-    check("a flaky entry: KNOWN when it fails, kept when it passed",
-          ("FAILED `k`: KNOWN (flaky: a race)" in out, "`p`: passed" in out, "| pi-shell set (runner) | **KNOWN** |" in out, rc),
-          (True, False, True, 0))
+    check("a flaky failure with no retry", ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of its unit ran)" in out, rc),
+          (True, 1))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("pass")]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure that passed on a retry of the whole unit",
+          ("FAILED `k`: KNOWN (flaky: a race; it passed on retry 2 of 2, the whole unit again: 2 of 2 tests, "
+           "the binary again, --test-threads=4)" in out, "`p`: passed" in out,
+           "| pi-shell set (runner) | **KNOWN** |" in out, rc), (True, False, True, 0))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("fail")]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure that failed every try",
+          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of the whole unit passed it: fail" in out,
+           "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("partial", 1, 2, "the test alone, 1 thread")]}),
+              open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure that passes alone and fails at the unit's threads",
+          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of the whole unit passed it: fail (2 of 2 tests, "
+           "the binary again, --test-threads=4), partial (1 of 2 tests, the test alone, 1 thread))" in out,
+           "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("skip")]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure whose retry skipped itself", ("FAILED `k`: **NEW**" in out, rc), (True, 1))
+    json.dump(dict(zle_runner, retries={"k": [rt("pass")]}), open(os.path.join(res, "zle-runner.json"), "w"))
     open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tgone\tflaky: a race\n")
     rc, out = summary()
     check("a flaky entry whose test left its unit is to be removed",
           ("`gone`: no longer in its unit (listed for: flaky: a race)" in out, rc), (True, 1))
+    json.dump(zle_runner, open(os.path.join(res, "zle-runner.json"), "w"))
+    # The scripts' retries: flaky_failed names the failed tests with a flaky entry, and record_retry
+    # adds one retry of the whole unit: `pass` only when the retry ran every test the unit ran and the
+    # test passed; a pass in a smaller run (the test alone) is `partial`. An event after other text
+    # on its line counts.
+    rj, rl = os.path.join(d, "retry.json"), os.path.join(d, "retry.log")
+    json.dump(result("set-runner", "pi-shell::zle_pty", "runner", "FAIL", 101, 1, passed=1, failed=2, failures=["k", "q"],
+                     tests=[("a", 1.0), ("k", 1.0), ("q", 1.0)]), open(rj, "w"))
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tflaky: a race\n"
+                                "set-runner\trunner\tpi-shell::zle_pty\tq\tthe host\n")
+    check("flaky_failed", flaky_failed(rj, known_file), ["k"])
+
+    def ev(name, event, stdout=""):
+        return json.dumps({"type": "test", "event": event, "name": name, "stdout": stdout}) + "\n"
+
+    open(rl, "w").write(ev("a", "ok") + ev("k", "failed") + ev("q", "failed"))
+    o1 = record_retry(rj, "k", rl, "4 threads")
+    open(rl, "w").write(ev("k", "ok"))
+    o2 = record_retry(rj, "k", rl, "alone")
+    open(rl, "w").write(ev("a", "ok") + "test k ... " + ev("k", "ok") + ev("q", "failed"))
+    o3 = record_retry(rj, "k", rl, "4 threads")
+    check("record_retry of the whole unit and of the test alone", (o1, o2, o3, json.load(open(rj))["retries"]["k"]),
+          ("fail", "partial", "pass", [{"outcome": "fail", "ran": 3, "of": 3, "shape": "4 threads"},
+                                       {"outcome": "partial", "ran": 1, "of": 3, "shape": "alone"},
+                                       {"outcome": "pass", "ran": 3, "of": 3, "shape": "4 threads"}]))
+    # nextest's and bun's retries are JUnit reports of the whole unit.
+    jb = os.path.join(d, "bun-retry.xml")
+    open(jb, "w").write('<testsuites><testsuite name="test/x.test.ts"><testsuite name="PDF pages"><testcase '
+                        'name="paints (each) page." classname="PDF pages" file="test/x.test.ts"/></testsuite></testsuite></testsuites>')
+    rjb = os.path.join(d, "retry-bun.json")
+    json.dump(result("ts-ca", "shard 1/10", "runner", "FAIL", 1, 1, failed=1, failures=["PDF pages::paints (each) page."],
+                     tests=[("PDF pages::paints (each) page.", 1.0)]), open(rjb, "w"))
+    rjn = os.path.join(d, "retry-nextest.json")
+    json.dump(result("builtins", "pi-builtins", "runner", "FAIL", 100, 1, passed=1, failed=1, failures=["pi-builtins::t2"],
+                     tests=[("pi-builtins::t1", 1.0), ("pi-builtins::t2", 1.0)]), open(rjn, "w"))
+    check("record_retry from a JUnit report", (record_retry(rjb, "PDF pages::paints (each) page.", jb, "the shard"),
+          record_retry(rjn, "pi-builtins::t2", ju, "the unit"), record_retry(rjn, "absent", jb, "the unit")),
+          ("pass", "fail", "fail"))
+    # A retry that passed after a skip marker checked nothing: `skip`, from a libtest log and from a
+    # JUnit report.
+    open(rl, "w").write(ev("a", "ok") + ev("k", "ok", "skipped: no zsh here\n") + ev("q", "failed"))
+    jsk = os.path.join(d, "skip-retry.xml")
+    open(jsk, "w").write('<testsuites><testsuite name="p"><testcase classname="p" name="t" time="1"><system-err>'
+                         'p: the host half is skipped: names do not fold\n</system-err></testcase></testsuite></testsuites>')
+    check("record_retry of a retry that skipped itself", (record_retry(rj, "k", rl, "4 threads"),
+          record_retry(rj, "p::t", jsk, "the unit")), ("skip", "skip"))
+    # Known self-skips (`skips: `, a sixth field: the skip line's start): a self-skip reads KNOWN only
+    # when each of its lines starts as an entry of its row and user says; one user's entry never
+    # covers the other user.
+    def bx(who, skipped, lines):
+        return dict(result("builtins", "pi-builtins", who, "UNKNOWN", 0, 1, passed=1,
+                           tests=[("a", 1.0)] + [(s, 1.0) for s in skipped], self_skipped=skipped,
+                           skip_lines={s: lines for s in skipped}), skip_only=True)
+
+    json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root"]), open(os.path.join(res, "b-runner.json"), "w"))
+    json.dump(bx("root", ["c"], ["c --reflink a b: skipped, this filesystem does not clone (x)"]),
+              open(os.path.join(res, "b-root.json"), "w"))
+    zle_k = "set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n"
+    need_root = "builtins\trunner\tpi-builtins\tc\tskips: it needs root\tc {} a b: skipped, it needs root\n"
+    no_clone = "builtins\troot\tpi-builtins\tc\tskips: no clone here\tc --reflink a b: skipped, this filesystem does not clone\n"
+    open(known_file, "w").write(zle_k + need_root)
+    rc, out = summary()
+    check("a known skip for one user only", ("SKIPPED ITSELF `c`: KNOWN (it needs root)" in out,
+          "| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, True, 1))
+    open(known_file, "a").write(no_clone)
+    rc, out = summary()
+    check("a known skip for each user", ("| pi-builtins, nextest default profile | **KNOWN** |" in out, rc), (True, 0))
+    open(known_file, "w").write(zle_k + need_root.replace("builtins\trunner", "builtins\troot") + no_clone)
+    rc, out = summary()
+    check("a known skip listed for the other user", ("`pi-builtins` (runner): UNKNOWN: 1 test(s) skipped themselves" in out, rc),
+          (True, 1))
+    open(known_file, "w").write(zle_k + need_root.replace("builtins", "workspace", 1) + no_clone)
+    rc, out = summary()
+    check("a known skip listed for another row", ("`pi-builtins` (runner): UNKNOWN: 1 test(s) skipped themselves" in out, rc),
+          (True, 1))
+    open(known_file, "w").write(zle_k + need_root + no_clone)
+    json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root", "c -p a b: skipped, no FIFO"]),
+              open(os.path.join(res, "b-runner.json"), "w"))
+    rc, out = summary()
+    check("a self-skip with one line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 1))
+    json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root"]), open(os.path.join(res, "b-runner.json"), "w"))
+    open(known_file, "a").write("builtins\trunner\tpi-builtins\ta\tskips: stale\ta: skipped\n")
+    rc, out = summary()
+    check("a known skip whose test ran without skipping itself is to be removed",
+          ("`a`: ran without skipping itself (listed: skips `a: skipped`: stale)" in out, rc), (True, 1))
+    json.dump(nx("runner", ["c"], ["a"]), open(os.path.join(res, "b-runner.json"), "w"))
+    json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
     # A `*` entry names its test in any unit of its row (a coding-agent shard moves when a file is added).
     for f in os.listdir(res):
         r = json.load(open(os.path.join(res, f)))
@@ -1346,6 +1530,15 @@ def selftest():
     check("a * entry whose test passed or is in no shard is to be removed",
           ("`gone`: no longer in its row (listed for: no WebMCP)" in out, "`t`: passed (listed for: no WebMCP)" in out, rc),
           (True, True, 1))
+    # `*` only on the rows whose units are shards: on the set rows a test's name is unique only in
+    # its binary (CiReview at 55a3d02c).
+    open(known_file, "w").write("set-runner\trunner\t*\tk\tthe host's zsh\n")
+    try:
+        read_known(known_file)
+        refused = False
+    except SystemExit:
+        refused = True
+    check("a * entry on a set row is refused", refused, True)
     json.dump(result("ts-ca", "shard 3/10", "runner", "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
               open(os.path.join(res, "ca3.json"), "w"))
     open(known_file, "w").write("# none\n")
@@ -1458,59 +1651,25 @@ def selftest():
     check("summary without a binary list", ("| pi-shell set (runner) | **UNKNOWN** | - |" in out, rc), (True, 1))
     check("summary without a binary list (gVisor)", "| pi-shell set, gVisor (root) | **UNKNOWN** | - |" in out, True)
 
-    # GV_ENVIRONMENT: in a gVisor row a listed test's self-skip or failure is set apart with its
-    # line; in a host row the same self-skip still makes the unit UNKNOWN; a real failure beside it
-    # still fails the unit.
-    envt = next(iter(GV_ENVIRONMENT))
-    e_s = {"type": "test", "event": "started", "name": envt}
-    e_skip = {"type": "test", "event": "ok", "name": envt, "exec_time": 0.1,
-              "stdout": "UNKNOWN: fs.protected_fifos is None, not 1 or more; nothing was checked\n"}
-    e_fail = {"type": "test", "event": "failed", "name": envt, "exec_time": 0.1,
-              "stdout": "thread 'x' panicked at src/x.rs:1:2:\nassertion failed: refused\n"}
-    end_2ok = {"type": "suite", "event": "ok", "passed": 2, "failed": 0}
-    end_2f = {"type": "suite", "event": "failed", "passed": 1, "failed": 1}
-    end_3f = {"type": "suite", "event": "failed", "passed": 1, "failed": 2}
+    # Known skips for the gVisor rows (known-failures.txt `skips: `): an entry for a gVisor row clears
+    # that row's self-skip; the same skip in a host row stays open.
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if r["row"] in ("builtins", "gv-builtins-uid1000", "gv-builtins-root"):
+            os.remove(os.path.join(res, f))
+    gline = "skipped: under gVisor an attribute set after the mode changed is refused in some runs"
 
-    def gvlt(events, exit_code, row="gv-set-root"):
-        p = os.path.join(d, "gv.log")
-        with open(p, "w") as f:
-            for e in events:
-                f.write(json.dumps(e) + "\n")
-        return gv_environment(parse_libtest(p, str(exit_code), 1, row, "pi-shell", "root"), test_outputs(p, "libtest"), libtest_slow(p))
-
-    r = gvlt([s0, a_s, a_ok, e_s, e_skip, end_2ok], 0)
-    check("gVisor env self-skip set apart", (r["status"], r["passed"], r["self_skipped"], [e["kind"] for e in r["environment"]]),
-          ("PASS", 1, [], ["skipped itself"]))
-    check("gVisor env line", r["environment"][0]["line"], "UNKNOWN: fs.protected_fifos is None, not 1 or more; nothing was checked")
-    r = gvlt([s0, a_s, a_ok, e_s, e_fail, end_2f], 101)
-    check("gVisor env failure set apart", (r["status"], r["failed"], r["failures"], r["environment"][0]["line"]),
-          ("PASS", 0, [], "assertion failed: refused"))
-    r = gvlt([s0, a_s, a_ok, b_s, b_f, e_s, e_fail, end_3f], 101)
-    check("a real failure beside it still fails", (r["status"], r["failures"]), ("FAIL", ["b"]))
-    end_1p1f = {"type": "suite", "event": "failed", "passed": 1, "failed": 1}
-    r = gvlt([s0, a_s, a_skip, e_s, e_fail, end_1p1f], 101)
-    check("a self-skip beside a set-apart failure keeps the unit UNKNOWN", (r["status"], r["self_skipped"]), ("UNKNOWN", ["a"]))
-    e_slow = {"type": "test", "event": "timeout", "name": "a"}
-    r = gvlt([s0, a_s, e_slow, a_ok, e_s, e_skip, end_2ok], 0)
-    check("a re-judged unit keeps its 60 s warning note", (r["status"], r["note"]), ("PASS", "past 60 s: a"))
-    p = os.path.join(d, "host.log")
-    with open(p, "w") as f:
-        for e in [s0, a_s, a_ok, e_s, e_skip, end_2ok]:
-            f.write(json.dumps(e) + "\n")
-    check("a host row keeps the self-skip UNKNOWN", parse_libtest(p, "0", 1, "set-root", "pi-shell", "root")["status"], "UNKNOWN")
-    json.dump(gvlt([s0, a_s, a_ok, e_s, e_skip, end_2ok], 0), open(os.path.join(res, "gv-env.json"), "w"))
+    def gskip(row, who):
+        return dict(result(row, "pi-builtins", who, "UNKNOWN", 0, 1, passed=1, tests=[("a", 1.0), ("ro", 1.0)],
+                           self_skipped=["ro"], skip_lines={"ro": [gline]}), skip_only=True)
+    for row, who in (("gv-builtins-uid1000", "uid1000"), ("gv-builtins-root", "root"), ("builtins", "runner"), ("builtins", "root")):
+        json.dump(gskip(row, who), open(os.path.join(res, f"ks-{row}-{who}.json"), "w"))
+    open(known_file, "w").write("".join(f"gv-builtins-{w}\t{w}\tpi-builtins\tro\tskips: gVisor\tskipped: under gVisor {{}}\n" for w in GV_WHO))
     rc, out = summary()
-    check("the summary lists the gVisor environment test", f"skipped itself `{envt}`: \"UNKNOWN: fs.protected_fifos" in out, True)
-    # The same through a nextest JUnit report (the gv-nextest path and its test names).
-    gj = os.path.join(d, "gv.xml")
-    with open(gj, "w") as f:
-        f.write('<testsuites><testsuite name="pi-builtins"><testcase classname="pi-builtins" name="cp::tests::ok" time="1"/>'
-                '<testcase classname="pi-builtins" name="cp::tests::a_read_only_file_cp_wrote_gets_its_attributes" time="1">'
-                '<system-out>skipped: under gVisor an attribute set after the mode changed is refused in some runs\n'
-                '</system-out></testcase></testsuite></testsuites>')
-    r = gv_environment(parse_junit(gj, "0", 1, "gv-builtins-root", "pi-builtins", "root", (0,), (100,)), test_outputs(gj, "junit"))
-    check("gVisor env self-skip set apart (JUnit)", (r["status"], [e["test"] for e in r["environment"]], r.get("skip_only")),
-          ("PASS", ["pi-builtins::cp::tests::a_read_only_file_cp_wrote_gets_its_attributes"], None))
+    check("a gVisor known skip clears its gVisor row", ("| pi-builtins, nextest default profile, gVisor (root) | **KNOWN** |" in out,
+          "| pi-builtins, nextest default profile, gVisor (uid 1000) | **KNOWN** |" in out), (True, True))
+    check("the same skip in a host row stays open", "| pi-builtins, nextest default profile | **UNKNOWN** |" in out, True)
+    open(known_file, "w").write("# none\n")
     # A gVisor self-skip is covered by the other user's gVisor pass, never by a host row's.
     def gnx(who, skipped, passed):
         return dict(result(f"gv-builtins-{who}", "pi-builtins", who, "UNKNOWN" if skipped else "PASS", 0, 1, passed=len(passed),
@@ -1555,7 +1714,7 @@ def selftest():
     print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest and bun counters, the tree's real "
           "skip lines and partial passes, the shard assignment and per-user weights, the summary's UNKNOWN for a "
           "unit no job or two jobs reported, the known and flaky entries, and skip-forms and skip-lines with "
-          "their controls, and the gVisor rows and their environment tests")
+          "their controls, and the gVisor rows and their known skips")
 
 
 def main(argv):
@@ -1573,13 +1732,8 @@ def main(argv):
     elif c == "nextest":
         junit, ex, secs, row, unit, who = a
         print(json.dumps(parse_junit(junit, ex, secs, row, unit, who, (0,), (100,))))
-    elif c == "gv-libtest":
-        print(json.dumps(gv_environment(parse_libtest(*a), test_outputs(a[0], "libtest"), libtest_slow(a[0]))))
     elif c == "gv-control":
         print(json.dumps(gv_control(*a)))
-    elif c == "gv-nextest":
-        junit, ex, secs, row, unit, who = a
-        print(json.dumps(gv_environment(parse_junit(junit, ex, secs, row, unit, who, (0,), (100,)), test_outputs(junit, "junit"))))
     elif c == "bun":
         print(json.dumps(parse_bun(*a)))
     elif c == "plain":
@@ -1590,6 +1744,13 @@ def main(argv):
         print(json.dumps(cmd_skip_forms(*a)))
     elif c == "skip-lines":
         print(json.dumps(cmd_skip_lines(*a)))
+    elif c == "flaky-failed":
+        for f in flaky_failed(*a):
+            print(f)
+    elif c == "retried":
+        print(record_retry(*a))
+    elif c == "junit-merge":
+        print(f"{junit_merge(a[0], a[1:])} test cases in {a[0]}")
     elif c == "selftest":
         selftest()
     else:
