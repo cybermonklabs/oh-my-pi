@@ -15,11 +15,14 @@
 
 mod obash_support;
 
-use std::{fs, os::unix::process::ExitStatusExt};
+use std::{
+	fs,
+	os::unix::{fs::symlink, process::ExitStatusExt},
+};
 
 use pi_shell::{Shell, ShellRunOptions, cancel::CancelToken};
 
-use crate::obash_support::{obash, output};
+use crate::obash_support::{command, obash, output};
 
 /// How a row's shell ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,7 +230,29 @@ fn exec_dies_of_the_signal_its_program_died_of() {
 		(r#"trap "echo T" EXIT; exec /bin/sh -c "kill -TERM \$\$""#, "", "", End::Signal(15)),
 		(r#"trap "echo T" EXIT; exec /bin/sh -c "kill -INT \$\$""#, "", "", End::Signal(2)),
 		(r#"trap "echo T" EXIT; exec /bin/sh -c "kill -PIPE \$\$""#, "", "", End::Signal(13)),
+		// SIGKILL's action cannot be set: the shell is killed all the same.
+		(r#"trap "echo T" EXIT; exec /bin/sh -c "kill -KILL \$\$""#, "", "", End::Signal(9)),
+		// The shell's own handler for the signal is gone before it is raised.
+		(r#"trap "echo t" TERM; exec /bin/sh -c "kill -TERM \$\$""#, "", "", End::Signal(15)),
+		(r#"trap "echo t" INT; exec /bin/sh -c "kill -INT \$\$""#, "", "", End::Signal(2)),
 	]);
+}
+
+/// zsh 5.9 too: the shell its `exec` replaced dies of its program's signal
+/// (obash runs as zsh by that name).
+#[test]
+fn zsh_exec_dies_of_the_signal_its_program_died_of() {
+	let tmp = tempfile::tempdir().unwrap();
+	let zsh = tmp.path().join("zsh");
+	symlink(env!("CARGO_BIN_EXE_obash"), &zsh).unwrap();
+	for (code, signal) in [
+		(r#"exec /bin/sh -c "kill -TERM \$\$""#, 15),
+		(r#"trap "echo t" TERM; exec /bin/sh -c "kill -TERM \$\$""#, 15),
+		(r#"exec /bin/sh -c "kill -KILL \$\$""#, 9),
+	] {
+		let o = output(command(&zsh).args(["-f", "-c", code]));
+		assert_eq!(o.status.signal(), Some(signal), "{code:?}: {o:?}");
+	}
 }
 
 #[test]
@@ -266,6 +291,19 @@ fn exec_names_its_program_by_the_full_path() {
 		(
 			r#"printf "echo \$0\n" > s2; chmod +x s2; trap "echo T" EXIT; exec ./s2"#,
 			"D/s2\n",
+			"",
+			End::Status(0),
+		),
+		// One leading `./` goes; the rest joins the directory as it is.
+		(
+			r#"mkdir q; trap "echo T" EXIT; exec .//q"#,
+			"",
+			"PFX: line 1: D//q: Is a directory\n",
+			End::Status(126),
+		),
+		(
+			r#"printf "echo \$0\n" > s2; chmod +x s2; trap "echo T" EXIT; exec .//s2"#,
+			"D//s2\n",
 			"",
 			End::Status(0),
 		),

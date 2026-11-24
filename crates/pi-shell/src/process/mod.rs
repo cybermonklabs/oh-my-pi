@@ -594,8 +594,11 @@ pub fn die_of_signal(signal: i32) {
 	default.sa_sigaction = libc::SIG_DFL;
 	// SAFETY: the mask is valid and writable.
 	unsafe { libc::sigemptyset(&raw mut default.sa_mask) };
-	// SAFETY: a valid action; a number the platform lacks fails with EINVAL.
-	if unsafe { libc::sigaction(signal, &raw const default, std::ptr::null_mut()) } != 0 {
+	// SAFETY: a valid action; a number the platform lacks fails with EINVAL,
+	// and so does SIGKILL, whose action is the default and cannot change.
+	if unsafe { libc::sigaction(signal, &raw const default, std::ptr::null_mut()) } != 0
+		&& signal != libc::SIGKILL
+	{
 		return;
 	}
 	// SAFETY: plain data, filled by sigemptyset.

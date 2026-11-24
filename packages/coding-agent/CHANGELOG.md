@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed `exec` in the `bash` tool's bash code running the EXIT trap of the shell it replaces: as in bash, no EXIT trap runs once `exec` has a program to run, also when the program fails to start and in a subshell, command substitution or background job (a name `exec` does not find, and `shopt -s execfail`, still keep it); `exec` names its program by its full path in its messages and as a script's `$0`
+- Fixed `exec` in the `bash` tool's bash code running the EXIT trap of the shell it replaces: as in bash, no EXIT trap runs once `exec` has a program to run, also when the program fails to start and in a subshell, command substitution or background job (a name `exec` does not find, and `shopt -s execfail`, still keep it); `exec` names its program by its full path in its messages and as a script's `$0`; and `omp bash`/obash die of the signal that killed the program `exec` ran (SIGKILL too; in zsh mode as well)
 
 ## [18.18.6] - 2026-11-09
 

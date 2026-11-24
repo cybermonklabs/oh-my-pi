@@ -4903,10 +4903,19 @@ fn bash_exec(vp: &mut Vproc) -> bool {
 	st(vp).exec_as.is_some() && vp.mode.dialect() != crate::bash::ids::Dialect::Zsh
 }
 
-/// bash's `full_pathname`: `name` against the working directory `cwd`,
-/// one leading `./` dropped (`sh_makepath` with `MP_RMDOT`).
+/// bash's `full_pathname`: a name starting with `/` as it is, else the
+/// working directory `cwd`, `/` and `name` with one leading `./` dropped
+/// (`sh_makepath` with `MP_RMDOT`): `.//x` is `cwd//x`, not `/x`.
 fn full_pathname(cwd: &[u8], name: &[u8]) -> BString {
-	absolute(cwd, name.strip_prefix(b"./").unwrap_or(name))
+	if name.first() == Some(&b'/') {
+		return name.into();
+	}
+	let mut p = BString::from(cwd);
+	if !p.ends_with(b"/") {
+		p.push(b'/');
+	}
+	p.extend_from_slice(name.strip_prefix(b"./").unwrap_or(name));
+	p
 }
 
 /// The answer to `probe` for the command running in `vp` (cached in its
