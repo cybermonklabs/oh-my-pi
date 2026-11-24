@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 30;
+pub const FRAMES_VERSION: u32 = 31;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -94,6 +94,11 @@ struct Image {
 	bangs:     Vec<super::proc::Bang>,
 	/// Their commands' redirections still deciding ([`Kernel::deferrals`]).
 	deferrals: Vec<super::proc::Deferral>,
+	/// Readers of a job's pid that have not spent time since
+	/// ([`Kernel::pid_readers`]), and the ends held from them
+	/// (`Shell::held`): a job that ended stays unreaped for its reader.
+	readers:   Vec<super::PidReader>,
+	held:      Vec<super::Held>,
 }
 
 /// One fd object.
@@ -648,6 +653,8 @@ impl Shell {
 			mems: fds.mems,
 			bangs: k.bangs.clone(),
 			deferrals: k.deferrals.clone(),
+			readers: k.pid_readers.clone(),
+			held: self.held.clone(),
 		};
 		let mut bytes = postcard::to_stdvec(&header).map_err(ExtError::Encode)?;
 		bytes.extend_from_slice(&postcard::to_stdvec(&image).map_err(ExtError::Encode)?);
@@ -722,6 +729,7 @@ impl Shell {
 			slice: None,
 			gone: Vec::new(),
 			orphans: Vec::new(),
+			held: Vec::new(),
 		};
 		let mut report = RestoreReport::default();
 		let mut restored = false;
@@ -794,6 +802,10 @@ impl Shell {
 			.into_iter()
 			.filter(|d| img.procs.iter().any(|p| p.vpid == d.vproc))
 			.collect();
+		// A held end waits for its reader: one not restored is gone, and
+		// the scheduler lets the end happen (`Shell::close_windows`).
+		k.pid_readers = img.readers;
+		self.held = img.held;
 		let built = (0..img.fd_objs.len()).map(|_| None).collect();
 		let mut objs = FdRebuild {
 			objs: img.fd_objs,

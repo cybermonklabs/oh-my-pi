@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `kill -0 $!` straight after a background job whose command ends at once (`true &`, `: &`, `exit 3 &`, a function of builtins, `exec` with no command) finds the job, and `jobs` lists it running, as in bash 5.2 and 5.3: the end of a job whose pid the shell waited for is held, as a child bash has not reaped yet, until the shell spends time (it runs as many ops as a scheduler slice since, or waits for anything but a pid). It found no such process (status 1) and listed the job done, because the job ran to its end while `$!` waited for its pid.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

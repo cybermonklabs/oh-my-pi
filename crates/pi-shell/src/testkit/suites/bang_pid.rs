@@ -424,3 +424,54 @@ fn a_redirection_that_would_wait_is_left_to_the_process() {
 	assert!(is_virtual(out.trim()), "{out}");
 	assert!(world.redirs.lock().iter().all(|(_, r)| r.is_none()));
 }
+
+// Failure mode: `kill -0 $!` straight after a job whose command ends at once
+// finds no such process (status 1), and `jobs` lists the job done: `$!`
+// waited for the job's pid, and the job ran on to its end while the shell
+// waited. Bash's parent knows `$!` at the fork and runs on at once, so its
+// next commands find a child it has not reaped (bash 5.2.21 and 5.3.20:
+// `0`, `Running`). The job's end is held from the shell until it spends
+// time: once it has (it ran as many ops as a scheduler slice since, in
+// `BUSY` or in a loop of `kill -0 $!`; `wait` waits), the job is gone (`1`)
+// and its status is the job's own. A job the shell let end before it
+// looked (`BUSY` first) is gone at once. With a snapshot at every
+// safepoint, the order is the same.
+#[test]
+fn a_job_that_ends_at_once_is_there_for_the_next_command() {
+	let jobs = "0\n[1]+  Running                    true &\n";
+	let spent = format!("true & kill -0 $!; echo $?; {BUSY}; kill -0 $!; echo $?");
+	let first = format!("true & {BUSY}; kill -0 $!; echo $?");
+	let rows: [(&str, &str); 16] = [
+		("true & kill -0 $!; echo $?", "0\n"),
+		(": & kill -0 $!; echo $?", "0\n"),
+		("true & x=1; kill -0 $!; echo $?", "0\n"),
+		("f() { :; }; f & kill -0 $!; echo $?", "0\n"),
+		("exec & kill -0 $!; echo $?", "0\n"),
+		("{ exec; } & kill -0 $!; echo $?", "0\n"),
+		("exit 3 & kill -0 $!; echo $?", "0\n"),
+		("true | true & kill -0 $!; echo $?", "0\n"),
+		("/x/true & kill -0 $!; echo $?", "0\n"),
+		("for i in 1 2 3; do true & kill -0 $!; echo $?; done", "0\n0\n0\n"),
+		("true & jobs -p >/dev/null; kill -0 $!; echo $?", "0\n"),
+		("true & kill -0 $!; echo $?; jobs", jobs),
+		("exit 3 & kill -0 $!; echo $?; wait $!; echo $?", "0\n3\n"),
+		(&spent, "0\n1\n"),
+		("true & while kill -0 $! 2>/dev/null; do :; done; echo end", "end\n"),
+		(&first, "1\n"),
+	];
+	let mut wrong = Vec::new();
+	for (src, want) in rows {
+		for fault in [Fault::None, Fault::Snapshot { every: 1 }] {
+			let out = run_script(World::new().host(), src.as_bytes(), &[], fault);
+			let got = String::from_utf8_lossy(&out.stdout).into_owned();
+			if (got.as_str(), out.status) != (want, 0) {
+				wrong
+					.push(format!("`{src}` ({fault:?}): {got:?} status {}, want {want:?}", out.status));
+			}
+			if fault != Fault::None && out.snapshots == 0 {
+				wrong.push(format!("`{src}` ({fault:?}): no snapshot landed"));
+			}
+		}
+	}
+	assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
