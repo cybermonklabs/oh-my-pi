@@ -16,11 +16,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import {
-	IndexedSessionStorage,
-	type SessionStorageBackend,
-	type SessionStorageIndexEntry,
-} from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
+import { IndexedSessionStorage } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { CURRENT_SESSION_VERSION, SESSION_TITLE_SLOT_BYTES } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { LINE_STREAM_CHUNK } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import {
@@ -32,6 +28,7 @@ import {
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
+import { MemoryBackend } from "../helpers/memory-session-backend";
 import { descriptorsUnder, HAS_PROC_FD } from "../helpers/open-descriptors";
 import { rejectionOf } from "../helpers/rejection";
 import { fillDiskUnder, pathUnderRegularFile, spoolWarnings } from "../helpers/spool-unusable";
@@ -106,49 +103,15 @@ async function rewriteBothWays(storage: SqlSessionStorage): Promise<{ stored: st
 }
 
 /**
- * A backend that keeps each session's text in memory and has no streamed full
- * write; it records each `writeFull` body's length and each path `readFull` reads.
+ * A {@link MemoryBackend}, which has no streamed full write, that records each
+ * path `readFull` reads.
  */
-class NoStreamBackend implements SessionStorageBackend {
-	readonly sessions = new Map<string, string>();
-	readonly writeFullBytes: number[] = [];
+class NoStreamBackend extends MemoryBackend {
 	readonly readFullPaths: string[] = [];
 
-	init(): Promise<void> {
-		return Promise.resolve();
-	}
-	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
-		return Promise.resolve([]);
-	}
-	readFull(path: string): Promise<string | null> {
+	override readFull(path: string): Promise<string | null> {
 		this.readFullPaths.push(path);
-		return Promise.resolve(this.sessions.get(path) ?? null);
-	}
-	readSlices(): Promise<[string, string]> {
-		return Promise.resolve(["", ""]);
-	}
-	writeFull(path: string, content: string): Promise<void> {
-		this.writeFullBytes.push(Buffer.byteLength(content));
-		this.sessions.set(path, content);
-		return Promise.resolve();
-	}
-	append(path: string, line: string): Promise<void> {
-		this.sessions.set(path, (this.sessions.get(path) ?? "") + line);
-		return Promise.resolve();
-	}
-	updateSessionTitle(): Promise<void> {
-		return Promise.resolve();
-	}
-	truncate(path: string): Promise<void> {
-		this.sessions.set(path, "");
-		return Promise.resolve();
-	}
-	remove(paths: string[]): Promise<void> {
-		for (const path of paths) this.sessions.delete(path);
-		return Promise.resolve();
-	}
-	move(): Promise<void> {
-		return Promise.resolve();
+		return super.readFull(path);
 	}
 }
 

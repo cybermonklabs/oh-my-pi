@@ -1,16 +1,22 @@
 /**
  * Indexed session storage backends that keep each session's text in a map,
  * for tests of what a full write hands its backend: one with only a whole
- * write, and one that also takes a streamed write.
+ * write, and one that also takes a streamed write. A test that needs a
+ * backend which differs in a few methods extends {@link MemoryBackend} and
+ * overrides only those.
  */
 import type {
 	SessionStorageBackend,
 	SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 
-/** A backend that keeps each session's text in memory and stores a full write as it is given. */
+/**
+ * A backend that keeps each session's text in memory and stores a full write
+ * as it is given; it records the bytes of each whole full write.
+ */
 export class MemoryBackend implements SessionStorageBackend {
 	readonly sessions = new Map<string, string>();
+	readonly writeFullBytes: number[] = [];
 
 	init(): Promise<void> {
 		return Promise.resolve();
@@ -25,6 +31,7 @@ export class MemoryBackend implements SessionStorageBackend {
 		return Promise.resolve(["", ""]);
 	}
 	writeFull(path: string, content: string): Promise<void> {
+		this.writeFullBytes.push(Buffer.byteLength(content));
 		this.sessions.set(path, content);
 		return Promise.resolve();
 	}
@@ -48,15 +55,10 @@ export class MemoryBackend implements SessionStorageBackend {
 	}
 }
 
-/** A {@link MemoryBackend} with a streamed full write; it records the bytes of each full write by kind. */
+/** A {@link MemoryBackend} with a streamed full write; it records the bytes of each streamed full write too. */
 export class StreamingMemoryBackend extends MemoryBackend {
 	readonly streamedBytes: number[] = [];
-	readonly writeFullBytes: number[] = [];
 
-	override writeFull(path: string, content: string): Promise<void> {
-		this.writeFullBytes.push(Buffer.byteLength(content));
-		return super.writeFull(path, content);
-	}
 	async writeFullStream(path: string, chunks: AsyncIterable<Uint8Array>, byteLength: number): Promise<void> {
 		const parts: Uint8Array[] = [];
 		for await (const chunk of chunks) parts.push(chunk);

@@ -11,11 +11,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { buildStage1RolloutItems, collectThreads } from "@oh-my-pi/pi-coding-agent/memories";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import {
-	IndexedSessionStorage,
-	type SessionStorageBackend,
-	type SessionStorageIndexEntry,
-} from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
+import { IndexedSessionStorage } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import {
 	defaultSessionStorage,
 	FileSessionStorage,
@@ -25,6 +21,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { parseJsonlLenient, TempDir } from "@oh-my-pi/pi-utils";
+import { MemoryBackend } from "../helpers/memory-session-backend";
 import { raceAfterFirstChunk, STILL } from "../session/chunked-read-race";
 import { LEASE_BACKENDS, openLeaseDb } from "../session/sql-session-lease-fixture";
 
@@ -87,43 +84,17 @@ function messageLine(index: number, body: string): string {
 }
 
 /** Sessions in a map, read only whole as Redis and SDK backends read them (no `readChunks`), counting the reads. */
-class WholeReadBackend implements SessionStorageBackend {
-	readonly sessions = new Map<string, string>();
+class WholeReadBackend extends MemoryBackend {
 	fullReads = 0;
 
-	init(): Promise<void> {
-		return Promise.resolve();
-	}
-	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
-		return Promise.resolve([]);
-	}
-	readFull(path: string): Promise<string | null> {
+	override readFull(path: string): Promise<string | null> {
 		this.fullReads++;
-		return Promise.resolve(this.sessions.get(path) ?? null);
+		return super.readFull(path);
 	}
-	readSlices(): Promise<[string, string]> {
+	override readSlices(): Promise<[string, string]> {
 		return Promise.reject(new Error("stage 1 reads no slices"));
 	}
-	writeFull(path: string, content: string): Promise<void> {
-		this.sessions.set(path, content);
-		return Promise.resolve();
-	}
-	append(path: string, line: string): Promise<void> {
-		this.sessions.set(path, (this.sessions.get(path) ?? "") + line);
-		return Promise.resolve();
-	}
-	updateSessionTitle(): Promise<void> {
-		return Promise.resolve();
-	}
-	truncate(path: string): Promise<void> {
-		this.sessions.set(path, "");
-		return Promise.resolve();
-	}
-	remove(paths: string[]): Promise<void> {
-		for (const path of paths) this.sessions.delete(path);
-		return Promise.resolve();
-	}
-	move(): Promise<void> {
+	override move(): Promise<void> {
 		return Promise.reject(new Error("stage 1 moves nothing"));
 	}
 }
