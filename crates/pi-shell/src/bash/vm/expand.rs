@@ -320,10 +320,19 @@ impl<'e, 'c> Expander<'e, 'c> {
 		Ok(())
 	}
 
-	/// The lookups bash makes of the special variable `s` at `site`
-	/// ([`dynvars::look`]), once although a park replays this expansion.
-	pub fn look_once(&mut self, s: dynvars::Special, site: dynvars::Site) -> X<()> {
-		self.effect(|ex| Ok(dynvars::look(ex.k, ex.cx, ex.vp, s.name(), site)?))
+	/// bash's lookup of a temporary assignment's `name` before its value is
+	/// expanded (`assign_in_env`): a special `RANDOM` or `SECONDS`, or the
+	/// one a reference `name` names ([`dynvars::named`]), at
+	/// [`dynvars::Site::Temp`]. Once although a park replays this
+	/// expansion, and decided on the first run: the value's expansion can
+	/// change what `name` names (`declare -n r; r=${r:=RANDOM}$(…) true`).
+	pub fn look_temp(&mut self, name: &[u8]) -> X<()> {
+		self.effect(|ex| {
+			if let Some(s) = dynvars::named(ex.k, ex.cx.store, ex.vp, name)? {
+				dynvars::look(ex.k, ex.cx, ex.vp, s.name(), dynvars::Site::Temp)?;
+			}
+			Ok(())
+		})
 	}
 
 	fn read_atom(&mut self, f: impl FnOnce(&mut Self) -> X<Val>) -> X<Val> {
@@ -1235,10 +1244,25 @@ impl<'e, 'c> Expander<'e, 'c> {
 					let name = name.clone();
 					let stored = value.clone();
 					let sub = key.as_ref().map(|k| k.as_slice());
+					// A reference with no target takes the value as the name
+					// it refers to (`declare -n r; ${r:=RANDOM}`), and bash
+					// expands to that name (the reference's own value), not
+					// the variable it now names: no `RANDOM` lookup.
+					let unset_ref = sub.is_none()
+						&& state::lookup_declared(&self.k.root, self.cx.store, self.vp, &name)?
+							.is_some_and(|v| {
+								v.attrs.contains(Attrs::NAMEREF) && v.attrs.contains(Attrs::INVISIBLE)
+							});
 					self.effect(|ex| ex.assign_scalar(&name, sub, stored))?;
 					// The value as stored: attributes may have changed it
 					// (`declare -i a; ${a:=4+3}` is 7).
-					let value = match self.read_atom(|ex| ex.var_value(&name, sub, false))? {
+					let value = match self.read_atom(|ex| {
+						if unset_ref {
+							Ok(Val::Str(value.clone()))
+						} else {
+							ex.var_value(&name, sub, false)
+						}
+					})? {
 						Val::Str(s) => s,
 						_ => value,
 					};

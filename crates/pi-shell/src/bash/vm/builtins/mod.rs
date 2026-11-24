@@ -335,12 +335,15 @@ impl<'a, 'c> Ctx<'a, 'c> {
 	/// bash makes of a special `RANDOM` or `SECONDS` at one site
 	/// ([`super::dynvars`]), each a `$RANDOM` draw. The first run logs it
 	/// done ([`Atom::Done`](super::proc::Atom::Done)) at this point of the
-	/// replay log, a re-run skips it. Call it only for a name
-	/// [`super::dynvars::named`] names (nothing is logged for another).
-	pub fn once(
-		&mut self,
-		look: impl FnOnce(&mut Self) -> Result<(), crate::bash::store::StoreError>,
-	) -> Result<(), Need> {
+	/// replay log, a re-run skips it. Call it where every run of the
+	/// builtin calls it, under a condition no run changes, and let `look`
+	/// decide from the state whether anything is looked up: a re-run that
+	/// does not call it leaves its `Done` to the next logged point, a
+	/// command substitution's output, which then runs again without end.
+	pub fn once<E>(&mut self, look: impl FnOnce(&mut Self) -> Result<(), E>) -> Result<(), Need>
+	where
+		Need: From<E>,
+	{
 		if matches!(self.log.get(self.log_cursor), Some(super::proc::Atom::Done)) {
 			self.log_cursor += 1;
 			return Ok(());

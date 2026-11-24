@@ -236,10 +236,23 @@ fn random_draws_as_often_as_bash_looks_it_up() {
 		("unset -n RANDOM RANDOM", "[] 982\n"),
 		("declare -n r=RANDOM; unset -n r", "[] 29338\n"),
 		("declare -n r=RANDOM; for r in 7; do :; done 2>/dev/null", "[] 29338\n"),
-		// An operand quoted as a whole is no array reference: one lookup.
+		// A `for` over a reference looks the chain up before it binds the
+		// word: the first word binds an unset reference, a reference to
+		// another name binds RANDOM with no lookup.
+		("declare -n r; for r in RANDOM RANDOM; do :; done", "[] 29338\n"),
+		("declare -n r=x; for r in RANDOM; do :; done", "[] 18498\n"),
+		// `[[ -v ]]` looks up the text before the operand's first `[` as
+		// written when that is a name (bash's `valid_array_reference` with
+		// `VA_NOEXPAND`), whatever follows it, then the expanded operand.
 		("[[ -v 'RANDOM[1]' ]]", "[] 29338\n"),
 		("[[ -v \"RANDOM[0]\" ]]", "[] 29338\n"),
 		("[[ -v RANDOM[\"1\"] ]]", "[] 982\n"),
+		("[[ -v RANDOM[1]\"\" ]]", "[] 982\n"),
+		("e=; [[ -v RANDOM[1]$e ]]", "[] 982\n"),
+		("[[ -v RANDOM[1]x ]]", "[] 29338\n"),
+		// `${r:=RANDOM}` of a reference with no target makes `r` name
+		// `RANDOM` and expands to that name, with no lookup.
+		("declare -n r; x=${r:=RANDOM}", "[RANDOM] 18498\n"),
 	] {
 		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
 		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
@@ -252,6 +265,61 @@ fn random_draws_as_often_as_bash_looks_it_up() {
 		let (out, err) = run(src);
 		assert_eq!(out, "", "{src}");
 		assert!(err.ends_with("line 1: [-1]: bad array subscript\n"), "{src}: {err}");
+	}
+}
+
+/// A declaration builtin acting through a name reference looks up the
+/// variable it names: at the global level as often as for the name itself,
+/// none for `-n` or an element; in a function four times through its own
+/// reference (the new local is the variable's) and three through another
+/// (the new local shadows the reference), twice for `local -n`. An
+/// assignment through a reference looks it up only through a global one
+/// (`bind_variable` resolves a function's by name). Each form runs after
+/// `RANDOM=5`, as in [`random_draws_as_often_as_bash_looks_it_up`]. Goldens
+/// from bash 5.3.20 (5.2.21 agrees).
+#[test]
+fn random_declarations_through_a_reference_look_it_up() {
+	for (form, want) in [
+		("declare -n r=RANDOM; declare r", "[] 29338\n"),
+		("declare -n r=RANDOM; declare -i r", "[] 982\n"),
+		("declare -n r=RANDOM; declare -n s=r; declare -x s", "[] 982\n"),
+		("declare -n r=RANDOM; declare r+=1", "[] 889\n"),
+		("declare -n r=RANDOM; export r", "[] 29338\n"),
+		("declare -n r=RANDOM; export r+=1", "[] 1803\n"),
+		("declare -n r=RANDOM; declare +n r", "[] 29338\n"),
+		("declare -n r=RANDOM; declare -n r", "[] 18498\n"),
+		("declare -n r=RANDOM; declare 'r[1]=8' 2>/dev/null", "[] 18498\n"),
+		("declare -n r=RANDOM; f() { local r; }; f", "[] 6493\n"),
+		("declare -n r=RANDOM; f() { local -n r; }; f", "[] 6493\n"),
+		("declare -n r=RANDOM; f() { local -n r=x; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { declare -g r; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { export r+=1; }; f", "[] 1803\n"),
+		("f() { local -n q=RANDOM; local q; }; f", "[] 16756\n"),
+		("f() { local -n q=RANDOM; local -n s=q; declare -i s; }; f", "[] 16756\n"),
+		("f() { local -n q=RANDOM; local -n q; }; f", "[] 982\n"),
+		("f() { local -n q=RANDOM; declare +n q; }; f", "[] 982\n"),
+		("f() { local -n q=RANDOM; export q; }; f", "[] 29338\n"),
+		("f() { local -n q=RANDOM; export q+=1; }; f", "[] 1187\n"),
+		("f() { local -n q=RANDOM; declare -g q; }; f", "[] 18498\n"),
+		("f() { local -n q=RANDOM; g; }; g() { local q; }; f", "[] 6493\n"),
+		("f() { local -n q=RANDOM; q+=1; }; f", "[] 2539\n"),
+		("f() { local -n q=RANDOM; g; }; g() { q+=1; }; f", "[] 2539\n"),
+		("declare -n r=RANDOM; f() { r+=1; }; f", "[] 889\n"),
+		("f() { local -n q='RANDOM[1]'; q=8; }; f", "[] 29338\n"),
+	] {
+		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+	// A refused value names the word as written; `+r` the variable.
+	for (src, diag) in [
+		("declare r=7", "line 1: declare: r: readonly variable\n"),
+		("declare +r r", "line 1: declare: RANDOM: readonly variable\n"),
+	] {
+		let src =
+			format!("RANDOM=7; readonly RANDOM; declare -n r=RANDOM; {src}; echo \"st=$? $RANDOM\"");
+		let (out, err) = run(&src);
+		assert_eq!(out, "st=1 20442\n", "{src}");
+		assert!(err.ends_with(diag), "{src}: {err}");
 	}
 }
 
@@ -332,6 +400,30 @@ fn random_readonly_refusals_look_it_up_first() {
 			"st=1 20442\n",
 			"line 1: declare: RANDOM: readonly variable\n",
 		),
+		// `export` and `readonly` look the name up after a refused value
+		// too, through a reference after its two lookups before the value;
+		// `+n` with a value names the reference as written. Goldens from
+		// bash 5.3.20.
+		(
+			"RANDOM=7; readonly RANDOM; export RANDOM=7; echo \"st=$? $RANDOM\"",
+			"st=1 7409\n",
+			"line 1: RANDOM: readonly variable\n",
+		),
+		(
+			"RANDOM=7; readonly RANDOM; readonly RANDOM=7; echo \"st=$? $RANDOM\"",
+			"st=1 7409\n",
+			"line 1: RANDOM: readonly variable\n",
+		),
+		(
+			"RANDOM=7; readonly RANDOM; declare -n r=RANDOM; export r=7; echo \"st=$? $RANDOM\"",
+			"st=1 22989\n",
+			"line 1: RANDOM: readonly variable\n",
+		),
+		(
+			"RANDOM=7; readonly RANDOM; declare -n r=RANDOM; declare +n r=7; echo \"st=$? $RANDOM\"",
+			"st=1 20442\n",
+			"line 1: declare: r: readonly variable\n",
+		),
 	] {
 		let (out, err) = run(src);
 		assert_eq!(out, want, "{src}");
@@ -363,6 +455,20 @@ fn random_lookups_happen_once_when_a_command_runs_again() {
 		("RANDOM=$RANDOM true", "[] 982\n"),
 		("x=${RANDOM}$(echo 1)", "[184981] 29338\n"),
 		("x=$((RANDOM))$(echo 1)", "[184981] 29338\n"),
+		// Through a name reference: the lookups of the variable it names.
+		("a=(0); declare -n r=RANDOM; declare -i r a='($(echo 2))'", "[] 982\n"),
+		("a=(0); declare -n r=RANDOM; declare r a='($(echo 2))'", "[] 29338\n"),
+		("f() { local -n q=RANDOM; local a=(0); local q a='($(echo 2))'; }; f", "[] 16756\n"),
+		("declare -n r=RANDOM; f() { local a=(0); local r a='($(echo 2))'; }; f", "[] 6493\n"),
+		// The first run decides what is looked up, although the declaration
+		// changes what the next run would look through: `local r` shadows
+		// the reference, `+n` ends it.
+		("a=(0); declare -n r=RANDOM; declare +n r a='($(echo 2))'", "[] 29338\n"),
+		("a=(0); declare -n r=RANDOM; declare +n r=7 a='($(echo 2))'", "[] 19344\n"),
+		("f() { local -n q=RANDOM; local a=(0); local +n q a='($(echo 2))'; }; f", "[] 982\n"),
+		// So does a temporary assignment's lookup, decided on the first run:
+		// its value makes `r` a reference to `RANDOM` only then.
+		("declare -n r; r=${r:=RANDOM}$(echo 1) true", "[] 18498\n"),
 	] {
 		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
 		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
@@ -671,6 +777,14 @@ fn seconds_locals_lookups_and_unset() {
 			"declare -n r=SECONDS; for r in 7; do :; done 2>/dev/null; SECONDS=1+1; echo $SECONDS",
 			"2\n",
 		),
+		// The chain is looked up before the word is bound: `r` names `x`,
+		// so `SECONDS` is not looked up and stays non-integer.
+		("declare -n r=x; for r in SECONDS; do :; done; SECONDS=1+1; echo $SECONDS", "0\n"),
+		// A declaration through a reference looks `SECONDS` up; an
+		// assignment through a function's own reference does not.
+		("declare -n r=SECONDS; declare r; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("declare -n r=SECONDS; f() { local r; }; f; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("f() { local -n q=SECONDS; q+=0; }; f; SECONDS=1+1; echo $SECONDS", "0\n"),
 		// A fork keeps whether `unset` removed the special meaning.
 		(
 			"SECONDS=5; (echo $SECONDS); unset SECONDS; (echo \"[$SECONDS]\"); x=$(echo \
@@ -1480,6 +1594,16 @@ fn references_to_elements_of_themselves_and_dangling_references() {
 		"bash: line 1: local: warning: a: circular name reference\nbash: line 1: warning: a: \
 		 circular name reference\nbash: line 1: `a[0]': not a valid identifier\n"
 	);
+}
+
+// Golden: bash 5.3.20 and 5.2.21: `declare` of an element through a
+// reference makes the reference a plain array also when its target exists
+// (outside a function, `declare_internal`'s `array_subscript_assignment`).
+#[test]
+fn an_element_declared_through_a_reference_removes_the_reference() {
+	let (out, err) = run("declare -n x=y; y=(1 2); declare 'x[1]=8'; declare -p x y");
+	assert_eq!(out, "declare -a x=([1]=\"8\")\ndeclare -a y=([0]=\"1\" [1]=\"2\")\n");
+	assert_eq!(err, "bash: line 1: warning: x: removing nameref attribute\n");
 }
 
 #[test]

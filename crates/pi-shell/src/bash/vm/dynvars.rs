@@ -283,6 +283,15 @@ pub enum Site {
 	/// options and value: `make_local_variable` and its callers, before the
 	/// local exists.
 	Local,
+	/// The same in a function through a name reference that is not the
+	/// function's own (a global one, or a caller's): the new local, of the
+	/// reference's name, shadows it (`local r` with a global
+	/// `declare -n r=RANDOM`).
+	LocalShadow,
+	/// In a function, `local -n NAME`, or `local +n NAME` with no value,
+	/// through a name reference: the function's own, or another one with a
+	/// value for the new local reference.
+	LocalNameref,
 	/// `export` or `readonly` with a value, after the assignment
 	/// (`set_or_show_attributes`).
 	ExportAfter,
@@ -318,10 +327,9 @@ pub enum Site {
 	For,
 	/// `unset NAME` and `unset 'NAME[i]'`.
 	Unset,
-	/// `[[ -v NAME ]]`, `test -v NAME` and `test -v 'NAME[i]'`.
+	/// `test -v NAME`, `test -v 'NAME[i]'`, and each of the two lookups of
+	/// `[[ -v NAME[i] ]]`: the name as written, then the expanded operand.
 	Test,
-	/// `[[ -v NAME[i] ]]`.
-	CondElement,
 	/// `${!NAME}`, after the value, and `${!r}` of a name reference `r` to
 	/// the variable.
 	Indirect,
@@ -350,8 +358,8 @@ impl Site {
 			| Self::Indirect
 			| Self::Keys
 			| Self::NamerefElement => 1,
-			Self::DeclareChange | Self::Element | Self::NamerefAssign | Self::CondElement => 2,
-			Self::DeclareNameref | Self::ArithElement => 3,
+			Self::DeclareChange | Self::Element | Self::NamerefAssign | Self::LocalNameref => 2,
+			Self::DeclareNameref | Self::ArithElement | Self::LocalShadow => 3,
 			Self::Local | Self::LetElement => 4,
 			Self::ExpandBefore(e) => EXPANSION[e.sub as usize][e.op as usize].0,
 			Self::ExpandAfter(e) => EXPANSION[e.sub as usize][e.op as usize].1,

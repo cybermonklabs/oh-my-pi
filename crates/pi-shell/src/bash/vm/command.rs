@@ -918,21 +918,10 @@ fn expand(
 			// with no temporary of the name in scope runs its value function
 			// ([`super::dynvars::Site::Temp`]), once although a park replays
 			// the expansion.
-			let temp = if assign_only {
-				None
-			} else {
-				match super::dynvars::named(k, cx.store, vp, &a.name) {
-					Ok(s) => s,
-					Err(err) => {
-						k.fail(err);
-						return Some(Flow::Discard(1));
-					},
-				}
-			};
 			let record = assign_parks(unit, a);
 			let res = expanding(k, vp, cx, Slot::Assigns, record, line, |ex| {
-				if let Some(s) = temp {
-					ex.look_once(s, super::dynvars::Site::Temp)?;
+				if !assign_only {
+					ex.look_temp(&a.name)?;
 				}
 				let index = match a.index {
 					Some(w) => Some(ex.scalar(unit, &unit.words[w as usize])?),
@@ -983,22 +972,8 @@ fn expand(
 				.and_then(|n| unit.source.get(n.lo as usize..n.hi as usize))
 				.unwrap_or_default();
 			let written = &src[..src.iter().position(|&c| c == b'=').unwrap_or(src.len())];
-			let temp = match super::dynvars::named(
-				k,
-				cx.store,
-				vp,
-				written.strip_suffix(b"+").unwrap_or(written),
-			) {
-				Ok(s) => s,
-				Err(err) => {
-					k.fail(err);
-					return Some(Flow::Discard(1));
-				},
-			};
 			let res = expanding(k, vp, cx, Slot::Assigns, word.parks, line, |ex| {
-				if let Some(s) = temp {
-					ex.look_once(s, super::dynvars::Site::Temp)?;
-				}
+				ex.look_temp(written.strip_suffix(b"+").unwrap_or(written))?;
 				ex.scalar(unit, word)
 			});
 			let text = match res {
@@ -1538,7 +1513,7 @@ fn shift_arrayref(arrayref: &mut Vec<u32>) {
 /// bash's `W_ARRAYREF` (`fix_arrayref_words`): the word is written as an
 /// array reference, `name[` in its leading unquoted text and `]` ending
 /// its trailing unquoted text (`d[$k]`, `d["$k"]`, not `"d[$k]"`).
-pub(crate) fn is_arrayref(word: &ir::Word) -> bool {
+fn is_arrayref(word: &ir::Word) -> bool {
 	let (Some(Part::Lit(first)), Some(Part::Lit(last))) = (word.parts.first(), word.parts.last())
 	else {
 		return false;
