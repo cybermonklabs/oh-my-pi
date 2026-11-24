@@ -19,6 +19,7 @@ import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_
 import { COST_GATE_NOTICE_SOURCE } from "../session/cost-gate";
 import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "../session/credential-disabled-notice";
 import { isSilentAbort } from "../session/messages";
+import { SessionExclusiveStopError } from "../session/session-manager";
 import { flushTelemetryExport } from "../telemetry-export";
 import { parseSlashCommand, parseSubcommand } from "../slash-commands/helpers/parse";
 import type { SlashCommandRuntime } from "../slash-commands/types";
@@ -657,17 +658,22 @@ async function runPrintModeCore(
 	// A latched store failure rethrows from `dispose()`; report it as lost
 	// durability rather than letting it escape as a raw fatal dump. The latch
 	// holds the latest failure, which may not be the one the observer first heard.
+	// So does an `OMP_SESSION_EXCLUSIVE=1` stop that left entries unsaved, whose
+	// stop line on stderr already names the reason.
 	let durabilityFailure = false;
 	try {
 		await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
 	} catch (error) {
-		const latched = persistenceFailure && session.sessionManager.getPersistenceFailure();
-		if (!latched || error !== latched) throw error;
-		durabilityFailure = true;
-		// The store is still failing at teardown, so this is the moment the
-		// transcript stops being retryable and becomes lost.
-		writeStderrLine(formatPersistenceDurabilityFailure(latched.message));
-		await stderrTail;
+		if (error instanceof SessionExclusiveStopError) durabilityFailure = true;
+		else {
+			const latched = persistenceFailure && session.sessionManager.getPersistenceFailure();
+			if (!latched || error !== latched) throw error;
+			durabilityFailure = true;
+			// The store is still failing at teardown, so this is the moment the
+			// transcript stops being retryable and becomes lost.
+			writeStderrLine(formatPersistenceDurabilityFailure(latched.message));
+			await stderrTail;
+		}
 	}
 
 	// Text mode reports the terminal failure on stderr exactly as before: same
