@@ -8,8 +8,12 @@
 //!   `{var}`) ends that fork, not the shell: the command fails with 127 under
 //!   `-c` or 1 from a script, and the shell goes on. An asynchronous simple
 //!   command's or a pipeline stage's fatal error lands where its parent's
-//!   would: 127 under `-c`, and no `!` after it runs. A subshell, a command
-//!   substitution and a compound job catch their own (status 1).
+//!   would: 127 under `-c`, and no `!` after it runs; an arithmetic error or a
+//!   bad substitution in its redirections ends that fork with 1, also before a
+//!   `!`. The fork's message goes where the command's redirections so far sent
+//!   it (`2>/dev/null` hides it), also when that stream is full for a while. A
+//!   subshell, a command substitution and a compound job catch their own
+//!   (status 1).
 //! - An asynchronous or piped null command bash forks for (fd 0 or a `{var}`)
 //!   exits 0 whatever its redirections do: bash forks it again, and the job's
 //!   fork exits at once.
@@ -58,7 +62,7 @@ use pi_shell::{
 /// Each row: id, run from a script file (else `-c`), script, status,
 /// stdout, stderr (the row's directory written `DIR`).
 const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
-	// 326 rows; bash 5.2.21 and 5.3.20 differ on (left out): h-in-fn/c,
+	// 374 rows; bash 5.2.21 and 5.3.20 differ on (left out): h-in-fn/c,
 	// h-bg-fn/c, h-null/c, g-null-move/c, g-null-move/script, g-assign-move/c,
 	// g-assign-move/script, x-fn/c, x-null-var/c, r2-bg-fn-eval/c,
 	// r2-sub-redir-fn/c, r2-var-local/c, g-fn-group-move-bg/c,
@@ -2466,6 +2470,390 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		"./s.sh: redirection error: cannot duplicate fd: Bad file descriptor\n./s.sh: line 1: 7: \
 		 Bad file descriptor\n",
 	),
+	(
+		"r5-bg-stderr",
+		false,
+		"/bin/cat 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r5-bg-stderr",
+		true,
+		"/bin/cat 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r5-pipe-stderr",
+		false,
+		"/bin/cat 2>/dev/null < ${x:?u} | cat; echo \"st=${PIPESTATUS[0]}\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r5-pipe-stderr",
+		true,
+		"/bin/cat 2>/dev/null < ${x:?u} | cat; echo \"st=${PIPESTATUS[0]}\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r5-bg-closed-stderr",
+		false,
+		"/bin/cat 2>&- < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r5-bg-closed-stderr",
+		true,
+		"/bin/cat 2>&- < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r5-bg-err-file",
+		false,
+		"/bin/cat 2>err < ${x:?u} & wait $!; echo \"st=$?\"; cat err",
+		0,
+		"st=127\nbash: line 1: x: u\n",
+		"",
+	),
+	(
+		"r5-bg-err-file",
+		true,
+		"/bin/cat 2>err < ${x:?u} & wait $!; echo \"st=$?\"; cat err",
+		0,
+		"st=1\n./s.sh: line 1: x: u\n",
+		"",
+	),
+	(
+		"r5-not-bg-stderr",
+		false,
+		"! /bin/cat 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r5-not-bg-stderr",
+		true,
+		"! /bin/cat 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r5-bg-builtin-dup",
+		false,
+		"echo 2>&1 < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"bash: line 1: x: u\nst=127\n",
+		"",
+	),
+	(
+		"r5-bg-builtin-dup",
+		true,
+		"echo 2>&1 < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"./s.sh: line 1: x: u\nst=1\n",
+		"",
+	),
+	(
+		"r5-bg-arith-stderr",
+		false,
+		"/bin/cat 2>/dev/null < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r5-bg-arith-stderr",
+		true,
+		"/bin/cat 2>/dev/null < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r5-bg-arith-err-file",
+		false,
+		"/bin/cat 2>err < $((1/0)) & wait $!; echo \"st=$?\"; cat err",
+		0,
+		"st=1\nbash: line 1: 1/0: division by 0 (error token is \"0\")\n",
+		"",
+	),
+	(
+		"r5-bg-arith-err-file",
+		true,
+		"/bin/cat 2>err < $((1/0)) & wait $!; echo \"st=$?\"; cat err",
+		0,
+		"st=1\n./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n",
+		"",
+	),
+	(
+		"r5-not-bg-arith",
+		false,
+		"! /bin/cat < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-bg-arith",
+		true,
+		"! /bin/cat < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-bg-notfound-arith",
+		false,
+		"! nosuch < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-bg-notfound-arith",
+		true,
+		"! nosuch < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-bg-command-arith",
+		false,
+		"! command /bin/cat < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-bg-command-arith",
+		true,
+		"! command /bin/cat < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-bg-badsub",
+		false,
+		"! /bin/cat < \"${x!y}\" & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: ${x!y}: bad substitution\n",
+	),
+	(
+		"r5-not-bg-badsub",
+		true,
+		"! /bin/cat < \"${x!y}\" & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: ${x!y}: bad substitution\n",
+	),
+	(
+		"r5-bg-badsub",
+		false,
+		"/bin/cat < \"${x!y}\" & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: ${x!y}: bad substitution\n",
+	),
+	(
+		"r5-bg-badsub",
+		true,
+		"/bin/cat < \"${x!y}\" & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: ${x!y}: bad substitution\n",
+	),
+	(
+		"r5-not-bg-builtin-arith",
+		false,
+		"! echo < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-bg-builtin-arith",
+		true,
+		"! echo < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-bg-fn-arith",
+		false,
+		"f() { :; }; ! f < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-bg-fn-arith",
+		true,
+		"f() { :; }; ! f < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-pipe-arith",
+		false,
+		"! /bin/cat < $((1/0)) | cat; echo \"st=$? ps=${PIPESTATUS[*]}\"",
+		0,
+		"st=1 ps=1 0\n",
+		"bash: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-pipe-arith",
+		true,
+		"! /bin/cat < $((1/0)) | cat; echo \"st=$? ps=${PIPESTATUS[*]}\"",
+		0,
+		"st=1 ps=1 0\n",
+		"./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-bg-sub-word",
+		false,
+		"/bin/cat \"$(true)\" < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r5-bg-sub-word",
+		true,
+		"/bin/cat \"$(true)\" < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r5-not-bg-sub-word",
+		false,
+		"! /bin/cat \"$(true)\" < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r5-not-bg-sub-word",
+		true,
+		"! /bin/cat \"$(true)\" < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r5-bg-sub-word-stderr",
+		false,
+		"/bin/cat \"$(true)\" 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r5-bg-sub-word-stderr",
+		true,
+		"/bin/cat \"$(true)\" 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r5-bg-sub-echo",
+		false,
+		"echo \"$(true)\" ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r5-bg-sub-echo",
+		true,
+		"echo \"$(true)\" ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r5-pipe-sub-word",
+		false,
+		"true | /bin/cat \"$(true)\" < ${x:?u}; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r5-pipe-sub-word",
+		true,
+		"true | /bin/cat \"$(true)\" < ${x:?u}; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r5-bg-procsub-word",
+		false,
+		"/bin/cat <(true) < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r5-bg-procsub-word",
+		true,
+		"/bin/cat <(true) < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r5-not-bg-sub-arith",
+		false,
+		"! /bin/cat \"`true`\" < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-not-bg-sub-arith",
+		true,
+		"! /bin/cat \"`true`\" < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: 1/0: division by 0 (error token is \"0\")\n",
+	),
+	(
+		"r5-bg-group-sub",
+		false,
+		"{ /bin/cat \"$(true)\" < ${x:?u}; } & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r5-bg-group-sub",
+		true,
+		"{ /bin/cat \"$(true)\" < ${x:?u}; } & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
 ];
 
 /// The rows bash 5.2.21 runs otherwise, as bash 5.3.20 runs them (this
@@ -2801,4 +3189,80 @@ fn a_running_subshell_keeps_its_own_var_that_the_shell_dropped() {
 		"stderr: {}",
 		String::from_utf8_lossy(&host.stderr.bytes())
 	);
+}
+
+/// The bound of one [`bounded_run`]: a run takes about a second.
+const RUN_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`run_script`] of `src` on a fresh [`FakeHost`] (with a write storm of
+/// `seed`, when given) under `fault`, in a thread of its own: a run that has
+/// not ended within [`RUN_BOUND`] is a failure (a fork that never stops
+/// waiting for its stream), and its thread is left to the end of the binary.
+fn bounded_run(src: &'static [u8], storm: Option<u64>, fault: Fault) -> Result<Outcome, String> {
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let host = match storm {
+			Some(seed) => FakeHost::new().with_write_storm(seed, 0.5),
+			None => FakeHost::new(),
+		};
+		let _ = tx.send(run_script(host, src, &[], fault));
+	});
+	rx.recv_timeout(RUN_BOUND).map_err(|e| match e {
+		std::sync::mpsc::RecvTimeoutError::Timeout => format!("no end within {RUN_BOUND:?}"),
+		std::sync::mpsc::RecvTimeoutError::Disconnected => "the run panicked".to_owned(),
+	})
+}
+
+/// The fork of an async command ends only after the message of a fatal
+/// error in its redirections is written where those redirections so far
+/// sent it (here `2>&1`: the standard output), also when that stream takes a
+/// few bytes at a time and is full in between (a write storm: the fork waits
+/// for it), and when the shell is imaged and restored at every op. Each run
+/// is bounded ([`bounded_run`]); the storm stops at its first run that does
+/// not end.
+///
+/// The storm runs unimaged: a restored host remakes its streams, and with
+/// them the storm's random sequence from its seed, so a run imaged about as
+/// often as its fork waits can meet the same full stream after each image
+/// (imaged every 2 ops, this test ran past 120 s and 3 GiB).
+#[test]
+fn a_forks_fatal_message_waits_for_the_stream_its_redirections_chose() {
+	const SRC: &[u8] = b"echo 2>&1 < ${x:?u} & wait $!; echo \"st=$?\"";
+	let got = |o: &Outcome| {
+		(
+			o.status,
+			String::from_utf8_lossy(&o.stdout).into_owned(),
+			String::from_utf8_lossy(&o.stderr).into_owned(),
+		)
+	};
+	// The status is the rows' to pin; here, where the message goes.
+	let plain = match bounded_run(SRC, None, Fault::None) {
+		Ok(o) => got(&o),
+		Err(e) => panic!("plain: {e}"),
+	};
+	assert!(
+		plain.0 == 0 && plain.1.starts_with("bash: line 1: x: u\nst=") && plain.2.is_empty(),
+		"plain: {plain:?}"
+	);
+	let mut wrong = Vec::new();
+	match bounded_run(SRC, None, Fault::Snapshot { every: 1 }) {
+		Ok(imaged) => {
+			assert!(imaged.snapshots > 0, "no snapshot was taken");
+			if got(&imaged) != plain {
+				wrong.push(format!("imaged: {:?}", got(&imaged)));
+			}
+		},
+		Err(e) => wrong.push(format!("imaged: {e}")),
+	}
+	for seed in 1..=16 {
+		match bounded_run(SRC, Some(seed), Fault::None) {
+			Ok(out) if got(&out) == plain => {},
+			Ok(out) => wrong.push(format!("storm {seed}: {:?}", got(&out))),
+			Err(e) => {
+				wrong.push(format!("storm {seed}: {e}"));
+				break;
+			},
+		}
+	}
+	assert!(wrong.is_empty(), "want {plain:?}:\n{}", wrong.join("\n"));
 }

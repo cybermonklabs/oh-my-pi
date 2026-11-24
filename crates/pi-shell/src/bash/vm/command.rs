@@ -312,10 +312,22 @@ pub fn exec(
 					match res {
 						Ok(()) => {},
 						// In the job's own fork the fork is the command's: a fatal
-						// error ends it with its status (127 or 1), and nothing after
-						// the command runs (a `!` included).
-						Err(super::redir::Halt::Flow(Flow::Exit(code))) if entry => {
-							return Flow::Exit(code);
+						// error ends it with its status (127 or 1), an arithmetic
+						// error or a bad substitution with 1, and nothing after the
+						// command runs (a `!` included). The fork ends after its
+						// message is written to stderr as the redirections so far
+						// left it (`2>/dev/null < ${x:?}` prints none).
+						Err(super::redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
+							if entry =>
+						{
+							let s = st(vp);
+							s.status = code;
+							s.control = Some(Transfer::Exit(code));
+							s.stage = Stage::Finish;
+							if let Some(fd) = exec::flush_out(k, vp) {
+								return Flow::Block(WaitKey::Write { fd });
+							}
+							continue;
 						},
 						// A fatal expansion error (`${x:?}`, `set -u`, `$((1/0))`) in
 						// the redirections of a command bash runs in a fork of its

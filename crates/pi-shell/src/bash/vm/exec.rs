@@ -3944,7 +3944,10 @@ fn bash_case_hit(
 /// without undo, and a fatal expansion error in them, or anywhere in a
 /// simple command, reaches what `vp`'s reaches. Any other job (an async
 /// `&&`/`||` list: bash forks it as a subshell, `CMD_FORCE_SUBSHELL`) and a
-/// compound without redirections of its own catch their own at once.
+/// compound without redirections of its own catch their own at once. The
+/// bodies of the command's `$( )`, backtick and `<( )` words come first:
+/// [`ir`] lowers each in place, ahead of the command's op, behind a `Jmp`
+/// to just past its `SubExit` (a child of its own runs it).
 pub(super) fn forked_for(child: &mut Vproc, vp: &Vproc, unit: &Unit, entry: u32) {
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
 	// The job's end: its `SubExit`, after a `!`'s `Not`.
@@ -3953,8 +3956,16 @@ pub(super) fn forked_for(child: &mut Vproc, vp: &Vproc, unit: &Unit, entry: u32)
 		Some(Opcode::Not) => code(at + 1) == Some(Opcode::SubExit),
 		_ => false,
 	};
-	let whole = match unit.ops.get(entry as usize) {
-		Some(op) if op.code == Opcode::Exec => ends(entry + 1),
+	let mut at = entry;
+	while let Some(op) = unit.ops.get(at as usize)
+		&& op.code == Opcode::Jmp
+		&& op.a > at
+		&& code(op.a - 1) == Some(Opcode::SubExit)
+	{
+		at = op.a;
+	}
+	let whole = match unit.ops.get(at as usize) {
+		Some(op) if op.code == Opcode::Exec => ends(at + 1),
 		Some(op) if op.code == Opcode::Redir => ends(op.b),
 		_ => false,
 	};
