@@ -7,13 +7,11 @@ import { digestStream } from "../utils/file-hash";
 import { BLOB_PREFIX, type SessionBlobSweep, type SessionBlobTier } from "./blob-store";
 import {
 	IndexedSessionStorage,
-	STALE_STAGING_MS,
 	SessionAppendBatchRolledBackError,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
-	utf8PartEnd,
-	utf8Parts,
 } from "./indexed-session-storage";
+import { STALE_STAGING_MS, utf8PartEnd, utf8Parts } from "./session-staging";
 import {
 	type SessionAcquireOptions,
 	type SessionClaimHolder,

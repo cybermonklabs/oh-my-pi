@@ -1,10 +1,9 @@
 import {
 	IndexedSessionStorage,
-	STALE_STAGING_MS,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
-	utf8Parts,
 } from "./indexed-session-storage";
+import { STALE_STAGING_MS, utf8Parts } from "./session-staging";
 import { SessionWriteConflictError } from "./session-storage";
 import { eexist } from "./session-storage-errors";
 import type { SessionTitleUpdate } from "./session-title-slot";

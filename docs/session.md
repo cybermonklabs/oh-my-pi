@@ -33,6 +33,8 @@ Does not cover `/tree` UI rendering behavior beyond semantics that affect sessio
 - [`src/session/session-storage.ts`](../packages/coding-agent/src/session/session-storage.ts) — storage abstractions
 - [`src/session/session-title-slot.ts`](../packages/coding-agent/src/session/session-title-slot.ts) — fixed-width current-title slot
 - [`src/session/indexed-session-storage.ts`](../packages/coding-agent/src/session/indexed-session-storage.ts) — local index + ordered remote-backed storage adapter
+- [`src/session/session-body.ts`](../packages/coding-agent/src/session/session-body.ts) — the bodies of indexed storage's full writes: spool file, in-memory copy, or streamed from the lines
+- [`src/session/session-staging.ts`](../packages/coding-agent/src/session/session-staging.ts) — what the SQL and Redis backends share to stage a streamed full write
 - [`src/session/sql-session-storage.ts`](../packages/coding-agent/src/session/sql-session-storage.ts) — PostgreSQL/MySQL/SQLite storage: session rows plus appended parts
 - [`src/session/messages.ts`](../packages/coding-agent/src/session/messages.ts) — custom-message transformers
 - [`src/session/blob-store.ts`](../packages/coding-agent/src/session/blob-store.ts) — content-addressed blob store
