@@ -96,7 +96,7 @@ use crate::bash::{
 };
 
 /// IR version; part of the frames header.
-pub const IR_VERSION: u32 = 17;
+pub const IR_VERSION: u32 = 18;
 
 /// Opcodes.
 #[derive(
@@ -614,8 +614,9 @@ pub enum Part {
 	},
 	/// `(…)` of a declaration-builtin argument (`declare -a a=(1 2)`).
 	Compound(Vec<ElemIr>),
-	/// A `${…}` bash accepts at parse time and rejects when expanding:
-	/// the whole text, for the `bad substitution` message.
+	/// A `${…}` bash accepts at parse time and rejects when expanding: the
+	/// text its `bad substitution` message names (the word, the inside of
+	/// `"…"`, the operator word or the run-time text being expanded).
 	BadSubst(BString),
 	/// A `$(` bash parses only when it expands the word, and that fails:
 	/// ``command substitution: line N: MSG`` with N the expansion line plus
@@ -679,7 +680,8 @@ impl ParamIr {
 			| OpIr::Trim { .. }
 			| OpIr::Replace { .. }
 			| OpIr::Case { .. }
-			| OpIr::Transform(_) => {
+			| OpIr::Transform(_)
+			| OpIr::BadTransform(..) => {
 				matches!((&self.param, &self.index), (ParamRef::At, None) | (_, Some(SubIr::At)))
 			},
 			OpIr::Length
@@ -727,6 +729,12 @@ pub enum SubIr {
 }
 
 /// `${…}` operator; words are `words` indexes.
+///
+/// `BadTransform(text, attrs)` is `${x@…}` with no valid operator (bash's
+/// `parameter_brace_transform`): `text` is what a `bad substitution` names
+/// (as [`Part::BadSubst`]), `attrs` whether the operator starts with `a` or
+/// `A`. An unset value expands to nothing (bash reads `a`/`A` even then), a
+/// set one is the error.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[expect(missing_docs, reason = "mirrors crate::bash::syntax::ParamOp")]
 pub enum OpIr {
@@ -743,6 +751,7 @@ pub enum OpIr {
 	Replace { mode: ReplaceIr, pat: u32, rep: Option<u32> },
 	Case { mode: CaseIr, all: bool, pat: Option<u32> },
 	Transform(u8),
+	BadTransform(BString, bool),
 }
 
 /// `${x/…}` selector.

@@ -1417,6 +1417,32 @@ impl<'e, 'c> Expander<'e, 'c> {
 				let out = self.transform(q, v, *op)?;
 				self.push(sink, out, quoted, rhs)?;
 			},
+			OpIr::BadTransform(text, attrs) => {
+				// bash `parameter_brace_transform` without a valid operator: an
+				// unset value is nothing (`set -u`: unbound), unless the
+				// operator starts with `a`/`A`; anything else is a bad
+				// substitution, fatal unless the shell is interactive.
+				let v = self.value(unit, p)?;
+				if matches!(v, Val::Unset) && !attrs {
+					self.check_unset(unit, p)?;
+					self.push(sink, v, quoted, rhs)?;
+					return Ok(());
+				}
+				let interactive = matches!(
+					state::record(
+						self.cx.store,
+						self.vp,
+						crate::bash::store::Key::Misc(crate::bash::store::MiscKey::Interactive)
+					)?,
+					Some(crate::bash::store::Record::Misc(v)) if v.as_slice() == b"1"
+				);
+				let diag = Diag::BadSubst { text: text.clone() };
+				return Err(if interactive {
+					Stop::Fail(diag)
+				} else {
+					Stop::Fatal(diag)
+				});
+			},
 		}
 		Ok(())
 	}

@@ -1237,7 +1237,8 @@ fn valid(u: &Unit) -> bool {
 						| OpIr::Indirect
 						| OpIr::PrefixNames { .. }
 						| OpIr::Substr { .. }
-						| OpIr::Transform(_) => true,
+						| OpIr::Transform(_)
+						| OpIr::BadTransform(..) => true,
 					};
 					index_ok && op_ok
 				},
