@@ -4602,9 +4602,32 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				// `wait -p` names the child by the pid the user knows (its
 				// program's OS pid), read before the job is forgotten.
 				let shown = vp.shown_pid(v);
-				if let Some(s) = k.proc_collect(cx.store, v) {
+				// A child whose job left the table answers at once with the
+				// status kept for it (bash `wait_for_single_pid`'s
+				// `bgp_search`); a posix shell forgets it (`bgp_delete`).
+				if vp.jobs.by_vpid(v).is_none()
+					&& let Some(s) = vp.jobs.bgp_search(v)
+				{
 					last = s;
+					if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+						.unwrap_or(false)
+					{
+						state::forget_status(&mut k.root, cx.store, vp, v);
+					}
+				} else if let Some(s) = k.proc_collect(cx.store, v) {
+					last = s;
+					// bash's `wait PID` only marks a job in the table notified:
+					// it leaves later with its status kept (`delete_job`'s
+					// `bgp_add`), so a second `wait PID` returns it again; a
+					// posix shell forgets it (`bgp_delete`).
+					let kept = vp.jobs.by_vpid(v).filter(|j| !j.inherited).map(|j| j.pid());
 					forget_job(vp, v);
+					if let Some(pid) = kept
+						&& !state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+							.unwrap_or(false)
+					{
+						state::save_status(&mut k.root, cx.store, vp, v, pid, s);
+					}
 					exec::reap_coproc(k, vp, cx, v);
 				} else if let (false, Some(JobState::Stopped(sig))) =
 					(force, vp.jobs.by_vpid(v).map(|j| j.state))
@@ -4655,13 +4678,25 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				k.proc_collect(cx.store, v);
 				forget_job(vp, v);
 			}
+			// And bash forgets every status kept (`wait_for_background_pids`'
+			// `bgp_clear`).
+			state::clear_statuses(&mut k.root, cx.store, vp);
 			st(vp).status
 		},
 		Some(Awaited::AnyJob) => {
-			let finished = st(vp).wait_for.iter().find_map(|v| {
-				k.proc_state(cx.store, *v)
+			let waiting_for = st(vp).wait_for.clone();
+			let finished = waiting_for.iter().find_map(|&v| {
+				k.proc_state(cx.store, v)
 					.and_then(super::ProcState::exited)
-					.map(|s| (*v, s))
+					// A job that left the table: the status kept for it.
+					.or_else(|| {
+						vp.jobs
+							.by_vpid(v)
+							.is_none()
+							.then(|| vp.jobs.bgp_search(v))
+							.flatten()
+					})
+					.map(|s| (v, s))
 			});
 			let Some((v, status)) = finished else {
 				if let Some(&v) = st(vp).wait_for.first() {
