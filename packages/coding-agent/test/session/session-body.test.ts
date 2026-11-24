@@ -19,6 +19,7 @@ import type {
 	WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { logger } from "@oh-my-pi/pi-utils";
+import { FullBodies } from "@oh-my-pi/pi-coding-agent/session/session-body";
 import { withoutAccountId } from "../helpers/account-id";
 
 /** A backend that keeps each session's text in memory and stores a full write as it is given. */
@@ -281,4 +282,48 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 			"/sessions/sync.jsonl": body,
 		});
 	});
+
+	// If this regresses, a spooled body read after its release reads a closed descriptor, or one the
+	// process has since given to another file, and publishes that file's bytes as the session.
+	it.skipIf(process.getuid === undefined)(
+		"refuses a read of a spooled body after its release, through a streamed write and a whole one",
+		async () => {
+			const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-spool-released-"));
+			vi.spyOn(os, "tmpdir").mockReturnValue(tmp);
+			const other = path.join(tmp, "other");
+			fs.writeFileSync(other, "o".repeat(Buffer.byteLength(body)));
+			try {
+				const outcomes: Array<{ failure: string | undefined; stored: string | undefined }> = [];
+				for (const backend of [new StreamingMemoryBackend(), new MemoryBackend()]) {
+					// What the backend holds, read back after a failed publish.
+					async function* stored(target: string): AsyncGenerator<Uint8Array> {
+						const text = backend.sessions.get(target);
+						if (text !== undefined) yield Buffer.from(text);
+					}
+					const bodies = new FullBodies(backend, stored);
+					const released = bodies.lines("/sessions/released.jsonl", serialized());
+					released.release?.();
+					// The next file opened takes the descriptor number the spool held.
+					const fd = fs.openSync(other, "r");
+					try {
+						// Called inside a task, as the store's path queue calls a publish.
+						const failure = await Promise.resolve()
+							.then(() => released.publish(1, null))
+							.then(
+								() => undefined,
+								(error: unknown) => String(error),
+							);
+						outcomes.push({ failure, stored: backend.sessions.get("/sessions/released.jsonl") });
+					} finally {
+						fs.closeSync(fd);
+					}
+				}
+				const refused = { failure: expect.stringContaining("read after it was released"), stored: undefined };
+				expect(outcomes).toEqual([refused, refused]);
+			} finally {
+				vi.restoreAllMocks();
+				await fsp.rm(tmp, { recursive: true, force: true });
+			}
+		},
+	);
 });

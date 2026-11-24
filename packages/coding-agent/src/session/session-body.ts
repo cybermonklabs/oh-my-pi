@@ -65,7 +65,7 @@ class BodySpool implements KeptBody {
 	async *chunks(): AsyncGenerator<Uint8Array> {
 		for (let position = 0; position < this.byteLength;) {
 			const buffer = Buffer.allocUnsafe(Math.min(LINE_STREAM_CHUNK, this.byteLength - position));
-			const read = await readAt(this.#fd, buffer, position);
+			const read = await readAt(this.#heldFd(), buffer, position);
 			if (read === 0) throw new Error(`Session body spool ended at byte ${position} of ${this.byteLength}`);
 			position += read;
 			yield read === buffer.byteLength ? buffer : buffer.subarray(0, read);
@@ -73,9 +73,10 @@ class BodySpool implements KeptBody {
 	}
 
 	text(): string {
+		const fd = this.#heldFd();
 		const bytes = Buffer.allocUnsafe(this.byteLength);
 		for (let position = 0; position < bytes.byteLength;) {
-			const read = fs.readSync(this.#fd, bytes, position, bytes.byteLength - position, position);
+			const read = fs.readSync(fd, bytes, position, bytes.byteLength - position, position);
 			if (read === 0) throw new Error(`Session body spool ended at byte ${position} of ${this.byteLength}`);
 			position += read;
 		}
@@ -90,6 +91,15 @@ class BodySpool implements KeptBody {
 		} catch {
 			// Already closed.
 		}
+	}
+
+	/**
+	 * The descriptor, until {@link close}: after it the number can belong to
+	 * another file, whose bytes a read would publish as this body.
+	 */
+	#heldFd(): number {
+		if (this.#closed) throw new Error("A session rewrite's body was read after it was released");
+		return this.#fd;
 	}
 }
 
