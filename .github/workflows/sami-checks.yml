@@ -54,9 +54,16 @@
 # reason the tree does not own yet; the summary shows each failure KNOWN (with the reason) or NEW, a
 # unit whose only failures are known reads KNOWN unless a test in it skipped itself and passed as no
 # other user, an entry of unit `*` names its test in any unit (shard) of its row, and an entry whose
-# test passed is listed for removal and fails the summary, unless its reason starts `flaky: `. The
-# browser tests run against the Chrome for Testing build the tree's puppeteer-core pins (bun.sh
-# chrome), not the runner's google-chrome. Skip prints: the skip-forms job fails on a print of the
+# test passed is listed for removal and fails the summary, unless its reason starts `flaky: `. A
+# failed test with a `flaky: ` entry makes its job run the whole unit again, at most twice, with the
+# same threads and user (set.sh, nextest.sh, ts.sh), and reads KNOWN only when it passed in such a
+# retry; a nextest JUnit case that failed and then passed on nextest's own retry is flaky, not a
+# pass. A `skips: ` entry names a self-skip by row, user, test and the start of its skip line, and
+# that self-skip reads KNOWN. pi-builtins' check_folded_sources tests run in a directory where names
+# fold (host.sh: ext4 casefold; nextest.sh SC_FOLDED). Each `bun test` gets the per-test timeout
+# the tree's own runner gives it (ts.sh: scripts/ci-test-ts.ts and ci.yml's OMP_TEST_TIMEOUT), not
+# bun's 5 s. The browser tests run against the Chrome for Testing build the tree's puppeteer-core
+# pins (bun.sh chrome), not the runner's google-chrome. Skip prints: the skip-forms job fails on a print of the
 # tree that says skip and that the summary's rule does not read; the summary job runs the same check
 # on every line a passing test printed (sc.py skip-lines), and both are units of the row "skip
 # prints the summary reads".
@@ -344,6 +351,9 @@ jobs:
       - name: Host
         run: bash tool/.github/sami-checks/host.sh "$SC/tools/sc-tools.tgz"
       - name: Tests
+        env:
+          # check_folded_sources' tests run their host half where names fold (host.sh's /mnt/sc-fold).
+          SC_FOLDED: 'test(/::a_source_whose_name_folds_to_the_backup_is_not_/)'
         run: bash tool/.github/sami-checks/nextest.sh builtins pi-builtins "${{ matrix.who }}" 'package(pi-builtins)'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ always() && needs.plan.outputs.silent != matrix.name }}

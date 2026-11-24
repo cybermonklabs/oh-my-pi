@@ -4,16 +4,31 @@
 # (then it is UNKNOWN). An entry whose test passed or no longer exists is listed in the summary to
 # be removed, and the summary job fails until it is, so the list only shrinks.
 # A flaky entry, whose reason starts with `flaky: `, names a test that fails in some runs and passes
-# in others: it reads KNOWN when it fails and is not listed for removal when it passes (it still is
-# when its test no longer exists).
-# A unit of `*` names the test in any unit of its row: a coding-agent shard holds the test files
-# whose sorted index mod 10 is the shard's, so a file added before a test moves it to another shard.
-# One per line, tab-separated: <row> <user> <unit> <test> <reason>.
-# Rows: set-runner, set-root, builtins, workspace, ts-small, ts-ca, macos, windows, clippy (sc.py
-# ROWS). A platform test is <binary>::<test> (user runner, unit pi-shell), with " (TIMEOUT)" after
-# it when it ran past its time bound, which no entry makes KNOWN. A flaky entry makes a platform
-# failure KNOWN only when the run shows a pass for it (it passed on its retry, or in some repeat);
-# a test that passed only on its retry and has no entry is NEW. A clippy finding is "<file>: <message>".
+# in others. When it fails, its job runs its whole unit again (set.sh, nextest.sh, ts.sh: the same
+# binary or filter, the same threads, the same user), at most twice; its failure reads KNOWN only
+# when it passed in such a retry, and NEW when it failed every retry or passed only in a smaller run
+# (a race at 4 threads can pass alone). Where a runner gives each test a process of its own
+# (nextest), the test's own retry is that process again and counts: sc.py reads nextest's own
+# retries from its JUnit report (a test with <flakyFailure> attempts that passed in the end is a
+# flaky failure, never a pass; one whose <rerunFailure> retries all failed stays failed). A flaky
+# failure with no entry reads NEW. An entry is not listed for removal when its test passes (it
+# still is when its test no longer exists).
+# The platform rows (macos, windows) are read the same way from each leg's JUnit report, nextest's
+# own retry in the same run (the same binary, profile, threads and user, under the run's load). A
+# platform test is <binary>::<test> (user runner, unit pi-shell), with " (TIMEOUT)" after it when it
+# ran past its time bound, which no entry makes KNOWN. A clippy finding is "<file>: <message>".
+# A unit of `*` names the test in any unit of its row, on the rows whose units are shards (ts-ca,
+# workspace: sc.py ANY_UNIT_ROWS): a coding-agent shard holds the test files whose sorted index mod
+# 10 is the shard's, so a file added before a test moves it to another shard. On the other rows a
+# test's name is unique only inside its unit, and sc.py refuses `*` there.
+# A known self-skip, whose reason starts with `skips: `, has a sixth field: the start of the skip
+# line the test prints (each `{...}` any text). A test that skipped itself reads KNOWN when each of
+# its skip lines starts as an entry of its row, user and test says; one user's entry never covers
+# the other user, and a unit with any other self-skip (not passed as the other user) is UNKNOWN.
+# An entry whose test ran without skipping itself, or printed no line that starts so, is listed
+# for removal.
+# One per line, tab-separated: <row> <user> <unit> <test> <reason> [<skip line start>].
+# Rows: set-runner, set-root, builtins, workspace, ts-small, ts-ca, macos, windows, clippy (sc.py ROWS).
 # Source: runs 45245119907 (509a2d77) and 45245136412 (a72018dd); red at both trees.
 set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_with_listambiguous	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
 set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_without_autolist	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
@@ -82,6 +97,7 @@ macos	runner	pi-shell	pi-shell::zsh_zcompile::zcompile_digest_and_listing_match_
 macos	runner	pi-shell	pi-shell::zsh_zcompile::zcompile_lists_dumps_zsh_wrote	fails at upstream 9058ab9d, 0 of 2 (run 45287904461)
 macos	runner	pi-shell	pi-shell::zle_widgets_pty::transposes	flaky: fails 1 of 2 at upstream 9058ab9d (run 45287904461)
 macos	runner	pi-shell	pi-shell::zsh_jobs_pty::a_suspended_loop_takes_the_rest_of_the_loop_with_it	flaky: fails 1 of 2 at upstream 9058ab9d (run 45287904461); a race in the real zsh, not in obash (platform-reds row 18)
+ts-ca	runner	*	PDF page screenshots in Chromium::paints each requested image-only page instead of the empty viewer	flaky: timed out rendering PDF page 1 (read-pdf.ts:151) in 1 of 4 full coding-agent runs (45287678343); passed 20 of 20 alone at 509a2d77 and a72018dd, 10 on Chrome for Testing 150.0.7871.24 and 10 on the runner's Chrome 157
 ts-ca	runner	*	browser WebMCP helpers::blames the Chrome version only when invokeTool itself is missing, not for another error saying something wasn't found	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
 ts-ca	runner	*	browser WebMCP helpers::cancels the page's tool invocation when the call is aborted	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
 ts-ca	runner	*	browser WebMCP helpers::discovers, invokes, bounds trust, and reports native registrations	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
