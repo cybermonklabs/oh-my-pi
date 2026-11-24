@@ -455,15 +455,32 @@ def gv_control(log, exit_code, secs, row, unit, who):
     return res
 
 
+def passed_attempt(out):
+    """How an attempt that passed reads: `skip` when its output holds a skip marker (it checked
+    nothing), else `pass`. The one rule for every retry: record_retry's and nextest's own."""
+    return "skip" if SKIP_MARKER.search(out or "") else "pass"
+
+
+def nextest_attempts(flaky, rerun, out):
+    """The outcomes of nextest's own retries after a test's first attempt: for a flaky case (its
+    <flakyFailure>/<flakyError> attempts, then a last attempt whose output is the case's own), each
+    flaky attempt after the first failed and the last attempt passed or skipped; for a failed case's
+    <rerunFailure>/<rerunError> retries, each failed."""
+    if flaky:
+        return ["fail"] * (flaky - 1) + [passed_attempt(out)]
+    return ["fail"] * rerun
+
+
 def junit_cases(path):
-    """(full name, kind, seconds, output, (retries, first failure)) of each <testcase> once. bun
-    nests a <testsuite> per describe block, so walking every suite's cases would count a nested
-    case once per enclosing suite. kind is ok, failed, skipped or flaky. nextest's own retries
-    (its Jenkins JUnit: <flakyFailure>/<flakyError> for each failed attempt of a test that passed in
-    the end, <rerunFailure>/<rerunError> for each failed retry of a test that failed every attempt)
-    give `flaky` (failed, then passed: not a pass) and the retries' outcomes after the first
-    attempt, with the first failure's message. A case with <failure> as well as flaky attempts
-    (nextest's flaky-fail) is `failed`: the runner counted it failed."""
+    """(full name, kind, seconds, output, (retries, first failure, nextest's retry elements)) of
+    each <testcase> once. bun nests a <testsuite> per describe block, so walking every suite's
+    cases would count a nested case once per enclosing suite. kind is ok, failed, skipped or flaky.
+    nextest's own retries (its Jenkins JUnit: <flakyFailure>/<flakyError> for each failed attempt of
+    a test that passed in the end, <rerunFailure>/<rerunError> for each failed retry of a test that
+    failed every attempt) give `flaky` (failed, then passed: not a pass) and the retries' outcomes
+    after the first attempt (nextest_attempts), with the first failure's message. A case with
+    <failure> as well as flaky attempts (nextest's flaky-fail) is `failed`: the runner counted it
+    failed."""
     root = ET.parse(path).getroot()
     parent = {c: p for p in root.iter() for c in p}
     for case in root.iter("testcase"):
@@ -476,23 +493,22 @@ def junit_cases(path):
         t = float(case.get("time") or 0)
         failed = [e for e in case if e.tag in ("failure", "error")]
         flaky = [e for e in case if e.tag in ("flakyFailure", "flakyError")]
-        rerun = [e for e in case if e.tag in ("rerunFailure", "rerunError")]
+        rerun = [e for e in case if e.tag in ("rerunFailure", "rerunError")] if failed else []
         if case.find("skipped") is not None:
             kind = "skipped"
         elif failed:
             kind = "failed"
         else:
             kind = "flaky" if flaky else "ok"
-        retries, first = [], ""
-        if flaky:
-            retries, first = ["fail"] * (len(flaky) - 1) + ["pass"], flaky[0]
-        elif rerun and failed:
-            retries, first = ["fail"] * len(rerun), failed[0]
-        if first != "":
-            lines = [l.strip() for l in (first.text or "").split("\n") if l.strip()]
-            first = (first.get("message") or " ".join(lines[:2]))[:200]
         out = "".join((e.text or "") for e in case if e.tag in ("system-out", "system-err"))
-        yield full, kind, t, out, (retries, first)
+        first = flaky[0] if flaky else failed[0] if rerun else None
+        message = ""
+        if first is not None:
+            lines = [l.strip() for l in (first.text or "").split("\n") if l.strip()]
+            message = (first.get("message") or " ".join(lines[:2]))[:200]
+        elements = len(flaky) or len(rerun)
+        retries = nextest_attempts(len(flaky), len(rerun), out) if elements else []
+        yield full, kind, t, out, (retries, message, elements)
 
 
 def junit_merge(out, paths):
@@ -540,7 +556,7 @@ def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits, pa
     of = len({n for n, _ in tests} | set(failures))
     retries = {}
     for c in cases:
-        outcomes, first = c[4]
+        outcomes, first, _ = c[4]
         if outcomes:
             retries[c[0]] = [{"outcome": o, "ran": 1, "of": of, "shape": f"nextest's own retry {i} of {len(outcomes)}",
                               "scope": "own-process", "first_failure": first} for i, o in enumerate(outcomes, 1)]
@@ -553,6 +569,11 @@ def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits, pa
         return r("UNKNOWN", f"exit {exit_code}: the run did not finish")
     if not cases:
         return r("UNKNOWN", "the JUnit report names no test")
+    # Each of nextest's retry elements of a case has its retry record: else the reading of them is
+    # broken, and a flaky or failed case would read without its retries.
+    unrecorded = [c[0] for c in cases if len(retries.get(c[0], [])) != c[4][2]]
+    if unrecorded:
+        return r("UNKNOWN", "a flaky case has no recorded retry: " + ", ".join(unrecorded[:12]))
     if (code in ok_exits) != (not hard):
         return r("UNKNOWN", f"exit {exit_code} with {len(hard)} failed")
     return skip_verdict(r("FAIL" if failures else "PASS"))
@@ -919,8 +940,7 @@ def record_retry(result_path, test, report, shape, scope="whole-unit"):
                 if kind != "skipped":
                     ran.add(name)
                 if name == test:
-                    outcome = ("fail" if kind == "failed" else "skip" if kind == "skipped" or SKIP_MARKER.search(out)
-                               else "pass")
+                    outcome = "fail" if kind == "failed" else "skip" if kind == "skipped" else passed_attempt(out)
         except (OSError, ET.ParseError):
             pass
     else:
@@ -933,7 +953,7 @@ def record_retry(result_path, test, report, shape, scope="whole-unit"):
             if ev and ev.get("type") == "test" and ev.get("event") in ("ok", "failed"):
                 ran.add(ev.get("name"))
                 if ev.get("name") == test:
-                    outcome = "fail" if ev["event"] == "failed" else "skip" if SKIP_MARKER.search(ev.get("stdout") or "") else "pass"
+                    outcome = "fail" if ev["event"] == "failed" else passed_attempt(ev.get("stdout"))
     r = json.load(open(result_path, encoding="utf-8"))
     unit = {n for n, _ in r["tests"]} | set(r["failures"])
     of = len(unit)
@@ -1632,7 +1652,7 @@ def selftest():
         f"FAILED `{fm4}`: **NEW** (flaky, and not on the known-failure list: it passed on retry 3 of 3" in out,
         "| pi-builtins, nextest default profile | **FAIL** |" in out, rc), (True, True, 1))
     r = nextest(cwd + fail_assert + flaky_mod_4, 100)
-    check("nextest: a test that failed every retry", (r["status"], r["failures"], [t["outcome"] for t in r["retries"][fa]]),
+    check("nextest: a test that failed every retry", (r["status"], r["failures"], [t["outcome"] for t in r["retries"].get(fa, [])]),
           ("FAIL", [fa, fm4], ["fail", "fail"]))
     check("nextest: a test that failed every retry, with exit 0", nextest(cwd + fail_assert, 0)["status"], "UNKNOWN")
     json.dump(r, open(os.path.join(res, "b-runner.json"), "w"))
@@ -1643,6 +1663,30 @@ def selftest():
         f"FAILED `{fa}`: **NEW** (listed as `flaky: an assertion`, but no retry of its shape passed it: fail (in its own "
         "process again: 1 of 3 tests, nextest's own retry 1 of 2); fail" in out,
         "| pi-builtins, nextest default profile | **FAIL** |" in out, rc), (True, True, 1))
+    # The last attempt of a flaky case is its own output: one that printed a skip marker checked
+    # nothing, so it is `skip` (passed_attempt, as for record_retry) and the listed test reads NEW
+    # (CiReview at 075957a9: it read KNOWN).
+    flaky_skip = flaky_mod_4.replace("</testcase>", "<system-out>skipped: no zsh here\n</system-out></testcase>")
+    r = nextest(cwd + flaky_skip, 0)
+    check("nextest: a flaky test whose passing attempt printed a skip line", [t["outcome"] for t in r["retries"][fm4]],
+          ["fail", "fail", "skip"])
+    json.dump(r, open(os.path.join(res, "b-runner.json"), "w"))
+    open(known_file, "w").write(zle_k + f"builtins\trunner\tpi-builtins\t{fm4}\tflaky: attempt % 4\n")
+    rc, out = summary()
+    check("nextest: a listed flaky test whose passing attempt skipped", (
+        f"FAILED `{fm4}`: **NEW** (listed as `flaky: attempt % 4`, but no retry of its shape passed it" in out,
+        "| pi-builtins, nextest default profile | **FAIL** |" in out, rc), (True, True, 1))
+    # A case with nextest's retry elements and no record of them is UNKNOWN by name (the reading of the
+    # elements planted broken: no outcome for any retry).
+    g = globals()
+    kept = g["nextest_attempts"]
+    g["nextest_attempts"] = lambda flaky, rerun, out: []
+    try:
+        r = nextest(cwd + fail_assert + flaky_mod_4, 100)
+    finally:
+        g["nextest_attempts"] = kept
+    check("nextest: a case with retry elements and no record", (r["status"], r["note"]),
+          ("UNKNOWN", f"a flaky case has no recorded retry: {fa}, {fm4}"))
     open(known_file, "w").write("# none\n")
     json.dump(nx("runner", ["c"], ["a"]), open(os.path.join(res, "b-runner.json"), "w"))
     # A `*` entry names its test in any unit of its row (a coding-agent shard moves when a file is added).
