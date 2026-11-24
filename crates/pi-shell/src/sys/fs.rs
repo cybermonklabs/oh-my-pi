@@ -560,9 +560,12 @@ impl StdFile {
 	)]
 	fn with_kind(file: fs::File, kind: FileKind, null: bool) -> Self {
 		// Only a descriptor that waits for readiness consults its access
-		// mode ([`Self::gated`]); a regular file or device skips the `fcntl`.
+		// mode ([`Self::gated`]); a regular file skips the `fcntl`. So does
+		// a device, but for the null device: its write is short-cut only
+		// where the kernel would take it (opened for reading alone, a
+		// write fails `EBADF`).
 		#[cfg(unix)]
-		let access = waits(kind)
+		let mode = (waits(kind) || null)
 			.then(|| {
 				use std::os::fd::AsRawFd;
 				// SAFETY: F_GETFL only reads the flags of our open descriptor.
@@ -570,6 +573,10 @@ impl StdFile {
 				(flags >= 0).then_some(flags & libc::O_ACCMODE)
 			})
 			.flatten();
+		#[cfg(unix)]
+		let null = null && mode != Some(libc::O_RDONLY);
+		#[cfg(unix)]
+		let access = mode.filter(|_| waits(kind));
 		#[cfg(all(target_os = "linux", test))]
 		let force_blocking_writer = *FORCE_BLOCKING_WRITER;
 		#[cfg(all(target_os = "linux", not(test)))]

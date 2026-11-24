@@ -59,7 +59,8 @@ pub struct Vproc {
 	/// so without this the trap could start a second time.
 	pub exit_trap_run: bool,
 	/// Background jobs not yet waited for or reported, current/previous
-	/// job and the `SIGCHLD` trap runs owed.
+	/// job, the `SIGCHLD` trap runs owed, and how this shell starts its
+	/// next ones (job control, stdin).
 	pub jobs:          JobTable,
 	/// `$!`: the last asynchronous child and the OS pid it is known by.
 	pub last_bg:       LastBg,
@@ -360,18 +361,28 @@ pub struct GetoptsState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobTable {
 	/// Jobs in start order (ascending numbers).
-	pub list:     Vec<Job>,
+	pub list:        Vec<Job>,
 	/// The current job (`%+`, `%%`), by number.
-	pub current:  Option<u32>,
+	pub current:     Option<u32>,
 	/// The previous job (`%-`), by number.
-	pub previous: Option<u32>,
+	pub previous:    Option<u32>,
 	/// `SIGCHLD` trap runs owed: bash runs the trap once per child that
 	/// finished while it was set, however many finished at once.
-	pub chld:     u32,
+	pub chld:        u32,
 	/// A forked subshell (`( )`, `&`, a pipeline stage, `<( )`): bash runs
 	/// it without job control and with an empty job table. A command
 	/// substitution keeps both (it lists its parent's jobs).
-	pub subshell: bool,
+	pub subshell:    bool,
+	/// bash's `stdin_redir`: since the command reader last cleared it, a
+	/// compound command run in this shell redirected stdin, or this vproc
+	/// runs a `( … )` that did, a coprocess or a pipeline stage fed by a
+	/// pipe; an asynchronous command then keeps the shell's stdin
+	/// ([`super::exec::async_stdin`]). A fork copies it; a new shell
+	/// starts without it. Here because the table has room for it (the
+	/// `Vproc` size guard has none); imaged with the vproc
+	/// (`ProcImage::stdin_redir`), not with the table.
+	#[serde(skip)]
+	pub stdin_redir: bool,
 }
 
 /// What a job spec names (bash `get_job_spec`), without its `%`.
@@ -870,7 +881,12 @@ pub enum FrameKind {
 		autoload: bool,
 	},
 	/// The code of a child vproc: `SubExit`/`End` exits the vproc.
-	Subshell,
+	Subshell {
+		/// A background job's or pipeline stage's child: what bash's fork
+		/// for it would know ([`Fork`]). `None` for a `( … )`, coprocess or
+		/// substitution child. Held in the variant, where it costs no size.
+		fork: Option<Fork>,
+	},
 	/// `${ cmd; }` / `${| cmd; }` run in the current shell: `SubExit` pops.
 	NoFork,
 	/// The last stage of a pipeline run in the current shell (`lastpipe`):
@@ -884,6 +900,24 @@ pub enum FrameKind {
 		/// Where the job ends.
 		stop_at: u32,
 	},
+}
+
+/// A background job's or pipeline stage's child, as the spawn left it
+/// ([`FrameKind::Subshell`]): read in O(1) where bash's `stdin_redir`
+/// rules ask which command its fork runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fork {
+	/// The op the command bash's fork runs starts at: the body's first op,
+	/// past a job's `time` and past the substitution bodies the command's
+	/// words and redirections are lowered ahead of it
+	/// ([`super::exec::command_start`]).
+	pub cmd:   u32,
+	/// The stage reads a pipe (a pipeline stage after the first).
+	pub piped: bool,
+	/// bash: the job is a lone simple command whose `/dev/null` is still
+	/// to come on fd 0, after its words are expanded
+	/// ([`super::exec::deferred_job_null`]).
+	pub null:  bool,
 }
 
 /// Parser state a [`FrameKind::Script`] keeps between its commands.
