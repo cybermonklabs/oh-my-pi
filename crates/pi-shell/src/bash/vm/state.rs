@@ -307,7 +307,8 @@ pub struct Root {
 	/// Whether a root variable (global or scope-local) may be a name
 	/// reference: set by every write of one, recomputed from the store on
 	/// invalidation. While it is clear, the root vproc's lookups read a
-	/// variable once and [`deref`](fn@deref) answers [`Deref::Plain`] without reading.
+	/// variable once and [`deref`](fn@deref) answers [`Deref::Plain`] without
+	/// reading.
 	namerefs:          bool,
 	/// Empty temporary-environment scopes on top of those (every builtin
 	/// runs in one, most without prefix assignments): written to the store
@@ -1293,8 +1294,9 @@ pub enum VarEdit<'e> {
 	/// (`a+=(x y)`); clears [`Attrs::INVISIBLE`].
 	Push(Vec<BString>),
 	/// Insert `key` into an associative array at the front of its bucket
-	/// among `buckets` ([`AssocArray::insert_front`](crate::bash::store::AssocArray::insert_front): zsh's hash order);
-	/// clears [`Attrs::INVISIBLE`].
+	/// among `buckets`
+	/// ([`AssocArray::insert_front`](crate::bash::store::AssocArray::insert_front):
+	/// zsh's hash order); clears [`Attrs::INVISIBLE`].
 	Insert {
 		/// The key (absent; a present one takes the value in place).
 		key:     &'e [u8],

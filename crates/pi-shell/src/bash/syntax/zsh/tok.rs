@@ -4,7 +4,7 @@
 //! lexer (this crate), the zsh pattern compiler (`crate::bash::pattern`) and
 //! the zsh expander (`crate::bash`).
 //!
-//! A zsh word (`crate::bash::syntax::WordPart::Zsh`) is **metafied**: every
+//! A zsh word ([`crate::bash::syntax::Part::Zsh`]) is **metafied**: every
 //! byte that zsh treats as special inside its strings (NUL and `0x83..=0xa2`)
 //! is stored as [`META`] followed by the byte XOR 32. Unquoted special
 //! characters are replaced by **tokens** (`0x84..=0xa2`), so a literal `*`

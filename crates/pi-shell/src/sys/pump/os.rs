@@ -335,12 +335,12 @@ mod imp {
 	///   ([`Drain::of`]).
 	/// - macOS: `/dev/fd/N` shares the description, so the pipe is a FIFO made
 	///   in a private directory under the temporary directory and opened four
-	///   times (`fifo_descriptions`): the pump writes through the shell's
-	///   write description, the children read the externals' read one, the drain
-	///   is the shell's read one, and the externals' write one is closed. The
-	///   FIFO and its directory are removed before any end is handed out, so
-	///   neither a drop nor a crash leaves anything behind. Where it cannot be
-	///   made, an anonymous pipe without a drain.
+	///   times (`fifo_descriptions`): the pump writes through the shell's write
+	///   description, the children read the externals' read one, the drain is
+	///   the shell's read one, and the externals' write one is closed. The FIFO
+	///   and its directory are removed before any end is handed out, so neither
+	///   a drop nor a crash leaves anything behind. Where it cannot be made, an
+	///   anonymous pipe without a drain.
 	pub fn feed_pipe() -> io::Result<(OsPipe, fs::File, Option<Drain>)> {
 		#[cfg(target_os = "macos")]
 		if let Ok([ours_read, ours_write, theirs_read, theirs_write]) =

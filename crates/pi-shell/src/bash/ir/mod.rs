@@ -630,7 +630,7 @@ pub enum Part {
 	/// expanded, so the code points convert to the locale's charset.
 	AnsiC(BString),
 	/// zsh dialect: a whole word in zsh's tokenized, metafied form
-	/// (`crate::bash::syntax::WordPart::Zsh`), expanded at run time by the zsh
+	/// ([`crate::bash::syntax::Part::Zsh`]), expanded at run time by the zsh
 	/// expander (zsh `subst.c`), which also runs its substitutions.
 	Zsh(BString),
 }

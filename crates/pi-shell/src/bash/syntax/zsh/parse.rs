@@ -10,8 +10,8 @@
 //! callers' token checks (`YYERROR`), so a construct that failed leaves a
 //! placeholder that never reaches a successful result.
 //!
-//! Every word is one `Pk::Zsh` part holding zsh's token string.
-//! Arithmetic text is zsh's token string too.
+//! Every word is one [`Pk::Zsh`](crate::bash::syntax::tree::Pk::Zsh) part
+//! holding zsh's token string. Arithmetic text is zsh's token string too.
 //!
 //! Ported from zsh 5.9 (MIT-style licence, Copyright (c) 1992-1997 Paul
 //! Falstad and the zsh development group).
@@ -1690,9 +1690,9 @@ impl Ctx<'_> {
 	}
 
 	/// zsh `par_cond_multi`: a module condition `-x arg…`. Its operands are
-	/// the parts of the unary condition's word, one `Pk::Zsh` part each
-	/// (no part for none), so a word with other than one part is such a
-	/// condition.
+	/// the parts of the unary condition's word, one
+	/// [`Pk::Zsh`](crate::bash::syntax::tree::Pk::Zsh) part each (no part for
+	/// none), so a word with other than one part is such a condition.
 	fn par_cond_multi(&mut self, a: Tw, l: Vec<Tw>) -> Option<Id<shape::Cond>> {
 		if a.0.len() < 2 || !is_dash(a.0[0]) {
 			return self.cond_error(b"condition expected: ", &a.0);

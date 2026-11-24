@@ -3,7 +3,8 @@
 //! Companion to the Rust-native filters in [`filters`](super::filters). A
 //! pipeline is a small, data-driven transform compiled from a TOML definition
 //! that ships either as a built-in (concatenated at build time) or supplied
-//! through a user-provided settings file via [`MinimizerConfig`](crate::minimizer::MinimizerConfig).
+//! through a user-provided settings file via
+//! [`MinimizerConfig`](crate::minimizer::MinimizerConfig).
 //!
 //! ## Pipeline stages (applied in order)
 //!
