@@ -31,7 +31,7 @@
 //! | Op | a | b | Semantics |
 //! |---|---|---|---|
 //! | `Nop` | – | – | nothing |
-//! | `Exec` | `cmds` index | – | simple command: expand, redirect, resolve, dispatch (staged, may park or call) |
+//! | `Exec` | `cmds` index | bits [`Op::EXEC_FORKED`], [`Op::EXEC_ASYNC`] | simple command: expand, redirect, resolve, dispatch (staged, may park or call) |
 //! | `Jmp` | target | – | jump |
 //! | `BrOk` | target | [`Construct`](crate::bash::event::Construct) | jump when `$?` = 0; emits `Branch` |
 //! | `BrFail` | target | [`Construct`](crate::bash::event::Construct) | jump when `$?` ≠ 0; emits `Branch` |
@@ -47,7 +47,7 @@
 //! | `LoopExit` | – | – | pop the loop record, `$?` = its status, emit `LoopEnd` |
 //! | `Redir` | `redirs` index | pc after the matching `PopRedir` | apply a compound command's redirections (staged), saving the previous fds; on failure `$?` = 1 and jump to `b` |
 //! | `PopRedir` | – | – | restore the fds saved by the matching `Redir` |
-//! | `Spawn` | `spawns` index | – | subshell, pipeline or background job (flag [`Op::DISOWN`]: zsh `&!`/`&|`, not in the job table): start child vprocs at the stage entries; `Subshell`/`Pipeline` wait and set `$?`/`PIPESTATUS`; then jump to the entry's `end` |
+//! | `Spawn` | `spawns` index | [`Op::ASYNC_PIPELINE`] or 0 | subshell, pipeline or background job (flag [`Op::DISOWN`]: zsh `&!`/`&|`, not in the job table): start child vprocs at the stage entries; `Subshell`/`Pipeline` wait and set `$?`/`PIPESTATUS`; then jump to the entry's `end` |
 //! | `SubExit` | – | – | end of a child's code: the vproc exits with `$?` |
 //! | `CaseWord` | `words` index | – | expand the `case` subject (no splitting) and push it |
 //! | `CaseArm` | `pats` index | next-arm pc | match the subject against the patterns; no match: jump to `b` |
@@ -96,7 +96,7 @@ use crate::bash::{
 };
 
 /// IR version; part of the frames header.
-pub const IR_VERSION: u32 = 17;
+pub const IR_VERSION: u32 = 18;
 
 /// Opcodes.
 #[derive(
@@ -203,6 +203,12 @@ pub struct Op {
 const _: () = assert!(size_of::<Op>() == 16);
 
 impl Op {
+	/// `Spawn` operand `b` on a bash pipeline that is a whole background
+	/// list item (`a | b &`, `! a | b &`; not with `&&`/`||` or `time`,
+	/// which fork a subshell first): bash runs it asynchronously, forking
+	/// every stage, so its last stage does not run in the shell under
+	/// `lastpipe` (`execute_pipeline`'s `asynchronous == 0` test).
+	pub const ASYNC_PIPELINE: u32 = 1;
 	/// Flag on `Exec`: the whole body of a `$( )` is `< file`, which
 	/// outputs the file (bash's `$(< file)`).
 	pub const CAT: u8 = 1 << 4;
@@ -213,6 +219,14 @@ impl Op {
 	/// Flag on a background `Spawn`: zsh `&!`/`&|`, the job is disowned at
 	/// once (not in the job table).
 	pub const DISOWN: u8 = 1 << 7;
+	/// `Exec` operand `b` bit: a bash `%job &` (the command's first word
+	/// as written starts with `%`, the command alone in a background list
+	/// item) runs here, not in a child, and its jobspec is `bg`.
+	pub const EXEC_ASYNC: u32 = 2;
+	/// `Exec` operand `b` bit: bash runs this simple command in the child
+	/// it forked for it (a pipeline stage, or a background list item whose
+	/// first word does not start with `%`), where a jobspec is no command.
+	pub const EXEC_FORKED: u32 = 1;
 	/// `Nop` operand `b` in a zsh unit: the end of a list (the DEBUG trap
 	/// point after it).
 	pub const LIST_END: u32 = 2;

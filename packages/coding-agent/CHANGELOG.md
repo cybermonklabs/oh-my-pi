@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a jobspec used as a command in the `bash` tool's bash code (`%1`, `%%`, `%name`): as bash's `fg` it now runs before its redirections, which are neither expanded nor applied (`%1 > ${f:=x}` no longer sets `f`, `%1 2>/dev/null` no longer hides the message); `%1 &` (also through an alias) is `bg` in the shell, not `fg` in a background job; a function named `%1` no longer wins; and in a pipeline stage or a forked background command it is `command not found` (127), except where bash runs it in the shell (the last stage under `shopt -s lastpipe`, unless the pipeline itself runs with `&`) or the `command` builtin runs it (`command -p -p %1`, `builtin command %1`)
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
