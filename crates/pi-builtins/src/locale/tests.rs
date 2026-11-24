@@ -1085,11 +1085,10 @@ fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
 		}
 		handle.end_group();
 		if reaped_elsewhere {
-			// `end_group` has sent every signal it sends by the time it
-			// returns, and a process a `SIGKILL` has reached takes no later
-			// signal: Linux marks it exiting as the `SIGKILL` is sent and then
-			// drops what follows (7.0 `kernel/signal.c:1003-1017`, `:877-883`),
-			// and gVisor stops no thread group that is exiting. So a member
+			// A process a `SIGKILL` has reached takes no later signal: Linux
+			// marks it exiting as the `SIGKILL` is sent and then drops what
+			// follows (7.0 `kernel/signal.c:1003-1017`, `:877-883`), and gVisor
+			// stops no thread group that is exiting. So a member
 			// left alone takes this stop and reads `T`; one that was ended
 			// never does, and reads `Z` or `X` until it is reaped, then
 			// nothing. A sleep and then `kill(member, 0)` passed for such a
@@ -1107,6 +1106,16 @@ fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
 				}
 				std::thread::sleep(std::time::Duration::from_millis(1));
 			};
+			// A signal `end_group` handed to another thread lands later, and a
+			// `SIGKILL` ends a stopped member: so the state is read again
+			// after a window. 200 ms is the claim's time, the window the old
+			// check gave: a signal sent later than that is not seen.
+			let later = if state == b'T' {
+				std::thread::sleep(std::time::Duration::from_millis(200));
+				state_and_threads(member).0
+			} else {
+				state
+			};
 			// SAFETY: the test cleans up what it started.
 			unsafe { libc::kill(member, libc::SIGKILL) };
 			assert!(
@@ -1118,6 +1127,12 @@ fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
 				char::from(state),
 				'T',
 				"a member of a group whose utility was reaped elsewhere was signalled: it did not stop"
+			);
+			assert_eq!(
+				char::from(later),
+				'T',
+				"a member of a group whose utility was reaped elsewhere was signalled after end_group \
+				 returned"
 			);
 		} else {
 			utility.wait().unwrap();
