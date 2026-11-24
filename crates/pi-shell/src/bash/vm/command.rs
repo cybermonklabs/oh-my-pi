@@ -311,16 +311,9 @@ pub fn exec(
 						},
 					}
 				}
-				if (op.flags & ir::Op::CAT != 0
-					|| (unit.mode.dialect() == crate::bash::ids::Dialect::Zsh
-						&& cmd.assigns.is_empty()
-						&& cmd
-							.redirs
-							.is_some_and(|list| zsh_read_subst(vp, unit, list))))
-					&& st(vp).argv.is_empty()
-				{
+				if op.flags & ir::Op::CAT != 0 && st(vp).argv.is_empty() {
 					// `$(< file)`: the file is the substitution's output.
-					if let Some(flow) = cat_stdin(k, vp, cx, line) {
+					if let Some(flow) = cat_stdin(k, vp, cx) {
 						return flow;
 					}
 					continue;
@@ -351,6 +344,9 @@ pub fn exec(
 			Stage::Lookup => {
 				if let Some(flow) = lookup(k, vp, cx, op, cmd.typeset) {
 					return flow;
+				}
+				if vp.pending_break.is_some() {
+					drop_childs_break(vp);
 				}
 			},
 			Stage::Dispatch
@@ -707,6 +703,29 @@ fn deferred_resolved(k: &mut Kernel, vp: &mut Vproc) {
 		};
 	}
 	st(vp).stage = Stage::Redirect;
+}
+
+/// bash expands the redirections of a program it runs (an external, or a
+/// name it cannot find) after the fork, in the child (`execute_disk_command`
+/// runs `do_redirections` there). A `break` or `continue` in a `${ }` of
+/// those redirections sets `breaking` in that child, which then runs the
+/// program or fails: the shell's loop never sees it. This shell expands them
+/// before the name resolves, so a break that waits from this command's
+/// redirections ([`super::proc::PendingBreak::redir`]) is dropped here once
+/// the name resolves to anything but a function or a builtin. (A pi utility
+/// stands for the program of its name: bash would fork for that too.)
+#[cold]
+#[inline(never)]
+fn drop_childs_break(vp: &mut Vproc) {
+	let here = vp.frames.len() as u32;
+	let from_redir = vp.pending_break.as_deref().is_some_and(|p| p.redir == here);
+	let program = !matches!(
+		st(vp).target,
+		None | Some(Target::Function(_) | Target::Intrinsic(_) | Target::Search)
+	);
+	if from_redir && program {
+		vp.pending_break = None;
+	}
 }
 
 /// Expand words, then assignment values. Assignment-only commands assign
@@ -1157,59 +1176,32 @@ fn expand(
 	None
 }
 
-/// `$(< file)`: read fd 0 (the redirected file) to its end and queue it
-/// as the command's output.
-fn cat_stdin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<Flow> {
+/// `$(< file)` (bash, in the shell: [`exec::start_sub`]): read fd 0 (the
+/// redirected file) to its end and append it to the substitution's capture,
+/// which the [`FrameKind::Cat`] frame running this command holds; the
+/// shell's fd 1 is not used. A read error is no failure, as in bash's
+/// `read_comsub`: `$(< dir)` is empty with status 0 and no message. (bash
+/// keeps what it read before an error; the engine's read answers nothing
+/// then.)
+fn cat_stdin(k: &Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<Flow> {
 	let req = Probe::Read { path: BString::from("/dev/stdin") };
 	let mut sc = exec::take_scratch(vp);
 	let answer = match probe::cached(&sc, &req) {
 		Some(r) => Ok(r.clone()),
 		None => probe::perform(k, cx, vp, &mut sc, &req),
 	};
-	vp.frames.last_mut().expect("frame").scratch = Some(sc);
+	let frame = vp.frames.last_mut().expect("frame");
+	frame.scratch = Some(sc);
 	let text = match answer {
 		Err(key) => return Some(Flow::Block(key)),
 		Ok(ProbeResult::Bytes(Ok(text))) => text,
-		Ok(ProbeResult::Bytes(Err(msg))) => {
-			k.diag(cx, vp, line, Diag::Usage { msg: format!("{msg}").into() });
-			let s = st(vp);
-			s.status = 1;
-			s.stage = Stage::Finish;
-			return None;
-		},
 		Ok(_) => BString::default(),
 	};
-	let s = st(vp);
-	s.writes
-		.push_back(PendingWrite { fd: 1, bytes: text, off: 0 });
-	s.stage = Stage::Output;
-	None
-}
-
-/// zsh `getoutput`'s `$(< word)` (`simple_redir_name`): the whole body of
-/// the zsh command substitution `vp` runs is one simple command made of a
-/// lone `<` on fd 0 (redirection list `list` of `unit`). Its output is the
-/// file, read without running `$READNULLCMD`.
-#[inline(never)]
-fn zsh_read_subst(vp: &Vproc, unit: &Unit, list: u32) -> bool {
-	let [Frame { kind: FrameKind::Script { src, what: ScriptKind::Eval, aux, .. }, .. }] =
-		vp.frames.as_slice()
-	else {
-		return false;
-	};
-	if aux.as_ref().is_some_and(|a| a.pending.is_some()) {
-		return false;
+	if let FrameKind::Cat { capture } = &frame.kind {
+		capture.append(&text);
 	}
-	// The list markers (`Nop`s) aside.
-	let mut ops = unit.ops.iter().filter(|op| op.code != ir::Opcode::Nop);
-	let lone_exec = matches!((ops.next(), ops.next(), ops.next()), (Some(exec), Some(end), None)
-		if exec.code == ir::Opcode::Exec && end.code == ir::Opcode::End);
-	vp.parent.is_some()
-		&& lone_exec
-		&& unit.redirs.get(list as usize).is_some_and(
-			|rs| matches!(rs.as_slice(), [r] if r.op == RedirKind::In && r.fd == ir::RedirFdIr::Default),
-		)
-		&& src.trim_ascii() == unit.source.trim_ascii()
+	st(vp).stage = Stage::Finish;
+	None
 }
 
 /// zsh `execcmd` for redirections without a command: without `$NULLCMD`
@@ -4701,8 +4693,13 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
 	vp.status = status;
-	vp.pipestatus.clear();
-	vp.pipestatus.push(status);
+	// bash's in-shell read of `$(< file)` runs no command: `PIPESTATUS`
+	// stays the last pipeline's (`false | true; echo "$(< f)"
+	// "${PIPESTATUS[@]}"` prints `… 1 0`).
+	if op.flags & ir::Op::CAT == 0 {
+		vp.pipestatus.clear();
+		vp.pipestatus.push(status);
+	}
 	if k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
 		// One fresh reading for the duration and the event's stamp; the
 		// next command's `CmdStart` may share it.

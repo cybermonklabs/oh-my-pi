@@ -16,8 +16,8 @@ use super::{
 	is_ident, probe,
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
-		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		LoopKind, LoopRec, ParseSnapshot, PendingBreak, PendingSub, PendingWrite, Probe, ProbeResult,
+		Run, Saved, Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -169,6 +169,16 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		let unit = held.as_ref().expect("just set");
 		let op = unit.ops[frame.pc as usize];
 		let fi = vp.frames.len() - 1;
+		// A `break` or `continue` that ran inside `${ }` or `${| }` waits
+		// for a loop (bash's `breaking`): the command holding it has
+		// finished, and no other command runs before a loop takes it.
+		if vp.pending_break.is_some()
+			&& vp.frames[fi].scratch.is_none()
+			&& unit.mode.dialect() == Dialect::Bash
+			&& pending_break(k, vp, cx, op)
+		{
+			continue;
+		}
 		// Control flow of a bash unit: it starts no command, cannot fail as
 		// one or block, and keeps the clock, so none of the bookkeeping
 		// below applies to it.
@@ -588,10 +598,12 @@ fn note_command(vp: &mut Vproc, unit: &Arc<Unit>, op: Op) {
 }
 
 /// Whether `op` starts a command bash reports on its own (`BASH_COMMAND`,
-/// the ERR trap): a simple command, `[[ ]]` or `(( ))`.
+/// the ERR trap): a simple command, `[[ ]]` or `(( ))`. The `< file` of a
+/// `$(< file)` ([`Op::CAT`]) is none: bash reads the file without running
+/// a command (no DEBUG trap, `BASH_COMMAND` stays the outer command's).
 fn starts_command(unit: &Unit, op: Op) -> bool {
 	match op.code {
-		Opcode::Exec => true,
+		Opcode::Exec => op.flags & Op::CAT == 0,
 		Opcode::Enter => unit
 			.nodes
 			.get(op.node as usize)
@@ -1625,7 +1637,9 @@ fn end_unit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 				pop_frame(&mut k.root, cx.store, vp);
 			}
 		},
-		FrameKind::NoFork | FrameKind::Stage => pop_frame(&mut k.root, cx.store, vp),
+		FrameKind::NoFork | FrameKind::Stage | FrameKind::Cat { .. } => {
+			pop_frame(&mut k.root, cx.store, vp);
+		},
 		FrameKind::Subshell | FrameKind::Job { .. } => {
 			unwind(&mut k.root, cx.store, vp, 0);
 			start_exit_trap_once(k, vp, cx);
@@ -1937,52 +1951,387 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 	}
 }
 
+/// The loops a `break` at the top of `frames` may leave (bash's
+/// `loop_level`): those of its frames from the top down past `eval`,
+/// `${ }`, a pipeline stage and `$(< file)` only (a function is a
+/// boundary, as bash's `loop_level` is), and not past a `${ }` or
+/// `$(< file)` in a `( … )`'s own redirection ([`subshell_redirection`]).
+fn loop_count(frames: &[Frame]) -> u32 {
+	let mut n = 0u32;
+	for (i, f) in frames.iter().enumerate().rev() {
+		n = n.saturating_add(u32::try_from(f.loops.len()).unwrap_or(u32::MAX));
+		if i == 0 || !breaks_through(&f.kind) || subshell_redirection(&frames[i - 1]) {
+			break;
+		}
+	}
+	n
+}
+
+/// Whether frame `f` is applying a `( … )`'s own redirections: its op is
+/// the `Redir` that [`ir`] lowers just before the subshell's `Enter` and
+/// `Spawn`. bash expands those words in the forked child, after
+/// `execute_in_subshell` zeroes `loop_level`, so a `break` there sees no
+/// loop; this shell expands them in the parent, before the `Spawn`.
+pub(super) fn subshell_redirection(f: &Frame) -> bool {
+	f.unit
+		.as_deref()
+		.is_some_and(|unit| subshell_redirection_at(unit, f.pc))
+}
+
+/// Whether the op at `at` is a `( … )`'s own `Redir`: the subshell's
+/// `Enter` and `Spawn` follow it.
+fn subshell_redirection_at(unit: &Unit, at: u32) -> bool {
+	let op = |at: u32| unit.ops.get(at as usize);
+	op(at).is_some_and(|r| r.code == Opcode::Redir)
+		&& op(at + 1).is_some_and(|e| e.code == Opcode::Enter)
+		&& op(at + 2).is_some_and(|s| {
+			s.code == Opcode::Spawn
+				&& unit
+					.spawns
+					.get(s.a as usize)
+					.is_some_and(|info| info.kind == SpawnKind::Subshell)
+		})
+}
+
+/// Whether the op at frame `f`'s pc starts a `( … )` that has its own
+/// redirection (its `Enter` or `Spawn`, after that `Redir` is applied):
+/// bash expands the redirection in the forked child, so a trap that a
+/// `kill $$` there sets off waits for the child, not for these ops.
+pub(super) fn redirected_subshell_starts(f: &Frame) -> bool {
+	let Some(unit) = f.unit.as_deref() else {
+		return false;
+	};
+	let redir = match unit.ops.get(f.pc as usize).map(|op| op.code) {
+		Some(Opcode::Enter) => f.pc.checked_sub(1),
+		Some(Opcode::Spawn) => f.pc.checked_sub(2),
+		_ => None,
+	};
+	redir.is_some_and(|at| subshell_redirection_at(unit, at))
+}
+
+/// A frame a `break` crosses to reach the loops outside it.
+const fn breaks_through(kind: &FrameKind) -> bool {
+	matches!(
+		kind,
+		FrameKind::Script { what: ScriptKind::Eval, .. }
+			| FrameKind::NoFork
+			| FrameKind::Stage
+			| FrameKind::Cat { .. }
+	)
+}
+
 fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool, op: Op) {
+	// bash's `check_loop_level`: with no loop to take it, `break` only
+	// complains (outside posix mode) and the commands after it run. Decided
+	// before any frame goes, so a `${ }` holding it goes on.
+	if loop_count(&vp.frames) == 0 {
+		if !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
+			let line = line_of(vp, op.node);
+			let name = if cont { "continue" } else { "break" };
+			let diag =
+				Diag::Usage { msg: "only meaningful in a `for', `while', or `until' loop".into() };
+			k.diag(cx, vp, line, diag.by(name));
+		}
+		vp.status = 0;
+		top_frame(vp).pc += 1;
+		return;
+	}
 	let mut remaining = n.max(1);
 	loop {
-		let f = top_frame(vp);
-		if let Some(rec) = f.loops.last().cloned() {
-			// More levels than loops: the outermost loop ends.
-			if remaining > 1 && f.loops.len() > 1 {
-				f.loops.pop();
+		let depth = vp.frames.len();
+		let top = &vp.frames[depth - 1];
+		if let Some(rec) = top.loops.last().cloned() {
+			// More levels than loops: the next loop out ends too, in this
+			// frame or past an `eval`, `${ }` or stage that holds this one
+			// (bash's `breaking` counts down at each loop); with none left,
+			// the outermost ends.
+			let further = loop_count(&vp.frames) > 1;
+			if remaining > 1 && further {
+				top_frame(vp).loops.pop();
 				truncate(vp, rec.depth);
 				remaining -= 1;
-				continue;
+				if !top_frame(vp).loops.is_empty() {
+					continue;
+				}
+			} else {
+				truncate(vp, rec.depth);
+				// The status is the builtin's: 0, or 1 for `break 0` (which
+				// leaves every loop); for a `break` that waited in a `${ }`,
+				// the status of the command that held it.
+				let status = vp.status;
+				let f = top_frame(vp);
+				// `continue` ends the body with its status too: the loop's
+				// status if no other body command runs.
+				if let Some(r) = f.loops.last_mut() {
+					r.status = status;
+				}
+				f.pc = if cont { rec.cont } else { rec.exit };
+				return;
 			}
-			truncate(vp, rec.depth);
-			// The status is the builtin's: 0, or 1 for `break 0` (which
-			// leaves every loop).
-			let status = vp.status;
-			let f = top_frame(vp);
-			// `continue` ends the body with its status too: the loop's
-			// status if no other body command runs.
-			if let Some(r) = f.loops.last_mut() {
-				r.status = status;
-			}
-			f.pc = if cont { rec.cont } else { rec.exit };
+		}
+		if top_frame(vp).kind == FrameKind::NoFork {
+			// bash's `break` only sets `breaking`: the body of `${ }` or
+			// `${| }` ends here as at its end (`REPLY` passed on), the
+			// command holding it runs, and a loop takes the levels left
+			// after it ([`pending_break`]), at most as many as reach a loop
+			// now (bash caps the count at `loop_level` when the break runs: a
+			// loop whose own redirection holds it is not counted yet).
+			pop_frame(&mut k.root, cx.store, vp);
+			let depth = vp
+				.frames
+				.iter()
+				.rposition(|f| !matches!(f.kind, FrameKind::Cat { .. }))
+				.map_or(0, |i| i + 1);
+			// A `${ }` in a redirection word or here-document of the command
+			// now on top (see `PendingBreak::redir`).
+			let in_redir = vp
+				.frames
+				.last()
+				.and_then(|f| f.scratch.as_ref())
+				.and_then(|s| s.exec.as_deref())
+				.is_some_and(|e| e.stage == super::proc::Stage::Redirect);
+			let redir = if in_redir { vp.frames.len() as u32 } else { 0 };
+			let levels = remaining.min(loop_count(&vp.frames)).max(1);
+			vp.pending_break =
+				Some(Box::new(PendingBreak { levels, cont, depth: depth as u32, redir }));
 			return;
 		}
-		let crossable = matches!(
-			f.kind,
-			FrameKind::Script { what: ScriptKind::Eval, .. } | FrameKind::NoFork | FrameKind::Stage
-		);
-		if crossable && vp.frames.len() > 1 {
-			pop_frame(&mut k.root, cx.store, vp);
-			// The caller's op (`eval`) is abandoned with the loop.
-			clear_scratch(&mut k.root, cx.store, vp);
-			continue;
+		pop_frame(&mut k.root, cx.store, vp);
+		// The caller's op (`eval`) is abandoned with the loop.
+		clear_scratch(&mut k.root, cx.store, vp);
+	}
+}
+
+/// bash's `breaking` ([`Vproc::pending_break`]) at an op that would start:
+/// `true` when it moved control (a loop took it, or a frame the waiting
+/// command entered ended), `false` to run the op.
+fn pending_break(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> bool {
+	let Some(p) = vp.pending_break.as_deref().copied() else {
+		return false;
+	};
+	let top = vp.frames.len() - 1;
+	if vp.frames.len() > p.depth as usize {
+		let kind = &vp.frames[top].kind;
+		if matches!(kind, FrameKind::Cat { .. }) {
+			// The command's own `$(< file)`: it reads its file and ends, and
+			// the command finishes with its value.
+			return false;
 		}
-		break;
+		if matches!(kind, FrameKind::Function { .. }) {
+			// A function the command called runs none of its commands (nor
+			// its RETURN trap).
+			unwind(&mut k.root, cx.store, vp, top);
+			return true;
+		}
+		let frame = &mut vp.frames[top];
+		if let FrameKind::Script { src, pos, stdin, .. } = &mut frame.kind {
+			// Nor does an `eval` or `.` it started: its text ends here.
+			pos.0 = src.len() as u32;
+			*stdin = false;
+			frame.unit = None;
+			return true;
+		}
+		vp.pending_break = None;
+		return false;
 	}
-	// bash's `check_loop_level` complains only outside posix mode.
-	if !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
-		let line = line_of(vp, op.node);
-		let name = if cont { "continue" } else { "break" };
-		let diag = Diag::Usage { msg: "only meaningful in a `for', `while', or `until' loop".into() };
-		k.diag(cx, vp, line, diag.by(name));
+	if vp.frames.len() == p.depth as usize {
+		match own_loop(&vp.frames[top]) {
+			OwnLoop::None => {},
+			OwnLoop::Header => return false,
+			OwnLoop::Test { until } => return own_loop_takes(k, vp, cx, p, Some(until), op),
+			OwnLoop::ArithTest => return own_loop_takes(k, vp, cx, p, None, op),
+		}
 	}
-	vp.status = 0;
-	top_frame(vp).pc += 1;
+	vp.pending_break = None;
+	if loop_count(&vp.frames) > 0 {
+		break_loops(k, vp, cx, p.levels, p.cont, op);
+		return true;
+	}
+	// No loop is left to take it (a `return` carried it out of every
+	// loop): bash would skip each command after it; this shell goes on.
+	false
+}
+
+/// Where the op on top of frame `f` stands in a loop command whose own
+/// redirection held a waiting `break` or `continue` ([`pending_break`]).
+/// bash expands a compound command's redirections before it runs the
+/// command, and a loop counts itself in `loop_level` only as it starts
+/// (`execute_while_or_until` and its siblings), so the break waits through
+/// the loop's header and the loop takes it: one level, with its first test
+/// or body skipped.
+#[derive(Clone, Copy)]
+enum OwnLoop {
+	/// Not such a loop's header, nor where it takes the break.
+	None,
+	/// The loop's header, which runs first: its `Enter`, record and words
+	/// (a `for` binds its first word and a `select` reads its first line
+	/// before bash's loop looks at `breaking`), and an arithmetic `for`'s
+	/// first and test expressions. A `for` or `select` out of words or
+	/// input at once ends without taking the break, which goes on out.
+	Header,
+	/// The first test of a `while` (`until`: true), which bash skips.
+	Test { until: bool },
+	/// The branch after an arithmetic `for`'s first test.
+	ArithTest,
+}
+
+/// [`OwnLoop`] of the op at frame `f`'s pc, from the ops before it: only
+/// the loop's own header lies between its `Redir` and the op, and a
+/// waiting break reaches no op of it but through that `Redir`. A `for`'s
+/// `ForNext` just after its `ForIn` runs too: a break in its words waits
+/// for the first word as bash's does, as bash counts the loop before it
+/// expands them. The bodies of the substitutions in a `for`'s or
+/// `select`'s words lie in its header too ([`before_blocks`]); the jump
+/// over one is the header's, and the break never runs one: [`start_sub`]
+/// expands each to nothing, as bash runs no command while `breaking`.
+fn own_loop(f: &Frame) -> OwnLoop {
+	let Some(unit) = f.unit.as_deref() else {
+		return OwnLoop::None;
+	};
+	let pc = f.pc;
+	let Some(&op) = unit.ops.get(pc as usize) else {
+		return OwnLoop::None;
+	};
+	if op.code == Opcode::LoopExit {
+		return match f.loops.last() {
+			Some(rec)
+				if rec.exit == pc
+					&& matches!(rec.kind, LoopKind::For { .. } | LoopKind::Select { .. }) =>
+			{
+				OwnLoop::Header
+			},
+			_ => OwnLoop::None,
+		};
+	}
+	let Some(prev_at) = before_blocks(unit, pc) else {
+		return OwnLoop::None;
+	};
+	let prev = unit.ops[prev_at as usize];
+	if op.code == Opcode::ForNext && prev.code == Opcode::ForIn && prev.node == op.node {
+		return OwnLoop::Header;
+	}
+	let node = prev.node;
+	let mut at = prev_at;
+	loop {
+		let o = unit.ops[at as usize];
+		if o.node != node {
+			return OwnLoop::None;
+		}
+		match o.code {
+			Opcode::Redir => break,
+			Opcode::Enter | Opcode::Arith | Opcode::LoopEnter | Opcode::ForIn | Opcode::SetStatus => {
+			},
+			_ => return OwnLoop::None,
+		}
+		let Some(before) = before_blocks(unit, at) else {
+			return OwnLoop::None;
+		};
+		at = before;
+	}
+	let ours = op.node == node;
+	match unit.nodes.get(node as usize).map(|n| n.kind) {
+		Some(NodeKind::While | NodeKind::Until)
+			if ours && matches!(op.code, Opcode::Enter | Opcode::LoopEnter) =>
+		{
+			OwnLoop::Header
+		},
+		Some(kind @ (NodeKind::While | NodeKind::Until)) if prev.code == Opcode::LoopEnter => {
+			OwnLoop::Test { until: kind == NodeKind::Until }
+		},
+		Some(NodeKind::For | NodeKind::Select)
+			if (ours && matches!(op.code, Opcode::Enter | Opcode::ForIn)) || block_at(unit, pc) =>
+		{
+			OwnLoop::Header
+		},
+		Some(NodeKind::ArithFor)
+			if ours
+				&& matches!(
+					op.code,
+					Opcode::Enter | Opcode::Arith | Opcode::LoopEnter | Opcode::SetStatus
+				) =>
+		{
+			OwnLoop::Header
+		},
+		Some(NodeKind::ArithFor) if ours && op.code == Opcode::BrFail => OwnLoop::ArithTest,
+		_ => OwnLoop::None,
+	}
+}
+
+/// Whether the op at `pc` is the jump over a substitution's body, as
+/// [`ir`] lowers a `$( )`, `${ }`, `${| }` or `<( )` in a word (`block`):
+/// a `Jmp` of node 0 to the op after the body's `SubExit`.
+fn block_at(unit: &Unit, pc: u32) -> bool {
+	unit.ops.get(pc as usize).is_some_and(|op| {
+		op.code == Opcode::Jmp
+			&& op.node == 0
+			&& op.a > pc + 1
+			&& unit
+				.ops
+				.get(op.a as usize - 1)
+				.is_some_and(|end| end.code == Opcode::SubExit && end.node == 0)
+	})
+}
+
+/// The pc of the op before `pc`, past the substitution bodies
+/// ([`block_at`]) that end just before it, an outer body with the bodies
+/// it holds; `None` at the unit's start.
+fn before_blocks(unit: &Unit, pc: u32) -> Option<u32> {
+	let mut at = pc.checked_sub(1)?;
+	loop {
+		let end = unit.ops[at as usize];
+		if end.code != Opcode::SubExit || end.node != 0 {
+			return Some(at);
+		}
+		let after = at + 1;
+		let jump = (0..at)
+			.rev()
+			.find(|&j| block_at(unit, j) && unit.ops[j as usize].a == after)?;
+		at = jump.checked_sub(1)?;
+	}
+}
+
+/// The loop whose own redirection held the waiting break `p` takes it, as
+/// bash's loop does on its first pass: a `while` (`until`: `Some(true)`)
+/// at its first test, which bash skips with the status `$?` has; an
+/// arithmetic `for` (`None`) after its first test. A `continue` of one
+/// level lets the loop go on (a `while` whose skipped test succeeds, an
+/// `until` whose skipped test fails: its body is skipped too; an
+/// arithmetic `for`'s test decides, as on any pass); anything else ends
+/// the loop, with the status bash's returns, and the levels left go to the
+/// loops around it ([`break_loops`]).
+fn own_loop_takes(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	p: PendingBreak,
+	until: Option<bool>,
+	op: Op,
+) -> bool {
+	vp.pending_break = None;
+	let skipped = vp.status;
+	if p.cont && p.levels == 1 {
+		match until {
+			Some(until) if (skipped == 0) != until => {
+				// The body bash skipped is the loop's last one so far.
+				if let Some(rec) = top_frame(vp).loops.last_mut() {
+					rec.status = skipped;
+				}
+				return false;
+			},
+			None => return false,
+			Some(_) => {
+				vp.status = 0;
+				break_loops(k, vp, cx, 1, false, op);
+				return true;
+			},
+		}
+	}
+	// An `until` returns its skipped body's status (the skipped test's when
+	// that failed, 0 when it ended the loop); a `while` and an arithmetic
+	// `for` return 0, no body having run.
+	vp.status = if until == Some(true) { skipped } else { 0 };
+	break_loops(k, vp, cx, p.levels, p.cont, op);
+	true
 }
 
 /// The top frame's scratch, created from the vproc's spare if absent.
@@ -2212,7 +2561,8 @@ pub fn settle_probe(
 /// The logged form of an expansion probe's answer: a PATH search's path
 /// (`None`: not found); an access check's success as an empty string; a
 /// filesystem request's ([`super::fsprobe`]) bytes, names (a list), other
-/// success (empty) or failure (`None`).
+/// success (empty) or failure (`None`); a file read's contents, or its
+/// failure's `strerror` text as a one-item list.
 pub fn probe_atom(answer: ProbeResult) -> Atom {
 	use super::fsprobe::FsAns;
 	Atom::Str(match answer {
@@ -2225,6 +2575,10 @@ pub fn probe_atom(answer: ProbeResult) -> Atom {
 		},
 		ProbeResult::Fs(Ok(FsAns::Bytes(b))) => Some(b),
 		ProbeResult::Fs(Ok(_)) => Some(BString::default()),
+		// A file read ([`Probe::Read`], zsh's `$(< word)`): its contents, or
+		// the `strerror` text of the failure as a one-item list.
+		ProbeResult::Bytes(Ok(b)) => Some(b),
+		ProbeResult::Bytes(Err(err)) => return Atom::List(vec![err]),
 		_ => None,
 	})
 }
@@ -2252,6 +2606,13 @@ pub fn start_sub(
 	sc: &mut Scratch,
 	sub: Sub,
 ) -> Flow {
+	// bash's `breaking`: while a `break` in an earlier `${ }` or `${| }` of
+	// the command waits for its loop, no later substitution runs a command
+	// (`execute_command_internal` returns at once); each expands to nothing.
+	if vp.pending_break.is_some() {
+		sc.sub = Some(PendingSub::NoFork { capture: Capture::default(), value: false });
+		return Flow::Call;
+	}
 	let Sub { unit, entry, form, text, line } = sub;
 	let first = unit
 		.ops
@@ -2269,6 +2630,24 @@ pub fn start_sub(
 	let inherit =
 		posix || state::option(&mut k.root, cx.store, vp, OptId::InheritErrexit).unwrap_or(false);
 	match form {
+		// `$(< file)`: bash reads the file in the shell itself, with no
+		// subshell (`optimize_cat_file`): the redirection's word expands as
+		// the shell's own (`set -u` ends the shell; no DEBUG trap, xtrace or
+		// ERR trap for the `< file`, which is no command bash runs). The body
+		// runs here in a frame of its own ([`FrameKind::Cat`]) that holds the
+		// capture; its `Exec` ([`ir::Op::CAT`]) appends the file to it. The
+		// shell's fds are left alone, so what the word's expansion writes
+		// (`${| cmd; }`) and an EXIT trap a fatal error in it runs write
+		// where the shell does. A failure inside does not count for `set -e`.
+		ComsubForm::Fork if unit.cat_exec(entry).is_some() => {
+			let kind = FrameKind::Cat { capture: capture.clone() };
+			let mut frame = Frame::new(Some(unit), entry, kind);
+			frame.line_shift = shift;
+			frame.ignore_errexit = true;
+			vp.frames.push(frame);
+			sc.sub = Some(PendingSub::NoFork { capture, value: false });
+			Flow::Call
+		},
 		ComsubForm::Fork => {
 			let mut fds = vp.fds.clone();
 			fds.set(1, Some(out));
@@ -2277,15 +2656,8 @@ pub fn start_sub(
 			// numbering its lines from the line the shell is at: at top
 			// level, where the whole command ends.
 			let base = top_level_end_line(vp).unwrap_or(line);
-			// `$(< file)` keeps its compiled form ([`ir::Op::CAT`]).
-			let cat = unit
-				.ops
-				.get(entry as usize)
-				.is_some_and(|op| op.flags & ir::Op::CAT != 0);
 			let reparse = text.and_then(|i| unit.strs.get(i as usize)).filter(|_| {
-				!posix
-					&& !cat
-					&& (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))
+				!posix && (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))
 			});
 			let mut child = if let Some(src) = reparse {
 				vp.child_text(k, cx.store, src, base, fds)
@@ -2833,14 +3205,13 @@ fn plain_arith(
 			let line = line_of(vp, op.node);
 			k.diag(cx, vp, line, d);
 			vp.status = 1;
-			// `((…))` continues; an arith-for header error leaves the loop
-			// (approximated by discarding the command).
+			// `((…))` continues; an arith-for header error leaves the loop.
 			if unit
 				.nodes
 				.get(op.node as usize)
 				.is_some_and(|n| n.kind == NodeKind::ArithFor)
 			{
-				Flow::Discard(1)
+				arith_for_failed(vp, unit, op)
 			} else {
 				Flow::Next
 			}
@@ -2854,6 +3225,54 @@ fn plain_arith(
 			stop_flow(k, vp, cx, line, Stop::Fail(d))
 		},
 	})
+}
+
+/// The flow after an arith-`for` header expression failed (its message
+/// shown, `$?` 1): bash's `execute_arith_for_command` leaves the loop with
+/// status 1, and the commands after it run. A failed first expression ends
+/// it before its record is pushed; a failed test or step drops the record.
+/// A `break` or `continue` that waits for a loop
+/// ([`Vproc::pending_break`], from the loop's own redirection or the
+/// test's substitution) loses one level to the loop at a failed test, as
+/// bash's loop checks `breaking` and `continuing` after the test; the
+/// levels left go on to the loops around it. It is no ERR trap point
+/// (the loop's status is no failed command's).
+fn arith_for_failed(vp: &mut Vproc, unit: &Unit, op: Op) -> Flow {
+	let frame = top_frame(vp);
+	frame.err_reported = true;
+	let pc = frame.pc;
+	let next = unit
+		.ops
+		.get(pc as usize + 1)
+		.copied()
+		.filter(|n| n.node == op.node);
+	if let Some(enter) = next.filter(|n| n.code == Opcode::LoopEnter) {
+		// The first expression: `LoopEnter`'s target is the loop's
+		// `LoopExit`, which would pop a record this loop has not pushed.
+		return Flow::Jump(enter.a + 1);
+	}
+	let Some(rec) = top_frame(vp).loops.pop() else {
+		// Every test and step runs with the loop's record pushed.
+		return Flow::Next;
+	};
+	let test = next.is_some_and(|n| n.code == Opcode::BrFail);
+	let depth = vp.frames.len();
+	if test
+		&& vp
+			.pending_break
+			.as_deref()
+			.is_some_and(|p| p.depth as usize == depth)
+	{
+		let left = vp
+			.pending_break
+			.as_deref()
+			.map_or(0, |p| p.levels.saturating_sub(1));
+		match vp.pending_break.as_deref_mut() {
+			Some(p) if left > 0 => p.levels = left,
+			_ => vp.pending_break = None,
+		}
+	}
+	Flow::Jump(rec.exit + 1)
 }
 
 /// Whether `op` (an `Enter`/`Leave`) brackets a zsh `[[ ]]` traced by
@@ -3013,7 +3432,10 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		},
 		Opcode::Spawn => spawn(k, vp, cx, unit, op),
 		Opcode::SubExit => {
-			if matches!(top_frame(vp).kind, FrameKind::NoFork | FrameKind::Stage) {
+			if matches!(
+				top_frame(vp).kind,
+				FrameKind::NoFork | FrameKind::Stage | FrameKind::Cat { .. }
+			) {
 				pop_frame(&mut k.root, cx.store, vp);
 			} else {
 				// A subshell, pipeline stage or job ends: its EXIT trap runs.
@@ -3087,13 +3509,9 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					k.diag(cx, vp, line, d);
 					vp.status = 1;
 					// `((…))` continues; an arith-for header error leaves the
-					// loop (approximated by discarding the command).
-					if unit
-						.nodes
-						.get(op.node as usize)
-						.is_some_and(|n| n.kind == NodeKind::ArithFor)
-					{
-						Flow::Discard(1)
+					// loop.
+					if arith_for {
+						arith_for_failed(vp, unit, op)
 					} else {
 						Flow::Next
 					}
@@ -4638,6 +5056,11 @@ fn zsh_debug_done(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 
 /// Run a configured trap in the interrupted shell, without re-entering it.
 pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey) -> bool {
+	// bash's `breaking`: while a `break` from `${ }` waits for its loop, a
+	// trap's action runs none of its commands (an EXIT trap too).
+	if vp.pending_break.is_some() {
+		return false;
+	}
 	// A subshell lists its parent's EXIT trap but runs only its own.
 	if key == TrapKey::Exit && vp.parent.is_some() && !vp.own_traps.has(key) {
 		return false;

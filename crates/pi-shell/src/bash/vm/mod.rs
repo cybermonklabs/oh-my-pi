@@ -2813,6 +2813,7 @@ impl Vproc {
 			calls: Vec::new(),
 			own_traps: proc::OwnTraps::EMPTY,
 			trap_frames: 0,
+			pending_break: None,
 			mode: ModeId::Bash,
 			zsh: None,
 			zle: None,

@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 30;
+pub const FRAMES_VERSION: u32 = 31;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -265,6 +265,9 @@ struct ProcImage {
 	calls:         Vec<super::callstack::Call>,
 	/// The pseudo-signal traps the vproc set itself.
 	own_traps:     super::proc::OwnTraps,
+	/// A `break` from `${ }` or `${| }` waiting for its loop: its command
+	/// may be parked.
+	pending_break: Option<super::proc::PendingBreak>,
 	/// Current mode (the root's is also `MiscKey::Mode`).
 	mode:          ModeId,
 	/// zsh state (sticky emulation, frames' restores).
@@ -330,6 +333,8 @@ struct FrameImage {
 	ignore_errexit:    bool,
 	subshell_line:     Option<u32>,
 	getopts:           super::proc::GetoptsState,
+	/// A [`FrameKind::Cat`] frame's capture: its memory object.
+	capture:           Option<u32>,
 }
 
 /// A saved fd: the fd object it held.
@@ -559,6 +564,10 @@ impl Shell {
 					ignore_errexit: f.ignore_errexit,
 					subshell_line: f.subshell_line,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
+					capture: match &f.kind {
+						FrameKind::Cat { capture } => Some(fds.capture(capture)),
+						_ => None,
+					},
 				});
 			}
 			for (fd, h) in p.fds.iter() {
@@ -617,6 +626,7 @@ impl Shell {
 				command,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
+				pending_break: p.pending_break.as_deref().copied(),
 				mode: p.mode,
 				zsh: p.zsh.clone(),
 				lineage: p.lineage,
@@ -848,6 +858,7 @@ impl Shell {
 			vp.subshell = p.subshell;
 			vp.calls = p.calls;
 			vp.own_traps = p.own_traps;
+			vp.pending_break = p.pending_break.map(Box::new);
 			vp.mode = p.mode;
 			vp.zsh = p.zsh;
 			vp.lineage = p.lineage;
@@ -1015,7 +1026,13 @@ impl Shell {
 					.into_iter()
 					.map(|r| objs.saved(cx.host, r))
 					.collect();
-				let mut frame = Frame::new(unit, f.pc, f.kind);
+				let mut kind = f.kind;
+				// The capture is the substitution's own buffer: the same memory
+				// object as its `PendingSub::NoFork`.
+				if let (FrameKind::Cat { capture }, Some(i)) = (&mut kind, f.capture) {
+					*capture = objs.capture(i);
+				}
+				let mut frame = Frame::new(unit, f.pc, kind);
 				frame.loops = f.loops;
 				frame.enters = f.enters;
 				frame.cases = f.cases;
