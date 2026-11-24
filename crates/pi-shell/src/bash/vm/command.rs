@@ -4095,7 +4095,7 @@ fn settle_builtin(
 			} else if w.all {
 				Awaited::AllJobs
 			} else {
-				Awaited::Jobs { force: w.force, operands: w.operands }
+				Awaited::Jobs { force: w.force, operands: w.operands, after: w.after }
 			});
 			e.stage = Stage::Await;
 			None
@@ -4435,7 +4435,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			}
 			status
 		},
-		Some(Awaited::Jobs { force, operands }) => {
+		Some(Awaited::Jobs { force, operands, after }) => {
 			let mut last = st(vp).status;
 			let mut waited = None;
 			let posix = state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
@@ -4449,8 +4449,13 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					waited_notice(k, vp, cx, v, line);
 					// A posix `wait PID` deletes the job and forgets the
 					// status it returned (`jobs.c:2782-2786`), for each pid
-					// operand, beside a job spec too.
-					let forget = posix && operands && named_by_pid(vp, v);
+					// operand, beside a job spec too: at that operand's turn,
+					// the last of the list to name the child (`wait %1 $p`
+					// waits for the job, then takes the status it kept; an
+					// operand naming it after the pid is no child,
+					// [`builtins::flow::wait`]).
+					let later = st(vp).wait_for[1..].contains(&v);
+					let forget = posix && operands && !later && named_by_pid(vp, v);
 					forget_job(k, cx, vp, v, forget);
 					exec::reap_coproc(k, vp, cx, v);
 				} else if let (false, Some(JobState::Stopped(sig))) =
@@ -4472,7 +4477,9 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			if let Some(pid) = waited {
 				waited_into(k, vp, cx, line, pid);
 			}
-			last
+			// An operand after the last child failed: bash returns the last
+			// operand's status.
+			after.unwrap_or(last)
 		},
 		Some(Awaited::AllJobs) => {
 			// bash waits for the first job still running, again and again
@@ -5321,7 +5328,7 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 	k.spawned.push(Box::new(child));
 	let s = st(vp);
 	s.wait_for = vec![vpid];
-	s.waiting = Some(Awaited::Jobs { force: true, operands: false });
+	s.waiting = Some(Awaited::Jobs { force: true, operands: false, after: None });
 	s.stage = Stage::Await;
 	Some(Flow::Block(WaitKey::Proc(vpid)))
 }

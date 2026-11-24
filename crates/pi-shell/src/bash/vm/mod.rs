@@ -3732,7 +3732,7 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 			Some(proc::Awaited::Jobs { .. } | proc::Awaited::AllJobs | proc::Awaited::AnyJob { .. })
 		);
 		if waiting && e.target == Some(proc::Target::Intrinsic(crate::bash::ids::IntrinsicId::Wait)) {
-			e.waiting = Some(proc::Awaited::Jobs { force: true, operands: false });
+			e.waiting = Some(proc::Awaited::Jobs { force: true, operands: false, after: None });
 			e.wait_for.clear();
 			e.wait_into = None;
 			e.status = status;

@@ -2276,6 +2276,9 @@ pub enum Awaited {
 		/// deletion forgets the status it returned, beside a job spec too
 		/// (`command::named_by_pid` finds them among the words).
 		operands: bool,
+		/// The status of the operands after the last child, when one of
+		/// them failed ([`super::builtins::Wait::after`]).
+		after:    Option<i32>,
 	},
 	/// Every background child (`wait` without operands); the status is 0.
 	AllJobs,

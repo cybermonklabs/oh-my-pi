@@ -533,16 +533,34 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	}
 	let mut list = Vec::new();
 	let mut status = 0;
+	// The status of the operands after the last child, when one failed:
+	// bash returns the last operand's status.
+	let mut after = None;
 	let zsh = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
+	// In posix mode bash waits for a pid operand with `wait_for_single_pid`,
+	// which deletes the job and forgets its status (`jobs.c:2782-2786`): a
+	// later operand naming that job then names no child (`pid N is not a
+	// child of this shell`, `%N: no such job`), operand by operand.
+	let posix = !zsh
+		&& crate::bash::vm::state::option(
+			&mut ctx.k.root,
+			ctx.cx.store,
+			ctx.vp,
+			crate::bash::store::OptId::Posix,
+		)
+		.unwrap_or(false);
+	let mut forgotten: Vec<Vpid> = Vec::new();
 	for a in args {
 		if zsh && !a.iter().all(u8::is_ascii_digit) {
 			// zsh `bin_fg`: any other word is a job spec; a bad one ends
 			// the arguments with status 127.
 			if let Some(v) = zsh_wait_job(ctx, a)? {
 				list.push(v);
+				after = None;
 				continue;
 			}
 			status = 127;
+			after = Some(127);
 			break;
 		}
 		if a.first().is_some_and(u8::is_ascii_digit) {
@@ -553,45 +571,62 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 					return done(1);
 				}
 				status = 1;
+				after = Some(1);
 				break;
 			};
 			let child = ctx.vp.vpid_of(pid);
-			if is_child(ctx, child) {
+			if is_child(ctx, child) && !forgotten.contains(&child) {
 				list.push(child);
+				after = None;
+				if posix {
+					forgotten.push(child);
+				}
 			} else {
 				// zsh `bin_fg`: silent under `posixbuiltins`.
 				if !zsh || !ctx.zsh_option(crate::bash::zshopt::ZshOpt::Posixbuiltins)? {
 					ctx.usage(format!("pid {pid} is not a child of this shell"));
 				}
 				status = 127;
+				after = Some(127);
 			}
 		} else if a.starts_with(b"%") {
 			match super::jobs::spec(ctx, a) {
 				Ok(n) => {
 					let job = ctx.vp.jobs.get(n).map(|j| (j.vpid, j.state));
+					if job.is_some_and(|(v, _)| forgotten.contains(&v)) {
+						super::jobs::no_such_job(ctx, a);
+						status = 127;
+						after = Some(127);
+						continue;
+					}
 					if let Some((_, crate::bash::vm::proc::JobState::Stopped(_))) = job {
 						ctx.diag(Diag::Warning {
 							msg: format!("warning: wait_for_job: job {n} is stopped").into(),
 						});
 					}
-					list.extend(job.map(|(v, _)| v));
+					if let Some((v, _)) = job {
+						list.push(v);
+						after = None;
+					}
 				},
 				Err(bad) => {
 					if matches!(bad, super::jobs::Bad::Missing) {
 						super::jobs::no_such_job(ctx, a);
 					}
 					status = 127;
+					after = Some(127);
 				},
 			}
 		} else {
 			ctx.usage(format!("`{}': not a pid or valid job spec", a.as_bstr()));
 			status = 1;
+			after = Some(1);
 		}
 	}
 	if list.is_empty() {
 		return done(status);
 	}
-	let wait = Wait { children: list, operands: true, all: false, any: false, into, force };
+	let wait = Wait { children: list, operands: true, after, all: false, any: false, into, force };
 	Ok(Outcome { status, control: Control::Wait(wait) })
 }
 
@@ -731,7 +766,15 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	{
 		list.push(last);
 	}
-	let wait = Wait { children: list, operands: false, all: true, any: false, into: None, force };
+	let wait = Wait {
+		children: list,
+		operands: false,
+		after: None,
+		all: true,
+		any: false,
+		into: None,
+		force,
+	};
 	Ok(Outcome { status: 0, control: Control::Wait(wait) })
 }
 
@@ -757,8 +800,15 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 			(ctx.vp.jobs.by_vpid(pid).is_none() && kept).then_some(pid)
 		});
 		if let Some(pid) = kept {
-			let wait =
-				Wait { children: vec![pid], operands: true, all: false, any: true, into, force: true };
+			let wait = Wait {
+				children: vec![pid],
+				operands: true,
+				after: None,
+				all: false,
+				any: true,
+				into,
+				force: true,
+			};
 			return Ok(Outcome { status: 0, control: Control::Wait(wait) });
 		}
 		for a in args {
@@ -810,6 +860,7 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 		return done(127);
 	}
 	let operands = !args.is_empty();
-	let wait = Wait { children: list, operands, all: false, any: true, into, force: true };
+	let wait =
+		Wait { children: list, operands, after: None, all: false, any: true, into, force: true };
 	Ok(Outcome { status: 0, control: Control::Wait(wait) })
 }

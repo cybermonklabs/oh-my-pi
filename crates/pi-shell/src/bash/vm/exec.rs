@@ -3243,9 +3243,24 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			Flow::Next
 		},
 		Opcode::Redir => {
-			// bash: in a fork's base frame, the line bash had as it forked it,
-			// looked for only once a diagnostic or an expansion needs it.
-			let line = redir::Line::fork(op.node, compound_line(vp, line));
+			// bash: a `( … )` takes its own line (the one its `)` closes on)
+			// before it forks, so its redirections name that line also as a
+			// pipeline stage or a job (`execute_command_internal`,
+			// `SET_LINE_NUMBER (command->value.Subshell->line)`, before
+			// `make_child`). Any other compound command's, in a fork's base
+			// frame, name the line bash had as it forked it, looked for only
+			// once a diagnostic or an expansion needs it.
+			let subshell = unit
+				.nodes
+				.get(op.node as usize)
+				.is_some_and(|n| n.kind == NodeKind::Subshell);
+			let line = if subshell {
+				redir::Line::at(
+					(unit.line + end_line(unit, op.node)).saturating_sub(top_frame(vp).line_shift),
+				)
+			} else {
+				redir::Line::fork(op.node, compound_line(vp, line))
+			};
 			match redir::apply(k, vp, cx, unit, op.a, &line) {
 				Ok(()) => {
 					let saves = match top_frame(vp).scratch.take() {

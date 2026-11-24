@@ -165,6 +165,10 @@ pub struct Wait {
 	/// it returned (beside a job spec too), and `wait -n` with operands
 	/// (`JWAIT_WAITING`) takes no kept status before it waits for them.
 	pub operands: bool,
+	/// The status of the operands after the last child, when one of them
+	/// failed (`pid N is not a child of this shell`, `%N: no such job`):
+	/// bash returns the last operand's status.
+	pub after:    Option<i32>,
 	/// `wait` without operands: the status stays 0 rather than the last
 	/// child's.
 	pub all:      bool,

@@ -373,6 +373,7 @@ pub fn bin_fg(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString], func: JobFunc)
 					let wait = Wait {
 						children: vec![vpid],
 						operands: false,
+						after:    None,
 						all:      false,
 						any:      false,
 						into:     None,

@@ -3258,6 +3258,44 @@ fn bash_answers_these_waits_and_writes_this_notice_as_bash_5_3() {
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
+/// bash's `wait` takes its operands in turn, and returns the last one's
+/// status (`wait_builtin`). In posix mode it waits for a pid operand with
+/// `wait_for_single_pid`, which deletes the job and forgets its status, so
+/// a later operand naming that job names no child: `pid N is not a child of
+/// this shell`, `%N: no such job`, 127. A job spec first leaves the job's
+/// status for a later pid operand. obash waited for the forgotten child
+/// without end, and returned the last child's status after a failed
+/// operand. Checked-in goldens measured with bash 5.3.20 and 5.2.21 (the
+/// same; [`bounded_bash_rows`]); the pid in a message is replaced by `P`.
+#[test]
+fn a_posix_wait_takes_each_operand_in_turn() {
+	const MSG: &str =
+		"e=$(mktemp); wait OPS 2>\"$e\"; echo a=$?; sed \"s/$p/P/\" \"$e\"; rm -f \"$e\"";
+	let posix = |ops: &str| {
+		format!("set -o posix; (exit 3) & p=$!; /bin/sleep 1 & {}", MSG.replace("OPS", ops))
+	};
+	let not_child = "a=127\nbash: line 1: wait: pid P is not a child of this shell\n";
+	let rows = vec![
+		(posix("$p $p"), not_child.to_owned()),
+		(posix("$p %2 $p"), not_child.to_owned()),
+		(posix("$p %1"), "a=127\nbash: line 1: wait: %1: no such job\n".to_owned()),
+		(posix("%1 $p"), "a=3\n".to_owned()),
+		(posix("%1 %1"), "a=3\n".to_owned()),
+		(posix("$p"), "a=3\n".to_owned()),
+		// Not posix: the job and its status stay.
+		("(exit 3) & p=$!; wait $p $p; echo a=$?".to_owned(), "a=3\n".to_owned()),
+		// A failed operand last (pid 1 is never a child; a word that is no
+		// pid nor job spec gives 1) gives its status; first, the status of
+		// the child after it.
+		("(exit 3) & p=$!; wait $p 1 2>/dev/null; echo a=$?".to_owned(), "a=127\n".to_owned()),
+		("(exit 3) & p=$!; wait $p x 2>/dev/null; echo a=$?".to_owned(), "a=1\n".to_owned()),
+		("(exit 3) & p=$!; wait 1 $p 2>/dev/null; echo a=$?".to_owned(), "a=3\n".to_owned()),
+	];
+	let mut wrong = Vec::new();
+	bounded_bash_rows(rows, &mut wrong);
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
 /// `should_optimize_fork` counts an EXIT, ERR or RETURN trap set to nothing
 /// (`trap '' ERR`, `signal_is_trapped`), and the ERR and RETURN traps a
 /// subshell has are the ones it inherited at the fork (`errtrace`,
@@ -3714,6 +3752,45 @@ fn bash_names_the_line_at_the_fork_for_a_compound_redirection_error() {
 		(
 			"( :\n{ :; } >/nonexistent-dir/x\n:\n)".to_owned(),
 			"bash: line 4: /nonexistent-dir/x: No such file or directory\n".to_owned(),
+			Exit(0),
+		),
+		// A `( … )` takes its own line (where its `)` is) before it forks,
+		// also as a pipeline stage or a job; a `{ }` or a loop stage names
+		// the line bash had as it forked.
+		(
+			"f() {\n:\n:\n( : ) >/nonexistent-dir/x | :\n}\nf 2>&1; echo end".to_owned(),
+			"bash: line 4: /nonexistent-dir/x: No such file or directory\nend\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"f() {\n:\n( :\n:\n) >/nonexistent-dir/x | :\n}\nf 2>&1; echo end".to_owned(),
+			"bash: line 5: /nonexistent-dir/x: No such file or directory\nend\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"f() {\n:\n: | ( : ) >/nonexistent-dir/x\n}\nf 2>&1; echo end".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\nend\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"f() {\n:\n( : ) >/nonexistent-dir/x &\nwait\n}\nf 2>&1; echo end".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\nend\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"f() {\n:\n( : ) >/nonexistent-dir/x\n}\nf 2>&1; echo end".to_owned(),
+			"bash: line 3: /nonexistent-dir/x: No such file or directory\nend\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"f() {\n:\n:\n{ :; } >/nonexistent-dir/x | :\n}\nf 2>&1; echo end".to_owned(),
+			"bash: line 1: /nonexistent-dir/x: No such file or directory\nend\n".to_owned(),
+			Exit(0),
+		),
+		(
+			"f() {\n:\nwhile false; do :; done >/nonexistent-dir/x | :\n}\nf 2>&1; echo end"
+				.to_owned(),
+			"bash: line 1: /nonexistent-dir/x: No such file or directory\nend\n".to_owned(),
 			Exit(0),
 		),
 	];

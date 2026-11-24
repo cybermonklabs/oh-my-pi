@@ -524,6 +524,7 @@ fn foreground(ctx: &mut Ctx<'_, '_>, word: Option<&BString>) -> R {
 	let wait = Wait {
 		children: vec![vpid],
 		operands: false,
+		after:    None,
 		all:      false,
 		any:      false,
 		into:     None,
