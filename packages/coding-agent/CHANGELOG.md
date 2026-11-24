@@ -199,6 +199,7 @@
 - Exiting after aborting a `bash` command now waits for its TERM-resistant foreground processes to be killed ([#18669](https://github.com/can1357/oh-my-pi/issues/18669)).
 - A disposed or switched session now releases every persistent shell it owns, including the ones a surface keeps under a name of its own (`/loop` conditions), instead of holding one native shell per surface for the life of the process ([#18717](https://github.com/can1357/oh-my-pi/pull/18717) by [@eggpeat](https://github.com/eggpeat))
 - Bash tool: a command that times out or is cancelled now behaves like Ctrl+C in a terminal: only what it started is stopped, and the shell keeps its variables, working directory and the `&` jobs earlier commands left running (a server or VM no longer dies with a later command's timeout)
+- An aborted `ssh://` transfer (a read, write, stat, directory listing or `HOME` lookup) no longer leaves a process of its ssh command running: on POSIX each transfer's ssh runs in a process group of its own, so the abort holds and reads its tree before signalling it and waits until the group is empty. These ssh calls run with `BatchMode=yes`, so the controlling terminal they lose this way never had a prompt to show
 
 ### Breaking Changes
 
