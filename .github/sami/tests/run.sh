@@ -122,6 +122,9 @@ doc_fail() {
 
 # --- build event log writers ---------------------------------------------------
 cfg() { jq -cn --arg l "$1" --arg k "$2" '{id:{targetConfigured:{label:$l}},configured:{targetKind:$k}}'; }
+# unbuilt <label>: the event Bazel writes for a target that did not build,
+# which then has no test summary at all.
+unbuilt() { jq -cn --arg l "$1" '{id: {targetCompleted: {label: $l}}, completed: {success: false}}'; }
 summary() { # label status [failed log] [passed log]
 	jq -cn --arg l "$1" --arg s "$2" --arg f "${3:-}" --arg p "${4:-}" '{id:{testSummary:{label:$l,configuration:{id:"c"}}},testSummary:({overallStatus:$s,totalRunCount:1}
 		+ (if $p != "" then {passed:[{name:"test.log",uri:("file://" + $p)}]} else {} end)
@@ -214,7 +217,7 @@ own_default() {
 
 # --- the test step's cases -------------------------------------------------------
 # run <name> <want: 0 or 1> <message regex or ''> <known failures> <stub body>
-# Environment of a case: KNOWN_SKIPS, KNOWN_OUTPUT, SANCTIONED, OWN,
+# Environment of a case: KNOWN_SKIPS, KNOWN_OUTPUT, SANCTIONED, OWN, ROOT_ALONE,
 # IGNORED_RUN, IGNORED_ROOT, CHILD_ENTRIES, MACOS, ONLY (lines of `<target>
 # <name>`; ONLY sets RUST_TEST_ONLY, with CANARY as RUST_TEST_CANARY), ROOTS
 # and ROOT_COUNT, ROOT_BODY, OWN_BODY, IGN_BODY, IGN_ROOT_BODY, STICKY_BODY
@@ -242,6 +245,7 @@ run() {
 	list rust-test-sanctioned-skips.txt "${SANCTIONED:-}" "ruling"
 	if [ -n "${SANCTIONED_LINE:-}" ]; then printf '%s\n' "$SANCTIONED_LINE" >>"$w/repo/.github/sami/rust-test-sanctioned-skips.txt"; fi
 	list rust-test-own-process.txt "${OWN:-}" "why"
+	list rust-test-root-alone.txt "${ROOT_ALONE:-}" "why"
 	list rust-test-ignored.txt "${IGNORED_RUN:-}" "why"
 	list rust-test-ignored-root.txt "${IGNORED_ROOT:-}" "why"
 	list rust-test-child-entries.txt "${CHILD_ENTRIES:-}" "the parent test"
@@ -267,7 +271,7 @@ W="$w"
 logs="$w/logs"
 OWN_TESTS="${OWN_TESTS:-}"
 OWN_PRINTS="${OWN_PRINTS:-}"
-$(declare -f lt_pass lt_fail lt_out lt_ignored lt_partial lt_child_summary doc_pass doc_fail cfg summary tpath bpath fakebin record_names target rt dt nt listed sanct query_names own_default)
+$(declare -f lt_pass lt_fail lt_out lt_ignored lt_partial lt_child_summary doc_pass doc_fail cfg summary unbuilt tpath bpath fakebin record_names target rt dt nt listed sanct query_names own_default)
 args=("\$@")
 if [ "\${args[0]#--bazelrc=}" != "\${args[0]}" ]; then args=("\${args[@]:1}"); fi
 if [ "\${args[0]}" = query ]; then
@@ -747,12 +751,25 @@ RAW_LIST=$RAWLIST run J146-source-line-with-words-in-a-report-fails 1 "$NAT wrot
 # rust-test-macos-inventory.sh give the same one: P13, I9).
 SANCTIONED_LINE="$D a::two ruling" run J147-list-line-without-its-why-stops 1 "rust-test-sanctioned-skips.txt:[0-9]+: no two spaces before its why: $D a::two ruling" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 # A target that did not build: its list lines cannot be checked, so they read
-# UNKNOWN in a notice, and the build failure alone fails the job: a
+# UNKNOWN in a notice, and the build failure alone fails the job. Bazel gives
+# such a target no test summary, only a failed targetCompleted event: a
 # child-entries line (J148), a sanctioned skip (J149), an #[ignore]d root test
-# run alone (J150).
-NOT_MSG='rust-test-child-entries.txt but is no' CHILD_ENTRIES="$B b::child" run J148-child-entry-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
-NOT_MSG='takes out 0 tests' SANCTIONED="$B s::x::byte_totals" run J149-sanctioned-skip-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so what its skip s::x::byte_totals" '' "{ $P; cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
-NOT_MSG='has no one test log' IGNORED_ROOT="$B r::cycle" IGN_ROOT_BODY="{ cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; } >\"\$bep\"; exit 1" run J150-ignored-root-test-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so its own invocation for r::cycle" '' "{ $P; cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
+# run alone (J150); and a summary that says FAILED_TO_BUILD (J151).
+UB="unbuilt $B"
+NOT_MSG='rust-test-child-entries.txt but is no' CHILD_ENTRIES="$B b::child" run J148-child-entry-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; $UB; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
+NOT_MSG='takes out 0 tests' SANCTIONED="$B s::x::byte_totals" run J149-sanctioned-skip-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so what its skip s::x::byte_totals" '' "{ $P; cfg $B 'rust_test rule'; $UB; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
+NOT_MSG='has no one test log' IGNORED_ROOT="$B r::cycle" IGN_ROOT_BODY="{ cfg $B 'rust_test rule'; $UB; } >\"\$bep\"; exit 1" run J150-ignored-root-test-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so its own invocation for r::cycle" '' "{ $P; cfg $B 'rust_test rule'; $UB; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
+NOT_MSG='rust-test-child-entries.txt but is no' CHILD_ENTRIES="$B b::child" run J151-child-entry-of-a-target-summarized-failed-to-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
+# A test of rust-test-root-alone.txt is taken out of the main invocation and
+# runs alone as root (J152); one that prints UNKNOWN: there checked nothing
+# (J153); one the main invocation still runs fails (J154).
+ROOT_ALONE="$B r::as_root" OWN_TESTS="a::one r::as_root" MAIN_MUST_SKIP=r::as_root run J152-root-test-alone 0 "Root test ran alone: $B r::as_root \\(ok\\)" '' "{ $P; sanct a::one r::as_root -- a::one; } >\"\$bep\"; exit 0"
+ROOT_ALONE="$B r::as_root" KNOWN_OUTPUT="$B r::as_root" STICKY_ROOT_BODY="FMT=json; FILTERED=1 rt $B PASSED lt_out r::as_root 'UNKNOWN: not root\\n' >\"\$bep\"; exit 0" run J153-root-test-prints-unknown 1 "$B r::as_root printed UNKNOWN: in its own invocation as root" '' "{ $P; sanct a::one r::as_root -- a::one; } >\"\$bep\"; exit 0"
+ROOT_ALONE="$B r::as_root" OWN_TESTS="a::one b::build_skipped r::as_root" run J154-root-test-ran-in-main 1 "$B r::as_root ran in the main invocation" '' "{ $P; sanct a::one b::build_skipped r::as_root -- a::one r::as_root; } >\"\$bep\"; exit 0"
+# A list line for a target the tree lacks (one a member not in this tree
+# adds) is named and nothing is run for it: bazel test of a target that does
+# not exist is no test (J155).
+NOT_MSG='bazel test exited|reported \[' IGNORED_RUN="//crates/pi-vcs:gone_test x::y" run J155-ignored-test-of-a-target-the-tree-lacks 1 "//crates/pi-vcs:gone_test x::y is in .github/sami/rust-test-ignored.txt, but the tree under test has no target //crates/pi-vcs:gone_test" '' "{ $P; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 0"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.

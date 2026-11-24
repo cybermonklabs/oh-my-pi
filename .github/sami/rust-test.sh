@@ -28,6 +28,8 @@
 #   prints how many there are and where.)
 #   - a test named in .github/sami/rust-test-own-process.txt does not run
 #     alone in an invocation of its own, or also runs in the main one;
+#   - a test named in .github/sami/rust-test-root-alone.txt does not run alone
+#     as root, or also runs in the main one, or prints `UNKNOWN:` as root;
 #   - a target in .github/sami/rust-test-root-targets.txt prints `not run:`,
 #     or passes another number of tests than its line names;
 #   - a sticky-directory FIFO test (`refused_in_a_sticky_directory` in its
@@ -144,6 +146,7 @@ entries rust-test-known-output.txt 2 known-output.tsv
 entries rust-test-known-raw-output.txt 2 known-raw-output.tsv
 entries rust-test-sanctioned-skips.txt 2 sanctioned.tsv
 entries rust-test-own-process.txt 2 own.tsv
+entries rust-test-root-alone.txt 2 root-alone.tsv
 entries rust-test-root-targets.txt 2 roots.tsv
 entries rust-test-cargo-workspaces.txt 1 cargo-workspaces.txt
 entries rust-test-ignored.txt 2 ignored-run.tsv
@@ -188,6 +191,15 @@ while IFS=$'\t' read -r target name; do
 	own+=("$target"$'\t'"$name")
 	skip_flags+=(--test_arg=--skip --test_arg="$name")
 done <"$tmp/own.tsv"
+# Tests that are not #[ignore]d but check part of what they test only as
+# root (rust-test-root-alone.txt): the main invocation takes them out too,
+# and each runs alone as root, out of the sandbox (linux-sandbox maps one
+# uid), after the other root runs.
+root_alone=()
+while IFS=$'\t' read -r target name; do
+	root_alone+=("$target"$'\t'"$name")
+	skip_flags+=(--test_arg=--skip --test_arg="$name")
+done <"$tmp/root-alone.tsv"
 # The sticky-directory FIFO tests (pi-shell's and pi-vfs's, with
 # `refused_in_a_sticky_directory` in their names) check that the kernel's
 # fs.protected_fifos refuses an open that may create of a FIFO another user
@@ -228,6 +240,11 @@ env_flags=(
 	--test_env=PI_AST_REPO_CORPUS="$PI_AST_REPO_CORPUS"
 	--sandbox_writable_path="$RUST_TEST_TMPDIR"
 )
+# The places pi-vcs's #[ignore]d mount and ownership tests need, which only
+# root can make: the job makes them under RUST_TEST_TMPDIR and names them.
+for var in PI_VCS_TEST_MOUNT_POINT PI_VCS_TEST_MOUNTED_FILE PI_VCS_TEST_FOREIGN_EMPTY_DIR; do
+	if [ -n "${!var:-}" ]; then env_flags+=(--test_env="$var=${!var}"); fi
+done
 tmpdir_under="/bin/sh $PWD/$sami/rust-test-tmpdir.sh $RUST_TEST_TMPDIR"
 # sudo resets PATH to its secure_path, so the test's PATH is given again
 # after it.
@@ -269,6 +286,9 @@ bep_rows() {
 # cargo or ignored-cargo-<n>). An empty field is `-`: bash's read joins
 # adjacent tabs.
 rows="$tmp/rows.tsv"
+: >"$tmp/unbuilt.txt"
+: >"$tmp/present.txt"
+declare -A absent=()
 : >"$rows"
 nlog=0
 # untangle <label> <log> [doc]: the log, in place, with each libtest event
@@ -333,6 +353,7 @@ collect() {
 		return 0
 	fi
 	bep_rows "$bep" >"$tmp/bep-rows.tsv"
+	jq -r 'select(.id.targetCompleted) | select((.completed.success // false) | not) | .id.targetCompleted.label' "$bep" >>"$tmp/unbuilt.txt"
 	while IFS=$'\t' read -r label rule status kind log; do
 		copy="$log"
 		bin=-
@@ -375,12 +396,31 @@ bazel_test() {
 	collect "$inv" "$bep"
 }
 
-# did_not_build <target>: every result Bazel gave the target is
+# did_not_build <target>: the target has no result but FAILED_TO_BUILD, and
+# a build event log named it as failed to build (a targetCompleted event
+# whose success is not true, or an aborted one: Bazel gives a test target
+# that does not compile no test summary at all), or a summary gave it
 # FAILED_TO_BUILD. A list line of such a target cannot be checked: its test
 # ran nowhere, and the build failure already fails the job. The checks below
 # then say UNKNOWN in a notice, and do not call the line wrong.
 did_not_build() {
-	awk -F'\t' -v t="$1" '$1 == t { n++; if ($3 == "FAILED_TO_BUILD") f++ } END { exit !(n > 0 && n == f) }' "$rows"
+	awk -F'\t' -v t="$1" '$1 == t && $3 != "FAILED_TO_BUILD" { ran = 1 } END { exit ran }' "$rows" || return 1
+	grep -qxF -- "$1" "$tmp/unbuilt.txt" || awk -F'\t' -v t="$1" '$1 == t { f = 1 } END { exit !f }' "$rows"
+}
+
+# in_tree <target>: the main or root invocation gave the target a result, or
+# named it as failed to build. absent_entry <title> <list> <target> <name>:
+# for a target not in the tree, an error naming the list line, and 0 (the
+# caller runs nothing for it). The lists come with the gate and the tree
+# under test is given: a line for a target this tree lacks (one a member not
+# in it adds) is for another tree, and bazel test of a target that does not
+# exist is no test.
+in_tree() { grep -qxF -- "$1" "$tmp/present.txt"; }
+absent_entry() {
+	in_tree "$3" && return 1
+	error "$1" "$3 $4 is in $2, but the tree under test has no target $3 (the main and root invocations gave it no result): that line is for another tree"
+	absent["$3"]=1
+	return 0
 }
 
 # check_alone <title> <invocation> <target> <name>: an invocation that ran one
@@ -389,6 +429,7 @@ did_not_build() {
 # lift, cannot pass as the test.
 check_alone() {
 	local title="$1" inv="$2" target="$3" name="$4" log event
+	[ -z "${absent[$target]:-}" ] || return 0
 	if did_not_build "$target"; then
 		echo "::notice title=$title::UNKNOWN: $target did not build, so its own invocation for $name ran nothing (the build failure fails the job)"
 		return 0
@@ -417,10 +458,12 @@ if [ -z "$only" ]; then
 	if [ "${#roots[@]}" -gt 0 ]; then
 		bazel_test root "$root_under" -- "${roots[@]}"
 	fi
+	{ cut -f1 "$rows"; cat "$tmp/unbuilt.txt"; } | LC_ALL=C sort -u >"$tmp/present.txt"
 	# Each own-process test alone: its target with libtest's --exact filter,
 	# one invocation per test.
 	for i in "${!own[@]}"; do
 		IFS=$'\t' read -r target name <<<"${own[$i]}"
+		absent_entry "Own-process test" "$sami/rust-test-own-process.txt" "$target" "$name" && continue
 		bazel_test "own-$i" "$tmpdir_under" --test_arg=--exact --test_arg="$name" -- "$target"
 	done
 	# The sticky-directory FIFO tests the main invocation's binaries list:
@@ -440,16 +483,21 @@ if [ -z "$only" ]; then
 	done
 	# Each #[ignore]d test the job runs anyway, alone, with --ignored. One
 	# run alone can take longer than Bazel's 300 s default for a medium test
-	# (pi-ast's whole-repository sweep), so these get 1200 s.
+	# (pi-ast's whole-repository sweep), so these get 1200 s. They run out of
+	# the sandbox: linux-sandbox gives a test a mount namespace of its own and
+	# maps one uid, and pi-vcs's tests must see the mounts and the other
+	# user's directory the job made as they are.
 	for i in "${!ignored_run[@]}"; do
 		IFS=$'\t' read -r target name <<<"${ignored_run[$i]}"
-		bazel_test "ignored-$i" "$tmpdir_under" --test_timeout=1200 --test_arg=--ignored --test_arg=--exact --test_arg="$name" -- "$target"
+		absent_entry "Ignored test" "$sami/rust-test-ignored.txt" "$target" "$name" && continue
+		bazel_test "ignored-$i" "$tmpdir_under" --strategy=TestRunner=local --test_timeout=1200 --test_arg=--ignored --test_arg=--exact --test_arg="$name" -- "$target"
 	done
 	# The same as root, out of the sandbox (linux-sandbox maps one uid), as
 	# the root targets run; last, since root's runs leave root's files in
 	# the target's test outputs.
 	for i in "${!ignored_root[@]}"; do
 		IFS=$'\t' read -r target name <<<"${ignored_root[$i]}"
+		absent_entry "Ignored root test" "$sami/rust-test-ignored-root.txt" "$target" "$name" && continue
 		bazel_test "ignored-root-$i" "$root_under" --strategy=TestRunner=local --test_timeout=1200 --test_arg=--ignored --test_arg=--exact --test_arg="$name" -- "$target"
 	done
 	# Each sticky-directory FIFO test again as root, which makes its own FIFO
@@ -457,6 +505,12 @@ if [ -z "$only" ]; then
 	for i in "${!sticky[@]}"; do
 		IFS=$'\t' read -r target name <<<"${sticky[$i]}"
 		bazel_test "sticky-root-$i" "$root_under" --strategy=TestRunner=local --test_arg=--exact --test_arg="$name" -- "$target"
+	done
+	# Each test of rust-test-root-alone.txt, alone, as root.
+	for i in "${!root_alone[@]}"; do
+		IFS=$'\t' read -r target name <<<"${root_alone[$i]}"
+		absent_entry "Root test" "$sami/rust-test-root-alone.txt" "$target" "$name" && continue
+		bazel_test "root-alone-$i" "$root_under" --strategy=TestRunner=local --test_arg=--exact --test_arg="$name" -- "$target"
 	done
 else
 	# Only the listed tests, and the canary: each target once, with libtest's
@@ -510,6 +564,16 @@ if [ -z "$only" ]; then
 	for i in "${!ignored_root[@]}"; do
 		IFS=$'\t' read -r target name <<<"${ignored_root[$i]}"
 		check_alone "Ignored root test" "ignored-root-$i" "$target" "$name"
+	done
+	# A root test that prints `UNKNOWN:` checked nothing as root either.
+	for i in "${!root_alone[@]}"; do
+		IFS=$'\t' read -r target name <<<"${root_alone[$i]}"
+		check_alone "Root test" "root-alone-$i" "$target" "$name"
+		while IFS= read -r log; do
+			if [ "$(grep -ac 'UNKNOWN:' "$log" || true)" != 0 ]; then
+				error "Rust test skips" "$target $name printed UNKNOWN: in its own invocation as root, so it checked nothing: $(grep -a -m 1 'UNKNOWN:' "$log")"
+			fi
+		done < <(awk -F'\t' -v a="root-alone-$i" '$7 == a && $5 != "-" { print $5 }' "$rows")
 	done
 fi
 
@@ -1185,6 +1249,11 @@ done
 # every test whose name contains it, in every binary.
 check_skip() {
 	local title="$1" from="$2" target="$3" name="$4" binary matches
+	[ -z "${absent[$target]:-}" ] || return 0
+	if ! in_tree "$target"; then
+		error "$title" "the skip $name in $from is of $target, which the tree under test has no target of (the main and root invocations gave it no result): that line is for another tree"
+		return 0
+	fi
 	if did_not_build "$target"; then
 		echo "::notice title=$title::UNKNOWN: $target did not build, so what its skip $name in $from takes out cannot be checked (the build failure fails the job)"
 		return 0
@@ -1211,6 +1280,10 @@ done
 for entry in "${own[@]}"; do
 	IFS=$'\t' read -r target name <<<"$entry"
 	check_skip "Own-process test" "$sami/rust-test-own-process.txt" "$target" "$name"
+done
+for entry in "${root_alone[@]}"; do
+	IFS=$'\t' read -r target name <<<"$entry"
+	check_skip "Root test" "$sami/rust-test-root-alone.txt" "$target" "$name"
 done
 # An #[ignore]d test that no invocation ran (one that ran with --ignored is
 # not one): a child process's entry point another test starts, or a test the
