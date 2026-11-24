@@ -631,9 +631,7 @@ fn set_value_plain(
 			} else {
 				v.clone()
 			};
-			let secs = if !integer {
-				super::valid_number(&text).unwrap_or(0)
-			} else {
+			let secs = if integer {
 				match arith_value(k, cx, vp, &text) {
 					Ok(n) => n,
 					Err(Diag::StoreFailed) => return Err(Diag::StoreFailed),
@@ -642,6 +640,8 @@ fn set_value_plain(
 						0
 					},
 				}
+			} else {
+				super::valid_number(&text).unwrap_or(0)
 			};
 			let now = cx.host.now_ns();
 			k.set_seconds(cx.store, vp, now, secs);
@@ -1814,6 +1814,16 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			_ => false,
 		};
 		let (name, index, append, value) = split_assignment(arg, flat);
+		// `readonly` and `export` take `-a` and `-A` only with a value
+		// (`set_or_show_attributes` declares it `-g[rx]a` or `-g[rx]A`);
+		// without one they only filter a listing, and the name gets the
+		// builtin's own attribute: `readonly -a x` on a readonly `x` is 0
+		// and `x` stays as it was.
+		let on = if value.is_none() && matches!(kind, DeclareKind::Export | DeclareKind::Readonly) {
+			on.without(Attrs::INDEXED).without(Attrs::ASSOC)
+		} else {
+			on
+		};
 		// bash looks the name up first (`find_variable` in `declare` and
 		// `local`, and in `export` or `readonly` with no value), and a
 		// lookup of the shell's `SECONDS` reads it (`get_seconds`), giving

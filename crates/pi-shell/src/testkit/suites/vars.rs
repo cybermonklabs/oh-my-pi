@@ -439,6 +439,32 @@ fn declare_keeps_a_readonly_variables_array_integer_and_case_attributes() {
 	}
 }
 
+/// `readonly` and `export` take `-a` and `-A` only with a value (bash's
+/// `set_or_show_attributes` then declares the name `-g[rx]a`/`-g[rx]A`);
+/// without one the name gets only the builtin's own attribute, a readonly
+/// one too: status 0, no array made, the value kept. Goldens from bash
+/// 5.3.20, the same in 5.2.21.
+#[test]
+fn readonly_and_export_take_array_flags_only_with_a_value() {
+	for (src, want) in [
+		("readonly x=1; readonly -a x; echo st=$?; declare -p x", "st=0\ndeclare -r x=\"1\"\n"),
+		("readonly x=1; readonly -A x; echo st=$?; declare -p x", "st=0\ndeclare -r x=\"1\"\n"),
+		("readonly x=1; export -a x; echo st=$?; declare -p x", "st=0\ndeclare -rx x=\"1\"\n"),
+		("readonly x=1; export -A x; echo st=$?; declare -p x", "st=0\ndeclare -rx x=\"1\"\n"),
+		("set -o posix; readonly x=1; readonly -a x; echo st=$?", "st=0\n"),
+		(
+			"readonly -a x=(1); export -a x; echo st=$?; declare -p x",
+			"st=0\ndeclare -arx x=([0]=\"1\")\n",
+		),
+		("readonly -a y; echo st=$?; declare -p y", "st=0\ndeclare -r y\n"),
+		("z=5; export -a z; echo st=$?; declare -p z", "st=0\ndeclare -x z=\"5\"\n"),
+		("z=5; readonly -A z; echo st=$?; declare -p z", "st=0\ndeclare -r z=\"5\"\n"),
+		("export -a y=5; echo st=$?; declare -p y", "st=0\ndeclare -ax y=([0]=\"5\")\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
 /// `SECONDS+=` adds to the value the last lookup stored, as bash's
 /// `make_variable_value` reads the variable's cell: a lookup two seconds
 /// on stores the count then (7); without one, the 5 stored before is what
