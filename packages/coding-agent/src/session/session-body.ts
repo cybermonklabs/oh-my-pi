@@ -52,14 +52,16 @@ interface KeptBody {
 	chunks(): AsyncGenerator<Uint8Array>;
 	/** The whole body as one string, for a backend that has no streamed full write. */
 	text(): string;
-	/** Free what the body holds; a later read throws. */
+	/** Free what the body holds; a later read throws {@link RELEASED_BODY_MESSAGE}. */
 	close(): void;
 }
 
+/** What a read of a {@link KeptBody} after its {@link KeptBody.close} throws, spooled or kept in memory. */
+const RELEASED_BODY_MESSAGE = "A session rewrite's body was read after it was released";
+
 /**
  * A {@link KeptBody} written to a temporary file, unlinked once open, and read
- * back through its descriptor, which its {@link PrivateTempFile} refuses once
- * the body is released.
+ * back through its descriptor until the body is released.
  */
 class BodySpool implements KeptBody {
 	readonly #file: PrivateTempFile;
@@ -75,7 +77,7 @@ class BodySpool implements KeptBody {
 	async *chunks(): AsyncGenerator<Uint8Array> {
 		// The descriptor is taken before the first read, so a released body refuses even when it is
 		// empty, and again after each chunk, since the body can be released while a consumer holds one.
-		for (let position = 0, fd = this.#file.fd; position < this.byteLength; fd = this.#file.fd) {
+		for (let position = 0, fd = this.#fd(); position < this.byteLength; fd = this.#fd()) {
 			const buffer = Buffer.allocUnsafe(Math.min(LINE_STREAM_CHUNK, this.byteLength - position));
 			const read = await readAt(fd, buffer, position);
 			if (read === 0) throw new Error(`Session body spool ended at byte ${position} of ${this.byteLength}`);
@@ -85,7 +87,7 @@ class BodySpool implements KeptBody {
 	}
 
 	text(): string {
-		const fd = this.#file.fd;
+		const fd = this.#fd();
 		const bytes = Buffer.allocUnsafe(this.byteLength);
 		for (let position = 0; position < bytes.byteLength;) {
 			const read = fs.readSync(fd, bytes, position, bytes.byteLength - position, position);
@@ -97,6 +99,16 @@ class BodySpool implements KeptBody {
 
 	close(): void {
 		this.#file.close();
+	}
+
+	/**
+	 * The descriptor, until {@link close}: after it the number can belong to
+	 * another file. Refused in the body's words, as a released snapshot is;
+	 * the file's own refusal stays behind it.
+	 */
+	#fd(): number {
+		if (this.#file.closed) throw new Error(RELEASED_BODY_MESSAGE);
+		return this.#file.fd;
 	}
 }
 
@@ -143,7 +155,7 @@ class BodySnapshot implements KeptBody {
 
 	/** The blocks, until {@link close}: a read after it would publish an empty body. */
 	#heldBlocks(): readonly Uint8Array[] {
-		if (!this.#blocks) throw new Error("A session rewrite's body was read after it was released");
+		if (!this.#blocks) throw new Error(RELEASED_BODY_MESSAGE);
 		return this.#blocks;
 	}
 }

@@ -74,6 +74,11 @@ class PrivateTempFile {
 		return this.#fd;
 	}
 
+	/** Whether {@link close} ran, so a holder can refuse a read in its own words before taking {@link fd}. */
+	get closed(): boolean {
+		return this.#closed;
+	}
+
 	/** Close the descriptor; a later call does nothing. */
 	close(): void {
 		if (this.#closed) return;

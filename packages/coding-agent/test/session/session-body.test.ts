@@ -20,6 +20,9 @@ import { withoutAccountId } from "../helpers/account-id";
 import { MemoryBackend, StreamingMemoryBackend } from "../helpers/memory-session-backend";
 import { spoolWarnings } from "../helpers/spool-unusable";
 
+/** What a read of a rewrite's body after its release throws, whether the body is spooled or kept in memory. */
+const RELEASED_BODY = "A session rewrite's body was read after it was released";
+
 /** A {@link StreamingMemoryBackend} whose streamed full write waits, before it reads a chunk, until the test lets it go on. */
 class HeldStreamBackend extends StreamingMemoryBackend {
 	#entered = Promise.withResolvers<void>();
@@ -259,7 +262,7 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 						fs.closeSync(fd);
 					}
 				}
-				const refused = { failure: expect.stringContaining("used after it was closed"), stored: undefined };
+				const refused = { failure: expect.stringContaining(RELEASED_BODY), stored: undefined };
 				expect(outcomes).toEqual([refused, refused]);
 			} finally {
 				vi.restoreAllMocks();
@@ -291,7 +294,7 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 					stored: backend.sessions.get("/sessions/empty.jsonl"),
 				}).toEqual({
 					byteLength: 0,
-					failure: expect.stringContaining("used after it was closed"),
+					failure: expect.stringContaining(RELEASED_BODY),
 					stored: undefined,
 				});
 			} finally {
@@ -300,4 +303,31 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 			}
 		},
 	);
+
+	// If this regresses, a body kept in memory (no account id, Windows) read after its release publishes
+	// an empty session, or refuses with another message than a released spool's, so one body contract
+	// reports one fault two ways.
+	it("refuses a read of a body kept in memory after its release, through a streamed write and a whole one, as a spool does", async () => {
+		withoutAccountId();
+		try {
+			const outcomes: Array<{ failure: string | undefined; stored: string | undefined }> = [];
+			for (const backend of [new StreamingMemoryBackend(), new MemoryBackend()]) {
+				const bodies = new FullBodies(backend, async function* () {});
+				const released = bodies.lines("/sessions/released.jsonl", serialized());
+				released.release?.();
+				// Called inside a task, as the store's path queue calls a publish.
+				const failure = await Promise.resolve()
+					.then(() => released.publish(1, null))
+					.then(
+						() => undefined,
+						(error: unknown) => String(error),
+					);
+				outcomes.push({ failure, stored: backend.sessions.get("/sessions/released.jsonl") });
+			}
+			const refused = { failure: expect.stringContaining(RELEASED_BODY), stored: undefined };
+			expect(outcomes).toEqual([refused, refused]);
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
 });
