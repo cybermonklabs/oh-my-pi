@@ -69,6 +69,7 @@ use crate::bash::{
 	host::{EnvView, Host, StdFd, Verdict},
 	ids::{CallId, CmdTag, JobId, ModeId, RunId, ToolRef, UnitId, Vpid},
 	ir::{self, Unit},
+	mem::Capture,
 	signal::{DefaultAction, SigTarget, Signal},
 	store::{Attrs, Change, Key, KeyBuf, MiscKey, OptId, Record, StateStore, StoreError, VarValue},
 };
@@ -502,6 +503,17 @@ pub struct Kernel {
 	/// The last root run that `exit` or `set -e` ended
 	/// ([`Shell::ended_by_exit`]); not imaged.
 	pub exited:             Option<RunId>,
+	/// The vprocs of the process substitutions started (bash's `<(…)` and
+	/// `>(…)`, zsh's too) that have not ended: a process shell stays for
+	/// them at its exit ([`Shell::substitutions_left`]). Each leaves the
+	/// list when it ends (`Shell::reaped`). Not imaged: a restored shell
+	/// knows of none, so its exit does not wait for them.
+	pub procsubs:           Vec<Vpid>,
+	/// The command substitutions' outputs that process substitutions of
+	/// [`Self::procsubs`] inherited: bash's `$(cmd > >(filter))` reads
+	/// until `filter` too has closed it ([`Kernel::capture_holder`]).
+	/// Pruned with [`Self::procsubs`]; not imaged.
+	pub procsub_captures:   Vec<(Vpid, Capture)>,
 	/// Signal deaths of external programs replacing a submitted run, pending
 	/// its completion report; callouts do not survive frame restoration.
 	pub exec_signals:       HashMap<RunId, i32>,
@@ -626,6 +638,8 @@ impl Kernel {
 			null_input: None,
 			callout_labels: Vec::new(),
 			exited: None,
+			procsubs: Vec::new(),
+			procsub_captures: Vec::new(),
 			exec_signals: HashMap::new(),
 			reported_signal: None,
 			bangs: Vec::new(),
@@ -822,12 +836,33 @@ impl Kernel {
 		}
 	}
 
+	/// Whether `vp` started child `vpid` and the scheduler has not adopted
+	/// it yet (its record is written at the next turn): a process
+	/// substitution a builtin's redirection started in this slice
+	/// (`echo hi > >(cmd); wait $!`).
+	pub fn spawned_by(&self, vp: Vpid, vpid: Vpid) -> bool {
+		self
+			.spawned
+			.iter()
+			.any(|p| p.vpid == vpid && p.parent == Some(vp))
+	}
+
 	/// Take the exit status of finished child vproc `vpid` (its record goes);
 	/// `None` while it runs or when unknown.
 	pub fn proc_collect(&mut self, store: &mut dyn StateStore, vpid: Vpid) -> Option<i32> {
 		let status = self.proc_state(store, vpid)?.exited()?;
 		self.root.write(store, Change::Del(Key::Proc(vpid)));
 		Some(status)
+	}
+
+	/// A running process substitution that holds `capture`, a command
+	/// substitution's output, if any ([`Self::procsub_captures`]).
+	pub fn capture_holder(&self, capture: &Capture) -> Option<Vpid> {
+		self
+			.procsub_captures
+			.iter()
+			.find(|(_, held)| held.key() == capture.key())
+			.map(|&(vpid, _)| vpid)
 	}
 
 	/// The clock for an event now: the last reading while it is still
@@ -2064,6 +2099,10 @@ impl Shell {
 		if self.k.engine.config().end_orphan_jobs {
 			self.gone.push(vpid);
 		}
+		if !self.k.procsubs.is_empty() {
+			self.k.procsubs.retain(|&v| v != vpid);
+			self.k.procsub_captures.retain(|&(v, _)| v != vpid);
+		}
 		let Some(i) = parent.and_then(|v| self.procs.iter().position(|p| p.vpid == v)) else {
 			return;
 		};
@@ -2540,6 +2579,94 @@ impl Shell {
 			.reported_signal
 			.filter(|(id, _)| *id == run)
 			.map(|(_, signal)| signal)
+	}
+
+	/// Whether a process substitution still runs that a process shell's
+	/// exit must wait for. bash's `<(…)` and `>(…)` are processes of their
+	/// own, which its exit leaves running with the descriptors they hold
+	/// (`cmd > >(slow-reader)`, `exec > >(tee log)`: their output still
+	/// comes). Here they are vprocs of this process, so a process shell
+	/// stays for them after its run ([`Self::end_for_exit`]). One counts
+	/// once what started it is gone, or when the root started it: one a
+	/// running background job started ends with that job at the exit.
+	pub fn substitutions_left(&self) -> bool {
+		!self.k.procsubs.is_empty() && !self.exit_survivors().is_empty()
+	}
+
+	/// The process substitutions [`Self::substitutions_left`] counts, in
+	/// the order they started. pi's session keeps a run's output open for
+	/// those its run started (`StdStreams::end_run`).
+	pub fn exit_survivors(&self) -> Vec<Vpid> {
+		let root = self.procs.first().map(|p| p.vpid);
+		self
+			.k
+			.procsubs
+			.iter()
+			.copied()
+			.filter(|&v| {
+				self
+					.live(v)
+					.is_some_and(|p| p.parent == root || p.parent.is_none_or(|q| self.live(q).is_none()))
+			})
+			.collect()
+	}
+
+	/// The process substitutions still running, in the order they started.
+	pub fn substitutions(&self) -> &[Vpid] {
+		&self.k.procsubs
+	}
+
+	/// Whether a process substitution still runs that is `vpid` or one it
+	/// started (at any depth whose links still run).
+	pub fn substitution_from(&self, vpid: Vpid) -> bool {
+		self.k.procsubs.iter().any(|&v| self.descends(v, vpid))
+	}
+
+	/// The vproc `vpid`, adopted or still to be.
+	fn live(&self, vpid: Vpid) -> Option<&Vproc> {
+		self
+			.procs
+			.iter()
+			.chain(&self.k.spawned)
+			.find(|p| p.vpid == vpid)
+			.map(|p| &**p)
+	}
+
+	/// A process shell exits after its run while
+	/// [`Self::substitutions_left`]: what the process's end would end goes
+	/// now, as an untrapped `TERM` ends it (background jobs, vprocs whose
+	/// parent is gone, and what they started; detached ones are spared, as
+	/// the process's end spares them), and every descriptor of the root
+	/// closes, as bash's exit closes its own. The substitutions to wait
+	/// for and what they started stay: a `>(…)` that reads what the shell
+	/// wrote sees end of file, unless something it waits for still runs.
+	pub fn end_for_exit(&mut self, cx: &mut Cx<'_>) {
+		let keep = self.exit_survivors();
+		let status = Signal::Term.exit_status(self.k.engine.config().platform);
+		for i in (1..self.procs.len()).rev() {
+			let v = self.procs[i].vpid;
+			if !self.procs[i].lineage.detached && !keep.iter().any(|&k| self.descends(v, k)) {
+				self.kill(cx, i, Signal::Term, status);
+			}
+		}
+		let root = &mut self.procs[0];
+		for fd in 0..root.fds.slots().len() {
+			root.fds.set(fd as i32, None);
+		}
+		root.procsubs.clear();
+	}
+
+	/// Whether `vpid` is `ancestor` or one of its descendants.
+	fn descends(&self, mut vpid: Vpid, ancestor: Vpid) -> bool {
+		loop {
+			if vpid == ancestor {
+				return true;
+			}
+			let Some(parent) = self.live(vpid).and_then(|p| p.parent) else {
+				return false;
+			};
+			vpid = parent;
+		}
 	}
 
 	/// Number of the root's background jobs that still wait for a running

@@ -859,7 +859,10 @@ fn zsh_params(args: &ShellArgs) -> Vec<(BString, BString)> {
 	}
 }
 
-/// Run `shell` until script `run` finishes; its status.
+/// Run `shell` until script `run` finishes; the script's status.
+///
+/// It then runs on until the process substitutions its exit leaves
+/// running end ([`finish_substitutions`]).
 ///
 /// Between steps the
 /// OS signals the host caught go to the root vproc `root`; while the shell
@@ -876,13 +879,49 @@ pub fn drive(
 	loop {
 		NativeHost::dispatch_signals(&shell.control(), root);
 		match shell.step(&mut Cx { host: &mut *host, store: &mut *store }, Budget::default()) {
-			Step::Done { run: done, status } if done == run => return status,
+			Step::Done { run: done, status } if done == run => {
+				finish_substitutions(host, store, shell, root, &mut parker);
+				return status;
+			},
 			Step::Call { id, .. } => no_callouts(shell, id),
 			Step::Blocked | Step::Paused => wait_runnable(&mut parker, shell, root),
 			// A busy shell never parks: notice background exits here.
 			Step::Yield => parker.poll_exits(),
 			Step::Done { .. } | Step::SuspendReady => {},
 			Step::Idle => return 0,
+		}
+	}
+}
+
+/// Wait for the process substitutions a process shell's exit leaves.
+///
+/// The shell's run is over and the process is to exit. bash's process
+/// substitutions are processes that its exit leaves running with the
+/// output they hold (`cmd > >(slow-reader)`, `exec > >(tee log)`), so the
+/// process stays until those of this shell end
+/// ([`Shell::substitutions_left`]). First the shell's traps are released
+/// and what the exit ends goes, the root's descriptors with it
+/// ([`Shell::end_for_exit`]): a `>(…)` reading the shell's output sees
+/// end of file. Returns at once when none is left.
+pub fn finish_substitutions(
+	host: &mut NativeHost,
+	store: &mut MemStore,
+	shell: &mut Shell,
+	root: Vpid,
+	parker: &mut Parker,
+) {
+	if !shell.substitutions_left() {
+		return;
+	}
+	host.release_signals();
+	shell.end_for_exit(&mut Cx { host: &mut *host, store: &mut *store });
+	while shell.substitutions_left() {
+		match shell.step(&mut Cx { host: &mut *host, store: &mut *store }, Budget::default()) {
+			Step::Call { id, .. } => no_callouts(shell, id),
+			Step::Blocked | Step::Paused => wait_runnable(parker, shell, root),
+			Step::Yield => parker.poll_exits(),
+			Step::Done { .. } | Step::SuspendReady => {},
+			Step::Idle => return,
 		}
 	}
 }
