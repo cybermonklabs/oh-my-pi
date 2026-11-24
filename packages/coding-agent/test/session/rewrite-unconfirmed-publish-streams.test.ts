@@ -127,7 +127,8 @@ for (const { kind, url } of BACKENDS) {
 				);
 				cleanups.push(async () => {
 					await storage.drain().catch(() => {});
-					for (const key of (await client.send("KEYS", [`${prefix}*`])) as string[]) await client.send("DEL", [key]);
+					for (const key of (await client.send("KEYS", [`${prefix}*`])) as string[])
+						await client.send("DEL", [key]);
 					client.close();
 				});
 				return storage;
