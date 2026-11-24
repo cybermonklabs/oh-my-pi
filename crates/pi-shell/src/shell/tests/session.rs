@@ -824,7 +824,13 @@ fn an_external_child_of_a_run_with_a_full_output_pipe_through_the_writer_thread_
 /// A run that succeeded, as a failed close finds it.
 #[cfg(unix)]
 fn succeeded() -> RunOutcome {
-	RunOutcome { status: 0, cancelled: false, exited: false, cwd: BString::default() }
+	RunOutcome {
+		status:    0,
+		cancelled: false,
+		exited:    false,
+		cwd:       BString::default(),
+		held:      false,
+	}
 }
 
 /// A failed close is said on the command's stderr and fails the command.
@@ -3094,6 +3100,7 @@ fn a_long_close_failure_record_goes_out_whole_with_its_newline() {
 		cancelled: false,
 		exited:    false,
 		cwd:       BString::default(),
+		held:      false,
 	});
 	let err = io::Error::other("x".repeat(100 << 10));
 	let mut stderr = crate::sys::StdFile::new(writer);

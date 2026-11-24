@@ -1708,10 +1708,14 @@ async fn run_shell_command_once(
 	// processes its cancel signalled may still be running their TERM traps,
 	// so the reader stays open until they close the pipe or the cancel bridge
 	// releases it (`CANCEL_READER_GRACE`).
+	// While process substitutions the command started still run
+	// (`RunOutcome::held`), the pipe reaches EOF when they end: the wait
+	// is for that, not for a pause in the output, up to `POST_EXIT_MAX`.
 	const POST_EXIT_IDLE: Duration = Duration::from_millis(250);
 	const POST_EXIT_MAX: Duration = Duration::from_secs(2);
 
 	let cancelled = cancel_token.is_cancelled();
+	let held = result.as_ref().is_ok_and(|outcome| outcome.held);
 	let mut reader_finished = false;
 	let mut reader_output = None;
 	let mut idle_timer = Box::pin(time::sleep(POST_EXIT_IDLE));
@@ -1732,7 +1736,7 @@ async fn run_shell_command_once(
 				}
 				idle_timer.as_mut().reset(time::Instant::now() + POST_EXIT_IDLE);
 			}
-			() = &mut idle_timer, if !cancelled => break,
+			() = &mut idle_timer, if !cancelled && !held => break,
 			() = &mut max_timer, if !cancelled => break,
 		}
 	}
@@ -1858,10 +1862,13 @@ async fn run_shell_command_streams_in_filesystem(
 	// what the pipes hold, and a drain the deadline does not stop (bounded by
 	// `DRAIN_STALL` past it). A cancelled run's readers stay open for its TERM
 	// traps until the cancel bridge releases them.
+	// A run whose process substitutions still hold its streams is waited
+	// for until EOF, up to `POST_EXIT_MAX`.
 	const POST_EXIT_IDLE: Duration = Duration::from_millis(250);
 	const POST_EXIT_MAX: Duration = Duration::from_secs(2);
 
 	let cancelled = cancel_token.is_cancelled();
+	let held = result.as_ref().is_ok_and(|outcome| outcome.held);
 	let mut stdout_finished = false;
 	let mut stderr_finished = false;
 	let mut idle_timer = Box::pin(time::sleep(POST_EXIT_IDLE));
@@ -1886,7 +1893,7 @@ async fn run_shell_command_streams_in_filesystem(
 				}
 				idle_timer.as_mut().reset(time::Instant::now() + POST_EXIT_IDLE);
 			}
-			() = &mut idle_timer, if !cancelled => break,
+			() = &mut idle_timer, if !cancelled && !held => break,
 			() = &mut max_timer, if !cancelled => break,
 		}
 	}

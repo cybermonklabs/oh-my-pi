@@ -223,6 +223,15 @@ impl NativeHost {
 		Signals::dispatch(ctl, root);
 	}
 
+	/// Give every signal the shell trapped its disposition from before the
+	/// shell set it, as the shell's exit would: the process stays only for
+	/// the process substitutions its exit leaves running
+	/// ([`crate::process::finish_substitutions`]), and a signal the shell
+	/// trapped must end it, not reach a root that has stopped running.
+	pub fn release_signals(&mut self) {
+		self.signals = Signals::default();
+	}
+
 	/// Flush the event sink.
 	pub fn flush(&mut self) -> io::Result<()> {
 		self.events.as_mut().map_or(Ok(()), |w| w.flush())

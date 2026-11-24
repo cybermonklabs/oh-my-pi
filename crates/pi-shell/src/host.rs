@@ -57,25 +57,63 @@ pub trait SpawnObserver: Send + Sync {
 
 /// The shell's standard streams, replaced for each run.
 ///
-/// Files acquired from [`crate::bash::Host::stdio`] retain their run's slots.
-/// Clearing those slots closes the caller's pipe ends and makes subsequent
+/// Files acquired from [`crate::bash::Host::stdio`] hold the streams their
+/// run installed. When the run ends ([`StdStreams::end_run`]) its streams
+/// are cleared: that closes the caller's pipe ends and makes subsequent
 /// reads return EOF and writes discard their data, even if background jobs
-/// still hold the files. Externals may independently hold the pipe open.
-/// Cheap to clone; clones share the current generation.
+/// still hold the files. A run whose process substitutions still run keeps
+/// its streams open until they end ([`StdStreams::release`]): bash's keep
+/// the descriptors they inherited, so their output (`cmd > >(slow-reader)`)
+/// reaches the caller after the command. Externals may independently hold
+/// the pipe open. Cheap to clone; clones share the current run's streams.
 #[derive(Clone, Default)]
 pub struct StdStreams {
-	slots:       Arc<Mutex<Arc<[Slot; 3]>>>,
+	current:     Arc<Mutex<Arc<Generation>>>,
+	/// The ended runs whose streams stay open ([`StdStreams::end_run`]):
+	/// what an external one of their process substitutions starts is
+	/// decoded into them as into the current run's.
+	held:        Arc<Mutex<Vec<Arc<Generation>>>>,
 	write_order: Arc<Mutex<Option<Arc<Mutex<()>>>>>,
 	/// Observer and clock for the installed capture generation, registered
 	/// lazily when its engine-side files are acquired.
 	output_end:  Arc<Mutex<Option<CaptureObserver>>>,
-	/// Stdout and stderr of the current run are one text capture
-	/// ([`StdStreams::install`]).
-	text:        Arc<AtomicBool>,
 }
 
 /// One swappable stream.
 type Slot = Mutex<Option<Box<dyn File>>>;
+
+/// The streams one run installed ([`StdStreams::install`]).
+#[derive(Default)]
+struct Generation {
+	slots: [Slot; 3],
+	/// Stdout and stderr are one text capture.
+	text:  bool,
+	/// The run is over ([`StdStreams::end_run`]): what its process
+	/// substitutions still write reaches the files, not the run's observer.
+	ended: AtomicBool,
+}
+
+impl Generation {
+	/// Whether `os` is this generation's stdout or stderr and they are a
+	/// text capture.
+	fn is_text(&self, os: OsHandle) -> bool {
+		self.text
+			&& self.slots[1..]
+				.iter()
+				.any(|slot| slot.lock().as_ref().and_then(|f| f.os_handle()) == Some(os))
+	}
+
+	/// Close every stream.
+	fn clear(&self) {
+		for slot in &self.slots {
+			*slot.lock() = None;
+		}
+	}
+}
+
+/// The streams of an ended run kept open for its process substitutions
+/// ([`StdStreams::end_run`]); [`StdStreams::release`] closes them.
+pub struct HeldRun(Arc<Generation>);
 
 struct CaptureObserver {
 	events: Arc<dyn crate::bash::EventSink>,
@@ -90,46 +128,49 @@ impl StdStreams {
 	pub fn install(&self, streams: [Option<std::fs::File>; 3], text: bool) {
 		let slots =
 			streams.map(|file| Mutex::new(file.map(|f| Box::new(StdFile::new(f)) as Box<dyn File>)));
-		*self.slots.lock() = Arc::new(slots);
+		*self.current.lock() = Arc::new(Generation { slots, text, ended: AtomicBool::new(false) });
 		*self.write_order.lock() = None;
 		*self.output_end.lock() = None;
-		self.text.store(text, Ordering::Release);
 	}
 
-	/// Whether `os` is the stdout or stderr of a text capture the run
-	/// installed ([`StdStreams::install`]).
-	fn is_text(&self, os: OsHandle) -> bool {
-		if !self.text.load(Ordering::Acquire) {
-			return false;
+	/// Whether the current run's stdout and stderr are one text capture.
+	fn text(&self) -> bool {
+		self.current.lock().text
+	}
+
+	/// The generation, current or held, whose text capture `os` is the
+	/// stdout or stderr of.
+	fn text_generation(&self, os: OsHandle) -> Option<Arc<Generation>> {
+		let current = Arc::clone(&self.current.lock());
+		if current.is_text(os) {
+			return Some(current);
 		}
-		let slots = Arc::clone(&self.slots.lock());
-		slots[1..]
-			.iter()
-			.any(|slot| slot.lock().as_ref().and_then(|f| f.os_handle()) == Some(os))
+		self.held.lock().iter().find(|g| g.is_text(os)).cloned()
 	}
 
-	/// A dup of the text capture's stdout, which decoded text is forwarded
-	/// into.
-	fn text_sink(&self) -> Option<Box<dyn File>> {
-		let slots = Arc::clone(&self.slots.lock());
-		let stdout = slots[1].lock();
-		stdout.as_ref()?.dup().ok()
-	}
-
-	/// Remove every stream, closing the files installed last.
-	pub fn clear(&self) {
+	/// The run is over: the next files come from an empty generation and
+	/// the run's observer is told that its output ended. The run's streams
+	/// close now, or with `keep` (its process substitutions still run) when
+	/// the [`HeldRun`] returned is given to [`StdStreams::release`]; what is
+	/// written to them after this reaches no observer.
+	pub fn end_run(&self, keep: bool) -> Option<HeldRun> {
 		let order = self.write_order.lock().clone();
 		let _order = order.as_ref().map(|order| order.lock());
-		let slots = self.slots.lock();
-		let present = [slots[1].lock().is_some(), slots[2].lock().is_some()];
-		for slot in slots.iter() {
-			*slot.lock() = None;
-		}
-		drop(slots);
+		let run = std::mem::take(&mut *self.current.lock());
+		run.ended.store(true, Ordering::Release);
+		let present = [run.slots[1].lock().is_some(), run.slots[2].lock().is_some()];
+		let text = run.text;
+		let held = if keep {
+			self.held.lock().push(Arc::clone(&run));
+			Some(HeldRun(run))
+		} else {
+			run.clear();
+			None
+		};
 		let observer = self.output_end.lock().take();
 		if let Some(CaptureObserver { events, start }) = observer {
 			let t_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-			if self.text.load(Ordering::Acquire) {
+			if text {
 				if present.into_iter().any(|present| present) {
 					events.output_end(t_ns, 1);
 				}
@@ -141,6 +182,14 @@ impl StdStreams {
 				}
 			}
 		}
+		held
+	}
+
+	/// Close the streams of an ended run kept open
+	/// ([`StdStreams::end_run`] with `keep`).
+	pub fn release(&self, run: HeldRun) {
+		self.held.lock().retain(|held| !Arc::ptr_eq(held, &run.0));
+		run.0.clear();
 	}
 
 	/// The engine-side file of stream `fd`.
@@ -172,11 +221,10 @@ impl StdStreams {
 			None
 		};
 		Box::new(StreamFile {
-			slots: Arc::clone(&self.slots.lock()),
+			run: Arc::clone(&self.current.lock()),
 			index,
 			events,
 			start,
-			merged: self.text.load(Ordering::Acquire),
 			write_order,
 		})
 	}
@@ -184,9 +232,8 @@ impl StdStreams {
 
 /// An engine [`File`] forwarding to one of the [`StdStreams`].
 struct StreamFile {
-	slots:       Arc<[Slot; 3]>,
+	run:         Arc<Generation>,
 	index:       usize,
-	merged:      bool,
 	write_order: Option<Arc<Mutex<()>>>,
 	events:      Option<Arc<dyn crate::bash::EventSink>>,
 	start:       Instant,
@@ -194,7 +241,7 @@ struct StreamFile {
 
 impl StreamFile {
 	fn with<T>(&self, empty: T, f: impl FnOnce(&mut dyn File) -> T) -> T {
-		self.slots[self.index]
+		self.run.slots[self.index]
 			.lock()
 			.as_mut()
 			.map_or(empty, |file| f(&mut **file))
@@ -203,12 +250,12 @@ impl StreamFile {
 
 impl File for StreamFile {
 	fn observes_output(&self) -> bool {
-		self.index != 0 && self.events.is_some()
+		self.index != 0 && self.events.is_some() && !self.run.ended.load(Ordering::Acquire)
 	}
 
 	fn output_key(&self) -> Option<(usize, i32)> {
 		self.observes_output().then(|| {
-			(Arc::as_ptr(&self.slots).addr(), if self.merged { 1 } else { self.index as i32 })
+			(Arc::as_ptr(&self.run).addr(), if self.run.text { 1 } else { self.index as i32 })
 		})
 	}
 
@@ -221,7 +268,7 @@ impl File for StreamFile {
 		tag: Option<crate::bash::CmdTag>,
 	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		let _order = self.write_order.as_ref().map(|order| order.lock());
-		let mut slot = self.slots[self.index].lock();
+		let mut slot = self.run.slots[self.index].lock();
 		let Some(file) = slot.as_mut() else {
 			return Poll::Ready(Ok((bytes.len(), None)));
 		};
@@ -230,9 +277,10 @@ impl File for StreamFile {
 			&& let Poll::Ready(Ok((n, _))) = &result
 			&& *n != 0
 			&& let Some(events) = &self.events
+			&& !self.run.ended.load(Ordering::Acquire)
 		{
 			let t_ns = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-			let fd = if self.merged { 1 } else { self.index as i32 };
+			let fd = if self.run.text { 1 } else { self.index as i32 };
 			events.output(tag, t_ns, fd, &bytes[..*n]);
 		}
 		result
@@ -283,12 +331,11 @@ impl File for StreamFile {
 	}
 
 	fn dup(&self) -> io::Result<Box<dyn File>> {
-		// Share the generation, not a duplicate OS handle: clear closes the
-		// run's pipe even while a background job retains this file.
+		// Share the generation, not a duplicate OS handle: the run's end
+		// closes its pipe even while a background job retains this file.
 		Ok(Box::new(Self {
-			slots:       Arc::clone(&self.slots),
+			run:         Arc::clone(&self.run),
 			index:       self.index,
-			merged:      self.merged,
 			events:      self.events.clone(),
 			write_order: self.write_order.clone(),
 			start:       self.start,
@@ -338,8 +385,9 @@ struct Launcher {
 
 /// A text sink a relay forwards into.
 enum TextSink {
-	/// The run's text capture.
-	Run,
+	/// A run's text capture: the current run's, or one an ended run keeps
+	/// open for its process substitutions.
+	Run(Arc<Generation>),
 	/// A command substitution's capture.
 	Capture(FdRef),
 }
@@ -347,7 +395,7 @@ enum TextSink {
 impl TextSink {
 	fn is_same(&self, other: &Self) -> bool {
 		match (self, other) {
-			(Self::Run, Self::Run) => true,
+			(Self::Run(a), Self::Run(b)) => Arc::ptr_eq(a, b),
 			(Self::Capture(a), Self::Capture(b)) => {
 				a.same(b)
 					|| a
@@ -363,7 +411,7 @@ impl Launcher {
 	/// The text sink `stdio` writes into, if it is one.
 	fn text_sink_of(&self, stdio: &StdioSpec) -> Option<TextSink> {
 		match stdio {
-			StdioSpec::Inherit(os) => self.streams.is_text(*os).then_some(TextSink::Run),
+			StdioSpec::Inherit(os) => self.streams.text_generation(*os).map(TextSink::Run),
 			StdioSpec::Pipe(fd) => {
 				(fd.is_capture() || fd.observes_output()).then(|| TextSink::Capture(fd.clone()))
 			},
@@ -395,17 +443,20 @@ impl Launcher {
 				os
 			} else {
 				let end = match &sink {
-					TextSink::Run => match self.streams.text_sink() {
-						Some(file) => End::File(file),
-						None => continue,
+					// A dup of the capture's stdout, which decoded text is
+					// forwarded into.
+					TextSink::Run(run) => {
+						match run.slots[1].lock().as_ref().and_then(|f| f.dup().ok()) {
+							Some(file) => End::File(file),
+							None => continue,
+						}
 					},
 					TextSink::Capture(fd) => End::Fd(fd.clone()),
 				};
 				let text = match &sink {
-					TextSink::Run => true,
+					TextSink::Run(_) => true,
 					TextSink::Capture(fd) => {
-						fd.is_capture()
-							|| (fd.observes_output() && self.streams.text.load(Ordering::Acquire))
+						fd.is_capture() || (fd.observes_output() && self.streams.text())
 					},
 				};
 				let os = relays.attach(end, text)?;
