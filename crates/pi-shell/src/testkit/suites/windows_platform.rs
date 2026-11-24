@@ -97,25 +97,22 @@ fn run_on(mode: ModeId, platform: Platform, src: &str) -> String {
 	String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned()
 }
 
-/// On Windows an asynchronous command without job control ignores `INT`
-/// (and in zsh `QUIT`), as zsh and bash have it, so the console's Ctrl-C
-/// passes it by: it lists the ignore, zsh's may trap it, bash's (ignored
-/// on entry) may not, and the shell's own traps stay unset. Elsewhere it
-/// keeps the shell's dispositions.
+/// An asynchronous command without job control ignores `INT` and `QUIT`,
+/// on every platform, so the console's Ctrl-C passes it by on Windows.
+/// zsh's lists the ignore and may trap it, and the shell's own traps stay
+/// unset (the zsh output as zsh 5.9 prints it on Linux). bash's (bash 5.3
+/// `setup_async_signals`) lists nothing and may trap it
+/// (`process_signals`' `an_asynchronous_command_ignores_int_and_quit`
+/// measures the rest against bash 5.3.20 and zsh 5.9).
 #[test]
-fn async_commands_ignore_interrupts_on_windows_only() {
+fn async_commands_ignore_interrupts() {
 	let zsh =
 		"( trap; trap 'print own' INT; trap ) & wait; print -r -- $(< <(trap)); trap; print done";
 	let bash = "( trap; trap 'echo own' INT; trap -p INT ) & wait; trap -p INT; echo done";
-	assert_eq!(
-		run_on(ModeId::Zsh, Platform::Windows, zsh),
-		"trap -- '' INT\ntrap -- '' QUIT\ntrap -- 'print own' INT\ntrap -- '' QUIT\ntrap -- '' INT \
-		 trap -- '' QUIT\ndone\n"
-	);
-	assert_eq!(
-		run_on(ModeId::Bash, Platform::Windows, bash),
-		"trap -- '' SIGINT\ntrap -- '' SIGINT\ndone\n"
-	);
-	assert_eq!(run_on(ModeId::Zsh, Platform::Linux, zsh), "trap -- 'print own' INT\n\ndone\n");
+	let zsh_out = "trap -- '' INT\ntrap -- '' QUIT\ntrap -- 'print own' INT\ntrap -- '' QUIT\ntrap \
+	               -- '' INT trap -- '' QUIT\ndone\n";
+	assert_eq!(run_on(ModeId::Zsh, Platform::Windows, zsh), zsh_out);
+	assert_eq!(run_on(ModeId::Bash, Platform::Windows, bash), "trap -- 'echo own' SIGINT\ndone\n");
+	assert_eq!(run_on(ModeId::Zsh, Platform::Linux, zsh), zsh_out);
 	assert_eq!(run_on(ModeId::Bash, Platform::Linux, bash), "trap -- 'echo own' SIGINT\ndone\n");
 }

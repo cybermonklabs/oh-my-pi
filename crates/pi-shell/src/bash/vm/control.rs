@@ -28,6 +28,10 @@ pub const RESUME: u32 = 1 << 1;
 pub const CANCEL: u32 = 1 << 2;
 pub const SUSPEND: u32 = 1 << 3;
 pub const SIGNAL: u32 = 1 << 4;
+/// An OS signal handler caught a signal the host has not forwarded yet
+/// ([`ControlHandle::signal_word`]): the next safepoint has the host
+/// forward it ([`crate::bash::Host::forward_signals`]).
+pub const OS_SIGNAL: u32 = 1 << 5;
 
 /// Shared control state of one shell.
 pub struct Ctl {
@@ -39,6 +43,9 @@ pub struct Ctl {
 	parked:     AtomicU64,
 	waiters:    Mutex<Vec<Waker>>,
 	signals:    Mutex<Vec<(SigTarget, Signal)>>,
+	/// How many signals [`ControlHandle::signal`] has queued, the last one's
+	/// number ([`Self::signals_queued`]); changed under `signals`' lock.
+	queued:     AtomicU64,
 }
 
 impl Ctl {
@@ -50,6 +57,7 @@ impl Ctl {
 			parked:     AtomicU64::new(0),
 			waiters:    Mutex::new(Vec::new()),
 			signals:    Mutex::new(Vec::new()),
+			queued:     AtomicU64::new(0),
 		})
 	}
 
@@ -68,8 +76,24 @@ impl Ctl {
 		Signal::from_repr(self.cancel_sig.load(Ordering::Acquire)).unwrap_or(Signal::Term)
 	}
 
-	pub(crate) fn take_signals(&self) -> Vec<(SigTarget, Signal)> {
-		std::mem::take(&mut *self.signals.lock())
+	/// Take the queued signals, with the number of the first: they are
+	/// numbered from 1 in the order they were queued.
+	pub(crate) fn take_signals(&self) -> (Vec<(SigTarget, Signal)>, u64) {
+		let mut signals = self.signals.lock();
+		let first = self.queued.load(Ordering::Acquire) + 1 - signals.len() as u64;
+		(std::mem::take(&mut *signals), first)
+	}
+
+	/// The number of the last signal queued: one with a higher number was
+	/// queued after this call.
+	pub(crate) fn signals_queued(&self) -> u64 {
+		self.queued.load(Ordering::Acquire)
+	}
+
+	/// Whether `sig` is forwarded ([`ControlHandle::signal`]) and not yet
+	/// delivered (the next safepoint delivers it).
+	pub(crate) fn signal_pending(&self, sig: Signal) -> bool {
+		self.signals.lock().iter().any(|&(_, s)| s == sig)
 	}
 
 	#[inline]
@@ -155,6 +179,9 @@ impl Wake for Ctl {
 pub struct ControlHandle(pub(crate) Arc<Ctl>);
 
 impl ControlHandle {
+	/// [`OS_SIGNAL`], for [`Self::signal_word`].
+	pub(crate) const OS_SIGNAL: u32 = OS_SIGNAL;
+
 	/// Pause the whole shell: virtual processes park at their next safepoint,
 	/// externals are stopped and tasks paused; `step` returns `Paused` until
 	/// [`ControlHandle::resume`].
@@ -189,7 +216,10 @@ impl ControlHandle {
 	/// Deliver a signal on the virtual signal bus (the `kill` builtin uses
 	/// the same path).
 	pub fn signal(&self, target: SigTarget, sig: Signal) {
-		self.0.signals.lock().push((target, sig));
+		let mut signals = self.0.signals.lock();
+		signals.push((target, sig));
+		self.0.queued.fetch_add(1, Ordering::AcqRel);
+		drop(signals);
 		self.0.request(SIGNAL, 0);
 	}
 
@@ -207,6 +237,15 @@ impl ControlHandle {
 	/// spinning on `step`.
 	pub fn poll_runnable(&self, cx: &mut Context<'_>) -> Poll<()> {
 		self.0.poll_since(self.0.parked.load(Ordering::Acquire), cx)
+	}
+
+	/// The control word, for a host's OS signal handler to set
+	/// [`OS_SIGNAL`] in, with one atomic `fetch_or` (async-signal-safe): the
+	/// running vproc stops at its next op, as for any request, so a signal
+	/// that comes while the shell runs shell code is taken before the next
+	/// command, as bash takes one.
+	pub(crate) fn signal_word(&self) -> &AtomicU32 {
+		&self.0.word
 	}
 }
 

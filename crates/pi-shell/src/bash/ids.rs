@@ -295,6 +295,14 @@ impl Platform {
 	}
 }
 
+/// The build target ([`Platform::current`]), as
+/// [`crate::bash::EngineConfig`]'s default.
+impl Default for Platform {
+	fn default() -> Self {
+		Self::current()
+	}
+}
+
 /// Engine-native builtins: the ones that touch interpreter
 /// state. Hosts return
 /// [`Resolved::Intrinsic`](crate::bash::Resolved::Intrinsic) for them; their

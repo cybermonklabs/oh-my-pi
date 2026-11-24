@@ -5,11 +5,19 @@
 //! Each case sources an rc file (fixture directory `~/fx`, fixture commands
 //! in `~/bin`, and for compsys cases `compinit -u -D` from zsh 5.9's
 //! installed completion functions), clears the screen, then types its
-//! steps; after each step it waits for the output to settle and records the
+//! steps; after each step it waits until the line editor has handled the
+//! keys and waits for the next one ([`Pty::zle_sync`]) and records the
 //! screen (rows without trailing blanks) and the cursor, and for colour
 //! cases the text and SGR sequences the step wrote
 //! (`comp_support::sgr_transcript`). The record must equal the snapshot in
 //! `tests/fixtures/zsh_comp_pty/<case>.txt`.
+//!
+//! The characters are UTF-8 (`LANG` from [`pty_support::utf8_locale`]) and the
+//! collation is the `C` locale's (`LC_COLLATE=C`): byte order, the same in
+//! every C library. A named locale's collation is the machine's locale data
+//! (glibc's `en_US.UTF-8` ignores punctuation, so `-a` sorts before `--color`;
+//! macOS's ignores case), so a snapshot recorded under one did not hold on
+//! the other.
 //!
 //! `PI_COMP_ORACLE=1` runs `/bin/zsh` against the snapshots;
 //! `PI_COMP_ORACLE=1 PI_COMP_BLESS=1` rewrites them from `/bin/zsh`.
@@ -18,21 +26,26 @@
 
 mod comp_support;
 mod pty_support;
+mod zsh_oracle;
 
 use std::{fmt::Write as _, fs, io, path::PathBuf, time::Duration};
 
-use comp_support::{bless, compsys_fpath, fpath_words, oracle, quiet, sgr_transcript, shell};
-use pty_support::Pty;
+use comp_support::{bless, compsys_fpath, fpath_words, oracle, sgr_transcript, shell};
+use pty_support::{Pty, ZLE_SYNC_SCRIPT};
 
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
 /// Bound of the startup and the rc file (obash's `compinit`).
 const STARTUP: Duration = Duration::from_secs(60);
-/// Bound of one step's output settling.
+/// Bound of one step (completion functions print nothing while they work).
 const STEP: Duration = Duration::from_secs(30);
 
-/// The fixture every case starts from (after `fpath`).
-const FIXTURE: &str = "PS1='%# '
+/// The fixture every case starts from (after `fpath`). The prompt and the
+/// mark of a line left without its newline are a literal `%`, not `%#`,
+/// which is `#` for root (`PROMPT_EOL_MARK`'s default is `%B%S%#%s%b`): the
+/// snapshots hold for the user the tests run as.
+const FIXTURE: &str = "PS1='%% '
+PROMPT_EOL_MARK='%B%S%%%s%b'
 mkdir -p ~/fx/dir1 ~/fx/dir2 ~/bin
 : >~/fx/file1 >~/fx/file2 >~/fx/foo.c >~/fx/foo.h
 for c in fxcmd-one fxcmd-two fxtool; do print '#!/bin/sh' >~/bin/$c; chmod +x ~/bin/$c; done
@@ -62,10 +75,17 @@ fn snapshot_path(name: &str) -> PathBuf {
 	PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/zsh_comp_pty/{name}.txt"))
 }
 
-/// Type `keys` and wait for the output to settle.
+/// Type `keys` and wait until the line editor has handled them and drawn
+/// everything it draws before it waits for the next key. One answer of the
+/// [`Pty::zle_sync`] handler comes after the work the keys started; the
+/// second comes after what the editor drew once that handler returned,
+/// which in zsh is nothing unless the handler invalidated the display. A
+/// redraw there (obash once redrew after every handler) is then on every
+/// screen read, not only on the ones it reached first.
 fn step(pty: &mut Pty, keys: &str) -> io::Result<()> {
 	pty.type_keys(keys, KEY)?;
-	pty.settle(quiet(), STEP)
+	pty.zle_sync(STEP)?;
+	pty.zle_sync(STEP)
 }
 
 /// Run the case on the shell under test; the record of its steps.
@@ -75,19 +95,19 @@ fn record(fpath: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) -> 
 		rcfile.push_str("autoload -U compinit; compinit -u -D\n");
 	}
 	rcfile.push_str(rc);
-	rcfile.push_str("\nprint -r -- RE''ADY\n");
+	let _ = write!(rcfile, "\n. ~/{ZLE_SYNC_SCRIPT}\nprint -r -- RE''ADY\n");
 	let mut pty = shell()
 		.args(["-f", "-i"])
-		.env("PS1", "%# ")
-		.env("LC_ALL", "en_US.UTF-8")
+		.env("PS1", "%% ")
+		.env("LC_COLLATE", "C")
 		.rc_file(".zshrc", rcfile)
+		.zle_sync()
 		.size(24, 80)
 		.spawn()?;
-	pty.read_until("%", STARTUP)?;
-	pty.settle(quiet(), STARTUP)?;
+	pty.wait_raw(STARTUP)?;
 	pty.type_keys(". ~/.zshrc\r", Duration::from_millis(20))?;
 	pty.read_until("READY", STARTUP)?;
-	pty.settle(quiet(), STARTUP)?;
+	pty.zle_sync(STARTUP)?;
 	// A clean screen for the case itself.
 	step(&mut pty, "\x0c")?;
 	let mut text = String::new();
@@ -108,7 +128,6 @@ fn record(fpath: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) -> 
 /// Record the case and compare it with (or, blessing, write) its snapshot.
 fn check(name: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) {
 	let Some(fpath) = compsys_fpath() else {
-		eprintln!("skipped: zsh 5.9 completion functions are not installed");
 		return;
 	};
 	let got = match record(&fpath_words(&fpath), setup, rc, steps, what) {

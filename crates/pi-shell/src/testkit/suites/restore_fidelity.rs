@@ -1,7 +1,14 @@
 //! Restore fidelity: state that lives in a vproc between ops
 //! survives a snapshot taken there.
 
-use crate::testkit::{FakeHost, Fault, run_script};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+use crate::{
+	bash::{SigSet, Signal, SpawnSpec},
+	testkit::{FakeHost, Fault, run_script},
+};
 
 fn same_under_snapshots(src: &[u8]) -> (Vec<u8>, Vec<u8>) {
 	let base = run_script(FakeHost::new(), src, &[], Fault::None);
@@ -41,4 +48,64 @@ fn a_waiting_select_does_not_prompt_twice() {
 fn bash_command_survives_a_snapshot_inside_a_trap() {
 	let (out, _) = same_under_snapshots(b"trap ': x; echo \"[$BASH_COMMAND]\"' DEBUG; echo one");
 	assert_eq!(out, b"[echo one]\none\n");
+}
+
+/// The signal sets the programs `src` starts are spawned with ignored
+/// (each spawn fails: 127, nothing runs), and the snapshots taken.
+fn spawn_masks(src: &[u8], fault: Fault) -> (Vec<SigSet>, u32) {
+	let seen = Arc::new(Mutex::new(Vec::new()));
+	let masks = Arc::clone(&seen);
+	let host = FakeHost::new().with_spawner(Box::new(move |spec: SpawnSpec<'_>| {
+		masks.lock().push(spec.sigmask_ign);
+		Err(std::io::ErrorKind::NotFound.into())
+	}));
+	let out = run_script(host, src, &[], fault);
+	let masks = seen.lock().clone();
+	(masks, out.snapshots)
+}
+
+/// A background subshell without job control ignores `INT` and `QUIT`
+/// (bash 5.3's asynchronous ignore, a field of the vproc in the frames
+/// image) also when restored after it started: a `kill -INT` of itself or
+/// of its fork does nothing, and its programs, and its fork's, start with
+/// both ignored. A trap it set keeps running and keeps `INT` at its default
+/// for its programs; after `trap CMD INT; trap - INT` its fork acts on
+/// `INT` itself, while the fork's programs ignore it. Goldens: bash 5.3.20
+/// (`SigIgn` 6 for `INT` and `QUIT`, 4 for `QUIT` alone).
+#[test]
+fn an_asynchronous_commands_ignored_signals_survive_a_snapshot() {
+	let rows: [(&[u8], &[u8]); 4] = [
+		(b"( :; :; kill -INT $BASHPID; echo alive ) & wait; echo st=$?", b"alive\nst=0\n"),
+		(b"( :; :; ( kill -INT $BASHPID; echo alive ); echo st=$? ) & wait", b"alive\nst=0\n"),
+		(b"( trap 'echo got' INT; :; :; kill -INT $BASHPID; echo after ) & wait", b"got\nafter\n"),
+		(
+			b"( trap 'echo x' INT; trap - INT; :; :; ( kill -INT $BASHPID; echo alive ); echo st=$? ) & wait",
+			b"st=130\n",
+		),
+	];
+	for (src, want) in rows {
+		let (out, err) = same_under_snapshots(src);
+		assert_eq!(
+			String::from_utf8_lossy(&out),
+			String::from_utf8_lossy(want),
+			"{} (stderr {:?})",
+			String::from_utf8_lossy(src),
+			String::from_utf8_lossy(&err)
+		);
+	}
+	let both = SigSet::EMPTY.with(Signal::Int).with(Signal::Quit);
+	let quit = SigSet::EMPTY.with(Signal::Quit);
+	let spawns: [(&[u8], SigSet); 4] = [
+		(b"( :; :; /x/p ) & wait", both),
+		(b"( :; :; ( /x/p ) ) & wait", both),
+		(b"( trap 'echo x' INT; :; :; /x/p ) & wait", quit),
+		(b"( trap 'echo x' INT; trap - INT; :; :; ( /x/p ) ) & wait", both),
+	];
+	for (src, want) in spawns {
+		let text = String::from_utf8_lossy(src);
+		assert_eq!(spawn_masks(src, Fault::None), (vec![want], 0), "{text}");
+		let (masks, snapshots) = spawn_masks(src, Fault::Snapshot { every: 1 });
+		assert!(snapshots > 0, "no snapshot landed: {text}");
+		assert_eq!(masks, vec![want], "{text} under snapshots");
+	}
 }

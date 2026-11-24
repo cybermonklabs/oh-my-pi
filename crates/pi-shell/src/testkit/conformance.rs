@@ -23,8 +23,8 @@ use crate::{
 		Script, Shell, ShellApi, SigTarget, Signal, StateStore, Step, StoreError, UnitId, VarValue,
 		Vpid,
 		store::{
-			BlobSlot, Change, Elem, Job, JobState, Key, KeyBuf, LossyKind, MiscKey, OptId, Record,
-			Sticky, Table, TrapKey, Var, ZshScope,
+			BlobSlot, Change, Elem, Job, JobFact, JobProc, JobProcs, JobState, Key, KeyBuf, LossyKind,
+			MiscKey, OptId, ProcState, Record, Sticky, Table, TrapKey, Var, ZshScope,
 		},
 		zshopt::{ZshOpt, ZshOpts},
 	},
@@ -284,6 +284,9 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				inherited: false,
 				wd:        bytes(b"/t\xffmp"),
 				os_pid:    Some(4242),
+				signal:    None,
+				procs:     None,
+				unreaped:  false,
 			}),
 		),
 		(
@@ -292,7 +295,7 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				id:        JobId(2),
 				number:    2,
 				vpid:      Vpid(Vpid::BASE + 2),
-				text:      bytes(b"{ :; }"),
+				text:      bytes(b"a | { :; }"),
 				state:     JobState::Done(137),
 				control:   false,
 				notified:  true,
@@ -300,8 +303,35 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				inherited: false,
 				wd:        bytes(b"/"),
 				os_pid:    None,
+				signal:    None,
+				procs:     None,
+				unreaped:  false,
 			}),
 		),
+		(
+			KeyBuf::JobFacts(JobId(2)),
+			Record::JobFacts(vec![
+				JobFact::Signal(Signal::Kill),
+				JobFact::Procs(JobProcs {
+					list:     vec![
+						JobProc {
+							vpid:   Vpid(Vpid::BASE + 4),
+							os_pid: Some(4244),
+							text:   bytes(b"a"),
+							state:  ProcState::Exited(0),
+						},
+						JobProc {
+							vpid:   Vpid(Vpid::BASE + 5),
+							os_pid: None,
+							text:   bytes(b"{ :; }"),
+							state:  ProcState::Killed(Signal::Kill),
+						},
+					],
+					pipefail: true,
+				}),
+			]),
+		),
+		(KeyBuf::BgPid(Vpid(Vpid::BASE + 3)), Record::Misc(bytes(b"137:4243:0"))),
 		(KeyBuf::Proc(Vpid(Vpid::BASE + 1)), Record::Proc {
 			parent: Some(Vpid(Vpid::BASE)),
 			status: None,
@@ -686,7 +716,7 @@ fn deleting_a_scope_drops_its_locals(store: &mut dyn StateStore) {
 }
 
 /// Every table, `Scope` and `Local` included.
-const TABLES: [Table; 14] = [
+const TABLES: [Table; 16] = [
 	Table::Var,
 	Table::Func,
 	Table::Alias,
@@ -701,6 +731,8 @@ const TABLES: [Table; 14] = [
 	Table::Local,
 	Table::ZshOpt,
 	Table::ZshAlias,
+	Table::JobFacts,
+	Table::BgPid,
 ];
 
 /// A scan of each table visits exactly that table's records, once each.
