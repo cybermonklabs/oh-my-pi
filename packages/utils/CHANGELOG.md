@@ -12,11 +12,11 @@
 - Added `@oh-my-pi/pi-utils/event-loop-slice` (`sliceExpired`, `nextSlice`, `mapInSlices`, `runInSlices`, `runToCompletion`, `parseJsonBytesInSlices`, `readJsonInSlices`) for CPU-bound background work that must give the event loop a turn after each 10 ms slice; concurrent passes share the budget and take it in turn, one pass through the event loop holds at most one slice, and a fetched JSON payload is decoded and parsed in slices of its own
 - `postmortem.register()` takes `afterOthers: true`: the callback starts only once every other callback of the same cleanup pass has settled, resolved or rejected, late registrations included, under the pass's one deadline, so it can release what the others would have released and find only what they left. A pass that ends at its deadline first does not start it. One without a `deadlineMs` of its own gets no time past the 10 s deadline: when another callback's `deadlineMs` held the pass open that long, it starts once that callback settles and the pass ends at once. With a `deadlineMs` of its own, the pass waits for it that long once it starts, also past the 10 s deadline. A `deadlineMs` callback's `waitMessage` does not wait for `afterOthers` callbacks.
 - `postmortem.exitAfterCleanup(code, { exit })`: runs every cleanup callback, then exits, and does not return, for a caller that must not go on; unlike `process.exit`, it waits for asynchronous cleanup callbacks first, and unlike `exitProcess`, it runs them at all. `exit: "native"` ends through `exitProcess`, past the extension-load guard, for a host-owned exit that can come while extensions load.
+- Added `isStringList()`, a type guard for an array whose every item is a string
 
 ### Changed
 
 - `spawn(cmd, { subreaper: true })` on Linux now starts the subreaper as the leader of its own process group and session, as `detached: true` does, and `subreaper` with `detached: false` is refused on every platform. The new session has no controlling terminal, so such a command cannot open `/dev/tty`, and terminal job control (Ctrl-C, Ctrl-Z) and a terminal hangup (SIGHUP) no longer reach it directly; stop it with `kill()`, `signal` or `timeout`
-- Added `isStringList()`, a type guard for an array whose every item is a string
 
 ### Fixed
 

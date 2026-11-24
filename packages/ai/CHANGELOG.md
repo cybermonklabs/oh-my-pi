@@ -2,10 +2,6 @@
 
 ## [Unreleased]
 
-### Breaking Changes
-
-- `normalizeAnthropicToolSchema()` moved from `@oh-my-pi/pi-ai/providers/anthropic` to `@oh-my-pi/pi-ai/providers/anthropic-tool-schema`
-
 ### Added
 
 - Added **Anthropic Console** to `/login`: sign in with a Claude Console account to use Claude models billed to your Console organization, without creating an API key. Console logins sit alongside Claude Pro/Max logins for the same organization.
@@ -15,7 +11,6 @@
 - `AIError.Flag.Connection` marks a failure that died on the wire with no HTTP status and no capacity signal — a cut stream, a closed socket, a truncated chunked transfer — so callers can tell it apart from a 429, a 529 or an overload
 - Model usage health now names why an account is depleted (`depletedBy`: `usage`, `account-policy` or `auth`) ([#19682](https://github.com/can1357/oh-my-pi/pull/19682) by [@sjawhar](https://github.com/sjawhar))
 - `addModelCallGuard({ refuse, settled }, scope?)` registers a check on model calls, and `runInModelCallScope(scope, fn)` runs `fn` in a scope; a guard with a scope sees only its own scope's calls and the calls made outside every scope: `stream`, `streamSimple` (and so `complete` and `completeSimple`), `generateImage`, `synthesizeSpeech` and native judgments of a catalog model consult every guard before the request is built, return a held call as an error (or reject with `ModelCallRefusedError`) without sending anything, and report how each call they let through ended
-- Added `CredentialUnavailableError`, a transient error for a configured credential source that produced no key; unlike `MissingApiKeyError`, a retry may succeed ([#14031](https://github.com/can1357/oh-my-pi/pull/14031) by [@sjawhar](https://github.com/sjawhar)).
 - Added `@oh-my-pi/pi-ai/providers/anthropic-tool-schema`, which loads without the provider: `anthropicWireToolFields()`, the input schema, `strict` and `eager_input_streaming` each tool of an Anthropic request goes out with (the provider builds its tools from it); `anthropicToolsRequest()` and `anthropicEagerInputStreaming()`, what decides them for a model and endpoint; and `anthropicStrictnessHashedTools()`, the tools as a hash of the request reads them (as they are under default settings; a flag that `PI_NO_STRICT`, Claude Code's experimental-beta kill switch or the strict-tools fallback takes off counts as `null`)
 - Added `anthropicKeepsToolDeclaration()` and `anthropicDeclaredTools()` to `@oh-my-pi/pi-ai/providers/anthropic-tool-declaration`: whether a model keeps its top-level tool declaration across a conversation (never while Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to its provider), and the tools a request declares there in wire order, a withdrawn tool still declared from its sent definition
 - Added `@oh-my-pi/pi-ai/providers/anthropic-beta-kill-switch` with `experimentalBetasDisabled()`, whether `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to a model's provider, and `withoutDisabledExperimentalBetas()`, the model with the compat an `anthropic` request then goes out with (no strict tools, no mid-conversation tool changes, …)
@@ -26,10 +21,6 @@
 - Added `bedrockSendsForcedToolChoice()` to `@oh-my-pi/pi-ai/providers/amazon-bedrock`, whether a forced tool choice goes out forced on a Bedrock model (not on a model that takes no forced tool use, nor on a prefix-bound line thinking on the request, which gets `auto`); `openAICompletionsSendsNonDefaultToolChoice()` to `@oh-my-pi/pi-ai/providers/openai-completions`, whether a chat completions request sends a `tool_choice` other than `auto` under the compat it resolves for the request (the `whenThinking` view with thinking on), and `openAICompletionsReasoningOptions()` to `@oh-my-pi/pi-ai`, the reasoning a request hands that provider; and `mapOpenAIResponsesToolChoiceForTools()` to `@oh-my-pi/pi-ai/providers/openai-responses`, the `tool_choice` a Responses request sends for the tools it offers; each provider decides its request's `tool_choice` by its own
 - Added `@oh-my-pi/pi-ai/providers/wire-model` with `wireModel()`, the model a request on a model goes out as, as `streamSimple` dispatches it: Factory Droid's route model for its wire (`factoryDroidRouteModel()`), GitLab Duo's upstream model (`gitLabDuoUpstreamModel()`), Kimi Code's and Synthetic's model for the selected API format (`kimiRequestModel()`, `syntheticRequestModel()`, from `openAIAnthropicShimModel()`), or the model a provider's `prepareModel` hook prepares (Cloudflare AI Gateway's reroutes); the model itself elsewhere
 - Added `promptCacheModelKey` to `AssistantMessage`: the model the request went out as, as the host's prompt cache keys it (provider, id, wire API and endpoint), which the coding agent stamps on a main reply so a resumed session tells a cache entry another server holds from its own; no provider puts it on an upstream request (the pi-native transport forwards it to its gateway with the rest of the message)
-
-### Changed
-
-- `OpenAIStrictToolsState.strictTools.disabledModelScopes` is a `Map` from each scope's key to the scope (it was a `Set` of keys)
 
 ### Fixed
 
@@ -63,11 +54,13 @@
 - Added `AccountPoolUnavailableError` (a `MissingApiKeyError`) for a session restricted to an OAuth account pool none of whose accounts can serve now, the `AssistantMessage` field `credentialUnavailable` for a turn that failed because no credential could give a key (nothing was sent, so a resume can go on with it), `isAutoDisabledCredential` for tombstones of OAuth credentials a failure disabled, and `isUserRemovalCause` with the `DELETED_BY_USER` and `LOGGED_OUT_BY_USER` causes, beside the `REPLACED_BY_CAUSE_PREFIX` and `DEDUPLICATED_CAUSE_PREFIX` cause prefixes; a user's removal or logout now also marks the provider's logins a failure had already disabled ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
 - Disabled-credential summaries now include the store's account `identityKey`, locally and through the auth broker to clients that announce the `disabled-identity-key` capability, so older clients keep reading the list; `isRecoverableDisabledCredential` lets clients tell whether a later removal or replacement of the same account ended a failure-disabled login, without conflating organizations or workspace members ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
 - Added the optional `SessionsApi.permitsIdentity(provider, sessionId, identityKey)`, which tells whether an account's identity key, also that of a login a failure disabled, belongs to a session's OAuth account pool. A custom `SessionsApi` should provide it: without it, a session restricted to an account pool does not wait for such a login when its key is missing, and omp logs one warning per provider in each thread ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
+- `normalizeAnthropicToolSchema()` moved from `@oh-my-pi/pi-ai/providers/anthropic` to `@oh-my-pi/pi-ai/providers/anthropic-tool-schema`
 
 ### Changed
 
 - Upgrade the auth broker before its clients: an older broker does not record a client's removal of a login a failure disabled, and the client now reports that with `AuthBrokerRemovalNotRecordedError` ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
 - A broker client's account pool (`OMP_AUTH_BROKER_ACCOUNT_POOL_FILE` or `accountPool`) now also filters disabled-credential tombstones: `listDisabledCredentials` lists only the disabled logins of the pool's accounts, and removing a provider or one login by id records the user's removal only on those. A broker that predates `identityKey` sends none, so with such a broker a pool rule that lists accounts hides every disabled OAuth login (fail closed): its client waits for none of them, and `/logout` and `omp usage` list none ([#17764](https://github.com/can1357/oh-my-pi/pull/17764) by [@sjawhar](https://github.com/sjawhar))
+- `OpenAIStrictToolsState.strictTools.disabledModelScopes` is a `Map` from each scope's key to the scope (it was a `Set` of keys)
 
 ## [18.18.4] - 2026-11-09
 
