@@ -178,6 +178,31 @@ async fn a_stage_whose_words_hold_a_substitution_runs_its_debug_trap_in_the_shel
 				.to_owned(),
 			"st=0 bang=\n",
 		),
+		// A stage whose words hold two or three substitutions: a plant that
+		// steps over one body only (one `Jmp`) passes the one-substitution
+		// rows above (the `ir` lowers one body per substitution) and fails
+		// here. The `$!` shape is in `background_job_bang.rs`.
+		(
+			format!("{dbg} echo $(echo a) $(echo b) | cat"),
+			"dbg echo $(echo a) $(echo b)\ndbg cat\na b\n",
+		),
+		(
+			format!("set -T; {dbg} echo $(echo a) $(echo b) | cat"),
+			"dbg echo $(echo a) $(echo b)\ndbg cat\ndbg echo a a dbg echo b b\n",
+		),
+		(
+			format!("{dbg} echo $(echo a) $(echo b) $(echo c) | cat"),
+			"dbg echo $(echo a) $(echo b) $(echo c)\ndbg cat\na b c\n",
+		),
+		(format!("{dbg} echo $(echo a) $(echo b) & wait"), "dbg echo $(echo a) $(echo b)\ndbg wait\na b\n"),
+		(
+			format!("set -T; {dbg} echo $(echo a) $(echo b) > /dev/null & wait"),
+			"dbg echo $(echo a) $(echo b) > /dev/null\ndbg wait\n",
+		),
+		(
+			format!("shopt -s lastpipe; set +m; {dbg} : x | : $(echo y) $(echo z); echo end"),
+			"dbg : x\ndbg : $(echo y) $(echo z)\ndbg echo end\nend\n",
+		),
 	];
 	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
 	assert_bash_outputs(&rows).await;
