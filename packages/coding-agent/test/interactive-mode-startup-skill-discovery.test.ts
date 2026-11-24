@@ -63,7 +63,7 @@ describe("InteractiveMode startup skill discovery (PR #9379 review)", () => {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -162,7 +162,7 @@ describe("InteractiveMode startup skill discovery (PR #9379 review)", () => {
 `,
 			);
 
-			const loaded = await loadExtensions([extPath], tempDir);
+			const loaded = await loadExtensions([{ path: extPath, scope: "explicit" }], tempDir);
 			expect(loaded.errors).toEqual([]);
 
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");

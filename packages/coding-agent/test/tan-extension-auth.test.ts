@@ -168,7 +168,7 @@ describe("/tan extension auth over a shared registry", () => {
 				authStorage,
 				modelRegistry,
 				disableExtensionDiscovery: true,
-				preloadedExtensionPaths: [extPath],
+				preloadedExtensionPaths: [{ path: extPath, scope: "explicit" }],
 				extensionRoots: () => parent.effectiveExtensionRoots,
 			});
 
