@@ -9,10 +9,11 @@
 //!   stays pending until signalled (a `sleep` without a timer). Once every
 //!   vproc is blocked, the shell's bytes are measured as above, for [`FEW`] and
 //!   [`MANY`] vprocs; per vproc = difference / ([`MANY`] − [`FEW`]) (vproc, job
-//!   entry, task handle). Target ≤ 2 KiB. The line after it breaks the
-//!   difference down by allocation size (8-byte classes, live allocations per
-//!   vproc), which names the structures that cost the bytes; the `memory
-//!   sizes:` line gives `size_of` of the engine structures an idle vproc holds
+//!   entry, task handle). Target ≤ 2,416 B ([`MAX_VPROC_BYTES`], which says how
+//!   it was set). The line after it breaks the difference down by allocation
+//!   size (8-byte classes, live allocations per vproc), which names the
+//!   structures that cost the bytes; the `memory sizes:` line gives `size_of`
+//!   of the engine structures an idle vproc holds
 //!   (`pi_shell::bash::vproc_layout`), to match against those classes.
 //! - **allocs**: allocations, reallocations and bytes per iteration of the
 //!   loop/func/strops workloads with `EventMask::NONE` (the event-off path) and
@@ -24,7 +25,7 @@
 //!
 //! ```text
 //! memory shell: … bytes after create + `:` (target ≤ 65536) PASS|MISS; store +… bytes; create + `:` … allocs, … bytes
-//! memory idle vprocs: 16 → … bytes, 272 → … bytes; … bytes per vproc (target ≤ 2048) PASS|MISS
+//! memory idle vprocs: 16 → … bytes, 272 → … bytes; … bytes per vproc (target ≤ 2416) PASS|MISS
 //! memory idle vproc allocations by size: 24-31 B ×1.00, …
 //! memory sizes: Vproc … B, Frame … B, Scratch … B, ScratchIo … B, ExecState … B…
 //! allocs loop NONE: … allocs/iter, … reallocs/iter, … bytes/iter; per run … allocs
@@ -175,7 +176,25 @@ fn live() -> usize {
 }
 
 const MAX_SHELL_BYTES: usize = 64 * 1024;
-const MAX_VPROC_BYTES: usize = 2 * 1024;
+/// Bytes per idle vproc: the largest measured value plus about 4 %, so a
+/// vproc that grows by more than 95 B fails it. Measured on Linux (runc),
+/// 3 rounds per tree, with this loop and with the vprocs forked back to
+/// back (`idle &` repeated, no write by the shell between the forks):
+/// 1,840 and 1,921 B at 9058ab9d; 2,123 to 2,195 and 1,889 B once forked
+/// vprocs own copy-on-write images (d2d553c3, Cut7 a72018dd to Cut9
+/// 85936bf7), which is what took this loop past 2,048 B; 2,321 and 2,013 B
+/// at Cut10 chain step 5 (a460228e). An image shares the shell's maps, and
+/// when the shell writes a variable after the fork (this loop's `i`), the
+/// shell copies its path and the vproc keeps the earlier one: the shard
+/// list, the shard and the entry with its name and value, six allocations
+/// per vproc (classes 0-7 B ×2, 48-55 B ×2, 128-135 B, and 88-95 B or
+/// 160-167 B by the shard the hasher puts `i` in). A vproc must keep the
+/// state it was forked with, so those bytes are the image's design. Since
+/// then a waiting `break` (`Vproc::pending_break`, chain step 1) and bash's
+/// kept statuses (`JobTable::bgp`, step 2), 8 B of `Vproc` each, and each
+/// vproc's write keys (40 B of `Vproc` and one 64-71 B allocation,
+/// `Vproc::write_key`, step 5) added the rest.
+const MAX_VPROC_BYTES: usize = 2416;
 
 /// Idle vprocs in the small and the large case.
 const FEW: u32 = 16;

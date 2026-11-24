@@ -85,7 +85,7 @@ pub struct JobCtl {
 	/// `(vproc, job key)` for vprocs outside the shell's foreground job
 	/// ([`leader_of`]): a background job and what it runs, a command
 	/// substitution (`None`: no job, the shell's own group). Kept here
-	/// rather than in the vproc (idle vproc ≤ 2 KiB); only while the
+	/// rather than in the vproc (idle vproc ≤ 2,416 B); only while the
 	/// shell does job control.
 	leaders:     Vec<(Vpid, Option<Vpid>)>,
 	/// Terminal modes of stopped jobs, put back by `fg` (zsh `jn->ty`).

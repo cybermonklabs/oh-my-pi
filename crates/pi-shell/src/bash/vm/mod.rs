@@ -445,7 +445,7 @@ pub struct Shell {
 	k:         Kernel,
 	/// Boxed: a `Vproc` is ~650 bytes and the vector doubles, so idle
 	/// subshells would pay up to twice that in spare capacity (target:
-	/// ≤ 2 KiB per idle vproc).
+	/// ≤ 2,416 B per idle vproc).
 	#[expect(clippy::vec_box, reason = "slack capacity of 8-byte slots, not of whole vprocs")]
 	procs:     Vec<Box<Vproc>>,
 	rr:        usize,
@@ -539,7 +539,7 @@ pub struct Kernel {
 	/// [`Kernel::proc_collect`]). Boxed as `Shell::procs` holds them:
 	/// adoption moves pointers, and the capacity a burst leaves behind is 8
 	/// bytes a slot, not a whole vproc (`cmd &` in a loop spawns ~200 per
-	/// slice: that kept ~600 bytes per idle vproc; the target is ≤ 2 KiB).
+	/// slice: that kept ~600 bytes per idle vproc; the target is ≤ 2,416 B).
 	#[expect(clippy::vec_box, reason = "slack capacity of 8-byte slots, not of whole vprocs")]
 	pub spawned:            Vec<Box<Vproc>>,
 	/// The records an asynchronous command's signal ignores
@@ -593,7 +593,7 @@ pub struct Kernel {
 	/// The empty document an async command without job control reads as
 	/// `/dev/null`, shared by all of them (it never yields a byte, so one
 	/// object serves every reader): an fd object and two buffers less per
-	/// background vproc (idle vproc ≤ 2 KiB). Not imaged (a restored
+	/// background vproc (idle vproc ≤ 2,416 B). Not imaged (a restored
 	/// child keeps its own object).
 	pub null_input:         Option<FdRef>,
 	/// `(label, caller)`: the labeled subshell trees host callouts started
@@ -3656,7 +3656,7 @@ impl Vproc {
 					.is_some_and(|op| op.flags & ir::Op::COND != 0)
 		});
 		// Room for exactly this frame: a `Frame` is ~300 bytes and a first
-		// push reserves four (idle vproc ≤ 2 KiB); calls grow it.
+		// push reserves four (idle vproc ≤ 2,416 B); calls grow it.
 		vp.frames.reserve_exact(1);
 		vp.frames.push(frame);
 		vp
