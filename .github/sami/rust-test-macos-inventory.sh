@@ -3,9 +3,16 @@
 # the tests only macOS can run. They are
 #   - each test a macOS test binary lists that the Linux binary of the same
 #     target does not (a test compiled only on macOS, `#[cfg(target_os =
-#     "macos")]`), and every test of a target Linux did not list at all;
+#     "macos")]`);
 #   - the tests .github/sami/rust-test-macos.txt names, which are #[ignore]d
 #     on other targets.
+# A target with no Linux listing did not build on Linux (the Linux job fails
+# for every target with no result). It is UNKNOWN here: which of its tests
+# only macOS compiles cannot be told, so none of them is taken (running them
+# all would run its Linux tests on macOS and read their failures as macOS
+# ones). The inventory then still lists every other target, writes
+# complete=true to GITHUB_OUTPUT so the job runs the tests it lists, and
+# exits 1, naming each UNKNOWN target.
 # It builds every Bazel test target under //crates for macOS, lists each
 # rust_test binary, and compares it with the Linux job's listing of the same
 # target (rust-test.sh leaves them, with index.tsv, in its listings
@@ -13,7 +20,7 @@
 # fails to build for macOS or has no macOS binary (a compile error only macOS
 # sees would otherwise drop its tests unseen), when a test
 # rust-test-macos.txt names is in no macOS binary's listing, and when no
-# macOS binary could be listed.
+# macOS binary could be listed; those leave no complete=true.
 # Usage: rust-test-macos-inventory.sh <Linux listings directory> <output list>
 #   OMP_BAZEL_RC   the bazelrc fragment .github/actions/bazel-cache wrote
 set -euo pipefail
@@ -55,6 +62,7 @@ bin_root="$(bazelisk --bazelrc="$OMP_BAZEL_RC" info bazel-bin)"
 : >"$out"
 listed=0
 declare -A mac_listed=()
+unknown=()
 while read -r label; do
 	path="${label#//}"
 	bin="$bin_root/${path%%:*}/${path#*:}"
@@ -68,7 +76,9 @@ while read -r label; do
 	if [ -n "${linux_listing[$label]:-}" ]; then
 		LC_ALL=C comm -23 "$tmp/mac.txt" "${linux_listing[$label]}" >"$tmp/only.txt"
 	else
-		cp "$tmp/mac.txt" "$tmp/only.txt"
+		: >"$tmp/only.txt"
+		unknown+=("$label")
+		echo "::error title=macOS inventory::UNKNOWN: $label has no Linux listing: the target did not build on Linux, so which of its $(count "$tmp/mac.txt") macOS tests only macOS compiles cannot be told; none of them runs here"
 	fi
 	while read -r name; do
 		printf '%s %s  compiled only on macOS\n' "$label" "$name" >>"$out"
@@ -89,3 +99,8 @@ done <"$tmp/named.tsv"
 LC_ALL=C sort -u -o "$out" "$out"
 echo "macOS inventory: $(count "$out") tests ($(awk '/compiled only on macOS$/ { n++ } END { print n + 0 }' "$out") compiled only on macOS, $(awk '/named in rust-test-macos.txt$/ { n++ } END { print n + 0 }' "$out") named in rust-test-macos.txt)"
 [ -s "$out" ] || stop "the macOS inventory is empty"
+echo "complete=true" >>"${GITHUB_OUTPUT:-/dev/null}"
+if [ "${#unknown[@]}" != 0 ]; then
+	echo "::error title=macOS inventory::UNKNOWN: ${#unknown[@]} target(s) with no Linux listing, whose macOS-only tests this job does not run: ${unknown[*]}"
+	exit 1
+fi

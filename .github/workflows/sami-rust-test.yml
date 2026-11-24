@@ -602,12 +602,17 @@ jobs:
         with:
           name: rust-test-listings
           path: ${{ runner.temp }}/linux-listings
+      # It lists every target it can read and exits 1 for a target with no
+      # Linux listing (UNKNOWN: it did not build on Linux); complete=true
+      # still lets the next step run the tests it listed.
       - name: The tests only macOS can run
+        id: inventory
         shell: bash
         env:
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
         run: bash .github/sami/rust-test-macos-inventory.sh "$RUNNER_TEMP/linux-listings" "$RUNNER_TEMP/macos-inventory.txt"
       - name: The macOS-only Rust tests
+        if: ${{ !cancelled() && steps.inventory.outputs.complete == 'true' }}
         shell: bash
         env:
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}

@@ -375,12 +375,24 @@ bazel_test() {
 	collect "$inv" "$bep"
 }
 
+# did_not_build <target>: every result Bazel gave the target is
+# FAILED_TO_BUILD. A list line of such a target cannot be checked: its test
+# ran nowhere, and the build failure already fails the job. The checks below
+# then say UNKNOWN in a notice, and do not call the line wrong.
+did_not_build() {
+	awk -F'\t' -v t="$1" '$1 == t { n++; if ($3 == "FAILED_TO_BUILD") f++ } END { exit !(n > 0 && n == f) }' "$rows"
+}
+
 # check_alone <title> <invocation> <target> <name>: an invocation that ran one
 # test alone must report exactly that test, and run it: a filter that
 # matches nothing (a renamed test), or an #[ignore] the invocation did not
 # lift, cannot pass as the test.
 check_alone() {
 	local title="$1" inv="$2" target="$3" name="$4" log event
+	if did_not_build "$target"; then
+		echo "::notice title=$title::UNKNOWN: $target did not build, so its own invocation for $name ran nothing (the build failure fails the job)"
+		return 0
+	fi
 	awk -F'\t' -v t="$target" -v inv="$inv" '$7 == inv && $1 == t && $5 != "-" { print $5 }' "$rows" >"$tmp/alone-logs.txt"
 	log="$(sed -n 1p "$tmp/alone-logs.txt")"
 	if [ "$(count "$tmp/alone-logs.txt")" != 1 ] || [ ! -f "$log" ]; then
@@ -1173,6 +1185,10 @@ done
 # every test whose name contains it, in every binary.
 check_skip() {
 	local title="$1" from="$2" target="$3" name="$4" binary matches
+	if did_not_build "$target"; then
+		echo "::notice title=$title::UNKNOWN: $target did not build, so what its skip $name in $from takes out cannot be checked (the build failure fails the job)"
+		return 0
+	fi
 	: >"$tmp/matches.tsv"
 	for binary in "${!listing_of[@]}"; do
 		awk -v b="$binary" -v n="$name" 'index($0, n) { print b "\t" $0 }' "${listing_of[$binary]}" >>"$tmp/matches.tsv"
@@ -1215,7 +1231,11 @@ while IFS=$'\t' read -r binary name; do
 done <"$tmp/ignored.tsv"
 for list in child-entries macos; do
 	while IFS=$'\t' read -r binary name; do
-		error "Rust test skips" "$binary $name is in $sami/rust-test-$list.txt but is no #[ignore]d test this job leaves unrun: remove its line"
+		if did_not_build "$binary"; then
+			echo "::notice title=Rust test skips::UNKNOWN: $binary did not build, so whether $name, which $sami/rust-test-$list.txt names, is still an #[ignore]d test is not known (the build failure fails the job)"
+		else
+			error "Rust test skips" "$binary $name is in $sami/rust-test-$list.txt but is no #[ignore]d test this job leaves unrun: remove its line"
+		fi
 	done < <(LC_ALL=C comm -13 "$tmp/ignored.tsv" "$tmp/$list.tsv")
 done
 echo "Test binaries listed: ${#listing_of[@]}; #[ignore]d tests no invocation ran: $(count "$tmp/ignored.tsv")"

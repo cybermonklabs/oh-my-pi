@@ -746,6 +746,13 @@ RAW_LIST=$RAWLIST run J146-source-line-with-words-in-a-report-fails 1 "$NAT wrot
 # stops the step, with the reader's message (rust-test-parity.sh and
 # rust-test-macos-inventory.sh give the same one: P13, I9).
 SANCTIONED_LINE="$D a::two ruling" run J147-list-line-without-its-why-stops 1 "rust-test-sanctioned-skips.txt:[0-9]+: no two spaces before its why: $D a::two ruling" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+# A target that did not build: its list lines cannot be checked, so they read
+# UNKNOWN in a notice, and the build failure alone fails the job: a
+# child-entries line (J148), a sanctioned skip (J149), an #[ignore]d root test
+# run alone (J150).
+NOT_MSG='rust-test-child-entries.txt but is no' CHILD_ENTRIES="$B b::child" run J148-child-entry-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
+NOT_MSG='takes out 0 tests' SANCTIONED="$B s::x::byte_totals" run J149-sanctioned-skip-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so what its skip s::x::byte_totals" '' "{ $P; cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
+NOT_MSG='has no one test log' IGNORED_ROOT="$B r::cycle" IGN_ROOT_BODY="{ cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; } >\"\$bep\"; exit 1" run J150-ignored-root-test-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so its own invocation for r::cycle" '' "{ $P; cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.
@@ -773,7 +780,8 @@ ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strfti
 # no test has a binary that lists none; a label absent has no binary, or no
 # Linux listing). <named>: rust-test-macos.txt's lines `<label> <test>`.
 # LINUX_INDEX=none leaves the Linux listings out. NAMED_LINE, a line written
-# as it is after <named>'s. The output names the inventory file's lines.
+# as it is after <named>'s. The output names the inventory file's lines, then
+# what the script wrote to GITHUB_OUTPUT.
 irun() {
 	local name="$1" want="$2" msg="$3" targets="$4" mac="$5" linux="$6" named="$7" w out rc label tests t i=0
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
@@ -810,7 +818,7 @@ case "\${args[0]}" in
 esac
 EOF
 	chmod +x "$w/bin/bazelisk"
-	out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null bash "$repo/.github/sami/rust-test-macos-inventory.sh" "$w/linux" "$w/inventory.txt" 2>&1; echo "--- inventory"; cat "$w/inventory.txt" 2>/dev/null)"
+	out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null GITHUB_OUTPUT="$w/github-output" bash "$repo/.github/sami/rust-test-macos-inventory.sh" "$w/linux" "$w/inventory.txt" 2>&1; echo "--- inventory"; cat "$w/inventory.txt" 2>/dev/null; echo "--- outputs"; cat "$w/github-output" 2>/dev/null)"
 	rc="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null bash "$repo/.github/sami/rust-test-macos-inventory.sh" "$w/linux" "$w/inventory2.txt" >/dev/null 2>&1; echo $?)"
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
@@ -825,9 +833,20 @@ irun I2-no-linux-listings 1 'UNKNOWN: .*index.tsv is missing or empty' "$T1" "$T
 LINUX_INDEX=none irun I2b-no-linux-listings-dir 1 'UNKNOWN: .*index.tsv is missing or empty' "$T1" "$T1 a::one" "$T1 a::one" ""
 irun I3-named-test-in-no-mac-binary 1 "$T1 a::gone is in .github/sami/rust-test-macos.txt but in no macOS binary's listing" "$T1" "$T1 a::one" "$T1 a::one" "$T1 a::gone"
 NAMED_LINE="$T1 a::named macOS libc" irun I9-named-line-without-its-why 1 "rust-test-macos.txt:2: no two spaces before its why: $T1 a::named macOS libc" "$T1" "$T1 a::one a::named" "$T1 a::one" ""
-irun I4-target-linux-did-not-list 0 "$T2 b::mac  compiled only on macOS" "$T1
-$T2" "$T1 a::one
-$T2 b::mac" "$T1 a::one" "$T1 a::one"
+# A target with no Linux listing did not build on Linux: it is UNKNOWN, and
+# none of its tests is taken as macOS-only (I4); every other target is still
+# listed (I4b) and the list is marked complete, so the job runs it (I4c). A
+# list without UNKNOWN is complete too (I4d).
+NOT_MSG="$T2 b::" irun I4-target-linux-did-not-list-is-unknown 1 "UNKNOWN: $T2 has no Linux listing: the target did not build on Linux" "$T1
+$T2" "$T1 a::one a::mac
+$T2 b::mac b::linux" "$T1 a::one" ""
+irun I4b-other-targets-listed-beside-an-unknown-one 1 "$T1 a::mac  compiled only on macOS" "$T1
+$T2" "$T1 a::one a::mac
+$T2 b::mac b::linux" "$T1 a::one" ""
+irun I4c-complete-beside-an-unknown-target 1 "^complete=true$" "$T1
+$T2" "$T1 a::one a::mac
+$T2 b::mac b::linux" "$T1 a::one" ""
+irun I4d-complete-without-unknown 0 "^complete=true$" "$T1" "$T1 a::one a::mac" "$T1 a::one" ""
 irun I5-no-mac-binary 1 "$T1 has no macOS binary at .*, though bazel build passed" "$T1" "" "$T1 a::one" ""
 # R1: a macOS build failure, or one queried target without a binary, fails.
 BUILD_RC=1 irun I6-macos-build-fails 1 'bazel build of the test targets for macOS exited 1' "$T1" "$T1 a::one" "$T1 a::one" ""
