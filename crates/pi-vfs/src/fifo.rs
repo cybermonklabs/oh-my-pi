@@ -291,9 +291,10 @@ impl Watch {
 	}
 }
 
-/// Helpers a drop left in `open(2)` after the look took their open, that
-/// have not returned ([`FifoOpen`]): on gVisor each is a thread asleep until
-/// a writer of its FIFO comes, if one ever does.
+/// Helpers a drop left after the look took their open, that have not ended
+/// ([`FifoOpen`]): on gVisor each is a thread asleep in `open(2)` until a
+/// writer of its FIFO comes, if one ever does, or one on its way to its last
+/// check, where it ends.
 static LEFT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The most helpers left at once: past it a read-only open is not looked at
@@ -365,8 +366,9 @@ struct Slot<T> {
 	exited:    bool,
 	/// The helper's `open(2)` returned.
 	returned:  bool,
-	/// The drop left this helper in `open(2)` after the look took its open
-	/// ([`FifoOpen::release`]): it counts in [`LEFT`] until it returns.
+	/// The drop left this helper after the look took its open
+	/// ([`FifoOpen::release`]): it counts in [`LEFT`] until it returns from
+	/// its `open(2)`, or ends without one (left before its last check).
 	counted:   bool,
 	/// The open's result is the read end the look found, not the helper's.
 	rescued:   bool,
@@ -1126,12 +1128,18 @@ impl<T> FifoOpen<T> {
 	}
 }
 
-/// Marks the helper ended when it returns or unwinds.
+/// Marks the helper ended when it returns or unwinds. A helper the drop
+/// left before its last check ends here without an `open(2)`: it stops
+/// counting in [`LEFT`] here.
 struct Exit<T>(Arc<Shared<T>>);
 
 impl<T> Drop for Exit<T> {
 	fn drop(&mut self) {
-		self.0.slot.lock().exited = true;
+		{
+			let mut s = self.0.slot.lock();
+			s.exited = true;
+			stop_counting(&mut s);
+		}
 		self.0.done.notify_all();
 	}
 }
@@ -1140,6 +1148,11 @@ impl<T> Drop for Exit<T> {
 /// [`LEFT`].
 fn helper_returned<T>(s: &mut Slot<T>) {
 	s.returned = true;
+	stop_counting(s);
+}
+
+/// A helper the drop left ([`Slot::counted`]) stops counting in [`LEFT`].
+fn stop_counting<T>(s: &mut Slot<T>) {
 	if s.counted {
 		s.counted = false;
 		LEFT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1318,7 +1331,7 @@ impl<T> Drop for FifoOpen<T> {
 	/// A helper the look took the open from ([`FifoOpen::start_reading`]) is
 	/// released even when the open's result was taken, and is waited for
 	/// only while it returns within [`RESCUED_JOIN`] once the peer is open;
-	/// else it is left, and counts in [`LEFT`] until it returns. On Linux a
+	/// else it is left, and counts in [`LEFT`] until it ends. On Linux a
 	/// writer's open wakes the helper, so a look does not take the open.
 	///
 	/// A helper it leaves opens nothing if it has not passed its last check.
