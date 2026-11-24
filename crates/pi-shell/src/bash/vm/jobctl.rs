@@ -32,7 +32,9 @@ use bstr::{BStr, BString};
 use super::{
 	Cx, Kernel, Shell,
 	exec::{self, Flow},
-	proc::{Frame, FrameKind, JobState, PendingWrite, Saved, Saves, Scratch, ScriptKind, Vproc},
+	proc::{
+		Frame, FrameKind, JobState, PendingWrite, Saved, Saves, Scratch, ScriptKind, Vproc, WriteKey,
+	},
 	state,
 };
 use crate::bash::{
@@ -131,6 +133,10 @@ struct Shout {
 	/// What the terminal's writer thread took of the front notice and has
 	/// not written yet.
 	unsettled: crate::bash::Unsettled,
+	/// The notices' wait on the terminal: a key of their own, so a notice
+	/// with no room never replaces the editor's wait there (the terminal's
+	/// owner's) with its own waker.
+	key:       crate::sys::WaitKey,
 }
 
 enum ShoutItem {
@@ -313,7 +319,12 @@ fn drain(jc: &mut JobCtl, ctl: &std::sync::Arc<super::control::Ctl>, waker: &Wak
 				if let Some(tty) = shtty.as_ref()
 					&& shout.off < bytes.len()
 				{
-					match tty.poll_write_out(&mut cx, &bytes[shout.off..], &mut shout.unsettled) {
+					match tty.poll_write_out_keyed(
+						&mut cx,
+						&bytes[shout.off..],
+						&mut shout.unsettled,
+						&mut shout.key,
+					) {
 						Poll::Ready(Ok(n)) if n > 0 => {
 							shout.off += n;
 							continue;
@@ -348,13 +359,16 @@ impl std::task::Wake for Unpark {
 /// Write `bytes` to `fd` and wait, on this thread, until they are out
 /// (written and settled), as zsh's blocking write does: for the shell's
 /// last words as it leaves, when nothing else runs. A failed write is
-/// lost, as zsh ignores the error of its warning.
+/// lost, as zsh ignores the error of its warning. The write waits with a
+/// key of its own: as the terminal's owner, its thread's waker would
+/// replace the editor's wait there.
 fn write_waiting(fd: &FdRef, bytes: &[u8]) {
 	let waker = Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
 	let mut cx = Context::from_waker(&waker);
 	let (mut off, mut unsettled) = (0, crate::bash::Unsettled::default());
+	let mut key = crate::sys::WaitKey::default();
 	while off < bytes.len() {
-		match fd.poll_write_out(&mut cx, &bytes[off..], &mut unsettled) {
+		match fd.poll_write_out_keyed(&mut cx, &bytes[off..], &mut unsettled, &mut key) {
 			Poll::Ready(Ok(n)) if n > 0 => off += n,
 			Poll::Ready(_) => return,
 			Poll::Pending => std::thread::park(),
@@ -924,6 +938,17 @@ pub fn suspend(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, sig: Signal) -> 
 	}
 	job.stopped = true;
 	let mut children: Vec<Vpid> = Vec::new();
+	// The moved ops write on in the job, so it takes the keys they write
+	// with: the current one, and the ones its moved traps interrupted. The
+	// stand-ins' pops put those back here first; then the shell goes on
+	// with a key of its own, since a moved write may be part way under them
+	// (a zsh multios tee keeps its progress by key).
+	let moved_traps = vp.frames[base + 1..]
+		.iter()
+		.filter(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }))
+		.count();
+	let job_trap_keys = vp.trap_keys[vp.trap_keys.len().saturating_sub(moved_traps)..].to_vec();
+	let job_key = std::sync::Arc::clone(&vp.write_key);
 	// Frames above the base move to the job; the shell pops stand-ins with
 	// the same kind and saved fds, so it returns from them as usual.
 	let mut moved: Vec<Frame> = Vec::new();
@@ -945,6 +970,8 @@ pub fn suspend(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, sig: Signal) -> 
 	// The base frame's part: the op at the pc and the open compounds.
 	let f = &mut vp.frames[base];
 	let scratch = f.scratch.take();
+	let write_parked = f.flags.write_parked();
+	f.flags.set_write_parked(false);
 	let enters = std::mem::take(&mut f.enters);
 	let loops = std::mem::take(&mut f.loops);
 	let cases = std::mem::take(&mut f.cases);
@@ -961,12 +988,25 @@ pub fn suspend(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, sig: Signal) -> 
 	}
 	let jf = &mut job.frames[0];
 	jf.scratch = scratch;
+	jf.flags.set_write_parked(write_parked);
 	jf.enters = enters;
 	jf.loops = loops;
 	jf.cases = cases;
 	jf.redirs = redirs;
 	jf.kind = FrameKind::Job { stop_at: end };
 	job.frames.extend(moved);
+	job.write_key = job_key;
+	job.trap_keys = job_trap_keys;
+	vp.write_key = WriteKey::default();
+	// A queued write part way (`Vproc::out_key`: the moved command's
+	// diagnostic) goes with the job, which writes the rest where its first
+	// bytes went, under its key, once continued, as zsh's stopped child does.
+	if let Some(key) = vp.out_key.take()
+		&& let Some(w) = vp.out.pop_front()
+	{
+		job.out.push_back(w);
+		job.out_key = Some(key);
+	}
 	job.trap_frames = u16::try_from(
 		job.frames
 			.iter()
@@ -2362,5 +2402,45 @@ mod tests {
 				assert!(waited, "the op did not wait for the notice queued while it was parked");
 			},
 		);
+	}
+}
+
+/// The notices' wait on the terminal, beside the editor's.
+#[cfg(all(test, unix))]
+mod keyed {
+	use std::sync::Arc;
+
+	use bstr::BString;
+
+	use super::*;
+	use crate::{
+		bash::{Engine, EngineConfig, MemStore, fd::FdTable},
+		sys::test_fifos::{Flag, FullFifo, drain},
+	};
+
+	// Failure mode (review of #111 at 3b9fe7ab): a job notice written to a
+	// terminal with no room polled it as its owner with a waker that wakes
+	// nobody, which replaced the editor's wait for room: the drain did not
+	// wake the editor. The notices wait with a key of their own.
+	#[test]
+	fn a_notice_keeps_the_editors_wait_for_room() {
+		let mut store = MemStore::new();
+		let root = state::Root::load(&mut store).unwrap();
+		let engine = Engine::new(EngineConfig::default());
+		let mut k = Kernel::new(&engine, root, BString::from("zsh"), std::process::id());
+		let FullFifo { writer, mut reader } = FullFifo::new();
+		let tty = FdRef::from_file(Box::new(writer));
+		k.jobctl.shtty = Some(tty.clone());
+		let mut vp = Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false);
+		let editor = Arc::new(Flag::default());
+		let waker = Waker::from(Arc::clone(&editor));
+		assert!(
+			tty.poll_write(&mut Context::from_waker(&waker), b"x")
+				.is_pending(),
+			"no room"
+		);
+		notice(&mut k, &mut vp, b"[1]  + done       sleep 1\n");
+		drain(&mut reader);
+		editor.wait("the editor, waiting for room, woken by the drain");
 	}
 }

@@ -223,7 +223,6 @@ kill $h 2>/dev/null
 	sleep 1
 	read -r v
 	echo "v=$v"
-	exec 6> "$D/fifo"
 } < <(printf 'z\n'; read -r _ < "$D/gate")"#,
 		"v=z",
 	),

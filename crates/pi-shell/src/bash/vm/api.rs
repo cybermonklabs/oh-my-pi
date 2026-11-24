@@ -69,12 +69,21 @@ impl ShellApi<'_, '_> {
 		self.io(|cx| h.poll_read(cx, buf))
 	}
 
-	/// Write to fd `fd` of the calling vproc (possibly partially). A chunk a
-	/// writer thread takes reports no error here: use [`Self::write_marked`]
-	/// and [`Self::settle_marked`] to get it.
-	pub fn write(&mut self, fd: i32, bytes: &[u8]) -> IoPoll<usize> {
+	/// Write to fd `fd` of the calling vproc (possibly partially) as the
+	/// writer `key` names. A callout writes with a key of its own, which goes
+	/// with it, never the vproc's ([`Vproc::write_key`]): its wait on the
+	/// object is its own, and a callout dropped while its write waits (a
+	/// cancelled run, a killed shell) leaves nothing behind for the vproc's
+	/// next write. A chunk a writer thread takes reports no error here: use
+	/// [`Self::write_marked`] and [`Self::settle_marked`] to get it.
+	pub fn write_keyed(
+		&mut self,
+		fd: i32,
+		bytes: &[u8],
+		key: &mut crate::sys::WaitKey,
+	) -> IoPoll<usize> {
 		let h = self.vproc().fds.handle(fd);
-		self.io(|cx| h.poll_write(cx, bytes))
+		self.io(|cx| h.poll_write_keyed(cx, bytes, key))
 	}
 
 	/// Ready once what fd `fd` of the calling vproc took is out
@@ -85,17 +94,18 @@ impl ShellApi<'_, '_> {
 		self.io(|cx| h.poll_settle(cx))
 	}
 
-	/// [`Self::write`], with the [`Mark`](crate::bash::Mark) of the chunk a
-	/// writer thread took (`None` when it wrote as it took): settle it with
-	/// [`Self::settle_marked`] to get that chunk's error
-	/// ([`crate::bash::File::poll_write_marked`]).
+	/// [`Self::write_keyed`], with the [`Mark`](crate::bash::Mark) of the
+	/// chunk a writer thread took (`None` when it wrote as it took): settle it
+	/// with [`Self::settle_marked`] to get that chunk's error
+	/// ([`crate::bash::File::poll_write_keyed`]).
 	pub fn write_marked(
 		&mut self,
 		fd: i32,
 		bytes: &[u8],
+		key: &mut crate::sys::WaitKey,
 	) -> IoPoll<(usize, Option<crate::bash::Mark>)> {
 		let h = self.vproc().fds.handle(fd);
-		self.io(|cx| h.poll_write_marked(cx, bytes))
+		self.io(|cx| h.poll_write_marked_keyed(cx, bytes, key))
 	}
 
 	/// Ready once the chunks of `marks`, which fd `fd` of the calling vproc

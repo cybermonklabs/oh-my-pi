@@ -22,7 +22,8 @@ use crate::bash::{
 #[cfg(test)]
 thread_local! {
 	/// Tests: run on this thread at the start of each read of an object
-	/// itself in [`FdRef::poll_read`], while every feed's lock is held.
+	/// itself in [`FdRef::poll_read`] and [`FdRef::poll_read_keyed`], while
+	/// every feed's lock is held.
 	pub(crate) static BEFORE_DIRECT_READ: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
 		const { std::cell::RefCell::new(None) };
 }
@@ -191,6 +192,26 @@ impl FdRef {
 		}
 	}
 
+	/// Before an external inherits this fd: an end of a pipe between
+	/// pipeline stages becomes an end of the OS pipe `os_pipe` makes
+	/// ([`MemFile::share_with_external`]), so [`Self::os_handle`] gives it to
+	/// the external directly. Every other object is left as it is.
+	pub(crate) fn share_with_external(
+		&self,
+		os_pipe: impl FnOnce(&[u8]) -> Option<(Box<dyn File>, Box<dyn File>)>,
+	) {
+		if let FdState::Mem(m) = &*self.0.state.lock() {
+			m.share_with_external(os_pipe);
+		}
+	}
+
+	/// Whether this fd holds an end of a pipe that became an OS pipe
+	/// ([`MemFile::is_os_pipe`]): a snapshot loses it, as it loses a host
+	/// file.
+	pub(crate) fn is_os_pipe(&self) -> bool {
+		self.with_mem(MemFile::is_os_pipe).unwrap_or(false)
+	}
+
 	/// A handle on a host file outside any shell, for tests that hand engine
 	/// objects to a host directly (the sys spawner's pump tests).
 	pub fn from_file(file: Box<dyn File>) -> Self {
@@ -306,6 +327,17 @@ impl FdRef {
 	/// pipe each have one (a `/dev/fd/N` duplicate), the first is read first
 	/// even when the second holds older bytes.
 	pub fn poll_read(&self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+		self.read_fed(cx, buf, &mut |cx, buf| self.poll_read_direct(cx, buf))
+	}
+
+	/// Read through the feeds of this pipe read end, if the host feeds it to
+	/// externals, then the object itself with `direct`.
+	fn read_fed(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		direct: &mut ReadOn<'_>,
+	) -> Poll<io::Result<usize>> {
 		let feeds = self
 			.with_mem(|m| match m {
 				MemFile::PipeRead(r) => r.feeds(),
@@ -319,12 +351,11 @@ impl FdRef {
 					hook();
 				}
 			});
-			self.poll_read_direct(cx, buf)
+			direct(cx, buf)
 		})
 	}
 
-	/// Read into `buf` from the object itself, past any feed: the host's
-	/// pump filling a feed reads this way.
+	/// Read into `buf` from the object itself, past any feed.
 	pub(crate) fn poll_read_direct(
 		&self,
 		cx: &mut Context<'_>,
@@ -332,6 +363,20 @@ impl FdRef {
 	) -> Poll<io::Result<usize>> {
 		match self.0.state.lock().file() {
 			Some(f) => f.poll_read(cx, buf),
+			None => Poll::Ready(Ok(0)),
+		}
+	}
+
+	/// [`Self::poll_read_direct`] as the task `key` names: the host's pump
+	/// filling a feed reads this way, with its copy's key.
+	pub(crate) fn poll_read_direct_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_read_keyed(cx, buf, key),
 			None => Poll::Ready(Ok(0)),
 		}
 	}
@@ -351,6 +396,59 @@ impl FdRef {
 	pub fn poll_write(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
 		match self.0.state.lock().file() {
 			Some(f) => f.poll_write(cx, buf),
+			None => Poll::Ready(Err(bad_fd())),
+		}
+	}
+
+	/// [`Self::poll_read`] for a host task that may wait beside the engine
+	/// and other tasks on this object: `key`, which the task's future holds,
+	/// keeps its wait apart ([`File::poll_read_keyed`]). It reads through the
+	/// object's feeds first, as [`Self::poll_read`] does.
+	pub fn poll_read_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.read_fed(cx, buf, &mut |cx, buf| self.poll_read_direct_keyed(cx, buf, key))
+	}
+
+	/// [`Self::poll_write`] for a writer that may wait beside others, as
+	/// [`Self::poll_read_keyed`]. A chunk a writer thread took is not
+	/// settled here: a writer that needs its error writes with
+	/// [`Self::poll_write_out_keyed`].
+	pub fn poll_write_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self
+			.poll_write_marked_keyed(cx, bytes, key)
+			.map_ok(|(n, _)| n)
+	}
+
+	/// [`Self::poll_write_keyed`] with the mark of the chunk a writer thread
+	/// took ([`File::poll_write_keyed`]); the caller settles it.
+	pub fn poll_write_marked_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		self.write_keyed(cx, bytes, None, key)
+	}
+
+	/// [`Self::poll_write_marked_keyed`] attributed to `tag`.
+	fn write_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::ids::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		match self.0.state.lock().file() {
+			Some(f) => f.poll_write_keyed(cx, bytes, tag, key),
 			None => Poll::Ready(Err(bad_fd())),
 		}
 	}
@@ -489,6 +587,24 @@ impl FdRef {
 		}
 	}
 
+	/// [`Self::poll_write_out`] as the writer `key` names
+	/// ([`File::poll_write_keyed`]): a write part way keeps its progress by
+	/// its key (a zsh multios tee, a provider file), and the write is done
+	/// only once its bytes are out of the shell.
+	pub fn poll_write_out_keyed(
+		&self,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+		unsettled: &mut Unsettled,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		match self.0.state.lock().file() {
+			Some(f) => unsettled.poll_write_file_keyed(f, cx, buf, key),
+			// Closed since its chunk was taken: that chunk is the thread's.
+			None => Poll::Ready(unsettled.0.take().map(|(n, _)| n).ok_or_else(bad_fd)),
+		}
+	}
+
 	/// Kind of the underlying object; `None` when closed or lost.
 	pub fn kind(&self) -> Option<FileKind> {
 		self.0.state.lock().file_ref().map(File::kind)
@@ -565,8 +681,31 @@ impl Unsettled {
 		cx: &mut Context<'_>,
 		buf: &[u8],
 	) -> Poll<io::Result<usize>> {
+		self.poll_with(file, cx, |file, cx| file.poll_write_marked(cx, buf))
+	}
+
+	/// [`Self::poll_write_file`] as the writer `key` names
+	/// ([`File::poll_write_keyed`]).
+	pub fn poll_write_file_keyed(
+		&mut self,
+		file: &mut dyn File,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.poll_with(file, cx, |file, cx| file.poll_write_keyed(cx, buf, None, key))
+	}
+
+	/// Write with `write` unless a chunk is still unsettled, then settle the
+	/// chunk a writer thread took, with its error, before it is counted.
+	fn poll_with(
+		&mut self,
+		file: &mut dyn File,
+		cx: &mut Context<'_>,
+		write: impl FnOnce(&mut dyn File, &mut Context<'_>) -> Poll<io::Result<(usize, Option<Mark>)>>,
+	) -> Poll<io::Result<usize>> {
 		if self.0.is_none() {
-			match std::task::ready!(file.poll_write_marked(cx, buf)) {
+			match std::task::ready!(write(file, cx)) {
 				Ok((n, Some(mark))) => self.0 = Some((n, mark)),
 				other => return Poll::Ready(other.map(|(n, _)| n)),
 			}
@@ -614,6 +753,27 @@ impl File for TaggedOutput {
 		self
 			.base
 			.poll_write_tagged(cx, bytes, tag.unwrap_or(self.tag))
+	}
+
+	fn poll_read_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.base.poll_read_keyed(cx, bytes, key)
+	}
+
+	fn poll_write_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::ids::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<(usize, Option<Mark>)>> {
+		self
+			.base
+			.write_keyed(cx, bytes, Some(tag.unwrap_or(self.tag)), key)
 	}
 
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

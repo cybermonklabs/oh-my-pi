@@ -838,6 +838,25 @@ impl File for LockedFile {
 		self.file.poll_write(cx, buf)
 	}
 
+	fn poll_read_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<usize>> {
+		self.file.poll_read_keyed(cx, buf, key)
+	}
+
+	fn poll_write_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		bytes: &[u8],
+		tag: Option<crate::bash::CmdTag>,
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<io::Result<(usize, Option<crate::bash::fs::Mark>)>> {
+		self.file.poll_write_keyed(cx, bytes, tag, key)
+	}
+
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
 		self.file.poll_flush(cx)
 	}

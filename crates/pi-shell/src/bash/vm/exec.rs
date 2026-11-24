@@ -17,7 +17,7 @@ use super::{
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, DebugSkip, Depths, Frame, FrameKind, InlineStage,
 		LastBg, LoopKind, LoopRec, ParseSnapshot, PendingBreak, PendingSub, PendingWrite, Probe,
-		ProbeResult, Run, Saved, Saves, Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		ProbeResult, Run, Saved, Saves, Scratch, ScriptKind, Slot, TryEnd, Vproc, WriteKey,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -95,13 +95,17 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			&& !vp.waiting_foreground()
 			&& !k.asking(vp.vpid)
 		{
+			// A `CHLD` trap waits while the command it would interrupt
+			// writes ([`Vproc::holds_trap`]); another runs now, under its own
+			// key.
 			let pending = vp.pending_traps.iter().find(|sig| {
-				!vp.frames.iter().any(|frame| {
-					matches!(frame.kind, FrameKind::Script {
-						what: ScriptKind::Trap { key: TrapKey::Signal(active), .. },
-						..
-					} if active == *sig)
-				})
+				!vp.holds_trap(*sig)
+					&& !vp.frames.iter().any(|frame| {
+						matches!(frame.kind, FrameKind::Script {
+							what: ScriptKind::Trap { key: TrapKey::Signal(active), .. },
+							..
+						} if active == *sig)
+					})
 			});
 			if let Some(sig) = pending {
 				vp.pending_traps = vp.pending_traps.without(sig);
@@ -405,6 +409,13 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		} else {
 			0
 		};
+		// Whether the op is parked on a write: dropped so, it takes the
+		// vproc's write key with it ([`forget_parked_write`]).
+		if let Some(frame) = vp.frames.get_mut(fi) {
+			frame
+				.flags
+				.set_write_parked(matches!(flow, Flow::Block(WaitKey::Write { .. })));
+		}
 		if !matches!(flow, Flow::Block(_) | Flow::Call)
 			&& let Some(frame) = vp.frames.get_mut(fi)
 		{
@@ -1002,7 +1013,8 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 /// then: a failed compound redirection restores the fds between the write
 /// and the settle. The chunk handed off last settles before the next one
 /// goes, and an entry stops at its first failed chunk; write errors on a
-/// diagnostic stream are dropped, as bash does.
+/// diagnostic stream are dropped, as bash does. A write goes on under the
+/// key it started with ([`Vproc::out_key`]) until it is done.
 pub fn flush_out(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 	// The shell's job notices still going out to its terminal come first
 	// ([`jobctl::notice`]): zsh wrote them with blocking writes.
@@ -1078,7 +1090,11 @@ fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 			pop_out(k, vp);
 			continue;
 		}
-		match handle.poll_write_marked(&mut cx, &w.bytes[w.off..]) {
+		let key = vp
+			.out_key
+			.get_or_insert_with(|| std::sync::Arc::clone(&vp.write_key));
+		let polled = handle.poll_write_marked_keyed(&mut cx, &w.bytes[w.off..], &mut key.lock());
+		match polled {
 			Poll::Ready(Ok((n, mark))) if n > 0 => {
 				w.off += n;
 				w.handed.mark = mark;
@@ -1094,8 +1110,10 @@ fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 }
 
 /// The front of `vp.out` is out (written and settled, or dropped): pop it,
-/// and continue the job it held back ([`PendingWrite::then_continue`]).
+/// end the key its write went on under ([`Vproc::out_key`]), and continue
+/// the job it held back ([`PendingWrite::then_continue`]).
 fn pop_out(k: &mut Kernel, vp: &mut Vproc) {
+	vp.out_key = None;
 	if let Some(w) = vp.out.pop_front()
 		&& let Some(id) = w.cont
 	{
@@ -1905,11 +1923,21 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 	let Some(mut f) = vp.frames.pop() else {
 		return;
 	};
-	if matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }) {
-		vp.trap_frames = vp.trap_frames.saturating_sub(1);
-	}
 	if let Some(sc) = f.scratch.take() {
 		drop_scratch(root, store, vp, sc);
+	}
+	// The frame's op goes first, under the key it wrote with: a trap's own,
+	// if this is a trap's frame.
+	if f.flags.write_parked() {
+		forget_parked_write(vp);
+	}
+	if matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }) {
+		vp.trap_frames = vp.trap_frames.saturating_sub(1);
+		// The key the trap interrupted ([`start_trap`]), on every way out:
+		// the trap's end, `return`, an error, an unwind.
+		if let Some(interrupted) = vp.trap_keys.pop() {
+			vp.write_key = interrupted;
+		}
 	}
 	while let Some(saves) = f.redirs.pop() {
 		restore(vp, saves.fds);
@@ -2087,11 +2115,29 @@ pub fn drop_scratch(
 /// few nested calls, small for an idle vproc's memory.
 const SPARE_SCRATCH: usize = 4;
 
-/// Drop the top frame's scratch of an op that is over (recycled).
+/// Drop the top frame's scratch of an op that is over (recycled), or that
+/// is dropped part way.
 pub fn clear_scratch(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
-	if let Some(sc) = top_frame(vp).scratch.take() {
+	let top = top_frame(vp);
+	let parked = top.flags.write_parked();
+	top.flags.set_write_parked(false);
+	if let Some(sc) = top.scratch.take() {
 		drop_scratch(root, store, vp, sc);
 	}
+	if parked {
+		forget_parked_write(vp);
+	}
+}
+
+/// An op dropped while parked on a write
+/// ([`super::proc::FrameFlags::write_parked`]) takes
+/// the vproc's write key with it: its write's progress is kept by key (a
+/// zsh multios tee keeps it per target, a provider file keeps the result
+/// of its task), so the vproc's next write with that key would start at
+/// those offsets, or take that result, and lose its bytes. A new key has
+/// none, and the old one's progress goes with it.
+pub fn forget_parked_write(vp: &mut Vproc) {
+	vp.write_key = WriteKey::default();
 }
 
 /// Take the top frame's scratch, or a cleared one (the vproc's spare).
@@ -5330,9 +5376,12 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 							let consumer = stage_text(unit, info, i + 1);
 							tap.open(BStr::new(&producer), BStr::new(&consumer))
 						});
+						// Untapped, the pipe becomes an OS pipe once an external
+						// takes an end, so two external stages share it as
+						// bash's do; a tapped one stays in memory for its mirror.
 						let (r, w) = match mirror {
 							Some(mirror) => mem::tapped_pipe(mirror),
-							None => mem::pipe(),
+							None => mem::stage_pipe(),
 						};
 						let w = FdRef::mem(w);
 						fds.set(1, Some(w.clone()));
@@ -6061,6 +6110,11 @@ fn push_trap(
 		exit: false,
 		returned: false,
 	});
+	// The trap writes with a key of its own: a command it interrupted may
+	// have a write part way under the vproc's key (a tee keeps its progress
+	// by key). Popping the trap's frame puts the key back ([`pop_frame`]).
+	let interrupted = std::mem::take(&mut vp.write_key);
+	vp.trap_keys.push(interrupted);
 	if let Some(saved) = restore {
 		super::mode::set_mode(&mut k.root, cx.store, vp, trap_mode);
 		vp.push_restore(*saved);
@@ -6929,7 +6983,67 @@ fn run_func_trap(
 
 #[cfg(test)]
 mod tests {
-	use super::{BASH_TIMEFORMAT, POSIX_TIMEFORMAT, time_report};
+	use std::sync::Arc;
+
+	use bstr::BString;
+
+	use super::{
+		BASH_TIMEFORMAT, Frame, FrameKind, POSIX_TIMEFORMAT, Root, ScriptKind, TrapKey, Vpid, Vproc,
+		WriteKey, pop_frame, time_report,
+	};
+	use crate::bash::{MemStore, fd::FdTable, signal::Signal};
+
+	/// A frame of a script of kind `what`, its op parked on a write
+	/// ([`super::proc::FrameFlags::write_parked`]).
+	fn parked(what: ScriptKind) -> Frame {
+		let mut f = Frame::new(None, 0, FrameKind::Script {
+			src: BString::default(),
+			pos: (0, 0),
+			aux: None,
+			what,
+			stdin: false,
+		});
+		f.flags.set_write_parked(true);
+		f
+	}
+
+	// Failure mode (review of #111 at a25f15f0, a test gap): popping a trap's
+	// frame whose own write waited gives the vproc a new key, which drops the
+	// trap's key and its write's progress, and then puts back the key the trap
+	// interrupted, whose write goes on. In the other order the interrupted
+	// command went on with a new key, and a tee wrote what it had written
+	// again. No script reaches this pop: `return`, `exit`, a cancel and Ctrl-C
+	// also drop the interrupted command (its frame gives the new key last),
+	// and the one zsh way, a signal function trap that returns non-zero (zsh
+	// `dotrapargs`), does not run here (`TRAPUSR1` is not called for USR1).
+	#[test]
+	fn popping_a_parked_trap_frame_puts_back_the_interrupted_key() {
+		let mut store = MemStore::new();
+		let mut root = Root::load(&mut store).unwrap();
+		let mut vp = Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false);
+		vp.frames.push(parked(ScriptKind::Run));
+		let interrupted: WriteKey = Arc::clone(&vp.write_key);
+		let trap = ScriptKind::Trap {
+			key:           TrapKey::Signal(Signal::Usr1),
+			status:        0,
+			cancel:        None,
+			return_target: None,
+			exit:          false,
+			returned:      false,
+		};
+		vp.frames.push(parked(trap));
+		vp.trap_keys.push(std::mem::take(&mut vp.write_key));
+		vp.trap_frames = 1;
+		let traps = Arc::clone(&vp.write_key);
+		pop_frame(&mut root, &mut store, &mut vp);
+		assert!(
+			Arc::ptr_eq(&vp.write_key, &interrupted),
+			"the interrupted command's key is not back (the trap's: {})",
+			Arc::ptr_eq(&vp.write_key, &traps)
+		);
+		assert!(vp.trap_keys.is_empty());
+		assert_eq!(Arc::strong_count(&traps), 1, "the trap's key is still held");
+	}
 
 	// Golden: bash 5.3.20 `time -p` and the default format.
 	#[test]
