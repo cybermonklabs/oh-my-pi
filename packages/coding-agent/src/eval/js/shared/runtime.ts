@@ -304,8 +304,8 @@ export class JsRuntime {
 	#installedPreludes = new Map<string, EvalPreludeSource>();
 	#disposed = false;
 	#runHookResolver = () => this.#als.getStore()?.hooks;
-	/** Abandons each run of this runtime that holds the realm's run slot (see {@link JsRuntime.dispose}). */
-	#abandonRuns = new Set<(reason: unknown) => void>();
+	/** This runtime's runs whose code has not settled; {@link JsRuntime.dispose} abandons them. */
+	#liveRuns = new Set<RunContext>();
 
 	#ownGlobal(key: string): void {
 		if (this.#ownedGlobalKeys.has(key)) return;
@@ -515,6 +515,7 @@ export class JsRuntime {
 	/** Invoke a callback inside this runtime's async run context. */
 	async runCallback<T>(runId: string, hooks: RuntimeHooks, callback: () => T | Promise<T>): Promise<T> {
 		this.#activateGlobals("run callback");
+		const leaveRun = enterGlobalRun(this.#globalOwner, "run callback");
 		const context: RunContext = {
 			runId,
 			hooks,
@@ -524,21 +525,25 @@ export class JsRuntime {
 			finalExpressionValue: undefined,
 			callOccurrences: new Map(),
 		};
-		return await this.#runExclusive(context, "run callback", undefined, callback);
+		this.#liveRuns.add(context);
+		try {
+			return await REALM_RUN.run(context, () => this.#als.run(context, callback));
+		} finally {
+			this.#liveRuns.delete(context);
+			this.#recordGlobals();
+			leaveRun();
+		}
 	}
 
-	/**
-	 * Run `code` in this runtime. When `signal` aborts before the code settles, the run is abandoned: it gives
-	 * the realm back at once, rejects with the abort reason, and its code is refused from then on.
-	 */
 	async run(
 		code: string,
 		filename: string | undefined,
 		hooks: RuntimeHooks,
-		options: { runId?: string; cwd?: string; localRoots?: Record<string, string>; signal?: AbortSignal } = {},
+		options: { runId?: string; cwd?: string; localRoots?: Record<string, string> } = {},
 	): Promise<unknown> {
 		this.#activateGlobals("run code");
 		this.#namespaceRevision++;
+		const leaveRun = enterGlobalRun(this.#globalOwner, "run code");
 		const context: RunContext = {
 			runId: options.runId ?? crypto.randomUUID(),
 			hooks,
@@ -549,84 +554,45 @@ export class JsRuntime {
 			finalExpressionValue: undefined,
 			callOccurrences: new Map(),
 		};
-		return await this.#runExclusive(context, "run code", options.signal, async () => {
-			const wrapped = await wrapCode(code);
-			// Compiling can wait (the first run loads Babel); a run abandoned meanwhile must evaluate nothing, since
-			// another run may own the realm's globals by now.
-			if (context.abandoned) throw abandonedRunError(context.abandoned.reason);
-			let value: unknown;
-			hooks.onEvaluate?.();
-			try {
-				value = indirectEval(wrapped.source, filename);
-			} catch (error) {
-				// The engine's own compile SyntaxError has no usable cell position; surface Babel's.
-				// Sync cells run inside indirectEval, so a SyntaxError may also be a runtime one
-				// (e.g. JSON.parse); only diagnose when the source itself fails to compile as a script.
-				if (error instanceof SyntaxError && !compiles(wrapped.source)) {
-					throw (await diagnoseCellSyntaxError(code)) ?? error;
-				}
-				throw error;
-			}
-			if (wrapped.finalExpressionReturned) {
-				const awaited = await awaitMaybePromise(value);
-				if (context.finalExpressionSet) {
-					const finalValue = context.finalExpressionValue;
-					context.finalExpressionSet = false;
-					context.finalExpressionValue = undefined;
-					return await awaitMaybePromise(finalValue);
-				}
-				return awaited;
-			}
-			return await awaitMaybePromise(value);
-		});
-	}
-
-	/**
-	 * Run `body` in `context` while this runtime holds the realm's run slot. The slot is given back when the body
-	 * settles, or at once when the run is abandoned: `signal` aborts or the runtime is disposed. In-process code
-	 * cannot be stopped, so a run whose code never settles would otherwise hold the slot, and lock every other
-	 * runtime of the realm out, until the process exits. An abandoned run records its globals, gives the slot
-	 * back and rejects with the abort reason. Its code may still resume later, under another run: every runtime
-	 * capability refuses it ({@link throwIfRunAbandoned}), and when it settles it records and releases nothing.
-	 */
-	async #runExclusive<T>(
-		context: RunContext,
-		action: string,
-		signal: AbortSignal | undefined,
-		body: () => T | Promise<T>,
-	): Promise<T> {
-		signal?.throwIfAborted();
-		const leaveRun = enterGlobalRun(this.#globalOwner, action);
-		const abandonment = Promise.withResolvers<never>();
-		// Observed at once: a body that throws synchronously never reaches the race below.
-		abandonment.promise.catch(() => {});
-		let holding = true;
-		const release = (): void => {
-			if (!holding) return;
-			holding = false;
-			signal?.removeEventListener("abort", onAbort);
-			this.#abandonRuns.delete(abandon);
+		this.#liveRuns.add(context);
+		try {
+			// The realm-wide run context lets every runtime refuse this run's code once it is abandoned.
+			return await REALM_RUN.run(context, () =>
+				this.#als.run(context, async () => {
+					const wrapped = await wrapCode(code);
+					// Compiling can wait (the first run loads Babel); a run abandoned meanwhile must evaluate nothing,
+					// since another run may own the realm's globals by now.
+					if (context.abandoned) throw abandonedRunError(context.abandoned.reason);
+					let value: unknown;
+					hooks.onEvaluate?.();
+					try {
+						value = indirectEval(wrapped.source, filename);
+					} catch (error) {
+						// The engine's own compile SyntaxError has no usable cell position; surface Babel's.
+						// Sync cells run inside indirectEval, so a SyntaxError may also be a runtime one
+						// (e.g. JSON.parse); only diagnose when the source itself fails to compile as a script.
+						if (error instanceof SyntaxError && !compiles(wrapped.source)) {
+							throw (await diagnoseCellSyntaxError(code)) ?? error;
+						}
+						throw error;
+					}
+					if (wrapped.finalExpressionReturned) {
+						const awaited = await awaitMaybePromise(value);
+						if (context.finalExpressionSet) {
+							const finalValue = context.finalExpressionValue;
+							context.finalExpressionSet = false;
+							context.finalExpressionValue = undefined;
+							return await awaitMaybePromise(finalValue);
+						}
+						return awaited;
+					}
+					return await awaitMaybePromise(value);
+				}),
+			);
+		} finally {
+			this.#liveRuns.delete(context);
 			this.#recordGlobals();
 			leaveRun();
-		};
-		const abandon = (reason: unknown): void => {
-			if (!holding) return;
-			const refuse = (): never => {
-				throw abandonedRunError(reason);
-			};
-			context.abandoned = { reason };
-			// The embedder's hooks are never called again, whichever path reaches them (stdio routing included).
-			context.hooks = { onText: refuse, onDisplay: refuse, callTool: refuse, onEvaluate: refuse };
-			release();
-			abandonment.reject(reason);
-		};
-		const onAbort = (): void => abandon(signal?.reason);
-		signal?.addEventListener("abort", onAbort, { once: true });
-		this.#abandonRuns.add(abandon);
-		try {
-			return await Promise.race([REALM_RUN.run(context, () => this.#als.run(context, body)), abandonment.promise]);
-		} finally {
-			release();
 		}
 	}
 
@@ -815,8 +781,17 @@ export class JsRuntime {
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
-		// Abandon the runs still in flight, so their slot is given back before this runtime's globals go.
-		for (const abandon of this.#abandonRuns) abandon(new Error("The JS runtime was disposed during this run"));
+		// Disposal releases realm run ownership, so a run abandoned by timeout cannot hold it forever.
+		if (activeGlobalRunOwner === this.#globalOwner) {
+			activeGlobalRunOwner = null;
+			activeGlobalRunDepth = 0;
+		}
+		// In-process code cannot be stopped, and a run's code that resumes later may meet another run in the realm:
+		// every runtime capability refuses it from now on ({@link throwIfRunAbandoned}), and the stdio routing drops
+		// its writes.
+		const reason = new Error("The JS runtime was disposed during this run");
+		for (const context of this.#liveRuns) context.abandoned = { reason };
+		this.#liveRuns.clear();
 		RUN_HOOK_RESOLVERS.delete(this.#runHookResolver);
 		for (const key of this.#ownedGlobalKeys) releaseGlobalKey(key, this.#globalOwner);
 		this.#ownedGlobalKeys.clear();
@@ -924,6 +899,8 @@ function enterGlobalRun(owner: symbol, action: string): () => void {
 	return () => {
 		if (left) return;
 		left = true;
+		// A disposed owner's late leave must not touch another owner's depth.
+		if (activeGlobalRunOwner !== owner) return;
 		activeGlobalRunDepth--;
 		if (activeGlobalRunDepth === 0) activeGlobalRunOwner = null;
 	};
@@ -962,9 +939,16 @@ function patchStdioOnce(): void {
 		PATCHED_STDIO_STREAMS.add(stream);
 		const original = stream.write.bind(stream) as (...args: unknown[]) => boolean;
 		const routed = (chunk: unknown, encoding?: unknown, callback?: unknown): boolean => {
+			const cb = typeof encoding === "function" ? encoding : callback;
+			// A disposed runtime's resolver is gone, so an abandoned run's write would reach the real stream. Drop it,
+			// as a live run's write never reaches the stream either; no throw, since host code (an RPC or print-mode
+			// writer a tool call of the run started) shares the run's async context and treats a throw as fatal.
+			if (REALM_RUN.getStore()?.abandoned) {
+				if (typeof cb === "function") (cb as (error?: Error | null) => void)();
+				return true;
+			}
 			const hooks = activeRunHooks();
 			if (!hooks) return original(chunk, encoding, callback);
-			const cb = typeof encoding === "function" ? encoding : callback;
 			const enc = typeof encoding === "string" ? (encoding as BufferEncoding) : undefined;
 			hooks.onText(chunkToString(chunk, enc));
 			if (typeof cb === "function") (cb as (error?: Error | null) => void)();

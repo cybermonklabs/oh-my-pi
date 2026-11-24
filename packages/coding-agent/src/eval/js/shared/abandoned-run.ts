@@ -1,8 +1,8 @@
 /**
  * The realm-wide record of which evaluated run the executing code belongs to, so that code of an abandoned run
- * is refused by every runtime of the realm. A run is abandoned when it timed out, was cancelled or its runtime
- * was disposed before its code settled: such code cannot be stopped in-process and may resume while another run
- * owns the realm.
+ * is refused by every runtime of the realm. A run is abandoned when its runtime is disposed before its code
+ * settled (a browser run discards its runtime when it times out or is cancelled with code still running): such
+ * code cannot be stopped in-process and may resume while another run owns the realm.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 // Subpath imports only, as in runtime.ts: the computer worker's readiness graph must not load pi_natives.
@@ -37,8 +37,8 @@ export function abandonedRunError(reason: unknown): Error {
 
 /**
  * Throws when the calling code belongs to an abandoned run. Every runtime capability (hooks, helpers, module
- * resolution) and every browser or computer run facade calls it, so such code cannot act inside the run that
- * owns the realm now.
+ * resolution) and every browser run facade calls it, so such code cannot act inside the run that owns the realm
+ * now. (The stdio routing drops such a run's writes instead of throwing.)
  */
 export function throwIfRunAbandoned(): void {
 	const abandoned = REALM_RUN.getStore()?.abandoned;

@@ -1646,6 +1646,12 @@ export class CmuxTab implements InProcessRunTab {
 		return new CmuxElementHandle(this, ref);
 	}
 
+	/** Drop the tab's runtime (a run abandoned mid-flight, or the tab closing); the next run gets a fresh one. */
+	discardRuntime(): void {
+		this.#runtime?.dispose();
+		this.#runtime = undefined;
+	}
+
 	ensureRuntime(session: SessionSnapshot): JsRuntime {
 		if (!this.#runtime) {
 			this.#runtime = new JsRuntime({

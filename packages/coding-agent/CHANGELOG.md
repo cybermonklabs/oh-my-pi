@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed one timed-out or cancelled cmux, Tern or inline-worker browser run, whose code was still waiting, breaking every later browser run on another tab until omp restarted (`Cannot initialize a JS runtime while another same-realm JS runtime is running`): an abandoned run now gives the process's JS realm back at once, and its code, if it wakes later, can no longer print, call tools or drive the tab of the run that owns the realm
+- Fixed one timed-out or cancelled cmux, Tern or inline-worker browser run, whose code was still waiting, breaking every later browser run on another tab until omp restarted (`Cannot initialize a JS runtime while another same-realm JS runtime is running`): such a run's runtime is now discarded, which gives the process's JS realm back, and its code, if it wakes later, can no longer print, write to stdout, call tools or drive the tab of the run that owns the realm. In-process runs of different cmux or Tern tabs now take turns instead of failing
 
 ## [18.18.6] - 2026-11-09
 

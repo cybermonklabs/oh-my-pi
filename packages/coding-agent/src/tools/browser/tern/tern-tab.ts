@@ -508,6 +508,12 @@ export class TernTab implements InProcessRunTab {
 		return this.#runtime;
 	}
 
+	/** Drop the tab's runtime (a run abandoned mid-flight, or the tab closing); the next run gets a fresh one. */
+	discardRuntime(): void {
+		this.#runtime?.dispose();
+		this.#runtime = undefined;
+	}
+
 	/** Publish the active run. */
 	setRunContext(context: InProcessRunContext): void {
 		this.#runContext = context;
