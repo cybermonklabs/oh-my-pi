@@ -1,0 +1,58 @@
+# The clippy row's baseline: the findings the release already has. The row applies the cut's rule
+# (Cut7's kit clippy gate: a crate fails only on findings beyond what its base already has) without
+# linting the base a second time: a crate reads FAIL for each finding beyond this file, KNOWN when
+# its findings are within it, and lists a line whose count fell here, to remove it from this file.
+#
+# One line a finding kind: crate<TAB>file<TAB>lint code<TAB>count<TAB>message. The lint code is the
+# diagnostic's code.code from `cargo clippy --message-format=json`; the message has no line or
+# column; the count is the number of places (file, line, column) with that code and message.
+#
+# To regenerate it from a release: dispatch sami-checks on the release commit, download that run's
+# sc-res-clippy artifact, and take its clippy-findings.txt (the same format, every finding of the
+# six crates). Drop the lines of findings being fixed, keep this header, and commit.
+#
+# From run 45380232583 on 509a2d77 (Cut8's release), less its 3 function_casts_as_integer findings,
+# which are being fixed.
+pi-natives	crates/pi-natives/src/desktop/linux/ax/menus.rs	clippy::items_after_test_module	1	items after a test module
+pi-natives	crates/pi-natives/src/desktop/linux/wayland/mod.rs	clippy::doc_markdown	2	item in documentation is missing backticks
+pi-natives	crates/pi-natives/src/desktop/linux/wayland/mod.rs	clippy::semicolon_if_nothing_returned	1	consider adding a `;` to the last statement for consistent formatting
+pi-natives	crates/pi-natives/src/desktop/linux/wayland/mod.rs	clippy::undocumented_unsafe_blocks	2	unsafe block missing a safety comment
+pi-natives	crates/pi-natives/src/desktop/linux/wayland/portal.rs	clippy::doc_markdown	2	item in documentation is missing backticks
+pi-natives	crates/pi-natives/src/pty.rs	clippy::ignore_without_reason	1	`#[ignore]` without reason
+pi-shell	crates/pi-shell/src/bash/vm/builtins/history/words.rs	clippy::literal_string_with_formatting_args	2	this looks like a formatting argument but it is not part of a formatting macro
+pi-shell	crates/pi-shell/src/bash/vm/zle/comp/complist/menu.rs	clippy::field_reassign_with_default	1	field assignment outside of initializer for an instance created with Default::default()
+pi-shell	crates/pi-shell/src/bash/vm/zle/comp/compmatch/tests.rs	clippy::cloned_ref_to_slice_refs	2	unnecessary use of `clone` to create a slice from a reference
+pi-shell	crates/pi-shell/src/bash/vm/zle/comp/compmatch/tests.rs	clippy::redundant_clone	1	redundant clone
+pi-shell	crates/pi-shell/src/bash/vm/zle/comp/tricky/tests.rs	clippy::byte_char_slices	1	can be more succinctly written as a byte str
+pi-shell	crates/pi-shell/src/bash/vm/zle/comp/tricky/tests.rs	clippy::ref_option	1	it is more idiomatic to use `Option<&T>` instead of `&Option<T>`
+pi-shell	crates/pi-shell/src/bash/vm/zle/widgets/misc.rs	clippy::map_unwrap_or	1	called `map(_).unwrap_or_default()` on an `Option` value
+pi-shell	crates/pi-shell/src/bash/vm/zle/widgets/textobjects.rs	clippy::literal_string_with_formatting_args	1	this looks like a formatting argument but it is not part of a formatting macro
+pi-shell	crates/pi-shell/src/bash/vm/zle/widgets/word.rs	clippy::map_unwrap_or	1	called `map(_).unwrap_or_default()` on an `Option` value
+pi-shell	crates/pi-shell/src/bash/vm/zsh/zwc.rs	clippy::or_fun_call	1	function call inside of `unwrap_or`
+pi-shell	crates/pi-shell/src/suites/vfs.rs	clippy::or_fun_call	1	function call inside of `map_or`
+pi-shell	crates/pi-shell/src/sys/tty.rs	clippy::redundant_clone	1	redundant clone
+pi-shell	crates/pi-shell/src/testkit/suites/zsh_mod_mapfile.rs	clippy::redundant_clone	1	redundant clone
+pi-shell	crates/pi-shell/src/testkit/suites/zsh_mod_p10k.rs	clippy::doc_markdown	2	item in documentation is missing backticks
+pi-shell	crates/pi-shell/src/testkit/suites/zsh_mod_pcre.rs	clippy::needless_raw_string_hashes	1	unnecessary hashes around raw string literal
+pi-shell	crates/pi-shell/src/testkit/suites/zsh_mod_private.rs	clippy::needless_raw_string_hashes	107	unnecessary hashes around raw string literal
+pi-shell	crates/pi-shell/src/testkit/suites/zsh_mod_regex.rs	clippy::needless_raw_string_hashes	3	unnecessary hashes around raw string literal
+pi-shell	crates/pi-shell/src/testkit/suites/zsh_mod_watch.rs	clippy::format_collect	1	use of `format!` to build up a string from an iterator
+pi-shell	crates/pi-shell/src/testkit/suites/zsh_mod_zutil.rs	clippy::needless_raw_string_hashes	54	unnecessary hashes around raw string literal
+pi-shell	crates/pi-shell/src/testkit/suites/zsh_parity.rs	clippy::literal_string_with_formatting_args	1	these look like formatting arguments but are not part of a formatting macro
+pi-shell	crates/pi-shell/src/testkit/suites/zsh_parity.rs	clippy::literal_string_with_formatting_args	1	this looks like a formatting argument but it is not part of a formatting macro
+pi-shell	crates/pi-shell/tests/comp_support/comptest.rs	clippy::semicolon_if_nothing_returned	1	consider adding a `;` to the last statement for consistent formatting
+pi-shell	crates/pi-shell/tests/obash.rs	clippy::format_collect	1	use of `format!` to build up a string from an iterator
+pi-shell	crates/pi-shell/tests/pty_support/mod.rs	clippy::missing_const_for_fn	3	this could be a `const fn`
+pi-shell	crates/pi-shell/tests/pty_support/vt.rs	clippy::map_unwrap_or	1	called `map(_).unwrap_or_default()` on an `Option` value
+pi-shell	crates/pi-shell/tests/pty_support/vt.rs	clippy::semicolon_if_nothing_returned	1	consider adding a `;` to the last statement for consistent formatting
+pi-shell	crates/pi-shell/tests/subshell_exit_trap_frames.rs	clippy::needless_raw_string_hashes	11	unnecessary hashes around raw string literal
+pi-shell	crates/pi-shell/tests/zle_vi_pty.rs	clippy::format_collect	1	use of `format!` to build up a string from an iterator
+pi-shell	crates/pi-shell/tests/zle_vi_pty.rs	clippy::literal_string_with_formatting_args	1	this looks like a formatting argument but it is not part of a formatting macro
+pi-shell	crates/pi-shell/tests/zsh_comp_y01.rs	clippy::literal_string_with_formatting_args	1	this looks like a formatting argument but it is not part of a formatting macro
+pi-shell	crates/pi-shell/tests/zsh_comp_y02.rs	clippy::doc_markdown	9	item in documentation is missing backticks
+pi-shell	crates/pi-shell/tests/zsh_comp_y03.rs	clippy::doc_markdown	4	item in documentation is missing backticks
+pi-shell	crates/pi-shell/tests/zsh_computil_args_pty.rs	clippy::byte_char_slices	1	can be more succinctly written as a byte str
+pi-shell	crates/pi-shell/tests/zsh_computil_args_pty.rs	clippy::format_push_string	1	`format!(..)` appended to existing `String`
+pi-shell	crates/pi-shell/tests/zsh_computil_args_pty.rs	clippy::or_fun_call	1	function call inside of `unwrap_or`
+pi-shell	crates/pi-shell/tests/zsh_mod_zftp.rs	clippy::assigning_clones	1	assigning the result of `ToOwned::to_owned()` may be inefficient
+pi-shell	crates/pi-shell/tests/zsh_zcompile.rs	clippy::needless_raw_string_hashes	1	unnecessary hashes around raw string literal

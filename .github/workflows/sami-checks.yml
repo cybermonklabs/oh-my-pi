@@ -31,10 +31,13 @@
 #   - macOS and Windows: platform-checks.yml (the fork's platform checks, a called workflow) builds
 #     pi-shell's tests once per platform on macos-15 and windows-2025 and runs them under nextest;
 #     the summary reads its own report (pc-report) as one unit per platform.
-#   - clippy: cargo clippy --tests --no-deps --keep-going -- -D warnings of pi-shell, pi-vcs,
-#     pi-vfs, pi-walker, pi-builtins and pi-natives, one unit per crate, then each crate again
-#     with an unused import planted as its control (.github/sami-checks/clippy.sh). It lints Linux
-#     code only; code built only for macOS or Windows is compiled, not linted, in the platform rows.
+#   - clippy: cargo clippy --tests --no-deps --keep-going --message-format=json -- -D warnings of
+#     pi-shell, pi-vcs, pi-vfs, pi-walker, pi-builtins and pi-natives, one unit per crate, then each
+#     crate again with an unused import planted as its control (.github/sami-checks/clippy.sh). A
+#     crate fails only on findings beyond .github/sami-checks/clippy-baseline.txt, the findings the
+#     release already has (the cut's rule, at no second build); its header says how to regenerate
+#     it. It lints Linux code only; code built only for macOS or Windows is compiled, not linted, in
+#     the platform rows.
 # The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
 # in the tools job (.github/sami-checks/tools.sh), on hosts .github/sami-checks/host.sh sets up.
 # sdk/rust/omp-rpc is its own cargo workspace and is not built here.

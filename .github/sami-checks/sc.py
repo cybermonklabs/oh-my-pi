@@ -9,7 +9,8 @@
   sc.py bun JUNIT LOG EXIT SECS ROW UNIT     one `bun test` run's result
   sc.py plain EXIT SECS ROW UNIT LOG         a command whose exit is its verdict (check:ts)
   sc.py clippy-crates METADATA CRATE...     "crate<TAB>dir<TAB>library root" a line, from `cargo metadata`
-  sc.py clippy LOG EXIT SECS CRATE DIR CONTROL_LOG CONTROL_FILE   one crate's clippy result
+  sc.py clippy LOG EXIT SECS CRATE DIR CONTROL_LOG CONTROL_FILE   one crate's clippy result against clippy-baseline.txt
+  sc.py clippy-baseline LOG CRATE DIR      one crate's findings as clippy-baseline.txt lines (to regenerate it)
   sc.py platforms PC OUT                   one result per platform from platform-checks' pc-report under PC
   sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout; exit 1 unless every row passed
   sc.py skip-forms TREE NOT_MARKERS        each print of TREE/crates that says skip is read or named (JSON)
@@ -110,7 +111,7 @@ ROWS = (
     ("check:ts", "checkts"),
     ("macOS: pi-shell, platform checks", "macos"),
     ("Windows: pi-shell, platform checks", "windows"),
-    ("clippy --tests -D warnings, per crate (failed: findings)", "clippy"),
+    ("clippy --tests -D warnings, per crate (failed: findings beyond clippy-baseline.txt)", "clippy"),
     ("skip prints the summary reads", "skipforms"),
 )
 
@@ -565,9 +566,11 @@ def parse_plain(exit_code, secs, row, unit, log):
                   failures=[] if ok else [f"{unit}: exit {exit_code}: " + " / ".join(l.strip() for l in tail if l.strip())[-600:]])
 
 
-# A finding: `file:line:col: warning|error[code]: message`, as cargo prints it with
-# --message-format=short (the kit's finding_lines pattern).
-FINDING = re.compile(r"^(?P<file>\S+?):\d+:\d+: (?:warning|error)(?:\[[^\]]*\])?: (?P<msg>.*)$")
+# The clippy row applies the cut's rule (Cut7's kit: a crate fails only on findings beyond what the
+# release already has) without linting the release a second time: the findings the release has
+# are checked in, one line per (crate, file, lint code, message) with a count. See the file's
+# header for how to regenerate it.
+CLIPPY_BASELINE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clippy-baseline.txt")
 
 
 def read_lines(path):
@@ -577,8 +580,56 @@ def read_lines(path):
         return None
 
 
-def findings(lines):
-    return [(m["file"], m["msg"]) for m in map(FINDING.match, lines) if m]
+def clippy_diagnostics(path):
+    """The findings in a `cargo clippy --message-format=json` log: {(file, code, message): {(line,
+    column)}}. A finding is a compiler message with a lint or error code (diagnostic `code.code`)
+    and a primary span. The same finding in several of a crate's targets (a module that the lib
+    test and a test binary both build) is one, by its place. None when there is no log."""
+    lines = read_lines(path)
+    if lines is None:
+        return None
+    out = {}
+    for line in lines:
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("reason") != "compiler-message":
+            continue
+        m = ev.get("message") or {}
+        code = (m.get("code") or {}).get("code")
+        span = next((s for s in m.get("spans") or () if s.get("is_primary")), None)
+        if code and span:
+            out.setdefault((span["file_name"], code, m.get("message", "")), set()).add((span["line_start"], span["column_start"]))
+    return out
+
+
+def read_clippy_baseline(path):
+    """{(crate, file, code, message): count} from the baseline file: `crate<TAB>file<TAB>code<TAB>
+    count<TAB>message` a line, `#` comments. A missing or malformed file stops sc.py: the crate then
+    has no result, and reads UNKNOWN."""
+    lines = read_lines(path)
+    if lines is None:
+        sys.exit(f"no clippy baseline at {path}")
+    base = {}
+    for n, line in enumerate(lines, 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split("\t", 4)
+        if len(parts) != 5 or not parts[3].isdigit():
+            sys.exit(f"{path}:{n}: want crate<TAB>file<TAB>code<TAB>count<TAB>message")
+        crate, f, code, count, msg = parts
+        base[(crate, f, code, msg)] = int(count)
+    return base
+
+
+def clippy_baseline_lines(log, crate, crate_dir):
+    """The baseline lines of one crate's findings in its log (the regeneration step's input)."""
+    own = {k: v for k, v in (clippy_diagnostics(log) or {}).items() if k[0].startswith(crate_dir.rstrip("/") + "/")}
+    for (f, code, msg), locs in sorted(own.items()):
+        print(f"{crate}\t{f}\t{code}\t{len(locs)}\t{msg}")
 
 
 def clippy_crates(metadata, crates):
@@ -596,44 +647,61 @@ def clippy_crates(metadata, crates):
         print(f"{c}\t{os.path.relpath(os.path.dirname(p['manifest_path']), root)}\t{os.path.relpath(lib, root) if lib else '-'}")
 
 
-def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file):
-    """One crate's clippy result. Its findings are the lines in files under its own directory: a
-    dependency's warnings, which --no-deps leaves at their own level, are not this crate's.
-    FAIL: exit 101 and findings, each named with its count. PASS: exit 0, no finding, and the
-    control run read the unused import clippy.sh planted in the crate's library root as a
-    finding. Anything else is UNKNOWN."""
-    def r(status, own=(), note=""):
-        counts = {}
-        for f, m in own:
-            counts[f"{f}: {m}"] = counts.get(f"{f}: {m}", 0) + 1
-        named = [k if n == 1 else f"{k} ({n} times)" for k, n in sorted(counts.items())]
-        return result("clippy", crate, "runner", status, exit_code, secs, failed=len(own), failures=named, note=note)
+def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, baseline_path=CLIPPY_BASELINE):
+    """One crate's clippy result, by the cut's rule against the baseline. Its findings are those in
+    files under its own directory (a dependency's are not this crate's). FAIL: a finding whose key
+    the baseline lacks, or a key with more places than the baseline counts, each place named
+    `file:line: code: message`. KNOWN: findings, each within the baseline. PASS: no finding. A
+    baseline key with fewer places here is listed for removal (baseline_fell), never a failure.
+    KNOWN and PASS also need the control run to read the unused import clippy.sh planted in the
+    crate's library root, a finding the baseline lacks. Anything else is UNKNOWN: no log, an exit
+    other than 0 or 101 (clippy did not finish), exit 101 with no finding of its own, exit 0 with
+    findings."""
+    base = {(f, code, msg): n for (c, f, code, msg), n in read_clippy_baseline(baseline_path).items() if c == crate}
+
+    def r(status, failures=(), note="", fell=()):
+        res = result("clippy", crate, "runner", status, exit_code, secs, failed=len(failures), failures=failures, note=note)
+        res["baseline_fell"] = list(fell)
+        return res
 
     if crate_dir == "-":
         return r("UNKNOWN", note=f"the tree has no package {crate}")
-    lines = read_lines(log)
-    if lines is None:
+    diags = clippy_diagnostics(log)
+    if diags is None:
         return r("UNKNOWN", note="no log")
-    own = [(f, m) for f, m in findings(lines) if f.startswith(crate_dir.rstrip("/") + "/")]
+    own = {k: v for k, v in diags.items() if k[0].startswith(crate_dir.rstrip("/") + "/")}
     try:
         code = int(exit_code)
     except ValueError:
         code = None
     if code not in (0, 101):
-        return r("UNKNOWN", own, f"exit {exit_code}: clippy did not finish" + (" (the time bound ended it)" if code == 124 else ""))
+        return r("UNKNOWN", note=f"exit {exit_code}: clippy did not finish" + (" (the time bound ended it)" if code == 124 else ""))
     if code == 101 and not own:
-        first = next((l for l in lines if l.startswith("error")), "no error line")
+        first = next((l for l in read_lines(log) or () if l.startswith("error")), "no error line")
         return r("UNKNOWN", note=f"exit 101 and no finding under {crate_dir}/, so it was not linted: {first[:300]}")
     if code == 0 and own:
-        return r("UNKNOWN", own, f"exit 0 with {len(own)} findings under -D warnings")
-    if own:
-        return r("FAIL", own)
-    ctl = read_lines(ctl_log)
-    if ctl is None:
-        return r("UNKNOWN", note="the control left no log, so a clean result proves nothing")
-    if not any(f == ctl_file and CLIPPY_CONTROL in m for f, m in findings(ctl)):
-        return r("UNKNOWN", note=f"the control's unused import planted in {ctl_file} was not read as a finding, so a clean result proves nothing")
-    return r("PASS")
+        return r("UNKNOWN", note=f"exit 0 with {sum(map(len, own.values()))} findings under -D warnings")
+    beyond, known = [], 0
+    for (f, lint, msg), places in sorted(own.items()):
+        b = base.get((f, lint, msg), 0)
+        if len(places) > b:
+            more = f" ({len(places)} here, {b} in the baseline)" if b else ""
+            beyond += [f"{f}:{line}: {lint}: {msg}{more}" for line, _ in sorted(places)]
+        else:
+            known += len(places)
+    fell = [f"{f}: {lint}: {msg} ({len(own.get((f, lint, msg), ()))} here, {b} in the baseline)"
+            for (f, lint, msg), b in sorted(base.items()) if len(own.get((f, lint, msg), ())) < b]
+    ctl = clippy_diagnostics(ctl_log)
+    caught = ctl is not None and any(f == ctl_file and lint == "unused_imports" and CLIPPY_CONTROL in msg for f, lint, msg in ctl)
+    said = "the planted control read as a finding beyond the baseline" if caught else (
+        "the control left no log" if ctl is None else f"the control's unused import planted in {ctl_file} was not read as a finding")
+    if beyond:
+        return r("FAIL", beyond, f"{len(beyond)} finding(s) beyond the baseline; {known} within it; {said}", fell)
+    if not caught:
+        return r("UNKNOWN", note=f"{said}, so a clean result proves nothing", fell=fell)
+    if known:
+        return r("KNOWN", note=f"{known} finding(s), each within the baseline; {said}", fell=fell)
+    return r("PASS", note=said, fell=fell)
 
 
 def read_kv(path):
@@ -1241,6 +1309,8 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
             for f in r["failures"]:
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}")
+            for f in r.get("baseline_fell", []):
+                details.append(f"- **{title}** `{r['unit']}`: fewer here than in the clippy baseline, remove it from the baseline: {f}")
             for f in r.get("self_skipped", []):
                 why = r.get("known_skips", {}).get(f)
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`" + (f": KNOWN ({why})" if why else ""))
@@ -1483,32 +1553,73 @@ def selftest():
         f.write("# c\n10 x\n600 x root\n")
     check("weights per user", (read_weights(wf, "runner")["x"], read_weights(wf, "root")["x"]), (10.0, 600.0))
 
-    # clippy: a crate's own findings fail it; a clean crate passes only when its control was caught.
+    # clippy, by the cut's rule against the checked-in baseline: a crate's own findings beyond the
+    # baseline fail it (a new key, or a key with more places), findings within it read KNOWN, a key
+    # with fewer places is listed for removal; a clean or known result needs its control caught.
     def write(name, text):
         p = os.path.join(d, name)
         with open(p, "w") as f:
             f.write(text)
         return p
 
-    own_f = "crates/pi-vfs/src/a.rs:3:5: error: redundant clone\n"
-    dep_f = "crates/pi-shell/src/b.rs:1:1: warning: unused variable: `x`\n"
-    ctl = write("ctl.log", f"crates/pi-vfs/src/lib.rs:90:1: error: unused import: `std::collections::BTreeMap as {CLIPPY_CONTROL}`\n")
+    def diag(f, line, code, msg, level="error"):
+        return json.dumps({"reason": "compiler-message", "message": {"message": msg, "level": level, "code": {"code": code},
+                           "spans": [{"file_name": f, "line_start": line, "column_start": 5, "is_primary": True}]}}) + "\n"
+
+    hashes = "unnecessary hashes around raw string literal"
+    own_a = diag("crates/pi-vfs/src/a.rs", 3, "clippy::needless_raw_string_hashes", hashes)
+    own_b = diag("crates/pi-vfs/src/a.rs", 9, "clippy::needless_raw_string_hashes", hashes)
+    cast = diag("crates/pi-vfs/src/b.rs", 86, "function_casts_as_integer", "direct cast of function item into an integer")
+    dep_f = diag("crates/pi-shell/src/b.rs", 1, "unused_variables", "unused variable: `x`", "warning")
+    # The same place twice (a module two targets build) is one finding.
+    again = own_a
+    noise = '    Checking pi-vfs v0.1.0\n{"reason":"compiler-artifact"}\n' + json.dumps(
+        {"reason": "compiler-message", "message": {"message": "aborting due to 2 previous errors", "code": None, "spans": []}}) + "\n"
+    ctl = write("ctl.log", diag("crates/pi-vfs/src/lib.rs", 90, "unused_imports",
+                                f"unused import: `std::collections::BTreeMap as {CLIPPY_CONTROL}`"))
     noctl = write("noctl.log", "    Checking pi-vfs v0.1.0\n")
+    bl = write("baseline.txt", "# a comment\n"
+               f"pi-vfs\tcrates/pi-vfs/src/a.rs\tclippy::needless_raw_string_hashes\t1\t{hashes}\n"
+               f"pi-vfs\tcrates/pi-vfs/src/c.rs\tclippy::doc_markdown\t2\titem in documentation is missing backticks\n"
+               f"pi-shell\tcrates/pi-shell/src/b.rs\tunused_variables\t1\tunused variable: `x`\n")
 
-    def cl(text, ex, c=ctl):
-        return parse_clippy(write("c.log", text), str(ex), 1, "pi-vfs", "crates/pi-vfs", c, "crates/pi-vfs/src/lib.rs")
+    def cl(text, ex, c=ctl, base=bl):
+        return parse_clippy(write("c.log", text), str(ex), 1, "pi-vfs", "crates/pi-vfs", c, "crates/pi-vfs/src/lib.rs", base)
 
-    r = cl(dep_f + own_f + own_f + "error: could not compile `pi-vfs`\n", 101)
-    check("clippy fail names its own findings only", (r["status"], r["failures"], r["failed"]),
-          ("FAIL", ["crates/pi-vfs/src/a.rs: redundant clone (2 times)"], 2))
-    check("clippy clean with its control caught", cl(dep_f + "    Finished\n", 0)["status"], "PASS")
-    check("clippy clean with its control not caught", cl("    Finished\n", 0, noctl)["status"], "UNKNOWN")
-    check("clippy clean with no control log", cl("    Finished\n", 0, os.path.join(d, "absent"))["status"], "UNKNOWN")
-    check("clippy killed", cl(own_f, 137)["status"], "UNKNOWN")
-    check("clippy ended by its bound", "time bound" in cl("", 124)["note"], True)
-    check("clippy 101 with no finding of its own", cl(dep_f + "error: failed to run custom build command for `x`\n", 101)["status"], "UNKNOWN")
-    check("clippy 0 with a finding", cl(own_f, 0)["status"], "UNKNOWN")
-    check("clippy crate the tree lacks", parse_clippy(ctl, "0", 1, "pi-x", "-", ctl, "-")["status"], "UNKNOWN")
+    r = cl(noise + dep_f + own_a + again + cast, 101)
+    check("clippy: a key the baseline lacks fails, named by place and lint",
+          (r["status"], r["failures"], r["baseline_fell"]),
+          ("FAIL", ["crates/pi-vfs/src/b.rs:86: function_casts_as_integer: direct cast of function item into an integer"],
+           [f"crates/pi-vfs/src/c.rs: clippy::doc_markdown: item in documentation is missing backticks (0 here, 2 in the baseline)"]))
+    r = cl(own_a + own_b, 101)
+    check("clippy: a key with more places than the baseline fails, each place named",
+          (r["status"], r["failures"]),
+          ("FAIL", [f"crates/pi-vfs/src/a.rs:3: clippy::needless_raw_string_hashes: {hashes} (2 here, 1 in the baseline)",
+                    f"crates/pi-vfs/src/a.rs:9: clippy::needless_raw_string_hashes: {hashes} (2 here, 1 in the baseline)"]))
+    r = cl(dep_f + own_a, 101)
+    check("clippy: findings within the baseline read KNOWN, a fallen key listed for removal",
+          (r["status"], r["failed"], len(r["baseline_fell"]), "planted control read" in r["note"]), ("KNOWN", 0, 1, True))
+    check("clippy: clean with its control caught", cl(dep_f, 0)["status"], "PASS")
+    check("clippy: findings within the baseline, control not caught", cl(own_a, 101, noctl)["status"], "UNKNOWN")
+    check("clippy: clean with no control log", cl("", 0, os.path.join(d, "absent"))["status"], "UNKNOWN")
+    check("clippy: a new finding fails even with the control not caught", cl(cast, 101, noctl)["status"], "FAIL")
+    check("clippy: killed", cl(own_a, 137)["status"], "UNKNOWN")
+    check("clippy: ended by its bound", "time bound" in cl("", 124)["note"], True)
+    check("clippy: 101 with no finding of its own", cl(dep_f + "error: failed to run custom build command for `x`\n", 101)["status"], "UNKNOWN")
+    check("clippy: 0 with a finding", cl(own_a, 0)["status"], "UNKNOWN")
+    check("clippy: no log", parse_clippy(os.path.join(d, "absent"), "101", 1, "pi-vfs", "crates/pi-vfs", ctl, "x", bl)["status"], "UNKNOWN")
+    check("clippy: a crate the tree lacks", parse_clippy(ctl, "0", 1, "pi-x", "-", ctl, "-", bl)["status"], "UNKNOWN")
+    check("clippy: the short format names no lint code, so it reads nothing",
+          clippy_diagnostics(write("short.log", "crates/pi-vfs/src/a.rs:3:5: error: unnecessary hashes around raw string literal\n")), {})
+    # The baseline lines a log gives (the regeneration step), read back as the same baseline.
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        clippy_baseline_lines(write("c.log", noise + dep_f + own_a + own_b + again + cast), "pi-vfs", "crates/pi-vfs")
+    regen = write("regen.txt", buf.getvalue())
+    check("clippy: regenerated baseline lines", read_clippy_baseline(regen),
+          {("pi-vfs", "crates/pi-vfs/src/a.rs", "clippy::needless_raw_string_hashes", hashes): 2,
+           ("pi-vfs", "crates/pi-vfs/src/b.rs", "function_casts_as_integer", "direct cast of function item into an integer"): 1})
+    check("clippy: against its own regenerated baseline, a log reads KNOWN",
+          cl(noise + own_a + own_b + cast, 101, base=regen)["status"], "KNOWN")
 
     # The platform rows: the platform checks' own report, read per platform.
     commit = "c" * 40
@@ -1582,7 +1693,8 @@ def selftest():
     check("summary row of the silent unit", "| pi-shell set (root) | **UNKNOWN** | 1 / 0 / 0 / 1 |" in out, True)
     check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 / 0 |" in out, True)
     check("summary names the silent clippy crate UNKNOWN", "`pi-vfs` (runner): UNKNOWN: no result" in out, True)
-    check("summary row of the silent clippy crate", "| clippy --tests -D warnings, per crate (failed: findings) | **UNKNOWN** | 5 / 0 / 0 / 1 |" in out, True)
+    check("summary row of the silent clippy crate",
+          "| clippy --tests -D warnings, per crate (failed: findings beyond clippy-baseline.txt) | **UNKNOWN** | 5 / 0 / 0 / 1 |" in out, True)
     check("summary row of the silent platform", "| Windows: pi-shell, platform checks | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
     check("summary row of a platform that reported", "| macOS: pi-shell, platform checks | **PASS** | 1 / 0 / 0 / 0 |" in out, True)
     # And the same with every unit present passes.
@@ -2114,6 +2226,8 @@ def main(argv):
         clippy_crates(a[0], a[1:])
     elif c == "clippy":
         print(json.dumps(parse_clippy(*a)))
+    elif c == "clippy-baseline":
+        clippy_baseline_lines(*a)
     elif c == "platforms":
         cmd_platforms(*a)
     elif c == "summary":
