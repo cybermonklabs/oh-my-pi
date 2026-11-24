@@ -24,7 +24,7 @@ use pi_vfs::{Metadata, child_path, is_virtual_path, normalize_lexically, parent_
 use thiserror::Error;
 use uucore::{display::Quotable, parser::shortcut_value_parser::ShortcutValueParser};
 
-use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes};
+use crate::host::{Host, Utility, format_usage, matches_parser, os_bytes, strip_errno};
 
 macro_rules! show_error {
 	($host:expr, $($args:tt)+) => {{
@@ -83,9 +83,9 @@ use uucore::{display::Quotable, safe_traversal::{DirFd, SymlinkBehavior}};
 
 use super::{
 	Host,
-	InteractiveMode, Options, handle_error_with_force, is_dir_empty, is_missing_under_force, prompt_descend,
-	remove_dir_with_special_cases, remove_file, show_permission_denied_error, show_removal_error,
-	verbose_removed_directory, verbose_removed_file,
+	InteractiveMode, Options, is_dir_empty, is_missing_under_force, prompt_descend,
+	remove_dir_with_special_cases, remove_file, remove_unreadable_dir, report_unless_missing,
+	show_removal_error, verbose_removed_directory, verbose_removed_file,
 };
 
 #[inline]
@@ -200,14 +200,7 @@ pub fn safe_remove_file(host: &mut Host,
 			Some(false)
 		},
 		Err(e) if is_missing_under_force(&e, options) => Some(false),
-		Err(e) => {
-			if e.kind() == std::io::ErrorKind::PermissionDenied {
-				show_error!(host, "cannot remove {}: Permission denied", path.quote());
-			} else {
-				let _ = show_removal_error(host, e, path);
-			}
-			Some(true)
-		},
+		Err(e) => Some(show_removal_error(host, e, path)),
 	}
 }
 
@@ -233,41 +226,12 @@ pub fn safe_remove_empty_dir(host: &mut Host,
 			Some(false)
 		},
 		Err(e) if is_missing_under_force(&e, options) => Some(false),
-		Err(e) => {
-			show_error!(host, "cannot remove {}: {e}", path.quote());
-			Some(true)
-		},
+		Err(e) => Some(show_removal_error(host, e, path)),
 	}
-}
-
-/// Helper to handle permission denied errors
-fn handle_permission_denied(host: &mut Host, 
-	dir_fd: &DirFd,
-	entry_name: &OsStr,
-	entry_path: &Path,
-	options: &Options,
-) -> bool {
-	// When we can't open a subdirectory due to permission denied,
-	// try to remove it directly (it might be empty).
-	// This matches GNU rm behavior with -f flag.
-	if let Err(remove_err) = dir_fd.unlink_at(entry_name, true) {
-		if is_missing_under_force(&remove_err, options) {
-			return false;
-		}
-		// The directory is not empty (or another error) and we can't read it
-		// to remove its contents. Report the original permission denied error.
-		// This matches GNU rm behavior — the real problem is we lack
-		// permission to traverse the directory.
-		show_permission_denied_error(host, entry_path);
-		return true;
-	}
-	// Successfully removed empty directory
-	verbose_removed_directory(host, entry_path, options);
-	false
 }
 
 /// Helper to handle unlink operation with error reporting
-fn handle_unlink(host: &mut Host, 
+fn handle_unlink(host: &mut Host,
 	dir_fd: &DirFd,
 	entry_name: &OsStr,
 	entry_path: &Path,
@@ -275,19 +239,14 @@ fn handle_unlink(host: &mut Host,
 	options: &Options,
 ) -> bool {
 	if let Err(e) = dir_fd.unlink_at(entry_name, is_dir) {
-		if is_missing_under_force(&e, options) {
-			return false;
-		}
-		show_error!(host, "cannot remove {}: {e}", entry_path.quote());
-		true
-	} else {
-		if is_dir {
-			verbose_removed_directory(host, entry_path, options);
-		} else {
-			verbose_removed_file(host, entry_path, options);
-		}
-		false
+		return report_unless_missing(host, e, entry_path, options);
 	}
+	if is_dir {
+		verbose_removed_directory(host, entry_path, options);
+	} else {
+		verbose_removed_file(host, entry_path, options);
+	}
+	false
 }
 
 /// Removes a native host directory tree with descriptor-relative traversal.
@@ -318,31 +277,27 @@ pub fn safe_remove_dir_recursive(host: &mut Host,
 
 	// Open the operand as the directory the lstat found, not following a
 	// symlink there: one swapped in since the lstat is refused (`ENOTDIR`)
-	// instead of emptied.
+	// instead of emptied. One that cannot be opened or listed is removed if
+	// it is empty, as GNU rm does.
 	let dir_fd = match open_stat_dir(&path_fs, initial_id) {
 		Ok(fd) => fd,
 		Err(e) if is_missing_under_force(&e, options) => return false,
 		Err(e) => {
-			// If we can't open the directory for safe traversal,
-			// handle the error appropriately and try to remove if possible
-			if e.kind() == std::io::ErrorKind::PermissionDenied {
-				// Try to remove the directory directly if it's empty
-				match host.fs().remove_dir(&path_fs) {
-					Ok(()) => {
-						verbose_removed_directory(host, path, options);
-						return false;
-					},
-					Err(gone) if is_missing_under_force(&gone, options) => return false,
-					// If we can't read the directory AND can't remove it,
-					// show permission denied error for GNU compatibility
-					Err(_) => return show_permission_denied_error(host, path),
-				}
-			}
-			return show_removal_error(host, e, path);
+			let removal = host.fs().remove_dir(&path_fs);
+			return remove_unreadable_dir(host, path, options, e, removal);
+		},
+	};
+	let entries = match dir_fd.read_dir() {
+		Ok(entries) => entries,
+		Err(e) if is_missing_under_force(&e, options) => return false,
+		Err(e) => {
+			drop(dir_fd);
+			let removal = host.fs().remove_dir(&path_fs);
+			return remove_unreadable_dir(host, path, options, e, removal);
 		},
 	};
 
-	let error = safe_remove_dir_recursive_impl(host, path, dir_fd, options);
+	let error = safe_remove_dir_recursive_impl(host, path, dir_fd, entries, options);
 
 	// After processing all children, remove the directory itself
 	if error {
@@ -493,14 +448,21 @@ fn reopen_parent(child_fd: &DirFd, dev: u64, ino: u64) -> std::io::Result<DirFd>
 	}
 }
 
-/// Empties the directory open as `cur_fd`, whose path is `path`, leaving the
-/// directory itself for the caller. Returns whether any error occurred.
+/// Empties the directory open as `cur_fd`, whose path is `path` and whose
+/// listing is `entries`, leaving the directory itself for the caller. Returns
+/// whether any error occurred.
 ///
 /// Walks with an explicit stack: recursing once per level overflows the
 /// thread's stack on a tree tens of thousands of levels deep, and that kills
 /// the whole process rather than failing the command.
 #[cfg(not(target_os = "redox"))]
-pub fn safe_remove_dir_recursive_impl(host: &mut Host, path: &Path, mut cur_fd: DirFd, options: &Options) -> bool {
+pub fn safe_remove_dir_recursive_impl(
+	host: &mut Host,
+	path: &Path,
+	mut cur_fd: DirFd,
+	entries: Vec<OsString>,
+	options: &Options,
+) -> bool {
 	let (mut dev, mut ino) = match cur_fd.metadata() {
 		Ok(metadata) => {
 			let info = metadata.file_info();
@@ -508,19 +470,7 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, path: &Path, mut cur_fd: 
 		},
 		Err(e) => return show_removal_error(host, e, path),
 	};
-	// Read directory entries using safe traversal
-	let mut entries = match cur_fd.read_dir() {
-		Ok(entries) => entries.into_iter(),
-		Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-			if !options.force {
-				show_permission_denied_error(host, path);
-			}
-			return !options.force;
-		},
-		Err(e) => {
-			return handle_error_with_force(host, e, path, options);
-		},
-	};
+	let mut entries = entries.into_iter();
 
 	let mut error = false;
 	let mut path_buf = path.as_os_str().as_bytes().to_vec();
@@ -576,7 +526,7 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, path: &Path, mut cur_fd: 
 			let entry_stat = match cur_fd.stat_at(&entry_name, SymlinkBehavior::NoFollow) {
 				Ok(stat) => stat,
 				Err(e) => {
-					error |= handle_error_with_force(host, e, path_of(&path_buf), options);
+					error |= report_unless_missing(host, e, path_of(&path_buf), options);
 					break 'entry false;
 				},
 			};
@@ -609,30 +559,29 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, path: &Path, mut cur_fd: 
 
 			// Open the just-stat'd subdirectory as that directory, not
 			// following a symlink: one swapped in since the stat makes the open
-			// fail instead of taking the walk off the tree.
+			// fail instead of taking the walk off the tree. One that cannot be
+			// opened or listed is removed if it is empty, as GNU rm does.
 			#[cfg(test)]
 			crate::host::run_hook(path_of(&path_buf));
 			let child_fd = match open_stat_subdir(&cur_fd, &entry_name, entry_id) {
 				Ok(fd) => fd,
+				Err(e) if is_missing_under_force(&e, options) => break 'entry false,
 				Err(e) => {
-					if e.kind() == std::io::ErrorKind::PermissionDenied {
-						error |= handle_permission_denied(host, &cur_fd, &entry_name, path_of(&path_buf), options);
-					} else {
-						error |= handle_error_with_force(host, e, path_of(&path_buf), options);
-					}
+					let removal = cur_fd.unlink_at(&entry_name, true);
+					error |= remove_unreadable_dir(host, path_of(&path_buf), options, e, removal);
 					break 'entry false;
 				},
 			};
 
-			let (child_entries, child_error) = match child_fd.read_dir() {
-				Ok(child_entries) => (child_entries.into_iter(), false),
-				Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-					if !options.force {
-						show_permission_denied_error(host, path_of(&path_buf));
-					}
-					(Vec::new().into_iter(), !options.force)
+			let child_entries = match child_fd.read_dir() {
+				Ok(child_entries) => child_entries.into_iter(),
+				Err(e) if is_missing_under_force(&e, options) => break 'entry false,
+				Err(e) => {
+					drop(child_fd);
+					let removal = cur_fd.unlink_at(&entry_name, true);
+					error |= remove_unreadable_dir(host, path_of(&path_buf), options, e, removal);
+					break 'entry false;
 				},
-				Err(e) => (Vec::new().into_iter(), handle_error_with_force(host, e, path_of(&path_buf), options)),
 			};
 
 			// Suspend this directory and empty the subdirectory first.
@@ -641,7 +590,7 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, path: &Path, mut cur_fd: 
 				dev,
 				ino,
 				entries: std::mem::replace(&mut entries, child_entries),
-				error: std::mem::replace(&mut error, child_error),
+				error: std::mem::replace(&mut error, false),
 				entry_name,
 				entry_mode: entry_stat.st_mode as libc::mode_t,
 				path_len: parent_len,
@@ -660,7 +609,13 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, path: &Path, mut cur_fd: 
 }
 
 #[cfg(target_os = "redox")]
-pub fn safe_remove_dir_recursive_impl(host: &mut Host, _path: &Path, _dir_fd: DirFd, _options: &Options) -> bool {
+pub fn safe_remove_dir_recursive_impl(
+	host: &mut Host,
+	_path: &Path,
+	_dir_fd: DirFd,
+	_entries: Vec<OsString>,
+	_options: &Options,
+) -> bool {
 	// safe_traversal stat_at is not supported on Redox
 	// This shouldn't be called on Redox, but provide a stub for compilation
 	true // Return error
@@ -761,13 +716,16 @@ fn verbose_removed_directory(host: &mut Host, path: &Path, options: &Options) {
 	}
 }
 
-/// Helper function to show error with context and return error status
+/// Reports that `path` could not be removed, with GNU's `strerror` text for
+/// `error`; a filesystem's permission refusal that carries no OS error reads
+/// as EACCES does. Returns the error status, `true`.
 fn show_removal_error(host: &mut Host, error: io::Error, path: &Path) -> bool {
-	if error.kind() == io::ErrorKind::PermissionDenied {
-		show_error!(host, "cannot remove {}: Permission denied", path.quote());
+	let reason = if error.kind() == io::ErrorKind::PermissionDenied && error.raw_os_error().is_none() {
+		"Permission denied".to_owned()
 	} else {
-		show_error!(host, "cannot remove {}: {error}", path.quote());
-	}
+		strip_errno(&error)
+	};
+	show_error!(host, "cannot remove {}: {reason}", path.quote());
 	true
 }
 
@@ -779,6 +737,7 @@ fn show_permission_denied_error(host: &mut Host, path: &Path) -> bool {
 
 /// Whether `e` says the entry is already gone, which `-f` ignores as GNU rm
 /// does: another process may remove part of the tree while it is walked.
+/// Nothing else is ignored, under `-f` or not.
 ///
 /// As in GNU rm, a later `-i`, `-I` or `--interactive=always|once` cancels
 /// that; the parser then leaves an interactive mode other than `Never`.
@@ -788,19 +747,45 @@ fn is_missing_under_force(e: &io::Error, options: &Options) -> bool {
 		&& matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }
 
-/// Helper to handle errors with force mode consideration
-fn handle_error_with_force(host: &mut Host, e: io::Error, path: &Path, options: &Options) -> bool {
-	// Permission denied errors should be shown even in force mode
-	// This matches GNU rm behavior
-	if e.kind() == io::ErrorKind::PermissionDenied {
-		show_permission_denied_error(host, path);
-		return true;
-	}
+/// Reports `e` for `path` unless `-f` ignores it ([`is_missing_under_force`]).
+/// Returns whether it was reported, which is the error status.
+fn report_unless_missing(host: &mut Host, e: io::Error, path: &Path, options: &Options) -> bool {
+	!is_missing_under_force(&e, options) && show_removal_error(host, e, path)
+}
 
-	if !options.force {
-		show_error!(host, "cannot remove {}: {e}", path.quote());
+/// GNU rm's answer for the directory `path` it could not open or list
+/// (`read`): it tries to remove it all the same, as it may be empty, and
+/// `removal` is that attempt. A removal that succeeds, or that `-f` ignores,
+/// is no error. One refused because the directory is not empty says less than
+/// why it could not be read, so that reason is reported; any other refusal is
+/// reported as itself. Returns the error status.
+#[cfg(unix)]
+fn remove_unreadable_dir(
+	host: &mut Host,
+	path: &Path,
+	options: &Options,
+	read: io::Error,
+	removal: io::Result<()>,
+) -> bool {
+	match removal {
+		Ok(()) => {
+			verbose_removed_directory(host, path, options);
+			false
+		},
+		Err(e) if is_missing_under_force(&e, options) => false,
+		Err(e)
+			if matches!(
+				e.kind(),
+				io::ErrorKind::DirectoryNotEmpty
+					| io::ErrorKind::IsADirectory
+					| io::ErrorKind::NotADirectory
+					| io::ErrorKind::AlreadyExists
+			) =>
+		{
+			show_removal_error(host, read, path)
+		},
+		Err(e) => show_removal_error(host, e, path),
 	}
-	!options.force
 }
 
 /// Removes the empty directory `fs_path`.
@@ -1410,18 +1395,9 @@ pub fn remove(host: &mut Host, files: &[&OsStr], options: &Options) -> bool {
 				}
 			},
 
-			Err(_e) => {
-				// TODO: actually print out the specific error
-				// TODO: When the error is not about missing files
-				// (e.g., permission), even rm -f should fail with
-				// outputting the error, but there's no easy way.
-				if options.force {
-					false
-				} else {
-					show_error!(host, "{}", RmError::CannotRemoveNoSuchFile(filename.to_os_string()));
-					true
-				}
-			},
+			// GNU rm: -f ignores an operand that is already gone, and nothing
+			// else; any other reason it cannot be looked up is reported.
+			Err(e) => !is_missing_under_force(&e, options) && show_removal_error(host, e, file),
 		}
 		.bitor(had_err);
 	}
@@ -1565,10 +1541,7 @@ fn remove_dir_recursive_with_provider(
 			// Something vanished under the call; the walk below removes
 			// whatever is left, and finds nothing if the tree is gone.
 			Err(e) if is_missing_under_force(&e, options) => {},
-			Err(e) => {
-				show_error!(host, "cannot remove {}: {e}", path.quote());
-				return true;
-			},
+			Err(e) => return show_removal_error(host, e, path),
 		}
 	}
 
@@ -1606,7 +1579,7 @@ fn remove_dir_recursive_with_provider(
 				};
 			},
 			Err(e) => {
-				error |= handle_error_with_force(host, e, path, options);
+				error |= report_unless_missing(host, e, path, options);
 				break;
 			},
 		}
@@ -2431,6 +2404,154 @@ mod tests {
 		// Without -f (and without a terminal to prompt on) the removal must
 		// report exactly the same.
 		assert_eq!(run("-r"), Some((code, err)));
+	}
+
+	/// GNU rm -f ignores an operand that is already gone, by a missing name or
+	/// by a path through a file, and nothing else; without -f each is reported
+	/// under its own reason.
+	#[cfg(unix)]
+	#[test]
+	fn missing_entries_are_silent_only_under_force() {
+		let cwd = tempdir().unwrap();
+		std::fs::write(cwd.path().join("file"), b"").unwrap();
+		let run = |args: &[&str]| {
+			let (code, capture) = run_util::<Rm>(args, "", cwd.path());
+			(code, capture.err())
+		};
+
+		for flags in ["-f", "-rf"] {
+			for operand in ["missing", "file/x"] {
+				assert_eq!(run(&[flags, operand]), (0, String::new()), "{flags} {operand}");
+			}
+		}
+		assert_eq!(run(&["missing"]), (1, "rm: cannot remove 'missing': No such file or directory\n".to_owned()));
+		assert_eq!(run(&["file/x"]), (1, "rm: cannot remove 'file/x': Not a directory\n".to_owned()));
+		assert!(cwd.path().join("file").is_file());
+	}
+
+	/// GNU rm reports an operand in a directory it may not search under that
+	/// reason, with -f or without: -f ignores only an operand that is gone. A
+	/// directory it may not read is removed if it is empty, and reported if
+	/// not.
+	#[cfg(unix)]
+	#[test]
+	fn force_reports_what_it_may_not_look_up_or_read() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let cwd = tempdir().unwrap();
+		let dirs = ["locked", "tree/empty", "tree/full"];
+		for dir in dirs {
+			std::fs::create_dir_all(cwd.path().join(dir)).unwrap();
+		}
+		std::fs::write(cwd.path().join("locked/x"), b"").unwrap();
+		std::fs::write(cwd.path().join("tree/full/f"), b"").unwrap();
+		let set_mode = |mode| {
+			for dir in dirs {
+				let _ = std::fs::set_permissions(cwd.path().join(dir), std::fs::Permissions::from_mode(mode));
+			}
+		};
+		set_mode(0o000);
+		// A privileged user searches and reads them regardless; nothing to test then.
+		if std::fs::symlink_metadata(cwd.path().join("locked/x")).is_ok() {
+			set_mode(0o755);
+			eprintln!("skipped: this user may search a directory of mode 000");
+			return;
+		}
+		let run = |args: &[&str]| {
+			let (code, capture) = run_util::<Rm>(args, "", cwd.path());
+			(code, capture.err())
+		};
+		let lookups = [&["-f", "locked/x"][..], &["-rf", "locked/x"], &["-r", "locked/x"], &["locked/x"]].map(run);
+		let tree = run(&["-rf", "tree"]);
+		set_mode(0o755);
+
+		for (args, result) in ["-f", "-rf", "-r", "(none)"].iter().zip(lookups) {
+			assert_eq!(result, (1, "rm: cannot remove 'locked/x': Permission denied\n".to_owned()), "{args}");
+		}
+		assert!(cwd.path().join("locked/x").exists());
+		assert_eq!(tree, (1, "rm: cannot remove 'tree/full': Permission denied\n".to_owned()));
+		assert!(!cwd.path().join("tree/empty").exists());
+		assert!(cwd.path().join("tree/full/f").exists());
+	}
+
+	/// GNU rm -f reports a directory it has no file descriptor left to open
+	/// or list (EMFILE) under that reason, as it reports every error but a
+	/// missing entry, rather than skipping it and then reporting the directory
+	/// above as not empty. The open-file limit belongs to the whole process,
+	/// so the removal runs in a process of its own.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn force_reports_a_directory_it_has_no_descriptor_to_open() {
+		if !crate::own_process::own_process() {
+			return;
+		}
+		let cwd = tempdir().unwrap();
+		// A chain deeper than the descriptors left below: the walk holds one
+		// for each level it has entered, and one more while it lists one.
+		let deepest = (0..12).fold(cwd.path().join("tree"), |dir, level| dir.join(format!("d{level}")));
+		std::fs::create_dir_all(&deepest).unwrap();
+		std::fs::write(deepest.join("f"), b"").unwrap();
+		let (mut host, capture) = Host::for_test(Rm::NAME, "", cwd.path());
+		let rm = Rm::try_parse_from(["rm", "-rf", "tree"]).unwrap();
+
+		// Four descriptors are left above the highest one open now.
+		let highest = std::fs::read_dir("/proc/self/fd")
+			.unwrap()
+			.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<libc::rlim_t>().ok())
+			.max()
+			.unwrap();
+		let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+		// SAFETY: getrlimit and setrlimit only read and write `limit`.
+		assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+		let saved = limit.rlim_cur;
+		limit.rlim_cur = highest + 1 + 4;
+		// SAFETY: as above.
+		assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+		let code = rm.run(&mut host);
+		limit.rlim_cur = saved;
+		// SAFETY: as above.
+		assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+		let err = capture.err();
+		assert_eq!(code, 1, "{err}");
+		assert_eq!(err.lines().count(), 1, "{err}");
+		let named = err
+			.strip_prefix("rm: cannot remove '")
+			.and_then(|rest| rest.strip_suffix("': Too many open files\n"));
+		assert!(named.is_some_and(|path| path.starts_with("tree/d0/")), "{err}");
+		assert!(deepest.join("f").exists(), "the removal went on below the directory it could not open");
+	}
+
+	/// GNU rm -f reports a mount point it cannot remove (EBUSY) under that
+	/// reason, removes the rest, and leaves the directories above it.
+	///
+	/// Ignored by default because it needs the privilege to mount: run it as
+	/// root, or as root of a user namespace (`unshare -rm`), with `--ignored`.
+	/// Without the mount nothing is busy, so a silent early return would
+	/// report a pass that proves nothing.
+	#[cfg(target_os = "linux")]
+	#[test]
+	#[ignore = "mounts a tmpfs; run as root with --ignored"]
+	fn force_reports_a_mount_point_it_cannot_remove() {
+		let cwd = tempdir().unwrap();
+		let point = cwd.path().join("tree/point");
+		std::fs::create_dir_all(&point).unwrap();
+		std::fs::write(cwd.path().join("tree/other"), b"").unwrap();
+		let mounted = std::process::Command::new("mount")
+			.args(["-t", "tmpfs", "tmpfs"])
+			.arg(&point)
+			.stderr(std::process::Stdio::null())
+			.status()
+			.is_ok_and(|status| status.success());
+		assert!(mounted, "mount -t tmpfs failed: run this test as root");
+
+		let (code, capture) = run_util::<Rm>(&["-rf", "tree"], "", cwd.path());
+		let unmounted = std::process::Command::new("umount").arg(&point).status();
+
+		assert_eq!((code, capture.err().as_str()), (1, "rm: cannot remove 'tree/point': Device or resource busy\n"));
+		assert!(point.is_dir());
+		assert!(!cwd.path().join("tree/other").exists());
+		assert!(unmounted.is_ok_and(|status| status.success()));
 	}
 
 	#[cfg(windows)]
