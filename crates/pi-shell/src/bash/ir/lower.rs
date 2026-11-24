@@ -594,7 +594,7 @@ impl Lower {
 				// with `%`: then `%job &` resumes the job in the background,
 				// here.
 				let lone = if zsh { None } else { lone_simple(ao) };
-				if lone.is_some_and(|s| self.starts_with_jobspec(s)) {
+				if lone.is_some_and(Self::starts_with_jobspec) {
 					self.exec_b = Op::EXEC_ASYNC;
 					self.and_or(ao)?;
 				} else {
@@ -631,15 +631,18 @@ impl Lower {
 		Ok(())
 	}
 
-	/// Whether simple command `s`'s first word as written (an assignment
-	/// counts) starts with `%`: bash's test on the unexpanded words.
-	fn starts_with_jobspec(&self, s: st::Simple<'_>) -> bool {
+	/// Whether simple command `s`'s first word (an assignment counts) starts
+	/// with `%`: bash's test on the parsed, unexpanded words, after alias
+	/// substitution (an alias `j=%1` makes `j &` a jobspec; `"%1"` is none).
+	fn starts_with_jobspec(s: st::Simple<'_>) -> bool {
 		if !s.assigns().is_empty() {
 			return false;
 		}
 		s.words().first().is_some_and(|w| {
-			let span = w.span().rebase(self.base);
-			self.unit.source.get(span.lo as usize) == Some(&b'%')
+			matches!(
+				w.parts().first().map(st::WordPart::get),
+				Some(st::Part::Lit(b)) if b.starts_with(b"%")
+			)
 		})
 	}
 

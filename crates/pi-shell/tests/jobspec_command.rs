@@ -91,6 +91,8 @@ fn a_jobspec_wins_over_a_function_and_command() {
 		(r#"%1() { echo fn; }; sleep 0.2 & %1 > out; echo "st=$?""#, "st=1\n", FG, 0),
 		(r#"sleep 0.2 & command %1 > out; echo "st=$?""#, "st=1\n", FG, 0),
 		(r#"sleep 0.2 & command -p %1 > out; echo "st=$?""#, "st=1\n", FG, 0),
+		// The redirection after a `command` prefix is not expanded either.
+		(r#"sleep 0.2 & command %1 > ${f:=x}; echo "[$f] $?""#, "[] 1\n", FG, 0),
 		(r#"sleep 0.2 & "%1" > out; echo "st=$?""#, "st=1\n", FG, 0),
 		(r#"j=%1; sleep 0.2 & $j > out; echo "st=$?""#, "st=1\n", FG, 0),
 		(r#"f() { %1 > out; }; sleep 0.2 & f; echo "st=$?""#, "st=1\n", FG, 0),
@@ -139,5 +141,87 @@ fn a_jobspec_in_a_subshell_or_group_is_fg_there() {
 		(r#"sleep 0.2 & { %1 > out; } & wait $!; echo "st=$?""#, "st=1\n", FG, 0),
 		(r#"sleep 0.2 & { %1 > out; } | cat; echo "${PIPESTATUS[*]}""#, "1 0\n", FG, 0),
 		(r#"sleep 0.2 & x=$(%1 > out 2>&1); echo "[$x] $?""#, "[] 1\n", FG, 0),
+	]);
+}
+
+/// `lastpipe` with job control off runs a pipeline's last stage in the
+/// shell (bash `execute_pipeline`): no fork, so a jobspec there is `fg`.
+#[test]
+fn a_jobspec_in_a_lastpipe_stage_is_fg() {
+	check(&[
+		(r#"shopt -s lastpipe; sleep 0.2 & true | %1; echo "${PIPESTATUS[*]}""#, "0 1\n", FG, 0),
+		(
+			r#"shopt -s lastpipe; sleep 0.2 & true | command %1; echo "${PIPESTATUS[*]}""#,
+			"0 1\n",
+			FG,
+			0,
+		),
+		(
+			r#"shopt -s lastpipe; sleep 0.2 & true | %1 > ${f:=x}; echo "[$f] ${PIPESTATUS[*]}""#,
+			"[] 0 1\n",
+			FG,
+			0,
+		),
+		// Job control on: no `lastpipe`, the stage is forked.
+		(r#"shopt -s lastpipe; set -m; true | %1; echo "${PIPESTATUS[*]}""#, "0 127\n", NOT_FOUND, 0),
+	]);
+}
+
+/// The `command` builtin runs its words as a command of its own, where a
+/// jobspec is `fg`, also in a child bash forked: any form other than the
+/// `command [-p] [--]` prefix bash drops first, and one `builtin` runs.
+#[test]
+fn a_jobspec_the_command_builtin_runs_is_fg() {
+	check(&[
+		(r#"sleep 0.2 & command -p -p %1; echo "st=$?""#, "st=1\n", FG, 0),
+		(r#"sleep 0.2 & builtin command %1; echo "st=$?""#, "st=1\n", FG, 0),
+		(r#"sleep 0.2 & builtin command %1 | cat; echo "${PIPESTATUS[*]}""#, "1 0\n", FG, 0),
+		(r#"sleep 0.2 & command -p -p %1 | cat; echo "${PIPESTATUS[*]}""#, "1 0\n", FG, 0),
+		(r#"sleep 0.2 & command -p -p %1 > ${f:=x}; echo "[$f] $?""#, "[x] 1\n", FG, 0),
+		// The prefix bash drops: `fg` unforked, a name not found forked.
+		(r#"sleep 0.2 & command %1; echo "st=$?""#, "st=1\n", FG, 0),
+		(r#"sleep 0.2 & command -p -- %1; echo "st=$?""#, "st=1\n", FG, 0),
+		(r#"sleep 0.2 & command command %1; echo "st=$?""#, "st=1\n", FG, 0),
+		(r#"sleep 0.2 & command %1 | cat; echo "${PIPESTATUS[*]}""#, "127 0\n", NOT_FOUND, 0),
+		// `builtin` runs a builtin by name: a jobspec is none.
+		(
+			r#"sleep 0.2 & command builtin %1; echo "st=$?""#,
+			"st=1\n",
+			"PFX: line 1: builtin: %1: not a shell builtin\n",
+			0,
+		),
+	]);
+}
+
+/// bash tests the parsed first word, after alias substitution: an alias
+/// for a jobspec makes `j &` a jobspec run in the shell (`bg`).
+#[test]
+fn an_alias_for_a_jobspec_is_one() {
+	const BG2: &str = "PFX: line 2: bg: no job control\n";
+	check(&[
+		(
+			"shopt -s expand_aliases; alias j=%1\nsleep 0.2 & j & echo \"st=$?\"; wait",
+			"st=1\n",
+			BG2,
+			0,
+		),
+		(
+			"shopt -s expand_aliases; alias j='%1 > ${f:=x}'\nsleep 0.2 & j & echo \"[$f] $?\"; wait",
+			"[] 1\n",
+			BG2,
+			0,
+		),
+		(
+			"shopt -s expand_aliases; alias j=%1\nsleep 0.2 & j > ${f:=x}; echo \"[$f] $?\"",
+			"[] 1\n",
+			"PFX: line 2: fg: no job control\n",
+			0,
+		),
+		(
+			"shopt -s expand_aliases; alias j='\"%1\"'\nsleep 0.2 & j & wait $!; echo \"st=$?\"",
+			"st=127\n",
+			"PFX: line 2: %1: command not found\n",
+			0,
+		),
 	]);
 }

@@ -258,7 +258,7 @@ pub fn exec(
 			},
 			Stage::Redirect
 				if unit.mode.dialect() != crate::bash::ids::Dialect::Zsh
-					&& op.b & ir::Op::EXEC_FORKED == 0
+					&& !bash_forked(vp, op)
 					&& jobspec_command(cx, vp) =>
 			{
 				// bash `execute_simple_command`: a command word that starts
@@ -1858,10 +1858,22 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 		let posix = state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 			.unwrap_or(false);
 		let mut via = Via::Plain;
+		// bash: the `command` builtin itself ran (a form other than the
+		// `command [-p] [--]` prefix `check_command_builtin` drops, or one a
+		// `builtin` runs): it runs its words as a command of its own, where
+		// a jobspec is `fg`, also in a child bash forked. The prefix form
+		// in a command bash does not fork is `fg` too: `jobspec_command`
+		// took it at the redirections, unless the one-step path (no
+		// redirections) skipped them.
+		let mut ran_command = false;
+		let unforked = !bash_forked(vp, op);
 		let target = loop {
 			// Borrowed (the resolution only reads `vp`): no copy of the
 			// name per command.
 			let name = &current_argv(vp)[0];
+			if ran_command && name.starts_with(b"%") {
+				break Target::Intrinsic(IntrinsicId::Fg);
+			}
 			let has_slash = name.contains(&b'/')
 				|| (k.engine.config().platform == crate::bash::ids::Platform::Windows
 					&& name.contains(&b'\\'));
@@ -1925,6 +1937,14 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 							.find(|a| !matches!(a.as_slice(), b"-p" | b"--"))
 							.is_some_and(|a| !a.starts_with(b"-")) =>
 				{
+					// bash's prefix form is `command [-p] [--] name`.
+					let opts = argv[1..]
+						.iter()
+						.take_while(|a| matches!(a.as_slice(), b"-p" | b"--"))
+						.count();
+					let prefix = opts < 2
+						|| (opts == 2 && argv[1].as_slice() == b"-p" && argv[2].as_slice() == b"--");
+					ran_command |= !zsh && (!prefix || via == Via::Builtin || unforked);
 					argv.remove(0);
 					shift_arrayref(arrayref);
 					while argv.len() > 1 && matches!(argv[0].as_slice(), b"-p" | b"--") {
@@ -1942,6 +1962,9 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 					};
 				},
 				Resolved::Intrinsic(IntrinsicId::Builtin) if argv.len() > 1 => {
+					// `builtin` runs a builtin by name, not a command: a
+					// jobspec after it is no builtin (`command builtin %1`).
+					ran_command = false;
 					argv.remove(0);
 					shift_arrayref(arrayref);
 					if argv[0].as_slice() == b"--" && argv.len() > 1 {
@@ -2199,8 +2222,9 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 	// The command name, for diagnostics only.
 	let argv0 = |vp: &mut Vproc| st(vp).argv[0].clone();
 	// zsh: a jobspec as a command is `fg jobspec`. bash's ran at the
-	// redirections (`jobspec_command`); one reaching here is in a child
-	// bash forked, where it is a name not found.
+	// redirections (`jobspec_command`) or in `lookup` (one the `command`
+	// builtin runs); one reaching here is in a child bash forked, where it
+	// is a name not found.
 	let jobspec = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
 		&& st(vp).exec_as.is_none()
 		&& st(vp).argv[0].starts_with(b"%");
@@ -4222,6 +4246,15 @@ fn exec_builtin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> O
 	s.control = Some(Transfer::Exec);
 	s.stage = Stage::Lookup;
 	None
+}
+
+/// Whether bash runs this simple command in a child it forked for it: the
+/// lowering's [`ir::Op::EXEC_FORKED`], unless it is the last stage of a
+/// pipeline run in the shell (`lastpipe`, a [`FrameKind::Stage`] frame),
+/// which bash does not fork.
+fn bash_forked(vp: &Vproc, op: Op) -> bool {
+	op.b & ir::Op::EXEC_FORKED != 0
+		&& !matches!(vp.frames.last().map(|f| &f.kind), Some(FrameKind::Stage))
 }
 
 /// bash `execute_simple_command`'s jobspec test: the command word, after
