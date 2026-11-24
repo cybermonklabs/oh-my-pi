@@ -98,10 +98,10 @@ pub struct Vproc {
 	/// past 65,535 loops) that shares `trap_frames`'s former 4 bytes, so
 	/// `Vproc` keeps its size.
 	pub outer_loops:   u16,
-	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
+	/// The command being run (`BASH_COMMAND`, [`BashCommand`]).
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
-	pub command:       Option<(Arc<Unit>, u32)>,
+	pub command:       Option<BashCommand>,
 	/// Pushes onto bash's call-stack arrays (`FUNCNAME`, `BASH_SOURCE`,
 	/// `BASH_LINENO`, `BASH_ARGC`, `BASH_ARGV`), oldest first; a subshell
 	/// starts with its parent's.
@@ -213,6 +213,21 @@ pub struct VprocZsh {
 	/// `filelist`). A subshell starts without.
 	#[serde(default)]
 	pub tempfiles:          Vec<(u32, BString)>,
+	/// zsh `intrap` a fork keeps: the shell that forked this vproc (or an
+	/// ancestor) was running a trap action, so no ZERR or DEBUG trap runs
+	/// here ([`super::exec::zsh_in_trap`]).
+	#[serde(default)]
+	pub in_trap:            bool,
+	/// zsh `errflag` left set by a `.` file an error ended
+	/// ([`super::exec`]'s `zsh_discard`) until the next command: the `.`
+	/// command runs no ZERR trap (zsh `dotrapargs`).
+	#[serde(default)]
+	pub errflag:            bool,
+	/// A subshell left by zsh's `exit` (`exit_val` set): an error that
+	/// ends its EXIT trap keeps the exit's status ([`super::exec`]'s
+	/// `zsh_discard`).
+	#[serde(default)]
+	pub exited:             bool,
 	/// The code (and line) of a glob's shell-code qualifier to run above
 	/// the op that returned [`Flow::Call`](super::exec::Flow::Call) for it
 	/// (zsh `qualsheval`); pushed by the run loop, which drops it when the
@@ -247,6 +262,9 @@ impl VprocZsh {
 			&& self.zexit.is_none()
 			&& !self.exit_from_function
 			&& self.last_math.is_none()
+			&& !self.in_trap
+			&& !self.errflag
+			&& !self.exited
 			&& self.glob_hook.is_none()
 	}
 }
@@ -759,16 +777,34 @@ pub struct Coproc {
 	pub write: i32,
 }
 
+/// What `BASH_COMMAND` names (bash's `the_printed_command_except_trap`),
+/// printed when it is read. 16 bytes, as the `(unit, node)` pair it
+/// replaced: `Vproc` keeps its size.
+#[derive(Clone, Debug)]
+pub enum BashCommand {
+	/// The op at pc `.1` of the unit: a simple command's `Exec`, the `Enter`
+	/// of `[[ ]]` or `(( ))`, the head of a `for` iteration (`ForNext`), of a
+	/// `select` (`ForIn`) or a `case` (`CaseWord`), or an arith-for
+	/// expression evaluated as written (`Arith`, [`Op::LITERAL`]).
+	///
+	/// [`Op::LITERAL`]: crate::bash::ir::Op::LITERAL
+	Op(Arc<Unit>, u32),
+	/// An arith-for expression as expanded (bash prints it `((…))` after
+	/// expanding it, before its DEBUG trap).
+	Expanded(Box<BString>),
+}
+
 impl Vproc {
-	/// `BASH_COMMAND`: the source text of the current command.
-	pub fn command_text(&self) -> &[u8] {
-		self.command.as_ref().map_or(&[][..], |(unit, node)| {
-			unit
-				.nodes
-				.get(*node as usize)
-				.and_then(|n| unit.source.get(n.lo as usize..n.hi as usize))
-				.unwrap_or_default()
-		})
+	/// `BASH_COMMAND`: the current command as bash prints it
+	/// ([`BashCommand`]).
+	pub fn command_text(&self) -> BString {
+		match &self.command {
+			None => BString::default(),
+			Some(BashCommand::Expanded(expr)) => {
+				BString::from(crate::bash::syntax::arith_command(expr))
+			},
+			Some(BashCommand::Op(unit, pc)) => super::exec::command_text(unit, *pc),
+		}
 	}
 
 	pub const fn has_work(&self) -> bool {
@@ -912,10 +948,22 @@ pub enum ScriptKind {
 		key:           crate::bash::store::TrapKey,
 		status:        i32,
 		cancel:        Option<i32>,
-		return_target: Option<usize>,
+		/// The frame (index) of the function or `.` file that returns once
+		/// the trap ends; a `u32` keeps [`Frame`] within its size bound.
+		return_target: Option<u32>,
 		/// An ERR trap run by `set -e`: the shell exits with `status` when
 		/// the trap ends.
 		exit:          bool,
+		/// bash: the loops an EXIT trap that `exit` started sees, its
+		/// `loop_level` as the exit left it ([`super::exec::exit_seen_loops`]):
+		/// a `break` or `continue` reaching past the trap ends it silently.
+		#[serde(default)]
+		loops:         u16,
+		/// bash: an ERR trap the parent ran for a pipeline's last `( … )`
+		/// element (`execute_cmd.c`'s subshell judgement): the pipeline is
+		/// judged too, so the trap runs again when it ends.
+		#[serde(default)]
+		again:         bool,
 	},
 	/// Shell code a builtin runs as zsh's `execode`/`execstring` do with
 	/// a context name (`zstyle -e` values, `zregexparse` guards and
@@ -1014,6 +1062,11 @@ pub struct Frame {
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
 	pub subshell_line:     Option<u32>,
+	/// bash: a `break N` or `continue N` its DEBUG trap ran before the op
+	/// at [`Self::debug_pc`], held until that op ends (bash runs the
+	/// trapped command and tests `breaking` when the next command starts):
+	/// `N << 1 | continue`, 0 for none.
+	pub held_break:        u32,
 	/// A function frame: the getopts state at the call, put back on return
 	/// when the function made `OPTIND` local (bash
 	/// `sh_getopt_save_istate`/`sh_getopt_restore_istate`). `None` is the
@@ -1045,6 +1098,7 @@ impl Frame {
 			ignore_errexit: false,
 			command_loop: false,
 			subshell_line: None,
+			held_break: 0,
 			getopts: None,
 		}
 	}

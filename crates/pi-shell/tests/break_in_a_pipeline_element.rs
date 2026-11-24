@@ -18,6 +18,13 @@
 //! snapshots and restores the shell at many ops, so that a forked child's
 //! loop count must survive the frames image.
 //!
+//! The traps: `break` and `continue`, with and without a count, in a
+//! signal, ERR, DEBUG and (bash) RETURN trap action that fires in a loop
+//! body or in a function called from the loop, and the shapes around them
+//! (the rest of the action, its status, `set -e`, top level). The ERR
+//! rows count how often the ERR (zsh: ZERR) trap runs, and with what
+//! status, for loops, conditions, lists, `!`, compounds and functions.
+//!
 //! The expected rows are the oracles' output, recorded in
 //! `tests/fixtures/break_in_a_pipeline_element/{bash,zsh}.jsonl` (stdout,
 //! status, and stderr with the program name before `: line` as `SH`).
@@ -770,6 +777,929 @@ fn forks(dialect: Dialect) -> Vec<Row> {
 	rows
 }
 
+/// The trap action and the command that runs it, for trap kind `trap`
+/// holding `w` (`break`, `continue 2`, …).
+fn trap_setup(dialect: Dialect, trap: &str, w: &str) -> (String, &'static str) {
+	match trap {
+		"sig" => (format!("trap '{w}' USR1; "), "kill -USR1 $$"),
+		"err" => {
+			let key = if dialect == Dialect::Bash {
+				"ERR"
+			} else {
+				"ZERR"
+			};
+			(format!("trap '{w}' {key}; "), "false")
+		},
+		"debug" => {
+			let var = if dialect == Dialect::Bash {
+				"BASH_COMMAND"
+			} else {
+				"ZSH_DEBUG_CMD"
+			};
+			(format!("trap '[[ ${var} == \": hit\" ]] && {w}' DEBUG; "), ": hit")
+		},
+		_ => (format!("g() {{ :; }}; trap '{w}' RETURN; "), "g"),
+	}
+}
+
+/// The trap rows, `trap/<trap>/<context>/<word>/<count>`: a `break` or
+/// `continue` in a signal, ERR, DEBUG or (bash) RETURN trap that fires in a
+/// loop body or in a function called from the loop.
+fn traps(dialect: Dialect) -> Vec<Row> {
+	let kinds: &[&str] = if dialect == Dialect::Bash {
+		&["sig", "err", "debug", "return"]
+	} else {
+		&["sig", "err", "debug"]
+	};
+	let mut rows = Vec::new();
+	for &trap in kinds {
+		for context in ["for", "while", "until", "select", "function"] {
+			for word in ["break", "continue"] {
+				for count in ["none", "2"] {
+					let (mut pre, el) = trap_setup(dialect, trap, &element(word, count));
+					if context == "function" {
+						let _ = write!(pre, "f() {{ {el}; echo f:$?; }}; ");
+					}
+					// The grid's loops, with the trap's command as the element.
+					let mut body = inner("break", "none", "alone", context).replace("break", el);
+					if count == "2" {
+						body = format!("for o in X Y; do echo o$o; {body}; echo c$o:$?; done; echo E:$?");
+					}
+					rows.push((format!("trap/{trap}/{context}/{word}/{count}"), pre + &body));
+				}
+			}
+		}
+	}
+	rows
+}
+
+/// The trap shapes around the trap rows, each in one and in two loops.
+const TRAP_SHAPES: &[(&str, &str, &str)] = &[
+	("rest-skipped", "trap 'break; echo after' USR1; ", "kill -USR1 $$"),
+	("status", "trap 'false; break' USR1; ", "kill -USR1 $$"),
+	("count3", "trap 'break 3' USR1; ", "kill -USR1 $$"),
+	(
+		"nested-function",
+		"trap 'break' USR1; h() { kill -USR1 $$; echo h; }; g() { h; echo g; }; ",
+		"g",
+	),
+	("err-in-condition", "trap 'break' ERR; ", "if false; then :; fi; false"),
+	("eval", "trap 'eval break' USR1; ", "kill -USR1 $$"),
+	("errexit", "set -e; trap 'break' ERR; ", "(exit 3)"),
+	("errexit-continue", "set -e; trap 'continue' ERR; ", "(exit 3)"),
+	// An EXIT trap run by `exit` inside the loop: bash starts it with no
+	// loop level (the message); zsh counts the loops, and `break` ends the
+	// trap while the exit goes on.
+	("exit", "trap 'echo t1; break; echo t2' EXIT; ", "exit 3"),
+	("exit-continue", "trap 'echo t1; continue; echo t2' EXIT; ", "exit 3"),
+	("exit-in-function", "trap 'echo t1; break; echo t2' EXIT; h() { exit 3; }; ", "h"),
+	("exit-in-subshell", "", "( trap 'echo t1; break; echo t2' EXIT; exit 3 ); echo s:$?"),
+];
+
+/// The trap shapes only bash has, `trap/own/<name>`. A RETURN trap fires
+/// for a function under `set -T` or one that set it, at the function's
+/// own loop level: no loop of its own, the message; a `return` from
+/// inside its own loop leaves that loop's level counted, and bash's
+/// `breaking` outlives the return, skipping the callers' commands up to
+/// their next loop. A DEBUG trap's `break` leaves `set -e` on.
+/// A DEBUG trap's `break` or `continue` lets the trapped command run; at a
+/// `for` iteration's DEBUG point, `$BASH_COMMAND` is the loop's header.
+const BASH_TRAP_SHAPES: &[(&str, &str)] = &[
+	(
+		"return-functrace",
+		"set -T; g() { :; }; trap 'echo r; break' RETURN; for i in 1 2; do echo a$i; g; echo \
+		 b$i:$?; done; echo e:$?",
+	),
+	(
+		"return-set-in-function",
+		"g() { trap 'echo r; break' RETURN; }; for i in 1 2; do echo a$i; g; echo b$i:$?; done; \
+		 echo e:$?",
+	),
+	(
+		"return-in-own-loop",
+		"set -T; trap 'echo r; break' RETURN; g() { for i in 1 2; do echo g$i; return 5; done; echo \
+		 after; }; g; echo s:$?",
+	),
+	(
+		"return-in-own-loop-caller-loop",
+		"set -T; trap 'echo r; break' RETURN; g() { for i in 1 2; do echo g$i; return 5; done; echo \
+		 after; }; for o in X Y; do echo o$o; g; echo s:$?; done; echo E:$?",
+	),
+	(
+		"return-in-own-loop-continue",
+		"set -T; trap 'echo r; continue' RETURN; g() { for i in 1 2; do echo g$i; return 5; done; \
+		 echo after; }; for o in X Y; do echo o$o; g; echo s:$?; done; echo E:$?",
+	),
+	(
+		"return-in-own-loop-through-function",
+		"g() { trap 'echo r; break' RETURN; for i in 1 2; do echo g$i; return 5; done; echo after; \
+		 }; h() { g; echo h:$?; }; for o in X Y; do echo o$o; h; echo s:$?; done; echo E:$?",
+	),
+	(
+		"debug-errexit",
+		"set -e; trap '[[ $BASH_COMMAND == \": hit\" ]] && { echo t; break; }; true' DEBUG; for i \
+		 in 1 2; do echo a$i; : hit; echo b$i; done; echo e; false; echo after",
+	),
+	// The EXIT trap `exit` runs inside a function's own loop starts with no
+	// loop level: its `break` prints the message and the rest of the trap
+	// runs.
+	(
+		"exit-in-function-loop",
+		"trap 'echo t1; break; echo t2' EXIT; h() { for j in 1 2; do echo j$j; exit 3; done; echo \
+		 h; }; h; echo e:$?",
+	),
+	(
+		"exit-in-function-loop-continue",
+		"trap 'echo t1; continue; echo t2' EXIT; h() { for j in 1 2; do echo j$j; exit 3; done; \
+		 echo h; }; for i in 1 2; do echo a$i; h; done; echo e:$?",
+	),
+	// A RETURN trap's `break` that finds no loop past the function leaves
+	// bash's `breaking` set to the run's end: the EXIT trap does nothing.
+	(
+		"return-break-no-loop-exit-trap",
+		"set -T; trap 'break' RETURN; trap 'echo X' EXIT; g() { for i in 1; do return; done; }; g; \
+		 echo after",
+	),
+	// A DEBUG trap's `break` or `continue` lets the trapped command run
+	// (bash tests `breaking` when the next command starts): its output,
+	// its status, not its ERR trap (`breaking` skips that trap's commands);
+	// a function or `eval` it starts runs none of its commands.
+	(
+		"debug-break-runs-the-command",
+		"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; for i in 1 2; do echo a$i; echo \
+		 hit; echo b$i; done; echo end",
+	),
+	(
+		"debug-break-last-command",
+		"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; for i in 1 2; do echo a$i; echo \
+		 hit; done; echo end",
+	),
+	(
+		"debug-break-and-list",
+		"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; for i in 1 2; do echo a$i; echo \
+		 hit && echo x$i; echo b$i; done; echo end",
+	),
+	(
+		"debug-break-failing-command",
+		"trap 'echo T' ERR; trap '[[ $BASH_COMMAND == \"false\" ]] && break' DEBUG; for i in 1 2; \
+		 do echo a$i; false; echo b$i; done; echo end:$?",
+	),
+	(
+		"debug-break-function",
+		"f() { echo in-f; }; trap '[[ $BASH_COMMAND == f ]] && break' DEBUG; for i in 1 2; do echo \
+		 a$i; f; echo b$i; done; echo end",
+	),
+	(
+		"debug-break-eval",
+		"trap '[[ $BASH_COMMAND == \"eval echo e1\" ]] && break' DEBUG; for i in 1 2; do echo a$i; \
+		 eval echo e1; echo b$i; done; echo end",
+	),
+	(
+		"debug-break-while",
+		"n=0; trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break' DEBUG; while [ $n -lt 2 ]; do \
+		 n=$((n+1)); echo a$n; echo hit; echo b$n; done; echo end",
+	),
+	(
+		"debug-break2-nested",
+		"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && break 2' DEBUG; for o in 1 2; do for i in 1 \
+		 2; do echo a$o$i; echo hit; echo b$o$i; done; echo o$o; done; echo end",
+	),
+	(
+		"debug-continue-while",
+		"n=0; trap '[[ $BASH_COMMAND == \"echo hit\" ]] && continue' DEBUG; while [ $n -lt 2 ]; do \
+		 n=$((n+1)); echo a$n; echo hit; echo b$n; done; echo end",
+	),
+	(
+		"debug-continue-while-failing",
+		"n=0; trap 'echo T' ERR; trap '[[ $BASH_COMMAND == false ]] && continue' DEBUG; while [ $n \
+		 -lt 2 ]; do n=$((n+1)); echo a$n; false; echo b$n; done; echo end:$?",
+	),
+	(
+		"debug-continue-for",
+		"trap '[[ $BASH_COMMAND == \"echo hit\" ]] && continue' DEBUG; for i in 1 2; do echo a$i; \
+		 echo hit; echo b$i; done; echo end",
+	),
+	(
+		"debug-continue-for-external",
+		"trap '[[ $BASH_COMMAND == \"/bin/echo hit\" ]] && continue' DEBUG; for i in 1 2; do echo \
+		 a$i; /bin/echo hit; echo b$i; done; echo end",
+	),
+	(
+		"debug-continue-for-header",
+		"trap '[[ $BASH_COMMAND == for* ]] && continue' DEBUG; for i in 1 2; do echo a$i; done; \
+		 echo end",
+	),
+	(
+		"debug-break-for-header",
+		"trap '[[ $BASH_COMMAND == for* ]] && break' DEBUG; for i in 1 2; do echo a$i; done; echo \
+		 end",
+	),
+];
+
+/// The trap shapes only zsh has, `trap/own/<name>`: a DEBUG trap's `break`
+/// puts `ERR_EXIT` back (zsh turns it off while the trap runs), a
+/// `TRAPZERR` function's `break` leaves the loop, and the `break` of the
+/// ZERR trap a `return N` runs is dropped by the return.
+const ZSH_TRAP_SHAPES: &[(&str, &str)] = &[
+	(
+		"debug-errexit-break",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && break' DEBUG; for i in 1 2; do \
+		 echo a$i; : hit; echo b$i; done; echo e; false; echo after",
+	),
+	(
+		"debug-errexit-continue",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && continue' DEBUG; for i in 1 2; \
+		 do echo a$i; : hit; echo b$i; done; echo e; false; echo after",
+	),
+	(
+		"trapzerr-break",
+		"TRAPZERR() { echo t; break; echo x; }; for i in 1 2; do echo a$i; false; echo b$i; done; \
+		 echo e:$?",
+	),
+	(
+		"trapzerr-continue",
+		"TRAPZERR() { echo t; continue; echo x; }; for i in 1 2; do echo a$i; false; echo b$i; \
+		 done; echo e:$?",
+	),
+	(
+		"trapzerr-break-errexit",
+		"setopt errexit; TRAPZERR() { echo t; break; }; for i in 1 2; do echo a$i; false; echo b$i; \
+		 done; echo e:$?",
+	),
+	// The ZERR trap a `return N` runs: the return drops the `break`.
+	(
+		"zerr-break-on-return",
+		"trap 'echo t; break' ZERR; f() { return 2; }; for i in 1 2; do echo a$i; f; echo b$i; \
+		 done; echo e:$?",
+	),
+	// `ERR_RETURN` in a trap action ends the action's list, not the function
+	// it interrupted (zsh `dotrapargs` puts `retflag` back), and every loop
+	// in reach of that code ends (`breaks = loops` outlives the trap); in a
+	// DEBUG trap (`noerrexit`) it does nothing; at top level it exits, as
+	// `ERR_EXIT` does (the controls).
+	(
+		"errreturn-trap-in-function",
+		"setopt err_return; trap 'false' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-trap-rest",
+		"setopt err_return; trap 'false; echo t2' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo \
+		 top:$?",
+	),
+	(
+		"errreturn-trap-calls-function",
+		"setopt err_return; g() { false; echo g; }; trap 'g; echo t' USR1; f() { kill -USR1 $$; \
+		 echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-trap-in-source",
+		"setopt err_return; trap 'false' USR1; . =(print 'kill -USR1 $$; echo s:$?'); echo top:$?",
+	),
+	(
+		"errreturn-trap-in-loop",
+		"setopt err_return; trap 'false' USR1; f() { for i in 1 2; do kill -USR1 $$; echo f$i:$?; \
+		 done; echo after:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-trap-in-loop-caller-loop",
+		"setopt err_return; trap 'false' USR1; f() { for i in 1 2; do kill -USR1 $$; echo f$i; \
+		 done; echo after; }; for o in X Y; do echo o$o; f; echo s$o:$?; done; echo E:$?",
+	),
+	(
+		"errreturn-trap-caller-loop",
+		"setopt err_return; trap 'false' USR1; f() { kill -USR1 $$; echo f:$?; }; for o in X Y; do \
+		 echo o$o; f; echo s$o:$?; done; echo E:$?",
+	),
+	(
+		"errreturn-trap-own-loop",
+		"setopt err_return; trap 'for j in 1 2; do false; echo t$j; done; echo tend' USR1; f() { \
+		 kill -USR1 $$; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-trap-localloops",
+		"setopt err_return localloops; trap 'false' USR1; f() { for i in 1 2; do kill -USR1 $$; \
+		 echo f$i; done; echo after; }; for o in X Y; do echo o$o; f; echo s$o:$?; done; echo E:$?",
+	),
+	(
+		"errreturn-zerr-in-function",
+		"setopt err_return; trap 'false' ZERR; f() { false; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-debug-in-function",
+		"setopt err_return; trap 'false' DEBUG; f() { echo f; }; f; echo top:$?",
+	),
+	("errreturn-debug-top", "setopt err_return; trap 'false' DEBUG; echo x; echo top:$?"),
+	("errreturn-trap-top", "setopt err_return; trap 'false' USR1; kill -USR1 $$; echo top:$?"),
+	("errexit-trap-top", "setopt err_exit; trap 'false' USR1; kill -USR1 $$; echo top:$?"),
+	(
+		"errexit-trap-in-function",
+		"setopt err_exit; trap 'false' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"errreturn-in-function-then-top",
+		"setopt err_return; trap 'false' USR1; f() { (exit 3); kill -USR1 $$; echo f:$?; }; f; echo \
+		 top:$?",
+	),
+	// No ZERR trap runs while any trap does (zsh `dotrap`'s `intrap`): a
+	// signal, DEBUG or EXIT trap, a function one calls; `ERR_EXIT` still
+	// applies there.
+	(
+		"zerr-in-signal-trap",
+		"trap 'echo Z$?' ZERR; trap 'false; echo t2' USR1; kill -USR1 $$; echo top:$?",
+	),
+	(
+		"zerr-in-signal-trap-function",
+		"trap 'echo Z$?' ZERR; g() { false; echo g; }; trap 'g; echo t2' USR1; kill -USR1 $$; echo \
+		 top:$?",
+	),
+	(
+		"zerr-in-signal-trap-in-function",
+		"trap 'echo Z$?' ZERR; trap 'false; echo t2' USR2; f() { kill -USR2 $$; echo f; }; f; echo \
+		 top:$?",
+	),
+	(
+		"zerr-in-debug-trap",
+		"trap 'echo Z$?' ZERR; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { false; echo d; }; :' \
+		 DEBUG; : hit; echo top:$?",
+	),
+	("zerr-in-exit-trap", "trap 'echo Z$?' ZERR; trap 'false; echo x' EXIT; echo top"),
+	("zerr-in-exit-trap-from-exit", "trap 'echo Z$?' ZERR; trap 'false; echo x' EXIT; exit 0"),
+	(
+		"zerr-after-signal-trap",
+		"trap 'echo Z$?' ZERR; trap 'false' USR1; kill -USR1 $$; false; echo top:$?",
+	),
+	(
+		"zerr-in-signal-trap-errexit",
+		"setopt errexit; trap 'echo Z$?' ZERR; trap 'false; echo t2' USR1; kill -USR1 $$; echo \
+		 top:$?",
+	),
+	(
+		"zerr-in-subshell-in-signal-trap",
+		"trap 'echo Z$?' ZERR; trap '(false; echo s); echo t2' USR1; kill -USR1 $$; echo top:$?",
+	),
+	("zerr-in-zerr-trap", "trap 'false; echo Z$?' ZERR; false; echo top:$?"),
+	(
+		"errreturn-trap-runs-no-zerr",
+		"setopt err_return; trap 'echo Z' ZERR; trap 'false; echo t2' USR1; f() { kill -USR1 $$; \
+		 echo f:$?; }; f; echo top:$?",
+	),
+	// A fork made inside a trap keeps `intrap`: no ZERR or DEBUG trap there,
+	// even after the trap ends; a fork made after it runs them.
+	(
+		"zerr-in-cmdsub-in-signal-trap",
+		"trap 'echo Z$?' ZERR; trap 'x=$(false; echo s); echo t2:$x' USR1; kill -USR1 $$; echo \
+		 top:$?",
+	),
+	(
+		"zerr-in-job-from-signal-trap",
+		"trap 'echo Z$?' ZERR; trap '{ false; echo s; } &' USR1; kill -USR1 $$; wait; echo top:$?",
+	),
+	(
+		"zerr-in-subshell-after-signal-trap",
+		"trap 'echo Z$?' ZERR; trap ':' USR1; kill -USR1 $$; ( false; echo s ); echo top:$?",
+	),
+	(
+		"debug-in-subshell-in-signal-trap",
+		"trap '[[ $ZSH_DEBUG_CMD == \": in\" ]] && echo D' DEBUG; trap '( : in; echo s ); echo t2' \
+		 USR1; kill -USR1 $$; echo top:$?",
+	),
+	(
+		"debug-in-cmdsub-in-signal-trap",
+		"trap '[[ $ZSH_DEBUG_CMD == \": in\" ]] && echo D >&2' DEBUG; trap 'x=$(: in; echo s); echo \
+		 t2:$x' USR1; kill -USR1 $$; echo top:$?",
+	),
+	(
+		"debug-in-subshell-after-signal-trap",
+		"trap '[[ $ZSH_DEBUG_CMD == \": in\" ]] && echo D' DEBUG; trap ':' USR1; kill -USR1 $$; ( : \
+		 in; echo s ); echo top:$?",
+	),
+	// An error that ends a DEBUG trap (a `break` with no loop, `${x?}`,
+	// a math error) ends it as its end would: `ERR_EXIT` comes back.
+	(
+		"debug-error-break-errexit",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && break; :' DEBUG; : hit; echo b; \
+		 false; echo after",
+	),
+	(
+		"debug-error-break-errexit-loop",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && break; :' DEBUG; : hit; for i \
+		 in 1; do echo a; done; false; echo after",
+	),
+	(
+		"debug-error-break",
+		"trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && break; :' DEBUG; : hit; echo b; false; echo \
+		 after:$?",
+	),
+	(
+		"debug-error-unset-errexit",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { : ${x?unset}; }; :' DEBUG; : \
+		 hit; echo b; false; echo after",
+	),
+	(
+		"debug-error-unset-errexit-in-function",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { : ${x?unset}; }; :' DEBUG; \
+		 f() { : hit; echo b; false; echo after; }; f; echo top",
+	),
+	(
+		"debug-error-math-errexit",
+		"setopt errexit; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && (( 1/0 )); :' DEBUG; : hit; \
+		 echo b; false; echo after",
+	),
+	(
+		"debug-after-error-unset-errexit",
+		"setopt errexit nodebugbeforecmd; trap '[[ $ZSH_DEBUG_CMD == \": hit\" ]] && { : \
+		 ${x?unset}; }; :' DEBUG; : hit; echo b; false; echo after",
+	),
+	// An error that ends a trap whose end exits: the EXIT trap `exit` ran
+	// still exits with the exit's status; the ZERR trap ERR_EXIT ran exits
+	// with 1. An EXIT trap at the script's end, and an unset parameter (the
+	// shell exits at once), are the controls.
+	("exit-error-break", "trap 'echo t1; break; echo t2' EXIT; exit 3"),
+	("exit-error-math", "trap 'echo t1; echo $(( 1 + )); echo t2' EXIT; exit 3"),
+	("exit-error-in-function", "trap 'echo t1; break; echo t2' EXIT; h() { exit 3; }; h; echo e:$?"),
+	(
+		"exit-error-in-function-loop",
+		"trap 'echo t1; break; echo t2' EXIT; h() { for j in 1 2; do echo j$j; exit 3; done; echo \
+		 h; }; h; echo e:$?",
+	),
+	("exit-error-in-subshell", "( trap 'echo t1; break; echo t2' EXIT; exit 3 ); echo s:$?"),
+	("exit-error-end-of-script", "trap 'echo t1; break; echo t2' EXIT; (exit 5)"),
+	(
+		"zerr-errexit-error-break",
+		"setopt errexit; trap 'echo t1; break; echo t2' ZERR; (exit 4); echo after",
+	),
+	(
+		"zerr-errexit-error-unset",
+		"setopt errexit; trap 'echo t1; : ${x?u}; echo t2' ZERR; (exit 4); echo after",
+	),
+	// An error that ends a signal trap: the interrupted command's status
+	// comes back, as at the trap's end. A DEBUG trap's and a ZERR trap's
+	// already matched (the controls: the command's status; 1).
+	(
+		"signal-error-break-status",
+		"trap 'echo t1; break; echo t2' USR1; (exit 4); kill -USR1 $$; echo s:$?",
+	),
+	(
+		"signal-error-math-status",
+		"trap 'echo t1; echo $(( 1 + )); echo t2' USR1; (exit 4); kill -USR1 $$; echo s:$?",
+	),
+	(
+		"signal-error-in-function",
+		"trap 'echo t1; break; echo t2' USR1; f() { kill -USR1 $$; echo f:$?; }; f; echo s:$?",
+	),
+	("signal-no-error-status", "trap 'echo t1; false' USR1; (exit 4); kill -USR1 $$; echo s:$?"),
+	(
+		"debug-error-break-status",
+		"trap '[[ $ZSH_DEBUG_CMD == \"(exit 4)\" ]] && break; :' DEBUG; (exit 4); echo s:$?",
+	),
+	("zerr-error-break-status", "trap 'echo t1; break; echo t2' ZERR; (exit 4); echo s:$?"),
+	("zerr-error-math-status", "trap 'echo t1; echo $(( 1 + )); echo t2' ZERR; (exit 4); echo s:$?"),
+];
+
+/// The trap shape rows, `trap/x<loops>/<name>`, three at top level, and
+/// the dialect's own (`trap/own/<name>`).
+fn trap_shapes(dialect: Dialect) -> Vec<Row> {
+	let zsh = |s: &str| {
+		if dialect == Dialect::Bash {
+			s.to_owned()
+		} else {
+			s.replace(" ERR;", " ZERR;")
+				.replace("set -e;", "setopt errexit;")
+		}
+	};
+	let mut rows = Vec::new();
+	for &(name, pre, x) in TRAP_SHAPES {
+		rows.push((
+			format!("trap/x1/{name}"),
+			zsh(&format!("{pre}for i in 1 2; do echo a$i; {x}; echo b$i:$?; done; echo e:$?")),
+		));
+		rows.push((
+			format!("trap/x2/{name}"),
+			zsh(&format!(
+				"{pre}for o in X Y; do echo o$o; for i in 1 2; do echo a$i; {x}; echo b$i:$?; done; \
+				 echo e:$?; echo c$o:$?; done; echo E:$?"
+			)),
+		));
+	}
+	rows.push((
+		"trap/x0/sig".to_owned(),
+		"trap 'break' USR1; kill -USR1 $$; echo after; echo top:$?".to_owned(),
+	));
+	rows.push(("trap/x0/err".to_owned(), zsh("trap 'break' ERR; false; echo after; echo top:$?")));
+	rows.push((
+		"trap/x0/exit-after-loop".to_owned(),
+		"trap 'echo t1; break; echo t2' EXIT; for i in 1 2; do echo a$i; done; echo after".to_owned(),
+	));
+	let own = if dialect == Dialect::Bash {
+		BASH_TRAP_SHAPES
+	} else {
+		ZSH_TRAP_SHAPES
+	};
+	for &(name, script) in own {
+		rows.push((format!("trap/own/{name}"), script.to_owned()));
+	}
+	rows
+}
+
+/// The ERR trap rows' shapes: how often the ERR (zsh: ZERR) trap runs, and
+/// with what status, for loops, conditions, lists, `!`, compounds and
+/// functions.
+const ERR_SHAPES: &[(&str, &str)] = &[
+	("while-body-false", "i=0; while [ $i -lt 1 ]; do i=$((i+1)); false; done"),
+	("while-body-status3", "i=0; while [ $i -lt 1 ]; do i=$((i+1)); (exit 3); done"),
+	("until-body-false", "i=0; until [ $i -ge 1 ]; do i=$((i+1)); false; done"),
+	("for-body-false", "for i in 1; do false; done"),
+	("while-two-iterations", "i=0; while [ $i -lt 2 ]; do i=$((i+1)); false; done"),
+	("while-false-then-true", "i=0; while [ $i -lt 1 ]; do i=$((i+1)); false; :; done"),
+	("while-cond-false", "while false; do :; done"),
+	("until-cond-true", "until true; do :; done"),
+	("if-cond-false", "if false; then :; fi"),
+	("elif-cond-false", "if false; then :; elif false; then :; fi"),
+	("if-body-false", "if true; then false; fi"),
+	("else-body-false", "if false; then :; else false; fi"),
+	("group-body-false", "{ false; }"),
+	("group-false-in-cond", "if { false; }; then :; fi"),
+	("and-list-first-false", "false && true"),
+	("and-list-last-false", "true && false"),
+	("or-list-false", "false || false"),
+	("not-true", "! true"),
+	("not-false", "! false"),
+	("case-body-false", "case x in x) false;; esac"),
+	("function-return-1", "f() { return 1; }; f"),
+	("function-body-false", "f() { false; }; f"),
+	("subshell-false", "( false )"),
+	("while-in-function", "f() { i=0; while [ $i -lt 1 ]; do i=$((i+1)); false; done; }; f"),
+	(
+		"nested-while",
+		"i=0; while [ $i -lt 1 ]; do i=$((i+1)); j=0; while [ $j -lt 1 ]; do j=$((j+1)); false; \
+		 done; done",
+	),
+	("select-body-false", "select x in a; do false; break; done <<< 1"),
+	("arith-false", "(( 0 ))"),
+	("cond-false", "[[ -z x ]]"),
+	("group-and-first-false", "{ false && true; }"),
+	("group-not-true", "{ ! true; }"),
+	("while-not-true", "i=0; while [ $i -lt 1 ]; do i=$((i+1)); ! true; done"),
+	("if-body-not-true", "if true; then ! true; fi"),
+	("while-and-first-false", "i=0; while [ $i -lt 1 ]; do i=$((i+1)); false && true; done"),
+	("for-and-first-false", "for i in 1; do false && true; done"),
+	("case-and-first-false", "case x in x) false && true;; esac"),
+	("function-and-first-false", "f() { false && true; }; f"),
+	("function-false-then-return", "f() { false; return 2; }; f"),
+	("pipeline-last-false", "true | false"),
+];
+
+/// The ERR shapes only bash runs here: under `set -E` a forked pipeline
+/// element or background job inherits the trap, and bash's child judges
+/// only the lists nested in the element, not a simple command it runs
+/// with its pipes, a `( … )` element's status or a job of one pipeline;
+/// `lastpipe`'s last element runs in the shell and is judged there too.
+const BASH_ERR_SHAPES: &[(&str, &str)] = &[
+	("errtrace-first-false-cat", "set -E; false | cat"),
+	("errtrace-middle-false-cat", "set -E; true | false | cat"),
+	("errtrace-first-cmdsub-word-cat", "set -E; false $(:) | cat"),
+	("errtrace-first-group-cat", "set -E; { false; } | cat"),
+	("errtrace-first-subshell-cat", "set -E; ( false ) | cat"),
+	("errtrace-first-function-cat", "set -E; f() { false; }; f | cat"),
+	("errtrace-first-cond-cat", "set -E; [[ -z x ]] | cat"),
+	("errtrace-background-false", "set -E; false & wait $!"),
+	("errtrace-background-group-false", "set -E; { false; } & wait $!"),
+	("errtrace-background-and-list", "set -E; true && false & wait $!"),
+	("errtrace-background-pipeline", "set -E; true | false & wait $!"),
+	("errtrace-background-subshell", "set -E; ( false ) & wait $!"),
+	("lastpipe-last-false", "shopt -s lastpipe; true | false"),
+	// A `[[ ]]` whose status comes from a `!` or from the left side of
+	// `&&` is judged at its end; the plain forms are the controls.
+	("cond-not", "[[ ! -n x ]]"),
+	("cond-and-left", "[[ -z x && -n x ]]"),
+	("cond-plain", "[[ -n '' ]]"),
+	("cond-or", "[[ -n '' || -n '' ]]"),
+	("errtrace-first-cond-not-cat", "set -E; [[ ! -n x ]] | cat"),
+	// A compound element or job led by its own redirection is the
+	// element's own command; `( false ) | cat` is the control.
+	("errtrace-first-subshell-redir-cat", "set -E; ( false ) 2>/dev/null | cat"),
+	("errtrace-first-group-bad-redir-cat", "set -E; { :; } </nope | cat"),
+	("errtrace-background-subshell-redir", "set -E; ( false ) 2>/dev/null & wait $!"),
+	// The parent judges a pipeline's last `( … )` element with the
+	// pipeline's status, then the pipeline (two ERR traps); not a group, a
+	// `!` pipeline, a condition or a job.
+	("last-subshell", "true | ( false )"),
+	("errtrace-last-subshell", "set -E; true | ( false )"),
+	("last-subshell-redir", "true | ( false ) 2>/dev/null"),
+	("last-group", "true | { false; }"),
+	("negated-last-subshell", "! true | ( true )"),
+	("condition-last-subshell", "if true | ( false ); then :; fi"),
+	("background-last-subshell", "true | ( false ) & wait $!"),
+];
+
+/// The ERR shapes only zsh has. `{ } always { }` is judged at its end like
+/// a command, unless a command since ran the trap (the always-list's own
+/// failure). `return N` (N ≠ 0) is a failed command: the ZERR trap runs
+/// inside the function, then the call is not judged again; a `!` around
+/// the return inverts its status.
+const ZSH_ERR_SHAPES: &[(&str, &str)] = &[
+	("always-false-true", "{ false } always { true }"),
+	("always-false-false", "{ false } always { false }"),
+	("always-true-false", "{ true } always { false }"),
+	("always-and-first-false", "{ false && true } always { true }"),
+	("always-in-function", "f() { { false } always { echo al } }; f"),
+	("false-then-return-noarg", "f() { false; return; }; f"),
+	("or-return", "f() { false || return 2; }; f"),
+	("return-in-condition", "f() { return 2; }; if f; then :; fi"),
+	("return-in-or-list", "f() { return 2; }; f || echo or"),
+	("return-in-loop", "f() { for i in 1; do return 3; done; }; f"),
+	("false-then-return-0", "f() { false; return 0; }; f"),
+	("always-return", "f() { { return 2 } always { echo al } }; f"),
+	("always-return-false", "f() { { return 2 } always { false } }; f"),
+	("return-sees-local", "trap 'echo T$?:$v' ZERR; f() { local v=in; return 2; }; f"),
+	("not-return", "f() { ! return 2; }; f"),
+	("not-return-0", "f() { ! return 0; }; f"),
+	("not-group-return", "f() { ! { return 2; }; }; f"),
+	("not-if-return", "f() { ! if true; then return 2; fi; }; f"),
+	("and-not-return", "f() { true && ! return 2; }; f"),
+	("return-in-pipeline", "f() { true | return 2; echo no; }; f"),
+	("return-top-level", "return 2"),
+	("function-trap-false-then-return", "TRAPZERR() { echo F$?; }; f() { false; return 2; }; f"),
+	("source-false-then-return", ". =(print 'false; return 4')"),
+	// zsh judges a pipeline element (forked, or the last one in the shell)
+	// and a job's list nowhere but in the lists nested in them; the
+	// pipeline's or the job's status once.
+	("pipeline-last-group-false", "true | { false; }"),
+	("pipeline-last-group-false-true", "true | { false; true; }"),
+	("pipeline-last-function", "f() { false; }; true | f"),
+	("pipeline-last-subshell", "true | (exit 3)"),
+	("pipeline-last-cond", "true | [[ -z x ]]"),
+	("pipeline-in-loop", "for i in 1; do true | false; done"),
+	("pipeline-pipefail", "setopt pipefail; false | true"),
+	("pipeline-first-false-cat", "false | cat"),
+	("pipeline-middle-false-cat", "true | false | cat"),
+	("pipeline-first-group-cat", "{ false; } | cat"),
+	("pipeline-first-subshell-cat", "( false ) | cat"),
+	("pipeline-first-function-cat", "f() { false; }; f | cat"),
+	("pipeline-first-cond-cat", "[[ -z x ]] | cat"),
+	("background-false", "false & wait $!"),
+	("background-group-false", "{ false; } & wait $!"),
+	("background-and-list", "true && false & wait $!"),
+	("background-pipeline", "true | false & wait $!"),
+	("background-subshell", "( false ) & wait $!"),
+];
+
+/// The ERR rows, `err/<n|e>/<name>`: each shape after `trap 'echo T$?'
+/// ERR`, then `echo end:$?`; `e` rows also set `-e`.
+fn errs(dialect: Dialect) -> Vec<Row> {
+	let (key, errexit) = if dialect == Dialect::Bash {
+		("ERR", "set -e; ")
+	} else {
+		("ZERR", "setopt errexit; ")
+	};
+	let own = if dialect == Dialect::Bash {
+		BASH_ERR_SHAPES
+	} else {
+		ZSH_ERR_SHAPES
+	};
+	let mut rows = Vec::new();
+	for &(name, shape) in ERR_SHAPES.iter().chain(own) {
+		for (tag, e) in [("n", ""), ("e", errexit)] {
+			rows.push((
+				format!("err/{tag}/{name}"),
+				format!("{e}trap 'echo T$?' {key}; {shape}; echo end:$?"),
+			));
+		}
+	}
+	rows
+}
+
+/// The `.` file shapes of both dialects, `source/<name>`: (name, the
+/// file's text, the code that sources it as `./s.sh` or a procsub). The
+/// file is made in a fresh directory, sourced by a relative name (a
+/// message names it), and removed after.
+const SOURCE_SHAPES: &[(&str, &str, &str)] = &[(
+	"file-own-loop-break2",
+	"for j in 1 2; do echo j$j; break 2; done; echo in",
+	"for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+)];
+
+/// [`SOURCE_SHAPES`] only bash has: its `source` keeps `loop_level`, so a
+/// `break` or `continue` in a `.` file (a file or a procsub) leaves the
+/// caller's loop; a `.` file's RETURN trap runs inside the caller's loops
+/// too (its `break` leaves them, after the file returned, with the file's
+/// status), and a `break` that leaves the file runs no RETURN trap.
+const BASH_SOURCE_SHAPES: &[(&str, &str, &str)] = &[
+	(
+		"file-break",
+		"echo s; break; echo x",
+		"for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-continue",
+		"echo s; continue; echo x",
+		"for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-source-break",
+		"echo s; break; echo x",
+		"for i in 1 2; do echo a$i; source ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-break2",
+		"echo s; break 2; echo x",
+		"for o in X Y; do echo o$o; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done; echo \
+		 c$o:$?; done",
+	),
+	(
+		"procsub-break",
+		"",
+		"for i in 1 2; do echo a$i; . <(echo 'echo s; break; echo x'); echo b$i:$?; done",
+	),
+	(
+		"procsub-continue",
+		"",
+		"for i in 1 2; do echo a$i; . <(echo 'echo s; continue; echo x'); echo b$i:$?; done",
+	),
+	// A `.` of `/dev/stdin` fed by a here-string is a `.` file too.
+	(
+		"herestring-break",
+		"",
+		"for i in 1 2; do echo a$i; . /dev/stdin <<< \"echo s; break; echo x\"; echo b$i:$?; done",
+	),
+	(
+		"herestring-continue",
+		"",
+		"for i in 1 2; do echo a$i; . /dev/stdin <<< \"echo s; continue; echo x\"; echo b$i:$?; done",
+	),
+	(
+		"herestring-break2",
+		"",
+		"for o in X Y; do echo o$o; for i in 1 2; do echo a$i; . /dev/stdin <<< \"echo s; break 2; \
+		 echo x\"; echo b$i:$?; done; echo c$o:$?; done",
+	),
+	// The file's own loop takes its `break`; the file goes on.
+	(
+		"file-own-loop-break",
+		"for k in a b; do echo $k; break; done; echo in",
+		". ./s.sh; echo top:$?",
+	),
+	(
+		"return-trap-break",
+		"echo s",
+		"trap 'echo r; break' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"return-trap-continue",
+		"echo s",
+		"trap 'echo r; continue' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"return-trap-status",
+		"echo s; return 3",
+		"trap 'false; break' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-break-runs-no-return-trap",
+		"echo s; break; echo x",
+		"trap 'echo r' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	// bash names a diagnostic after `BASH_SOURCE[0]`: the `.` file, or the
+	// file a function was defined in (`$0` for one defined in the `-c`
+	// string), however deep the error.
+	("file-break-top", "echo s; break; echo x", ". ./s.sh; echo top:$?"),
+	(
+		"file-break-in-function",
+		"echo s; break; echo x",
+		"f() { . ./s.sh; echo f:$?; }; for i in 1 2; do echo a$i; f; echo b$i:$?; done",
+	),
+	("file-command-not-found", "nosuchcmd_q", ". ./s.sh; echo top:$?"),
+	("file-unbound", "set -u; echo $nosuchvar_q", "( . ./s.sh ); echo top:$?"),
+	("file-defines-function", "g() { break; }", ". ./s.sh; for i in 1; do g; done; echo top:$?"),
+	("file-calls-main-function", "f", "f() { break; }; for i in 1; do . ./s.sh; done; echo top:$?"),
+	("main-function", "", "f() { nosuchcmd_q; }; f; echo top:$?"),
+	("file-nested", "printf \"%s\\n\" break > t.sh; . ./t.sh", ". ./s.sh; echo top:$?"),
+	("file-syntax-error", "if", ". ./s.sh; echo top:$?"),
+	("file-eval-error", "eval nosuchcmd_q", ". ./s.sh; echo top:$?"),
+	("file-cmdsub-error", "x=$(nosuchcmd_q)", ". ./s.sh; echo top:$?"),
+	("file-subshell-error", "(nosuchcmd_q)", ". ./s.sh; echo top:$?"),
+	// A `return` from inside the file's own loop: its RETURN trap runs
+	// after bash restored `loop_level` (`_evalfile`), so the file's loop is
+	// out of its reach; the caller's loops are in it.
+	(
+		"file-loop-return-trap-break",
+		"for j in 1; do return 3; done",
+		"trap 'echo r; break; echo r2' RETURN; . ./s.sh; echo after:$?",
+	),
+	(
+		"file-loop-return-trap-break2-caller",
+		"for j in 1; do return 3; done",
+		"trap 'break 2' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i; done; echo end:$?",
+	),
+	(
+		"file-loop-return-trap-continue-caller",
+		"for j in 1; do return 3; done",
+		"trap 'continue' RETURN; for i in 1 2; do echo a$i; . ./s.sh; echo b$i; done; echo end:$?",
+	),
+];
+
+/// [`SOURCE_SHAPES`] only zsh has: its `.` does not count the caller's
+/// loops, so a `break` there is an error, which ends the file; an error
+/// that ends a `.` file makes it return 126 (`bin_dot`'s `128 -
+/// SOURCE_ERROR`), at any depth below it; a math error inside `(( ))` is
+/// no such error, nor are a failure or a `return` (the controls).
+const ZSH_SOURCE_SHAPES: &[(&str, &str, &str)] = &[
+	(
+		"file-break",
+		"echo s; break; echo x",
+		"for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-continue",
+		"echo s; continue; echo x",
+		"for i in 1 2; do echo a$i; . ./s.sh; echo b$i:$?; done",
+	),
+	(
+		"file-source-break",
+		"echo s; break; echo x",
+		"for i in 1 2; do echo a$i; source ./s.sh; echo b$i:$?; done",
+	),
+	("file-break-top", "echo s; break; echo x", ". ./s.sh; echo top:$?"),
+	(
+		"file-break-in-function",
+		"echo s; break; echo x",
+		"f() { . ./s.sh; echo f:$?; }; for i in 1 2; do echo a$i; f; echo b$i:$?; done",
+	),
+	(
+		"file-nested-break",
+		"printf \"%s\\n\" break > t.sh; . ./t.sh; echo in:$?",
+		". ./s.sh; echo top:$?",
+	),
+	("file-math-syntax-error", "echo s; echo $(( 1 + )); echo x", ". ./s.sh; echo top:$?"),
+	("file-unset-error", "echo s; : ${x?unset}; echo x", "( . ./s.sh ); echo top:$?"),
+	("file-break-errexit", "echo s; break; echo x", "setopt errexit; . ./s.sh; echo top:$?"),
+	("file-math-division-error", "echo s; (( 1/0 )); echo x", ". ./s.sh; echo top:$?"),
+	("file-false", "echo s; false", ". ./s.sh; echo top:$?"),
+	("file-return", "echo s; return 3; echo x", ". ./s.sh; echo top:$?"),
+	// Under `ERR_EXIT` zsh exits inside the file with the error's status,
+	// unless the `.` runs in a condition; `ERR_RETURN` judges the `.`'s
+	// 126; the error's `errflag` keeps the ZERR trap from running for the
+	// `.` command, not for the next one.
+	(
+		"file-break-errexit-condition",
+		"echo s; break; echo x",
+		"setopt errexit; if . ./s.sh; then echo t; else echo f:$?; fi; echo top:$?",
+	),
+	(
+		"file-break-errexit-or",
+		"echo s; break; echo x",
+		"setopt errexit; . ./s.sh || echo or:$?; echo top:$?",
+	),
+	(
+		"file-break-errexit-function",
+		"echo s; break; echo x",
+		"setopt errexit; f() { . ./s.sh; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"file-break-errreturn-function",
+		"echo s; break; echo x",
+		"setopt err_return; f() { . ./s.sh; echo f:$?; }; f; echo top:$?",
+	),
+	(
+		"file-break-errreturn-top",
+		"echo s; break; echo x",
+		"setopt err_return; . ./s.sh; echo top:$?",
+	),
+	("file-break-zerr", "echo s; break; echo x", "trap 'echo Z$?' ZERR; . ./s.sh; echo top:$?"),
+	(
+		"file-break-zerr-errexit",
+		"echo s; break; echo x",
+		"setopt errexit; trap 'echo Z$?' ZERR; . ./s.sh; echo top:$?",
+	),
+	(
+		"file-break-zerr-then-false",
+		"echo s; break; echo x",
+		"trap 'echo Z$?' ZERR; . ./s.sh; false; echo top:$?",
+	),
+];
+
+/// The `.` file rows, `source/<name>`.
+fn sources(dialect: Dialect) -> Vec<Row> {
+	let own = if dialect == Dialect::Bash {
+		BASH_SOURCE_SHAPES
+	} else {
+		ZSH_SOURCE_SHAPES
+	};
+	SOURCE_SHAPES
+		.iter()
+		.chain(own)
+		.map(|&(name, file, code)| {
+			(
+				format!("source/{name}"),
+				format!(
+					"d=$(mktemp -d); cd \"$d\"; printf '%s\\n' '{file}' > s.sh; {code}; echo e:$?; cd \
+					 /; rm -r \"$d\""
+				),
+			)
+		})
+		.collect()
+}
+
 /// stderr with the program's name before `: ` written `SH` (bash names
 /// itself by its path, and bash 5.2.21 a function's error `environment`).
 fn normalized_stderr(stderr: &[u8]) -> String {
@@ -806,7 +1736,8 @@ enum Runner<'a> {
 }
 
 /// Run row `id`'s `script` as `dialect` with `runner`: with `-c`, or for a
-/// `fatal/s/` row from the script file `s.sh` in a directory of its own.
+/// `fatal/s/` or `exit/s/` row from the script file `s.sh` in a directory
+/// of its own.
 fn run_row(dialect: Dialect, runner: Runner<'_>, id: &str, script: &str) -> Outcome {
 	let mut cmd = match runner {
 		Runner::Oracle(program) => command(program),
@@ -821,7 +1752,7 @@ fn run_row(dialect: Dialect, runner: Runner<'_>, id: &str, script: &str) -> Outc
 		}
 		cmd.arg("-f");
 	}
-	let out = if id.starts_with("fatal/s/") {
+	let out = if id.starts_with("fatal/s/") || id.starts_with("exit/s/") {
 		static NEXT: AtomicUsize = AtomicUsize::new(0);
 		let dir = env::temp_dir().join(format!(
 			"pi-loop-{}-{}",
@@ -956,8 +1887,9 @@ fn assert_rows(dialect: Dialect, prefix: &str, rows: &[Row]) {
 	assert_recorded(dialect, rows, &got, &record);
 }
 
-/// Rows run under snapshots: each forks its child inside a loop and runs
-/// no program (an external in flight skips a snapshot).
+/// Rows run under snapshots: each forks its child inside a loop (or, in
+/// zsh, inside a trap action: `VprocZsh::in_trap`) and runs no program (an
+/// external in flight skips a snapshot).
 const BASH_SNAPSHOT_ROWS: &[&str] = &[
 	"grid/for/break/none/last/none",
 	"grid/while/continue/2/first/pipefail",
@@ -979,6 +1911,8 @@ const ZSH_SNAPSHOT_ROWS: &[&str] = &[
 	"grid/function/break/none/first/none",
 	"fork/x1/cmdsub-exit-trap",
 	"fork/x1/bg-subshell",
+	"trap/own/zerr-in-subshell-in-signal-trap",
+	"trap/own/zerr-in-job-from-signal-trap",
 ];
 
 /// The grid in bash: a simple command forked as an element keeps the loop
@@ -1010,15 +1944,109 @@ fn zsh_forks_match_zsh() {
 	assert_rows(Dialect::Zsh, "fork/", &forks(Dialect::Zsh));
 }
 
+/// `break` and `continue` in a trap action, in bash: a signal, ERR, DEBUG
+/// or RETURN trap runs inside the loops of the code it interrupted
+/// (`parse_and_execute` keeps `loop_level`), so its `break` leaves the
+/// trap and then the loop; the rest of the action is skipped.
+#[test]
+fn bash_traps_match_bash() {
+	let rows: Vec<Row> = traps(Dialect::Bash)
+		.into_iter()
+		.chain(trap_shapes(Dialect::Bash))
+		.collect();
+	assert_rows(Dialect::Bash, "trap/", &rows);
+}
+
+/// The same in zsh (signal, ZERR and DEBUG traps): `loops` reaches into a
+/// trap action.
+#[test]
+fn zsh_traps_match_zsh() {
+	let rows: Vec<Row> = traps(Dialect::Zsh)
+		.into_iter()
+		.chain(trap_shapes(Dialect::Zsh))
+		.collect();
+	assert_rows(Dialect::Zsh, "trap/", &rows);
+}
+
+/// The ERR trap runs once per failed command in bash: a loop, group, `if`
+/// or `case` that takes its status from a command already judged runs it
+/// no second time.
+#[test]
+fn bash_err_trap_runs_once() {
+	assert_rows(Dialect::Bash, "err/", &errs(Dialect::Bash));
+}
+
+/// The same for zsh's ZERR trap.
+#[test]
+fn zsh_err_trap_runs_once() {
+	assert_rows(Dialect::Zsh, "err/", &errs(Dialect::Zsh));
+}
+
+/// bash: a `break` or `continue` in a `.` file (a file or a procsub) and
+/// in its RETURN trap leaves the caller's loop.
+#[test]
+fn bash_source_matches_bash() {
+	assert_rows(Dialect::Bash, "source/", &sources(Dialect::Bash));
+}
+
+/// zsh: a `.` file does not see the caller's loops.
+#[test]
+fn zsh_source_matches_zsh() {
+	assert_rows(Dialect::Zsh, "source/", &sources(Dialect::Zsh));
+}
+
 /// The fatal errors of forked simple commands in bash ([`FATALS`]).
 #[test]
 fn bash_fatal_errors_match_bash() {
 	assert_rows(Dialect::Bash, "fatal/", &fatals());
 }
 
+/// The loops the EXIT trap of `exit` sees, from a script file
+/// (`exit/s/<name>`) and with `-c` (`exit/c/<name>`): bash's `loop_level`
+/// as the exit left it. A function starts at level 0, and the exit's jump
+/// out of `parse_and_execute` (a `-c` string, `eval`, `.`, a trap action)
+/// restores the level saved there; a script file's loops stay. A `break`
+/// that reaches past the trap ends it silently.
+const EXIT_LOOP_SHAPES: &[(&str, &str)] = &[
+	("top-loop", "trap 'break; echo t' EXIT; for i in 1; do exit 3; done"),
+	("function-loop", "trap 'break; echo t' EXIT; f() { for i in 1; do exit 3; done; }; f"),
+	("loop-function", "trap 'break; echo t' EXIT; f() { exit 3; }; for i in 1; do f; done"),
+	("eval-loop", "trap 'break; echo t' EXIT; eval 'for i in 1; do exit 3; done'"),
+	("loop-eval", "trap 'break; echo t' EXIT; for i in 1; do eval 'exit 3'; done"),
+	("no-loop", "trap 'break; echo t' EXIT; exit 3"),
+	("continue-loop", "trap 'continue; echo t' EXIT; for i in 1 2; do echo a$i; exit 3; done"),
+	(
+		"two-loops",
+		"trap 'echo t0; break 2; echo t' EXIT; for o in 1; do for i in 1; do exit 3; done; done",
+	),
+	("end-of-script", "trap 'break; echo t' EXIT; for i in 1; do :; done"),
+	(
+		"subshell-loop",
+		"trap 'break; echo t' EXIT; ( trap 'break; echo s' EXIT; for i in 1; do exit 3; done ); \
+		 echo st=$?",
+	),
+];
+
+/// The EXIT-trap rows: each [`EXIT_LOOP_SHAPES`] shape from a script and
+/// with `-c`.
+fn exit_loops() -> Vec<Row> {
+	EXIT_LOOP_SHAPES
+		.iter()
+		.flat_map(|&(name, x)| {
+			[(format!("exit/c/{name}"), x.to_owned()), (format!("exit/s/{name}"), x.to_owned())]
+		})
+		.collect()
+}
+
+/// The EXIT trap of `exit` sees the loops bash's does ([`EXIT_LOOP_SHAPES`]).
+#[test]
+fn bash_exit_traps_see_the_exit_loops() {
+	assert_rows(Dialect::Bash, "exit/", &exit_loops());
+}
+
 /// Run the rows `ids` names under [`Runner::ObashSnapshots`] and assert
 /// the recorded outcome of each: a forked child's loops
-/// (`Vproc::outer_loops`) and where its fatal error ends
+/// (`Vproc::outer_loops`), zsh's `intrap` and where a fatal error ends
 /// (`Frame::command_loop`) survive the frames image.
 fn assert_rows_under_snapshots(dialect: Dialect, ids: &[&str]) {
 	let fatal = if dialect == Dialect::Bash {
@@ -1029,6 +2057,7 @@ fn assert_rows_under_snapshots(dialect: Dialect, ids: &[&str]) {
 	let rows: Vec<Row> = grid(dialect)
 		.into_iter()
 		.chain(forks(dialect))
+		.chain(trap_shapes(dialect))
 		.chain(fatal)
 		.filter(|(id, _)| ids.contains(&id.as_str()))
 		.collect();

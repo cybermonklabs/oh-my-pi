@@ -239,6 +239,15 @@ pub fn listed(
 	Ok(vars)
 }
 
+/// `BASH_SOURCE[0]` as the call stack holds it: the file of the innermost
+/// `.` file or function (the file it was defined in). `None` outside both.
+pub fn innermost_file(vp: &Vproc) -> Option<&BString> {
+	vp.calls.iter().rev().find_map(|c| match &c.kind {
+		CallKind::Function { file, .. } | CallKind::Source { file, .. } => Some(file),
+		CallKind::Args(_) => None,
+	})
+}
+
 /// The file a function defined now records as its source (bash's
 /// `make_function_def`): `BASH_SOURCE[0]`, else `$0` (a `-c` string or a
 /// script on standard input).
@@ -251,11 +260,7 @@ pub fn definition_file(
 	store: &mut dyn StateStore,
 	vp: &Vproc,
 ) -> Result<BString, StoreError> {
-	let innermost = vp.calls.iter().rev().find_map(|c| match &c.kind {
-		CallKind::Function { file, .. } | CallKind::Source { file, .. } => Some(file),
-		CallKind::Args(_) => None,
-	});
-	if let Some(file) = innermost {
+	if let Some(file) = innermost_file(vp) {
 		return Ok(file.clone());
 	}
 	if has_main(store, vp)? {

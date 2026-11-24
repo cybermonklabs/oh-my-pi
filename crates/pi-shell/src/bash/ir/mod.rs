@@ -93,6 +93,7 @@ pub(crate) use self::lower::{
 use crate::bash::{
 	event::{EventKind, EventMask, NodeKind, RedirKind},
 	ids::{AstNodeId, ModeId, UnitId},
+	trace::syntax::UnitSyntax,
 };
 
 /// IR version; part of the frames header.
@@ -267,6 +268,14 @@ pub struct Unit {
 	/// executable state.
 	#[serde(skip)]
 	pub(crate) trace_syntax: std::sync::OnceLock<Arc<crate::bash::trace::syntax::UnitSyntax>>,
+	/// The syntax tree [`Unit::with_command`] prints a command from
+	/// (`BASH_COMMAND`, a traced `for`, `select` or `case` head) when no
+	/// observed compilation kept one: kept at compile time for a command
+	/// whose source does not parse back to its tree (an alias expanded in
+	/// it), else parsed again from the source the first time it is asked
+	/// for; `None` inside when it cannot be. Not executable state.
+	#[serde(skip)]
+	pub(crate) kept_syntax:  OnceLock<Option<Arc<UnitSyntax>>>,
 	/// Code.
 	pub ops:                 Vec<Op>,
 	/// Syntax nodes by [`AstNodeId`].
@@ -319,6 +328,7 @@ impl Unit {
 			line: 1,
 			deferred: None,
 			trace_syntax: std::sync::OnceLock::new(),
+			kept_syntax: OnceLock::new(),
 			ops: Vec::new(),
 			nodes: Vec::new(),
 			words: Vec::new(),
@@ -423,6 +433,34 @@ impl Unit {
 	/// The node record of `id`, if any.
 	pub fn node(&self, id: AstNodeId) -> Option<&NodeInfo> {
 		self.nodes.get(id.0 as usize)
+	}
+
+	/// `f` of command node `node` as the parser built it, from the tree an
+	/// observed compilation kept, else from [`Unit::kept_syntax`] (the
+	/// unit's source parsed again in its parser context once,
+	/// [`UnitSyntax::restore`], when compiling kept none). `None` when that
+	/// tree has no command `node` at the span the unit records for it.
+	pub(crate) fn with_command<T>(
+		&self,
+		node: u32,
+		f: impl FnOnce(crate::bash::syntax::Command<'_>) -> T,
+	) -> Option<T> {
+		let syntax = match self.trace_syntax.get() {
+			Some(syntax) => syntax,
+			None => self
+				.kept_syntax
+				.get_or_init(|| UnitSyntax::restore(self).map(Arc::new))
+				.as_ref()?,
+		};
+		let info = self.nodes.get(node as usize)?;
+		let tree = &syntax.tree.tree;
+		let at = tree.nodes.iter().position(|n| {
+			n.kind == crate::bash::syntax::tree::K::Command
+				&& n.id == node
+				&& n.lo.checked_sub(syntax.offset) == Some(info.lo)
+				&& n.hi.checked_sub(syntax.offset) == Some(info.hi)
+		})?;
+		Some(f(crate::bash::syntax::Command::at(tree, u32::try_from(at).ok()?)))
 	}
 
 	/// Approximate heap size, for the engine's unit cache budget.
