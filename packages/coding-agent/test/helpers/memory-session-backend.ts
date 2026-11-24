@@ -1,9 +1,10 @@
 /**
  * Indexed session storage backends that keep each session's text in a map,
- * for tests of what a full write hands its backend: one with only a whole
- * write, and one that also takes a streamed write. A test that needs a
- * backend which differs in a few methods extends {@link MemoryBackend} and
- * overrides only those.
+ * for tests of what a full write hands its backend and what a read takes from
+ * it: one with only a whole write, and one that also takes a streamed write.
+ * Both record the bytes of each whole full write and each path a whole read
+ * reads. A test that needs a backend which differs in a few methods extends
+ * {@link MemoryBackend} and overrides only those.
  */
 import type {
 	SessionStorageBackend,
@@ -12,11 +13,13 @@ import type {
 
 /**
  * A backend that keeps each session's text in memory and stores a full write
- * as it is given; it records the bytes of each whole full write.
+ * as it is given; it records the bytes of each whole full write and each path
+ * `readFull` reads.
  */
 export class MemoryBackend implements SessionStorageBackend {
 	readonly sessions = new Map<string, string>();
 	readonly writeFullBytes: number[] = [];
+	readonly readFullPaths: string[] = [];
 
 	init(): Promise<void> {
 		return Promise.resolve();
@@ -25,6 +28,7 @@ export class MemoryBackend implements SessionStorageBackend {
 		return Promise.resolve([]);
 	}
 	readFull(path: string): Promise<string | null> {
+		this.readFullPaths.push(path);
 		return Promise.resolve(this.sessions.get(path) ?? null);
 	}
 	readSlices(): Promise<[string, string]> {

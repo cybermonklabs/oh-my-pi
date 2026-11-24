@@ -102,19 +102,6 @@ async function rewriteBothWays(storage: SqlSessionStorage): Promise<{ stored: st
 	};
 }
 
-/**
- * A {@link MemoryBackend}, which has no streamed full write, that records each
- * path `readFull` reads.
- */
-class NoStreamBackend extends MemoryBackend {
-	readonly readFullPaths: string[] = [];
-
-	override readFull(path: string): Promise<string | null> {
-		this.readFullPaths.push(path);
-		return super.readFull(path);
-	}
-}
-
 describe("SQL session storage full rewrites when the spool cannot be used", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -313,7 +300,7 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 		process.env.TMPDIR = pathUnderRegularFile(tmp);
 		vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const error = vi.spyOn(logger, "error").mockImplementation(() => {});
-		const backend = new NoStreamBackend();
+		const backend = new MemoryBackend();
 		const storage = new IndexedSessionStorage(backend);
 		await storage.initialize();
 		const before = sessionLines("before", 1).join("");
@@ -354,7 +341,7 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 		process.env.TMPDIR = pathUnderRegularFile(tmp);
 		vi.spyOn(logger, "warn").mockImplementation(() => {});
 		vi.spyOn(logger, "error").mockImplementation(() => {});
-		const backend = new NoStreamBackend();
+		const backend = new MemoryBackend();
 		const storage = new IndexedSessionStorage(backend);
 		await storage.initialize();
 		const lines = sessionLines("already stored");

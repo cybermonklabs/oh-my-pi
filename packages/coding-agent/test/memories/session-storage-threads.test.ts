@@ -83,14 +83,8 @@ function messageLine(index: number, body: string): string {
 	return JSON.stringify({ type: "message", id: `m${index}`, message });
 }
 
-/** Sessions in a map, read only whole as Redis and SDK backends read them (no `readChunks`), counting the reads. */
+/** Sessions in a map, read only whole as Redis and SDK backends read them (no `readChunks`). */
 class WholeReadBackend extends MemoryBackend {
-	fullReads = 0;
-
-	override readFull(path: string): Promise<string | null> {
-		this.fullReads++;
-		return super.readFull(path);
-	}
 	override readSlices(): Promise<[string, string]> {
 		return Promise.reject(new Error("stage 1 reads no slices"));
 	}
@@ -167,9 +161,9 @@ describe("memories over the session storage", () => {
 		await storage.writeText(rollout, raw);
 
 		for (const limit of [100_000, 10_000_000]) {
-			backend.fullReads = 0;
+			backend.readFullPaths.length = 0;
 			expect(await buildStage1RolloutItems(rollout, limit, storage)).toBe(referenceItems(raw, limit));
-			expect({ limit, fullReads: backend.fullReads }).toEqual({ limit, fullReads: 1 });
+			expect({ limit, fullReads: backend.readFullPaths.length }).toEqual({ limit, fullReads: 1 });
 		}
 	});
 });
