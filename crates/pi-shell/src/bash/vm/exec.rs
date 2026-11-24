@@ -356,6 +356,16 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		if !matches!(flow, Flow::Block(_)) {
 			unblock(k, cx, vp);
 		}
+		// bash writes an error's message at once, to the stderr the
+		// redirections in force left (`: 2>/dev/null 3>"${x:?}"` and
+		// `{ x=${y:?}; } 2>/dev/null` print none): before the jump that ends
+		// the command, its list or the shell undoes them (the op's own here,
+		// its frames' in the unwind).
+		if unit.mode.dialect() == Dialect::Bash
+			&& matches!(flow, Flow::Exit(_) | Flow::Discard(_) | Flow::Abort(_))
+		{
+			let _ = flush_out(k, vp);
+		}
 		// The op is over unless it parks or called a frame: drop its scratch
 		// and close its process substitutions.
 		if !matches!(flow, Flow::Block(_) | Flow::Call) {
