@@ -1994,15 +1994,20 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 			let checkhash =
 				state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Checkhash)
 					.unwrap_or(false);
+			// bash's `phash_search`: an entry in the current directory itself
+			// (`./s`, as bash hashes a find through `PATH=.` or an empty
+			// entry) is taken only while it is an executable file there, else
+			// the name is searched again (`HASH_CHKDOT`); zsh takes any entry.
+			let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 			match hashed {
 				// bash runs a hashed name without searching PATH.
-				Some((path, hits)) if !checkhash => {
+				Some((path, hits)) if !checkhash && (zsh || !probe::hashed_in_cwd(&path)) => {
 					let rec = Record::CmdHash { path: path.clone(), hits: hits.saturating_add(1) };
 					let key = KeyBuf::CmdHash(name.clone());
 					state::store_record(&mut k.root, cx.store, vp, key, Some(rec));
 					// `hash` keeps bash's display path (`./e` for an empty
-					// PATH entry): a file relative to the shell's cwd.
-					let target = absolute(&vp.cwd, &path);
+					// PATH entry, `bin/u`): a file relative to the shell's cwd.
+					let target = hashed_target(vp, &path);
 					sc.exec.as_mut().expect("exec").target = Some(Target::External(target));
 				},
 				hashed => {
@@ -2015,17 +2020,14 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 							.and_then(|v| v.as_scalar().map(BString::from))
 							.unwrap_or_default()
 					};
-					// `checkhash`: the hashed path first, if it is still an
-					// executable file.
+					// `checkhash`, or an entry in the current directory: the
+					// hashed file first, if it is still an executable file.
 					// zsh `pathdirs` (a name with a slash searched): the name
 					// itself first.
 					let mut cands: Vec<BString> = hashed
-						.map(|(p, _)| absolute(&vp.cwd, &p))
+						.map(|(p, _)| hashed_target(vp, &p))
 						.into_iter()
-						.chain(
-							(vp.mode.dialect() == crate::bash::ids::Dialect::Zsh && name.contains(&b'/'))
-								.then(|| absolute(&vp.cwd, &name)),
-						)
+						.chain((zsh && name.contains(&b'/')).then(|| absolute(&vp.cwd, &name)))
 						.collect();
 					let extensions = probe::executable_extensions(k, cx, vp);
 					cands.extend(candidates(
@@ -2059,13 +2061,20 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 					&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Hashall)
 						.unwrap_or(true)
 				{
+					// bash hashes the file as it built it (`./s` for `PATH=.`);
+					// a file the hash table gave keeps its entry.
+					let shown = if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+						path.clone()
+					} else {
+						searched_name(k, cx, vp, &name, &path, false)
+					};
 					let hits = match state::record(cx.store, vp, Key::CmdHash(BStr::new(&name))) {
-						Ok(Some(Record::CmdHash { path: old, hits })) if *old == path => {
+						Ok(Some(Record::CmdHash { path: old, hits })) if *old == shown => {
 							hits.saturating_add(1)
 						},
 						_ => 1,
 					};
-					let rec = Record::CmdHash { path: path.clone(), hits };
+					let rec = Record::CmdHash { path: shown, hits };
 					state::store_record(&mut k.root, cx.store, vp, KeyBuf::CmdHash(name), Some(rec));
 				}
 				sc.exec.as_mut().expect("exec").target = Some(Target::External(path));
@@ -2598,8 +2607,7 @@ fn spawned_external(
 		Err(err) => {
 			// bash names the file it tried: the PATH (or hash table)
 			// result, a name with `/` as written.
-			let name = st(vp).argv[0].clone();
-			let name = if name.contains(&b'/') { name } else { path };
+			let name = program_name(k, cx, vp, &path, false);
 			let (diag, status) = spawn_error(name, err);
 			k.diag(cx, vp, line, diag);
 			let s = st(vp);
@@ -4816,7 +4824,7 @@ fn run_script_file(
 		Err(key) => return Some(Flow::Block(key)),
 		Ok(ProbeResult::Bytes(Ok(text))) => text,
 		Ok(ProbeResult::Bytes(Err(msg))) => {
-			let name = st(vp).argv[0].clone();
+			let name = program_name(k, cx, vp, &path, true);
 			k.diag(cx, vp, line, Diag::Usage { msg: format!("{name}: {msg}").into() });
 			let s = st(vp);
 			s.status = 126;
@@ -4827,7 +4835,7 @@ fn run_script_file(
 		Ok(_) => BString::default(),
 	};
 	if looks_binary(&text) {
-		let name = st(vp).argv[0].clone();
+		let name = program_name(k, cx, vp, &path, true);
 		k.diag(cx, vp, line, Diag::BinaryFile { name });
 		let s = st(vp);
 		s.status = 126;
@@ -4848,10 +4856,83 @@ fn run_script_file(
 		}
 	};
 	// `$0` is the file bash tried: a name with `/` as written, else the
-	// PATH (or hash table) result.
-	let name = st(vp).argv[0].clone();
-	let file = if name.contains(&b'/') { name } else { path };
+	// PATH (or hash table) result as bash built it.
+	let file = program_name(k, cx, vp, &path, true);
 	super::nested::start_script(k, vp, cx, &env, &file, &text)
+}
+
+/// The name bash gives the program a command runs: a name with `/` as
+/// written, else the file its PATH search (or hash table) gave as bash
+/// built it, `dir/name` with the entry as written (`./s` for `PATH=.`,
+/// `bin/s`), not the absolute path `path` the search probed. `executable`:
+/// the file proved to be one (the OS ran it, or refused it as a script or
+/// a binary file of another format). zsh names `path`, and so does `exec`
+/// (bash's `exec` names the file made absolute, `full_pathname`).
+fn program_name(
+	k: &Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	path: &BString,
+	executable: bool,
+) -> BString {
+	let argv0 = st(vp).argv[0].clone();
+	if argv0.contains(&b'/') {
+		return argv0;
+	}
+	if st(vp).exec_as.is_some() || vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		return path.clone();
+	}
+	searched_name(k, cx, vp, &argv0, path, executable)
+}
+
+/// The file the search for `name` found at `path` (absolute) as bash built
+/// it: `dir/name` for the `$PATH` entry `path` came from
+/// ([`probe::shown_candidate`]), or the hash table's relative entry when
+/// the hash table gave `path` (`bin/u`, read as `./bin/u` while it is an
+/// `executable` file, as bash's `phash_search` reads it); `path` itself on
+/// Windows (`PATHEXT` spellings) or when no entry gave it (`command -p`).
+fn searched_name(
+	k: &Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	name: &[u8],
+	path: &BString,
+	executable: bool,
+) -> BString {
+	let platform = k.engine.config().platform;
+	if platform == crate::bash::ids::Platform::Windows {
+		return path.clone();
+	}
+	if let Ok(Some(Record::CmdHash { path: hashed, .. })) =
+		state::record(cx.store, vp, Key::CmdHash(BStr::new(name)))
+		&& probe::hashed_relative(hashed)
+	{
+		let dotted = probe::hashed_dotted(hashed);
+		if absolute(&vp.cwd, &dotted) == *path {
+			return if executable { dotted } else { hashed.clone() };
+		}
+	}
+	let var = state::lookup(&k.root, cx.store, vp, b"PATH")
+		.ok()
+		.flatten()
+		.and_then(|v| v.as_scalar().map(BString::from))
+		.unwrap_or_default();
+	candidates(&var, name, &vp.cwd, platform, &[])
+		.iter()
+		.position(|c| c == path)
+		.and_then(|i| probe::shown_candidate(&var, name, i))
+		.unwrap_or_else(|| path.clone())
+}
+
+/// The file the hash table entry `entry` names: bash's `phash_search`
+/// reads a relative entry (`bin/u`) from the current directory as
+/// `./bin/u` ([`probe::hashed_dotted`]); zsh runs an entry as it is.
+fn hashed_target(vp: &Vproc, entry: &[u8]) -> BString {
+	if vp.mode.dialect() != crate::bash::ids::Dialect::Zsh && probe::hashed_relative(entry) {
+		absolute(&vp.cwd, &probe::hashed_dotted(entry))
+	} else {
+		absolute(&vp.cwd, entry)
+	}
 }
 
 /// The answer to `probe` for the command running in `vp` (cached in its
@@ -5006,12 +5087,6 @@ fn refused(
 		return zsh_refused(k, vp, cx, line, path, code);
 	}
 	let err = std::io::Error::from_raw_os_error(code);
-	// bash names the file it tried: the PATH (or hash table) result, a name
-	// with `/` as written.
-	let name = {
-		let n = st(vp).argv[0].clone();
-		if n.contains(&b'/') { n } else { path.clone() }
-	};
 	let enoent = err.kind() == ErrorKind::NotFound;
 	let mut status = if enoent { 127 } else { 126 };
 	let stat = match command_probe(k, cx, vp, &Probe::Stat { path: path.clone(), follow: true }) {
@@ -5019,34 +5094,38 @@ fn refused(
 		Ok(ProbeResult::Stat(stat)) => stat,
 		Ok(_) => None,
 	};
-	let diag = if stat.as_ref().is_some_and(|s| s.kind == StatKind::Dir) {
+	let dir = stat.as_ref().is_some_and(|s| s.kind == StatKind::Dir);
+	// bash's `executable_file`: it exists, is not a directory and may be
+	// executed.
+	let executable = !dir
+		&& stat.is_some()
+		&& match command_probe(k, cx, vp, &Probe::Access { path: path.clone(), mode: 4 }) {
+			Err(key) => return Some(Flow::Block(key)),
+			Ok(ProbeResult::Ok(ok)) => ok,
+			Ok(_) => false,
+		};
+	// bash names the file it tried: the PATH (or hash table) result, a name
+	// with `/` as written.
+	let name = program_name(k, cx, vp, path, executable);
+	let diag = if dir {
 		Diag::IsADirectory { name }
+	} else if !executable
+		|| matches!(err.kind(), ErrorKind::ArgumentListTooLong | ErrorKind::OutOfMemory)
+	{
+		Diag::Refused { name, err }
 	} else {
-		// bash's `executable_file`: it exists and may be executed.
-		let executable = stat.is_some()
-			&& match command_probe(k, cx, vp, &Probe::Access { path: path.clone(), mode: 4 }) {
-				Err(key) => return Some(Flow::Block(key)),
-				Ok(ProbeResult::Ok(ok)) => ok,
-				Ok(_) => false,
-			};
-		if !executable
-			|| matches!(err.kind(), ErrorKind::ArgumentListTooLong | ErrorKind::OutOfMemory)
-		{
-			Diag::Refused { name, err }
+		let text = match command_probe(k, cx, vp, &Probe::Read { path: path.clone() }) {
+			Err(key) => return Some(Flow::Block(key)),
+			Ok(ProbeResult::Bytes(Ok(text))) => text,
+			Ok(_) => BString::default(),
+		};
+		if text.starts_with(b"#!") {
+			status = 126;
+			Diag::BadInterpreter { name, interp: interpreter(&text), err }
+		} else if enoent {
+			Diag::RequiredFileMissing { name }
 		} else {
-			let text = match command_probe(k, cx, vp, &Probe::Read { path: path.clone() }) {
-				Err(key) => return Some(Flow::Block(key)),
-				Ok(ProbeResult::Bytes(Ok(text))) => text,
-				Ok(_) => BString::default(),
-			};
-			if text.starts_with(b"#!") {
-				status = 126;
-				Diag::BadInterpreter { name, interp: interpreter(&text), err }
-			} else if enoent {
-				Diag::RequiredFileMissing { name }
-			} else {
-				Diag::Refused { name, err }
-			}
+			Diag::Refused { name, err }
 		}
 	};
 	k.diag(cx, vp, line, diag);

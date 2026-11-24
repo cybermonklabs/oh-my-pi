@@ -287,20 +287,44 @@ enum Kind {
 	Hashed(BString),
 }
 
-/// The hashed path of `name`, counting the lookup as a hit, as bash's
-/// `phash_search` does.
+/// The hashed file of `name`, counting the lookup as a hit, as bash's
+/// `phash_search` does ([`hashed_file`]).
 fn hashed(ctx: &mut Ctx<'_, '_>, name: &[u8]) -> Result<Option<BString>, Need> {
 	if name.contains(&b'/') {
 		return Ok(None);
 	}
 	match ctx.record(Key::CmdHash(BStr::new(name)))? {
 		Some(Record::CmdHash { path, hits }) => {
-			let rec = Record::CmdHash { path: path.clone(), hits: hits.saturating_add(1) };
+			let file = hashed_file(ctx, path.clone())?;
+			let rec = Record::CmdHash { path, hits: hits.saturating_add(1) };
 			ctx.store_record(KeyBuf::CmdHash(name.into()), Some(rec));
-			Ok(Some(path))
+			Ok(file)
 		},
 		_ => Ok(None),
 	}
+}
+
+/// The file the hash table entry `entry` names now, as bash's
+/// `phash_search` reads it: a relative entry (`bin/u`) is `./bin/u` while
+/// that is an executable file, else `entry`, or none (the name is searched
+/// again) for an entry in the current directory itself (`./s`). zsh reads
+/// an entry as it is.
+fn hashed_file(ctx: &Ctx<'_, '_>, entry: BString) -> Result<Option<BString>, Need> {
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh || !probe::hashed_relative(&entry) {
+		return Ok(Some(entry));
+	}
+	let dotted = probe::hashed_dotted(&entry);
+	let abs = absolute(&ctx.vp.cwd, &dotted);
+	// bash's `executable_file`: it exists, is not a directory and may be
+	// executed.
+	let file = matches!(
+		ctx.probe(Probe::Stat { path: abs.clone(), follow: true })?,
+		ProbeResult::Stat(Some(s)) if s.kind != crate::bash::fs::StatKind::Dir
+	);
+	if file && ctx.probe(Probe::Access { path: abs, mode: 4 })? == ProbeResult::Ok(true) {
+		return Ok(Some(dotted));
+	}
+	Ok((!probe::hashed_in_cwd(&entry)).then_some(entry))
 }
 
 /// bash's `sv_path` (`phash_flush`): any assignment to `PATH`, a command's
@@ -830,6 +854,11 @@ pub fn hash(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			continue;
 		}
 		if o.has(b't') {
+			// The file the entry names now, as bash's `phash_search` reads it.
+			let found = match found {
+				Some(p) => hashed_file(ctx, p)?,
+				None => None,
+			};
 			match found {
 				Some(p) if reusable => {
 					writeln!(out, "builtin hash -p {} {}", p.as_bstr(), name.as_bstr())

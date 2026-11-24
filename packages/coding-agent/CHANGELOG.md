@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the `bash` tool's bash code naming a program found through a relative `$PATH` entry by an absolute path with `./` in it (`/dir/./s`): as bash, it is `./s` (for `PATH=.` or an empty entry), `bin/s` or `../s`, as the `$0` of a script without `#!`, in messages and in `hash -t`; a later run from the hash table reads such an entry as bash does (`./bin/s` while it is an executable file), and only a `./s` entry is searched again after a `cd`
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
