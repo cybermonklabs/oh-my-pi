@@ -7,7 +7,8 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { ColdEntryStore, isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
+import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
+import { ColdEntryStore } from "@oh-my-pi/pi-coding-agent/session/cold-entry-store";
 import {
 	describePendingToolCalls,
 	SESSION_EXIT_CUSTOM_TYPE,

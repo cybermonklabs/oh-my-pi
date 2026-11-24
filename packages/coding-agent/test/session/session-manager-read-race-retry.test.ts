@@ -7,7 +7,7 @@
  */
 import { describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
-import { ColdEntryStore } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
+import { ColdEntryStore } from "@oh-my-pi/pi-coding-agent/session/cold-entry-store";
 import { type ColdStoreStats, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	MemorySessionStorage,

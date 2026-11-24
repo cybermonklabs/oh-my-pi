@@ -41,23 +41,24 @@ import {
 import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
 import {
-	type ColdBoundary,
-	ColdEntryStore,
-	coldBoundary,
-	coldCutPathIndex,
 	coldEntryForPersistence,
 	convertColdEntries,
 	convertToColdEntry,
 	copyColdEntry,
 	hydrateColdEntry,
 	hydrateKeptEntries,
-	keptWholeByKind,
-	LoadedValueInterner,
 	isColdEntry,
-	readCompactions,
-	streamedKeptStart,
 	wholeTargetsOf,
 } from "./cold-entries";
+import {
+	type ColdBoundary,
+	coldBoundary,
+	coldCutPathIndex,
+	keptWholeByKind,
+	readCompactions,
+	streamedKeptStart,
+} from "./cold-entry-policy";
+import { ColdEntryStore } from "./cold-entry-store";
 import type { CompactionMethod } from "./compaction-methods";
 import {
 	type BashExecutionMessage,
@@ -1013,6 +1014,60 @@ export interface SessionContextBuildOptions extends BuildSessionContextOptions {
 	 * its accessors.
 	 */
 	measureOnly?: boolean;
+}
+
+/** Short strings shared across a load's entries; longer ones are mostly unique. */
+const INTERNED_STRING_MAX_UNITS = 64;
+/** Runtimes are shared up to this JSON length: a source checkout's, with commit and branch, runs past 64. */
+const INTERNED_RUNTIME_MAX_UNITS = 256;
+/** Distinct values one load shares at most, so unique values cannot grow the tables without bound. */
+const INTERNED_VALUES_MAX = 16_384;
+
+/**
+ * Shares equal values among the entries one load parses, which the parser
+ * gives each its own copy of: short strings of the entry and of its message
+ * (a string's identity is not observable), each `parentId` with its parent's
+ * `id`, and the `runtime` identity, the same for every entry one build wrote,
+ * which is frozen once shared. Memory per entry is what a long session's
+ * older entries keep in memory, so the copies add up.
+ */
+class LoadedValueInterner {
+	readonly #strings = new Map<string, string>();
+	readonly #runtimes = new Map<string, object>();
+
+	/** Share `entry`'s values with the entries already interned; `parent` is its parent entry, if loaded. */
+	intern(entry: SessionEntry, parent: SessionEntry | undefined): void {
+		const holder = entry as unknown as Record<string, unknown>;
+		this.#internStrings(holder);
+		if (parent && entry.parentId === parent.id) holder.parentId = parent.id;
+		const runtime = holder.runtime;
+		if (typeof runtime === "object" && runtime !== null) holder.runtime = this.#internRuntime(runtime);
+		const message = entry.type === "message" ? holder.message : undefined;
+		if (typeof message === "object" && message !== null && !Array.isArray(message)) {
+			this.#internStrings(message as Record<string, unknown>);
+		}
+	}
+
+	#internStrings(holder: Record<string, unknown>): void {
+		for (const key of Object.keys(holder)) {
+			if (key === "id" || key === "parentId" || key === "timestamp") continue;
+			const value = holder[key];
+			if (typeof value !== "string" || value.length > INTERNED_STRING_MAX_UNITS) continue;
+			const shared = this.#strings.get(value);
+			if (shared !== undefined) holder[key] = shared;
+			else if (this.#strings.size < INTERNED_VALUES_MAX) this.#strings.set(value, value);
+		}
+	}
+
+	#internRuntime(runtime: object): object {
+		const key = stringifyJson(runtime);
+		if (key === undefined || key.length > INTERNED_RUNTIME_MAX_UNITS) return runtime;
+		const shared = this.#runtimes.get(key);
+		if (shared) return shared;
+		if (this.#runtimes.size >= INTERNED_VALUES_MAX) return runtime;
+		this.#runtimes.set(key, Object.freeze(runtime));
+		return runtime;
+	}
 }
 
 /** A session file streamed into memory, its older entries cold; see `SessionManager.#loadTranscript`. */

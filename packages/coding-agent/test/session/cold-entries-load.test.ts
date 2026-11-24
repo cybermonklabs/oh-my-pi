@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import * as coldEntries from "@oh-my-pi/pi-coding-agent/session/cold-entries";
+import * as coldEntryPolicy from "@oh-my-pi/pi-coding-agent/session/cold-entry-policy";
 import { sanitizeRehydratedOpenAIResponsesAssistantMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	CURRENT_SESSION_VERSION,
@@ -90,9 +90,9 @@ function user(text: string) {
  * fields.
  */
 async function openWithPass(file: string, pass: (byId: Map<string, SessionEntry>) => void): Promise<SessionManager> {
-	const coldBoundary = coldEntries.coldBoundary;
+	const coldBoundary = coldEntryPolicy.coldBoundary;
 	let passed = false;
-	vi.spyOn(coldEntries, "coldBoundary").mockImplementation((entries, branch, model) => {
+	vi.spyOn(coldEntryPolicy, "coldBoundary").mockImplementation((entries, branch, model) => {
 		const boundary = coldBoundary(entries, branch, model);
 		if (!passed) {
 			passed = true;

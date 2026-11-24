@@ -7,7 +7,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
-import { isColdEntry, keptWholeByKind } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
+import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
+import { keptWholeByKind } from "@oh-my-pi/pi-coding-agent/session/cold-entry-policy";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";

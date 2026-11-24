@@ -19,7 +19,9 @@ Does not cover `/tree` UI rendering behavior beyond semantics that affect sessio
 
 - [`src/session/session-manager.ts`](../packages/coding-agent/src/session/session-manager.ts) — orchestration: tree/leaf, appends, persistence, blobs, lifecycle factories
 - [`src/session/session-entries.ts`](../packages/coding-agent/src/session/session-entries.ts) — entry/header types, `SessionEntry` union, `CURRENT_SESSION_VERSION`
-- [`src/session/cold-entries.ts`](../packages/coding-agent/src/session/cold-entries.ts) — the store of older entry bodies, cold entries and the cut
+- [`src/session/cold-entries.ts`](../packages/coding-agent/src/session/cold-entries.ts) — cold entries: the accessors that read an older entry's body back from its record
+- [`src/session/cold-entry-policy.ts`](../packages/coding-agent/src/session/cold-entry-policy.ts) — which entries go cold: the cut, the kind table, the position rules
+- [`src/session/cold-entry-store.ts`](../packages/coding-agent/src/session/cold-entry-store.ts) — the store of older entry bodies: temporary file or compressed blocks in memory
 - [`src/session/session-migrations.ts`](../packages/coding-agent/src/session/session-migrations.ts) — version migrations
 - [`src/session/session-loader.ts`](../packages/coding-agent/src/session/session-loader.ts) — file load + blob-ref resolution
 - [`src/session/session-context.ts`](../packages/coding-agent/src/session/session-context.ts) — `buildSessionContext`
