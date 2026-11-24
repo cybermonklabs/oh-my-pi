@@ -26,6 +26,22 @@ sudo sysctl -q -w vm.max_map_count=1048576
 [ "$(sysctl -n vm.max_map_count)" -ge 1048576 ] || fail "vm.max_map_count is $(sysctl -n vm.max_map_count), not 1048576 or more"
 echo "HOST $(sysctl vm.max_map_count)"
 
+# A directory per user where names fold, as host.sh makes one for the host rows: an ext4 with
+# casefold, `chattr +F` on each directory, bind-mounted into the containers at /scratch/fold
+# (gvisor.sh). pi-builtins' check_folded_sources tests run their host half there (gvisor-run.sh
+# probes, as the test's user, whether names fold inside the sandbox).
+truncate -s 256M "$RUNNER_TEMP/sc-gvfold.img"
+mkfs.ext4 -F -q -O casefold -E encoding=utf8 "$RUNNER_TEMP/sc-gvfold.img"
+sudo mkdir -p /mnt/sc-gvfold
+sudo mount -o loop "$RUNNER_TEMP/sc-gvfold.img" /mnt/sc-gvfold
+sudo install -d -o 1000 -g 1000 -m 0755 /mnt/sc-gvfold/tmp-uid1000
+sudo install -d -o root -g root -m 0755 /mnt/sc-gvfold/tmp-root
+sudo chattr +F /mnt/sc-gvfold/tmp-uid1000 /mnt/sc-gvfold/tmp-root
+sudo touch /mnt/sc-gvfold/tmp-root/fold-probe
+sudo test -e /mnt/sc-gvfold/tmp-root/FOLD-PROBE || fail "names do not fold in /mnt/sc-gvfold on the host (kernel $(uname -r))"
+sudo rm -f /mnt/sc-gvfold/tmp-root/fold-probe
+echo "HOST /mnt/sc-gvfold ext4 casefold; names fold on the host"
+
 d=$(mktemp -d)
 url=https://storage.googleapis.com/gvisor/releases/release/$GV_RELEASE/x86_64/gvisor.tar.zstd
 echo "STEP curl -fsSL -o gvisor.tar.zstd $url"

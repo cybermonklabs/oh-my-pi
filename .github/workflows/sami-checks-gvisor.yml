@@ -66,6 +66,9 @@ env:
   SC_TEST_PATH: /opt/sc-ref/bin:/usr/local/bin:/usr/bin:/bin
   SC_BIN_BOUND: "1800"
   SC_GV_SET_SHARDS: ${{ inputs.set_shards }}
+  # pi-builtins' check_folded_sources tests, which run their host half where names fold (as in
+  # sami-checks.yml's pi-builtins job).
+  SC_FOLDED: 'test(/::a_source_whose_name_folds_to_the_backup_is_not_/)'
 
 jobs:
   gvisor:

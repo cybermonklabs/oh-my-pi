@@ -21,9 +21,9 @@ done
 # where it looks while the rest of the archive stays read-only.
 args=(--rm --runtime=runsc --init --ulimit nofile=65536:65536
 	-v "$CARGO_TARGET_DIR:$CARGO_TARGET_DIR:ro" --tmpfs "$CARGO_TARGET_DIR/nextest:mode=1777"
-	-v "$SC_TREE:$SC_TREE" --tmpfs "$SC_TREE/target:mode=1777"
+	-v "$SC_TREE:$SC_TREE" --tmpfs "$SC_TREE/target:mode=1777" -v /mnt/sc-gvfold:/scratch/fold
 	-v "$GITHUB_WORKSPACE/tool:$GITHUB_WORKSPACE/tool:ro" -v "$SC/meta:/sc/meta:ro" -v "$SC/res:/sc/res"
-	-e GITHUB_WORKSPACE -e CARGO_TARGET_DIR -e SC_TREE -e SC_TEST_PATH -e SC_BIN_BOUND -e SC_GV_SET_SHARDS)
+	-e GITHUB_WORKSPACE -e CARGO_TARGET_DIR -e SC_TREE -e SC_TEST_PATH -e SC_BIN_BOUND -e SC_GV_SET_SHARDS -e SC_FOLDED)
 if [ "$part" = builtins ]; then
 	nx=$(command -v cargo-nextest) || { echo "::error::cargo-nextest is not installed"; exit 1; }
 	args+=(-v "$nx:/usr/local/bin/cargo-nextest:ro")
