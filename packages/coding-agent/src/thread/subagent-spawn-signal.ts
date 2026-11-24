@@ -32,14 +32,19 @@ export class SubagentSpawnSignal {
 	/** Spawns last reported for the current message. */
 	#reported = 0;
 
+	/** Start a new message: forget the previous message's calls so its count starts from zero. */
+	reset(): void {
+		this.#calls.clear();
+		this.#reported = 0;
+	}
+
 	/**
 	 * Feed one streamed assistant event; returns the number of spawns the message's tool
 	 * calls are expected to make whenever it grows, else `undefined`.
 	 */
 	observe(event: AssistantMessageEvent): number | undefined {
 		if (event.type === "start") {
-			this.#calls.clear();
-			this.#reported = 0;
+			this.reset();
 			return undefined;
 		}
 		if (event.type !== "toolcall_start" && event.type !== "toolcall_delta") return undefined;

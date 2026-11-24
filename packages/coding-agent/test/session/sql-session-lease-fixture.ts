@@ -23,6 +23,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL, type Socket, type SocketHandler, type TCPSocketListener } from "bun";
+import { dropSessionStoreTables } from "../helpers/sql-session-storage";
 
 type SqlClient = InstanceType<typeof SQL>;
 
@@ -221,9 +222,7 @@ export async function openLeaseDb(adapter: SqlSessionStorageAdapter, url: string
 					await storage.drain().catch(() => undefined);
 					await client.end();
 				}
-				for (const name of [`${table}_parts`, `${table}_blobs`, `${table}_refs`, table, leaseTable]) {
-					await admin.unsafe(`DROP TABLE IF EXISTS ${name}`);
-				}
+				await dropSessionStoreTables(admin, table, leaseTable);
 			} finally {
 				await admin.end();
 				dir.removeSync();

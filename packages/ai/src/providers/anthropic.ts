@@ -986,12 +986,37 @@ function isEmptyContentDelta(event: AnthropicStreamEvent): boolean {
 }
 
 /**
+ * The HTTP status the Anthropic API answers with for an error type it also
+ * streams in an `error` frame of a 200 response. A rate limit or an overload
+ * reported in the stream is the same refusal as the HTTP 429 or 529 one, so it
+ * carries that status and reads as one downstream (turn recovery's rate-limit
+ * wait, slow mode, the transient lane). No other type is given a status.
+ */
+const ANTHROPIC_STREAM_ERROR_STATUS: Readonly<Record<string, number>> = {
+	rate_limit_error: 429,
+	overloaded_error: 529,
+};
+
+/**
+ * A `rate_limit_error` the API streamed in an `error` frame of a 200 response:
+ * the HTTP 429 refusal, which the provider loop below does not send again
+ * itself. Turn recovery owns that wait (the wait the message states, its
+ * backoff, `retry.maxRetries`, the fallback chain), so each of its attempts is
+ * one request; the loop's own backoff would resend the whole request up to
+ * {@link PROVIDER_MAX_RETRIES} times against the same per-minute limit first.
+ * An HTTP 429 response is not this error and keeps the loop's retry.
+ */
+class AnthropicStreamRateLimitError extends AIError.ProviderHttpError {}
+
+/**
  * In-stream `error` SSE frames carry an Anthropic error envelope:
  * `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`.
  * Surface the structured type, code and message instead of the raw JSON blob;
  * the error type token (e.g. `overloaded_error`, `rate_limit_error`) is kept in
  * the message so `isProviderRetryableError`'s classification keys off the
- * structured type rather than incidental JSON substrings.
+ * structured type rather than incidental JSON substrings. A type in
+ * {@link ANTHROPIC_STREAM_ERROR_STATUS} becomes a {@link AIError.ProviderHttpError}
+ * with that status and the type as its code, as the HTTP response would.
  *
  * `midMessage` marks a frame that lands inside an open message envelope — after
  * `message_start`, before the terminal frame (`message_stop`, or a
@@ -1006,16 +1031,19 @@ function isEmptyContentDelta(event: AnthropicStreamEvent): boolean {
  * Codex native-lane steer rejection uses, so a gateway-cut stream is
  * identifiable after the `Error` instance is gone.
  *
- * Only frame types the provider loop already retries take the truncation path.
- * A deterministic rejection (`invalid_request_error`, `authentication_error`,
- * `billing_error`, `permission_error`, an account cap) is a decision the
- * provider made about the request, not a cut wire: rewriting it as a truncation
- * would replay a request that can never succeed and, once text is committed,
- * continue a turn the provider refused. The gate is
- * {@link AIError.isProviderRetryableError} on the very error that is otherwise
- * thrown, so a frame keeps exactly the verdict it had before this classification
- * existed — the retry decision moves nowhere, only the shape of a retryable
- * failure changes.
+ * Only frame types the provider loop already retries take the truncation path,
+ * and a rate limit never does. A deterministic rejection
+ * (`invalid_request_error`, `authentication_error`, `billing_error`,
+ * `permission_error`, an account cap) is a decision the provider made about the
+ * request, not a cut wire: rewriting it as a truncation would replay a request
+ * that can never succeed and, once text is committed, continue a turn the
+ * provider refused. The gate is {@link AIError.isProviderRetryableError} on the
+ * very error that is otherwise thrown, so a frame keeps exactly the verdict it
+ * had before this classification existed — the retry decision moves nowhere,
+ * only the shape of a retryable failure changes. A `rate_limit_error` is also
+ * the provider's decision, about the request rate: it stays the 429 refusal
+ * wherever it lands, so turn recovery waits on this model for the window to
+ * clear instead of re-sending the whole context at once as a resumed truncation.
  */
 function createAnthropicSseStreamError(data: string, midMessage: boolean): Error {
 	let parsed: { error?: { type?: unknown; code?: unknown; message?: unknown } } | undefined;
@@ -1027,15 +1055,21 @@ function createAnthropicSseStreamError(data: string, midMessage: boolean): Error
 	const errorType = typeof parsed?.error?.type === "string" ? parsed.error.type : undefined;
 	const errorCode = typeof parsed?.error?.code === "string" ? parsed.error.code : undefined;
 	const message = typeof parsed?.error?.message === "string" ? parsed.error.message : undefined;
-	const rejection = new AIError.ProviderResponseError(
-		message
-			? errorType
-				? `Anthropic stream error (${errorType}): ${message}`
-				: `Anthropic stream error: ${message}`
-			: data,
-		{ provider: "anthropic", kind: "output" },
-	);
-	if (!midMessage || !AIError.isProviderRetryableError(rejection)) {
+	const text = message
+		? errorType
+			? `Anthropic stream error (${errorType}): ${message}`
+			: `Anthropic stream error: ${message}`
+		: data;
+	const httpStatus =
+		errorType !== undefined && Object.hasOwn(ANTHROPIC_STREAM_ERROR_STATUS, errorType)
+			? ANTHROPIC_STREAM_ERROR_STATUS[errorType]
+			: undefined;
+	const HttpError = httpStatus === 429 ? AnthropicStreamRateLimitError : AIError.ProviderHttpError;
+	const rejection =
+		httpStatus === undefined
+			? new AIError.ProviderResponseError(text, { provider: "anthropic", kind: "output" })
+			: new HttpError(text, httpStatus, { code: errorType });
+	if (!midMessage || httpStatus === 429 || !AIError.isProviderRetryableError(rejection)) {
 		return rejection;
 	}
 	const fields = [errorType ? `type=${errorType}` : undefined, errorCode ? `code=${errorCode}` : undefined]
@@ -3738,6 +3772,7 @@ const streamAnthropicOnce = (
 						!isLocalIdleTimeout &&
 						firstTokenTime === undefined &&
 						!streamedReplayUnsafeContent &&
+						!(streamFailure instanceof AnthropicStreamRateLimitError) &&
 						AIError.isProviderRetryableError(streamFailure);
 					if (
 						activeAbortTracker.wasCallerAbort() ||

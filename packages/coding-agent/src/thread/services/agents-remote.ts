@@ -4,22 +4,25 @@
  *
  * The APIs are synchronous wherever the main classes are, so those calls are
  * `callSync` round trips; async APIs use `call`, and results nobody reads
- * (`setActivity`, `recordReply`, `adopt`) are ordered notifications. Change
- * listeners share one main-side forwarding subscription per proxy, which is
- * dropped once the last local listener unsubscribes; events arrive
- * asynchronously after the main-side change.
+ * (`setActivity`, `recordReply`, `forgetAgent`, `adopt`) are ordered
+ * notifications. Change listeners share one main-side forwarding
+ * subscription per proxy, which is dropped once the last local listener
+ * unsubscribes; events arrive asynchronously after the main-side change.
  */
 import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentAwaitsApi } from "../../registry/agent-awaits";
-import type {
-	AdoptOptions,
-	AgentLifecycleApi,
-	AgentLifecycleDisposeOptions,
-	AgentReleaseOptions,
-	ColdReviveOptions,
-	LiveAgentTarget,
-	PersistedSubagentReviverFactory,
+import {
+	type AdoptedReviver,
+	type AdoptOptions,
+	type AgentLifecycleApi,
+	type AgentLifecycleDisposeOptions,
+	type AgentReleaseOptions,
+	type AgentReviver,
+	type ColdReviveOptions,
+	type LiveAgentTarget,
+	type PersistedSubagentReviverFactory,
+	runReviver,
 } from "../../registry/agent-lifecycle";
 import type {
 	AgentHistorySummary,
@@ -140,6 +143,14 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 		return this.#remote.callSync("markResultAccepted", id, expected, responseAt);
 	}
 
+	markRunEnded(id: string, expected?: AgentRefExpectation): boolean {
+		return this.#remote.callSync("markRunEnded", id, expected);
+	}
+
+	startRun(id: string, expected?: AgentRefExpectation): boolean {
+		return this.#remote.callSync("startRun", id, expected);
+	}
+
 	staleAcceptedRuns(): AgentRef[] {
 		return this.#remote.callSync("staleAcceptedRuns");
 	}
@@ -197,6 +208,16 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 	}
 }
 
+/**
+ * `revive` as a function main can call across the link: a plain-data reviver's state holds this
+ * thread's live objects, which cannot be copied, so the worker keeps it behind a function. Built
+ * here, handed nothing else: JSC keeps an enclosing function's `arguments` reachable from its arrow
+ * closures, so one built inside `adopt` would pin all of that call's arguments.
+ */
+function crossThreadReviver(revive: AdoptedReviver): AgentReviver {
+	return typeof revive === "function" ? revive : expected => runReviver(revive, expected);
+}
+
 /** Worker proxy of main's {@link AgentLifecycleApi}; the reviver factory and the process exit's teardown are main-only. */
 export class RemoteAgentLifecycle implements AgentLifecycleApi {
 	readonly #remote: RemoteObject<AgentLifecycleProtocol>;
@@ -209,8 +230,10 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		throw new Error("The persisted subagent reviver factory is owned by the main thread");
 	}
 
+	/** A reviver stays on this thread with the session it rebuilds; main holds a proxy of it. */
 	adopt(id: string, opts: AdoptOptions, expected?: AgentRefExpectation): void {
-		this.#remote.notify("adopt", id, opts, expected);
+		const revive = opts.revive && crossThreadReviver(opts.revive);
+		this.#remote.notify("adopt", id, revive === opts.revive ? opts : { ...opts, revive }, expected);
 	}
 
 	has(id: string, expected?: AgentRefExpectation): boolean {
@@ -304,5 +327,13 @@ export class RemoteIrcBus implements IrcBusApi {
 
 	recordReply(from: string, to: string): void {
 		this.#remote.notify("recordReply", from, to);
+	}
+
+	forgetAgent(agentId: string): void {
+		this.#remote.notify("forgetAgent", agentId);
+	}
+
+	holdSentMarks(agentId: string): () => void {
+		return this.#remote.callSync("holdSentMarks", agentId);
 	}
 }

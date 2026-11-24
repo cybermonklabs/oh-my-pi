@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { __internalsForTesting, withFileLock } from "../src/file-lock";
+import { __internalsForTesting, acquireFileLock, withFileLock, withFileLockSync } from "../src/file-lock";
 import { isEnoent } from "../src/fs-error";
 import { removeWithRetries } from "../src/temp";
 import { createProductionChildEnv } from "../../../scripts/test-env";
@@ -22,6 +22,40 @@ afterAll(async () => {
 		await removeWithRetries(root).catch(() => {});
 	}
 });
+
+/** Starts a process that holds `target`'s lock until it is killed, and waits until it holds it. */
+async function startHolder(root: string, target: string): Promise<Bun.Subprocess<"ignore", "ignore", "pipe">> {
+	const readyPath = path.join(root, "holder-ready");
+	const holder = Bun.spawn(
+		[process.execPath, path.join(import.meta.dir, "fixtures/file-lock-holder.ts"), target, readyPath],
+		{
+			cwd: path.resolve(import.meta.dir, "../../.."),
+			env: { HOME: process.env.HOME ?? "", PATH: process.env.PATH ?? "" },
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+		},
+	);
+	for (;;) {
+		try {
+			await fs.access(readyPath);
+			return holder;
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			if (holder.exitCode !== null) {
+				throw new Error(
+					`lock holder exited before readiness (${holder.exitCode}): ${await new Response(holder.stderr).text()}`,
+				);
+			}
+		}
+	}
+}
+
+async function stopHolder(holder: Bun.Subprocess): Promise<void> {
+	if (holder.exitCode !== null) return;
+	holder.kill();
+	await holder.exited;
+}
 
 describe("native file-lock ownership", () => {
 	test("a cancelled waiter never enters its critical section or releases the current owner", async () => {
@@ -152,4 +186,58 @@ describe("native file-lock ownership", () => {
 		const final = JSON.parse(text) as { counter: number };
 		expect(final.counter).toBe(N);
 	}, 30_000);
+
+	// If this regresses, a TUI or RPC session that waits on a lock another process holds
+	// (settings, the browser daemon, a session write) blocks its event loop on every attempt.
+	test("a waiting loop leaves the event loop free while another process holds the lock, and takes it once the holder exits", async () => {
+		const root = await mkRoot();
+		const target = path.join(root, "contended.json");
+		const holder = await startHolder(root, target);
+		try {
+			// Real time on purpose: a stall would be a native call blocking the thread, which a fake clock
+			// cannot see. A ticker 1 ms apart records the longest time the event loop could not run; 50 ms
+			// is far above scheduling noise.
+			let longestGap = 0;
+			let ticking = true;
+			const ticker = (async () => {
+				let last = performance.now();
+				while (ticking) {
+					await Bun.sleep(1);
+					const now = performance.now();
+					longestGap = Math.max(longestGap, now - last);
+					last = now;
+				}
+			})();
+			const acquiring = acquireFileLock(target, { retries: 1_000, retryDelayMs: 5 });
+			// Long enough for several attempts against the live holder.
+			await Bun.sleep(300);
+			await stopHolder(holder);
+			const lock = await acquiring;
+			ticking = false;
+			await ticker;
+			lock.release();
+
+			expect(longestGap).toBeLessThan(50);
+		} finally {
+			await stopHolder(holder);
+		}
+	}, 10_000);
+
+	// If this regresses, a synchronous wait on a lock another process holds (the session
+	// write gate) makes a claim on every attempt before it gives up.
+	test("a synchronous waiting loop gives up on a held lock without a blocking claim on every attempt", async () => {
+		const root = await mkRoot();
+		const target = path.join(root, "contended-sync.json");
+		const holder = await startHolder(root, target);
+		try {
+			const started = performance.now();
+			expect(() => withFileLockSync(target, () => {}, { retries: 20, retryDelayMs: 5 })).toThrow(
+				"Failed to acquire lock",
+			);
+			// 19 probes, 19 delays of 5 ms and one claim.
+			expect(performance.now() - started).toBeLessThan(500);
+		} finally {
+			await stopHolder(holder);
+		}
+	}, 10_000);
 });

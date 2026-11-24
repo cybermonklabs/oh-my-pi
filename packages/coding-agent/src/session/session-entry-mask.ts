@@ -1,12 +1,13 @@
 /**
- * Copy-on-write masking of a session entry or header, and of a `/btw` record, before it reaches
- * the session store (`secrets.maskSessionStore`). Every string is masked except a field that
+ * Copy-on-write masking of a session entry or header, of fields of an entry stored apart from it
+ * (an `entry_patch` record's patches), and of a `/btw` record, before it reaches the session store
+ * (`secrets.maskSessionStore`). Every string is masked except a field that
  * {@link POSITIONS} keeps, and a field is kept only at the position the table names for it: under
  * a tool call's `arguments`, a tool result's `details`, custom data or any other key the table
- * does not name, every string is masked whatever its key or shape. Object keys, numbers, booleans
- * and `null` are never masked (KR13). An entry made of primitives, plain objects and real arrays
- * with nothing to mask comes back as the same object; a masked one shares every untouched such
- * subtree with the live entry.
+ * does not name, every string is masked whatever its key or shape, except an image's blob reference (KR14).
+ * Object keys, numbers, booleans and `null` are never masked (KR13). An entry made of primitives,
+ * plain objects and real arrays with nothing to mask comes back as the same object; a masked one
+ * shares every untouched such subtree with the live entry.
  *
  * The walk reads a primitive, a plain object or a real array as itself. Any other node (a `bigint`,
  * a boxed primitive, a node with a callable `toJSON`, a class instance) it reads as the plain data
@@ -35,10 +36,22 @@
  * - KR12: outside this walk, `SessionStoreMask.maskText` never cuts one of its own markers: a held value that
  *   overlaps one replaces it whole, and a marker no held value overlaps stays as it is.
  * - KR13: object keys, numbers, booleans and `null`, never masked.
+ * - KR14: in free content, an image's blob reference (`blob:sha256:` and a 64-hex content hash)
+ *   where persistence externalizes the image and a load resolves it, by the rule both use
+ *   ({@link resolvedImageSiteOf}). In every entry, the `data` of a `content` image block or an
+ *   `images` image. In a cold entry's record ({@link MaskedForm} `record`) also the `result` of a
+ *   generated image (`image_generation_call`) and an `image_url`, a string in a list under it too,
+ *   and an array nested in an array sits under the outer array's key: the record holds the
+ *   reference there where the live entry holds the data a load resolved, so the store gets the
+ *   same bytes cold or whole. A snapcompact frame's `data`, which a load leaves as a reference, any
+ *   other blob reference in free content, and image data that is no blob reference, are masked.
  */
 import { isBoxedPrimitive } from "node:util/types";
-import { countNewlines, isRecord, stringifyJson, tryParseJson } from "@oh-my-pi/pi-utils";
+import { countNewlines, isRecord, tryParseJson } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
+import { BLOB_HASH_RE, BLOB_PREFIX, isBlobRef } from "./blob-store";
+import { ContainerPath, type NestedWalk, runNested } from "./nested-walk";
+import { entryJsonText, type ImageSite, imageAt, resolvedImageSiteOf } from "./session-persistence";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /** A child the parent copy leaves out: an object key omitted, an array item removed. */
@@ -561,17 +574,29 @@ const POSITIONS: Readonly<Record<PositionName, Position>> = {
 };
 
 /**
- * One masking walk: its mask, and how many strings it replaced a held value in. The drop rules
- * (KR6, KR8-KR10) read that count over a subtree, so a block or carrier loses its signature or its
- * place only when masking changed text in it, never because the copy holds a non-plain node of it
- * (a `Date`, a `URL`, a `bigint`) as the plain form the session line stores.
+ * The form of the entry a masking walk reads. `live`: an entry as the session holds it, whose
+ * images a load resolved to their data. `record`: a cold entry's record read back for a write
+ * (`coldEntryForPersistence`), whose images are the blob references persistence wrote (KR14).
+ */
+export type MaskedForm = "live" | "record";
+
+/**
+ * One masking walk: its mask, the form of what it reads, and how many strings it replaced a held
+ * value in. The drop rules (KR6, KR8-KR10) read that count over a subtree, so a block or carrier
+ * loses its signature or its place only when masking changed text in it, never because the copy
+ * holds a non-plain node of it (a `Date`, a `URL`, a `bigint`) as the plain form the session line stores.
+ * The walk keeps its own stack ({@link runNested}), so it masks a value as deep as `JSON.parse`
+ * reads; `path` makes a cycle fail instead of walking on.
  */
 class MaskWalk {
 	replacements = 0;
+	readonly form: MaskedForm;
+	readonly path = new ContainerPath();
 	readonly #mask: SessionStoreMask;
 
-	constructor(mask: SessionStoreMask) {
+	constructor(mask: SessionStoreMask, form: MaskedForm) {
 		this.#mask = mask;
+		this.form = form;
 	}
 
 	/** `text` with every held value replaced by its marker, counted. */
@@ -588,32 +613,61 @@ class MaskWalk {
 }
 
 /**
- * `entry` with every held secret replaced by its marker, for the stored copy
- * only: the live entry is never mutated. Returns `entry` itself when it is
- * plain data with nothing to mask, or when `mask` is `null` or empty. Signed
- * blocks whose text changed lose their signature; provider replay state whose
- * text changed is dropped whole.
+ * `entry`, in `form`, with every held secret replaced by its marker, for the
+ * stored copy only: the live entry is never mutated. Returns `entry` itself
+ * when it is plain data with nothing to mask, or when `mask` is `null` or
+ * empty. Signed blocks whose text changed lose their signature; provider
+ * replay state whose text changed is dropped whole.
  */
-export function maskSessionEntry<T>(entry: T, mask: SessionStoreMask | null): T {
+export function maskSessionEntry<T>(entry: T, mask: SessionStoreMask | null, form: MaskedForm = "live"): T {
 	if (mask === null || mask.empty) return entry;
-	const walk = new MaskWalk(mask);
-	if (!isPlainObject(entry)) return maskFree(entry, "", walk) as T;
-	return maskObject(entry, walk, entry.type === "session" ? POSITIONS.header : POSITIONS.entry) as T;
+	const walk = new MaskWalk(mask, form);
+	if (!isPlainObject(entry)) return maskFreeValue(entry, "", walk) as T;
+	return runNested(maskObject(entry, walk, entry.type === "session" ? POSITIONS.header : POSITIONS.entry)) as T;
 }
 
 /** `record`, a `/btw` history record, with every held secret replaced by its marker, for the stored copy only. */
 export function maskBtwRecord<T>(record: T, mask: SessionStoreMask | null): T {
 	if (mask === null || mask.empty) return record;
-	const walk = new MaskWalk(mask);
-	return (isPlainObject(record) ? maskObject(record, walk, POSITIONS.btwRecord) : maskFree(record, "", walk)) as T;
+	const walk = new MaskWalk(mask, "live");
+	return (
+		isPlainObject(record) ? runNested(maskObject(record, walk, POSITIONS.btwRecord)) : maskFreeValue(record, "", walk)
+	) as T;
 }
 
 /**
- * `value` with every held secret replaced by its marker, for a stored copy of free data, such as a
- * subagent's yield data: no field in it is kept. The value itself is masked, never dropped.
+ * `fields`, top-level fields of an entry of `type` stored apart from it, such as a patch of an
+ * `entry_patch` record, masked as the same values are in that entry's own stored line
+ * ({@link maskSessionEntry}) read in `form`: the rules of an entry and of its `type` keep, mask
+ * and drop them. Returns `fields` itself when it holds nothing to mask, or when `mask` is `null`
+ * or empty.
  */
-export function maskStoredData<T>(value: T, mask: SessionStoreMask | null): T {
-	return mask === null || mask.empty ? value : (maskFree(value, "", new MaskWalk(mask)) as T);
+export function maskEntryFields<T>(fields: T, type: string, mask: SessionStoreMask | null, form: MaskedForm): T {
+	return maskFieldsAt(fields, POSITIONS.entry, type, mask, form);
+}
+
+/** {@link maskEntryFields} for fields of a `message` entry's message of `role`. */
+export function maskMessageFields<T>(fields: T, role: string, mask: SessionStoreMask | null, form: MaskedForm): T {
+	return maskFieldsAt(fields, POSITIONS.message, role, mask, form);
+}
+
+/** `fields`, read in `form`, masked at `at` as an object there whose `type` or `role` is `tag`. */
+function maskFieldsAt<T>(fields: T, at: Position, tag: string, mask: SessionStoreMask | null, form: MaskedForm): T {
+	if (mask === null || mask.empty) return fields;
+	const walk = new MaskWalk(mask, form);
+	if (!isPlainObject(fields)) return maskFreeValue(fields, "", walk) as T;
+	return runNested(
+		maskObjectAs(fields, walk, at, at.variants === undefined ? undefined : variantOf(tag, at.variants)),
+	) as T;
+}
+
+/**
+ * `value`, read in `form`, with every held secret replaced by its marker, for a stored copy of
+ * free data, such as a subagent's yield data: no field in it is kept. The value itself is
+ * masked, never dropped.
+ */
+export function maskStoredData<T>(value: T, mask: SessionStoreMask | null, form: MaskedForm = "live"): T {
+	return mask === null || mask.empty ? value : (maskFreeValue(value, "", new MaskWalk(mask, form)) as T);
 }
 
 /** `update` with its title masked, so the store's title field holds what the title slot holds. */
@@ -625,30 +679,47 @@ export function maskTitleUpdate(update: SessionTitleUpdate, mask: SessionStoreMa
 
 /**
  * `value`, free content under `key` of its holder (an array index as a number), masked in the form
- * `stringifyJson` writes it. A primitive, a plain object or a real array is returned as itself when
- * masking changes nothing in it. Any other node (a `bigint`, a boxed primitive, a node with `toJSON`,
- * a class instance) comes back as its stored form in plain data, never as itself: the copy's later
- * readers, `prepareEntryForPersistence` (which rebuilds an object from its own keys) and
- * `stringifyJson`, then read the same form the walk masked.
+ * `stringifyJson` writes it, but for an image's blob reference (KR14). A primitive, a plain object
+ * or a real array is returned as itself when masking changes nothing in it. Any other node (a
+ * `bigint`, a boxed primitive, a node with `toJSON`, a class instance) comes back as its stored form
+ * in plain data, never as itself: the copy's later readers, `prepareEntryForPersistence` (which
+ * rebuilds an object from its own keys) and `stringifyJson`, then read the same form the walk masked.
  */
-function maskFree(value: unknown, key: string | number, walk: MaskWalk): unknown {
+function maskFreeValue(value: unknown, key: string | number, walk: MaskWalk): unknown {
+	return walksInto(value) ? runNested(maskFree(value, key, walk)) : maskScalar(value, key, walk);
+}
+
+/**
+ * Whether masking `value` as free content walks into it ({@link maskFree}): an object, a bigint, or a
+ * function with `toJSON`. {@link maskScalar} masks every other value.
+ */
+function walksInto(value: unknown): value is object | bigint {
 	switch (typeof value) {
-		case "string":
-			return walk.text(value);
+		case "object":
+			return value !== null;
 		case "bigint":
-			return maskStoredForm(value, key, walk);
+			return true;
 		case "function":
 			// A function is not written unless its `toJSON` gives a value.
-			return typeof Reflect.get(value, "toJSON") === "function" ? maskStoredForm(value, key, walk) : value;
-		case "object":
-			if (value === null) return value;
-			if (isPlainObject(value)) return maskObject(value, walk, undefined);
-			if (isRealArray(value)) return maskArray(value, walk, undefined, false);
-			return maskStoredForm(value, key, walk);
+			return typeof Reflect.get(value, "toJSON") === "function";
 		default:
-			// A number or a boolean is written as it is; `undefined` or a symbol not at all.
-			return value;
+			return false;
 	}
+}
+
+/** {@link maskFreeValue} of a `value` the walk does not walk into ({@link walksInto}). */
+function maskScalar(value: unknown, key: string | number, walk: MaskWalk): unknown {
+	// A number or a boolean is written as it is; `undefined`, a symbol or a function without `toJSON` not at all.
+	if (typeof value !== "string") return value;
+	return keptImageSite(value, key, walk) === undefined ? walk.text(value) : value;
+}
+
+/** The step that masks `value`, which the walk walks into ({@link walksInto}), as {@link maskFreeValue} does. */
+function maskFree(value: object | bigint, key: string | number, walk: MaskWalk): NestedWalk {
+	if (typeof value === "bigint" || typeof value === "function") return maskStoredForm(value, key, walk);
+	if (isPlainObject(value)) return maskFreeObject(value, walk, key);
+	if (isRealArray(value)) return maskArray(value, walk, undefined, false, key);
+	return maskStoredForm(value, key, walk);
 }
 
 /**
@@ -657,13 +728,14 @@ function maskFree(value: unknown, key: string | number, walk: MaskWalk): unknown
  * function, and is `undefined` when nothing is written. A node `stringifyJson` cannot write (a
  * boxed `BigInt`, a cycle) throws here, so the write fails as it does with masking off.
  */
-function maskStoredForm(value: object | bigint, key: string | number, walk: MaskWalk): unknown {
+function* maskStoredForm(value: object | bigint, key: string | number, walk: MaskWalk): NestedWalk {
 	// Under the same key, so a `toJSON` gets the key it gets when the session line is written. A
 	// plain object always serializes; `ownValue`, so a key nothing is written under reads no
 	// `Object.prototype` member.
 	const name = String(key);
-	const holder: Record<string, unknown> = JSON.parse(stringifyJson({ [name]: value })!);
-	return maskFree(ownValue(holder, name), name, walk);
+	const holder: Record<string, unknown> = JSON.parse(entryJsonText({ [name]: value })!);
+	const stored = ownValue(holder, name);
+	return walksInto(stored) ? yield maskFree(stored, name, walk) : maskScalar(stored, name, walk);
 }
 
 /** Whether `value` is a plain object: an `Object` or `null` prototype, no callable `toJSON`, not a boxed primitive. */
@@ -683,33 +755,52 @@ function isRealArray(value: unknown): value is unknown[] {
 }
 
 /** `value`, a plain object, masked at `at`, or {@link DROP} when `at` is a carrier whose text masking changed. */
-function maskChild(value: Record<string, unknown>, walk: MaskWalk, at: Position): unknown {
+function* maskChild(value: Record<string, unknown>, walk: MaskWalk, at: Position): NestedWalk {
 	const before = walk.replacements;
-	const next = maskObject(value, walk, at);
+	const next = yield maskObject(value, walk, at);
 	return at.carrier && walk.replacements > before ? DROP : next;
 }
 
 /**
- * `items`, an array in its stored form, masked: with `at`, each plain-object element at `at`; with
- * `keepStrings`, each primitive-string element kept; every other element free content.
+ * `items`, an array in its stored form under `arrayKey` of its holder, masked: with `at`, each
+ * plain-object element at `at`; with `keepStrings`, each primitive-string element kept; every other
+ * element free content. A plain object ({@link maskFreeObject}), a string (KR14: an image URL's
+ * blob reference, {@link keptImageSite}) and, in a cold entry's record, a nested array sit under
+ * `arrayKey`.
  */
-function maskArray(items: unknown[], walk: MaskWalk, at: Position | undefined, keepStrings: boolean): unknown[] {
+function* maskArray(
+	items: unknown[],
+	walk: MaskWalk,
+	at: Position | undefined,
+	keepStrings: boolean,
+	arrayKey: string | number,
+): NestedWalk<unknown[]> {
+	walk.path.enter(items);
 	let copy: unknown[] | undefined;
 	let droppedPair: unknown;
 	for (let i = 0; i < items.length; i++) {
 		const item = items[i];
 		let next: unknown;
 		if (typeof item === "string") {
-			next = keepStrings ? item : walk.text(item);
+			next = keepStrings ? item : maskScalar(item, arrayKey, walk);
 		} else if (at !== undefined && isPlainObject(item)) {
 			const before = walk.replacements;
-			next = maskChild(item, walk, at);
+			next = yield maskChild(item, walk, at);
 			// KR10: the siblings of a server-tool block go with it only when masking changed text in it.
-			if (walk.replacements > before && at.variants !== undefined && variantOf(item, at.variants)?.pair) {
+			if (
+				walk.replacements > before &&
+				at.variants !== undefined &&
+				variantOf(item[at.variants.key], at.variants)?.pair
+			) {
 				droppedPair = item[at.variants.key];
 			}
+		} else if (at === undefined && isPlainObject(item)) {
+			next = yield maskFreeObject(item, walk, arrayKey);
+		} else if (walk.form === "record" && isRealArray(item)) {
+			// Persistence and a load read a nested array's elements under the outer array's key (KR14).
+			next = yield maskArray(item, walk, undefined, false, arrayKey);
 		} else {
-			next = maskFree(item, i, walk);
+			next = walksInto(item) ? yield maskFree(item, i, walk) : maskScalar(item, i, walk);
 		}
 		if (copy === undefined) {
 			// `Object.is`: a `NaN` left as it is is unchanged.
@@ -718,6 +809,7 @@ function maskArray(items: unknown[], walk: MaskWalk, at: Position | undefined, k
 		}
 		if (next !== DROP) copy.push(next);
 	}
+	walk.path.leave(items);
 	if (copy === undefined) return items;
 	if (droppedPair === undefined || at?.variants === undefined) return copy;
 	const { key } = at.variants;
@@ -725,8 +817,64 @@ function maskArray(items: unknown[], walk: MaskWalk, at: Position | undefined, k
 }
 
 /** `obj`, an object in its stored form, masked at `at`, a listed position of a plain object, or as free content without one. */
-function maskObject(obj: Record<string, unknown>, walk: MaskWalk, at: Position | undefined): Record<string, unknown> {
-	const variant = at?.variants === undefined ? undefined : variantOf(obj, at.variants);
+function maskObject(
+	obj: Record<string, unknown>,
+	walk: MaskWalk,
+	at: Position | undefined,
+): NestedWalk<Record<string, unknown>> {
+	return maskObjectAs(
+		obj,
+		walk,
+		at,
+		at?.variants === undefined ? undefined : variantOf(obj[at.variants.key], at.variants),
+	);
+}
+
+/**
+ * `obj`, a plain object of free content under `key` of its holder (an array element under its
+ * array's key), masked as free content, but for the blob reference of the image it holds (KR14,
+ * {@link keptImageSite}).
+ */
+function maskFreeObject(
+	obj: Record<string, unknown>,
+	walk: MaskWalk,
+	key: string | number,
+): NestedWalk<Record<string, unknown>> {
+	return maskObjectAs(obj, walk, undefined, undefined, keptImageSite(obj, key, walk));
+}
+
+/**
+ * KR14: the site of the image `value`, free content under `key` of its holder (an array element
+ * under its array's key), holds as a blob reference where a load resolves it
+ * ({@link resolvedImageSiteOf}), or `undefined`: `data` or `result`, a field of `value`, or
+ * `image_url`, `value` itself. In a cold entry's record every such site counts: there the reference
+ * is what persistence wrote for the image, where the live entry holds base64 or a data URL. In a
+ * live entry only `data` of a `content` image block or an `images` image counts; a free
+ * `image_url` or generated image holds the data a load resolved there. A snapcompact frame, which a
+ * load leaves as a reference, and a blob reference anywhere else hold no image a load reads: they
+ * are masked as the out-of-position cases of KR7-KR9 mask them.
+ */
+function keptImageSite(value: unknown, key: string | number, walk: MaskWalk): ImageSite | undefined {
+	const site = typeof key === "string" ? resolvedImageSiteOf(value, key) : undefined;
+	if (site === undefined || (site !== "data" && walk.form === "live")) return undefined;
+	const image = imageAt(value, site);
+	return typeof image === "string" && isBlobRef(image) && BLOB_HASH_RE.test(image.slice(BLOB_PREFIX.length))
+		? site
+		: undefined;
+}
+
+/**
+ * {@link maskObject} with `variant`, the row of `at` for `obj`'s `type` or `role`, chosen by the
+ * caller, and with the value under `kept`, when given, stored as written.
+ */
+function* maskObjectAs(
+	obj: Record<string, unknown>,
+	walk: MaskWalk,
+	at: Position | undefined,
+	variant: Position | undefined,
+	kept?: string,
+): NestedWalk<Record<string, unknown>> {
+	walk.path.enter(obj);
 	const signatureKey = signatureKeyOf(obj, variant);
 	const before = walk.replacements;
 	let copy: Record<string, unknown> | undefined;
@@ -734,7 +882,14 @@ function maskObject(obj: Record<string, unknown>, walk: MaskWalk, at: Position |
 	for (const key in obj) {
 		if (!Object.hasOwn(obj, key)) continue;
 		const value = obj[key];
-		const next = at === undefined ? maskFree(value, key, walk) : maskField(value, walk, at, variant, key);
+		let next: unknown;
+		if (key === kept) next = value;
+		else if (walksInto(value)) {
+			const step = at === undefined ? maskFree(value, key, walk) : maskFieldStep(value, walk, at, variant, key);
+			next = step === undefined ? value : yield step;
+		} else if (at !== undefined && typeof value === "string") {
+			next = listed(at, variant, "strings", key) ? value : walk.text(value);
+		} else next = maskScalar(value, key, walk);
 		if (copy === undefined) {
 			if (Object.is(next, value)) continue;
 			copy = copyBefore(obj, key);
@@ -743,6 +898,7 @@ function maskObject(obj: Record<string, unknown>, walk: MaskWalk, at: Position |
 		setOwn(copy, key, next);
 		if (key === "content" && typeof next === "string" && next !== value) maskedContent = next;
 	}
+	walk.path.leave(obj);
 	// KR6, KR10: a signed block whose text a value changed no longer matches its signature.
 	const unsigned =
 		signatureKey !== undefined &&
@@ -759,19 +915,27 @@ function maskObject(obj: Record<string, unknown>, walk: MaskWalk, at: Position |
 }
 
 /**
- * The value under `key` of a plain object at `at` (with its `variant`), masked by the shape `at`
- * declares for `key`, judged on the live value; a value of any other shape is free content.
+ * The step that masks the value under `key` of a plain object at `at` (with its `variant`), one the
+ * walk walks into ({@link walksInto}), by the shape `at` declares for `key`, judged on the live
+ * value: a value of any other shape is free content. `undefined` for a value `at` keeps whole. A
+ * string there is masked by the caller, {@link maskObjectAs}: kept when `at` lists `key` among
+ * its strings.
  */
-function maskField(value: unknown, walk: MaskWalk, at: Position, variant: Position | undefined, key: string): unknown {
-	if (typeof value === "string") return listed(at, variant, "strings", key) ? value : walk.text(value);
+function maskFieldStep(
+	value: object | bigint,
+	walk: MaskWalk,
+	at: Position,
+	variant: Position | undefined,
+	key: string,
+): NestedWalk | undefined {
 	if (isPlainObject(value)) {
-		if (listed(at, variant, "wholeObjects", key)) return value;
+		if (listed(at, variant, "wholeObjects", key)) return undefined;
 		const child = placed(at, variant, "objects", key);
-		return child === undefined ? maskObject(value, walk, undefined) : maskChild(value, walk, child);
+		return child === undefined ? maskFreeObject(value, walk, key) : maskChild(value, walk, child);
 	}
 	if (isRealArray(value)) {
-		if (listed(at, variant, "stringArrays", key)) return maskArray(value, walk, undefined, true);
-		return maskArray(value, walk, placed(at, variant, "elements", key), false);
+		if (listed(at, variant, "stringArrays", key)) return maskArray(value, walk, undefined, true, key);
+		return maskArray(value, walk, placed(at, variant, "elements", key), false, key);
 	}
 	return maskFree(value, key, walk);
 }
@@ -792,9 +956,8 @@ function placed(
 	return name === undefined ? undefined : POSITIONS[name];
 }
 
-/** The rules `variants` adds for `obj`, by its `type` or `role`. */
-function variantOf(obj: Record<string, unknown>, variants: NonNullable<Position["variants"]>): Position | undefined {
-	const tag = obj[variants.key];
+/** The rules `variants` adds for an object whose `type` or `role` is `tag`. */
+function variantOf(tag: unknown, variants: NonNullable<Position["variants"]>): Position | undefined {
 	const variant = typeof tag === "string" ? ownValue(variants.by, tag) : undefined;
 	return typeof variant === "string" ? POSITIONS[variant] : variant;
 }

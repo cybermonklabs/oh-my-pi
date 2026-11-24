@@ -14,6 +14,7 @@ import {
 	type SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { nextTurn, until } from "../helpers/refusing-session-stores";
 
 /** An in-memory backend whose writes to `failing` fail while it is set. */
 class PathFailingBackend implements SessionStorageBackend {
@@ -170,6 +171,36 @@ describe("IndexedSessionStorage.drain", () => {
 		expect(backend.files.has(parent.getSessionFile() as string)).toBe(true);
 
 		await expect(child.close()).rejects.toThrow("the store refused a write");
+		backend.failing = undefined;
+	});
+
+	it("a parent's exit wait after a size conflict leaves a subagent's refused append to the subagent's own drain", async () => {
+		// If this regresses, the exit wait of a parent whose rewrite met another writer (flushSyncThenConfirm,
+		// as a signalled exit records it) takes the failure of a subagent sharing the store: the subagent's
+		// own drain no longer reports that its append failed.
+		const { backend, storage } = await indexedStore();
+		const child = await SessionManager.open("/sessions/parent/Child.jsonl", undefined, storage, {
+			initialCwd: "/cwd",
+		});
+		child.appendMessage(assistant("the child's first answer"));
+		await child.flush();
+		const childFile = child.getSessionFile() as string;
+		backend.failing = childFile;
+		child.appendMessage(assistant("the child's refused answer"));
+		// Let the refusal settle without any drain, which could take the child's failure: one event-loop
+		// turn after the backend refused runs the store's handler for it.
+		await until(() => backend.refused > 0, "the child's refused append");
+		await nextTurn();
+
+		// Another writer's body lands at the parent's path first, so the parent's own rewrite fails the
+		// store's size check, and the child's failure counts only against the child's path from here on.
+		const parent = SessionManager.create("/cwd", "/sessions/main", storage);
+		await storage.writeTextAtomic(parent.getSessionFile() as string, "another writer's line\n");
+		parent.appendMessage({ role: "user", content: "the parent's question", timestamp: Date.now() });
+		parent.appendMessage(assistant("the parent's answer"));
+		await parent.flushSyncThenConfirm()?.catch(() => undefined);
+
+		await expect(storage.drain(childFile)).rejects.toThrow(`the store refused a write to ${childFile}`);
 		backend.failing = undefined;
 	});
 });

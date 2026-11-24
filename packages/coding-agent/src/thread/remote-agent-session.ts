@@ -71,6 +71,7 @@ import type {
 	EphemeralTurnResult,
 	Prewalk,
 	PromptOptions,
+	QueuedMessageTarget,
 	ResolvedRoleModel,
 	RestoredQueuedMessage,
 	RoleModelCycle,
@@ -102,7 +103,7 @@ import type { SubagentParentInputs } from "../task/persisted-revive";
 import type { AgentDefinition } from "../task/types";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import { type ApprovalGrantStore, getApprovalGrants } from "../tools/approval-cache";
-import { USER_TODO_EDIT_CUSTOM_TYPE } from "../tools/todo";
+import { USER_TODO_EDIT_CUSTOM_TYPE } from "../session/session-entries";
 import { TokenRateMeter } from "../utils/token-rate";
 import type { ThreadId } from "./identity";
 import { type RemoteObject, RpcClosedError, rpcSync } from "./rpc";
@@ -875,6 +876,12 @@ export class RemoteAgentSession implements AgentViewSession {
 
 	steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
 		return this.#command("steer", text, images, options);
+	}
+
+	/** Take back a queued message on the home worker; a session that is already gone holds none. */
+	removeQueuedMessage(target: QueuedMessageTarget, queue: "steering" | "followUp"): Promise<boolean> {
+		if (this.#closed !== undefined) return Promise.resolve(false);
+		return this.#command("removeQueuedMessage", target, queue);
 	}
 
 	abort(options?: SessionAbortOptions): Promise<void> {

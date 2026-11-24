@@ -154,7 +154,7 @@ describe("Context usage consolidation", () => {
 
 		sessionManager.branch(parentId!);
 		sessionManager.appendMessage({ role: "user", content: "active branch hello", timestamp: 4000 } as Message);
-		sessionManager.appendMessage({
+		const activeResponse = {
 			role: "assistant",
 			content: [{ type: "text", text: "active response" }],
 			api: mockModel.api,
@@ -171,13 +171,15 @@ describe("Context usage consolidation", () => {
 			},
 			contextSnapshot: { promptTokens: 200, nonMessageTokens: 10 },
 			timestamp: 5000,
-		} as AssistantMessage);
+		} as AssistantMessage;
+		sessionManager.appendMessage(activeResponse);
 
 		syncSession(session, agent);
 
 		const breakdown = session.getContextBreakdown();
 		expect(breakdown?.anchored).toBe(true);
-		expect(breakdown?.usedTokens).toBe(200);
+		// The active anchor's prompt, and its answer, which the next request carries.
+		expect(breakdown?.usedTokens).toBe(200 + agent.tokenizer.countMessage(activeResponse));
 
 		await tempDir.remove();
 	});
@@ -187,7 +189,7 @@ describe("Context usage consolidation", () => {
 		const { session, sessionManager, agent } = createSession(tempDir);
 
 		sessionManager.appendMessage({ role: "user", content: "first", timestamp: 1000 } as Message);
-		const firstId = sessionManager.appendMessage({
+		const firstResponse = {
 			role: "assistant",
 			content: [{ type: "text", text: "first response" }],
 			api: mockModel.api,
@@ -204,7 +206,8 @@ describe("Context usage consolidation", () => {
 			},
 			contextSnapshot: { promptTokens: 150, nonMessageTokens: 10 },
 			timestamp: 2000,
-		} as AssistantMessage);
+		} as AssistantMessage;
+		const firstId = sessionManager.appendMessage(firstResponse);
 
 		sessionManager.appendMessage({ role: "user", content: "second", timestamp: 3000 } as Message);
 		sessionManager.appendMessage({
@@ -231,7 +234,7 @@ describe("Context usage consolidation", () => {
 
 		const breakdown = session.getContextBreakdown();
 		expect(breakdown?.anchored).toBe(true);
-		expect(breakdown?.usedTokens).toBe(150);
+		expect(breakdown?.usedTokens).toBe(150 + agent.tokenizer.countMessage(firstResponse));
 
 		await tempDir.remove();
 	});
@@ -273,7 +276,7 @@ describe("Context usage consolidation", () => {
 		const { session, sessionManager, agent } = createSession(tempDir);
 
 		sessionManager.appendMessage({ role: "user", content: "query", timestamp: 1000 } as Message);
-		sessionManager.appendMessage({
+		const anchorResponse = {
 			role: "assistant",
 			content: [{ type: "text", text: "anchor response" }],
 			api: mockModel.api,
@@ -290,7 +293,8 @@ describe("Context usage consolidation", () => {
 			},
 			contextSnapshot: { promptTokens: 150, nonMessageTokens: 10 },
 			timestamp: 2000,
-		} as AssistantMessage);
+		} as AssistantMessage;
+		sessionManager.appendMessage(anchorResponse);
 
 		const customMsg: AgentMessage = {
 			role: "custom",
@@ -306,7 +310,7 @@ describe("Context usage consolidation", () => {
 		expect(breakdown?.anchored).toBe(true);
 
 		const customEstimate = agent.tokenizer.countMessage(customMsg);
-		expect(breakdown?.usedTokens).toBe(150 + customEstimate);
+		expect(breakdown?.usedTokens).toBe(150 + agent.tokenizer.countMessage(anchorResponse) + customEstimate);
 
 		await tempDir.remove();
 	});

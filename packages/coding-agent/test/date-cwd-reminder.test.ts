@@ -1130,6 +1130,80 @@ describe("date-cwd-reminder", () => {
 				expect(wireOf(resumed).slice(0, sent.messages.length)).toEqual(wireOf(sent));
 				expect(resumed.messages.at(-1)?.content).toBe(`${renderDateCwdReminder("2026-08-16", "/work")}\n\nnext`);
 			});
+
+			// If this regresses, a long session keeps in the date/cwd reminder injector, for as long as it runs, the
+			// turns its compactions cut (each copy sent with its reminder) and a key for each of them; or the request
+			// after a compaction resends the turns it kept with other reminders than they were sent with, or without
+			// them, so a provider re-reads them instead of continuing from its cached copy.
+			it("retainTurns drops the state of the cut turns and re-keys a conversation whose first turn was cut", () => {
+				const { journal, loads } = createJournal();
+				const injector = new DateCwdReminderInjector(journal);
+				const send = (messages: Message[], date: string) =>
+					injector.transform({ systemPrompt: ["system"], messages }, date, "/work");
+				const assistant = (text: string, timestamp: number): Message => ({
+					...createAssistantMessage(text),
+					timestamp,
+				});
+				const toolResult = (text: string, timestamp: number): Message => ({
+					role: "toolResult",
+					toolCallId: `call-${timestamp}`,
+					toolName: "read",
+					content: [{ type: "text", text }],
+					isError: false,
+					timestamp,
+				});
+				const first: Message = { role: "user", content: "first", timestamp: 1 };
+				const call = assistant("call", 2);
+				const result = toolResult("one", 3);
+				const reply = assistant("a", 4);
+				// Programmatic steering sent one turn twice in a millisecond: the compaction cuts the first copy and
+				// keeps the second, which then holds the first copy's key.
+				const twin: Message = { role: "user", content: "ok", timestamp: 5 };
+				const secondTwin = structuredClone(twin);
+				const keptCall = assistant("call again", 7);
+				const keptResult = toolResult("two", 8);
+				const history = [first, call, result, reply, twin, assistant("b", 6), secondTwin, keptCall, keptResult];
+				const reminder = (date: string) => renderDateCwdReminder(date, "/work");
+
+				send([first], "2026-08-14");
+				// Each day's reminder goes to the turn sent first that day: a developer turn behind a tool result
+				// when no user turn is new.
+				send(history.slice(0, 3), "2026-08-15");
+				const withFirstTwin = send(history.slice(0, 5), "2026-08-16");
+				send(history.slice(0, 7), "2026-08-17");
+				const beforeCompaction = send(history, "2026-08-18");
+				const keptWire = wireOf(beforeCompaction).slice(7);
+				expect(keptWire).toEqual([
+					JSON.stringify(["user", `${reminder("2026-08-17")}\n\nok`]),
+					JSON.stringify(["assistant", keptCall.content]),
+					JSON.stringify(["toolResult", keptResult.content]),
+					JSON.stringify(["developer", reminder("2026-08-18")]),
+				]);
+
+				// The compaction keeps the history from the second copy of the twin on, behind its summary.
+				const summary: Message = { role: "user", content: "summary", timestamp: 10 };
+				const kept = [summary, secondTwin, keptCall, keptResult, assistant("c", 9)];
+				injector.retainTurns(kept);
+				const loadsAtCompaction = loads();
+				const afterCompaction = send([...kept, { role: "user", content: "next", timestamp: 11 }], "2026-08-18");
+
+				// The conversation that lost its first turn is the one the next request continues, from memory: the
+				// kept turns go out as they were sent, the second twin with its own reminder, not the cut twin's.
+				expect(loads()).toBe(loadsAtCompaction);
+				expect(wireOf(afterCompaction).slice(1, 1 + keptWire.length)).toEqual(keptWire);
+				expect(afterCompaction.messages[0]?.content).toBe(`${reminder("2026-08-18")}\n\nsummary`);
+
+				// Back on the history before the compaction, the injector holds nothing of the turns it cut: it reads
+				// them from the journal, as a resumed session does, so each goes out with the reminder it was first
+				// sent with, and the new turn tells the model today's date.
+				const branchedBack = send(
+					[first, call, result, reply, { role: "user", content: "back", timestamp: 12 }],
+					"2026-08-19",
+				);
+				expect(loads()).toBe(loadsAtCompaction + 1);
+				expect(wireOf(branchedBack).slice(0, 5)).toEqual(wireOf(withFirstTwin).slice(0, 5));
+				expect(branchedBack.messages.at(-1)?.content).toBe(`${reminder("2026-08-19")}\n\nback`);
+			});
 		});
 	});
 });
@@ -1779,6 +1853,149 @@ describe("date-cwd reminder on the provider wire", () => {
 				{ type: "text", text: renderDateCwdReminder("2026-08-16", normalizePromptPath(tempDir.path())) },
 				{ type: "text", text: "second" },
 			]);
+		} finally {
+			setSystemTime();
+			authStorage.close();
+		}
+	});
+
+	// If this regresses, the requests after a compaction resend the turns it kept with other reminders than they
+	// were first sent with, or without them, so a provider re-reads the kept turns instead of continuing from its
+	// cached copy of them; or they resend a cut turn's date.
+	it("resends the turns a compaction kept with the reminders they were sent with", async () => {
+		using tempDir = TempDir.createSync("@pi-date-cwd-reminder-");
+		await Bun.write(tempDir.join("notes.txt"), "notes");
+		const api = "test-date-cwd-reminder-compaction";
+		const contexts: Context[] = [];
+		registerCustomApi(api, (_model, context) => {
+			contexts.push(context);
+			const stream = new AssistantMessageEventStream();
+			const request = contexts.length;
+			queueMicrotask(() => {
+				if (request !== 2) {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+					return;
+				}
+				// The second turn's tool continuation runs on the next day.
+				setSystemTime(new Date(2026, 7, 16, 0, 1));
+				const toolCall = {
+					type: "toolCall" as const,
+					id: "read-1",
+					name: "read",
+					arguments: { path: "notes.txt" },
+				};
+				const message: AssistantMessage = {
+					...createAssistantMessage(""),
+					content: [toolCall],
+					stopReason: "toolUse",
+				};
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: message });
+				stream.push({ type: "done", reason: "toolUse", message });
+			});
+			return stream;
+		});
+		const model = buildModel({
+			id: "date-cwd-reminder-compaction",
+			name: "Date cwd reminder compaction",
+			api,
+			provider: "managed-primary",
+			// Remote endpoint: a loopback URL would turn on append-only context, which pins message identity.
+			baseUrl: "https://api.example.com/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		authStorage.keys.setRuntime(model.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		// The compaction keeps the second turn on: it carries a reminder of its own, and the next day's reminder
+		// follows its tool result.
+		const keepFromSecond: ExtensionFactory = pi => {
+			pi.on("session_before_compact", async event => {
+				const second = event.branchEntries.find(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						JSON.stringify(entry.message.content).includes("second"),
+				);
+				if (!second) throw new Error("The second turn is not on the branch");
+				return {
+					compaction: {
+						summary: "The user said first.",
+						shortSummary: undefined,
+						firstKeptEntryId: second.id,
+						tokensBefore: event.preparation.tokensBefore,
+						details: {},
+					},
+				};
+			});
+		};
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({ "compaction.enabled": false, "compaction.keepRecentTokens": 1 }),
+			model,
+			toolNames: ["read"],
+			disableExtensionDiscovery: true,
+			extensions: [keepFromSecond],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			taskDepth: 1,
+			agentId: "SubAgent",
+		});
+		sessions.push(session);
+
+		const cwd = normalizePromptPath(tempDir.path());
+		setSystemTime(new Date(2026, 7, 14, 23, 59));
+		try {
+			await session.sendUserMessage("first");
+			setSystemTime(new Date(2026, 7, 15, 0, 1));
+			await session.sendUserMessage("second");
+			await session.waitForIdle();
+			await session.compact();
+			await session.sendUserMessage("third");
+			await session.sendUserMessage("fourth");
+
+			expect(contexts).toHaveLength(5);
+			const wire = contexts.map(context =>
+				context.messages.map(message => JSON.stringify([message.role, message.content])),
+			);
+			// The last request before the compaction ends with the second turn, its tool call and result, and the
+			// next day's reminder.
+			const kept = wire[2]!.slice(2);
+			expect(kept[0]).toBe(
+				JSON.stringify([
+					"user",
+					[
+						{ type: "text", text: renderDateCwdReminder("2026-08-15", cwd) },
+						{ type: "text", text: "second" },
+					],
+				]),
+			);
+			expect(kept.at(-1)).toBe(JSON.stringify(["developer", renderDateCwdReminder("2026-08-16", cwd)]));
+			// After it: the summary with today's reminder, then the kept turns as they were sent.
+			const summary = contexts[3]!.messages[0]!;
+			if (summary.role !== "user") throw new Error(`The first turn after the compaction is a ${summary.role} turn`);
+			const summaryText =
+				typeof summary.content === "string"
+					? summary.content
+					: summary.content.map(part => (part.type === "text" ? part.text : "")).join("\n\n");
+			expect(summaryText).toStartWith(renderDateCwdReminder("2026-08-16", cwd));
+			expect(summaryText).toContain("The user said first.");
+			expect(wire[3]!.slice(1, 1 + kept.length)).toEqual(kept);
+			expect(JSON.stringify(contexts[3]!.messages)).not.toContain("2026-08-14");
+			expect(wire[4]!.slice(0, wire[3]!.length)).toEqual(wire[3]!);
 		} finally {
 			setSystemTime();
 			authStorage.close();

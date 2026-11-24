@@ -219,11 +219,11 @@ import {
 } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
 import { type CfgApproval, type CfgChangeRequest, setCfgApprovalHost } from "../internal-urls/cfg-protocol";
+import { GOAL_COMPLETED_CUSTOM_TYPE, TODO_HUD_STATE_CUSTOM_TYPE } from "../session/session-entries";
 import {
 	createTodoHudStateData,
 	getTodoHudVisibility,
 	nextActionableTask,
-	TODO_HUD_STATE_CUSTOM_TYPE,
 	type TodoHudStateEntryData,
 } from "../tools/todo";
 import {
@@ -5795,7 +5795,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const ownerScope = this.#vibeModeOwnerScope;
 		if (!this.vibeModeEnabled || !ownerScope) return;
 		// A switch of the parent session stops the workers' turns and their own jobs.
-		await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager, "stop");
+		await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager);
 		this.#vibeScopeSuspendedForSwitch = true;
 	}
 
@@ -6028,7 +6028,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#vibeModePreviousTools = undefined;
 			this.#vibeModeOwnerScope = undefined;
 			if (ownerScope && !options?.vibeScopeAlreadySuspended) {
-				await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager, "stop");
+				await VibeSessionRegistry.global().suspendScope(ownerScope, this.session.asyncJobManager);
 			}
 			this.#updateVibeModeStatus();
 		}
@@ -6460,7 +6460,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (options?.reason === "completed") {
 			this.session.setGoalModeState(undefined);
 			this.sessionManager.appendModeChange("none");
-			this.sessionManager.appendCustomEntry("goal-completed", {
+			this.sessionManager.appendCustomEntry(GOAL_COMPLETED_CUSTOM_TYPE, {
 				objective: currentState?.goal?.objective,
 				tokensUsed: currentState?.goal?.tokensUsed,
 				tokenBudget: currentState?.goal?.tokenBudget,

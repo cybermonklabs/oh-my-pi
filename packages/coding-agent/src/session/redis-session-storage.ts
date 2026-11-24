@@ -3,8 +3,9 @@ import {
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
-import { SessionWriteConflictError } from "./session-storage";
-import { eexist } from "./session-storage-errors";
+import { STALE_STAGING_MS, utf8Parts } from "./session-staging";
+import { SessionReadConflictError, SessionWriteConflictError } from "./session-storage";
+import { eexist, enoent } from "./session-storage-errors";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /**
@@ -42,6 +43,10 @@ export interface RedisSessionStorageOptions {
 
 const DEFAULT_PREFIX = "omp:sessions:";
 const DEFAULT_SCAN_COUNT = 500;
+/** Bytes of each part a streamed full write appends to its staging key. */
+const STAGING_PART_BYTES = 1024 * 1024;
+/** Most bytes one window of a chunked read (`readChunks`) fetches. */
+const READ_WINDOW_BYTES = 1024 * 1024;
 
 const WRITE_FULL_SCRIPT = `-- OMP_WRITE_FULL
 local expected = ARGV[6]
@@ -63,6 +68,50 @@ else
 end
 return {1, string.len(ARGV[1])}`;
 
+// One part of a streamed full write: appended to the write's staging key,
+// which then expires ARGV[2] ms later, so a killed writer's key goes.
+const STAGE_PART_SCRIPT = `-- OMP_STAGE_PART
+local size = redis.call("APPEND", KEYS[1], ARGV[1])
+redis.call("PEXPIRE", KEYS[1], ARGV[2])
+return size`;
+
+// One script, so the size check, the swap of the staging key (KEYS[1]) over
+// the file key, and its mtime and title run with no other client's command
+// between. ARGV[5] is the expected size ("" for none, "-1" for no key),
+// ARGV[6] the body's byte length. Returns {1, size} once swapped; {0, actual}
+// when the size check refuses, and {-1, staged} when the staging key does not
+// hold the body (it expired), both after deleting the staging key.
+const WRITE_STAGED_SCRIPT = `-- OMP_WRITE_STAGED
+local expected = ARGV[5]
+if expected ~= "" then
+	local actual = -1
+	if redis.call("EXISTS", KEYS[2]) == 1 then
+		actual = redis.call("STRLEN", KEYS[2])
+	end
+	if actual ~= tonumber(expected) then
+		redis.call("DEL", KEYS[1])
+		return {0, actual}
+	end
+end
+local staged = redis.call("STRLEN", KEYS[1])
+if staged ~= tonumber(ARGV[6]) then
+	redis.call("DEL", KEYS[1])
+	return {-1, staged}
+end
+if staged == 0 then
+	redis.call("SET", KEYS[2], "")
+else
+	redis.call("RENAME", KEYS[1], KEYS[2])
+	redis.call("PERSIST", KEYS[2])
+end
+redis.call("HSET", KEYS[3], ARGV[1], ARGV[2])
+if ARGV[3] == "1" then
+	redis.call("HSET", KEYS[4], ARGV[1], ARGV[4])
+else
+	redis.call("HDEL", KEYS[4], ARGV[1])
+end
+return {1, staged}`;
+
 const APPEND_SCRIPT = `-- OMP_APPEND
 local size = redis.call("APPEND", KEYS[1], ARGV[1])
 redis.call("HSET", KEYS[2], ARGV[2], ARGV[3])
@@ -71,6 +120,95 @@ return size`;
 const UPDATE_TITLE_SCRIPT = `-- OMP_UPDATE_TITLE
 redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
 redis.call("HSET", KEYS[2], ARGV[1], ARGV[3])
+return 1`;
+
+// One script, so the size and the bytes come from one read: no client's write
+// lands between them. ARGV[1] is the first byte, ARGV[2] the last ("-1" for
+// the end, "" for none); a missing key returns nil.
+const READ_FROM_SCRIPT = `-- OMP_READ_FROM
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return false
+end
+local text = ""
+if ARGV[2] ~= "" then
+	text = redis.call("GETRANGE", KEYS[1], ARGV[1], ARGV[2])
+end
+return {redis.call("STRLEN", KEYS[1]), text}`;
+
+// One window of a chunked read: the key's size, and from byte ARGV[1] at most
+// ARGV[2] bytes, up to ARGV[3], the size the read's first window saw ("" for
+// the first window, which reads up to the size it finds). A window starts and
+// ends between characters, so its bytes decode to a string and encode back to
+// the same bytes: a first window from inside a character starts at the byte
+// that begins it (a later one starts where the last one ended), and a window
+// that stops short of the read's end ends before the character its next byte
+// continues, never as nothing (each backs over at most three continuation
+// bytes, and not at all where the bytes are not UTF-8). Returns {size, the
+// window's byte length, its SHA-1, the window, the bytes it starts before
+// ARGV[1]}; {size} alone when the key is shorter than ARGV[3] now, and nil
+// when it is missing.
+const READ_WINDOW_SCRIPT = `-- OMP_READ_WINDOW
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return false
+end
+local size = redis.call("STRLEN", KEYS[1])
+local stop = size
+if ARGV[3] ~= "" then
+	stop = tonumber(ARGV[3])
+	if size < stop then
+		return {size}
+	end
+end
+-- The continuation bytes (10xxxxxx), at most three and none before byte
+-- floor, that run back from byte at to the byte that begins their character;
+-- 0 when byte at begins one, or when no such byte is found.
+local function back_to_start(at, floor)
+	local probe = redis.call("GETRANGE", KEYS[1], math.max(floor, at - 3), at)
+	local back = 0
+	while back < 3 and #probe - back > 1 do
+		local byte = string.byte(probe, #probe - back)
+		if byte < 128 or byte >= 192 then
+			break
+		end
+		back = back + 1
+	end
+	if back > 0 and string.byte(probe, #probe - back) >= 192 then
+		return back
+	end
+	return 0
+end
+local first = tonumber(ARGV[1])
+if first >= stop then
+	return {size, 0, "", "", 0}
+end
+local start = first
+if first > 0 and ARGV[3] == "" then
+	start = first - back_to_start(first, 0)
+end
+local last = math.min(start + tonumber(ARGV[2]), stop) - 1
+if last + 1 < stop then
+	last = last - back_to_start(last + 1, start + 1)
+end
+local text = redis.call("GETRANGE", KEYS[1], start, last)
+return {size, string.len(text), redis.sha1hex(text), text, first - start}`;
+
+// The check at the end of a chunked read, in one script, so it compares one
+// state of the key: 1 when the key holds, from byte ARGV[1] on, the windows
+// the read yielded, given as each one's byte length and SHA-1 in order
+// (ARGV[2], ARGV[3], then the next window's); 0 when it does not, or is gone.
+const CHECK_WINDOWS_SCRIPT = `-- OMP_CHECK_WINDOWS
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return 0
+end
+local at = tonumber(ARGV[1])
+for i = 2, #ARGV, 2 do
+	local length = tonumber(ARGV[i])
+	local text = redis.call("GETRANGE", KEYS[1], at, at + length - 1)
+	if string.len(text) ~= length or redis.sha1hex(text) ~= ARGV[i + 1] then
+		return 0
+	end
+	at = at + length
+end
 return 1`;
 
 // One script, so the key, its mtime and its title move together: no client's
@@ -148,13 +286,34 @@ function decodeTitleMeta(raw: string | undefined): SessionTitleUpdate | undefine
 }
 
 /**
+ * The conflict a write script reports as `{0, actual}`: `actual` is the
+ * session's byte length, or -1 when it has none; a reply that carries no
+ * number there (NaN) reads as none too.
+ */
+function sizeConflict(path: string, expectedSize: number | null, actual: number): SessionWriteConflictError {
+	return new SessionWriteConflictError(path, expectedSize, actual === -1 || !Number.isFinite(actual) ? null : actual);
+}
+
+/** A write script's `{status, size}` reply as two numbers, each NaN where the reply has no number. */
+function writeReply(result: unknown): [status: number, size: number] {
+	return Array.isArray(result) ? [Number(result[0]), Number(result[1])] : [Number.NaN, Number.NaN];
+}
+
+/**
  * Redis-backed implementation of {@link SessionStorage}. Each session JSONL
  * file maps to a Redis STRING key, with per-key metadata (mtime) tracked in a
  * single sibling HASH. This process keeps only a metadata index (`size`,
  * `mtimeMs`) in memory so synchronous `existsSync` / `statSync` /
- * `listFilesSync` calls remain available without mirroring full content.
+ * `listFilesSync` calls remain available without mirroring full content. A
+ * full rewrite streams its body in parts to a staging key of its own and
+ * swaps it in (see `writeFullStream`), and a chunked read (`readChunks`),
+ * which the check after a failed publish and the loaders of long sessions
+ * take, fetches the stored text in windows of at most
+ * {@link READ_WINDOW_BYTES}, so neither holds the body as one value.
  */
 export class RedisSessionStorage extends IndexedSessionStorage {
+	/** Always set: the Redis backend reads a session window by window. */
+	declare readonly readChunks: (path: string, fromByte?: number) => AsyncIterable<Uint8Array>;
 	/**
 	 * Warm the metadata index with every existing session key under the configured
 	 * prefix and return the ready-to-use storage. Must be awaited before passing
@@ -222,6 +381,93 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		return Promise.all([head, tail]);
 	}
 
+	async readFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number } | null> {
+		const take = maxBytes === undefined ? undefined : Math.max(0, Math.trunc(maxBytes));
+		const last = take === undefined ? "-1" : take === 0 ? "" : String(offset + take - 1);
+		const result = await this.#client.send("EVAL", [
+			READ_FROM_SCRIPT,
+			"1",
+			this.#fileKey(path),
+			String(offset),
+			last,
+		]);
+		if (!Array.isArray(result)) return null;
+		return { text: String(result[1]), size: Number(result[0]) };
+	}
+
+	/**
+	 * The stored bytes from `fromByte`, a window of at most
+	 * {@link READ_WINDOW_BYTES} per script (`READ_WINDOW_SCRIPT`), each window
+	 * one chunk. A window starts and ends between characters, so its text
+	 * decodes and encodes back to its bytes; a read from inside a character
+	 * fetches that character whole and yields its bytes from `fromByte` on.
+	 * The read stops at the size its first window saw, so an append made
+	 * meanwhile is left out; a key that is gone or shorter than that at a later
+	 * window was deleted or rewritten during the read, which then fails with
+	 * {@link SessionReadConflictError}.
+	 *
+	 * A full rewrite to as many bytes or more is not seen by a window, so once
+	 * the bytes the read yielded come from more than one window, one script at
+	 * the read's end (`CHECK_WINDOWS_SCRIPT`) checks that the key holds them
+	 * still, by each window's byte length and SHA-1 as the window script gave
+	 * them; one that does not is a read conflict too. The check runs when the
+	 * read ends, and also when its consumer closes it before that (a `break`
+	 * out of its loop), whose `return()` then rejects with the conflict. A
+	 * read that fails runs no check.
+	 */
+	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
+		const key = this.#fileKey(path);
+		// The check's arguments: the byte the first window starts at, then each window's byte length and SHA-1.
+		const windows: string[] = [];
+		let failed = false;
+		try {
+			let at = Math.max(0, Math.trunc(fromByte));
+			let stop: number | undefined;
+			do {
+				const reply = await this.#client.send("EVAL", [
+					READ_WINDOW_SCRIPT,
+					"1",
+					key,
+					String(at),
+					String(READ_WINDOW_BYTES),
+					stop === undefined ? "" : String(stop),
+				]);
+				if (!Array.isArray(reply)) {
+					if (stop === undefined) throw enoent(path);
+					throw new SessionReadConflictError(path);
+				}
+				const size = Number(reply[0]);
+				if (stop === undefined) stop = size;
+				else if (size < stop) throw new SessionReadConflictError(path);
+				const length = Number(reply[1]);
+				if (length === 0) return;
+				// Only a first window from inside a character starts before `at`.
+				const before = Number(reply[4]);
+				if (windows.length === 0) windows.push(String(at - before));
+				windows.push(String(length), String(reply[2]));
+				at += length - before;
+				const bytes = Buffer.from(String(reply[3]), "utf8");
+				yield before > 0 ? bytes.subarray(before) : bytes;
+			} while (at < stop);
+		} catch (err) {
+			failed = true;
+			throw err;
+		} finally {
+			// More than one window: at the read's end, or where its consumer closed it, unless it is failing already.
+			if (!failed && windows.length > 3) await this.#confirmWindows(path, key, windows);
+		}
+	}
+
+	/**
+	 * Fail with {@link SessionReadConflictError} unless `key` still holds the
+	 * windows a {@link readChunks} of `path` yielded: `windows` is the byte the
+	 * first one starts at, then each one's byte length and SHA-1.
+	 */
+	async #confirmWindows(path: string, key: string, windows: string[]): Promise<void> {
+		const held = await this.#client.send("EVAL", [CHECK_WINDOWS_SCRIPT, "1", key, ...windows]);
+		if (Number(held) !== 1) throw new SessionReadConflictError(path);
+	}
+
 	async writeFull(
 		path: string,
 		content: string,
@@ -243,11 +489,69 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 			expectedSize === undefined ? "" : String(expectedSize ?? -1),
 		]);
 		if (expectedSize === undefined) return;
-		const written = Array.isArray(result) && Number(result[0]) === 1;
-		if (written) return;
-		const encodedActual = Array.isArray(result) ? Number(result[1]) : Number.NaN;
-		const actualSize = encodedActual === -1 ? null : Number.isFinite(encodedActual) ? encodedActual : null;
-		throw new SessionWriteConflictError(path, expectedSize, actualSize);
+		const [status, size] = writeReply(result);
+		if (status === 1) return;
+		throw sizeConflict(path, expectedSize, size);
+	}
+
+	/**
+	 * {@link writeFull} from a stream. Each part of at most
+	 * {@link STAGING_PART_BYTES}, ending on a character boundary, is appended
+	 * to a staging key of this write's alone, `<prefix>staging:<path>#<random
+	 * UUID>`, which expires {@link STALE_STAGING_MS} after its last part, so a
+	 * killed writer's goes; then one script checks the session's size, checks
+	 * that the staging key holds the whole body, renames it over the file key
+	 * and sets the mtime and title. No other write knows the staging key, so
+	 * none can rename it, and no listing sees it (they scan file keys). A
+	 * failure deletes it and leaves the session as it was.
+	 */
+	async writeFullStream(
+		path: string,
+		chunks: AsyncIterable<Uint8Array>,
+		byteLength: number,
+		mtimeMs: number,
+		title?: SessionTitleUpdate,
+		expectedSize?: number | null,
+	): Promise<void> {
+		const staging = `${this.#prefix}staging:${path}#${crypto.randomUUID()}`;
+		let result: unknown;
+		try {
+			let staged = 0;
+			for await (const part of utf8Parts(chunks, STAGING_PART_BYTES)) {
+				await this.#client.send("EVAL", [STAGE_PART_SCRIPT, "1", staging, part.text, String(STALE_STAGING_MS)]);
+				staged += part.byteLength;
+			}
+			if (staged !== byteLength) {
+				throw new Error(`RedisSessionStorage: a full write of ${path} streamed ${staged} bytes, not ${byteLength}`);
+			}
+			result = await this.#client.send("EVAL", [
+				WRITE_STAGED_SCRIPT,
+				"4",
+				staging,
+				this.#fileKey(path),
+				this.#metaKey(),
+				this.#titleMetaKey(),
+				path,
+				String(mtimeMs),
+				title ? "1" : "0",
+				title ? encodeTitleMeta(title) : "",
+				expectedSize === undefined ? "" : String(expectedSize ?? -1),
+				String(byteLength),
+			]);
+		} catch (err) {
+			try {
+				await this.#client.send("DEL", [staging]);
+			} catch {
+				// The write's own failure is the one to report; the staging key expires.
+			}
+			throw err;
+		}
+		const [status, size] = writeReply(result);
+		if (status === 1) return;
+		if (status === 0) throw sizeConflict(path, expectedSize ?? null, size);
+		throw new Error(
+			`RedisSessionStorage: the staging key of a full write of ${path} held ${size} bytes, not ${byteLength}`,
+		);
 	}
 
 	async append(path: string, line: string, mtimeMs: number): Promise<void> {

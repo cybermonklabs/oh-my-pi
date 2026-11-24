@@ -22,6 +22,10 @@
 - Added `Agent.declaredTools()`: the tools the next main request declares, in wire order, the active tools as given and, while a tool stays on the roster, a withdrawn tool Anthropic keeps declared as the agent last sent it
 - Added `kimiApiFormatResolver` to the `Agent` options: the Kimi Code API format read at each main request, which the request goes out in and `declaredToolsFingerprint()` and `declaredTools()` read the model it goes out as in, so a host setting changed mid-session reaches the next request
 
+### Changed
+
+- Prune passes look up tool calls before the compaction boundary in an index built once per boundary and branch, instead of re-reading that history on every pass that misses a call
+
 ### Fixed
 
 - Steering and follow-ups drained for the next turn now return to their queue when the run is aborted before that turn starts, including while `/pause` holds it, instead of being recorded with no reply ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
@@ -34,6 +38,9 @@
 - A per-call context message (`markPerCallContextMessage`) that a main request repeats with the bytes the previous main request had at the same position is now sent as history, so Anthropic prompt caching keeps both rolling breakpoints instead of anchoring one before it; side requests (`buildSideRequestContext`) keep the marks as set, and only a request the provider dispatched (its `beforeDispatch`) counts as the previous one: one a `beforeModelCall` stop, an abort, or a refusal inside the stream function (a spend cap checked again as the request goes out, a model check) kept from going out does not
 - `streamProxy` now calls `beforeDispatch` before it sends the request, as the pi-ai transports do: a refusal there sends nothing to the proxy, and an `Agent` behind a proxy sends a repeated per-call context message as history
 - `Agent` now applies a change of `intentTracing` or `pruneToolDescriptions` from the next model call, as it does the system prompt and tools, instead of from the next prompt run, so a rebuild that changes all of them in the middle of a run changes them at one request and Anthropic prompt caching writes the prompt once; a response's tool calls are still stripped by the switch of the request that produced it
+- The context figure that the status line, compaction and the rate-limit fallback read now counts `$` Python output, `@file` mentions and a `!` command's terminal images, and no longer counts a `!!` or `$$` output that no request carries
+- Counting a stored custom message whose content is neither text nor blocks no longer throws
+- After a compaction that kept no entry (an Anthropic native compaction that summarizes everything), the prune and shake passes start at that compaction, or at the turns added while it ran, instead of walking, and reading, the whole history on every pass
 
 ## [18.18.2] - 2026-11-08
 

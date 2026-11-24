@@ -46,6 +46,7 @@ import type {
 	EphemeralTurnResult,
 	Prewalk,
 	PromptOptions,
+	QueuedMessageTarget,
 	ResolvedRoleModel,
 	RestoredQueuedMessage,
 	RoleModelCycleResult,
@@ -269,6 +270,7 @@ export interface SessionAbortOptions {
 export type SessionHostProtocol = {
 	prompt: RpcMethod<[text: string, options?: PromptOptions], boolean>;
 	steer: RpcMethod<[text: string, images?: ImageContent[], options?: SteerOptions], void>;
+	removeQueuedMessage: RpcMethod<[target: QueuedMessageTarget, queue: "steering" | "followUp"], boolean>;
 	abort: RpcMethod<[options?: SessionAbortOptions], void>;
 	dispose: RpcMethod<[options?: AgentSessionDisposeOptions], void>;
 	deliverIrcMessage: RpcMethod<[msg: IrcMessage], "injected" | "woken">;
@@ -364,6 +366,10 @@ export type SessionBridgeProtocol = {
 	subscribeRunState: RpcMethod<[session: AgentSessionHandle, listener: (state: SessionRunState) => void], () => void>;
 	prompt: RpcMethod<[session: AgentSessionHandle, text: string, options?: PromptOptions], boolean>;
 	steer: RpcMethod<[session: AgentSessionHandle, text: string, images?: ImageContent[], options?: SteerOptions], void>;
+	removeQueuedMessage: RpcMethod<
+		[session: AgentSessionHandle, target: QueuedMessageTarget, queue: "steering" | "followUp"],
+		boolean
+	>;
 	abort: RpcMethod<[session: AgentSessionHandle, options?: SessionAbortOptions], void>;
 	dispose: RpcMethod<[session: AgentSessionHandle, options?: AgentSessionDisposeOptions], void>;
 	deliverIrcMessage: RpcMethod<[session: AgentSessionHandle, msg: IrcMessage], "injected" | "woken">;

@@ -7,6 +7,7 @@ import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import { isCompressScratchPath } from "@oh-my-pi/omp-stats/parser";
 import {
+	ConcatSink,
 	formatBytes,
 	getAgentDir,
 	getBlobsDir,
@@ -40,9 +41,10 @@ import {
 	restoreArchivedSessionLocked,
 } from "../session/session-archive";
 import { codeOf, statIfPresent, withGcLock } from "../session/gc-lock";
-import { readSessionHeaderId } from "../session/session-loader";
+import { readSessionHeaderId, transcriptByteChunks } from "../session/session-loader";
 import {
 	FileSessionStorage,
+	retryRacedRead,
 	SESSION_STAGING_RE,
 	type SessionStorage,
 	tryAcquireSessionLease,
@@ -590,6 +592,21 @@ function collectBlobHashesFromText(text: string, hashes: Set<string>): void {
 	}
 }
 
+/**
+ * {@link collectBlobHashesFromText} over the bytes `chunks` yields, a line at
+ * a time, holding one chunk and the line it ends inside. A reference never
+ * spans lines.
+ */
+async function collectBlobHashesFromChunks(chunks: AsyncIterable<Uint8Array>, hashes: Set<string>): Promise<void> {
+	const decoder = new TextDecoder();
+	const lines = new ConcatSink();
+	for await (const chunk of chunks) {
+		for (const line of lines.appendAndFlushLines(chunk)) collectBlobHashesFromText(decoder.decode(line), hashes);
+	}
+	const tail = lines.flush();
+	if (tail) collectBlobHashesFromText(decoder.decode(tail), hashes);
+}
+
 /** The first way `after` differs from `before`, or undefined when it does not. */
 function censusChange(before: Map<string, string>, after: Map<string, string>): string | undefined {
 	for (const [name, standing] of after) {
@@ -976,15 +993,15 @@ async function runBlobGc(
 				);
 			}
 			for (const file of stored) {
-				let text: string;
 				try {
-					text = await storage.readText(file);
+					// Raced by a rewrite: read it again, never skip it, or the blobs only it references would go.
+					await retryRacedRead(() =>
+						collectBlobHashesFromChunks(transcriptByteChunks(file, storage), referenced.hashes),
+					);
 				} catch (error) {
 					// Removed since the listing: it references nothing anymore.
-					if (codeOf(error) === "ENOENT") continue;
-					throw error;
+					if (codeOf(error) !== "ENOENT") throw error;
 				}
-				collectBlobHashesFromText(text, referenced.hashes);
 			}
 		}
 		const { candidates, staging } = await collectBlobCandidates(blobDir, options.track);

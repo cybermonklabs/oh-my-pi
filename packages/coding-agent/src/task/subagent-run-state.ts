@@ -1,0 +1,13 @@
+/**
+ * Module state the subagent run (`./executor`) and its warm revive (`./subagent-revive`) share.
+ */
+import type { AgentSession } from "../session/agent-session";
+
+/**
+ * The model session creation started a subagent session on in place of the
+ * one it requested, and the `Fallback:` notice saying why
+ * (`startupModelFallback`). Kept with the session, not one run, so every
+ * monitor that attaches to it (the spawn's, a follow-up turn's, an IRC
+ * wake's) reports the substitution whenever that model serves.
+ */
+export const startupModelFallbacks = new WeakMap<AgentSession, { model: string; reason: string }>();
