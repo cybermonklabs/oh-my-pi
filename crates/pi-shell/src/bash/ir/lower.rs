@@ -432,6 +432,11 @@ struct Lower {
 	lines:         Lines,
 	/// Depth of condition contexts.
 	cond:          u32,
+	/// The next pipeline lowered is a background job's whole command
+	/// whose `!` does not invert the job's status (bash clears
+	/// `CMD_INVERT_RETURN` in an asynchronous child; zsh does not invert an
+	/// untimed one): it is lowered without its `Not`.
+	async_bang:    bool,
 	features:      syn::Features,
 	/// Lowering run-time parsed text (`lower_text`) outside any command
 	/// substitution body: its words are [`WordKind::Text`] (no tilde
@@ -504,6 +509,7 @@ impl Lower {
 			base,
 			lines: Lines::default(),
 			cond: 0,
+			async_bang: false,
 			features,
 			text: false,
 		}
@@ -579,6 +585,17 @@ impl Lower {
 					self.unit.ops[at as usize].flags |= Op::DISOWN;
 				}
 				let entry = self.here();
+				// bash and zsh do not apply a background job's `!` to the job's
+				// status (bash's asynchronous child clears `CMD_INVERT_RETURN`,
+				// `execute_cmd.c:1597`); zsh 5.9 inverts a timed one.
+				let first = ao.first();
+				self.async_bang =
+					ao.rest().len() == 0 && first.bang() && !(zsh && first.time().is_some());
+				// The shell still takes that `!` when `extdebug` skips the job
+				// before it forks: the `Spawn` says the job had one.
+				if self.async_bang {
+					self.unit.ops[at as usize].flags |= Op::NEGATED;
+				}
 				self.and_or(ao)?;
 				self.emit(Opcode::SubExit, 0, 0, ao_id);
 				let end = self.here();
@@ -621,6 +638,7 @@ impl Lower {
 	}
 
 	fn pipeline(&mut self, p: st::Pipeline<'_>) -> R {
+		let async_bang = std::mem::take(&mut self.async_bang);
 		let pid = p.id().0;
 		self.node(p.id(), NodeKind::Pipeline, p.span());
 		let time = p.time();
@@ -654,7 +672,12 @@ impl Lower {
 		}
 		if p.bang() {
 			self.cond -= 1;
-			self.emit(Opcode::Not, 0, 0, pid);
+			// A background job's own `!` pipeline still runs as a condition
+			// (errexit stays off in it, bash's `CMD_IGNORE_RETURN`), but its
+			// status is not inverted ([`Self::async_bang`]).
+			if !async_bang {
+				self.emit(Opcode::Not, 0, 0, pid);
+			}
 		}
 		if let Some(t) = time {
 			self.emit(Opcode::TimeEnd, 0, u32::from(t.posix), pid);
@@ -1036,6 +1059,7 @@ impl Lower {
 			base:          self.base,
 			lines:         self.lines.clone(),
 			cond:          0,
+			async_bang:    false,
 			features:      self.features,
 			text:          false,
 		};

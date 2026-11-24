@@ -17,7 +17,7 @@ use super::{
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, DebugSkip, Depths, Frame, FrameKind, InlineStage,
 		LastBg, LoopKind, LoopRec, ParseSnapshot, PendingBreak, PendingSub, PendingWrite, Probe,
-		ProbeResult, Run, Saved, Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		ProbeResult, Run, Saved, Saves, Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -1419,11 +1419,12 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 					.map(|(op, u)| {
 						let (entries, lone) = debug_stage_entries(u, op);
 						let entry = entries.get(done - 1).copied();
-						let negated = entry.is_some_and(|e| {
-							u.ops
-								.get(e as usize + 1)
-								.is_some_and(|o| o.code == Opcode::Not)
-						});
+						// `! cmd &`: the job's code has no `Not` (bash's
+						// asynchronous child does not invert its status), so
+						// the `Spawn` says the job had one ([`Op::NEGATED`]):
+						// a job skipped here is not forked, and the shell
+						// inverts, as bash's parent does.
+						let negated = op.flags & Op::NEGATED != 0;
 						(lone.then_some(u.spawns[op.a as usize].end), entry, negated)
 					});
 				if f.debug_pc == Some(ENTRY_DEBUG) {
@@ -1928,7 +1929,7 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 		drop_scratch(root, store, vp, sc);
 	}
 	while let Some(saves) = f.redirs.pop() {
-		restore(vp, saves);
+		restore(vp, saves.fds);
 	}
 	let keep = vp.frames.len();
 	close_procsubs(vp, keep);
@@ -2215,7 +2216,7 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 		saves.push(f.redirs.pop().expect("checked"));
 	}
 	for s in saves {
-		restore(vp, s);
+		restore(vp, s.fds);
 	}
 }
 
@@ -2876,10 +2877,12 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			}
 			// bash exits 127 when the error reaches the command loop of a `-c`
 			// string (`run_one_command`), 1 from a script and from a nearer
-			// `top_level` ([`fatal_reaches_command_loop`]). zsh exits 1 from
-			// any of them (`errflag` ends `loop` with 1).
+			// `top_level` ([`fatal_reaches_command_loop`]). Under `set -e`
+			// bash's `report_error` exits at once with the failure status. zsh
+			// exits 1 from any of them (`errflag` ends `loop` with 1).
 			let command = vp.mode.dialect() != Dialect::Zsh
 				&& fatal_reaches_command_loop(vp)
+				&& !errexit_on(k, cx, vp)
 				&& matches!(
 					state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
 					Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
@@ -3186,7 +3189,7 @@ pub fn start_sub(
 			let prev = vp.fds.get(1).cloned();
 			if form == ComsubForm::NoFork {
 				vp.fds.set(1, Some(out));
-				frame.redirs.push(vec![Saved { fd: 1, prev }]);
+				frame.redirs.push(vec![Saved { fd: 1, prev }].into());
 			}
 			vp.frames.push(frame);
 			sc.sub = Some(PendingSub::NoFork { capture, value: form == ComsubForm::Value });
@@ -3879,24 +3882,93 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			if let Some(fd) = flush_out(k, vp) {
 				return Flow::Block(WaitKey::Write { fd });
 			}
-			match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
+			let pc = top_frame(vp).pc;
+			// The own redirections of the command a fork was made for, and of
+			// a `( … )`, are made in the fork without undo; a compound command's
+			// in the shell are undone after it.
+			let forked = vp.frames.len() == 1 && vp.fork().at_entry();
+			if forked && vp.fork().ending() {
+				// Its own redirections ended the fork, which waited for their
+				// message (`run_slice` writes what is left before the op comes
+				// back): it exits now, and they are not made again.
+				return Flow::Exit(vp.status);
+			}
+			let subshell = matches!(
+				unit.ops.get(pc as usize + 1..pc as usize + 3),
+				Some([enter, spawn])
+					if enter.code == Opcode::Enter
+						&& spawn.code == Opcode::Spawn
+						&& unit.spawns.get(spawn.a as usize).is_some_and(|s| s.kind == SpawnKind::Subshell)
+			);
+			// A bash `( … )`'s own `{var}`s are its fork's: the shell keeps
+			// none (zsh code keeps its own rule).
+			let fork = subshell && !forked && unit.mode.dialect() != Dialect::Zsh;
+			let owner = redir::Owner::Compound { undo: !forked && !subshell, fork };
+			let res = redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line), owner);
+			if forked && !matches!(res, Err(redir::Halt::Flow(_))) {
+				// Past the fork's own redirections, its body runs under bash's
+				// `execute_in_subshell`, which catches its fatal errors.
+				vp.set_fork(super::proc::Fork::CHILD);
+			}
+			match res {
 				Ok(()) => {
 					let saves = match top_frame(vp).scratch.take() {
 						Some(mut sc) => {
-							let saves = sc
-								.io
-								.as_mut()
-								.map_or_default(|io| std::mem::take(&mut io.saved));
+							// The `{var}`s go with the saved fds to the `Spawn`.
+							let saves = sc.io.as_mut().map_or_default(|io| Saves {
+								fds:  std::mem::take(&mut io.saved),
+								vars: io.var_fds.take(),
+							});
 							drop_scratch(&mut k.root, cx.store, vp, sc);
 							saves
 						},
-						None => Vec::new(),
+						None => Saves::default(),
 					};
 					top_frame(vp).redirs.push(saves);
 					Flow::Next
 				},
+				// A fatal expansion error in a `( … )`'s own redirections ends
+				// its fork, which bash makes them in before the subshell's
+				// catcher (`execute_in_subshell`): the subshell fails with the
+				// status the fork exits with (127 from a `-c` string, else 1)
+				// and the shell goes on, with none of its `{var}`s. (zsh code
+				// keeps its own rule.)
+				Err(redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code))) if fork => {
+					redir::forget_var_fds(k, vp, cx);
+					// The message goes to stderr as the redirections so far
+					// left it (`2>/dev/null < ${x:?}` prints none), after a
+					// queued notice, as in the failure path below.
+					super::jobctl::drain_shout(k);
+					let _ = flush_queued(k, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
+					vp.status = code;
+					Flow::Jump(op.b)
+				},
+				// In the job's own fork (an async compound command or pipeline
+				// stage: `forked_for`) the fork is the command's: a fatal error
+				// in the command's own redirections ends it with its status (127
+				// or 1), an arithmetic error or a bad substitution with 1, and
+				// nothing after the command runs (a `!` included). The fork ends
+				// after its message is written to stderr as the redirections so
+				// far left it (`2>/dev/null < ${x:?}` prints none), waiting for a
+				// stream that is full. (zsh code keeps its own rule.)
+				Err(redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
+					if forked && unit.mode.dialect() == Dialect::Bash =>
+				{
+					vp.status = code;
+					vp.set_fork(vp.fork().end());
+					match flush_out(k, vp) {
+						Some(fd) => Flow::Block(WaitKey::Write { fd }),
+						None => Flow::Exit(code),
+					}
+				},
 				Err(redir::Halt::Flow(f)) => f,
 				Err(redir::Halt::Failed) => {
+					// A `( … )`'s own redirections are its fork's: the shell
+					// keeps none of their `{var}`s.
+					if fork {
+						redir::forget_var_fds(k, vp, cx);
+					}
 					// The message goes to stderr as the redirections so far left
 					// it; what would block is written after the restore. No notice
 					// can be pending here: the wait on entry returned with the
@@ -3916,7 +3988,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		},
 		Opcode::PopRedir => {
 			if let Some(saves) = top_frame(vp).redirs.pop() {
-				restore(vp, saves);
+				restore(vp, saves.fds);
 			}
 			Flow::Next
 		},
@@ -4791,6 +4863,38 @@ fn bash_case_hit(
 		.any(|p| k.engine.patterns().get(p, opts).matches(subject)))
 }
 
+/// Mark `child`, forked by `vp` to run the job or stage at `entry` (an
+/// async command, a pipeline stage), as bash's fork for it. When the job is
+/// one command (bash's `execute_disk_command` or a compound's own fork:
+/// the entry `Exec` or `Redir` leads straight to the job's end, as
+/// [`bang_stage`]'s `Lone` test reads it) the child gets
+/// [`super::proc::Fork::entry`]: that command's own redirections are made
+/// without undo, and a fatal expansion error in them, or anywhere in a
+/// simple command, reaches what `vp`'s reaches. Any other job (an async
+/// `&&`/`||` list: bash forks it as a subshell, `CMD_FORCE_SUBSHELL`) and a
+/// compound without redirections of its own catch their own at once. The
+/// bodies of the command's substitution words come first ([`skip_blocks`]).
+pub(super) fn forked_for(child: &mut Vproc, vp: &Vproc, unit: &Unit, entry: u32) {
+	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	// The job's end: its `SubExit`, after a `!`'s `Not`.
+	let ends = |at: u32| match code(at) {
+		Some(Opcode::SubExit) => true,
+		Some(Opcode::Not) => code(at + 1) == Some(Opcode::SubExit),
+		_ => false,
+	};
+	let at = skip_blocks(unit, entry);
+	let whole = match unit.ops.get(at as usize) {
+		Some(op) if op.code == Opcode::Exec => ends(at + 1),
+		Some(op) if op.code == Opcode::Redir => ends(op.b),
+		_ => false,
+	};
+	child.set_fork(if whole {
+		super::proc::Fork::entry(vp.fork())
+	} else {
+		super::proc::Fork::CHILD
+	});
+}
+
 /// bash's `subshell_level` step for a pipeline stage or (`background`) an
 /// async command starting at `entry`: a `( … )` that is the stage's whole
 /// command counts once, at its own `Spawn` (a job's `time` or `!` around it
@@ -5212,7 +5316,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					&& !vp
 						.frames
 						.iter()
-						.any(|f| f.redirs.iter().flatten().any(|s| s.fd == 0))
+						.any(|f| f.redirs.iter().flat_map(|r| &r.fds).any(|s| s.fd == 0))
 				{
 					let null = k
 						.null_input
@@ -5233,6 +5337,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						k.debug_skips
 							.push(DebugSkip { vproc: child.vpid, frame, entries });
 					}
+					forked_for(&mut child, vp, unit, info.stages[0].entry);
 				}
 				if info.kind == SpawnKind::Background && !control {
 					ignore_async_signals(k, cx, &mut child);
@@ -5251,6 +5356,14 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				} else {
 					k.bang_kin_add(vp.vpid, child.vpid);
 				}
+				// The `{var}`s of a subshell's own redirections are its fork's:
+				// the child has them in the snapshot it starts from
+				// (`state::fork_image`), the shell keeps none (below).
+				let fork_vars = if info.kind == SpawnKind::Subshell {
+					top_frame(vp).redirs.last_mut().and_then(|r| r.vars.take())
+				} else {
+					None
+				};
 				children.push(child.vpid);
 				let vpid = child.vpid;
 				k.spawned.push(Box::new(child));
@@ -5275,6 +5388,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					k.emit_op(cx, vp, op.node, EventData::Background { job, pid: vpid });
 					vp.status = 0;
 					return Flow::Jump(info.end);
+				}
+				if let Some(vars) = fork_vars {
+					redir::forget_vars(k, vp, cx, *vars);
 				}
 				k.emit_op(cx, vp, op.node, EventData::Subshell { child: vpid });
 			},
@@ -5323,7 +5439,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						frame.line_shift = line_shift;
 						let prev = vp.fds.get(0).cloned();
 						vp.fds.set(0, stdin.take());
-						frame.redirs.push(vec![Saved { fd: 0, prev }]);
+						frame.redirs.push(vec![Saved { fd: 0, prev }].into());
 						vp.frames.push(frame);
 						return Flow::Call;
 					}
@@ -5360,6 +5476,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						.get(skip_blocks(unit, stage.entry) as usize)
 						.is_some_and(|op| op.code == Opcode::Exec);
 					child.outer_loops = fork_loops(vp, simple);
+					forked_for(&mut child, vp, unit, stage.entry);
 					let level = if async_elements {
 						0
 					} else {
@@ -5464,7 +5581,29 @@ pub(super) fn job_text(
 	}
 	match crate::bash::syntax::parse_all(&src, feat) {
 		Ok(p) if p.commands.len() == 1 => {
-			BString::from(crate::bash::syntax::command_string(p.commands[0].list()))
+			let list = p.commands[0].list();
+			let text = BString::from(crate::bash::syntax::command_string(list));
+			// bash 5.2.21 and 5.3.20 do not show the `!` of a job that is one
+			// pipeline of simple commands (`! false &` is `false`, `! a | b
+			// &` is `a | b`): it is a flag of those commands, which the
+			// printed text leaves out. A lone compound command keeps it (`!
+			// { false; }`, `! ( false )`, `! [[ … ]]`), and so does a timed
+			// pipeline (`time ! false`), whose text starts with `time `, so
+			// the `! ` prefix below is never there to take off.
+			let hidden = list.items().one().is_some_and(|item| {
+				let and_or = item.and_or();
+				let p = and_or.first();
+				and_or.rest().len() == 0
+					&& p.bang()
+					&& (p.stages().len() > 1
+						|| p.stages().one().is_some_and(|c| {
+							matches!(c.kind(), crate::bash::syntax::tree::CommandKind::Simple(_))
+						}))
+			});
+			match text.strip_prefix(b"! ") {
+				Some(rest) if hidden => BString::from(rest),
+				_ => text,
+			}
 		},
 		_ => src,
 	}

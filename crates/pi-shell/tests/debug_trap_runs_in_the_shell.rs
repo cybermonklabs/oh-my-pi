@@ -235,27 +235,27 @@ async fn a_debug_trap_action_runs_no_return_trap() {
 
 /// The process `$!` names for a negated background pipeline, by the pid
 /// probe ([`pid_row`]), as bash names it: `! a | PROG &` is known by its
-/// last program. `kill` of `$!` ends the job. The row prints no `wait`
-/// status: `wait` of that `$!` gives the job's negated status here (0)
-/// where bash gives the program's (143), an older difference.
+/// last program. `kill` of `$!` ends the job, and `wait` of that `$!`
+/// gives the program's status (143): a background job's `!` does not
+/// invert it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_negated_pipelines_bang_names_what_bash_names() {
-	let row = pid_row("! : | PROG").replace(r#"echo "st=$?"; "#, "");
-	assert_bash_outputs(&[(row.as_str(), "program\n")]).await;
+	let row = pid_row("! : | PROG");
+	assert_bash_outputs(&[(row.as_str(), "program\nst=143\n")]).await;
 }
 
 /// A `time`d background pipeline (`time a | PROG &`, `time ! a | PROG &`)
 /// is known by its last program (`body_pipeline` unwraps `time`), as before
 /// this change and as #171 names it: `program`, then the status of `wait`
-/// after `kill` of `$!`. Kept differences from bash 5.2.21 and 5.3.20,
-/// whose `$!` is the timed job's own subshell (`CMD_FORCE_SUBSHELL`): they
-/// print `other`; and under `!`, `wait` gives the job's negated status here
-/// (0) where bash gives its subshell's (143), as for `! a | PROG &`.
+/// after `kill` of `$!` (143 under `!` too: a background job's `!` does
+/// not invert it). Kept difference from bash 5.2.21 and 5.3.20, whose `$!`
+/// is the timed job's own subshell (`CMD_FORCE_SUBSHELL`): they print
+/// `other`.
 #[test]
 fn a_timed_pipelines_bang_is_its_last_program() {
 	let rows = [
 		("TIMEFORMAT=; time : | PROG", "program\nst=143\n", "other\nst=143\n"),
-		("TIMEFORMAT=; time ! : | PROG", "program\nst=0\n", "other\nst=143\n"),
+		("TIMEFORMAT=; time ! : | PROG", "program\nst=143\n", "other\nst=143\n"),
 	];
 	let mut mismatches = Vec::new();
 	for (start, want, bash) in rows {

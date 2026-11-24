@@ -568,7 +568,7 @@ pub fn push_call(
 		let prev = vp.fds.get(0).cloned();
 		vp.fds.set(0, Some(null));
 		if let Some(f) = vp.frames.last_mut() {
-			f.redirs.push(vec![Saved { fd: 0, prev }]);
+			f.redirs.push(vec![Saved { fd: 0, prev }].into());
 		}
 	}
 	(depth, status)

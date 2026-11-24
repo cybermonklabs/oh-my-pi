@@ -198,7 +198,7 @@ pub fn perform(
 			let io = sc.io();
 			if io.search.is_none() {
 				let extensions = executable_extensions(k, cx, vp);
-				io.search = Some(PathSearch {
+				io.search = Some(Box::new(PathSearch {
 					cands:         candidates(
 						path,
 						name,
@@ -209,7 +209,7 @@ pub fn perform(
 					idx:           0,
 					checking_exec: false,
 					nonexec:       None,
-				});
+				}));
 			}
 			match path_search(&mut tcx, cx, sc, false) {
 				// Windows reports the probed path: `shown_candidate` splits PATH
