@@ -2195,9 +2195,14 @@ const fn skip_back(src: &[u8], mut at: usize) -> usize {
 }
 
 /// `at`, moved back over the word that ends there (a here-document's
-/// delimiter), a quoted part whole.
+/// delimiter), a quoted part whole and a backslash-escaped character with
+/// its backslash.
 fn word_back(src: &[u8], mut at: usize) -> usize {
 	while let Some(&c) = at.checked_sub(1).and_then(|i| src.get(i)) {
+		if at >= 2 && src[at - 2] == b'\\' {
+			at -= 2;
+			continue;
+		}
 		match c {
 			b'\'' | b'"' => match src[..at - 1].iter().rposition(|&q| q == c) {
 				Some(open) => at = open,

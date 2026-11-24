@@ -640,7 +640,9 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 /// deleted, so a spec naming it then names none: `getjob`'s warning, 127,
 /// and no operand after it is read. A finished job has left zsh's table
 /// ([`zsh_in_table`]), also one that ended while the `wait` waited for
-/// another. `base` is the first operand's index in `argv`.
+/// another. A trapped signal ends the wait for one operand with 128 + its
+/// number, and the next operand is read with that status
+/// (`vm::interrupt_wait`). `base` is the first operand's index in `argv`.
 fn zsh_wait(
 	ctx: &mut Ctx<'_, '_>,
 	args: &[BString],
@@ -735,8 +737,9 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 			&& rest
 				.first()
 				.is_none_or(|&c| matches!(c, b'%' | b'+' | b'-') || c.is_ascii_digit());
-		// With no job at all zsh has no current (previous) job either.
-		let empty = ctx.vp.jobs.iter().next().is_none();
+		// With no job left in zsh's table zsh has no current (previous) job
+		// either.
+		let empty = !ctx.vp.jobs.iter().any(zsh_in_table);
 		if numbered && empty && matches!(rest, b"" | b"%" | b"+") {
 			ctx.usage("no current job");
 		} else if numbered && empty && rest == b"-" {

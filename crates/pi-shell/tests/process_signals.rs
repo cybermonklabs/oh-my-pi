@@ -3883,6 +3883,17 @@ fn bash_names_the_line_at_the_fork_for_a_compound_redirection_error() {
 		(format!("f() {{\necho $(\n:\n( : ) {X}\n) end\n}}\nf 2>&1"), 3),
 		(format!(":\nf() {{\n:\necho $(\n( : ) {X}\n) end\n}}\nf 2>&1"), 4),
 		(format!("set -o posix\n:\necho $(\n:\n( : ) {X}\n) end"), 4),
+		// An escaped character in a here-document's delimiter, a quoted one,
+		// and a `{fd}` redirection, before or after the `)`.
+		(format!("f() {{\n:\n( : ) <<E\\ F {X} | :\nx\nE F\n}}\nf 2>&1; echo end"), 3),
+		(format!("f() {{\n:\n( : ) <<a\\;b {X} | :\nx\na;b\n}}\nf 2>&1; echo end"), 3),
+		(format!("f() {{\n:\n( :\n) <<E\\ F {X} | :\nx\nE F\n}}\nf 2>&1; echo end"), 4),
+		(format!(":\n( :\n) <<E\\ F {X}\nx\nE F\necho end"), 3),
+		(format!("f() {{\n:\n( : ) <<\"E F\" {X} | :\nx\nE F\n}}\nf 2>&1; echo end"), 3),
+		(format!("f() {{\n:\n( :\n) <<\"E F\" \\\n{X} | :\nx\nE F\n}}\nf 2>&1; echo end"), 4),
+		(format!(":\n( :\n) <<\"E F\" {X}\nx\nE F\necho end"), 3),
+		(format!("f() {{\n:\n( :\n) {{fd}}{X} | :\n}}\nf 2>&1; echo end"), 4),
+		(format!("f() {{\n:\n( :\n) {{fd}}<<\"E F\" {X} | :\nx\nE F\n}}\nf 2>&1; echo end"), 4),
 	];
 	let rows = rows
 		.into_iter()
@@ -4033,9 +4044,44 @@ fn zsh_wait_reads_each_operand_at_its_turn() {
 				"/bin/sleep 0.3 & p=$!; wait $p %/bin/sleep".to_owned(),
 				"zsh:wait:2: job not found: /bin/sleep\na=127\n".to_owned(),
 			),
+			// Once no job is left in zsh's table, zsh has no current or
+			// previous job (`getjob`); also after one ended mid-wait.
+			(
+				format!("{} & {} & wait %1 %%", x("3", "0.4"), x("4", "0.1")),
+				"zsh:wait:2: no current job\na=127\n".to_owned(),
+			),
+			(
+				"(exit 3) & /bin/sleep 0.2; wait %%".to_owned(),
+				"zsh:wait:2: no current job\na=127\n".to_owned(),
+			),
+			(
+				"(exit 3) & /bin/sleep 0.2; wait %-".to_owned(),
+				"zsh:wait:2: no previous job\na=127\n".to_owned(),
+			),
 		]
 		.into_iter()
 		.map(|(pre, out)| (format!("{pre} 2>&1; echo a=$?"), out))
+		.collect(),
+	);
+	// A trapped signal ends the wait for one operand; zsh goes on with the
+	// next one, the status so far 128 + the signal (`bin_fg`). The sender
+	// stays alive: one that ends at once races zsh's own `SIGCHLD`.
+	let usr1 = "(/bin/sleep 0.3; kill -USR1 $$; exec /bin/sleep 4) >/dev/null 2>&1 & k=$!; \
+	            /bin/sleep 1.5 & p=$!;";
+	let not_one = "zsh:wait:2: pid 1 is not a child of this shell\na=127\n";
+	zsh_rows(
+		[
+			("trap 'echo T' USR1", "$p 1", not_one),
+			("trap 'echo T' USR1", "%2 %2", "a=0\n"),
+			("trap 'echo T' USR1; (exit 5) & q=$!", "$p $q", "a=5\n"),
+			("trap 'echo T' USR1", "$p %2", "a=0\n"),
+			("trap 'echo T' USR1", "%2 1", not_one),
+			("TRAPUSR1() { echo T; }", "%2 %2", "a=0\n"),
+		]
+		.into_iter()
+		.map(|(trap, ops, out)| {
+			(format!("{trap}; {usr1} wait {ops} 2>&1; echo a=$?; kill $k"), format!("T\n{out}"))
+		})
 		.collect(),
 	);
 }

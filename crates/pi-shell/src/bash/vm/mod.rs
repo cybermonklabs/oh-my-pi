@@ -3721,8 +3721,11 @@ pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, job: Option<Vpid
 }
 
 /// End a `wait` builtin that `p` is in with `status` (a trapped signal
-/// arrived): its `Exec` completes at once, keeping the jobs it waited for;
-/// a zsh `wait` reads no more operands (`bin_fg` returns at once).
+/// arrived): its wait for the child ends at once, keeping the jobs it
+/// waited for. bash's `wait` completes with that status; zsh's goes on with
+/// its next operand, the status so far `status` (`bin_fg` keeps the 128 +
+/// signal of `waitforpid` and `zwaitjob` in `retval` and reads the next
+/// operand, jobs.c:2437-2451, 2552-2569; [`proc::ExecState::resume`]).
 fn interrupt_wait(p: &mut Vproc, status: i32) {
 	for frame in &mut p.frames {
 		let Some(e) = frame.scratch.as_mut().and_then(|sc| sc.exec.as_mut()) else {
@@ -3737,7 +3740,6 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 			e.wait_for.clear();
 			e.wait_into = None;
 			e.status = status;
-			e.resume = false;
 		}
 	}
 }
