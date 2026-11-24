@@ -11,6 +11,7 @@ import type {
 } from "@oh-my-pi/pi-mnemopi";
 import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
 import type { LocalModelInitializer } from "@oh-my-pi/pi-mnemopi/core";
+import { bankDbPathIn } from "@oh-my-pi/pi-mnemopi/core/banks";
 import { logger, prompt, toError, withLoopPhase } from "@oh-my-pi/pi-utils";
 import {
 	composeRecallQuery,
@@ -35,7 +36,7 @@ import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import memoryRecallChangesPrompt from "../prompts/system/memory-recall-changes.md" with { type: "text" };
 import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with { type: "text" };
-import { type MnemopiBackendConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
+import { type MnemopiBackendConfig, type MnemopiBankConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
 import { mnemopiEmbedClient } from "./embed-client";
 import { cfgMnemopiInjectionTokenLimit } from "./settings";
 
@@ -46,7 +47,10 @@ interface RecallBlock {
 }
 
 // The mnemopi package pulls the embeddings stack; keep it off the CLI startup
-// module graph by loading it lazily at the async boundaries that need it.
+// module graph by loading it lazily at the async boundaries that need it. The
+// bank layout (`core/banks`) pulls none of it: a recall's scope names its banks'
+// databases wherever the scope is read, a session built over a transcript
+// before anything loaded the core module (`omp render`) included.
 let mnemopiMod: typeof MnemopiNs | undefined;
 let mnemopiCoreMod: typeof MnemopiCoreNs | undefined;
 
@@ -317,6 +321,14 @@ export interface MnemopiSessionStateApi {
 	consolidate(options?: MnemopiConsolidateOptions): Promise<void>;
 }
 
+/** A transcript's recall and retention tracking ({@link MnemopiSessionState.conversationTracking}). */
+export interface MnemopiConversationTracking {
+	readonly lastRetainedTurn: number;
+	readonly retentionCursorLoaded: boolean;
+	readonly hasRecalledForFirstTurn: boolean;
+	readonly lastRecallSnippet: string | undefined;
+}
+
 export class MnemopiSessionState implements MnemopiSessionStateApi {
 	sessionId: string;
 	readonly config: MnemopiBackendConfig;
@@ -399,6 +411,29 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		this.#retentionCursorLoaded = false;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
+	}
+
+	/** What {@link resetConversationTracking} resets, for {@link restoreConversationTracking}. */
+	conversationTracking(): MnemopiConversationTracking {
+		return {
+			lastRetainedTurn: this.lastRetainedTurn,
+			retentionCursorLoaded: this.#retentionCursorLoaded,
+			hasRecalledForFirstTurn: this.hasRecalledForFirstTurn,
+			lastRecallSnippet: this.lastRecallSnippet,
+		};
+	}
+
+	/**
+	 * Puts back the tracking of a transcript the session returns to (a session switch that failed after it reset the
+	 * tracking for the target): its first turn already recalled, so its next one recalls no more than before. A recall
+	 * still running for the target is dropped.
+	 */
+	restoreConversationTracking(tracking: MnemopiConversationTracking): void {
+		this.#recallGeneration++;
+		this.lastRetainedTurn = tracking.lastRetainedTurn;
+		this.#retentionCursorLoaded = tracking.retentionCursorLoaded;
+		this.hasRecalledForFirstTurn = tracking.hasRecalledForFirstTurn;
+		this.lastRecallSnippet = tracking.lastRecallSnippet;
 	}
 
 	getScopedRecallTargets(): readonly MnemopiScopedMemory[] {
@@ -775,6 +810,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			const changes = this.#recallChanges(persisted.memories);
 			return {
 				context: persisted.text || undefined,
+				reused: true,
 				notice: changes && {
 					content: changes.content,
 					details: { scope, memories: changes.memories } satisfies MemoryRecallChangesDetails,
@@ -936,6 +972,10 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 
 	async maybeRecallOnAgentStart(): Promise<void> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
+		// On a model that binds thinking to its prompt the run's request is on its way, and a recall landing now would
+		// rebuild the cached prompt: the next turn's prompt preparation recalls again, and a recall that lands after
+		// the model answered goes out as a hidden message after the newest content (`beforeAgentStartPrompt`).
+		if (this.session.model?.thinking?.prefixBinding === true) return;
 		const generation = this.#recallGeneration;
 		// No message can join a turn already started, so a reused recall's changes wait for
 		// the next resume to be reported.
@@ -1168,7 +1208,7 @@ function createScopedResources(config: MnemopiBackendConfig, beforeDispatch: Dis
 	};
 }
 
-function resolveScopedBanks(config: MnemopiBackendConfig): {
+function resolveScopedBanks(config: MnemopiBankConfig): {
 	scoping: MnemopiScoping;
 	globalBank: string;
 	retainBank: string;
@@ -1194,7 +1234,7 @@ export function getMnemopiScopedBanks(config: MnemopiBackendConfig): readonly st
 }
 
 /** Identifies the banks and databases a first-turn recall reads, so a persisted recall is only reused for the same ones. */
-export function getMnemopiRecallScope(config: MnemopiBackendConfig): string {
+export function getMnemopiRecallScope(config: MnemopiBankConfig): string {
 	const { recallBanks } = resolveScopedBanks(config);
 	return JSON.stringify(["mnemopi", recallBanks.map(bank => [bank, resolveBankDbPath(config, bank)])]);
 }
@@ -1282,11 +1322,14 @@ function createMemory(config: MnemopiBackendConfig, bank: string, beforeDispatch
 	} as ConstructorParameters<typeof Mnemopi>[0]);
 }
 
-function resolveBankDbPath(config: MnemopiBackendConfig, bank: string): string {
+/**
+ * The database `bank` lives in: the configured one for the shared bank, else the bank's own beside it. Creates nothing,
+ * so a read of a recall's scope (a resume, `omp render`) leaves the memories directory as it found it.
+ */
+export function resolveBankDbPath(config: MnemopiBankConfig, bank: string): string {
 	const sharedBank = config.globalBank ?? config.baseBank ?? "default";
 	if (bank === sharedBank) return config.dbPath;
-	const { BankManager } = requireMnemopiCore();
-	return new BankManager(dirname(config.dbPath)).getBankDbPath(bank);
+	return bankDbPathIn(dirname(config.dbPath), bank);
 }
 
 function mergeRecallResult(

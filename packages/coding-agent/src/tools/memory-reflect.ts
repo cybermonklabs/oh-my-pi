@@ -1,6 +1,7 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { logger, prompt, untilAborted, toError } from "@oh-my-pi/pi-utils";
+import { Memo } from "@oh-my-pi/pi-tui/native/memo";
 import { isHindsightConfigured, loadHindsightConfig } from "../hindsight/config";
 import { ensureBankExists } from "../hindsight/bank";
 import reflectDescription from "../prompts/tools/reflect.md" with { type: "text" };
@@ -21,10 +22,10 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 	readonly approval = "read" as const;
 	readonly label = "Reflect";
 	get description(): string {
-		return prompt.render(reflectDescription, {
-			toolRefs: sessionMemoryToolRefs(this.session),
-		});
+		const toolRefs = sessionMemoryToolRefs(this.session);
+		return this.#description.get(Object.values(toolRefs), () => prompt.render(reflectDescription, { toolRefs }));
 	}
+	readonly #description = new Memo<string>();
 	readonly parameters = memoryReflectSchema;
 	readonly strict = true;
 	readonly loadMode = "discoverable";

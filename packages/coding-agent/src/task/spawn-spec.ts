@@ -332,6 +332,8 @@ const createAgentSessionOptionClasses: InputClasses<CreateAgentSessionOptions> =
 	taskDepth: "S",
 	parentHindsightSessionState: "L",
 	parentMnemopiSessionState: "L",
+	// Set only by `/tan` for its clone (the forked session that withholds a change); no subagent build passes it.
+	tanParent: "N",
 	agentId: "S",
 	agentDisplayName: "S",
 	agentName: "S",

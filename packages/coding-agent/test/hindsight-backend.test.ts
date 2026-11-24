@@ -22,6 +22,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 
 import {
+	cfgHindsightApiUrl,
 	cfgHindsightBankId,
 	cfgHindsightBankIdPrefix,
 	cfgHindsightBankMission,
@@ -96,6 +97,7 @@ function makeFakeSession(deps: FakeSessionDeps) {
 			return () => listeners.delete(listener);
 		},
 		refreshBaseSystemPrompt: vi.fn().mockResolvedValue(undefined),
+		withdrawMemoryRecall: vi.fn().mockResolvedValue(undefined),
 		emitNotice: () => {},
 		settleMemoryBackend: async () => {},
 		getHindsightSessionState: () => hindsightState,
@@ -721,6 +723,30 @@ describe("hindsightBackend live bank routing", () => {
 		await hindsightBackend.applySettings!(session as never, ["hindsight.bankId"]);
 
 		expect(session.getHindsightSessionState()).toBe(initial);
+	});
+
+	// `fetch` reads the URL as a URL and the client drops trailing slashes, so a respelled server is the same one: a
+	// rebuild would recall afresh and withdraw the recall the system prompt carries, rewriting the cached prompt.
+	it("does not rebuild when hindsight.apiUrl is respelled for the same server", async () => {
+		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({} as never);
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		cfgHindsightApiUrl.set(settings, "http://localhost:8888");
+		const session = makeFakeSession({ sessionId: "s-respelled", settings });
+
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+
+		const initial = session.getHindsightSessionState();
+		cfgHindsightApiUrl.set(settings, "HTTP://LocalHost:8888/");
+		await hindsightBackend.applySettings!(session as never, ["hindsight.apiUrl"]);
+
+		expect(session.getHindsightSessionState()).toBe(initial);
+		expect(session.withdrawMemoryRecall).not.toHaveBeenCalled();
 	});
 
 	it("applies a mid-session recall budget change to the next recall", async () => {

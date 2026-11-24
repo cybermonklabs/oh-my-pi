@@ -106,8 +106,8 @@ The separate `AgentSession.branch(entryId)` API, used by extension/hook command 
 `SessionManager.createBranchedSession(leafId)` specifics:
 
 - Builds root→leaf path via `getBranch(leafId)`; throws if missing.
-- Excludes existing `label` entries from copied path.
-- Rebuilds fresh label entries from the resolved label map (`labelsInEffect()`) for entries that remain in path.
+- Excludes existing `label` entries from copied path; an entry whose parent was an excluded label takes that label's parent, so every copied entry points at one the copy holds.
+- Rebuilds fresh label entries from the resolved label map (`labelsInEffect()`) for entries that remain in path, after the last copied entry and under new ids (`newestCopiedEntryId` names the newest entry kept under its own id, which records and `session_before_branch` name).
 - Persistent mode: writes new JSONL file and switches manager to it; returns new file path.
 - In-memory mode: replaces in-memory entries; returns `undefined`.
 

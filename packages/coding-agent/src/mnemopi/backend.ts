@@ -48,6 +48,7 @@ import {
 	type MnemopiSessionStateApi,
 	requireMnemopi,
 	requireMnemopiCore,
+	resolveBankDbPath,
 	setMnemopiSessionState,
 } from "./state";
 
@@ -160,14 +161,14 @@ export const mnemopiBackend: MemoryBackend = {
 		}
 	},
 
-	async buildDeveloperInstructions(_agentDir, _cwd, settings, session): Promise<string | undefined> {
+	async buildDeveloperInstructions(_agentDir, _cwd, settings, session, options): Promise<string | undefined> {
 		return withLoopPhase("mnemopi.recall", () => {
 			const state = getMnemopiSessionState(session);
 			const primary = state?.aliasOf ?? state;
 			const parts = [
 				prompt.render(mnemopiInstructions, { toolRefs: memoryToolRefs(session?.getXdevToolEntries()) }),
 			];
-			if (primary?.lastRecallSnippet) parts.push(primary.lastRecallSnippet);
+			if (primary?.lastRecallSnippet && !options?.recallDelivered) parts.push(primary.lastRecallSnippet);
 			const rendered = parts.join("\n\n").trim();
 			if (!rendered) return undefined;
 			return truncateApproxTokens(rendered, cfgMnemopiInjectionTokenLimit.get(settings));
@@ -180,6 +181,7 @@ export const mnemopiBackend: MemoryBackend = {
 		if (!state || !preparation) return undefined;
 		return {
 			context: preparation.context,
+			reused: preparation.reused,
 			notice: preparation.notice,
 			commit: () => getMnemopiSessionState(session) === state && preparation.commit(),
 		};
@@ -382,13 +384,6 @@ function createStatsMemory(config: MnemopiBackendConfig, bank: string): Mnemopi 
 		...providerOptions,
 		reconcile: false,
 	} as ConstructorParameters<typeof Mnemopi>[0]);
-}
-
-function resolveBankDbPath(config: MnemopiBackendConfig, bank: string): string {
-	const sharedBank = config.globalBank ?? config.baseBank ?? "default";
-	if (bank === sharedBank) return config.dbPath;
-	const { BankManager } = requireMnemopiCore();
-	return new BankManager(path.dirname(config.dbPath)).getBankDbPath(bank);
 }
 
 function renderMnemopiStats(banks: readonly MnemopiBankStats[]): string {

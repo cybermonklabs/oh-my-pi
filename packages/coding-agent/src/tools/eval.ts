@@ -73,6 +73,7 @@ import { cfgTaskMaxRecursionDepth, perCallModelEnabled } from "../task/settings"
 import { getPerCallModelAdvertisement, type PerCallModelAdvertisement } from "../task/model-approval";
 import { shapeToolResult } from "../spotlight";
 import { cfgToolsMaxTimeout, cfgToolsSpeculativeExecutionEnabled } from "./settings";
+import { renderInputsSnapshot, sameRenderInputs } from "./render-inputs";
 
 /** Language tokens the eval tool accepts, in stable display order. */
 export type EvalLanguageToken = "py" | "js";
@@ -367,7 +368,14 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	readonly loadMode = "essential";
 	readonly label = "Eval";
 	get description(): string {
-		return getEvalToolDescription(this.#descriptionOptions());
+		const options = this.#descriptionOptions();
+		// Compared with a copy of the options the description was rendered from, so a prelude or tool name list the
+		// embedder changes in place still renders it again.
+		if (!sameRenderInputs(this.#descriptionInputs, options)) {
+			this.#description = getEvalToolDescription(options);
+			this.#descriptionInputs = renderInputsSnapshot(options);
+		}
+		return this.#description;
 	}
 
 	/**
@@ -407,7 +415,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			autoProvision: cfgEvalAutoProvision.get(session.settings),
 			perCallModel,
 			perCallModelAdvertisement: perCallModel
-				? getPerCallModelAdvertisement(session.settings, session.getActiveModel?.(), session.modelRegistry)
+				? (session.advertisedPerCallModels?.() ??
+					getPerCallModelAdvertisement(session.settings, session.getActiveModel?.(), session.modelRegistry))
 				: undefined,
 			toolNames: session.getAdvertisedEvalToolNames?.(),
 			maxTimeout: cfgToolsMaxTimeout.get(session.settings),
@@ -427,8 +436,14 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		},
 	];
 	get examples(): readonly ToolExample<typeof evalSchema.infer>[] {
-		const langs = new Set(this.#enabledLanguages());
-		return EvalTool.#examples.filter(ex => "call" in ex && langs.has(ex.call.language));
+		const langs = this.#enabledLanguages();
+		const key = langs.join(",");
+		if (this.#examplesKey !== key) {
+			const enabled = new Set(langs);
+			this.#cachedExamples = EvalTool.#examples.filter(ex => "call" in ex && enabled.has(ex.call.language));
+			this.#examplesKey = key;
+		}
+		return this.#cachedExamples;
 	}
 	get parameters(): typeof evalSchema {
 		const langs = this.#enabledLanguages();
@@ -478,6 +493,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 	#paramsKey?: string;
 	#cachedParams?: typeof evalSchema;
+	#descriptionInputs?: EvalToolDescriptionOptions;
+	#description = "";
+	// The examples by the enabled languages they were filtered for: one array per list, so the tool's per-tool key
+	// (and with it the declared-tools memo) stays the same while the list does.
+	#examplesKey?: string;
+	#cachedExamples: readonly ToolExample<typeof evalSchema.infer>[] = [];
 	readonly #shadowCells = new Map<string, EvalShadowCellSession>();
 	readonly #environmentModes: Partial<Record<EvalLanguage, "managed" | "project">> = {};
 

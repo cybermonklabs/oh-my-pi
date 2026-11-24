@@ -176,6 +176,8 @@ const OPTION_COMPARES = {
 	slashCommands: "data",
 	suppressAutoPrewalk: "data",
 	systemPromptTemplate: "data",
+	// Set only by `/tan` for its clone.
+	tanParent: "data",
 	taskPromptCacheKey: "data",
 	titleSystemPrompt: "data",
 	tuiTranscript: "data",

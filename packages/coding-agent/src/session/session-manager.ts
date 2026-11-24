@@ -690,6 +690,15 @@ export function conversationTip(
 }
 
 /**
+ * The id of the newest entry of `path` that is not a label, `undefined` when there is none. A copy of the path
+ * ({@link SessionManager.createBranchedSession}) re-creates every label under a new id, so a record or event that
+ * names where a branch stands for a copy to find names this entry.
+ */
+export function newestCopiedEntryId(path: readonly SessionEntry[]): string | undefined {
+	return path.findLast(entry => entry.type !== "label")?.id;
+}
+
+/**
  * Maintains the derived views over a session's entry list: id lookup, the
  * parent→children adjacency, the resolved label map, the active leaf, and the
  * running usage totals. Kept in lockstep with the manager's `#entries` so reads
@@ -1226,6 +1235,8 @@ export class SessionManager {
 	#titleRevision = 0;
 	/** Bumped by in-place entry updates, which a {@link SessionBodyStamp} cannot otherwise see. */
 	#bodyRevision = 0;
+	/** Bumped each time the entries are read in whole ({@link loadRevision}). */
+	#loadRevision = 0;
 	#sessionFile: string | undefined;
 	#header!: SessionHeader;
 	#titleUpdatedAt = "";
@@ -1443,6 +1454,8 @@ export class SessionManager {
 	#queuedConflictRecoveries = 0;
 	/** The files this manager moved off, so a conflict a write to one reports retries at the sibling it went on in. */
 	readonly #movedOffFrom = new Set<string>();
+	/** The id the session had in each notice's `from`, for a move to a sibling under a new id ({@link movedOffSessionId}). */
+	readonly #movedOffSessionIds = new WeakMap<SessionPersistenceNotice, string>();
 	/** Write conflicts a recovery took over: the store's drain reports them again, and they are no failure. */
 	readonly #takenOverConflicts = new WeakSet<Error>();
 	/**
@@ -2568,7 +2581,9 @@ export class SessionManager {
 		this.#movedOffFrom.add(path.resolve(from));
 		this.#rememberBreadcrumb(this.#cwd, to);
 		this.#claimSession();
-		this.#notifyPersistenceNotice({ reason, from, to });
+		const notice: SessionPersistenceNotice = { reason, from, to };
+		this.#movedOffSessionIds.set(notice, previousSessionId);
+		this.#notifyPersistenceNotice(notice);
 		this.#notifySessionFileChanged(from);
 		return to;
 	}
@@ -3690,6 +3705,7 @@ export class SessionManager {
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
 		this.#header = header;
 		this.#entries = entries;
+		this.#loadRevision++;
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
@@ -4957,6 +4973,7 @@ export class SessionManager {
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
 		manager.#entries = structuredClone(this.#entries);
+		manager.#loadRevision++;
 		manager.#index.rebuild(manager.#entries);
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
@@ -5953,6 +5970,18 @@ export class SessionManager {
 		return this.#bodyRevision;
 	}
 
+	/**
+	 * Bumped each time the entries are read in whole: a session file opened, resumed or read again (a `/resume` of the
+	 * session already held, a reload), copied into a new session (`forkFrom`: `omp --fork`, a resume of a session that
+	 * moved away, a `/tan` or task fork; {@link persistCopy}), a captured state restored. Records read from the entries
+	 * and kept by session (image drops, snapcompact refusals, the cut rule's waits) are read again at a new revision:
+	 * another process may have continued the session file since this one last read it, and the records a read brings
+	 * stand over what this process held before it.
+	 */
+	get loadRevision(): number {
+		return this.#loadRevision;
+	}
+
 	/** Tracks user rename requests; background title updates do not invalidate them. */
 	get titleRevision(): number {
 		return this.#titleRevision;
@@ -6017,6 +6046,16 @@ export class SessionManager {
 		return () => {
 			this.#persistenceNoticeCallbacks.delete(cb);
 		};
+	}
+
+	/**
+	 * The id this session had in `notice.from`, for a notice of a move to a sibling under a new id; `undefined` for
+	 * a move that kept the id (a subagent transcript that followed its parent session's move). The sibling's header
+	 * does not name the old id as a continuation, so a later resume of the old file does not follow it; this tells an
+	 * observer which session the copy carries on.
+	 */
+	movedOffSessionId(notice: SessionPersistenceNotice): string | undefined {
+		return this.#movedOffSessionIds.get(notice);
 	}
 
 	/**
@@ -6489,6 +6528,22 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/**
+	 * Append `message`, a custom message the agent was sent, as its entry ({@link appendCustomMessageEntry}). The entry
+	 * keeps the message's own timestamp: what names a turn by it (the image clamp, the date/cwd reminder) finds, after
+	 * a re-read, the same turn the model was sent.
+	 */
+	appendCustomMessage<T>(message: CustomMessage<T>): string {
+		return this.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			message.details,
+			message.attribution,
+			message.timestamp,
+		);
+	}
+
 	/** Append a TTSR injection entry recording which rules were injected. */
 	appendTtsrInjection(ruleNames: string[]): string {
 		const entry: TtsrInjectionEntry = {
@@ -6852,6 +6907,10 @@ export class SessionManager {
 
 	/**
 	 * Create a new session file containing only the path from root to `leafId`.
+	 * Label entries are left out and the labels of kept entries re-created after the
+	 * last one under new ids; an entry that followed a left-out label hangs from that
+	 * label's parent, so every kept entry points at one the copy holds
+	 * ({@link newestCopiedEntryId} names the newest entry kept under its own id).
 	 * With `copyArtifacts`, the source artifact directory is copied in the background;
 	 * the new artifact manager waits for it before allocating ids or resolving
 	 * `artifact://`, so kept references stay valid and new ids cannot collide.
@@ -6867,12 +6926,22 @@ export class SessionManager {
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
 
 		// Drop label entries from the path; recreate them fresh from the resolved map.
+		// An entry after a dropped label takes the label's own (kept) parent.
 		// Every kept entry lies on the forked path, so a late-usage or off-branch leaf
 		// marker no longer applies.
 		const entriesToKeep: SessionEntry[] = [];
+		const droppedLabelParents = new Map<string, string | null>();
 		for (const entry of branchPath) {
-			if (entry.type === "label") continue;
-			entriesToKeep.push(entry.activeLeafId === undefined ? entry : { ...entry, activeLeafId: undefined });
+			const parentId =
+				entry.parentId !== null && droppedLabelParents.has(entry.parentId)
+					? (droppedLabelParents.get(entry.parentId) ?? null)
+					: entry.parentId;
+			if (entry.type === "label") {
+				droppedLabelParents.set(entry.id, parentId);
+				continue;
+			}
+			const kept = parentId === entry.parentId ? entry : { ...entry, parentId };
+			entriesToKeep.push(kept.activeLeafId === undefined ? kept : { ...kept, activeLeafId: undefined });
 		}
 		const keptIds = new Set(entriesToKeep.map(entry => entry.id));
 		const labelsToCarry: Array<{ targetId: string; label: string }> = [];
@@ -7149,6 +7218,7 @@ export class SessionManager {
 		manager.#titleUpdatedAt = nowIso();
 		manager.#hasTitleSlot = true;
 		manager.#entries = history;
+		manager.#loadRevision++;
 		manager.#index.rebuild(history);
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		if (options?.repairInterruptedTail) {

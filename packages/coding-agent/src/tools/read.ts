@@ -187,6 +187,7 @@ import { parseSqlitePathCandidates } from "./sqlite-reader";
 import { formatBytes, shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolAbortError, throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { Memo } from "@oh-my-pi/pi-tui/native/memo";
 import { toolResult } from "./tool-result";
 
 import {
@@ -1148,13 +1149,15 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	};
 	readonly label = "Read";
 	readonly loadMode = "essential";
-	/** Rendered per access so the hashline guidance follows a live `edit.mode` change. */
+	/** Rendered when an input changes, so the hashline guidance follows a live `edit.mode` change. */
 	get description(): string {
-		return prompt.render(readDescription, {
-			IS_HL_MODE: resolveFileDisplayMode(this.session).hashLines,
-			BINARY_VIEWS: cfgIdaAvailable.get(this.session.settings),
-		});
+		const isHlMode = resolveFileDisplayMode(this.session).hashLines;
+		const binaryViews = cfgIdaAvailable.get(this.session.settings);
+		return this.#description.get([isHlMode, binaryViews], () =>
+			prompt.render(readDescription, { IS_HL_MODE: isHlMode, BINARY_VIEWS: binaryViews }),
+		);
 	}
+	readonly #description = new Memo<string>();
 	readonly parameters = readSchema;
 	readonly strict = true;
 

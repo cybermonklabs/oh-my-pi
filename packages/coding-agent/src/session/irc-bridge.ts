@@ -319,13 +319,7 @@ export class IrcBridge {
 		}
 		if (this.#host.planModeEnabled()) {
 			this.#host.agent.appendMessage(record);
-			this.#host.sessionManager.appendCustomMessageEntry(
-				record.customType,
-				record.content,
-				record.display,
-				record.details,
-				record.attribution ?? "agent",
-			);
+			this.#host.sessionManager.appendCustomMessage(record);
 			return "injected";
 		}
 		this.#host.wakeForIrc([record]);
