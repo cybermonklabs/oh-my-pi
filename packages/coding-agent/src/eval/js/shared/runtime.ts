@@ -15,6 +15,7 @@ import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 import type { EvalTableColumn } from "@oh-my-pi/pi-tui/tools/eval";
 import { type EvalDisplayOutput, evalImageMetadata } from "../../types";
 import type { EvalPreludeSource } from "../worker-protocol";
+import { abandonedRunError, REALM_RUN, throwIfRunAbandoned } from "./abandoned-run";
 import { createHelpers, type HelperBundle } from "./helpers";
 import { awaitMaybePromise, indirectEval } from "./indirect-eval";
 import { LocalModuleLoader } from "./local-module-loader";
@@ -75,6 +76,8 @@ export interface RunContext {
 	callOccurrences: Map<string, number>;
 	finalExpressionSet: boolean;
 	finalExpressionValue: unknown;
+	/** Set when the run was abandoned before its code settled (see {@link throwIfRunAbandoned}). */
+	abandoned?: { reason: unknown };
 }
 
 export interface RuntimeOptions {
@@ -301,6 +304,8 @@ export class JsRuntime {
 	#installedPreludes = new Map<string, EvalPreludeSource>();
 	#disposed = false;
 	#runHookResolver = () => this.#als.getStore()?.hooks;
+	/** This runtime's runs whose code has not settled; {@link JsRuntime.dispose} abandons them. */
+	#liveRuns = new Set<RunContext>();
 
 	#ownGlobal(key: string): void {
 		if (this.#ownedGlobalKeys.has(key)) return;
@@ -395,7 +400,7 @@ export class JsRuntime {
 		this.helpers = createHelpers({
 			cwd: () => this.#activeCwd(),
 			env: this.#env,
-			localRoots: () => this.#als.getStore()?.localRoots ?? this.#localRoots,
+			localRoots: () => this.#activeRun()?.localRoots ?? this.#localRoots,
 			emitStatus: event => this.#activeHooks("emitStatus")?.onDisplay({ type: "status", event }),
 		});
 		this.#initialGlobalKeys = new Set(Object.getOwnPropertyNames(globalThis));
@@ -520,9 +525,11 @@ export class JsRuntime {
 			finalExpressionValue: undefined,
 			callOccurrences: new Map(),
 		};
+		this.#liveRuns.add(context);
 		try {
-			return await this.#als.run(context, callback);
+			return await REALM_RUN.run(context, () => this.#als.run(context, callback));
 		} finally {
+			this.#liveRuns.delete(context);
 			this.#recordGlobals();
 			leaveRun();
 		}
@@ -547,35 +554,43 @@ export class JsRuntime {
 			finalExpressionValue: undefined,
 			callOccurrences: new Map(),
 		};
+		this.#liveRuns.add(context);
 		try {
-			return await this.#als.run(context, async () => {
-				const wrapped = await wrapCode(code);
-				let value: unknown;
-				hooks.onEvaluate?.();
-				try {
-					value = indirectEval(wrapped.source, filename);
-				} catch (error) {
-					// The engine's own compile SyntaxError has no usable cell position; surface Babel's.
-					// Sync cells run inside indirectEval, so a SyntaxError may also be a runtime one
-					// (e.g. JSON.parse); only diagnose when the source itself fails to compile as a script.
-					if (error instanceof SyntaxError && !compiles(wrapped.source)) {
-						throw (await diagnoseCellSyntaxError(code)) ?? error;
+			// The realm-wide run context lets every runtime refuse this run's code once it is abandoned.
+			return await REALM_RUN.run(context, () =>
+				this.#als.run(context, async () => {
+					const wrapped = await wrapCode(code);
+					// Compiling can wait (the first run loads Babel); a run abandoned meanwhile must evaluate nothing,
+					// since another run may own the realm's globals by now.
+					if (context.abandoned) throw abandonedRunError(context.abandoned.reason);
+					let value: unknown;
+					hooks.onEvaluate?.();
+					try {
+						value = indirectEval(wrapped.source, filename);
+					} catch (error) {
+						// The engine's own compile SyntaxError has no usable cell position; surface Babel's.
+						// Sync cells run inside indirectEval, so a SyntaxError may also be a runtime one
+						// (e.g. JSON.parse); only diagnose when the source itself fails to compile as a script.
+						if (error instanceof SyntaxError && !compiles(wrapped.source)) {
+							throw (await diagnoseCellSyntaxError(code)) ?? error;
+						}
+						throw error;
 					}
-					throw error;
-				}
-				if (wrapped.finalExpressionReturned) {
-					const awaited = await awaitMaybePromise(value);
-					if (context.finalExpressionSet) {
-						const finalValue = context.finalExpressionValue;
-						context.finalExpressionSet = false;
-						context.finalExpressionValue = undefined;
-						return await awaitMaybePromise(finalValue);
+					if (wrapped.finalExpressionReturned) {
+						const awaited = await awaitMaybePromise(value);
+						if (context.finalExpressionSet) {
+							const finalValue = context.finalExpressionValue;
+							context.finalExpressionSet = false;
+							context.finalExpressionValue = undefined;
+							return await awaitMaybePromise(finalValue);
+						}
+						return awaited;
 					}
-					return awaited;
-				}
-				return await awaitMaybePromise(value);
-			});
+					return await awaitMaybePromise(value);
+				}),
+			);
 		} finally {
+			this.#liveRuns.delete(context);
 			this.#recordGlobals();
 			leaveRun();
 		}
@@ -587,17 +602,23 @@ export class JsRuntime {
 		logConsoleArgs("log", [value], hooks);
 	}
 
+	/** This runtime's run the calling code belongs to; throws for code of an abandoned run of any runtime. */
+	#activeRun(): RunContext | undefined {
+		throwIfRunAbandoned();
+		return this.#als.getStore();
+	}
+
 	#activeCwd(): string {
-		return this.#als.getStore()?.cwd ?? this.#cwd;
+		return this.#activeRun()?.cwd ?? this.#cwd;
 	}
 
 	#activeFilename(): string | undefined {
-		const filename = this.#als.getStore()?.filename;
+		const filename = this.#activeRun()?.filename;
 		return filename && path.isAbsolute(filename) ? filename : undefined;
 	}
 
 	#activeHooks(action: string): RuntimeHooks | undefined {
-		const hooks = this.#als.getStore()?.hooks;
+		const hooks = this.#activeRun()?.hooks;
 		if (!hooks) {
 			logger.warn("js runtime helper called outside an active run", { action });
 		}
@@ -645,7 +666,7 @@ export class JsRuntime {
 			__omp_session__: this.#session,
 			__omp_helpers__: this.helpers,
 			__omp_with_call_site__: <T>(siteId: string, action: () => T): T => {
-				const context = this.#als.getStore();
+				const context = this.#activeRun();
 				if (!context) return action();
 				const occurrence = context.callOccurrences.get(siteId) ?? 0;
 				context.callOccurrences.set(siteId, occurrence + 1);
@@ -654,13 +675,18 @@ export class JsRuntime {
 			__omp_call_tool__: async (name: string, args: unknown) => {
 				const hooks = this.#activeHooks("tool");
 				if (!hooks) return undefined;
-				return surfaceBridgedToolImages(await hooks.callTool(name, args, this.#callSiteAls.getStore()), hooks);
+				const result = await hooks.callTool(name, args, this.#callSiteAls.getStore());
+				// The run may have been abandoned while the tool ran: its hooks take nothing more.
+				throwIfRunAbandoned();
+				return surfaceBridgedToolImages(result, hooks);
 			},
 			__omp_prelude__: async (name: string, parameters: unknown) => {
 				const hooks = this.#activeHooks("prelude");
 				if (!hooks) return undefined;
 				const payload = { name, parameters };
-				return surfaceBridgedToolImages(await hooks.callTool("__prelude__", payload), hooks);
+				const result = await hooks.callTool("__prelude__", payload);
+				throwIfRunAbandoned();
+				return surfaceBridgedToolImages(result, hooks);
 			},
 			__omp_import__: async (source: string, options?: ImportCallOptions) => {
 				const filename = this.#activeFilename();
@@ -707,7 +733,7 @@ export class JsRuntime {
 				if (table) hooks.onDisplay({ type: "view", text: buffer, view: table });
 			},
 			__omp_set_final_expr__: (value: unknown) => {
-				const context = this.#als.getStore();
+				const context = this.#activeRun();
 				if (!context) {
 					logger.warn("js runtime final expression set outside an active run");
 					return;
@@ -755,6 +781,17 @@ export class JsRuntime {
 	dispose(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		// Disposal releases realm run ownership, so a run abandoned by timeout cannot hold it forever.
+		if (activeGlobalRunOwner === this.#globalOwner) {
+			activeGlobalRunOwner = null;
+			activeGlobalRunDepth = 0;
+		}
+		// In-process code cannot be stopped, and a run's code that resumes later may meet another run in the realm:
+		// every runtime capability refuses it from now on ({@link throwIfRunAbandoned}), and the stdio routing drops
+		// its writes.
+		const reason = new Error("The JS runtime was disposed during this run");
+		for (const context of this.#liveRuns) context.abandoned = { reason };
+		this.#liveRuns.clear();
 		RUN_HOOK_RESOLVERS.delete(this.#runHookResolver);
 		for (const key of this.#ownedGlobalKeys) releaseGlobalKey(key, this.#globalOwner);
 		this.#ownedGlobalKeys.clear();
@@ -862,6 +899,8 @@ function enterGlobalRun(owner: symbol, action: string): () => void {
 	return () => {
 		if (left) return;
 		left = true;
+		// A disposed owner's late leave must not touch another owner's depth.
+		if (activeGlobalRunOwner !== owner) return;
 		activeGlobalRunDepth--;
 		if (activeGlobalRunDepth === 0) activeGlobalRunOwner = null;
 	};
@@ -900,9 +939,16 @@ function patchStdioOnce(): void {
 		PATCHED_STDIO_STREAMS.add(stream);
 		const original = stream.write.bind(stream) as (...args: unknown[]) => boolean;
 		const routed = (chunk: unknown, encoding?: unknown, callback?: unknown): boolean => {
+			const cb = typeof encoding === "function" ? encoding : callback;
+			// A disposed runtime's resolver is gone, so an abandoned run's write would reach the real stream. Drop it,
+			// as a live run's write never reaches the stream either; no throw, since host code (an RPC or print-mode
+			// writer a tool call of the run started) shares the run's async context and treats a throw as fatal.
+			if (REALM_RUN.getStore()?.abandoned) {
+				if (typeof cb === "function") (cb as (error?: Error | null) => void)();
+				return true;
+			}
 			const hooks = activeRunHooks();
 			if (!hooks) return original(chunk, encoding, callback);
-			const cb = typeof encoding === "function" ? encoding : callback;
 			const enc = typeof encoding === "string" ? (encoding as BufferEncoding) : undefined;
 			hooks.onText(chunkToString(chunk, enc));
 			if (typeof cb === "function") (cb as (error?: Error | null) => void)();
