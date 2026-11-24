@@ -21,8 +21,12 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { readOnlyDefault, readStoredParts, readStoredSession } from "../helpers/sql-session-storage";
-import { sessionStoreTables } from "./sql-session-lease-fixture";
+import {
+	dropSessionStoreTables,
+	readOnlyDefault,
+	readStoredParts,
+	readStoredSession,
+} from "../helpers/sql-session-storage";
 
 const url = process.env.OMP_TEST_SQL_POSTGRES_URL;
 
@@ -52,9 +56,7 @@ afterEach(async () => {
 	current = undefined;
 	if (!db) return;
 	try {
-		for (const name of [...sessionStoreTables(db.table), db.scratch]) {
-			await db.other.unsafe(`DROP TABLE IF EXISTS ${name}`);
-		}
+		await dropSessionStoreTables(db.other, db.table, db.scratch);
 	} finally {
 		// Undo the test's session-level SET. Best effort: a RESET that fails on a
 		// broken connection must not hide the error that broke it.
@@ -485,7 +487,7 @@ describe.skipIf(!url)("SqlSessionStorage starting beside other stores on Postgre
 				expect(await columns({ other }, `${table}_parts`)).toEqual(["content", "path", "start_offset"]);
 			} finally {
 				try {
-					for (const name of sessionStoreTables(table)) await other.unsafe(`DROP TABLE IF EXISTS ${name}`);
+					await dropSessionStoreTables(other, table);
 				} finally {
 					await Promise.all([...clients, other].map(client => client.end()));
 				}

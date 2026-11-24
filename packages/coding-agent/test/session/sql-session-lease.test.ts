@@ -19,6 +19,7 @@ import {
 	type SqlSessionStorageTransaction,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SQL } from "bun";
+import { dropSessionStoreTables } from "../helpers/sql-session-storage";
 import {
 	type GatedClient,
 	gatedClient,
@@ -34,7 +35,6 @@ import {
 	TcpProxy,
 	transcript,
 	until,
-	type WireStatement,
 } from "./sql-session-lease-fixture";
 
 // These tests wait in real time on purpose: a lease expires and a heartbeat
@@ -1426,9 +1426,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 					expect(await db.leases(ID)).toEqual([]);
 				} finally {
 					await client.end();
-					for (const name of [db.leaseTable, parts, blobs, refs, db.table]) {
-						await db.sql(`DROP TABLE IF EXISTS ${name}`);
-					}
+					await dropSessionStoreTables({ unsafe: query => db.sql(query) }, db.table, db.leaseTable);
 					await db.sql(`REVOKE ALL ON SCHEMA public FROM ${role}`);
 					await db.sql(`DROP ROLE IF EXISTS ${role}`);
 				}
@@ -1494,9 +1492,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 					expect(await db.leases(ID)).toEqual([]);
 				} finally {
 					await client.end();
-					for (const name of [db.leaseTable, parts, blobs, refs, db.table]) {
-						await db.sql(`DROP TABLE IF EXISTS ${name}`);
-					}
+					await dropSessionStoreTables({ unsafe: query => db.sql(query) }, db.table, db.leaseTable);
 					await db.sql(`DROP USER IF EXISTS '${user}'@'%'`);
 				}
 			},

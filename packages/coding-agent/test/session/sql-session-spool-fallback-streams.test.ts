@@ -23,6 +23,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
+import { dropSessionStoreTables } from "../helpers/sql-session-storage";
 
 type SqlClient = InstanceType<typeof SQL>;
 
@@ -242,10 +243,7 @@ class Db {
 	}
 
 	async close(): Promise<void> {
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_refs`);
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_blobs`);
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
+		await dropSessionStoreTables(this.client, this.table);
 		await this.client.end();
 		this.#dir?.removeSync();
 		this.cwd.removeSync();

@@ -33,7 +33,8 @@ import { getConfigRootDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { Longest, recordClient, recordStorage } from "../helpers/longest-value";
 import { raceAfterFirstChunk } from "./chunked-read-race";
-import { reserveWrapped, sessionStoreTables } from "./sql-session-lease-fixture";
+import { dropSessionStoreTables } from "../helpers/sql-session-storage";
+import { reserveWrapped } from "./sql-session-lease-fixture";
 
 type SqlClient = InstanceType<typeof SQL>;
 
@@ -223,7 +224,7 @@ class Db {
 	}
 
 	async close(): Promise<void> {
-		for (const name of sessionStoreTables(this.table)) await this.client.unsafe(`DROP TABLE IF EXISTS ${name}`);
+		await dropSessionStoreTables(this.client, this.table);
 		for (const client of this.#others) await client.end();
 		await this.client.end();
 		this.#dir?.removeSync();

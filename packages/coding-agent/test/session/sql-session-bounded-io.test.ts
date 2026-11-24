@@ -37,8 +37,7 @@ import * as piUtils from "@oh-my-pi/pi-utils";
 import { getBlobsDir, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { Longest, recordClient, recordStorage } from "../helpers/longest-value";
-import { readOnlyDefault, readStoredSession } from "../helpers/sql-session-storage";
-import { sessionStoreTables } from "./sql-session-lease-fixture";
+import { dropSessionStoreTables, readOnlyDefault, readStoredSession } from "../helpers/sql-session-storage";
 
 type SqlClient = InstanceType<typeof SQL>;
 
@@ -171,7 +170,7 @@ class Db {
 	}
 
 	async close(): Promise<void> {
-		for (const name of sessionStoreTables(this.table)) await this.client.unsafe(`DROP TABLE IF EXISTS ${name}`);
+		await dropSessionStoreTables(this.client, this.table);
 		await this.client.end();
 		this.#dir?.removeSync();
 	}

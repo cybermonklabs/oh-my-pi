@@ -1504,9 +1504,11 @@ function buildQueries(
 			mysql: `CAST(substr(${column}, 1, @len) AS BINARY) = CAST(${value} AS BINARY)`,
 			sqlite: `substr(${column}, 1, @len) = ${value}`,
 		})[adapter];
-	// The parts under `@dir` that have no row, `p`: by the key range, then the prefix itself (see deleteUnder).
-	const orphanParts = (range: boolean): string =>
-		`${range ? "p.path >= @stem AND p.path < @dir_end AND " : ""}${startsWith("p.path", "@dir")}`;
+	// `<column>` is a path under `@dir`: with `range`, within the directory's key range from `@stem` up to
+	// `@dir_end` first, so the server reads (and a locking statement locks) only that range, then the prefix itself
+	// (see deleteUnder).
+	const underDirectory = (column: string, range: boolean): string =>
+		`${range ? `${column} >= @stem AND ${column} < @dir_end AND ` : ""}${startsWith(column, "@dir")}`;
 	// SQLite only: the rowid a part inserted at `@now` (ms since the epoch) takes, see DialectQueries.partRowids; null,
 	// for SQLite to pick one, when the largest rowid is SQLITE_MAX_ROWID already, whose `+ 1` is a REAL no rowid takes.
 	// `@now * 1024` stays below 2^63 for every date a `Date` holds.
@@ -1521,19 +1523,19 @@ function buildQueries(
 						`DELETE FROM ${parts} WHERE path IN (SELECT path FROM gone)`,
 				),
 				sql(
-					`DELETE FROM ${parts} AS p WHERE ${orphanParts(range)} ` +
+					`DELETE FROM ${parts} AS p WHERE ${underDirectory("p.path", range)} ` +
 						`AND NOT EXISTS (SELECT 1 FROM ${table} AS r WHERE r.path = p.path)`,
 				),
 			],
 			mysql: [
 				sql(
 					`DELETE r, p FROM ${table} AS r LEFT JOIN ${parts} AS p ON p.path = r.path ` +
-						// The key range first, so the delete reads and locks only the rows under `@dir` (see deleteUnder).
-						`WHERE ${range ? "r.path >= @stem AND r.path < @dir_end AND " : ""}${startsWith("r.path", "@dir")}`,
+						// The key range first, so the delete reads and locks only the rows under `@dir`.
+						`WHERE ${underDirectory("r.path", range)}`,
 				),
 				sql(
 					`DELETE p FROM ${parts} AS p LEFT JOIN ${table} AS r ON r.path = p.path ` +
-						`WHERE ${orphanParts(range)} AND r.path IS NULL`,
+						`WHERE ${underDirectory("p.path", range)} AND r.path IS NULL`,
 				),
 			],
 			sqlite: [
@@ -1839,9 +1841,7 @@ function buildQueries(
 								// The rows under `@dir` that the directory delete takes: those whose prefix is exactly
 								// `@dir`, whatever the column's collation (see deleteUnder), on MySQL and MariaDB within its
 								// key range, so the lock reads and locks only those rows and the gaps around them.
-								(under
-									? ` OR (${mysql ? "path >= @stem AND path < @dir_end AND " : ""}${startsWith("path", "@dir")})`
-									: "") +
+								(under ? ` OR (${underDirectory("path", mysql)})` : "") +
 								" ORDER BY path FOR UPDATE",
 						),
 		sessionRowsOf: mysql

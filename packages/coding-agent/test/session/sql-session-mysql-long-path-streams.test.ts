@@ -22,6 +22,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
+import { dropSessionStoreTables } from "../helpers/sql-session-storage";
 
 const MYSQL_URL = process.env.OMP_TEST_SQL_MYSQL_URL;
 const SKIP = MYSQL_URL ? undefined : "OMP_TEST_SQL_MYSQL_URL is not set";
@@ -198,9 +199,7 @@ describe.skipIf(SKIP !== undefined)(
 				const client = new SQL(MYSQL_URL ?? "");
 				const cwd = TempDir.createSync("@omp-mysql-long-path-cwd-");
 				cleanups.push(async () => {
-					for (const suffix of ["_refs", "_blobs", "_parts", ""]) {
-						await client.unsafe(`DROP TABLE IF EXISTS ${table}${suffix}`);
-					}
+					await dropSessionStoreTables(client, table);
 					await client.end();
 					cwd.removeSync();
 				});
