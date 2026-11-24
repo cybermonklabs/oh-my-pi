@@ -31,7 +31,7 @@
 //! | Op | a | b | Semantics |
 //! |---|---|---|---|
 //! | `Nop` | – | – | nothing |
-//! | `Exec` | `cmds` index | – | simple command: expand, redirect, resolve, dispatch (staged, may park or call) |
+//! | `Exec` | `cmds` index | bits [`Op::EXEC_FORKED`], [`Op::EXEC_ASYNC`] | simple command: expand, redirect, resolve, dispatch (staged, may park or call) |
 //! | `Jmp` | target | – | jump |
 //! | `BrOk` | target | [`Construct`](crate::bash::event::Construct) | jump when `$?` = 0; emits `Branch` |
 //! | `BrFail` | target | [`Construct`](crate::bash::event::Construct) | jump when `$?` ≠ 0; emits `Branch` |
@@ -96,7 +96,7 @@ use crate::bash::{
 };
 
 /// IR version; part of the frames header.
-pub const IR_VERSION: u32 = 17;
+pub const IR_VERSION: u32 = 18;
 
 /// Opcodes.
 #[derive(
@@ -213,6 +213,14 @@ impl Op {
 	/// Flag on a background `Spawn`: zsh `&!`/`&|`, the job is disowned at
 	/// once (not in the job table).
 	pub const DISOWN: u8 = 1 << 7;
+	/// `Exec` operand `b` bit: a bash `%job &` (the command's first word
+	/// as written starts with `%`, the command alone in a background list
+	/// item) runs here, not in a child, and its jobspec is `bg`.
+	pub const EXEC_ASYNC: u32 = 2;
+	/// `Exec` operand `b` bit: bash runs this simple command in the child
+	/// it forked for it (a pipeline stage, or a background list item whose
+	/// first word does not start with `%`), where a jobspec is no command.
+	pub const EXEC_FORKED: u32 = 1;
 	/// `Nop` operand `b` in a zsh unit: the end of a list (the DEBUG trap
 	/// point after it).
 	pub const LIST_END: u32 = 2;

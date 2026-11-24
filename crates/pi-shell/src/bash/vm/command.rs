@@ -256,6 +256,23 @@ pub fn exec(
 				s.status = 0;
 				s.stage = Stage::Finish;
 			},
+			Stage::Redirect
+				if unit.mode.dialect() != crate::bash::ids::Dialect::Zsh
+					&& op.b & ir::Op::EXEC_FORKED == 0
+					&& jobspec_command(cx, vp) =>
+			{
+				// bash `execute_simple_command`: a command word that starts
+				// with `%` is `fg` (`bg` for a lone `%job &`), run before the
+				// redirections are expanded or applied: none is.
+				let id = if op.b & ir::Op::EXEC_ASYNC != 0 {
+					IntrinsicId::Bg
+				} else {
+					IntrinsicId::Fg
+				};
+				let s = st(vp);
+				s.target = Some(Target::Intrinsic(id));
+				s.stage = Stage::Lookup;
+			},
 			Stage::Redirect => {
 				if let Some(list) = cmd.redirs {
 					// Opens: `CmdExpanded` reads the clock after them.
@@ -520,7 +537,9 @@ fn plain_statement(
 			_ => return None,
 		}
 	}
+	// A jobspec (`%1`) is `fg`/`bg` from the redirection stage on.
 	if name.contains(&b'/')
+		|| name.starts_with(b"%")
 		|| xtrace::on(k, cx, vp)
 		|| state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(true)
 		|| state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Keyword)
@@ -2179,7 +2198,12 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 	let target = st(vp).target.clone().unwrap_or(Target::NotFound);
 	// The command name, for diagnostics only.
 	let argv0 = |vp: &mut Vproc| st(vp).argv[0].clone();
-	let jobspec = st(vp).exec_as.is_none() && st(vp).argv[0].starts_with(b"%");
+	// zsh: a jobspec as a command is `fg jobspec`. bash's ran at the
+	// redirections (`jobspec_command`); one reaching here is in a child
+	// bash forked, where it is a name not found.
+	let jobspec = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
+		&& st(vp).exec_as.is_none()
+		&& st(vp).argv[0].starts_with(b"%");
 	if !k.bangs.is_empty() {
 		let exec = st(vp).exec_as.is_some();
 		bang_dispatch(k, vp.vpid, &target, exec);
@@ -2208,10 +2232,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 	match target {
 		Target::Function(fname) => call_function(k, vp, cx, op, line, fname),
 		Target::Intrinsic(id) => run_builtin(k, vp, cx, line, id),
-		Target::NotFound | Target::Search if jobspec => {
-			// A jobspec as a command is `fg jobspec` (bash).
-			run_builtin(k, vp, cx, line, IntrinsicId::Fg)
-		},
+		Target::NotFound | Target::Search if jobspec => run_builtin(k, vp, cx, line, IntrinsicId::Fg),
 		Target::NotFound | Target::Search if st(vp).exec_as.is_some() => {
 			// bash's `exec`: a name not found that is a directory "cannot
 			// execute" (126).
@@ -4201,6 +4222,47 @@ fn exec_builtin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> O
 	s.control = Some(Transfer::Exec);
 	s.stage = Stage::Lookup;
 	None
+}
+
+/// bash `execute_simple_command`'s jobspec test: the command word, after
+/// any `command [-p] [--]` prefixes (`check_command_builtin`; not when
+/// `command` is a function, which then runs), starts with `%`. The
+/// prefixes are dropped from the words.
+fn jobspec_command(cx: &mut Cx<'_>, vp: &mut Vproc) -> bool {
+	let mut at = 0;
+	loop {
+		let argv = &st(vp).argv;
+		let Some(word) = argv.get(at) else {
+			return false;
+		};
+		if word.starts_with(b"%") {
+			break;
+		}
+		if word.as_slice() != b"command"
+			|| matches!(
+				state::record(cx.store, vp, Key::Func(BStr::new(b"command"))),
+				Ok(Some(Record::Func { .. }))
+			) {
+			return false;
+		}
+		let argv = &st(vp).argv;
+		let mut next = at + 1;
+		if argv.get(next).is_some_and(|w| w.as_slice() == b"-p") {
+			next += 1;
+		}
+		match argv.get(next) {
+			Some(w) if w.as_slice() == b"--" => next += 1,
+			Some(w) if w.starts_with(b"-") => return false,
+			_ => {},
+		}
+		at = next;
+	}
+	let s = st(vp);
+	s.argv.drain(..at);
+	for _ in 0..at {
+		shift_arrayref(&mut s.arrayref);
+	}
+	true
 }
 
 /// This vproc may settle a background job's pid ([`super::proc::Bang`]):
