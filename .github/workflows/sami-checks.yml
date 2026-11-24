@@ -28,6 +28,8 @@
 #   - TypeScript: natives, utils, scripts/ci-release-publish.test.ts and mnemopi --isolate in one
 #     job; coding-agent --isolate over 10 shards by file; check:ts. The host addon they load is
 #     built once, in the natives job.
+#   - under gVisor (sami-checks-gvisor.yml): the pi-shell set (and so the one-process lib) and
+#     pi-builtins again, from the same archive, in a runsc container, as uid 1000 and as root.
 # The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
 # in the tools job (.github/sami-checks/tools.sh), on hosts .github/sami-checks/host.sh sets up.
 # sdk/rust/omp-rpc is its own cargo workspace and is not built here.
@@ -126,6 +128,8 @@ jobs:
       builtins: ${{ steps.plan.outputs.builtins }}
       ts: ${{ steps.plan.outputs.ts }}
       ca_shards: ${{ steps.plan.outputs.ca_shards }}
+      gvisor: ${{ steps.plan.outputs.gvisor }}
+      gv_set_shards: ${{ steps.plan.outputs.gv_set_shards }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -509,9 +513,20 @@ jobs:
           path: ${{ github.workspace }}/sc/res/
           retention-days: 14
 
+  gvisor:
+    name: gVisor
+    needs: [plan, tools, build]
+    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.build.result == 'success' }}
+    uses: ./.github/workflows/sami-checks-gvisor.yml
+    with:
+      commit: ${{ needs.plan.outputs.commit }}
+      silent: ${{ needs.plan.outputs.silent }}
+      matrix: ${{ needs.plan.outputs.gvisor }}
+      set_shards: ${{ needs.plan.outputs.gv_set_shards }}
+
   summary:
     name: summary
-    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms]
+    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms, gvisor]
     if: ${{ always() && needs.plan.outputs.commit != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15

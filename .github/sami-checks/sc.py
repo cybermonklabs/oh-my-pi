@@ -6,6 +6,7 @@
   sc.py ts-small                   the small TypeScript suites, one "unit<TAB>dir<TAB>bound<TAB>args" a line
   sc.py libtest LOG EXIT SECS ROW UNIT WHO   one libtest binary's result (JSON on stdout)
   sc.py nextest JUNIT EXIT SECS ROW UNIT WHO one nextest run's result
+  sc.py gv-control LOG EXIT SECS ROW UNIT WHO the map-limit control: gv-libtest, UNKNOWN unless each ORPHAN_CONTROL_TESTS test ran
   sc.py bun JUNIT LOG EXIT SECS ROW UNIT     one `bun test` run's result
   sc.py plain EXIT SECS ROW UNIT LOG         a command whose exit is its verdict (check:ts)
   sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout; exit 1 unless every row passed
@@ -51,6 +52,24 @@ TS_SMALL = (
     ("mnemopi", "packages/mnemopi", 1200, ["--isolate", "test"]),
 )
 PI_SHELL = "pi-shell"
+# The gVisor rows (sami-checks-gvisor.yml): the pi-shell set, one libtest process per binary, over
+# GV_SET_SHARDS shards (its run of the lib binary is also the one-process lib row), and pi-builtins
+# under nextest, each in a runsc container, as uid 1000 and as root.
+GV_SET_SHARDS = 4
+GV_WHO = ("uid1000", "root")
+# The map-limit control (gvisor-run.sh) runs the lib's orphan_jobs module at 4 threads. A filter that
+# selects nothing (the module renamed or moved) lets libtest exit 0 having run nothing, so the control
+# needs each of the module's tests by name: these, its #[test] functions at 509a2d77 and a72018dd.
+ORPHAN_CONTROL_TESTS = tuple(f"testkit::suites::orphan_jobs::{t}" for t in (
+    "a_subshell_exit_ends_its_background_native_task",
+    "a_subshell_exit_ends_its_background_shell_loop",
+    "a_subshell_exit_ends_a_background_loop_waiting_on_an_external",
+    "a_background_job_that_is_just_an_external_outlives_its_subshell",
+    "a_nested_job_is_judged_on_its_own_when_its_parent_job_ends",
+    "a_detached_tree_outlives_its_subshell",
+    "orphans_are_found_again_after_a_restore",
+    "without_the_knob_orphaned_jobs_run_on",
+))
 # Seconds a pi-shell binary is assumed to take when the weights file does not name it.
 DEFAULT_WEIGHT = 5.0
 # What a test prints when it returns early having checked nothing: a passing test that prints one
@@ -80,6 +99,8 @@ SKIP_WORD = re.compile(
     r"|\bnot checked\b|\bchecked nothing\b|\bnot compared\b",
     re.I,
 )
+# A NOT-RUN line a test writes past libtest's capture, to stderr (parse_libtest matches it to its test).
+NOT_RUN = re.compile(r"NOT-RUN ([A-Za-z0-9_]+): [^\n]*")
 
 ROWS = (
     ("pi-shell set (runner)", "set-runner"),
@@ -91,6 +112,14 @@ ROWS = (
     ("coding-agent --isolate", "ts-ca"),
     ("check:ts", "checkts"),
     ("skip prints the summary reads", "skipforms"),
+    ("pi-shell set, gVisor (uid 1000)", "gv-set-uid1000"),
+    ("pi-shell set, gVisor (root)", "gv-set-root"),
+    ("pi-shell lib, one process, 4 threads, gVisor (uid 1000)", "gv-lib4-uid1000"),
+    ("pi-shell lib, one process, 4 threads, gVisor (root)", "gv-lib4-root"),
+    ("pi-builtins, nextest default profile, gVisor (uid 1000)", "gv-builtins-uid1000"),
+    ("pi-builtins, nextest default profile, gVisor (root)", "gv-builtins-root"),
+    ("pi-shell orphan_jobs at 4 threads, gVisor: the map-limit control (uid 1000)", "gv-orphan-uid1000"),
+    ("pi-shell orphan_jobs at 4 threads, gVisor: the map-limit control (root)", "gv-orphan-root"),
 )
 
 
@@ -110,9 +139,18 @@ def ts_matrix():
     return [{"shard": s, "name": f"ts-ca-{s}"} for s in range(1, CODING_AGENT_SHARDS + 1)]
 
 
+def gvisor_matrix():
+    m = []
+    for w in GV_WHO:
+        m += [{"who": w, "part": "set", "shard": s, "name": f"gv-set-{w}-{s}"} for s in range(1, GV_SET_SHARDS + 1)]
+        m.append({"who": w, "part": "builtins", "shard": 0, "name": f"gv-builtins-{w}"})
+    return m
+
+
 def all_job_names():
     names = [m["name"] for m in set_matrix()] + [m["name"] for m in workspace_matrix()]
     names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()] + ["ts-small", "checkts", "skip-forms"]
+    names += [m["name"] for m in gvisor_matrix()]
     return names
 
 
@@ -141,6 +179,8 @@ def cmd_plan():
         "workspace_parts": WORKSPACE_PARTS,
         "ts": json.dumps(ts_matrix()),
         "ca_shards": CODING_AGENT_SHARDS,
+        "gvisor": json.dumps(gvisor_matrix()),
+        "gv_set_shards": GV_SET_SHARDS,
     }
     for k, v in out.items():
         print(f"{k}={v}")
@@ -313,7 +353,7 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
     """libtest's JSON events (-Z unstable-options --format json --report-time, --show-output).
     Text that is not an event (a child's or a thread's own writes) is ignored. libtest's
     `timeout` event is its 60 s warning, not a verdict: the test's own ok or failed comes later."""
-    started, ended, slow, times, failures, skipped, partial, skip_lines = set(), set(), set(), {}, [], [], [], {}
+    started, ended, slow, times, failures, skipped, partial, skip_lines, oks = set(), set(), set(), {}, [], [], [], {}, set()
     passed = failed = ignored = 0
     suite_end = None
     rules = partial_rules(partial_path)
@@ -338,6 +378,7 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
                 ended.add(name)
                 if e == "ok":
                     passed += 1
+                    oks.add(name)
                     k = skip_reading(name, ev.get("stdout") or "", rules)
                     if k and k[1]:
                         partial.append((name, len(k[0]), k[1]))
@@ -357,6 +398,22 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
         code = None
     tests = sorted(times.items())
     unfinished = sorted(started - ended)
+    # A test that writes "NOT-RUN <its name>: <why>" straight to the binary's stderr, past libtest's
+    # capture (pi-shell's spawn tests do), skipped itself: the line names the test, so it is matched
+    # to the one passing test whose name ends in that name. A line that names no passing test, or
+    # more than one, makes the unit UNKNOWN.
+    unmatched = []
+    for m in NOT_RUN.finditer("\n".join(lines)):
+        nr = m.group(1)
+        hit = [t for t in oks if t == nr or t.endswith("::" + nr)]
+        if len(hit) == 1:
+            if hit[0] not in skipped:
+                skipped.append(hit[0])
+            # The known-skip entries match a test's skip lines (known_skip).
+            if m.group(0).strip() not in skip_lines.setdefault(hit[0], []):
+                skip_lines[hit[0]].append(m.group(0).strip())
+        elif nr not in unmatched:
+            unmatched.append(nr)
 
     def r(status, note=""):
         return result(row, unit, who, status, exit_code, secs, passed, failed, ignored, failures, tests, note, skipped,
@@ -376,10 +433,26 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
                             f"the events {passed} and {failed}")
     if (code == 0) != (failed == 0):
         return r("UNKNOWN", f"exit {exit_code} with {failed} failed")
+    if unmatched and not failed:
+        return r("UNKNOWN", "NOT-RUN line(s) that name no one passing test: " + ", ".join(unmatched[:10]))
     res = r("FAIL" if failed else "PASS")
     if slow:
         res["note"] = "past 60 s: " + ", ".join(sorted(slow)[:10])
     return skip_verdict(res)
+
+
+def gv_control(log, exit_code, secs, row, unit, who):
+    """The map-limit control's result: libtest's result, UNKNOWN unless every test of
+    ORPHAN_CONTROL_TESTS ran to a verdict; the ones that did not are named."""
+    res = parse_libtest(log, exit_code, secs, row, unit, who)
+    ran = {n for n, _ in res["tests"]} | set(res["failures"])
+    missing = [t for t in ORPHAN_CONTROL_TESTS if t not in ran]
+    if missing:
+        note = (f"{len(missing)} of the {len(ORPHAN_CONTROL_TESTS)} control tests did not run: "
+                + ", ".join(t.rsplit("::", 1)[-1] for t in missing))
+        res["note"] = note if res["status"] != "UNKNOWN" else f"{res['note']}; {note}"
+        res["status"] = "UNKNOWN"
+    return res
 
 
 def passed_attempt(out):
@@ -561,8 +634,14 @@ def expected_units(build_dir):
                 exp.append((f"set-{who}", ident, who))
         if any(i == PI_SHELL for i, _ in bins):
             exp.append(("lib4", PI_SHELL, "runner"))
+        for who in GV_WHO:
+            exp += [(f"gv-set-{who}", ident, who) for ident, _ in bins]
+            if any(i == PI_SHELL for i, _ in bins):
+                exp.append((f"gv-lib4-{who}", PI_SHELL, who))
+                exp.append((f"gv-orphan-{who}", "testkit::suites::orphan_jobs", who))
     else:
-        notes["set-runner"] = notes["set-root"] = notes["lib4"] = "the build gave no binary list, so the set could not run"
+        for key in ["set-runner", "set-root", "lib4"] + [f"gv-{r}-{w}" for r in ("set", "lib4", "orphan") for w in GV_WHO]:
+            notes[key] = "the build gave no binary list, so the set could not run"
     for who in SET_WHO:
         exp.append(("builtins", "pi-builtins", who))
     for who in SET_WHO:
@@ -574,6 +653,8 @@ def expected_units(build_dir):
         exp.append(("ts-ca", f"shard {s}/{CODING_AGENT_SHARDS}", "runner"))
     exp.append(("checkts", "check:ts", "runner"))
     exp.append(("skipforms", "tree", "runner"))
+    for who in GV_WHO:
+        exp.append((f"gv-builtins-{who}", "pi-builtins", who))
     # The run-time half, which the summary job runs on the results before the summary (sc.py skip-lines).
     exp.append(("skipforms", "runtime", "runner"))
     return exp, notes
@@ -930,11 +1011,15 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             dup.add(k)
         got[k] = r
     # The tests each (unit, user) passed without a skip marker: a test that skipped itself as one
-    # user is covered when the same test passed as the other.
+    # user is covered when the same test passed as the other, on the same runtime (a gVisor row's
+    # self-skip only by a gVisor row's pass).
+    def runtime(row):
+        return "gvisor" if row.startswith("gv-") else "host"
+
     passed_as = {}
     for r in results:
         bad = set(r["failures"]) | set(r.get("self_skipped", []))
-        passed_as.setdefault((r["unit"], r["who"]), set()).update(n for n, _ in r["tests"] if n not in bad)
+        passed_as.setdefault((runtime(r["row"]), r["unit"], r["who"]), set()).update(n for n, _ in r["tests"] if n not in bad)
     exp, notes = expected_units(build_dir)
     lines = []
     commit = os.environ.get("SC_COMMIT", "?")
@@ -965,10 +1050,10 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             elif e in dup:
                 r = dict(r, status="UNKNOWN", note="two jobs reported this unit")
             else:
-                # A self-skip is covered when the same test passed as the other user, and known when
+                # A self-skip is covered when the same test passed as the other user on the same runtime, and known when
                 # each of its skip lines is a `skips: ` entry of this row and user.
-                others = [w for w in SET_WHO if w != r["who"]]
-                open_ = [s for s in r.get("self_skipped", []) if not any(s in passed_as.get((r["unit"], w), ()) for w in others)]
+                others = [w for w in (GV_WHO if runtime(key) == "gvisor" else SET_WHO) if w != r["who"]]
+                open_ = [s for s in r.get("self_skipped", []) if not any(s in passed_as.get((runtime(key), r["unit"], w), ()) for w in others)]
                 listed = {}
                 for s in open_:
                     why = known_skip(skips, key, r["who"], r["unit"], s, r.get("skip_lines", {}).get(s))
@@ -1136,6 +1221,17 @@ def selftest():
     check("libtest no log", parse_libtest(os.path.join(d, "absent"), "0", 1, "r", "u", "w")["status"], "UNKNOWN")
     r = lt([s0, a_s, a_skip, end_ok], 0)
     check("libtest self-skip", (r["status"], r["passed"], r["self_skipped"]), ("UNKNOWN", 0, ["a"]))
+    busy_t = "sys::spawn::unix::tests::a_busy_program_runs_once_its_holder_lets_go"
+    nr_s = {"type": "test", "event": "started", "name": busy_t}
+    nr_ok = {"type": "test", "event": "ok", "name": busy_t, "exec_time": 0.1}
+    nr_end = {"type": "suite", "event": "ok", "passed": 2, "failed": 0}
+    nr_line = "NOT-RUN a_busy_program_runs_once_its_holder_lets_go: this kernel runs a program held open for writing\n"
+    r = lt([s0, a_s, a_ok, nr_s, nr_ok, nr_end], 0, nr_line)
+    check("a NOT-RUN line on stderr is that test's self-skip", (r["status"], r["self_skipped"]), ("UNKNOWN", [busy_t]))
+    r = lt([s0, a_s, a_ok, nr_s, nr_ok, nr_end], 0, "NOT-RUN no_such_test: why\n")
+    check("a NOT-RUN line that names no test is UNKNOWN", (r["status"], "no_such_test" in r["note"]), ("UNKNOWN", True))
+    r = lt([s0, a_s, a_ok, nr_s, nr_ok, nr_end], 0, nr_line)
+    check("a NOT-RUN line is kept as that test's skip line", r["skip_lines"].get(busy_t), [nr_line.strip()])
     # A child that shares the binary's stdout left `test x ... ` unfinished, and the next event came
     # after it on the same line (run 45287678343, pi-shell lib): the event still counts.
     p = os.path.join(d, "glued.log")
@@ -1268,11 +1364,13 @@ def selftest():
     }}
     json.dump(meta, open(os.path.join(build, "binaries-metadata.json"), "w"))
     exp, _ = expected_units(build)
+    paths = {}
     for i, (row, unit, who) in enumerate(exp):
+        paths[(row, unit, who)] = os.path.join(res, f"{i}.json")
         if (row, unit, who) == ("set-root", "pi-shell::zle_pty", "root"):
             continue  # the planted silent unit
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
-                  open(os.path.join(res, f"{i}.json"), "w"))
+                  open(paths[(row, unit, who)], "w"))
 
     known_file = os.path.join(d, "known.txt")
     open(known_file, "w").write("# none\n")
@@ -1620,6 +1718,43 @@ def selftest():
     json.dump(result("ts-ca", "shard 3/10", "runner", "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
               open(os.path.join(res, "ca3.json"), "w"))
     open(known_file, "w").write("# none\n")
+    # A gVisor job that reports nothing: gv-builtins-root (its one unit), and the uid 1000 set shard
+    # that holds the lib binary (its set unit and the lib row both come from that job).
+    check("the plan names the gVisor jobs", {"gv-builtins-root", "gv-set-uid1000-1", "gv-set-root-4"} <= set(all_job_names()), True)
+    check("the gVisor set jobs are the shards assign() gives", set(assign([f"b{i}" for i in range(40)], {}, GV_SET_SHARDS).values()),
+          {m["shard"] for m in gvisor_matrix() if m["part"] == "set" and m["who"] == "root"})
+    check("the gVisor rows expect both users", {("gv-builtins-uid1000", "pi-builtins", "uid1000"), ("gv-lib4-root", "pi-shell", "root"),
+                                                ("gv-set-root", "pi-shell::zle_pty", "root")} <= set(exp), True)
+    check("the map-limit control row is expected for both users", {("gv-orphan-uid1000", "testkit::suites::orphan_jobs", "uid1000"),
+                                                                   ("gv-orphan-root", "testkit::suites::orphan_jobs", "root")} <= set(exp), True)
+    gv_silent = [("gv-builtins-root", "pi-builtins", "root"), ("gv-set-uid1000", "pi-shell", "uid1000"), ("gv-lib4-uid1000", "pi-shell", "uid1000"),
+                 ("gv-orphan-uid1000", "testkit::suites::orphan_jobs", "uid1000")]
+    for k in gv_silent:
+        if k in paths:
+            os.rename(paths[k], paths[k] + ".planted")
+    rc, out = summary()
+    check("summary exit with a silent gVisor job", rc, 1)
+    check("a silent gVisor builtins job reads UNKNOWN", "| pi-builtins, nextest default profile, gVisor (root) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
+    check("a silent gVisor builtins job is named", "`pi-builtins` (root): UNKNOWN: no result" in out, True)
+    check("a silent gVisor set shard reads UNKNOWN", "| pi-shell set, gVisor (uid 1000) | **UNKNOWN** | 1 / 0 / 0 / 1 |" in out, True)
+    check("its control row reads UNKNOWN", "| pi-shell orphan_jobs at 4 threads, gVisor: the map-limit control (uid 1000) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
+    check("its lib row reads UNKNOWN", "| pi-shell lib, one process, 4 threads, gVisor (uid 1000) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
+    check("the other gVisor rows pass", "| pi-builtins, nextest default profile, gVisor (uid 1000) | **PASS** | 1 / 0 / 0 / 0 |" in out
+          and "| pi-shell set, gVisor (root) | **PASS** | 2 / 0 / 0 / 0 |" in out, True)
+    # A gVisor unit that ran and failed reads FAIL with its test named.
+    for k in gv_silent:
+        if k in paths:
+            os.rename(paths[k] + ".planted", paths[k])
+    json.dump(result("gv-builtins-root", "pi-builtins", "root", "FAIL", 100, 1, passed=1, failed=1, failures=["pi-builtins::cp::tests::x"]),
+              open(paths.get(("gv-builtins-root", "pi-builtins", "root"), os.path.join(res, "gv-builtins-root.json")), "w"))
+    rc, out = summary()
+    check("a failing gVisor unit fails its row", ("| pi-builtins, nextest default profile, gVisor (root) | **FAIL** | 0 / 0 / 1 / 0 |" in out, rc), (True, 1))
+    check("a failing gVisor test is named", "`pi-builtins` (root): FAILED `pi-builtins::cp::tests::x`: **NEW**" in out, True)
+    # A gVisor row's failure that the list names under its gVisor row key reads KNOWN.
+    open(known_file, "w").write("gv-builtins-root\troot\tpi-builtins\tpi-builtins::cp::tests::x\tthe host's too\n")
+    rc, out = summary()
+    check("a listed gVisor failure is KNOWN", "| pi-builtins, nextest default profile, gVisor (root) | **KNOWN** | 0 / 1 / 0 / 0 |" in out, True)
+    open(known_file, "w").write("# none\n")
     # skip-forms: a literal that says it skips is read by SKIP_MARKER or named as not a marker; a new
     # form fails the check until one of the two is true.
     tree = os.path.join(d, "tree")
@@ -1690,6 +1825,63 @@ def selftest():
     os.remove(os.path.join(build, "binaries-metadata.json"))
     rc, out = summary()
     check("summary without a binary list", ("| pi-shell set (runner) | **UNKNOWN** | - |" in out, rc), (True, 1))
+    check("summary without a binary list (gVisor)", "| pi-shell set, gVisor (root) | **UNKNOWN** | - |" in out, True)
+
+    # Known skips for the gVisor rows (known-failures.txt `skips: `): an entry for a gVisor row clears
+    # that row's self-skip; the same skip in a host row stays open.
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if r["row"] in ("builtins", "gv-builtins-uid1000", "gv-builtins-root"):
+            os.remove(os.path.join(res, f))
+    gline = "skipped: under gVisor an attribute set after the mode changed is refused in some runs"
+
+    def gskip(row, who):
+        return dict(result(row, "pi-builtins", who, "UNKNOWN", 0, 1, passed=1, tests=[("a", 1.0), ("ro", 1.0)],
+                           self_skipped=["ro"], skip_lines={"ro": [gline]}), skip_only=True)
+    for row, who in (("gv-builtins-uid1000", "uid1000"), ("gv-builtins-root", "root"), ("builtins", "runner"), ("builtins", "root")):
+        json.dump(gskip(row, who), open(os.path.join(res, f"ks-{row}-{who}.json"), "w"))
+    open(known_file, "w").write("".join(f"gv-builtins-{w}\t{w}\tpi-builtins\tro\tskips: gVisor\tskipped: under gVisor {{}}\n" for w in GV_WHO))
+    rc, out = summary()
+    check("a gVisor known skip clears its gVisor row", ("| pi-builtins, nextest default profile, gVisor (root) | **KNOWN** |" in out,
+          "| pi-builtins, nextest default profile, gVisor (uid 1000) | **KNOWN** |" in out), (True, True))
+    check("the same skip in a host row stays open", "| pi-builtins, nextest default profile | **UNKNOWN** |" in out, True)
+    open(known_file, "w").write("# none\n")
+    # A gVisor self-skip is covered by the other user's gVisor pass, never by a host row's.
+    def gnx(who, skipped, passed):
+        return dict(result(f"gv-builtins-{who}", "pi-builtins", who, "UNKNOWN" if skipped else "PASS", 0, 1, passed=len(passed),
+                           tests=[(n, 1.0) for n in passed + skipped], self_skipped=skipped), skip_only=bool(skipped))
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if r["row"].startswith("gv-builtins") or r["row"] == "builtins":
+            os.remove(os.path.join(res, f))
+    json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
+    json.dump(gnx("uid1000", ["c"], ["a"]), open(os.path.join(res, "gb-uid1000.json"), "w"))
+    json.dump(gnx("root", ["c"], ["a"]), open(os.path.join(res, "gb-root.json"), "w"))
+    rc, out = summary()
+    check("a gVisor self-skip is not covered by a host pass", "| pi-builtins, nextest default profile, gVisor (uid 1000) | **UNKNOWN** |" in out, True)
+    json.dump(gnx("root", [], ["a", "c"]), open(os.path.join(res, "gb-root.json"), "w"))
+    rc, out = summary()
+    check("a gVisor self-skip is covered by the other user's gVisor pass",
+          "| pi-builtins, nextest default profile, gVisor (uid 1000) | **PASS** |" in out, True)
+
+    # The map-limit control needs each of its tests by name: a filter that selects nothing (the module
+    # renamed or moved) exits 0 having run nothing, and must read UNKNOWN, not PASS.
+    def ctl(names):
+        p = os.path.join(d, "ctl.log")
+        ev = [{"type": "suite", "event": "started", "test_count": len(names)}]
+        for n in names:
+            ev += [{"type": "test", "event": "started", "name": n}, {"type": "test", "event": "ok", "name": n, "exec_time": 0.1}]
+        ev.append({"type": "suite", "event": "ok", "passed": len(names), "failed": 0})
+        with open(p, "w") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in ev))
+        return gv_control(p, "0", 1, "gv-orphan-root", "testkit::suites::orphan_jobs", "root")
+    check("the map-limit control with each of its tests passes", ctl(list(ORPHAN_CONTROL_TESTS))["status"], "PASS")
+    r = ctl([])
+    check("a control whose filter selects nothing (the module renamed) is UNKNOWN",
+          (r["status"], f"{len(ORPHAN_CONTROL_TESTS)} of the {len(ORPHAN_CONTROL_TESTS)} control tests did not run" in r["note"]), ("UNKNOWN", True))
+    r = ctl(list(ORPHAN_CONTROL_TESTS[1:]))
+    check("a control test that did not run is UNKNOWN and named",
+          (r["status"], r["note"].endswith(ORPHAN_CONTROL_TESTS[0].rsplit("::", 1)[-1])), ("UNKNOWN", True))
 
     if fails:
         for f in fails:
@@ -1698,7 +1890,7 @@ def selftest():
     print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest and bun counters, the tree's real "
           "skip lines and partial passes, the shard assignment and per-user weights, the summary's UNKNOWN for a "
           "unit no job or two jobs reported, the known and flaky entries, and skip-forms and skip-lines with "
-          "their controls")
+          "their controls, and the gVisor rows and their known skips")
 
 
 def main(argv):
@@ -1716,6 +1908,8 @@ def main(argv):
     elif c == "nextest":
         junit, ex, secs, row, unit, who = a
         print(json.dumps(parse_junit(junit, ex, secs, row, unit, who, (0,), (100,))))
+    elif c == "gv-control":
+        print(json.dumps(gv_control(*a)))
     elif c == "bun":
         print(json.dumps(parse_bun(*a)))
     elif c == "plain":
