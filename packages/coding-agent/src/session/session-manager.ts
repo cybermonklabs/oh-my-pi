@@ -50,6 +50,7 @@ import {
 	stripInternalDetailsFields,
 } from "./messages";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
+import type { SubagentSpawnSpec } from "../task/spawn-spec";
 import { createInterruptedToolResults, sessionExitFollowsLastMessage } from "./exit-diagnostics";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
 import {
@@ -3809,6 +3810,7 @@ export class SessionManager {
 		compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 		isolated?: boolean;
 		workPoolYieldItems?: WorkPoolYieldItem[];
+		spawnSpec?: SubagentSpawnSpec;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -4893,6 +4895,8 @@ export interface PersistedSessionInit {
 	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 	isolated?: boolean;
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/** The inputs the subagent was spawned with; absent on older files and a `/tan` clone. */
+	spawnSpec?: SubagentSpawnSpec;
 }
 
 /**
@@ -4925,6 +4929,7 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			isolated: entry.isolated,
 			...(entry.compactionThreshold !== undefined ? { compactionThreshold: entry.compactionThreshold } : undefined),
 			...(entry.workPoolYieldItems !== undefined ? { workPoolYieldItems: entry.workPoolYieldItems } : undefined),
+			...(entry.spawnSpec !== undefined ? { spawnSpec: entry.spawnSpec } : undefined),
 		};
 	}
 	return init;

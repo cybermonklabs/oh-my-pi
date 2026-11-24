@@ -258,7 +258,15 @@ function createFactory(cwd: string, eventBus?: EventBus, owner: ReviveOwnerOptio
 	return createPersistedSubagentReviverFactory({
 		session: parentSession,
 		authStorage: owner.authStorage ?? ({} as never),
-		modelRegistry: owner.modelRegistry ?? ({ authStorage: {} } as ModelRegistry),
+		// A registry that holds no model and whose discovery finds none: a revive resolves a spawn spec's model there.
+		modelRegistry:
+			owner.modelRegistry ??
+			({
+				authStorage: {},
+				getAll: () => [],
+				refreshInBackground: () => {},
+				awaitBackgroundRefresh: async () => {},
+			} as unknown as ModelRegistry),
 		settings: owner.settings ?? Settings.isolated(),
 		enableLsp: true,
 		eventBus,
@@ -361,6 +369,7 @@ describe("persisted subagent revival", () => {
 		const preparedExtensions: PreparedExtension[] = [
 			{
 				path: "<owner-policy>",
+				scope: "inline",
 				resolvedPath: "<owner-policy>",
 				factory: pi => {
 					pi.registerTool({
@@ -628,10 +637,11 @@ describe("persisted subagent revival", () => {
 			maxTokens: 8192,
 		});
 
-	/** A warm registry stub holding exactly `models`. */
+	/** A warm registry stub holding exactly `models`, whose discovery finds no other. */
 	const stubRegistry = (models: Model[]) =>
 		({
 			authStorage: {},
+			refreshInBackground: () => {},
 			awaitBackgroundRefresh: async () => {},
 			getAvailable: () => models,
 			getAll: () => models,

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `discoverExtensionPaths()` and `discoverSessionExtensionPaths()` return `{ path, scope }` entries instead of path strings, as do the `deferredPaths` of `loadSessionExtensions()`; `AgentSession.extensionPaths`, `AgentSessionConfig.extensionPaths` and `ToolSession.extensionPaths` list such entries, and each `PreparedExtension` carries the `scope` its extension was found at (`project`, `user`, `explicit` or `inline`)
+
 ### Added
 
 - Tray cards now mark subagents that are only waiting on their own agents or jobs (`wait`, `vibe_wait`), so Tern shows them apart from subagents doing work
@@ -31,6 +35,7 @@
 
 - The bash tool's description tells the agent to run a system program by path (`/usr/bin/x`) only after the builtin's output proved wrong.
 - The bash tool's visualization keeps a one-line awk, jq, regex or other embedded program highlighted where it appears in the command; only multi-line programs move below it behind a `⟦awk ↓⟧`-style chip.
+- `loadExtensions()` and `CreateAgentSessionOptions.preloadedExtensionPaths` also take `{ path, scope }` entries; a bare path, or a prepared extension given to `bindPreparedExtensions()` without a `scope`, is read as `explicit`
 
 ### Fixed
 
@@ -60,6 +65,10 @@
 - Fixed the batch `task` tool rejecting a JSON-string `tasks` payload with a misleading "Missing `tasks`" error; promoted payloads now also have their double-encoded item prose repaired ([#20190](https://github.com/can1357/oh-my-pi/pull/20190) by [@arfoux](https://github.com/arfoux))
 - Claude Code plugin skills, commands and agents now resolve `${CLAUDE_PLUGIN_ROOT}` / `${OMP_PLUGIN_ROOT}` in their Markdown bodies, so plugins that point at bundled scripts work ([#20165](https://github.com/can1357/oh-my-pi/issues/20165), [#20186](https://github.com/can1357/oh-my-pi/pull/20186) by [@koeria](https://github.com/koeria))
 - `omp -e <path>` keeps the instant first frame, so a slow terminal reply no longer switches the keyboard protocol after keys were typed ([#20158](https://github.com/can1357/oh-my-pi/issues/20158), [#20193](https://github.com/can1357/oh-my-pi/pull/20193) by [@koeria](https://github.com/koeria))
+- Fixed a parked subagent revived from its stored transcript running on other settings than when revived in memory (its model, thinking level, tools, LSP and cache-warming values, and wake-turn time limit); both revives now build from one spawn spec stored in `session_init`
+- Fixed an edited `session_init` record widening what a subagent revived from it may do: its ids and artifacts directory now come from the live registry entry, its credential source and workspace roots from the live parent (the root session where the parent is not live), its cost gate and prepared extensions from that session whatever the record's list of live inputs names, and its extension roots from that session too, without their explicit list where the record leaves them out; its task depth and wake limits are held to the live parent chain and settings, its cache warming is held to `streaming` as every spawn sets it, the workspace roots of its file's header are dropped, and of its stored settings overlay only the settings a spawn writes are restored
+- Fixed a subagent revived from its stored transcript after the root session moved to another directory being built in the root's directory while its tools ran in its own: it now builds in its own directory, where it finds its project's custom tools, MCP servers, extensions, custom commands and memory; where its live parent (or the root) works in another directory, it takes none of that directory's custom-tool paths, MCP manager, or project and user extensions (it discovers those, plugins included, in its own directory under the root session's extension policy, and keeps only that session's explicit and inline extensions), builds on the main thread, and still masks that project's secrets (`.omp/secrets.yml`) beside its own
+- Fixed a session's task tool offering the agents that the first session in the same directory had discovered under other extension roots (such as another session's `--extension` agents under `--no-extensions`); each task tool now lists the agents of its own session's extension roots
 
 ### Removed
 
