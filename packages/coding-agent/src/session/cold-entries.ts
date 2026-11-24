@@ -32,6 +32,7 @@ import { compactionKeptStart } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, stringifyJson } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
+import { assertAccountPrivateDir } from "../utils/owner-private-dir";
 import { type BlobStore, isBlobRef } from "./blob-store";
 import {
 	approvedPlanFileOf,
@@ -739,33 +740,18 @@ interface DecompressedBlock {
 let openFailureLogged = false;
 
 /**
- * Throw unless `dir` is a directory, not a link to one, that account `uid`
- * owns and no other account can enter: `mkdirSync` takes a directory that
- * exists as it is, which another account could have made first.
+ * Make a store's file under `os.tmpdir()/omp-cold-<uid>/`, a directory that
+ * account `uid` owns alone, and unlink it once open. Throws when the file
+ * cannot be made (`os.tmpdir()` read-only, under a regular file, full, out of
+ * descriptors) or the directory is not the account's alone.
  */
-function assertPrivateDirectory(dir: string, uid: number): void {
-	const stat = fs.lstatSync(dir);
-	if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o077) !== 0) {
-		throw new Error(`${dir} is not a directory this account owns alone`);
-	}
-}
-
-/**
- * Make a store's file under `os.tmpdir()/omp-cold-<uid>/`, a directory the
- * account owns alone, and unlink it once open. Throws when the file cannot
- * be made (`os.tmpdir()` read-only, under a regular file, full, out of
- * descriptors), the directory is not the account's alone, or the platform has
- * no account ids to check the directory's owner against.
- */
-function openStoreFile(): StoreHandle {
+function openStoreFile(uid: number): StoreHandle {
 	// One directory per account: `os.tmpdir()` is shared between accounts on
 	// Linux and the directory is 0700, so under one shared name the first
 	// account would own it and every other account's open would fail.
-	const uid = process.getuid?.();
-	if (uid === undefined) throw new Error("this platform has no account id to check the store directory's owner");
 	const dir = path.join(os.tmpdir(), `omp-cold-${uid}`);
 	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-	assertPrivateDirectory(dir, uid);
+	assertAccountPrivateDir(dir, uid, "Older session entry store directory");
 	const file = path.join(dir, `${process.pid}-${crypto.randomUUID()}.jsonl`);
 	const fd = fs.openSync(file, "wx+", 0o600);
 	try {
@@ -801,14 +787,14 @@ interface CachedRecord {
  * Normally a file under `os.tmpdir()/omp-cold-<uid>/`, a directory the account
  * owns alone, unlinked as soon as it is open (its disk is freed when the
  * descriptor closes, and a killed process leaves nothing). Otherwise the
- * records are kept in memory: on Windows ({@link open}), where that file
- * cannot be made, and from a failed write to it on (a full disk), they are
- * zstd-compressed in blocks of whole records of at most
- * {@link WRITE_BATCH_BYTES} (a larger record alone); the records gathered for
- * the next block stay as bytes, and the records the file already holds are
- * read from it. A read of a record in a block decompresses
- * that block, and the reads after it in the same synchronous pass share it
- * while they stay in that block, so a pass over the records in store order
+ * records are kept in memory: where the platform has no account ids (Windows,
+ * see {@link open}), where that file cannot be made, and from a failed write
+ * to it on (a full disk), they are zstd-compressed in blocks of whole records
+ * of at most {@link WRITE_BATCH_BYTES} (a larger record alone); the records
+ * gathered for the next block stay as bytes, and the records the file already
+ * holds are read from it. A read of a record in a block decompresses that
+ * block, and the reads after it in the same synchronous pass share it while
+ * they stay in that block, so a pass over the records in store order
  * decompresses each block once; the block is dropped as soon as the pass ends
  * (in a microtask), leaving only the parsed records in the record cache. No
  * other directory is used. A record is the entry exactly as the manager held
@@ -856,18 +842,20 @@ export class ColdEntryStore {
 	#hydrations = 0;
 
 	/**
-	 * A new store: over a file, or in memory on Windows and where its file
-	 * cannot be made (`os.tmpdir()` read-only, under a regular file, full, out
-	 * of descriptors, or its directory not one the account owns alone), which
-	 * last is logged once per process with the reason.
+	 * A new store: over a file, or in memory where the platform has no account
+	 * ids (Windows) and where its file cannot be made (`os.tmpdir()` read-only,
+	 * under a regular file, full, out of descriptors, or its directory not one
+	 * the account owns alone), which last is logged once per process with the
+	 * reason.
 	 */
 	static open(blobs: BlobStore): ColdEntryStore {
-		// A Windows file takes the access list of its directory, and nothing tells
-		// whether another account made `omp-cold` in a shared temporary directory
-		// first: it could read the records, which hold the entries unmasked.
-		if (os.platform() === "win32") return new ColdEntryStore(blobs, undefined);
+		// Without an account id there is no owner to check the store directory
+		// against, and a file takes its directory's access list (Windows): the
+		// records, which hold the entries unmasked, stay in memory instead.
+		const uid = process.getuid?.();
+		if (uid === undefined) return new ColdEntryStore(blobs, undefined);
 		try {
-			return new ColdEntryStore(blobs, openStoreFile());
+			return new ColdEntryStore(blobs, openStoreFile(uid));
 		} catch (error) {
 			if (!openFailureLogged) {
 				openFailureLogged = true;

@@ -23,6 +23,7 @@ import {
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { coldDirIn } from "../helpers/account-id";
 import { HAS_PROC_FD, isUnder } from "../helpers/open-descriptors";
 
 /** Larger than any value an entry before the cut keeps in memory. */
@@ -32,12 +33,6 @@ const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 const RUNS_AS_ROOT = process.getuid?.() === 0;
 /** Windows has no account ids or POSIX modes, so a shared store directory cannot be made there. */
 const HAS_POSIX_OWNERS = process.platform !== "win32" && process.getuid !== undefined;
-
-/** This account's store directory under `tmp`. */
-function coldDirIn(tmp: string): string {
-	const uid = process.getuid?.();
-	return path.join(tmp, uid === undefined ? "omp-cold" : `omp-cold-${uid}`);
-}
 
 function assistant(text: string): AssistantMessage {
 	return {

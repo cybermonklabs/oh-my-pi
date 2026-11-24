@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ConcatSink, countNewlines, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import { digestStream } from "../utils/file-hash";
+import { assertAccountPrivateDir } from "../utils/owner-private-dir";
 import {
 	childDirNames,
 	childKeyName,
@@ -354,11 +355,26 @@ interface FullBody {
 }
 
 /**
- * A full-write body written to a temporary file, unlinked once open, so the
- * lines a caller hands over are not held a second time while the publish
- * waits in the path queue. It is read back through its descriptor.
+ * A full-write body read from its lines once, when the write is queued, and
+ * kept until its publish (and any read-back) has settled: so the publish
+ * stores the bytes the lines held then, whatever changes in the entries
+ * after, and the lines a caller hands over are not held a second time while
+ * the publish waits in the path queue. A private file ({@link BodySpool}) or
+ * compressed blocks in memory ({@link BodySnapshot}).
  */
-class BodySpool {
+interface KeptBody {
+	readonly byteLength: number;
+	readonly title: SessionTitleUpdate | undefined;
+	/** The body in chunks of at most {@link LINE_STREAM_CHUNK} bytes, each a buffer of its own. */
+	chunks(): AsyncGenerator<Uint8Array>;
+	/** The whole body as one string, for a backend that has no streamed full write. */
+	text(): string;
+	/** Free what the body holds; a later read throws. */
+	close(): void;
+}
+
+/** A {@link KeptBody} written to a temporary file, unlinked once open, and read back through its descriptor. */
+class BodySpool implements KeptBody {
 	readonly #fd: number;
 	#closed = false;
 
@@ -370,7 +386,6 @@ class BodySpool {
 		this.#fd = fd;
 	}
 
-	/** The body in reads of {@link LINE_STREAM_CHUNK} bytes, each a buffer of its own. */
 	async *chunks(): AsyncGenerator<Uint8Array> {
 		for (let position = 0; position < this.byteLength;) {
 			const buffer = Buffer.allocUnsafe(Math.min(LINE_STREAM_CHUNK, this.byteLength - position));
@@ -381,7 +396,6 @@ class BodySpool {
 		}
 	}
 
-	/** The whole body as one string, for a backend that has no streamed full write. */
 	text(): string {
 		const bytes = Buffer.allocUnsafe(this.byteLength);
 		for (let position = 0; position < bytes.byteLength;) {
@@ -412,14 +426,72 @@ function readAt(fd: number, buffer: Uint8Array, position: number): Promise<numbe
 	return promise;
 }
 
+/** zstd level of a {@link BodySnapshot}'s blocks, the cold store's level for its blocks. */
+const SNAPSHOT_ZSTD_LEVEL = 3;
+
+/**
+ * A {@link KeptBody} kept in memory where no private spool file can be made
+ * (a platform without account ids, Windows): the UTF-8 bytes of its lines,
+ * zstd-compressed in blocks of at most {@link LINE_STREAM_CHUNK} bytes, each
+ * ending on a character boundary, so no string or buffer as long as the body
+ * is held.
+ */
+class BodySnapshot implements KeptBody {
+	#blocks: readonly Uint8Array[] | undefined;
+
+	constructor(
+		blocks: readonly Uint8Array[],
+		readonly byteLength: number,
+		readonly title: SessionTitleUpdate | undefined,
+	) {
+		this.#blocks = blocks;
+	}
+
+	async *chunks(): AsyncGenerator<Uint8Array> {
+		for (const block of this.#heldBlocks()) yield Bun.zstdDecompressSync(block);
+	}
+
+	text(): string {
+		let text = "";
+		for (const block of this.#heldBlocks()) text += Bun.zstdDecompressSync(block).toString("utf-8");
+		return text;
+	}
+
+	close(): void {
+		this.#blocks = undefined;
+	}
+
+	/** The blocks, until {@link close}: a read after it would publish an empty body. */
+	#heldBlocks(): readonly Uint8Array[] {
+		if (!this.#blocks) throw new Error("A session rewrite's body was read after it was released");
+		return this.#blocks;
+	}
+}
+
+/**
+ * Snapshot `lines` into a {@link BodySnapshot}, iterating them once, counting
+ * their bytes and reading the title slot from their {@link LinesHead}, as the
+ * spool does ({@link spoolLines}).
+ */
+function snapshotLines(lines: Iterable<string>): BodySnapshot {
+	const head = new LinesHead();
+	const blocks: Uint8Array[] = [];
+	let bytes = 0;
+	for (const chunk of encodeLines(head.note(lines), true)) {
+		blocks.push(Bun.zstdCompressSync(chunk, { level: SNAPSHOT_ZSTD_LEVEL }));
+		bytes += chunk.byteLength;
+	}
+	return new BodySnapshot(blocks, bytes, head.title());
+}
+
 /**
  * The head of a full write's lines, which its title slot and the header's
  * session id are read from: the lines through the second newline (the title
  * slot is read to the first, the session id at most to the second), at most
  * those that make up the first {@link LINE_STREAM_CHUNK} UTF-16 units, and
- * always the whole first line. The spool ({@link spoolLines}) and a write
- * streamed from the lines ({@link measureLines}) both read it here, so they
- * read the same title.
+ * always the whole first line. The spool ({@link spoolLines}), the snapshot
+ * ({@link snapshotLines}) and a write streamed from the lines
+ * ({@link measureLines}) all read it here, so they read the same title.
  */
 class LinesHead {
 	#text = "";
@@ -448,23 +520,18 @@ class LinesHead {
 }
 
 /**
- * Spool `lines` to a new file under {@link spoolDir}, unlinked once open,
- * iterating them once, counting their bytes and reading the title slot from
- * their {@link LinesHead}. Throws when the directory or the file cannot be
- * made, opened or written, and when the directory is not one this account
- * owns that no other account can enter (another account can make the shared
- * name first, or plant a symlink there) or the platform has no account ids to
- * check its owner against. A file it opened is closed and removed.
+ * Spool `lines` to a new file under {@link spoolDir} of account `uid`,
+ * unlinked once open, iterating them once, counting their bytes and reading
+ * the title slot from their {@link LinesHead}. Throws when the directory or
+ * the file cannot be made, opened or written, and when the directory is not
+ * one this account owns that no other account can enter (another account can
+ * make the shared name first, or plant a symlink there). A file it opened is
+ * closed and removed.
  */
-function spoolLines(lines: Iterable<string>): BodySpool {
-	const uid = process.getuid?.();
-	if (uid === undefined) throw new Error("This platform has no account id to check a session spool directory's owner");
+function spoolLines(lines: Iterable<string>, uid: number): BodySpool {
 	const dir = spoolDir(uid);
 	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-	const st = fs.lstatSync(dir);
-	if (!st.isDirectory() || st.uid !== uid || (st.mode & 0o077) !== 0) {
-		throw new Error(`Session spool directory ${dir} is not a private directory owned by this user`);
-	}
+	assertAccountPrivateDir(dir, uid, "Session spool directory");
 	const file = path.join(dir, `${process.pid}-${Snowflake.next()}.spool`);
 	const fd = fs.openSync(file, "wx+", 0o600);
 	try {
@@ -473,7 +540,7 @@ function spoolLines(lines: Iterable<string>): BodySpool {
 		const bytes = writeLinesToDescriptorSync(fd, head.note(lines));
 		return new BodySpool(fd, bytes, head.title());
 	} catch (err) {
-		new BodySpool(fd, 0, undefined).close();
+		fs.closeSync(fd);
 		fs.rmSync(file, { force: true });
 		throw err;
 	}
@@ -814,10 +881,11 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Streaming {@link writeTextSync}: spools `lines` to a temporary file and
-	 * publishes it from there, so the body is never one string. On Windows, and
-	 * when the spool cannot be used, it streams the lines to the backend
-	 * instead (see {@link #linesBody}). A subclass or spy that intercepts
+	 * Streaming {@link writeTextSync}: reads `lines` once, into a temporary
+	 * file, or, where the platform has no account ids, into compressed blocks
+	 * in memory, and publishes the body from there, so it is never one string.
+	 * When the spool cannot be used it streams the lines to the backend instead
+	 * (see {@link #linesBody}). A subclass or spy that intercepts
 	 * {@link writeTextSync} still sees every full rewrite: the lines are then
 	 * joined and routed through it.
 	 */
@@ -851,55 +919,46 @@ export class IndexedSessionStorage implements SessionStorage {
 		};
 	}
 
-	#spoolBody(path: string, spool: BodySpool): FullBody {
+	/** The body `kept` holds, published from it, and compared with it after a failed publish. */
+	#keptBody(path: string, kept: KeptBody): FullBody {
 		return {
-			byteLength: spool.byteLength,
-			title: spool.title,
+			byteLength: kept.byteLength,
+			title: kept.title,
 			publish: (mtimeMs, expectedSize) =>
 				this.#backend.writeFullStream
-					? this.#backend.writeFullStream(
-							path,
-							spool.chunks(),
-							spool.byteLength,
-							mtimeMs,
-							spool.title,
-							expectedSize,
-						)
-					: this.#backend.writeFull(path, spool.text(), mtimeMs, spool.title, expectedSize),
+					? this.#backend.writeFullStream(path, kept.chunks(), kept.byteLength, mtimeMs, kept.title, expectedSize)
+					: this.#backend.writeFull(path, kept.text(), mtimeMs, kept.title, expectedSize),
 			// Compared by size and SHA-256, chunk by chunk: only a backend without
 			// `readChunks` reads the stored side whole.
 			isStored: async () => {
 				const stored = await digestStream(this.#backendChunks(path, 0));
-				if (stored.bytes !== spool.byteLength) return false;
-				return stored.hash === (await digestStream(spool.chunks())).hash;
+				if (stored.bytes !== kept.byteLength) return false;
+				return stored.hash === (await digestStream(kept.chunks())).hash;
 			},
-			release: () => spool.close(),
+			release: () => kept.close(),
 		};
 	}
 
 	/**
-	 * The body of a full rewrite of `lines`: spooled to a temporary file, or,
-	 * when the spool cannot be made, opened or written (`os.tmpdir()` read-only
-	 * or full, or its spool directory not private to this account), streamed
-	 * from the lines themselves ({@link #streamedBody}), with one warning per
-	 * store. That reads `lines` again, so an iterator, which yields its lines
-	 * only once, is read into an array first. A throw from `lines` itself (an
-	 * entry that cannot be read or serialized) is no spool failure: it
-	 * propagates as it is, with no second read and no warning. On Windows no
-	 * spool is made: a file there takes the access list of its directory, and
-	 * nothing tells whether another account made the shared name first. The
-	 * lines stream to the backend, or, for a backend with no streamed write,
-	 * are joined into one string, as the spool is read back for it.
+	 * The body of a full rewrite of `lines`, read from them now: spooled to a
+	 * private temporary file, or, where the platform has no account id
+	 * (Windows), kept compressed in memory ({@link snapshotLines}), since
+	 * there is no owner to check a spool directory against and a file takes
+	 * its directory's access list. When the spool cannot be made, opened or
+	 * written (`os.tmpdir()` read-only or full, or its spool directory not
+	 * private to this account), it is streamed from the lines themselves
+	 * ({@link #streamedBody}), with one warning per store. That reads `lines`
+	 * again, so an iterator, which yields its lines only once, is read into an
+	 * array first. A throw from `lines` itself (an entry that cannot be read or
+	 * serialized) is no spool failure: it propagates as it is, with no second
+	 * read and no warning.
 	 */
 	#linesBody(path: string, lines: Iterable<string>): FullBody {
+		const uid = process.getuid?.();
+		if (uid === undefined) return this.#keptBody(path, snapshotLines(lines));
 		// An iterator is its own iterable, and yields its lines only once.
 		const iterator: unknown = lines[Symbol.iterator]();
 		const readable: Iterable<string> = iterator === lines ? Array.from(lines) : lines;
-		if (os.platform() === "win32") {
-			return this.#backend.writeFullStream
-				? this.#streamedBody(path, readable, undefined)
-				: this.#textBody(path, Array.from(readable).join(""));
-		}
 		let linesFailed = false;
 		// Only a throw from `readable` lands in the catch: a throw from the spool's
 		// own writes ends the iteration through `return`, which runs no catch.
@@ -912,15 +971,14 @@ export class IndexedSessionStorage implements SessionStorage {
 			}
 		}
 		try {
-			return this.#spoolBody(path, spoolLines(noteLinesFailure()));
+			return this.#keptBody(path, spoolLines(noteLinesFailure(), uid));
 		} catch (err) {
 			if (linesFailed) throw err;
 			const spoolError = toError(err).message;
 			if (!this.#spoolFailureLogged) {
 				this.#spoolFailureLogged = true;
-				const uid = process.getuid?.();
 				logger.warn("Session rewrites stream straight to the store: their spool file cannot be used", {
-					dir: uid === undefined ? undefined : spoolDir(uid),
+					dir: spoolDir(uid),
 					error: spoolError,
 				});
 			}
@@ -929,18 +987,17 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * The body of a full rewrite of `lines` that has no spool: measured now
-	 * ({@link measureLines}), and read from the lines again when it publishes,
-	 * through the backend's streamed write ({@link streamLines}), so it is
-	 * never one value; a backend without one cannot take it, and its rewrite
-	 * fails without reading the stored copy back. A publish that fails
+	 * The body of a full rewrite of `lines` whose spool cannot be used:
+	 * measured now ({@link measureLines}), and read from the lines again when
+	 * it publishes, through the backend's streamed write ({@link streamLines}),
+	 * so it is never one value; a backend without one cannot take it, and its
+	 * rewrite fails without reading the stored copy back. A publish that fails
 	 * replaces nothing, and is logged as an error naming the session, the path
-	 * and the cause (and `spoolError`, why the spool could not be used, where
-	 * one was tried), besides failing the write as any publish does; the next
+	 * and the cause, besides failing the write as any publish does; the next
 	 * full rewrite tries the spool, and this, again. A refusal the caller
 	 * resolves (a size conflict, a lost claim) is not logged.
 	 */
-	#streamedBody(path: string, lines: Iterable<string>, spoolError: string | undefined): FullBody {
+	#streamedBody(path: string, lines: Iterable<string>, spoolError: string): FullBody {
 		const measured = measureLines(lines);
 		const writeFullStream = this.#backend.writeFullStream;
 		return {
@@ -962,7 +1019,7 @@ export class IndexedSessionStorage implements SessionStorage {
 					);
 				} catch (err) {
 					if (!(err instanceof SessionWriteConflictError) && !(err instanceof SessionLeaseLostError)) {
-						logger.error("Session rewrite not stored: streaming it to the store failed", {
+						logger.error("Session rewrite not stored: its spool cannot be used, and streaming it failed", {
 							session: measured.sessionId,
 							path,
 							error: toError(err).message,

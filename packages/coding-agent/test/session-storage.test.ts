@@ -17,6 +17,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { type SessionTitleUpdate, serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { logger } from "@oh-my-pi/pi-utils";
+import { withoutAccountId } from "./helpers/account-id";
 
 class ControlledTitleUpdateBackend implements SessionStorageBackend {
 	readonly #sessionPath: string;
@@ -876,6 +877,32 @@ class StreamingMemoryBackend extends MemoryBackend {
 	}
 }
 
+/** A {@link StreamingMemoryBackend} whose streamed full write waits, before it reads a chunk, until the test lets it go on. */
+class HeldStreamBackend extends StreamingMemoryBackend {
+	#entered = Promise.withResolvers<void>();
+	#release = Promise.withResolvers<void>();
+
+	/** Resolve once a streamed full write has started and waits. */
+	entered(): Promise<void> {
+		return this.#entered.promise;
+	}
+
+	/** Let the waiting streamed full write go on, and hold the next one. */
+	release(): void {
+		const release = this.#release;
+		this.#entered = Promise.withResolvers();
+		this.#release = Promise.withResolvers();
+		release.resolve();
+	}
+
+	override async writeFullStream(path: string, chunks: AsyncIterable<Uint8Array>, byteLength: number): Promise<void> {
+		const release = this.#release.promise;
+		this.#entered.resolve();
+		await release;
+		await super.writeFullStream(path, chunks, byteLength);
+	}
+}
+
 /** An indexed storage that records the whole text each full rewrite hands its own text writers. */
 class InterceptingIndexedStorage extends IndexedSessionStorage {
 	readonly intercepted: string[] = [];
@@ -939,12 +966,13 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 		},
 	);
 
-	// If this regresses, a full rewrite on Windows writes the session's unmasked body to a file under
-	// the temporary directory, where a directory another account made first gives that account read access.
-	it("makes no spool file on Windows: streams the lines to a backend that takes a stream, and joins them for one that does not", async () => {
+	// If this regresses, a full rewrite where the platform gives no account id (Windows) writes the
+	// session's unmasked body to a file under the temporary directory, which takes that directory's
+	// access list, and no directory owner can be checked against an account id there.
+	it("makes no spool file without an account id: streams the body to a backend that takes a stream, and hands it whole to one that does not", async () => {
 		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-spool-windows-"));
 		vi.spyOn(os, "tmpdir").mockReturnValue(tmp);
-		vi.spyOn(os, "platform").mockReturnValue("win32");
+		withoutAccountId();
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const streaming = new StreamingMemoryBackend();
@@ -976,6 +1004,64 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 		} finally {
 			vi.restoreAllMocks();
 			await fsp.rm(tmp, { recursive: true, force: true });
+		}
+	});
+
+	// If this regresses, a full rewrite where the platform gives no account id (Windows) reads the
+	// session's entries again as it publishes, so an entry patched after the rewrite was queued fails
+	// the publish ("Session rewrite not stored"): the synchronous rewrite reports a disk failure and the
+	// atomic one throws to its caller.
+	it("publishes the bytes the lines held when the rewrite was queued without an account id, whatever they hold after", async () => {
+		withoutAccountId();
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		vi.spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			const backend = new HeldStreamBackend();
+			const storage = new IndexedSessionStorage(backend);
+			await storage.initialize();
+			// A session's rewrite reads its lines from its live entries on each pass over them.
+			const live = { data: "as queued" };
+			const liveLines: Iterable<string> = {
+				*[Symbol.iterator]() {
+					yield lines[0]!;
+					const entry = {
+						type: "custom",
+						customType: "n",
+						id: "a",
+						parentId: null,
+						timestamp: "t1",
+						data: live.data,
+					};
+					yield `${JSON.stringify(entry)}\n`;
+				},
+			};
+			const queued = Array.from(liveLines).join("");
+			const outcome = (write: Promise<void>): Promise<string> =>
+				write.then(
+					() => "stored",
+					(error: unknown) => String(error),
+				);
+
+			storage.writeLinesSync("/sessions/sync.jsonl", liveLines, { expectedSize: null });
+			await backend.entered();
+			// Same length, other bytes: only the content changed.
+			live.data = "patched!!";
+			backend.release();
+			const sync = await outcome(storage.drain());
+			live.data = "as queued";
+			const atomicWrite = storage.writeLinesAtomic("/sessions/atomic.jsonl", liveLines, { expectedSize: null });
+			await backend.entered();
+			live.data = "patched!!";
+			backend.release();
+			const atomic = await outcome(atomicWrite);
+
+			expect({ sync, atomic, stored: Object.fromEntries(backend.sessions) }).toEqual({
+				sync: "stored",
+				atomic: "stored",
+				stored: { "/sessions/sync.jsonl": queued, "/sessions/atomic.jsonl": queued },
+			});
+		} finally {
+			vi.restoreAllMocks();
 		}
 	});
 

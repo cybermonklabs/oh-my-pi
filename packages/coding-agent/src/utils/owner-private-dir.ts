@@ -25,6 +25,24 @@ export function ownerPrivateDirError(stat: OwnerPrivateDirStat, expectedUid: num
 }
 
 /**
+ * Throw unless `dir`, read with `lstat`, is a directory (not a link to one)
+ * that account `uid` owns with mode 0700: `mkdirSync` takes a directory that
+ * exists as it is, which another account could have made first, or left open
+ * to others. Unlike {@link assertOwnerPrivateDir} it changes nothing, so a
+ * caller that cannot use the directory can go without it.
+ *
+ * @param label Human-readable directory role prefixed to the thrown message.
+ */
+export function assertAccountPrivateDir(dir: string, uid: number, label: string): void {
+	const stat = fs.lstatSync(dir);
+	const reason = ownerPrivateDirError(
+		{ isSymlink: stat.isSymbolicLink(), isDir: stat.isDirectory(), uid: stat.uid, mode: stat.mode },
+		uid,
+	);
+	if (reason) throw new Error(`${label} ${dir} ${reason}`);
+}
+
+/**
  * Harden a directory pulled from a shared temp base, where another local user
  * may have created the path first.
  *

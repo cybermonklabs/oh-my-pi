@@ -14,15 +14,13 @@ import {
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { getBlobsDir, getConfigRootDir, logger, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { coldDirIn, withoutAccountId } from "../helpers/account-id";
 import { HAS_PROC_FD } from "../helpers/open-descriptors";
 
 /** Larger than any value a cold entry keeps in memory. */
 const BODY = "x".repeat(4096);
-/** This account's store directory under `tmp`. */
-function coldDirIn(tmp: string): string {
-	return path.join(tmp, `omp-cold-${process.getuid?.()}`);
-}
 const COLD_DIR = coldDirIn(os.tmpdir());
+const TIMESTAMP = "2026-01-01T00:00:00.000Z";
 
 function usage() {
 	return {
@@ -48,49 +46,51 @@ function assistant(text: string) {
 	};
 }
 
+/** A transcript record of a fixture: its id, and whatever else the record holds. */
+type FixtureRecord = { readonly id: string } & Record<string, unknown>;
+
+/**
+ * Write `records` to `dir/session.jsonl` after a header, each stamped
+ * {@link TIMESTAMP} and, unless it names its own parent, the child of the
+ * record before it (the first a root). The session id is the directory's
+ * name, so no two tests share a session (a manager another test left open
+ * keeps its writer claim on its session).
+ */
+async function writeTranscript(dir: string, records: readonly FixtureRecord[]): Promise<string> {
+	const header: SessionHeader = {
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		id: path.basename(dir),
+		timestamp: TIMESTAMP,
+		cwd: dir,
+	};
+	const entries = records.map(({ id, ...fields }, index) => ({
+		type: fields.type,
+		id,
+		parentId: index === 0 ? null : records[index - 1]!.id,
+		timestamp: TIMESTAMP,
+		...fields,
+	}));
+	const file = path.join(dir, "session.jsonl");
+	await Bun.write(file, [header, ...entries].map(line => `${JSON.stringify(line)}\n`).join(""));
+	return file;
+}
+
 /**
  * A session whose compaction keeps `u2` on: `u1` and `a1` lie before the cut,
- * and so does `m1`, a model change, which stays whole by kind. Its id is the
- * directory's name, so no two tests share a session (a manager another test
- * left open keeps its writer claim on its session).
+ * and so does `m1`, a model change, which stays whole by kind. Every entry
+ * carries `runtime` when given.
  */
-async function writeSession(dir: string, runtime?: RuntimeIdentity): Promise<string> {
-	const file = path.join(dir, "session.jsonl");
-	const timestamp = "2026-01-01T00:00:00.000Z";
-	const id = path.basename(dir);
-	const header: SessionHeader = { type: "session", version: CURRENT_SESSION_VERSION, id, timestamp, cwd: dir };
-	const entries = [
-		header,
-		{
-			type: "message",
-			id: "u1",
-			parentId: null,
-			timestamp,
-			message: { role: "user", content: `u1 ${BODY}`, timestamp: 1 },
-		},
-		{ type: "model_change", id: "m1", parentId: "u1", timestamp, model: "anthropic/claude-sonnet-4-20250514" },
-		{ type: "message", id: "a1", parentId: "m1", timestamp, message: assistant(`a1 ${BODY}`) },
-		{
-			type: "message",
-			id: "u2",
-			parentId: "a1",
-			timestamp,
-			message: { role: "user", content: `u2 ${BODY}`, timestamp: 3 },
-		},
-		{
-			type: "compaction",
-			id: "c1",
-			parentId: "u2",
-			timestamp,
-			summary: `c1 ${BODY}`,
-			firstKeptEntryId: "u2",
-			tokensBefore: 1000,
-		},
-		{ type: "message", id: "a2", parentId: "c1", timestamp, message: assistant(`a2 ${BODY}`) },
+function writeSession(dir: string, runtime?: RuntimeIdentity): Promise<string> {
+	const records: FixtureRecord[] = [
+		{ type: "message", id: "u1", message: { role: "user", content: `u1 ${BODY}`, timestamp: 1 } },
+		{ type: "model_change", id: "m1", model: "anthropic/claude-sonnet-4-20250514" },
+		{ type: "message", id: "a1", message: assistant(`a1 ${BODY}`) },
+		{ type: "message", id: "u2", message: { role: "user", content: `u2 ${BODY}`, timestamp: 3 } },
+		{ type: "compaction", id: "c1", summary: `c1 ${BODY}`, firstKeptEntryId: "u2", tokensBefore: 1000 },
+		{ type: "message", id: "a2", message: assistant(`a2 ${BODY}`) },
 	];
-	const lines = entries.map(record => JSON.stringify(runtime && record !== header ? { ...record, runtime } : record));
-	await Bun.write(file, lines.map(line => `${line}\n`).join(""));
-	return file;
+	return writeTranscript(dir, runtime ? records.map(record => ({ ...record, runtime })) : records);
 }
 
 function open(file: string, coldStore = true): Promise<SessionManager> {
@@ -178,21 +178,10 @@ const SIGNED_IMAGE = Buffer.alloc(3000, 3).toString("base64");
  * session holds them, and `a2` a signed tool call with {@link SIGNED_IMAGE};
  * `a1` and `a3` hold text a full write cuts. Ends at `u4`.
  */
-async function writeImageSession(dir: string, images: [StoredImage, StoredImage]): Promise<string> {
-	const file = path.join(dir, "session.jsonl");
-	const timestamp = "2026-01-01T00:00:00.000Z";
-	const header: SessionHeader = {
-		type: "session",
-		version: CURRENT_SESSION_VERSION,
-		id: path.basename(dir),
-		timestamp,
-		cwd: dir,
-	};
-	const user = (id: string, parentId: string | null, image?: StoredImage) => ({
+function writeImageSession(dir: string, images: [StoredImage, StoredImage]): Promise<string> {
+	const user = (id: string, image?: StoredImage): FixtureRecord => ({
 		type: "message",
 		id,
-		parentId,
-		timestamp,
 		message: {
 			role: "user",
 			content: [
@@ -202,30 +191,19 @@ async function writeImageSession(dir: string, images: [StoredImage, StoredImage]
 			timestamp: 1,
 		},
 	});
-	const reply = (id: string, parentId: string, text = BODY) => ({
+	const reply = (id: string, text = BODY): FixtureRecord => ({
 		type: "message",
 		id,
-		parentId,
-		timestamp,
 		message: assistant(`${id} ${text}`),
 	});
-	const compaction = (id: string, parentId: string, firstKeptEntryId: string) => ({
-		type: "compaction",
-		id,
-		parentId,
-		timestamp,
-		summary: `${id} ${BODY}`,
-		firstKeptEntryId,
-		tokensBefore: 1000,
-	});
-	const entries = [
-		header,
-		user("u1", null, images[0]),
-		reply("a1", "u1", UNCUT_TEXT),
-		user("u2", "a1"),
-		compaction("c1", "u2", "u2"),
+	return writeTranscript(dir, [
+		user("u1", images[0]),
+		reply("a1", UNCUT_TEXT),
+		user("u2"),
+		{ type: "compaction", id: "c1", summary: `c1 ${BODY}`, firstKeptEntryId: "u2", tokensBefore: 1000 },
 		{
-			...reply("a2", "c1"),
+			type: "message",
+			id: "a2",
 			message: {
 				...assistant(`a2 ${BODY}`),
 				content: [
@@ -240,12 +218,10 @@ async function writeImageSession(dir: string, images: [StoredImage, StoredImage]
 				],
 			},
 		},
-		user("u3", "a2", images[1]),
-		reply("a3", "u3", UNCUT_TEXT),
-		user("u4", "a3"),
-	];
-	await Bun.write(file, entries.map(record => `${JSON.stringify(record)}\n`).join(""));
-	return file;
+		user("u3", images[1]),
+		reply("a3", UNCUT_TEXT),
+		user("u4"),
+	]);
 }
 
 /** A `tool_result_prune` record that blanks `r1` of {@link writeToolResultSession}. */
@@ -264,22 +240,18 @@ const R2_PATCH = {
 	data: { patches: [{ entryId: "r2", message: { content: [{ type: "text", text: "r2 patched" }] } }] },
 };
 
-/** A transcript record of a fixture: its id, and whatever else the record holds. */
-type FixtureRecord = { readonly id: string } & Record<string, unknown>;
-
 /**
  * A session whose compaction `c1` keeps `u2` on: before the cut, `r1` and
  * `r2`, tool results holding an image each as a blob reference the way a
  * written session holds them, load cold, and `records` follow `r2`. Ends at
- * `a3`. Each entry's parent is the entry before it.
+ * `a3`.
  */
-async function writeToolResultSession(
+function writeToolResultSession(
 	dir: string,
 	images: [StoredImage, StoredImage],
 	records: readonly FixtureRecord[] = [],
 ): Promise<string> {
-	const timestamp = "2026-01-01T00:00:00.000Z";
-	const call = (id: string, callId: string) => ({
+	const call = (id: string, callId: string): FixtureRecord => ({
 		type: "message",
 		id,
 		message: {
@@ -288,7 +260,7 @@ async function writeToolResultSession(
 			stopReason: "toolUse",
 		},
 	});
-	const result = (id: string, callId: string, image: StoredImage) => ({
+	const result = (id: string, callId: string, image: StoredImage): FixtureRecord => ({
 		type: "message",
 		id,
 		message: {
@@ -303,7 +275,7 @@ async function writeToolResultSession(
 			timestamp: 2,
 		},
 	});
-	const entries: readonly FixtureRecord[] = [
+	return writeTranscript(dir, [
 		{ type: "message", id: "u1", message: { role: "user", content: `u1 ${BODY}`, timestamp: 1 } },
 		call("a1", "call-1"),
 		result("r1", "call-1", images[0]),
@@ -313,25 +285,7 @@ async function writeToolResultSession(
 		{ type: "message", id: "u2", message: { role: "user", content: `u2 ${BODY}`, timestamp: 3 } },
 		{ type: "compaction", id: "c1", summary: `c1 ${BODY}`, firstKeptEntryId: "u2", tokensBefore: 1000 },
 		{ type: "message", id: "a3", message: assistant(`a3 ${BODY}`) },
-	];
-	const header: SessionHeader = {
-		type: "session",
-		version: CURRENT_SESSION_VERSION,
-		id: path.basename(dir),
-		timestamp,
-		cwd: dir,
-	};
-	const lines = [
-		header,
-		...entries.map((record, index) => ({
-			...record,
-			parentId: index === 0 ? null : entries[index - 1]!.id,
-			timestamp,
-		})),
-	];
-	const file = path.join(dir, "session.jsonl");
-	await Bun.write(file, lines.map(line => `${JSON.stringify(line)}\n`).join(""));
-	return file;
+	]);
 }
 
 describe("cold entry store", () => {
@@ -617,14 +571,15 @@ describe("cold entry store", () => {
 		},
 	);
 
-	// If this regresses, a session on Windows writes its older entries unmasked to a file under the
-	// temporary directory, which another account that made `omp-cold` there first can read.
-	it("keeps older entries compressed in memory on Windows, making no file under the temporary directory", async () => {
+	// If this regresses, a session where the platform gives no account id (Windows) writes its older
+	// entries unmasked to a file under the temporary directory, which takes that directory's access list,
+	// and no directory owner can be checked against an account id there.
+	it("keeps older entries compressed in memory without an account id, making no file under the temporary directory", async () => {
 		using dir = TempDir.createSync("@omp-cold-entries-");
 		using tmp = TempDir.createSync("@omp-cold-tmpdir-");
 		const file = await writeSession(dir.path());
 		vi.spyOn(os, "tmpdir").mockReturnValue(tmp.path());
-		vi.spyOn(os, "platform").mockReturnValue("win32");
+		withoutAccountId();
 
 		const manager = await open(file);
 		try {
@@ -644,14 +599,14 @@ describe("cold entry store", () => {
 	// before it, and each read of one of those records decompresses the large one with it.
 	it("gives a record larger than a batch a block of its own, so a read of the record before it decompresses only that one", () => {
 		using tmp = TempDir.createSync("@omp-cold-batch-");
-		vi.spyOn(os, "platform").mockReturnValue("win32");
+		withoutAccountId();
 		const store = ColdEntryStore.open(new BlobStore(tmp.join("blobs")));
 		try {
 			const user = (id: string, content: string): SessionEntry => ({
 				type: "message",
 				id,
 				parentId: null,
-				timestamp: "2026-01-01T00:00:00.000Z",
+				timestamp: TIMESTAMP,
 				message: { role: "user", content, timestamp: 1 },
 			});
 			const small = user("small", `small ${BODY}`);
@@ -810,7 +765,7 @@ describe("cold entry store", () => {
 			const manager = await open(file);
 			try {
 				const coldBefore = isColdEntry(entry(manager, "r1"));
-				const prune = { ...R1_PRUNE, parentId: "a3", timestamp: "2026-01-01T00:00:00.000Z" };
+				const prune = { ...R1_PRUNE, parentId: "a3", timestamp: TIMESTAMP };
 				fs.appendFileSync(file, `${JSON.stringify(prune)}\n`);
 				const reads = vi.spyOn(BlobStore.prototype, "getSync");
 				// This manager's next append finds the record past what it wrote, and keeps it.
@@ -863,26 +818,12 @@ describe("cold entry store", () => {
 			const cacheBytes = 16 * 1024 * 1024;
 			const blobs = new BlobStore(getBlobsDir());
 			const imageBytes = 3 * 1024 * 1024;
-			const timestamp = "2026-01-01T00:00:00.000Z";
-			const lines: object[] = [
-				{
-					type: "session",
-					version: CURRENT_SESSION_VERSION,
-					id: path.basename(dir.path()),
-					timestamp,
-					cwd: dir.path(),
-				},
-			];
-			let parentId: string | null = null;
-			const ids: string[] = [];
-			for (let index = 0; index < 8; index++) {
+			const ids = Array.from({ length: 8 }, (_, index) => `u${index}`);
+			const screenshots = ids.map((id, index): FixtureRecord => {
 				const { ref } = blobs.putSync(Buffer.alloc(imageBytes, index + 1), { extension: "png" });
-				const id = `u${index}`;
-				lines.push({
+				return {
 					type: "message",
 					id,
-					parentId,
-					timestamp,
 					message: {
 						role: "user",
 						content: [
@@ -891,30 +832,13 @@ describe("cold entry store", () => {
 						],
 						timestamp: 1,
 					},
-				});
-				ids.push(id);
-				parentId = id;
-			}
-			lines.push(
-				{
-					type: "message",
-					id: "keep",
-					parentId,
-					timestamp,
-					message: { role: "user", content: "keep", timestamp: 2 },
-				},
-				{
-					type: "compaction",
-					id: "c1",
-					parentId: "keep",
-					timestamp,
-					summary: "summary",
-					firstKeptEntryId: "keep",
-					tokensBefore: 1000,
-				},
-			);
-			const file = path.join(dir.path(), "session.jsonl");
-			await Bun.write(file, lines.map(line => `${JSON.stringify(line)}\n`).join(""));
+				};
+			});
+			const file = await writeTranscript(dir.path(), [
+				...screenshots,
+				{ type: "message", id: "keep", message: { role: "user", content: "keep", timestamp: 2 } },
+				{ type: "compaction", id: "c1", summary: "summary", firstKeptEntryId: "keep", tokensBefore: 1000 },
+			]);
 			const manager = await open(file);
 			try {
 				expect(manager.coldStoreStats().coldEntries).toBe(8);
@@ -964,7 +888,7 @@ describe("cold entry store", () => {
 					type: "message",
 					id: "u1",
 					parentId: null,
-					timestamp: "2026-01-01T00:00:00.000Z",
+					timestamp: TIMESTAMP,
 					message: {
 						role: "user",
 						content: [
