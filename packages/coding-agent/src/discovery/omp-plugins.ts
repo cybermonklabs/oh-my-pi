@@ -37,13 +37,13 @@ import {
 	parseRequestIdFormat,
 	scanSkillsFromDir,
 } from "./helpers";
-import {
-	listOmpExtensionRoots,
-	OMP_PLUGINS_PROVIDER_ID as PROVIDER_ID,
-	type OmpExtensionRoot,
-} from "./omp-extension-roots";
+import { listOmpExtensionRoots, type OmpExtensionRoot } from "./omp-extension-roots";
 import { resolvePluginStdioPaths } from "./substitute-plugin-root";
 
+// Its own literal, not `OMP_PLUGINS_PROVIDER_ID`: `omp-extension-roots` reaches this module again through its own
+// imports, so the registration below can run while that module is still loading (a test that imports it first read
+// the binding before its initialization).
+const PROVIDER_ID = "omp-plugins";
 const DISPLAY_NAME = "OMP Extension Packages";
 const DESCRIPTION =
 	"Sub-discovery (skills, hooks, tools, commands, rules, prompts, .mcp.json) inside extension packages";
