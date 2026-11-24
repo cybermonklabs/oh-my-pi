@@ -378,15 +378,16 @@ describe("retain.execute", () => {
 		const requests = retainBatchSpy.mock.calls.map(([, items]) =>
 			items.map(item => ({ content: item.content, tags: item.tags })),
 		);
-		expect(requests).toEqual(
+		// Same-call items share a publication mtime, so their order within a request is unspecified.
+		const projectRequest = requests.find(items => items.some(item => item.tags !== undefined));
+		expect(projectRequest).toHaveLength(2);
+		expect(projectRequest).toEqual(
 			expect.arrayContaining([
-				[
-					{ content: "pi uses tabs", tags: ["project:pi"] },
-					{ content: "pi builds with bun", tags: ["project:pi"] },
-				],
-				[{ content: "the user prefers zsh across projects", tags: undefined }],
+				{ content: "pi uses tabs", tags: ["project:pi"] },
+				{ content: "pi builds with bun", tags: ["project:pi"] },
 			]),
 		);
+		expect(requests).toContainEqual([{ content: "the user prefers zsh across projects", tags: undefined }]);
 	});
 
 	it("sends global and project items in one untagged request when the scope has no project tags", async () => {
@@ -402,10 +403,15 @@ describe("retain.execute", () => {
 		await registeredState?.flushRetainQueue();
 
 		expect(retainBatchSpy).toHaveBeenCalledTimes(1);
-		expect(retainBatchSpy.mock.calls[0][1].map(item => ({ content: item.content, tags: item.tags }))).toEqual([
-			{ content: "shared fact", tags: undefined },
-			{ content: "explicitly global fact", tags: undefined },
-		]);
+		const items = retainBatchSpy.mock.calls[0][1].map(item => ({ content: item.content, tags: item.tags }));
+		// Same-call items share a publication mtime, so their order within the batch is unspecified.
+		expect(items).toHaveLength(2);
+		expect(items).toEqual(
+			expect.arrayContaining([
+				{ content: "shared fact", tags: undefined },
+				{ content: "explicitly global fact", tags: undefined },
+			]),
+		);
 	});
 
 	it("retains items enqueued without a scope as project-scoped", async () => {
