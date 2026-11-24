@@ -548,6 +548,12 @@ def fmt_secs(s):
     return f"{s / 60:.1f} min" if s >= 90 else f"{s:.0f} s"
 
 
+# The rows whose units are shards a test moves between (ts-ca: files by sorted index; workspace:
+# nextest's count partitions), where a known-failure entry may name `*` for any unit. On the other
+# rows a unit is a binary or a suite, and a test's name is unique only inside it.
+ANY_UNIT_ROWS = ("ts-ca", "workspace")
+
+
 def known_rows(path):
     """known-failures.txt's entries as lists of fields: five, or six for a `skips: ` entry."""
     rows = []
@@ -558,13 +564,15 @@ def known_rows(path):
             f = line.rstrip("\n").split("\t")
             if len(f) != (6 if len(f) > 4 and f[4].startswith("skips: ") else 5):
                 sys.exit(f"known-failures.txt: not five tab-separated fields (six for `skips: `): {line!r}")
+            if f[2] == "*" and f[0] not in ANY_UNIT_ROWS:
+                sys.exit(f"known-failures.txt: unit `*` only on the rows {', '.join(ANY_UNIT_ROWS)}: {line!r}")
             rows.append(f)
     return rows
 
 
 def read_known(path):
     """known-failures.txt's failures: (row, user, unit, test) -> reason. A unit of `*` is any unit
-    of the row."""
+    of the row (ANY_UNIT_ROWS only)."""
     return {tuple(f[:4]): f[4] for f in known_rows(path) if len(f) == 5}
 
 
@@ -1384,6 +1392,15 @@ def selftest():
     check("a * entry whose test passed or is in no shard is to be removed",
           ("`gone`: no longer in its row (listed for: no WebMCP)" in out, "`t`: passed (listed for: no WebMCP)" in out, rc),
           (True, True, 1))
+    # `*` only on the rows whose units are shards: on the set rows a test's name is unique only in
+    # its binary (CiReview at 55a3d02c).
+    open(known_file, "w").write("set-runner\trunner\t*\tk\tthe host's zsh\n")
+    try:
+        read_known(known_file)
+        refused = False
+    except SystemExit:
+        refused = True
+    check("a * entry on a set row is refused", refused, True)
     json.dump(result("ts-ca", "shard 3/10", "runner", "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
               open(os.path.join(res, "ca3.json"), "w"))
     open(known_file, "w").write("# none\n")

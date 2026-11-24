@@ -7,8 +7,10 @@
 # in others. When it fails, its job runs it again alone by name (set.sh: at most twice, as the same
 # user, from the same binary); its failure reads KNOWN only when a retry passed, and NEW when every
 # try failed. It is not listed for removal when it passes (it still is when its test no longer exists).
-# A unit of `*` names the test in any unit of its row: a coding-agent shard holds the test files
-# whose sorted index mod 10 is the shard's, so a file added before a test moves it to another shard.
+# A unit of `*` names the test in any unit of its row, on the rows whose units are shards (ts-ca,
+# workspace: sc.py ANY_UNIT_ROWS): a coding-agent shard holds the test files whose sorted index mod
+# 10 is the shard's, so a file added before a test moves it to another shard. On the other rows a
+# test's name is unique only inside its unit, and sc.py refuses `*` there.
 # A known self-skip, whose reason starts with `skips: `, has a sixth field: the start of the skip
 # line the test prints (each `{...}` any text). A test that skipped itself reads KNOWN when each of
 # its skip lines starts as an entry of its row, user and test says; one user's entry never covers
