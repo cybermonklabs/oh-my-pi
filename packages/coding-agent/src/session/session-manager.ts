@@ -54,7 +54,7 @@ import {
 	type ColdBoundary,
 	coldBoundary,
 	coldCutPathIndex,
-	keptWholeByKind,
+	coldKindOf,
 	readCompactions,
 	streamedKeptStart,
 } from "./cold-entry-policy";
@@ -4646,7 +4646,7 @@ export class SessionManager {
 					const keptStart = streamedKeptStart(intake.entries, entry, intake.cooled, id => intake.index.has(id));
 					for (; intake.cooled < keptStart; intake.cooled++) {
 						const older = intake.entries[intake.cooled]!;
-						if (keptWholeByKind(older)) continue;
+						if (coldKindOf(older).wholeByKind) continue;
 						convertToColdEntry(older, openStore, { imagesExternalized: true, paced: true });
 					}
 				}

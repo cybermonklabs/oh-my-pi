@@ -8,7 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
-import { keptWholeByKind } from "@oh-my-pi/pi-coding-agent/session/cold-entry-policy";
+import { coldKindOf } from "@oh-my-pi/pi-coding-agent/session/cold-entry-policy";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -71,7 +71,7 @@ describe("the entry_patch record patchEntries writes, as the cold store reads it
 		// The record, then the other custom entry, as the cold store holds each once the cut passed them.
 		const held = [recordId, otherId].map(id => {
 			const entry = id === undefined ? undefined : manager.getEntry(id);
-			return entry && { type: entry.type, wholeByKind: keptWholeByKind(entry), cold: isColdEntry(entry) };
+			return entry && { type: entry.type, wholeByKind: coldKindOf(entry).wholeByKind, cold: isColdEntry(entry) };
 		});
 		expect(held).toEqual([
 			{ type: "custom", wholeByKind: false, cold: true },

@@ -60,9 +60,9 @@ export const COLD_JSON_MAX_BYTES = 320;
 
 /** Fields that always stay data: the tree structure every walk reads. */
 const ENTRY_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["type", "id", "parentId", "timestamp", "activeLeafId"]);
-/** The fields of a cold entry of a {@link ColdKind.coreCustom} type that stay data. */
+/** The fields of a cold entry of a `ColdKind.coreCustom` type (cold-entry-policy.ts) that stay data. */
 const CORE_CUSTOM_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set([...ENTRY_FIELDS_IN_MEMORY, "customType"]);
-/** The fields of a cold entry of a {@link ColdKind.coreCustom} type that stay data while small. */
+/** The fields of a cold entry of a `ColdKind.coreCustom` type (cold-entry-policy.ts) that stay data while small. */
 const CORE_CUSTOM_FIELDS_KEPT_WHILE_SMALL: ReadonlySet<string> = new Set(["runtime"]);
 const MESSAGE_FIELDS_IN_MEMORY: ReadonlySet<string> = new Set(["role"]);
 /**
@@ -453,14 +453,14 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
  * each value of the entry too large to keep ({@link COLD_STRING_MAX_UNITS},
  * {@link COLD_JSON_MAX_BYTES}), each value of its `message` but the small ones
  * of {@link MESSAGE_FIELDS_KEPT_WHILE_SMALL}, and for a type of
- * {@link ColdKind.coreCustom} every value but the tree fields, `customType`
+ * `ColdKind.coreCustom` (cold-entry-policy.ts) every value but the tree fields, `customType`
  * and a small `runtime`. An entry made whole from this
  * store whose values are unchanged takes its former record back instead of
  * writing a new one. Pass `imagesExternalized` for an entry parsed from a
  * session file, whose image data are blob references already, and `paced`
  * from a load, which converts a whole transcript in one burst: the record's
  * bytes count toward the next full collection
- * ({@link COLLECT_AFTER_RECORD_BYTES}), as a read's do. Returns false,
+ * (`COLLECT_AFTER_RECORD_BYTES` in cold-entry-store.ts), as a read's do. Returns false,
  * changing nothing, when every value stays, `entry` is cold already, the
  * store is closed, or the record cannot be made (an image the blob store
  * cannot take; reported once per store): the entry then stays whole.

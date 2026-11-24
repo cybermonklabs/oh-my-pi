@@ -351,7 +351,7 @@ export class ColdEntryStore {
 		releaseStoreHandle(this.#handle);
 	}
 
-	/** Write one record; its entry becomes cold through {@link convertToColdEntry}. Only while {@link writable}. */
+	/** Write one record; its entry becomes cold through `convertToColdEntry` (cold-entries.ts). Only while {@link writable}. */
 	append(data: Buffer): ColdRecord {
 		if (!this.writable) throw new Error("A cold entry store that closed cannot take a record.");
 		// A record that would take the batch past its size starts the next one,

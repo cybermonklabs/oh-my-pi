@@ -121,11 +121,6 @@ export function coldKindOf(entry: SessionEntry): ColdKind {
 	return kinds.entryTypes.get(entry.type) ?? GOES_COLD;
 }
 
-/** Whether `entry` stays whole wherever it lies, by its kind ({@link coldKindOf}). */
-export function keptWholeByKind(entry: SessionEntry): boolean {
-	return coldKindOf(entry).wholeByKind;
-}
-
 /** The compactions a context build on a path can start from. */
 export interface ReadCompactions {
 	/**
@@ -150,7 +145,7 @@ export function readCompactions(path: readonly SessionEntry[], model: Model | un
  * or a user's edit of it (what the to-do list restores from), the newest to-do
  * HUD choice and the newest mode change (what a resume restores; of an older
  * one a resume reads only its mode and the approved plan file it names, both
- * in memory: {@link COLD_APPROVED_PLAN_FILE}), the notebook revisions every
+ * in memory: `COLD_APPROVED_PLAN_FILE` in cold-message.ts), the notebook revisions every
  * context build reads ({@link contextNotesEntriesRead}), and the request the
  * context of an `experimental-context-rollover` compaction takes from before
  * its kept entries ({@link rolloverRequest}), for each of `compactions`.
@@ -257,7 +252,7 @@ export interface ColdBoundary {
  * the cut on, but the records no context or turn reads there:
  * {@link ColdKind.storedPastCut}, and a compaction older than every compaction a
  * build reads, as the stale entry a snapcompact frame rescue replaces), those
- * kept whole by kind ({@link keptWholeByKind}) and those kept whole by
+ * kept whole by kind (`wholeByKind` of {@link coldKindOf}) and those kept whole by
  * position on the path ({@link entriesKeptWholeOnPath}). An entry off the
  * current path is cold wherever it lies.
  */
@@ -279,7 +274,7 @@ export function coldBoundary(
 	const cold = new Uint8Array(entries.length);
 	for (let index = 0; index < entries.length; index++) {
 		const entry = entries[index]!;
-		if (!whole.has(entry) && !keptWholeByKind(entry)) cold[index] = 1;
+		if (!whole.has(entry) && !coldKindOf(entry).wholeByKind) cold[index] = 1;
 	}
 	return { cold };
 }
