@@ -307,7 +307,7 @@ Core tools live in the same namespace as `read` and `bash`. Pin the active set w
 
 - `checkpoint` — mark conversation state for a later collapse-and-report.
 - `rewind` — prune exploratory context, keep a concise report.
-- `retain` — queue durable facts into the active memory bank.
+- `retain` — record what was said or done, by whom, when and why, in the active memory bank.
 - `recall` — search the memory bank for raw memories.
 - `reflect` — synthesize an answer over the bank.
 - `memory_edit` — update, forget, or invalidate stored memories by id.

@@ -8,5 +8,5 @@ This agent has local Mnemopi long-term memory.
 {{#if autoRetain}}
 - Completed turns are also retained automatically.
 {{else}}
-- Turns are not retained automatically: only what you store with `{{toolRefs.retain}}` is kept.
+- Turns are not retained automatically: a memory is kept only when it is stored on purpose, as with `{{toolRefs.retain}}`.
 {{/if}}

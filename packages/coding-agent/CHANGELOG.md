@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- With `mnemopi.autoRetain` off, and in subagents, the Mnemopi memory instructions no longer tell the agent that completed turns are retained automatically
+- With `mnemopi.autoRetain` off, and in subagents, the Mnemopi memory instructions no longer tell the agent that completed turns are retained automatically. The line follows the settings and the session's task depth, so a session's first system prompt, rendered before the memory backend starts, is right too
 
 ## [18.18.6] - 2026-11-09
 

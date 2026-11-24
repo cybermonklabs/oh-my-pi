@@ -93,7 +93,9 @@ describe("Mnemopi memory instructions", () => {
 
 	it("say turns are not retained automatically when autoRetain is off", async () => {
 		const text = await instructions(startSession(false));
-		expect(text).toContain("Turns are not retained automatically: only what you store with `retain` is kept.");
+		expect(text).toContain(
+			"Turns are not retained automatically: a memory is kept only when it is stored on purpose, as with `retain`.",
+		);
 		expect(text).not.toContain("are retained automatically");
 	});
 
@@ -102,6 +104,20 @@ describe("Mnemopi memory instructions", () => {
 		const text = await instructions(startSession(true, parent));
 		expect(text).toContain("Turns are not retained automatically");
 		expect(text).not.toContain("are retained automatically");
+	});
+
+	it("follow the settings and the task depth before the session's Mnemopi state exists", async () => {
+		const render = async (autoRetain: boolean, taskDepth: number) =>
+			(await mnemopiBackend.buildDeveloperInstructions(
+				"/tmp",
+				"/tmp",
+				Settings.isolated({ "mnemopi.autoRetain": autoRetain }),
+				undefined,
+				taskDepth,
+			)) ?? "";
+		expect(await render(true, 0)).toContain(RETAINED);
+		expect(await render(false, 0)).toContain(NOT_RETAINED);
+		expect(await render(true, 1)).toContain(NOT_RETAINED);
 	});
 });
 
