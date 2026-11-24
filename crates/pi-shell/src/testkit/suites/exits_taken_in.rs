@@ -610,29 +610,32 @@ fn a_trap_waits_until_the_builtin_that_took_the_exit_in_is_done() {
 // before `echo end`. Without the withdrawal `end` comes first; before the
 // trap waited for the builtin, the trap ran inside `jobs >/dev/null`. The
 // `chld` lines: the subshell, `/x/quiet`, the held job, then the loop,
-// which runs on for many turns and ends by itself.
+// which runs on for many turns and ends by itself. The run has no time
+// bound of its own: it ends when that loop has run its 3,000 turns of shell
+// arithmetic, which beside a loaded node's other work take tens of seconds,
+// and the test runner's limit is the only time bound. A wall-clock bound
+// here decided the test by the node's load, not by the order it checks.
 #[test]
 fn a_builtin_that_goes_on_unanswered_withdraws_its_ask() {
-	let (out, err, _) = run_bounded(
+	let (out, err, _) = run(
+		&World::new(),
 		"trap 'echo chld' CHLD; /x/held & ( i=0; while [ $i -lt 3000 ]; do i=$((i+1)); done ) & \
 		 b=$!; disown %2; (:); /x/quiet; jobs >/dev/null; echo end; while kill -0 $b 2>/dev/null; \
 		 do :; done",
 		false,
-		Fault::None,
-		"no fault",
 	);
 	assert_eq!(out, "chld\nchld\nchld\nend\nchld\n");
 	assert_eq!(err, "");
 }
 
 /// How long [`run_bounded`] waits: at least twice the longest correct run
-/// it bounds, read where these tests run. The longest is the withdraw test
-/// (`a_builtin_that_goes_on_unanswered_withdraws_its_ask`) on gVisor beside
-/// 64 busy loops with this file's other tests in parallel: 18.2-28.4 s in
-/// 16 runs, while the file took 45-92 s, so the test took at most 0.46 of
-/// the file's time. On a node where the file took up to 120 s the test ran
-/// past 30 s in 10 of 10 runs: about 0.46 × 120 s ≈ 55 s there. 120 s is
-/// more than twice that.
+/// it bounds, read where these tests run. Its runs are those of
+/// `an_ask_outlives_a_snapshot` (14 scripts, each with a pause and with a
+/// snapshot every 1, 2, 3, 5 and 8 ops), whose failure was a run that never
+/// ends. On gVisor beside 192 busy loops, with this file's other tests in
+/// parallel, that whole test took 15.1-34.8 s in 20 runs (on runc beside
+/// 64 busy loops, 5.2-7.8 s), so no one of its runs took longer than
+/// 34.8 s; 120 s is more than three times that.
 const RUN_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// [`run_with`] on a world of its own, in a thread of its own: a run that
