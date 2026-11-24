@@ -168,6 +168,19 @@ pub struct PendingBreak {
 	pub redir:  u32,
 }
 
+/// `extdebug`: the stages of the `Spawn` at frame `frame` of vproc `vproc`
+/// whose DEBUG trap, run in the shell before the fork, failed (their
+/// entries): bash forks no process for such a stage. Moved to the job's
+/// vproc when the pipeline is a background job's. Kept by the kernel
+/// ([`super::Kernel::debug_skips`]), not the vproc or frame (each at its
+/// idle-size bound), and only while a skip waits for its `Spawn`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugSkip {
+	pub vproc:   Vpid,
+	pub frame:   u32,
+	pub entries: Vec<u32>,
+}
+
 /// The terminal of the session a vproc runs in when it is not the shell's
 /// ([`VprocZsh::ctty`]).
 #[derive(Clone, Debug, Default)]
@@ -780,13 +793,20 @@ impl LastBg {
 }
 
 /// A background job whose pid is still to be settled, kept by the kernel
-/// ([`super::Kernel::bangs`]) for the vproc that may settle it. The first
-/// command that vproc dispatches decides: the external spawned as the job's
-/// lone command (or `exec`'d, or a pipeline's last stage's) makes the job
-/// known by that program's OS pid ([`Job::os_pid`], `$!`); anything else
-/// (a builtin, a native task, a subshell, a non-`exec` external in a
-/// compound body, the vproc's end) leaves its virtual pid. Readers of the
-/// pid (`$!`, `jobs -l`/`-p`/`-x`) wait for the decision.
+/// ([`super::Kernel::bangs`]) for the vproc that may settle it. The
+/// external spawned as the job's lone command (or `exec`'d, or a
+/// pipeline's last stage's) makes the job known by that program's OS pid
+/// ([`Job::os_pid`], `$!`). Another program (or callout) the job runs,
+/// also in a command substitution, subshell or pipeline stage of its own
+/// ([`super::Kernel::bang_kin`]), keeps its virtual pid: the job waits for
+/// it, and it may wait for the shell. Builtins, loops, command
+/// substitutions and subshells decide nothing, as bash's forked child may
+/// still `exec` its program after them. The job keeps its virtual pid when
+/// it ends, when a redirection or `.` would wait on a FIFO or pipe, or
+/// once it would make a reader of the pid (`$!`, `jobs -l`/`-p`/`-x`), who
+/// waits for the decision, wait: it is stopped or waits for something
+/// outside itself, or has run a scheduler slice since the reader parked
+/// (`Shell::decide_waited_bangs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bang {
 	/// The vproc that decides: the job's own, or the subshell a callout of
@@ -875,7 +895,8 @@ impl Vproc {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BangStage {
 	/// The job's body is one simple command: its external is the program
-	/// (bash's subshell `exec`s it).
+	/// (bash's subshell `exec`s it). `eval`, `.` and `source` as that
+	/// command run their text at this stage.
 	Lone,
 	/// Only an `exec`'d external is (`{ exec cmd; } &`, a function called
 	/// as the lone command).
@@ -995,6 +1016,10 @@ pub struct Run {
 	pub too_long_to_host:  bool,
 	/// [`Script::refusals_to_host`](super::Script::refusals_to_host).
 	pub refusals_to_host:  bool,
+	/// A host callout's subshell runs it (`nohup`, `timeout`, `xargs`,
+	/// `find -exec`): it stands for the external program the callout runs,
+	/// so its frame runs no DEBUG trap ([`FrameFlags::no_debug_trap`]).
+	pub callout:           bool,
 }
 
 /// What kind of activation a frame is.
@@ -1101,6 +1126,11 @@ pub enum ScriptKind {
 		/// An ERR trap run by `set -e`: the shell exits with `status` when
 		/// the trap ends.
 		exit:          bool,
+		/// zsh: the `TRAPNAL` function this frame called ended by `return`
+		/// (zsh's `trapreturn`). Only such a non-zero status ends the
+		/// interrupted code; a function that falls off its end with one
+		/// does not.
+		returned:      bool,
 	},
 	/// Shell code a builtin runs as zsh's `execode`/`execstring` do with
 	/// a context name (`zstyle -e` values, `zregexparse` guards and
@@ -1146,6 +1176,56 @@ impl FrameKind {
 	}
 }
 
+/// Bits of a [`Frame`] that only a vproc's base frame or a run's first frame
+/// sets, two in one byte ([`Frame::flags`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameFlags(u8);
+
+impl FrameFlags {
+	const COMMAND_LOOP: u8 = 1;
+	const NO_DEBUG_TRAP: u8 = 2;
+
+	/// The base frame of a fork: a fatal error in it, run as a forked
+	/// simple command, reaches bash's command loop when its forking
+	/// shell's would have when it forked (bash's fork copies `top_level`).
+	/// Set from [`super::exec::fatal_reaches_command_loop`] of the forking
+	/// shell and read there.
+	#[must_use]
+	pub const fn command_loop(self) -> bool {
+		self.0 & Self::COMMAND_LOOP != 0
+	}
+
+	/// The base frame of a vproc that runs no DEBUG trap and keeps
+	/// `BASH_COMMAND`: a command or process substitution (bash's or zsh's) a
+	/// DEBUG trap action started (or one such substitution started), as
+	/// bash's and zsh's, so a trap that substitutes does not run itself again
+	/// without end (a subshell it starts runs the trap again, as bash's
+	/// does); and a host callout's subshell ([`Run::callout`]), which stands
+	/// for an external program.
+	#[must_use]
+	pub const fn no_debug_trap(self) -> bool {
+		self.0 & Self::NO_DEBUG_TRAP != 0
+	}
+
+	/// Sets [`Self::command_loop`].
+	pub const fn set_command_loop(&mut self, on: bool) {
+		self.set(Self::COMMAND_LOOP, on);
+	}
+
+	/// Sets [`Self::no_debug_trap`].
+	pub const fn set_no_debug_trap(&mut self, on: bool) {
+		self.set(Self::NO_DEBUG_TRAP, on);
+	}
+
+	const fn set(&mut self, bit: u8, on: bool) {
+		if on {
+			self.0 |= bit;
+		} else {
+			self.0 &= !bit;
+		}
+	}
+}
+
 /// One activation: a unit, a pc and its loop, case, time and redirection
 /// stacks.
 pub struct Frame {
@@ -1168,7 +1248,8 @@ pub struct Frame {
 	/// command substitution by re-parsing its text from the line of the
 	/// command that runs it, so its first command reports that line.
 	pub line_shift:        u32,
-	/// Exec op whose DEBUG trap has already run.
+	/// Exec op whose DEBUG trap has already run (for a `Spawn`, see
+	/// [`super::exec::SPAWN_DEBUG`]).
 	pub debug_pc:          Option<u32>,
 	/// Pseudo-traps installed in this function rather than inherited.
 	pub debug_trap_local:  bool,
@@ -1187,14 +1268,10 @@ pub struct Frame {
 	/// `set -e` is ignored: an `if`/`while`/`until` condition, a `&&`/`||`
 	/// list except its last command, a `!` pipeline.
 	pub ignore_errexit:    bool,
-	/// The base frame of a fork: a fatal error in it, run as a forked
-	/// simple command, reaches bash's command loop when its forking
-	/// shell's would have when it forked (bash's fork copies `top_level`).
-	/// Set from [`super::exec::fatal_reaches_command_loop`] of the forking
-	/// shell and read there. It takes the padding byte after `Frame`'s
-	/// fields smaller than 8 B (two `u32`s, two `Option<u32>`s and seven
-	/// `bool`s: 31 B), so `Frame` keeps its size.
-	pub command_loop:      bool,
+	/// Bits of a base frame ([`FrameFlags`]). One byte: it takes the padding
+	/// byte after `Frame`'s fields smaller than 8 B (two `u32`s, two
+	/// `Option<u32>`s and seven `bool`s: 31 B), so `Frame` keeps its size.
+	pub flags:             FrameFlags,
 	/// The base frame of a `( … )` child: the line bash reports for errors
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
@@ -1228,7 +1305,7 @@ impl Frame {
 			debug_errexit: false,
 			err_reported: false,
 			ignore_errexit: false,
-			command_loop: false,
+			flags: FrameFlags(0),
 			subshell_line: None,
 			getopts: None,
 		}

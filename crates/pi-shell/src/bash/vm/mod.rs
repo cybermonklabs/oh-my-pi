@@ -64,7 +64,7 @@ use crate::bash::{
 	diag::{Diag, DiagSite, render},
 	engine::Engine,
 	error::ShellError,
-	event::{AssignScope, Event, EventData, EventMask, Origin, OriginChain, OriginLink},
+	event::{AssignScope, Event, EventData, EventMask, Origin, OriginChain, OriginLink, WaitKey},
 	fd::{FdOrigin, FdRef, FdTable},
 	fs::File,
 	host::{EnvView, Host, StdFd, Verdict},
@@ -619,6 +619,25 @@ pub struct Kernel {
 	/// Background jobs whose pid is still to be settled
 	/// ([`proc::Bang`]): imaged (a restored job still decides).
 	pub bangs:              Vec<proc::Bang>,
+	/// `extdebug`: pipeline stages a failing DEBUG trap skips, waiting for
+	/// their `Spawn` ([`proc::DebugSkip`]), one list per vproc and frame:
+	/// imaged (a snapshot can fall between two stages' traps). A list whose
+	/// `Spawn` never ran (a trap `return`ed) is dropped when a `Spawn` at
+	/// that frame or above next runs its stage traps (also with the trap
+	/// gone: the pseudo-trap check stays set once a DEBUG trap was).
+	pub debug_skips:        Vec<proc::DebugSkip>,
+	/// `(job, ops)`: the ops what decides a background job's pid has run
+	/// since a reader of the pid parked ([`Shell::decide_waited_bangs`]);
+	/// dropped when the job settles. Not imaged: a restored shell gives a
+	/// waited job a new slice.
+	pub bang_spent:         Vec<(Vpid, u32)>,
+	/// `(child, vproc)`: an in-engine child the vproc that decides a job's
+	/// pid waits for (a command substitution, a subshell, a pipeline
+	/// stage), transitively ([`Kernel::bang_kin_add`]). A program such a
+	/// child runs is one the job waits for: the job keeps its virtual pid
+	/// when it starts. Dropped when the job settles; not imaged (a vpid is
+	/// never reused).
+	pub bang_kin:           Vec<(Vpid, Vpid)>,
 	/// `(job, OS pid)`: jobs settled on their program's OS pid during the
 	/// turn, written into the job tables and `$!` of every vproc by the
 	/// scheduler after it (`Shell::adopt`); empty between turns, not
@@ -761,6 +780,9 @@ impl Kernel {
 			exec_refusals: HashMap::new(),
 			reported_refusal: None,
 			bangs: Vec::new(),
+			debug_skips: Vec::new(),
+			bang_spent: Vec::new(),
+			bang_kin: Vec::new(),
 			settled: Vec::new(),
 			pid_owners: Vec::new(),
 			exits_asked: Vec::new(),
@@ -861,6 +883,16 @@ impl Kernel {
 			return;
 		};
 		let bang = self.bangs.swap_remove(i);
+		if !self.bang_spent.is_empty() {
+			self.bang_spent.retain(|&(job, _)| job != bang.job);
+		}
+		if self.bangs.is_empty() {
+			// Also the children of a vproc a job's decision moved from
+			// (`exec::retarget_bang`).
+			self.bang_kin.clear();
+		} else if !self.bang_kin.is_empty() {
+			self.bang_kin.retain(|&(_, decider)| decider != bang.vproc);
+		}
 		if let Some(pid) = os {
 			self.settled.push((bang.job, pid));
 			if bang.vproc != bang.job {
@@ -869,6 +901,28 @@ impl Kernel {
 		}
 		jobctl::bang_settled(self, bang.vproc, os);
 		self.ctl.notify();
+	}
+
+	/// `parent` started `child`, an in-engine child it waits for (a command
+	/// substitution, a subshell, a pipeline stage): when `parent` decides a
+	/// job's pid, or is such a child of the vproc that does, so is `child`
+	/// ([`Kernel::bang_kin`]).
+	pub fn bang_kin_add(&mut self, parent: Vpid, child: Vpid) {
+		if self.bangs.is_empty() {
+			return;
+		}
+		let decider = if self.bangs.iter().any(|b| b.vproc == parent) {
+			Some(parent)
+		} else {
+			self
+				.bang_kin
+				.iter()
+				.find(|&&(c, _)| c == parent)
+				.map(|&(_, d)| d)
+		};
+		if let Some(decider) = decider {
+			self.bang_kin.push((child, decider));
+		}
 	}
 
 	/// Next `$RANDOM` (0..=32767); the generator state is written through.
@@ -2000,6 +2054,7 @@ impl Shell {
 			exit_trap_started: false,
 			too_long_to_host: script.too_long_to_host,
 			refusals_to_host: script.refusals_to_host,
+			callout: false,
 		};
 		let stdio = match script.vproc {
 			VprocSel::Root => {
@@ -2200,6 +2255,9 @@ impl Shell {
 				.then_some((ran, left - used));
 			self.adopt(cx);
 			self.end_orphans(cx, Some(ran));
+			if !self.k.bangs.is_empty() {
+				self.decide_waited_bangs(ran, used);
+			}
 			self.job_events(cx);
 			if !self.k.exits_asked.is_empty() || !self.taking_in.is_empty() {
 				self.take_in_exits(ran);
@@ -2409,6 +2467,83 @@ impl Shell {
 		for vproc in seen {
 			self.k.settle_bang(vproc, None);
 		}
+	}
+
+	/// A reader of a background job's pid (`$!`, `jobs -p`, the job's
+	/// `[n] pid` line, a `wait` for it) parks until the job decides it
+	/// ([`proc::Bang`]). The job keeps its virtual pid once it would make
+	/// that reader wait: when what decides it is stopped, or waits for
+	/// anything but an in-engine child of its own (a command substitution,
+	/// a subshell), a program's launch or its own filesystem answer (a
+	/// child's, such as a FIFO open, is a wait: [`Self::bang_waits`]); or when
+	/// it has run a scheduler slice ([`SLICE`] ops) since the reader parked,
+	/// so a job that runs without end never holds the reader. Until then
+	/// the job runs on and may still `exec` its program, which gives it the
+	/// program's OS pid, as bash's forked child is known by its pid at once.
+	/// `ran` just ran `used` ops.
+	fn decide_waited_bangs(&mut self, ran: Vpid, used: u32) {
+		let mut i = 0;
+		while let Some(&bang) = self.k.bangs.get(i) {
+			let read = bang.stage != proc::BangStage::Callout
+				&& self.procs.iter().any(|p| {
+					p.blocked
+						.as_ref()
+						.is_some_and(|b| b.key == WaitKey::Proc(bang.job))
+				});
+			if !read {
+				i += 1;
+				continue;
+			}
+			let (waits, on_its_way) = self.bang_waits(bang.vproc, ran);
+			let spent = if let Some(at) = self.k.bang_spent.iter().position(|&(j, _)| j == bang.job) {
+				&mut self.k.bang_spent[at].1
+			} else {
+				self.k.bang_spent.push((bang.job, 0));
+				&mut self.k.bang_spent.last_mut().expect("just pushed").1
+			};
+			if on_its_way {
+				*spent = spent.saturating_add(used);
+			}
+			if waits || *spent >= SLICE {
+				// It leaves `bangs`: index `i` now holds the next one.
+				self.k.settle_bang(bang.vproc, None);
+			} else {
+				i += 1;
+			}
+		}
+	}
+
+	/// Whether `vproc`, which decides a job's pid, would wait (it is
+	/// stopped, or parked on anything but an in-engine child that is not
+	/// waiting itself, a program's launch or its own filesystem answer; a
+	/// cycle of vprocs parked on each other waits too), and whether `ran`
+	/// is on its way: `vproc` or a child it waits for, transitively. (Only
+	/// the job's own program can be launching: any other decides when it
+	/// starts, `bang_dispatch`.) A child's filesystem wait (a command
+	/// substitution, subshell, pipeline stage or job of the job's own) is a
+	/// wait: outside obash's pending-fs test mode only a FIFO open or read
+	/// pends, and it may wait for what the shell does after it reads `$!`.
+	/// The job's own FIFO opens and reads decide where they are made
+	/// (`redir::defer`, zsh's redirections, `.`).
+	fn bang_waits(&self, vproc: Vpid, ran: Vpid) -> (bool, bool) {
+		let mut v = vproc;
+		let mut on_its_way = false;
+		for _ in 0..=self.procs.len() {
+			on_its_way |= v == ran;
+			let Some(p) = self.procs.iter().find(|p| p.vpid == v) else {
+				return (false, on_its_way);
+			};
+			if p.stopped {
+				return (true, on_its_way);
+			}
+			match p.blocked.as_ref().map(|b| &b.key) {
+				None | Some(WaitKey::Spawn { .. }) => return (false, on_its_way),
+				Some(WaitKey::Fs { .. }) => return (v != vproc, on_its_way),
+				Some(WaitKey::Proc(child)) => v = *child,
+				Some(_) => return (true, on_its_way),
+			}
+		}
+		(true, on_its_way)
 	}
 
 	/// Child vproc `vpid` of `parent` ended with `status`: the parent's job
@@ -3470,7 +3605,9 @@ impl Vproc {
 		vp.trace_base = xtrace::level(self) - 1;
 		// bash's fork copies `top_level`: a fatal error in a forked simple
 		// command ends where its forking shell's would have.
-		frame.command_loop = exec::fatal_reaches_command_loop(self);
+		frame
+			.flags
+			.set_command_loop(exec::fatal_reaches_command_loop(self));
 		// Started from a context where `set -e` is ignored (the parent's op
 		// is a condition, or its frame runs in one): so is the child.
 		frame.ignore_errexit = self.frames.last().is_some_and(|f| {
