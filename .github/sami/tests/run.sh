@@ -804,6 +804,15 @@ ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strfti
 # says nothing (sami-checks run 45351216411: the macOS job read each
 # Linux-only flaky line as a target with no result).
 FLAKY="$B x::f" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='listed flaky' run K10-only-flaky-line-of-a-test-not-run-here 0 "Ran here, as .github/sami/only.txt names: $D m::strftime" '' 'exit 9'
+# X1-X3 (CiReview2 at 32e3af7a): a flaky test the RUST_TEST_ONLY run does run.
+# X1 failed, then passed: KNOWN, and the stub refuses an only-* invocation
+# without the retry flag. X2 failed on every attempt: NEW, exit 1. X3
+# passed: a notice.
+FJ='{ "type": "suite", "event": "started", "test_count": 2 }\n{ "type": "test", "name": "m::langinfo", "event": "failed", "stdout": "left: 1" }\n{ "type": "test", "name": "m::strftime", "event": "ok" }\n{ "type": "suite", "event": "failed", "passed": 1, "failed": 1, "ignored": 0, "measured": 0, "filtered_out": 1, "exec_time": 0.0 }\n'
+XPRE="if [ \"\$OWN_TARGET\" = $D ]; then has \"--flaky_test_attempts=^$D\\\$@3\"; f=\"\$(tpath $D)\"; a=\"\$(dirname \"\$f\")/test_attempts/attempt_1.log\"; mkdir -p \"\$(dirname \"\$a\")\"; printf '$FJ' >\"\$a\"; fakebin $D m::langinfo m::strftime p::canary;"
+FLAKY="$D m::langinfo" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='no result|Known failure, failed as expected' OWN_BODY="$XPRE FILTERED=1 FMT=json lt_out m::langinfo '' m::strftime '' >\"\$f\"; { cfg $D 'rust_test rule'; summary $D FLAKY \"\$a\" \"\$f\"; } >\"\$bep\"; exit 0; fi; own_default" run X1-only-flaky-ran-here-failed-then-passed 0 "Known flaky test, failed on 1 of 2 attempts and passed on another: $D m::langinfo" '' 'exit 9'
+FLAKY="$D m::langinfo" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='no result|Known failure, failed as expected|Known flaky test, failed on' OWN_BODY="$XPRE printf '$FJ' >\"\$f\"; { cfg $D 'rust_test rule'; summary $D FAILED \"\$a \$f\"; } >\"\$bep\"; exit 3; fi; own_default" run X2-only-flaky-ran-here-failed-every-attempt 1 "$D m::langinfo is listed flaky in .github/sami/rust-test-known-failures.txt, but failed on every attempt \\(2 of 2\\): NEW" '' 'exit 9'
+FLAKY="$D m::langinfo" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='no result|::error' run X3-only-flaky-ran-here-passed 0 "$D m::langinfo is listed flaky in .github/sami/rust-test-known-failures.txt and did not fail" '' 'exit 9'
 
 # --- rust-test-macos-inventory.sh ------------------------------------------------
 # irun <name> <want> <message regex> <targets> <mac binaries> <linux listings>
