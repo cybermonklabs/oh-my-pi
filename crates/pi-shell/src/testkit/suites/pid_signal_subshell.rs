@@ -104,12 +104,18 @@ fn a_signal_to_the_pid_of_a_nested_subshell_job_ends_the_inner_subshell() {
 const INNER: &str = "echo $BASHPID > /p; : > /r; while :; do :; done";
 
 // Failure mode: the signal also followed a `( … )` that is not the whole
-// body of its subshell (`( :; ( list ) )`, `true && ( list )`), where bash
-// forks a second process: the inner loop ended with the outer subshell,
-// where bash leaves it running.
+// body of its subshell (`( :; ( list ) )`, `true && ( list )`, and where
+// the subshell does more after it, `( ( list ); : )` and `( ! ( list ) )`),
+// where bash forks a second process: the inner loop ended with the outer
+// subshell, where bash leaves it running.
 #[test]
 fn a_signal_to_the_pid_of_a_subshell_job_spares_a_subshell_after_a_command() {
-	for job in [format!("( :; ( {INNER} ) )"), format!("true && ( {INNER} )")] {
+	for job in [
+		format!("( :; ( {INNER} ) )"),
+		format!("true && ( {INNER} )"),
+		format!("( ( {INNER} ); : )"),
+		format!("( ! ( {INNER} ) )"),
+	] {
 		let src = format!(
 			"{job} & b=$!; {STARTED}; read -r i < /p; kill $b; wait $b; echo st=$?; kill -0 $i && \
 			 echo running; kill $i"
