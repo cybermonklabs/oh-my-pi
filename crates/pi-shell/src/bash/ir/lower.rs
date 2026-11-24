@@ -1402,11 +1402,12 @@ impl Lower {
 					OpIr::Trim { pat, .. } => word(*pat),
 					OpIr::Replace { pat, rep, .. } => word(*pat) || rep.is_some_and(word),
 					OpIr::Case { pat, .. } => pat.is_some_and(word),
-					OpIr::None
-					| OpIr::Length
-					| OpIr::Indirect
-					| OpIr::PrefixNames { .. }
-					| OpIr::Transform(_) => false,
+					OpIr::None | OpIr::Length | OpIr::Indirect | OpIr::PrefixNames { .. } => false,
+					// `${x@P}` expands the value as a prompt, which runs the
+					// command substitutions in it (`x='$(cmd)'`); the word
+					// records so the expansion can park on one instead of
+					// meeting the `Stop::Sub` in a pass that cannot.
+					OpIr::Transform(c) => *c == b'P',
 				};
 				// `$!` waits while its job decides on its pid (`Stop::Wait`).
 				let bang = p.param == ParamRef::LastBg;
