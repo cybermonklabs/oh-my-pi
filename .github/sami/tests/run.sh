@@ -800,6 +800,10 @@ ONLY="$ONLYT" OWN_TESTS="m::langinfo m::strftime" run K6-only-without-canary 1 '
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" CARGO_MODE=fail-lib run K7-only-cargo-test-fails 1 "sdk/rust/demo:lib:demo demo::broken failed and is not in" '' 'exit 9'
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-raw-skip run K8-only-cargo-doctest-skips 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) skipped itself and is not in" '' 'exit 9'
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=ignored IGNORED_RUN="sdk/rust/demo:test:wire a::slow" NOT_MSG='::error' run K9-only-cargo-ignored-left-to-linux 0 "Ignored cargo test, run alone with --ignored by the Linux job: sdk/rust/demo:test:wire a::slow" '' 'exit 9'
+# K10: with RUST_TEST_ONLY, a flaky line of a test this run does not run
+# says nothing (sami-checks run 45351216411: the macOS job read each
+# Linux-only flaky line as a target with no result).
+FLAKY="$B x::f" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='listed flaky' run K10-only-flaky-line-of-a-test-not-run-here 0 "Ran here, as .github/sami/only.txt names: $D m::strftime" '' 'exit 9'
 
 # --- rust-test-macos-inventory.sh ------------------------------------------------
 # irun <name> <want> <message regex> <targets> <mac binaries> <linux listings>

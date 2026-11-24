@@ -555,7 +555,7 @@ else
 		while IFS=$'\t' read -r t name; do
 			[ "$t" = "$target" ] && filters+=(--test_arg="$name")
 		done <"$tmp/only-run.tsv"
-		bazel_test "only-$n" "$tmpdir_under" --test_arg=--exact "${filters[@]}" -- "$target"
+		bazel_test "only-$n" "$tmpdir_under" "${flaky_flags[@]}" --test_arg=--exact "${filters[@]}" -- "$target"
 	done < <(cut -f1 "$tmp/only-run.tsv" | LC_ALL=C sort -u)
 fi
 if [ ! -s "$rows" ]; then
@@ -1165,19 +1165,20 @@ reconcile() {
 # says nothing about it.
 if [ -n "$only" ]; then
 	cut -f1,2 "$tmp/only-run.tsv" | LC_ALL=C sort -u >"$tmp/only-names.tsv"
-	for list in known-failures known-skips known-output; do
+	for list in known-failures known-skips known-output flaky; do
 		{ LC_ALL=C sort -u "$tmp/$list.tsv" | LC_ALL=C comm -12 - "$tmp/only-names.tsv"; awk -F'\t' '$1 !~ /^\/\//' "$tmp/$list.tsv"; } | LC_ALL=C sort -u >"$tmp/$list.here"
 		mv "$tmp/$list.here" "$tmp/$list.tsv"
 	done
 fi
 # The flaky reckoning (see flaky.tsv above). The attempts of a target are its
-# logs in the main and root invocations; a test failed on one when that log
-# names it failed. The tests it judges, and the flaky lines, then leave the
-# known-failure reconciling.
+# logs in the main and root invocations (with RUST_TEST_ONLY, its only-*
+# invocation, and flaky.tsv holds only the lines of tests that run there); a
+# test failed on one when that log names it failed. The tests it judges, and
+# the flaky lines, then leave the known-failure reconciling.
 : >"$tmp/flaky-judged.tsv"
 while IFS=$'\t' read -r label name; do
-	attempts="$(awk -F'\t' -v t="$label" '$1 == t && ($7 == "main" || $7 == "root") && $5 != "-" { n++ } END { print n + 0 }' "$rows")"
-	fails="$(awk -F'\t' -v t="$label" -v n="$name" '$1 == t && $2 == n && ($4 == "main" || $4 == "root") { print $3 }' "$tmp/failed-at.tsv" | LC_ALL=C sort -u | awk 'END { print NR }')"
+	attempts="$(awk -F'\t' -v t="$label" '$1 == t && ($7 == "main" || $7 == "root" || $7 ~ /^only-/) && $5 != "-" { n++ } END { print n + 0 }' "$rows")"
+	fails="$(awk -F'\t' -v t="$label" -v n="$name" '$1 == t && $2 == n && ($4 == "main" || $4 == "root" || $4 ~ /^only-/) { print $3 }' "$tmp/failed-at.tsv" | LC_ALL=C sort -u | awk 'END { print NR }')"
 	if [ "$attempts" = 0 ]; then
 		error "Rust test flaky" "$label $name is listed flaky in $sami/rust-test-known-failures.txt, but the tree under test gave $label no result"
 	elif [ "$fails" = 0 ]; then
