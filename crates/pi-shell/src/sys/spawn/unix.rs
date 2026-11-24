@@ -301,6 +301,11 @@ impl State {
 		}
 	}
 
+	/// `s` is no longer this spawner's to end ([`ExtProc::release`]).
+	fn unrecord(&self, s: Scope) {
+		self.groups.lock().list.retain(|x| *x != s);
+	}
+
 	/// Whether `posix_spawn` can express a spec with this umask and these
 	/// ignored signals (it can neither set a umask nor ignore a signal; the
 	/// child inherits both from the host).
@@ -1660,6 +1665,15 @@ impl ExtProc for UnixProc {
 
 	fn cont(&mut self) -> io::Result<()> {
 		self.scope.signal(Signal::Cont)
+	}
+
+	/// From now on as a detached external: no longer a leak, and dropped
+	/// while it runs it is released, not ended.
+	fn release(&mut self) {
+		if !self.detached {
+			self.detached = true;
+			self.shared.state.unrecord(self.scope);
+		}
 	}
 }
 

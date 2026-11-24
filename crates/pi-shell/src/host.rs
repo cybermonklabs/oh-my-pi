@@ -863,7 +863,7 @@ struct Observed {
 }
 
 impl Observed {
-	fn release(&mut self) {
+	fn report_released(&mut self) {
 		if !self.released {
 			self.released = true;
 			self.observer.released(self.child.pid());
@@ -878,7 +878,7 @@ impl ExtProc for Observed {
 
 	fn poll_wait(&mut self, cx: &mut Context<'_>) -> Poll<ExitStatus> {
 		let status = std::task::ready!(self.child.poll_wait(cx));
-		self.release();
+		self.report_released();
 		Poll::Ready(status)
 	}
 
@@ -893,11 +893,15 @@ impl ExtProc for Observed {
 	fn cont(&mut self) -> io::Result<()> {
 		self.child.cont()
 	}
+
+	fn release(&mut self) {
+		self.child.release();
+	}
 }
 
 impl Drop for Observed {
 	fn drop(&mut self) {
-		self.release();
+		self.report_released();
 	}
 }
 

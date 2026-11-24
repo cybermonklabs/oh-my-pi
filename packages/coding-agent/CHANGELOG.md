@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `omp bash` and obash ending a background program (`cmd &`, `nohup cmd &`) when the shell exits: as bash does, the shell now leaves it running. In-engine background work (a function, a loop, a subshell with more to run, a pipeline) still ends with the shell, and the `bash` tool's sessions still end every background job
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
