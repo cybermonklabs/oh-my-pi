@@ -382,6 +382,12 @@ struct Slot<T> {
 	/// to join it.
 	#[cfg(test)]
 	hold:      bool,
+	/// Test hook: with `hold`, the helper stays held until the test clears
+	/// this, also while the drop joins it and after the drop left it (a
+	/// helper thread descheduled after its check for longer than
+	/// [`RESCUED_JOIN`]).
+	#[cfg(test)]
+	hold_long: bool,
 	/// Test hook: the drop holds its end of the FIFO and is about to join the
 	/// helper.
 	#[cfg(test)]
@@ -441,6 +447,8 @@ impl<T> Default for Slot<T> {
 			looks:                  0,
 			#[cfg(test)]
 			hold:                   false,
+			#[cfg(test)]
+			hold_long:              false,
 			#[cfg(test)]
 			joining:                false,
 			#[cfg(test)]
@@ -1190,7 +1198,7 @@ where
 				let seam_hold = seam::reached_after_check();
 				let held = || {
 					let s = shared.slot.lock();
-					(s.hold || seam_hold) && !s.joining && !s.left
+					(s.hold || seam_hold) && (s.hold_long || (!s.joining && !s.left))
 				};
 				while held() {
 					thread::yield_now();
@@ -2257,6 +2265,68 @@ mod tests {
 		assert!(!shared.slot.lock().counted, "the helper that returned still counts as left");
 		assert_eq!(drain(reader).0, b"ab");
 		assert!(!has_reader(&path), "a reader is left");
+	}
+
+	/// A helper the drop leaves counts in [`LEFT`] only until it ends, also
+	/// one the drop leaves before its last check, which ends without an
+	/// `open(2)`. The `hold` and `hold_long` hooks keep the helper after its
+	/// check of the cancel through the drop's wait of [`RESCUED_JOIN`], so
+	/// the drop leaves it; the count is read while it is held, then it is let
+	/// go. In a process of its own, so no other test's helper moves [`LEFT`]
+	/// meanwhile.
+	#[test]
+	fn a_helper_the_drop_leaves_stops_counting_when_it_ends() {
+		if crate::dir_handle::alone(
+			"fifo::tests::a_helper_the_drop_leaves_stops_counting_when_it_ends",
+		) {
+			return;
+		}
+		let left = || LEFT.load(std::sync::atomic::Ordering::Relaxed);
+		let before = left();
+		let (_dir, path) = new_fifo();
+		let mut opened = reading(&path, Slot { hold: true, hold_long: true, ..Slot::default() });
+		while !opened.shared.slot.lock().opening {
+			thread::yield_now();
+		}
+		// The helper is not in `open(2)`: the look's end lets this writer go.
+		let wp = path.clone();
+		let writer = thread::spawn(move || -> io::Result<()> {
+			let mut w = fs::OpenOptions::new().write(true).open(&wp)?;
+			w.write_all(b"a\n")
+		});
+		writer.join().unwrap().unwrap();
+		let reader = opened
+			.wait_for(Duration::from_secs(10))
+			.expect("no result 10 s after the writer wrote")
+			.unwrap();
+		assert!(opened.shared.slot.lock().rescued, "the look did not take the open");
+		let shared = Arc::clone(&opened.shared);
+		// The drop runs on its own thread: one that waits for the held helper
+		// is released after 5 s (the helper let go), so the test fails instead
+		// of hanging.
+		let (sent, done) = std::sync::mpsc::channel();
+		let dropper = thread::spawn(move || {
+			drop(opened);
+			let _ = sent.send(());
+		});
+		let waited = done.recv_timeout(Duration::from_secs(5)).is_err();
+		let during = left();
+		shared.slot.lock().hold_long = false;
+		dropper.join().unwrap();
+		assert!(!waited, "the drop waited for a helper held after its check");
+		assert_eq!(during, before + 1, "the drop did not leave the helper");
+		// A writer for a helper that goes on into `open(2)` once let go.
+		let wp = path;
+		thread::spawn(move || {
+			let _ = fs::OpenOptions::new().write(true).open(&wp);
+		});
+		let deadline = std::time::Instant::now() + Duration::from_secs(10);
+		while Arc::strong_count(&shared) > 1 {
+			assert!(std::time::Instant::now() < deadline, "the helper did not end once let go");
+			thread::sleep(Duration::from_millis(10));
+		}
+		drop(reader);
+		assert_eq!(left(), before, "a helper the drop left still counts in LEFT after it ended");
 	}
 
 	/// Past [`MAX_LEFT`] helpers left, a read-only open is not looked at, so
