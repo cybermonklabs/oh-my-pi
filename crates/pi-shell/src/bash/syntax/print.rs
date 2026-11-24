@@ -147,6 +147,45 @@ pub fn command_string(list: List<'_>) -> Vec<u8> {
 	p.out
 }
 
+/// `BASH_COMMAND` of `cmd`: bash's `the_printed_command_except_trap`.
+///
+/// The text bash holds while `cmd` runs, as the command's own execution
+/// prints it. A simple command as `print_simple_command` prints it
+/// (assignments, words, redirections, a `|&` stage's `2>&1`, here-document
+/// bodies); `[[ … ]]` and `(( … ))` as `print_cond_command` and
+/// `print_arith_command` (without the command's redirections); the head of
+/// a `for`, `select` or `case` as `print_for_command_head`,
+/// `print_select_command_head` and `print_case_command_head` (`for NAME in
+/// WORDS`, `select NAME in WORDS`, `case WORD in ` with bash's trailing
+/// blank). `None` for any other command.
+pub fn bash_command(cmd: Command<'_>) -> Option<Vec<u8>> {
+	let mut p = Bp::new(false);
+	match cmd.kind() {
+		CommandKind::Simple(s) => p.simple(s, cmd.redirs(), cmd.pipe_stderr()),
+		CommandKind::Cond(e) => {
+			p.put(b"[[ ");
+			p.cond(e);
+			p.put(b" ]]");
+		},
+		CommandKind::Arith(a) => return Some(arith_command(a.src())),
+		CommandKind::For(f) => p.for_head(b"for ", f),
+		CommandKind::Select(f) => p.for_head(b"select ", f),
+		CommandKind::Case(c) => p.case_head(c),
+		_ => return None,
+	}
+	Some(p.out)
+}
+
+/// bash `print_arith_command` of `expr`: `((expr))`. An arith-for
+/// expression's `BASH_COMMAND` is this of the expression as expanded.
+pub fn arith_command(expr: &[u8]) -> Vec<u8> {
+	let mut out = Vec::with_capacity(expr.len() + 4);
+	out.extend_from_slice(b"((");
+	out.extend_from_slice(expr);
+	out.extend_from_slice(b"))");
+	out
+}
+
 /// bash `print_comsub`: the text bash stores for a command substitution
 /// body.
 pub fn comsub_text(list: List<'_>) -> Vec<u8> {
@@ -613,6 +652,14 @@ impl<'a> Bp<'a> {
 	}
 
 	fn for_like(&mut self, kw: &[u8], f: For<'a>) {
+		self.for_head(kw, f);
+		self.put(b";");
+		self.loop_body(f.body());
+	}
+
+	/// `print_for_command_head` / `print_select_command_head`: `KW NAME in
+	/// WORDS` (`"$@"` without a list).
+	fn for_head(&mut self, kw: &[u8], f: For<'a>) {
 		self.put(kw);
 		self.put(f.var());
 		for v in f.extra_vars() {
@@ -631,8 +678,6 @@ impl<'a> Bp<'a> {
 			},
 			None => self.put(b"\"$@\""),
 		}
-		self.put(b";");
-		self.loop_body(f.body());
 	}
 
 	/// `newline("do\n")` … `newline("done")` of `for` and `select`.
@@ -671,9 +716,7 @@ impl<'a> Bp<'a> {
 	}
 
 	fn case(&mut self, c: Case<'a>) {
-		self.put(b"case ");
-		word_text(c.word(), &mut self.out);
-		self.put(b" in ");
+		self.case_head(c);
 		if !c.arms().is_empty() {
 			self.indentation += INDENT_AMOUNT;
 			for (i, arm) in c.arms().iter().enumerate() {
@@ -704,6 +747,13 @@ impl<'a> Bp<'a> {
 			self.indentation -= INDENT_AMOUNT;
 		}
 		self.newline(b"esac");
+	}
+
+	/// `print_case_command_head`: `case WORD in `.
+	fn case_head(&mut self, c: Case<'a>) {
+		self.put(b"case ");
+		word_text(c.word(), &mut self.out);
+		self.put(b" in ");
 	}
 
 	fn while_cmd(&mut self, w: While<'a>) {
