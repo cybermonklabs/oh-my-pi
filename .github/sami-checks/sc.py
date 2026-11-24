@@ -16,6 +16,9 @@
                                            SCOPE whole-unit (the default) or own-process (nextest)
   sc.py junit-merge OUT JUNIT...           one JUnit report of several (nextest.sh's two passes)
   sc.py selftest                           the counters and the summary against hand-made inputs
+  sc.py docs STREAM LOG EXIT SECS          `cargo doc --message-format=json -p pi-shell`: each broken intra-doc link (docs.sh)
+  sc.py changelog LOG EXIT SECS FILES DIFF `fix-changelogs.ts --check`: each CHANGELOG it would rewrite (changelog.sh)
+  sc.py plant WHAT TREE                    the docs or changelog row's control: puts its planted fault in TREE
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
 binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 nor 100, a bun run
@@ -91,6 +94,8 @@ ROWS = (
     ("coding-agent --isolate", "ts-ca"),
     ("check:ts", "checkts"),
     ("skip prints the summary reads", "skipforms"),
+    ("rustdoc intra-doc links (pi-shell)", "docs"),
+    ("CHANGELOG format (fix-changelogs --check)", "changelog"),
 )
 
 
@@ -113,6 +118,7 @@ def ts_matrix():
 def all_job_names():
     names = [m["name"] for m in set_matrix()] + [m["name"] for m in workspace_matrix()]
     names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()] + ["ts-small", "checkts", "skip-forms"]
+    names += ["docs", "changelog"]
     return names
 
 
@@ -131,6 +137,9 @@ def cmd_plan():
     silent = os.environ.get("SC_INPUT_SILENT", "")
     if silent and silent not in all_job_names():
         sys.exit(f"::error::the silent input names no job of the plan: '{silent}' (one of {', '.join(all_job_names())})")
+    plant = os.environ.get("SC_INPUT_PLANT", "")
+    if plant and plant not in PLANTS:
+        sys.exit(f"::error::the plant input names no row's control: '{plant}' (one of {', '.join(PLANTS)})")
     out = {
         "commit": commit,
         "silent": silent,
@@ -141,6 +150,7 @@ def cmd_plan():
         "workspace_parts": WORKSPACE_PARTS,
         "ts": json.dumps(ts_matrix()),
         "ca_shards": CODING_AGENT_SHARDS,
+        "plant": plant,
     }
     for k, v in out.items():
         print(f"{k}={v}")
@@ -576,6 +586,8 @@ def expected_units(build_dir):
     exp.append(("skipforms", "tree", "runner"))
     # The run-time half, which the summary job runs on the results before the summary (sc.py skip-lines).
     exp.append(("skipforms", "runtime", "runner"))
+    exp.append(("docs", "pi-shell", "runner"))
+    exp.append(("changelog", "changelogs", "runner"))
     return exp, notes
 
 
@@ -954,6 +966,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     lines.append("|---|---|---|---|---|")
     all_ok = True
     details = []
+    verdicts = {}
     for title, key in ROWS:
         units = [e for e in exp if e[0] == key]
         rs = []
@@ -1006,6 +1019,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         longest = max(rs, key=lambda r: r["seconds"], default=None)
         lu = f"{longest['unit']} ({longest['who']}), {fmt_secs(longest['seconds'])}" if longest else "-"
         lines.append(f"| {title} | **{verdict}** | {counts} | {tp} / {tf} / {ti} / {ts} | {lu} |")
+        verdicts[key] = (verdict, [f for r in rs for f in r["failures"]])
         if verdict not in ("PASS", "KNOWN"):
             all_ok = False
         for r in rs:
@@ -1018,6 +1032,16 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`" + (f": KNOWN ({why})" if why else ""))
             for f, n, why in r.get("partial", []):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): `{f}`: partial: {n} sub-cases skipped ({why})")
+    # A planted run (the dispatch input `plant`) says so first, and whether the control caught its plant.
+    plant = os.environ.get("SC_PLANT", "")
+    if plant:
+        path, text, needle = PLANTS[plant]
+        v, fs = verdicts.get(plant, ("absent", []))
+        caught = v == "FAIL" and any(needle in f for f in fs)
+        all_ok = False
+        lines[2:2] = [f"**Planted run (`plant={plant}`)**: the {plant} job added `` {text} `` to `{path}` before it ran. "
+                      + (f"The control caught it: the row reads FAIL and names `{needle}`." if caught else
+                         f"**THE CONTROL FAILED**: the row reads {v} and does not name `{needle}` in a failure."), ""]
     lines.append("")
     # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
     # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
@@ -1690,6 +1714,80 @@ def selftest():
     os.remove(os.path.join(build, "binaries-metadata.json"))
     rc, out = summary()
     check("summary without a binary list", ("| pi-shell set (runner) | **UNKNOWN** | - |" in out, rc), (True, 1))
+    # The docs and changelog rows. The plan takes `plant` as docs, changelog or nothing.
+    for plant_in, ok in (("", True), ("docs", True), ("changelog", True), ("both", False)):
+        env = dict(GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_REF="refs/heads/x", SC_INPUT_COMMIT="a" * 40,
+                   SC_INPUT_SILENT="", SC_INPUT_PLANT=plant_in)
+        kept_env = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                cmd_plan()
+            got = f"plant={plant_in}" in buf.getvalue().splitlines()
+        except SystemExit:
+            got = False
+        for k, v in kept_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        check(f"plan with plant={plant_in!r}", got, ok)
+    check("docs and changelog are job names silent takes", {"docs", "changelog"} <= set(all_job_names()), True)
+    # Each plant lands where the job's tool reads it.
+    ptree = os.path.join(d, "ptree")
+    for what, body in (("docs", "//! pi-shell\n#![allow(x)]\nmod a;\npub mod bash;\npub mod b;\n"),
+                       ("changelog", "# Changelog\n\n## [Unreleased]\n\n## [1.0.0] - 2026-01-01\n\n### Added\n\n- x\n")):
+        p = os.path.join(ptree, PLANTS[what][0])
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").write(body)
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_plant(what, ptree)
+        check(f"the {what} plant", open(p).read().split("\n")[3:6],
+              {"docs": [PLANTS["docs"][1], "pub mod bash;", "pub mod b;"],
+               "changelog": ["", PLANTS["changelog"][1], ""]}[what])
+    # A unified diff's first change in each file; a removed line that starts `-- ` is no header.
+    dfile = os.path.join(d, "c.diff")
+    open(dfile, "w").write("--- a/p/x.md\n+++ b/p/x.md\n@@ -3,5 +3,3 @@\n ## [Unreleased]\n \n-### Planted\n--- dashes\n"
+                           " ## [1.0.0]\n@@ -20,2 +18,1 @@\n a\n-b\n--- a/p/y.md\n+++ b/p/y.md\n@@ -1 +1 @@\n-old\n+new\n")
+    check("changed_lines", changed_lines(dfile), {"p/x.md": (5, ["-### Planted", "--- dashes"]), "p/y.md": (1, ["-old", "+new"])})
+    # The summary: a docs or changelog job that reports nothing is UNKNOWN, and so is its row; a
+    # planted run says whether its control caught the plant.
+    res2, build2 = os.path.join(d, "res2"), os.path.join(d, "build2")
+    os.makedirs(res2)
+    os.makedirs(build2)
+    for i, (row, unit, who) in enumerate(expected_units(build2)[0]):
+        json.dump(result(row, unit, who, "PASS", 0, 1, passed=1), open(os.path.join(res2, f"{i}.json"), "w"))
+
+    def summary2(drop=(), plant_env=""):
+        for k in drop:
+            os.remove(os.path.join(res2, k))
+        os.environ["SC_PLANT"] = plant_env
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc2 = cmd_summary(res2, build2, known_file)
+        os.environ.pop("SC_PLANT")
+        return rc2, buf.getvalue()
+
+    docs_i = [f for f in os.listdir(res2) if json.load(open(os.path.join(res2, f)))["row"] == "docs"]
+    log_i = [f for f in os.listdir(res2) if json.load(open(os.path.join(res2, f)))["row"] == "changelog"]
+    _, out = summary2()
+    check("summary: docs and changelog rows pass", ("| rustdoc intra-doc links (pi-shell) | **PASS** | 1 / 0 / 0 / 0 |" in out,
+          "| CHANGELOG format (fix-changelogs --check) | **PASS** | 1 / 0 / 0 / 0 |" in out), (True, True))
+    _, out = summary2(plant_env="docs")
+    check("summary: a planted docs run whose row passed", ("**Planted run (`plant=docs`)**" in out,
+          "**THE CONTROL FAILED**: the row reads PASS" in out), (True, True))
+    json.dump(result("docs", "pi-shell", "runner", "FAIL", 101, 1, 0, 1,
+                     failures=["crates/pi-shell/src/lib.rs:36:10: unresolved link to 'NoSuchItemPlanted'"]),
+              open(os.path.join(res2, docs_i[0]), "w"))
+    rc, out = summary2(plant_env="docs")
+    check("summary: a planted docs run whose row names the plant",
+          ("The control caught it: the row reads FAIL and names `NoSuchItemPlanted`." in out, rc), (True, 1))
+    rc, out = summary2(drop=docs_i + log_i)
+    check("summary: no docs or changelog result", ("| rustdoc intra-doc links (pi-shell) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
+          "| CHANGELOG format (fix-changelogs --check) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
+          "`pi-shell` (runner): UNKNOWN: no result" in out, "`changelogs` (runner): UNKNOWN: no result" in out, rc),
+          (True, True, True, True, 1))
 
     if fails:
         for f in fails:
@@ -1699,6 +1797,175 @@ def selftest():
           "skip lines and partial passes, the shard assignment and per-user weights, the summary's UNKNOWN for a "
           "unit no job or two jobs reported, the known and flaky entries, and skip-forms and skip-lines with "
           "their controls")
+
+
+# The docs row (docs.sh): `cargo doc --no-deps -p pi-shell` with -D rustdoc::broken_intra_doc_links.
+# cargo's JSON names each diagnostic's lint, so every form of that lint's error is read, not only
+# `unresolved link to`.
+DOCS_LINT = "rustdoc::broken_intra_doc_links"
+# The changelog row (changelog.sh): scripts/fix-changelogs.ts --check prints the first line, or the
+# second and then each file it would rewrite, one a line; anything else is the tool's own error.
+CHANGELOG_CLEAN = re.compile(r"^Changelogs already clean since (.*)\.$", re.M)
+CHANGELOG_FIXED = re.compile(r"^Fixed (\d+) changelog\(s\) since (.*) \(check, not written\):$", re.M)
+CHANGELOG_FILE = re.compile(r"^  (\S+): (\d+ promoted item\(s\), .*)$", re.M)
+# Each row's control, the dispatch input `plant`: row key -> (the file, the line the job adds to it
+# before it runs, the words a failure of the row must then hold). pi-shell's first public module
+# gets a doc comment that links to no item; the first release section of a small CHANGELOG gets an
+# empty category heading, which fix-changelogs removes.
+PLANTS = {
+    "docs": ("crates/pi-shell/src/lib.rs", "/// See [`NoSuchItemPlanted`].", "NoSuchItemPlanted"),
+    "changelog": ("packages/browser-relay/CHANGELOG.md", "### Planted empty heading", "Planted empty heading"),
+}
+
+
+def stopped(exit_code):
+    """Whether the time bound, a signal or a missing command ended a run (parse_plain's rule)."""
+    return exit_code in ("124", "125", "126", "127", "137") or (exit_code.isdigit() and int(exit_code) > 128)
+
+
+def first_line(text):
+    return next((line.strip() for line in text.splitlines() if line.strip()), "")
+
+
+def parse_docs(stream, log, exit_code, secs, row="docs", unit="pi-shell"):
+    """`cargo doc --message-format=json` (STREAM, its stdout) and its stderr (LOG). FAIL names each
+    error of rustdoc's broken_intra_doc_links lint as `path:line:col: message (label)`. PASS needs
+    exit 0, cargo's build-finished with success and no error. Any other end is UNKNOWN with its first
+    error line. Backticks become ' so that a name reads as one code span in the summary."""
+    try:
+        text = open(stream, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return result(row, unit, "runner", "UNKNOWN", exit_code, secs, note="no cargo output")
+    try:
+        err = open(log, encoding="utf-8", errors="replace").read()
+    except OSError:
+        err = ""
+    links, others, finished = [], [], None
+    for line in text.splitlines():
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(m, dict):
+            continue
+        if m.get("reason") == "build-finished":
+            finished = m.get("success")
+        d = m.get("message") if m.get("reason") == "compiler-message" else None
+        if not isinstance(d, dict) or d.get("level") != "error":
+            continue
+        if (d.get("code") or {}).get("code") == DOCS_LINT:
+            spans = d.get("spans") or [{}]
+            sp = next((s for s in spans if s.get("is_primary")), spans[0])
+            name = f"{sp.get('file_name', '?')}:{sp.get('line_start', '?')}:{sp.get('column_start', '?')}: {d.get('message', '')}"
+            if sp.get("label"):
+                name += f" ({sp['label']})"
+            name = name.replace("`", "'")
+            if name not in links:
+                links.append(name)
+        elif not d.get("message", "").startswith("aborting due to"):
+            others.append(first_line(d.get("rendered") or d.get("message", "")))
+    if stopped(exit_code):
+        return result(row, unit, "runner", "UNKNOWN", exit_code, secs, note=f"exit {exit_code}: the time bound or a signal ended it")
+    if links:
+        note = f"{len(links)} broken intra-doc link(s)"
+        if others:
+            note += f"; and {len(others)} other error(s), the first: {others[0]}"
+        return result(row, unit, "runner", "FAIL", exit_code, secs, 0, len(links), failures=links, note=note)
+    if exit_code == "0" and finished is True and not others:
+        return result(row, unit, "runner", "PASS", exit_code, secs, 1, note="no broken intra-doc link")
+    why = others[0] if others else next((line.strip() for line in err.splitlines() if line.startswith("error")), "")
+    if not why and exit_code == "0":
+        why = "cargo reported no successful build-finished"
+    return result(row, unit, "runner", "UNKNOWN", exit_code, secs,
+                  note=f"exit {exit_code}, and no broken-link error: {why or 'no error line'}")
+
+
+def changed_lines(diff_path):
+    """{path: (the old file's line of the first change, the first 4 changed lines)} of each file's
+    first hunk in `diff -u` output whose new-file label is b/<path>. Hunk lengths are counted, so a
+    removed line that starts `-- ` is not read as a file header."""
+    out, cur = {}, None
+    try:
+        lines = open(diff_path, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return out
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ b/"):
+            cur = lines[i + 1][len("+++ b/"):]
+            i += 2
+            continue
+        m = re.match(r"@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@", line)
+        i += 1
+        if not m or cur is None:
+            continue
+        old, n_old, n_new = int(m.group(1)), int(m.group(2) or 1), int(m.group(3) or 1)
+        first, changed = None, []
+        while (n_old > 0 or n_new > 0) and i < len(lines):
+            tag = lines[i][:1] or " "
+            if tag in "-+" and first is None:
+                first = old
+            if tag in "-+" and len(changed) < 4:
+                changed.append(lines[i])
+            if tag in " -":
+                old += 1
+                n_old -= 1
+            if tag in " +":
+                n_new -= 1
+            i += 1
+        if cur not in out and first is not None:
+            out[cur] = (first, changed)
+    return out
+
+
+def parse_changelog(log, exit_code, secs, files, diff, row="changelog", unit="changelogs"):
+    """fix-changelogs.ts --check (LOG, its stdout and stderr) over FILES CHANGELOGs. PASS on exit 0
+    with its clean line; FAIL on exit 1 with its list of the files it would rewrite, each named with
+    its counts and the first lines the rewrite changes (DIFF: changelog.sh's `diff -u` of each file
+    before and after the tool's write mode); any other end (the tool's own error) is UNKNOWN with its
+    message."""
+    try:
+        text = open(log, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return result(row, unit, "runner", "UNKNOWN", exit_code, secs, note="no log")
+    n = int(files)
+    if stopped(exit_code):
+        return result(row, unit, "runner", "UNKNOWN", exit_code, secs, note=f"exit {exit_code}: the time bound or a signal ended it")
+    clean, fixed = CHANGELOG_CLEAN.search(text), CHANGELOG_FIXED.search(text)
+    if exit_code == "0" and clean and not fixed:
+        return result(row, unit, "runner", "PASS", exit_code, secs, n, note=f"{n} CHANGELOGs, clean since {clean.group(1)}")
+    listed = CHANGELOG_FILE.findall(text[fixed.end():]) if fixed else []
+    if exit_code == "1" and listed and len(listed) == int(fixed.group(1)):
+        heads = changed_lines(diff)
+        fails = []
+        for path, counts in listed:
+            h = heads.get(path)
+            where = f"from line {h[0]}: " + " | ".join(h[1]) if h else "the write run left it unchanged"
+            fails.append(f"{path}: {counts}; {where}"[:400].replace("`", "'"))
+        note = f"{len(listed)} of {n} CHANGELOGs would be rewritten (since {fixed.group(2)})"
+        extra = sorted(set(heads) - {p for p, _ in listed})
+        if extra:
+            note += "; the write run also changed " + ", ".join(extra)
+        return result(row, unit, "runner", "FAIL", exit_code, secs, n - len(listed), len(listed), failures=fails, note=note)
+    said = " / ".join(line.strip() for line in text.splitlines() if line.strip())
+    return result(row, unit, "runner", "UNKNOWN", exit_code, secs, note=f"exit {exit_code}: {said[:400] or 'no output'}")
+
+
+def cmd_plant(what, tree):
+    """Puts a row's planted fault (PLANTS) in TREE and prints where."""
+    path, text, _ = PLANTS[what]
+    p = os.path.join(tree, path)
+    lines = open(p, encoding="utf-8").read().split("\n")
+    if what == "docs":
+        at, new = next((i for i, line in enumerate(lines) if line.startswith("pub mod ")), None), [text]
+    else:
+        at, new = next((i + 1 for i, line in enumerate(lines) if line.startswith("## [")), None), ["", text]
+    if at is None:
+        sys.exit(f"::error::{path} has no place for the {what} plant")
+    lines[at:at] = new
+    open(p, "w", encoding="utf-8").write("\n".join(lines))
+    print(f"PLANT {what}: {path}:{at + len(new)}: {text}")
 
 
 def main(argv):
@@ -1733,6 +2000,12 @@ def main(argv):
         print(record_retry(*a))
     elif c == "junit-merge":
         print(f"{junit_merge(a[0], a[1:])} test cases in {a[0]}")
+    elif c == "docs":
+        print(json.dumps(parse_docs(*a)))
+    elif c == "changelog":
+        print(json.dumps(parse_changelog(*a)))
+    elif c == "plant":
+        cmd_plant(*a)
     elif c == "selftest":
         selftest()
     else:

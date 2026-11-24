@@ -8,9 +8,12 @@
 #     later, so sami itself is not tested again).
 #   - A dispatch tests any pushed commit, given as a full 40-character id:
 #       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
-#         -f commit=<sha> [-f silent=<job name>]
+#         -f commit=<sha> [-f silent=<job name>] [-f plant=docs|changelog]
 #     `silent` is the summary's control: the named job (for example set-root-2) uploads nothing,
 #     and the summary must then read its units and its row UNKNOWN.
+#     `plant` is the docs or changelog row's control: that job first adds a fault to the tree
+#     (sc.py PLANTS: a doc comment with a broken intra-doc link, or an empty CHANGELOG heading),
+#     and the summary says at its top whether the row then read FAIL naming it.
 #   - A push of feat/sami-checks (this tool's own branch) runs only the plan job's selftest: the
 #     counters and the summary against hand-made inputs. GitHub dispatches only a workflow it has
 #     seen run, and this file is not on the default branch; that push run registers it.
@@ -58,6 +61,12 @@
 # tree that says skip and that the summary's rule does not read; the summary job runs the same check
 # on every line a passing test printed (sc.py skip-lines), and both are units of the row "skip
 # prints the summary reads".
+# Docs and CHANGELOGs: the docs job runs `cargo doc --no-deps -p pi-shell` with
+# -D rustdoc::broken_intra_doc_links on the tree's toolchain, cold like the build job (docs.sh),
+# and names each broken link by path, line and link text; the changelog job runs
+# `bun scripts/fix-changelogs.ts --check` on a checkout with the full history and tags (the tool
+# reads its baseline from the latest v* tag) and names each CHANGELOG the tool would rewrite with
+# the first lines it changes (changelog.sh). Both start with the plan and add no time to the run.
 #
 # Caches. No job restores or saves a GitHub Actions cache (cache-mode: none for the whole run).
 # The build job compiles dev-dependencies, build scripts and proc macros that release_binary never
@@ -68,7 +77,7 @@
 name: sami checks
 
 run-name: >-
-  ${{ github.event_name == 'workflow_dispatch' && format('sami checks {0}{1}', inputs.commit, inputs.silent != '' && format(' (control: {0} uploads nothing)', inputs.silent) || '')
+  ${{ github.event_name == 'workflow_dispatch' && format('sami checks {0}{1}{2}', inputs.commit, inputs.silent != '' && format(' (control: {0} uploads nothing)', inputs.silent) || '', inputs.plant != '' && format(' (control: plant={0})', inputs.plant) || '')
   || github.ref == 'refs/heads/sami-candidate' && format('sami checks {0} (sami-candidate)', github.sha)
   || 'sami checks: the tool''s own controls' }}
 
@@ -85,6 +94,11 @@ on:
         type: string
       silent:
         description: "Control: a job name (for example set-root-2) that uploads nothing"
+        required: false
+        default: ""
+        type: string
+      plant:
+        description: "Control: docs or changelog, a row whose job first plants a fault the row must name"
         required: false
         default: ""
         type: string
@@ -126,6 +140,7 @@ jobs:
       builtins: ${{ steps.plan.outputs.builtins }}
       ts: ${{ steps.plan.outputs.ts }}
       ca_shards: ${{ steps.plan.outputs.ca_shards }}
+      plant: ${{ steps.plan.outputs.plant }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -139,6 +154,7 @@ jobs:
         env:
           SC_INPUT_COMMIT: ${{ inputs.commit }}
           SC_INPUT_SILENT: ${{ inputs.silent }}
+          SC_INPUT_PLANT: ${{ inputs.plant }}
         run: python3 tool/.github/sami-checks/sc.py plan | tee -a "$GITHUB_OUTPUT"
 
   tools:
@@ -511,7 +527,7 @@ jobs:
 
   summary:
     name: summary
-    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms]
+    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms, docs, changelog]
     if: ${{ always() && needs.plan.outputs.commit != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -537,6 +553,7 @@ jobs:
       - name: Summary
         env:
           SC_COMMIT: ${{ needs.plan.outputs.commit }}
+          SC_PLANT: ${{ needs.plan.outputs.plant }}
         run: |
           mkdir -p "$SC/report" "$SC/results/sc-skip-lines" "$SC/build"
           rc=0
@@ -584,5 +601,76 @@ jobs:
         if: ${{ always() && needs.plan.outputs.silent != 'skip-forms' }}
         with:
           name: sc-res-skip-forms
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  docs:
+    # rustdoc's broken intra-doc links in pi-shell (docs.sh), on the tree's toolchain, built cold.
+    name: rustdoc intra-doc links
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: Toolchain (the tree's rust-toolchain.toml channel, minimal profile)
+        run: |
+          ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SC_TREE/rust-toolchain.toml" | head -n 1)
+          [ -n "$ch" ] || { echo "::error::no channel in the tree's rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$ch" >> "$GITHUB_ENV"
+      - name: cargo doc -p pi-shell
+        env:
+          SC_PLANT: ${{ needs.plan.outputs.plant }}
+        run: bash tool/.github/sami-checks/docs.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'docs' }}
+        with:
+          name: sc-res-docs
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  changelog:
+    # fix-changelogs.ts --check (changelog.sh). The tool reads its baseline from the latest v* tag
+    # and its archive links from the history, so this checkout has both.
+    name: CHANGELOG format
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: bun 1.4.5
+        run: bash tool/.github/sami-checks/bun.sh
+      - name: bun install
+        working-directory: tree
+        run: bun install --frozen-lockfile
+      - name: fix-changelogs --check
+        env:
+          SC_PLANT: ${{ needs.plan.outputs.plant }}
+        run: bash tool/.github/sami-checks/changelog.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'changelog' }}
+        with:
+          name: sc-res-changelog
           path: ${{ github.workspace }}/sc/res/
           retention-days: 14
