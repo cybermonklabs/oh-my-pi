@@ -623,6 +623,57 @@ fn fifo_opens_through_a_cancellable_view_wait_for_a_writer_and_observe_the_token
 	assert_eq!(late_writer.raw_os_error(), Some(libc::ENXIO), "a reader was left open");
 }
 
+/// A read-only FIFO open through a cancellable view goes through
+/// `FifoOpen::start_reading`: under gVisor bytes another reader left, with
+/// no writer, end it (the look's first limit, which only a look gives); on
+/// Linux it waits for a writer, here until the token fires. The kernel is
+/// named by `PI_VFS_TEST_KERNEL` (the Jobs set it from the pod's runtime);
+/// unset, nothing is checked.
+#[cfg(unix)]
+#[test]
+fn fifo_read_opens_through_a_cancellable_view_are_looked_at_only_on_gvisor() {
+	use std::{io::Write, os::unix::fs::OpenOptionsExt};
+	let Ok(kernel) = std::env::var("PI_VFS_TEST_KERNEL") else {
+		eprintln!("UNKNOWN: PI_VFS_TEST_KERNEL is not set; nothing was checked");
+		return;
+	};
+	let dir = TempDir::new("fifo-looked");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let other = std::fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(&fifo)
+		.unwrap();
+	let mut writer = std::fs::OpenOptions::new()
+		.write(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(&fifo)
+		.unwrap();
+	writer.write_all(b"ab").unwrap();
+	drop(writer);
+	// A child a sibling test forks holds a copy of that writer until its
+	// `exec`, which would end the open on Linux too.
+	std::thread::sleep(Duration::from_millis(100));
+	let token = CancellationToken::new();
+	let scoped = BlockingFs::native().with_cancellation(token.clone());
+	let canceller = std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_secs(2));
+		token.cancel();
+	});
+	let opened = scoped.open(&fifo);
+	canceller.join().unwrap();
+	drop(other);
+	assert_eq!(
+		opened.is_ok(),
+		kernel == "gvisor",
+		"the open ended with no writer ({:?}), with PI_VFS_TEST_KERNEL={kernel}",
+		opened.as_ref().err()
+	);
+}
+
 /// A cancel releases a waiting FIFO open by opening the FIFO for writing,
 /// which this process may not do to a FIFO it can only read. Such an open
 /// must still return as a blocking open does: as soon as a writer connects,
