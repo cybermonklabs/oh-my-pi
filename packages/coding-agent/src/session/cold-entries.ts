@@ -42,7 +42,7 @@ import { forgetConvertMemo } from "./messages";
 import { isRolloverRequestEntry } from "./session-context";
 import type { FileEntry, SessionEntry } from "./session-entries";
 import { repairTruncatedSnapcompactFrames } from "./session-loader";
-import { entryRecordText } from "./session-persistence";
+import { entryJsonText, entryRecordText } from "./session-persistence";
 
 /**
  * A string value of a cold entry stays in memory up to this many UTF-16 units:
@@ -354,10 +354,12 @@ function restoreFields(
 /**
  * Cold `entry` as a plain object with the same fields in the same order, for
  * `prepareEntryForPersistence`: its record parsed with image data left as blob
- * references (every record holds them so) and with legacy truncated snapcompact
+ * references (a record holds an image inline only where the entry was loaded
+ * so, or the blob store could not take it) and with legacy truncated snapcompact
  * frames repaired, as resolving the record would, each value the entry keeps
  * in memory taken from the entry. The persisted line is the one the whole entry
- * gives, but a full write neither reads nor hashes nor stores its images again.
+ * gives, but a full write neither reads nor hashes nor stores again an image its
+ * record holds as a reference.
  * `undefined` when `entry` is not cold.
  */
 export function coldEntryForPersistence(entry: FileEntry): FileEntry | undefined {
@@ -462,8 +464,9 @@ export function copyColdEntry(entry: SessionEntry, overrides?: Readonly<Record<s
  * bytes count toward the next full collection
  * (`COLLECT_AFTER_RECORD_BYTES` in cold-entry-store.ts), as a read's do. Returns false,
  * changing nothing, when every value stays, `entry` is cold already, the
- * store is closed, or the record cannot be made (an image the blob store
- * cannot take; reported once per store): the entry then stays whole.
+ * store is closed, or the record cannot be made, which only a value JSON
+ * cannot write causes ({@link entryRecordText}; reported once per store): the
+ * entry then stays whole.
  */
 export function convertToColdEntry(
 	entry: SessionEntry,
@@ -491,8 +494,12 @@ export function convertToColdEntry(
 	if (!store.writable) return false;
 	let text: string;
 	try {
-		text = options?.imagesExternalized ? (stringifyJson(entry) ?? "null") : entryRecordText(entry, store.blobs);
+		text = options?.imagesExternalized ? (entryJsonText(entry) ?? "null") : entryRecordText(entry, store.blobs);
 	} catch (error) {
+		// Only a value JSON cannot write gets here (a cycle, a getter or `toJSON`
+		// that throws, a bigint in a value too deep for a recursive walk, a text
+		// past the engine's longest string): never an entry parsed from a
+		// transcript line shorter than that, and its transcript write fails too.
 		store.noteRecordFailure(error);
 		return false;
 	}

@@ -1,5 +1,5 @@
 import { isAnthropicServerToolHistoryBlock } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
-import { countNewlines, isRecord, stringifyJson } from "@oh-my-pi/pi-utils";
+import { countNewlines, isRecord, stringifyJson, stringifyJsonIteratively } from "@oh-my-pi/pi-utils";
 import { PRESERVE_KEY as SNAPCOMPACT_PRESERVE_KEY } from "@oh-my-pi/snapcompact";
 import {
 	type BlobStore,
@@ -686,25 +686,62 @@ function externalizeImagesOnly(value: unknown, blobStore: BlobStore, key?: strin
 }
 
 /**
+ * The JSON text {@link stringifyJson} writes for `value`, also for a value
+ * nested deeper than `JSON.stringify` recurses (Bun's slows past about 20,000
+ * levels and runs out of stack near 40,000, while `JSON.parse`, and so a
+ * transcript line, reads 400,000): on that `RangeError` the value is written
+ * again by `stringifyJsonIteratively`, which gives the same bytes but writes
+ * no bigint.
+ */
+export function entryJsonText(value: unknown): string | undefined {
+	try {
+		return stringifyJson(value);
+	} catch (error) {
+		if (!(error instanceof RangeError)) throw error;
+		return stringifyJsonIteratively(value);
+	}
+}
+
+/**
  * The JSON text of `entry` as the manager holds it, with image payloads
  * replaced by blob references (the blob store keeps their bytes). Unlike
  * {@link prepareEntryForPersistence} nothing is truncated, stripped or masked:
  * parsing the text and resolving its blob references gives the entry back,
  * but for snapcompact frames, which resolving leaves as references where the
  * entry may have held their base64 data; their readers resolve a reference as
- * they read it (`lazyImageDataSync`).
+ * they read it (`lazyImageDataSync`). Where the images cannot be replaced (the
+ * walk runs out of stack on a value nested deeper than it recurses, or the
+ * blob store cannot take an image, as on a full disk), the text is the
+ * entry's JSON with its images inline, which parses back to the entry as
+ * well. Throws only for a value JSON cannot write: a cycle, a getter or
+ * `toJSON` that throws, a bigint in a value nested deeper than the walk
+ * recurses, or a text longer than the engine's longest string (2^31 - 1
+ * units). A value parsed from a transcript line holds none of the first
+ * three, and the last needs a line about that long.
  */
 export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string {
 	let externalized: unknown;
 	try {
 		externalized = externalizeImagesOnly(entry, blobStore);
 	} catch (error) {
-		// A library object in `details` can carry a getter that throws when the
-		// walk probes it (see prepareEntryForPersistence); its plain JSON has none.
-		// A cause the clone does not remove fails again: the first error is kept.
 		let json: string | undefined;
+		if (error instanceof RangeError) {
+			// The walk ran out of stack, so `JSON.stringify` would take seconds on
+			// the entry or run out too: the writer that keeps its own stack writes it.
+			try {
+				json = stringifyJsonIteratively(entry);
+			} catch {
+				throw error;
+			}
+			if (json === undefined) throw error;
+			return json;
+		}
+		// A library object in `details` can carry a getter that throws when the
+		// walk probes it (see prepareEntryForPersistence); its plain JSON has none,
+		// and the walk replaces the images in that. A value JSON cannot write
+		// fails here: the first error is kept.
 		try {
-			json = stringifyJson(entry);
+			json = entryJsonText(entry);
 		} catch {
 			throw error;
 		}
@@ -712,8 +749,9 @@ export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string 
 		try {
 			externalized = externalizeImagesOnly(JSON.parse(json), blobStore);
 		} catch {
-			throw error;
+			// The walk fails on the clone too: an image the blob store cannot take (a full disk), or the depth.
+			return json;
 		}
 	}
-	return stringifyJson(externalized) ?? "null";
+	return entryJsonText(externalized) ?? "null";
 }

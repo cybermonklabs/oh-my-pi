@@ -12,7 +12,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { BlobStore } from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import {
@@ -302,8 +302,8 @@ describe("a resume and a running session work when the older-entry store cannot 
 		},
 	);
 
-	// A full disk under the blob store must not stop the context rebuild after a compaction.
-	it("builds the context after a compaction and keeps an entry whole when its image cannot be stored as it goes cold", async () => {
+	// A full disk under the blob store must not stop the context rebuild after a compaction, nor keep the entry whole.
+	it("builds the context after a compaction and moves an entry out of memory with its image inline when the image cannot be stored", async () => {
 		using dir = TempDir.createSync("@omp-cold-unusable-");
 		const image: ImageContent = {
 			type: "image",
@@ -332,11 +332,67 @@ describe("a resume and a running session work when the older-entry store cannot 
 		]);
 		const u1 = manager.getEntry("u1");
 		if (!u1) throw new Error("missing entry u1");
-		expect(isColdEntry(u1)).toBe(false);
+		expect(isColdEntry(u1)).toBe(true);
 		expect(u1.type === "message" ? u1.message : undefined).toEqual(withImage);
 		const a1 = manager.getEntry("a1");
 		if (!a1) throw new Error("missing entry a1");
 		expect(isColdEntry(a1)).toBe(true);
+		vi.restoreAllMocks();
+		await manager.close();
+	});
+
+	// A load makes the target of a patch record whole to patch it, then returns it to the store.
+	it("resumes an entry a patch record names before the cut out of memory with its image inline when the image cannot be stored", async () => {
+		using dir = TempDir.createSync("@omp-cold-unusable-");
+		const image: ImageContent = {
+			type: "image",
+			data: Buffer.alloc(3000, 7).toString("base64"),
+			mimeType: "image/png",
+		};
+		const call: AssistantMessage = {
+			...assistant(`a1 ${BODY}`),
+			content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: {} }],
+			stopReason: "toolUse",
+		};
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "inspect",
+			content: [{ type: "text", text: `r1 ${BODY}` }, image],
+			isError: false,
+			timestamp: 2,
+		};
+		const file = await writeSession(dir.path(), [
+			{ type: "message", id: "a1", parentId: null, timestamp: TIMESTAMP, message: call },
+			{ type: "message", id: "r1", parentId: "a1", timestamp: TIMESTAMP, message: result },
+			{
+				type: "custom",
+				customType: "entry_patch",
+				id: "x1",
+				parentId: "r1",
+				timestamp: TIMESTAMP,
+				data: { patches: [{ entryId: "r1", message: { prunedAt: 7 } }] },
+			},
+			{ type: "message", id: "u2", parentId: "x1", timestamp: TIMESTAMP, message: user(`u2 ${BODY}`) },
+			{
+				type: "compaction",
+				id: "c1",
+				parentId: "u2",
+				timestamp: TIMESTAMP,
+				summary: `c1 ${BODY}`,
+				firstKeptEntryId: "u2",
+				tokensBefore: 1000,
+			},
+		]);
+		vi.spyOn(BlobStore.prototype, "putSync").mockImplementation(() => {
+			throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+		});
+
+		const manager = await open(file);
+		const r1 = manager.getEntry("r1");
+		if (!r1) throw new Error("missing entry r1");
+		expect(isColdEntry(r1)).toBe(true);
+		expect(r1.type === "message" ? r1.message : undefined).toEqual({ ...result, prunedAt: 7 });
 		vi.restoreAllMocks();
 		await manager.close();
 	});

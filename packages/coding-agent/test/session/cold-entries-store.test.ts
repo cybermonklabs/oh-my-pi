@@ -14,7 +14,15 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { getBlobsDir, getConfigRootDir, logger, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import {
+	getBlobsDir,
+	getConfigRootDir,
+	isRecord,
+	logger,
+	setAgentDir,
+	stringifyJsonIteratively,
+	TempDir,
+} from "@oh-my-pi/pi-utils";
 import { coldDirIn, withoutAccountId } from "../helpers/account-id";
 import { HAS_PROC_FD } from "../helpers/open-descriptors";
 
@@ -73,7 +81,8 @@ async function writeTranscript(dir: string, records: readonly FixtureRecord[]): 
 		...fields,
 	}));
 	const file = path.join(dir, "session.jsonl");
-	await Bun.write(file, [header, ...entries].map(line => `${JSON.stringify(line)}\n`).join(""));
+	// The writer that keeps its own stack: Bun's JSON.stringify takes seconds on a line as deep as JSON.parse reads.
+	await Bun.write(file, [header, ...entries].map(line => `${stringifyJsonIteratively(line)}\n`).join(""));
 	return file;
 }
 
@@ -94,6 +103,69 @@ function writeSession(dir: string, runtime?: RuntimeIdentity): Promise<string> {
 	return writeTranscript(dir, runtime ? records.map(record => ({ ...record, runtime })) : records);
 }
 
+/** Levels past what `JSON.stringify` recurses (Bun's stops near 40,000) and a recursive walk; `JSON.parse` reads 400,000. */
+const DEEP_LEVELS = 50_000;
+
+/** `{ next: … }` nested {@link DEEP_LEVELS} levels around `{ leaf: "bottom" }`. */
+function deepDetails(): unknown {
+	let node: unknown = { leaf: "bottom" };
+	for (let level = 0; level < DEEP_LEVELS; level++) node = { next: node };
+	return node;
+}
+
+/** How many `next` levels `value` nests, and the value at the bottom. */
+function nestingOf(value: unknown): { levels: number; bottom: unknown } {
+	let levels = 0;
+	let node = value;
+	while (isRecord(node) && "next" in node) {
+		node = node.next;
+		levels++;
+	}
+	return { levels, bottom: node };
+}
+
+/**
+ * A session whose tool result `r1` has `details` nested {@link DEEP_LEVELS}
+ * levels (a tool returns any JSON). With `compacted`, `r1` lies before the cut
+ * of `c1`, which keeps `u2` on; without it the session ends at `u2`, every
+ * entry whole.
+ */
+function writeDeepSession(dir: string, compacted: boolean): Promise<string> {
+	const records: FixtureRecord[] = [
+		{ type: "message", id: "u1", message: { role: "user", content: `u1 ${BODY}`, timestamp: 1 } },
+		{
+			type: "message",
+			id: "a1",
+			message: {
+				...assistant(`a1 ${BODY}`),
+				content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: {} }],
+				stopReason: "toolUse",
+			},
+		},
+		{
+			type: "message",
+			id: "r1",
+			message: {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "inspect",
+				content: [{ type: "text", text: `r1 ${BODY}` }],
+				details: deepDetails(),
+				isError: false,
+				timestamp: 2,
+			},
+		},
+		{ type: "message", id: "u2", message: { role: "user", content: `u2 ${BODY}`, timestamp: 3 } },
+	];
+	if (compacted) {
+		records.push(
+			{ type: "compaction", id: "c1", summary: `c1 ${BODY}`, firstKeptEntryId: "u2", tokensBefore: 1000 },
+			{ type: "message", id: "a2", message: assistant(`a2 ${BODY}`) },
+		);
+	}
+	return writeTranscript(dir, records);
+}
+
 function open(file: string, coldStore = true): Promise<SessionManager> {
 	return SessionManager.open(file, undefined, new FileSessionStorage(), { suppressBreadcrumb: true, coldStore });
 }
@@ -107,6 +179,13 @@ function entry(manager: SessionManager, id: string): SessionEntry {
 function messageOf(found: SessionEntry) {
 	if (found.type !== "message") throw new Error(`entry ${found.id} is not a message`);
 	return found.message;
+}
+
+/** The message of tool result entry `found`. */
+function toolResultOf(found: SessionEntry) {
+	const message = messageOf(found);
+	if (message.role !== "toolResult") throw new Error(`entry ${found.id} is not a tool result`);
+	return message;
 }
 
 /** The content of a user or assistant message entry of the fixture. */
@@ -383,6 +462,32 @@ describe("cold entry store", () => {
 		}).toThrow(TypeError);
 		expect(() => content.push({ type: "text", text: "more" })).toThrow(TypeError);
 		expect(textOf(entry(manager, "a1"))).toBe(`a1 ${BODY}`);
+	});
+
+	// A transcript line holds JSON as deep as JSON.parse reads; JSON.stringify and a recursive walk stop far short of it.
+	it("resumes an entry before the cut nested deeper than JSON.stringify recurses cold, and reads it back", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const manager = await open(await writeDeepSession(dir.path(), true));
+		const r1 = entry(manager, "r1");
+
+		expect(isColdEntry(r1)).toBe(true);
+		expect(nestingOf(toolResultOf(r1).details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+		expect(toolResultOf(r1).content).toEqual([{ type: "text", text: `r1 ${BODY}` }]);
+		await manager.close();
+	});
+
+	it("moves an entry nested deeper than JSON.stringify recurses out of memory at a compaction, and reads it back", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const manager = await open(await writeDeepSession(dir.path(), false));
+		expect(isColdEntry(entry(manager, "r1"))).toBe(false);
+
+		manager.appendCompaction(`c1 ${BODY}`, undefined, "u2", 1000);
+		manager.buildSessionContext();
+		const r1 = entry(manager, "r1");
+		expect(isColdEntry(r1)).toBe(true);
+		expect(nestingOf(toolResultOf(r1).details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+		expect(toolResultOf(r1).content).toEqual([{ type: "text", text: `r1 ${BODY}` }]);
+		await manager.close();
 	});
 
 	it("makes a cold entry whole when one of its fields is assigned, and persists the write", async () => {

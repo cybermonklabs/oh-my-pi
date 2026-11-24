@@ -951,41 +951,75 @@ interface BlobRefSite {
 	asDataUrl: boolean;
 }
 
+/** A container {@link collectBlobRefSites} is walking, and the next of its members to walk. */
+type BlobRefWalkFrame =
+	| { readonly array: unknown[]; readonly key: string | undefined; index: number }
+	| { readonly object: Record<string, unknown>; readonly keys: readonly string[]; index: number };
+
 /**
- * Collect the blob references in `value`, a node under `key` of its holder,
- * and below it, wherever persistence externalizes an image and a load resolves
- * it ({@link resolvedImageSiteOf}). An array's elements, a string one too, sit
- * under the array's key. Snapcompact frames stay as references until context
- * rebuilding selects them.
+ * Collect the blob references in `value` and below it, wherever persistence
+ * externalizes an image and a load resolves it ({@link resolvedImageSiteOf}),
+ * in the order a depth-first walk meets them. An array's elements, a string
+ * one too, sit under the array's key. Snapcompact frames stay as references
+ * until context rebuilding selects them. The walk keeps its own stack, so it
+ * reads a value as deep as `JSON.parse` reads (about ten times what a
+ * recursive walk's stack allows): the record of a cold entry is one. A
+ * container met again inside itself (a cycle, never in parsed JSON) is not
+ * walked again.
  */
-function collectBlobRefSites(value: unknown, sites: BlobRefSite[], key?: string): void {
-	if (Array.isArray(value)) {
-		for (let index = 0; index < value.length; index++) {
-			const item: unknown = value[index];
+function collectBlobRefSites(value: unknown, sites: BlobRefSite[]): void {
+	const stack: BlobRefWalkFrame[] = [];
+	const open = new Set<object>();
+	const enter = (node: unknown, key: string | undefined): void => {
+		if (typeof node !== "object" || node === null || open.has(node)) return;
+		if (Array.isArray(node)) {
+			open.add(node);
+			stack.push({ array: node, key, index: 0 });
+			return;
+		}
+		const holder = node as Record<string, unknown>;
+		const site = resolvedImageSiteOf(holder, key);
+		const ref = site === undefined ? undefined : imageAt(holder, site);
+		if (site !== undefined && typeof ref === "string" && isBlobRef(ref)) {
+			sites.push({ holder, key: site, ref, asDataUrl: false });
+			// An image payload's other fields hold no image.
+			if (site === "data") return;
+		}
+		const keys: string[] = [];
+		for (const childKey in holder) keys.push(childKey);
+		open.add(holder);
+		stack.push({ object: holder, keys, index: 0 });
+	};
+	enter(value, undefined);
+	while (stack.length > 0) {
+		const frame = stack[stack.length - 1]!;
+		if ("array" in frame) {
+			const { array, key } = frame;
+			if (frame.index >= array.length) {
+				open.delete(array);
+				stack.pop();
+				continue;
+			}
+			const index = frame.index++;
+			const item = array[index];
 			if (typeof item !== "string") {
-				collectBlobRefSites(item, sites, key);
+				enter(item, key);
 			} else if (resolvedImageSiteOf(item, key) !== undefined && isBlobRef(item)) {
 				// A provider image's URL listed under `image_url`: its blob holds the whole data URL.
-				sites.push({ holder: value, key: index, ref: item, asDataUrl: true });
+				sites.push({ holder: array, key: index, ref: item, asDataUrl: true });
 			}
+			continue;
 		}
-		return;
-	}
-
-	if (typeof value !== "object" || value === null) return;
-	const holder = value as Record<string, unknown>;
-	const site = resolvedImageSiteOf(holder, key);
-	const ref = site === undefined ? undefined : imageAt(holder, site);
-	if (site !== undefined && typeof ref === "string" && isBlobRef(ref)) {
-		sites.push({ holder, key: site, ref, asDataUrl: false });
-		// An image payload's other fields hold no image.
-		if (site === "data") return;
-	}
-
-	for (const childKey in holder) {
+		const { object: holder, keys } = frame;
+		if (frame.index >= keys.length) {
+			open.delete(holder);
+			stack.pop();
+			continue;
+		}
+		const childKey = keys[frame.index++]!;
 		const child = holder[childKey];
 		if (typeof child !== "string") {
-			collectBlobRefSites(child, sites, childKey);
+			enter(child, childKey);
 		} else if (resolvedImageSiteOf(child, childKey) !== undefined && isBlobRef(child)) {
 			// A provider image's URL: its blob holds the whole data URL.
 			sites.push({ holder, key: childKey, ref: child, asDataUrl: true });
@@ -998,18 +1032,29 @@ function collectBlobRefSites(value: unknown, sites: BlobRefSite[], key?: string)
  * Early-exits on the first hit, so blob-free entries skip the
  * {@link collectBlobRefSites} descent entirely. Conservative — a blob ref in a
  * non-resolved position still returns true, which only costs an extra (no-op) walk.
+ * Like that walk it keeps its own stack, so it checks a value of any depth
+ * `JSON.parse` reads; it reads each container once, so a cycle ends.
  */
 function containsBlobRef(value: unknown): boolean {
 	if (typeof value === "string") return isBlobRef(value);
-	if (Array.isArray(value)) {
-		for (const item of value) {
-			if (containsBlobRef(item)) return true;
-		}
-		return false;
-	}
 	if (typeof value !== "object" || value === null) return false;
-	for (const key in value) {
-		if (containsBlobRef((value as Record<string, unknown>)[key])) return true;
+	const seen = new Set<object>();
+	const pending: object[] = [value];
+	// Whether `member` is a blob reference; a container is left to walk.
+	const isRef = (member: unknown): boolean => {
+		if (typeof member === "string") return isBlobRef(member);
+		if (typeof member === "object" && member !== null) pending.push(member);
+		return false;
+	};
+	while (pending.length > 0) {
+		const container = pending.pop()!;
+		if (seen.has(container)) continue;
+		seen.add(container);
+		if (Array.isArray(container)) {
+			for (const member of container) if (isRef(member)) return true;
+		} else {
+			for (const key in container) if (isRef(Reflect.get(container, key))) return true;
+		}
 	}
 	return false;
 }
