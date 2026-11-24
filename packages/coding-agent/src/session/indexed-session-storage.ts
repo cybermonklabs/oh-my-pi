@@ -179,7 +179,7 @@ interface IndexAppend {
 /**
  * A line queued on a path's append batch: its optimistic index frame, the
  * error of the writer that queued it, and its own outcome, which settles its
- * frame and its bytes of the process bound ({@link appendAdmission}).
+ * frame and its bytes of the process's queued appends ({@link appendAdmission}).
  */
 interface QueuedLine {
 	readonly line: string;
@@ -211,23 +211,33 @@ function appendsChain(lines: readonly QueuedLine[]): boolean {
 const RESOLVED = Promise.resolve();
 
 /**
- * Most UTF-8 bytes of appended lines that every {@link IndexedSessionStorage}
- * in this process together holds queued and unsettled before
- * {@link IndexedSessionStorage.waitForAppendAdmission} waits.
+ * UTF-8 bytes of appended lines that every {@link IndexedSessionStorage} in
+ * this process together holds queued and unsettled past which
+ * {@link IndexedSessionStorage.waitForAppendAdmission} waits. Not a hard
+ * bound: `appendSync` queues its line whatever the queue holds, and an async
+ * `append` queues its line before it waits, so the queue passes it by what
+ * they add while turns wait.
  */
 const APPEND_ADMISSION_BYTES = 64 * 1024 * 1024;
 
 /**
- * The process bound on queued appends: the UTF-8 bytes of the lines every
- * path of every {@link IndexedSessionStorage} queued, each counted from when
- * it queues until its backend write settles, either way; and the admissions
+ * How long an admission waits before it logs a warning, once: queued lines
+ * that take this long to settle (a backend whose connection hangs) hold every
+ * turn of the process before each model request and each tool result.
+ */
+const APPEND_ADMISSION_WARN_MS = 10_000;
+
+/**
+ * The process's queued appends: the UTF-8 bytes of the lines every path of
+ * every {@link IndexedSessionStorage} queued, each counted from when it
+ * queues until its backend write settles, either way; and the admissions
  * waiting for them to fall to {@link APPEND_ADMISSION_BYTES}.
  */
 class AppendAdmission {
 	#queuedBytes = 0;
 	readonly #waiters = new Set<() => void>();
 
-	/** Whether the queued bytes are at or under the bound. */
+	/** Whether the queued bytes are at or under {@link APPEND_ADMISSION_BYTES}. */
 	get admits(): boolean {
 		return this.#queuedBytes <= APPEND_ADMISSION_BYTES;
 	}
@@ -243,7 +253,7 @@ class AppendAdmission {
 		this.#waiters.clear();
 	}
 
-	/** Resolve once the queued bytes are at or under the bound, or `signal` fires; at once when either holds now. */
+	/** Resolve once the queued bytes are at or under {@link APPEND_ADMISSION_BYTES}, or `signal` fires; at once when either holds now. */
 	wait(signal: AbortSignal | undefined): Promise<void> {
 		if (this.admits || signal?.aborted) return RESOLVED;
 		return this.#waitFor(signal);
@@ -256,9 +266,19 @@ class AppendAdmission {
 		const admit = (): void => resolve();
 		this.#waiters.add(admit);
 		signal?.addEventListener("abort", admit, { once: true });
+		const slow = setTimeout(() => {
+			logger.warn("Session append admission still waiting", {
+				queuedBytes: this.#queuedBytes,
+				admissionBytes: APPEND_ADMISSION_BYTES,
+				waitMs: Math.round(performance.now() - started),
+			});
+		}, APPEND_ADMISSION_WARN_MS);
+		// The warning alone keeps no process alive.
+		slow.unref();
 		try {
 			await promise;
 		} finally {
+			clearTimeout(slow);
 			this.#waiters.delete(admit);
 			signal?.removeEventListener("abort", admit);
 		}
@@ -314,23 +334,13 @@ function titleUpdateForIndex(entry: IndexEntry): SessionTitleUpdate | undefined 
 
 /**
  * Directory under the OS temp directory holding full-write bodies until their
- * backend publish settles: one per account, private to it, as the OS temp
- * directory is shared between accounts and a directory another account made
- * first would refuse this one's files.
+ * backend publish settles: one per account (`uid`), private to it, as the OS
+ * temp directory is shared between accounts and a directory another account
+ * made first would refuse this one's files.
  */
-function spoolDir(): string {
-	const uid = process.getuid?.();
-	return path.join(os.tmpdir(), uid === undefined ? "omp-spool" : `omp-spool-${uid}`);
+function spoolDir(uid: number): string {
+	return path.join(os.tmpdir(), `omp-spool-${uid}`);
 }
-
-/**
- * Age at which a spool file is a dead process's. Only Windows leaves one
- * behind: POSIX unlinks a spool file as soon as it is open, while Windows
- * removes it after the publish, so a killed process's file is swept at the
- * next start.
- */
-const STALE_SPOOL_MS = 60 * 60 * 1000;
-let staleSpoolsSwept = false;
 
 /** One full write: its size and title slot, its backend publish, and the read-back after a failed publish. */
 interface FullBody {
@@ -344,24 +354,20 @@ interface FullBody {
 }
 
 /**
- * A full-write body written to a temporary file, so the lines a caller hands
- * over are not held a second time while the publish waits in the path queue.
- * It is read back through its descriptor.
+ * A full-write body written to a temporary file, unlinked once open, so the
+ * lines a caller hands over are not held a second time while the publish
+ * waits in the path queue. It is read back through its descriptor.
  */
 class BodySpool {
 	readonly #fd: number;
-	/** The file to remove on close; unset on POSIX, where it was unlinked once open. */
-	readonly #file: string | undefined;
 	#closed = false;
 
 	constructor(
 		fd: number,
-		file: string | undefined,
 		readonly byteLength: number,
 		readonly title: SessionTitleUpdate | undefined,
 	) {
 		this.#fd = fd;
-		this.#file = file;
 	}
 
 	/** The body in reads of {@link LINE_STREAM_CHUNK} bytes, each a buffer of its own. */
@@ -391,9 +397,8 @@ class BodySpool {
 		this.#closed = true;
 		try {
 			fs.closeSync(this.#fd);
-			if (this.#file) fs.rmSync(this.#file, { force: true });
 		} catch {
-			// A Windows file still in use is swept at the next start.
+			// Already closed.
 		}
 	}
 }
@@ -405,21 +410,6 @@ function readAt(fd: number, buffer: Uint8Array, position: number): Promise<numbe
 		else resolve(bytesRead);
 	});
 	return promise;
-}
-
-/** Remove spool files a killed process left behind; Windows only, once per process. */
-function sweepStaleSpools(dir: string): void {
-	if (staleSpoolsSwept) return;
-	staleSpoolsSwept = true;
-	const cutoff = Date.now() - STALE_SPOOL_MS;
-	for (const name of fs.readdirSync(dir)) {
-		const file = path.join(dir, name);
-		try {
-			if (fs.statSync(file).mtimeMs < cutoff) fs.rmSync(file, { force: true });
-		} catch {
-			// Removed by another process meanwhile, or still open in one.
-		}
-	}
 }
 
 /**
@@ -458,35 +448,33 @@ class LinesHead {
 }
 
 /**
- * Spool `lines` to a new file under {@link spoolDir}, iterating them once,
- * counting their bytes and reading the title slot from their
- * {@link LinesHead}. Throws when the directory or the file cannot be made,
- * opened or written, and, where accounts have ids, when the directory is not
- * one this account owns that no other account can enter: another account can
- * make the shared name first, or plant a symlink there. A file it opened is
- * closed and removed.
+ * Spool `lines` to a new file under {@link spoolDir}, unlinked once open,
+ * iterating them once, counting their bytes and reading the title slot from
+ * their {@link LinesHead}. Throws when the directory or the file cannot be
+ * made, opened or written, and when the directory is not one this account
+ * owns that no other account can enter (another account can make the shared
+ * name first, or plant a symlink there) or the platform has no account ids to
+ * check its owner against. A file it opened is closed and removed.
  */
 function spoolLines(lines: Iterable<string>): BodySpool {
-	const dir = spoolDir();
-	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 	const uid = process.getuid?.();
-	if (uid !== undefined) {
-		const st = fs.lstatSync(dir);
-		if (!st.isDirectory() || st.uid !== uid || (st.mode & 0o077) !== 0) {
-			throw new Error(`Session spool directory ${dir} is not a private directory owned by this user`);
-		}
+	if (uid === undefined) throw new Error("This platform has no account id to check a session spool directory's owner");
+	const dir = spoolDir(uid);
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const st = fs.lstatSync(dir);
+	if (!st.isDirectory() || st.uid !== uid || (st.mode & 0o077) !== 0) {
+		throw new Error(`Session spool directory ${dir} is not a private directory owned by this user`);
 	}
-	const windows = process.platform === "win32";
-	if (windows) sweepStaleSpools(dir);
 	const file = path.join(dir, `${process.pid}-${Snowflake.next()}.spool`);
 	const fd = fs.openSync(file, "wx+", 0o600);
 	try {
-		if (!windows) fs.unlinkSync(file);
+		fs.unlinkSync(file);
 		const head = new LinesHead();
 		const bytes = writeLinesToDescriptorSync(fd, head.note(lines));
-		return new BodySpool(fd, windows ? file : undefined, bytes, head.title());
+		return new BodySpool(fd, bytes, head.title());
 	} catch (err) {
-		new BodySpool(fd, file, 0, undefined).close();
+		new BodySpool(fd, 0, undefined).close();
+		fs.rmSync(file, { force: true });
 		throw err;
 	}
 }
@@ -804,13 +792,17 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * {@link SessionStorage.waitForAppendAdmission}. The bound is 64 MiB of
-	 * the lines that every path of every `IndexedSessionStorage` in this
-	 * process has queued to append, counted from when a line queues until its
-	 * backend write settles, either way; a line a waiting caller appends next
-	 * is not counted, so no caller waits for capacity only its own write would
-	 * free. A wait that waited logs the bytes queued when it began and how
-	 * long it took (`Session append admission waited`).
+	 * {@link SessionStorage.waitForAppendAdmission}. A wait lasts while the
+	 * lines that every path of every `IndexedSessionStorage` in this process
+	 * has queued to append hold more than 64 MiB, each counted from when it
+	 * queues until its backend write settles, either way; a line a waiting
+	 * caller appends next is not counted, so no caller waits for capacity only
+	 * its own write would free. That is where turns start to wait, not a hard
+	 * bound: `appendSync` never waits, and `append` queues its line, then
+	 * waits. A wait that lasts 10 s logs a warning once, with the bytes queued
+	 * then (`Session append admission still waiting`); a wait that waited logs
+	 * the bytes queued when it began and how long it took (`Session append
+	 * admission waited`).
 	 */
 	waitForAppendAdmission(signal?: AbortSignal): Promise<void> {
 		return appendAdmission.wait(signal);
@@ -823,9 +815,9 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	/**
 	 * Streaming {@link writeTextSync}: spools `lines` to a temporary file and
-	 * publishes it from there, so the body is never one string. When the spool
-	 * cannot be used it streams the lines to the backend instead (see
-	 * {@link #linesBody}). A subclass or spy that intercepts
+	 * publishes it from there, so the body is never one string. On Windows, and
+	 * when the spool cannot be used, it streams the lines to the backend
+	 * instead (see {@link #linesBody}). A subclass or spy that intercepts
 	 * {@link writeTextSync} still sees every full rewrite: the lines are then
 	 * joined and routed through it.
 	 */
@@ -893,12 +885,21 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * store. That reads `lines` again, so an iterator, which yields its lines
 	 * only once, is read into an array first. A throw from `lines` itself (an
 	 * entry that cannot be read or serialized) is no spool failure: it
-	 * propagates as it is, with no second read and no warning.
+	 * propagates as it is, with no second read and no warning. On Windows no
+	 * spool is made: a file there takes the access list of its directory, and
+	 * nothing tells whether another account made the shared name first. The
+	 * lines stream to the backend, or, for a backend with no streamed write,
+	 * are joined into one string, as the spool is read back for it.
 	 */
 	#linesBody(path: string, lines: Iterable<string>): FullBody {
 		// An iterator is its own iterable, and yields its lines only once.
 		const iterator: unknown = lines[Symbol.iterator]();
 		const readable: Iterable<string> = iterator === lines ? Array.from(lines) : lines;
+		if (os.platform() === "win32") {
+			return this.#backend.writeFullStream
+				? this.#streamedBody(path, readable, undefined)
+				: this.#textBody(path, Array.from(readable).join(""));
+		}
 		let linesFailed = false;
 		// Only a throw from `readable` lands in the catch: a throw from the spool's
 		// own writes ends the iteration through `return`, which runs no catch.
@@ -917,8 +918,9 @@ export class IndexedSessionStorage implements SessionStorage {
 			const spoolError = toError(err).message;
 			if (!this.#spoolFailureLogged) {
 				this.#spoolFailureLogged = true;
+				const uid = process.getuid?.();
 				logger.warn("Session rewrites stream straight to the store: their spool file cannot be used", {
-					dir: spoolDir(),
+					dir: uid === undefined ? undefined : spoolDir(uid),
 					error: spoolError,
 				});
 			}
@@ -933,11 +935,12 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * never one value; a backend without one cannot take it, and its rewrite
 	 * fails without reading the stored copy back. A publish that fails
 	 * replaces nothing, and is logged as an error naming the session, the path
-	 * and the cause, besides failing the write as any publish does; the next
+	 * and the cause (and `spoolError`, why the spool could not be used, where
+	 * one was tried), besides failing the write as any publish does; the next
 	 * full rewrite tries the spool, and this, again. A refusal the caller
 	 * resolves (a size conflict, a lost claim) is not logged.
 	 */
-	#streamedBody(path: string, lines: Iterable<string>, spoolError: string): FullBody {
+	#streamedBody(path: string, lines: Iterable<string>, spoolError: string | undefined): FullBody {
 		const measured = measureLines(lines);
 		const writeFullStream = this.#backend.writeFullStream;
 		return {
@@ -959,7 +962,7 @@ export class IndexedSessionStorage implements SessionStorage {
 					);
 				} catch (err) {
 					if (!(err instanceof SessionWriteConflictError) && !(err instanceof SessionLeaseLostError)) {
-						logger.error("Session rewrite not stored: its spool cannot be used, and streaming it failed", {
+						logger.error("Session rewrite not stored: streaming it to the store failed", {
 							session: measured.sessionId,
 							path,
 							error: toError(err).message,
@@ -1386,8 +1389,8 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * Queue the publish of `line` on `path`: it joins the path's batch still
 	 * gathering lines ({@link #gathering}), or starts one, which goes to the
 	 * backend once the path's earlier operations settle. The promise is the
-	 * line's own outcome; its index frame and its bytes of the process bound
-	 * settle with it.
+	 * line's own outcome; its index frame and its bytes of the process's
+	 * queued appends ({@link appendAdmission}) settle with it.
 	 */
 	_queueAppend(path: string, line: string, append: IndexAppend, getError?: () => Error | undefined): Promise<void> {
 		const { mtimeMs } = append;
@@ -1709,9 +1712,9 @@ class IndexedSessionStorageWriter implements SessionStorageWriter {
 
 	/**
 	 * Queue `line` at once, in call order, as {@link appendSync} does; resolve
-	 * once it is stored and the process bound on queued appends admits more
+	 * once it is stored and the process's queued appends admit more
 	 * ({@link IndexedSessionStorage.waitForAppendAdmission}), so a caller that
-	 * awaits each append queues no more while the queue is past the bound. A
+	 * awaits each append queues no more while the queue is past 64 MiB. A
 	 * line that fails rejects as it settles, without waiting for admission.
 	 */
 	async append(line: string): Promise<void> {

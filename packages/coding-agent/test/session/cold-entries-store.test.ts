@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { BlobStore, type SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
-import { ColdEntryStore, convertToColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
+import { ColdEntryStore, convertToColdEntry, isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import type { RuntimeIdentity } from "@oh-my-pi/pi-coding-agent/session/runtime-identity";
 import {
 	CURRENT_SESSION_VERSION,
@@ -20,8 +20,7 @@ import { HAS_PROC_FD } from "../helpers/open-descriptors";
 const BODY = "x".repeat(4096);
 /** This account's store directory under `tmp`. */
 function coldDirIn(tmp: string): string {
-	const uid = process.getuid?.();
-	return path.join(tmp, uid === undefined ? "omp-cold" : `omp-cold-${uid}`);
+	return path.join(tmp, `omp-cold-${process.getuid?.()}`);
 }
 const COLD_DIR = coldDirIn(os.tmpdir());
 
@@ -532,36 +531,73 @@ describe("cold entry store", () => {
 		},
 	);
 
-	// On Windows a killed process leaves its store file, which holds the entries unmasked.
-	it("removes the store files of processes that are gone when a store opens on Windows, keeping a live one's", () => {
+	// If this regresses, a session on Windows writes its older entries unmasked to a file under the
+	// temporary directory, which another account that made `omp-cold` there first can read.
+	it("keeps older entries compressed in memory on Windows, making no file under the temporary directory", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
 		using tmp = TempDir.createSync("@omp-cold-tmpdir-");
+		const file = await writeSession(dir.path());
 		vi.spyOn(os, "tmpdir").mockReturnValue(tmp.path());
-		const coldDir = coldDirIn(tmp.path());
-		fs.mkdirSync(coldDir, { mode: 0o700 });
-		// Above every pid limit: no process has it.
-		const gone = path.join(coldDir, `${2 ** 31 - 1}-${crypto.randomUUID()}.jsonl`);
-		const live = path.join(coldDir, `${process.pid}-${crypto.randomUUID()}.jsonl`);
-		fs.writeFileSync(gone, "{}\n");
-		fs.writeFileSync(live, "{}\n");
+		vi.spyOn(os, "platform").mockReturnValue("win32");
 
-		const platform = Object.getOwnPropertyDescriptor(process, "platform");
-		if (!platform) throw new Error("process.platform has no descriptor");
-		Object.defineProperty(process, "platform", { ...platform, value: "win32" });
-		let store: ColdEntryStore | undefined;
+		const manager = await open(file);
 		try {
-			store = ColdEntryStore.open(new BlobStore(path.join(tmp.path(), "blobs")));
+			const { coldEntries, storeInMemory } = manager.coldStoreStats();
+			expect({
+				coldEntries,
+				storeInMemory,
+				underTmp: fs.readdirSync(tmp.path()),
+				u1: textOf(entry(manager, "u1")),
+			}).toEqual({ coldEntries: 2, storeInMemory: true, underTmp: [], u1: `u1 ${BODY}` });
 		} finally {
-			Object.defineProperty(process, "platform", platform);
+			await manager.close();
 		}
-		if (!store || store.inMemory) throw new Error("the store did not open its file");
+	});
+
+	// If this regresses, a store kept in memory puts a large tool result in one block with the records
+	// before it, and each read of one of those records decompresses the large one with it.
+	it("gives a record larger than a batch a block of its own, so a read of the record before it decompresses only that one", () => {
+		using tmp = TempDir.createSync("@omp-cold-batch-");
+		vi.spyOn(os, "platform").mockReturnValue("win32");
+		const store = ColdEntryStore.open(new BlobStore(tmp.join("blobs")));
 		try {
-			const files = fs.readdirSync(coldDir);
-			expect(files).not.toContain(path.basename(gone));
-			expect(files).toContain(path.basename(live));
+			const user = (id: string, content: string): SessionEntry => ({
+				type: "message",
+				id,
+				parentId: null,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content, timestamp: 1 },
+			});
+			const small = user("small", `small ${BODY}`);
+			const large = user("large", "z".repeat(2 * 1024 * 1024));
+			const after = user("after", `after ${BODY}`);
+			const recordBytes = [small, large].map(record => Buffer.byteLength(JSON.stringify(record)));
+			const compress = vi.spyOn(Bun, "zstdCompressSync");
+			const decompress = vi.spyOn(Bun, "zstdDecompressSync");
+			for (const record of [small, large, after]) {
+				expect(convertToColdEntry(record, () => store, { imagesExternalized: true })).toBe(true);
+			}
+
+			const smallText = textOf(small);
+			const decompressedForSmall = decompress.mock.results.map(result => (result.value as Uint8Array).byteLength);
+			expect({
+				store: store.inMemory,
+				blocks: compress.mock.calls.map(([data]) => Buffer.byteLength(data)),
+				decompressedForSmall,
+				smallText,
+				largeLength: textOf(large).length,
+				afterText: textOf(after),
+			}).toEqual({
+				store: true,
+				blocks: recordBytes,
+				decompressedForSmall: [recordBytes[0]],
+				smallText: `small ${BODY}`,
+				largeLength: 2 * 1024 * 1024,
+				afterText: `after ${BODY}`,
+			});
 		} finally {
 			store.close();
 		}
-		expect(fs.readdirSync(coldDir)).toEqual([path.basename(live)]);
 	});
 
 	describe("full rewrites of entries with images", () => {
@@ -647,6 +683,120 @@ describe("cold entry store", () => {
 			const text = await Bun.file(file).text();
 			for (const image of images) expect(text).toContain(image.ref);
 			await manager.close();
+		});
+
+		// If this regresses, every resume reads the images of every cold tool result a prune or patch
+		// record names, which the record then replaces, until a full rewrite folds the records in.
+		it("apply at a resume the prune and patch records of cold tool results without reading their images", async () => {
+			using dir = TempDir.createSync("@omp-cold-entries-");
+			const images = storeImages();
+			const timestamp = "2026-01-01T00:00:00.000Z";
+			const call = (id: string, parentId: string, callId: string) => ({
+				type: "message",
+				id,
+				parentId,
+				timestamp,
+				message: {
+					...assistant(`${id} ${BODY}`),
+					content: [{ type: "toolCall", id: callId, name: "inspect", arguments: {} }],
+					stopReason: "toolUse",
+				},
+			});
+			const result = (id: string, parentId: string, callId: string, image: StoredImage) => ({
+				type: "message",
+				id,
+				parentId,
+				timestamp,
+				message: {
+					role: "toolResult",
+					toolCallId: callId,
+					toolName: "inspect",
+					content: [
+						{ type: "text", text: `${id} ${BODY}` },
+						{ type: "image", data: image.ref, mimeType: "image/png" },
+					],
+					isError: false,
+					timestamp: 2,
+				},
+			});
+			const header: SessionHeader = {
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: path.basename(dir.path()),
+				timestamp,
+				cwd: dir.path(),
+			};
+			const lines = [
+				header,
+				{
+					type: "message",
+					id: "u1",
+					parentId: null,
+					timestamp,
+					message: { role: "user", content: `u1 ${BODY}`, timestamp: 1 },
+				},
+				call("a1", "u1", "call-1"),
+				result("r1", "a1", "call-1", images[0]),
+				call("a2", "r1", "call-2"),
+				result("r2", "a2", "call-2", images[1]),
+				{
+					type: "custom",
+					customType: "tool_result_prune",
+					id: "p1",
+					parentId: "r2",
+					timestamp,
+					data: { results: [{ entryId: "r1", notice: "[r1 pruned]", prunedAt: 7 }] },
+				},
+				{
+					type: "custom",
+					customType: "entry_patch",
+					id: "x1",
+					parentId: "p1",
+					timestamp,
+					data: { patches: [{ entryId: "r2", message: { content: [{ type: "text", text: "r2 patched" }] } }] },
+				},
+				{
+					type: "message",
+					id: "u2",
+					parentId: "x1",
+					timestamp,
+					message: { role: "user", content: `u2 ${BODY}`, timestamp: 3 },
+				},
+				{
+					type: "compaction",
+					id: "c1",
+					parentId: "u2",
+					timestamp,
+					summary: `c1 ${BODY}`,
+					firstKeptEntryId: "u2",
+					tokensBefore: 1000,
+				},
+				{ type: "message", id: "a3", parentId: "c1", timestamp, message: assistant(`a3 ${BODY}`) },
+			];
+			const file = path.join(dir.path(), "session.jsonl");
+			await Bun.write(file, lines.map(line => `${JSON.stringify(line)}\n`).join(""));
+			const reads = vi.spyOn(BlobStore.prototype, "getSync");
+
+			const manager = await open(file);
+			try {
+				const hashes = new Set(images.map(image => image.hash));
+				const imageReads = reads.mock.calls.filter(([hash]) => hashes.has(hash));
+				const r1 = messageOf(entry(manager, "r1"));
+				const r2 = messageOf(entry(manager, "r2"));
+				expect({
+					imageReads,
+					cold: ["r1", "r2"].map(id => isColdEntry(entry(manager, id))),
+					r1: r1.role === "toolResult" ? { content: r1.content, prunedAt: r1.prunedAt } : undefined,
+					r2: r2.role === "toolResult" ? r2.content : undefined,
+				}).toEqual({
+					imageReads: [],
+					cold: [true, true],
+					r1: { content: [{ type: "text", text: "[r1 pruned]" }], prunedAt: 7 },
+					r2: [{ type: "text", text: "r2 patched" }],
+				});
+			} finally {
+				await manager.close();
+			}
 		});
 	});
 

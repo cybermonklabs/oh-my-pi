@@ -4600,11 +4600,19 @@ export class SessionManager {
 				? coldBoundary(intake.entries, intake.index.branchView(), undefined)
 				: undefined;
 			if (boundary) hydrateKeptEntries(intake.entries, boundary, { resolveBlobs: false });
-			// Prune records, then patch records, apply after migration; a record
-			// whose target is cold writes through its accessor, which makes it
-			// whole until #coolLoadedEntries below returns it to the store.
-			applyToolResultPrunes(intake.entries);
-			applyEntryPatches(intake.entries);
+			// Prune records, then patch records, apply after migration. A record's
+			// cold target is made whole first with its images left as blob
+			// references, since a write through its accessor would make it whole
+			// with every image read back; convertColdEntries below returns it to the store.
+			const targets = {
+				get: (id: string): SessionEntry | undefined => {
+					const target = intake.index.get(id);
+					if (target) hydrateColdEntry(target, { resolveBlobs: false });
+					return target;
+				},
+			};
+			applyToolResultPrunes(intake.entries, targets);
+			applyEntryPatches(intake.entries, targets);
 			// Sanitize after the load-time passes, as a load of the whole transcript
 			// does, since a pass can change what an entry replays: every whole entry,
 			// and each entry the stream found replay metadata on, made whole for it.

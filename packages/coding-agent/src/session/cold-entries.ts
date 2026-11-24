@@ -32,7 +32,6 @@ import { compactionKeptStart } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, stringifyJson } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
-import { isPidAlive } from "@oh-my-pi/pi-utils/pid";
 import { type BlobStore, isBlobRef } from "./blob-store";
 import {
 	approvedPlanFileOf,
@@ -87,10 +86,11 @@ const CACHE_ENTRIES = 8;
 const CACHE_BYTES = 16 * 1024 * 1024;
 /**
  * Records are written to the store's file, or compressed into one block when
- * the store keeps them in memory, in batches of about this size: a batch
- * closes at the record that takes it past this size, and a file store's read
- * of a record still gathered writes the batch at once, so a write can be
- * smaller and so can the block a failed write leaves.
+ * the store keeps them in memory, in batches of at most this size: a batch
+ * closes before the record that would take it past this size, so a larger
+ * record goes alone and a read of a record near it decompresses no more than
+ * this. A file store's read of a record still gathered writes the batch at
+ * once, so a write can be smaller and so can the block a failed write leaves.
  */
 const WRITE_BATCH_BYTES = 1024 * 1024;
 /**
@@ -714,8 +714,6 @@ function freezeAndMeasure(value: unknown): number {
 /** What the finalizer needs to release a store's file; must not refer to the store. */
 interface StoreHandle {
 	fd: number;
-	/** Set on Windows, where an open file cannot be unlinked: deleted when the store goes. */
-	path: string | undefined;
 	/** Set once `fd` is closed: the number may belong to another file since. */
 	closed: boolean;
 }
@@ -733,39 +731,11 @@ interface DecompressedBlock {
 	readonly data: Buffer;
 }
 
-const windowsStoreHandles = new Set<StoreHandle>();
-let windowsExitHookInstalled = false;
 /**
  * Whether a store whose file could not be made was reported; the cause is the
  * host's, so once per process is enough.
  */
 let openFailureLogged = false;
-/** A store file's name: the pid of the process that made it, then a UUID. */
-const STORE_FILE_NAME = /^(\d+)-[0-9a-f-]+\.jsonl$/;
-/** Whether this process swept the store directory ({@link sweepStaleStores}). */
-let staleStoresSwept = false;
-
-/**
- * Delete from `dir` the store files of processes that are gone, at the first
- * store a process opens; for Windows, where a store's file is deleted only
- * when the store closes, is collected or at exit, so a killed process leaves
- * its file, which holds its entries unmasked. A file whose pid a live process
- * has (its own, or a dead one's pid reused) stays until a later sweep finds
- * that pid gone.
- */
-function sweepStaleStores(dir: string): void {
-	if (staleStoresSwept) return;
-	staleStoresSwept = true;
-	for (const name of fs.readdirSync(dir)) {
-		const match = STORE_FILE_NAME.exec(name);
-		if (!match || isPidAlive(Number(match[1]))) continue;
-		try {
-			fs.rmSync(path.join(dir, name), { force: true });
-		} catch {
-			// Still held open by some process: a later process's sweep takes it.
-		}
-	}
-}
 
 /**
  * Throw unless `dir` is a directory, not a link to one, that account `uid`
@@ -781,35 +751,29 @@ function assertPrivateDirectory(dir: string, uid: number): void {
 
 /**
  * Make a store's file under `os.tmpdir()/omp-cold-<uid>/`, a directory the
- * account owns alone, and unlink it once open outside Windows. Throws when the
- * file cannot be made (`os.tmpdir()` read-only, under a regular file, full,
- * out of descriptors) or the directory is not the account's alone.
+ * account owns alone, and unlink it once open. Throws when the file cannot
+ * be made (`os.tmpdir()` read-only, under a regular file, full, out of
+ * descriptors), the directory is not the account's alone, or the platform has
+ * no account ids to check the directory's owner against.
  */
 function openStoreFile(): StoreHandle {
 	// One directory per account: `os.tmpdir()` is shared between accounts on
 	// Linux and the directory is 0700, so under one shared name the first
 	// account would own it and every other account's open would fail.
 	const uid = process.getuid?.();
-	const dir = path.join(os.tmpdir(), uid === undefined ? "omp-cold" : `omp-cold-${uid}`);
+	if (uid === undefined) throw new Error("this platform has no account id to check the store directory's owner");
+	const dir = path.join(os.tmpdir(), `omp-cold-${uid}`);
 	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-	const windows = process.platform === "win32";
-	if (windows) sweepStaleStores(dir);
-	else if (uid !== undefined) assertPrivateDirectory(dir, uid);
+	assertPrivateDirectory(dir, uid);
 	const file = path.join(dir, `${process.pid}-${crypto.randomUUID()}.jsonl`);
 	const fd = fs.openSync(file, "wx+", 0o600);
-	const handle: StoreHandle = { fd, path: undefined, closed: false };
-	if (windows) {
-		handle.path = file;
-		trackWindowsStore(handle);
-		return handle;
-	}
 	try {
 		fs.unlinkSync(file);
 	} catch (error) {
 		fs.closeSync(fd);
 		throw error;
 	}
-	return handle;
+	return { fd, closed: false };
 }
 
 function releaseStoreHandle(handle: StoreHandle): void {
@@ -820,26 +784,10 @@ function releaseStoreHandle(handle: StoreHandle): void {
 	} catch {
 		// Already closed.
 	}
-	if (handle.path === undefined) return;
-	windowsStoreHandles.delete(handle);
-	try {
-		fs.unlinkSync(handle.path);
-	} catch {
-		// Already gone.
-	}
 }
 
 /** Closes a store's descriptor once no manager and no cold entry refers to the store. */
 const storeRegistry = new FinalizationRegistry<StoreHandle>(releaseStoreHandle);
-
-function trackWindowsStore(handle: StoreHandle): void {
-	windowsStoreHandles.add(handle);
-	if (windowsExitHookInstalled) return;
-	windowsExitHookInstalled = true;
-	process.once("exit", () => {
-		for (const pending of windowsStoreHandles) releaseStoreHandle(pending);
-	});
-}
 
 interface CachedRecord {
 	readonly entry: Readonly<Record<string, unknown>>;
@@ -850,24 +798,23 @@ interface CachedRecord {
 /**
  * One loaded manager's records of cold entries, with one of two backings.
  * Normally a file under `os.tmpdir()/omp-cold-<uid>/`, a directory the account
- * owns alone, unlinked as soon as it is open on POSIX (its disk is freed when
- * the descriptor closes, and a killed process leaves nothing; on Windows it is
- * deleted when the store is closed or collected and at exit, and a later
- * process deletes a killed process's file at its first store open, unless
- * that pid is in use again). Where that file cannot be made, and from a
- * failed write to it on (a full disk), the records are kept in memory instead,
- * zstd-compressed in blocks of whole records of about
- * {@link WRITE_BATCH_BYTES}; the records gathered for the next block stay as
- * bytes, and the records the file already holds are read from it. A read of a
- * record in a block decompresses that block, and the reads after it in the
- * same synchronous pass share it while they stay in that block, so a pass over
- * the records in store order decompresses each block once; the block is
- * dropped as soon as the pass ends (in a microtask), leaving only the parsed
- * records in the record cache. No other directory is used. A record is
- * the entry exactly as the manager held it, with image data replaced by blob
- * references. Every cold entry refers to its store, so a clone sharing the
- * entries keeps it open as long as it needs it; the last manager holding it
- * closes it when that manager closes ({@link release}).
+ * owns alone, unlinked as soon as it is open (its disk is freed when the
+ * descriptor closes, and a killed process leaves nothing). Otherwise the
+ * records are kept in memory: on Windows ({@link open}), where that file
+ * cannot be made, and from a failed write to it on (a full disk), they are
+ * zstd-compressed in blocks of whole records of at most
+ * {@link WRITE_BATCH_BYTES} (a larger record alone); the records gathered for
+ * the next block stay as bytes, and the records the file already holds are
+ * read from it. A read of a record in a block decompresses
+ * that block, and the reads after it in the same synchronous pass share it
+ * while they stay in that block, so a pass over the records in store order
+ * decompresses each block once; the block is dropped as soon as the pass ends
+ * (in a microtask), leaving only the parsed records in the record cache. No
+ * other directory is used. A record is the entry exactly as the manager held
+ * it, with image data replaced by blob references. Every cold entry refers to
+ * its store, so a clone sharing the entries keeps it open as long as it needs
+ * it; the last manager holding it closes it when that manager closes
+ * ({@link release}).
  */
 export class ColdEntryStore {
 	readonly #blobs: BlobStore;
@@ -908,12 +855,16 @@ export class ColdEntryStore {
 	#hydrations = 0;
 
 	/**
-	 * A new store: over a file, or in memory where its file cannot be made
-	 * (`os.tmpdir()` read-only, under a regular file, full, out of descriptors,
-	 * or its directory not one the account owns alone), which is logged once
-	 * per process with the reason.
+	 * A new store: over a file, or in memory on Windows and where its file
+	 * cannot be made (`os.tmpdir()` read-only, under a regular file, full, out
+	 * of descriptors, or its directory not one the account owns alone), which
+	 * last is logged once per process with the reason.
 	 */
 	static open(blobs: BlobStore): ColdEntryStore {
+		// A Windows file takes the access list of its directory, and nothing tells
+		// whether another account made `omp-cold` in a shared temporary directory
+		// first: it could read the records, which hold the entries unmasked.
+		if (os.platform() === "win32") return new ColdEntryStore(blobs, undefined);
 		try {
 			return new ColdEntryStore(blobs, openStoreFile());
 		} catch (error) {
@@ -1050,6 +1001,9 @@ export class ColdEntryStore {
 	/** Write one record; its entry becomes cold through {@link convertToColdEntry}. Only while {@link writable}. */
 	append(data: Buffer): ColdRecord {
 		if (!this.writable) throw new Error("A cold entry store that closed cannot take a record.");
+		// A record that would take the batch past its size starts the next one,
+		// so a block holds one record larger than that alone.
+		if (this.#pendingBytes > 0 && this.#pendingBytes + data.length > WRITE_BATCH_BYTES) this.#flush();
 		const record: ColdRecord = { store: this, offset: this.#bytes, length: data.length };
 		this.#pending.push(data);
 		this.#pendingBytes += data.length;

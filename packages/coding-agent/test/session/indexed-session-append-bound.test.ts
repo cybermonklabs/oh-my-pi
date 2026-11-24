@@ -1,8 +1,9 @@
 /**
  * Indexed storage (`IndexedSessionStorage`, which SQL and Redis session
- * storage build on) under a backend that falls behind: every path of every
- * store in the process together holds at most 64 MiB of queued appends, an
- * admission wait ends once enough of them settle (or the turn is aborted),
+ * storage build on) under a backend that falls behind: a turn waits for
+ * admission while every path of every store in the process together holds
+ * more than 64 MiB of queued appends, the wait ends once enough of them
+ * settle (or the turn is aborted), a wait that lasts 10 s logs one warning,
  * and a path's lines queued behind an append in flight go to a backend that
  * has `appendBatch` in one call, the index rolling back as it does for
  * failed appends one at a time.
@@ -18,7 +19,7 @@ import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/ses
 import { logger } from "@oh-my-pi/pi-utils";
 
 const MiB = 1024 * 1024;
-/** The process bound on queued append bytes. */
+/** The queued append bytes past which a turn waits for admission. */
 const BOUND = 64 * MiB;
 /** One line of exactly 1 MiB; every queued copy is this one string. */
 const MIB_LINE = `${"x".repeat(MiB - 1)}\n`;
@@ -49,6 +50,12 @@ class Releases {
 		await this.#oneHeld();
 		this.#held.shift()?.();
 		await flushMicrotasks();
+	}
+
+	/** Release the oldest held append, once one is held, waiting on no clock: for a test on fake timers. */
+	async releaseOneNow(): Promise<void> {
+		await this.#oneHeld();
+		this.#held.shift()?.();
 	}
 
 	/** Release held appends, oldest first, until `done` settles. */
@@ -357,6 +364,49 @@ describe("indexed session storage bounds the appends it queues", () => {
 
 		await releases.releaseUntil(Promise.all([unbounded, writer.flush()]));
 		await session.storage.drain();
+	});
+
+	it("logs one warning once an admission has waited 10 s, with the bytes queued, and none for a wait that ends sooner", async () => {
+		// If this regresses, a backend whose connection hangs stops every turn of the process at its next
+		// model request with nothing in the log until the turn is aborted, or the log takes a line per wait.
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		vi.spyOn(logger, "debug").mockImplementation(() => {});
+		const releases = new Releases();
+		const session = { ...(await heldStorage(releases)), paths: ["/s/slow.jsonl"] };
+		const writer = session.storage.openWriter("/s/slow.jsonl");
+		for (let n = 0; n < 65; n++) writer.appendSync?.(MIB_LINE);
+		const stillWaiting = () =>
+			warn.mock.calls
+				.filter(([message]) => message === "Session append admission still waiting")
+				.map(([, data]) => data);
+		const warning = { queuedBytes: 65 * MiB, admissionBytes: BOUND, waitMs: 10_000 };
+
+		vi.useFakeTimers();
+		try {
+			const slow = session.storage.waitForAppendAdmission();
+			vi.advanceTimersByTime(9_999);
+			const before = stillWaiting();
+			vi.advanceTimersByTime(1);
+			const at = stillWaiting();
+			vi.advanceTimersByTime(60_000);
+			expect({ before, at, later: stillWaiting() }).toEqual({ before: [], at: [warning], later: [warning] });
+			await releases.releaseOneNow();
+			await slow;
+
+			// Past 64 MiB again: this wait ends after 5 s, and its warning never comes.
+			writer.appendSync?.(MIB_LINE);
+			const fast = session.storage.waitForAppendAdmission();
+			vi.advanceTimersByTime(5_000);
+			await releases.releaseOneNow();
+			await fast;
+			vi.advanceTimersByTime(60_000);
+			expect(stillWaiting()).toEqual([warning]);
+		} finally {
+			vi.useRealTimers();
+			// Other tests share the process's queued appends: leave none behind, also when this one fails.
+			await releases.releaseUntil(writer.flush());
+			await session.storage.drain();
+		}
 	});
 });
 

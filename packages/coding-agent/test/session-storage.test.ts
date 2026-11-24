@@ -16,6 +16,7 @@ import {
 	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { type SessionTitleUpdate, serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import { logger } from "@oh-my-pi/pi-utils";
 
 class ControlledTitleUpdateBackend implements SessionStorageBackend {
 	readonly #sessionPath: string;
@@ -858,6 +859,23 @@ class MemoryBackend implements SessionStorageBackend {
 	}
 }
 
+/** A {@link MemoryBackend} with a streamed full write; it records the bytes of each full write by kind. */
+class StreamingMemoryBackend extends MemoryBackend {
+	readonly streamedBytes: number[] = [];
+	readonly writeFullBytes: number[] = [];
+
+	override writeFull(path: string, content: string): Promise<void> {
+		this.writeFullBytes.push(Buffer.byteLength(content));
+		return super.writeFull(path, content);
+	}
+	async writeFullStream(path: string, chunks: AsyncIterable<Uint8Array>, byteLength: number): Promise<void> {
+		const parts: Uint8Array[] = [];
+		for await (const chunk of chunks) parts.push(chunk);
+		this.streamedBytes.push(byteLength);
+		this.sessions.set(path, Buffer.concat(parts).toString("utf8"));
+	}
+}
+
 /** An indexed storage that records the whole text each full rewrite hands its own text writers. */
 class InterceptingIndexedStorage extends IndexedSessionStorage {
 	readonly intercepted: string[] = [];
@@ -920,6 +938,46 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 			}
 		},
 	);
+
+	// If this regresses, a full rewrite on Windows writes the session's unmasked body to a file under
+	// the temporary directory, where a directory another account made first gives that account read access.
+	it("makes no spool file on Windows: streams the lines to a backend that takes a stream, and joins them for one that does not", async () => {
+		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-spool-windows-"));
+		vi.spyOn(os, "tmpdir").mockReturnValue(tmp);
+		vi.spyOn(os, "platform").mockReturnValue("win32");
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const streaming = new StreamingMemoryBackend();
+			const joined = new MemoryBackend();
+			for (const backend of [streaming, joined]) {
+				const storage = new IndexedSessionStorage(backend);
+				await storage.initialize();
+				await storage.writeLinesAtomic("/sessions/atomic.jsonl", serialized(), { expectedSize: null });
+				storage.writeLinesSync("/sessions/sync.jsonl", serialized(), { expectedSize: null });
+				await storage.drain();
+			}
+
+			expect({
+				underTmp: fs.readdirSync(tmp),
+				streamed: streaming.streamedBytes,
+				streamingWriteFull: streaming.writeFullBytes,
+				stored: [streaming, joined].map(backend => Object.fromEntries(backend.sessions)),
+				spoolWarnings: warn.mock.calls.filter(([message]) => String(message).includes("spool")),
+			}).toEqual({
+				underTmp: [],
+				streamed: [Buffer.byteLength(body), Buffer.byteLength(body)],
+				streamingWriteFull: [],
+				stored: [
+					{ "/sessions/atomic.jsonl": body, "/sessions/sync.jsonl": body },
+					{ "/sessions/atomic.jsonl": body, "/sessions/sync.jsonl": body },
+				],
+				spoolWarnings: [],
+			});
+		} finally {
+			vi.restoreAllMocks();
+			await fsp.rm(tmp, { recursive: true, force: true });
+		}
+	});
 
 	it("hands a subclass that intercepts writeTextAtomic and writeTextSync the joined lines, and stores them", async () => {
 		const backend = new MemoryBackend();
