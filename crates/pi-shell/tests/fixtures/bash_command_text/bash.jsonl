@@ -79,6 +79,7 @@
 {"id":"c/trap-cmdsub-exit","script":"trap 'x=$(echo \"$BASH_COMMAND\"); echo \"E:[$x]\"' EXIT; echo   a >/dev/null","stdout":"E:[echo a > /dev/null]\n","stderr":"","status":0}
 {"id":"c/trap-cmdsub-nested","script":"trap 'x=$(y=$(echo \"$BASH_COMMAND\"); echo \"$y\"); echo \"D:[$x]\"' DEBUG; echo  a >/dev/null","stdout":"D:[echo a > /dev/null]\n","stderr":"","status":0}
 {"id":"c/trap-cmdsub-subshell","script":"trap 'x=$( ( echo \"$BASH_COMMAND\" ) ); echo \"D:[$x]\"' DEBUG; echo  a >/dev/null","stdout":"D:[echo \"$BASH_COMMAND\"]\n","stderr":"","status":0}
+{"id":"c/trap-coproc","script":"trap 'coproc { echo \"C:[$BASH_COMMAND]\"; read -r; }; read -r l <&\"${COPROC[0]}\"; echo \"$l\"; echo >&\"${COPROC[1]}\"; wait' EXIT; echo  a >/dev/null","stdout":"C:[echo \"C:[$BASH_COMMAND]\"]\n","stderr":"","status":0}
 {"id":"c/trap-function-cmdsub","script":"f() { x=$(echo \"$BASH_COMMAND\"); echo \"F:[$x]\"; }; trap f DEBUG; echo  a >/dev/null","stdout":"F:[echo a > /dev/null]\n","stderr":"","status":0}
 {"id":"c/trap-pipeline","script":"trap 'echo \"P:[$BASH_COMMAND]\" | cat' DEBUG; echo  a >/dev/null","stdout":"P:[echo a > /dev/null]\n","stderr":"","status":0}
 {"id":"c/trap-pipeline-compound","script":"trap '{ echo \"P:[$BASH_COMMAND]\"; } | cat' DEBUG; echo  a >/dev/null","stdout":"P:[echo \"P:[$BASH_COMMAND]\"]\n","stderr":"","status":0}
@@ -174,6 +175,7 @@
 {"id":"s/trap-cmdsub-exit","script":"trap 'x=$(echo \"$BASH_COMMAND\"); echo \"E:[$x]\"' EXIT; echo   a >/dev/null","stdout":"E:[echo a > /dev/null]\n","stderr":"","status":0}
 {"id":"s/trap-cmdsub-nested","script":"trap 'x=$(y=$(echo \"$BASH_COMMAND\"); echo \"$y\"); echo \"D:[$x]\"' DEBUG; echo  a >/dev/null","stdout":"D:[echo a > /dev/null]\n","stderr":"","status":0}
 {"id":"s/trap-cmdsub-subshell","script":"trap 'x=$( ( echo \"$BASH_COMMAND\" ) ); echo \"D:[$x]\"' DEBUG; echo  a >/dev/null","stdout":"D:[echo \"$BASH_COMMAND\"]\n","stderr":"","status":0}
+{"id":"s/trap-coproc","script":"trap 'coproc { echo \"C:[$BASH_COMMAND]\"; read -r; }; read -r l <&\"${COPROC[0]}\"; echo \"$l\"; echo >&\"${COPROC[1]}\"; wait' EXIT; echo  a >/dev/null","stdout":"C:[echo \"C:[$BASH_COMMAND]\"]\n","stderr":"","status":0}
 {"id":"s/trap-function-cmdsub","script":"f() { x=$(echo \"$BASH_COMMAND\"); echo \"F:[$x]\"; }; trap f DEBUG; echo  a >/dev/null","stdout":"F:[echo a > /dev/null]\n","stderr":"","status":0}
 {"id":"s/trap-pipeline","script":"trap 'echo \"P:[$BASH_COMMAND]\" | cat' DEBUG; echo  a >/dev/null","stdout":"P:[echo a > /dev/null]\n","stderr":"","status":0}
 {"id":"s/trap-pipeline-compound","script":"trap '{ echo \"P:[$BASH_COMMAND]\"; } | cat' DEBUG; echo  a >/dev/null","stdout":"P:[echo \"P:[$BASH_COMMAND]\"]\n","stderr":"","status":0}

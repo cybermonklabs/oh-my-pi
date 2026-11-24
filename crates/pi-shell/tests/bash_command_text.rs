@@ -217,6 +217,12 @@ const OWN_ROWS: &[(&str, &str)] = &[
 		"trap-cmdsub-subshell",
 		r#"trap 'x=$( ( echo "$BASH_COMMAND" ) ); echo "D:[$x]"' DEBUG; echo  a >/dev/null"#,
 	),
+	// A coprocess, which bash forks through `execute_in_subshell` too: its
+	// own command.
+	(
+		"trap-coproc",
+		r#"trap 'coproc { echo "C:[$BASH_COMMAND]"; read -r; }; read -r l <&"${COPROC[0]}"; echo "$l"; echo >&"${COPROC[1]}"; wait' EXIT; echo  a >/dev/null"#,
+	),
 	// A `$( )` outside a trap names its own command.
 	("cmdsub-own-command", r#"x=$(echo  "[$BASH_COMMAND]"); echo "$x""#),
 	("read-in-body", r#"for i in 1; do echo "[$BASH_COMMAND]"; done"#),
