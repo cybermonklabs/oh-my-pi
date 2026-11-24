@@ -236,7 +236,8 @@ export async function runInProcessTab(tab: InProcessRunTab, opts: RunInProcessOp
 		};
 		// Like the inline worker fallback, in-process runs execute user JS here: awaited
 		// backend/tool calls observe this abort signal, but a synchronous infinite loop
-		// cannot be interrupted.
+		// cannot be interrupted. The runtime gets the signal too: a run abandoned with code
+		// still pending gives the realm back at once instead of when (if ever) that code settles.
 		let returnValue: unknown;
 		let runError: unknown;
 		let runFailed = false;
@@ -246,7 +247,7 @@ export async function runInProcessTab(tab: InProcessRunTab, opts: RunInProcessOp
 				recordFloatingFailure,
 				async () =>
 					await Promise.race([
-						runtime.run(opts.code, filename, hooks, { runId, cwd: opts.snapshot.cwd }),
+						runtime.run(opts.code, filename, hooks, { runId, cwd: opts.snapshot.cwd, signal }),
 						cancelRejection,
 						floatingFailure,
 					]),

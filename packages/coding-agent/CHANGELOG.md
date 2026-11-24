@@ -199,6 +199,7 @@
 - Exiting after aborting a `bash` command now waits for its TERM-resistant foreground processes to be killed ([#18669](https://github.com/can1357/oh-my-pi/issues/18669)).
 - A disposed or switched session now releases every persistent shell it owns, including the ones a surface keeps under a name of its own (`/loop` conditions), instead of holding one native shell per surface for the life of the process ([#18717](https://github.com/can1357/oh-my-pi/pull/18717) by [@eggpeat](https://github.com/eggpeat))
 - Bash tool: a command that times out or is cancelled now behaves like Ctrl+C in a terminal: only what it started is stopped, and the shell keeps its variables, working directory and the `&` jobs earlier commands left running (a server or VM no longer dies with a later command's timeout)
+- Fixed one timed-out or cancelled cmux, Tern or inline-worker browser run, whose code was still waiting, breaking every later browser run on another tab until omp restarted (`Cannot initialize a JS runtime while another same-realm JS runtime is running`): an abandoned run now gives the process's JS realm back at once, and its code, if it wakes later, can no longer print, call tools or drive the tab of the run that owns the realm
 
 ### Breaking Changes
 
