@@ -3967,6 +3967,7 @@ fn run_builtin(
 			ctx.compound.clone_from(&e.compound);
 			ctx.arrayref.clone_from(&e.arrayref);
 			ctx.resumed = e.resumed;
+			ctx.waited = e.status;
 			let r = builtins::run(id, &mut ctx, &e.argv);
 			// Not through `command`.
 			let fatal = ctx.usage_error && !e.via_command;
@@ -4097,6 +4098,10 @@ fn settle_builtin(
 		Control::Wait(w) => {
 			e.wait_for = w.children;
 			e.wait_into = w.into.map(Box::new);
+			if let Some(next) = w.resume {
+				e.resumed = next;
+				e.resume = true;
+			}
 			e.waiting = Some(if w.any {
 				Awaited::AnyJob { waited: None, operands: w.operands }
 			} else if w.all {
@@ -4464,6 +4469,17 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					let later = st(vp).wait_for[1..].contains(&v);
 					let forget = posix && operands && !later && named_by_pid(vp, v);
 					forget_job(k, cx, vp, v, forget);
+					// zsh `wait`, one operand at a time: zsh keeps the status
+					// of a job a job spec waited for (its `SIGCHLD` handler kept
+					// it, `addbgstatus`), for a later pid operand; a pid
+					// operand takes the one kept (`getbgstatus`).
+					if st(vp).resume {
+						if zsh_waited_spec(vp) {
+							state::save_status(&mut k.root, cx.store, vp, v, shown, s);
+						} else {
+							state::forget_status(&mut k.root, cx.store, vp, v);
+						}
+					}
 					exec::reap_coproc(k, vp, cx, v);
 				} else if let (false, Some(JobState::Stopped(sig))) =
 					(force, vp.jobs.by_vpid(v).map(|j| j.state))
@@ -4489,7 +4505,18 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			}
 			// An operand after the last child failed: bash returns the last
 			// operand's status.
-			after.unwrap_or(last)
+			let status = after.unwrap_or(last);
+			// zsh `wait` goes on from the operand after this one, with this
+			// status ([`builtins::Wait::resume`]).
+			if st(vp).resume {
+				let s = st(vp);
+				s.resume = false;
+				s.status = status;
+				s.waiting = None;
+				s.stage = Stage::Dispatch;
+				return None;
+			}
+			status
 		},
 		Some(Awaited::AllJobs) => {
 			// bash waits for the first job still running, again and again
@@ -4881,6 +4908,17 @@ fn named_by_pid(vp: &Vproc, v: crate::bash::ids::Vpid) -> bool {
 		.filter(|w| !w.is_empty() && w.iter().all(u8::is_ascii_digit))
 		.filter_map(|w| std::str::from_utf8(w).ok()?.parse().ok())
 		.any(|pid| vp.vpid_of(pid) == v)
+}
+
+/// Whether the operand zsh `wait` waits for now (the one before
+/// `argv[resumed]`, [`builtins::Wait::resume`]) is a job spec, not a pid
+/// (zsh `isanum`).
+fn zsh_waited_spec(vp: &mut Vproc) -> bool {
+	let e = st(vp);
+	(e.resumed as usize)
+		.checked_sub(1)
+		.and_then(|i| e.argv.get(i))
+		.is_some_and(|w| w.is_empty() || !w.iter().all(u8::is_ascii_digit))
 }
 
 /// The status of child `v` that `wait` waits for, once it ended: its

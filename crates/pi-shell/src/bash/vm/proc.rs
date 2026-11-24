@@ -2109,9 +2109,12 @@ pub struct ExecState {
 	/// posix shell.
 	pub via_command:   bool,
 	/// The awaited frame was pushed by the builtin, which runs again when
-	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).
+	/// it returns ([`Control::Resume`](super::builtins::Control::Resume));
+	/// or zsh `wait` waits for one operand's child, and runs again once it
+	/// ended ([`Wait::resume`](super::builtins::Wait::resume)).
 	pub resume:        bool,
-	/// Times the builtin ran again after a frame it pushed returned.
+	/// Times the builtin ran again after a frame it pushed returned; for
+	/// zsh `wait`, the `argv` index of the operand it goes on from.
 	pub resumed:       u32,
 	/// bash's notice of the command a signal killed, written to the shell's
 	/// own standard error once the command's redirections are undone

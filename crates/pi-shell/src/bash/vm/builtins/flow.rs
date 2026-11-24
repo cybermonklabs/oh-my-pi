@@ -524,6 +524,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			crate::bash::vm::state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, base, false);
 		}
 	}
+	let words = args.len();
 	let args = o.rest;
 	if any {
 		return wait_any(ctx, args, into);
@@ -531,56 +532,28 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if args.is_empty() {
 		return wait_all(ctx, force);
 	}
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		// The first operand's index in `argv`, after the name and options.
+		return zsh_wait(ctx, args, 1 + words - args.len(), into, force);
+	}
 	let mut list = Vec::new();
 	let mut status = 0;
 	// The status of the operands after the last child, when one failed:
 	// bash returns the last operand's status.
 	let mut after = None;
-	let zsh = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 	// In posix mode bash waits for a pid operand with `wait_for_single_pid`,
-	// which deletes the job and forgets its status (`jobs.c:2782-2786`), and
-	// zsh deletes the job it waited for: a later operand naming that job
-	// then names no child (`pid N is not a child of this shell`, `%N: no
-	// such job`), operand by operand.
-	let forgets = zsh
-		|| crate::bash::vm::state::option(
-			&mut ctx.k.root,
-			ctx.cx.store,
-			ctx.vp,
-			crate::bash::store::OptId::Posix,
-		)
-		.unwrap_or(false);
+	// which deletes the job and forgets its status (`jobs.c:2782-2786`): a
+	// later operand naming that job then names no child (`pid N is not a
+	// child of this shell`, `%N: no such job`), operand by operand.
+	let posix = crate::bash::vm::state::option(
+		&mut ctx.k.root,
+		ctx.cx.store,
+		ctx.vp,
+		crate::bash::store::OptId::Posix,
+	)
+	.unwrap_or(false);
 	let mut forgotten: Vec<Vpid> = Vec::new();
-	// zsh `bin_fg`: a pid operand that names no child leaves 127 for the
-	// command, and no later pid operand is waited for.
-	let mut zsh_failed = false;
 	for a in args {
-		if zsh && !a.iter().all(u8::is_ascii_digit) {
-			// zsh `bin_fg`: any other word is a job spec; a bad one ends
-			// the arguments with status 127, and so does one naming a job
-			// an earlier pid operand waited for (zsh deleted it).
-			match zsh_wait_job(ctx, a)? {
-				Some(v) if forgotten.contains(&v) => {
-					if !ctx.zsh_option(crate::bash::zshopt::ZshOpt::Posixbuiltins)? {
-						ctx.usage(format!("{}: no such job", a.as_bstr()));
-					}
-				},
-				Some(v) => {
-					list.push(v);
-					if !zsh_failed {
-						after = None;
-					}
-					continue;
-				},
-				None => {},
-			}
-			status = 127;
-			after = Some(127);
-			break;
-		}
-		if zsh && zsh_failed && a.first().is_some_and(u8::is_ascii_digit) {
-			continue;
-		}
 		if a.first().is_some_and(u8::is_ascii_digit) {
 			let Some(pid) = number(a).and_then(|n| u32::try_from(n).ok()) else {
 				// bash returns at once on a malformed pid.
@@ -596,17 +569,13 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			if is_child(ctx, child) && !forgotten.contains(&child) {
 				list.push(child);
 				after = None;
-				if forgets {
+				if posix {
 					forgotten.push(child);
 				}
 			} else {
-				// zsh `bin_fg`: silent under `posixbuiltins`.
-				if !zsh || !ctx.zsh_option(crate::bash::zshopt::ZshOpt::Posixbuiltins)? {
-					ctx.usage(format!("pid {pid} is not a child of this shell"));
-				}
+				ctx.usage(format!("pid {pid} is not a child of this shell"));
 				status = 127;
 				after = Some(127);
-				zsh_failed = zsh;
 			}
 		} else if a.starts_with(b"%") {
 			match super::jobs::spec(ctx, a) {
@@ -645,15 +614,111 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if list.is_empty() {
 		return done(status);
 	}
-	let wait = Wait { children: list, operands: true, after, all: false, any: false, into, force };
+	let wait = Wait {
+		children: list,
+		operands: true,
+		after,
+		all: false,
+		any: false,
+		into,
+		force,
+		resume: None,
+	};
 	Ok(Outcome { status, control: Control::Wait(wait) })
+}
+
+/// zsh `wait id …` (`bin_fg`): each operand at its turn, in the job table
+/// the waits before it left, one child waited for at a time (the builtin
+/// runs again for the operands after it: [`Wait::resume`]). The status so
+/// far starts at 0. A pid operand of a job in the table is waited for only
+/// while that status is 0 (`if (retval == 0) retval = waitforpid (pid,
+/// 1)`), else passed over; one of a child whose job left the table gives
+/// the status zsh kept for it (`getbgstatus`, which forgets it); any other
+/// number warns `pid N is not a child of this shell` (silent under
+/// `posixbuiltins`) and gives 127. A job spec is waited for whatever the
+/// status so far (`zwaitjob`) and gives the job's status; a waited job is
+/// deleted, so a spec naming it then names none: `getjob`'s warning, 127,
+/// and no operand after it is read. A finished job has left zsh's table
+/// ([`zsh_in_table`]), also one that ended while the `wait` waited for
+/// another. `base` is the first operand's index in `argv`.
+fn zsh_wait(
+	ctx: &mut Ctx<'_, '_>,
+	args: &[BString],
+	base: usize,
+	into: Option<BString>,
+	force: bool,
+) -> R {
+	// Run again after a wait: from the operand after the waited one, with
+	// the waited child's status.
+	let (from, mut status) = match ctx.resumed {
+		0 => (0, 0),
+		next => ((next as usize).saturating_sub(base), ctx.waited),
+	};
+	for (i, a) in args.iter().enumerate().skip(from) {
+		let next = u32::try_from(base + i + 1).unwrap_or(u32::MAX);
+		// zsh `isanum`: any other word is a job spec.
+		if a.is_empty() || !a.iter().all(u8::is_ascii_digit) {
+			let Some(v) = zsh_wait_job(ctx, a)? else {
+				status = 127;
+				break;
+			};
+			return Ok(zsh_waits_for(v, status, next, into, force));
+		}
+		let Some(pid) = number(a).and_then(|n| u32::try_from(n).ok()) else {
+			ctx.usage(format!("`{}': not a pid or valid job spec", a.as_bstr()));
+			status = 1;
+			break;
+		};
+		let child = ctx.vp.vpid_of(pid);
+		if !is_child(ctx, child) {
+			if !ctx.zsh_option(crate::bash::zshopt::ZshOpt::Posixbuiltins)? {
+				ctx.usage(format!("pid {pid} is not a child of this shell"));
+			}
+			status = 127;
+			continue;
+		}
+		// zsh `findproc`: a job of the table holds the pid; else the wait
+		// takes the status zsh kept for it.
+		let listed = ctx
+			.vp
+			.jobs
+			.by_vpid(child)
+			.is_some_and(|j| !j.inherited && zsh_in_table(j));
+		if !listed || status == 0 {
+			return Ok(zsh_waits_for(child, status, next, into, force));
+		}
+	}
+	done(status)
+}
+
+/// [`zsh_wait`] waits for child `v`, then runs again from `argv[next]`.
+fn zsh_waits_for(v: Vpid, status: i32, next: u32, into: Option<BString>, force: bool) -> Outcome {
+	let wait = Wait {
+		children: vec![v],
+		operands: true,
+		after: None,
+		all: false,
+		any: false,
+		into,
+		force,
+		resume: Some(next),
+	};
+	Outcome { status, control: Control::Wait(wait) }
+}
+
+/// Whether job `j` is in zsh's table for [`zsh_wait`]: one that runs or
+/// stopped. Without job control zsh deletes a finished job as it reaps it
+/// (its `printjob` prints nothing): one that ended before the `wait`, or
+/// while it waited for another job.
+const fn zsh_in_table(j: &crate::bash::vm::proc::Job) -> bool {
+	!matches!(j.state, crate::bash::vm::proc::JobState::Done(_))
 }
 
 /// zsh `getjob` and `bin_fg`'s in-use check for `wait SPEC`: the job's
 /// vpid, or `None` after zsh's warning (silent under `posixbuiltins`). A
-/// finished job is gone from zsh's table (it is deleted when reported),
-/// so `%%`, `%+`, `%-` and `%N` naming none are `SPEC: no such job`; a
-/// name or `%?text` matching none is `job not found: …`.
+/// finished job is gone from zsh's table ([`zsh_in_table`]), so `%%`,
+/// `%+`, `%-` and `%N` naming none are `SPEC: no such job`; a name or
+/// `%?text` matching none is `job not found: …`.
 fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, super::Need> {
 	let rest = word.strip_prefix(b"%").unwrap_or(word);
 	let found = match ctx.vp.jobs.lookup(rest) {
@@ -661,7 +726,7 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 			.vp
 			.jobs
 			.get(n)
-			.filter(|j| !matches!(j.state, crate::bash::vm::proc::JobState::Done(_)))
+			.filter(|j| zsh_in_table(j))
 			.map(|j| j.vpid),
 		_ => None,
 	};
@@ -793,6 +858,7 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 		any: false,
 		into: None,
 		force,
+		resume: None,
 	};
 	Ok(Outcome { status: 0, control: Control::Wait(wait) })
 }
@@ -827,6 +893,7 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 				any: true,
 				into,
 				force: true,
+				resume: None,
 			};
 			return Ok(Outcome { status: 0, control: Control::Wait(wait) });
 		}
@@ -879,7 +946,15 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 		return done(127);
 	}
 	let operands = !args.is_empty();
-	let wait =
-		Wait { children: list, operands, after: None, all: false, any: true, into, force: true };
+	let wait = Wait {
+		children: list,
+		operands,
+		after: None,
+		all: false,
+		any: true,
+		into,
+		force: true,
+		resume: None,
+	};
 	Ok(Outcome { status: 0, control: Control::Wait(wait) })
 }

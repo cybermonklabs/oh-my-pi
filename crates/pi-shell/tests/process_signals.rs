@@ -3279,6 +3279,13 @@ fn a_forked_builtin_holds_none_of_the_parents_jobs() {
 				.to_owned(),
 			"w=127\nst=0\n".to_owned(),
 		),
+		// A builtin through `command`, which runs it after the drop.
+		(
+			"exec 2>/dev/null; /bin/sleep 1 & command kill %1 & wait $!; echo k=$?; wait %1; echo \
+			 st=$?"
+				.to_owned(),
+			"k=1\nst=0\n".to_owned(),
+		),
 	];
 	let mut wrong = Vec::new();
 	bounded_bash_rows(rows, &mut wrong);
@@ -3841,7 +3848,10 @@ fn bash_names_the_line_at_the_fork_for_a_compound_redirection_error() {
 	// A `( … )` bash runs without a fork of its own keeps the line it finds:
 	// the sole command of another `( … )` (not under `!`: `CMD_NO_FORK`)
 	// that of the one around it, a coproc's command the fork's. The `)`'s
-	// line, not the line a continued redirection list ends on.
+	// line, not the line a continued redirection list ends on, nor the line
+	// a here-document's body ends on, and the word `coproc` on an earlier
+	// line names no coproc. In a function's `$( … )` the lines count from
+	// the substitution's frame (bash 5.3; 5.2 numbers those otherwise).
 	const X: &str = ">/nonexistent-dir/x";
 	let err =
 		|line: u32| format!("bash: line {line}: /nonexistent-dir/x: No such file or directory\n");
@@ -3858,6 +3868,21 @@ fn bash_names_the_line_at_the_fork_for_a_compound_redirection_error() {
 		(format!(":\n( ( :\n) {X}\n:\n)\necho end"), 3),
 		(format!(":\n( ( : ) {X} &\nwait\n)\necho end"), 2),
 		(format!("f() {{\n:\n( : ) \\\n{X} | :\n}}\nf 2>&1; echo end"), 3),
+		(format!("f() {{\n:\n( cat <<EOF\nx\nEOF\n) {X} | :\n}}\nf 2>&1; echo end"), 6),
+		(format!("f() {{\n:\n( cat <<EOF\nx\nEOF\n) {X}\n}}\nf 2>&1; echo end"), 6),
+		(format!(":\n( cat <<EOF\nx\nEOF\n) {X}\necho end"), 5),
+		(format!(":\n( ( cat ) <<EOF {X}\nx\nEOF\n)\necho end"), 5),
+		(format!(":\n( ( : ) <<EOF {X}\nx\nEOF\n) | :\necho end"), 5),
+		(format!("f() {{\n:\n( ( : ) <<EOF {X}\nx\nEOF\n) | :\n}}\nf 2>&1; echo end"), 6),
+		(format!("f() {{\n:\n( : ) <<EOF {X} | :\nx\nEOF\n}}\nf 2>&1; echo end"), 3),
+		(format!("f() {{\n: # coproc\n( :\n) {X} | :\n}}\nf 2>&1; echo end"), 4),
+		(format!("f() {{\nx=coproc\n( :\n) {X} | :\n}}\nf 2>&1; echo end"), 4),
+		(format!("f() {{\n:\n( : &\n) {X} | :\nwait\n}}\nf 2>&1; echo end"), 4),
+		(format!("f() {{\n:\n( : &\n) {X}\nwait\n}}\nf 2>&1; echo end"), 4),
+		(format!(":\n( ( :\n) {X} &\n)\n/bin/sleep 1\necho end"), 3),
+		(format!("f() {{\necho $(\n:\n( : ) {X}\n) end\n}}\nf 2>&1"), 3),
+		(format!(":\nf() {{\n:\necho $(\n( : ) {X}\n) end\n}}\nf 2>&1"), 4),
+		(format!("set -o posix\n:\necho $(\n:\n( : ) {X}\n) end"), 4),
 	];
 	let rows = rows
 		.into_iter()
@@ -3948,6 +3973,71 @@ fn zsh_wait_names_no_child_for_a_job_it_waited_for() {
 		(msg("/bin/sleep 1", "1 $p"), not_one.to_owned()),
 		(msg("(exit 3)", "$p 1"), not_one.to_owned()),
 	]);
+}
+
+/// zsh's `wait` reads each operand at its turn (`bin_fg`): the status so
+/// far starts at 0; a pid operand of a job still in the table is waited
+/// for only while it is 0, one whose job has left the table gives the
+/// status zsh kept for it, any other number 127; a job spec is waited for
+/// whatever the status so far, and the job it waited for is deleted, so a
+/// later spec naming it names no job (`getjob`'s warning for its kind),
+/// 127, and no operand after it is read. obash gave 127 for every row with
+/// a failed operand before the last, and waited without end for a job a
+/// job spec had waited for. Checked-in goldens measured with zsh 5.9.
+#[test]
+fn zsh_wait_reads_each_operand_at_its_turn() {
+	let not_one = |a: &str| format!("zsh:wait:2: pid 1 is not a child of this shell\na={a}\n");
+	let no_job = "zsh:wait:2: %1: no such job\na=127\n";
+	// A job a job spec names still runs at that operand's turn: one that
+	// ended at once can leave zsh's own table first (zsh 5.9 varies).
+	let x = |n: &str, s: &str| format!("/bin/sh -c 'sleep {s}; exit {n}'");
+	let (x3, x5) = (x("3", "0.2"), x("5", "0.2"));
+	zsh_rows(
+		[
+			("(exit 3) & p=$!; /bin/sleep 0.3; wait 1 $p".to_owned(), not_one("3")),
+			("/bin/sleep 0.3 & wait 1 %1".to_owned(), not_one("0")),
+			(format!("{x3} & wait 1 %1"), not_one("3")),
+			(
+				"(exit 3) & p=$!; (exit 4) & q=$!; /bin/sleep 0.3; wait 1 $p $q".to_owned(),
+				not_one("4"),
+			),
+			(format!("/bin/sleep 0.1 & {x5} & wait 1 %2"), not_one("5")),
+			("/bin/sleep 0.3 & p=$!; wait 1 $p %1".to_owned(), not_one("0")),
+			("setopt posixbuiltins; /bin/sleep 0.3 & wait 1 %1".to_owned(), "a=0\n".to_owned()),
+			(
+				"/bin/sleep 0.5 & p=$!; (exit 4) & q=$!; /bin/sleep 0.2; wait $q $p".to_owned(),
+				"a=4\n".to_owned(),
+			),
+			(format!("{x3} & p=$!; wait %1 $p"), "a=3\n".to_owned()),
+			("/bin/sleep 0.3 & p=$!; wait %1 $p".to_owned(), "a=0\n".to_owned()),
+			(format!("{x3} & p=$!; wait %% $p"), "a=3\n".to_owned()),
+			(format!("{x3} & wait %1 %1"), no_job.to_owned()),
+			// The second job ends while `wait` waits for the first: zsh
+			// deletes it as it reaps it, so `%2` names no job.
+			(
+				format!("{} & {} & wait %1 %2 %1", x("3", "0.3"), x("4", "0.1")),
+				"zsh:wait:2: %2: no such job\na=127\n".to_owned(),
+			),
+			(format!("setopt posixbuiltins; {x3} & p=$!; wait %1 $p"), "a=3\n".to_owned()),
+			(format!("setopt posixbuiltins; {x3} & wait %1 %1"), "a=127\n".to_owned()),
+			("/bin/sleep 0.3 & p=$!; wait $p %1".to_owned(), no_job.to_owned()),
+			(
+				"/bin/sleep 0.3 & p=$!; /bin/sleep 0.5 & q=$!; wait $p %1 $q".to_owned(),
+				no_job.to_owned(),
+			),
+			(
+				"/bin/sleep 0.3 & p=$!; wait $p %%".to_owned(),
+				"zsh:wait:2: no current job\na=127\n".to_owned(),
+			),
+			(
+				"/bin/sleep 0.3 & p=$!; wait $p %/bin/sleep".to_owned(),
+				"zsh:wait:2: job not found: /bin/sleep\na=127\n".to_owned(),
+			),
+		]
+		.into_iter()
+		.map(|(pre, out)| (format!("{pre} 2>&1; echo a=$?"), out))
+		.collect(),
+	);
 }
 
 /// bash forks a pipeline stage's or a job's simple command before it

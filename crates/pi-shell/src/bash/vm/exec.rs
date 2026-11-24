@@ -2114,61 +2114,71 @@ enum Unforked {
 	Coproc,
 }
 
+/// From the unit's code, not its text (a here-document body, a comment or
+/// a word can hold anything): `node`'s ops begin a coproc's or a `( … )`'s
+/// child, and for a `( … )` they are all of it, up to its `SubExit` (a
+/// `!`, a `time`, an `&` or another command adds ops of its own).
 fn unforked(u: &Unit, node: u32) -> Unforked {
-	let src: &[u8] = &u.source;
-	let Some(n) = u.nodes.get(node as usize) else {
-		return Unforked::No;
-	};
-	let before = skip_back(src, n.lo as usize);
-	if before.checked_sub(1).and_then(|i| src.get(i)) == Some(&b'(') {
-		let open = u32::try_from(before - 1).unwrap_or(u32::MAX);
-		let outer = u
-			.nodes
-			.iter()
-			.position(|m| m.kind == NodeKind::Subshell && m.lo == open)
-			.and_then(|i| u32::try_from(i).ok());
-		return if let Some(outer) = outer
-			&& src.get(skip_fwd(src, n.hi as usize, false)) == Some(&b')')
-		{
-			Unforked::Sole(outer)
-		} else {
-			Unforked::No
-		};
-	}
-	// `coproc ( … )`, `coproc NAME ( … )`.
-	let (word, at) = word_before(src, before);
-	let (prev, _) = word_before(src, skip_back(src, at));
-	if word == b"coproc" || (!word.is_empty() && prev == b"coproc") {
-		Unforked::Coproc
-	} else {
-		Unforked::No
-	}
-}
-
-/// The byte of `( … )` `node`'s `)`: its last byte, else (redirections
-/// follow it, in the node too) the first `)` after the last syntax node of
-/// its body, which the ops between its `Redir` and `PopRedir` run.
-fn close_paren(u: &Unit, node: u32) -> Option<usize> {
-	let n = u.nodes.get(node as usize)?;
-	let redir = u
+	// `node`'s first op: its `Redir`, else its `Enter`.
+	let Some(first) = u
 		.ops
 		.iter()
-		.enumerate()
-		.find(|(_, op)| op.code == Opcode::Redir && op.node == node);
-	let at = if let Some((pc, op)) = redir {
-		let body = u.ops.get(pc + 1..op.b as usize)?;
-		let end = body
-			.iter()
-			.filter(|o| o.node != node)
-			.filter_map(|o| u.nodes.get(o.node as usize))
-			.filter(|m| m.lo > n.lo && m.hi <= n.hi)
-			.map(|m| m.hi)
-			.max()?;
-		skip_fwd(&u.source, end as usize, true)
-	} else {
-		(n.hi as usize).checked_sub(1)?
+		.position(|op| op.node == node && matches!(op.code, Opcode::Redir | Opcode::Enter))
+	else {
+		return Unforked::No;
 	};
-	(u.source.get(at) == Some(&b')')).then_some(at)
+	// The op after them: past its `PopRedir`, else its `Leave`.
+	let end = match u.ops.get(first) {
+		Some(op) if op.code == Opcode::Redir => Some(op.b as usize),
+		_ => u.ops[first..]
+			.iter()
+			.position(|op| op.node == node && op.code == Opcode::Leave)
+			.map(|i| first + i + 1),
+	};
+	for (i, s) in u.spawns.iter().enumerate() {
+		if s.stages.first().map(|st| st.entry as usize) != Some(first) {
+			continue;
+		}
+		match s.kind {
+			SpawnKind::Coproc { .. } => return Unforked::Coproc,
+			SpawnKind::Subshell if end.is_some_and(|end| end + 1 == s.end as usize) => {
+				let outer = u
+					.ops
+					.iter()
+					.find(|op| op.code == Opcode::Spawn && op.a as usize == i)
+					.map(|op| op.node);
+				return outer.map_or(Unforked::No, Unforked::Sole);
+			},
+			_ => {},
+		}
+	}
+	Unforked::No
+}
+
+/// The byte of `( … )` `node`'s `)`: the node ends with it, or with the
+/// redirections after it, back over which it is found (a here-document's
+/// body comes after the line, out of the node).
+fn close_paren(u: &Unit, node: u32) -> Option<usize> {
+	let n = u.nodes.get(node as usize)?;
+	let src: &[u8] = &u.source;
+	let redirs = u
+		.ops
+		.iter()
+		.find(|op| op.code == Opcode::Redir && op.node == node)
+		.and_then(|op| u.redirs.get(op.a as usize));
+	let mut at = n.hi as usize;
+	for r in redirs.into_iter().flatten().rev() {
+		at = skip_back(src, at);
+		at = match &r.target {
+			ir::RedirTargetIr::Word(w) => {
+				u.nodes.get(u.words.get(*w as usize)?.node as usize)?.lo as usize
+			},
+			ir::RedirTargetIr::HereDoc { .. } => word_back(src, at),
+		};
+		at = op_back(src, skip_back(src, at));
+	}
+	let at = skip_back(src, at).checked_sub(1)?;
+	(src.get(at) == Some(&b')')).then_some(at)
 }
 
 /// `at`, moved back over blanks, newlines and backslash-newlines.
@@ -2184,33 +2194,38 @@ const fn skip_back(src: &[u8], mut at: usize) -> usize {
 	at
 }
 
-/// `at`, moved on over blanks, newlines, backslash-newlines, `;`, comments
-/// and, with `amp`, `&`: what can stand between a list's last command and
-/// the `)` that ends it.
-fn skip_fwd(src: &[u8], mut at: usize, amp: bool) -> usize {
-	while let Some(&c) = src.get(at) {
+/// `at`, moved back over the word that ends there (a here-document's
+/// delimiter), a quoted part whole.
+fn word_back(src: &[u8], mut at: usize) -> usize {
+	while let Some(&c) = at.checked_sub(1).and_then(|i| src.get(i)) {
 		match c {
-			b' ' | b'\t' | b'\n' | b';' => at += 1,
-			b'&' if amp => at += 1,
-			b'\\' if src.get(at + 1) == Some(&b'\n') => at += 2,
-			b'#' => {
-				while src.get(at).is_some_and(|&c| c != b'\n') {
-					at += 1;
-				}
+			b'\'' | b'"' => match src[..at - 1].iter().rposition(|&q| q == c) {
+				Some(open) => at = open,
+				None => break,
 			},
-			_ => break,
+			b' ' | b'\t' | b'\n' | b'<' | b'>' | b'&' | b'|' | b';' | b'(' | b')' => break,
+			_ => at -= 1,
 		}
 	}
 	at
 }
 
-/// The word of name characters that ends at `at`, and where it begins.
-fn word_before(src: &[u8], at: usize) -> (&[u8], usize) {
-	let start = src[..at]
-		.iter()
-		.rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
-		.map_or(0, |i| i + 1);
-	(&src[start..at], start)
+/// `at`, moved back over a redirection's operator and its fd (`2>&`,
+/// `<<-`, `&>>`, `>|`, `{fd}>`).
+fn op_back(src: &[u8], mut at: usize) -> usize {
+	while at > 0 && matches!(src[at - 1], b'<' | b'>' | b'&' | b'|' | b'-') {
+		at -= 1;
+	}
+	if at > 0 && src[at - 1] == b'}' {
+		if let Some(open) = src[..at].iter().rposition(|&c| c == b'{') {
+			at = open;
+		}
+	} else {
+		while at > 0 && src[at - 1].is_ascii_digit() {
+			at -= 1;
+		}
+	}
+	at
 }
 
 /// The line bash reports for an error of a compound command (a failed

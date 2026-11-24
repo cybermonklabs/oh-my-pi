@@ -378,6 +378,7 @@ pub fn bin_fg(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString], func: JobFunc)
 						any:      false,
 						into:     None,
 						force:    false,
+						resume:   None,
 					};
 					return Ok(Outcome { status: 0, control: Control::Wait(wait) });
 				}

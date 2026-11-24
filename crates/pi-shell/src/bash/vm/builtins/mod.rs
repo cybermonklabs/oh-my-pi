@@ -178,6 +178,10 @@ pub struct Wait {
 	pub into:     Option<BString>,
 	/// `wait -f`: a stopped job does not end the wait.
 	pub force:    bool,
+	/// zsh `wait id …` waits for one operand's child at a time: once it
+	/// ended the builtin runs again, [`Ctx::resumed`] this (the next
+	/// operand's index in `argv`) and [`Ctx::waited`] the wait's status.
+	pub resume:   Option<u32>,
 }
 
 /// `name` and the subscript of a `name[subscript]` variable reference.
@@ -243,8 +247,12 @@ pub struct Ctx<'a, 'c> {
 	/// key as is.
 	pub arrayref:    Vec<u32>,
 	/// Times the builtin ran again after a frame it pushed returned
-	/// ([`Control::Resume`]).
+	/// ([`Control::Resume`]); for zsh `wait`, the `argv` index of the
+	/// operand it goes on from ([`Wait::resume`]).
 	pub resumed:     u32,
+	/// The status of the wait a zsh `wait` ran again after
+	/// ([`Wait::resume`]).
+	pub waited:      i32,
 }
 
 impl<'a, 'c> Ctx<'a, 'c> {
@@ -271,6 +279,7 @@ impl<'a, 'c> Ctx<'a, 'c> {
 			log_cursor: 0,
 			arrayref: Vec::new(),
 			resumed: 0,
+			waited: 0,
 		}
 	}
 
