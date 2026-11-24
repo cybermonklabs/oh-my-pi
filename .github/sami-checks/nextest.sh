@@ -4,7 +4,8 @@
 # its tests that run alone), with a JUnit report added by a tool config. The report keeps each
 # passing test's output, so sc.py nextest can see a test that skipped itself (a test that needs
 # root skips itself as the runner's user; the summary counts it covered when it passed as root).
-# Nothing is built here.
+# A test with a `flaky: ` entry that failed reads KNOWN only when it passed in a run of the whole
+# unit again (below). Nothing is built here.
 #   nextest.sh ROW UNIT WHO FILTERSET [PARTITION]
 # SC_FOLDED, when set, is a filterset of tests that need a temporary directory where names fold:
 # they run in a second pass with TMPDIR in host.sh's /mnt/sc-fold, the first pass leaves them out,
@@ -28,9 +29,8 @@ store-success-output = true
 store-failure-output = true
 EOF
 nx=$(command -v cargo-nextest) || { echo "::error::cargo-nextest is not installed"; exit 1; }
-base=(--archive-file "$SC/archive/tests.tar.zst" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite
+args=(--archive-file "$SC/archive/tests.tar.zst" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite
 	--workspace-remap "$SC_TREE" --tool-config-file "sami-checks:$cfg" --no-fail-fast)
-args=("${base[@]}")
 [ -n "$part" ] && args+=(--partition "$part")
 # nextest writes its store under the workspace root (--workspace-remap: the tree), as
 # platform-checks found; the extracted target directory is the other place it could be.
@@ -47,11 +47,11 @@ else
 	run=(env -i)
 	tmp=/mnt/sc/tmp-runner fold=/mnt/sc-fold/tmp-runner
 fi
-pass() { # <TMPDIR> <filterset> <JUnit copy>: one nextest run; returns its exit code
+pass() { # <TMPDIR> <filterset> <JUnit copy> <log>: one nextest run; returns its exit code
 	sudo rm -f "${junits[@]}"
 	"${run[@]}" "${envv[@]}" TMPDIR="$1" PATH="$SC_TEST_PATH:$(dirname "$nx")" RUST_BACKTRACE=1 RSYNC_REFERENCE_REQUIRED=1 \
 		PI_TEST_STICKY_FIFO="$SC_STICKY_FIFO" CARGO_TERM_COLOR=never \
-		"$nx" nextest run "${args[@]}" -E "$2" >> "$log" 2>&1 < /dev/null
+		"$nx" nextest run "${args[@]}" -E "$2" >> "$4" 2>&1 < /dev/null
 	local rc=$? j
 	for j in "${junits[@]}"; do
 		if sudo test -f "$j"; then
@@ -61,15 +61,15 @@ pass() { # <TMPDIR> <filterset> <JUnit copy>: one nextest run; returns its exit 
 	done
 	return "$rc"
 }
-s=$(date +%s)
-if [ -z "$folded" ]; then
-	pass "$tmp" "$filter" "$SC/res/logs/$safe.junit.xml"
-	rc=$?
-else
-	p1=$SC/res/logs/$safe.pass1.xml p2=$SC/res/logs/$safe.pass2.xml
-	pass "$tmp" "($filter) - ($folded)" "$p1"
+unit() { # <JUnit report> <log>: the unit's run, one pass or two with SC_FOLDED; returns its exit
+	local out=$1 lg=$2 rc rc1 rc2 c
+	if [ -z "$folded" ]; then
+		pass "$tmp" "$filter" "$out" "$lg"
+		return
+	fi
+	pass "$tmp" "($filter) - ($folded)" "${out%.xml}.pass1.xml" "$lg"
 	rc1=$?
-	pass "$fold" "($filter) & ($folded)" "$p2"
+	pass "$fold" "($filter) & ($folded)" "${out%.xml}.pass2.xml" "$lg"
 	rc2=$?
 	# A pass that did not end normally (nextest 0 or 100) gives the unit its exit; else 100 if
 	# either pass had a failure.
@@ -82,27 +82,31 @@ else
 		esac
 	done
 	echo "PASSES $row $unit $who: exit $rc1 in $tmp, exit $rc2 in $fold (SC_FOLDED: $folded)"
-	python3 "$tool/sc.py" junit-merge "$SC/res/logs/$safe.junit.xml" "$p1" "$p2" ||
+	python3 "$tool/sc.py" junit-merge "$out" "${out%.xml}.pass1.xml" "${out%.xml}.pass2.xml" ||
 		echo "::error::the two passes' JUnit reports do not merge; the unit reads UNKNOWN"
-fi
+	return "$rc"
+}
+s=$(date +%s)
+unit "$SC/res/logs/$safe.junit.xml" "$log"
+rc=$?
 secs=$(($(date +%s) - s))
 python3 "$tool/sc.py" nextest "$SC/res/logs/$safe.junit.xml" "$rc" "$secs" "$row" "$unit" "$who" > "$SC/res/$safe.json"
-# A failed test that known-failures.txt names `flaky: ` runs again alone, by binary and name, at most
-# twice, until it passes (no partition; where names fold when it ran there); the summary reads its
-# failure KNOWN only when a retry passed.
-args=("${base[@]}")
-while IFS= read -r t; do
-	[ -n "$t" ] || continue
-	IFS=$'\t' read -r cls name _ < <(python3 "$tool/sc.py" junit-test "$SC/res/logs/$safe.junit.xml" "$t") || continue
-	dir=$tmp
-	[ -n "$folded" ] && python3 "$tool/sc.py" junit-test "$p2" "$t" > /dev/null 2>&1 && dir=$fold
-	for try in 1 2; do
-		rj=$SC/res/logs/$safe.retry$try.$(printf '%s' "$t" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-80).xml
-		pass "$dir" "binary_id($cls) & test(=$name)" "$rj"
-		got=$(python3 "$tool/sc.py" retried "$SC/res/$safe.json" "$t" "$rj")
-		echo "RETRY $row $unit $who $t: try $try of 2: $got"
-		[ "$got" = pass ] && break
+# When a test that known-failures.txt names `flaky: ` fails, the whole unit runs again (the same
+# filter, partition, passes, threads and user), at most twice, while such a test has not passed;
+# the summary reads its failure KNOWN only when it passed in such a retry.
+mapfile -t flaky < <(python3 "$tool/sc.py" flaky-failed "$SC/res/$safe.json" "$tool/known-failures.txt")
+for try in 1 2; do
+	[ "${#flaky[@]}" -gt 0 ] || break
+	rj=$SC/res/logs/$safe.retry$try.xml
+	unit "$rj" "$SC/res/logs/$safe.retry$try.log"
+	left=()
+	for t in "${flaky[@]}"; do
+		got=$(python3 "$tool/sc.py" retried "$SC/res/$safe.json" "$t" "$rj" \
+			"the unit again: nextest, ${part:+partition $part, }nextest's threads ($(nproc) CPUs), as $who")
+		echo "RETRY $row $unit $who $t: try $try of 2 (the whole unit): $got"
+		[ "$got" = pass ] || left+=("$t")
 	done
-done < <(python3 "$tool/sc.py" flaky-failed "$SC/res/$safe.json" "$tool/known-failures.txt")
+	flaky=(${left[@]+"${left[@]}"})
+done
 echo "ROW $row $unit $who: nextest exit $rc in ${secs}s; $(grep -E '^ *Summary ' "$log" | tr -s ' \n' ' ')"
 tail -n 40 "$log"

@@ -12,8 +12,7 @@
   sc.py skip-forms TREE NOT_MARKERS        each print of TREE/crates that says skip is read or named (JSON)
   sc.py skip-lines RESULTS NOT_MARKERS     each skip line a passing test printed is read or named (JSON)
   sc.py flaky-failed RESULT KNOWN          the failed tests of one result with a `flaky: ` entry, one a line
-  sc.py retried RESULT TEST REPORT         adds one retry's outcome (pass, skip or fail) to RESULT
-  sc.py junit-test JUNIT TEST              what runs TEST again alone: classname, name, file, name as a regex
+  sc.py retried RESULT TEST REPORT SHAPE   adds one retry of the whole unit (pass, partial, skip or fail) to RESULT
   sc.py junit-merge OUT JUNIT...           one JUnit report of several (nextest.sh's two passes)
   sc.py selftest                           the counters and the summary against hand-made inputs
 
@@ -26,8 +25,8 @@ apart, named, and its unit is UNKNOWN, unless each of its skip lines is a sub-ca
 partial-skips.txt lets that test skip and the entry's witness line is in its output (then it
 passes and is listed as partial), it passed as the other user, or known-failures.txt names each of
 its skip lines for that row and user (`skips: `; then it reads KNOWN). A test that started and
-never ended is named. A failure with a `flaky: ` entry reads KNOWN only when the test, run again
-alone in the same job (set.sh, at most twice), passed.
+never ended is named. A failure with a `flaky: ` entry reads KNOWN only when the test passed in
+a retry of its whole unit in the same job (the unit's command again, at most twice).
 """
 
 import json
@@ -379,9 +378,10 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
     return skip_verdict(res)
 
 
-def junit_testcases(path):
-    """(element, full name) of each <testcase> once. bun nests a <testsuite> per describe block, so
-    walking every suite's cases would count a nested case once per enclosing suite."""
+def junit_cases(path):
+    """(full name, ok/failed/skipped, seconds, output) of each <testcase> once. bun nests a
+    <testsuite> per describe block, so walking every suite's cases would count a nested case once
+    per enclosing suite."""
     root = ET.parse(path).getroot()
     parent = {c: p for p in root.iter() for c in p}
     for case in root.iter("testcase"):
@@ -390,12 +390,7 @@ def junit_testcases(path):
         if not cls:
             p = parent.get(case)
             cls = p.get("name", "") if p is not None and p.tag == "testsuite" else ""
-        yield case, (f"{cls}::{name}" if cls and not name.startswith(cls) else name)
-
-
-def junit_cases(path):
-    """(full name, ok/failed/skipped, seconds, output) of each <testcase> once."""
-    for case, full in junit_testcases(path):
+        full = f"{cls}::{name}" if cls and not name.startswith(cls) else name
         t = float(case.get("time") or 0)
         if case.find("skipped") is not None:
             kind = "skipped"
@@ -405,17 +400,6 @@ def junit_cases(path):
             kind = "ok"
         out = "".join((e.text or "") for e in case if e.tag in ("system-out", "system-err"))
         yield full, kind, t, out
-
-
-def junit_test(path, test):
-    """What runs `test` of a JUnit report again alone: its classname (nextest: the binary id), its
-    own name (nextest: the test's path in its binary), its file (bun) and its own name as a JavaScript
-    regex (bun test -t). None when the report has no such test."""
-    for case, full in junit_testcases(path):
-        if full == test:
-            name = case.get("name", "")
-            return case.get("classname", ""), name, case.get("file", ""), re.sub(r"[.*+?^${}()|[\]\\/]", r"\\\g<0>", name)
-    return None
 
 
 def junit_merge(out, paths):
@@ -797,22 +781,27 @@ def cmd_skip_lines(results_dir, exceptions_path):
 
 def flaky_failed(result_path, known_path):
     """The failed tests of one result that the known-failure list names `flaky: ` for its row,
-    user and unit (or `*`): set.sh runs each again by name, at most twice."""
+    user and unit (or `*`): the job runs the whole unit again, at most twice, while one is left."""
     r = json.load(open(result_path, encoding="utf-8"))
     known = read_known(known_path)
     return [f for f in r["failures"]
             if (known_reason(known, r["row"], r["who"], r["unit"], f) or "").startswith("flaky: ")]
 
 
-def record_retry(result_path, test, report):
-    """Reads one retry of a test run again alone by name (a libtest log, or a JUnit report: nextest,
-    bun) and adds its outcome to the result's `retries` for the test: `pass`, `skip` (it passed
-    after a skip marker, or was skipped) or `fail` (it failed, did not end, or is not in the report).
-    Returns the outcome."""
-    outcome = "fail"
+def record_retry(result_path, test, report, shape):
+    """Reads one retry of the whole unit (its command again: the same binary or filter, the same
+    threads, the same user; a libtest log, or a JUnit report of nextest or bun) and adds to the
+    result's `retries` for `test`: the outcome, how many of the unit's tests the retry ran, and
+    `shape`, the script's words for how it ran. The outcome is `pass`, `partial` (it passed in a
+    retry that did not run every test the unit ran: a test alone or at another size is not the
+    same race), `skip` (it passed after a skip marker, or was skipped) or `fail` (it failed, did
+    not end, or is not in the report). Returns the outcome."""
+    outcome, ran = "fail", set()
     if report.endswith(".xml"):
         try:
             for name, kind, _, out in junit_cases(report):
+                if kind != "skipped":
+                    ran.add(name)
                 if name == test:
                     outcome = ("fail" if kind == "failed" else "skip" if kind == "skipped" or SKIP_MARKER.search(out)
                                else "pass")
@@ -825,10 +814,17 @@ def record_retry(result_path, test, report):
             lines = []
         for line in lines:
             ev = libtest_event(line)
-            if ev and ev.get("type") == "test" and ev.get("name") == test and ev.get("event") in ("ok", "failed"):
-                outcome = "fail" if ev["event"] == "failed" else "skip" if SKIP_MARKER.search(ev.get("stdout") or "") else "pass"
+            if ev and ev.get("type") == "test" and ev.get("event") in ("ok", "failed"):
+                ran.add(ev.get("name"))
+                if ev.get("name") == test:
+                    outcome = "fail" if ev["event"] == "failed" else "skip" if SKIP_MARKER.search(ev.get("stdout") or "") else "pass"
     r = json.load(open(result_path, encoding="utf-8"))
-    r.setdefault("retries", {}).setdefault(test, []).append(outcome)
+    unit = {n for n, _ in r["tests"]} | set(r["failures"])
+    of = len(unit)
+    n = len(ran & unit)
+    if outcome == "pass" and n < of:
+        outcome = "partial"
+    r.setdefault("retries", {}).setdefault(test, []).append({"outcome": outcome, "ran": n, "of": of, "shape": shape})
     json.dump(r, open(result_path, "w", encoding="utf-8"))
     return outcome
 
@@ -839,19 +835,24 @@ def cmd_summary(results_dir, build_dir, known_path=None):
 
     def failure_reason(r, row, f):
         """(the reason, how the summary shows it) for failure f of result r; no reason when the
-        failure is NEW. A flaky entry gives its reason only when a retry of the test in the same job
-        passed (set.sh runs a failed test with a flaky entry again by name, at most twice)."""
+        failure is NEW. A flaky entry gives its reason only when the test passed in a retry of the
+        whole unit in the same job (set.sh, nextest.sh, ts.sh: the unit's command again, at most
+        twice): a retry of the test alone does not show the race of the full run."""
         why = known_reason(known, row, r["who"], r["unit"], f)
         if why is None:
             return None, "**NEW**"
         if not why.startswith("flaky: "):
             return why, f"KNOWN ({why})"
         tries = r.get("retries", {}).get(f, [])
-        if "pass" in tries:
-            return why, f"KNOWN ({why}; it passed on retry {tries.index('pass') + 1} of {len(tries)})"
+        outcomes = [t["outcome"] for t in tries]
+        if "pass" in outcomes:
+            t = tries[outcomes.index("pass")]
+            return why, (f"KNOWN ({why}; it passed on retry {outcomes.index('pass') + 1} of {len(tries)}, "
+                         f"the whole unit again: {t['ran']} of {t['of']} tests, {t['shape']})")
         if not tries:
-            return None, f"**NEW** (listed as `{why}`, but no retry of it ran)"
-        return None, f"**NEW** (listed as `{why}`, but it failed {len(tries)} retr{'y' if len(tries) == 1 else 'ies'} too)"
+            return None, f"**NEW** (listed as `{why}`, but no retry of its unit ran)"
+        seen = ", ".join(f"{t['outcome']} ({t['ran']} of {t['of']} tests, {t['shape']})" for t in tries)
+        return None, f"**NEW** (listed as `{why}`, but no retry of the whole unit passed it: {seen})"
 
     results = load_results(results_dir)
     got, dup = {}, set()
@@ -1287,53 +1288,92 @@ def selftest():
     open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tp\tfixed since\n")
     rc, out = summary()
     check("a listed test that passed is to be removed", ("`p`: passed (listed for: fixed since)" in out, rc), (True, 1))
-    # A flaky entry (its reason starts `flaky: `): its failure reads KNOWN only when a retry of the
-    # test in the same job passed, and NEW when no retry ran or every try failed (CiReview at
-    # 55a3d02c: a test that failed in every run read KNOWN). It is not listed for removal when its test
-    # passed, and is when its test is no longer in its unit.
+    # A flaky entry (its reason starts `flaky: `): its failure reads KNOWN only when the test passed in
+    # a retry of its whole unit in the same job (the unit's command again: the same binary or filter,
+    # threads and user), and NEW when no retry ran, every retry failed, or it passed only in a retry
+    # that did not run the whole unit (CiReview at 55a3d02c and at ee06226f: a race that fails at 4
+    # threads and passes alone read KNOWN). It is not listed for removal when its test passed, and is
+    # when its test is no longer in its unit.
+    def rt(outcome, ran=2, of=2, shape="the binary again, --test-threads=4"):
+        return {"outcome": outcome, "ran": ran, "of": of, "shape": shape}
+
     open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tflaky: a race\n"
                                 "set-runner\trunner\tpi-shell::zle_pty\tp\tflaky: a race\n")
     rc, out = summary()
-    check("a flaky failure with no retry", ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of it ran)" in out, rc),
+    check("a flaky failure with no retry", ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of its unit ran)" in out, rc),
           (True, 1))
-    json.dump(dict(zle_runner, retries={"k": ["fail", "pass"]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("pass")]}), open(os.path.join(res, "zle-runner.json"), "w"))
     rc, out = summary()
-    check("a flaky failure that passed on a retry",
-          ("FAILED `k`: KNOWN (flaky: a race; it passed on retry 2 of 2)" in out, "`p`: passed" in out,
+    check("a flaky failure that passed on a retry of the whole unit",
+          ("FAILED `k`: KNOWN (flaky: a race; it passed on retry 2 of 2, the whole unit again: 2 of 2 tests, "
+           "the binary again, --test-threads=4)" in out, "`p`: passed" in out,
            "| pi-shell set (runner) | **KNOWN** |" in out, rc), (True, False, True, 0))
-    json.dump(dict(zle_runner, retries={"k": ["fail", "fail"]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("fail")]}), open(os.path.join(res, "zle-runner.json"), "w"))
     rc, out = summary()
     check("a flaky failure that failed every try",
-          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but it failed 2 retries too)" in out,
+          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of the whole unit passed it: fail" in out,
            "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
-    json.dump(dict(zle_runner, retries={"k": ["pass"]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("partial", 1, 2, "the test alone, 1 thread")]}),
+              open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure that passes alone and fails at the unit's threads",
+          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of the whole unit passed it: fail (2 of 2 tests, "
+           "the binary again, --test-threads=4), partial (1 of 2 tests, the test alone, 1 thread))" in out,
+           "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("skip")]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure whose retry skipped itself", ("FAILED `k`: **NEW**" in out, rc), (True, 1))
+    json.dump(dict(zle_runner, retries={"k": [rt("pass")]}), open(os.path.join(res, "zle-runner.json"), "w"))
     open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tgone\tflaky: a race\n")
     rc, out = summary()
     check("a flaky entry whose test left its unit is to be removed",
           ("`gone`: no longer in its unit (listed for: flaky: a race)" in out, rc), (True, 1))
     json.dump(zle_runner, open(os.path.join(res, "zle-runner.json"), "w"))
-    # set.sh's retries: flaky_failed names the failed tests with a flaky entry, and record_retry adds
-    # one retry's outcome from its log (an event after other text on its line counts).
+    # The scripts' retries: flaky_failed names the failed tests with a flaky entry, and record_retry
+    # adds one retry of the whole unit: `pass` only when the retry ran every test the unit ran and the
+    # test passed; a pass in a smaller run (the test alone) is `partial`. An event after other text
+    # on its line counts.
     rj, rl = os.path.join(d, "retry.json"), os.path.join(d, "retry.log")
-    json.dump(result("set-runner", "pi-shell::zle_pty", "runner", "FAIL", 101, 1, failed=2, failures=["k", "q"]), open(rj, "w"))
+    json.dump(result("set-runner", "pi-shell::zle_pty", "runner", "FAIL", 101, 1, passed=1, failed=2, failures=["k", "q"],
+                     tests=[("a", 1.0), ("k", 1.0), ("q", 1.0)]), open(rj, "w"))
     open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tflaky: a race\n"
                                 "set-runner\trunner\tpi-shell::zle_pty\tq\tthe host\n")
     check("flaky_failed", flaky_failed(rj, known_file), ["k"])
-    open(rl, "w").write(json.dumps({"type": "test", "event": "failed", "name": "k"}) + "\n")
-    o1 = record_retry(rj, "k", rl)
-    open(rl, "w").write("test k ... " + json.dumps({"type": "test", "event": "ok", "name": "k", "stdout": ""}) + "\n")
-    o2 = record_retry(rj, "k", rl)
-    check("record_retry", (o1, o2, json.load(open(rj))["retries"]), ("fail", "pass", {"k": ["fail", "pass"]}))
-    # nextest's and bun's retries: junit_test gives what runs a test again alone, and record_retry
-    # reads the retry's JUnit report.
+
+    def ev(name, event, stdout=""):
+        return json.dumps({"type": "test", "event": event, "name": name, "stdout": stdout}) + "\n"
+
+    open(rl, "w").write(ev("a", "ok") + ev("k", "failed") + ev("q", "failed"))
+    o1 = record_retry(rj, "k", rl, "4 threads")
+    open(rl, "w").write(ev("k", "ok"))
+    o2 = record_retry(rj, "k", rl, "alone")
+    open(rl, "w").write(ev("a", "ok") + "test k ... " + ev("k", "ok") + ev("q", "failed"))
+    o3 = record_retry(rj, "k", rl, "4 threads")
+    check("record_retry of the whole unit and of the test alone", (o1, o2, o3, json.load(open(rj))["retries"]["k"]),
+          ("fail", "partial", "pass", [{"outcome": "fail", "ran": 3, "of": 3, "shape": "4 threads"},
+                                       {"outcome": "partial", "ran": 1, "of": 3, "shape": "alone"},
+                                       {"outcome": "pass", "ran": 3, "of": 3, "shape": "4 threads"}]))
+    # nextest's and bun's retries are JUnit reports of the whole unit.
     jb = os.path.join(d, "bun-retry.xml")
     open(jb, "w").write('<testsuites><testsuite name="test/x.test.ts"><testsuite name="PDF pages"><testcase '
                         'name="paints (each) page." classname="PDF pages" file="test/x.test.ts"/></testsuite></testsuite></testsuites>')
-    check("junit_test, nextest", junit_test(ju, "pi-builtins::t2"), ("pi-builtins", "t2", "", "t2"))
-    check("junit_test, bun", junit_test(jb, "PDF pages::paints (each) page."),
-          ("PDF pages", "paints (each) page.", "test/x.test.ts", r"paints \(each\) page\."))
-    check("record_retry from a JUnit report", (record_retry(rj, "PDF pages::paints (each) page.", jb),
-          record_retry(rj, "pi-builtins::t2", ju), record_retry(rj, "absent", jb)), ("pass", "fail", "fail"))
+    rjb = os.path.join(d, "retry-bun.json")
+    json.dump(result("ts-ca", "shard 1/10", "runner", "FAIL", 1, 1, failed=1, failures=["PDF pages::paints (each) page."],
+                     tests=[("PDF pages::paints (each) page.", 1.0)]), open(rjb, "w"))
+    rjn = os.path.join(d, "retry-nextest.json")
+    json.dump(result("builtins", "pi-builtins", "runner", "FAIL", 100, 1, passed=1, failed=1, failures=["pi-builtins::t2"],
+                     tests=[("pi-builtins::t1", 1.0), ("pi-builtins::t2", 1.0)]), open(rjn, "w"))
+    check("record_retry from a JUnit report", (record_retry(rjb, "PDF pages::paints (each) page.", jb, "the shard"),
+          record_retry(rjn, "pi-builtins::t2", ju, "the unit"), record_retry(rjn, "absent", jb, "the unit")),
+          ("pass", "fail", "fail"))
+    # A retry that passed after a skip marker checked nothing: `skip`, from a libtest log and from a
+    # JUnit report.
+    open(rl, "w").write(ev("a", "ok") + ev("k", "ok", "skipped: no zsh here\n") + ev("q", "failed"))
+    jsk = os.path.join(d, "skip-retry.xml")
+    open(jsk, "w").write('<testsuites><testsuite name="p"><testcase classname="p" name="t" time="1"><system-err>'
+                         'p: the host half is skipped: names do not fold\n</system-err></testcase></testsuite></testsuites>')
+    check("record_retry of a retry that skipped itself", (record_retry(rj, "k", rl, "4 threads"),
+          record_retry(rj, "p::t", jsk, "the unit")), ("skip", "skip"))
     # Known self-skips (`skips: `, a sixth field: the skip line's start): a self-skip reads KNOWN only
     # when each of its lines starts as an entry of its row and user says; one user's entry never
     # covers the other user.
@@ -1511,16 +1551,12 @@ def main(argv):
     elif c == "skip-lines":
         print(json.dumps(cmd_skip_lines(*a)))
     elif c == "flaky-failed":
-        print("\n".join(flaky_failed(*a)))
+        for f in flaky_failed(*a):
+            print(f)
     elif c == "retried":
         print(record_retry(*a))
     elif c == "junit-merge":
         print(f"{junit_merge(a[0], a[1:])} test cases in {a[0]}")
-    elif c == "junit-test":
-        t = junit_test(*a)
-        if t is None:
-            sys.exit(f"{a[0]} has no test {a[1]!r}")
-        print("\t".join(t))
     elif c == "selftest":
         selftest()
     else:

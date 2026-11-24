@@ -2,9 +2,10 @@
 # The TypeScript rows, in the tree after `bun install` with the natives job's addon in
 # packages/natives/native (the only addon a workspace load reads). Each `bun test` runs as the gate
 # kit ran it (kit-tsx driver.sh): env -i with bun on PATH and a fresh HOME, stdin /dev/null, a JUnit
-# report; sc.py bun reads it with bun's own summary line. A failed test that known-failures.txt
-# names `flaky: ` runs again alone (its file, -t its name), at most twice, until it passes; the
-# summary reads its failure KNOWN only when a retry passed.
+# report; sc.py bun reads it with bun's own summary line. When a test that known-failures.txt names
+# `flaky: ` fails, the unit's whole `bun test` runs again (the same files, flags and order), at most
+# twice, while such a test has not passed; the summary reads its failure KNOWN only when it passed in
+# such a retry.
 #   ts.sh small           the suites sc.py's TS_SMALL lists, one after another
 #   ts.sh ca SHARD        coding-agent --isolate, the files whose index (sorted) mod N is SHARD - 1
 #   ts.sh checkts         bun run check:ts
@@ -19,37 +20,43 @@ chrome_env=()
 [ -n "${PUPPETEER_EXECUTABLE_PATH:-}" ] && chrome_env=(PUPPETEER_EXECUTABLE_PATH="$PUPPETEER_EXECUTABLE_PATH")
 
 one() { # <row> <unit> <dir> <bound seconds> <bun test args...>
-	local row=$1 unit=$2 dir=$3 bound=$4 safe home log junit s rc secs
+	local row=$1 unit=$2 dir=$3 bound=$4 safe log junit s rc secs try rj t got
 	shift 4
 	safe=$(printf '%s' "$row-$unit" | tr -c 'A-Za-z0-9_.-' '_')
 	log=$SC/res/logs/$safe.log
 	junit=$SC/res/logs/$safe.junit.xml
-	home=$(mktemp -d)
 	s=$(date +%s)
-	(cd "$SC_TREE/$dir" && timeout -k 10 "$bound" env -i PATH="$(dirname "$bun"):/usr/bin:/bin" HOME="$home" \
-		${chrome_env[@]+"${chrome_env[@]}"} "$bun" test --reporter=junit --reporter-outfile="$junit" "$@" < /dev/null) > "$log" 2>&1
+	bunrun "$dir" "$bound" "$junit" "$log" "$@"
 	rc=$?
 	secs=$(($(date +%s) - s))
-	rm -rf "${home:?}"
 	python3 "$tool/sc.py" bun "$junit" "$log" "$rc" "$secs" "$row" "$unit" > "$SC/res/$safe.json"
 	echo "BUN $row $unit exit=$rc ${secs}s $(grep -E '^Ran [0-9]+ tests? across' "$log" | tail -n 1)"
 	grep -E '^\(fail\)' "$log" | head -n 40 || true
-	local t file pat try rj got
-	while IFS= read -r t; do
-		[ -n "$t" ] || continue
-		IFS=$'\t' read -r _ _ file pat < <(python3 "$tool/sc.py" junit-test "$junit" "$t") || continue
-		for try in 1 2; do
-			rj=$SC/res/logs/$safe.retry$try.$(printf '%s' "$t" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-80).xml
-			home=$(mktemp -d)
-			(cd "$SC_TREE/$dir" && timeout -k 10 600 env -i PATH="$(dirname "$bun"):/usr/bin:/bin" HOME="$home" \
-				${chrome_env[@]+"${chrome_env[@]}"} "$bun" test --reporter=junit --reporter-outfile="$rj" "./$file" -t "$pat" < /dev/null) \
-				>> "$SC/res/logs/$safe.retries.txt" 2>&1
-			rm -rf "${home:?}"
-			got=$(python3 "$tool/sc.py" retried "$SC/res/$safe.json" "$t" "$rj")
-			echo "RETRY $row $unit $t: try $try of 2: $got"
-			[ "$got" = pass ] && break
+	local flaky left
+	mapfile -t flaky < <(python3 "$tool/sc.py" flaky-failed "$SC/res/$safe.json" "$tool/known-failures.txt")
+	for try in 1 2; do
+		[ "${#flaky[@]}" -gt 0 ] || break
+		rj=$SC/res/logs/$safe.retry$try.xml
+		bunrun "$dir" "$bound" "$rj" "$SC/res/logs/$safe.retry$try.log" "$@"
+		left=()
+		for t in "${flaky[@]}"; do
+			got=$(python3 "$tool/sc.py" retried "$SC/res/$safe.json" "$t" "$rj" "the unit again: bun test, its $# arguments")
+			echo "RETRY $row $unit $t: try $try of 2 (the whole unit): $got"
+			[ "$got" = pass ] || left+=("$t")
 		done
-	done < <(python3 "$tool/sc.py" flaky-failed "$SC/res/$safe.json" "$tool/known-failures.txt")
+		flaky=(${left[@]+"${left[@]}"})
+	done
+}
+
+bunrun() { # <dir> <bound seconds> <JUnit report> <log> <bun test args...>: one `bun test`; returns its exit
+	local dir=$1 bound=$2 junit=$3 log=$4 home rc
+	shift 4
+	home=$(mktemp -d)
+	(cd "$SC_TREE/$dir" && timeout -k 10 "$bound" env -i PATH="$(dirname "$bun"):/usr/bin:/bin" HOME="$home" \
+		${chrome_env[@]+"${chrome_env[@]}"} "$bun" test --reporter=junit --reporter-outfile="$junit" "$@" < /dev/null) > "$log" 2>&1
+	rc=$?
+	rm -rf "${home:?}"
+	return "$rc"
 }
 
 case $mode in

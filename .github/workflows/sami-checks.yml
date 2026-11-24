@@ -46,8 +46,9 @@
 # unit whose only failures are known reads KNOWN unless a test in it skipped itself and passed as no
 # other user, an entry of unit `*` names its test in any unit (shard) of its row, and an entry whose
 # test passed is listed for removal and fails the summary, unless its reason starts `flaky: `. A
-# failed test with a `flaky: ` entry runs again alone in its job, at most twice (set.sh, nextest.sh,
-# ts.sh), and reads KNOWN only when a retry passed. A `skips: ` entry names a self-skip by row, user,
+# failed test with a `flaky: ` entry makes its job run the whole unit again, at most twice, with the
+# same threads and user (set.sh, nextest.sh, ts.sh), and reads KNOWN only when it passed in such a
+# retry. A `skips: ` entry names a self-skip by row, user,
 # test and the start of its skip line, and that self-skip reads KNOWN. pi-builtins' check_folded_sources
 # tests run in a directory where names fold (host.sh: ext4 casefold; nextest.sh SC_FOLDED). The
 # browser tests run against the Chrome for Testing build the tree's puppeteer-core pins (bun.sh

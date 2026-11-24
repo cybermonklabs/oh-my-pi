@@ -4,9 +4,11 @@
 # (then it is UNKNOWN). An entry whose test passed or no longer exists is listed in the summary to
 # be removed, and the summary job fails until it is, so the list only shrinks.
 # A flaky entry, whose reason starts with `flaky: `, names a test that fails in some runs and passes
-# in others. When it fails, its job runs it again alone by name (set.sh: at most twice, as the same
-# user, from the same binary); its failure reads KNOWN only when a retry passed, and NEW when every
-# try failed. It is not listed for removal when it passes (it still is when its test no longer exists).
+# in others. When it fails, its job runs its whole unit again (set.sh, nextest.sh, ts.sh: the same
+# binary or filter, the same threads, the same user), at most twice; its failure reads KNOWN only
+# when it passed in such a retry, and NEW when it failed every retry or passed only in a smaller run
+# (a race at 4 threads can pass alone). It is not listed for removal when it passes (it still is
+# when its test no longer exists).
 # A unit of `*` names the test in any unit of its row, on the rows whose units are shards (ts-ca,
 # workspace: sc.py ANY_UNIT_ROWS): a coding-agent shard holds the test files whose sorted index mod
 # 10 is the shard's, so a file added before a test moves it to another shard. On the other rows a
