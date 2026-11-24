@@ -11,12 +11,3 @@ import type { AgentSession } from "../session/agent-session";
  * wake's) reports the substitution whenever that model serves.
  */
 export const startupModelFallbacks = new WeakMap<AgentSession, { model: string; reason: string }>();
-
-/**
- * Compaction thresholds of the root (non-subagent) settings a subagent chain
- * started from. Per-agent `task.agentCompactionThresholdOverrides` entries
- * replace `compaction.threshold*` and switch off `compaction.modelThresholds`
- * only for the agent they name; every other descendant resolves against these
- * root values, not an ancestor's override.
- */
-export const kRootCompactionThresholds = Symbol("task.rootCompactionThresholds");

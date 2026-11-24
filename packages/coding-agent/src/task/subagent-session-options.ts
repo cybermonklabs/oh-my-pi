@@ -10,17 +10,17 @@ import { DEFAULT_PEER_ROSTER_LIMIT, LIST_STATUS_ORDER } from "@oh-my-pi/pi-tui/t
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
-import { AgentRegistry, type AgentRegistryApi } from "../registry/agent-registry";
-import { isCurrentSessionRosterRef } from "../registry/persisted-agents";
+import { AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import type { CreateAgentSessionOptions } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import { isLocalAgentSession } from "../session/agent-session-handle";
 import type { SessionEntry } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
-import type { MCPToolFollower, RootCompactionThresholds } from "./executor";
+import type { SessionStorage } from "../session/session-storage";
+import type { MCPToolFollower } from "./executor";
 import { assertPerCallModelApproved, type PerCallModelGrants } from "./model-approval";
 import type { PreparedSeanceSession } from "./seance";
-import { kRootCompactionThresholds } from "./subagent-run-state";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 
 export interface IrcPeerRosterRow {
@@ -77,11 +77,6 @@ export function collectIrcPeerRoster(
 	return { peers, parkedCount, omittedCount };
 }
 
-/** Settings from {@link createSubagentSettings}, tagged with its chain's root compaction thresholds. */
-export interface SubagentChainSettings extends Settings {
-	[kRootCompactionThresholds]?: RootCompactionThresholds;
-}
-
 /**
  * The subagent's own attached session. Its prompt builders run on its home
  * thread, so an attached session is the local {@link AgentSession}.
@@ -115,7 +110,10 @@ export interface SubagentPromptInputs {
 	 * the session), dropped at dispose.
 	 */
 	ircRenders?: IrcRenderLog;
-	/** Set only while a warm revive builds the session: the roster read back by {@link revivalIrcRoster}. */
+	/**
+	 * Set only while a warm revive builds the session: the roster read back by `revivalIrcRoster`
+	 * (subagent-revive.ts).
+	 */
 	revivalIrcRoster?: IrcPeerRosterData;
 }
 
@@ -169,9 +167,9 @@ export function ircRosterBlockKey(block: string): string {
 
 /**
  * The spawn-time inputs of a subagent session. The live run and the lifecycle reviver both build
- * their {@link createAgentSession} options from it, so a parked subagent keeps this data (its plain
- * parts in its transcript, see {@link SUBAGENT_REVIVE_ENTRY}) rather than the spawning run's options,
- * monitor, abort signals, progress sinks or settings.
+ * their `createAgentSession` (sdk.ts) options from it, so a parked subagent keeps this data (its
+ * plain parts in its transcript, see `SUBAGENT_REVIVE_ENTRY` in subagent-revive.ts) rather than the
+ * spawning run's options, monitor, abort signals, progress sinks or settings.
  */
 export interface SubagentSessionSpec {
 	options: Omit<
@@ -191,7 +189,7 @@ export interface SubagentSessionSpec {
 	/**
 	 * Whether a warm revive can read the session's transcript back: the subagent is kept alive and has a session
 	 * file. Only then does the transcript record the rosters its prompt renders ({@link IRC_ROSTER_ENTRY}) and its
-	 * revive inputs ({@link SUBAGENT_REVIVE_ENTRY}).
+	 * revive inputs (`SUBAGENT_REVIVE_ENTRY` in subagent-revive.ts).
 	 */
 	revivable: boolean;
 }
@@ -244,11 +242,12 @@ export function buildSubagentSessionOptions(
 		// A launch prompts its assignment only after setup; a revive's turns are its IRC wakes.
 		awaitingAssignment: launch !== undefined,
 		systemPrompt: defaultPrompt => {
-			// A revive shows the roster {@link revivalIrcRoster} returned, and a rebuild that leaves the
-			// rest of the prompt unchanged keeps the roster the prompt it replaces showed: peer rows carry
-			// each peer's live activity, so a re-collected roster changed the prompt's bytes on every such
-			// rebuild and the provider wrote the whole conversation to its prompt cache again. A rebuild
-			// whose default blocks changed loses the cached prefix anyway, so it catches the roster up.
+			// A revive shows the roster `revivalIrcRoster` (subagent-revive.ts) returned, and a rebuild
+			// that leaves the rest of the prompt unchanged keeps the roster the prompt it replaces showed:
+			// peer rows carry each peer's live activity, so a re-collected roster changed the prompt's
+			// bytes on every such rebuild and the provider wrote the whole conversation to its prompt
+			// cache again. A rebuild whose default blocks changed loses the cached prefix anyway, so it
+			// catches the roster up.
 			const ircRoster = !inputs.ircEnabled
 				? undefined
 				: (inputs.revivalIrcRoster ??
@@ -335,4 +334,55 @@ export function recordedIrcRosterBlocks(entries: readonly SessionEntry[]): Set<s
 		if (record) recorded.add(record.block);
 	}
 	return recorded;
+}
+
+/**
+ * `fields` without its keys whose value is `undefined`; with `keys`, only the fields they name. A parked subagent
+ * keeps its spawn's session options and wake-turn inputs for as long as it can be revived, and their readers take a
+ * missing key as `undefined`.
+ */
+export function withoutUndefinedFields<T extends object>(fields: T): T;
+export function withoutUndefinedFields<T extends object, K extends keyof T>(fields: T, keys: readonly K[]): Pick<T, K>;
+export function withoutUndefinedFields<T extends object>(
+	fields: T,
+	keys: readonly (keyof T)[] = Object.keys(fields) as (keyof T)[],
+): Partial<T> {
+	const defined: Partial<T> = {};
+	for (const key of keys) {
+		if (fields[key] !== undefined) defined[key] = fields[key];
+	}
+	return defined;
+}
+
+/**
+ * Drops `session`'s rendered rosters and roster root when it is disposed: the transcript keeps what a revive needs,
+ * and the revive resolves the root again.
+ */
+export function dropIrcRendersOnDispose(session: AgentSession, inputs: SubagentPromptInputs): void {
+	session.addDisposer(() => {
+		inputs.ircRenders = undefined;
+		inputs.ircRootSessionFile = undefined;
+	});
+}
+
+/**
+ * Re-resolves the IRC roster root a subagent's prompt scopes its peer rows to,
+ * scanning the persisted roster in `storage`, where the tree's transcripts live.
+ */
+export async function refreshSubagentIrcRoot(
+	inputs: SubagentPromptInputs,
+	sessionManager: SessionManager,
+	sessionFile: string | null,
+	storage: SessionStorage,
+): Promise<void> {
+	if (!inputs.ircEnabled) return;
+	const registry = AgentRegistry.global();
+	inputs.ircRootSessionFile = await ensurePersistedRoster(
+		registry,
+		sessionManager.getSessionFile() ??
+			sessionFile ??
+			registry.get(inputs.id)?.sessionFile ??
+			registry.get(MAIN_AGENT_ID)?.sessionFile,
+		storage,
+	);
 }

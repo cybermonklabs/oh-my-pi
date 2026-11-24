@@ -3,25 +3,15 @@
  * credentials its runs made, what the parked subagent keeps in memory, and the revive that rebuilds its session
  * from them.
  */
-import type { Api, Model, ServiceTierByFamily } from "@oh-my-pi/pi-ai";
+import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import { validateAgentAccountPools } from "../config/account-pools";
-import type { CompactionThresholdPair } from "../config/compaction-threshold";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting } from "../config/model-resolver";
-import { all as allSettings, lookup as lookupSetting } from "../config/registry";
-import {
-	deleteByPath,
-	getByPath,
-	type OverlayLayers,
-	type RawSettings,
-	type Settings,
-	setByPath,
-} from "../config/settings";
+import type { OverlayLayers, Settings } from "../config/settings";
 import { initializeExtensions } from "../modes/runtime-init";
 import { WarmReviveInputsMissingError } from "../registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
-import { ensurePersistedRoster } from "../registry/persisted-agents";
+import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import { type CreateAgentSessionResult, createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { ArtifactManagerApi } from "../session/artifacts";
@@ -32,8 +22,6 @@ import type { SessionStorage } from "../session/session-storage";
 import type { EventBus } from "../utils/event-bus";
 import {
 	attachIrcWakeTurnMonitor,
-	compactionThresholdSettings,
-	createSubagentSettings,
 	followMCPTools,
 	type IrcWakeTurnMonitorOptions,
 	type MCPToolFollower,
@@ -41,44 +29,41 @@ import {
 	subagentRetryFallbackRole,
 } from "./executor";
 import { cfgTaskAgentAccountPools } from "./settings";
-import { kRootCompactionThresholds, startupModelFallbacks } from "./subagent-run-state";
+import { startupModelFallbacks } from "./subagent-run-state";
 import {
 	buildSubagentSessionOptions,
+	dropIrcRendersOnDispose,
 	explicitSubagentToolNames,
 	type IrcPeerRosterData,
 	ircRosterBlockKey,
 	ircRosterRecordOf,
 	recordedIrcRosterBlocks,
-	type SubagentChainSettings,
+	refreshSubagentIrcRoot,
 	type SubagentPromptInputs,
 	type SubagentSessionSpec,
+	withoutUndefinedFields,
 } from "./subagent-session-options";
+import {
+	kRootCompactionThresholds,
+	layerWrites,
+	splitCredentialWrites,
+	type SubagentChainSettings,
+	type SubagentCredentialWrites,
+	type SubagentSettingsInputs,
+	type SubagentSettingsWrites,
+	subagentSettingsFromInputs,
+	withCredentialWrites,
+	withLayerWrites,
+} from "./subagent-settings";
 import type { AgentDefinition } from "./types";
 
 /**
- * `fields` without its keys whose value is `undefined`; with `keys`, only the fields they name. A parked subagent
- * keeps its spawn's session options and wake-turn inputs for as long as it can be revived, and their readers take a
- * missing key as `undefined`.
- */
-export function withoutUndefinedFields<T extends object>(fields: T): T;
-export function withoutUndefinedFields<T extends object, K extends keyof T>(fields: T, keys: readonly K[]): Pick<T, K>;
-export function withoutUndefinedFields<T extends object>(
-	fields: T,
-	keys: readonly (keyof T)[] = Object.keys(fields) as (keyof T)[],
-): Partial<T> {
-	const defined: Partial<T> = {};
-	for (const key of keys) {
-		if (fields[key] !== undefined) defined[key] = fields[key];
-	}
-	return defined;
-}
-
-/**
  * The roster the parked session's prompt showed, read back from its transcript: the
- * {@link IRC_ROSTER_ENTRY} of a block of the base its latest `session_init` holds, the base its
- * last model call was built from (before any `before_agent_start` rewrite, which the revived turn
- * runs again). `undefined` when the transcript records none, as one written before rosters were
- * recorded: the revive then renders the live registry's roster.
+ * `IRC_ROSTER_ENTRY` (subagent-session-options.ts) of a block of the base its latest
+ * `session_init` holds, the base its last model call was built from (before any
+ * `before_agent_start` rewrite, which the revived turn runs again). `undefined` when the
+ * transcript records none, as one written before rosters were recorded: the revive then renders
+ * the live registry's roster.
  */
 function revivalIrcRoster(entries: readonly SessionEntry[]): IrcPeerRosterData | undefined {
 	const base = extractSessionInit(entries)?.systemPrompt;
@@ -89,176 +74,6 @@ function revivalIrcRoster(entries: readonly SessionEntry[]): IrcPeerRosterData |
 		if (record && held.has(record.block)) return record.roster;
 	}
 	return undefined;
-}
-
-/**
- * Drops `session`'s rendered rosters and roster root when it is disposed: the transcript keeps what a revive needs,
- * and the revive resolves the root again.
- */
-export function dropIrcRendersOnDispose(session: AgentSession, inputs: SubagentPromptInputs): void {
-	session.addDisposer(() => {
-		inputs.ircRenders = undefined;
-		inputs.ircRootSessionFile = undefined;
-	});
-}
-
-/**
- * Re-resolves the IRC roster root a subagent's prompt scopes its peer rows to,
- * scanning the persisted roster in `storage`, where the tree's transcripts live.
- */
-export async function refreshSubagentIrcRoot(
-	inputs: SubagentPromptInputs,
-	sessionManager: SessionManager,
-	sessionFile: string | null,
-	storage: SessionStorage,
-): Promise<void> {
-	if (!inputs.ircEnabled) return;
-	const registry = AgentRegistry.global();
-	inputs.ircRootSessionFile = await ensurePersistedRoster(
-		registry,
-		sessionManager.getSessionFile() ??
-			sessionFile ??
-			registry.get(inputs.id)?.sessionFile ??
-			registry.get(MAIN_AGENT_ID)?.sessionFile,
-		storage,
-	);
-}
-
-/**
- * A spawn's own inputs to its settings overlay. Over the live parent settings they build the overlay
- * at spawn and again at each warm revive, so a parked subagent keeps these few values instead of a
- * copy of the overlay's layers.
- */
-export interface SubagentSettingsInputs {
-	readonly compactionThreshold: CompactionThresholdPair | undefined;
-	/** The agent definition turns `read` summaries off. */
-	readonly noReadSummaries: boolean;
-	/** An isolated run must not expose roots outside its worktree. */
-	readonly isolated: boolean;
-	readonly advisor: boolean;
-	/** The advisor model pattern, expanded against the spawning owner's roles. */
-	readonly advisorRolePattern: string | undefined;
-	readonly parentServiceTier: ServiceTierByFamily | null | undefined;
-}
-
-/** The subagent overlay of `parent` that `inputs` describe (see {@link createSubagentSettings}). */
-export function subagentSettingsFromInputs(parent: Settings, inputs: SubagentSettingsInputs): SubagentChainSettings {
-	return createSubagentSettings(
-		parent,
-		{
-			...compactionThresholdSettings(inputs.compactionThreshold),
-			...(inputs.noReadSummaries ? { "read.summarize.enabled": false } : undefined),
-			...(inputs.isolated ? { "workspace.additionalDirectories": [] } : undefined),
-			...(inputs.advisor ? { "advisor.enabled": true } : undefined),
-			...(inputs.advisorRolePattern
-				? { modelRoles: { ...parent.getModelRoles(), advisor: inputs.advisorRolePattern } }
-				: undefined),
-		},
-		inputs.parentServiceTier,
-	);
-}
-
-/** Writes a subagent's runs made to one layer of its settings overlay, by top-level key. */
-interface SettingsLayerWrites {
-	/** Keys a run set, each with the value it held when the live session was disposed. */
-	readonly set?: Readonly<Record<string, unknown>>;
-	/** Keys a run removed. */
-	readonly removed?: readonly string[];
-}
-
-/**
- * Settings writes a subagent's runs made to its overlay's own layers. JSON data, as the settings
- * layers are, so a {@link SUBAGENT_REVIVE_ENTRY} holds them, except the values of credential
- * settings ({@link SubagentCredentialWrites}).
- */
-interface SubagentSettingsWrites {
-	readonly global?: SettingsLayerWrites;
-	readonly overrides?: SettingsLayerWrites;
-}
-
-/** The top-level keys whose value in `layer` differs from `baseline`'s; `undefined` when none does. */
-function layerWrites(baseline: RawSettings, layer: RawSettings): SettingsLayerWrites | undefined {
-	let set: Record<string, unknown> | undefined;
-	let removed: string[] | undefined;
-	for (const key of new Set([...Object.keys(baseline), ...Object.keys(layer)])) {
-		if (Bun.deepEquals(baseline[key], layer[key])) continue;
-		if (layer[key] === undefined) (removed ??= []).push(key);
-		else (set ??= {})[key] = layer[key];
-	}
-	return set || removed ? { set, removed } : undefined;
-}
-
-/** `layer` with `writes` applied. */
-function withLayerWrites(layer: RawSettings, writes: SettingsLayerWrites | undefined): RawSettings {
-	if (!writes) return layer;
-	const set = writes.set ?? {};
-	const removed = new Set(writes.removed);
-	const written: RawSettings = {};
-	for (const key of new Set([...Object.keys(layer), ...Object.keys(set)])) {
-		const value = Object.hasOwn(set, key) ? set[key] : removed.has(key) ? undefined : layer[key];
-		if (value !== undefined) written[key] = value;
-	}
-	return written;
-}
-
-/**
- * Values of credential settings (`Setting.isCredential`: an API key, a token, a password) a
- * subagent's runs wrote to its overlay's layers, by setting id. They stay out of its
- * {@link SUBAGENT_REVIVE_ENTRY}: the transcript file stores what it is given, unmasked unless the
- * session store is masked. The parked subagent keeps them in its {@link WarmReviveState}, and its
- * warm revive puts them back into the writes the entry holds.
- */
-interface SubagentCredentialWrites {
-	readonly global?: Readonly<Record<string, unknown>>;
-	readonly overrides?: Readonly<Record<string, unknown>>;
-}
-
-/** `writes` without the values of credential settings, and those values by setting id. */
-function splitCredentialWrites(writes: SettingsLayerWrites | undefined): {
-	writes: SettingsLayerWrites | undefined;
-	credentials: Record<string, unknown> | undefined;
-} {
-	if (!writes?.set) return { writes, credentials: undefined };
-	let set: RawSettings | undefined;
-	let credentials: Record<string, unknown> | undefined;
-	for (const setting of allSettings()) {
-		if (!setting.isCredential) continue;
-		const value = getByPath(set ?? writes.set, setting.segments);
-		if (value === undefined) continue;
-		(credentials ??= {})[setting.id] = value;
-		// A copy, so deleting from it leaves the caller's `writes` unchanged.
-		set ??= { ...writes.set };
-		deleteByPath(set, setting.segments);
-	}
-	if (!set) return { writes, credentials };
-	const { removed } = writes;
-	const kept = Object.keys(set).length > 0 ? set : undefined;
-	return { writes: kept || removed ? { set: kept, removed } : undefined, credentials };
-}
-
-/** `writes` with the credential values {@link splitCredentialWrites} took out of each layer put back. */
-function withCredentialWrites(
-	writes: SubagentSettingsWrites | undefined,
-	credentials: SubagentCredentialWrites | undefined,
-): SubagentSettingsWrites | undefined {
-	if (!credentials) return writes;
-	const restore = (
-		layer: SettingsLayerWrites | undefined,
-		values: Readonly<Record<string, unknown>> | undefined,
-	): SettingsLayerWrites | undefined => {
-		if (!values) return layer;
-		// A copy: the writes' records are the reopened transcript's entry.
-		const set: RawSettings = structuredClone(layer?.set ?? {});
-		for (const [id, value] of Object.entries(values)) {
-			const setting = lookupSetting(id);
-			if (setting) setByPath(set, setting.segments, value);
-		}
-		return { set, removed: layer?.removed };
-	};
-	return {
-		global: restore(writes?.global, credentials.global),
-		overrides: restore(writes?.overrides, credentials.overrides),
-	};
 }
 
 /**
@@ -605,8 +420,8 @@ type SharedSpecOptions = Pick<SubagentSpecOptions, KeysWithSource<typeof SPEC_OP
  * with equal copies, so a state that kept the registry's object would then keep alive one nothing
  * else holds. The credential settings are set at disposal too. Its plain inputs are in its
  * transcript's newest {@link SUBAGENT_REVIVE_ENTRY} and the peer roster its prompt showed in an
- * {@link IRC_ROSTER_ENTRY}; its session file is the one its registry record names, which the
- * lifecycle hands each revive.
+ * `IRC_ROSTER_ENTRY` (subagent-session-options.ts); its session file is the one its registry
+ * record names, which the lifecycle hands each revive.
  */
 export interface WarmReviveState extends SharedSpecOptions {
 	/** Storage the parked session's file lives in; the revive reopens it there. */

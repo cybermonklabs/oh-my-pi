@@ -39,8 +39,6 @@ import { defaultSessionStorage, type SessionStorage } from "../session/session-s
 import type { EventBus } from "../utils/event-bus";
 import {
 	attachIrcWakeTurnMonitor,
-	compactionThresholdSettings,
-	createSubagentSettings,
 	followMCPTools,
 	replayRevivedAgentStart,
 	softRequestBudgetFor,
@@ -57,6 +55,7 @@ import {
 } from "./model-approval";
 import { cfgTaskAgentAccountPools, cfgTaskAgentIdleTtlMs, cfgTaskMaxEffort } from "./settings";
 import { type RestoredSeanceSession, restoreSeanceSession } from "./seance";
+import { compactionThresholdSettings, createSubagentSettings } from "./subagent-settings";
 import { seanceIsolationOptions } from "./seance-policy";
 import type { AgentDefinition } from "./types";
 
@@ -540,8 +539,8 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			outputSchemaMode: init.outputSchemaMode,
 			restrictToolNames: restrictToolNames || undefined,
 			requireYieldTool: structured,
-			// Mirrors the task executor's own internal-spawner opt-in
-			// (executor.ts, `buildSubagentSessionOptions`): `initializeExtensions`
+			// Mirrors the task executor's own internal-spawner opt-in (executor.ts,
+			// the session spec `runSubprocessOnThisThread` builds): `initializeExtensions`
 			// below re-runs `discoverStartupSkillPaths()` once session_start
 			// fires, and without this the merge is a no-op, silently dropping
 			// any resources_discover contribution the revived subagent's own

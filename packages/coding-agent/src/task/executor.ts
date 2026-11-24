@@ -53,13 +53,7 @@ import {
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
-import {
-	buildServiceTierByFamily,
-	isServiceTierForFamily,
-	resolveAgentServiceTierOverride,
-	resolveSubagentServiceTier,
-	type ServiceTierInheritSettingValue,
-} from "../config/service-tier";
+import { resolveAgentServiceTierOverride, type ServiceTierInheritSettingValue } from "../config/service-tier";
 import type { CompactionThresholdPair } from "../config/compaction-threshold";
 import { type OAuthAccountPools, SessionAccountPoolScope } from "../config/account-pools";
 import { Settings } from "../config/settings";
@@ -146,23 +140,28 @@ import { formatTaskResultSummary } from "./result-summary";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
 	createWarmReviveState,
-	dropIrcRendersOnDispose,
-	refreshSubagentIrcRoot,
 	reviveWarmSubagent,
 	type SubagentReviveInputs,
-	type SubagentSettingsInputs,
-	subagentSettingsFromInputs,
 	trackSubagentReviveRecord,
 	type WarmReviveState,
-	withoutUndefinedFields,
 } from "./subagent-revive";
-import { kRootCompactionThresholds, startupModelFallbacks } from "./subagent-run-state";
+import { startupModelFallbacks } from "./subagent-run-state";
 import {
 	buildSubagentSessionOptions,
+	dropIrcRendersOnDispose,
 	explicitSubagentToolNames,
-	type SubagentChainSettings,
+	refreshSubagentIrcRoot,
 	type SubagentSessionSpec,
+	withoutUndefinedFields,
 } from "./subagent-session-options";
+import {
+	inheritedSubagentServiceTiers,
+	kRootCompactionThresholds,
+	type RootCompactionThresholds,
+	type SubagentChainSettings,
+	type SubagentSettingsInputs,
+	subagentSettingsFromInputs,
+} from "./subagent-settings";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import {
 	type AgentDefinition,
@@ -198,24 +197,17 @@ import {
 	cfgTaskMaxRecursionDepth,
 	cfgTaskAgentAdvisor,
 } from "./settings";
-import {
-	cfgTierSubagent,
-	cfgTierGoogle,
-	cfgTierAnthropic,
-	cfgTierOpenai,
-	cfgRetryFallbackChains,
-	cfgDefaultThinkingLevel,
-} from "../session/settings";
+import { cfgRetryFallbackChains } from "../session/settings";
 import { cfgDisabledProviders } from "../config/model-settings";
 import { getRetryFallbackRole, installRetryFallbackRole } from "../session/retry-fallback-chains";
-import {
-	cfgCompactionModelThresholdsEnabled,
-	cfgCompactionThresholdPercent,
-	cfgCompactionThresholdTokens,
-} from "../session/context-settings";
 
 export type { YieldItem } from "@oh-my-pi/pi-tui/tools/task";
 export { collectIrcPeerRoster, type IrcPeerRosterData, type IrcPeerRosterRow } from "./subagent-session-options";
+export {
+	compactionThresholdSettings,
+	createSubagentSettings,
+	type RootCompactionThresholds,
+} from "./subagent-settings";
 
 const TASK_ABORT_CLEANUP_GRACE_MS = 10_000;
 
@@ -1182,115 +1174,6 @@ export function followMCPTools(
 		},
 		dispose: unsubscribe,
 	};
-}
-
-/**
- * Per-family tiers a subagent inherits: the parent's live tiers when a live session supplied
- * them, else its configured `tier.*`. Live entries a family can't realize (a resumed session
- * file may carry `{anthropic: "flex"}`) are dropped — the subagent overlay rejects them.
- */
-function inheritedSubagentServiceTiers(
-	baseSettings: Settings,
-	inheritedServiceTier?: ServiceTierByFamily | null,
-): ServiceTierByFamily {
-	if (inheritedServiceTier === undefined) {
-		return buildServiceTierByFamily(
-			cfgTierOpenai.get(baseSettings),
-			cfgTierAnthropic.get(baseSettings),
-			cfgTierGoogle.get(baseSettings),
-		);
-	}
-	const tiers: ServiceTierByFamily = {};
-	for (const family of ["openai", "anthropic", "google"] as const) {
-		const tier = inheritedServiceTier?.[family];
-		if (isServiceTierForFamily(family, tier)) tiers[family] = tier;
-	}
-	return tiers;
-}
-
-/** Root compaction thresholds a subagent chain pins (see {@link kRootCompactionThresholds}). */
-export interface RootCompactionThresholds extends CompactionThresholdPair {
-	modelThresholdsEnabled: boolean;
-}
-
-/**
- * Settings overrides applying an exact-name compaction threshold entry to one
- * subagent. The agent entry outranks `compaction.modelThresholds`, including
- * entries added while the agent runs, so model entries are switched off for it.
- */
-export function compactionThresholdSettings(
-	threshold: CompactionThresholdPair | undefined,
-): Readonly<Record<string, unknown>> | undefined {
-	return threshold === undefined
-		? undefined
-		: {
-				"compaction.thresholdPercent": threshold.thresholdPercent,
-				"compaction.thresholdTokens": threshold.thresholdTokens,
-				"compaction.modelThresholdsEnabled": false,
-			};
-}
-
-export function createSubagentSettings(
-	baseSettings: SubagentChainSettings,
-	overrides?: Readonly<Record<string, unknown>>,
-	inheritedServiceTier?: ServiceTierByFamily | null,
-): Settings {
-	// Resolve the subagent's per-family tiers from `tier.subagent` ("inherit" =
-	// match the parent's live tiers when a live session supplied them, else the
-	// subagent's own configured tier.* settings). The result is stamped onto the
-	// overlay so createAgentSession's tier.* reads pick it up.
-	const inheritedTiers = inheritedSubagentServiceTiers(baseSettings, inheritedServiceTier);
-	const subagentTiers = resolveSubagentServiceTier(cfgTierSubagent.get(baseSettings), inheritedTiers);
-	// A parent subagent's own per-agent threshold must not leak to its children: descendants
-	// of a subagent pin the root's thresholds. A root parent's children read them through live.
-	const inheritedRootThresholds = baseSettings[kRootCompactionThresholds];
-	const rootThresholds = inheritedRootThresholds ?? {
-		thresholdPercent: cfgCompactionThresholdPercent.get(baseSettings),
-		thresholdTokens: cfgCompactionThresholdTokens.get(baseSettings),
-		modelThresholdsEnabled: cfgCompactionModelThresholdsEnabled.get(baseSettings),
-	};
-	// Every other setting reads through to the parent live; writes on the overlay stay local.
-	const subagentSettings: SubagentChainSettings = baseSettings.overlay(
-		{
-			...(inheritedRootThresholds && {
-				"compaction.thresholdPercent": inheritedRootThresholds.thresholdPercent,
-				"compaction.thresholdTokens": inheritedRootThresholds.thresholdTokens,
-				"compaction.modelThresholdsEnabled": inheritedRootThresholds.modelThresholdsEnabled,
-			}),
-			// A subagent's thinking level is chosen at spawn (agent definition, `effort`, or this
-			// snapshot of the parent default); a later parent default edit must not re-steer it.
-			defaultThinkingLevel: cfgDefaultThinkingLevel.get(baseSettings),
-			"tier.openai": subagentTiers.openai ?? "none",
-			"tier.anthropic": subagentTiers.anthropic ?? "none",
-			"tier.google": subagentTiers.google ?? "none",
-			// Async jobs and bash/eval auto-backgrounding are inherited from the parent:
-			// background jobs are owner-routed to the subagent's own session, and
-			// the run driver's quiescence barrier + teardown reap guarantee no
-			// owner job outlives the run, so worktree capture/cleanup stays
-			// race-free (previously both were force-disabled here).
-
-			// Subagents run headless — there is no UI to confirm prompts against, so
-			// the parent task approval is the authorization boundary. Use yolo mode
-			// to preserve unattended subagent execution. User `tools.approval` policies still apply.
-			"tools.approvalMode": "yolo",
-			// Subagents run unadvised by default; runSubprocess opts a spawn back in
-			// per agent (frontmatter `advisor` / `task.agentAdvisor`) via overrides.
-			"advisor.enabled": false,
-			// A subagent assignment is one turn: its tool loop ends only when the run
-			// yields, so post-turn `checkCompaction` (driven from `agent_end`) fires
-			// after the run is over and `maintainContextMidRun` is the only proactive
-			// compaction the child ever reaches. `compaction.midTurnEnabled` encodes an
-			// interactive preference — keep compaction boundaries on real user turns —
-			// that has no counterpart here, so inheriting `false` left hours-long
-			// worker runs sailing past the configured threshold until the provider
-			// rejected the context (#13211). A per-spawn override still wins.
-			"compaction.midTurnEnabled": true,
-			...overrides,
-		},
-		{ derived: true },
-	);
-	subagentSettings[kRootCompactionThresholds] = rootThresholds;
-	return subagentSettings;
 }
 
 export type AbortReason = "signal" | "shutdown" | "terminate" | "timeout" | "budget";
