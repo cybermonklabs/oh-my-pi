@@ -29,6 +29,7 @@
 {"id":"c/case-functrace","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; set -T; f() { case x in x) :;; esac; }; f","stdout":"D:[set -T]\nD:[f]\nD:[f]\nD:[case x in ]\nD:[:]\n","stderr":"","status":0}
 {"id":"c/case-nested","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; for i in 1; do case $i in 1) case x in x) :;; esac;; esac; done","stdout":"D:[for i in 1]\nD:[case $i in ]\nD:[case x in ]\nD:[:]\n","stderr":"","status":0}
 {"id":"c/case-no-match","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; case b in a) echo no;; esac; echo after","stdout":"D:[case b in ]\nD:[echo after]\nafter\n","stderr":"","status":0}
+{"id":"c/cmdsub-own-command","script":"x=$(echo  \"[$BASH_COMMAND]\"); echo \"$x\"","stdout":"[echo \"[$BASH_COMMAND]\"]\n","stderr":"","status":0}
 {"id":"c/compound-redirs","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; [[ -n a ]] 2>/dev/null; (( 1 )) 2>/dev/null; for i in 1; do :; done 2>/dev/null","stdout":"D:[[[ -n a ]]]\nD:[(( 1 ))]\nD:[for i in 1]\nD:[:]\n","stderr":"","status":0}
 {"id":"c/cond","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; x=1; [[  -n  $x  ]]; [[ $x == 1 && ( -z \"\" || $x ) ]]","stdout":"D:[x=1]\nD:[[[ -n $x ]]]\nD:[[[ $x == 1 && ( -z \"\" || -n $x ) ]]]\n","stderr":"","status":0}
 {"id":"c/err-trap","script":"trap 'echo \"R:[$BASH_COMMAND]\"' ERR; false   ;  [[  -z  x  ]]","stdout":"R:[false]\nR:[[[ -z x ]]]\n","stderr":"","status":1}
@@ -70,6 +71,20 @@
 {"id":"c/select-positional","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; set -- p; select s; do break; done 2>/dev/null <<< 1","stdout":"D:[set -- p]\nD:[select s in \"$@\"]\nD:[break]\n","stderr":"","status":0}
 {"id":"c/simple-blanks","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; echo   a    b  >/dev/null","stdout":"D:[echo a b > /dev/null]\n","stderr":"","status":0}
 {"id":"c/substitutions","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; echo $(  echo  a  ;  echo  b  ) `echo  c`","stdout":"D:[echo $(echo a; echo b) `echo  c`]\na b c\n","stderr":"","status":0}
+{"id":"c/trap-background","script":"trap '{ echo \"B:[$BASH_COMMAND]\"; } & wait' DEBUG; echo  a >/dev/null","stdout":"B:[echo \"B:[$BASH_COMMAND]\"]\n","stderr":"","status":0}
+{"id":"c/trap-background-simple","script":"trap 'echo \"B:[$BASH_COMMAND]\" & wait' DEBUG; echo  a >/dev/null","stdout":"B:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"c/trap-cmdsub-arith-for","script":"trap 'x=$(echo \"$BASH_COMMAND\"); echo \"D:[$x]\"' DEBUG; n=0; for ((i=$n; i<1; i++)); do :; done","stdout":"D:[n=0]\nD:[((i=0))]\nD:[((i<1))]\nD:[:]\nD:[((i++))]\nD:[((i<1))]\n","stderr":"","status":0}
+{"id":"c/trap-cmdsub-debug","script":"trap 'x=$(echo \"$BASH_COMMAND\"); echo \"D:[$x]\"' DEBUG; for i in a; do :; done; case a in a) :;; esac; echo  hi >/dev/null","stdout":"D:[for i in a]\nD:[:]\nD:[case a in ]\nD:[:]\nD:[echo hi > /dev/null]\n","stderr":"","status":0}
+{"id":"c/trap-cmdsub-err","script":"trap 'x=$(echo \"$BASH_COMMAND\"); echo \"R:[$x]\"' ERR; false   ;  :","stdout":"R:[false]\n","stderr":"","status":0}
+{"id":"c/trap-cmdsub-exit","script":"trap 'x=$(echo \"$BASH_COMMAND\"); echo \"E:[$x]\"' EXIT; echo   a >/dev/null","stdout":"E:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"c/trap-cmdsub-nested","script":"trap 'x=$(y=$(echo \"$BASH_COMMAND\"); echo \"$y\"); echo \"D:[$x]\"' DEBUG; echo  a >/dev/null","stdout":"D:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"c/trap-cmdsub-subshell","script":"trap 'x=$( ( echo \"$BASH_COMMAND\" ) ); echo \"D:[$x]\"' DEBUG; echo  a >/dev/null","stdout":"D:[echo \"$BASH_COMMAND\"]\n","stderr":"","status":0}
+{"id":"c/trap-coproc","script":"trap 'coproc { echo \"C:[$BASH_COMMAND]\"; read -r; }; read -r l <&\"${COPROC[0]}\"; echo \"$l\"; echo >&\"${COPROC[1]}\"; wait' EXIT; echo  a >/dev/null","stdout":"C:[echo \"C:[$BASH_COMMAND]\"]\n","stderr":"","status":0}
+{"id":"c/trap-function-cmdsub","script":"f() { x=$(echo \"$BASH_COMMAND\"); echo \"F:[$x]\"; }; trap f DEBUG; echo  a >/dev/null","stdout":"F:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"c/trap-pipeline","script":"trap 'echo \"P:[$BASH_COMMAND]\" | cat' DEBUG; echo  a >/dev/null","stdout":"P:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"c/trap-pipeline-compound","script":"trap '{ echo \"P:[$BASH_COMMAND]\"; } | cat' DEBUG; echo  a >/dev/null","stdout":"P:[echo \"P:[$BASH_COMMAND]\"]\n","stderr":"","status":0}
+{"id":"c/trap-procsub","script":"trap 'cat <(echo \"Q:[$BASH_COMMAND]\")' DEBUG; echo  a >/dev/null","stdout":"Q:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"c/trap-subshell","script":"trap '( echo \"S:[$BASH_COMMAND]\" )' DEBUG; echo  a >/dev/null","stdout":"S:[echo \"S:[$BASH_COMMAND]\"]\n","stderr":"","status":0}
 {"id":"c/xtrace-arith-for","script":"set -x; n=1; for ((i=$(  echo  0  ); i<$n; i++)); do :; done","stdout":"","stderr":"+ n=1\n++ echo 0\n+ (( i=0 ))\n+ (( i<1 ))\n+ :\n+ (( i++ ))\n+ (( i<1 ))\n","status":0}
 {"id":"c/xtrace-arith-for-empty","script":"set -x; for ((;;)); do break; done","stdout":"","stderr":"+ (( 1 ))\n+ (( 1 ))\n+ break\n","status":0}
 {"id":"c/xtrace-case","script":"set -x; case $(  echo  a  ) in a) :;; esac","stdout":"","stderr":"+ case $(echo a) in\n++ echo a\n+ :\n","status":0}
@@ -110,6 +125,7 @@
 {"id":"s/case-functrace","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; set -T; f() { case x in x) :;; esac; }; f","stdout":"D:[set -T]\nD:[f]\nD:[f]\nD:[case x in ]\nD:[:]\n","stderr":"","status":0}
 {"id":"s/case-nested","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; for i in 1; do case $i in 1) case x in x) :;; esac;; esac; done","stdout":"D:[for i in 1]\nD:[case $i in ]\nD:[case x in ]\nD:[:]\n","stderr":"","status":0}
 {"id":"s/case-no-match","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; case b in a) echo no;; esac; echo after","stdout":"D:[case b in ]\nD:[echo after]\nafter\n","stderr":"","status":0}
+{"id":"s/cmdsub-own-command","script":"x=$(echo  \"[$BASH_COMMAND]\"); echo \"$x\"","stdout":"[echo \"[$BASH_COMMAND]\"]\n","stderr":"","status":0}
 {"id":"s/compound-redirs","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; [[ -n a ]] 2>/dev/null; (( 1 )) 2>/dev/null; for i in 1; do :; done 2>/dev/null","stdout":"D:[[[ -n a ]]]\nD:[(( 1 ))]\nD:[for i in 1]\nD:[:]\n","stderr":"","status":0}
 {"id":"s/cond","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; x=1; [[  -n  $x  ]]; [[ $x == 1 && ( -z \"\" || $x ) ]]","stdout":"D:[x=1]\nD:[[[ -n $x ]]]\nD:[[[ $x == 1 && ( -z \"\" || -n $x ) ]]]\n","stderr":"","status":0}
 {"id":"s/err-trap","script":"trap 'echo \"R:[$BASH_COMMAND]\"' ERR; false   ;  [[  -z  x  ]]","stdout":"R:[false]\nR:[[[ -z x ]]]\n","stderr":"","status":1}
@@ -151,6 +167,20 @@
 {"id":"s/select-positional","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; set -- p; select s; do break; done 2>/dev/null <<< 1","stdout":"D:[set -- p]\nD:[select s in \"$@\"]\nD:[break]\n","stderr":"","status":0}
 {"id":"s/simple-blanks","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; echo   a    b  >/dev/null","stdout":"D:[echo a b > /dev/null]\n","stderr":"","status":0}
 {"id":"s/substitutions","script":"trap 'echo \"D:[$BASH_COMMAND]\"' DEBUG; echo $(  echo  a  ;  echo  b  ) `echo  c`","stdout":"D:[echo $(echo a; echo b) `echo  c`]\na b c\n","stderr":"","status":0}
+{"id":"s/trap-background","script":"trap '{ echo \"B:[$BASH_COMMAND]\"; } & wait' DEBUG; echo  a >/dev/null","stdout":"B:[echo \"B:[$BASH_COMMAND]\"]\n","stderr":"","status":0}
+{"id":"s/trap-background-simple","script":"trap 'echo \"B:[$BASH_COMMAND]\" & wait' DEBUG; echo  a >/dev/null","stdout":"B:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"s/trap-cmdsub-arith-for","script":"trap 'x=$(echo \"$BASH_COMMAND\"); echo \"D:[$x]\"' DEBUG; n=0; for ((i=$n; i<1; i++)); do :; done","stdout":"D:[n=0]\nD:[((i=0))]\nD:[((i<1))]\nD:[:]\nD:[((i++))]\nD:[((i<1))]\n","stderr":"","status":0}
+{"id":"s/trap-cmdsub-debug","script":"trap 'x=$(echo \"$BASH_COMMAND\"); echo \"D:[$x]\"' DEBUG; for i in a; do :; done; case a in a) :;; esac; echo  hi >/dev/null","stdout":"D:[for i in a]\nD:[:]\nD:[case a in ]\nD:[:]\nD:[echo hi > /dev/null]\n","stderr":"","status":0}
+{"id":"s/trap-cmdsub-err","script":"trap 'x=$(echo \"$BASH_COMMAND\"); echo \"R:[$x]\"' ERR; false   ;  :","stdout":"R:[false]\n","stderr":"","status":0}
+{"id":"s/trap-cmdsub-exit","script":"trap 'x=$(echo \"$BASH_COMMAND\"); echo \"E:[$x]\"' EXIT; echo   a >/dev/null","stdout":"E:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"s/trap-cmdsub-nested","script":"trap 'x=$(y=$(echo \"$BASH_COMMAND\"); echo \"$y\"); echo \"D:[$x]\"' DEBUG; echo  a >/dev/null","stdout":"D:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"s/trap-cmdsub-subshell","script":"trap 'x=$( ( echo \"$BASH_COMMAND\" ) ); echo \"D:[$x]\"' DEBUG; echo  a >/dev/null","stdout":"D:[echo \"$BASH_COMMAND\"]\n","stderr":"","status":0}
+{"id":"s/trap-coproc","script":"trap 'coproc { echo \"C:[$BASH_COMMAND]\"; read -r; }; read -r l <&\"${COPROC[0]}\"; echo \"$l\"; echo >&\"${COPROC[1]}\"; wait' EXIT; echo  a >/dev/null","stdout":"C:[echo \"C:[$BASH_COMMAND]\"]\n","stderr":"","status":0}
+{"id":"s/trap-function-cmdsub","script":"f() { x=$(echo \"$BASH_COMMAND\"); echo \"F:[$x]\"; }; trap f DEBUG; echo  a >/dev/null","stdout":"F:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"s/trap-pipeline","script":"trap 'echo \"P:[$BASH_COMMAND]\" | cat' DEBUG; echo  a >/dev/null","stdout":"P:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"s/trap-pipeline-compound","script":"trap '{ echo \"P:[$BASH_COMMAND]\"; } | cat' DEBUG; echo  a >/dev/null","stdout":"P:[echo \"P:[$BASH_COMMAND]\"]\n","stderr":"","status":0}
+{"id":"s/trap-procsub","script":"trap 'cat <(echo \"Q:[$BASH_COMMAND]\")' DEBUG; echo  a >/dev/null","stdout":"Q:[echo a > /dev/null]\n","stderr":"","status":0}
+{"id":"s/trap-subshell","script":"trap '( echo \"S:[$BASH_COMMAND]\" )' DEBUG; echo  a >/dev/null","stdout":"S:[echo \"S:[$BASH_COMMAND]\"]\n","stderr":"","status":0}
 {"id":"s/xtrace-arith-for","script":"set -x; n=1; for ((i=$(  echo  0  ); i<$n; i++)); do :; done","stdout":"","stderr":"+ n=1\n++ echo 0\n+ (( i=0 ))\n+ (( i<1 ))\n+ :\n+ (( i++ ))\n+ (( i<1 ))\n","status":0}
 {"id":"s/xtrace-arith-for-empty","script":"set -x; for ((;;)); do break; done","stdout":"","stderr":"+ (( 1 ))\n+ (( 1 ))\n+ break\n","status":0}
 {"id":"s/xtrace-case","script":"set -x; case $(  echo  a  ) in a) :;; esac","stdout":"","stderr":"+ case $(echo a) in\n++ echo a\n+ :\n","status":0}

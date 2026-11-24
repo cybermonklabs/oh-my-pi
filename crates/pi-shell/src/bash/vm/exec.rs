@@ -608,9 +608,15 @@ fn note_expanded(vp: &mut Vproc, expr: BString) {
 	}
 }
 
-/// Whether a trap action runs in `vp` (its frame count first: no scan
-/// outside one).
+/// Whether a trap action runs in `vp`, or `vp` is a fork of one that keeps
+/// its trapped command ([`OwnTraps::trap_fork`]); its frame count first: no
+/// scan outside one.
+///
+/// [`OwnTraps::trap_fork`]: super::proc::OwnTraps::trap_fork
 fn in_trap_action(vp: &Vproc) -> bool {
+	if vp.own_traps.trap_fork() {
+		return true;
+	}
 	vp.trap_frames != 0
 		&& vp
 			.frames
@@ -2049,14 +2055,18 @@ pub fn bash_loop_count(vp: &Vproc) -> u32 {
 	n
 }
 
-/// The loops a child forked from `vp` runs inside ([`Vproc::outer_loops`]):
-/// a zsh fork keeps all of them (zsh's `loops`); bash keeps them
-/// (`loop_level`) only when `keeps`, a fork made without
-/// `execute_in_subshell`: a simple command run as a pipeline element or a
-/// job of one pipeline, a command or process substitution. bash zeroes the
-/// level for `( … )`, a compound element, an and-or, compound or timed job
-/// and a coprocess.
-pub fn fork_loops(vp: &Vproc, keeps: bool) -> u16 {
+/// What a child forked from `vp` inherits of bash's fork, which copies the
+/// whole shell: the loops it runs inside ([`Vproc::outer_loops`]) and the
+/// running trap ([`OwnTraps::trap_fork`]). bash keeps both only when `keeps`,
+/// a fork made without `execute_in_subshell`: a simple command run as a
+/// pipeline element or a job of one pipeline, a command or process
+/// substitution. `execute_in_subshell` zeroes the loop level and
+/// `running_trap` for `( … )`, a compound element, an and-or, compound or
+/// timed job and a coprocess. A zsh fork keeps all its loops (zsh's
+/// `loops`).
+///
+/// [`OwnTraps::trap_fork`]: super::proc::OwnTraps::trap_fork
+pub fn fork_state(child: &mut Vproc, vp: &Vproc, keeps: bool) {
 	let n = if vp.mode.dialect() == Dialect::Zsh {
 		zsh_loop_count(vp)
 	} else if keeps {
@@ -2065,7 +2075,8 @@ pub fn fork_loops(vp: &Vproc, keeps: bool) -> u16 {
 		0
 	};
 	// Past `u16::MAX` loops the count saturates ([`Vproc::outer_loops`]).
-	u16::try_from(n).unwrap_or(u16::MAX)
+	child.outer_loops = u16::try_from(n).unwrap_or(u16::MAX);
+	child.own_traps = child.own_traps.with_trap_fork(keeps && in_trap_action(vp));
 }
 
 /// The first op at or after `at` that is not the jump over a command or
@@ -2087,7 +2098,7 @@ fn skip_blocks(unit: &Unit, mut at: u32) -> u32 {
 }
 
 /// Whether bash forks the job whose body starts at `entry` without
-/// `execute_in_subshell`, so that it keeps the loop level ([`fork_loops`]):
+/// `execute_in_subshell`, so that it keeps the loop level ([`fork_state`]):
 /// a body of one pipeline, with or without `!`, whose simple commands bash
 /// forks from the shell itself. An and-or list, a compound command or a
 /// timed pipeline is run as a subshell (`CMD_FORCE_SUBSHELL`).
@@ -2599,7 +2610,7 @@ pub fn start_sub(
 			// lists the parent's jobs, `fg` finds no current job.
 			child.jobs = inherited_jobs(vp, vp.jobs.subshell);
 			// bash and zsh keep the loop level: a `break` ends the substitution.
-			child.outer_loops = fork_loops(vp, true);
+			fork_state(&mut child, vp, true);
 			// Its externals stay in the shell's process group.
 			super::jobctl::set_leader(k, child.vpid, None);
 			let vpid = child.vpid;
@@ -2674,7 +2685,7 @@ pub fn start_zsh_sub(
 	fds.set(1, Some(FdRef::mem(capture.clone())));
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
 	child.jobs = inherited_jobs(vp, vp.jobs.subshell);
-	child.outer_loops = fork_loops(vp, true);
+	fork_state(&mut child, vp, true);
 	// Its externals stay in the shell's process group (zsh
 	// `ESUB_NOMONITOR`).
 	super::jobctl::set_leader(k, child.vpid, None);
@@ -2718,7 +2729,7 @@ pub fn start_zsh_procsub(
 	fds.set(their_fd, Some(theirs));
 	let line = line_of(vp, 0);
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
-	child.outer_loops = fork_loops(vp, true);
+	fork_state(&mut child, vp, true);
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}
@@ -2873,7 +2884,7 @@ pub fn start_procsub(
 	}
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
 	// bash keeps the loop level in a process substitution.
-	child.outer_loops = fork_loops(vp, true);
+	fork_state(&mut child, vp, true);
 	let vpid = child.vpid;
 	// Not a job: its externals stay in the shell's group, without the
 	// terminal.
@@ -4513,7 +4524,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
 				let keeps =
 					info.kind == SpawnKind::Background && bash_job_keeps(unit, info.stages[0].entry);
-				child.outer_loops = fork_loops(vp, keeps);
+				fork_state(&mut child, vp, keeps);
 				if info.kind == SpawnKind::Background && !control {
 					ignore_async_signals(k, cx, &mut child);
 				}
@@ -4628,7 +4639,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						.ops
 						.get(skip_blocks(unit, stage.entry) as usize)
 						.is_some_and(|op| op.code == Opcode::Exec);
-					child.outer_loops = fork_loops(vp, simple);
+					fork_state(&mut child, vp, simple);
 					let level = if async_elements {
 						0
 					} else {
@@ -4843,7 +4854,7 @@ fn start_coproc(
 	fds.set(0, Some(FdRef::mem(in_r)));
 	fds.set(1, Some(FdRef::mem(out_w)));
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
-	child.outer_loops = fork_loops(vp, false);
+	fork_state(&mut child, vp, false);
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}

@@ -178,6 +178,53 @@ const OWN_ROWS: &[(&str, &str)] = &[
 		"exit-trap-arith-for-expanded",
 		r#"trap 'echo "E:[$BASH_COMMAND]"' EXIT; n=1; for ((i=0; i<$n; i++)); do :; done"#,
 	),
+	// In a child a trap action forks (`$( )`, `( … )`, a pipeline element, a
+	// background command): the trapped command, as the action reads it.
+	(
+		"trap-cmdsub-debug",
+		r#"trap 'x=$(echo "$BASH_COMMAND"); echo "D:[$x]"' DEBUG; for i in a; do :; done; case a in a) :;; esac; echo  hi >/dev/null"#,
+	),
+	(
+		"trap-cmdsub-exit",
+		r#"trap 'x=$(echo "$BASH_COMMAND"); echo "E:[$x]"' EXIT; echo   a >/dev/null"#,
+	),
+	("trap-cmdsub-err", r#"trap 'x=$(echo "$BASH_COMMAND"); echo "R:[$x]"' ERR; false   ;  :"#),
+	(
+		"trap-cmdsub-nested",
+		r#"trap 'x=$(y=$(echo "$BASH_COMMAND"); echo "$y"); echo "D:[$x]"' DEBUG; echo  a >/dev/null"#,
+	),
+	(
+		"trap-cmdsub-arith-for",
+		r#"trap 'x=$(echo "$BASH_COMMAND"); echo "D:[$x]"' DEBUG; n=0; for ((i=$n; i<1; i++)); do :; done"#,
+	),
+	("trap-subshell", r#"trap '( echo "S:[$BASH_COMMAND]" )' DEBUG; echo  a >/dev/null"#),
+	("trap-pipeline", r#"trap 'echo "P:[$BASH_COMMAND]" | cat' DEBUG; echo  a >/dev/null"#),
+	("trap-background", r#"trap '{ echo "B:[$BASH_COMMAND]"; } & wait' DEBUG; echo  a >/dev/null"#),
+	(
+		"trap-function-cmdsub",
+		r#"f() { x=$(echo "$BASH_COMMAND"); echo "F:[$x]"; }; trap f DEBUG; echo  a >/dev/null"#,
+	),
+	(
+		"trap-background-simple",
+		r#"trap 'echo "B:[$BASH_COMMAND]" & wait' DEBUG; echo  a >/dev/null"#,
+	),
+	(
+		"trap-pipeline-compound",
+		r#"trap '{ echo "P:[$BASH_COMMAND]"; } | cat' DEBUG; echo  a >/dev/null"#,
+	),
+	("trap-procsub", r#"trap 'cat <(echo "Q:[$BASH_COMMAND]")' DEBUG; echo  a >/dev/null"#),
+	(
+		"trap-cmdsub-subshell",
+		r#"trap 'x=$( ( echo "$BASH_COMMAND" ) ); echo "D:[$x]"' DEBUG; echo  a >/dev/null"#,
+	),
+	// A coprocess, which bash forks through `execute_in_subshell` too: its
+	// own command.
+	(
+		"trap-coproc",
+		r#"trap 'coproc { echo "C:[$BASH_COMMAND]"; read -r; }; read -r l <&"${COPROC[0]}"; echo "$l"; echo >&"${COPROC[1]}"; wait' EXIT; echo  a >/dev/null"#,
+	),
+	// A `$( )` outside a trap names its own command.
+	("cmdsub-own-command", r#"x=$(echo  "[$BASH_COMMAND]"); echo "$x""#),
 	("read-in-body", r#"for i in 1; do echo "[$BASH_COMMAND]"; done"#),
 	// In a pipeline element or an async command: its own text, as the child
 	// that runs it reads it.
@@ -236,6 +283,8 @@ const SNAPSHOT_ROWS: &[&str] = &[
 	"c/arith-for-expanded",
 	"c/arith-for-cmdsub",
 	"c/simple-blanks",
+	"c/trap-cmdsub-debug",
+	"c/trap-cmdsub-err",
 ];
 
 /// One row: its id and script.
