@@ -1538,7 +1538,7 @@ fn shift_arrayref(arrayref: &mut Vec<u32>) {
 /// bash's `W_ARRAYREF` (`fix_arrayref_words`): the word is written as an
 /// array reference, `name[` in its leading unquoted text and `]` ending
 /// its trailing unquoted text (`d[$k]`, `d["$k"]`, not `"d[$k]"`).
-fn is_arrayref(word: &ir::Word) -> bool {
+pub(crate) fn is_arrayref(word: &ir::Word) -> bool {
 	let (Some(Part::Lit(first)), Some(Part::Lit(last))) = (word.parts.first(), word.parts.last())
 	else {
 		return false;

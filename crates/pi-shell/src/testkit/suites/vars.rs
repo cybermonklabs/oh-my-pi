@@ -229,6 +229,17 @@ fn random_draws_as_often_as_bash_looks_it_up() {
 		("for RANDOM in '1+'; do :; done 2> /dev/null", "[] 29338\n"),
 		("set -k; true RANDOM=7; set +k", "[] 29338\n"),
 		("set -k; true RANDOM=$RANDOM; set +k", "[] 982\n"),
+		("set -k; true RANDOM+=1; set +k", "[] 29338\n"),
+		// `unset -n` and a `for` over a reference look up the end of the
+		// reference chain (`find_variable_last_nameref`).
+		("unset -n RANDOM", "[] 29338\n"),
+		("unset -n RANDOM RANDOM", "[] 982\n"),
+		("declare -n r=RANDOM; unset -n r", "[] 29338\n"),
+		("declare -n r=RANDOM; for r in 7; do :; done 2>/dev/null", "[] 29338\n"),
+		// An operand quoted as a whole is no array reference: one lookup.
+		("[[ -v 'RANDOM[1]' ]]", "[] 29338\n"),
+		("[[ -v \"RANDOM[0]\" ]]", "[] 29338\n"),
+		("[[ -v RANDOM[\"1\"] ]]", "[] 982\n"),
 	] {
 		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
 		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
@@ -262,6 +273,39 @@ fn random_in_a_subshells_redirections_is_the_childs() {
 	] {
 		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
 		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+}
+
+/// Whether `unset` or an array assignment removed `RANDOM`'s special
+/// meaning is imaged with the generator: a shell snapshotted and restored
+/// at every step keeps a plain `RANDOM` plain. Goldens from bash 5.3.20.
+#[test]
+fn random_plain_survives_a_restore() {
+	let wait = "i=0; while [ $i -lt 8 ]; do i=$((i+1)); done";
+	for (src, want) in [
+		(
+			format!("unset RANDOM; {wait}; RANDOM=5; echo $RANDOM $RANDOM; declare -p RANDOM"),
+			"5 5\ndeclare -- RANDOM=\"5\"\n",
+		),
+		(
+			format!(
+				"RANDOM=5; a=$RANDOM; {wait}; b=$RANDOM; RANDOM[1]=3; {wait}; echo $a $b $RANDOM \
+				 $RANDOM; declare -p RANDOM"
+			),
+			"18498 29338 6493 6493\ndeclare -ai RANDOM=([0]=\"6493\" [1]=\"3\")\n",
+		),
+	] {
+		for fault in [Fault::None, Fault::Snapshot { every: 1 }] {
+			let out = run_script(FakeHost::new(), src.as_bytes(), &[], fault);
+			assert_eq!(
+				(
+					String::from_utf8_lossy(&out.stdout).as_ref(),
+					String::from_utf8_lossy(&out.stderr).as_ref()
+				),
+				(want, ""),
+				"{src} {fault:?}"
+			);
+		}
 	}
 }
 
@@ -364,6 +408,7 @@ fn random_assignment_seeds_as_bash_does() {
 		("RANDOM=5; RANDOM=$RANDOM eval 'echo $RANDOM'; echo $RANDOM", "29338\n982\n"),
 		("RANDOM=7; readonly RANDOM; echo $RANDOM $RANDOM", "26956 7409\n"),
 		("RANDOM=7; readonly RANDOM; declare -p RANDOM", "declare -ir RANDOM=\"26956\"\n"),
+		("RANDOM=7; readonly RANDOM; unset -n RANDOM 2>/dev/null; echo $RANDOM", "7409\n"),
 		(
 			"f() { local RANDOM; echo \"[$RANDOM]\"; RANDOM=5; echo $RANDOM $RANDOM; }; f; RANDOM=7; \
 			 echo $RANDOM",
@@ -620,6 +665,18 @@ fn seconds_locals_lookups_and_unset() {
 		),
 		("f() { unset SECONDS; }; f; SECONDS=1+1; echo $SECONDS", "1+1\n"),
 		("( unset SECONDS; SECONDS=1+1; echo $SECONDS ); SECONDS=1+1; echo $SECONDS", "1+1\n0\n"),
+		("unset -n SECONDS; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("declare -n r=SECONDS; unset -n r; SECONDS=1+1; echo $SECONDS", "2\n"),
+		(
+			"declare -n r=SECONDS; for r in 7; do :; done 2>/dev/null; SECONDS=1+1; echo $SECONDS",
+			"2\n",
+		),
+		// A fork keeps whether `unset` removed the special meaning.
+		(
+			"SECONDS=5; (echo $SECONDS); unset SECONDS; (echo \"[$SECONDS]\"); x=$(echo \
+			 \"[$SECONDS]\"); echo $x",
+			"5\n[]\n[]\n",
+		),
 	] {
 		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
 	}

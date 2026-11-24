@@ -1257,7 +1257,9 @@ pub fn assign(
 /// Assign a `for` loop's control variable: when it is a name reference,
 /// each word becomes its new target (bash: "a name reference will be
 /// established for each word"); otherwise a plain [`assign`]. bash looks a
-/// special `RANDOM` or `SECONDS` up before each word ([`Site::For`]).
+/// special `RANDOM` or `SECONDS` up before each word ([`Site::For`]), also
+/// at the end of a reference chain (`find_variable_last_nameref`: `for r in
+/// 7` with `r` a reference to `RANDOM` draws).
 pub fn assign_loop_var(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -1265,7 +1267,7 @@ pub fn assign_loop_var(
 	name: &[u8],
 	value: BString,
 ) -> Result<(), Diag> {
-	if let Err(e) = dynvars::look(k, cx, vp, name, Site::For) {
+	if let Err(e) = dynvars::look_through(k, cx, vp, name, Site::For) {
 		k.fail(e);
 		return Err(Diag::StoreFailed);
 	}
@@ -3123,18 +3125,18 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		// `SECONDS` up first (`find_variable`, which runs its value
 		// function), so it is an integer scalar here: element 0 unsets it,
 		// which removes the special meaning as `unset NAME` does; another
-		// is no array element. Once per command, by name (an index's command
-		// substitution runs `unset` again, after this name is plain).
+		// is no array element. `unset -n` looks up the end of the reference
+		// chain (`find_variable_last_nameref`), `RANDOM` itself or what a
+		// reference names, and removes nothing special. Once per command,
+		// by name (an index's command substitution runs `unset` again, after
+		// this name is plain).
 		let special = if o.has(b'n') {
 			None
 		} else {
 			dynvars::visible(ctx.k, ctx.cx.store, ctx.vp, name)?
 		};
-		if !o.has(b'n')
-			&& Special::of(name).is_some()
-			&& ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash
-		{
-			ctx.once(|ctx| dynvars::look(ctx.k, ctx.cx, ctx.vp, name, Site::Unset))?;
+		if dynvars::named(ctx.k, ctx.cx.store, ctx.vp, name)?.is_some() {
+			ctx.once(|ctx| dynvars::look_through(ctx.k, ctx.cx, ctx.vp, name, Site::Unset))?;
 		}
 		let var = state::lookup_declared(&ctx.k.root, ctx.cx.store, ctx.vp, name)?.map(|v| {
 			(

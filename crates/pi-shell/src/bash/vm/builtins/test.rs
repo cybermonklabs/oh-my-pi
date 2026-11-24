@@ -101,8 +101,10 @@ fn stat(ctx: &Ctx<'_, '_>, arg: &[u8], follow: bool) -> T<Option<Stat>> {
 	}
 }
 
-/// A unary primary (bash's `unary_test`).
-fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
+/// A unary primary (bash's `unary_test`). `cond`: in `[[ ]]`; `arrayref`:
+/// its operand was written as an array reference, `name[` unquoted
+/// (bash's `W_ARRAYREF`, `TEST_ARRAYEXP`).
+fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool, arrayref: bool) -> T<bool> {
 	Ok(match op {
 		b'z' => arg.is_empty(),
 		b'n' => !arg.is_empty(),
@@ -123,9 +125,14 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 				let (name, i) = (&arg[..open], &arg[open + 1..close]);
 				// bash looks the name up (`find_variable`): a special `RANDOM`
 				// or `SECONDS` runs its value function, `[[ -v NAME[i] ]]`
-				// twice; once per command although a probe or a key's command
-				// substitution runs `test` again.
-				let site = if cond { Site::CondElement } else { Site::Test };
+				// with the operand written as an array reference twice
+				// (`'NAME[i]'` quoted whole once); once per command although a
+				// probe or a key's command substitution runs `test` again.
+				let site = if arrayref {
+					Site::CondElement
+				} else {
+					Site::Test
+				};
 				if dynvars::named(ctx.k, ctx.cx.store, ctx.vp, name)
 					.map_err(Need::from)?
 					.is_some()
@@ -338,7 +345,7 @@ trait Primaries {
 
 impl Primaries for Ctx<'_, '_> {
 	fn unary(&mut self, op: u8, arg: &[u8]) -> T<bool> {
-		unary(self, op, arg, false)
+		unary(self, op, arg, false, false)
 	}
 
 	fn binary(&mut self, op: &[u8], l: &[u8], r: &[u8]) -> T<bool> {
@@ -701,7 +708,10 @@ pub fn cond_test(
 		let (res, chunks) = {
 			let mut ctx = Ctx::new(k, cx, vp, sc.probes(), line, "[[");
 			let res = match c {
-				CondIr::Unary { op, .. } if is_unary(op) => unary(&mut ctx, op[1], &vals[0], true),
+				CondIr::Unary { op, arg, .. } if is_unary(op) => {
+					let arrayref = crate::bash::vm::command::is_arrayref(&unit.words[*arg as usize]);
+					unary(&mut ctx, op[1], &vals[0], true, arrayref)
+				},
 				CondIr::Unary { op, .. } => {
 					Err(syntax(format!("{}: unary operator expected", op.as_bstr())))
 				},
