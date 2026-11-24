@@ -1663,6 +1663,9 @@ pub enum Transfer {
 	DiscardAll(i32),
 	/// `exec command`: the shell exits with the command's status.
 	Exec,
+	/// The rest of the innermost script's command is abandoned with this
+	/// status (a `-c` string goes on with its next command).
+	Discard(i32),
 }
 
 /// An expanded assignment value.
