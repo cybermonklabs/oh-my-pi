@@ -1191,7 +1191,8 @@ fn substring_offsets_keep_conditional_operators() {
 
 #[test]
 fn conditional_command_spans_run_through_the_closing_brackets() {
-	// `$BASH_COMMAND` is the source text of the command's span.
+	// The span `BASH_COMMAND` finds the command's node by (and prints, as
+	// written, where the unit's tree cannot be had).
 	let src = b"[[ -n $unset ]] && x\n";
 	let prog = parse_all(src, Features::NONE).expect("parses");
 	let span = first_of(prog.commands[0].list()).span();

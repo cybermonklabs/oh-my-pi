@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use super::{
 	CallOutcome, Cx, Kernel, Shell, host_stdio,
 	proc::{
-		Atom, Awaited, ExecState, Frame, FrameKind, JobState, Live, LoopRec, PendingSub,
+		Atom, Awaited, BashCommand, ExecState, Frame, FrameKind, JobState, Live, LoopRec, PendingSub,
 		PendingWrite, Probe, ProbeResult, RedirProgress, Run, Saved, Scratch, ScratchIo, ScratchZsh,
 		ScriptKind, Stage, Target, Vproc,
 	},
@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 31;
+pub const FRAMES_VERSION: u32 = 32;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -259,10 +259,11 @@ struct ProcImage {
 	subshell:      u32,
 	/// The forking shell's loops it runs inside (`Vproc::outer_loops`).
 	outer_loops:   u16,
-	/// `BASH_COMMAND`: the unit (written to the store) and syntax node; a
-	/// trap action that runs after the restore still names the trapped
+	/// `BASH_COMMAND` ([`super::proc::BashCommand`]): the unit (written to
+	/// the store) and the op's pc, or an arith-for expression as expanded;
+	/// a trap action that runs after the restore still names the trapped
 	/// command.
-	command:       Option<(UnitId, u32)>,
+	command:       Option<CommandImage>,
 	/// Pushes onto bash's call-stack arrays.
 	calls:         Vec<super::callstack::Call>,
 	/// The pseudo-signal traps the vproc set itself.
@@ -277,6 +278,13 @@ struct ProcImage {
 	/// shell schedules exactly as the externalized one would have (no
 	/// second `Blocked`, same interleaving).
 	blocked:       Option<(WaitKey, u64)>,
+}
+
+/// Image of [`super::proc::BashCommand`].
+#[derive(Serialize, Deserialize)]
+enum CommandImage {
+	Op(UnitId, u32),
+	Expanded(BString),
 }
 
 /// A subshell vproc's state that the root vproc keeps in the store.
@@ -580,14 +588,15 @@ impl Shell {
 				.collect();
 			runs.extend(p.runs.iter().map(|r| r.id));
 			let command = match &p.command {
-				Some((unit, node)) => {
+				Some(BashCommand::Op(unit, pc)) => {
 					if self.k.note_written(unit.id) {
 						let bytes = postcard::to_stdvec(&**unit).map_err(ExtError::Encode)?;
 						cx.store.put_blob(BlobSlot::Unit(unit.id), &bytes)?;
 						report.units_written += 1;
 					}
-					Some((unit.id, *node))
+					Some(CommandImage::Op(unit.id, *pc))
 				},
+				Some(BashCommand::Expanded(expr)) => Some(CommandImage::Expanded(BString::clone(expr))),
 				None => None,
 			};
 			let fields = p.overlay.as_ref().map(|overlay| Fields {
@@ -857,16 +866,20 @@ impl Shell {
 			vp.mode = p.mode;
 			vp.zsh = p.zsh;
 			vp.lineage = p.lineage;
-			if let Some((id, node)) = p.command {
-				let unit = load_unit(
-					engine,
-					cx.store,
-					id,
-					k.mask.contains(crate::bash::event::EventKind::UnitCompiled),
-				)?;
-				k.note_written(unit.id);
-				vp.command = Some((unit, node));
-			}
+			vp.command = match p.command {
+				Some(CommandImage::Op(id, pc)) => {
+					let unit = load_unit(
+						engine,
+						cx.store,
+						id,
+						k.mask.contains(crate::bash::event::EventKind::UnitCompiled),
+					)?;
+					k.note_written(unit.id);
+					Some(BashCommand::Op(unit, pc))
+				},
+				Some(CommandImage::Expanded(expr)) => Some(BashCommand::Expanded(Box::new(expr))),
+				None => None,
+			};
 			// Waits on engine objects whose wake-ups were restored (child
 			// vprocs, jobs, in-memory pipes) keep their mark, so scheduling
 			// matches the plain run. Every other source (externals,

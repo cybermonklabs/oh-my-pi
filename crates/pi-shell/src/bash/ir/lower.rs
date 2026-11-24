@@ -9,7 +9,7 @@ use super::{
 };
 use crate::bash::{
 	event::{NodeKind, RedirKind},
-	ids::ModeId,
+	ids::{Dialect, ModeId},
 	syntax::{self as syn, tree as st},
 };
 
@@ -25,6 +25,19 @@ mod construct {
 	pub const UNTIL: u32 = 3;
 	pub const AND: u32 = 4;
 	pub const OR: u32 = 5;
+}
+
+/// The text arith-for expression `src` (after its leading blanks)
+/// evaluates: as written; when empty, `1` in bash (`make_arith_for_command`)
+/// and nothing in zsh.
+const fn arith_for_expr(src: &[u8], bash: bool) -> Option<&[u8]> {
+	if !src.trim_ascii().is_empty() {
+		Some(src)
+	} else if bash {
+		Some(b"1")
+	} else {
+		None
+	}
 }
 
 /// Lower one parsed top-level command.
@@ -391,7 +404,10 @@ pub(crate) fn materialize(unit: &Unit, observed: bool) -> Option<Unit> {
 	for word in &mut lower.unit.words {
 		word.classify();
 	}
-	if observed && lower.unit.trace_syntax.get().is_none() {
+	// The tree, which the source alone cannot reproduce: for an observer,
+	// and in bash for `BASH_COMMAND` ([`Unit::with_command`]).
+	let keep = observed && lower.unit.trace_syntax.get().is_none();
+	if keep || (unit.mode.dialect() == Dialect::Bash && lower.unit.kept_syntax.get().is_none()) {
 		let syntax = crate::bash::trace::syntax::UnitSyntax::new(
 			base,
 			crate::bash::trace::syntax::SyntaxTree::new(
@@ -402,7 +418,12 @@ pub(crate) fn materialize(unit: &Unit, observed: bool) -> Option<Unit> {
 		)
 		.with_context(unit.mode, unit.features)
 		.with_aliases(&unit.aliases);
-		let _ = lower.unit.trace_syntax.set(std::sync::Arc::new(syntax));
+		let syntax = std::sync::Arc::new(syntax);
+		if keep {
+			let _ = lower.unit.trace_syntax.set(syntax);
+		} else {
+			let _ = lower.unit.kept_syntax.set(Some(syntax));
+		}
 	}
 	Some(lower.unit)
 }
@@ -829,27 +850,31 @@ impl Lower {
 				self.node(cid, NodeKind::ArithFor, cspan);
 				self.emit(Opcode::Enter, 0, 0, id);
 				// The header's expressions are not commands: a zero value
-				// neither runs the ERR trap nor exits under `set -e`.
+				// neither runs the ERR trap nor exits under `set -e`. bash
+				// evaluates an empty one as `1` (`make_arith_for_command`),
+				// with its DEBUG trap and `BASH_COMMAND`; zsh skips it (an
+				// empty test is true).
 				self.cond += 1;
+				let bash = self.unit.mode.dialect() == Dialect::Bash;
 				let (init, test, step) = (f.init().src(), f.cond().src(), f.step().src());
-				if !init.trim_ascii().is_empty() {
+				if let Some(init) = arith_for_expr(init, bash) {
 					let (a, b) = self.arith(init);
 					self.emit(Opcode::Arith, a, b, id);
 				}
 				let enter = self.emit(Opcode::LoopEnter, 0, 0, id);
 				let cond = self.here();
-				if test.trim_ascii().is_empty() {
-					self.emit(Opcode::SetStatus, 0, 0, id);
-				} else {
+				if let Some(test) = arith_for_expr(test, bash) {
 					let (a, b) = self.arith(test);
 					self.emit(Opcode::Arith, a, b, id);
+				} else {
+					self.emit(Opcode::SetStatus, 0, 0, id);
 				}
 				let br = self.emit(Opcode::BrFail, 0, construct::WHILE, id);
 				self.cond -= 1;
 				self.list(f.body())?;
 				let step_pc = self.emit(Opcode::LoopNote, 0, 0, id);
 				self.patch_b(enter, step_pc);
-				if !step.trim_ascii().is_empty() {
+				if let Some(step) = arith_for_expr(step, bash) {
 					let (a, b) = self.arith(step);
 					self.cond += 1;
 					self.emit(Opcode::Arith, a, b, id);

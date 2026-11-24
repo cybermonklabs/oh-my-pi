@@ -22,6 +22,7 @@
 - bash: a diagnostic printed inside a `.` file, or inside a function defined in one, names that file (`./s.sh: line 1: …`), as a non-interactive bash names it after `BASH_SOURCE[0]`, instead of the shell's name; a syntax error there no longer says `-c`
 - zsh: an error that ends an EXIT trap `exit` started (a `break` with no loop, a math error) no longer changes the exit status, and one that ends a ZERR trap run under `ERR_EXIT` still ends the shell, with status 1, as zsh does
 - zsh: an error that ends a signal trap's action (a `break` with no loop, a math error) gives back the interrupted command's status, as the trap's normal end does, instead of the error's
+- `$BASH_COMMAND` holds the text bash 5.3 prints for what runs: at the DEBUG trap of a `for` iteration, a `select`, a `case` and each arith-for expression it names that head (`for i in 1 2`, `select s in q`, `case $x in `, the expression as expanded: `((i=0))`, and `((1))` for an empty one, which now runs its DEBUG trap too), where it still named the command before; a simple command, `[[ ]]` and `(( ))` read as bash prints them (`echo a b > /dev/null`, `x=$(echo a)`, an alias expanded), not as written; under `extdebug` a failing DEBUG trap at a head skips what bash skips (the rest of that `for` iteration, the whole `select` or `case`); and `set -x` shows a `for`, `select` or `case` head with the same words, a `case` or `select` head before its words expand
 
 ## [18.18.6] - 2026-11-09
 
