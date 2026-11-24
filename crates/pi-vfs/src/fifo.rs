@@ -1110,6 +1110,66 @@ mod tests {
 		assert!(!got.is_empty(), "the other reader got none of its writer's bytes");
 	}
 
+	/// A writer the look's read end lets out of `open(2)` has a reader to
+	/// write to: the look keeps that end open until the open is over, and
+	/// the writer's bytes become the open's result. The helper here never
+	/// enters `open(2)` (the `hold` hook, as a helper thread descheduled
+	/// after its check), so the look's end is the FIFO's only reader. The
+	/// writer writes 200 ms after the first look let it go (at 50 ms), between
+	/// the looks at 150 ms and 350 ms.
+	#[test]
+	fn a_writer_the_look_lets_go_has_a_reader() {
+		let (_dir, path) = new_fifo();
+		let mut opened = reading(&path, Slot { hold: true, ..Slot::default() });
+		while !opened.shared.slot.lock().opening {
+			thread::yield_now();
+		}
+		let writer = thread::spawn(move || -> io::Result<()> {
+			// Waits for a reader: the look's end is the first.
+			let mut writer = fs::OpenOptions::new().write(true).open(&path)?;
+			thread::sleep(Duration::from_millis(200));
+			writer.write_all(b"a\n")
+		});
+		let wrote = writer.join().unwrap();
+		assert!(
+			wrote.is_ok(),
+			"the look let the writer go and closed its end before the helper was a reader: {wrote:?}"
+		);
+		let reader = opened
+			.wait_for(Duration::from_secs(10))
+			.expect("no result 10 s after the writer wrote")
+			.unwrap();
+		assert!(opened.shared.slot.lock().rescued, "the result is not the look's");
+		assert_eq!(drain(reader).0, b"a\n", "the writer's bytes are not the open's");
+	}
+
+	/// The looks of every open are made by one thread for the process, not
+	/// a thread per open: four opens that have each been looked at leave
+	/// one thread named `fifo-watch`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn one_thread_looks_at_every_open() {
+		let fifos: Vec<_> = (0..4).map(|_| new_fifo()).collect();
+		let opens: Vec<_> = fifos
+			.iter()
+			.map(|(_, path)| reading(path, Slot::default()))
+			.collect();
+		for open in &opens {
+			let deadline = std::time::Instant::now() + Duration::from_secs(10);
+			while open.shared.slot.lock().looks == 0 {
+				assert!(std::time::Instant::now() < deadline, "an open was not looked at in 10 s");
+				thread::sleep(Duration::from_millis(10));
+			}
+		}
+		let watchers = fs::read_dir("/proc/self/task")
+			.unwrap()
+			.filter_map(|task| fs::read_to_string(task.ok()?.path().join("comm")).ok())
+			.filter(|comm| comm.trim_end() == "fifo-watch")
+			.count();
+		drop(opens);
+		assert_eq!(watchers, 1, "threads named fifo-watch while four opens are looked at");
+	}
+
 	/// A helper that finds the open cancelled opens nothing: it ends
 	/// (instead of waiting in `open(2)` for a writer) and leaves no reader.
 	/// Until it ends, the FIFO is watched for the reader a helper that
