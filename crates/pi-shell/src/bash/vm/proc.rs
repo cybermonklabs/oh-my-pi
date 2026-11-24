@@ -91,7 +91,7 @@ pub struct Vproc {
 	pub subshell:      u32,
 	/// Loops of the shell that forked this vproc that its code runs inside
 	/// (bash's inherited `loop_level`, zsh's `loops`), set by
-	/// [`super::exec::fork_loops`]: a `break` or `continue` that reaches
+	/// [`super::exec::fork_state`]: a `break` or `continue` that reaches
 	/// past this vproc's own loops ends the vproc, as the end of its code
 	/// would. Zero for the shell itself and for a fork bash runs through
 	/// `execute_in_subshell`, which zeroes the level. A `u16` (saturating
@@ -300,7 +300,7 @@ impl Vproc {
 }
 
 /// A set of trap keys ([`Vproc::own_traps`]): the pseudo-signals and the
-/// signals.
+/// signals; and one flag beside them, [`OwnTraps::trap_fork`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnTraps {
 	pseudo:  u8,
@@ -310,6 +310,9 @@ pub struct OwnTraps {
 impl OwnTraps {
 	/// The empty set.
 	pub const EMPTY: Self = Self { pseudo: 0, signals: SigSet::EMPTY };
+	/// The bit of [`OwnTraps::trap_fork`], above the pseudo-signals' (a spare
+	/// bit, so `Vproc` keeps its size).
+	const TRAP_FORK: u8 = 16;
 
 	const fn bit(key: crate::bash::store::TrapKey) -> u8 {
 		use crate::bash::store::TrapKey;
@@ -338,6 +341,28 @@ impl OwnTraps {
 			},
 			_ => Self { pseudo: self.pseudo | Self::bit(key), signals: self.signals },
 		}
+	}
+
+	/// Whether the vproc was forked by a trap action, or by such a fork,
+	/// without bash's `execute_in_subshell` (a command or process
+	/// substitution, a simple command as a pipeline element or job:
+	/// [`fork_state`]'s `keeps`). bash's fork copies `running_trap` and the
+	/// DEBUG trap's in-progress mark, so its commands keep the trapped
+	/// command as `BASH_COMMAND`.
+	///
+	/// [`fork_state`]: super::exec::fork_state
+	pub const fn trap_fork(self) -> bool {
+		self.pseudo & Self::TRAP_FORK != 0
+	}
+
+	/// The set with [`OwnTraps::trap_fork`] set to `on`.
+	pub const fn with_trap_fork(self, on: bool) -> Self {
+		let pseudo = if on {
+			self.pseudo | Self::TRAP_FORK
+		} else {
+			self.pseudo & !Self::TRAP_FORK
+		};
+		Self { pseudo, signals: self.signals }
 	}
 }
 

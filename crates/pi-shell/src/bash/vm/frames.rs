@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 32;
+pub const FRAMES_VERSION: u32 = 33;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -266,7 +266,8 @@ struct ProcImage {
 	command:       Option<CommandImage>,
 	/// Pushes onto bash's call-stack arrays.
 	calls:         Vec<super::callstack::Call>,
-	/// The pseudo-signal traps the vproc set itself.
+	/// The pseudo-signal traps the vproc set itself, and whether it is a fork
+	/// of a trap action that keeps its trapped command.
 	own_traps:     super::proc::OwnTraps,
 	/// Current mode (the root's is also `MiscKey::Mode`).
 	mode:          ModeId,

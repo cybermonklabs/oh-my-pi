@@ -4966,7 +4966,7 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 	text.push(b'\n');
 	let mut child = vp.child_text(k, cx.store, &text, line, vp.fds.clone());
 	// The command's own fork: bash and zsh keep the loop level.
-	child.outer_loops = super::exec::fork_loops(vp, true);
+	super::exec::fork_state(&mut child, vp, true);
 	let vpid = child.vpid;
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));
