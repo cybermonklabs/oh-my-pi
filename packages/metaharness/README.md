@@ -26,6 +26,19 @@ bun run serve --port 4700
    host-side.
 3. **Harbor owns trials.** The runner/serve layer polls each trial's
    `result.json` for progress, spend, and outcomes.
+4. **Harbor telemetry is off.** Harbor sends each job's model names and
+   providers, built-in agent names, Harbor-registry dataset and task names,
+   token counts, cost, each command and the names of its flags, and which AI
+   coding agent started it to PostHog (`us.i.posthog.com`) unless
+   `HARBOR_TELEMETRY` is `0`, `false`, `no`, `off` or `disabled`. The
+   runner sets `HARBOR_TELEMETRY=0` on every `harbor run` and
+   `harbor job resume` it starts, unless your environment already sets a
+   non-blank `HARBOR_TELEMETRY`; `--dry-run` prints the command with it.
+   Set it yourself when you run Harbor by hand:
+
+   ```bash
+   HARBOR_TELEMETRY=0 harbor run ...
+   ```
 
 ## Server
 

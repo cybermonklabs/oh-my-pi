@@ -20,10 +20,12 @@ configured providers' `baseUrl` at the host's pm2 auth-gateway (default
 resolves credentials host-side. No provider API keys are passed in.
 
 All knobs come from environment variables the runner sets on the `harbor` process
-(see `OMP_BENCH_*` below); the agent reads them from `os.environ` directly.
+(see `OMP_BENCH_*` below); the agent reads them from `os.environ` directly. The
+runner also defaults `HARBOR_TELEMETRY` to `0`: without it Harbor sends each job's
+model names, dataset names and commands to PostHog.
 
-Selected via `harbor run --agent-import-path omp_local:OmpLocal` with the
-directory of this file on `PYTHONPATH`.
+Selected via `HARBOR_TELEMETRY=0 harbor run --agent-import-path omp_local:OmpLocal`
+with the directory of this file on `PYTHONPATH`.
 """
 
 from __future__ import annotations
