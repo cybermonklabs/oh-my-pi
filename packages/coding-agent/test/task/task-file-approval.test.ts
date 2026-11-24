@@ -21,6 +21,39 @@ import { approvalCacheKeyForPath } from "@oh-my-pi/pi-coding-agent/tools/approva
 import { withToolApprovalScope } from "@oh-my-pi/pi-coding-agent/tools/approval-scope";
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 
+/**
+ * A FIFO made at `fifoPath` and a shell blocked in its open for writing until a reader opens it.
+ * `outcome()` resolves to "still blocked" when no reader released the shell, else to its exit code;
+ * disposing it kills the shell.
+ */
+async function blockedFifoWriter(fifoPath: string) {
+	expect(Bun.spawnSync(["mkfifo", fifoPath]).exitCode).toBe(0);
+	// The shell reports that it started, then blocks in its open of the FIFO until a reader opens it.
+	const writer = Bun.spawn(["sh", "-c", 'echo started && printf x > "$1"', "sh", fifoPath], {
+		stdout: "pipe",
+		stderr: "ignore",
+	});
+	const blocked = {
+		outcome(): Promise<number | "still blocked"> {
+			// A reader's open would let the writer go on: it exits, or dies of SIGPIPE when that reader closes.
+			// Real clock on purpose: the passing outcome is another process not exiting, which no event signals
+			// and fake timers cannot advance; the wait bounds how long a late exit can go unseen.
+			return Promise.race([writer.exited, Bun.sleep(2_000).then(() => "still blocked" as const)]);
+		},
+		async [Symbol.asyncDispose](): Promise<void> {
+			writer.kill();
+			await writer.exited;
+		},
+	};
+	try {
+		await writer.stdout.getReader().read();
+	} catch (error) {
+		await blocked[Symbol.asyncDispose]();
+		throw error;
+	}
+	return blocked;
+}
+
 describe("taskFile approval binding", () => {
 	let directory: string;
 	const executions: ExecutorOptions[] = [];
@@ -375,34 +408,19 @@ describe("taskFile approval binding", () => {
 		"refuses a FIFO task file without releasing a writer blocked in its open",
 		async () => {
 			const taskFile = path.join(directory, "task.fifo");
-			expect(Bun.spawnSync(["mkfifo", taskFile]).exitCode).toBe(0);
+			await using writer = await blockedFifoWriter(taskFile);
 			const { wrapper, context, tool } = await createWrapper(async () => "Approve");
-			// The shell reports that it started, then blocks in its open of the FIFO until a reader opens it.
-			const writer = Bun.spawn(["sh", "-c", 'echo started && printf x > "$1"', "sh", taskFile], {
-				stdout: "pipe",
-				stderr: "ignore",
-			});
-			try {
-				await (writer.stdout as ReadableStream<Uint8Array>).getReader().read();
-				const approved = await wrapper.execute("fifo-approved", { taskFile }, undefined, undefined, context);
-				const unapproved = await tool.execute("fifo-unapproved", { taskFile });
+			const approved = await wrapper.execute("fifo-approved", { taskFile }, undefined, undefined, context);
+			const unapproved = await tool.execute("fifo-unapproved", { taskFile });
 
-				for (const result of [approved, unapproved]) {
-					expect(result.isError).toBe(true);
-					expect(result.content).toEqual([
-						expect.objectContaining({ text: expect.stringContaining("must resolve to a regular file") }),
-					]);
-				}
-				// A reader's open would let the writer go on: it exits, or dies of SIGPIPE when that reader closes.
-				// Real clock on purpose: the passing outcome is another process not exiting, which no event signals
-				// and fake timers cannot advance; the wait bounds how long a late exit can go unseen.
-				const outcome = await Promise.race([writer.exited, Bun.sleep(2_000).then(() => "still blocked")]);
-				expect(outcome).toBe("still blocked");
-				expect(executions).toHaveLength(0);
-			} finally {
-				writer.kill();
-				await writer.exited;
+			for (const result of [approved, unapproved]) {
+				expect(result.isError).toBe(true);
+				expect(result.content).toEqual([
+					expect.objectContaining({ text: expect.stringContaining("must resolve to a regular file") }),
+				]);
 			}
+			expect(await writer.outcome()).toBe("still blocked");
+			expect(executions).toHaveLength(0);
 		},
 		10_000,
 	);
@@ -415,38 +433,26 @@ describe("taskFile approval binding", () => {
 		async () => {
 			const taskFile = path.join(directory, "task.md");
 			await Bun.write(taskFile, "Approved assignment.");
-			const fifo = path.join(directory, "task.fifo");
-			expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
-			// The writer opens the FIFO by a second name, which the rename over the task file leaves in place.
+			// The writer opens the FIFO by a name of its own; a second name of it is what the rename moves over the
+			// task file.
 			const writerPath = path.join(directory, "writer.fifo");
-			await fs.promises.link(fifo, writerPath);
-			const writer = Bun.spawn(["sh", "-c", 'echo started && printf x > "$1"', "sh", writerPath], {
-				stdout: "pipe",
-				stderr: "ignore",
+			await using writer = await blockedFifoWriter(writerPath);
+			const fifo = path.join(directory, "task.fifo");
+			await fs.promises.link(writerPath, fifo);
+			// The approval captured the regular file; the FIFO takes its name before the call runs.
+			const { wrapper, context } = await createWrapper(async () => {
+				await fs.promises.rename(fifo, taskFile);
+				return "Approve";
 			});
-			try {
-				await (writer.stdout as ReadableStream<Uint8Array>).getReader().read();
-				// The approval captured the regular file; the FIFO takes its name before the call runs.
-				const { wrapper, context } = await createWrapper(async () => {
-					await fs.promises.rename(fifo, taskFile);
-					return "Approve";
-				});
 
-				const result = await wrapper.execute("fifo-swapped", { taskFile }, undefined, undefined, context);
+			const result = await wrapper.execute("fifo-swapped", { taskFile }, undefined, undefined, context);
 
-				expect(result.isError).toBe(true);
-				expect(result.content).toEqual([
-					expect.objectContaining({ text: expect.stringContaining("changed after approval; retry the call") }),
-				]);
-				// Real clock on purpose: the passing outcome is another process not exiting, which no event signals
-				// and fake timers cannot advance; the wait bounds how long a late exit can go unseen.
-				const outcome = await Promise.race([writer.exited, Bun.sleep(2_000).then(() => "still blocked")]);
-				expect(outcome).toBe("still blocked");
-				expect(executions).toHaveLength(0);
-			} finally {
-				writer.kill();
-				await writer.exited;
-			}
+			expect(result.isError).toBe(true);
+			expect(result.content).toEqual([
+				expect.objectContaining({ text: expect.stringContaining("changed after approval; retry the call") }),
+			]);
+			expect(await writer.outcome()).toBe("still blocked");
+			expect(executions).toHaveLength(0);
 		},
 		10_000,
 	);
