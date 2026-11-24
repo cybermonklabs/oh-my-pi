@@ -15,7 +15,10 @@
  *   (the next `ensureLive` cold-revives through the persisted factory), every
  *   registry ref holding a session homed there is detached and turns `parked`
  *   (session file on disk) or `aborted`, and the mirrors close, so in-flight
- *   commands reject with an error naming the worker.
+ *   commands reject with an error naming the worker. The thread holds each
+ *   such agent's journal until it has stopped, so the lifecycle holds a ref
+ *   with a session file as a park in flight until then
+ *   (`AgentLifecycleManager.parkUntil`), and a revive waits for it.
  *
  * Worker side: proxies installed with `installGlobal`, the bridge handed to
  * peer handles, and a `SessionPublisher` for every session constructed here.
@@ -213,9 +216,16 @@ export class MainSessionBridge {
 		this.#revivers.clear();
 		for (const { lifecycle, id, revive } of revivers) lifecycle.forgetReviver(id, revive);
 		const registry = AgentRegistry.global();
+		const mainLifecycle = AgentLifecycleManager.global();
+		const ended = this.#peer.ended;
 		for (const ref of registry.list()) {
 			const session = ref.session;
 			if (!(session instanceof RemoteAgentSession) || session.home !== this.#peer.threadId) continue;
+			// The thread holds the agent's journal until it has stopped; a revive waits for that. Held
+			// before the ref turns parked, so even a listener that revives at that change waits.
+			if (ended && ref.sessionFile && mainLifecycle instanceof AgentLifecycleManager) {
+				mainLifecycle.parkUntil(ref.id, ref, ended);
+			}
 			registry.detachSession(ref.id, ref);
 			if (ref.status !== "aborted") registry.setStatus(ref.id, ref.sessionFile ? "parked" : "aborted", ref);
 		}

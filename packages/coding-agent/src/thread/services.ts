@@ -17,6 +17,12 @@ export interface WorkerPeer {
 	readonly link: MainThreadLink;
 	/** Hold the worker alive (and its idle shutdown off) while main depends on it; returns an idempotent release. */
 	retain?(): () => void;
+	/**
+	 * Settles once the worker's thread has stopped, after its exit hooks ran. A thread that is told
+	 * to stop still runs until then, and the OS closes its descriptors only then: a lock or lease it
+	 * took (a session's ownership lease) reads as held until this settles.
+	 */
+	readonly ended?: Promise<void>;
 }
 
 /** One bridged concern; every hook is optional. */

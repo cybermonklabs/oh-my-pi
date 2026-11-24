@@ -134,6 +134,7 @@ export class SubagentWorker implements WorkerPeer {
 	readonly #options: SubagentWorkerOptions;
 	readonly #replyPort: MessagePort;
 	readonly #handshake = Promise.withResolvers<void>();
+	readonly #ended = Promise.withResolvers<void>();
 	#runs = 0;
 	#holds = 0;
 	#booted = false;
@@ -177,7 +178,10 @@ export class SubagentWorker implements WorkerPeer {
 			this.#die(`worker crashed: ${message}`);
 		});
 		worker.addEventListener("messageerror", () => this.#die("worker sent an undeliverable message"));
-		worker.addEventListener("close", event => this.#die(`worker exited with code ${event.code}`));
+		worker.addEventListener("close", event => {
+			this.#die(`worker exited with code ${event.code}`);
+			this.#ended.resolve();
+		});
 		this.#handshake.promise.catch(() => {});
 		this.ready = this.#start(channel.port2, counter);
 		// Callers that never await `ready` must not turn a failed start into an unhandled rejection.
@@ -207,6 +211,15 @@ export class SubagentWorker implements WorkerPeer {
 	/** Why the worker died, once it has. */
 	get exitReason(): string | undefined {
 		return this.#exitReason;
+	}
+
+	/**
+	 * Settles once the worker's thread has stopped, after {@link terminate} or its own exit: Bun
+	 * stops the thread after `terminate()` returns, and the descriptors it opened (its session
+	 * leases among them) close only then. See {@link WorkerPeer.ended}.
+	 */
+	get ended(): Promise<void> {
+		return this.#ended.promise;
 	}
 
 	/**

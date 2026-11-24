@@ -363,7 +363,8 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	/**
 	 * In-flight park attempts, each bound to the ref it started from. A park is
 	 * cancelable until the live session is detached; after detach, ensureLive
-	 * waits for the park and revives.
+	 * waits for the park and revives. A worker's death holds each agent it ran
+	 * here, detached, until its thread has stopped ({@link parkUntil}).
 	 */
 	readonly #parks = new Map<string, ParkInFlight>();
 	/** In-flight revives, bound to the parked ref that initiated them, so concurrent {@link ensureLive} calls coalesce. */
@@ -628,14 +629,44 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 					logger.warn("AgentLifecycleManager.park: session dispose failed", { id, error: String(error) });
 				}
 			} finally {
-				// Only clear if we are still the in-flight entry (a later park would
-				// have replaced us only after we resolved).
+				// Only clear if we are still the in-flight entry: a later park replaces
+				// us only after we resolved, a parkUntil also while we run.
 				if (this.#parks.get(id) === park) this.#parks.delete(id);
 			}
 		})();
 
 		this.#parks.set(id, park);
 		return park.promise;
+	}
+
+	/**
+	 * Hold `ref`, whose session ran on a thread that is ending (a subagent
+	 * worker that died), as a park in flight until `ended` settles. The caller
+	 * detaches the session and marks the ref `parked` (or `aborted`) at once,
+	 * but the thread holds the agent's journal, its ownership lease, until it
+	 * has stopped. Meanwhile {@link ensureLive} and {@link release} wait for
+	 * this as for a park still disposing a detached session, so no revive
+	 * probes the journal, or claims it, while the dead thread holds it: the
+	 * probe would refuse the transcript as another process's live session, and
+	 * the claim would move the revived session to a new file. A park already in
+	 * flight for `id` ends first. Main thread only.
+	 */
+	parkUntil(id: string, ref: AgentRef, ended: Promise<void>): void {
+		const prior = this.#parks.get(id);
+		const park: ParkInFlight = {
+			ref,
+			promise: Promise.all([prior?.promise, ended]).then(
+				() => {},
+				() => {},
+			),
+			cancel: () => false,
+			cancelled: false,
+			detached: true,
+		};
+		this.#parks.set(id, park);
+		void park.promise.then(() => {
+			if (this.#parks.get(id) === park) this.#parks.delete(id);
+		});
 	}
 
 	/**
