@@ -2601,7 +2601,7 @@ fn spawned_external(
 			let name = st(vp).argv[0].clone();
 			let name = if name.contains(&b'/') { name } else { path };
 			let name = if bash_exec(vp) {
-				full_pathname(&vp.cwd, &name)
+				full_pathname(&vp.cwd, &name, k.engine.config().platform)
 			} else {
 				name
 			};
@@ -4855,7 +4855,7 @@ fn run_script_file(
 		path
 	};
 	let (file, shown) = if bash_exec(vp) {
-		let file = full_pathname(&vp.cwd, &tried);
+		let file = full_pathname(&vp.cwd, &tried, k.engine.config().platform);
 		(file.clone(), file)
 	} else {
 		(tried, argv0)
@@ -4903,11 +4903,13 @@ fn bash_exec(vp: &mut Vproc) -> bool {
 	st(vp).exec_as.is_some() && vp.mode.dialect() != crate::bash::ids::Dialect::Zsh
 }
 
-/// bash's `full_pathname`: a name starting with `/` as it is, else the
-/// working directory `cwd`, `/` and `name` with one leading `./` dropped
-/// (`sh_makepath` with `MP_RMDOT`): `.//x` is `cwd//x`, not `/x`.
-fn full_pathname(cwd: &[u8], name: &[u8]) -> BString {
-	if name.first() == Some(&b'/') {
+/// bash's `full_pathname`: an absolute name as it is, else the working
+/// directory `cwd`, `/` and `name` with one leading `./` dropped
+/// (`sh_makepath` with `MP_RMDOT`): `.//x` is `cwd//x`, not `/x`. A name is
+/// absolute by the engine's rule for `platform` ([`probe::is_absolute_on`]:
+/// `/`, a URL path, and on Windows a drive or UNC path).
+fn full_pathname(cwd: &[u8], name: &[u8], platform: crate::bash::ids::Platform) -> BString {
+	if probe::is_absolute_on(name, platform) {
 		return name.into();
 	}
 	let mut p = BString::from(cwd);
@@ -5076,7 +5078,7 @@ fn refused(
 		let n = st(vp).argv[0].clone();
 		let tried = if n.contains(&b'/') { n } else { path.clone() };
 		if bash_exec(vp) {
-			full_pathname(&vp.cwd, &tried)
+			full_pathname(&vp.cwd, &tried, k.engine.config().platform)
 		} else {
 			tried
 		}
@@ -5308,7 +5310,7 @@ fn build_env(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Result<EnvView, StoreEr
 
 #[cfg(test)]
 mod tests {
-	use super::{fpath_dirs, looks_binary};
+	use super::{fpath_dirs, full_pathname, looks_binary};
 	use crate::bash::ids::Platform;
 
 	/// `$fpath` joins Windows directories with `;`; the autoload search
@@ -5318,6 +5320,25 @@ mod tests {
 	fn fpath_dirs_split_on_the_platform_separator() {
 		assert_eq!(fpath_dirs(Some(b"C:/a/fn;D:/b"), Platform::Windows), ["C:/a/fn", "D:/b"]);
 		assert_eq!(fpath_dirs(Some(b"/a:/b"), Platform::Linux), ["/a", "/b"]);
+	}
+
+	/// `exec`'s full path keeps a name that is absolute on the configured
+	/// platform (a Windows drive or UNC path, a URL path) and joins any
+	/// other onto the working directory, dropping one leading `./`.
+	#[test]
+	fn full_pathname_keeps_absolute_names_of_the_platform() {
+		let win = |name: &[u8]| full_pathname(br"C:\project", name, Platform::Windows);
+		assert_eq!(win(br"D:\Tools\app.exe"), r"D:\Tools\app.exe");
+		assert_eq!(win(br"\\server\share\app.exe"), r"\\server\share\app.exe");
+		assert_eq!(win(b"C:/tools/run.sh"), "C:/tools/run.sh");
+		assert_eq!(win(b"tool.exe"), r"C:\project/tool.exe");
+		let linux = |name: &[u8]| full_pathname(b"/w", name, Platform::Linux);
+		assert_eq!(linux(b"/bin/x"), "/bin/x");
+		assert_eq!(linux(b"./x"), "/w/x");
+		assert_eq!(linux(b".//x"), "/w//x");
+		assert_eq!(linux(b"skill://x/y"), "skill://x/y");
+		// A drive path is not absolute off Windows.
+		assert_eq!(linux(b"C:/x"), "/w/C:/x");
 	}
 
 	// bash `check_binary_file`: only a NUL on the first line (within 80

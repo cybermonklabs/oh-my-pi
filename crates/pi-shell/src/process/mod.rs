@@ -603,7 +603,8 @@ pub fn die_of_signal(signal: i32) {
 	}
 	// SAFETY: plain data, filled by sigemptyset.
 	let mut set: libc::sigset_t = unsafe { mem::zeroed() };
-	// SAFETY: the set is valid and writable; the signal was accepted above.
+	// SAFETY: the set is valid and writable; the signal is one the platform
+	// has (sigaction accepted it above, or it is SIGKILL).
 	unsafe {
 		libc::sigemptyset(&raw mut set);
 		libc::sigaddset(&raw mut set, signal);
