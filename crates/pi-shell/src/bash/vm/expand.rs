@@ -2861,20 +2861,28 @@ fn hash_table(
 fn dynamic_value(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
-	vp: &Vproc,
+	vp: &mut Vproc,
 	line: u32,
 	name: &[u8],
 ) -> Result<Option<DynVal>, StoreError> {
 	Ok(Some(match name {
 		b"RANDOM" => {
-			DynVal::Str(BString::from(k.next_random(cx.store).format_into(&mut NumBuffer::new())))
+			DynVal::Str(BString::from(k.next_random(cx, vp).format_into(&mut NumBuffer::new())))
 		},
 		b"SRANDOM" => DynVal::Str(BString::from(
 			((cx.host.random() & 0xffff_ffff) as u32).format_into(&mut NumBuffer::new()),
 		)),
 		b"SECONDS" => {
-			let s = cx.host.now_ns().saturating_sub(k.start_ns) / 1_000_000_000;
-			DynVal::Str(BString::from(s.format_into(&mut NumBuffer::new())))
+			// After `unset SECONDS`, or with a local or temporary `SECONDS`
+			// in scope, bash code's `SECONDS` is a plain variable.
+			if vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+				&& !seconds_visible(k, cx.store, vp)?
+			{
+				return Ok(None);
+			}
+			let secs = k.seconds_now(vp, cx.host.now_ns());
+			seconds_read(k, cx, vp, secs)?;
+			DynVal::Str(BString::from(secs.format_into(&mut NumBuffer::new())))
 		},
 		b"EPOCHSECONDS" => {
 			DynVal::Str(BString::from(cx.host.wall().secs.format_into(&mut NumBuffer::new())))
@@ -2907,6 +2915,94 @@ fn dynamic_value(
 		},
 		_ => return Ok(None),
 	}))
+}
+
+/// Whether bash code's `SECONDS` as `vp` sees it is the shell's clock: not
+/// after `unset SECONDS`, and not while a local or temporary `SECONDS` is in
+/// scope (bash makes those plain variables; `make_local_variable` copies no
+/// dynamic value).
+pub(crate) fn seconds_visible(
+	k: &Kernel,
+	store: &mut dyn crate::bash::store::StateStore,
+	vp: &Vproc,
+) -> Result<bool, StoreError> {
+	Ok(!k.seconds_plain(vp)
+		&& state::lookup_declared_scoped(&k.root, store, vp, b"SECONDS")?
+			.1
+			.is_none())
+}
+
+/// bash's `get_seconds`, run by every lookup of the shell's `SECONDS` (a
+/// read of `$SECONDS`, and `declare`, `local` and `export` of the name,
+/// which call `find_variable`): the variable gets the integer attribute
+/// (`set_int_value` with flag 1), so a `SECONDS=` after it is arithmetic,
+/// and its value (the text a `SECONDS+=` appends to) becomes `secs`, the
+/// count now.
+fn seconds_read(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	secs: i64,
+) -> Result<(), StoreError> {
+	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash {
+		return Ok(());
+	}
+	let text = BString::from(secs.format_into(&mut NumBuffer::new()));
+	let var = state::global_in(cx.store, vp, b"SECONDS")?;
+	if var.is_some_and(|v| {
+		v.attrs.contains(Attrs::INTEGER)
+			&& !v.attrs.contains(Attrs::INVISIBLE)
+			&& matches!(&v.value, VarValue::Str(s) if *s == text)
+	}) {
+		return Ok(());
+	}
+	let attrs = var
+		.map_or(Attrs::NONE, |v| v.attrs)
+		.without(Attrs::INVISIBLE)
+		.with(Attrs::INTEGER);
+	let var = Var { attrs, value: VarValue::Str(text) };
+	state::store_var(&mut k.root, cx.store, vp, b"SECONDS", Some(var), Level::Global);
+	Ok(())
+}
+
+/// A lookup of the shell's `SECONDS` outside an expansion (`declare`,
+/// `local`, `export`): [`seconds_read`] when bash code's `SECONDS` is the
+/// shell's clock.
+pub(crate) fn seconds_lookup(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+) -> Result<(), StoreError> {
+	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash || !seconds_visible(k, cx.store, vp)? {
+		return Ok(());
+	}
+	let secs = k.seconds_now(vp, cx.host.now_ns());
+	seconds_read(k, cx, vp, secs)
+}
+
+/// bash makes the shell's `SECONDS` a plain variable before an element, a
+/// compound or an array attribute reaches it (`convert_var_to_array` and
+/// `convert_var_to_assoc` drop the dynamic value and the assign function).
+/// The lookup before it (`find_variable`) reads the clock, so the array's
+/// element 0 is the count and the variable is integer. A readonly
+/// `SECONDS` stays the clock: the assignment, or the `declare -a`/`-A`
+/// (bash 5.3.20's `invalid_readonly_attrs`), that follows refuses it.
+pub(crate) fn seconds_to_plain(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+) -> Result<(), StoreError> {
+	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash || !seconds_visible(k, cx.store, vp)? {
+		return Ok(());
+	}
+	let secs = k.seconds_now(vp, cx.host.now_ns());
+	seconds_read(k, cx, vp, secs)?;
+	if state::global_in(cx.store, vp, b"SECONDS")?.is_some_and(|v| v.attrs.contains(Attrs::READONLY))
+	{
+		return Ok(());
+	}
+	k.set_seconds_plain(cx.store, vp);
+	Ok(())
 }
 
 /// Whether [`Expander::dynamic`] computes `name` (keep in sync).
@@ -4046,6 +4142,25 @@ impl arith::Env for Vars<'_, '_> {
 		let (name, index) = deref_target(&target, name, index);
 		let mut buf = NumBuffer::new();
 		let text = value.format_into(&mut buf).as_bytes();
+		// bash's arithmetic assignment is `bind_int_variable`: on the
+		// shell's `SECONDS` it runs `assign_seconds`, as `SECONDS=` does,
+		// and an element (`SECONDS[0]`) makes `SECONDS` a plain array first.
+		let seconds_clock = name == b"SECONDS"
+			&& self.vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+			&& match seconds_visible(self.k, self.cx.store, self.vp) {
+				Ok(visible) => visible,
+				Err(e) => {
+					self.k.fail(e);
+					return Err(arith::Error::Expand { diag: Box::new(Diag::StoreFailed) });
+				},
+			};
+		if seconds_clock
+			&& index.is_some()
+			&& let Err(e) = seconds_to_plain(self.k, self.cx, self.vp)
+		{
+			self.k.fail(e);
+			return Err(arith::Error::Expand { diag: Box::new(Diag::StoreFailed) });
+		}
 		let cur = state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
 			.ok()
 			.flatten();
@@ -4060,6 +4175,14 @@ impl arith::Env for Vars<'_, '_> {
 				.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF) && v.attrs.contains(Attrs::INVISIBLE))
 		{
 			arith::Env::warn(self, Diag::InvalidIdent { name: BString::from(text) });
+			return Ok(());
+		}
+		if seconds_clock && index.is_none() {
+			let lhs = super::builtins::Lhs { name, index: None, append: false };
+			let value = super::proc::AssignValue::Scalar(BString::from(text));
+			super::builtins::set_value(self.k, self.cx, self.vp, lhs, value, Level::Dynamic)
+				.map_err(|d| arith::Error::Expand { diag: Box::new(d) })?;
+			super::builtins::emit_assignment(self.k, self.cx, self.vp, name, Level::Dynamic);
 			return Ok(());
 		}
 		// In place where the variable is bound (`edit_var` at the dynamic

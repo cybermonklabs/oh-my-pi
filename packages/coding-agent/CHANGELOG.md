@@ -5,6 +5,11 @@
 ### Fixed
 
 - Fixed background jobs (`&`), subshells and command substitutions in the `bash` tool seeing changes the parent shell made after they started; they now keep the variables, positional parameters (`$1`, `$@`), functions, aliases and shell options they started with, as in bash ([#19072](https://github.com/can1357/oh-my-pi/pull/19072) by [@H4vC](https://github.com/H4vC); reported in [#18990](https://github.com/can1357/oh-my-pi/pull/18990) by [@alphastorm](https://github.com/alphastorm))
+- Fixed `$RANDOM` and `$SECONDS` in the `bash` tool's subshells, background jobs and command substitutions moving the parent shell's: each child now draws from and counts on its own copy, as bash and zsh do (bash code reseeds the copy on first use, zsh code continues it), and a nested `bash`/`zsh` starts fresh ones
+- Fixed `SECONDS` in bash code behaving unlike bash's: `SECONDS=n` was ignored and now counts on from n (a decimal number, else 0; arithmetic once `$SECONDS` was read or after `declare -i SECONDS`), as do `((SECONDS=n))`, `let` and the other arithmetic assignments; `SECONDS+=` adds to the last value, `printf '%(…)T' -2` and `time` count from the assignment, a `local SECONDS` is a plain variable, `unset SECONDS` (or of its element 0) makes it one for good, an element, compound or `-a`/`-A` assignment makes it a plain array, and `SECONDS` from the environment is the starting count
+- Fixed `export 'a[0]=x'` and `readonly 'a[0]=x'` in the `bash` tool assigning an array element: as in bash, a subscripted name is not a valid identifier for them
+- Fixed `declare -a`, `-A`, `-i`, `-l`, `-u`, `-c` (and their `+` forms) in the `bash` tool changing a readonly variable: as in bash 5.3, they now fail with `readonly variable` and status 1, and the variable stays as it was (bash 5.2 changed it)
+- Fixed `readonly -a`, `readonly -A`, `export -a` and `export -A` with a name and no value in the `bash` tool making the variable an array (and failing with `readonly variable` on a readonly one): as in bash, they give the name only the readonly or export attribute, with status 0
 
 ## [18.18.6] - 2026-11-09
 
