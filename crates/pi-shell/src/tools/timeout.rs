@@ -315,7 +315,7 @@ impl Timeout {
 	}
 
 	/// Whether the limit has come at `now`: `deadline` has passed, or the
-	/// test's [`Timeout::gate`] exists.
+	/// test's `Timeout::gate` exists.
 	#[cfg_attr(not(test), expect(clippy::unused_self, reason = "reads the test gate in tests"))]
 	fn expired(&self, now: u64, deadline: Option<u64>) -> bool {
 		#[cfg(test)]
@@ -326,7 +326,7 @@ impl Timeout {
 	}
 
 	/// When the limit of a call that has just started comes: its duration
-	/// from `now`, or the next poll of a test [`Timeout::gate`].
+	/// from `now`, or the next poll of a test `Timeout::gate`.
 	#[cfg_attr(not(test), expect(clippy::unused_self, reason = "reads the test gate in tests"))]
 	fn limit_at(&self, now: u64, opts: &Options) -> Option<u64> {
 		#[cfg(test)]
@@ -337,7 +337,7 @@ impl Timeout {
 	}
 
 	/// The deadline of a running call at its next turn: its own, or the
-	/// next poll of a test [`Timeout::gate`].
+	/// next poll of a test `Timeout::gate`.
 	#[cfg_attr(
 		not(test),
 		expect(

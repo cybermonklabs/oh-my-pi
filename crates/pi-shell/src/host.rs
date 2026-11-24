@@ -523,7 +523,7 @@ impl PiHost {
 
 	/// Serve externals the paths `vfs` aliases: a `scheme://` argument,
 	/// program or working directory the filesystem backs with a host file is
-	/// handed to the external as that file (see [`PiHost::spawn`]).
+	/// handed to the external as that file (see `PiHost::spawn`).
 	pub fn set_vfs(&mut self, vfs: Option<crate::vfs::VfsFs>) {
 		self.vfs = vfs;
 	}

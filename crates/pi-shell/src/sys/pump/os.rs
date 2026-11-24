@@ -113,7 +113,7 @@ impl OsPipe {
 		let _ = drain;
 	}
 
-	/// Our end of a [`named_pipe`] the child reads, before there is data
+	/// Our end of a `named_pipe` the child reads, before there is data
 	/// for it: keep it listening (spares, and instances whose client left),
 	/// so the child's opens find an instance however slow the producer is.
 	#[cfg_attr(
@@ -132,7 +132,7 @@ impl OsPipe {
 		let _ = cx;
 	}
 
-	/// Our end of a [`named_pipe`] no client holds: the child never opened
+	/// Our end of a `named_pipe` no client holds: the child never opened
 	/// it, or left without writing (no end of file comes from it).
 	#[cfg_attr(
 		unix,
@@ -335,14 +335,12 @@ mod imp {
 	///   ([`Drain::of`]).
 	/// - macOS: `/dev/fd/N` shares the description, so the pipe is a FIFO made
 	///   in a private directory under the temporary directory and opened four
-	///   times ([`fifo_descriptions`]): the pump writes through the shell's
+	///   times (`fifo_descriptions`): the pump writes through the shell's
 	///   write description, the children read the externals' read one, the drain
 	///   is the shell's read one, and the externals' write one is closed. The
 	///   FIFO and its directory are removed before any end is handed out, so
 	///   neither a drop nor a crash leaves anything behind. Where it cannot be
 	///   made, an anonymous pipe without a drain.
-	///
-	/// [`fifo_descriptions`]: crate::sys::fifo_pair::fifo_descriptions
 	pub fn feed_pipe() -> io::Result<(OsPipe, fs::File, Option<Drain>)> {
 		#[cfg(target_os = "macos")]
 		if let Ok([ours_read, ours_write, theirs_read, theirs_write]) =

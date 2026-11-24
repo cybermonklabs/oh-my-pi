@@ -222,7 +222,7 @@ impl Rig {
 	}
 
 	/// Test hook: the shell's next vpid becomes `next` (a counter near
-	/// [`crate::bash::ids::Vpid::CEILING`]): snapshot, rewrite the stored
+	/// [`Vpid::CEILING`](crate::bash::Vpid::CEILING)): snapshot, rewrite the stored
 	/// `MiscKey::NextVpid`, restore.
 	pub fn set_next_vpid(&mut self, next: u32) {
 		self.set_next_vpid_with(next, RestoreOpts::default());

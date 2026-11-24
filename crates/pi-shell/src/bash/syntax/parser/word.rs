@@ -1446,7 +1446,7 @@ impl<'s> Parser<'s> {
 		Ok((offset, Some(self.t.arith(Span::new(lo2, hi2), &len, false))))
 	}
 
-	/// Read one word in `mode` until end of input ([`parse_text`]).
+	/// Read one word in `mode` until end of input ([`parse_text`](crate::bash::syntax::parse_text)).
 	pub(super) fn text_word(&mut self, mode: TextMode) -> PResult<Id<shape::Word>> {
 		self.lx.extglob = false;
 		let lo = self.off();
@@ -1524,7 +1524,7 @@ fn word_end_in_quote(rest: &[u8]) -> Option<usize> {
 }
 
 /// Length of the run at the start of `rest` before the first byte that is
-/// `special`. Under a charset flag ([`Features::multibyte`]) the bytes after
+/// `special`. Under a charset flag ([`Features::multibyte`](crate::bash::syntax::Features::multibyte)) the bytes after
 /// a character's first byte never end the run, and a character cut by the
 /// end of `rest` is left to the byte-at-a-time path.
 #[inline]

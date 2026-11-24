@@ -22,7 +22,7 @@
 //!   [`Pattern::try_file`] matches one file-name segment for the engine's
 //!   globbing, with the path so far for `~` exclusions and the shared
 //!   approximation state ([`Approx`]).
-//! - [`getmatch`], [`getmatcharr`] and [`getmatchlist`] are `glob.c`'s
+//! - [`getmatch`](fn@getmatch), [`getmatcharr`] and [`getmatchlist`] are `glob.c`'s
 //!   `getmatch` family with every [`SubFlags`] combination.
 //! - [`haswilds`] decides whether a word is subject to filename generation.
 //!

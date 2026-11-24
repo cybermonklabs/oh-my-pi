@@ -334,7 +334,7 @@ pub struct Fired {
 	pub swept:  Option<Result<Vec<ProcInfo>, String>>,
 }
 
-/// Where an abandon escalation records what it does ([`Escalation`]): in
+/// Where an abandon escalation records what it does (`Escalation`): in
 /// test builds only, a no-op otherwise.
 #[derive(Clone)]
 struct Journal(#[cfg(test)] Arc<Mutex<Escalation>>);
@@ -1863,7 +1863,7 @@ fn open_max() -> i32 {
 /// else each descriptor `/proc/self/fd` lists (a kernel without
 /// `close_range`, or a seccomp profile that refuses it); else every number
 /// below the descriptor limit (no `/proc`, and macOS). Tests force the
-/// slower ways ([`force_sweep`]).
+/// slower ways (`force_sweep`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sweep {
 	CloseRange,

@@ -36,7 +36,7 @@ pub fn getpermtext(list: List<'_>, indent: usize) -> Vec<u8> {
 }
 
 /// zsh's text of one command at indentation 0 (its redirections
-/// included), for [`crate::bash::syntax::print`] with `PrintStyle::Zsh`.
+/// included), for [`crate::bash::syntax::print`](fn@crate::bash::syntax::print) with `PrintStyle::Zsh`.
 pub fn command_text(cmd: Command<'_>) -> Vec<u8> {
 	let mut t = Text::new(Vec::new(), 0, 0);
 	t.command(cmd, false);

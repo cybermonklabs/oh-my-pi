@@ -1389,7 +1389,7 @@ impl Reader {
 /// source (the caller exits as usual).
 ///
 /// # Errors
-/// A [`Need`] while a file is read.
+/// A `Need` while a file is read.
 pub fn logout_on_exit(
 	ctx: &mut crate::bash::vm::builtins::Ctx<'_, '_>,
 	status: i32,

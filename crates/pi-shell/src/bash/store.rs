@@ -1240,7 +1240,7 @@ pub enum MiscKey {
 	/// count (decimal), then one name and one value per entry in zsh's
 	/// iteration order, the value being a flags byte (`ND_USERNAME`,
 	/// `ND_NOABBREV`) followed by the directory
-	/// ([`crate::bash::vm::zsh::nameddir`]).
+	/// (`crate::bash::vm::zsh::nameddir`).
 	ZshNamedDirs,
 	/// bash's `current_command_number` (decimal; absent: 1), the prompt's
 	/// `\#`: an interactive reader adds one per top-level command it runs.
@@ -1251,7 +1251,7 @@ pub enum MiscKey {
 	/// zsh's module tables (`modulestab`, autoloadable builtins,
 	/// conditions, math functions and parameters) when they differ from
 	/// the ones zsh boots with (`Record::Misc`, postcard;
-	/// [`crate::bash::vm::builtins::zsh_module`]).
+	/// `crate::bash::vm::builtins::zsh_module`).
 	ZshModules,
 	/// zsh/mathfunc's `signgam`: the sign of Γ the last `lgamma()` left
 	/// (`Record::Misc`, decimal; absent: 0).
@@ -1259,7 +1259,7 @@ pub enum MiscKey {
 	/// zsh/net/tcp's session table (`ztcp_sessions`, `Record::Words`):
 	/// one entry per session in creation order, `FD TYPE LOCALIP LOCALPORT
 	/// PEERIP PEERPORT` with `TYPE` one of `L` (listener), `I` (inbound),
-	/// `O` (outbound), `Z` (zftp) ([`crate::bash::vm::builtins`]'s
+	/// `O` (outbound), `Z` (zftp) (`crate::bash::vm::builtins`'s
 	/// `zsh_mod_tcp`).
 	ZshTcpSessions,
 	/// zsh's `procsubstpid`: the vproc id of the last process
@@ -1297,11 +1297,11 @@ pub enum MiscKey {
 	/// zsh/pcre's compiled pattern (`pcre_compile`): `Record::Words` of
 	/// the PCRE option bits (decimal) and the pattern; absent when none
 	/// was compiled or the last compile failed
-	/// ([`crate::bash::vm::builtins::zsh_mod_pcre`]).
+	/// (`crate::bash::vm::builtins::zsh_mod_pcre`).
 	ZshPcre,
 	/// zsh/zftp's sessions and connection state between commands
 	/// (`Record::Misc`, postcard;
-	/// [`crate::bash::vm::builtins::zsh_mod_zftp`]).
+	/// `crate::bash::vm::builtins::zsh_mod_zftp`).
 	Zftp,
 	/// zsh/zftp's status files shared with subshells (zsh's `zfstatfd`;
 	/// `Record::Misc`, postcard), kept in the root store.
@@ -1312,11 +1312,11 @@ pub enum MiscKey {
 	/// and `${(k)termcap}` list (`Record::Misc`: a byte telling how ncurses
 	/// set it up, `S` `setupterm` only, `T` `tgetent`, `F` `tgetent` then a
 	/// failed one, then the terminal name;
-	/// [`crate::bash::vm::builtins::zsh_mod_terminfo`]).
+	/// `crate::bash::vm::builtins::zsh_mod_terminfo`).
 	ZshCurTerm,
 	/// `unset mapfile` left zsh/mapfile's special unset (zsh's `PM_UNSET`)
 	/// until the next assignment to it or a module unload (`Record::Misc`,
-	/// `1`; [`crate::bash::vm::builtins::zsh_mod_mapfile`]).
+	/// `1`; `crate::bash::vm::builtins::zsh_mod_mapfile`).
 	ZshMapfileUnset,
 	/// zsh/computil's `compdescribe` state between `-i`/`-I` and the `-g`
 	/// calls (`cd_state`; `Record::Misc`, postcard;
@@ -1347,7 +1347,7 @@ pub enum MiscKey {
 	/// per function, newest first as zsh lists them: the name, `s` for a
 	/// string function (`-Ms`) or empty, the fewest and most arguments
 	/// (decimal, -1 for no limit), and the shell function it calls (empty:
-	/// the same name) ([`crate::bash::vm::zsh::arith`]).
+	/// the same name) (`crate::bash::vm::zsh::arith`).
 	ZshMathFuncs,
 	/// The `PATH` whose directories zsh's command table holds every
 	/// command of (zsh `pathchecked` at the end of `path`, after

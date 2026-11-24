@@ -7,7 +7,7 @@
 //! reuses a tree only clears them.
 //!
 //! Each family of node kinds has one module holding its whole encoding: the
-//! child slots ([`slot`]-style constants), the builders that write it and
+//! child slots (`slot`-style constants), the builders that write it and
 //! the `Copy` views that read it ([`List`], [`Command`], [`Word`],
 //! [`WordPart`], …), which mirror the shapes of the bash grammar. Builders
 //! take and return typed handles ([`Id`]), so a child of the wrong shape

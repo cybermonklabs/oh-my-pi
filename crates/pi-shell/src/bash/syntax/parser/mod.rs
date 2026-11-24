@@ -9,7 +9,7 @@
 //!
 //! Input is a byte cursor over the source plus a stack of alias expansions;
 //! nothing is copied per byte. Words are lexed straight into
-//! [`WordPart`]s; command substitutions are parsed recursively at parse
+//! [`WordPart`](crate::bash::syntax::WordPart)s; command substitutions are parsed recursively at parse
 //! time, as bash 5.3 does.
 //!
 //! Node ids are assigned once a top-level command is complete

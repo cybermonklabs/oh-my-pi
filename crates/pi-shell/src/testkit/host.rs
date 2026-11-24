@@ -1,4 +1,4 @@
-//! `FakeHost`: a deterministic [`Host`] for engine tests.
+//! `FakeHost`: a deterministic [`Host`](crate::bash::Host) for engine tests.
 //!
 //! Output is captured in memory; the clock advances 1 µs per read (and
 //! jumps to the next timer deadline when every vproc waits); host
@@ -552,7 +552,7 @@ impl FakeHost {
 	/// Virtual time: when every vproc waits, jump the clock to the earliest
 	/// armed timer's deadline and fire it. `false` when no timer is armed.
 	///
-	/// [`crate::testkit::advance`] calls it on `Step::Blocked`, so `read -t`
+	/// [`crate::testkit::run::advance`] calls it on `Step::Blocked`, so `read -t`
 	/// times out deterministically. A test that mixes timers with real-time
 	/// `MemFs` latency may see a timer fire before a slow fs answer.
 	pub fn fire_next_timer(&self) -> bool {

@@ -2,7 +2,7 @@
 //!
 //! - [`NativeTerminal`]: the process host's [`Terminal`] over the real
 //!   terminals of this process (Unix), or over its console (Windows,
-//!   [`crate::sys::console`]).
+//!   `crate::sys::console`).
 //! - [`TermiosGuard`]: saves a terminal's modes and puts them back when dropped
 //!   (optionally switching it to raw mode first).
 //! - Free functions over raw descriptors (`attrs`, `set_attrs`, `window_size`,

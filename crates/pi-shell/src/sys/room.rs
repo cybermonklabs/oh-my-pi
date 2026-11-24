@@ -264,7 +264,7 @@ impl Room {
 }
 
 /// Make the room's thread. Fails as `pthread_create` does at the thread limit
-/// (`EAGAIN`), and in tests where [`no_thread_on_this_thread`] says so.
+/// (`EAGAIN`), and in tests where `no_thread_on_this_thread` says so.
 fn spawn(inner: Arc<Inner>) -> io::Result<()> {
 	#[cfg(test)]
 	{
