@@ -45,12 +45,14 @@
 # Artifacts: sc-report (summary.md), sc-res-<job> (each unit's result and log), sc-build.
 # Known failures: .github/sami-checks/known-failures.txt names tests that fail on every tree for a
 # reason the tree does not own yet; the summary shows each failure KNOWN (with the reason) or NEW, a
-# row whose only failures are known reads KNOWN, and an entry whose test passed is listed for removal
-# and fails the summary, unless its reason starts `flaky: `. The browser tests run against the
-# Chrome for Testing build the tree's puppeteer-core pins (bun.sh chrome), not the runner's
-# google-chrome. Skip prints: the skip-forms job fails on a print of the tree that says skip and that
-# the summary's rule does not read; the summary job runs the same check on every line a passing test
-# printed (sc.py skip-lines), and both are units of the row "skip prints the summary reads".
+# unit whose only failures are known reads KNOWN unless a test in it skipped itself and passed as no
+# other user, an entry of unit `*` names its test in any unit (shard) of its row, and an entry whose
+# test passed is listed for removal and fails the summary, unless its reason starts `flaky: `. The
+# browser tests run against the Chrome for Testing build the tree's puppeteer-core pins (bun.sh
+# chrome), not the runner's google-chrome. Skip prints: the skip-forms job fails on a print of the
+# tree that says skip and that the summary's rule does not read; the summary job runs the same check
+# on every line a passing test printed (sc.py skip-lines), and both are units of the row "skip
+# prints the summary reads".
 #
 # Caches. No job restores or saves a GitHub Actions cache (cache-mode: none for the whole run).
 # The build job compiles dev-dependencies, build scripts and proc macros that release_binary never
