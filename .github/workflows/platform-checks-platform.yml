@@ -44,6 +44,14 @@ on:
       timeout_minutes:
         required: true
         type: string
+      keep_success_output:
+        required: false
+        default: false
+        type: boolean
+      skip_bash_install:
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -68,6 +76,8 @@ env:
   PC_FILTER: ${{ inputs.filter }}
   PC_RETRIES: ${{ inputs.retries }}
   PC_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+  PC_SKIP_BASH_INSTALL: ${{ inputs.skip_bash_install }}
+  PC_KEEP_SUCCESS_OUTPUT: ${{ inputs.keep_success_output }}
   PC_PLANT_TREE: ${{ inputs.plant_tree }}
 
 jobs:
@@ -198,7 +208,7 @@ jobs:
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      - name: Host (ubuntu's kernel settings, zsh; macOS's bash)
+      - name: Host (ubuntu's kernel settings, zsh; macOS's bash 5)
         run: |
           # shellcheck disable=SC2024 # the apt log is the runner's own file
           case "$RUNNER_OS" in
@@ -210,8 +220,37 @@ jobs:
             fi
             ;;
           macOS)
-            b="$(brew --prefix 2> /dev/null)/bin/bash"
-            if [ -x "$b" ]; then echo "PI_TEST_REAL_BASH=$b" >> "$GITHUB_ENV"; fi
+            # The tests compare against bash 5.2 and 5.3, and macOS's /bin/bash is 3.2. Homebrew's
+            # bash goes first on PATH and into PI_TEST_REAL_BASH. A leg that does not get bash 5
+            # there stops here and reads UNKNOWN with the reason; it never runs on bash 3.2.
+            # skip_bash_install is that check's control.
+            prefix=$(brew --prefix)
+            if [ "$PC_SKIP_BASH_INSTALL" != true ]; then
+              HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install bash > "$RUNNER_TEMP/brew.log" 2>&1 ||
+                tail -n 5 "$RUNNER_TEMP/brew.log"
+            fi
+            export PATH="$prefix/bin:$PATH"
+            got=$(command -v bash)
+            major=$(bash -c 'echo "${BASH_VERSINFO[0]}"' 2> /dev/null)
+            why=""
+            if [ "$got" != "$prefix/bin/bash" ]; then
+              why="bash on PATH is ${got:-none}, not $prefix/bin/bash (the Homebrew install failed or was skipped)"
+            elif ! [[ "$major" =~ ^[0-9]+$ ]] || [ "$major" -lt 5 ]; then
+              why="$got is bash ${major:-?}, not 5 or later"
+            fi
+            if [ -n "$why" ]; then
+              {
+                echo "platform=$PC_PLATFORM"
+                echo "tree=$PC_TREE"
+                echo "who=$PC_WHO"
+                echo "leg=$PC_LEG"
+                echo "note=no bash 5 on this macOS leg: $why"
+              } > "$PC/results/meta.env"
+              echo "::error::no bash 5 on this macOS leg: $why"
+              exit 1
+            fi
+            echo "$prefix/bin" >> "$GITHUB_PATH"
+            echo "PI_TEST_REAL_BASH=$prefix/bin/bash" >> "$GITHUB_ENV"
             ;;
           esac
           {
@@ -221,6 +260,7 @@ jobs:
             done
             echo "zsh=$(zsh --version 2> /dev/null || echo none)"
             echo "bash=$(bash --version | head -n 1)"
+            echo "bash_path=$(command -v bash)"
             echo "cpus=$(getconf _NPROCESSORS_ONLN 2> /dev/null || echo "${NUMBER_OF_PROCESSORS:-?}")"
           } | tee "$PC/results/host.env"
       - name: Tests

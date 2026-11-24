@@ -135,7 +135,9 @@ def ts_matrix():
 def all_job_names():
     names = [m["name"] for m in set_matrix()] + [m["name"] for m in workspace_matrix()]
     names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()]
-    names += ["ts-small", "checkts", "skip-forms", "platforms", "clippy"]
+    # macos-bash is no job: it skips the macOS legs' Homebrew bash install (the platform checks'
+    # skip_bash_install), whose check must then stop the legs, so the macOS row reads UNKNOWN.
+    names += ["ts-small", "checkts", "skip-forms", "platforms", "clippy", "macos-bash"]
     return names
 
 

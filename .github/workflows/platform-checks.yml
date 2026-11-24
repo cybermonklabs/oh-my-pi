@@ -12,6 +12,7 @@
 #     -f head=<sha> [-f base=<sha>] [-f plant=<sha>] [-f platforms=macos,windows,ubuntu] \
 #     [-f crates=pi-shell] [-f filter='<nextest filterset>'] [-f repeat=1] [-f legs=1] \
 #     [-f retries=0] [-f flaky_passes=false] [-f timeout_minutes=10] [-f as_root=false]
+#     [-f skip_bash_install=false] [-f keep_success_output=false]
 #
 # Inputs are used exactly as given: no spaces in lists, whole numbers written plainly. A plant
 # is a commit whose own change (plant^..plant) is applied to head; the plan fails when it does
@@ -147,6 +148,16 @@ on:
         type: string
       as_root:
         description: "Also run the ubuntu legs as root"
+        required: false
+        default: false
+        type: boolean
+      keep_success_output:
+        description: "Keep passing tests' output too (nextest success-output final, and in the JUnit report)"
+        required: false
+        default: false
+        type: boolean
+      skip_bash_install:
+        description: "Control: the macOS legs skip the Homebrew bash install, and must read UNKNOWN"
         required: false
         default: false
         type: boolean
@@ -294,6 +305,8 @@ jobs:
       filter: ${{ inputs.filter }}
       retries: ${{ inputs.retries }}
       timeout_minutes: ${{ inputs.timeout_minutes }}
+      keep_success_output: ${{ inputs.keep_success_output }}
+      skip_bash_install: ${{ inputs.skip_bash_install }}
 
   windows:
     name: windows
@@ -312,6 +325,8 @@ jobs:
       filter: ${{ inputs.filter }}
       retries: ${{ inputs.retries }}
       timeout_minutes: ${{ inputs.timeout_minutes }}
+      keep_success_output: ${{ inputs.keep_success_output }}
+      skip_bash_install: ${{ inputs.skip_bash_install }}
 
   ubuntu:
     name: ubuntu
@@ -330,6 +345,8 @@ jobs:
       filter: ${{ inputs.filter }}
       retries: ${{ inputs.retries }}
       timeout_minutes: ${{ inputs.timeout_minutes }}
+      keep_success_output: ${{ inputs.keep_success_output }}
+      skip_bash_install: ${{ inputs.skip_bash_install }}
 
   report:
     name: report

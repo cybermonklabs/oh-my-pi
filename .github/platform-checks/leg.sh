@@ -16,6 +16,9 @@ mkdir -p "$res"
 	echo "count=$PC_COUNT"
 	echo "partition=${PC_PARTITION:-1}/${PC_PARTITIONS:-1}"
 	echo "image=${ImageOS:-?}/${ImageVersion:-?}"
+	# The bash the tests compare with when they read PI_TEST_REAL_BASH (the host step sets it on macOS).
+	echo "pi_test_real_bash=${PI_TEST_REAL_BASH:-unset}"
+	if [ -n "${PI_TEST_REAL_BASH:-}" ]; then echo "pi_test_real_bash_version=$("$PI_TEST_REAL_BASH" --version | head -n 1)"; fi
 } > "$meta"
 fail() {
 	echo "note=$*" >> "$meta"
@@ -36,13 +39,13 @@ cat > "$cfg" << EOF
 [profile.platform-checks]
 fail-fast = false
 failure-output = "final"
-success-output = "never"
+success-output = "$([ "${PC_KEEP_SUCCESS_OUTPUT:-}" = true ] && echo final || echo never)"
 retries = $PC_RETRIES
 slow-timeout = { period = "${PC_SLOW_PERIOD:-60s}", terminate-after = $PC_TIMEOUT_MINUTES, grace-period = "${PC_GRACE:-10s}" }
 
 [profile.platform-checks.junit]
 path = "junit.xml"
-store-success-output = false
+store-success-output = $([ "${PC_KEEP_SUCCESS_OUTPUT:-}" = true ] && echo true || echo false)
 store-failure-output = true
 EOF
 

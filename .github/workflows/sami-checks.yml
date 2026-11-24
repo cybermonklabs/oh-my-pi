@@ -10,7 +10,8 @@
 #       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
 #         -f commit=<sha> [-f silent=<job name>]
 #     `silent` is the summary's control: the named job (for example set-root-2) uploads nothing,
-#     and the summary must then read its units and its row UNKNOWN.
+#     and the summary must then read its units and its row UNKNOWN. `silent=macos-bash` instead
+#     makes the macOS legs skip their bash 5 install, and the macOS row must read UNKNOWN.
 #   - A push of feat/sami-checks (this tool's own branch) runs only the plan job's selftest: the
 #     counters and the summary against hand-made inputs. GitHub dispatches only a workflow it has
 #     seen run, and this file is not on the default branch; that push run registers it.
@@ -84,7 +85,7 @@
 name: sami checks
 
 run-name: >-
-  ${{ github.event_name == 'workflow_dispatch' && format('sami checks {0}{1}', inputs.commit, inputs.silent != '' && format(' (control: {0} uploads nothing)', inputs.silent) || '')
+  ${{ github.event_name == 'workflow_dispatch' && format('sami checks {0}{1}', inputs.commit, inputs.silent != '' && format(' (control: silent={0})', inputs.silent) || '')
   || github.ref == 'refs/heads/sami-candidate' && format('sami checks {0} (sami-candidate)', github.sha)
   || 'sami checks: the tool''s own controls' }}
 
@@ -100,7 +101,7 @@ on:
         required: true
         type: string
       silent:
-        description: "Control: a job name (for example set-root-2) that uploads nothing"
+        description: "Control: a job name (for example set-root-2) that uploads nothing, or macos-bash (the macOS legs skip their bash 5 install)"
         required: false
         default: ""
         type: string
@@ -553,6 +554,9 @@ jobs:
       crates: ${{ needs.plan.outputs.platform_crates }}
       partitions: ${{ needs.plan.outputs.platform_partitions }}
       retries: ${{ needs.plan.outputs.platform_retries }}
+      # The control `silent=macos-bash`: the macOS legs skip the Homebrew bash install, and their
+      # check stops them, so the macOS row must read UNKNOWN.
+      skip_bash_install: ${{ needs.plan.outputs.silent == 'macos-bash' }}
 
   clippy:
     name: clippy
