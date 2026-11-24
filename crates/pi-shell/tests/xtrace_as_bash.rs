@@ -4,11 +4,14 @@
 //! level down (bash runs it with `parse_and_execute`); a declaration
 //! builtin's compound assignment traced as the assignment it makes, when
 //! its word expands and before the words after it (`+ a=('1' '<TAB>')`,
-//! every element in plain single quotes, then `+ declare -a a`);
-//! `export`'s and `readonly`'s `name=value` operands traced as each is
-//! assigned, through the builtin's own (redirected) descriptors
-//! (`+ export X=1`, then `+ X=1`; none for `-f`, `-a` or `-A`); and
-//! `PS4`'s first character repeated whole when it is multibyte.
+//! every element in plain single quotes, then `+ declare -a a`), each
+//! substitution in the command run once when a `${ ;}` turns `set -x`,
+//! `failglob` or `set -f` on or off; `export`'s and `readonly`'s
+//! `name=value` operands traced as each is assigned, through the
+//! builtin's own (redirected) descriptors (`+ export X=1`, then `+ X=1`;
+//! none for `-f`, `-a` or `-A`), a failed write of that line not failing
+//! the builtin; and `PS4`'s first character repeated whole when it is
+//! multibyte.
 //!
 //! The rows ([`ROWS`]) are bash's own output: each script as `bash -c` and
 //! as `bash ./s.sh`, run by bash 5.3.20 and 5.2.21 in a fresh directory
@@ -21,8 +24,9 @@
 //! pid; a `PS4` whose first byte is no character in a UTF-8 locale (bash
 //! 5.3.20 aborts on it); and the rows about when a declaration's compound
 //! assignment is made rather than traced (bash makes it as it expands the
-//! word, so a later word sees it and a `failglob` error stops the words
-//! after it; obash makes it in the builtin).
+//! word, so a later word sees it, a `failglob` error stops the words after
+//! it, and under `failglob` it is traced before a later `${ ;}` runs;
+//! obash makes it in the builtin).
 #![cfg(unix)]
 
 mod obash_support;

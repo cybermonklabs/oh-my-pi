@@ -1757,12 +1757,20 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			status = 1;
 			continue;
 		}
-		// `declare -r c[100]` declares an indexed array; `readonly a[5]`
-		// and `export a[5]` are no names.
+		// `declare -r c[100]` declares an indexed array; `readonly a[5]`,
+		// `export a[5]` and `export a[5]=x` are no names (bash checks the
+		// part before the `=` with `legal_identifier`, and shows it; with
+		// `-a`/`-A` it hands the operand to `declare`).
 		let subscripted = value.is_none() && name.len() < arg.len();
 		let special = matches!(kind, DeclareKind::Readonly | DeclareKind::Export);
-		if subscripted && special {
-			ctx.err(Diag::InvalidIdent { name: arg.clone() });
+		if special && (subscripted || (index.is_some() && !arrays)) {
+			let shown = match arg.find_byte(b'=') {
+				Some(eq) if value.is_some() => {
+					BString::from(arg[..eq].strip_suffix(b"+").unwrap_or(&arg[..eq]))
+				},
+				_ => arg.clone(),
+			};
+			ctx.err(Diag::InvalidIdent { name: shown });
 			// A POSIX shell exits on a special builtin's usage error.
 			ctx.usage_error = true;
 			status = 1;
@@ -1794,7 +1802,6 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		if special
 			&& !arrays
 			&& !compound_word
-			&& index.is_none()
 			&& let Some(v) = value
 			&& ctx.vp.mode.dialect() != crate::bash::ids::Dialect::Zsh
 			&& xtrace::on(ctx.k, ctx.cx, ctx.vp)

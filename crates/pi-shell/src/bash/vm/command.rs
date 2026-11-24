@@ -663,9 +663,14 @@ fn seeded_exec(
 /// Write a fast-path builtin's output now. `Err((n, off))`: the first `n`
 /// chunks and `off` bytes of the next went out, the rest is for the
 /// staged output, which also takes all of it (`Err((0, 0))`) when it has a
-/// diagnostic to render or the shell has output queued before it.
+/// diagnostic to render or a trace line to write unchecked
+/// ([`xtrace::TRACE_WRITE`]), or the shell has output queued before it.
 fn write_now(k: &Kernel, vp: &Vproc, chunks: &[Chunk]) -> Result<(), (usize, usize)> {
-	if !vp.out.is_empty() || chunks.iter().any(|c| !matches!(c, Chunk::Out(..))) {
+	if !vp.out.is_empty()
+		|| chunks
+			.iter()
+			.any(|c| !matches!(c, Chunk::Out(fd, _) if fd & xtrace::TRACE_WRITE == 0))
+	{
 		return Err((0, 0));
 	}
 	let mut tcx = Context::from_waker(&k.waker);
@@ -730,8 +735,8 @@ fn expand(
 		// expands that word (`expand_declaration_argument`), before the
 		// words after it: that expansion keeps a replay log, so a later
 		// park runs it again without a second trace line.
-		let compounds = !zsh && decl_compounds(unit, words) && xtrace::on(k, cx, vp);
-		let record = compounds || words.iter().any(|&w| unit.words[w as usize].parks);
+		let decl = !zsh && decl_compounds(unit, words);
+		let record = decl || words.iter().any(|&w| unit.words[w as usize].parks);
 		// Expand into the state's (recycled) vectors; a replay starts over.
 		let s = st(vp);
 		let mut argv = std::mem::take(&mut s.argv);
@@ -764,6 +769,15 @@ fn expand(
 			arrayref.clear();
 			late = None;
 			ex.pool = std::mem::take(&mut pool);
+			// The pathname expansion options that decide which compound
+			// words have their walks made here are the first pass's, and so
+			// is the choice to trace each compound word: a `${ ;}` after
+			// them can change the options (bash has made the assignments by
+			// then), and the trace and walks log entries that each replay
+			// must read in step.
+			if decl {
+				ex.first_pass_glob_opts()?;
+			}
 			// zsh `KSH_TYPESET`, read at the first argument that needs it.
 			let mut ksh_typeset = None;
 			for &w in words {
@@ -784,7 +798,11 @@ fn expand(
 					// unless `failglob` leaves that to the walks after the
 					// words: then it and every compound word after it is
 					// traced after them.
-					if compounds && late.is_none() {
+					let traced = decl && late.is_none() && {
+						let on = xtrace::on(ex.k, ex.cx, ex.vp);
+						ex.first_pass(on)
+					};
+					if traced {
 						if !elem_globs.is_empty()
 							&& super::glob::compound_globs_in(ex, &mut elems, &elem_globs)?
 						{
@@ -4657,7 +4675,9 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 			state.writes.pop_front();
 			continue;
 		}
-		let fd = pending.fd;
+		// A trace line (`xtrace::TRACE_WRITE`) goes to its fd unchecked.
+		let trace = pending.fd & xtrace::TRACE_WRITE != 0;
+		let fd = pending.fd & !xtrace::TRACE_WRITE;
 		let handle = vp.fds.handle(fd);
 		let state = st(vp);
 		let pending = state.writes.front_mut().expect("checked");
@@ -4667,6 +4687,11 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 				if pending.off >= pending.bytes.len() {
 					state.writes.pop_front();
 				}
+			},
+			// bash writes it with an unchecked `fprintf`: the line is lost,
+			// the builtin's status and its other output stay.
+			Poll::Ready(_) if trace => {
+				state.writes.pop_front();
 			},
 			Poll::Ready(res) => {
 				state.writes.retain(|queued| queued.fd != fd);

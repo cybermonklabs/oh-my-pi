@@ -3808,5 +3808,575 @@
    "in\ne\ne2\n",
    "+[6] f\n+[4] echo in\n+[8] eval 'echo e\necho e2'\n++[8] echo e\n++[9] echo e2\n"
   ]
+ },
+ {
+  "id": "d-funsub-xtrace-off",
+  "file": false,
+  "script": "n=0; set -x; declare -a a=(1) x=${ set +x; n=$((n+1)); echo s; }; echo \"n=$n x=$x a=${a[*]}\"",
+  "bash53": [
+   0,
+   "n=1 x=s a=1\n",
+   "+ a=('1')\n++ set +x\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ a=('1')\nbash: line 1: x=${ set +x; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-xtrace-off",
+  "file": true,
+  "script": "n=0; set -x; declare -a a=(1) x=${ set +x; n=$((n+1)); echo s; }; echo \"n=$n x=$x a=${a[*]}\"",
+  "bash53": [
+   0,
+   "n=1 x=s a=1\n",
+   "+ a=('1')\n++ set +x\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ a=('1')\n./s.sh: line 1: x=${ set +x; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-xtrace-on",
+  "file": false,
+  "script": "n=0; declare -a a=(1) x=${ set -x; n=$((n+1)); echo s; }; set +x; echo \"n=$n x=$x a=${a[*]}\"",
+  "bash53": [
+   0,
+   "n=1 x=s a=1\n",
+   "++ n=1\n++ echo s\n+ declare -a a x=s\n+ set +x\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: x=${ set -x; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-xtrace-on",
+  "file": true,
+  "script": "n=0; declare -a a=(1) x=${ set -x; n=$((n+1)); echo s; }; set +x; echo \"n=$n x=$x a=${a[*]}\"",
+  "bash53": [
+   0,
+   "n=1 x=s a=1\n",
+   "++ n=1\n++ echo s\n+ declare -a a x=s\n+ set +x\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: x=${ set -x; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-quiet-local",
+  "file": false,
+  "script": "f() { local -a a=(1) x=${ { set +x; } 2>/dev/null; echo s; }; echo \"x=$x\"; }; set -x; f",
+  "bash53": [
+   0,
+   "x=s\n",
+   "+ f\n+ a=('1')\n"
+  ],
+  "bash52": [
+   2,
+   "",
+   "bash: -c: line 1: syntax error near unexpected token `}'\nbash: -c: line 1: `f() { local -a a=(1) x=${ { set +x; } 2>/dev/null; echo s; }; echo \"x=$x\"; }; set -x; f'\n"
+  ]
+ },
+ {
+  "id": "d-funsub-quiet-local",
+  "file": true,
+  "script": "f() { local -a a=(1) x=${ { set +x; } 2>/dev/null; echo s; }; echo \"x=$x\"; }; set -x; f",
+  "bash53": [
+   0,
+   "x=s\n",
+   "+ f\n+ a=('1')\n"
+  ],
+  "bash52": [
+   2,
+   "",
+   "./s.sh: line 1: syntax error near unexpected token `}'\n./s.sh: line 1: `f() { local -a a=(1) x=${ { set +x; } 2>/dev/null; echo s; }; echo \"x=$x\"; }; set -x; f'\n"
+  ]
+ },
+ {
+  "id": "d-valsub-xtrace-off",
+  "file": false,
+  "script": "n=0; set -x; declare -a a=(1) x=${| set +x; n=$((n+1)); REPLY=s; }; echo \"n=$n x=$x\"",
+  "bash53": [
+   0,
+   "n=1 x=s\n",
+   "+ a=('1')\n++ set +x\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ a=('1')\nbash: line 1: x=${| set +x; n=$((n+1)); REPLY=s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-valsub-xtrace-off",
+  "file": true,
+  "script": "n=0; set -x; declare -a a=(1) x=${| set +x; n=$((n+1)); REPLY=s; }; echo \"n=$n x=$x\"",
+  "bash53": [
+   0,
+   "n=1 x=s\n",
+   "+ a=('1')\n++ set +x\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ a=('1')\n./s.sh: line 1: x=${| set +x; n=$((n+1)); REPLY=s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-failglob-on",
+  "file": false,
+  "script": ": > g1; n=0; set -x; declare -a f=(g*) x=${ shopt -s failglob; n=$((n+1)); echo s; }; echo \"n=$n ${f[*]} $x\"",
+  "bash53": [
+   0,
+   "n=1 g1 s\n",
+   "+ f=('g1')\n++ shopt -s failglob\n++ n=1\n++ echo s\n+ declare -a f x=s\n+ echo 'n=1 g1 s'\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ f=('g1')\nbash: line 1: x=${ shopt -s failglob; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-failglob-on",
+  "file": true,
+  "script": ": > g1; n=0; set -x; declare -a f=(g*) x=${ shopt -s failglob; n=$((n+1)); echo s; }; echo \"n=$n ${f[*]} $x\"",
+  "bash53": [
+   0,
+   "n=1 g1 s\n",
+   "+ f=('g1')\n++ shopt -s failglob\n++ n=1\n++ echo s\n+ declare -a f x=s\n+ echo 'n=1 g1 s'\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ f=('g1')\n./s.sh: line 1: x=${ shopt -s failglob; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-noglob-on",
+  "file": false,
+  "script": ": > g1; n=0; set -x; declare -a f=(g*) x=${ set -f; n=$((n+1)); echo s; }; set +f; echo \"n=$n ${f[*]} $x\"",
+  "bash53": [
+   0,
+   "n=1 g1 s\n",
+   "+ f=('g1')\n++ set -f\n++ n=1\n++ echo s\n+ declare -a f x=s\n+ set +f\n+ echo 'n=1 g1 s'\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ f=('g1')\nbash: line 1: x=${ set -f; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-noglob-on",
+  "file": true,
+  "script": ": > g1; n=0; set -x; declare -a f=(g*) x=${ set -f; n=$((n+1)); echo s; }; set +f; echo \"n=$n ${f[*]} $x\"",
+  "bash53": [
+   0,
+   "n=1 g1 s\n",
+   "+ f=('g1')\n++ set -f\n++ n=1\n++ echo s\n+ declare -a f x=s\n+ set +f\n+ echo 'n=1 g1 s'\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ f=('g1')\n./s.sh: line 1: x=${ set -f; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-noglob-off",
+  "file": false,
+  "script": ": > g1; set -f; n=0; set -x; declare -a f=(g*) x=${ set +f; n=$((n+1)); echo s; }; echo \"n=$n ${f[*]} $x\"",
+  "bash53": [
+   0,
+   "n=1 g* s\n",
+   "+ f=('g*')\n++ set +f\n++ n=1\n++ echo s\n+ declare -a f x=s\n+ echo 'n=1 g* s'\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ f=('g*')\nbash: line 1: x=${ set +f; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-noglob-off",
+  "file": true,
+  "script": ": > g1; set -f; n=0; set -x; declare -a f=(g*) x=${ set +f; n=$((n+1)); echo s; }; echo \"n=$n ${f[*]} $x\"",
+  "bash53": [
+   0,
+   "n=1 g* s\n",
+   "+ f=('g*')\n++ set +f\n++ n=1\n++ echo s\n+ declare -a f x=s\n+ echo 'n=1 g* s'\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ f=('g*')\n./s.sh: line 1: x=${ set +f; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-two-toggles",
+  "file": false,
+  "script": "n=0; set -x; declare -a a=(1) x=${ set +x; n=$((n+1)); echo s; } b=(2) y=${ set -x; n=$((n+1)); echo t; }; set +x; echo \"n=$n x=$x y=$y a=${a[*]} b=${b[*]}\"",
+  "bash53": [
+   0,
+   "n=2 x=s y=t a=1 b=2\n",
+   "+ a=('1')\n++ set +x\n++ n=2\n++ echo t\n+ declare -a a x=s b y=t\n+ set +x\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ a=('1')\nbash: line 1: x=${ set +x; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-two-toggles",
+  "file": true,
+  "script": "n=0; set -x; declare -a a=(1) x=${ set +x; n=$((n+1)); echo s; } b=(2) y=${ set -x; n=$((n+1)); echo t; }; set +x; echo \"n=$n x=$x y=$y a=${a[*]} b=${b[*]}\"",
+  "bash53": [
+   0,
+   "n=2 x=s y=t a=1 b=2\n",
+   "+ a=('1')\n++ set +x\n++ n=2\n++ echo t\n+ declare -a a x=s b y=t\n+ set +x\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ a=('1')\n./s.sh: line 1: x=${ set +x; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-xtrace-off-glob",
+  "file": false,
+  "script": ": > g1; : > g2; n=0; set -x; declare -a f=(g*) x=${ set +x; n=$((n+1)); echo s; }; echo \"n=$n ${f[*]} $x\"",
+  "bash53": [
+   0,
+   "n=1 g1 g2 s\n",
+   "+ f=('g1' 'g2')\n++ set +x\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ f=('g1' 'g2')\nbash: line 1: x=${ set +x; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-xtrace-off-glob",
+  "file": true,
+  "script": ": > g1; : > g2; n=0; set -x; declare -a f=(g*) x=${ set +x; n=$((n+1)); echo s; }; echo \"n=$n ${f[*]} $x\"",
+  "bash53": [
+   0,
+   "n=1 g1 g2 s\n",
+   "+ f=('g1' 'g2')\n++ set +x\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ f=('g1' 'g2')\n./s.sh: line 1: x=${ set +x; n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-untraced-decl",
+  "file": false,
+  "script": "n=0; declare -a a=(1) x=${ n=$((n+1)); echo s; }; echo \"n=$n x=$x\"",
+  "bash53": [
+   0,
+   "n=1 x=s\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: x=${ n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-funsub-untraced-decl",
+  "file": true,
+  "script": "n=0; declare -a a=(1) x=${ n=$((n+1)); echo s; }; echo \"n=$n x=$x\"",
+  "bash53": [
+   0,
+   "n=1 x=s\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: x=${ n=$((n+1)); echo s; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "w-xtracefd-full",
+  "file": false,
+  "script": "exec 7>/dev/full; BASH_XTRACEFD=7; set -x; export X=1; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "w-xtracefd-full",
+  "file": true,
+  "script": "exec 7>/dev/full; BASH_XTRACEFD=7; set -x; export X=1; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "w-xtracefd-full-in-builtin",
+  "file": false,
+  "script": "exec 3>&1; BASH_XTRACEFD=3; set -x; export X=1 3>/dev/full; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "+ export X=1\n+ echo s=0\ns=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "+ export X=1\n+ echo s=0\ns=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "w-xtracefd-full-in-builtin",
+  "file": true,
+  "script": "exec 3>&1; BASH_XTRACEFD=3; set -x; export X=1 3>/dev/full; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "+ export X=1\n+ echo s=0\ns=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "+ export X=1\n+ echo s=0\ns=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "w-xtracefd-full-errexit",
+  "file": false,
+  "script": "exec 7>/dev/full; BASH_XTRACEFD=7; set -ex; export X=1; echo \"after s=$?\"",
+  "bash53": [
+   0,
+   "after s=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after s=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "w-xtracefd-full-errexit",
+  "file": true,
+  "script": "exec 7>/dev/full; BASH_XTRACEFD=7; set -ex; export X=1; echo \"after s=$?\"",
+  "bash53": [
+   0,
+   "after s=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "after s=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "w-readonly-full",
+  "file": false,
+  "script": "exec 7>/dev/full; BASH_XTRACEFD=7; set -x; readonly R=1 S=2; echo \"s=$? $R$S\"",
+  "bash53": [
+   0,
+   "s=0 12\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=0 12\n",
+   ""
+  ]
+ },
+ {
+  "id": "w-readonly-full",
+  "file": true,
+  "script": "exec 7>/dev/full; BASH_XTRACEFD=7; set -x; readonly R=1 S=2; echo \"s=$? $R$S\"",
+  "bash53": [
+   0,
+   "s=0 12\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=0 12\n",
+   ""
+  ]
+ },
+ {
+  "id": "w-stderr-full",
+  "file": false,
+  "script": "set -x; export X=1 2>/dev/full; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "+ export X=1\n+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "+ export X=1\n+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "w-stderr-full",
+  "file": true,
+  "script": "set -x; export X=1 2>/dev/full; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "+ export X=1\n+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "+ export X=1\n+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "w-export-p-full",
+  "file": false,
+  "script": "set -x; export -p >/dev/full; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ export -p\nbash: line 1: export: write error: No space left on device\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ export -p\nbash: line 1: export: write error: No space left on device\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "w-export-p-full",
+  "file": true,
+  "script": "set -x; export -p >/dev/full; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ export -p\n./s.sh: line 1: export: write error: No space left on device\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ export -p\n./s.sh: line 1: export: write error: No space left on device\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "g-export-subscripted",
+  "file": false,
+  "script": "set -x; export 'a[1]=x' 2>f; cat f",
+  "bash53": [
+   0,
+   "bash: line 1: export: `a[1]': not a valid identifier\n",
+   "+ export 'a[1]=x'\n+ cat f\n"
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: export: `a[1]': not a valid identifier\n",
+   "+ export 'a[1]=x'\n+ cat f\n"
+  ]
+ },
+ {
+  "id": "g-export-subscripted",
+  "file": true,
+  "script": "set -x; export 'a[1]=x' 2>f; cat f",
+  "bash53": [
+   0,
+   "./s.sh: line 1: export: `a[1]': not a valid identifier\n",
+   "+ export 'a[1]=x'\n+ cat f\n"
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: export: `a[1]': not a valid identifier\n",
+   "+ export 'a[1]=x'\n+ cat f\n"
+  ]
+ },
+ {
+  "id": "g-export-compound",
+  "file": false,
+  "script": "set -x; export a=(1 2); declare -p a",
+  "bash53": [
+   0,
+   "declare -ax a=([0]=\"1\" [1]=\"2\")\n",
+   "+ a=('1' '2')\n+ export a\n+ declare -p a\n"
+  ],
+  "bash52": [
+   0,
+   "declare -ax a=([0]=\"1\" [1]=\"2\")\n",
+   "+ a=('1' '2')\n+ export a\n+ declare -p a\n"
+  ]
+ },
+ {
+  "id": "g-export-compound",
+  "file": true,
+  "script": "set -x; export a=(1 2); declare -p a",
+  "bash53": [
+   0,
+   "declare -ax a=([0]=\"1\" [1]=\"2\")\n",
+   "+ a=('1' '2')\n+ export a\n+ declare -p a\n"
+  ],
+  "bash52": [
+   0,
+   "declare -ax a=([0]=\"1\" [1]=\"2\")\n",
+   "+ a=('1' '2')\n+ export a\n+ declare -p a\n"
+  ]
+ },
+ {
+  "id": "g-trace-fills-pipe",
+  "file": false,
+  "script": "{ set -x; declare -a a=(\"$(printf %070000d 0)\") x=$(echo s); set +x; } 2>&1 | { sleep 1; md5sum; }",
+  "bash53": [
+   0,
+   "11db9edada0dcf6ce7e1bcbf2e618490  -\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "11db9edada0dcf6ce7e1bcbf2e618490  -\n",
+   ""
+  ]
+ },
+ {
+  "id": "g-trace-fills-pipe",
+  "file": true,
+  "script": "{ set -x; declare -a a=(\"$(printf %070000d 0)\") x=$(echo s); set +x; } 2>&1 | { sleep 1; md5sum; }",
+  "bash53": [
+   0,
+   "11db9edada0dcf6ce7e1bcbf2e618490  -\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "11db9edada0dcf6ce7e1bcbf2e618490  -\n",
+   ""
+  ]
  }
 ]

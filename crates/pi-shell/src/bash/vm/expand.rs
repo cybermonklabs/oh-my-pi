@@ -327,6 +327,30 @@ impl<'e, 'c> Expander<'e, 'c> {
 		self.note(|| Atom::Done);
 	}
 
+	/// A choice as the first pass of this expansion made it (`now` there),
+	/// the same on every replay: an option read when bash expanded the
+	/// word, which a `${ ;}` later in the command may have changed since.
+	/// A choice that decides what the pass logs must not change between
+	/// passes, or a replay reads its log out of step.
+	pub fn first_pass(&mut self, now: bool) -> bool {
+		if let Some(Atom::Branch(then)) = self.replay() {
+			return then;
+		}
+		self.note(|| Atom::Branch(now));
+		now
+	}
+
+	/// Pathname expansion's options (`set -f`, `extglob`) for the rest of
+	/// this expansion as its first pass read them ([`Self::first_pass`]):
+	/// they decide which words have walks logged in the pass.
+	pub fn first_pass_glob_opts(&mut self) -> X<()> {
+		let now = self.glob_opts()?;
+		let noglob = self.first_pass(now.noglob);
+		let extglob = self.first_pass(now.extglob);
+		self.glob_opts = Some(GlobOpts { noglob, extglob });
+		Ok(())
+	}
+
 	fn read_atom(&mut self, f: impl FnOnce(&mut Self) -> X<Val>) -> X<Val> {
 		match self.replay() {
 			Some(Atom::Str(None)) => return Ok(Val::Unset),

@@ -158,8 +158,8 @@ pub fn emit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, body: &[
 
 /// A trace line a builtin writes as it runs (bash's `export` and
 /// `readonly` trace each `name=value` operand as they assign it): the
-/// descriptor it goes to, as the builtin's redirections left them, and
-/// the `PS4` prefix, `body`, a newline.
+/// descriptor it goes to, as the builtin's redirections left them, with
+/// [`TRACE_WRITE`] set, and the `PS4` prefix, `body`, a newline.
 pub fn builtin_line(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -170,8 +170,16 @@ pub fn builtin_line(
 	let mut bytes = prefix(k, cx, vp, line);
 	bytes.extend_from_slice(body);
 	bytes.push(b'\n');
-	(trace_fd(k, cx, vp), bytes)
+	(trace_fd(k, cx, vp) | TRACE_WRITE, bytes)
 }
+
+/// The bit of a builtin's queued output fd that marks a trace line
+/// ([`builtin_line`]): a failed write of it is dropped, as bash's
+/// unchecked `fprintf` to the trace stream drops it (`print_cmd.c`
+/// `xtrace_print_assignment`), not reported as the builtin's own write
+/// error. A bit of the fd, not a field of the queued write: no frame
+/// changes, and no descriptor comes near it.
+pub const TRACE_WRITE: i32 = 1 << 30;
 
 /// Queue `bytes` (a whole trace line, or zsh's pieces of one) for the
 /// trace output.

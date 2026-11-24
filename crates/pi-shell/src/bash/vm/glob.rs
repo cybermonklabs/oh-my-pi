@@ -795,16 +795,17 @@ pub fn expand_compound_globs(
 /// `set -x`, which traces a declaration's compound assignment once its
 /// word is expanded whole, before the words after it: each walk is asked
 /// as a [`Stop::Probe`](super::expand::Stop::Probe), its answer logged and
-/// replayed when the op runs again. `Ok(false)` under `failglob`: the walk
-/// stays [`expand_compound_globs`]'s, whose error ends the command as
-/// bash's does.
+/// replayed when the op runs again. `Ok(false)` under `failglob`, as the
+/// first pass found it ([`first_pass`](super::expand::Expander::first_pass)):
+/// the walk stays [`expand_compound_globs`]'s, whose error ends the command
+/// as bash's does.
 pub fn compound_globs_in(
 	ex: &mut super::expand::Expander<'_, '_>,
 	elems: &mut Vec<super::expand::CompoundElem>,
 	globs: &[(u32, BString)],
 ) -> Result<bool, super::expand::Stop> {
 	let s = Setup::read(ex.k, ex.cx, ex.vp);
-	if s.failglob {
+	if ex.first_pass(s.failglob) {
 		return Ok(false);
 	}
 	let mut results = Vec::with_capacity(globs.len());
