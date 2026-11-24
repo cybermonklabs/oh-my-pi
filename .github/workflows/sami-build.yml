@@ -1,7 +1,7 @@
 name: Build sami branch
 
 # How the release owner cuts a release:
-#   1. Push the composed candidate to sami-candidate. That push runs every
+#   1. Push the composed candidate to release-candidate. That push runs every
 #      job here but publish: carry, version, release_binary (it builds,
 #      smoke-tests and uploads the archives), attest (it attests the
 #      archives, their sidecars and the release notes) and
@@ -14,7 +14,7 @@ name: Build sami branch
 #      attested archives. It never rebuilds.
 # For a pushed sami commit that carries this file and
 # .github/sami/release-candidate.sh as they are here: with no green
-# sami-candidate run of that commit, publish fails and publishes nothing. An
+# release-candidate run of that commit, publish fails and publishes nothing. An
 # archive whose sha256 is not the one the candidate run attested is refused
 # and named with both digests, and nothing is published. A candidate whose
 # carry check named a release older than the newest one is refused too: a
@@ -24,7 +24,7 @@ name: Build sami branch
 # file: GitHub runs the dispatched ref's own sami-build.yml, so a ref whose copy
 # was changed can attest. publish's checks keep that run's files out of a
 # release (see the attest job).
-# The release build cache is saved only on a push to sami-candidate, where
+# The release build cache is saved only on a push to release-candidate, where
 # release_cache_prune keeps one entry per target; sami, where nothing is
 # built, keeps none.
 # Known limit: a push to sami runs the pushed commit's own sami-build.yml and
@@ -35,7 +35,7 @@ name: Build sami branch
 # reason, a push of any branch whose own workflow asks for contents: write
 # can create a release directly, and a ruleset on sami would not stop it.
 # Any identity of the agent App sjawhar-agent[bot] can push sami and
-# sami-candidate. No ruleset guards either ref, by the decision of
+# release-candidate. No ruleset guards either ref, by the decision of
 # 2026-11-23: no wrong push has been seen, and a protection against a risk
 # nobody has seen waits for a person's request.
 
@@ -43,7 +43,7 @@ on:
   push:
     branches:
       - sami
-      - sami-candidate
+      - release-candidate
   workflow_dispatch:
 
 # Each job that needs more than reading the repository says so itself.
@@ -132,9 +132,9 @@ jobs:
       # cache (its garbage collection deletes the least recently used
       # actions), and the downloads (Bazel's repository cache and the cargo
       # registry), which are emptied when they grow past theirs. Each push
-      # to sami-candidate saves a new entry per target (the key ends in the
+      # to release-candidate saves a new entry per target (the key ends in the
       # commit, and GitHub never overwrites a key), and release_cache_prune
-      # then deletes the entries it supersedes. So on sami-candidate the
+      # then deletes the entries it supersedes. So on release-candidate the
       # cache holds one entry per target, about 1.40 GB for linux-x64 and
       # 0.95 GB for darwin-arm64 (about 2.35 GB), and up to twice that in the
       # minutes between a save and the prune; sami, where nothing is built,
@@ -182,17 +182,17 @@ jobs:
       # and 27 min on macos-15 over the 19 pushes of 2026-11-19 to 11-22. The
       # steps below keep Bazel's disk cache and repository cache, and the
       # cargo registry that crate_universe reads (CARGO_BAZEL_ISOLATED=0 in
-      # .bazelrc), in GitHub's Actions cache: each push to sami-candidate, the
+      # .bazelrc), in GitHub's Actions cache: each push to release-candidate, the
       # ref the release is built on, restores the newest entry for its ref and
-      # target and saves a new one. Whoever can push sami-candidate can seed
+      # target and saves a new one. Whoever can push release-candidate can seed
       # what this job restores; the same identities can push sami, which
       # publishes, so the cache gives them nothing they lack. A candidate's
       # own code also runs here before the save, red or green, so its
       # outputs reach the entry the next candidate restores. When a candidate
-      # is dropped because its code is not trusted, delete sami-candidate's
+      # is dropped because its code is not trusted, delete release-candidate's
       # entries before the next candidate push (or bump v1 in all four
       # places: the key, both restore-keys, and release_cache_prune's prefix):
-      #   gh api --paginate 'repos/cybermonklabs/oh-my-pi/actions/caches?ref=refs/heads/sami-candidate&key=omp-release-bazel-v1-' -q '.actions_caches[].id' |
+      #   gh api --paginate 'repos/cybermonklabs/oh-my-pi/actions/caches?ref=refs/heads/release-candidate&key=omp-release-bazel-v1-' -q '.actions_caches[].id' |
       #     xargs -I{} gh api -X DELETE repos/cybermonklabs/oh-my-pi/actions/caches/{}
       - name: Restore the release build cache
         id: release-cache
@@ -279,7 +279,7 @@ jobs:
             release/*.tar.gz
             release/*.tar.gz.sha256
           if-no-files-found: error
-      # Only a push to sami-candidate saves the cache; a dispatch or any other
+      # Only a push to release-candidate saves the cache; a dispatch or any other
       # event only restores. cache-mode takes no expression, so this condition
       # on the bound and save steps enforces it (harness cases W14 to W19, W26,
       # W27 and W38). A failed build's finished actions are still valid results,
@@ -287,7 +287,7 @@ jobs:
       # same commit restored its exact key and has nothing to save.
       - name: Bound the release build cache
         id: release-cache-bound
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' && !cancelled() && steps.release-cache.outputs.cache-hit != 'true' && (steps.natives.outcome == 'success' || steps.natives.outcome == 'failure') }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/release-candidate' && !cancelled() && steps.release-cache.outputs.cache-hit != 'true' && (steps.natives.outcome == 'success' || steps.natives.outcome == 'failure') }}
         shell: python3 {0}
         run: |
           import os, shutil, time
@@ -349,7 +349,7 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"save={'true' if save else 'false'}\n")
       - name: Save the release build cache
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' && !cancelled() && steps.release-cache-bound.outputs.save == 'true' }}
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/release-candidate' && !cancelled() && steps.release-cache-bound.outputs.save == 'true' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.RELEASE_CACHE_PATHS }}
@@ -369,19 +369,19 @@ jobs:
     # this job and the candidate run is red before sami moves. Harness cases
     # W39 to W67
     # (.github/sami/tests/run.sh) keep it so. It runs only on a push to
-    # sami-candidate, so the public transparency log gets no trial entries.
+    # release-candidate, so the public transparency log gets no trial entries.
     # This if: does not keep a dispatch run's files out of a release: GitHub
     # runs the workflow file of the ref a run is on, and that file can attest
     # anything. publish's checks do (.github/sami/release-candidate.sh): find
-    # takes only a run of a push to sami-candidate at the pushed commit, the
+    # takes only a run of a push to release-candidate at the pushed commit, the
     # downloads take that run's artifacts by its run id, and verify accepts a
     # file only with an attestation whose certificate names that run
     # (runInvocationURI), a push (buildTrigger) and sami-build.yml at
-    # refs/heads/sami-candidate (its subject and buildSignerURI), from the
+    # refs/heads/release-candidate (its subject and buildSignerURI), from the
     # pushed commit on that ref.
     name: Attest the release archives and notes
     needs: [carry, release_binary]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/release-candidate' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -424,7 +424,7 @@ jobs:
   release_cache_prune:
     # Keeps the newest release build cache entry of each target in this
     # ref and deletes the rest (see release_binary's env). It runs on a push
-    # to sami-candidate, the only run that saves an entry; a push to sami
+    # to release-candidate, the only run that saves an entry; a push to sami
     # builds and saves nothing. No checkout and no member code: it only
     # lists and deletes this ref's entries whose key starts with
     # omp-release-bazel-v1-<ref>-, and this job alone may delete cache
@@ -434,7 +434,7 @@ jobs:
     # grants actions write.
     name: Keep one release build cache per target
     needs: release_binary
-    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/release-candidate' }}
     # The run's conclusion, which publish reads, follows the build, its smoke
     # tests and attest; a failed prune shows only on this job. The step, not
     # the job, has the 10-minute limit: past it the step fails, which
@@ -497,11 +497,11 @@ jobs:
 
   publish:
     # A push to sami runs only this job, and it builds nothing. It takes the
-    # green sami-build run of sami-candidate at the same commit, downloads
+    # green sami-build run of release-candidate at the same commit, downloads
     # that run's archives and release notes, and publishes them only after
     # .github/sami/release-candidate.sh checks that each one is a file that
     # run attested (its attest job, on the push, signed by sami-build.yml at
-    # refs/heads/sami-candidate) and that there is exactly one archive per
+    # refs/heads/release-candidate) and that there is exactly one archive per
     # release target. A red release_binary or attest leaves the candidate
     # run red, so no run is found and nothing is published; sami-checks.yml's
     # run, the Rust tests among it, is not read. The checkout has the tags:
@@ -523,7 +523,7 @@ jobs:
       actions: read
       attestations: read
     env:
-      CANDIDATE_BRANCH: sami-candidate
+      CANDIDATE_BRANCH: release-candidate
       # release_binary's matrix targets: one archive of each is published.
       RELEASE_TARGETS: linux-x64 darwin-arm64
       GH_TOKEN: ${{ github.token }}

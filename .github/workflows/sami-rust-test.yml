@@ -1,5 +1,5 @@
 # The Rust tests of a release candidate, report only. sami-checks.yml calls this workflow on
-# each push of sami-candidate and on its dispatch. rust_test runs `bazel test //crates/...` and
+# each push of release-candidate and on its dispatch. rust_test runs `bazel test //crates/...` and
 # the repository's other cargo workspaces against the known-failure gate
 # (.github/sami/rust-test.sh); rust_test_macos runs the tests only macOS can run. These were
 # sami-build.yml's rust_test and rust_test_macos jobs, where a red one held the release. Here a
@@ -10,7 +10,7 @@
 # (.github/sami) and the actions these jobs use (.github/actions) come from the commit this run
 # was started from, checked out at tool/. The gate's are copied over the tree's .github/sami,
 # since its scripts read their lists at .github/sami in the directory they run in. On a push of
-# sami-candidate both are the same commit; a dispatch of an older commit (one from before this
+# release-candidate both are the same commit; a dispatch of an older commit (one from before this
 # gate, for example) is judged by the lists at the dispatched ref.
 #
 # Caches: cache-mode is none here and on the calling job. Test code runs here with the runner's

@@ -15,17 +15,17 @@ if [ "$1" = attestation ] && [ "$2" = verify ]; then
   run="${STUB_RUN:-4242}"; case " ${STUB_OTHER:-} " in *" $b "*) run=999;; esac
   repo=o/r; case " ${STUB_FOREIGN:-} " in *" $b "*) repo=x/r;; esac
   trigger=push; case " ${STUB_DISPATCH:-} " in *" $b "*) trigger=workflow_dispatch;; esac
-  ref=sami-candidate; case " ${STUB_SIGNER_REF:-} " in *" $b "*) ref=other;; esac
+  ref=release-candidate; case " ${STUB_SIGNER_REF:-} " in *" $b "*) ref=other;; esac
   att() { printf '{"verificationResult":{"signature":{"certificate":{"runInvocationURI":"https://github.com/%s/actions/runs/%s/attempts/1","buildTrigger":"%s","buildSignerURI":"https://github.com/o/r/.github/workflows/sami-build.yml@refs/heads/%s"}}},"attestation":{"bundle":{"x":"%s"}}}' "$1" "$2" "$3" "$4" "${STUB_PLANT:-}"; }
   # An empty answer; two JSON documents, the one that does not match first;
   # the three certificate fields split over two attestations of one answer,
   # each of the three ways (run alone, trigger alone, signer alone).
   case " ${STUB_EMPTY:-} " in *" $b "*) exit 0;; esac
-  case " ${STUB_GARBLED:-} " in *" $b "*) printf '[%s]\n[\n' "$(att o/r "$run" push sami-candidate)"; exit 0;; esac
-  case " ${STUB_TWO:-} " in *" $b "*) printf '[%s]\n[%s]\n' "$(att o/r 999 push sami-candidate)" "$(att o/r "$run" push sami-candidate)"; exit 0;; esac
-  case " ${STUB_SPLIT:-} " in *" $b "*) printf '[%s,%s]\n' "$(att o/r "$run" workflow_dispatch other)" "$(att o/r 999 push sami-candidate)"; exit 0;; esac
-  case " ${STUB_SPLIT2:-} " in *" $b "*) printf '[%s,%s]\n' "$(att o/r "$run" workflow_dispatch sami-candidate)" "$(att o/r 999 push other)"; exit 0;; esac
-  case " ${STUB_SPLIT3:-} " in *" $b "*) printf '[%s,%s]\n' "$(att o/r "$run" push other)" "$(att o/r 999 workflow_dispatch sami-candidate)"; exit 0;; esac
+  case " ${STUB_GARBLED:-} " in *" $b "*) printf '[%s]\n[\n' "$(att o/r "$run" push release-candidate)"; exit 0;; esac
+  case " ${STUB_TWO:-} " in *" $b "*) printf '[%s]\n[%s]\n' "$(att o/r 999 push release-candidate)" "$(att o/r "$run" push release-candidate)"; exit 0;; esac
+  case " ${STUB_SPLIT:-} " in *" $b "*) printf '[%s,%s]\n' "$(att o/r "$run" workflow_dispatch other)" "$(att o/r 999 push release-candidate)"; exit 0;; esac
+  case " ${STUB_SPLIT2:-} " in *" $b "*) printf '[%s,%s]\n' "$(att o/r "$run" workflow_dispatch release-candidate)" "$(att o/r 999 push other)"; exit 0;; esac
+  case " ${STUB_SPLIT3:-} " in *" $b "*) printf '[%s,%s]\n' "$(att o/r "$run" push other)" "$(att o/r 999 workflow_dispatch release-candidate)"; exit 0;; esac
   printf '[%s]\n' "$(att "$repo" "$run" "$trigger" "$ref")"
   exit 0
 fi
@@ -47,7 +47,7 @@ setup() { # fresh candidate dir
     head -c 4096 /dev/urandom > "$d/$a"; (cd "$d" && sha256sum "$a" > "$a.sha256"); done
   printf 'Previous release: v18.18.6-sami.20261123-024918 (%s).\n\nnotes body\n' "${PREVC:0:12}" > "$RUNNER_TEMP/candidate/release-notes/carry-notes.md"
   export GITHUB_OUTPUT="$W/out"; : > "$GITHUB_OUTPUT"; export GITHUB_STEP_SUMMARY="$W/sum"; : > "$GITHUB_STEP_SUMMARY"
-  export GITHUB_REPOSITORY=o/r GITHUB_SHA="$SHA" CANDIDATE_BRANCH=sami-candidate RUN_ID=4242 RELEASE_TARGETS="linux-x64 darwin-arm64"
+  export GITHUB_REPOSITORY=o/r GITHUB_SHA="$SHA" CANDIDATE_BRANCH=release-candidate RUN_ID=4242 RELEASE_TARGETS="linux-x64 darwin-arm64"
   unset STUB_REFUSE STUB_OTHER STUB_PLANT STUB_RUN STUB_FOREIGN STUB_DISPATCH STUB_SIGNER_REF STUB_EMPTY STUB_GARBLED STUB_TWO STUB_SPLIT STUB_SPLIT2 STUB_SPLIT3; : > "$STUB_LOG"
 }
 case_() { # name want(0|1) msg-regex  -- runs verify in the repo
@@ -60,9 +60,9 @@ case_() { # name want(0|1) msg-regex  -- runs verify in the repo
 }
 setup; case_ V0-good 0 "Verified against run 4242, tag $TAG"
 grep -q "^tag=$TAG$" "$GITHUB_OUTPUT" && echo "PASS V0-output-tag" || { echo "FAIL V0-output-tag"; failn=$((failn+1)); }
-grep -c -- '--source-ref refs/heads/sami-candidate' "$STUB_LOG" | sed 's/^/INFO verify calls with source-ref: /'
+grep -c -- '--source-ref refs/heads/release-candidate' "$STUB_LOG" | sed 's/^/INFO verify calls with source-ref: /'
 grep -c -- '--deny-self-hosted-runners' "$STUB_LOG" | sed 's/^/INFO verify calls with deny-self-hosted: /'
-[ "$(grep -c -- '--cert-identity https://github.com/o/r/.github/workflows/sami-build.yml@refs/heads/sami-candidate ' "$STUB_LOG")" = 5 ] && echo "PASS V0-cert-identity" || { echo "FAIL V0-cert-identity"; failn=$((failn+1)); }
+[ "$(grep -c -- '--cert-identity https://github.com/o/r/.github/workflows/sami-build.yml@refs/heads/release-candidate ' "$STUB_LOG")" = 5 ] && echo "PASS V0-cert-identity" || { echo "FAIL V0-cert-identity"; failn=$((failn+1)); }
 setup; touch "$RUNNER_TEMP/candidate/mise-linux-x64/extra"; case_ V1-extra-file 1 'mise-linux-x64 must hold exactly one'
 setup; mkdir -p "$RUNNER_TEMP/candidate/mise-linux-arm64"; case_ V2-extra-artifact 1 'artifact mise-linux-arm64'
 setup; head -c 10 /dev/urandom >> "$RUNNER_TEMP/candidate/mise-linux-x64/omp-$TAG-linux-x64.tar.gz"; case_ V3-swapped-archive 1 'sha256 [0-9a-f]{64}; the candidate run attested [0-9a-f]{64}'
@@ -102,11 +102,11 @@ fcase() { # name want msg json
   if [ "$ok" = 1 ]; then pass=$((pass+1)); echo "PASS $name rc=$rc"; else failn=$((failn+1)); echo "FAIL $name rc=$rc"; printf '%s\n' "$out" | head -3 | sed 's/^/    | /'; fi; : > "$W/fout"
 }
 run() { printf '{"id":%s,"head_sha":"%s","event":"%s","head_branch":"%s","conclusion":"%s","path":".github/workflows/sami-build.yml","html_url":"u%s"}' "$1" "$2" "$3" "$4" "$5" "$1"; }
-fcase F0-one-green 0 '^run_id=7$' "{\"total_count\":1,\"workflow_runs\":[$(run 7 $SHA push sami-candidate success)]}"
-fcase F1-two-green-takes-max 0 '^run_id=9$' "{\"total_count\":2,\"workflow_runs\":[$(run 9 $SHA push sami-candidate success),$(run 7 $SHA push sami-candidate success)]}"
-fcase F2-page-short 1 'UNKNOWN' "{\"total_count\":3,\"workflow_runs\":[$(run 7 $SHA push sami-candidate success)]}"
+fcase F0-one-green 0 '^run_id=7$' "{\"total_count\":1,\"workflow_runs\":[$(run 7 $SHA push release-candidate success)]}"
+fcase F1-two-green-takes-max 0 '^run_id=9$' "{\"total_count\":2,\"workflow_runs\":[$(run 9 $SHA push release-candidate success),$(run 7 $SHA push release-candidate success)]}"
+fcase F2-page-short 1 'UNKNOWN' "{\"total_count\":3,\"workflow_runs\":[$(run 7 $SHA push release-candidate success)]}"
 fcase F3-wrong-branch 1 'no green sami-build run' "{\"total_count\":1,\"workflow_runs\":[$(run 7 $SHA push sami success)]}"
-fcase F4-dispatch 1 'no green sami-build run' "{\"total_count\":1,\"workflow_runs\":[$(run 7 $SHA workflow_dispatch sami-candidate success)]}"
-fcase F5-red 1 'no green sami-build run' "{\"total_count\":1,\"workflow_runs\":[$(run 7 $SHA push sami-candidate failure)]}"
-fcase F6-other-sha 1 'no green sami-build run' "{\"total_count\":1,\"workflow_runs\":[$(run 7 0000000000000000000000000000000000000000 push sami-candidate success)]}"
+fcase F4-dispatch 1 'no green sami-build run' "{\"total_count\":1,\"workflow_runs\":[$(run 7 $SHA workflow_dispatch release-candidate success)]}"
+fcase F5-red 1 'no green sami-build run' "{\"total_count\":1,\"workflow_runs\":[$(run 7 $SHA push release-candidate failure)]}"
+fcase F6-other-sha 1 'no green sami-build run' "{\"total_count\":1,\"workflow_runs\":[$(run 7 0000000000000000000000000000000000000000 push release-candidate success)]}"
 echo "release-candidate.sh harness: $pass passed, $failn failed"

@@ -129,7 +129,7 @@ def cmd_plan():
         commit = os.environ.get("SC_INPUT_COMMIT", "")
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
             sys.exit(f"::error::the commit input must be a full 40-character lowercase id, not '{commit}'")
-    elif event == "push" and ref == "refs/heads/sami-candidate":
+    elif event == "push" and ref == "refs/heads/release-candidate":
         commit = os.environ["GITHUB_SHA"]
     else:
         # A push of this tool's own branch: its controls only (the selftest), no tree.

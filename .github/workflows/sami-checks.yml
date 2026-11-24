@@ -4,7 +4,7 @@
 # forward.
 #
 # When it runs.
-#   - A push to sami-candidate tests the pushed commit (sami fast-forwards to that same commit
+#   - A push to release-candidate tests the pushed commit (sami fast-forwards to that same commit
 #     later, so sami itself is not tested again).
 #   - A dispatch tests any pushed commit, given as a full 40-character id:
 #       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
@@ -65,7 +65,7 @@
 #
 # Caches. No job restores or saves a GitHub Actions cache (cache-mode: none for the whole run).
 # The build job compiles dev-dependencies, build scripts and proc macros that release_binary never
-# runs, and a dispatch can name any pushed commit; with cache access on sami-candidate either
+# runs, and a dispatch can name any pushed commit; with cache access on release-candidate either
 # could plant an entry release_binary restores. So every run builds cold: about 15 min for the
 # tests' cargo build and 17 min for the addon on the first runs; bun install takes about 2 s.
 # The rust-test job calls its workflow with cache-mode none, and that workflow declares none too.
@@ -74,13 +74,13 @@ name: sami checks
 
 run-name: >-
   ${{ github.event_name == 'workflow_dispatch' && format('sami checks {0}{1}', inputs.commit, inputs.silent != '' && format(' (control: {0} uploads nothing)', inputs.silent) || '')
-  || github.ref == 'refs/heads/sami-candidate' && format('sami checks {0} (sami-candidate)', github.sha)
+  || github.ref == 'refs/heads/release-candidate' && format('sami checks {0} (release-candidate)', github.sha)
   || 'sami checks: the tool''s own controls' }}
 
 on:
   push:
     branches:
-      - sami-candidate
+      - release-candidate
       - feat/sami-checks
   workflow_dispatch:
     inputs:

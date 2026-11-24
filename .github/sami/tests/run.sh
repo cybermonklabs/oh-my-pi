@@ -1006,7 +1006,7 @@ fi
 # release_cache_prune, or sami-rust-test.yml's rust_test and rust_test_macos.
 # Those two run test code on runners whose user has passwordless sudo, on
 # the release's ref (sami-checks.yml calls them on the push of
-# sami-candidate); such code could save an entry for that ref (one no run
+# release-candidate); such code could save an entry for that ref (one no run
 # has written yet, or one a ref's own lookup takes before main's) that
 # release_binary would restore.
 # The workflow sets cache-mode: none, so a job's cache token can neither
@@ -1018,7 +1018,7 @@ fi
 # bun-install step, which then sets cache=none and runs neither of its cache
 # steps. release_binary passes `cache: "false"` to its bun-install step too,
 # since bun-install's own save runs on main. release_binary may restore, and
-# saves only on a push to sami-candidate, the ref the release is built on:
+# saves only on a push to release-candidate, the ref the release is built on:
 # cache-mode takes no expression, so each of its actions/cache/save steps
 # starts its `if:` with that condition, has no `||` and nothing after the
 # expression's `}}`, on its line or on a deeper line that YAML folds into the
@@ -1050,7 +1050,7 @@ fi
 # this run's artifacts only; and each download step gives artifact-ids, so it
 # takes the artifacts its upload steps made, not whatever a job of this run
 # uploaded under their names later. Its if: is exactly the push to
-# sami-candidate test; its one block-style artifact-ids line names exactly
+# release-candidate test; its one block-style artifact-ids line names exactly
 # carry's notes-artifact-id and release_binary's two mise-*-artifact-id
 # outputs, which are those jobs' upload steps' artifact ids; and each of the
 # five release files (two archives, two sidecars, the notes) has an
@@ -1065,7 +1065,7 @@ fi
 # the job above's.
 cache_lint() {
 	local wf="$1" action="$2" bazel_action="$3" need="$4" rc=0 job jobs bad steps bun n ok modes saves ns others acts scripts fetches aw perms idt runs foreign byname want_if ifs coe idl subj d dj dl ds cont
-	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/sami-candidate'"'"' && [^|\\$}]*\}\}\\n(        [^ \\].*)?$'
+	local push_guard='\\n        if: \$\{\{ github\.event_name == '"'"'push'"'"' && github\.ref == '"'"'refs/heads/release-candidate'"'"' && [^|\\$}]*\}\}\\n(        [^ \\].*)?$'
 	# These four read each line with a space added at its end (and the first
 	# two at its start too), so no pattern needs an anchor inside a group.
 	local member_code='[^[:alnum:]_.-](bash|sh|zsh|dash|bun|bunx|node|npx|npm|python|python3|perl|ruby|deno|curl|wget|pwsh|powershell|source|git)[^[:alnum:]_.-]|[^[:alnum:]_.]\.\.?/|\.github/|GITHUB_WORKSPACE'
@@ -1114,11 +1114,11 @@ cache_lint() {
 			saves="$(printf '%s\n' "$steps" | grep -E 'uses: *actions/cache/save@' || true)"
 			ns="$(printf '%s' "$saves" | grep -c . || true)"
 			if printf '%s\n' "$saves" | grep -vE -- "$push_guard" | grep -q .; then
-				echo "release_binary saves a cache on an event other than a push to sami-candidate"
+				echo "release_binary saves a cache on an event other than a push to release-candidate"
 				ok=0
 			fi
 			if [ "$ok" = 1 ]; then
-				echo "release_binary: save steps: $ns, each only on a push to sami-candidate; bun-install steps: $n, each with cache: \"false\""
+				echo "release_binary: save steps: $ns, each only on a push to release-candidate; bun-install steps: $n, each with cache: \"false\""
 			fi
 		else
 			modes="$(grep -vE '^ *#' "$scratch/job.yml" | grep -F 'cache-mode' | grep -vxF '    cache-mode: none' || true)"
@@ -1179,10 +1179,10 @@ cache_lint() {
 					echo "attest has a line that is not a key, which YAML folds into the value of the key above it: $(printf '%s\n' "$cont" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
 					ok=0
 				fi
-				# The job's if: is exactly the push-to-sami-candidate test, and
+				# The job's if: is exactly the push-to-release-candidate test, and
 				# no step has an if: of its own or continue-on-error: either
 				# could leave a file unattested in a green run.
-				want_if="    if: \${{ github.event_name == 'push' && github.ref == 'refs/heads/sami-candidate' }}"
+				want_if="    if: \${{ github.event_name == 'push' && github.ref == 'refs/heads/release-candidate' }}"
 				ifs="$(grep -E $'^    ["\']?if["\']?[[:space:]]*:' "$scratch/job.yml" || true)"
 				if [ "$ifs" != "$want_if" ]; then
 					echo "attest's if: is not exactly [$want_if], so it could attest on another event or ref: $(printf '%s\n' "${ifs:-none}" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
@@ -1267,7 +1267,7 @@ cache_lint() {
 				echo "release_cache_prune: no action; no listed interpreter or downloader, git, ./, ../ or .github/ path or GITHUB_WORKSPACE; each gh call names actions/caches or gh cache outside a comment"
 			fi
 			if [ "$ok" = 1 ] && [ "$job" = attest ]; then
-				echo "attest: only actions/download-artifact and actions/attest-build-provenance, pinned by commit; no run step; no other run, repository or token; downloads by artifact id; if: a push to sami-candidate; artifact-ids: the upload steps' three ids; one attest step per release file"
+				echo "attest: only actions/download-artifact and actions/attest-build-provenance, pinned by commit; no run step; no other run, repository or token; downloads by artifact id; if: a push to release-candidate; artifact-ids: the upload steps' three ids; one attest step per release file"
 			fi
 		fi
 		[ "$ok" = 1 ] || rc=1
@@ -1327,7 +1327,7 @@ wlint() {
 	rc=$?
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
-wlint W1-release-binary-cache-rule 0 'release_binary: save steps: 1, each only on a push to sami-candidate; bun-install steps: 1, each with cache: "false"' '' ''
+wlint W1-release-binary-cache-rule 0 'release_binary: save steps: 1, each only on a push to release-candidate; bun-install steps: 1, each with cache: "false"' '' ''
 wlint W2-release-binary-bun-install-with-cache 1 'release_binary has a bun-install step without cache: "false"' '/^          cache: "false"$/d' ''
 wlint W3-carry-cache-step 1 'carry has an actions/cache step' 's|^        run: git fetch --no-tags https://github.com/can1357/oh-my-pi.git main:refs/remotes/upstream/main$|&\n      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0|' ''
 wlint W4-action-ignores-the-input 1 'does not set cache=none' '' '/echo "cache=none"/d'
@@ -1353,14 +1353,14 @@ wlint W10-workflow-cache-mode-not-none 1 'has no workflow-level cache-mode: none
 wlint W11-carry-cache-mode-read 1 'carry has a cache-mode line other than \[    cache-mode: none\]: \[    cache-mode: read\]' 's/^  carry:$/&\n    cache-mode: read/' ''
 WF=sami-rust-test.yml wlint W12-rust-test-cache-mode-write 1 'rust_test has a cache-mode line other than \[    cache-mode: none\]: \[    cache-mode: write\]' 's/^  rust_test:$/&\n    cache-mode: write/' ''
 wlint W13-publish-cache-step 1 'publish has an actions/cache step' 's|^      - name: Find the candidate run$|      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0\n&|' ''
-# release_binary saves only on a push to sami-candidate; a dispatch, a pull
+# release_binary saves only on a push to release-candidate; a dispatch, a pull
 # request, a push to another ref or any other event only restores.
-wlint W14-release-binary-save-unguarded 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/github.event_name == 'push' && github.ref == 'refs\/heads\/sami-candidate' && //" ''
-wlint W15-release-binary-save-on-dispatch 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/github.event_name == 'push'/github.event_name == 'workflow_dispatch'/" ''
-wlint W16-release-binary-save-on-pull-request 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/github.event_name == 'push'/github.event_name == 'pull_request'/" ''
-wlint W17-release-binary-save-or 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s#github.ref == 'refs/heads/sami-candidate' &&#github.ref == 'refs/heads/sami-candidate' ||#" ''
+wlint W14-release-binary-save-unguarded 1 'release_binary saves a cache on an event other than a push to release-candidate$' "s/github.event_name == 'push' && github.ref == 'refs\/heads\/release-candidate' && //" ''
+wlint W15-release-binary-save-on-dispatch 1 'release_binary saves a cache on an event other than a push to release-candidate$' "s/github.event_name == 'push'/github.event_name == 'workflow_dispatch'/" ''
+wlint W16-release-binary-save-on-pull-request 1 'release_binary saves a cache on an event other than a push to release-candidate$' "s/github.event_name == 'push'/github.event_name == 'pull_request'/" ''
+wlint W17-release-binary-save-or 1 'release_binary saves a cache on an event other than a push to release-candidate$' "s#github.ref == 'refs/heads/release-candidate' &&#github.ref == 'refs/heads/release-candidate' ||#" ''
 wlint W18-release-binary-post-save-step 1 'release_binary has an actions/cache step that saves in its post step' 's|uses: actions/cache/restore@|uses: actions/cache@|' ''
-wlint W19-release-binary-save-or-after-guard 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/steps.release-cache-bound.outputs.save == 'true' }}/steps.release-cache-bound.outputs.save == 'true' || github.event_name == 'workflow_dispatch' }}/" ''
+wlint W19-release-binary-save-or-after-guard 1 'release_binary saves a cache on an event other than a push to release-candidate$' "s/steps.release-cache-bound.outputs.save == 'true' }}/steps.release-cache-bound.outputs.save == 'true' || github.event_name == 'workflow_dispatch' }}/" ''
 # No other caching action can save under release_binary's token, and a job
 # line the lint cannot read stops it.
 wlint W20-release-binary-other-cache-action 1 'release_binary uses an action outside its list: Swatinem/rust-cache@v2' 's|^      - name: Point Bazel at the release build cache$|      - uses: Swatinem/rust-cache@v2\n&|' ''
@@ -1374,8 +1374,8 @@ WF=sami-rust-test.yml wlint W25-rust-test-keys-indented-six 1 'rust_test has a c
 # GitHub reads an if: with text outside ${{ }} as a string, which is true,
 # so nothing may follow the save guard's expression, on its line (W26) or
 # on a deeper line that YAML folds into the value (W27).
-wlint W26-release-binary-save-text-after-the-expression 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/& \\&\\& \${{ !cancelled() }}/" ''
-wlint W27-release-binary-save-text-on-a-folded-line 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/&\\n          \\&\\& \${{ !cancelled() }}/" ''
+wlint W26-release-binary-save-text-after-the-expression 1 'release_binary saves a cache on an event other than a push to release-candidate$' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/& \\&\\& \${{ !cancelled() }}/" ''
+wlint W27-release-binary-save-text-on-a-folded-line 1 'release_binary saves a cache on an event other than a push to release-candidate$' "s/steps.release-cache-bound.outputs.save == 'true' }}\$/&\\n          \\&\\& \${{ !cancelled() }}/" ''
 # release_cache_prune holds actions: write, so it runs no member code: no
 # action (W28), no interpreter, git or repository path (W29), and no gh
 # call but on actions/caches (W35, and W37 with actions/caches only in a
@@ -1394,8 +1394,8 @@ wlint W35-release-cache-prune-gh-repo-clone 1 'release_cache_prune calls gh for 
 WF=sami-rust-test.yml wlint W36-rust-test-actions-write-read-in-a-comment 1 'rust_test names an actions permission other than read or none, which only release_cache_prune may hold: \[      actions: write # was actions: read\]' '/^  rust_test:$/,/^  rust_test_macos:$/s/^      contents: read$/&\n      actions: write # was actions: read/' ''
 wlint W37-release-cache-prune-gh-caches-in-a-comment 1 'release_cache_prune calls gh for something other than actions/caches, so it could fetch member code: \[          gh api "repos/\$GH_REPO/contents/p\.sh" >p # not actions/caches\]' 's|^          list >caches.tsv$|          gh api "repos/$GH_REPO/contents/p.sh" >p # not actions/caches\n&|' ''
 # A push to another ref only restores, sami included: the guard names
-# sami-candidate (W38).
-wlint W38-release-binary-save-on-sami 1 'release_binary saves a cache on an event other than a push to sami-candidate$' "s/github.ref == 'refs\/heads\/sami-candidate' \&\& !cancelled() \&\& steps.release-cache-bound/github.ref == 'refs\/heads\/sami' \&\& !cancelled() \&\& steps.release-cache-bound/" ''
+# release-candidate (W38).
+wlint W38-release-binary-save-on-sami 1 'release_binary saves a cache on an event other than a push to release-candidate$' "s/github.ref == 'refs\/heads\/release-candidate' \&\& !cancelled() \&\& steps.release-cache-bound/github.ref == 'refs\/heads\/sami' \&\& !cancelled() \&\& steps.release-cache-bound/" ''
 # attest holds id-token: write, so it runs no member code: no action but
 # download-artifact and attest-build-provenance (W40), each pinned by commit
 # (W51), no run step (W41, W48 in flow style), no download of another run's
@@ -1404,7 +1404,7 @@ wlint W38-release-binary-save-on-sami 1 'release_binary saves a cache on an even
 # other job (W43, W45 by write-all, W47; in sami-rust-test.yml, W46 with
 # the value on the next line) and not the workflow (W44) names an id-token
 # permission other than read or none. attest runs only on a push to
-# sami-candidate (W54 without the event test, W55 with ||), downloads
+# release-candidate (W54 without the event test, W55 with ||), downloads
 # exactly the upload steps'
 # three ids by their needs outputs (W56 another output, W57 a literal id),
 # which are the upload steps' artifact ids (W60), and attests each release
@@ -1414,7 +1414,7 @@ wlint W38-release-binary-save-on-sami 1 'release_binary saves a cache on an even
 # the artifact-ids (W64) or a subject-path (W65), and no quote or # on the
 # artifact-ids line (W66 " #,<id>" inside quotes, W67 the quoted value
 # continued on a line that starts with #).
-wlint W39-attest-rule 0 "attest: only actions/download-artifact and actions/attest-build-provenance, pinned by commit; no run step; no other run, repository or token; downloads by artifact id; if: a push to sami-candidate; artifact-ids: the upload steps' three ids; one attest step per release file" '' ''
+wlint W39-attest-rule 0 "attest: only actions/download-artifact and actions/attest-build-provenance, pinned by commit; no run step; no other run, repository or token; downloads by artifact id; if: a push to release-candidate; artifact-ids: the upload steps' three ids; one attest step per release file" '' ''
 wlint W40-attest-checkout 1 'attest uses an action other than actions/download-artifact and actions/attest-build-provenance pinned by commit, so it could run member code: \[      - uses: actions/checkout@' 's|^      - name: Download the archives and the release notes$|      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0\n&|' ''
 wlint W41-attest-run-step 1 'attest has a run step, so it could run member code: \[      - run: bash \.github/sami/carry-check\.sh\]' 's|^      - name: Download the archives and the release notes$|      - run: bash .github/sami/carry-check.sh\n&|' ''
 wlint W42-attest-download-of-another-run 1 'attest names another run, repository or token, so it could attest files this run did not build: \[          run-id: 1\]' '/^  attest:$/,/^  release_cache_prune:$/s|^          path: \${{ runner.temp }}/attest$|&\n          run-id: 1|' ''
@@ -1429,8 +1429,8 @@ wlint W50-attest-download-by-pattern 1 'attest downloads an artifact by name or 
 wlint W51-attest-action-by-tag 1 'attest uses an action other than actions/download-artifact and actions/attest-build-provenance pinned by commit, so it could run member code: \[        uses: actions/download-artifact@v4\]' '/^  attest:$/,/^  release_cache_prune:$/s|actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0|actions/download-artifact@v4|' ''
 wlint W52-attest-artifact-ids-only-in-a-comment 1 'attest downloads an artifact by name or pattern, not by the id its upload gave, so a job of this run could have replaced it: \[ - name: Download the archives and the release notes uses: actions/download-artifact@' '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: .*$/          pattern: mise-*  # artifact-ids: later/' ''
 wlint W53-attest-artifact-ids-empty 1 'attest downloads an artifact by name or pattern, not by the id its upload gave, so a job of this run could have replaced it: \[ - name: Download the archives and the release notes uses: actions/download-artifact@' '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: .*$/          artifact-ids: ""\n          pattern: mise-*/' ''
-wlint W54-attest-if-without-the-event 1 "so it could attest on another event or ref: \\[    if: .\\{\\{ github\\.ref == 'refs/heads/sami-candidate' \\}\\}\\]\$" "/^  attest:\$/,/^  release_cache_prune:\$/s/^    if: \${{ github.event_name == 'push' && /    if: \${{ /" ''
-wlint W55-attest-if-or 1 "so it could attest on another event or ref: \\[    if: .\\{\\{ github\\.event_name == 'push' \\|\\| github\\.ref == 'refs/heads/sami-candidate' \\}\\}\\]\$" "/^  attest:\$/,/^  release_cache_prune:\$/s/ && github.ref == 'refs\\/heads\\/sami-candidate' }}\$/ || github.ref == 'refs\\/heads\\/sami-candidate' }}/" ''
+wlint W54-attest-if-without-the-event 1 "so it could attest on another event or ref: \\[    if: .\\{\\{ github\\.ref == 'refs/heads/release-candidate' \\}\\}\\]\$" "/^  attest:\$/,/^  release_cache_prune:\$/s/^    if: \${{ github.event_name == 'push' && /    if: \${{ /" ''
+wlint W55-attest-if-or 1 "so it could attest on another event or ref: \\[    if: .\\{\\{ github\\.event_name == 'push' \\|\\| github\\.ref == 'refs/heads/release-candidate' \\}\\}\\]\$" "/^  attest:\$/,/^  release_cache_prune:\$/s/ && github.ref == 'refs\\/heads\\/release-candidate' }}\$/ || github.ref == 'refs\\/heads\\/release-candidate' }}/" ''
 wlint W56-attest-artifact-ids-another-output 1 "attest downloads by a needs output that is not an upload step's artifact id: \\[.\\{\\{ needs\\.version\\.outputs\\.tag \\}\\}\\]" 's/needs\.release_binary\.outputs\.mise-darwin-arm64-artifact-id/needs.version.outputs.tag/' ''
 wlint W57-attest-artifact-ids-literal 1 'attest downloads an artifact id that is not a needs output \(a literal or another expression\), so it need not be what this run uploaded: \[12345\]' 's/,\${{ needs\.release_binary\.outputs\.mise-linux-x64-artifact-id }},/,12345,/' ''
 wlint W58-attest-two-paths-in-one-step 1 'attest has an attest-build-provenance step that does not give one subject-path on its line, so a missing file might not fail it: \[- name: Attest the release notes\]' 's|^          subject-path: \${{ runner.temp }}/attest/release-notes/carry-notes.md$|          subject-path: \|\n            ${{ runner.temp }}/attest/release-notes/carry-notes.md\n            ${{ runner.temp }}/attest/mise-*/*.tar.gz|' ''
