@@ -139,57 +139,57 @@ afterEach(() => {
 });
 
 describe("older entry bodies and rewrite bodies by the temporary directory", () => {
-	// If this regresses, a session keeps its older bodies whole in memory, or every rewrite streams
-	// from the live entries, on a host whose store and spool directories are exactly as omp makes them.
-	it("use a file in a directory this account owns with mode 0700", async () => {
-		const { file, tmp } = await setUp({ mode: 0o700 });
-		const result = await probe("private", tmp, file);
-		const uid = process.getuid?.();
-		expect({
-			...result,
-			opened: result.opened.map(name => path.dirname(name)),
-		}).toEqual({
-			resumes: [
-				{ storeInMemory: false, coldEntries: 2, readsBack: true },
-				{ storeInMemory: false, coldEntries: 2, readsBack: true },
-			],
-			rewritesStored: [true, true],
-			opened: [`omp-cold-${uid}`, `omp-cold-${uid}`, `omp-spool-${uid}`, `omp-spool-${uid}`],
-			warnings: [],
-			underTmp: [`omp-cold-${uid}`, `omp-spool-${uid}`],
-		});
-		// Every file was unlinked as soon as it was open.
-		for (const name of result.underTmp) expect(fs.readdirSync(path.join(tmp, name))).toEqual([]);
-	}, 30_000);
+	// Each case here names its directories for the account id and checks them against it; the links of
+	// the linked case also need a privilege on Windows, which has no account id.
+	describe.skipIf(process.getuid === undefined)("where the account id can be read", () => {
+		// If this regresses, a session keeps its older bodies whole in memory, or every rewrite streams
+		// from the live entries, on a host whose store and spool directories are exactly as omp makes them.
+		it("use a file in a directory this account owns with mode 0700", async () => {
+			const { file, tmp } = await setUp({ mode: 0o700 });
+			const result = await probe("private", tmp, file);
+			const uid = process.getuid?.();
+			expect({
+				...result,
+				opened: result.opened.map(name => path.dirname(name)),
+			}).toEqual({
+				resumes: [
+					{ storeInMemory: false, coldEntries: 2, readsBack: true },
+					{ storeInMemory: false, coldEntries: 2, readsBack: true },
+				],
+				rewritesStored: [true, true],
+				opened: [`omp-cold-${uid}`, `omp-cold-${uid}`, `omp-spool-${uid}`, `omp-spool-${uid}`],
+				warnings: [],
+				underTmp: [`omp-cold-${uid}`, `omp-spool-${uid}`],
+			});
+			// Every file was unlinked as soon as it was open.
+			for (const name of result.underTmp) expect(fs.readdirSync(path.join(tmp, name))).toEqual([]);
+		}, 30_000);
 
-	// If this regresses, the store or the spool writes unmasked bodies into a directory whose mode omp
-	// did not set (owner-only but not 0700), or stops warning, or warns at every resume and rewrite.
-	it("keep the bodies in memory and stream the rewrites, warning once each, in an owner-only 0300 directory", async () => {
-		const { file, tmp } = await setUp({ mode: 0o300 });
-		expect(await probe("owner-only-0300", tmp, file)).toEqual(refusedDirs(process.getuid?.()));
-	}, 30_000);
+		// If this regresses, the store or the spool writes unmasked bodies into a directory whose mode omp
+		// did not set (owner-only but not 0700), or stops warning, or warns at every resume and rewrite.
+		it("keep the bodies in memory and stream the rewrites, warning once each, in an owner-only 0300 directory", async () => {
+			const { file, tmp } = await setUp({ mode: 0o300 });
+			expect(await probe("owner-only-0300", tmp, file)).toEqual(refusedDirs(process.getuid?.()));
+		}, 30_000);
 
-	// If this regresses, the store or the spool follows a link planted under the temporary directory
-	// and writes unmasked bodies into whatever directory it names, here one this account owns with
-	// mode 0700, so only the link itself is wrong.
-	it("keep the bodies in memory and stream the rewrites, warning once each, where the directories are links to 0700 directories of this account's", async () => {
-		const { file, tmp } = await setUp({ mode: 0o700, linked: true });
-		expect(await probe("linked", tmp, file)).toEqual(refusedDirs(process.getuid?.()));
-	}, 30_000);
+		// If this regresses, the store or the spool follows a link planted under the temporary directory
+		// and writes unmasked bodies into whatever directory it names, here one this account owns with
+		// mode 0700, so only the link itself is wrong.
+		it("keep the bodies in memory and stream the rewrites, warning once each, where the directories are links to 0700 directories of this account's", async () => {
+			const { file, tmp } = await setUp({ mode: 0o700, linked: true });
+			expect(await probe("linked", tmp, file)).toEqual(refusedDirs(process.getuid?.()));
+		}, 30_000);
 
-	// If this regresses, the store or the spool writes unmasked bodies into a directory another account
-	// made first under this account's name, which that account can read whatever its mode.
-	it.skipIf(process.getuid === undefined)(
-		"keep the bodies in memory and stream the rewrites, warning once each, in 0700 directories another account owns",
-		async () => {
+		// If this regresses, the store or the spool writes unmasked bodies into a directory another account
+		// made first under this account's name, which that account can read whatever its mode.
+		it("keep the bodies in memory and stream the rewrites, warning once each, in 0700 directories another account owns", async () => {
 			// The probe reads this account's id plus one as its own (`other-account`), so the directories
 			// named for that id, which this account makes, are another account's to it.
 			const other = (process.getuid?.() ?? 0) + 1;
 			const { file, tmp } = await setUp({ mode: 0o700, uid: other });
 			expect(await probe("other-account", tmp, file)).toEqual(refusedDirs(other));
-		},
-		30_000,
-	);
+		}, 30_000);
+	});
 
 	// If this regresses, a session where the account id cannot be read (Windows) writes its older
 	// bodies or its rewrites to files under the temporary directory, or logs a warning for a host
