@@ -883,13 +883,14 @@ pub fn suspend(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, sig: Signal) -> 
 	k.spawned.push(Box::new(job));
 	reclaim(k, cx, Some(jvpid), false);
 	// zsh `printjob`: a newline first after a `^Z` of the job itself
-	// (`doputnl`), not after a construct's.
+	// (`doputnl`), not after a construct's; bash's line has its own
+	// ([`notice_line`]).
 	let mut line = Vec::new();
-	if sig == Signal::Tstp && !construct {
+	if sig == Signal::Tstp && !construct && vp.mode.dialect() == Dialect::Zsh {
 		line.push(b'\n');
 	}
 	let how = JobLine { thisfmt: true, pid: long_list(k, cx, vp), ..JobLine::default() };
-	if let Some(text) = format_job(vp, number, how, platform) {
+	if let Some(text) = notice_line(k, cx, vp, number, how, platform) {
 		line.extend_from_slice(&text);
 	}
 	notice(k, vp, &line);
@@ -1085,17 +1086,17 @@ pub fn job_done(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, vpid: Vpid) {
 }
 
 /// [`report`] at any time under `notify` (zsh `update_job` from the
-/// `SIGCHLD` handler): while the line editor waits for a key the notice
-/// goes above the line it redraws.
+/// `SIGCHLD` handler; bash `set -b`): while the line editor waits for a key
+/// the notice goes above the line it redraws.
 fn report_async(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, number: u32, platform: Platform) {
 	let how = JobLine { pid: long_list(k, cx, vp), ..JobLine::default() };
-	if let Some(line) = format_job(vp, number, how, platform)
+	if let Some(line) = notice_line(k, cx, vp, number, how, platform)
 		&& super::zle::display::print_above(k, cx, vp, &line)
 	{
 		settle_report(vp, number);
 		return;
 	}
-	report(k, vp, number, platform, how);
+	report(k, cx, vp, number, platform, how);
 }
 
 /// zsh `LONG_LIST_JOBS`: job notices show the pid (`printjob`'s `lng`).
@@ -1104,10 +1105,59 @@ fn long_list(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 		&& state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Longlistjobs).unwrap_or(false)
 }
 
+/// Job `number`'s notice in `vp`'s dialect, for a job that stopped, or
+/// ended while not in the foreground. zsh: `printjob` ([`format_job`] with
+/// `how`). bash: `notify_of_job_status` with job control, the line `jobs`
+/// prints for the job (bash `pretty_print_job` with `JLIST_STANDARD`,
+/// [`super::builtins::jobs::job_line`]: how the job ended, from its signal
+/// and its processes, never from its status alone, so an exit with 137 is
+/// `Exit 137` and only a signal seen to end it is named), after a newline
+/// for a stop, then `(wd now: DIR)` when the shell's directory is not the
+/// one the job started in. `None` when there is no such job.
+pub fn notice_line(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	number: u32,
+	how: JobLine,
+	platform: Platform,
+) -> Option<Vec<u8>> {
+	if vp.mode.dialect() == Dialect::Zsh {
+		return format_job(vp, number, how, platform);
+	}
+	let posix = state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
+	let home = state::lookup(&k.root, cx.store, vp, b"HOME")
+		.ok()
+		.flatten()
+		.and_then(|v| v.as_scalar().map(BString::from));
+	let home = home.as_ref().map(|h| h.as_slice());
+	let show = super::builtins::jobs::Show { posix, home, platform };
+	let job = vp.jobs.get(number)?;
+	let mut line = Vec::new();
+	if matches!(job.state, JobState::Stopped(_)) {
+		line.push(b'\n');
+	}
+	line.extend_from_slice(&super::builtins::jobs::job_line(vp, number, false, &show)?);
+	if job.wd != vp.cwd {
+		line.extend_from_slice(b"(wd now: ");
+		line.extend_from_slice(&super::builtins::dirstack::polite(home, &vp.cwd, false));
+		line.extend_from_slice(b")\n");
+	}
+	Some(line)
+}
+
 /// Print job `number`'s changed state (zsh `printjob` from `scanjobs` or
-/// `update_job`) and forget it when it is done (`deletejob`).
-fn report(k: &Kernel, vp: &mut Vproc, number: u32, platform: Platform, how: JobLine) {
-	if let Some(line) = format_job(vp, number, how, platform) {
+/// `update_job`; bash `notify_of_job_status`: [`notice_line`]) and forget
+/// it when it is done (`deletejob`).
+fn report(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	number: u32,
+	platform: Platform,
+	how: JobLine,
+) {
+	if let Some(line) = notice_line(k, cx, vp, number, how, platform) {
 		notice(k, vp, &line);
 	}
 	settle_report(vp, number);
@@ -1189,7 +1239,7 @@ pub fn notices_before_prompt(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 		.collect();
 	let how = JobLine { pid: long_list(k, cx, vp), ..JobLine::default() };
 	for number in changed {
-		report(k, vp, number, platform, how);
+		report(k, cx, vp, number, platform, how);
 	}
 }
 
@@ -1507,12 +1557,14 @@ impl Shell {
 					if fg {
 						reclaim(&mut self.k, cx, Some(leader), false);
 						let mut line = Vec::new();
-						if sig == Signal::Tstp {
+						let zsh = self.procs[owner].mode.dialect() == Dialect::Zsh;
+						if sig == Signal::Tstp && zsh {
 							line.push(b'\n');
 						}
 						let pid = long_list(&mut self.k, cx, &self.procs[owner]);
 						let how = JobLine { thisfmt: true, pid, ..JobLine::default() };
-						if let Some(text) = format_job(&self.procs[owner], number, how, platform) {
+						let ovp = &self.procs[owner];
+						if let Some(text) = notice_line(&mut self.k, cx, ovp, number, how, platform) {
 							line.extend_from_slice(&text);
 						}
 						notice(&self.k, &mut self.procs[owner], &line);

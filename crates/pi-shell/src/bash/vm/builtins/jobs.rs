@@ -19,7 +19,7 @@ use crate::bash::{
 		exec::push_script,
 		expand::Stop,
 		jobctl, killed,
-		proc::{Job, JobLookup, JobProc, JobState, LastBg, ProcState, ScriptKind},
+		proc::{Job, JobLookup, JobProc, JobState, LastBg, ProcState, ScriptKind, Vproc},
 		quote,
 	},
 };
@@ -117,10 +117,13 @@ enum Form {
 }
 
 /// What `jobs` prints a line for besides its text.
-struct Show<'h> {
-	posix:    bool,
-	home:     Option<&'h [u8]>,
-	platform: Platform,
+pub struct Show<'h> {
+	/// `set -o posix` (`Done(N)`, `Stopped(SIGTSTP)`).
+	pub posix:    bool,
+	/// `$HOME`, for the `(wd: …)` note.
+	pub home:     Option<&'h [u8]>,
+	/// The signal numbers and descriptions.
+	pub platform: Platform,
 }
 
 /// One `jobs` entry for job `number` (bash `pretty_print_job`), marking the
@@ -142,10 +145,26 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 	if form == Form::Changed && job.notified {
 		return;
 	}
-	let long = form == Form::Long;
-	let mark = if ctx.vp.jobs.current == Some(number) {
+	if let Some(line) = job_line(ctx.vp, number, form == Form::Long, show) {
+		ctx.out(&line);
+	}
+	if let Some(job) = ctx.vp.jobs.get_mut(number) {
+		job.notified = true;
+	}
+}
+
+/// Job `number`'s `jobs` line (bash `pretty_print_job` with
+/// `JLIST_STANDARD`, or with `long` `JLIST_LONG`, one line for each of its
+/// processes): `[n]+  `, how it is ([`status_text`], from how the job and
+/// its processes ended, never from its status alone) padded to bash's
+/// column, then its command. Also the line of bash's notice of a job that
+/// stopped or ended in the background ([`jobctl::notice_line`]). `None`
+/// when there is no such job.
+pub fn job_line(vp: &Vproc, number: u32, long: bool, show: &Show<'_>) -> Option<Vec<u8>> {
+	let job = vp.jobs.get(number)?;
+	let mark = if vp.jobs.current == Some(number) {
 		'+'
-	} else if ctx.vp.jobs.previous == Some(number) {
+	} else if vp.jobs.previous == Some(number) {
 		'-'
 	} else {
 		' '
@@ -154,7 +173,7 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 	if job.state == JobState::Running {
 		tail.extend_from_slice(b" &");
 	}
-	if job.wd != ctx.vp.cwd {
+	if job.wd != vp.cwd {
 		tail.extend_from_slice(b"  (wd: ");
 		tail.extend_from_slice(&dirstack::polite(show.home, &job.wd, false));
 		tail.push(b')');
@@ -179,10 +198,7 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 	line.resize(line.len() + killed::padding(&status), b' ');
 	line.extend_from_slice(&text);
 	line.push(b'\n');
-	ctx.out(&line);
-	if let Some(job) = ctx.vp.jobs.get_mut(number) {
-		job.notified = true;
-	}
+	Some(line)
 }
 
 /// Forget finished jobs whose state was reported (bash

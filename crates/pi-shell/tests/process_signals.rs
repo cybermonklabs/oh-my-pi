@@ -1797,6 +1797,107 @@ fn an_interactive_bash_with_plus_m_still_does_job_control() -> io::Result<()> {
 	Ok(())
 }
 
+/// A screen row as [`an_interactive_bash_announces_a_job_as_jobs_lists_it`]
+/// compares it: a `^Z` the terminal echoed as a blank row, and a background
+/// job's `[n] PID` line with its pid as `PID`.
+fn job_row(row: &str) -> String {
+	if row == "^Z" {
+		return String::new();
+	}
+	match row.strip_prefix('[').and_then(|r| r.split_once("] ")) {
+		Some((n, pid)) if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) => {
+			format!("[{n}] PID")
+		},
+		_ => row.to_owned(),
+	}
+}
+
+/// An interactive bash with job control announces a job that stopped, or
+/// that ended in the background, before its next prompt as `jobs` lists it
+/// (bash `notify_of_job_status`: `pretty_print_job` with `JLIST_STANDARD`,
+/// a newline first for a stop): how the job ended, never read from its
+/// status alone, so a job that exited with 137 is `Exit 137`, and only a
+/// signal seen to end it is named (`Killed`). Three shells: `^Z` stops a
+/// foreground program (typed once the job holds the terminal; where the
+/// terminal's group cannot be read, the `TSTP` goes to the job's group,
+/// [`pty_support::Pty::signal_job`]); a background program exits with 137
+/// once the file `$F` exists; `kill -KILL` ends a background program. The
+/// next command waits until `jobs -r` lists no job, so the notice comes
+/// before the prompt after it. The rows from the first command on are
+/// compared ([`job_row`]) with the goldens, which follow bash 5.3's
+/// `jobs.c`, and live with a bash 5.3 or later ([`real_bash_golden`]).
+#[test]
+fn an_interactive_bash_announces_a_job_as_jobs_lists_it() -> io::Result<()> {
+	let wait = "while jobs -r >\"$F.r\"; [ -s \"$F.r\" ]; do /bin/sleep 0.01; done";
+	let exits = "/bin/sh -c 'until [ -e \"$F\" ]; do /bin/sleep 0.01; done; exit 137'";
+	let line = |status: &str, text: &str| format!("[1]+  {status:<27}{text}");
+	let killed = desc(libc::SIGKILL);
+	let stop = vec![String::new(), line("Stopped", "/bin/sleep 30"), String::from("P$")];
+	let exit = vec![
+		String::from("[1] PID"),
+		format!("P$ {wait}"),
+		line("Exit 137", exits),
+		String::from("P$"),
+	];
+	let kill_next = format!("kill -KILL %1; {wait}");
+	let kill = vec![
+		String::from("[1] PID"),
+		format!("P$ {kill_next}"),
+		line(&killed, "/bin/sleep 30"),
+		String::from("P$"),
+	];
+	let exit_first = format!("{exits} &");
+	// Each shell's first command, the next one (none after the stop), and
+	// the rows after the first command's.
+	let cases = [
+		("/bin/sleep 30", None, stop),
+		(exit_first.as_str(), Some(wait), exit),
+		("/bin/sleep 30 &", Some(kill_next.as_str()), kill),
+	];
+	for (first, next, want) in &cases {
+		let ours = Spawn::obash_as("bash");
+		let real = real_bash_golden().map(|bash| Spawn::new(bash).argv0("bash"));
+		let shells =
+			std::iter::once(("obash", ours)).chain(real.map(|spawn| ("the real shell", spawn)));
+		for (who, spawn) in shells {
+			let dir = tempfile::tempdir()?;
+			let file = dir.path().join("F");
+			let mut shell = spawn
+				.size(50, 200)
+				.args(["--norc", "--noprofile", "-i"])
+				.env("F", &file)
+				.env("PS1", "P$ ")
+				.spawn()?;
+			let prompts = |screen: &str| screen.lines().filter(|row| row.starts_with("P$")).count();
+			shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 1)?;
+			shell.write(format!("{first}\r"))?;
+			let mut at = 2;
+			if let Some(next) = next {
+				shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 2)?;
+				fs::write(&file, "")?;
+				shell.write(format!("{next}\r"))?;
+				at = 3;
+			} else if shell.wait_job_running(&["sleep"], TIMEOUT)? {
+				shell.write("\x1a")?;
+			} else {
+				shell.signal_job(&["sleep"], libc::SIGTSTP, TIMEOUT)?;
+			}
+			shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == at)?;
+			let screen = shell.screen().contents();
+			let typed = format!("P$ {first}");
+			let rows: Vec<String> = screen
+				.lines()
+				.skip_while(|row| *row != typed)
+				.skip(1)
+				.map(job_row)
+				.collect();
+			shell.write("kill -KILL %1\r")?;
+			assert_eq!(&rows, want, "{who}: {first}: {:?}", shell.output());
+		}
+	}
+	Ok(())
+}
+
 /// A subshell's notice names it by the pid the shell shows for it
 /// everywhere else: `$BASHPID` inside it, `$!` for its job (bash 5.3.20 and
 /// 5.2.21: its process's pid, compared live only with a bash 5.3 or later,
