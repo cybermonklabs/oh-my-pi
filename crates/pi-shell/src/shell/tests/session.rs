@@ -615,6 +615,29 @@ async fn one_shot_completion_aborts_internal_background_jobs() {
 	);
 }
 
+/// A one-shot session ends a background job that is just its program too:
+/// only the process shell (`obash`) leaves one running as it exits
+/// ([`Shell::release_lone_jobs`](crate::bash::Shell::release_lone_jobs)).
+#[tokio::test(flavor = "multi_thread")]
+async fn one_shot_completion_ends_a_background_program() {
+	let marker = tempfile::NamedTempFile::new().expect("marker file");
+	let marker_path = marker.path().to_string_lossy();
+	std::fs::remove_file(marker.path()).expect("remove initial marker");
+	let command = format!(r#"/bin/sh -c "sleep 1; echo leaked > {}" &"#, quote_arg(&marker_path));
+
+	execute_shell(
+		ShellExecuteOptions { command, ..Default::default() },
+		None,
+		CancelToken::default(),
+	)
+	.await
+	.expect("one-shot shell execution");
+	// As above: well past the job's 1 s sleep.
+	time::sleep(Duration::from_millis(2000)).await;
+
+	assert!(!marker.path().exists(), "a background program outlived its one-shot session");
+}
+
 /// A background builtin started in a subshell ends with the subshell, as an
 /// external one does. Left running it was out of reach — no process for
 /// `pkill`, no job for `kill %N` — and spun for the life of the host.

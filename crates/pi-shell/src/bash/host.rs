@@ -624,6 +624,13 @@ pub trait ExtProc: Send {
 	fn stop(&mut self) -> io::Result<()>;
 	/// Continue after [`ExtProc::stop`].
 	fn cont(&mut self) -> io::Result<()>;
+	/// The process shell leaves this process running as it exits
+	/// ([`Shell::release_lone_jobs`](crate::bash::Shell::release_lone_jobs)):
+	/// dropping the `ExtProc` afterwards signals nothing, as for a detached
+	/// ([`Lineage::detached`]) external, and whoever observes the exit reaps
+	/// it. The default does nothing: the process ends with the shell, as on
+	/// a host whose processes cannot outlive it.
+	fn release(&mut self) {}
 }
 
 /// Opens a [`PipeMirror`] per pipeline pipe ([`Host::pipe_tap`]).

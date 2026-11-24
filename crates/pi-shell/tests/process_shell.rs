@@ -124,10 +124,11 @@ fn command_strings_and_exit_statuses_match_zsh() {
 	}
 }
 
-/// A standalone shell abandons the externals still running when it exits:
-/// a background job without `nohup` gets `TERM` and is gone shortly after.
+/// A standalone shell leaves a background job that is just its program
+/// running when it exits, as bash and zsh do (it used to end it with
+/// `TERM`). The job is killed here once seen running.
 #[test]
-fn a_standalone_exit_ends_running_background_externals() {
+fn a_standalone_exit_leaves_a_background_program_running() {
 	let out = Command::new(env!("CARGO_BIN_EXE_obash"))
 		.args(["-c", "/bin/sleep 31 >/dev/null 2>&1 </dev/null & echo $!"])
 		.output()
@@ -138,12 +139,13 @@ fn a_standalone_exit_ends_running_background_externals() {
 		.trim()
 		.parse()
 		.expect("the job's pid");
-	let deadline = std::time::Instant::now() + TIMEOUT;
+	// Longer than the grace an abandoned external gets before `KILL`.
+	std::thread::sleep(std::time::Duration::from_secs(2));
 	// SAFETY: signal 0 only checks that the process exists.
-	while unsafe { libc::kill(pid, 0) } == 0 {
-		assert!(std::time::Instant::now() < deadline, "sleep {pid} still runs after obash exited");
-		std::thread::sleep(std::time::Duration::from_millis(20));
-	}
+	let alive = unsafe { libc::kill(pid, 0) } == 0;
+	// SAFETY: the pid is the job's `sleep`, which nothing else reaps.
+	unsafe { libc::kill(pid, libc::SIGKILL) };
+	assert!(alive, "sleep {pid} was ended when obash exited");
 }
 
 /// `$!` of a background pipeline is its last process's pid (zsh runs that

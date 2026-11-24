@@ -544,6 +544,10 @@ impl ExtProc for SignalsOnExit {
 	fn cont(&mut self) -> io::Result<()> {
 		self.child.cont()
 	}
+
+	fn release(&mut self) {
+		self.child.release();
+	}
 }
 
 /// The signals this process ignores now: call at startup, before any trap,

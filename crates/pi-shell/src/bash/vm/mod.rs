@@ -2568,6 +2568,74 @@ impl Shell {
 			.count()
 	}
 
+	/// Whether a background job that is just its external program
+	/// ([`Self::release_lone_jobs`]) has not started that program yet: the
+	/// root ran ahead of it. The process shell steps the shell until this is
+	/// false, or every vproc is blocked, before it releases them.
+	pub fn lone_jobs_starting(&self) -> bool {
+		self.procs.iter().any(|p| {
+			self.lone_job(p)
+				&& !matches!(p.frames[0].scratch.as_ref().map(|sc| &sc.live), Some(Live::Ext(_)))
+		})
+	}
+
+	/// The process shell is leaving (`obash`, `omp bash`): each background
+	/// job that is just its external program (`cmd &`, `nohup cmd &`; bash's
+	/// child `exec`s it, so the job is that process) keeps running, as bash
+	/// leaves its children running when it exits. Its [`ExtProc`] is
+	/// released ([`ExtProc::release`]), so dropping the shell does not end
+	/// it. In-engine work still ends with the shell: a job running commands
+	/// before its last one, a function, a loop, a pipeline, and what those
+	/// started. A session never calls this: its jobs end with it.
+	///
+	/// [`ExtProc`]: crate::bash::ExtProc
+	/// [`ExtProc::release`]: crate::bash::ExtProc::release
+	pub fn release_lone_jobs(&mut self) {
+		let jobs: Vec<Vpid> = self
+			.procs
+			.iter()
+			.filter(|p| self.lone_job(p))
+			.map(|p| p.vpid)
+			.collect();
+		for p in self.procs.iter_mut().filter(|p| jobs.contains(&p.vpid)) {
+			if let Some(sc) = p.frames[0].scratch.as_mut()
+				&& let Live::Ext(e) = &mut sc.live
+			{
+				e.release();
+			}
+		}
+	}
+
+	/// Whether `p` is a background job (its live parent lists it) that is
+	/// just its external program: a subshell vproc with no `EXIT` trap of
+	/// its own, whose one frame is at the `Exec` of its last command or of
+	/// one it `exec`s (bash's child `exec`s that program).
+	fn lone_job(&self, p: &Vproc) -> bool {
+		if !p.transient || p.own_traps.has(crate::bash::store::TrapKey::Exit) {
+			return false;
+		}
+		let [frame] = p.frames.as_slice() else {
+			return false;
+		};
+		let Some(unit) = frame.unit.as_ref() else {
+			return false;
+		};
+		let code_at = |pc: u32| unit.ops.get(pc as usize).map(|op| op.code);
+		let exec = frame
+			.scratch
+			.as_ref()
+			.and_then(|sc| sc.exec.as_ref())
+			.is_some_and(|e| e.exec_as.is_some());
+		code_at(frame.pc) == Some(ir::Opcode::Exec)
+			&& (exec || code_at(frame.pc + 1) == Some(ir::Opcode::SubExit))
+			&& p.parent.is_some_and(|parent| {
+				self
+					.procs
+					.iter()
+					.any(|q| q.vpid == parent && q.jobs.by_vpid(p.vpid).is_some())
+			})
+	}
+
 	/// Answer a [`Step::Call`]. Unknown ids (cancelled scripts) are ignored.
 	pub fn complete(&mut self, call: CallId, outcome: CallOutcome) {
 		if self.awaiting(call).is_some() {

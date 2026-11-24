@@ -66,9 +66,11 @@ pub struct ProcessOptions {
 	/// - teardown: the engine's caches and the variable store are freed before
 	///   [`main`] returns. Standalone, the process is about to exit, so that
 	///   memory is left to the OS; the shell itself (its externals, tasks and
-	///   descriptors) is torn down the same either way.
+	///   descriptors) is torn down the same either way, except a background job
+	///   that is just its program, left running as bash leaves it
+	///   ([`Shell::release_lone_jobs`]).
 	///
-	/// Nothing outlives the call: a second [`main`] in the same process
+	/// Nothing else outlives the call: a second [`main`] in the same process
 	/// starts from the same state.
 	pub embedded: bool,
 }
@@ -556,14 +558,19 @@ fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: Proce
 	let status = drive(&mut host, &mut store, &mut shell, run, root);
 	// zsh `zexit`: hang up running jobs, give the terminal back.
 	shell.leave_job_control(&mut Cx { host: &mut host, store: &mut store });
+	// bash leaves its children running when it exits: a background job that
+	// is just its program keeps running; in-engine work ends with the shell.
+	start_lone_jobs(&mut host, &mut store, &mut shell);
+	shell.release_lone_jobs();
 	// Standalone, the process exits next: let the OS reclaim the engine's
 	// unit cache and the store instead of freeing every cached unit,
 	// function and variable one by one (a quarter of a 100k-command
 	// script's run). Both are plain data. The shell still drops first: it
-	// owns the live externals (abandoning one signals its process group),
-	// task handles and the script's descriptors. Its `Arc` of the engine is
-	// not the last one, so dropping it frees no cache. Not under
-	// `alloc-stats`, whose `live=` count reads what is still allocated at exit.
+	// owns the live externals (abandoning one signals its process group; a
+	// released one runs on), task handles and the script's descriptors. Its
+	// `Arc` of the engine is not the last one, so dropping it frees no cache.
+	// Not under `alloc-stats`, whose `live=` count reads what is still
+	// allocated at exit.
 	drop(shell);
 	if !opts.embedded && !cfg!(feature = "alloc-stats") {
 		mem::forget(store);
@@ -883,6 +890,20 @@ pub fn drive(
 			Step::Yield => parker.poll_exits(),
 			Step::Done { .. } | Step::SuspendReady => {},
 			Step::Idle => return 0,
+		}
+	}
+}
+
+/// Let each background job that is just its program start it
+/// ([`Shell::lone_jobs_starting`]): step `shell` until none is still on
+/// its way, or every vproc waits (such a job then waits on something else,
+/// a command substitution, and is no lone program yet).
+fn start_lone_jobs(host: &mut NativeHost, store: &mut MemStore, shell: &mut Shell) {
+	while shell.lone_jobs_starting() {
+		match shell.step(&mut Cx { host: &mut *host, store: &mut *store }, Budget::default()) {
+			Step::Call { id, .. } => no_callouts(shell, id),
+			Step::Yield | Step::Done { .. } => {},
+			Step::Blocked | Step::Paused | Step::SuspendReady | Step::Idle => return,
 		}
 	}
 }
