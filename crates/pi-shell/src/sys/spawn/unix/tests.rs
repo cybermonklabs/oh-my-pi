@@ -1297,11 +1297,11 @@ fn waiting_open_holds_no_host_descriptor(sweep: Sweep) {
 	drop(writer);
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
-	let a = argv(&["/bin/true"]);
+	let a = argv(&["/usr/bin/true"]);
 	let mut sp = spec(&a, &env, NEW);
 	sp.redirs = Some(ChildRedirs {
 		list:      vec![child_open(&[0], &fifo, OpenFlags::READ)],
-		exec_diag: BString::from("test: /bin/true: "),
+		exec_diag: BString::from("test: /usr/bin/true: "),
 	});
 	super::force_sweep(sweep);
 	let spawned = s.spawn(sp);
@@ -1386,11 +1386,11 @@ fn a_number_reused_between_the_list_and_the_fork_is_not_kept() {
 	});
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
-	let a = argv(&["/bin/true"]);
+	let a = argv(&["/usr/bin/true"]);
 	let mut sp = spec(&a, &env, NEW);
 	sp.redirs = Some(ChildRedirs {
 		list:      vec![child_open(&[0], &fifo, OpenFlags::READ)],
-		exec_diag: BString::from("test: /bin/true: "),
+		exec_diag: BString::from("test: /usr/bin/true: "),
 	});
 	let mut p = s.spawn(sp).expect("spawn");
 	// SAFETY: `n` is this test's copy of the write end now, owned here.
