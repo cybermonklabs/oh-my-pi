@@ -1612,6 +1612,19 @@ fn an_interactive_bash_reports_a_foreground_job_a_signal_killed() -> io::Result<
 	Ok(())
 }
 
+/// A command line that runs `cmd`, then `jobs -l` into `file` until the list
+/// has `want.0` lines with `Running` and `want.1` with `stop` (a stop's
+/// description), at most 100 times 50 ms apart: a shell learns of a stop or
+/// a continue as it reaps the change, which can come after its next
+/// command (bash 5.3.20 on gVisor under load, once in 10 runs, after half a
+/// second).
+fn settled_jobs_l(cmd: &str, file: &str, want: (u32, u32), stop: &str) -> String {
+	let (running, stopped) = want;
+	let state = format!("\"$(grep -c Running {file}) $(grep -c '{stop}' {file})\"");
+	let until = format!("n=0; until jobs -l >{file}; [ {state} = '{running} {stopped}' ]");
+	format!("{cmd}; {until} || [ $n -ge 100 ]; do n=$((n + 1)); /bin/sleep 0.05; done")
+}
+
 /// With job control (an interactive bash), `jobs -l` shows each process of
 /// a pipeline job as it is (`print_pipeline` with `JLIST_LONG`; `waitchld`
 /// waits with `WUNTRACED` and `WCONTINUED`): once `kill -STOP` stopped its
@@ -1621,10 +1634,10 @@ fn an_interactive_bash_reports_a_foreground_job_a_signal_killed() -> io::Result<
 /// is stopped (`set_job_status_and_cleanup`): the first line shows the
 /// signal's description and the second, stopped by it too, nothing; `kill
 /// -CONT %1` runs the job again (`set_job_running`) and `kill -STOP %1`
-/// stops the whole of it. Each `jobs -l` goes into a file, its pids masked
-/// ([`mask_job_pids`], [`mask_stage_pids`]). The goldens follow bash 5.3's
-/// `jobs.c`, not measured; compared live with a bash 5.3 or later
-/// ([`real_bash_golden`]).
+/// stops the whole of it. Each `jobs -l` goes into a file once it shows the
+/// step's state ([`settled_jobs_l`]), its pids masked ([`mask_job_pids`],
+/// [`mask_stage_pids`]). The goldens follow bash 5.3's `jobs.c`, not
+/// measured; compared live with a bash 5.3 or later ([`real_bash_golden`]).
 #[test]
 fn an_interactive_jobs_l_shows_each_process_of_a_job_as_it_is() -> io::Result<()> {
 	let stopped = desc(libc::SIGSTOP);
@@ -1634,11 +1647,13 @@ fn an_interactive_jobs_l_shows_each_process_of_a_job_as_it_is() -> io::Result<()
 		let w = if status.is_empty() { 25 } else { 27 };
 		format!("     PID {status:<w$}| /bin/sleep 30{tail}\n")
 	};
+	// Each step's command, the lines of its list with `Running` and with the
+	// stop, and the list.
 	let steps = [
-		("kill -STOP $f", first("Running") + &second("Running", " &")),
-		("kill -STOP $!", first(stopped.as_str()) + &second("", "")),
-		("kill -CONT %1", first("Running") + &second("", " &")),
-		("kill -STOP %1", first(stopped.as_str()) + &second("", "")),
+		("kill -STOP $f", (2, 0), first("Running") + &second("Running", " &")),
+		("kill -STOP $!", (0, 1), first(stopped.as_str()) + &second("", "")),
+		("kill -CONT %1", (1, 0), first("Running") + &second("", " &")),
+		("kill -STOP %1", (0, 1), first(stopped.as_str()) + &second("", "")),
 	];
 	let ours = Spawn::obash_as("bash");
 	let real = real_bash_golden().map(|bash| Spawn::new(bash).argv0("bash"));
@@ -1662,13 +1677,13 @@ fn an_interactive_jobs_l_shows_each_process_of_a_job_as_it_is() -> io::Result<()
 		run(&mut shell, "/bin/sleep 30 | /bin/sleep 30 &")?;
 		run(&mut shell, "jobs -p >\"$F.p\"; read f <\"$F.p\"")?;
 		let mut lists = Vec::new();
-		for (i, (kill, _)) in steps.iter().enumerate() {
-			run(&mut shell, &format!("{kill}; /bin/sleep 0.5; jobs -l >\"$F.{i}\""))?;
+		for (i, (kill, counts, _)) in steps.iter().enumerate() {
+			run(&mut shell, &settled_jobs_l(kill, &format!("\"$F.{i}\""), *counts, &stopped))?;
 			let list = fs::read(dir.path().join(format!("F.{i}")))?;
 			lists.push(String::from_utf8_lossy(&mask_stage_pids(&mask_job_pids(&list))).into_owned());
 		}
 		run(&mut shell, "kill -KILL %1")?;
-		let want: Vec<&str> = steps.iter().map(|(_, want)| want.as_str()).collect();
+		let want: Vec<&str> = steps.iter().map(|(.., want)| want.as_str()).collect();
 		assert_eq!(lists, want, "{who}: {:?}", shell.output());
 	}
 	Ok(())
@@ -1679,16 +1694,20 @@ fn an_interactive_jobs_l_shows_each_process_of_a_job_as_it_is() -> io::Result<()
 /// a stage obash runs itself (`read x`, a builtin) too, as bash's process
 /// for it stops with the group; `bg` runs each of them again
 /// (`set_job_running`): `jobs -l` then shows the job running and its second
-/// process as its first (nothing). Its pids masked ([`mask_job_pids`],
+/// process as its first (nothing), once it shows the job running
+/// ([`settled_jobs_l`]). Its pids masked ([`mask_job_pids`],
 /// [`mask_stage_pids`]). The golden follows bash 5.3's `jobs.c`; bash
 /// 5.3.20 printed it on runc in a builds Job, and it is compared live with
-/// a bash 5.3 or later ([`real_bash_golden`]). The test sends the `TSTP` to
-/// the job's group itself once `fg` printed the job
-/// ([`pty_support::Pty::signal_job`]): gVisor does not tell the terminal's
-/// foreground group.
+/// a bash 5.3 or later ([`real_bash_golden`]). The `^Z` is typed once the
+/// job runs in the terminal's foreground group, so it stops the job only if
+/// `fg` gave the job the terminal ([`pty_support::Pty::wait_job_running`]).
+/// Where that group cannot be read (gVisor answers `TIOCGPGRP` on the
+/// master with `ENOTTY`), the test sends the `TSTP` to the job's group
+/// itself ([`pty_support::Pty::signal_job`]), which does not check that.
 #[test]
 fn an_interactive_bg_runs_each_process_of_a_stopped_job_again() -> io::Result<()> {
 	let want = format!("[1]+ PID {:<27}/bin/sleep 30\n     PID {:<25}| read x &\n", "Running", "");
+	let stopped = desc(libc::SIGSTOP);
 	let ours = Spawn::obash_as("bash");
 	let real = real_bash_golden().map(|bash| Spawn::new(bash).argv0("bash"));
 	let shells = std::iter::once(("obash", ours)).chain(real.map(|spawn| ("the real shell", spawn)));
@@ -1706,16 +1725,74 @@ fn an_interactive_bg_runs_each_process_of_a_stopped_job_again() -> io::Result<()
 		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 2)?;
 		shell.write("fg\r")?;
 		shell.wait_screen(TIMEOUT, |s| s.contents().ends_with("/bin/sleep 30 | read x"))?;
-		shell.signal_job(&["sleep"], libc::SIGTSTP, TIMEOUT)?;
+		if shell.wait_job_running(&["sleep"], TIMEOUT)? {
+			shell.write("\x1a")?;
+		} else {
+			shell.signal_job(&["sleep"], libc::SIGTSTP, TIMEOUT)?;
+		}
 		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 3)?;
 		shell.write("bg\r")?;
 		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 4)?;
-		shell.write("/bin/sleep 0.5; jobs -l >\"$F\"\r")?;
+		let list = settled_jobs_l(":", "\"$F\"", (1, 0), &stopped);
+		shell.write(format!("{list}\r"))?;
 		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 5)?;
 		let list = fs::read(dir.path().join("F"))?;
 		let list = String::from_utf8_lossy(&mask_stage_pids(&mask_job_pids(&list))).into_owned();
 		shell.write("kill -KILL %1\r")?;
 		assert_eq!(list, want, "{who}: {:?}", shell.output());
+	}
+	Ok(())
+}
+
+/// A command-line `+m` leaves job control on in an interactive bash: it only
+/// declines to force job control on, and an interactive shell takes the
+/// terminal whatever the flag says (bash `initialize_job_control
+/// (jobs_m_flag)`). So `$-` holds `m`, `fg` resumes a job, and the job `fg`
+/// resumed that a `KILL` ended gets its row, as with `-i` alone
+/// ([`an_interactive_bash_reports_a_foreground_job_a_signal_killed`]). bash
+/// 5.3.20 and 5.2.21 do so on a pty; compared live with a bash 5.3 or later
+/// ([`real_bash_golden`]).
+#[test]
+fn an_interactive_bash_with_plus_m_still_does_job_control() -> io::Result<()> {
+	let killed = desc(libc::SIGKILL);
+	let job = "/bin/sh -c 'until [ -e \"$F\" ]; do /bin/sleep 0.01; done; kill -KILL $$'";
+	let ours = Spawn::obash_as("bash");
+	let real = real_bash_golden().map(|bash| Spawn::new(bash).argv0("bash"));
+	let shells = std::iter::once(("obash", ours)).chain(real.map(|spawn| ("the real shell", spawn)));
+	for (who, spawn) in shells {
+		let dir = tempfile::tempdir()?;
+		let file = dir.path().join("F");
+		let mut shell = spawn
+			.size(50, 200)
+			.args(["--norc", "--noprofile", "-i", "+m"])
+			.env("F", &file)
+			.env("PS1", "P$ ")
+			.spawn()?;
+		let prompts = |screen: &str| screen.lines().filter(|row| row.starts_with("P$")).count();
+		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 1)?;
+		let check = "case $- in *m*) echo monitor on;; *) echo monitor off;; esac";
+		shell.write(format!("{check}\r"))?;
+		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 2)?;
+		shell.write(format!("{job} &\r"))?;
+		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 3)?;
+		shell.write("fg\r")?;
+		// Without job control `fg` fails at once, and the next prompt shows.
+		shell.wait_screen(TIMEOUT, |s| {
+			let screen = s.contents();
+			screen.ends_with(job) || prompts(screen.as_str()) == 4
+		})?;
+		fs::write(&file, "")?;
+		shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 4)?;
+		let screen = shell.screen().contents();
+		// The `n` rows after the row that shows `typed`.
+		let after = |typed: &str, n: usize| {
+			let rows = screen.lines().skip_while(|row| *row != typed).skip(1);
+			rows.take(n).map(str::to_owned).collect::<Vec<_>>()
+		};
+		let got = (after(&format!("P$ {check}"), 1), after("P$ fg", 3));
+		let fg_rows = vec![job.to_owned(), format!("{killed:<27}{job}"), String::from("P$")];
+		let want = (vec![String::from("monitor on")], fg_rows);
+		assert_eq!(got, want, "{who}: {:?}", shell.output());
 	}
 	Ok(())
 }

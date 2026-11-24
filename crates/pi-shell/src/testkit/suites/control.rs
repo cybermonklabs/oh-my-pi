@@ -3,7 +3,9 @@
 use crate::{
 	bash::{
 		Budget, Cx, Engine, EngineConfig, Incompatibility, MemStore, RestoreError, RestoreOpts,
-		RunId, Script, Shell, SigTarget, Signal, StateStore, Step, ir::IR_VERSION, store::BlobSlot,
+		RunId, Script, Shell, SigTarget, Signal, StateStore, Step,
+		ir::IR_VERSION,
+		store::{BlobSlot, Change, Key, Table},
 	},
 	testkit::{
 		FakeHost, Fault, Rig,
@@ -233,13 +235,12 @@ const OLD_ROOT_JOBS_STORE: &[u8] = include_bytes!("../fixtures/frames/c55f78f6_r
 /// are in the store's own records, which keep their layout (what came later
 /// is a record of its own, [`crate::bash::store::Record::JobFacts`]). Its
 /// frames are refused; with `drop_frames` it restores, the run abandoned,
-/// the variable kept, job 1 lost (137, as `KILL` ended it) and job 2 as
-/// `KILL` ended it: a finished job whose facts do not say how it ended
-/// reads as its status says ([`crate::bash::store::Job::set_facts`]). So
-/// the next run's first line reports both, in job order, as bash reports a
-/// background job `KILL` ended (a notice on standard error, as
-/// [`a_root_jobs_signal_outlives_a_store_image`] reports one), and `jobs`
-/// lists neither.
+/// the variable kept, job 1 lost (137) and job 2 done with 137, and `jobs`
+/// lists both as `Exit 137`, with no notice. Neither has a signal recorded:
+/// obash did not see job 1 end, and job 2's store kept only its status,
+/// which does not say that a signal ended it
+/// ([`crate::bash::store::Job::set_facts`]); `Killed` would claim a signal
+/// nobody saw.
 #[test]
 fn an_older_store_whose_root_has_jobs_restores() {
 	let engine = Engine::new(EngineConfig::default());
@@ -268,23 +269,55 @@ fn an_older_store_whose_root_has_jobs_restores() {
 	let budget = Budget::default();
 	assert_eq!(advance(&mut shell, &mut host, &mut store, RunId(1), budget), Stop::Done(255));
 	assert_eq!(advance(&mut shell, &mut host, &mut store, next, budget), Stop::Done(0));
-	let killed = Signal::Kill.description(EngineConfig::default().platform);
-	let tail = format!(" {killed:<27}{{ while :; do\n    :;\ndone; }}\n");
-	let err = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
-	let pids: Vec<Option<u32>> = err
-		.split("bash: line 1: ")
-		.skip(1)
-		.map(|notice| {
-			notice
-				.strip_suffix(tail.as_str())
-				.and_then(|p| p.trim().parse().ok())
-		})
-		.collect();
-	assert!(
-		err.starts_with("bash: line 1: ") && pids.len() == 2 && pids.iter().all(Option::is_some),
-		"{err:?}"
+	let text = "{ while :; do\n    :;\ndone; }";
+	let exited = "Exit 137";
+	assert_eq!(
+		String::from_utf8_lossy(&host.stdout.bytes()),
+		format!("kept\n[1]-  {exited:<27}{text}\n[2]+  {exited:<27}{text}\nend\n")
 	);
-	assert_eq!(String::from_utf8_lossy(&host.stdout.bytes()), "kept\nend\n");
+	assert_eq!(String::from_utf8_lossy(&host.stderr.bytes()), "");
+}
+
+/// A root job that exited with 137, restored from a store that holds no
+/// facts for it, as a store written before the job's signal was kept holds
+/// none (the store's image, `MemStore::to_bytes` and `from_bytes`, with
+/// each [`crate::bash::store::Record::JobFacts`] deleted): `jobs` lists it
+/// as `Exit 137`, with no notice. Its status alone does not say that a
+/// signal ended it, and `Killed` would claim a signal nobody saw.
+#[test]
+fn an_older_stores_job_that_ended_with_137_lists_exit_137() {
+	let mut r = rig();
+	let job = format!("{{ exit 137; }} & {NONE_RUNNING}");
+	r.run(Script::command(job.as_bytes()), Fault::None);
+	r.snapshot();
+	let mut store = MemStore::from_bytes(&r.store.to_bytes()).expect("the store image decodes");
+	let mut facts = Vec::new();
+	store
+		.scan(Table::JobFacts, &mut |key, _| {
+			if let Key::JobFacts(id) = key {
+				facts.push(id);
+			}
+		})
+		.expect("scan the job facts");
+	for id in facts {
+		store
+			.apply(Change::Del(Key::JobFacts(id)))
+			.expect("delete the job facts");
+	}
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let (mut shell, _) = Shell::restore(
+		&engine,
+		&mut Cx { host: &mut host, store: &mut store },
+		RestoreOpts::default(),
+	)
+	.expect("restore");
+	let next = shell.submit(Script::command(&b"jobs"[..]));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, next, Budget::default()), Stop::Done(0));
+	let out = String::from_utf8_lossy(&host.stdout.bytes()).into_owned();
+	let err = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+	let listed = format!("[1]+  {:<27}{{ exit 137; }}\n", "Exit 137");
+	assert_eq!((out, err), (listed, String::new()));
 }
 
 /// The signal that ended a root job outlives a store image
@@ -337,10 +370,8 @@ const NONE_RUNNING: &str = "n=0; while jobs -r >/tmp/running; [ -s /tmp/running 
 
 /// How a root job ended outlives a store image (`MemStore::to_bytes`,
 /// `from_bytes`) and a restore: one that exited with 137 is still listed as
-/// `Exit 137`, with no notice ([`crate::bash::store::JobFact::Exited`]), not
-/// as the death by `KILL` that a status of 137 names in a store written
-/// before the job's signal was kept
-/// ([`an_older_store_whose_root_has_jobs_restores`]). bash 5.3.20 lists
+/// `Exit 137`, with no notice (it has no signal recorded,
+/// [`crate::bash::store::Job::signal`]). bash 5.3.20 lists
 /// `{ exit 137; } &` as `Exit 137`.
 #[test]
 fn a_root_jobs_exit_with_137_outlives_a_store_image() {
@@ -356,8 +387,8 @@ fn a_root_jobs_exit_with_137_outlives_a_store_image() {
 }
 
 /// How a subshell's job ended outlives every snapshot of a run (a
-/// subshell's job table is in the frames image, its jobs' facts beside it:
-/// [`crate::bash::store::JobFact::Exited`] for an exit above 128): under
+/// subshell's job table is in the frames image, its jobs' facts beside it;
+/// a job that exited has no signal recorded): under
 /// `Fault::Snapshot { every: 1 }` the subshell's `jobs` lists the job that
 /// exited with 137 as the uninterrupted run does, as `Exit 137`.
 #[test]

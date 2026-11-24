@@ -41,7 +41,7 @@ use hashbrown::{DefaultHashBuilder, HashTable};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::bash::{
-	ids::{JobId, ModeId, Platform, UnitId, Vpid},
+	ids::{JobId, ModeId, UnitId, Vpid},
 	signal::Signal,
 	zshopt::{ZshOpt, ZshOpts},
 };
@@ -590,10 +590,12 @@ pub struct Job {
 	/// process whose end is its status ([`JobProcs::status_process`]). With
 	/// the status it is how the job ended, which `jobs`, the notices and
 	/// `wait` read: a status alone does not tell an exit with 137 from a
-	/// death by `KILL` ([`JobFact::Exited`]). Not part of this record's layout,
-	/// which a store written before it was kept must still decode: the store
-	/// keeps it in the job's [`Record::JobFacts`] ([`Job::facts`]), the frames
-	/// image next to a subshell's job table.
+	/// death by `KILL`, so a finished job with no signal recorded exited
+	/// (`Exit 137`), never `Killed`, which would claim a signal nobody saw.
+	/// Not part of this record's layout, which a store written before it was
+	/// kept must still decode: the store keeps it in the job's
+	/// [`Record::JobFacts`] ([`Job::facts`]), the frames image next to a
+	/// subshell's job table.
 	#[serde(skip)]
 	pub signal:    Option<Signal>,
 	/// The job's processes (bash's job's `PROCESS` list), when it has
@@ -720,22 +722,13 @@ impl Job {
 		if let Some(procs) = &self.procs {
 			facts.push(JobFact::Procs((**procs).clone()));
 		}
-		if self.exited_above_128() {
-			facts.push(JobFact::Exited);
-		}
 		facts
-	}
-
-	/// The job exited with a status above 128, and no signal ended it
-	/// ([`JobFact::Exited`]), as [`Self::ended`] left it.
-	const fn exited_above_128(&self) -> bool {
-		self.signal.is_none() && matches!(self.state, JobState::Done(status) if status > 128)
 	}
 
 	/// Whether the job has any facts ([`Job::facts`]). A job's facts never
 	/// go: a job that had some has some.
 	pub const fn has_facts(&self) -> bool {
-		self.signal.is_some() || self.procs.is_some() || self.exited_above_128()
+		self.signal.is_some() || self.procs.is_some()
 	}
 
 	/// Whether `have` are this job's facts ([`Job::facts`]), compared in
@@ -749,41 +742,21 @@ impl Job {
 				.procs
 				.as_deref()
 				.is_none_or(|procs| matches!(have.next(), Some(JobFact::Procs(p)) if p == procs))
-			&& (!self.exited_above_128() || have.next() == Some(&JobFact::Exited))
 			&& have.next().is_none()
 	}
 
 	/// Take `facts` ([`Job::facts`]) back; what they do not name is unset. A
-	/// finished job with a status above 128 whose facts name neither the
-	/// signal that ended it nor [`JobFact::Exited`] comes from a store
-	/// written before the job's signal was kept, whose `jobs` read such a
-	/// status as a death by the signal 128 + n: it reads so here too (by
-	/// `platform`'s numbers), or as its processes say when it has them
-	/// ([`JobProcs::signal`]).
-	pub fn set_facts(&mut self, facts: &[JobFact], platform: Platform) {
+	/// finished job whose facts name no signal exited, also one from a store
+	/// written before the job's signal was kept (a status of 137 lists as
+	/// `Exit 137`): no signal was seen to end it.
+	pub fn set_facts(&mut self, facts: &[JobFact]) {
 		self.signal = None;
 		self.procs = None;
-		let mut exited = false;
 		for fact in facts {
 			match fact {
 				JobFact::Signal(sig) => self.signal = Some(*sig),
 				JobFact::Procs(procs) => self.procs = Some(Box::new(procs.clone())),
-				JobFact::Exited => exited = true,
 			}
-		}
-		if let JobState::Done(status) = self.state
-			&& status > 128
-			&& self.signal.is_none()
-			&& !exited
-		{
-			self.signal = self.procs.as_deref().map_or_else(
-				|| {
-					u8::try_from(status - 128)
-						.ok()
-						.and_then(|n| Signal::from_number(n, platform))
-				},
-				JobProcs::signal,
-			);
 		}
 	}
 
@@ -854,12 +827,6 @@ pub enum JobFact {
 	Signal(Signal),
 	/// [`Job::procs`].
 	Procs(JobProcs),
-	/// The job exited with a status above 128 ([`JobState::Done`]), and no
-	/// signal ended it ([`Job::signal`] unset): an exit with 137 is no death
-	/// by `KILL`. Kept so that a job with neither this nor
-	/// [`Self::Signal`] is known to come from a store written before
-	/// [`Job::signal`] was kept ([`Job::set_facts`]).
-	Exited,
 }
 
 /// The processes of a job that has several (bash's job's `PROCESS` list).

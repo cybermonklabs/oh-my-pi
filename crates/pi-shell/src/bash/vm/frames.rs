@@ -57,7 +57,7 @@ use crate::bash::{
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
 /// a variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 41;
+pub const FRAMES_VERSION: u32 = 42;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -875,12 +875,10 @@ impl Shell {
 				vp.status = f.status;
 				vp.pipestatus = f.pipestatus;
 				vp.jobs = f.jobs;
-				// A job the image holds no facts for has none
-				// ([`crate::bash::store::Job::set_facts`]).
-				let platform = engine.config().platform;
-				for job in &mut vp.jobs.list {
-					let facts = f.job_facts.iter().find(|(id, _)| *id == job.id);
-					job.set_facts(facts.map_or(&[][..], |(_, facts)| facts.as_slice()), platform);
+				for (id, facts) in &f.job_facts {
+					if let Some(job) = vp.jobs.list.iter_mut().find(|j| j.id == *id) {
+						job.set_facts(facts);
+					}
 				}
 				vp.last_bg = f.last_bg;
 				vp.getopts = f.getopts;
@@ -1118,11 +1116,12 @@ impl Shell {
 	}
 
 	/// Restored without frames: a child vproc the store lists as running has
-	/// no execution position; it is lost (status 137, its job done as one
-	/// `KILL` ended, [`super::proc::Job::ended`]: `jobs` shows it `Killed`,
-	/// a [`Lost::Vproc`] entry). Records of children of vprocs that are gone
-	/// (subshells' children) are dropped, and so are the root's function
-	/// scopes (the calls they belonged to are gone).
+	/// no execution position; it is lost (status 137, its job done with no
+	/// signal recorded, [`super::proc::Job::ended`]: obash did not see how it
+	/// ended, so `jobs` shows `Exit 137`, never `Killed`; a [`Lost::Vproc`]
+	/// entry). Records of children of vprocs that are gone (subshells'
+	/// children) are dropped, and so are the root's function scopes (the
+	/// calls they belonged to are gone).
 	fn lose_running(
 		&mut self,
 		cx: &mut Cx<'_>,
@@ -1144,7 +1143,7 @@ impl Shell {
 				report.lost.push(Lost::Vproc { vpid });
 				self.k.proc_exited(cx.store, vpid, parent, 137);
 				if let Some(job) = self.procs[0].jobs.by_vpid_mut(vpid) {
-					job.ended(137, Some(crate::bash::signal::Signal::Kill));
+					job.ended(137, None);
 				}
 			}
 		}

@@ -350,7 +350,6 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				unreaped:  false,
 			}),
 		),
-		(KeyBuf::JobFacts(JobId(3)), Record::JobFacts(vec![JobFact::Exited])),
 		(
 			KeyBuf::Job(JobId(4)),
 			Record::Job(Job {

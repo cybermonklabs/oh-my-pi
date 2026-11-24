@@ -1773,12 +1773,6 @@ impl Shell {
 			.env
 			.iter()
 			.any(|(n, _)| matches!(n.as_slice(), b"POSIXLY_CORRECT" | b"POSIX_PEDANTIC"));
-		// bash `-i`: job control is on (`set -m`) unless the command line
-		// turns it off; [`jobctl::init_io`] turns it off again when there is
-		// no terminal to take over.
-		if !zsh && init.interactive {
-			k.root.set_option(cx.store, OptId::Monitor, true);
-		}
 		// A zsh-dialect shell's options are zsh's, applied once its root vproc
 		// exists (below).
 		let mut zsh_options = Vec::new();
@@ -1800,6 +1794,14 @@ impl Shell {
 		if posix {
 			k.root.set_option(cx.store, OptId::Posix, true);
 			k.root.set_option(cx.store, OptId::ExpandAliases, true);
+		}
+		// bash `-i`: job control is on (`set -m`), also after a command-line
+		// `+m`, which only declines to force it on (bash
+		// `initialize_job_control (jobs_m_flag)`: an interactive shell takes
+		// the terminal whatever the flag says); [`jobctl::init_io`] turns it
+		// off again when there is no terminal to take over.
+		if !zsh && init.interactive {
+			k.root.set_option(cx.store, OptId::Monitor, true);
 		}
 		state::init_option_vars(&mut k.root, cx.store)?;
 		k.root
