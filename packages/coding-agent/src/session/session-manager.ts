@@ -6253,7 +6253,7 @@ export class SessionManager {
 	 * manager's storage, when this manager does not write it now: a session a work pool's spawn
 	 * records are in, after its owner went on in another one. See {@link appendCustomEntriesToFile}.
 	 * Resolves "refused", and writes nothing, once this session stopped under
-	 * `OMP_SESSION_EXCLUSIVE=1`: the process ends, and nothing of it writes after the stop.
+	 * `OMP_SESSION_EXCLUSIVE=1`: the process ends, and nothing of this session writes after the stop.
 	 */
 	appendCustomEntriesToSession(
 		sessionId: string,

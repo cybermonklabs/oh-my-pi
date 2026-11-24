@@ -613,6 +613,28 @@ function subagentHeader(): string {
 	return `${JSON.stringify(header)}\n`;
 }
 
+/**
+ * Have `manager` append a turn when `storage` first reads `target`, as a switch's load does: the turn lands in the
+ * session the switch leaves, while it loads. Returns how many turns it appended so far.
+ */
+function appendWhenLoading(storage: SqlSessionStorage, target: string, manager: SessionManager): () => number {
+	const readText = storage.readText.bind(storage);
+	let appended = 0;
+	Object.defineProperty(storage, "readText", {
+		value: (file: string) => {
+			if (appended === 0 && path.resolve(file) === path.resolve(target)) {
+				appended++;
+				manager.appendMessage(userTurn("appended while the switch loads"));
+			}
+			return readText(file);
+		},
+	});
+	return () => appended;
+}
+
+/** The rejection of a switch that a stop of the session `ID` refused, whatever the stop's reason. */
+const SWITCH_REFUSED = new RegExp(`^Session ${ID} stops \\([a-z-]+\\): .* so it opens no other session\\.$`);
+
 for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 	describe.skipIf(!url)(`a sealed subagent transcript under a parent another holder took over (${adapter})`, () => {
 		for (const variable of [false, true]) {
@@ -775,6 +797,59 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			release();
 		}, 60_000);
 	});
+
+	describe.skipIf(!url)(`a switch whose load meets an OMP_SESSION_EXCLUSIVE=1 stop (${adapter})`, () => {
+		it("refuses before it sets the new file: the stopped session stays the manager's, and none is left", async () => {
+			// If this fails, a turn appended while the switch loads, which lands in the session it leaves, met the fence
+			// after the earlier checks: the switch sets the other file, records the stopped session as left, and flush
+			// and close judge the other session, though the turn is stored nowhere.
+			using _exclusive = exclusive();
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const hold = holdClaimRelease(storage);
+			const file = sessionFile(db);
+			const otherFile = path.join(path.dirname(file), `2026-11-17T00-00-00-000Z_${OTHER_ID}.jsonl`);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.writeText(otherFile, transcript(OTHER_ID, "another session"));
+			await storage.drain();
+			const manager = await resume(storage, file);
+			const before = await db.row(file);
+			const release = await takeOver(db, file);
+			// The switch's load reads the other session: the turn appended then is the first write since the takeover.
+			const appendedDuringLoad = appendWhenLoading(storage, otherFile, manager);
+
+			const switched = await outcome(manager.setSessionFile(otherFile));
+			const flushed = await outcome(manager.flush());
+			const sync = syncOutcome(manager);
+			const closed = await outcome(manager.close());
+
+			const stop = expect.stringContaining(`Session ${ID} stops (open-elsewhere)`);
+			expect({
+				appendedDuringLoad: appendedDuringLoad(),
+				switched,
+				flushed,
+				sync,
+				closed,
+				stopped: hold.reached,
+				file: manager.getSessionFile(),
+				id: manager.getSessionId(),
+				left: manager.getLeftSessions(),
+				untouched: Bun.deepEquals(await db.row(file), before),
+			}).toEqual({
+				appendedDuringLoad: 1,
+				switched: expect.stringMatching(SWITCH_REFUSED),
+				flushed: stop,
+				sync: stop,
+				closed: stop,
+				stopped: true,
+				file,
+				id: ID,
+				left: [],
+				untouched: true,
+			});
+			release();
+		}, 60_000);
+	});
 }
 
 for (const { adapter, url } of LEASE_BACKENDS) {
@@ -825,6 +900,62 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 				stopped: true,
 				claimedElsewhere: false,
 				file,
+				untouched: true,
+			});
+		}, 60_000);
+	});
+
+	describe.skipIf(!url)(`a switch whose load meets a replaced file under OMP_SESSION_EXCLUSIVE=1 (${adapter})`, () => {
+		it("refuses before it sets the new file: the stopped session stays the manager's, and none is left", async () => {
+			// If this fails, a turn appended while the switch loads, which lands in the session it leaves, met the other
+			// session an older build put over the file after the earlier checks: the switch sets the other file,
+			// records the stopped session as left, and flush and close judge the other session.
+			using _exclusive = exclusive();
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const hold = holdClaimRelease(storage);
+			const file = sessionFile(db);
+			const otherFile = path.join(path.dirname(file), `2026-11-17T00-00-00-000Z_${OTHER_ID}.jsonl`);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.writeText(otherFile, transcript(OTHER_ID, "another session"));
+			await storage.drain();
+			const manager = await resume(storage, file);
+			manager.appendMessage(userTurn("stored before the change"));
+			await manager.flush();
+			const replacement = transcript("01a1f700-0000-7000-8000-0000000000d5", "another session");
+			const older = await db.open({ claims: false });
+			await older.writeText(file, replacement);
+			await older.drain();
+			// The switch's load reads the other session: the turn appended then is the first write to meet the change.
+			const appendedDuringLoad = appendWhenLoading(storage, otherFile, manager);
+
+			const switched = await outcome(manager.setSessionFile(otherFile));
+			const flushed = await outcome(manager.flush());
+			const sync = syncOutcome(manager);
+			const closed = await outcome(manager.close());
+
+			const stop = expect.stringContaining(`Session ${ID} stops (`);
+			expect({
+				appendedDuringLoad: appendedDuringLoad(),
+				switched,
+				flushed,
+				sync,
+				closed,
+				stopped: hold.reached,
+				file: manager.getSessionFile(),
+				id: manager.getSessionId(),
+				left: manager.getLeftSessions(),
+				untouched: (await db.row(file))?.content === replacement,
+			}).toEqual({
+				appendedDuringLoad: 1,
+				switched: expect.stringMatching(SWITCH_REFUSED),
+				flushed: stop,
+				sync: stop,
+				closed: stop,
+				stopped: true,
+				file,
+				id: ID,
+				left: [],
 				untouched: true,
 			});
 		}, 60_000);
