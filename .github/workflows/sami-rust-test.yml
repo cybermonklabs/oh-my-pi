@@ -417,9 +417,11 @@ jobs:
       # need places only root can make: a tmpfs, which the runner's user can
       # write, mounted inside a directory that user owns; a file bind-mounted
       # inside another; and an empty directory another user (65534) owns
-      # that the runner's user can write. They go under /mnt/reflink/tmp,
-      # which the tests' sandbox can write, and the test step passes their
-      # names on to the tests (--test_env).
+      # that the runner's user can write, in a directory root owns, so an
+      # add cannot put a directory of its own in its place (in run
+      # 45325297653 its parent was the runner's, and the add made it
+      # again). They go under /mnt/reflink/tmp, and the test step passes
+      # their names on to the tests (--test_env).
       - name: The places pi-vcs's ignored tests need
         shell: bash
         run: |
@@ -429,14 +431,15 @@ jobs:
           echo 'a file of someone else' >"$base/sources/file"
           : >"$base/file-tree/mounted"
           sudo mount --bind "$base/sources/file" "$base/file-tree/mounted"
-          sudo install -d -o 65534 -g 65534 -m 0777 "$base/foreign-empty"
+          sudo install -d -o root -g root -m 0755 "$base/foreign"
+          sudo install -d -o 65534 -g 65534 -m 0777 "$base/foreign/empty"
           findmnt "$base/mount-tree/m"
           findmnt "$base/file-tree/mounted"
-          ls -ld "$base/foreign-empty"
+          ls -ld "$base/foreign" "$base/foreign/empty"
           {
             echo "PI_VCS_TEST_MOUNT_POINT=$base/mount-tree/m"
             echo "PI_VCS_TEST_MOUNTED_FILE=$base/file-tree/mounted"
-            echo "PI_VCS_TEST_FOREIGN_EMPTY_DIR=$base/foreign-empty"
+            echo "PI_VCS_TEST_FOREIGN_EMPTY_DIR=$base/foreign/empty"
           } >>"$GITHUB_ENV"
       # sdk/rust/omp-rpc's two #[ignore]d smoke tests run the repository's
       # omp server (`bun packages/coding-agent/src/cli.ts --mode rpc`), so the

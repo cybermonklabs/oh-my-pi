@@ -506,11 +506,14 @@ if [ -z "$only" ]; then
 		IFS=$'\t' read -r target name <<<"${sticky[$i]}"
 		bazel_test "sticky-root-$i" "$root_under" --strategy=TestRunner=local --test_arg=--exact --test_arg="$name" -- "$target"
 	done
-	# Each test of rust-test-root-alone.txt, alone, as root.
+	# Each test of rust-test-root-alone.txt, alone, as root. Its TEST_TMPDIR
+	# is on the reflink filesystem, which every user can reach: Bazel's own
+	# is below the runner's home, which is closed to other users, and
+	# pi-vfs's root tests hand their tree to another user (run 45325297653).
 	for i in "${!root_alone[@]}"; do
 		IFS=$'\t' read -r target name <<<"${root_alone[$i]}"
 		absent_entry "Root test" "$sami/rust-test-root-alone.txt" "$target" "$name" && continue
-		bazel_test "root-alone-$i" "$root_under" --strategy=TestRunner=local --test_arg=--exact --test_arg="$name" -- "$target"
+		bazel_test "root-alone-$i" "$root_under" --strategy=TestRunner=local --test_tmpdir="$RUST_TEST_TMPDIR/bazel-root-alone" --test_arg=--exact --test_arg="$name" -- "$target"
 	done
 else
 	# Only the listed tests, and the canary: each target once, with libtest's
