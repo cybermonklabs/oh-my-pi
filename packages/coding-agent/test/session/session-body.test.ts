@@ -9,11 +9,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	IndexedSessionStorage,
-	type SessionStorageBackend,
-	type SessionStorageIndexEntry,
-} from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
+import { IndexedSessionStorage } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import type {
 	SessionStorageWriteOptions,
 	WriteTextAtomicOptions,
@@ -21,63 +17,8 @@ import type {
 import { logger } from "@oh-my-pi/pi-utils";
 import { FullBodies } from "@oh-my-pi/pi-coding-agent/session/session-body";
 import { withoutAccountId } from "../helpers/account-id";
-
-/** A backend that keeps each session's text in memory and stores a full write as it is given. */
-class MemoryBackend implements SessionStorageBackend {
-	readonly sessions = new Map<string, string>();
-
-	init(): Promise<void> {
-		return Promise.resolve();
-	}
-	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
-		return Promise.resolve([]);
-	}
-	readFull(path: string): Promise<string | null> {
-		return Promise.resolve(this.sessions.get(path) ?? null);
-	}
-	readSlices(): Promise<[string, string]> {
-		return Promise.resolve(["", ""]);
-	}
-	writeFull(path: string, content: string): Promise<void> {
-		this.sessions.set(path, content);
-		return Promise.resolve();
-	}
-	append(path: string, line: string): Promise<void> {
-		this.sessions.set(path, (this.sessions.get(path) ?? "") + line);
-		return Promise.resolve();
-	}
-	updateSessionTitle(): Promise<void> {
-		return Promise.resolve();
-	}
-	truncate(path: string): Promise<void> {
-		this.sessions.set(path, "");
-		return Promise.resolve();
-	}
-	remove(paths: string[]): Promise<void> {
-		for (const path of paths) this.sessions.delete(path);
-		return Promise.resolve();
-	}
-	move(): Promise<void> {
-		return Promise.resolve();
-	}
-}
-
-/** A {@link MemoryBackend} with a streamed full write; it records the bytes of each full write by kind. */
-class StreamingMemoryBackend extends MemoryBackend {
-	readonly streamedBytes: number[] = [];
-	readonly writeFullBytes: number[] = [];
-
-	override writeFull(path: string, content: string): Promise<void> {
-		this.writeFullBytes.push(Buffer.byteLength(content));
-		return super.writeFull(path, content);
-	}
-	async writeFullStream(path: string, chunks: AsyncIterable<Uint8Array>, byteLength: number): Promise<void> {
-		const parts: Uint8Array[] = [];
-		for await (const chunk of chunks) parts.push(chunk);
-		this.streamedBytes.push(byteLength);
-		this.sessions.set(path, Buffer.concat(parts).toString("utf8"));
-	}
-}
+import { MemoryBackend, StreamingMemoryBackend } from "../helpers/memory-session-backend";
+import { spoolWarnings } from "../helpers/spool-unusable";
 
 /** A {@link StreamingMemoryBackend} whose streamed full write waits, before it reads a chunk, until the test lets it go on. */
 class HeldStreamBackend extends StreamingMemoryBackend {
@@ -192,7 +133,7 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 				streamed: streaming.streamedBytes,
 				streamingWriteFull: streaming.writeFullBytes,
 				stored: [streaming, joined].map(backend => Object.fromEntries(backend.sessions)),
-				spoolWarnings: warn.mock.calls.filter(([message]) => String(message).includes("spool")),
+				spoolWarnings: spoolWarnings(warn.mock.calls),
 			}).toEqual({
 				underTmp: [],
 				streamed: [Buffer.byteLength(body), Buffer.byteLength(body)],

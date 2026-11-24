@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import type { OlderBodiesProbeResult } from "../fixtures/older-bodies-private-dir-probe";
 
 /** Larger than any value an entry before the cut keeps in memory. */
 const BODY = "x".repeat(4096);
@@ -25,14 +26,6 @@ const probePath = path.join(import.meta.dir, "../fixtures/older-bodies-private-d
 const COLD_WARNING =
 	"Older session entries are kept compressed in memory: their store cannot be made under the temporary directory";
 const SPOOL_WARNING = "Session rewrites stream straight to the store: their spool file cannot be used";
-
-interface ProbeResult {
-	resumes: Array<{ storeInMemory: boolean; coldEntries: number; readsBack: boolean }>;
-	rewritesStored: boolean[];
-	opened: string[];
-	warnings: string[];
-	underTmp: string[];
-}
 
 /** A session whose compaction keeps `u2` on: `u1` and `a1` lie before the cut. */
 async function writeSession(dir: string): Promise<string> {
@@ -94,7 +87,7 @@ async function setUp(mode: number | undefined): Promise<{ file: string; tmp: str
 	return { file: await writeSession(sessionDir.path()), tmp: tmp.path() };
 }
 
-async function probe(scenario: string, tmp: string, file: string): Promise<ProbeResult> {
+async function probe(scenario: string, tmp: string, file: string): Promise<OlderBodiesProbeResult> {
 	const child = Bun.spawn([process.execPath, probePath, scenario, tmp, file], {
 		cwd: path.join(import.meta.dir, "../../../.."),
 		env: { ...process.env, PI_CODING_AGENT_DIR: path.join(path.dirname(file), "agent") },
@@ -107,7 +100,7 @@ async function probe(scenario: string, tmp: string, file: string): Promise<Probe
 		child.exited,
 	]);
 	expect(exitCode, stderr).toBe(0);
-	return JSON.parse(stdout) as ProbeResult;
+	return JSON.parse(stdout) as OlderBodiesProbeResult;
 }
 
 afterEach(() => {

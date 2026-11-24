@@ -12,15 +12,23 @@ import { spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	IndexedSessionStorage,
-	type SessionStorageBackend,
-	type SessionStorageIndexEntry,
-} from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
+import { IndexedSessionStorage } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { logger } from "@oh-my-pi/pi-utils";
 import { withoutAccountId } from "../helpers/account-id";
+import { StreamingMemoryBackend } from "../helpers/memory-session-backend";
+
+/** What the probe prints: what each resume kept and read back, the rewrites stored, the files opened and the warnings logged. */
+export interface OlderBodiesProbeResult {
+	resumes: Array<{ storeInMemory: boolean; coldEntries: number; readsBack: boolean }>;
+	rewritesStored: boolean[];
+	/** Files opened under the directory standing for `os.tmpdir()`, relative to it. */
+	opened: string[];
+	warnings: string[];
+	/** The entries of that directory once the probe is done, sorted. */
+	underTmp: string[];
+}
 
 const [scenario, tmp, file] = process.argv.slice(2);
 if (!scenario || !tmp || !file) throw new Error("usage: older-bodies-private-dir-probe.ts <scenario> <tmp> <session>");
@@ -37,47 +45,13 @@ spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...rest: unknown
 	return Reflect.apply(openSync, fs, [target, ...rest]);
 }) as typeof fs.openSync);
 
-/** A backend that keeps each session's text in memory and takes a streamed full write. */
-class MemoryBackend implements SessionStorageBackend {
-	readonly sessions = new Map<string, string>();
-	async init(): Promise<void> {}
-	async loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
-		return [];
-	}
-	async readFull(target: string): Promise<string | null> {
-		return this.sessions.get(target) ?? null;
-	}
-	async readSlices(): Promise<[string, string]> {
-		return ["", ""];
-	}
-	async writeFull(target: string, content: string): Promise<void> {
-		this.sessions.set(target, content);
-	}
-	async writeFullStream(target: string, chunks: AsyncIterable<Uint8Array>): Promise<void> {
-		const parts: Uint8Array[] = [];
-		for await (const chunk of chunks) parts.push(chunk);
-		this.sessions.set(target, Buffer.concat(parts).toString("utf8"));
-	}
-	async append(target: string, line: string): Promise<void> {
-		this.sessions.set(target, (this.sessions.get(target) ?? "") + line);
-	}
-	async updateSessionTitle(): Promise<void> {}
-	async truncate(target: string): Promise<void> {
-		this.sessions.set(target, "");
-	}
-	async remove(paths: string[]): Promise<void> {
-		for (const target of paths) this.sessions.delete(target);
-	}
-	async move(): Promise<void> {}
-}
-
 const open = (coldStore: boolean): Promise<SessionManager> =>
 	SessionManager.open(file, undefined, new FileSessionStorage(), { suppressBreadcrumb: true, coldStore });
 
 const whole = await open(false);
 const expected = JSON.stringify(whole.getEntries());
 await whole.close();
-const resumes: Array<{ storeInMemory: boolean; coldEntries: number; readsBack: boolean }> = [];
+const resumes: OlderBodiesProbeResult["resumes"] = [];
 for (let resume = 0; resume < 2; resume++) {
 	const manager = await open(true);
 	const { storeInMemory, coldEntries } = manager.coldStoreStats();
@@ -86,7 +60,7 @@ for (let resume = 0; resume < 2; resume++) {
 }
 
 const lines = (await Bun.file(file).text()).split(/(?<=\n)/);
-const backend = new MemoryBackend();
+const backend = new StreamingMemoryBackend();
 const storage = new IndexedSessionStorage(backend);
 await storage.initialize();
 for (const target of ["/sessions/one.jsonl", "/sessions/two.jsonl"]) {
@@ -94,6 +68,11 @@ for (const target of ["/sessions/one.jsonl", "/sessions/two.jsonl"]) {
 }
 const rewritesStored = [...backend.sessions.values()].map(text => text === lines.join(""));
 
-process.stdout.write(
-	JSON.stringify({ resumes, rewritesStored, opened, warnings, underTmp: fs.readdirSync(tmp).sort() }),
-);
+const result: OlderBodiesProbeResult = {
+	resumes,
+	rewritesStored,
+	opened,
+	warnings,
+	underTmp: fs.readdirSync(tmp).sort(),
+};
+process.stdout.write(JSON.stringify(result));
