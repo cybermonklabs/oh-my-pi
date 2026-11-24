@@ -8,7 +8,7 @@ import * as fs from "node:fs";
 import { countNewlines, logger, toError } from "@oh-my-pi/pi-utils";
 import { digestStream } from "../utils/file-hash";
 import { openPrivateTempFile, type PrivateTempFile, privateTempDir } from "../utils/owner-private-dir";
-import { BLOCK_ZSTD_LEVEL } from "./cold-entry-store";
+import { BLOCK_ZSTD_LEVEL } from "./block-zstd-level";
 import type { SessionStorageBackend } from "./indexed-session-storage";
 import {
 	LINE_STREAM_CHUNK,

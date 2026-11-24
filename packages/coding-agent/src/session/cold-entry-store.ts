@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import { logger } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { openPrivateTempFile, type PrivateTempFile } from "../utils/owner-private-dir";
+import { BLOCK_ZSTD_LEVEL } from "./block-zstd-level";
 import type { BlobStore } from "./blob-store";
 import type { SessionEntry } from "./session-entries";
 import { resolveBlobRefsInEntriesSync } from "./session-loader";
@@ -31,14 +32,6 @@ const CACHE_BYTES = 16 * 1024 * 1024;
  * once, so a write can be smaller and so can the block a failed write leaves.
  */
 const WRITE_BATCH_BYTES = 1024 * 1024;
-/**
- * zstd level of a block kept in memory: the store's blocks of records, and a
- * rewrite's in-memory copy of its body (`BodySnapshot` in `session-body.ts`).
- * Measured on two long transcripts: 17.2 MiB of records took 3.9 MiB, 344.3
- * MiB took 65.7 MiB, and a read of one record (decompress its 1 MiB block,
- * slice it) 1.6 to 2.0 ms.
- */
-export const BLOCK_ZSTD_LEVEL = 3;
 /**
  * Record bytes read back, or written by a load, between two full collections.
  * One synchronous loop over many cold entries (an extension reading every
