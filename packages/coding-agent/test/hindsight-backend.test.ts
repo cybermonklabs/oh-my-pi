@@ -441,7 +441,7 @@ describe("hindsightBackend first-turn injection", () => {
 
 		const prompt = await hindsightBackend.buildDeveloperInstructions("/tmp", "/tmp", settings, session as never);
 		expect(prompt).toContain("Use `xd://recall` proactively");
-		expect(prompt).toContain("Use `retain` to store");
+		expect(prompt).toContain("Use `retain` to record");
 	});
 
 	it("places the <mental_models> block above the <memories> recall block in developer instructions", async () => {

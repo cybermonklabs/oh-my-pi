@@ -310,6 +310,21 @@ export interface MnemopiSessionStateApi {
 	consolidate(options?: MnemopiConsolidateOptions): Promise<void>;
 }
 
+/**
+ * The memory instructions for a session. They say completed turns are retained
+ * automatically only when this session's turns are: `autoRetain` is on and the
+ * session is not a subagent alias ({@link MnemopiSessionState.maybeRetainOnAgentEnd}).
+ */
+export function renderMnemopiInstructions(
+	state: MnemopiSessionStateApi | undefined,
+	mountedDevices: readonly { name: string }[] | undefined,
+): string {
+	return prompt.render(mnemopiInstructions, {
+		toolRefs: memoryToolRefs(mountedDevices),
+		autoRetain: state !== undefined && state.aliasOf === undefined && state.config.autoRetain,
+	});
+}
+
 export class MnemopiSessionState implements MnemopiSessionStateApi {
 	sessionId: string;
 	readonly config: MnemopiBackendConfig;
@@ -674,9 +689,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 	 * that ends in "…" when it cut one.
 	 */
 	budgetRecallBlock(block: string): string {
-		const instructions = prompt.render(mnemopiInstructions, {
-			toolRefs: memoryToolRefs(this.session.getXdevToolEntries()),
-		});
+		const instructions = renderMnemopiInstructions(this, this.session.getXdevToolEntries());
 		return truncateApproxTokens(
 			[instructions, block].join("\n\n").trim(),
 			cfgMnemopiInjectionTokenLimit.get(this.session.settings),

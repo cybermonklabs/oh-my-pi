@@ -34,8 +34,8 @@ First detect the language, then extract ONLY high-signal, long-term relevant ite
 Categories to extract (return valid JSON only, no extra text):
 - facts: persistent user metrics, states, knowledge, or personal data
   (Examples: 'my name is X', 'I work at Y', 'server runs on port 8080')
-- instructions: rules or commands directed at me the agent
-  (Examples: 'always use tabs', 'never delete logs', 'call me boss')
+- instructions: requests directed at me the agent, each as a record of who asked, when, and why
+  (Examples: 'the user asked for tabs to match the repo style', 'the user asked to be called boss')
 - preferences: likes, dislikes, and their evolution
   (Examples: 'I like dark mode', 'I prefer Python over Go')
 - timelines: real events with dates/times

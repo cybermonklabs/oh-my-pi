@@ -1,6 +1,6 @@
 # retain
 
-> Store durable facts through the active long-term memory backend.
+> Record what was said or done, by whom, when and why, through the active long-term memory backend.
 
 ## Source
 
