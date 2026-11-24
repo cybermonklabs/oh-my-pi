@@ -515,7 +515,7 @@ export interface ExecutorOptions {
 	sessionFile?: string | null;
 	/**
 	 * Storage the child's transcript is opened in, read from, and revived from:
-	 * the parent session's ({@link sessionTreeStorage}). Omitted: the
+	 * the parent session's (`sessionTreeStorage` in session/session-storage.ts). Omitted: the
 	 * default session storage.
 	 */
 	sessionStorage?: SessionStorage;
