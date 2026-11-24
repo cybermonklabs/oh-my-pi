@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { convertToLlm, stripImagesFromMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, hasStrippableImages, stripImagesFromMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 
 const png = (data: string = "iVBORw0KGgo"): ImageContent => ({ type: "image", data, mimeType: "image/png" });
 const text = (value: string): TextContent => ({ type: "text", text: value });
@@ -135,5 +135,73 @@ describe("stripImagesFromMessage", () => {
 		};
 
 		expect(stripImagesFromMessage(message)).toBe(0);
+	});
+
+	// Regression: `dropImages` skips every message `hasStrippableImages` answers false for, so a role
+	// whose images the check misses keeps them after `/dropimages`; and a role the check finds but the
+	// strip misses is rewritten for nothing and keeps its images too.
+	it.each<{ site: string; message: () => AgentMessage }>([
+		{ site: "user content", message: () => ({ role: "user", content: [text("a"), png()], timestamp: 1 }) },
+		{ site: "developer content", message: () => ({ role: "developer", content: [png()], timestamp: 1 }) },
+		{
+			site: "custom message content",
+			message: () => ({ role: "custom", customType: "note", content: [png()], display: true, timestamp: 1 }),
+		},
+		{
+			site: "legacy hook message content",
+			message: () => ({ role: "hookMessage", customType: "note", content: [png()], display: true, timestamp: 1 }),
+		},
+		{
+			site: "tool result content",
+			message: () => ({
+				role: "toolResult",
+				toolCallId: "tc1",
+				toolName: "read",
+				content: [png()],
+				isError: false,
+				timestamp: 1,
+			}),
+		},
+		{
+			site: "tool result details.images",
+			message: () => ({
+				role: "toolResult",
+				toolCallId: "tc1",
+				toolName: "generate_image",
+				content: [text("generated")],
+				details: { images: [png()] },
+				isError: false,
+				timestamp: 1,
+			}),
+		},
+		{
+			site: "manual Bash images",
+			message: () => ({
+				role: "bashExecution",
+				command: "shot",
+				output: "",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				images: [png()],
+				timestamp: 1,
+			}),
+		},
+		{
+			site: "file mention attachments",
+			message: () => ({
+				role: "fileMention",
+				files: [{ path: "b.png", content: "", image: png(), byteSize: 1 }],
+				timestamp: 1,
+			}),
+		},
+	])("strips every image the check finds: $site", ({ message: make }) => {
+		const message = make();
+		expect(hasStrippableImages(message)).toBe(true);
+
+		expect(stripImagesFromMessage(message)).toBeGreaterThan(0);
+
+		expect(JSON.stringify(message)).not.toContain('"type":"image"');
+		expect(hasStrippableImages(message)).toBe(false);
 	});
 });

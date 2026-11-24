@@ -13,7 +13,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as sharedWorker from "@oh-my-pi/pi-coding-agent/subprocess/shared-worker";
 import type { RefCountedWorkerHandle } from "@oh-my-pi/pi-coding-agent/subprocess/worker-client";
-import { createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/subagent-settings";
 import * as titleClient from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import type { TinyWorkerRequest, TinyWorkerResponse } from "@oh-my-pi/pi-coding-agent/tiny/title-protocol";
 import { TempDir } from "@oh-my-pi/pi-utils";

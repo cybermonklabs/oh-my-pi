@@ -27,6 +27,7 @@ import type { Settings } from "../config/settings";
 import { isProviderEnabled, isUserSourceEnabled } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import type { CustomTool } from "../extensibility/custom-tools/types";
+import { spawnedSubagentSkills } from "../extensibility/skills";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -815,7 +816,7 @@ async function refreshSkillsForAutoload(session: ToolSession, agent: AgentDefini
 }
 
 function resolveAutoloadSkills(session: ToolSession, agent: AgentDefinition) {
-	const skills = [...(session.skills ?? [])];
+	const skills = spawnedSubagentSkills(session.skills);
 	// Names only: the executor resolves them against the child session's
 	// merged skill set after startup `resources_discover`, so child-discovered
 	// or child-replaced skills autoload correctly (executor.ts).

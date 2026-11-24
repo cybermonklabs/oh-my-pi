@@ -210,6 +210,14 @@ interface RootState {
 const MAX_ROOTS = 8;
 
 /**
+ * Start of the key a conversation whose first turn a compaction cut is kept under
+ * ({@link DateCwdReminderInjector.retainTurns}). Every turn key starts with its
+ * role, so no turn has such a key and no request continues the conversation as
+ * its own; it can only be the one a request with a new first turn continues.
+ */
+const CUT_ROOT_PREFIX = "\u0000cut#";
+
+/**
  * Keeps volatile date/cwd reminders append-only across provider requests.
  *
  * The first value is attached to the first user turn. A changed value attaches
@@ -232,6 +240,10 @@ const MAX_ROOTS = 8;
  * has an injector of its own: two advisors can start their histories with turns
  * that share a key, so a root key alone cannot tell them apart.
  *
+ * A compaction tells the injector which turns its history still holds
+ * ({@link DateCwdReminderInjector.retainTurns}): no request sends a turn the
+ * compaction cut again, so no conversation keeps state for one.
+ *
  * With a journal, every placement is recorded, and a conversation this injector
  * has not served starts from the placements an earlier injector recorded for it
  * (a resumed session, a revived subagent, a switched-in transcript).
@@ -240,6 +252,8 @@ export class DateCwdReminderInjector {
 	#states = new Map<string, RootState>();
 	readonly #journal: DateCwdReminderJournal | undefined;
 	#scope: string | undefined;
+	/** Conversations whose first turn a compaction cut, for their keys ({@link CUT_ROOT_PREFIX}). */
+	#cutRoots = 0;
 
 	constructor(journal?: DateCwdReminderJournal) {
 		this.#journal = journal;
@@ -257,6 +271,33 @@ export class DateCwdReminderInjector {
 		const reminder = renderDateCwdReminder(date, cwd);
 		const messages = this.#inject(context.messages, reminder);
 		return messages === context.messages ? context : { ...context, messages };
+	}
+
+	/**
+	 * Keep state only for the turns of `messages`, the history a compaction left:
+	 * no request after it sends a turn the compaction cut again, so the injector
+	 * keeps nothing for one. Each conversation keeps the reminders of the turns
+	 * that remain, under the ordinals they hold now, as the next request would
+	 * find them, so that request continues it as before ({@link #predecessorOf}).
+	 * A conversation whose first turn was cut waits for it under a key no turn
+	 * has; one left with no turn is forgotten, and a request that comes back to
+	 * it starts from the journal like any conversation this injector no longer holds.
+	 */
+	retainTurns(messages: Message[]): void {
+		const { keys, counts } = this.#keysOf(messages);
+		const present = new Set(keys);
+		const states = new Map<string, RootState>();
+		for (const [root, state] of this.#states) {
+			this.#keepTurns(state, counts, present);
+			// Every turn a conversation keeps state for was sent, so a conversation with no sent turn left keeps none.
+			if (state.seen.size === 0) continue;
+			if (present.has(root)) {
+				states.set(root, state);
+				continue;
+			}
+			states.set(`${CUT_ROOT_PREFIX}${this.#cutRoots++}`, state);
+		}
+		this.#states = states;
 	}
 
 	/**
@@ -320,6 +361,22 @@ export class DateCwdReminderInjector {
 		}
 		state.controls = controls;
 		state.counts = counts;
+	}
+
+	/**
+	 * Fit a conversation's state to a history that lost its start: its turns move
+	 * to the ordinals they hold among `counts`, and the state of every turn not in
+	 * `present` is dropped.
+	 */
+	#keepTurns(state: RootState, counts: Map<string, number>, present: ReadonlySet<string>): void {
+		this.#followOrdinals(state, counts, true);
+		for (const key of state.injections.keys()) {
+			if (!present.has(key)) state.injections.delete(key);
+		}
+		for (const key of state.seen) {
+			if (!present.has(key)) state.seen.delete(key);
+		}
+		state.controls = state.controls.filter(control => present.has(control.anchor));
 	}
 
 	/**
@@ -388,15 +445,7 @@ export class DateCwdReminderInjector {
 			seen: new Set(previous?.seen),
 			counts: previous ? previous.counts : new Map(),
 		};
-		this.#followOrdinals(state, counts, true);
-		const present = new Set(keys);
-		for (const key of state.injections.keys()) {
-			if (!present.has(key)) state.injections.delete(key);
-		}
-		for (const key of state.seen) {
-			if (!present.has(key)) state.seen.delete(key);
-		}
-		state.controls = state.controls.filter(control => present.has(control.anchor));
+		this.#keepTurns(state, counts, new Set(keys));
 		if (recreated) {
 			state.injections.set(root, {
 				reminder: previousFirst.reminder,

@@ -24,6 +24,16 @@
 
 - Removed `PruneResult.undo()` from `pruneToolOutputs` and `pruneSupersededToolResults`; persist `PruneResult.pruned` instead of rolling the prune back when saving it fails.
 
+### Changed
+
+- Prune passes look up tool calls before the compaction boundary in an index built once per boundary and branch, instead of re-reading that history on every pass that misses a call
+
+### Fixed
+
+- The context figure that the status line, compaction and the rate-limit fallback read now counts `$` Python output, `@file` mentions and a `!` command's terminal images, and no longer counts a `!!` or `$$` output that no request carries
+- Counting a stored custom message whose content is neither text nor blocks no longer throws
+- After a compaction that kept no entry (an Anthropic native compaction that summarizes everything), the prune and shake passes start at that compaction, or at the turns added while it ran, instead of walking, and reading, the whole history on every pass
+
 ## [18.18.2] - 2026-11-08
 
 ### Added

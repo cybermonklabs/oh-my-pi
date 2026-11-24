@@ -14,6 +14,7 @@ import type { FollowUpTurnOptions, SubagentRunRequest } from "../task/executor";
 import type { PersistedReviveSpec } from "../task/persisted-revive";
 import type { ThreadId } from "./identity";
 import type { RpcLink, RpcMethod } from "./rpc";
+import type { TextFormat, TextFormatInput, TextFormatParseReply } from "./text-format-forwarding";
 
 /** Raw first message main posts to a new worker, before any RPC frame. */
 export interface SubagentWorkerInit {
@@ -46,6 +47,8 @@ export type SubagentMainApi = {
 	ping: RpcMethod<[nonce: number], number>;
 	/** Route a follow-up turn of a session not homed on the calling worker to its home thread. */
 	runFollowUpTurn: RpcMethod<[options: FollowUpTurnOptions], SingleResult>;
+	/** Parse YAML, TOML, JSONC, JSON5 or XML for the worker on main's heap (see `./text-format-forwarding`). */
+	parseTextFormat: RpcMethod<[format: TextFormat, input: TextFormatInput, options: unknown], TextFormatParseReply>;
 };
 
 /** Methods a subagent host worker serves to the main thread. */

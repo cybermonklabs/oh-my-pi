@@ -4,6 +4,7 @@ import type {
 	ImageContent,
 	Message,
 	MessageAttribution,
+	Model,
 	ServiceTierByFamily,
 	TextContent,
 	Usage,
@@ -39,6 +40,25 @@ import {
 } from "../secrets/session-store-mask";
 import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
+import {
+	coldEntryForPersistence,
+	convertColdEntries,
+	convertToColdEntry,
+	copyColdEntry,
+	hydrateColdEntry,
+	hydrateKeptEntries,
+	isColdEntry,
+	wholeTargetsOf,
+} from "./cold-entries";
+import {
+	type ColdBoundary,
+	coldBoundary,
+	coldCutPathIndex,
+	coldKindOf,
+	readCompactions,
+	streamedKeptStart,
+} from "./cold-entry-policy";
+import { ColdEntryStore } from "./cold-entry-store";
 import type { CompactionMethod } from "./compaction-methods";
 import {
 	type BashExecutionMessage,
@@ -107,18 +127,25 @@ import {
 	type SessionInfo,
 } from "./session-listing";
 import {
-	loadEntriesFromFile,
-	loadSessionFile,
+	collectBlobRefNames,
 	normalizeAssistantUsage,
 	parseSessionContent,
+	probeSessionFile,
 	readSessionHeaderId,
 	resolveBlobRefsInEntries,
 	resolveBlobRefsInEntriesSync,
+	type SessionFileVisit,
 	type SessionLoadResult,
 	sessionContentDigest,
+	transcriptByteChunks,
+	visitEntriesFromChunksSync,
 	visitEntriesFromFile,
+	type VisitEntriesFromFileStreamOptions,
+	visitEntriesFromFileStream,
+	visitLoadedSession,
+	visitSessionFile,
 } from "./session-loader";
-import { generateId, migrateToCurrentVersion } from "./session-migrations";
+import { generateId, lacksEntryId, SessionEntryMigration } from "./session-migrations";
 import {
 	computeDefaultSessionDir,
 	hasPositiveMovedProjectEvidence,
@@ -137,9 +164,11 @@ import {
 	isSessionStoreOutage,
 	isSessionStoreWriteRefusal,
 	MemorySessionStorage,
+	retryRacedRead,
 	SESSION_HEADER_PREFIX_BYTES,
 	type SessionClaimHolder,
 	SessionLeaseLostError,
+	SessionReadConflictError,
 	type SessionStorage,
 	type SessionStorageWriter,
 	SessionWriteConflictError,
@@ -160,6 +189,17 @@ import {
 	normalizeWorkspaceDirectory,
 } from "./session-workspace";
 import { recordSessionRecap, recordSessionTitle } from "./session-index";
+import {
+	applyEntryPatches,
+	ENTRY_PATCH_CUSTOM_TYPE,
+	type EntryPatch,
+	entryAcceptsPatch,
+	isEntryPatchRecord,
+	maskEntryPatchRecord,
+	setPatchedFields,
+	toEntryPatchData,
+	withoutEntryPatches,
+} from "./entry-patches";
 import { applyToolResultPrunes } from "./tool-result-prunes";
 
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
@@ -175,8 +215,6 @@ const ACK_COMPARE_WINDOW_BYTES = 1 << 16;
 export const SESSION_TAIL_APPEND_CHUNK_BYTES = 4 * 1024 * 1024;
 /** `details.kind` of the empty `branch_summary` {@link SessionManager.discardEntryDurably} writes. */
 export const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
-/** `model_usage` purpose carrying the billed usage of an assistant turn removed by `discardEntryDurably`. */
-const DISCARDED_TURN_USAGE_PURPOSE = "discarded-turn";
 /**
  * Read-back-and-retry passes one full rewrite makes after meeting another
  * writer's entries. Each pass re-reads the file, so only a writer that appends
@@ -560,6 +598,11 @@ function normalizeLoadedUsage(entries: SessionEntry[]): number {
 	return repaired;
 }
 
+/** Report the assistant messages a load completed the usage of. */
+function warnRepairedUsage(count: number): void {
+	if (count > 0) logger.warn("Loaded assistant messages with incomplete usage", { count });
+}
+
 function addUsage(target: UsageStatistics, usage: Usage | undefined): void {
 	if (!usage) return;
 	target.input += usage.input;
@@ -697,7 +740,8 @@ export function conversationTip(
  */
 export class SessionEntryIndex {
 	#entriesById = new Map<string, SessionEntry>();
-	#children = new Map<string | null, SessionEntry[]>();
+	/** Children by parent: a lone child (most entries have one) is stored without an array. */
+	#children = new Map<string | null, SessionEntry | SessionEntry[]>();
 	#labels = new Map<string, string>();
 	#leaf: string | null = null;
 	#usage = emptyUsageStatistics();
@@ -724,7 +768,14 @@ export class SessionEntryIndex {
 	rebuild(entries: readonly SessionEntry[]): void {
 		this.clear();
 		for (const entry of entries) this.insert(entry);
-		// A captured late-usage leaf can dangle after its target was rolled back or rewritten away.
+		this.settleLeaf(entries);
+	}
+
+	/**
+	 * Finish inserting `entries`, all of them, one by one: a captured late-usage
+	 * leaf can dangle after its target was rolled back or rewritten away.
+	 */
+	settleLeaf(entries: readonly SessionEntry[]): void {
 		if (this.#leaf !== null && !this.#entriesById.has(this.#leaf)) this.setLeaf(lastSelfSelectedLeafId(entries));
 	}
 
@@ -754,8 +805,9 @@ export class SessionEntryIndex {
 		}
 
 		const bucket = this.#children.get(entry.parentId);
-		if (bucket) bucket.push(entry);
-		else this.#children.set(entry.parentId, [entry]);
+		if (bucket === undefined) this.#children.set(entry.parentId, entry);
+		else if (Array.isArray(bucket)) bucket.push(entry);
+		else this.#children.set(entry.parentId, [bucket, entry]);
 
 		if (entry.type === "label") {
 			if (entry.label) this.#labels.set(entry.targetId, entry.label);
@@ -812,7 +864,9 @@ export class SessionEntryIndex {
 	}
 
 	childrenOf(parentId: string): SessionEntry[] {
-		return [...(this.#children.get(parentId) ?? [])];
+		const bucket = this.#children.get(parentId);
+		if (bucket === undefined) return [];
+		return Array.isArray(bucket) ? [...bucket] : [bucket];
 	}
 
 	labelFor(id: string): string | undefined {
@@ -948,6 +1002,123 @@ interface SessionManagerStateSnapshot {
 	taskSiblingCandidate: string | undefined;
 	header: SessionHeader;
 	entries: SessionEntry[];
+	/** The store the cold ones among `entries` were written to; shared with the manager that captured them. */
+	coldStore: ColdEntryStore | undefined;
+	/** The model the cut was last computed for, which the agent's context was built for. */
+	coldCutModel: Model | undefined;
+}
+
+/** {@link SessionManager.coldStoreStats}: how much of the session lives in its cold entry store. */
+export interface ColdStoreStats {
+	/** Entries whose large values are read from the store on access. */
+	coldEntries: number;
+	/** Bytes of records in the store. */
+	storeBytes: number;
+	/** Records read back to serve a field read. */
+	materializations: number;
+	/** Cold entries made whole again. */
+	hydrations: number;
+	/**
+	 * Whether the store keeps new records compressed in memory: no store file
+	 * could be made under `os.tmpdir()`, or a write to it failed.
+	 */
+	storeInMemory: boolean;
+	/** Bytes of the compressed blocks of records the store keeps in memory. */
+	compressedBytes: number;
+}
+
+/** Options of {@link SessionManager.buildSessionContext}. */
+export interface SessionContextBuildOptions extends BuildSessionContextOptions {
+	/**
+	 * The build only measures the context (`model`'s, for a fit check) and does
+	 * not become the agent's context: it adopts no model and moves no cut, so
+	 * every entry stays cold or whole as it is, and a cold one is read through
+	 * its accessors.
+	 */
+	measureOnly?: boolean;
+}
+
+/** Short strings shared across a load's entries; longer ones are mostly unique. */
+const INTERNED_STRING_MAX_UNITS = 64;
+/** Runtimes are shared up to this JSON length: a source checkout's, with commit and branch, runs past 64. */
+const INTERNED_RUNTIME_MAX_UNITS = 256;
+/** Distinct values one load shares at most, so unique values cannot grow the tables without bound. */
+const INTERNED_VALUES_MAX = 16_384;
+
+/**
+ * Shares equal values among the entries one load parses, which the parser
+ * gives each its own copy of: short strings of the entry and of its message
+ * (a string's identity is not observable), each `parentId` with its parent's
+ * `id`, and the `runtime` identity, the same for every entry one build wrote,
+ * which is frozen once shared. Memory per entry is what a long session's
+ * older entries keep in memory, so the copies add up.
+ */
+class LoadedValueInterner {
+	readonly #strings = new Map<string, string>();
+	readonly #runtimes = new Map<string, object>();
+
+	/** Share `entry`'s values with the entries already interned; `parent` is its parent entry, if loaded. */
+	intern(entry: SessionEntry, parent: SessionEntry | undefined): void {
+		const holder = entry as unknown as Record<string, unknown>;
+		this.#internStrings(holder);
+		if (parent && entry.parentId === parent.id) holder.parentId = parent.id;
+		const runtime = holder.runtime;
+		if (typeof runtime === "object" && runtime !== null) holder.runtime = this.#internRuntime(runtime);
+		const message = entry.type === "message" ? holder.message : undefined;
+		if (typeof message === "object" && message !== null && !Array.isArray(message)) {
+			this.#internStrings(message as Record<string, unknown>);
+		}
+	}
+
+	#internStrings(holder: Record<string, unknown>): void {
+		for (const key of Object.keys(holder)) {
+			if (key === "id" || key === "parentId" || key === "timestamp") continue;
+			const value = holder[key];
+			if (typeof value !== "string" || value.length > INTERNED_STRING_MAX_UNITS) continue;
+			const shared = this.#strings.get(value);
+			if (shared !== undefined) holder[key] = shared;
+			else if (this.#strings.size < INTERNED_VALUES_MAX) this.#strings.set(value, value);
+		}
+	}
+
+	#internRuntime(runtime: object): object {
+		const key = stringifyJson(runtime);
+		if (key === undefined || key.length > INTERNED_RUNTIME_MAX_UNITS) return runtime;
+		const shared = this.#runtimes.get(key);
+		if (shared) return shared;
+		if (this.#runtimes.size >= INTERNED_VALUES_MAX) return runtime;
+		this.#runtimes.set(key, Object.freeze(runtime));
+		return runtime;
+	}
+}
+
+/** A session file streamed into memory, its older entries cold; see `SessionManager.#loadTranscript`. */
+interface LoadedTranscript extends SessionFileVisit {
+	/** `undefined` when the file holds no entries (or is missing). */
+	header: SessionHeader | undefined;
+	entries: SessionEntry[];
+	index: SessionEntryIndex;
+	coldStore: ColdEntryStore | undefined;
+	/** Whether a migration changed the entries, so the file needs a rewrite. */
+	migrated: boolean;
+	/** Whether stale replay metadata was stripped from an assistant entry. */
+	sanitized: boolean;
+	/** Assistant messages whose incomplete usage was completed. */
+	repairedUsage: number;
+}
+
+/** How {@link SessionManager.forkFrom} turns each source entry into one of the fork's. */
+interface ForkEntryOptions {
+	resetInheritedCost?: boolean;
+	seance?: boolean;
+}
+
+/** Where `SessionManager.#loadTranscript` reads a transcript from and what it does to each entry. */
+interface TranscriptLoadOptions {
+	throwIfMissing?: boolean;
+	fork?: ForkEntryOptions;
+	/** The transcript already read whole (a small file `probeSessionFile` loaded): visited instead of reading it again. */
+	preloaded?: SessionLoadResult;
 }
 
 interface DiskQueueOptions {
@@ -978,8 +1149,8 @@ interface AtomicEntryBatch {
  * The state a full-file body was serialized from, cheap to compare against
  * the live state. Entries change only by append, array replacement (which
  * bumps the entries generation), or an in-place update announced through
- * `rewriteEntries()` (which bumps the revision); the title slot and header
- * are small and compared by value.
+ * `rewriteEntries()` or `patchEntries()` (which bump the revision); the title
+ * slot and header are small and compared by value.
  */
 interface SessionBodyStamp {
 	generation: number;
@@ -1021,7 +1192,7 @@ function durableFrontier(generation: number, count: number, size: number): Durab
 	};
 }
 
-/** Entries another writer added to the session file, and where they sit in it (see `#foreignEntriesIn`). */
+/** Entries another writer added to the session file, and where they sit in it (see `#foreignEntryScan`). */
 interface ForeignEntries {
 	foreign: SessionEntry[];
 	at: number;
@@ -1105,6 +1276,117 @@ async function fileMatchesLines(filePath: string, lines: Iterable<string>): Prom
 	return expectedOffset === expectedLength && !encodeNextWindow();
 }
 
+/** A body's UTF-8 byte length and SHA-256, which {@link chunksMatchBody} compares stored chunks with. */
+interface SessionBodyDigest {
+	readonly bytes: number;
+	readonly sha256: string;
+}
+
+/** {@link SessionBodyDigest} of `body`, hashed while holding one line of it at a time. */
+function sessionBodyDigest(body: SessionFileBody): SessionBodyDigest {
+	const hasher = new Bun.CryptoHasher("sha256");
+	for (const line of body.lines) hasher.update(line);
+	// Iterating `lines` counted the body's bytes again.
+	return { bytes: body.bytes, sha256: hasher.digest("hex") };
+}
+
+/**
+ * Whether stored chunks are exactly the bytes `expected` describes, compared
+ * by byte length and SHA-256 while holding one stored chunk at a time.
+ */
+async function chunksMatchBody(chunks: AsyncIterable<Uint8Array>, expected: SessionBodyDigest): Promise<boolean> {
+	const stored = new Bun.CryptoHasher("sha256");
+	let storedBytes = 0;
+	for await (const chunk of chunks) {
+		storedBytes += chunk.byteLength;
+		if (storedBytes > expected.bytes) return false;
+		stored.update(chunk);
+	}
+	return storedBytes === expected.bytes && stored.digest("hex") === expected.sha256;
+}
+
+/** Bytes of one synchronous read of a stored transcript; see {@link transcriptByteChunksSync}. */
+const SYNC_READ_WINDOW_BYTES = 1024 * 1024;
+
+/**
+ * The stored transcript at `filePath` as synchronous chunks of at most
+ * {@link SYNC_READ_WINDOW_BYTES}: windows of the file itself for file storage,
+ * whatever its other range readers do; windows through `readTextRangeSync` for
+ * another storage that has it, read twice (see {@link checkedTextRangeWindows});
+ * otherwise its whole `readTextSync` text as one chunk; `undefined` when the
+ * storage reads nothing synchronously. A missing transcript throws ENOENT once
+ * iterated.
+ */
+function transcriptByteChunksSync(filePath: string, storage: SessionStorage): Iterable<Uint8Array> | undefined {
+	if (storage instanceof FileSessionStorage) return fileWindows(filePath);
+	const readRange = storage.readTextRangeSync;
+	if (readRange)
+		return checkedTextRangeWindows(filePath, (start, end) => readRange.call(storage, filePath, start, end));
+	const readText = storage.readTextSync;
+	if (readText) return wholeText(() => readText.call(storage, filePath));
+	return undefined;
+}
+
+/**
+ * {@link textRangeWindows}, then the same windows read again and compared by
+ * SHA-256 with what was yielded: a storage that reads by range holds nothing
+ * open across windows, so another writer's full write between two of them
+ * would hand back a mix of two bodies. A second read that differs throws
+ * {@link SessionReadConflictError} for `filePath` once the windows ran out.
+ */
+function* checkedTextRangeWindows(
+	filePath: string,
+	readRange: (start: number, end: number) => string,
+): Generator<Uint8Array> {
+	const yielded = new Bun.CryptoHasher("sha256");
+	for (const window of textRangeWindows(readRange)) {
+		yielded.update(window);
+		yield window;
+	}
+	const again = new Bun.CryptoHasher("sha256");
+	for (const window of textRangeWindows(readRange)) again.update(window);
+	if (again.digest("hex") !== yielded.digest("hex")) throw new SessionReadConflictError(filePath);
+}
+
+/**
+ * Successive windows of a transcript `readRange` decodes. A window that ends
+ * inside a multibyte character decodes its first bytes as U+FFFD, so trailing
+ * U+FFFD characters are read again at the head of the next window.
+ */
+function* textRangeWindows(readRange: (start: number, end: number) => string): Generator<Uint8Array> {
+	let position = 0;
+	for (;;) {
+		const text = readRange(position, position + SYNC_READ_WINDOW_BYTES);
+		if (text.length === 0) return;
+		let end = text.length;
+		while (end > 0 && text.charCodeAt(end - 1) === 0xfffd) end--;
+		const window = Buffer.from(end > 0 ? text.slice(0, end) : text, "utf8");
+		position += window.byteLength;
+		yield window;
+	}
+}
+
+/** Successive windows of the file at `filePath`, each valid until the next is read. */
+function* fileWindows(filePath: string): Generator<Uint8Array> {
+	const fd = fs.openSync(filePath, "r");
+	try {
+		const window = Buffer.allocUnsafe(SYNC_READ_WINDOW_BYTES);
+		let position = 0;
+		for (;;) {
+			const read = fs.readSync(fd, window, 0, window.length, position);
+			if (read === 0) return;
+			position += read;
+			yield window.subarray(0, read);
+		}
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+function* wholeText(readText: () => string): Generator<Uint8Array> {
+	yield Buffer.from(readText(), "utf8");
+}
+
 /**
  * Whether `loaded` still describes the current session object without parsing
  * it again. Size, mtime, and inode are not authoritative (an in-place rewrite
@@ -1169,6 +1451,30 @@ export class ForkSourceNotFoundError extends Error {
 	constructor(sourcePath: string) {
 		super(`Session "${sourcePath}" not found.`);
 		this.name = "ForkSourceNotFoundError";
+	}
+}
+
+/**
+ * A count of a transcript's entries toward its "unindexed" verdict: it has
+ * non-header entries and none of them has an id, so it may predate ids
+ * altogether (see migrateToCurrentVersion).
+ */
+class UnindexedCount {
+	#sawEntry = false;
+	#sawId = false;
+
+	/** Counts `entry`; true when it is a non-header entry with an id, which settles the verdict as false. */
+	add(entry: FileEntry): boolean {
+		if (entry.type === "session") return false;
+		this.#sawEntry = true;
+		if (lacksEntryId(entry)) return false;
+		this.#sawId = true;
+		return true;
+	}
+
+	/** The verdict on the entries counted so far. */
+	get unindexed(): boolean {
+		return this.#sawEntry && !this.#sawId;
 	}
 }
 
@@ -1245,6 +1551,25 @@ export class SessionManager {
 		this.#entriesGeneration++;
 	}
 	#index = new SessionEntryIndex();
+	/**
+	 * Whether entries before the context cut move to a {@link ColdEntryStore}.
+	 * Every persisted manager does; an in-memory one, or one opened with
+	 * `coldStore: false`, holds every entry.
+	 */
+	readonly #coldStoreEnabled: boolean;
+	/** The store new cold entries go to; created when the first entry turns cold. */
+	#coldStore: ColdEntryStore | undefined;
+	/** The model the cut was last computed for (see `coldCutPathIndex`); unset until a context build names one. */
+	#coldCutModel: Model | undefined;
+	/**
+	 * The leaf, the entries, the newest compaction or the model changed since
+	 * the cut was last applied: set by {@link #setLeaf} when the leaf moves,
+	 * {@link #reindexEntries}, {@link #recordEntry} for a compaction,
+	 * {@link #staleColdBoundary} when it adopts a model, and
+	 * {@link #resetColdCut} when asked; cleared by {@link buildSessionContext}
+	 * once the build that applies the cut made its entries whole and returned.
+	 */
+	#coldCutStale = false;
 
 	/** A full body reached the session file and nothing has replaced it since; crosses the lazy file-creation gate. */
 	#fileIsCurrent = false;
@@ -1464,7 +1789,13 @@ export class SessionManager {
 	 */
 	#pendingArtifactCopy: { sessionFile: string; done: Promise<void> } | undefined;
 
-	private constructor(cwd: string, sessionDir: string, persist: boolean, storage: SessionStorage) {
+	private constructor(
+		cwd: string,
+		sessionDir: string,
+		persist: boolean,
+		storage: SessionStorage,
+		coldStore: boolean = persist,
+	) {
 		this.#cwd = cwd;
 		// Absolute, so session files (and `PI_SESSION_FILE` in bash and eval) stay
 		// valid after a command changes directory: `--session-dir` may be relative.
@@ -1474,6 +1805,7 @@ export class SessionManager {
 		// A storage that keeps blobs beside the local store (SQL) gets each one a session
 		// persists and cannot draw again, landed before the transcript write that names it.
 		this.#blobs = new BlobStore(getBlobsDir(), storage.blobTier);
+		this.#coldStoreEnabled = coldStore;
 
 		if (persist && sessionDir) {
 			try {
@@ -1906,7 +2238,7 @@ export class SessionManager {
 			stored = null;
 		}
 		if (stored === this.#expectedDiskSize || this.#sessionFile !== sessionFile) return;
-		await this.#setSessionFile(sessionFile, undefined, { keepClaim: true });
+		await this.#setSessionFile(sessionFile, { keepClaim: true });
 	}
 
 	/**
@@ -2185,46 +2517,77 @@ export class SessionManager {
 	}
 
 	/**
-	 * The entries `content` holds that this manager does not, or `undefined`
-	 * when it is not this session's journal. `at` is where they go in
+	 * A visitor of the stored transcript, entry by entry, that finds the entries
+	 * it holds that this manager does not, with the visit's `options`, which
+	 * count its malformed records and the bytes it read (`bytes()`: the stored
+	 * size once it read the whole transcript). `found()` is `undefined` when the
+	 * transcript is not this session's journal (its first entry is not this
+	 * session's header), and the visit stops there. `at` is where they go in
 	 * `#entries` to keep the file's order: after the last entry both hold, so
 	 * this manager's entries the file lacks still follow them.
 	 * `extendsFrontier` reports that the file is this manager's first
 	 * `shared` entries, at least the durable frontier's, followed only by
 	 * them: another writer (a clone's original healing a missed entry) may
-	 * have appended this manager's own next entries before them.
+	 * have appended this manager's own next entries before them. One scan
+	 * serves one read: a read again starts a new scan.
 	 */
-	#foreignEntriesIn(content: string): ForeignEntries | undefined {
-		const { entries, invalidHeader, malformedRecords } = parseSessionContent(content);
-		const header = entries[0];
-		if (invalidHeader || header?.type !== "session" || header.id !== this.#sessionId) return undefined;
-		const durable = this.#durable;
-		let extendsFrontier =
-			malformedRecords === 0 &&
-			durable?.generation === this.#entriesGeneration &&
-			durable.issued === durable.confirmed;
+	#foreignEntryScan(): {
+		visit: (entry: FileEntry) => boolean;
+		options: Pick<VisitEntriesFromFileStreamOptions, "onMalformedRecord" | "onChunk">;
+		bytes: () => number;
+		found: () => ForeignEntries | undefined;
+	} {
+		let ownJournal: boolean | undefined;
+		let malformedRecords = 0;
+		let bytes = 0;
+		let sharedInOrder = true;
 		const foreign: SessionEntry[] = [];
 		const shared = new Set<string>();
-		for (let i = 1; i < entries.length; i++) {
-			const entry = entries[i] as SessionEntry;
-			if (!this.#index.has(entry.id)) {
-				foreign.push(entry);
-				continue;
-			}
-			shared.add(entry.id);
-			const sharedEntry = this.#index.get(entry.id);
-			if (
-				foreign.length > 0 ||
-				this.#entries[shared.size - 1]?.id !== entry.id ||
-				sharedEntry?.parentId !== entry.parentId
-			) {
-				extendsFrontier = false;
-			}
-		}
-		if (durable === undefined || shared.size < durable.confirmed) extendsFrontier = false;
-		let at = this.#entries.length;
-		while (at > 0 && !shared.has(this.#entries[at - 1]!.id)) at--;
-		return { foreign, at, shared: shared.size, extendsFrontier };
+		return {
+			visit: raw => {
+				if (ownJournal === undefined) {
+					ownJournal = raw.type === "session" && raw.id === this.#sessionId;
+					return ownJournal;
+				}
+				const entry = raw as SessionEntry;
+				if (!this.#index.has(entry.id)) {
+					foreign.push(entry);
+					return true;
+				}
+				shared.add(entry.id);
+				const sharedEntry = this.#index.get(entry.id);
+				if (
+					foreign.length > 0 ||
+					this.#entries[shared.size - 1]?.id !== entry.id ||
+					sharedEntry?.parentId !== entry.parentId
+				) {
+					sharedInOrder = false;
+				}
+				return true;
+			},
+			options: {
+				onMalformedRecord: () => {
+					malformedRecords++;
+				},
+				onChunk: chunk => {
+					bytes += chunk.byteLength;
+				},
+			},
+			bytes: () => bytes,
+			found: () => {
+				if (!ownJournal) return undefined;
+				const durable = this.#durable;
+				const extendsFrontier =
+					sharedInOrder &&
+					malformedRecords === 0 &&
+					durable?.generation === this.#entriesGeneration &&
+					durable.issued === durable.confirmed &&
+					shared.size >= durable.confirmed;
+				let at = this.#entries.length;
+				while (at > 0 && !shared.has(this.#entries[at - 1]!.id)) at--;
+				return { foreign, at, shared: shared.size, extendsFrontier };
+			},
+		};
 	}
 
 	/**
@@ -2235,7 +2598,10 @@ export class SessionManager {
 	 * manager's first entries, at least the durable frontier's, followed by
 	 * them, the frontier extends over all of them, so this manager's next
 	 * entries follow as an append; otherwise the retried rewrite republishes
-	 * them with the rest.
+	 * them with the rest. A `tool_result_prune` record among them blanks the
+	 * tool results it names, and an `entry_patch` record sets its fields on
+	 * the entries it names, as a load does: the rewrite writes those effects
+	 * inline and the patch record empty.
 	 */
 	#adoptForeignEntries(found: ForeignEntries, diskSize: number): void {
 		const leaf = this.#index.leafId();
@@ -2250,6 +2616,17 @@ export class SessionManager {
 		this.#index.setLeaf(leaf);
 		this.#entries = [...this.#entries.slice(0, found.at), ...kept, ...this.#entries.slice(found.at)];
 		this.#expectedDiskSize = diskSize;
+		// A cold target is made whole without reading its images, and goes back to the store with the values
+		// the records set, as `updateEntryBody` does; one that stays whole gets its images, as whole entries hold them.
+		const hydrated: SessionEntry[] = [];
+		const targets = wholeTargetsOf(this.#index, hydrated);
+		const pruned = applyToolResultPrunes(kept, targets);
+		const patched = applyEntryPatches(kept, targets);
+		for (const target of hydrated) {
+			if (!convertToColdEntry(target, () => this.#openColdStore()))
+				resolveBlobRefsInEntriesSync([target], this.#blobs);
+		}
+		if (pruned || patched) this.#bodyRevision++;
 		this.#durable =
 			found.extendsFrontier && durable && kept.length === found.foreign.length
 				? durableFrontier(this.#entriesGeneration, found.shared + kept.length, diskSize)
@@ -2350,8 +2727,18 @@ export class SessionManager {
 	 * an external tool) appending to the file this process owns. Overwriting
 	 * would erase those entries and retrying blindly can never succeed, so read
 	 * the file back, keep its new entries, and retry against the size just read.
-	 * A deleted file is recreated; a file that no longer reads as this session
-	 * is left untouched and the session moves to a sibling.
+	 * File storage, and a storage with `readTextRangeSync`, read the file in
+	 * bounded windows parsed as they arrive, so the transcript is not held
+	 * whole; a storage with only `readTextSync` gives its whole text at once
+	 * (see `transcriptByteChunksSync`). A deleted file is recreated; a file that
+	 * no longer reads as this session is left untouched and the session moves
+	 * to a sibling. A read that another writer's full write changed between
+	 * two windows (`SessionReadConflictError`, see {@link checkedTextRangeWindows})
+	 * is read again from the start, at most {@link MAX_WRITE_CONFLICT_RECOVERIES}
+	 * reads in all as {@link #recoverFromWriteConflict} does, then the session
+	 * moves to a sibling as `contested`: the rewrite is never retried without a
+	 * whole read of one body, since its size check could pass against the other
+	 * writer's body and overwrite it.
 	 *
 	 * After {@link MAX_WRITE_CONFLICT_RECOVERIES} passes (`recoveries`) the
 	 * other writer is still racing every read-to-publish window: leave the file
@@ -2363,33 +2750,51 @@ export class SessionManager {
 		const contested = this.#conflictedSessionFile(error);
 		if (!contested) return undefined;
 		if (recoveries >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
-		if (!this.#storage.readTextSync) return undefined;
-		let content: string;
-		try {
-			content = this.#storage.readTextSync(contested);
-		} catch (readError) {
-			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
-			this.#expectedDiskSize = null;
-			this.#durable = undefined;
+		for (let reads = 1; ; reads++) {
+			const chunks = transcriptByteChunksSync(contested, this.#storage);
+			if (!chunks) return undefined;
+			const scan = this.#foreignEntryScan();
+			try {
+				visitEntriesFromChunksSync(chunks, scan.visit, scan.options);
+			} catch (readError) {
+				if (readError instanceof SessionReadConflictError) {
+					if (reads >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
+					continue;
+				}
+				if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
+				this.#expectedDiskSize = null;
+				this.#durable = undefined;
+				return contested;
+			}
+			const found = scan.found();
+			if (!found) return this.#moveOffSessionFile("replaced");
+			resolveBlobRefsInEntriesSync(found.foreign, this.#blobs);
+			this.#adoptForeignEntries(found, scan.bytes());
 			return contested;
 		}
-		const found = this.#foreignEntriesIn(content);
-		if (!found) return this.#moveOffSessionFile("replaced");
-		resolveBlobRefsInEntriesSync(found.foreign, this.#blobs);
-		this.#adoptForeignEntries(found, Buffer.byteLength(content, "utf8"));
-		return contested;
 	}
 
 	/**
-	 * Asynchronous {@link #recoverFromWriteConflictSync}. For a write this
-	 * manager queued (`queued`, see {@link #recoverQueuedConflict}) on a
-	 * backend that defers publishes it first lets this manager's own queued
-	 * writes to the file settle and reloads the store's index, so the content
-	 * it reads back, and the size the retry is checked against, are the
-	 * store's, never a write of this manager still in flight; a conflict on a
-	 * file this manager already moved off retries at the sibling it went on in. A switch waits for a recovery the
-	 * drain started before it reads the session it leaves ({@link #setSessionFile}), and records a move off one makes
-	 * while it loads ({@link #activeSwitch}).
+	 * Asynchronous {@link #recoverFromWriteConflictSync}, reading the storage's
+	 * chunk stream. For a write this manager queued (`queued`, see
+	 * {@link #recoverQueuedConflict}) on a backend that defers publishes it
+	 * first lets this manager's own queued writes to the file settle and
+	 * reloads the store's index, so the content it reads back, and the size
+	 * the retry is checked against, are the store's, never a write of this
+	 * manager still in flight; a conflict on a file this manager already moved
+	 * off retries at the sibling it went on in. A switch waits for a recovery
+	 * the drain started before it reads the session it leaves
+	 * ({@link #setSessionFile}), and records a move off one makes while it
+	 * loads ({@link #activeSwitch}).
+	 *
+	 * A read that another writer's full write or delete cut off
+	 * (`SessionReadConflictError`: SQL storage's chunked read) is read again
+	 * from the start, at most {@link MAX_WRITE_CONFLICT_RECOVERIES} reads in
+	 * all; past that the other writer is still rewriting the file, and the
+	 * session moves to a sibling as `contested`. The file still holds this
+	 * session, so it is never taken for a `replaced` one, and the publish is
+	 * never retried without a whole read: its size check could pass against
+	 * the other writer's body of the same size and overwrite it.
 	 */
 	async #recoverFromWriteConflict(error: unknown, recoveries: number, queued = false): Promise<string | undefined> {
 		if (
@@ -2411,24 +2816,37 @@ export class SessionManager {
 			if (this.#sessionFile !== contested) return this.#sessionFile;
 		}
 		const epoch = this.#diskEpoch;
-		let content: string;
-		try {
-			content = await this.#storage.readText(contested);
-		} catch (readError) {
-			// A synchronous rewrite during the read already recovered; retry against its result.
-			if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
-			if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
-			this.#expectedDiskSize = null;
-			this.#durable = undefined;
-			return contested;
+		let scan = this.#foreignEntryScan();
+		for (let reads = 1; ; reads++) {
+			try {
+				await visitEntriesFromFileStream(contested, scan.visit, {
+					...scan.options,
+					storage: this.#storage,
+					throwIfMissing: true,
+				});
+				break;
+			} catch (readError) {
+				// A synchronous rewrite during the read already recovered; retry against its result.
+				if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
+				if (readError instanceof SessionReadConflictError) {
+					if (reads >= MAX_WRITE_CONFLICT_RECOVERIES) return this.#moveOffSessionFile("contested");
+					// One scan serves one read: what the cut-off read found says nothing about the next.
+					scan = this.#foreignEntryScan();
+					continue;
+				}
+				if (!isEnoent(readError)) return this.#moveOffSessionFile("replaced");
+				this.#expectedDiskSize = null;
+				this.#durable = undefined;
+				return contested;
+			}
 		}
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
-		const found = this.#foreignEntriesIn(content);
+		const found = scan.found();
 		if (!found) return this.#moveOffSessionFile("replaced");
 		await resolveBlobRefsInEntries(found.foreign, this.#blobs);
 		if (this.#diskEpoch !== epoch || this.#sessionFile !== contested) return this.#sessionFile;
 		// An append during the await may have moved the frontier past what was read; the retry republishes.
-		this.#adoptForeignEntries({ ...found, extendsFrontier: false }, Buffer.byteLength(content, "utf8"));
+		this.#adoptForeignEntries({ ...found, extendsFrontier: false }, scan.bytes());
 		return contested;
 	}
 
@@ -2898,8 +3316,23 @@ export class SessionManager {
 		return settingsStoreMask(Settings.instance, this.#cwd);
 	}
 
-	#lineFor(entry: FileEntry, mask = this.storeMask()): string {
-		return `${stringifyJson(prepareEntryForPersistence(maskSessionEntry(entry, mask), this.#blobs)) ?? "null"}\n`;
+	/**
+	 * The stored line of `entry`, without its patches when `withoutPatches`: a
+	 * cold entry's whole form read back from its record, masked with `mask` in
+	 * that form, so the store gets the same bytes whether the entry is cold or
+	 * whole ({@link maskSessionEntry}). An `entry_patch` record stays one line,
+	 * each of its patches masked by the rules of the entry this manager holds
+	 * under its id ({@link maskEntryPatchRecord}).
+	 */
+	#lineFor(entry: FileEntry, mask = this.storeMask(), withoutPatches = false): string {
+		const record = coldEntryForPersistence(entry);
+		const read = record ?? entry;
+		const source = withoutPatches ? withoutEntryPatches(read) : read;
+		const form = record === undefined ? "live" : "record";
+		const masked = isEntryPatchRecord(source)
+			? maskEntryPatchRecord(source, this.#index, mask, form)
+			: maskSessionEntry(source, mask, form);
+		return `${stringifyJson(prepareEntryForPersistence(masked, this.#blobs)) ?? "null"}\n`;
 	}
 
 	/**
@@ -2937,10 +3370,17 @@ export class SessionManager {
 		return !this.#allEntriesHandedToStorage() && this.#shouldHaveSessionFile();
 	}
 
-	/** Verify a failed acknowledgement without materializing a file-backed transcript. */
+	/**
+	 * Verify a failed acknowledgement chunk by chunk: file bytes exactly, other
+	 * storage by size and SHA-256. A full rewrite or delete that races the read
+	 * (`SessionReadConflictError`) is read again from its start through
+	 * {@link retryRacedRead}, never as one whole-text read; the body is hashed
+	 * once, before the first read.
+	 */
 	async #bodyMatchesStorage(sessionFile: string, body: SessionFileBody): Promise<boolean> {
 		if (this.#storage instanceof FileSessionStorage) return fileMatchesLines(sessionFile, body.lines);
-		return textMatchesLines(await this.#storage.readText(sessionFile), body.lines);
+		const expected = sessionBodyDigest(body);
+		return retryRacedRead(() => chunksMatchBody(transcriptByteChunks(sessionFile, this.#storage), expected));
 	}
 
 	/**
@@ -3031,7 +3471,7 @@ export class SessionManager {
 					yield line;
 				}
 				for (let index = 0; index < entryCount; index++) {
-					const line = manager.#lineFor(entries[index]!, mask);
+					const line = manager.#lineFor(entries[index]!, mask, true);
 					const lineBytes = Buffer.byteLength(line, "utf8");
 					bytes += lineBytes;
 					bytesSinceGc += lineBytes;
@@ -3312,7 +3752,7 @@ export class SessionManager {
 				}
 				if (this.#diskEpoch !== epoch) {
 					try {
-						if (textMatchesLines(await this.#storage.readText(sessionFile), body.lines)) {
+						if (await this.#bodyMatchesStorage(sessionFile, body)) {
 							this.#recordPublish(body.stamp, body.bytes);
 						}
 					} catch {
@@ -3658,6 +4098,7 @@ export class SessionManager {
 
 		this.#entries = [];
 		this.#index.clear();
+		this.#resetColdCut(undefined, false);
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = false;
 		this.#loadedMalformedRecords = 0;
@@ -3687,15 +4128,99 @@ export class SessionManager {
 	}
 
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
-		this.#header = header;
+		this.#adoptHeader(header);
 		this.#entries = entries;
+		warnRepairedUsage(normalizeLoadedUsage(entries));
+		this.#reindexEntries();
+	}
+
+	/** Index `#entries` again after they changed as a whole; the cut is computed again at the next context build. */
+	#reindexEntries(): void {
+		this.#index.rebuild(this.#entries);
+		this.#coldCutStale = true;
+	}
+
+	/** Take the session's identity and title from a loaded `header`. */
+	#adoptHeader(header: SessionHeader): void {
+		this.#header = header;
 		this.#sessionId = header.id;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = header.timestamp;
-		const repairedUsage = normalizeLoadedUsage(entries);
-		if (repairedUsage > 0) logger.warn("Loaded assistant messages with incomplete usage", { count: repairedUsage });
-		this.#index.rebuild(entries);
+	}
+
+	/**
+	 * Start over with `store` as the cold store: the cut is computed again, for
+	 * no model yet, at the next context build when `stale`, else once a trigger
+	 * marks it stale.
+	 */
+	#resetColdCut(store: ColdEntryStore | undefined, stale: boolean): void {
+		this.#adoptColdStore(store);
+		this.#coldCutModel = undefined;
+		this.#coldCutStale = stale;
+	}
+
+	/** Make `store` the one new cold entries go to, holding it in place of the previous one. */
+	#adoptColdStore(store: ColdEntryStore | undefined): void {
+		if (store === this.#coldStore) return;
+		this.#coldStore?.release(false);
+		store?.retain();
+		this.#coldStore = store;
+	}
+
+	/**
+	 * The store new cold entries go to, created on first use: over a file, or
+	 * kept compressed in memory where none can be made.
+	 */
+	#openColdStore(): ColdEntryStore {
+		if (this.#coldStore) return this.#coldStore;
+		const store = ColdEntryStore.open(this.#blobs);
+		this.#adoptColdStore(store);
+		return store;
+	}
+
+	/**
+	 * Whether a convert pass can make an entry cold: false once the store
+	 * closed, when {@link convertToColdEntry} keeps every entry whole.
+	 */
+	#coldStoreTakesRecords(): boolean {
+		return this.#coldStore?.writable ?? true;
+	}
+
+	/**
+	 * Bring every entry in line with `boundary`: in the `hydrate` phase the
+	 * entries it keeps whole become whole again, in the `convert` phase the
+	 * others become cold.
+	 */
+	#applyColdBoundary(boundary: ColdBoundary, phase: "hydrate" | "convert"): void {
+		const entries = this.#entries;
+		if (phase === "convert") {
+			convertColdEntries(entries, boundary, () => this.#openColdStore());
+			return;
+		}
+		hydrateKeptEntries(entries, boundary);
+	}
+
+	/**
+	 * The boundary to apply before the next context build, or undefined when
+	 * the last one still holds. A trigger (load, compaction, branch move) marks
+	 * it stale. A build that names a model whose provider or API differs from
+	 * the model the cut was computed for adopts that model, whose readable
+	 * compaction can start the context earlier, and computes the cut again: the
+	 * first build for a model switched to reads no cold entry. A build that only
+	 * measures (`measureOnly`) changes neither. The cut stays stale until the
+	 * build applies it ({@link buildSessionContext}).
+	 */
+	#staleColdBoundary(options: SessionContextBuildOptions | undefined): ColdBoundary | undefined {
+		if (!this.#coldStoreEnabled || options?.measureOnly) return undefined;
+		const model = options?.transcript ? undefined : options?.model;
+		const current = this.#coldCutModel;
+		if (model && (current === undefined || model.provider !== current.provider || model.api !== current.api)) {
+			this.#coldCutModel = model;
+			this.#coldCutStale = true;
+		}
+		if (!this.#coldCutStale) return undefined;
+		return coldBoundary(this.#entries, this.#index.branchView(), this.#coldCutModel);
 	}
 
 	#freshEntryFields(): { id: string; parentId: string | null; timestamp: string; runtime: RuntimeIdentity } {
@@ -3707,7 +4232,9 @@ export class SessionManager {
 		};
 	}
 
+	/** Move the leaf; when it moves, the cut is computed again at the next context build. */
 	#setLeaf(id: string | null): void {
+		if (this.#index.leafId() !== id) this.#coldCutStale = true;
 		this.#index.setLeaf(id);
 		const batch = this.#atomicEntryBatch;
 		if (batch && !batch.collecting) {
@@ -3726,6 +4253,10 @@ export class SessionManager {
 		}
 		this.#entries.push(entry);
 		this.#index.insert(entry);
+		// A compaction moves the cut once the agent's context is rebuilt from it
+		// (the next context build). A model change moves it at the first build
+		// for the new model, which adopts that model.
+		if (entry.type === "compaction") this.#coldCutStale = true;
 		const batch = this.#atomicEntryBatch;
 		if (batch?.collecting) batch.entryIds.add(entry.id);
 		if (batch && !batch.collecting) {
@@ -3765,7 +4296,7 @@ export class SessionManager {
 			this.#entries.slice(0, durable.issued).every(entry => !batch.entryIds.has(entry.id));
 		this.#entries = retained;
 		if (durable && keepsFrontier) durable.generation = this.#entriesGeneration;
-		this.#index.rebuild(retained);
+		this.#reindexEntries();
 		this.#index.setLeaf(restoredLeaf && this.#index.has(restoredLeaf) ? restoredLeaf : null);
 	}
 
@@ -3875,6 +4406,8 @@ export class SessionManager {
 			// a rollback observe the move it is undoing.
 			header: structuredClone(this.#header),
 			entries: [...this.#entries],
+			coldStore: this.#coldStore,
+			coldCutModel: this.#coldCutModel,
 		};
 	}
 
@@ -3886,7 +4419,7 @@ export class SessionManager {
 	 */
 	cloneCurrentSession(options?: { persist?: boolean }): SessionManager {
 		const persist = options?.persist ?? this.#persist;
-		const clone = new SessionManager(this.#cwd, this.#sessionDir, persist, this.#storage);
+		const clone = new SessionManager(this.#cwd, this.#sessionDir, persist, this.#storage, this.#coldStoreEnabled);
 		clone.#storeMasking = this.#storeMasking;
 		clone.#suppressBreadcrumb = true;
 		clone.restoreState(this.captureState());
@@ -3956,6 +4489,12 @@ export class SessionManager {
 		this.#durable = snapshot.durable
 			? durableFrontier(this.#entriesGeneration, snapshot.durable.count, snapshot.durable.size)
 			: undefined;
+		this.#adoptColdStore(snapshot.coldStore);
+		// A rollback leaves the agent's context the one built for this model (a
+		// switch restores it, a move keeps it), so the cut `#applyEntries` marked
+		// stale, recomputed at the next build or recool, keeps whole what that
+		// context holds.
+		this.#coldCutModel = snapshot.coldCutModel;
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 		// A rolled-back switch gives up the claim it took on the session it opened.
@@ -4046,7 +4585,7 @@ export class SessionManager {
 	): Promise<void> {
 		const storage = this.#storage;
 		if (!claim || !storage.acquireSessionClaim || !this.#persist) {
-			return this.#setSessionFile(sessionFile, undefined, { switched });
+			return this.#setSessionFile(sessionFile, { switched });
 		}
 		const resolved = path.resolve(sessionFile);
 		// An append to this file still running (a stopped work pool's discards, `appendCustomEntriesToFile`) writes
@@ -4054,7 +4593,7 @@ export class SessionManager {
 		// append's session or this one moves to a sibling.
 		await SessionManager.#pendingAppends.get(resolved);
 		const sessionId = await readSessionHeaderId(resolved, storage);
-		if (!sessionId) return this.#setSessionFile(resolved, undefined, { switched });
+		if (!sessionId) return this.#setSessionFile(resolved, { switched });
 		// A reload of the session this manager holds keeps its own claim through the load: a write in between (a work
 		// pool's record; a reload cancels no jobs) takes that claim, not the switch's handover slot, which is the only
 		// one left once the manager gives its own back and which a write's claim cannot share. The adoption then lets
@@ -4086,7 +4625,7 @@ export class SessionManager {
 		// there, under an id of its own).
 		const claimed = { sessionId, release, holder, adopted: false };
 		try {
-			await this.#setSessionFile(resolved, undefined, { claimed, switched, keepClaim: rereads });
+			await this.#setSessionFile(resolved, { claimed, switched, keepClaim: rereads });
 		} finally {
 			if (!claimed.adopted) release?.();
 		}
@@ -4094,11 +4633,14 @@ export class SessionManager {
 
 	async #setSessionFile(
 		sessionFile: string,
-		loadedSession?: SessionLoadResult,
-		options?: {
-			throwIfMissing?: boolean;
+		options?: Pick<TranscriptLoadOptions, "throwIfMissing" | "preloaded"> & {
 			newSession?: NewSessionOptions;
 			keepClaim?: boolean;
+			/**
+			 * Set by `#open`, which waited for the file's pending {@link appendCustomEntriesToFile} writes before its
+			 * load, or, for that writer's own load, must not: the load then does not wait for them.
+			 */
+			appendsAwaited?: boolean;
 			/**
 			 * The lease {@link setSessionFile} took before it loaded the file: adopted with the id, in one step, and
 			 * marked `adopted`; {@link setSessionFile} releases it otherwise.
@@ -4119,7 +4661,7 @@ export class SessionManager {
 	): Promise<void> {
 		// An append to this file that is still running (a stopped work pool's discards) lands first,
 		// so the session loads it and its next entry follows it. `#open` waits before its own load.
-		if (!loadedSession) await SessionManager.#pendingAppends.get(path.resolve(sessionFile));
+		if (!options?.appendsAwaited) await SessionManager.#pendingAppends.get(path.resolve(sessionFile));
 		await this.#drainWrites();
 		// A queued write's conflict the drain met starts a recovery (#recoverQueuedConflict): it keeps the other
 		// writer's entries and publishes the transcript again, or moves this session to a sibling. Let it finish, as
@@ -4156,9 +4698,7 @@ export class SessionManager {
 		}
 
 		let resolvedSessionFile: string;
-		let loaded: SessionLoadResult;
-		let sourceSize: number | null;
-		let migrated = false;
+		let loaded: LoadedTranscript | undefined;
 		let headerCwd: string | undefined;
 		let headerCwdEnterable = false;
 		try {
@@ -4176,27 +4716,21 @@ export class SessionManager {
 					this.#sessionDir = path.dirname(resolvedSessionFile);
 				}
 			}
-			loaded = loadedSession ?? (await loadSessionFile(resolvedSessionFile, this.#storage));
-			sourceSize =
-				loaded.sourceSize !== undefined
-					? loaded.sourceSize
-					: this.#storage.existsSync(resolvedSessionFile)
-						? this.#storage.statSync(resolvedSessionFile).size
-						: null;
+			loaded = await this.#loadTranscript(resolvedSessionFile, {
+				throwIfMissing: options?.throwIfMissing,
+				preloaded: options?.preloaded,
+			});
 			if (loaded.invalidHeader) {
 				throw new Error(
 					`Cannot resume session "${resolvedSessionFile}": the session header is missing or malformed. The file was not modified.`,
 				);
 			}
 			// Every await of the load runs before the new file is set, so the file, the id and the entries change in
-			// one step: a write in between would claim the session left's id at the new file's path.
-			if (loaded.entries.length > 0) {
-				migrated = migrateToCurrentVersion(loaded.entries);
-				applyToolResultPrunes(loaded.entries);
-				// The blobs this session names get its reference rows, so another session's delete keeps them.
-				await resolveBlobRefsInEntries(loaded.entries, this.#blobs, resolvedSessionFile);
-				// loadEntriesFromFile guarantees entries[0] is a valid session header.
-				const cwd = (loaded.entries[0] as SessionHeader).cwd;
+			// one step: a write in between would claim the session left's id at the new file's path. The load itself
+			// migrates the entries, applies their prune and patch records, and gives the blobs they name their
+			// reference rows (see #loadTranscript).
+			if (loaded.header) {
+				const cwd = loaded.header.cwd;
 				headerCwd = cwd ? path.resolve(cwd) : undefined;
 				headerCwdEnterable =
 					headerCwd !== undefined &&
@@ -4230,15 +4764,20 @@ export class SessionManager {
 				this.#switchGeneration++;
 				this.#heldAdoptionFile = undefined;
 			}
+		} catch (error) {
+			// A load this switch does not adopt closes the store of older entry bodies it opened, now, not at a collection.
+			loaded?.coldStore?.close();
+			throw error;
 		} finally {
 			if (switching) {
 				this.#activeSwitch = undefined;
 			}
 		}
+		const sourceSize = loaded.sourceSize;
 		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
 
-		const { entries: fileEntries, titleSlot } = loaded;
-		if (fileEntries.length === 0) {
+		const { header, titleSlot } = loaded;
+		if (!header) {
 			if (options?.throwIfMissing) {
 				throw new Error(
 					`Cannot resume session "${resolvedSessionFile}": the session file holds no entries. The file was not modified.`,
@@ -4252,8 +4791,6 @@ export class SessionManager {
 			if (await this.#writeNewSessionFile()) this.#fileIsCurrent = true;
 			return;
 		}
-
-		const header = fileEntries[0] as SessionHeader;
 
 		// Adopt the loaded session's working directory only when it is verifiably
 		// accessible. Sessions live in a dir keyed by their cwd, so resuming a
@@ -4277,25 +4814,24 @@ export class SessionManager {
 			this.#fallbackRuntimeOnly = false;
 		}
 
-		this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
+		this.#adoptLoadedTranscript(header, loaded);
 		this.#expectedDiskSize = sourceSize;
 		this.#additionalDirectories = header.additionalDirectories ?? [];
 		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
 		this.#hasTitleSlot = titleSlot !== undefined;
 		this.#fileIsCurrent = true;
-		this.#rewriteRequired = migrated || loaded.malformedRecords > 0;
+		this.#rewriteRequired = loaded.migrated || loaded.malformedRecords > 0 || loaded.sanitized;
 		// Migration assigns ids and parents the file lacks, and a torn record
 		// would swallow the next append, so either republishes first.
 		this.#durable =
-			migrated || loaded.malformedRecords > 0 || sourceSize === null
+			loaded.migrated || loaded.malformedRecords > 0 || sourceSize === null
 				? undefined
 				: durableFrontier(this.#entriesGeneration, this.#entries.length, sourceSize);
 		this.#loadedMalformedRecords = loaded.malformedRecords;
 		this.#forceFileCreation = true;
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
-
-		if (this.sanitizeLoadedOpenAIResponsesReplayMetadata()) this.#rewriteRequired = true;
+		if (loaded.sanitized) this.#bodyRevision++;
 		// Adopt a lease taken before the load with the id, before any await:
 		// nothing observes the id without its claim, or a held id at all.
 		const claimed = options?.claimed;
@@ -4330,6 +4866,252 @@ export class SessionManager {
 		// here rather than at its first append, so a roster scan cannot offer the
 		// adopted transcript as revivable in between.
 		if (this.#writerOwned) this.#claimSession();
+	}
+
+	/** Make a {@link LoadedTranscript} this manager's entries, under `header`. */
+	#adoptLoadedTranscript(header: SessionHeader, loaded: LoadedTranscript): void {
+		this.#adoptHeader(header);
+		this.#entries = loaded.entries;
+		this.#index = loaded.index;
+		this.#resetColdCut(loaded.coldStore, false);
+		warnRepairedUsage(loaded.repairedUsage);
+		SessionManager.#releaseLoadedTranscript(loaded);
+	}
+
+	/**
+	 * Empty a {@link LoadedTranscript} its manager took over. The promise that
+	 * delivered it can stay referenced by an engine cache after the load, and
+	 * would keep every entry alive after the manager released them.
+	 */
+	static #releaseLoadedTranscript(loaded: LoadedTranscript): void {
+		loaded.entries = [];
+		loaded.index = new SessionEntryIndex();
+		loaded.coldStore = undefined;
+	}
+
+	/**
+	 * Stream the session at `filePath` into memory one entry at a time, so the
+	 * transcript is never held whole: each entry is migrated, its usage
+	 * completed, adapted for a fork and indexed. When the stream reaches a
+	 * compaction, the entries before its kept start that are not kept whole by
+	 * kind are written to a new cold store; the entries since stay whole until
+	 * a later compaction or the end of the stream decides, so a session with no
+	 * compaction and no other branch writes nothing. After the stream the cut
+	 * is computed for the leaf, the entries it keeps whole are made whole
+	 * again, stale replay metadata is stripped (after any load-time pass, so
+	 * from what the passes left), every other entry still whole goes to the
+	 * store (an entry off the leaf's path, or one a pass or the stripping made
+	 * whole), and the whole entries' blob references are resolved.
+	 *
+	 * A full rewrite or delete that replaced the transcript mid-read
+	 * (`SessionReadConflictError`) makes the whole load run again from its
+	 * start, as often as {@link retryRacedRead} allows before the error
+	 * surfaces: each pass builds its entries and its cold store afresh, and a
+	 * pass that throws closes the store it opened, so nothing of it reaches
+	 * the next one.
+	 */
+	#loadTranscript(filePath: string, options: TranscriptLoadOptions): Promise<LoadedTranscript> {
+		return retryRacedRead(async () => {
+			// A current-version file whose first entry has no id may predate ids
+			// altogether; only a pass over every entry tells (see migrateToCurrentVersion).
+			// Each pass learns it afresh: what a raced read found of the transcript
+			// says nothing about the one read next.
+			let unindexed: boolean | undefined;
+			for (;;) {
+				const loaded = await this.#streamTranscript(filePath, options, unindexed);
+				if (loaded) return loaded;
+				unindexed = await this.#transcriptIsUnindexed(filePath, options);
+			}
+		});
+	}
+
+	/** Visit the transcript at `filePath`, or the copy of it `options.preloaded` already holds. */
+	async #visitTranscript(
+		filePath: string,
+		options: TranscriptLoadOptions,
+		visit: (entry: FileEntry) => void | boolean,
+	): Promise<SessionFileVisit> {
+		if (options.preloaded) return visitLoadedSession(options.preloaded, visit);
+		return visitSessionFile(filePath, this.#storage, visit, { throwIfMissing: options.throwIfMissing });
+	}
+
+	/** Whether `filePath` has non-header entries and none of them has an id. */
+	async #transcriptIsUnindexed(filePath: string, options: TranscriptLoadOptions): Promise<boolean> {
+		const count = new UnindexedCount();
+		await this.#visitTranscript(filePath, options, entry => !count.add(entry));
+		return count.unindexed;
+	}
+
+	/**
+	 * One streamed pass of {@link #loadTranscript}. Returns undefined, having
+	 * kept nothing, when `unindexed` is still unknown and the file needs it.
+	 * A known `unindexed` that this pass's own body contradicts came from a
+	 * body another writer replaced between the passes: the pass then fails as
+	 * a raced read (`SessionReadConflictError`), so the load runs again. Against
+	 * `unindexed: true` it fails at the first entry with an id.
+	 */
+	async #streamTranscript(
+		filePath: string,
+		options: TranscriptLoadOptions,
+		unindexed: boolean | undefined,
+	): Promise<LoadedTranscript | undefined> {
+		const fork = options.fork;
+		let header: SessionHeader | undefined;
+		let migration: SessionEntryMigration | undefined;
+		let needsIndexCheck = false;
+		// What this pass's body says of a known `unindexed`; an unknown one is not counted.
+		const count = unindexed === undefined ? undefined : new UnindexedCount();
+		let sanitized = false;
+		let repairedUsage = 0;
+		// The entries live only in `intake`, emptied before this returns: an
+		// async function keeps its locals in a scope that its closures (and an
+		// engine call-site cache holding the last visitor) can keep alive, and
+		// that scope must not keep the transcript alive once the manager lets go.
+		const interner = new LoadedValueInterner();
+		// The blobs every entry names, cold ones too, by hash with their MIME types (see the end of the pass); only
+		// the blob tier's pass reads them, so without a tier none are collected.
+		const named = this.#blobs.tier ? new Map<string, string | undefined>() : undefined;
+		const intake: {
+			entries: SessionEntry[];
+			index: SessionEntryIndex;
+			store: ColdEntryStore | undefined;
+			/** Entries before this index were offered to the store by a compaction's kept start. */
+			cooled: number;
+			/** Entries carrying replay metadata a resume strips, sanitized once the load-time passes ran. */
+			unsanitized: SessionEntry[];
+		} = {
+			entries: [],
+			index: new SessionEntryIndex(),
+			store: undefined,
+			cooled: 0,
+			unsanitized: [],
+		};
+		const openStore = () => {
+			intake.store ??= ColdEntryStore.open(this.#blobs);
+			return intake.store;
+		};
+		const startMigration = (current: SessionHeader): SessionEntryMigration => {
+			const started = new SessionEntryMigration(current, unindexed ?? false);
+			started.migrate(current);
+			return started;
+		};
+		try {
+			const visited = await this.#visitTranscript(filePath, options, raw => {
+				if (!header) {
+					header = raw as SessionHeader;
+					return;
+				}
+				if (!migration) {
+					if (
+						unindexed === undefined &&
+						(header.version ?? 1) >= 2 &&
+						(raw.type === "session" || lacksEntryId(raw))
+					) {
+						needsIndexCheck = true;
+						return false;
+					}
+					migration = startMigration(header);
+				}
+				// An entry with an id already contradicts a body without ids.
+				if (count?.add(raw) && unindexed) throw new SessionReadConflictError(filePath);
+				migration.migrate(raw);
+				if (raw.type === "session" && fork) return;
+				let entry = raw as SessionEntry;
+				if (
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					normalizeAssistantUsage(entry.message)
+				) {
+					repairedUsage++;
+				}
+				if (fork?.resetInheritedCost) SessionManager.#resetInheritedUsageCost(entry);
+				if (fork?.seance && entry.type === "session_init") entry = SessionManager.#neutralizedSessionInit(entry);
+				if (
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message) !== entry.message
+				) {
+					intake.unsanitized.push(entry);
+				}
+				interner.intern(entry, entry.parentId === null ? undefined : intake.index.get(entry.parentId));
+				intake.entries.push(entry);
+				intake.index.insert(entry);
+				// Before the entry can go cold: the blobs it names, which the open writes back and references.
+				if (named) collectBlobRefNames(entry, named);
+				if (this.#coldStoreEnabled && entry.type === "compaction") {
+					const keptStart = streamedKeptStart(intake.entries, entry, intake.cooled, id => intake.index.has(id));
+					for (; intake.cooled < keptStart; intake.cooled++) {
+						const older = intake.entries[intake.cooled]!;
+						if (coldKindOf(older).wholeByKind) continue;
+						convertToColdEntry(older, openStore, { imagesExternalized: true, paced: true });
+					}
+				}
+			});
+			if (needsIndexCheck) {
+				intake.store?.close();
+				return undefined;
+			}
+			if (count && count.unindexed !== unindexed) {
+				throw new SessionReadConflictError(filePath);
+			}
+			if (header && !migration) migration = startMigration(header);
+			intake.index.settleLeaf(intake.entries);
+			const boundary = this.#coldStoreEnabled
+				? coldBoundary(intake.entries, intake.index.branchView(), undefined)
+				: undefined;
+			if (boundary) hydrateKeptEntries(intake.entries, boundary, { resolveBlobs: false });
+			// Prune records, then patch records, apply after migration, to targets
+			// made whole without their images (wholeTargetsOf); convertColdEntries
+			// below returns those to the store.
+			const targets = wholeTargetsOf(intake.index);
+			applyToolResultPrunes(intake.entries, targets);
+			applyEntryPatches(intake.entries, targets);
+			// Sanitize after the load-time passes, as a load of the whole transcript
+			// does, since a pass can change what an entry replays: every whole entry,
+			// and each entry the stream found replay metadata on, made whole for it.
+			for (const entry of intake.unsanitized) hydrateColdEntry(entry, { resolveBlobs: false });
+			intake.unsanitized = [];
+			for (const entry of intake.entries) {
+				if (!isColdEntry(entry) && SessionManager.#sanitizeLoadedEntry(entry)) sanitized = true;
+			}
+			// Put in the store every entry the boundary leaves cold that the load
+			// holds whole: one the stream kept whole after the newest compaction's
+			// kept start that the leaf's path leaves, and one a load-time pass
+			// (writing through an accessor) or the replay-metadata stripping made
+			// whole, which goes back with the values it now holds.
+			if (boundary) convertColdEntries(intake.entries, boundary, openStore, { paced: true });
+			// The blobs this session names get its reference rows, so another session's delete keeps them: those
+			// of every entry the stream read (`named`), the ones now cold included. A fork's come with its own write.
+			// The active snapcompact compaction is looked up among every entry, since a cold entry (a patch record)
+			// can lie on its branch, by tree fields a cold entry keeps; only the whole entries are walked for blobs.
+			await resolveBlobRefsInEntries(
+				intake.entries.filter(entry => !isColdEntry(entry)),
+				this.#blobs,
+				fork ? undefined : filePath,
+				{ collected: named, transcript: intake.entries },
+			);
+			if (intake.store && !intake.entries.some(isColdEntry)) {
+				intake.store.close();
+				intake.store = undefined;
+			}
+			const loaded: LoadedTranscript = {
+				...visited,
+				header: visited.invalidHeader ? undefined : header,
+				entries: intake.entries,
+				index: intake.index,
+				coldStore: intake.store,
+				migrated: migration?.needed ?? false,
+				sanitized,
+				repairedUsage,
+			};
+			intake.entries = [];
+			intake.index = new SessionEntryIndex();
+			intake.store = undefined;
+			return loaded;
+		} catch (error) {
+			intake.store?.close();
+			throw error;
+		}
 	}
 
 	/**
@@ -4943,7 +5725,9 @@ export class SessionManager {
 		storage: SessionStorage = defaultSessionStorage(),
 	): Promise<SessionManager> {
 		const sessionDir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(this.#cwd, undefined, storage);
-		const manager = new SessionManager(this.#cwd, sessionDir, true, storage);
+		// An in-memory source holds every entry, and the copy persists: it moves older ones to a store.
+		const coldStore = this.#persist ? this.#coldStoreEnabled : true;
+		const manager = new SessionManager(this.#cwd, sessionDir, true, storage, coldStore);
 		manager.#storeMasking = this.#storeMasking;
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		manager.#resetToNewSession({ taskPromptCacheKey: this.#header.taskPromptCacheKey });
@@ -4955,10 +5739,20 @@ export class SessionManager {
 		manager.#additionalDirectories = [...this.#additionalDirectories];
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
-		manager.#entries = structuredClone(this.#entries);
-		manager.#index.rebuild(manager.#entries);
+		// A whole entry is cloned; a cold one is copied as a new cold entry over the same record.
+		manager.#entries = this.#entries.map(entry =>
+			isColdEntry(entry) ? copyColdEntry(entry) : structuredClone(entry),
+		);
+		manager.#adoptColdStore(this.#coldStore);
+		manager.#reindexEntries();
 		manager.#forceFileCreation = true;
-		await manager.#rewriteAtomically();
+		try {
+			await manager.#rewriteAtomically();
+		} catch (error) {
+			// No caller gets the copy to close, so its hold on the store goes now, not at a collection.
+			manager.#releaseColdStore();
+			throw error;
+		}
 		return manager;
 	}
 
@@ -5146,6 +5940,66 @@ export class SessionManager {
 	}
 
 	/**
+	 * {@link flushSync}, then, on a storage that only queues the publish
+	 * (indexed backends such as SQL), the wait for that publish: the promise
+	 * settles once {@link flush} has seen the store take every queued write, and
+	 * rejects when one failed. `undefined` when the synchronous flush alone made
+	 * the session durable (file and memory storage).
+	 *
+	 * On such a storage a rewrite queued while this manager's own earlier
+	 * publish is unconfirmed fails the store's size check. That publish's
+	 * confirmation rewrites the transcript, the refused entries included, so
+	 * the wait covers it before {@link flush} reports what is left. When the
+	 * drain fails and the flush still fails after it, the wait rejects with the
+	 * drain's error (the store's first failed write, which may belong to any
+	 * path) instead of the size-check conflict the flush still holds.
+	 *
+	 * A write the lease fence refused latches no failure: the loss moves the
+	 * session to a sibling, whose publish carries the refused entries. Under
+	 * `OMP_SESSION_EXCLUSIVE=1` the loss stops the session instead, and writes
+	 * them nowhere. So the promise also rejects when the session stopped, or
+	 * when storage still lacks an entry once the flush has settled.
+	 */
+	flushSyncThenConfirm(): Promise<void> | undefined {
+		if (!this.#storage.defersSyncPublish) {
+			this.flushSync();
+			return undefined;
+		}
+		let flushed: Promise<void>;
+		try {
+			this.flushSync();
+			flushed = this.flush();
+		} catch (error) {
+			if (!(error instanceof SessionWriteConflictError)) throw error;
+			// The drain hands back (and clears) the store's first failure, and the
+			// conflict latched first keeps that failure out of the persistence log:
+			// report it in place of the conflict when the flush fails too.
+			flushed = this.#storage.drain().then(
+				() => this.flush(),
+				drainError =>
+					this.flush().catch(() => {
+						throw drainError;
+					}),
+			);
+		}
+		return flushed.then(() => {
+			if (this.#exclusiveStopping) {
+				throw new Error("The session stopped under OMP_SESSION_EXCLUSIVE=1 before storage held its last entries.");
+			}
+			if (this.#hasUnsavedEntries()) throw new Error("Storage does not hold every entry of the session.");
+		});
+	}
+
+	/**
+	 * The storage's {@link SessionStorage.waitForAppendAdmission}: settles once this process may queue more
+	 * transcript appends, or at once when `signal` fires. `undefined` when the storage never makes turns wait on
+	 * queued appends, so a caller has nothing to wait for.
+	 */
+	waitForAppendAdmission(signal?: AbortSignal): Promise<void> | undefined {
+		return this.#storage.waitForAppendAdmission?.(signal);
+	}
+
+	/**
 	 * Drop only session files that this manager saw materialized for a draft and
 	 * that still contain no durable conversation or extension state. Explicit
 	 * ensureOnDisk() records (ACP session/new, handoff) stay resumable.
@@ -5199,21 +6053,31 @@ export class SessionManager {
 	}
 
 	/**
-	 * Write the entries storage is missing, then close the append writer.
-	 * Rejects only while storage is still not proven to hold every entry.
-	 * While a {@link dropSession} deletes the current file, this waits for the
-	 * delete to settle first. A close that rejects while the store refuses
-	 * this session's writes keeps the transcript (see {@link #hold}); a close
-	 * that lands sends the sessions the same store refused and waits for
-	 * those sends (see {@link #sendRefusedSessions}).
+	 * Write the entries storage is missing, then close the append writer and,
+	 * unless a clone still holds it, the store of older entry bodies, so its
+	 * descriptor and disk are freed now rather than at a collection. A manager
+	 * that does not persist only lets go of the store. Close a
+	 * manager last: an older entry of it cannot be read once its store is
+	 * closed. Rejects only while storage is still not proven to hold every
+	 * entry. While a {@link dropSession} deletes the current file, this waits
+	 * for the delete to settle first. A close that rejects while the store
+	 * refuses this session's writes keeps the transcript (see {@link #hold});
+	 * a close that lands sends the sessions the same store refused and waits
+	 * for those sends (see {@link #sendRefusedSessions}).
 	 */
 	async close(): Promise<void> {
 		this.#closes++;
 		await this.#pendingDrop?.settled.promise;
-		if (!this.#persist) return;
+		if (!this.#persist) {
+			// A clone made without persistence shares its source's store.
+			this.#releaseColdStore();
+			return;
+		}
+		let failed = false;
 		try {
 			await this.#closeLocked();
 		} catch (error) {
+			failed = true;
 			// The rejection can be a repair failure that wraps the refusal
 			// (SessionPersistenceIndeterminateError); the queue is where the
 			// refusal itself was admitted (see #noteDiskFailure).
@@ -5227,6 +6091,11 @@ export class SessionManager {
 				await this.#hold();
 			throw error;
 		} finally {
+			// The close's writes read older entries from the store; nothing reads them after close, also when the
+			// close fails early (a marker unlink that throws). A failed close whose transcript stays (held for a
+			// later send, see #hold, or kept for an owner that stays open, see seal's `keepEntries`) still reads
+			// them: the store then goes when the hold ends (see #unhold), or with the manager.
+			if (!failed || (!this.#heldBasis && !this.#keepsEntries)) this.#releaseColdStore();
 			// Closing gives up this process's ownership claim; a later write
 			// reclaims it. It goes last: until the final publish has run, the
 			// claim keeps the session's write fence in place, so no write of this
@@ -5386,6 +6255,8 @@ export class SessionManager {
 		this.#heldBasis = undefined;
 		this.#leaveStoreQueue();
 		if (held) this.#releaseSessionClaim();
+		// The held transcript was the store's last reader on this closed manager, unless its owner keeps the entries.
+		if (held && !this.#keepsEntries) this.#releaseColdStore();
 		if (this.#released && !this.#keepsEntries && !this.#entriesReleased) this.releaseRetainedEntries();
 	}
 
@@ -5541,6 +6412,12 @@ export class SessionManager {
 		if (this.#diskFailure && (this.#entriesReleased || !this.#allEntriesHandedToStorage())) throw this.#diskFailure;
 	}
 
+	/** Drop this manager's hold on its cold store, closing the store when no other manager holds it. */
+	#releaseColdStore(): void {
+		this.#coldStore?.release(true);
+		this.#coldStore = undefined;
+	}
+
 	/**
 	 * Raise the terminal write barrier ahead of the final {@link close}. Once
 	 * sealed:
@@ -5590,6 +6467,8 @@ export class SessionManager {
 		this.#durable = undefined;
 		this.#refusedSessionSwitch = undefined;
 		this.#index.clear();
+		// A clone or a snapshot taken for a rollback can still read the store; it closes once collected.
+		this.#resetColdCut(undefined, false);
 		this.#inMemoryArtifacts = null;
 		this.#closeWriterEventually();
 		this.#entriesReleased = true;
@@ -5947,7 +6826,7 @@ export class SessionManager {
 		return this.#titleSource;
 	}
 
-	/** Bumped when entries are rewritten in place (`rewriteEntries`, replay sanitizing); appends do not bump it. */
+	/** Bumped when entries change in place (`rewriteEntries`, `patchEntries`, replay sanitizing); appends do not bump it. */
 	get bodyRevision(): number {
 		return this.#bodyRevision;
 	}
@@ -6440,12 +7319,49 @@ export class SessionManager {
 	 * outputs). Use sparingly. It persists content changes only; re-parenting
 	 * entries in place is not supported. A failed rewrite leaves later appends
 	 * incremental, and its edits reach the file with the next full rewrite.
+	 * Field updates that {@link patchEntries} can describe go through it instead.
 	 */
 	async rewriteEntries(): Promise<void> {
 		this.#bodyRevision++;
 		if (!this.#persist || !this.#sessionFile) return;
 		this.#rewriteRequired = true;
 		await this.#rewriteAtomically();
+	}
+
+	/**
+	 * Set fields on entries this session holds and persist them as one appended
+	 * `entry_patch` record, whose size follows the patched fields rather than
+	 * the transcript; whole-file readers replay it on load (`entry-patches.ts`).
+	 * Bumps the body revision, as {@link rewriteEntries} does, so observers of
+	 * in-place updates (the thread publisher) republish the entries. The record
+	 * holds its own copy of each value, and an entry keeps a value it already
+	 * holds (an elide pass passes a message's own `content`), so no entry
+	 * shares an object with the record.
+	 *
+	 * Rejects before changing anything when a patch names an entry this
+	 * session lacks or a field that entry's kind does not have. A failed write
+	 * does not reject: like every append, it reaches the persistence-error
+	 * observers, the fields stay set, and the next successful write lands them.
+	 * Resolves once pending writes, the record's included, have settled.
+	 */
+	async patchEntries(patches: readonly EntryPatch[]): Promise<void> {
+		if (patches.length === 0) return;
+		const data = toEntryPatchData(patches);
+		const changes = patches.map(patch => {
+			const target = this.#index.get(patch.entryId);
+			if (!target || !entryAcceptsPatch(target, patch)) {
+				throw new Error(`Entry patch does not fit session entry ${patch.entryId}`);
+			}
+			return { target, patch };
+		});
+		for (const { target, patch } of changes) setPatchedFields(target, patch);
+		this.#bodyRevision++;
+		this.appendCustomEntry(ENTRY_PATCH_CUSTOM_TYPE, data);
+		try {
+			await this.flush();
+		} catch (error) {
+			this.#noteDiskFailure(error);
+		}
 	}
 
 	/**
@@ -6619,14 +7535,58 @@ export class SessionManager {
 	}
 
 	/**
+	 * The active-leaf branch from the cut on: the first entry the model context
+	 * keeps of the latest compaction (see `coldCutPathIndex`) to the leaf. Their
+	 * bodies stay in memory, except the records no turn reads there (patch
+	 * records, `session_exit` records, a user's to-do edit, a to-do HUD choice
+	 * or a mode change older than the newest of its kind, a compaction older
+	 * than the one the context starts from), so a reader of the recent turns
+	 * reads no older body.
+	 * The whole branch when the context uses no compaction.
+	 */
+	getBranchFromCut(): SessionEntry[] {
+		const branch = this.#index.branchView();
+		return branch.slice(coldCutPathIndex(branch, readCompactions(branch, this.#coldCutModel)));
+	}
+
+	/**
 	 * Build the session context (LLM messages), or — with `{ transcript: true }` —
 	 * the full-history display transcript, from the current leaf path.
 	 */
-	buildSessionContext(options?: BuildSessionContextOptions): SessionContext {
-		return buildSessionContext(this.#entries, this.#index.leafId(), this.#index.entriesById(), {
+	buildSessionContext(options?: SessionContextBuildOptions): SessionContext {
+		// Entries the new cut keeps become whole before the build reads them;
+		// the ones it leaves behind go cold once the context no longer holds them.
+		const boundary = this.#staleColdBoundary(options);
+		if (boundary) this.#applyColdBoundary(boundary, "hydrate");
+		const context = buildSessionContext(this.#entries, this.#index.leafId(), this.#index.entriesById(), {
 			resolveFrameData: data => this.resolveFrameData(data),
 			...options,
 		});
+		if (boundary) {
+			// Applied: a hydration or a build that throws leaves the cut stale, so
+			// the next build applies it again instead of reading the entries it
+			// keeps through their accessors.
+			this.#coldCutStale = false;
+			if (this.#coldStoreTakesRecords()) this.#applyColdBoundary(boundary, "convert");
+		}
+		return context;
+	}
+
+	/**
+	 * The display transcript (`buildSessionContext({ transcript: true })`) of
+	 * the active branch from its newest compaction on. The full transcript ends
+	 * with these same messages, since that compaction renders as its summary
+	 * there too, so a reader of the last turns (the retry check of an idle
+	 * session) gets them without reading an entry before the compaction.
+	 */
+	buildTranscriptSinceCompaction(): SessionContext["messages"] {
+		const branch = this.#index.branchView();
+		const start = branch.findLastIndex(entry => entry.type === "compaction");
+		if (start < 0) return this.buildSessionContext({ transcript: true }).messages;
+		return buildSessionContext(branch.slice(start), this.#index.leafId(), undefined, {
+			transcript: true,
+			resolveFrameData: data => this.resolveFrameData(data),
+		}).messages;
 	}
 
 	/** Prompt blocks for a snapcompact archive, budgeted and resolved as {@link buildSessionContext} attaches them. */
@@ -6643,16 +7603,21 @@ export class SessionManager {
 	/** Strip stale OpenAI Responses replay metadata from loaded assistant entries. */
 	sanitizeLoadedOpenAIResponsesReplayMetadata(): boolean {
 		let changed = false;
+		// A cold entry was sanitized when it was loaded, before it went cold.
 		for (const entry of this.#entries) {
-			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-			const sanitized = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
-			if (sanitized === entry.message) continue;
-
-			entry.message = sanitized;
-			changed = true;
+			if (!isColdEntry(entry) && SessionManager.#sanitizeLoadedEntry(entry)) changed = true;
 		}
 		if (changed) this.#bodyRevision++;
 		return changed;
+	}
+
+	/** {@link sanitizeLoadedOpenAIResponsesReplayMetadata} for one entry; whether it changed. */
+	static #sanitizeLoadedEntry(entry: SessionEntry): boolean {
+		if (entry.type !== "message" || entry.message.role !== "assistant") return false;
+		const sanitized = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
+		if (sanitized === entry.message) return false;
+		entry.message = sanitized;
+		return true;
 	}
 
 	getHeader(): SessionHeader | null {
@@ -6699,6 +7664,49 @@ export class SessionManager {
 		return [...this.#entries];
 	}
 
+	/** How much of the session lives in its cold entry store; for diagnostics and tests. */
+	coldStoreStats(): ColdStoreStats {
+		let coldEntries = 0;
+		for (const entry of this.#entries) if (isColdEntry(entry)) coldEntries++;
+		const store = this.#coldStore;
+		return {
+			coldEntries,
+			storeBytes: store?.bytes ?? 0,
+			materializations: store?.materializations ?? 0,
+			hydrations: store?.hydrations ?? 0,
+			storeInMemory: store?.inMemory ?? false,
+			compressedBytes: store?.compressedBytes ?? 0,
+		};
+	}
+
+	/**
+	 * Change nested values of the entry `id` in place: a cold entry's values
+	 * read back frozen, so it is made whole first, `update` runs on it, and it
+	 * goes back to the store with its new body. Persist with
+	 * {@link rewriteEntries} afterwards, as for any in-place update.
+	 */
+	updateEntryBody<T>(id: string, update: (entry: SessionEntry) => T): T {
+		const entry = this.#index.get(id);
+		if (!entry) throw new Error(`Entry ${id} not found`);
+		const wasCold = hydrateColdEntry(entry);
+		const result = update(entry);
+		if (wasCold) convertToColdEntry(entry, () => this.#openColdStore());
+		return result;
+	}
+
+	/**
+	 * Put back in the store, with the values they hold now, the entries before
+	 * the cut (or off the current path) that a write made whole. A write to a
+	 * field of a cold entry makes it whole: a prune pass blanking a result
+	 * before the cut, or a failed persist restoring the previous values; this
+	 * returns the entry to the store, to its former record when the values are
+	 * unchanged.
+	 */
+	recoolEntries(): void {
+		if (!this.#coldStoreEnabled || !this.#coldStoreTakesRecords()) return;
+		this.#applyColdBoundary(coldBoundary(this.#entries, this.#index.branchView(), this.#coldCutModel), "convert");
+	}
+
 	/** {@link conversationTip} of the session at its active leaf. */
 	getConversationTip(): SessionEntry | undefined {
 		return conversationTip(this.#entries, this.#index.branchView());
@@ -6730,101 +7738,25 @@ export class SessionManager {
 	 * Durably move the active branch past a discarded entry.
 	 *
 	 * The loader reconstructs the active branch from the last physical journal
-	 * entry, so changing the in-memory leaf alone is lost on reload. Known
-	 * metadata children are chained onto the discarded entry's parent before the
-	 * entry is removed. If any child may carry content, the subtree is preserved
-	 * off-branch instead. Both paths append a metadata-only branch marker, and
-	 * a removal republishes the journal without the entry.
+	 * entry, so changing the in-memory leaf alone is lost on reload. A
+	 * metadata-only branch marker under the discarded entry's parent moves the
+	 * leaf, followed by fresh copies of the entry's children when they are all
+	 * `service_tier_change` entries; a subtree that may carry content stays
+	 * off-branch as it is. The discard only appends, so it survives a restart
+	 * while full rewrites fail.
 	 *
-	 * A removed assistant turn was still billed, so its usage is re-journaled as
-	 * an off-branch `model_usage` entry; session totals and `omp stats` keep
-	 * counting it. A subtree preserved off-branch keeps its own usage.
-	 *
-	 * When that republish fails, the removal is undone: the entry and its
-	 * children return to the journal as storage holds them, and the marker is
-	 * appended under the entry's parent instead, followed by fresh copies of the
-	 * `service_tier_change` children, so the discard survives a restart while
-	 * full rewrites keep failing and later turns keep appending.
+	 * The discarded entry stays in the journal off-branch, so a discarded
+	 * assistant turn keeps its billed usage: session totals and `omp stats`
+	 * count every entry.
 	 */
 	async discardEntryDurably(entryId: string): Promise<void> {
 		const entry = this.#index.get(entryId);
 		if (!entry) return;
 		const children = this.#index.childrenOf(entryId);
-		const markerDetails = { kind: DISCARDED_ENTRY_BRANCH_MARKER, discardedEntryId: entryId };
-		if (!children.every(child => child.type === "service_tier_change")) {
-			this.branchWithSummary(entry.parentId, "", markerDetails);
-			await this.flush();
-			return;
+		this.branchWithSummary(entry.parentId, "", { kind: DISCARDED_ENTRY_BRANCH_MARKER, discardedEntryId: entryId });
+		if (children.every((child): child is ServiceTierChangeEntry => child.type === "service_tier_change")) {
+			for (const child of children) this.appendServiceTierChange(child.serviceTier);
 		}
-		const original = this.#entries;
-		let leafId = entry.parentId;
-		for (const child of children) {
-			child.parentId = leafId;
-			leafId = child.id;
-		}
-		const originalGeneration = this.#entriesGeneration;
-		const removed = original.filter(candidate => candidate !== entry);
-		this.#entries = removed;
-		const removedGeneration = this.#entriesGeneration;
-		this.#index.rebuild(removed);
-		// The durable frontier described the previous array, so recording the
-		// usage or marker republishes the journal without the entry.
-		if (entry.type === "message" && entry.message.role === "assistant") {
-			const { api, provider, model, usage, stopReason, errorMessage } = entry.message;
-			// Off-branch like late usage: totals count every entry, and the kept
-			// chain stays made of entries collab guests replicate.
-			this.#recordEntry({
-				type: "model_usage",
-				id: generateId(this.#index),
-				parentId: leafId,
-				timestamp: entry.timestamp,
-				runtime: currentRuntimeIdentity(),
-				activeLeafId: leafId,
-				purpose: DISCARDED_TURN_USAGE_PURPOSE,
-				api,
-				provider,
-				model,
-				usage,
-				stopReason,
-				...(errorMessage === undefined ? {} : { errorMessage }),
-			});
-		}
-		const markerId = this.branchWithSummary(leafId, "", markerDetails);
-		// A deferring backend confirms the republish only once it drains.
-		await this.flush().catch(() => undefined);
-		const published =
-			!this.#persist ||
-			!this.#sessionFile ||
-			!this.#shouldHaveSessionFile() ||
-			this.#durable?.generation === removedGeneration;
-		const marker = this.#index.get(markerId);
-		if (published || this.#entries !== removed || marker?.type !== "branch_summary") {
-			await this.flush();
-			return;
-		}
-		const appendedSince = removed.slice(removed.indexOf(marker) + 1);
-		const leafAfter = this.#index.leafId();
-		for (const child of children) child.parentId = entryId;
-		this.#entries = original;
-		// Storage still holds the original entries, so the frontier over them holds again.
-		const durable = this.#durable;
-		if (durable?.generation === originalGeneration) durable.generation = this.#entriesGeneration;
-		this.#index.rebuild(original);
-		// Neither the marker nor anything recorded after it reached storage, so
-		// their parents can still change before they are appended.
-		marker.parentId = entry.parentId;
-		marker.fromId = entry.parentId ?? "root";
-		original.push(marker);
-		this.#index.insert(marker);
-		for (const child of children as ServiceTierChangeEntry[]) this.appendServiceTierChange(child.serviceTier);
-		const tip = this.#index.leafId();
-		for (const later of appendedSince) {
-			if (later.parentId === markerId) later.parentId = tip;
-			original.push(later);
-			this.#index.insert(later);
-		}
-		this.#index.setLeaf(leafAfter === markerId ? tip : leafAfter);
-		this.#appendToSessionFile(marker);
 		await this.flush();
 	}
 
@@ -6870,7 +7802,9 @@ export class SessionManager {
 		const entriesToKeep: SessionEntry[] = [];
 		for (const entry of branchPath) {
 			if (entry.type === "label") continue;
-			entriesToKeep.push(entry.activeLeafId === undefined ? entry : { ...entry, activeLeafId: undefined });
+			if (entry.activeLeafId === undefined) entriesToKeep.push(entry);
+			else if (isColdEntry(entry)) entriesToKeep.push(copyColdEntry(entry, { activeLeafId: undefined }));
+			else entriesToKeep.push({ ...entry, activeLeafId: undefined });
 		}
 		const keptIds = new Set(entriesToKeep.map(entry => entry.id));
 		const labelsToCarry: Array<{ targetId: string; label: string }> = [];
@@ -6919,7 +7853,7 @@ export class SessionManager {
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = timestamp;
 		this.#hasTitleSlot = true;
-		this.#index.rebuild(this.#entries);
+		this.#reindexEntries();
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#forceFileCreation = this.#persist;
@@ -7098,31 +8032,30 @@ export class SessionManager {
 			resetInheritedCost?: boolean;
 			repairInterruptedTail?: boolean;
 			seance?: boolean;
+			/** @internal `false` holds every entry in memory instead of moving older ones to a cold store. */
+			coldStore?: boolean;
 			storeMasking?: StoreMaskingBinding;
 		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const manager = new SessionManager(cwd, dir, true, storage, options?.coldStore);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		if (options?.storeMasking) manager.setStoreMasking(options.storeMasking);
 
 		// A missing source must fail instead of forking an empty parentless session:
 		// the loader swallows ENOENT by default for fresh-session opens, so fork opts out.
-		let sourceEntries: FileEntry[];
+		let loaded: LoadedTranscript;
 		try {
-			sourceEntries = await loadEntriesFromFile(sourcePath, storage, { throwIfMissing: true });
+			loaded = await manager.#loadTranscript(sourcePath, {
+				throwIfMissing: true,
+				fork: { resetInheritedCost: options?.resetInheritedCost, seance: options?.seance },
+			});
 		} catch (err) {
 			if (isEnoent(err) || isEnotdir(err)) throw new ForkSourceNotFoundError(sourcePath);
 			throw err;
 		}
-		migrateToCurrentVersion(sourceEntries);
-		applyToolResultPrunes(sourceEntries);
-		await resolveBlobRefsInEntries(sourceEntries, manager.#blobs);
 
-		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
-		normalizeLoadedUsage(history);
-		if (options?.resetInheritedCost) SessionManager.#resetInheritedUsageCost(history);
+		const sourceHeader = loaded.header;
 		manager.#resetToNewSession(
 			{
 				parentSession: sourceHeader?.id,
@@ -7138,48 +8071,49 @@ export class SessionManager {
 			: (sourceHeader?.additionalDirectories ?? []).filter(d => d !== path.resolve(cwd));
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? manager.#additionalDirectories : undefined;
-		if (options?.seance) {
-			manager.#header.seanceSource = path.resolve(sourcePath);
-			SessionManager.#neutralizeSessionInits(history);
-		}
+		if (options?.seance) manager.#header.seanceSource = path.resolve(sourcePath);
 		manager.#sessionName = manager.#header.title;
 		manager.#titleSource = manager.#header.titleSource;
 		manager.#titleUpdatedAt = nowIso();
 		manager.#hasTitleSlot = true;
+		const history = loaded.entries;
 		manager.#entries = history;
-		manager.#index.rebuild(history);
-		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
+		manager.#index = loaded.index;
+		manager.#resetColdCut(loaded.coldStore, false);
+		SessionManager.#releaseLoadedTranscript(loaded);
 		if (options?.repairInterruptedTail) {
+			const repairedFrom = history.length;
 			SessionManager.#repairForkedInterruptedTail(history, manager.#index.pathTo());
-			manager.#index.rebuild(history);
+			for (const entry of history.slice(repairedFrom)) manager.#index.insert(entry);
 		}
-		await manager.#writeNewSessionFile();
-		if (!options?.seance && options?.copyArtifacts !== false) {
-			await copySessionArtifacts(sourcePath, manager.#sessionFile!, storage);
+		try {
+			await manager.#writeNewSessionFile();
+			if (!options?.seance && options?.copyArtifacts !== false) {
+				await copySessionArtifacts(sourcePath, manager.#sessionFile!, storage);
+			}
+		} catch (error) {
+			// No caller gets the fork to close, so the store its load opened closes now, not at a collection.
+			manager.#releaseColdStore();
+			throw error;
 		}
 		return manager;
 	}
 
-	/** Replace inherited `session_init` entries, in place, with inert custom entries keeping the same tree position. */
-	static #neutralizeSessionInits(history: SessionEntry[]): void {
-		for (let index = 0; index < history.length; index++) {
-			const entry = history[index]!;
-			if (entry.type !== "session_init") continue;
-			const neutralized: CustomEntry = {
-				type: "custom",
-				customType: "source_session_init",
-				id: entry.id,
-				parentId: entry.parentId,
-				timestamp: entry.timestamp,
-				data: entry,
-			};
-			history[index] = neutralized;
-		}
+	/** An inherited `session_init` entry as an inert custom entry keeping the same tree position. */
+	static #neutralizedSessionInit(entry: SessionInitEntry): CustomEntry {
+		return {
+			type: "custom",
+			customType: "source_session_init",
+			id: entry.id,
+			parentId: entry.parentId,
+			timestamp: entry.timestamp,
+			data: entry,
+		};
 	}
 
 	/**
-	 * Zero the monetary attribution (cost, credits, premium requests) on the
-	 * forked history's assistant turns and completed `task` results, in place.
+	 * Zero the monetary attribution (cost, credits, premium requests) of one
+	 * forked entry: an assistant turn or a completed `task` result, in place.
 	 *
 	 * A tan fork is a fresh agent that inherits the parent's transcript purely
 	 * for context; its spend must reflect only its own work. Session cost is
@@ -7188,12 +8122,10 @@ export class SessionManager {
 	 * Token counts are left intact — compaction anchors and context math depend
 	 * on them — since only billing attribution is inherited, not context size.
 	 */
-	static #resetInheritedUsageCost(history: SessionEntry[]): void {
-		for (const entry of history) {
-			resetUsageCost(entryUsage(entry));
-			if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "task") {
-				resetTaskResultBilling(entry.message.details);
-			}
+	static #resetInheritedUsageCost(entry: SessionEntry): void {
+		resetUsageCost(entryUsage(entry));
+		if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "task") {
+			resetTaskResultBilling(entry.message.details);
 		}
 	}
 
@@ -7240,12 +8172,19 @@ export class SessionManager {
 	 * @param options.initialCwd Cwd to use when the file is empty or missing.
 	 * @param options.throwIfMissing Propagate ENOENT instead of creating a new session at a missing path.
 	 * @param options.parentSession Parent session file recorded when the file is empty or missing.
+	 * @param options.coldStore `@internal` `false` holds every entry in memory instead of moving older ones to a cold store.
 	 */
 	static async open(
 		filePath: string,
 		sessionDir?: string,
 		storage: SessionStorage = defaultSessionStorage(),
-		options?: { initialCwd?: string; parentSession?: string; suppressBreadcrumb?: boolean; throwIfMissing?: boolean },
+		options?: {
+			initialCwd?: string;
+			parentSession?: string;
+			suppressBreadcrumb?: boolean;
+			throwIfMissing?: boolean;
+			coldStore?: boolean;
+		},
 	): Promise<SessionManager> {
 		return SessionManager.#open(filePath, sessionDir, storage, options, { awaitPendingAppends: true });
 	}
@@ -7259,16 +8198,23 @@ export class SessionManager {
 		sessionDir: string | undefined,
 		storage: SessionStorage,
 		options:
-			| { initialCwd?: string; parentSession?: string; suppressBreadcrumb?: boolean; throwIfMissing?: boolean }
+			| {
+					initialCwd?: string;
+					parentSession?: string;
+					suppressBreadcrumb?: boolean;
+					throwIfMissing?: boolean;
+					coldStore?: boolean;
+			  }
 			| undefined,
 		internal: { awaitPendingAppends: boolean },
 	): Promise<SessionManager> {
 		if (internal.awaitPendingAppends) await SessionManager.#pendingAppends.get(path.resolve(filePath));
-		const probed = await loadSessionFile(filePath, storage, {
+		// A streamed transcript yields only its header here; its entries stream in below.
+		const probed = await probeSessionFile(filePath, storage, {
 			throwIfMissing: options?.throwIfMissing,
 			digest: options?.throwIfMissing,
 		});
-		const header = probed.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		const header = probed.header;
 		// Resume into the session's recorded cwd only when it is verifiably
 		// accessible. A deleted or permission-blocked (macOS TCC denial) project
 		// dir would make the constructor's #cwd — and the `setProjectDir` chdir
@@ -7283,21 +8229,27 @@ export class SessionManager {
 			(recordedCwd && !recordedCwdUsable
 				? SessionManager.getDefaultSessionDir(cwd, undefined, storage)
 				: path.dirname(path.resolve(filePath)));
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const manager = new SessionManager(cwd, dir, true, storage, options?.coldStore);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		// Fail-closed callers yield while probing the recorded cwd. Before
 		// adoption, digest the current content and parse again only if it
 		// differs from the snapshot parsed above. A deleted, truncated, or
 		// replaced transcript then still fails closed, and a stable
-		// multi-gigabyte session is read once more but parsed only once.
-		const loaded =
-			options?.throwIfMissing && !(await sessionSnapshotIsCurrent(storage, filePath, probed))
-				? await loadSessionFile(filePath, storage, { throwIfMissing: true })
-				: probed;
-		await manager.#setSessionFile(filePath, loaded, {
+		// multi-gigabyte session is read once more but parsed only once. A
+		// streamed transcript was not parsed above: it streams in after the probe.
+		const preloaded =
+			probed.loaded && options?.throwIfMissing && !(await sessionSnapshotIsCurrent(storage, filePath, probed.loaded))
+				? undefined
+				: probed.loaded;
+		await manager.#setSessionFile(filePath, {
 			throwIfMissing: options?.throwIfMissing,
 			newSession: { parentSession: options?.parentSession },
+			preloaded,
+			appendsAwaited: true,
 		});
+		// A finished async call can stay referenced by an engine cache; drop the
+		// probe's copy of the entries so it cannot outlive the manager's.
+		if (probed.loaded) probed.loaded.entries = [];
 		return manager;
 	}
 
@@ -7371,7 +8323,12 @@ export class SessionManager {
 		};
 
 		try {
-			await visitEntriesFromFile(filePath, visit, storage);
+			// A full rewrite between two chunks of a long transcript fails the read: read it again from its start.
+			await retryRacedRead(() => {
+				header = undefined;
+				initEntries.length = 0;
+				return visitEntriesFromFile(filePath, visit, storage);
+			});
 		} catch {
 			return null;
 		}
@@ -7400,7 +8357,9 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = defaultSessionStorage(),
-		options: { onSessionContinuation?: (continuation: SessionContinuation) => void } = {},
+		options: {
+			onSessionContinuation?: (continuation: SessionContinuation) => void;
+		} = {},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const resolvedCwd = path.resolve(cwd);

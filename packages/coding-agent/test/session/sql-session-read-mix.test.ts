@@ -1,0 +1,381 @@
+/**
+ * A chunked read (`readChunks`) of a SQL session fetches its parts one page
+ * at a time. When the parts are replaced between two pages, the read must
+ * notice and fail with `SessionReadConflictError` (the loaders then read
+ * again), or finish with one whole body: never the first pages of one body
+ * followed by the rest of another. Here the session goes (a delete, or a
+ * truncate to "") and is appended again with lines of the same lengths, so
+ * every part starts where an old one did. Each case runs against SQLite
+ * always and against PostgreSQL and MySQL when `OMP_TEST_SQL_POSTGRES_URL` /
+ * `OMP_TEST_SQL_MYSQL_URL` name a database.
+ */
+import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
+import { loadSessionFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import { SessionReadConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import { padFills, raceAfterFirstChunk } from "./chunked-read-race";
+import { LEASE_BACKENDS, type LeaseDb, openLeaseDb, transcript } from "./sql-session-lease-fixture";
+
+const ID = "01a1f000-0000-7000-8000-000000000071";
+/** Timings under which no heartbeat runs during a case. */
+const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
+const MiB = 1024 * 1024;
+const TIMESTAMP = "2026-11-17T00:00:00.000Z";
+
+/** Session {@link ID}'s header and first turn, then eight 1 MiB lines of `fill`: over 8 MiB, past several pages. */
+function body(fill: string): string[] {
+	return [
+		transcript(ID, "first"),
+		...Array.from(
+			{ length: 8 },
+			(_, n) =>
+				`${JSON.stringify({ type: "custom", customType: "pad", id: `p${n}`, parentId: null, timestamp: TIMESTAMP, data: fill.repeat(MiB) })}\n`,
+		),
+	];
+}
+
+/** Append `lines` to `file` one by one, as a session's writer does, and wait until they are stored. */
+async function appendLines(storage: SqlSessionStorage, file: string, lines: string[]): Promise<void> {
+	const writer = storage.openWriter(file, { flags: "a" });
+	for (const line of lines) await writer.append(line);
+	await writer.close();
+	await storage.drain();
+}
+
+for (const { adapter, url } of LEASE_BACKENDS) {
+	describe.skipIf(!url)(`a chunked SQL read raced by a re-created body (${adapter})`, () => {
+		for (const replace of ["delete", "truncate"] as const) {
+			it(`yields the old body, the new one or a read conflict when a ${replace} and same-length appends land between two pages`, async () => {
+				// If this regresses, loading, copying or forking a session another process re-created meanwhile
+				// silently yields its first lines from the old transcript and the rest from the new one.
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const writer = await db.open({ lease: STILL });
+				const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+				const release = await writer.acquireSessionClaim?.(ID, file);
+				const before = body("a");
+				const after = body("b");
+				await appendLines(writer, file, before);
+
+				const reader = await db.open({ lease: STILL });
+				await reader.refresh();
+				const chunks: Uint8Array[] = [];
+				let outcome: string;
+				try {
+					for await (const chunk of reader.readChunks(file)) {
+						chunks.push(chunk);
+						if (chunks.length !== 1) continue;
+						if (replace === "delete") await writer.unlink(file);
+						else await writer.writeText(file, "");
+						await writer.drain();
+						await appendLines(writer, file, after);
+					}
+					const text = Buffer.concat(chunks).toString("utf8");
+					outcome = text === before.join("") ? "old body" : text === after.join("") ? "new body" : "a mix";
+				} catch (err) {
+					if (!(err instanceof SessionReadConflictError)) throw err;
+					outcome = "read conflict";
+				}
+				expect(["old body", "new body", "read conflict"]).toContain(outcome);
+				release?.();
+			}, 120_000);
+		}
+	});
+}
+
+/** `count` lines of 1 MiB of `fill` that session {@link ID} appends after its body. */
+function laterLines(fill: string, count: number): string[] {
+	return Array.from(
+		{ length: count },
+		(_, n) =>
+			`${JSON.stringify({ type: "custom", customType: "pad", id: `q${n}`, parentId: null, timestamp: TIMESTAMP, data: fill.repeat(MiB) })}\n`,
+	);
+}
+
+/**
+ * Read `file` through `reader` from `fromByte`, running `race` once, right
+ * after the first chunk. What the read gave: the name of the entry of `bodies`
+ * its bytes equal, "read conflict", "a short body" (the start of one of
+ * `bodies`) or "a mix".
+ */
+async function racedRead(
+	reader: SqlSessionStorage,
+	file: string,
+	fromByte: number,
+	race: () => Promise<void>,
+	bodies: Record<string, string>,
+): Promise<string> {
+	const chunks: Uint8Array[] = [];
+	try {
+		for await (const chunk of reader.readChunks(file, fromByte)) {
+			chunks.push(chunk);
+			if (chunks.length === 1) await race();
+		}
+	} catch (err) {
+		if (!(err instanceof SessionReadConflictError)) throw err;
+		return "read conflict";
+	}
+	const text = Buffer.concat(chunks).toString("utf8");
+	const named = Object.entries(bodies).find(([, body]) => body === text);
+	if (named) return named[0];
+	return Object.values(bodies).some(body => body.startsWith(text)) ? "a short body" : "a mix";
+}
+
+// Another store writes the session between two pages of a chunked read: an
+// append, a rename, or a full rewrite of the same size under a read from an
+// offset (`readChunks(path, fromByte)`, which starts inside the transcript).
+for (const { adapter, url } of LEASE_BACKENDS) {
+	describe.skipIf(!url)(`a chunked SQL read raced by another store (${adapter})`, () => {
+		async function sessionOf(
+			db: LeaseDb,
+		): Promise<{ writer: SqlSessionStorage; file: string; release?: () => void }> {
+			const writer = await db.open({ lease: STILL });
+			const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+			const release = await writer.acquireSessionClaim?.(ID, file);
+			return { writer, file, release: release ?? undefined };
+		}
+
+		async function readerOf(db: LeaseDb): Promise<SqlSessionStorage> {
+			const reader = await db.open({ lease: STILL });
+			await reader.refresh();
+			return reader;
+		}
+
+		it("yields exactly the body its first query saw when the other store appends lines between two pages", async () => {
+			// If this regresses, a resume of a session another process keeps appending to fails as raced, or
+			// ends in the middle of a line the read never finished.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const { writer, file, release } = await sessionOf(db);
+			const before = body("a");
+			await appendLines(writer, file, before);
+			const reader = await readerOf(db);
+
+			const outcome = await racedRead(reader, file, 0, () => appendLines(writer, file, laterLines("c", 2)), {
+				"old body": before.join(""),
+				"old body and the appended lines": [...before, ...laterLines("c", 2)].join(""),
+			});
+
+			expect(outcome).toBe("old body");
+			release?.();
+		}, 120_000);
+
+		it("fails as a read conflict or yields the old body when the other store renames the session between two pages", async () => {
+			// If this regresses, a session moved away during a read loads as its first pages only.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const { writer, file, release } = await sessionOf(db);
+			const before = body("a");
+			await appendLines(writer, file, before);
+			const reader = await readerOf(db);
+			const moved = path.join(db.dir.path(), "sessions", "-moved-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+
+			const outcome = await racedRead(reader, file, 0, () => writer.rename(file, moved), {
+				"old body": before.join(""),
+			});
+
+			expect(["old body", "read conflict"]).toContain(outcome);
+			release?.();
+		}, 120_000);
+
+		it("yields one body's bytes from the read's offset, or a read conflict, when the other store rewrites the session to the same size between two pages", async () => {
+			// If this regresses, a read from an offset of a session rewritten meanwhile reads the start of one body
+			// and the rest of another. Both bodies are full writes, so every part of one starts where a part of
+			// the other does, and the parts' offsets and the size cannot tell them apart.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const { writer, file, release } = await sessionOf(db);
+			const before = body("a").join("");
+			const after = body("b").join("");
+			await writer.writeText(file, before);
+			const reader = await readerOf(db);
+			const fromByte = 2 * MiB + MiB / 2;
+
+			const outcome = await racedRead(reader, file, fromByte, () => writer.writeText(file, after), {
+				"old body": Buffer.from(before).subarray(fromByte).toString("utf8"),
+				"new body": Buffer.from(after).subarray(fromByte).toString("utf8"),
+			});
+
+			expect(["old body", "new body", "read conflict"]).toContain(outcome);
+			release?.();
+		}, 120_000);
+	});
+}
+
+/**
+ * Session {@link ID}'s header and a first turn that says `prompt`, then a
+ * 1 MiB pad of "a" and seven of `fill`. Two such bodies whose prompts have one
+ * length have lines of the same lengths, and the same pad at the end of a
+ * read's first page (the turn and the first pad), while the turn before it and
+ * the pads after it differ.
+ */
+function sharedPadBody(prompt: string, fill: string): string[] {
+	return [transcript(ID, prompt), ...body("a").slice(1, 2), ...body(fill).slice(2)];
+}
+
+/** The text of the first user turn among `entries`. */
+function firstPrompt(entries: readonly unknown[]): string {
+	for (const entry of entries as Array<{ type?: string; message?: { role?: string; content?: unknown } }>) {
+		if (entry.type === "message" && entry.message?.role === "user") return String(entry.message.content);
+	}
+	return "";
+}
+
+// SQLite gives a new part the largest rowid plus one, so parts appended after a delete or a truncate take
+// the rowids of the parts they replace. The read must still tell the new body from the old one when the
+// part it fetched last holds the same bytes in both.
+describe("a chunked SQLite read raced by a re-created body that shares the part the read fetched last", () => {
+	for (const replace of ["delete", "truncate"] as const) {
+		it(`yields the old body, the new one or a read conflict when a ${replace} and re-appends land between two pages`, async () => {
+			// If this regresses, a session another process re-created meanwhile reads as its first lines from the
+			// old transcript and the rest from the new one, though one line in between is the same in both.
+			await using db = await openLeaseDb("sqlite", "sqlite");
+			const writer = await db.open({ lease: STILL });
+			const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+			const release = await writer.acquireSessionClaim?.(ID, file);
+			const before = sharedPadBody("first", "b");
+			const after = sharedPadBody("FIRST", "c");
+			expect(after.map(line => line.length)).toEqual(before.map(line => line.length));
+			await appendLines(writer, file, before);
+			const reader = await db.open({ lease: STILL });
+			await reader.refresh();
+
+			const outcome = await racedRead(
+				reader,
+				file,
+				0,
+				async () => {
+					if (replace === "delete") await writer.unlink(file);
+					else await writer.writeText(file, "");
+					await writer.drain();
+					await appendLines(writer, file, after);
+				},
+				{ "old body": before.join(""), "new body": after.join("") },
+			);
+
+			expect(["old body", "new body", "read conflict"]).toContain(outcome);
+			release?.();
+		}, 120_000);
+
+		it(`loads one body's entries when a ${replace} and re-appends land after the first chunk of the load`, async () => {
+			// If this regresses, resuming a session another process re-created meanwhile opens with the first turn
+			// of the old transcript followed by the later entries of the new one.
+			await using db = await openLeaseDb("sqlite", "sqlite");
+			const writer = await db.open({ lease: STILL });
+			const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+			const release = await writer.acquireSessionClaim?.(ID, file);
+			const before = sharedPadBody("first", "b");
+			const after = sharedPadBody("FIRST", "c");
+			await appendLines(writer, file, before);
+			const reader = await db.open({ lease: STILL });
+			await reader.refresh();
+			const race = raceAfterFirstChunk(reader, file, async () => {
+				if (replace === "delete") await writer.unlink(file);
+				else await writer.writeText(file, "");
+				await writer.drain();
+				await appendLines(writer, file, after);
+			});
+
+			let outcome: string;
+			try {
+				const loaded = await loadSessionFile(file, reader);
+				outcome = `${firstPrompt(loaded.entries)} ${padFills(loaded.entries)}`;
+			} catch (err) {
+				if (!(err instanceof SessionReadConflictError)) throw err;
+				outcome = "read conflict";
+			}
+
+			expect(race.ran).toBe(true);
+			expect(["first abbbbbbb", "FIRST accccccc", "read conflict"]).toContain(outcome);
+			release?.();
+		}, 120_000);
+	}
+});
+
+/**
+ * Write `lines` as session `file` the way an omp release older than the store's SQLite rowid rule does, by raw
+ * SQL on the fixture's connection: delete the session's parts and row (a no-op when it has none), insert its
+ * row, then insert each line as a part whose rowid is the parts table's largest rowid plus one. That release's
+ * writer leaves the rowid to SQLite, which picks exactly that, so a session it deletes and writes again gives
+ * its new parts the rowids of the old ones.
+ */
+async function olderWriterWrites(db: LeaseDb, file: string, lines: string[]): Promise<void> {
+	await db.sql(`DELETE FROM ${db.table}_parts WHERE path = @1`, [file]);
+	await db.sql(`DELETE FROM ${db.table} WHERE path = @1`, [file]);
+	const size = lines.reduce((total, line) => total + Buffer.byteLength(line), 0);
+	await db.sql(`INSERT INTO ${db.table} (path, content, mtime_ms, byte_len) VALUES (@1, '', @2, @3)`, [
+		file,
+		Date.now(),
+		size,
+	]);
+	let offset = 0;
+	for (const line of lines) {
+		await db.sql(
+			`INSERT INTO ${db.table}_parts (rowid, path, start_offset, content) ` +
+				`VALUES ((SELECT coalesce(max(rowid), 0) + 1 FROM ${db.table}_parts), @1, @2, @3)`,
+			[file, offset, line],
+		);
+		offset += Buffer.byteLength(line);
+	}
+}
+
+// An older release started the session and this store appended the rest of it, as when omp is upgraded while
+// a session is open; the older release, still running in another process, then re-creates the session. The
+// part the read starts at gets its old rowid back, and the part the read fetched last is the same in both bodies.
+describe("a chunked SQLite read of a session an older release started, raced by that release re-creating it", () => {
+	/** Session `file` of `db`: its first two lines from the older writer, the rest appended by a store of this release. */
+	async function startedByOlderWriter(db: LeaseDb, file: string, lines: string[]): Promise<() => void> {
+		// The store makes the tables; the older writer then starts the session, and the store finds it on refresh.
+		const writer = await db.open({ lease: STILL });
+		await olderWriterWrites(db, file, lines.slice(0, 2));
+		await writer.refresh();
+		const release = await writer.acquireSessionClaim?.(ID, file);
+		await appendLines(writer, file, lines.slice(2));
+		return () => release?.();
+	}
+
+	it("yields the old body, the new one or a read conflict when the older writer re-creates it between two pages", async () => {
+		// If this regresses, while an older omp release shares the SQLite database, reading a session that release
+		// re-creates meanwhile gives its first lines from the old transcript and the rest from the new one.
+		await using db = await openLeaseDb("sqlite", "sqlite");
+		const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+		const before = sharedPadBody("first", "b");
+		const after = sharedPadBody("FIRST", "c");
+		expect(after.map(line => line.length)).toEqual(before.map(line => line.length));
+		const release = await startedByOlderWriter(db, file, before);
+		expect((await db.row(file))?.content).toBe(before.join(""));
+		const reader = await db.open({ lease: STILL });
+		await reader.refresh();
+
+		const outcome = await racedRead(reader, file, 0, () => olderWriterWrites(db, file, after), {
+			"old body": before.join(""),
+			"new body": after.join(""),
+		});
+
+		expect(["old body", "new body", "read conflict"]).toContain(outcome);
+		release();
+	}, 120_000);
+
+	it("loads one body's entries when the older writer re-creates it after the first chunk of the load", async () => {
+		// If this regresses, resuming a session an older omp release re-creates meanwhile opens with the first turn
+		// of the old transcript followed by the later entries of the new one.
+		await using db = await openLeaseDb("sqlite", "sqlite");
+		const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+		const before = sharedPadBody("first", "b");
+		const after = sharedPadBody("FIRST", "c");
+		const release = await startedByOlderWriter(db, file, before);
+		const reader = await db.open({ lease: STILL });
+		await reader.refresh();
+		const race = raceAfterFirstChunk(reader, file, () => olderWriterWrites(db, file, after));
+
+		let outcome: string;
+		try {
+			const loaded = await loadSessionFile(file, reader);
+			outcome = `${firstPrompt(loaded.entries)} ${padFills(loaded.entries)}`;
+		} catch (err) {
+			if (!(err instanceof SessionReadConflictError)) throw err;
+			outcome = "read conflict";
+		}
+
+		expect(race.ran).toBe(true);
+		expect(["first abbbbbbb", "FIRST accccccc", "read conflict"]).toContain(outcome);
+		release();
+	}, 120_000);
+});

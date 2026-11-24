@@ -52,3 +52,31 @@ export async function readStoredSessions(
 	}
 	return sessions;
 }
+
+/**
+ * Drop every table a store whose session table is `table` makes, and the
+ * tables `extra` names (a lease table, a scratch table), so a case leaves none
+ * behind in a shared PostgreSQL or MySQL database.
+ */
+export async function dropSessionStoreTables(
+	client: { unsafe(query: string): Promise<unknown> },
+	table: string,
+	...extra: string[]
+): Promise<void> {
+	for (const name of [`${table}_parts`, `${table}_blobs`, `${table}_refs`, table, ...extra]) {
+		await client.unsafe(`DROP TABLE IF EXISTS ${name}`);
+	}
+}
+
+/**
+ * `default_transaction_read_only` on a PostgreSQL client's connection: `setting`
+ * is the default new transactions start from, `reset_val` the one the session
+ * began with (from the database, role, server or connection start), which a
+ * session `SET` leaves alone.
+ */
+export async function readOnlyDefault(client: SqlClient): Promise<{ setting: string; reset_val: string } | undefined> {
+	const rows = (await client.unsafe(
+		"SELECT setting, reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'",
+	)) as Array<{ setting: string; reset_val: string }>;
+	return rows[0];
+}
