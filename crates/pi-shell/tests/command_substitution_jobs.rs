@@ -569,7 +569,8 @@ fn a_process_substitution_of_a_fork_gets_no_finished_job() {
 /// or process substitution, the fork drops every finished job, `$!`'s too,
 /// from its own list, so the substitution lists none and the fork's own
 /// `jobs` after it none. A running job stays, so does one a SIGTERM killed,
-/// and in posix mode `$!`'s. The shell itself (a `{ …; }` it runs) drops
+/// and in posix mode `$!`'s and one a signal killed that the fork traps
+/// itself with a command. The shell itself (a `{ …; }` it runs) drops
 /// none of its own, nor does a fork that runs no substitution. A
 /// foreground external, a builtin or a pipeline drops none; `wait PID`
 /// takes only its job. From a script file a fork drops none (bash's
@@ -754,6 +755,13 @@ fn a_fork_drops_every_finished_job_as_it_expands_a_substitution() {
 			err:    "",
 		},
 		Both {
+			name:   "posix-hangup-under-its-own-trap-kept",
+			script: r"set -o posix; ( trap 'echo hup' HUP; sleep 20 & p=$!; /bin/true & q=$!; kill -HUP $p; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; y=$(:); jobs; echo e ); echo end",
+			out:    "[1]-  Hangup                     sleep 20\n[2]+  Done                       /bin/true\ne\nend\n",
+			file:   "[1]-  Hangup                     sleep 20\n[2]+  Done                       /bin/true\ne\nend\n",
+			err:    "",
+		},
+		Both {
 			name:   "pipeline-drops-none",
 			script: r"( /bin/sh -c 'exit 3' & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; true | cat; jobs; echo e )",
 			out:    "[1]-  Exit 3                     /bin/sh -c 'exit 3'\n[2]+  Done                       /bin/true\ne\n",
@@ -776,7 +784,8 @@ fn a_fork_drops_every_finished_job_as_it_expands_a_substitution() {
 /// process's own `jobs` after it list only `$!`'s, from a script file too.
 /// A foreground external or a builtin drops none. A job a SIGTERM killed
 /// stays; one that a signal the shell traps with a command killed goes (the
-/// substitution's process has that trap reset).
+/// substitution's process has that trap reset), but one a signal killed that
+/// the substitution's process traps itself with a command stays.
 #[test]
 fn a_command_substitution_drops_its_own_jobs_as_it_expands_one() {
 	assert_both(&[
@@ -834,6 +843,13 @@ fn a_command_substitution_drops_its_own_jobs_as_it_expands_one() {
 			script: r#"trap 'echo hup' HUP; x=$( sleep 20 & p=$!; /bin/true & q=$!; kill -HUP $p; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; y=$(:); jobs; echo e ); echo "[$x]""#,
 			out:    "[[2]   Done                       /bin/true\ne]\n",
 			file:   "[[2]   Done                       /bin/true\ne]\n",
+			err:    "",
+		},
+		Both {
+			name:   "hangup-under-its-own-trap-kept",
+			script: r#"x=$( trap 'echo hup' HUP; sleep 20 & p=$!; /bin/true & q=$!; kill -HUP $p; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; y=$(:); jobs; echo e ); echo "[$x]""#,
+			out:    "[[1]-  Hangup                     sleep 20\n[2]+  Done                       /bin/true\ne]\n",
+			file:   "[[1]-  Hangup                     sleep 20\n[2]+  Done                       /bin/true\ne]\n",
 			err:    "",
 		},
 	]);
