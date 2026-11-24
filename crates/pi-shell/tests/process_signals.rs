@@ -3586,8 +3586,11 @@ const SENT: &str = "until [ -e \"$F.sent\" ]; do /bin/sleep 0.01; done";
 /// have blocked ([`Run::when_blocked`]): the case tests a signal that comes
 /// while the shell waits, and a shell, or a process it forked, that has
 /// not reached its wait yet takes the signal otherwise (bash `wait_for`,
-/// `make_child`; obash `wait_starts`). Without, the shell runs shell code
-/// that never blocks.
+/// `make_child`; obash `wait_starts`). Without, the command runs shell
+/// code that never blocks, and each shell gets it once it waits for the
+/// copies of itself it forked ([`Run::when_it_waits`]): bash that has
+/// forked a subshell and not yet reached `wait_for` takes an `INT` as one
+/// that came while it ran shell code, and dies of it at once.
 struct SentCase {
 	shell:  &'static str,
 	script: String,
@@ -3601,7 +3604,8 @@ struct SentCase {
 /// One run of `script` as `shell` by `program`, which gets `sig` (to its
 /// process group with `group`) once the command it waits for has made
 /// `$F`; with `blocked`, only once the shell has also blocked
-/// ([`Run::when_blocked`]).
+/// ([`Run::when_blocked`]), else once it waits for the copies of itself it
+/// forked ([`Run::when_it_waits`]).
 fn sent(
 	program: &OsStr,
 	shell: &'static str,
@@ -3614,13 +3618,30 @@ fn sent(
 	let started = dir.path().join("started");
 	let run = Run::script(program, shell, script).env("F", &started);
 	let run = if group { run.own_group() } else { run };
-	let run = if blocked { run.when_blocked() } else { run };
+	let run = if blocked {
+		run.when_blocked()
+	} else {
+		run.when_it_waits()
+	};
 	run.go_signalled(&started, sig, group)
 }
 
 /// Run each case under obash and, where it exists, the real shell: both
 /// print the same and end the same.
 fn run_sent(cases: Vec<SentCase>) {
+	run_sent_raced(cases, &[]);
+}
+
+/// [`run_sent`], where the real shell may also print and end as `raced`
+/// says for the case of that script (its own timing picks one); obash
+/// prints and ends as the case says.
+fn run_sent_raced(cases: Vec<SentCase>, raced: &[(String, &[u8], End)]) {
+	assert!(
+		raced
+			.iter()
+			.all(|(row, ..)| cases.iter().any(|c| c.script == *row)),
+		"each raced row is a case"
+	);
 	for SentCase { shell, script, sig, group, stdout, end, waits } in cases {
 		let ours = sent(OsStr::new(env!("CARGO_BIN_EXE_obash")), shell, &script, sig, group, waits);
 		let shown = format!(
@@ -3634,11 +3655,17 @@ fn run_sent(cases: Vec<SentCase>) {
 		);
 		if let Some(real) = real(shell) {
 			let theirs = sent(real.as_os_str(), shell, &script, sig, group, waits);
-			assert_eq!(
-				(&ours.stdout, ours.end()),
-				(&theirs.stdout, theirs.end()),
-				"{shown}: {theirs:?}"
-			);
+			let other = raced
+				.iter()
+				.find(|(row, ..)| *row == script)
+				.map(|&(_, out, end)| (out.to_vec(), Some(end)));
+			if other != Some((theirs.stdout.clone(), theirs.end())) {
+				assert_eq!(
+					(&ours.stdout, ours.end()),
+					(&theirs.stdout, theirs.end()),
+					"{shown}: {theirs:?}"
+				);
+			}
 		}
 	}
 }
@@ -3880,7 +3907,19 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	// Shell code that makes `$F`, then runs on, never blocking, until the run
 	// has sent the signal.
 	let busy = ": > \"$F\"; until [ -e \"$F.sent\" ]; do :; done";
-	run_sent(vec![
+	// The pipeline whose every stage dies of the `INT`: bash 5.2.21 goes on
+	// now and then (`after`), its stages' statuses `130 0` (the last stage's
+	// `/bin/sh` took no `INT`, and what it ran read its input to the end) or
+	// `130 130`: bash alone on gVisor under load, signalled as here once each
+	// process was blocked, 4 runs in 12,600 of this row, 5 in 10,000 with the
+	// last stage reading its input itself and the first waiting on a FIFO.
+	// bash's timing, not the run's; obash prints the golden.
+	let pipeline = format!(
+		"trap 'echo x' EXIT; /bin/sh -c ': > \"$F.a\"; {SENT}; exec /bin/sleep 3' | {last}; echo \
+		 after"
+	);
+	let raced = [(pipeline.clone(), &b"after\nx\n"[..], Exit(0))];
+	let cases = vec![
 		case(script.clone(), false, b"child-done\nafter\nx\n", Exit(0)),
 		case(script, true, b"child-int\nchild-done\nafter\nx\n", Exit(0)),
 		case(
@@ -3907,7 +3946,8 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 			died,
 		),
 		// Shell code that never blocks: each shell is signalled once `$F`
-		// exists (the subshell makes it itself, once it has set up).
+		// exists (the subshell makes it itself, once it has set up) and it
+		// waits for the subshell ([`Run::when_it_waits`]).
 		SentCase {
 			waits: false,
 			..case(
@@ -3933,15 +3973,7 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 			b"after\nx\n",
 			Exit(0),
 		),
-		case(
-			format!(
-				"trap 'echo x' EXIT; /bin/sh -c ': > \"$F.a\"; {SENT}; exec /bin/sleep 3' | {last}; \
-				 echo after"
-			),
-			true,
-			b"x\n",
-			died,
-		),
+		case(pipeline, true, b"x\n", died),
 		// A stage of shell code dies of the `INT` at once (`… | while read`,
 		// `while …; done | …`), and the command that caught it ends last; a
 		// stage or a subshell that waits for that command goes on.
@@ -3951,10 +3983,10 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 			b"after\nx\n",
 			Exit(0),
 		),
-		// Busy shell code that never blocks (a loop that forked `sleep` lost the
-		// signal when it came in bash's `make_child`, and ran on): no gate. The
-		// stage makes `$F.b` once it has set up, and the command makes `$F`
-		// once that exists.
+		// Busy shell code that never blocks (a loop that forked `sleep` lost
+		// the signal when it came in bash's `make_child`, and ran on): no
+		// gate. The stage makes `$F.b` once it has set up, and the command
+		// makes `$F` once that exists.
 		SentCase {
 			waits: false,
 			..case(
@@ -4158,11 +4190,13 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 				died,
 			)
 		},
-		// A subshell whose EXIT trap the `INT` began, and whose process another
-		// signal then ends (the trap `exec`s a program that dies of `TERM`, or
-		// kills it with `KILL`), dies of that signal: its parent goes on. (A
-		// `kill -TERM $BASHPID` in the trap gives bash 5.2.21 either end under
-		// load.)
+		// A subshell whose EXIT trap the `INT` began, and whose process
+		// another signal then ends (the trap `exec`s a program that dies of
+		// `TERM`, or kills it with `KILL`), dies of that signal: its parent
+		// goes on, as it waits for the subshell ([`Run::when_it_waits`];
+		// signalled before its `wait_for`, bash 5.2.21 died of the `INT` at
+		// once under load). (A `kill -TERM $BASHPID` in the trap gives bash
+		// 5.2.21 either end under load.)
 		SentCase {
 			waits: false,
 			..case(
@@ -4184,7 +4218,8 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 				Exit(0),
 			)
 		},
-	]);
+	];
+	run_sent_raced(cases, &raced);
 }
 
 /// bash `termsig_sighandler`: a terminating signal that comes while the EXIT
