@@ -4871,10 +4871,16 @@ fn bash_case_hit(
 /// [`bang_stage`]'s `Lone` test reads it) the child gets
 /// [`super::proc::Fork::entry`]: that command's own redirections are made
 /// without undo, and a fatal expansion error in them, or anywhere in a
-/// simple command, reaches what `vp`'s reaches. Any other job (an async
-/// `&&`/`||` list: bash forks it as a subshell, `CMD_FORCE_SUBSHELL`) and a
-/// compound without redirections of its own catch their own at once. The
-/// bodies of the command's substitution words come first ([`skip_blocks`]).
+/// simple command, reaches what `vp`'s reaches. So too a bash job that times
+/// a compound with redirections of its own (`time { :; } 2>/dev/null < f &`):
+/// bash forks the timed job as a subshell (`CMD_FORCE_SUBSHELL`) whose
+/// `execute_in_subshell` makes the compound's redirections before it times
+/// the compound, so they are the fork's (the time report goes where they
+/// send stderr) and a fatal error in them ends it; a timed simple command
+/// runs under that child's catcher. Any other job (an async `&&`/`||` list:
+/// bash forks it as a subshell, `CMD_FORCE_SUBSHELL`) and a compound
+/// without redirections of its own catch their own at once. The bodies of
+/// the command's substitution words come first ([`skip_blocks`]).
 pub(super) fn forked_for(child: &mut Vproc, vp: &Vproc, unit: &Unit, entry: u32) {
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
 	// The job's end: its `SubExit`, after a `!`'s `Not`.
@@ -4887,6 +4893,14 @@ pub(super) fn forked_for(child: &mut Vproc, vp: &Vproc, unit: &Unit, entry: u32)
 	let whole = match unit.ops.get(at as usize) {
 		Some(op) if op.code == Opcode::Exec => ends(at + 1),
 		Some(op) if op.code == Opcode::Redir => ends(op.b),
+		// `TimeStart Redir … PopRedir [Not] TimeEnd SubExit` ([`ends_stage`]).
+		Some(op) if op.code == Opcode::TimeStart && unit.mode.dialect() == Dialect::Bash => {
+			let at = skip_blocks(unit, at + 1);
+			unit
+				.ops
+				.get(at as usize)
+				.is_some_and(|op| op.code == Opcode::Redir && ends_stage(unit, op.b))
+		},
 		_ => false,
 	};
 	child.set_fork(if whole {
