@@ -37,9 +37,9 @@
 //! **Cancellation.** A cancelled run is stopped through the engine's
 //! [`ControlHandle::cancel`](crate::bash::ControlHandle::cancel): first `TERM`
 //! (signal traps run, externals get `TERM`, status 143), then, if the run
-//! has not ended after [`TERM_GRACE`], `KILL` (no traps, status 137).
+//! has not ended after [`TERM_GRACE`](crate::host::TERM_GRACE), `KILL` (no traps, status 137).
 //! Unwinding drops the externals the run waits for; the spawner sends their
-//! process groups `TERM` and `KILL` after [`TERM_GRACE`] in the background.
+//! process groups `TERM` and `KILL` after [`TERM_GRACE`](crate::host::TERM_GRACE) in the background.
 //! The cancel request reaches the engine only from the driver, while the run
 //! it targets is still in flight, so a late cancel never leaks into the next
 //! command. What `nohup` started ([`crate::tools`]) is detached: neither a
@@ -497,7 +497,7 @@ impl Session {
 	/// Run one command to completion and report how it ended.
 	///
 	/// When `cancel` fires the run is stopped (`TERM`, then `KILL` after
-	/// [`TERM_GRACE`]) and the outcome says `cancelled`. Dropping the future
+	/// [`TERM_GRACE`](crate::host::TERM_GRACE)) and the outcome says `cancelled`. Dropping the future
 	/// stops the run with `KILL`. A non-zero status (`exit 3`, `set -e`,
 	/// `nosuchcmd`) is an outcome, not an error: the session stays usable.
 	///
