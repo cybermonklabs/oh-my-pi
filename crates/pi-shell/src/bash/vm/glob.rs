@@ -791,6 +791,120 @@ pub fn expand_compound_globs(
 	)
 }
 
+/// [`expand_compound_globs`] inside the expansion `ex` itself, for bash's
+/// `set -x`, which traces a declaration's compound assignment once its
+/// word is expanded whole, before the words after it: each walk is asked
+/// as a [`Stop::Probe`](super::expand::Stop::Probe), its answer logged and
+/// replayed when the op runs again. `Ok(false)` under `failglob`: the walk
+/// stays [`expand_compound_globs`]'s, whose error ends the command as
+/// bash's does.
+pub fn compound_globs_in(
+	ex: &mut super::expand::Expander<'_, '_>,
+	elems: &mut Vec<super::expand::CompoundElem>,
+	globs: &[(u32, BString)],
+) -> Result<bool, super::expand::Stop> {
+	let s = Setup::read(ex.k, ex.cx, ex.vp);
+	if s.failglob {
+		return Ok(false);
+	}
+	let mut results = Vec::with_capacity(globs.len());
+	for (_, pattern) in globs {
+		let Some(answer) = ex.log.get(ex.cursor).cloned() else {
+			let probe = Probe::Glob { pattern: pattern.clone(), opts: s.opts };
+			return Err(super::expand::Stop::Probe(probe));
+		};
+		ex.cursor += 1;
+		results.push(match answer {
+			super::proc::Atom::List(paths) => ProbeResult::Paths(paths),
+			_ => ProbeResult::Ok(false),
+		});
+	}
+	ex.k.clock_stale();
+	let spliced = s.splice(elems, globs, results, |e, path| super::expand::CompoundElem {
+		key:    None,
+		append: e.append,
+		value:  path,
+	});
+	debug_assert!(spliced.is_ok(), "no `failglob` error without `failglob`");
+	Ok(true)
+}
+
+/// What a pathname expansion reads from the shell: the walk's options,
+/// `GLOBIGNORE`'s patterns, `nullglob` and `failglob`.
+struct Setup {
+	opts:     GlobOpts,
+	ignore:   Vec<Pattern>,
+	nullglob: bool,
+	failglob: bool,
+}
+
+impl Setup {
+	fn read(k: &mut super::Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Self {
+		let ignore_text = var_value(k, cx, vp, b"GLOBIGNORE").unwrap_or_default();
+		let ignore_src = ignore_patterns(&ignore_text);
+		let sort_var = var_value(k, cx, vp, b"GLOBSORT");
+		let opts = GlobOpts {
+			// A non-empty `GLOBIGNORE` turns on `dotglob` (bash's
+			// `setup_glob_ignore`).
+			dotglob:  option_on(k, cx, vp, OptId::Dotglob) || !ignore_src.is_empty(),
+			nocase:   option_on(k, cx, vp, OptId::Nocaseglob),
+			extglob:  option_on(k, cx, vp, OptId::Extglob),
+			globstar: option_on(k, cx, vp, OptId::Globstar),
+			skipdots: option_on(k, cx, vp, OptId::Globskipdots),
+			utf8:     super::locale::is_utf8(k, cx.store, vp),
+			sort:     GlobSort::parse(sort_var.as_ref().map(|v| v.as_slice())),
+		};
+		let nullglob = option_on(k, cx, vp, OptId::Nullglob);
+		let failglob = option_on(k, cx, vp, OptId::Failglob);
+		let ignore = ignore_src
+			.iter()
+			.map(|p| Pattern::compile(p, PatOpts::globignore(opts.extglob, opts.nocase, opts.utf8)))
+			.collect();
+		Self { opts, ignore, nullglob, failglob }
+	}
+
+	/// Replace the items recorded in `globs` by the matches the walks
+	/// answered (`results`, in order): `from_path` makes the item a match
+	/// becomes. `Err(i)`: under `failglob`, item `i` matched nothing, and
+	/// nothing changed.
+	fn splice<T>(
+		&self,
+		items: &mut Vec<T>,
+		globs: &[(u32, BString)],
+		results: Vec<ProbeResult>,
+		from_path: impl Fn(&T, BString) -> T,
+	) -> Result<(), usize> {
+		let mut found = Vec::with_capacity(results.len());
+		for ((i, _), answer) in globs.iter().zip(results) {
+			let ProbeResult::Paths(mut paths) = answer else {
+				continue;
+			};
+			if !self.ignore.is_empty() {
+				paths.retain(|p| acceptable(p, &self.ignore));
+			}
+			let i = *i as usize;
+			if paths.is_empty() && self.failglob && i < items.len() {
+				return Err(i);
+			}
+			found.push((i, paths));
+		}
+		for (i, paths) in found.into_iter().rev() {
+			if i >= items.len() {
+				continue;
+			}
+			if paths.is_empty() {
+				if self.nullglob {
+					items.remove(i);
+				}
+				continue;
+			}
+			let matched: Vec<T> = paths.into_iter().map(|p| from_path(&items[i], p)).collect();
+			items.splice(i..=i, matched);
+		}
+		Ok(())
+	}
+}
+
 /// [`expand_globs`] for any item list: `word` is an item's text, `from_path`
 /// the item a match of it becomes.
 #[expect(
@@ -810,26 +924,7 @@ fn expand_globs_with<T>(
 	if globs.is_empty() {
 		return Ok(());
 	}
-	let ignore_text = var_value(k, cx, vp, b"GLOBIGNORE").unwrap_or_default();
-	let ignore_src = ignore_patterns(&ignore_text);
-	let sort_var = var_value(k, cx, vp, b"GLOBSORT");
-	let opts = GlobOpts {
-		// A non-empty `GLOBIGNORE` turns on `dotglob` (bash's
-		// `setup_glob_ignore`).
-		dotglob:  option_on(k, cx, vp, OptId::Dotglob) || !ignore_src.is_empty(),
-		nocase:   option_on(k, cx, vp, OptId::Nocaseglob),
-		extglob:  option_on(k, cx, vp, OptId::Extglob),
-		globstar: option_on(k, cx, vp, OptId::Globstar),
-		skipdots: option_on(k, cx, vp, OptId::Globskipdots),
-		utf8:     super::locale::is_utf8(k, cx.store, vp),
-		sort:     GlobSort::parse(sort_var.as_ref().map(|v| v.as_slice())),
-	};
-	let nullglob = option_on(k, cx, vp, OptId::Nullglob);
-	let failglob = option_on(k, cx, vp, OptId::Failglob);
-	let ignore: Vec<Pattern> = ignore_src
-		.iter()
-		.map(|p| Pattern::compile(p, PatOpts::globignore(opts.extglob, opts.nocase, opts.utf8)))
-		.collect();
+	let s = Setup::read(k, cx, vp);
 	let mut sc = vp
 		.frames
 		.last_mut()
@@ -837,7 +932,7 @@ fn expand_globs_with<T>(
 		.unwrap_or_default();
 	let mut results = Vec::with_capacity(globs.len());
 	for (_, pattern) in globs {
-		let probe = Probe::Glob { pattern: pattern.clone(), opts };
+		let probe = Probe::Glob { pattern: pattern.clone(), opts: s.opts };
 		let answer = match super::probe::cached(&sc, &probe) {
 			Some(r) => r.clone(),
 			None => match super::probe::perform(k, cx, vp, &mut sc, &probe) {
@@ -851,38 +946,10 @@ fn expand_globs_with<T>(
 		results.push(answer);
 	}
 	vp.frames.last_mut().expect("frame").scratch = Some(sc);
-	let mut found = Vec::with_capacity(results.len());
-	for ((i, _), answer) in globs.iter().zip(results) {
-		let ProbeResult::Paths(mut paths) = answer else {
-			continue;
-		};
-		if !ignore.is_empty() {
-			paths.retain(|p| acceptable(p, &ignore));
-		}
-		let i = *i as usize;
-		if paths.is_empty()
-			&& failglob
-			&& let Some(item) = items.get(i)
-		{
-			k.diag(cx, vp, line, Diag::NoMatch { pattern: BString::from(word(item)) });
-			return Err(Flow::Discard(1));
-		}
-		found.push((i, paths));
-	}
-	for (i, paths) in found.into_iter().rev() {
-		if i >= items.len() {
-			continue;
-		}
-		if paths.is_empty() {
-			if nullglob {
-				items.remove(i);
-			}
-			continue;
-		}
-		let matched: Vec<T> = paths.into_iter().map(|p| from_path(&items[i], p)).collect();
-		items.splice(i..=i, matched);
-	}
-	Ok(())
+	s.splice(items, globs, results, from_path).map_err(|i| {
+		k.diag(cx, vp, line, Diag::NoMatch { pattern: BString::from(word(&items[i])) });
+		Flow::Discard(1)
+	})
 }
 
 #[cfg(test)]

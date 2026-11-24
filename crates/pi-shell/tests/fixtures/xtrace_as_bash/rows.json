@@ -2608,5 +2608,1205 @@
    "",
    "./s.sh: line 1: ${ f; }: bad substitution\n"
   ]
+ },
+ {
+  "id": "e-export-devnull",
+  "file": false,
+  "script": "set -x; export X=1 2>/dev/null; echo \"$X\"",
+  "bash53": [
+   0,
+   "1\n",
+   "+ export X=1\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ export X=1\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "e-export-devnull",
+  "file": true,
+  "script": "set -x; export X=1 2>/dev/null; echo \"$X\"",
+  "bash53": [
+   0,
+   "1\n",
+   "+ export X=1\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ export X=1\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "e-readonly-devnull",
+  "file": false,
+  "script": "set -x; readonly Q=1 2>/dev/null; echo \"$Q\"",
+  "bash53": [
+   0,
+   "1\n",
+   "+ readonly Q=1\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ readonly Q=1\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "e-readonly-devnull",
+  "file": true,
+  "script": "set -x; readonly Q=1 2>/dev/null; echo \"$Q\"",
+  "bash53": [
+   0,
+   "1\n",
+   "+ readonly Q=1\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ readonly Q=1\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "e-readonly-arrays",
+  "file": false,
+  "script": "set -x; readonly -a ra=x; readonly -A rA=y",
+  "bash53": [
+   0,
+   "",
+   "+ readonly -a ra=x\n+ readonly -A rA=y\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ readonly -a ra=x\n+ readonly -A rA=y\n"
+  ]
+ },
+ {
+  "id": "e-readonly-arrays",
+  "file": true,
+  "script": "set -x; readonly -a ra=x; readonly -A rA=y",
+  "bash53": [
+   0,
+   "",
+   "+ readonly -a ra=x\n+ readonly -A rA=y\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ readonly -a ra=x\n+ readonly -A rA=y\n"
+  ]
+ },
+ {
+  "id": "e-export-function",
+  "file": false,
+  "script": "set -x; export() { echo fn \"$@\"; }; export E=1",
+  "bash53": [
+   0,
+   "fn E=1\n",
+   "+ export E=1\n+ echo fn E=1\n"
+  ],
+  "bash52": [
+   0,
+   "fn E=1\n",
+   "+ export E=1\n+ echo fn E=1\n"
+  ]
+ },
+ {
+  "id": "e-export-function",
+  "file": true,
+  "script": "set -x; export() { echo fn \"$@\"; }; export E=1",
+  "bash53": [
+   0,
+   "fn E=1\n",
+   "+ export E=1\n+ echo fn E=1\n"
+  ],
+  "bash52": [
+   0,
+   "fn E=1\n",
+   "+ export E=1\n+ echo fn E=1\n"
+  ]
+ },
+ {
+  "id": "e-enable-n",
+  "file": false,
+  "script": "set -x; enable -n export; export X=1 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\n",
+   "+ enable -n export\n+ export X=1\n+ echo s=127\n"
+  ],
+  "bash52": [
+   0,
+   "s=127\n",
+   "+ enable -n export\n+ export X=1\n+ echo s=127\n"
+  ]
+ },
+ {
+  "id": "e-enable-n",
+  "file": true,
+  "script": "set -x; enable -n export; export X=1 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=127\n",
+   "+ enable -n export\n+ export X=1\n+ echo s=127\n"
+  ],
+  "bash52": [
+   0,
+   "s=127\n",
+   "+ enable -n export\n+ export X=1\n+ echo s=127\n"
+  ]
+ },
+ {
+  "id": "e-readonly-stdout",
+  "file": false,
+  "script": "set -x; readonly R=2 2>&1 >/dev/null",
+  "bash53": [
+   0,
+   "+ R=2\n",
+   "+ readonly R=2\n"
+  ],
+  "bash52": [
+   0,
+   "+ R=2\n",
+   "+ readonly R=2\n"
+  ]
+ },
+ {
+  "id": "e-readonly-stdout",
+  "file": true,
+  "script": "set -x; readonly R=2 2>&1 >/dev/null",
+  "bash53": [
+   0,
+   "+ R=2\n",
+   "+ readonly R=2\n"
+  ],
+  "bash52": [
+   0,
+   "+ R=2\n",
+   "+ readonly R=2\n"
+  ]
+ },
+ {
+  "id": "e-export-f",
+  "file": false,
+  "script": "exec 9>&2; BASH_XTRACEFD=9; set -x; export -f nf=1 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ export -f nf=1\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ export -f nf=1\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "e-export-f",
+  "file": true,
+  "script": "exec 9>&2; BASH_XTRACEFD=9; set -x; export -f nf=1 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ export -f nf=1\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ export -f nf=1\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "e-export-a",
+  "file": false,
+  "script": "set -x; export -a eb=x",
+  "bash53": [
+   0,
+   "",
+   "+ export -a eb=x\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export -a eb=x\n"
+  ]
+ },
+ {
+  "id": "e-export-a",
+  "file": true,
+  "script": "set -x; export -a eb=x",
+  "bash53": [
+   0,
+   "",
+   "+ export -a eb=x\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export -a eb=x\n"
+  ]
+ },
+ {
+  "id": "e-builtin-command",
+  "file": false,
+  "script": "set -x; builtin export B=1; command export C=2; command -- export D=3",
+  "bash53": [
+   0,
+   "",
+   "+ builtin export B=1\n+ B=1\n+ command export C=2\n+ C=2\n+ command -- export D=3\n+ D=3\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ builtin export B=1\n+ B=1\n+ command export C=2\n+ C=2\n+ command -- export D=3\n+ D=3\n"
+  ]
+ },
+ {
+  "id": "e-builtin-command",
+  "file": true,
+  "script": "set -x; builtin export B=1; command export C=2; command -- export D=3",
+  "bash53": [
+   0,
+   "",
+   "+ builtin export B=1\n+ B=1\n+ command export C=2\n+ C=2\n+ command -- export D=3\n+ D=3\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ builtin export B=1\n+ B=1\n+ command export C=2\n+ C=2\n+ command -- export D=3\n+ D=3\n"
+  ]
+ },
+ {
+  "id": "e-export-badname",
+  "file": false,
+  "script": "set -x; export X=1 1Y=2 Z=3",
+  "bash53": [
+   1,
+   "",
+   "+ export X=1 1Y=2 Z=3\n+ X=1\nbash: line 1: export: `1Y=2': not a valid identifier\n+ Z=3\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ export X=1 1Y=2 Z=3\n+ X=1\nbash: line 1: export: `1Y=2': not a valid identifier\n+ Z=3\n"
+  ]
+ },
+ {
+  "id": "e-export-badname",
+  "file": true,
+  "script": "set -x; export X=1 1Y=2 Z=3",
+  "bash53": [
+   1,
+   "",
+   "+ export X=1 1Y=2 Z=3\n+ X=1\n./s.sh: line 1: export: `1Y=2': not a valid identifier\n+ Z=3\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ export X=1 1Y=2 Z=3\n+ X=1\n./s.sh: line 1: export: `1Y=2': not a valid identifier\n+ Z=3\n"
+  ]
+ },
+ {
+  "id": "e-export-readonly",
+  "file": false,
+  "script": "set -x; readonly R=1; export A=1 R=2 B=3",
+  "bash53": [
+   1,
+   "",
+   "+ readonly R=1\n+ R=1\n+ export A=1 R=2 B=3\n+ A=1\n+ R=2\nbash: line 1: R: readonly variable\n+ B=3\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ readonly R=1\n+ R=1\n+ export A=1 R=2 B=3\n+ A=1\n+ R=2\nbash: line 1: R: readonly variable\n+ B=3\n"
+  ]
+ },
+ {
+  "id": "e-export-readonly",
+  "file": true,
+  "script": "set -x; readonly R=1; export A=1 R=2 B=3",
+  "bash53": [
+   1,
+   "",
+   "+ readonly R=1\n+ R=1\n+ export A=1 R=2 B=3\n+ A=1\n+ R=2\n./s.sh: line 1: R: readonly variable\n+ B=3\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ readonly R=1\n+ R=1\n+ export A=1 R=2 B=3\n+ A=1\n+ R=2\n./s.sh: line 1: R: readonly variable\n+ B=3\n"
+  ]
+ },
+ {
+  "id": "e-export-escaped",
+  "file": false,
+  "script": "set -x; \\export X=1",
+  "bash53": [
+   0,
+   "",
+   "+ export X=1\n+ X=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export X=1\n+ X=1\n"
+  ]
+ },
+ {
+  "id": "e-export-escaped",
+  "file": true,
+  "script": "set -x; \\export X=1",
+  "bash53": [
+   0,
+   "",
+   "+ export X=1\n+ X=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export X=1\n+ X=1\n"
+  ]
+ },
+ {
+  "id": "e-export-var",
+  "file": false,
+  "script": "set -x; e=export; $e Y=2",
+  "bash53": [
+   0,
+   "",
+   "+ e=export\n+ export Y=2\n+ Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ e=export\n+ export Y=2\n+ Y=2\n"
+  ]
+ },
+ {
+  "id": "e-export-var",
+  "file": true,
+  "script": "set -x; e=export; $e Y=2",
+  "bash53": [
+   0,
+   "",
+   "+ e=export\n+ export Y=2\n+ Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ e=export\n+ export Y=2\n+ Y=2\n"
+  ]
+ },
+ {
+  "id": "e-export-func-args",
+  "file": false,
+  "script": "set -x; f() { export \"$@\"; }; f Z=3",
+  "bash53": [
+   0,
+   "",
+   "+ f Z=3\n+ export Z=3\n+ Z=3\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f Z=3\n+ export Z=3\n+ Z=3\n"
+  ]
+ },
+ {
+  "id": "e-export-func-args",
+  "file": true,
+  "script": "set -x; f() { export \"$@\"; }; f Z=3",
+  "bash53": [
+   0,
+   "",
+   "+ f Z=3\n+ export Z=3\n+ Z=3\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f Z=3\n+ export Z=3\n+ Z=3\n"
+  ]
+ },
+ {
+  "id": "e-export-append",
+  "file": false,
+  "script": "set -x; X=a; export X+=b; echo \"$X\"",
+  "bash53": [
+   0,
+   "ab\n",
+   "+ X=a\n+ export X+=b\n+ X+=b\n+ echo ab\n"
+  ],
+  "bash52": [
+   0,
+   "ab\n",
+   "+ X=a\n+ export X+=b\n+ X+=b\n+ echo ab\n"
+  ]
+ },
+ {
+  "id": "e-export-append",
+  "file": true,
+  "script": "set -x; X=a; export X+=b; echo \"$X\"",
+  "bash53": [
+   0,
+   "ab\n",
+   "+ X=a\n+ export X+=b\n+ X+=b\n+ echo ab\n"
+  ],
+  "bash52": [
+   0,
+   "ab\n",
+   "+ X=a\n+ export X+=b\n+ X+=b\n+ echo ab\n"
+  ]
+ },
+ {
+  "id": "e-export-n",
+  "file": false,
+  "script": "set -x; export -n N=1",
+  "bash53": [
+   0,
+   "",
+   "+ export -n N=1\n+ N=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export -n N=1\n+ N=1\n"
+  ]
+ },
+ {
+  "id": "e-export-n",
+  "file": true,
+  "script": "set -x; export -n N=1",
+  "bash53": [
+   0,
+   "",
+   "+ export -n N=1\n+ N=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export -n N=1\n+ N=1\n"
+  ]
+ },
+ {
+  "id": "e-export-xtracefd",
+  "file": false,
+  "script": "exec 7>tr; BASH_XTRACEFD=7; set -x; export X=1 2>/dev/null; set +x; cat tr",
+  "bash53": [
+   0,
+   "+ export X=1\n+ X=1\n+ set +x\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "+ export X=1\n+ X=1\n+ set +x\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-export-xtracefd",
+  "file": true,
+  "script": "exec 7>tr; BASH_XTRACEFD=7; set -x; export X=1 2>/dev/null; set +x; cat tr",
+  "bash53": [
+   0,
+   "+ export X=1\n+ X=1\n+ set +x\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "+ export X=1\n+ X=1\n+ set +x\n",
+   ""
+  ]
+ },
+ {
+  "id": "e-export-quoted",
+  "file": false,
+  "script": "set -x; export S='a b' T=$'\\t' U=",
+  "bash53": [
+   0,
+   "",
+   "+ export 'S=a b' $'T=\\t' U=\n+ S='a b'\n+ T=$'\\t'\n+ U=\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export 'S=a b' 'T=\t' U=\n+ S='a b'\n+ T='\t'\n+ U=\n"
+  ]
+ },
+ {
+  "id": "e-export-quoted",
+  "file": true,
+  "script": "set -x; export S='a b' T=$'\\t' U=",
+  "bash53": [
+   0,
+   "",
+   "+ export 'S=a b' $'T=\\t' U=\n+ S='a b'\n+ T=$'\\t'\n+ U=\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export 'S=a b' 'T=\t' U=\n+ S='a b'\n+ T='\t'\n+ U=\n"
+  ]
+ },
+ {
+  "id": "e-readonly-a-compound",
+  "file": false,
+  "script": "set -x; readonly -a rc=(1 2)",
+  "bash53": [
+   0,
+   "",
+   "+ rc=('1' '2')\n+ readonly -a rc\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ rc=('1' '2')\n+ readonly -a rc\n"
+  ]
+ },
+ {
+  "id": "e-readonly-a-compound",
+  "file": true,
+  "script": "set -x; readonly -a rc=(1 2)",
+  "bash53": [
+   0,
+   "",
+   "+ rc=('1' '2')\n+ readonly -a rc\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ rc=('1' '2')\n+ readonly -a rc\n"
+  ]
+ },
+ {
+  "id": "e-export-lineno",
+  "file": false,
+  "script": "PS4='+[$LINENO] '\nset -x\nexport X=1\nreadonly Y=2",
+  "bash53": [
+   0,
+   "",
+   "+[3] export X=1\n+[3] X=1\n+[4] readonly Y=2\n+[4] Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+[3] export X=1\n+[3] X=1\n+[4] readonly Y=2\n+[4] Y=2\n"
+  ]
+ },
+ {
+  "id": "e-export-lineno",
+  "file": true,
+  "script": "PS4='+[$LINENO] '\nset -x\nexport X=1\nreadonly Y=2",
+  "bash53": [
+   0,
+   "",
+   "+[3] export X=1\n+[3] X=1\n+[4] readonly Y=2\n+[4] Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+[3] export X=1\n+[3] X=1\n+[4] readonly Y=2\n+[4] Y=2\n"
+  ]
+ },
+ {
+  "id": "c-declare-tab",
+  "file": false,
+  "script": "set -x; declare -a e=($'\\t' '*' \"it's\" '' 'a b')",
+  "bash53": [
+   0,
+   "",
+   "+ e=('\t' '*' 'it'\\''s' '' 'a b')\n+ declare -a e\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ e=('\t' '*' 'it'\\''s' '' 'a b')\n+ declare -a e\n"
+  ]
+ },
+ {
+  "id": "c-declare-tab",
+  "file": true,
+  "script": "set -x; declare -a e=($'\\t' '*' \"it's\" '' 'a b')",
+  "bash53": [
+   0,
+   "",
+   "+ e=('\t' '*' 'it'\\''s' '' 'a b')\n+ declare -a e\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ e=('\t' '*' 'it'\\''s' '' 'a b')\n+ declare -a e\n"
+  ]
+ },
+ {
+  "id": "c-declare-assoc-tab",
+  "file": false,
+  "script": "set -x; declare -A h=([$'\\t']=x [\"a b\"]=y [k]+=z)",
+  "bash53": [
+   0,
+   "",
+   "+ h=(['\t']='x' ['a b']='y' ['k']+='z')\n+ declare -A h\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ h=(['\t']='x' ['a b']='y' ['k']+='z')\n+ declare -A h\n"
+  ]
+ },
+ {
+  "id": "c-declare-assoc-tab",
+  "file": true,
+  "script": "set -x; declare -A h=([$'\\t']=x [\"a b\"]=y [k]+=z)",
+  "bash53": [
+   0,
+   "",
+   "+ h=(['\t']='x' ['a b']='y' ['k']+='z')\n+ declare -A h\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ h=(['\t']='x' ['a b']='y' ['k']+='z')\n+ declare -A h\n"
+  ]
+ },
+ {
+  "id": "c-declare-newline",
+  "file": false,
+  "script": "set -x; declare -a n=($'a\\nb')",
+  "bash53": [
+   0,
+   "",
+   "+ n=('a\nb')\n+ declare -a n\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ n=('a\nb')\n+ declare -a n\n"
+  ]
+ },
+ {
+  "id": "c-declare-newline",
+  "file": true,
+  "script": "set -x; declare -a n=($'a\\nb')",
+  "bash53": [
+   0,
+   "",
+   "+ n=('a\nb')\n+ declare -a n\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ n=('a\nb')\n+ declare -a n\n"
+  ]
+ },
+ {
+  "id": "c-declare-kv",
+  "file": false,
+  "script": "set -x; declare -A kv=(k $'\\t')",
+  "bash53": [
+   0,
+   "",
+   "+ kv=('k' '\t')\n+ declare -A kv\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ kv=('k' '\t')\n+ declare -A kv\n"
+  ]
+ },
+ {
+  "id": "c-declare-kv",
+  "file": true,
+  "script": "set -x; declare -A kv=(k $'\\t')",
+  "bash53": [
+   0,
+   "",
+   "+ kv=('k' '\t')\n+ declare -A kv\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ kv=('k' '\t')\n+ declare -A kv\n"
+  ]
+ },
+ {
+  "id": "c-declare-empty",
+  "file": false,
+  "script": "set -x; declare -a z=()",
+  "bash53": [
+   0,
+   "",
+   "+ z=()\n+ declare -a z\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ z=()\n+ declare -a z\n"
+  ]
+ },
+ {
+  "id": "c-declare-empty",
+  "file": true,
+  "script": "set -x; declare -a z=()",
+  "bash53": [
+   0,
+   "",
+   "+ z=()\n+ declare -a z\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ z=()\n+ declare -a z\n"
+  ]
+ },
+ {
+  "id": "c-export-compound",
+  "file": false,
+  "script": "set -x; export -a ex=(1 $'\\t')",
+  "bash53": [
+   0,
+   "",
+   "+ ex=('1' '\t')\n+ export -a ex\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ ex=('1' '\t')\n+ export -a ex\n"
+  ]
+ },
+ {
+  "id": "c-export-compound",
+  "file": true,
+  "script": "set -x; export -a ex=(1 $'\\t')",
+  "bash53": [
+   0,
+   "",
+   "+ ex=('1' '\t')\n+ export -a ex\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ ex=('1' '\t')\n+ export -a ex\n"
+  ]
+ },
+ {
+  "id": "c-declare-order",
+  "file": false,
+  "script": "set -x; declare -a a=(1) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1')\n++ echo s\n+ declare -a a x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1')\n++ echo s\n+ declare -a a x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-order",
+  "file": true,
+  "script": "set -x; declare -a a=(1) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1')\n++ echo s\n+ declare -a a x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1')\n++ echo s\n+ declare -a a x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-order-two",
+  "file": false,
+  "script": "set -x; declare -a a=(1) b=($(echo t)) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1')\n++ echo t\n+ b=('t')\n++ echo s\n+ declare -a a b x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1')\n++ echo t\n+ b=('t')\n++ echo s\n+ declare -a a b x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-order-two",
+  "file": true,
+  "script": "set -x; declare -a a=(1) b=($(echo t)) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1')\n++ echo t\n+ b=('t')\n++ echo s\n+ declare -a a b x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1')\n++ echo t\n+ b=('t')\n++ echo s\n+ declare -a a b x=s\n"
+  ]
+ },
+ {
+  "id": "c-local-order",
+  "file": false,
+  "script": "set -x; f() { local -a a=(1) x=$(echo s); }; f",
+  "bash53": [
+   0,
+   "",
+   "+ f\n+ a=('1')\n++ echo s\n+ local -a a x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f\n+ a=('1')\n++ echo s\n+ local -a a x=s\n"
+  ]
+ },
+ {
+  "id": "c-local-order",
+  "file": true,
+  "script": "set -x; f() { local -a a=(1) x=$(echo s); }; f",
+  "bash53": [
+   0,
+   "",
+   "+ f\n+ a=('1')\n++ echo s\n+ local -a a x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f\n+ a=('1')\n++ echo s\n+ local -a a x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-glob-order",
+  "file": false,
+  "script": ": > g1; : > g2; set -x; declare -a f=(g*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ f=('g1' 'g2')\n++ echo s\n+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f=('g1' 'g2')\n++ echo s\n+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-glob-order",
+  "file": true,
+  "script": ": > g1; : > g2; set -x; declare -a f=(g*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ f=('g1' 'g2')\n++ echo s\n+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f=('g1' 'g2')\n++ echo s\n+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-glob-then-plain",
+  "file": false,
+  "script": ": > g1; set -x; declare -a f=(g*) p=(2) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ f=('g1')\n+ p=('2')\n++ echo s\n+ declare -a f p x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f=('g1')\n+ p=('2')\n++ echo s\n+ declare -a f p x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-glob-then-plain",
+  "file": true,
+  "script": ": > g1; set -x; declare -a f=(g*) p=(2) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ f=('g1')\n+ p=('2')\n++ echo s\n+ declare -a f p x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f=('g1')\n+ p=('2')\n++ echo s\n+ declare -a f p x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-nullglob",
+  "file": false,
+  "script": "shopt -s nullglob; set -x; declare -a f=(nomatch*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ f=()\n++ echo s\n+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f=()\n++ echo s\n+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-nullglob",
+  "file": true,
+  "script": "shopt -s nullglob; set -x; declare -a f=(nomatch*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ f=()\n++ echo s\n+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f=()\n++ echo s\n+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-globignore",
+  "file": false,
+  "script": ": > g1; : > g2; GLOBIGNORE=g2; set -x; declare -a f=(g*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ f=('g1')\n++ echo s\n+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f=('g1')\n++ echo s\n+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-globignore",
+  "file": true,
+  "script": ": > g1; : > g2; GLOBIGNORE=g2; set -x; declare -a f=(g*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ f=('g1')\n++ echo s\n+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f=('g1')\n++ echo s\n+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-glob-dir",
+  "file": false,
+  "script": "mkdir d; : > d/a; : > d/b; set -x; declare -a f=(d/*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ f=('d/a' 'd/b')\n++ echo s\n+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f=('d/a' 'd/b')\n++ echo s\n+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "c-declare-glob-dir",
+  "file": true,
+  "script": "mkdir d; : > d/a; : > d/b; set -x; declare -a f=(d/*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "+ f=('d/a' 'd/b')\n++ echo s\n+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f=('d/a' 'd/b')\n++ echo s\n+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "c-prefix-and-compound",
+  "file": false,
+  "script": "set -x; v=1 declare -a a=(1)",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1')\n+ v=1\n+ declare -a a\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1')\n+ v=1\n+ declare -a a\n"
+  ]
+ },
+ {
+  "id": "c-prefix-and-compound",
+  "file": true,
+  "script": "set -x; v=1 declare -a a=(1)",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1')\n+ v=1\n+ declare -a a\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1')\n+ v=1\n+ declare -a a\n"
+  ]
+ },
+ {
+  "id": "p-ps4-multibyte-utf8",
+  "file": false,
+  "script": "LC_ALL=C.UTF-8; PS4='→ '; set -x; eval 'echo e'; f() { eval 'echo g'; }; f",
+  "bash53": [
+   0,
+   "e\ng\n",
+   "→ eval 'echo e'\n→→ echo e\n→ f\n→ eval 'echo g'\n→→ echo g\n"
+  ],
+  "bash52": [
+   0,
+   "e\ng\n",
+   "→ eval 'echo e'\n→→ echo e\n→ f\n→ eval 'echo g'\n→→ echo g\n"
+  ]
+ },
+ {
+  "id": "p-ps4-multibyte-utf8",
+  "file": true,
+  "script": "LC_ALL=C.UTF-8; PS4='→ '; set -x; eval 'echo e'; f() { eval 'echo g'; }; f",
+  "bash53": [
+   0,
+   "e\ng\n",
+   "→ eval 'echo e'\n→→ echo e\n→ f\n→ eval 'echo g'\n→→ echo g\n"
+  ],
+  "bash52": [
+   0,
+   "e\ng\n",
+   "→ eval 'echo e'\n→→ echo e\n→ f\n→ eval 'echo g'\n→→ echo g\n"
+  ]
+ },
+ {
+  "id": "p-ps4-multibyte-e",
+  "file": false,
+  "script": "LC_ALL=C.UTF-8; PS4='é: '; set -x; eval 'echo e'",
+  "bash53": [
+   0,
+   "e\n",
+   "é: eval 'echo e'\néé: echo e\n"
+  ],
+  "bash52": [
+   0,
+   "e\n",
+   "é: eval 'echo e'\néé: echo e\n"
+  ]
+ },
+ {
+  "id": "p-ps4-multibyte-e",
+  "file": true,
+  "script": "LC_ALL=C.UTF-8; PS4='é: '; set -x; eval 'echo e'",
+  "bash53": [
+   0,
+   "e\n",
+   "é: eval 'echo e'\néé: echo e\n"
+  ],
+  "bash52": [
+   0,
+   "e\n",
+   "é: eval 'echo e'\néé: echo e\n"
+  ]
+ },
+ {
+  "id": "p-ps4-multibyte-c",
+  "file": false,
+  "script": "LC_ALL=C; PS4='→ '; set -x; eval 'echo e'",
+  "bash53": [
+   0,
+   "e\n",
+   "→ eval 'echo e'\n�→ echo e\n"
+  ],
+  "bash52": [
+   0,
+   "e\n",
+   "→ eval 'echo e'\n�→ echo e\n"
+  ]
+ },
+ {
+  "id": "p-ps4-multibyte-c",
+  "file": true,
+  "script": "LC_ALL=C; PS4='→ '; set -x; eval 'echo e'",
+  "bash53": [
+   0,
+   "e\n",
+   "→ eval 'echo e'\n�→ echo e\n"
+  ],
+  "bash52": [
+   0,
+   "e\n",
+   "→ eval 'echo e'\n�→ echo e\n"
+  ]
+ },
+ {
+  "id": "l-lineno-lines",
+  "file": false,
+  "script": "PS4='+[$LINENO] '\nset -x\necho a\necho b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "+[3] echo a\n+[4] echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "+[3] echo a\n+[4] echo b\n"
+  ]
+ },
+ {
+  "id": "l-lineno-lines",
+  "file": true,
+  "script": "PS4='+[$LINENO] '\nset -x\necho a\necho b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "+[3] echo a\n+[4] echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "+[3] echo a\n+[4] echo b\n"
+  ]
+ },
+ {
+  "id": "l-lineno-function-eval",
+  "file": false,
+  "script": "PS4='+[$LINENO] '\nset -x\nf() {\n  echo in\n}\nf\neval 'echo e\necho e2'",
+  "bash53": [
+   0,
+   "in\ne\ne2\n",
+   "+[6] f\n+[4] echo in\n+[7] eval $'echo e\\necho e2'\n++[7] echo e\n++[8] echo e2\n"
+  ],
+  "bash52": [
+   0,
+   "in\ne\ne2\n",
+   "+[6] f\n+[4] echo in\n+[8] eval 'echo e\necho e2'\n++[8] echo e\n++[9] echo e2\n"
+  ]
+ },
+ {
+  "id": "l-lineno-function-eval",
+  "file": true,
+  "script": "PS4='+[$LINENO] '\nset -x\nf() {\n  echo in\n}\nf\neval 'echo e\necho e2'",
+  "bash53": [
+   0,
+   "in\ne\ne2\n",
+   "+[6] f\n+[4] echo in\n+[7] eval $'echo e\\necho e2'\n++[7] echo e\n++[8] echo e2\n"
+  ],
+  "bash52": [
+   0,
+   "in\ne\ne2\n",
+   "+[6] f\n+[4] echo in\n+[8] eval 'echo e\necho e2'\n++[8] echo e\n++[9] echo e2\n"
+  ]
  }
 ]

@@ -23,6 +23,7 @@ use crate::bash::{
 		proc::{AssignValue, Vproc},
 		quote,
 		state::{self, Level, Var, VarEdit},
+		xtrace,
 	},
 };
 
@@ -1698,6 +1699,9 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		return done(status);
 	}
 	let first = args.len() - o.rest.len();
+	// `export -a`/`readonly -A` hand a `name=value` operand to `declare`
+	// (bash `set_or_show_attributes`), which does not trace it.
+	let arrays = o.has(b'a') || o.has(b'A');
 	for (j, arg) in o.rest.iter().enumerate() {
 		let compound_word = ctx.compound.contains(&((1 + first + j) as u32));
 		if kind == DeclareKind::Local && arg.as_slice() == b"-" {
@@ -1781,6 +1785,26 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				break;
 			}
 			continue;
+		}
+		// `export`/`readonly` assign a `name=value` operand as they reach it
+		// (bash `do_assignment_no_expand`), tracing it first under `set -x`
+		// (`+ X=1`) through the builtin's own descriptors, before anything
+		// the assignment reports; a compound one was traced as its word
+		// expanded.
+		if special
+			&& !arrays
+			&& !compound_word
+			&& index.is_none()
+			&& let Some(v) = value
+			&& ctx.vp.mode.dialect() != crate::bash::ids::Dialect::Zsh
+			&& xtrace::on(ctx.k, ctx.cx, ctx.vp)
+		{
+			let utf8 = xtrace::utf8(ctx.k, ctx.cx, ctx.vp);
+			let mut body = Vec::new();
+			let shown = AssignValue::Scalar(BString::from(v));
+			xtrace::push_assign(&mut body, name, None, append, &shown, utf8);
+			let (fd, bytes) = xtrace::builtin_line(ctx.k, ctx.cx, ctx.vp, ctx.line, &body);
+			ctx.out_fd(fd, &bytes);
 		}
 		// The binding this declaration acts on: a new local shadows rather
 		// than follows an outer reference.

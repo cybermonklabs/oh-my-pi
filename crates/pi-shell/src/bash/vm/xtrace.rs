@@ -156,6 +156,23 @@ pub fn emit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, body: &[
 	write(k, cx, vp, bytes);
 }
 
+/// A trace line a builtin writes as it runs (bash's `export` and
+/// `readonly` trace each `name=value` operand as they assign it): the
+/// descriptor it goes to, as the builtin's redirections left them, and
+/// the `PS4` prefix, `body`, a newline.
+pub fn builtin_line(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	line: u32,
+	body: &[u8],
+) -> (i32, Vec<u8>) {
+	let mut bytes = prefix(k, cx, vp, line);
+	bytes.extend_from_slice(body);
+	bytes.push(b'\n');
+	(trace_fd(k, cx, vp), bytes)
+}
+
 /// Queue `bytes` (a whole trace line, or zsh's pieces of one) for the
 /// trace output.
 pub fn write(k: &Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, bytes: Vec<u8>) {
@@ -306,8 +323,9 @@ fn zsh_trace_fd(vp: &mut Vproc) -> i32 {
 }
 
 /// `PS4` expanded as a prompt (`${PS4@P}`; as it is when the expansion
-/// would need a command substitution), its first character repeated to
-/// the nesting [`level`]. Unset or empty: no prefix.
+/// would need a command substitution), its first character (as many bytes
+/// as the locale's `mblen` makes it, as bash's `indirection_level_string`
+/// takes it) repeated to the nesting [`level`]. Unset or empty: no prefix.
 fn prefix(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Vec<u8> {
 	let ps4 = state::lookup(&k.root, cx.store, vp, b"PS4")
 		.ok()
@@ -326,9 +344,12 @@ fn prefix(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Vec<u8>
 		ps4
 	};
 	let mut out = Vec::with_capacity(expanded.len() + 4);
-	if let Some(&first) = expanded.first() {
-		for _ in 1..level(vp) {
-			out.push(first);
+	let level = level(vp);
+	if level > 1 && !expanded.is_empty() {
+		let cs = locale::charset(k, cx.store, vp);
+		let first = &expanded[..locale::char_len(cs, &expanded, false).unwrap_or(1)];
+		for _ in 1..level {
+			out.extend_from_slice(first);
 		}
 	}
 	out.extend_from_slice(&expanded);

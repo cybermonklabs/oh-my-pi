@@ -2049,6 +2049,14 @@ pub fn expanding<T>(
 			Ok(v)
 		},
 		Err(Stop::Sub { unit, entry, form, text }) => {
+			// What the expansion queued so far (a declaration's compound
+			// assignment traced as its word expanded) is out before the
+			// substitution runs, as bash writes it first; the op runs again
+			// once a blocked write is done (its expansion replays).
+			if let Some(fd) = flush_out(k, vp) {
+				top_frame(vp).scratch = Some(sc);
+				return Err(Flow::Block(WaitKey::Write { fd }));
+			}
 			// A no-fork substitution pushes its frame above this op's.
 			let flow = start_sub(k, vp, cx, &mut sc, Sub { unit, entry, form, text, line });
 			vp.frames[fi].scratch = Some(sc);
@@ -2212,11 +2220,13 @@ pub fn settle_probe(
 /// The logged form of an expansion probe's answer: a PATH search's path
 /// (`None`: not found); an access check's success as an empty string; a
 /// filesystem request's ([`super::fsprobe`]) bytes, names (a list), other
-/// success (empty) or failure (`None`).
+/// success (empty) or failure (`None`); a pathname walk's matches (a list:
+/// [`super::glob::compound_globs_in`]).
 pub fn probe_atom(answer: ProbeResult) -> Atom {
 	use super::fsprobe::FsAns;
 	Atom::Str(match answer {
 		ProbeResult::Path(p) => p,
+		ProbeResult::Paths(paths) => return Atom::List(paths),
 		ProbeResult::Ok(ok) => ok.then(BString::default),
 		ProbeResult::Fs(Ok(FsAns::Names(names))) => return Atom::List(names),
 		// User database entries: name and home directory of each.

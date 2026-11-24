@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `set -x` in bash mode now traces as bash 5.3 does: the shell's EXIT trap at the top level (also after `exit` in a function, an `eval` or a `.` file), a `${ ;}` or `${| ;}` body one level down, a declaration builtin's compound assignment as the assignment it makes first (`+ a=('1' '2')`, then `+ declare -a a`), and `export`'s and `readonly`'s `name=value` operands as assignments after the command (`+ X=1`).
+- `set -x` in bash mode now traces as bash 5.3 does: the shell's EXIT trap at the top level (also after `exit` in a function, an `eval` or a `.` file), a `${ ;}` or `${| ;}` body one level down, a declaration builtin's compound assignment as the assignment it makes, when its word expands (`+ a=('1' '2')`, each element in plain single quotes, then `+ declare -a a`), and each `name=value` operand of `export` and `readonly` as the builtin assigns it, through its own redirected descriptors (`+ X=1`).
 
 ## [18.18.6] - 2026-11-09
 

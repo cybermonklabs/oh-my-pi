@@ -725,7 +725,13 @@ fn expand(
 	}
 	if !st(vp).expanded {
 		let words = &unit.lists[cmd.words as usize];
-		let record = words.iter().any(|&w| unit.words[w as usize].parks);
+		let zsh = unit.mode.dialect() == crate::bash::ids::Dialect::Zsh;
+		// bash's `set -x` traces a declaration's compound assignment as it
+		// expands that word (`expand_declaration_argument`), before the
+		// words after it: that expansion keeps a replay log, so a later
+		// park runs it again without a second trace line.
+		let compounds = !zsh && decl_compounds(unit, words) && xtrace::on(k, cx, vp);
+		let record = compounds || words.iter().any(|&w| unit.words[w as usize].parks);
 		// Expand into the state's (recycled) vectors; a replay starts over.
 		let s = st(vp);
 		let mut argv = std::mem::take(&mut s.argv);
@@ -750,10 +756,13 @@ fn expand(
 		keywords.clear();
 		let mut arrayref = std::mem::take(&mut st(vp).arrayref);
 		arrayref.clear();
-		let zsh = unit.mode.dialect() == crate::bash::ids::Dialect::Zsh;
+		// The first entry of `compound` traced after the pathname
+		// expansion of the compound words (below), not as it expands.
+		let mut late = None;
 		let res = expanding(k, vp, cx, Slot::Words, record, line, |ex| {
 			keywords.clear();
 			arrayref.clear();
+			late = None;
 			ex.pool = std::mem::take(&mut pool);
 			// zsh `KSH_TYPESET`, read at the first argument that needs it.
 			let mut ksh_typeset = None;
@@ -770,6 +779,25 @@ fn expand(
 				let mut elems = Vec::new();
 				let mut elem_globs = Vec::new();
 				if ex.decl_compound(unit, word, &argv, &mut prefix, &mut elems, &mut elem_globs)? {
+					// Traced once its words' pathname expansion is done too,
+					// here in the pass (a walk parks it, and it replays),
+					// unless `failglob` leaves that to the walks after the
+					// words: then it and every compound word after it is
+					// traced after them.
+					if compounds && late.is_none() {
+						if !elem_globs.is_empty()
+							&& super::glob::compound_globs_in(ex, &mut elems, &elem_globs)?
+						{
+							elem_globs.clear();
+						}
+						if elem_globs.is_empty() {
+							let mut text = prefix.clone();
+							text.extend_from_slice(&compound_text(&elems));
+							ex.trace_once(&text);
+						} else {
+							late = Some(compound.len());
+						}
+					}
 					let at = argv.len() as u32;
 					argv.push(BString::default());
 					compound.push(at);
@@ -810,6 +838,11 @@ fn expand(
 			let mut text = BString::from(prefix);
 			text.extend_from_slice(&compound_text(&elems));
 			argv[at as usize] = text;
+		}
+		if let Some(from) = late {
+			for &i in &compound[from..] {
+				xtrace::emit(k, cx, vp, line, &argv[i as usize]);
+			}
 		}
 		scratch(vp).spare_words = pool;
 		let s = st(vp);
@@ -1147,7 +1180,8 @@ fn expand(
 		if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 			trace_zsh(k, vp, cx, unit, &cmd.assigns, line);
 		} else {
-			trace(k, vp, cx, unit, &cmd.assigns, line);
+			let traced = decl_compounds(unit, &unit.lists[cmd.words as usize]);
+			trace(k, vp, cx, unit, &cmd.assigns, traced, line);
 		}
 		// Out before the command's redirections move stderr.
 		if let Some(fd) = exec::flush_out(k, vp) {
@@ -1507,13 +1541,25 @@ fn is_arrayref(word: &ir::Word) -> bool {
 	name > 0 && !first[0].is_ascii_digit() && first.get(name) == Some(&b'[') && last.ends_with(b"]")
 }
 
-/// `set -x`: one line per assignment, then the words.
+/// Whether one of `words` is a declaration builtin's compound assignment
+/// argument (`declare -a a=(1)`, bash's `W_COMPASSIGN|W_ASSIGNARG`).
+fn decl_compounds(unit: &Unit, words: &[u32]) -> bool {
+	words.iter().any(|&w| {
+		let word = &unit.words[w as usize];
+		word.kind == ir::WordKind::DeclArg && matches!(word.parts.last(), Some(Part::Compound(_)))
+	})
+}
+
+/// `set -x`: one line per assignment, then the words. `traced`: the
+/// compound assignment words are declaration arguments, traced as they
+/// expanded ([`expand`]).
 fn trace(
 	k: &mut Kernel,
 	vp: &mut Vproc,
 	cx: &mut Cx<'_>,
 	unit: &Unit,
 	assigns: &[ir::AssignOp],
+	traced: bool,
 	line: u32,
 ) {
 	let utf8 = xtrace::utf8(k, cx, vp);
@@ -1554,9 +1600,9 @@ fn trace(
 	}
 	if !s.argv.is_empty() {
 		// A declaration builtin's compound assignment (`declare -a a=(1 2)`)
-		// is made before the builtin runs, traced as bash's
-		// `do_assignment_internal` shows it (`a=('1' '2')`), and the
-		// builtin gets the bare name (`declare -a a`).
+		// was traced as its word expanded (bash makes it then, and shows it
+		// as `do_assignment_internal` does: `a=('1' '2')`); the builtin
+		// gets the bare name (`declare -a a`).
 		let mut argv = s.argv.clone();
 		for &i in &s.compound {
 			let Some(word) = argv.get_mut(i as usize) else {
@@ -1565,41 +1611,15 @@ fn trace(
 			let Some(eq) = word.iter().position(|&c| c == b'=') else {
 				continue;
 			};
-			lines.push(word.to_vec());
+			if !traced {
+				lines.push(word.to_vec());
+			}
 			let name = eq - usize::from(eq > 0 && word[eq - 1] == b'+');
 			word.truncate(name);
 		}
 		let mut body = Vec::new();
 		xtrace::push_words(&mut body, &argv, utf8);
 		lines.push(body);
-		// `export` and `readonly` make each `name=value` operand an
-		// assignment of their own (bash's `do_word_assignment`), traced
-		// after the command.
-		if matches!(argv[0].as_slice(), b"export" | b"readonly") {
-			let mut options = true;
-			for (i, w) in argv.iter().enumerate().skip(1) {
-				if options && w.starts_with(b"-") {
-					options = w.as_slice() != b"--";
-					continue;
-				}
-				options = false;
-				if s.compound.contains(&(i as u32)) {
-					continue;
-				}
-				let Some(eq) = w.iter().position(|&c| c == b'=') else {
-					continue;
-				};
-				let append = eq > 0 && w[eq - 1] == b'+';
-				let name = &w[..eq - usize::from(append)];
-				if !super::is_ident(name) {
-					continue;
-				}
-				let mut body = Vec::new();
-				let value = AssignValue::Scalar(BString::from(&w[eq + 1..]));
-				xtrace::push_assign(&mut body, name, None, append, &value, utf8);
-				lines.push(body);
-			}
-		}
 	}
 	for body in lines {
 		xtrace::emit(k, cx, vp, line, &body);

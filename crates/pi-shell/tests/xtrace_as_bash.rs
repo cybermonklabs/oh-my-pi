@@ -2,10 +2,13 @@
 //! (also after `exit` in a function, an `eval` or a `.` file, which bash
 //! has unwound before it runs the trap); a `${ ;}` or `${| ;}` body one
 //! level down (bash runs it with `parse_and_execute`); a declaration
-//! builtin's compound assignment traced as the assignment it makes first
-//! (`+ a=('1' '2')`, then `+ declare -a a`); and `export`'s and
-//! `readonly`'s `name=value` operands traced as assignments after the
-//! command (`+ export X=1`, then `+ X=1`).
+//! builtin's compound assignment traced as the assignment it makes, when
+//! its word expands and before the words after it (`+ a=('1' '<TAB>')`,
+//! every element in plain single quotes, then `+ declare -a a`);
+//! `export`'s and `readonly`'s `name=value` operands traced as each is
+//! assigned, through the builtin's own (redirected) descriptors
+//! (`+ export X=1`, then `+ X=1`; none for `-f`, `-a` or `-A`); and
+//! `PS4`'s first character repeated whole when it is multibyte.
 //!
 //! The rows ([`ROWS`]) are bash's own output: each script as `bash -c` and
 //! as `bash ./s.sh`, run by bash 5.3.20 and 5.2.21 in a fresh directory
@@ -13,9 +16,13 @@
 //! row both run alike is checked as both run it, one they run otherwise as
 //! 5.3.20 does. Left out: `PS4` with a substitution in it (`$(…)`, a
 //! backquote, `${ ;}`) and a command substitution's own EXIT trap level,
-//! which obash does not trace as bash yet, a pipeline's trace order (it
-//! depends on which stage runs first, in bash too) and a row that prints a
-//! pid.
+//! which obash does not trace as bash yet; a pipeline's trace order (it
+//! depends on which stage runs first, in bash too); a row that prints a
+//! pid; a `PS4` whose first byte is no character in a UTF-8 locale (bash
+//! 5.3.20 aborts on it); and the rows about when a declaration's compound
+//! assignment is made rather than traced (bash makes it as it expands the
+//! word, so a later word sees it and a `failglob` error stops the words
+//! after it; obash makes it in the builtin).
 #![cfg(unix)]
 
 mod obash_support;
