@@ -576,6 +576,21 @@ describe("cold entry store", () => {
 		expect(() => maskSessionEntry(cyclic, mask)).toThrow(TypeError);
 	});
 
+	it("resumes entries carrying a runtime nested deeper than JSON.stringify recurses, and reads it back", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const runtime = deepDetails();
+		const file = await writeTranscript(dir.path(), [
+			{ type: "message", id: "u1", message: { role: "user", content: `u1 ${BODY}`, timestamp: 1 }, runtime },
+			{ type: "message", id: "a1", message: assistant(`a1 ${BODY}`), runtime },
+		]);
+		const manager = await open(file);
+
+		for (const id of ["u1", "a1"]) {
+			expect(nestingOf(entry(manager, id).runtime)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+		}
+		await manager.close();
+	});
+
 	it("makes a cold entry whole when one of its fields is assigned, and persists the write", async () => {
 		using dir = TempDir.createSync("@omp-cold-entries-");
 		const file = await writeSession(dir.path());
