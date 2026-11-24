@@ -231,7 +231,7 @@ mod platform {
 			};
 			tasks.flatten().all(|task| {
 				// A thread that ended after the listing has no stat left to read.
-				let Ok(stat) = fs::read_to_string(task.path().join("stat")) else {
+				let Ok(stat) = read_lossy(task.path().join("stat")) else {
 					return true;
 				};
 				// The state follows the command name, which may itself hold `)`.
@@ -264,7 +264,7 @@ mod platform {
 			let mut threads = 0_usize;
 			for task in tasks.flatten() {
 				// A thread that ended after the listing blocks nothing.
-				let Ok(status) = fs::read_to_string(task.path().join("status")) else {
+				let Ok(status) = read_lossy(task.path().join("status")) else {
 					continue;
 				};
 				let mask = status
@@ -373,7 +373,15 @@ mod platform {
 		if super::proc_read_fault::stat_fails(pid) {
 			return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
 		}
-		fs::read_to_string(format!("/proc/{pid}/stat"))
+		read_lossy(format!("/proc/{pid}/stat"))
+	}
+
+	/// `path` read whole, with bytes that are not UTF-8 replaced. A process's
+	/// name (`comm`) may hold any bytes: the kernel cuts it at 15 bytes, inside
+	/// a character too, and writes it into `stat` and `status` unescaped. A
+	/// read that refused such a file would hide the fields after the name.
+	fn read_lossy(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+		fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 	}
 
 	/// The entries of `/proc`. A test can make the listing fail for one group.
@@ -1993,7 +2001,8 @@ mod tests {
 	/// The state letter of `pid`'s main thread: `T` once it has stopped.
 	#[cfg(target_os = "linux")]
 	fn thread_state(pid: i32) -> Option<char> {
-		let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+		let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+		let stat = String::from_utf8_lossy(&stat);
 		stat[stat.rfind(')')? + 1..].trim_start().chars().next()
 	}
 
@@ -2430,8 +2439,8 @@ mod tests {
 	/// The command name of `pid` (`/proc/<pid>/comm`), empty when unreadable.
 	#[cfg(target_os = "linux")]
 	fn comm(pid: i32) -> String {
-		std::fs::read_to_string(format!("/proc/{pid}/comm"))
-			.map_or_else(|_| String::new(), |name| name.trim().to_string())
+		std::fs::read(format!("/proc/{pid}/comm"))
+			.map_or_else(|_| String::new(), |name| String::from_utf8_lossy(&name).trim().to_string())
 	}
 
 	/// The live (not zombie) processes of process group `pgid`, after giving
@@ -2445,9 +2454,10 @@ mod tests {
 				.flatten()
 				.filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
 				.filter(|pid| {
-					let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+					let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
 						return false;
 					};
+					let stat = String::from_utf8_lossy(&stat);
 					let Some(end) = stat.rfind(')') else {
 						return false;
 					};
@@ -3194,6 +3204,223 @@ mod tests {
 			!outlived,
 			"the member outlived the termination: a group whose member could not be read was read as \
 			 empty"
+		);
+	}
+
+	/// A name that is not UTF-8, as a name the kernel cut inside a multibyte
+	/// character is.
+	#[cfg(target_os = "linux")]
+	const NON_UTF8_NAME: &[u8] = b"\xe8x\0";
+
+	/// Forks a process that, in a process group of its own when `own_group`,
+	/// blocks or ignores TERM as `term` says, names itself [`NON_UTF8_NAME`]
+	/// and pauses for good. Returns once it has its name. Only raw system calls
+	/// run after the fork: the test process has other threads.
+	#[cfg(target_os = "linux")]
+	fn spawn_non_utf8_named(own_group: bool, term: NonUtf8Term) -> i32 {
+		use std::ptr;
+
+		let mut ready = [0; 2];
+		// SAFETY: the array has room for the two descriptors pipe2 writes.
+		assert_eq!(unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) }, 0, "ready pipe");
+		// SAFETY: the child runs only raw system calls on memory made before the
+		// fork, and leaves by being killed.
+		let pid = unsafe { libc::fork() };
+		assert!(pid >= 0, "fork");
+		if pid == 0 {
+			// SAFETY: as above; every pointer names a live local of this frame.
+			unsafe {
+				if own_group {
+					libc::setpgid(0, 0);
+				}
+				match term {
+					NonUtf8Term::Default => {
+						libc::signal(libc::SIGTERM, libc::SIG_DFL);
+					},
+					NonUtf8Term::Ignored => {
+						libc::signal(libc::SIGTERM, libc::SIG_IGN);
+					},
+					NonUtf8Term::Blocked => {
+						libc::signal(libc::SIGTERM, libc::SIG_DFL);
+						let mut set: libc::sigset_t = std::mem::zeroed();
+						libc::sigemptyset(&raw mut set);
+						libc::sigaddset(&raw mut set, libc::SIGTERM);
+						libc::sigprocmask(libc::SIG_BLOCK, &raw const set, ptr::null_mut());
+					},
+				}
+				libc::prctl(libc::PR_SET_NAME, NON_UTF8_NAME.as_ptr());
+				libc::write(ready[1], [1u8].as_ptr().cast(), 1);
+				loop {
+					libc::pause();
+				}
+			}
+		}
+		if own_group {
+			// SAFETY: setpgid takes scalars; the child is this process's own.
+			unsafe { libc::setpgid(pid, pid) };
+		}
+		let mut byte = 0u8;
+		// SAFETY: the ends are this process's own descriptors, each closed once;
+		// `byte` has room for the one byte read.
+		let got = unsafe {
+			libc::close(ready[1]);
+			let got = libc::read(ready[0], (&raw mut byte).cast(), 1);
+			libc::close(ready[0]);
+			got
+		};
+		assert_eq!(got, 1, "the child named itself");
+		pid
+	}
+
+	/// What a [`spawn_non_utf8_named`] process does with TERM.
+	#[cfg(target_os = "linux")]
+	#[derive(Clone, Copy)]
+	enum NonUtf8Term {
+		Default,
+		Ignored,
+		Blocked,
+	}
+
+	/// Kills and reaps this process's child `pid` on drop.
+	#[cfg(target_os = "linux")]
+	struct ChildGuard(i32);
+
+	#[cfg(target_os = "linux")]
+	impl Drop for ChildGuard {
+		fn drop(&mut self) {
+			let mut status = 0;
+			// SAFETY: kill and waitpid take scalars and a valid out-pointer; the
+			// pid is this process's own child, not yet reaped.
+			unsafe {
+				libc::kill(self.0, libc::SIGKILL);
+				libc::waitpid(self.0, &raw mut status, 0);
+			}
+		}
+	}
+
+	/// Whether `pid` has a stat whose state is not `Z` or `X`, read as bytes.
+	#[cfg(target_os = "linux")]
+	fn alive(pid: i32) -> bool {
+		thread_state(pid).is_some_and(|state| state != 'Z' && state != 'X')
+	}
+
+	/// In group mode, a process anywhere on the machine whose name is not
+	/// UTF-8 no longer makes the group wait read every group as alive: the
+	/// group of an ended root, its zombie not yet reaped, is read as empty, and
+	/// the call returns `true` well before its bound. The process is outside
+	/// the group.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_in_group_mode_ends_with_a_non_utf8_named_process_running() {
+		use std::{os::unix::process::CommandExt, process::Command};
+
+		let named = spawn_non_utf8_named(false, NonUtf8Term::Default);
+		let _named = ChildGuard(named);
+		let mut root = Command::new("sleep")
+			.arg("1000")
+			.process_group(0)
+			.spawn()
+			.expect("spawn the root");
+		let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
+		let _guard = GroupGuard(root_pid);
+		let process = Process::from_pid(root_pid).expect("pin the root");
+
+		let started = std::time::Instant::now();
+		let exited = process
+			.terminate_tree(true, 100, 3000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let took = started.elapsed();
+		let _ = reap(&mut root);
+		assert!(exited, "group-mode terminate read the ended root's group as alive (took {took:?})");
+		assert!(took < Duration::from_millis(2000), "the group wait ran to its bound: {took:?}");
+	}
+
+	/// The walk reads, and ends, a child whose name is not UTF-8. This one
+	/// ignores TERM and outlives its parent's TERM, so only a walk that pinned
+	/// it kills it.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_kills_a_non_utf8_named_child() {
+		// SAFETY: the child calls only raw system calls (setpgid, the helper's
+		// fork and its calls, pause) and is killed or ends of a signal.
+		let root = unsafe { libc::fork() };
+		assert!(root >= 0, "fork the root");
+		if root == 0 {
+			// SAFETY: as above.
+			unsafe {
+				libc::setpgid(0, 0);
+				libc::signal(libc::SIGTERM, libc::SIG_DFL);
+				let _ = spawn_non_utf8_named(false, NonUtf8Term::Ignored);
+				loop {
+					libc::pause();
+				}
+			}
+		}
+		// SAFETY: setpgid takes scalars; the root is this process's child.
+		unsafe { libc::setpgid(root, root) };
+		let _guard = GroupGuard(root);
+		let mut child = 0;
+		wait_until("the root's child named itself", || {
+			let Ok(children) = std::fs::read(format!("/proc/{root}/task/{root}/children")) else {
+				return false;
+			};
+			let Some(pid) = String::from_utf8_lossy(&children)
+				.split_whitespace()
+				.find_map(|pid| pid.parse::<i32>().ok())
+			else {
+				return false;
+			};
+			let named = std::fs::read(format!("/proc/{pid}/comm"))
+				.is_ok_and(|name| name.strip_suffix(b"\n") == Some(&NON_UTF8_NAME[..2]));
+			if named {
+				child = pid;
+			}
+			named
+		});
+		let process = Process::from_pid(root).expect("pin the root");
+
+		let exited = process
+			.terminate_tree(false, 200, 3000, CancelToken::default())
+			.await
+			.expect("terminate");
+		let _ = reap_pid(root);
+		let deadline = std::time::Instant::now() + Duration::from_secs(2);
+		while alive(child) && std::time::Instant::now() < deadline {
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		assert!(exited, "the root must be gone");
+		assert!(!alive(child), "the child named {NON_UTF8_NAME:?} outlived the termination");
+	}
+
+	/// The walk's reads of a process's threads take a name that is not UTF-8:
+	/// a running process does not read as stopped, a stopped one does, and
+	/// where masks are shown its blocked TERM reads as blocked.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn the_walk_reads_the_threads_of_a_non_utf8_named_process() {
+		let named = spawn_non_utf8_named(true, NonUtf8Term::Blocked);
+		let _named = ChildGuard(named);
+		let process = Process::from_pid(named).expect("pin the process whose name is not UTF-8");
+		wait_until("the process sleeps in pause", || thread_state(named) == Some('S'));
+		assert!(
+			!process.inner.stopped(),
+			"a running process whose name is not UTF-8 read as stopped"
+		);
+		assert!(process.inner.asleep(), "a process asleep in pause did not read as asleep");
+		if masks_shown() {
+			assert_eq!(
+				process.inner.blocks(TERM_SIGNAL),
+				Some(true),
+				"its blocked TERM did not read as blocked"
+			);
+		}
+		// SAFETY: kill takes scalars; the process is this process's child.
+		unsafe { libc::kill(named, libc::SIGSTOP) };
+		wait_until("the process stopped", || thread_state(named) == Some('T'));
+		assert!(
+			process.inner.stopped(),
+			"a stopped process whose name is not UTF-8 did not read as stopped"
 		);
 	}
 }
