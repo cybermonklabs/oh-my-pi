@@ -328,6 +328,11 @@ fn an_integer_underscore_bind_error_names_its_command() {
 			"",
 			div0("((", "a/b"),
 		),
+		(
+			"declare -i _=5; f() { for ((i=0; i < ${ echo 1; true; }; i++)); do true; done; }; f a/b",
+			"",
+			div0("((", "a/b"),
+		),
 	]);
 	let dir = tempfile::tempdir().unwrap();
 	for (name, text) in [
