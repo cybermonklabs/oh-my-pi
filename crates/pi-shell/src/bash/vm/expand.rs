@@ -626,8 +626,11 @@ impl<'e, 'c> Expander<'e, 'c> {
 		};
 		let (name, sub) = (&operand[..open], &operand[open + 1..operand.len() - 1]);
 		// Only a `$` or `` ` `` the words' expansion left unquoted is
-		// expanded here; one it backslash-quoted (an expansion's value) is
-		// the primary's to unquote, as before.
+		// expanded here: one written in single quotes, or in the value of
+		// an expansion outside any subscript (`[[ -v $ref ]]`), which bash
+		// expands here too. A subscript's expansion, unquoted or in double
+		// quotes, came back backslash-quoted ([`Self::arith_operand`]): its
+		// value is the primary's to unquote, never expanded again.
 		let mut live = false;
 		let mut i = 0;
 		while i < sub.len() {
@@ -648,11 +651,16 @@ impl<'e, 'c> Expander<'e, 'c> {
 			_ => None,
 		};
 		let assoc = self.is_assoc(target.as_ref().map_or(name, |t| t.as_slice()))?;
-		let value = if assoc {
+		let mut value = if assoc {
 			self.expand_arith_text(&subscript_as_arith_text(sub))?
 		} else {
 			BString::from(self.expand_text(sub)?.into_owned())
 		};
+		// An empty index evaluates to 0, as any empty arithmetic does
+		// (`[[ -v 'a[$(echo)]' ]]` asks for `a[0]`).
+		if !assoc && value.is_empty() {
+			value.push(b'0');
+		}
 		// Quoted as the words' expansion quotes a subscript's value (bash
 		// `sh_backslash_quote` with `expand_array_subscript`'s table).
 		let mut out = BString::from(name);
@@ -668,13 +676,18 @@ impl<'e, 'c> Expander<'e, 'c> {
 	}
 
 	/// An arithmetic operand of `[[ ]]` (`-eq` … `-ge`) or the `-v`
-	/// operand (bash `cond_expand_word` with `Q_ARITH`): one unquoted word,
-	/// neither split nor globbed, except that each unquoted subscript
-	/// (`name[…]`) is expanded on its own (no process substitution) and
-	/// comes back backslash-quoted for the evaluator (bash
-	/// `expand_array_subscript`): `assoc[$key]` with `key='x]'` is
-	/// `assoc[x\]]`. Without `quote` (`[[ -v ]]` under `assoc_expand_once`,
-	/// whose key is used as it is) the expansion comes back unquoted.
+	/// operand (bash `cond_expand_word` with `Q_ARITH`): one word, neither
+	/// split nor globbed, except that each subscript (a `[` with a matching
+	/// `]` and something between), unquoted or in double quotes, is
+	/// expanded on its own like an unquoted word (no process substitution)
+	/// and comes back backslash-quoted for the evaluator (bash
+	/// `expand_array_subscript`): `assoc[$key]` and `"assoc[$key]"` with
+	/// `key='x]'` are `assoc[x\]]`, and what a value holds is never
+	/// expanded again (`key='$(cmd)'` runs nothing). Only text written in
+	/// single quotes reaches the evaluator unquoted (`'a[$(cmd)]'` runs
+	/// `cmd` there). Without `quote` (`[[ -v ]]` under
+	/// `assoc_expand_once`, whose key is used as it is) the expansion comes
+	/// back unquoted.
 	pub fn arith_operand(&mut self, unit: &Arc<Unit>, w: &Word, quote: bool) -> X<BString> {
 		let src = unit
 			.nodes
@@ -696,47 +709,95 @@ impl<'e, 'c> Expander<'e, 'c> {
 						.position(|&c| c == b'\'')
 						.map_or(src.len(), |n| i + n + 2);
 				},
-				b'"' => i = skip_dquoted(src, i + 1).map_or(src.len(), |e| e + 1),
+				// bash expands a double-quoted part with `Q_ARITH` too, so a
+				// subscript in it is expanded and quoted as an unquoted one
+				// is; the text around it is double-quoted as before.
+				b'"' => {
+					let close = skip_dquoted(src, i + 1).unwrap_or(src.len());
+					// The double-quoted text not yet in `out`.
+					let mut piece = i + 1;
+					let mut j = i + 1;
+					while j < close {
+						match src[j] {
+							b'\\' => j += 2,
+							b'`' => j = skip_backquote(src, j + 1).map_or(close, |e| e + 1),
+							b'$' if matches!(src.get(j + 1), Some(b'(' | b'{' | b'[')) => {
+								let (open, end) = pair_of(src[j + 1]);
+								j = skip_pair(src, j + 2, open, end).map_or(close, |e| e + 1);
+							},
+							b'[' => match skip_pair(&src[..close], j + 1, b'[', b']') {
+								Some(end) if end > j + 1 => {
+									if piece == i + 1 {
+										out.extend_from_slice(&subscript_as_arith_text(&src[last..i]));
+									}
+									out.push(b'"');
+									out.extend_from_slice(&src[piece..=j]);
+									out.push(b'"');
+									self.push_subscript(&mut out, &src[j + 1..end], quote)?;
+									piece = end;
+									j = end + 1;
+								},
+								_ => j += 1,
+							},
+							_ => j += 1,
+						}
+					}
+					if piece != i + 1 {
+						out.push(b'"');
+						out.extend_from_slice(&src[piece..close.min(src.len())]);
+						out.push(b'"');
+						last = (close + 1).min(src.len());
+					}
+					i = close + 1;
+				},
 				b'`' => i = skip_backquote(src, i + 1).map_or(src.len(), |e| e + 1),
 				b'$' if matches!(src.get(i + 1), Some(b'(' | b'{' | b'[')) => {
 					let (open, close) = pair_of(src[i + 1]);
 					i = skip_pair(src, i + 2, open, close).map_or(src.len(), |e| e + 1);
 				},
-				b'[' if i > 0 && (src[i - 1].is_ascii_alphanumeric() || src[i - 1] == b'_') => {
-					match skip_pair(src, i + 1, b'[', b']') {
-						Some(end) if end > i + 1 => {
-							let sub = &src[i + 1..end];
-							let value = if sub
-								.iter()
-								.any(|c| matches!(c, b'$' | b'`' | b'\\' | b'"' | b'\''))
-							{
-								self.expand_arith_text(&subscript_as_arith_text(sub))?
-							} else {
-								BString::from(sub)
-							};
-							out.extend_from_slice(&subscript_as_arith_text(&src[last..=i]));
-							if quote {
-								push_quoted_subscript(&mut out, &value);
-							} else {
-								for &c in value.iter() {
-									// Escaped only for the arithmetic-text parse.
-									if matches!(c, b'$' | b'`' | b'"' | b'\\') {
-										out.push(b'\\');
-									}
-									out.push(c);
-								}
-							}
-							last = end;
-							i = end + 1;
-						},
-						_ => i += 1,
-					}
+				b'[' => match skip_pair(src, i + 1, b'[', b']') {
+					Some(end) if end > i + 1 => {
+						out.extend_from_slice(&subscript_as_arith_text(&src[last..=i]));
+						self.push_subscript(&mut out, &src[i + 1..end], quote)?;
+						last = end;
+						i = end + 1;
+					},
+					_ => i += 1,
 				},
 				_ => i += 1,
 			}
 		}
 		out.extend_from_slice(&subscript_as_arith_text(&src[last.min(src.len())..]));
 		self.expand_arith_text(&out)
+	}
+
+	/// Append the subscript `sub`, expanded as an unquoted word (bash
+	/// `expand_subscript_string`), to the arithmetic text `out`:
+	/// backslash-quoted for the evaluator when `quote`, else escaped only
+	/// for the arithmetic-text parse.
+	fn push_subscript(&mut self, out: &mut Vec<u8>, sub: &[u8], quote: bool) -> X<()> {
+		let expanded;
+		let value = if sub
+			.iter()
+			.any(|c| matches!(c, b'$' | b'`' | b'\\' | b'"' | b'\''))
+		{
+			expanded = self.expand_arith_text(&subscript_as_arith_text(sub))?;
+			expanded.as_slice()
+		} else {
+			sub
+		};
+		if quote {
+			push_quoted_subscript(out, value);
+		} else {
+			for &c in value {
+				// Escaped only for the arithmetic-text parse.
+				if matches!(c, b'$' | b'`' | b'"' | b'\\') {
+					out.push(b'\\');
+				}
+				out.push(c);
+			}
+		}
+		Ok(())
 	}
 
 	/// Expand `text` parsed as arithmetic text.
@@ -2582,11 +2643,15 @@ impl<'e, 'c> Expander<'e, 'c> {
 		let Some(var) = state::lookup(&self.k.root, self.cx.store, self.vp, name)? else {
 			// A negative subscript of an unset (or declared, unset) array
 			// has no element to count back from: bash warns as for one
-			// past the start (`declare -ar c; ${c[-4]}`).
+			// past the start (`declare -ar c; ${c[-4]}`). Outside a function
+			// `FUNCNAME` is invisible but holds elements to count back from
+			// ([`hidden_funcname_len`](super::callstack::hidden_funcname_len)).
 			if !list
 				&& let Some(i) = index
 				&& i.starts_with(b"-")
 				&& !self.is_assoc(name)?
+				&& super::callstack::hidden_funcname_len(self.cx.store, self.vp, name)?
+					.is_none_or(|len| len + parse_index(i) < 0)
 			{
 				let shown = self.resolved_name(name)?;
 				self.warn_bad_sub(&shown);
@@ -4170,6 +4235,19 @@ impl arith::Env for Vars<'_, '_> {
 				}
 				return Ok(text.map(|t| arith::Value::of(&t)));
 			}
+			// Outside a function `FUNCNAME` is invisible, but a negative
+			// subscript counts back from the elements it holds
+			// ([`hidden_funcname_len`](super::callstack::hidden_funcname_len)):
+			// `$((FUNCNAME[-1]))` in a script file reads an unset element,
+			// silently.
+			if let Some(i) = index
+				&& i.first() == Some(&b'-')
+				&& let Ok(Some(len)) =
+					super::callstack::hidden_funcname_len(self.cx.store, self.vp, name)
+				&& len + parse_index(i) >= 0
+			{
+				return self.unbound_checked(name, None);
+			}
 		}
 		// One walk for a variable that is no name reference (the common
 		// case); a reference is followed, also to an array element.
@@ -4359,6 +4437,14 @@ impl arith::Env for Vars<'_, '_> {
 
 	fn check_set(&mut self, name: &[u8]) -> Result<(), arith::Error> {
 		if is_dynamic(name) {
+			// Outside a function `FUNCNAME` is invisible, so unset
+			// (`set -u; $((FUNCNAME[@]))` is `FUNCNAME: unbound variable`).
+			if matches!(
+				super::callstack::hidden_funcname_len(self.cx.store, self.vp, name),
+				Ok(Some(_))
+			) {
+				self.nounset_error(name)?;
+			}
 			return Ok(());
 		}
 		let target = match state::deref(&self.k.root, self.cx.store, self.vp, name) {
@@ -4390,6 +4476,14 @@ fn func_binds(
 		}
 	}
 	Ok(false)
+}
+
+/// An evaluated subscript (decimal text) as a number; 0 when it is none.
+fn parse_index(i: &[u8]) -> i64 {
+	std::str::from_utf8(i)
+		.ok()
+		.and_then(|s| s.parse().ok())
+		.unwrap_or(0)
 }
 
 /// The text of `v` (element `index`) arithmetic evaluates, from the

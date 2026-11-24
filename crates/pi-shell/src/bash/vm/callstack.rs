@@ -93,7 +93,7 @@ impl CallKind {
 /// Whether the running top-level script is a file: bash pushes the `main`
 /// level (`open_shell_script`) only then, not for a `-c` string or a script
 /// read from standard input.
-pub(crate) fn has_main(store: &mut dyn StateStore, vp: &Vproc) -> Result<bool, StoreError> {
+fn has_main(store: &mut dyn StateStore, vp: &Vproc) -> Result<bool, StoreError> {
 	Ok(!matches!(
 		state::record(store, vp, Key::Misc(MiscKey::RunOrigin))?,
 		Some(Record::Misc(origin)) if matches!(origin.as_slice(), b"c" | b"s")
@@ -201,6 +201,34 @@ pub fn in_function(vp: &Vproc) -> bool {
 	vp.calls
 		.iter()
 		.any(|c| matches!(c.kind, CallKind::Function { .. }))
+}
+
+/// The number of elements bash's `FUNCNAME` holds where it is invisible
+/// (outside any function), when `name` is `FUNCNAME` there: a `source`
+/// for each `.` file being read (`_evalfile`) and `main` for a script file
+/// (`open_shell_script`). A negative subscript counts back from them, so
+/// `${FUNCNAME[-1]}` at a script file's top level, or in a `.` file, names
+/// an unset element silently, where a `-c` string has none to count back
+/// to and warns. `None` for any other name, and inside a function, where
+/// [`array`] lists the elements.
+///
+/// # Errors
+///
+/// A store failure reading the run origin.
+pub(crate) fn hidden_funcname_len(
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	name: &[u8],
+) -> Result<Option<i64>, StoreError> {
+	if name != b"FUNCNAME" || in_function(vp) {
+		return Ok(None);
+	}
+	let sources = vp
+		.calls
+		.iter()
+		.filter(|c| matches!(c.kind, CallKind::Source { .. }))
+		.count();
+	Ok(Some(sources as i64 + i64::from(has_main(store, vp)?)))
 }
 
 /// The call-stack arrays as `declare`/`set` list them (bash's real arrays):

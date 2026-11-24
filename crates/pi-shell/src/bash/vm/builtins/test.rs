@@ -172,14 +172,16 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 						.map_err(Need::from)?,
 					Some(_) => None,
 				};
-				// At a script's top level bash's `FUNCNAME` holds an invisible
-				// `main` (`shell.c`): `[[ -v FUNCNAME[-1] ]]` names that element,
-				// which is unset; with `-c` there is none to count back to.
-				let top_main = v.is_none()
-					&& dynamic.is_none()
-					&& name == b"FUNCNAME"
-					&& !crate::bash::vm::callstack::in_function(ctx.vp)
-					&& crate::bash::vm::callstack::has_main(ctx.cx.store, ctx.vp).map_err(Need::from)?;
+				// Outside a function bash's `FUNCNAME` is invisible but holds a
+				// `source` per `.` file and `main` for a script file:
+				// `[[ -v FUNCNAME[-1] ]]` names one of them, which is unset.
+				let hidden = match (&v, &dynamic) {
+					(None, None) => {
+						crate::bash::vm::callstack::hidden_funcname_len(ctx.cx.store, ctx.vp, name)
+							.map_err(Need::from)?
+					},
+					_ => None,
+				};
 				// An index is expanded once more (bash's `array_expand_index`:
 				// `test -v 'a[$(echo 1)]'`) unless `assoc_expand_once`.
 				let expanded;
@@ -209,8 +211,7 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 								Some(v.next_index())
 							},
 							(_, Some((items, true))) => Some(items.len() as i64),
-							_ if top_main => Some(1),
-							_ => None,
+							_ => hidden,
 						};
 						let n = match len {
 							Some(len) if n < 0 => len + n,
