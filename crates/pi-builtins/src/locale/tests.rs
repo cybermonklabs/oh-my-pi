@@ -939,7 +939,7 @@ fn a_locale_utility_that_misbehaves_is_reported() {
 /// wrote their utilities themselves (`fs::write`), such a child kept the
 /// write descriptor, the kernel refused to run the utility ("Text file
 /// busy"), and the query refused with exit status 126: one whole-crate run
-/// in a runc Job (`fix16-loc60b-rc`) failed so.
+/// in a runc Job failed so.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_child_forked_while_the_utility_is_written_leaves_it_runnable() {
@@ -1044,7 +1044,7 @@ fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
 /// Before Linux 6.9, a member whose main thread has exited while another of
 /// its threads runs is ended too: its `stat` reads `Z`, as a true zombie's
 /// does, and the walk used to skip it, so it outlived the query
-/// (INFRA-4425's review of `77e857a4`). A true zombie in the group is still
+/// (a review of `77e857a4`). A true zombie in the group is still
 /// skipped: it has ended, and only its parent's wait removes it.
 ///
 /// The utility, the member and the zombie are this test's children, so the
