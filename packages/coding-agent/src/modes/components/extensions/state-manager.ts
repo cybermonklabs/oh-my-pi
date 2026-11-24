@@ -2,7 +2,6 @@
  * State manager for the Extension Control Center.
  * Handles data loading, tree building, filtering, and toggle persistence.
  */
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
 import type { ContextFile } from "../../../capability/context-file";
@@ -26,7 +25,11 @@ import {
 	loadCapability,
 } from "../../../discovery";
 import { createSourceMeta, getExtensionNameFromPath } from "../../../discovery/helpers";
-import { isExtensionFile, listPackageExtensionModules } from "../../../extensibility/extensions/loader";
+import {
+	extensionPathKey,
+	isExtensionFile,
+	listPackageExtensionModules,
+} from "../../../extensibility/extensions/loader";
 import { readDisabledServers, readEnabledServers } from "../../../mcp/config-writer";
 import { commandPreview } from "@oh-my-pi/pi-tui/overlays/extensions/inspector-model";
 import { inferMcpTransport } from "@oh-my-pi/pi-tui/overlays/extensions/mcp-runtime";
@@ -94,15 +97,14 @@ async function loadPackageModules(
 		loadCapability<Hook>("hooks", { cwd, disabledExtensions: disabledIds, extensionRoots: roots }),
 	]);
 	const hookFactories = hooks.items.map(hook => hook.path).filter(file => isExtensionFile(path.basename(file)));
-	const realpath = (file: string) => fs.realpath(file).catch(() => path.resolve(file));
 	const seen = new Set(
-		await Promise.all([...nativeModules.map(module => module.path), ...hookFactories].map(realpath)),
+		await Promise.all([...nativeModules.map(module => module.path), ...hookFactories].map(extensionPathKey)),
 	);
 	const providerName = getProviderInfo(PACKAGE_MODULE_PROVIDER)?.displayName ?? PACKAGE_MODULE_PROVIDER;
 	const modules: ExtensionModule[] = [];
 	for (const entry of [...explicit, ...configured]) {
 		if (!entry.toggleable) continue;
-		const key = await realpath(entry.path);
+		const key = await extensionPathKey(entry.path);
 		if (seen.has(key)) continue;
 		seen.add(key);
 		modules.push({

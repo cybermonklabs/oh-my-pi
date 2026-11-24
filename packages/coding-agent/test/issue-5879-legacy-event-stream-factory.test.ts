@@ -31,7 +31,7 @@ describe("issue #5879: legacy provider compatibility", () => {
 		setAgentDir(freshAgentDir);
 
 		try {
-			const result = await loadExtensions([extensionPath], projectDir.path());
+			const result = await loadExtensions([{ path: extensionPath, scope: "explicit" }], projectDir.path());
 
 			expect(result.errors).toEqual([]);
 			expect(result.extensions).toHaveLength(1);
