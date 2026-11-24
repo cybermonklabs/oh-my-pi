@@ -901,3 +901,62 @@ fn test_v_expands_its_subscript() {
 	assert_eq!(out, "yes\nno\nst=1\nhk\n");
 	assert_eq!(err, "");
 }
+
+// Golden: bash 5.3.20 (5.2.21 agrees on the global reference only): an
+// unset name reference names no variable, so an arithmetic `[-1]` write
+// through it names no element: bash warns and assigns nothing, and the
+// reference stays.
+#[test]
+fn negative_write_through_an_unset_reference_assigns_nothing() {
+	let (out, err) = run(
+		r#"declare -n r; ((r[-1]=3)); echo "st=$?"; declare -p r; f() { local -n s; ((s[-1]=4)); declare -p s; }; f"#,
+	);
+	assert_eq!(out, "st=0\ndeclare -n r\ndeclare -n s\n");
+	assert_eq!(
+		err,
+		"bash: line 1: r[-1]: bad array subscript\nbash: line 1: s[-1]: bad array subscript\n"
+	);
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): `-v` of a negative subscript through
+// a name reference (and a chain of them) to a declared empty associative
+// array looks up a key, silently.
+#[test]
+fn test_v_negative_subscript_through_a_reference_to_an_empty_assoc() {
+	let (out, err) = run(
+		r"declare -A A; declare -n r=A s=r; [[ -v r[-1] ]] || echo nv; test -v 'r[-1]' || echo nv2; [[ -v s[-1] ]] || echo nv3; f() { local -n t=A; [[ -v t[-2] ]] || echo nl; }; f",
+	);
+	assert_eq!(out, "nv\nnv2\nnv3\nnl\n");
+	assert_eq!(err, "");
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): at a script file's top level
+// `FUNCNAME` holds an invisible `main`, so `FUNCNAME[-1]` names it, unset,
+// silently; a `-c` string has none, and the subscript is bad.
+#[test]
+fn funcname_negative_subscript_at_a_scripts_top_level() {
+	use crate::{
+		bash::{Origin, Script},
+		testkit::fault::{Rig, skeleton_init},
+	};
+	let src = b"[[ -v FUNCNAME[-1] ]] || echo top\n";
+	let mut rig = Rig::new(FakeHost::new(), skeleton_init(&[]));
+	let script = Script { origin: Origin::File("t.sh".into()), ..Script::command(src.to_vec()) };
+	rig.run(script, Fault::None);
+	assert_eq!(String::from_utf8_lossy(&rig.host.stdout.bytes()), "top\n");
+	assert_eq!(String::from_utf8_lossy(&rig.host.stderr.bytes()), "");
+	let (out, err) = run("[[ -v FUNCNAME[-1] ]] || echo top");
+	assert_eq!(out, "top\n");
+	assert_eq!(err, "bash: line 1: FUNCNAME: bad array subscript\n");
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): `[[ -v` expands its subscript again,
+// a command substitution in it included (`array_expand_once` is off there).
+#[test]
+fn cond_v_runs_a_substitution_in_its_subscript() {
+	let (out, err) = run(
+		r#"a=(x y); [[ -v 'a[$(echo 1)]' ]] && echo yes; echo "st=$?"; [[ -v 'a[`echo 5`]' ]] || echo no; declare -A h; [[ -v 'h[$(echo k)]' ]]; echo "st=$?"; h[k]=1; if [[ -v 'h[$(echo k)]' ]]; then echo hk; fi; echo after"#,
+	);
+	assert_eq!(out, "yes\nst=0\nno\nst=1\nhk\nafter\n");
+	assert_eq!(err, "");
+}

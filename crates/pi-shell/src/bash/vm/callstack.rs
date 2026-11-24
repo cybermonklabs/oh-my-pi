@@ -93,7 +93,7 @@ impl CallKind {
 /// Whether the running top-level script is a file: bash pushes the `main`
 /// level (`open_shell_script`) only then, not for a `-c` string or a script
 /// read from standard input.
-fn has_main(store: &mut dyn StateStore, vp: &Vproc) -> Result<bool, StoreError> {
+pub(crate) fn has_main(store: &mut dyn StateStore, vp: &Vproc) -> Result<bool, StoreError> {
 	Ok(!matches!(
 		state::record(store, vp, Key::Misc(MiscKey::RunOrigin))?,
 		Some(Record::Misc(origin)) if matches!(origin.as_slice(), b"c" | b"s")

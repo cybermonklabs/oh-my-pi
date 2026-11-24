@@ -122,15 +122,29 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 				let (name, i) = (&arg[..open], &arg[open + 1..close]);
 				let v = ctx.var(name)?;
 				// A declared, empty associative array is one too (`declare
-				// -A h; [[ -v h[-1] ]]` looks up the key `-1`).
+				// -A h; [[ -v h[-1] ]]` looks up the key `-1`), also through a
+				// name reference (`declare -n r=h; [[ -v r[-1] ]]`).
+				let target =
+					match crate::bash::vm::state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)
+						.map_err(Need::from)?
+					{
+						crate::bash::vm::state::Deref::To { name: t, index: None } => Some(t),
+						_ => None,
+					};
+				let declared_name = target.as_ref().map_or(name, |t| t.as_slice());
 				let assoc = v
 					.as_ref()
 					.is_some_and(|v| matches!(v.value, VarValue::Assoc(_)))
-					|| crate::bash::vm::state::lookup_declared(&ctx.k.root, ctx.cx.store, ctx.vp, name)
-						.map_err(Need::from)?
-						.is_some_and(|d| {
-							d.attrs.contains(Attrs::ASSOC) || matches!(d.value, VarValue::Assoc(_))
-						});
+					|| crate::bash::vm::state::lookup_declared(
+						&ctx.k.root,
+						ctx.cx.store,
+						ctx.vp,
+						declared_name,
+					)
+					.map_err(Need::from)?
+					.is_some_and(|d| {
+						d.attrs.contains(Attrs::ASSOC) || matches!(d.value, VarValue::Assoc(_))
+					});
 				// A key is expanded once more (bash's
 				// `expand_subscript_string`) unless `assoc_expand_once`;
 				// `@` and `*` are keys too.
@@ -158,6 +172,14 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 						.map_err(Need::from)?,
 					Some(_) => None,
 				};
+				// At a script's top level bash's `FUNCNAME` holds an invisible
+				// `main` (`shell.c`): `[[ -v FUNCNAME[-1] ]]` names that element,
+				// which is unset; with `-c` there is none to count back to.
+				let top_main = v.is_none()
+					&& dynamic.is_none()
+					&& name == b"FUNCNAME"
+					&& !crate::bash::vm::callstack::in_function(ctx.vp)
+					&& crate::bash::vm::callstack::has_main(ctx.cx.store, ctx.vp).map_err(Need::from)?;
 				// An index is expanded once more (bash's `array_expand_index`:
 				// `test -v 'a[$(echo 1)]'`) unless `assoc_expand_once`.
 				let expanded;
@@ -187,6 +209,7 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 								Some(v.next_index())
 							},
 							(_, Some((items, true))) => Some(items.len() as i64),
+							_ if top_main => Some(1),
 							_ => None,
 						};
 						let n = match len {
@@ -675,7 +698,10 @@ pub fn cond_test(
 		},
 		CondIr::Word(w) => std::slice::from_ref(w),
 	};
-	let record = words.iter().any(|&w| unit.words[w as usize].parks);
+	// `-v`'s subscript is expanded with the words (below), where a command
+	// substitution in it can run: its expansion is logged for the replay.
+	let v_operand = matches!(c, CondIr::Unary { op, .. } if op.as_slice() == b"-v");
+	let record = v_operand || words.iter().any(|&w| unit.words[w as usize].parks);
 	let rhs_op: &[u8] = match c {
 		CondIr::Binary { op, .. } => op.as_slice(),
 		_ => &[],
@@ -709,11 +735,19 @@ pub fn cond_test(
 				_ => ex.scalar(unit, word)?,
 			});
 		}
-		Ok(vals)
+		// bash's `-v` expands the subscript again (`array_expand_once` is
+		// off in `[[ ]]`) unless `assoc_expand_once` kept it as it is.
+		let v_subscript = if v_operand && quote {
+			Some(ex.cond_v_operand(vals[0].clone())?)
+		} else {
+			None
+		};
+		Ok((vals, v_subscript))
 	}) {
 		Ok(v) => v,
 		Err(flow) => return flow,
 	};
+	let (vals, v_subscript) = vals;
 	// `set -x`: bash shows a pattern operand with its quoting as
 	// backslashes (`[[ b == c\* ]]`), which is how it is expanded here.
 	if crate::bash::vm::xtrace::on(k, cx, vp) {
@@ -740,7 +774,9 @@ pub fn cond_test(
 		let (res, chunks) = {
 			let mut ctx = Ctx::new(k, cx, vp, sc.probes(), line, "[[");
 			let res = match c {
-				CondIr::Unary { op, .. } if is_unary(op) => unary(&mut ctx, op[1], &vals[0], true),
+				CondIr::Unary { op, .. } if is_unary(op) => {
+					unary(&mut ctx, op[1], v_subscript.as_ref().unwrap_or(&vals[0]), true)
+				},
 				CondIr::Unary { op, .. } => {
 					Err(syntax(format!("{}: unary operator expected", op.as_bstr())))
 				},
@@ -803,12 +839,17 @@ pub fn cond_test(
 				}
 				return Flow::Block(key);
 			},
-			// Only builtins expand subscripts through `Ctx`; a `[[ ]]`
-			// primary never parks.
+			// A `[[ ]]` primary's subscript is expanded with its words
+			// ([`Expander::cond_v_operand`](crate::bash::vm::expand::Expander::cond_v_operand)),
+			// so no substitution is left for it; should one be, it is
+			// reported, never a silent end of the shell.
 			Err(Fail::Need(Need::Sub(_))) => {
+				report(k, cx, vp, line, chunks);
 				if let Some(f) = vp.frames.last_mut() {
 					f.scratch = Some(sc);
 				}
+				let what = "a command substitution left in a `[[ ]]` primary".into();
+				k.diag(cx, vp, line, Diag::Unsupported { what });
 				return Flow::Discard(1);
 			},
 		}

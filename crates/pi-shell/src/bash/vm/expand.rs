@@ -612,6 +612,61 @@ impl<'e, 'c> Expander<'e, 'c> {
 		Ok(Cow::Owned(expanded.into()))
 	}
 
+	/// `[[ -v name[sub] ]]`'s operand once its subscript is expanded here,
+	/// as bash's `-v` does again (`execute_cond_node` runs it with
+	/// `array_expand_once` off: `[[ -v 'a[$(echo 1)]' ]]` finds `a[1]`): an
+	/// index as arithmetic text, a key of an associative array (a declared
+	/// empty one, or one a name reference names, too) as a key, the result
+	/// backslash-quoted for the evaluator. Here the expansion can run a
+	/// command substitution and park, which the `[[ ]]` primary cannot.
+	/// Any other operand comes back as it is.
+	pub fn cond_v_operand(&mut self, operand: BString) -> X<BString> {
+		let (Some(open), true) = (operand.find_byte(b'['), operand.ends_with(b"]")) else {
+			return Ok(operand);
+		};
+		let (name, sub) = (&operand[..open], &operand[open + 1..operand.len() - 1]);
+		// Only a `$` or `` ` `` the words' expansion left unquoted is
+		// expanded here; one it backslash-quoted (an expansion's value) is
+		// the primary's to unquote, as before.
+		let mut live = false;
+		let mut i = 0;
+		while i < sub.len() {
+			match sub[i] {
+				b'\\' => i += 2,
+				b'$' | b'`' => {
+					live = true;
+					break;
+				},
+				_ => i += 1,
+			}
+		}
+		if !live || !super::is_ident(name) {
+			return Ok(operand);
+		}
+		let target = match state::deref(&self.k.root, self.cx.store, self.vp, name)? {
+			state::Deref::To { name: t, index: None } => Some(t),
+			_ => None,
+		};
+		let assoc = self.is_assoc(target.as_ref().map_or(name, |t| t.as_slice()))?;
+		let value = if assoc {
+			self.expand_arith_text(&subscript_as_arith_text(sub))?
+		} else {
+			BString::from(self.expand_text(sub)?.into_owned())
+		};
+		// Quoted as the words' expansion quotes a subscript's value (bash
+		// `sh_backslash_quote` with `expand_array_subscript`'s table).
+		let mut out = BString::from(name);
+		out.push(b'[');
+		for &c in value.iter() {
+			if matches!(c, b'[' | b']' | b'$' | b'`' | b'~' | b'\\' | b'\'' | b'"') {
+				out.push(b'\\');
+			}
+			out.push(c);
+		}
+		out.push(b']');
+		Ok(out)
+	}
+
 	/// An arithmetic operand of `[[ ]]` (`-eq` … `-ge`) or the `-v`
 	/// operand (bash `cond_expand_word` with `Q_ARITH`): one unquoted word,
 	/// neither split nor globbed, except that each unquoted subscript
@@ -4202,6 +4257,10 @@ impl arith::Env for Vars<'_, '_> {
 					.and_then(|s| s.parse().ok())
 					.unwrap_or(0);
 				let next = match cur {
+					// A name reference here names no variable (an unset one:
+					// `deref` gave `Plain`); bash's `find_variable` finds none,
+					// so the subscript names no element.
+					Some(v) if v.attrs.contains(Attrs::NAMEREF) => None,
 					Some(v) if matches!(v.value, VarValue::Str(_)) => Some(1),
 					Some(v) => Some(v.next_index()),
 					None => dynamic_next,
