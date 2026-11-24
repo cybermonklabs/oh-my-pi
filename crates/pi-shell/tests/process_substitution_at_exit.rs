@@ -107,6 +107,9 @@ fn a_process_substitution_outlives_the_shell() {
 			0,
 			"after\nhi\n",
 		),
+		// The reader runs two subshells under the substitution: the exit
+		// spares what descends from it at any depth.
+		("/bin/echo hi > >( ( (sleep 0.3; /bin/cat); : ); : ); echo after", 0, "after\nhi\n"),
 		(": > >(sleep 1; echo late); echo after", 0, "after\nlate\n"),
 	]);
 }
