@@ -203,15 +203,12 @@ impl Tty {
 	/// [`Self::flush`] where shell code runs next (a line read, a widget's
 	/// function, the command after `vared`, `zle -I` or `zle -R`, a hook
 	/// after `PROMPT_SP`): what the terminal does not take now holds the
-	/// vproc's next op back, as zsh's blocking `fflush(shout)` does. `out`
-	/// is the vproc's queued output, which it writes before its next op,
-	/// the display first (`exec::flush_out`); an empty entry for [`FD`]
-	/// makes it wait when nothing else is queued. An external writes to the
-	/// terminal itself: started while display bytes were going out, its
-	/// output came before them.
+	/// vproc's next op back ([`hold`]), as zsh's blocking `fflush(shout)`
+	/// does. An external writes to the terminal itself: started while
+	/// display bytes were going out, its output came before them.
 	pub fn flush_or_hold(&mut self, k: &Kernel, out: &mut VecDeque<PendingWrite>) {
-		if self.flush(k).is_some() && out.is_empty() {
-			out.push_back(PendingWrite::new(FD, BString::default()));
+		if self.flush(k).is_some() {
+			hold(out);
 		}
 	}
 
@@ -236,5 +233,15 @@ impl Tty {
 		let waker = std::task::Waker::noop();
 		let mut tcx = Context::from_waker(waker);
 		usize::from(self.file.poll_read(&mut tcx, &mut []).is_ready())
+	}
+}
+
+/// Hold the vproc's next op until its terminal output is out: `out` is the
+/// vproc's queued output, which it writes before its next op, the editor's
+/// display and the shell's job notices first (`exec::flush_out`); an empty
+/// entry for [`FD`] makes it wait when nothing else is queued.
+pub fn hold(out: &mut VecDeque<PendingWrite>) {
+	if out.is_empty() {
+		out.push_back(PendingWrite::new(FD, BString::default()));
 	}
 }

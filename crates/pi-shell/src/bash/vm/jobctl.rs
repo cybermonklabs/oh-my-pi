@@ -260,7 +260,10 @@ pub fn format_job(vp: &Vproc, number: u32, how: JobLine, platform: Platform) -> 
 /// terminal, else its standard output. On the terminal the notice is
 /// queued ([`JobCtl::shout`]) and goes out as the terminal takes it
 /// ([`drain_shout`]); the shell's next output waits for it
-/// ([`shout_waits`]).
+/// ([`shout_waits`]), and so does its next op while it is not out
+/// ([`super::zle::tty::hold`]): zsh writes it with blocking writes, so an
+/// external that runs next (the list's next command after `zsh: killed`)
+/// prints after it.
 pub fn notice(k: &mut Kernel, vp: &mut Vproc, bytes: &[u8]) {
 	if k.jobctl.shtty.is_none() {
 		vp.out.push_back(PendingWrite::new(1, BString::from(bytes)));
@@ -270,7 +273,9 @@ pub fn notice(k: &mut Kernel, vp: &mut Vproc, bytes: &[u8]) {
 		.shout
 		.items
 		.push_back(ShoutItem::Text(bytes.to_vec()));
-	drain_shout(k);
+	if drain_shout(k) {
+		super::zle::tty::hold(&mut vp.out);
+	}
 }
 
 /// Continue job `id` (`SIGCONT`): at once, or, while notices are still
@@ -2433,6 +2438,82 @@ mod tests {
 					let _ = step_until_done(&mut shell, &mut host, &mut store);
 				}
 				let want = "[1]  + continued  sleep 100\r\n42\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
+			},
+		);
+	}
+
+	/// The editor parks on its own display's write (`getbyte` flushes before
+	/// it reads a key, and the terminal's writer thread still holds the
+	/// bytes): the vproc's next op waits for the display. A trap's command
+	/// runs there once a signal (or `TMOUT` with `TRAPALRM`) unparks the
+	/// vproc; it ran at once, so an external there printed before the
+	/// display, where zsh's blocking `fflush(shout)` before its read orders
+	/// the display first.
+	#[test]
+	fn the_next_op_waits_while_the_editor_parks_on_its_display() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::the_next_op_waits_while_the_editor_parks_on_its_display"),
+			|| {
+				let (mut shell, mut host, mut store, mut master) = shell_with_a_terminal();
+				let base = editing_with_display(&mut shell, b"% ", |_| {
+					zexec::then(zexec::Await::Char, |_, _| zexec::WResult::Done(0))
+				});
+				let held = crate::sys::hold_writers();
+				let got = zexec::drive(
+					&mut shell.k,
+					&mut Cx { host: &mut host, store: &mut store },
+					&mut shell.procs[0],
+					base,
+				);
+				assert!(
+					matches!(
+						got,
+						zexec::Drive::Park(crate::bash::event::WaitKey::Write {
+							fd: super::super::zle::tty::FD,
+						})
+					),
+					"the editor did not park on its display's write"
+				);
+				shell.submit(crate::bash::Script::command(b"x=1".to_vec()));
+				let done = step_until_blocked_or_done(&mut shell, &mut host, &mut store);
+				let ran = is_set(&shell, &mut store, b"x");
+				assert!(
+					!done && !ran,
+					"the next op ran while the editor parked on its display (done={done}, ran={ran})"
+				);
+				drop(held);
+				assert_eq!(step_until_done(&mut shell, &mut host, &mut store), 0);
+				assert!(is_set(&shell, &mut store, b"x"), "the command did not run");
+				assert_eq!(read_terminal(&mut master, 2), "% ");
+			},
+		);
+	}
+
+	/// A job notice still in the terminal's writer thread (`zsh: killed  cmd`
+	/// after a foreground command, the list's next command next): the next
+	/// op waits for it, as zsh's blocking write of the notice orders it
+	/// before what runs next. It ran at once, so an external there printed
+	/// before the notice.
+	#[test]
+	fn the_command_after_a_job_notice_waits_for_it() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::the_command_after_a_job_notice_waits_for_it"),
+			|| {
+				let (mut shell, mut host, mut store, mut master) = shell_with_a_terminal();
+				let held = crate::sys::hold_writers();
+				notice(&mut shell.k, &mut shell.procs[0], b"zsh: killed     sleep 100\n");
+				shell.submit(crate::bash::Script::command(b"x=1".to_vec()));
+				let done = step_until_blocked_or_done(&mut shell, &mut host, &mut store);
+				let ran = is_set(&shell, &mut store, b"x");
+				assert!(
+					!done && !ran,
+					"the next op ran while a job notice was not out (done={done}, ran={ran})"
+				);
+				drop(held);
+				assert_eq!(step_until_done(&mut shell, &mut host, &mut store), 0);
+				assert!(is_set(&shell, &mut store, b"x"), "the command did not run");
+				let want = "zsh: killed     sleep 100\r\n";
 				assert_eq!(read_terminal(&mut master, want.len()), want);
 			},
 		);

@@ -390,9 +390,9 @@ pub fn drive(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, base: usize) -> Dr
 		};
 		// Display bytes go out before other code runs (the accepted line, a
 		// widget's function, the command after `vared` or a `zle` call). A
-		// park is a key read that already flushed (`getbyte`): writing now
-		// would replace the terminal's read watch with a write watch (one per
-		// file).
+		// park is a key read that already flushed and held the next op while
+		// its bytes go out (`getbyte`): writing now would replace the
+		// terminal's read watch with a write watch (one per file).
 		if matches!(out, Some(Drive::Frame | Drive::Done(_)))
 			&& let Some(t) = zle.tty.as_mut()
 		{
@@ -1221,8 +1221,12 @@ fn getbyte(zw: &mut Zw<'_, '_>, keytimeout: bool) -> Byte {
 		zw.ed.lastchar = -1;
 		return Byte::Eof;
 	};
-	// The display is out before the key is waited for.
+	// The display is out before the key is waited for. While it goes out,
+	// what the vproc runs before the editor goes on (a trap's command, once a
+	// signal or `TMOUT` unparks it) waits for it too, as after zsh's blocking
+	// `fflush(shout)` in `getbyte`.
 	if let Some(key) = tty.flush(zw.k) {
+		super::tty::hold(&mut zw.vp.out);
 		return Byte::Pending(key);
 	}
 	match tty.read_byte(zw.k) {
