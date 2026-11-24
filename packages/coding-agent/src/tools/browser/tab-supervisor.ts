@@ -1056,6 +1056,15 @@ async function runInTabWithSnapshot(
 			// In-process runners stay out of worker-backed tabs. A close during
 			// this import aborts `runSignal` and rejects `promise` first.
 			const { runInProcessTab } = await import("./in-process-run");
+			// A close or cancel during the import: start no run, so no runtime is built on a tab that has ended.
+			if (runSignal.aborted) {
+				reject(
+					runSignal.reason instanceof ToolAbortError
+						? runSignal.reason
+						: new ToolAbortError(undefined, { cause: runSignal.reason }),
+				);
+				return await promise;
+			}
 			// `runInProcessTab.then(resolve, reject)` publishes the run's real
 			// outcome to `promise`, but `releaseTab` may have already
 			// rejected it — `Promise.withResolvers` settles on the first
@@ -1358,6 +1367,8 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 	tab.pending.clear();
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_TAB_CLOSE_TIMEOUT_MS;
 	if (tab.backend === "tern") {
+		// Its runtime would otherwise keep any run ownership of this process's realm a hung run left behind.
+		tab.ternTab.discardRuntime();
 		let closeError: unknown;
 		if (wasAlive) {
 			try {
@@ -1386,6 +1397,7 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 		return "released";
 	}
 	if (tab.backend === "cmux") {
+		tab.cmuxTab.discardRuntime();
 		let closeError: unknown;
 		if (wasAlive && tab.cmuxOwnsSurface) {
 			try {
@@ -2231,8 +2243,13 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
 
 /** Teardown half of {@link forceKillTab} for a cmux or Tern surface, published through the release single-flight. */
 async function forceKillSurfaceTab(tab: CmuxTabSession | TernTabSession, name: string): Promise<void> {
-	if (tab.backend === "tern")
+	// A killed tab's runtime ends with it, as on a release: its globals leave this process's realm.
+	if (tab.backend === "tern") {
+		tab.ternTab.discardRuntime();
 		await tab.ternTab.close({ timeoutMs: DEFAULT_TAB_CLOSE_TIMEOUT_MS }).catch(() => undefined);
+	} else {
+		tab.cmuxTab.discardRuntime();
+	}
 	await releaseBrowser(tab.browser, { kill: false });
 	tabs.delete(name);
 }

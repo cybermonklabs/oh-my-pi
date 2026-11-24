@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed cmux and Tern tabs, and Puppeteer tabs on the inline tab worker, keeping their JS runtime after the tab was closed or killed: each such tab left its runtime's entries in the process's shared global table, holding the runtime and its last run's tab objects, for the life of the omp process. The runtime now ends with its tab
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

@@ -52,6 +52,8 @@ export interface InProcessRunTab {
 	setRunContext(context: InProcessRunContext): void;
 	/** Forget the finished run. */
 	clearRunContext(): void;
+	/** Dispose the tab's runtime, so a run that never settled stops holding this process's realm. */
+	discardRuntime(): void;
 }
 
 /** Inputs of {@link runInProcessTab}. */
