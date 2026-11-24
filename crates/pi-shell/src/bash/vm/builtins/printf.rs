@@ -485,12 +485,13 @@ impl<'x> Fmt<'x, '_, '_> {
 		} else {
 			-1
 		};
+		let start = self.ctx.k.start_of(self.ctx.vp);
 		let host = &self.ctx.cx.host;
 		let now = host.wall().secs;
 		let secs = match arg {
 			-1 => now,
 			-2 => {
-				let up = host.now_ns().saturating_sub(self.ctx.k.start_ns) / 1_000_000_000;
+				let up = host.now_ns().saturating_sub(start) / 1_000_000_000;
 				now - i64::try_from(up).unwrap_or(0)
 			},
 			s => s,

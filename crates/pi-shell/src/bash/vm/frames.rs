@@ -3,11 +3,12 @@
 //! The blob holds execution position only. The root shell's tables (its
 //! function scopes, `$?`, `PIPESTATUS`, `$!`, job table, `getopts`
 //! progress, `ulimit` values, cwd) and the kernel's counters (`next_vpid`,
-//! `next_job`, `$RANDOM`, `$SECONDS` base) and child-process table are in
-//! the store at all times; restore reads them there, with or without a
-//! blob. A forked vproc's scopes, global state (its [`crate::bash::Image`],
-//! as what it changed from the root's) and fields are execution position
-//! and are in the blob.
+//! `next_job`, the shell's `$RANDOM` and `$SECONDS` base) and child-process
+//! table are in the store at all times; restore reads them there, with or
+//! without a blob. A forked vproc's scopes, global state (its
+//! [`crate::bash::Image`], as what it changed from the root's) and fields
+//! (its own `$RANDOM` and `$SECONDS` base among them) are execution
+//! position and are in the blob.
 //!
 //! Layout: a postcard [`Header`] (magic `OBF1`, IR version, frames version,
 //! engine build id, ids of the scripts in flight) followed by a postcard
@@ -58,7 +59,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 32;
+pub const FRAMES_VERSION: u32 = 33;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -273,6 +274,8 @@ struct ProcImage {
 	zsh:           Option<Box<super::proc::VprocZsh>>,
 	/// Host lineage (a detached tree stays detached after a restore).
 	lineage:       crate::bash::host::Lineage,
+	/// A forked vproc's `$RANDOM` generator and `$SECONDS` origin.
+	clock:         Option<super::proc::Clock>,
 	/// What the vproc was parked on and the wake count then: a restored
 	/// shell schedules exactly as the externalized one would have (no
 	/// second `Blocked`, same interleaving).
@@ -634,6 +637,7 @@ impl Shell {
 				mode: p.mode,
 				zsh: p.zsh.clone(),
 				lineage: p.lineage,
+				clock: p.clock,
 				blocked: p.blocked.as_ref().map(|b| (b.key.clone(), b.at)),
 			});
 		}
@@ -733,10 +737,10 @@ impl Shell {
 				.and_then(state::Random::decode)
 				.unwrap_or_default()
 		};
-		k.start_ns = match parse_misc(cx.store, MiscKey::StartNs)? {
-			Some(ns) => ns,
-			None => cx.host.now_ns(),
-		};
+		let clock = parse_misc::<super::StartRecord>(cx.store, MiscKey::StartNs)?;
+		k.start_ns = clock.map_or_else(|| cx.host.now_ns(), |c| c.start);
+		k.seconds = clock.map_or(0, |c| c.seconds);
+		k.seconds_plain = clock.is_some_and(|c| c.plain);
 		// The images restored below may hold DEBUG/ERR/RETURN actions a
 		// subshell set: `start_trap` takes its full path for them.
 		k.pseudo_traps.note_all();
@@ -891,6 +895,7 @@ impl Shell {
 			vp.mode = p.mode;
 			vp.zsh = p.zsh;
 			vp.lineage = p.lineage;
+			vp.clock = p.clock;
 			if let Some((id, node)) = p.command {
 				let unit = load_unit(
 					engine,

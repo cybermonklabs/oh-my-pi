@@ -575,6 +575,13 @@ impl FakeHost {
 		true
 	}
 
+	/// Start the clock at `ns` instead of 0, as a host that has run for a
+	/// while (a start time moved back past 0 wraps on a fresh clock).
+	pub fn with_clock_at(self, ns: u64) -> Self {
+		self.clock.store(ns, Ordering::Relaxed);
+		self
+	}
+
 	/// Use `fs` as the filesystem.
 	pub fn with_fs(mut self, fs: MemFs) -> Self {
 		self.fs = fs;
