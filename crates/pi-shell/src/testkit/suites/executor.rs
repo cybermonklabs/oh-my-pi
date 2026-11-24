@@ -360,6 +360,119 @@ fn a_break_in_a_value_substitution_waits_for_its_command() {
 	]);
 }
 
+/// An error in an arithmetic `for`'s header ends that loop with status 1,
+/// and the commands after it run (bash's `execute_arith_for_command`); its
+/// message goes where the loop's own redirections send it. It runs no ERR
+/// trap and does not end a `set -e` shell. A `break` or `continue` waiting
+/// in the test's substitution takes the loop at a failed test; one in the
+/// first or step expression goes on to the loop around it. bash 5.2.21
+/// agrees on the rows with no `${| }`, but for its wording of the syntax
+/// error. The runs restored between the error and the loop's end check the
+/// loop record's state in the image.
+#[test]
+fn an_arith_for_header_error_ends_only_its_loop() {
+	let syntax = |word: &str, token: &str| {
+		format!(
+			"bash: line 1: ((: {word}: arithmetic syntax error: operand expected (error token is \
+			 \"{token}\")\n"
+		)
+	};
+	let by0 = |word: &str, token: &str| {
+		format!("bash: line 1: ((: {word}: division by 0 (error token is \"{token}\")\n")
+	};
+	let twice = |s: String| format!("{s}{s}");
+	check_rows(&[
+		("for (( j=; j<2; j++ )); do echo j$j; done; echo st=$?", "st=1\n", &syntax("j=", "="), 0),
+		("for (( j=; j<2; j++ )); do echo j$j; done 2>/dev/null; echo st=$?", "st=1\n", "", 0),
+		(
+			"x=; for (( j=$x; j<2; j++ )); do echo j$j; done; echo st=$?",
+			"st=1\n",
+			&syntax("j=", "="),
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=1/0; j<2; j++ )); do echo j$j; done; echo \"b$i:$?\"; done; \
+			 echo end:$?",
+			"b1:1\nb2:1\nend:0\n",
+			&twice(by0("j=1/0", "0")),
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=0; j<1/0; j++ )); do echo j$j; done; echo \"b$i:$?\"; done; \
+			 echo end:$?",
+			"b1:1\nb2:1\nend:0\n",
+			&twice(by0("j<1/0", "0")),
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=0; j<2; j+=1/0 )); do echo j$j; done; echo \"b$i:$?\"; done; \
+			 echo end:$?",
+			"j0\nb1:1\nj0\nb2:1\nend:0\n",
+			&twice(by0("j+=1/0 ", "0 ")),
+			0,
+		),
+		(
+			"for (( j=; j<2; j++ )); do echo j$j; done && echo ok || echo no; echo next",
+			"no\nnext\n",
+			&syntax("j=", "="),
+			0,
+		),
+		(
+			"for (( j=0; j<2; j++ )); do for (( k=; k<1; k++ )); do echo k; done; echo \"j$j:$?\"; \
+			 done; echo end:$?",
+			"j0:1\nj1:1\nend:0\n",
+			&twice(syntax("k=", "=")),
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=0; j<${| break; }; j++ )); do echo j$j; done; echo \
+			 \"b$i:$?\"; done; echo end:$?",
+			"b1:1\nb2:1\nend:0\n",
+			&twice(syntax("j<", "<")),
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=0; j<2; j+=${| break; } )); do echo j$j; done; echo \
+			 \"b$i:$?\"; done; echo end:$?",
+			"j0\nend:1\n",
+			&syntax("j+= ", "+= "),
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=${| break; }; j<2; j++ )); do echo j$j; done; echo \
+			 \"b$i:$?\"; done; echo end:$?",
+			"end:1\n",
+			&syntax("j=", "="),
+			0,
+		),
+		(
+			"trap \"echo E\" ERR; for (( j=; j<2; j++ )); do :; done; echo st=$?",
+			"st=1\n",
+			&syntax("j=", "="),
+			0,
+		),
+		(
+			"trap \"echo E\" ERR; for (( j=0; j<1/0; j++ )); do :; done; echo st=$?",
+			"st=1\n",
+			&by0("j<1/0", "0"),
+			0,
+		),
+		("set -e; for (( j=; j<2; j++ )); do :; done; echo after", "after\n", &syntax("j=", "="), 0),
+		(
+			"set -e; for (( j=0; j<2; j+=1/0 )); do :; done; echo after",
+			"after\n",
+			&by0("j+=1/0 ", "0 "),
+			0,
+		),
+		(
+			"f() { for (( j=; ; )); do :; done; echo \"in f $?\"; }; f; echo \"out $?\"",
+			"in f 1\nout 0\n",
+			&syntax("j=", "="),
+			0,
+		),
+	]);
+}
+
 /// `ambiguous redirect` names the word as bash stores it: each command
 /// substitution re-printed by the parser (also in a function body and in
 /// an operator's word), `$'…'` decoded in single quotes, `$"…"` as `"…"`;

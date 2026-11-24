@@ -2328,7 +2328,10 @@ enum OwnLoop {
 /// waiting break reaches no op of it but through that `Redir`. A `for`'s
 /// `ForNext` just after its `ForIn` runs too: a break in its words waits
 /// for the first word as bash's does, as bash counts the loop before it
-/// expands them.
+/// expands them. The bodies of the substitutions in a `for`'s or
+/// `select`'s words lie in its header too ([`before_blocks`]); the jump
+/// over one is the header's, and the break never runs one: [`start_sub`]
+/// expands each to nothing, as bash runs no command while `breaking`.
 fn own_loop(f: &Frame) -> OwnLoop {
 	let Some(unit) = f.unit.as_deref() else {
 		return OwnLoop::None;
@@ -2348,14 +2351,15 @@ fn own_loop(f: &Frame) -> OwnLoop {
 			_ => OwnLoop::None,
 		};
 	}
-	let Some(&prev) = pc.checked_sub(1).and_then(|at| unit.ops.get(at as usize)) else {
+	let Some(prev_at) = before_blocks(unit, pc) else {
 		return OwnLoop::None;
 	};
+	let prev = unit.ops[prev_at as usize];
 	if op.code == Opcode::ForNext && prev.code == Opcode::ForIn && prev.node == op.node {
 		return OwnLoop::Header;
 	}
 	let node = prev.node;
-	let mut at = pc - 1;
+	let mut at = prev_at;
 	loop {
 		let o = unit.ops[at as usize];
 		if o.node != node {
@@ -2367,7 +2371,7 @@ fn own_loop(f: &Frame) -> OwnLoop {
 			},
 			_ => return OwnLoop::None,
 		}
-		let Some(before) = at.checked_sub(1) else {
+		let Some(before) = before_blocks(unit, at) else {
 			return OwnLoop::None;
 		};
 		at = before;
@@ -2383,7 +2387,7 @@ fn own_loop(f: &Frame) -> OwnLoop {
 			OwnLoop::Test { until: kind == NodeKind::Until }
 		},
 		Some(NodeKind::For | NodeKind::Select)
-			if ours && matches!(op.code, Opcode::Enter | Opcode::ForIn) =>
+			if (ours && matches!(op.code, Opcode::Enter | Opcode::ForIn)) || block_at(unit, pc) =>
 		{
 			OwnLoop::Header
 		},
@@ -2398,6 +2402,39 @@ fn own_loop(f: &Frame) -> OwnLoop {
 		},
 		Some(NodeKind::ArithFor) if ours && op.code == Opcode::BrFail => OwnLoop::ArithTest,
 		_ => OwnLoop::None,
+	}
+}
+
+/// Whether the op at `pc` is the jump over a substitution's body, as
+/// [`ir`] lowers a `$( )`, `${ }`, `${| }` or `<( )` in a word (`block`):
+/// a `Jmp` of node 0 to the op after the body's `SubExit`.
+fn block_at(unit: &Unit, pc: u32) -> bool {
+	unit.ops.get(pc as usize).is_some_and(|op| {
+		op.code == Opcode::Jmp
+			&& op.node == 0
+			&& op.a > pc + 1
+			&& unit
+				.ops
+				.get(op.a as usize - 1)
+				.is_some_and(|end| end.code == Opcode::SubExit && end.node == 0)
+	})
+}
+
+/// The pc of the op before `pc`, past the substitution bodies
+/// ([`block_at`]) that end just before it, an outer body with the bodies
+/// it holds; `None` at the unit's start.
+fn before_blocks(unit: &Unit, pc: u32) -> Option<u32> {
+	let mut at = pc.checked_sub(1)?;
+	loop {
+		let end = unit.ops[at as usize];
+		if end.code != Opcode::SubExit || end.node != 0 {
+			return Some(at);
+		}
+		let after = at + 1;
+		let jump = (0..at)
+			.rev()
+			.find(|&j| block_at(unit, j) && unit.ops[j as usize].a == after)?;
+		at = jump.checked_sub(1)?;
 	}
 }
 
@@ -3332,14 +3369,13 @@ fn plain_arith(
 			let line = line_of(vp, op.node);
 			k.diag(cx, vp, line, d);
 			vp.status = 1;
-			// `((…))` continues; an arith-for header error leaves the loop
-			// (approximated by discarding the command).
+			// `((…))` continues; an arith-for header error leaves the loop.
 			if unit
 				.nodes
 				.get(op.node as usize)
 				.is_some_and(|n| n.kind == NodeKind::ArithFor)
 			{
-				Flow::Discard(1)
+				arith_for_failed(vp, unit, op)
 			} else {
 				Flow::Next
 			}
@@ -3353,6 +3389,54 @@ fn plain_arith(
 			stop_flow(k, vp, cx, line, Stop::Fail(d))
 		},
 	})
+}
+
+/// The flow after an arith-`for` header expression failed (its message
+/// shown, `$?` 1): bash's `execute_arith_for_command` leaves the loop with
+/// status 1, and the commands after it run. A failed first expression ends
+/// it before its record is pushed; a failed test or step drops the record.
+/// A `break` or `continue` that waits for a loop
+/// ([`Vproc::pending_break`], from the loop's own redirection or the
+/// test's substitution) loses one level to the loop at a failed test, as
+/// bash's loop checks `breaking` and `continuing` after the test; the
+/// levels left go on to the loops around it. It is no ERR trap point
+/// (the loop's status is no failed command's).
+fn arith_for_failed(vp: &mut Vproc, unit: &Unit, op: Op) -> Flow {
+	let frame = top_frame(vp);
+	frame.err_reported = true;
+	let pc = frame.pc;
+	let next = unit
+		.ops
+		.get(pc as usize + 1)
+		.copied()
+		.filter(|n| n.node == op.node);
+	if let Some(enter) = next.filter(|n| n.code == Opcode::LoopEnter) {
+		// The first expression: `LoopEnter`'s target is the loop's
+		// `LoopExit`, which would pop a record this loop has not pushed.
+		return Flow::Jump(enter.a + 1);
+	}
+	let Some(rec) = top_frame(vp).loops.pop() else {
+		// Every test and step runs with the loop's record pushed.
+		return Flow::Next;
+	};
+	let test = next.is_some_and(|n| n.code == Opcode::BrFail);
+	let depth = vp.frames.len();
+	if test
+		&& vp
+			.pending_break
+			.as_deref()
+			.is_some_and(|p| p.depth as usize == depth)
+	{
+		let left = vp
+			.pending_break
+			.as_deref()
+			.map_or(0, |p| p.levels.saturating_sub(1));
+		match vp.pending_break.as_deref_mut() {
+			Some(p) if left > 0 => p.levels = left,
+			_ => vp.pending_break = None,
+		}
+	}
+	Flow::Jump(rec.exit + 1)
 }
 
 /// Whether `op` (an `Enter`/`Leave`) brackets a zsh `[[ ]]` traced by
@@ -3611,13 +3695,9 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					k.diag(cx, vp, line, d);
 					vp.status = 1;
 					// `((…))` continues; an arith-for header error leaves the
-					// loop (approximated by discarding the command).
-					if unit
-						.nodes
-						.get(op.node as usize)
-						.is_some_and(|n| n.kind == NodeKind::ArithFor)
-					{
-						Flow::Discard(1)
+					// loop.
+					if arith_for {
+						arith_for_failed(vp, unit, op)
 					} else {
 						Flow::Next
 					}
