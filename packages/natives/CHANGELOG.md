@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `rm -f` now ignores only an entry that is already gone, as GNU rm does, and reports every other error with exit status 1: a directory it cannot open or list (for want of a file descriptor, say) is named with that reason instead of being skipped and a directory above it reported as not empty, and an operand in a directory it may not search is reported instead of ignored. Without `-f` such an operand is reported with its own reason instead of "No such file or directory", and messages no longer end with ` (os error N)`
+- `rm -f` now ignores only a name that names no file, as GNU rm does (an entry already gone, a path through a non-directory, or a name the filesystem rejects: ENOENT, ENOTDIR, EINVAL, EILSEQ), and reports every other error with exit status 1: a directory it cannot open or list (for want of a file descriptor, say) is named with that reason instead of being skipped and a directory above it reported as not empty, and an operand in a directory it may not search is reported instead of ignored. Without `-f` such an operand is reported with its own reason instead of "No such file or directory", and messages no longer end with ` (os error N)`
 
 ## [18.18.6] - 2026-11-09
 

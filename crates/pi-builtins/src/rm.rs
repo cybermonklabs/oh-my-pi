@@ -645,16 +645,31 @@ fn show_permission_denied_error(host: &mut Host, path: &Path) -> bool {
 	true
 }
 
-/// Whether `e` says the entry is already gone, which `-f` ignores as GNU rm
-/// does: another process may remove part of the tree while it is walked.
-/// Nothing else is ignored, under `-f` or not.
+/// Whether `e` says the name names no file, which `-f` ignores as GNU rm does
+/// (`remove.c`, `nonexistent_file_errno`): the entry is already gone (another
+/// process may remove part of the tree while it is walked), a component of
+/// its path is not a directory, or the filesystem rejects the name (EINVAL,
+/// EILSEQ). Nothing else is ignored, under `-f` or not.
 ///
 /// As in GNU rm, a later `-i`, `-I` or `--interactive=always|once` cancels
 /// that; the parser then leaves an interactive mode other than `Never`.
 fn is_missing_under_force(e: &io::Error, options: &Options) -> bool {
 	options.force
 		&& !matches!(options.interactive, InteractiveMode::Always | InteractiveMode::Once)
-		&& matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+		&& (matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) || names_no_file(e))
+}
+
+/// GNU's `nonexistent_file_errno` (remove.c) also counts EINVAL and EILSEQ: a
+/// name the filesystem rejects (smbfs gives EINVAL, POSIX asks for EILSEQ)
+/// names no file there.
+#[cfg(unix)]
+fn names_no_file(e: &io::Error) -> bool {
+	matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EILSEQ))
+}
+
+#[cfg(not(unix))]
+fn names_no_file(_: &io::Error) -> bool {
+	false
 }
 
 /// Reports `e` for `path` unless `-f` ignores it ([`is_missing_under_force`]).
@@ -1305,7 +1320,7 @@ pub fn remove(host: &mut Host, files: &[&OsStr], options: &Options) -> bool {
 				}
 			},
 
-			// GNU rm: -f ignores an operand that is already gone, and nothing
+			// GNU rm: -f ignores an operand that names no file, and nothing
 			// else; any other reason it cannot be looked up is reported.
 			Err(e) => !is_missing_under_force(&e, options) && show_removal_error(host, e, file),
 		}
@@ -1856,6 +1871,29 @@ mod tests {
 	use super::{Rm, clean_trailing_slashes};
 	use crate::host::{Host, Utility, run_util};
 
+	/// GNU rm -f (remove.c, `nonexistent_file_errno`) ignores ENOENT, ENOTDIR,
+	/// EINVAL and EILSEQ, and nothing else; without -f it ignores none of them.
+	#[cfg(unix)]
+	#[test]
+	fn force_ignores_what_gnu_counts_as_nonexistent() {
+		let force = super::Options { force: true, interactive: super::InteractiveMode::Never, ..super::Options::default() };
+		let plain = super::Options { force: false, interactive: super::InteractiveMode::Never, ..super::Options::default() };
+		for (errno, ignored) in [
+			(libc::ENOENT, true),
+			(libc::ENOTDIR, true),
+			(libc::EINVAL, true),
+			(libc::EILSEQ, true),
+			(libc::EACCES, false),
+			(libc::ELOOP, false),
+			(libc::ENAMETOOLONG, false),
+			(libc::EMFILE, false),
+		] {
+			let e = std::io::Error::from_raw_os_error(errno);
+			assert_eq!(super::is_missing_under_force(&e, &force), ignored, "-f, errno {errno}: {e}");
+			assert!(!super::is_missing_under_force(&e, &plain), "no -f, errno {errno}: {e}");
+		}
+	}
+
 	#[test]
 	fn collapses_repeated_root_slashes() {
 		assert_eq!(Path::new("/"), clean_trailing_slashes(Path::new("/////")));
@@ -2216,9 +2254,9 @@ mod tests {
 		assert_eq!(run("-r"), Some((code, err)));
 	}
 
-	/// GNU rm -f ignores an operand that is already gone, by a missing name or
-	/// by a path through a file, and nothing else; without -f each is reported
-	/// under its own reason.
+	/// GNU rm -f ignores an operand that names no file, here a missing name or
+	/// a path through a file; without -f each is reported under its own
+	/// reason.
 	#[cfg(unix)]
 	#[test]
 	fn missing_entries_are_silent_only_under_force() {
