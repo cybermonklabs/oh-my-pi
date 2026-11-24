@@ -554,6 +554,8 @@ fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: Proce
 	shell.set_event_mask(EventMask::NONE);
 	let run = shell.submit(Script { origin, ..Script::command(source) });
 	let status = drive(&mut host, &mut store, &mut shell, run, root);
+	// The program `exec` ran died of a signal: bash is that program.
+	let signal = shell.exec_signal(run);
 	// zsh `zexit`: hang up running jobs, give the terminal back.
 	shell.leave_job_control(&mut Cx { host: &mut host, store: &mut store });
 	// Standalone, the process exits next: let the OS reclaim the engine's
@@ -569,8 +571,47 @@ fn run(args: &ShellArgs, env: Vec<(BString, BString)>, input: Input, opts: Proce
 		mem::forget(store);
 		mem::forget(engine);
 	}
+	// Embedded, the process is the runtime's: the status stands for it.
+	if !opts.embedded
+		&& let Some(signal) = signal
+	{
+		die_of_signal(signal);
+	}
 	status & 0xff
 }
+
+/// End this process by `signal` with its default action.
+///
+/// The shell's `exec`'d program died of it, and bash is that program, so
+/// its parent sees the signal, not a status. stdout is flushed first.
+/// Returns when the signal does not end a process by default (the caller
+/// then exits with the status it has).
+#[cfg(unix)]
+pub fn die_of_signal(signal: i32) {
+	let _ = io::stdout().flush();
+	// SAFETY: plain data; SIG_DFL with an empty mask is a valid action.
+	let mut default: libc::sigaction = unsafe { mem::zeroed() };
+	default.sa_sigaction = libc::SIG_DFL;
+	// SAFETY: the mask is valid and writable.
+	unsafe { libc::sigemptyset(&raw mut default.sa_mask) };
+	// SAFETY: a valid action; a number the platform lacks fails with EINVAL.
+	if unsafe { libc::sigaction(signal, &raw const default, std::ptr::null_mut()) } != 0 {
+		return;
+	}
+	// SAFETY: plain data, filled by sigemptyset.
+	let mut set: libc::sigset_t = unsafe { mem::zeroed() };
+	// SAFETY: the set is valid and writable; the signal was accepted above.
+	unsafe {
+		libc::sigemptyset(&raw mut set);
+		libc::sigaddset(&raw mut set, signal);
+		libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+		libc::raise(signal);
+	}
+}
+
+/// Off Unix a process ends with a status only.
+#[cfg(not(unix))]
+pub const fn die_of_signal(_signal: i32) {}
 
 /// The new shell's initial state from the command line `args`.
 ///

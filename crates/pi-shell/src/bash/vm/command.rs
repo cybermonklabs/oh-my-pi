@@ -2597,9 +2597,14 @@ fn spawned_external(
 		},
 		Err(err) => {
 			// bash names the file it tried: the PATH (or hash table)
-			// result, a name with `/` as written.
+			// result, a name with `/` as written; `exec`, by its full path.
 			let name = st(vp).argv[0].clone();
 			let name = if name.contains(&b'/') { name } else { path };
+			let name = if bash_exec(vp) {
+				full_pathname(&vp.cwd, &name)
+			} else {
+				name
+			};
 			let (diag, status) = spawn_error(name, err);
 			k.diag(cx, vp, line, diag);
 			let s = st(vp);
@@ -4700,6 +4705,12 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = st(vp);
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
+	// bash's `exec` resets the trapped signals once it has a program to run
+	// (`reset_signal_handlers` in `exec_builtin`): a name with `/`, or one
+	// the search found. Only a name not found keeps the EXIT trap.
+	let replaced = matches!(control, Some(Transfer::Exec))
+		&& !matches!(e.target, None | Some(Target::NotFound | Target::Search))
+		&& vp.mode.dialect() != crate::bash::ids::Dialect::Zsh;
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
@@ -4748,7 +4759,29 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 				Flow::Discard(n)
 			}
 		},
-		Some(Transfer::Exec) => Flow::Exit(status),
+		Some(Transfer::Exec) => {
+			if replaced {
+				forgo_exit_trap(k, cx, vp);
+			}
+			Flow::Exit(status)
+		},
+	}
+}
+
+/// The shell `exec` replaced runs no EXIT trap on its way out: whether its
+/// program ran or failed to start, bash had reset the trap first. A root
+/// vproc marks its run (the run boundary would start it) and drops the
+/// trap, as a run that fires it does (the next run of a retained shell is
+/// a new invocation); a forked subshell marks itself.
+fn forgo_exit_trap(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
+	if let Some(run) = vp.runs.front_mut() {
+		run.exit_trap_started = true;
+		if vp.parent.is_none() {
+			let key = KeyBuf::Trap(crate::bash::store::TrapKey::Exit);
+			state::store_record(&mut k.root, cx.store, vp, key, None);
+		}
+	} else {
+		vp.exit_trap_run = true;
 	}
 }
 
@@ -4812,12 +4845,26 @@ fn run_script_file(
 		None => probe::perform(k, cx, vp, &mut sc, &probe_req),
 	};
 	vp.frames.last_mut().expect("frame").scratch = Some(sc);
+	// The file bash tried: a name with `/` as written, else the PATH (or
+	// hash table) result; `exec` names it by its full path. Outside `exec`
+	// a refusal names the command as written.
+	let argv0 = st(vp).argv[0].clone();
+	let tried = if argv0.contains(&b'/') {
+		argv0.clone()
+	} else {
+		path
+	};
+	let (file, shown) = if bash_exec(vp) {
+		let file = full_pathname(&vp.cwd, &tried);
+		(file.clone(), file)
+	} else {
+		(tried, argv0)
+	};
 	let text = match answer {
 		Err(key) => return Some(Flow::Block(key)),
 		Ok(ProbeResult::Bytes(Ok(text))) => text,
 		Ok(ProbeResult::Bytes(Err(msg))) => {
-			let name = st(vp).argv[0].clone();
-			k.diag(cx, vp, line, Diag::Usage { msg: format!("{name}: {msg}").into() });
+			k.diag(cx, vp, line, Diag::Usage { msg: format!("{shown}: {msg}").into() });
 			let s = st(vp);
 			s.status = 126;
 			s.stage = Stage::Finish;
@@ -4827,8 +4874,7 @@ fn run_script_file(
 		Ok(_) => BString::default(),
 	};
 	if looks_binary(&text) {
-		let name = st(vp).argv[0].clone();
-		k.diag(cx, vp, line, Diag::BinaryFile { name });
+		k.diag(cx, vp, line, Diag::BinaryFile { name: shown });
 		let s = st(vp);
 		s.status = 126;
 		s.stage = Stage::Finish;
@@ -4847,11 +4893,20 @@ fn run_script_file(
 			},
 		}
 	};
-	// `$0` is the file bash tried: a name with `/` as written, else the
-	// PATH (or hash table) result.
-	let name = st(vp).argv[0].clone();
-	let file = if name.contains(&b'/') { name } else { path };
+	// `$0` is the file bash tried.
 	super::nested::start_script(k, vp, cx, &env, &file, &text)
+}
+
+/// Whether the command is bash's `exec` (not zsh's), which names its
+/// program by the full path ([`full_pathname`]).
+fn bash_exec(vp: &mut Vproc) -> bool {
+	st(vp).exec_as.is_some() && vp.mode.dialect() != crate::bash::ids::Dialect::Zsh
+}
+
+/// bash's `full_pathname`: `name` against the working directory `cwd`,
+/// one leading `./` dropped (`sh_makepath` with `MP_RMDOT`).
+fn full_pathname(cwd: &[u8], name: &[u8]) -> BString {
+	absolute(cwd, name.strip_prefix(b"./").unwrap_or(name))
 }
 
 /// The answer to `probe` for the command running in `vp` (cached in its
@@ -5007,10 +5062,15 @@ fn refused(
 	}
 	let err = std::io::Error::from_raw_os_error(code);
 	// bash names the file it tried: the PATH (or hash table) result, a name
-	// with `/` as written.
+	// with `/` as written; `exec`, by its full path.
 	let name = {
 		let n = st(vp).argv[0].clone();
-		if n.contains(&b'/') { n } else { path.clone() }
+		let tried = if n.contains(&b'/') { n } else { path.clone() };
+		if bash_exec(vp) {
+			full_pathname(&vp.cwd, &tried)
+		} else {
+			tried
+		}
 	};
 	let enoent = err.kind() == ErrorKind::NotFound;
 	let mut status = if enoent { 127 } else { 126 };

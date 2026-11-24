@@ -556,13 +556,14 @@ impl Injector {
 		}
 	}
 
-	/// Run the shell until script `parts.run` finishes; its status. Faults
-	/// are injected at every `Yield` as the plan says.
+	/// Run the shell until script `parts.run` finishes; its status, and the
+	/// signal the program its `exec` ran died of ([`Shell::exec_signal`]).
+	/// Faults are injected at every `Yield` as the plan says.
 	///
 	/// # Errors
 	///
 	/// A failed snapshot, restore, pause or re-exec ([`FaultError`]).
-	pub fn drive(&mut self, parts: Parts) -> Result<i32, FaultError> {
+	pub fn drive(&mut self, parts: Parts) -> Result<(i32, Option<i32>), FaultError> {
 		let Parts { cfg, mut host, mut store, mut shell, run, mask } = parts;
 		let root = Vpid(cfg.vpid_base);
 		let every_k = self.budget();
@@ -649,7 +650,7 @@ impl Injector {
 			}
 		};
 		host.flush()?;
-		Ok(status)
+		Ok((status, shell.exec_signal(run)))
 	}
 
 	/// Pause, observe `Paused` at the next safepoint, resume.
