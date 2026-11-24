@@ -911,6 +911,27 @@ pub enum BangStage {
 	Pipeline,
 }
 
+/// A jump that ends a command (`exit`, a fatal expansion error's) held
+/// while the shell writes its queued messages to a stream that is full
+/// ([`super::Kernel::held_flows`]): bash writes them before the jump undoes
+/// the redirections that chose their stream, waiting as long as it takes.
+/// It goes with its frame: an op of a frame below it runs (a trap that
+/// returns from its function), a new frame takes its index (a trap's, the
+/// EXIT trap's after an `exit`, the next run's after a cancel), the vproc
+/// exits, a cancel or a kill unwinds it, or the vproc ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldFlow {
+	/// The vproc that jumps.
+	pub vproc:  Vpid,
+	/// The index of the frame whose op jumps (a trap that runs meanwhile
+	/// runs its own ops above it).
+	pub frame:  u32,
+	/// `exit` (else the rest of the line is discarded).
+	pub exit:   bool,
+	/// Its status.
+	pub status: i32,
+}
+
 /// A running coprocess: its vproc, the variable naming it and the shell's
 /// ends of its pipes (unset and closed once it is reaped).
 #[derive(Clone, Debug, Serialize, Deserialize)]

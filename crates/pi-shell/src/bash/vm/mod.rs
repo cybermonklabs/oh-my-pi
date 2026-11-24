@@ -674,6 +674,9 @@ pub struct Kernel {
 	/// was busy ([`proc::BusySpawn`]), by deciding vproc; not imaged (a
 	/// restored spawn meets the busy program again).
 	pub busy:               Vec<(Vpid, proc::BusySpawn)>,
+	/// Jumps waiting for their messages to be written ([`proc::HeldFlow`]):
+	/// imaged (a restored shell writes them, then jumps).
+	pub held_flows:         Vec<proc::HeldFlow>,
 	/// Job control of the interactive shell (process groups, the
 	/// terminal, stop events); not imaged.
 	pub jobctl:             jobctl::JobCtl,
@@ -791,6 +794,7 @@ impl Kernel {
 			math_opts: None,
 			deferrals: Vec::new(),
 			busy: Vec::new(),
+			held_flows: Vec::new(),
 			jobctl: jobctl::JobCtl::default(),
 		}
 	}
@@ -806,6 +810,26 @@ impl Kernel {
 	/// while it decides ([`proc::Deferral`]).
 	pub fn deferral(&mut self, vproc: Vpid) -> Option<&mut proc::Deferral> {
 		self.deferrals.iter_mut().find(|d| d.vproc == vproc)
+	}
+
+	/// `vproc` exited, a cancel or a kill unwound it, or it ended: its held
+	/// jumps go with its frames ([`proc::HeldFlow`]).
+	pub fn forget_holds(&mut self, vproc: Vpid) {
+		if !self.held_flows.is_empty() {
+			self.held_flows.retain(|h| h.vproc != vproc);
+		}
+	}
+
+	/// A frame of `vproc` at `depth` or above went, and a new one takes its
+	/// index (a trap's): the jumps they held go with them
+	/// ([`proc::HeldFlow`]).
+	pub fn forget_holds_from(&mut self, vproc: Vpid, depth: usize) {
+		if !self.held_flows.is_empty() {
+			let depth = u32::try_from(depth).unwrap_or(u32::MAX);
+			self
+				.held_flows
+				.retain(|h| h.vproc != vproc || h.frame < depth);
+		}
 	}
 
 	/// `vproc` ended, or its command did: forget what it was deciding.
@@ -2306,6 +2330,7 @@ impl Shell {
 				// A job that ended undecided keeps its virtual pid.
 				self.k.settle_bang(p.vpid, None);
 				self.k.forget_deferral(p.vpid);
+				self.k.forget_holds(p.vpid);
 				self.k.proc_exited(cx.store, p.vpid, p.parent, p.status);
 				self.k.ctl.notify();
 				self.rr = 0;
@@ -2705,7 +2730,7 @@ impl Shell {
 					if trapped {
 						exec::mark_cancel(&mut self.procs[i], status);
 					} else {
-						exec::finish_cancel(&mut self.k.root, cx.store, &mut self.procs[i], status);
+						exec::finish_cancel(&mut self.k, cx.store, &mut self.procs[i], status);
 					}
 				} else {
 					self.kill(cx, i, sig, status);
@@ -2762,7 +2787,8 @@ impl Shell {
 	}
 
 	/// Terminate vproc `i` with `status`: signal its task or external, end its
-	/// scripts. Transient vprocs are removed.
+	/// scripts (the jumps their frames held go with them: a root lives on for
+	/// its next run). Transient vprocs are removed.
 	fn kill(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32) {
 		let vpid = self.procs[i].vpid;
 		self.drop_take_in(vpid);
@@ -2780,6 +2806,7 @@ impl Shell {
 			}
 		}
 		exec::unwind(&mut self.k.root, cx.store, p, 0);
+		self.k.forget_holds(p.vpid);
 		while state::drop_scope(&mut self.k.root, cx.store, p) {}
 		p.out.clear();
 		p.blocked = None;

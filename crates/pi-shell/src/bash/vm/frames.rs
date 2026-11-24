@@ -58,7 +58,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 36;
+pub const FRAMES_VERSION: u32 = 39;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -102,6 +102,8 @@ struct Image {
 	/// `Shell::taking_in`, `Shell::fresh`): a builtin that asked stays
 	/// parked across a snapshot, so its ask and its answer go with it.
 	take_in:     TakeInImage,
+	/// Jumps waiting for their messages ([`Kernel::held_flows`]).
+	held_flows:  Vec<super::proc::HeldFlow>,
 }
 
 /// The take-in's state, as the image keeps it ([`Image::take_in`]).
@@ -701,6 +703,7 @@ impl Shell {
 				asks:  self.taking_in.clone(),
 				fresh: self.fresh.clone(),
 			},
+			held_flows: k.held_flows.clone(),
 		};
 		let mut bytes = postcard::to_stdvec(&header).map_err(ExtError::Encode)?;
 		bytes.extend_from_slice(&postcard::to_stdvec(&image).map_err(ExtError::Encode)?);
@@ -875,6 +878,11 @@ impl Shell {
 			.debug_skips
 			.into_iter()
 			.filter(|s| img.procs.iter().any(|p| p.vpid == s.vproc))
+			.collect();
+		k.held_flows = img
+			.held_flows
+			.into_iter()
+			.filter(|h| img.procs.iter().any(|p| p.vpid == h.vproc))
 			.collect();
 		let built = (0..img.fd_objs.len()).map(|_| None).collect();
 		let mut objs = FdRebuild {
