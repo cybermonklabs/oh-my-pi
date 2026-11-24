@@ -237,6 +237,22 @@ fn a_break_in_a_programs_redirection_stays_in_its_child() {
 			"",
 			0,
 		),
+		// The child keeps the loop level, so the break ends its `${| }` and
+		// waits there as bash's `breaking` does: a later `${| }` of the same
+		// command runs nothing, and the program runs. So it does in a `$( )`
+		// in the loop, whose child keeps the level for the program's own.
+		(
+			"for i in 1 2; do cat 3>e${| break; } 4>e${| echo 2nd >&2; } <<< p$i; echo in; done",
+			"p1\nin\np2\nin\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do x=$(cat 3>e${| break; } <<< p$i; echo more); echo \"[$x]\"; done",
+			"[p1\nmore]\n[p2\nmore]\n",
+			"",
+			0,
+		),
 		// In the shell: the break waits for the command, then the loop ends.
 		(
 			"for i in 1 2; do read v <<E\n${| break; }x\nE\necho \"in [$v]\"; done; echo \"out [$v]\"",
@@ -829,8 +845,8 @@ fn a_trap_runs_before_a_break_in_a_substitution() {
 		),
 		// A program's redirection: bash expands it in the child, and the trap
 		// waits for the child (a builtin's, expanded in the shell, runs it at
-		// once: not yet, as this shell expands a simple command's
-		// redirections before its name resolves).
+		// once: not yet here, as the shell holds a trap back while any simple
+		// command's redirections are made).
 		(
 			"trap \"echo trapped\" USR1; for i in 1; do /bin/echo e 2> ${| kill -USR1 $$; \
 			 REPLY=/dev/null; break; }; echo in; done; echo out",

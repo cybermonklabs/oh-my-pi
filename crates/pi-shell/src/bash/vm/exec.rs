@@ -16,8 +16,8 @@ use super::{
 	is_ident, probe,
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, DebugSkip, Depths, Frame, FrameKind, InlineStage,
-		LastBg, LoopKind, LoopRec, ParseSnapshot, PendingBreak, PendingSub, PendingWrite, Probe,
-		ProbeResult, Run, Saved, Saves, Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		LastBg, LoopKind, LoopRec, OneCommand, ParseSnapshot, PendingBreak, PendingSub, PendingWrite,
+		Probe, ProbeResult, Run, Saved, Saves, Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -162,7 +162,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		let at = k.ctl.wakes();
 		let frame = vp.frames.last().expect("checked above");
 		// A suspended job's base frame ends where the shell's pipeline did.
-		if let FrameKind::Job { stop_at } = frame.kind
+		if let FrameKind::Job { stop_at, .. } = frame.kind
 			&& stop_at == frame.pc
 		{
 			end_unit(k, vp, cx);
@@ -2260,8 +2260,10 @@ pub fn bash_loop_count(vp: &Vproc) -> u32 {
 /// the `Redir` that [`ir`] lowers just before the subshell's `Enter` and
 /// `Spawn`. bash expands those words in the forked child, after
 /// `execute_in_subshell` zeroes `loop_level`, so a `break` there, or in a
-/// substitution started there, sees no loop; this shell expands them in
-/// the parent, before the `Spawn`.
+/// substitution started there, sees no loop; this shell expands them
+/// before the `Spawn`, in the fork [`subshell_redirections`] makes when
+/// they can change the shell (its first frame stands at this `Redir`), else
+/// in the parent.
 pub(super) fn subshell_redirection(f: &Frame) -> bool {
 	f.unit
 		.as_deref()
@@ -2421,17 +2423,8 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 				.iter()
 				.rposition(|f| !matches!(f.kind, FrameKind::Cat { .. }))
 				.map_or(0, |i| i + 1);
-			// A `${ }` in a redirection word or here-document of the command
-			// now on top (see `PendingBreak::redir`).
-			let in_redir = vp
-				.frames
-				.last()
-				.and_then(|f| f.scratch.as_ref())
-				.and_then(|s| s.exec.as_deref())
-				.is_some_and(|e| e.stage == super::proc::Stage::Redirect);
-			let redir = if in_redir { vp.frames.len() as u32 } else { 0 };
 			vp.pending_break =
-				Some(Box::new(PendingBreak { levels: remaining, cont, depth: depth as u32, redir }));
+				Some(Box::new(PendingBreak { levels: remaining, cont, depth: depth as u32 }));
 			return;
 		}
 		let passes = bash_loop_frame(&f.kind);
@@ -2821,17 +2814,21 @@ fn posix_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 /// shell was exiting with (`last_command_exit_value` is saved across the
 /// trap), so the shell leaves with that status and not with the constant
 /// below. Only the EXIT trap does this, so a nested trap action of any
-/// other kind answers `None` and keeps the constant.
+/// other kind answers `None` and keeps the constant. A fork made for one
+/// command in the trap (its base frame's [`FrameKind::Job`]) shares it.
 ///
 /// The saved status is carried as the `i32` the frame holds, exactly as
 /// every other reader of it does (`return` with no argument inside a
 /// trap, the frame-pop restore); it is already a wait status in `0..=255`
 /// on every path that arms a trap, and narrowing it here would be a
 /// silent second opinion about a value this function does not own.
-fn exit_trap_status(vp: &Vproc) -> Option<i32> {
+pub(super) fn exit_trap_status(vp: &Vproc) -> Option<i32> {
 	vp.frames.iter().rev().find_map(|frame| match frame.kind {
 		FrameKind::Script { what: ScriptKind::Trap { key, status, .. }, .. } => {
 			Some((key == TrapKey::Exit).then_some(status))
+		},
+		FrameKind::Job { one: Some(OneCommand { trap_exit: Some(status), .. }), .. } => {
+			Some(Some(status))
 		},
 		_ => None,
 	})?
@@ -2923,6 +2920,13 @@ pub fn fatal_reaches_command_loop(vp: &Vproc) -> bool {
 	let Some(base) = vp.frames.first() else {
 		return super::subshell_depth(vp) == 0;
 	};
+	// The fork made for one command's redirections (a program's, a `( … )`'s:
+	// [`FrameKind::Job`]'s `one`): bash's fork copies `top_level`, so the
+	// error ends where its forking shell's would have, as its base frame
+	// recorded when it forked (`f() { /bin/cat < ${x:?u}; }; f &`).
+	if matches!(base.kind, FrameKind::Job { one: Some(_), .. }) {
+		return base.flags.command_loop();
+	}
 	if vp.parent.is_some()
 		&& let Some(unit) = base.unit.as_deref()
 	{
@@ -3904,6 +3908,9 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			// A bash `( … )`'s own `{var}`s are its fork's: the shell keeps
 			// none (zsh code keeps its own rule).
 			let fork = subshell && !forked && unit.mode.dialect() != Dialect::Zsh;
+			if fork && let Some(flow) = subshell_redirections(k, vp, cx, unit, op) {
+				return flow;
+			}
 			let owner = redir::Owner::Compound { undo: !forked && !subshell, fork };
 			let res = redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line), owner);
 			if forked && !matches!(res, Err(redir::Halt::Flow(_))) {
@@ -3946,13 +3953,15 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					Flow::Jump(op.b)
 				},
 				// In the job's own fork (an async compound command or pipeline
-				// stage: `forked_for`) the fork is the command's: a fatal error
-				// in the command's own redirections ends it with its status (127
-				// or 1), an arithmetic error or a bad substitution with 1, and
-				// nothing after the command runs (a `!` included). The fork ends
-				// after its message is written to stderr as the redirections so
-				// far left it (`2>/dev/null < ${x:?}` prints none), waiting for a
-				// stream that is full. (zsh code keeps its own rule.)
+				// stage: `forked_for`; the fork made for a `( … )`'s
+				// redirections: `subshell_redirections`) the fork is the
+				// command's: a fatal error in the command's own redirections ends
+				// it with its status (127 or 1), an arithmetic error or a bad
+				// substitution with 1, and nothing after the command runs (a `!`
+				// included). The fork ends after its message is written to
+				// stderr as the redirections so far left it (`2>/dev/null <
+				// ${x:?}` prints none), waiting for a stream that is full. (zsh
+				// code keeps its own rule.)
 				Err(redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
 					if forked && unit.mode.dialect() == Dialect::Bash =>
 				{
@@ -4862,6 +4871,69 @@ fn bash_case_hit(
 	Ok(patterns
 		.iter()
 		.any(|p| k.engine.patterns().get(p, opts).matches(subject)))
+}
+
+/// bash's `execute_in_subshell` makes a `( … )`'s own redirections in the
+/// subshell's fork. When they can change the shell
+/// ([`redir::changes_shell`]: `( … ) > ${f:=x}`), the `Redir` op `op` at the
+/// top frame's pc and the subshell after it run in a child vproc, marked as
+/// the fork made for that one command (its `Redir` makes them without undo,
+/// its `Spawn` runs the body, as for an async `( … )`), and the shell goes on
+/// after the command with the child's status. `None`: the redirections are
+/// made here (they change nothing, or some already were).
+#[cold]
+#[inline(never)]
+fn subshell_redirections(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Arc<Unit>,
+	op: Op,
+) -> Option<Flow> {
+	let waited = top_frame(vp)
+		.scratch
+		.as_ref()
+		.and_then(|sc| sc.children.first().map(|&(v, _)| v));
+	if let Some(v) = waited {
+		let Some(status) = k.proc_collect(cx.store, v) else {
+			return Some(Flow::Block(WaitKey::Proc(v)));
+		};
+		clear_scratch(&mut k.root, cx.store, vp);
+		if vp.parent.is_none() && k.jobctl.has_pgrp() {
+			super::jobctl::fg_done(k, cx, vp, None, b"");
+		}
+		vp.status = status;
+		vp.pipestatus.clear();
+		vp.pipestatus.push(status);
+		return Some(Flow::Jump(op.b));
+	}
+	let started = top_frame(vp)
+		.scratch
+		.as_ref()
+		.and_then(|sc| sc.io.as_ref())
+		.is_some_and(|io| io.redir.done > 0 || io.redir.target.is_some());
+	if started || !redir::changes_shell(k, vp, cx, unit, op.a) {
+		return None;
+	}
+	// A job's command that forks keeps its virtual pid (`spawn`).
+	if !k.bangs.is_empty() {
+		k.settle_bang(vp.vpid, None);
+	}
+	let pc = top_frame(vp).pc;
+	let mut child = vp.child(k, cx.store, Arc::clone(unit), pc, vp.fds.clone());
+	// The subshell's `Spawn` in the child counts the level; no EXIT trap of
+	// this fork's own (the body's runs in its subshell); no loop level of the
+	// shell's (`execute_in_subshell` sets it to 0).
+	super::set_subshell_depth(&mut child, super::subshell_depth(vp));
+	child.set_fork(super::proc::Fork::entry(vp.fork()));
+	child.exit_trap_run = true;
+	let one = OneCommand { trap_exit: exit_trap_status(vp) };
+	child.frames[0].kind = FrameKind::Job { stop_at: op.b, one: Some(one) };
+	let vpid = child.vpid;
+	k.emit_op(cx, vp, op.node, EventData::Subshell { child: vpid });
+	k.spawned.push(Box::new(child));
+	scratch(vp).children = vec![(vpid, None)];
+	Some(Flow::Block(WaitKey::Proc(vpid)))
 }
 
 /// Mark `child`, forked by `vp` to run the job or stage at `entry` (an

@@ -2622,10 +2622,19 @@ impl Shell {
 	}
 
 	/// Vproc `i` has work and is neither stopped nor waiting for a wake that
-	/// has not come.
+	/// has not come. A vproc parked on the fork made for one command's
+	/// redirections ([`Vproc::parked_on_fork`]) waits for that fork to end:
+	/// the wakes of others (the fork's own opens, say) would run its op
+	/// again for nothing, before the fork could take what woke it, and a
+	/// host that images the shell at every op would image it each time.
 	fn runnable(&self, i: usize, wakes: u64) -> bool {
 		let p = &self.procs[i];
-		p.has_work() && !p.stopped && p.blocked.as_ref().is_none_or(|b| b.at != wakes)
+		p.has_work()
+			&& !p.stopped
+			&& p.blocked.as_ref().is_none_or(|b| b.at != wakes)
+			&& p
+				.parked_on_fork()
+				.is_none_or(|v| !self.procs.iter().any(|c| c.vpid == v))
 	}
 
 	/// A finished script or an outgoing callout, if any.

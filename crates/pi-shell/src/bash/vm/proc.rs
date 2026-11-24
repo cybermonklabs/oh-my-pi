@@ -14,7 +14,7 @@ use crate::bash::{
 	fs::{FsPending, Stat},
 	host::{ExtProc, Resolved, Task},
 	ids::{CallId, CmdTag, IntrinsicId, JobId, ModeId, NativeRef, RunId, ToolRef, Vpid},
-	ir::Unit,
+	ir::{Opcode, Unit},
 	mem::Capture,
 	signal::SigSet,
 	syntax::Pos,
@@ -162,13 +162,6 @@ pub struct PendingBreak {
 	/// frame is one that command entered: its `$(< file)` frame runs on;
 	/// a function, `eval` or `.` runs none of its commands.
 	pub depth:  u32,
-	/// The frame count of the command whose redirections were being expanded
-	/// when the `break` ran (0: not in a redirection). bash expands the
-	/// redirections of a program it runs (an external, a command it cannot
-	/// find) in the forked child, so the break is lost with that child: it is
-	/// dropped once that command's name resolves to one ([`super::command`]'s
-	/// `drop_childs_break`).
-	pub redir:  u32,
 }
 
 /// `extdebug`: the stages of the `Spawn` at frame `frame` of vproc `vproc`
@@ -915,7 +908,8 @@ pub struct Deferral {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeferPhase {
 	/// The redirection stage stopped at the open that would wait; the
-	/// command's name resolves next.
+	/// command's name resolves next (bash code resolved it before the
+	/// redirections, so it decides at once).
 	Lookup,
 	/// It is an external: the redirection stage resumes, collecting the
 	/// rest for the process.
@@ -1023,9 +1017,11 @@ impl Vproc {
 	/// there ends (`run_pending_traps`), before a later `break` can leave the
 	/// trap nothing to run. bash expands a program's redirections, and a
 	/// `( … )`'s, in its forked child, so a trap set off there waits for
-	/// that child; this shell expands a simple command's redirections before
-	/// its name resolves, so it holds a trap from them back whatever the
-	/// name runs.
+	/// that child, as it does here for the fork made for them
+	/// ([`Awaited::Fork`], the `( … )`'s child). A builtin's or function's
+	/// redirections are made in the shell, where bash runs such a trap at
+	/// once; this shell still holds it back while any simple command's
+	/// redirections are made.
 	pub fn waiting_foreground(&self) -> bool {
 		self
 			.frames
@@ -1051,10 +1047,37 @@ impl Vproc {
 						}
 						|| matches!(
 							scratch.exec.as_ref().and_then(|exec| exec.waiting),
-							Some(Awaited::Call(_) | Awaited::Task(_) | Awaited::Ext { .. })
+							Some(
+								Awaited::Call(_) | Awaited::Task(_) | Awaited::Ext { .. } | Awaited::Fork
+							)
 						)
 				})
 			})
+	}
+
+	/// The fork made for one command's redirections ([`FrameKind::Job`]'s
+	/// `one`) that `self` is parked on at its top frame: a program's
+	/// ([`Awaited::Fork`]) or a `( … )`'s (its `Redir` op's one child).
+	/// Only that fork's end lets the op go on (a trapped signal waits for it
+	/// too: [`Self::waiting_foreground`]).
+	pub fn parked_on_fork(&self) -> Option<Vpid> {
+		let WaitKey::Proc(v) = self.blocked.as_ref()?.key else {
+			return None;
+		};
+		let f = self.frames.last()?;
+		let sc = f.scratch.as_ref()?;
+		let ours = match sc.exec.as_deref() {
+			Some(e) => e.waiting == Some(Awaited::Fork) && e.wait_for.first() == Some(&v),
+			None => {
+				sc.children.as_slice() == [(v, None)]
+					&& f
+						.unit
+						.as_ref()
+						.and_then(|u| u.ops.get(f.pc as usize))
+						.is_some_and(|op| op.code == Opcode::Redir)
+			},
+		};
+		ours.then_some(v)
 	}
 }
 
@@ -1148,13 +1171,30 @@ pub enum FrameKind {
 		capture: crate::bash::mem::Capture,
 	},
 	/// The base frame of a job the shell suspended
-	/// ([`super::jobctl::suspend`]): a subshell frame that also ends its
-	/// vproc when its pc reaches `stop_at` (the end of the top-level
-	/// pipeline it took over from the shell).
+	/// ([`super::jobctl::suspend`]), or of the fork bash makes for one
+	/// command whose redirections can change the shell (`one`): a subshell
+	/// frame that also ends its vproc when its pc reaches `stop_at` (the end
+	/// of the top-level pipeline it took over from the shell, the end of
+	/// that command).
 	Job {
 		/// Where the job ends.
 		stop_at: u32,
+		/// The fork made for one command's redirections (a program's,
+		/// `command::fork_redirections`; a `( … )`'s,
+		/// `exec::subshell_redirections`); `None` for a suspended job.
+		#[serde(default)]
+		one:     Option<OneCommand>,
 	},
+}
+
+/// What the fork bash makes for one command whose redirections can change
+/// the shell keeps of the shell ([`FrameKind::Job`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OneCommand {
+	/// Forked while the shell ran its EXIT trap: the status the trap keeps,
+	/// which a fatal error in the fork exits with, as in the shell (bash's
+	/// fork shares its saved exit status).
+	pub trap_exit: Option<i32>,
 }
 
 /// Parser state a [`FrameKind::Script`] keeps between its commands.
@@ -1680,11 +1720,12 @@ pub struct ScratchIo {
 	/// The zsh part ([`ScratchZsh`]), created by zsh code on first use
 	/// ([`Self::zsh()`]): a bash op's progress neither carries nor clears it.
 	pub zsh:     Option<Box<ScratchZsh>>,
-	/// The `{var}` redirections a bash `( … )`'s own `Redir` op made so far
-	/// (a simple command's are [`ExecState::var_fds`]), which bash makes in
-	/// the subshell's fork: when they fail the shell forgets them at once
-	/// ([`super::redir::forget_var_fds`]), else after the fork
-	/// ([`Saves::vars`]). No other op takes one. Boxed: few ops have one.
+	/// The `{var}` redirections a bash `( … )`'s own `Redir` op made so far,
+	/// which bash makes in the subshell's fork: when they fail the shell
+	/// forgets them at once ([`super::redir::forget_var_fds`]), else after
+	/// the fork ([`Saves::vars`]). No other op takes one (a simple command
+	/// bash forks for makes its own in a child vproc when it has one:
+	/// [`ExecState::apart`]). Boxed: few ops have one.
 	#[expect(clippy::box_collection, reason = "8 B where a Vec is 24: the size guard below")]
 	pub var_fds: Option<Box<Vec<VarFd>>>,
 }
@@ -1968,22 +2009,17 @@ pub struct ExecState {
 	/// subshell level down ([`super::exec::raise_element_level`]), once.
 	#[serde(default)]
 	pub raised:      bool,
-	/// The `{var}` redirections made so far of a command bash makes them for
-	/// in its fork (an external, a name not found, a null command that
-	/// forks): neither the fd nor the value reaches the shell, which forgets
-	/// them when they fail or when the command ends
-	/// ([`super::redir::forget_var_fds`]). No other command takes one.
-	/// Boxed: few commands have one.
-	#[expect(
-		clippy::box_collection,
-		reason = "8 B where a Vec is 24: the size guard below counts every byte"
-	)]
-	pub var_fds:     Option<Box<Vec<VarFd>>>,
+	/// The command runs in the fork bash makes for a program whose
+	/// redirections can change the shell (`execute_disk_command`,
+	/// `execute_null_command`'s `forcefork`): its redirections and the
+	/// program are this vproc's, which ends with the command; the shell
+	/// that forked it reports it.
+	pub apart:       bool,
 }
 
-/// A `{var}` redirection bash makes in a fork (a command bash forks for, a
-/// `( … )`'s own): the fd, and the variable's name and declared binding
-/// before it took the fd (`None`: unbound).
+/// A `{var}` redirection bash makes in a `( … )`'s fork: the fd, and the
+/// variable's name and declared binding before it took the fd (`None`:
+/// unbound).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VarFd {
 	pub fd:    i32,
@@ -2044,10 +2080,6 @@ pub enum Stage {
 	Output,
 	/// Report and finish.
 	Finish,
-	/// The redirections of a command bash forks for failed (its `status` is
-	/// the fork's): resolve the name, as bash does in the shell before it
-	/// forks (hashing it), then finish; the command runs no further.
-	FailedLookup,
 }
 
 /// What a command name resolved to.
@@ -2141,6 +2173,10 @@ pub enum Awaited {
 	AllJobs,
 	/// The first of the children to finish (`wait -n`); its status.
 	AnyJob,
+	/// The fork made for the command's redirections (`wait_for`'s one
+	/// vproc, [`ExecState::apart`]): a foreground command, as the program
+	/// it runs; its status.
+	Fork,
 }
 
 /// Transient handles; never serialized.
@@ -2273,5 +2309,89 @@ mod tests {
 		assert_eq!(gone.map(|s| s.vpid), Some(Vpid(top - 2)));
 		assert_eq!(jobs.bgp_search(Vpid(top - 1)), Some(3));
 		assert_eq!(jobs.bgp.as_ref().map_or(0, |list| list.len()), BGP_MAX);
+	}
+}
+
+#[cfg(test)]
+mod parked_on_fork_tests {
+	use super::*;
+
+	fn shell() -> Vproc {
+		Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false)
+	}
+
+	fn frame_with(scratch: Scratch) -> Frame {
+		// `FrameKind::Job { one: None }` does not matter here: the function
+		// reads nothing of the frame but its scratch (and, for the subshell
+		// branch, its `unit` and `pc`). A frame with no unit reports its
+		// current op as `None`, which the Redir-op check rules out.
+		let mut f = Frame::new(None, 0, FrameKind::Job { stop_at: 0, one: None });
+		f.scratch = Some(Box::new(scratch));
+		f
+	}
+
+	fn exec_scratch(waiting: Option<Awaited>, wait_for: Vec<Vpid>) -> Scratch {
+		let tag = CmdTag { run: RunId(0), vpid: Vpid(1), seq: 0 };
+		let mut es = ExecState::new(tag, 0);
+		es.waiting = waiting;
+		es.wait_for = wait_for;
+		Scratch { exec: Some(Box::new(es)), ..Scratch::default() }
+	}
+
+	// A program's redirection fork: the shell is parked on `WaitKey::Proc`
+	// for it, its top frame's `exec` is `Awaited::Fork`, and `wait_for`
+	// names that vproc. `parked_on_fork` returns the fork's vpid.
+	#[test]
+	fn awaited_fork_for_the_blocked_vproc_counts() {
+		let fork = Vpid(42);
+		let mut vp = shell();
+		vp.blocked = Some(Blocked { key: WaitKey::Proc(fork), at: 0 });
+		vp.frames
+			.push(frame_with(exec_scratch(Some(Awaited::Fork), vec![fork])));
+		assert_eq!(vp.parked_on_fork(), Some(fork));
+	}
+
+	// The `wait_for.first() == Some(&v)` guard: the shell is blocked on a
+	// different vproc from the one `Awaited::Fork` names, so the top frame
+	// is not parked on its own redirection fork. A plant that drops this
+	// guard would widen `Awaited::Fork` to every vproc the shell could be
+	// blocked on, so `parked_on_fork` would say Some here instead of None.
+	#[test]
+	fn awaited_fork_for_a_different_vproc_is_not_parked() {
+		let blocked_on = Vpid(42);
+		let fork = Vpid(43);
+		let mut vp = shell();
+		vp.blocked = Some(Blocked { key: WaitKey::Proc(blocked_on), at: 0 });
+		vp.frames
+			.push(frame_with(exec_scratch(Some(Awaited::Fork), vec![fork])));
+		assert_eq!(vp.parked_on_fork(), None);
+	}
+
+	// The `Opcode::Redir` guard of the no-exec branch: with one child in
+	// the scratch and no running command, the current op must be the
+	// `Redir` whose fork we are parked on. A frame with no unit reports
+	// no op, so `parked_on_fork` returns None. A plant that drops this
+	// guard would widen the no-exec branch to every vproc with one
+	// child, which a plain `( sleep 0.1; ) & wait` reaches.
+	#[test]
+	fn no_exec_without_a_redir_op_is_not_parked() {
+		let child = Vpid(42);
+		let sc = Scratch { children: vec![(child, None)], ..Scratch::default() };
+		let mut vp = shell();
+		vp.blocked = Some(Blocked { key: WaitKey::Proc(child), at: 0 });
+		vp.frames.push(frame_with(sc));
+		assert_eq!(vp.parked_on_fork(), None);
+	}
+
+	// The shell is blocked on something other than a vproc: no fork
+	// answers, whatever the frame says.
+	#[test]
+	fn blocked_on_a_non_proc_key_is_not_parked() {
+		let fork = Vpid(42);
+		let mut vp = shell();
+		vp.blocked = Some(Blocked { key: WaitKey::Read { fd: 0 }, at: 0 });
+		vp.frames
+			.push(frame_with(exec_scratch(Some(Awaited::Fork), vec![fork])));
+		assert_eq!(vp.parked_on_fork(), None);
 	}
 }

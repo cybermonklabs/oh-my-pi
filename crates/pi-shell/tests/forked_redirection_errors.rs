@@ -21,7 +21,10 @@
 //!   bash makes them in the job's fork before it times the compound
 //!   (`execute_in_subshell`), so a fatal error in them gives that status and
 //!   message, and no time report; a timed simple command's is caught there
-//!   (status 1).
+//!   (status 1). A fatal error in the redirections of a program or a `( … )`
+//!   that a function run by an asynchronous command or a pipeline stage makes
+//!   in a fork of its own lands where that function's would (`f() { /bin/cat <
+//!   ${x:?u}; }; f &`).
 //! - An asynchronous or piped null command bash forks for (fd 0 or a `{var}`)
 //!   exits 0 whatever its redirections do: bash forks it again, and the job's
 //!   fork exits at once.
@@ -70,11 +73,12 @@ use pi_shell::{
 /// Each row: id, run from a script file (else `-c`), script, status,
 /// stdout, stderr (the row's directory written `DIR`).
 const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
-	// 481 rows; bash 5.2.21 and 5.3.20 differ on (left out): h-in-fn/c,
+	// 484 rows; bash 5.2.21 and 5.3.20 differ on (left out): h-in-fn/c,
 	// h-bg-fn/c, h-null/c, g-null-move/c, g-null-move/script, g-assign-move/c,
 	// g-assign-move/script, x-fn/c, x-null-var/c, r2-bg-fn-eval/c,
 	// r2-sub-redir-fn/c, r2-var-local/c, g-fn-group-move-bg/c,
-	// g-fn-close-move-bg/c, l-not-bg-fn-fatal/c
+	// g-fn-close-move-bg/c, l-not-bg-fn-fatal/c, o-bg-fn-ext/c,
+	// o-pipe-fn-ext/c, o-bg-fn-subshell/c
 	("h-ext", false, "/bin/cat < ${x:?u}; echo \"s=$?\"", 0, "s=127\n", "bash: line 1: x: u\n"),
 	("h-ext", true, "/bin/cat < ${x:?u}; echo \"s=$?\"", 0, "s=1\n", "./s.sh: line 1: x: u\n"),
 	("h-notfound", false, "nosuch < ${x:?u}; echo \"s=$?\"", 0, "s=127\n", "bash: line 1: x: u\n"),
@@ -3351,6 +3355,30 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		"./s.sh: line 1: x: u\n",
 	),
 	(
+		"o-bg-fn-ext",
+		true,
+		"f() { /bin/cat < ${x:?u}; }; f & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"o-pipe-fn-ext",
+		true,
+		"f() { /bin/cat < ${x:?u}; }; : | f; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"o-bg-fn-subshell",
+		true,
+		"f() { ( : ) < ${x:?u}; }; f & wait $!; echo \"s=$?\"",
+		0,
+		"s=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
 		"l-not-bg-eval-fatal",
 		false,
 		"! eval '/bin/cat < ${x:?u}' & wait $!; echo \"st=$?\"",
@@ -3723,7 +3751,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 /// The rows bash 5.2.21 runs otherwise, as bash 5.3.20 runs them (this
 /// library follows bash 5.3), in the form of [`ROWS`].
 const ROWS53: &[(&str, bool, &str, i32, &str, &str)] = &[
-	// 15 rows bash 5.2.21 runs otherwise, as bash 5.3.20 runs them
+	// 18 rows bash 5.2.21 runs otherwise, as bash 5.3.20 runs them
 	(
 		"h-in-fn",
 		false,
@@ -3830,6 +3858,33 @@ const ROWS53: &[(&str, bool, &str, i32, &str, &str)] = &[
 		"f() { /bin/cat < ${x:?u}; }; ! f & wait $!; echo \"st=$?\"",
 		0,
 		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	// The fork made for a program's or a `( … )`'s redirections in a function
+	// that a background job or a pipeline element runs: its fatal error ends
+	// where the fork's forking shell's would (bash's fork copies `top_level`).
+	(
+		"o-bg-fn-ext",
+		false,
+		"f() { /bin/cat < ${x:?u}; }; f & wait $!; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"o-pipe-fn-ext",
+		false,
+		"f() { /bin/cat < ${x:?u}; }; : | f; echo \"s=$?\"",
+		0,
+		"s=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"o-bg-fn-subshell",
+		false,
+		"f() { ( : ) < ${x:?u}; }; f & wait $!; echo \"s=$?\"",
+		0,
+		"s=127\n",
 		"bash: line 1: x: u\n",
 	),
 ];
@@ -3962,7 +4017,10 @@ fn a_subshells_own_var_is_its_forks_across_a_restore() {
 	};
 	let plain = run_script(host(), SRC, &[], Fault::None);
 	let imaged = run_script(host(), SRC, &[], Fault::Snapshot { every: 1 });
-	assert!(imaged.snapshots > 10, "{} snapshots", imaged.snapshots);
+	// The shell runs again only once a fork it waits for ends: 13 images at
+	// a6a2639b, where the shell made these redirections itself; not one more
+	// at each wake of the fork's own opens.
+	assert!((11..100).contains(&imaged.snapshots), "{} snapshots", imaged.snapshots);
 	let mid_list = imaged_at_every_other_wait(host(), SRC);
 	assert!(mid_list.snapshots > 0, "no snapshot mid-list");
 	let want = (0, "in=[10] l=x\nout=[]\nw=[] x=[] y=[]\n".to_owned());
