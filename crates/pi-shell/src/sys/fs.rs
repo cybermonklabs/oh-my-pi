@@ -1454,7 +1454,7 @@ mod fifo {
 		};
 		#[cfg(test)]
 		let name = host.to_path_buf();
-		let open = FifoOpen::start(host, &meta, nofollow, creates, truncates, move |path, pinned| {
+		let open = move |path: &std::path::Path, pinned: bool| {
 			#[cfg(test)]
 			{
 				ROUTES.lock().push((name.clone(), pinned));
@@ -1481,7 +1481,15 @@ mod fifo {
 			#[cfg(test)]
 			OPENED.lock().push(name);
 			opened
-		});
+		};
+		// Under gVisor a read-only open does not depend on its `open(2)` being
+		// woken (gVisor can leave it asleep after its writer came): see
+		// `FifoOpen::start_reading`.
+		let open = if write {
+			FifoOpen::start(host, &meta, nofollow, creates, truncates, open)
+		} else {
+			FifoOpen::start_reading(host, &meta, nofollow, creates, open, Ok)
+		};
 		Some(Box::new(Pending(open)))
 	}
 
@@ -2812,6 +2820,64 @@ mod tests {
 			drop(f);
 			assert_eq!(reader.join().unwrap(), "hi");
 			fs::remove_file(host_path(&path).unwrap()).unwrap();
+		}
+
+		/// A read-only open of a FIFO goes through `FifoOpen::start_reading`:
+		/// under gVisor bytes another reader left, with no writer, end it
+		/// (the look's first limit, which only a look gives); on Linux it
+		/// waits for a writer. `PI_VFS_TEST_KERNEL` names the kernel (the
+		/// Jobs set it from the pod's runtime); unset, nothing is checked.
+		#[test]
+		fn a_read_open_is_looked_at_only_on_gvisor() {
+			let Ok(kernel) = std::env::var("PI_VFS_TEST_KERNEL") else {
+				eprintln!("UNKNOWN: PI_VFS_TEST_KERNEL is not set; nothing was checked");
+				return;
+			};
+			let path = fifo();
+			let host = host_path(&path).unwrap().to_path_buf();
+			let other = fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&host)
+				.unwrap();
+			let mut writer = fs::OpenOptions::new()
+				.write(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&host)
+				.unwrap();
+			writer.write_all(b"ab").unwrap();
+			drop(writer);
+			// A child a sibling test forks holds a copy of that writer until
+			// its `exec`, which would end the open on Linux too.
+			thread::sleep(Duration::from_millis(100));
+			let mut p = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
+			let waker = Waker::from(Arc::new(Unpark(thread::current())));
+			let mut cx = Context::from_waker(&waker);
+			let deadline = Instant::now() + Duration::from_secs(2);
+			let took = loop {
+				if let Poll::Ready(r) = p.poll(&mut cx) {
+					break Some(r.unwrap());
+				}
+				if Instant::now() >= deadline {
+					break None;
+				}
+				thread::park_timeout(Duration::from_millis(20));
+			};
+			let looked = took.is_some();
+			// A writer ends an open that waits.
+			let writer = fs::OpenOptions::new()
+				.write(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&host)
+				.unwrap();
+			let end = took.unwrap_or_else(|| finish(&mut p));
+			drop((end, p, writer, other));
+			fs::remove_file(&host).unwrap();
+			assert_eq!(
+				looked,
+				kernel == "gvisor",
+				"the open ended with no writer, with PI_VFS_TEST_KERNEL={kernel}"
+			);
 		}
 
 		/// A FIFO opened for writing only goes to the helper thread even when
