@@ -494,6 +494,13 @@ async fn a_job_whose_words_hold_a_substitution_is_known_by_its_program() {
 	let rows = [
 		(pid_row(r#"PROG "$(true)""#), "program\nst=143\n"),
 		(pid_row(r#"{ exec PROG "$(true)"; }"#), "program\nst=143\n"),
+		// Two and three substitutions in the lone and group forms: a plant
+		// that steps over one body only passes the one-substitution rows
+		// above (one `Jmp` per substitution) and fails here. `ir` lowers
+		// each body in place ahead of the command.
+		(pid_row(r#"PROG "$(true)" "$(true)""#), "program\nst=143\n"),
+		(pid_row(r#"{ exec PROG "$(true)" "$(true)"; }"#), "program\nst=143\n"),
+		(pid_row(r#"PROG "$(true)" "$(true)" "$(true)""#), "program\nst=143\n"),
 	];
 	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
 	assert_bash_outputs(&rows).await;
