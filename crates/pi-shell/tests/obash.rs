@@ -76,18 +76,22 @@ wait; echo "status $?""#;
 }
 
 /// `OBASH_BLESS=1` rewrites the golden from the actual stream (review the
-/// diff).
+/// diff). Standard output is a regular file, which takes each write at once
+/// on every platform: on macOS and Windows a pipe's writes go to the
+/// descriptor's writer thread, and the shell parks until the thread has
+/// written them or not (`Blocked` and `Unblocked` on `Write { fd: 1 }`), as
+/// the thread's timing falls.
 #[test]
 fn events_golden() {
 	let dir = tempfile::tempdir().unwrap();
 	let path = dir.path().join("events.jsonl");
-	let out = output(obash().args([
-		"--events=jsonl",
-		&format!("--events-out={}", path.display()),
-		"-c",
-		LOOP,
-	]));
-	assert_eq!(out.stdout, b"1\n2\n");
+	let stdout = dir.path().join("stdout");
+	output(
+		obash()
+			.args(["--events=jsonl", &format!("--events-out={}", path.display()), "-c", LOOP])
+			.stdout(fs::File::create(&stdout).unwrap()),
+	);
+	assert_eq!(fs::read(&stdout).unwrap(), b"1\n2\n");
 	let actual =
 		golden::normalize(&golden::parse_jsonl(&fs::read_to_string(&path).unwrap()).unwrap());
 	let golden_path = events_fixture("for-loop.jsonl");
