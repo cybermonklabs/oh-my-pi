@@ -647,8 +647,8 @@ impl Kernel {
 		self.deferrals.iter_mut().find(|d| d.vproc == vproc)
 	}
 
-	/// `vproc` exited, its run ended, or it ended: its held jumps go with
-	/// its frames ([`proc::HeldFlow`]).
+	/// `vproc` exited, a cancel or a kill unwound it, or it ended: its held
+	/// jumps go with its frames ([`proc::HeldFlow`]).
 	pub fn forget_holds(&mut self, vproc: Vpid) {
 		if !self.held_flows.is_empty() {
 			self.held_flows.retain(|h| h.vproc != vproc);
@@ -2207,7 +2207,7 @@ impl Shell {
 					if trapped {
 						exec::mark_cancel(&mut self.procs[i], status);
 					} else {
-						exec::finish_cancel(&mut self.k.root, cx.store, &mut self.procs[i], status);
+						exec::finish_cancel(&mut self.k, cx.store, &mut self.procs[i], status);
 					}
 				} else {
 					self.kill(cx, i, sig, status);
@@ -2270,7 +2270,8 @@ impl Shell {
 	}
 
 	/// Terminate vproc `i` with `status`: signal its task or external, end its
-	/// scripts. Transient vprocs are removed.
+	/// scripts (the jumps their frames held go with them: a root lives on for
+	/// its next run). Transient vprocs are removed.
 	fn kill(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32) {
 		let p = &mut self.procs[i];
 		for f in &mut p.frames {
@@ -2286,6 +2287,7 @@ impl Shell {
 			}
 		}
 		exec::unwind(&mut self.k.root, cx.store, p, 0);
+		self.k.forget_holds(p.vpid);
 		while state::drop_scope(&mut self.k.root, cx.store, p) {}
 		p.out.clear();
 		p.blocked = None;
@@ -2308,7 +2310,6 @@ impl Shell {
 			self.k.trace_unit_origins.remove(&p.vpid);
 			self.k.settle_bang(p.vpid, None);
 			self.k.forget_deferral(p.vpid);
-			self.k.forget_holds(p.vpid);
 			self.k.proc_exited(cx.store, p.vpid, p.parent, status);
 			self.rr = 0;
 			self.reaped(cx, p.parent, p.vpid, status);

@@ -739,8 +739,11 @@ pub enum BangStage {
 /// while the shell writes its queued messages to a stream that is full
 /// ([`super::Kernel::held_flows`]): bash writes them before the jump undoes
 /// the redirections that chose their stream, waiting as long as it takes.
-/// It goes when its frame does: a frame below it runs an op, the frame runs
-/// another op, the vproc exits, its run ends or the vproc ends.
+/// It goes when its frame does, whatever op it names: an op of a frame below
+/// it, or of a new frame at its index, runs (a trap that returns from its
+/// function); the vproc exits (a trap's `exit`, before the EXIT trap runs
+/// from the start of frame 0); a cancel or a kill unwinds the vproc (before
+/// the EXIT trap or the next run starts frame 0); the vproc ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldFlow {
 	/// The vproc that jumps.

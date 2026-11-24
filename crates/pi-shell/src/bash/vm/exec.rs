@@ -254,8 +254,8 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		let bash = unit.mode.dialect() == Dialect::Bash;
 		// The op ended in a jump whose messages a full stream held
 		// ([`super::proc::HeldFlow`]): the loop's top wrote them, so the jump
-		// is made now. A hold whose frame went (an op below it runs) or runs
-		// another op (a trap's `break` moved it on) goes.
+		// is made now. A hold whose frame went (an op of a frame below it, or
+		// of a new frame at its index, runs) goes.
 		let jump = if k.held_flows.is_empty() {
 			None
 		} else {
@@ -488,7 +488,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			},
 		}
 		if cancel_transfer {
-			finish_cancel(&mut k.root, cx.store, vp, cancellation.expect("checked"));
+			finish_cancel(k, cx.store, vp, cancellation.expect("checked"));
 			continue;
 		}
 		let errexit = errexit_failed
@@ -836,14 +836,13 @@ fn end_run(k: &mut Kernel, vp: &Vproc, cx: &mut Cx<'_>, run: &super::proc::Run) 
 	k.emit(cx, (vp.vpid, vp.mode), Some(run), EventData::RunEnd { status });
 	k.trace_sources.remove(&vp.vpid);
 	k.trace_unit_origins.remove(&vp.vpid);
-	// A cancelled run's frames are gone, and the jumps they held.
-	k.forget_holds(vp.vpid);
 	k.done.push_back((run.id, status));
 }
 
 /// The jump held for the op of `vp`'s frame `fi` ([`super::proc::HeldFlow`]),
 /// taken; the vproc's holds whose frame went (at or above `fi` but not its
-/// op: a frame below them runs an op, or theirs runs another one) dropped.
+/// op: a frame below them runs an op, or a new frame at their index does)
+/// dropped.
 #[cold]
 #[inline(never)]
 fn take_hold(k: &mut Kernel, vp: &Vproc, fi: usize) -> Option<super::proc::HeldFlow> {
@@ -1184,7 +1183,7 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			return None;
 		}
 		if let Some(cancel) = cancel {
-			finish_cancel(&mut k.root, cx.store, vp, cancel);
+			finish_cancel(k, cx.store, vp, cancel);
 		} else if let Some(status) = status
 			&& exit
 		{
@@ -4965,9 +4964,12 @@ pub fn mark_cancel(vp: &mut Vproc, status: i32) {
 /// End a cancelled vproc (after its signal trap, or at once when it has
 /// none; `Shell::apply_requests`): unwind everything with `status`. The
 /// started run still runs its EXIT trap, as bash does when a signal ends
-/// the shell; scripts queued behind it end unstarted.
-pub fn finish_cancel(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc, status: i32) {
-	unwind(root, store, vp, 0);
+/// the shell; scripts queued behind it end unstarted. The jumps its frames
+/// held go with them, before that EXIT trap or the next run starts a frame
+/// at their index ([`super::proc::HeldFlow`]).
+pub fn finish_cancel(k: &mut Kernel, store: &mut dyn StateStore, vp: &mut Vproc, status: i32) {
+	unwind(&mut k.root, store, vp, 0);
+	k.forget_holds(vp.vpid);
 	vp.status = status;
 	vp.blocked = None;
 	for (i, run) in vp.runs.iter_mut().enumerate() {

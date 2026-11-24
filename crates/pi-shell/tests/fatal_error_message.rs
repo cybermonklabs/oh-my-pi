@@ -23,7 +23,7 @@ use std::{fs, os::unix::process::CommandExt as _, path::Path};
 
 use obash_support::{obash, output};
 use pi_shell::{
-	bash::{Budget, Script, Signal},
+	bash::{Budget, EngineConfig, Script, SigTarget, Signal, Vpid},
 	testkit::{
 		FakeHost, Fault, Rig,
 		fault::skeleton_init,
@@ -235,7 +235,8 @@ fn a_held_discard_goes_on_with_the_next_line() {
 /// A trap that runs while a jump is held runs in a frame of its own: it
 /// does not take the jump, which is made once the trap returns (obash
 /// writes the whole message first, where bash loses it to the signal's
-/// interruption of its write).
+/// interruption of its write). Nor does the trap's op drop the hold: the
+/// held op does not run again, so its message is written once.
 #[test]
 fn a_trap_while_a_jump_is_held_runs_and_the_jump_follows() {
 	let src = format!(
@@ -243,25 +244,33 @@ fn a_trap_while_a_jump_is_held_runs_and_the_jump_follows() {
 		 2>&1 3>\"${{zz?u}}\"; echo never; }} | {READER}; echo \"ps=${{PIPESTATUS[*]}}\""
 	);
 	let (status, out, err) = run(&src, false);
+	let messages = out.matches("zz: u").count();
 	assert!(
-		out.contains("T-usr1\n") && !out.contains("never") && out.ends_with("ps=1 0\n"),
-		"status {status} stdout {out:?} stderr {err:?}"
+		messages == 1
+			&& out.contains("T-usr1\n")
+			&& !out.contains("never")
+			&& out.ends_with("ps=1 0\n"),
+		"messages {messages} status {status} stdout {out:?} stderr {err:?}"
 	);
 }
 
 /// A trap that returns from the function whose op holds a jump takes the
-/// jump with the function's frame: the function called next runs.
+/// hold with the function's frame, at the first op of the frame below: the
+/// function called next at that frame's index runs, and so does the same
+/// function, called again, at the held op's own frame index and op (`&&`
+/// shows its status 0, which [`READER`] would print without its `0`).
 #[test]
 fn a_trap_that_returns_drops_the_held_jump() {
 	let src = format!(
-		"{{ f() {{ trap 'return 7' USR1; p=$BASHPID; ( delay; kill -USR1 $p ) & : 2>&1 \
-		 3>\"${{zz?u}}\"; echo never; }}; g() {{ echo in-g; }}; printf '%065536d' 0; f; echo \
-		 \"after-f s=$?\"; g; echo after-g; }} | {READER}; echo \"ps=${{PIPESTATUS[*]}}\""
+		"{{ f() {{ trap 'return 7' USR1; p=$BASHPID; [ -n \"$1\" ] || {{ ( delay; kill -USR1 $p ) & \
+		 }}; : 2>&1 3>&\"${{1:?u}}\"; echo \"in-f $1\"; }}; g() {{ echo in-g; }}; printf '%065536d' \
+		 0; f; echo \"after-f s=$?\"; g; echo after-g; f 1 && echo after-f2; }} | {READER}; echo \
+		 \"ps=${{PIPESTATUS[*]}}\""
 	);
 	let (status, out, err) = run(&src, false);
 	assert!(
-		out.contains("after-f s=7\nin-g\nafter-g\n") && out.ends_with("ps=0 0\n"),
-		"status {status} stdout {out:?} stderr {err:?}"
+		out.contains("after-f s=7\nin-g\nafter-g\nin-f 1\nafter-f2\n") && out.ends_with("ps=0 0\n"),
+		"held jump taken after the trap's return: status {status} stdout {out:?} stderr {err:?}"
 	);
 }
 
@@ -278,6 +287,65 @@ fn a_trap_that_exits_runs_the_exit_trap_whole() {
 	assert!(
 		out.contains("X-exit\nX-end\n") && out.ends_with("ps=5 0\n"),
 		"status {status} stdout {out:?} stderr {err:?}"
+	);
+}
+
+/// `src` run alone, with one USR1 sent to the root vproc at stop `at` (if
+/// the run lasts that long): its status and stdout.
+fn usr1_at(src: &str, at: u32) -> (i32, String) {
+	let root = Vpid(EngineConfig::default().vpid_base);
+	let mut rig = Rig::new(host(), skeleton_init(&[]));
+	let id = rig.shell().submit(Script::command(src.as_bytes().to_vec()));
+	let budget = Budget { max_ops: 64, max_ns: u64::MAX };
+	let mut steps = 0u32;
+	let status = loop {
+		let (shell, host, store) = rig.parts();
+		match advance_or_blocked(shell, host, store, id, budget) {
+			Stop::Done(status) => break status,
+			Stop::Blocked => {
+				let (shell, host, _) = rig.parts();
+				if !host.fire_next_timer() {
+					wait_runnable(&shell.control());
+				}
+			},
+			Stop::Paused => rig.shell().control().resume(),
+			Stop::Yield => {},
+		}
+		steps += 1;
+		if steps == at {
+			rig.shell()
+				.control()
+				.signal(SigTarget::Vpid(root), Signal::Usr1);
+		}
+		assert!(steps < 1_000_000, "`{src}`: never ended");
+	};
+	(status, text(&rig.host.stdout.bytes()))
+}
+
+/// A trap that exits while the op at the start of a line holds its jump
+/// (frame 0, pc 0): the frames go, the held jump with them, so the EXIT
+/// trap, which runs from the start of frame 0, runs whole. USR1 comes at
+/// each stop from 3 to 120 (the first ones while the jump is held).
+#[test]
+fn a_trap_that_exits_while_a_line_start_op_holds_runs_the_exit_trap_whole() {
+	let src = format!(
+		"trap 'echo X-exit; echo X-end' EXIT; trap 'exit 5' USR1\nexec 2> >({READER})\nprintf \
+		 '%065536d' 0 >&2\nx=${{y:?u}}\necho never"
+	);
+	let mut bad = Vec::new();
+	let mut fives = 0usize;
+	for at in 3..=120 {
+		let (status, out) = usr1_at(&src, at);
+		fives += usize::from(status == 5);
+		if !out.contains("X-exit\n") || !out.contains("X-end\n") || out.contains("never") {
+			bad.push(format!("at {at}: status {status} stdout {out:?}"));
+		}
+	}
+	assert!(
+		bad.is_empty() && fives > 0,
+		"{fives} runs with status 5; {} bad, the first:\n{}",
+		bad.len(),
+		bad.iter().take(4).cloned().collect::<Vec<_>>().join("\n")
 	);
 }
 
@@ -325,4 +393,98 @@ fn a_cancelled_runs_held_jump_is_not_taken_by_the_next_run() {
 		}
 	}
 	assert!(bad.is_empty(), "run 2 did not run whole after:\n{}", bad.join("\n"));
+}
+
+/// Run 1 of the cancel tests below, its jump held on a reader that never
+/// reads: by the op at the start of its line (frame 0, pc 0, where the next
+/// run and the EXIT trap start) or by one later on it, with and without an
+/// EXIT trap.
+const HELD_FIRSTS: &[(&str, &str)] = &[
+	("line-start", "exec 2> >(hold)\nprintf '%065536d' 0 >&2\nx=${y:?u}\necho never"),
+	(
+		"line-start-exit-trap",
+		"trap 'echo X-exit; echo X-end' EXIT\nexec 2> >(hold)\nprintf '%065536d' 0 \
+		 >&2\nx=${y:?u}\necho never",
+	),
+	("mid-line", "exec 2> >(hold)\nprintf '%065536d' 0 >&2; x=${y:?u}\necho never"),
+	(
+		"mid-line-exit-trap",
+		"trap 'echo X-exit; echo X-end' EXIT\nexec 2> >(hold)\nprintf '%065536d' 0 >&2; \
+		 x=${y:?u}\necho never",
+	),
+];
+
+/// `first` on a fresh shell, cancelled with `sig` at its 2000th stop, then
+/// `echo second; echo "s=$?"` on the same shell: run 1's status and
+/// stdout, run 2's.
+fn cancel_then_run(first: &str, sig: Signal) -> (i32, String, i32, String) {
+	let mut rig = Rig::new(host(), skeleton_init(&[]));
+	let id = rig
+		.shell()
+		.submit(Script::command(first.as_bytes().to_vec()));
+	let budget = Budget { max_ops: 64, max_ns: u64::MAX };
+	let mut steps = 0u32;
+	let status1 = loop {
+		let (shell, host, store) = rig.parts();
+		match advance_or_blocked(shell, host, store, id, budget) {
+			Stop::Done(status) => break status,
+			Stop::Paused => shell.control().resume(),
+			Stop::Yield | Stop::Blocked => {},
+		}
+		steps += 1;
+		if steps == 2000 {
+			rig.shell().control().cancel(sig);
+		}
+		assert!(steps < 1_000_000, "{first:?} {sig:?}: run 1 never ended");
+	};
+	let n1 = rig.host.stdout.bytes().len();
+	let out1 = text(&rig.host.stdout.bytes()[..n1]);
+	let status2 = rig.run(Script::command(b"echo second; echo \"s=$?\"".to_vec()), Fault::None);
+	let out2 = text(&rig.host.stdout.bytes()[n1..]);
+	(status1, out1, status2, out2)
+}
+
+/// Each run of [`HELD_FIRSTS`] cancelled with `sig`: the cancel drops the
+/// held jump with the frames, so the EXIT trap (TERM and INT run it, KILL
+/// does not) and the next run, both from the start of frame 0, run whole.
+fn a_cancel_drops_the_held_jump(sig: Signal) {
+	let mut bad = Vec::new();
+	for (name, first) in HELD_FIRSTS {
+		let want1 = if first.starts_with("trap") && sig != Signal::Kill {
+			"X-exit\nX-end\n"
+		} else {
+			""
+		};
+		let (status1, out1, status2, out2) = cancel_then_run(first, sig);
+		if out1 != want1
+			|| status2 != 0
+			|| !out2.starts_with("second\ns=0\n")
+			|| out2.contains("never")
+		{
+			bad.push(format!(
+				"{name}: run 1 status {status1} stdout {out1:?}; run 2 status {status2} stdout \
+				 {out2:?}"
+			));
+		}
+	}
+	assert!(bad.is_empty(), "{sig:?} cancel, a held jump left behind:\n{}", bad.join("\n"));
+}
+
+/// A KILL cancel unwinds the run without its EXIT trap: the next run's
+/// first op does not take the held jump.
+#[test]
+fn a_kill_cancel_drops_the_held_jump() {
+	a_cancel_drops_the_held_jump(Signal::Kill);
+}
+
+/// A TERM cancel: the EXIT trap and the next run do not take the held jump.
+#[test]
+fn a_term_cancel_drops_the_held_jump() {
+	a_cancel_drops_the_held_jump(Signal::Term);
+}
+
+/// An INT cancel: the EXIT trap and the next run do not take the held jump.
+#[test]
+fn an_int_cancel_drops_the_held_jump() {
+	a_cancel_drops_the_held_jump(Signal::Int);
 }
