@@ -16,6 +16,8 @@
 #     actions: write and only attest id-token: write, and neither runs
 #     member code (cache_lint); and sami-rust-test.yml, whose jobs run the
 #     tests: none of them may use the cache or hold either permission.
+#   - the candidate branch: every file that names the branch a candidate is
+#     pushed to names the same one (candidate_lint, cases C*).
 # Each case checks an exit code and a message. RUST_TEST_SH runs the cases
 # against another copy of the test step, and LEGACY=1 drops the argument
 # checks that copy predates (to show which cases an older step fails).
@@ -1443,6 +1445,144 @@ wlint W64-attest-artifact-ids-folded 1 'attest has a line that is not a key, whi
 wlint W65-attest-subject-path-folded 1 'attest has a line that is not a key, which YAML folds into the value of the key above it: \[            ,\$\{\{ runner\.temp \}\}/attest/mise-\*/\*\.tar\.gz\]' 's|^          subject-path: \${{ runner.temp }}/attest/release-notes/carry-notes.md$|&\n            ,${{ runner.temp }}/attest/mise-*/*.tar.gz|' ''
 wlint W66-attest-artifact-ids-quoted-hash 1 "attest's artifact-ids line has a quote or a #, and inside quotes \" #\" is part of the value, so this lint cannot read which ids it downloads: \\[          artifact-ids: \"\\\$\\{\\{ needs\\.carry\\.outputs\\.notes-artifact-id \\}\\},.* #,12345\"\\]" '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: \(.*\)$/          artifact-ids: "\1 #,12345"/' ''
 wlint W67-attest-artifact-ids-quoted-hash-folded 1 "attest's artifact-ids line has a quote or a #, and inside quotes \" #\" is part of the value, so this lint cannot read which ids it downloads: \\[          artifact-ids: \"\\\$\\{\\{ needs\\.carry\\.outputs\\.notes-artifact-id \\}\\},.*artifact-id \\}\\}\\]" '/^  attest:$/,/^  release_cache_prune:$/s/^          artifact-ids: \(.*\)$/          artifact-ids: "\1\n            #,12345"/' ''
+
+# --- the candidate branch's name -------------------------------------------------
+# candidate_lint <dir>: every place that names the branch a release candidate
+# is pushed to names one branch. The places: sami-build.yml's push trigger
+# (beside sami), each github.ref test in its jobs and steps (beside sami:
+# release_binary's cache bound and save steps, attest, release_cache_prune),
+# publish's CANDIDATE_BRANCH, sami-checks.yml's push trigger (beside
+# feat/sami-checks) and its run name's github.ref test, sc.py plan's push
+# ref, and release-candidate-harness.sh's CANDIDATE_BRANCH. release-candidate.sh
+# names the branch only as $CANDIDATE_BRANCH: once in its run search, once in
+# its signer and once in its --source-ref, and no refs/heads/<name> literally.
+# A place that names no branch, or a file it cannot read, is UNKNOWN, and
+# fails: a check that read nothing has not passed.
+push_branches() { # <workflow>: the branches of on.push.branches, one a line
+	awk '
+		/^on:[[:space:]]*$/ { on = 1; next }
+		on && /^[^[:space:]#]/ { on = 0 }
+		on && /^  push:[[:space:]]*$/ { push = 1; next }
+		push && /^  [^[:space:]]/ { push = 0 }
+		push && /^    branches:[[:space:]]*$/ { br = 1; next }
+		br && /^      - / { b = $0; sub(/^      - */, "", b); gsub(/["'\'']/, "", b); sub(/[[:space:]]+$/, "", b); print b; next }
+		br { br = 0 }
+	' "$1"
+}
+refs_in() { # <file> <regex before the name> <character that ends it>: each name, on lines that are no comment
+	awk -v pre="$2" -v end="$3" '
+		/^[[:space:]]*#/ { next }
+		{
+			s = $0
+			while (match(s, pre "[^" end "]+" end)) {
+				m = substr(s, RSTART, RLENGTH)
+				sub(pre, "", m)
+				print substr(m, 1, length(m) - 1)
+				s = substr(s, RSTART + RLENGTH)
+			}
+		}
+	' "$1"
+}
+candidate_lint() {
+	local d="$1" t place names n rc=0 q="'"
+	local build="$d/.github/workflows/sami-build.yml" checks="$d/.github/workflows/sami-checks.yml"
+	local rcsh="$d/.github/sami/release-candidate.sh"
+	t="$(mktemp "$scratch/candidate.XXXXXX")"
+	{
+		push_branches "$build" | grep -vx sami | sed 's/^/sami-build.yml push trigger	/'
+		refs_in "$build" "github[.]ref == ${q}refs/heads/" "$q" | grep -vx sami | sed 's/^/sami-build.yml github.ref tests	/'
+		awk '/^[[:space:]]*#/ { next } /^[[:space:]]+CANDIDATE_BRANCH:[[:space:]]/ { v = $2; gsub(/["'\'']/, "", v); print v }' "$build" | sed 's/^/sami-build.yml CANDIDATE_BRANCH	/'
+		push_branches "$checks" | grep -vx feat/sami-checks | sed 's/^/sami-checks.yml push trigger	/'
+		refs_in "$checks" "github[.]ref == ${q}refs/heads/" "$q" | sed 's/^/sami-checks.yml github.ref tests	/'
+		refs_in "$d/.github/sami-checks/sc.py" 'ref == "refs/heads/' '"' | sed 's/^/sc.py plan push ref	/'
+		refs_in "$d/.github/sami/tests/release-candidate-harness.sh" 'CANDIDATE_BRANCH=' ' ' | sed 's/^/release-candidate-harness.sh CANDIDATE_BRANCH	/'
+	} >"$t" 2>/dev/null
+	for place in "sami-build.yml push trigger" "sami-build.yml github.ref tests" "sami-build.yml CANDIDATE_BRANCH" \
+		"sami-checks.yml push trigger" "sami-checks.yml github.ref tests" "sc.py plan push ref" \
+		"release-candidate-harness.sh CANDIDATE_BRANCH"; do
+		names="$(awk -F'\t' -v p="$place" '$1 == p { print $2 }' "$t" | LC_ALL=C sort -u | tr '\n' ' ')"
+		if [ -z "$names" ]; then
+			echo "UNKNOWN: $place names no branch (or its file could not be read)"
+			rc=1
+		else
+			echo "$place: ${names% }"
+		fi
+	done
+	n="$(cut -f2 "$t" | LC_ALL=C sort -u | awk 'NF' | wc -l | tr -d ' ')"
+	if [ "$n" -gt 1 ]; then
+		echo "INCONSISTENT: the candidate branch has $n names: $(cut -f2 "$t" | LC_ALL=C sort -u | tr '\n' ' ')"
+		rc=1
+	fi
+	if [ ! -r "$rcsh" ]; then
+		echo "UNKNOWN: release-candidate.sh could not be read"
+		rc=1
+	else
+		for place in 'run search|runs?branch=$CANDIDATE_BRANCH&' 'signer|@refs/heads/$CANDIDATE_BRANCH"' 'source ref|--source-ref "refs/heads/$CANDIDATE_BRANCH"'; do
+			n="$(awk '!/^[[:space:]]*#/' "$rcsh" | grep -cF -- "${place#*|}" || true)"
+			if [ "$n" != 1 ]; then
+				echo "release-candidate.sh's ${place%%|*} names the branch otherwise than as \$CANDIDATE_BRANCH ($n lines read ${place#*|})"
+				rc=1
+			fi
+		done
+		names="$(awk '!/^[[:space:]]*#/' "$rcsh" | grep -oE 'refs/heads/[A-Za-z][A-Za-z0-9._/-]*' | LC_ALL=C sort -u | tr '\n' ' ' || true)"
+		if [ -n "$names" ]; then
+			echo "release-candidate.sh names ${names% } literally, not as \$CANDIDATE_BRANCH"
+			rc=1
+		fi
+	fi
+	if [ "$rc" = 0 ]; then
+		echo "CONSISTENT: the candidate branch is $(cut -f2 "$t" | LC_ALL=C sort -u | awk 'NF'), in 7 places, and release-candidate.sh's 3 as \$CANDIDATE_BRANCH"
+	fi
+	return "$rc"
+}
+
+# clint <name> <want> <message regex> [<file> <sed>]: candidate_lint on a copy
+# of the repository's files, <file> edited by <sed>. An edit that changes
+# nothing fails the case: it would test the files as they are.
+clint() {
+	local name="$1" want="$2" msg="$3" file="${4:-}" edit="${5:-}" w f out rc
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/clint.XXXXXX")"
+	for f in .github/workflows/sami-build.yml .github/workflows/sami-checks.yml .github/sami-checks/sc.py \
+		.github/sami/release-candidate.sh .github/sami/tests/release-candidate-harness.sh; do
+		mkdir -p "$w/$(dirname "$f")"
+		cp "$repo/$f" "$w/$f"
+	done
+	if [ -n "$file" ]; then
+		sed -e "$edit" "$repo/$file" >"$w/$file"
+		if cmp -s "$repo/$file" "$w/$file"; then
+			verdict "$name" "$want" 98 "$msg" "clint: the edit of $file changed nothing"
+			return 0
+		fi
+	fi
+	out="$(candidate_lint "$w" 2>&1)"
+	rc=$?
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+
+cb_build=.github/workflows/sami-build.yml
+cb_checks=.github/workflows/sami-checks.yml
+cb_rc=.github/sami/release-candidate.sh
+# C0: the files as they are name one branch. C1 to C13 each put the old name,
+# sami-candidate, back in one place, and each fails (C1 and C3 are the only
+# two that cache_lint also sees, as W1 and W39). C14 and C15: a place that
+# names nothing is UNKNOWN.
+NOT_MSG='INCONSISTENT|UNKNOWN|otherwise than|literally' clint C0-candidate-branch-one-name 0 '^CONSISTENT: the candidate branch is release-candidate, in 7 places'
+clint C1-attest-if 1 'INCONSISTENT: the candidate branch has 2 names: release-candidate sami-candidate' "$cb_build" "/{{ github.event_name == 'push' && github.ref == 'refs\\/heads\\/release-candidate' }}/s/release-candidate/sami-candidate/"
+clint C2-cache-bound-if 1 'INCONSISTENT' "$cb_build" '/steps.release-cache.outputs.cache-hit/s/refs\/heads\/release-candidate/refs\/heads\/sami-candidate/'
+clint C3-cache-save-if 1 'INCONSISTENT' "$cb_build" '/steps.release-cache-bound.outputs.save/s/refs\/heads\/release-candidate/refs\/heads\/sami-candidate/'
+clint C4-release-cache-prune-if 1 'INCONSISTENT' "$cb_build" "/!cancelled() && github.event_name == 'push' && github.ref/s/release-candidate/sami-candidate/"
+clint C5-build-push-trigger 1 'INCONSISTENT' "$cb_build" 's/^      - release-candidate$/      - sami-candidate/'
+clint C6-publish-candidate-branch 1 'INCONSISTENT' "$cb_build" 's/CANDIDATE_BRANCH: release-candidate/CANDIDATE_BRANCH: sami-candidate/'
+clint C7-checks-push-trigger 1 'INCONSISTENT' "$cb_checks" 's/^      - release-candidate$/      - sami-candidate/'
+clint C8-checks-run-name 1 'INCONSISTENT' "$cb_checks" '/&& format(/s/refs\/heads\/release-candidate/refs\/heads\/sami-candidate/'
+clint C9-sc-plan-push-ref 1 'INCONSISTENT' .github/sami-checks/sc.py 's/ref == "refs\/heads\/release-candidate"/ref == "refs\/heads\/sami-candidate"/'
+clint C10-verify-source-ref 1 "release-candidate.sh's source ref names the branch otherwise than as .CANDIDATE_BRANCH" "$cb_rc" 's/--source-ref "refs\/heads\/$CANDIDATE_BRANCH"/--source-ref "refs\/heads\/sami-candidate"/'
+clint C11-verify-signer-ref 1 "release-candidate.sh's signer names the branch otherwise than as .CANDIDATE_BRANCH" "$cb_rc" 's/@refs\/heads\/$CANDIDATE_BRANCH"/@refs\/heads\/sami-candidate"/'
+clint C12-find-run-search-branch 1 "release-candidate.sh's run search names the branch otherwise than as .CANDIDATE_BRANCH" "$cb_rc" 's/runs?branch=$CANDIDATE_BRANCH&/runs?branch=sami-candidate\&/'
+clint C13-rc-harness-candidate-branch 1 'INCONSISTENT' .github/sami/tests/release-candidate-harness.sh 's/CANDIDATE_BRANCH=release-candidate/CANDIDATE_BRANCH=sami-candidate/'
+clint C14-checks-trigger-names-none 1 'UNKNOWN: sami-checks.yml push trigger names no branch' "$cb_checks" '/^      - release-candidate$/d'
+clint C15-sc-py-empty 1 'UNKNOWN: sc.py plan push ref names no branch' .github/sami-checks/sc.py 'd'
 
 # --- rust-test-parity.sh ---------------------------------------------------------
 # prun <name> <want> <message regex> <rules: JSON lines>: the parity script in

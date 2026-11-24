@@ -121,15 +121,12 @@ rust_test(
 # no such main.rs), such as tests/*_support and tests/zsh_oracle. Many start
 # obash: cargo names its path in CARGO_BIN_EXE_obash, and so does this target,
 # relative to the runfiles root; the support modules make it absolute.
-rust_test_suite(
-    name = "pi-shell_integration_tests",
-    srcs = glob(
-        ["tests/*.rs"],
-        exclude = [
-            "tests/minimizer_fixtures.rs",
-            "tests/vfs.rs",
-        ],
-    ),
+_INTEGRATION_SHARED_SRCS = glob(
+    ["tests/*/**/*.rs"],
+    exclude = ["tests/fixtures/**"],
+)
+
+_INTEGRATION_ATTRS = dict(
     aliases = aliases(),
     data = glob([
         "src/testkit/fixtures/**",
@@ -143,14 +140,45 @@ rust_test_suite(
         "//bazel:fastbuild": ["-Copt-level=1"],
         "//conditions:default": [],
     }),
-    shared_srcs = glob(
-        ["tests/*/**/*.rs"],
-        exclude = ["tests/fixtures/**"],
-    ),
     deps = all_crate_deps(normal = True) + all_crate_deps(normal_dev = True) + [
         ":pi-shell",
         "//crates/pi-vfs",
     ],
+)
+
+rust_test_suite(
+    name = "pi-shell_integration_tests",
+    srcs = glob(
+        ["tests/*.rs"],
+        exclude = [
+            "tests/minimizer_fixtures.rs",
+            "tests/vfs.rs",
+            # Its own target below.
+            "tests/zsh_computil_args_pty.rs",
+        ],
+    ),
+    shared_srcs = _INTEGRATION_SHARED_SRCS,
+    **_INTEGRATION_ATTRS
+)
+
+# tests/zsh_computil_args_pty.rs as the suite above makes a test (the same
+# label and crate name), with timeout "long" (900 s) in place of the 300 s of
+# a medium test. Measured on 2026-11-24, its cargo test binary run alone at
+# --test-threads=4 on 4 dedicated CPUs, at 85936bf7 and e49ef793: 40 runs,
+# 233 to 283 s each, none with an unfinished test. Its slowest tests,
+# y03_arguments_01 to _09, take 62 to 87 s each: each compinit costs obash
+# 1 to 3 s, and they run about 20 each. Under Bazel, on a 4-vCPU GitHub runner
+# that runs 4 test actions at once, the 300 s timeout stopped it with 13 of
+# its 19 tests done (sami-checks run 45351216411), and that runner ran about
+# twice as slow as an idle one: about 570 s, which 900 s exceeds 1.6 times.
+# Only this target is long, so a hang in any other still stops at 300 s.
+rust_test(
+    name = "pi-shell_integration_tests_tests/zsh_computil_args_pty_test",
+    timeout = "long",
+    crate_name = "pi_shell_integration_tests_tests_zsh_computil_args_pty_test",
+    crate_root = "tests/zsh_computil_args_pty.rs",
+    srcs = ["tests/zsh_computil_args_pty.rs"] + _INTEGRATION_SHARED_SRCS,
+    **_INTEGRATION_ATTRS
 )
 
 # obash's own unit tests (src/bin/obash), which cargo runs as the bin target.
