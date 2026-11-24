@@ -298,6 +298,19 @@ fn random_declarations_through_a_reference_look_it_up() {
 		("f() { local -n q=RANDOM; local -n s=q; declare -i s; }; f", "[] 16756\n"),
 		("f() { local -n q=RANDOM; local -n q; }; f", "[] 982\n"),
 		("f() { local -n q=RANDOM; declare +n q; }; f", "[] 982\n"),
+		// `+n NAME=VALUE` looks the target up as `+n NAME` does. On a
+		// reference the function owns, the value is assigned to the name
+		// as to any reference: an identifier, else refused (below).
+		("declare -n r=RANDOM; f() { local +n r=3; }; f", "[] 982\n"),
+		("f() { local -n q=RANDOM; g; }; g() { local +n q=3; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { declare +n r=3; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { local +n -i r=3; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { local +n r+=3; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { local +n r=3; x=$r; }; f", "[3] 982\n"),
+		(
+			"f() { local -n q=RANDOM; local +n q=zz; declare -p q; }; f",
+			"declare -- q=\"zz\"\n[] 982\n",
+		),
 		("f() { local -n q=RANDOM; export q; }; f", "[] 29338\n"),
 		("f() { local -n q=RANDOM; export q+=1; }; f", "[] 1187\n"),
 		("f() { local -n q=RANDOM; declare -g q; }; f", "[] 18498\n"),
@@ -321,6 +334,13 @@ fn random_declarations_through_a_reference_look_it_up() {
 		assert_eq!(out, "st=1 20442\n", "{src}");
 		assert!(err.ends_with(diag), "{src}: {err}");
 	}
+	// `+n NAME=VALUE` on a reference the function owns is an assignment to
+	// the reference: `3` is no identifier, so it is refused and nothing is
+	// drawn beyond the two lookups.
+	let (out, err) =
+		run("RANDOM=5; f() { local -n q=RANDOM; local +n q=3; }; f; echo \"[$RANDOM]\"");
+	assert_eq!(out, "[982]\n");
+	assert!(err.ends_with("local: `3': not a valid identifier\n"), "{err}");
 }
 
 /// bash applies a subshell's redirections in the child, after the fork: a
@@ -422,6 +442,17 @@ fn random_readonly_refusals_look_it_up_first() {
 		(
 			"RANDOM=7; readonly RANDOM; declare -n r=RANDOM; declare +n r=7; echo \"st=$? $RANDOM\"",
 			"st=1 20442\n",
+			"line 1: declare: r: readonly variable\n",
+		),
+		// A plain target too: the word as written, not the target's name.
+		(
+			"y=1; readonly y; declare -n r=y; declare +n r=7; echo \"st=$? $y\"",
+			"st=1 1\n",
+			"line 1: declare: r: readonly variable\n",
+		),
+		(
+			"y=1; readonly y; declare -n r=y; declare +n -i r=7; echo \"st=$? $y\"",
+			"st=1 1\n",
 			"line 1: declare: r: readonly variable\n",
 		),
 	] {
@@ -1620,6 +1651,16 @@ fn attributes_given_with_and_without_the_reference() {
 	);
 	assert_eq!(out, "declare -a foo=([0]=\"X\")\n");
 	assert_eq!(err, "bash: line 1: declare: var: not found\n");
+	// On a reference the running function owns, `+n NAME=VALUE` assigns
+	// the name itself, as an assignment to a reference does: a value that
+	// is no identifier is refused and the reference stays. Goldens from
+	// bash 5.3.20 (5.2.21 agrees).
+	let (out, err) = run(
+		"y=1; f() { local -n q=y; local +n q=zz; declare -p q; echo \"$y\"; }; f; g() { local -n \
+		 p=y; local +n p=3; declare -p p; echo \"$y\"; }; g",
+	);
+	assert_eq!(out, "declare -- q=\"zz\"\n1\ndeclare -n p=\"y\"\n1\n");
+	assert!(err.ends_with("local: `3': not a valid identifier\n"), "{err}");
 }
 
 // Golden: bash 5.3.20 (upstream exp8.sub, array32.sub): an arithmetic

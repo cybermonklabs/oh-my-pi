@@ -2021,7 +2021,9 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 								.then_some(Site::NamerefAssign)
 						},
 						Level::Dynamic => Some(Site::Declare),
-						Level::Local if off.contains(Attrs::NAMEREF) && value.is_some() => None,
+						// `+n NAME=VALUE` looks up as `+n NAME` does
+						// ([`Site::LocalNameref`], below): bash looks the
+						// target up twice before it assigns.
 						Level::Local => {
 							let own = own_reference(ctx, name, special.name())?;
 							// `-n` with no value on a reference the function
@@ -2215,6 +2217,31 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			// (`declare +n -i foo=7+4` makes the target 11).
 			let mut ref_on = on;
 			if let Some(value) = value {
+				// On a reference the running function owns, bash assigns
+				// the name itself as it assigns to any name reference: the
+				// value must be an identifier (`local -n q=RANDOM; local +n
+				// q=3` is refused and `q` stays a reference), and the name
+				// keeps the value as a plain variable. Through a global or
+				// a caller's reference the value goes to the target, below.
+				if level == Level::Local
+					&& let state::Deref::To { name: t, .. } =
+						state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)?
+					&& own_reference(ctx, name, &t)?
+				{
+					if !is_ident(value) {
+						ctx.err(Diag::InvalidIdent { name: BString::from(value) });
+						status = 1;
+						continue;
+					}
+					let attrs = raw
+						.as_ref()
+						.map_or(Attrs::NONE, |v| v.attrs)
+						.without(off)
+						.without(Attrs::INVISIBLE)
+						.with(on);
+					ctx.set_var(name, Some(Var::scalar(value, attrs)), level);
+					continue;
+				}
 				// A special target through a global reference: the
 				// assignment's lookups ([`set_value`]'s), on the first run.
 				let mut special = None;
@@ -2242,17 +2269,16 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 							dynvars::look(ctx.k, ctx.cx, ctx.vp, s.name(), Site::NamerefAssign)?;
 						}
 						let lhs = Lhs { name: s.name(), index: None, append };
-						// A refusal names the word as written (`declare: r:
-						// readonly variable`).
-						set_value(ctx.k, ctx.cx, ctx.vp, lhs, value, Level::Dynamic).map_err(
-							|d| match d {
-								Diag::Readonly { .. } => Diag::Readonly { name: name.into() },
-								d => d,
-							},
-						)
+						set_value(ctx.k, ctx.cx, ctx.vp, lhs, value, Level::Dynamic)
 					},
 					None => set_value(ctx.k, ctx.cx, ctx.vp, Lhs { name, index, append }, value, level),
 				};
+				// A refusal names the word as written, not the target the
+				// reference names (`declare: r: readonly variable`).
+				let res = res.map_err(|d| match d {
+					Diag::Readonly { .. } => Diag::Readonly { name: name.into() },
+					d => d,
+				});
 				if let Err(d) = res {
 					ctx.err(d);
 					status = 1;
