@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed the embedded shell's interactive line editor running an accepted line before the line was on the terminal: the line's last display could still be in the terminal's writer thread when the command started, so an external command's output came above the line it ran from (`cat ~/log` printed its lines, then `cat ~/log`). The editor now hands on a line it read (and `vared` assigns, and a `zle` call in a widget returns) only once its display is out, as zsh's blocking writes order them
 - Fixed the embedded shell losing up to 64 KiB written through a zsh multios redirection (`{ ... } >&1 >/dev/null`, `exec >&1 >/dev/null`) by `syswrite`, `sysread -o` or a builtin whose output went out at once: the tee only queued the bytes, the writer counted them as written, and the queue was dropped when the redirection or the run ended. Each write through the tee now ends once every target of the tee has it
 - Fixed `history -w` and `history -a` to a FIFO, a pipe or a socket writing the history again on every poll, without end; the write now counts the bytes it wrote instead of reading the file's position, which such a file does not have
 - Fixed omp freezing for seconds to minutes on WSL2 while saving sessions: Linux `FileLock` now locks a sidecar file instead of binding a socket, which takes about 10 ms per call there. Older omp versions still running do not see these locks, so restart them after updating ([#19704](https://github.com/can1357/oh-my-pi/pull/19704) by [@turgaybulut](https://github.com/turgaybulut))

@@ -1730,7 +1730,7 @@ mod tests {
 
 	use bstr::BString;
 
-	use super::*;
+	use super::{super::zle::exec as zexec, *};
 	use crate::bash::{Engine, EngineConfig, File as _, FileKind, MemStore, fd::FdTable};
 
 	/// A kernel whose shell terminal (zsh `SHTTY`) is the terminal side of a
@@ -2103,11 +2103,10 @@ mod tests {
 
 	/// A compound command whose redirection fails (`{ :; } 2>err >/no/f`)
 	/// while the line editor's display bytes are still in the terminal's
-	/// writer thread (the editor flushes once at the end of a line and goes
-	/// on): the command waits for them before it applies its redirections,
-	/// so its message goes to the fd 2 they left (the file). The message
-	/// waited behind the bytes past the restore, and went to the restored
-	/// fd 2.
+	/// writer thread: the command waits for them before it applies its
+	/// redirections, so its message goes to the fd 2 they left (the file). The
+	/// message waited behind the bytes past the restore, and went to the
+	/// restored fd 2.
 	#[test]
 	fn a_failed_redirections_message_goes_to_its_redirected_stderr_while_the_editors_bytes_wait() {
 		crate::sys::in_blocking_writer_process(
@@ -2373,10 +2372,10 @@ mod tests {
 
 	/// A builtin on the fast path (`echo 42`) with fd 1 on the terminal,
 	/// while the line editor's end of line is still in the terminal's writer
-	/// thread (the editor flushes once at the end of a line and goes on):
-	/// the output comes after the editor's bytes, as zsh's blocking writes
-	/// order them. Written at once by the fast path, the output came first,
-	/// as in the interactive prompt test's `bash-5.3$ echo $((6 * 7))42`.
+	/// thread: the output comes after the editor's bytes, as zsh's blocking
+	/// writes order them. Written at once by the fast path, the output came
+	/// first, as in the interactive prompt test's
+	/// `bash-5.3$ echo $((6 * 7))42`.
 	#[test]
 	fn a_fast_builtins_output_reaches_the_terminal_after_the_editors_bytes() {
 		crate::sys::in_blocking_writer_process(
@@ -2435,6 +2434,168 @@ mod tests {
 				}
 				let want = "[1]  + continued  sleep 100\r\n42\r\n";
 				assert_eq!(read_terminal(&mut master, want.len()), want);
+			},
+		);
+	}
+
+	/// `shell`'s root vproc (with a terminal, as [`shell_with_a_terminal`]
+	/// gives) editing a line (`% echo hi`), whose driver
+	/// ([`zexec::push_root`]) runs a task that queues `display` and then does
+	/// `then`; the driver's base.
+	fn editing_with_display(
+		shell: &mut crate::bash::Shell,
+		display: &'static [u8],
+		then: impl FnOnce(&mut zexec::Zw<'_, '_>) -> zexec::WResult + Send + 'static,
+	) -> usize {
+		use super::super::zle::{Context, Editor, Zle, tty::Tty};
+		let mut ed = Editor::new(Context::LineStart, 0);
+		ed.line = "echo hi".chars().collect();
+		ed.lprompt = b"% ".to_vec();
+		let task = zexec::native_task(move |zw, _| {
+			if let Some(t) = zw.zle.tty.as_mut() {
+				t.put(display);
+			}
+			then(zw)
+		});
+		let base = zexec::push_root(&mut ed, task, shell.procs[0].frames.len());
+		let mut zle = Zle::new(false);
+		zle.tty = Tty::open(&shell.k);
+		zle.ed = Some(Box::new(ed));
+		shell.procs[0].zle = Some(Box::new(zle));
+		base
+	}
+
+	/// Whether `name` is set in `shell`'s root vproc.
+	fn is_set(shell: &crate::bash::Shell, store: &mut MemStore, name: &[u8]) -> bool {
+		state::lookup(&shell.k.root, store, &shell.procs[0], name)
+			.unwrap()
+			.is_some()
+	}
+
+	/// A line editor's driver done while the line's last display is still in
+	/// the terminal's writer thread (zsh's `zleread` ends with `trashzle`):
+	/// the next command waits for the bytes before its first op, as after
+	/// zsh's blocking `fflush(shout)`. It ran at once, so an external there
+	/// wrote to the terminal before the line: in the interactive history
+	/// test, `cat ~/log` printed its lines, then the line `cat ~/log`
+	/// (`set_local_history_toggles`).
+	#[test]
+	fn the_command_after_an_editors_driver_waits_for_its_display() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::the_command_after_an_editors_driver_waits_for_its_display"),
+			|| {
+				let (mut shell, mut host, mut store, mut master) = shell_with_a_terminal();
+				let base = editing_with_display(&mut shell, b"% x=1\n", |_| zexec::WResult::Done(0));
+				let held = crate::sys::hold_writers();
+				let got = zexec::drive(
+					&mut shell.k,
+					&mut Cx { host: &mut host, store: &mut store },
+					&mut shell.procs[0],
+					base,
+				);
+				assert!(matches!(got, zexec::Drive::Done(zexec::Got::Status(0))));
+				// The reader takes the editor and the line runs.
+				if let Some(z) = shell.procs[0].zle.as_deref_mut() {
+					z.ed = None;
+				}
+				shell.submit(crate::bash::Script::command(b"x=1".to_vec()));
+				let done = step_until_blocked_or_done(&mut shell, &mut host, &mut store);
+				assert!(!done, "the command ended while the line's display was not out");
+				assert!(!is_set(&shell, &mut store, b"x"), "the command ran before the line's display");
+				drop(held);
+				assert_eq!(step_until_done(&mut shell, &mut host, &mut store), 0);
+				assert!(is_set(&shell, &mut store, b"x"), "the command did not run");
+				let want = "% x=1\r\n";
+				assert_eq!(read_terminal(&mut master, want.len()), want);
+			},
+		);
+	}
+
+	/// A widget's shell function the editor calls while its display is still
+	/// in the terminal's writer thread (`zle-line-init` after the first
+	/// refresh, `zle-line-finish` after the last): the function's first op
+	/// waits for the bytes, as the command after a line does.
+	#[test]
+	fn a_widget_function_waits_for_the_editors_display() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_widget_function_waits_for_the_editors_display"),
+			|| {
+				let (mut shell, mut host, mut store, _master) = shell_with_a_terminal();
+				shell.submit(crate::bash::Script::command(b"f() { :; }".to_vec()));
+				assert_eq!(step_until_done(&mut shell, &mut host, &mut store), 0);
+				let base = editing_with_display(&mut shell, b"% ", |_| {
+					zexec::then(
+						zexec::Await::Function { name: BString::from("f"), args: Vec::new() },
+						|_, _| zexec::WResult::Done(0),
+					)
+				});
+				let _held = crate::sys::hold_writers();
+				let got = zexec::drive(
+					&mut shell.k,
+					&mut Cx { host: &mut host, store: &mut store },
+					&mut shell.procs[0],
+					base,
+				);
+				assert!(matches!(got, zexec::Drive::Frame), "the function's frame was not pushed");
+				// The vproc writes its queued output, the display first, before
+				// its next op ([`exec::run_slice`]).
+				assert!(
+					!shell.procs[0].out.is_empty(),
+					"the function's first op does not wait for the display"
+				);
+			},
+		);
+	}
+
+	/// The other places the editor writes its display where shell code can
+	/// run next (`zle -R`, and the redraw after a `SIGWINCH`; `zle -I`; a job
+	/// notice drawn above the line, a trap may run before the next key; a
+	/// message's trash; `PROMPT_SP` and the mail notice before the hooks):
+	/// display bytes still in the terminal's writer thread hold the vproc's
+	/// next op, as zsh's blocking `fflush(shout)` does.
+	#[test]
+	fn each_display_write_holds_the_next_op_while_its_bytes_go_out() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::each_display_write_holds_the_next_op_while_its_bytes_go_out"),
+			|| {
+				use super::super::zle::{display, reader};
+				type Site = fn(&mut Kernel, &mut Cx<'_>, &mut Vproc);
+				let sites: [(&str, Site); 5] = [
+					("zle_refresh", |k, cx, vp| display::zle_refresh(k, cx, vp, None, false)),
+					("invalidate", display::invalidate),
+					("print_above", |k, cx, vp| {
+						assert!(display::print_above(k, cx, vp, b"[1]  + done  sleep 1\n"));
+					}),
+					("trash_for_message", display::trash_for_message),
+					("put_tty", |k, _, vp| reader::put_tty(k, vp, b"% ")),
+				];
+				let mut unheld = Vec::new();
+				for (name, site) in sites {
+					// fd 2 on the terminal: a message's trash is for a message
+					// that goes there.
+					let (mut shell, mut host, mut store, _master) =
+						shell_with_fd_on_its_terminal_written_at_once(2);
+					let _ = editing_with_display(&mut shell, b"", |_| zexec::WResult::Done(0));
+					let held = crate::sys::hold_writers();
+					let tty = shell.procs[0]
+						.zle
+						.as_deref_mut()
+						.and_then(|z| z.tty.as_mut());
+					tty.expect("the editor's terminal").put(b"% x=1");
+					site(
+						&mut shell.k,
+						&mut Cx { host: &mut host, store: &mut store },
+						&mut shell.procs[0],
+					);
+					if shell.procs[0].out.is_empty() {
+						unheld.push(name);
+					}
+					drop(held);
+				}
+				assert!(
+					unheld.is_empty(),
+					"the next op does not wait for the display after {unheld:?}"
+				);
 			},
 		);
 	}

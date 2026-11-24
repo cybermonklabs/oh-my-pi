@@ -6,13 +6,18 @@
 //! belong to job control (`jobctl`), which opens the terminal at
 //! interactive startup: ZLE borrows them.
 
-use std::task::{Context, Poll};
+use std::{
+	collections::VecDeque,
+	task::{Context, Poll},
+};
+
+use bstr::BString;
 
 use crate::bash::{
 	event::WaitKey,
 	fd::FdRef,
 	term::{CtlChar, SetWhen, TermFlag},
-	vm::{Cx, Kernel, jobctl},
+	vm::{Cx, Kernel, jobctl, proc::PendingWrite},
 };
 
 /// The descriptor number that stands for the editing terminal: in a
@@ -193,6 +198,21 @@ impl Tty {
 		}
 		self.out.clear();
 		None
+	}
+
+	/// [`Self::flush`] where shell code runs next (a line read, a widget's
+	/// function, the command after `vared`, `zle -I` or `zle -R`, a hook
+	/// after `PROMPT_SP`): what the terminal does not take now holds the
+	/// vproc's next op back, as zsh's blocking `fflush(shout)` does. `out`
+	/// is the vproc's queued output, which it writes before its next op,
+	/// the display first (`exec::flush_out`); an empty entry for [`FD`]
+	/// makes it wait when nothing else is queued. An external writes to the
+	/// terminal itself: started while display bytes were going out, its
+	/// output came before them.
+	pub fn flush_or_hold(&mut self, k: &Kernel, out: &mut VecDeque<PendingWrite>) {
+		if self.flush(k).is_some() && out.is_empty() {
+			out.push_back(PendingWrite::new(FD, BString::default()));
+		}
 	}
 
 	/// One byte typed, if one is there (`Ok(None)`: nothing yet, the
