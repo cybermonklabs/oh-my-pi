@@ -7,6 +7,7 @@
   sc.py libtest LOG EXIT SECS ROW UNIT WHO   one libtest binary's result (JSON on stdout)
   sc.py nextest JUNIT EXIT SECS ROW UNIT WHO one nextest run's result
   sc.py gv-libtest ..., gv-nextest ...       the same for a gVisor row, with GV_ENVIRONMENT's tests set apart
+  sc.py gv-control LOG EXIT SECS ROW UNIT WHO the map-limit control: gv-libtest, UNKNOWN unless each ORPHAN_CONTROL_TESTS test ran
   sc.py bun JUNIT LOG EXIT SECS ROW UNIT     one `bun test` run's result
   sc.py plain EXIT SECS ROW UNIT LOG         a command whose exit is its verdict (check:ts)
   sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout; exit 1 unless every row passed
@@ -57,6 +58,19 @@ GV_WHO = ("uid1000", "root")
 # each one, with the line it printed, apart from the tree's failures. Each entry needs evidence.
 BUSY_EXEC = ("gVisor runs a program held open for writing (no ETXTBSY), so there is no busy exec to retry; the test "
              "says NOT-RUN (spawn/unix/tests.rs busy_exec_refused); the policy tests cover the retry")
+# The map-limit control (gvisor-run.sh) runs the lib's orphan_jobs module at 4 threads. A filter that
+# selects nothing (the module renamed or moved) lets libtest exit 0 having run nothing, so the control
+# needs each of the module's tests by name: these, its #[test] functions at 509a2d77 and a72018dd.
+ORPHAN_CONTROL_TESTS = tuple(f"testkit::suites::orphan_jobs::{t}" for t in (
+    "a_subshell_exit_ends_its_background_native_task",
+    "a_subshell_exit_ends_its_background_shell_loop",
+    "a_subshell_exit_ends_a_background_loop_waiting_on_an_external",
+    "a_background_job_that_is_just_an_external_outlives_its_subshell",
+    "a_nested_job_is_judged_on_its_own_when_its_parent_job_ends",
+    "a_detached_tree_outlives_its_subshell",
+    "orphans_are_found_again_after_a_restore",
+    "without_the_knob_orphaned_jobs_run_on",
+))
 GV_ENVIRONMENT = {
     "sys::fs::fifo::tests::an_open_that_may_create_is_refused_in_a_sticky_directory_as_the_plain_open_is":
         "gVisor has no /proc/sys/fs/protected_fifos (its procfs fs/ lists only aio-max-nr, aio-nr, file-max, "
@@ -508,6 +522,20 @@ def gv_environment(res, outputs, slow=()):
         res["passed"] += len(res["self_skipped"])
         res.pop("skip_only", None)
         skip_verdict(res)
+    return res
+
+
+def gv_control(log, exit_code, secs, row, unit, who):
+    """The map-limit control's result: the gVisor libtest result, UNKNOWN unless every test of
+    ORPHAN_CONTROL_TESTS ran to a verdict; the ones that did not are named."""
+    res = gv_environment(parse_libtest(log, exit_code, secs, row, unit, who), test_outputs(log, "libtest"), libtest_slow(log))
+    ran = {n for n, _ in res["tests"]} | set(res["failures"])
+    missing = [t for t in ORPHAN_CONTROL_TESTS if t not in ran]
+    if missing:
+        note = (f"{len(missing)} of the {len(ORPHAN_CONTROL_TESTS)} control tests did not run: "
+                + ", ".join(t.rsplit("::", 1)[-1] for t in missing))
+        res["note"] = note if res["status"] != "UNKNOWN" else f"{res['note']}; {note}"
+        res["status"] = "UNKNOWN"
     return res
 
 
@@ -1501,6 +1529,25 @@ def selftest():
     check("a gVisor self-skip is covered by the other user's gVisor pass",
           "| pi-builtins, nextest default profile, gVisor (uid 1000) | **PASS** |" in out, True)
 
+    # The map-limit control needs each of its tests by name: a filter that selects nothing (the module
+    # renamed or moved) exits 0 having run nothing, and must read UNKNOWN, not PASS.
+    def ctl(names):
+        p = os.path.join(d, "ctl.log")
+        ev = [{"type": "suite", "event": "started", "test_count": len(names)}]
+        for n in names:
+            ev += [{"type": "test", "event": "started", "name": n}, {"type": "test", "event": "ok", "name": n, "exec_time": 0.1}]
+        ev.append({"type": "suite", "event": "ok", "passed": len(names), "failed": 0})
+        with open(p, "w") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in ev))
+        return gv_control(p, "0", 1, "gv-orphan-root", "testkit::suites::orphan_jobs", "root")
+    check("the map-limit control with each of its tests passes", ctl(list(ORPHAN_CONTROL_TESTS))["status"], "PASS")
+    r = ctl([])
+    check("a control whose filter selects nothing (the module renamed) is UNKNOWN",
+          (r["status"], f"{len(ORPHAN_CONTROL_TESTS)} of the {len(ORPHAN_CONTROL_TESTS)} control tests did not run" in r["note"]), ("UNKNOWN", True))
+    r = ctl(list(ORPHAN_CONTROL_TESTS[1:]))
+    check("a control test that did not run is UNKNOWN and named",
+          (r["status"], r["note"].endswith(ORPHAN_CONTROL_TESTS[0].rsplit("::", 1)[-1])), ("UNKNOWN", True))
+
     if fails:
         for f in fails:
             print(f"SELFTEST FAIL {f}")
@@ -1528,6 +1575,8 @@ def main(argv):
         print(json.dumps(parse_junit(junit, ex, secs, row, unit, who, (0,), (100,))))
     elif c == "gv-libtest":
         print(json.dumps(gv_environment(parse_libtest(*a), test_outputs(a[0], "libtest"), libtest_slow(a[0]))))
+    elif c == "gv-control":
+        print(json.dumps(gv_control(*a)))
     elif c == "gv-nextest":
         junit, ex, secs, row, unit, who = a
         print(json.dumps(gv_environment(parse_junit(junit, ex, secs, row, unit, who, (0,), (100,)), test_outputs(junit, "junit"))))
