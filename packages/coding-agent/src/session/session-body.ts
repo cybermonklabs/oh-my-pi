@@ -7,7 +7,7 @@
 import * as fs from "node:fs";
 import { countNewlines, logger, toError } from "@oh-my-pi/pi-utils";
 import { digestStream } from "../utils/file-hash";
-import { openPrivateTempFile, privateTempDir } from "../utils/owner-private-dir";
+import { openPrivateTempFile, type PrivateTempFile, privateTempDir } from "../utils/owner-private-dir";
 import { BLOCK_ZSTD_LEVEL } from "./cold-entry-store";
 import type { SessionStorageBackend } from "./indexed-session-storage";
 import {
@@ -49,23 +49,26 @@ interface KeptBody {
 	close(): void;
 }
 
-/** A {@link KeptBody} written to a temporary file, unlinked once open, and read back through its descriptor. */
+/**
+ * A {@link KeptBody} written to a temporary file, unlinked once open, and read
+ * back through its descriptor, which its {@link PrivateTempFile} refuses once
+ * the body is released.
+ */
 class BodySpool implements KeptBody {
-	readonly #fd: number;
-	#closed = false;
+	readonly #file: PrivateTempFile;
 
 	constructor(
-		fd: number,
+		file: PrivateTempFile,
 		readonly byteLength: number,
 		readonly title: SessionTitleUpdate | undefined,
 	) {
-		this.#fd = fd;
+		this.#file = file;
 	}
 
 	async *chunks(): AsyncGenerator<Uint8Array> {
 		for (let position = 0; position < this.byteLength;) {
 			const buffer = Buffer.allocUnsafe(Math.min(LINE_STREAM_CHUNK, this.byteLength - position));
-			const read = await readAt(this.#heldFd(), buffer, position);
+			const read = await readAt(this.#file.fd, buffer, position);
 			if (read === 0) throw new Error(`Session body spool ended at byte ${position} of ${this.byteLength}`);
 			position += read;
 			yield read === buffer.byteLength ? buffer : buffer.subarray(0, read);
@@ -73,7 +76,7 @@ class BodySpool implements KeptBody {
 	}
 
 	text(): string {
-		const fd = this.#heldFd();
+		const fd = this.#file.fd;
 		const bytes = Buffer.allocUnsafe(this.byteLength);
 		for (let position = 0; position < bytes.byteLength;) {
 			const read = fs.readSync(fd, bytes, position, bytes.byteLength - position, position);
@@ -84,22 +87,7 @@ class BodySpool implements KeptBody {
 	}
 
 	close(): void {
-		if (this.#closed) return;
-		this.#closed = true;
-		try {
-			fs.closeSync(this.#fd);
-		} catch {
-			// Already closed.
-		}
-	}
-
-	/**
-	 * The descriptor, until {@link close}: after it the number can belong to
-	 * another file, whose bytes a read would publish as this body.
-	 */
-	#heldFd(): number {
-		if (this.#closed) throw new Error("A session rewrite's body was read after it was released");
-		return this.#fd;
+		this.#file.close();
 	}
 }
 
@@ -210,13 +198,13 @@ class LinesHead {
  * opened is closed.
  */
 function spoolLines(lines: Iterable<string>, uid: number): BodySpool {
-	const fd = openPrivateTempFile("spool", uid, "Session spool directory");
+	const file = openPrivateTempFile("spool", uid, "Session spool directory");
 	try {
 		const head = new LinesHead();
-		const bytes = writeLinesToDescriptorSync(fd, head.note(lines));
-		return new BodySpool(fd, bytes, head.title());
+		const bytes = writeLinesToDescriptorSync(file.fd, head.note(lines));
+		return new BodySpool(file, bytes, head.title());
 	} catch (err) {
-		fs.closeSync(fd);
+		file.close();
 		throw err;
 	}
 }

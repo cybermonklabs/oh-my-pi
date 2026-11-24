@@ -53,18 +53,50 @@ export function privateTempDir(prefix: string, uid: number): string {
 }
 
 /**
+ * A file {@link openPrivateTempFile} opened, read and written through its
+ * descriptor until {@link close}. After the close the process can give the
+ * number to another file, whose bytes a read would take for this file's, so
+ * {@link fd} throws from then on and only the first close closes it.
+ */
+export class PrivateTempFile {
+	readonly #fd: number;
+	#closed = false;
+
+	constructor(fd: number) {
+		this.#fd = fd;
+	}
+
+	/** The descriptor; throws once the file is closed. */
+	get fd(): number {
+		if (this.#closed) throw new Error("A private temporary file was used after it was closed");
+		return this.#fd;
+	}
+
+	/** Close the descriptor; a later call does nothing. */
+	close(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		try {
+			fs.closeSync(this.#fd);
+		} catch {
+			// Already closed.
+		}
+	}
+}
+
+/**
  * Open a new file, mode 0600, in {@link privateTempDir}, made 0700 when
  * missing and used only when it is a directory (not a link to one) that
  * account `uid` owns with mode 0700, and unlink it once open: its disk is
  * freed when the descriptor closes, and a killed process leaves nothing.
- * Returns the descriptor. Throws when the directory or the file cannot be
- * made or opened (`os.tmpdir()` read-only, under a regular file, full, out of
- * descriptors) or the directory is refused; a file it opened and could not
- * unlink is closed and removed.
+ * Throws when the directory or the file cannot be made or opened
+ * (`os.tmpdir()` read-only, under a regular file, full, out of descriptors)
+ * or the directory is refused; a file it opened and could not unlink is
+ * closed and removed.
  *
  * @param label Human-readable directory role prefixed to a refusal's message.
  */
-export function openPrivateTempFile(prefix: string, uid: number, label: string): number {
+export function openPrivateTempFile(prefix: string, uid: number, label: string): PrivateTempFile {
 	const dir = privateTempDir(prefix, uid);
 	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 	assertAccountPrivateDir(dir, uid, label);
@@ -77,7 +109,7 @@ export function openPrivateTempFile(prefix: string, uid: number, label: string):
 		fs.rmSync(file, { force: true });
 		throw error;
 	}
-	return fd;
+	return new PrivateTempFile(fd);
 }
 
 /**

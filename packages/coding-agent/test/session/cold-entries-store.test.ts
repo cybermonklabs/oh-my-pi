@@ -596,6 +596,22 @@ describe("cold entry store", () => {
 		}
 	});
 
+	// If this regresses, a record read after its store closed reads the store's descriptor number, which
+	// the process can have given to another file since, and parses that file's bytes as the entry.
+	it.skipIf(process.getuid === undefined)("refuses a read of a record from its file once the store closed", () => {
+		using tmp = TempDir.createSync("@omp-cold-closed-");
+		const store = ColdEntryStore.open(new BlobStore(tmp.join("blobs")));
+		const record = store.append(Buffer.from(JSON.stringify({ type: "custom", id: "c1", data: BODY })));
+		const before = store.parse(record, false);
+		store.close();
+
+		expect({ inMemory: store.inMemory, before }).toEqual({
+			inMemory: false,
+			before: { type: "custom", id: "c1", data: BODY },
+		});
+		expect(() => store.parse(record, false)).toThrow("read after its session closed");
+	});
+
 	// If this regresses, a store kept in memory puts a large tool result in one block with the records
 	// before it, and each read of one of those records decompresses the large one with it.
 	it("gives a record larger than a batch a block of its own, so a read of the record before it decompresses only that one", () => {

@@ -318,7 +318,7 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 						fs.closeSync(fd);
 					}
 				}
-				const refused = { failure: expect.stringContaining("read after it was released"), stored: undefined };
+				const refused = { failure: expect.stringContaining("used after it was closed"), stored: undefined };
 				expect(outcomes).toEqual([refused, refused]);
 			} finally {
 				vi.restoreAllMocks();

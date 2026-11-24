@@ -7,7 +7,7 @@
 import * as fs from "node:fs";
 import { logger } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
-import { openPrivateTempFile } from "../utils/owner-private-dir";
+import { openPrivateTempFile, type PrivateTempFile } from "../utils/owner-private-dir";
 import type { BlobStore } from "./blob-store";
 import type { SessionEntry } from "./session-entries";
 import { resolveBlobRefsInEntriesSync } from "./session-loader";
@@ -99,13 +99,6 @@ function freezeAndMeasure(value: unknown): number {
 	return units;
 }
 
-/** What the finalizer needs to release a store's file; must not refer to the store. */
-interface StoreHandle {
-	fd: number;
-	/** Set once `fd` is closed: the number may belong to another file since. */
-	closed: boolean;
-}
-
 /** Records from store offset `start` to `end`, whole, kept compressed in memory. */
 interface CompressedBlock {
 	readonly start: number;
@@ -125,18 +118,12 @@ interface DecompressedBlock {
  */
 let openFailureLogged = false;
 
-function releaseStoreHandle(handle: StoreHandle): void {
-	if (handle.closed) return;
-	handle.closed = true;
-	try {
-		fs.closeSync(handle.fd);
-	} catch {
-		// Already closed.
-	}
-}
-
-/** Closes a store's descriptor once no manager and no cold entry refers to the store. */
-const storeRegistry = new FinalizationRegistry<StoreHandle>(releaseStoreHandle);
+/**
+ * Closes a store's file once no manager and no cold entry refers to the
+ * store. The file registered refers to no store, so it does not keep the
+ * store it closes alive.
+ */
+const storeRegistry = new FinalizationRegistry<PrivateTempFile>(file => file.close());
 
 interface CachedRecord {
 	readonly entry: Readonly<Record<string, unknown>>;
@@ -168,7 +155,7 @@ interface CachedRecord {
 export class ColdEntryStore {
 	readonly #blobs: BlobStore;
 	/** The store's file; undefined for a store kept in memory from its start. */
-	readonly #handle: StoreHandle | undefined;
+	readonly #file: PrivateTempFile | undefined;
 	#closed = false;
 	/** Bytes handed out to records. */
 	#bytes = 0;
@@ -218,8 +205,7 @@ export class ColdEntryStore {
 		const uid = process.getuid?.();
 		if (uid === undefined) return new ColdEntryStore(blobs, undefined);
 		try {
-			const fd = openPrivateTempFile("cold", uid, "Older session entry store directory");
-			return new ColdEntryStore(blobs, { fd, closed: false });
+			return new ColdEntryStore(blobs, openPrivateTempFile("cold", uid, "Older session entry store directory"));
 		} catch (error) {
 			if (!openFailureLogged) {
 				openFailureLogged = true;
@@ -232,12 +218,12 @@ export class ColdEntryStore {
 		}
 	}
 
-	/** A store over the file `handle` holds, or in memory without one; see {@link open}. */
-	private constructor(blobs: BlobStore, handle: StoreHandle | undefined) {
+	/** A store over `file`, or in memory without one; see {@link open}. */
+	private constructor(blobs: BlobStore, file: PrivateTempFile | undefined) {
 		this.#blobs = blobs;
-		this.#handle = handle;
-		this.#inMemory = handle === undefined;
-		if (handle) storeRegistry.register(this, handle, this);
+		this.#file = file;
+		this.#inMemory = file === undefined;
+		if (file) storeRegistry.register(this, file, this);
 	}
 
 	/** Whether the store takes new records: it is open. */
@@ -346,9 +332,9 @@ export class ColdEntryStore {
 		this.#pendingBytes = 0;
 		this.#blocks.length = 0;
 		this.#decompressed = undefined;
-		if (!this.#handle) return;
+		if (!this.#file) return;
 		storeRegistry.unregister(this);
-		releaseStoreHandle(this.#handle);
+		this.#file.close();
 	}
 
 	/** Write one record; its entry becomes cold through `convertToColdEntry` (cold-entries.ts). Only while {@link writable}. */
@@ -382,11 +368,12 @@ export class ColdEntryStore {
 		const data = this.#pending.length === 1 ? this.#pending[0]! : Buffer.concat(this.#pending, this.#pendingBytes);
 		this.#pending = [];
 		this.#pendingBytes = 0;
-		if (this.#handle && !this.#inMemory) {
+		if (this.#file && !this.#inMemory) {
+			const fd = this.#file.fd;
 			try {
 				let done = 0;
 				while (done < data.length) {
-					done += fs.writeSync(this.#handle.fd, data, done, data.length - done, this.#written + done);
+					done += fs.writeSync(fd, data, done, data.length - done, this.#written + done);
 				}
 				this.#written += data.length;
 				return;
@@ -430,8 +417,9 @@ export class ColdEntryStore {
 	}
 
 	#readFile(record: ColdRecord): Buffer {
-		const fd = this.#handle?.fd;
-		if (fd === undefined) throw new Error("A cold session entry's record is missing from its store.");
+		const file = this.#file;
+		if (!file) throw new Error("A cold session entry's record is missing from its store.");
+		const fd = file.fd;
 		const data = Buffer.allocUnsafe(record.length);
 		let done = 0;
 		while (done < record.length) {
