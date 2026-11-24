@@ -2,7 +2,9 @@
 # A test job's host: the reference tools (tools.sh's tarball) unpacked at /, the locales and the
 # terminfo entry the tests read, fs.protected_* as a hardened host sets them, a temporary
 # directory per user on a loop-mounted XFS with reflinks (pi-iso and pi-vcs clone with FICLONE),
-# and the sticky-directory FIFO the FIFO tests open as the runner's user (PI_TEST_STICKY_FIFO:
+# a directory per user where names fold, on a loop-mounted ext4 with casefold (pi-builtins'
+# check_folded_sources tests run their host half there: nextest.sh SC_FOLDED), and the
+# sticky-directory FIFO the FIFO tests open as the runner's user (PI_TEST_STICKY_FIFO:
 # mode 0666, uid 65534, in a 1777 directory of root's, as sami-rust-test.yml's rust_test sets it up).
 # Then the reference environment's checks (the gate kit's refenv.sh check): a host that misses a
 # part fails here by name, so its tests do not return early and pass having compared nothing.
@@ -30,6 +32,19 @@ sudo install -d -o root -g root -m 0755 /mnt/sc/tmp-root
 echo probe > /mnt/sc/tmp-runner/p && cp --reflink=always /mnt/sc/tmp-runner/p /mnt/sc/tmp-runner/p2 ||
 	fail "/mnt/sc takes no reflink"
 rm -f /mnt/sc/tmp-runner/p /mnt/sc/tmp-runner/p2
+# Names fold in /mnt/sc-fold/tmp-<user>: `chattr +F` on an empty directory of an ext4 made with
+# casefold, so what is made in it folds too. No filesystem here has both reflinks and casefold,
+# so this is a second temporary directory, for the tests that need it.
+truncate -s 256M "$RUNNER_TEMP/sc-fold.img"
+mkfs.ext4 -F -q -O casefold -E encoding=utf8 "$RUNNER_TEMP/sc-fold.img"
+sudo mkdir -p /mnt/sc-fold
+sudo mount -o loop "$RUNNER_TEMP/sc-fold.img" /mnt/sc-fold
+sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 /mnt/sc-fold/tmp-runner
+sudo install -d -o root -g root -m 0755 /mnt/sc-fold/tmp-root
+sudo chattr +F /mnt/sc-fold/tmp-runner /mnt/sc-fold/tmp-root
+: > /mnt/sc-fold/tmp-runner/fold-probe
+[ -e /mnt/sc-fold/tmp-runner/FOLD-PROBE ] || fail "names do not fold in /mnt/sc-fold/tmp-runner (kernel $(uname -r))"
+rm -f /mnt/sc-fold/tmp-runner/fold-probe
 # Search permission (x, not read) on the workspace's ancestors: a test run as root that re-runs its
 # own binary as another uid (cp's other-owner test runs it as uid 1000) must reach the binary, and
 # GitHub's /home/runner is 0750 (run 45254699112: "uid 1000 cannot run the test binary").
@@ -73,5 +88,5 @@ case "$r" in "rsync  version 3.5.1  protocol version 33"*) ;; *) fail "the refer
 j=$(/opt/sc-ref/bin/jj --version)
 case "$j" in "jj 0.46.0"*) ;; *) fail "the reference jj is '$j'" ;; esac
 b=$(/bin/bash --version | head -n 1)
-echo "HOST zsh=[$v] rsync=[$r] jj=[$j] bash=[$b] locales en_US sv_SE de_DE; /mnt/sc xfs reflink; sticky FIFO $fifo refused; fs.protected_fifos=$(cat /proc/sys/fs/protected_fifos) uid=$(id -u) cpus=$(nproc) image=${ImageOS:-?}/${ImageVersion:-?} kernel=$(uname -r)"
+echo "HOST zsh=[$v] rsync=[$r] jj=[$j] bash=[$b] locales en_US sv_SE de_DE; /mnt/sc xfs reflink; /mnt/sc-fold ext4 casefold; sticky FIFO $fifo refused; fs.protected_fifos=$(cat /proc/sys/fs/protected_fifos) uid=$(id -u) cpus=$(nproc) image=${ImageOS:-?}/${ImageVersion:-?} kernel=$(uname -r)"
 echo "HOST / $(stat -c '%U:%G %a' /) /usr $(stat -c '%U:%G %a' /usr) /usr/bin/zsh $(stat -c '%U:%G %a' /usr/bin/zsh)"

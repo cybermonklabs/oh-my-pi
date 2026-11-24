@@ -1,8 +1,29 @@
 # Known failures of the sami checks: tests that fail on every tree for a reason the tree does not
-# own yet. The summary shows each failure as KNOWN (with this reason) or NEW; a row whose only
-# failures are known reads KNOWN. An entry whose test passed or no longer exists is listed in
-# the summary to be removed, and the summary job fails until it is, so the list only shrinks.
-# One per line, tab-separated: <row> <user> <unit> <test> <reason>.
+# own yet. The summary shows each failure as KNOWN (with this reason) or NEW; a unit whose only
+# failures are known reads KNOWN, unless a test in it skipped itself and passed as no other user
+# (then it is UNKNOWN). An entry whose test passed or no longer exists is listed in the summary to
+# be removed, and the summary job fails until it is, so the list only shrinks.
+# A flaky entry, whose reason starts with `flaky: `, names a test that fails in some runs and passes
+# in others. When it fails, its job runs its whole unit again (set.sh, nextest.sh, ts.sh: the same
+# binary or filter, the same threads, the same user), at most twice; its failure reads KNOWN only
+# when it passed in such a retry, and NEW when it failed every retry or passed only in a smaller run
+# (a race at 4 threads can pass alone). Where a runner gives each test a process of its own
+# (nextest), the test's own retry is that process again and counts: sc.py reads nextest's own
+# retries from its JUnit report (a test with <flakyFailure> attempts that passed in the end is a
+# flaky failure, never a pass; one whose <rerunFailure> retries all failed stays failed). A flaky
+# failure with no entry reads NEW. An entry is not listed for removal when its test passes (it
+# still is when its test no longer exists).
+# A unit of `*` names the test in any unit of its row, on the rows whose units are shards (ts-ca,
+# workspace: sc.py ANY_UNIT_ROWS): a coding-agent shard holds the test files whose sorted index mod
+# 10 is the shard's, so a file added before a test moves it to another shard. On the other rows a
+# test's name is unique only inside its unit, and sc.py refuses `*` there.
+# A known self-skip, whose reason starts with `skips: `, has a sixth field: the start of the skip
+# line the test prints (each `{...}` any text). A test that skipped itself reads KNOWN when each of
+# its skip lines starts as an entry of its row, user and test says; one user's entry never covers
+# the other user, and a unit with any other self-skip (not passed as the other user) is UNKNOWN.
+# An entry whose test ran without skipping itself, or printed no line that starts so, is listed
+# for removal.
+# One per line, tab-separated: <row> <user> <unit> <test> <reason> [<skip line start>].
 # Rows: set-runner, set-root, builtins, workspace, ts-small, ts-ca (sc.py ROWS).
 # Source: runs 45245119907 (509a2d77) and 45245136412 (a72018dd); red at both trees.
 set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_with_listambiguous	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
@@ -46,10 +67,23 @@ set-root	root	pi-shell::zsh_comp_pty	spell_word_corrects_a_command	root's zsh pr
 set-root	root	pi-shell::zsh_comp_pty	zls_colors_parameter	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
 set-root	root	pi-shell::zsh_comp_pty	zls_colors_types_patterns_and_selection	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
 set-root	root	pi-shell::zsh_computil_pty	compsys_kill_signals	the host's signal list differs from the zsh 5.9 snapshot
-set-root	root	pi-shell::zsh_jobs_pty	a_suspended_loop_takes_the_rest_of_the_loop_with_it	a race in the real zsh, not in obash
+set-root	root	pi-shell::zsh_jobs_pty	a_suspended_loop_takes_the_rest_of_the_loop_with_it	flaky: a race in the real zsh, not in obash (platform-reds row 18)
+set-root	root	pi-shell::zsh_mod_zpty	zsh_mod_zpty_non_blocking_read_takes_what_is_there	flaky: a race in Cut8 itself (12/30 vs 18/30 on gVisor)
 set-root	root	pi-shell::zsh_zcompile	zcompile_digest_and_listing_match_zsh	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
 set-root	root	pi-shell::zsh_zcompile	zcompile_lists_dumps_zsh_wrote	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
 set-runner	runner	pi-shell::zsh_comp_pty	options_and_values_of_arguments	fails against zsh 5.9 on every tree since Cut7 (no fix yet)
 set-runner	runner	pi-shell::zsh_computil_pty	compsys_kill_signals	the host's signal list differs from the zsh 5.9 snapshot
+set-runner	runner	pi-shell::zsh_jobs_pty	a_suspended_loop_takes_the_rest_of_the_loop_with_it	flaky: a race in the real zsh, not in obash (platform-reds row 18)
+set-runner	runner	pi-shell::zsh_mod_zpty	zsh_mod_zpty_non_blocking_read_takes_what_is_there	flaky: a race in Cut8 itself (12/30 vs 18/30 on gVisor)
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_digest_and_listing_match_zsh	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_lists_dumps_zsh_wrote	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
+ts-ca	runner	*	PDF page screenshots in Chromium::paints each requested image-only page instead of the empty viewer	flaky: timed out rendering PDF page 1 (read-pdf.ts:151) in 1 of 4 full coding-agent runs (45287678343); passed 20 of 20 alone at 509a2d77 and a72018dd, 10 on Chrome for Testing 150.0.7871.24 and 10 on the runner's Chrome 157
+ts-ca	runner	*	browser WebMCP helpers::blames the Chrome version only when invokeTool itself is missing, not for another error saying something wasn't found	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
+ts-ca	runner	*	browser WebMCP helpers::cancels the page's tool invocation when the call is aborted	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
+ts-ca	runner	*	browser WebMCP helpers::discovers, invokes, bounds trust, and reports native registrations	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
+ts-ca	runner	*	browser WebMCP helpers::forgets a page's tools once it navigates and finds the next page's	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
+ts-ca	runner	*	browser WebMCP helpers::keeps a page alive whose same-site iframe is touched before it navigates	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
+ts-ca	runner	*	browser WebMCP helpers::leaves the page's globals and modelContext alone, before and after a webmcp helper runs	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
+ts-ca	runner	*	browser WebMCP helpers::lists a same-process iframe's tools, registered before the first call, until the iframe navigates	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
+ts-ca	runner	*	browser WebMCP helpers::lists and invokes a tool a cross-origin iframe registers in its own process	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
+ts-ca	runner	*	browser WebMCP helpers::never starts the page's tool once the call is aborted	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)

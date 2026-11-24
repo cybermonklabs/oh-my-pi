@@ -1,0 +1,6 @@
+# Prints of the tree that say skip, not run, gave up or nothing checked and are NOT a test skipping
+# itself or a part of itself (a part is a skip too: partial-skips.txt lets a test skip one and pass).
+# sc.py skip-forms fails on any such print SKIP_MARKER does not read unless it is named here, and
+# sc.py skip-lines fails on any such line a passing test printed unless it matches an entry here
+# (from the line's start, each x any text). At 509a2d77 no print of the tree needs an entry.
+# One per line, tab-separated: <path under the tree> <start of the printed text, arguments as x> <reason>.

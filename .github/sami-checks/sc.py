@@ -8,7 +8,13 @@
   sc.py nextest JUNIT EXIT SECS ROW UNIT WHO one nextest run's result
   sc.py bun JUNIT LOG EXIT SECS ROW UNIT     one `bun test` run's result
   sc.py plain EXIT SECS ROW UNIT LOG         a command whose exit is its verdict (check:ts)
-  sc.py summary RESULTS BUILD              the step summary (markdown) on stdout; exit 1 unless every row passed
+  sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout; exit 1 unless every row passed
+  sc.py skip-forms TREE NOT_MARKERS        each print of TREE/crates that says skip is read or named (JSON)
+  sc.py skip-lines RESULTS NOT_MARKERS     each skip line a passing test printed is read or named (JSON)
+  sc.py flaky-failed RESULT KNOWN          the failed tests of one result with a `flaky: ` entry, one a line
+  sc.py retried RESULT TEST REPORT SHAPE [SCOPE]   adds one retry (pass, partial, skip or fail) to RESULT;
+                                           SCOPE whole-unit (the default) or own-process (nextest)
+  sc.py junit-merge OUT JUNIT...           one JUnit report of several (nextest.sh's two passes)
   sc.py selftest                           the counters and the summary against hand-made inputs
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
@@ -16,7 +22,12 @@ binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 no
 with no JUnit report or no summary line, a command the time bound or a signal ended, and a unit
 the plan expects that no job reported, or that two jobs reported, are UNKNOWN, and so is every row
 they belong to. A test that passed after printing a skip marker compared nothing: it is counted
-apart, named, and its unit is UNKNOWN. A test that started and never ended is named.
+apart, named, and its unit is UNKNOWN, unless each of its skip lines is a sub-case that
+partial-skips.txt lets that test skip and the entry's witness line is in its output (then it
+passes and is listed as partial), it passed as the other user, or known-failures.txt names each of
+its skip lines for that row and user (`skips: `; then it reads KNOWN). A test that started and
+never ended is named. A failure with a `flaky: ` entry reads KNOWN only when the test passed in
+a retry of its whole unit in the same job (the unit's command again, at most twice).
 """
 
 import json
@@ -42,11 +53,33 @@ TS_SMALL = (
 PI_SHELL = "pi-shell"
 # Seconds a pi-shell binary is assumed to take when the weights file does not name it.
 DEFAULT_WEIGHT = 5.0
-# What a test prints when it returns early having checked nothing (the markers sami-build's
-# rust_test reads, .github/sami/rust-test.sh): a passing test that prints one did not pass.
-# A marker counts at the start of a line or after a `<case name>: ` prefix (`t: not run: ...`);
-# a line that only mentions the word later (`the host half is skipped: ...`) does not.
-SKIP_MARKER = re.compile(r"^\s*(?:[^\n:]{1,200}:\s+)?(?:skipped:|skipping\b|SKIP\b|not run\b|UNKNOWN:)|UNCOMPARED", re.M)
+# What a test prints when it returns early having checked nothing: a passing test that prints one
+# did not pass. The forms are the tree's own (sc.py skip-forms lists every print of the tree that
+# says skip, not run or nothing checked, and fails on one this rule does not read): `skipped: ...`,
+# `skipped, ...`, `skipped mode 0200: ...`, `skipping ...`, `SKIP: ...`, `NOT-RUN ...`,
+# `UNKNOWN: ...`, `not checked`, each at the start of a line, after one capitalised word
+# (`CHILD skipped: ...`) or a subject and `is`/`are` (pi-builtins file_backup/tests.rs prints
+# `cp: the host half is skipped: ...`, pi-shell zsh_mod_zftp/io.rs `...: the mark is not checked`),
+# and after up to 8 `<prefix>: ` segments, since a case name can itself hold ": " (pi-iso cow.rs
+# prints `/dev/shm: 3 bytes onto 5, ... failing: skipped, ...`); and `UNCOMPARED`, `nothing was
+# checked`, `the test saw nothing` and `nothing to test` anywhere in a line. A skip of part of a
+# test is a skip too: partial-skips.txt is where a test may skip a part and still pass. Each segment
+# ends at its first colon and takes all the blanks after it, and a subject is at most 200
+# characters, so a line is tried in a bounded number of ways.
+SKIP_MARKER = re.compile(
+    r"^[ \t]*(?![ \t])(?:[^\n:]{0,200}:[ \t]+(?![ \t])){0,8}"
+    r"(?:[A-Z][A-Z0-9_-]*[ \t]+|[^\n:]{0,200}?\b(?:is|are)[ \t]+)?"
+    r"(?:skipped\b|skipping\b|SKIP\b|not run\b|NOT-RUN\b|UNKNOWN:|not checked\b)"
+    r"|UNCOMPARED|nothing was checked|the test saw nothing|nothing to test",
+    re.M,
+)
+# A line or literal that says it skips, did not run, gave up or checked nothing (sc.py skip-forms
+# and skip-lines): each one must be read by SKIP_MARKER or be named in skip-forms-not-markers.txt.
+SKIP_WORD = re.compile(
+    r"\bskip(?:ped|ping|s)?\b|\bnot[ -]run\b|NOT-RUN|UNCOMPARED|nothing was checked|nothing to test"
+    r"|\bnot checked\b|\bchecked nothing\b|\bnot compared\b",
+    re.I,
+)
 
 ROWS = (
     ("pi-shell set (runner)", "set-runner"),
@@ -57,6 +90,7 @@ ROWS = (
     ("TypeScript suites", "ts-small"),
     ("coding-agent --isolate", "ts-ca"),
     ("check:ts", "checkts"),
+    ("skip prints the summary reads", "skipforms"),
 )
 # The Rust tests (sami-rust-test.yml) report no units here: each of its two jobs is a row of its own,
 # read from the job's conclusion, which sami-checks.yml passes as SC_RUST_TESTS.
@@ -84,7 +118,7 @@ def ts_matrix():
 
 def all_job_names():
     names = [m["name"] for m in set_matrix()] + [m["name"] for m in workspace_matrix()]
-    names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()] + ["ts-small", "checkts"]
+    names += [m["name"] for m in builtins_matrix()] + [m["name"] for m in ts_matrix()] + ["ts-small", "checkts", "skip-forms"]
     return names
 
 
@@ -176,7 +210,7 @@ def cmd_shard(who, n, k, meta, weights_path):
 
 
 def result(row, unit, who, status, exit_code, secs, passed=0, failed=0, ignored=0, failures=(), tests=(),
-           note="", self_skipped=()):
+           note="", self_skipped=(), partial=(), skip_lines=None, retries=None):
     return {
         "row": row,
         "unit": unit,
@@ -188,15 +222,72 @@ def result(row, unit, who, status, exit_code, secs, passed=0, failed=0, ignored=
         "failed": failed,
         "ignored": ignored,
         "self_skipped": list(self_skipped),
+        # Every skip line of each test in self_skipped, which known-failures.txt's `skips: ` entries
+        # match: a test reads as a known skip only when each of its lines matches, so none is dropped.
+        "skip_lines": {n: list(ls) for n, ls in (skip_lines or {}).items()},
+        "partial": [list(p) for p in partial],
+        # Each failed test's retries in this job (record_retry, or nextest's own retries read from its
+        # JUnit report): [{outcome, ran, of, shape, scope}].
+        "retries": {n: list(rs) for n, rs in (retries or {}).items()},
         "failures": list(failures),
         "tests": [[n, round(t, 3)] for n, t in tests],
         "note": note,
     }
 
 
+PARTIAL_SKIPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "partial-skips.txt")
+
+
+def literal_pattern(lit):
+    """A format literal as a pattern of the whole line it prints, each `{...}` argument any text."""
+    parts = re.split(r"(\{\{|\}\}|\{[^{}]*\})", lit)
+    return re.compile("".join(
+        re.escape(p[0]) if p in ("{{", "}}") else ".*" if p.startswith("{") else re.escape(p) for p in parts))
+
+
+def read_partial_skips(path=PARTIAL_SKIPS):
+    """partial-skips.txt: [test, format literal, witness regex, reason] per entry."""
+    out = []
+    if path and os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            if line.strip() and not line.startswith("#"):
+                f = line.rstrip("\n").split("\t")
+                if len(f) != 4:
+                    sys.exit(f"{path}: not four tab-separated fields: {line!r}")
+                out.append(f)
+    return out
+
+
+def partial_rules(path=PARTIAL_SKIPS):
+    """test -> [(the literal's line pattern, the witness, the reason)]."""
+    rules = {}
+    for test, lit, witness, reason in read_partial_skips(path):
+        rules.setdefault(test, []).append((literal_pattern(lit), re.compile(witness, re.M), reason))
+    return rules
+
+
+def skip_reading(name, out, rules):
+    """How a passing test's output reads: None when no line of it holds a skip marker; else (its
+    skip lines, the reason) when each skip line is printed by a literal the partial-skip list lets
+    this test skip and that entry's witness is in the output (a partial pass), else (lines, None)."""
+    lines = [l.strip() for l in out.splitlines() if SKIP_MARKER.search(l)]
+    if not lines:
+        return None
+    live = [(p, r) for p, w, r in rules.get(name, ()) if w.search(out)]
+    used = []
+    for l in lines:
+        why = next((r for p, r in live if p.fullmatch(l)), None)
+        if why is None:
+            return lines, None
+        if why not in used:
+            used.append(why)
+    return lines, "; ".join(used)
+
+
 def skip_verdict(res):
     """A unit whose passing tests printed a skip marker: those tests are not passes, and the unit
-    is UNKNOWN unless it already failed or is UNKNOWN for another reason."""
+    is UNKNOWN unless it already failed or is UNKNOWN for another reason. A partial pass (the
+    partial-skip list) stays a pass and is only listed."""
     s = res["self_skipped"]
     if s:
         res["passed"] -= len(s)
@@ -207,23 +298,38 @@ def skip_verdict(res):
     return res
 
 
-def parse_libtest(log, exit_code, secs, row, unit, who):
+EVENT_START = re.compile(r'\{\s*"type"\s*:')
+
+
+def libtest_event(line):
+    """The libtest JSON event on a line, or None. A child process that writes to the binary's stdout
+    can leave a line unfinished, so an event can start after its text (`test x ... { "type": ...`,
+    run 45287678343) or have text after it."""
+    m = EVENT_START.search(line)
+    if not m:
+        return None
+    try:
+        ev, _ = json.JSONDecoder().raw_decode(line, m.start())
+    except ValueError:
+        return None
+    return ev if isinstance(ev, dict) else None
+
+
+def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKIPS):
     """libtest's JSON events (-Z unstable-options --format json --report-time, --show-output).
-    Lines that are not events (a child's or a thread's own writes) are ignored. libtest's
+    Text that is not an event (a child's or a thread's own writes) is ignored. libtest's
     `timeout` event is its 60 s warning, not a verdict: the test's own ok or failed comes later."""
-    started, ended, slow, times, failures, skipped = set(), set(), set(), {}, [], []
+    started, ended, slow, times, failures, skipped, partial, skip_lines = set(), set(), set(), {}, [], [], [], {}
     passed = failed = ignored = 0
     suite_end = None
+    rules = partial_rules(partial_path)
     try:
         lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
     except OSError:
         return result(row, unit, who, "UNKNOWN", exit_code, secs, note="no log")
     for line in lines:
-        if not line.startswith("{"):
-            continue
-        try:
-            ev = json.loads(line)
-        except ValueError:
+        ev = libtest_event(line)
+        if ev is None:
             continue
         if ev.get("type") == "suite" and ev.get("event") in ("ok", "failed"):
             suite_end = ev
@@ -238,8 +344,12 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
                 ended.add(name)
                 if e == "ok":
                     passed += 1
-                    if SKIP_MARKER.search(ev.get("stdout") or ""):
+                    k = skip_reading(name, ev.get("stdout") or "", rules)
+                    if k and k[1]:
+                        partial.append((name, len(k[0]), k[1]))
+                    elif k:
                         skipped.append(name)
+                        skip_lines[name] = k[0]
                 elif e == "ignored":
                     ignored += 1
                 else:
@@ -255,7 +365,8 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
     unfinished = sorted(started - ended)
 
     def r(status, note=""):
-        return result(row, unit, who, status, exit_code, secs, passed, failed, ignored, failures, tests, note, skipped)
+        return result(row, unit, who, status, exit_code, secs, passed, failed, ignored, failures, tests, note, skipped,
+                      partial, skip_lines)
 
     if code not in (0, 101):
         note = f"exit {exit_code}: the binary did not finish"
@@ -277,9 +388,32 @@ def parse_libtest(log, exit_code, secs, row, unit, who):
     return skip_verdict(res)
 
 
+def passed_attempt(out):
+    """How an attempt that passed reads: `skip` when its output holds a skip marker (it checked
+    nothing), else `pass`. The one rule for every retry: record_retry's and nextest's own."""
+    return "skip" if SKIP_MARKER.search(out or "") else "pass"
+
+
+def nextest_attempts(flaky, rerun, out):
+    """The outcomes of nextest's own retries after a test's first attempt: for a flaky case (its
+    <flakyFailure>/<flakyError> attempts, then a last attempt whose output is the case's own), each
+    flaky attempt after the first failed and the last attempt passed or skipped; for a failed case's
+    <rerunFailure>/<rerunError> retries, each failed."""
+    if flaky:
+        return ["fail"] * (flaky - 1) + [passed_attempt(out)]
+    return ["fail"] * rerun
+
+
 def junit_cases(path):
-    """Each <testcase> once. bun nests a <testsuite> per describe block, so walking every suite's
-    cases would count a nested case once per enclosing suite."""
+    """(full name, kind, seconds, output, (retries, first failure, nextest's retry elements)) of
+    each <testcase> once. bun nests a <testsuite> per describe block, so walking every suite's
+    cases would count a nested case once per enclosing suite. kind is ok, failed, skipped or flaky.
+    nextest's own retries (its Jenkins JUnit: <flakyFailure>/<flakyError> for each failed attempt of
+    a test that passed in the end, <rerunFailure>/<rerunError> for each failed retry of a test that
+    failed every attempt) give `flaky` (failed, then passed: not a pass) and the retries' outcomes
+    after the first attempt (nextest_attempts), with the first failure's message. A case with
+    <failure> as well as flaky attempts (nextest's flaky-fail) is `failed`: the runner counted it
+    failed."""
     root = ET.parse(path).getroot()
     parent = {c: p for p in root.iter() for c in p}
     for case in root.iter("testcase"):
@@ -290,17 +424,41 @@ def junit_cases(path):
             cls = p.get("name", "") if p is not None and p.tag == "testsuite" else ""
         full = f"{cls}::{name}" if cls and not name.startswith(cls) else name
         t = float(case.get("time") or 0)
+        failed = [e for e in case if e.tag in ("failure", "error")]
+        flaky = [e for e in case if e.tag in ("flakyFailure", "flakyError")]
+        rerun = [e for e in case if e.tag in ("rerunFailure", "rerunError")] if failed else []
         if case.find("skipped") is not None:
             kind = "skipped"
-        elif case.find("failure") is not None or case.find("error") is not None:
+        elif failed:
             kind = "failed"
         else:
-            kind = "ok"
+            kind = "flaky" if flaky else "ok"
         out = "".join((e.text or "") for e in case if e.tag in ("system-out", "system-err"))
-        yield full, kind, t, out
+        first = flaky[0] if flaky else failed[0] if rerun else None
+        message = ""
+        if first is not None:
+            lines = [l.strip() for l in (first.text or "").split("\n") if l.strip()]
+            message = (first.get("message") or " ".join(lines[:2]))[:200]
+        elements = len(flaky) or len(rerun)
+        retries = nextest_attempts(len(flaky), len(rerun), out) if elements else []
+        yield full, kind, t, out, (retries, message, elements)
 
 
-def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits):
+def junit_merge(out, paths):
+    """One JUnit report of several (nextest.sh's two passes): every <testsuite> of each under one
+    <testsuites>. Each input must exist and parse; else nothing is written, and the unit has no
+    report (UNKNOWN). Returns the number of test cases written."""
+    if os.path.exists(out):
+        os.remove(out)
+    merged = ET.Element("testsuites")
+    for p in paths:
+        root = ET.parse(p).getroot()
+        merged.extend(root.findall("testsuite") if root.tag == "testsuites" else [root])
+    ET.ElementTree(merged).write(out, encoding="unicode")
+    return sum(1 for _ in merged.iter("testcase"))
+
+
+def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits, partial_path=PARTIAL_SKIPS):
     try:
         code = int(exit_code)
     except ValueError:
@@ -312,20 +470,45 @@ def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits):
     except ET.ParseError as e:
         return result(row, unit, who, "UNKNOWN", exit_code, secs, note=f"the JUnit report does not parse: {e}")
     passed = sum(1 for c in cases if c[1] == "ok")
-    failures = [c[0] for c in cases if c[1] == "failed"]
+    # A flaky case failed first and passed on nextest's own retry: it is a failure the known-failure
+    # list's `flaky: ` rule reads with its retries; the runner counted it passed, so the exit check
+    # reads only the cases the runner counted failed.
+    hard = [c[0] for c in cases if c[1] == "failed"]
+    failures = hard + [c[0] for c in cases if c[1] == "flaky"]
     ignored = sum(1 for c in cases if c[1] == "skipped")
-    skipped = [c[0] for c in cases if c[1] == "ok" and SKIP_MARKER.search(c[3])]
+    rules = partial_rules(partial_path)
+    skipped, partial, skip_lines = [], [], {}
+    for c in cases:
+        k = skip_reading(c[0], c[3], rules) if c[1] == "ok" else None
+        if k and k[1]:
+            partial.append((c[0], len(k[0]), k[1]))
+        elif k:
+            skipped.append(c[0])
+            skip_lines[c[0]] = k[0]
     tests = [(c[0], c[2]) for c in cases if c[1] != "skipped"]
+    of = len({n for n, _ in tests} | set(failures))
+    retries = {}
+    for c in cases:
+        outcomes, first, _ = c[4]
+        if outcomes:
+            retries[c[0]] = [{"outcome": o, "ran": 1, "of": of, "shape": f"nextest's own retry {i} of {len(outcomes)}",
+                              "scope": "own-process", "first_failure": first} for i, o in enumerate(outcomes, 1)]
 
     def r(s, note=""):
-        return result(row, unit, who, s, exit_code, secs, passed, len(failures), ignored, failures, tests, note, skipped)
+        return result(row, unit, who, s, exit_code, secs, passed, len(failures), ignored, failures, tests, note, skipped,
+                      partial, skip_lines, retries)
 
     if code not in ok_exits + fail_exits:
         return r("UNKNOWN", f"exit {exit_code}: the run did not finish")
     if not cases:
         return r("UNKNOWN", "the JUnit report names no test")
-    if (code in ok_exits) != (not failures):
-        return r("UNKNOWN", f"exit {exit_code} with {len(failures)} failed")
+    # Each of nextest's retry elements of a case has its retry record: else the reading of them is
+    # broken, and a flaky or failed case would read without its retries.
+    unrecorded = [c[0] for c in cases if len(retries.get(c[0], [])) != c[4][2]]
+    if unrecorded:
+        return r("UNKNOWN", "a flaky case has no recorded retry: " + ", ".join(unrecorded[:12]))
+    if (code in ok_exits) != (not hard):
+        return r("UNKNOWN", f"exit {exit_code} with {len(hard)} failed")
     return skip_verdict(r("FAIL" if failures else "PASS"))
 
 
@@ -396,6 +579,9 @@ def expected_units(build_dir):
     for s in range(1, CODING_AGENT_SHARDS + 1):
         exp.append(("ts-ca", f"shard {s}/{CODING_AGENT_SHARDS}", "runner"))
     exp.append(("checkts", "check:ts", "runner"))
+    exp.append(("skipforms", "tree", "runner"))
+    # The run-time half, which the summary job runs on the results before the summary (sc.py skip-lines).
+    exp.append(("skipforms", "runtime", "runner"))
     return exp, notes
 
 
@@ -404,22 +590,344 @@ def fmt_secs(s):
     return f"{s / 60:.1f} min" if s >= 90 else f"{s:.0f} s"
 
 
-def read_known(path):
-    """known-failures.txt: (row, user, unit, test) -> reason."""
-    known = {}
+# The rows whose units are shards a test moves between (ts-ca: files by sorted index; workspace:
+# nextest's count partitions), where a known-failure entry may name `*` for any unit. On the other
+# rows a unit is a binary or a suite, and a test's name is unique only inside it.
+ANY_UNIT_ROWS = ("ts-ca", "workspace")
+
+
+def known_rows(path):
+    """known-failures.txt's entries as lists of fields: five, or six for a `skips: ` entry."""
+    rows = []
     if path and os.path.exists(path):
         for line in open(path, encoding="utf-8"):
             if not line.strip() or line.startswith("#"):
                 continue
             f = line.rstrip("\n").split("\t")
-            if len(f) != 5:
-                sys.exit(f"known-failures.txt: not five tab-separated fields: {line!r}")
-            known[tuple(f[:4])] = f[4]
-    return known
+            if len(f) != (6 if len(f) > 4 and f[4].startswith("skips: ") else 5):
+                sys.exit(f"known-failures.txt: not five tab-separated fields (six for `skips: `): {line!r}")
+            if f[2] == "*" and f[0] not in ANY_UNIT_ROWS:
+                sys.exit(f"known-failures.txt: unit `*` only on the rows {', '.join(ANY_UNIT_ROWS)}: {line!r}")
+            rows.append(f)
+    return rows
+
+
+def read_known(path):
+    """known-failures.txt's failures: (row, user, unit, test) -> reason. A unit of `*` is any unit
+    of the row (ANY_UNIT_ROWS only)."""
+    return {tuple(f[:4]): f[4] for f in known_rows(path) if len(f) == 5}
+
+
+def read_known_skips(path):
+    """known-failures.txt's known self-skips: (row, user, unit, test) -> [(the skip line's start as
+    a pattern, each `{...}` any text; the reason; the start as written)]."""
+    skips = {}
+    for f in known_rows(path):
+        if len(f) == 6:
+            skips.setdefault(tuple(f[:4]), []).append((literal_pattern(f[5]), f[4][len("skips: "):], f[5]))
+    return skips
+
+
+def known_reason(known, row, who, unit, test):
+    """The reason the known-failure list gives for a failure: its entry for the unit, else its entry
+    for any unit of the row (`*`: a coding-agent shard is the files' sorted index mod 10, so a test
+    moves to another shard when a file is added before it). None when the list does not name it."""
+    why = known.get((row, who, unit, test))
+    return why if why is not None else known.get((row, who, "*", test))
+
+
+def known_skip(skips, row, who, unit, test, lines):
+    """The reason the known-failure list gives for a test that skipped itself: each of its skip lines
+    starts as one of the test's `skips: ` entries for this row and user (unit or `*`) says. None when
+    a line matches none, or no skip line was kept."""
+    entries = skips.get((row, who, unit, test), []) + skips.get((row, who, "*", test), [])
+    if not entries or not lines:
+        return None
+    used = []
+    for line in lines:
+        why = next((w for p, w, _ in entries if p.match(line)), None)
+        if why is None:
+            return None
+        if why not in used:
+            used.append(why)
+    return "; ".join(used)
+
+
+def rust_literals(text):
+    """The string literals of Rust source (plain, byte and raw), comments and chars left out:
+    [(offset, text)]."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif re.match(r'b?r#*"', text[i:i + 66]) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            m = re.match(r'(b?r)(#*)"', text[i:])
+            close = '"' + m.group(2)
+            start = i + len(m.group(0))
+            j = text.find(close, start)
+            j = n if j < 0 else j
+            out.append((i, text[start:j]))
+            i = j + len(close)
+        elif c == '"' or (c == "b" and text.startswith('b"', i) and (i == 0 or not text[i - 1].isalnum())):
+            start = i + (2 if c == "b" else 1)
+            j = start
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append((i, text[start:j]))
+            i = j + 1
+        elif c == "'":
+            m = re.match(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])'", text[i:])
+            i += len(m.group(0)) if m else 1
+        else:
+            i += 1
+    return out
+
+
+# A format argument as `x`, and as a value that itself holds ": ", blanks and a comma, as a case name
+# built with format! does at run time (pi-iso cow.rs: `{case}: skipped, ...`, case `{place}: ...`).
+ARG_SAMPLES = ("x", "x: y, z")
+
+
+def literal_sample(lit, arg="x"):
+    """What a format literal prints, roughly: line continuations joined, each `{...}` argument as `arg`."""
+    s = re.sub(r"\\\n\s*", "", lit).replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+    s = s.replace("{{", "\0").replace("}}", "\1")
+    s = re.sub(r"\{[^{}]*\}", lambda _: arg, s)
+    return s.replace("\0", "{").replace("\1", "}")
+
+
+PRINT_CALL = re.compile(r"\b(?:e?print(?:ln)?|writeln|write)!\s*\(")
+
+
+def printed(text, off):
+    """Whether the literal at `off` is an argument of a print macro: eprintln!, println!, eprint!,
+    print!, or write!/writeln! to std::io::stderr() or stdout() (pi-shell's say_not_run)."""
+    window = text[max(0, off - 400):off]
+    for m in reversed(list(PRINT_CALL.finditer(window))):
+        inner = window[m.end():]
+        if inner.count("(") >= inner.count(")"):
+            return not m.group(0).startswith("write") or "stderr()" in inner or "stdout()" in inner
+    return False
+
+
+def read_not_markers(path):
+    """skip-forms-not-markers.txt: [path, start of the printed text with arguments as x, reason]."""
+    out = []
+    for line in open(path, encoding="utf-8"):
+        if line.strip() and not line.startswith("#"):
+            f = line.rstrip("\n").split("\t")
+            if len(f) != 3:
+                sys.exit(f"{path}: not three tab-separated fields: {line!r}")
+            out.append(f)
+    return out
+
+
+def skip_forms(tree, exceptions_path, partial_path=PARTIAL_SKIPS):
+    """Every literal under <tree>/crates that says skip, not run, gave up or checked nothing must be
+    read by SKIP_MARKER, with its arguments as each of ARG_SAMPLES, or be named in the exceptions file
+    (`<path>\\t<start of the literal, arguments as x>\\t<reason>`) as not a skip marker. A literal of
+    the partial-skip list must still be printed somewhere. Returns (unread literals, exceptions and
+    partial-skip entries that match nothing, the number of .rs files read)."""
+    exc = [[e[0], e[1], False] for e in read_not_markers(exceptions_path)]
+    partial = [(e[0], e[1]) for e in read_partial_skips(partial_path)]
+    partial_lits = {lit for _, lit in partial}
+    printed_lits = set()
+    unread, files_read = [], 0
+    for dp, dirs, files in os.walk(os.path.join(tree, "crates")):
+        dirs[:] = sorted(d for d in dirs if d != "target")
+        for f in sorted(files):
+            if not f.endswith(".rs"):
+                continue
+            files_read += 1
+            p = os.path.join(dp, f)
+            rel = os.path.relpath(p, tree)
+            text = open(p, encoding="utf-8", errors="replace").read()
+            for off, lit in rust_literals(text):
+                if lit in partial_lits and printed(text, off):
+                    printed_lits.add(lit)
+                samples = [literal_sample(lit, a) for a in ARG_SAMPLES]
+                bad = [s for s in samples if SKIP_WORD.search(s) and not SKIP_MARKER.search(s)]
+                if not bad or not printed(text, off):
+                    continue
+                hit = [e for e in exc if e[0] == rel and samples[0].startswith(e[1])]
+                for e in hit:
+                    e[2] = True
+                if not hit:
+                    unread.append(f"{rel}:{text.count(chr(10), 0, off) + 1}: {bad[0][:160]!r}")
+    stale = [f"{e[0]}: {e[1]!r}" for e in exc if not e[2]]
+    stale += [f"partial-skips.txt, {test}: {lit!r}" for test, lit in partial if lit not in printed_lits]
+    return unread, stale, files_read
+
+
+def cmd_skip_forms(tree, exceptions_path):
+    unread, stale, files_read = skip_forms(tree, exceptions_path)
+    fails = [f"a skip print the summary does not read: {u}" for u in unread]
+    fails += [f"an entry that names no printed literal of the tree any more: {s}" for s in stale]
+    if fails:
+        status, note = "FAIL", ""
+    elif not files_read:
+        status, note = "UNKNOWN", f"no .rs file under {tree}/crates: nothing was scanned"
+    else:
+        status, note = "PASS", f"every skip print of the {files_read} .rs files is read or named as not a marker"
+    return result("skipforms", "tree", "runner", status, 0, 0, int(status == "PASS"), len(fails), failures=fails, note=note)
+
+
+def passing_outputs(results_dir, unreadable):
+    """(report, test, output) of each test that passed in a results directory: the passing cases of
+    each JUnit report (nextest, bun) and the `ok` events of each libtest log (the pi-shell set).
+    A report that does not parse is added to `unreadable`."""
+    for dp, dirs, files in os.walk(results_dir):
+        dirs.sort()
+        for f in sorted(files):
+            p = os.path.join(dp, f)
+            if f.endswith(".junit.xml"):
+                try:
+                    cases = list(junit_cases(p))
+                except ET.ParseError:
+                    unreadable.append(os.path.relpath(p, results_dir))
+                    continue
+                for name, kind, _, out, _ in cases:
+                    if kind == "ok":
+                        yield p, name, out
+            elif f.endswith(".log"):
+                for line in open(p, encoding="utf-8", errors="replace"):
+                    ev = libtest_event(line)
+                    if ev and ev.get("type") == "test" and ev.get("event") == "ok":
+                        yield p, ev.get("name", "?"), ev.get("stdout") or ""
+
+
+def skip_lines(results_dir, exceptions_path):
+    """The run-time half of skip-forms: each line a passing test printed that SKIP_WORD selects must be
+    read by SKIP_MARKER or match an entry of the exceptions file (its text from the line's start,
+    each `x` any text). Returns ({unread line: [report and test, ...]}, tests read, unreadable reports)."""
+    pats = [re.compile(r"[ \t]*" + ".*?".join(re.escape(p) for p in e[1].split("x")))
+            for e in read_not_markers(exceptions_path)]
+    unread, tests, unreadable = {}, 0, []
+    for p, name, out in passing_outputs(results_dir, unreadable):
+        tests += 1
+        for line in out.splitlines():
+            if SKIP_WORD.search(line) and not SKIP_MARKER.search(line) and not any(r.match(line) for r in pats):
+                unread.setdefault(line.strip()[:200], []).append(f"{os.path.relpath(p, results_dir)} {name}")
+    return unread, tests, unreadable
+
+
+def cmd_skip_lines(results_dir, exceptions_path):
+    unread, tests, unreadable = skip_lines(results_dir, exceptions_path)
+    fails = [f"a skip line the summary does not read: {line!r}, printed {len(w)} time(s), first by {w[0]}"
+             for line, w in sorted(unread.items())]
+    if fails:
+        status, note = "FAIL", ""
+    elif not tests:
+        status, note = "UNKNOWN", f"no passing test's output under {results_dir}: nothing was read"
+    elif unreadable:
+        status, note = "UNKNOWN", f"{len(unreadable)} JUnit report(s) do not parse: " + ", ".join(unreadable[:5])
+    else:
+        status, note = "PASS", f"every skip line of {tests} passing tests is read or named as not a marker"
+    return result("skipforms", "runtime", "runner", status, 0, 0, int(status == "PASS"), len(fails), failures=fails, note=note)
+
+
+def flaky_failed(result_path, known_path):
+    """The failed tests of one result that the known-failure list names `flaky: ` for its row,
+    user and unit (or `*`): the job runs the whole unit again, at most twice, while one is left."""
+    r = json.load(open(result_path, encoding="utf-8"))
+    known = read_known(known_path)
+    return [f for f in r["failures"]
+            if (known_reason(known, r["row"], r["who"], r["unit"], f) or "").startswith("flaky: ")]
+
+
+def record_retry(result_path, test, report, shape, scope="whole-unit"):
+    """Reads one retry and adds to the result's `retries` for `test`: the outcome, how many of the
+    unit's tests the retry ran, `shape` (the script's words for how it ran) and `scope`. REPORT is a
+    libtest log or a JUnit report (nextest, bun). The outcome is `pass`, `partial`, `skip` (it passed
+    after a skip marker, or was skipped) or `fail` (it failed, did not end, or is not in the report).
+    With scope `whole-unit`, the retry is the unit's command again (the same binary or filter,
+    threads and user), and a pass in it that did not run every test the unit ran is `partial`: a
+    test alone or at another size is not the same race. With scope `own-process`, the runner gives
+    each test a process of its own (nextest), so its retry alone is that same process again, as in
+    nextest's own retries; a pass then counts however many tests ran. Returns the outcome."""
+    if scope not in ("whole-unit", "own-process"):
+        sys.exit(f"retried: scope {scope!r} is neither whole-unit nor own-process")
+    outcome, ran = "fail", set()
+    if report.endswith(".xml"):
+        try:
+            for name, kind, _, out, _ in junit_cases(report):
+                if kind != "skipped":
+                    ran.add(name)
+                if name == test:
+                    outcome = "fail" if kind == "failed" else "skip" if kind == "skipped" else passed_attempt(out)
+        except (OSError, ET.ParseError):
+            pass
+    else:
+        try:
+            lines = open(report, encoding="utf-8", errors="replace").read().splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            ev = libtest_event(line)
+            if ev and ev.get("type") == "test" and ev.get("event") in ("ok", "failed"):
+                ran.add(ev.get("name"))
+                if ev.get("name") == test:
+                    outcome = "fail" if ev["event"] == "failed" else passed_attempt(ev.get("stdout"))
+    r = json.load(open(result_path, encoding="utf-8"))
+    unit = {n for n, _ in r["tests"]} | set(r["failures"])
+    of = len(unit)
+    n = len(ran & unit)
+    if outcome == "pass" and n < of and scope == "whole-unit":
+        outcome = "partial"
+    r.setdefault("retries", {}).setdefault(test, []).append(
+        {"outcome": outcome, "ran": n, "of": of, "shape": shape, "scope": scope})
+    json.dump(r, open(result_path, "w", encoding="utf-8"))
+    return outcome
 
 
 def cmd_summary(results_dir, build_dir, known_path=None):
     known = read_known(known_path)
+    skips = read_known_skips(known_path)
+
+    def failure_reason(r, row, f):
+        """(the reason, how the summary shows it) for failure f of result r; no reason when the
+        failure is NEW. A flaky entry gives its reason only when the test passed in a retry of the
+        shape it failed in, in the same job: the whole unit again (set.sh, nextest.sh, ts.sh), or,
+        where each test has a process of its own (nextest), that process again (record_retry's
+        scope): a retry of a test alone from a shared process does not show the race of the full run."""
+        why = known_reason(known, row, r["who"], r["unit"], f)
+        tries = r.get("retries", {}).get(f, [])
+        outcomes = [t["outcome"] for t in tries]
+
+        def told(t):
+            what = "in its own process again" if t["scope"] == "own-process" else "a rerun of the unit"
+            return f"{what}: {t['ran']} of {t['of']} tests, {t['shape']}"
+
+        def first(t):
+            return f"; first failure: {t['first_failure']}" if t.get("first_failure") else ""
+
+        if why is None:
+            if "pass" in outcomes:
+                t = tries[outcomes.index("pass")]
+                return None, (f"**NEW** (flaky, and not on the known-failure list: it passed on retry "
+                              f"{outcomes.index('pass') + 1} of {len(tries)}, {told(t)}{first(t)})")
+            return None, "**NEW**"
+        if not why.startswith("flaky: "):
+            return why, f"KNOWN ({why})"
+        if "pass" in outcomes:
+            t = tries[outcomes.index("pass")]
+            return why, f"KNOWN ({why}; it passed on retry {outcomes.index('pass') + 1} of {len(tries)}, {told(t)}{first(t)})"
+        if not tries:
+            return None, f"**NEW** (listed as `{why}`, but no retry of its unit ran)"
+        seen = "; ".join(f"{t['outcome']} ({told(t)})" for t in tries)
+        return None, f"**NEW** (listed as `{why}`, but no retry of its shape passed it: {seen}{first(tries[0])})"
+
     results = load_results(results_dir)
     got, dup = {}, set()
     for r in results:
@@ -441,8 +949,12 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     lines.append("Report only: nothing here gates a release. A row passes when every unit in it was read and passed, "
                  "and reads KNOWN when its only failures are on the known-failure list. A unit is UNKNOWN when its "
                  "runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with its summary line), when a "
-                 "passing test printed a skip marker and passed as no other user, or when no job (or more than one) "
-                 "reported it; its row is then UNKNOWN too.")
+                 "passing test printed a skip marker and passed as no other user (even when every failure of the "
+                 "unit is known), or when no job (or more than one) reported it; its row is then UNKNOWN too. A test "
+                 "whose only skip lines are sub-cases the partial-skip list names for it, with that entry's witness "
+                 "line in its output, passes and is listed as partial. A self-skip the known-failure list names "
+                 "(`skips: `, for that row and user) reads KNOWN; a failure with a `flaky: ` entry reads KNOWN "
+                 "only when a retry of the test in the same job passed.")
     lines.append("")
     lines.append("| Row | Verdict | Units: pass / known / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
@@ -453,19 +965,38 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         rs = []
         for e in units:
             r = got.get(e)
+            unlisted = []
             if r is None:
                 r = result(key, e[1], e[2], "UNKNOWN", "-", 0, note="no result: its job reported nothing (it failed before its upload, did not run, or its upload was planted away)")
             elif e in dup:
                 r = dict(r, status="UNKNOWN", note="two jobs reported this unit")
-            elif r.get("skip_only") and r["status"] == "UNKNOWN":
+            else:
+                # A self-skip is covered when the same test passed as the other user, and known when
+                # each of its skip lines is a `skips: ` entry of this row and user.
                 others = [w for w in SET_WHO if w != r["who"]]
-                open_ = [s for s in r["self_skipped"] if not any(s in passed_as.get((r["unit"], w), ()) for w in others)]
-                if open_:
-                    r = dict(r, note=f"{len(open_)} test(s) skipped themselves here and passed as no other user: " + ", ".join(open_[:12]))
+                open_ = [s for s in r.get("self_skipped", []) if not any(s in passed_as.get((r["unit"], w), ()) for w in others)]
+                listed = {}
+                for s in open_:
+                    why = known_skip(skips, key, r["who"], r["unit"], s, r.get("skip_lines", {}).get(s))
+                    if why is not None:
+                        listed[s] = why
+                unlisted = [s for s in open_ if s not in listed]
+                r = dict(r, known_skips=listed)
+                if r.get("skip_only") and r["status"] == "UNKNOWN":
+                    if unlisted:
+                        r["note"] = f"{len(unlisted)} test(s) skipped themselves here and passed as no other user: " + ", ".join(unlisted[:12])
+                    elif listed:
+                        r.update(status="KNOWN", note=f"{len(listed)} test(s) skipped themselves as the known-failure list says")
+                    else:
+                        r.update(status="PASS", note=f"{len(r['self_skipped'])} test(s) skipped themselves as {r['who']} and passed as {', '.join(others)}")
+            # Known failures make a unit KNOWN only when nothing else is open: a test that skipped
+            # itself here, passed as no other user and is not a known skip makes it UNKNOWN.
+            if r["status"] == "FAIL" and r["failures"] and all(failure_reason(r, key, f)[0] for f in r["failures"]):
+                if unlisted:
+                    r = dict(r, status="UNKNOWN", note=f"every failure is known, but {len(unlisted)} test(s) skipped themselves here "
+                                                       "and passed as no other user: " + ", ".join(unlisted[:12]))
                 else:
-                    r = dict(r, status="PASS", note=f"{len(r['self_skipped'])} test(s) skipped themselves as {r['who']} and passed as {', '.join(others)}")
-            if r["status"] == "FAIL" and r["failures"] and all((key, r["who"], r["unit"], f) in known for f in r["failures"]):
-                r = dict(r, status="KNOWN")
+                    r = dict(r, status="KNOWN")
             rs.append(r)
         if key in notes and not units:
             verdict, counts = "UNKNOWN", "-"
@@ -487,11 +1018,12 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
             for f in r["failures"]:
-                why = known.get((key, r["who"], r["unit"], f))
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: "
-                               + (f"KNOWN ({why})" if why else "**NEW**"))
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}")
             for f in r.get("self_skipped", []):
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`")
+                why = r.get("known_skips", {}).get(f)
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`" + (f": KNOWN ({why})" if why else ""))
+            for f, n, why in r.get("partial", []):
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): `{f}`: partial: {n} sub-cases skipped ({why})")
     # SC_RUST_TESTS is "rust_test=<result> rust_test_macos=<result>". Absent: a caller from before
     # those jobs, and no Rust rows. success passes and failure fails; a job with no result, or with
     # any other (cancelled, skipped), is UNKNOWN.
@@ -509,23 +1041,49 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     lines.append("")
     # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
     # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
-    # neither: it stays.
+    # neither: it stays, and so does a `*` entry while any unit of its row did not report. A flaky
+    # entry (its reason starts `flaky: `) is not listed when its test passed. A `skips: ` entry is
+    # listed when its test ran without skipping itself, or printed no skip line that starts so.
+    def entry_results(row, who, unit):
+        if unit == "*":
+            return [got.get(e) for e in exp if e[0] == row and e[2] == who], "its row"
+        return [got.get((row, unit, who))], "its unit"
+
     stale = []
     for (row, who, unit, test), why in sorted(known.items()):
-        r = got.get((row, unit, who))
-        if r is None or r["status"] == "UNKNOWN" or test in r["failures"]:
+        rs, where = entry_results(row, who, unit)
+        if not rs or any(r is None or r["status"] == "UNKNOWN" or test in r["failures"] for r in rs):
             continue
-        names = {n for n, _ in r["tests"]}
-        stale.append(f"- `{unit}` ({who}) `{test}`: " + ("passed" if test in names else "no longer in its unit")
+        names = {n for r in rs for n, _ in r["tests"]}
+        if test in names and why.startswith("flaky: "):
+            continue
+        stale.append(f"- `{unit}` ({who}) `{test}`: " + ("passed" if test in names else f"no longer in {where}")
                      + f" (listed for: {why})")
+    for (row, who, unit, test), entries in sorted(skips.items()):
+        rs, where = entry_results(row, who, unit)
+        if not rs or any(r is None or (r["status"] == "UNKNOWN" and not r.get("skip_only")) or test in r["failures"]
+                         for r in rs):
+            continue
+        names = {n for r in rs for n, _ in r["tests"]}
+        printed = [line for r in rs for line in r.get("skip_lines", {}).get(test, [])]
+        for pattern, why, start in entries:
+            if test not in names:
+                gone = f"no longer in {where}"
+            elif not printed:
+                gone = "ran without skipping itself"
+            elif not any(pattern.match(line) for line in printed):
+                gone = "printed no skip line that starts so"
+            else:
+                continue
+            stale.append(f"- `{unit}` ({who}) `{test}`: {gone} (listed: skips `{start}`: {why})")
     if stale:
         all_ok = False
-        lines.append("### Known-failure entries to remove (their test did not fail)")
+        lines.append("### Known-failure entries to remove (their test did not fail or skip itself so)")
         lines.append("")
         lines.extend(stale)
         lines.append("")
     if details:
-        lines.append("### Each failing test and each UNKNOWN")
+        lines.append("### Each failing test, each UNKNOWN and each partial pass")
         lines.append("")
         lines.extend(details[:400])
         if len(details) > 400:
@@ -598,6 +1156,17 @@ def selftest():
     check("libtest no log", parse_libtest(os.path.join(d, "absent"), "0", 1, "r", "u", "w")["status"], "UNKNOWN")
     r = lt([s0, a_s, a_skip, end_ok], 0)
     check("libtest self-skip", (r["status"], r["passed"], r["self_skipped"]), ("UNKNOWN", 0, ["a"]))
+    # A child that shares the binary's stdout left `test x ... ` unfinished, and the next event came
+    # after it on the same line (run 45287678343, pi-shell lib): the event still counts.
+    p = os.path.join(d, "glued.log")
+    with open(p, "w") as f:
+        f.write(json.dumps(s0) + "\n" + json.dumps(a_s) + "\n" + json.dumps(b_s) + "\nrunning 1 test\nTerminated\n"
+                "test shell::tests::process_control::kill_builtin_signals_only_the_shell_at_its_own_pid ... "
+                '{ "type": "test", "name": "a", "event": "ok", "exec_time": 0.013708871 }\nok\n'
+                + json.dumps({"type": "test", "event": "ok", "name": "b", "exec_time": 0.1}) + "\n"
+                + json.dumps({"type": "suite", "event": "ok", "passed": 2, "failed": 0}) + "\n")
+    r = parse_libtest(p, "0", 1, "set-runner", "x", "runner")
+    check("libtest event after a child's unfinished line", (r["status"], r["passed"]), ("PASS", 2))
 
     ju = os.path.join(d, "j.xml")
     with open(ju, "w") as f:
@@ -621,6 +1190,16 @@ def selftest():
                 'name="b" time="1"/></testsuite></testsuite></testsuite></testsuites>')
     r = parse_junit(jn, "100", 1, "b", "u", "r", (0,), (100,))
     check("JUnit nested suites count each case once", (r["passed"], r["failed"], r["failures"]), (1, 1, ["outer::a"]))
+    # nextest.sh's two passes: one report of both, and none when a pass left no report.
+    jm = os.path.join(d, "merged.xml")
+    r = parse_junit(jm, "100", 1, "b", "u", "r", (0,), (100,)) if junit_merge(jm, [ju, js]) == 4 else {}
+    check("JUnit merge of two passes", (r.get("failures"), r.get("ignored"), r.get("self_skipped")),
+          (["pi-builtins::t2"], 1, ["p::t1"]))
+    try:
+        junit_merge(jm, [ju, os.path.join(d, "no-pass2.xml")])
+    except OSError:
+        pass
+    check("JUnit merge with a missing pass writes nothing", os.path.exists(jm), False)
     blog = os.path.join(d, "b.log")
     with open(blog, "w") as f:
         f.write("(pass) x\n")
@@ -637,9 +1216,57 @@ def selftest():
     check("check:ts failed", parse_plain("2", 1, "checkts", "check:ts", blog)["status"], "FAIL")
     for line, want in (("t: not run: this process cannot give a file to uid 65534", True),
                        ("fifo-case: skipped: no FIFO", True), ("skipped: bare", True),
-                       ("cp --reflink=always: the host half is skipped: no reflink", False),
+                       ("cp --reflink=always: the host half is skipped: no reflink", True),
                        ("running 1 test", False), ("test result: ok. 1 passed", False)):
         check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line + "\n")), want)
+    # The tree's real skip lines at run time (run 45272140047 on 509a2d77): pi-iso cow.rs:928, whose
+    # case name holds ": ", and pi-shell zsh_mod_zftp.rs:352's give-up; and lines that are no marker.
+    cow = [f"/dev/shm: {n}, the clone into the emptied file{w} failing: skipped, this filesystem does not clone"
+           for n in ("3 bytes onto 5", "4101 bytes onto 8192") for w in ("", " and the clone back", " and both ways back")]
+    zftp = "no free /etc/services port: nothing to test"
+    for line in cow + [zftp, "a: b: c: d: e: f: g: h: skipped, eight prefixes"]:
+        check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line + "\n")), True)
+    for line in ("cp --reflink=always: the host half is skipped: names do not fold in /mnt/sc/tmp-root/.tmp5Dxs0i",
+                 "mv: the host half is skipped: names do not fold in /mnt/sc/tmp-runner/.tmpsbHh4I",
+                 "this system carries no TCP urgent data: the mark is not checked", "x: the rows are skipped"):
+        check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line + "\n")), True)
+    for line in ("the temporary directory: FICLONE says yes", "/dev/shm: FICLONE says Operation not supported (os error 95)",
+                 "a: b: c: d: e: f: g: h: i: skipped, nine prefixes", "x: the test passed, it skipped nothing",
+                 "x: the run was not skipped"):
+        check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line + "\n")), False)
+    # The partial-skip list: cow.rs's test passes as partial only with its witness and only those lines.
+    from xml.sax.saxutils import escape
+    pf = os.path.join(d, "partial.txt")
+    open(pf, "w").write("p::cow\t{case}: skipped, this filesystem does not clone\t^the temporary directory: FICLONE says yes$\ttmpfs rows\n"
+                        "cow\t{case}: skipped, this filesystem does not clone\t^the temporary directory: FICLONE says yes$\ttmpfs rows\n")
+    witness = "the temporary directory: FICLONE says yes\n/dev/shm: FICLONE says Operation not supported (os error 95)\n"
+    cow_err = witness + "\n".join(cow) + "\n"
+
+    def jx(name, err):
+        p = os.path.join(d, "cow.xml")
+        with open(p, "w") as f:
+            f.write(f'<testsuites><testsuite name="p"><testcase classname="p" name="{name}" time="1"><system-out>\n'
+                    f'running 1 test\n\n</system-out><system-err>{escape(err)}</system-err></testcase></testsuite></testsuites>')
+        r = parse_junit(p, "0", 1, "workspace", "u", "r", (0,), (100,), pf)
+        return r["status"], r["self_skipped"], r["partial"]
+
+    def lx(name, out):
+        p = os.path.join(d, "cow.log")
+        with open(p, "w") as f:
+            for e in (s0, {"type": "test", "event": "started", "name": name},
+                      {"type": "test", "event": "ok", "name": name, "exec_time": 0.1, "stdout": out}, end_ok):
+                f.write(json.dumps(e) + "\n")
+        r = parse_libtest(p, "0", 1, "set-runner", "u", "runner", pf)
+        return r["status"], r["self_skipped"], r["partial"]
+
+    check("JUnit: cow.rs's lines with the witness", jx("cow", cow_err), ("PASS", [], [["p::cow", 6, "tmpfs rows"]]))
+    check("JUnit: cow.rs's lines without the witness", jx("cow", "\n".join(cow) + "\n"), ("UNKNOWN", ["p::cow"], []))
+    check("JUnit: cow.rs's lines and one more skip line", jx("cow", cow_err + "skipped: no FIFO\n"), ("UNKNOWN", ["p::cow"], []))
+    check("JUnit: cow.rs's lines in a test the list does not name", jx("other", cow_err), ("UNKNOWN", ["p::other"], []))
+    check("JUnit: zftp's give-up", jx("zftp", zftp + "\n"), ("UNKNOWN", ["p::zftp"], []))
+    check("libtest: cow.rs's lines with the witness", lx("cow", cow_err), ("PASS", [], [["cow", 6, "tmpfs rows"]]))
+    check("libtest: cow.rs's lines without the witness", lx("cow", "\n".join(cow) + "\n"), ("UNKNOWN", ["cow"], []))
+    check("libtest: zftp's give-up", lx("zftp", zftp + "\n"), ("UNKNOWN", ["zftp"], []))
 
     check("assign is longest-first", assign(["a", "b", "c", "d"], {"a": 100, "b": 60, "c": 50, "d": 10}, 2),
           {"a": 1, "b": 2, "c": 2, "d": 1})
@@ -708,6 +1335,16 @@ def selftest():
     rc, out = summary()
     check("a self-skip as both users", ("| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, 1))
     json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
+    # A partial pass is a pass, listed with its reason.
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if (r["row"], r["unit"], r["who"]) == ("workspace", "part 1/2", "runner"):
+            os.remove(os.path.join(res, f))
+    json.dump(result("workspace", "part 1/2", "runner", "PASS", 0, 1, passed=1, tests=[("p::cow", 1.0)],
+                     partial=[("p::cow", 6, "tmpfs rows")]), open(os.path.join(res, "ws.json"), "w"))
+    rc, out = summary()
+    check("a partial pass in the summary", ("| workspace, nextest (not pi-shell, pi-builtins) | **PASS** |" in out,
+          "`part 1/2` (runner): `p::cow`: partial: 6 sub-cases skipped (tmpfs rows)" in out, rc), (True, True, 0))
     # The known-failure list: a failure it names reads KNOWN, one it does not is NEW, and an entry
     # whose test passed is listed for removal and fails the summary.
     json.dump(result("set-runner", "pi-shell::zle_pty", "runner", "FAIL", 101, 1, passed=1, failed=1,
@@ -722,6 +1359,20 @@ def selftest():
     open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
     rc, out = summary()
     check("a listed failure is KNOWN", ("FAILED `k`: KNOWN (the host's zsh)" in out, "| pi-shell set (runner) | **KNOWN** |" in out, rc), (True, True, 0))
+    # Known failures do not hide a self-skip: a unit whose failures are all known and in which a test
+    # skipped itself and passed as no other user is UNKNOWN (the zsh_zcompile probe on gVisor's root
+    # set); with the test passed as root it is KNOWN.
+    zle_runner = json.load(open(os.path.join(res, "zle-runner.json")))
+    json.dump(dict(zle_runner, self_skipped=["s"], tests=zle_runner["tests"] + [["s", 1.0]]),
+              open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("known failures and an open self-skip", ("| pi-shell set (runner) | **UNKNOWN** |" in out,
+          "every failure is known, but 1 test(s) skipped themselves here" in out, rc), (True, True, 1))
+    json.dump(result("set-root", "pi-shell::zle_pty", "root", "PASS", 0, 1, passed=1, tests=[("s", 1.0)]),
+              open(os.path.join(res, "silent.json"), "w"))
+    rc, out = summary()
+    check("known failures and a self-skip root covered", ("| pi-shell set (runner) | **KNOWN** |" in out, rc), (True, 0))
+    json.dump(zle_runner, open(os.path.join(res, "zle-runner.json"), "w"))
     open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tp\tfixed since\n")
     rc, out = summary()
     check("a listed test that passed is to be removed", ("`p`: passed (listed for: fixed since)" in out, rc), (True, 1))
@@ -740,7 +1391,336 @@ def selftest():
     rc, out = summary()
     check("a Rust job with no result", (f"| {RUST_JOBS[0][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, 1))
     del os.environ["SC_RUST_TESTS"]
+    # A flaky entry (its reason starts `flaky: `): its failure reads KNOWN only when the test passed in
+    # a retry of its whole unit in the same job (the unit's command again: the same binary or filter,
+    # threads and user), and NEW when no retry ran, every retry failed, or it passed only in a retry
+    # that did not run the whole unit (CiReview at 55a3d02c and at ee06226f: a race that fails at 4
+    # threads and passes alone read KNOWN). It is not listed for removal when its test passed, and is
+    # when its test is no longer in its unit.
+    def rt(outcome, ran=2, of=2, shape="the binary again, --test-threads=4", scope="whole-unit"):
+        return {"outcome": outcome, "ran": ran, "of": of, "shape": shape, "scope": scope}
+
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tflaky: a race\n"
+                                "set-runner\trunner\tpi-shell::zle_pty\tp\tflaky: a race\n")
+    rc, out = summary()
+    check("a flaky failure with no retry", ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of its unit ran)" in out, rc),
+          (True, 1))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("pass")]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure that passed on a retry of the whole unit",
+          ("FAILED `k`: KNOWN (flaky: a race; it passed on retry 2 of 2, a rerun of the unit: 2 of 2 tests, "
+           "the binary again, --test-threads=4)" in out, "`p`: passed" in out,
+           "| pi-shell set (runner) | **KNOWN** |" in out, rc), (True, False, True, 0))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("fail")]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure that failed every try",
+          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of its shape passed it: fail" in out,
+           "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("partial", 1, 2, "the test alone, 1 thread")]}),
+              open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure that passes alone and fails at the unit's threads",
+          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of its shape passed it: fail (a rerun of the unit: "
+           "2 of 2 tests, the binary again, --test-threads=4); partial (a rerun of the unit: 1 of 2 tests, the test alone, "
+           "1 thread))" in out,
+           "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
+    # Where each test has a process of its own (nextest, record_retry's scope own-process), a retry of
+    # the test alone is that process again, as nextest's own retries are, and its pass counts.
+    json.dump(dict(zle_runner, retries={"k": [rt("pass", 1, 2, "nextest's retry", "own-process")]}),
+              open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure that passed in its own process again",
+          ("FAILED `k`: KNOWN (flaky: a race; it passed on retry 1 of 1, in its own process again: 1 of 2 tests, "
+           "nextest's retry)" in out, rc), (True, 0))
+    json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("skip")]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure whose retry skipped itself", ("FAILED `k`: **NEW**" in out, rc), (True, 1))
+    json.dump(dict(zle_runner, retries={"k": [rt("pass")]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tgone\tflaky: a race\n")
+    rc, out = summary()
+    check("a flaky entry whose test left its unit is to be removed",
+          ("`gone`: no longer in its unit (listed for: flaky: a race)" in out, rc), (True, 1))
+    json.dump(zle_runner, open(os.path.join(res, "zle-runner.json"), "w"))
+    # The scripts' retries: flaky_failed names the failed tests with a flaky entry, and record_retry
+    # adds one retry of the whole unit: `pass` only when the retry ran every test the unit ran and the
+    # test passed; a pass in a smaller run (the test alone) is `partial`. An event after other text
+    # on its line counts.
+    rj, rl = os.path.join(d, "retry.json"), os.path.join(d, "retry.log")
+    json.dump(result("set-runner", "pi-shell::zle_pty", "runner", "FAIL", 101, 1, passed=1, failed=2, failures=["k", "q"],
+                     tests=[("a", 1.0), ("k", 1.0), ("q", 1.0)]), open(rj, "w"))
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tflaky: a race\n"
+                                "set-runner\trunner\tpi-shell::zle_pty\tq\tthe host\n")
+    check("flaky_failed", flaky_failed(rj, known_file), ["k"])
+
+    def ev(name, event, stdout=""):
+        return json.dumps({"type": "test", "event": event, "name": name, "stdout": stdout}) + "\n"
+
+    open(rl, "w").write(ev("a", "ok") + ev("k", "failed") + ev("q", "failed"))
+    o1 = record_retry(rj, "k", rl, "4 threads")
+    open(rl, "w").write(ev("k", "ok"))
+    o2 = record_retry(rj, "k", rl, "alone")
+    open(rl, "w").write(ev("a", "ok") + "test k ... " + ev("k", "ok") + ev("q", "failed"))
+    o3 = record_retry(rj, "k", rl, "4 threads")
+    check("record_retry of the whole unit and of the test alone", (o1, o2, o3, json.load(open(rj))["retries"]["k"]),
+          ("fail", "partial", "pass", [{"outcome": "fail", "ran": 3, "of": 3, "shape": "4 threads", "scope": "whole-unit"},
+                                       {"outcome": "partial", "ran": 1, "of": 3, "shape": "alone", "scope": "whole-unit"},
+                                       {"outcome": "pass", "ran": 3, "of": 3, "shape": "4 threads", "scope": "whole-unit"}]))
+    # nextest's and bun's retries are JUnit reports of the whole unit.
+    jb = os.path.join(d, "bun-retry.xml")
+    open(jb, "w").write('<testsuites><testsuite name="test/x.test.ts"><testsuite name="PDF pages"><testcase '
+                        'name="paints (each) page." classname="PDF pages" file="test/x.test.ts"/></testsuite></testsuite></testsuites>')
+    rjb = os.path.join(d, "retry-bun.json")
+    json.dump(result("ts-ca", "shard 1/10", "runner", "FAIL", 1, 1, failed=1, failures=["PDF pages::paints (each) page."],
+                     tests=[("PDF pages::paints (each) page.", 1.0)]), open(rjb, "w"))
+    rjn = os.path.join(d, "retry-nextest.json")
+    json.dump(result("builtins", "pi-builtins", "runner", "FAIL", 100, 1, passed=1, failed=1, failures=["pi-builtins::t2"],
+                     tests=[("pi-builtins::t1", 1.0), ("pi-builtins::t2", 1.0)]), open(rjn, "w"))
+    check("record_retry from a JUnit report", (record_retry(rjb, "PDF pages::paints (each) page.", jb, "the shard"),
+          record_retry(rjn, "pi-builtins::t2", ju, "the unit"), record_retry(rjn, "absent", jb, "the unit")),
+          ("pass", "fail", "fail"))
+    jo = os.path.join(d, "own-retry.xml")
+    open(jo, "w").write('<testsuites><testsuite name="pi-builtins"><testcase classname="pi-builtins" name="t2" time="1"/>'
+                        '</testsuite></testsuites>')
+    check("record_retry of a nextest test alone: partial for a whole-unit scope, pass in its own process",
+          (record_retry(rjn, "pi-builtins::t2", jo, "alone"), record_retry(rjn, "pi-builtins::t2", jo, "alone", "own-process")),
+          ("partial", "pass"))
+    # A retry that passed after a skip marker checked nothing: `skip`, from a libtest log and from a
+    # JUnit report.
+    open(rl, "w").write(ev("a", "ok") + ev("k", "ok", "skipped: no zsh here\n") + ev("q", "failed"))
+    jsk = os.path.join(d, "skip-retry.xml")
+    open(jsk, "w").write('<testsuites><testsuite name="p"><testcase classname="p" name="t" time="1"><system-err>'
+                         'p: the host half is skipped: names do not fold\n</system-err></testcase></testsuite></testsuites>')
+    check("record_retry of a retry that skipped itself", (record_retry(rj, "k", rl, "4 threads"),
+          record_retry(rj, "p::t", jsk, "the unit")), ("skip", "skip"))
+    # Known self-skips (`skips: `, a sixth field: the skip line's start): a self-skip reads KNOWN only
+    # when each of its lines starts as an entry of its row and user says; one user's entry never
+    # covers the other user.
+    def bx(who, skipped, lines):
+        return dict(result("builtins", "pi-builtins", who, "UNKNOWN", 0, 1, passed=1,
+                           tests=[("a", 1.0)] + [(s, 1.0) for s in skipped], self_skipped=skipped,
+                           skip_lines={s: lines for s in skipped}), skip_only=True)
+
+    json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root"]), open(os.path.join(res, "b-runner.json"), "w"))
+    json.dump(bx("root", ["c"], ["c --reflink a b: skipped, this filesystem does not clone (x)"]),
+              open(os.path.join(res, "b-root.json"), "w"))
+    zle_k = "set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n"
+    need_root = "builtins\trunner\tpi-builtins\tc\tskips: it needs root\tc {} a b: skipped, it needs root\n"
+    no_clone = "builtins\troot\tpi-builtins\tc\tskips: no clone here\tc --reflink a b: skipped, this filesystem does not clone\n"
+    open(known_file, "w").write(zle_k + need_root)
+    rc, out = summary()
+    check("a known skip for one user only", ("SKIPPED ITSELF `c`: KNOWN (it needs root)" in out,
+          "| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, True, 1))
+    open(known_file, "a").write(no_clone)
+    rc, out = summary()
+    check("a known skip for each user", ("| pi-builtins, nextest default profile | **KNOWN** |" in out, rc), (True, 0))
+    open(known_file, "w").write(zle_k + need_root.replace("builtins\trunner", "builtins\troot") + no_clone)
+    rc, out = summary()
+    check("a known skip listed for the other user", ("`pi-builtins` (runner): UNKNOWN: 1 test(s) skipped themselves" in out, rc),
+          (True, 1))
+    open(known_file, "w").write(zle_k + need_root.replace("builtins", "workspace", 1) + no_clone)
+    rc, out = summary()
+    check("a known skip listed for another row", ("`pi-builtins` (runner): UNKNOWN: 1 test(s) skipped themselves" in out, rc),
+          (True, 1))
+    open(known_file, "w").write(zle_k + need_root + no_clone)
+    json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root", "c -p a b: skipped, no FIFO"]),
+              open(os.path.join(res, "b-runner.json"), "w"))
+    rc, out = summary()
+    check("a self-skip with one line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 1))
+    # Every skip line counts: twenty lines an entry names and a twenty-first it does not is UNKNOWN
+    # (CiReview at 15d6f1a9: only the first 20 lines were kept, so the 21st was never matched).
+    json.dump(bx("runner", ["c"], [f"c -p a b: skipped, it needs root ({i})" for i in range(20)] + ["c -p a b: skipped, no FIFO"]),
+              open(os.path.join(res, "b-runner.json"), "w"))
+    rc, out = summary()
+    check("a self-skip whose 21st line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 1))
+    json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root"]), open(os.path.join(res, "b-runner.json"), "w"))
+    open(known_file, "a").write("builtins\trunner\tpi-builtins\ta\tskips: stale\ta: skipped\n")
+    rc, out = summary()
+    check("a known skip whose test ran without skipping itself is to be removed",
+          ("`a`: ran without skipping itself (listed: skips `a: skipped`: stale)" in out, rc), (True, 1))
+    json.dump(nx("runner", ["c"], ["a"]), open(os.path.join(res, "b-runner.json"), "w"))
+    json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
+    # nextest's own retries, in its JUnit report as nexte.st documents it (docs/machine-readable/junit,
+    # the fixture-project example): a test that failed and then passed has <flakyFailure> children
+    # and reads FLAKY, a failure with its retries for the `flaky: ` rule; a test that failed every
+    # attempt keeps <failure> with <rerunFailure> children; nextest exits 0 when only flaky tests
+    # failed first.
+    def attempt(tag, msg):
+        return (f'<{tag} timestamp="2024-01-09T07:50:12.665+00:00" time="0.004" type="test failure">{msg}\n'
+                'note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n'
+                '<system-out>\nrunning 1 test\ntest x ... FAILED\n</system-out><system-err>panicked</system-err>'
+                f'</{tag}>')
+
+    cwd = '<testcase name="test_cwd" classname="fixture-project::basic" time="0.004"></testcase>'
+    fail_assert = ('<testcase name="test_failure_assert" classname="fixture-project::basic" time="0.004">'
+                   '<failure type="test failure">thread &apos;test_failure_assert&apos; panicked at tests/basic.rs:19:5:\n'
+                   'assertion `left == right` failed: this is an assertion</failure>'
+                   + attempt("rerunFailure", "thread &apos;test_failure_assert&apos; panicked at tests/basic.rs:19:5:")
+                   + attempt("rerunFailure", "thread &apos;test_failure_assert&apos; panicked at tests/basic.rs:19:5:")
+                   + '<system-out>\nrunning 1 test\n</system-out></testcase>')
+    flaky_mod_4 = ('<testcase name="test_flaky_mod_4" classname="fixture-project::basic" time="0.004">'
+                   + "".join(attempt("flakyFailure", f"thread &apos;test_flaky_mod_4&apos; panicked at tests/basic.rs:43:9:\n"
+                                                     f"Failed because attempt {i} % 4 != 0") for i in (1, 2, 3))
+                   + '</testcase>')
+    nj = os.path.join(d, "nextest-retries.xml")
+
+    def nextest(cases, code):
+        with open(nj, "w") as f:
+            f.write('<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="nextest-run" tests="3" failures="1" errors="0">'
+                    f'<testsuite name="fixture-project::basic" tests="3" disabled="0" errors="0" failures="1">{cases}'
+                    '</testsuite></testsuites>')
+        return parse_junit(nj, str(code), 1, "builtins", "pi-builtins", "runner", (0,), (100,))
+
+    fm4, fa = "fixture-project::basic::test_flaky_mod_4", "fixture-project::basic::test_failure_assert"
+    r = nextest(cwd + flaky_mod_4, 0)
+    check("nextest: exit 0 with a flaky test", (r["status"], r["passed"], r["failures"], [t["outcome"] for t in r["retries"][fm4]],
+                                                r["retries"][fm4][0]["first_failure"]),
+          ("FAIL", 1, [fm4], ["fail", "fail", "pass"],
+           "thread 'test_flaky_mod_4' panicked at tests/basic.rs:43:9: Failed because attempt 1 % 4 != 0"))
+    json.dump(r, open(os.path.join(res, "b-runner.json"), "w"))
+    open(known_file, "w").write(zle_k + f"builtins\trunner\tpi-builtins\t{fm4}\tflaky: attempt % 4\n")
+    rc, out = summary()
+    check("nextest: a listed flaky test that passed on its own retry", (
+        f"FAILED `{fm4}`: KNOWN (flaky: attempt % 4; it passed on retry 3 of 3, in its own process again: 1 of 2 tests, "
+        "nextest's own retry 3 of 3; first failure: thread 'test_flaky_mod_4' panicked" in out,
+        "| pi-builtins, nextest default profile | **KNOWN** |" in out, rc), (True, True, 0))
+    open(known_file, "w").write(zle_k)
+    rc, out = summary()
+    check("nextest: an unlisted flaky test", (
+        f"FAILED `{fm4}`: **NEW** (flaky, and not on the known-failure list: it passed on retry 3 of 3" in out,
+        "| pi-builtins, nextest default profile | **FAIL** |" in out, rc), (True, True, 1))
+    r = nextest(cwd + fail_assert + flaky_mod_4, 100)
+    check("nextest: a test that failed every retry", (r["status"], r["failures"], [t["outcome"] for t in r["retries"].get(fa, [])]),
+          ("FAIL", [fa, fm4], ["fail", "fail"]))
+    check("nextest: a test that failed every retry, with exit 0", nextest(cwd + fail_assert, 0)["status"], "UNKNOWN")
+    json.dump(r, open(os.path.join(res, "b-runner.json"), "w"))
+    open(known_file, "w").write(zle_k + f"builtins\trunner\tpi-builtins\t{fm4}\tflaky: attempt % 4\n"
+                                f"builtins\trunner\tpi-builtins\t{fa}\tflaky: an assertion\n")
+    rc, out = summary()
+    check("nextest: a listed flaky test that failed every retry", (
+        f"FAILED `{fa}`: **NEW** (listed as `flaky: an assertion`, but no retry of its shape passed it: fail (in its own "
+        "process again: 1 of 3 tests, nextest's own retry 1 of 2); fail" in out,
+        "| pi-builtins, nextest default profile | **FAIL** |" in out, rc), (True, True, 1))
+    # The last attempt of a flaky case is its own output: one that printed a skip marker checked
+    # nothing, so it is `skip` (passed_attempt, as for record_retry) and the listed test reads NEW
+    # (CiReview at 075957a9: it read KNOWN).
+    flaky_skip = flaky_mod_4.replace("</testcase>", "<system-out>skipped: no zsh here\n</system-out></testcase>")
+    r = nextest(cwd + flaky_skip, 0)
+    check("nextest: a flaky test whose passing attempt printed a skip line", [t["outcome"] for t in r["retries"][fm4]],
+          ["fail", "fail", "skip"])
+    json.dump(r, open(os.path.join(res, "b-runner.json"), "w"))
+    open(known_file, "w").write(zle_k + f"builtins\trunner\tpi-builtins\t{fm4}\tflaky: attempt % 4\n")
+    rc, out = summary()
+    check("nextest: a listed flaky test whose passing attempt skipped", (
+        f"FAILED `{fm4}`: **NEW** (listed as `flaky: attempt % 4`, but no retry of its shape passed it" in out,
+        "| pi-builtins, nextest default profile | **FAIL** |" in out, rc), (True, True, 1))
+    # A case with nextest's retry elements and no record of them is UNKNOWN by name (the reading of the
+    # elements planted broken: no outcome for any retry).
+    g = globals()
+    kept = g["nextest_attempts"]
+    g["nextest_attempts"] = lambda flaky, rerun, out: []
+    try:
+        r = nextest(cwd + fail_assert + flaky_mod_4, 100)
+    finally:
+        g["nextest_attempts"] = kept
+    check("nextest: a case with retry elements and no record", (r["status"], r["note"]),
+          ("UNKNOWN", f"a flaky case has no recorded retry: {fa}, {fm4}"))
     open(known_file, "w").write("# none\n")
+    json.dump(nx("runner", ["c"], ["a"]), open(os.path.join(res, "b-runner.json"), "w"))
+    # A `*` entry names its test in any unit of its row (a coding-agent shard moves when a file is added).
+    for f in os.listdir(res):
+        r = json.load(open(os.path.join(res, f)))
+        if (r["row"], r["unit"]) == ("ts-ca", "shard 3/10"):
+            os.remove(os.path.join(res, f))
+    json.dump(result("ts-ca", "shard 3/10", "runner", "FAIL", 1, 1, passed=1, failed=1, failures=["w"],
+                     tests=[("w", 1.0), ("t", 1.0)]), open(os.path.join(res, "ca3.json"), "w"))
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n"
+                                "ts-ca\trunner\t*\tw\tno WebMCP\n")
+    rc, out = summary()
+    check("a * entry names its test in any shard", ("FAILED `w`: KNOWN (no WebMCP)" in out,
+          "| coding-agent --isolate | **KNOWN** |" in out, rc), (True, True, 0))
+    open(known_file, "a").write("ts-ca\trunner\t*\tgone\tno WebMCP\nts-ca\trunner\t*\tt\tno WebMCP\n")
+    rc, out = summary()
+    check("a * entry whose test passed or is in no shard is to be removed",
+          ("`gone`: no longer in its row (listed for: no WebMCP)" in out, "`t`: passed (listed for: no WebMCP)" in out, rc),
+          (True, True, 1))
+    # `*` only on the rows whose units are shards: on the set rows a test's name is unique only in
+    # its binary (CiReview at 55a3d02c).
+    open(known_file, "w").write("set-runner\trunner\t*\tk\tthe host's zsh\n")
+    try:
+        read_known(known_file)
+        refused = False
+    except SystemExit:
+        refused = True
+    check("a * entry on a set row is refused", refused, True)
+    json.dump(result("ts-ca", "shard 3/10", "runner", "PASS", 0, 1, passed=1, tests=[("t", 1.0)]),
+              open(os.path.join(res, "ca3.json"), "w"))
+    open(known_file, "w").write("# none\n")
+    # skip-forms: a literal that says it skips is read by SKIP_MARKER or named as not a marker; a new
+    # form fails the check until one of the two is true.
+    tree = os.path.join(d, "tree")
+    os.makedirs(os.path.join(tree, "crates", "c", "src"))
+    src = os.path.join(tree, "crates", "c", "src", "lib.rs")
+    exf = os.path.join(d, "exc.txt")
+    open(src, "w").write('// skipped: a comment is no print\nfn t(case: &str) {\n'
+                         '    eprintln!("{case}: skipped, it needs root");\n    eprintln!("CHILD skipped: {}", 1);\n'
+                         '    eprintln!("NOT-RUN {case}: this kernel runs a program held open for writing");\n'
+                         '    let c = \'"\';\n    eprintln!(r#"skipped mode 0200: "raw" ok"#);\n'
+                         '    eprintln!("{case}: the host half is skipped: names do not fold");\n}\n')
+    pfs = os.path.join(d, "partial-forms.txt")
+    open(pfs, "w").write("c::t\t{case}: skipped, it needs root\tw\tr\n")
+    open(os.path.join(tree, "crates", "c", "src", "more.rs"), "w").write(
+        'fn m(case: &str) {\n    eprintln!("{case}: skipped, this filesystem does not clone");\n'
+        '    eprintln!("no free /etc/services port: nothing to test");\n'
+        '    eprintln!("this system carries no TCP urgent data: the mark is not checked");\n'
+        '    eprintln!("{case}: it skipped nothing");\n}\n')
+    open(exf, "w").write("crates/c/src/more.rs\tx: it skipped nothing\tsays nothing was skipped\n")
+    check("skip-forms on known forms", skip_forms(tree, exf, pfs), ([], [], 2))
+    # skip-lines, the run-time half, on a results directory: cow.rs's lines are read, the named partial
+    # check is not a marker, and a failed test's lines are not read at all.
+    rt = os.path.join(d, "rt")
+    os.makedirs(os.path.join(rt, "sc-res-w", "logs"))
+    check("skip-lines with no report", cmd_skip_lines(rt, exf)["status"], "UNKNOWN")
+    with open(os.path.join(rt, "sc-res-w", "logs", "w.junit.xml"), "w") as f:
+        f.write('<testsuites><testsuite name="p"><testcase classname="p" name="cow" time="1"><system-err>'
+                + escape(cow_err + zftp + "\ncp: the host half is skipped: names do not fold in /tmp/.tmpX\n"
+                         + "case: it skipped nothing\n")
+                + '</system-err></testcase><testcase classname="p" name="f" time="1"><failure/><system-err>'
+                'a failed test, skipping in a new way\n</system-err></testcase></testsuite></testsuites>')
+    check("skip-lines on read and named lines", cmd_skip_lines(rt, exf)["status"], "PASS")
+    # Controls: b523cbf8's rule read one `<prefix>: ` and no `nothing to test`; with it both halves
+    # report cow.rs's form and the zftp give-up.
+    g = globals()
+    kept = g["SKIP_MARKER"]
+    g["SKIP_MARKER"] = re.compile(r"^\s*(?:[^\n:]{1,200}:\s+|[A-Z][A-Z0-9_-]*\s+)?(?:skipped\b|skipping\b|SKIP\b|"
+                                  r"not run\b|NOT-RUN\b|UNKNOWN:)|UNCOMPARED|nothing was checked|the test saw nothing", re.M)
+    try:
+        unread = skip_forms(tree, exf, pfs)[0]
+        lines = cmd_skip_lines(rt, exf)["failures"]
+    finally:
+        g["SKIP_MARKER"] = kept
+    check("skip-forms with the one-prefix rule", [u for u in unread if "more.rs" in u],
+          ["crates/c/src/more.rs:2: 'x: y, z: skipped, this filesystem does not clone'",
+           "crates/c/src/more.rs:3: 'no free /etc/services port: nothing to test'",
+           "crates/c/src/more.rs:4: 'this system carries no TCP urgent data: the mark is not checked'"])
+    check("skip-lines with the one-prefix rule", (len(lines), sum(zftp in l for l in lines),
+          sum("host half" in l for l in lines)), (8, 1, 1))
+    open(src, "a").write('fn u() { eprintln!("no check here, skipping quietly"); }\n')
+    unread = skip_forms(tree, exf, pfs)[0]
+    check("skip-forms catches a planted new form", unread, ["crates/c/src/lib.rs:10: 'no check here, skipping quietly'"])
+    with open(os.path.join(rt, "sc-res-w", "logs", "set.log"), "w") as f:
+        f.write(json.dumps({"type": "test", "event": "ok", "name": "q", "stdout": "no clone here, skipping quietly\n"}) + "\n")
+    r = cmd_skip_lines(rt, exf)
+    check("skip-lines catches a planted line", (r["status"], r["failures"]),
+          ("FAIL", ["a skip line the summary does not read: 'no clone here, skipping quietly', printed 1 time(s), "
+                    "first by sc-res-w/logs/set.log q"]))
+    open(exf, "a").write("crates/c/src/lib.rs\tgone\tstale\n")
+    check("skip-forms names a stale exception", skip_forms(tree, exf, pfs)[1], ["crates/c/src/lib.rs: 'gone'"])
+    open(pfs, "a").write("c::t\t{case}: gone too\tw\tr\n")
+    check("skip-forms names a stale partial-skip entry", skip_forms(tree, exf, pfs)[1],
+          ["crates/c/src/lib.rs: 'gone'", "partial-skips.txt, c::t: '{case}: gone too'"])
+    for line in ("x: skipped, this filesystem does not clone", "CHILD skipped: uid 1000", "skipped mode 0200: root",
+                 "NOT-RUN t: this kernel", "SKIP: running as root", "skipping reftable coverage: x"):
+        check(f"skip marker in {line!r}", bool(SKIP_MARKER.search(line)), True)
     # No binary list: the set rows are UNKNOWN, not empty passes.
     os.remove(os.path.join(build, "binaries-metadata.json"))
     rc, out = summary()
@@ -750,9 +1730,10 @@ def selftest():
         for f in fails:
             print(f"SELFTEST FAIL {f}")
         sys.exit(1)
-    print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest and bun counters, the shard "
-          "assignment and per-user weights, the summary's UNKNOWN for a unit no job or two jobs reported, "
-          "and the Rust tests' rows from their jobs' conclusions")
+    print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest and bun counters, the tree's real "
+          "skip lines and partial passes, the shard assignment and per-user weights, the summary's UNKNOWN for a "
+          "unit no job or two jobs reported, the known and flaky entries, skip-forms and skip-lines with "
+          "their controls, and the Rust tests' rows from their jobs' conclusions")
 
 
 def main(argv):
@@ -776,6 +1757,17 @@ def main(argv):
         print(json.dumps(parse_plain(*a)))
     elif c == "summary":
         sys.exit(cmd_summary(*a))
+    elif c == "skip-forms":
+        print(json.dumps(cmd_skip_forms(*a)))
+    elif c == "skip-lines":
+        print(json.dumps(cmd_skip_lines(*a)))
+    elif c == "flaky-failed":
+        for f in flaky_failed(*a):
+            print(f)
+    elif c == "retried":
+        print(record_retry(*a))
+    elif c == "junit-merge":
+        print(f"{junit_merge(a[0], a[1:])} test cases in {a[0]}")
     elif c == "selftest":
         selftest()
     else:
