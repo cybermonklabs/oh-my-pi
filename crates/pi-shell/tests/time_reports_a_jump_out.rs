@@ -369,6 +369,12 @@ fn a_report_goes_through_the_redirections_at_the_jump() {
 			0,
 		),
 		(
+			"exit's own redirection in eval",
+			"( time eval 'exit 3 2>err' ); echo w=$?; echo err:; cat err",
+			"report\nw=3\nerr:\n",
+			0,
+		),
+		(
 			"exit through eval, the group's",
 			"( time { eval '{ exit 3; } 2>/dev/null'; } 2>err ); echo w=$?; echo err:; cat err",
 			"w=3\nerr:\nreport\n",
@@ -415,6 +421,118 @@ fn a_report_goes_through_the_redirections_at_the_jump() {
 		("", 127),
 		("", 1),
 	)]);
+}
+
+/// While a function runs (also one called inside the `eval`), bash's
+/// `parse_and_execute` keeps the redirections inside an `eval` or `.` for
+/// two jumps: `set -e`'s exit at the innermost `eval` or `.` (the levels
+/// outside it undo theirs), and `exit` at every level when an EXIT trap is
+/// set. The report and the EXIT trap go through them, as with no `time`.
+/// Every other case undoes them first.
+#[test]
+fn in_a_function_errexit_and_exit_keep_the_redirections_of_eval() {
+	assert_rows(&[
+		(
+			"set -e",
+			"( set -e; f() { time eval '{ false; } 2>/dev/null'; }; f ); echo w=$?",
+			"w=1\n",
+			0,
+		),
+		(
+			"set -e, .",
+			"printf '{ false; } 2>/dev/null\\n' > g; ( set -e; f() { time . ./g; }; f ); echo w=$?",
+			"w=1\n",
+			0,
+		),
+		(
+			"set -e, a function called in eval",
+			"( set -e; time eval 'f() { { false; } 2>/dev/null; }; f' ); echo w=$?",
+			"w=1\n",
+			0,
+		),
+		(
+			"set -e, EXIT trap",
+			"( set -e; trap 'echo T >&2' EXIT; f() { time eval '{ false; } 2>/dev/null'; }; f ); \
+			 echo w=$?",
+			"w=1\n",
+			0,
+		),
+		(
+			"set -e, ERR trap",
+			"( set -e; trap 'echo E >&2' ERR; f() { time eval '{ false; } 2>/dev/null'; }; f ); echo \
+			 w=$?",
+			"w=1\n",
+			0,
+		),
+		(
+			"set -e, into a file",
+			"( set -e; f() { time eval '{ false; } 2>err'; }; f ); echo w=$?; echo err:; cat err",
+			"w=1\nerr:\nreport\n",
+			0,
+		),
+		(
+			"set -e, the outer eval undoes its own",
+			"( set -e; f() { time eval '{ eval false; } 2>/dev/null'; }; f ); echo w=$?",
+			"report\nw=1\n",
+			0,
+		),
+		(
+			"set -e, the inner eval keeps",
+			"( set -e; f() { time eval 'eval \"{ false; } 2>/dev/null\"'; }; f ); echo w=$?",
+			"w=1\n",
+			0,
+		),
+		(
+			"exit, EXIT trap",
+			"( trap 'echo T >&2' EXIT; f() { time eval '{ exit 3; } 2>/dev/null'; }; f ); echo w=$?",
+			"w=3\n",
+			0,
+		),
+		(
+			"exit, EXIT trap, nested eval",
+			"( trap 'echo T >&2' EXIT; f() { time eval '{ eval \"exit 3\"; } 2>/dev/null'; }; f ); \
+			 echo w=$?",
+			"w=3\n",
+			0,
+		),
+		(
+			"exit, ignored EXIT trap",
+			"( trap '' EXIT; f() { time eval '{ exit 3; } 2>/dev/null'; }; f ); echo w=$?",
+			"w=3\n",
+			0,
+		),
+		(
+			"exit, EXIT trap reset",
+			"( trap 'echo T >&2' EXIT; trap - EXIT; f() { time eval '{ exit 3; } 2>/dev/null'; }; f \
+			 ); echo w=$?",
+			"report\nw=3\n",
+			0,
+		),
+		(
+			"exit, no EXIT trap",
+			"( f() { time eval '{ exit 3; } 2>/dev/null'; }; f ); echo w=$?",
+			"report\nw=3\n",
+			0,
+		),
+		(
+			"exit, no function",
+			"( trap 'echo T >&2' EXIT; time eval '{ exit 3; } 2>/dev/null' ); echo w=$?",
+			"report\nT\nw=3\n",
+			0,
+		),
+		(
+			"set -e, no time",
+			"( set -e; trap 'echo T >&2' EXIT; f() { eval '{ false; } 2>/dev/null'; }; f ); echo w=$?",
+			"w=1\n",
+			0,
+		),
+		(
+			"exit, no time",
+			"( trap 'echo T >&2' EXIT; f() { eval '{ exit 3; } 2>/dev/null'; }; f ); echo w=$?",
+			"w=3\n",
+			0,
+		),
+	]);
 }
 
 /// In a script's own commands (outside every `eval`, `.`, trap action and
@@ -854,7 +972,10 @@ fn an_error_in_a_subscripts_text_reports_the_times() {
 /// Each report pairs a `time` with its own start and its own format, in
 /// the order the `time`s end: the innermost first, a `time -p` in the
 /// POSIX format whatever `time` comes later in its command, and a `break`
-/// leaves the `time`s around its loop to their own end.
+/// leaves the `time`s around its loop to their own end. A `break` or
+/// `continue` ends each `time` it leaves the same way: `time -p` in the
+/// POSIX format, and a `time` that starts after it neither reports nor
+/// takes another's place.
 #[test]
 fn each_report_has_its_own_start_and_format() {
 	assert_rows(&[
@@ -886,6 +1007,54 @@ fn each_report_has_its_own_start_and_format() {
 			"continue in a timed loop",
 			"time { for i in 1 2; do continue; done; echo after; }",
 			"after\nreport\n",
+			0,
+		),
+		(
+			"break, time -p",
+			"for i in 1 2; do time -p { echo $i; break; }; done; echo after",
+			"1\nreal 0.00\nuser 0.00\nsys 0.00\nafter\n",
+			0,
+		),
+		(
+			"continue, time -p",
+			"for i in 1 2; do time -p { echo $i; continue; }; done; echo after",
+			"1\nreal 0.00\nuser 0.00\nsys 0.00\n2\nreal 0.00\nuser 0.00\nsys 0.00\nafter\n",
+			0,
+		),
+		(
+			"break, nested time -p",
+			"for i in 1; do time { time -p { break; }; }; done; echo after",
+			"real 0.00\nuser 0.00\nsys 0.00\nreport\nafter\n",
+			0,
+		),
+		(
+			"continue, nested time -p",
+			"for i in 1; do time { time -p { continue; }; }; done; echo after",
+			"real 0.00\nuser 0.00\nsys 0.00\nreport\nafter\n",
+			0,
+		),
+		(
+			"break, a later time",
+			"for i in 1; do time -p { break; time true; }; done; echo after",
+			"real 0.00\nuser 0.00\nsys 0.00\nafter\n",
+			0,
+		),
+		(
+			"continue, a later time -p",
+			"for i in 1; do time { continue; time -p true; }; done; echo after",
+			"report\nafter\n",
+			0,
+		),
+		(
+			"break, two later times",
+			"for i in 1; do time { break; time -p true; time true; }; done; echo after",
+			"report\nafter\n",
+			0,
+		),
+		(
+			"break in eval, a later time",
+			"for i in 1; do eval 'time -p { break; time true; }'; done; echo after",
+			"real 0.00\nuser 0.00\nsys 0.00\nafter\n",
 			0,
 		),
 	]);

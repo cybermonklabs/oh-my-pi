@@ -428,7 +428,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			Flow::Break { n, cont } => break_loops(k, vp, cx, n, cont, op),
 			Flow::Exit(status) if unit.mode.dialect() == Dialect::Zsh => zsh_exit(k, vp, cx, status),
 			Flow::Exit(status) => {
-				report_jump(k, vp, cx, 0);
+				report_jump(k, vp, cx, 0, Jump::Other);
 				exit_shell(k, vp, cx, status);
 			},
 			Flow::Discard(status) if unit.mode.dialect() == Dialect::Zsh => {
@@ -440,7 +440,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				// a trap action) catches the jump: the innermost script goes
 				// on with its next command.
 				if let Some(i) = script_frame(vp) {
-					report_jump(k, vp, cx, i);
+					report_jump(k, vp, cx, i, Jump::Other);
 					unwind(&mut k.root, cx.store, vp, i + 1);
 					clear_scratch(&mut k.root, cx.store, vp);
 					truncate(vp, Depths::default());
@@ -448,7 +448,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 					f.unit = None;
 					f.loops.clear();
 				} else {
-					report_jump(k, vp, cx, 0);
+					report_jump(k, vp, cx, 0, Jump::Other);
 					unwind(&mut k.root, cx.store, vp, 0);
 				}
 			},
@@ -470,7 +470,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			}
 		} else if errexit {
 			let status = vp.status;
-			report_jump(k, vp, cx, 0);
+			report_jump(k, vp, cx, 0, Jump::Errexit);
 			exit_shell(k, vp, cx, status);
 		} else if errreturn_failed && unit.mode.dialect() == Dialect::Zsh && zsh_errreturn(k, cx, vp)
 		{
@@ -1133,7 +1133,7 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 		{
 			// `set -e` after the ERR trap: bash's errexit jump comes once
 			// the trap ran, and `time_command` reports it.
-			report_jump(k, vp, cx, 0);
+			report_jump(k, vp, cx, 0, Jump::Errexit);
 			exit_shell(k, vp, cx, status);
 		} else if func_trap && trap_status != 0 && vp.mode.dialect() == Dialect::Zsh {
 			// zsh `dotrapargs`: a function trap returning non-zero forces
@@ -3448,6 +3448,20 @@ fn bash_time_report(
 	}
 }
 
+/// A jump out of the commands that run, as bash's `parse_and_execute` (an
+/// `eval`, `.` or trap action) catches and passes it on: it decides whether
+/// that level undoes its commands' redirections first ([`kept_redirections`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Jump {
+	/// The `exit` (or `logout`) builtin: bash's `EXITBLTIN`.
+	Exit,
+	/// `set -e`'s exit, also after the ERR trap: bash's `ERREXIT`.
+	Errexit,
+	/// Any other: a fatal error and a discarded command (`FORCE_EOF`,
+	/// `EXITPROG`, `DISCARD`).
+	Other,
+}
+
 /// bash's `time_command` catches a jump out of the timed command (`exit`,
 /// `set -e`, a fatal expansion error, a discarded command): it reports the
 /// times, then jumps on (`break` and `continue` are no jumps:
@@ -3457,12 +3471,14 @@ fn bash_time_report(
 /// ([`jump_out`]). Report, innermost first, the `time` marks of frames
 /// `frame` and up, and drop them. A jump that passes an `eval`, `.` or
 /// trap action (a `parse_and_execute`, which undoes its commands'
-/// redirections as it passes the jump on) reports the marks below it
-/// through the redirections in effect outside it.
-fn report_left_times(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, frame: usize) {
+/// redirections as it passes the jump on, except those
+/// [`kept_redirections`] leaves) reports the marks below it through the
+/// redirections in effect outside it.
+fn report_left_times(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, frame: usize, jump: Jump) {
 	if vp.frames.iter().skip(frame).all(|f| f.times.is_empty()) {
 		return;
 	}
+	let kept = kept_redirections(k, vp, cx, frame, jump);
 	let end = time_mark(&*cx.host);
 	let line = vp
 		.frames
@@ -3478,11 +3494,57 @@ fn report_left_times(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, frame: usi
 			bash_time_report(k, vp, cx, dash_p, false, elapsed(start, end), line);
 		}
 		if i > frame
+			&& i < kept
 			&& parse_and_execute(&vp.frames[i])
 			&& vp.frames[frame..i].iter().any(|f| !f.times.is_empty())
 		{
-			undo_redirections(k, vp, i);
+			undo_redirections(k, vp, i, kept);
 		}
+	}
+}
+
+/// The first frame whose redirections a jump out of frames `frame` and up
+/// leaves in effect (past the last frame when it leaves none). bash's
+/// `parse_and_execute` runs its `pe_dispose` unwind frame, which undoes the
+/// redirections of the commands it ran, for every jump but two while a
+/// function runs (`variable_context`, also one called inside it): for
+/// `exit` when an EXIT trap is set it discards that frame at every level,
+/// so the reports and the trap go through them; for `set -e` it discards it
+/// at the innermost level only, which also leaves every function context
+/// (`reset_local_contexts`), so the levels outside that one undo theirs.
+fn kept_redirections(
+	k: &mut Kernel,
+	vp: &Vproc,
+	cx: &mut Cx<'_>,
+	frame: usize,
+	jump: Jump,
+) -> usize {
+	let none = vp.frames.len();
+	match jump {
+		Jump::Other => none,
+		Jump::Exit if in_function_scope(k, cx, vp) && exit_trapped(k, cx, vp) => frame,
+		Jump::Errexit if in_function_scope(k, cx, vp) => vp
+			.frames
+			.iter()
+			.rposition(parse_and_execute)
+			.unwrap_or(none),
+		Jump::Exit | Jump::Errexit => none,
+	}
+}
+
+/// Whether `vp` has an EXIT trap set (bash's `signal_is_trapped (0)`), also
+/// one that ignores (`trap '' EXIT`); a subshell lists its parent's but has
+/// none of its own ([`start_trap`]).
+fn exit_trapped(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	if vp.parent.is_some() && !vp.own_traps.has(TrapKey::Exit) {
+		return false;
+	}
+	match state::record(cx.store, vp, Key::Trap(TrapKey::Exit)) {
+		Ok(rec) => matches!(rec, Some(Record::Trap { .. })),
+		Err(err) => {
+			k.fail(err);
+			false
+		},
 	}
 }
 
@@ -3510,14 +3572,20 @@ fn pending_time_ends(f: &super::proc::Frame, n: usize) -> Vec<bool> {
 }
 
 /// A jump out of frames `frame` and up (`exit`, `set -e`, a discarded
-/// command): their `time` marks report ([`report_left_times`]) and go out
-/// before the unwind ([`written_before_the_unwind`]). zsh mode keeps its own
-/// rules.
-pub(super) fn report_jump(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, frame: usize) {
+/// command; `jump` says which): their `time` marks report
+/// ([`report_left_times`]) and go out before the unwind
+/// ([`written_before_the_unwind`]). zsh mode keeps its own rules.
+pub(super) fn report_jump(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	frame: usize,
+	jump: Jump,
+) {
 	if vp.mode.dialect() == Dialect::Zsh {
 		return;
 	}
-	report_left_times(k, vp, cx, frame);
+	report_left_times(k, vp, cx, frame, jump);
 	written_before_the_unwind(k, vp);
 }
 
@@ -3592,12 +3660,13 @@ fn parse_and_execute_frame(cx: &mut Cx<'_>, vp: &Vproc) -> usize {
 }
 
 /// bash's `run_unwind_protects`: what is queued goes out through the
-/// redirections in effect, then those of frames `from` and up are undone
-/// (each frame's running op's own, then its compound commands', innermost
-/// first), so the reports that follow go to the fds outside them.
-fn undo_redirections(k: &Kernel, vp: &mut Vproc, from: usize) {
+/// redirections in effect, then those of frames `from` up to `to` (not
+/// included) are undone (each frame's running op's own, then its compound
+/// commands', innermost first), so the reports that follow go to the fds
+/// outside them.
+fn undo_redirections(k: &Kernel, vp: &mut Vproc, from: usize, to: usize) {
 	written_before_the_unwind(k, vp);
-	let mut i = vp.frames.len();
+	let mut i = to.min(vp.frames.len());
 	while i > from {
 		i -= 1;
 		let own = vp.frames[i]
@@ -3632,13 +3701,14 @@ pub(super) fn jump_out(k: &Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, cleanup: boo
 		return;
 	};
 	let inside = parse_and_execute_frame(cx, vp);
+	let all = vp.frames.len();
 	if cleanup {
-		undo_redirections(k, vp, leave);
+		undo_redirections(k, vp, leave, all);
 		for f in vp.frames.iter_mut().skip(leave.max(inside)) {
 			f.times.clear();
 		}
-	} else if inside == vp.frames.len() {
-		undo_redirections(k, vp, leave);
+	} else if inside == all {
+		undo_redirections(k, vp, leave, all);
 	}
 }
 

@@ -4701,6 +4701,8 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = st(vp);
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
+	let exit_builtin =
+		matches!(e.target, Some(Target::Intrinsic(IntrinsicId::Exit | IntrinsicId::Logout)));
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
@@ -4714,9 +4716,16 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	}
 	// `exit` jumps while its own redirections are in effect: bash's
 	// `time_command` reports through them (`time exit 3 2>/dev/null` prints
-	// nothing), so the report goes out before they are undone below.
+	// nothing), so the report goes out before they are undone below. A
+	// `break` with a non-numeric count leaves the shell too (bash's
+	// `EXITPROG`, not the `exit` builtin's `EXITBLTIN`).
 	if matches!(control, Some(Transfer::Exit(_))) {
-		exec::report_jump(k, vp, cx, 0);
+		let jump = if exit_builtin {
+			exec::Jump::Exit
+		} else {
+			exec::Jump::Other
+		};
+		exec::report_jump(k, vp, cx, 0, jump);
 	}
 	let sc = vp
 		.frames
