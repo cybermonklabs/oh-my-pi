@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- An aborted `ssh://` transfer (a read, write, stat, directory listing or `HOME` lookup) no longer leaves a process of its ssh command running: on POSIX each transfer's ssh runs in a process group of its own, so the abort holds and reads its tree before signalling it and waits until the group is empty. These ssh calls run with `BatchMode=yes`, so the controlling terminal they lose this way never had a prompt to show
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

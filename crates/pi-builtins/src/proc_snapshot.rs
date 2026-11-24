@@ -166,8 +166,11 @@ pub mod sys {
 		Some(stat[stat.rfind(')')? + 1..].split_whitespace())
 	}
 
+	/// Field `index` after the command name. The stat is read as bytes: a
+	/// process's name may hold any bytes (the kernel cuts it at 15 bytes,
+	/// inside a character too), and must not hide the fields after it.
 	fn stat_field<T: FromStr>(pid: i32, index: usize) -> Option<T> {
-		stat_fields(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)?
+		stat_fields(&String::from_utf8_lossy(&fs::read(format!("/proc/{pid}/stat")).ok()?))?
 			.nth(index)?
 			.parse()
 			.ok()
