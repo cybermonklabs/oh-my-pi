@@ -3523,7 +3523,10 @@ fn a_subshells_own_var_is_its_forks_across_a_restore() {
 	};
 	let plain = run_script(host(), SRC, &[], Fault::None);
 	let imaged = run_script(host(), SRC, &[], Fault::Snapshot { every: 1 });
-	assert!(imaged.snapshots > 10, "{} snapshots", imaged.snapshots);
+	// The shell runs again only once a fork it waits for ends: 13 images at
+	// a6a2639b, where the shell made these redirections itself; not one more
+	// at each wake of the fork's own opens.
+	assert!((11..100).contains(&imaged.snapshots), "{} snapshots", imaged.snapshots);
 	let mid_list = imaged_at_every_other_wait(host(), SRC);
 	assert!(mid_list.snapshots > 0, "no snapshot mid-list");
 	let want = (0, "in=[10] l=x\nout=[]\nw=[] x=[] y=[]\n".to_owned());
