@@ -21,6 +21,7 @@ import {
 import { getSessionsDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "../helpers/settings-test-state";
 import { readStoredSession } from "../helpers/sql-session-storage";
+import { sessionStoreTables } from "./sql-session-lease-fixture";
 
 const BACKENDS: ReadonlyArray<{ adapter: SqlSessionStorageAdapter; url: string | undefined }> = [
 	{ adapter: "sqlite", url: "sqlite" },
@@ -73,9 +74,7 @@ async function seed(adapter: SqlSessionStorageAdapter, url: string) {
 	};
 	const { client, storage } = await connect();
 	cleanups.push(async () => {
-		await client.unsafe(`DROP TABLE IF EXISTS ${table}_parts`);
-		await client.unsafe(`DROP TABLE IF EXISTS ${table}_blobs`);
-		await client.unsafe(`DROP TABLE IF EXISTS ${table}`);
+		for (const name of sessionStoreTables(table)) await client.unsafe(`DROP TABLE IF EXISTS ${name}`);
 	});
 	const cwd = tempDir.join("from");
 	const sessionDir = path.join(getSessionsDir(), "--from--");

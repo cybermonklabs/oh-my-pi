@@ -22,6 +22,7 @@ import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-ti
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { readOnlyDefault, readStoredParts, readStoredSession } from "../helpers/sql-session-storage";
+import { sessionStoreTables } from "./sql-session-lease-fixture";
 
 const url = process.env.OMP_TEST_SQL_POSTGRES_URL;
 
@@ -51,7 +52,7 @@ afterEach(async () => {
 	current = undefined;
 	if (!db) return;
 	try {
-		for (const name of [`${db.table}_parts`, `${db.table}_blobs`, db.table, db.scratch]) {
+		for (const name of [...sessionStoreTables(db.table), db.scratch]) {
 			await db.other.unsafe(`DROP TABLE IF EXISTS ${name}`);
 		}
 	} finally {
@@ -484,8 +485,7 @@ describe.skipIf(!url)("SqlSessionStorage starting beside other stores on Postgre
 				expect(await columns({ other }, `${table}_parts`)).toEqual(["content", "path", "start_offset"]);
 			} finally {
 				try {
-					for (const name of [`${table}_parts`, `${table}_blobs`, table])
-						await other.unsafe(`DROP TABLE IF EXISTS ${name}`);
+					for (const name of sessionStoreTables(table)) await other.unsafe(`DROP TABLE IF EXISTS ${name}`);
 				} finally {
 					await Promise.all([...clients, other].map(client => client.end()));
 				}

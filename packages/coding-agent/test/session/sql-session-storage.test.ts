@@ -414,6 +414,31 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await raw.end();
 	});
 
+	it("readChunks reads a batch of appends whose lines split a surrogate pair, at the size the batch recorded", async () => {
+		// If this regresses, a writer's raw appends of a line ending in a lone high surrogate and of one starting with
+		// the lone low one, stored in one batch, join into one character: the stored bytes fall 2 short of `byte_len`,
+		// and every chunked read of the session (a load, a resume) fails with SessionReadConflictError.
+		const { client, storage } = await createSqlite();
+		const path = "/sessions/p/split-pair.jsonl";
+		const writer = storage.openWriter(path);
+		const appendSync = writer.appendSync?.bind(writer);
+		if (!appendSync) throw new Error("the SQL store's writer appends synchronously");
+		// Queued in one tick: both lines go to the database in one batch of appends.
+		for (const line of ["x\uD83D", "\uDE00\n"]) appendSync(line);
+		await writer.close();
+
+		// Each line stores what its own UTF-8 encoding holds, a lone surrogate as U+FFFD: what appending the lines one
+		// by one stores, at the size the batch added.
+		const stored = "x\uFFFD\uFFFD\n";
+		const read = Buffer.concat(await Array.fromAsync(storage.readChunks(path))).toString("utf-8");
+		expect({ size: storage.statSync(path).size, read, text: await storage.readText(path) }).toEqual({
+			size: Buffer.byteLength(stored),
+			read: stored,
+			text: stored,
+		});
+		await client.end();
+	});
+
 	it("readChunks fetches about the window a reader stops after, not a whole page of 12 MiB", async () => {
 		const raw = new SQL("sqlite::memory:");
 		let paged = 0;

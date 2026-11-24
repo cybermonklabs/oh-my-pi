@@ -32,6 +32,7 @@ import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { RedisClient, SQL } from "bun";
 import { Longest, recordMethod } from "../helpers/longest-value";
 import { fillDiskUnder, pathUnderRegularFile, spoolWarnings } from "../helpers/spool-unusable";
+import { sessionStoreTables } from "./sql-session-lease-fixture";
 
 const MiB = 1024 * 1024;
 /** No string or buffer handed to or returned by the backend during a rewrite may reach past this. */
@@ -226,7 +227,8 @@ async function openStore(kind: BackendKind, url: string, watch: BackendWatch): P
 		storage,
 		close: async () => {
 			await storage.drain().catch(() => {});
-			for (const table of [`${name}_parts`, name, leaseTable]) await client.unsafe(`DROP TABLE IF EXISTS ${table}`);
+			for (const table of [...sessionStoreTables(name), leaseTable])
+				await client.unsafe(`DROP TABLE IF EXISTS ${table}`);
 			await client.end();
 			dir?.removeSync();
 		},

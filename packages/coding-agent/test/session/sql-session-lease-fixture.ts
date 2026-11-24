@@ -43,6 +43,15 @@ export type LeaseServer = SqlSessionStorageAdapter | "mariadb";
 /** The backends whose claim is a lease row with a heartbeat. */
 export const ROW_LEASE_BACKENDS = LEASE_BACKENDS.filter(backend => backend.adapter !== "sqlite");
 
+/**
+ * Every table a store whose session table is `table` makes (the lease table
+ * aside, which its options name): what a case that made its own store drops,
+ * so none stays in a shared PostgreSQL or MySQL database.
+ */
+export function sessionStoreTables(table: string): string[] {
+	return [`${table}_parts`, `${table}_blobs`, `${table}_refs`, table];
+}
+
 /** Milliseconds since the epoch on the database clock, as the store writes lease times. */
 const DB_NOW: Record<SqlSessionStorageAdapter, string> = {
 	postgres: "(extract(epoch from clock_timestamp()) * 1000)::bigint",
@@ -193,7 +202,7 @@ export async function openLeaseDb(adapter: SqlSessionStorageAdapter, url: string
 					await storage.drain().catch(() => undefined);
 					await client.end();
 				}
-				for (const name of [`${table}_parts`, `${table}_blobs`, `${table}_refs`, table, leaseTable]) {
+				for (const name of [...sessionStoreTables(table), leaseTable]) {
 					await admin.unsafe(`DROP TABLE IF EXISTS ${name}`);
 				}
 			} finally {

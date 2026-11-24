@@ -46,6 +46,7 @@ import { collectSubSessions } from "@oh-my-pi/pi-coding-agent/session/sub-sessio
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { mockSchedulerWaitWithClock } from "../helpers/mock-scheduler-clock";
+import { sessionStoreTables } from "./sql-session-lease-fixture";
 
 /** A value longer than this means a transcript was read, written or parsed whole. */
 const WHOLE_VALUE_LIMIT = 16 * 1024 * 1024;
@@ -1004,8 +1005,7 @@ describe.each(sqlTargets)("a 64 MiB transcript on $name SQL storage", ({ url }) 
 		const table = `omp_bounded_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
 		const storage = await SqlSessionStorage.create({ client, table });
 		cleanups.push(async () => {
-			await client.unsafe(`DROP TABLE IF EXISTS ${table}_parts`);
-			await client.unsafe(`DROP TABLE IF EXISTS ${table}`);
+			for (const name of sessionStoreTables(table)) await client.unsafe(`DROP TABLE IF EXISTS ${name}`);
 			await client.end();
 		});
 		await storage.writeText(transcript.file, await Bun.file(transcript.file).text());

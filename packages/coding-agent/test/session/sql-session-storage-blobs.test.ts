@@ -1694,12 +1694,14 @@ describe("session blobs in the SQL session storage", () => {
 
 			// The one deadlock the lock order leaves (docs/session.md, "Races"): a rename whose destination has no
 			// row takes that key by its UPDATE, after the source's lock, and a delete with the artifacts directory
-			// locks every row and gap of the session table in path order on MySQL and MariaDB (it can use no index).
-			// The rename D → B is paused before its UPDATE, holding D; the delete of A with its artifacts locks A,
-			// then C with the gap before it, where B goes, and waits for D; the rename's UPDATE then waits for that
-			// gap. InnoDB rolls one back, and the deadlock retry runs it again: both end as they would alone.
+			// locks, on MySQL and MariaDB, the rows under the directory and the gaps around them, in path order. The
+			// rename D → B, both under the directory of A, is paused before its UPDATE, holding D; the delete of A
+			// with its artifacts locks A, then M with the gap before it, where B goes, and waits for D; the rename's
+			// UPDATE then waits for that gap. InnoDB rolls one back, and the deadlock retry runs it again: they end
+			// as one after the other does, the rename first (the delete then takes B) or the delete first (the
+			// rename then finds no D).
 			it.skipIf(adapter !== "mysql")(
-				"deadlocks once, and runs the rolled-back side again, when a delete with artifacts scans past a rename's destination that has no row",
+				"deadlocks once, and runs the rolled-back side again, when a delete with artifacts locks the gap of a rename's destination under the directory",
 				async () => {
 					await using db = await openLeaseDb(adapter, url ?? "");
 					const deadlocks: string[] = [];
@@ -1716,33 +1718,117 @@ describe("session blobs in the SQL session storage", () => {
 						},
 					});
 					const deleter = await db.open({ claims: false, wrap: client => deadlockLog(client, deadlocks) });
-					const [a, b, c, d] = ["a", "b-dst", "c", "d-src"].map(name =>
-						db.dir.join("sessions", `${name}.jsonl`),
-					) as [string, string, string, string];
-					const moved = transcript(ID, "moved");
-					for (const path of [a, c]) await renamer.writeText(path, transcript(ID, "kept apart"));
-					await renamer.writeText(d, moved);
+					const [a, c] = ["a", "c"].map(name => db.dir.join("sessions", `${name}.jsonl`)) as [string, string];
+					const [b, m, d] = ["b-dst", "m", "z-src"].map(name => db.dir.join("sessions", "a", `${name}.jsonl`)) as [
+						string,
+						string,
+						string,
+					];
+					for (const path of [a, m, d, c]) await renamer.writeText(path, transcript(ID, "kept apart"));
 					await renamer.drain();
 					await deleter.refresh();
 
 					gate?.close();
-					const renaming = renamer.rename(d, b);
+					const renaming = renamer.rename(d, b).then(
+						() => "renamed",
+						(err: unknown) => (err instanceof Error && "code" in err ? String(err.code) : String(err)),
+					);
 					let deleting: Promise<void> | undefined;
 					try {
 						await Promise.race([gate?.paused(), renaming]);
 						deleting = deleter.deleteSessionWithArtifacts(a);
-						// A real wait: the delete's scan must reach the rename's row on the server before the UPDATE runs.
+						// A real wait: the delete's lock must reach the rename's row on the server before the UPDATE runs.
 						await Promise.race([deleting, Bun.sleep(1000)]);
 					} finally {
 						gate?.open();
 					}
-					await Promise.all([renaming, deleting]);
-					expect({
-						deadlocks: deadlocks.length,
-						paths: await db.paths(),
-						b: (await db.row(b))?.content,
-					}).toEqual({ deadlocks: 1, paths: [b, c], b: moved });
+					const [renamed] = await Promise.all([renaming, deleting]);
+					expect({ deadlocks: deadlocks.length, paths: await db.paths() }).toEqual({ deadlocks: 1, paths: [c] });
+					// The rename first, or the delete first, which leaves it no source.
+					expect(["renamed", "ENOENT"]).toContain(renamed);
 				},
+			);
+
+			// A delete with the artifacts directory locks, on MySQL and MariaDB, the session rows under the directory
+			// by its key range: those rows, the gaps between them and the gaps at either end, up to the nearest row
+			// outside (MariaDB locks the first row past the range too). Another session's row, or a gap away from the
+			// directory, is not locked: its writes commit while the delete runs.
+			it.skipIf(adapter !== "mysql")(
+				"commits another client's append, full write and new session away from the directory while a delete with artifacts holds its locks",
+				async () => {
+					// If this regresses, on MySQL and MariaDB a session delete with its artifacts locks every row and gap of
+					// the session table until it commits: every other session's append, full write and new session on that
+					// database waits for it.
+					await using db = await openLeaseDb(adapter, url ?? "");
+					let gate: GatedClient | undefined;
+					const deleter = await db.open({
+						claims: false,
+						wrap: client => {
+							gate = gatedClient(
+								client,
+								new RegExp(`^SELECT path FROM \\S*\\b${db.table} WHERE path IN \\(.* FOR UPDATE$`),
+							);
+							return gate.client;
+						},
+					});
+					const other = await db.open({ claims: false });
+					// Sorted: the session before the deleted one, the deleted one and its transcript, the next session (by
+					// which the directory's range ends), one after it, and a new session at the end.
+					const [before, deleted, next, after, fresh] = [
+						"a-before",
+						"b-deleted",
+						"c-next",
+						"d-after",
+						"e-fresh",
+					].map(name => db.dir.join("sessions", `${name}.jsonl`)) as [string, string, string, string, string];
+					const child = db.dir.join("sessions", "b-deleted", "task.jsonl");
+					const kept = transcript(ID, "kept");
+					for (const path of [before, deleted, child, next, after]) await deleter.writeText(path, kept);
+					await deleter.drain();
+					await other.refresh();
+					const line = `${JSON.stringify({ type: "custom", customType: "note", data: "appended" })}\n`;
+					const rewritten = transcript(ID, "rewritten");
+					const created = transcript(ID, "created");
+					// Whether `write` commits within 10 s while the delete holds its locks. A real wait: a write that waits
+					// for a lock sits in the server, which tells the client nothing until the lock wait ends (50 s).
+					const outcome = (write: () => Promise<void>): Promise<string> =>
+						Promise.race([
+							write().then(() => "committed"),
+							Bun.sleep(10_000).then(() => "waited for the delete"),
+						]);
+
+					gate?.close();
+					const deleting = deleter.deleteSessionWithArtifacts(deleted);
+					let writes: string[] = [];
+					let seen: Record<string, string | undefined> = {};
+					try {
+						await Promise.race([gate?.paused(), deleting]);
+						writes = await Promise.all([
+							outcome(async () => {
+								const writer = other.openWriter(before);
+								await writer.append(line);
+								await writer.close();
+							}),
+							outcome(() => other.writeText(after, rewritten)),
+							outcome(() => other.writeText(fresh, created)),
+						]);
+						seen = {
+							before: (await db.row(before))?.content,
+							after: (await db.row(after))?.content,
+							fresh: (await db.row(fresh))?.content,
+						};
+					} finally {
+						gate?.open();
+					}
+					await deleting;
+					await other.drain();
+					expect({ writes, seen, paths: await db.paths() }).toEqual({
+						writes: ["committed", "committed", "committed"],
+						seen: { before: kept + line, after: rewritten, fresh: created },
+						paths: [before, next, after, fresh],
+					});
+				},
+				120_000,
 			);
 
 			// A rename moves its source's references one key at a time, from a read after it locks the source's row:

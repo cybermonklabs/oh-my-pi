@@ -158,8 +158,8 @@ describe.skipIf(!MYSQL_URL)("deleting a MySQL session while another client write
 			lease: STILL,
 			wrap: client => {
 				// The delete's lock of the session's rows and of every row under its directory, its first statement
-				// on the session table: on MySQL and MariaDB it locks every row and gap it scans, so another
-				// client's write under the directory after it waits for the delete to end.
+				// on the session table: on MySQL and MariaDB it locks the rows and gaps of the directory's key range,
+				// so another client's write under the directory after it waits for the delete to end.
 				gate = gatedClient(
 					client,
 					new RegExp(`^SELECT path FROM ${db.table} WHERE path IN .* FOR UPDATE$`),

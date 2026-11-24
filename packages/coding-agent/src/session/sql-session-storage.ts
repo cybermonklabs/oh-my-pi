@@ -408,7 +408,16 @@ interface DialectQueries {
 	danglingRefs: Statement;
 	/** PostgreSQL and SQLite: drop the reference of `@path` to `@sha256` while `@path` has no session row. */
 	deleteDanglingRef: Statement;
-	/** PostgreSQL and MySQL: lock exclusive, in path order, the session rows of `count` paths, with `under` every row under `@dir` too, as {@link deleteUnder} compares the prefix (MySQL's caller names, without `under`, only rows there are). */
+	/**
+	 * PostgreSQL and MySQL: lock exclusive, in path order, the session rows of
+	 * `count` paths, with `under` every row under `@dir` too, as
+	 * {@link deleteUnder} compares the prefix (MySQL's caller names, without
+	 * `under`, only rows there are). On MySQL and MariaDB the rows under
+	 * `@dir` are read by {@link deleteUnder}'s key range, from `@stem` up to
+	 * `@dir_end`, with the prefix compared as bytes too: a compare as bytes is
+	 * no key range, and an `OR` with no key range on one side scans the whole
+	 * session table, locking every row and gap until COMMIT.
+	 */
 	lockSessionRowsForWrite: ((count: number, under: boolean) => Statement) | undefined;
 	/** MySQL: the paths of `count` paths that have a session row, read without a lock. */
 	sessionRowsOf: ((count: number) => Statement) | undefined;
@@ -675,6 +684,18 @@ interface HashRow {
 interface PathRow {
 	path: string;
 }
+
+/** The values a directory delete binds (see `DialectQueries.deleteUnder`); a type, so it binds as statement values. */
+type UnderDirectory = {
+	/** The directory, with its final "/". */
+	dir: string;
+	/** Its length in characters. */
+	len: number;
+	/** The directory without its final "/": where its key range starts. */
+	stem: string;
+	/** The directory with its final "/" made "0": where its key range ends. */
+	dir_end: string;
+};
 
 /** What `#lockSessionRowsForWrite` answers. */
 interface LockedSessionRows {
@@ -1816,8 +1837,11 @@ function buildQueries(
 						sql(
 							`SELECT path FROM ${table} WHERE path IN (${inList("p", count)})` +
 								// The rows under `@dir` that the directory delete takes: those whose prefix is exactly
-								// `@dir`, whatever the column's collation (see deleteUnder).
-								(under ? ` OR ${startsWith("path", "@dir")}` : "") +
+								// `@dir`, whatever the column's collation (see deleteUnder), on MySQL and MariaDB within its
+								// key range, so the lock reads and locks only those rows and the gaps around them.
+								(under
+									? ` OR (${mysql ? "path >= @stem AND path < @dir_end AND " : ""}${startsWith("path", "@dir")})`
+									: "") +
 								" ORDER BY path FOR UPDATE",
 						),
 		sessionRowsOf: mysql
@@ -2076,7 +2100,8 @@ function addChunkDigest(digest: Buffer, offset: number, bytes: Uint8Array): void
  * The parts a batch of appends stores for `lines`, in order, each at most
  * {@link PART_BYTES}: whole lines share a part while they fit, and a longer
  * line is cut at character boundaries, its last piece starting the next part.
- * No part, and no string made, is longer than that.
+ * No part, and no string made, is longer than that. A part holds each line's
+ * own UTF-8 encoding, so its bytes are the sum the batch adds to `byte_len`.
  */
 function* appendedParts(lines: readonly string[]): Generator<{ content: string; bytes: number }> {
 	let pieces: string[] = [];
@@ -2089,7 +2114,10 @@ function* appendedParts(lines: readonly string[]): Generator<{ content: string; 
 			size = 0;
 		}
 		if (bytes <= PART_BYTES) {
-			pieces.push(line);
+			// Well formed, as its UTF-8 encoding is (a lone surrogate as U+FFFD): joined raw, a line that ends in a
+			// lone high surrogate and the next, starting with the lone low one, would make one 4-byte character of
+			// the 6 bytes their lengths count.
+			pieces.push(line.toWellFormed());
 			size += bytes;
 			continue;
 		}
@@ -4954,11 +4982,12 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async remove(paths: string[], dir?: string): Promise<void> {
-		// The key range of the parts under `dir` runs from `dir` without its final "/" up to `dir` with that
-		// "/" made "0": in code-point order and under MySQL's PAD SPACE every path under `dir` sorts within it,
-		// whatever follows the "/" (see DialectQueries.deleteUnder). On PostgreSQL the delete takes the range
-		// only under a code-point collation, and compares the prefix alone under any other (#directoryRange).
-		const under =
+		// The key range under `dir` runs from `dir` without its final "/" up to `dir` with that "/" made "0": in
+		// code-point order and under MySQL's PAD SPACE every path under `dir` sorts within it, whatever follows the
+		// "/" (see DialectQueries.deleteUnder). On MySQL the lock of the rows under `dir` reads that range too
+		// (#lockSessionRowsForWrite). On PostgreSQL the parts delete takes the range only under a code-point
+		// collation, and compares the prefix alone under any other (#directoryRange).
+		const under: UnderDirectory | undefined =
 			dir === undefined
 				? undefined
 				: { dir, len: [...dir].length, stem: dir.slice(0, -1), dir_end: `${dir.slice(0, -1)}0` };
@@ -5148,19 +5177,21 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * blob rows: a locking read of a missing path locks its gap, and an insert
 	 * into that gap at another path (a rename's destination, a new session)
 	 * would wait for it. Then it answers, as `present`, the paths whose rows
-	 * it locked, and the caller changes only those. With `under` MySQL can use
-	 * no index (the prefix is compared as bytes, as
-	 * {@link DialectQueries.deleteUnder} compares it), so the lock scans and
-	 * locks every row, gaps too, in path order; PostgreSQL locks no gap. There
-	 * it answers, as `locked`, every row it locked, and no `present`: the
-	 * caller changes every path. Elsewhere nothing is answered; SQLite runs
-	 * one writer at a time.
+	 * it locked, and the caller changes only those. With `under` it answers,
+	 * as `locked`, every row it locked, and no `present`: the caller changes
+	 * every path. On MySQL and MariaDB the rows under the directory are read
+	 * by the directory's key range (see
+	 * {@link DialectQueries.lockSessionRowsForWrite}): the lock takes those
+	 * rows, the gaps between them and the gaps at either end of the range, up
+	 * to the nearest row outside it (MariaDB locks the first row past the
+	 * range too), and no other row or gap. PostgreSQL locks no gap.
+	 * Elsewhere nothing is answered; SQLite runs one writer at a time.
 	 */
 	async #lockSessionRowsForWrite(
 		transaction: SqlSessionStorageTransaction,
 		paths: readonly string[],
 		there: ReadonlySet<string> | undefined,
-		under?: { dir: string; len: number },
+		under?: UnderDirectory,
 	): Promise<LockedSessionRows> {
 		const lock = this.#q.lockSessionRowsForWrite;
 		if (!lock) return { present: undefined, locked: [] };
@@ -5168,7 +5199,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (!there || under) {
 			const rows = (await run(transaction, lock(ordered.length, under !== undefined), {
 				...listValues("p", ordered),
-				...(under ?? {}),
+				...under,
 			})) as PathRow[];
 			return { present: undefined, locked: under ? rows : [] };
 		}

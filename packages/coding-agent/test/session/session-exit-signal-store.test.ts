@@ -15,6 +15,7 @@ import { SESSION_EXIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
+import { sessionStoreTables } from "./sql-session-lease-fixture";
 
 const HOST = path.join(import.meta.dir, "../fixtures/session-exit-signal-host.ts");
 const POSTGRES_URL = process.env.OMP_TEST_SQL_POSTGRES_URL;
@@ -215,7 +216,7 @@ describe.skipIf(!POSTGRES_URL)("SIGTERM on SQL storage on PostgreSQL", () => {
 		cleanups.push(async () => {
 			const client = new SQL(url);
 			try {
-				await client.unsafe(`DROP TABLE IF EXISTS ${name}_parts, ${name}`);
+				await client.unsafe(`DROP TABLE IF EXISTS ${sessionStoreTables(name).join(", ")}`);
 			} finally {
 				await client.end();
 			}

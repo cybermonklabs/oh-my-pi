@@ -39,6 +39,7 @@ import { getConfigRootDir, isRecord, setAgentDir, stringifyJson, TempDir } from 
 import { SQL } from "bun";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "../collab/helpers/in-memory-relay";
 import { failNextReads, plainYml, sourceReadWarnings, YML_MARKER } from "../helpers/masker-sources";
+import { sessionStoreTables } from "./sql-session-lease-fixture";
 
 const ENV_VALUE = "zq9-synthetic-service-4821";
 const FILE_VALUE = "file-held-token-7310";
@@ -83,7 +84,8 @@ function sqlBackend(name: string, connect: () => InstanceType<typeof SQL>, table
 				},
 				async close() {
 					for (const each of opened) await each.drain().catch(() => {});
-					if (options.table) await client.unsafe(`DROP TABLE IF EXISTS ${options.table}`);
+					const tables = options.table ? sessionStoreTables(options.table) : [];
+					for (const name of tables) await client.unsafe(`DROP TABLE IF EXISTS ${name}`);
 					await client.end();
 				},
 			};

@@ -22,6 +22,7 @@ import {
 	type SqlSessionStorageResult,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { sessionStoreTables } from "./sql-session-lease-fixture";
 
 type SqlClient = InstanceType<typeof SQL>;
 
@@ -69,9 +70,7 @@ class Db implements AsyncDisposable {
 	}
 
 	async [Symbol.asyncDispose](): Promise<void> {
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_blobs`);
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
+		for (const name of sessionStoreTables(this.table)) await this.client.unsafe(`DROP TABLE IF EXISTS ${name}`);
 		for (const client of this.#clients) await client.end();
 	}
 }
