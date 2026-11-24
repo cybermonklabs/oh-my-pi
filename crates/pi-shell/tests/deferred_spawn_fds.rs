@@ -5,6 +5,9 @@
 
 #![cfg(unix)]
 
+mod pty_support;
+mod real_bash;
+
 use std::{
 	path::Path,
 	process::{Command, Stdio},
@@ -16,9 +19,9 @@ use std::{
 const HANG: Duration = Duration::from_secs(30);
 
 fn shells() -> Vec<(&'static str, String)> {
-	let mut shells = vec![("obash", env!("CARGO_BIN_EXE_obash").to_owned())];
-	if Path::new("/bin/bash").exists() {
-		shells.push(("bash", "/bin/bash".to_owned()));
+	let mut shells = vec![("obash", pty_support::obash().to_owned())];
+	if let Some(bash) = real_bash::real_bash() {
+		shells.push(("bash", bash));
 	}
 	shells
 }
