@@ -1,11 +1,14 @@
 # The clippy row's baseline: the findings the release already has. The row applies the cut's rule
 # (Cut7's kit clippy gate: a crate fails only on findings beyond what its base already has) without
 # linting the base a second time: a crate reads FAIL for each finding beyond this file, KNOWN when
-# its findings are within it, and lists a line whose count fell here, to remove it from this file.
+# its findings are within it, and names each line whose count fell here with the line that
+# replaces it (or "delete its line"), which the next change of this file takes.
 #
 # One line a finding kind: crate<TAB>file<TAB>lint code<TAB>count<TAB>message. The lint code is the
 # diagnostic's code.code from `cargo clippy --message-format=json`; the message has no line or
-# column; the count is the number of places (file, line, column) with that code and message.
+# column; the count is the number of places (file, line, column) with that code and message. A
+# compile error with no code (rustc gives a syntax error none) is never a line here: its target was
+# not linted, so it always fails the crate.
 #
 # To regenerate it from a release: dispatch sami-checks on the release commit, download that run's
 # sc-res-clippy artifact, and take its clippy-findings.txt (the same format, every finding of the

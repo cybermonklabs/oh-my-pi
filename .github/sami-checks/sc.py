@@ -582,30 +582,38 @@ def read_lines(path):
         return None
 
 
+# The key of a compile error that carries no lint code (rustc gives a syntax error none). It is a
+# finding that no baseline line holds: a target that did not compile was never linted.
+UNCODED_ERROR = "error"
+
+
 def clippy_diagnostics(path):
-    """The findings in a `cargo clippy --message-format=json` log: {(file, code, message): {(line,
-    column)}}. A finding is a compiler message with a lint or error code (diagnostic `code.code`)
-    and a primary span. The same finding in several of a crate's targets (a module that the lib
-    test and a test binary both build) is one, by its place. None when there is no log."""
+    """The findings in a `cargo clippy --message-format=json` log, and the numbers of its lines that
+    look like cargo messages (`{"reason":`) but do not parse: ({(file, code, message): {(line,
+    column)}}, [line number]). A finding is a compiler message with a primary span and a code: its
+    lint or error code (diagnostic `code.code`), or UNCODED_ERROR for an error with none. The same
+    finding in several of a crate's targets (a module that the lib test and a test binary both
+    build) is one, by its place. None when there is no log."""
     lines = read_lines(path)
     if lines is None:
         return None
-    out = {}
-    for line in lines:
-        if not line.startswith("{"):
+    out, unread = {}, []
+    for n, line in enumerate(lines, 1):
+        if not line.startswith('{"reason":'):
             continue
         try:
             ev = json.loads(line)
         except ValueError:
+            unread.append(n)
             continue
         if ev.get("reason") != "compiler-message":
             continue
         m = ev.get("message") or {}
-        code = (m.get("code") or {}).get("code")
+        code = (m.get("code") or {}).get("code") or (UNCODED_ERROR if m.get("level") == "error" else None)
         span = next((s for s in m.get("spans") or () if s.get("is_primary")), None)
         if code and span:
             out.setdefault((span["file_name"], code, m.get("message", "")), set()).add((span["line_start"], span["column_start"]))
-    return out
+    return out, unread
 
 
 def read_clippy_baseline(path):
@@ -628,10 +636,18 @@ def read_clippy_baseline(path):
 
 
 def clippy_baseline_lines(log, crate, crate_dir):
-    """The baseline lines of one crate's findings in its log (the regeneration step's input)."""
-    own = {k: v for k, v in (clippy_diagnostics(log) or {}).items() if k[0].startswith(crate_dir.rstrip("/") + "/")}
+    """The baseline lines of one crate's findings in its log (the regeneration step's input). A
+    compile error with no code is never a baseline line; it and any line that did not parse are
+    named in a comment line instead, so a regenerated baseline cannot take them in unseen."""
+    diags, unread = clippy_diagnostics(log) or ({}, ["(no log)"])
+    own = {k: v for k, v in diags.items() if k[0].startswith(crate_dir.rstrip("/") + "/")}
     for (f, code, msg), locs in sorted(own.items()):
-        print(f"{crate}\t{f}\t{code}\t{len(locs)}\t{msg}")
+        if code == UNCODED_ERROR:
+            print(f"# {crate}: a compile error, not a baseline line: {f}:{min(locs)[0]}: {msg}")
+        else:
+            print(f"{crate}\t{f}\t{code}\t{len(locs)}\t{msg}")
+    if unread:
+        print(f"# {crate}: log lines that did not parse, so their findings are missing here: {', '.join(map(str, unread[:12]))}")
 
 
 def clippy_crates(metadata, crates):
@@ -652,14 +668,17 @@ def clippy_crates(metadata, crates):
 def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, baseline_path=CLIPPY_BASELINE):
     """One crate's clippy result, by the cut's rule against the baseline. Its findings are those in
     files under its own directory (a dependency's are not this crate's). FAIL: a finding whose key
-    the baseline lacks, or a key with more places than the baseline counts, each place named
-    `file:line: code: message`. KNOWN: findings, each within the baseline. PASS: no finding. A
-    baseline key with fewer places here is listed for removal (baseline_fell), never a failure.
-    KNOWN and PASS also need the control run to read the unused import clippy.sh planted in the
-    crate's library root, a finding the baseline lacks. Anything else is UNKNOWN: no log, an exit
-    other than 0 or 101 (clippy did not finish), exit 101 with no finding of its own, exit 0 with
-    findings."""
-    base = {(f, code, msg): n for (c, f, code, msg), n in read_clippy_baseline(baseline_path).items() if c == crate}
+    the baseline lacks, a key with more places than the baseline counts, or a compile error with no
+    code (UNCODED_ERROR, which no baseline line holds: its target was never linted), each place
+    named `file:line: code: message`. KNOWN: findings, each within the baseline. PASS: no finding.
+    A baseline key with fewer places here is listed (baseline_fell) with the line that replaces it,
+    never a failure. KNOWN and PASS also need the control run to read the unused import clippy.sh
+    planted in the crate's library root, a finding the baseline lacks. Anything else is UNKNOWN: no
+    log, a log line that looks like a cargo message but does not parse (its finding is unread), an
+    exit other than 0 or 101 (clippy did not finish), exit 101 with no finding of its own, exit 0
+    with findings."""
+    base = {(f, code, msg): n for (c, f, code, msg), n in read_clippy_baseline(baseline_path).items()
+            if c == crate and code != UNCODED_ERROR}
 
     def r(status, failures=(), note="", fell=()):
         res = result("clippy", crate, "runner", status, exit_code, secs, failed=len(failures), failures=failures, note=note)
@@ -668,9 +687,10 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, base
 
     if crate_dir == "-":
         return r("UNKNOWN", note=f"the tree has no package {crate}")
-    diags = clippy_diagnostics(log)
-    if diags is None:
+    got = clippy_diagnostics(log)
+    if got is None:
         return r("UNKNOWN", note="no log")
+    diags, unread = got
     own = {k: v for k, v in diags.items() if k[0].startswith(crate_dir.rstrip("/") + "/")}
     try:
         code = int(exit_code)
@@ -678,7 +698,7 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, base
         code = None
     if code not in (0, 101):
         return r("UNKNOWN", note=f"exit {exit_code}: clippy did not finish" + (" (the time bound ended it)" if code == 124 else ""))
-    if code == 101 and not own:
+    if code == 101 and not own and not unread:
         first = next((l for l in read_lines(log) or () if l.startswith("error")), "no error line")
         return r("UNKNOWN", note=f"exit 101 and no finding under {crate_dir}/, so it was not linted: {first[:300]}")
     if code == 0 and own:
@@ -691,10 +711,17 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, base
             beyond += [f"{f}:{line}: {lint}: {msg}{more}" for line, _ in sorted(places)]
         else:
             known += len(places)
-    fell = [f"{f}: {lint}: {msg} ({len(own.get((f, lint, msg), ()))} here, {b} in the baseline)"
-            for (f, lint, msg), b in sorted(base.items()) if len(own.get((f, lint, msg), ())) < b]
+    fell = []
+    for (f, lint, msg), b in sorted(base.items()):
+        n = len(own.get((f, lint, msg), ()))
+        if n < b:
+            fix = "delete its line" if n == 0 else f"its line becomes `{crate}\t{f}\t{lint}\t{n}\t{msg}` (tab-separated)"
+            fell.append(f"{f}: {lint}: {msg} ({n} here, {b} in the baseline): {fix}")
+    if unread:
+        return r("UNKNOWN", beyond, f"log line(s) {', '.join(map(str, unread[:12]))} look like cargo messages and do not parse, "
+                                    "so their findings are unread", fell)
     ctl = clippy_diagnostics(ctl_log)
-    caught = ctl is not None and any(f == ctl_file and lint == "unused_imports" and CLIPPY_CONTROL in msg for f, lint, msg in ctl)
+    caught = ctl is not None and any(f == ctl_file and lint == "unused_imports" and CLIPPY_CONTROL in msg for f, lint, msg in ctl[0])
     said = "the planted control read as a finding beyond the baseline" if caught else (
         "the control left no log" if ctl is None else f"the control's unused import planted in {ctl_file} was not read as a finding")
     if beyond:
@@ -1312,7 +1339,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             for f in r["failures"]:
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}")
             for f in r.get("baseline_fell", []):
-                details.append(f"- **{title}** `{r['unit']}`: fewer here than in the clippy baseline, remove it from the baseline: {f}")
+                details.append(f"- **{title}** `{r['unit']}`: fewer here than in the clippy baseline (a change of the baseline, not a failure): {f}")
             for f in r.get("self_skipped", []):
                 why = r.get("known_skips", {}).get(f)
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`" + (f": KNOWN ({why})" if why else ""))
@@ -1592,7 +1619,7 @@ def selftest():
     check("clippy: a key the baseline lacks fails, named by place and lint",
           (r["status"], r["failures"], r["baseline_fell"]),
           ("FAIL", ["crates/pi-vfs/src/b.rs:86: function_casts_as_integer: direct cast of function item into an integer"],
-           [f"crates/pi-vfs/src/c.rs: clippy::doc_markdown: item in documentation is missing backticks (0 here, 2 in the baseline)"]))
+           [f"crates/pi-vfs/src/c.rs: clippy::doc_markdown: item in documentation is missing backticks (0 here, 2 in the baseline): delete its line"]))
     r = cl(own_a + own_b, 101)
     check("clippy: a key with more places than the baseline fails, each place named",
           (r["status"], r["failures"]),
@@ -1609,13 +1636,42 @@ def selftest():
     check("clippy: ended by its bound", "time bound" in cl("", 124)["note"], True)
     check("clippy: 101 with no finding of its own", cl(dep_f + "error: failed to run custom build command for `x`\n", 101)["status"], "UNKNOWN")
     check("clippy: 0 with a finding", cl(own_a, 0)["status"], "UNKNOWN")
-    check("clippy: no log", parse_clippy(os.path.join(d, "absent"), "101", 1, "pi-vfs", "crates/pi-vfs", ctl, "x", bl)["status"], "UNKNOWN")
+    # A missing log is UNKNOWN by itself, at exit 0 as at 101 (at 101 another branch also gives UNKNOWN).
+    for ex in ("0", "101"):
+        r = parse_clippy(os.path.join(d, "absent"), ex, 1, "pi-vfs", "crates/pi-vfs", ctl, "crates/pi-vfs/src/lib.rs", bl)
+        check(f"clippy: no log, exit {ex}", (r["status"], r["note"]), ("UNKNOWN", "no log"))
     check("clippy: a crate the tree lacks", parse_clippy(ctl, "0", 1, "pi-x", "-", ctl, "-", bl)["status"], "UNKNOWN")
     check("clippy: the short format names no lint code, so it reads nothing",
-          clippy_diagnostics(write("short.log", "crates/pi-vfs/src/a.rs:3:5: error: unnecessary hashes around raw string literal\n")), {})
+          clippy_diagnostics(write("short.log", "crates/pi-vfs/src/a.rs:3:5: error: unnecessary hashes around raw string literal\n")), ({}, []))
+    # A compile error with no code (rustc gives a syntax error code=null) is a finding no baseline
+    # line holds: its target was never linted, so the crate fails beside findings within the baseline.
+    broken = json.dumps({"reason": "compiler-message", "message": {
+        "message": "expected expression, found `;`", "level": "error", "code": None,
+        "spans": [{"file_name": "crates/pi-vfs/tests/broken.rs", "line_start": 3, "column_start": 13, "is_primary": True}]}}) + "\n"
+    uncoded = "crates/pi-vfs/tests/broken.rs:3: error: expected expression, found `;`"
+    r = cl(noise + own_a + broken, 101)
+    check("clippy: a compile error with no code fails beside findings within the baseline",
+          (r["status"], r["failures"]), ("FAIL", [uncoded]))
+    in_base = write("baseline-error.txt", f"pi-vfs\tcrates/pi-vfs/tests/broken.rs\terror\t1\texpected expression, found `;`\n")
+    check("clippy: a compile error with no code fails even when a baseline line names it",
+          cl(broken, 101, base=in_base)["failures"], [uncoded])
+    warned = broken.replace('"level": "error"', '"level": "warning"')
+    check("clippy: a warning with no code is no finding", clippy_diagnostics(write("w.log", warned)), ({}, []))
+    # A line that looks like a cargo message and does not parse hides its finding: UNKNOWN, named.
+    cut = noise + own_a + broken[:60] + "\n"
+    r = cl(cut, 101)
+    check("clippy: a cargo message line that does not parse", (r["status"], r["note"]),
+          ("UNKNOWN", "log line(s) 5 look like cargo messages and do not parse, so their findings are unread"))
+    # A fallen count names the line that replaces it.
+    r = cl(own_a, 101, base=write("baseline-3.txt", f"pi-vfs\tcrates/pi-vfs/src/a.rs\tclippy::needless_raw_string_hashes\t3\t{hashes}\n"))
+    check("clippy: a fallen count names its replacement line", (r["status"], r["baseline_fell"]),
+          ("KNOWN", [f"crates/pi-vfs/src/a.rs: clippy::needless_raw_string_hashes: {hashes} (1 here, 3 in the baseline): its line becomes "
+                     f"`pi-vfs\tcrates/pi-vfs/src/a.rs\tclippy::needless_raw_string_hashes\t1\t{hashes}` (tab-separated)"]))
     # The baseline lines a log gives (the regeneration step), read back as the same baseline.
     with contextlib.redirect_stdout(io.StringIO()) as buf:
-        clippy_baseline_lines(write("c.log", noise + dep_f + own_a + own_b + again + cast), "pi-vfs", "crates/pi-vfs")
+        clippy_baseline_lines(write("c.log", noise + dep_f + own_a + own_b + again + cast + broken), "pi-vfs", "crates/pi-vfs")
+    check("clippy: a regenerated baseline names a compile error in a comment, not a line",
+          "# pi-vfs: a compile error, not a baseline line: crates/pi-vfs/tests/broken.rs:3: expected expression, found `;`" in buf.getvalue(), True)
     regen = write("regen.txt", buf.getvalue())
     check("clippy: regenerated baseline lines", read_clippy_baseline(regen),
           {("pi-vfs", "crates/pi-vfs/src/a.rs", "clippy::needless_raw_string_hashes", hashes): 2,
