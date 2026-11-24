@@ -620,6 +620,20 @@ fn starts_command(unit: &Unit, op: Op) -> bool {
 	}
 }
 
+/// bash names `((` and `[[` the command for errors (a `$_` bind's after
+/// them too, [`Vproc::cmd_name`]) once, when they start: after their DEBUG
+/// trap, before their words are expanded, so a `${ cmd; }` in them names
+/// last (`execute_arith_command`, `execute_cond_command`). Their `Enter`
+/// runs once; their `Arith` and `CondTest` ops start again after such a
+/// substitution.
+fn name_compound(vp: &mut Vproc, unit: &Unit, op: Op) {
+	match unit.nodes.get(op.node as usize).map(|n| n.kind) {
+		Some(NodeKind::Arith) => vp.cmd_name = super::proc::CmdName::Arith,
+		Some(NodeKind::Cond) => vp.cmd_name = super::proc::CmdName::Cond,
+		_ => {},
+	}
+}
+
 /// Whether `vp` runs in a function scope (a store failure reads as no and
 /// is kept).
 fn in_function_scope(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
@@ -2827,6 +2841,7 @@ fn control_flow(
 			}
 			if starts {
 				note_command(vp, unit, op);
+				name_compound(vp, unit, op);
 			}
 			let f = top_frame(vp);
 			if starts {
@@ -2871,12 +2886,15 @@ fn plain_arith(
 	unit: &Unit,
 	op: Op,
 ) -> Option<Flow> {
-	// bash names `((` the command from here on (`this_command_name`), as
-	// `dispatch` does for the other arithmetic ops.
-	vp.cmd_name = super::proc::CmdName::Arith;
 	if op.b != Op::LITERAL || super::xtrace::on(k, cx, vp) {
 		return None;
 	}
+	// bash names `((` the command (`this_command_name`): an arith-`for`
+	// expression after it is expanded, a `(( ))` command when it starts
+	// (its `Enter`, [`name_compound`]). A literal expands to itself and runs
+	// nothing, so here is after both. Not before the check above: an op
+	// that `dispatch` expands starts again after a `${ cmd; }` in it.
+	vp.cmd_name = super::proc::CmdName::Arith;
 	let text = &unit.ariths[op.a as usize];
 	Some(match expand::arith_command(k, cx, vp, text) {
 		Ok(v) => {
@@ -2996,6 +3014,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			if on && let Some(node_kind) = unit.nodes.get(op.node as usize).map(|n| n.kind) {
 				k.emit_op_at(cx, vp, op.node, EventData::CmdStart { node_kind }, start);
 			}
+			name_compound(vp, unit, op);
 			// zsh `execcond`: a traced `[[ ]]` is one line, its primaries
 			// added as they are evaluated (`zsh::cond`).
 			if zsh_cond_traced(k, vp, cx, unit, op) {
@@ -3108,14 +3127,19 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		},
 		Opcode::Arith if unit.mode.dialect() == Dialect::Zsh => zsh_arith(k, vp, cx, unit, op, line),
 		Opcode::Arith => {
-			// bash names `((` the command for errors from here on, including
-			// a `$_` bind's after it (`this_command_name`).
-			vp.cmd_name = super::proc::CmdName::Arith;
 			let text = &unit.ariths[op.a as usize];
 			let arith_for = unit
 				.nodes
 				.get(op.node as usize)
 				.is_some_and(|n| n.kind == NodeKind::ArithFor);
+			// bash names `((` the command for errors (`this_command_name`),
+			// a `$_` bind's after it too. An arith-`for` expression names
+			// it after the expression is expanded (`eval_arith_for_expr`):
+			// here at each start, the last after any `${ cmd; }` in it ran.
+			// A `(( ))` command named it once, when it started (`Enter`).
+			if arith_for {
+				vp.cmd_name = super::proc::CmdName::Arith;
+			}
 			// One inlined pass (each `<[u8]>::contains` is a call).
 			let record = text.iter().any(|&c| c == b'$' || c == b'`');
 			let res = expanding(k, vp, cx, Slot::Words, record, line, |ex| {
@@ -3168,10 +3192,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		Opcode::CondTest if unit.mode.dialect() == Dialect::Zsh => {
 			super::zsh::cond::cond_test(k, vp, cx, unit, op, line)
 		},
-		Opcode::CondTest => {
-			vp.cmd_name = super::proc::CmdName::Cond;
-			builtins::cond_test(k, vp, cx, unit, op, line)
-		},
+		Opcode::CondTest => builtins::cond_test(k, vp, cx, unit, op, line),
 		Opcode::FuncDef => {
 			let f = &unit.funcs[op.a as usize];
 			// bash records a definition's line at its end.
@@ -3658,8 +3679,13 @@ fn for_in(
 ) -> Flow {
 	// bash's `select` clears `this_command_name` when it starts, before it
 	// expands its words (`execute_select_command`), even when it then runs
-	// no selection.
-	if op.flags & Op::SELECT != 0 && unit.mode.dialect() == Dialect::Bash {
+	// no selection. Only at the op's first start (no scratch yet): it
+	// starts again after a `${ cmd; }` in its words, whose commands name
+	// last.
+	if op.flags & Op::SELECT != 0
+		&& unit.mode.dialect() == Dialect::Bash
+		&& top_frame(vp).scratch.is_none()
+	{
 		vp.cmd_name = super::proc::CmdName::Cleared;
 	}
 	let pc = top_frame(vp).pc;

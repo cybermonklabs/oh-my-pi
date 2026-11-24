@@ -132,12 +132,14 @@ fn a_script_without_a_shebang_starts_with_its_name() {
 /// command they run; no name once a simple command that the command ran (a
 /// function body, `eval`, `.`) has finished; the outer command after one
 /// that only returned (a `.` file's RETURN trap, which runs after that,
-/// names last); `((` or `[[` after those; none once a `select` started. A
-/// readonly `_`'s error is bare. Stdout and stderr only: bash 5.3.20 also
-/// abandons the rest of the line after such an error (status 1 in `-c`),
-/// which this shell does not do for any assignment error yet. Each script
-/// ends with the failing command, so that does not show here. The `.` and
-/// `< in` rows read files of a temporary directory.
+/// names last); `((` or `[[` after those; none once a `select` started.
+/// `select`, `((` and `[[` name once, when they start, so a `${ cmd; }` in
+/// their words names last. A readonly `_`'s error is bare. Stdout and
+/// stderr only: bash 5.3.20 also abandons the rest of the line after such
+/// an error (status 1 in `-c`), which this shell does not do for any
+/// assignment error yet. Each script ends with the failing command, so that
+/// does not show here. The `.` and `< in` rows read files of a temporary
+/// directory.
 #[test]
 fn an_integer_underscore_bind_error_names_its_command() {
 	let literal: &[(&str, &str, &str)] = &[
@@ -278,6 +280,54 @@ fn an_integer_underscore_bind_error_names_its_command() {
 		),
 		// `eval`'s bind after a `break` in it names no command.
 		("declare -i _=5; for i in 1; do eval 'break;' a/b; done", "", div0("", "a/b")),
+		// `select`, `((` and `[[` name the command once, when they start: a
+		// `${ cmd; }` in their words runs after that and names last.
+		(
+			"declare -i _=5; f() { select x in ${ echo a; (( 1 )); }; do :; done 2>/dev/null; }; f \
+			 a/b",
+			"\n",
+			div0("((", "a/b"),
+		),
+		(
+			"declare -i _=5; f() { select x in ${ echo a; (( 1 )); } $(echo b); do :; done \
+			 2>/dev/null; }; f a/b",
+			"\n",
+			div0("((", "a/b"),
+		),
+		(
+			"declare -i _=5; f() { select x in ${ echo a; [[ x ]]; }; do :; done 2>/dev/null; }; f \
+			 a/b",
+			"\n",
+			div0("[[", "a/b"),
+		),
+		(
+			"declare -i _=5; f() { select x in a ${ echo b; (( 1 )); }; do :; done 2>/dev/null; }; f \
+			 a/b",
+			"\n",
+			div0("((", "a/b"),
+		),
+		(
+			"declare -i _=5; f() { select x in ${ echo a; true; }; do :; done 2>/dev/null; }; f a/b",
+			"\n",
+			div0("", "a/b"),
+		),
+		("declare -i _=5; f() { (( ${ true; echo 1; } )); }; f a/b", "", div0("", "a/b")),
+		("declare -i _=5; f() { (( ${ (( 1 )); echo 1; } )); }; f a/b", "", div0("", "a/b")),
+		(
+			"declare -i _=5; f() { while (( ${ true; echo 0; } )); do :; done; }; f a/b",
+			"",
+			div0("", "a/b"),
+		),
+		("declare -i _=5; f() { [[ -n ${ true; echo x; } ]]; }; f a/b", "", div0("", "a/b")),
+		("declare -i _=5; f() { [[ -n ${ true; echo x; } && -n y ]]; }; f a/b", "", div0("", "a/b")),
+		("declare -i _=5; f() { (( $(echo 1) )); }; f a/b", "", div0("((", "a/b")),
+		("declare -i _=5; f() { [[ -n $(echo x) ]]; }; f a/b", "", div0("[[", "a/b")),
+		(
+			"declare -i _=5; f() { for (( i = ${ true; echo 0; }; i < 1; i++ )); do true; done; }; f \
+			 a/b",
+			"",
+			div0("((", "a/b"),
+		),
 	]);
 	let dir = tempfile::tempdir().unwrap();
 	for (name, text) in [
