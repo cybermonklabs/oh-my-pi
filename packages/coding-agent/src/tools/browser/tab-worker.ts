@@ -2226,6 +2226,8 @@ export class WorkerCore {
 	}
 
 	#ensureRuntime(session: SessionSnapshot): JsRuntime {
+		// A core that stopped while a run waited builds no runtime: nothing would dispose it.
+		if (this.#stopped) throw new ToolAbortError("Tab worker stopped");
 		if (this.#runtime) return this.#runtime;
 		this.#runtime = new JsRuntime({
 			initialCwd: session.cwd,
@@ -3655,6 +3657,9 @@ export class WorkerCore {
 		this.#stopped = true;
 		this.#unsub();
 		this.#uninstallRejectionGuard();
+		// The tab's runtime ends with the core: an inline core shares omp's realm, whose global table would keep it.
+		this.#runtime?.dispose();
+		this.#runtime = null;
 		return true;
 	}
 

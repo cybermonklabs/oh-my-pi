@@ -326,6 +326,7 @@
 - When a browser omp launched does not close in time, omp now ends the browser's whole process group (puppeteer launches Chromium detached, in a group of its own) and waits until the group is empty, as puppeteer's own kill does: a child that a browser process forks while it is being ended, and that outlives its parent, no longer keeps running. An app omp spawned is no longer killed by pid after it has exited, when the pid may belong to another process
 - Secret obfuscation and the stream redaction of `omp stream` and `/record` skip a `secrets.yml` that is not a regular file, such as a directory or a FIFO, without opening it, and one that grows while it is read; both skips are logged as a warning
 - Merging a task's changes back (three-way patch apply, cherry-picking its branch, and restoring stashed edits) now reports a conflict when both sides edit adjacent lines, as git does, instead of merging both edits ([#16410](https://github.com/can1357/oh-my-pi/pull/16410) by [@sjawhar](https://github.com/sjawhar))
+- Fixed cmux and Tern tabs, and Puppeteer tabs on the inline tab worker, keeping their JS runtime after the tab was closed or killed: each such tab left its runtime's entries in the process's shared global table, holding the runtime and its last run's tab objects, for the life of the omp process. The runtime now ends with its tab
 
 ### Security
 
