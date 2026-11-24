@@ -19,6 +19,13 @@ import {
 } from "./session-storage";
 import { parseTitleSlotFromContent, type SessionTitleUpdate, titleUpdateFromSlot } from "./session-title-slot";
 
+/**
+ * The kind of private temporary directory the spool files live in
+ * ({@link privateTempDir}): the one a spool opens its file in and the one its
+ * warning names.
+ */
+const SPOOL_DIR_KIND = "spool";
+
 /** One full write: its size and title slot, its backend publish, and the read-back after a failed publish. */
 export interface FullBody {
 	byteLength: number;
@@ -200,7 +207,7 @@ class LinesHead {
  * opened is closed.
  */
 function spoolLines(lines: Iterable<string>, uid: number): BodySpool {
-	const file = openPrivateTempFile("spool", uid, "Session spool directory");
+	const file = openPrivateTempFile(SPOOL_DIR_KIND, uid, "Session spool directory");
 	try {
 		const head = new LinesHead();
 		const bytes = writeLinesToDescriptorSync(file.fd, head.note(lines));
@@ -366,7 +373,7 @@ export class FullBodies {
 			if (!this.#spoolFailureLogged) {
 				this.#spoolFailureLogged = true;
 				logger.warn("Session rewrites stream straight to the store: their spool file cannot be used", {
-					dir: privateTempDir("spool", uid),
+					dir: privateTempDir(SPOOL_DIR_KIND, uid),
 					error: spoolError,
 				});
 			}
