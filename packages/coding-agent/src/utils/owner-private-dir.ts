@@ -56,9 +56,11 @@ export function privateTempDir(prefix: string, uid: number): string {
  * A file {@link openPrivateTempFile} opened, read and written through its
  * descriptor until {@link close}. After the close the process can give the
  * number to another file, whose bytes a read would take for this file's, so
- * {@link fd} throws from then on and only the first close closes it.
+ * {@link fd} throws from then on and only the first close closes it. Only
+ * {@link openPrivateTempFile} makes one, so the class is exported as a type:
+ * no other module can wrap a descriptor of its own as a private file.
  */
-export class PrivateTempFile {
+class PrivateTempFile {
 	readonly #fd: number;
 	#closed = false;
 
@@ -83,6 +85,8 @@ export class PrivateTempFile {
 		}
 	}
 }
+
+export type { PrivateTempFile };
 
 /**
  * Open a new file, mode 0600, in {@link privateTempDir}, made 0700 when
