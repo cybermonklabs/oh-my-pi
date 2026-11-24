@@ -73,7 +73,7 @@ use crate::{
 use crate::{
 	fifo::{FifoName, FifoOpen, FifoPin},
 	fs::{
-		by_name_options, creates, fifo_open_waits, reopen_options, truncates, wait_fifo,
+		by_name_options, creates, fifo_open_waits, reads_only, reopen_options, truncates, wait_fifo,
 		wait_fifo_async,
 	},
 };
@@ -647,7 +647,9 @@ fn host_fifo_pin(
 /// applies itself while the open is live ([`by_name_options`]), relative to
 /// a duplicate of the directory's descriptor. Elsewhere (off Linux, and on
 /// Linux without `/proc`) the helper opens `name` there, and the release
-/// opens it while it names the pinned FIFO.
+/// opens it while it names the pinned FIFO. Under gVisor a read-only open
+/// ([`reads_only`]) also looks for a writer its helper missed
+/// ([`FifoOpen::start_reading`]).
 #[cfg(unix)]
 fn host_fifo_open(
 	handle: &native::Handle,
@@ -664,23 +666,24 @@ fn host_fifo_open(
 	let fifo_name = FifoName::at(handle.as_fd(), name)?;
 	let dir = handle.try_clone()?;
 	let (open_name, open_options, mask) = (name.to_vec(), options.clone(), host_mask(scope));
-	Ok(FifoOpen::start_pinned(
-		pin,
-		fifo_name,
-		creates(options),
-		truncates(options),
-		move |path, pinned| {
-			if pinned {
-				reopen_options(&open_options)
-					.to_std()
-					.open(path)
-					.map(File::from)
-			} else {
-				let by_name = by_name_options(&open_options);
-				with_scratch(|s| native::open_at(s, &dir, &open_name, &by_name, mask)).map(File::from)
-			}
-		},
-	))
+	let open = move |path: &std::path::Path, pinned: bool| {
+		if pinned {
+			reopen_options(&open_options)
+				.to_std()
+				.open(path)
+				.map(File::from)
+		} else {
+			let by_name = by_name_options(&open_options);
+			with_scratch(|s| native::open_at(s, &dir, &open_name, &by_name, mask)).map(File::from)
+		}
+	};
+	Ok(if reads_only(options) {
+		FifoOpen::start_pinned_reading(pin, fifo_name, creates(options), open, |end| {
+			Ok(File::from(end))
+		})
+	} else {
+		FifoOpen::start_pinned(pin, fifo_name, creates(options), truncates(options), open)
+	})
 }
 
 const fn provider_dir_options(mode: Option<u32>) -> DirOptions {

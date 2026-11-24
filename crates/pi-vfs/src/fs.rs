@@ -371,6 +371,14 @@ pub(crate) fn by_name_options(options: &OpenOptions) -> OpenOptions {
 	by_name
 }
 
+/// Whether an open with `options` reads only: under gVisor such a FIFO open
+/// does not depend on its `open(2)` being woken ([`FifoOpen::start_reading`]),
+/// as gVisor can leave it asleep after its writer came.
+#[cfg(unix)]
+pub(crate) const fn reads_only(options: &OpenOptions) -> bool {
+	options.is_read() && !options.is_writable()
+}
+
 /// Starts opening one end of the FIFO at `path`, pinned as `pin`, on a helper
 /// thread (see [`FifoOpen`]), so that the wait for the other end observes
 /// `token` and, for async callers, holds no runtime worker. The helper runs
@@ -378,7 +386,9 @@ pub(crate) fn by_name_options(options: &OpenOptions) -> OpenOptions {
 /// without a token: once the other end connects. It opens the pin's
 /// `/proc/self/fd/N` with [`reopen_options`], or the path with
 /// [`by_name_options`] when the open has `O_CREAT` ([`creates`]) or no
-/// `/proc/self/fd/N` reaches the pin.
+/// `/proc/self/fd/N` reaches the pin. Under gVisor a read-only open
+/// ([`reads_only`]) also looks for a writer its helper missed
+/// ([`FifoOpen::start_reading`]).
 ///
 /// Once the token fires, the open fails with [`crate::cancelled`], and
 /// dropping it releases the helper, so it leaves no end of the FIFO behind
@@ -399,20 +409,21 @@ fn start_fifo(
 	}
 	let follow = options.get_custom_flags() & libc::O_NOFOLLOW == 0;
 	let name = FifoName::Path { path: path.to_path_buf(), follow };
+	let read_only = reads_only(options);
+	let (o_creat, o_trunc) = (creates(options), truncates(options));
 	let (scope, options) = (scope.clone(), options.clone());
-	Ok(FifoOpen::start_pinned(
-		pin,
-		name,
-		creates(&options),
-		truncates(&options),
-		move |path, pinned| {
-			if pinned {
-				native_open(&scope, path, &reopen_options(&options))
-			} else {
-				native_open(&scope, path, &by_name_options(&options))
-			}
-		},
-	))
+	let open = move |path: &Path, pinned: bool| {
+		if pinned {
+			native_open(&scope, path, &reopen_options(&options))
+		} else {
+			native_open(&scope, path, &by_name_options(&options))
+		}
+	};
+	Ok(if read_only {
+		FifoOpen::start_pinned_reading(pin, name, o_creat, open, |end| Ok(File::from(end)))
+	} else {
+		FifoOpen::start_pinned(pin, name, o_creat, o_trunc, open)
+	})
 }
 
 /// Waits for a FIFO open on this thread, checking `token` every poll slice.
