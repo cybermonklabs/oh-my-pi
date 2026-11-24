@@ -16,8 +16,8 @@ use parking_lot::Mutex;
 
 use crate::{
 	bash::{
-		Budget, CallOutcome, Cx, EngineConfig, ExitStatus, ExtProc, Lineage, Script, ShellApi,
-		Signal, SpawnSpec, Step,
+		Budget, CallOutcome, Cx, EngineConfig, EventMask, ExitStatus, ExtProc, Lineage, Script,
+		ShellApi, Signal, SpawnSpec, Step,
 	},
 	testkit::{
 		FakeHost, Rig,
@@ -94,6 +94,15 @@ fn rig(end_orphan_jobs: bool, signals: &Signals) -> Rig {
 	);
 	let cfg = EngineConfig { end_orphan_jobs, ..EngineConfig::default() };
 	Rig::with_config(host, skeleton_init(&[]), cfg)
+}
+
+/// [`rig`] for a test that leaves work running through its whole `settle`:
+/// it emits no events. [`FakeHost`] keeps each event as JSON, a busy loop's
+/// events fill gigabytes in 50 steps, and no test here reads them.
+fn spinning_rig(end_orphan_jobs: bool, signals: &Signals) -> Rig {
+	let mut r = rig(end_orphan_jobs, signals);
+	r.shell().set_event_mask(EventMask::NONE);
+	r
 }
 
 /// Runs `src` as a root script; its status.
@@ -208,7 +217,7 @@ fn a_nested_job_is_judged_on_its_own_when_its_parent_job_ends() {
 // subshell that backgrounded the callout.
 #[test]
 fn a_detached_tree_outlives_its_subshell() {
-	let mut r = rig(true, &Signals::default());
+	let mut r = spinning_rig(true, &Signals::default());
 	assert_eq!(run(&mut r, "spin() { while :; do :; done; }; (detach spin &)"), 0);
 	assert_eq!(settle(&mut r, 50), Settled::Busy);
 	assert!(r.shell().label_live(LABEL), "the detached tree was ended");
@@ -230,11 +239,11 @@ fn orphans_are_found_again_after_a_restore() {
 // jobs.
 #[test]
 fn without_the_knob_orphaned_jobs_run_on() {
-	let mut r = rig(false, &Signals::default());
+	let mut r = spinning_rig(false, &Signals::default());
 	assert_eq!(run(&mut r, "(hold &)"), 0);
 	assert_eq!(settle(&mut r, 50), Settled::Busy);
 	assert_eq!(r.host.live_tasks(), 1);
-	let mut r = rig(false, &Signals::default());
+	let mut r = spinning_rig(false, &Signals::default());
 	assert_eq!(run(&mut r, "(while :; do :; done &)"), 0);
 	assert_eq!(settle(&mut r, 50), Settled::Busy);
 }
