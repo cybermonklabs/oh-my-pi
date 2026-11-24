@@ -452,6 +452,39 @@ fn shell_code_stages_between_externals() {
 	]);
 }
 
+/// A writer whose reader has gone is killed by `SIGPIPE` (141) once a pipe's
+/// worth is written, as in bash: a group's and an external's writes go into
+/// the kernel pipe the reader holds. Through an in-memory pipe and a host
+/// pump (64 KiB each) in front of the external, obash held about 128 KiB more
+/// before a write blocked, so a writer of 96 KiB ended with 0 where bash's
+/// gets `SIGPIPE`. The reader sleeps a second before it takes one byte and
+/// ends: a writer of 4 KiB has ended by then (0), and one of 96 KiB or 256 KiB
+/// waits on the full pipe when the reader goes. Each row with `pipefail` off
+/// and on.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_writer_whose_reader_has_gone_gets_sigpipe_after_one_pipes_worth() {
+	let reader = "/bin/sh -c 'sleep 1; exec /usr/bin/head -c 1' >/dev/null";
+	let mut cases = Vec::new();
+	for (kib, killed) in [(4, false), (96, true), (256, true)] {
+		let n = kib * 1024;
+		let writers = [
+			format!("{{ printf '%0{n}d' 0; echo after; }}"),
+			format!("/usr/bin/head -c {n} /dev/zero"),
+		];
+		let ps = if killed { "141" } else { "0" };
+		for writer in writers {
+			for (pipefail, s) in [("", "0"), ("set -o pipefail; ", ps)] {
+				let script =
+					format!("{pipefail}{writer} | {reader}; echo \"s=$? ps=${{PIPESTATUS[*]}}\"");
+				let want = String::leak(format!("s={s} ps={ps} 0\n"));
+				cases.push(Case::new(Dialect::Bash, script, want));
+			}
+		}
+	}
+	check("a_writer_whose_reader_has_gone_gets_sigpipe_after_one_pipes_worth", &cases);
+}
+
 /// End of file waits for every holder of the write end: a background
 /// external, and the stage's own shell code after its first external ended.
 #[test]
