@@ -2343,14 +2343,14 @@ mod tests {
 		let flag = flag.to_owned();
 		let label = flag.clone();
 		std::thread::spawn(move || {
-			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+			let (runtime, pool) = crate::host::drain_runtime();
 			let status = runtime.block_on(async {
 				let (mut host, _) = Host::for_test_async("rg", "", root);
 				host.set_test_stdout(OpenFile::from(writer));
 				let parsed = Rg::try_parse_from(["rg", flag.as_str(), "hit", "f"]).unwrap();
 				let run = run_caught_async::<Rg>(parsed, &mut host);
 				let reader = std::fs::File::from(OwnedFd::from(reader));
-				let drain = crate::host::drain_once_the_write_waits(reader, capacity);
+				let drain = crate::host::drain_once_the_write_waits(reader, capacity, &pool);
 				let (status, _reader) = tokio::join!(run, drain);
 				status
 			});

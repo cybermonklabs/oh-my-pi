@@ -939,9 +939,12 @@ mod tests {
 		let (done, finished) = channel::<()>();
 		std::thread::spawn(move || {
 			if finished.recv_timeout(Duration::from_secs(5)) == Err(RecvTimeoutError::Timeout) {
-				eprintln!(
-					"DEADLINE fired: the gated write to a pipe of {capacity} bytes did not finish within 5s"
+				// Straight to fd 2: libtest's capture takes `eprintln!`
+				// in this thread too, and `exit` drops what it took.
+				let line = format!(
+					"DEADLINE fired: the gated write to a pipe of {capacity} bytes did not finish within 5s\n"
 				);
+				let _ = std::io::stderr().write_all(line.as_bytes());
 				std::process::exit(1);
 			}
 		});
@@ -991,7 +994,9 @@ mod tests {
 		let (done, finished) = channel::<()>();
 		std::thread::spawn(move || {
 			if finished.recv_timeout(Duration::from_secs(10)) == Err(RecvTimeoutError::Timeout) {
-				eprintln!("DEADLINE fired: a drain without a private reopen did not finish within 10s");
+				// Straight to fd 2, past libtest's capture (see above).
+				let line = "DEADLINE fired: a drain without a private reopen did not finish within 10s\n";
+				let _ = std::io::stderr().write_all(line.as_bytes());
 				std::process::exit(1);
 			}
 		});
