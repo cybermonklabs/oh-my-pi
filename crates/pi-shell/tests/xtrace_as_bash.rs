@@ -1,32 +1,41 @@
 //! `set -x` traces as bash 5.3 does: the shell's EXIT trap at the top level
 //! (also after `exit` in a function, an `eval` or a `.` file, which bash
-//! has unwound before it runs the trap); a `${ ;}` or `${| ;}` body one
-//! level down (bash runs it with `parse_and_execute`); a declaration
-//! builtin's compound assignment traced as the assignment it makes, when
-//! its word expands and before the words after it (`+ a=('1' '<TAB>')`,
-//! every element in plain single quotes, then `+ declare -a a`), each
-//! substitution in the command run once when a `${ ;}` turns `set -x`,
-//! `failglob` or `set -f` on or off; `export`'s and `readonly`'s
-//! `name=value` operands traced as each is assigned, through the
-//! builtin's own (redirected) descriptors (`+ export X=1`, then `+ X=1`;
-//! none for `-f`, `-a` or `-A`), a failed write of that line not failing
-//! the builtin; and `PS4`'s first character repeated whole when it is
-//! multibyte.
+//! has unwound before it runs the trap), a command substitution's at its
+//! commands' level and a subshell's one below them; a `${ ;}` or `${| ;}`
+//! body one level down (bash runs it with `parse_and_execute`); `PS4`
+//! expanded for each line with its substitutions run (`$( )`, a backquote,
+//! `${ ;}`, `${| ;}`), at every place bash traces: a simple command's
+//! assignments and words, a declaration's compound assignment, `export`'s
+//! and `readonly`'s operands, `case`, `for` and `select` headers (a `for`
+//! header before its variable is bound), `(( ))`, an arithmetic `for`'s
+//! expressions and `[[ ]]`; a declaration builtin's compound assignment
+//! traced as the assignment it makes, when its word expands and before the
+//! words after it (`+ a=('1' '<TAB>')`, every element in plain single
+//! quotes, then `+ declare -a a`), each substitution in the command run
+//! once when a `${ ;}` turns `set -x`, `failglob` or `set -f` on or off;
+//! `export`'s and `readonly`'s `name=value` operands traced as each is
+//! assigned, through the builtin's own (redirected) descriptors
+//! (`+ export X=1`, then `+ X=1`; none for `-f`, `-a` or `-A`), a failed
+//! write of that line not failing the builtin; and `PS4`'s first character
+//! repeated whole when it is multibyte.
 //!
 //! The rows ([`ROWS`]) are bash's own output: each script as `bash -c` and
 //! as `bash ./s.sh`, run by bash 5.3.20 and 5.2.21 in a fresh directory
 //! holding `in` ("hello") and a FIFO `fifo`, the directory written `DIR`; a
 //! row both run alike is checked as both run it, one they run otherwise as
-//! 5.3.20 does. Left out: `PS4` with a substitution in it (`$(…)`, a
-//! backquote, `${ ;}`) and a command substitution's own EXIT trap level,
-//! which obash does not trace as bash yet; a pipeline's trace order (it
-//! depends on which stage runs first, in bash too); a row that prints a
-//! pid; a `PS4` whose first byte is no character in a UTF-8 locale (bash
-//! 5.3.20 aborts on it); and the rows about when a declaration's compound
-//! assignment is made rather than traced (bash makes it as it expands the
-//! word, so a later word sees it, a `failglob` error stops the words after
-//! it, and under `failglob` it is traced before a later `${ ;}` runs;
-//! obash makes it in the builtin).
+//! 5.3.20 does. Left out: a `PS4` that reads a variable the command it
+//! traces assigns (bash expands it between the assignments, obash once
+//! after them); a pipeline's trace order (it depends on which stage runs
+//! first, in bash too); a row that prints a pid; a `PS4` whose first byte
+//! is no character in a UTF-8 locale (bash 5.3.20 aborts on it); a syntax
+//! error in a `PS4` substitution (bash and obash word the diagnostic and
+//! its prefix differently); a `${x@P}` whose value runs a command
+//! substitution (`x='$(exit 3)'; echo "${x@P}"`), which obash cannot yet
+//! park on and its own member fixes; and the rows about when a
+//! declaration's compound assignment is made rather than traced (bash
+//! makes it as it expands the word, so a later word sees it, a `failglob`
+//! error stops the words after it, and under `failglob` it is traced
+//! before a later `${ ;}` runs; obash makes it in the builtin).
 #![cfg(unix)]
 
 mod obash_support;

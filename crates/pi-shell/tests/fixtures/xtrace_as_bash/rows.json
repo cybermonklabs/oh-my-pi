@@ -930,6 +930,36 @@
   ]
  },
  {
+  "id": "x-ps4-cmdsub",
+  "file": false,
+  "script": "PS4='$(echo T) '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "T echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "T echo a\n"
+  ]
+ },
+ {
+  "id": "x-ps4-cmdsub",
+  "file": true,
+  "script": "PS4='$(echo T) '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "T echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "T echo a\n"
+  ]
+ },
+ {
   "id": "x-ps4-empty",
   "file": false,
   "script": "PS4=''; set -x; echo a",
@@ -2277,6 +2307,36 @@
    0,
    "T\n",
    "+ trap 'echo T' EXIT\n+ :\n++ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-comsub",
+  "file": false,
+  "script": "set -x; x=$(trap 'echo T' EXIT; :); echo \"$x\"",
+  "bash53": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ :\n++ echo T\n+ x=T\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ :\n++ echo T\n+ x=T\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-comsub",
+  "file": true,
+  "script": "set -x; x=$(trap 'echo T' EXIT; :); echo \"$x\"",
+  "bash53": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ :\n++ echo T\n+ x=T\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ :\n++ echo T\n+ x=T\n+ echo T\n"
   ]
  },
  {
@@ -2610,6 +2670,1506 @@
   ]
  },
  {
+  "id": "p-cmdsub",
+  "file": false,
+  "script": "PS4='$(echo T) '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "T echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "T echo a\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub",
+  "file": true,
+  "script": "PS4='$(echo T) '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "T echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "T echo a\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-twice",
+  "file": false,
+  "script": "PS4='$(echo T) '; set -x; echo a; echo b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "T echo a\nT echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "T echo a\nT echo b\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-twice",
+  "file": true,
+  "script": "PS4='$(echo T) '; set -x; echo a; echo b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "T echo a\nT echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "T echo a\nT echo b\n"
+  ]
+ },
+ {
+  "id": "p-backquote",
+  "file": false,
+  "script": "PS4='`echo B` '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "B echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "B echo a\n"
+  ]
+ },
+ {
+  "id": "p-backquote",
+  "file": true,
+  "script": "PS4='`echo B` '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "B echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "B echo a\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-level",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; eval 'echo a'",
+  "bash53": [
+   0,
+   "a\n",
+   "T+ eval 'echo a'\nTT+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "T+ eval 'echo a'\nTT+ echo a\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-level",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; eval 'echo a'",
+  "bash53": [
+   0,
+   "a\n",
+   "T+ eval 'echo a'\nTT+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "T+ eval 'echo a'\nTT+ echo a\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-count",
+  "file": false,
+  "script": "n=0; PS4='$((n+=1))+ '; set -x; echo a; echo b; set +x; echo \"n=$n\"",
+  "bash53": [
+   0,
+   "a\nb\nn=3\n",
+   "1+ echo a\n2+ echo b\n3+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\nn=3\n",
+   "1+ echo a\n2+ echo b\n3+ set +x\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-count",
+  "file": true,
+  "script": "n=0; PS4='$((n+=1))+ '; set -x; echo a; echo b; set +x; echo \"n=$n\"",
+  "bash53": [
+   0,
+   "a\nb\nn=3\n",
+   "1+ echo a\n2+ echo b\n3+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\nn=3\n",
+   "1+ echo a\n2+ echo b\n3+ set +x\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-sideeffect",
+  "file": false,
+  "script": "PS4='$(x=1)+ '; set -x; echo a; set +x; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "a\n[]\n",
+   "+ echo a\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "a\n[]\n",
+   "+ echo a\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-sideeffect",
+  "file": true,
+  "script": "PS4='$(x=1)+ '; set -x; echo a; set +x; echo \"[$x]\"",
+  "bash53": [
+   0,
+   "a\n[]\n",
+   "+ echo a\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "a\n[]\n",
+   "+ echo a\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "p-funsub",
+  "file": false,
+  "script": "PS4='${ echo F; }+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "F+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "bash: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ echo a\n"
+  ]
+ },
+ {
+  "id": "p-funsub",
+  "file": true,
+  "script": "PS4='${ echo F; }+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "F+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "./s.sh: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ echo a\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-status",
+  "file": false,
+  "script": "PS4='$(exit 3)+ '; set -x; false; echo $?",
+  "bash53": [
+   0,
+   "1\n",
+   "+ false\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ false\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-status",
+  "file": true,
+  "script": "PS4='$(exit 3)+ '; set -x; false; echo $?",
+  "bash53": [
+   0,
+   "1\n",
+   "+ false\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ false\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-for",
+  "file": false,
+  "script": "PS4='$(echo T) '; set -x; for i in 1; do :; done",
+  "bash53": [
+   0,
+   "",
+   "T for i in 1\nT :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T for i in 1\nT :\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-for",
+  "file": true,
+  "script": "PS4='$(echo T) '; set -x; for i in 1; do :; done",
+  "bash53": [
+   0,
+   "",
+   "T for i in 1\nT :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T for i in 1\nT :\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-assign",
+  "file": false,
+  "script": "PS4='$(echo T) '; set -x; x=1",
+  "bash53": [
+   0,
+   "",
+   "T x=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T x=1\n"
+  ]
+ },
+ {
+  "id": "p-cmdsub-assign",
+  "file": true,
+  "script": "PS4='$(echo T) '; set -x; x=1",
+  "bash53": [
+   0,
+   "",
+   "T x=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T x=1\n"
+  ]
+ },
+ {
+  "id": "p3-assign-two",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; x=1 y=2 true",
+  "bash53": [
+   0,
+   "",
+   "T+ x=1\nT+ y=2\nT+ true\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ x=1\nT+ y=2\nT+ true\n"
+  ]
+ },
+ {
+  "id": "p3-assign-two",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; x=1 y=2 true",
+  "bash53": [
+   0,
+   "",
+   "T+ x=1\nT+ y=2\nT+ true\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ x=1\nT+ y=2\nT+ true\n"
+  ]
+ },
+ {
+  "id": "p3-status-seen",
+  "file": false,
+  "script": "PS4='$(echo $?)+ '; set -x; false; true; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "0+ false\n1+ true\n0+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "0+ false\n1+ true\n0+ echo a\n"
+  ]
+ },
+ {
+  "id": "p3-status-seen",
+  "file": true,
+  "script": "PS4='$(echo $?)+ '; set -x; false; true; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "0+ false\n1+ true\n0+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "0+ false\n1+ true\n0+ echo a\n"
+  ]
+ },
+ {
+  "id": "p3-status-kept",
+  "file": false,
+  "script": "PS4='$(exit 3)+ '; set -x; false; echo $?",
+  "bash53": [
+   0,
+   "1\n",
+   "+ false\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ false\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "p3-status-kept",
+  "file": true,
+  "script": "PS4='$(exit 3)+ '; set -x; false; echo $?",
+  "bash53": [
+   0,
+   "1\n",
+   "+ false\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ false\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "p3-subshell-level",
+  "file": false,
+  "script": "PS4='$(echo $BASH_SUBSHELL)+ '; set -x; echo a; ( echo b )",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "1+ echo a\n2+ echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "1+ echo a\n2+ echo b\n"
+  ]
+ },
+ {
+  "id": "p3-subshell-level",
+  "file": true,
+  "script": "PS4='$(echo $BASH_SUBSHELL)+ '; set -x; echo a; ( echo b )",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "1+ echo a\n2+ echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "1+ echo a\n2+ echo b\n"
+  ]
+ },
+ {
+  "id": "p3-lineno",
+  "file": false,
+  "script": "PS4='$(echo $LINENO)+ '; set -x; echo a\necho b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "1+ echo a\n2+ echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "1+ echo a\n2+ echo b\n"
+  ]
+ },
+ {
+  "id": "p3-lineno",
+  "file": true,
+  "script": "PS4='$(echo $LINENO)+ '; set -x; echo a\necho b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "1+ echo a\n2+ echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "1+ echo a\n2+ echo b\n"
+  ]
+ },
+ {
+  "id": "p3-stderr",
+  "file": false,
+  "script": "PS4='$(echo E >&2)+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "E\n+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "E\n+ echo a\n"
+  ]
+ },
+ {
+  "id": "p3-stderr",
+  "file": true,
+  "script": "PS4='$(echo E >&2)+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "E\n+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "E\n+ echo a\n"
+  ]
+ },
+ {
+  "id": "p3-for",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; for i in 1; do :; done",
+  "bash53": [
+   0,
+   "",
+   "T+ for i in 1\nT+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ for i in 1\nT+ :\n"
+  ]
+ },
+ {
+  "id": "p3-for",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; for i in 1; do :; done",
+  "bash53": [
+   0,
+   "",
+   "T+ for i in 1\nT+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ for i in 1\nT+ :\n"
+  ]
+ },
+ {
+  "id": "p3-case",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; case a in a) :;; esac",
+  "bash53": [
+   0,
+   "",
+   "T+ case a in\nT+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ case a in\nT+ :\n"
+  ]
+ },
+ {
+  "id": "p3-case",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; case a in a) :;; esac",
+  "bash53": [
+   0,
+   "",
+   "T+ case a in\nT+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ case a in\nT+ :\n"
+  ]
+ },
+ {
+  "id": "p3-dbracket",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; [[ a ]]",
+  "bash53": [
+   0,
+   "",
+   "T+ [[ -n a ]]\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ [[ -n a ]]\n"
+  ]
+ },
+ {
+  "id": "p3-dbracket",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; [[ a ]]",
+  "bash53": [
+   0,
+   "",
+   "T+ [[ -n a ]]\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ [[ -n a ]]\n"
+  ]
+ },
+ {
+  "id": "p3-arith",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; (( 1 ))",
+  "bash53": [
+   0,
+   "",
+   "T+ ((  1  ))\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ ((  1  ))\n"
+  ]
+ },
+ {
+  "id": "p3-arith",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; (( 1 ))",
+  "bash53": [
+   0,
+   "",
+   "T+ ((  1  ))\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ ((  1  ))\n"
+  ]
+ },
+ {
+  "id": "p3-arith-for",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; for ((i=0; i<1; i++)); do :; done",
+  "bash53": [
+   0,
+   "",
+   "T+ (( i=0 ))\nT+ (( i<1 ))\nT+ :\nT+ (( i++ ))\nT+ (( i<1 ))\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ (( i=0 ))\nT+ (( i<1 ))\nT+ :\nT+ (( i++ ))\nT+ (( i<1 ))\n"
+  ]
+ },
+ {
+  "id": "p3-arith-for",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; for ((i=0; i<1; i++)); do :; done",
+  "bash53": [
+   0,
+   "",
+   "T+ (( i=0 ))\nT+ (( i<1 ))\nT+ :\nT+ (( i++ ))\nT+ (( i<1 ))\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ (( i=0 ))\nT+ (( i<1 ))\nT+ :\nT+ (( i++ ))\nT+ (( i<1 ))\n"
+  ]
+ },
+ {
+  "id": "p3-select",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; select x in a; do break; done < /dev/null",
+  "bash53": [
+   1,
+   "\n",
+   "T+ select x in a\n1) a\n#? "
+  ],
+  "bash52": [
+   1,
+   "\n",
+   "T+ select x in a\n1) a\n#? "
+  ]
+ },
+ {
+  "id": "p3-select",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; select x in a; do break; done < /dev/null",
+  "bash53": [
+   1,
+   "\n",
+   "T+ select x in a\n1) a\n#? "
+  ],
+  "bash52": [
+   1,
+   "\n",
+   "T+ select x in a\n1) a\n#? "
+  ]
+ },
+ {
+  "id": "p3-function",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; f() { echo in; }; f",
+  "bash53": [
+   0,
+   "in\n",
+   "T+ f\nT+ echo in\n"
+  ],
+  "bash52": [
+   0,
+   "in\n",
+   "T+ f\nT+ echo in\n"
+  ]
+ },
+ {
+  "id": "p3-function",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; f() { echo in; }; f",
+  "bash53": [
+   0,
+   "in\n",
+   "T+ f\nT+ echo in\n"
+  ],
+  "bash52": [
+   0,
+   "in\n",
+   "T+ f\nT+ echo in\n"
+  ]
+ },
+ {
+  "id": "p3-eval",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; eval 'echo e'",
+  "bash53": [
+   0,
+   "e\n",
+   "T+ eval 'echo e'\nTT+ echo e\n"
+  ],
+  "bash52": [
+   0,
+   "e\n",
+   "T+ eval 'echo e'\nTT+ echo e\n"
+  ]
+ },
+ {
+  "id": "p3-eval",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; eval 'echo e'",
+  "bash53": [
+   0,
+   "e\n",
+   "T+ eval 'echo e'\nTT+ echo e\n"
+  ],
+  "bash52": [
+   0,
+   "e\n",
+   "T+ eval 'echo e'\nTT+ echo e\n"
+  ]
+ },
+ {
+  "id": "p3-comsub",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; x=$(echo in); echo \"$x\"",
+  "bash53": [
+   0,
+   "in\n",
+   "TT+ echo in\nT+ x=in\nT+ echo in\n"
+  ],
+  "bash52": [
+   0,
+   "in\n",
+   "TT+ echo in\nT+ x=in\nT+ echo in\n"
+  ]
+ },
+ {
+  "id": "p3-comsub",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; x=$(echo in); echo \"$x\"",
+  "bash53": [
+   0,
+   "in\n",
+   "TT+ echo in\nT+ x=in\nT+ echo in\n"
+  ],
+  "bash52": [
+   0,
+   "in\n",
+   "TT+ echo in\nT+ x=in\nT+ echo in\n"
+  ]
+ },
+ {
+  "id": "p3-backquote-two",
+  "file": false,
+  "script": "PS4='`echo B`+ '; set -x; x=1; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "B+ x=1\nB+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "B+ x=1\nB+ echo a\n"
+  ]
+ },
+ {
+  "id": "p3-backquote-two",
+  "file": true,
+  "script": "PS4='`echo B`+ '; set -x; x=1; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "B+ x=1\nB+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "B+ x=1\nB+ echo a\n"
+  ]
+ },
+ {
+  "id": "p3-funsub-two",
+  "file": false,
+  "script": "PS4='${ echo F; }+ '; set -x; echo a; echo b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "F+ echo a\nF+ echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "bash: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ echo a\nbash: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ echo b\n"
+  ]
+ },
+ {
+  "id": "p3-funsub-two",
+  "file": true,
+  "script": "PS4='${ echo F; }+ '; set -x; echo a; echo b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "F+ echo a\nF+ echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "./s.sh: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ echo a\n./s.sh: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ echo b\n"
+  ]
+ },
+ {
+  "id": "p3-valsub",
+  "file": false,
+  "script": "PS4='${| REPLY=V; }+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "V+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "bash: line 1: ${| REPLY=V; }+ : bad substitution\n${| REPLY=V; }+ echo a\n"
+  ]
+ },
+ {
+  "id": "p3-valsub",
+  "file": true,
+  "script": "PS4='${| REPLY=V; }+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "V+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "./s.sh: line 1: ${| REPLY=V; }+ : bad substitution\n${| REPLY=V; }+ echo a\n"
+  ]
+ },
+ {
+  "id": "p3-trap-exit",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; trap 'echo X' EXIT; echo body",
+  "bash53": [
+   0,
+   "body\nX\n",
+   "T+ trap 'echo X' EXIT\nT+ echo body\nT+ echo X\n"
+  ],
+  "bash52": [
+   0,
+   "body\nX\n",
+   "T+ trap 'echo X' EXIT\nT+ echo body\nT+ echo X\n"
+  ]
+ },
+ {
+  "id": "p3-trap-exit",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; trap 'echo X' EXIT; echo body",
+  "bash53": [
+   0,
+   "body\nX\n",
+   "T+ trap 'echo X' EXIT\nT+ echo body\nT+ echo X\n"
+  ],
+  "bash52": [
+   0,
+   "body\nX\n",
+   "T+ trap 'echo X' EXIT\nT+ echo body\nT+ echo X\n"
+  ]
+ },
+ {
+  "id": "p3-redir",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; echo a > f; cat f",
+  "bash53": [
+   0,
+   "a\n",
+   "T+ echo a\nT+ cat f\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "T+ echo a\nT+ cat f\n"
+  ]
+ },
+ {
+  "id": "p3-redir",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; echo a > f; cat f",
+  "bash53": [
+   0,
+   "a\n",
+   "T+ echo a\nT+ cat f\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "T+ echo a\nT+ cat f\n"
+  ]
+ },
+ {
+  "id": "p3-builtin-declare",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; declare -a a=(1 2)",
+  "bash53": [
+   0,
+   "",
+   "T+ a=('1' '2')\nT+ declare -a a\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ a=('1' '2')\nT+ declare -a a\n"
+  ]
+ },
+ {
+  "id": "p3-builtin-declare",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; declare -a a=(1 2)",
+  "bash53": [
+   0,
+   "",
+   "T+ a=('1' '2')\nT+ declare -a a\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ a=('1' '2')\nT+ declare -a a\n"
+  ]
+ },
+ {
+  "id": "p3-mixed",
+  "file": false,
+  "script": "PS4='$(echo C)${ echo F; }$((1+1))+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "CF2+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "bash: line 1: $(echo C)${ echo F; }$((1+1))+ : bad substitution\n$(echo C)${ echo F; }$((1+1))+ echo a\n"
+  ]
+ },
+ {
+  "id": "p3-mixed",
+  "file": true,
+  "script": "PS4='$(echo C)${ echo F; }$((1+1))+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "CF2+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "./s.sh: line 1: $(echo C)${ echo F; }$((1+1))+ : bad substitution\n$(echo C)${ echo F; }$((1+1))+ echo a\n"
+  ]
+ },
+ {
+  "id": "p3-xtracefd",
+  "file": false,
+  "script": "exec 7>tr; BASH_XTRACEFD=7; PS4='$(echo T)+ '; set -x; echo a; set +x; cat tr",
+  "bash53": [
+   0,
+   "a\nT+ echo a\nT+ set +x\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "a\nT+ echo a\nT+ set +x\n",
+   ""
+  ]
+ },
+ {
+  "id": "p3-xtracefd",
+  "file": true,
+  "script": "exec 7>tr; BASH_XTRACEFD=7; PS4='$(echo T)+ '; set -x; echo a; set +x; cat tr",
+  "bash53": [
+   0,
+   "a\nT+ echo a\nT+ set +x\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "a\nT+ echo a\nT+ set +x\n",
+   ""
+  ]
+ },
+ {
+  "id": "e3-comsub-exit",
+  "file": false,
+  "script": "set -x; x=$(trap 'echo T' EXIT; :); echo \"$x\"",
+  "bash53": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ :\n++ echo T\n+ x=T\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ :\n++ echo T\n+ x=T\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-comsub-exit",
+  "file": true,
+  "script": "set -x; x=$(trap 'echo T' EXIT; :); echo \"$x\"",
+  "bash53": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ :\n++ echo T\n+ x=T\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ :\n++ echo T\n+ x=T\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-comsub-exit-nested",
+  "file": false,
+  "script": "set -x; x=$(y=$(trap 'echo T' EXIT; :); echo \"$y\"); echo \"$x\"",
+  "bash53": [
+   0,
+   "T\n",
+   "+++ trap 'echo T' EXIT\n+++ :\n+++ echo T\n++ y=T\n++ echo T\n+ x=T\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+++ trap 'echo T' EXIT\n+++ :\n+++ echo T\n++ y=T\n++ echo T\n+ x=T\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-comsub-exit-nested",
+  "file": true,
+  "script": "set -x; x=$(y=$(trap 'echo T' EXIT; :); echo \"$y\"); echo \"$x\"",
+  "bash53": [
+   0,
+   "T\n",
+   "+++ trap 'echo T' EXIT\n+++ :\n+++ echo T\n++ y=T\n++ echo T\n+ x=T\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+++ trap 'echo T' EXIT\n+++ :\n+++ echo T\n++ y=T\n++ echo T\n+ x=T\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-subshell-exit",
+  "file": false,
+  "script": "set -x; ( trap 'echo T' EXIT; : )",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ :\n++ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ :\n++ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-subshell-exit",
+  "file": true,
+  "script": "set -x; ( trap 'echo T' EXIT; : )",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ :\n++ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ :\n++ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-comsub-exit-exit",
+  "file": false,
+  "script": "set -x; x=$(trap 'echo T' EXIT; exit 0); echo \"$x\"",
+  "bash53": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ exit 0\n++ echo T\n+ x=T\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ exit 0\n++ echo T\n+ x=T\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-comsub-exit-exit",
+  "file": true,
+  "script": "set -x; x=$(trap 'echo T' EXIT; exit 0); echo \"$x\"",
+  "bash53": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ exit 0\n++ echo T\n+ x=T\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ exit 0\n++ echo T\n+ x=T\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "p3-for-var",
+  "file": false,
+  "script": "PS4='$(echo \"[$i]\")+ '; set -x; for i in a b; do :; done",
+  "bash53": [
+   0,
+   "",
+   "[]+ for i in a b\n[a]+ :\n[a]+ for i in a b\n[b]+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "[]+ for i in a b\n[a]+ :\n[a]+ for i in a b\n[b]+ :\n"
+  ]
+ },
+ {
+  "id": "p3-for-var",
+  "file": true,
+  "script": "PS4='$(echo \"[$i]\")+ '; set -x; for i in a b; do :; done",
+  "bash53": [
+   0,
+   "",
+   "[]+ for i in a b\n[a]+ :\n[a]+ for i in a b\n[b]+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "[]+ for i in a b\n[a]+ :\n[a]+ for i in a b\n[b]+ :\n"
+  ]
+ },
+ {
+  "id": "p3-case-arm",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; case a in b) :;; a) echo hit;; esac",
+  "bash53": [
+   0,
+   "hit\n",
+   "T+ case a in\nT+ echo hit\n"
+  ],
+  "bash52": [
+   0,
+   "hit\n",
+   "T+ case a in\nT+ echo hit\n"
+  ]
+ },
+ {
+  "id": "p3-case-arm",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; case a in b) :;; a) echo hit;; esac",
+  "bash53": [
+   0,
+   "hit\n",
+   "T+ case a in\nT+ echo hit\n"
+  ],
+  "bash52": [
+   0,
+   "hit\n",
+   "T+ case a in\nT+ echo hit\n"
+  ]
+ },
+ {
+  "id": "p3-nested-level",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; eval 'eval \"echo e\"'",
+  "bash53": [
+   0,
+   "e\n",
+   "T+ eval 'eval \"echo e\"'\nTT+ eval 'echo e'\nTTT+ echo e\n"
+  ],
+  "bash52": [
+   0,
+   "e\n",
+   "T+ eval 'eval \"echo e\"'\nTT+ eval 'echo e'\nTTT+ echo e\n"
+  ]
+ },
+ {
+  "id": "p3-nested-level",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; eval 'eval \"echo e\"'",
+  "bash53": [
+   0,
+   "e\n",
+   "T+ eval 'eval \"echo e\"'\nTT+ eval 'echo e'\nTTT+ echo e\n"
+  ],
+  "bash52": [
+   0,
+   "e\n",
+   "T+ eval 'eval \"echo e\"'\nTT+ eval 'echo e'\nTTT+ echo e\n"
+  ]
+ },
+ {
+  "id": "p3-in-function-trap",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; f() { trap 'echo R' RETURN; :; }; f; trap - RETURN",
+  "bash53": [
+   0,
+   "R\n",
+   "T+ f\nT+ trap 'echo R' RETURN\nT+ :\nTT+ echo R\nT+ trap - RETURN\n"
+  ],
+  "bash52": [
+   0,
+   "R\n",
+   "T+ f\nT+ trap 'echo R' RETURN\nT+ :\nTT+ echo R\nT+ trap - RETURN\n"
+  ]
+ },
+ {
+  "id": "p3-in-function-trap",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; f() { trap 'echo R' RETURN; :; }; f; trap - RETURN",
+  "bash53": [
+   0,
+   "R\n",
+   "T+ f\nT+ trap 'echo R' RETURN\nT+ :\nTT+ echo R\nT+ trap - RETURN\n"
+  ],
+  "bash52": [
+   0,
+   "R\n",
+   "T+ f\nT+ trap 'echo R' RETURN\nT+ :\nTT+ echo R\nT+ trap - RETURN\n"
+  ]
+ },
+ {
+  "id": "p3-backquote-for",
+  "file": false,
+  "script": "PS4='`echo B`+ '; set -x; for i in 1; do :; done; (( 1 )); [[ x ]]; case a in a) ;; esac",
+  "bash53": [
+   0,
+   "",
+   "B+ for i in 1\nB+ :\nB+ ((  1  ))\nB+ [[ -n x ]]\nB+ case a in\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "B+ for i in 1\nB+ :\nB+ ((  1  ))\nB+ [[ -n x ]]\nB+ case a in\n"
+  ]
+ },
+ {
+  "id": "p3-backquote-for",
+  "file": true,
+  "script": "PS4='`echo B`+ '; set -x; for i in 1; do :; done; (( 1 )); [[ x ]]; case a in a) ;; esac",
+  "bash53": [
+   0,
+   "",
+   "B+ for i in 1\nB+ :\nB+ ((  1  ))\nB+ [[ -n x ]]\nB+ case a in\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "B+ for i in 1\nB+ :\nB+ ((  1  ))\nB+ [[ -n x ]]\nB+ case a in\n"
+  ]
+ },
+ {
+  "id": "p3-empty-sub",
+  "file": false,
+  "script": "PS4='$(:)'; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "echo a\n"
+  ]
+ },
+ {
+  "id": "p3-empty-sub",
+  "file": true,
+  "script": "PS4='$(:)'; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "echo a\n"
+  ]
+ },
+ {
+  "id": "p3-error-in-ps4",
+  "file": false,
+  "script": "PS4='$(echo T)${x?u}+ '; set -x; echo a; echo \"st=$?\"",
+  "bash53": [
+   0,
+   "a\nst=0\n",
+   "bash: line 1: x: u\n$(echo T)${x?u}+ echo a\nbash: line 1: x: u\n$(echo T)${x?u}+ echo st=0\n"
+  ],
+  "bash52": [
+   0,
+   "a\nst=0\n",
+   "bash: line 1: x: u\n$(echo T)${x?u}+ echo a\nbash: line 1: x: u\n$(echo T)${x?u}+ echo st=0\n"
+  ]
+ },
+ {
+  "id": "p3-error-in-ps4",
+  "file": true,
+  "script": "PS4='$(echo T)${x?u}+ '; set -x; echo a; echo \"st=$?\"",
+  "bash53": [
+   0,
+   "a\nst=0\n",
+   "./s.sh: line 1: x: u\n$(echo T)${x?u}+ echo a\n./s.sh: line 1: x: u\n$(echo T)${x?u}+ echo st=0\n"
+  ],
+  "bash52": [
+   0,
+   "a\nst=0\n",
+   "./s.sh: line 1: x: u\n$(echo T)${x?u}+ echo a\n./s.sh: line 1: x: u\n$(echo T)${x?u}+ echo st=0\n"
+  ]
+ },
+ {
+  "id": "p3-sub-sees-status",
+  "file": false,
+  "script": "PS4='$(echo $?)+ '; set -x; (exit 3); case a in a) ;; esac; [[ a ]]; (( 1 ))",
+  "bash53": [
+   0,
+   "",
+   "0+ exit 3\n3+ case a in\n0+ [[ -n a ]]\n0+ ((  1  ))\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "0+ exit 3\n3+ case a in\n0+ [[ -n a ]]\n0+ ((  1  ))\n"
+  ]
+ },
+ {
+  "id": "p3-sub-sees-status",
+  "file": true,
+  "script": "PS4='$(echo $?)+ '; set -x; (exit 3); case a in a) ;; esac; [[ a ]]; (( 1 ))",
+  "bash53": [
+   0,
+   "",
+   "0+ exit 3\n3+ case a in\n0+ [[ -n a ]]\n0+ ((  1  ))\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "0+ exit 3\n3+ case a in\n0+ [[ -n a ]]\n0+ ((  1  ))\n"
+  ]
+ },
+ {
+  "id": "e3-subshell-eval-exit",
+  "file": false,
+  "script": "set -x; ( trap 'echo T' EXIT; eval 'exit 0' )",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n++ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n++ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-subshell-eval-exit",
+  "file": true,
+  "script": "set -x; ( trap 'echo T' EXIT; eval 'exit 0' )",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n++ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n++ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-root-eval-exit",
+  "file": false,
+  "script": "set -x; trap 'echo T' EXIT; eval 'exit 0'",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-root-eval-exit",
+  "file": true,
+  "script": "set -x; trap 'echo T' EXIT; eval 'exit 0'",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-comsub-function-exit",
+  "file": false,
+  "script": "set -x; f() { exit 0; }; x=$(trap 'echo T' EXIT; f); echo \"$x\"",
+  "bash53": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ f\n++ exit 0\n++ echo T\n+ x=T\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ f\n++ exit 0\n++ echo T\n+ x=T\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "e3-comsub-function-exit",
+  "file": true,
+  "script": "set -x; f() { exit 0; }; x=$(trap 'echo T' EXIT; f); echo \"$x\"",
+  "bash53": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ f\n++ exit 0\n++ echo T\n+ x=T\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "++ trap 'echo T' EXIT\n++ f\n++ exit 0\n++ echo T\n+ x=T\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "p3-assign-status",
+  "file": false,
+  "script": "PS4='$(exit 3)+ '; set -x; x=1; echo \"st=$?\"; y=$(exit 4); echo \"st=$?\"",
+  "bash53": [
+   0,
+   "st=0\nst=4\n",
+   "+ x=1\n+ echo st=0\n++ exit 4\n+ y=\n+ echo st=4\n"
+  ],
+  "bash52": [
+   0,
+   "st=0\nst=4\n",
+   "+ x=1\n+ echo st=0\n++ exit 4\n+ y=\n+ echo st=4\n"
+  ]
+ },
+ {
+  "id": "p3-assign-status",
+  "file": true,
+  "script": "PS4='$(exit 3)+ '; set -x; x=1; echo \"st=$?\"; y=$(exit 4); echo \"st=$?\"",
+  "bash53": [
+   0,
+   "st=0\nst=4\n",
+   "+ x=1\n+ echo st=0\n++ exit 4\n+ y=\n+ echo st=4\n"
+  ],
+  "bash52": [
+   0,
+   "st=0\nst=4\n",
+   "+ x=1\n+ echo st=0\n++ exit 4\n+ y=\n+ echo st=4\n"
+  ]
+ },
+ {
+  "id": "p3-assign-sub-status",
+  "file": false,
+  "script": "PS4='$(exit 3)+ '; set -x; x=$(exit 5) y=1; echo \"st=$?\"",
+  "bash53": [
+   0,
+   "st=5\n",
+   "++ exit 5\n+ x=\n+ y=1\n+ echo st=5\n"
+  ],
+  "bash52": [
+   0,
+   "st=5\n",
+   "++ exit 5\n+ x=\n+ y=1\n+ echo st=5\n"
+  ]
+ },
+ {
+  "id": "p3-assign-sub-status",
+  "file": true,
+  "script": "PS4='$(exit 3)+ '; set -x; x=$(exit 5) y=1; echo \"st=$?\"",
+  "bash53": [
+   0,
+   "st=5\n",
+   "++ exit 5\n+ x=\n+ y=1\n+ echo st=5\n"
+  ],
+  "bash52": [
+   0,
+   "st=5\n",
+   "++ exit 5\n+ x=\n+ y=1\n+ echo st=5\n"
+  ]
+ },
+ {
   "id": "e-export-devnull",
   "file": false,
   "script": "set -x; export X=1 2>/dev/null; echo \"$X\"",
@@ -3807,6 +5367,1536 @@
    0,
    "in\ne\ne2\n",
    "+[6] f\n+[4] echo in\n+[8] eval 'echo e\necho e2'\n++[8] echo e\n++[9] echo e2\n"
+  ]
+ },
+ {
+  "id": "p5-export-two",
+  "file": false,
+  "script": "PS4='$(echo T) '; set -x; export X=1 Y=2; echo \"$X$Y\"",
+  "bash53": [
+   0,
+   "12\n",
+   "T export X=1 Y=2\nT X=1\nT Y=2\nT echo 12\n"
+  ],
+  "bash52": [
+   0,
+   "12\n",
+   "T export X=1 Y=2\nT X=1\nT Y=2\nT echo 12\n"
+  ]
+ },
+ {
+  "id": "p5-export-two",
+  "file": true,
+  "script": "PS4='$(echo T) '; set -x; export X=1 Y=2; echo \"$X$Y\"",
+  "bash53": [
+   0,
+   "12\n",
+   "T export X=1 Y=2\nT X=1\nT Y=2\nT echo 12\n"
+  ],
+  "bash52": [
+   0,
+   "12\n",
+   "T export X=1 Y=2\nT X=1\nT Y=2\nT echo 12\n"
+  ]
+ },
+ {
+  "id": "p5-readonly-two",
+  "file": false,
+  "script": "PS4='$(echo T) '; set -x; readonly R=1 S=2; echo \"$R$S\"",
+  "bash53": [
+   0,
+   "12\n",
+   "T readonly R=1 S=2\nT R=1\nT S=2\nT echo 12\n"
+  ],
+  "bash52": [
+   0,
+   "12\n",
+   "T readonly R=1 S=2\nT R=1\nT S=2\nT echo 12\n"
+  ]
+ },
+ {
+  "id": "p5-readonly-two",
+  "file": true,
+  "script": "PS4='$(echo T) '; set -x; readonly R=1 S=2; echo \"$R$S\"",
+  "bash53": [
+   0,
+   "12\n",
+   "T readonly R=1 S=2\nT R=1\nT S=2\nT echo 12\n"
+  ],
+  "bash52": [
+   0,
+   "12\n",
+   "T readonly R=1 S=2\nT R=1\nT S=2\nT echo 12\n"
+  ]
+ },
+ {
+  "id": "p5-export-devnull",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; export X=1 2>/dev/null; echo \"$X\"",
+  "bash53": [
+   0,
+   "1\n",
+   "T+ export X=1\nT+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "T+ export X=1\nT+ echo 1\n"
+  ]
+ },
+ {
+  "id": "p5-export-devnull",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; export X=1 2>/dev/null; echo \"$X\"",
+  "bash53": [
+   0,
+   "1\n",
+   "T+ export X=1\nT+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "T+ export X=1\nT+ echo 1\n"
+  ]
+ },
+ {
+  "id": "p5-export-xtracefd",
+  "file": false,
+  "script": "exec 7>tr; BASH_XTRACEFD=7; PS4='$(echo T)+ '; set -x; export X=1 Y=2; set +x; cat tr",
+  "bash53": [
+   0,
+   "T+ export X=1 Y=2\nT+ X=1\nT+ Y=2\nT+ set +x\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "T+ export X=1 Y=2\nT+ X=1\nT+ Y=2\nT+ set +x\n",
+   ""
+  ]
+ },
+ {
+  "id": "p5-export-xtracefd",
+  "file": true,
+  "script": "exec 7>tr; BASH_XTRACEFD=7; PS4='$(echo T)+ '; set -x; export X=1 Y=2; set +x; cat tr",
+  "bash53": [
+   0,
+   "T+ export X=1 Y=2\nT+ X=1\nT+ Y=2\nT+ set +x\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "T+ export X=1 Y=2\nT+ X=1\nT+ Y=2\nT+ set +x\n",
+   ""
+  ]
+ },
+ {
+  "id": "p5-readonly-error",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; readonly R=1; readonly A=1 R=2 B=3; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "T+ readonly R=1\nT+ R=1\nT+ readonly A=1 R=2 B=3\nT+ A=1\nT+ R=2\nbash: line 1: R: readonly variable\nT+ B=3\nT+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "T+ readonly R=1\nT+ R=1\nT+ readonly A=1 R=2 B=3\nT+ A=1\nT+ R=2\nbash: line 1: R: readonly variable\nT+ B=3\nT+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-readonly-error",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; readonly R=1; readonly A=1 R=2 B=3; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "T+ readonly R=1\nT+ R=1\nT+ readonly A=1 R=2 B=3\nT+ A=1\nT+ R=2\n./s.sh: line 1: R: readonly variable\nT+ B=3\nT+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "T+ readonly R=1\nT+ R=1\nT+ readonly A=1 R=2 B=3\nT+ A=1\nT+ R=2\n./s.sh: line 1: R: readonly variable\nT+ B=3\nT+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-export-badname",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; export X=1 1Y=2 Z=3; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "T+ export X=1 1Y=2 Z=3\nT+ X=1\nbash: line 1: export: `1Y=2': not a valid identifier\nT+ Z=3\nT+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "T+ export X=1 1Y=2 Z=3\nT+ X=1\nbash: line 1: export: `1Y=2': not a valid identifier\nT+ Z=3\nT+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-export-badname",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; export X=1 1Y=2 Z=3; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "T+ export X=1 1Y=2 Z=3\nT+ X=1\n./s.sh: line 1: export: `1Y=2': not a valid identifier\nT+ Z=3\nT+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "T+ export X=1 1Y=2 Z=3\nT+ X=1\n./s.sh: line 1: export: `1Y=2': not a valid identifier\nT+ Z=3\nT+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-export-funsub",
+  "file": false,
+  "script": "PS4='${ echo F; }+ '; set -x; export X=1 Y=2",
+  "bash53": [
+   0,
+   "",
+   "F+ export X=1 Y=2\nF+ X=1\nF+ Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "bash: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ export X=1 Y=2\nbash: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ X=1\nbash: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ Y=2\n"
+  ]
+ },
+ {
+  "id": "p5-export-funsub",
+  "file": true,
+  "script": "PS4='${ echo F; }+ '; set -x; export X=1 Y=2",
+  "bash53": [
+   0,
+   "",
+   "F+ export X=1 Y=2\nF+ X=1\nF+ Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "./s.sh: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ export X=1 Y=2\n./s.sh: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ X=1\n./s.sh: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ Y=2\n"
+  ]
+ },
+ {
+  "id": "p5-readonly-backquote",
+  "file": false,
+  "script": "PS4='`echo B`+ '; set -x; readonly R=1 S=2",
+  "bash53": [
+   0,
+   "",
+   "B+ readonly R=1 S=2\nB+ R=1\nB+ S=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "B+ readonly R=1 S=2\nB+ R=1\nB+ S=2\n"
+  ]
+ },
+ {
+  "id": "p5-readonly-backquote",
+  "file": true,
+  "script": "PS4='`echo B`+ '; set -x; readonly R=1 S=2",
+  "bash53": [
+   0,
+   "",
+   "B+ readonly R=1 S=2\nB+ R=1\nB+ S=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "B+ readonly R=1 S=2\nB+ R=1\nB+ S=2\n"
+  ]
+ },
+ {
+  "id": "p5-export-in-function",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; f() { export \"$@\"; }; f A=1 B=2",
+  "bash53": [
+   0,
+   "",
+   "T+ f A=1 B=2\nT+ export A=1 B=2\nT+ A=1\nT+ B=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ f A=1 B=2\nT+ export A=1 B=2\nT+ A=1\nT+ B=2\n"
+  ]
+ },
+ {
+  "id": "p5-export-in-function",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; f() { export \"$@\"; }; f A=1 B=2",
+  "bash53": [
+   0,
+   "",
+   "T+ f A=1 B=2\nT+ export A=1 B=2\nT+ A=1\nT+ B=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ f A=1 B=2\nT+ export A=1 B=2\nT+ A=1\nT+ B=2\n"
+  ]
+ },
+ {
+  "id": "p5-export-status-ps4",
+  "file": false,
+  "script": "PS4='$(echo $?)+ '; set -x; false; export X=1 Y=2",
+  "bash53": [
+   0,
+   "",
+   "0+ false\n1+ export X=1 Y=2\n1+ X=1\n1+ Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "0+ false\n1+ export X=1 Y=2\n1+ X=1\n1+ Y=2\n"
+  ]
+ },
+ {
+  "id": "p5-export-status-ps4",
+  "file": true,
+  "script": "PS4='$(echo $?)+ '; set -x; false; export X=1 Y=2",
+  "bash53": [
+   0,
+   "",
+   "0+ false\n1+ export X=1 Y=2\n1+ X=1\n1+ Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "0+ false\n1+ export X=1 Y=2\n1+ X=1\n1+ Y=2\n"
+  ]
+ },
+ {
+  "id": "p5-export-compound",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; export -a ea=(1 2) E=3",
+  "bash53": [
+   0,
+   "",
+   "T+ ea=('1' '2')\nT+ export -a ea E=3\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ ea=('1' '2')\nT+ export -a ea E=3\n"
+  ]
+ },
+ {
+  "id": "p5-export-compound",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; export -a ea=(1 2) E=3",
+  "bash53": [
+   0,
+   "",
+   "T+ ea=('1' '2')\nT+ export -a ea E=3\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ ea=('1' '2')\nT+ export -a ea E=3\n"
+  ]
+ },
+ {
+  "id": "p5-export-plain-per-operand",
+  "file": false,
+  "script": "PS4='+$X '; set -x; export X=1 Y=2",
+  "bash53": [
+   0,
+   "",
+   "+ export X=1 Y=2\n+ X=1\n+1 Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export X=1 Y=2\n+ X=1\n+1 Y=2\n"
+  ]
+ },
+ {
+  "id": "p5-export-plain-per-operand",
+  "file": true,
+  "script": "PS4='+$X '; set -x; export X=1 Y=2",
+  "bash53": [
+   0,
+   "",
+   "+ export X=1 Y=2\n+ X=1\n+1 Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export X=1 Y=2\n+ X=1\n+1 Y=2\n"
+  ]
+ },
+ {
+  "id": "p5-readonly-plain-per-operand",
+  "file": false,
+  "script": "PS4='+[$R] '; set -x; readonly R=1 S=2",
+  "bash53": [
+   0,
+   "",
+   "+[] readonly R=1 S=2\n+[] R=1\n+[1] S=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+[] readonly R=1 S=2\n+[] R=1\n+[1] S=2\n"
+  ]
+ },
+ {
+  "id": "p5-readonly-plain-per-operand",
+  "file": true,
+  "script": "PS4='+[$R] '; set -x; readonly R=1 S=2",
+  "bash53": [
+   0,
+   "",
+   "+[] readonly R=1 S=2\n+[] R=1\n+[1] S=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+[] readonly R=1 S=2\n+[] R=1\n+[1] S=2\n"
+  ]
+ },
+ {
+  "id": "p5-export-arith-ps4",
+  "file": false,
+  "script": "PS4='$((X+1))+ '; set -x; export X=1 Y=2",
+  "bash53": [
+   0,
+   "",
+   "1+ export X=1 Y=2\n1+ X=1\n2+ Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "1+ export X=1 Y=2\n1+ X=1\n2+ Y=2\n"
+  ]
+ },
+ {
+  "id": "p5-export-arith-ps4",
+  "file": true,
+  "script": "PS4='$((X+1))+ '; set -x; export X=1 Y=2",
+  "bash53": [
+   0,
+   "",
+   "1+ export X=1 Y=2\n1+ X=1\n2+ Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "1+ export X=1 Y=2\n1+ X=1\n2+ Y=2\n"
+  ]
+ },
+ {
+  "id": "p5-declare-order",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; declare -a a=(1) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "T+ a=('1')\nTT+ echo s\nT+ declare -a a x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ a=('1')\nTT+ echo s\nT+ declare -a a x=s\n"
+  ]
+ },
+ {
+  "id": "p5-declare-order",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; declare -a a=(1) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "T+ a=('1')\nTT+ echo s\nT+ declare -a a x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ a=('1')\nTT+ echo s\nT+ declare -a a x=s\n"
+  ]
+ },
+ {
+  "id": "p5-declare-two",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; declare -a a=(1) b=(2 3); declare -p a b",
+  "bash53": [
+   0,
+   "declare -a a=([0]=\"1\")\ndeclare -a b=([0]=\"2\" [1]=\"3\")\n",
+   "T+ a=('1')\nT+ b=('2' '3')\nT+ declare -a a b\nT+ declare -p a b\n"
+  ],
+  "bash52": [
+   0,
+   "declare -a a=([0]=\"1\")\ndeclare -a b=([0]=\"2\" [1]=\"3\")\n",
+   "T+ a=('1')\nT+ b=('2' '3')\nT+ declare -a a b\nT+ declare -p a b\n"
+  ]
+ },
+ {
+  "id": "p5-declare-two",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; declare -a a=(1) b=(2 3); declare -p a b",
+  "bash53": [
+   0,
+   "declare -a a=([0]=\"1\")\ndeclare -a b=([0]=\"2\" [1]=\"3\")\n",
+   "T+ a=('1')\nT+ b=('2' '3')\nT+ declare -a a b\nT+ declare -p a b\n"
+  ],
+  "bash52": [
+   0,
+   "declare -a a=([0]=\"1\")\ndeclare -a b=([0]=\"2\" [1]=\"3\")\n",
+   "T+ a=('1')\nT+ b=('2' '3')\nT+ declare -a a b\nT+ declare -p a b\n"
+  ]
+ },
+ {
+  "id": "p5-declare-glob",
+  "file": false,
+  "script": ": > g1; : > g2; PS4='$(echo T)+ '; set -x; declare -a f=(g*)",
+  "bash53": [
+   0,
+   "",
+   "T+ f=('g1' 'g2')\nT+ declare -a f\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ f=('g1' 'g2')\nT+ declare -a f\n"
+  ]
+ },
+ {
+  "id": "p5-declare-glob",
+  "file": true,
+  "script": ": > g1; : > g2; PS4='$(echo T)+ '; set -x; declare -a f=(g*)",
+  "bash53": [
+   0,
+   "",
+   "T+ f=('g1' 'g2')\nT+ declare -a f\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ f=('g1' 'g2')\nT+ declare -a f\n"
+  ]
+ },
+ {
+  "id": "p5-declare-glob-order",
+  "file": false,
+  "script": ": > g1; : > g2; PS4='$(echo T)+ '; set -x; declare -a f=(g*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "T+ f=('g1' 'g2')\nTT+ echo s\nT+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ f=('g1' 'g2')\nTT+ echo s\nT+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "p5-declare-glob-order",
+  "file": true,
+  "script": ": > g1; : > g2; PS4='$(echo T)+ '; set -x; declare -a f=(g*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "T+ f=('g1' 'g2')\nTT+ echo s\nT+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ f=('g1' 'g2')\nTT+ echo s\nT+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "p5-local-order",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; f() { local -a a=(1) x=$(echo s); }; f",
+  "bash53": [
+   0,
+   "",
+   "T+ f\nT+ a=('1')\nTT+ echo s\nT+ local -a a x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ f\nT+ a=('1')\nTT+ echo s\nT+ local -a a x=s\n"
+  ]
+ },
+ {
+  "id": "p5-local-order",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; f() { local -a a=(1) x=$(echo s); }; f",
+  "bash53": [
+   0,
+   "",
+   "T+ f\nT+ a=('1')\nTT+ echo s\nT+ local -a a x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ f\nT+ a=('1')\nTT+ echo s\nT+ local -a a x=s\n"
+  ]
+ },
+ {
+  "id": "p5-for-var-plain",
+  "file": false,
+  "script": "PS4='[$i]+ '; set -x; for i in a b; do :; done",
+  "bash53": [
+   0,
+   "",
+   "[]+ for i in a b\n[a]+ :\n[a]+ for i in a b\n[b]+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "[]+ for i in a b\n[a]+ :\n[a]+ for i in a b\n[b]+ :\n"
+  ]
+ },
+ {
+  "id": "p5-for-var-plain",
+  "file": true,
+  "script": "PS4='[$i]+ '; set -x; for i in a b; do :; done",
+  "bash53": [
+   0,
+   "",
+   "[]+ for i in a b\n[a]+ :\n[a]+ for i in a b\n[b]+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "[]+ for i in a b\n[a]+ :\n[a]+ for i in a b\n[b]+ :\n"
+  ]
+ },
+ {
+  "id": "p5-for-var-funsub",
+  "file": false,
+  "script": "PS4='${ echo \"[$i]\"; }+ '; set -x; for i in a b; do :; done",
+  "bash53": [
+   0,
+   "",
+   "[]+ for i in a b\n[a]+ :\n[a]+ for i in a b\n[b]+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "bash: line 1: ${ echo \"[$i]\"; }+ : bad substitution\n${ echo \"[$i]\"; }+ for i in a b\nbash: line 1: ${ echo \"[$i]\"; }+ : bad substitution\n${ echo \"[$i]\"; }+ :\nbash: line 1: ${ echo \"[$i]\"; }+ : bad substitution\n${ echo \"[$i]\"; }+ for i in a b\nbash: line 1: ${ echo \"[$i]\"; }+ : bad substitution\n${ echo \"[$i]\"; }+ :\n"
+  ]
+ },
+ {
+  "id": "p5-for-var-funsub",
+  "file": true,
+  "script": "PS4='${ echo \"[$i]\"; }+ '; set -x; for i in a b; do :; done",
+  "bash53": [
+   0,
+   "",
+   "[]+ for i in a b\n[a]+ :\n[a]+ for i in a b\n[b]+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "./s.sh: line 1: ${ echo \"[$i]\"; }+ : bad substitution\n${ echo \"[$i]\"; }+ for i in a b\n./s.sh: line 1: ${ echo \"[$i]\"; }+ : bad substitution\n${ echo \"[$i]\"; }+ :\n./s.sh: line 1: ${ echo \"[$i]\"; }+ : bad substitution\n${ echo \"[$i]\"; }+ for i in a b\n./s.sh: line 1: ${ echo \"[$i]\"; }+ : bad substitution\n${ echo \"[$i]\"; }+ :\n"
+  ]
+ },
+ {
+  "id": "p5-assign-compound",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; a=(1 2); b=(g*) c=1",
+  "bash53": [
+   0,
+   "",
+   "T+ a=(1 2)\nT+ b=(g*)\nT+ c=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ a=(1 2)\nT+ b=(g*)\nT+ c=1\n"
+  ]
+ },
+ {
+  "id": "p5-assign-compound",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; a=(1 2); b=(g*) c=1",
+  "bash53": [
+   0,
+   "",
+   "T+ a=(1 2)\nT+ b=(g*)\nT+ c=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "T+ a=(1 2)\nT+ b=(g*)\nT+ c=1\n"
+  ]
+ },
+ {
+  "id": "p5-glob-words",
+  "file": false,
+  "script": ": > g1; : > g2; PS4='$(echo T)+ '; set -x; echo g*; for f in g*; do :; done",
+  "bash53": [
+   0,
+   "g1 g2\n",
+   "T+ echo g1 g2\nT+ for f in g*\nT+ :\nT+ for f in g*\nT+ :\n"
+  ],
+  "bash52": [
+   0,
+   "g1 g2\n",
+   "T+ echo g1 g2\nT+ for f in g*\nT+ :\nT+ for f in g*\nT+ :\n"
+  ]
+ },
+ {
+  "id": "p5-glob-words",
+  "file": true,
+  "script": ": > g1; : > g2; PS4='$(echo T)+ '; set -x; echo g*; for f in g*; do :; done",
+  "bash53": [
+   0,
+   "g1 g2\n",
+   "T+ echo g1 g2\nT+ for f in g*\nT+ :\nT+ for f in g*\nT+ :\n"
+  ],
+  "bash52": [
+   0,
+   "g1 g2\n",
+   "T+ echo g1 g2\nT+ for f in g*\nT+ :\nT+ for f in g*\nT+ :\n"
+  ]
+ },
+ {
+  "id": "p5-funsub-declare-glob",
+  "file": false,
+  "script": ": > g1; PS4='${ echo F; }+ '; set -x; declare -a f=(g*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "F+ f=('g1')\nFF+ echo s\nF+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "bash: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ f=('g1')\nbash: line 1: ${ echo F; }+ : bad substitution\n$${ echo F; }+ echo s\nbash: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "p5-funsub-declare-glob",
+  "file": true,
+  "script": ": > g1; PS4='${ echo F; }+ '; set -x; declare -a f=(g*) x=$(echo s)",
+  "bash53": [
+   0,
+   "",
+   "F+ f=('g1')\nFF+ echo s\nF+ declare -a f x=s\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "./s.sh: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ f=('g1')\n./s.sh: line 1: ${ echo F; }+ : bad substitution\n$${ echo F; }+ echo s\n./s.sh: line 1: ${ echo F; }+ : bad substitution\n${ echo F; }+ declare -a f x=s\n"
+  ]
+ },
+ {
+  "id": "p5-word-and-ps4",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; echo $(echo a) \"$(echo b)\"",
+  "bash53": [
+   0,
+   "a b\n",
+   "TT+ echo a\nTT+ echo b\nT+ echo a b\n"
+  ],
+  "bash52": [
+   0,
+   "a b\n",
+   "TT+ echo a\nTT+ echo b\nT+ echo a b\n"
+  ]
+ },
+ {
+  "id": "p5-word-and-ps4",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; echo $(echo a) \"$(echo b)\"",
+  "bash53": [
+   0,
+   "a b\n",
+   "TT+ echo a\nTT+ echo b\nT+ echo a b\n"
+  ],
+  "bash52": [
+   0,
+   "a b\n",
+   "TT+ echo a\nTT+ echo b\nT+ echo a b\n"
+  ]
+ },
+ {
+  "id": "p5-case-word-sub",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; case $(echo a) in a) echo hit;; esac",
+  "bash53": [
+   0,
+   "hit\n",
+   "T+ case $(echo a) in\nTT+ echo a\nT+ echo hit\n"
+  ],
+  "bash52": [
+   0,
+   "hit\n",
+   "T+ case $(echo a) in\nTT+ echo a\nT+ echo hit\n"
+  ]
+ },
+ {
+  "id": "p5-case-word-sub",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; case $(echo a) in a) echo hit;; esac",
+  "bash53": [
+   0,
+   "hit\n",
+   "T+ case $(echo a) in\nTT+ echo a\nT+ echo hit\n"
+  ],
+  "bash52": [
+   0,
+   "hit\n",
+   "T+ case $(echo a) in\nTT+ echo a\nT+ echo hit\n"
+  ]
+ },
+ {
+  "id": "p5-for-list-sub",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; for i in $(echo a b); do :; done",
+  "bash53": [
+   0,
+   "",
+   "TT+ echo a b\nT+ for i in $(echo a b)\nT+ :\nT+ for i in $(echo a b)\nT+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "TT+ echo a b\nT+ for i in $(echo a b)\nT+ :\nT+ for i in $(echo a b)\nT+ :\n"
+  ]
+ },
+ {
+  "id": "p5-for-list-sub",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; for i in $(echo a b); do :; done",
+  "bash53": [
+   0,
+   "",
+   "TT+ echo a b\nT+ for i in $(echo a b)\nT+ :\nT+ for i in $(echo a b)\nT+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "TT+ echo a b\nT+ for i in $(echo a b)\nT+ :\nT+ for i in $(echo a b)\nT+ :\n"
+  ]
+ },
+ {
+  "id": "p5-arith-sub",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; (( $(echo 1) + 1 )); echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "TT+ echo 1\nT+ ((  1 + 1  ))\nT+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "TT+ echo 1\nT+ ((  1 + 1  ))\nT+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-arith-sub",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; (( $(echo 1) + 1 )); echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "TT+ echo 1\nT+ ((  1 + 1  ))\nT+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "TT+ echo 1\nT+ ((  1 + 1  ))\nT+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-dbracket-sub",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; [[ $(echo a) == a ]]; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "TT+ echo a\nT+ [[ a == a ]]\nT+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "TT+ echo a\nT+ [[ a == a ]]\nT+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-dbracket-sub",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; [[ $(echo a) == a ]]; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "TT+ echo a\nT+ [[ a == a ]]\nT+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "TT+ echo a\nT+ [[ a == a ]]\nT+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-dbracket-probe",
+  "file": false,
+  "script": "PS4='+ '; set -x; [[ -e in ]]; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "+ [[ -e in ]]\n+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "+ [[ -e in ]]\n+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-dbracket-probe",
+  "file": true,
+  "script": "PS4='+ '; set -x; [[ -e in ]]; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "+ [[ -e in ]]\n+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "+ [[ -e in ]]\n+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-dbracket-probe-ps4",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; [[ -e in ]]; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "T+ [[ -e in ]]\nT+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "T+ [[ -e in ]]\nT+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-dbracket-probe-ps4",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; [[ -e in ]]; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "T+ [[ -e in ]]\nT+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "T+ [[ -e in ]]\nT+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-dbracket-probe-neg",
+  "file": false,
+  "script": "PS4='+ '; set -x; [[ ! -e nope ]]; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "+ [[ ! -e nope ]]\n+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "+ [[ ! -e nope ]]\n+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-dbracket-probe-neg",
+  "file": true,
+  "script": "PS4='+ '; set -x; [[ ! -e nope ]]; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "+ [[ ! -e nope ]]\n+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "+ [[ ! -e nope ]]\n+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-select-list-sub",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; select x in $(echo a); do break; done < /dev/null",
+  "bash53": [
+   1,
+   "\n",
+   "T+ select x in $(echo a)\nTT+ echo a\n1) a\n#? "
+  ],
+  "bash52": [
+   1,
+   "\n",
+   "T+ select x in $(echo a)\nTT+ echo a\n1) a\n#? "
+  ]
+ },
+ {
+  "id": "p5-select-list-sub",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; select x in $(echo a); do break; done < /dev/null",
+  "bash53": [
+   1,
+   "\n",
+   "T+ select x in $(echo a)\nTT+ echo a\n1) a\n#? "
+  ],
+  "bash52": [
+   1,
+   "\n",
+   "T+ select x in $(echo a)\nTT+ echo a\n1) a\n#? "
+  ]
+ },
+ {
+  "id": "p5-status-for-body",
+  "file": false,
+  "script": "PS4='$(exit 3)+ '; set -x; false; for i in 1; do echo \"s=$?\"; done",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ false\n+ for i in 1\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ false\n+ for i in 1\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-status-for-body",
+  "file": true,
+  "script": "PS4='$(exit 3)+ '; set -x; false; for i in 1; do echo \"s=$?\"; done",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ false\n+ for i in 1\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ false\n+ for i in 1\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-status-case-arm",
+  "file": false,
+  "script": "PS4='$(exit 3)+ '; set -x; false; case a in a) echo \"s=$?\";; esac",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ false\n+ case a in\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ false\n+ case a in\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-status-case-arm",
+  "file": true,
+  "script": "PS4='$(exit 3)+ '; set -x; false; case a in a) echo \"s=$?\";; esac",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ false\n+ case a in\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ false\n+ case a in\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-status-return",
+  "file": false,
+  "script": "PS4='$(true)+ '; set -x; f() { return; }; false; f; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ false\n+ f\n+ return\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ false\n+ f\n+ return\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-status-return",
+  "file": true,
+  "script": "PS4='$(true)+ '; set -x; f() { return; }; false; f; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ false\n+ f\n+ return\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ false\n+ f\n+ return\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-status-funsub-return",
+  "file": false,
+  "script": "PS4='${ true; }+ '; set -x; f() { return; }; false; f; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ false\n+ f\n+ return\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "bash: line 1: ${ true; }+ : bad substitution\n${ true; }+ false\nbash: line 1: ${ true; }+ : bad substitution\n${ true; }+ f\nenvironment: line 1: ${ true; }+ : bad substitution\n${ true; }+ return\nbash: line 1: ${ true; }+ : bad substitution\n${ true; }+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-status-funsub-return",
+  "file": true,
+  "script": "PS4='${ true; }+ '; set -x; f() { return; }; false; f; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ false\n+ f\n+ return\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: ${ true; }+ : bad substitution\n${ true; }+ false\n./s.sh: line 1: ${ true; }+ : bad substitution\n${ true; }+ f\n./s.sh: line 1: ${ true; }+ : bad substitution\n${ true; }+ return\n./s.sh: line 1: ${ true; }+ : bad substitution\n${ true; }+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-status-funsub-for",
+  "file": false,
+  "script": "PS4='${ true; }+ '; set -x; false; for i in 1; do echo \"s=$?\"; done",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ false\n+ for i in 1\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "bash: line 1: ${ true; }+ : bad substitution\n${ true; }+ false\nbash: line 1: ${ true; }+ : bad substitution\n${ true; }+ for i in 1\nbash: line 1: ${ true; }+ : bad substitution\n${ true; }+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-status-funsub-for",
+  "file": true,
+  "script": "PS4='${ true; }+ '; set -x; false; for i in 1; do echo \"s=$?\"; done",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ false\n+ for i in 1\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "./s.sh: line 1: ${ true; }+ : bad substitution\n${ true; }+ false\n./s.sh: line 1: ${ true; }+ : bad substitution\n${ true; }+ for i in 1\n./s.sh: line 1: ${ true; }+ : bad substitution\n${ true; }+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "p5-status-two-subs",
+  "file": false,
+  "script": "PS4='$(exit 3)$(echo $?)+ '; set -x; true",
+  "bash53": [
+   0,
+   "",
+   "3+ true\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "3+ true\n"
+  ]
+ },
+ {
+  "id": "p5-status-two-subs",
+  "file": true,
+  "script": "PS4='$(exit 3)$(echo $?)+ '; set -x; true",
+  "bash53": [
+   0,
+   "",
+   "3+ true\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "3+ true\n"
+  ]
+ },
+ {
+  "id": "p5-error-lines",
+  "file": false,
+  "script": "PS4='${x?u}+ '; set -x; a=1 b=2 true",
+  "bash53": [
+   0,
+   "",
+   "bash: line 1: x: u\n${x?u}+ a=1\nbash: line 1: x: u\n${x?u}+ b=2\nbash: line 1: x: u\n${x?u}+ true\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "bash: line 1: x: u\n${x?u}+ a=1\nbash: line 1: x: u\n${x?u}+ b=2\nbash: line 1: x: u\n${x?u}+ true\n"
+  ]
+ },
+ {
+  "id": "p5-error-lines",
+  "file": true,
+  "script": "PS4='${x?u}+ '; set -x; a=1 b=2 true",
+  "bash53": [
+   0,
+   "",
+   "./s.sh: line 1: x: u\n${x?u}+ a=1\n./s.sh: line 1: x: u\n${x?u}+ b=2\n./s.sh: line 1: x: u\n${x?u}+ true\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "./s.sh: line 1: x: u\n${x?u}+ a=1\n./s.sh: line 1: x: u\n${x?u}+ b=2\n./s.sh: line 1: x: u\n${x?u}+ true\n"
+  ]
+ },
+ {
+  "id": "p5-error-sub-lines",
+  "file": false,
+  "script": "PS4='$(echo T)${x?u}+ '; set -x; a=1 true; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "bash: line 1: x: u\n$(echo T)${x?u}+ a=1\nbash: line 1: x: u\n$(echo T)${x?u}+ true\nbash: line 1: x: u\n$(echo T)${x?u}+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "bash: line 1: x: u\n$(echo T)${x?u}+ a=1\nbash: line 1: x: u\n$(echo T)${x?u}+ true\nbash: line 1: x: u\n$(echo T)${x?u}+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-error-sub-lines",
+  "file": true,
+  "script": "PS4='$(echo T)${x?u}+ '; set -x; a=1 true; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "./s.sh: line 1: x: u\n$(echo T)${x?u}+ a=1\n./s.sh: line 1: x: u\n$(echo T)${x?u}+ true\n./s.sh: line 1: x: u\n$(echo T)${x?u}+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "./s.sh: line 1: x: u\n$(echo T)${x?u}+ a=1\n./s.sh: line 1: x: u\n$(echo T)${x?u}+ true\n./s.sh: line 1: x: u\n$(echo T)${x?u}+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "p5-error-sites",
+  "file": false,
+  "script": "PS4='${x?u}+ '; set -x; case a in a) ;; esac; [[ a ]]; (( 1 )); for i in 1; do :; done",
+  "bash53": [
+   0,
+   "",
+   "bash: line 1: x: u\n${x?u}+ case a in\nbash: line 1: x: u\n${x?u}+ [[ -n a ]]\nbash: line 1: x: u\n${x?u}+ ((  1  ))\nbash: line 1: x: u\n${x?u}+ for i in 1\nbash: line 1: x: u\n${x?u}+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "bash: line 1: x: u\n${x?u}+ case a in\nbash: line 1: x: u\n${x?u}+ [[ -n a ]]\nbash: line 1: x: u\n${x?u}+ ((  1  ))\nbash: line 1: x: u\n${x?u}+ for i in 1\nbash: line 1: x: u\n${x?u}+ :\n"
+  ]
+ },
+ {
+  "id": "p5-error-sites",
+  "file": true,
+  "script": "PS4='${x?u}+ '; set -x; case a in a) ;; esac; [[ a ]]; (( 1 )); for i in 1; do :; done",
+  "bash53": [
+   0,
+   "",
+   "./s.sh: line 1: x: u\n${x?u}+ case a in\n./s.sh: line 1: x: u\n${x?u}+ [[ -n a ]]\n./s.sh: line 1: x: u\n${x?u}+ ((  1  ))\n./s.sh: line 1: x: u\n${x?u}+ for i in 1\n./s.sh: line 1: x: u\n${x?u}+ :\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "./s.sh: line 1: x: u\n${x?u}+ case a in\n./s.sh: line 1: x: u\n${x?u}+ [[ -n a ]]\n./s.sh: line 1: x: u\n${x?u}+ ((  1  ))\n./s.sh: line 1: x: u\n${x?u}+ for i in 1\n./s.sh: line 1: x: u\n${x?u}+ :\n"
+  ]
+ },
+ {
+  "id": "p5-error-export",
+  "file": false,
+  "script": "PS4='$(echo T)${x?u}+ '; set -x; export X=1 Y=2",
+  "bash53": [
+   0,
+   "",
+   "bash: line 1: x: u\n$(echo T)${x?u}+ export X=1 Y=2\nbash: line 1: x: u\n$(echo T)${x?u}+ X=1\nbash: line 1: x: u\n$(echo T)${x?u}+ Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "bash: line 1: x: u\n$(echo T)${x?u}+ export X=1 Y=2\nbash: line 1: x: u\n$(echo T)${x?u}+ X=1\nbash: line 1: x: u\n$(echo T)${x?u}+ Y=2\n"
+  ]
+ },
+ {
+  "id": "p5-error-export",
+  "file": true,
+  "script": "PS4='$(echo T)${x?u}+ '; set -x; export X=1 Y=2",
+  "bash53": [
+   0,
+   "",
+   "./s.sh: line 1: x: u\n$(echo T)${x?u}+ export X=1 Y=2\n./s.sh: line 1: x: u\n$(echo T)${x?u}+ X=1\n./s.sh: line 1: x: u\n$(echo T)${x?u}+ Y=2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "./s.sh: line 1: x: u\n$(echo T)${x?u}+ export X=1 Y=2\n./s.sh: line 1: x: u\n$(echo T)${x?u}+ X=1\n./s.sh: line 1: x: u\n$(echo T)${x?u}+ Y=2\n"
+  ]
+ },
+ {
+  "id": "p5-error-plain-export",
+  "file": false,
+  "script": "PS4='${x?u}+ '; set -x; export X=1",
+  "bash53": [
+   0,
+   "",
+   "bash: line 1: x: u\n${x?u}+ export X=1\nbash: line 1: x: u\n${x?u}+ X=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "bash: line 1: x: u\n${x?u}+ export X=1\nbash: line 1: x: u\n${x?u}+ X=1\n"
+  ]
+ },
+ {
+  "id": "p5-error-plain-export",
+  "file": true,
+  "script": "PS4='${x?u}+ '; set -x; export X=1",
+  "bash53": [
+   0,
+   "",
+   "./s.sh: line 1: x: u\n${x?u}+ export X=1\n./s.sh: line 1: x: u\n${x?u}+ X=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "./s.sh: line 1: x: u\n${x?u}+ export X=1\n./s.sh: line 1: x: u\n${x?u}+ X=1\n"
+  ]
+ },
+ {
+  "id": "p5-sub-untraced",
+  "file": false,
+  "script": "PS4='$(case $- in *x*) echo X;; *) echo N;; esac)+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "N+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "N+ echo a\n"
+  ]
+ },
+ {
+  "id": "p5-sub-untraced",
+  "file": true,
+  "script": "PS4='$(case $- in *x*) echo X;; *) echo N;; esac)+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "N+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "N+ echo a\n"
+  ]
+ },
+ {
+  "id": "p5-funsub-untraced",
+  "file": false,
+  "script": "PS4='${ case $- in *x*) echo X;; *) echo N;; esac; }+ '; set -x; echo a; echo b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "N+ echo a\nN+ echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "bash: line 1: ${ case $- in *x*) echo X;; *) echo N;; esac; }+ : bad substitution\n${ case $- in *x*) echo X;; *) echo N;; esac; }+ echo a\nbash: line 1: ${ case $- in *x*) echo X;; *) echo N;; esac; }+ : bad substitution\n${ case $- in *x*) echo X;; *) echo N;; esac; }+ echo b\n"
+  ]
+ },
+ {
+  "id": "p5-funsub-untraced",
+  "file": true,
+  "script": "PS4='${ case $- in *x*) echo X;; *) echo N;; esac; }+ '; set -x; echo a; echo b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "N+ echo a\nN+ echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "./s.sh: line 1: ${ case $- in *x*) echo X;; *) echo N;; esac; }+ : bad substitution\n${ case $- in *x*) echo X;; *) echo N;; esac; }+ echo a\n./s.sh: line 1: ${ case $- in *x*) echo X;; *) echo N;; esac; }+ : bad substitution\n${ case $- in *x*) echo X;; *) echo N;; esac; }+ echo b\n"
+  ]
+ },
+ {
+  "id": "p5-sub-shellopts",
+  "file": false,
+  "script": "PS4='$(case :$SHELLOPTS: in *:xtrace:*) echo X;; *) echo N;; esac)+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "N+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "N+ echo a\n"
+  ]
+ },
+ {
+  "id": "p5-sub-shellopts",
+  "file": true,
+  "script": "PS4='$(case :$SHELLOPTS: in *:xtrace:*) echo X;; *) echo N;; esac)+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "N+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "N+ echo a\n"
+  ]
+ },
+ {
+  "id": "p5-funsub-xtrace-back",
+  "file": false,
+  "script": "PS4='${ :; }+ '; set -x; echo a; case $- in *x*) echo on;; esac",
+  "bash53": [
+   0,
+   "a\non\n",
+   "+ echo a\n+ case $- in\n+ echo on\n"
+  ],
+  "bash52": [
+   0,
+   "a\non\n",
+   "bash: line 1: ${ :; }+ : bad substitution\n${ :; }+ echo a\nbash: line 1: ${ :; }+ : bad substitution\n${ :; }+ case $- in\nbash: line 1: ${ :; }+ : bad substitution\n${ :; }+ echo on\n"
+  ]
+ },
+ {
+  "id": "p5-funsub-xtrace-back",
+  "file": true,
+  "script": "PS4='${ :; }+ '; set -x; echo a; case $- in *x*) echo on;; esac",
+  "bash53": [
+   0,
+   "a\non\n",
+   "+ echo a\n+ case $- in\n+ echo on\n"
+  ],
+  "bash52": [
+   0,
+   "a\non\n",
+   "./s.sh: line 1: ${ :; }+ : bad substitution\n${ :; }+ echo a\n./s.sh: line 1: ${ :; }+ : bad substitution\n${ :; }+ case $- in\n./s.sh: line 1: ${ :; }+ : bad substitution\n${ :; }+ echo on\n"
+  ]
+ },
+ {
+  "id": "p5-nested-sub",
+  "file": false,
+  "script": "PS4='$(echo $(echo T))+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "T+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "T+ echo a\n"
+  ]
+ },
+ {
+  "id": "p5-nested-sub",
+  "file": true,
+  "script": "PS4='$(echo $(echo T))+ '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "T+ echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "T+ echo a\n"
+  ]
+ },
+ {
+  "id": "p5-sub-in-sub-trace",
+  "file": false,
+  "script": "PS4='$(echo T)+ '; set -x; x=$(y=$(echo in); echo \"$y\"); echo \"$x\"",
+  "bash53": [
+   0,
+   "in\n",
+   "TTT+ echo in\nTT+ y=in\nTT+ echo in\nT+ x=in\nT+ echo in\n"
+  ],
+  "bash52": [
+   0,
+   "in\n",
+   "TTT+ echo in\nTT+ y=in\nTT+ echo in\nT+ x=in\nT+ echo in\n"
+  ]
+ },
+ {
+  "id": "p5-sub-in-sub-trace",
+  "file": true,
+  "script": "PS4='$(echo T)+ '; set -x; x=$(y=$(echo in); echo \"$y\"); echo \"$x\"",
+  "bash53": [
+   0,
+   "in\n",
+   "TTT+ echo in\nTT+ y=in\nTT+ echo in\nT+ x=in\nT+ echo in\n"
+  ],
+  "bash52": [
+   0,
+   "in\n",
+   "TTT+ echo in\nTT+ y=in\nTT+ echo in\nT+ x=in\nT+ echo in\n"
+  ]
+ },
+ {
+  "id": "p5-valsub-reply",
+  "file": false,
+  "script": "PS4='${| REPLY=V; }+ '; set -x; REPLY=r; echo \"$REPLY\"",
+  "bash53": [
+   0,
+   "r\n",
+   "V+ REPLY=r\nV+ echo r\n"
+  ],
+  "bash52": [
+   0,
+   "r\n",
+   "bash: line 1: ${| REPLY=V; }+ : bad substitution\n${| REPLY=V; }+ REPLY=r\nbash: line 1: ${| REPLY=V; }+ : bad substitution\n${| REPLY=V; }+ echo r\n"
+  ]
+ },
+ {
+  "id": "p5-valsub-reply",
+  "file": true,
+  "script": "PS4='${| REPLY=V; }+ '; set -x; REPLY=r; echo \"$REPLY\"",
+  "bash53": [
+   0,
+   "r\n",
+   "V+ REPLY=r\nV+ echo r\n"
+  ],
+  "bash52": [
+   0,
+   "r\n",
+   "./s.sh: line 1: ${| REPLY=V; }+ : bad substitution\n${| REPLY=V; }+ REPLY=r\n./s.sh: line 1: ${| REPLY=V; }+ : bad substitution\n${| REPLY=V; }+ echo r\n"
   ]
  },
  {
@@ -4797,6 +7887,216 @@
    0,
    "a\ns=0\n",
    "./s.sh: line 1: BASH_XTRACEFD: 1073741824: invalid value for trace file descriptor\n+ echo a\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-xp",
+  "file": false,
+  "script": "x='$(echo P)'; PS4='${x@P}+ '; set -x; readonly A=1 B=2; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2\nP+ A=1\nP+ B=2\nP+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2\nP+ A=1\nP+ B=2\nP+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-xp",
+  "file": true,
+  "script": "x='$(echo P)'; PS4='${x@P}+ '; set -x; readonly A=1 B=2; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2\nP+ A=1\nP+ B=2\nP+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2\nP+ A=1\nP+ B=2\nP+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-xp-three",
+  "file": false,
+  "script": "x='$(echo P)'; PS4='${x@P}+ '; set -x; readonly A=1 B=2 C=3; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2 C=3\nP+ A=1\nP+ B=2\nP+ C=3\nP+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2 C=3\nP+ A=1\nP+ B=2\nP+ C=3\nP+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-xp-three",
+  "file": true,
+  "script": "x='$(echo P)'; PS4='${x@P}+ '; set -x; readonly A=1 B=2 C=3; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2 C=3\nP+ A=1\nP+ B=2\nP+ C=3\nP+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2 C=3\nP+ A=1\nP+ B=2\nP+ C=3\nP+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "b2-export-xp-count",
+  "file": false,
+  "script": "x='$(echo x >> cnt)'; PS4='${x@P}+ '; set -x; export A=1 B=2; set +x; n=$(wc -l < cnt); echo \"n=$((n)) A=$A B=$B\"",
+  "bash53": [
+   0,
+   "n=4 A=1 B=2\n",
+   "+ export A=1 B=2\n+ A=1\n+ B=2\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "n=4 A=1 B=2\n",
+   "+ export A=1 B=2\n+ A=1\n+ B=2\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "b2-export-xp-count",
+  "file": true,
+  "script": "x='$(echo x >> cnt)'; PS4='${x@P}+ '; set -x; export A=1 B=2; set +x; n=$(wc -l < cnt); echo \"n=$((n)) A=$A B=$B\"",
+  "bash53": [
+   0,
+   "n=4 A=1 B=2\n",
+   "+ export A=1 B=2\n+ A=1\n+ B=2\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "n=4 A=1 B=2\n",
+   "+ export A=1 B=2\n+ A=1\n+ B=2\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-xp-array",
+  "file": false,
+  "script": "a=('$(echo P)'); PS4='${a[0]@P}+ '; set -x; readonly A=1 B=2; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2\nP+ A=1\nP+ B=2\nP+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2\nP+ A=1\nP+ B=2\nP+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-xp-array",
+  "file": true,
+  "script": "a=('$(echo P)'); PS4='${a[0]@P}+ '; set -x; readonly A=1 B=2; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2\nP+ A=1\nP+ B=2\nP+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "P+ readonly A=1 B=2\nP+ A=1\nP+ B=2\nP+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-var-ps4",
+  "file": false,
+  "script": "PS4='[$A]+ '; set -x; readonly A=1 B=2; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "[]+ readonly A=1 B=2\n[]+ A=1\n[1]+ B=2\n[1]+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "[]+ readonly A=1 B=2\n[]+ A=1\n[1]+ B=2\n[1]+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-var-ps4",
+  "file": true,
+  "script": "PS4='[$A]+ '; set -x; readonly A=1 B=2; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "[]+ readonly A=1 B=2\n[]+ A=1\n[1]+ B=2\n[1]+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "[]+ readonly A=1 B=2\n[]+ A=1\n[1]+ B=2\n[1]+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-literal-at",
+  "file": false,
+  "script": "PS4='u@Ph+ '; set -x; readonly A=1 B=2; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "u@Ph+ readonly A=1 B=2\nu@Ph+ A=1\nu@Ph+ B=2\nu@Ph+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "u@Ph+ readonly A=1 B=2\nu@Ph+ A=1\nu@Ph+ B=2\nu@Ph+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-literal-at",
+  "file": true,
+  "script": "PS4='u@Ph+ '; set -x; readonly A=1 B=2; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "u@Ph+ readonly A=1 B=2\nu@Ph+ A=1\nu@Ph+ B=2\nu@Ph+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "u@Ph+ readonly A=1 B=2\nu@Ph+ A=1\nu@Ph+ B=2\nu@Ph+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-x-plain",
+  "file": false,
+  "script": "x='$(echo P)'; PS4='${x}+ '; set -x; readonly A=1 B=2; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "$(echo P)+ readonly A=1 B=2\n$(echo P)+ A=1\n$(echo P)+ B=2\n$(echo P)+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "$(echo P)+ readonly A=1 B=2\n$(echo P)+ A=1\n$(echo P)+ B=2\n$(echo P)+ echo s=0\n"
+  ]
+ },
+ {
+  "id": "b2-readonly-x-plain",
+  "file": true,
+  "script": "x='$(echo P)'; PS4='${x}+ '; set -x; readonly A=1 B=2; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=0\n",
+   "$(echo P)+ readonly A=1 B=2\n$(echo P)+ A=1\n$(echo P)+ B=2\n$(echo P)+ echo s=0\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "$(echo P)+ readonly A=1 B=2\n$(echo P)+ A=1\n$(echo P)+ B=2\n$(echo P)+ echo s=0\n"
   ]
  }
 ]

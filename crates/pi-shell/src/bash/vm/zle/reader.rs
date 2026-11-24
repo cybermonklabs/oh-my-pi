@@ -432,8 +432,9 @@ impl Reader {
 				)
 				.into(),
 			),
-			Err(Stop::Sub { unit, entry, form, text }) => {
-				Err(start_sub(k, vp, cx, &mut self.sc, Sub { unit, entry, form, text, line: 0 }).into())
+			Err(Stop::Sub { unit, entry, form, text, untraced }) => {
+				let sub = Sub { unit, entry, form, text, line: 0, untraced };
+				Err(start_sub(k, vp, cx, &mut self.sc, sub).into())
 			},
 			Err(Stop::Fail(d) | Stop::Fatal(d)) => {
 				self.sc.recycle();

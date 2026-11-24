@@ -334,6 +334,23 @@ impl<'a, 'c> Ctx<'a, 'c> {
 		}
 	}
 
+	/// `n` bash trace prefixes for lines the builtin writes as it runs
+	/// (`export`'s and `readonly`'s operands): `PS4` expanded once for each,
+	/// its command substitutions run in turn ([`super::xtrace::ps4_in`]).
+	/// [`Need::Sub`] parks the builtin until one is done; the re-run replays
+	/// them, so it asks before it changes anything.
+	pub fn trace_prefixes(&mut self, n: usize) -> Result<Vec<super::xtrace::Prefix>, Need> {
+		let line = self.line;
+		let mut ex =
+			super::expand::Expander::new(self.k, self.cx, self.vp, &mut self.log, true, line);
+		ex.cursor = self.log_cursor;
+		let res = (0..n)
+			.map(|_| super::xtrace::ps4_in(&mut ex, line))
+			.collect::<Result<Vec<_>, _>>();
+		self.log_cursor = ex.cursor;
+		res.map_err(Need::Sub)
+	}
+
 	/// Queue bytes for stdout.
 	pub fn out(&mut self, bytes: &[u8]) {
 		self.out_fd(1, bytes);

@@ -64,13 +64,17 @@ pub enum Stop {
 	/// A command substitution must run first (the op parks, then replays).
 	Sub {
 		/// Unit holding the body.
-		unit:  Arc<Unit>,
+		unit:     Arc<Unit>,
 		/// Entry pc of the body.
-		entry: u32,
+		entry:    u32,
 		/// Syntax form.
-		form:  ComsubForm,
+		form:     ComsubForm,
 		/// `strs` index of a `$( )` body's source text.
-		text:  Option<u32>,
+		text:     Option<u32>,
+		/// `PS4`'s: it runs with `set -x` off, as bash's
+		/// `indirection_level_string` turns it off while it expands `PS4`
+		/// (else each trace line in it would run it again, without end).
+		untraced: bool,
 	},
 	/// A zsh command substitution must run first: `text` is its body (zsh
 	/// source, parsed in the vproc's mode when it starts); the op parks,
@@ -318,13 +322,18 @@ impl<'e, 'c> Expander<'e, 'c> {
 
 	/// `set -x`: queue the trace line `body` once, however often this
 	/// expansion replays (bash traces a declaration's compound assignment
-	/// as it expands that word, before the words after it).
-	pub fn trace_once(&mut self, body: &[u8]) {
+	/// as it expands that word, before the words after it), after `PS4`
+	/// expanded in this pass ([`super::xtrace::ps4_in`]: a substitution in
+	/// it stops the pass, and replays with it; the statuses stay as they
+	/// were, [`Self::prompt`]).
+	pub fn trace_once(&mut self, body: &[u8]) -> X<()> {
+		let prefix = super::xtrace::ps4_in(self, self.line)?;
 		if self.replay().is_some() {
-			return;
+			return Ok(());
 		}
-		super::xtrace::emit(self.k, self.cx, self.vp, self.line, body);
+		super::xtrace::line_out(self.k, self.cx, self.vp, prefix, body);
 		self.note(|| Atom::Done);
+		Ok(())
 	}
 
 	/// A choice as the first pass of this expansion made it (`now` there),
@@ -1073,7 +1082,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 				self.vp.status = status;
 				Ok(out)
 			},
-			_ => Err(Stop::Sub { unit: Arc::clone(unit), entry, form, text }),
+			_ => Err(Stop::Sub { unit: Arc::clone(unit), entry, form, text, untraced: false }),
 		}
 	}
 
@@ -2223,7 +2232,29 @@ impl<'e, 'c> Expander<'e, 'c> {
 			)
 			.map_err(|err| Stop::Fail(Diag::Syntax { msg: err.msg }))?;
 		let word = unit.words.last().cloned().unwrap_or_default();
-		self.scalar(&unit, &word)
+		// bash `decode_prompt_string` keeps `$?` and the status the last
+		// command substitution left across this expansion. `$?` is the one
+		// the first pass found, logged: a `${ ;}` run between passes changed
+		// it. A substitution still to run sees `$?` as the pass left it, as
+		// bash's does.
+		let status = if let Some(Atom::Str(Some(s))) = self.replay() {
+			std::str::from_utf8(&s)
+				.ok()
+				.and_then(|s| s.parse().ok())
+				.unwrap_or(self.vp.status)
+		} else {
+			let status = self.vp.status;
+			self.note(|| Atom::Str(Some(BString::from(status.format_into(&mut NumBuffer::new())))));
+			status
+		};
+		let sub_status = self.sub_status;
+		self.vp.status = status;
+		let value = self.scalar(&unit, &word);
+		if !matches!(value, Err(Stop::Sub { .. })) {
+			self.vp.status = status;
+			self.sub_status = sub_status;
+		}
+		value
 	}
 
 	/// The current local time in strftime `fmt` (`TZ` as exported), for

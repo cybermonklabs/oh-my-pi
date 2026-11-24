@@ -1702,6 +1702,31 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 	// `export -a`/`readonly -A` hand a `name=value` operand to `declare`
 	// (bash `set_or_show_attributes`), which does not trace it.
 	let arrays = o.has(b'a') || o.has(b'A');
+	// bash expands `PS4` for each operand it traces, as it assigns it. A
+	// `PS4` that runs a command is expanded here for every operand to be
+	// traced, before anything changes, since the builtin starts over once
+	// each command is done (so it reads the variables as they were before
+	// the first operand, unlike bash); any other `PS4` at each operand.
+	let special = matches!(kind, DeclareKind::Readonly | DeclareKind::Export);
+	let mut prefixes = if special && !arrays && xtrace::ps4_runs_commands(ctx.k, ctx.cx, ctx.vp) {
+		let posix = ctx.option(OptId::Posix)?;
+		let mut n = 0;
+		for (j, arg) in o.rest.iter().enumerate() {
+			let (name, index, _, value) = split_assignment(arg, false);
+			// The operands the loop below reports and skips (or stops at).
+			if (value.is_none() && name.len() < arg.len()) || !is_ident(name) {
+				if posix {
+					break;
+				}
+				continue;
+			}
+			let compound_word = ctx.compound.contains(&((1 + first + j) as u32));
+			n += usize::from(!compound_word && index.is_none() && value.is_some());
+		}
+		ctx.trace_prefixes(n)?.into_iter()
+	} else {
+		Vec::new().into_iter()
+	};
 	for (j, arg) in o.rest.iter().enumerate() {
 		let compound_word = ctx.compound.contains(&((1 + first + j) as u32));
 		if kind == DeclareKind::Local && arg.as_slice() == b"-" {
@@ -1810,7 +1835,14 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			let mut body = Vec::new();
 			let shown = AssignValue::Scalar(BString::from(v));
 			xtrace::push_assign(&mut body, name, None, append, &shown, utf8);
-			let (fd, bytes) = xtrace::builtin_line(ctx.k, ctx.cx, ctx.vp, ctx.line, &body);
+			let prefix = match prefixes.next() {
+				Some(p) => p,
+				None => ctx.trace_prefixes(1)?.pop().unwrap_or_default(),
+			};
+			if let Some((_, d)) = prefix.error {
+				ctx.diag(d);
+			}
+			let (fd, bytes) = xtrace::builtin_line(ctx.k, ctx.cx, ctx.vp, prefix.text, &body);
 			ctx.trace_line(fd, &bytes);
 		}
 		// The binding this declaration acts on: a new local shadows rather
