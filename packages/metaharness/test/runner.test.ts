@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,6 +9,7 @@ import {
 	parseArgs,
 	readTrials,
 	resolveResumeConfig,
+	runBenchmark,
 } from "../src/runner";
 
 describe("generic agent-arg / env passthrough", () => {
@@ -275,5 +276,120 @@ describe("resume", () => {
 		// No explicit filters → no -f flags: harbor's own default applies.
 		const bare = parseArgs(["--resume", "j"]);
 		expect(buildResumeArgs(bare, "/jobs/j")).toEqual(["job", "resume", "-p", "/jobs/j"]);
+	});
+});
+
+describe("harbor telemetry", () => {
+	const savedEnv = {
+		HOME: process.env.HOME,
+		PATH: process.env.PATH,
+		HARBOR_TELEMETRY: process.env.HARBOR_TELEMETRY,
+	};
+	const roots: string[] = [];
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		for (const [key, value] of Object.entries(savedEnv)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	/**
+	 * Put a stand-in `harbor` first on PATH that records its argv and the
+	 * HARBOR_TELEMETRY it was started with, and capture the runner's output.
+	 * The runner looks harbor up through a login shell, whose /etc/profile may
+	 * reset PATH, so the temporary HOME's .bash_profile puts the stub first too.
+	 */
+	const stubHarbor = (): { jobsDir: string; argv: () => string[]; telemetry: () => string; stdout: string[] } => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "harbor-telemetry-test-"));
+		roots.push(root);
+		const bin = path.join(root, "bin");
+		fs.mkdirSync(bin);
+		const argvFile = path.join(root, "harbor.argv");
+		const telemetryFile = path.join(root, "harbor.telemetry");
+		fs.writeFileSync(
+			path.join(bin, "harbor"),
+			[
+				"#!/bin/sh",
+				`printf '%s\\n' "$@" > '${argvFile}'`,
+				`printf '%s' "\${HARBOR_TELEMETRY-__unset__}" > '${telemetryFile}'`,
+				"",
+			].join("\n"),
+			{ mode: 0o755 },
+		);
+		fs.writeFileSync(path.join(root, ".bash_profile"), `PATH='${bin}':"$PATH"; export PATH\n`);
+		process.env.HOME = root;
+		process.env.PATH = `${bin}${path.delimiter}${process.env.PATH ?? ""}`;
+		// The progress loop sleeps 10 s per frame off a terminal.
+		const realSleep = Bun.sleep.bind(Bun);
+		vi.spyOn(Bun, "sleep").mockImplementation(() => realSleep(10));
+		const stdout: string[] = [];
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			stdout.push(String(chunk));
+			return true;
+		});
+		return {
+			jobsDir: path.join(root, "jobs"),
+			argv: () => fs.readFileSync(argvFile, "utf8").split("\n").filter(Boolean),
+			telemetry: () => fs.readFileSync(telemetryFile, "utf8"),
+			stdout,
+		};
+	};
+
+	const newRun = (jobsDir: string, jobName: string, ...extra: string[]) =>
+		parseArgs(["--agent", "nop", "--tasks", "1", "--jobs-dir", jobsDir, "--job-name", jobName, ...extra]);
+
+	it("starts `harbor run` with HARBOR_TELEMETRY=0", async () => {
+		delete process.env.HARBOR_TELEMETRY;
+		const harbor = stubHarbor();
+		const run = await runBenchmark(newRun(harbor.jobsDir, "telemetry-run"));
+		expect(run.exitCode).toBe(0);
+		expect(harbor.argv()[0]).toBe("run");
+		expect(harbor.telemetry()).toBe("0");
+	});
+
+	it("starts `harbor job resume` with HARBOR_TELEMETRY=0", async () => {
+		delete process.env.HARBOR_TELEMETRY;
+		const harbor = stubHarbor();
+		const jobName = "telemetry-resume";
+		const jobDir = path.join(harbor.jobsDir, jobName);
+		fs.mkdirSync(jobDir, { recursive: true });
+		fs.writeFileSync(path.join(jobDir, "config.json"), JSON.stringify({ environment: { type: "docker" } }));
+		const benchDir = path.join(harbor.jobsDir, "_bench", jobName);
+		fs.mkdirSync(benchDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(benchDir, "runner-config.json"),
+			JSON.stringify({ agent: "nop", tasks: 1, models: ["anthropic/claude-sonnet-4-6"] }),
+		);
+		const cfg = resolveResumeConfig(parseArgs(["--resume", jobName, "--jobs-dir", harbor.jobsDir]));
+		const run = await runBenchmark(cfg);
+		expect(run.exitCode).toBe(0);
+		expect(harbor.argv().slice(0, 4)).toEqual(["job", "resume", "-p", jobDir]);
+		expect(harbor.telemetry()).toBe("0");
+	});
+
+	it("keeps a HARBOR_TELEMETRY value the caller set", async () => {
+		const harbor = stubHarbor();
+		process.env.HARBOR_TELEMETRY = "1";
+		const run = await runBenchmark(newRun(harbor.jobsDir, "telemetry-explicit"));
+		expect(run.exitCode).toBe(0);
+		expect(harbor.telemetry()).toBe("1");
+	});
+
+	it("prints the --dry-run harbor command with HARBOR_TELEMETRY=0", async () => {
+		delete process.env.HARBOR_TELEMETRY;
+		const harbor = stubHarbor();
+		await runBenchmark(newRun(harbor.jobsDir, "telemetry-dry-run", "--dry-run"));
+		expect(harbor.stdout.filter(line => line.startsWith("HARBOR_TELEMETRY=0 harbor run "))).toHaveLength(1);
+	});
+
+	it("sets HARBOR_TELEMETRY=0 for a managed agent and reads a blank value as unset", () => {
+		const cfg = parseArgs(["--model", "anthropic/claude-opus-4-8"]);
+		delete process.env.HARBOR_TELEMETRY;
+		expect(buildHarborEnv(cfg, "/tmp/models.yml", null, "test").HARBOR_TELEMETRY).toBe("0");
+		process.env.HARBOR_TELEMETRY = " ";
+		expect(buildHarborEnv(cfg, "/tmp/models.yml", null, "test").HARBOR_TELEMETRY).toBe("0");
 	});
 });

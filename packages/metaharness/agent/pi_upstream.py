@@ -21,9 +21,11 @@ Env knobs (set by the runner; `OMP_BENCH_*` are shared with `omp_local.py`):
 `OMP_BENCH_GATEWAY_URL`, `OMP_BENCH_GATEWAY_TOKEN`, `OMP_BENCH_PI_MODELS`
 (JSON array of model specs), `OMP_BENCH_PI_SYSTEM_PROMPT` (host path),
 `OMP_BENCH_PI_VERSION`, `OMP_BENCH_NODE_VERSION`, `OMP_BENCH_THINKING`,
-`OMP_BENCH_TOOLS`, `OMP_BENCH_AGENT_ARGS`, `OMP_BENCH_FORWARD_ENV`.
+`OMP_BENCH_TOOLS`, `OMP_BENCH_AGENT_ARGS`, `OMP_BENCH_FORWARD_ENV`. The runner also
+defaults `HARBOR_TELEMETRY` to `0`: without it Harbor sends each job's model
+names, dataset names and commands to PostHog.
 
-Selected via `harbor run --agent-import-path pi_upstream:PiUpstream`.
+Selected via `HARBOR_TELEMETRY=0 harbor run --agent-import-path pi_upstream:PiUpstream`.
 """
 
 from __future__ import annotations
