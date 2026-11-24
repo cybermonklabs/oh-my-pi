@@ -625,16 +625,28 @@ fn a_builtin_that_goes_on_unanswered_withdraws_its_ask() {
 	assert_eq!(err, "");
 }
 
+/// How long [`run_bounded`] waits: at least twice the longest correct run
+/// it bounds, read where these tests run. The longest is the withdraw test
+/// (`a_builtin_that_goes_on_unanswered_withdraws_its_ask`) on gVisor beside
+/// 64 busy loops with this file's other tests in parallel: 18.2-28.4 s in
+/// 16 runs, while the file took 45-92 s, so the test took at most 0.46 of
+/// the file's time. On a node where the file took up to 120 s the test ran
+/// past 30 s in 10 of 10 runs: about 0.46 × 120 s ≈ 55 s there. 120 s is
+/// more than twice that.
+const RUN_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// [`run_with`] on a world of its own, in a thread of its own: a run that
-/// has not finished after 30 s fails the test (`what` names the fault). The
-/// thread of a run that never ends spins on until the test process exits.
+/// has not finished after [`RUN_BOUND`] fails the test (`what` names the
+/// fault). The thread of a run that never ends spins on until the test
+/// process exits.
 fn run_bounded(src: &'static str, zsh: bool, fault: Fault, what: &str) -> (String, String, i32) {
 	let (tx, rx) = std::sync::mpsc::channel();
 	std::thread::spawn(move || {
 		let _ = tx.send(run_with(&World::new(), src, zsh, fault));
 	});
-	rx.recv_timeout(std::time::Duration::from_secs(30))
-		.unwrap_or_else(|_| panic!("`{src}` (zsh={zsh}) did not finish within 30 s with {what}"))
+	rx.recv_timeout(RUN_BOUND).unwrap_or_else(|_| {
+		panic!("`{src}` (zsh={zsh}) did not finish within {RUN_BOUND:?} with {what}")
+	})
 }
 
 // Failure mode: a snapshot taken while a builtin waited for the answer to
