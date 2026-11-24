@@ -415,9 +415,17 @@ fn a_break_in_a_subshells_redirection_sees_no_loop() {
 /// first line first, or ends without one and passes the break on; an
 /// arithmetic `for` evaluates its first two expressions. The count is
 /// capped at the loops around it when the break runs. A `break` in a
-/// `for`'s own words waits for its first word too.
+/// `for`'s own words waits for its first word too. While the break waits,
+/// a substitution in the loop's header runs nothing and gives nothing, as
+/// bash runs no command while `breaking`: an arithmetic `for` whose header
+/// is then wrong ends with status 1 (its message to the redirection), and
+/// the break goes on out, unless its test failed, which takes one level.
 #[cfg(unix)]
 #[test]
+#[expect(
+	clippy::literal_string_with_formatting_args,
+	reason = "Bash parameter expansion is intentional fixture syntax, not Rust formatting."
+)]
 fn a_loop_takes_a_break_from_its_own_redirection() {
 	check("bash", &[
 		(
@@ -623,14 +631,151 @@ fn a_loop_takes_a_break_from_its_own_redirection() {
 			 1: break: only meaningful in a `for', `while', or `until' loop\n",
 			0,
 		),
+		// A substitution in the header's words or expressions runs nothing
+		// while the break waits.
+		(
+			"for i in 1 2; do for x in ${| echo side$i; REPLY=q; } b; do echo x$x; done 2> ${| \
+			 REPLY=/dev/null; continue; }; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"b1:0 [b]\nb2:0 [b]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for x in ${| echo side$i; REPLY=q; } b; do echo x$x; done 2> ${| \
+			 REPLY=/dev/null; break; }; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"b1:0 [b]\nb2:0 [b]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for x in $(echo side$i; echo q) b; do echo x$x; done 2> ${| \
+			 REPLY=/dev/null; continue; }; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"b1:0 [b]\nb2:0 [b]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do n=0; for x in ${| REPLY=$((n+=5)); } b; do echo x$x; done 2> ${| \
+			 REPLY=/dev/null; break; }; echo \"n=$n\"; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"n=0\nb1:0 [b]\nn=0\nb2:0 [b]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for x in a ${| break; } b; do echo x$x; done 2> ${| REPLY=/dev/null; \
+			 continue; }; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"xb\nb1:0 [b]\nxb\nb2:0 [b]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for x in a ${| continue; } b; do echo x$x; done 2> ${| \
+			 REPLY=/dev/null; break; }; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"b1:0 [a]\nb2:0 [a]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for x in ${ echo a$i; } ${| REPLY=c; } b; do echo x$x; done 2> ${| \
+			 REPLY=/dev/null; continue; }; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"b1:0 [b]\nb2:0 [b]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for x in <(echo p) b; do echo x${x:+set}; done 2> ${| REPLY=/dev/null; \
+			 continue; }; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"xset\nb1:0 [b]\nxset\nb2:0 [b]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for x in \"${| REPLY=q; }\" b; do echo x$x; done 2> ${| \
+			 REPLY=/dev/null; continue; }; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"xb\nb1:0 [b]\nxb\nb2:0 [b]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for x in ${| x=$(echo q); REPLY=$x; } b; do echo x$x; done 2> ${| \
+			 REPLY=/dev/null; break; }; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"b1:0 [b]\nb2:0 [b]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do select x in ${| echo side$i; REPLY=a; } b; do echo s$x; break; done 2> \
+			 ${| REPLY=/dev/null; break; } <<< 1; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"b1:0 [b]\nb2:0 [b]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do select x in $(echo a) b; do echo s$x; break; done 2> ${| \
+			 REPLY=/dev/null; continue; } <<< 1; echo \"b$i:$? [$x]\"; done; echo end:$?",
+			"\nb1:1 [b]\n\nb2:1 [b]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=${| echo side$i; REPLY=0; }; j<2; j++ )); do echo j$j; done \
+			 2> ${| REPLY=/dev/null; break; }; echo \"b$i:$? [$j]\"; done; echo end:$?",
+			"end:1\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=$(echo 0); j<2; j++ )); do echo j$j; done 2> ${| \
+			 REPLY=/dev/null; continue; }; echo \"b$i:$? [$j]\"; done; echo end:$?",
+			"end:1\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=0; j<${| REPLY=2; }; j++ )); do echo j$j; done 2> ${| \
+			 REPLY=/dev/null; break; }; echo \"b$i:$? [$j]\"; done; echo end:$?",
+			"b1:1 [0]\nb2:1 [0]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=0; j<${| REPLY=2; }; j++ )); do echo j$j; done 2> ${| \
+			 REPLY=/dev/null; continue; }; echo \"b$i:$? [$j]\"; done; echo end:$?",
+			"b1:1 [0]\nb2:1 [0]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=1/0; j<2; j++ )); do echo j$j; done 2> ${| REPLY=/dev/null; \
+			 break; }; echo \"b$i:$? [$j]\"; done; echo end:$?",
+			"end:1\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for o in A; do for (( j=0; j<${| REPLY=2; }; j++ )); do echo j$j; done \
+			 2> ${| REPLY=/dev/null; continue 2; }; echo o$o; done; echo \"b$i:$? [$j]\"; done; echo \
+			 end:$?",
+			"b1:1 [0]\nb2:1 [0]\nend:0\n",
+			"",
+			0,
+		),
+		(
+			"for i in 1 2; do for (( j=0; j<2; j+=${| REPLY=1; } )); do echo j$j; done 2> ${| \
+			 REPLY=/dev/null; break; }; echo \"b$i:$? [$j]\"; done; echo end:$?",
+			"b1:0 [0]\nb2:0 [0]\nend:0\n",
+			"",
+			0,
+		),
 	]);
 }
 
 /// A trap that a command in a `${ }` sets off runs before the next command
 /// there, as bash runs a pending trap as each command ends, so a `break`
-/// after it does not leave the trap with nothing to run. In a program's or
-/// a `( … )`'s own redirection, which bash expands in the forked child, the
-/// trap waits for that child.
+/// after it does not leave the trap with nothing to run: in a command's
+/// words, and in a group's, `if`'s, `case`'s or loop's own redirection. In
+/// a program's or a `( … )`'s own redirection, which bash expands in the
+/// forked child, the trap waits for that child.
 #[cfg(unix)]
 #[test]
 fn a_trap_runs_before_a_break_in_a_substitution() {
@@ -726,6 +871,71 @@ fn a_trap_runs_before_a_break_in_a_substitution() {
 			 for i in 1; do f; echo in; done; echo out",
 			"trapped\nf x\nfin\nin\nout\n",
 			"bash: line 1: break: only meaningful in a `for', `while', or `until' loop\n",
+			0,
+		),
+		// A compound command's own redirection, which bash expands in the
+		// shell: the trap runs before the `break` or `continue` is taken.
+		(
+			"trap \"echo trapped\" USR1; for i in 1 2; do while true; do echo w; break; done 2> ${| \
+			 kill -USR1 $$; REPLY=/dev/null; break; }; echo \"in$i\"; done; echo out",
+			"trapped\nin1\ntrapped\nin2\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; for i in 1 2; do while true; do echo w; break; done 2> ${| \
+			 kill -USR1 $$; REPLY=/dev/null; continue; }; echo \"in$i\"; done; echo out",
+			"trapped\nw\nin1\ntrapped\nw\nin2\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; for i in 1 2; do for x in a b; do echo x$x; done 2> ${| \
+			 kill -USR1 $$; REPLY=/dev/null; continue; }; echo \"in$i\"; done; echo out",
+			"trapped\nxb\nin1\ntrapped\nxb\nin2\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; for i in 1 2; do { echo g; } 2> ${| kill -USR1 $$; \
+			 REPLY=/dev/null; break; }; echo \"in$i\"; done; echo out",
+			"trapped\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; for i in 1 2; do { echo g; } 2> ${| kill -USR1 $$; \
+			 REPLY=/dev/null; continue; }; echo \"in$i\"; done; echo out",
+			"trapped\ntrapped\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; for i in 1 2; do if true; then echo t; fi 2> ${| kill -USR1 \
+			 $$; REPLY=/dev/null; break; }; echo \"in$i\"; done; echo out",
+			"trapped\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; for i in 1 2; do if true; then echo t; fi 2> ${| kill -USR1 \
+			 $$; REPLY=/dev/null; continue; }; echo \"in$i\"; done; echo out",
+			"trapped\ntrapped\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; for i in 1 2; do case x in x) echo c;; esac 2> ${| kill \
+			 -USR1 $$; REPLY=/dev/null; break; }; echo \"in$i\"; done; echo out",
+			"trapped\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; for i in 1 2; do case x in x) echo c;; esac 2> ${| kill \
+			 -USR1 $$; REPLY=/dev/null; continue; }; echo \"in$i\"; done; echo out",
+			"trapped\ntrapped\nout\n",
+			"",
 			0,
 		),
 	]);
