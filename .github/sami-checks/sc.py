@@ -12,7 +12,8 @@
   sc.py skip-forms TREE NOT_MARKERS        each print of TREE/crates that says skip is read or named (JSON)
   sc.py skip-lines RESULTS NOT_MARKERS     each skip line a passing test printed is read or named (JSON)
   sc.py flaky-failed RESULT KNOWN          the failed tests of one result with a `flaky: ` entry, one a line
-  sc.py retried RESULT TEST REPORT SHAPE   adds one retry of the whole unit (pass, partial, skip or fail) to RESULT
+  sc.py retried RESULT TEST REPORT SHAPE [SCOPE]   adds one retry (pass, partial, skip or fail) to RESULT;
+                                           SCOPE whole-unit (the default) or own-process (nextest)
   sc.py junit-merge OUT JUNIT...           one JUnit report of several (nextest.sh's two passes)
   sc.py selftest                           the counters and the summary against hand-made inputs
 
@@ -788,14 +789,18 @@ def flaky_failed(result_path, known_path):
             if (known_reason(known, r["row"], r["who"], r["unit"], f) or "").startswith("flaky: ")]
 
 
-def record_retry(result_path, test, report, shape):
-    """Reads one retry of the whole unit (its command again: the same binary or filter, the same
-    threads, the same user; a libtest log, or a JUnit report of nextest or bun) and adds to the
-    result's `retries` for `test`: the outcome, how many of the unit's tests the retry ran, and
-    `shape`, the script's words for how it ran. The outcome is `pass`, `partial` (it passed in a
-    retry that did not run every test the unit ran: a test alone or at another size is not the
-    same race), `skip` (it passed after a skip marker, or was skipped) or `fail` (it failed, did
-    not end, or is not in the report). Returns the outcome."""
+def record_retry(result_path, test, report, shape, scope="whole-unit"):
+    """Reads one retry and adds to the result's `retries` for `test`: the outcome, how many of the
+    unit's tests the retry ran, `shape` (the script's words for how it ran) and `scope`. REPORT is a
+    libtest log or a JUnit report (nextest, bun). The outcome is `pass`, `partial`, `skip` (it passed
+    after a skip marker, or was skipped) or `fail` (it failed, did not end, or is not in the report).
+    With scope `whole-unit`, the retry is the unit's command again (the same binary or filter,
+    threads and user), and a pass in it that did not run every test the unit ran is `partial`: a
+    test alone or at another size is not the same race. With scope `own-process`, the runner gives
+    each test a process of its own (nextest), so its retry alone is that same process again, as in
+    nextest's own retries; a pass then counts however many tests ran. Returns the outcome."""
+    if scope not in ("whole-unit", "own-process"):
+        sys.exit(f"retried: scope {scope!r} is neither whole-unit nor own-process")
     outcome, ran = "fail", set()
     if report.endswith(".xml"):
         try:
@@ -822,9 +827,10 @@ def record_retry(result_path, test, report, shape):
     unit = {n for n, _ in r["tests"]} | set(r["failures"])
     of = len(unit)
     n = len(ran & unit)
-    if outcome == "pass" and n < of:
+    if outcome == "pass" and n < of and scope == "whole-unit":
         outcome = "partial"
-    r.setdefault("retries", {}).setdefault(test, []).append({"outcome": outcome, "ran": n, "of": of, "shape": shape})
+    r.setdefault("retries", {}).setdefault(test, []).append(
+        {"outcome": outcome, "ran": n, "of": of, "shape": shape, "scope": scope})
     json.dump(r, open(result_path, "w", encoding="utf-8"))
     return outcome
 
@@ -836,8 +842,9 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     def failure_reason(r, row, f):
         """(the reason, how the summary shows it) for failure f of result r; no reason when the
         failure is NEW. A flaky entry gives its reason only when the test passed in a retry of the
-        whole unit in the same job (set.sh, nextest.sh, ts.sh: the unit's command again, at most
-        twice): a retry of the test alone does not show the race of the full run."""
+        shape it failed in, in the same job: the whole unit again (set.sh, nextest.sh, ts.sh), or,
+        where each test has a process of its own (nextest), that process again (record_retry's
+        scope): a retry of a test alone from a shared process does not show the race of the full run."""
         why = known_reason(known, row, r["who"], r["unit"], f)
         if why is None:
             return None, "**NEW**"
@@ -845,14 +852,18 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             return why, f"KNOWN ({why})"
         tries = r.get("retries", {}).get(f, [])
         outcomes = [t["outcome"] for t in tries]
+
+        def told(t):
+            what = "in its own process again" if t["scope"] == "own-process" else "a rerun of the unit"
+            return f"{what}: {t['ran']} of {t['of']} tests, {t['shape']}"
+
         if "pass" in outcomes:
             t = tries[outcomes.index("pass")]
-            return why, (f"KNOWN ({why}; it passed on retry {outcomes.index('pass') + 1} of {len(tries)}, "
-                         f"the whole unit again: {t['ran']} of {t['of']} tests, {t['shape']})")
+            return why, f"KNOWN ({why}; it passed on retry {outcomes.index('pass') + 1} of {len(tries)}, {told(t)})"
         if not tries:
             return None, f"**NEW** (listed as `{why}`, but no retry of its unit ran)"
-        seen = ", ".join(f"{t['outcome']} ({t['ran']} of {t['of']} tests, {t['shape']})" for t in tries)
-        return None, f"**NEW** (listed as `{why}`, but no retry of the whole unit passed it: {seen})"
+        seen = "; ".join(f"{t['outcome']} ({told(t)})" for t in tries)
+        return None, f"**NEW** (listed as `{why}`, but no retry of its shape passed it: {seen})"
 
     results = load_results(results_dir)
     got, dup = {}, set()
@@ -1294,8 +1305,8 @@ def selftest():
     # that did not run the whole unit (CiReview at 55a3d02c and at ee06226f: a race that fails at 4
     # threads and passes alone read KNOWN). It is not listed for removal when its test passed, and is
     # when its test is no longer in its unit.
-    def rt(outcome, ran=2, of=2, shape="the binary again, --test-threads=4"):
-        return {"outcome": outcome, "ran": ran, "of": of, "shape": shape}
+    def rt(outcome, ran=2, of=2, shape="the binary again, --test-threads=4", scope="whole-unit"):
+        return {"outcome": outcome, "ran": ran, "of": of, "shape": shape, "scope": scope}
 
     open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tflaky: a race\n"
                                 "set-runner\trunner\tpi-shell::zle_pty\tp\tflaky: a race\n")
@@ -1305,21 +1316,30 @@ def selftest():
     json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("pass")]}), open(os.path.join(res, "zle-runner.json"), "w"))
     rc, out = summary()
     check("a flaky failure that passed on a retry of the whole unit",
-          ("FAILED `k`: KNOWN (flaky: a race; it passed on retry 2 of 2, the whole unit again: 2 of 2 tests, "
+          ("FAILED `k`: KNOWN (flaky: a race; it passed on retry 2 of 2, a rerun of the unit: 2 of 2 tests, "
            "the binary again, --test-threads=4)" in out, "`p`: passed" in out,
            "| pi-shell set (runner) | **KNOWN** |" in out, rc), (True, False, True, 0))
     json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("fail")]}), open(os.path.join(res, "zle-runner.json"), "w"))
     rc, out = summary()
     check("a flaky failure that failed every try",
-          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of the whole unit passed it: fail" in out,
+          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of its shape passed it: fail" in out,
            "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
     json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("partial", 1, 2, "the test alone, 1 thread")]}),
               open(os.path.join(res, "zle-runner.json"), "w"))
     rc, out = summary()
     check("a flaky failure that passes alone and fails at the unit's threads",
-          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of the whole unit passed it: fail (2 of 2 tests, "
-           "the binary again, --test-threads=4), partial (1 of 2 tests, the test alone, 1 thread))" in out,
+          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of its shape passed it: fail (a rerun of the unit: "
+           "2 of 2 tests, the binary again, --test-threads=4); partial (a rerun of the unit: 1 of 2 tests, the test alone, "
+           "1 thread))" in out,
            "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
+    # Where each test has a process of its own (nextest, record_retry's scope own-process), a retry of
+    # the test alone is that process again, as nextest's own retries are, and its pass counts.
+    json.dump(dict(zle_runner, retries={"k": [rt("pass", 1, 2, "nextest's retry", "own-process")]}),
+              open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure that passed in its own process again",
+          ("FAILED `k`: KNOWN (flaky: a race; it passed on retry 1 of 1, in its own process again: 1 of 2 tests, "
+           "nextest's retry)" in out, rc), (True, 0))
     json.dump(dict(zle_runner, retries={"k": [rt("fail"), rt("skip")]}), open(os.path.join(res, "zle-runner.json"), "w"))
     rc, out = summary()
     check("a flaky failure whose retry skipped itself", ("FAILED `k`: **NEW**" in out, rc), (True, 1))
@@ -1350,9 +1370,9 @@ def selftest():
     open(rl, "w").write(ev("a", "ok") + "test k ... " + ev("k", "ok") + ev("q", "failed"))
     o3 = record_retry(rj, "k", rl, "4 threads")
     check("record_retry of the whole unit and of the test alone", (o1, o2, o3, json.load(open(rj))["retries"]["k"]),
-          ("fail", "partial", "pass", [{"outcome": "fail", "ran": 3, "of": 3, "shape": "4 threads"},
-                                       {"outcome": "partial", "ran": 1, "of": 3, "shape": "alone"},
-                                       {"outcome": "pass", "ran": 3, "of": 3, "shape": "4 threads"}]))
+          ("fail", "partial", "pass", [{"outcome": "fail", "ran": 3, "of": 3, "shape": "4 threads", "scope": "whole-unit"},
+                                       {"outcome": "partial", "ran": 1, "of": 3, "shape": "alone", "scope": "whole-unit"},
+                                       {"outcome": "pass", "ran": 3, "of": 3, "shape": "4 threads", "scope": "whole-unit"}]))
     # nextest's and bun's retries are JUnit reports of the whole unit.
     jb = os.path.join(d, "bun-retry.xml")
     open(jb, "w").write('<testsuites><testsuite name="test/x.test.ts"><testsuite name="PDF pages"><testcase '
@@ -1366,6 +1386,12 @@ def selftest():
     check("record_retry from a JUnit report", (record_retry(rjb, "PDF pages::paints (each) page.", jb, "the shard"),
           record_retry(rjn, "pi-builtins::t2", ju, "the unit"), record_retry(rjn, "absent", jb, "the unit")),
           ("pass", "fail", "fail"))
+    jo = os.path.join(d, "own-retry.xml")
+    open(jo, "w").write('<testsuites><testsuite name="pi-builtins"><testcase classname="pi-builtins" name="t2" time="1"/>'
+                        '</testsuite></testsuites>')
+    check("record_retry of a nextest test alone: partial for a whole-unit scope, pass in its own process",
+          (record_retry(rjn, "pi-builtins::t2", jo, "alone"), record_retry(rjn, "pi-builtins::t2", jo, "alone", "own-process")),
+          ("partial", "pass"))
     # A retry that passed after a skip marker checked nothing: `skip`, from a libtest log and from a
     # JUnit report.
     open(rl, "w").write(ev("a", "ok") + ev("k", "ok", "skipped: no zsh here\n") + ev("q", "failed"))

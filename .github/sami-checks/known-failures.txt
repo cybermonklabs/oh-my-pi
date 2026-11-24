@@ -7,8 +7,10 @@
 # in others. When it fails, its job runs its whole unit again (set.sh, nextest.sh, ts.sh: the same
 # binary or filter, the same threads, the same user), at most twice; its failure reads KNOWN only
 # when it passed in such a retry, and NEW when it failed every retry or passed only in a smaller run
-# (a race at 4 threads can pass alone). It is not listed for removal when it passes (it still is
-# when its test no longer exists).
+# (a race at 4 threads can pass alone). Where a runner gives each test a process of its own (nextest
+# on the platform rows), the test's own retry is that process again and counts (sc.py retried,
+# scope own-process). It is not listed for removal when it passes (it still is when its test no
+# longer exists).
 # A unit of `*` names the test in any unit of its row, on the rows whose units are shards (ts-ca,
 # workspace: sc.py ANY_UNIT_ROWS): a coding-agent shard holds the test files whose sorted index mod
 # 10 is the shard's, so a file added before a test moves it to another shard. On the other rows a
