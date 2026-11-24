@@ -3,8 +3,12 @@ import { type } from "@oh-my-pi/omptype";
 import type { AssistantMessage, Context, Message } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Agent } from "../src/agent";
+import { normalizeTools } from "../src/agent-loop";
+import { toolSpecsFingerprint } from "../src/append-only-context";
 import type { AgentTool } from "../src/types";
+import { withNativeDialectEnv } from "./helpers";
 
 function agentTool(name: string): AgentTool {
 	return {
@@ -93,5 +97,58 @@ describe("Agent — inactive tool definitions", () => {
 			if (previousDialect === undefined) delete Bun.env.PI_DIALECT;
 			else Bun.env.PI_DIALECT = previousDialect;
 		}
+	});
+});
+
+describe("Agent — a refused request's tool declaration", () => {
+	it("is not read: the declared tools follow the request before it, as the replay sends no refusal", async () => {
+		await withNativeDialectEnv(async () => {
+			// A model whose requests keep their tool declaration across the conversation.
+			const model = getBundledModel("anthropic", "claude-opus-5-5");
+			if (!model) throw new Error("expected the bundled claude-opus-5-5");
+			const contexts: Context[] = [];
+			const refusal: AssistantMessage = {
+				...reply({
+					messageIndex: 3,
+					tools: { declared: ["read", "grep"], deferred: ["grep"], active: ["read", "grep"] },
+				}),
+				stopReason: "error",
+				stopDetails: { type: "refusal" },
+			};
+			const responses = [
+				reply({ messageIndex: 1, tools: { declared: ["read"], deferred: [], active: ["read"] } }),
+				refusal,
+			];
+			const read = agentTool("read");
+			const agent = new Agent({
+				initialState: { model, systemPrompt: ["system"], tools: [read] },
+				streamFn: (_model, context) => {
+					contexts.push(context);
+					const message = responses[contexts.length - 1] ?? reply();
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() =>
+						stream.push(
+							message.stopReason === "error"
+								? { type: "error", reason: "error", error: message }
+								: { type: "done", reason: "stop", message },
+						),
+					);
+					return stream;
+				},
+			});
+
+			await agent.prompt("first");
+			// The refused request adds grep; grep is withdrawn before the next request.
+			agent.setTools([read, agentTool("grep")]);
+			await agent.prompt("second");
+			agent.setTools([read]);
+			// Precondition: the transcript keeps the refusal, with the declaration its request recorded.
+			expect(agent.state.messages.at(-1)).toMatchObject({ stopDetails: { type: "refusal" } });
+
+			expect(agent.declaredTools(model).map(tool => tool.name)).toEqual(["read"]);
+			expect(agent.declaredToolsFingerprint(model)).toBe(
+				toolSpecsFingerprint(normalizeTools([read], { injectIntent: false }) ?? []),
+			);
+		});
 	});
 });

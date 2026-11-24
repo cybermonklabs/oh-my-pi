@@ -72,6 +72,11 @@ export interface TodoTrackerHost {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	/**
+	 * The settings the declarations the requests send were written for: under a held settings change, the values the
+	 * bound prompt and the kept tool definitions were sent with (`AgentSession.requestSettings`).
+	 */
+	requestSettings(): Settings;
 	model(): Model | undefined;
 	agentKind(): "main" | "sub";
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
@@ -364,7 +369,8 @@ export class TodoTracker {
 		};
 		return {
 			toolRefs: { task: wireName("task"), todo: wireName("todo") },
-			taskBatch: cfgTaskBatch.get(this.#host.settings),
+			// The `task` definition the model reads: a held `task.batch` change keeps its batch field as sent.
+			taskBatch: cfgTaskBatch.get(this.#host.requestSettings()),
 		};
 	}
 

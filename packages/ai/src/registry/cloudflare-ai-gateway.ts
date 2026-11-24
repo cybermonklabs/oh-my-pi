@@ -11,6 +11,7 @@ import { $env } from "@oh-my-pi/pi-utils";
 import { NO_AUTH_SENTINEL } from "../auth-retry";
 import * as AIError from "../error";
 import type { Api, Model } from "../types";
+import { sameOwnFields } from "../utils/same-own-fields";
 import type { ProviderTransport } from "./build";
 
 /**
@@ -21,15 +22,6 @@ import type { ProviderTransport } from "./build";
  * snapshot check and rebuilds.
  */
 const compatRouteModels = new WeakMap<Model<Api>, { source: Model<Api>; prepared: Model<Api> }>();
-
-function sameOwnFields(a: object, b: object): boolean {
-	const aKeys = Object.keys(a);
-	if (aKeys.length !== Object.keys(b).length) return false;
-	for (const key of aKeys) {
-		if ((a as Record<string, unknown>)[key] !== (b as Record<string, unknown>)[key]) return false;
-	}
-	return true;
-}
 
 /** Cloudflare AI Gateway model/request shaping; login lives in `oauth/cloudflare-ai-gateway.ts` + its auth rule. */
 export const cloudflareAiGatewayTransport: ProviderTransport = {

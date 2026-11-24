@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Agent, AgentEvent } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { StreamingEditGuard } from "@oh-my-pi/pi-coding-agent/session/stream-guards";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 
@@ -13,7 +14,7 @@ interface RecoveryHarness {
 	state: { settings: Settings; promptSequence: number; promptGeneration: number; disposed: boolean };
 	aborts: unknown[];
 	appended: Record<string, unknown>[];
-	persisted: unknown[][];
+	persisted: CustomMessage[];
 	notices: { level: string; message: string }[];
 	tasks: ((signal: AbortSignal) => Promise<void>)[];
 	continueCount: () => number;
@@ -37,7 +38,7 @@ function createHarness(opts: RecoveryHarnessOptions = {}): RecoveryHarness {
 	};
 	const aborts: unknown[] = [];
 	const appended: Record<string, unknown>[] = [];
-	const persisted: unknown[][] = [];
+	const persisted: CustomMessage[] = [];
 	const notices: { level: string; message: string }[] = [];
 	const tasks: ((signal: AbortSignal) => Promise<void>)[] = [];
 	let continueCount = 0;
@@ -56,8 +57,8 @@ function createHarness(opts: RecoveryHarnessOptions = {}): RecoveryHarness {
 		} as unknown as Agent,
 		settings: state.settings,
 		sessionManager: {
-			appendCustomMessageEntry(...args: unknown[]) {
-				persisted.push(args);
+			appendCustomMessage(message: CustomMessage) {
+				persisted.push(message);
 			},
 		} as unknown as SessionManager,
 		model: () => undefined,
@@ -101,8 +102,8 @@ describe("streaming edit recovery", () => {
 
 		const persisted = harness.persisted[0];
 		if (!persisted) throw new Error("expected a persisted recovery entry");
-		expect(persisted[0]).toBe("streaming-edit-recovery");
-		expect(persisted[2]).toBe(false);
+		expect(persisted.customType).toBe("streaming-edit-recovery");
+		expect(persisted.display).toBe(false);
 
 		expect(harness.continueCount()).toBe(1);
 		const info = harness.notices.find(notice => notice.level === "info");

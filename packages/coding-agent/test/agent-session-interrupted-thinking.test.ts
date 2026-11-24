@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { Api, AssistantMessage, Model, ThinkingContent } from "@oh-my-pi/pi-ai";
@@ -298,7 +298,12 @@ describe("AgentSession interrupted thinking persistence", () => {
 		);
 	});
 
-	it("makes hidden continuity available in agent state before awaited message_end delivery finishes", async () => {
+	/** An extension runner whose `message_end` handler holds delivery until `release` resolves. */
+	async function delayedMessageEndRunner(): Promise<{
+		extensionRunner: ExtensionRunner;
+		entered: Promise<void>;
+		release: () => void;
+	}> {
 		const releaseExtension = Promise.withResolvers<void>();
 		const extensionEntered = Promise.withResolvers<void>();
 		const extensionRuntime = new ExtensionRuntime();
@@ -321,25 +326,62 @@ describe("AgentSession interrupted thinking persistence", () => {
 			SessionManager.inMemory(),
 			new ModelRegistry(authStorage, path.join(tempDir.path(), "extension-models.yml")),
 		);
-		const harness = createSession(extensionRunner);
+		return { extensionRunner, entered: extensionEntered.promise, release: () => releaseExtension.resolve() };
+	}
+
+	/** Resolves once `sessionManager` stores the interrupted-thinking continuity entry. */
+	function continuityStored(sessionManager: SessionManager): Promise<void> {
 		const persisted = Promise.withResolvers<void>();
-		const previous = harness.sessionManager.onEntryAppended;
-		harness.sessionManager.onEntryAppended = entry => {
+		const previous = sessionManager.onEntryAppended;
+		sessionManager.onEntryAppended = entry => {
 			previous?.(entry);
 			if (entry.type !== "custom_message" || entry.customType !== INTERRUPTED_THINKING_MESSAGE_TYPE) return;
-			harness.sessionManager.onEntryAppended = previous;
+			sessionManager.onEntryAppended = previous;
 			persisted.resolve();
 		};
+		return persisted.promise;
+	}
+
+	it("makes hidden continuity available in agent state before awaited message_end delivery finishes", async () => {
+		const delayed = await delayedMessageEndRunner();
+		const harness = createSession(delayed.extensionRunner);
+		const persisted = continuityStored(harness.sessionManager);
 		const message = thinkingAssistant(harness.model, USER_INTERRUPT_LABEL);
 
 		harness.session.agent.emitExternalEvent({ type: "message_start", message });
 		harness.session.agent.emitExternalEvent({ type: "message_end", message });
-		await extensionEntered.promise;
+		await delayed.entered;
 
 		expect(harness.session.agent.state.messages.some(isInterruptedThinkingMessage)).toBe(true);
 
-		releaseExtension.resolve();
-		await persisted.promise;
+		delayed.release();
+		await persisted;
+	});
+
+	it("stores hidden continuity under the timestamp it was sent with when message_end delivery delays the store", async () => {
+		const delayed = await delayedMessageEndRunner();
+		const harness = createSession(delayed.extensionRunner);
+		const persisted = continuityStored(harness.sessionManager);
+		const message = thinkingAssistant(harness.model, USER_INTERRUPT_LABEL);
+
+		harness.session.agent.emitExternalEvent({ type: "message_start", message });
+		harness.session.agent.emitExternalEvent({ type: "message_end", message });
+		await delayed.entered;
+		const sent = harness.session.agent.state.messages.find(isInterruptedThinkingMessage);
+		if (!sent) throw new Error("Expected the hidden continuity in agent state");
+		// The store waits for delivery, which ends a second after the agent took the message.
+		setSystemTime(sent.timestamp + 1_000);
+		try {
+			delayed.release();
+			await persisted;
+		} finally {
+			setSystemTime();
+		}
+
+		// A session read again from its entries names each turn by its role and timestamp (the image clamp's
+		// drops, the date/cwd reminder's placements): it must find the turn the agent sent, not one stamped later.
+		const reread = harness.sessionManager.buildSessionContext().messages.find(isInterruptedThinkingMessage);
+		expect(reread?.timestamp).toBe(sent.timestamp);
 	});
 
 	it("leaves native thinking on non-user aborts and does not append hidden context", async () => {

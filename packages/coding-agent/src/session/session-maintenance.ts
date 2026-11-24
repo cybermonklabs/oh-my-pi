@@ -32,8 +32,10 @@ import {
 	DEFAULT_SHAKE_CONFIG,
 	type CompactionSettings as EngineCompactionSettings,
 	effectiveReserveTokens,
+	getMessageFromEntry,
 	invalidateMessageCache,
 	isTranscriptUsageAnchor,
+	MAX_SUMMARY_TOKENS,
 	NativeCompactionError,
 	prepareCompaction,
 	promptBudgetTokens,
@@ -50,19 +52,21 @@ import {
 } from "@oh-my-pi/pi-agent-core/compaction";
 import {
 	DEFAULT_PRUNE_CONFIG,
+	type PruneCut,
 	type PruneResult,
 	pruneSupersededToolResults,
 	pruneToolOutputs,
 	readToolSupersedeKey,
 } from "@oh-my-pi/pi-agent-core/compaction/pruning";
 import type { ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
-import type {
-	AssistantMessage,
-	CodexCompactionContext,
-	Context,
-	Message,
-	Model,
-	ProviderSessionState,
+import {
+	type AssistantMessage,
+	type CodexCompactionContext,
+	type Context,
+	type Message,
+	type Model,
+	type ProviderSessionState,
+	resolveCacheRetention,
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { replaysNativeResponsesHistory } from "@oh-my-pi/pi-ai/providers/openai-shared";
@@ -100,12 +104,19 @@ import {
 	resolveSpeculationMethod,
 } from "./compaction-methods";
 import {
+	type ContextCut,
+	type ContextCutSession,
+	decideSessionContextCut,
+	promptCacheEntryLapsed,
+} from "./context-cut";
+import {
 	assistantTurnDelivered,
 	convertToLlm,
 	invalidateConvertToLlmArrayCache,
 	isUserAuthoredMessage,
 	stripImagesFromMessage,
 } from "./messages";
+import type { ObservedPromptCacheEntry } from "./prompt-cache-status";
 import { isTerminalTextAssistantAnswer } from "./queued-messages";
 import {
 	resolveCompactionConfiguredTarget,
@@ -120,7 +131,7 @@ import {
 	getReadableCompactionEntry,
 } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
-import type { SessionManager } from "./session-manager";
+import { newestCopiedEntryId, type SessionManager } from "./session-manager";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { resolveSpeculationLeadTokens, SPECULATION_LEAD_MIN_TOKENS } from "./speculation-lead";
 import { TOOL_RESULT_PRUNE_CUSTOM_TYPE, toToolResultPruneData } from "./tool-result-prunes";
@@ -137,7 +148,8 @@ import {
 	cfgSnapcompactShape,
 } from "./context-settings";
 import { resolveModelCompactionSettings } from "./model-compaction-threshold";
-import { cfgProvidersOpenaiCodexDaybreak, cfgRetry } from "./settings";
+import { cfgProvidersCacheRetention, cfgProvidersOpenaiCodexDaybreak, cfgRetry } from "./settings";
+import { promptCacheModelKey, resolveKimiApiFormat } from "./settings-stream-fn";
 
 export type CompactionCheckResult = Readonly<{
 	continuationScheduled: boolean;
@@ -236,6 +248,14 @@ function hasUsableCompactionMethod(
 	return resolveCompactionMethodOrder(settings.methodOrder).some(candidate =>
 		isCompactionMethodUsable(candidate, reason, model, settings, excludeMedia),
 	);
+}
+
+/**
+ * Whether an automatic maintenance pass for `reason` is a forced cut: the provider refused the request for its size,
+ * or stopped its turn with the window full.
+ */
+function forcedByReason(reason: "overflow" | "threshold" | "idle" | "incomplete"): boolean {
+	return reason === "overflow" || reason === "incomplete";
 }
 
 /**
@@ -388,8 +408,11 @@ function mergeLlmCompactionPreserveData(
 	return snapcompact.stripPreservedArchive(Object.keys(preserveData).length > 0 ? preserveData : undefined);
 }
 
-/** Wrap a handoff document as a compaction summary: append the cumulative file-operations tag and derive entry details. */
-function handoffSummaryFromDocument(
+/**
+ * Wrap `document` (a handoff document; empty for the file lists alone) as a compaction summary: append the cumulative
+ * file-operations tag and derive entry details.
+ */
+function summaryWithFileOperations(
 	document: string,
 	preparation: CompactionPreparation,
 ): { summary: string; details: CompactionDetails } {
@@ -504,6 +527,8 @@ export interface SessionMaintenanceHost {
 		pendingMessages?: AgentMessage[];
 	}): ContextUsageBreakdown | undefined;
 	getContextUsage(options?: { contextWindow?: number }): ContextUsage | undefined;
+	/** The prompt cache entry the next request would read (`AgentSession.getPromptCacheStatus`'s entry). */
+	observedPromptCacheEntry(): ObservedPromptCacheEntry | undefined;
 	shake(mode: ShakeMode, options?: { config?: ShakeConfig; signal?: AbortSignal }): Promise<ShakeResult>;
 	dropImages(): Promise<{ removed: number; tokensFreed: number }>;
 	generateHandoffDocument(
@@ -559,6 +584,135 @@ function archiveReader(model: Model): ArchiveReader {
  */
 function mayHoldArchive(message: CompactionSummaryMessage): boolean {
 	return message.method === undefined || message.method === "snapcompact";
+}
+
+/**
+ * An automatic snapcompact pass the cut rule refused once its archive was rendered: what that archive and the kept
+ * tail would leave, and the context it was weighed for. Later maintenance points weigh the cut with these figures
+ * before they start another pass.
+ */
+interface RefusedSnapcompact {
+	/** The context the pass would have left, the tools and system prompt included (the cut's `afterTokens`). */
+	afterTokens: number;
+	/**
+	 * The newest entry of the branch the pass was weighed on, labels aside (a copy re-creates them under new ids): a
+	 * later point weighs the history that grew from it.
+	 */
+	leafId: string;
+	/**
+	 * The newest compaction, model and method settings the archive was rendered for. It names no session: a copy of the
+	 * session (a fork, a branch into a new file, a move off a contested file) holds the same history.
+	 */
+	contextKey: string;
+}
+
+/**
+ * The {@link RefusedSnapcompact} records one read of a session's entries holds, oldest first, with the session and
+ * the read ({@link SessionManager.loadRevision}) they were read for, and the latest pass this process saw refused
+ * since that read: a new read of the entries starts with none, while a copy of the session in this process (another
+ * session id at the same revision) keeps the one this process saw.
+ */
+interface SnapcompactRefusals {
+	sessionId: string;
+	loadRevision: number;
+	refusals: RefusedSnapcompact[];
+	remembered: RefusedSnapcompact | undefined;
+}
+
+/**
+ * Custom session entry holding a {@link RefusedSnapcompact}, written at each refusal on the branch current then, after
+ * the leaf the archive was weighed on, and into a copy of the branch up to that leaf
+ * (`SessionMaintenance.followTranscriptCopy`): a process that resumes the session finds the figures among the entries
+ * of every branch and weighs them on any branch that carries that leaf before it starts another pass.
+ */
+const SNAPCOMPACT_REFUSAL_ENTRY_TYPE = "snapcompact-refusal";
+
+function isRecordedSnapcompactRefusal(data: unknown): data is RefusedSnapcompact & { version: 1 } {
+	return (
+		isRecord(data) &&
+		data.version === 1 &&
+		typeof data.afterTokens === "number" &&
+		typeof data.leafId === "string" &&
+		typeof data.contextKey === "string"
+	);
+}
+
+/**
+ * The cut rule's last answer for an automatic model-summary compaction when it was "waits": the model it was weighed
+ * for, the prompt cache entry it was weighed on, followed through each request that touched that entry while it was
+ * live (`SessionMaintenance.#compactionWaits`), the newest compaction on the branch then, and the branch leaf the rule
+ * answered at. It names no session: a copy of the session (a fork, a branch into a new file, a move off a contested
+ * file) sends the same history, and its requests read the same entry.
+ */
+interface CompactionWait {
+	/** The model the compaction was weighed for, as the prompt cache keys it ({@link promptCacheModelKey}). */
+	modelKey: string;
+	entry: NonNullable<ContextCutSession["cacheEntry"]>;
+	/** Id of the branch's newest compaction when the rule answered, null with none: another one ends the wait. */
+	compactionId: string | null;
+	/**
+	 * The newest entry of the branch the rule answered at, labels aside (a copy re-creates them under new ids): a branch
+	 * that does not carry it holds another history.
+	 */
+	leafId: string;
+}
+
+/**
+ * Custom session entry holding a {@link CompactionWait}, written when the cut rule answers "waits" for an automatic
+ * model-summary compaction and the session's newest record does not hold that wait already, on the branch current
+ * then (`SessionMaintenance.#writeCompactionWait`): once for each cache entry the rule waits on, again only once a
+ * request touched the entry after the recorded figures would have lapsed, and into a copy of the session that lacks it
+ * (`SessionMaintenance.followTranscriptCopy`; `/fork` at the branch's newest message carries it with the records after
+ * that message). A process that reads the session's entries in whole (from its file, or a copy of it) holds the wait of
+ * the newest record while it still applies, as the process that wrote it did.
+ */
+const COMPACTION_WAIT_ENTRY_TYPE = "compaction-wait";
+
+/**
+ * Custom session entry holding `{ version: 1 }`, written when a wait the session's newest
+ * {@link COMPACTION_WAIT_ENTRY_TYPE} record holds stops: the rule admits the compaction, or the wait no longer applies.
+ */
+const COMPACTION_WAIT_END_ENTRY_TYPE = "compaction-wait-end";
+
+function isRecordedCompactionWait(data: unknown): data is CompactionWait & { version: 1 } {
+	if (!isRecord(data) || data.version !== 1 || !isRecord(data.entry)) return false;
+	const { tier, touchedAt, ttlMs } = data.entry;
+	return (
+		typeof data.modelKey === "string" &&
+		typeof data.leafId === "string" &&
+		(typeof data.compactionId === "string" || data.compactionId === null) &&
+		(tier === "short" || tier === "long") &&
+		typeof touchedAt === "number" &&
+		(ttlMs === undefined || typeof ttlMs === "number")
+	);
+}
+
+function isRecordedCompactionWaitEnd(data: unknown): data is { version: 1 } {
+	return isRecord(data) && data.version === 1;
+}
+
+/**
+ * What one read of a session's entries records of the cut rule's waits: the newest {@link COMPACTION_WAIT_ENTRY_TYPE}
+ * record among them, undefined when there is none or a {@link COMPACTION_WAIT_END_ENTRY_TYPE} record ends it, kept
+ * current by this process's own writes; the read it was taken for (the session's id and
+ * {@link SessionManager.loadRevision}); whether this process took it in since that read
+ * (`SessionMaintenance.#compactionWaits`); and whether the read copies one this process had taken in: another session
+ * id at the same revision (a `/fork`, a branch into a new file, a move off a contested file, `/new`), which holds the
+ * history this process held, part of it, or none of it.
+ */
+interface CompactionWaitRecords {
+	sessionId: string;
+	loadRevision: number;
+	newest: CompactionWait | undefined;
+	taken: boolean;
+	copied: boolean;
+}
+
+/** The figures of `entry` the cut rule reads, kept as they stand now. */
+function cacheEntryFigures(
+	entry: NonNullable<ContextCutSession["cacheEntry"]>,
+): NonNullable<ContextCutSession["cacheEntry"]> {
+	return { tier: entry.tier, touchedAt: entry.touchedAt, ttlMs: entry.ttlMs };
 }
 
 /** Owns compaction, pruning, shake, promotion, and automatic context maintenance. */
@@ -636,6 +790,45 @@ export class SessionMaintenance {
 		{ key: string; length: number; first: AgentMessage | undefined }
 	>();
 	readonly #host: SessionMaintenanceHost;
+	/** Called with every automatic cut the cut rule admits ({@link onContextCutAdmitted}). */
+	readonly #cutAdmittedListeners = new Set<(cut: ContextCut) => void>();
+	/**
+	 * The latest offer of the tool-result prune passes in this process: the session and branch leaf it was made on,
+	 * and whether the cut rule withheld a pass at it ({@link #prunePassesWithheld}).
+	 */
+	#pruneOffer: { sessionId: string; leafId: string | null; withheld: boolean } | undefined;
+	/**
+	 * The refusals the session records ({@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE}) on every branch and the latest pass
+	 * the cut rule refused after rendering ({@link #snapcompactMayBeAdmitted}): read once for each session the manager
+	 * holds and each time it reads the session's entries in whole (again after a switch to another session, or back to
+	 * one another process continued meanwhile), and kept current by this process's own writes
+	 * ({@link #sessionSnapcompactRefusals}).
+	 */
+	#recordedSnapcompactRefusals: SnapcompactRefusals | undefined;
+	/**
+	 * The cut rule's last answer for an automatic model-summary compaction, while it was "waits". While it holds, no
+	 * maintenance point starts a background speculation, or replaces an armed one, for a cut that cannot run. A
+	 * process that read the session's entries in whole takes it from the session's records, and one that copied the
+	 * session carries it to the copy ({@link #compactionWaits}).
+	 */
+	#compactionWait: CompactionWait | undefined;
+	/**
+	 * The newest wait the session records ({@link COMPACTION_WAIT_ENTRY_TYPE}): read once for each session the manager
+	 * holds and each time it reads the session's entries in whole, and kept current by this process's own writes
+	 * ({@link #sessionCompactionWaits}).
+	 */
+	#recordedCompactionWaits: CompactionWaitRecords | undefined;
+	/**
+	 * The read ({@link #sessionCompactionWaits}) the cut rule last answered in for an automatic model-summary
+	 * compaction ({@link #recordCompactionAnswer}); undefined until it first answers. Another read means this process
+	 * holds another session, or read the session's entries again, since it answered: one it read (a resume, a `/resume`
+	 * switch, a fork of a session file) may have been waiting on the compaction in the process that wrote it, and a copy
+	 * (a `/fork`, a branch into a new file, a move off a contested file) may hold a branch the rule was not asked about.
+	 * It takes or carries the wait while that applies ({@link #compactionWaits}), and
+	 * {@link deferThresholdCompactionToSpeculation} asks the rule first otherwise; a session this process began, before
+	 * it first answers, has nothing to ask about.
+	 */
+	#compactionAnswerRead: CompactionWaitRecords | undefined;
 
 	get #model(): Model | undefined {
 		return this.#host.model();
@@ -775,6 +968,391 @@ export class SessionMaintenance {
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 	}
 
+	/**
+	 * Whether an automatic cut runs now, by the cut rule over the live session's figures
+	 * ({@link decideSessionContextCut}). A cut that is not admitted does not run: the next
+	 * maintenance point proposes it again, and it runs once it pays, the cache entry lapses, or the
+	 * request cannot be served without it. Manual `/shake` and `/compact`, and a compaction an RPC
+	 * client requests, do not ask.
+	 */
+	admitsContextCut(cut: ContextCut): boolean {
+		const admitted = this.#cutRuleAdmits(cut);
+		if (admitted) for (const listener of this.#cutAdmittedListeners) listener(cut);
+		return admitted;
+	}
+
+	/** Whether the cut rule admits `cut` now, as {@link admitsContextCut} asks it, without telling its listeners. */
+	#cutRuleAdmits(cut: ContextCut): boolean {
+		const model = this.#model;
+		// No model: no prices or window to weigh the cut with.
+		return (
+			!model ||
+			decideSessionContextCut(
+				{
+					model,
+					cacheEntry: this.#nextPromptCacheEntry(),
+					compactionSettings: this.#compactionSettings,
+					branch: this.#host.sessionManager.getBranchView(),
+					promptTokens: cut.promptTokens ?? this.#cutPromptTokens(),
+					now: Date.now(),
+				},
+				cut,
+			).admitted
+		);
+	}
+
+	/** Calls `listener` with each cut {@link admitsContextCut} admits, until the returned function is called. */
+	onContextCutAdmitted(listener: (cut: ContextCut) => void): () => void {
+		this.#cutAdmittedListeners.add(listener);
+		return () => this.#cutAdmittedListeners.delete(listener);
+	}
+
+	/**
+	 * Asks the cut rule about a forced cut, which it always admits: the rule logs the decision and
+	 * {@link onContextCutAdmitted}'s listeners hear of the cut.
+	 */
+	#recordForcedCut(cut: ContextCut): void {
+		this.admitsContextCut(cut);
+	}
+
+	/** Whether the prompt cache entry the next request would read has lapsed, by the cut rule's lapse condition. */
+	promptCacheLapsed(): boolean {
+		return promptCacheEntryLapsed(this.#nextPromptCacheEntry(), Date.now());
+	}
+
+	/**
+	 * The prompt cache entry the cut rule reads: none when the next request asks for no caching or cannot read the
+	 * entry (its `change`: the model, thinking level, tools, system prompt or retention changed since, or a compaction
+	 * replaced what it cached), so it counts as lapsed.
+	 */
+	#nextPromptCacheEntry(): ObservedPromptCacheEntry | undefined {
+		const retention = cfgProvidersCacheRetention.get(this.#host.settings);
+		if (resolveCacheRetention(retention === "auto" ? undefined : retention) === "none") return undefined;
+		const entry = this.#host.observedPromptCacheEntry();
+		return entry?.change === undefined ? entry : undefined;
+	}
+
+	/**
+	 * Records the cut rule's answer for an automatic model-summary compaction: a wait on the entry the next request
+	 * reads, or nothing once the rule admitted it. The session records it too, so a process that reads the session's
+	 * entries in whole holds the same wait: a wait its newest record does not hold already writes a
+	 * {@link COMPACTION_WAIT_ENTRY_TYPE} record ({@link #writeCompactionWait}), and an answer that ends the recorded
+	 * wait a {@link COMPACTION_WAIT_END_ENTRY_TYPE} one.
+	 */
+	#recordCompactionAnswer(admitted: boolean): void {
+		const model = this.#model;
+		const entry = admitted || !model ? undefined : this.#nextPromptCacheEntry();
+		const sessionManager = this.#host.sessionManager;
+		// The answer stands over the wait the session records.
+		const records = this.#sessionCompactionWaits();
+		records.taken = true;
+		this.#compactionAnswerRead = records;
+		// Labels carry no history, and a copy of the branch re-creates them under new ids.
+		const leafId = newestCopiedEntryId(sessionManager.getBranchView());
+		const wait: CompactionWait | undefined =
+			!model || !entry || leafId === undefined
+				? undefined
+				: {
+						modelKey: this.#cacheModelKey(model),
+						entry: cacheEntryFigures(entry),
+						compactionId: getLatestCompactionEntry(sessionManager.getBranchView())?.id ?? null,
+						leafId,
+					};
+		this.#compactionWait = wait;
+		if (!wait) {
+			this.#endRecordedCompactionWait(records);
+			return;
+		}
+		this.#writeCompactionWait(records, wait);
+	}
+
+	/**
+	 * Writes `wait` to the session as a {@link COMPACTION_WAIT_ENTRY_TYPE} record unless the session's newest record
+	 * already holds it for the entry `wait` follows: the same model, newest compaction, tier and lifetime, on a branch
+	 * that carries the record's leaf, and that entry touched again before the recorded figures lapsed. A process that
+	 * reads the session takes that record for such an entry ({@link #takeCompactionWait}), so a request that only
+	 * touches the live entry again adds no record: one is written for each cache entry the rule waits on, and another
+	 * only once a touch comes after the recorded figures would have lapsed.
+	 */
+	#writeCompactionWait(records: CompactionWaitRecords, wait: CompactionWait): void {
+		const sessionManager = this.#host.sessionManager;
+		const newest = records.newest;
+		if (
+			newest?.modelKey === wait.modelKey &&
+			newest.compactionId === wait.compactionId &&
+			newest.entry.tier === wait.entry.tier &&
+			newest.entry.ttlMs === wait.entry.ttlMs &&
+			!promptCacheEntryLapsed(newest.entry, wait.entry.touchedAt) &&
+			this.#branchCarries(newest.leafId)
+		) {
+			return;
+		}
+		const recorded: CompactionWait = { ...wait };
+		sessionManager.appendCustomEntry(COMPACTION_WAIT_ENTRY_TYPE, { version: 1, ...recorded });
+		records.newest = recorded;
+	}
+
+	/**
+	 * Whether the cut rule's last answer for an automatic model-summary compaction is still "waits" on the same cache
+	 * entry: same model, the same newest compaction on the branch, and the entry the next request reads is the one the
+	 * rule waited on, readable, not lapsed, and touched since only by requests that came while it was live. A lapse, an
+	 * entry the next request cannot read, a new entry, another model or compaction end the wait, as does a pass the
+	 * rule admits (a forced reason among them, {@link #recordCompactionAnswer}); the session records the end. At each
+	 * new read of the session ({@link #sessionCompactionWaits}: another session id, or its entries read in whole) the
+	 * wait is taken in again ({@link #takeCompactionWait}). The real pass asks the rule again at every maintenance
+	 * point; this only keeps a background summary from being requested, at a model call each, for a cut that cannot
+	 * run yet.
+	 */
+	#compactionWaits(): boolean {
+		const records = this.#sessionCompactionWaits();
+		if (!records.taken) {
+			records.taken = true;
+			// Entries read in whole bring the records of every process that wrote them, which stand over the wait this
+			// process held. A copy this process made holds its own history, whose newest answer is the wait it held.
+			return this.#takeCompactionWait(records, records.copied ? this.#compactionWait : records.newest) !== undefined;
+		}
+		const wait = this.#compactionWait;
+		if (!wait) return false;
+		const entry = this.#nextPromptCacheEntry();
+		if (entry && entry.touchedAt >= wait.entry.touchedAt && this.#compactionWaitHolds(wait, entry)) {
+			wait.entry = cacheEntryFigures(entry);
+			return true;
+		}
+		this.#compactionWait = undefined;
+		this.#endRecordedCompactionWait(records);
+		return false;
+	}
+
+	/**
+	 * Takes `candidate` in as this process's wait at a new read of the session while it applies there: on a branch that
+	 * carries the leaf the rule answered at, as a wait holds ({@link #compactionWaitHolds}). The entry the next request
+	 * reads may now be the one the branch's newest reply left, touched a moment before the request the wait followed,
+	 * so the branch, not that touch, shows it is not an older one; the wait follows that entry from then on. With no
+	 * candidate that applies no wait stands, and the read's newest record is ended, as a wait that stops is. Returns the
+	 * wait taken in.
+	 */
+	#takeCompactionWait(
+		records: CompactionWaitRecords,
+		candidate: CompactionWait | undefined,
+	): CompactionWait | undefined {
+		const entry = this.#nextPromptCacheEntry();
+		if (
+			!candidate ||
+			!entry ||
+			!this.#branchCarries(candidate.leafId) ||
+			!this.#compactionWaitHolds(candidate, entry)
+		) {
+			this.#compactionWait = undefined;
+			this.#endRecordedCompactionWait(records);
+			return undefined;
+		}
+		this.#compactionWait = { ...candidate, entry: cacheEntryFigures(entry) };
+		return this.#compactionWait;
+	}
+
+	/**
+	 * Writes into a copy of the session, just made (`/fork`, `/fork <entry>`, `/branch`, a `/btw` branch, a move off a
+	 * contested file), the wait on a model-summary compaction and the snapcompact refusal this process holds where they
+	 * apply there and the copy holds no record of them. Their records sit after the branch's newest message when they
+	 * were written: `/fork` at that message, while it is the branch's newest, copies them with it, but a copy that
+	 * leaves them out (later entries branch off that message, a `/btw` branch after `/tree` to it) gets them here; with
+	 * them, a process that resumes the copy holds them as this process does.
+	 */
+	followTranscriptCopy(): void {
+		const records = this.#sessionCompactionWaits();
+		// The copy carries the wait this process held while it applies there, as a maintenance point takes it in.
+		if (records.copied && !records.taken && this.#compactionWait) {
+			records.taken = true;
+			const wait = this.#takeCompactionWait(records, this.#compactionWait);
+			if (wait) this.#writeCompactionWait(records, wait);
+		}
+		const refusals = this.#sessionSnapcompactRefusals();
+		const refused = refusals.remembered;
+		if (
+			refused &&
+			this.#branchCarries(refused.leafId) &&
+			!refusals.refusals.some(
+				recorded =>
+					recorded.leafId === refused.leafId &&
+					recorded.contextKey === refused.contextKey &&
+					recorded.afterTokens === refused.afterTokens,
+			)
+		) {
+			this.#recordSnapcompactRefusal(refusals, refused);
+		}
+	}
+
+	/** Whether the current branch carries the entry `id`. */
+	#branchCarries(id: string): boolean {
+		return this.#host.sessionManager.getBranchView().findLastIndex(entry => entry.id === id) >= 0;
+	}
+
+	/**
+	 * Writes `refused` to the session as a {@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE} record and adds it to `records`, the
+	 * session's refusals as this process read them.
+	 */
+	#recordSnapcompactRefusal(records: SnapcompactRefusals, refused: RefusedSnapcompact): void {
+		this.#host.sessionManager.appendCustomEntry(SNAPCOMPACT_REFUSAL_ENTRY_TYPE, { version: 1, ...refused });
+		records.refusals.push(refused);
+	}
+
+	/**
+	 * Whether `entry`, the one the next request reads, keeps `wait` as the session stands now: same model, the same
+	 * newest compaction on the branch, and a readable entry of the same tier, touched again before the entry the rule
+	 * waited on lapsed and not lapsed since.
+	 */
+	#compactionWaitHolds(wait: CompactionWait, entry: ObservedPromptCacheEntry): boolean {
+		const model = this.#model;
+		return (
+			model !== undefined &&
+			!entry.refreshMissed &&
+			wait.modelKey === this.#cacheModelKey(model) &&
+			wait.compactionId === (getLatestCompactionEntry(this.#host.sessionManager.getBranchView())?.id ?? null) &&
+			entry.tier === wait.entry.tier &&
+			// Touched again before the entry the rule waited on lapsed: the same entry, kept live.
+			!promptCacheEntryLapsed(wait.entry, entry.touchedAt) &&
+			!promptCacheEntryLapsed(entry, Date.now())
+		);
+	}
+
+	/** `model` as the prompt cache keys it, in the session's Kimi Code API format ({@link promptCacheModelKey}). */
+	#cacheModelKey(model: Model): string {
+		return promptCacheModelKey(model, resolveKimiApiFormat(this.#host.settings));
+	}
+
+	/**
+	 * The newest wait the session's entries record, on every branch ({@link #recordedCompactionWaits}): the newest
+	 * {@link COMPACTION_WAIT_ENTRY_TYPE} record, whichever session wrote it (a copy of the session holds the records of
+	 * the session it copies), unless a {@link COMPACTION_WAIT_END_ENTRY_TYPE} record follows it. Read again for each
+	 * session id the manager holds and each read of its entries in whole; a new read is not taken in yet
+	 * ({@link #compactionWaits}).
+	 */
+	#sessionCompactionWaits(): CompactionWaitRecords {
+		const sessionManager = this.#host.sessionManager;
+		const sessionId = sessionManager.getSessionId();
+		const loadRevision = sessionManager.loadRevision;
+		const cached = this.#recordedCompactionWaits;
+		if (cached?.sessionId === sessionId && cached.loadRevision === loadRevision) return cached;
+		let newest: CompactionWait | undefined;
+		for (const entry of sessionManager.getEntries()) {
+			if (entry.type !== "custom") continue;
+			const data = entry.data;
+			if (entry.customType === COMPACTION_WAIT_ENTRY_TYPE) {
+				if (isRecordedCompactionWait(data)) {
+					newest = {
+						modelKey: data.modelKey,
+						entry: cacheEntryFigures(data.entry),
+						compactionId: data.compactionId,
+						leafId: data.leafId,
+					};
+				}
+			} else if (entry.customType === COMPACTION_WAIT_END_ENTRY_TYPE && isRecordedCompactionWaitEnd(data)) {
+				newest = undefined;
+			}
+		}
+		const read: CompactionWaitRecords = {
+			sessionId,
+			loadRevision,
+			newest,
+			taken: false,
+			copied: cached?.taken === true && cached.loadRevision === loadRevision,
+		};
+		this.#recordedCompactionWaits = read;
+		return read;
+	}
+
+	/** Records that the wait the session's newest record holds stopped, if it holds one. */
+	#endRecordedCompactionWait(records: CompactionWaitRecords): void {
+		if (!records.newest) return;
+		this.#host.sessionManager.appendCustomEntry(COMPACTION_WAIT_END_ENTRY_TYPE, { version: 1 });
+		records.newest = undefined;
+	}
+
+	/** `P` for a cut whose site did not measure it: the live context, floored by the stored estimate. */
+	#cutPromptTokens(): number {
+		return compactionContextTokens(
+			this.#host.getContextUsage({ contextWindow: this.#model?.contextWindow ?? 0 })?.tokens ?? 0,
+			this.#estimateStoredContextTokens(),
+		);
+	}
+
+	/**
+	 * Tokens `entries` sends from `index` on. Encrypted reasoning counts at its full local size, so
+	 * the figure errs high, and `P` less it, a cut's cached prefix `p`, errs low: a smaller `p`
+	 * only makes the cut's rewrite look dearer.
+	 */
+	#tokensFrom(entries: readonly SessionEntry[], index: number): number {
+		let tokens = 0;
+		for (let i = index; i < entries.length; i++) {
+			const message = getMessageFromEntry(entries[i]);
+			if (message) tokens += this.#tokenizer.countMessage(message);
+		}
+		return tokens;
+	}
+
+	/**
+	 * The cut-rule gate of a prune pass over `entries`: it keeps what precedes its first blanked result. A pass it
+	 * withholds is offered again once the prompt cache entry lapses ({@link #pruneWithheldIfDue}).
+	 */
+	#pruneGate(site: string, entries: readonly SessionEntry[]): (cut: PruneCut) => boolean {
+		return cut => {
+			const promptTokens = this.#cutPromptTokens();
+			const admitted = this.admitsContextCut({
+				site,
+				prefixTokens: Math.max(0, promptTokens - this.#tokensFrom(entries, cut.firstIndex)),
+				removedTokens: cut.tokensSaved,
+				forced: false,
+				promptTokens,
+			});
+			if (!admitted && this.#pruneOffer) this.#pruneOffer.withheld = true;
+			return admitted;
+		};
+	}
+
+	/** Records an offer of the tool-result prune passes on the current branch; the gate marks a pass it withholds. */
+	#recordPruneOffer(): void {
+		const sessionManager = this.#host.sessionManager;
+		this.#pruneOffer = {
+			sessionId: sessionManager.getSessionId(),
+			leafId: sessionManager.getLeafId(),
+			withheld: false,
+		};
+	}
+
+	/**
+	 * Whether the tool-result prune passes count as withheld: the cut rule withheld one at their latest offer, or this
+	 * process made no offer on the history the current branch holds (after a restart, on another session, or after a
+	 * move to another branch), where a pass withheld before is not known to have run since.
+	 */
+	#prunePassesWithheld(): boolean {
+		const offer = this.#pruneOffer;
+		if (!offer || offer.withheld) return true;
+		const sessionManager = this.#host.sessionManager;
+		if (offer.sessionId !== sessionManager.getSessionId()) return true;
+		return offer.leafId !== null && !this.#branchCarries(offer.leafId);
+	}
+
+	/**
+	 * Offers the tool-result prune passes again when they count as withheld ({@link #prunePassesWithheld}) and the
+	 * prompt cache entry the next request would read has lapsed: that request writes the whole prompt again anyway,
+	 * so the rule admits the prune ("lapsed"). The passes are offered after each turn, when its reply has just
+	 * refreshed the entry; this runs before a request is sent (the pre-prompt maintenance and a tool-loop boundary),
+	 * so a prune withheld while the entry was live runs at the first request after it lapsed, in this process or after
+	 * a restart. `prepare` runs only when the passes are due, and a `false` from it leaves them due. Returns whether a
+	 * pass pruned.
+	 */
+	async #pruneWithheldIfDue(prepare?: () => Promise<boolean>): Promise<boolean> {
+		if (!this.#prunePassesWithheld() || this.#usesExperimentalContextManagement() || !this.promptCacheLapsed()) {
+			return false;
+		}
+		if (prepare && !(await prepare())) return false;
+		this.#recordPruneOffer();
+		const superseded = this.#pruneStaleToolResults();
+		const settings = this.#compactionSettings;
+		const aged = settings.enabled && hasConfiguredCompactionMethod(settings) ? this.#pruneToolOutputs() : undefined;
+		return superseded !== undefined || aged !== undefined;
+	}
+
 	#pruneToolOutputs(): { prunedCount: number; tokensSaved: number } | undefined {
 		const branchEntries = this.#host.sessionManager.getBranchView();
 		const keepBoundaryId = getLatestCompactionEntry(branchEntries)?.firstKeptEntryId;
@@ -792,6 +1370,7 @@ export class SessionMaintenance {
 				cacheWarmSuffixTokens: model?.thinking?.prefixBinding === true ? 0 : PRUNE_CACHE_WARM_SUFFIX_TOKENS,
 				cacheLookbackPositions: model ? resolvePromptCacheLookback(model) : undefined,
 				convertToLlm,
+				admit: this.#pruneGate("prune-tool-outputs", branchEntries),
 			}),
 		);
 		if (result.prunedCount === 0) {
@@ -836,6 +1415,7 @@ export class SessionMaintenance {
 				suffixTokenLimit: model?.thinking?.prefixBinding === true ? 0 : undefined,
 				cacheLookbackPositions: model ? resolvePromptCacheLookback(model) : undefined,
 				convertToLlm,
+				admit: this.#pruneGate("prune-stale-tool-results", branchEntries),
 			}),
 		);
 		if (result.prunedCount === 0) {
@@ -1047,18 +1627,10 @@ export class SessionMaintenance {
 			if (opts.signal?.aborted || opts.isCurrent?.() === false) throw new CompactionCancelledError();
 		};
 		assertCurrent();
-		const branchEntries = this.#host.sessionManager.getBranch();
-		const latestCompaction = getLatestCompactionEntry(branchEntries);
-		const config = this.#withPlanProtection({
-			...(opts.config ?? AGGRESSIVE_SHAKE_CONFIG),
-			// Skip entries summarized away by the latest compaction — shaking them
-			// only churns persisted history with no prompt/cache effect. The cut is
-			// unconditional on the wire (see `buildSessionContext`), so a compaction
-			// the active model cannot replay still hides its prefix from the prompt.
-			keepBoundaryId: latestCompaction?.firstKeptEntryId,
-		});
-		let regions = collectShakeRegions(branchEntries, this.#tokenizer, config);
-		if (opts.toolResultsOnly) regions = regions.filter(region => region.kind === "toolResult");
+		const { branchEntries, latestCompaction, config, regions } = this.#elideRegions(
+			opts.config,
+			opts.toolResultsOnly,
+		);
 		if (regions.length === 0) {
 			return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
 		}
@@ -1172,6 +1744,12 @@ export class SessionMaintenance {
 		if (!settings.enabled || !resolveCompactionMethodOrder(settings.methodOrder).includes("shake")) return false;
 		const isCurrent = () => !this.#host.isDisposed() && this.#host.promptGeneration() === generation;
 		if (!isCurrent()) return false;
+		// The provider timed out reading the request body: it cannot be served as it is.
+		const cut = this.#shakeCut("request-body-timeout-shake", DEFAULT_SHAKE_CONFIG, {
+			forced: true,
+			toolResultsOnly: true,
+		});
+		if (cut) this.#recordForcedCut(cut);
 		try {
 			const result = await this.shake("elide", {
 				config: DEFAULT_SHAKE_CONFIG,
@@ -1186,6 +1764,52 @@ export class SessionMaintenance {
 			}
 			return false;
 		}
+	}
+
+	/** What `shake("elide")` with `configOverride` would elide on the current branch, oldest region first. */
+	#elideRegions(configOverride: ShakeConfig | undefined, toolResultsOnly: boolean | undefined) {
+		const branchEntries = this.#host.sessionManager.getBranch();
+		const latestCompaction = getLatestCompactionEntry(branchEntries);
+		const config = this.#withPlanProtection({
+			...(configOverride ?? AGGRESSIVE_SHAKE_CONFIG),
+			// Skip entries summarized away by the latest compaction — shaking them
+			// only churns persisted history with no prompt/cache effect. The cut is
+			// unconditional on the wire (see `buildSessionContext`), so a compaction
+			// the active model cannot replay still hides its prefix from the prompt.
+			keepBoundaryId: latestCompaction?.firstKeptEntryId,
+		});
+		let regions = collectShakeRegions(branchEntries, this.#tokenizer, config);
+		if (toolResultsOnly) regions = regions.filter(region => region.kind === "toolResult");
+		return { branchEntries, latestCompaction, config, regions };
+	}
+
+	/**
+	 * The cut an automatic `shake("elide")` with `config` would make: it keeps what precedes its
+	 * oldest region and saves each region less its placeholder. `undefined` when nothing is
+	 * eligible: that shake rewrites nothing, and its caller's no-progress handling runs as before.
+	 */
+	#shakeCut(
+		site: string,
+		config: ShakeConfig,
+		options: { forced: boolean; promptTokens?: number; toolResultsOnly?: boolean },
+	): ContextCut | undefined {
+		const { branchEntries, regions } = this.#elideRegions(config, options.toolResultsOnly);
+		if (regions.length === 0) return undefined;
+		const promptTokens = options.promptTokens ?? this.#cutPromptTokens();
+		let removedTokens = 0;
+		// Placeholders as written without a recovery artifact; the artifact link adds a few tokens to each.
+		for (const [index, region] of regions.entries()) {
+			const placeholder = this.#tokenizer.countTokens(this.#shakeElidePlaceholder(region, index, undefined));
+			removedTokens += Math.max(0, region.tokens - placeholder);
+		}
+		const firstIndex = branchEntries.indexOf(regions[0].entry);
+		return {
+			site,
+			prefixTokens: Math.max(0, promptTokens - this.#tokensFrom(branchEntries, firstIndex)),
+			removedTokens,
+			forced: options.forced,
+			promptTokens,
+		};
 	}
 
 	#shakeElidePlaceholder(region: ShakeRegion, index: number, artifactId: string | undefined): string {
@@ -2259,7 +2883,7 @@ export class SessionMaintenance {
 		try {
 			const result = await this.#host.generateHandoffDocument(customInstructions, options);
 			if (!result) return undefined;
-			const { summary, details } = handoffSummaryFromDocument(result.document, preparation);
+			const { summary, details } = summaryWithFileOperations(result.document, preparation);
 			await this.#commitCompactionEntry({
 				summary,
 				shortSummary: undefined,
@@ -2305,6 +2929,9 @@ export class SessionMaintenance {
 		const thresholdTokens = resolveThresholdTokens(contextWindow, settings);
 		if (contextTokens >= thresholdTokens) return; // real maintenance owns it now
 		if (thresholdTokens - contextTokens > resolveSpeculationLeadTokens(thresholdTokens)) return;
+		// While the rule waits on the same entry, a new summary would cost a model call for a cut that cannot run: the
+		// speculation that is armed stays as it is and none starts.
+		if (this.#compactionWaits()) return;
 		const current = this.#speculation;
 		if (current) {
 			if (!current.armed) return; // one run at a time
@@ -2386,8 +3013,24 @@ export class SessionMaintenance {
 	 * for local-first method orders (shake/snapcompact are instant), when
 	 * async compaction is disabled, or when a `session_before_compact`
 	 * extension must keep exact blocking semantics.
+	 *
+	 * A process that holds the session under another read than the one it
+	 * last asked the cut rule in ({@link #compactionAnswerRead}: it read the
+	 * session's entries in whole, a resume, a `/resume` switch, a fork of a
+	 * session file, or copied it, a `/fork`, a branch into a new file, a move
+	 * off a contested file) takes or carries the wait while it still applies
+	 * ({@link #compactionWaits}); with none, it asks the cut rule before its
+	 * first summary since, with the figures the real pass weighs
+	 * (`pendingContextTokens`: the pending prompt counted in `contextTokens`),
+	 * and keeps the answer: the process that wrote the session may have been
+	 * waiting on this compaction on the entry the next request reads, starting
+	 * no summary, and a wait starts none here either.
 	 */
-	deferThresholdCompactionToSpeculation(contextTokens: number, contextWindow: number): boolean {
+	deferThresholdCompactionToSpeculation(
+		contextTokens: number,
+		contextWindow: number,
+		pendingContextTokens?: number,
+	): boolean {
 		if (contextWindow <= 0 || this.#host.isDisposed()) return false;
 		const settings = this.#compactionSettings;
 		if (this.#usesExperimentalContextManagement()) return false;
@@ -2408,6 +3051,9 @@ export class SessionMaintenance {
 		);
 		if (contextTokens >= graceCapTokens) return false;
 		const run = this.#speculation;
+		// While the rule waits on the same entry, no new or replacement summary starts: an armed one is kept as it is
+		// and the real pass asks the rule again; one still summarizing keeps deferring.
+		if (this.#compactionWaits()) return run !== undefined && !run.armed;
 		if (run) {
 			if (run.armed) {
 				if (!this.#armedSpeculationValid(run.armed, contextTokens)) {
@@ -2417,6 +3063,22 @@ export class SessionMaintenance {
 				return false; // ready — the real pass splices it in now
 			}
 			return true; // still summarizing in the background
+		}
+		const answered = this.#compactionAnswerRead;
+		const records = this.#sessionCompactionWaits();
+		// A session this process began has nothing to ask about until it first answers.
+		if (answered === undefined ? records.loadRevision !== 0 : answered !== records) {
+			// The summary cuts nothing, so the admitted-cut listeners hear nothing; the real pass asks again before it
+			// commits one.
+			const cut = this.#compactionCutBeforeStart(
+				`compaction-${method}`,
+				"threshold",
+				resolveMethodSettings(settings, method),
+				{ triggerContextTokens: contextTokens, pendingContextTokens },
+			);
+			const admitted = !cut || this.#cutRuleAdmits(cut);
+			this.#recordCompactionAnswer(admitted);
+			if (!admitted) return false;
 		}
 		this.#startSpeculationRun(contextTokens, method);
 		return true;
@@ -2448,7 +3110,7 @@ export class SessionMaintenance {
 				signal,
 			});
 			if (!generated) return clear();
-			const { summary, details } = handoffSummaryFromDocument(generated.document, preparation);
+			const { summary, details } = summaryWithFileOperations(generated.document, preparation);
 			armed = {
 				result: {
 					summary,
@@ -2818,6 +3480,8 @@ export class SessionMaintenance {
 	async runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
 		const model = this.#model;
 		if (!model) return;
+		// A prune the cut rule withheld while the cache entry was live runs before the first request after it lapsed.
+		await this.#pruneWithheldIfDue();
 		const contextWindow = model.contextWindow ?? 0;
 		if (contextWindow <= 0) return;
 		const compactionSettings = this.#compactionSettings;
@@ -2845,10 +3509,11 @@ export class SessionMaintenance {
 				return;
 			}
 		}
+		const pendingContextTokens = this.#tokenizer.countMessages(messages, { excludeEncryptedReasoning: true });
 		// Grace band: a live (or just-started) background speculation absorbs the
 		// blocking summarization; the user's prompt goes out immediately and the
 		// armed result is spliced in at the next boundary.
-		if (this.deferThresholdCompactionToSpeculation(contextTokens, contextWindow)) {
+		if (this.deferThresholdCompactionToSpeculation(contextTokens, contextWindow, pendingContextTokens)) {
 			logger.debug("Pre-prompt threshold deferred to speculative compaction", {
 				contextTokens,
 				contextWindow,
@@ -2877,10 +3542,21 @@ export class SessionMaintenance {
 		await this.runAutoCompaction("threshold", false, {
 			autoContinue: false,
 			triggerContextTokens: contextTokens,
-			pendingContextTokens: this.#tokenizer.countMessages(messages, { excludeEncryptedReasoning: true }),
+			pendingContextTokens,
 			preparedContextTokens: this.#estimateStoredContextTokens(),
 			phase: "pre_turn",
 		});
+	}
+
+	/**
+	 * Points the agent loop's live `activeMessages` at the agent's messages when a cut replaced them, so the loop's
+	 * next request sends the cut context.
+	 */
+	#adoptAgentMessages(activeMessages: AgentMessage[]): void {
+		const messages = this.#host.agent.state.messages;
+		if (messages === activeMessages) return;
+		activeMessages.splice(0, activeMessages.length, ...messages);
+		invalidateConvertToLlmArrayCache(activeMessages);
 	}
 
 	/**
@@ -2890,7 +3566,8 @@ export class SessionMaintenance {
 	 * are already paired in `activeMessages`, the live array the agent loop reads
 	 * before its next model call. Before compacting, the just-finished turn is
 	 * synchronously persisted if async message hooks have not reached the normal
-	 * append path yet.
+	 * append path yet. A prune the cut rule withheld runs here too, once the
+	 * prompt cache entry lapsed meanwhile (a tool that ran past its lifetime).
 	 */
 	async maintainContextMidRun(
 		activeMessages: AgentMessage[],
@@ -2905,6 +3582,15 @@ export class SessionMaintenance {
 			!context?.willContinue
 		)
 			return;
+
+		// The withheld prune rewrites the session, so the finished turn must be in it first.
+		const pruned = await this.#pruneWithheldIfDue(
+			async () =>
+				(await this.#host.persistTurnMessagesForMidRunCompaction(context)) &&
+				!signal?.aborted &&
+				!this.#host.isDisposed(),
+		);
+		if (pruned) this.#adoptAgentMessages(activeMessages);
 
 		const model = this.#model;
 		const contextWindow = model?.contextWindow ?? 0;
@@ -2942,11 +3628,7 @@ export class SessionMaintenance {
 				this.#midTurnDeadEndPendingPrePrompt = null;
 			}
 			if (signal?.aborted) return;
-			const compactedMessages = this.#host.agent.state.messages;
-			if (compactedMessages !== activeMessages) {
-				activeMessages.splice(0, activeMessages.length, ...compactedMessages);
-				invalidateConvertToLlmArrayCache(activeMessages);
-			}
+			this.#adoptAgentMessages(activeMessages);
 			return;
 		}
 
@@ -3032,11 +3714,7 @@ export class SessionMaintenance {
 		}
 
 		if (signal?.aborted) return;
-		const compactedMessages = this.#host.agent.state.messages;
-		if (compactedMessages !== activeMessages) {
-			activeMessages.splice(0, activeMessages.length, ...compactedMessages);
-			invalidateConvertToLlmArrayCache(activeMessages);
-		}
+		this.#adoptAgentMessages(activeMessages);
 		logger.debug("Mid-run compaction ran between provider calls", {
 			contextTokens,
 			contextWindow,
@@ -3519,7 +4197,9 @@ export class SessionMaintenance {
 
 		// Stale-result pass runs every turn, before any threshold gating: it is
 		// cheap (bails when no candidate) and independent of the compaction
-		// setting.
+		// setting. The passes here are this turn's offer on this branch: a pass
+		// the cut rule withholds marks it withheld.
+		this.#recordPruneOffer();
 		const supersedeResult = this.#usesExperimentalContextManagement() ? undefined : this.#pruneStaleToolResults();
 
 		const compactionSettings = this.#compactionSettings;
@@ -4566,7 +5246,11 @@ export class SessionMaintenance {
 		let elided = 0;
 		let elidedTokens = 0;
 		let elideSink = "placeholders";
+		// Every rescue tier is forced (cut rule condition 1): the compaction before it could not free
+		// enough context to serve the request. Each tier still asks the rule, which logs its decision.
 		if (!options.skipElide) {
+			const shakeCut = this.#shakeCut("rescue-shake", RESCUE_SHAKE_CONFIG, { forced: true });
+			if (shakeCut) this.#recordForcedCut(shakeCut);
 			try {
 				const result = await this.#host.shake("elide", { config: RESCUE_SHAKE_CONFIG, signal });
 				elided = result.toolResultsDropped + result.blocksDropped;
@@ -4594,6 +5278,10 @@ export class SessionMaintenance {
 		}
 		if (signal.aborted) return false;
 		let imagesDropped = 0;
+		// The pass measures the image tokens itself, so the cut states s = 0. Forced, it is admitted whatever its
+		// figures, which the rule logs; p = 0, the conservative bound, also tells AgentSession's cut listener that it
+		// rewrites every message, so a held settings rebuild runs before the next request, as after a compaction.
+		this.#recordForcedCut({ site: "rescue-drop-images", prefixTokens: 0, removedTokens: 0, forced: true });
 		try {
 			imagesDropped = (await this.#host.dropImages()).removed;
 			if (imagesDropped > 0) this.#host.rebaseAfterCompaction();
@@ -5168,6 +5856,185 @@ export class SessionMaintenance {
 	}
 
 	/**
+	 * The cut an automatic compaction makes, in the rule's letters, when it leaves `afterTokens` of context (the
+	 * tools and system prompt included, a pending prompt not). It keeps the tools and system prompt cached (`p`,
+	 * their local estimate) and writes every message after them again, and it removes what the context holds beyond
+	 * what it leaves. A pending prompt, counted in the trigger figure `P`, is sent either way, so it is not removed.
+	 */
+	#compactionCut(
+		site: string,
+		reason: "overflow" | "threshold" | "idle" | "incomplete",
+		afterTokens: number,
+		trigger: { triggerContextTokens?: number; pendingContextTokens?: number },
+	): ContextCut {
+		const promptTokens = trigger.triggerContextTokens ?? this.#cutPromptTokens();
+		return {
+			site,
+			prefixTokens: computeNonMessageTokens(
+				this.#host.nonMessageTokenSource(),
+				this.#tokenizer,
+				this.#host.settings.revision,
+			),
+			removedTokens: Math.max(0, promptTokens - (trigger.pendingContextTokens ?? 0) - afterTokens),
+			forced: forcedByReason(reason),
+			promptTokens,
+		};
+	}
+
+	/**
+	 * The cut-rule gate of an automatic compaction with `settings`, asked before it starts
+	 * ({@link #compactionCutBeforeStart}). Snapcompact is asked by {@link #snapcompactMayBeAdmitted} instead, and again
+	 * by the archive it renders before it commits. With nothing to summarize the method's own no-op handling runs and
+	 * nothing is cut, so the rule is not asked.
+	 */
+	#admitsCompaction(
+		site: string,
+		reason: "overflow" | "threshold" | "idle" | "incomplete",
+		settings: EngineCompactionSettings,
+		trigger: { triggerContextTokens?: number; pendingContextTokens?: number },
+	): boolean {
+		const cut = this.#compactionCutBeforeStart(site, reason, settings, trigger);
+		return !cut || this.admitsContextCut(cut);
+	}
+
+	/**
+	 * The cut an automatic model-summary compaction with `settings` makes, weighed before it starts. Its summary does
+	 * not exist yet, so the context it leaves is counted with the summary at the summarizer's cap (one more for a split
+	 * turn's prefix) plus the file lists appended to it, beside the kept tail and the tools and system prompt: the
+	 * write is never underestimated. Undefined without a model or with nothing to summarize.
+	 */
+	#compactionCutBeforeStart(
+		site: string,
+		reason: "overflow" | "threshold" | "idle" | "incomplete",
+		settings: EngineCompactionSettings,
+		trigger: { triggerContextTokens?: number; pendingContextTokens?: number },
+	): ContextCut | undefined {
+		const model = this.#model;
+		if (!model) return undefined;
+		const preparation = prepareCompaction(this.#host.sessionManager.getBranch(), settings, model, this.#tokenizer);
+		if (!preparation) return undefined;
+		const afterTokens =
+			computeNonMessageTokens(this.#host.nonMessageTokenSource(), this.#tokenizer, this.#host.settings.revision) +
+			this.#tokenizer.countMessages(preparation.recentMessages) +
+			this.#tokenizer.countTokens(summaryWithFileOperations("", preparation).summary) +
+			MAX_SUMMARY_TOKENS * (preparation.isSplitTurn ? 2 : 1);
+		return this.#compactionCut(site, reason, afterTokens, trigger);
+	}
+
+	/**
+	 * The cut-rule gate of an automatic snapcompact compaction with `settings`, asked before it starts. Its archive does
+	 * not exist yet, so the rule weighs the most favourable cut it could make: the archive at no tokens, leaving the
+	 * tools and system prompt and the kept tail, counted as {@link #projectCompactedContextTokens} counts it, or the
+	 * tools and system prompt alone when a `session_before_compact` handler, which may keep a shorter tail, is
+	 * registered. A larger cut never saves fewer reads nor writes more again, and whether a cut is forced or its cache
+	 * entry lapsed does not depend on its size, so a pass that waits on this cut waits on any archive it would render:
+	 * it starts nothing. A pass admitted here is weighed again by the archive it renders before it commits, and only
+	 * that cut reaches the {@link onContextCutAdmitted} listeners. With nothing to summarize the rule is not asked.
+	 *
+	 * Once the rule refused a rendered archive, the rule weighs what that archive would leave instead, while the
+	 * context it was rendered for stands ({@link #snapcompactContextKey}, on a branch that carries the leaf it was
+	 * weighed on): the pass starts, runs its hooks and renders again only when those figures are admitted (the context
+	 * grew, the entry lapsed or cannot be read, the reason forces the cut), or once that context is gone (a branch
+	 * without that leaf, another session's included, a compaction, another model or method settings). A copy of the
+	 * session (a `/fork`, a branch into a new file, a move off a contested file) holds the same history, so the refusal
+	 * stands there too. The refusal is kept in the session as well ({@link SNAPCOMPACT_REFUSAL_ENTRY_TYPE}), so a
+	 * process that resumes it weighs the same figures on the same branches, one continued from the refused leaf itself,
+	 * which does not carry the record, included.
+	 */
+	#snapcompactMayBeAdmitted(
+		reason: "overflow" | "threshold" | "idle" | "incomplete",
+		settings: EngineCompactionSettings,
+		trigger: { triggerContextTokens?: number; pendingContextTokens?: number },
+	): boolean {
+		const model = this.#model;
+		if (!model) return true;
+		const branch = this.#host.sessionManager.getBranch();
+		const preparation = prepareCompaction(branch, settings, model, this.#tokenizer);
+		if (!preparation) return true;
+		// Computed only once there is a refusal to weigh; most checks have none.
+		let contextKey: string | undefined;
+		const applies = (candidate: RefusedSnapcompact | undefined): candidate is RefusedSnapcompact =>
+			candidate !== undefined &&
+			candidate.contextKey === (contextKey ??= this.#snapcompactContextKey(branch, settings)) &&
+			this.#branchCarries(candidate.leafId);
+		const recorded = this.#sessionSnapcompactRefusals();
+		let refused = recorded.remembered;
+		if (!applies(refused)) {
+			// A refusal this process does not remember: one an earlier process recorded (a resumed session), on this
+			// branch or on another that carries the leaf it was weighed on.
+			refused = recorded.refusals.findLast(applies);
+			recorded.remembered = refused;
+		}
+		if (refused) {
+			return this.#cutRuleAdmits(
+				this.#compactionCut("compaction-snapcompact-refused", reason, refused.afterTokens, trigger),
+			);
+		}
+		const keptTokens = this.#host.extensionRunner?.hasHandlers("session_before_compact")
+			? 0
+			: this.#countProjectedMessages(preparation.recentMessages);
+		const afterTokens =
+			computeNonMessageTokens(this.#host.nonMessageTokenSource(), this.#tokenizer, this.#host.settings.revision) +
+			keptTokens;
+		return this.#cutRuleAdmits(this.#compactionCut("compaction-snapcompact-bound", reason, afterTokens, trigger));
+	}
+
+	/**
+	 * The refusals the session records on every branch, oldest first, and the refusal this process remembers since
+	 * they were read ({@link #recordedSnapcompactRefusals}). Each record sits after the refused leaf on the branch
+	 * current when it was written, while the process that wrote it weighs it on every branch that carries that leaf, so
+	 * a process that resumes the session reads them all. A read of the entries in whole remembers no refusal: the
+	 * records hold every process's refusals, and the newest that applies stands over this process's own (another
+	 * process may have refused a pass on a branch that carries this one's leaf since). A copy of the session this
+	 * process made (another session id at the same revision: a `/fork`, a branch into a new file, a move off a contested
+	 * file) holds this process's history, so it keeps the refusal the process remembers, which a branch copied up to
+	 * the refused leaf holds no record of until {@link followTranscriptCopy} writes one there.
+	 */
+	#sessionSnapcompactRefusals(): SnapcompactRefusals {
+		const sessionManager = this.#host.sessionManager;
+		const sessionId = sessionManager.getSessionId();
+		const loadRevision = sessionManager.loadRevision;
+		const cached = this.#recordedSnapcompactRefusals;
+		if (cached?.sessionId === sessionId && cached.loadRevision === loadRevision) return cached;
+		const refusals: RefusedSnapcompact[] = [];
+		for (const entry of sessionManager.getEntries()) {
+			if (entry.type !== "custom" || entry.customType !== SNAPCOMPACT_REFUSAL_ENTRY_TYPE) continue;
+			const data = entry.data;
+			if (isRecordedSnapcompactRefusal(data)) {
+				refusals.push({ afterTokens: data.afterTokens, leafId: data.leafId, contextKey: data.contextKey });
+			}
+		}
+		const read: SnapcompactRefusals = {
+			sessionId,
+			loadRevision,
+			refusals,
+			remembered: cached?.loadRevision === loadRevision ? cached.remembered : undefined,
+		};
+		this.#recordedSnapcompactRefusals = read;
+		return read;
+	}
+
+	/** Forgets the refusal this process remembers ({@link #recordedSnapcompactRefusals}). */
+	#forgetSnapcompactRefusal(): void {
+		const recorded = this.#recordedSnapcompactRefusals;
+		if (recorded) recorded.remembered = undefined;
+	}
+
+	/**
+	 * What a snapcompact archive is rendered for besides the history it summarizes: the newest compaction on `branch`,
+	 * the reading model, the method `settings` and the archive shape setting.
+	 */
+	#snapcompactContextKey(branch: readonly SessionEntry[], settings: EngineCompactionSettings): string {
+		const model = this.#model;
+		return JSON.stringify([
+			getLatestCompactionEntry(branch)?.id,
+			model && `${model.provider}/${model.id}`,
+			settings,
+			cfgSnapcompactShape.get(this.#host.settings),
+		]);
+	}
+
+	/**
 	 * Internal: Run auto-compaction with events.
 	 *
 	 * Every method, handoff included, runs to completion before this resolves,
@@ -5223,6 +6090,13 @@ export class SessionMaintenance {
 			if (deadEnd) return deadEnd;
 		}
 		if (this.#usesExperimentalContextManagement()) {
+			// A rollover the model asked for (`new_context`) is its choice, not an automatic cut.
+			if (
+				!explicitNewContextRequest &&
+				!this.#admitsCompaction("context-rollover", reason, compactionSettings, options)
+			) {
+				return COMPACTION_CHECK_NONE;
+			}
 			return await this.#runExperimentalContextRollover(reason, willRetry, options);
 		}
 		// The explicit request is valid only on the notes-backed rollover path.
@@ -5289,14 +6163,30 @@ export class SessionMaintenance {
 				: COMPACTION_CHECK_NONE;
 		}
 
+		// A compaction that waits leaves any background speculation armed for a later pass. Shake
+		// weighs its own, smaller cut ({@link #runAutoShake}); snapcompact weighs the most favourable
+		// cut it could make here, and the archive it renders before it commits it.
+		if (method !== "shake") {
+			const methodSettings = resolveMethodSettings(compactionSettings, method);
+			const admitted =
+				method === "snapcompact"
+					? this.#snapcompactMayBeAdmitted(reason, methodSettings, options)
+					: this.#admitsCompaction(`compaction-${method}`, reason, methodSettings, options);
+			if (method !== "snapcompact") this.#recordCompactionAnswer(admitted);
+			if (!admitted) return COMPACTION_CHECK_NONE;
+		}
+
 		// A speculative pass may have already produced this compaction's summary
 		// in the background. Claiming consumes the slot either way: an in-flight
 		// run is aborted (this real pass supersedes it) and an armed result is
 		// returned only when still valid for the current branch/model/settings.
 		// Snapcompact is local and instant, so an armed LLM summary (possible
-		// only when settings/model changed since arming) never overrides it.
-		const claimedSpec = this.#claimArmedSpeculation(options.triggerContextTokens, options.pendingContextTokens);
-		const armedSpec = method === "snapcompact" ? undefined : claimedSpec;
+		// only when settings/model changed since arming) never overrides it; it
+		// claims the slot once the cut rule admits what it commits.
+		const armedSpec =
+			method === "snapcompact"
+				? undefined
+				: this.#claimArmedSpeculation(options.triggerContextTokens, options.pendingContextTokens);
 
 		const effectiveSettings = resolveMethodSettings(compactionSettings, method);
 		const fallbackFromShake = options.fallbackFromShake === true;
@@ -5429,6 +6319,9 @@ export class SessionMaintenance {
 
 			let pathEntriesForCompaction = pathEntries;
 			let preparation = prepareCompaction(pathEntriesForCompaction, effectiveSettings, this.#model, this.#tokenizer);
+			// Snapcompact asks the cut rule before it commits (below). A pass with nothing to summarize until its
+			// rescue rewrote history is not asked, as {@link #admitsCompaction} asks no pass with nothing to summarize.
+			const weighsSnapcompact = method === "snapcompact" && preparation !== undefined;
 			if (!preparation) {
 				// prepareCompaction found nothing to summarize because the kept region
 				// is a single oversized recent turn — findCutPoint never cuts inside a
@@ -5867,7 +6760,7 @@ export class SessionMaintenance {
 				preserveData = compactionPrep.preserveData;
 				providerReplayThroughEntryId = compactionPrep.providerReplayThroughEntryId;
 			} else if (handoffDocument) {
-				const handoffSummary = handoffSummaryFromDocument(handoffDocument.document, preparation);
+				const handoffSummary = summaryWithFileOperations(handoffDocument.document, preparation);
 				summary = handoffSummary.summary;
 				shortSummary = undefined;
 				firstKeptEntryId = preparation.firstKeptEntryId;
@@ -6169,6 +7062,48 @@ export class SessionMaintenance {
 					});
 				}
 				return reason === "threshold" ? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION : COMPACTION_CHECK_NONE;
+			}
+			// Snapcompact is weighed by what it commits, known only now: its rendered archive (or a hook's compaction)
+			// and the kept tail. One that waits starts no other method and leaves any speculation armed, and what it
+			// would leave is remembered, so later points weigh it before they start and render again
+			// ({@link #snapcompactMayBeAdmitted}); one the rule admits claims the speculation slot, which this pass
+			// supersedes.
+			if (method === "snapcompact") {
+				if (
+					weighsSnapcompact &&
+					!this.admitsContextCut(this.#compactionCut(`compaction-${method}`, reason, projectedAfter, options))
+				) {
+					// Labels carry no history, and a copy of the branch re-creates them under new ids.
+					const leafId = newestCopiedEntryId(pathEntriesForCompaction);
+					// A refusal with no leaf to weigh a later branch against is not kept.
+					if (leafId === undefined) {
+						this.#forgetSnapcompactRefusal();
+					} else {
+						const refused: RefusedSnapcompact = {
+							afterTokens: projectedAfter,
+							leafId,
+							contextKey: this.#snapcompactContextKey(pathEntriesForCompaction, effectiveSettings),
+						};
+						const recorded = this.#sessionSnapcompactRefusals();
+						recorded.remembered = refused;
+						// Kept in the session, so a process that resumes it weighs these figures before it starts.
+						this.#recordSnapcompactRefusal(recorded, refused);
+					}
+					await this.#emitLifecycleEvent(
+						{
+							type: "auto_compaction_end",
+							action,
+							result: undefined,
+							aborted: false,
+							willRetry: false,
+							skipped: true,
+						},
+						options.detachPostCommit === true,
+					);
+					return COMPACTION_CHECK_NONE;
+				}
+				this.#forgetSnapcompactRefusal();
+				this.#claimArmedSpeculation(options.triggerContextTokens, options.pendingContextTokens);
 			}
 			if (projectedAfter < candidateTokensBefore) {
 				tokensBefore = candidateTokensBefore;
@@ -6486,6 +7421,12 @@ export class SessionMaintenance {
 		detachPostCommit = false,
 	): Promise<CompactionCheckResult | "fallback"> {
 		const action = "shake";
+		// A shake that waits starts nothing: no lifecycle events, and no later method takes its place.
+		const cut = this.#shakeCut("auto-shake", DEFAULT_SHAKE_CONFIG, {
+			forced: forcedByReason(reason),
+			promptTokens: triggerContextTokens,
+		});
+		if (cut && !this.admitsContextCut(cut)) return COMPACTION_CHECK_NONE;
 		this.#autoCompactionAbortController?.abort();
 		const controller = new AbortController();
 		this.#autoCompactionAbortController = controller;

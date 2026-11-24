@@ -123,6 +123,21 @@ interface AccountScope {
 }
 
 /**
+ * The upstream and host a request without an OAuth identity takes: the discovered upstream (undefined without one), and
+ * the model's host, else the wire's default.
+ */
+function unidentifiedScope(
+	model: Model<"factory-droid-agent">,
+	registry: FactoryDroidModelPolicy | undefined,
+	wire: FactoryDroidWire,
+): { upstream: string | undefined; baseUrl: string } {
+	return {
+		upstream: defaultUpstream(model, registry),
+		baseUrl: model.baseUrl || factoryDroidWireBaseUrl(wire, undefined),
+	};
+}
+
+/**
  * Bind one attempt to the credential that serves it: host, organization,
  * eligible upstream and native limits all follow that account. Without an
  * OAuth identity the discovered scope applies. Cached live routing may encode
@@ -137,11 +152,12 @@ function scopeToAccount(
 	token: string,
 ): AccountScope {
 	if (!identity) {
+		const { upstream, baseUrl } = unidentifiedScope(model, registry, wire);
 		return {
 			model,
-			upstream: requireUpstream(defaultUpstream(model, registry)),
+			upstream: requireUpstream(upstream),
 			orgId: factoryDroidOrgIdFromToken(token) ?? model.factoryDroidOrgId,
-			baseUrl: model.baseUrl || factoryDroidWireBaseUrl(wire, undefined),
+			baseUrl,
 		};
 	}
 	// Custom gateways keep their URL; Factory's own hosts follow residency.
@@ -232,6 +248,20 @@ function resolveRoute(
 	}
 	routes.set(key, route);
 	return route;
+}
+
+/**
+ * The model a request on `model` goes out as: the shared transport's model for its route ({@link resolveRoute}), with
+ * the API and compat of the wire, as a request without an OAuth identity resolves the route (the discovered upstream
+ * and host; an account whose region narrows the upstream can resolve another), or `model` itself on the native Gemini
+ * client and without an upstream.
+ */
+export function factoryDroidRouteModel(model: Model<"factory-droid-agent">): Model<Api> {
+	const registry = resolveFactoryDroidPolicy(model);
+	const wire = registry?.wire ?? "openai-completions";
+	const { upstream, baseUrl } = unidentifiedScope(model, registry, wire);
+	if (wire === "google-generate" || upstream === undefined) return model;
+	return resolveRoute(model, { model, upstream, orgId: model.factoryDroidOrgId, baseUrl }, wire).inner ?? model;
 }
 
 /** The attempt's effort: undefined when reasoning is off. */
