@@ -579,8 +579,9 @@ pub struct Kernel {
 	/// `(vproc, signal, given)`: a terminating signal a stopped bash vproc of
 	/// shell code got that does not continue it (bash's `kill_pid`
 	/// continues a stopped job only for `TERM` and `HUP`), taken once the
-	/// vproc is continued, as a stopped subshell acts on it then
-	/// (`Shell::deliver`); `given`: its programs have it from the kernel
+	/// vproc is continued, the lowest signal number first, as a stopped
+	/// subshell acts on its pending signals then (`Shell::deliver`);
+	/// `given`: its programs have it from the kernel
 	/// ([`SigTarget::JobGroup`]). Dropped when the vproc ends; not imaged (a
 	/// restored shell's stopped vproc runs on once continued).
 	pub held_ends:          Vec<(Vpid, Signal, bool)>,
@@ -3379,9 +3380,19 @@ impl Shell {
 			}
 			self.job_changed(cx, vpid, stop);
 		}
-		// A vproc continued takes the end it held while stopped.
+		// A vproc continued takes the end it held while stopped, the lowest
+		// signal number first, as the kernel delivers the pending signals
+		// of a stopped bash subshell.
+		let platform = self.k.engine.config().platform;
 		for vpid in continued {
-			while let Some(at) = self.k.held_ends.iter().position(|&(v, ..)| v == vpid) {
+			while let Some((at, _)) = self
+				.k
+				.held_ends
+				.iter()
+				.enumerate()
+				.filter(|&(_, &(v, ..))| v == vpid)
+				.min_by_key(|&(_, &(_, sig, _))| sig.number(platform))
+			{
 				let (_, held, given) = self.k.held_ends.remove(at);
 				let Some(i) = self.procs.iter().position(|p| p.vpid == vpid) else {
 					break;

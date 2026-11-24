@@ -4888,23 +4888,32 @@ fn set_m_jobs_run_in_a_process_group_of_their_own_without_a_terminal() {
 /// control, and a `-PID` of a group that is no job's (the shell's own,
 /// probed with signal 0) stays a plain group signal. The one group signal
 /// also reaches a program the job left in its group while the job runs
-/// only shell code (`left-gone`). A stopped job is continued only by
-/// `TERM` or `HUP` (and ended by `KILL`): another signal, `USR1` here,
-/// waits in its stopped processes, its shell code too, until `kill -CONT
-/// %1` (`stopped`, then `st=138`), by `-PID` and by `%1`. The shell has
-/// no terminal. The goldens are bash 5.3.20's (compared live only with a
-/// bash 5.3 or later, [`real_bash_golden`]); bash 5.2.21 gives the same
-/// output, and prints its `[1]+  Terminated` notices besides. The rows of
-/// a job a `USR1` ends compare no stderr: bash prints its notice of the
-/// job, with its pid. Each row waits for what it needs (a file the job
-/// makes; a stopped job: its lone program's state `T` and `jobs` saying
-/// `Stopped`, as bash continues a job it sends `TERM` only once it has
-/// learned of the stop; the job's process gone or a zombie before `wait`,
-/// as bash learns of a continue only from its wait status), bounded by
-/// `$SECONDS` within the run's own bound, so that a wait that never ends
-/// shows where (`exit 97`). Each row ends its job, writes its output to
-/// files and is bounded ([`bounded_to_files`]); every row runs as a `-c`
-/// string and as a script file ([`Form`]).
+/// only shell code (`left-gone`), and a group with no process left (the
+/// job's one program ended) is no error: the shell code ends of it. A
+/// stopped job is continued only by `TERM` or `HUP` (`st=129`, its program
+/// too; `KILL` ends it): another signal, `USR1` here, waits in its stopped
+/// processes, its shell code too, until `kill -CONT %1` (`stopped`, then
+/// `st=138`), by `-PID` and by `%1`. Of two such signals the stopped
+/// shell code dies of the lower-numbered one, whatever the order they were
+/// sent in (`USR2` then `USR1`: `st=138`). The shell has no terminal. The
+/// goldens are bash 5.3.20's (compared live only with a bash 5.3 or later,
+/// [`real_bash_golden`]); bash 5.2.21 gives the same output, and prints
+/// its `[1]+  Terminated` notices besides. The rows of a job a `USR1`,
+/// `USR2` or `HUP` ends compare no stderr: bash prints its notice of such
+/// a job, with its pid, for `USR1`. Each row waits for what it needs (a
+/// file the job makes; a stopped job: its lone program's state `T` and
+/// `jobs` saying `Stopped`, as bash continues a job it sends `TERM` only
+/// once it has learned of the stop; the job's process gone or a zombie
+/// before `wait`, as bash learns of a continue only from its wait status),
+/// bounded by `$SECONDS` within the run's own bound, so that a wait that
+/// never ends shows where: `exit 97`, and `exit 98` for the waits for a
+/// stop. bash 5.3.20 on gVisor now and then never shows a stop there (1
+/// test run in 3 of a live gVisor cell, in two gates): its run then ends
+/// with `exit 98` before any output, is not compared, and says so on
+/// stderr (`UNCOMPARED:`). obash is compared in every run. Each row ends
+/// its job, writes its output to files and is bounded
+/// ([`bounded_to_files`]); every row runs as a `-c` string and as a script
+/// file ([`Form`]).
 #[cfg(target_os = "linux")]
 #[test]
 fn set_m_kill_of_a_jobs_group_reaches_its_shell_code() {
@@ -4917,16 +4926,17 @@ fn set_m_kill_of_a_jobs_group_reaches_its_shell_code() {
 	let compound = format!("/bin/rm -f \"$F.run\"; set -m; {stage} & {started}");
 	let waited = "echo kill=$?; wait $!; echo st=$?";
 	// Process `pid` stopped (its state `T`).
+	let stop_bound = "[ \"$SECONDS\" -lt 20 ] || exit 98";
 	let stopped = |pid: &str| {
-		format!("until read -r _ _ s _ < /proc/{pid}/stat && [ \"$s\" = T ]; do {bound}; done")
+		format!("until read -r _ _ s _ < /proc/{pid}/stat && [ \"$s\" = T ]; do {stop_bound}; done")
 	};
 	// What `jobs` says of the job.
 	let listed = "jobs >\"$F.j\"; read -r j <\"$F.j\"; [ \"${j#*Stopped}\" != \"$j\" ] && echo \
 	              stopped || echo \"not stopped: $j\"";
 	// Until `jobs` says the job stopped.
 	let job_stopped = format!(
-		"until jobs >\"$F.j\"; read -r j <\"$F.j\"; [ \"${{j#*Stopped}}\" != \"$j\" ]; do {bound}; \
-		 /bin/sleep 0.05; done"
+		"until jobs >\"$F.j\"; read -r j <\"$F.j\"; [ \"${{j#*Stopped}}\" != \"$j\" ]; do \
+		 {stop_bound}; /bin/sleep 0.05; done"
 	);
 	// The job's process gone or a zombie, then waited for.
 	let gone = format!(
@@ -5013,6 +5023,60 @@ fn set_m_kill_of_a_jobs_group_reaches_its_shell_code() {
 			"kill=0\nst=143\nprogram-gone\n",
 			true,
 		),
+		// `HUP` continues a stopped job as `TERM` does, by `%1` and by
+		// `-PID`, and the job dies of it (`st=129`), its program too.
+		(format!("{held}; kill -HUP %1; echo kill=$?; {gone}"), "kill=0\nst=129\n", false),
+		(format!("{held}; kill -HUP -- -$!; echo kill=$?; {gone}"), "kill=0\nst=129\n", false),
+		(
+			format!(
+				"/bin/rm -f \"$F.run\"; set -m; {{ /bin/sh -c 'echo $$ > \"$0.run\"; exec /bin/sleep \
+				 30' \"$F\"; echo after; }} & until [ -s \"$F.run\" ]; do {bound}; done; read p < \
+				 \"$F.run\"; kill -STOP %1; {job_stopped}; kill -HUP %1; echo kill=$?; {gone}; i=0; \
+				 while kill -0 $p 2>/dev/null && [ $i -lt 100 ]; do i=$((i+1)); /bin/sleep 0.05; \
+				 done; kill -0 $p 2>/dev/null && echo program-alive || echo program-gone; kill -KILL \
+				 $p 2>/dev/null; :"
+			),
+			"kill=0\nst=129\nprogram-gone\n",
+			false,
+		),
+		// A job whose group has no process left, as its one program ended
+		// and it runs only shell code: the kill is no error, and the shell
+		// code ends of it.
+		(
+			format!(
+				"set -m; {{ /bin/true; while :; do {bound}; done; }} & /bin/sleep 0.3; kill %1; echo \
+				 kill=$?; wait $!; echo st=$?"
+			),
+			"kill=0\nst=143\n",
+			true,
+		),
+		(
+			format!(
+				"set -m; {{ /bin/true; while :; do {bound}; done; }} & /bin/sleep 0.3; kill -TERM -- \
+				 -$!; echo kill=$?; wait $!; echo st=$?"
+			),
+			"kill=0\nst=143\n",
+			true,
+		),
+		// Two signals a stopped job of shell code holds: once continued it
+		// dies of the lower-numbered one (`USR1`, `st=138`), whatever the
+		// order they were sent in.
+		(
+			format!(
+				"set -m; ( while :; do /bin/sleep 0.2; done ) & /bin/sleep 0.5; kill -STOP %1; \
+				 {job_stopped}; kill -USR2 %1; kill -USR1 %1; /bin/sleep 0.3; kill -CONT %1; {gone}"
+			),
+			"st=138\n",
+			false,
+		),
+		(
+			format!(
+				"set -m; ( while :; do /bin/sleep 0.2; done ) & /bin/sleep 0.5; kill -STOP %1; \
+				 {job_stopped}; kill -USR1 %1; kill -USR2 %1; /bin/sleep 0.3; kill -CONT %1; {gone}"
+			),
+			"st=138\n",
+			false,
+		),
 	];
 	let dir = tempfile::tempdir().expect("a directory for the script and the output");
 	for form in Form::BOTH {
@@ -5026,7 +5090,16 @@ fn set_m_kill_of_a_jobs_group_reaches_its_shell_code() {
 			let obash = OsStr::new(env!("CARGO_BIN_EXE_obash"));
 			assert_eq!(run(obash), want, "{form:?}: {script}");
 			if let Some(real) = real_bash_golden() {
-				assert_eq!(run(real.as_os_str()), want, "bash {form:?}: {script}");
+				let theirs = run(real.as_os_str());
+				// A bash that never showed the stop (`exit 98` before any
+				// output): no reading of it, and said so.
+				if theirs.0.is_empty() && theirs.2 == Some(Exit(98)) {
+					zsh_oracle::uncompared(&format!(
+						"bash {form:?} never showed a stop in 20 s: {script}"
+					));
+				} else {
+					assert_eq!(theirs, want, "bash {form:?}: {script}");
+				}
 			}
 		}
 	}
@@ -5670,27 +5743,31 @@ fn a_job_stopped_before_its_program_starts_shows_its_pid() {
 		));
 	}
 	// The program stops once it started, and runs on only once continued.
-	// Under `set -m` the row waits until `jobs` says the job stopped, 3 s
-	// at most; a bash that has not learned of the stop by then (bash 5.3.20
-	// on gVisor as root, now and then) lists it `Running` (the row's
-	// alternative), and its program still runs only once continued.
+	// It sleeps 0.2 s, so that obash's held stop reaches it first (obash
+	// sends the stop once it has spawned the program: without the sleep the
+	// program said `ran` before it in some runs), and then says `ran` only
+	// once the shell has made `$F.go`, which the shell does after its `kill
+	// -STOP %1` (the program waits 30 s at most): so the stop comes before
+	// the program can end, however late the shell sends it (bash 5.3.20 on
+	// gVisor sent it more than 0.2 s after its fork, 1 run in 320, when the
+	// program only slept 0.2 s). Under `set -m` the row waits until `jobs`
+	// says the job stopped, 3 s at most; a bash that has not learned of the
+	// stop by then (bash 5.3.20 on gVisor as root, now and then) lists it
+	// `Running` (the row's alternative), and its program still runs only
+	// once continued.
+	let ran = r#"/bin/sh -c 'sleep 0.2; i=0; until [ -e "$0.go" ]; do i=$((i+1)); [ $i -lt 600 ] || exit 97; sleep 0.05; done; echo ran' "$F""#;
 	for (m, listed) in [
-		("set -m; ", "[1]+ PID Stopped (signal)           /bin/sh -c 'sleep 0.2; echo ran'\n"),
-		("", "[1]+ PID Running                    /bin/sh -c 'sleep 0.2; echo ran' &\n"),
+		("set -m; ", format!("[1]+ PID Stopped (signal)           {ran}\n")),
+		("", format!("[1]+ PID Running                    {ran} &\n")),
 	] {
-		let job = format!("{OUT}{m}/bin/sh -c 'sleep 0.2; echo ran' & kill -STOP %1");
+		let job = format!("{OUT}/bin/rm -f \"$F.go\"; {m}{ran} & kill -STOP %1; : > \"$F.go\"");
 		let (learned, unlearned) = if m.is_empty() {
 			("/bin/sleep 0.5", None)
 		} else {
 			(
 				"i=0; until jobs >\"$F.j\"; read -r j <\"$F.j\"; [ \"${j#*Stopped}\" != \"$j\" ] || [ \
 				 $i -ge 60 ]; do i=$((i+1)); /bin/sleep 0.05; done",
-				Some((
-					"[1]+ PID Running                    /bin/sh -c 'sleep 0.2; echo ran' \
-					 &\nran\nst=0\n"
-						.to_owned(),
-					"",
-				)),
+				Some((format!("[1]+ PID Running                    {ran} &\nran\nst=0\n"), "")),
 			)
 		};
 		rows.push((
