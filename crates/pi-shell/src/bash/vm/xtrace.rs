@@ -15,20 +15,35 @@ use super::{
 use crate::bash::{store::OptId, zshopt::ZshOpt};
 
 /// bash's `indirection_level` in `vp`: 1 at the top, one more per `eval`,
-/// `.` file and trap action running, plus the level the vproc started at
+/// `.` file, trap action and `${ ;}` / `${| ;}` running (each a
+/// `parse_and_execute`), plus the level the vproc started at
 /// ([`Vproc::trace_base`]: its parent's, and one more in a command
-/// substitution).
+/// substitution). The shell's own EXIT trap runs once the commands it
+/// ends have unwound (bash's `exit_shell` after the script or the `-c`
+/// string returned), at the top level whatever frames are still below it
+/// here.
 pub fn level(vp: &Vproc) -> u32 {
-	let nested = vp
-		.frames
-		.iter()
-		.filter(|f| {
-			matches!(f.kind, FrameKind::Script {
-				what: ScriptKind::Eval | ScriptKind::Source | ScriptKind::Trap { .. },
-				..
-			})
+	let counts = |f: &&super::proc::Frame| {
+		matches!(
+			f.kind,
+			FrameKind::NoFork
+				| FrameKind::Script {
+					what: ScriptKind::Eval | ScriptKind::Source | ScriptKind::Trap { .. },
+					..
+				}
+		)
+	};
+	let exit_trap = |f: &super::proc::Frame| {
+		matches!(f.kind, FrameKind::Script {
+			what: ScriptKind::Trap { key: crate::bash::store::TrapKey::Exit, .. },
+			..
 		})
-		.count();
+	};
+	let from = match vp.frames.iter().rposition(exit_trap) {
+		Some(i) if vp.parent.is_none() => i + 1,
+		_ => 0,
+	};
+	let nested = vp.frames[from..].iter().filter(counts).count();
 	1u32
 		.saturating_add(vp.trace_base)
 		.saturating_add(u32::try_from(nested).unwrap_or(u32::MAX))

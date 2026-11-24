@@ -1,0 +1,2612 @@
+[
+ {
+  "id": "x-simple",
+  "file": false,
+  "script": "set -x; echo a b",
+  "bash53": [
+   0,
+   "a b\n",
+   "+ echo a b\n"
+  ],
+  "bash52": [
+   0,
+   "a b\n",
+   "+ echo a b\n"
+  ]
+ },
+ {
+  "id": "x-simple",
+  "file": true,
+  "script": "set -x; echo a b",
+  "bash53": [
+   0,
+   "a b\n",
+   "+ echo a b\n"
+  ],
+  "bash52": [
+   0,
+   "a b\n",
+   "+ echo a b\n"
+  ]
+ },
+ {
+  "id": "x-quote-space",
+  "file": false,
+  "script": "set -x; echo 'a b' \"c d\"",
+  "bash53": [
+   0,
+   "a b c d\n",
+   "+ echo 'a b' 'c d'\n"
+  ],
+  "bash52": [
+   0,
+   "a b c d\n",
+   "+ echo 'a b' 'c d'\n"
+  ]
+ },
+ {
+  "id": "x-quote-space",
+  "file": true,
+  "script": "set -x; echo 'a b' \"c d\"",
+  "bash53": [
+   0,
+   "a b c d\n",
+   "+ echo 'a b' 'c d'\n"
+  ],
+  "bash52": [
+   0,
+   "a b c d\n",
+   "+ echo 'a b' 'c d'\n"
+  ]
+ },
+ {
+  "id": "x-quote-empty",
+  "file": false,
+  "script": "set -x; echo '' x",
+  "bash53": [
+   0,
+   " x\n",
+   "+ echo '' x\n"
+  ],
+  "bash52": [
+   0,
+   " x\n",
+   "+ echo '' x\n"
+  ]
+ },
+ {
+  "id": "x-quote-empty",
+  "file": true,
+  "script": "set -x; echo '' x",
+  "bash53": [
+   0,
+   " x\n",
+   "+ echo '' x\n"
+  ],
+  "bash52": [
+   0,
+   " x\n",
+   "+ echo '' x\n"
+  ]
+ },
+ {
+  "id": "x-quote-special",
+  "file": false,
+  "script": "set -x; echo 'a;b' 'c|d' 'e&f' 'g$h' 'i\"j' \"k'l\" 'm\\n' '*' '?' '[x]' '~' '#x' 'x#'",
+  "bash53": [
+   0,
+   "a;b c|d e&f g$h i\"j k'l m\\n * ? [x] ~ #x x#\n",
+   "+ echo 'a;b' 'c|d' 'e&f' 'g$h' 'i\"j' 'k'\\''l' 'm\\n' '*' '?' '[x]' '~' '#x' x#\n"
+  ],
+  "bash52": [
+   0,
+   "a;b c|d e&f g$h i\"j k'l m\\n * ? [x] ~ #x x#\n",
+   "+ echo 'a;b' 'c|d' 'e&f' 'g$h' 'i\"j' 'k'\\''l' 'm\\n' '*' '?' '[x]' '~' '#x' x#\n"
+  ]
+ },
+ {
+  "id": "x-quote-special",
+  "file": true,
+  "script": "set -x; echo 'a;b' 'c|d' 'e&f' 'g$h' 'i\"j' \"k'l\" 'm\\n' '*' '?' '[x]' '~' '#x' 'x#'",
+  "bash53": [
+   0,
+   "a;b c|d e&f g$h i\"j k'l m\\n * ? [x] ~ #x x#\n",
+   "+ echo 'a;b' 'c|d' 'e&f' 'g$h' 'i\"j' 'k'\\''l' 'm\\n' '*' '?' '[x]' '~' '#x' x#\n"
+  ],
+  "bash52": [
+   0,
+   "a;b c|d e&f g$h i\"j k'l m\\n * ? [x] ~ #x x#\n",
+   "+ echo 'a;b' 'c|d' 'e&f' 'g$h' 'i\"j' 'k'\\''l' 'm\\n' '*' '?' '[x]' '~' '#x' x#\n"
+  ]
+ },
+ {
+  "id": "x-quote-ctl",
+  "file": false,
+  "script": "set -x; echo $'a\\tb' $'c\\nd' $'\\001' $'\\e'",
+  "bash53": [
+   0,
+   "a\tb c\nd \u0001 \u001b\n",
+   "+ echo $'a\\tb' $'c\\nd' $'\\001' $'\\E'\n"
+  ],
+  "bash52": [
+   0,
+   "a\tb c\nd \u0001 \u001b\n",
+   "+ echo 'a\tb' 'c\nd' $'\\001' $'\\E'\n"
+  ]
+ },
+ {
+  "id": "x-quote-ctl",
+  "file": true,
+  "script": "set -x; echo $'a\\tb' $'c\\nd' $'\\001' $'\\e'",
+  "bash53": [
+   0,
+   "a\tb c\nd \u0001 \u001b\n",
+   "+ echo $'a\\tb' $'c\\nd' $'\\001' $'\\E'\n"
+  ],
+  "bash52": [
+   0,
+   "a\tb c\nd \u0001 \u001b\n",
+   "+ echo 'a\tb' 'c\nd' $'\\001' $'\\E'\n"
+  ]
+ },
+ {
+  "id": "x-quote-nonascii-utf8",
+  "file": false,
+  "script": "LC_ALL=C.UTF-8; set -x; echo $'\\xc3\\xa9' $'\\xff'",
+  "bash53": [
+   0,
+   "é �\n",
+   "+ echo é $'\\377'\n"
+  ],
+  "bash52": [
+   0,
+   "é �\n",
+   "+ echo é $'\\377'\n"
+  ]
+ },
+ {
+  "id": "x-quote-nonascii-utf8",
+  "file": true,
+  "script": "LC_ALL=C.UTF-8; set -x; echo $'\\xc3\\xa9' $'\\xff'",
+  "bash53": [
+   0,
+   "é �\n",
+   "+ echo é $'\\377'\n"
+  ],
+  "bash52": [
+   0,
+   "é �\n",
+   "+ echo é $'\\377'\n"
+  ]
+ },
+ {
+  "id": "x-quote-nonascii-c",
+  "file": false,
+  "script": "LC_ALL=C; set -x; echo $'\\xc3\\xa9' $'\\xff'",
+  "bash53": [
+   0,
+   "é �\n",
+   "+ echo $'\\303\\251' $'\\377'\n"
+  ],
+  "bash52": [
+   0,
+   "é �\n",
+   "+ echo $'\\303\\251' $'\\377'\n"
+  ]
+ },
+ {
+  "id": "x-quote-nonascii-c",
+  "file": true,
+  "script": "LC_ALL=C; set -x; echo $'\\xc3\\xa9' $'\\xff'",
+  "bash53": [
+   0,
+   "é �\n",
+   "+ echo $'\\303\\251' $'\\377'\n"
+  ],
+  "bash52": [
+   0,
+   "é �\n",
+   "+ echo $'\\303\\251' $'\\377'\n"
+  ]
+ },
+ {
+  "id": "x-assign",
+  "file": false,
+  "script": "set -x; x=1 y=\"a b\"; echo \"$x\"",
+  "bash53": [
+   0,
+   "1\n",
+   "+ x=1\n+ y='a b'\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ x=1\n+ y='a b'\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "x-assign",
+  "file": true,
+  "script": "set -x; x=1 y=\"a b\"; echo \"$x\"",
+  "bash53": [
+   0,
+   "1\n",
+   "+ x=1\n+ y='a b'\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ x=1\n+ y='a b'\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "x-assign-prefix",
+  "file": false,
+  "script": "set -x; A=1 B=\"x y\" env -u PATH true",
+  "bash53": [
+   0,
+   "",
+   "+ A=1\n+ B='x y'\n+ env -u PATH true\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ A=1\n+ B='x y'\n+ env -u PATH true\n"
+  ]
+ },
+ {
+  "id": "x-assign-prefix",
+  "file": true,
+  "script": "set -x; A=1 B=\"x y\" env -u PATH true",
+  "bash53": [
+   0,
+   "",
+   "+ A=1\n+ B='x y'\n+ env -u PATH true\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ A=1\n+ B='x y'\n+ env -u PATH true\n"
+  ]
+ },
+ {
+  "id": "x-assign-array",
+  "file": false,
+  "script": "set -x; a=(1 \"2 3\"); a[5]=x; a+=(y)",
+  "bash53": [
+   0,
+   "",
+   "+ a=(1 \"2 3\")\n+ a[5]=x\n+ a+=(y)\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=(1 \"2 3\")\n+ a[5]=x\n+ a+=(y)\n"
+  ]
+ },
+ {
+  "id": "x-assign-array",
+  "file": true,
+  "script": "set -x; a=(1 \"2 3\"); a[5]=x; a+=(y)",
+  "bash53": [
+   0,
+   "",
+   "+ a=(1 \"2 3\")\n+ a[5]=x\n+ a+=(y)\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=(1 \"2 3\")\n+ a[5]=x\n+ a+=(y)\n"
+  ]
+ },
+ {
+  "id": "x-assign-only-sub",
+  "file": false,
+  "script": "set -x; x=$(echo hi)",
+  "bash53": [
+   0,
+   "",
+   "++ echo hi\n+ x=hi\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "++ echo hi\n+ x=hi\n"
+  ]
+ },
+ {
+  "id": "x-assign-only-sub",
+  "file": true,
+  "script": "set -x; x=$(echo hi)",
+  "bash53": [
+   0,
+   "",
+   "++ echo hi\n+ x=hi\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "++ echo hi\n+ x=hi\n"
+  ]
+ },
+ {
+  "id": "x-redir",
+  "file": false,
+  "script": "set -x; echo a > f; cat < f 2>/dev/null; echo b >> f 2>&1",
+  "bash53": [
+   0,
+   "a\n",
+   "+ echo a\n+ cat\n+ echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "+ echo a\n+ cat\n+ echo b\n"
+  ]
+ },
+ {
+  "id": "x-redir",
+  "file": true,
+  "script": "set -x; echo a > f; cat < f 2>/dev/null; echo b >> f 2>&1",
+  "bash53": [
+   0,
+   "a\n",
+   "+ echo a\n+ cat\n+ echo b\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "+ echo a\n+ cat\n+ echo b\n"
+  ]
+ },
+ {
+  "id": "x-redir-heredoc",
+  "file": false,
+  "script": "HOME=/h; set -x; cat <<E\nhi $HOME\nE",
+  "bash53": [
+   0,
+   "hi /h\n",
+   "+ cat\n"
+  ],
+  "bash52": [
+   0,
+   "hi /h\n",
+   "+ cat\n"
+  ]
+ },
+ {
+  "id": "x-redir-heredoc",
+  "file": true,
+  "script": "HOME=/h; set -x; cat <<E\nhi $HOME\nE",
+  "bash53": [
+   0,
+   "hi /h\n",
+   "+ cat\n"
+  ],
+  "bash52": [
+   0,
+   "hi /h\n",
+   "+ cat\n"
+  ]
+ },
+ {
+  "id": "x-herestring",
+  "file": false,
+  "script": "set -x; cat <<< \"a b\"",
+  "bash53": [
+   0,
+   "a b\n",
+   "+ cat\n"
+  ],
+  "bash52": [
+   0,
+   "a b\n",
+   "+ cat\n"
+  ]
+ },
+ {
+  "id": "x-herestring",
+  "file": true,
+  "script": "set -x; cat <<< \"a b\"",
+  "bash53": [
+   0,
+   "a b\n",
+   "+ cat\n"
+  ],
+  "bash52": [
+   0,
+   "a b\n",
+   "+ cat\n"
+  ]
+ },
+ {
+  "id": "x-cmdsub",
+  "file": false,
+  "script": "set -x; echo \"$(echo inner)\"",
+  "bash53": [
+   0,
+   "inner\n",
+   "++ echo inner\n+ echo inner\n"
+  ],
+  "bash52": [
+   0,
+   "inner\n",
+   "++ echo inner\n+ echo inner\n"
+  ]
+ },
+ {
+  "id": "x-cmdsub",
+  "file": true,
+  "script": "set -x; echo \"$(echo inner)\"",
+  "bash53": [
+   0,
+   "inner\n",
+   "++ echo inner\n+ echo inner\n"
+  ],
+  "bash52": [
+   0,
+   "inner\n",
+   "++ echo inner\n+ echo inner\n"
+  ]
+ },
+ {
+  "id": "x-nested-cmdsub",
+  "file": false,
+  "script": "set -x; echo $(echo $(echo deep))",
+  "bash53": [
+   0,
+   "deep\n",
+   "+++ echo deep\n++ echo deep\n+ echo deep\n"
+  ],
+  "bash52": [
+   0,
+   "deep\n",
+   "+++ echo deep\n++ echo deep\n+ echo deep\n"
+  ]
+ },
+ {
+  "id": "x-nested-cmdsub",
+  "file": true,
+  "script": "set -x; echo $(echo $(echo deep))",
+  "bash53": [
+   0,
+   "deep\n",
+   "+++ echo deep\n++ echo deep\n+ echo deep\n"
+  ],
+  "bash52": [
+   0,
+   "deep\n",
+   "+++ echo deep\n++ echo deep\n+ echo deep\n"
+  ]
+ },
+ {
+  "id": "x-subshell",
+  "file": false,
+  "script": "set -x; ( echo sub; ( echo sub2 ) )",
+  "bash53": [
+   0,
+   "sub\nsub2\n",
+   "+ echo sub\n+ echo sub2\n"
+  ],
+  "bash52": [
+   0,
+   "sub\nsub2\n",
+   "+ echo sub\n+ echo sub2\n"
+  ]
+ },
+ {
+  "id": "x-subshell",
+  "file": true,
+  "script": "set -x; ( echo sub; ( echo sub2 ) )",
+  "bash53": [
+   0,
+   "sub\nsub2\n",
+   "+ echo sub\n+ echo sub2\n"
+  ],
+  "bash52": [
+   0,
+   "sub\nsub2\n",
+   "+ echo sub\n+ echo sub2\n"
+  ]
+ },
+ {
+  "id": "x-andor",
+  "file": false,
+  "script": "set -x; true && echo y || echo n",
+  "bash53": [
+   0,
+   "y\n",
+   "+ true\n+ echo y\n"
+  ],
+  "bash52": [
+   0,
+   "y\n",
+   "+ true\n+ echo y\n"
+  ]
+ },
+ {
+  "id": "x-andor",
+  "file": true,
+  "script": "set -x; true && echo y || echo n",
+  "bash53": [
+   0,
+   "y\n",
+   "+ true\n+ echo y\n"
+  ],
+  "bash52": [
+   0,
+   "y\n",
+   "+ true\n+ echo y\n"
+  ]
+ },
+ {
+  "id": "x-if",
+  "file": false,
+  "script": "set -x; if [ 1 = 1 ]; then echo t; elif false; then :; else echo e; fi",
+  "bash53": [
+   0,
+   "t\n",
+   "+ '[' 1 = 1 ']'\n+ echo t\n"
+  ],
+  "bash52": [
+   0,
+   "t\n",
+   "+ '[' 1 = 1 ']'\n+ echo t\n"
+  ]
+ },
+ {
+  "id": "x-if",
+  "file": true,
+  "script": "set -x; if [ 1 = 1 ]; then echo t; elif false; then :; else echo e; fi",
+  "bash53": [
+   0,
+   "t\n",
+   "+ '[' 1 = 1 ']'\n+ echo t\n"
+  ],
+  "bash52": [
+   0,
+   "t\n",
+   "+ '[' 1 = 1 ']'\n+ echo t\n"
+  ]
+ },
+ {
+  "id": "x-while",
+  "file": false,
+  "script": "set -x; i=0; while [ $i -lt 2 ]; do i=$((i+1)); done",
+  "bash53": [
+   0,
+   "",
+   "+ i=0\n+ '[' 0 -lt 2 ']'\n+ i=1\n+ '[' 1 -lt 2 ']'\n+ i=2\n+ '[' 2 -lt 2 ']'\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ i=0\n+ '[' 0 -lt 2 ']'\n+ i=1\n+ '[' 1 -lt 2 ']'\n+ i=2\n+ '[' 2 -lt 2 ']'\n"
+  ]
+ },
+ {
+  "id": "x-while",
+  "file": true,
+  "script": "set -x; i=0; while [ $i -lt 2 ]; do i=$((i+1)); done",
+  "bash53": [
+   0,
+   "",
+   "+ i=0\n+ '[' 0 -lt 2 ']'\n+ i=1\n+ '[' 1 -lt 2 ']'\n+ i=2\n+ '[' 2 -lt 2 ']'\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ i=0\n+ '[' 0 -lt 2 ']'\n+ i=1\n+ '[' 1 -lt 2 ']'\n+ i=2\n+ '[' 2 -lt 2 ']'\n"
+  ]
+ },
+ {
+  "id": "x-until",
+  "file": false,
+  "script": "set -x; until true; do :; done",
+  "bash53": [
+   0,
+   "",
+   "+ true\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ true\n"
+  ]
+ },
+ {
+  "id": "x-until",
+  "file": true,
+  "script": "set -x; until true; do :; done",
+  "bash53": [
+   0,
+   "",
+   "+ true\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ true\n"
+  ]
+ },
+ {
+  "id": "x-for",
+  "file": false,
+  "script": "set -x; for i in a \"b c\"; do echo $i; done",
+  "bash53": [
+   0,
+   "a\nb c\n",
+   "+ for i in a \"b c\"\n+ echo a\n+ for i in a \"b c\"\n+ echo b c\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb c\n",
+   "+ for i in a \"b c\"\n+ echo a\n+ for i in a \"b c\"\n+ echo b c\n"
+  ]
+ },
+ {
+  "id": "x-for",
+  "file": true,
+  "script": "set -x; for i in a \"b c\"; do echo $i; done",
+  "bash53": [
+   0,
+   "a\nb c\n",
+   "+ for i in a \"b c\"\n+ echo a\n+ for i in a \"b c\"\n+ echo b c\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb c\n",
+   "+ for i in a \"b c\"\n+ echo a\n+ for i in a \"b c\"\n+ echo b c\n"
+  ]
+ },
+ {
+  "id": "x-for-arith",
+  "file": false,
+  "script": "set -x; for ((i=0; i<2; i++)); do :; done",
+  "bash53": [
+   0,
+   "",
+   "+ (( i=0 ))\n+ (( i<2 ))\n+ :\n+ (( i++ ))\n+ (( i<2 ))\n+ :\n+ (( i++ ))\n+ (( i<2 ))\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ (( i=0 ))\n+ (( i<2 ))\n+ :\n+ (( i++ ))\n+ (( i<2 ))\n+ :\n+ (( i++ ))\n+ (( i<2 ))\n"
+  ]
+ },
+ {
+  "id": "x-for-arith",
+  "file": true,
+  "script": "set -x; for ((i=0; i<2; i++)); do :; done",
+  "bash53": [
+   0,
+   "",
+   "+ (( i=0 ))\n+ (( i<2 ))\n+ :\n+ (( i++ ))\n+ (( i<2 ))\n+ :\n+ (( i++ ))\n+ (( i<2 ))\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ (( i=0 ))\n+ (( i<2 ))\n+ :\n+ (( i++ ))\n+ (( i<2 ))\n+ :\n+ (( i++ ))\n+ (( i<2 ))\n"
+  ]
+ },
+ {
+  "id": "x-select",
+  "file": false,
+  "script": "set -x; select x in a b; do break; done < /dev/null",
+  "bash53": [
+   1,
+   "\n",
+   "+ select x in a b\n1) a\n2) b\n#? "
+  ],
+  "bash52": [
+   1,
+   "\n",
+   "+ select x in a b\n1) a\n2) b\n#? "
+  ]
+ },
+ {
+  "id": "x-select",
+  "file": true,
+  "script": "set -x; select x in a b; do break; done < /dev/null",
+  "bash53": [
+   1,
+   "\n",
+   "+ select x in a b\n1) a\n2) b\n#? "
+  ],
+  "bash52": [
+   1,
+   "\n",
+   "+ select x in a b\n1) a\n2) b\n#? "
+  ]
+ },
+ {
+  "id": "x-case",
+  "file": false,
+  "script": "set -x; case \"a b\" in a*) echo hit;; *) echo miss;; esac",
+  "bash53": [
+   0,
+   "hit\n",
+   "+ case \"a b\" in\n+ echo hit\n"
+  ],
+  "bash52": [
+   0,
+   "hit\n",
+   "+ case \"a b\" in\n+ echo hit\n"
+  ]
+ },
+ {
+  "id": "x-case",
+  "file": true,
+  "script": "set -x; case \"a b\" in a*) echo hit;; *) echo miss;; esac",
+  "bash53": [
+   0,
+   "hit\n",
+   "+ case \"a b\" in\n+ echo hit\n"
+  ],
+  "bash52": [
+   0,
+   "hit\n",
+   "+ case \"a b\" in\n+ echo hit\n"
+  ]
+ },
+ {
+  "id": "x-dbracket",
+  "file": false,
+  "script": "HOME=/h; set -x; [[ $HOME == /* && -n \"x y\" || a < b ]]; [[ abc =~ ^a(b)c$ ]]",
+  "bash53": [
+   0,
+   "",
+   "+ [[ /h == /* ]]\n+ [[ -n x y ]]\n+ [[ abc =~ ^a(b)c$ ]]\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ [[ /h == /* ]]\n+ [[ -n x y ]]\n+ [[ abc =~ ^a(b)c$ ]]\n"
+  ]
+ },
+ {
+  "id": "x-dbracket",
+  "file": true,
+  "script": "HOME=/h; set -x; [[ $HOME == /* && -n \"x y\" || a < b ]]; [[ abc =~ ^a(b)c$ ]]",
+  "bash53": [
+   0,
+   "",
+   "+ [[ /h == /* ]]\n+ [[ -n x y ]]\n+ [[ abc =~ ^a(b)c$ ]]\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ [[ /h == /* ]]\n+ [[ -n x y ]]\n+ [[ abc =~ ^a(b)c$ ]]\n"
+  ]
+ },
+ {
+  "id": "x-arith",
+  "file": false,
+  "script": "set -x; (( x = 1 + 2 )); (( x > 2 )) && echo big",
+  "bash53": [
+   0,
+   "big\n",
+   "+ ((  x = 1 + 2  ))\n+ ((  x > 2  ))\n+ echo big\n"
+  ],
+  "bash52": [
+   0,
+   "big\n",
+   "+ ((  x = 1 + 2  ))\n+ ((  x > 2  ))\n+ echo big\n"
+  ]
+ },
+ {
+  "id": "x-arith",
+  "file": true,
+  "script": "set -x; (( x = 1 + 2 )); (( x > 2 )) && echo big",
+  "bash53": [
+   0,
+   "big\n",
+   "+ ((  x = 1 + 2  ))\n+ ((  x > 2  ))\n+ echo big\n"
+  ],
+  "bash52": [
+   0,
+   "big\n",
+   "+ ((  x = 1 + 2  ))\n+ ((  x > 2  ))\n+ echo big\n"
+  ]
+ },
+ {
+  "id": "x-function",
+  "file": false,
+  "script": "set -x; f() { echo in \"$@\"; }; f a \"b c\"",
+  "bash53": [
+   0,
+   "in a b c\n",
+   "+ f a 'b c'\n+ echo in a 'b c'\n"
+  ],
+  "bash52": [
+   0,
+   "in a b c\n",
+   "+ f a 'b c'\n+ echo in a 'b c'\n"
+  ]
+ },
+ {
+  "id": "x-function",
+  "file": true,
+  "script": "set -x; f() { echo in \"$@\"; }; f a \"b c\"",
+  "bash53": [
+   0,
+   "in a b c\n",
+   "+ f a 'b c'\n+ echo in a 'b c'\n"
+  ],
+  "bash52": [
+   0,
+   "in a b c\n",
+   "+ f a 'b c'\n+ echo in a 'b c'\n"
+  ]
+ },
+ {
+  "id": "x-function-kw",
+  "file": false,
+  "script": "set -x; function g { local v=1; echo $v; }; g",
+  "bash53": [
+   0,
+   "1\n",
+   "+ g\n+ local v=1\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ g\n+ local v=1\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "x-function-kw",
+  "file": true,
+  "script": "set -x; function g { local v=1; echo $v; }; g",
+  "bash53": [
+   0,
+   "1\n",
+   "+ g\n+ local v=1\n+ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ g\n+ local v=1\n+ echo 1\n"
+  ]
+ },
+ {
+  "id": "x-ps4",
+  "file": false,
+  "script": "PS4='+[$LINENO] '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "+[1] echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "+[1] echo a\n"
+  ]
+ },
+ {
+  "id": "x-ps4",
+  "file": true,
+  "script": "PS4='+[$LINENO] '; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "+[1] echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "+[1] echo a\n"
+  ]
+ },
+ {
+  "id": "x-ps4-nested",
+  "file": false,
+  "script": "PS4='+${FUNCNAME[0]:-main}: '; set -x; f() { echo x; }; f",
+  "bash53": [
+   0,
+   "x\n",
+   "+main: f\n+f: echo x\n"
+  ],
+  "bash52": [
+   0,
+   "x\n",
+   "+main: f\n+f: echo x\n"
+  ]
+ },
+ {
+  "id": "x-ps4-nested",
+  "file": true,
+  "script": "PS4='+${FUNCNAME[0]:-main}: '; set -x; f() { echo x; }; f",
+  "bash53": [
+   0,
+   "x\n",
+   "+main: f\n+f: echo x\n"
+  ],
+  "bash52": [
+   0,
+   "x\n",
+   "+main: f\n+f: echo x\n"
+  ]
+ },
+ {
+  "id": "x-ps4-empty",
+  "file": false,
+  "script": "PS4=''; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "echo a\n"
+  ]
+ },
+ {
+  "id": "x-ps4-empty",
+  "file": true,
+  "script": "PS4=''; set -x; echo a",
+  "bash53": [
+   0,
+   "a\n",
+   "echo a\n"
+  ],
+  "bash52": [
+   0,
+   "a\n",
+   "echo a\n"
+  ]
+ },
+ {
+  "id": "x-level",
+  "file": false,
+  "script": "set -x; eval \"echo e\"; echo $(echo c); ( echo s )",
+  "bash53": [
+   0,
+   "e\nc\ns\n",
+   "+ eval 'echo e'\n++ echo e\n++ echo c\n+ echo c\n+ echo s\n"
+  ],
+  "bash52": [
+   0,
+   "e\nc\ns\n",
+   "+ eval 'echo e'\n++ echo e\n++ echo c\n+ echo c\n+ echo s\n"
+  ]
+ },
+ {
+  "id": "x-level",
+  "file": true,
+  "script": "set -x; eval \"echo e\"; echo $(echo c); ( echo s )",
+  "bash53": [
+   0,
+   "e\nc\ns\n",
+   "+ eval 'echo e'\n++ echo e\n++ echo c\n+ echo c\n+ echo s\n"
+  ],
+  "bash52": [
+   0,
+   "e\nc\ns\n",
+   "+ eval 'echo e'\n++ echo e\n++ echo c\n+ echo c\n+ echo s\n"
+  ]
+ },
+ {
+  "id": "x-builtin-eval",
+  "file": false,
+  "script": "set -x; eval 'x=1; echo $x'",
+  "bash53": [
+   0,
+   "1\n",
+   "+ eval 'x=1; echo $x'\n++ x=1\n++ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ eval 'x=1; echo $x'\n++ x=1\n++ echo 1\n"
+  ]
+ },
+ {
+  "id": "x-builtin-eval",
+  "file": true,
+  "script": "set -x; eval 'x=1; echo $x'",
+  "bash53": [
+   0,
+   "1\n",
+   "+ eval 'x=1; echo $x'\n++ x=1\n++ echo 1\n"
+  ],
+  "bash52": [
+   0,
+   "1\n",
+   "+ eval 'x=1; echo $x'\n++ x=1\n++ echo 1\n"
+  ]
+ },
+ {
+  "id": "x-trap",
+  "file": false,
+  "script": "set -x; trap 'echo T' EXIT; echo body",
+  "bash53": [
+   0,
+   "body\nT\n",
+   "+ trap 'echo T' EXIT\n+ echo body\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "body\nT\n",
+   "+ trap 'echo T' EXIT\n+ echo body\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "x-trap",
+  "file": true,
+  "script": "set -x; trap 'echo T' EXIT; echo body",
+  "bash53": [
+   0,
+   "body\nT\n",
+   "+ trap 'echo T' EXIT\n+ echo body\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "body\nT\n",
+   "+ trap 'echo T' EXIT\n+ echo body\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "x-declare",
+  "file": false,
+  "script": "set -x; declare -a a=(1 2); local 2>/dev/null; export X=1; readonly R=1",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1' '2')\n+ declare -a a\n+ local\n+ export X=1\n+ X=1\n+ readonly R=1\n+ R=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1' '2')\n+ declare -a a\n+ local\n+ export X=1\n+ X=1\n+ readonly R=1\n+ R=1\n"
+  ]
+ },
+ {
+  "id": "x-declare",
+  "file": true,
+  "script": "set -x; declare -a a=(1 2); local 2>/dev/null; export X=1; readonly R=1",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1' '2')\n+ declare -a a\n+ local\n+ export X=1\n+ X=1\n+ readonly R=1\n+ R=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1' '2')\n+ declare -a a\n+ local\n+ export X=1\n+ X=1\n+ readonly R=1\n+ R=1\n"
+  ]
+ },
+ {
+  "id": "x-time",
+  "file": false,
+  "script": "set -x; TIMEFORMAT=; time echo t",
+  "bash53": [
+   0,
+   "t\n",
+   "+ TIMEFORMAT=\n+ echo t\n"
+  ],
+  "bash52": [
+   0,
+   "t\n",
+   "+ TIMEFORMAT=\n+ echo t\n"
+  ]
+ },
+ {
+  "id": "x-time",
+  "file": true,
+  "script": "set -x; TIMEFORMAT=; time echo t",
+  "bash53": [
+   0,
+   "t\n",
+   "+ TIMEFORMAT=\n+ echo t\n"
+  ],
+  "bash52": [
+   0,
+   "t\n",
+   "+ TIMEFORMAT=\n+ echo t\n"
+  ]
+ },
+ {
+  "id": "x-not",
+  "file": false,
+  "script": "set -x; ! false",
+  "bash53": [
+   0,
+   "",
+   "+ false\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ false\n"
+  ]
+ },
+ {
+  "id": "x-not",
+  "file": true,
+  "script": "set -x; ! false",
+  "bash53": [
+   0,
+   "",
+   "+ false\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ false\n"
+  ]
+ },
+ {
+  "id": "x-coproc",
+  "file": false,
+  "script": "set -x; coproc C { echo c; }; read -r l <&\"${C[0]}\"; echo \"$l\"",
+  "bash53": [
+   0,
+   "c\n",
+   "+ read -r l\n+ echo c\n+ echo c\n"
+  ],
+  "bash52": [
+   0,
+   "c\n",
+   "+ read -r l\n+ echo c\n+ echo c\n"
+  ]
+ },
+ {
+  "id": "x-coproc",
+  "file": true,
+  "script": "set -x; coproc C { echo c; }; read -r l <&\"${C[0]}\"; echo \"$l\"",
+  "bash53": [
+   0,
+   "c\n",
+   "+ read -r l\n+ echo c\n+ echo c\n"
+  ],
+  "bash52": [
+   0,
+   "c\n",
+   "+ read -r l\n+ echo c\n+ echo c\n"
+  ]
+ },
+ {
+  "id": "x-set-plus",
+  "file": false,
+  "script": "set -x; echo a; set +x; echo b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "+ echo a\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "+ echo a\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "x-set-plus",
+  "file": true,
+  "script": "set -x; echo a; set +x; echo b",
+  "bash53": [
+   0,
+   "a\nb\n",
+   "+ echo a\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "a\nb\n",
+   "+ echo a\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "x-glob",
+  "file": false,
+  "script": "set -x; touch g1 g2; echo g*",
+  "bash53": [
+   0,
+   "g1 g2\n",
+   "+ touch g1 g2\n+ echo g1 g2\n"
+  ],
+  "bash52": [
+   0,
+   "g1 g2\n",
+   "+ touch g1 g2\n+ echo g1 g2\n"
+  ]
+ },
+ {
+  "id": "x-glob",
+  "file": true,
+  "script": "set -x; touch g1 g2; echo g*",
+  "bash53": [
+   0,
+   "g1 g2\n",
+   "+ touch g1 g2\n+ echo g1 g2\n"
+  ],
+  "bash52": [
+   0,
+   "g1 g2\n",
+   "+ touch g1 g2\n+ echo g1 g2\n"
+  ]
+ },
+ {
+  "id": "x-tilde",
+  "file": false,
+  "script": "HOME=/h; set -x; echo ~ ~/x",
+  "bash53": [
+   0,
+   "/h /h/x\n",
+   "+ echo /h /h/x\n"
+  ],
+  "bash52": [
+   0,
+   "/h /h/x\n",
+   "+ echo /h /h/x\n"
+  ]
+ },
+ {
+  "id": "x-tilde",
+  "file": true,
+  "script": "HOME=/h; set -x; echo ~ ~/x",
+  "bash53": [
+   0,
+   "/h /h/x\n",
+   "+ echo /h /h/x\n"
+  ],
+  "bash52": [
+   0,
+   "/h /h/x\n",
+   "+ echo /h /h/x\n"
+  ]
+ },
+ {
+  "id": "x-brace",
+  "file": false,
+  "script": "set -x; echo {a,b}c",
+  "bash53": [
+   0,
+   "ac bc\n",
+   "+ echo ac bc\n"
+  ],
+  "bash52": [
+   0,
+   "ac bc\n",
+   "+ echo ac bc\n"
+  ]
+ },
+ {
+  "id": "x-brace",
+  "file": true,
+  "script": "set -x; echo {a,b}c",
+  "bash53": [
+   0,
+   "ac bc\n",
+   "+ echo ac bc\n"
+  ],
+  "bash52": [
+   0,
+   "ac bc\n",
+   "+ echo ac bc\n"
+  ]
+ },
+ {
+  "id": "x-param-ops",
+  "file": false,
+  "script": "set -x; v=abc; echo ${v#a} ${v/b/X} ${#v} ${v:-d}",
+  "bash53": [
+   0,
+   "bc aXc 3 abc\n",
+   "+ v=abc\n+ echo bc aXc 3 abc\n"
+  ],
+  "bash52": [
+   0,
+   "bc aXc 3 abc\n",
+   "+ v=abc\n+ echo bc aXc 3 abc\n"
+  ]
+ },
+ {
+  "id": "x-param-ops",
+  "file": true,
+  "script": "set -x; v=abc; echo ${v#a} ${v/b/X} ${#v} ${v:-d}",
+  "bash53": [
+   0,
+   "bc aXc 3 abc\n",
+   "+ v=abc\n+ echo bc aXc 3 abc\n"
+  ],
+  "bash52": [
+   0,
+   "bc aXc 3 abc\n",
+   "+ v=abc\n+ echo bc aXc 3 abc\n"
+  ]
+ },
+ {
+  "id": "x-empty-command",
+  "file": false,
+  "script": "set -x; $empty",
+  "bash53": [
+   0,
+   "",
+   ""
+  ],
+  "bash52": [
+   0,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "x-empty-command",
+  "file": true,
+  "script": "set -x; $empty",
+  "bash53": [
+   0,
+   "",
+   ""
+  ],
+  "bash52": [
+   0,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "x-assign-empty",
+  "file": false,
+  "script": "set -x; x=''",
+  "bash53": [
+   0,
+   "",
+   "+ x=\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ x=\n"
+  ]
+ },
+ {
+  "id": "x-assign-empty",
+  "file": true,
+  "script": "set -x; x=''",
+  "bash53": [
+   0,
+   "",
+   "+ x=\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ x=\n"
+  ]
+ },
+ {
+  "id": "x-xtracefd",
+  "file": false,
+  "script": "exec 7>tr; BASH_XTRACEFD=7; set -x; echo a; set +x; cat tr",
+  "bash53": [
+   0,
+   "a\n+ echo a\n+ set +x\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "a\n+ echo a\n+ set +x\n",
+   ""
+  ]
+ },
+ {
+  "id": "x-xtracefd",
+  "file": true,
+  "script": "exec 7>tr; BASH_XTRACEFD=7; set -x; echo a; set +x; cat tr",
+  "bash53": [
+   0,
+   "a\n+ echo a\n+ set +x\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "a\n+ echo a\n+ set +x\n",
+   ""
+  ]
+ },
+ {
+  "id": "x-funsub",
+  "file": false,
+  "script": "set -x; echo ${ echo fs; }",
+  "bash53": [
+   0,
+   "fs\n",
+   "++ echo fs\n+ echo fs\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: ${ echo fs; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "x-funsub",
+  "file": true,
+  "script": "set -x; echo ${ echo fs; }",
+  "bash53": [
+   0,
+   "fs\n",
+   "++ echo fs\n+ echo fs\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: ${ echo fs; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "x-valsub",
+  "file": false,
+  "script": "set -x; echo ${| REPLY=v; }",
+  "bash53": [
+   0,
+   "v\n",
+   "++ REPLY=v\n+ echo v\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: ${| REPLY=v; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "x-valsub",
+  "file": true,
+  "script": "set -x; echo ${| REPLY=v; }",
+  "bash53": [
+   0,
+   "v\n",
+   "++ REPLY=v\n+ echo v\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: ${| REPLY=v; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "d-declare-scalar",
+  "file": false,
+  "script": "set -x; declare x=1",
+  "bash53": [
+   0,
+   "",
+   "+ declare x=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare x=1\n"
+  ]
+ },
+ {
+  "id": "d-declare-scalar",
+  "file": true,
+  "script": "set -x; declare x=1",
+  "bash53": [
+   0,
+   "",
+   "+ declare x=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare x=1\n"
+  ]
+ },
+ {
+  "id": "d-declare-plain",
+  "file": false,
+  "script": "set -x; declare x",
+  "bash53": [
+   0,
+   "",
+   "+ declare x\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare x\n"
+  ]
+ },
+ {
+  "id": "d-declare-plain",
+  "file": true,
+  "script": "set -x; declare x",
+  "bash53": [
+   0,
+   "",
+   "+ declare x\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare x\n"
+  ]
+ },
+ {
+  "id": "d-declare-two",
+  "file": false,
+  "script": "set -x; declare x=1 y=\"a b\"",
+  "bash53": [
+   0,
+   "",
+   "+ declare x=1 'y=a b'\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare x=1 'y=a b'\n"
+  ]
+ },
+ {
+  "id": "d-declare-two",
+  "file": true,
+  "script": "set -x; declare x=1 y=\"a b\"",
+  "bash53": [
+   0,
+   "",
+   "+ declare x=1 'y=a b'\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare x=1 'y=a b'\n"
+  ]
+ },
+ {
+  "id": "d-declare-a",
+  "file": false,
+  "script": "set -x; declare -a a=(1 \"2 3\")",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1' '2 3')\n+ declare -a a\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1' '2 3')\n+ declare -a a\n"
+  ]
+ },
+ {
+  "id": "d-declare-a",
+  "file": true,
+  "script": "set -x; declare -a a=(1 \"2 3\")",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1' '2 3')\n+ declare -a a\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1' '2 3')\n+ declare -a a\n"
+  ]
+ },
+ {
+  "id": "d-declare-nooption-array",
+  "file": false,
+  "script": "set -x; declare a=(1 2)",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1' '2')\n+ declare a\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1' '2')\n+ declare a\n"
+  ]
+ },
+ {
+  "id": "d-declare-nooption-array",
+  "file": true,
+  "script": "set -x; declare a=(1 2)",
+  "bash53": [
+   0,
+   "",
+   "+ a=('1' '2')\n+ declare a\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=('1' '2')\n+ declare a\n"
+  ]
+ },
+ {
+  "id": "d-declare-A",
+  "file": false,
+  "script": "set -x; declare -A A=([k]=v [l]=\"x y\")",
+  "bash53": [
+   0,
+   "",
+   "+ A=(['k']='v' ['l']='x y')\n+ declare -A A\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ A=(['k']='v' ['l']='x y')\n+ declare -A A\n"
+  ]
+ },
+ {
+  "id": "d-declare-A",
+  "file": true,
+  "script": "set -x; declare -A A=([k]=v [l]=\"x y\")",
+  "bash53": [
+   0,
+   "",
+   "+ A=(['k']='v' ['l']='x y')\n+ declare -A A\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ A=(['k']='v' ['l']='x y')\n+ declare -A A\n"
+  ]
+ },
+ {
+  "id": "d-declare-a-append",
+  "file": false,
+  "script": "set -x; a=(0); declare -a a+=(1)",
+  "bash53": [
+   0,
+   "",
+   "+ a=(0)\n+ a+=('1')\n+ declare -a a\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=(0)\n+ a+=('1')\n+ declare -a a\n"
+  ]
+ },
+ {
+  "id": "d-declare-a-append",
+  "file": true,
+  "script": "set -x; a=(0); declare -a a+=(1)",
+  "bash53": [
+   0,
+   "",
+   "+ a=(0)\n+ a+=('1')\n+ declare -a a\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ a=(0)\n+ a+=('1')\n+ declare -a a\n"
+  ]
+ },
+ {
+  "id": "d-declare-i",
+  "file": false,
+  "script": "set -x; declare -i n=1+2",
+  "bash53": [
+   0,
+   "",
+   "+ declare -i n=1+2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare -i n=1+2\n"
+  ]
+ },
+ {
+  "id": "d-declare-i",
+  "file": true,
+  "script": "set -x; declare -i n=1+2",
+  "bash53": [
+   0,
+   "",
+   "+ declare -i n=1+2\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare -i n=1+2\n"
+  ]
+ },
+ {
+  "id": "d-declare-x",
+  "file": false,
+  "script": "set -x; declare -x X=1",
+  "bash53": [
+   0,
+   "",
+   "+ declare -x X=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare -x X=1\n"
+  ]
+ },
+ {
+  "id": "d-declare-x",
+  "file": true,
+  "script": "set -x; declare -x X=1",
+  "bash53": [
+   0,
+   "",
+   "+ declare -x X=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare -x X=1\n"
+  ]
+ },
+ {
+  "id": "d-declare-empty",
+  "file": false,
+  "script": "set -x; declare x=''",
+  "bash53": [
+   0,
+   "",
+   "+ declare x=\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare x=\n"
+  ]
+ },
+ {
+  "id": "d-declare-empty",
+  "file": true,
+  "script": "set -x; declare x=''",
+  "bash53": [
+   0,
+   "",
+   "+ declare x=\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare x=\n"
+  ]
+ },
+ {
+  "id": "d-declare-subscript",
+  "file": false,
+  "script": "set -x; declare a[1]=x",
+  "bash53": [
+   0,
+   "",
+   "+ declare 'a[1]=x'\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare 'a[1]=x'\n"
+  ]
+ },
+ {
+  "id": "d-declare-subscript",
+  "file": true,
+  "script": "set -x; declare a[1]=x",
+  "bash53": [
+   0,
+   "",
+   "+ declare 'a[1]=x'\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare 'a[1]=x'\n"
+  ]
+ },
+ {
+  "id": "d-export",
+  "file": false,
+  "script": "set -x; export X=1",
+  "bash53": [
+   0,
+   "",
+   "+ export X=1\n+ X=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export X=1\n+ X=1\n"
+  ]
+ },
+ {
+  "id": "d-export",
+  "file": true,
+  "script": "set -x; export X=1",
+  "bash53": [
+   0,
+   "",
+   "+ export X=1\n+ X=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export X=1\n+ X=1\n"
+  ]
+ },
+ {
+  "id": "d-export-two",
+  "file": false,
+  "script": "set -x; export X=1 Y",
+  "bash53": [
+   0,
+   "",
+   "+ export X=1 Y\n+ X=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export X=1 Y\n+ X=1\n"
+  ]
+ },
+ {
+  "id": "d-export-two",
+  "file": true,
+  "script": "set -x; export X=1 Y",
+  "bash53": [
+   0,
+   "",
+   "+ export X=1 Y\n+ X=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ export X=1 Y\n+ X=1\n"
+  ]
+ },
+ {
+  "id": "d-export-plain",
+  "file": false,
+  "script": "set -x; X=1; export X",
+  "bash53": [
+   0,
+   "",
+   "+ X=1\n+ export X\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ X=1\n+ export X\n"
+  ]
+ },
+ {
+  "id": "d-export-plain",
+  "file": true,
+  "script": "set -x; X=1; export X",
+  "bash53": [
+   0,
+   "",
+   "+ X=1\n+ export X\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ X=1\n+ export X\n"
+  ]
+ },
+ {
+  "id": "d-readonly",
+  "file": false,
+  "script": "set -x; readonly R=1",
+  "bash53": [
+   0,
+   "",
+   "+ readonly R=1\n+ R=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ readonly R=1\n+ R=1\n"
+  ]
+ },
+ {
+  "id": "d-readonly",
+  "file": true,
+  "script": "set -x; readonly R=1",
+  "bash53": [
+   0,
+   "",
+   "+ readonly R=1\n+ R=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ readonly R=1\n+ R=1\n"
+  ]
+ },
+ {
+  "id": "d-local",
+  "file": false,
+  "script": "set -x; f() { local v=1 w; local -a b=(1); }; f",
+  "bash53": [
+   0,
+   "",
+   "+ f\n+ local v=1 w\n+ b=('1')\n+ local -a b\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f\n+ local v=1 w\n+ b=('1')\n+ local -a b\n"
+  ]
+ },
+ {
+  "id": "d-local",
+  "file": true,
+  "script": "set -x; f() { local v=1 w; local -a b=(1); }; f",
+  "bash53": [
+   0,
+   "",
+   "+ f\n+ local v=1 w\n+ b=('1')\n+ local -a b\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ f\n+ local v=1 w\n+ b=('1')\n+ local -a b\n"
+  ]
+ },
+ {
+  "id": "d-typeset",
+  "file": false,
+  "script": "set -x; typeset t=1",
+  "bash53": [
+   0,
+   "",
+   "+ typeset t=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ typeset t=1\n"
+  ]
+ },
+ {
+  "id": "d-typeset",
+  "file": true,
+  "script": "set -x; typeset t=1",
+  "bash53": [
+   0,
+   "",
+   "+ typeset t=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ typeset t=1\n"
+  ]
+ },
+ {
+  "id": "d-declare-quoted",
+  "file": false,
+  "script": "set -x; declare 'q=a b'",
+  "bash53": [
+   0,
+   "",
+   "+ declare 'q=a b'\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare 'q=a b'\n"
+  ]
+ },
+ {
+  "id": "d-declare-quoted",
+  "file": true,
+  "script": "set -x; declare 'q=a b'",
+  "bash53": [
+   0,
+   "",
+   "+ declare 'q=a b'\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare 'q=a b'\n"
+  ]
+ },
+ {
+  "id": "d-declare-expanded",
+  "file": false,
+  "script": "set -x; n=x; declare \"$n=1\"",
+  "bash53": [
+   0,
+   "",
+   "+ n=x\n+ declare x=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ n=x\n+ declare x=1\n"
+  ]
+ },
+ {
+  "id": "d-declare-expanded",
+  "file": true,
+  "script": "set -x; n=x; declare \"$n=1\"",
+  "bash53": [
+   0,
+   "",
+   "+ n=x\n+ declare x=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ n=x\n+ declare x=1\n"
+  ]
+ },
+ {
+  "id": "d-command-declare",
+  "file": false,
+  "script": "set -x; command declare c=1",
+  "bash53": [
+   0,
+   "",
+   "+ command declare c=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ command declare c=1\n"
+  ]
+ },
+ {
+  "id": "d-command-declare",
+  "file": true,
+  "script": "set -x; command declare c=1",
+  "bash53": [
+   0,
+   "",
+   "+ command declare c=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ command declare c=1\n"
+  ]
+ },
+ {
+  "id": "d-builtin-declare",
+  "file": false,
+  "script": "set -x; builtin declare b=1",
+  "bash53": [
+   0,
+   "",
+   "+ builtin declare b=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ builtin declare b=1\n"
+  ]
+ },
+ {
+  "id": "d-builtin-declare",
+  "file": true,
+  "script": "set -x; builtin declare b=1",
+  "bash53": [
+   0,
+   "",
+   "+ builtin declare b=1\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ builtin declare b=1\n"
+  ]
+ },
+ {
+  "id": "d-declare-glob",
+  "file": false,
+  "script": "set -x; declare g=*",
+  "bash53": [
+   0,
+   "",
+   "+ declare 'g=*'\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare 'g=*'\n"
+  ]
+ },
+ {
+  "id": "d-declare-glob",
+  "file": true,
+  "script": "set -x; declare g=*",
+  "bash53": [
+   0,
+   "",
+   "+ declare 'g=*'\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ declare 'g=*'\n"
+  ]
+ },
+ {
+  "id": "t-exit",
+  "file": false,
+  "script": "set -x; trap 'echo T' EXIT; echo body",
+  "bash53": [
+   0,
+   "body\nT\n",
+   "+ trap 'echo T' EXIT\n+ echo body\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "body\nT\n",
+   "+ trap 'echo T' EXIT\n+ echo body\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit",
+  "file": true,
+  "script": "set -x; trap 'echo T' EXIT; echo body",
+  "bash53": [
+   0,
+   "body\nT\n",
+   "+ trap 'echo T' EXIT\n+ echo body\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "body\nT\n",
+   "+ trap 'echo T' EXIT\n+ echo body\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-exit",
+  "file": false,
+  "script": "set -x; trap 'echo T' EXIT; exit 0",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ exit 0\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ exit 0\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-exit",
+  "file": true,
+  "script": "set -x; trap 'echo T' EXIT; exit 0",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ exit 0\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ exit 0\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-in-function",
+  "file": false,
+  "script": "set -x; trap 'echo T' EXIT; f() { exit 0; }; f",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ f\n+ exit 0\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ f\n+ exit 0\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-in-function",
+  "file": true,
+  "script": "set -x; trap 'echo T' EXIT; f() { exit 0; }; f",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ f\n+ exit 0\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ f\n+ exit 0\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-eval",
+  "file": false,
+  "script": "set -x; trap 'echo T' EXIT; eval 'exit 0'",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-eval",
+  "file": true,
+  "script": "set -x; trap 'echo T' EXIT; eval 'exit 0'",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ eval 'exit 0'\n++ exit 0\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-subshell",
+  "file": false,
+  "script": "set -x; ( trap 'echo T' EXIT; : )",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ :\n++ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ :\n++ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-subshell",
+  "file": true,
+  "script": "set -x; ( trap 'echo T' EXIT; : )",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ :\n++ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'echo T' EXIT\n+ :\n++ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-source",
+  "file": false,
+  "script": "set -x; echo 'exit 0' > s2; trap 'echo T' EXIT; . ./s2",
+  "bash53": [
+   0,
+   "T\n",
+   "+ echo 'exit 0'\n+ trap 'echo T' EXIT\n+ . ./s2\n++ exit 0\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ echo 'exit 0'\n+ trap 'echo T' EXIT\n+ . ./s2\n++ exit 0\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-source",
+  "file": true,
+  "script": "set -x; echo 'exit 0' > s2; trap 'echo T' EXIT; . ./s2",
+  "bash53": [
+   0,
+   "T\n",
+   "+ echo 'exit 0'\n+ trap 'echo T' EXIT\n+ . ./s2\n++ exit 0\n+ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ echo 'exit 0'\n+ trap 'echo T' EXIT\n+ . ./s2\n++ exit 0\n+ echo T\n"
+  ]
+ },
+ {
+  "id": "t-err",
+  "file": false,
+  "script": "set -x; trap 'echo E' ERR; false",
+  "bash53": [
+   1,
+   "E\n",
+   "+ trap 'echo E' ERR\n+ false\n++ echo E\n"
+  ],
+  "bash52": [
+   1,
+   "E\n",
+   "+ trap 'echo E' ERR\n+ false\n++ echo E\n"
+  ]
+ },
+ {
+  "id": "t-err",
+  "file": true,
+  "script": "set -x; trap 'echo E' ERR; false",
+  "bash53": [
+   1,
+   "E\n",
+   "+ trap 'echo E' ERR\n+ false\n++ echo E\n"
+  ],
+  "bash52": [
+   1,
+   "E\n",
+   "+ trap 'echo E' ERR\n+ false\n++ echo E\n"
+  ]
+ },
+ {
+  "id": "t-debug",
+  "file": false,
+  "script": "set -x; trap 'echo D' DEBUG; :; trap - DEBUG",
+  "bash53": [
+   0,
+   "D\nD\n",
+   "+ trap 'echo D' DEBUG\n++ echo D\n+ :\n++ echo D\n+ trap - DEBUG\n"
+  ],
+  "bash52": [
+   0,
+   "D\nD\n",
+   "+ trap 'echo D' DEBUG\n++ echo D\n+ :\n++ echo D\n+ trap - DEBUG\n"
+  ]
+ },
+ {
+  "id": "t-debug",
+  "file": true,
+  "script": "set -x; trap 'echo D' DEBUG; :; trap - DEBUG",
+  "bash53": [
+   0,
+   "D\nD\n",
+   "+ trap 'echo D' DEBUG\n++ echo D\n+ :\n++ echo D\n+ trap - DEBUG\n"
+  ],
+  "bash52": [
+   0,
+   "D\nD\n",
+   "+ trap 'echo D' DEBUG\n++ echo D\n+ :\n++ echo D\n+ trap - DEBUG\n"
+  ]
+ },
+ {
+  "id": "t-return",
+  "file": false,
+  "script": "set -x; f() { :; }; trap 'echo R' RETURN; f; trap - RETURN",
+  "bash53": [
+   0,
+   "",
+   "+ trap 'echo R' RETURN\n+ f\n+ :\n+ trap - RETURN\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ trap 'echo R' RETURN\n+ f\n+ :\n+ trap - RETURN\n"
+  ]
+ },
+ {
+  "id": "t-return",
+  "file": true,
+  "script": "set -x; f() { :; }; trap 'echo R' RETURN; f; trap - RETURN",
+  "bash53": [
+   0,
+   "",
+   "+ trap 'echo R' RETURN\n+ f\n+ :\n+ trap - RETURN\n"
+  ],
+  "bash52": [
+   0,
+   "",
+   "+ trap 'echo R' RETURN\n+ f\n+ :\n+ trap - RETURN\n"
+  ]
+ },
+ {
+  "id": "t-exit-nested-eval",
+  "file": false,
+  "script": "set -x; trap 'eval \"echo T\"' EXIT; :",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'eval \"echo T\"' EXIT\n+ :\n+ eval 'echo T'\n++ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'eval \"echo T\"' EXIT\n+ :\n+ eval 'echo T'\n++ echo T\n"
+  ]
+ },
+ {
+  "id": "t-exit-nested-eval",
+  "file": true,
+  "script": "set -x; trap 'eval \"echo T\"' EXIT; :",
+  "bash53": [
+   0,
+   "T\n",
+   "+ trap 'eval \"echo T\"' EXIT\n+ :\n+ eval 'echo T'\n++ echo T\n"
+  ],
+  "bash52": [
+   0,
+   "T\n",
+   "+ trap 'eval \"echo T\"' EXIT\n+ :\n+ eval 'echo T'\n++ echo T\n"
+  ]
+ },
+ {
+  "id": "f-funsub",
+  "file": false,
+  "script": "set -x; echo ${ echo fs; }",
+  "bash53": [
+   0,
+   "fs\n",
+   "++ echo fs\n+ echo fs\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: ${ echo fs; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-funsub",
+  "file": true,
+  "script": "set -x; echo ${ echo fs; }",
+  "bash53": [
+   0,
+   "fs\n",
+   "++ echo fs\n+ echo fs\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: ${ echo fs; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-valsub",
+  "file": false,
+  "script": "set -x; echo ${| REPLY=v; }",
+  "bash53": [
+   0,
+   "v\n",
+   "++ REPLY=v\n+ echo v\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: ${| REPLY=v; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-valsub",
+  "file": true,
+  "script": "set -x; echo ${| REPLY=v; }",
+  "bash53": [
+   0,
+   "v\n",
+   "++ REPLY=v\n+ echo v\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: ${| REPLY=v; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-funsub-nested",
+  "file": false,
+  "script": "set -x; echo ${ echo ${ echo in; }; }",
+  "bash53": [
+   0,
+   "in\n",
+   "+++ echo in\n++ echo in\n+ echo in\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: ${ echo ${ echo in; }; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-funsub-nested",
+  "file": true,
+  "script": "set -x; echo ${ echo ${ echo in; }; }",
+  "bash53": [
+   0,
+   "in\n",
+   "+++ echo in\n++ echo in\n+ echo in\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: ${ echo ${ echo in; }; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-funsub-in-eval",
+  "file": false,
+  "script": "set -x; eval 'echo ${ echo e; }'",
+  "bash53": [
+   0,
+   "e\n",
+   "+ eval 'echo ${ echo e; }'\n+++ echo e\n++ echo e\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ eval 'echo ${ echo e; }'\nbash: line 1: ${ echo e; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-funsub-in-eval",
+  "file": true,
+  "script": "set -x; eval 'echo ${ echo e; }'",
+  "bash53": [
+   0,
+   "e\n",
+   "+ eval 'echo ${ echo e; }'\n+++ echo e\n++ echo e\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "+ eval 'echo ${ echo e; }'\n./s.sh: line 1: ${ echo e; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-comsub",
+  "file": false,
+  "script": "set -x; echo $(echo cs)",
+  "bash53": [
+   0,
+   "cs\n",
+   "++ echo cs\n+ echo cs\n"
+  ],
+  "bash52": [
+   0,
+   "cs\n",
+   "++ echo cs\n+ echo cs\n"
+  ]
+ },
+ {
+  "id": "f-comsub",
+  "file": true,
+  "script": "set -x; echo $(echo cs)",
+  "bash53": [
+   0,
+   "cs\n",
+   "++ echo cs\n+ echo cs\n"
+  ],
+  "bash52": [
+   0,
+   "cs\n",
+   "++ echo cs\n+ echo cs\n"
+  ]
+ },
+ {
+  "id": "f-funsub-function",
+  "file": false,
+  "script": "set -x; f() { echo ff; }; echo ${ f; }",
+  "bash53": [
+   0,
+   "ff\n",
+   "++ f\n++ echo ff\n+ echo ff\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "bash: line 1: ${ f; }: bad substitution\n"
+  ]
+ },
+ {
+  "id": "f-funsub-function",
+  "file": true,
+  "script": "set -x; f() { echo ff; }; echo ${ f; }",
+  "bash53": [
+   0,
+   "ff\n",
+   "++ f\n++ echo ff\n+ echo ff\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: ${ f; }: bad substitution\n"
+  ]
+ }
+]

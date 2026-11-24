@@ -1553,9 +1553,53 @@ fn trace(
 		lines.push(body);
 	}
 	if !s.argv.is_empty() {
+		// A declaration builtin's compound assignment (`declare -a a=(1 2)`)
+		// is made before the builtin runs, traced as bash's
+		// `do_assignment_internal` shows it (`a=('1' '2')`), and the
+		// builtin gets the bare name (`declare -a a`).
+		let mut argv = s.argv.clone();
+		for &i in &s.compound {
+			let Some(word) = argv.get_mut(i as usize) else {
+				continue;
+			};
+			let Some(eq) = word.iter().position(|&c| c == b'=') else {
+				continue;
+			};
+			lines.push(word.to_vec());
+			let name = eq - usize::from(eq > 0 && word[eq - 1] == b'+');
+			word.truncate(name);
+		}
 		let mut body = Vec::new();
-		xtrace::push_words(&mut body, &s.argv, utf8);
+		xtrace::push_words(&mut body, &argv, utf8);
 		lines.push(body);
+		// `export` and `readonly` make each `name=value` operand an
+		// assignment of their own (bash's `do_word_assignment`), traced
+		// after the command.
+		if matches!(argv[0].as_slice(), b"export" | b"readonly") {
+			let mut options = true;
+			for (i, w) in argv.iter().enumerate().skip(1) {
+				if options && w.starts_with(b"-") {
+					options = w.as_slice() != b"--";
+					continue;
+				}
+				options = false;
+				if s.compound.contains(&(i as u32)) {
+					continue;
+				}
+				let Some(eq) = w.iter().position(|&c| c == b'=') else {
+					continue;
+				};
+				let append = eq > 0 && w[eq - 1] == b'+';
+				let name = &w[..eq - usize::from(append)];
+				if !super::is_ident(name) {
+					continue;
+				}
+				let mut body = Vec::new();
+				let value = AssignValue::Scalar(BString::from(&w[eq + 1..]));
+				xtrace::push_assign(&mut body, name, None, append, &value, utf8);
+				lines.push(body);
+			}
+		}
 	}
 	for body in lines {
 		xtrace::emit(k, cx, vp, line, &body);
