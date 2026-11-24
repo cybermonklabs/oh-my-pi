@@ -2,7 +2,9 @@
 # The TypeScript rows, in the tree after `bun install` with the natives job's addon in
 # packages/natives/native (the only addon a workspace load reads). Each `bun test` runs as the gate
 # kit ran it (kit-tsx driver.sh): env -i with bun on PATH and a fresh HOME, stdin /dev/null, a JUnit
-# report; sc.py bun reads it with bun's own summary line.
+# report; sc.py bun reads it with bun's own summary line. A failed test that known-failures.txt
+# names `flaky: ` runs again alone (its file, -t its name), at most twice, until it passes; the
+# summary reads its failure KNOWN only when a retry passed.
 #   ts.sh small           the suites sc.py's TS_SMALL lists, one after another
 #   ts.sh ca SHARD        coding-agent --isolate, the files whose index (sorted) mod N is SHARD - 1
 #   ts.sh checkts         bun run check:ts
@@ -32,6 +34,22 @@ one() { # <row> <unit> <dir> <bound seconds> <bun test args...>
 	python3 "$tool/sc.py" bun "$junit" "$log" "$rc" "$secs" "$row" "$unit" > "$SC/res/$safe.json"
 	echo "BUN $row $unit exit=$rc ${secs}s $(grep -E '^Ran [0-9]+ tests? across' "$log" | tail -n 1)"
 	grep -E '^\(fail\)' "$log" | head -n 40 || true
+	local t file pat try rj got
+	while IFS= read -r t; do
+		[ -n "$t" ] || continue
+		IFS=$'\t' read -r _ _ file pat < <(python3 "$tool/sc.py" junit-test "$junit" "$t") || continue
+		for try in 1 2; do
+			rj=$SC/res/logs/$safe.retry$try.$(printf '%s' "$t" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-80).xml
+			home=$(mktemp -d)
+			(cd "$SC_TREE/$dir" && timeout -k 10 600 env -i PATH="$(dirname "$bun"):/usr/bin:/bin" HOME="$home" \
+				${chrome_env[@]+"${chrome_env[@]}"} "$bun" test --reporter=junit --reporter-outfile="$rj" "./$file" -t "$pat" < /dev/null) \
+				>> "$SC/res/logs/$safe.retries.txt" 2>&1
+			rm -rf "${home:?}"
+			got=$(python3 "$tool/sc.py" retried "$SC/res/$safe.json" "$t" "$rj")
+			echo "RETRY $row $unit $t: try $try of 2: $got"
+			[ "$got" = pass ] && break
+		done
+	done < <(python3 "$tool/sc.py" flaky-failed "$SC/res/$safe.json" "$tool/known-failures.txt")
 }
 
 case $mode in

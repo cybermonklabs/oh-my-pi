@@ -4,11 +4,18 @@
 # (then it is UNKNOWN). An entry whose test passed or no longer exists is listed in the summary to
 # be removed, and the summary job fails until it is, so the list only shrinks.
 # A flaky entry, whose reason starts with `flaky: `, names a test that fails in some runs and passes
-# in others: it reads KNOWN when it fails and is not listed for removal when it passes (it still is
-# when its test no longer exists).
+# in others. When it fails, its job runs it again alone by name (set.sh: at most twice, as the same
+# user, from the same binary); its failure reads KNOWN only when a retry passed, and NEW when every
+# try failed. It is not listed for removal when it passes (it still is when its test no longer exists).
 # A unit of `*` names the test in any unit of its row: a coding-agent shard holds the test files
 # whose sorted index mod 10 is the shard's, so a file added before a test moves it to another shard.
-# One per line, tab-separated: <row> <user> <unit> <test> <reason>.
+# A known self-skip, whose reason starts with `skips: `, has a sixth field: the start of the skip
+# line the test prints (each `{...}` any text). A test that skipped itself reads KNOWN when each of
+# its skip lines starts as an entry of its row, user and test says; one user's entry never covers
+# the other user, and a unit with any other self-skip (not passed as the other user) is UNKNOWN.
+# An entry whose test ran without skipping itself, or printed no line that starts so, is listed
+# for removal.
+# One per line, tab-separated: <row> <user> <unit> <test> <reason> [<skip line start>].
 # Rows: set-runner, set-root, builtins, workspace, ts-small, ts-ca (sc.py ROWS).
 # Source: runs 45245119907 (509a2d77) and 45245136412 (a72018dd); red at both trees.
 set-root	root	pi-shell::zsh_comp_pty	ambiguous_prefix_with_listambiguous	root's zsh prompt ends in '#', and the test waits for '%' (zsh_comp_pty.rs:116): a harness assumption in zsh mode; no fix planned
@@ -62,6 +69,7 @@ set-runner	runner	pi-shell::zsh_jobs_pty	a_suspended_loop_takes_the_rest_of_the_
 set-runner	runner	pi-shell::zsh_mod_zpty	zsh_mod_zpty_non_blocking_read_takes_what_is_there	flaky: a race in Cut8 itself (12/30 vs 18/30 on gVisor)
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_digest_and_listing_match_zsh	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
 set-runner	runner	pi-shell::zsh_zcompile	zcompile_lists_dumps_zsh_wrote	the runner's zsh refuses the .zwc obash writes ("can't open file" / "invalid zwc file")
+ts-ca	runner	*	PDF page screenshots in Chromium::paints each requested image-only page instead of the empty viewer	flaky: timed out rendering PDF page 1 (read-pdf.ts:151) in 1 of 4 full coding-agent runs (45287678343); passed 20 of 20 alone at 509a2d77 and a72018dd, 10 on Chrome for Testing 150.0.7871.24 and 10 on the runner's Chrome 157
 ts-ca	runner	*	browser WebMCP helpers::blames the Chrome version only when invokeTool itself is missing, not for another error saying something wasn't found	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
 ts-ca	runner	*	browser WebMCP helpers::cancels the page's tool invocation when the call is aborted	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)
 ts-ca	runner	*	browser WebMCP helpers::discovers, invokes, bounds trust, and reports native registrations	Chrome for Testing 150.0.7871.24, started with --enable-features=WebMCPTesting,DevToolsWebMCPSupport (launch.ts:640), gives pages no WebMCP: "Chrome does not expose WebMCP to this page" (webmcp.ts:380)

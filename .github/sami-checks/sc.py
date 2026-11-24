@@ -11,6 +11,10 @@
   sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout; exit 1 unless every row passed
   sc.py skip-forms TREE NOT_MARKERS        each print of TREE/crates that says skip is read or named (JSON)
   sc.py skip-lines RESULTS NOT_MARKERS     each skip line a passing test printed is read or named (JSON)
+  sc.py flaky-failed RESULT KNOWN          the failed tests of one result with a `flaky: ` entry, one a line
+  sc.py retried RESULT TEST REPORT         adds one retry's outcome (pass, skip or fail) to RESULT
+  sc.py junit-test JUNIT TEST              what runs TEST again alone: classname, name, file, name as a regex
+  sc.py junit-merge OUT JUNIT...           one JUnit report of several (nextest.sh's two passes)
   sc.py selftest                           the counters and the summary against hand-made inputs
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
@@ -19,8 +23,11 @@ with no JUnit report or no summary line, a command the time bound or a signal en
 the plan expects that no job reported, or that two jobs reported, are UNKNOWN, and so is every row
 they belong to. A test that passed after printing a skip marker compared nothing: it is counted
 apart, named, and its unit is UNKNOWN, unless each of its skip lines is a sub-case that
-partial-skips.txt lets that test skip and the entry's witness line is in its output; then it
-passes and is listed as partial. A test that started and never ended is named.
+partial-skips.txt lets that test skip and the entry's witness line is in its output (then it
+passes and is listed as partial), it passed as the other user, or known-failures.txt names each of
+its skip lines for that row and user (`skips: `; then it reads KNOWN). A test that started and
+never ended is named. A failure with a `flaky: ` entry reads KNOWN only when the test, run again
+alone in the same job (set.sh, at most twice), passed.
 """
 
 import json
@@ -197,7 +204,7 @@ def cmd_shard(who, n, k, meta, weights_path):
 
 
 def result(row, unit, who, status, exit_code, secs, passed=0, failed=0, ignored=0, failures=(), tests=(),
-           note="", self_skipped=(), partial=()):
+           note="", self_skipped=(), partial=(), skip_lines=None):
     return {
         "row": row,
         "unit": unit,
@@ -209,6 +216,9 @@ def result(row, unit, who, status, exit_code, secs, passed=0, failed=0, ignored=
         "failed": failed,
         "ignored": ignored,
         "self_skipped": list(self_skipped),
+        # The skip lines of each test in self_skipped (at most 20), which known-failures.txt's
+        # `skips: ` entries match.
+        "skip_lines": {n: list(ls[:20]) for n, ls in (skip_lines or {}).items()},
         "partial": [list(p) for p in partial],
         "failures": list(failures),
         "tests": [[n, round(t, 3)] for n, t in tests],
@@ -248,9 +258,9 @@ def partial_rules(path=PARTIAL_SKIPS):
 
 
 def skip_reading(name, out, rules):
-    """How a passing test's output reads: None when no line of it holds a skip marker; else (the
-    number of skip lines, the reason) when each skip line is printed by a literal the partial-skip list
-    lets this test skip and that entry's witness is in the output (a partial pass), else (n, None)."""
+    """How a passing test's output reads: None when no line of it holds a skip marker; else (its
+    skip lines, the reason) when each skip line is printed by a literal the partial-skip list lets
+    this test skip and that entry's witness is in the output (a partial pass), else (lines, None)."""
     lines = [l.strip() for l in out.splitlines() if SKIP_MARKER.search(l)]
     if not lines:
         return None
@@ -259,10 +269,10 @@ def skip_reading(name, out, rules):
     for l in lines:
         why = next((r for p, r in live if p.fullmatch(l)), None)
         if why is None:
-            return len(lines), None
+            return lines, None
         if why not in used:
             used.append(why)
-    return len(lines), "; ".join(used)
+    return lines, "; ".join(used)
 
 
 def skip_verdict(res):
@@ -300,7 +310,7 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
     """libtest's JSON events (-Z unstable-options --format json --report-time, --show-output).
     Text that is not an event (a child's or a thread's own writes) is ignored. libtest's
     `timeout` event is its 60 s warning, not a verdict: the test's own ok or failed comes later."""
-    started, ended, slow, times, failures, skipped, partial = set(), set(), set(), {}, [], [], []
+    started, ended, slow, times, failures, skipped, partial, skip_lines = set(), set(), set(), {}, [], [], [], {}
     passed = failed = ignored = 0
     suite_end = None
     rules = partial_rules(partial_path)
@@ -327,9 +337,10 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
                     passed += 1
                     k = skip_reading(name, ev.get("stdout") or "", rules)
                     if k and k[1]:
-                        partial.append((name, k[0], k[1]))
+                        partial.append((name, len(k[0]), k[1]))
                     elif k:
                         skipped.append(name)
+                        skip_lines[name] = k[0]
                 elif e == "ignored":
                     ignored += 1
                 else:
@@ -346,7 +357,7 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
 
     def r(status, note=""):
         return result(row, unit, who, status, exit_code, secs, passed, failed, ignored, failures, tests, note, skipped,
-                      partial)
+                      partial, skip_lines)
 
     if code not in (0, 101):
         note = f"exit {exit_code}: the binary did not finish"
@@ -368,9 +379,9 @@ def parse_libtest(log, exit_code, secs, row, unit, who, partial_path=PARTIAL_SKI
     return skip_verdict(res)
 
 
-def junit_cases(path):
-    """Each <testcase> once. bun nests a <testsuite> per describe block, so walking every suite's
-    cases would count a nested case once per enclosing suite."""
+def junit_testcases(path):
+    """(element, full name) of each <testcase> once. bun nests a <testsuite> per describe block, so
+    walking every suite's cases would count a nested case once per enclosing suite."""
     root = ET.parse(path).getroot()
     parent = {c: p for p in root.iter() for c in p}
     for case in root.iter("testcase"):
@@ -379,7 +390,12 @@ def junit_cases(path):
         if not cls:
             p = parent.get(case)
             cls = p.get("name", "") if p is not None and p.tag == "testsuite" else ""
-        full = f"{cls}::{name}" if cls and not name.startswith(cls) else name
+        yield case, (f"{cls}::{name}" if cls and not name.startswith(cls) else name)
+
+
+def junit_cases(path):
+    """(full name, ok/failed/skipped, seconds, output) of each <testcase> once."""
+    for case, full in junit_testcases(path):
         t = float(case.get("time") or 0)
         if case.find("skipped") is not None:
             kind = "skipped"
@@ -389,6 +405,31 @@ def junit_cases(path):
             kind = "ok"
         out = "".join((e.text or "") for e in case if e.tag in ("system-out", "system-err"))
         yield full, kind, t, out
+
+
+def junit_test(path, test):
+    """What runs `test` of a JUnit report again alone: its classname (nextest: the binary id), its
+    own name (nextest: the test's path in its binary), its file (bun) and its own name as a JavaScript
+    regex (bun test -t). None when the report has no such test."""
+    for case, full in junit_testcases(path):
+        if full == test:
+            name = case.get("name", "")
+            return case.get("classname", ""), name, case.get("file", ""), re.sub(r"[.*+?^${}()|[\]\\/]", r"\\\g<0>", name)
+    return None
+
+
+def junit_merge(out, paths):
+    """One JUnit report of several (nextest.sh's two passes): every <testsuite> of each under one
+    <testsuites>. Each input must exist and parse; else nothing is written, and the unit has no
+    report (UNKNOWN). Returns the number of test cases written."""
+    if os.path.exists(out):
+        os.remove(out)
+    merged = ET.Element("testsuites")
+    for p in paths:
+        root = ET.parse(p).getroot()
+        merged.extend(root.findall("testsuite") if root.tag == "testsuites" else [root])
+    ET.ElementTree(merged).write(out, encoding="unicode")
+    return sum(1 for _ in merged.iter("testcase"))
 
 
 def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits, partial_path=PARTIAL_SKIPS):
@@ -406,18 +447,19 @@ def parse_junit(junit, exit_code, secs, row, unit, who, ok_exits, fail_exits, pa
     failures = [c[0] for c in cases if c[1] == "failed"]
     ignored = sum(1 for c in cases if c[1] == "skipped")
     rules = partial_rules(partial_path)
-    skipped, partial = [], []
+    skipped, partial, skip_lines = [], [], {}
     for c in cases:
         k = skip_reading(c[0], c[3], rules) if c[1] == "ok" else None
         if k and k[1]:
-            partial.append((c[0], k[0], k[1]))
+            partial.append((c[0], len(k[0]), k[1]))
         elif k:
             skipped.append(c[0])
+            skip_lines[c[0]] = k[0]
     tests = [(c[0], c[2]) for c in cases if c[1] != "skipped"]
 
     def r(s, note=""):
         return result(row, unit, who, s, exit_code, secs, passed, len(failures), ignored, failures, tests, note, skipped,
-                      partial)
+                      partial, skip_lines)
 
     if code not in ok_exits + fail_exits:
         return r("UNKNOWN", f"exit {exit_code}: the run did not finish")
@@ -506,18 +548,34 @@ def fmt_secs(s):
     return f"{s / 60:.1f} min" if s >= 90 else f"{s:.0f} s"
 
 
-def read_known(path):
-    """known-failures.txt: (row, user, unit, test) -> reason. A unit of `*` is any unit of the row."""
-    known = {}
+def known_rows(path):
+    """known-failures.txt's entries as lists of fields: five, or six for a `skips: ` entry."""
+    rows = []
     if path and os.path.exists(path):
         for line in open(path, encoding="utf-8"):
             if not line.strip() or line.startswith("#"):
                 continue
             f = line.rstrip("\n").split("\t")
-            if len(f) != 5:
-                sys.exit(f"known-failures.txt: not five tab-separated fields: {line!r}")
-            known[tuple(f[:4])] = f[4]
-    return known
+            if len(f) != (6 if len(f) > 4 and f[4].startswith("skips: ") else 5):
+                sys.exit(f"known-failures.txt: not five tab-separated fields (six for `skips: `): {line!r}")
+            rows.append(f)
+    return rows
+
+
+def read_known(path):
+    """known-failures.txt's failures: (row, user, unit, test) -> reason. A unit of `*` is any unit
+    of the row."""
+    return {tuple(f[:4]): f[4] for f in known_rows(path) if len(f) == 5}
+
+
+def read_known_skips(path):
+    """known-failures.txt's known self-skips: (row, user, unit, test) -> [(the skip line's start as
+    a pattern, each `{...}` any text; the reason; the start as written)]."""
+    skips = {}
+    for f in known_rows(path):
+        if len(f) == 6:
+            skips.setdefault(tuple(f[:4]), []).append((literal_pattern(f[5]), f[4][len("skips: "):], f[5]))
+    return skips
 
 
 def known_reason(known, row, who, unit, test):
@@ -526,6 +584,23 @@ def known_reason(known, row, who, unit, test):
     moves to another shard when a file is added before it). None when the list does not name it."""
     why = known.get((row, who, unit, test))
     return why if why is not None else known.get((row, who, "*", test))
+
+
+def known_skip(skips, row, who, unit, test, lines):
+    """The reason the known-failure list gives for a test that skipped itself: each of its skip lines
+    starts as one of the test's `skips: ` entries for this row and user (unit or `*`) says. None when
+    a line matches none, or no skip line was kept."""
+    entries = skips.get((row, who, unit, test), []) + skips.get((row, who, "*", test), [])
+    if not entries or not lines:
+        return None
+    used = []
+    for line in lines:
+        why = next((w for p, w, _ in entries if p.match(line)), None)
+        if why is None:
+            return None
+        if why not in used:
+            used.append(why)
+    return "; ".join(used)
 
 
 def rust_literals(text):
@@ -712,8 +787,64 @@ def cmd_skip_lines(results_dir, exceptions_path):
     return result("skipforms", "runtime", "runner", status, 0, 0, int(status == "PASS"), len(fails), failures=fails, note=note)
 
 
+def flaky_failed(result_path, known_path):
+    """The failed tests of one result that the known-failure list names `flaky: ` for its row,
+    user and unit (or `*`): set.sh runs each again by name, at most twice."""
+    r = json.load(open(result_path, encoding="utf-8"))
+    known = read_known(known_path)
+    return [f for f in r["failures"]
+            if (known_reason(known, r["row"], r["who"], r["unit"], f) or "").startswith("flaky: ")]
+
+
+def record_retry(result_path, test, report):
+    """Reads one retry of a test run again alone by name (a libtest log, or a JUnit report: nextest,
+    bun) and adds its outcome to the result's `retries` for the test: `pass`, `skip` (it passed
+    after a skip marker, or was skipped) or `fail` (it failed, did not end, or is not in the report).
+    Returns the outcome."""
+    outcome = "fail"
+    if report.endswith(".xml"):
+        try:
+            for name, kind, _, out in junit_cases(report):
+                if name == test:
+                    outcome = ("fail" if kind == "failed" else "skip" if kind == "skipped" or SKIP_MARKER.search(out)
+                               else "pass")
+        except (OSError, ET.ParseError):
+            pass
+    else:
+        try:
+            lines = open(report, encoding="utf-8", errors="replace").read().splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            ev = libtest_event(line)
+            if ev and ev.get("type") == "test" and ev.get("name") == test and ev.get("event") in ("ok", "failed"):
+                outcome = "fail" if ev["event"] == "failed" else "skip" if SKIP_MARKER.search(ev.get("stdout") or "") else "pass"
+    r = json.load(open(result_path, encoding="utf-8"))
+    r.setdefault("retries", {}).setdefault(test, []).append(outcome)
+    json.dump(r, open(result_path, "w", encoding="utf-8"))
+    return outcome
+
+
 def cmd_summary(results_dir, build_dir, known_path=None):
     known = read_known(known_path)
+    skips = read_known_skips(known_path)
+
+    def failure_reason(r, row, f):
+        """(the reason, how the summary shows it) for failure f of result r; no reason when the
+        failure is NEW. A flaky entry gives its reason only when a retry of the test in the same job
+        passed (set.sh runs a failed test with a flaky entry again by name, at most twice)."""
+        why = known_reason(known, row, r["who"], r["unit"], f)
+        if why is None:
+            return None, "**NEW**"
+        if not why.startswith("flaky: "):
+            return why, f"KNOWN ({why})"
+        tries = r.get("retries", {}).get(f, [])
+        if "pass" in tries:
+            return why, f"KNOWN ({why}; it passed on retry {tries.index('pass') + 1} of {len(tries)})"
+        if not tries:
+            return None, f"**NEW** (listed as `{why}`, but no retry of it ran)"
+        return None, f"**NEW** (listed as `{why}`, but it failed {len(tries)} retr{'y' if len(tries) == 1 else 'ies'} too)"
+
     results = load_results(results_dir)
     got, dup = {}, set()
     for r in results:
@@ -738,7 +869,9 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                  "passing test printed a skip marker and passed as no other user (even when every failure of the "
                  "unit is known), or when no job (or more than one) reported it; its row is then UNKNOWN too. A test "
                  "whose only skip lines are sub-cases the partial-skip list names for it, with that entry's witness "
-                 "line in its output, passes and is listed as partial.")
+                 "line in its output, passes and is listed as partial. A self-skip the known-failure list names "
+                 "(`skips: `, for that row and user) reads KNOWN; a failure with a `flaky: ` entry reads KNOWN "
+                 "only when a retry of the test in the same job passed.")
     lines.append("")
     lines.append("| Row | Verdict | Units: pass / known / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
@@ -749,25 +882,36 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         rs = []
         for e in units:
             r = got.get(e)
-            open_ = []
+            unlisted = []
             if r is None:
                 r = result(key, e[1], e[2], "UNKNOWN", "-", 0, note="no result: its job reported nothing (it failed before its upload, did not run, or its upload was planted away)")
             elif e in dup:
                 r = dict(r, status="UNKNOWN", note="two jobs reported this unit")
             else:
+                # A self-skip is covered when the same test passed as the other user, and known when
+                # each of its skip lines is a `skips: ` entry of this row and user.
                 others = [w for w in SET_WHO if w != r["who"]]
                 open_ = [s for s in r.get("self_skipped", []) if not any(s in passed_as.get((r["unit"], w), ()) for w in others)]
+                listed = {}
+                for s in open_:
+                    why = known_skip(skips, key, r["who"], r["unit"], s, r.get("skip_lines", {}).get(s))
+                    if why is not None:
+                        listed[s] = why
+                unlisted = [s for s in open_ if s not in listed]
+                r = dict(r, known_skips=listed)
                 if r.get("skip_only") and r["status"] == "UNKNOWN":
-                    if open_:
-                        r = dict(r, note=f"{len(open_)} test(s) skipped themselves here and passed as no other user: " + ", ".join(open_[:12]))
+                    if unlisted:
+                        r["note"] = f"{len(unlisted)} test(s) skipped themselves here and passed as no other user: " + ", ".join(unlisted[:12])
+                    elif listed:
+                        r.update(status="KNOWN", note=f"{len(listed)} test(s) skipped themselves as the known-failure list says")
                     else:
-                        r = dict(r, status="PASS", note=f"{len(r['self_skipped'])} test(s) skipped themselves as {r['who']} and passed as {', '.join(others)}")
+                        r.update(status="PASS", note=f"{len(r['self_skipped'])} test(s) skipped themselves as {r['who']} and passed as {', '.join(others)}")
             # Known failures make a unit KNOWN only when nothing else is open: a test that skipped
-            # itself here and passed as no other user makes it UNKNOWN.
-            if r["status"] == "FAIL" and r["failures"] and all(known_reason(known, key, r["who"], r["unit"], f) is not None for f in r["failures"]):
-                if open_:
-                    r = dict(r, status="UNKNOWN", note=f"every failure is known, but {len(open_)} test(s) skipped themselves here "
-                                                       "and passed as no other user: " + ", ".join(open_[:12]))
+            # itself here, passed as no other user and is not a known skip makes it UNKNOWN.
+            if r["status"] == "FAIL" and r["failures"] and all(failure_reason(r, key, f)[0] for f in r["failures"]):
+                if unlisted:
+                    r = dict(r, status="UNKNOWN", note=f"every failure is known, but {len(unlisted)} test(s) skipped themselves here "
+                                                       "and passed as no other user: " + ", ".join(unlisted[:12]))
                 else:
                     r = dict(r, status="KNOWN")
             rs.append(r)
@@ -791,26 +935,26 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
             for f in r["failures"]:
-                why = known_reason(known, key, r["who"], r["unit"], f)
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: "
-                               + (f"KNOWN ({why})" if why is not None else "**NEW**"))
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}")
             for f in r.get("self_skipped", []):
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`")
+                why = r.get("known_skips", {}).get(f)
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`" + (f": KNOWN ({why})" if why else ""))
             for f, n, why in r.get("partial", []):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): `{f}`: partial: {n} sub-cases skipped ({why})")
     lines.append("")
     # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
     # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
     # neither: it stays, and so does a `*` entry while any unit of its row did not report. A flaky
-    # entry (its reason starts `flaky: `) is not listed when its test passed.
+    # entry (its reason starts `flaky: `) is not listed when its test passed. A `skips: ` entry is
+    # listed when its test ran without skipping itself, or printed no skip line that starts so.
+    def entry_results(row, who, unit):
+        if unit == "*":
+            return [got.get(e) for e in exp if e[0] == row and e[2] == who], "its row"
+        return [got.get((row, unit, who))], "its unit"
+
     stale = []
     for (row, who, unit, test), why in sorted(known.items()):
-        if unit == "*":
-            rs = [got.get(e) for e in exp if e[0] == row and e[2] == who]
-            where = "its row"
-        else:
-            rs = [got.get((row, unit, who))]
-            where = "its unit"
+        rs, where = entry_results(row, who, unit)
         if not rs or any(r is None or r["status"] == "UNKNOWN" or test in r["failures"] for r in rs):
             continue
         names = {n for r in rs for n, _ in r["tests"]}
@@ -818,9 +962,26 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             continue
         stale.append(f"- `{unit}` ({who}) `{test}`: " + ("passed" if test in names else f"no longer in {where}")
                      + f" (listed for: {why})")
+    for (row, who, unit, test), entries in sorted(skips.items()):
+        rs, where = entry_results(row, who, unit)
+        if not rs or any(r is None or (r["status"] == "UNKNOWN" and not r.get("skip_only")) or test in r["failures"]
+                         for r in rs):
+            continue
+        names = {n for r in rs for n, _ in r["tests"]}
+        printed = [line for r in rs for line in r.get("skip_lines", {}).get(test, [])]
+        for pattern, why, start in entries:
+            if test not in names:
+                gone = f"no longer in {where}"
+            elif not printed:
+                gone = "ran without skipping itself"
+            elif not any(pattern.match(line) for line in printed):
+                gone = "printed no skip line that starts so"
+            else:
+                continue
+            stale.append(f"- `{unit}` ({who}) `{test}`: {gone} (listed: skips `{start}`: {why})")
     if stale:
         all_ok = False
-        lines.append("### Known-failure entries to remove (their test did not fail)")
+        lines.append("### Known-failure entries to remove (their test did not fail or skip itself so)")
         lines.append("")
         lines.extend(stale)
         lines.append("")
@@ -932,6 +1093,16 @@ def selftest():
                 'name="b" time="1"/></testsuite></testsuite></testsuite></testsuites>')
     r = parse_junit(jn, "100", 1, "b", "u", "r", (0,), (100,))
     check("JUnit nested suites count each case once", (r["passed"], r["failed"], r["failures"]), (1, 1, ["outer::a"]))
+    # nextest.sh's two passes: one report of both, and none when a pass left no report.
+    jm = os.path.join(d, "merged.xml")
+    r = parse_junit(jm, "100", 1, "b", "u", "r", (0,), (100,)) if junit_merge(jm, [ju, js]) == 4 else {}
+    check("JUnit merge of two passes", (r.get("failures"), r.get("ignored"), r.get("self_skipped")),
+          (["pi-builtins::t2"], 1, ["p::t1"]))
+    try:
+        junit_merge(jm, [ju, os.path.join(d, "no-pass2.xml")])
+    except OSError:
+        pass
+    check("JUnit merge with a missing pass writes nothing", os.path.exists(jm), False)
     blog = os.path.join(d, "b.log")
     with open(blog, "w") as f:
         f.write("(pass) x\n")
@@ -1108,18 +1279,94 @@ def selftest():
     open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tp\tfixed since\n")
     rc, out = summary()
     check("a listed test that passed is to be removed", ("`p`: passed (listed for: fixed since)" in out, rc), (True, 1))
-    # A flaky entry (its reason starts `flaky: `) is KNOWN when its test fails and is not listed for
-    # removal when it passes; it is listed when its test is no longer in its unit.
+    # A flaky entry (its reason starts `flaky: `): its failure reads KNOWN only when a retry of the
+    # test in the same job passed, and NEW when no retry ran or every try failed (CiReview at
+    # 55a3d02c: a test that failed in every run read KNOWN). It is not listed for removal when its test
+    # passed, and is when its test is no longer in its unit.
     open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tflaky: a race\n"
                                 "set-runner\trunner\tpi-shell::zle_pty\tp\tflaky: a race\n")
     rc, out = summary()
-    check("a flaky entry: KNOWN when it fails, kept when it passed",
-          ("FAILED `k`: KNOWN (flaky: a race)" in out, "`p`: passed" in out, "| pi-shell set (runner) | **KNOWN** |" in out, rc),
-          (True, False, True, 0))
+    check("a flaky failure with no retry", ("FAILED `k`: **NEW** (listed as `flaky: a race`, but no retry of it ran)" in out, rc),
+          (True, 1))
+    json.dump(dict(zle_runner, retries={"k": ["fail", "pass"]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure that passed on a retry",
+          ("FAILED `k`: KNOWN (flaky: a race; it passed on retry 2 of 2)" in out, "`p`: passed" in out,
+           "| pi-shell set (runner) | **KNOWN** |" in out, rc), (True, False, True, 0))
+    json.dump(dict(zle_runner, retries={"k": ["fail", "fail"]}), open(os.path.join(res, "zle-runner.json"), "w"))
+    rc, out = summary()
+    check("a flaky failure that failed every try",
+          ("FAILED `k`: **NEW** (listed as `flaky: a race`, but it failed 2 retries too)" in out,
+           "| pi-shell set (runner) | **FAIL** |" in out, rc), (True, True, 1))
+    json.dump(dict(zle_runner, retries={"k": ["pass"]}), open(os.path.join(res, "zle-runner.json"), "w"))
     open(known_file, "a").write("set-runner\trunner\tpi-shell::zle_pty\tgone\tflaky: a race\n")
     rc, out = summary()
     check("a flaky entry whose test left its unit is to be removed",
           ("`gone`: no longer in its unit (listed for: flaky: a race)" in out, rc), (True, 1))
+    json.dump(zle_runner, open(os.path.join(res, "zle-runner.json"), "w"))
+    # set.sh's retries: flaky_failed names the failed tests with a flaky entry, and record_retry adds
+    # one retry's outcome from its log (an event after other text on its line counts).
+    rj, rl = os.path.join(d, "retry.json"), os.path.join(d, "retry.log")
+    json.dump(result("set-runner", "pi-shell::zle_pty", "runner", "FAIL", 101, 1, failed=2, failures=["k", "q"]), open(rj, "w"))
+    open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tflaky: a race\n"
+                                "set-runner\trunner\tpi-shell::zle_pty\tq\tthe host\n")
+    check("flaky_failed", flaky_failed(rj, known_file), ["k"])
+    open(rl, "w").write(json.dumps({"type": "test", "event": "failed", "name": "k"}) + "\n")
+    o1 = record_retry(rj, "k", rl)
+    open(rl, "w").write("test k ... " + json.dumps({"type": "test", "event": "ok", "name": "k", "stdout": ""}) + "\n")
+    o2 = record_retry(rj, "k", rl)
+    check("record_retry", (o1, o2, json.load(open(rj))["retries"]), ("fail", "pass", {"k": ["fail", "pass"]}))
+    # nextest's and bun's retries: junit_test gives what runs a test again alone, and record_retry
+    # reads the retry's JUnit report.
+    jb = os.path.join(d, "bun-retry.xml")
+    open(jb, "w").write('<testsuites><testsuite name="test/x.test.ts"><testsuite name="PDF pages"><testcase '
+                        'name="paints (each) page." classname="PDF pages" file="test/x.test.ts"/></testsuite></testsuite></testsuites>')
+    check("junit_test, nextest", junit_test(ju, "pi-builtins::t2"), ("pi-builtins", "t2", "", "t2"))
+    check("junit_test, bun", junit_test(jb, "PDF pages::paints (each) page."),
+          ("PDF pages", "paints (each) page.", "test/x.test.ts", r"paints \(each\) page\."))
+    check("record_retry from a JUnit report", (record_retry(rj, "PDF pages::paints (each) page.", jb),
+          record_retry(rj, "pi-builtins::t2", ju), record_retry(rj, "absent", jb)), ("pass", "fail", "fail"))
+    # Known self-skips (`skips: `, a sixth field: the skip line's start): a self-skip reads KNOWN only
+    # when each of its lines starts as an entry of its row and user says; one user's entry never
+    # covers the other user.
+    def bx(who, skipped, lines):
+        return dict(result("builtins", "pi-builtins", who, "UNKNOWN", 0, 1, passed=1,
+                           tests=[("a", 1.0)] + [(s, 1.0) for s in skipped], self_skipped=skipped,
+                           skip_lines={s: lines for s in skipped}), skip_only=True)
+
+    json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root"]), open(os.path.join(res, "b-runner.json"), "w"))
+    json.dump(bx("root", ["c"], ["c --reflink a b: skipped, this filesystem does not clone (x)"]),
+              open(os.path.join(res, "b-root.json"), "w"))
+    zle_k = "set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n"
+    need_root = "builtins\trunner\tpi-builtins\tc\tskips: it needs root\tc {} a b: skipped, it needs root\n"
+    no_clone = "builtins\troot\tpi-builtins\tc\tskips: no clone here\tc --reflink a b: skipped, this filesystem does not clone\n"
+    open(known_file, "w").write(zle_k + need_root)
+    rc, out = summary()
+    check("a known skip for one user only", ("SKIPPED ITSELF `c`: KNOWN (it needs root)" in out,
+          "| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, True, 1))
+    open(known_file, "a").write(no_clone)
+    rc, out = summary()
+    check("a known skip for each user", ("| pi-builtins, nextest default profile | **KNOWN** |" in out, rc), (True, 0))
+    open(known_file, "w").write(zle_k + need_root.replace("builtins\trunner", "builtins\troot") + no_clone)
+    rc, out = summary()
+    check("a known skip listed for the other user", ("`pi-builtins` (runner): UNKNOWN: 1 test(s) skipped themselves" in out, rc),
+          (True, 1))
+    open(known_file, "w").write(zle_k + need_root.replace("builtins", "workspace", 1) + no_clone)
+    rc, out = summary()
+    check("a known skip listed for another row", ("`pi-builtins` (runner): UNKNOWN: 1 test(s) skipped themselves" in out, rc),
+          (True, 1))
+    open(known_file, "w").write(zle_k + need_root + no_clone)
+    json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root", "c -p a b: skipped, no FIFO"]),
+              open(os.path.join(res, "b-runner.json"), "w"))
+    rc, out = summary()
+    check("a self-skip with one line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 1))
+    json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root"]), open(os.path.join(res, "b-runner.json"), "w"))
+    open(known_file, "a").write("builtins\trunner\tpi-builtins\ta\tskips: stale\ta: skipped\n")
+    rc, out = summary()
+    check("a known skip whose test ran without skipping itself is to be removed",
+          ("`a`: ran without skipping itself (listed: skips `a: skipped`: stale)" in out, rc), (True, 1))
+    json.dump(nx("runner", ["c"], ["a"]), open(os.path.join(res, "b-runner.json"), "w"))
+    json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
     # A `*` entry names its test in any unit of its row (a coding-agent shard moves when a file is added).
     for f in os.listdir(res):
         r = json.load(open(os.path.join(res, f)))
@@ -1246,6 +1493,17 @@ def main(argv):
         print(json.dumps(cmd_skip_forms(*a)))
     elif c == "skip-lines":
         print(json.dumps(cmd_skip_lines(*a)))
+    elif c == "flaky-failed":
+        print("\n".join(flaky_failed(*a)))
+    elif c == "retried":
+        print(record_retry(*a))
+    elif c == "junit-merge":
+        print(f"{junit_merge(a[0], a[1:])} test cases in {a[0]}")
+    elif c == "junit-test":
+        t = junit_test(*a)
+        if t is None:
+            sys.exit(f"{a[0]} has no test {a[1]!r}")
+        print("\t".join(t))
     elif c == "selftest":
         selftest()
     else:

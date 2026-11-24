@@ -4,7 +4,10 @@
 # runner's user or as root, --test-threads=4, with the hang bound SC_BIN_BOUND (seconds) per
 # binary. libtest reports in JSON (nightly's -Z unstable-options --format json --report-time),
 # with each passing test's output (--show-output) so sc.py libtest can see a test that skipped
-# itself. Writes $SC/res/<unit>.json and $SC/res/logs/.
+# itself. A failed test that known-failures.txt names `flaky: ` for this row, user and binary runs
+# again alone by name, as the same user from the same binary, at most twice, until it passes; the
+# summary reads its failure KNOWN only when a retry passed. Writes $SC/res/<unit>.json and
+# $SC/res/logs/.
 #   set.sh WHO SHARD
 # Nothing is built here; the archive was unpacked at $GITHUB_WORKSPACE, the path it was built at.
 set -uo pipefail
@@ -24,6 +27,16 @@ mkdir -p "$home"
 envv=(HOME="$home" USER="$who" LOGNAME="$who" TMPDIR="$tmp" PATH="$SC_TEST_PATH" RUST_BACKTRACE=1
 	RSYNC_REFERENCE_REQUIRED=1 PI_TEST_STICKY_FIFO="$SC_STICKY_FIFO"
 	CARGO_PKG_NAME=pi-shell CARGO_MANIFEST_DIR="$SC_TREE/crates/pi-shell")
+run() { # <log> <libtest args...>: $bin as this shard's user, in the tests' environment
+	local out=$1
+	shift
+	local cmd=(timeout --verbose -k 10 "$SC_BIN_BOUND" "$bin" -Z unstable-options --format json --report-time --show-output "$@")
+	if [ "$who" = root ]; then
+		(cd "$SC_TREE/crates/pi-shell" && sudo env -i "${envv[@]}" "${cmd[@]}") > "$out" 2>&1 < /dev/null
+	else
+		(cd "$SC_TREE/crates/pi-shell" && env -i "${envv[@]}" "${cmd[@]}") > "$out" 2>&1 < /dev/null
+	fi
+}
 n=0
 while IFS=$'\t' read -r ident bin; do
 	n=$((n + 1))
@@ -34,16 +47,21 @@ while IFS=$'\t' read -r ident bin; do
 		continue
 	fi
 	s=$(date +%s.%N)
-	cmd=(timeout --verbose -k 10 "$SC_BIN_BOUND" "$bin" -Z unstable-options --format json --report-time --show-output --test-threads=4)
-	if [ "$who" = root ]; then
-		(cd "$SC_TREE/crates/pi-shell" && sudo env -i "${envv[@]}" "${cmd[@]}") > "$log" 2>&1 < /dev/null
-	else
-		(cd "$SC_TREE/crates/pi-shell" && env -i "${envv[@]}" "${cmd[@]}") > "$log" 2>&1 < /dev/null
-	fi
+	run "$log" --test-threads=4
 	rc=$?
 	secs=$(python3 -c "import time; print(f'{time.time() - $s:.1f}')")
 	python3 "$tool/sc.py" libtest "$log" "$rc" "$secs" "set-$who" "$ident" "$who" > "$SC/res/$safe.json"
 	echo "BIN $ident $who exit=$rc ${secs}s $(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["status"], "passed", r["passed"], "failed", r["failed"], r["note"])' "$SC/res/$safe.json")"
+	while IFS= read -r t; do
+		[ -n "$t" ] || continue
+		for try in 1 2; do
+			rlog=$SC/res/logs/$safe.retry$try.$(printf '%s' "$t" | tr -c 'A-Za-z0-9_.-' '_').log
+			run "$rlog" --exact "$t" --test-threads=1
+			got=$(python3 "$tool/sc.py" retried "$SC/res/$safe.json" "$t" "$rlog")
+			echo "RETRY $ident $who $t: try $try of 2: $got"
+			[ "$got" = pass ] && break
+		done
+	done < <(python3 "$tool/sc.py" flaky-failed "$SC/res/$safe.json" "$tool/known-failures.txt")
 	# The one-process lib row is the runner's run of the lib binary in this shard: the same command.
 	if [ "$ident" = pi-shell ] && [ "$who" = runner ]; then
 		python3 "$tool/sc.py" libtest "$log" "$rc" "$secs" lib4 "$ident" "$who" > "$SC/res/lib4.json"
