@@ -11,6 +11,7 @@ import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { CompactionMethod } from "./compaction-methods";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
+import type { SubagentSpawnSpec } from "../task/spawn-spec";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
 import type { RuntimeIdentity } from "./runtime-identity";
 
@@ -318,6 +319,8 @@ export interface SessionInitEntry extends SessionEntryBase {
 	isolated?: boolean;
 	/** Work-pool yield items of the last model call; revival restores them so the yield tool matches. Absent when none. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/** Plain-data inputs the subagent was spawned with; a revive builds the session from them. Absent on older files, a seance consult and a `/tan` clone. */
+	spawnSpec?: SubagentSpawnSpec;
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */

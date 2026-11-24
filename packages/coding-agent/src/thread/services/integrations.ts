@@ -14,22 +14,25 @@
  *   worker with synchronous getters (`rpcSync`), since `resolveLocalRoot` reads them synchronously;
  *   a worker-side one reaches main as a snapshot of its current values.
  * - **Prepared extensions** (`"prepared-extension"`): a `PreparedExtension` crosses as its module
- *   path; the receiver re-imports the module on first bind, so the factory runs in the receiving
+ *   path and scope; the receiver re-imports the module on first bind, so the factory runs in the receiving
  *   thread against that thread's `ExtensionAPI`. Model providers such factories register in a
  *   worker are dropped by the worker's model-registry mirror: the parent bound the same prepared
  *   extensions to main's registry, which the mirror follows (see `./auth`).
  *
  * Main-side values that are plain functions (no type to match a codec on) are converted by
- * {@link bridgeIntegrationOptions} before an `ExecutorOptions` object crosses a link.
+ * {@link bridgeIntegrationOptions} before a run's options cross a link, and by
+ * {@link bridgePersistedReviveSpec} before a cold revive's live inputs do.
  */
 import type { TSchema } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { CustomTool } from "../../extensibility/custom-tools/types";
 import { importExtensionModule } from "../../extensibility/extensions/loader";
-import type { ExtensionFactory, PreparedExtension } from "../../extensibility/extensions/types";
+import type { ExtensionFactory, ExtensionScope, PreparedExtension } from "../../extensibility/extensions/types";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import { MCPManager, type MCPManagerApi, type MCPManagerGlobal, type MCPToolScope } from "../../mcp/manager";
-import type { ExecutorOptions } from "../../task/executor";
+import type { SubagentRunOptions } from "../../task/executor";
+import type { PersistedReviveSpec } from "../../task/persisted-revive";
+import { evalToolDescriptor } from "../../task/spawn-spec";
 import { isMainThread } from "../identity";
 import type { MainThreadLink, WorkerThreadLink } from "../protocol";
 import { type RpcCodec, type RpcServe, rpcSync } from "../rpc";
@@ -67,11 +70,12 @@ function isViewOf<TParams extends TSchema, TDetails>(
 }
 
 /**
- * Main side: the cross-thread form of a custom tool — its data fields plus `execute`/`onSession`
- * running on this thread, with the synchronous approval hooks marked {@link rpcSync}. Render and
- * describe hooks are dropped: only the main-thread UI renders tool calls. Cached on the tool, so
- * repeated sends export the same functions. `parameters` must be structured-clone data (JSON
- * schema); TypeBox symbol metadata does not cross.
+ * The cross-thread form of a custom tool — its data fields plus `execute`/`onSession` running on this
+ * thread, with the synchronous approval hooks marked {@link rpcSync}: built on main for a worker child's
+ * tools, and on a worker for the kernel tools of a parent homed there, which a cold revive on main takes.
+ * Render and describe hooks are dropped: only the main-thread UI renders tool calls. Cached on the tool,
+ * so repeated sends export the same functions. `parameters` must be structured-clone data (JSON schema);
+ * TypeBox symbol metadata does not cross.
  */
 export function toWorkerCustomTool<TParams extends TSchema, TDetails>(
 	tool: CustomTool<TParams, TDetails>,
@@ -114,11 +118,12 @@ export function toWorkerCustomTool<TParams extends TSchema, TDetails>(
 
 /**
  * Main side: convert the integration fields of `options` that cannot cross as-is into forms that
- * behave identically in a worker. Call once on the options a main-thread caller hands to a
- * worker-hosted `runSubprocess`; returns a shallow copy (other fields are untouched).
+ * behave identically in a worker. Call once on the options a main-thread `runSubprocess` hands to a
+ * worker-hosted run (its extension inputs already normalized); returns a shallow copy (other fields are untouched).
  *
  * - `extensionRoots`, `preparedSession.promptSuffix`: called synchronously by the child → `rpcSync`.
- * - `customTools`: {@link toWorkerCustomTool} views.
+ * - `customTools`: {@link toWorkerCustomTool} views, with each eval tool's descriptor in
+ *   `customToolDescriptors`: a view is a new object, so the worker cannot look the descriptor up.
  * - `parentTelemetry`: `toWorkerTelemetryConfig` (captures the active span as the child's parent, so
  *   call this inside the parent's `execute_tool task` context).
  *
@@ -126,8 +131,8 @@ export function toWorkerCustomTool<TParams extends TSchema, TDetails>(
  * classes (`mcpManager`, `localProtocolOptions`, `preloadedPreparedExtensions`, tool contexts);
  * `perCallModelGrants` crosses intact (its `settings` becomes the worker's live mirror).
  */
-export function bridgeIntegrationOptions(options: ExecutorOptions): ExecutorOptions {
-	const bridged: ExecutorOptions = { ...options };
+export function bridgeIntegrationOptions(options: SubagentRunOptions): SubagentRunOptions {
+	const bridged: SubagentRunOptions = { ...options };
 	const extensionRoots = options.extensionRoots;
 	if (extensionRoots) bridged.extensionRoots = rpcSync(() => extensionRoots());
 	const seance = options.preparedSession;
@@ -138,9 +143,38 @@ export function bridgeIntegrationOptions(options: ExecutorOptions): ExecutorOpti
 			promptSuffix: rpcSync((resolvedModel?: string) => promptSuffix(resolvedModel)),
 		};
 	}
-	if (options.customTools) bridged.customTools = options.customTools.map(tool => toWorkerCustomTool(tool));
+	if (options.customTools) {
+		bridged.customTools = options.customTools.map(tool => toWorkerCustomTool(tool));
+		const descriptors = options.customTools.flatMap(tool => evalToolDescriptor(tool) ?? []);
+		if (descriptors.length > 0) bridged.customToolDescriptors = descriptors;
+	}
 	if (options.parentTelemetry) bridged.parentTelemetry = toWorkerTelemetryConfig(options.parentTelemetry);
 	return bridged;
+}
+
+/**
+ * Main side: the cold revive of `spec`, its live inputs converted as {@link bridgeIntegrationOptions}
+ * converts a run's, for a worker-hosted `revivePersistedSubagent`: `extensionRoots` → `rpcSync`, custom
+ * tools → {@link toWorkerCustomTool} views (a call runs where the live parent's kernel lives: on main, or on
+ * the parent's worker through main), telemetry → `toWorkerTelemetryConfig`. The worker reads the spawn spec
+ * from the transcript, but for its settings overlay, which main checked and which crosses in `prepared` as the
+ * plain data it is; the other inputs cross through codecs and exported classes.
+ */
+export function bridgePersistedReviveSpec(spec: PersistedReviveSpec): PersistedReviveSpec {
+	const { live, customTools } = spec.prepared;
+	const extensionRoots = live.extensionRoots;
+	return {
+		...spec,
+		prepared: {
+			...spec.prepared,
+			live: {
+				...live,
+				extensionRoots: extensionRoots ? rpcSync(() => extensionRoots()) : undefined,
+				telemetry: live.telemetry ? toWorkerTelemetryConfig(live.telemetry) : undefined,
+			},
+			customTools: customTools.map(tool => toWorkerCustomTool(tool)),
+		},
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -210,6 +244,7 @@ const localProtocolOptionsCodec: RpcCodec<LocalProtocolOptions> = {
 
 interface WirePreparedExtension {
 	readonly path: string;
+	readonly scope: ExtensionScope;
 	readonly resolvedPath: string;
 	readonly error: string | null;
 	readonly loadable: boolean;
@@ -218,12 +253,25 @@ interface WirePreparedExtension {
 /** This thread's import of each extension module, by resolved path. */
 const extensionImports = new Map<string, Promise<PreparedExtension>>();
 
+/** Every extension scope: a wire value's scope is one of these, as a prepared extension's always is. */
+const EXTENSION_SCOPES: Readonly<Record<ExtensionScope, true>> = {
+	project: true,
+	user: true,
+	explicit: true,
+	inline: true,
+};
+
+function isExtensionScope(value: unknown): value is ExtensionScope {
+	return typeof value === "string" && Object.hasOwn(EXTENSION_SCOPES, value);
+}
+
 function isPreparedExtension(value: unknown): value is PreparedExtension {
 	if (typeof value !== "object" || value === null || Object.getPrototypeOf(value) !== Object.prototype) return false;
 	const factory: unknown = Reflect.get(value, "factory");
 	const error: unknown = Reflect.get(value, "error");
 	return (
 		typeof Reflect.get(value, "path") === "string" &&
+		isExtensionScope(Reflect.get(value, "scope")) &&
 		typeof Reflect.get(value, "resolvedPath") === "string" &&
 		(factory === null || typeof factory === "function") &&
 		(error === null || typeof error === "string")
@@ -231,11 +279,11 @@ function isPreparedExtension(value: unknown): value is PreparedExtension {
 }
 
 /** A factory that imports `resolvedPath` in the calling thread on first use and runs its export. */
-function threadLocalFactory(resolvedPath: string): ExtensionFactory {
+function threadLocalFactory(resolvedPath: string, scope: ExtensionScope): ExtensionFactory {
 	return async api => {
 		let pending = extensionImports.get(resolvedPath);
 		if (!pending) {
-			pending = importExtensionModule(resolvedPath, resolvedPath);
+			pending = importExtensionModule({ path: resolvedPath, scope }, resolvedPath);
 			extensionImports.set(resolvedPath, pending);
 		}
 		const prepared = await pending;
@@ -249,6 +297,7 @@ function isWirePreparedExtension(value: unknown): value is WirePreparedExtension
 		typeof value === "object" &&
 		value !== null &&
 		typeof Reflect.get(value, "path") === "string" &&
+		isExtensionScope(Reflect.get(value, "scope")) &&
 		typeof Reflect.get(value, "resolvedPath") === "string" &&
 		typeof Reflect.get(value, "loadable") === "boolean"
 	);
@@ -259,6 +308,7 @@ const preparedExtensionCodec: RpcCodec<PreparedExtension> = {
 	is: isPreparedExtension,
 	encode: prepared => ({
 		path: prepared.path,
+		scope: prepared.scope,
 		resolvedPath: prepared.resolvedPath,
 		error: prepared.error,
 		loadable: prepared.factory !== null,
@@ -267,9 +317,10 @@ const preparedExtensionCodec: RpcCodec<PreparedExtension> = {
 		if (!isWirePreparedExtension(data)) throw new Error("prepared-extension: malformed wire value");
 		return {
 			path: data.path,
+			scope: data.scope,
 			resolvedPath: data.resolvedPath,
 			error: data.error,
-			factory: data.loadable ? threadLocalFactory(data.resolvedPath) : null,
+			factory: data.loadable ? threadLocalFactory(data.resolvedPath, data.scope) : null,
 		};
 	},
 };

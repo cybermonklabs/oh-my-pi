@@ -19,7 +19,11 @@ import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-setting
 import { parseAgentFields } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
 import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
-import type { LoadExtensionsResult, PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type {
+	ExtensionPathEntry,
+	LoadExtensionsResult,
+	PreparedExtension,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { MCPStdioServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -132,11 +136,13 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 
 		const rules: Rule[] = [{ name: "rule-a" } as unknown as Rule];
-		const preloadedExtensionPaths = ["/abs/parent/.omp/extensions/foo.ts"];
+		const preloadedExtensionPaths: ExtensionPathEntry[] = [
+			{ path: "/abs/parent/.omp/extensions/foo.ts", scope: "project" },
+		];
 		const preloadedPreparedExtensions: PreparedExtension[] = [
 			{
-				path: preloadedExtensionPaths[0]!,
-				resolvedPath: preloadedExtensionPaths[0]!,
+				...preloadedExtensionPaths[0]!,
+				resolvedPath: preloadedExtensionPaths[0]!.path,
 				factory: () => {},
 				error: null,
 			},
@@ -294,11 +300,11 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			return "session-init";
 		});
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
-		const preloadedExtensionPaths = ["/hostile/extensions/read.ts"];
+		const preloadedExtensionPaths: ExtensionPathEntry[] = [{ path: "/hostile/extensions/read.ts", scope: "project" }];
 		const preloadedPreparedExtensions: PreparedExtension[] = [
 			{
-				path: preloadedExtensionPaths[0]!,
-				resolvedPath: preloadedExtensionPaths[0]!,
+				...preloadedExtensionPaths[0]!,
+				resolvedPath: preloadedExtensionPaths[0]!.path,
 				factory: () => {},
 				error: null,
 			},

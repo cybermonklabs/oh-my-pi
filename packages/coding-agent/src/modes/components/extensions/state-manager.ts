@@ -2,7 +2,6 @@
  * State manager for the Extension Control Center.
  * Handles data loading, tree building, filtering, and toggle persistence.
  */
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getMCPConfigPath, logger } from "@oh-my-pi/pi-utils";
 import type { ContextFile } from "../../../capability/context-file";
@@ -26,7 +25,12 @@ import {
 	loadCapability,
 } from "../../../discovery";
 import { createSourceMeta, getExtensionNameFromPath } from "../../../discovery/helpers";
-import { isExtensionFile, listPackageExtensionModules } from "../../../extensibility/extensions/loader";
+import { OMP_PLUGINS_PROVIDER_ID } from "../../../discovery/omp-extension-roots";
+import {
+	extensionPathKey,
+	isExtensionFile,
+	listPackageExtensionModules,
+} from "../../../extensibility/extensions/loader";
 import { readDisabledServers, readEnabledServers } from "../../../mcp/config-writer";
 import { commandPreview } from "@oh-my-pi/pi-tui/overlays/extensions/inspector-model";
 import { inferMcpTransport } from "@oh-my-pi/pi-tui/overlays/extensions/mcp-runtime";
@@ -67,9 +71,6 @@ function resolveState(
 	return { state: "active" };
 }
 
-/** Provider that labels installed-plugin and configured-package modules; it owns their sibling skills/tools. */
-const PACKAGE_MODULE_PROVIDER = "omp-plugins";
-
 /**
  * Extension modules the loader appends after native discovery — installed
  * plugin entries and configured `extensions` paths — that `disabledExtensions`
@@ -94,22 +95,21 @@ async function loadPackageModules(
 		loadCapability<Hook>("hooks", { cwd, disabledExtensions: disabledIds, extensionRoots: roots }),
 	]);
 	const hookFactories = hooks.items.map(hook => hook.path).filter(file => isExtensionFile(path.basename(file)));
-	const realpath = (file: string) => fs.realpath(file).catch(() => path.resolve(file));
 	const seen = new Set(
-		await Promise.all([...nativeModules.map(module => module.path), ...hookFactories].map(realpath)),
+		await Promise.all([...nativeModules.map(module => module.path), ...hookFactories].map(extensionPathKey)),
 	);
-	const providerName = getProviderInfo(PACKAGE_MODULE_PROVIDER)?.displayName ?? PACKAGE_MODULE_PROVIDER;
+	const providerName = getProviderInfo(OMP_PLUGINS_PROVIDER_ID)?.displayName ?? OMP_PLUGINS_PROVIDER_ID;
 	const modules: ExtensionModule[] = [];
 	for (const entry of [...explicit, ...configured]) {
 		if (!entry.toggleable) continue;
-		const key = await realpath(entry.path);
+		const key = await extensionPathKey(entry.path);
 		if (seen.has(key)) continue;
 		seen.add(key);
 		modules.push({
 			name: getExtensionNameFromPath(entry.path),
 			path: entry.path,
 			level: entry.level,
-			_source: { ...createSourceMeta(PACKAGE_MODULE_PROVIDER, entry.path, entry.level), providerName },
+			_source: { ...createSourceMeta(OMP_PLUGINS_PROVIDER_ID, entry.path, entry.level), providerName },
 		});
 	}
 	return modules;
