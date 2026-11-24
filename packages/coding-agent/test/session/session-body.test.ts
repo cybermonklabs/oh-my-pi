@@ -326,4 +326,37 @@ describe("IndexedSessionStorage full writes of lines a generator yields", () => 
 			}
 		},
 	);
+
+	// If this regresses, an empty spooled body read after its release publishes an empty session
+	// through a streamed write, where a longer one refuses the read as the body's contract says.
+	it.skipIf(process.getuid === undefined)(
+		"refuses a streamed read of an empty spooled body after its release",
+		async () => {
+			const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-spool-released-empty-"));
+			vi.spyOn(os, "tmpdir").mockReturnValue(tmp);
+			try {
+				const backend = new StreamingMemoryBackend();
+				const bodies = new FullBodies(backend, async function* () {});
+				const released = bodies.lines("/sessions/empty.jsonl", []);
+				released.release?.();
+				const failure = await released.publish(1, null).then(
+					() => undefined,
+					(error: unknown) => String(error),
+				);
+
+				expect({
+					byteLength: released.byteLength,
+					failure,
+					stored: backend.sessions.get("/sessions/empty.jsonl"),
+				}).toEqual({
+					byteLength: 0,
+					failure: expect.stringContaining("used after it was closed"),
+					stored: undefined,
+				});
+			} finally {
+				vi.restoreAllMocks();
+				await fsp.rm(tmp, { recursive: true, force: true });
+			}
+		},
+	);
 });

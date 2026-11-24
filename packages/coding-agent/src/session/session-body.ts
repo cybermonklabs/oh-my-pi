@@ -66,9 +66,11 @@ class BodySpool implements KeptBody {
 	}
 
 	async *chunks(): AsyncGenerator<Uint8Array> {
-		for (let position = 0; position < this.byteLength;) {
+		// The descriptor is taken before the first read, so a released body refuses even when it is
+		// empty, and again after each chunk, since the body can be released while a consumer holds one.
+		for (let position = 0, fd = this.#file.fd; position < this.byteLength; fd = this.#file.fd) {
 			const buffer = Buffer.allocUnsafe(Math.min(LINE_STREAM_CHUNK, this.byteLength - position));
-			const read = await readAt(this.#file.fd, buffer, position);
+			const read = await readAt(fd, buffer, position);
 			if (read === 0) throw new Error(`Session body spool ended at byte ${position} of ${this.byteLength}`);
 			position += read;
 			yield read === buffer.byteLength ? buffer : buffer.subarray(0, read);
