@@ -2751,12 +2751,48 @@ mod tests {
 			}
 		}
 
-		fn pending(p: FsPoll<Box<dyn File>>) -> Box<dyn crate::bash::FsPending<Box<dyn File>>> {
+		/// A one-way open of a FIFO with no other end must pend. `Ready` is
+		/// either an open that completed, because another end was open, or one
+		/// that failed, and those have nothing in common, so the panic says
+		/// which it was and what the path is at that moment: [`StdFs::open`]
+		/// is `Ready` for a one-way open only where [`fifo::pending`] found no
+		/// FIFO at the path, which is `fs::metadata` failing or finding
+		/// something else. A run of the whole library in one process once hit
+		/// this and left nothing to read.
+		fn pending(
+			path: &BStr,
+			p: FsPoll<Box<dyn File>>,
+		) -> Box<dyn crate::bash::FsPending<Box<dyn File>>> {
 			match p {
 				FsPoll::Pending(p) => p,
-				FsPoll::Ready(_) => {
-					panic!("a one-way FIFO open with no other end must not complete synchronously")
+				FsPoll::Ready(r) => {
+					let outcome = match r {
+						Ok(f) => format!("completed, opening a {:?}", f.kind()),
+						Err(e) => format!("failed with {e}"),
+					};
+					panic!(
+						"a one-way FIFO open with no other end must not complete synchronously: it \
+						 {outcome}; {}",
+						now(path)
+					)
 				},
+			}
+		}
+
+		/// What `path` names at this moment, for a panic that must say why an
+		/// open found no FIFO there.
+		fn now(path: &BStr) -> String {
+			let Ok(host) = host_path(path) else {
+				return format!("{path:?} is no host path");
+			};
+			match fs::symlink_metadata(host) {
+				Err(e) => format!("{host:?} does not stat: {e}"),
+				Ok(m) => format!(
+					"{host:?} is {:?}, mode {:o}, {} link(s)",
+					kind_of(m.file_type()),
+					std::os::unix::fs::MetadataExt::mode(&m),
+					std::os::unix::fs::MetadataExt::nlink(&m)
+				),
 			}
 		}
 
@@ -2776,7 +2812,8 @@ mod tests {
 		#[test]
 		fn reading_a_fifo_is_pending_until_a_writer_opens() {
 			let path = fifo();
-			let mut p = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
+			let mut p =
+				pending(path.as_bstr(), StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
 			let host = host_path(&path).unwrap().to_path_buf();
 			let writer = thread::spawn(move || {
 				thread::sleep(Duration::from_millis(50));
@@ -2802,7 +2839,8 @@ mod tests {
 		#[test]
 		fn writing_a_fifo_is_pending_until_a_reader_opens() {
 			let path = fifo();
-			let mut p = pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
+			let mut p =
+				pending(path.as_bstr(), StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
 			let host = host_path(&path).unwrap().to_path_buf();
 			let reader = thread::spawn(move || {
 				let mut s = String::new();
@@ -2850,7 +2888,8 @@ mod tests {
 			// A child a sibling test forks holds a copy of that writer until
 			// its `exec`, which would end the open on Linux too.
 			thread::sleep(Duration::from_millis(100));
-			let mut p = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
+			let mut p =
+				pending(path.as_bstr(), StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
 			let waker = Waker::from(Arc::new(Unpark(thread::current())));
 			let mut cx = Context::from_waker(&waker);
 			let deadline = Instant::now() + Duration::from_secs(2);
@@ -2896,7 +2935,8 @@ mod tests {
 				.custom_flags(libc::O_NONBLOCK)
 				.open(&host)
 				.unwrap();
-			let mut w = pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
+			let mut w =
+				pending(path.as_bstr(), StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
 			let mut writer = finish(&mut w);
 			let waker = Waker::noop();
 			assert!(matches!(
@@ -2916,8 +2956,10 @@ mod tests {
 		#[test]
 		fn both_ends_of_a_fifo_on_one_thread_never_block() {
 			let path = fifo();
-			let mut w = pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
-			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
+			let mut w =
+				pending(path.as_bstr(), StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0));
+			let mut r =
+				pending(path.as_bstr(), StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
 			let mut reader = finish(&mut r);
 			let mut writer = finish(&mut w);
 			assert_eq!(reader.kind(), FileKind::Pipe);
@@ -3853,7 +3895,8 @@ mod tests {
 
 			let path = fifo();
 			let host = host_path(&path).unwrap().to_path_buf();
-			let mut r = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
+			let mut r =
+				pending(path.as_bstr(), StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
 			// The read open's helper waits in `open(2)` until this open.
 			let writer = fs::OpenOptions::new().write(true).open(&host).unwrap();
 			let mut reader = finish(&mut r);
@@ -4014,11 +4057,17 @@ mod tests {
 				.with(OpenFlags::CREATE)
 				.with(OpenFlags::TRUNC);
 			for round in 0..200 {
-				drop(pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0)));
+				drop(pending(
+					path.as_bstr(),
+					StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0),
+				));
 				assert!(!fifo::has_reader(&host), "round {round}: a reader is left on the FIFO");
-				drop(pending(StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0)));
+				drop(pending(
+					path.as_bstr(),
+					StdFs::default().open(path.as_bstr(), OpenFlags::WRITE, 0),
+				));
 				assert!(!fifo::has_writer(&host), "round {round}: a writer is left on the FIFO");
-				drop(pending(StdFs::default().open(path.as_bstr(), redirect, 0o666)));
+				drop(pending(path.as_bstr(), StdFs::default().open(path.as_bstr(), redirect, 0o666)));
 				assert!(!fifo::has_writer(&host), "round {round}: a `>` writer is left on the FIFO");
 			}
 			fs::remove_file(&host).unwrap();
