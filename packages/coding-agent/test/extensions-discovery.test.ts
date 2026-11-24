@@ -850,6 +850,9 @@ describe("extensions discovery", () => {
 			// The user plugin root follows the home directory: one under this test's directory keeps its entries in view.
 			const home = tempDir.join("home");
 			vi.spyOn(os, "homedir").mockReturnValue(home);
+			// On Linux and macOS the resolver prefers `$XDG_DATA_HOME/omp` over the home config root when that
+			// directory exists, so the XDG roots are cleared too; the environment is restored after each test.
+			for (const key of ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]) delete process.env[key];
 			// Rebuild the directory resolver, which reads the home directory when it is built.
 			setAgentDir(getAgentDir());
 			/** Installs plugin `name` in `pluginsDir`: a manifest module `<name>.ts` and a hook `<name>-hook.ts`. */
