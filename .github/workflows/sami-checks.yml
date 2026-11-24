@@ -48,11 +48,13 @@
 # test passed is listed for removal and fails the summary, unless its reason starts `flaky: `. A
 # failed test with a `flaky: ` entry makes its job run the whole unit again, at most twice, with the
 # same threads and user (set.sh, nextest.sh, ts.sh), and reads KNOWN only when it passed in such a
-# retry. A `skips: ` entry names a self-skip by row, user,
-# test and the start of its skip line, and that self-skip reads KNOWN. pi-builtins' check_folded_sources
-# tests run in a directory where names fold (host.sh: ext4 casefold; nextest.sh SC_FOLDED). The
-# browser tests run against the Chrome for Testing build the tree's puppeteer-core pins (bun.sh
-# chrome), not the runner's google-chrome. Skip prints: the skip-forms job fails on a print of the
+# retry; a nextest JUnit case that failed and then passed on nextest's own retry is flaky, not a
+# pass. A `skips: ` entry names a self-skip by row, user, test and the start of its skip line, and
+# that self-skip reads KNOWN. pi-builtins' check_folded_sources tests run in a directory where names
+# fold (host.sh: ext4 casefold; nextest.sh SC_FOLDED). Each `bun test` gets the per-test timeout
+# the tree's own runner gives it (ts.sh: scripts/ci-test-ts.ts and ci.yml's OMP_TEST_TIMEOUT), not
+# bun's 5 s. The browser tests run against the Chrome for Testing build the tree's puppeteer-core
+# pins (bun.sh chrome), not the runner's google-chrome. Skip prints: the skip-forms job fails on a print of the
 # tree that says skip and that the summary's rule does not read; the summary job runs the same check
 # on every line a passing test printed (sc.py skip-lines), and both are units of the row "skip
 # prints the summary reads".

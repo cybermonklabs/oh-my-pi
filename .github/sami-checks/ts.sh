@@ -18,6 +18,14 @@ mkdir -p "$SC/res/logs"
 # The Chrome the browser tests launch: the pinned Chrome for Testing (bun.sh chrome), when set.
 chrome_env=()
 [ -n "${PUPPETEER_EXECUTABLE_PATH:-}" ] && chrome_env=(PUPPETEER_EXECUTABLE_PATH="$PUPPETEER_EXECUTABLE_PATH")
+# The per-test timeout the tree's own runner gives `bun test`: scripts/ci-test-ts.ts (testTimeoutMs,
+# applyChunkBudget) passes --timeout=OMP_TEST_TIMEOUT seconds, 30 when unset, and the tree's
+# .github/workflows/ci.yml sets OMP_TEST_TIMEOUT for its whole run (120 at 509a2d77). bun's own
+# default, 5 s, applies to hooks too: browser-interactions.test.ts's browser launch hook timed out
+# under it (run 45336629027). The value is read from the tree under test, and its tests see it too.
+omp_timeout=$(sed -n 's/^ *OMP_TEST_TIMEOUT: *"\{0,1\}\([0-9][0-9]*\)"\{0,1\} *$/\1/p' "$SC_TREE/.github/workflows/ci.yml" | head -n 1)
+omp_timeout=${omp_timeout:-30}
+echo "TIMEOUT bun test --timeout=$((omp_timeout * 1000)) (OMP_TEST_TIMEOUT=$omp_timeout, the tree's ci.yml or its runner's default)"
 
 one() { # <row> <unit> <dir> <bound seconds> <bun test args...>
 	local row=$1 unit=$2 dir=$3 bound=$4 safe log junit s rc secs try rj t got
@@ -53,7 +61,8 @@ bunrun() { # <dir> <bound seconds> <JUnit report> <log> <bun test args...>: one 
 	shift 4
 	home=$(mktemp -d)
 	(cd "$SC_TREE/$dir" && timeout -k 10 "$bound" env -i PATH="$(dirname "$bun"):/usr/bin:/bin" HOME="$home" \
-		${chrome_env[@]+"${chrome_env[@]}"} "$bun" test --reporter=junit --reporter-outfile="$junit" "$@" < /dev/null) > "$log" 2>&1
+		OMP_TEST_TIMEOUT="$omp_timeout" ${chrome_env[@]+"${chrome_env[@]}"} \
+		"$bun" test --timeout="$((omp_timeout * 1000))" --reporter=junit --reporter-outfile="$junit" "$@" < /dev/null) > "$log" 2>&1
 	rc=$?
 	rm -rf "${home:?}"
 	return "$rc"
@@ -67,7 +76,8 @@ webmcp-probe)
 		[ -n "$exe" ] || continue
 		home=$(mktemp -d)
 		out=$( (cd "$SC_TREE/packages/coding-agent" && timeout -k 10 600 env -i PATH="$(dirname "$bun"):/usr/bin:/bin" HOME="$home" \
-			PUPPETEER_EXECUTABLE_PATH="$exe" "$bun" test ./test/tools/browser-webmcp.test.ts < /dev/null) 2>&1)
+			OMP_TEST_TIMEOUT="$omp_timeout" PUPPETEER_EXECUTABLE_PATH="$exe" \
+			"$bun" test --timeout="$((omp_timeout * 1000))" ./test/tools/browser-webmcp.test.ts < /dev/null) 2>&1)
 		rm -rf "${home:?}"
 		echo "WEBMCP $("$exe" --version) ($exe): $(printf '%s\n' "$out" | grep -E '^ *[0-9]+ (pass|fail)$' | tr -s ' \n' ' ')"
 		printf '%s\n' "$out" | grep -m 3 -E 'does not expose WebMCP|no native WebMCP|cannot invoke' || true
