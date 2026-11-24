@@ -17,7 +17,7 @@
   sc.py junit-merge OUT JUNIT...           one JUnit report of several (nextest.sh's two passes)
   sc.py selftest                           the counters and the summary against hand-made inputs
   sc.py docs UNIT STREAM LOG EXIT SECS     `cargo doc --message-format=json -p pi-shell`: each broken intra-doc link (docs.sh)
-  sc.py changelog LOG EXIT SECS FILES DIFF `fix-changelogs.ts --check`: each CHANGELOG it would rewrite (changelog.sh)
+  sc.py changelog LOG EXIT SECS FILES DIFF WRITE_EXIT  `fix-changelogs.ts --check`: each CHANGELOG it would rewrite (changelog.sh)
   sc.py plant WHAT TREE                    the docs or changelog row's control: puts its planted fault in TREE
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
@@ -1761,6 +1761,9 @@ def selftest():
     res2, build2 = os.path.join(d, "res2"), os.path.join(d, "build2")
     os.makedirs(res2)
     os.makedirs(build2)
+    json.dump(meta, open(os.path.join(build2, "binaries-metadata.json"), "w"))
+    known2 = os.path.join(d, "known2.txt")
+    open(known2, "w").write("# none\n")
     for i, (row, unit, who) in enumerate(expected_units(build2)[0]):
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1), open(os.path.join(res2, f"{i}.json"), "w"))
 
@@ -1770,7 +1773,7 @@ def selftest():
         os.environ["SC_PLANT"] = plant_env
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc2 = cmd_summary(res2, build2, known_file)
+            rc2 = cmd_summary(res2, build2, known2)
         os.environ.pop("SC_PLANT")
         return rc2, buf.getvalue()
 
@@ -1821,6 +1824,13 @@ def selftest():
           ("FAIL", [tg40, nd], "2 broken intra-doc link(s), to 2 distinct target(s)"))
     check("docs: one target linked twice", docs([tg % (40, 27), tg % (42, 46), finished_no], "101"),
           ("FAIL", [tg40, tg42], "2 broken intra-doc link(s), to 1 distinct target(s)"))
+    # The lint's other form in the private build of run 45442475434: a link that names two items.
+    ambiguous = ('{"reason":"compiler-message","package_id":"pi-shell","message":{"level":"error","code":{"code":'
+                 '"rustdoc::broken_intra_doc_links"},"message":"`deref` is both a function and a macro","spans":[{"file_name":'
+                 '"crates/pi-shell/src/bash/vm/state.rs","line_start":310,"column_start":26,"is_primary":true,"label":'
+                 '"ambiguous link"}],"rendered":"error: `deref` is both a function and a macro"}}')
+    check("docs: an ambiguous link", docs([ambiguous, finished_no], "101")[:2],
+          ("FAIL", ["crates/pi-shell/src/bash/vm/state.rs:310:26: 'deref' is both a function and a macro (ambiguous link)"]))
     check("docs: another error", docs([e0432, note_e0432, finished_no], "101"),
           ("UNKNOWN", [], "exit 101, and no broken-link error: error[E0432]: unresolved import `nosuch`"))
     check("docs: clean", docs([artifact, finished_yes], "0")[:2], ("PASS", []))
@@ -1839,11 +1849,11 @@ def selftest():
     relay_diff = ("--- a/packages/browser-relay/CHANGELOG.md\n+++ b/packages/browser-relay/CHANGELOG.md\n@@ -2,8 +2,6 @@\n"
                   " \n ## [Unreleased]\n \n-### Planted empty heading\n-\n ## [18.18.2] - 2026-11-08\n \n ### Added\n")
 
-    def clog(text, code, diff_text=""):
+    def clog(text, code, diff_text="", write_exit="0"):
         lp, dp = os.path.join(d, "changelog.log"), os.path.join(d, "changelog.diff")
         open(lp, "w").write(text)
         open(dp, "w").write(diff_text)
-        return parse_changelog(lp, code, 1, "14", dp)
+        return parse_changelog(lp, code, 1, "14", dp, write_exit)
 
     r = clog(six, "1", relay_diff)
     check("changelog: the planted heading", (r["status"], r["passed"], r["failed"], r["note"], r["failures"][2:3]),
@@ -1852,13 +1862,27 @@ def selftest():
             "duplicate(s), 1 removed empty heading(s); from line 5: -### Planted empty heading | -"]))
     check("changelog: a file the write run left unchanged", r["failures"][:1] and r["failures"][0].endswith(
           "; the write run left it unchanged"), True)
+    r = clog(six, "1", "", "1")
+    check("changelog: the write run failed", (r["status"], r["failures"][2:3]), ("FAIL", [
+          "packages/browser-relay/CHANGELOG.md: 0 promoted item(s), 0 merged duplicate heading(s), 0 dropped released "
+          "duplicate(s), 1 removed empty heading(s); the write run failed (exit 1)"]))
     check("changelog: a list shorter than its count", clog(six.rsplit("  packages/tui", 1)[0], "1")["status"], "UNKNOWN")
     r = clog("Changelogs already clean since v1.0.0.\n", "0")
     check("changelog: clean", (r["status"], r["passed"], r["note"]), ("PASS", 14, "14 CHANGELOGs, clean since v1.0.0"))
+    check("changelog: exit 0 with no clean line", clog("", "0")["status"], "UNKNOWN")
     check("changelog: an argument the tool does not take", (clog("Unknown argument: --bogus\n", "1")["status"],
           clog("Unknown argument: --bogus\n", "1")["note"]), ("UNKNOWN", "exit 1: Unknown argument: --bogus"))
     check("changelog: git failed", clog("Failed with exit code 128\n", "1")["note"], "exit 1: Failed with exit code 128")
-    check("changelog: the time bound", clog(six, "124")["status"], "UNKNOWN")
+    check("changelog: the time bound", clog(six, "124")["note"], "exit 124: the time bound or a signal ended it")
+    # An internal compiler error: the level rustc's JSON gives one (rustc_errors Level::Bug).
+    ice = json.dumps({"reason": "compiler-message", "package_id": "pi-shell", "message": {
+        "level": "error: internal compiler error", "code": None, "message": "unexpected panic", "spans": [],
+        "rendered": "error: internal compiler error: unexpected panic"}})
+    check("docs: a link and an internal compiler error", docs([planted, ice, finished_no], "101"),
+          ("FAIL", [pl], "1 broken intra-doc link(s), to 1 distinct target(s); and 1 other error(s), the first: "
+                         "error: internal compiler error: unexpected panic"))
+    check("docs: an internal compiler error alone", docs([ice, finished_no], "101"),
+          ("UNKNOWN", [], "exit 101, and no broken-link error: error: internal compiler error: unexpected panic"))
     # The summary with these rows: the docs row's two units, each planted run's verdict, and a docs or
     # changelog job that reports nothing.
     docs_i = {json.load(open(os.path.join(res2, f)))["unit"]: f for f in os.listdir(res2)
@@ -1866,17 +1890,25 @@ def selftest():
     log_i = [f for f in os.listdir(res2) if json.load(open(os.path.join(res2, f)))["row"] == "changelog"]
     check("the docs row's units", sorted(docs_i), ["private", "public"])
     docs_i = {u: docs_i.get(u, f"docs-{u}.json") for u in ("public", "private")}
-    _, out = summary2()
+    rc, out = summary2()
     check("summary: docs and changelog rows pass", ("| rustdoc intra-doc links (pi-shell) | **PASS** | 2 / 0 / 0 / 0 |" in out,
-          "| CHANGELOG format (fix-changelogs --check) | **PASS** | 1 / 0 / 0 / 0 |" in out), (True, True))
-    _, out = summary2(plant_env="docs")
+          "| CHANGELOG format (fix-changelogs --check) | **PASS** | 1 / 0 / 0 / 0 |" in out, rc), (True, True, 0))
+    rc, out = summary2(plant_env="docs")
     check("summary: a planted docs run whose row passed", ("**Planted run (`plant=docs`)**" in out,
           "**THE CONTROL FAILED**: the row reads PASS, and these units do not read FAIL naming `NoSuchItemPlanted`: "
-          "`public`, `private`." in out), (True, True))
+          "`public`, `private`." in out, rc), (True, True, 1))
+    # On the real tree the row fails without the plant (run 45442475434: 21 and 46 links), so a FAIL
+    # that does not name the plant must read as a control that failed.
+    for u in ("public", "private"):
+        json.dump(result("docs", u, "runner", "FAIL", "101", 1, 0, 1, failures=[tg40]), open(os.path.join(res2, docs_i[u]), "w"))
+    rc, out = summary2(plant_env="docs")
+    check("summary: a planted docs run whose units fail without naming the plant",
+          ("**THE CONTROL FAILED**: the row reads FAIL, and these units do not read FAIL naming `NoSuchItemPlanted`: "
+           "`public`, `private`." in out, rc), (True, 1))
     json.dump(result("docs", "public", "runner", "FAIL", "101", 1, 0, 1, failures=[pl]), open(os.path.join(res2, docs_i["public"]), "w"))
     rc, out = summary2(plant_env="docs")
     check("summary: a planted docs run that only one unit names",
-          ("| rustdoc intra-doc links (pi-shell) | **FAIL** | 1 / 0 / 1 / 0 |" in out,
+          ("| rustdoc intra-doc links (pi-shell) | **FAIL** | 0 / 0 / 2 / 0 |" in out,
            "**THE CONTROL FAILED**: the row reads FAIL, and these units do not read FAIL naming `NoSuchItemPlanted`: `private`." in out,
            rc), (True, True, 1))
     json.dump(result("docs", "private", "runner", "FAIL", "101", 1, 0, 2, failures=[pl, tg40]),
@@ -1885,8 +1917,17 @@ def selftest():
     check("summary: a planted docs run that both units name",
           ("The control caught it: the row reads FAIL, and each of its units (`public`, `private`) names `NoSuchItemPlanted`." in out,
            f"`private` (runner): FAILED `{tg40}`: **NEW**" in out, rc), (True, True, 1))
+    six_r = clog(six, "1", relay_diff)
+    json.dump(dict(six_r, failures=[f for f in six_r["failures"] if "browser-relay" not in f]), open(os.path.join(res2, log_i[0]), "w"))
     rc, out = summary2(plant_env="changelog")
-    check("summary: a planted changelog run whose row passed", "**THE CONTROL FAILED**: the row reads PASS" in out, True)
+    check("summary: a planted changelog run whose row fails without naming the plant",
+          ("**THE CONTROL FAILED**: the row reads FAIL, and these units do not read FAIL naming `Planted empty heading`: "
+           "`changelogs`." in out, rc), (True, 1))
+    json.dump(six_r, open(os.path.join(res2, log_i[0]), "w"))
+    rc, out = summary2(plant_env="changelog")
+    check("summary: a planted changelog run that names the plant",
+          ("The control caught it: the row reads FAIL, and each of its units (`changelogs`) names `Planted empty heading`." in out,
+           rc), (True, 1))
     rc, out = summary2(drop=[f for f in docs_i.values() if os.path.exists(os.path.join(res2, f))] + log_i)
     check("summary: no docs or changelog result", ("| rustdoc intra-doc links (pi-shell) | **UNKNOWN** | 0 / 0 / 0 / 2 |" in out,
           "| CHANGELOG format (fix-changelogs --check) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
@@ -1916,8 +1957,8 @@ CHANGELOG_FIXED = re.compile(r"^Fixed (\d+) changelog\(s\) since (.*) \(check, n
 CHANGELOG_FILE = re.compile(r"^  (\S+): (\d+ promoted item\(s\), .*)$", re.M)
 # Each row's control, the dispatch input `plant`: row key -> (the file, the line the job adds to it
 # before it runs, the words a failure of the row must then hold). pi-shell's first public module
-# gets a doc comment that links to no item; the first release section of a small CHANGELOG gets an
-# empty category heading, which fix-changelogs removes.
+# gets a doc comment that links to no item; a small CHANGELOG gets an empty category heading after
+# its first `## [` heading ([Unreleased] in this tree), which fix-changelogs removes.
 PLANTS = {
     "docs": ("crates/pi-shell/src/lib.rs", "/// See [`NoSuchItemPlanted`].", "NoSuchItemPlanted"),
     "changelog": ("packages/browser-relay/CHANGELOG.md", "### Planted empty heading", "Planted empty heading"),
@@ -1957,7 +1998,8 @@ def parse_docs(unit, stream, log, exit_code, secs, row="docs"):
         if m.get("reason") == "build-finished":
             finished = m.get("success")
         d = m.get("message") if m.get("reason") == "compiler-message" else None
-        if not isinstance(d, dict) or d.get("level") != "error":
+        # rustc gives an internal compiler error the level `error: internal compiler error`.
+        if not isinstance(d, dict) or not str(d.get("level", "")).startswith("error"):
             continue
         if (d.get("code") or {}).get("code") == DOCS_LINT:
             spans = d.get("spans") or [{}]
@@ -2026,12 +2068,12 @@ def changed_lines(diff_path):
     return out
 
 
-def parse_changelog(log, exit_code, secs, files, diff, row="changelog", unit="changelogs"):
+def parse_changelog(log, exit_code, secs, files, diff, write_exit="0", row="changelog", unit="changelogs"):
     """fix-changelogs.ts --check (LOG, its stdout and stderr) over FILES CHANGELOGs. PASS on exit 0
     with its clean line; FAIL on exit 1 with its list of the files it would rewrite, each named with
     its counts and the first lines the rewrite changes (DIFF: changelog.sh's `diff -u` of each file
-    before and after the tool's write mode); any other end (the tool's own error) is UNKNOWN with its
-    message."""
+    before and after the tool's write mode, which exited WRITE_EXIT); any other end (the tool's own
+    error) is UNKNOWN with its message."""
     try:
         text = open(log, encoding="utf-8", errors="replace").read()
     except OSError:
@@ -2048,7 +2090,8 @@ def parse_changelog(log, exit_code, secs, files, diff, row="changelog", unit="ch
         fails = []
         for path, counts in listed:
             h = heads.get(path)
-            where = f"from line {h[0]}: " + " | ".join(h[1]) if h else "the write run left it unchanged"
+            gone = "the write run left it unchanged" if write_exit == "0" else f"the write run failed (exit {write_exit})"
+            where = f"from line {h[0]}: " + " | ".join(h[1]) if h else gone
             fails.append(f"{path}: {counts}; {where}"[:400].replace("`", "'"))
         note = f"{len(listed)} of {n} CHANGELOGs would be rewritten (since {fixed.group(2)})"
         extra = sorted(set(heads) - {p for p, _ in listed})

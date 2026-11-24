@@ -36,15 +36,17 @@ fix "$logs/changelog.log" --check
 rc=$?
 secs=$(($(date +%s) - s))
 : > "$logs/changelog.diff"
+wrc=-
 if [ "$rc" = 1 ]; then
 	fix "$logs/changelog-write.log"
-	echo "the write run: exit $? / $(tr '\n' '/' < "$logs/changelog-write.log")"
+	wrc=$?
+	echo "the write run: exit $wrc / $(tr '\n' '/' < "$logs/changelog-write.log")"
 	for f in "${files[@]}"; do
 		diff -u --label "a/$f" --label "b/$f" "$before/$f" "$SC_TREE/$f" >> "$logs/changelog.diff"
 	done
 fi
 rm -rf "${before:?}"
-python3 "$tool/sc.py" changelog "$logs/changelog.log" "$rc" "$secs" "${#files[@]}" "$logs/changelog.diff" > "$SC/res/changelog.json"
+python3 "$tool/sc.py" changelog "$logs/changelog.log" "$rc" "$secs" "${#files[@]}" "$logs/changelog.diff" "$wrc" > "$SC/res/changelog.json"
 echo "CHANGELOG --check exit=$rc ${secs}s over ${#files[@]} files"
 cat "$logs/changelog.log"
 python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["status"], r["note"]); [print(" ", f) for f in r["failures"]]' "$SC/res/changelog.json"
