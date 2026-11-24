@@ -70,6 +70,10 @@ pub struct StdFile {
 	/// Writes for a descriptor with no private non-blocking description,
 	/// started on the first such write.
 	writer:         Option<BlockingWriter>,
+	/// The [`BlockingWriter`]'s own descriptor, made with this file where
+	/// writes take that route: at the first write the process may be out
+	/// of descriptors, and the shell's report that it is goes out as one.
+	spare:          Option<fs::File>,
 	/// Linux only: a fresh non-blocking open file description of a pipe's
 	/// write end. Externals keep the blocking description they inherited.
 	#[cfg(target_os = "linux")]
@@ -212,8 +216,9 @@ struct WriterState {
 }
 
 impl BlockingWriter {
-	fn start(file: &fs::File) -> io::Result<Self> {
-		let mut file = file.try_clone()?;
+	/// Starts the thread, which writes through `file`, a descriptor of its
+	/// own ([`StdFile`]'s `spare`).
+	fn start(mut file: fs::File) -> io::Result<Self> {
 		let (jobs, queue) = std::sync::mpsc::channel::<(Mark, Vec<u8>)>();
 		let state = Arc::new(parking_lot::Mutex::new(WriterState::default()));
 		let shared = Arc::clone(&state);
@@ -554,10 +559,6 @@ impl StdFile {
 		}
 	}
 
-	#[cfg_attr(
-		not(unix),
-		expect(clippy::missing_const_for_fn, reason = "reads the access mode with fcntl on Unix")
-	)]
 	fn with_kind(file: fs::File, kind: FileKind, null: bool) -> Self {
 		// Only a descriptor that waits for readiness consults its access
 		// mode ([`Self::gated`]); a regular file or device skips the `fcntl`.
@@ -580,12 +581,13 @@ impl StdFile {
 			&& access.is_none_or(|access| access == libc::O_WRONLY || access == libc::O_RDWR))
 		.then(|| private_nonblocking_writer(&file).ok())
 		.flatten();
-		Self {
+		let mut this = Self {
 			file,
 			kind,
 			#[cfg(unix)]
 			watch: [None, None],
 			writer: None,
+			spare: None,
 			#[cfg(target_os = "linux")]
 			private_writer,
 			#[cfg(all(test, unix))]
@@ -594,6 +596,30 @@ impl StdFile {
 			access,
 			null,
 			ahead: RefCell::new(None),
+		};
+		if this.writes_on_thread() {
+			this.spare = this.file.try_clone().ok();
+		}
+		this
+	}
+
+	/// Whether a write goes to the [`BlockingWriter`]: the route
+	/// [`File::poll_write_marked`] takes.
+	fn writes_on_thread(&self) -> bool {
+		if self.null {
+			return false;
+		}
+		#[cfg(target_os = "linux")]
+		if self.private_writer.is_some() {
+			return false;
+		}
+		#[cfg(unix)]
+		{
+			self.gated(true)
+		}
+		#[cfg(not(unix))]
+		{
+			self.kind != FileKind::Regular
 		}
 	}
 
@@ -731,7 +757,11 @@ impl StdFile {
 		buf: &[u8],
 	) -> Poll<io::Result<(usize, Mark)>> {
 		if self.writer.is_none() {
-			match BlockingWriter::start(&self.file) {
+			let file = match self.spare.take() {
+				Some(file) => Ok(file),
+				None => self.file.try_clone(),
+			};
+			match file.and_then(BlockingWriter::start) {
 				Ok(writer) => self.writer = Some(writer),
 				Err(e) => return Poll::Ready(Err(e)),
 			}
@@ -3115,6 +3145,53 @@ mod tests {
 					reader.read_to_end(&mut rest).unwrap();
 					drop(finished);
 					assert_eq!(rest, b"BBBB\n", "after A's line, only B's line, once");
+				},
+			);
+		}
+
+		/// The first write through the writer thread is made when the process
+		/// has no descriptor left (`EMFILE`): the thread's descriptor was made
+		/// with the file. Made at that write, it failed, and so did the write:
+		/// on macOS the shell's report that it ran out of descriptors went
+		/// nowhere (`tests/descriptor_limit.rs`).
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_first_write_through_the_writer_thread_needs_no_new_descriptor() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::a_first_write_through_the_writer_thread_needs_no_new_descriptor"
+				),
+				|| {
+					let (mut reader, w) = io::pipe().unwrap();
+					let mut writer = StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(w)));
+					assert!(!writer.has_private_writer());
+					let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+					// SAFETY: `lim` is a valid, writable `rlimit`.
+					assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) }, 0);
+					let soft = lim.rlim_cur;
+					// No new descriptor at all; this process runs this test alone
+					// (`in_blocking_writer_process`).
+					lim.rlim_cur = 0;
+					// SAFETY: `lim` is a valid `rlimit`, the soft limit lowered.
+					assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lim) }, 0);
+					let control = fs::File::open("/dev/null");
+					let wrote =
+						writer.poll_write(&mut Context::from_waker(Waker::noop()), b"out of fds\n");
+					lim.rlim_cur = soft;
+					// SAFETY: as above; the soft limit goes back to what it was.
+					assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lim) }, 0);
+					assert_eq!(
+						control.err().and_then(|e| e.raw_os_error()),
+						Some(libc::EMFILE),
+						"a new descriptor was made"
+					);
+					assert!(matches!(wrote, Poll::Ready(Ok(11))), "{wrote:?}");
+					let finished = deadline("the write with no fd left", Duration::from_secs(5));
+					let mut got = [0u8; 11];
+					reader.read_exact(&mut got).unwrap();
+					drop(finished);
+					assert_eq!(&got, b"out of fds\n");
 				},
 			);
 		}
