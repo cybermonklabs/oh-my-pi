@@ -146,6 +146,13 @@ pub enum Control {
 	/// subscript), status in [`Outcome::status`]: a `-c` string is abandoned
 	/// whole, a script file goes on with its next command.
 	DiscardAll,
+	/// An error that abandons the rest of the command the innermost script,
+	/// `-c` string, `eval` or `.` file runs, which then goes on with its next
+	/// command (bash's `exp_jump_to_top_level (DISCARD)` from a word
+	/// expansion, caught by `parse_and_execute` with no `top_level_cleanup`:
+	/// a declaration builtin's compound argument that fails), status in
+	/// [`Outcome::status`]. A subshell ends; `set -e` does not act.
+	Discard,
 	/// A frame was pushed (`eval`, `source`): wait for it to return.
 	Frame,
 	/// A frame was pushed (`mapfile`'s callback): wait for it to return,

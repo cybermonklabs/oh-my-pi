@@ -465,6 +465,140 @@ fn readonly_and_export_take_array_flags_only_with_a_value() {
 	}
 }
 
+/// A compound `name=(…)` argument of `declare`, `typeset`, `local`,
+/// `export` or `readonly` is declared and assigned while bash expands the
+/// words (`expand_declaration_argument`), before the builtin runs. When
+/// that fails (a readonly variable, an array that cannot convert), the rest
+/// of the command line is abandoned (`DISCARD`): the script goes on with
+/// its next line, `$?` 1; a subshell or `$(…)` ends, an `eval` ends its
+/// command. The arguments before it that are not compound were never
+/// assigned. Only `declare`, `typeset` or `local` in a function skip a
+/// failed declaration (`W_FORCELOCAL`) and report the name again. A failed
+/// declaration does not end a `set -e` shell; a failed value does (bash's
+/// `report_error`). Goldens from bash 5.3.20; bash 5.2.21 gives the same
+/// output but for `set -e` with `-a`, where it exits.
+#[test]
+fn a_failed_compound_declaration_abandons_the_line() {
+	const NEXT: &str = "echo \"next st=$? x=${x[*]}\"";
+	for (src, want) in [
+		(format!("readonly x=1\ndeclare -a x=(2); echo \"same st=$?\"\n{NEXT}"), "next st=1 x=1\n"),
+		(format!("readonly x=1\ntypeset x+=(3); echo \"same st=$?\"\n{NEXT}"), "next st=1 x=1\n"),
+		(format!("readonly x=1\nexport x=(2); echo \"same st=$?\"\n{NEXT}"), "next st=1 x=1\n"),
+		(
+			format!("readonly x=1\nreadonly -A x=([k]=2); echo \"same st=$?\"\n{NEXT}"),
+			"next st=1 x=1\n",
+		),
+		(
+			format!("set -e\nreadonly x=1\ndeclare -a x=(2); echo \"same st=$?\"\n{NEXT}"),
+			"next st=1 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\n( declare -a x=(2); echo \"in-sub st=$?\" ); echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"same st=1\nnext st=0 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\ny=$(declare -a x=(2); echo in); echo \"same st=$? y=[$y]\"\n{NEXT}"
+			),
+			"same st=1 y=[]\nnext st=0 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\neval 'declare -a x=(2); echo \"in-eval st=$?\"'; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"same st=1\nnext st=0 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\nf() {{ export x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"next st=1 x=1\n",
+		),
+		(
+			format!(
+				"f() {{ local -r x=1; local x=(2); echo \"in-f st=$? x=${{x[*]}}\"; }}\nf; echo \
+				 \"same st=$?\"\n{NEXT}"
+			),
+			"next st=1 x=\n",
+		),
+		(
+			format!(
+				"readonly x=1\nfor i in 1 2; do declare -a x=(2); echo \"in-loop $i\"; done; echo \
+				 \"same st=$?\"\n{NEXT}"
+			),
+			"next st=1 x=1\n",
+		),
+		(
+			"readonly x=1\ndeclare a=1 x=(2) b=2; echo \"same st=$?\"\necho \"next a=${a-unset} \
+			 b=${b-unset}\""
+				.to_owned(),
+			"next a=unset b=unset\n",
+		),
+		(
+			"readonly x=1\ndeclare -a y=(1) x=(2) z=(3); echo \"same st=$?\"\necho \"next \
+			 y=${y[*]-unset} z=${z[*]-unset}\""
+				.to_owned(),
+			"next y=1 z=unset\n",
+		),
+		(
+			format!("declare -a x=(1)\ndeclare -A x=([k]=2); echo \"same st=$?\"\n{NEXT}"),
+			"next st=1 x=1\n",
+		),
+	] {
+		let (out, err) = run(&src);
+		assert_eq!(out, want, "{src}");
+		assert!(
+			err.contains("x: readonly variable") || err.contains("x: cannot convert"),
+			"{src}: {err}"
+		);
+	}
+	// A function's `declare` (also with `-g`) skips the failed declaration
+	// and reports the name twice; the function goes on.
+	for (src, diag) in [
+		(
+			format!(
+				"readonly x=1\nf() {{ declare -a x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"x: readonly variable",
+		),
+		(
+			format!(
+				"readonly x=1\nf() {{ declare -ga x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"x: readonly variable",
+		),
+		(
+			format!(
+				"declare -a x=(1)\nf() {{ declare -gA x=([k]=2); echo \"in-f st=$?\"; }}\nf; echo \
+				 \"same st=$?\"\n{NEXT}"
+			),
+			"x: cannot convert indexed to associative array",
+		),
+	] {
+		let (out, err) = run(&src);
+		assert_eq!(out, "in-f st=1\nsame st=0\nnext st=0 x=1\n", "{src}");
+		assert_eq!(err.matches(diag).count(), 2, "{src}: {err}");
+	}
+	// A failed value (not a failed declaration) is reported as bash's
+	// `report_error` reports it, which under `set -e` ends the shell.
+	for src in [
+		format!("set -e\nreadonly x=1\ndeclare x=(2); echo \"same st=$?\"\n{NEXT}"),
+		format!("set -e\nreadonly x=1\ntypeset x+=(3); echo \"same st=$?\"\n{NEXT}"),
+		format!("set -e\nreadonly x=1\nreadonly x=(2); echo \"same st=$?\"\n{NEXT}"),
+	] {
+		let (out, err) = run(&src);
+		assert_eq!(out, "", "{src}");
+		assert!(err.contains("x: readonly variable"), "{src}: {err}");
+	}
+}
+
 /// `SECONDS+=` adds to the value the last lookup stored, as bash's
 /// `make_variable_value` reads the variable's cell: a lookup two seconds
 /// on stores the count then (7); without one, the 5 stored before is what

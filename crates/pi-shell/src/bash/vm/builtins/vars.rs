@@ -1794,8 +1794,21 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 	// `export SECONDS=…` and `readonly SECONDS=…` look `SECONDS` up after
 	// assigning it (`set_or_show_attributes`): see the loop's end.
 	let mut seconds_after = false;
-	for (j, arg) in o.rest.iter().enumerate() {
+	// bash declares and assigns each compound `name=(…)` argument while it
+	// expands the words (`expand_declaration_argument`), before the builtin
+	// runs the others: the compound ones go first, in order, then the rest.
+	// `declare`, `typeset` and `local` in a function skip one whose
+	// declaration fails (`W_FORCELOCAL`); any other failure of one abandons
+	// the command line ([`super::Control::Discard`]).
+	let forcelocal = matches!(kind, DeclareKind::Declare | DeclareKind::Local) && in_function;
+	let n = o.rest.len();
+	for step in 0..2 * n {
+		let j = step % n;
+		let arg = &o.rest[j];
 		let compound_word = ctx.compound.contains(&((1 + first + j) as u32));
+		if compound_word != (step < n) {
+			continue;
+		}
 		if kind == DeclareKind::Local && arg.as_slice() == b"-" {
 			// `local -`: the `set` options, restored when the function
 			// returns.
@@ -2137,7 +2150,7 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				|| off.contains(Attrs::READONLY)
 				|| (on.bits() | off.bits()) & fixed != 0)
 		{
-			let d = Diag::Readonly { name: name.into() };
+			let d = || Diag::Readonly { name: name.into() };
 			let array_flag = on.contains(Attrs::INDEXED) || on.contains(Attrs::ASSOC);
 			if compound_word {
 				// bash reports a compound word's failed array assignment
@@ -2147,19 +2160,32 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				match func.filter(|_| array_flag) {
 					Some(f) => {
 						let f = String::from_utf8_lossy(&f).into_owned();
-						ctx.diag(d.by(f));
+						ctx.diag(d().by(f));
 					},
-					None => ctx.diag(d),
+					None => ctx.diag(d()),
 				}
-			} else if value.is_some()
-				&& matches!(kind, DeclareKind::Readonly | DeclareKind::Export)
-				&& !array_flag
-			{
+				// Its declaration fails on an attribute a readonly variable
+				// keeps, else its value does (`do_word_assignment`). Only a
+				// failed declaration of `declare`, `typeset` or `local` in a
+				// function is skipped, and the builtin names it again. bash
+				// reports a failed value with `report_error`, which ends the
+				// shell under `set -e` (`exit_immediately_on_error`).
+				let declaring = off.contains(Attrs::READONLY) || (on.bits() | off.bits()) & fixed != 0;
+				if !(declaring && forcelocal) {
+					let control = if !declaring && ctx.option(OptId::Errexit)? {
+						super::Control::Exit
+					} else {
+						super::Control::Discard
+					};
+					return Ok(super::Outcome { status: 1, control });
+				}
+				ctx.err(d());
+			} else if value.is_some() && special && !array_flag {
 				// A plain value through `readonly`/`export` fails as an
 				// assignment would.
-				ctx.diag(d);
+				ctx.diag(d());
 			} else {
-				ctx.err(d);
+				ctx.err(d());
 			}
 			status = 1;
 			continue;
@@ -2194,19 +2220,20 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			let msg = format!("{}: {msg}", name.as_bstr());
 			if compound_word {
 				// bash reports a failed compound assignment bare at top
-				// level, and in a function under the function's name and
-				// again under `declare`'s.
+				// level, and in a function under the function's name; a
+				// function's `declare`, `typeset` or `local` skips it and
+				// names it again under its own, any other abandons the line.
 				let func = state::func_name(&ctx.k.root, ctx.cx.store, ctx.vp)?;
+				let report = Diag::Usage { msg: msg.clone().into() };
 				match func.map(|f| String::from_utf8_lossy(&f).into_owned()) {
-					Some(f) => {
-						ctx.diag(Diag::Usage { msg: msg.clone().into() }.by(f));
-						ctx.err(Diag::Usage { msg: msg.into() });
-					},
-					None => ctx.diag(Diag::Usage { msg: msg.into() }),
+					Some(f) => ctx.diag(report.by(f)),
+					None => ctx.diag(report),
 				}
-			} else {
-				ctx.err(Diag::Usage { msg: msg.into() });
+				if !forcelocal {
+					return Ok(super::Outcome { status: 1, control: super::Control::Discard });
+				}
 			}
+			ctx.err(Diag::Usage { msg: msg.into() });
 			// The (inherited) local still comes into being.
 			if let Some(var) = cur
 				&& level == Level::Local
