@@ -121,30 +121,32 @@ rust_test(
 # no such main.rs), such as tests/*_support and tests/zsh_oracle. Many start
 # obash: cargo names its path in CARGO_BIN_EXE_obash, and so does this target,
 # relative to the runfiles root; the support modules make it absolute.
+# The suite and the target below share these values. Bazel refuses **kwargs in
+# a BUILD file, so each passes them by name.
 _INTEGRATION_SHARED_SRCS = glob(
     ["tests/*/**/*.rs"],
     exclude = ["tests/fixtures/**"],
 )
 
-_INTEGRATION_ATTRS = dict(
-    aliases = aliases(),
-    data = glob([
-        "src/testkit/fixtures/**",
-        "tests/fixtures/**",
-    ]) + [":obash"],
-    edition = "2024",
-    proc_macro_deps = all_crate_deps(proc_macro = True) + all_crate_deps(proc_macro_dev = True),
-    rustc_env = {"CARGO_BIN_EXE_obash": "$(rootpath :obash)"},
-    rustc_flags = select({
-        # As pi-shell_test: the engine runs in some of these test processes.
-        "//bazel:fastbuild": ["-Copt-level=1"],
-        "//conditions:default": [],
-    }),
-    deps = all_crate_deps(normal = True) + all_crate_deps(normal_dev = True) + [
-        ":pi-shell",
-        "//crates/pi-vfs",
-    ],
-)
+_INTEGRATION_DATA = glob([
+    "src/testkit/fixtures/**",
+    "tests/fixtures/**",
+]) + [":obash"]
+
+_INTEGRATION_PROC_MACRO_DEPS = all_crate_deps(proc_macro = True) + all_crate_deps(proc_macro_dev = True)
+
+_INTEGRATION_RUSTC_ENV = {"CARGO_BIN_EXE_obash": "$(rootpath :obash)"}
+
+_INTEGRATION_RUSTC_FLAGS = select({
+    # As pi-shell_test: the engine runs in some of these test processes.
+    "//bazel:fastbuild": ["-Copt-level=1"],
+    "//conditions:default": [],
+})
+
+_INTEGRATION_DEPS = all_crate_deps(normal = True) + all_crate_deps(normal_dev = True) + [
+    ":pi-shell",
+    "//crates/pi-vfs",
+]
 
 rust_test_suite(
     name = "pi-shell_integration_tests",
@@ -157,8 +159,14 @@ rust_test_suite(
             "tests/zsh_computil_args_pty.rs",
         ],
     ),
+    aliases = aliases(),
+    data = _INTEGRATION_DATA,
+    edition = "2024",
+    proc_macro_deps = _INTEGRATION_PROC_MACRO_DEPS,
+    rustc_env = _INTEGRATION_RUSTC_ENV,
+    rustc_flags = _INTEGRATION_RUSTC_FLAGS,
     shared_srcs = _INTEGRATION_SHARED_SRCS,
-    **_INTEGRATION_ATTRS
+    deps = _INTEGRATION_DEPS,
 )
 
 # tests/zsh_computil_args_pty.rs as the suite above makes a test (the same
@@ -175,10 +183,16 @@ rust_test_suite(
 rust_test(
     name = "pi-shell_integration_tests_tests/zsh_computil_args_pty_test",
     timeout = "long",
+    srcs = ["tests/zsh_computil_args_pty.rs"] + _INTEGRATION_SHARED_SRCS,
+    aliases = aliases(),
     crate_name = "pi_shell_integration_tests_tests_zsh_computil_args_pty_test",
     crate_root = "tests/zsh_computil_args_pty.rs",
-    srcs = ["tests/zsh_computil_args_pty.rs"] + _INTEGRATION_SHARED_SRCS,
-    **_INTEGRATION_ATTRS
+    data = _INTEGRATION_DATA,
+    edition = "2024",
+    proc_macro_deps = _INTEGRATION_PROC_MACRO_DEPS,
+    rustc_env = _INTEGRATION_RUSTC_ENV,
+    rustc_flags = _INTEGRATION_RUSTC_FLAGS,
+    deps = _INTEGRATION_DEPS,
 )
 
 # obash's own unit tests (src/bin/obash), which cargo runs as the bin target.
