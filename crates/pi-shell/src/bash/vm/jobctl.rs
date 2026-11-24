@@ -470,19 +470,21 @@ pub const fn without_terminal(k: &Kernel) -> bool {
 	k.jobctl.pgrp.is_some() && k.jobctl.handle.is_none()
 }
 
-/// The process group of the job of `vp`'s table that vproc `owner` runs a
-/// program of (bash `kill_pid`'s `find_pipeline`: `kill -- -PID` of a
-/// process of a job signals the job's group, whether job control is on now
-/// or not), in a script without a terminal: a job started under `set -m`
-/// keeps its group after `set +m` ([`kept`]). `None` for any other vproc,
-/// a job in the shell's group, or a shell with a terminal.
-pub fn job_group(k: &Kernel, vp: &Vproc, owner: Vpid) -> Option<i32> {
+/// The job of `vp`'s table that vproc `owner` runs a program of, and that
+/// job's process group (bash `kill_pid`'s `find_pipeline`: `kill -- -PID`
+/// of a process of a job signals the job's group, whether job control is
+/// on now or not), in a script without a terminal: a job started under
+/// `set -m` keeps its group after `set +m` ([`kept`]). The job is its
+/// vproc's vpid. `None` for any other vproc, a job in the shell's group, or
+/// a shell with a terminal.
+pub fn job_group(k: &Kernel, vp: &Vproc, owner: Vpid) -> Option<(Vpid, i32)> {
 	if k.jobctl.handle.is_some() || k.jobctl.interactive {
 		return None;
 	}
 	let leader = leader_of(k, owner)?;
 	vp.jobs.by_vpid(leader).filter(|j| !j.inherited)?;
-	group(k, leader).and_then(|g| i32::try_from(g).ok())
+	let group = group(k, leader).and_then(|g| i32::try_from(g).ok())?;
+	Some((leader, group))
 }
 
 /// The interactive root got `sig` with no trap set: what zsh's handler

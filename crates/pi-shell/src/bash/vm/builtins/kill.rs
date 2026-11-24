@@ -166,35 +166,43 @@ pub(super) fn target(
 			job.unreaped = false;
 			return Err(TargetError::NoSuchJob);
 		}
-		// bash `kill_pid`: continuing a stopped job by `kill` acts like `bg`
-		// (the job runs, the current job stays).
-		if send == Send::Signal(Signal::Cont) && matches!(job.state, JobState::Stopped(_)) {
-			job.state = JobState::Running;
-			job.notified = true;
-		}
-		if ends(send) && !has_program(job) {
-			job.unreaped = true;
-		}
-		return Ok(Some(SigTarget::Job(job.id)));
+		let vpid = job.vpid;
+		return job_target(ctx, vpid, send).map(Some);
 	}
 	let pid = std::str::from_utf8(arg)
 		.ok()
 		.and_then(|s| s.parse::<i32>().ok())
 		.ok_or(TargetError::NotAnId)?;
 	// bash `kill_pid`: `-PID` of a process of a job with a group of its own
-	// signals the job's group (a pipeline's `$!` names its last process,
-	// the group is its first's).
+	// (any of its processes: a pipeline's `$!` names its last, the group is
+	// its first's) signals the job ([`job_target`]). Once the job is gone,
+	// the signal goes to its group as the OS has it.
 	let owner = u32::try_from(-i64::from(pid))
 		.ok()
 		.filter(|_| pid < -1)
 		.and_then(|p| {
-			ctx.k
-				.pid_owner(p)
-				.or_else(|| ctx.vp.jobs.by_pid(p).map(|j| j.vpid))
+			ctx.k.pid_owner(p).or_else(|| {
+				ctx.vp
+					.jobs
+					.by_pid(p)
+					.or_else(|| ctx.vp.jobs.by_process_pid(p))
+					.map(|j| j.vpid)
+			})
 		});
-	let pid = owner
-		.and_then(|v| jobctl::job_group(ctx.k, ctx.vp, v))
-		.map_or(pid, |group| -group);
+	let mapped = owner.and_then(|v| jobctl::job_group(ctx.k, ctx.vp, v));
+	if let Some((leader, _)) = mapped {
+		let state = ctx.k.proc_state(ctx.cx.store, leader);
+		let ended = matches!(state, Some(crate::bash::vm::ProcState::Exited(_)));
+		if ctx
+			.vp
+			.jobs
+			.by_vpid(leader)
+			.is_some_and(|j| !ended && !matches!(j.state, JobState::Done(_)))
+		{
+			return job_target(ctx, leader, send).map(Some);
+		}
+	}
+	let pid = mapped.map_or(pid, |(_, group)| -group);
 	let base = ctx.k.engine.config().vpid_base;
 	// A job's (or `$!`'s) program OS pid names the job's vproc: the signal
 	// reaches the program through it, and the job's state follows. A
@@ -236,6 +244,52 @@ pub(super) fn target(
 			.map_err(TargetError::Host),
 	}
 }
+
+/// `kill` of live job `vpid` (its vproc), by `%job` or by the group `kill
+/// -- -PID` names. bash's `kill_pid` signals the job's process group. With
+/// a group of its own (a script's `set -m` job, [`jobctl::job_group`]),
+/// one OS signal to that group (bash's `killpg`) reaches every program in
+/// it, the job's and any one they left there, and the job's shell code,
+/// which obash runs in its own process, takes it on the bus
+/// ([`SigTarget::JobGroup`]); bash then continues a stopped job it sent
+/// `TERM` or `HUP`. A group with no process left (the job runs only shell
+/// code now) is no error. Else every process of the job takes it on the
+/// bus ([`SigTarget::Job`]).
+fn job_target(ctx: &mut Ctx<'_, '_>, vpid: Vpid, send: Send) -> Result<SigTarget, TargetError> {
+	let group = jobctl::job_group(ctx.k, ctx.vp, vpid).map(|(_, group)| group);
+	let job = ctx
+		.vp
+		.jobs
+		.by_vpid_mut(vpid)
+		.ok_or(TargetError::NoSuchJob)?;
+	let stopped = matches!(job.state, JobState::Stopped(_));
+	// bash `kill_pid`: continuing a stopped job by `kill` acts like `bg`
+	// (the job runs, the current job stays).
+	if send == Send::Signal(Signal::Cont) && stopped {
+		job.state = JobState::Running;
+		job.notified = true;
+	}
+	if ends(send) && !has_program(job) {
+		job.unreaped = true;
+	}
+	let id = job.id;
+	let Some(group) = group else {
+		return Ok(SigTarget::Job(id));
+	};
+	if let Some(sig) = send.signal() {
+		match ctx.cx.host.signal_process(-group, Some(sig)) {
+			Err(e) if e.raw_os_error() != Some(ESRCH) => return Err(TargetError::Host(e)),
+			_ => {},
+		}
+		if stopped && matches!(sig, Signal::Term | Signal::Hup) {
+			let _ = ctx.cx.host.signal_process(-group, Some(Signal::Cont));
+		}
+	}
+	Ok(SigTarget::JobGroup(id))
+}
+
+/// `ESRCH` (Linux, the BSDs): no process is in the group.
+const ESRCH: i32 = 3;
 
 /// Whether `send` ends a process that neither traps nor ignores it
 /// ([`crate::bash::store::Job::unreaped`]).

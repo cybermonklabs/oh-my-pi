@@ -587,6 +587,18 @@ impl JobTable {
 		self.list.iter().find(|j| j.named_by(pid))
 	}
 
+	/// The job one of whose processes is the program of OS pid `pid`: a
+	/// pipeline's stage that is just that program
+	/// ([`crate::bash::store::JobProc::os_pid`]),
+	/// such as its first, which leads the job's group.
+	pub fn by_process_pid(&self, pid: u32) -> Option<&Job> {
+		self.list.iter().find(|j| {
+			j.procs
+				.as_deref()
+				.is_some_and(|procs| procs.list.iter().any(|p| p.os_pid == Some(pid)))
+		})
+	}
+
 	/// Add a background job (bash `stop_pipeline` for an async list): it
 	/// takes the number after the highest one in use (bash does not reuse
 	/// lower freed numbers until the table is empty) and becomes current
