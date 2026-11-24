@@ -1002,24 +1002,78 @@ pub fn wait_blocked(pid: i32) {
 #[cfg(not(target_os = "linux"))]
 pub const fn wait_blocked(_pid: i32) {}
 
+/// Wait until process `pid`, a shell, waits for the copies of itself it
+/// forked (a subshell, a pipeline stage, a command substitution): it is
+/// blocked (in `waitpid`, or reading a substitution's output), stopped or
+/// gone, whatever those copies run; or it has no such copy. A copy is a
+/// child that runs the shell's own program, read again at each look: a
+/// shell that runs a subshell in its own process (obash) has none but a
+/// child between its `fork` and `exec` (a spawn in flight), which is no
+/// copy once it has `exec`ed. bash takes a signal that comes between the
+/// `fork` of a command and its `wait_for` as one that came while it ran
+/// shell code (it dies of an `INT` at once, where in `wait_for` it acts on
+/// one only once the command has died of it); on a loaded machine a signal
+/// sent once the command has made a file came that early. [`wait_blocked`]
+/// waits in vain for a command of shell code that never blocks. Bounded as
+/// every wait ([`TIMEOUT`]); off Linux it returns at once.
+#[cfg(target_os = "linux")]
+pub fn wait_until_it_waits(pid: i32) {
+	let deadline = Instant::now() + TIMEOUT;
+	let Ok(program) = fs::read_link(format!("/proc/{pid}/exe")) else {
+		return;
+	};
+	loop {
+		let copies: Vec<i32> = children(pid)
+			.into_iter()
+			.filter(|kid| fs::read_link(format!("/proc/{kid}/exe")).is_ok_and(|p| p == program))
+			.collect();
+		let mut running = Vec::new();
+		running_itself(pid, &mut running);
+		if copies.is_empty() || running.is_empty() {
+			return;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"after {TIMEOUT:?}, {pid} still runs, not waiting for its copies {copies:?} (pid, state, \
+			 name): {running:?}"
+		);
+		std::thread::sleep(Duration::from_millis(5));
+	}
+}
+
+/// `wait_until_it_waits` off Linux: there is no `/proc` to read, so it
+/// returns at once.
+#[cfg(not(target_os = "linux"))]
+pub const fn wait_until_it_waits(_pid: i32) {}
+
 /// Each of `pid` and the processes below it that is running or in an
 /// uninterruptible wait (state `R` or `D`), into `out` with its state and
 /// name ([`wait_blocked`]); one gone is none.
 #[cfg(target_os = "linux")]
 fn running_below(pid: i32, out: &mut Vec<(i32, String, String)>) {
+	if running_itself(pid, out) {
+		for kid in children(pid) {
+			running_below(kid, out);
+		}
+	}
+}
+
+/// `pid`, into `out` with its state and name, if it is running or in an
+/// uninterruptible wait (state `R` or `D`); whether it is there at all
+/// ([`wait_until_it_waits`], [`running_below`]).
+#[cfg(target_os = "linux")]
+fn running_itself(pid: i32, out: &mut Vec<(i32, String, String)>) -> bool {
 	let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-		return;
+		return false;
 	};
 	let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
-		return;
+		return false;
 	};
 	let state = stat[close + 1..].split_whitespace().next().unwrap_or("");
 	if matches!(state, "R" | "D") {
 		out.push((pid, state.to_owned(), stat[open + 1..close].to_owned()));
 	}
-	for kid in children(pid) {
-		running_below(kid, out);
-	}
+	true
 }
 
 /// The children of `pid`: each of its threads' `children` file, or, where

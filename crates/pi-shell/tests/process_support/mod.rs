@@ -26,7 +26,7 @@ use std::{
 };
 
 use crate::{
-	pty_support::{every_signal_at_its_default, wait_blocked},
+	pty_support::{every_signal_at_its_default, wait_blocked, wait_until_it_waits},
 	zsh_oracle,
 };
 
@@ -111,6 +111,9 @@ pub struct Run {
 	/// [`Self::go_signalled`] signals only once the shell has blocked
 	/// ([`Self::when_blocked`]).
 	blocked:   bool,
+	/// [`Self::go_signalled`] signals only once the shell waits for the
+	/// copies of itself it forked ([`Self::when_it_waits`]).
+	forks:     bool,
 	/// The file its standard input reads ([`Self::input`]); else the test's.
 	input:     Option<PathBuf>,
 }
@@ -129,6 +132,7 @@ impl Run {
 			group: false,
 			end_group: false,
 			blocked: false,
+			forks: false,
 			input: None,
 		}
 	}
@@ -216,6 +220,17 @@ impl Run {
 	#[must_use]
 	pub const fn when_blocked(mut self) -> Self {
 		self.blocked = true;
+		self
+	}
+
+	/// [`Self::go_signalled`] sends its signal only once the shell waits for
+	/// the copies of itself it forked ([`wait_until_it_waits`]), whatever
+	/// they run: for a command of shell code that never blocks, which
+	/// [`Self::when_blocked`] would wait for in vain. A shell that runs that
+	/// code in its own process (obash) gets it at once.
+	#[must_use]
+	pub const fn when_it_waits(mut self) -> Self {
+		self.forks = true;
 		self
 	}
 
@@ -351,9 +366,12 @@ impl Run {
 			std::thread::sleep(Duration::from_millis(5));
 		}
 		let pid = child.pid();
-		// The shell blocked waiting for the command ([`Self::when_blocked`]).
+		// The shell blocked waiting for the command ([`Self::when_blocked`]),
+		// or for the copies of itself it forked ([`Self::when_it_waits`]).
 		if self.blocked {
 			wait_blocked(pid);
+		} else if self.forks {
+			wait_until_it_waits(pid);
 		}
 		// SAFETY: kill takes integer ids; the child is not reaped yet.
 		let sent = unsafe { libc::kill(if group { -pid } else { pid }, sig) };
