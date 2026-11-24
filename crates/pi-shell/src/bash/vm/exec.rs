@@ -2989,6 +2989,12 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			// a `( … )`, are made in the fork without undo; a compound command's
 			// in the shell are undone after it.
 			let forked = vp.frames.len() == 1 && vp.fork().at_entry();
+			if forked && vp.fork().ending() {
+				// Its own redirections ended the fork, which waited for their
+				// message (`run_slice` writes what is left before the op comes
+				// back): it exits now, and they are not made again.
+				return Flow::Exit(vp.status);
+			}
 			let subshell = matches!(
 				unit.ops.get(pc as usize + 1..pc as usize + 3),
 				Some([enter, spawn])
@@ -3037,6 +3043,24 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					clear_scratch(&mut k.root, cx.store, vp);
 					vp.status = code;
 					Flow::Jump(op.b)
+				},
+				// In the job's own fork (an async compound command or pipeline
+				// stage: `forked_for`) the fork is the command's: a fatal error
+				// in the command's own redirections ends it with its status (127
+				// or 1), an arithmetic error or a bad substitution with 1, and
+				// nothing after the command runs (a `!` included). The fork ends
+				// after its message is written to stderr as the redirections so
+				// far left it (`2>/dev/null < ${x:?}` prints none), waiting for a
+				// stream that is full. (zsh code keeps its own rule.)
+				Err(redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
+					if forked && unit.mode.dialect() == Dialect::Bash =>
+				{
+					vp.status = code;
+					vp.set_fork(vp.fork().end());
+					match flush_out(k, vp) {
+						Some(fd) => Flow::Block(WaitKey::Write { fd }),
+						None => Flow::Exit(code),
+					}
 				},
 				Err(redir::Halt::Flow(f)) => f,
 				Err(redir::Halt::Failed) => {

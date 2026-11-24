@@ -126,9 +126,9 @@ pub struct Vproc {
 	pub zle:           Option<Box<super::zle::Zle>>,
 }
 
-/// What a vproc's fatal expansion errors reach and whether bash forked it
-/// to run one command ([`Vproc::fork`]), kept in the top byte of
-/// [`Vproc::subshell`].
+/// What a vproc's fatal expansion errors reach, whether bash forked it to
+/// run one command, and whether that command's own redirections ended it
+/// ([`Vproc::fork`]), kept in the top byte of [`Vproc::subshell`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fork(u8);
 
@@ -140,6 +140,9 @@ impl Fork {
 	/// `execute_in_subshell` (or the substitution's own catcher) catches its
 	/// fatal errors, which exit with the failure status.
 	pub const CHILD: Self = Self(Self::CAUGHT);
+	/// The one command's own redirections (below) met a fatal error: the
+	/// fork exits once their message is written ([`Self::ending`]).
+	const ENDING: u8 = 4;
 	/// The one command it was forked for has its own redirections to come.
 	const ENTRY: u8 = 2;
 	/// The shell itself, or a nested shell: bash's `run_one_command` catches
@@ -164,14 +167,28 @@ impl Fork {
 	pub const fn at_entry(self) -> bool {
 		self.0 & Self::ENTRY != 0
 	}
+
+	/// The fork whose own redirections met a fatal error: it exits, with
+	/// `$?`, once their message is written (the op that made them waits for
+	/// a full stream, and when it comes back it exits instead of making them
+	/// again).
+	pub const fn end(self) -> Self {
+		Self(self.0 | Self::ENDING)
+	}
+
+	/// [`Self::end`]: the fork only waits to exit.
+	pub const fn ending(self) -> bool {
+		self.0 & Self::ENDING != 0
+	}
 }
 
 /// The bits of [`Vproc::subshell`] that hold the depth.
 pub(super) const SUBSHELL_DEPTH: u32 = 0x00ff_ffff;
 
 impl Vproc {
-	/// What this vproc's fatal expansion errors reach, and whether it was
-	/// forked to run one command whose own redirections are still to come.
+	/// What this vproc's fatal expansion errors reach, whether it was forked
+	/// to run one command whose own redirections are still to come, and
+	/// whether they ended it.
 	pub const fn fork(&self) -> Fork {
 		Fork((self.subshell >> 24) as u8)
 	}

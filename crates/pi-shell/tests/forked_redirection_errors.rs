@@ -7,13 +7,14 @@
 //!   name not found, `command X`, a null command that redirects fd 0 or a
 //!   `{var}`) ends that fork, not the shell: the command fails with 127 under
 //!   `-c` or 1 from a script, and the shell goes on. An asynchronous simple
-//!   command's or a pipeline stage's fatal error lands where its parent's
-//!   would: 127 under `-c`, and no `!` after it runs; an arithmetic error or a
-//!   bad substitution in its redirections ends that fork with 1, also before a
-//!   `!`. The fork's message goes where the command's redirections so far sent
-//!   it (`2>/dev/null` hides it), also when that stream is full for a while. A
-//!   subshell, a command substitution and a compound job catch their own
-//!   (status 1).
+//!   command's or a pipeline stage's fatal error, and one in the own
+//!   redirections of an asynchronous compound command or a compound stage,
+//!   lands where its parent's would: 127 under `-c`, and no `!` after it runs;
+//!   an arithmetic error or a bad substitution in its redirections ends that
+//!   fork with 1, also before a `!`. The fork's message goes where the
+//!   command's redirections so far sent it (`2>/dev/null` hides it), also when
+//!   that stream is full for a while. A subshell, a command substitution and
+//!   the body of a compound job catch their own (status 1).
 //! - An asynchronous or piped null command bash forks for (fd 0 or a `{var}`)
 //!   exits 0 whatever its redirections do: bash forks it again, and the job's
 //!   fork exits at once.
@@ -62,7 +63,7 @@ use pi_shell::{
 /// Each row: id, run from a script file (else `-c`), script, status,
 /// stdout, stderr (the row's directory written `DIR`).
 const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
-	// 374 rows; bash 5.2.21 and 5.3.20 differ on (left out): h-in-fn/c,
+	// 428 rows; bash 5.2.21 and 5.3.20 differ on (left out): h-in-fn/c,
 	// h-bg-fn/c, h-null/c, g-null-move/c, g-null-move/script, g-assign-move/c,
 	// g-assign-move/script, x-fn/c, x-null-var/c, r2-bg-fn-eval/c,
 	// r2-sub-redir-fn/c, r2-var-local/c, g-fn-group-move-bg/c,
@@ -2854,6 +2855,438 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		"st=1\n",
 		"./s.sh: line 1: x: u\n",
 	),
+	(
+		"r6-bg-two-sub-words",
+		false,
+		"/bin/cat \"$(true)\" \"$(true)\" < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r6-bg-two-sub-words",
+		true,
+		"/bin/cat \"$(true)\" \"$(true)\" < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r6-not-bg-two-sub-words",
+		false,
+		"! /bin/cat \"$(true)\" \"$(true)\" < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r6-not-bg-two-sub-words",
+		true,
+		"! /bin/cat \"$(true)\" \"$(true)\" < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r6-bg-sub-procsub-words",
+		false,
+		"/bin/cat \"$(true)\" <(true) < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"bash: line 1: x: u\n",
+	),
+	(
+		"r6-bg-sub-procsub-words",
+		true,
+		"/bin/cat \"$(true)\" <(true) < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"./s.sh: line 1: x: u\n",
+	),
+	(
+		"r6-bg-group-stderr",
+		false,
+		"{ /bin/cat; } 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-bg-group-stderr",
+		true,
+		"{ /bin/cat; } 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-subshell-stderr",
+		false,
+		"( /bin/cat ) 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-bg-subshell-stderr",
+		true,
+		"( /bin/cat ) 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-group-dup",
+		false,
+		"{ :; } 2>&1 < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"bash: line 1: x: u\nst=127\n",
+		"",
+	),
+	(
+		"r6-bg-group-dup",
+		true,
+		"{ :; } 2>&1 < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"./s.sh: line 1: x: u\nst=1\n",
+		"",
+	),
+	(
+		"r6-bg-group-err-file",
+		false,
+		"{ :; } 2>err < ${x:?u} & wait $!; echo \"st=$?\"; cat err",
+		0,
+		"st=127\nbash: line 1: x: u\n",
+		"",
+	),
+	(
+		"r6-bg-group-err-file",
+		true,
+		"{ :; } 2>err < ${x:?u} & wait $!; echo \"st=$?\"; cat err",
+		0,
+		"st=1\n./s.sh: line 1: x: u\n",
+		"",
+	),
+	(
+		"r6-bg-while-stderr",
+		false,
+		"while :; do break; done 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-bg-while-stderr",
+		true,
+		"while :; do break; done 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-group-arith-stderr",
+		false,
+		"{ :; } 2>/dev/null < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-group-arith-stderr",
+		true,
+		"{ :; } 2>/dev/null < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-pipe-group-stderr",
+		false,
+		"{ /bin/cat; } 2>/dev/null < ${x:?u} | cat; echo \"st=${PIPESTATUS[0]}\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-pipe-group-stderr",
+		true,
+		"{ /bin/cat; } 2>/dev/null < ${x:?u} | cat; echo \"st=${PIPESTATUS[0]}\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-not-bg-group-stderr",
+		false,
+		"! { :; } 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-not-bg-group-stderr",
+		true,
+		"! { :; } 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-not-bg-group-arith",
+		false,
+		"! { :; } 2>/dev/null < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-not-bg-group-arith",
+		true,
+		"! { :; } 2>/dev/null < $((1/0)) & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-group-badsub-stderr",
+		false,
+		"{ :; } 2>/dev/null < \"${x!y}\" & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-group-badsub-stderr",
+		true,
+		"{ :; } 2>/dev/null < \"${x!y}\" & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-group-closed-stderr",
+		false,
+		"{ :; } 2>&- < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-bg-group-closed-stderr",
+		true,
+		"{ :; } 2>&- < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-subshell-dup",
+		false,
+		"( : ) 2>&1 < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"bash: line 1: x: u\nst=127\n",
+		"",
+	),
+	(
+		"r6-bg-subshell-dup",
+		true,
+		"( : ) 2>&1 < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"./s.sh: line 1: x: u\nst=1\n",
+		"",
+	),
+	(
+		"r6-bg-if-stderr",
+		false,
+		"if :; then :; fi 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-bg-if-stderr",
+		true,
+		"if :; then :; fi 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-for-stderr",
+		false,
+		"for i in 1; do :; done 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-bg-for-stderr",
+		true,
+		"for i in 1; do :; done 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-case-stderr",
+		false,
+		"case x in x) :;; esac 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-bg-case-stderr",
+		true,
+		"case x in x) :;; esac 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-until-dup",
+		false,
+		"until :; do :; done 2>&1 < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"bash: line 1: x: u\nst=127\n",
+		"",
+	),
+	(
+		"r6-bg-until-dup",
+		true,
+		"until :; do :; done 2>&1 < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"./s.sh: line 1: x: u\nst=1\n",
+		"",
+	),
+	(
+		"r6-bg-arith-cmd-stderr",
+		false,
+		"(( 1 )) 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-bg-arith-cmd-stderr",
+		true,
+		"(( 1 )) 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-cond-stderr",
+		false,
+		"[[ -n x ]] 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-bg-cond-stderr",
+		true,
+		"[[ -n x ]] 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-group-setu",
+		false,
+		"set -u; { :; } 2>/dev/null < $nosuch & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-bg-group-setu",
+		true,
+		"set -u; { :; } 2>/dev/null < $nosuch & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-pipe-group-dup",
+		false,
+		"{ :; } 2>&1 < ${x:?u} | cat; echo \"st=${PIPESTATUS[0]}\"",
+		0,
+		"bash: line 1: x: u\nst=127\n",
+		"",
+	),
+	(
+		"r6-pipe-group-dup",
+		true,
+		"{ :; } 2>&1 < ${x:?u} | cat; echo \"st=${PIPESTATUS[0]}\"",
+		0,
+		"./s.sh: line 1: x: u\nst=1\n",
+		"",
+	),
+	(
+		"r6-pipe-last-group-stderr",
+		false,
+		"true | { /bin/cat; } 2>/dev/null < ${x:?u}; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-pipe-last-group-stderr",
+		true,
+		"true | { /bin/cat; } 2>/dev/null < ${x:?u}; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-group-sub-word-stderr",
+		false,
+		"{ :; } 2>/dev/null < \"$(true)${x:?u}\" & wait $!; echo \"st=$?\"",
+		0,
+		"st=127\n",
+		"",
+	),
+	(
+		"r6-bg-group-sub-word-stderr",
+		true,
+		"{ :; } 2>/dev/null < \"$(true)${x:?u}\" & wait $!; echo \"st=$?\"",
+		0,
+		"st=1\n",
+		"",
+	),
+	(
+		"r6-bg-group-then-after",
+		false,
+		"{ :; } 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"; echo after",
+		0,
+		"st=127\nafter\n",
+		"",
+	),
+	(
+		"r6-bg-group-then-after",
+		true,
+		"{ :; } 2>/dev/null < ${x:?u} & wait $!; echo \"st=$?\"; echo after",
+		0,
+		"st=1\nafter\n",
+		"",
+	),
+	(
+		"r6-bg-group-body-stderr",
+		false,
+		"{ /bin/cat < ${x:?u}; echo after; } 2>/dev/null & wait $!; echo \"st=$?\"",
+		0,
+		"after\nst=0\n",
+		"",
+	),
+	(
+		"r6-bg-group-body-stderr",
+		true,
+		"{ /bin/cat < ${x:?u}; echo after; } 2>/dev/null & wait $!; echo \"st=$?\"",
+		0,
+		"after\nst=0\n",
+		"",
+	),
 ];
 
 /// The rows bash 5.2.21 runs otherwise, as bash 5.3.20 runs them (this
@@ -3191,21 +3624,16 @@ fn a_running_subshell_keeps_its_own_var_that_the_shell_dropped() {
 	);
 }
 
-/// The bound of one [`bounded_run`]: a run takes about a second.
+/// The bound of one [`bounded`] run: a run takes milliseconds.
 const RUN_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// [`run_script`] of `src` on a fresh [`FakeHost`] (with a write storm of
-/// `seed`, when given) under `fault`, in a thread of its own: a run that has
-/// not ended within [`RUN_BOUND`] is a failure (a fork that never stops
-/// waiting for its stream), and its thread is left to the end of the binary.
-fn bounded_run(src: &'static [u8], storm: Option<u64>, fault: Fault) -> Result<Outcome, String> {
+/// `run` in a thread of its own: a run that has not ended within
+/// [`RUN_BOUND`] is a failure (a fork that never stops waiting for its
+/// stream), and its thread is left to the end of the binary.
+fn bounded<T: Send + 'static>(run: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
 	let (tx, rx) = std::sync::mpsc::channel();
 	std::thread::spawn(move || {
-		let host = match storm {
-			Some(seed) => FakeHost::new().with_write_storm(seed, 0.5),
-			None => FakeHost::new(),
-		};
-		let _ = tx.send(run_script(host, src, &[], fault));
+		let _ = tx.send(run());
 	});
 	rx.recv_timeout(RUN_BOUND).map_err(|e| match e {
 		std::sync::mpsc::RecvTimeoutError::Timeout => format!("no end within {RUN_BOUND:?}"),
@@ -3213,56 +3641,144 @@ fn bounded_run(src: &'static [u8], storm: Option<u64>, fault: Fault) -> Result<O
 	})
 }
 
+/// A run's status, standard output and standard error.
+type Got = (i32, String, String);
+
+/// [`run_script`] of `src` on a fresh [`FakeHost`] (with a write storm of
+/// `seed`, when given) under `fault`, [`bounded`].
+fn bounded_run(src: &'static [u8], storm: Option<u64>, fault: Fault) -> Result<Outcome, String> {
+	bounded(move || {
+		let host = match storm {
+			Some(seed) => FakeHost::new().with_write_storm(seed, 0.5),
+			None => FakeHost::new(),
+		};
+		run_script(host, src, &[], fault)
+	})
+}
+
+/// `src` as a `-c` script under the write storm of `seed`, run one op at a
+/// time and imaged and restored once: at the first op boundary where the
+/// standard output holds some but not all of the `len` bytes it gets first
+/// (the fork's message, part written, the fork waiting for the stream).
+/// What it gave, and whether it was imaged; [`bounded`].
+fn bounded_imaged_mid_message(
+	src: &'static [u8],
+	seed: u64,
+	len: usize,
+) -> Result<(Got, bool), String> {
+	bounded(move || {
+		let one = Budget { max_ops: 1, max_ns: u64::MAX };
+		let mut rig = Rig::new(FakeHost::new().with_write_storm(seed, 0.5), skeleton_init(&[]));
+		let id = rig.shell().submit(Script::command(src.to_vec()));
+		let mut imaged = false;
+		let status = loop {
+			let n = rig.host.stdout.bytes().len();
+			if !imaged && n > 0 && n < len {
+				rig.snapshot();
+				imaged = true;
+				continue;
+			}
+			let (shell, host, store) = rig.parts();
+			match advance(shell, host, store, id, one) {
+				Stop::Done(status) => break status,
+				Stop::Yield => {},
+				other => panic!("unexpected {other:?}"),
+			}
+		};
+		let got = (
+			status,
+			String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned(),
+			String::from_utf8_lossy(&rig.host.stderr.bytes()).into_owned(),
+		);
+		let (shell, host, store) = rig.parts();
+		host.assert_no_leaks(shell, store);
+		(got, imaged)
+	})
+}
+
 /// The fork of an async command ends only after the message of a fatal
 /// error in its redirections is written where those redirections so far
 /// sent it (here `2>&1`: the standard output), also when that stream takes a
 /// few bytes at a time and is full in between (a write storm: the fork waits
-/// for it), and when the shell is imaged and restored at every op. Each run
-/// is bounded ([`bounded_run`]); the storm stops at its first run that does
-/// not end.
+/// for it), when the shell is imaged and restored at every op, and when it
+/// is imaged and restored once while the fork waits with its message part
+/// written. The fork's command is a builtin, the same behind a `!` (nothing
+/// after the fatal error runs, the `!` neither, also after the fork waited),
+/// and a `{ }` whose own redirections fail (the fork does not make them
+/// again after it waited). Each run is bounded ([`bounded`]); a storm stops
+/// at its first run that does not end.
 ///
-/// The storm runs unimaged: a restored host remakes its streams, and with
-/// them the storm's random sequence from its seed, so a run imaged about as
-/// often as its fork waits can meet the same full stream after each image
-/// (imaged every 2 ops, this test ran past 120 s and 3 GiB).
+/// The storm runs are not imaged at every op: a restored host remakes its
+/// streams, and with them the storm's random sequence from its seed, so a
+/// run imaged about as often as its fork waits can meet the same full stream
+/// after each image (imaged every 2 ops, this test ran past 120 s and 3
+/// GiB).
 #[test]
 fn a_forks_fatal_message_waits_for_the_stream_its_redirections_chose() {
-	const SRC: &[u8] = b"echo 2>&1 < ${x:?u} & wait $!; echo \"st=$?\"";
-	let got = |o: &Outcome| {
+	const MESSAGE: &str = "bash: line 1: x: u\n";
+	const JOBS: [(&str, &[u8]); 3] = [
+		("echo", b"echo 2>&1 < ${x:?u} & wait $!; echo \"st=$?\""),
+		("not-echo", b"! echo 2>&1 < ${x:?u} & wait $!; echo \"st=$?\""),
+		("group", b"{ :; } 2>&1 < ${x:?u} & wait $!; echo \"st=$?\""),
+	];
+	let got = |o: &Outcome| -> Got {
 		(
 			o.status,
 			String::from_utf8_lossy(&o.stdout).into_owned(),
 			String::from_utf8_lossy(&o.stderr).into_owned(),
 		)
 	};
-	// The status is the rows' to pin; here, where the message goes.
-	let plain = match bounded_run(SRC, None, Fault::None) {
-		Ok(o) => got(&o),
-		Err(e) => panic!("plain: {e}"),
-	};
-	assert!(
-		plain.0 == 0 && plain.1.starts_with("bash: line 1: x: u\nst=") && plain.2.is_empty(),
-		"plain: {plain:?}"
-	);
 	let mut wrong = Vec::new();
-	match bounded_run(SRC, None, Fault::Snapshot { every: 1 }) {
-		Ok(imaged) => {
-			assert!(imaged.snapshots > 0, "no snapshot was taken");
-			if got(&imaged) != plain {
-				wrong.push(format!("imaged: {:?}", got(&imaged)));
-			}
-		},
-		Err(e) => wrong.push(format!("imaged: {e}")),
-	}
-	for seed in 1..=16 {
-		match bounded_run(SRC, Some(seed), Fault::None) {
-			Ok(out) if got(&out) == plain => {},
-			Ok(out) => wrong.push(format!("storm {seed}: {:?}", got(&out))),
-			Err(e) => {
-				wrong.push(format!("storm {seed}: {e}"));
-				break;
+	for (name, src) in JOBS {
+		// The status is the rows' to pin; here, where the message goes, and
+		// that a run that waited ends as the plain run does.
+		let plain = match bounded_run(src, None, Fault::None) {
+			Ok(o) => got(&o),
+			Err(e) => panic!("{name} plain: {e}"),
+		};
+		assert!(
+			plain.0 == 0 && plain.1.starts_with(&format!("{MESSAGE}st=")) && plain.2.is_empty(),
+			"{name} plain: {plain:?}"
+		);
+		match bounded_run(src, None, Fault::Snapshot { every: 1 }) {
+			Ok(imaged) => {
+				assert!(imaged.snapshots > 0, "{name}: no snapshot was taken");
+				if got(&imaged) != plain {
+					wrong.push(format!("{name} imaged at every op: {:?}", got(&imaged)));
+				}
 			},
+			Err(e) => wrong.push(format!("{name} imaged at every op: {e}")),
+		}
+		for seed in 1..=16 {
+			match bounded_run(src, Some(seed), Fault::None) {
+				Ok(out) if got(&out) == plain => {},
+				Ok(out) => wrong.push(format!("{name} storm {seed}: {:?}", got(&out))),
+				Err(e) => {
+					wrong.push(format!("{name} storm {seed}: {e}"));
+					break;
+				},
+			}
+		}
+		// The control of the image runs: some of them are imaged while the
+		// message is part written.
+		let mut mid = 0;
+		for seed in 1..=16 {
+			match bounded_imaged_mid_message(src, seed, MESSAGE.len()) {
+				Ok((out, imaged)) => {
+					mid += u32::from(imaged);
+					if out != plain {
+						wrong.push(format!("{name} imaged mid-message {seed}: {out:?}"));
+					}
+				},
+				Err(e) => {
+					wrong.push(format!("{name} imaged mid-message {seed}: {e}"));
+					break;
+				},
+			}
+		}
+		if mid == 0 {
+			wrong.push(format!("{name}: no run was imaged mid-message"));
 		}
 	}
-	assert!(wrong.is_empty(), "want {plain:?}:\n{}", wrong.join("\n"));
+	assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
