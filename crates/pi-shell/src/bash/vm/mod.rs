@@ -2942,18 +2942,13 @@ impl Vproc {
 		vp.trace_base = xtrace::level(self) - 1;
 		// Started from a context where `set -e` is ignored (the parent's op
 		// is a condition, or its frame runs in one): so is the child.
-		frame.ignore_errexit = self.frames.last().is_some_and(|f| {
-			f.ignore_errexit
-				|| f
-					.unit
-					.as_ref()
-					.and_then(|u| u.ops.get(f.pc as usize))
-					.is_some_and(|op| op.flags & ir::Op::COND != 0)
-		});
+		frame.ignore_errexit = self.frames.last().is_some_and(exec::errexit_ignored);
 		// bash's fork keeps `parse_and_execute_level`: a child started
 		// inside an `eval`, `.` or trap action (or a child of one) runs
 		// inside that level.
-		frame.parse_level = self.frames.iter().any(exec::parse_and_execute);
+		if self.frames.iter().any(exec::parse_and_execute) {
+			frame.parse_level = proc::ParseLevel::Kept;
+		}
 		// Room for exactly this frame: a `Frame` is ~300 bytes and a first
 		// push reserves four (idle vproc ≤ 2 KiB); calls grow it.
 		vp.frames.reserve_exact(1);

@@ -449,6 +449,40 @@ pub enum Diag {
 		/// The element as bash shows it (`a[-9]`, `[-9]=x`).
 		shown: BString,
 	},
+	/// `a[0]=(1)`: bash's `report_error` prints it without the command's
+	/// name, so [`Diag::by`] leaves it as it is.
+	#[error("{shown}: cannot assign list to array member")]
+	ListToMember {
+		/// The element as bash shows it (`a[0]`).
+		shown: BString,
+	},
+	/// `A=([k]=v x)`: an associative array's compound element without a
+	/// key. bash's `report_error` prints it without the command's name, so
+	/// [`Diag::by`] leaves it as it is.
+	#[error("{name}: {word}: must use subscript when assigning associative array")]
+	AssocSubscript {
+		/// The array.
+		name: BString,
+		/// The element (single-quoted when `declare` got it).
+		word: BString,
+	},
+	/// `a=([@]=x)`: an indexed array's compound element with the key `@` or
+	/// `*`. bash's `report_error` prints it without the command's name, so
+	/// [`Diag::by`] leaves it as it is.
+	#[error("{shown}: cannot assign to non-numeric index")]
+	NonNumericIndex {
+		/// The element as written (`[@]=x`).
+		shown: BString,
+	},
+	/// `.` or `source` could not read its file: bash's `file_error`, a
+	/// `report_error`.
+	#[error("{path}: {msg}")]
+	FileError {
+		/// The file as given.
+		path: BString,
+		/// The system's reason.
+		msg:  BString,
+	},
 	/// The OS refused to run a file (bash's `file_error` in
 	/// `shell_execve`): `name: strerror` (126, 127 for `ENOENT`).
 	#[error("{name}: {}", strerror(.err))]
@@ -481,7 +515,14 @@ pub enum Diag {
 impl Diag {
 	/// `self` reported by builtin `cmd`.
 	pub fn by(self, cmd: impl Into<Cow<'static, str>>) -> Self {
-		if matches!(self, Self::ArithSubscript { .. } | Self::BadSubscript { .. }) {
+		if matches!(
+			self,
+			Self::ArithSubscript { .. }
+				| Self::BadSubscript { .. }
+				| Self::ListToMember { .. }
+				| Self::AssocSubscript { .. }
+				| Self::NonNumericIndex { .. }
+		) {
 			return self;
 		}
 		Self::Prefixed { cmd: cmd.into(), diag: Box::new(self) }

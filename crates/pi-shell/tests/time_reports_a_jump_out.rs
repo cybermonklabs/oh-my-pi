@@ -720,6 +720,44 @@ fn return_and_exec_do_not_report() {
 	]);
 }
 
+/// A `SIGPIPE` ends a shell whose builtin writes to a pipe with no reader:
+/// no jump, so its `time` gives no report. The shell starts with the
+/// signal's default disposition (the test process ignores it).
+#[test]
+fn a_builtin_that_a_sigpipe_ends_does_not_report() {
+	use std::os::unix::process::CommandExt as _;
+
+	let script = "exec 2>&1; TIMEFORMAT=report; { sleep 1; time { echo x; } 2>e1; echo after >&2; \
+	              } | true; echo w=$?; echo e1:; cat e1";
+	for mode in [Mode::C, Mode::Script] {
+		let dir = tempfile::tempdir().expect("a row directory");
+		let mut cmd = obash_support::obash();
+		cmd.current_dir(dir.path());
+		match mode {
+			Mode::C => cmd.args(["-c", script]),
+			Mode::Script => {
+				std::fs::write(dir.path().join("s.sh"), format!("{script}\n"))
+					.expect("the script file");
+				cmd.arg("s.sh")
+			},
+		};
+		// SAFETY: `signal` is async-signal-safe; the child sets the default
+		// disposition before exec.
+		unsafe {
+			cmd.pre_exec(|| {
+				if libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR {
+					Err(std::io::Error::last_os_error())
+				} else {
+					Ok(())
+				}
+			});
+		}
+		let out = obash_support::output(&mut cmd);
+		let got = (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code());
+		assert_eq!(got, (String::from("w=0\ne1:\n"), Some(0)), "{mode:?}");
+	}
+}
+
 /// An arithmetic subscript error's jump comes after bash's
 /// `top_level_cleanup` (`array_expand_index`): every `time` started inside
 /// a `-c` string, an `eval`, a `.`, a trap action or a command or process
@@ -1214,6 +1252,129 @@ fn errexit_out_of_a_function_resets_its_context_before_the_exit_trap() {
 	]);
 }
 
+/// Other jumps out of a function change the function context before the
+/// EXIT trap too. bash's `top_level_cleanup` sets it to 0 (`break` with a
+/// bad count; an expansion error in a script's own commands), and each
+/// `eval`, `.`, `-c` string or command substitution a jump passes undoes,
+/// which pops the functions called inside it (an expansion error under
+/// `-c`; a posix special builtin's error without `set -e`). A command
+/// substitution's text is such a level for `set -e` too. `set -e` in the
+/// trap's `eval` then undoes its redirections, so the report goes out of
+/// them. A function called outside every level keeps the context, and so
+/// does `report_error`'s exit, which is no jump.
+#[test]
+fn a_jump_out_of_a_function_changes_its_context_before_the_exit_trap() {
+	const TRAP: &str = "trap 'set -e; time eval \"{ false; } 2>/dev/null\"' EXIT; ";
+	const BREAK: &str = "SH: break: x: numeric argument required\n";
+	const MISSING: &str = "SH: missing: No such file or directory\n";
+	let in_sub = |f: &str| {
+		format!(
+			"{f}x=$( set -e; trap 'time eval \"{{ false; }} 2>/dev/null\"' EXIT; g() {{ false; }}; g \
+			 ); echo \"x=[$x] s=$?\"{}",
+			if f.is_empty() { "" } else { "; }; f" }
+		)
+	};
+	let rows = [
+		(
+			"an expansion error",
+			format!("{TRAP}f() {{ echo ${{x:?u}}; }}; f"),
+			"SH: x: u\nreport\n".to_owned(),
+			1,
+		),
+		(
+			"break",
+			format!("{TRAP}f() {{ for i in 1; do break x; done; }}; f"),
+			format!("{BREAK}report\n"),
+			1,
+		),
+		(
+			"break, a subshell",
+			format!("( {TRAP}f() {{ for i in 1; do break x; done; }}; f ); echo w=$?"),
+			format!("{BREAK}report\nw=1\n"),
+			0,
+		),
+		(
+			"a posix special builtin",
+			format!("( set -o posix; {TRAP}f() {{ : <missing; }}; eval f ); echo w=$?"),
+			format!("{MISSING}report\nw=1\n"),
+			0,
+		),
+		("set -e in a command substitution", in_sub("f() { "), "report\nx=[] s=1\n".to_owned(), 0),
+		(
+			"set -e in a command substitution, the shell",
+			in_sub(""),
+			"report\nx=[] s=1\n".to_owned(),
+			0,
+		),
+		(
+			"a posix special builtin in an inner eval",
+			format!("( set -o posix; {TRAP}f() {{ eval ': <missing'; }}; f ); echo w=$?"),
+			format!("{MISSING}w=1\n"),
+			0,
+		),
+		(
+			"report_error",
+			format!("( set -e; {TRAP}readonly r=1; f() {{ r=2; }}; f ); echo w=$?"),
+			"SH: r: readonly variable\nw=1\n".to_owned(),
+			0,
+		),
+		(
+			"an expansion error in a command substitution",
+			format!("x=$( {TRAP}g() {{ echo ${{x:?u}}; }}; g ); echo \"x=[$x] s=$?\""),
+			"SH: x: u\nreport\nx=[] s=1\n".to_owned(),
+			0,
+		),
+		(
+			"a function of the shell it forked from",
+			format!("f() {{ x=$( {TRAP}g() {{ echo ${{x:?u}}; }}; g ); echo \"x=[$x] s=$?\"; }}; f"),
+			"SH: x: u\nx=[] s=1\n".to_owned(),
+			0,
+		),
+		(
+			"an expansion error in an eval",
+			format!("( {TRAP}f() {{ echo ${{x:?u}}; }}; eval f ); echo w=$?"),
+			"SH: x: u\nreport\nw=1\n".to_owned(),
+			0,
+		),
+		(
+			"break in an eval",
+			format!("( {TRAP}f() {{ eval 'for i in 1; do break x; done'; }}; f ); echo w=$?"),
+			format!("{BREAK}report\nw=1\n"),
+			0,
+		),
+		(
+			"an arithmetic subscript error",
+			format!("( set -o posix; {TRAP}f() {{ a[1/0]=x; }}; eval f ); echo w=$?"),
+			"SH: 1/0: division by 0 (error token is \"0\")\nreport\nw=1\n".to_owned(),
+			0,
+		),
+		(
+			"a subshell forked inside an eval",
+			"f() { eval '( set -e; trap \"time eval \\\"{ false; } 2>/dev/null\\\"\" EXIT; g() { \
+			 false; }; g )'; }; f; echo w=$?"
+				.to_owned(),
+			"w=1\n".to_owned(),
+			0,
+		),
+	];
+	let rows: Vec<_> = rows
+		.iter()
+		.map(|(n, s, w, st)| (*n, s.as_str(), w.as_str(), *st))
+		.collect();
+	assert_rows(&rows);
+	let subshell = format!("( {TRAP}f() {{ echo ${{x:?u}}; }}; f ); echo w=$?");
+	let in_eval = format!("{TRAP}f() {{ eval 'echo ${{x:?u}}'; }}; f");
+	assert_rows_by_mode(&[
+		(
+			"an expansion error, a subshell",
+			&subshell,
+			("SH: x: u\nw=1\n", 0),
+			("SH: x: u\nreport\nw=1\n", 0),
+		),
+		("an expansion error, an eval", &in_eval, ("SH: x: u\nreport\n", 1), ("SH: x: u\n", 1)),
+	]);
+}
+
 /// `break` or `continue` with a count that is not a number runs bash's
 /// `top_level_cleanup` before it leaves the shell: every redirection is
 /// undone, and a `time` started inside the `-c` string or an `eval` loses
@@ -1315,13 +1476,16 @@ fn a_posix_special_builtins_error_is_errexit() {
 }
 
 /// Under `set -e` bash's `report_error` (a readonly variable assigned, an
-/// unbound one, `${x:?}`, a bad array subscript, an invalid variable name, a
-/// `failglob` miss) exits the shell itself: no jump, so no `time` reports.
-/// In an assignment, a posix special builtin's assignment, `let`, `(( ))`,
-/// `read`, `printf -v`, `export`, an expansion, in a condition and in a
-/// function called there; the status is `$?`, or 1. Not without `set -e`,
-/// not inside an `eval` a condition runs (bash turns the flag off there),
-/// and not for `declare`'s own message.
+/// unbound one, `${x:?}`, a bad array subscript, a list assigned to an array
+/// element, an associative array's element without a key, an invalid
+/// variable name, a `failglob` miss, a file `.` cannot read) exits the shell
+/// itself: no jump, so no `time` reports. In an assignment, a posix special
+/// builtin's assignment, `let`, `(( ))`, `read`, `printf -v`, `export`,
+/// `declare`, `local`, `.`, an expansion, in a condition and in a function
+/// called there; the status is `$?`, or 1. Not without `set -e`, and not
+/// inside an `eval`, `.` or a builtin run through `command` that a
+/// condition runs (bash turns the flag off there; `builtin` does not), nor
+/// for `declare`'s own message.
 #[test]
 fn report_error_under_set_e_leaves_without_a_report() {
 	const RO: &str = "w=1\ne1:\nSH: r: readonly variable\n";
@@ -1371,6 +1535,101 @@ fn report_error_under_set_e_leaves_without_a_report() {
 			"w=1\ne1:\nSH: u: unbound variable\nreport\n",
 		),
 		("declare", ro("declare r=2"), "w=1\ne1:\nSH: declare: r: readonly variable\nreport\n"),
+		(
+			"command in a condition",
+			ro("command export r=2 || echo no"),
+			"no\nreport\nafter\nw=0\ne1:\nSH: r: readonly variable\n",
+		),
+		(
+			"command in a function in a condition",
+			format!(
+				"( set -e; readonly r=1; f() {{ command export r=2; }}; time {{ f || echo no{TAIL}"
+			),
+			"no\nreport\nafter\nw=0\ne1:\nSH: r: readonly variable\n",
+		),
+		("command", ro("command export r=2"), RO),
+		("builtin in a condition", ro("builtin export r=2 || echo no"), RO),
+		(
+			"command in an && list",
+			ro("command export r=2 && echo yes"),
+			"report\nafter\nw=0\ne1:\nSH: r: readonly variable\n",
+		),
+		(
+			". in a condition",
+			format!("( set -e; time {{ . ./missing || echo no{TAIL}"),
+			"no\nreport\nafter\nw=0\ne1:\nSH: ./missing: No such file or directory\n",
+		),
+		(
+			"command . in a condition",
+			format!("( set -e; time {{ command . ./missing || echo no{TAIL}"),
+			"no\nreport\nafter\nw=0\ne1:\nSH: ./missing: No such file or directory\n",
+		),
+		("declare, a compound value", ro("declare r=(1)"), RO),
+		(
+			"local, a compound value",
+			format!("( set -e; readonly r=1; f() {{ local r=(1); }}; time {{ f{TAIL}"),
+			"w=1\ne1:\nSH: f: r: readonly variable\nSH: local: r: readonly variable\nreport\n",
+		),
+		(
+			"declare -a, a compound value",
+			format!("( set -e; readonly r=1; f() {{ declare -a r=(1); }}; time {{ f{TAIL}"),
+			"w=1\ne1:\nSH: f: r: readonly variable\nSH: declare: r: readonly variable\nreport\n",
+		),
+		(
+			"declare, a bad subscript",
+			format!("( set -e; time {{ declare -a a=([-9]=x){TAIL}"),
+			"w=1\ne1:\nSH: [-9]=x: bad array subscript\n",
+		),
+		(
+			"local, a bad subscript",
+			format!("( set -e; f() {{ local -a a=([-9]=x); }}; time {{ f{TAIL}"),
+			"w=1\ne1:\nSH: [-9]=x: bad array subscript\n",
+		),
+		(
+			"declare, a bad element",
+			format!("( set -e; time {{ declare a[-9]=x{TAIL}"),
+			"w=1\ne1:\nSH: a[-9]: bad array subscript\n",
+		),
+		(
+			". of a missing file",
+			format!("( set -e; time {{ . ./missing{TAIL}"),
+			"w=1\ne1:\nSH: ./missing: No such file or directory\n",
+		),
+		(
+			". in posix mode",
+			format!("( set -o posix; set -e; time {{ . ./missing{TAIL}"),
+			"w=1\ne1:\nSH: ./missing: No such file or directory\n",
+		),
+		(
+			"a list to an element",
+			format!("( set -e; time {{ a[0]=(1){TAIL}"),
+			"w=1\ne1:\nSH: a[0]: cannot assign list to array member\n",
+		),
+		(
+			"an element without a key",
+			format!("( set -e; declare -A A; time {{ A=([k]=v x){TAIL}"),
+			"w=1\ne1:\nSH: A: x: must use subscript when assigning associative array\n",
+		),
+		(
+			"declare, an element without a key",
+			format!("( set -e; time {{ declare -A A=([k]=v x){TAIL}"),
+			"w=1\ne1:\nSH: A: 'x': must use subscript when assigning associative array\n",
+		),
+		(
+			"an empty subscript",
+			format!("( set -e; time {{ a=([]=x){TAIL}"),
+			"w=1\ne1:\nSH: []=x: bad array subscript\n",
+		),
+		(
+			"a non-numeric index",
+			format!("( set -e; time {{ a=([@]=x){TAIL}"),
+			"w=1\ne1:\nSH: [@]=x: cannot assign to non-numeric index\n",
+		),
+		(
+			"let, unbound",
+			format!("( set -eu; time {{ let u{TAIL}"),
+			"w=1\ne1:\nSH: u: unbound variable\n",
+		),
 	];
 	let rows: Vec<_> = rows
 		.iter()
@@ -1397,6 +1656,37 @@ fn report_error_under_set_e_leaves_without_a_report() {
 			"status",
 			"( set -e; false || readonly r=1; (exit 5) || r=2; echo after ); echo w=$?",
 			"SH: r: readonly variable\nw=5\n",
+			0,
+		),
+		(
+			"command in an if",
+			"( set -e; readonly r=1; if command export r=2; then :; else echo no; fi; echo after ); \
+			 echo w=$?",
+			"SH: r: readonly variable\nno\nafter\nw=0\n",
+			0,
+		),
+		(
+			"command in a ! pipeline",
+			"( set -e; readonly r=1; ! command export r=2; echo after ); echo w=$?",
+			"SH: r: readonly variable\nafter\nw=0\n",
+			0,
+		),
+		(
+			"status, .",
+			"( set -e; (exit 5) || . ./missing; echo after ); echo w=$?",
+			"SH: ./missing: No such file or directory\nw=5\n",
+			0,
+		),
+		(
+			"status, a list to an element",
+			"( set -e; (exit 5) || a[0]=(1); echo after ); echo w=$?",
+			"SH: a[0]: cannot assign list to array member\nw=5\n",
+			0,
+		),
+		(
+			"status, let",
+			"( set -eu; (exit 5) || let u; echo after ); echo w=$?",
+			"SH: u: unbound variable\nw=1\n",
 			0,
 		),
 	]);

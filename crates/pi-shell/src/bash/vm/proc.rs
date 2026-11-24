@@ -816,6 +816,23 @@ pub struct Run {
 	pub exit_trap_started: bool,
 }
 
+/// Where the base frame of a child sits in bash's `parse_and_execute` levels
+/// ([`Frame::parse_level`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParseLevel {
+	/// Outside every level it starts: every frame but such a child's base.
+	#[default]
+	Outside,
+	/// A child forked inside an `eval`, `.` or trap action: bash's fork keeps
+	/// `parse_and_execute_level`, but the child's jumps go to its own top
+	/// (`execute_in_subshell`), which is no level of its own.
+	Kept,
+	/// A command or process substitution, whose text bash runs with
+	/// `parse_and_execute`: a level of its own (`command_substitute`,
+	/// `process_substitute`).
+	Substitution,
+}
+
 /// What kind of activation a frame is.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FrameKind {
@@ -1001,12 +1018,9 @@ pub struct Frame {
 	/// `set -e` is ignored: an `if`/`while`/`until` condition, a `&&`/`||`
 	/// list except its last command, a `!` pipeline.
 	pub ignore_errexit:    bool,
-	/// The base frame of a child that runs inside one of bash's
-	/// `parse_and_execute` levels from its start: one forked inside an
-	/// `eval`, `.` or trap action (bash's fork keeps
-	/// `parse_and_execute_level`), and a command or process substitution,
-	/// whose text bash runs with `parse_and_execute`.
-	pub parse_level:       bool,
+	/// Where the base frame of a child sits in bash's `parse_and_execute`
+	/// levels ([`ParseLevel`]); every other frame is outside them.
+	pub parse_level:       ParseLevel,
 	/// The base frame of a `( … )` child: the line bash reports for errors
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
@@ -1040,7 +1054,7 @@ impl Frame {
 			debug_errexit: false,
 			err_reported: false,
 			ignore_errexit: false,
-			parse_level: false,
+			parse_level: ParseLevel::Outside,
 			subshell_line: None,
 			getopts: None,
 		}

@@ -480,7 +480,7 @@ fn assign_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: 
 	let flow = if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 		.unwrap_or(false)
 	{
-		Flow::Exit(1, exec::Jump::Other)
+		Flow::Exit(1, exec::top_level_jump(cx, vp, cleanup))
 	} else {
 		Flow::Discard(1)
 	};
@@ -4014,14 +4014,18 @@ fn settle_builtin(
 			outcome.control = Control::Exit(exec::Jump::Other);
 		}
 	}
-	// A message the builtin prints bare (`let`, `read`, `printf -v`,
-	// `export` on a readonly variable) is bash's `report_error`: under
-	// `set -e` the shell exits where it is printed
-	// ([`exec::report_error_exits`]), and what would follow it never comes.
-	// `declare`'s bare one (a compound assignment) is not: bash 5.3 fails
-	// the builtin, and `set -e` exits after it.
-	if !matches!(outcome.control, Control::Frame | Control::Resume | Control::Wait(_))
-		&& !matches!(id, IntrinsicId::Declare | IntrinsicId::Typeset | IntrinsicId::Local)
+	// A message the builtin prints that is bash's `report_error` (`let`,
+	// `read`, `printf -v`, `export` on a readonly variable, `declare`'s bad
+	// array subscript, a file `.` cannot read): under `set -e` the shell
+	// exits where it is printed ([`exec::report_error_exits`]), and what
+	// would follow it never comes. bash turns `set -e` off while a
+	// condition runs `eval`, `.` or any builtin through `command`
+	// (`execute_cmd.c`, line 5000).
+	let errexit_off = (matches!(id, IntrinsicId::Eval | IntrinsicId::Dot | IntrinsicId::Source)
+		|| sc.exec.as_ref().is_some_and(|e| e.via_command))
+		&& vp.frames.last().is_some_and(exec::errexit_ignored);
+	if !errexit_off
+		&& !matches!(outcome.control, Control::Frame | Control::Resume | Control::Wait(_))
 		&& let Some(at) = chunks
 			.iter()
 			.position(|c| matches!(c, Chunk::Diag(d) if exec::report_error_exits(k, cx, vp, d)))
@@ -4657,7 +4661,7 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 						// a bash pipeline child.
 						let platform = k.engine.config().platform;
 						let status = crate::bash::signal::Signal::Pipe.exit_status(platform);
-						return Some(Flow::Exit(status, exec::Jump::Other));
+						return Some(Flow::Exit(status, exec::Jump::Direct));
 					}
 					if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 						zsh_write_error(k, vp, cx, line, fd, &err);
@@ -4808,9 +4812,10 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		},
 		Some(Transfer::Exec) => {
 			// The program replaced the shell (or `exec` failed and the shell
-			// exits): bash's `time` around it never reports.
+			// exits, `exit_shell` with no jump): bash's `time` around it
+			// never reports.
 			exec::drop_times(vp);
-			Flow::Exit(status, exec::Jump::Other)
+			Flow::Exit(status, exec::Jump::Direct)
 		},
 	}
 }

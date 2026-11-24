@@ -105,13 +105,15 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			ctx.err(Diag::Usage { msg: format!("{}: is a directory", shown.as_bstr()).into() });
 			return done(1);
 		},
+		// bash's `file_error`: a `report_error` (`set -e` exits at once).
 		ProbeResult::Bytes(Err(msg)) => {
-			ctx.diag(Diag::Usage { msg: format!("{}: {}", file.as_bstr(), msg.as_bstr()).into() });
+			ctx.diag(Diag::FileError { path: file.clone(), msg });
 			ctx.usage_error = true;
 			return done(1);
 		},
 		_ => {
-			ctx.diag(Diag::NoSuchFile { name: file.clone() });
+			let msg = BString::from("No such file or directory");
+			ctx.diag(Diag::FileError { path: file.clone(), msg });
 			ctx.usage_error = true;
 			return done(1);
 		},
