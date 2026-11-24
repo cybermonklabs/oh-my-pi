@@ -13,7 +13,7 @@ import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { ExtensionFactory, PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -155,7 +155,11 @@ async function spawnAndPark() {
 		},
 	});
 	const catalogAvailable = modelRegistry.getAvailable.bind(modelRegistry);
+	const catalogAll = modelRegistry.getAll.bind(modelRegistry);
 	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [mock, ...catalogAvailable(kind)]);
+	// A registry lists every model it can serve among all its models too; a cold revive resolves the
+	// spawn's model there.
+	vi.spyOn(modelRegistry, "getAll").mockImplementation(() => [mock, ...catalogAll()]);
 	const settings = Settings.isolated({
 		// No TTL timer: the test parks explicitly through the same path the timer takes.
 		"task.agentIdleTtlMs": 0,
@@ -167,8 +171,8 @@ async function spawnAndPark() {
 		"advisor.enabled": false,
 		modelRoles: { default: "mock/mock-model" },
 	});
-	const preparedExtensions = [
-		{ path: "<inline-0>", resolvedPath: "<inline-0>", factory: registersAtFirstTurn, error: null },
+	const preparedExtensions: PreparedExtension[] = [
+		{ path: "<inline-0>", scope: "inline", resolvedPath: "<inline-0>", factory: registersAtFirstTurn, error: null },
 	];
 	try {
 		const result = await runSubprocess({

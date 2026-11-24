@@ -62,17 +62,33 @@ The factory can:
 
 With ambient discovery enabled, sessions load JS/TS hook factories discovered
 by `hookCapability` through the extension runner.
-`discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds?, options?)`:
+`discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds?, options?)`
+returns one `{ path, scope }` entry per source, gathered in this order:
 
 1. Loads extension modules from the native provider only
 2. Loads importable `.ts`/`.js` hook factories from the hook capability registry (unless `includeAmbientHooks: false`)
 3. Appends enabled plugin extension entry points
 4. Resolves explicitly configured files/directories
 
-Paths are deduplicated by absolute path. With `ambient: false`, native/installed
+A native hook of the project's `.omp/hooks/` has scope `project`, one of the
+agent directory's `hooks/` has scope `user`, a hook of an installed plugin has
+the plugin's install scope, a hook of a plugin loaded with `--plugin-dir` has
+scope `user`, and a hook of a package root named by `--extension`,
+`additionalExtensionPaths` or the `extensions` setting has scope `explicit`.
+A hook of another provider's directory keeps that directory's level: the
+`claude` provider's `.ts`/`.js` files of `.claude/hooks/pre/` and
+`.claude/hooks/post/` are `project`, and those of the same directories under
+Claude's user directory (`~/.claude` by default) are `user`; the
+`codex` provider's `pre-<tool>.{ts,js}` and `post-<tool>.{ts,js}` files of
+`.codex/hooks/` are `project`, and those of `~/.codex/hooks/` are `user`.
+`loadExtensions()` takes these entries; it also takes a bare path string, which
+it reads as an `explicit` entry. See
+[Extension Loading](./extension-loading.md#load-order-and-precedence) for what each scope means.
+
+Entries are deduplicated by real file. With `ambient: false`, native/installed
 discovery is skipped, but configured package roots can still contribute hook
-factories. Foreign user sources require opt-in via `enabledProviders`; project
-sources are unaffected by that user-level gate.
+factories, each `explicit`. Foreign user sources require opt-in via
+`enabledProviders`; project sources are unaffected by that user-level gate.
 
 ### Native discovery location
 

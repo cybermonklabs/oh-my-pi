@@ -46,7 +46,7 @@ describe("extension runtime setting overrides", () => {
 		await Bun.write(extensionPath, EXTENSION_SOURCE);
 		if (globalConfig) await Bun.write(path.join(agentDir, "config.yml"), globalConfig);
 		const settings = await Settings.init({ cwd, agentDir });
-		const result = await loadExtensions([extensionPath], cwd);
+		const result = await loadExtensions([{ path: extensionPath, scope: "explicit" }], cwd);
 		expect(result.errors).toEqual([]);
 		return settings;
 	}

@@ -3277,6 +3277,40 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 	});
 });
 
+describe("loadSecrets with extra project directories", () => {
+	it("loads each extra project directory's secrets once beside cwd's, an entry of cwd's project winning a shared content", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-secret-projects-"));
+		try {
+			const project = path.join(root, "project");
+			const other = path.join(root, "other");
+			const agentDir = path.join(root, "agent");
+			await fs.mkdir(path.join(project, ".omp"), { recursive: true });
+			await fs.mkdir(path.join(other, ".omp"), { recursive: true });
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.writeFile(
+				path.join(project, ".omp", "secrets.yml"),
+				"- type: plain\n  content: project-secret\n- type: plain\n  content: shared-secret\n  mode: replace\n",
+			);
+			await fs.writeFile(
+				path.join(other, ".omp", "secrets.yml"),
+				"- type: plain\n  content: other-secret\n- type: plain\n  content: shared-secret\n",
+			);
+			await fs.writeFile(path.join(agentDir, "secrets.yml"), "- type: plain\n  content: global-secret\n");
+
+			const entries = await loadSecrets(project, agentDir, [other, project, other]);
+
+			expect(entries.map(entry => [entry.content, entry.mode])).toEqual([
+				["global-secret", "obfuscate"],
+				["project-secret", "obfuscate"],
+				["shared-secret", "replace"],
+				["other-secret", "obfuscate"],
+			]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("SecretObfuscator cross-turn cache stability", () => {
 	// The provider prompt cache is content-addressed: convertToLlm / transformProviderContext
 	// re-run obfuscation over the WHOLE message array every turn, so a non-deterministic

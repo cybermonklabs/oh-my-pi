@@ -62,8 +62,12 @@ describe("loadExtensions per-session binding (#2190 review fix)", () => {
 		const parentEventBus = new EventBus();
 		const subagentEventBus = new EventBus();
 
-		const parent = await loadExtensions([extPath], "/tmp/parent-cwd", parentEventBus);
-		const subagent = await loadExtensions([extPath], "/tmp/subagent-cwd", subagentEventBus);
+		const parent = await loadExtensions([{ path: extPath, scope: "explicit" }], "/tmp/parent-cwd", parentEventBus);
+		const subagent = await loadExtensions(
+			[{ path: extPath, scope: "explicit" }],
+			"/tmp/subagent-cwd",
+			subagentEventBus,
+		);
 
 		expect(parent.errors).toEqual([]);
 		expect(subagent.errors).toEqual([]);
