@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The default extraction prompt records an `instructions` item as who asked for what, when and why, not as a bare command
+
 ## [18.18.4] - 2026-11-09
 
 ### Fixed

@@ -30,13 +30,14 @@ import {
 import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import { redactMemorySecrets, redactRememberWrite } from "../memory-backend/redact";
+import type { Settings } from "../config/settings";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import memoryRecallChangesPrompt from "../prompts/system/memory-recall-changes.md" with { type: "text" };
 import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with { type: "text" };
 import { type MnemopiBackendConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
 import { mnemopiEmbedClient } from "./embed-client";
-import { cfgMnemopiInjectionTokenLimit } from "./settings";
+import { cfgMnemopiAutoRetain, cfgMnemopiInjectionTokenLimit } from "./settings";
 
 /** A rendered recall block and where each tracked memory's text starts in it. */
 interface RecallBlock {
@@ -308,6 +309,25 @@ export interface MnemopiSessionStateApi {
 	rememberScoped(memory: MnemopiRememberInput, options?: MnemopiRememberOptions, target?: MnemopiBankTarget): string;
 	getScopedStats(): MnemopiBankStats[];
 	consolidate(options?: MnemopiConsolidateOptions): Promise<void>;
+}
+
+/**
+ * The memory instructions. They say completed turns are retained automatically only
+ * when they are: `mnemopi.autoRetain` is on and the session is top-level. A subagent
+ * aliases its parent's banks and retains nothing of its own
+ * ({@link MnemopiSessionState.maybeRetainOnAgentEnd}). Read from the settings, not from
+ * a Mnemopi state: a session renders its first system prompt before its state exists.
+ * A live `mnemopi.*` edit reinstalls the state, so its config agrees with the settings.
+ */
+export function renderMnemopiInstructions(
+	settings: Settings,
+	subagent: boolean,
+	mountedDevices: readonly { name: string }[] | undefined,
+): string {
+	return prompt.render(mnemopiInstructions, {
+		toolRefs: memoryToolRefs(mountedDevices),
+		autoRetain: !subagent && cfgMnemopiAutoRetain.get(settings),
+	});
 }
 
 export class MnemopiSessionState implements MnemopiSessionStateApi {
@@ -674,9 +694,11 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 	 * that ends in "…" when it cut one.
 	 */
 	budgetRecallBlock(block: string): string {
-		const instructions = prompt.render(mnemopiInstructions, {
-			toolRefs: memoryToolRefs(this.session.getXdevToolEntries()),
-		});
+		const instructions = renderMnemopiInstructions(
+			this.session.settings,
+			this.aliasOf !== undefined,
+			this.session.getXdevToolEntries(),
+		);
 		return truncateApproxTokens(
 			[instructions, block].join("\n\n").trim(),
 			cfgMnemopiInjectionTokenLimit.get(this.session.settings),

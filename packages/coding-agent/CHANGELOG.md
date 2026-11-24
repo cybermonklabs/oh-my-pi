@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `retain`, the memory instructions and the Mnemopi fact extractor now ask for a memory as a record of what was said or done, by whom, when, why and where to find it, not as a bare rule or command, so a later session can weigh a recalled memory instead of obeying it. The extractor also treats its input as text to extract from, not as a request to answer
+
+### Fixed
+
+- With `mnemopi.autoRetain` off, and in subagents, the Mnemopi memory instructions no longer tell the agent that completed turns are retained automatically. The line follows the settings and the session's task depth, so a session's first system prompt, rendered before the memory backend starts, is right too
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
