@@ -141,6 +141,32 @@ entries() {
 	list_entries "$sami/$1" "$2" >"$tmp/$3" || stop "$sami/$1 has a malformed line (above)"
 }
 entries rust-test-known-failures.txt 2 known-failures.tsv
+# Flaky entries: a known-failure line whose reason starts with `flaky: `.
+# Bazel runs each such target up to 3 times (--flaky_test_attempts, on the
+# main and root invocations: the whole target again after an attempt that
+# failed) and keeps every attempt's log. The reckoning below the libtest
+# logs reads, per flaky test: failed on some attempts and passed on another
+# is KNOWN; failed on every attempt is NEW; passed on the first is a pass,
+# with a notice. A test with a plain known-failure line, or none, is judged
+# as before, on every attempt it failed.
+awk '/^[[:space:]]*(#|$)/ { next }
+	{ i = index($0, " "); first = substr($0, 1, i - 1); rest = substr($0, i + 1)
+	  j = index(rest, "  "); why = substr(rest, j); sub(/^ +/, "", why)
+	  if (why ~ /^flaky: /) print first "\t" substr(rest, 1, j - 1) }' "$sami/rust-test-known-failures.txt" | LC_ALL=C sort -u >"$tmp/flaky.tsv"
+# label_regex <label>: a regex that matches exactly the label. A comma
+# would split Bazel's filter list; no label of this repository has one.
+label_regex() {
+	local re="$1" c
+	for c in . + '*' '?' '(' ')' '[' ']' '{' '}' '^' '$' '|'; do
+		re="${re//"$c"/\\$c}"
+	done
+	printf '^%s$' "$re"
+}
+flaky_flags=()
+while read -r target; do
+	case "$target" in *,*) stop "$target in $sami/rust-test-known-failures.txt has a comma, which --flaky_test_attempts cannot take" ;; esac
+	flaky_flags+=(--flaky_test_attempts="$(label_regex "$target")@3")
+done < <(cut -f1 "$tmp/flaky.tsv" | LC_ALL=C sort -u)
 entries rust-test-known-skips.txt 2 known-skips.tsv
 entries rust-test-known-output.txt 2 known-output.tsv
 entries rust-test-known-raw-output.txt 2 known-raw-output.tsv
@@ -454,9 +480,9 @@ check_alone() {
 }
 
 if [ -z "$only" ]; then
-	bazel_test main "$tmpdir_under" "${skip_flags[@]}" -- //crates/... "${not_roots[@]}"
+	bazel_test main "$tmpdir_under" "${skip_flags[@]}" "${flaky_flags[@]}" -- //crates/... "${not_roots[@]}"
 	if [ "${#roots[@]}" -gt 0 ]; then
-		bazel_test root "$root_under" -- "${roots[@]}"
+		bazel_test root "$root_under" "${flaky_flags[@]}" -- "${roots[@]}"
 	fi
 	{ cut -f1 "$rows"; cat "$tmp/unbuilt.txt"; } | LC_ALL=C sort -u >"$tmp/present.txt"
 	# Each own-process test alone: its target with libtest's --exact filter,
@@ -747,6 +773,7 @@ fi
 skip_line='^([A-Za-z0-9_:]+: )?(skipped|skipping|SKIP|not run|UNCOMPARED)[ :]'
 raw_skip_line='(^|: )(skipped|skipping|SKIP|not run|UNCOMPARED)[ :]'
 failed="$tmp/failed.tsv"
+: >"$tmp/failed-at.tsv"
 skips="$tmp/skips.tsv"
 outputs="$tmp/outputs.tsv"
 incomplete="$tmp/incomplete.txt"
@@ -843,15 +870,17 @@ check_root() {
 	fi
 }
 
-# add_failed <target> <status> <names>: a failed log's failed tests, one per
-# line. A failed log that names none (a crash, a timeout) fails the job,
-# since the list cannot account for it.
+# add_failed <target> <status> <names> <log> <invocation>: a failed log's
+# failed tests, one per line, and in failed-at.tsv each with its log and
+# invocation (for the flaky reckoning). A failed log that names none (a
+# crash, a timeout) fails the job, since the list cannot account for it.
 add_failed() {
 	if [ -z "$3" ]; then
 		error "Rust tests" "$1 is $2 and its log names no failed test"
 		return 0
 	fi
 	printf '%s\n' "$3" | awk -v label="$1" 'NF { print label "\t" $0 }' >>"$failed"
+	printf '%s\n' "$3" | awk -v label="$1" -v at="$4" -v inv="$5" 'NF { print label "\t" $0 "\t" at "\t" inv }' >>"$tmp/failed-at.tsv"
 }
 
 # doc_dir <target>: a doctest target's crate directory: crates/x for the
@@ -941,7 +970,7 @@ check_libtest() {
 	echo "::group::$label failures"
 	jq -R -r 'fromjson? | select(type == "object" and .type == "test" and .event == "failed") | "---- \(.name) ----\n\(.stdout // "")"' "$log"
 	echo "::endgroup::"
-	add_failed "$label" "$status" "$names"
+	add_failed "$label" "$status" "$names" "$log" "$inv"
 }
 
 # check_doctest <target> <status> <kind> <log>: a rust_doc_test log is the
@@ -995,7 +1024,7 @@ check_doctest() {
 		/^test result: FAILED\./ { printf "%s", names }
 		{ inlist = 0; names = "" }
 	' "$log")"
-	add_failed "$label" "$status" "$names"
+	add_failed "$label" "$status" "$names" "$log" "$inv"
 }
 
 while IFS=$'\t' read -r label rule status kind log _ inv; do
@@ -1141,6 +1170,29 @@ if [ -n "$only" ]; then
 		mv "$tmp/$list.here" "$tmp/$list.tsv"
 	done
 fi
+# The flaky reckoning (see flaky.tsv above). The attempts of a target are its
+# logs in the main and root invocations; a test failed on one when that log
+# names it failed. The tests it judges, and the flaky lines, then leave the
+# known-failure reconciling.
+: >"$tmp/flaky-judged.tsv"
+while IFS=$'\t' read -r label name; do
+	attempts="$(awk -F'\t' -v t="$label" '$1 == t && ($7 == "main" || $7 == "root") && $5 != "-" { n++ } END { print n + 0 }' "$rows")"
+	fails="$(awk -F'\t' -v t="$label" -v n="$name" '$1 == t && $2 == n && ($4 == "main" || $4 == "root") { print $3 }' "$tmp/failed-at.tsv" | LC_ALL=C sort -u | awk 'END { print NR }')"
+	if [ "$attempts" = 0 ]; then
+		error "Rust test flaky" "$label $name is listed flaky in $sami/rust-test-known-failures.txt, but the tree under test gave $label no result"
+	elif [ "$fails" = 0 ]; then
+		echo "::notice title=Known flaky test::$label $name is listed flaky in $sami/rust-test-known-failures.txt and did not fail"
+	elif [ "$fails" -lt "$attempts" ]; then
+		echo "Known flaky test, failed on $fails of $attempts attempts and passed on another: $label $name"
+	else
+		error "Rust test flaky" "$label $name is listed flaky in $sami/rust-test-known-failures.txt, but failed on every attempt ($fails of $attempts): NEW"
+	fi
+	printf '%s\t%s\n' "$label" "$name" >>"$tmp/flaky-judged.tsv"
+done <"$tmp/flaky.tsv"
+LC_ALL=C sort -u "$failed" | LC_ALL=C comm -23 - "$tmp/flaky-judged.tsv" >"$tmp/failed-left.tsv"
+mv "$tmp/failed-left.tsv" "$failed"
+LC_ALL=C sort -u "$tmp/known-failures.tsv" | LC_ALL=C comm -23 - "$tmp/flaky.tsv" >"$tmp/known-left.tsv"
+mv "$tmp/known-left.tsv" "$tmp/known-failures.tsv"
 reconcile "$failed" "$sami/rust-test-known-failures.txt" "$tmp/known-failures.tsv" failure failed "Rust test failed" error
 reconcile "$skips" "$sami/rust-test-known-skips.txt" "$tmp/known-skips.tsv" skip "skipped itself" "Rust test skipped" error
 echo "Skipped tests: $(count "$skips")"

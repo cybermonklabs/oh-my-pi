@@ -125,10 +125,11 @@ cfg() { jq -cn --arg l "$1" --arg k "$2" '{id:{targetConfigured:{label:$l}},conf
 # unbuilt <label>: the event Bazel writes for a target that did not build,
 # which then has no test summary at all.
 unbuilt() { jq -cn --arg l "$1" '{id: {targetCompleted: {label: $l}}, completed: {success: false}}'; }
-summary() { # label status [failed log] [passed log]
-	jq -cn --arg l "$1" --arg s "$2" --arg f "${3:-}" --arg p "${4:-}" '{id:{testSummary:{label:$l,configuration:{id:"c"}}},testSummary:({overallStatus:$s,totalRunCount:1}
-		+ (if $p != "" then {passed:[{name:"test.log",uri:("file://" + $p)}]} else {} end)
-		+ (if $f != "" then {failed:[{name:"test.log",uri:("file://" + $f)}]} else {} end))}'
+summary() { # label status [failed logs] [passed logs], each list split on spaces
+	jq -cn --arg l "$1" --arg s "$2" --arg f "${3:-}" --arg p "${4:-}" 'def logs($x): $x | split(" ") | map(select(. != "") | {name:"test.log",uri:("file://" + .)});
+		{id:{testSummary:{label:$l,configuration:{id:"c"}}},testSummary:({overallStatus:$s,totalRunCount:1}
+		+ (if $p != "" then {passed:logs($p)} else {} end)
+		+ (if $f != "" then {failed:logs($f)} else {} end))}'
 }
 # tpath / bpath <label>: a target's test.log and test binary, as Bazel lays
 # them out under bazel-out.
@@ -227,7 +228,9 @@ own_default() {
 # 5 after any run whose arguments hold this text), RAW_LIST (a
 # rust-test-known-raw-output.txt to use in place of KNOWN_RAW's),
 # SANCTIONED_LINE (a line written as it is after SANCTIONED's), NOT_MSG (a
-# regex the output must not match).
+# regex the output must not match), FLAKY (known-failure lines whose reason
+# is `flaky: a race`), MAIN_MUST_FLAKY (targets the main invocation must
+# give --flaky_test_attempts=^<target>$@3).
 run() {
 	local name="$1" want="$2" msg="$3" entries="$4" body="$5"
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
@@ -239,6 +242,7 @@ run() {
 		{ echo '# header'; echo; [ -n "$2" ] && printf '%s\n' "$2" | while read -r a b; do [ -n "$a" ] && printf '%s %s  %s\n' "$a" "$b" "$3"; done; } >"$w/repo/.github/sami/$1"
 	}
 	if [ "$entries" != MISSING ]; then list rust-test-known-failures.txt "$entries" "owner fix: reason"; fi
+	if [ -n "${FLAKY:-}" ]; then printf '%s\n' "$FLAKY" | while read -r a b; do printf '%s %s  flaky: a race\n' "$a" "$b"; done >>"$w/repo/.github/sami/rust-test-known-failures.txt"; fi
 	list rust-test-root-targets.txt "${ROOTS:+$ROOTS ${ROOT_COUNT:-2}}" "why"
 	list rust-test-known-skips.txt "${KNOWN_SKIPS:-}" "reason"
 	list rust-test-known-output.txt "${KNOWN_OUTPUT:-}" "prints a summary; no skip"
@@ -349,6 +353,7 @@ if [ "\$inv" = main ]; then
 	[ "\${targets[0]:-}" = //crates/... ] || { echo "stub: main run's targets are [\${targets[*]}]" >&2; exit 2; }
 	for r in ${ROOTS:-}; do has "-\$r"; done
 	for s in ${MAIN_MUST_SKIP:-}; do has "--test_arg=--skip --test_arg=\$s"; done
+	for t in ${MAIN_MUST_FLAKY:-}; do has "--flaky_test_attempts=^\${t}\\\$@3"; done
 elif [ "\$inv" = root ]; then
 	$(printf '%s' "${ROOT_BODY:-exit 9}")
 else
@@ -770,6 +775,13 @@ ROOT_ALONE="$B r::as_root" OWN_TESTS="a::one b::build_skipped r::as_root" run J1
 # adds) is named and nothing is run for it: bazel test of a target that does
 # not exist is no test (J155).
 NOT_MSG='bazel test exited|reported \[' IGNORED_RUN="//crates/pi-vcs:gone_test x::y" run J155-ignored-test-of-a-target-the-tree-lacks 1 "//crates/pi-vcs:gone_test x::y is in .github/sami/rust-test-ignored.txt, but the tree under test has no target //crates/pi-vcs:gone_test" '' "{ $P; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 0"
+# A test listed flaky: its target gets Bazel's retries in the main invocation;
+# failed on one attempt and passed on the next, it is known (J156); failed on
+# every attempt, it is new (J157); passed on the first, it passes with a
+# notice (J158). A plain known failure on a retried attempt stays as J17b.
+FLAKY="$B x::f" MAIN_MUST_FLAKY="$B" run J156-flaky-listed-failed-then-passed 0 "Known flaky test, failed on 1 of 2 attempts and passed on another: $B x::f" '' "f=\"\$(tpath $B)\"; a=\"\$(dirname \"\$f\")/test_attempts/attempt_1.log\"; mkdir -p \"\$(dirname \"\$a\")\"; lt_fail x::f >\"\$a\"; lt_pass x::passes x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B FLAKY \"\$a\" \"\$f\"; } >\"\$bep\"; exit 0"
+NOT_MSG='Known flaky test, failed on' FLAKY="$B x::f" run J157-flaky-listed-failed-every-attempt 1 "$B x::f is listed flaky in .github/sami/rust-test-known-failures.txt, but failed on every attempt \\(2 of 2\\): NEW" '' "f=\"\$(tpath $B)\"; a=\"\$(dirname \"\$f\")/test_attempts/attempt_1.log\"; mkdir -p \"\$(dirname \"\$a\")\"; lt_fail x::f >\"\$a\"; lt_fail x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B FAILED \"\$a \$f\"; } >\"\$bep\"; exit 3"
+NOT_MSG='Known failure did not happen|failed and is not in' FLAKY="$B x::f" run J158-flaky-listed-passed-first 0 "$B x::f is listed flaky in .github/sami/rust-test-known-failures.txt and did not fail" '' "f=\"\$(tpath $B)\"; mkdir -p \"\$(dirname \"\$f\")\"; lt_pass x::passes x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B PASSED '' \"\$f\"; } >\"\$bep\"; exit 0"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.
