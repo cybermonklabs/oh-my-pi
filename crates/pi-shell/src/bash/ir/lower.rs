@@ -614,6 +614,22 @@ impl Lower {
 						self.exec_b = Op::EXEC_FORKED;
 					}
 					self.and_or(ao)?;
+					// bash runs a pipeline that is the whole item asynchronously,
+					// every stage forked (`execute_pipeline`); `&&`/`||` and
+					// `time` (whose `TimeStart` opens the item) fork a subshell
+					// first, where `lastpipe` holds.
+					if !zsh
+						&& ao.rest().next().is_none()
+						&& let Some(op) = self.unit.ops.get_mut(entry as usize)
+						&& op.code == Opcode::Spawn
+						&& self
+							.unit
+							.spawns
+							.get(op.a as usize)
+							.is_some_and(|s| s.kind == SpawnKind::Pipeline)
+					{
+						op.b |= Op::ASYNC_PIPELINE;
+					}
 					self.emit(Opcode::SubExit, 0, 0, ao_id);
 					let end = self.here();
 					let s = &mut self.unit.spawns[spawn as usize];

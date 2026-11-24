@@ -106,6 +106,9 @@ fn a_lone_jobspec_in_the_background_is_bg_here() {
 	check(&[
 		(r#"sleep 0.2 & %1 & echo "st=$?""#, "st=1\n", BG, 0),
 		(r#"sleep 0.2 & %1 > ${f:=out} & echo "[$f]"; wait"#, "[]\n", BG, 0),
+		// No redirection is made, also with no job.
+		("%1 > out & wait; [ -e out ] && echo made || echo none", "none\n", BG, 0),
+		("sleep 0.2 & %1 >> out & wait; [ -e out ] && echo made || echo none", "none\n", BG, 0),
 		(r#"sleep 0.2 & %1 &>/dev/null & echo "st=$?""#, "st=1\n", BG, 0),
 		(r#"sleep 0.2 & ! %1 & echo "st=$?""#, "st=0\n", BG, 0),
 		(r#"set -e; sleep 0.2 & %1 & echo "st=$?""#, "", BG, 1),
@@ -131,6 +134,9 @@ fn a_jobspec_bash_forks_for_is_not_found() {
 		(r#"j=%1; sleep 0.2 & $j & wait $!; echo "st=$?""#, "st=127\n", NOT_FOUND, 0),
 		(r#"sleep 0.2 & "%1" & wait $!; echo "st=$?""#, "st=127\n", NOT_FOUND, 0),
 		(r#"sleep 0.2 & A=1 %1 & wait $!; echo "st=$?""#, "st=127\n", NOT_FOUND, 0),
+		// A quoted `%` makes no jobspec: the command is forked.
+		(r#"sleep 0.2 & \%1 & wait $!; echo "st=$?""#, "st=127\n", NOT_FOUND, 0),
+		(r#"sleep 0.2 & '%1' & wait $!; echo "st=$?""#, "st=127\n", NOT_FOUND, 0),
 	]);
 }
 
@@ -145,7 +151,10 @@ fn a_jobspec_in_a_subshell_or_group_is_fg_there() {
 }
 
 /// `lastpipe` with job control off runs a pipeline's last stage in the
-/// shell (bash `execute_pipeline`): no fork, so a jobspec there is `fg`.
+/// shell (bash `execute_pipeline`): no fork, so a jobspec there is `fg`. Not
+/// for a pipeline that is the whole `&` item: bash runs it asynchronously,
+/// every stage forked; `&&`, `time` and a compound command fork a subshell
+/// first, where `lastpipe` holds again.
 #[test]
 fn a_jobspec_in_a_lastpipe_stage_is_fg() {
 	check(&[
@@ -164,6 +173,34 @@ fn a_jobspec_in_a_lastpipe_stage_is_fg() {
 		),
 		// Job control on: no `lastpipe`, the stage is forked.
 		(r#"shopt -s lastpipe; set -m; true | %1; echo "${PIPESTATUS[*]}""#, "0 127\n", NOT_FOUND, 0),
+		// The whole `&` item: every stage forked.
+		(
+			r#"shopt -s lastpipe; sleep 0.2 & true | %1 & wait $!; echo "st=$?""#,
+			"st=127\n",
+			NOT_FOUND,
+			0,
+		),
+		("shopt -s lastpipe; sleep 0.2 & ! true | %1 & wait; echo done", "done\n", NOT_FOUND, 0),
+		(
+			r#"shopt -s lastpipe; sleep 0.2 & true | %1 > ${f:=x} & wait $!; echo "[$f] st=$?""#,
+			"[] st=127\n",
+			NOT_FOUND,
+			0,
+		),
+		// A subshell first: `lastpipe` holds there.
+		(r#"shopt -s lastpipe; sleep 0.2 & { true | %1; } & wait $!; echo "st=$?""#, "st=1\n", FG, 0),
+		(
+			r#"shopt -s lastpipe; sleep 0.2 & true | %1 && echo yes & wait $!; echo "st=$?""#,
+			"st=1\n",
+			FG,
+			0,
+		),
+		(
+			r#"shopt -s lastpipe; TIMEFORMAT=; sleep 0.2 & time true | %1 & wait $!; echo "st=$?""#,
+			"st=1\n",
+			FG,
+			0,
+		),
 	]);
 }
 

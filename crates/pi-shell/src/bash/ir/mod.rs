@@ -47,7 +47,7 @@
 //! | `LoopExit` | – | – | pop the loop record, `$?` = its status, emit `LoopEnd` |
 //! | `Redir` | `redirs` index | pc after the matching `PopRedir` | apply a compound command's redirections (staged), saving the previous fds; on failure `$?` = 1 and jump to `b` |
 //! | `PopRedir` | – | – | restore the fds saved by the matching `Redir` |
-//! | `Spawn` | `spawns` index | – | subshell, pipeline or background job (flag [`Op::DISOWN`]: zsh `&!`/`&|`, not in the job table): start child vprocs at the stage entries; `Subshell`/`Pipeline` wait and set `$?`/`PIPESTATUS`; then jump to the entry's `end` |
+//! | `Spawn` | `spawns` index | [`Op::ASYNC_PIPELINE`] or 0 | subshell, pipeline or background job (flag [`Op::DISOWN`]: zsh `&!`/`&|`, not in the job table): start child vprocs at the stage entries; `Subshell`/`Pipeline` wait and set `$?`/`PIPESTATUS`; then jump to the entry's `end` |
 //! | `SubExit` | – | – | end of a child's code: the vproc exits with `$?` |
 //! | `CaseWord` | `words` index | – | expand the `case` subject (no splitting) and push it |
 //! | `CaseArm` | `pats` index | next-arm pc | match the subject against the patterns; no match: jump to `b` |
@@ -203,6 +203,12 @@ pub struct Op {
 const _: () = assert!(size_of::<Op>() == 16);
 
 impl Op {
+	/// `Spawn` operand `b` on a bash pipeline that is a whole background
+	/// list item (`a | b &`, `! a | b &`; not with `&&`/`||` or `time`,
+	/// which fork a subshell first): bash runs it asynchronously, forking
+	/// every stage, so its last stage does not run in the shell under
+	/// `lastpipe` (`execute_pipeline`'s `asynchronous == 0` test).
+	pub const ASYNC_PIPELINE: u32 = 1;
 	/// Flag on `Exec`: the whole body of a `$( )` is `< file`, which
 	/// outputs the file (bash's `$(< file)`).
 	pub const CAT: u8 = 1 << 4;

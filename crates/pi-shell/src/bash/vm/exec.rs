@@ -4105,14 +4105,17 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 			SpawnKind::Pipeline => {
 				let n = info.stages.len();
 				let tap = cx.host.pipe_tap();
-				// `lastpipe` without job control: the last stage runs here. zsh
-				// runs it in the current shell but under sh emulation
-				// (`execcmd_exec`'s `last1 == 2 && input &&
+				// `lastpipe` without job control: the last stage runs here,
+				// unless bash runs the pipeline asynchronously (the whole
+				// background item, [`Op::ASYNC_PIPELINE`]): it forks every
+				// stage. zsh runs it in the current shell but under sh
+				// emulation (`execcmd_exec`'s `last1 == 2 && input &&
 				// EMULATION(EMULATE_SH)`).
 				let lastpipe = if unit.mode.dialect() == Dialect::Zsh {
 					vp.mode != ModeId::ZshSh
 				} else {
-					state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
+					op.b & Op::ASYNC_PIPELINE == 0
+						&& state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
 						&& !job_control(k, cx, vp)
 				};
 				let mut stdin = vp.fds.get(0).cloned();
