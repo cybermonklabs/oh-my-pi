@@ -4397,9 +4397,12 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		// bash's `stop_pipeline` (each fork it makes a job of) first deletes
 		// the finished jobs reported (`jobs.c:572`); for a `lastpipe`
 		// pipeline it runs with the job list frozen (`execute_pipeline`),
-		// deleting none.
+		// deleting none. A `( … )` the shell waits for is a job too.
 		if info.kind != SpawnKind::Pipeline {
 			super::killed::cleanup_dead_jobs(vp);
+			if info.kind == SpawnKind::Subshell {
+				super::killed::foreground_job(vp);
+			}
 		}
 		match info.kind {
 			SpawnKind::Subshell | SpawnKind::Background => {
@@ -4521,6 +4524,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				};
 				if !lastpipe {
 					super::killed::cleanup_dead_jobs(vp);
+					if !job_stages {
+						super::killed::foreground_job(vp);
+					}
 				}
 				let mut stdin = vp.fds.get(0).cloned();
 				for (i, stage) in info.stages.iter().enumerate() {
@@ -4816,9 +4822,9 @@ pub(super) fn fork_async_ignored(
 /// them, which are not its children, and the statuses its parent kept for
 /// `wait PID` (bash's child has the parent's bgp list: a command
 /// substitution's `wait PID` finds one); `subshell` turns job control off.
-/// A fork keeps its shell's frozen job list: the parent's own
-/// ([`Vproc::jobs_kept`]) or the one it started with
-/// ([`super::proc::JobTable::kept`]).
+/// A fork keeps its shell's `jobs_list_frozen` ([`Vproc::freeze`]), and the
+/// numbers its foreground commands hold
+/// ([`super::proc::JobTable::held`]).
 pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTable {
 	let parent = &vp.jobs;
 	let mut list = parent.list.clone();
@@ -4832,7 +4838,8 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 		chld: 0,
 		subshell,
 		comsub: parent.comsub,
-		kept: parent.kept || vp.jobs_kept(),
+		freeze: vp.freeze(),
+		held: parent.held,
 		bgp: parent.bgp.clone(),
 	}
 }
@@ -4857,17 +4864,16 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 /// (`xparse_dolparen` re-parses it through `shell_getc` too,
 /// [`super::killed::expanded`]): a `( … )`, job or stage forked from a `-c`
 /// shell drops every finished job there, `$!`'s too, so the child gets none.
-/// The child is a fork of `vp`, and keeps `vp`'s `jobs_list_frozen`: where
-/// `vp`'s job list is kept ([`Vproc::jobs_kept`]: the last stage of a
-/// `lastpipe` pipeline, a function substitution, a trap run with the list
-/// frozen), or `vp` is itself a fork of a shell whose list was kept then
-/// (a subshell, a pipeline stage, a background job, a command or process
-/// substitution: [`super::proc::JobTable::kept`], which [`inherited_jobs`]
-/// set), `notify_and_cleanup` returns before `cleanup_dead_jobs`, and the
-/// child keeps every job. An interactive shell's command substitution reads
-/// no line through that path, and keeps every job too.
+/// The child is a fork of `vp`, and keeps `vp`'s `jobs_list_frozen`
+/// ([`Vproc::freeze`]: the last stage of a `lastpipe` pipeline, a function
+/// substitution, a trap run with the list frozen, or the freeze `vp` itself
+/// forked with, [`super::proc::JobTable::freeze`], which [`inherited_jobs`]
+/// copied): while it is set, `notify_and_cleanup` returns before
+/// `cleanup_dead_jobs`, and the child keeps every job. An interactive
+/// shell's command substitution reads no line through that path, and keeps
+/// every job too.
 fn drop_finished_jobs(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, child: &mut Vproc) {
-	if child.jobs.kept || super::jobctl::interactive(k) {
+	if child.jobs.freeze != super::proc::Freeze::No || super::jobctl::interactive(k) {
 		return;
 	}
 	let mut kept = |j: &super::proc::Job| {

@@ -1457,6 +1457,10 @@ pub enum MiscKey {
 	JobPrevious,
 	/// `SIGCHLD` trap runs owed (decimal); absent when zero.
 	ChldOwed,
+	/// The highest job number the root's foreground commands hold while
+	/// bash deletes no job (decimal; absent when zero; the vm's
+	/// `JobTable::held`).
+	JobsHeld,
 	/// The next [`JobId`] (decimal).
 	NextJob,
 	/// The next vpid (decimal).

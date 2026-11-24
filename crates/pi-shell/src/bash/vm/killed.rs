@@ -782,15 +782,16 @@ fn report_all(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Opt
 /// process (`SUBSHELL_COMSUB`), and in posix mode any shell, marks every one
 /// but the job `$!` names (`4611-4620`); any other fork marks each one a
 /// signal did not kill, `$!`'s too (the catch-all, `4683-4687`), and reports
-/// the others ([`unreported`]). None while no job may be deleted
-/// ([`Vproc::jobs_kept`], or a fork of a shell whose job list was kept,
-/// [`super::proc::JobTable::kept`]: bash marks there but deletes nothing),
-/// in an interactive shell, and in zsh.
+/// the others ([`unreported`]). None while the job list is frozen
+/// ([`Vproc::jobs_frozen`]: `notify_and_cleanup` returns at once); where
+/// it only marks (a function substitution, or a fork of a shell running
+/// one, [`super::proc::Freeze::Marks`]) bash marks them, and the first
+/// cleanup outside deletes them ([`cleanup_dead_jobs`]). None in an
+/// interactive shell, nor in zsh.
 fn mark_unreported(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	let open = |j: &super::proc::Job| !j.notified && matches!(j.state, JobState::Done(_));
 	if vp.mode.dialect() != Dialect::Bash
-		|| vp.jobs_kept()
-		|| vp.jobs.kept
+		|| vp.jobs_frozen()
 		|| !vp.jobs.iter().any(open)
 		|| (vp.jobs.comsub == Comsub::No && !misc_is(cx, vp, MiscKey::RunOrigin, b"c"))
 		|| misc_is(cx, vp, MiscKey::Interactive, b"1")
@@ -835,18 +836,35 @@ fn mark_unreported(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 
 /// bash's `cleanup_dead_jobs`: the finished jobs of `vp` already reported
 /// (`J_NOTIFIED`: listed, waited for while the job list was frozen) go from
-/// the table, but none while no job may be deleted ([`Vproc::jobs_kept`]:
-/// `jobs.c:1310`). A `wait PID` still finds a status `wait` collected
-/// ([`super::proc::JobTable::bgp`]) or the process's own. bash only: zsh
-/// deletes a job as it reports it. bash calls it at each of its cleanup
-/// points: the report points ([`report_all`]), `jobs`, the end of a `wait`,
-/// each fork (`stop_pipeline`, `jobs.c:572`) and each loop iteration (`REAP`,
-/// `execute_cmd.c:3105`, `3267`, `3606`, `3838`, also as `break` or
-/// `continue` ends the body: `exec::break_loops`).
+/// the table, and so do the foreground ones that held their numbers
+/// ([`super::proc::JobTable::held`]), but none while no job may be deleted
+/// ([`Vproc::jobs_kept`]: `jobs.c:1310`). A `wait PID` still finds a status
+/// `wait` collected ([`super::proc::JobTable::bgp`]) or the process's own.
+/// bash only: zsh deletes a job as it reports it. bash calls it at each of
+/// its cleanup points: the report points ([`report_all`]), `jobs`, the end
+/// of a `wait`, each fork (`stop_pipeline`, `jobs.c:572`) and each loop
+/// iteration (`REAP`, `execute_cmd.c:3105`, `3267`, `3606`, `3838`, also as
+/// `break` or `continue` ends the body: `exec::break_loops`).
 pub(super) fn cleanup_dead_jobs(vp: &mut Vproc) {
 	let reported = |j: &super::proc::Job| j.notified && matches!(j.state, JobState::Done(_));
-	if vp.jobs.iter().any(reported) && vp.mode.dialect() == Dialect::Bash && !vp.jobs_kept() {
-		vp.jobs.remove_where(reported);
+	if (vp.jobs.held == 0 && !vp.jobs.iter().any(reported))
+		|| vp.mode.dialect() != Dialect::Bash
+		|| vp.jobs_kept()
+	{
+		return;
+	}
+	vp.jobs.held = 0;
+	vp.jobs.remove_where(reported);
+}
+
+/// bash's `stop_pipeline` for a command the shell forks and waits for (an
+/// external, a `( … )`, a pipeline): it is a job, which the next cleanup
+/// deletes once it ends, before any other takes a number; but while no job
+/// may be deleted ([`Vproc::jobs_kept`]) it keeps its number, and the next
+/// job takes one after it ([`super::proc::JobTable::hold`]). bash only.
+pub(super) fn foreground_job(vp: &mut Vproc) {
+	if vp.mode.dialect() == Dialect::Bash && vp.jobs_kept() {
+		vp.jobs.hold();
 	}
 }
 

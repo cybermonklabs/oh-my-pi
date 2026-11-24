@@ -473,14 +473,20 @@ pub struct JobTable {
 	/// Where a command or process substitution leaves this shell: which
 	/// background jobs a signal killed it reports ([`super::killed`]).
 	pub comsub:   Comsub,
-	/// This shell is a fork (a subshell, a pipeline stage, a background
-	/// job, a command or process substitution) of a shell whose job list
-	/// was kept as it forked ([`Vproc::jobs_kept`], or this flag of that
-	/// shell): bash's fork keeps `jobs_list_frozen`, so this shell, and a
-	/// command or process substitution it starts, drops no finished job
-	/// ([`super::killed`]'s `mark_unreported`,
-	/// [`super::exec::drop_finished_jobs`]).
-	pub kept:     bool,
+	/// The `jobs_list_frozen` this shell forked with ([`Freeze`]): bash's
+	/// fork (a subshell, a pipeline stage, a background job, a command or
+	/// process substitution) copies the value its shell had, and nothing in
+	/// the fork ends that freeze, so it holds for the fork's whole life
+	/// ([`Vproc::freeze`]). bash only.
+	pub freeze:   Freeze,
+	/// The highest job number a foreground command holds (bash
+	/// `stop_pipeline` makes every fork a job; `cleanup_dead_jobs` deletes
+	/// a finished foreground one at once, but none while no job may be
+	/// deleted, [`Vproc::jobs_kept`]): the next job takes a number after it
+	/// ([`Self::add`]). Zero when none holds one; cleared by the first
+	/// cleanup outside the freeze. A copy of the table keeps it, as bash's
+	/// command substitution keeps its shell's jobs. bash only.
+	pub held:     u32,
 	/// The statuses of background jobs that left the table (bash's bgp
 	/// list: `delete_job`'s `bgp_add`), oldest first, at most [`BGP_MAX`]:
 	/// `wait PID` finds one once its job left the table, and a `wait` a trap
@@ -542,6 +548,24 @@ impl Comsub {
 	}
 }
 
+/// bash's `jobs_list_frozen`: whether jobs may be reported and deleted
+/// now. Set by the shell while it runs the last stage of a `lastpipe`
+/// pipeline and a trap run with the list frozen (`freeze_jobs_list (1)`),
+/// and a function substitution (`freeze_jobs_list (-1)`), each restoring
+/// the value it found; a fork keeps the value its shell had
+/// ([`JobTable::freeze`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Freeze {
+	/// 0: jobs are reported and deleted.
+	#[default]
+	No,
+	/// -1: jobs are reported and marked reported, but none is deleted;
+	/// `wait -n` takes a finished job and marks it.
+	Marks,
+	/// 1: no job is reported or deleted, and `wait -n` returns at once.
+	Frozen,
+}
+
 /// What a job spec names (bash `get_job_spec`), without its `%`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobLookup {
@@ -596,11 +620,12 @@ impl JobTable {
 	}
 
 	/// Add a background job (bash `stop_pipeline` for an async list): it
-	/// takes the number after the highest one in use (bash does not reuse
-	/// lower freed numbers until the table is empty) and becomes current
-	/// as `reset_current` decides. Returns its number.
+	/// takes the number after the highest one in use or held by a foreground
+	/// command ([`Self::held`]; bash does not reuse lower freed numbers until
+	/// the table is empty) and becomes current as `reset_current` decides.
+	/// Returns its number.
 	pub fn add(&mut self, id: JobId, vpid: Vpid, text: BString, control: bool, wd: BString) -> u32 {
-		let number = self.list.last().map_or(1, |j| j.number.saturating_add(1));
+		let number = self.highest().saturating_add(1);
 		self.list.push(Job {
 			id,
 			number,
@@ -619,6 +644,18 @@ impl JobTable {
 		});
 		self.reset_current();
 		number
+	}
+
+	/// A foreground command bash makes a job of (`stop_pipeline`) starts
+	/// while no job may be deleted: it holds the next number
+	/// ([`Self::held`]).
+	pub fn hold(&mut self) {
+		self.held = self.highest().saturating_add(1);
+	}
+
+	/// The highest job number in use or held.
+	fn highest(&self) -> u32 {
+		self.list.last().map_or(0, |j| j.number).max(self.held)
 	}
 
 	/// The process of vproc `vpid` of one of the jobs ([`Job::procs`]) is
@@ -1080,30 +1117,44 @@ impl Vproc {
 		})
 	}
 
-	/// Whether bash runs with its job list frozen (`jobs_list_frozen` > 0): in
-	/// a trap it runs so ([`ScriptKind::Trap`]'s `frozen`), or in the last
-	/// stage of a pipeline it runs in the shell (`lastpipe`,
-	/// `execute_pipeline`'s `freeze_jobs_list (1)`). No job is reported or
-	/// deleted meanwhile, and `wait -n` returns at once.
-	pub fn jobs_frozen(&self) -> bool {
-		let trap = self.trap_frames != 0
-			&& self.frames.iter().any(|f| {
-				matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { frozen: true, .. }, .. })
-			});
-		trap
-			|| (self.mode.dialect() == crate::bash::ids::Dialect::Bash
-				&& self.frames.iter().any(|f| f.kind == FrameKind::Stage))
+	/// bash's `jobs_list_frozen` now ([`Freeze`]): the innermost freeze of
+	/// this vproc's frames, as each one sets it and puts back the value it
+	/// found: a trap run with the list frozen ([`ScriptKind::Trap`]'s
+	/// `frozen`) or the last stage of a pipeline it runs in the shell
+	/// (`lastpipe`, `execute_pipeline`'s `freeze_jobs_list (1)`) freeze it;
+	/// a function substitution (`${ …; }`, `${| …; }`: `function_substitute`'s
+	/// `freeze_jobs_list (-1)`) only marks. Outside them, the value the
+	/// vproc forked with ([`JobTable::freeze`]): a fork keeps it for its
+	/// whole life.
+	pub fn freeze(&self) -> Freeze {
+		let bash = self.mode.dialect() == crate::bash::ids::Dialect::Bash;
+		let traps = self.trap_frames != 0;
+		for f in self.frames.iter().rev() {
+			match &f.kind {
+				FrameKind::Script { what: ScriptKind::Trap { frozen: true, .. }, .. } if traps => {
+					return Freeze::Frozen;
+				},
+				FrameKind::Stage if bash => return Freeze::Frozen,
+				FrameKind::NoFork if bash => return Freeze::Marks,
+				_ => {},
+			}
+		}
+		if bash { self.jobs.freeze } else { Freeze::No }
 	}
 
-	/// Whether bash deletes no job now (`jobs_list_frozen` ≠ 0): its job list
-	/// is frozen ([`Self::jobs_frozen`]), or it runs a function substitution
-	/// (`${ …; }`, `${| …; }`: `function_substitute`'s `freeze_jobs_list
-	/// (-1)`), where jobs are still reported and marked reported. The next
-	/// cleanup outside deletes what was marked.
+	/// Whether bash runs with its job list frozen (`jobs_list_frozen` > 0,
+	/// [`Self::freeze`]): no job is reported or deleted meanwhile, and
+	/// `wait -n` returns at once.
+	pub fn jobs_frozen(&self) -> bool {
+		self.freeze() == Freeze::Frozen
+	}
+
+	/// Whether bash deletes no job now (`jobs_list_frozen` ≠ 0,
+	/// [`Self::freeze`]): frozen, or only marking, where jobs are still
+	/// reported and marked reported. The next cleanup outside deletes what
+	/// was marked.
 	pub fn jobs_kept(&self) -> bool {
-		self.jobs_frozen()
-			|| (self.mode.dialect() == crate::bash::ids::Dialect::Bash
-				&& self.frames.iter().any(|f| f.kind == FrameKind::NoFork))
+		self.freeze() != Freeze::No
 	}
 }
 
@@ -2163,8 +2214,12 @@ impl Live {
 // in each background vproc's overlay, bash's asynchronous ignore of `INT`
 // and `QUIT`: 587 B (a 532-byte map, a 48-byte word list, the two names).
 // It is a field now (`Vproc::async_ignored`, one byte: Vproc 680 → 688 B),
-// and the bench (debug) measured 2,458 → 1,879 B per idle vproc.
-const _: () = assert!(size_of::<Vproc>() <= 688, "Vproc grew (idle vproc ≤ 2 KiB)");
+// and the bench (debug) measured 2,458 → 1,879 B per idle vproc. The job
+// numbers foreground commands hold while bash deletes no job
+// (`JobTable::held`, a `u32` as bash's job numbers have no ceiling there:
+// JobTable 56 → 64 B, Vproc 688 → 696 B): the bench (release) measured
+// 1,901 → 1,909 B per idle vproc.
+const _: () = assert!(size_of::<Vproc>() <= 696, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 384, "ExecState grew (idle vproc ≤ 2 KiB)");

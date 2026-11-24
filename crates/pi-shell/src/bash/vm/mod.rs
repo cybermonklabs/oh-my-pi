@@ -4222,10 +4222,11 @@ impl Vproc {
 			vp.jobs = exec::inherited_jobs(self, true);
 		}
 		// bash's fork keeps `jobs_list_frozen` (`execute_in_subshell`'s
-		// `without_job_control` empties the list but leaves the freeze): a
-		// command substitution it starts drops no job
-		// ([`proc::JobTable::kept`]).
-		vp.jobs.kept = self.jobs.kept || self.jobs_kept();
+		// `without_job_control` empties the list but leaves the freeze), and
+		// nothing in it ends that freeze: for its whole life it deletes no
+		// job, and a command or process substitution it starts drops none
+		// ([`proc::JobTable::freeze`]).
+		vp.jobs.freeze = self.freeze();
 		// A fork of a command or process substitution is not one (bash
 		// `execute_in_subshell` starts a new `subshell_environment`); the
 		// substitution sets its own process's ([`exec::start_sub`],

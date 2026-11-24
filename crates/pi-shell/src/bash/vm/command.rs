@@ -2445,10 +2445,11 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			st(vp).in_place = super::killed::in_place(k, cx, vp, op);
 			st(vp).subshell_exec = super::killed::subshell_exec(k, cx, vp, op);
 			// bash forks the program (`stop_pipeline` first deletes the
-			// finished jobs reported, `jobs.c:572`) unless it runs it with
-			// `exec` in its own process.
+			// finished jobs reported, `jobs.c:572`, and makes it a job) unless
+			// it runs it with `exec` in its own process.
 			if !st(vp).in_place && !st(vp).subshell_exec {
 				super::killed::cleanup_dead_jobs(vp);
+				super::killed::foreground_job(vp);
 			}
 			// The root's process becomes the program's: each signal that would
 			// end it is caught, to be the program's
@@ -4540,12 +4541,15 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				.map(|j| j.vpid)
 				.collect();
 			// While no job may be deleted, `cleanup_dead_jobs` keeps them
-			// (`jobs.c:1470`).
-			if !vp.jobs_kept() {
-				for v in done {
+			// (`jobs.c:1470`), marked reported as bash marks them
+			// (`mark_dead_jobs_as_notified`, `wait_for_single_pid`): a later
+			// `jobs -n` lists none of them ([`forget_job`]).
+			let kept_list = vp.jobs_kept();
+			for v in done {
+				if !kept_list {
 					k.proc_collect(cx.store, v);
-					forget_job(vp, v);
 				}
+				forget_job(vp, v);
 			}
 			// And the statuses kept go (`bgp_clear`), frozen or not.
 			state::clear_statuses(&mut k.root, cx.store, vp);

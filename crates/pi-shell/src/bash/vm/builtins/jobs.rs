@@ -195,11 +195,15 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 }
 
 /// Forget finished jobs whose state was reported (bash
-/// `cleanup_dead_jobs`, which deletes none while the job list is frozen);
-/// bash keeps each one's status for `wait PID` (`delete_job`'s `bgp_add`).
+/// `cleanup_dead_jobs`, which deletes none while the job list is frozen),
+/// and the foreground ones that held their numbers; bash keeps each
+/// background one's status for `wait PID` (`delete_job`'s `bgp_add`).
 fn cleanup(ctx: &mut Ctx<'_, '_>) {
-	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash && ctx.vp.jobs_kept() {
-		return;
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash {
+		if ctx.vp.jobs_kept() {
+			return;
+		}
+		ctx.vp.jobs.held = 0;
 	}
 	let dead = |j: &Job| j.notified && matches!(j.state, JobState::Done(_));
 	let kept: Vec<(Vpid, u32, i32, bool)> = ctx
