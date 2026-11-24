@@ -336,9 +336,9 @@ fn run(cli: &Cli, launch: Launch, modes: EnvModes) -> Result<i32, Box<dyn std::e
 		shell.set_event_mask(mask);
 		injector.resumed(resume, &report.lost)?;
 		let parts = fault::Parts { cfg, host, store, shell, run: resume.run(), mask };
-		let status = injector.drive(parts);
+		let ended = injector.drive(parts);
 		injector.finish();
-		return Ok(status?);
+		return Ok(died_of(ended?));
 	}
 	let mut store = MemStore::new();
 	// Nested obash instances (`${THIS_SH}`) draw their own fault stream.
@@ -365,12 +365,22 @@ fn run(cli: &Cli, launch: Launch, modes: EnvModes) -> Result<i32, Box<dyn std::e
 	host.bind_signals(shell.control(), pi_shell::bash::Vpid(cfg.vpid_base));
 	shell.set_event_mask(mask);
 	let run = shell.submit(Script { origin, ..Script::command(source) });
-	let status = injector.drive(fault::Parts { cfg, host, store, shell, run, mask });
+	let ended = injector.drive(fault::Parts { cfg, host, store, shell, run, mask });
 	injector.finish();
 	if let (Some(path), Some(trace)) = (&cli.trace, &trace) {
 		fs::write(path, trace.snapshot_json())?;
 	}
-	Ok(status?)
+	Ok(died_of(ended?))
+}
+
+/// The status a fault-mode run exits with: first, when the program its
+/// `exec` ran died of a signal, obash dies of it too
+/// ([`process::die_of_signal`]), as the plain run does.
+fn died_of((status, signal): (i32, Option<i32>)) -> i32 {
+	if let Some(signal) = signal {
+		process::die_of_signal(signal);
+	}
+	status
 }
 
 /// obash's own options an `exec`-mode fault run passes to the process it

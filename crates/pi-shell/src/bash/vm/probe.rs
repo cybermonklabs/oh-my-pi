@@ -658,10 +658,7 @@ pub fn absolute(cwd: &[u8], name: &[u8]) -> BString {
 /// [`absolute`] for the configured shell platform: the Windows drive and UNC
 /// rule stays testable on any host instead of compiling only on Windows.
 pub fn absolute_on(cwd: &[u8], name: &[u8], platform: Platform) -> BString {
-	if name.first() == Some(&b'/') || url_root_len(name).is_some() {
-		return name.into();
-	}
-	if platform == Platform::Windows && is_windows_absolute(name) {
+	if is_absolute_on(name, platform) {
 		return name.into();
 	}
 	let mut p = BString::from(cwd);
@@ -670,6 +667,15 @@ pub fn absolute_on(cwd: &[u8], name: &[u8], platform: Platform) -> BString {
 	}
 	p.extend_from_slice(name);
 	p
+}
+
+/// Whether `name` is absolute on `platform` by the engine's rule: it starts
+/// with `/` or is a URL path ([`url_root_len`]), or on Windows it is a drive
+/// or UNC path ([`is_windows_absolute`]).
+pub fn is_absolute_on(name: &[u8], platform: Platform) -> bool {
+	name.first() == Some(&b'/')
+		|| url_root_len(name).is_some()
+		|| (platform == Platform::Windows && is_windows_absolute(name))
 }
 
 /// A Windows drive (`C:\x`, `C:/x`) or UNC (`\\srv\share`) path.
