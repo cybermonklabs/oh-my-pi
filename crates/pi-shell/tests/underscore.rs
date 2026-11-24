@@ -131,12 +131,13 @@ fn a_script_without_a_shebang_starts_with_its_name() {
 /// program by the name it was run by; `command` and `builtin` by the
 /// command they run; no name once a simple command that the command ran (a
 /// function body, `eval`, `.`) has finished; the outer command after one
-/// that only returned; `((` or `[[` after those. A readonly `_`'s error is
-/// bare. Stdout and stderr only: bash 5.3.20 also abandons the rest of the
-/// line after such an error (status 1 in `-c`), which this shell does not
-/// do for any assignment error yet. Each script ends with the failing
-/// command, so that does not show here. The `.` rows source files of a
-/// temporary directory.
+/// that only returned (a `.` file's RETURN trap, which runs after that,
+/// names last); `((` or `[[` after those; none once a `select` started. A
+/// readonly `_`'s error is bare. Stdout and stderr only: bash 5.3.20 also
+/// abandons the rest of the line after such an error (status 1 in `-c`),
+/// which this shell does not do for any assignment error yet. Each script
+/// ends with the failing command, so that does not show here. The `.` and
+/// `< in` rows read files of a temporary directory.
 #[test]
 fn an_integer_underscore_bind_error_names_its_command() {
 	let literal: &[(&str, &str, &str)] = &[
@@ -242,9 +243,51 @@ fn an_integer_underscore_bind_error_names_its_command() {
 			"",
 			div0("((", "a/b"),
 		),
+		// A `.` file's `return` puts the name back before its RETURN trap,
+		// whose commands then name last; a function's after it (above).
+		("declare -i _=5; trap true RETURN; . ./q a/b", "", div0("", "a/b")),
+		("declare -i _=5; trap '(( 1 ))' RETURN; . ./q a/b", "", div0("((", "a/b")),
+		("declare -i _=5; trap true RETURN; . ./q2 a/b", "", div0("", "a/b")),
+		("declare -i _=5; trap true RETURN; . ./v a/b", "", div0("", "a/b")),
+		("declare -i _=5; trap true RETURN; . ./s a/b", "", div0("", "a/b")),
+		("declare -i _=5; trap '(( 1 ))' RETURN; . /dev/null a/b", "", div0("((", "a/b")),
+		// `select` clears the name when it starts, once: not at each
+		// selection (a `for` does, above). Stdin is /dev/null or `in`.
+		("declare -i _=5; f() { select x in; do :; done; }; f a/b", "", div0("", "a/b")),
+		(
+			"declare -i _=5; f() { select x in a; do :; done; }; f a/b",
+			"\n",
+			format!("1) a\n#? {}", div0("", "a/b")),
+		),
+		(
+			"declare -i _=5; f() { select x in a b; do (( 1 )); done 2>/dev/null; }; f a/b",
+			"\n",
+			div0("", "a/b"),
+		),
+		("declare -i _=5; f() { (( 1 )); select x in; do :; done; }; f a/b", "", div0("", "a/b")),
+		(
+			"declare -i _=5; f() { select x in a; do case $x in a) (( 1 )) ;; esac; done \
+			 2>/dev/null; }; f a/b < in",
+			"\n",
+			div0("((", "a/b"),
+		),
+		(
+			"declare -i _=5; f() { select x in a; do ( true ); break; done 2>/dev/null; }; f a/b < in",
+			"",
+			div0("", "a/b"),
+		),
+		// `eval`'s bind after a `break` in it names no command.
+		("declare -i _=5; for i in 1; do eval 'break;' a/b; done", "", div0("", "a/b")),
 	]);
 	let dir = tempfile::tempdir().unwrap();
-	for (name, text) in [("s", "true\n"), ("r", "true\nreturn 0\n"), ("q", "return 0\n")] {
+	for (name, text) in [
+		("s", "true\n"),
+		("r", "true\nreturn 0\n"),
+		("q", "return 0\n"),
+		("q2", "(( 1 )); return\n"),
+		("v", "eval 'return 0'\n"),
+		("in", "1\n2\n"),
+	] {
 		std::fs::write(dir.path().join(name), text).unwrap();
 	}
 	check_rows(&rows, Some(dir.path()));

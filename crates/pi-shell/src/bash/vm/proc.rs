@@ -909,9 +909,9 @@ pub enum ScriptKind {
 		status:        i32,
 		cancel:        Option<i32>,
 		return_target: Option<usize>,
-		/// The command name ([`Vproc::cmd_name`]) the `return` whose RETURN
-		/// trap this is puts back when it ends (`None`: a `.` file that
-		/// ended).
+		/// The command name ([`Vproc::cmd_name`]) the function `return`
+		/// whose RETURN trap this is puts back when it ends (`None`: a `.`
+		/// file's trap, after which its commands' name stays).
 		return_name:   Option<CmdName>,
 		/// An ERR trap run by `set -e`: the shell exits with `status` when
 		/// the trap ends.
@@ -1557,7 +1557,7 @@ pub struct ExecState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CmdName {
 	/// No name: a simple command ran to its end (bash clears the name), a
-	/// `for` started an iteration, or nothing ran yet.
+	/// `for` started an iteration, a `select` started, or nothing ran yet.
 	Cleared,
 	/// The running simple command's own name (its first word), set once
 	/// its words are expanded.

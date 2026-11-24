@@ -412,15 +412,23 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 					// The commands the return leaves put back the command
 					// name from before the outermost of them, the one running
 					// in the returning frame (bash's unwind of
-					// `this_command_name`), after a RETURN trap.
+					// `this_command_name`). A function's RETURN trap runs
+					// before that unwind (`execute_function`), a `.` file's
+					// after it (`evalfile_internal` unwinds, then `source_file`
+					// runs the trap), so there the trap's commands name last.
 					let back = name_after_return(vp, i);
+					let function = matches!(vp.frames[i].kind, FrameKind::Function { .. });
+					if !function {
+						vp.cmd_name = back;
+					}
 					if vp.frames[i].kind == FrameKind::NoFork || !return_trap(k, vp, cx, i) {
 						vp.cmd_name = back;
 						unwind(&mut k.root, cx.store, vp, i);
-					} else if let Some(Frame {
-						kind: FrameKind::Script { what: ScriptKind::Trap { return_name, .. }, .. },
-						..
-					}) = vp.frames.last_mut()
+					} else if function
+						&& let Some(Frame {
+							kind: FrameKind::Script { what: ScriptKind::Trap { return_name, .. }, .. },
+							..
+						}) = vp.frames.last_mut()
 					{
 						*return_name = Some(back);
 					}
@@ -3648,6 +3656,12 @@ fn for_in(
 	op: Op,
 	line: u32,
 ) -> Flow {
+	// bash's `select` clears `this_command_name` when it starts, before it
+	// expands its words (`execute_select_command`), even when it then runs
+	// no selection.
+	if op.flags & Op::SELECT != 0 && unit.mode.dialect() == Dialect::Bash {
+		vp.cmd_name = super::proc::CmdName::Cleared;
+	}
 	let pc = top_frame(vp).pc;
 	let exit = unit.ops.get(pc as usize + 1).map_or(pc + 1, |next| next.a);
 	let var = unit.names[op.b as usize].clone();
@@ -3776,12 +3790,15 @@ fn for_next(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		}
 	};
 	clear_scratch(&mut k.root, cx.store, vp);
-	// bash's `for` clears `this_command_name` at each iteration.
-	vp.cmd_name = super::proc::CmdName::Cleared;
 	let select = top_frame(vp)
 		.loops
 		.last()
 		.is_some_and(|r| matches!(r.kind, LoopKind::Select { .. }));
+	// bash's `for` clears `this_command_name` at each iteration; `select`
+	// clears it once, when it starts ([`for_in`]).
+	if !select {
+		vp.cmd_name = super::proc::CmdName::Cleared;
+	}
 	// A `for` variable that is a nameref is retargeted to each word.
 	let assigned = if select {
 		builtins::assign(k, vp, cx, &var, value.clone(), Level::Dynamic)
