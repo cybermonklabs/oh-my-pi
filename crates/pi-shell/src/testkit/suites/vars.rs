@@ -1087,3 +1087,106 @@ fn funcname_negative_subscript_in_arithmetic_and_expansions() {
 	assert_eq!(out, "");
 	assert_eq!(err, "bash: line 1: FUNCNAME: unbound variable\n");
 }
+
+// Golden: bash 5.3.20 (5.2.21 says `syntax error` for `arithmetic syntax
+// error`): in double quotes a `[` after any character, not only a name
+// character (`"${n}[$k]"`, `"$(echo h)[$k]"`), opens a subscript that is
+// expanded once and quoted: what the value holds is never run (no `S`, `B`,
+// `C` or `D` on stderr, `v` and `m` untouched); an index is an arithmetic
+// syntax error, a key the value as written.
+#[test]
+fn cond_v_subscript_after_an_expansion_in_double_quotes_expands_once() {
+	let (out, err) = run(concat!(
+		r#"a=(x y); n=a; for k in '$(echo S >&2; echo 1)' '`echo B >&2; echo 1`' '${u:=1}' '$((m+=1))'; do ( [[ -v "${n}[$k]" ]] && echo "y:$k" ); echo "st=$?"; done"#,
+		"\n",
+		r#"declare -A h=([k]=1); n=h; m=0; for k in '$(echo C >&2; echo k)' '`echo D >&2; echo k`' '${v:=k}' '$((m+=1))' k; do [[ -v "${n}[$k]" ]] && echo "Y:$k" || echo "N:$k"; [[ -v "$(echo h)[$k]" ]] && echo "Z:$k"; done; echo "v=${v-unset} m=$m""#,
+	));
+	assert_eq!(
+		out,
+		concat!(
+			"st=1\nst=1\nst=1\nst=1\n",
+			"N:$(echo C >&2; echo k)\nN:`echo D >&2; echo k`\nN:${v:=k}\nN:$((m+=1))\nY:k\nZ:k\n",
+			"v=unset m=0\n"
+		)
+	);
+	assert_eq!(
+		err,
+		concat!(
+			"bash: line 1: $(echo S >&2; echo 1): arithmetic syntax error: operand expected (error \
+			 token is \"$(echo S >&2; echo 1)\")\n",
+			"bash: line 1: `echo B >&2; echo 1`: arithmetic syntax error: operand expected (error \
+			 token is \"`echo B >&2; echo 1`\")\n",
+			"bash: line 1: ${u:=1}: arithmetic syntax error: operand expected (error token is \
+			 \"${u:=1}\")\n",
+			"bash: line 1: $((m+=1)): arithmetic syntax error: operand expected (error token is \
+			 \"$((m+=1))\")\n",
+		)
+	);
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): an empty key of an associative array
+// (a name reference's target too) names no element; only an index is 0.
+// bash also warns `h: bad array subscript` there, which this engine does
+// not yet, so that warning goes to /dev/null.
+#[test]
+fn cond_v_empty_key_of_an_associative_array_names_no_element() {
+	let (out, err) = run(
+		r"declare -A h=([0]=1 [k]=2); [[ -v 'h[$(echo)]' ]] 2>/dev/null && echo y0 || echo n0; declare -n r=h; [[ -v 'r[$(echo)]' ]] 2>/dev/null && echo r0 || echo nr; [[ -v 'h[$(echo k)]' ]] && echo hk; a=(x); [[ -v 'a[$(echo)]' ]] && echo a0",
+	);
+	assert_eq!(out, "n0\nnr\nhk\na0\n");
+	assert_eq!(err, "");
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): at a script file's top level (and in
+// a command substitution there) `FUNCNAME` hides one element, `main`, so
+// `${FUNCNAME[-2]}` is bad; a `.` file read there hides two (`source`,
+// `main`), so it is silent there.
+#[test]
+fn funcname_negative_subscript_past_the_hidden_elements_is_bad() {
+	let (out, err) = run_file(concat!(
+		r#"echo "[${FUNCNAME[-2]}] [${FUNCNAME[-1]}]"; x=$(echo "[${FUNCNAME[-2]}]"); echo "$x"; printf '%s\n' 'echo "[${FUNCNAME[-2]}]"' > /tmp/s.sh; . /tmp/s.sh; echo after"#,
+		"\n"
+	));
+	assert_eq!(out, "[] []\n[]\n[]\nafter\n");
+	assert_eq!(err, "t.sh: line 1: FUNCNAME: bad array subscript\n".repeat(2));
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): under `set -u` the element
+// `FUNCNAME[-1]` names at a script file's top level (the invisible `main`)
+// is unset, in arithmetic (`FUNCNAME: unbound variable`) as in an
+// expansion (`FUNCNAME[-1]: unbound variable`).
+#[test]
+fn funcname_negative_subscript_under_set_u_is_unbound() {
+	let (out, err) = run_file(concat!(
+		r#"( set -u; echo "[$((FUNCNAME[-1]))]"; echo no ); echo "st=$?"; ( set -u; echo "[${FUNCNAME[-1]}]"; echo no ); echo "st=$?"; echo after"#,
+		"\n"
+	));
+	assert_eq!(out, "st=1\nst=1\nafter\n");
+	assert_eq!(
+		err,
+		"t.sh: line 1: FUNCNAME: unbound variable\nt.sh: line 1: FUNCNAME[-1]: unbound variable\n"
+	);
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees, but starts the warning in the
+// function with `environment:`, not `bash:`): under `set -u` a set dynamic
+// array (`PIPESTATUS`, `LINENO`, `BASH_SUBSHELL`, `BASH_LINENO`, and
+// `FUNCNAME` in a function) is no unbound variable: its `[@]` or `[*]` in
+// arithmetic warns and reads 0, as any array's does.
+#[test]
+fn all_elements_of_a_set_dynamic_array_under_set_u_warn_in_arithmetic() {
+	let (out, err) = run(
+		r#"set -u; true | true; echo "[$((PIPESTATUS[@]))]"; echo "[$((LINENO[@])) $((BASH_SUBSHELL[*]))]"; echo "[$((BASH_LINENO[@]))]"; f() { echo "[$((FUNCNAME[@]))]"; }; f; echo after"#,
+	);
+	assert_eq!(out, "[0]\n[0 0]\n[0]\n[0]\nafter\n");
+	assert_eq!(
+		err,
+		concat!(
+			"bash: line 1: PIPESTATUS[@]: bad array subscript\n",
+			"bash: line 1: LINENO[@]: bad array subscript\n",
+			"bash: line 1: BASH_SUBSHELL[*]: bad array subscript\n",
+			"bash: line 1: BASH_LINENO[@]: bad array subscript\n",
+			"bash: line 1: FUNCNAME[@]: bad array subscript\n",
+		)
+	);
+}
