@@ -80,7 +80,7 @@ export interface PendingRun {
 	signal?: AbortSignal;
 	toolCalls: Map<string, AbortController>;
 	/**
-	 * Fires when `releaseTab` closes the tab out from under an in-flight run
+	 * Fires when `releaseTab` (or a kill) closes the tab out from under an in-flight run
 	 * (sibling `browser close --all`, session-scoped reap, etc.). Composed
 	 * into the cmux run's signal so `wait(...)`, cmux socket calls, and the
 	 * facade proxies unwind promptly instead of blocking to the run's
@@ -1056,6 +1056,7 @@ async function runInTabWithSnapshot(
 			// In-process runners stay out of worker-backed tabs. A close during
 			// this import aborts `runSignal` and rejects `promise` first.
 			const { runInProcessTab } = await import("./in-process-run");
+			if (afterInProcessImportForTest) await afterInProcessImportForTest();
 			// A close or cancel during the import: start no run, so no runtime is built on a tab that has ended.
 			if (runSignal.aborted) {
 				reject(
@@ -1117,7 +1118,7 @@ async function runInTabWithSnapshot(
 				promise,
 				opts.timeoutMs + GRACE_MS,
 				"Browser code execution hung past grace; tab killed",
-				async reason => await forceKillTab(name, reason),
+				async reason => await forceKillTab(tab, reason),
 			);
 			if (result.recoverTab) {
 				const reattached = await recoverWorkerTab(
@@ -1165,7 +1166,7 @@ async function runInTabWithSnapshot(
 				if (error.reason === USER_CANCELLED_DEBUGGER) {
 					// The relay hides a tab whose debugging bar the user cancelled, so a re-adoption cannot succeed.
 					const cancelled = `${error.message}. The user cancelled Chrome's debugging bar${landed}. omp released the tab; the relay hides it until its URL changes, so navigate it in Chrome, then open it again`;
-					if (tabs.get(name) === tab && tab.state === "alive") await forceKillTab(name, cancelled);
+					if (tabs.get(name) === tab && tab.state === "alive") await forceKillTab(tab, cancelled);
 					if (opts.signal?.aborted) throw new ToolAbortError();
 					throw new ToolError(cancelled);
 				}
@@ -1245,9 +1246,9 @@ async function recoverWorkerTab(
 		onNotReattached?: (why: string) => void;
 	} = {},
 ): Promise<boolean> {
-	// The kills go by name: a tab closed meanwhile may have been reopened under it, and that one is not ours to kill.
+	// The kills name this tab: a tab closed meanwhile may have been reopened under its name, and that one is not ours to kill.
 	const killTab = async (killReason: string): Promise<false> => {
-		if (tabs.get(name) === tab && tab.state === "alive") await forceKillTab(name, killReason);
+		if (tabs.get(name) === tab && tab.state === "alive") await forceKillTab(tab, killReason);
 		return false;
 	};
 	try {
@@ -1883,6 +1884,14 @@ export function getTabsMapForTest(): Map<string, TabSession> {
 	return tabs;
 }
 
+/** Test hook: awaited after a cmux or Tern run's import of the in-process runner, before the run starts. */
+let afterInProcessImportForTest: (() => Promise<void>) | undefined;
+
+/** Test-only: set (or clear) {@link afterInProcessImportForTest}, so a test can land a close in that window. */
+export function setAfterInProcessImportForTest(hook: (() => Promise<void>) | undefined): void {
+	afterInProcessImportForTest = hook;
+}
+
 function isLastSurfaceCloseError(err: unknown): boolean {
 	const message = err instanceof Error ? err.message : String(err);
 	return /last/i.test(message);
@@ -2128,7 +2137,7 @@ function attachTabWorker(tab: WorkerTabSession, worker: WorkerHandle): void {
 			pending.reject(error);
 		}
 		if (looping) {
-			forceKillTab(tab.name, reason).catch(logCleanupFailure);
+			forceKillTab(tab, reason).catch(logCleanupFailure);
 			return;
 		}
 		const recovery = recoverWorkerTab(tab, tab.name, WORKER_EXIT_REATTACH_TIMEOUT_MS, `${exited}; tab closed`, {
@@ -2219,9 +2228,14 @@ async function recycleTimedOutWorkerTab(
 	}
 }
 
-async function forceKillTab(name: string, reason: string): Promise<void> {
-	const tab = tabs.get(name);
-	if (!tab) return;
+/**
+ * Kill a worker tab whose state is unknown. It takes the tab itself, never a name: a tab closed meanwhile may have
+ * been reopened under its name, and that one is not ours to kill. Only a worker tab can be killed: a cmux or Tern tab
+ * ends only by a release, which discards its runtime.
+ */
+async function forceKillTab(tab: WorkerTabSession, reason: string): Promise<void> {
+	const name = tab.name;
+	if (tabs.get(name) !== tab) return;
 	// A release already owns this tab's teardown. Joining it keeps one worker
 	// termination, one browser-hold release, and one ownership decision — the
 	// racing pair otherwise released the shared browser's hold twice and let the
@@ -2234,13 +2248,18 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
 	killedTabs.set(name, reason);
 	tab.state = "dead";
 	const error = postmortem.markExpectedCleanupError(new ToolError(reason));
-	for (const pending of tab.pending.values()) pending.reject(error);
+	for (const pending of tab.pending.values()) {
+		// As a release does. Only cmux and Tern runs listen to closeAc, and they never reach a kill; the worker's
+		// terminate below ends a worker run.
+		pending.closeAc?.abort(error);
+		pending.reject(error);
+	}
 	tab.pending.clear();
 	// Published before the first await so a release landing during the close
 	// below joins instead of tearing the same tab down a second time. The
 	// published result is the release contract — the tab is gone either way; a
 	// target that could not be closed stays in the ownership registry instead.
-	const teardown = tab.backend === "worker" ? forceKillTabTeardown(tab) : forceKillSurfaceTab(tab, name);
+	const teardown = forceKillTabTeardown(tab);
 	const entry = { promise: teardown.then((): "released" => "released"), opts: { kill: false } };
 	releaseInflight.set(tab, entry);
 	try {
@@ -2248,19 +2267,6 @@ async function forceKillTab(name: string, reason: string): Promise<void> {
 	} finally {
 		if (releaseInflight.get(tab) === entry) releaseInflight.delete(tab);
 	}
-}
-
-/** Teardown half of {@link forceKillTab} for a cmux or Tern surface, published through the release single-flight. */
-async function forceKillSurfaceTab(tab: CmuxTabSession | TernTabSession, name: string): Promise<void> {
-	// A killed tab's runtime ends with it, as on a release: its globals leave this process's realm.
-	if (tab.backend === "tern") {
-		tab.ternTab.discardRuntime();
-		await tab.ternTab.close({ timeoutMs: DEFAULT_TAB_CLOSE_TIMEOUT_MS }).catch(() => undefined);
-	} else {
-		tab.cmuxTab.discardRuntime();
-	}
-	await releaseBrowser(tab.browser, { kill: false });
-	tabs.delete(name);
 }
 
 /**
