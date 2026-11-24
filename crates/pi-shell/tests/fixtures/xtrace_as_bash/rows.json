@@ -4378,5 +4378,425 @@
    "11db9edada0dcf6ce7e1bcbf2e618490  -\n",
    ""
   ]
+ },
+ {
+  "id": "r4-trace-pipe",
+  "file": false,
+  "script": "{ exec 7>&1; BASH_XTRACEFD=7; set -x; sleep 0.3; export X=1; echo after > f2; } | :; echo \"p=$?\"; [ -e f2 ]; echo \"f2=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf2=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf2=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "r4-trace-pipe",
+  "file": true,
+  "script": "{ exec 7>&1; BASH_XTRACEFD=7; set -x; sleep 0.3; export X=1; echo after > f2; } | :; echo \"p=$?\"; [ -e f2 ]; echo \"f2=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf2=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf2=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "r4-trace-pipe-trap",
+  "file": false,
+  "script": "{ trap '' PIPE; exec 7>&1; BASH_XTRACEFD=7; set -x; sleep 0.3; export X=1; echo after > f2; } | :; echo \"p=$?\"; [ -e f2 ]; echo \"f2=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf2=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf2=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "r4-trace-pipe-trap",
+  "file": true,
+  "script": "{ trap '' PIPE; exec 7>&1; BASH_XTRACEFD=7; set -x; sleep 0.3; export X=1; echo after > f2; } | :; echo \"p=$?\"; [ -e f2 ]; echo \"f2=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf2=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf2=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "r4-out-pipe",
+  "file": false,
+  "script": "{ sleep 0.3; echo out; echo after > f3; } | :; echo \"p=$?\"; [ -e f3 ]; echo \"f3=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf3=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf3=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "r4-out-pipe",
+  "file": true,
+  "script": "{ sleep 0.3; echo out; echo after > f3; } | :; echo \"p=$?\"; [ -e f3 ]; echo \"f3=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf3=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf3=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "r4-trace-full-after",
+  "file": false,
+  "script": "exec 7>/dev/full; BASH_XTRACEFD=7; set -x; export X=1; echo after > f5; echo \"s=$? $([ -e f5 ]; echo $?)\"",
+  "bash53": [
+   0,
+   "s=0 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=0 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "r4-trace-full-after",
+  "file": true,
+  "script": "exec 7>/dev/full; BASH_XTRACEFD=7; set -x; export X=1; echo after > f5; echo \"s=$? $([ -e f5 ]; echo $?)\"",
+  "bash53": [
+   0,
+   "s=0 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=0 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "r4-export-a-subscript",
+  "file": false,
+  "script": "set -x; export -a 'a[1]=x'; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ export -a 'a[1]=x'\nbash: line 1: export: `a[1]': not a valid identifier\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ export -a 'a[1]=x'\nbash: line 1: export: `a[1]': not a valid identifier\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "r4-export-a-subscript",
+  "file": true,
+  "script": "set -x; export -a 'a[1]=x'; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ export -a 'a[1]=x'\n./s.sh: line 1: export: `a[1]': not a valid identifier\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ export -a 'a[1]=x'\n./s.sh: line 1: export: `a[1]': not a valid identifier\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "r4-export-a-subscript-err",
+  "file": false,
+  "script": "export -a 'a[1]=x' 2>e; echo \"s=$?\"; cat e; declare -p a 2>&1 | tail -1",
+  "bash53": [
+   0,
+   "s=1\nbash: line 1: export: `a[1]': not a valid identifier\nbash: line 1: declare: a: not found\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nbash: line 1: export: `a[1]': not a valid identifier\nbash: line 1: declare: a: not found\n",
+   ""
+  ]
+ },
+ {
+  "id": "r4-export-a-subscript-err",
+  "file": true,
+  "script": "export -a 'a[1]=x' 2>e; echo \"s=$?\"; cat e; declare -p a 2>&1 | tail -1",
+  "bash53": [
+   0,
+   "s=1\n./s.sh: line 1: export: `a[1]': not a valid identifier\n./s.sh: line 1: declare: a: not found\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\n./s.sh: line 1: export: `a[1]': not a valid identifier\n./s.sh: line 1: declare: a: not found\n",
+   ""
+  ]
+ },
+ {
+  "id": "r4-readonly-a-subscript",
+  "file": false,
+  "script": "set -x; readonly -a 'b[1]=x'; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ readonly -a 'b[1]=x'\nbash: line 1: readonly: `b[1]': not a valid identifier\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ readonly -a 'b[1]=x'\nbash: line 1: readonly: `b[1]': not a valid identifier\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "r4-readonly-a-subscript",
+  "file": true,
+  "script": "set -x; readonly -a 'b[1]=x'; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ readonly -a 'b[1]=x'\n./s.sh: line 1: readonly: `b[1]': not a valid identifier\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ readonly -a 'b[1]=x'\n./s.sh: line 1: readonly: `b[1]': not a valid identifier\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "r4-export-A-subscript",
+  "file": false,
+  "script": "set -x; export -A 'c[k]=x'; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ export -A 'c[k]=x'\nbash: line 1: export: `c[k]': not a valid identifier\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ export -A 'c[k]=x'\nbash: line 1: export: `c[k]': not a valid identifier\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "r4-export-A-subscript",
+  "file": true,
+  "script": "set -x; export -A 'c[k]=x'; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ export -A 'c[k]=x'\n./s.sh: line 1: export: `c[k]': not a valid identifier\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ export -A 'c[k]=x'\n./s.sh: line 1: export: `c[k]': not a valid identifier\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "r4-readonly-a-subscript-noval",
+  "file": false,
+  "script": "set -x; readonly -a 'b[1]'; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ readonly -a 'b[1]'\nbash: line 1: readonly: `b[1]': not a valid identifier\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ readonly -a 'b[1]'\nbash: line 1: readonly: `b[1]': not a valid identifier\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "r4-readonly-a-subscript-noval",
+  "file": true,
+  "script": "set -x; readonly -a 'b[1]'; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ readonly -a 'b[1]'\n./s.sh: line 1: readonly: `b[1]': not a valid identifier\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ readonly -a 'b[1]'\n./s.sh: line 1: readonly: `b[1]': not a valid identifier\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "r4-export-a-plain",
+  "file": false,
+  "script": "set -x; export -a a=(1 2); echo \"s=$?\"; set +x; declare -p a",
+  "bash53": [
+   0,
+   "s=0\ndeclare -ax a=([0]=\"1\" [1]=\"2\")\n",
+   "+ a=('1' '2')\n+ export -a a\n+ echo s=0\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\ndeclare -ax a=([0]=\"1\" [1]=\"2\")\n",
+   "+ a=('1' '2')\n+ export -a a\n+ echo s=0\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "r4-export-a-plain",
+  "file": true,
+  "script": "set -x; export -a a=(1 2); echo \"s=$?\"; set +x; declare -p a",
+  "bash53": [
+   0,
+   "s=0\ndeclare -ax a=([0]=\"1\" [1]=\"2\")\n",
+   "+ a=('1' '2')\n+ export -a a\n+ echo s=0\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\ndeclare -ax a=([0]=\"1\" [1]=\"2\")\n",
+   "+ a=('1' '2')\n+ export -a a\n+ echo s=0\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "r4-export-subscript",
+  "file": false,
+  "script": "set -x; export 'a[1]=x'; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ export 'a[1]=x'\nbash: line 1: export: `a[1]': not a valid identifier\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ export 'a[1]=x'\nbash: line 1: export: `a[1]': not a valid identifier\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "r4-export-subscript",
+  "file": true,
+  "script": "set -x; export 'a[1]=x'; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   "+ export 'a[1]=x'\n./s.sh: line 1: export: `a[1]': not a valid identifier\n+ echo s=1\n"
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   "+ export 'a[1]=x'\n./s.sh: line 1: export: `a[1]': not a valid identifier\n+ echo s=1\n"
+  ]
+ },
+ {
+  "id": "r4-declare-a-subscript",
+  "file": false,
+  "script": "set -x; declare -a 'd[1]=x'; echo \"s=$?\"; set +x; declare -p d",
+  "bash53": [
+   0,
+   "s=0\ndeclare -a d=([1]=\"x\")\n",
+   "+ declare -a 'd[1]=x'\n+ echo s=0\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\ndeclare -a d=([1]=\"x\")\n",
+   "+ declare -a 'd[1]=x'\n+ echo s=0\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "r4-declare-a-subscript",
+  "file": true,
+  "script": "set -x; declare -a 'd[1]=x'; echo \"s=$?\"; set +x; declare -p d",
+  "bash53": [
+   0,
+   "s=0\ndeclare -a d=([1]=\"x\")\n",
+   "+ declare -a 'd[1]=x'\n+ echo s=0\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\ndeclare -a d=([1]=\"x\")\n",
+   "+ declare -a 'd[1]=x'\n+ echo s=0\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "r4-xtracefd-2p30",
+  "file": false,
+  "script": "exec 0>t0; BASH_XTRACEFD=1073741824; set -x; export X=1; set +x; echo \"s=$?\"; cat t0",
+  "bash53": [
+   0,
+   "s=0\n",
+   "bash: line 1: BASH_XTRACEFD: 1073741824: invalid value for trace file descriptor\n+ export X=1\n+ X=1\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "bash: line 1: BASH_XTRACEFD: 1073741824: invalid value for trace file descriptor\n+ export X=1\n+ X=1\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "r4-xtracefd-2p30",
+  "file": true,
+  "script": "exec 0>t0; BASH_XTRACEFD=1073741824; set -x; export X=1; set +x; echo \"s=$?\"; cat t0",
+  "bash53": [
+   0,
+   "s=0\n",
+   "./s.sh: line 1: BASH_XTRACEFD: 1073741824: invalid value for trace file descriptor\n+ export X=1\n+ X=1\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "s=0\n",
+   "./s.sh: line 1: BASH_XTRACEFD: 1073741824: invalid value for trace file descriptor\n+ export X=1\n+ X=1\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "r4-xtracefd-2p30-echo",
+  "file": false,
+  "script": "exec 0>t0; BASH_XTRACEFD=1073741824; set -x; echo a; set +x; echo \"s=$?\"; cat t0",
+  "bash53": [
+   0,
+   "a\ns=0\n",
+   "bash: line 1: BASH_XTRACEFD: 1073741824: invalid value for trace file descriptor\n+ echo a\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "a\ns=0\n",
+   "bash: line 1: BASH_XTRACEFD: 1073741824: invalid value for trace file descriptor\n+ echo a\n+ set +x\n"
+  ]
+ },
+ {
+  "id": "r4-xtracefd-2p30-echo",
+  "file": true,
+  "script": "exec 0>t0; BASH_XTRACEFD=1073741824; set -x; echo a; set +x; echo \"s=$?\"; cat t0",
+  "bash53": [
+   0,
+   "a\ns=0\n",
+   "./s.sh: line 1: BASH_XTRACEFD: 1073741824: invalid value for trace file descriptor\n+ echo a\n+ set +x\n"
+  ],
+  "bash52": [
+   0,
+   "a\ns=0\n",
+   "./s.sh: line 1: BASH_XTRACEFD: 1073741824: invalid value for trace file descriptor\n+ echo a\n+ set +x\n"
+  ]
  }
 ]

@@ -1512,8 +1512,7 @@ pub(crate) fn hend_output(
 	}
 	if let Some(mut line) = out.print {
 		line.push(b'\n');
-		vp.out
-			.push_back(PendingWrite { fd: 2, bytes: line, off: 0 });
+		vp.out.push_back(PendingWrite::new(2, line));
 	}
 	*run = out.run;
 }
@@ -3348,9 +3347,7 @@ fn time_end(
 		end.sys.saturating_sub(start.sys),
 	];
 	match time_report(&format, times) {
-		Ok(text) => vp
-			.out
-			.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 }),
+		Ok(text) => vp.out.push_back(PendingWrite::new(2, text)),
 		Err(c) => {
 			let msg = format!("TIMEFORMAT: `{}': invalid format character", char::from(c));
 			k.diag(cx, vp, line, Diag::Usage { msg: msg.into() });
@@ -3395,8 +3392,7 @@ fn zsh_time_end(
 		text.extend_from_slice(&zsh_time_report(&format, b"children", children));
 		text
 	};
-	vp.out
-		.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
+	vp.out.push_back(PendingWrite::new(2, text));
 }
 
 /// zsh's default `TIMEFMT` (`DEFAULT_TIMEFMT`).

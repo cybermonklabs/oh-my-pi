@@ -664,13 +664,9 @@ fn seeded_exec(
 /// chunks and `off` bytes of the next went out, the rest is for the
 /// staged output, which also takes all of it (`Err((0, 0))`) when it has a
 /// diagnostic to render or a trace line to write unchecked
-/// ([`xtrace::TRACE_WRITE`]), or the shell has output queued before it.
+/// ([`Chunk::Trace`]), or the shell has output queued before it.
 fn write_now(k: &Kernel, vp: &Vproc, chunks: &[Chunk]) -> Result<(), (usize, usize)> {
-	if !vp.out.is_empty()
-		|| chunks
-			.iter()
-			.any(|c| !matches!(c, Chunk::Out(fd, _) if fd & xtrace::TRACE_WRITE == 0))
-	{
+	if !vp.out.is_empty() || chunks.iter().any(|c| !matches!(c, Chunk::Out(..))) {
 		return Err((0, 0));
 	}
 	let mut tcx = Context::from_waker(&k.waker);
@@ -1232,8 +1228,7 @@ fn cat_stdin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Opti
 		Ok(_) => BString::default(),
 	};
 	let s = st(vp);
-	s.writes
-		.push_back(PendingWrite { fd: 1, bytes: text, off: 0 });
+	s.writes.push_back(PendingWrite::new(1, text));
 	s.stage = Stage::Output;
 	None
 }
@@ -2015,11 +2010,10 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 						let msg = format!("-{}: invalid option", argv[0][1] as char).into();
 						let line = line_of(vp, op.node);
 						k.diag(cx, vp, line, Diag::Usage { msg }.by("builtin"));
-						vp.out.push_back(PendingWrite {
-							fd:    2,
-							bytes: BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
-							off:   0,
-						});
+						vp.out.push_back(PendingWrite::new(
+							2,
+							BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
+						));
 						let s = st(vp);
 						s.status = 2;
 						s.stage = Stage::Finish;
@@ -2880,8 +2874,7 @@ fn zsh_funcnest(
 		line:   zline,
 		utf8:   false,
 	});
-	vp.out
-		.push_back(super::proc::PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+	vp.out.push_back(super::proc::PendingWrite::new(2, bytes));
 	vp.status = 1;
 	Some(Flow::Discard(1))
 }
@@ -3102,8 +3095,7 @@ fn parse_autoload(
 					let site = crate::bash::diag::ZshSite { prefix: name, line, utf8: false };
 					bytes.extend_from_slice(&crate::bash::diag::render_zsh(&diag, site));
 				}
-				vp.out
-					.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+				vp.out.push_back(PendingWrite::new(2, bytes));
 				return Err(());
 			},
 		}
@@ -4073,18 +4065,15 @@ fn settle_builtin(
 		}
 	}
 	for c in chunks {
-		let (fd, bytes) = match c {
-			Chunk::Out(fd, b) => (fd, b),
+		let write = match c {
+			Chunk::Out(fd, b) => PendingWrite::new(fd, b),
+			Chunk::Trace(fd, b) => PendingWrite::traced(fd, b),
 			Chunk::Diag(d) => {
 				super::zle::display::trash_for_message(k, cx, vp);
-				(2, k.render_diag(cx, vp, line, &d))
+				PendingWrite::new(2, k.render_diag(cx, vp, line, &d))
 			},
 		};
-		sc.exec
-			.as_mut()
-			.expect("exec")
-			.writes
-			.push_back(PendingWrite { fd, bytes: bytes.into(), off: 0 });
+		sc.exec.as_mut().expect("exec").writes.push_back(write);
 	}
 	let e = sc.exec.as_mut().expect("exec");
 	e.status = outcome.status;
@@ -4235,10 +4224,8 @@ fn exec_builtin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> O
 		let text = k.render_diag(cx, vp, line, &Diag::Usage { msg: msg.into() }.by("exec"));
 		let s = st(vp);
 		s.argv = argv;
-		s.writes
-			.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
-		s.writes
-			.push_back(PendingWrite { fd: 2, bytes: USAGE.into(), off: 0 });
+		s.writes.push_back(PendingWrite::new(2, text));
+		s.writes.push_back(PendingWrite::new(2, USAGE));
 		s.status = 2;
 		s.stage = Stage::Output;
 		return None;
@@ -4675,9 +4662,8 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 			state.writes.pop_front();
 			continue;
 		}
-		// A trace line (`xtrace::TRACE_WRITE`) goes to its fd unchecked.
-		let trace = pending.fd & xtrace::TRACE_WRITE != 0;
-		let fd = pending.fd & !xtrace::TRACE_WRITE;
+		// A trace line goes to its fd unchecked (`PendingWrite::trace`).
+		let (trace, fd) = (pending.trace, pending.fd);
 		let handle = vp.fds.handle(fd);
 		let state = st(vp);
 		let pending = state.writes.front_mut().expect("checked");
@@ -4688,13 +4674,28 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 					state.writes.pop_front();
 				}
 			},
-			// bash writes it with an unchecked `fprintf`: the line is lost,
-			// the builtin's status and its other output stay.
-			Poll::Ready(_) if trace => {
+			// bash writes it with an unchecked `fprintf`: the line is lost
+			// and the builtin's status and its other output stay. A broken
+			// pipe still raises the virtual SIGPIPE and ends the shell, as
+			// it does for any write; only the write error (the diagnostic
+			// and status 1) is dropped.
+			Poll::Ready(res) if trace => {
 				state.writes.pop_front();
+				if let Err(err) = res
+					&& err.kind() == std::io::ErrorKind::BrokenPipe
+					&& fd != 2
+					&& !sigpipe_ignored(cx.store, vp)
+				{
+					let platform = k.engine.config().platform;
+					return Some(Flow::Exit(crate::bash::signal::Signal::Pipe.exit_status(platform)));
+				}
 			},
 			Poll::Ready(res) => {
-				state.writes.retain(|queued| queued.fd != fd);
+				// The rest of the builtin's output for that fd is dropped; a
+				// queued trace line is not its output, and is still tried.
+				state
+					.writes
+					.retain(|queued| queued.fd != fd || queued.trace);
 				if fd != 2 {
 					let err = res
 						.err()
@@ -4719,9 +4720,7 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 					// Through the command's own fd 2 (`2>&1 >&4`), while its
 					// redirections are in place.
 					let bytes = k.render_diag(cx, vp, line, &Diag::WriteError { cmd, err });
-					st(vp)
-						.writes
-						.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+					st(vp).writes.push_back(PendingWrite::new(2, bytes));
 				}
 			},
 			Poll::Pending => return Some(Flow::Block(WaitKey::Write { fd })),
@@ -4768,9 +4767,7 @@ fn zsh_write_error(
 	}
 	for d in diags {
 		let bytes = k.render_diag(cx, vp, line, &d);
-		st(vp)
-			.writes
-			.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+		st(vp).writes.push_back(PendingWrite::new(2, bytes));
 	}
 }
 
@@ -4854,7 +4851,7 @@ fn print_exit_value(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32
 		&& on(k, cx, vp, ZshOpt::Shinstdin)
 	{
 		let bytes = BString::from(format!("zsh: exit {status}\n"));
-		vp.out.push_back(PendingWrite { fd: 2, bytes, off: 0 });
+		vp.out.push_back(PendingWrite::new(2, bytes));
 	}
 }
 

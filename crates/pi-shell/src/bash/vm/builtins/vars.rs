@@ -1758,12 +1758,12 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			continue;
 		}
 		// `declare -r c[100]` declares an indexed array; `readonly a[5]`,
-		// `export a[5]` and `export a[5]=x` are no names (bash checks the
-		// part before the `=` with `legal_identifier`, and shows it; with
-		// `-a`/`-A` it hands the operand to `declare`).
+		// `export a[5]` and `export a[5]=x` are no names: bash checks the
+		// part before the `=` with `legal_identifier` in `setattr`, before
+		// the `-a`/`-A` branch, so a subscript is refused even with them.
 		let subscripted = value.is_none() && name.len() < arg.len();
 		let special = matches!(kind, DeclareKind::Readonly | DeclareKind::Export);
-		if special && (subscripted || (index.is_some() && !arrays)) {
+		if special && (subscripted || index.is_some()) {
 			let shown = match arg.find_byte(b'=') {
 				Some(eq) if value.is_some() => {
 					BString::from(arg[..eq].strip_suffix(b"+").unwrap_or(&arg[..eq]))
@@ -1811,7 +1811,7 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			let shown = AssignValue::Scalar(BString::from(v));
 			xtrace::push_assign(&mut body, name, None, append, &shown, utf8);
 			let (fd, bytes) = xtrace::builtin_line(ctx.k, ctx.cx, ctx.vp, ctx.line, &body);
-			ctx.out_fd(fd, &bytes);
+			ctx.trace_line(fd, &bytes);
 		}
 		// The binding this declaration acts on: a new local shadows rather
 		// than follows an outer reference.
