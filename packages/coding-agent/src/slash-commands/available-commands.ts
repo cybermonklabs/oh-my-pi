@@ -6,7 +6,7 @@ import type { ExtensionRunner } from "../extensibility/extensions";
 import { getSkillSlashCommandName, type Skill } from "../extensibility/skills";
 import { type FileSlashCommand, loadSlashCommands } from "../extensibility/slash-commands";
 import { ACP_BUILTIN_RESERVED_NAMES, isAcpBuiltinShadowedName } from "./acp-builtins";
-import { BUILTIN_SLASH_COMMANDS_INTERNAL } from "./builtin-registry";
+import { BUILTIN_SLASH_COMMANDS_INTERNAL, lookupBuiltinSlashCommand } from "./builtin-registry";
 
 export type AvailableSlashCommandSource = "builtin" | "skill" | "extension" | "custom" | "mcp_prompt" | "file";
 
@@ -109,10 +109,13 @@ export async function buildAvailableSlashCommands(
 	return commands;
 }
 
+/** The commands an ACP client is offered: all of them but the built-ins marked `acpHidden` (`/live`). */
 export function toAcpAvailableCommands(commands: readonly InternalAvailableSlashCommand[]): AvailableCommand[] {
-	return commands.map(command => ({
-		name: command.name,
-		description: command.description ?? "",
-		input: command.input,
-	}));
+	return commands
+		.filter(command => command.source !== "builtin" || !lookupBuiltinSlashCommand(command.name)?.acpHidden)
+		.map(command => ({
+			name: command.name,
+			description: command.description ?? "",
+			input: command.input,
+		}));
 }

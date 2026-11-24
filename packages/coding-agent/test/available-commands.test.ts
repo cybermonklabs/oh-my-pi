@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildAvailableSlashCommands } from "@oh-my-pi/pi-coding-agent/slash-commands/available-commands";
+import { ACP_BUILTIN_SLASH_COMMANDS } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import {
+	buildAvailableSlashCommands,
+	toAcpAvailableCommands,
+} from "@oh-my-pi/pi-coding-agent/slash-commands/available-commands";
 
 describe("buildAvailableSlashCommands", () => {
 	test("returns RPC-safe command metadata with stable sources", async () => {
@@ -172,5 +176,26 @@ describe("buildAvailableSlashCommands", () => {
 		expect(byName.models).toBeUndefined();
 		expect(byName.plugins.source).toBe("builtin");
 		expect(byName.plugins.aliases).toEqual(["plugin"]);
+	});
+
+	test("offers /live to RPC clients but not to ACP clients, which answer it as not available", async () => {
+		const commands = await buildAvailableSlashCommands(
+			{
+				customCommands: [],
+				skills: [],
+				sessionManager: { getCwd: () => "/tmp" },
+				setSlashCommands: () => {},
+			} as never,
+			async () => [],
+		);
+		// RPC mode lists every built-in with a text-mode handler, /live among them.
+		expect(commands.find(command => command.name === "live")?.source).toBe("builtin");
+		const acp = toAcpAvailableCommands(commands).map(command => command.name);
+		expect(acp).not.toContain("live");
+		// Control: the other built-ins with a text-mode handler are still offered to ACP clients.
+		expect(acp).toContain("compact");
+		expect(acp).toHaveLength(commands.length - 1);
+		expect(ACP_BUILTIN_SLASH_COMMANDS.map(command => command.name)).not.toContain("live");
+		expect(ACP_BUILTIN_SLASH_COMMANDS.map(command => command.name)).toContain("compact");
 	});
 });
