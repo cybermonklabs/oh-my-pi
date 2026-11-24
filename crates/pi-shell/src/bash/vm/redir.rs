@@ -212,20 +212,53 @@ const fn default_fd(op: RedirKind) -> i32 {
 	}
 }
 
-/// Source text of word `w` (for `ambiguous redirect`).
+/// The text bash stores for word `w`, which `ambiguous redirect` names:
+/// the source, with each command substitution as the parser re-prints it
+/// (`$(  true;false  )` is `$(true; false)`, `${| return 3; }` is
+/// `${|return 3; }`), `$'…'` decoded in single quotes and `$"…"` as `"…"`
+/// ([`crate::bash::syntax::word_text`]). The unit's syntax is parsed again
+/// for it (an error path); a zsh word, or one that syntax does not hold at
+/// the word's span, is named by its source text.
 fn word_text(unit: &Unit, w: u32) -> BString {
 	let node = unit.words[w as usize].node;
-	unit
-		.nodes
-		.get(node as usize)
-		.map_or_else(BString::default, |n| {
-			BString::from(
-				unit
-					.source
-					.get(n.lo as usize..n.hi as usize)
-					.unwrap_or_default(),
-			)
-		})
+	let Some(info) = unit.nodes.get(node as usize) else {
+		return BString::default();
+	};
+	let source = || {
+		BString::from(
+			unit
+				.source
+				.get(info.lo as usize..info.hi as usize)
+				.unwrap_or_default(),
+		)
+	};
+	if unit.mode.dialect() != Dialect::Bash {
+		return source();
+	}
+	let syntax = match unit.trace_syntax.get() {
+		Some(s) => Arc::clone(s),
+		None => match crate::bash::trace::syntax::UnitSyntax::restore(unit) {
+			Some(s) => Arc::new(s),
+			None => return source(),
+		},
+	};
+	let tree = &syntax.tree.tree;
+	// The word is the node of its preorder id ([`crate::bash::syntax::NodeId`])
+	// at its span: unit-relative (a re-parsed unit) or from the offset the
+	// syntax keeps (a deferred function body).
+	let at = tree.nodes.iter().position(|n| {
+		n.kind == crate::bash::syntax::tree::K::Word
+			&& n.id == node
+			&& ((n.lo, n.hi) == (info.lo, info.hi)
+				|| (n.lo.checked_sub(syntax.offset), n.hi.checked_sub(syntax.offset))
+					== (Some(info.lo), Some(info.hi)))
+	});
+	let Some(at) = at else {
+		return source();
+	};
+	let mut out = Vec::new();
+	crate::bash::syntax::word_text(crate::bash::syntax::Word::at(tree, at as u32), &mut out);
+	BString::from(out)
 }
 
 /// The expanded target (a path, an fd number, or document bytes). `Ok(Err(d))`:

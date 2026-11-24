@@ -369,15 +369,25 @@ fn a_substitution_with_no_command_needs_no_vpid() {
 	assert_eq!(got, (String::new(), ZSH_MESSAGE.to_owned(), 1));
 }
 
-/// Stated, not changed: `$(< file)` still runs in a vproc, so with none left
-/// it fails as a fork, where bash 5.2.21, 5.3.20 and zsh 5.9 read the file in
-/// the shell itself and go on.
+/// `$(< file)` needs no vpid: bash 5.2.21, 5.3.20 and zsh 5.9 read the file
+/// in the shell itself (bash's `optimize_cat_file`), so with none left the
+/// value is read and the shell goes on, and an interactive bash's prompt
+/// shows it. A file name with a `$( )` in it still needs one for that
+/// substitution, which fails as a fork.
 #[test]
-fn a_file_substitution_still_needs_a_vpid() {
+fn a_file_substitution_needs_no_vpid() {
 	let mut r = rig_at(Vpid::CEILING + 1);
-	let got = run(&mut r, "x=$(< /dev/null); echo after");
+	let got = run(&mut r, "x=$(< /dev/null); echo \"after st=$? x=[$x]\"");
+	assert_eq!(got, ("after st=0 x=[]\n".to_owned(), String::new(), 0));
+	let mut r = rig_at(Vpid::CEILING + 1);
+	let got = run(&mut r, "x=$(< \"$(echo /dev/null)\"); echo after");
 	assert_eq!(got, (String::new(), MESSAGE.to_owned(), 254));
 	let mut r = zsh_rig_at(Vpid::CEILING + 1);
-	let got = run(&mut r, "x=$(< /dev/null); print after");
-	assert_eq!(got, (String::new(), ZSH_MESSAGE.to_owned(), 1));
+	let got = run(&mut r, "x=$(< /dev/null); print \"after st=$? x=[$x]\"");
+	assert_eq!(got, ("after st=0 x=[]\n".to_owned(), String::new(), 0));
+	let mut init = ShellInit { interactive: true, ..skeleton_init(&[]) };
+	init.env.push(("PS1".into(), "$ ".into()));
+	let input = "PS1='$(< /dev/null)> '\necho one\necho hi\n";
+	let got = interactive(init, Vpid::CEILING + 1, input);
+	assert_eq!(got, ("one\nhi\n".to_owned(), "$ > > > ".to_owned(), 0));
 }

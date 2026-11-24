@@ -125,6 +125,10 @@ pub struct Vproc {
 	/// never runs inside its own action, so they nest at most once per trap
 	/// kind, far below `u16::MAX`.
 	pub trap_frames:   u16,
+	/// A `break` or `continue` run inside `${ }` or `${| }` that no loop
+	/// has taken yet (bash's `breaking` or `continuing`); boxed, as it is
+	/// rare and an idle vproc pays 8 B for it.
+	pub pending_break: Option<Box<PendingBreak>>,
 	/// Current mode: the emulation its code runs under, set by
 	/// `emulate`, a mode-switching function call (restored on return) and
 	/// a run's explicit mode; inherited by children. The root's is written
@@ -138,6 +142,30 @@ pub struct Vproc {
 	/// Inherited (copied) by children; never serialized: a restored shell
 	/// starts with zsh's defaults and no line in progress.
 	pub zle:           Option<Box<super::zle::Zle>>,
+}
+
+/// A `break` or `continue` that ran inside `${ }` or `${| }`
+/// ([`Vproc::pending_break`]). bash's `break` only sets `breaking`: the
+/// substitution's body ends there, later substitutions of its command run
+/// nothing, the command itself runs, and the next loop out takes the
+/// levels left ([`super::exec`]'s `pending_break`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingBreak {
+	/// Loop levels left.
+	pub levels: u32,
+	/// `continue` instead of `break`.
+	pub cont:   bool,
+	/// The frame count of the command holding the substitution. A deeper
+	/// frame is one that command entered: its `$(< file)` frame runs on;
+	/// a function, `eval` or `.` runs none of its commands.
+	pub depth:  u32,
+	/// The frame count of the command whose redirections were being expanded
+	/// when the `break` ran (0: not in a redirection). bash expands the
+	/// redirections of a program it runs (an external, a command it cannot
+	/// find) in the forked child, so the break is lost with that child: it is
+	/// dropped once that command's name resolves to one ([`super::command`]'s
+	/// `drop_childs_break`).
+	pub redir:  u32,
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's
@@ -798,17 +826,44 @@ impl Vproc {
 	}
 
 	/// Bash defers trapped signals while waiting for a foreground command.
+	/// Not between the commands of a `${ ;}` or `${| ;}` body that bash runs
+	/// in the shell itself (in a simple command's words, a compound
+	/// command's own redirection): bash runs a pending trap as each command
+	/// there ends (`run_pending_traps`), before a later `break` can leave the
+	/// trap nothing to run. bash expands a program's redirections, and a
+	/// `( … )`'s, in its forked child, so a trap set off there waits for
+	/// that child; this shell expands a simple command's redirections before
+	/// its name resolves, so it holds a trap from them back whatever the
+	/// name runs.
 	pub fn waiting_foreground(&self) -> bool {
-		self.frames.iter().any(|frame| {
-			frame.scratch.as_ref().is_some_and(|scratch| {
-				!scratch.children.is_empty()
-					|| scratch.sub.is_some()
-					|| matches!(
-						scratch.exec.as_ref().and_then(|exec| exec.waiting),
-						Some(Awaited::Call(_) | Awaited::Task(_) | Awaited::Ext { .. })
-					)
+		self
+			.frames
+			.last()
+			.is_some_and(super::exec::redirected_subshell_starts)
+			|| self.frames.iter().enumerate().any(|(i, frame)| {
+				frame.scratch.as_ref().is_some_and(|scratch| {
+					!scratch.children.is_empty()
+						|| match scratch.sub {
+							Some(PendingSub::NoFork { .. }) => {
+								!self
+									.frames
+									.get(i + 1)
+									.is_some_and(|above| above.kind == FrameKind::NoFork)
+									|| scratch
+										.exec
+										.as_deref()
+										.is_some_and(|exec| exec.stage == Stage::Redirect)
+									|| super::exec::subshell_redirection(frame)
+							},
+							Some(_) => true,
+							None => false,
+						}
+						|| matches!(
+							scratch.exec.as_ref().and_then(|exec| exec.waiting),
+							Some(Awaited::Call(_) | Awaited::Task(_) | Awaited::Ext { .. })
+						)
+				})
 			})
-		})
 	}
 }
 
@@ -887,6 +942,16 @@ pub enum FrameKind {
 	/// The last stage of a pipeline run in the current shell (`lastpipe`):
 	/// `SubExit` pops, and the `Spawn` op collects its status.
 	Stage,
+	/// The body of a bash `$(< file)` run in the current shell (bash
+	/// `optimize_cat_file`): its `< file` reads the file into `capture`,
+	/// the substitution's own buffer, and leaves the shell's fds alone;
+	/// `SubExit` pops.
+	Cat {
+		/// The substitution's buffer. The frames image keeps it by its memory
+		/// object (`FrameImage::capture`), not here.
+		#[serde(skip)]
+		capture: crate::bash::mem::Capture,
+	},
 	/// The base frame of a job the shell suspended
 	/// ([`super::jobctl::suspend`]): a subshell frame that also ends its
 	/// vproc when its pc reaches `stop_at` (the end of the top-level
@@ -1855,8 +1920,9 @@ impl Live {
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
 // that to at most 1,840 B. The forking shell's loop count
 // (`Vproc::outer_loops`) is a `u16` beside a `u16` `Vproc::trap_frames`,
-// in the 4 bytes `trap_frames` had: `Vproc` keeps its 672 B.
-const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
+// in the 4 bytes `trap_frames` had; a `break` waiting in `${ }`
+// (`Vproc::pending_break`, boxed, 8 B) brings it to at most 1,848 B.
+const _: () = assert!(size_of::<Vproc>() <= 680, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");

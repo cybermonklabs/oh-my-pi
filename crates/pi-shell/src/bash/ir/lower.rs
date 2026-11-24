@@ -1415,30 +1415,11 @@ impl Lower {
 		}
 	}
 
-	/// `$(< file)`: flag the body's lone `Exec` ([`Op::CAT`]) when it has
-	/// no words, no assignments and one `<` on fd 0.
+	/// `$(< file)`: flag the body's lone `Exec` ([`Op::CAT`],
+	/// [`Unit::cat_exec`]).
 	fn mark_cat(&mut self, entry: u32) {
-		let ops = &self.unit.ops;
-		let (Some(op), Some(next)) = (ops.get(entry as usize), ops.get(entry as usize + 1)) else {
-			return;
-		};
-		if op.code != Opcode::Exec || next.code != Opcode::SubExit {
-			return;
-		}
-		let cmd = &self.unit.cmds[op.a as usize];
-		let lone_input = cmd
-			.redirs
-			.and_then(|l| self.unit.redirs.get(l as usize))
-			.is_some_and(
-				|rs| matches!(rs.as_slice(), [r] if r.op == RedirKind::In && r.fd == RedirFdIr::Default),
-			);
-		let empty = self
-			.unit
-			.lists
-			.get(cmd.words as usize)
-			.is_none_or(Vec::is_empty);
-		if lone_input && empty && cmd.assigns.is_empty() {
-			self.unit.ops[entry as usize].flags |= Op::CAT;
+		if let Some(pc) = self.unit.cat_exec(entry) {
+			self.unit.ops[pc as usize].flags |= Op::CAT;
 		}
 	}
 
