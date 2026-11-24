@@ -21,7 +21,7 @@ use crate::bash::{
 		expand::{
 			self, arith_value, attr_letters, seconds_lookup, seconds_to_plain, seconds_visible,
 		},
-		is_ident,
+		is_ident, nested,
 		proc::{AssignValue, Vproc},
 		quote,
 		state::{self, Level, Var, VarEdit},
@@ -2165,19 +2165,18 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					None => ctx.diag(d()),
 				}
 				// Its declaration fails on an attribute a readonly variable
-				// keeps, else its value does (`do_word_assignment`). Only a
-				// failed declaration of `declare`, `typeset` or `local` in a
-				// function is skipped, and the builtin names it again. bash
+				// keeps, else its value does (`do_word_assignment`); the
+				// declaration gets no `+r` (`expand_declaration_argument`
+				// passes `make_internal_declare` only `I i l u c` and the
+				// word's `a A g`), so `declare +r x=(2)` fails its value. Only
+				// a failed declaration of `declare`, `typeset` or `local` in
+				// a function is skipped, and the builtin names it again. bash
 				// reports a failed value with `report_error`, which ends the
-				// shell under `set -e` (`exit_immediately_on_error`).
-				let declaring = off.contains(Attrs::READONLY) || (on.bits() | off.bits()) & fixed != 0;
+				// shell when `exit_immediately_on_error` is set.
+				let declaring = (on.bits() | off.bits()) & fixed != 0;
 				if !(declaring && forcelocal) {
-					let control = if !declaring && ctx.option(OptId::Errexit)? {
-						super::Control::Exit
-					} else {
-						super::Control::Discard
-					};
-					return Ok(super::Outcome { status: 1, control });
+					let exits = !declaring && exits_on_error(ctx)?;
+					return Ok(super::Outcome { status: 1, control: discard(ctx, exits) });
 				}
 				ctx.err(d());
 			} else if value.is_some() && special && !array_flag {
@@ -2233,7 +2232,7 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					None => ctx.diag(report),
 				}
 				if !forcelocal {
-					return Ok(super::Outcome { status: 1, control: super::Control::Discard });
+					return Ok(super::Outcome { status: 1, control: discard(ctx, false) });
 				}
 			}
 			ctx.err(Diag::Usage { msg: msg.into() });
@@ -2557,6 +2556,38 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		seconds_lookup(ctx.k, ctx.cx, ctx.vp)?;
 	}
 	done(status)
+}
+
+/// bash's `exit_immediately_on_error` as `report_error` reads it: `set -e`
+/// is on, and no `eval` or `.` of this shell runs where its status is
+/// ignored (an `if`, `while` or `until` condition, a `!` pipeline, a
+/// `&&`/`||` list but its last command), for which `execute_builtin` turns
+/// it off (`builtin_ignoring_errexit`). A function called there does not.
+fn exits_on_error(ctx: &mut Ctx<'_, '_>) -> Result<bool, Need> {
+	use crate::bash::vm::proc::{FrameKind, ScriptKind};
+	Ok(ctx.option(OptId::Errexit)?
+		&& !ctx.vp.frames.iter().any(|f| {
+			f.ignore_errexit
+				&& matches!(f.kind, FrameKind::Script {
+					what: ScriptKind::Eval | ScriptKind::Source,
+					..
+				})
+		}))
+}
+
+/// The control for a failed compound argument (bash's `DISCARD`): the rest
+/// of the command line is abandoned, and the innermost script, `eval` or `.`
+/// goes on with its next command; `exits` (`report_error` under
+/// `exit_immediately_on_error`) ends the shell instead. In a subshell the
+/// jump goes on to the subshell's own top level, also from an `eval` or `.`
+/// in it (`parse_and_execute`), which ends the subshell with status 1 as an
+/// exit does.
+fn discard(ctx: &mut Ctx<'_, '_>, exits: bool) -> super::Control {
+	if exits || nested::in_subshell(ctx.cx.store, ctx.vp) {
+		super::Control::Exit
+	} else {
+		super::Control::Discard
+	}
 }
 
 /// The `(key, append, value)` elements of a compound value

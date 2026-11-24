@@ -151,7 +151,8 @@ pub enum Control {
 	/// command (bash's `exp_jump_to_top_level (DISCARD)` from a word
 	/// expansion, caught by `parse_and_execute` with no `top_level_cleanup`:
 	/// a declaration builtin's compound argument that fails), status in
-	/// [`Outcome::status`]. A subshell ends; `set -e` does not act.
+	/// [`Outcome::status`]; `set -e` does not act. In a subshell, which the
+	/// jump ends, the builtin sends [`Control::Exit`] instead.
 	Discard,
 	/// A frame was pushed (`eval`, `source`): wait for it to return.
 	Frame,
