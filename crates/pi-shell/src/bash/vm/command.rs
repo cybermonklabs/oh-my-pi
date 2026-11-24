@@ -20,9 +20,9 @@ use super::{
 	expand::{CompoundElem, Expander, Stop, compound_text},
 	probe::{self, Search, absolute, candidates},
 	proc::{
-		AssignValue, Awaited, BangStage, DeferPhase, ExecAs, ExecState, Frame, FrameKind, JobState,
-		Live, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot, Stage, Target,
-		Transfer, Vproc,
+		AssignValue, Awaited, BangStage, CmdName, DeferPhase, ExecAs, ExecState, Frame, FrameKind,
+		JobState, Live, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot,
+		Stage, Target, Transfer, Vproc,
 	},
 	state::{self, Level, Scope, Var, VarMap},
 	xtrace,
@@ -73,6 +73,7 @@ impl ExecState {
 			via_command: false,
 			resume: false,
 			resumed: 0,
+			name_before: None,
 		}
 	}
 
@@ -104,6 +105,7 @@ impl ExecState {
 			via_command,
 			resume,
 			resumed,
+			name_before,
 		} = self;
 		*stage = Stage::Expand;
 		*old_tag = tag;
@@ -130,6 +132,7 @@ impl ExecState {
 		*via_command = false;
 		*resume = false;
 		*resumed = 0;
+		*name_before = None;
 	}
 }
 
@@ -468,6 +471,12 @@ fn assignment_statement(
 	vp.status = 0;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(0);
+	// An assignment-only command leaves `$_` empty (bash `bind_lastarg`,
+	// with no command name), and clears the name.
+	if !forked_alone(vp) {
+		bash_last_arg(k, vp, cx, line, BString::default(), CmdName::Cleared, None);
+	}
+	vp.cmd_name = CmdName::Cleared;
 	Some(Flow::Next)
 }
 
@@ -580,6 +589,11 @@ fn plain_statement(
 			} else {
 				Stage::Expand
 			};
+			if globs.is_empty() {
+				// The words are expanded: the command names itself.
+				e.name_before = Some(vp.cmd_name);
+				vp.cmd_name = CmdName::Own;
+			}
 			e.globs = globs;
 			sc.exec = Some(e);
 			vp.frames.last_mut().expect("frame").scratch = Some(sc);
@@ -605,6 +619,11 @@ fn plain_statement(
 		vp.status = outcome.status;
 		vp.pipestatus.clear();
 		vp.pipestatus.push(outcome.status);
+		let last = argv.pop().unwrap_or_default();
+		if !forked_alone(vp) {
+			bash_last_arg(k, vp, cx, line, last, CmdName::Own, argv.first().map(|n| &n[..]));
+		}
+		vp.cmd_name = CmdName::Cleared;
 		return Some(Flow::Next);
 	}
 	// The stages take over from the expanded words: a builtin that needs
@@ -616,6 +635,8 @@ fn plain_statement(
 	e.scoped = true;
 	e.target = Some(Target::Intrinsic(id));
 	e.stage = Stage::Dispatch;
+	e.name_before = Some(vp.cmd_name);
+	vp.cmd_name = CmdName::Own;
 	sc.exec = Some(e);
 	match res {
 		Ok(outcome) => {
@@ -1123,6 +1144,7 @@ fn expand(
 		s.status = s.sub_status.unwrap_or(0);
 	}
 	s.stage = Stage::Redirect;
+	name_command(vp);
 	if assign_only
 		&& k.mask.contains(crate::bash::event::EventKind::CmdExpanded)
 		&& let Some(e) = current_exec(vp)
@@ -2247,7 +2269,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			s.stage = Stage::Output;
 			None
 		},
-		Target::SelfShell => match build_env(k, cx, vp) {
+		Target::SelfShell => match build_env(k, cx, vp, None) {
 			Ok(env) => super::nested::start(k, vp, cx, line, &env),
 			Err(err) => {
 				k.fail(err);
@@ -2256,14 +2278,15 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		},
 		Target::Refused { path, code } => refused(k, vp, cx, line, &path, code),
 		Target::Tool(tool) => {
-			let (env, umask) =
-				match build_env(k, cx, vp).and_then(|env| Ok((env, state::umask(cx.store, vp)?))) {
-					Ok(v) => v,
-					Err(err) => {
-						k.fail(err);
-						return Some(Flow::Discard(1));
-					},
-				};
+			let (env, umask) = match build_env(k, cx, vp, None)
+				.and_then(|env| Ok((env, state::umask(cx.store, vp)?)))
+			{
+				Ok(v) => v,
+				Err(err) => {
+					k.fail(err);
+					return Some(Flow::Discard(1));
+				},
+			};
 			let id = CallId(k.next_call);
 			k.next_call += 1;
 			let (argv, tag) = {
@@ -2289,14 +2312,15 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			Some(Flow::Block(WaitKey::Call(id)))
 		},
 		Target::Native(native) | Target::Device(native) => {
-			let (env, umask) =
-				match build_env(k, cx, vp).and_then(|env| Ok((env, state::umask(cx.store, vp)?))) {
-					Ok(v) => v,
-					Err(err) => {
-						k.fail(err);
-						return Some(Flow::Discard(1));
-					},
-				};
+			let (env, umask) = match build_env(k, cx, vp, None)
+				.and_then(|env| Ok((env, state::umask(cx.store, vp)?)))
+			{
+				Ok(v) => v,
+				Err(err) => {
+					k.fail(err);
+					return Some(Flow::Discard(1));
+				},
+			};
 			let extra = extra_fds(vp);
 			let argv = st(vp).argv.clone();
 			let tag = st(vp).tag;
@@ -2359,7 +2383,14 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			let env = if exec_as.as_ref().is_some_and(|e| e.clear_env) {
 				EnvView::new(Vec::new())
 			} else {
-				match build_env(k, cx, vp) {
+				// An external the shell runs gets `_` as its path. One `exec`
+				// starts gets only an exported `_`, if any (bash passes the
+				// environment it last built, whose `_` is the last external's
+				// path; this shell builds none to keep). A utility's command
+				// (`env`, `xargs`) runs through `exec`, so it gets an explicit
+				// `_=VALUE` the utility gives it, else none.
+				let path = exec_as.is_none().then_some(&path[..]);
+				match build_env(k, cx, vp, path) {
 					Ok(env) => env,
 					Err(err) => {
 						k.fail(err);
@@ -4700,6 +4731,16 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = st(vp);
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
+	// bash `bind_lastarg`: the command's last word (its name when it has
+	// no argument, empty after an assignment-only command). `exit`,
+	// `return` and `exec` leave before it: an EXIT or RETURN trap sees the
+	// command before them. The whole of a forked pipeline stage or
+	// asynchronous command binds nothing ([`forked_alone`]).
+	let left = matches!(control, Some(Transfer::Return(_) | Transfer::Exit(_) | Transfer::Exec));
+	let binds = vp.mode.dialect() == crate::bash::ids::Dialect::Bash && !left && !forked_alone(vp);
+	// The last word is the value; the others stay in the command's state,
+	// which the next command reuses (`spare_exec`, `pool_words`).
+	let last = binds.then(|| st(vp).argv.pop().unwrap_or_default());
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
@@ -4716,10 +4757,32 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		.last_mut()
 		.and_then(|f| f.scratch.take())
 		.expect("exec scratch");
-	exec::drop_scratch(&mut k.root, cx.store, vp, sc);
+	// The bind follows the command's temporary scope and redirections (a
+	// message goes to the shell's stderr), and reads the name from the
+	// words before they are recycled: a borrow, copied only where `_` has
+	// attributes.
+	let sc = exec::release_scratch(&mut k.root, cx.store, vp, sc);
 	if k.mask.bits() != 0 {
 		vp.fds.set_command_tag(None);
 	}
+	if let Some(last) = last {
+		let line = exec::line_of(vp, op.node);
+		let who = vp.cmd_name;
+		let own = sc
+			.exec
+			.as_deref()
+			.and_then(|e| e.argv.first())
+			.map(|n| &n[..]);
+		bash_last_arg(k, vp, cx, line, last, who, own);
+	}
+	// bash clears `this_command_name` when a command runs to its end; one
+	// that leaves (`exit`, `return`, `exec`) puts back the name from before
+	// it.
+	vp.cmd_name = match sc.exec.as_deref().and_then(|e| e.name_before) {
+		Some(before) if left => before,
+		_ => CmdName::Cleared,
+	};
+	exec::keep_scratch(vp, sc);
 	if status != 0 && in_shell && vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		print_exit_value(k, vp, cx, status);
 	}
@@ -4750,6 +4813,151 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		},
 		Some(Transfer::Exec) => Flow::Exit(status),
 	}
+}
+
+/// bash `bind_lastarg`: after a simple command `$_` is its last word (its
+/// name when it has no argument, empty after an assignment-only command),
+/// assigned as `_=word` would be: at the innermost scope that declares `_`
+/// (`local _`), through its attributes (`-u`, `-l`, `-i`; `-n` assigns the
+/// variable it names; an array's element 0 takes it), a readonly one kept
+/// with bash's error. Then `_` is not exported, so an external gets it only
+/// as its own path ([`build_env`]). A plain `_`, the usual case, takes the
+/// bytes in place. `( )` and command substitutions bind it in their own
+/// vprocs only, and the whole of a forked pipeline stage or background job
+/// binds nothing ([`forked_alone`]). A value error names the command as
+/// bash's `this_command_name` does then (`who`, [`Vproc::cmd_name`]): its
+/// own name `own` (`None`: `last` is), none after a simple command it ran
+/// to its end (a function body, `eval`, `.`), `((` or `[[` after one of
+/// those (`echo: [3]: arithmetic syntax error …`); a readonly `_`'s error
+/// stays bare.
+fn bash_last_arg(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	line: u32,
+	last: BString,
+	who: CmdName,
+	own: Option<&[u8]>,
+) {
+	let cur = match state::lookup_declared(&k.root, cx.store, vp, b"_") {
+		Ok(v) => v.map(|v| (v.attrs, matches!(v.value, crate::bash::store::VarValue::Str(_)))),
+		Err(err) => {
+			k.fail(err);
+			return;
+		},
+	};
+	let exported = match cur {
+		None => {
+			let var = Var::scalar(last, Attrs::default());
+			state::store_var(&mut k.root, cx.store, vp, b"_", Some(var), Level::Dynamic);
+			return;
+		},
+		Some((attrs, true)) if attrs.without(Attrs::EXPORT) == Attrs::NONE => {
+			let edit = state::VarEdit::Set { elem: None, value: &last, append: false };
+			if let Err(err) = state::edit_var(&mut k.root, cx.store, vp, b"_", Level::Dynamic, edit) {
+				k.fail(err);
+				return;
+			}
+			attrs.contains(Attrs::EXPORT)
+		},
+		Some((attrs, _)) => {
+			// `_` has attributes, so this is the rare path: the name a value
+			// error gives is kept before the word goes into the assignment.
+			let name = BString::from(match who {
+				CmdName::Own => own.unwrap_or(&last[..]),
+				CmdName::Cleared => &b""[..],
+				CmdName::Arith => &b"(("[..],
+				CmdName::Cond => &b"[["[..],
+			});
+			let lhs = Lhs { name: b"_", index: None, append: false };
+			if let Err(d) =
+				builtins::set_value(k, cx, vp, lhs, AssignValue::Scalar(last), Level::Dynamic)
+			{
+				let d = if matches!(d, Diag::Readonly { .. }) || name.is_empty() {
+					d
+				} else {
+					d.by(String::from_utf8_lossy(&name).into_owned())
+				};
+				k.diag(cx, vp, line, d);
+			}
+			attrs.contains(Attrs::EXPORT)
+		},
+	};
+	if exported {
+		let var = match state::lookup_declared(&k.root, cx.store, vp, b"_") {
+			Ok(Some(v)) => Var { attrs: v.attrs.without(Attrs::EXPORT), value: v.value.clone() },
+			Ok(None) => return,
+			Err(err) => {
+				k.fail(err);
+				return;
+			},
+		};
+		let edit = state::VarEdit::Replace(var);
+		if let Err(err) = state::edit_var(&mut k.root, cx.store, vp, b"_", Level::Dynamic, edit) {
+			k.fail(err);
+		}
+	}
+}
+
+/// The command names itself once its words are expanded, as bash sets
+/// `this_command_name` after `expand_words`: a `${ cmd; }` in a word runs
+/// before, one in a redirection after ([`Vproc::cmd_name`]).
+fn name_command(vp: &mut Vproc) {
+	let before = vp.cmd_name;
+	st(vp).name_before = Some(before);
+	vp.cmd_name = CmdName::Own;
+}
+
+/// bash binds no `$_` after a simple command that is the whole of a forked
+/// pipeline stage (not `lastpipe`'s last, which runs in the shell) or of an
+/// asynchronous command: `execute_simple_command` forks it itself, and the
+/// child runs a builtin or function through
+/// `execute_subshell_builtin_or_function`, which ends in `subshell_exit`,
+/// or execs a program. `( … )`, a group stage, a coprocess and a command
+/// substitution run their commands unforked in the child, which binds.
+fn forked_alone(vp: &Vproc) -> bool {
+	let [frame] = vp.frames.as_slice() else {
+		return false;
+	};
+	let Some(unit) = frame.unit.as_deref() else {
+		return false;
+	};
+	let pc = frame.pc;
+	let next = unit.ops.get(pc as usize + 1).map(|op| op.code);
+	matches!(frame.kind, FrameKind::Subshell)
+		&& next == Some(ir::Opcode::SubExit)
+		&& unit.spawns.iter().any(|s| {
+			matches!(s.kind, ir::SpawnKind::Pipeline | ir::SpawnKind::Background)
+				&& s.stages.iter().any(|stage| stage.entry == pc)
+		})
+}
+
+/// A `break` or `continue` in `eval` leaves the loop through it: bash's
+/// `eval` returns after it, so its command binds `$_` as any command does
+/// (with no name: the break ran to its end), then the loop ends.
+pub(super) fn bind_crossed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
+	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash || forked_alone(vp) {
+		return;
+	}
+	let Some(frame) = vp.frames.last_mut() else {
+		return;
+	};
+	let node = frame
+		.unit
+		.as_ref()
+		.and_then(|u| u.ops.get(frame.pc as usize))
+		.map(|op| op.node);
+	let last = frame
+		.scratch
+		.as_deref_mut()
+		.and_then(|s| s.exec.as_deref_mut())
+		.map(|e| e.argv.pop().unwrap_or_default());
+	let (Some(node), Some(last)) = (node, last) else {
+		return;
+	};
+	let line = exec::line_of(vp, node);
+	bash_last_arg(k, vp, cx, line, last, CmdName::Cleared, None);
+	vp.cmd_name = CmdName::Cleared;
 }
 
 /// zsh `execcmd`/`execshfunc` under `printexitvalue` with `shinstdin`: a
@@ -4835,11 +5043,17 @@ fn run_script_file(
 		exec_failed(k, cx, vp);
 		return None;
 	}
+	// `$0` is the file bash tried: a name with `/` as written, else the
+	// PATH (or hash table) result. The new shell's `_` is that name too, as
+	// an external's is its path (not after `exec`).
+	let name = st(vp).argv[0].clone();
+	let file = if name.contains(&b'/') { name } else { path };
 	// The environment the program would have been given (`exec -c`: none).
 	let env = if st(vp).exec_as.as_ref().is_some_and(|e| e.clear_env) {
 		EnvView::new(Vec::new())
 	} else {
-		match build_env(k, cx, vp) {
+		let underscore = st(vp).exec_as.is_none().then_some(&file[..]);
+		match build_env(k, cx, vp, underscore) {
 			Ok(env) => env,
 			Err(err) => {
 				k.fail(err);
@@ -4847,10 +5061,6 @@ fn run_script_file(
 			},
 		}
 	};
-	// `$0` is the file bash tried: a name with `/` as written, else the
-	// PATH (or hash table) result.
-	let name = st(vp).argv[0].clone();
-	let file = if name.contains(&b'/') { name } else { path };
 	super::nested::start_script(k, vp, cx, &env, &file, &text)
 }
 
@@ -5189,8 +5399,15 @@ fn extra_fds(vp: &Vproc) -> Vec<(i32, FdRef)> {
 /// The environment of a command: exported variables as the vproc sees them
 /// (prefix assignments are in its innermost scope), plus exported
 /// functions as `BASH_FUNC_name%%`. Built per external (and nested shell
-/// or tool call): only the exported entries are read and copied.
-fn build_env(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Result<EnvView, StoreError> {
+/// or tool call): only the exported entries are read and copied. `path`:
+/// a bash external's full path, which bash gives it as `_` (bash
+/// `put_command_name_into_env`).
+fn build_env(
+	k: &Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	path: Option<&[u8]>,
+) -> Result<EnvView, StoreError> {
 	let mut pairs: Vec<(BString, BString)> = Vec::new();
 	state::exported(&k.root, cx.store, vp, &mut pairs)?;
 	// Imported strings with non-identifier names pass through unchanged.
@@ -5233,6 +5450,11 @@ fn build_env(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Result<EnvView, StoreEr
 				pairs.push((name.clone(), v.clone()));
 			}
 		}
+	}
+	// An external's `_` is its path: pushed last, it replaces an exported
+	// `_` ([`EnvView::new`] keeps the later of two names).
+	if let Some(path) = path.filter(|_| vp.mode.dialect() == crate::bash::ids::Dialect::Bash) {
+		pairs.push((BString::from("_"), BString::from(path)));
 	}
 	Ok(EnvView::new(pairs))
 }

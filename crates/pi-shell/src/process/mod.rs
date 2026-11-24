@@ -662,6 +662,7 @@ pub fn shell_init(
 	ShellInit {
 		mode: args.mode,
 		argv0,
+		shell_name: Some(args.shell_name.clone()),
 		args: params,
 		env,
 		cwd,

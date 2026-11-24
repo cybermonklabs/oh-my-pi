@@ -203,6 +203,8 @@ async fn env_runs_its_command_through_the_shell() {
 	assert_eq!(out(&mut s, "export BAR=x; env BAR=y true; echo $BAR").await, "x\n");
 	// Its stdin is the caller's.
 	assert_eq!(out(&mut s, "echo piped | env cat").await, "piped\n");
+	// An explicit `_=VALUE` reaches the command, as GNU `env`'s does.
+	assert_eq!(out(&mut s, "env _=x printenv _").await, "x\n");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -239,6 +241,8 @@ async fn env_clear_and_unset_remove_inherited_non_shell_entries() {
 	assert!(plain.lines().any(|line| line == "PI_PROBE_PLAIN=1"));
 	assert_eq!(own(out(&mut s, "env -i /usr/bin/env").await), "");
 	assert_eq!(own(out(&mut s, "env -i A=1 /usr/bin/env").await), "A=1\n");
+	assert_eq!(own(out(&mut s, "env -i _=x /usr/bin/env").await), "_=x\n");
+	assert_eq!(own(out(&mut s, "env -i _=x A=1 /usr/bin/env").await), "A=1\n_=x\n");
 	assert_eq!(own(out(&mut s, "env -i 'PI_PROBE-DASH=2' /usr/bin/env").await), "PI_PROBE-DASH=2\n");
 	// A command-prefix assignment shadows the exported global: clearing or
 	// removing the binding must not uncover the global's value.

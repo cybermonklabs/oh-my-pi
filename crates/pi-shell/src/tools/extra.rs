@@ -184,6 +184,12 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 	let mut source = Vec::new();
 	let mut foreign_env = Vec::new();
 	let mut unexport_env = Vec::new();
+	// An explicit `_=VALUE`: given as a prefix of the final command, which
+	// reaches the program (`_=x exec …`). An `export _=…` command would
+	// itself bind `$_` to its last word, unexported, after it. pi's `env`
+	// gives every `Clear` and `Remove` before its `Set`s
+	// (`environment_changes`), so neither comes after a `_=VALUE`.
+	let mut underscore: Option<BString> = None;
 	for change in command.env_changes() {
 		match change {
 			// Every variable goes (a readonly one stops being exported), and
@@ -229,6 +235,9 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 				source.extend_from_slice(name.as_bytes());
 				source.extend_from_slice(b" 2>/dev/null; ");
 			},
+			EnvChange::Set(name, value) if name == "_" => {
+				underscore = Some(BString::from(value.as_bytes()));
+			},
 			EnvChange::Set(name, value) if is_name(name) => {
 				source.extend_from_slice(b"export ");
 				source.extend_from_slice(name.as_bytes());
@@ -242,6 +251,11 @@ fn script(mut command: ShellCommand, program: &Program, env_names: &[BString]) -
 		}
 	}
 	let mut args: Vec<BString> = command.args().iter().map(|arg| os_bytes(arg)).collect();
+	if let Some(value) = &underscore {
+		source.extend_from_slice(b"_=");
+		quote(&mut source, value);
+		source.push(b' ');
+	}
 	match program {
 		Program::Builtin => source.extend_from_slice(b"command -- \"$@\""),
 		Program::Path(path) => {
