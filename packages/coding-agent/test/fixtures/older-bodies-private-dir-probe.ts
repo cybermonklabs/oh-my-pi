@@ -1,12 +1,16 @@
 /**
  * Child process for test/session/older-bodies-private-dir.test.ts, so the
  * warnings a cold store or a spool logs once are this process's first. Takes
- * the scenario (`private`, `owner-only-0300` or `no-account-id`), the
- * directory that stands for `os.tmpdir()`, and a session file whose
- * compaction leaves entries before its cut. Resumes the session twice with
- * the older-entry store and rewrites one store's session twice through the
- * spool, then prints, as JSON, what each resume kept and read back, the files
- * opened under that directory, and the warnings logged.
+ * the scenario, the directory that stands for `os.tmpdir()`, and a session
+ * file whose compaction leaves entries before its cut. Resumes the session
+ * twice with the older-entry store and rewrites one store's session twice
+ * through the spool, then prints, as JSON, what each resume kept and read
+ * back, the files opened under that directory, and the warnings logged
+ * ({@link OlderBodiesProbeResult}). Two scenarios change what the process
+ * reads as its account id: `no-account-id` reads none, as on Windows, and
+ * `other-account` reads this account's id plus one, so the directories named
+ * for that id, which this account made, are another account's. Any other
+ * scenario names what the test put under the directory.
  */
 import { spyOn } from "bun:test";
 import * as fs from "node:fs";
@@ -33,6 +37,11 @@ export interface OlderBodiesProbeResult {
 const [scenario, tmp, file] = process.argv.slice(2);
 if (!scenario || !tmp || !file) throw new Error("usage: older-bodies-private-dir-probe.ts <scenario> <tmp> <session>");
 if (scenario === "no-account-id") withoutAccountId();
+if (scenario === "other-account") {
+	const uid = process.getuid?.();
+	if (uid === undefined) throw new Error("other-account needs an account id");
+	spyOn(process, "getuid").mockReturnValue(uid + 1);
+}
 spyOn(os, "tmpdir").mockReturnValue(tmp);
 const warnings: string[] = [];
 spyOn(logger, "warn").mockImplementation(message => {
