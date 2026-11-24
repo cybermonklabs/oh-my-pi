@@ -1,9 +1,10 @@
 //! A `bad substitution` names what bash was expanding when the bad part
 //! failed (bash's `expand_word_internal` string): the word as written, the
-//! inside of `"…"`, an operator's word, the text of a here-document or of
-//! arithmetic, a keyed array element whole. A `${x@…}` with no valid
-//! operator is bash's `parameter_brace_transform`: nothing for an unset
-//! value, a fatal error for a set one.
+//! inside of `"…"` (in arithmetic too), an operator's word, the text of a
+//! here-document or of arithmetic, a keyed array element whole (of an
+//! associative array, its value). A `${x@…}` with no valid operator is
+//! bash's `parameter_brace_transform`: nothing for a null value (unless
+//! the operator starts with `a` or `A`), a fatal error for a set one.
 //!
 //! Goldens: bash 5.3.20, measured in a cluster Job (bash 5.2.21 agrees but
 //! for `export v=…`, where it names `environment`). Each row runs as `-c`
@@ -261,7 +262,8 @@ fn names_the_operator_word() {
 }
 
 /// A here-document body, arithmetic text, a substring offset: the whole
-/// text, as bash parses it when it runs.
+/// text, as bash parses it when it runs. In arithmetic, the inside of a
+/// pair of double quotes: bash expands it as a string of its own.
 #[test]
 fn names_the_text_parsed_when_it_runs() {
 	check(&[
@@ -352,24 +354,150 @@ echo "after $?""#,
 			1,
 			1,
 		),
+		(
+			"echo $(( \"${x!}\" + 1 ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: ${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( 1 + \"a${x!}b\" ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: a${x!}b: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"(( \"${x!}\" + 1 ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: ${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"for (( i=\"${x!}\"; i<1; i++ )); do :; done\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: ${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc; echo ${x:\"${y!}\"}\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		// Each pair of quotes on its own; outside them, the whole text.
+		(
+			"echo $(( \"1\" + \"b${x!}\" ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: b${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( \"1\" + ${x!} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1:  \"1\" + ${x!} : bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=1; echo $(( \"${x@Z}\" ))\necho \"after $?\"",
+			"",
+			"PFX: line 1: ${x@Z}: bad substitution\n",
+			127,
+			1,
+		),
 	]);
 }
 
 /// A keyed array element: bash names `[key]=value` with the brackets
-/// quoted.
+/// quoted. An associative array's element names only the value, which bash
+/// expands as a string of its own; whether the array is associative is
+/// known when the element expands (`declare -A h` before `h=(…)`).
 #[test]
 fn names_a_keyed_element_whole() {
-	check(&[(
-		r#"a=([0]=a${x!}b); echo "after $?""#,
-		"",
-		"PFX: line 1: \\[0\\]=a${x!}b: bad substitution\n",
-		1,
-		1,
-	)]);
+	check(&[
+		(
+			r#"a=([0]=a${x!}b); echo "after $?""#,
+			"",
+			"PFX: line 1: \\[0\\]=a${x!}b: bad substitution\n",
+			1,
+			1,
+		),
+		(
+			"declare -A h=([k]=a${x!}b)\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: a${x!}b: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"declare -A h\nh=([k]=a${x!}b)\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: a${x!}b: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"declare -A h\nh+=([k]=a${x!}b)\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: a${x!}b: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"declare -A h=([k]+=a${x!}b)\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: a${x!}b: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"declare -A h\ndeclare -n r=h\nr=([k]=a${x!}b)\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 3: a${x!}b: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"declare -A h='([k]=a${x!}b)'\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: a${x!}b: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=1; declare -A h=([k]=a${x@Z}b)\necho \"after $?\"",
+			"",
+			"PFX: line 1: a${x@Z}b: bad substitution\n",
+			127,
+			1,
+		),
+		// `declare` without `-A` expands the list as indexed first.
+		(
+			"declare -A h\ndeclare h=([k]=a${x!}b)\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \\[k\\]=a${x!}b: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"declare -a a\na=([1]=a${x!}b)\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \\[1\\]=a${x!}b: bad substitution\n",
+			0,
+			0,
+		),
+	]);
 }
 
-/// `${u@…}` with no valid operator and `u` unset: nothing, status 0
-/// (`set -u`: unbound).
+/// `${u@…}` with no valid operator and a null value (`u` unset, or an
+/// empty `$@`, `$*` or `${a[@]}`): nothing, status 0. `set -u` comes first
+/// for an unset `u` (`$@`, `$*` and `${a[@]}` are exempt).
 #[test]
 fn an_invalid_transform_of_an_unset_value_is_nothing() {
 	check(&[
@@ -379,6 +507,57 @@ fn an_invalid_transform_of_an_unset_value_is_nothing() {
 			r#"set -u; echo a${u@Z}b; echo "after $?""#,
 			"",
 			"PFX: line 1: u: unbound variable\n",
+			127,
+			1,
+		),
+		("set --\necho x${@@Z}y\necho \"after $?\"", "xy\nafter 0\n", "", 0, 0),
+		("set --\necho x${*@Z}y\necho \"after $?\"", "xy\nafter 0\n", "", 0, 0),
+		("set --\necho \"q${@@Z}r\"\necho \"after $?\"", "qr\nafter 0\n", "", 0, 0),
+		("a=()\necho x${a[@]@Z}y\necho \"after $?\"", "xy\nafter 0\n", "", 0, 0),
+		("declare -A h=()\necho x${h[@]@Z}y\necho \"after $?\"", "xy\nafter 0\n", "", 0, 0),
+		("set -u\na=()\necho q${a[@]@Z}r\necho \"after $?\"", "qr\nafter 0\n", "", 0, 0),
+		("set -u\nset --\necho q${@@Z}r\necho \"after $?\"", "qr\nafter 0\n", "", 0, 0),
+	]);
+}
+
+/// An operator that starts with `a` or `A` reads the attributes of an
+/// unset or null value too: a fatal `bad substitution`, after `set -u`'s
+/// check.
+#[test]
+fn an_invalid_attribute_transform_of_an_unset_value_is_fatal() {
+	check(&[
+		(
+			"echo a${u@aZ}b\necho \"after $?\"",
+			"",
+			"PFX: line 1: a${u@aZ}b: bad substitution\n",
+			127,
+			1,
+		),
+		(
+			"set --\necho x${@@aZ}y\necho \"after $?\"",
+			"",
+			"PFX: line 2: x${@@aZ}y: bad substitution\n",
+			127,
+			1,
+		),
+		(
+			"set -u\necho a${u@aZ}b\necho \"after $?\"",
+			"",
+			"PFX: line 2: u: unbound variable\n",
+			127,
+			1,
+		),
+		(
+			"set -u\necho a${u@AZ}b\necho \"after $?\"",
+			"",
+			"PFX: line 2: u: unbound variable\n",
+			127,
+			1,
+		),
+		(
+			"set -u\ndeclare -a a=([1]=x)\necho ${a@aZ}\necho \"after $?\"",
+			"",
+			"PFX: line 3: a: unbound variable\n",
 			127,
 			1,
 		),
@@ -474,6 +653,21 @@ E
 echo "after $?""#,
 			"",
 			"PFX: line 1: ${x@Z}\n: bad substitution\n",
+			127,
+			1,
+		),
+		// A list of one empty word is set.
+		(
+			"set -- \"\"\necho x${@@Z}y\necho \"after $?\"",
+			"",
+			"PFX: line 2: x${@@Z}y: bad substitution\n",
+			127,
+			1,
+		),
+		(
+			"a=(\"\")\necho x${a[@]@Z}y\necho \"after $?\"",
+			"",
+			"PFX: line 2: x${a[@]@Z}y: bad substitution\n",
 			127,
 			1,
 		),

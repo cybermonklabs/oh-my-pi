@@ -183,6 +183,10 @@ pub struct Expander<'e, 'c> {
 	/// Spare field buffers (the previous command's words): a field takes
 	/// one, cleared, before it allocates, and an unused one goes back.
 	pub pool:       Vec<BString>,
+	/// The word being expanded is the value of an associative array's
+	/// keyed element (bash expands it as a string of its own): a `bad
+	/// substitution` in it names only the value.
+	assoc_value:    bool,
 }
 
 /// The cached value of `IFS` for one expansion (shared with the field
@@ -270,6 +274,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 			ifs: IfsCache::Unknown,
 			glob_opts: None,
 			pool: Vec::new(),
+			assoc_value: false,
 		}
 	}
 
@@ -991,10 +996,12 @@ impl<'e, 'c> Expander<'e, 'c> {
 				// (pathname expansion of its words goes through
 				// [`Self::decl_compound`] instead).
 				let mut out = Vec::with_capacity(elems.len());
-				self.compound(unit, elems, &mut out, None)?;
+				self.compound(unit, elems, &mut out, None, false)?;
 				sink.lit(&compound_text(&out), true);
 			},
-			Part::BadSubst(text) => return Err(Stop::Fail(Diag::BadSubst { text: text.clone() })),
+			Part::BadSubst(text, value) => {
+				return Err(Stop::Fail(Diag::BadSubst { text: self.bad_text(text, *value) }));
+			},
 			Part::Zsh(t) => self.zsh_word(t, WordKind::Plain, sink)?,
 			Part::AnsiC(raw) => {
 				let cs = super::locale::charset(self.k, self.cx.store, self.vp);
@@ -1417,14 +1424,24 @@ impl<'e, 'c> Expander<'e, 'c> {
 				let out = self.transform(q, v, *op)?;
 				self.push(sink, out, quoted, rhs)?;
 			},
-			OpIr::BadTransform(text, attrs) => {
-				// bash `parameter_brace_transform` without a valid operator: an
-				// unset value is nothing (`set -u`: unbound), unless the
-				// operator starts with `a`/`A`; anything else is a bad
-				// substitution, fatal unless the shell is interactive.
+			OpIr::BadTransform(text, value, attrs) => {
+				// bash `parameter_brace_transform` without a valid operator.
+				// `set -u` comes first for an unset value, whatever the
+				// operator (`check_unset` exempts `$@` and `$*`). A null value
+				// (unset, or the empty list of `$@`, `$*` or `${a[@]}`) is
+				// nothing unless the operator starts with `a`/`A`; anything
+				// else is a bad substitution, fatal unless the shell is
+				// interactive.
 				let v = self.value(unit, p)?;
-				if matches!(v, Val::Unset) && !attrs {
+				if matches!(v, Val::Unset) {
 					self.check_unset(unit, p)?;
+				}
+				let null = match &v {
+					Val::Unset => true,
+					Val::List { items, .. } => items.is_empty(),
+					Val::Str(_) => false,
+				};
+				if null && !attrs {
 					self.push(sink, v, quoted, rhs)?;
 					return Ok(());
 				}
@@ -1436,7 +1453,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 					)?,
 					Some(crate::bash::store::Record::Misc(v)) if v.as_slice() == b"1"
 				);
-				let diag = Diag::BadSubst { text: text.clone() };
+				let diag = Diag::BadSubst { text: self.bad_text(text, *value) };
 				return Err(if interactive {
 					Stop::Fail(diag)
 				} else {
@@ -1445,6 +1462,16 @@ impl<'e, 'c> Expander<'e, 'c> {
 			},
 		}
 		Ok(())
+	}
+
+	/// What a `bad substitution` names: `text`, or in the value of an
+	/// associative array's keyed element the value only (from offset
+	/// `value` of the element's text).
+	fn bad_text(&self, text: &BString, value: Option<u32>) -> BString {
+		value
+			.filter(|_| self.assoc_value)
+			.and_then(|at| text.get(at as usize..))
+			.map_or_else(|| text.clone(), BString::from)
 	}
 
 	/// `${p-…}` and friends: `p` is unset (an empty list counts), or null
@@ -1829,17 +1856,15 @@ impl<'e, 'c> Expander<'e, 'c> {
 		out: &mut Vec<CompoundElem>,
 		globs: Option<&mut Vec<(u32, BString)>>,
 	) -> X<()> {
-		if elems.first().is_some_and(|e| e.key.is_none()) {
-			let assoc = match state::deref(&self.k.root, self.cx.store, self.vp, name)? {
-				state::Deref::Plain => self.is_assoc(name)?,
-				state::Deref::To { name: target, index: None } => self.is_assoc(&target)?,
-				_ => false,
-			};
-			if assoc {
-				return self.kvpair(unit, elems, false, out);
-			}
+		let assoc = match state::deref(&self.k.root, self.cx.store, self.vp, name)? {
+			state::Deref::Plain => self.is_assoc(name)?,
+			state::Deref::To { name: target, index: None } => self.is_assoc(&target)?,
+			_ => false,
+		};
+		if assoc && elems.first().is_some_and(|e| e.key.is_none()) {
+			return self.kvpair(unit, elems, false, out);
 		}
-		self.compound(unit, elems, out, globs)
+		self.compound(unit, elems, out, globs, assoc)
 	}
 
 	/// Key-value pair elements of an associative compound assignment, each
@@ -1915,7 +1940,9 @@ impl<'e, 'c> Expander<'e, 'c> {
 	/// (`readonly a=($1)` with `$1` = `a b c` makes 3 elements). With
 	/// `globs`, the words needing pathname expansion are recorded as
 	/// `(index in out, pattern)` (unless `set -f`); run
-	/// [`super::glob::expand_compound_globs`] on them.
+	/// [`super::glob::expand_compound_globs`] on them. `assoc`: the target
+	/// is an associative array, whose keyed values bash expands as strings
+	/// of their own.
 	#[expect(
 		clippy::iter_with_drain,
 		reason = "the per-word buffers are drained to be reused for the next element"
@@ -1926,6 +1953,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 		elems: &[crate::bash::ir::ElemIr],
 		out: &mut Vec<CompoundElem>,
 		mut globs: Option<&mut Vec<(u32, BString)>>,
+		assoc: bool,
 	) -> X<()> {
 		// One word's fields and glob entries, reused across elements.
 		let mut words = Vec::new();
@@ -1933,8 +1961,10 @@ impl<'e, 'c> Expander<'e, 'c> {
 		for e in elems {
 			if let Some(key) = e.key {
 				let key = self.scalar(unit, &unit.words[key as usize])?;
-				let value = self.scalar(unit, &unit.words[e.value as usize])?;
-				out.push(CompoundElem { key: Some(key), append: e.append, value });
+				let outer = std::mem::replace(&mut self.assoc_value, assoc);
+				let value = self.scalar(unit, &unit.words[e.value as usize]);
+				self.assoc_value = outer;
+				out.push(CompoundElem { key: Some(key), append: e.append, value: value? });
 				continue;
 			}
 			let w = &unit.words[e.value as usize];
@@ -1995,7 +2025,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 		{
 			self.kvpair(unit, elems, true, out)?;
 		} else {
-			self.compound(unit, elems, out, Some(globs))?;
+			self.compound(unit, elems, out, Some(globs), assoc)?;
 		}
 		Ok(true)
 	}
@@ -3894,7 +3924,7 @@ pub fn compound_string(
 	let res = if assoc && elems.first().is_some_and(|e| e.key.is_none()) {
 		ex.kvpair(&unit, elems, true, &mut out)
 	} else {
-		ex.compound(&unit, elems, &mut out, Some(&mut globs))
+		ex.compound(&unit, elems, &mut out, Some(&mut globs), assoc)
 	};
 	*cursor = ex.cursor;
 	res?;

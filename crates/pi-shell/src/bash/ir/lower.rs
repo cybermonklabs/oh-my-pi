@@ -425,7 +425,8 @@ fn take_body(unit: Unit, root: u32) -> Option<Unit> {
 enum Scan<'t> {
 	/// A word as bash stores it (an operator's word, a brace-expanded word).
 	Word(st::Word<'t>),
-	/// The inside of `"…"`.
+	/// The inside of `"…"` (also of a pair of quotes arithmetic text drops,
+	/// which bash expands as a string of its own).
 	Dq(st::Seq<'t, st::WordPart<'t>>),
 	/// A keyed array element, `\[key\]=value`.
 	Elem(st::ArrayElem<'t>),
@@ -435,9 +436,12 @@ enum Scan<'t> {
 }
 
 impl Scan<'_> {
-	/// The string; `source` is the unit's.
-	fn text(self, source: &[u8]) -> BString {
+	/// The string, and for a keyed element the offset where its value
+	/// starts (an associative array's element names only the value);
+	/// `source` is the unit's.
+	fn text(self, source: &[u8]) -> (BString, Option<u32>) {
 		let mut out = Vec::new();
+		let mut value = None;
 		match self {
 			Self::Word(w) => syn::word_text(w, &mut out),
 			Self::Dq(parts) => syn::dq_text(parts, &mut out),
@@ -447,11 +451,12 @@ impl Scan<'_> {
 					syn::word_text(key, &mut out);
 				}
 				out.extend_from_slice(if e.append() { b"\\]+=" } else { b"\\]=" });
+				value = Some(out.len() as u32);
 				syn::word_text(e.value(), &mut out);
 			},
 			Self::Text => out.extend_from_slice(source),
 		}
-		out.into()
+		(out.into(), value)
 	}
 }
 
@@ -1453,9 +1458,27 @@ impl Lower {
 	fn plain_word(&mut self, w: st::Word<'_>, kind: WordKind, scan: Scan<'_>) -> Idx {
 		let kind = if self.text { WordKind::Text } else { kind };
 		self.node(w.id(), NodeKind::Word, w.span());
-		let mut parts = Vec::with_capacity(w.parts().len());
-		for part in w.parts() {
-			self.part(part, false, &mut parts, scan)?;
+		let all = w.parts();
+		let mut parts = Vec::with_capacity(all.len());
+		// Arithmetic text keeps the quotes it drops as a pair of
+		// `DroppedQuote` markers: bash expands their inside as a string of
+		// its own, which a `bad substitution` names.
+		let mut quoted: Option<st::Seq<'_, st::WordPart<'_>>> = None;
+		for (i, part) in all.iter().enumerate() {
+			if matches!(scan, Scan::Text) && matches!(part.get(), st::Part::DroppedQuote) {
+				quoted = if quoted.is_some() {
+					None
+				} else {
+					let rest = all.skip(i + 1);
+					let n = rest
+						.iter()
+						.position(|p| matches!(p.get(), st::Part::DroppedQuote))
+						.unwrap_or(rest.len());
+					Some(rest.take(n))
+				};
+				continue;
+			}
+			self.part(part, false, &mut parts, quoted.map_or(scan, Scan::Dq))?;
 		}
 		let parks = parts.iter().any(|p| self.part_parks(p));
 		let idx = self.unit.words.len() as u32;
@@ -1472,7 +1495,7 @@ impl Lower {
 			Part::Lit(_)
 			| Part::Quoted(_)
 			| Part::AnsiC(_)
-			| Part::BadSubst(_)
+			| Part::BadSubst(..)
 			| Part::ComsubSyntax { .. } => false,
 			Part::Comsub { .. } | Part::ProcSub { .. } => true,
 			// zsh words are parsed when they expand: any may substitute.
@@ -1620,17 +1643,17 @@ impl Lower {
 			},
 			st::Part::Compound(elems) => out.push(Part::Compound(self.elems(elems)?)),
 			st::Part::BadSubst(raw) => {
-				let text = scan.text(&self.unit.source);
+				let (text, value) = scan.text(&self.unit.source);
 				out.push(match bad_transform(raw) {
 					Some((param, index, attrs)) => Part::Param(Box::new(ParamIr {
 						param,
 						index,
-						op: OpIr::BadTransform(text, attrs),
+						op: OpIr::BadTransform(text, value, attrs),
 						indirect: false,
 						quoted,
 						braced: true,
 					})),
-					None => Part::BadSubst(text),
+					None => Part::BadSubst(text, value),
 				});
 			},
 			st::Part::DroppedQuote => {},

@@ -616,8 +616,11 @@ pub enum Part {
 	Compound(Vec<ElemIr>),
 	/// A `${…}` bash accepts at parse time and rejects when expanding: the
 	/// text its `bad substitution` message names (the word, the inside of
-	/// `"…"`, the operator word or the run-time text being expanded).
-	BadSubst(BString),
+	/// `"…"`, the operator word or the run-time text being expanded). In a
+	/// keyed array element (`\[key\]=value`), the offset where the value
+	/// starts: an associative array's element names only the value, which
+	/// bash expands as a string of its own.
+	BadSubst(BString, Option<u32>),
 	/// A `$(` bash parses only when it expands the word, and that fails:
 	/// ``command substitution: line N: MSG`` with N the expansion line plus
 	/// `line`.
@@ -730,11 +733,11 @@ pub enum SubIr {
 
 /// `${…}` operator; words are `words` indexes.
 ///
-/// `BadTransform(text, attrs)` is `${x@…}` with no valid operator (bash's
-/// `parameter_brace_transform`): `text` is what a `bad substitution` names
-/// (as [`Part::BadSubst`]), `attrs` whether the operator starts with `a` or
-/// `A`. An unset value expands to nothing (bash reads `a`/`A` even then), a
-/// set one is the error.
+/// `BadTransform(text, value, attrs)` is `${x@…}` with no valid operator
+/// (bash's `parameter_brace_transform`): `text` and `value` say what its
+/// message names (as [`Part::BadSubst`]), `attrs` whether the operator
+/// starts with `a` or `A`. An unset value expands to nothing (bash reads
+/// `a`/`A` even then), a set one is the error.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[expect(missing_docs, reason = "mirrors crate::bash::syntax::ParamOp")]
 pub enum OpIr {
@@ -751,7 +754,7 @@ pub enum OpIr {
 	Replace { mode: ReplaceIr, pat: u32, rep: Option<u32> },
 	Case { mode: CaseIr, all: bool, pat: Option<u32> },
 	Transform(u8),
-	BadTransform(BString, bool),
+	BadTransform(BString, Option<u32>, bool),
 }
 
 /// `${x/…}` selector.
