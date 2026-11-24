@@ -11,6 +11,7 @@
 - Fixed `declare -a`, `-A`, `-i`, `-l`, `-u`, `-c` (and their `+` forms) in the `bash` tool changing a readonly variable: as in bash 5.3, they now fail with `readonly variable` and status 1, and the variable stays as it was (bash 5.2 changed it)
 - Fixed `readonly -a`, `readonly -A`, `export -a` and `export -A` with a name and no value in the `bash` tool making the variable an array (and failing with `readonly variable` on a readonly one): as in bash, they give the name only the readonly or export attribute, with status 0
 - Fixed a failed compound assignment through `declare`, `typeset`, `local`, `export` or `readonly` in the `bash` tool (`readonly x=1; declare -a x=(2)`, or an array that cannot convert) going on with the rest of its line: as in bash, the rest of the command line is abandoned and the script goes on with its next line with status 1, a subshell or command substitution ends, `eval` ends its command, and the other arguments are not assigned; `declare`, `typeset` and `local` in a function skip an argument whose declaration fails and go on; under `set -e` a failed value (not a failed declaration) ends the shell
+- Fixed an assignment error of `readonly` or `export` in the `bash` tool in POSIX mode (`set -o posix; readonly x=1; readonly x=2`) going on: as in bash, the shell exits with status 1
 
 ## [18.18.6] - 2026-11-09
 

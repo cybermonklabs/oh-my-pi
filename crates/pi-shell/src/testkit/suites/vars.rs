@@ -599,6 +599,24 @@ fn a_failed_compound_declaration_abandons_the_line() {
 	}
 }
 
+/// In posix mode an assignment error of `readonly` or `export` (special
+/// builtins) ends a non-interactive shell with status 1; `declare`'s does
+/// not. Goldens from bash 5.3.20 and 5.2.21.
+#[test]
+fn posix_readonly_and_export_assignment_errors_end_the_shell() {
+	for src in [
+		"set -o posix\nreadonly x=1\nreadonly x=2; echo \"same st=$?\"\necho next",
+		"set -o posix\nreadonly x=1\nexport x=2; echo \"same st=$?\"\necho next",
+		"set -o posix\nreadonly x=1\nreadonly -a x=2; echo \"same st=$?\"\necho next",
+	] {
+		let (out, err) = run(src);
+		assert_eq!(out, "", "{src}");
+		assert!(err.contains("x: readonly variable"), "{src}: {err}");
+	}
+	let (out, _) = run("set -o posix\nreadonly x=1\ndeclare x=2; echo \"same st=$?\"\necho next");
+	assert_eq!(out, "same st=1\nnext\n");
+}
+
 /// `SECONDS+=` adds to the value the last lookup stored, as bash's
 /// `make_variable_value` reads the variable's cell: a lookup two seconds
 /// on stores the count then (7); without one, the 5 stored before is what

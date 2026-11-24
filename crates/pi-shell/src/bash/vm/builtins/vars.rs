@@ -2187,6 +2187,9 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			} else {
 				ctx.err(d());
 			}
+			// A posix shell exits on an assignment error of `readonly` or
+			// `export`, special builtins (`EX_BADASSIGN`).
+			ctx.usage_error |= special && value.is_some();
 			status = 1;
 			continue;
 		}
