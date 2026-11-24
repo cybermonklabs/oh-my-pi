@@ -125,6 +125,64 @@ wait; trap - DEBUG; echo "v=${{v-unset}}""#
 	assert_bash_outputs(&rows).await;
 }
 
+/// A simple stage or a lone background command whose words (or a
+/// redirection's) hold a command substitution: bash runs its DEBUG trap in
+/// the shell before it forks, as for any simple stage, with the command's
+/// own text; the child does not run it again under `set -T` (its
+/// substitution's commands run theirs), nor does a `lastpipe` stage in the
+/// shell; under `extdebug` a failing trap skips the stage or the job. (`ir`
+/// lowers a word's substitution body in place ahead of the command, behind
+/// a jump.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_whose_words_hold_a_substitution_runs_its_debug_trap_in_the_shell() {
+	let dbg = r#"trap 'echo "dbg $BASH_COMMAND"' DEBUG;"#;
+	let rows = [
+		(format!("{dbg} echo $(echo a) | cat"), "dbg echo $(echo a)\ndbg cat\na\n"),
+		(
+			format!("{dbg} echo x | cat 2> $(echo /dev/null)"),
+			"dbg echo x\ndbg cat 2> $(echo /dev/null)\nx\n",
+		),
+		(format!("{dbg} echo $(echo a) & wait"), "dbg echo $(echo a)\ndbg wait\na\n"),
+		(
+			format!(r#"{dbg} ! : $(echo a) & wait; echo "st=$?""#),
+			"dbg : $(echo a)\ndbg wait\ndbg echo \"st=$?\"\nst=0\n",
+		),
+		(
+			format!("set -T; {dbg} echo $(echo a) | cat"),
+			"dbg echo $(echo a)\ndbg cat\ndbg echo a a\n",
+		),
+		(
+			format!("set -T; {dbg} echo $(echo a) > /dev/null & wait"),
+			"dbg echo $(echo a) > /dev/null\ndbg wait\n",
+		),
+		(
+			format!("shopt -s lastpipe; set +m; {dbg} : x | : $(echo y); echo end"),
+			"dbg : x\ndbg : $(echo y)\ndbg echo end\nend\n",
+		),
+		(
+			format!("set -T; shopt -s lastpipe; set +m; {dbg} : x | : $(echo y); echo end"),
+			"dbg : x\ndbg : $(echo y)\ndbg echo end\nend\n",
+		),
+		(
+			r#"trap 'case $BASH_COMMAND in *"(echo a)"*) v=set;; esac' DEBUG; echo $(echo a) | cat; trap - DEBUG; echo "v=${v-unset}""#
+				.to_owned(),
+			"a\nv=set\n",
+		),
+		(
+			r#"shopt -s extdebug; trap '[[ $BASH_COMMAND != *false* ]]' DEBUG; echo $(echo a) | false $(echo b) | cat; echo "p=${PIPESTATUS[*]}""#
+				.to_owned(),
+			"p=141 0\n",
+		),
+		(
+			r#"shopt -s extdebug; trap '[[ $BASH_COMMAND != *false* ]]' DEBUG; false $(echo b) & wait; echo "st=$? bang=${!+set}""#
+				.to_owned(),
+			"st=0 bang=\n",
+		),
+	];
+	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+	assert_bash_outputs(&rows).await;
+}
+
 /// In a background job's DEBUG trap the shell's own `$BASHPID` and
 /// `$BASH_SUBSHELL` (0) show, and `$LINENO` is the command's line, with
 /// and without `set -T`; `trap -p` lists the trap inside a job.
