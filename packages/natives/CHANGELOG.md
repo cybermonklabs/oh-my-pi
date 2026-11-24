@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `kill $!` of a `( list ) &` job reaches the subshell that runs the list, as in bash, which runs such a job as one process. Only the job's own vproc died: `wait $!` answered at once with its status, the subshell's trap of the signal never ran, and without `end_orphan_jobs` (obash, the engine's default) `( while :; do :; done ) & sleep 1; kill $!` left the loop running for the life of the shell. Now the subshell's trap runs and `wait $!` returns the subshell's status; `( ( list ) ) &` is reached the same way. `kill %1` already reached it.
+- `kill $!` of a `( list ) &` job reaches the subshell that runs the list, as in bash, which runs such a job as one process. Only the job's own vproc died: `wait $!` answered at once with its status, the subshell's trap of the signal never ran, and without `end_orphan_jobs` (obash, the engine's default) `( while :; do :; done ) & sleep 1; kill $!` left the loop running for the life of the shell. Now the subshell's trap runs, `kill -STOP $!` and `kill -CONT $!` stop and continue it, and `wait $!` returns the subshell's status. The same holds for a job with redirections (`( list ) >file &`, `( list ) 2>&1 &`) and for a `( … )` that is a subshell's whole body (`( ( list ) ) &`), which bash also runs as one process, but not for a `( … )` after another command (`( :; ( list ) ) &`, `true && ( list ) &`), for which bash forks a second process that the signal does not reach. `kill %1` already reached the subshell; for a job with redirections, `wait` after it now returns the status the subshell's trap exits with, not 143.
 
 ## [18.18.6] - 2026-11-09
 

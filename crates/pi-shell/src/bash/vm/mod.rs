@@ -2355,7 +2355,8 @@ impl Shell {
 
 	/// The running subshell of the `( … )` that vproc `i` only waits for
 	/// before it exits (the job vproc of `( list ) &`; [`transparent`]'s
-	/// `Some(false)` for a `( … )`), by index.
+	/// `Some(false)` for a `( … )`), by index, when that `( … )` is the
+	/// whole body of `i` ([`whole_stage`]): bash runs it in `i`'s process.
 	fn paren_child(&self, i: usize) -> Option<usize> {
 		let p = &self.procs[i];
 		if transparent(p, true) != Some(false) {
@@ -2366,7 +2367,9 @@ impl Shell {
 		};
 		let unit = frame.unit.as_ref()?;
 		let op = unit.ops.get(frame.pc as usize)?;
-		if !matches!(unit.spawns.get(op.a as usize)?.kind, ir::SpawnKind::Subshell) {
+		if !matches!(unit.spawns.get(op.a as usize)?.kind, ir::SpawnKind::Subshell)
+			|| !whole_stage(unit, frame.pc)
+		{
 			return None;
 		}
 		let [(child, None)] = frame.scratch.as_ref()?.children.as_slice() else {
@@ -2400,12 +2403,15 @@ impl Shell {
 				SigTarget::Tree(v) => self.in_job(self.procs[i].vpid, v),
 			})
 			.collect();
-		// bash forks once for `( list ) &`, and that one process is the
-		// subshell: a signal sent to the pid of a vproc that only waits for
-		// its `( … )` (the job vproc of `( list ) &`, `$!`) reaches that
-		// subshell, as `kill %1` does, transitively through `( ( … ) )`.
-		// Each such waiter is transparent to the signal below, so it ends
-		// with its subshell's status.
+		// bash forks once for `( list ) &` (and `( list ) >file &`), and that
+		// one process is the subshell: a signal sent to the pid of a vproc
+		// that only waits for its `( … )` (the job vproc of `( list ) &`,
+		// `$!`) reaches that subshell, as `kill %1` does, and through it the
+		// `( … )` that is a subshell's whole body (`( ( … ) )`), which bash
+		// runs in the same process, but not one after another command
+		// (`( :; ( … ) )`), for which bash forks again. Each such waiter is
+		// transparent to the signal below, so it ends with its subshell's
+		// status.
 		let mut waiters: Vec<Vpid> = Vec::new();
 		if let SigTarget::Vpid(v) = target {
 			let mut at = hits.iter().copied().find(|&i| self.procs[i].vpid == v);
@@ -2757,9 +2763,11 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 /// command: `Some(true)` when `p` is a subshell vproc (no `EXIT` trap of its
 /// own) whose one frame awaits the external that is its last command (`cmd
 /// &`, a pipeline stage, `( cmd )`) or one it `exec`s; `Some(false)` when it
-/// only waits for the stages of its pipeline or its `( … )` before it exits
-/// (the job vproc of `a | b &`), and the signal reaches those too
-/// (`children`: a job, label or broadcast target); `None` otherwise.
+/// only waits for the stages of its pipeline or its `( … )` (with that
+/// command's redirections, `( list ) >file &`) before it exits (the job
+/// vproc of `a | b &`), and the signal reaches those too (`children`: a
+/// job, label or broadcast target, or a pid target that
+/// [`Shell::deliver`] forwards to its `( … )`); `None` otherwise.
 fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 	if !p.transient || p.own_traps.has(crate::bash::store::TrapKey::Exit) {
 		return None;
@@ -2779,8 +2787,12 @@ fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 		(_, ir::Opcode::Spawn) if children && !sc.children.is_empty() => {
 			let spawn = unit.spawns.get(op.a as usize)?;
 			let end = match (spawn.kind, code_at(spawn.end)) {
-				// `( … )`: its `Leave` follows.
-				(ir::SpawnKind::Subshell, Some(ir::Opcode::Leave)) => spawn.end + 1,
+				// `( … )`: its `Leave` follows, then the `PopRedir` of its
+				// redirections, if it has any.
+				(ir::SpawnKind::Subshell, Some(ir::Opcode::Leave)) => {
+					let after = spawn.end + 1;
+					after + u32::from(code_at(after) == Some(ir::Opcode::PopRedir))
+				},
 				(ir::SpawnKind::Subshell | ir::SpawnKind::Pipeline, _) => spawn.end,
 				_ => return None,
 			};
@@ -2788,6 +2800,41 @@ fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 		},
 		_ => None,
 	}
+}
+
+/// Whether the `( … )` whose `Spawn` is at `pc` is the whole body of the
+/// subshell, job or pipeline stage that runs it: that body's entry is the
+/// `( … )`'s `Enter`, or the `Redir` of its redirections before it
+/// (`[Redir] Enter Spawn … Leave [PopRedir] SubExit`; [`transparent`]
+/// checks the end). bash runs such a `( … )` in the process of that body
+/// (`execute_in_subshell` gives a body that is one `cm_subshell`
+/// `CMD_NO_FORK`, and does its redirections first); after another
+/// command, as in `( :; ( list ) )`, it forks.
+fn whole_stage(unit: &Unit, pc: u32) -> bool {
+	let code_at = |pc: u32| unit.ops.get(pc as usize).map(|op| op.code);
+	let Some(enter) = pc
+		.checked_sub(1)
+		.filter(|&at| code_at(at) == Some(ir::Opcode::Enter))
+	else {
+		return false;
+	};
+	let redirected = unit
+		.ops
+		.get(pc as usize)
+		.and_then(|op| unit.spawns.get(op.a as usize))
+		.is_some_and(|spawn| code_at(spawn.end + 1) == Some(ir::Opcode::PopRedir));
+	let entry = if redirected {
+		match enter.checked_sub(1) {
+			Some(at) if code_at(at) == Some(ir::Opcode::Redir) => at,
+			_ => return false,
+		}
+	} else {
+		enter
+	};
+	unit
+		.spawns
+		.iter()
+		.any(|spawn| spawn.stages.iter().any(|stage| stage.entry == entry))
 }
 
 fn set_stopped(p: &mut Vproc, on: bool) {

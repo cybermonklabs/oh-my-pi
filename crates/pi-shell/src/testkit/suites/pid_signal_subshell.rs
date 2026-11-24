@@ -2,7 +2,10 @@
 //! once for it, and that one process is the subshell, so the signal ends
 //! (or traps in) the list. The engine runs the job as a vproc that only
 //! waits for the vproc of its `( … )`; the signal has to reach that
-//! subshell, as `kill %1` reaches it.
+//! subshell, as `kill %1` reaches it. bash runs `( list ) >file &` and a
+//! `( … )` that is a subshell's whole body (`( ( list ) ) &`) in that one
+//! process too, but forks again for a `( … )` after another command
+//! (`( :; ( list ) ) &`): there the signal ends the outer subshell only.
 
 use std::time::{Duration, Instant};
 
@@ -94,6 +97,74 @@ fn the_subshell_of_a_subshell_job_traps_a_signal_to_its_pid() {
 fn a_signal_to_the_pid_of_a_nested_subshell_job_ends_the_inner_subshell() {
 	let src = format!("( ( {LOOP} ) ) & b=$!; {STARTED}; kill $b; wait $b; echo st=$?");
 	assert_eq!(killed(&src), "st=143\n", "{src}");
+}
+
+/// The inner subshell's loop, once it has written its `$BASHPID` (`/p`)
+/// and said it runs (`/r`).
+const INNER: &str = "echo $BASHPID > /p; : > /r; while :; do :; done";
+
+// Failure mode: the signal also followed a `( … )` that is not the whole
+// body of its subshell (`( :; ( list ) )`, `true && ( list )`), where bash
+// forks a second process: the inner loop ended with the outer subshell,
+// where bash leaves it running.
+#[test]
+fn a_signal_to_the_pid_of_a_subshell_job_spares_a_subshell_after_a_command() {
+	for job in [format!("( :; ( {INNER} ) )"), format!("true && ( {INNER} )")] {
+		let src = format!(
+			"{job} & b=$!; {STARTED}; read -r i < /p; kill $b; wait $b; echo st=$?; kill -0 $i && \
+			 echo running; kill $i"
+		);
+		assert_eq!(killed(&src), "st=143\nrunning\n", "{src}");
+	}
+}
+
+// Failure mode: as above, and the outer subshell's `TERM` trap ran (`o`)
+// once the inner loop had ended; bash keeps that trap waiting for the inner
+// subshell, which runs on, and `kill -KILL` ends the outer one without it.
+#[test]
+fn a_signal_to_the_pid_of_a_subshell_job_waits_in_its_trap_for_an_inner_subshell() {
+	let src = format!(
+		"( trap 'echo o' TERM; ( {INNER} ) ) & b=$!; {STARTED}; read -r i < /p; kill $b; kill -0 $i \
+		 && echo running; kill -KILL $b; wait $b; echo st=$?; kill $i"
+	);
+	assert_eq!(killed(&src), "running\nst=137\n", "{src}");
+}
+
+// Failure mode: a `( … )` with redirections (`( list ) >file &`, the usual
+// way to start background work) was not reached: the job vproc waits for
+// it between a `Redir` and a `PopRedir`, so the signal ended that vproc
+// alone and the loop ran on; with `kill %1` the subshell's trap ran, but
+// `wait` answered 143, the job vproc's own status.
+#[test]
+fn a_signal_to_the_pid_of_a_redirected_subshell_job_ends_the_subshell() {
+	for job in [
+		format!("( {LOOP} ) >/dev/null"),
+		format!("( {LOOP} ) 2>&1"),
+		format!("( ( {LOOP} ) >/dev/null )"),
+	] {
+		let src = format!("{job} & b=$!; {STARTED}; kill $b; wait $b; echo st=$?");
+		assert_eq!(killed(&src), "st=143\n", "{src}");
+	}
+	for kill in ["kill $b", "kill %1"] {
+		let src = format!(
+			"( trap 'echo t; exit 3' TERM; {LOOP} ) 2>/dev/null & b=$!; {STARTED}; {kill}; wait $b; \
+			 echo st=$?"
+		);
+		assert_eq!(killed(&src), "t\nst=3\n", "{src}");
+	}
+}
+
+// Failure mode: `kill -STOP $!` stopped the job vproc only and the
+// subshell's loop ran on (its counter `/c` moved while the shell ran more
+// than a turn of ops); `kill -CONT $!` then had nothing to continue.
+#[test]
+fn stop_and_cont_to_the_pid_of_a_subshell_job_reach_the_subshell() {
+	let src = "( : > /r; n=0; while :; do n=$((n+1)); echo $n > /c; done ) & b=$!; until [ -e /r ] \
+	           && read -r a < /c; do :; done; kill -STOP $b; read -r a < /c; k=0; until [ $k = \
+	           1000 ]; do k=$((k+1)); done; read -r c < /c; [ \"$a\" = \"$c\" ] && echo stopped; \
+	           kill -CONT $b; until read -r d < /c && [ \"$d\" != \"$c\" ]; do :; done; echo \
+	           running; kill $b; wait $b; echo st=$?";
+	assert_eq!(killed(src), "stopped\nrunning\nst=143\n", "{src}");
 }
 
 // Controls, which ended the loop before: the job's spec, a brace group the
