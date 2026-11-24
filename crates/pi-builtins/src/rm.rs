@@ -276,12 +276,18 @@ pub fn safe_remove_dir_recursive(host: &mut Host,
 	};
 
 	// Open the operand as the directory the lstat found, not following a
-	// symlink there: one swapped in since the lstat is refused (`ENOTDIR`)
-	// instead of emptied. One that cannot be opened or listed is removed if
-	// it is empty, as GNU rm does.
+	// symlink there: anything swapped in since the lstat, a symlink or another
+	// directory, is refused (`ENOTDIR`) and kept, an empty directory too. One
+	// that cannot be opened or listed is removed if it is empty, as GNU rm
+	// does.
+	#[cfg(test)]
+	crate::host::run_hook(path);
 	let dir_fd = match open_stat_dir(&path_fs, initial_id) {
 		Ok(fd) => fd,
 		Err(e) if is_missing_under_force(&e, options) => return false,
+		// Not the directory the lstat found: nothing at this name is rm's to
+		// remove.
+		Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => return show_removal_error(host, e, path),
 		Err(e) => {
 			let removal = host.fs().remove_dir(&path_fs);
 			return remove_unreadable_dir(host, path, options, e, removal);
@@ -558,14 +564,22 @@ pub fn safe_remove_dir_recursive_impl(
 			}
 
 			// Open the just-stat'd subdirectory as that directory, not
-			// following a symlink: one swapped in since the stat makes the open
-			// fail instead of taking the walk off the tree. One that cannot be
-			// opened or listed is removed if it is empty, as GNU rm does.
+			// following a symlink: anything swapped in since the stat, a
+			// symlink or another directory, makes the open fail (`ENOTDIR`)
+			// instead of taking the walk off the tree, and is kept, an empty
+			// directory too. One that cannot be opened or listed is removed if
+			// it is empty, as GNU rm does.
 			#[cfg(test)]
 			crate::host::run_hook(path_of(&path_buf));
 			let child_fd = match open_stat_subdir(&cur_fd, &entry_name, entry_id) {
 				Ok(fd) => fd,
 				Err(e) if is_missing_under_force(&e, options) => break 'entry false,
+				// Not the directory the stat found: nothing at this name is
+				// rm's to remove.
+				Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
+					error |= show_removal_error(host, e, path_of(&path_buf));
+					break 'entry false;
+				},
 				Err(e) => {
 					let removal = cur_fd.unlink_at(&entry_name, true);
 					error |= remove_unreadable_dir(host, path_of(&path_buf), options, e, removal);
@@ -2068,6 +2082,66 @@ mod tests {
 			let e = std::io::Error::from_raw_os_error(errno);
 			assert_eq!(super::is_missing_under_force(&e, &force), ignored, "-f, errno {errno}: {e}");
 			assert!(!super::is_missing_under_force(&e, &plain), "no -f, errno {errno}: {e}");
+		}
+	}
+
+	/// rm -r keeps a directory put in place of the subdirectory it stat'd, an
+	/// empty one too: the identity check refuses it (`ENOTDIR`), and rm then
+	/// removes nothing at that name.
+	#[cfg(unix)]
+	#[test]
+	fn an_empty_directory_swapped_in_after_the_stat_is_kept() {
+		const TREE: &str = "rm-seam-empty-swap";
+		let cwd = tempdir().unwrap();
+		let tree = cwd.path().join(TREE);
+		std::fs::create_dir_all(tree.join("sub")).unwrap();
+		std::fs::write(tree.join("sub/in"), b"").unwrap();
+		let other = cwd.path().join("other");
+		std::fs::create_dir(&other).unwrap();
+		let ran = std::sync::Arc::new(AtomicBool::new(false));
+		let (sub, parked, seen) = (tree.join("sub"), cwd.path().join("parked"), std::sync::Arc::clone(&ran));
+		crate::host::hook_at(Path::new(TREE).join("sub"), move || {
+			std::fs::rename(&sub, &parked).unwrap();
+			std::fs::rename(&other, &sub).unwrap();
+			seen.store(true, Ordering::SeqCst);
+		});
+		let (code, capture) = run_util::<Rm>(&["-r", TREE], "", cwd.path());
+		let err = capture.err();
+		assert!(ran.load(Ordering::SeqCst), "the swap at rm's seam did not run: ({code}, {err:?})");
+		assert!(tree.join("sub").is_dir(), "removed a directory that was not the one it stat'd: ({code}, {err:?})");
+		assert_eq!(code, 1, "{err}");
+		assert!(err.starts_with("rm: cannot remove 'rm-seam-empty-swap/sub': Not a directory"), "{err}");
+	}
+
+	/// The same for the operand: rm -r keeps an empty directory put in its
+	/// place after the lstat and reports it; rm -rf keeps it silently, as `-f`
+	/// ignores ENOTDIR.
+	#[cfg(unix)]
+	#[test]
+	fn an_empty_directory_swapped_in_for_the_operand_after_the_lstat_is_kept() {
+		const OPERAND: &str = "rm-seam-empty-operand";
+		for (flags, want_code, want_err) in
+			[("-r", 1, "rm: cannot remove 'rm-seam-empty-operand': Not a directory"), ("-rf", 0, "")]
+		{
+			let cwd = tempdir().unwrap();
+			let operand = cwd.path().join(OPERAND);
+			std::fs::create_dir(&operand).unwrap();
+			std::fs::write(operand.join("in"), b"").unwrap();
+			let other = cwd.path().join("other");
+			std::fs::create_dir(&other).unwrap();
+			let ran = std::sync::Arc::new(AtomicBool::new(false));
+			let (moved, parked, seen) = (operand.clone(), cwd.path().join("parked"), std::sync::Arc::clone(&ran));
+			crate::host::hook_at(Path::new(OPERAND).to_path_buf(), move || {
+				std::fs::rename(&moved, &parked).unwrap();
+				std::fs::rename(&other, &moved).unwrap();
+				seen.store(true, Ordering::SeqCst);
+			});
+			let (code, capture) = run_util::<Rm>(&[flags, OPERAND], "", cwd.path());
+			let err = capture.err();
+			assert!(ran.load(Ordering::SeqCst), "{flags}: the swap at rm's seam did not run: ({code}, {err:?})");
+			assert!(operand.is_dir(), "{flags}: removed a directory that was not the one it lstat'd: ({code}, {err:?})");
+			assert!(cwd.path().join("parked/in").exists(), "{flags}: touched the directory it lstat'd: ({code}, {err:?})");
+			assert_eq!((code, err.trim_end()), (want_code, want_err), "{flags}");
 		}
 	}
 
