@@ -73,3 +73,17 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 [[profile.ci.overrides]]
 filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix)'
 slow-timeout = { period = "60s", terminate-after = 20 }
+
+# feed_reads' one test runs its eight rows under obash and under bash; one row
+# reads 100,000 lines through a fed pipe. Under gVisor at 1952m CPU beside 64
+# busy loops a whole correct run took up to 812 s (builds Jobs, tags
+# fb-20261124T1057, fb-20261124T1231 and fb-20261124T1613), past the 240 s
+# bound above. Its bound is 28 periods of 60 s (1,680 s): more than twice that.
+# The test also bounds each row itself (`BOUNDS` in tests/feed_reads.rs).
+[[profile.default.overrides]]
+filter = 'package(pi-shell) & test(=the_shell_reads_the_bytes_an_externals_feed_holds)'
+slow-timeout = { period = "60s", terminate-after = 28 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-shell) & test(=the_shell_reads_the_bytes_an_externals_feed_holds)'
+slow-timeout = { period = "60s", terminate-after = 28 }
