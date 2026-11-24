@@ -181,6 +181,9 @@ struct Slot<T> {
 	/// is cleared (one gVisor does not wake even for the drop's end).
 	#[cfg(test)]
 	stay:      bool,
+	/// Test hook: the watcher's first wait, in place of [`FIRST_PROBE`].
+	#[cfg(test)]
+	first:     Option<Duration>,
 }
 
 impl<T> Default for Slot<T> {
@@ -208,6 +211,8 @@ impl<T> Default for Slot<T> {
 			stuck:                  false,
 			#[cfg(test)]
 			stay:                   false,
+			#[cfg(test)]
+			first:                  None,
 		}
 	}
 }
@@ -373,7 +378,10 @@ fn spawn_watcher<T: Send + 'static>(
 		.spawn(move || {
 			// The open is over: it has a result, or the helper returned.
 			let over = |s: &Slot<T>| s.result.is_some() || s.finished || s.cancelled || s.returned;
+			#[cfg(not(test))]
 			let mut wait = FIRST_PROBE;
+			#[cfg(test)]
+			let mut wait = shared.slot.lock().first.unwrap_or(FIRST_PROBE);
 			let end = loop {
 				{
 					let mut s = shared.slot.lock();
@@ -925,12 +933,14 @@ mod tests {
 		assert_eq!(drain(end).0, b"ab");
 	}
 
-	/// An open that ends within [`FIRST_PROBE`] (its writer comes after
-	/// 20 ms) is not looked at.
+	/// An open that ends within the watcher's first wait is not looked at.
+	/// The first wait is 10 s here (the `first` hook), so a loaded node that
+	/// holds the writer back past [`FIRST_PROBE`] does not fail it.
 	#[test]
 	fn an_open_that_ends_within_the_first_wait_is_not_looked_at() {
 		let (_dir, path) = new_fifo();
-		let mut opened = reading(&path, Slot::default());
+		let slot = Slot { first: Some(Duration::from_secs(10)), ..Slot::default() };
+		let mut opened = reading(&path, slot);
 		thread::sleep(Duration::from_millis(20));
 		let writer = fs::OpenOptions::new().write(true).open(&path).unwrap();
 		let reader = opened
@@ -1090,8 +1100,10 @@ mod tests {
 		writer.write_all(b"x").unwrap();
 		thread::sleep(Duration::from_millis(200));
 		writer.write_all(b"y").unwrap();
-		drop(writer);
+		// Read before the close: the other reader's end of file may come
+		// before this thread runs again.
 		let closed = std::time::Instant::now();
+		drop(writer);
 		let (got, ended) = other.join().unwrap();
 		drop(opened);
 		assert!(ended >= closed, "the other reader read end of file before its writer closed");
