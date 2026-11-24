@@ -4122,6 +4122,37 @@ mod tests {
 	#[cfg(target_os = "linux")]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn terminate_in_group_mode_ends_a_member_that_joins_after_the_kill() {
+		ends_a_member_that_joins_after_the_kill(false).await;
+	}
+
+	/// The same with a member whose name is not UTF-8: the group wait's scan
+	/// must count it as a member. A scan that took it for no member would
+	/// read the group as empty, stop sending the KILL, and return `true`
+	/// while it runs.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn terminate_in_group_mode_ends_a_non_utf8_named_member_that_joins_after_the_kill() {
+		ends_a_member_that_joins_after_the_kill(true).await;
+	}
+
+	/// The group scan counts a live member whose name is not UTF-8, here the
+	/// only process of its group.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn the_group_scan_counts_a_non_utf8_named_member() {
+		let named = spawn_non_utf8_named(true, NonUtf8Term::Default);
+		let _named = ChildGuard(named);
+		assert_eq!(
+			platform::group_has_live_member(named),
+			Some(true),
+			"a live member whose name is not UTF-8 did not count"
+		);
+	}
+
+	/// [`terminate_in_group_mode_ends_a_member_that_joins_after_the_kill`],
+	/// with the member named [`NON_UTF8_NAME`] when `non_utf8_name`.
+	#[cfg(target_os = "linux")]
+	async fn ends_a_member_that_joins_after_the_kill(non_utf8_name: bool) {
 		use std::{os::unix::process::CommandExt, process::Command};
 
 		// The root ignores TERM, so the polite wave leaves it running and the
@@ -4135,15 +4166,25 @@ mod tests {
 		let _guard = GroupGuard(root_pid);
 		let process = Process::from_pid(root_pid).expect("pin the root");
 		wait_until("the root runs sleep with TERM ignored", || comm(root_pid) == "sleep");
-		// SAFETY: the child only calls pause, which is async-signal-safe; the
-		// test process has other threads.
+		// SAFETY: the child only calls prctl and pause, which are
+		// async-signal-safe; the test process has other threads.
 		let helper = unsafe { libc::fork() };
 		assert!(helper >= 0, "fork the helper");
 		if helper == 0 {
+			if non_utf8_name {
+				// SAFETY: PR_SET_NAME reads the NUL-terminated name; it names
+				// the calling thread, the child's only one.
+				unsafe { libc::prctl(libc::PR_SET_NAME, NON_UTF8_NAME.as_ptr()) };
+			}
 			loop {
 				// SAFETY: pause takes no arguments.
 				unsafe { libc::pause() };
 			}
+		}
+		if non_utf8_name {
+			wait_until("the helper is named \\xe8x", || {
+				std::fs::read(format!("/proc/{helper}/comm")).is_ok_and(|name| name == b"\xe8x\n")
+			});
 		}
 		let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 		{
