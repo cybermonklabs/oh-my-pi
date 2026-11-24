@@ -174,6 +174,45 @@ fn a_builtin_write_to_a_read_only_descriptor_fails_as_bash() {
 	]);
 }
 
+/// The engine's own pipes (a pipeline stage, a process substitution): the
+/// wrong end fails with `EBADF`, as a kernel pipe's does.
+#[test]
+fn the_wrong_end_of_an_engine_pipe_is_a_bad_file_descriptor() {
+	check_bash(&[
+		(
+			"{ read x <&1; echo \"r=$?\" >&2; } | cat",
+			"",
+			"bash: line 1: read: 0: read error: Bad file descriptor\nr=1\n",
+			0,
+		),
+		(
+			"exec 4> >(cat); read -n 1 -u 4 x; echo \"r=$?\"",
+			"r=1\n",
+			"bash: line 1: read: 4: read error: Bad file descriptor\n",
+			0,
+		),
+		(
+			"{ exec 0<&1; select x in a; do :; done; echo \"r=$?\" >&2; } | cat",
+			"\n",
+			"1) a\n#? bash: line 1: 0: read error: Bad file descriptor\nr=1\n",
+			0,
+		),
+		(
+			"echo a | { echo x >&0; printf y >&0; echo \"r=$?\"; }",
+			"r=1\n",
+			"bash: line 1: echo: write error: Bad file descriptor\nbash: line 1: printf: write \
+			 error: Bad file descriptor\n",
+			0,
+		),
+		(
+			"exec 4< <(:); echo x >&4; echo \"r=$?\"",
+			"r=1\n",
+			"bash: line 1: echo: write error: Bad file descriptor\n",
+			0,
+		),
+	]);
+}
+
 /// zsh's `read` takes a failed read as the end of its input, and its
 /// `echo` ignores `EBADF` on its standard output; only the shell's own check
 /// of an unredirected standard output reports it.
@@ -189,6 +228,27 @@ fn zsh_mode_keeps_zsh_on_failed_reads_and_writes() {
 			"zsh:1: write error: bad file descriptor\nr=0\n",
 			0,
 		),
+		// zsh's `print` and `echo` ignore EBADF on their standard output,
+		// the read end of a pipe too.
+		("echo a | { print x >&0; echo x >&0; echo \"r=$?\"; }", "r=0\n", "", 0),
+		("{ read x <&1; echo \"r=$?\" >&2; } | cat", "", "r=1\n", 0),
+		// zsh's `select` reports no read error.
+		("exec 0<.; select x in a; do :; done; echo \"r=$?\"", "r=0\n", "1) a  \n?# \n", 0),
+		// The wrong end of an engine pipe is not ready for `zselect` (as a
+		// kernel pipe's), and `sysread` fails on it with status 2.
+		(
+			"zmodload zsh/zselect; exec 4> >(cat); zselect -t 0 -r 4; echo \"r=$? [$reply]\"",
+			"r=1 []\n",
+			"",
+			0,
+		),
+		(
+			"zmodload zsh/zselect; exec 4> >(cat); zselect -t 0 -w 4; echo \"r=$? [$reply]\"",
+			"r=0 [-w 4]\n",
+			"",
+			0,
+		),
+		("zmodload zsh/system; exec 4> >(cat); sysread -i 4 x; echo \"r=$?\"", "r=2\n", "", 0),
 	];
 	for &(text, stdout, stderr, status) in rows {
 		let out = output(obash().arg0("zsh").args(["-c", text]));
