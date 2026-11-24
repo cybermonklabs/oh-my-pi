@@ -43,9 +43,7 @@ const FIXTURES: &[&str] = &[
 ];
 
 fn fixture(name: &str) -> Value {
-	let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-		.join("tests/fixtures/hashline")
-		.join(name);
+	let path = common::fixtures_root().join("hashline").join(name);
 	serde_json::from_str(
 		&std::fs::read_to_string(&path)
 			.unwrap_or_else(|error| panic!("read {}: {error}", path.display())),

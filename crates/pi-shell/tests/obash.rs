@@ -13,10 +13,18 @@ use crate::obash_support::{obash, output};
 
 const LOOP: &str = "for i in 1 2; do echo $i; done";
 
+/// An events fixture. Under cargo the compile-time manifest dir exists at
+/// runtime; under Bazel the compile-time sandbox path is gone, so fall back to
+/// the runfiles-relative layout (test cwd is the workspace runfiles root and
+/// the fixtures ride along as `data`).
 fn events_fixture(name: &str) -> PathBuf {
-	PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-		.join("src/testkit/fixtures/events")
-		.join(name)
+	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/testkit/fixtures/events");
+	let root = if manifest.is_dir() {
+		manifest
+	} else {
+		PathBuf::from("crates/pi-shell/src/testkit/fixtures/events")
+	};
+	root.join(name)
 }
 
 #[test]

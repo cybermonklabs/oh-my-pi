@@ -1,5 +1,5 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test", "rust_test_suite")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -31,5 +31,27 @@ rust_test(
     data = glob(["tests/fixtures/**"]),
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+# Integration tests: one rust_test per tests/*.rs, as cargo builds them, each
+# with the helpers under tests/common. They read their fixtures at run time.
+rust_test_suite(
+    name = "pi-edit_integration_tests",
+    srcs = glob(["tests/*.rs"]),
+    aliases = aliases(),
+    data = glob(["tests/fixtures/**"]),
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True) + all_crate_deps(proc_macro_dev = True),
+    shared_srcs = glob(["tests/common/**/*.rs"]),
+    deps = all_crate_deps(normal = True) + all_crate_deps(normal_dev = True) + [
+        ":pi-edit",
+        "//crates/pi-ast",
+    ],
+)
+
+rust_doc_test(
+    name = "pi-edit_doc_test",
+    crate = ":pi-edit",
     deps = all_crate_deps(normal_dev = True),
 )
