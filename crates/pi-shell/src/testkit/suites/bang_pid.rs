@@ -434,14 +434,21 @@ fn a_redirection_that_would_wait_is_left_to_the_process() {
 // time: once it has (it ran as many ops as a scheduler slice since, in
 // `BUSY` or in a loop of `kill -0 $!`; `wait` waits), the job is gone (`1`)
 // and its status is the job's own. A job the shell let end before it
-// looked (`BUSY` first) is gone at once. With a snapshot at every
-// safepoint, the order is the same.
+// looked (`BUSY` first) is gone at once. Two jobs read in turn are both
+// there. Reaping a program the shell ran spends time, as bash's `waitchld`
+// reaps every exited child then. A reader that waits for another job's pid
+// spends time while any other work runs, and a reader that was stopped has
+// spent it. With a snapshot at every safepoint, the order is the same.
 #[test]
 fn a_job_that_ends_at_once_is_there_for_the_next_command() {
 	let jobs = "0\n[1]+  Running                    true &\n";
 	let spent = format!("true & kill -0 $!; echo $?; {BUSY}; kill -0 $!; echo $?");
 	let first = format!("true & {BUSY}; kill -0 $!; echo $?");
-	let rows: [(&str, &str); 16] = [
+	let stopped = format!(
+		"( true & p=$!; kill -STOP $BASHPID; kill -0 $p 2>/dev/null; echo $? ) & {BUSY}; kill -CONT \
+		 %1; wait; echo end"
+	);
+	let rows: [(&str, &str); 21] = [
 		("true & kill -0 $!; echo $?", "0\n"),
 		(": & kill -0 $!; echo $?", "0\n"),
 		("true & x=1; kill -0 $!; echo $?", "0\n"),
@@ -456,6 +463,15 @@ fn a_job_that_ends_at_once_is_there_for_the_next_command() {
 		("true & kill -0 $!; echo $?; jobs", jobs),
 		("exit 3 & kill -0 $!; echo $?; wait $!; echo $?", "0\n3\n"),
 		(&spent, "0\n1\n"),
+		("true & a=$!; true & b=$!; kill -0 $a; echo $?; kill -0 $b; echo $?", "0\n0\n"),
+		("/x/true | /x/true & kill -0 $!; echo $?", "0\n"),
+		("true & p=$!; /x/true; true & q=$!; kill -0 $p; echo $?", "1\n"),
+		(
+			"true & p=$!; f() { echo \"$(n=0; while kill -0 $p 2>/dev/null && (( ++n < 5000 )); do \
+			 :; done; (( n < 5000 )) && echo gone || echo stuck)\"; }; f & w=$!; wait $w; echo end=$?",
+			"gone\nend=0\n",
+		),
+		(&stopped, "1\nend\n"),
 		("true & while kill -0 $! 2>/dev/null; do :; done; echo end", "end\n"),
 		(&first, "1\n"),
 	];

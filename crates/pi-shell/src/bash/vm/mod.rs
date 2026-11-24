@@ -555,8 +555,10 @@ pub struct Kernel {
 	/// runs on at once, so a child that ends at once is still unreaped when
 	/// the parent's next commands look: the end of the job (or of the vproc
 	/// its `$!` names) is held from its reader (`Shell::adopt`) until the
-	/// reader parks on anything but a pid decision or has run as many ops
-	/// as a scheduler slice since its wait (`PidReader::spent`,
+	/// reader parks on anything but a pid decision, reaps a program it ran
+	/// ([`Self::reaped_program`]), or has run as many ops as a scheduler
+	/// slice since its wait, counting while it waits for another job's pid
+	/// the ops of whichever vproc runs (`PidReader::spent`,
 	/// `Shell::close_windows`). Imaged, with the ends held.
 	pub pid_readers:        Vec<PidReader>,
 	/// The math options ([`zsh::arith::math_options`]) last read for a vproc
@@ -721,6 +723,15 @@ impl Kernel {
 		{
 			self.pid_readers.push(PidReader { reader, job, spent: 0 });
 		}
+	}
+
+	/// `reader` reaped a program it waited for: bash's `waitchld` then reaps
+	/// every child that has exited, so the reader has spent time
+	/// ([`Self::pid_readers`]), even when the program's exit was there at the
+	/// first poll and it never parked. The ends held from the reader happen
+	/// after its turn (`Shell::close_windows`).
+	pub fn reaped_program(&mut self, reader: Vpid) {
+		self.pid_readers.retain(|r| r.reader != reader);
 	}
 
 	/// Next `$RANDOM` (0..=32767); the generator state is written through.
@@ -1998,13 +2009,6 @@ impl Shell {
 				return Step::Paused;
 			}
 			if !self.procs.iter().any(|p| p.has_work()) {
-				// No reader can spend more time: what was held from one
-				// happens (its CHLD trap may give the shell work again).
-				if !self.held.is_empty() || !self.k.pid_readers.is_empty() {
-					self.k.pid_readers.clear();
-					self.close_windows(cx, None);
-					continue;
-				}
 				return Step::Idle;
 			}
 			let wakes = self.k.ctl.wakes();
@@ -2141,16 +2145,19 @@ impl Shell {
 	/// The ops reader `r` of a job's pid has run since its wait for the pid
 	/// ended ([`PidReader::spent`]), or `None` once it has spent time: it is
 	/// gone, stopped or out of work, it parked on anything but a pid
-	/// decision (a program, a `wait`, a read), or it has run as many ops as
-	/// a scheduler slice ([`SLICE`]) since that wait. `ran` is the vproc
-	/// that just ran and the ops it used; the turn that parked the reader
-	/// for this pid is its wait.
+	/// decision (a program, a `wait`, a read), or [`SLICE`] ops have run
+	/// since that wait: its own, and while it is parked on another job's pid
+	/// decision, those of whichever vproc runs (bash's parent runs on at
+	/// once, so time passes for it). A program the reader reaped at once
+	/// never parks and spends through [`Kernel::reaped_program`], not here.
+	/// `ran` is the vproc that just ran and the ops it used; the turn that
+	/// parked the reader for this pid is its wait.
 	fn unspent(&self, r: PidReader, ran: Option<(Vpid, u32)>) -> Option<u32> {
 		let p = self.procs.iter().find(|p| p.vpid == r.reader)?;
 		if p.stopped {
 			return None;
 		}
-		let Some((_, used)) = ran.filter(|&(v, _)| v == r.reader) else {
+		let Some((ran, used)) = ran else {
 			return Some(r.spent);
 		};
 		let reads = |job: Vpid| {
@@ -2164,6 +2171,7 @@ impl Shell {
 		match p.blocked.as_ref().map(|b| &b.key) {
 			Some(&WaitKey::Proc(job)) if job == r.job && reads(job) => return Some(r.spent),
 			Some(&WaitKey::Proc(job)) if reads(job) => {},
+			_ if ran != r.reader => return Some(r.spent),
 			Some(_) => return None,
 			None if !p.has_work() => return None,
 			None => {},
