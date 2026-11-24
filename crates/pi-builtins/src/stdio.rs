@@ -925,19 +925,33 @@ mod tests {
 	}
 
 	/// A gated write to a pipe takes no more than a writable pipe is sure to
-	/// take. Here a page and one byte were read from a full pipe, so it
-	/// reports 4,097 bytes free but takes 4,096: the second page stays
-	/// until it is read to its end. A blocking write of all 4,097 would wait
-	/// for the last byte on the runtime's only thread, which the reader
-	/// below needs. The bound runs on a thread of its own.
+	/// take, and waits for room for the rest. Here a page and one byte were
+	/// read from a full pipe, which then has 4,097 bytes free, and the write
+	/// is of 4,098. Linux counts room in pages: the pipe takes 4,096 (the
+	/// second page stays until it is read to its end). gVisor counts bytes:
+	/// it takes 4,097 and refuses the rest. On both, what is left waits for
+	/// room, and a blocking write of all 4,098 would wait for it on the
+	/// runtime's only thread, which the reader below needs. The reader reads
+	/// once the write put bytes in the pipe (`FIONREAD` above what the fill
+	/// left). The bound runs on a thread of its own.
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	#[test]
 	fn a_gated_write_takes_no_more_than_a_writable_pipe_takes() {
 		use std::{
 			os::fd::AsRawFd,
 			sync::mpsc::{RecvTimeoutError, channel},
-			time::Duration,
+			time::{Duration, Instant},
 		};
+
+		/// The bytes in the pipe `reader` reads.
+		fn queued(reader: &std::io::PipeReader) -> usize {
+			let mut queued: libc::c_int = 0;
+			// SAFETY: `FIONREAD` writes one `c_int` through the pointer, which
+			// is valid for the call; `reader` owns the fd.
+			let status = unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &raw mut queued) };
+			assert_eq!(status, 0, "FIONREAD: {}", std::io::Error::last_os_error());
+			usize::try_from(queued).expect("FIONREAD counted fewer than no bytes")
+		}
 
 		let (mut reader, writer) = std::io::pipe().unwrap();
 		let writer = OwnedFd::from(writer);
@@ -952,9 +966,12 @@ mod tests {
 		let (done, finished) = channel::<()>();
 		std::thread::spawn(move || {
 			if finished.recv_timeout(Duration::from_secs(5)) == Err(RecvTimeoutError::Timeout) {
-				eprintln!(
-					"DEADLINE fired: the gated write to a pipe of {capacity} bytes did not finish within 5s"
+				// Straight to fd 2: libtest's capture takes `eprintln!`
+				// in this thread too, and `exit` drops what it took.
+				let line = format!(
+					"DEADLINE fired: the gated write to a pipe of {capacity} bytes did not finish within 5s\n"
 				);
+				let _ = std::io::stderr().write_all(line.as_bytes());
 				std::process::exit(1);
 			}
 		});
@@ -964,9 +981,13 @@ mod tests {
 			.unwrap();
 		runtime.block_on(async {
 			let descriptor = descriptor::Descriptor::gated(writer).unwrap();
-			let write = descriptor.write_all(&[b'x'; 4097]);
+			let write = descriptor.write_all(&[b'x'; 4098]);
 			let drain = async {
-				tokio::time::sleep(Duration::from_millis(100)).await;
+				let start = Instant::now();
+				while queued(&reader) <= capacity - 4097 {
+					assert!(start.elapsed() < Duration::from_secs(4), "the write put nothing in the pipe");
+					tokio::time::sleep(Duration::from_millis(1)).await;
+				}
 				// Only what the fill left, which is in the pipe whatever the
 				// write did: this read does not wait.
 				reader.read_exact(&mut vec![0; capacity - 4097]).unwrap();
@@ -1000,7 +1021,9 @@ mod tests {
 		let (done, finished) = channel::<()>();
 		std::thread::spawn(move || {
 			if finished.recv_timeout(Duration::from_secs(10)) == Err(RecvTimeoutError::Timeout) {
-				eprintln!("DEADLINE fired: a drain without a private reopen did not finish within 10s");
+				// Straight to fd 2, past libtest's capture (see above).
+				let line = "DEADLINE fired: a drain without a private reopen did not finish within 10s\n";
+				let _ = std::io::stderr().write_all(line.as_bytes());
 				std::process::exit(1);
 			}
 		});
@@ -1109,18 +1132,54 @@ mod tests {
 
 	/// A descriptor that can block but cannot be duplicated to register it
 	/// (`EMFILE`) writes on the blocking pool: on a current-thread runtime a
-	/// write to a full pipe nothing reads leaves the runtime's thread free (a
-	/// timer on it fires), and ends with the pipe's error once the reader
-	/// leaves. A write on the runtime's thread would hold it for good; the
-	/// bound runs on the calling thread.
+	/// write to a full pipe nothing reads leaves the runtime's thread free
+	/// (its timers fire while the pool's thread is seen asleep in that write),
+	/// and ends with the pipe's error once the reader leaves. A write on the
+	/// runtime's thread would hold it for good; the bound runs on the calling
+	/// thread.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_descriptor_that_cannot_be_registered_writes_on_the_blocking_pool() {
 		use std::{
 			os::fd::AsRawFd as _,
 			sync::mpsc::{RecvTimeoutError, channel},
-			time::Duration,
+			time::{Duration, Instant},
 		};
+
+		/// The name of the runtime's blocking-pool threads.
+		const POOL: &str = "unregistered-wr";
+
+		/// Whether a blocking-pool thread of this test's runtime is asleep
+		/// (`S` in procfs), with its tid.
+		fn pool_thread_asleep() -> Option<String> {
+			std::fs::read_dir("/proc/self/task").expect("/proc/self/task").flatten().find_map(|task| {
+				let comm = std::fs::read_to_string(task.path().join("comm")).ok()?;
+				let stat = std::fs::read_to_string(task.path().join("stat")).ok()?;
+				let state = stat.rsplit_once(") ")?.1.split(' ').next()?;
+				(comm.trim() == POOL && state == "S").then(|| task.file_name().to_string_lossy().into_owned())
+			})
+		}
+
+		/// Until the pool's thread is seen asleep on two polls in a row: the
+		/// write is its only work, so it sleeps in that write to the full
+		/// pipe. Polled on the runtime's own thread, whose timers fire only
+		/// while the write leaves that thread free.
+		async fn asleep_in_the_write() {
+			let start = Instant::now();
+			let mut asleep = None;
+			loop {
+				let now = pool_thread_asleep();
+				if now.is_some() && now == asleep {
+					return;
+				}
+				asleep = now;
+				assert!(
+					start.elapsed() < Duration::from_secs(8),
+					"the write was never seen waiting on the blocking pool"
+				);
+				tokio::time::sleep(Duration::from_millis(1)).await;
+			}
+		}
 
 		let (reader, writer) = std::io::pipe().unwrap();
 		// SAFETY: `F_GETPIPE_SZ` takes no argument; `writer` owns the fd.
@@ -1133,6 +1192,7 @@ mod tests {
 		std::thread::spawn(move || {
 			descriptor::OPEN_DUP_FAILS.set(true);
 			let runtime = tokio::runtime::Builder::new_current_thread()
+				.thread_name(POOL)
 				.enable_all()
 				.build()
 				.unwrap();
@@ -1144,7 +1204,7 @@ mod tests {
 				tokio::pin!(write);
 				tokio::select! {
 					_ = &mut write => panic!("a write to a full pipe nothing reads returned"),
-					() = tokio::time::sleep(Duration::from_millis(50)) => {},
+					() = asleep_in_the_write() => {},
 				}
 				drop(reader);
 				write.await.1
@@ -1160,7 +1220,9 @@ mod tests {
 			Err(RecvTimeoutError::Timeout) => {
 				panic!("DEADLINE fired: the write waited in the kernel on the runtime's thread")
 			},
-			Err(e) => panic!("{e}"),
+			Err(RecvTimeoutError::Disconnected) => {
+				panic!("the runtime's thread panicked before it sent the write's result; its message is above")
+			},
 		}
 	}
 }
