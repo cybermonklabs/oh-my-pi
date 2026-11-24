@@ -1264,13 +1264,19 @@ export class SessionManager {
 		// A write the lease fence refused is no storage failure: the claim is lost, and the loss moves or stops the
 		// session (see #onSessionClaimLost); a subagent transcript follows its parent. Once a main session is sealed
 		// (a dispose's close), nothing moves or stops it any more, so the entries a write of its file carried are lost:
-		// that refusal is the failure close() reports. A stopped session reports through its stop.
+		// that refusal is the failure close() reports. A stopped session reports through its stop. A subagent
+		// transcript (its path under its parent's stem) never takes that path, sealed or not: its claim is its parent's
+		// lease, which it neither moves off nor stops.
 		if (errorLike instanceof SessionLeaseLostError) {
+			const file = this.#sessionFile;
+			const root = file ? sessionLeaseRoot(file) : undefined;
+			const subagent = !!file && !!root && path.resolve(file).startsWith(`${root.stem}${path.sep}`);
 			if (
 				this.#followParentMove() ||
+				subagent ||
 				!this.#released ||
 				this.#exclusiveStop ||
-				path.resolve(errorLike.path) !== this.#sessionFile
+				path.resolve(errorLike.path) !== file
 			) {
 				return errorLike;
 			}
@@ -3229,7 +3235,13 @@ export class SessionManager {
 		},
 	): Promise<void> {
 		await this.#drainAndCloseWriter();
-		// A write the drain was the first to see refused can stop the session: it stays the session the stop judges.
+		// A queued write's conflict the drain met recovers in the background (#recoverQueuedConflict): let it end in the
+		// session it concerns, as flush() does, so a recovery that finds the file replaced is not lost to the switch.
+		for (let pass = 0; this.#queuedConflictRecovery && pass <= MAX_WRITE_CONFLICT_RECOVERIES; pass++) {
+			await this.#queuedConflictRecovery;
+		}
+		// A write the drain or a recovery was the first to see refused can stop the session: it stays the session the
+		// stop judges, and the switch gives up nothing of it, its claim least of all.
 		if (this.#exclusiveStop) await this.#refuseSwitchAfterStop(this.#exclusiveStop);
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
@@ -4008,6 +4020,8 @@ export class SessionManager {
 					{ ignorePriorError: true },
 				).catch(() => undefined);
 			}
+			// A move the terminal publish made copies the artifacts to the sibling in the background: let it land.
+			await this.#pendingArtifactCopy?.done;
 			await this.#rejectIfStopLeftEntriesUnsaved();
 			if (this.#diskFailure) throw this.#diskFailure;
 		} finally {

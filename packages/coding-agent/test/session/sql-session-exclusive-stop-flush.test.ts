@@ -10,11 +10,15 @@
  * controls stop a session before it writes anything (a resume another process holds; an idle session whose heartbeat
  * finds its lease taken over): storage then holds every entry, so flush and close resolve, also when the load owes a
  * republish (an older build's version, a torn record), and so does `AgentSession.dispose()`; only a turn the seal
- * drops makes them reject. A stop during a switch keeps the session that stopped. Last, a close after the session was
- * sealed (a dispose) whose own write the fence refuses reports that write's loss. SQLite always; PostgreSQL and MySQL
- * (MySQL 8 or MariaDB) when `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a database.
+ * drops makes them reject. The rows named "negative control" pass before this change too: each fails only if a stop
+ * that left nothing unsaved made them reject. A stop during a switch keeps the session that stopped, with its turns
+ * and its claim, also through `AgentSession.switchSession`, and a stopped session takes no lease of a switch's target.
+ * Last, a close after the session was sealed (a dispose) whose own write the fence refuses reports that write's loss,
+ * and a sealed subagent transcript's close does as before this change. SQLite always; PostgreSQL and MySQL (MySQL 8
+ * or MariaDB) when `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a database.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -243,8 +247,9 @@ async function resumeHeldElsewhere(
 for (const { adapter, url } of LEASE_BACKENDS) {
 	describe.skipIf(!url)(`OMP_SESSION_EXCLUSIVE=1 stop at a resume another process holds (${adapter})`, () => {
 		for (const { what, content } of STORED) {
-			it(`lets flush, flushSync and close resolve when the stop left every entry stored: ${what}`, async () => {
-				// If this fails, a stop alone rejects: a caller is told entries are unsaved that storage holds.
+			it(`negative control: lets flush, flushSync and close resolve when the stop left every entry stored: ${what}`, async () => {
+				// A negative control: it passes without this change too. If it fails, a stop alone rejects: a caller is
+				// told entries are unsaved that storage holds.
 				await using db = await openLeaseDb(adapter, url ?? "");
 				const storage = await db.open({ lease: STILL });
 				const hold = holdClaimRelease(storage);
@@ -393,8 +398,9 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			}
 		}, 60_000);
 
-		it("lets flush, flushSync and close resolve when the stop comes before any write after a load that skipped a torn record", async () => {
-			// If this fails, a load that leaves no byte-level proof of its entries counts them unsaved until a write.
+		it("negative control: lets flush, flushSync and close resolve when the stop comes before any write after a load that skipped a torn record", async () => {
+			// A negative control: it passes without this change too. If it fails, a load that leaves no byte-level proof
+			// of its entries counts them unsaved until a write.
 			using _exclusive = exclusive();
 			await using db = await openLeaseDb(adapter, url ?? "");
 			const storage = await db.open({ lease: FAST });
@@ -508,28 +514,51 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 		}, 30_000);
 
 		it("moves the session to a sibling that holds the turn without OMP_SESSION_EXCLUSIVE=1", async () => {
-			// If this fails, close resolves with the turn stored nowhere.
+			// If this fails, close resolves with the turn stored nowhere, or before the move's copy of the session's
+			// artifacts and subagent transcripts reached the sibling's folder, though a mode exits right after the close.
 			await using db = await openLeaseDb(adapter, url ?? "");
 			const storage = await db.open({ lease: STILL });
 			const file = sessionFile(db);
+			const stem = file.slice(0, -".jsonl".length);
 			await storage.writeText(file, transcript(ID, "before"));
+			await storage.writeText(path.join(stem, "Worker.jsonl"), subagentHeader());
 			await storage.drain();
+			// Tool artifacts beside the session on disk: enough that the copy outlasts the rest of the close.
+			const ARTIFACTS = 400;
+			await fs.promises.mkdir(stem, { recursive: true });
+			for (let n = 0; n < ARTIFACTS; n++) await Bun.write(path.join(stem, `${n}.bash.log`), "x".repeat(4096));
 			const before = await db.row(file);
 
 			const closed = await closeAfterSeal(db, storage, true);
+			await storage.drain();
 
-			const siblings = (await db.paths()).filter(stored => stored !== file);
-			const sibling = siblings[0] === undefined ? undefined : await db.row(siblings[0]);
+			const folder = path.dirname(file);
+			const siblings = (await db.paths()).filter(stored => stored !== file && path.dirname(stored) === folder);
+			const [first] = siblings;
+			const sibling = first === undefined ? undefined : await db.row(first);
+			const siblingStem = first?.slice(0, -".jsonl".length);
+			const copy = siblingStem === undefined ? undefined : await db.row(path.join(siblingStem, "Worker.jsonl"));
+			const copiedArtifacts = await fs.promises.readdir(siblingStem ?? folder).catch(() => [] as string[]);
 			expect({
 				closed,
 				siblings: siblings.length,
 				turnInSibling: sibling?.content.includes("appended before the seal"),
+				subagentCopied: copy?.content === subagentHeader(),
+				artifactsCopied: copiedArtifacts.filter(name => name.endsWith(".bash.log")).length,
 				untouched: Bun.deepEquals(await db.row(file), before),
-			}).toEqual({ closed: "resolved", siblings: 1, turnInSibling: true, untouched: true });
+			}).toEqual({
+				closed: "resolved",
+				siblings: 1,
+				turnInSibling: true,
+				subagentCopied: true,
+				artifactsCopied: ARTIFACTS,
+				untouched: true,
+			});
 		}, 30_000);
 
-		it("resolves with the turn stored when no other holder took the lease over", async () => {
-			// The control of the cases above: the same close with the lease still this store's.
+		it("negative control: resolves with the turn stored when no other holder took the lease over", async () => {
+			// The negative control of the cases above, which passes without this change too: the same close with the
+			// lease still this store's.
 			using _exclusive = exclusive();
 			await using db = await openLeaseDb(adapter, url ?? "");
 			const storage = await db.open({ lease: STILL });
@@ -547,5 +576,229 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 				turnStored: (await db.row(file))?.content.includes("appended before the seal"),
 			}).toEqual({ closed: "resolved", stopped: false, paths: [file], turnStored: true });
 		}, 30_000);
+	});
+}
+
+/** The first line of a subagent transcript the task tool writes under its parent's stem. */
+function subagentHeader(): string {
+	const header = { type: "session", version: 3, id: "Worker", timestamp: "2026-11-17T00:00:00.000Z", cwd: "/w" };
+	return `${JSON.stringify(header)}\n`;
+}
+
+for (const { adapter, url } of ROW_LEASE_BACKENDS) {
+	describe.skipIf(!url)(`a sealed subagent transcript under a parent another holder took over (${adapter})`, () => {
+		for (const variable of [false, true]) {
+			const label = variable ? "with" : "without";
+			it(`closes as before this change: no move of its own, no stop line naming it (${label} OMP_SESSION_EXCLUSIVE=1)`, async () => {
+				// If this fails, the sealed-close latch takes a subagent transcript for a main session: it moves to
+				// siblings under the parent's stem and close rejects (without the variable), or it stops the process
+				// naming the subagent (with it). The parent's own loss is as before this change: the parent moves to a
+				// sibling of its own (without the variable) or stops (with it).
+				const before = process.env.OMP_SESSION_EXCLUSIVE;
+				if (variable) process.env.OMP_SESSION_EXCLUSIVE = "1";
+				else delete process.env.OMP_SESSION_EXCLUSIVE;
+				const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+				try {
+					await using db = await openLeaseDb(adapter, url ?? "");
+					const storage = await db.open({ lease: STILL });
+					const hold = holdClaimRelease(storage);
+					const file = sessionFile(db);
+					const stem = file.slice(0, -".jsonl".length);
+					const child = path.join(stem, "Worker.jsonl");
+					await storage.writeText(file, transcript(ID, "before"));
+					await storage.writeText(child, subagentHeader());
+					await storage.drain();
+					const parent = await resume(storage, file);
+					const subagent = await SessionManager.open(child, undefined, storage, { suppressBreadcrumb: true });
+					const notices: string[] = [];
+					subagent.onPersistenceNotice(notice => notices.push(notice.to));
+					subagent.appendMessage(assistantTurn("the subagent's stored answer"));
+					await subagent.flush();
+					const release = await takeOver(db, file);
+					subagent.appendMessage(userTurn("the subagent's late turn"));
+					subagent.seal();
+
+					const closed = await outcome(subagent.close());
+					// With the variable, the parent's stop names it once its holder lookup ends.
+					if (variable) await until(() => hold.reached, 15_000, { what: "the parent's stop" });
+
+					const stopLine = /^Session (\S+) stops \(/;
+					const stopIds = stderr.mock.calls.flatMap(([chunk]) => stopLine.exec(String(chunk))?.[1] ?? []);
+					expect({
+						closed,
+						notices,
+						subagentFile: subagent.getSessionFile(),
+						underParentStem: (await db.paths()).filter(stored => stored.startsWith(`${stem}${path.sep}`)),
+						stopIds,
+					}).toEqual({
+						closed: "resolved",
+						notices: [],
+						subagentFile: child,
+						underParentStem: [child],
+						stopIds: variable ? [ID] : [],
+					});
+					release();
+					if (!variable) await outcome(parent.close());
+				} finally {
+					stderr.mockRestore();
+					if (before === undefined) delete process.env.OMP_SESSION_EXCLUSIVE;
+					else process.env.OMP_SESSION_EXCLUSIVE = before;
+				}
+			}, 60_000);
+		}
+	});
+
+	describe.skipIf(!url)(`AgentSession.switchSession after an OMP_SESSION_EXCLUSIVE=1 stop (${adapter})`, () => {
+		it("keeps the turn the stop left unsaved, so flush, flushSync and close reject with the stop", async () => {
+			// If this fails, the switch's rollback puts back the manager's state from before the turn: the turn is
+			// dropped, the file reads as current, and flush and close resolve with the turn stored nowhere.
+			using _exclusive = exclusive();
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const tempDir = TempDir.createSync("@omp-exclusive-stop-switch-");
+			const authStorage = createInMemoryAuthStorage();
+			authStorage.keys.setRuntime("anthropic", "test-key");
+			try {
+				const storage = await db.open({ lease: STILL });
+				holdClaimRelease(storage);
+				const file = sessionFile(db);
+				const otherFile = path.join(path.dirname(file), `2026-11-17T00-00-00-000Z_${OTHER_ID}.jsonl`);
+				await storage.writeText(file, transcript(ID, "before"));
+				await storage.writeText(otherFile, transcript(OTHER_ID, "another session"));
+				await storage.drain();
+				const manager = await resume(storage, file);
+				const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+				if (!model) throw new Error("expected the bundled anthropic claude-sonnet-4-5");
+				const session = new AgentSession({
+					agent: new Agent({ initialState: { model, systemPrompt: ["test"], tools: [] } }),
+					sessionManager: manager,
+					settings: Settings.isolated(),
+					modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+					agentId: "Main",
+				});
+				const before = await db.row(file);
+				const release = await takeOver(db, file);
+				// A turn appended as the switch begins (a switch hook, a work pool's record): its write is the first to
+				// meet the fence.
+				const switchFile = manager.setSessionFile.bind(manager);
+				manager.setSessionFile = ((target, options) => {
+					manager.appendMessage(userTurn("appended as the switch begins"));
+					return switchFile(target, options);
+				}) as SessionManager["setSessionFile"];
+
+				const switched = await outcome(session.switchSession(otherFile));
+				const flushed = await outcome(manager.flush());
+				const sync = syncOutcome(manager);
+				const closed = await outcome(manager.close());
+
+				const stop = expect.stringContaining(TAKEN_OVER);
+				expect({
+					switched,
+					flushed,
+					sync,
+					closed,
+					file: manager.getSessionFile(),
+					untouched: Bun.deepEquals(await db.row(file), before),
+				}).toEqual({ switched: stop, flushed: stop, sync: stop, closed: stop, file, untouched: true });
+				release();
+			} finally {
+				authStorage.close();
+				AsyncJobManager.resetForTests();
+				tempDir.removeSync();
+			}
+		}, 60_000);
+	});
+
+	describe.skipIf(!url)(`setSessionFile on a session that stopped under OMP_SESSION_EXCLUSIVE=1 (${adapter})`, () => {
+		it("takes no lease of the target: it rejects at once, without waiting for the target's holder", async () => {
+			// If this fails, the stopped manager first waits for and takes the target's lease, then rejects.
+			using _exclusive = exclusive();
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const hold = holdClaimRelease(storage);
+			const file = sessionFile(db);
+			const otherFile = path.join(path.dirname(file), `2026-11-17T00-00-00-000Z_${OTHER_ID}.jsonl`);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.writeText(otherFile, transcript(OTHER_ID, "another session"));
+			await storage.drain();
+			const manager = await resume(storage, file);
+			const release = await takeOver(db, file);
+			manager.appendMessage(userTurn("refused by the fence"));
+			await until(() => hold.reached, 15_000, { what: "the stop to reach its release of the store's claims" });
+			await using holder = await anotherProcess(db);
+			expect((await holder.run({ op: "claim", sessionId: OTHER_ID, path: otherFile })).held).toBe(true);
+			let waited = false;
+
+			const switched = await outcome(
+				manager.setSessionFile(otherFile, {
+					claim: {
+						waitMs: 20_000,
+						onWait: () => {
+							waited = true;
+						},
+					},
+				}),
+			);
+
+			expect({ switched, waited, file: manager.getSessionFile() }).toEqual({
+				switched: expect.stringContaining(TAKEN_OVER),
+				waited: false,
+				file,
+			});
+			release();
+		}, 60_000);
+	});
+}
+
+for (const { adapter, url } of LEASE_BACKENDS) {
+	describe.skipIf(!url)(`a switch whose drain first sees an OMP_SESSION_EXCLUSIVE=1 stop (${adapter})`, () => {
+		it("refuses before it gives up the claim of the session that stopped", async () => {
+			// If this fails, the switch releases the stopped session's claim before it refuses (it refuses only after
+			// it loaded the target): another process can claim the session while this one still lives, its turn unsaved.
+			using _exclusive = exclusive();
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const hold = holdClaimRelease(storage);
+			const file = sessionFile(db);
+			const otherFile = path.join(path.dirname(file), `2026-11-17T00-00-00-000Z_${OTHER_ID}.jsonl`);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.writeText(otherFile, transcript(OTHER_ID, "another session"));
+			await storage.drain();
+			const manager = await resume(storage, file);
+			manager.appendMessage(userTurn("stored before the change"));
+			await manager.flush();
+			// An older build puts another session over the file. The store's claim of the session stays this store's:
+			// a stop for a replaced file gives it back only at the release the test holds.
+			const replacement = transcript("01a1f700-0000-7000-8000-0000000000d5", "another session");
+			const older = await db.open({ claims: false });
+			await older.writeText(file, replacement);
+			await older.drain();
+
+			// The append meets the other session's file while the switch drains it, the first to see the replacement.
+			manager.appendMessage(userTurn("refused by the size check"));
+			const switched = await outcome(manager.setSessionFile(otherFile));
+			// A claim the switch gave up is deleted once the store's queued work settles.
+			await storage.drain().catch(() => undefined);
+			await using holder = await anotherProcess(db);
+			// The probe claims the session's id at a path that holds nothing: a claim at its own file, which now holds
+			// another session, is refused whoever holds the id.
+			const probe = path.join(db.dir.path(), "probe", path.basename(file));
+			const claimedElsewhere = (await holder.run({ op: "claim", sessionId: ID, path: probe })).held;
+
+			expect({
+				switched,
+				stopped: hold.reached,
+				claimedElsewhere,
+				file: manager.getSessionFile(),
+				untouched: (await db.row(file))?.content === replacement,
+			}).toEqual({
+				switched: expect.stringContaining(
+					`Session ${ID} stops (replaced): its file now holds another session. OMP_SESSION_EXCLUSIVE=1 keeps it from moving to another id, so it opens no other session.`,
+				),
+				stopped: true,
+				claimedElsewhere: false,
+				file,
+				untouched: true,
+			});
+		}, 60_000);
 	});
 }
