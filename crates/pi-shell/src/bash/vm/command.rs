@@ -20,9 +20,9 @@ use super::{
 	expand::{CompoundElem, Expander, Stop, compound_text},
 	probe::{self, Search, absolute, candidates},
 	proc::{
-		AssignValue, Awaited, BangStage, DeferPhase, ExecAs, ExecState, Frame, FrameKind, JobState,
-		Live, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot, Stage, Target,
-		Transfer, Vproc,
+		AssignValue, Awaited, BangStage, CmdName, DeferPhase, ExecAs, ExecState, Frame, FrameKind,
+		JobState, Live, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot,
+		Stage, Target, Transfer, Vproc,
 	},
 	state::{self, Level, Scope, Var, VarMap},
 	xtrace,
@@ -73,6 +73,7 @@ impl ExecState {
 			via_command: false,
 			resume: false,
 			resumed: 0,
+			name_before: None,
 		}
 	}
 
@@ -104,6 +105,7 @@ impl ExecState {
 			via_command,
 			resume,
 			resumed,
+			name_before,
 		} = self;
 		*stage = Stage::Expand;
 		*old_tag = tag;
@@ -130,6 +132,7 @@ impl ExecState {
 		*via_command = false;
 		*resume = false;
 		*resumed = 0;
+		*name_before = None;
 	}
 }
 
@@ -468,8 +471,12 @@ fn assignment_statement(
 	vp.status = 0;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(0);
-	// An assignment-only command leaves `$_` empty (bash `bind_lastarg`).
-	bash_last_arg(k, vp, cx, line, BString::default(), None);
+	// An assignment-only command leaves `$_` empty (bash `bind_lastarg`,
+	// with no command name), and clears the name.
+	if !forked_alone(vp) {
+		bash_last_arg(k, vp, cx, line, BString::default(), CmdName::Cleared, None);
+	}
+	vp.cmd_name = CmdName::Cleared;
 	Some(Flow::Next)
 }
 
@@ -582,6 +589,11 @@ fn plain_statement(
 			} else {
 				Stage::Expand
 			};
+			if globs.is_empty() {
+				// The words are expanded: the command names itself.
+				e.name_before = Some(vp.cmd_name);
+				vp.cmd_name = CmdName::Own;
+			}
 			e.globs = globs;
 			sc.exec = Some(e);
 			vp.frames.last_mut().expect("frame").scratch = Some(sc);
@@ -608,7 +620,10 @@ fn plain_statement(
 		vp.pipestatus.clear();
 		vp.pipestatus.push(outcome.status);
 		let last = argv.pop().unwrap_or_default();
-		bash_last_arg(k, vp, cx, line, last, argv.first().map(|n| &n[..]));
+		if !forked_alone(vp) {
+			bash_last_arg(k, vp, cx, line, last, CmdName::Own, argv.first().map(|n| &n[..]));
+		}
+		vp.cmd_name = CmdName::Cleared;
 		return Some(Flow::Next);
 	}
 	// The stages take over from the expanded words: a builtin that needs
@@ -620,6 +635,8 @@ fn plain_statement(
 	e.scoped = true;
 	e.target = Some(Target::Intrinsic(id));
 	e.stage = Stage::Dispatch;
+	e.name_before = Some(vp.cmd_name);
+	vp.cmd_name = CmdName::Own;
 	sc.exec = Some(e);
 	match res {
 		Ok(outcome) => {
@@ -1127,6 +1144,7 @@ fn expand(
 		s.status = s.sub_status.unwrap_or(0);
 	}
 	s.stage = Stage::Redirect;
+	name_command(vp);
 	if assign_only
 		&& k.mask.contains(crate::bash::event::EventKind::CmdExpanded)
 		&& let Some(e) = current_exec(vp)
@@ -4716,9 +4734,10 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	// bash `bind_lastarg`: the command's last word (its name when it has
 	// no argument, empty after an assignment-only command). `exit`,
 	// `return` and `exec` leave before it: an EXIT or RETURN trap sees the
-	// command before them.
-	let binds = vp.mode.dialect() == crate::bash::ids::Dialect::Bash
-		&& !matches!(control, Some(Transfer::Return(_) | Transfer::Exit(_) | Transfer::Exec));
+	// command before them. The whole of a forked pipeline stage or
+	// asynchronous command binds nothing ([`forked_alone`]).
+	let left = matches!(control, Some(Transfer::Return(_) | Transfer::Exit(_) | Transfer::Exec));
+	let binds = vp.mode.dialect() == crate::bash::ids::Dialect::Bash && !left && !forked_alone(vp);
 	// The last word is the value; the others stay in the command's state,
 	// which the next command reuses (`spare_exec`, `pool_words`).
 	let last = binds.then(|| st(vp).argv.pop().unwrap_or_default());
@@ -4748,13 +4767,21 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	}
 	if let Some(last) = last {
 		let line = exec::line_of(vp, op.node);
-		let name = sc
+		let who = vp.cmd_name;
+		let own = sc
 			.exec
 			.as_deref()
 			.and_then(|e| e.argv.first())
 			.map(|n| &n[..]);
-		bash_last_arg(k, vp, cx, line, last, name);
+		bash_last_arg(k, vp, cx, line, last, who, own);
 	}
+	// bash clears `this_command_name` when a command runs to its end; one
+	// that leaves (`exit`, `return`, `exec`) puts back the name from before
+	// it.
+	vp.cmd_name = match sc.exec.as_deref().and_then(|e| e.name_before) {
+		Some(before) if left => before,
+		_ => CmdName::Cleared,
+	};
 	exec::keep_scratch(vp, sc);
 	if status != 0 && in_shell && vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		print_exit_value(k, vp, cx, status);
@@ -4795,17 +4822,22 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 /// variable it names; an array's element 0 takes it), a readonly one kept
 /// with bash's error. Then `_` is not exported, so an external gets it only
 /// as its own path ([`build_env`]). A plain `_`, the usual case, takes the
-/// bytes in place. Pipelines, `( )` and background jobs bind it in their
-/// own vprocs only. `name` is the command's name (`None`: `last` is), which
-/// a value error names as bash's `this_command_name` does (`echo: [3]:
-/// arithmetic syntax error …`); a readonly `_`'s error stays bare.
+/// bytes in place. `( )` and command substitutions bind it in their own
+/// vprocs only, and the whole of a forked pipeline stage or background job
+/// binds nothing ([`forked_alone`]). A value error names the command as
+/// bash's `this_command_name` does then (`who`, [`Vproc::cmd_name`]): its
+/// own name `own` (`None`: `last` is), none after a simple command it ran
+/// to its end (a function body, `eval`, `.`), `((` or `[[` after one of
+/// those (`echo: [3]: arithmetic syntax error …`); a readonly `_`'s error
+/// stays bare.
 fn bash_last_arg(
 	k: &mut Kernel,
 	vp: &mut Vproc,
 	cx: &mut Cx<'_>,
 	line: u32,
 	last: BString,
-	name: Option<&[u8]>,
+	who: CmdName,
+	own: Option<&[u8]>,
 ) {
 	let cur = match state::lookup_declared(&k.root, cx.store, vp, b"_") {
 		Ok(v) => v.map(|v| (v.attrs, matches!(v.value, crate::bash::store::VarValue::Str(_)))),
@@ -4831,7 +4863,12 @@ fn bash_last_arg(
 		Some((attrs, _)) => {
 			// `_` has attributes, so this is the rare path: the name a value
 			// error gives is kept before the word goes into the assignment.
-			let name = BString::from(name.unwrap_or(&last[..]));
+			let name = BString::from(match who {
+				CmdName::Own => own.unwrap_or(&last[..]),
+				CmdName::Cleared => &b""[..],
+				CmdName::Arith => &b"(("[..],
+				CmdName::Cond => &b"[["[..],
+			});
 			let lhs = Lhs { name: b"_", index: None, append: false };
 			if let Err(d) =
 				builtins::set_value(k, cx, vp, lhs, AssignValue::Scalar(last), Level::Dynamic)
@@ -4860,6 +4897,67 @@ fn bash_last_arg(
 			k.fail(err);
 		}
 	}
+}
+
+/// The command names itself once its words are expanded, as bash sets
+/// `this_command_name` after `expand_words`: a `${ cmd; }` in a word runs
+/// before, one in a redirection after ([`Vproc::cmd_name`]).
+fn name_command(vp: &mut Vproc) {
+	let before = vp.cmd_name;
+	st(vp).name_before = Some(before);
+	vp.cmd_name = CmdName::Own;
+}
+
+/// bash binds no `$_` after a simple command that is the whole of a forked
+/// pipeline stage (not `lastpipe`'s last, which runs in the shell) or of an
+/// asynchronous command: `execute_simple_command` forks it itself, and the
+/// child runs a builtin or function through
+/// `execute_subshell_builtin_or_function`, which ends in `subshell_exit`,
+/// or execs a program. `( … )`, a group stage, a coprocess and a command
+/// substitution run their commands unforked in the child, which binds.
+fn forked_alone(vp: &Vproc) -> bool {
+	let [frame] = vp.frames.as_slice() else {
+		return false;
+	};
+	let Some(unit) = frame.unit.as_deref() else {
+		return false;
+	};
+	let pc = frame.pc;
+	let next = unit.ops.get(pc as usize + 1).map(|op| op.code);
+	matches!(frame.kind, FrameKind::Subshell)
+		&& next == Some(ir::Opcode::SubExit)
+		&& unit.spawns.iter().any(|s| {
+			matches!(s.kind, ir::SpawnKind::Pipeline | ir::SpawnKind::Background)
+				&& s.stages.iter().any(|stage| stage.entry == pc)
+		})
+}
+
+/// A `break` or `continue` in `eval` leaves the loop through it: bash's
+/// `eval` returns after it, so its command binds `$_` as any command does
+/// (with no name: the break ran to its end), then the loop ends.
+pub(super) fn bind_crossed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
+	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash || forked_alone(vp) {
+		return;
+	}
+	let Some(frame) = vp.frames.last_mut() else {
+		return;
+	};
+	let node = frame
+		.unit
+		.as_ref()
+		.and_then(|u| u.ops.get(frame.pc as usize))
+		.map(|op| op.node);
+	let last = frame
+		.scratch
+		.as_deref_mut()
+		.and_then(|s| s.exec.as_deref_mut())
+		.map(|e| e.argv.pop().unwrap_or_default());
+	let (Some(node), Some(last)) = (node, last) else {
+		return;
+	};
+	let line = exec::line_of(vp, node);
+	bash_last_arg(k, vp, cx, line, last, CmdName::Cleared, None);
+	vp.cmd_name = CmdName::Cleared;
 }
 
 /// zsh `execcmd`/`execshfunc` under `printexitvalue` with `shinstdin`: a

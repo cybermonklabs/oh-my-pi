@@ -129,6 +129,10 @@ pub struct ShellInit {
 	pub mode:        ModeId,
 	/// `$0`; also the prefix of diagnostics.
 	pub argv0:       BString,
+	/// The shell's own `argv[0]` when `$0` is a script's or a `-c` name's
+	/// (`None`: [`Self::argv0`] is): bash's first `$_` when the environment
+	/// gives none.
+	pub shell_name:  Option<BString>,
 	/// Positional parameters.
 	pub args:        Vec<BString>,
 	/// Imported environment (names that are not identifiers are skipped;
@@ -199,6 +203,7 @@ impl Default for ShellInit {
 		Self {
 			mode:        ModeId::Bash,
 			argv0:       BString::from("bash"),
+			shell_name:  None,
 			args:        Vec::new(),
 			env:         Vec::new(),
 			cwd:         BString::from("/"),
@@ -1235,6 +1240,15 @@ fn startup_vars(k: &mut Kernel, cx: &mut Cx<'_>, init: &ShellInit) -> Result<(),
 		if forced || state::global(cx.store, name)?.is_none() {
 			k.root.set_var(cx.store, name, Some(var));
 		}
+	}
+	// bash's first `$_` when the environment gives none: the shell's
+	// argv[0], not a script's name (`set_if_not ("_", dollar_vars[0])`).
+	if init.mode.dialect() == crate::bash::ids::Dialect::Bash
+		&& state::global(cx.store, b"_")?.is_none()
+	{
+		let name = init.shell_name.as_ref().unwrap_or(&init.argv0);
+		k.root
+			.set_var(cx.store, b"_", Some(Var::scalar(name.clone(), Attrs::NONE)));
 	}
 	// zsh's other prompt names share the variable of `PS1`, … (`RPS1`
 	// and `RPS2` start unset, and so do their other names).
@@ -2809,6 +2823,7 @@ impl Vproc {
 			trace_base: 0,
 			subshell: 0,
 			command: None,
+			cmd_name: proc::CmdName::Cleared,
 			spare: Vec::new(),
 			calls: Vec::new(),
 			own_traps: proc::OwnTraps::EMPTY,

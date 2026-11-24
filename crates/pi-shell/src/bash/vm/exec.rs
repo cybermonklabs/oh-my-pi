@@ -409,8 +409,20 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 					)
 				});
 				if let Some(i) = target {
+					// The commands the return leaves put back the command
+					// name from before the outermost of them, the one running
+					// in the returning frame (bash's unwind of
+					// `this_command_name`), after a RETURN trap.
+					let back = name_after_return(vp, i);
 					if vp.frames[i].kind == FrameKind::NoFork || !return_trap(k, vp, cx, i) {
+						vp.cmd_name = back;
 						unwind(&mut k.root, cx.store, vp, i);
+					} else if let Some(Frame {
+						kind: FrameKind::Script { what: ScriptKind::Trap { return_name, .. }, .. },
+						..
+					}) = vp.frames.last_mut()
+					{
+						*return_name = Some(back);
 					}
 				} else if vp.parent.is_some() && in_function_scope(k, cx, vp) {
 					exit_shell(k, vp, cx, status);
@@ -1088,13 +1100,15 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			}
 		}
 		let frame = top_frame(vp);
-		let (status, source, cancel, return_target, exit) = match frame.kind {
+		let (status, source, cancel, return_target, return_name, exit) = match frame.kind {
 			FrameKind::Script {
-				what: ScriptKind::Trap { status, cancel, return_target, exit, .. },
+				what: ScriptKind::Trap { status, cancel, return_target, return_name, exit, .. },
 				..
-			} => (Some(status), false, cancel, return_target, exit),
-			FrameKind::Script { what: ScriptKind::Source, .. } => (None, true, None, None, false),
-			_ => (None, false, None, None, false),
+			} => (Some(status), false, cancel, return_target, return_name, exit),
+			FrameKind::Script { what: ScriptKind::Source, .. } => {
+				(None, true, None, None, None, false)
+			},
+			_ => (None, false, None, None, None, false),
 		};
 		let debug = matches!(frame.kind, FrameKind::Script {
 			what: ScriptKind::Trap { key: TrapKey::Debug, .. },
@@ -1138,6 +1152,11 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 		} else if let Some(status) = status {
 			vp.status = status;
 			if let Some(target) = return_target {
+				// The RETURN trap of a `return` ran: the name the return puts
+				// back follows it.
+				if let Some(back) = return_name {
+					vp.cmd_name = back;
+				}
 				unwind(&mut k.root, cx.store, vp, target);
 			} else if debug
 				&& trap_status != 0
@@ -1853,6 +1872,19 @@ pub fn unwind(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc, keep:
 	}
 }
 
+/// The command name ([`Vproc::cmd_name`]) a `return` to frame `target`
+/// leaves: the one from before the command running in that frame, the
+/// outermost the return ends (an `eval` or `.` around it); when that is
+/// the `return` itself, its finish already put it back.
+fn name_after_return(vp: &Vproc, target: usize) -> super::proc::CmdName {
+	vp.frames
+		.get(target)
+		.and_then(|f| f.scratch.as_deref())
+		.and_then(|s| s.exec.as_deref())
+		.and_then(|e| e.name_before)
+		.unwrap_or(vp.cmd_name)
+}
+
 /// Restore saved fds (latest first).
 pub fn restore(vp: &mut Vproc, saves: Vec<Saved>) {
 	for s in saves.into_iter().rev() {
@@ -1978,9 +2010,15 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 			f.kind,
 			FrameKind::Script { what: ScriptKind::Eval, .. } | FrameKind::NoFork | FrameKind::Stage
 		);
+		let eval = matches!(f.kind, FrameKind::Script { what: ScriptKind::Eval, .. });
 		if crossable && vp.frames.len() > 1 {
 			pop_frame(&mut k.root, cx.store, vp);
-			// The caller's op (`eval`) is abandoned with the loop.
+			// bash's `eval` returns after the break: its command binds `$_`
+			// as any command does. Then the caller's op is abandoned with
+			// the loop.
+			if eval {
+				command::bind_crossed(k, vp, cx);
+			}
 			clear_scratch(&mut k.root, cx.store, vp);
 			continue;
 		}
@@ -2825,6 +2863,9 @@ fn plain_arith(
 	unit: &Unit,
 	op: Op,
 ) -> Option<Flow> {
+	// bash names `((` the command from here on (`this_command_name`), as
+	// `dispatch` does for the other arithmetic ops.
+	vp.cmd_name = super::proc::CmdName::Arith;
 	if op.b != Op::LITERAL || super::xtrace::on(k, cx, vp) {
 		return None;
 	}
@@ -3059,6 +3100,9 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		},
 		Opcode::Arith if unit.mode.dialect() == Dialect::Zsh => zsh_arith(k, vp, cx, unit, op, line),
 		Opcode::Arith => {
+			// bash names `((` the command for errors from here on, including
+			// a `$_` bind's after it (`this_command_name`).
+			vp.cmd_name = super::proc::CmdName::Arith;
 			let text = &unit.ariths[op.a as usize];
 			let arith_for = unit
 				.nodes
@@ -3116,7 +3160,10 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		Opcode::CondTest if unit.mode.dialect() == Dialect::Zsh => {
 			super::zsh::cond::cond_test(k, vp, cx, unit, op, line)
 		},
-		Opcode::CondTest => builtins::cond_test(k, vp, cx, unit, op, line),
+		Opcode::CondTest => {
+			vp.cmd_name = super::proc::CmdName::Cond;
+			builtins::cond_test(k, vp, cx, unit, op, line)
+		},
 		Opcode::FuncDef => {
 			let f = &unit.funcs[op.a as usize];
 			// bash records a definition's line at its end.
@@ -3729,6 +3776,8 @@ fn for_next(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		}
 	};
 	clear_scratch(&mut k.root, cx.store, vp);
+	// bash's `for` clears `this_command_name` at each iteration.
+	vp.cmd_name = super::proc::CmdName::Cleared;
 	let select = top_frame(vp)
 		.loops
 		.last()
@@ -4784,6 +4833,7 @@ fn push_trap(
 		status,
 		cancel: None,
 		return_target: None,
+		return_name: None,
 		exit: false,
 	});
 	if let Some(saved) = restore {

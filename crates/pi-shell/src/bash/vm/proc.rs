@@ -93,6 +93,11 @@ pub struct Vproc {
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
 	pub command:       Option<(Arc<Unit>, u32)>,
+	/// bash's `this_command_name` as an error in a `$_` bind reads it: the
+	/// finishing command's own name, or what ran inside it since (a simple
+	/// command that ran to its end clears it; `((` and `[[` name
+	/// themselves).
+	pub cmd_name:      CmdName,
 	/// Pushes onto bash's call-stack arrays (`FUNCNAME`, `BASH_SOURCE`,
 	/// `BASH_LINENO`, `BASH_ARGC`, `BASH_ARGV`), oldest first; a subshell
 	/// starts with its parent's.
@@ -106,8 +111,10 @@ pub struct Vproc {
 	/// the per-op checks (cancellation, `BASH_COMMAND`, a trap inside its
 	/// own action) skip their frame scans. Kept by
 	/// [`super::exec::push_script`], [`super::exec::pop_frame`] and the
-	/// frame restore; never serialized (recounted from the frames).
-	pub trap_frames:   u32,
+	/// frame restore; never serialized (recounted from the frames). A trap
+	/// never runs inside its own action, so they nest at most once per trap
+	/// kind, far below `u16::MAX`.
+	pub trap_frames:   u16,
 	/// Current mode: the emulation its code runs under, set by
 	/// `emulate`, a mode-switching function call (restored on return) and
 	/// a run's explicit mode; inherited by children. The root's is written
@@ -902,6 +909,10 @@ pub enum ScriptKind {
 		status:        i32,
 		cancel:        Option<i32>,
 		return_target: Option<usize>,
+		/// The command name ([`Vproc::cmd_name`]) the `return` whose RETURN
+		/// trap this is puts back when it ends (`None`: a `.` file that
+		/// ended).
+		return_name:   Option<CmdName>,
 		/// An ERR trap run by `set -e`: the shell exits with `status` when
 		/// the trap ends.
 		exit:          bool,
@@ -1535,6 +1546,26 @@ pub struct ExecState {
 	pub resume:      bool,
 	/// Times the builtin ran again after a frame it pushed returned.
 	pub resumed:     u32,
+	/// [`Vproc::cmd_name`] before this command named itself, once its
+	/// words are expanded (`None` before): a `return` that leaves it puts
+	/// it back, as bash's unwind of `this_command_name` does.
+	pub name_before: Option<CmdName>,
+}
+
+/// The name an error in the `$_` bind of the command now finishing gives,
+/// as bash's `this_command_name` holds it then ([`Vproc::cmd_name`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CmdName {
+	/// No name: a simple command ran to its end (bash clears the name), a
+	/// `for` started an iteration, or nothing ran yet.
+	Cleared,
+	/// The running simple command's own name (its first word), set once
+	/// its words are expanded.
+	Own,
+	/// `((`: an arithmetic command or an arithmetic `for` ran.
+	Arith,
+	/// `[[`: a conditional command ran.
+	Cond,
 }
 
 /// Options of `exec [-cl] [-a name] command`.
@@ -1754,7 +1785,8 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B.
+// that to at most 1,840 B. `Vproc::cmd_name` (1 B) sits in the 2 bytes a
+// `u16` `Vproc::trap_frames` freed: `Vproc` keeps its 672 B.
 const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
