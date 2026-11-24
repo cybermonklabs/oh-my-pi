@@ -501,6 +501,7 @@ import {
 	copySessionArtifacts,
 	extractSessionInit,
 	type PersistedSessionInit,
+	SessionExclusiveStopError,
 	type SessionManager,
 } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
@@ -3947,6 +3948,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		) {
 			return;
 		}
+		// A session that stopped under OMP_SESSION_EXCLUSIVE=1 writes nothing more: the marker would be dropped, and a
+		// dropped entry makes flushSync() and close() report the stop as entries left unsaved.
+		if (this.sessionManager.isExclusiveStopped()) return;
 		const kind: SessionExitData["kind"] =
 			reason === "dispose" || reason === postmortem.Reason.MANUAL
 				? "normal"
@@ -14323,7 +14327,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			return true;
 		} catch (error) {
-			this.sessionManager.restoreState(previousSessionState);
+			// A switch an OMP_SESSION_EXCLUSIVE=1 stop refused changed nothing in the manager, which holds the stopped
+			// session with every entry, saved or not: putting the snapshot back would drop an entry appended since and
+			// mark the file current, so flush and close would report an unsaved turn as saved.
+			if (!(error instanceof SessionExclusiveStopError)) this.sessionManager.restoreState(previousSessionState);
 			this.#freshProviderSessionId = previousFreshProviderSessionId;
 			this.#syncAgentSessionId(previousSessionState.sessionId, false);
 			this.#memory.rekeyForCurrentSessionId();
