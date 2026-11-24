@@ -1059,3 +1059,387 @@ fn each_report_has_its_own_start_and_format() {
 		),
 	]);
 }
+
+/// bash's `run_exit_trap` clears the EXIT trap before its action runs, in a
+/// subshell and a command substitution as in the shell itself: an `exit` in
+/// the action (here in a function it calls) passes each `eval` or `.`,
+/// which undoes its redirections, so the report goes out of them. A trap
+/// the action sets again, also one that ignores, counts again.
+#[test]
+fn a_running_exit_trap_counts_as_none() {
+	assert_rows(&[
+		(
+			"subshell",
+			"( trap 'f' EXIT; f() { time eval '{ exit 4; } 2>e1'; }; exit 3 ); echo w=$?; echo e1:; \
+			 cat e1",
+			"report\nw=4\ne1:\n",
+			0,
+		),
+		(
+			"subshell, at its end",
+			"( trap 'f' EXIT; f() { time eval '{ exit 4; } 2>e1'; }; true ); echo w=$?; echo e1:; \
+			 cat e1",
+			"report\nw=4\ne1:\n",
+			0,
+		),
+		(
+			"subshell, two evals",
+			"( trap 'f' EXIT; f() { time eval '{ eval \"{ exit 4; } 2>e2\"; } 2>e1'; }; exit 3 ); \
+			 echo w=$?; echo e1:; cat e1; echo e2:; cat e2",
+			"report\nw=4\ne1:\ne2:\n",
+			0,
+		),
+		(
+			"subshell, .",
+			"( trap 'f' EXIT; f() { time . ./g; }; printf '{ exit 4; } 2>e1\\n' > g; exit 3 ); echo \
+			 w=$?; echo e1:; cat e1",
+			"report\nw=4\ne1:\n",
+			0,
+		),
+		(
+			"command substitution",
+			"f() { x=$( trap 'g' EXIT; g() { time eval '{ exit 4; } 2>/dev/null'; }; exit 3 ); echo \
+			 \"x=[$x] s=$?\"; }; f 2>&1; echo w=$?",
+			"report\nx=[] s=4\nw=0\n",
+			0,
+		),
+		(
+			"command substitution, no function",
+			"x=$( trap 'f' EXIT; f() { time eval '{ exit 4; } 2>/dev/null'; }; exit 3 2>&1 ) 2>&1; \
+			 echo \"x=[$x] s=$?\"",
+			"report\nx=[] s=4\n",
+			0,
+		),
+		(
+			"the shell",
+			"trap 'f' EXIT; f() { time eval '{ exit 4; } 2>/dev/null'; }; exit 3",
+			"report\n",
+			4,
+		),
+		(
+			"set again",
+			"( trap 'trap \"echo X >&2\" EXIT; f' EXIT; f() { time eval '{ exit 4; } 2>e1'; }; exit \
+			 3 ); echo w=$?; echo e1:; cat e1",
+			"w=4\ne1:\nreport\n",
+			0,
+		),
+		(
+			"set again, the shell",
+			"trap 'trap \"echo X >&2\" EXIT; f' EXIT; f() { time eval '{ exit 4; } 2>/dev/null'; }; \
+			 exit 3",
+			"",
+			4,
+		),
+		(
+			"set again to ignore",
+			"( trap 'trap \"\" EXIT; f' EXIT; f() { time eval '{ exit 4; } 2>e1'; }; exit 3 ); echo \
+			 w=$?; echo e1:; cat e1",
+			"w=4\ne1:\nreport\n",
+			0,
+		),
+	]);
+}
+
+/// When `set -e` leaves a function, bash resets the function context before
+/// the EXIT trap at the first `eval`, `.` or `-c` string the jump passes, or
+/// in a script's `reader_loop` outside posix mode: `set -e` in the trap's
+/// `eval` then undoes its redirections, so the report goes out of them. An
+/// `exit` keeps the context, a function the trap calls has its own, and a
+/// subshell's own catch resets nothing. Under `-c` the `-c` string undoes
+/// after an inner `eval` reset it, which runs the function's `pop_context`
+/// and leaves the context set again.
+#[test]
+fn errexit_out_of_a_function_resets_its_context_before_the_exit_trap() {
+	assert_rows(&[
+		(
+			"set -e",
+			"set -e; trap 'time eval \"{ false; } 2>/dev/null\"' EXIT; f() { false; }; f",
+			"report\n",
+			1,
+		),
+		(
+			"ERR trap",
+			"set -eE; trap 'echo E >&2' ERR; trap 'time eval \"{ false; } 2>/dev/null\"' EXIT; f() { \
+			 false; }; f",
+			"E\nreport\n",
+			1,
+		),
+		(
+			"an eval in a subshell",
+			"( set -e; trap 'time eval \"{ false; } 2>/dev/null\"' EXIT; f() { eval false; }; f ); \
+			 echo w=$?",
+			"report\nw=1\n",
+			0,
+		),
+		(
+			"exit",
+			"trap 'set -e; time eval \"{ false; } 2>/dev/null\"' EXIT; f() { exit 3; }; f",
+			"",
+			1,
+		),
+		(
+			"the trap calls a function",
+			"set -e; trap 'g' EXIT; g() { time eval '{ false; } 2>/dev/null'; }; f() { false; }; f",
+			"",
+			1,
+		),
+		(
+			"subshell",
+			"( set -e; trap 'time eval \"{ false; } 2>e1\"' EXIT; f() { false; }; f ); echo w=$?; \
+			 echo e1:; cat e1",
+			"w=1\ne1:\nreport\n",
+			0,
+		),
+		(
+			"no function",
+			"set -e; trap 'time eval \"{ false; } 2>/dev/null\"' EXIT; false",
+			"report\n",
+			1,
+		),
+	]);
+	assert_rows_by_mode(&[
+		(
+			"posix",
+			"set -o posix; set -e; trap 'time eval \"{ false; } 2>/dev/null\"' EXIT; f() { false; }; \
+			 f",
+			("report\n", 1),
+			("", 1),
+		),
+		(
+			"an eval, the shell",
+			"set -e; trap 'time eval \"{ false; } 2>/dev/null\"' EXIT; f() { eval false; }; f",
+			("", 1),
+			("report\n", 1),
+		),
+	]);
+}
+
+/// `break` or `continue` with a count that is not a number runs bash's
+/// `top_level_cleanup` before it leaves the shell: every redirection is
+/// undone, and a `time` started inside the `-c` string or an `eval` loses
+/// its catch, so only a script's own `time`s report, on the shell's stderr.
+#[test]
+fn break_with_a_bad_count_cleans_up_first() {
+	const MSG: &str = "SH: break: x: numeric argument required\n";
+	assert_rows(&[(
+		"in eval",
+		"( for i in 1; do eval 'time { break x; } 2>e1'; done ); echo w=$?; echo e1:; cat e1",
+		"w=2\ne1:\nSH: break: x: numeric argument required\n",
+		0,
+	)]);
+	let c = format!("w=2\ne1:\n{MSG}");
+	let s = format!("report\nw=2\ne1:\n{MSG}");
+	assert_rows_by_mode(&[
+		(
+			"group",
+			"( for i in 1; do time { break x; } 2>e1; done ); echo w=$?; echo e1:; cat e1",
+			(&c, 0),
+			(&s, 0),
+		),
+		(
+			"time eval, in a function",
+			"( f() { for i in 1; do time eval '{ break x; } 2>e1'; done; }; f ); echo w=$?; echo \
+			 e1:; cat e1",
+			(&c, 0),
+			(&s, 0),
+		),
+		("the shell", "for i in 1; do time { break x; } 2>e1; done", ("", 2), ("report\n", 2)),
+		(
+			"continue",
+			"( for i in 1; do time eval '{ continue x; } 2>e1'; done ); echo w=$?; echo e1:; cat e1",
+			("w=2\ne1:\nSH: continue: x: numeric argument required\n", 0),
+			("report\nw=2\ne1:\nSH: continue: x: numeric argument required\n", 0),
+		),
+	]);
+}
+
+/// A posix shell leaves on a special builtin's error by bash's `ERREXIT`
+/// (`execute_cmd.c`, lines 1005 and 4872): under `set -e` in a function the
+/// innermost `eval` keeps its redirections, so the report and the EXIT trap
+/// go into them; without `set -e` every level undoes.
+#[test]
+fn a_posix_special_builtins_error_is_errexit() {
+	const MISSING: &str = "SH: missing: No such file or directory\n";
+	let kept = format!("w=1\ne1:\n{MISSING}report\n");
+	let undone = format!("report\nw=1\ne1:\n{MISSING}");
+	let trapped = format!("w=1\ne1:\n{MISSING}report\nT\n");
+	assert_rows(&[
+		(
+			"set -e",
+			"( set -o posix; set -e; f() { time eval '{ : <missing; } 2>e1'; }; f ); echo w=$?; echo \
+			 e1:; cat e1",
+			&kept,
+			0,
+		),
+		(
+			"set -e, EXIT trap",
+			"( set -o posix; set -e; trap 'echo T >&2' EXIT; f() { time eval '{ : <missing; } 2>e1'; \
+			 }; f ); echo w=$?; echo e1:; cat e1",
+			&trapped,
+			0,
+		),
+		(
+			"set -e, a usage error",
+			"( set -o posix; set -e; f() { time eval '{ shift 9; } 2>e1'; }; f ); echo w=$?; echo \
+			 e1:; cat e1",
+			"w=1\ne1:\nSH: shift: 9: shift count out of range\nreport\n",
+			0,
+		),
+		(
+			"no set -e",
+			"( set -o posix; f() { time eval '{ : <missing; } 2>e1'; }; f ); echo w=$?; echo e1:; \
+			 cat e1",
+			&undone,
+			0,
+		),
+		(
+			"no set -e, a usage error",
+			"( set -o posix; f() { time eval '{ shift 9; } 2>e1'; }; f ); echo w=$?; echo e1:; cat e1",
+			"report\nw=1\ne1:\nSH: shift: 9: shift count out of range\n",
+			0,
+		),
+		(
+			"set -e, an inner eval",
+			"( set -o posix; set -e; f() { time eval '{ eval \": <missing\"; } 2>e1'; }; f ); echo \
+			 w=$?; echo e1:; cat e1",
+			&undone,
+			0,
+		),
+		(
+			"set -e, no function",
+			"( set -o posix; set -e; time eval '{ : <missing; } 2>e1' ); echo w=$?; echo e1:; cat e1",
+			&undone,
+			0,
+		),
+	]);
+}
+
+/// Under `set -e` bash's `report_error` (a readonly variable assigned, an
+/// unbound one, `${x:?}`, a bad array subscript, an invalid variable name, a
+/// `failglob` miss) exits the shell itself: no jump, so no `time` reports.
+/// In an assignment, a posix special builtin's assignment, `let`, `(( ))`,
+/// `read`, `printf -v`, `export`, an expansion, in a condition and in a
+/// function called there; the status is `$?`, or 1. Not without `set -e`,
+/// not inside an `eval` a condition runs (bash turns the flag off there),
+/// and not for `declare`'s own message.
+#[test]
+fn report_error_under_set_e_leaves_without_a_report() {
+	const RO: &str = "w=1\ne1:\nSH: r: readonly variable\n";
+	const TAIL: &str = "; } 2>e1; echo after ); echo w=$?; echo e1:; cat e1";
+	let ro = |body: &str| format!("( set -e; readonly r=1; time {{ {body}{TAIL}");
+	let rows = [
+		("assignment", ro("r=2"), RO),
+		("let", ro("let r=2"), RO),
+		("(( ))", ro("(( r=2 ))"), RO),
+		("read", ro("read r <<< x"), RO),
+		("printf -v", ro("printf -v r x"), RO),
+		("export", ro("export r=2"), RO),
+		("in a condition", ro("r=2 || echo no"), RO),
+		(
+			"in a function in a condition",
+			format!("( set -e; readonly r=1; f() {{ r=2; }}; time {{ f || echo no{TAIL}"),
+			RO,
+		),
+		(
+			"parameter error",
+			format!("( set -e; time {{ echo ${{x:?u}}{TAIL}"),
+			"w=1\ne1:\nSH: x: u\n",
+		),
+		(
+			"unbound",
+			format!("( set -eu; time {{ echo $u{TAIL}"),
+			"w=1\ne1:\nSH: u: unbound variable\n",
+		),
+		(
+			"bad subscript",
+			format!("( set -e; time {{ b[]=x{TAIL}"),
+			"w=1\ne1:\nSH: b[]: bad array subscript\n",
+		),
+		(
+			"invalid variable name",
+			format!("( set -e; x=; time {{ echo ${{!x}}{TAIL}"),
+			"w=1\ne1:\nSH: : invalid variable name\n",
+		),
+		(
+			"failglob",
+			format!("( set -e; shopt -s failglob; time {{ echo /nonexist*{TAIL}"),
+			"w=1\ne1:\nSH: no match: /nonexist*\n",
+		),
+		(
+			"eval in a condition",
+			format!("( set -eu; time {{ eval 'echo $u' || echo no{TAIL}"),
+			"w=1\ne1:\nSH: u: unbound variable\nreport\n",
+		),
+		("declare", ro("declare r=2"), "w=1\ne1:\nSH: declare: r: readonly variable\nreport\n"),
+	];
+	let rows: Vec<_> = rows
+		.iter()
+		.map(|(n, s, w)| (*n, s.as_str(), *w, 0))
+		.collect();
+	assert_rows(&rows);
+	assert_rows(&[
+		(
+			"posix special builtin",
+			"( set -o posix; set -e; f() { time eval '{ readonly r=1; r=2 :; } 2>e1'; }; f ); echo \
+			 w=$?; echo e1:; cat e1",
+			RO,
+			0,
+		),
+		(
+			"EXIT trap",
+			"( set -e; trap 'echo T >&2' EXIT; f() { time eval '{ readonly r=1; r=2; } 2>/dev/null'; \
+			 }; f ); echo w=$?",
+			"w=1\n",
+			0,
+		),
+		("the shell", "set -e; readonly r=1; time { r=2; } 2>/dev/null; echo after", "", 1),
+		(
+			"status",
+			"( set -e; false || readonly r=1; (exit 5) || r=2; echo after ); echo w=$?",
+			"SH: r: readonly variable\nw=5\n",
+			0,
+		),
+	]);
+	assert_rows_by_mode(&[(
+		"no set -e",
+		"( readonly r=1; time { r=2; } 2>e1; echo after ); echo w=$?; echo e1:; cat e1",
+		("w=1\ne1:\nSH: r: readonly variable\nreport\n", 0),
+		("report\nw=1\ne1:\nSH: r: readonly variable\n", 0),
+	)]);
+}
+
+/// A subshell forked inside a function runs in the function's context (the
+/// scope, not the subshell's own frames), and counts only its own EXIT trap,
+/// not its parent's, set or ignored.
+#[test]
+fn a_subshell_of_a_function_and_its_own_exit_trap() {
+	assert_rows(&[
+		(
+			"set -e",
+			"f() { ( set -e; time eval '{ false; } 2>/dev/null' ); }; f; echo w=$?",
+			"w=1\n",
+			0,
+		),
+		(
+			"set -e, two evals",
+			"f() { ( set -e; time eval 'eval \"{ false; } 2>e2\"' ); }; f; echo w=$?; echo e2:; cat \
+			 e2",
+			"w=1\ne2:\nreport\n",
+			0,
+		),
+		(
+			"the parent's EXIT trap",
+			"trap 'echo T >&2' EXIT; f() { ( time eval '{ exit 3; } 2>/dev/null' ); }; f; echo w=$?; \
+			 trap - EXIT",
+			"report\nw=3\n",
+			0,
+		),
+		(
+			"the parent's EXIT trap, ignored",
+			"trap '' EXIT; f() { ( time eval '{ exit 3; } 2>e1' ); }; f; echo w=$?; trap - EXIT; \
+			 echo e1:; cat e1",
+			"report\nw=3\ne1:\n",
+			0,
+		),
+	]);
+}

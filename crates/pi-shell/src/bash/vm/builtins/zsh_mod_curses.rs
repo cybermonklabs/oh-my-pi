@@ -32,6 +32,7 @@ use crate::bash::{
 	FdRef, OsHandle, SetWhen, TermFlag, Termios,
 	event::WaitKey,
 	vm::{
+		exec::Jump,
 		expand::Expander,
 		proc::{Probe, ProbeResult, Vproc},
 		zsh::{
@@ -523,7 +524,7 @@ fn init(ctx: &mut Ctx<'_, '_>) -> R {
 		.unwrap_or_else(|| "unknown".into());
 	let Some(ti) = terminfo(ctx, &term)? else {
 		ctx.out_fd(2, format!("Error opening terminal: {term}.\n").as_bytes());
-		return Ok(Outcome { status: 1, control: Control::Exit });
+		return Ok(Outcome { status: 1, control: Control::Exit(Jump::Other) });
 	};
 	let saved = get_tty(ctx);
 	let size = tty_handle(ctx).and_then(|h| ctx.cx.host.terminal()?.size(h).ok());

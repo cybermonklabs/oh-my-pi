@@ -1156,7 +1156,7 @@ pub fn define_function(
 	if let Some(d) = rejected {
 		k.diag(cx, vp, line, d);
 		if posix {
-			return Flow::Exit(2);
+			return Flow::Exit(2, exec::Jump::Other);
 		}
 		vp.status = 1;
 		return Flow::Next;

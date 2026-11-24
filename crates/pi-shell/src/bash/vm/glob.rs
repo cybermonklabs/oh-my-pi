@@ -864,7 +864,14 @@ fn expand_globs_with<T>(
 			&& failglob
 			&& let Some(item) = items.get(i)
 		{
-			k.diag(cx, vp, line, Diag::NoMatch { pattern: BString::from(word(item)) });
+			let d = Diag::NoMatch { pattern: BString::from(word(item)) };
+			// Under `set -e` bash's `report_error` exits the shell itself.
+			if exec::report_error_exits(k, cx, vp, &d) {
+				let status = exec::report_error_status(vp, &d);
+				k.diag(cx, vp, line, d);
+				return Err(Flow::Exit(status, exec::Jump::Direct));
+			}
+			k.diag(cx, vp, line, d);
 			let flow = Flow::Discard(1);
 			exec::jump_out(k, cx, vp, false, &flow);
 			return Err(flow);

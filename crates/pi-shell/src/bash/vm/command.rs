@@ -299,8 +299,9 @@ pub fn exec(
 							let s = st(vp);
 							s.status = 1;
 							s.stage = Stage::Finish;
+							// bash's `ERREXIT` (execute_cmd.c:4872).
 							if fatal {
-								s.control = Some(Transfer::Exit(1));
+								s.control = Some(Transfer::Exit(1, exec::Jump::Errexit));
 							}
 							// The message goes to stderr as the redirections so far
 							// left it (`2>&1 >&bad`), before they are undone.
@@ -466,13 +467,20 @@ fn assignment_statement(
 /// A failed assignment statement: bash reports it and abandons the rest of
 /// the command line; a posix shell exits ([`exec::jump_out`]: an
 /// arithmetic subscript error's jump comes after `top_level_cleanup`).
+/// Under `set -e` a readonly variable or a bad subscript exits at once
+/// ([`exec::report_error_exits`]).
 fn assign_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: Diag) -> Flow {
+	if exec::report_error_exits(k, cx, vp, &d) {
+		let status = exec::report_error_status(vp, &d);
+		k.diag(cx, vp, line, d);
+		return Flow::Exit(status, exec::Jump::Direct);
+	}
 	let cleanup = exec::cleanup_jump(vp, &d);
 	k.diag(cx, vp, line, d);
 	let flow = if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 		.unwrap_or(false)
 	{
-		Flow::Exit(1)
+		Flow::Exit(1, exec::Jump::Other)
 	} else {
 		Flow::Discard(1)
 	};
@@ -912,11 +920,17 @@ fn expand(
 			{
 				let mut shown = a.name.clone();
 				shown.extend_from_slice(b"[]");
-				k.diag(cx, vp, line, Diag::BadSubscript { shown });
+				let d = Diag::BadSubscript { shown };
+				if exec::report_error_exits(k, cx, vp, &d) {
+					let status = exec::report_error_status(vp, &d);
+					k.diag(cx, vp, line, d);
+					return Some(Flow::Exit(status, exec::Jump::Direct));
+				}
+				k.diag(cx, vp, line, d);
 				if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 					.unwrap_or(false)
 				{
-					return Some(Flow::Exit(1));
+					return Some(Flow::Exit(1, exec::Jump::Other));
 				}
 				return Some(Flow::Discard(1));
 			}
@@ -1006,8 +1020,16 @@ fn expand(
 			if readonly {
 				// bash reports it and runs the command without the
 				// assignment; in posix mode the command does not run, and a
-				// special builtin's assignment error ends the shell.
-				k.diag(cx, vp, line, Diag::Readonly { name: name.clone() });
+				// special builtin's assignment error ends the shell. Under
+				// `set -e` the message itself exits the shell
+				// ([`exec::report_error_exits`]).
+				let d = Diag::Readonly { name: name.clone() };
+				if exec::report_error_exits(k, cx, vp, &d) {
+					let status = exec::report_error_status(vp, &d);
+					k.diag(cx, vp, line, d);
+					return Some(Flow::Exit(status, exec::Jump::Direct));
+				}
+				k.diag(cx, vp, line, d);
 				// zsh: an error (`errflag`); the command does not run.
 				if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 					return Some(Flow::Discard(1));
@@ -1016,7 +1038,7 @@ fn expand(
 					.unwrap_or(false)
 				{
 					if IntrinsicId::from_name(&st(vp).argv[0]).is_some_and(is_special) {
-						return Some(Flow::Exit(1));
+						return Some(Flow::Exit(1, exec::Jump::Other));
 					}
 					let s = st(vp);
 					s.status = 1;
@@ -3616,7 +3638,7 @@ pub fn call_anon(
 		exec::clear_scratch(&mut k.root, cx.store, vp);
 		vp.status = status;
 		if let Some(pending) = exec::zsh_exit_pending(vp) {
-			return Flow::Exit(pending);
+			return Flow::Exit(pending, exec::Jump::Other);
 		}
 		if status != 0 {
 			print_exit_value(k, vp, cx, status);
@@ -3962,17 +3984,18 @@ fn settle_builtin(
 	id: IntrinsicId,
 	mut sc: Box<Scratch>,
 	mut outcome: builtins::Outcome,
-	chunks: Vec<Chunk>,
+	mut chunks: Vec<Chunk>,
 	fatal: bool,
 ) -> Option<Flow> {
-	// A special builtin's usage error ends a posix shell.
+	// A special builtin's usage error ends a posix shell: bash's `ERREXIT`
+	// (execute_cmd.c:1005).
 	if fatal
 		&& outcome.status != 0
 		&& is_special(id)
 		&& matches!(outcome.control, Control::None | Control::Return)
 		&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false)
 	{
-		outcome.control = Control::Exit;
+		outcome.control = Control::Exit(exec::Jump::Errexit);
 	}
 	// zsh `execcmd`'s `fatal:`: under `posixbuiltins` an error
 	// (`errflag`) of a `BINF_PSPECIAL` builtin exits a
@@ -3988,8 +4011,26 @@ fn settle_builtin(
 		} else if !state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Interactive).unwrap_or(false)
 		{
 			outcome.status = 1;
-			outcome.control = Control::Exit;
+			outcome.control = Control::Exit(exec::Jump::Other);
 		}
+	}
+	// A message the builtin prints bare (`let`, `read`, `printf -v`,
+	// `export` on a readonly variable) is bash's `report_error`: under
+	// `set -e` the shell exits where it is printed
+	// ([`exec::report_error_exits`]), and what would follow it never comes.
+	// `declare`'s bare one (a compound assignment) is not: bash 5.3 fails
+	// the builtin, and `set -e` exits after it.
+	if !matches!(outcome.control, Control::Frame | Control::Resume | Control::Wait(_))
+		&& !matches!(id, IntrinsicId::Declare | IntrinsicId::Typeset | IntrinsicId::Local)
+		&& let Some(at) = chunks
+			.iter()
+			.position(|c| matches!(c, Chunk::Diag(d) if exec::report_error_exits(k, cx, vp, d)))
+	{
+		if let Chunk::Diag(d) = &chunks[at] {
+			outcome.status = exec::report_error_status(vp, d);
+		}
+		outcome.control = Control::Exit(exec::Jump::Direct);
+		chunks.truncate(at + 1);
 	}
 	for c in chunks {
 		let (fd, bytes) = match c {
@@ -4051,8 +4092,8 @@ fn settle_builtin(
 			e.stage = Stage::Output;
 			None
 		},
-		Control::Exit => {
-			e.control = Some(Transfer::Exit(outcome.status));
+		Control::Exit(jump) => {
+			e.control = Some(Transfer::Exit(outcome.status, jump));
 			e.stage = Stage::Output;
 			None
 		},
@@ -4367,7 +4408,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			if vp.zsh.is_some()
 				&& let Some(pending) = exec::zsh_exit_pending(vp)
 			{
-				st(vp).control = Some(Transfer::Exit(pending));
+				st(vp).control = Some(Transfer::Exit(pending, exec::Jump::Other));
 			}
 			status
 		},
@@ -4615,7 +4656,8 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 						// The virtual SIGPIPE ends this shell silently, as it ends
 						// a bash pipeline child.
 						let platform = k.engine.config().platform;
-						return Some(Flow::Exit(crate::bash::signal::Signal::Pipe.exit_status(platform)));
+						let status = crate::bash::signal::Signal::Pipe.exit_status(platform);
+						return Some(Flow::Exit(status, exec::Jump::Other));
 					}
 					if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 						zsh_write_error(k, vp, cx, line, fd, &err);
@@ -4701,8 +4743,6 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = st(vp);
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
-	let exit_builtin =
-		matches!(e.target, Some(Target::Intrinsic(IntrinsicId::Exit | IntrinsicId::Logout)));
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
@@ -4717,14 +4757,9 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	// `exit` jumps while its own redirections are in effect: bash's
 	// `time_command` reports through them (`time exit 3 2>/dev/null` prints
 	// nothing), so the report goes out before they are undone below. A
-	// `break` with a non-numeric count leaves the shell too (bash's
-	// `EXITPROG`, not the `exit` builtin's `EXITBLTIN`).
-	if matches!(control, Some(Transfer::Exit(_))) {
-		let jump = if exit_builtin {
-			exec::Jump::Exit
-		} else {
-			exec::Jump::Other
-		};
+	// `break` with a non-numeric count runs bash's `top_level_cleanup` first
+	// ([`exec::Jump::Cleanup`]).
+	if let Some(Transfer::Exit(_, jump)) = control {
 		exec::report_jump(k, vp, cx, 0, jump);
 	}
 	let sc = vp
@@ -4743,7 +4778,7 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		None => Flow::Next,
 		Some(Transfer::Return(n)) => Flow::Return(n),
 		Some(Transfer::Break { n, cont }) => Flow::Break { n, cont },
-		Some(Transfer::Exit(n)) => Flow::Exit(n),
+		Some(Transfer::Exit(n, jump)) => Flow::Exit(n, jump),
 		Some(Transfer::DiscardAll(n)) => {
 			let command = matches!(
 				state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
@@ -4775,7 +4810,7 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 			// The program replaced the shell (or `exec` failed and the shell
 			// exits): bash's `time` around it never reports.
 			exec::drop_times(vp);
-			Flow::Exit(status)
+			Flow::Exit(status, exec::Jump::Other)
 		},
 	}
 }

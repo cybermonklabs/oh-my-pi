@@ -328,6 +328,11 @@ impl OwnTraps {
 			_ => Self { pseudo: self.pseudo | Self::bit(key), signals: self.signals },
 		}
 	}
+
+	/// The set without `key`, a pseudo-signal (a signal key is kept).
+	pub const fn without(self, key: crate::bash::store::TrapKey) -> Self {
+		Self { pseudo: self.pseudo & !Self::bit(key), signals: self.signals }
+	}
 }
 
 /// `getopts` progress between calls (bash's `sh_optind`, `sh_curopt` and
@@ -898,13 +903,18 @@ pub enum ScriptKind {
 	Hook,
 	/// A trap action, restoring the interrupted status when it finishes.
 	Trap {
-		key:           crate::bash::store::TrapKey,
-		status:        i32,
-		cancel:        Option<i32>,
-		return_target: Option<usize>,
-		/// An ERR trap run by `set -e`: the shell exits with `status` when
-		/// the trap ends.
-		exit:          bool,
+		key:               crate::bash::store::TrapKey,
+		status:            i32,
+		cancel:            Option<i32>,
+		return_target:     Option<usize>,
+		/// An ERR trap run by `set -e`, or an EXIT trap `exit_shell`
+		/// started: the shell exits with `status` when the trap ends.
+		exit:              bool,
+		/// An EXIT trap started after `set -e` left a function where bash's
+		/// `reset_local_contexts` ran first (the `-c` string's or an `eval`'s
+		/// `parse_and_execute`, a script's `reader_loop` outside posix
+		/// mode): its jumps see no function context until it calls one.
+		outside_functions: bool,
 	},
 	/// Shell code a builtin runs as zsh's `execode`/`execstring` do with
 	/// a context name (`zstyle -e` values, `zregexparse` guards and
@@ -1563,7 +1573,9 @@ pub enum Transfer {
 		n:    u32,
 		cont: bool,
 	},
-	Exit(i32),
+	/// The shell exits with this status by this jump (it decides what the
+	/// `time`s the jump leaves report).
+	Exit(i32, super::exec::Jump),
 	/// The rest of the line is abandoned with this status (a `-c` string
 	/// whole).
 	DiscardAll(i32),
