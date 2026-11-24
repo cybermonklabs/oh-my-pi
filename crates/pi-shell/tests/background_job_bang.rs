@@ -485,6 +485,20 @@ async fn a_wrapped_jobs_bang_names_what_bash_names() {
 	assert_bash_outputs(&rows).await;
 }
 
+/// A job whose command's words hold a command substitution, lone or as a
+/// group's `exec`, is known by its program's pid, as in bash: `ir` lowers
+/// the substitution's body ahead of the command, behind a jump, and `$!`
+/// named another process (bash 5.3.20 and 5.2.21 print `program`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_whose_words_hold_a_substitution_is_known_by_its_program() {
+	let rows = [
+		(pid_row(r#"PROG "$(true)""#), "program\nst=143\n"),
+		(pid_row(r#"{ exec PROG "$(true)"; }"#), "program\nst=143\n"),
+	];
+	let rows: Vec<(&str, &str)> = rows.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+	assert_bash_outputs(&rows).await;
+}
+
 /// `$!` names a live process, as bash's does, by the check a pid file or
 /// `ps -p` makes ([`alive_row`]): a job whose `eval`, `.` or `source` text
 /// runs the program (bash names its subshell, which lives as long; this

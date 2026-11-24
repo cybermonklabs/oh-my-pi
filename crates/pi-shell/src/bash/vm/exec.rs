@@ -247,7 +247,8 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				.nth(done);
 			if let Some((i, entry)) = next {
 				vp.frames[fi].debug_pc = Some(SPAWN_DEBUG - u32::try_from(i + 1).unwrap_or(MAX_STAGES));
-				let stage_op = unit.ops[entry as usize];
+				// The stage's `Exec`, past its words' substitution bodies.
+				let stage_op = unit.ops[skip_blocks(unit, entry) as usize];
 				note_command(vp, unit, stage_op);
 				let line = line_of(vp, stage_op.node);
 				if start_trap(k, vp, cx, TrapKey::Debug) {
@@ -5064,22 +5065,25 @@ fn async_element_subshell(unit: &Unit, at: u32) -> bool {
 /// ([`BangStage::Lone`]), a group that `exec`s one (`{ exec cmd; }`,
 /// [`BangStage::Exec`]), or a pipeline, whose last stage decides
 /// ([`BangStage::Pipeline`], [`retarget_bang`]). Any other compound job
-/// keeps its virtual pid at once: its readers never wait.
+/// keeps its virtual pid at once: its readers never wait. The command's
+/// words' substitution bodies come before its `Exec` ([`skip_blocks`]).
 fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
-	if simple_body(unit, entry) {
+	if simple_body(unit, skip_blocks(unit, entry)) {
 		return Some(BangStage::Lone);
 	}
 	if body_pipeline(unit, entry).is_some() {
 		return Some(BangStage::Pipeline);
 	}
-	let group = [Opcode::Enter, Opcode::Exec, Opcode::Leave, Opcode::SubExit]
-		.iter()
-		.zip(entry..)
-		.all(|(&want, at)| code(at) == Some(want));
+	let at = skip_blocks(unit, entry + 1);
+	let group = code(entry) == Some(Opcode::Enter)
+		&& [Opcode::Exec, Opcode::Leave, Opcode::SubExit]
+			.iter()
+			.zip(at..)
+			.all(|(&want, at)| code(at) == Some(want));
 	let exec = unit
 		.ops
-		.get(entry as usize + 1)
+		.get(at as usize)
 		.and_then(|op| unit.cmds.get(op.a as usize))
 		.and_then(|cmd| unit.lists.get(cmd.words as usize))
 		.and_then(|words| words.first())
@@ -5098,14 +5102,16 @@ fn simple_body(unit: &Unit, entry: u32) -> bool {
 }
 
 /// A background job's body that is one simple command, maybe negated
-/// (`cmd &`, `! cmd &`): an `Exec`, `[Not]`, then the job's end. bash runs
-/// its DEBUG trap in the shell before it forks.
+/// (`cmd &`, `! cmd &`): past its words' substitution bodies
+/// ([`skip_blocks`]), an `Exec`, `[Not]`, then the job's end. bash runs its
+/// DEBUG trap in the shell before it forks.
 fn lone_simple(unit: &Unit, entry: u32) -> bool {
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
-	code(entry) == Some(Opcode::Exec)
-		&& match code(entry + 1) {
+	let at = skip_blocks(unit, entry);
+	code(at) == Some(Opcode::Exec)
+		&& match code(at + 1) {
 			Some(Opcode::SubExit) => true,
-			Some(Opcode::Not) => code(entry + 2) == Some(Opcode::SubExit),
+			Some(Opcode::Not) => code(at + 2) == Some(Opcode::SubExit),
 			_ => false,
 		}
 }
@@ -5143,14 +5149,16 @@ fn body_pipeline(unit: &Unit, entry: u32) -> Option<usize> {
 /// `extdebug`): a background job's lone command (`cmd &`, `! cmd &`), or
 /// each simple stage of a pipeline, also of the pipeline a background job
 /// is. bash forks a `time`d job first (`time a | b &`), and the job runs
-/// those traps itself under `set -T`, as a `time`d pipeline in it does.
+/// those traps itself under `set -T`, as a `time`d pipeline in it does. A
+/// stage's words' substitution bodies come before its `Exec`
+/// ([`skip_blocks`]), whose command the trap is for.
 fn debug_stage_entries(unit: &Unit, op: Op) -> (Vec<u32>, bool) {
 	let simple = |spawn: usize| -> Vec<u32> {
 		unit.spawns[spawn]
 			.stages
 			.iter()
 			.map(|s| s.entry)
-			.filter(|&entry| simple_body(unit, entry))
+			.filter(|&entry| simple_body(unit, skip_blocks(unit, entry)))
 			.collect()
 	};
 	let info = &unit.spawns[op.a as usize];
@@ -5204,15 +5212,20 @@ fn shell_ran_stage_traps(k: &Kernel, vp: &Vproc, unit: &Unit, op: Op, pc: u32) -
 }
 
 /// The shell ran the DEBUG trap of the simple command a child starts with
-/// at `entry` ([`shell_debug_stages`]): the child does not run it again.
-/// In zsh mode the mark is never read: only bash's trap points (a command,
-/// a `Spawn`) compare `debug_pc` with an `Exec`'s pc, and zsh's trap runs
-/// at its list markers (`Nop`), which `lone_simple`'s `entry` never is.
+/// at `entry` ([`shell_debug_stages`]): the child does not run it again at
+/// its `Exec`. It starts there, past the jumps over its words' substitution
+/// bodies ([`skip_blocks`]), which do nothing else and would drop the mark
+/// (any op that goes on does). In zsh mode the mark is never read: only
+/// bash's trap points (a command, a `Spawn`) compare `debug_pc` with an
+/// `Exec`'s pc, and zsh's trap runs at its list markers (`Nop`), which
+/// `lone_simple`'s `entry` never is.
 fn mark_debug_done(unit: &Unit, frames: &mut [Frame], entry: u32) {
 	if lone_simple(unit, entry)
 		&& let Some(frame) = frames.last_mut()
 	{
-		frame.debug_pc = Some(entry);
+		let exec = skip_blocks(unit, entry);
+		frame.pc = exec;
+		frame.debug_pc = Some(exec);
 	}
 }
 
@@ -5433,8 +5446,12 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						sc.children = children.into_iter().map(|v| (v, None)).collect();
 						sc.inline = Some(InlineStage::Running);
 						let mut frame = Frame::new(Some(Arc::clone(unit)), stage.entry, FrameKind::Stage);
-						if unit.mode.dialect() == Dialect::Bash && simple_body(unit, stage.entry) {
-							frame.debug_pc = Some(stage.entry);
+						// As [`mark_debug_done`]: at its `Exec`, past the jumps
+						// over its words' substitution bodies.
+						let exec = skip_blocks(unit, stage.entry);
+						if unit.mode.dialect() == Dialect::Bash && simple_body(unit, exec) {
+							frame.pc = exec;
+							frame.debug_pc = Some(exec);
 						}
 						frame.line_shift = line_shift;
 						let prev = vp.fds.get(0).cloned();
