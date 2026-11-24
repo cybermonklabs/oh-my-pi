@@ -749,6 +749,37 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 			assert_eq!(masked(&obash_in().go()), masked(&theirs), "stdin: {script:?}");
 		}
 	}
+	// A job this shell's `kill` ended while it was stopped gets no notice:
+	// obash reported one, naming the job's vproc id for a `set -m` job stopped
+	// before it ran (the a6 rows of the bisect that found this). Checked with
+	// a next line left to read after the kill, and at the end of a script
+	// file. A job killed while running is still reported (the cases above).
+	//
+	// Pinned against the authoritative golden (bash 5.3.20 on runc, where it
+	// prints nothing) and NOT live-compared with the runner's bash, because
+	// bash is runtime-dependent here and the live comparison is an un-fixable
+	// flake: on gVisor bash reaps the job before the next-line read and
+	// reports it WITH A REAL PID, 1 to 2 runs in 3:
+	//   obash: `next`
+	//   bash : `NAME: line 2: PID Killed  /bin/sleep 20` then `next`
+	// obash never spawned the stopped-before-spawn job, so it has no pid to
+	// print; inventing one is the very defect this fixes, so obash is
+	// deterministically silent. `bash_keeps_finished_jobs_while_the_job_list_
+	// is_frozen` and `bash_keeps_a_waited_status_and_deletes_a_reported_job_
+	// after_the_freeze` are the same class, accepted since round 3.
+	let stopped = "set -m; /bin/sleep 20 & kill -STOP %1; /bin/sleep 0.3; kill -KILL %1";
+	let cstr = format!("exec 2>&1; {stopped}\necho next");
+	let ours = Run::script(env!("CARGO_BIN_EXE_obash"), "bash", &cstr).go();
+	let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+	if got != ("next\n".to_string(), Some(Exit(0))) {
+		wrong.push(format!("-c {cstr:?}\n  got:  {got:?}\n  want: \"next\\n\""));
+	}
+	fs::write(&path, format!("exec 2>&1; {stopped}\n")).expect("write the script");
+	let ours = obash().go();
+	let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+	if got != (String::new(), Some(Exit(0))) {
+		wrong.push(format!("file stopped-kill\n  got:  {got:?}\n  want: \"\""));
+	}
 	// A substitution and `jobs` in a script file.
 	for (script, line, out) in [
 		(format!("{w}; x=$(echo in); echo \"$x\""), 2, "in\n"),
@@ -1817,42 +1848,68 @@ fn job_row(row: &str) -> String {
 /// (bash `notify_of_job_status`: `pretty_print_job` with `JLIST_STANDARD`,
 /// a newline first for a stop): how the job ended, never read from its
 /// status alone, so a job that exited with 137 is `Exit 137`, and only a
-/// signal seen to end it is named (`Killed`). Three shells: `^Z` stops a
+/// signal seen to end it is named (`Killed`). Five shells: `^Z` stops a
 /// foreground program (typed once the job holds the terminal; where the
 /// terminal's group cannot be read, the `TSTP` goes to the job's group,
 /// [`pty_support::Pty::signal_job`]); a background program exits with 137
-/// once the file `$F` exists; `kill -KILL` ends a background program. The
-/// next command waits until `jobs -r` lists no job, so the notice comes
-/// before the prompt after it. The rows from the first command on are
+/// once the file `$F` exists; `kill -KILL` ends a background program; two
+/// background programs end before the same prompt (each notice keeps the
+/// job's mark, `[1]-` and `[2]+`); a job started in `$F.d` ends after
+/// `cd ..` (`(wd: …)` after its command, then `(wd now: …)`). The next
+/// command waits until `jobs -r` lists no job, so the notices come before
+/// the prompt after it. The rows from the first command on are
 /// compared ([`job_row`]) with the goldens, which follow bash 5.3's
 /// `jobs.c`, and live with a bash 5.3 or later ([`real_bash_golden`]).
 #[test]
 fn an_interactive_bash_announces_a_job_as_jobs_lists_it() -> io::Result<()> {
 	let wait = "while jobs -r >\"$F.r\"; [ -s \"$F.r\" ]; do /bin/sleep 0.01; done";
 	let exits = "/bin/sh -c 'until [ -e \"$F\" ]; do /bin/sleep 0.01; done; exit 137'";
-	let line = |status: &str, text: &str| format!("[1]+  {status:<27}{text}");
+	let ends = "/bin/sh -c 'until [ -e \"$F\" ]; do /bin/sleep 0.01; done'";
+	let exit3 = "/bin/sh -c 'until [ -e \"$F\" ]; do /bin/sleep 0.01; done; exit 3'";
+	let line = |job: &str, status: &str, text: &str| format!("[{job}  {status:<27}{text}");
 	let killed = desc(libc::SIGKILL);
-	let stop = vec![String::new(), line("Stopped", "/bin/sleep 30"), String::from("P$")];
+	let stop = vec![String::new(), line("1]+", "Stopped", "/bin/sleep 30"), String::from("P$")];
 	let exit = vec![
 		String::from("[1] PID"),
 		format!("P$ {wait}"),
-		line("Exit 137", exits),
+		line("1]+", "Exit 137", exits),
 		String::from("P$"),
 	];
 	let kill_next = format!("kill -KILL %1; {wait}");
 	let kill = vec![
 		String::from("[1] PID"),
 		format!("P$ {kill_next}"),
-		line(&killed, "/bin/sleep 30"),
+		line("1]+", &killed, "/bin/sleep 30"),
+		String::from("P$"),
+	];
+	let two = vec![
+		String::from("[1] PID"),
+		String::from("[2] PID"),
+		format!("P$ {wait}"),
+		line("1]-", "Done", ends),
+		line("2]+", "Exit 3", exit3),
+		String::from("P$"),
+	];
+	// `{D}`: the test's directory.
+	let wd_next = format!("cd ..; {wait}");
+	let wd = vec![
+		String::from("[1] PID"),
+		format!("P$ {wd_next}"),
+		format!("{}  (wd: {{D}}/F.d)", line("1]+", "Done", ends)),
+		String::from("(wd now: {D})"),
 		String::from("P$"),
 	];
 	let exit_first = format!("{exits} &");
+	let two_first = format!("{ends} & {exit3} &");
+	let wd_first = format!("cd \"$F.d\"; {ends} &");
 	// Each shell's first command, the next one (none after the stop), and
 	// the rows after the first command's.
 	let cases = [
 		("/bin/sleep 30", None, stop),
 		(exit_first.as_str(), Some(wait), exit),
 		("/bin/sleep 30 &", Some(kill_next.as_str()), kill),
+		(two_first.as_str(), Some(wait), two),
+		(wd_first.as_str(), Some(wd_next.as_str()), wd),
 	];
 	for (first, next, want) in &cases {
 		let ours = Spawn::obash_as("bash");
@@ -1862,6 +1919,9 @@ fn an_interactive_bash_announces_a_job_as_jobs_lists_it() -> io::Result<()> {
 		for (who, spawn) in shells {
 			let dir = tempfile::tempdir()?;
 			let file = dir.path().join("F");
+			fs::create_dir(dir.path().join("F.d"))?;
+			let d = dir.path().to_string_lossy().into_owned();
+			let want: Vec<String> = want.iter().map(|row| row.replace("{D}", &d)).collect();
 			let mut shell = spawn
 				.size(50, 200)
 				.args(["--norc", "--noprofile", "-i"])
@@ -1892,7 +1952,79 @@ fn an_interactive_bash_announces_a_job_as_jobs_lists_it() -> io::Result<()> {
 				.map(job_row)
 				.collect();
 			shell.write("kill -KILL %1\r")?;
-			assert_eq!(&rows, want, "{who}: {first}: {:?}", shell.output());
+			assert_eq!(rows, want, "{who}: {first}: {:?}", shell.output());
+		}
+	}
+	Ok(())
+}
+
+/// `^Z` for the foreground job running `/bin/sleep`: typed once the job holds
+/// the terminal ([`pty_support::Pty::wait_job_running`]), else (where the
+/// terminal's group cannot be read) `TSTP` to the job's group
+/// ([`pty_support::Pty::signal_job`]).
+fn ctrl_z(shell: &mut pty_support::Pty) -> io::Result<()> {
+	if shell.wait_job_running(&["sleep"], TIMEOUT)? {
+		shell.write("\x1a")
+	} else {
+		shell.signal_job(&["sleep"], libc::SIGTSTP, TIMEOUT)
+	}
+}
+
+/// Two more notices of an interactive bash
+/// ([`an_interactive_bash_announces_a_job_as_jobs_lists_it`]): the job `fg`
+/// resumed, stopped again by `^Z` ([`ctrl_z`]), gets bash's stop line as
+/// the first stop did (a blank row, then `[1]+  Stopped …`); under `set -b`
+/// a background job's end is announced at once with bash's line (bash
+/// writes it into the line being typed, obash on a row of its own, so only
+/// the line is looked for). Compared with the goldens and live with a bash
+/// 5.3 or later ([`real_bash_golden`]).
+#[test]
+fn an_interactive_bash_announces_a_stop_after_fg_and_an_end_under_set_b() -> io::Result<()> {
+	let exits = "/bin/sh -c 'until [ -e \"$F\" ]; do /bin/sleep 0.01; done; exit 137'";
+	let stopped = format!("[1]+  {:<27}/bin/sleep 30", "Stopped");
+	let ended = format!("[1]+  {:<27}{exits}", "Exit 137");
+	let spawns = || {
+		let ours = Spawn::obash_as("bash");
+		let real = real_bash_golden().map(|bash| Spawn::new(bash).argv0("bash"));
+		std::iter::once(("obash", ours)).chain(real.map(|spawn| ("the real shell", spawn)))
+	};
+	for set_b in [false, true] {
+		for (who, spawn) in spawns() {
+			let dir = tempfile::tempdir()?;
+			let file = dir.path().join("F");
+			let mut shell = spawn
+				.size(50, 200)
+				.args(["--norc", "--noprofile", "-i"])
+				.env("F", &file)
+				.env("PS1", "P$ ")
+				.spawn()?;
+			let prompts = |screen: &str| screen.lines().filter(|row| row.starts_with("P$")).count();
+			shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 1)?;
+			if set_b {
+				shell.write("set -b\r")?;
+				shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 2)?;
+				shell.write(format!("{exits} &\r"))?;
+				shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 3)?;
+				fs::write(&file, "")?;
+				shell.wait_screen(TIMEOUT, |s| s.contents().contains(&ended))?;
+				continue;
+			}
+			shell.write("/bin/sleep 30\r")?;
+			ctrl_z(&mut shell)?;
+			shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 2)?;
+			shell.write("fg\r")?;
+			ctrl_z(&mut shell)?;
+			shell.wait_screen(TIMEOUT, |s| prompts(s.contents().as_str()) == 3)?;
+			let screen = shell.screen().contents();
+			let rows: Vec<String> = screen
+				.lines()
+				.skip_while(|row| *row != "P$ fg")
+				.skip(1)
+				.map(job_row)
+				.collect();
+			shell.write("kill -KILL %1\r")?;
+			let want = ["/bin/sleep 30", "", stopped.as_str(), "P$"];
+			assert_eq!(rows, want, "{who}: {:?}", shell.output());
 		}
 	}
 	Ok(())

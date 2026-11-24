@@ -1238,8 +1238,22 @@ pub fn notices_before_prompt(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 		.map(|j| j.number)
 		.collect();
 	let how = JobLine { pid: long_list(k, cx, vp), ..JobLine::default() };
+	if vp.mode.dialect() == Dialect::Zsh {
+		for number in changed {
+			report(k, cx, vp, number, platform, how);
+		}
+		return;
+	}
+	// bash reports every changed job (`notify_of_job_status`), then deletes
+	// the finished ones (`cleanup_dead_jobs`): each notice carries the marks
+	// the jobs had before any of them went.
+	for &number in &changed {
+		if let Some(line) = notice_line(k, cx, vp, number, how, platform) {
+			notice(k, vp, &line);
+		}
+	}
 	for number in changed {
-		report(k, cx, vp, number, platform, how);
+		settle_report(vp, number);
 	}
 }
 

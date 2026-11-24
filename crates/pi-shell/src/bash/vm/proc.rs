@@ -618,6 +618,7 @@ impl JobTable {
 			signal: None,
 			procs: None,
 			unreaped: false,
+			no_notice: false,
 		});
 		self.reset_current();
 		number

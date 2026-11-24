@@ -629,6 +629,13 @@ pub struct Job {
 	/// counts as reaped.
 	#[serde(skip)]
 	pub unreaped:  bool,
+	/// No killed-job notice: this shell's `kill` ended the job while it was
+	/// stopped, and bash prints none for such a job (`notify_of_job_status`
+	/// reports a job killed while it ran, not one killed while stopped), so
+	/// the killed-job notice code leaves it out. Set by that `kill`. Kept in
+	/// memory only.
+	#[serde(skip)]
+	pub no_notice: bool,
 }
 
 impl Job {
@@ -777,6 +784,7 @@ impl Job {
 			signal:    None,
 			procs:     None,
 			unreaped:  false,
+			no_notice: false,
 		}
 	}
 
@@ -798,6 +806,7 @@ impl Job {
 			signal: _,
 			procs: _,
 			unreaped: _,
+			no_notice: _,
 		} = self;
 		have.signal.is_none()
 			&& have.procs.is_none()

@@ -170,6 +170,11 @@ pub(super) fn target(
 			job.set_running();
 			job.notified = true;
 		}
+		// bash reports a job killed while it ran, not one killed while
+		// stopped: leave the latter unreported ([`Job::no_notice`]).
+		if ends(send) && matches!(job.state, JobState::Stopped(_)) {
+			job.no_notice = true;
+		}
 		if ends(send) && !has_program(job) {
 			job.unreaped = true;
 		}
@@ -200,6 +205,9 @@ pub(super) fn target(
 	// it ends that has no program yet, or one it finds gone, which bash's
 	// `kill` (that still finds a zombie) finds gone only once it reaped it.
 	if let Some(job) = named.and_then(|v| ctx.vp.jobs.by_vpid_mut(v)) {
+		if ends(send) && matches!(job.state, JobState::Stopped(_)) {
+			job.no_notice = true;
+		}
 		match live {
 			Some(_) if ends(send) && !has_program(job) => job.unreaped = true,
 			Some(_) => {},
