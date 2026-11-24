@@ -4853,6 +4853,10 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 /// (`set -m`) dies of it. Each one deleted keeps its status for `wait PID`
 /// (`delete_job`'s `bgp_add`),
 /// and the current and previous jobs are chosen again as `delete_job` does.
+/// `vp` dropped its own first, as it expanded the substitution
+/// (`xparse_dolparen` re-parses it through `shell_getc` too,
+/// [`super::killed::expanded`]): a `( … )`, job or stage forked from a `-c`
+/// shell drops every finished job there, `$!`'s too, so the child gets none.
 /// The child is a fork of `vp`, and keeps `vp`'s `jobs_list_frozen`: where
 /// `vp`'s job list is kept ([`Vproc::jobs_kept`]: the last stage of a
 /// `lastpipe` pipeline, a function substitution, a trap run with the list
