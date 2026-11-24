@@ -22,7 +22,14 @@ mod obash_support;
 use std::{fs, os::unix::process::CommandExt as _, path::Path};
 
 use obash_support::{obash, output};
-use pi_shell::testkit::{FakeHost, Fault, run_script};
+use pi_shell::{
+	bash::{Budget, Script, Signal},
+	testkit::{
+		FakeHost, Fault, Rig,
+		fault::skeleton_init,
+		run::{Stop, advance_or_blocked, wait_runnable},
+	},
+};
 use serde_json::Value;
 
 /// The rows, as bash 5.3.20 and 5.2.21 ran them: `{id, file, script,
@@ -138,30 +145,184 @@ fn an_errors_message_goes_to_the_stderr_the_redirections_set() {
 	check(&rows);
 }
 
+/// A reader that waits 400 polls of the native task `wait400` (time for
+/// the writer to fill the 64 KiB pipe), then prints each line without its
+/// zeros.
+const READER: &str = "{ wait400; while IFS= read -r l; do printf '%s\\n' \"${l//0/}\"; done; }";
+
+/// A host with the native tasks the tests below hold on: `wait400` (400
+/// polls), `delay` (4 polls) and `hold` (never ends by itself).
+fn host() -> FakeHost {
+	let mut host = FakeHost::new();
+	host.countdown("wait400", 400, 0);
+	host.countdown("delay", 4, 0);
+	host.countdown("hold", u32::MAX, 0);
+	host
+}
+
+fn text(b: &[u8]) -> String {
+	String::from_utf8_lossy(b).into_owned()
+}
+
+/// Run `src` as a `-c` script; with `image`, imaged and restored at every
+/// other stop of the shell (a small budget makes them often: while the
+/// jump is held, a native task polls, so the shell yields there rather than
+/// blocks), not only between ops. Its status, stdout and stderr.
+fn run(src: &str, image: bool) -> (i32, String, String) {
+	let mut rig = Rig::new(host(), skeleton_init(&[]));
+	let id = rig.shell().submit(Script::command(src.as_bytes().to_vec()));
+	let budget = Budget { max_ops: 64, max_ns: u64::MAX };
+	let mut fresh = true;
+	let status = loop {
+		let (shell, host, store) = rig.parts();
+		match advance_or_blocked(shell, host, store, id, budget) {
+			Stop::Done(status) => break status,
+			Stop::Yield | Stop::Blocked if image && fresh => {
+				rig.snapshot();
+				fresh = false;
+			},
+			Stop::Blocked => {
+				let (shell, host, _) = rig.parts();
+				if !host.fire_next_timer() {
+					wait_runnable(&shell.control());
+				}
+				fresh = true;
+			},
+			Stop::Paused => rig.shell().control().resume(),
+			Stop::Yield => fresh = true,
+		}
+	};
+	assert!(!image || rig.snapshots > 0, "`{src}`: no image was taken");
+	(status, text(&rig.host.stdout.bytes()), text(&rig.host.stderr.bytes()))
+}
+
 /// A message whose stream is a full pipe is written once the reader drains
 /// it, still before the jump undoes the redirection that chose the pipe,
-/// also when the shell is imaged and restored at every op while the jump
-/// waits: the reader (held by a native task until the writer has filled
-/// the pipe) gets the message, and stderr nothing.
+/// and exactly once, also when the shell is imaged and restored while the
+/// jump is held: the reader gets the message, and stderr nothing.
 #[test]
 fn a_message_waits_for_a_full_pipe_before_the_jump() {
-	const SRC: &str = concat!(
-		"{ printf '%065536d' 0; : 2>&1 3>\"${zz?u}\"; } | ",
-		"{ hold; while IFS= read -r l; do printf '%s\\n' \"${l//0/}\"; done; }; ",
-		"echo \"ps=${PIPESTATUS[*]}\"",
+	let src = format!(
+		"{{ printf '%065536d' 0; : 2>&1 3>\"${{zz?u}}\"; echo never; }} | {READER}; echo \
+		 \"ps=${{PIPESTATUS[*]}}\""
 	);
-	let host = || {
-		let mut host = FakeHost::new();
-		host.countdown("hold", 20, 0);
-		host
-	};
-	for (what, fault) in [("plain", Fault::None), ("imaged", Fault::Snapshot { every: 1 })] {
-		let got = run_script(host(), SRC.as_bytes(), &[], fault);
-		let (out, err) = (String::from_utf8_lossy(&got.stdout), String::from_utf8_lossy(&got.stderr));
+	for image in [false, true] {
+		let (status, out, err) = run(&src, image);
+		let lines: Vec<&str> = out.lines().collect();
 		assert!(
-			out.contains("zz: u\n") && out.ends_with("ps=1 0\n") && err.is_empty(),
-			"{what}: status {} stdout {out:?} stderr {err:?}",
-			got.status
+			lines.len() == 2 && lines[0].ends_with("zz: u") && lines[1] == "ps=1 0" && err.is_empty(),
+			"imaged {image}: status {status} stdout {out:?} stderr {err:?}"
 		);
 	}
+}
+
+/// A held jump that discards the rest of the line (an arithmetic error at
+/// the top level) discards it once its message is out, and the next line
+/// runs (`exec 4>&2` keeps the shell's stderr for it).
+#[test]
+fn a_held_discard_goes_on_with_the_next_line() {
+	let src = "exec 4>&2; { printf '%065536d' 0; : 2>&1 3>/dev/null$((1/0)); echo same; } > \
+	           >(wait400; while IFS= read -r l; do :; done)\necho \"next s=$?\" >&4";
+	for image in [false, true] {
+		let (status, out, err) = run(src, image);
+		assert!(
+			!out.contains("same") && err.lines().last().is_some_and(|l| l.starts_with("next s=")),
+			"imaged {image}: status {status} stdout {out:?} stderr {err:?}"
+		);
+	}
+}
+
+/// A trap that runs while a jump is held runs in a frame of its own: it
+/// does not take the jump, which is made once the trap returns (obash
+/// writes the whole message first, where bash loses it to the signal's
+/// interruption of its write).
+#[test]
+fn a_trap_while_a_jump_is_held_runs_and_the_jump_follows() {
+	let src = format!(
+		"{{ trap 'echo T-usr1' USR1; printf '%065536d' 0; p=$BASHPID; ( delay; kill -USR1 $p ) & : \
+		 2>&1 3>\"${{zz?u}}\"; echo never; }} | {READER}; echo \"ps=${{PIPESTATUS[*]}}\""
+	);
+	let (status, out, err) = run(&src, false);
+	assert!(
+		out.contains("T-usr1\n") && !out.contains("never") && out.ends_with("ps=1 0\n"),
+		"status {status} stdout {out:?} stderr {err:?}"
+	);
+}
+
+/// A trap that returns from the function whose op holds a jump takes the
+/// jump with the function's frame: the function called next runs.
+#[test]
+fn a_trap_that_returns_drops_the_held_jump() {
+	let src = format!(
+		"{{ f() {{ trap 'return 7' USR1; p=$BASHPID; ( delay; kill -USR1 $p ) & : 2>&1 \
+		 3>\"${{zz?u}}\"; echo never; }}; g() {{ echo in-g; }}; printf '%065536d' 0; f; echo \
+		 \"after-f s=$?\"; g; echo after-g; }} | {READER}; echo \"ps=${{PIPESTATUS[*]}}\""
+	);
+	let (status, out, err) = run(&src, false);
+	assert!(
+		out.contains("after-f s=7\nin-g\nafter-g\n") && out.ends_with("ps=0 0\n"),
+		"status {status} stdout {out:?} stderr {err:?}"
+	);
+}
+
+/// A trap that exits while a jump is held: the frames go, the held jump
+/// with them, and the EXIT trap runs whole with the trap's status.
+#[test]
+fn a_trap_that_exits_runs_the_exit_trap_whole() {
+	let src = format!(
+		"{{ trap 'echo X-exit; echo X-end' EXIT; trap 'exit 5' USR1; printf '%065536d' 0; \
+		 p=$BASHPID; ( delay; kill -USR1 $p ) & : 2>&1 3>\"${{zz?u}}\"; echo never; }} | {READER}; \
+		 echo \"ps=${{PIPESTATUS[*]}}\""
+	);
+	let (status, out, err) = run(&src, false);
+	assert!(
+		out.contains("X-exit\nX-end\n") && out.ends_with("ps=5 0\n"),
+		"status {status} stdout {out:?} stderr {err:?}"
+	);
+}
+
+/// A run cancelled while its jump is held leaves nothing behind on the
+/// shell, which lives on for the next run: `echo second` runs whole after
+/// each signal, for each way to fill a stream and fail (and a control whose
+/// message fits).
+#[test]
+fn a_cancelled_runs_held_jump_is_not_taken_by_the_next_run() {
+	const FIRSTS: &[(&str, &str)] = &[
+		("group-assign", "{ printf '%065536d' 0; { x=${y:?u}; } 2>&1; echo never; } > >(hold)"),
+		("redir-word", "{ printf '%065536d' 0; : 2>&1 3>\"${zz?u}\"; echo never; } > >(hold)"),
+		("arith-command", "{ printf '%065536d' 0; (( 1/0 )) 2>&1; echo never; } > >(hold)"),
+		("arith-assign", "{ printf '%065536d' 0; x=$((1/0)); echo never; } > >(hold) 2>&1"),
+		("exec-stderr", "exec 2> >(hold); printf '%065536d' 0 >&2; x=${y:?u}; echo never"),
+		("control-no-fill", "{ { x=${y:?u}; } 2>&1; echo never; } > >(hold)"),
+	];
+	let mut bad = Vec::new();
+	for sig in [Signal::Kill, Signal::Term, Signal::Int] {
+		for (name, first) in FIRSTS {
+			let mut rig = Rig::new(host(), skeleton_init(&[]));
+			let id = rig
+				.shell()
+				.submit(Script::command(first.as_bytes().to_vec()));
+			let budget = Budget { max_ops: 64, max_ns: u64::MAX };
+			let mut steps = 0u32;
+			loop {
+				let (shell, host, store) = rig.parts();
+				match advance_or_blocked(shell, host, store, id, budget) {
+					Stop::Done(_) => break,
+					Stop::Paused => shell.control().resume(),
+					Stop::Yield | Stop::Blocked => {},
+				}
+				steps += 1;
+				if steps == 200 {
+					rig.shell().control().cancel(sig);
+				}
+				assert!(steps < 1_000_000, "{name} {sig:?}: run 1 never ended");
+			}
+			let status = rig.run(Script::command(b"echo second; echo \"s=$?\"".to_vec()), Fault::None);
+			let out = text(&rig.host.stdout.bytes());
+			if status != 0 || !out.ends_with("second\ns=0\n") {
+				bad.push(format!("{name} {sig:?}: run 2 status {status} stdout {out:?}"));
+			}
+		}
+	}
+	assert!(bad.is_empty(), "run 2 did not run whole after:\n{}", bad.join("\n"));
 }

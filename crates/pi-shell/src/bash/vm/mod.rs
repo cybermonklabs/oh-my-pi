@@ -647,6 +647,14 @@ impl Kernel {
 		self.deferrals.iter_mut().find(|d| d.vproc == vproc)
 	}
 
+	/// `vproc` exited, its run ended, or it ended: its held jumps go with
+	/// its frames ([`proc::HeldFlow`]).
+	pub fn forget_holds(&mut self, vproc: Vpid) {
+		if !self.held_flows.is_empty() {
+			self.held_flows.retain(|h| h.vproc != vproc);
+		}
+	}
+
 	/// `vproc` ended, or its command did: forget what it was deciding.
 	pub fn forget_deferral(&mut self, vproc: Vpid) {
 		if !self.deferrals.is_empty() {
@@ -2008,6 +2016,7 @@ impl Shell {
 				// A job that ended undecided keeps its virtual pid.
 				self.k.settle_bang(p.vpid, None);
 				self.k.forget_deferral(p.vpid);
+				self.k.forget_holds(p.vpid);
 				self.k.proc_exited(cx.store, p.vpid, p.parent, p.status);
 				self.k.ctl.notify();
 				self.rr = 0;
@@ -2299,6 +2308,7 @@ impl Shell {
 			self.k.trace_unit_origins.remove(&p.vpid);
 			self.k.settle_bang(p.vpid, None);
 			self.k.forget_deferral(p.vpid);
+			self.k.forget_holds(p.vpid);
 			self.k.proc_exited(cx.store, p.vpid, p.parent, status);
 			self.rr = 0;
 			self.reaped(cx, p.parent, p.vpid, status);

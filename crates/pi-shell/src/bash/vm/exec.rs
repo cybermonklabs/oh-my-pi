@@ -252,23 +252,20 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		// The hottest ops straight to their handlers, past `dispatch`'s
 		// frame.
 		let bash = unit.mode.dialect() == Dialect::Bash;
-		let flow = if !k.held_flows.is_empty()
-			&& let Some(i) = k
-				.held_flows
-				.iter()
-				.position(|h| h.vproc == vp.vpid && h.frame as usize == fi)
-		{
-			// The op ended in a jump whose messages a full stream held: they
-			// are written first (waiting again while it stays full), then the
-			// jump is made.
-			if let Some(fd) = flush_out(k, vp) {
-				return park(k, cx, vp, WaitKey::Write { fd }, at);
-			}
-			let held = k.held_flows.swap_remove(i);
-			if held.exit {
-				Flow::Exit(held.status)
+		// The op ended in a jump whose messages a full stream held
+		// ([`super::proc::HeldFlow`]): the loop's top wrote them, so the jump
+		// is made now. A hold whose frame went (an op below it runs) or runs
+		// another op (a trap's `break` moved it on) goes.
+		let jump = if k.held_flows.is_empty() {
+			None
+		} else {
+			take_hold(k, vp, fi)
+		};
+		let flow = if let Some(jump) = jump {
+			if jump.exit {
+				Flow::Exit(jump.status)
 			} else {
-				Flow::Discard(held.status)
+				Flow::Discard(jump.status)
 			}
 		} else if bash && op.code == Opcode::Exec {
 			command::exec(k, vp, cx, unit, op, line_of(vp, op.node))
@@ -371,15 +368,18 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		// `{ x=${y:?}; } 2>/dev/null` print none), waiting while that stream
 		// is full: before the jump that ends the command or the line undoes
 		// them (the op's own when its scratch goes, its frames' in the
-		// unwind). The jump is held meanwhile ([`super::proc::HeldFlow`]).
+		// unwind). The jump is held meanwhile, and goes with the op's frame if
+		// something else unwinds it first (a cancel, a trap's `exit` or
+		// `return`, the vproc's end).
 		if bash
 			&& let Flow::Exit(status) | Flow::Discard(status) = flow
 			&& let Some(fd) = flush_out(k, vp)
 		{
 			let exit = matches!(flow, Flow::Exit(_));
 			let frame = u32::try_from(fi).unwrap_or(u32::MAX);
+			let pc = vp.frames[fi].pc;
 			k.held_flows
-				.push(super::proc::HeldFlow { vproc: vp.vpid, frame, exit, status });
+				.push(super::proc::HeldFlow { vproc: vp.vpid, frame, pc, exit, status });
 			return park(k, cx, vp, WaitKey::Write { fd }, at);
 		}
 		if !matches!(flow, Flow::Block(_) | Flow::Call)
@@ -659,6 +659,8 @@ fn errexit_on(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 /// `exit` inside a function runs the root's trap first, above the
 /// function's frames: bash's trap sees its `FUNCNAME` and locals.
 fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
+	// Its frames go, and the jumps they held.
+	k.forget_holds(vp.vpid);
 	// zsh `zexit` while its hooks run: the hook calls end, the status is the
 	// new one.
 	if vp.zsh.is_some()
@@ -834,7 +836,29 @@ fn end_run(k: &mut Kernel, vp: &Vproc, cx: &mut Cx<'_>, run: &super::proc::Run) 
 	k.emit(cx, (vp.vpid, vp.mode), Some(run), EventData::RunEnd { status });
 	k.trace_sources.remove(&vp.vpid);
 	k.trace_unit_origins.remove(&vp.vpid);
+	// A cancelled run's frames are gone, and the jumps they held.
+	k.forget_holds(vp.vpid);
 	k.done.push_back((run.id, status));
+}
+
+/// The jump held for the op of `vp`'s frame `fi` ([`super::proc::HeldFlow`]),
+/// taken; the vproc's holds whose frame went (at or above `fi` but not its
+/// op: a frame below them runs an op, or theirs runs another one) dropped.
+#[cold]
+#[inline(never)]
+fn take_hold(k: &mut Kernel, vp: &Vproc, fi: usize) -> Option<super::proc::HeldFlow> {
+	let pc = vp.frames[fi].pc;
+	let mut jump = None;
+	k.held_flows.retain(|h| {
+		if h.vproc != vp.vpid || (h.frame as usize) < fi {
+			return true;
+		}
+		if h.frame as usize == fi && h.pc == pc {
+			jump = Some(*h);
+		}
+		false
+	});
+	jump
 }
 
 /// Park `vp` on `key` (emitting `Blocked` when the key changes).
