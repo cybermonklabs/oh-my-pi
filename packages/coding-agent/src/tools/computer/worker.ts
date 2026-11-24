@@ -1546,6 +1546,8 @@ export class ComputerWorkerCore {
 						runtime.run(message.code, `computer-run-${message.id}.js`, this.#runtimeHooks(active, output), {
 							runId: message.id,
 							cwd: message.session.cwd,
+							// An abandoned run's code that resumes later cannot drive the next run's desktop.
+							signal,
 						}),
 					),
 					cancelRejection,

@@ -2129,9 +2129,12 @@ export class WorkerCore {
 					onFloatingRejection,
 					async () =>
 						await Promise.race([
+							// The signal lets a run abandoned with code still pending give the realm back at once: an
+							// inline (same-realm) worker would otherwise lock every other runtime of omp's process out.
 							runtime.run(msg.code, `browser-run-${msg.id}.js`, hooks, {
 								runId: msg.id,
 								cwd: msg.session.cwd,
+								signal,
 							}),
 							cancelRejection,
 							floatingFailure.promise,

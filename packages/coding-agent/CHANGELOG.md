@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed one timed-out or cancelled cmux, Tern or inline-worker browser run, whose code was still waiting, breaking every later browser run on another tab until omp restarted (`Cannot initialize a JS runtime while another same-realm JS runtime is running`): an abandoned run now gives the process's JS realm back at once, and its code, if it wakes later, can no longer print, call tools or drive the tab of the run that owns the realm
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
