@@ -2908,5 +2908,155 @@
    "s=1\n",
    ""
   ]
+ },
+ {
+  "id": "fp-redir",
+  "file": false,
+  "script": "{ printf '%065536d' 0; : 2>&1 3>\"${zz?u}\"; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "bash: line 1: zz: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: zz: u\nps=1 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-redir",
+  "file": true,
+  "script": "{ printf '%065536d' 0; : 2>&1 3>\"${zz?u}\"; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: zz: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: zz: u\nps=1 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-group",
+  "file": false,
+  "script": "{ printf '%065536d' 0; { x=${y:?u}; } 2>&1; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "bash: line 1: y: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: y: u\nps=1 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-group",
+  "file": true,
+  "script": "{ printf '%065536d' 0; { x=${y:?u}; } 2>&1; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: y: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: y: u\nps=1 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-exit",
+  "file": false,
+  "script": "exec 3>&1; { printf '%065536d' 0 >&3; : 2>&3 4>\"${zz?u}\"; echo never; } 3>&1 | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }",
+  "bash53": [
+   0,
+   "bash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-exit",
+  "file": true,
+  "script": "exec 3>&1; { printf '%065536d' 0 >&3; : 2>&3 4>\"${zz?u}\"; echo never; } 3>&1 | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }",
+  "bash53": [
+   0,
+   "./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-nonfatal-ctl",
+  "file": false,
+  "script": "{ printf '%065536d' 0; : 2>&1 3< /nonexistent/x; echo after; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\nafter\nps=0 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\nafter\nps=0 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-nonfatal-ctl",
+  "file": true,
+  "script": "{ printf '%065536d' 0; : 2>&1 3< /nonexistent/x; echo after; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\nafter\nps=0 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\nafter\nps=0 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-empty-ctl",
+  "file": false,
+  "script": "{ echo ${y:?u}; } 2>&1 | cat; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "bash: line 1: y: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: y: u\nps=1 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-empty-ctl",
+  "file": true,
+  "script": "{ echo ${y:?u}; } 2>&1 | cat; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: y: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: y: u\nps=1 0\n",
+   ""
+  ]
  }
 ]

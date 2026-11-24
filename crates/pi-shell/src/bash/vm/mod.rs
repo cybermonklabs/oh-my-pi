@@ -528,6 +528,9 @@ pub struct Kernel {
 	/// Background jobs' lone commands whose redirections wait for their name
 	/// to resolve ([`proc::Deferral`]): imaged (a restored command goes on).
 	pub deferrals:          Vec<proc::Deferral>,
+	/// Jumps waiting for their messages to be written ([`proc::HeldFlow`]):
+	/// imaged (a restored shell writes them, then jumps).
+	pub held_flows:         Vec<proc::HeldFlow>,
 	/// Job control of the interactive shell (process groups, the
 	/// terminal, stop events); not imaged.
 	pub jobctl:             jobctl::JobCtl,
@@ -633,6 +636,7 @@ impl Kernel {
 			pid_owners: Vec::new(),
 			math_opts: None,
 			deferrals: Vec::new(),
+			held_flows: Vec::new(),
 			jobctl: jobctl::JobCtl::default(),
 		}
 	}

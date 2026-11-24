@@ -12,8 +12,9 @@
 //! so a message sent to `2>err` is seen. They cover a builtin, `echo`, a
 //! function, a `{ }`, a loop, a null command and `exec`, each after
 //! `2>/dev/null`, `2>&1` and `2>err`, with a fatal expansion error (and, as
-//! controls, an open that fails, a bad fd, an ambiguous word), and errors in
-//! a body under its compound's redirection.
+//! controls, an open that fails, a bad fd, an ambiguous word), errors in a
+//! body under its compound's redirection, and messages whose stream is a pipe
+//! already full (the reader waits two seconds before it reads).
 #![cfg(unix)]
 
 mod obash_support;
@@ -21,6 +22,7 @@ mod obash_support;
 use std::{fs, os::unix::process::CommandExt as _, path::Path};
 
 use obash_support::{obash, output};
+use pi_shell::testkit::{FakeHost, Fault, run_script};
 use serde_json::Value;
 
 /// The rows, as bash 5.3.20 and 5.2.21 ran them: `{id, file, script,
@@ -134,4 +136,32 @@ fn an_errors_message_goes_to_the_stderr_the_redirections_set() {
 	assert!(rows.iter().all(|r| r.same52), "a row bash 5.2.21 runs otherwise");
 	assert!(rows.len() > 150, "{} rows", rows.len());
 	check(&rows);
+}
+
+/// A message whose stream is a full pipe is written once the reader drains
+/// it, still before the jump undoes the redirection that chose the pipe,
+/// also when the shell is imaged and restored at every op while the jump
+/// waits: the reader (held by a native task until the writer has filled
+/// the pipe) gets the message, and stderr nothing.
+#[test]
+fn a_message_waits_for_a_full_pipe_before_the_jump() {
+	const SRC: &str = concat!(
+		"{ printf '%065536d' 0; : 2>&1 3>\"${zz?u}\"; } | ",
+		"{ hold; while IFS= read -r l; do printf '%s\\n' \"${l//0/}\"; done; }; ",
+		"echo \"ps=${PIPESTATUS[*]}\"",
+	);
+	let host = || {
+		let mut host = FakeHost::new();
+		host.countdown("hold", 20, 0);
+		host
+	};
+	for (what, fault) in [("plain", Fault::None), ("imaged", Fault::Snapshot { every: 1 })] {
+		let got = run_script(host(), SRC.as_bytes(), &[], fault);
+		let (out, err) = (String::from_utf8_lossy(&got.stdout), String::from_utf8_lossy(&got.stderr));
+		assert!(
+			out.contains("zz: u\n") && out.ends_with("ps=1 0\n") && err.is_empty(),
+			"{what}: status {} stdout {out:?} stderr {err:?}",
+			got.status
+		);
+	}
 }

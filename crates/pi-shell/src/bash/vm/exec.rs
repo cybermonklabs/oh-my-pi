@@ -252,7 +252,25 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		// The hottest ops straight to their handlers, past `dispatch`'s
 		// frame.
 		let bash = unit.mode.dialect() == Dialect::Bash;
-		let flow = if bash && op.code == Opcode::Exec {
+		let flow = if !k.held_flows.is_empty()
+			&& let Some(i) = k
+				.held_flows
+				.iter()
+				.position(|h| h.vproc == vp.vpid && h.frame as usize == fi)
+		{
+			// The op ended in a jump whose messages a full stream held: they
+			// are written first (waiting again while it stays full), then the
+			// jump is made.
+			if let Some(fd) = flush_out(k, vp) {
+				return park(k, cx, vp, WaitKey::Write { fd }, at);
+			}
+			let held = k.held_flows.swap_remove(i);
+			if held.exit {
+				Flow::Exit(held.status)
+			} else {
+				Flow::Discard(held.status)
+			}
+		} else if bash && op.code == Opcode::Exec {
 			command::exec(k, vp, cx, unit, op, line_of(vp, op.node))
 		} else if bash
 			&& op.code == Opcode::Arith
@@ -348,6 +366,22 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		} else {
 			0
 		};
+		// bash writes an error's message at once, to the stderr the
+		// redirections in force left (`: 2>/dev/null 3>"${x:?}"` and
+		// `{ x=${y:?}; } 2>/dev/null` print none), waiting while that stream
+		// is full: before the jump that ends the command or the line undoes
+		// them (the op's own when its scratch goes, its frames' in the
+		// unwind). The jump is held meanwhile ([`super::proc::HeldFlow`]).
+		if bash
+			&& let Flow::Exit(status) | Flow::Discard(status) = flow
+			&& let Some(fd) = flush_out(k, vp)
+		{
+			let exit = matches!(flow, Flow::Exit(_));
+			let frame = u32::try_from(fi).unwrap_or(u32::MAX);
+			k.held_flows
+				.push(super::proc::HeldFlow { vproc: vp.vpid, frame, exit, status });
+			return park(k, cx, vp, WaitKey::Write { fd }, at);
+		}
 		if !matches!(flow, Flow::Block(_) | Flow::Call)
 			&& let Some(frame) = vp.frames.get_mut(fi)
 		{
@@ -355,16 +389,6 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		}
 		if !matches!(flow, Flow::Block(_)) {
 			unblock(k, cx, vp);
-		}
-		// bash writes an error's message at once, to the stderr the
-		// redirections in force left (`: 2>/dev/null 3>"${x:?}"` and
-		// `{ x=${y:?}; } 2>/dev/null` print none): before the jump that ends
-		// the command, its list or the shell undoes them (the op's own here,
-		// its frames' in the unwind).
-		if unit.mode.dialect() == Dialect::Bash
-			&& matches!(flow, Flow::Exit(_) | Flow::Discard(_) | Flow::Abort(_))
-		{
-			let _ = flush_out(k, vp);
 		}
 		// The op is over unless it parks or called a frame: drop its scratch
 		// and close its process substitutions.
