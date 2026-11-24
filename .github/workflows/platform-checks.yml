@@ -1,0 +1,393 @@
+# Platform checks: a fork member's Rust tests on macos-15, windows-2025 and ubuntu-24.04
+# (ubuntu also as root, on a real kernel with fs.protected_* set), head against an optional
+# base, with an optional planted fault. Started by hand (workflow_dispatch); a push that
+# changes this tool runs only its own controls.
+#
+# How to dispatch. Push every commit you name first (a plant goes on a scratch branch you
+# have scanned); give commits as full 40-character ids; always dispatch with --ref
+# platform-checks, so every check shares that ref's caches:
+#
+#   gh workflow run platform-checks.yml --repo cybermonklabs/oh-my-pi --ref platform-checks \
+#     -f head=<sha> [-f base=<sha>] [-f plant=<sha>] [-f platforms=macos,windows,ubuntu] \
+#     [-f crates=pi-shell] [-f filter='<nextest filterset>'] [-f repeat=1] [-f legs=1] \
+#     [-f retries=0] [-f flaky_passes=false] [-f timeout_minutes=10] [-f as_root=false]
+#     [-f skip_bash_install=false] [-f keep_success_output=false]
+#
+# Inputs are used exactly as given: no spaces in lists, whole numbers written plainly. A plant
+# is a commit whose own change (plant^..plant) is applied to head; the plan fails when it does
+# not apply or changes nothing. The filter is a nextest filterset
+# (https://nexte.st/docs/filtersets/) from a fixed character set: no quotes, semicolons or
+# newlines. repeat N runs the filter N times as nextest stress runs, split over `legs`
+# parallel jobs that run the same archive. retries > 0 retries a failed test; a test that
+# passes only on a retry reads FLAKY and fails the run unless flaky_passes=true.
+#
+# Where the result is: the run's summary page names the exact commits built, each build's time
+# and cargo cache state, a verdict per platform, tree and user (PASS, FAIL, TIMEOUT, FLAKY or
+# UNKNOWN; UNKNOWN when the filter selected no test that runs there, or a result is missing),
+# each test that did not pass every repeat with its count n/N, head-only failures, and whether
+# the plant was caught. The run passes when head (and base) pass everywhere and, with a plant,
+# some test fails at the plant and passes at head on every platform. Artifacts: pc-report
+# (summary.md, verdicts.tsv, tests.tsv), pc-results-<platform>-<tree>-<user>-<leg> (nextest's
+# list, JUnit report and log) and pc-build-<platform>-<tree> (build log and record). Each is
+# uploaded only after the scan step finds no private key, token shape or value of this run's
+# own token in it. pc-archive-* holds the built tests for the test legs and expires after a day.
+#
+# How it is fast. Each tree (head, base, head plus the plant) is built once per platform by
+# `cargo nextest archive`; the test legs (user, root, repeats) run that archive and build
+# nothing. The plant is built in the head job on the head's target directory, so cargo
+# rebuilds only the crates the plant changed. Each platform runs in its own call of
+# platform-checks-platform.yml, so its legs start when its own builds are done. Each test leg
+# uses every core (nextest's default test threads), except tests the tree's
+# .config/nextest.toml marks to run alone. Each test has a time bound (slow-timeout x
+# terminate-after), so a hung test reads TIMEOUT with its name. Swatinem/rust-cache keeps
+# cargo's registry and dependency builds per platform in this ref: its shared-key replaces only
+# the job part of the key; the rustc version, the environment and the Cargo.lock hashes stay in
+# it, so a check restores the newest cache of the same platform and toolchain (the lock hash
+# falls back to a key prefix), and the workspace crates themselves always rebuild. Only the
+# build jobs may write the cache (cache-mode).
+#
+# Limits. Doctests do not run: nextest cannot run them, least of all from an archive, so they
+# would need a cargo build of their own per tree. pi-shell at 9058ab9d has at most 4 (about 6 s
+# per tree in the earlier scratch runs); run `cargo test --doc` for them where they matter.
+#
+# Cache size. A job after the platforms keeps the newest cargo cache per platform and toolchain
+# in this ref and deletes the ones it supersedes, so the steady state is one entry per platform
+# (about 0.36-0.64 GB macOS, 0.42 GB Windows, 0.38 GB ubuntu) for each toolchain in use. It runs
+# no member code: it checks out nothing and only lists and deletes cache entries, and it alone
+# holds actions: write. A failure of this job does not change the run's conclusion.
+#
+# Security boundary. These jobs run member code: build scripts, proc macros and tests. They
+# run on disposable GitHub-hosted runners with no secrets, no environment and no broker; the
+# token can only read the repository (permissions: contents: read), and every checkout drops
+# it (persist-credentials: false) before member code runs. Publishing and anything privileged
+# stays outside this workflow. Member code can still reach the job's own runtime token (the
+# runner gives passwordless sudo), so a hostile member could write this ref's cargo cache from
+# a build job, which the release refs never read, or upload a forged results artifact under
+# another leg's name before that leg does. The log scan detects leaks; it does not contain them.
+# The plan job refuses any ref but platform-checks, so these caches never share a scope with
+# the release refs.
+name: platform checks
+
+run-name: >-
+  ${{ github.event_name == 'push' && 'platform checks: the tool''s own controls' || format('platform checks {0}{1}{2} [{3}]',
+  inputs.head, inputs.base && format(' vs {0}', inputs.base) || '', inputs.plant && format(' + plant {0}', inputs.plant) || '', inputs.platforms) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      head:
+        description: "Commit to test: a full 40-character id, pushed to this repository"
+        required: true
+        type: string
+      base:
+        description: "Base commit to test the same way (optional)"
+        required: false
+        default: ""
+        type: string
+      plant:
+        description: "Plant: a commit (on a scanned scratch branch) whose own change is applied to head (optional)"
+        required: false
+        default: ""
+        type: string
+      platforms:
+        description: "Comma-separated, no spaces: macos, windows, ubuntu"
+        required: false
+        default: "macos,windows,ubuntu"
+        type: string
+      crates:
+        description: "Comma-separated packages whose tests are built"
+        required: false
+        default: "pi-shell"
+        type: string
+      filter:
+        description: "nextest filterset selecting the tests"
+        required: false
+        default: "all()"
+        type: string
+      repeat:
+        description: "Runs of the filter per tree, platform and user (nextest stress runs)"
+        required: false
+        default: "1"
+        type: string
+      legs:
+        description: "Parallel jobs the repeats are split over (each runs the same archive)"
+        required: false
+        default: "1"
+        type: string
+      retries:
+        description: "nextest retries of a failed test (0: none)"
+        required: false
+        default: "0"
+        type: string
+      flaky_passes:
+        description: "Count a test that passes only on a retry (FLAKY) as a pass"
+        required: false
+        default: false
+        type: boolean
+      timeout_minutes:
+        description: "Time bound per test, in minutes (nextest ends the test: TIMEOUT)"
+        required: false
+        default: "10"
+        type: string
+      as_root:
+        description: "Also run the ubuntu legs as root"
+        required: false
+        default: false
+        type: boolean
+      keep_success_output:
+        description: "Keep passing tests' output too (nextest success-output final, and in the JUnit report)"
+        required: false
+        default: false
+        type: boolean
+      skip_bash_install:
+        description: "Control: the macOS legs skip the Homebrew bash install, and must read UNKNOWN"
+        required: false
+        default: false
+        type: boolean
+  # GitHub dispatches only a workflow it has seen run, and this file lives off the default
+  # branch: a push that changes the tool runs it once, which registers it. That run is the
+  # tool's own test: the classifier and scan controls, and the controls on real nextest output
+  # from the fixture crate. It checks out no member commit; every other job is skipped on push.
+  push:
+    branches: [platform-checks]
+    paths:
+      - .github/workflows/platform-checks.yml
+      - .github/workflows/platform-checks-platform.yml
+      - .github/platform-checks/**
+
+permissions:
+  contents: read
+
+# Only the build jobs (in platform-checks-platform.yml) write cargo's cache; the platform
+# jobs below pass write access to that workflow, which grants it to its build job alone.
+cache-mode: read
+
+# One group per dispatch: a dispatch never cancels another.
+concurrency:
+  group: platform-checks-${{ github.run_id }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  NEXTEST_VERSION: "0.9.151"
+  PC_HEAD: ${{ inputs.head }}
+  PC_BASE: ${{ inputs.base }}
+  PC_PLANT: ${{ inputs.plant }}
+  PC_PLATFORMS: ${{ inputs.platforms }}
+  PC_CRATES: ${{ inputs.crates }}
+  PC_FILTER: ${{ inputs.filter }}
+  PC_REPEAT: ${{ inputs.repeat }}
+  PC_LEGS: ${{ inputs.legs }}
+  PC_RETRIES: ${{ inputs.retries }}
+  PC_FLAKY_PASSES: ${{ inputs.flaky_passes }}
+  PC_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+  PC_AS_ROOT: ${{ inputs.as_root }}
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      builds: ${{ steps.plan.outputs.builds }}
+      legs: ${{ steps.plan.outputs.legs }}
+      builds_macos: ${{ steps.plan.outputs.builds_macos }}
+      legs_macos: ${{ steps.plan.outputs.legs_macos }}
+      builds_windows: ${{ steps.plan.outputs.builds_windows }}
+      legs_windows: ${{ steps.plan.outputs.legs_windows }}
+      builds_ubuntu: ${{ steps.plan.outputs.builds_ubuntu }}
+      legs_ubuntu: ${{ steps.plan.outputs.legs_ubuntu }}
+      plant_tree: ${{ steps.trees.outputs.plant_tree }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Controls of the classifier and the scan (hand-made inputs)
+        run: python3 .github/platform-checks/pc.py selftest
+      - name: Inputs
+        id: plan
+        if: github.event_name == 'workflow_dispatch'
+        run: python3 .github/platform-checks/pc.py plan >> "$GITHUB_OUTPUT"
+      - name: Runner paths
+        if: github.event_name == 'workflow_dispatch'
+        run: bash .github/platform-checks/tree.sh setup
+      - name: Commits exist, and the plant changes the head
+        id: trees
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          bash .github/platform-checks/tree.sh checkout "$PC_HEAD"
+          if [ -n "$PC_BASE" ]; then
+            git fetch --quiet --no-tags --depth=1 origin "$PC_BASE" || { echo "::error::cannot fetch base $PC_BASE: push it first"; exit 1; }
+          fi
+          if [ -n "$PC_PLANT" ]; then
+            planted=$(bash .github/platform-checks/tree.sh plant "$PC_PLANT")
+            [[ "$planted" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no planted tree id: $planted"; exit 1; }
+            echo "plant_tree=$planted" >> "$GITHUB_OUTPUT"
+          fi
+
+  controls:
+    # The tool's own test on real nextest output, when the tool changes: the fixture crate's
+    # pass, failure, hang, flake and ignored test through leg.sh and the classifier.
+    name: controls on real nextest output
+    needs: plan
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner paths
+        run: bash .github/platform-checks/tree.sh setup
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Controls
+        run: bash .github/platform-checks/controls.sh
+      - name: Scan the control logs
+        id: scan
+        if: always()
+        env:
+          PC_SCAN_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$PC/upload/pc-controls" && cp -R "$PC"/logs/. "$PC/upload/pc-controls/"
+          python3 .github/platform-checks/pc.py scan "$PC/upload"
+      - name: Control logs
+        if: always() && steps.scan.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pc-controls
+          path: ${{ runner.temp }}/pc/upload/
+          retention-days: 14
+
+  macos:
+    name: macos
+    needs: plan
+    if: github.event_name == 'workflow_dispatch' && needs.plan.outputs.legs_macos != '[]'
+    # The most the called workflow may grant: there, only its build job writes.
+    cache-mode: write
+    uses: ./.github/workflows/platform-checks-platform.yml
+    with:
+      builds: ${{ needs.plan.outputs.builds_macos }}
+      legs: ${{ needs.plan.outputs.legs_macos }}
+      plant_tree: ${{ needs.plan.outputs.plant_tree }}
+
+  windows:
+    name: windows
+    needs: plan
+    if: github.event_name == 'workflow_dispatch' && needs.plan.outputs.legs_windows != '[]'
+    # The most the called workflow may grant: there, only its build job writes.
+    cache-mode: write
+    uses: ./.github/workflows/platform-checks-platform.yml
+    with:
+      builds: ${{ needs.plan.outputs.builds_windows }}
+      legs: ${{ needs.plan.outputs.legs_windows }}
+      plant_tree: ${{ needs.plan.outputs.plant_tree }}
+
+  ubuntu:
+    name: ubuntu
+    needs: plan
+    if: github.event_name == 'workflow_dispatch' && needs.plan.outputs.legs_ubuntu != '[]'
+    # The most the called workflow may grant: there, only its build job writes.
+    cache-mode: write
+    uses: ./.github/workflows/platform-checks-platform.yml
+    with:
+      builds: ${{ needs.plan.outputs.builds_ubuntu }}
+      legs: ${{ needs.plan.outputs.legs_ubuntu }}
+      plant_tree: ${{ needs.plan.outputs.plant_tree }}
+
+  report:
+    name: report
+    needs: [plan, macos, windows, ubuntu]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && needs.plan.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Each artifact's root holds one folder named after it, so merging them keeps them apart
+      # (download-artifact puts a single match straight into `path`).
+      - name: Leg results
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: pc-results-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/results
+      - name: Build records
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: pc-build-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/builds
+      - name: Verdicts
+        env:
+          PC_LEGS_JSON: ${{ needs.plan.outputs.legs }}
+          PC_BUILDS_JSON: ${{ needs.plan.outputs.builds }}
+          PC_PLANT_TREE: ${{ needs.plan.outputs.plant_tree }}
+        run: |
+          python3 .github/platform-checks/pc.py report "$RUNNER_TEMP/results" "$RUNNER_TEMP/builds" "$RUNNER_TEMP/report/pc-report" >> "$GITHUB_STEP_SUMMARY"
+      - name: Scan the report
+        id: scan
+        if: always()
+        env:
+          PC_SCAN_TOKEN: ${{ github.token }}
+        run: python3 .github/platform-checks/pc.py scan "$RUNNER_TEMP/report"
+      - name: Report
+        if: always() && steps.scan.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pc-report
+          path: ${{ runner.temp }}/report/
+          retention-days: 30
+
+  cache-prune:
+    # One cargo cache per platform and toolchain in this ref: keep the newest entry of each
+    # key prefix up to the environment hash, and delete the ones it supersedes. No checkout and no member code; this job alone
+    # may delete cache entries.
+    name: keep one cargo cache per platform
+    needs: [plan, macos, windows, ubuntu]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && needs.plan.result == 'success' }}
+    # The run's conclusion follows the verdicts; a failed cleanup shows only on this job.
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Delete superseded cargo caches of this ref
+        run: |
+          gh api --paginate "repos/$GH_REPO/actions/caches?key=v0-rust-platform-checks-&ref=$GITHUB_REF&per_page=100" \
+            -q '.actions_caches[] | [.id, .key, .created_at, .size_in_bytes] | @tsv' > caches.tsv
+          echo "CACHES $(wc -l < caches.tsv) entries of this ref before"
+          if [ ! -s caches.tsv ]; then
+            echo "::warning::CACHES UNKNOWN: the list found no platform-checks cache entry; the key format may have changed"
+            exit 0
+          fi
+          # Key: v0-rust-platform-checks-<platform>-<os>-<arch>-<environment hash>-<lock hash>.
+          # The group is fields 5-8: the platform and its toolchain (environment hash).
+          sort -t$'\t' -k3,3r caches.tsv | awk -F'\t' '{ split($2, k, "-"); g = k[5] "-" k[6] "-" k[7] "-" k[8]; if (g in kept) print; else kept[g] = 1 }' > superseded.tsv
+          while IFS=$'\t' read -r id key created size; do
+            # Another dispatch may have deleted it first: that is done too.
+            if gh api -X DELETE "repos/$GH_REPO/actions/caches/$id" > /dev/null 2>&1; then
+              echo "DELETED $key ($((size / 1000000)) MB, created $created)"
+            else
+              echo "GONE $key (deleted elsewhere, or the delete failed)"
+            fi
+          done < superseded.tsv
+          gh api --paginate "repos/$GH_REPO/actions/caches?key=v0-rust-platform-checks-&ref=$GITHUB_REF&per_page=100" \
+            -q '.actions_caches[] | [.key, .size_in_bytes] | @tsv' > after.tsv
+          awk -F'\t' '{ split($1, k, "-"); g = k[5] "-" k[6] "-" k[7] "-" k[8]; n[g]++; s += $2 } END {
+            for (p in n) { printf "KEPT %s: %d entr%s\n", p, n[p], n[p] == 1 ? "y" : "ies"; if (n[p] > 1) bad = 1 }
+            printf "CACHES %d entries of this ref after, %.2f GB\n", NR, s / 1e9; exit bad }' after.tsv

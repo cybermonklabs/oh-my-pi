@@ -1,0 +1,9 @@
+# A crate of known outcomes for the tool's own controls (controls.sh): real nextest output for
+# the classifier. Not part of the repository's workspace.
+[package]
+name = "pc-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
