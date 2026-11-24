@@ -45,6 +45,7 @@ import {
 	coldRolloverRequestMark,
 } from "./cold-message";
 import { CONTEXT_NOTES_ENTRY_TYPE, contextNotesEntriesRead } from "./context-notes";
+import type { EntryPatchTargets } from "./entry-patches";
 import { SESSION_EXIT_CUSTOM_TYPE, TOOL_EXECUTION_START_CUSTOM_TYPE } from "./exit-diagnostics";
 import { forgetConvertMemo } from "./messages";
 import { getReadableCompactionEntry, isRolloverRequestEntry } from "./session-context";
@@ -1363,4 +1364,22 @@ export function convertColdEntries(
 	for (let index = 0; index < entries.length; index++) {
 		if (belongsCold(boundary, index)) convertToColdEntry(entries[index]!, openStore, options);
 	}
+}
+
+/**
+ * `byId` as the targets of the prune and patch records a load or an adoption
+ * of another writer's entries applies: each cold target is made whole first,
+ * its images left as blob references ({@link hydrateColdEntry}), since a write
+ * through one of its accessors would make it whole with every image read back
+ * just before the record replaces them. Each target it makes whole is pushed
+ * to `hydrated`.
+ */
+export function wholeTargetsOf(byId: EntryPatchTargets, hydrated?: SessionEntry[]): EntryPatchTargets {
+	return {
+		get(id) {
+			const target = byId.get(id);
+			if (target && hydrateColdEntry(target, { resolveBlobs: false })) hydrated?.push(target);
+			return target;
+		},
+	};
 }

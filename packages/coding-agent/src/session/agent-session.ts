@@ -3038,8 +3038,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 		});
 		this.agent.prepareQueuedMessages = this.#prepareQueuedUserMessages;
-		// A storage that bounds this process's queued transcript appends holds each model request until it admits
-		// more, so a backend that falls behind slows the turn; the loop's abort signal ends the wait.
+		// Past the point where a storage makes turns wait on this process's queued transcript appends, each
+		// model request waits until it admits more: a backend that falls behind slows the turn, and the loop's
+		// abort signal ends the wait.
 		this.addDisposer(this.agent.addBeforeModelCallHook(signal => this.sessionManager.waitForAppendAdmission(signal)));
 		this.#detachUsageBeforeModelCall = this.agent.addBeforeModelCallHook(async signal => {
 			if (!cfgRetryUsageAwareFallback.get(this.settings)) return;

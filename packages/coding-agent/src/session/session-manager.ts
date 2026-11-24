@@ -56,6 +56,7 @@ import {
 	isColdEntry,
 	readCompactions,
 	streamedKeptStart,
+	wholeTargetsOf,
 } from "./cold-entries";
 import type { CompactionMethod } from "./compaction-methods";
 import {
@@ -2349,8 +2350,16 @@ export class SessionManager {
 		this.#index.setLeaf(leaf);
 		this.#entries = [...this.#entries.slice(0, found.at), ...kept, ...this.#entries.slice(found.at)];
 		this.#expectedDiskSize = diskSize;
-		const pruned = applyToolResultPrunes(kept, this.#index);
-		const patched = applyEntryPatches(kept, this.#index);
+		// A cold target is made whole without reading its images, and goes back to the store with the values
+		// the records set, as `updateEntryBody` does; one that stays whole gets its images, as whole entries hold them.
+		const hydrated: SessionEntry[] = [];
+		const targets = wholeTargetsOf(this.#index, hydrated);
+		const pruned = applyToolResultPrunes(kept, targets);
+		const patched = applyEntryPatches(kept, targets);
+		for (const target of hydrated) {
+			if (!convertToColdEntry(target, () => this.#openColdStore()))
+				resolveBlobRefsInEntriesSync([target], this.#blobs);
+		}
 		if (pruned || patched) this.#bodyRevision++;
 		this.#durable =
 			found.extendsFrontier && durable && kept.length === found.foreign.length
@@ -4600,17 +4609,10 @@ export class SessionManager {
 				? coldBoundary(intake.entries, intake.index.branchView(), undefined)
 				: undefined;
 			if (boundary) hydrateKeptEntries(intake.entries, boundary, { resolveBlobs: false });
-			// Prune records, then patch records, apply after migration. A record's
-			// cold target is made whole first with its images left as blob
-			// references, since a write through its accessor would make it whole
-			// with every image read back; convertColdEntries below returns it to the store.
-			const targets = {
-				get: (id: string): SessionEntry | undefined => {
-					const target = intake.index.get(id);
-					if (target) hydrateColdEntry(target, { resolveBlobs: false });
-					return target;
-				},
-			};
+			// Prune records, then patch records, apply after migration, to targets
+			// made whole without their images (wholeTargetsOf); convertColdEntries
+			// below returns those to the store.
+			const targets = wholeTargetsOf(intake.index);
 			applyToolResultPrunes(intake.entries, targets);
 			applyEntryPatches(intake.entries, targets);
 			// Sanitize after the load-time passes, as a load of the whole transcript
@@ -5534,8 +5536,8 @@ export class SessionManager {
 
 	/**
 	 * The storage's {@link SessionStorage.waitForAppendAdmission}: settles once this process may queue more
-	 * transcript appends, or at once when `signal` fires. `undefined` when the storage has no bound on queued
-	 * appends, so a caller has nothing to wait for.
+	 * transcript appends, or at once when `signal` fires. `undefined` when the storage never makes turns wait on
+	 * queued appends, so a caller has nothing to wait for.
 	 */
 	waitForAppendAdmission(signal?: AbortSignal): Promise<void> | undefined {
 		return this.#storage.waitForAppendAdmission?.(signal);

@@ -530,10 +530,10 @@ export interface SessionStorage {
 	drain(): Promise<void>;
 	/**
 	 * Resolve once this process may queue more transcript appends: at once while the transcript appends it has
-	 * queued and not yet settled are within its bound, otherwise once enough of them settle; at once when `signal`
-	 * fires. An agent session awaits it before each model request and before each tool result it appends, so a
-	 * backend that falls behind slows the turns instead of holding their lines in memory. Storage without a bound
-	 * omits it.
+	 * queued and not yet settled are at or under the point where its turns start to wait (not a bound on what it
+	 * queues), otherwise once enough of them settle; at once when `signal` fires. An agent session awaits it before
+	 * each model request and before each tool result it appends, so a backend that falls behind slows the turns
+	 * instead of holding their lines in memory. Storage that never makes turns wait omits it.
 	 */
 	waitForAppendAdmission?(signal?: AbortSignal): Promise<void>;
 }

@@ -248,6 +248,92 @@ async function writeImageSession(dir: string, images: [StoredImage, StoredImage]
 	return file;
 }
 
+/** A `tool_result_prune` record that blanks `r1` of {@link writeToolResultSession}. */
+const R1_PRUNE = {
+	type: "custom",
+	customType: "tool_result_prune",
+	id: "p1",
+	data: { results: [{ entryId: "r1", notice: "[r1 pruned]", prunedAt: 7 }] },
+};
+
+/** An `entry_patch` record that sets the content of `r2` of {@link writeToolResultSession}. */
+const R2_PATCH = {
+	type: "custom",
+	customType: "entry_patch",
+	id: "x1",
+	data: { patches: [{ entryId: "r2", message: { content: [{ type: "text", text: "r2 patched" }] } }] },
+};
+
+/** A transcript record of a fixture: its id, and whatever else the record holds. */
+type FixtureRecord = { readonly id: string } & Record<string, unknown>;
+
+/**
+ * A session whose compaction `c1` keeps `u2` on: before the cut, `r1` and
+ * `r2`, tool results holding an image each as a blob reference the way a
+ * written session holds them, load cold, and `records` follow `r2`. Ends at
+ * `a3`. Each entry's parent is the entry before it.
+ */
+async function writeToolResultSession(
+	dir: string,
+	images: [StoredImage, StoredImage],
+	records: readonly FixtureRecord[] = [],
+): Promise<string> {
+	const timestamp = "2026-01-01T00:00:00.000Z";
+	const call = (id: string, callId: string) => ({
+		type: "message",
+		id,
+		message: {
+			...assistant(`${id} ${BODY}`),
+			content: [{ type: "toolCall", id: callId, name: "inspect", arguments: {} }],
+			stopReason: "toolUse",
+		},
+	});
+	const result = (id: string, callId: string, image: StoredImage) => ({
+		type: "message",
+		id,
+		message: {
+			role: "toolResult",
+			toolCallId: callId,
+			toolName: "inspect",
+			content: [
+				{ type: "text", text: `${id} ${BODY}` },
+				{ type: "image", data: image.ref, mimeType: "image/png" },
+			],
+			isError: false,
+			timestamp: 2,
+		},
+	});
+	const entries: readonly FixtureRecord[] = [
+		{ type: "message", id: "u1", message: { role: "user", content: `u1 ${BODY}`, timestamp: 1 } },
+		call("a1", "call-1"),
+		result("r1", "call-1", images[0]),
+		call("a2", "call-2"),
+		result("r2", "call-2", images[1]),
+		...records,
+		{ type: "message", id: "u2", message: { role: "user", content: `u2 ${BODY}`, timestamp: 3 } },
+		{ type: "compaction", id: "c1", summary: `c1 ${BODY}`, firstKeptEntryId: "u2", tokensBefore: 1000 },
+		{ type: "message", id: "a3", message: assistant(`a3 ${BODY}`) },
+	];
+	const header: SessionHeader = {
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		id: path.basename(dir),
+		timestamp,
+		cwd: dir,
+	};
+	const lines = [
+		header,
+		...entries.map((record, index) => ({
+			...record,
+			parentId: index === 0 ? null : entries[index - 1]!.id,
+			timestamp,
+		})),
+	];
+	const file = path.join(dir, "session.jsonl");
+	await Bun.write(file, lines.map(line => `${JSON.stringify(line)}\n`).join(""));
+	return file;
+}
+
 describe("cold entry store", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -690,91 +776,7 @@ describe("cold entry store", () => {
 		it("apply at a resume the prune and patch records of cold tool results without reading their images", async () => {
 			using dir = TempDir.createSync("@omp-cold-entries-");
 			const images = storeImages();
-			const timestamp = "2026-01-01T00:00:00.000Z";
-			const call = (id: string, parentId: string, callId: string) => ({
-				type: "message",
-				id,
-				parentId,
-				timestamp,
-				message: {
-					...assistant(`${id} ${BODY}`),
-					content: [{ type: "toolCall", id: callId, name: "inspect", arguments: {} }],
-					stopReason: "toolUse",
-				},
-			});
-			const result = (id: string, parentId: string, callId: string, image: StoredImage) => ({
-				type: "message",
-				id,
-				parentId,
-				timestamp,
-				message: {
-					role: "toolResult",
-					toolCallId: callId,
-					toolName: "inspect",
-					content: [
-						{ type: "text", text: `${id} ${BODY}` },
-						{ type: "image", data: image.ref, mimeType: "image/png" },
-					],
-					isError: false,
-					timestamp: 2,
-				},
-			});
-			const header: SessionHeader = {
-				type: "session",
-				version: CURRENT_SESSION_VERSION,
-				id: path.basename(dir.path()),
-				timestamp,
-				cwd: dir.path(),
-			};
-			const lines = [
-				header,
-				{
-					type: "message",
-					id: "u1",
-					parentId: null,
-					timestamp,
-					message: { role: "user", content: `u1 ${BODY}`, timestamp: 1 },
-				},
-				call("a1", "u1", "call-1"),
-				result("r1", "a1", "call-1", images[0]),
-				call("a2", "r1", "call-2"),
-				result("r2", "a2", "call-2", images[1]),
-				{
-					type: "custom",
-					customType: "tool_result_prune",
-					id: "p1",
-					parentId: "r2",
-					timestamp,
-					data: { results: [{ entryId: "r1", notice: "[r1 pruned]", prunedAt: 7 }] },
-				},
-				{
-					type: "custom",
-					customType: "entry_patch",
-					id: "x1",
-					parentId: "p1",
-					timestamp,
-					data: { patches: [{ entryId: "r2", message: { content: [{ type: "text", text: "r2 patched" }] } }] },
-				},
-				{
-					type: "message",
-					id: "u2",
-					parentId: "x1",
-					timestamp,
-					message: { role: "user", content: `u2 ${BODY}`, timestamp: 3 },
-				},
-				{
-					type: "compaction",
-					id: "c1",
-					parentId: "u2",
-					timestamp,
-					summary: `c1 ${BODY}`,
-					firstKeptEntryId: "u2",
-					tokensBefore: 1000,
-				},
-				{ type: "message", id: "a3", parentId: "c1", timestamp, message: assistant(`a3 ${BODY}`) },
-			];
-			const file = path.join(dir.path(), "session.jsonl");
-			await Bun.write(file, lines.map(line => `${JSON.stringify(line)}\n`).join(""));
+			const file = await writeToolResultSession(dir.path(), images, [R1_PRUNE, R2_PATCH]);
 			const reads = vi.spyOn(BlobStore.prototype, "getSync");
 
 			const manager = await open(file);
@@ -793,6 +795,42 @@ describe("cold entry store", () => {
 					cold: [true, true],
 					r1: { content: [{ type: "text", text: "[r1 pruned]" }], prunedAt: 7 },
 					r2: [{ type: "text", text: "r2 patched" }],
+				});
+			} finally {
+				await manager.close();
+			}
+		});
+
+		// If this regresses, a session whose previous process, or another writer, appends a prune record
+		// reads the images of the cold tool result the record names, which the record then replaces.
+		it("apply a prune record another writer appends to a cold tool result without reading its image", async () => {
+			using dir = TempDir.createSync("@omp-cold-entries-");
+			const images = storeImages();
+			const file = await writeToolResultSession(dir.path(), images);
+			const manager = await open(file);
+			try {
+				const coldBefore = isColdEntry(entry(manager, "r1"));
+				const prune = { ...R1_PRUNE, parentId: "a3", timestamp: "2026-01-01T00:00:00.000Z" };
+				fs.appendFileSync(file, `${JSON.stringify(prune)}\n`);
+				const reads = vi.spyOn(BlobStore.prototype, "getSync");
+				// This manager's next append finds the record past what it wrote, and keeps it.
+				manager.appendMessage({ role: "user", content: "next", timestamp: 4 });
+				await manager.flush();
+
+				const hashes = new Set(images.map(image => image.hash));
+				const r1 = messageOf(entry(manager, "r1"));
+				expect({
+					coldBefore,
+					adopted: manager.getEntry(R1_PRUNE.id) !== undefined,
+					imageReads: reads.mock.calls.filter(([hash]) => hashes.has(hash)),
+					coldAfter: isColdEntry(entry(manager, "r1")),
+					r1: r1.role === "toolResult" ? { content: r1.content, prunedAt: r1.prunedAt } : undefined,
+				}).toEqual({
+					coldBefore: true,
+					adopted: true,
+					imageReads: [],
+					coldAfter: true,
+					r1: { content: [{ type: "text", text: "[r1 pruned]" }], prunedAt: 7 },
 				});
 			} finally {
 				await manager.close();
