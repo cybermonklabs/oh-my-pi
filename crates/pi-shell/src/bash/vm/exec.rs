@@ -2815,8 +2815,17 @@ pub fn start_procsub(
 	}
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
 	// bash's `process_substitute` sets `SUBSHELL_COMSUB` too: it reports no
-	// job a signal killed ([`super::killed`]).
+	// job a signal killed ([`super::killed`]). Its process keeps the job
+	// list (no `without_job_control`), and drops first the finished jobs a
+	// command substitution drops: `cat <(jobs)` lists what `$(jobs)` lists.
+	let bash = child.mode.dialect() != Dialect::Zsh;
+	if bash {
+		child.jobs = inherited_jobs(vp, true);
+	}
 	child.jobs.comsub = super::proc::Comsub::Own;
+	if bash {
+		drop_finished_jobs(k, cx, vp, &mut child);
+	}
 	zsh_subshell_traps(k, cx, &mut child, false);
 	// bash's `process_substitute` calls `setup_async_signals` too: without
 	// job control it ignores `INT` and `QUIT`.
@@ -4803,11 +4812,13 @@ pub(super) fn fork_async_ignored(
 }
 
 /// The job table a child that lists its parent's jobs starts with (a
-/// command substitution, a `jobs` pipeline stage): copies of them, which
-/// are not its children, and the statuses its parent kept for `wait PID`
-/// (bash's child has the parent's bgp list: a command substitution's `wait
-/// PID` finds one); `subshell` turns job control off. A fork keeps its
-/// shell's frozen job list ([`super::proc::JobTable::kept`]).
+/// command or process substitution, a `jobs` pipeline stage): copies of
+/// them, which are not its children, and the statuses its parent kept for
+/// `wait PID` (bash's child has the parent's bgp list: a command
+/// substitution's `wait PID` finds one); `subshell` turns job control off.
+/// A fork keeps its shell's frozen job list: the parent's own
+/// ([`Vproc::jobs_kept`]) or the one it started with
+/// ([`super::proc::JobTable::kept`]).
 pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTable {
 	let parent = &vp.jobs;
 	let mut list = parent.list.clone();
@@ -4821,16 +4832,17 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 		chld: 0,
 		subshell,
 		comsub: parent.comsub,
-		kept: parent.kept,
+		kept: parent.kept || vp.jobs_kept(),
 		bgp: parent.bgp.clone(),
 	}
 }
 
-/// bash 5.3 for a command substitution child of a shell that is not
-/// interactive: before the child reads its first command, `shell_getc`'s
-/// `notify_and_cleanup` (parse.y) deletes each finished job that
-/// `notify_of_job_status` marks notified there (`startup_state` 2 with
-/// `SUBSHELL_COMSUB`): every one but the job `$!` names, and not one that a
+/// bash 5.3 for the process of a command or process substitution of a shell
+/// that is not interactive (`process_substitute` sets `SUBSHELL_COMSUB` and
+/// `startup_state` 2 too): before the child reads its first command,
+/// `shell_getc`'s `notify_and_cleanup` (parse.y) deletes each finished job
+/// that `notify_of_job_status` marks notified there: every one but the job
+/// `$!` names, and not one that a
 /// SIGINT, SIGTERM or SIGPIPE killed, nor one that a signal the shell
 /// ignores with `trap '' SIG` killed (the child's `signal_is_trapped`,
 /// [`super::killed::ignored_by_trap`]); one that a signal the shell traps
@@ -4843,13 +4855,14 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 /// and the current and previous jobs are chosen again as `delete_job` does.
 /// The child is a fork of `vp`, and keeps `vp`'s `jobs_list_frozen`: where
 /// `vp`'s job list is kept ([`Vproc::jobs_kept`]: the last stage of a
-/// `lastpipe` pipeline, a function substitution), or was kept when `vp`
-/// itself started ([`super::proc::JobTable::kept`]), `notify_and_cleanup`
-/// returns before `cleanup_dead_jobs`, and the child keeps every job. An
-/// interactive shell's command substitution reads no line through that
-/// path, and keeps every job too.
+/// `lastpipe` pipeline, a function substitution, a trap run with the list
+/// frozen), or `vp` is itself a fork of a shell whose list was kept then
+/// (a subshell, a pipeline stage, a background job, a command or process
+/// substitution: [`super::proc::JobTable::kept`], which [`inherited_jobs`]
+/// set), `notify_and_cleanup` returns before `cleanup_dead_jobs`, and the
+/// child keeps every job. An interactive shell's command substitution reads
+/// no line through that path, and keeps every job too.
 fn drop_finished_jobs(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, child: &mut Vproc) {
-	child.jobs.kept |= vp.jobs_kept();
 	if child.jobs.kept || super::jobctl::interactive(k) {
 		return;
 	}

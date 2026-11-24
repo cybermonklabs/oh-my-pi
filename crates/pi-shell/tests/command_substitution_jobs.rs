@@ -1,12 +1,13 @@
-//! A command substitution of a shell that is not interactive drops the
-//! finished jobs bash 5.3 drops before it runs its first command: every one
-//! but the job `$!` names, and not one a SIGINT, SIGTERM or SIGPIPE killed,
-//! nor one a signal the shell ignores with `trap '' SIG` killed (how the job
-//! ended, not its status: one that exited 130, 141 or 143 goes). Each one
-//! keeps its status for `wait PID`. So `$(jobs)` lists what bash lists, and
-//! a loop that waits for `$(jobs -p | wc -l)` to fall ends. Where bash's job
-//! list is frozen (the last stage of a `lastpipe` pipeline, a function
-//! substitution) it drops none.
+//! A command or process substitution of a shell that is not interactive
+//! drops the finished jobs bash 5.3 drops before it runs its first command:
+//! every one but the job `$!` names, and not one a SIGINT, SIGTERM or SIGPIPE
+//! killed, nor one a signal the shell ignores with `trap '' SIG` killed (how
+//! the job ended, not its status: one that exited 130, 141 or 143 goes).
+//! Each one keeps its status for `wait PID`. So `$(jobs)` and `<(jobs)` list
+//! what bash lists, and a loop that waits for `$(jobs -p | wc -l)` to fall
+//! ends. Where bash's job list is frozen (the last stage of a `lastpipe`
+//! pipeline, a function substitution, a trap run with the list frozen, and
+//! any fork of a shell there) it drops none.
 //! Each row's output is bash 5.3.20's for `bash -c`; a finished job's end is
 //! waited for with `kill -0`, so the rows need no timing. bash 5.2.21 prints a
 //! narrower status column, has no function substitution (`${ …; }`), and
@@ -118,6 +119,13 @@ fn a_command_substitution_lists_the_jobs_bash_lists() {
 			err:    "",
 		},
 		Row {
+			name:   "hangup-under-an-ignoring-trap-set-after-it-kept",
+			script: r#"sleep 20 & p=$!; /bin/true & q=$!; kill -HUP $p; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; trap '' HUP; x=$(jobs); echo "[$x]"; echo end"#,
+			out:    "[[1]-  Hangup                     sleep 20\n[2]+  Done                       \
+			         /bin/true]\nend\n",
+			err:    "",
+		},
+		Row {
 			name:   "exit-status-dropped",
 			script: r#"/bin/sh -c 'exit 3' & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; echo end"#,
 			out:    "[[2]   Done                       /bin/true]\nend\n",
@@ -207,11 +215,12 @@ fn a_count_of_listed_jobs_falls_when_they_end() {
 /// Where bash's job list is frozen, its command substitution drops no job:
 /// the substitution's process is a fork that keeps the list frozen, so it
 /// deletes nothing before its first command. That is the last stage of a
-/// `lastpipe` pipeline, which the shell runs itself, and a function
-/// substitution (`${ …; }`), also for a command substitution started inside
-/// one started there. A loop in a `lastpipe` stage that waits for
-/// `$(jobs -p | wc -l)` to fall counts every job (its bound prints `stuck`);
-/// after the pipeline the count falls again.
+/// `lastpipe` pipeline, which the shell runs itself, a function
+/// substitution (`${ …; }`), and a trap run with the list frozen (`INT` as
+/// the foreground child that SIGINT killed ends), also for a command
+/// substitution started inside one started there. A loop in a `lastpipe`
+/// stage that waits for `$(jobs -p | wc -l)` to fall counts every job (its
+/// bound prints `stuck`); after the pipeline the count falls again.
 #[test]
 fn a_command_substitution_drops_no_job_where_bash_s_list_is_frozen() {
 	assert_rows(&[
@@ -255,7 +264,102 @@ fn a_command_substitution_drops_no_job_where_bash_s_list_is_frozen() {
 			out:    "stuck\nend\n",
 			err:    "",
 		},
+		Row {
+			name:   "int-trap",
+			script: r#"/bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; trap 'x=$(jobs); echo "[$x]"' INT; /bin/sh -c 'kill -INT $PPID; kill -INT $$'; echo "rc=$?""#,
+			out:    "[[1]-  Done                       /bin/true\n[2]+  Done                       \
+			         /bin/true]\nrc=130\n",
+			err:    "",
+		},
 	]);
+}
+
+/// A fork of a shell whose job list is frozen keeps it frozen (bash's
+/// `without_job_control` empties a subshell's job list but leaves the
+/// freeze): a command or process substitution it starts drops none of the
+/// jobs the fork itself started. In a `lastpipe` stage and in `${ …; }`: a
+/// `( … )` subshell, a `{ …; } &` group, a pipeline stage, a substitution
+/// nested in a subshell, and a process substitution.
+#[test]
+fn a_fork_of_a_frozen_shell_drops_no_job() {
+	assert_rows(&[
+		Row {
+			name:   "lastpipe-subshell",
+			script: r#"shopt -s lastpipe; echo | { ( /bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]" ); }"#,
+			out:    "[[1]-  Done                       /bin/true\n[2]+  Done                       \
+			         /bin/true]\n",
+			err:    "",
+		},
+		Row {
+			name:   "lastpipe-async-group",
+			script: r#"shopt -s lastpipe; echo | { { /bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; } & wait; }"#,
+			out:    "[[1]-  Done                       /bin/true\n[2]+  Done                       \
+			         /bin/true]\n",
+			err:    "",
+		},
+		Row {
+			name:   "lastpipe-pipeline-stage",
+			script: r#"shopt -s lastpipe; echo | { { /bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; } | cat; }"#,
+			out:    "[[1]-  Done                       /bin/true\n[2]+  Done                       \
+			         /bin/true]\n",
+			err:    "",
+		},
+		Row {
+			name:   "lastpipe-subshell-nested",
+			script: r#"shopt -s lastpipe; echo | { ( /bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(echo "$(jobs)"); echo "[$x]" ); }"#,
+			out:    "[[1]-  Done                       /bin/true\n[2]+  Done                       \
+			         /bin/true]\n",
+			err:    "",
+		},
+		Row {
+			name:   "function-substitution-subshell",
+			script: r#"y=${ ( /bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]" ); }; echo "$y""#,
+			out:    "[[1]-  Done                       /bin/true\n[2]+  Done                       \
+			         /bin/true]\n",
+			err:    "",
+		},
+		Row {
+			name:   "function-substitution-async-group",
+			script: r#"y=${ { /bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; } & wait; }; echo "$y""#,
+			out:    "[[1]-  Done                       /bin/true\n[2]+  Done                       \
+			         /bin/true]\n",
+			err:    "",
+		},
+		Row {
+			name:   "function-substitution-pipeline-stage",
+			script: r#"y=${ { /bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]"; } | cat; }; echo "$y""#,
+			out:    "[[1]-  Done                       /bin/true\n[2]+  Done                       \
+			         /bin/true]\n",
+			err:    "",
+		},
+		Row {
+			name:   "function-substitution-subshell-nested",
+			script: r#"y=${ ( /bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(echo "$(jobs)"); echo "[$x]" ); }; echo "$y""#,
+			out:    "[[1]-  Done                       /bin/true\n[2]+  Done                       \
+			         /bin/true]\n",
+			err:    "",
+		},
+		Row {
+			name:   "function-substitution-process-substitution",
+			script: r#"y=${ cat <( /bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; x=$(jobs); echo "[$x]" ); }; echo "$y""#,
+			out:    "[[1]-  Done                       /bin/true\n[2]+  Done                       \
+			         /bin/true]\n",
+			err:    "",
+		},
+	]);
+}
+
+/// A process substitution's process keeps the shell's job list and drops
+/// the finished jobs a command substitution drops, before its first
+/// command: `cat <(jobs)` lists what `$(jobs)` lists (it listed nothing).
+#[test]
+fn a_process_substitution_lists_the_jobs_a_command_substitution_lists() {
+	assert_rows(&[Row {
+		name:   "process-substitution",
+		script: r"/bin/true & p=$!; /bin/true & q=$!; while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; cat <(jobs); echo end",
+		out:    "[2]   Done                       /bin/true\nend\n",
+		err:    "",
+	}]);
 }
 
 /// A job the command substitution dropped keeps its status there: `wait
