@@ -1,4 +1,6 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
 
 export interface OwnerPrivateDirStat {
@@ -30,16 +32,52 @@ export function ownerPrivateDirError(stat: OwnerPrivateDirStat, expectedUid: num
  * exists as it is, which another account could have made first, or left open
  * to others. Unlike {@link assertOwnerPrivateDir} it changes nothing, so a
  * caller that cannot use the directory can go without it.
- *
- * @param label Human-readable directory role prefixed to the thrown message.
  */
-export function assertAccountPrivateDir(dir: string, uid: number, label: string): void {
+function assertAccountPrivateDir(dir: string, uid: number, label: string): void {
 	const stat = fs.lstatSync(dir);
 	const reason = ownerPrivateDirError(
 		{ isSymlink: stat.isSymbolicLink(), isDir: stat.isDirectory(), uid: stat.uid, mode: stat.mode },
 		uid,
 	);
 	if (reason) throw new Error(`${label} ${dir} ${reason}`);
+}
+
+/**
+ * The directory under `os.tmpdir()` for account `uid`'s private temporary
+ * files of kind `prefix`: one per account, as the temporary directory is
+ * shared between accounts and a directory another account made first would
+ * refuse this one's files.
+ */
+export function privateTempDir(prefix: string, uid: number): string {
+	return path.join(os.tmpdir(), `omp-${prefix}-${uid}`);
+}
+
+/**
+ * Open a new file, mode 0600, in {@link privateTempDir}, made 0700 when
+ * missing and used only when it is a directory (not a link to one) that
+ * account `uid` owns with mode 0700, and unlink it once open: its disk is
+ * freed when the descriptor closes, and a killed process leaves nothing.
+ * Returns the descriptor. Throws when the directory or the file cannot be
+ * made or opened (`os.tmpdir()` read-only, under a regular file, full, out of
+ * descriptors) or the directory is refused; a file it opened and could not
+ * unlink is closed and removed.
+ *
+ * @param label Human-readable directory role prefixed to a refusal's message.
+ */
+export function openPrivateTempFile(prefix: string, uid: number, label: string): number {
+	const dir = privateTempDir(prefix, uid);
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	assertAccountPrivateDir(dir, uid, label);
+	const file = path.join(dir, `${process.pid}-${crypto.randomUUID()}`);
+	const fd = fs.openSync(file, "wx+", 0o600);
+	try {
+		fs.unlinkSync(file);
+	} catch (error) {
+		fs.closeSync(fd);
+		fs.rmSync(file, { force: true });
+		throw error;
+	}
+	return fd;
 }
 
 /**

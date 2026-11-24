@@ -5,11 +5,9 @@
  * full collections that record reads and a load's writes share.
  */
 import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
-import { assertAccountPrivateDir } from "../utils/owner-private-dir";
+import { openPrivateTempFile } from "../utils/owner-private-dir";
 import type { BlobStore } from "./blob-store";
 import type { SessionEntry } from "./session-entries";
 import { resolveBlobRefsInEntriesSync } from "./session-loader";
@@ -34,11 +32,13 @@ const CACHE_BYTES = 16 * 1024 * 1024;
  */
 const WRITE_BATCH_BYTES = 1024 * 1024;
 /**
- * zstd level of a block of records kept in memory. Measured on two long
- * transcripts: 17.2 MiB of records took 3.9 MiB, 344.3 MiB took 65.7 MiB, and
- * a read of one record (decompress its 1 MiB block, slice it) 1.6 to 2.0 ms.
+ * zstd level of a block kept in memory: the store's blocks of records, and a
+ * rewrite's in-memory copy of its body (`BodySnapshot` in `session-body.ts`).
+ * Measured on two long transcripts: 17.2 MiB of records took 3.9 MiB, 344.3
+ * MiB took 65.7 MiB, and a read of one record (decompress its 1 MiB block,
+ * slice it) 1.6 to 2.0 ms.
  */
-const BLOCK_ZSTD_LEVEL = 3;
+export const BLOCK_ZSTD_LEVEL = 3;
 /**
  * Record bytes read back, or written by a load, between two full collections.
  * One synchronous loop over many cold entries (an extension reading every
@@ -125,30 +125,6 @@ interface DecompressedBlock {
  */
 let openFailureLogged = false;
 
-/**
- * Make a store's file under `os.tmpdir()/omp-cold-<uid>/`, a directory that
- * account `uid` owns alone, and unlink it once open. Throws when the file
- * cannot be made (`os.tmpdir()` read-only, under a regular file, full, out of
- * descriptors) or the directory is not the account's alone.
- */
-function openStoreFile(uid: number): StoreHandle {
-	// One directory per account: `os.tmpdir()` is shared between accounts on
-	// Linux and the directory is 0700, so under one shared name the first
-	// account would own it and every other account's open would fail.
-	const dir = path.join(os.tmpdir(), `omp-cold-${uid}`);
-	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-	assertAccountPrivateDir(dir, uid, "Older session entry store directory");
-	const file = path.join(dir, `${process.pid}-${crypto.randomUUID()}.jsonl`);
-	const fd = fs.openSync(file, "wx+", 0o600);
-	try {
-		fs.unlinkSync(file);
-	} catch (error) {
-		fs.closeSync(fd);
-		throw error;
-	}
-	return { fd, closed: false };
-}
-
 function releaseStoreHandle(handle: StoreHandle): void {
 	if (handle.closed) return;
 	handle.closed = true;
@@ -228,11 +204,12 @@ export class ColdEntryStore {
 	#hydrations = 0;
 
 	/**
-	 * A new store: over a file, or in memory where the platform has no account
-	 * ids (Windows) and where its file cannot be made (`os.tmpdir()` read-only,
-	 * under a regular file, full, out of descriptors, or its directory not one
-	 * the account owns alone), which last is logged once per process with the
-	 * reason.
+	 * A new store: over a file under `os.tmpdir()/omp-cold-<uid>/`, a directory
+	 * that account `uid` owns alone (`openPrivateTempFile`), or in memory where
+	 * the account id cannot be read (Windows) and where its file cannot be made
+	 * (`os.tmpdir()` read-only, under a regular file, full, out of descriptors,
+	 * or its directory not one the account owns alone), which last is logged
+	 * once per process with the reason.
 	 */
 	static open(blobs: BlobStore): ColdEntryStore {
 		// Without an account id there is no owner to check the store directory
@@ -241,7 +218,8 @@ export class ColdEntryStore {
 		const uid = process.getuid?.();
 		if (uid === undefined) return new ColdEntryStore(blobs, undefined);
 		try {
-			return new ColdEntryStore(blobs, openStoreFile(uid));
+			const fd = openPrivateTempFile("cold", uid, "Older session entry store directory");
+			return new ColdEntryStore(blobs, { fd, closed: false });
 		} catch (error) {
 			if (!openFailureLogged) {
 				openFailureLogged = true;

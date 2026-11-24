@@ -5,11 +5,10 @@
  * from the lines when the spool cannot be used.
  */
 import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import { countNewlines, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { countNewlines, logger, toError } from "@oh-my-pi/pi-utils";
 import { digestStream } from "../utils/file-hash";
-import { assertAccountPrivateDir } from "../utils/owner-private-dir";
+import { openPrivateTempFile, privateTempDir } from "../utils/owner-private-dir";
+import { BLOCK_ZSTD_LEVEL } from "./cold-entry-store";
 import type { SessionStorageBackend } from "./indexed-session-storage";
 import {
 	LINE_STREAM_CHUNK,
@@ -19,16 +18,6 @@ import {
 	writeLinesToDescriptorSync,
 } from "./session-storage";
 import { parseTitleSlotFromContent, type SessionTitleUpdate, titleUpdateFromSlot } from "./session-title-slot";
-
-/**
- * Directory under the OS temp directory holding full-write bodies until their
- * backend publish settles: one per account (`uid`), private to it, as the OS
- * temp directory is shared between accounts and a directory another account
- * made first would refuse this one's files.
- */
-function spoolDir(uid: number): string {
-	return path.join(os.tmpdir(), `omp-spool-${uid}`);
-}
 
 /** One full write: its size and title slot, its backend publish, and the read-back after a failed publish. */
 export interface FullBody {
@@ -113,9 +102,6 @@ function readAt(fd: number, buffer: Uint8Array, position: number): Promise<numbe
 	return promise;
 }
 
-/** zstd level of a {@link BodySnapshot}'s blocks, the cold store's level for its blocks. */
-const SNAPSHOT_ZSTD_LEVEL = 3;
-
 /**
  * A {@link KeptBody} kept in memory where no private spool file can be made
  * (a platform without account ids, Windows): the UTF-8 bytes of its lines,
@@ -165,7 +151,7 @@ function snapshotLines(lines: Iterable<string>): BodySnapshot {
 	const blocks: Uint8Array[] = [];
 	let bytes = 0;
 	for (const chunk of encodeLines(head.note(lines), true)) {
-		blocks.push(Bun.zstdCompressSync(chunk, { level: SNAPSHOT_ZSTD_LEVEL }));
+		blocks.push(Bun.zstdCompressSync(chunk, { level: BLOCK_ZSTD_LEVEL }));
 		bytes += chunk.byteLength;
 	}
 	return new BodySnapshot(blocks, bytes, head.title());
@@ -207,28 +193,20 @@ class LinesHead {
 }
 
 /**
- * Spool `lines` to a new file under {@link spoolDir} of account `uid`,
- * unlinked once open, iterating them once, counting their bytes and reading
- * the title slot from their {@link LinesHead}. Throws when the directory or
- * the file cannot be made, opened or written, and when the directory is not
- * one this account owns that no other account can enter (another account can
- * make the shared name first, or plant a symlink there). A file it opened is
- * closed and removed.
+ * Spool `lines` to a new file of account `uid` under `os.tmpdir()/omp-spool-<uid>/`
+ * ({@link openPrivateTempFile}), iterating them once, counting their bytes and
+ * reading the title slot from their {@link LinesHead}. Throws when the file
+ * cannot be made, opened or written, or its directory is refused; a file it
+ * opened is closed.
  */
 function spoolLines(lines: Iterable<string>, uid: number): BodySpool {
-	const dir = spoolDir(uid);
-	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-	assertAccountPrivateDir(dir, uid, "Session spool directory");
-	const file = path.join(dir, `${process.pid}-${Snowflake.next()}.spool`);
-	const fd = fs.openSync(file, "wx+", 0o600);
+	const fd = openPrivateTempFile("spool", uid, "Session spool directory");
 	try {
-		fs.unlinkSync(file);
 		const head = new LinesHead();
 		const bytes = writeLinesToDescriptorSync(fd, head.note(lines));
 		return new BodySpool(fd, bytes, head.title());
 	} catch (err) {
 		fs.closeSync(fd);
-		fs.rmSync(file, { force: true });
 		throw err;
 	}
 }
@@ -388,7 +366,7 @@ export class FullBodies {
 			if (!this.#spoolFailureLogged) {
 				this.#spoolFailureLogged = true;
 				logger.warn("Session rewrites stream straight to the store: their spool file cannot be used", {
-					dir: spoolDir(uid),
+					dir: privateTempDir("spool", uid),
 					error: spoolError,
 				});
 			}
