@@ -831,18 +831,22 @@ mod tests {
 	/// `JoinHandle` detaches on drop, so without the abort guard a recovery
 	/// walk would run on after the session that asked for it closed.
 	///
-	/// The start is a handshake rather than a sleep, so a slow scheduler
-	/// cannot fail it; only the span between the drop and the work's own
-	/// completion is a wait, and it is generous.
+	/// The start is a handshake and the end is the work's own drop, so no
+	/// step waits on a clock: the work never finishes on its own, and only the
+	/// abort can drop it.
 	#[test]
 	fn dropping_the_caller_stops_work_on_the_filesystem_runtime() {
-		use std::{
-			sync::{
-				Arc,
-				atomic::{AtomicBool, Ordering},
-			},
-			time::Duration,
-		};
+		use std::time::Duration;
+
+		/// Sends on its channel when dropped: the work future that holds it
+		/// was dropped, so it can never run on.
+		struct SignalOnDrop(flume::Sender<()>);
+
+		impl Drop for SignalOnDrop {
+			fn drop(&mut self) {
+				let _ = self.0.send(());
+			}
+		}
 
 		let host = tokio::runtime::Builder::new_multi_thread()
 			.worker_threads(1)
@@ -850,15 +854,15 @@ mod tests {
 			.build()
 			.unwrap();
 		let (started_tx, started_rx) = flume::bounded::<()>(1);
-		let ran_on = Arc::new(AtomicBool::new(false));
-		let ran_on_probe = Arc::clone(&ran_on);
+		let (dropped_tx, dropped_rx) = flume::bounded::<()>(1);
 
 		host.block_on(async move {
 			let work = Box::pin(on_filesystem_runtime("dropped", async move {
+				let _dropped = SignalOnDrop(dropped_tx);
 				let _ = started_tx.send(());
-				// The yield point a walker has between directories.
-				tokio::time::sleep(Duration::from_secs(2)).await;
-				ran_on_probe.store(true, Ordering::SeqCst);
+				// The yield point a walker has between directories, held open
+				// until the work is dropped.
+				std::future::pending::<()>().await;
 			}));
 			let mut work = Some(work);
 			// Let go the moment the work is in flight.
@@ -868,12 +872,13 @@ mod tests {
 			}
 			drop(work.take());
 
-			tokio::time::sleep(Duration::from_secs(3)).await;
-			assert!(
-				!ran_on.load(Ordering::SeqCst),
-				"the work ran on after its caller was dropped, so a closed session leaves filesystem \
-				 work running"
-			);
+			tokio::time::timeout(Duration::from_secs(10), dropped_rx.recv_async())
+				.await
+				.expect(
+					"the work ran on after its caller was dropped, so a closed session leaves \
+					 filesystem work running",
+				)
+				.expect("the work's drop signal never arrived");
 		});
 	}
 

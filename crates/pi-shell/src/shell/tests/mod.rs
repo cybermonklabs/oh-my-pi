@@ -520,6 +520,33 @@ replace = [{ pattern = "hello", replacement = "HI" }]
 	}
 }
 
+/// A FIFO at `path`: a child script that runs `read _ < "$gate"` blocks
+/// in that open until [`release_gate`], without polling for a file.
+#[cfg(unix)]
+fn gate_fifo(path: &std::path::Path) {
+	use std::os::unix::ffi::OsStrExt as _;
+	let name = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("gate path");
+	// SAFETY: `name` is a valid C string for the call's duration.
+	let rc = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+	assert_eq!(rc, 0, "mkfifo {}: {}", path.display(), std::io::Error::last_os_error());
+}
+
+/// Releases a child blocked on the [`gate_fifo`] at `path`: one line,
+/// written through a descriptor that also reads, so the open does not wait
+/// for the child and the line waits in the FIFO for it. Keep the returned
+/// file until the child has read it.
+#[cfg(unix)]
+fn release_gate(path: &std::path::Path) -> std::fs::File {
+	use std::io::Write as _;
+	let mut gate = std::fs::File::options()
+		.read(true)
+		.write(true)
+		.open(path)
+		.expect("open the gate");
+	gate.write_all(b"go\n").expect("release the gate");
+	gate
+}
+
 /// Lets in-flight writes land, empties `path`, and reports whether anything
 /// wrote to it again: a background `yes` still running refills it within
 /// milliseconds.

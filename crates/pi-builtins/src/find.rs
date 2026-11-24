@@ -5510,19 +5510,11 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn walks_a_directory_chain_deeper_than_the_stack() {
 		let (_dir, root) = fixture();
-		// Stay under the host's PATH_MAX: every level adds "/d".
-		#[cfg(unix)]
-		let path_max = usize::try_from(libc::PATH_MAX).expect("PATH_MAX is positive");
-		#[cfg(not(unix))]
-		let path_max = 4096;
-		let depth = (path_max - 96 - root.join("deep/f").as_os_str().len()) / 2;
-		let mut chain = PathBuf::from("deep");
-		for _ in 0..depth {
-			chain.push("d");
-		}
-		fs::create_dir_all(root.join(&chain)).unwrap();
-		let leaf = chain.join("f");
-		fs::write(root.join(&leaf), b"x").unwrap();
+		// Dropped before `_dir`, so the tempdir's removal does not hold a
+		// descriptor for each level of it (`DeepChain`).
+		let chain = crate::host::DeepChain::create(root.join("deep"));
+		let depth = chain.depth();
+		fs::write(chain.deepest().join("f"), b"x").unwrap();
 
 		let runtime = tokio::runtime::Builder::new_multi_thread()
 			.worker_threads(1)

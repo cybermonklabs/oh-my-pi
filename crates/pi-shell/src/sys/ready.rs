@@ -345,11 +345,46 @@ mod tests {
 
 	use super::*;
 
-	struct Unpark(thread::Thread);
+	/// A waker that records being woken and unparks the thread it was made on.
+	struct Woken {
+		thread: thread::Thread,
+		woken:  std::sync::atomic::AtomicBool,
+	}
 
-	impl Wake for Unpark {
+	impl Wake for Woken {
 		fn wake(self: Arc<Self>) {
-			self.0.unpark();
+			self.woken.store(true, Ordering::SeqCst);
+			self.thread.unpark();
+		}
+	}
+
+	/// The id of the calling thread.
+	#[cfg(target_os = "linux")]
+	fn current_thread_id() -> libc::pid_t {
+		// SAFETY: `gettid` has no preconditions.
+		unsafe { libc::gettid() }
+	}
+
+	/// Returns once this process's thread `tid` sleeps (state `S`), as a
+	/// parked thread does, looking 1 ms apart at first and at most 20 ms apart
+	/// later; fails after 10 seconds.
+	#[cfg(target_os = "linux")]
+	fn wait_until_asleep(tid: libc::pid_t) {
+		let deadline = std::time::Instant::now() + Duration::from_secs(10);
+		let mut backoff = crate::testkit::Backoff::new();
+		loop {
+			let stat =
+				std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap_or_default();
+			// The name, in parentheses, may hold anything: the state follows
+			// the last `)`.
+			if stat
+				.rsplit_once(')')
+				.is_some_and(|(_, rest)| rest.trim_start().starts_with('S'))
+			{
+				return;
+			}
+			assert!(std::time::Instant::now() < deadline, "the reader never parked");
+			thread::sleep(backoff.pause());
 		}
 	}
 
@@ -358,18 +393,31 @@ mod tests {
 		let (r, mut w) = io::pipe().unwrap();
 		assert!(!now(r.as_raw_fd(), READ).unwrap());
 		assert!(now(w.as_raw_fd(), WRITE).unwrap());
-		let waker = Waker::from(Arc::new(Unpark(thread::current())));
+		let woken = Arc::new(Woken { thread: thread::current(), woken: Default::default() });
+		let waker = Waker::from(Arc::clone(&woken));
 		let _watch = watch(r.as_raw_fd(), READ, &waker).unwrap();
+		#[cfg(target_os = "linux")]
+		let reader = current_thread_id();
 		let writer = thread::spawn(move || {
+			// The pipe becomes readable once the reader is parked, waiting for
+			// the wake. Without /proc (macOS), after 50 ms instead.
+			#[cfg(target_os = "linux")]
+			wait_until_asleep(reader);
+			#[cfg(not(target_os = "linux"))]
 			thread::sleep(Duration::from_millis(50));
 			w.write_all(b"x").unwrap();
 			w
 		});
+		// The watch's wake ends the park; the deadline only ends a test whose
+		// wake never comes.
 		let deadline = Instant::now() + Duration::from_secs(10);
-		while !now(r.as_raw_fd(), READ).unwrap() {
-			assert!(Instant::now() < deadline);
-			thread::park_timeout(Duration::from_millis(100));
+		while !woken.woken.load(Ordering::SeqCst) {
+			let left = deadline
+				.checked_duration_since(Instant::now())
+				.expect("the watch never woke the reader");
+			thread::park_timeout(left);
 		}
+		assert!(now(r.as_raw_fd(), READ).unwrap(), "woken once readable");
 		drop(writer.join().unwrap());
 		assert!(now(r.as_raw_fd(), READ).unwrap(), "hang-up also counts as ready");
 	}
