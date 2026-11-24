@@ -828,14 +828,21 @@ async function pickPageFromList(pages: Page[], options: PickTargetOptions): Prom
 
 /**
  * SIGTERM the process tree, wait briefly, then SIGKILL anything still alive.
- * Single-process variant for our own spawned children. A hard wave whose walk
- * could not read the whole tree (no descriptor left) still killed everything it
- * read and the process group: that is logged, and no caller's stop fails on it.
+ * Single-process variant for our own spawned children. A process that leads
+ * a process group of its own (puppeteer launches Chromium detached, so every
+ * browser omp launches leads one) is ended with its group, as puppeteer's own
+ * kill does: the wait lasts until the group is empty, so a child that one of
+ * its processes forks while it is being ended, and that outlives its parent,
+ * is ended too. A process in another's group (an app spawned into omp's own
+ * group) is ended by its tree alone. A hard wave whose walk could not read the
+ * whole tree (no descriptor left) still killed everything it read and the
+ * process group: that is logged, and no caller's stop fails on it.
  */
 export async function gracefulKillTreeOnce(pid: number, gracePeriodMs = 2000): Promise<void> {
 	const process = Process.fromPid(pid);
 	if (!process) return;
-	await process.terminate({ gracefulMs: gracePeriodMs, timeoutMs: 500 }).catch(error => {
+	const group = process.groupId() === pid;
+	await process.terminate({ gracefulMs: gracePeriodMs, timeoutMs: 500, group }).catch(error => {
 		logger.warn("Browser process tree stopped, but part of it could not be read", {
 			pid,
 			error: error instanceof Error ? error.message : String(error),
