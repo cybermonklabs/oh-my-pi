@@ -4124,9 +4124,15 @@ impl arith::Env for Vars<'_, '_> {
 		let target = if declared.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF)) {
 			state::deref(&self.k.root, self.cx.store, self.vp, name).unwrap_or(state::Deref::Plain)
 		} else {
+			let unset = declared.is_none_or(|v| v.attrs.contains(Attrs::INVISIBLE));
 			let (text, bad) = arith_element(declared, index);
 			let value = text.map(arith::Value::of);
 			if bad {
+				// Under `set -u` an unset variable is the unbound error, not
+				// the warning (bash `expr_streval` checks it first).
+				if unset {
+					self.nounset_error(name)?;
+				}
 				self.warn_bad_sub(name);
 			}
 			return self.unbound_checked(name, value);
@@ -4135,9 +4141,13 @@ impl arith::Env for Vars<'_, '_> {
 		let var = state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
 			.ok()
 			.flatten();
+		let unset = var.is_none_or(|v| v.attrs.contains(Attrs::INVISIBLE));
 		let (text, bad) = arith_element(var, index);
 		let value = text.map(arith::Value::of);
 		if bad {
+			if unset {
+				self.nounset_error(name)?;
+			}
 			self.warn_bad_sub(name);
 		}
 		self.unbound_checked(name, value)
@@ -4147,6 +4157,17 @@ impl arith::Env for Vars<'_, '_> {
 		let target =
 			state::deref(&self.k.root, self.cx.store, self.vp, name).unwrap_or(state::Deref::Plain);
 		let (name, index) = deref_target(&target, name, index);
+		// A negative index of bash's dynamic `LINENO`, `PIPESTATUS`, …
+		// counts back from its elements (a scalar's one).
+		let dynamic_next = match index {
+			Some(i) if i.first() == Some(&b'-') && is_dynamic(name) => {
+				dynamic_elements(self.k, self.cx, self.vp, name)
+					.ok()
+					.flatten()
+					.map(|(items, list)| if list { items.len() as i64 } else { 1 })
+			},
+			_ => None,
+		};
 		let mut buf = NumBuffer::new();
 		let text = value.format_into(&mut buf).as_bytes();
 		let cur = state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
@@ -4165,10 +4186,12 @@ impl arith::Env for Vars<'_, '_> {
 			arith::Env::warn(self, Diag::InvalidIdent { name: BString::from(text) });
 			return Ok(());
 		}
-		// A negative index counts back from the end of an indexed array (a
-		// scalar is its element 0); before its start, or of an unset
-		// variable, it names no element: bash reports `name[i]: bad array
-		// subscript` and assigns nothing (`assign_array_element`).
+		// A negative index counts back from the end of an indexed array; a
+		// scalar, declared but unset too, is its element 0 (bash's
+		// `assign_array_element` takes the variable `find_variable` finds,
+		// which may be invisible). Before an array's start, or of an
+		// unset variable, it names no element: bash reports `name[i]: bad
+		// array subscript` and assigns nothing.
 		let mut counted = NumBuffer::new();
 		let assoc = cur
 			.is_some_and(|v| matches!(v.value, VarValue::Assoc(_)) || v.attrs.contains(Attrs::ASSOC));
@@ -4178,9 +4201,11 @@ impl arith::Env for Vars<'_, '_> {
 					.ok()
 					.and_then(|s| s.parse().ok())
 					.unwrap_or(0);
-				let next = cur
-					.filter(|v| !v.attrs.contains(Attrs::INVISIBLE))
-					.map(Var::next_index);
+				let next = match cur {
+					Some(v) if matches!(v.value, VarValue::Str(_)) => Some(1),
+					Some(v) => Some(v.next_index()),
+					None => dynamic_next,
+				};
 				match next.map(|next| next + n) {
 					Some(j) if j >= 0 => Some(j.format_into(&mut counted).as_bytes()),
 					_ => {
@@ -4246,11 +4271,49 @@ impl arith::Env for Vars<'_, '_> {
 		self.k.arith_recent.get(text, self.k.engine.arith())
 	}
 
+	/// Whether `name` is an associative array, a declared empty one too;
+	/// a name reference answers for its target (`declare -n r=A;
+	/// $((r[@]))` reads `A`'s key `@`).
 	fn is_assoc(&mut self, name: &[u8]) -> bool {
-		state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
+		let assoc = |v: &Var| matches!(v.value, VarValue::Assoc(_)) || v.attrs.contains(Attrs::ASSOC);
+		let Some((is_ref, is_assoc)) =
+			state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
+				.ok()
+				.flatten()
+				.map(|v| (v.attrs.contains(Attrs::NAMEREF), assoc(v)))
+		else {
+			return false;
+		};
+		if !is_ref {
+			return is_assoc;
+		}
+		match state::deref(&self.k.root, self.cx.store, self.vp, name) {
+			Ok(state::Deref::To { name: t, index: None }) => {
+				state::lookup_declared(&self.k.root, self.cx.store, self.vp, &t)
+					.ok()
+					.flatten()
+					.is_some_and(assoc)
+			},
+			_ => false,
+		}
+	}
+
+	fn check_set(&mut self, name: &[u8]) -> Result<(), arith::Error> {
+		if is_dynamic(name) {
+			return Ok(());
+		}
+		let target = match state::deref(&self.k.root, self.cx.store, self.vp, name) {
+			Ok(state::Deref::To { name: t, index: None }) => t,
+			_ => BString::from(name),
+		};
+		let unset = state::lookup_declared(&self.k.root, self.cx.store, self.vp, &target)
 			.ok()
 			.flatten()
-			.is_some_and(|v| matches!(v.value, VarValue::Assoc(_)) || v.attrs.contains(Attrs::ASSOC))
+			.is_none_or(|v| v.attrs.contains(Attrs::INVISIBLE));
+		if unset {
+			self.nounset_error(name)?;
+		}
+		Ok(())
 	}
 }
 
@@ -4351,6 +4414,34 @@ impl Vars<'_, '_> {
 	fn warn_bad_sub(&mut self, name: &[u8]) {
 		arith::Env::warn(self, Diag::BadSubscript { shown: BString::from(name) });
 	}
+
+	/// Under `set -u`, the unbound error for the unset variable `name`.
+	fn nounset_error(&mut self, name: &[u8]) -> Result<(), arith::Error> {
+		if state::option(&mut self.k.root, self.cx.store, self.vp, OptId::Nounset).unwrap_or(false) {
+			return Err(arith::Error::Unbound { name: BString::from(name) });
+		}
+		Ok(())
+	}
+}
+
+/// The elements of bash's dynamic variable `name` (`PIPESTATUS`,
+/// `FUNCNAME`, …; a dynamic scalar is its one element) and whether it is
+/// an array; `None` for any other name and for a dynamic associative one.
+///
+/// # Errors
+/// [`StoreError`] when the store cannot be read.
+pub fn dynamic_elements(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	name: &[u8],
+) -> Result<Option<(Vec<BString>, bool)>, StoreError> {
+	let line = super::exec::current_line(vp);
+	Ok(match dynamic_value(k, cx, vp, line, name)? {
+		Some(DynVal::Str(s)) => Some((vec![s], false)),
+		Some(DynVal::List(items)) => Some((items, true)),
+		Some(DynVal::Assoc(_)) | None => None,
+	})
 }
 
 #[cfg(test)]

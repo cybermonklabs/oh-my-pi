@@ -121,10 +121,20 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 			{
 				let (name, i) = (&arg[..open], &arg[open + 1..close]);
 				let v = ctx.var(name)?;
+				// A declared, empty associative array is one too (`declare
+				// -A h; [[ -v h[-1] ]]` looks up the key `-1`).
+				let assoc = v
+					.as_ref()
+					.is_some_and(|v| matches!(v.value, VarValue::Assoc(_)))
+					|| crate::bash::vm::state::lookup_declared(&ctx.k.root, ctx.cx.store, ctx.vp, name)
+						.map_err(Need::from)?
+						.is_some_and(|d| {
+							d.attrs.contains(Attrs::ASSOC) || matches!(d.value, VarValue::Assoc(_))
+						});
 				// A key is expanded once more (bash's
 				// `expand_subscript_string`) unless `assoc_expand_once`;
 				// `@` and `*` are keys too.
-				if let Some(v) = v.as_ref().filter(|v| matches!(v.value, VarValue::Assoc(_))) {
+				if assoc {
 					let key = if expand_once {
 						BString::from(i)
 					} else {
@@ -136,11 +146,35 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 							},
 						}
 					};
-					return Ok(!key.is_empty() && v.key(&key).is_some());
+					return Ok(!key.is_empty() && v.is_some_and(|v| v.key(&key).is_some()));
 				}
 				if matches!(i, b"@" | b"*") {
 					return Ok(v.is_some_and(|v| !v.values().is_empty()));
 				}
+				// bash's dynamic arrays (`PIPESTATUS`, `FUNCNAME`, …) and
+				// scalars (`BASHPID`), which this shell keeps no variable for.
+				let dynamic = match &v {
+					None => crate::bash::vm::expand::dynamic_elements(ctx.k, ctx.cx, ctx.vp, name)
+						.map_err(Need::from)?,
+					Some(_) => None,
+				};
+				// An index is expanded once more (bash's `array_expand_index`:
+				// `test -v 'a[$(echo 1)]'`) unless `assoc_expand_once`.
+				let expanded;
+				let i = if !expand_once && i.iter().any(|c| matches!(c, b'$' | b'`')) {
+					match ctx.expand_index_subscript(i)? {
+						Ok(t) => {
+							expanded = t;
+							expanded.as_slice()
+						},
+						Err(d) => {
+							ctx.err(d);
+							return Ok(false);
+						},
+					}
+				} else {
+					i
+				};
 				// bash evaluates an index even when the variable is unset
 				// (`array_value_internal`); a negative one counts back from
 				// the end of an indexed array, and one before its start, or
@@ -148,17 +182,25 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 				// subscript` and names no element.
 				return match super::vars::subscript_value(ctx.k, ctx.cx, ctx.vp, i) {
 					Ok(n) => {
-						let n = match v.as_ref() {
-							Some(v) if n < 0 && matches!(v.value, VarValue::Indexed(_)) => {
-								v.next_index() + n
+						let len = match (&v, &dynamic) {
+							(Some(v), _) if matches!(v.value, VarValue::Indexed(_)) => {
+								Some(v.next_index())
 							},
+							(_, Some((items, true))) => Some(items.len() as i64),
+							_ => None,
+						};
+						let n = match len {
+							Some(len) if n < 0 => len + n,
 							_ => n,
 						};
 						if n < 0 {
 							ctx.err(Diag::BadSubscript { shown: BString::from(name) });
 							return Ok(false);
 						}
-						Ok(v.is_some_and(|v| v.index(n).is_some()))
+						Ok(match &dynamic {
+							Some((items, _)) => usize::try_from(n).is_ok_and(|n| n < items.len()),
+							None => v.is_some_and(|v| v.index(n).is_some()),
+						})
 					},
 					Err(d @ Diag::ArithSubscript { .. }) => Err(Fail::Discard(d)),
 					Err(_) => Ok(false),

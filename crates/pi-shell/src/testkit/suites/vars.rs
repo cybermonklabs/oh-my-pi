@@ -837,3 +837,67 @@ fn all_elements_in_arithmetic_warn_and_read_zero() {
 	let bad = |s: &str| format!("bash: line 1: {s}: bad array subscript\n");
 	assert_eq!(err, [bad("x[@]"), bad("x[*]"), bad("x[@]").repeat(3)].concat());
 }
+
+// Golden: bash 5.3.20 (5.2.21 agrees): under `set -u` arithmetic reports an
+// unset variable before its subscript (`expr_streval` checks it first), for
+// a negative index and for `[@]` alike.
+#[test]
+fn arithmetic_under_set_u_reports_the_unset_variable_first() {
+	let (out, err) = run(
+		"set -u; ( : $((u[-1])) ); ( declare x; : $((x[-1])) ); ( declare -a d; : $((d[-1])) ); ( : \
+		 $((u[@])); echo no ); echo after",
+	);
+	assert_eq!(out, "after\n");
+	let unbound = |s: &str| format!("bash: line 1: {s}: unbound variable\n");
+	assert_eq!(err, [unbound("u"), unbound("x"), unbound("d"), unbound("u")].concat());
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): an arithmetic assignment to `[-1]` of
+// a declared but unset scalar, or of a dynamic scalar, counts it as element
+// 0 (`assign_array_element`).
+#[test]
+fn arithmetic_counts_a_declared_unset_scalar_as_element_0() {
+	let (out, err) = run(
+		"declare -i x; ((x[-1]=3)); declare -p x; f() { local y; ((y[-1]=4)); declare -p y; }; f; \
+		 ((LINENO[-1]=5)); echo st=$?",
+	);
+	assert_eq!(out, "declare -ai x=([0]=\"3\")\ndeclare -a y=([0]=\"4\")\nst=0\n");
+	assert_eq!(err, "");
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): `-v` of a negative subscript looks up
+// a key of a declared empty associative array, and counts back from the end
+// of a dynamic array, silently.
+#[test]
+fn test_v_negative_subscript_of_an_assoc_or_dynamic_array() {
+	let (out, err) = run(
+		"declare -A A; [[ -v A[-1] ]] || echo nv; test -v 'A[-1]' || echo nv2; true | true; [[ -v \
+		 PIPESTATUS[-1] ]] && echo p1",
+	);
+	assert_eq!(out, "nv\nnv2\np1\n");
+	assert_eq!(err, "");
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): through a name reference to an
+// associative array, `@` in arithmetic is its key.
+#[test]
+fn arithmetic_all_elements_through_a_reference_to_an_assoc() {
+	let (out, err) = run(
+		"declare -A A=([@]=5); declare -n r=A; echo $((r[@])); declare -A B=([k]=1); declare -n \
+		 s=B; echo $((s[@]=3)) $((s[k])); declare -p B",
+	);
+	assert_eq!(out, "5\n3 1\ndeclare -A B=([\"@\"]=\"3\" [k]=\"1\" )\n");
+	assert_eq!(err, "");
+}
+
+// Golden: bash 5.3.20 (5.2.21 agrees): `test -v` expands its subscript once
+// more (`array_expand_index`, `expand_subscript_string`).
+#[test]
+fn test_v_expands_its_subscript() {
+	let (out, err) = run(
+		"a=(x y); test -v 'a[$(echo 1)]' && echo yes; test -v 'a[$(echo 5)]' || echo no; declare -A \
+		 h; test -v 'h[$(echo k)]'; echo st=$?; h[k]=1; test -v 'h[$(echo k)]' && echo hk",
+	);
+	assert_eq!(out, "yes\nno\nst=1\nhk\n");
+	assert_eq!(err, "");
+}
