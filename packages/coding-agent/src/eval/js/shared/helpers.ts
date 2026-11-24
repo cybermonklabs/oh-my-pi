@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils/fs-error";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { throwIfRunAbandoned } from "./abandoned-run";
 import type { JsStatusEvent } from "./types";
 
 export interface HelperOptions {
@@ -43,8 +44,11 @@ export interface HelperBundle {
 const utf8Encoder = new TextEncoder();
 
 export function createHelpers(ctx: HelperContext): HelperBundle {
+	// Each helper that reads, writes or sets state refuses code of an abandoned run before it acts (an absolute
+	// path never asks the run for its cwd, and `env` writes the runtime's own map).
 	return {
 		read: async (rawPath, options = {}) => {
+			throwIfRunAbandoned();
 			const resolved = await resolveRegularFile(ctx, rawPath);
 			if (!resolved) return undefined;
 			const { filePath, file, size } = resolved;
@@ -61,6 +65,7 @@ export function createHelpers(ctx: HelperContext): HelperBundle {
 			return text;
 		},
 		writeFile: async (rawPath, data) => {
+			throwIfRunAbandoned();
 			if (!isWriteData(data)) {
 				throw new ToolError("write() expects string, Blob, ArrayBuffer, or TypedArray data");
 			}
@@ -74,6 +79,7 @@ export function createHelpers(ctx: HelperContext): HelperBundle {
 			return filePath;
 		},
 		env: (key, value) => {
+			throwIfRunAbandoned();
 			if (!key) {
 				const merged = Object.fromEntries(Object.entries(getMergedEnv(ctx)).sort(([a], [b]) => a.localeCompare(b)));
 				ctx.emitStatus({ op: "env", count: Object.keys(merged).length, keys: Object.keys(merged).slice(0, 20) });

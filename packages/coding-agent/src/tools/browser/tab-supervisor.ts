@@ -1358,6 +1358,8 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 	tab.pending.clear();
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_TAB_CLOSE_TIMEOUT_MS;
 	if (tab.backend === "tern") {
+		// Its runtime would otherwise keep any run ownership of this process's realm a hung run left behind.
+		tab.ternTab.discardRuntime();
 		let closeError: unknown;
 		if (wasAlive) {
 			try {
@@ -1386,6 +1388,7 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 		return "released";
 	}
 	if (tab.backend === "cmux") {
+		tab.cmuxTab.discardRuntime();
 		let closeError: unknown;
 		if (wasAlive && tab.cmuxOwnsSurface) {
 			try {
