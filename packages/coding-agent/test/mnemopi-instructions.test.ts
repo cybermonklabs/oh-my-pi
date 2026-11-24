@@ -113,7 +113,7 @@ describe("Mnemopi memory instructions", () => {
 				"/tmp",
 				Settings.isolated({ "mnemopi.autoRetain": autoRetain }),
 				undefined,
-				taskDepth,
+				{ taskDepth },
 			)) ?? "";
 		expect(await render(true, 0)).toContain(RETAINED);
 		expect(await render(false, 0)).toContain(NOT_RETAINED);

@@ -9,6 +9,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { type CompactionMethod, resolveSpeculationMethod } from "@oh-my-pi/pi-coding-agent/session/compaction-methods";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import type { ObservedPromptCacheEntry } from "@oh-my-pi/pi-coding-agent/session/prompt-cache-status";
 import { SessionMaintenance, type SessionMaintenanceHost } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgMemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/settings";
@@ -84,6 +85,8 @@ describe("async speculative compaction", () => {
 				focus: string,
 				options?: { autoTriggered?: boolean; signal?: AbortSignal },
 			) => Promise<{ document: string } | undefined>;
+			/** The prompt cache entry the next request reads; none by default, so every cut counts as lapsed. */
+			cacheEntry?: () => ObservedPromptCacheEntry | undefined;
 		} = {},
 	): SessionMaintenance {
 		agent = new Agent({
@@ -156,6 +159,7 @@ describe("async speculative compaction", () => {
 			recordAnchoredHistoryRewrite: () => {},
 			getContextBreakdown: () => undefined,
 			getContextUsage: () => undefined,
+			observedPromptCacheEntry: options.cacheEntry ?? (() => undefined),
 			shake: async () => ({ modified: false, tokensRemoved: 0 }),
 			dropImages: async () => ({ removed: 0 }),
 			generateHandoffDocument: options.generateHandoffDocument ?? (async () => undefined),
@@ -993,6 +997,72 @@ describe("async speculative compaction", () => {
 		expect(compactSpy).toHaveBeenCalledTimes(2);
 		const entry = sessionManager.getEntries().findLast(item => item.type === "compaction");
 		expect(entry?.type === "compaction" ? entry.summary : undefined).toBe("summary 2");
+	});
+
+	it("starts no new speculation while the cut rule waits on the same live cache entry", async () => {
+		const HOUR_MS = 60 * 60_000;
+		let invocation = 0;
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: `summary ${++invocation}`,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+		// The latest requests' prompts grew 10,000 then 30,000 tokens: a compaction would be back at the threshold
+		// within two requests, so rewriting what it keeps costs more than the reads it saves while the one-hour entry
+		// is live, and the cut rule waits.
+		for (const promptTokens of [20_000, 50_000]) {
+			sessionManager.appendMessage(userMessage("next step"));
+			const reply = assistantMessage("step done", model);
+			reply.usage = { ...reply.usage, input: 0, cacheRead: promptTokens, totalTokens: promptTokens + 100 };
+			sessionManager.appendMessage(reply);
+		}
+		let touchedAt = Date.now();
+		maintenance = createMaintenance({
+			cacheEntry: () => ({
+				model,
+				tier: "long",
+				touchedAt,
+				ttlMs: HOUR_MS,
+				promptTokens: 50_000,
+				refreshMissed: false,
+				inferred: true,
+			}),
+		});
+		const maintain = async (contextTokens: number): Promise<void> => {
+			if (maintenance.deferThresholdCompactionToSpeculation(contextTokens, CONTEXT_WINDOW)) return;
+			await maintenance.runAutoCompaction("threshold", false, { triggerContextTokens: contextTokens });
+		};
+		const compacted = () => sessionManager.getEntries().some(item => item.type === "compaction");
+
+		// A turn past the threshold starts the background summary; the next point finds it armed, asks the rule, and
+		// the rule waits.
+		await maintain(THRESHOLD + 1_000);
+		await waitForState("armed");
+		await maintain(THRESHOLD + 1_500);
+		expect({ compacted: compacted(), summaries: compactSpy.mock.calls.length }).toEqual({
+			compacted: false,
+			summaries: 1,
+		});
+
+		// The branch grows past what the armed summary can recover; every later point, the rule still waits on the
+		// same entry, a request touching it each time. A new summary request at each point would cost a model call
+		// for a cut that cannot run.
+		sessionManager.appendMessage(assistantMessage("large-tail-token ".repeat(45_000), model));
+		for (const contextTokens of [THRESHOLD + 2_000, THRESHOLD + 2_500, THRESHOLD + 3_000]) {
+			touchedAt = Date.now();
+			await maintain(contextTokens);
+			await Promise.resolve();
+		}
+		expect({ compacted: compacted(), summaries: compactSpy.mock.calls.length }).toEqual({
+			compacted: false,
+			summaries: 1,
+		});
+
+		// The entry lapses: the cut adds no write, the wait ends, and the compaction runs.
+		touchedAt = Date.now() - 2 * HOUR_MS;
+		await maintain(THRESHOLD + 3_500);
+		expect(compacted()).toBe(true);
 	});
 
 	it("discards an armed summary when a persisted custom message prevents recovery headroom", async () => {

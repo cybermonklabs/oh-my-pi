@@ -24,7 +24,12 @@ import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD, SPECULATIVE_STREAM_SESSION
 import type { AssistantMessage, AssistantMessageEvent, Context, Message, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import { kCursorExecResolved, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import {
+	isPerCallContextMessage,
+	kCursorExecResolved,
+	markPerCallContextMessage,
+	setStreamingPartialJson,
+} from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import type { HarmonyDetection } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import * as harmonyLeak from "@oh-my-pi/pi-ai/utils/harmony-leak";
@@ -5576,6 +5581,51 @@ describe("agentLoop pre-model-call gate", () => {
 		expect(mock.calls[1]?.options?.toolChoice).toBeUndefined();
 		expect(executed).toEqual(["resolved"]);
 		expect(agent.state.messages.filter(message => message === reminder)).toHaveLength(2);
+	});
+
+	it("compares a per-call message with the last request sent, not with one the gate stopped", async () => {
+		const contexts: Context[] = [];
+		const mock = createMockModel({
+			responses: [
+				context => {
+					contexts.push(context);
+					return { content: ["first"] };
+				},
+				context => {
+					contexts.push(context);
+					return { content: ["third"] };
+				},
+			],
+		});
+		// A context hook's note ahead of the history, rebuilt for every request.
+		let note = "status: idle";
+		const agent = new Agent({
+			initialState: { model: mock.model },
+			// As every transport does, the stream function calls `beforeDispatch` as it sends, which takes the record.
+			streamFn: (model, context, options) => {
+				options?.beforeDispatch?.();
+				return mock.stream(model, context, options);
+			},
+			transformContext: async messages => {
+				const status: AgentMessage = { role: "user", content: note, timestamp: 0 };
+				markPerCallContextMessage(status);
+				return [status, ...messages];
+			},
+		});
+		let gateCalls = 0;
+		agent.setBeforeModelCall(() => (++gateCalls === 2 ? { stop: true, reason: "over budget" } : undefined));
+
+		await agent.prompt("first");
+		note = "status: busy";
+		// The gate stops this request: the provider never sees the new note.
+		await agent.prompt("second");
+		await agent.prompt("third");
+
+		expect(contexts).toHaveLength(2);
+		const [, third] = contexts;
+		// The note changed since the last request sent, so it is no history the cache holds: it stays per-call.
+		expect(third?.messages[0]?.content).toBe("status: busy");
+		expect(isPerCallContextMessage(third?.messages[0])).toBe(true);
 	});
 
 	it("closes an open Harmony retry turn when the gate stops the retry", async () => {

@@ -49,7 +49,13 @@ describe("emitResourcesDiscover result validation (PR #9379 review)", () => {
 `,
 			);
 
-			const loaded = await loadExtensions([malformedPath, wellFormedPath], tempDir);
+			const loaded = await loadExtensions(
+				[
+					{ path: malformedPath, scope: "explicit" },
+					{ path: wellFormedPath, scope: "explicit" },
+				],
+				tempDir,
+			);
 			expect(loaded.errors).toEqual([]);
 
 			const authStorage = createInMemoryAuthStorage();

@@ -14,6 +14,7 @@ import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type {
 	BeforeSubagentSpawnEvent,
 	BeforeSubagentSpawnEventResult,
+	ExtensionPathEntry,
 	PreparedExtension,
 } from "../extensibility/extensions/types";
 import type { Skill, SkillRediscoveryHost } from "../extensibility/skills";
@@ -41,6 +42,7 @@ import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
 import { type AgentDefinition, canSpawnAtDepth } from "../task/types";
+import type { PerCallModelAdvertisement } from "../task/model-approval";
 import { type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { EventBus } from "../utils/event-bus";
@@ -282,12 +284,12 @@ export interface ToolSession {
 	 */
 	activeRules?: readonly Rule[];
 	/**
-	 * Pre-discovered extension source paths. Forwarded to subagents so they
-	 * skip the FS scan but still re-bind extensions to their own session-scoped
-	 * `ExtensionAPI` (cwd, eventBus, runtime). Inline extension factories
-	 * (`<inline-N>`) are NOT included — those are session-local.
+	 * Pre-discovered extension source paths, each with its scope. Forwarded to
+	 * subagents so they skip the FS scan but still re-bind extensions to their own
+	 * session-scoped `ExtensionAPI` (cwd, eventBus, runtime). Inline extension
+	 * factories (`<inline-N>`) are NOT included — those are session-local.
 	 */
-	extensionPaths?: string[];
+	extensionPaths?: ExtensionPathEntry[];
 	/** Imported extension factories safe to rebind in child sessions. */
 	preparedExtensions?: PreparedExtension[];
 	/**
@@ -397,6 +399,11 @@ export interface ToolSession {
 	getToolByName?: (name: string) => AgentTool | undefined;
 	/** Look up an enabled tool through the eval bridge's normal permission pipeline. */
 	getToolForEvalBridge?: (name: string) => AgentTool | undefined;
+	/**
+	 * Why a call to the tool or `xd://` device `name`, bare or `xd://`-prefixed, is refused: a held settings change
+	 * disabled it while the bound prompt still lists it, until the rebuild. Undefined when calls to it run.
+	 */
+	heldToolRefusal?: (name: string) => string | undefined;
 	/** Current session context for eval-bridged tool execution. */
 	getToolContext?: () => AgentToolContext | undefined;
 	/** Tool names the eval description advertises as callable from cells; frozen with the cached prompt prefix. */
@@ -445,6 +452,21 @@ export interface ToolSession {
 	 * hidden notice. Absent when the embedder has no base-prompt surface.
 	 */
 	advertisedSessionAgents?: () => readonly AgentDefinition[];
+	/**
+	 * Discovered agents baked into the current base prompt surface, listed by
+	 * the task description instead of the latest scan so a rescan mid-session
+	 * does not mutate the provider tool prefix; the delta rides a hidden notice.
+	 * Undefined when the embedder has no base-prompt surface or the surface
+	 * holds no scan; the description then lists the latest scan.
+	 */
+	advertisedDiscoveredAgents?: () => readonly AgentDefinition[] | undefined;
+	/**
+	 * Per-call model approvals baked into the current base prompt surface,
+	 * listed by the task and eval descriptions instead of the live settings;
+	 * a change rides a hidden notice. Undefined when the embedder has no
+	 * base-prompt surface or per-call models were off at its last rebuild.
+	 */
+	advertisedPerCallModels?: () => PerCallModelAdvertisement | undefined;
 	/** Get resolved model string if explicitly set for this session */
 	getModelString?: () => string | undefined;
 	/** Get the current session model string, regardless of how it was chosen */
@@ -689,8 +711,8 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 	const allowJs = backends.js;
 	const skipEvalPreflight = session.skipPythonPreflight === true;
 	// Eval tool is enabled if ANY backend is reachable. JS needs no preflight, so
-	// we only probe Python when JS is disabled — otherwise allowEval is
-	// already true and per-backend availability is checked at first invocation.
+	// we only probe Python when JS is disabled — otherwise the eval gate is
+	// already open and per-backend availability is checked at first invocation.
 	let pythonAvailable = true;
 	const evalRequested = requestedTools === undefined || requestedTools.includes("eval");
 	if (!skipEvalPreflight && !allowJs && evalRequested) {
@@ -707,11 +729,6 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			}
 		}
 	}
-
-	const effectivePythonAllowed = allowPython && pythonAvailable;
-	// Eval is exposed whenever any backend is reachable. A backend may be
-	// unreachable, in which case eval dispatches exclusively to the others.
-	const allowEval = effectivePythonAllowed || allowJs;
 
 	// Checkpoint and rewind are a pair: listing one without the other strands
 	// the agent (it can checkpoint but not rewind, or vice versa). Auto-include
@@ -780,7 +797,8 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			}
 		}
 	}
-	const editDisabled = cfgEditMode.get(session.settings) === "none";
+	// Each gate reads its settings when it is asked, so a caller that tracks the reads (`trackSettingsReads`: the
+	// live reconcile) learns which settings gate a tool.
 	const isToolAllowed = (name: string) => {
 		// Never in the default set. Explicitly activatable while goal.enabled and
 		// no goal record exists yet — /guided-goal enables it so the agent can
@@ -794,9 +812,14 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		}
 		if (name === "lsp") return enableLsp && cfgLspEnabled.get(session.settings);
 		// Without an edit tool, bash is the remaining way to modify existing files.
-		if (name === "edit") return !editDisabled;
-		if (name === "bash") return editDisabled || cfgBashEnabled.get(session.settings);
-		if (name === "eval") return allowEval;
+		if (name === "edit") return cfgEditMode.get(session.settings) !== "none";
+		if (name === "bash") return cfgEditMode.get(session.settings) === "none" || cfgBashEnabled.get(session.settings);
+		// Eval is exposed whenever any backend is reachable. A backend may be
+		// unreachable, in which case eval dispatches exclusively to the others.
+		if (name === "eval") {
+			const { python, js } = resolveEvalBackends(session);
+			return (python && pythonAvailable) || js;
+		}
 		if (name === "debug") return cfgDebugEnabled.get(session.settings);
 		if (name === "ida") return cfgIdaAvailable.get(session.settings);
 		if (name === "todo")

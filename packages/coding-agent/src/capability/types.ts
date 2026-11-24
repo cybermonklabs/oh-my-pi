@@ -159,10 +159,12 @@ export interface SourceMeta {
 	level: "user" | "project" | "native";
 	/**
 	 * Registry or CLI source that supplied a plugin root, when the provider
-	 * tracks it (currently `claude-plugins`: `"claude"` for `~/.claude/plugins`,
-	 * `"omp"` for omp's own registry, `"plugin-dir"` for `--plugin-dir`). Lets
-	 * user-scope gating distinguish omp's own installs from the foreign Claude
-	 * tree — see `isSourceEnabled` in `extensibility/skills.ts` (#10743).
+	 * tracks it: `claude-plugins` gives `"claude"` for `~/.claude/plugins`,
+	 * `"omp"` for omp's own registry, `"plugin-dir"` for `--plugin-dir`, which
+	 * lets user-scope gating distinguish omp's own installs from the foreign
+	 * Claude tree — see `isSourceEnabled` in `extensibility/skills.ts` (#10743);
+	 * `omp-plugins` hooks give their package root's lane (`"explicit"`,
+	 * `"configured"` or `"installed"`), which sets their extension scope.
 	 */
 	origin?: string;
 	/**

@@ -12,6 +12,7 @@ import type { Settings } from "../config/settings";
 import type { HindsightSessionStateApi } from "../hindsight/state";
 import type { MnemopiSessionStateApi } from "../mnemopi/state";
 import type { AgentSession } from "../session/agent-session";
+import type { RecallChangesReport } from "./recall-entry";
 
 export type MemoryBackendId = "off" | "local" | "hindsight" | "mnemopi" | "sharpshooter";
 
@@ -96,13 +97,33 @@ export interface MemoryBackendStartOptions {
 export interface MemoryPromptPreparation {
 	context?: string;
 	/**
+	 * `context` is the recall this transcript already delivered, read back from the session
+	 * rather than recalled again: the transcript's requests carried it.
+	 */
+	reused?: boolean;
+	/**
 	 * Model-facing note delivered with this turn's user message, e.g. what changed in the
 	 * memories a reused recall holds. Persisted in the transcript as a hidden custom message
 	 * whose `details` carry the backend's bookkeeping, so both land only once delivered.
 	 */
-	notice?: { content: string; details: unknown };
+	notice?: RecallChangesReport;
 	/** Commit synchronously after delivery validation; false rejects lost ownership without state writes. */
 	commit(): boolean;
+}
+
+/** Options of {@link MemoryBackend.buildDeveloperInstructions}. */
+export interface MemoryInstructionsOptions {
+	/**
+	 * The conversation carries the recall itself (`AgentSession.memoryRecall`), as a hidden message or as the system
+	 * prompt's own last block: leave out the recall the backend adopted, which the prompt would otherwise send a
+	 * second time.
+	 */
+	recallDelivered?: boolean;
+	/**
+	 * The session's task recursion depth (0 or absent for a top-level session). The first prompt build runs before
+	 * `start`, so a backend whose instructions differ for a subagent reads it here, not from its own session state.
+	 */
+	taskDepth?: number;
 }
 
 export interface MemoryBackend {
@@ -121,16 +142,14 @@ export interface MemoryBackend {
 	 * Markdown injected as the system-prompt append section.
 	 * Returned on every prompt rebuild via `refreshBaseSystemPrompt()`.
 	 * `cwd` is the session's project directory and selects project-scoped memory.
-	 * `taskDepth` is the session's task recursion depth (0 or absent for a top-level
-	 * session). The first rebuild runs before `start`, so a backend whose instructions
-	 * differ for a subagent reads it here, not from its own session state.
+	 * A backend that carries its adopted recall here leaves it out under {@link MemoryInstructionsOptions.recallDelivered}.
 	 */
 	buildDeveloperInstructions(
 		agentDir: string,
 		cwd: string,
 		settings: Settings,
 		session?: AgentSession,
-		taskDepth?: number,
+		options?: MemoryInstructionsOptions,
 	): Promise<string | undefined>;
 
 	/** Wipe all persisted state for this backend (slash `/memory clear`). */

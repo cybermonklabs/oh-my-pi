@@ -191,11 +191,24 @@ export function getNextTimeBasedPricingTransition(cost: ModelCost, timestamp?: n
 	return next === Infinity ? undefined : next;
 }
 
-/** Price a fully uncached prompt at its request timestamp (Unix ms); scheduled prices default to now. */
-export function calculateUncachedInputCost(cost: ModelCost, promptInputTokens: number, timestamp?: number): number {
+/**
+ * The rate card and peak/off-peak multiplier of a request of `promptInputTokens` at `timestamp` (Unix ms); only
+ * scheduled prices default to now.
+ */
+function resolvePricing(
+	cost: ModelCost,
+	promptInputTokens: number,
+	timestamp: number | undefined,
+): { rates: TokenCost; multiplier: number } {
 	const pricingTimestamp = cost.timeBased ? (timestamp ?? Date.now()) : undefined;
 	const rates = resolveTokenCost(cost, promptInputTokens, pricingTimestamp);
-	return (rates.input / 1_000_000) * promptInputTokens * timeBasedMultiplier(cost.timeBased, pricingTimestamp);
+	return { rates, multiplier: timeBasedMultiplier(cost.timeBased, pricingTimestamp) };
+}
+
+/** Price a fully uncached prompt at its request timestamp (Unix ms); scheduled prices default to now. */
+export function calculateUncachedInputCost(cost: ModelCost, promptInputTokens: number, timestamp?: number): number {
+	const { rates, multiplier } = resolvePricing(cost, promptInputTokens, timestamp);
+	return (rates.input / 1_000_000) * promptInputTokens * multiplier;
 }
 
 /** Price usage at its request timestamp (Unix ms); only scheduled prices default to now. */
@@ -203,9 +216,7 @@ export function calculateUsageCost(cost: ModelCost, usage: Usage, timestamp?: nu
 	const orchestration = usage.orchestration;
 	const promptInputTokens =
 		usage.input + usage.cacheRead + usage.cacheWrite + (orchestration?.input ?? 0) + (orchestration?.cacheRead ?? 0);
-	const pricingTimestamp = cost.timeBased ? (timestamp ?? Date.now()) : undefined;
-	const rates = resolveTokenCost(cost, promptInputTokens, pricingTimestamp);
-	const multiplier = timeBasedMultiplier(cost.timeBased, pricingTimestamp);
+	const { rates, multiplier } = resolvePricing(cost, promptInputTokens, timestamp);
 	usage.cost.input = (rates.input / 1000000) * (usage.input + (orchestration?.input ?? 0)) * multiplier;
 	usage.cost.output = (rates.output / 1000000) * (usage.output + (orchestration?.output ?? 0)) * multiplier;
 	usage.cost.cacheRead =
@@ -220,17 +231,64 @@ export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage
 	return calculateUsageCost(model.cost, usage, timestamp);
 }
 
+/** Lifetime a prompt-cache write is billed at: five minutes or one hour. */
+export type CacheLifetime = "5m" | "1h";
+
+/** Dollars per token for reading cached prompt tokens and writing them at one lifetime. */
+export interface CacheTokenPrices {
+	/** Price of one prompt token read from the cache. */
+	read: number;
+	/** Price of one prompt token written to the cache at the requested lifetime. */
+	write: number;
+}
+
+/**
+ * Per-token cache prices for a write not yet made, by the rule usage is billed by: a read at the `cacheRead` rate;
+ * where the card prices a cache write, a five-minute write at the `cacheWrite` rate and a one-hour write at twice the
+ * input rate ({@link cacheWriteRate}); where it prices none, a write at the input rate at either lifetime.
+ * `promptInputTokens` selects the long-context tier and `timestamp` (Unix ms) the dated card and peak/off-peak
+ * multiplier, exactly as {@link calculateUsageCost} applies them; only scheduled prices default to now.
+ *
+ * A card that prices cache reads but no cache write is one whose provider bills no write premium and reports the
+ * tokens a request writes to its cache as uncached input (OpenAI, DeepSeek), which the bill prices at the input
+ * rate; its cache-write bucket, which such usage leaves empty, bills at the card's write price of nothing. A card
+ * that prices neither a cache read nor a cache write at that tier prices no cache, so it has no cache to keep: both
+ * prices are 0 at either lifetime.
+ */
+export function getCacheTokenPrices(
+	cost: ModelCost,
+	lifetime: CacheLifetime,
+	promptInputTokens: number,
+	timestamp?: number,
+): CacheTokenPrices {
+	const { rates, multiplier } = resolvePricing(cost, promptInputTokens, timestamp);
+	if (!(rates.cacheRead > 0) && !(rates.cacheWrite > 0)) return { read: 0, write: 0 };
+	const write = rates.cacheWrite > 0 ? cacheWriteRate(rates, lifetime) : rates.input / 1000000;
+	return { read: (rates.cacheRead / 1000000) * multiplier, write: write * multiplier };
+}
+
+/**
+ * Price of one cache-write token at `lifetime`, before any peak/off-peak multiplier.
+ *
+ * `rates.cacheWrite` is the 5-minute write rate (Anthropic bills 5m writes at
+ * 1.25x base input). 1h writes bill at 2x base input. Deriving 1h from
+ * `input * 2` (Anthropic's published multiplier) is model-independent and
+ * stays correct even for legacy entries whose stored `cacheWrite` scalar
+ * drifts from 1.25x input. A card that prices no cache write charges no
+ * one-hour premium either: its writes bill at its `cacheWrite` rate at
+ * either lifetime.
+ */
+function cacheWriteRate(rates: TokenCost, lifetime: CacheLifetime): number {
+	return lifetime === "1h" && rates.cacheWrite > 0 ? (rates.input * 2) / 1000000 : rates.cacheWrite / 1000000;
+}
+
 /**
  * Price cache-write tokens, honoring the TTL breakdown when the provider reports one.
  *
- * `rates.cacheWrite` is the 5-minute write rate (Anthropic bills 5m writes at
- * 1.25x base input). When `usage.cttl` is present the write can mix 5m and 1h
- * breakpoints, and 1h writes bill at 2x base input, so each component is
- * priced at its own rate instead of the flat 5m rate. Deriving 1h from
- * `input * 2` (Anthropic's published multiplier) is model-independent and
- * stays correct even for legacy entries whose stored
- * `cacheWrite` scalar drifts from 1.25x input. Providers that omit `cttl`
- * (everyone but Anthropic) keep the flat-rate calculation.
+ * When `usage.cttl` is present the write can mix 5m and 1h breakpoints, so
+ * each component is priced at its own {@link cacheWriteRate} instead of the
+ * flat 5m rate. Providers that omit `cttl` (everyone but Anthropic) keep the
+ * flat-rate calculation.
  *
  * The breakdown is documented to sum to `usage.cacheWrite`, but the two are written
  * from independent wire fields (`cache_creation` vs `cache_creation_input_tokens`),
@@ -238,13 +296,13 @@ export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage
  * a partial or stale breakdown must never make write tokens free.
  */
 function cacheWriteCost(rates: TokenCost, usage: Usage): number {
-	const rate5m = rates.cacheWrite / 1000000;
+	const rate5m = cacheWriteRate(rates, "5m");
 	const cttl = usage.cttl;
 	if (!cttl) return rate5m * usage.cacheWrite;
 	const fiveMinute = cttl.ephemeral5m ?? 0;
 	const oneHour = cttl.ephemeral1h ?? 0;
 	const residual = Math.max(0, usage.cacheWrite - fiveMinute - oneHour);
-	return rate5m * (fiveMinute + residual) + ((rates.input * 2) / 1000000) * oneHour;
+	return rate5m * (fiveMinute + residual) + cacheWriteRate(rates, "1h") * oneHour;
 }
 
 /**

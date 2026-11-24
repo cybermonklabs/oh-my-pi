@@ -54,6 +54,8 @@ export interface SessionSwitchEvent {
  * - `"branch"`: rewinds to a user message; `entryId` and everything after it are dropped.
  * - `"fork"`: forks at a transcript entry; `entryId` is the last entry kept.
  * - `"btw"`: promotes a `/btw` answer; `entryId` is the last entry kept before it.
+ *
+ * A kept `entryId` is never a label: the new file re-creates the labels it keeps under new ids.
  */
 export type SessionBranchReason = "branch" | "fork" | "btw";
 

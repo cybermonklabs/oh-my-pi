@@ -872,25 +872,21 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			let toolConfig = toolPlan.toolConfig;
 			const sentinelInjected = toolPlan.sentinelInjected;
 			let additionalModelRequestFields = buildAdditionalModelRequestFields(model, options);
-			const thinkingDisabled =
-				isRecord(additionalModelRequestFields?.thinking) &&
-				additionalModelRequestFields.thinking.type === "disabled";
+			const thinkingDisabled = sendsThinkingDisabled(model, options.reasoning);
 			const prefixMismatchBehavior =
 				!thinkingDisabled && model.thinking?.prefixBinding && model.compat.supportsThinkingBindingControls
 					? (options.anthropicPrefixMismatchBehavior ?? "drop_block")
 					: undefined;
 
-			// Some models (Opus/Sonnet 5.5) reject forced tool use outright; keep the
-			// tools offered under `auto` and leave thinking intact.
+			// Some models (Opus/Sonnet 5.5) reject forced tool use outright, and Bedrock rejects thinking + forced
+			// tool_choice: those, and prefix-bound lines (Fable) thinking on the request, keep the tools offered under
+			// `auto` and leave thinking intact ({@link bedrockSendsForcedToolChoice}); elsewhere the request drops
+			// thinking.
 			const forcedChoice = toolConfig?.toolChoice?.any || toolConfig?.toolChoice?.tool;
-			if (toolConfig && forcedChoice && !model.compat.supportsForcedToolChoice) {
+			if (toolConfig && forcedChoice && !bedrockSendsForcedToolChoice(model, options.reasoning)) {
 				toolConfig = { ...toolConfig, toolChoice: { auto: {} } };
 			} else if (toolConfig && forcedChoice && !thinkingDisabled) {
-				// Bedrock rejects thinking + forced tool_choice. Prefix-bound lines (Fable)
-				// think adaptively even when no thinking field is sent, so downgrade their
-				// forced choice regardless of the binding controls; elsewhere drop thinking.
-				if (model.thinking?.prefixBinding) toolConfig = { ...toolConfig, toolChoice: { auto: {} } };
-				else additionalModelRequestFields = undefined;
+				additionalModelRequestFields = undefined;
 			}
 			if (prefixMismatchBehavior) {
 				additionalModelRequestFields = applyBedrockThinkingBinding(
@@ -1666,6 +1662,31 @@ const DEFAULT_BEDROCK_THINKING_BUDGETS: Record<Effort, number> = {
 	max: 32768,
 };
 
+/** Whether a request with `reasoning`, its {@link BedrockOptions.reasoning}, turns `model`'s thinking off on the wire. */
+function sendsThinkingDisabled(
+	model: Model<"bedrock-converse-stream">,
+	reasoning: BedrockOptions["reasoning"],
+): boolean {
+	return model.reasoning && !reasoning && model.compat.disabledThinking === "disabled";
+}
+
+/**
+ * Whether a request that forces a tool (`any`, or a named tool) sends that choice to `model`, with `reasoning` its
+ * {@link BedrockOptions.reasoning}; otherwise the choice goes out as `auto` with the tools still offered. A model that
+ * takes no forced tool use gets `auto`, and so does a prefix-bound line (Fable) unless the request turns its thinking
+ * off: Bedrock rejects thinking with a forced choice, and that line thinks adaptively even when no thinking field is
+ * sent. Elsewhere the forced choice goes out and the request drops its thinking.
+ */
+export function bedrockSendsForcedToolChoice(
+	model: Model<"bedrock-converse-stream">,
+	reasoning: BedrockOptions["reasoning"],
+): boolean {
+	return (
+		model.compat.supportsForcedToolChoice &&
+		(!model.thinking?.prefixBinding || sendsThinkingDisabled(model, reasoning))
+	);
+}
+
 function buildAdditionalModelRequestFields(
 	model: Model<"bedrock-converse-stream">,
 	options: BedrockOptions,
@@ -1673,10 +1694,9 @@ function buildAdditionalModelRequestFields(
 	const reasoning = options.reasoning;
 	if (!model.reasoning) return undefined;
 	if (!reasoning) {
-		if (model.compat.disabledThinking === "disabled") {
-			return { thinking: { type: "disabled" }, output_config: { effort: "low" } };
-		}
-		return undefined;
+		return sendsThinkingDisabled(model, reasoning)
+			? { thinking: { type: "disabled" }, output_config: { effort: "low" } }
+			: undefined;
 	}
 
 	const mode = model.thinking?.mode;

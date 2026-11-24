@@ -85,7 +85,7 @@ export default function(pi) {
 `;
 		fs.writeFileSync(entryPath, entryContent, "utf-8");
 
-		const result = await loadExtensions([entryPath], cwd);
+		const result = await loadExtensions([{ path: entryPath, scope: "explicit" }], cwd);
 
 		expect(result.errors).toHaveLength(0);
 		expect(result.extensions[0].tools.has("dedup-tool")).toBe(true);
