@@ -52,7 +52,8 @@ pub struct Vproc {
 	/// all go back to their pre-trap values once the trap's frame is popped,
 	/// so without this the trap could start a second time.
 	pub exit_trap_run: bool,
-	/// Background jobs not yet waited for or reported, current/previous
+	/// Background jobs not yet waited for or reported (and foreground ones
+	/// while no job may be deleted, [`Job::foreground`]), current/previous
 	/// job and the `SIGCHLD` trap runs owed.
 	pub jobs:          JobTable,
 	/// `$!`: the last asynchronous child and the OS pid it is known by.
@@ -479,14 +480,6 @@ pub struct JobTable {
 	/// the fork ends that freeze, so it holds for the fork's whole life
 	/// ([`Vproc::freeze`]). bash only.
 	pub freeze:   Freeze,
-	/// The highest job number a foreground command holds (bash
-	/// `stop_pipeline` makes every fork a job; `cleanup_dead_jobs` deletes
-	/// a finished foreground one at once, but none while no job may be
-	/// deleted, [`Vproc::jobs_kept`]): the next job takes a number after it
-	/// ([`Self::add`]). Zero when none holds one; cleared by the first
-	/// cleanup outside the freeze. A copy of the table keeps it, as bash's
-	/// command substitution keeps its shell's jobs. bash only.
-	pub held:     u32,
 	/// The statuses of background jobs that left the table (bash's bgp
 	/// list: `delete_job`'s `bgp_add`), oldest first, at most [`BGP_MAX`]:
 	/// `wait PID` finds one once its job left the table, and a `wait` a trap
@@ -577,6 +570,17 @@ pub enum JobLookup {
 	Ambiguous,
 }
 
+/// The status of a job whose processes `procs` all ended (bash
+/// `raw_job_exit_status`): that of the process whose end is the job's
+/// ([`JobProcs::status_process`]), 0 when none failed under `pipefail`.
+fn procs_status(procs: &JobProcs, platform: crate::bash::Platform) -> i32 {
+	match procs.status_process().map(|p| p.state) {
+		Some(ProcState::Exited(n)) => n,
+		Some(ProcState::Killed(sig)) => sig.exit_status(platform),
+		Some(ProcState::Running) | None => 0,
+	}
+}
+
 impl JobTable {
 	/// Number of jobs (prompt `\j`).
 	pub const fn len(&self) -> usize {
@@ -603,29 +607,55 @@ impl JobTable {
 		self.list.iter_mut().find(|j| j.number == number)
 	}
 
-	/// The job whose root vproc is `vpid`.
+	/// The background job whose root vproc is `vpid`. A foreground job
+	/// ([`Job::foreground`]) is none: what follows a child's end, a stop or
+	/// a `wait PID` passes it by.
 	pub fn by_vpid(&self, vpid: Vpid) -> Option<&Job> {
-		self.list.iter().find(|j| j.vpid == vpid)
+		self.list.iter().find(|j| j.vpid == vpid && !j.foreground)
 	}
 
-	/// The job whose root vproc is `vpid`, to update it.
+	/// The background job whose root vproc is `vpid`, to update it.
 	pub fn by_vpid_mut(&mut self, vpid: Vpid) -> Option<&mut Job> {
-		self.list.iter_mut().find(|j| j.vpid == vpid)
+		self
+			.list
+			.iter_mut()
+			.find(|j| j.vpid == vpid && !j.foreground)
 	}
 
-	/// The job `pid` names: its virtual pid or its program's OS pid
-	/// ([`Job::os_pid`]).
+	/// The background job `pid` names: its virtual pid or its program's OS
+	/// pid ([`Job::os_pid`]).
 	pub fn by_pid(&self, pid: u32) -> Option<&Job> {
-		self.list.iter().find(|j| j.named_by(pid))
+		self.list.iter().find(|j| j.named_by(pid) && !j.foreground)
+	}
+
+	/// The foreground job ([`Job::foreground`]) whose root vproc is `vpid`,
+	/// this shell's own: the key `wait %N` waits by.
+	pub fn foreground(&self, vpid: Vpid) -> Option<&Job> {
+		self
+			.list
+			.iter()
+			.find(|j| j.vpid == vpid && j.foreground && !j.inherited)
+	}
+
+	/// The foreground job whose root vproc is `vpid`, to update it.
+	pub fn foreground_mut(&mut self, vpid: Vpid) -> Option<&mut Job> {
+		self
+			.list
+			.iter_mut()
+			.find(|j| j.vpid == vpid && j.foreground && !j.inherited)
+	}
+
+	/// The number the next job takes: the one after the highest in use
+	/// (bash does not reuse lower freed numbers until the table is empty).
+	fn next_number(&self) -> u32 {
+		self.list.last().map_or(1, |j| j.number.saturating_add(1))
 	}
 
 	/// Add a background job (bash `stop_pipeline` for an async list): it
-	/// takes the number after the highest one in use or held by a foreground
-	/// command ([`Self::held`]; bash does not reuse lower freed numbers until
-	/// the table is empty) and becomes current as `reset_current` decides.
-	/// Returns its number.
+	/// takes the next number ([`Self::next_number`]) and becomes current as
+	/// `reset_current` decides. Returns its number.
 	pub fn add(&mut self, id: JobId, vpid: Vpid, text: BString, control: bool, wd: BString) -> u32 {
-		let number = self.highest().saturating_add(1);
+		let number = self.next_number();
 		self.list.push(Job {
 			id,
 			number,
@@ -640,22 +670,156 @@ impl JobTable {
 			os_pid: None,
 			signal: None,
 			procs: None,
+			foreground: false,
 			unreaped: false,
 		});
 		self.reset_current();
 		number
 	}
 
-	/// A foreground command bash makes a job of (`stop_pipeline`) starts
-	/// while no job may be deleted: it holds the next number
-	/// ([`Self::held`]).
-	pub fn hold(&mut self) {
-		self.held = self.highest().saturating_add(1);
+	/// Add the job of a command the shell forked and waits for (bash
+	/// `stop_pipeline` for a foreground command, [`Job::foreground`]), vproc
+	/// `vpid`, with `procs` for a pipeline: it takes the next number as
+	/// [`Self::add`] does, and the current and previous jobs stay (bash's
+	/// `reset_current` is for an asynchronous one). Returns its number.
+	pub fn add_foreground(
+		&mut self,
+		id: JobId,
+		vpid: Vpid,
+		text: BString,
+		wd: BString,
+		procs: Option<JobProcs>,
+	) -> u32 {
+		let number = self.next_number();
+		self.list.push(Job {
+			id,
+			number,
+			vpid,
+			text,
+			state: JobState::Running,
+			control: false,
+			notified: false,
+			nohup: false,
+			inherited: false,
+			wd,
+			os_pid: None,
+			signal: None,
+			procs: procs.map(Box::new),
+			foreground: true,
+			unreaped: false,
+		});
+		number
 	}
 
-	/// The highest job number in use or held.
-	fn highest(&self) -> u32 {
-		self.list.last().map_or(0, |j| j.number).max(self.held)
+	/// Child `vpid` of this shell ended as `end`, with `status`: the
+	/// foreground job it is, or the last of whose processes it is, is done
+	/// ([`Job::foreground`]), its status that of the process whose end is
+	/// the job's ([`JobProcs::status_process`]) and its signal the one that
+	/// ended that process (bash `waitchld` and `set_job_status_and_cleanup`;
+	/// for a `( … )`, none when `pipeline`: a signal ended its vproc as it
+	/// ran a pipeline); `notified` as bash's wait for it leaves it
+	/// (`notify_and_cleanup`).
+	pub fn foreground_reaped(
+		&mut self,
+		vpid: Vpid,
+		end: ProcState,
+		status: i32,
+		pipeline: bool,
+		notified: bool,
+		platform: crate::bash::Platform,
+	) {
+		let Some(job) = self.list.iter_mut().find(|j| {
+			j.foreground
+				&& !j.inherited
+				&& j.state == JobState::Running
+				&& match j.procs.as_deref() {
+					Some(procs) => procs.list.iter().any(|p| p.vpid == vpid),
+					None => j.vpid == vpid,
+				}
+		}) else {
+			return;
+		};
+		let (status, signal) = match job.procs.as_deref_mut() {
+			None => (status, end.signal().filter(|_| !pipeline)),
+			Some(procs) => {
+				if let Some(p) = procs.get_mut(vpid) {
+					p.state = end;
+				}
+				if procs.list.iter().any(|p| p.state == ProcState::Running) {
+					return;
+				}
+				(procs_status(procs, platform), procs.signal())
+			},
+		};
+		job.state = JobState::Done(status);
+		job.signal = signal;
+		job.notified = notified;
+	}
+
+	/// The last stage of the `lastpipe` pipeline whose first forked stage is
+	/// vproc `first` ended with `status`: bash appends it to the pipeline's
+	/// job (`execute_pipeline`'s `append_process`) as a process of the shell
+	/// `shell` that exited so, its command the last one the stage ran (bash
+	/// `the_printed_command_except_trap`, `$BASH_COMMAND`): the job's text
+	/// ends with it, `jobs` shows how it ended, and once every stage ended
+	/// the job's status is the pipeline's ([`JobProcs::status_process`]).
+	pub fn lastpipe_stage_ended(
+		&mut self,
+		first: Vpid,
+		shell: Vpid,
+		text: BString,
+		status: i32,
+		platform: crate::bash::Platform,
+	) {
+		let Some(job) = self
+			.list
+			.iter_mut()
+			.find(|j| j.vpid == first && j.foreground && !j.inherited)
+		else {
+			return;
+		};
+		let Some(procs) = job.procs.as_deref_mut() else {
+			return;
+		};
+		job.text.extend_from_slice(b" | ");
+		job.text.extend_from_slice(&text);
+		procs.list.push(JobProc {
+			vpid: shell,
+			os_pid: None,
+			text,
+			state: ProcState::Exited(status & 0xff),
+		});
+		if matches!(job.state, JobState::Done(_)) {
+			job.state = JobState::Done(procs_status(procs, platform));
+			job.signal = procs.signal();
+		}
+	}
+
+	/// The job of the external this shell starts or waits for
+	/// ([`super::killed::foreground_job`]): the last job, a foreground one of
+	/// no processes still running that knows no program yet. The shell runs
+	/// nothing else meanwhile, so no job comes after it.
+	pub fn pending_external_mut(&mut self) -> Option<&mut Job> {
+		self.list.last_mut().filter(|j| {
+			j.foreground
+				&& !j.inherited
+				&& j.state == JobState::Running
+				&& j.procs.is_none()
+				&& j.os_pid.is_none()
+		})
+	}
+
+	/// The foreground external of OS pid `pid` ended with `status`, killed
+	/// by `signal` (bash `wait_for`): its job, if it has one, is done;
+	/// `notified` as [`Self::foreground_reaped`].
+	pub fn external_ended(&mut self, pid: u32, status: i32, signal: Option<Signal>, notified: bool) {
+		if let Some(job) = self.list.iter_mut().rev().find(|j| {
+			j.foreground && !j.inherited && j.state == JobState::Running && j.os_pid == Some(pid)
+		}) {
+			job.state = JobState::Done(status);
+			job.signal = signal;
+			job.notified = notified;
+		}
 	}
 
 	/// The process of vproc `vpid` of one of the jobs ([`Job::procs`]) is
@@ -2214,12 +2378,8 @@ impl Live {
 // in each background vproc's overlay, bash's asynchronous ignore of `INT`
 // and `QUIT`: 587 B (a 532-byte map, a 48-byte word list, the two names).
 // It is a field now (`Vproc::async_ignored`, one byte: Vproc 680 → 688 B),
-// and the bench (debug) measured 2,458 → 1,879 B per idle vproc. The job
-// numbers foreground commands hold while bash deletes no job
-// (`JobTable::held`, a `u32` as bash's job numbers have no ceiling there:
-// JobTable 56 → 64 B, Vproc 688 → 696 B): the bench (release) measured
-// 1,901 → 1,909 B per idle vproc.
-const _: () = assert!(size_of::<Vproc>() <= 696, "Vproc grew (idle vproc ≤ 2 KiB)");
+// and the bench (debug) measured 2,458 → 1,879 B per idle vproc.
+const _: () = assert!(size_of::<Vproc>() <= 688, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 384, "ExecState grew (idle vproc ≤ 2 KiB)");

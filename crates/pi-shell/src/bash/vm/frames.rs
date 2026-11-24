@@ -1169,6 +1169,14 @@ impl Shell {
 				}
 			}
 		}
+		// A foreground job's command went with the frames
+		// ([`super::proc::Job::foreground`]): it is done too.
+		for job in &mut self.procs[0].jobs.list {
+			if job.foreground && job.state == JobState::Running {
+				job.state = JobState::Done(137);
+				job.notified = false;
+			}
+		}
 		Ok(())
 	}
 }

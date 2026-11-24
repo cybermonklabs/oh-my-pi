@@ -2553,6 +2553,25 @@ impl Shell {
 			return;
 		};
 		let owner = self.process_ended(i, vpid, proc::ProcState::ended(status, died_of));
+		// bash's foreground job of it ([`proc::Job::foreground`]) is done
+		// once it, or each process of the pipeline it is a stage of, ended.
+		// bash's wait for it marks it reported where the list only marks
+		// (`notify_and_cleanup` under -1), but not a `lastpipe` pipeline's,
+		// which it waits for with the list still frozen.
+		if self.procs[i].jobs.iter().any(|j| j.foreground) {
+			let p = &self.procs[i];
+			let inline = p
+				.frames
+				.last()
+				.and_then(|f| f.scratch.as_deref())
+				.is_some_and(|sc| sc.inline().is_some());
+			let notified = !inline && p.freeze() == proc::Freeze::Marks;
+			let platform = self.k.engine.config().platform;
+			let end = proc::ProcState::ended(status, died_of);
+			self.procs[i]
+				.jobs
+				.foreground_reaped(vpid, end, status, pipeline, notified, platform);
+		}
 		let job = self.procs[i].jobs.by_vpid_mut(vpid);
 		let background = job.is_some();
 		// The runs of the `CHLD` trap this end owes: one for the process it
@@ -3304,14 +3323,25 @@ impl Shell {
 			SigTarget::Outside(v) => (SigTarget::Vpid(v), Sender::Process),
 			target => (target, Sender::Shell),
 		};
-		let job_root = match target {
+		// A foreground job's processes are the shell's own children, with no
+		// vproc of the job's: bash's `kill_pid` signals each one still alive
+		// ([`proc::Job::foreground`]).
+		let job_roots: Vec<Vpid> = match target {
 			SigTarget::Job(id) => self
 				.procs
 				.iter()
 				.flat_map(|p| p.jobs.iter())
 				.find(|job| job.id == id)
-				.map(|job| job.vpid),
-			_ => None,
+				.map_or_else(Vec::new, |job| match job.procs.as_deref() {
+					Some(procs) if job.foreground => procs
+						.list
+						.iter()
+						.filter(|p| p.state == proc::ProcState::Running)
+						.map(|p| p.vpid)
+						.collect(),
+					_ => vec![job.vpid],
+				}),
+			_ => Vec::new(),
 		};
 		let mut hits: Vec<usize> = (0..self.procs.len())
 			.filter(|&i| match target {
@@ -3319,7 +3349,9 @@ impl Shell {
 					self.procs[i].vpid == v
 				},
 				SigTarget::All => true,
-				SigTarget::Job(_) => job_root.is_some_and(|v| self.in_job(self.procs[i].vpid, v)),
+				SigTarget::Job(_) => job_roots
+					.iter()
+					.any(|&v| self.in_job(self.procs[i].vpid, v)),
 				SigTarget::Label(l) => l != 0 && self.procs[i].lineage.label == l,
 				SigTarget::Tree(v) => self.in_job(self.procs[i].vpid, v),
 			})

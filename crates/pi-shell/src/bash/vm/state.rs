@@ -370,9 +370,8 @@ struct Synced {
 	/// The ids of the jobs written, in table order. The jobs themselves are
 	/// compared with their store records (no copy of the table).
 	job_ids:    Vec<JobId>,
-	/// `%+`, `%-`, the owed `SIGCHLD` runs and the number foreground
-	/// commands hold, as written.
-	job_marks:  (Option<u32>, Option<u32>, u32, u32),
+	/// `%+`, `%-` and the owed `SIGCHLD` runs as written.
+	job_marks:  (Option<u32>, Option<u32>, u32),
 	getopts:    GetoptsState,
 	rlimits:    Vec<(Rlimit, Option<u64>, Option<u64>)>,
 }
@@ -3072,10 +3071,19 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	let same_ids =
 		ids.len() == jobs.list.len() && ids.iter().zip(&jobs.list).all(|(id, j)| *id == j.id);
 	if !same_ids {
-		for id in &ids {
-			if !jobs.list.iter().any(|j| j.id == *id) {
-				root.write(store, Change::Del(Key::Job(*id)));
-				root.write(store, Change::Del(Key::JobFacts(*id)));
+		// A job started since the last sync (the table only grew) deletes
+		// none; otherwise each id no longer in the table goes. A lookup per
+		// id, not a scan of the table: a `lastpipe` stage can keep thousands
+		// of foreground jobs (`Job::foreground`), one more per fork.
+		let grown =
+			ids.len() < jobs.list.len() && ids.iter().zip(&jobs.list).all(|(id, j)| *id == j.id);
+		if !grown {
+			let live: std::collections::HashSet<JobId> = jobs.list.iter().map(|j| j.id).collect();
+			for id in &ids {
+				if !live.contains(id) {
+					root.write(store, Change::Del(Key::Job(*id)));
+					root.write(store, Change::Del(Key::JobFacts(*id)));
+				}
 			}
 		}
 		ids.clear();
@@ -3120,19 +3128,17 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 			);
 		}
 	}
-	let (current, previous, chld, held) = root.synced.job_marks;
-	let count = |n: u32| Some(n).filter(|&n| n > 0);
+	let (current, previous, chld) = root.synced.job_marks;
 	for (key, new, was) in [
 		(MiscKey::JobCurrent, jobs.current, current),
 		(MiscKey::JobPrevious, jobs.previous, previous),
-		(MiscKey::ChldOwed, count(jobs.chld), count(chld)),
-		(MiscKey::JobsHeld, count(jobs.held), count(held)),
+		(MiscKey::ChldOwed, Some(jobs.chld).filter(|&n| n > 0), Some(chld).filter(|&n| n > 0)),
 	] {
 		if new != was {
 			root.set_record(store, KeyBuf::Misc(key), new.map(|n| Record::Misc(decimal(n))));
 		}
 	}
-	root.synced.job_marks = (jobs.current, jobs.previous, jobs.chld, jobs.held);
+	root.synced.job_marks = (jobs.current, jobs.previous, jobs.chld);
 }
 
 /// Keep the status `status` of `vp`'s background job `vpid` that left the
@@ -3203,7 +3209,7 @@ pub fn sync_root(root: &mut Root, store: &mut dyn StateStore, vp: &Vproc) {
 	}
 	// Jobs are compared with their records: only an empty table that was
 	// written empty is skipped without a read.
-	let marks = (vp.jobs.current, vp.jobs.previous, vp.jobs.chld, vp.jobs.held);
+	let marks = (vp.jobs.current, vp.jobs.previous, vp.jobs.chld);
 	if !vp.jobs.list.is_empty() || !root.synced.job_ids.is_empty() || marks != root.synced.job_marks
 	{
 		write_jobs(root, store, &vp.jobs);
@@ -3300,9 +3306,6 @@ pub fn load_root(
 		subshell: false,
 		comsub: super::proc::Comsub::No,
 		freeze: super::proc::Freeze::No,
-		held: misc(store, MiscKey::JobsHeld)?
-			.and_then(|s| parse(&s))
-			.unwrap_or(0),
 		bgp,
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);
@@ -3312,7 +3315,7 @@ pub fn load_root(
 		pipestatus: vp.pipestatus.clone(),
 		last_bg:    vp.last_bg,
 		job_ids:    vp.jobs.list.iter().map(|j| j.id).collect(),
-		job_marks:  (vp.jobs.current, vp.jobs.previous, vp.jobs.chld, vp.jobs.held),
+		job_marks:  (vp.jobs.current, vp.jobs.previous, vp.jobs.chld),
 		getopts:    vp.getopts.clone(),
 		rlimits:    vp.rlimits.clone(),
 	};

@@ -2446,10 +2446,15 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			st(vp).subshell_exec = super::killed::subshell_exec(k, cx, vp, op);
 			// bash forks the program (`stop_pipeline` first deletes the
 			// finished jobs reported, `jobs.c:572`, and makes it a job) unless
-			// it runs it with `exec` in its own process.
+			// it runs it with `exec` in its own process. A spawn tried again
+			// (the redirections applied here after all) keeps the job it made.
 			if !st(vp).in_place && !st(vp).subshell_exec {
 				super::killed::cleanup_dead_jobs(vp);
-				super::killed::foreground_job(vp);
+				if super::killed::keeps_foreground(vp) && vp.jobs.pending_external_mut().is_none() {
+					let text = super::killed::external_text(k, cx, vp, op);
+					let own = k.vpid(cx.store);
+					super::killed::foreground_job(vp, job, own, text, None);
+				}
 			}
 			// The root's process becomes the program's: each signal that would
 			// end it is caught, to be the program's
@@ -2597,6 +2602,12 @@ fn spawned_external(
 			k.forget_deferral(vp.vpid);
 			super::jobctl::spawned(k, vp, child.as_ref());
 			let pid = child.pid();
+			// Its foreground job, if it has one, is known by the program's
+			// pid, by which its end finds it
+			// ([`super::proc::JobTable::external_ended`]).
+			if let Some(job) = vp.jobs.pending_external_mut() {
+				job.os_pid = Some(pid);
+			}
 			// The job this vproc may still settle is known by its program
 			// (`bang_dispatch` let only its lone or `exec`'d external
 			// through).
@@ -4436,6 +4447,37 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			let mut waited = None;
 			let keep = keeps_statuses(k, cx, vp);
 			while let Some(&v) = st(vp).wait_for.first() {
+				// A foreground job (`wait %N`, [`super::proc::Job::foreground`])
+				// ends as its processes, the shell's own children, end: bash's
+				// `wait_for_job` waits for them, returns the job's status and
+				// marks it reported.
+				if let Some(job) = vp.jobs.foreground(v) {
+					let pid = job.pid();
+					let JobState::Done(s) = job.state else {
+						let running = job
+							.procs
+							.as_deref()
+							.and_then(|p| {
+								p.list
+									.iter()
+									.find(|p| p.state == crate::bash::store::ProcState::Running)
+							})
+							.map_or(v, |p| p.vpid);
+						if let Some(flow) = write_out(k, vp, cx, line) {
+							return Some(flow);
+						}
+						return Some(Flow::Block(WaitKey::Proc(running)));
+					};
+					last = s;
+					waited_notice(k, vp, cx, v, line);
+					if let Some(job) = vp.jobs.foreground_mut(v) {
+						job.notified = true;
+					}
+					super::killed::cleanup_dead_jobs(vp);
+					waited = Some(pid);
+					st(vp).wait_for.remove(0);
+					continue;
+				}
 				// `wait -p` names the child by the pid the user knows (its
 				// program's OS pid), read before the job is forgotten.
 				let shown = vp.shown_pid(v);
@@ -4527,7 +4569,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				.jobs
 				.iter()
 				.filter(|j| match j.state {
-					JobState::Done(status) => {
+					JobState::Done(status) if !j.foreground => {
 						!last.is(j.vpid)
 							|| (kept != Some(j.vpid)
 								&& ((if bash { j.notified } else { status > 128 })
@@ -4550,6 +4592,18 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					k.proc_collect(cx.store, v);
 				}
 				forget_job(vp, v);
+			}
+			// `mark_dead_jobs_as_notified` marks the finished foreground jobs
+			// too ([`super::proc::Job::foreground`]), whose processes the
+			// shell took in already; the cleanup deletes them, but none while
+			// no job may be deleted.
+			if bash && vp.jobs.iter().any(|j| j.foreground) {
+				for job in &mut vp.jobs.list {
+					if job.foreground && matches!(job.state, JobState::Done(_)) {
+						job.notified = true;
+					}
+				}
+				super::killed::cleanup_dead_jobs(vp);
 			}
 			// And the statuses kept go (`bgp_clear`), frozen or not.
 			state::clear_statuses(&mut k.root, cx.store, vp);
@@ -4689,6 +4743,12 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				},
 				None => lost(k, vp, cx, op, line, Lost::Ext { vpid: vp.vpid, pid }),
 			};
+			// Its foreground job ([`super::proc::Job::foreground`]) is done,
+			// reported where the list only marks (`notify_and_cleanup` under -1).
+			if vp.jobs.iter().any(|j| j.foreground) {
+				let marks = vp.freeze() == super::proc::Freeze::Marks;
+				vp.jobs.external_ended(pid, status, killed, marks);
+			}
 			// The shell's process was the program it `exec`ed: bash and zsh
 			// run no EXIT trap after it.
 			if replacing && reaped {
@@ -4984,9 +5044,23 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let notice = e.notice.take();
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
+	let external = matches!(
+		e.target,
+		Some(Target::External(_) | Target::Interp(_) | Target::Script(_) | Target::Refused { .. })
+	);
 	vp.status = status;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
+	// An external the host refused, or ran as a script, ended without a
+	// program's end: its foreground job ([`super::proc::Job::foreground`])
+	// ends with the command's status.
+	if external && vp.jobs.pending_external_mut().is_some() {
+		let marks = vp.freeze() == super::proc::Freeze::Marks;
+		if let Some(job) = vp.jobs.pending_external_mut() {
+			job.state = JobState::Done(status);
+			job.notified = marks;
+		}
+	}
 	if k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
 		// One fresh reading for the duration and the event's stamp; the
 		// next command's `CmdStart` may share it.

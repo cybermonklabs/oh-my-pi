@@ -183,11 +183,14 @@ pub(super) fn target(
 		if zsh.is_none() {
 			job.notified = false;
 		}
+		// A foreground job's processes are the shell's children, and its
+		// vproc names only the first of them: its state alone says it ended.
 		if matches!(job.state, JobState::Done(_))
-			|| matches!(
-				ctx.k.proc_state(ctx.cx.store, job.vpid),
-				Some(crate::bash::vm::ProcState::Exited(_))
-			) {
+			|| (!job.foreground
+				&& matches!(
+					ctx.k.proc_state(ctx.cx.store, job.vpid),
+					Some(crate::bash::vm::ProcState::Exited(_))
+				)) {
 			// bash's `kill` finds the job gone once it reaped it.
 			job.unreaped = false;
 			if zsh.is_some() {
