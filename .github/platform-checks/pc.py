@@ -101,12 +101,52 @@ def scope(env):
     return False, ""
 
 
+# The settings a dispatch gives in one `options` input, because GitHub takes at most 10
+# workflow_dispatch inputs: `name=value` pairs separated by spaces, in any order. Each name is a
+# call input of this workflow too, and a caller passes it on its own. The value of each is its
+# PC_ environment variable's, so a dispatch and a call reach the jobs the same way.
+OPTIONS = ("legs", "retries", "flaky_passes", "partitions", "as_root", "keep_success_output", "skip_bash_install")
+OPTION_OK = re.compile(r"[A-Za-z0-9_]+=[A-Za-z0-9_.,:/-]*")
+
+
+def options(env):
+    """{name: value} of the `options` input (PC_OPTIONS), checked against OPTIONS. Empty on a call,
+    where each setting is an input of its own. Dies on a pair that does not parse, a name that is
+    not a setting, or a name given twice."""
+    text = env.get("PC_OPTIONS", "").strip()
+    if not text:
+        return {}
+    got = {}
+    for pair in text.split():
+        if not OPTION_OK.fullmatch(pair):
+            die(f"options: [{pair}] is not name=value, of A-Z a-z 0-9 _ . , : / -")
+        name, _, value = pair.partition("=")
+        if name not in OPTIONS:
+            die(f"options: {name} is no setting; one of {', '.join(OPTIONS)}")
+        if name in got:
+            die(f"options: {name} is given twice")
+        got[name] = value
+    return got
+
+
+def setting(env, opts, name, default):
+    """One setting's value: from `options` on a dispatch, else from its own input, else default."""
+    if name in opts:
+        return opts[name]
+    value = env.get("PC_" + name.upper(), "")
+    return value if value != "" else default
+
+
 def plan():
-    """Check each input exactly as the jobs will use it (nothing is stripped or rewritten)."""
+    """Check each input exactly as the jobs will use it (nothing is stripped or rewritten), and
+    print each setting the jobs need, whether it came from `options` or from its own input."""
     env = os.environ
     called, refusal = scope(env)
     if refusal:
         die(refusal)
+    opts = options(env)
+    if called and opts:
+        die("options is a dispatch input; a caller passes each setting on its own")
     head, base, plant = env.get("PC_HEAD", ""), env.get("PC_BASE", ""), env.get("PC_PLANT", "")
     if not SHA.fullmatch(head):
         die("head must be a full 40-character commit id")
@@ -122,15 +162,21 @@ def plan():
         die("filter must be a nextest filterset of at most 500 characters from "
             "A-Z a-z 0-9 _ : / ^ $ . * + ? | & ! = ~ ( ) , # { } [ ] \\ - and space")
     repeat = whole("repeat", env.get("PC_REPEAT"), 1, 500)
-    legs = whole("legs", env.get("PC_LEGS"), 1, 20)
+    legs = whole("legs", setting(env, opts, "legs", "1"), 1, 20)
     # partitions N splits the selected tests into N parallel legs (nextest --partition count:k/N);
     # each partition runs every repeat, split over `legs` as before.
-    partitions = whole("partitions", env.get("PC_PARTITIONS") or "1", 1, 20)
+    partitions = whole("partitions", setting(env, opts, "partitions", "1"), 1, 20)
     if legs > repeat:
         die(f"legs ({legs}) must not exceed repeat ({repeat})")
-    whole("retries", env.get("PC_RETRIES"), 0, 5)
-    whole("timeout_minutes", env.get("PC_TIMEOUT_MINUTES"), 1, 60)
-    as_root = env.get("PC_AS_ROOT") == "true"
+    retries = whole("retries", setting(env, opts, "retries", "0"), 0, 5)
+    timeout_minutes = whole("timeout_minutes", env.get("PC_TIMEOUT_MINUTES"), 1, 60)
+    flags = {}
+    for name in ("flaky_passes", "as_root", "keep_success_output", "skip_bash_install"):
+        value = setting(env, opts, name, "false")
+        if value not in ("true", "false"):
+            die(f"{name} must be true or false, not [{value}]")
+        flags[name] = value
+    as_root = flags["as_root"] == "true"
 
     # Leg k of L runs its share of the repeats as one nextest stress run.
     shares, offset = [], 0
@@ -166,6 +212,14 @@ def plan():
     print(f"builds={json.dumps([b for p in RUNNERS for b in out[f'builds_{p}']], **compact)}")
     print(f"legs={json.dumps([l for p in RUNNERS for l in out[f'legs_{p}']], **compact)}")
     print(f"called={str(called).lower()}")
+    # Each setting the platform jobs take, resolved here: a dispatch gives some of them in
+    # `options`, a caller as inputs of its own, and the jobs read only these.
+    print(f"legs_n={legs}")
+    print(f"retries={retries}")
+    print(f"timeout_minutes={timeout_minutes}")
+    print(f"partitions={partitions}")
+    for name, value in flags.items():
+        print(f"{name}={value}")
     print(f"PLAN {sum(len(out[f'builds_{p}']) for p in RUNNERS)} build jobs, {total} test legs; "
           + (f"called by {env.get('GITHUB_WORKFLOW_REF')}" if called else "a dispatch"), file=sys.stderr)
 
@@ -857,6 +911,43 @@ def partition_selftest():
     return int(bad)
 
 
+def options_selftest():
+    """The `options` input: what it accepts, what it refuses, and that each setting reaches the
+    plan the same way from `options` as from its own input."""
+    rows = [
+        ("empty", "", {}),
+        ("one pair", "legs=4", {"legs": "4"}),
+        ("every setting", " ".join(f"{n}=x" for n in OPTIONS), {n: "x" for n in OPTIONS}),
+        ("a flag", "as_root=true keep_success_output=false", {"as_root": "true", "keep_success_output": "false"}),
+        ("an empty value", "retries=", {"retries": ""}),
+        ("extra spaces", "  legs=2   retries=1  ", {"legs": "2", "retries": "1"}),
+        ("no equals", "legs", None),
+        ("a name that is no setting", "legs=2 threads=4", None),
+        ("a name given twice", "legs=2 legs=3", None),
+        ("a value with a space", "filter=a b", None),
+        ("a quoted value", "legs='2'", None),
+    ]
+    bad = 0
+    for name, text, want in rows:
+        try:
+            got = options({"PC_OPTIONS": text})
+        except SystemExit:
+            got = None
+        print(f"{'OK      ' if got == want else 'MISMATCH'} options: {name}: {got}")
+        bad |= got != want
+    # setting(): `options` first, then the setting's own input, then the default.
+    cases = [
+        ("from options", {"PC_LEGS": "9"}, {"legs": "4"}, "4"),
+        ("from its own input", {"PC_LEGS": "9"}, {}, "9"),
+        ("the default", {"PC_LEGS": ""}, {}, "1"),
+    ]
+    for name, env, opts, want in cases:
+        got = setting(env, opts, "legs", "1")
+        print(f"{'OK      ' if got == want else 'MISMATCH'} setting: {name}: {got}")
+        bad |= got != want
+    return int(bad)
+
+
 def scope_selftest():
     """The plan's scope rows: a dispatch runs only from platform-checks; a call runs anywhere."""
     caller = "cybermonklabs/oh-my-pi/.github/workflows/sami-checks.yml"
@@ -881,7 +972,7 @@ def scope_selftest():
 
 
 def selftest():
-    bad = classifier_selftest() | scope_selftest() | partition_selftest()
+    bad = classifier_selftest() | scope_selftest() | partition_selftest() | options_selftest()
     problems = scan_selftest()
     for p in problems:
         print(f"MISMATCH scan control: {p}")
