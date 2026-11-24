@@ -274,6 +274,48 @@ fn a_trap_that_returns_drops_the_held_jump() {
 	);
 }
 
+/// A second trap that starts at the frame index a returned function left
+/// does not take that function's held jump: the trap's own action runs,
+/// and so does the line after the function. The first USR1 trap sets the
+/// next action, signals the shell again (the second signal waits while
+/// its own trap runs) and returns from `f`, whose first op holds the jump
+/// (the redirections of the function's body, pc 0 of its frame).
+///
+/// `nest`: `f` is called from another function, so the trap's frame takes
+/// an index with a frame still below it.
+fn a_second_trap_does_not_take_the_returned_functions_jump(nest: bool) {
+	let call = if nest {
+		"g() { p=$BASHPID; ( delay; kill -USR1 $p ) & f; }; g"
+	} else {
+		"p=$BASHPID; ( delay; kill -USR1 $p ) & f"
+	};
+	let src = format!(
+		"{{ trap 'trap \"echo T2\" USR1; kill -USR1 $p; return 7' USR1; f() {{ echo never; }} 2>&1 \
+		 3>\"${{zz?u}}\"; printf '%065536d' 0; {call}; echo \"after-f s=$?\"; echo after; }} | \
+		 {READER}; echo \"ps=${{PIPESTATUS[*]}}\""
+	);
+	let (status, out, err) = run(&src, false);
+	assert!(
+		out.contains("T2\nafter-f s=7\nafter\n")
+			&& !out.contains("never")
+			&& out.ends_with("ps=0 0\n"),
+		"nested {nest}: the second trap took the held jump: status {status} stdout {out:?} stderr \
+		 {err:?}"
+	);
+}
+
+/// The held function is called from another function.
+#[test]
+fn a_second_trap_does_not_take_a_nested_functions_held_jump() {
+	a_second_trap_does_not_take_the_returned_functions_jump(true);
+}
+
+/// The held function is called from the line itself.
+#[test]
+fn a_second_trap_does_not_take_a_top_level_functions_held_jump() {
+	a_second_trap_does_not_take_the_returned_functions_jump(false);
+}
+
 /// A trap that exits while a jump is held: the frames go, the held jump
 /// with them, and the EXIT trap runs whole with the trap's status.
 #[test]
@@ -344,6 +386,77 @@ fn a_trap_that_exits_while_a_line_start_op_holds_runs_the_exit_trap_whole() {
 	assert!(
 		bad.is_empty() && fives > 0,
 		"{fives} runs with status 5; {} bad, the first:\n{}",
+		bad.len(),
+		bad.iter().take(4).cloned().collect::<Vec<_>>().join("\n")
+	);
+}
+
+/// `src` with one USR1 sent to the root vproc at stop `at`, then `echo
+/// second; echo "s=$?"` on the same shell: run 1's status and stdout, run
+/// 2's.
+fn usr1_then_run(src: &str, at: u32) -> (i32, String, i32, String) {
+	let root = Vpid(EngineConfig::default().vpid_base);
+	let mut rig = Rig::new(host(), skeleton_init(&[]));
+	let id = rig.shell().submit(Script::command(src.as_bytes().to_vec()));
+	let budget = Budget { max_ops: 64, max_ns: u64::MAX };
+	let mut steps = 0u32;
+	let status1 = loop {
+		let (shell, host, store) = rig.parts();
+		match advance_or_blocked(shell, host, store, id, budget) {
+			Stop::Done(status) => break status,
+			Stop::Blocked => {
+				let (shell, host, _) = rig.parts();
+				if !host.fire_next_timer() {
+					wait_runnable(&shell.control());
+				}
+			},
+			Stop::Paused => rig.shell().control().resume(),
+			Stop::Yield => {},
+		}
+		steps += 1;
+		if steps == at {
+			rig.shell()
+				.control()
+				.signal(SigTarget::Vpid(root), Signal::Usr1);
+		}
+		assert!(steps < 1_000_000, "`{src}`: never ended");
+	};
+	let n1 = rig.host.stdout.bytes().len();
+	let out1 = text(&rig.host.stdout.bytes()[..n1]);
+	let status2 = rig.run(Script::command(b"echo second; echo \"s=$?\"".to_vec()), Fault::None);
+	let out2 = text(&rig.host.stdout.bytes()[n1..]);
+	(status1, out1, status2, out2)
+}
+
+/// A trap that exits while the op at the start of a line holds its jump,
+/// with no EXIT trap to run: the shell drops the hold as it exits, so the
+/// next run on the same shell, which starts at that frame and op, runs
+/// whole. The reader of run 1's standard error is still open, so it prints
+/// the held message during run 2, before run 2's own output.
+/// USR1 comes at each stop from 3 to 10; the stops that land while
+/// the jump is held end run 1 with the trap's status.
+#[test]
+fn a_trap_that_exits_while_a_line_start_op_holds_leaves_the_next_run_whole() {
+	let src = format!(
+		"trap 'exit 5' USR1\nexec 2> >({READER})\nprintf '%065536d' 0 >&2\nx=${{y:?u}}\necho never"
+	);
+	let mut bad = Vec::new();
+	let mut fives = 0usize;
+	for at in 3..=10 {
+		let (status1, out1, status2, out2) = usr1_then_run(&src, at);
+		fives += usize::from(status1 == 5);
+		if status1 == 5
+			&& (status2 != 0 || !out2.ends_with("second\ns=0\n") || out2.contains("never"))
+		{
+			bad.push(format!(
+				"at {at}: run 1 status {status1} stdout {out1:?}; run 2 status {status2} stdout \
+				 {out2:?}"
+			));
+		}
+	}
+	assert!(
+		bad.is_empty() && fives > 0,
+		"{fives} runs exited from the trap; {} left a held jump, the first:\n{}",
 		bad.len(),
 		bad.iter().take(4).cloned().collect::<Vec<_>>().join("\n")
 	);

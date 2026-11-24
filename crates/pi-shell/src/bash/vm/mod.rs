@@ -655,6 +655,18 @@ impl Kernel {
 		}
 	}
 
+	/// A frame of `vproc` at `depth` or above went, and a new one takes its
+	/// index (a trap's): the jumps they held go with them
+	/// ([`proc::HeldFlow`]).
+	pub fn forget_holds_from(&mut self, vproc: Vpid, depth: usize) {
+		if !self.held_flows.is_empty() {
+			let depth = u32::try_from(depth).unwrap_or(u32::MAX);
+			self
+				.held_flows
+				.retain(|h| h.vproc != vproc || h.frame < depth);
+		}
+	}
+
 	/// `vproc` ended, or its command did: forget what it was deciding.
 	pub fn forget_deferral(&mut self, vproc: Vpid) {
 		if !self.deferrals.is_empty() {

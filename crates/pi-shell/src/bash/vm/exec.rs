@@ -254,8 +254,8 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		let bash = unit.mode.dialect() == Dialect::Bash;
 		// The op ended in a jump whose messages a full stream held
 		// ([`super::proc::HeldFlow`]): the loop's top wrote them, so the jump
-		// is made now. A hold whose frame went (an op of a frame below it, or
-		// of a new frame at its index, runs) goes.
+		// is made now, by the op's own frame. A hold goes when an op of a
+		// frame below it runs, and when a new frame takes its index.
 		let jump = if k.held_flows.is_empty() {
 			None
 		} else {
@@ -368,18 +368,17 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		// `{ x=${y:?}; } 2>/dev/null` print none), waiting while that stream
 		// is full: before the jump that ends the command or the line undoes
 		// them (the op's own when its scratch goes, its frames' in the
-		// unwind). The jump is held meanwhile, and goes with the op's frame if
-		// something else unwinds it first (a cancel, a trap's `exit` or
-		// `return`, the vproc's end).
+		// unwind). The jump is held meanwhile, and goes with the op's frame
+		// when something else unwinds it first (a trap's `return` or `exit`,
+		// a cancel, a kill, the vproc's end).
 		if bash
 			&& let Flow::Exit(status) | Flow::Discard(status) = flow
 			&& let Some(fd) = flush_out(k, vp)
 		{
 			let exit = matches!(flow, Flow::Exit(_));
 			let frame = u32::try_from(fi).unwrap_or(u32::MAX);
-			let pc = vp.frames[fi].pc;
 			k.held_flows
-				.push(super::proc::HeldFlow { vproc: vp.vpid, frame, pc, exit, status });
+				.push(super::proc::HeldFlow { vproc: vp.vpid, frame, exit, status });
 			return park(k, cx, vp, WaitKey::Write { fd }, at);
 		}
 		if !matches!(flow, Flow::Block(_) | Flow::Call)
@@ -839,20 +838,20 @@ fn end_run(k: &mut Kernel, vp: &Vproc, cx: &mut Cx<'_>, run: &super::proc::Run) 
 	k.done.push_back((run.id, status));
 }
 
-/// The jump held for the op of `vp`'s frame `fi` ([`super::proc::HeldFlow`]),
-/// taken; the vproc's holds whose frame went (at or above `fi` but not its
-/// op: a frame below them runs an op, or a new frame at their index does)
-/// dropped.
+/// The jump `vp`'s frame `fi` holds ([`super::proc::HeldFlow`]), taken by
+/// the op running there; the holds of the frames above it, which are gone,
+/// dropped. Every frame that takes the index of a gone frame drops its hold
+/// first: a trap's in [`push_trap`], the EXIT trap's in [`exit_shell`], a
+/// cancelled or killed vproc's in [`finish_cancel`] and `Shell::kill`.
 #[cold]
 #[inline(never)]
 fn take_hold(k: &mut Kernel, vp: &Vproc, fi: usize) -> Option<super::proc::HeldFlow> {
-	let pc = vp.frames[fi].pc;
 	let mut jump = None;
 	k.held_flows.retain(|h| {
 		if h.vproc != vp.vpid || (h.frame as usize) < fi {
 			return true;
 		}
-		if h.frame as usize == fi && h.pc == pc {
+		if h.frame as usize == fi {
 			jump = Some(*h);
 		}
 		false
@@ -4824,6 +4823,11 @@ fn push_trap(
 	state::push_scope(&mut k.root, cx.store, vp, scope);
 	let status = vp.status;
 	vp.blocked = None;
+	// The trap's frame takes the index of a frame that went (a trap that
+	// `return`s from the function holding a jump, then a second signal):
+	// the jumps those frames held go with them, before the trap's first op
+	// runs at their index ([`super::proc::HeldFlow`]).
+	k.forget_holds_from(vp.vpid, vp.frames.len());
 	push_script(vp, action, 1, ScriptKind::Trap {
 		key,
 		status,
