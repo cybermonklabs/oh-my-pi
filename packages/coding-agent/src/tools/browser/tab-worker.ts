@@ -1524,6 +1524,14 @@ export function describeInflight(inflight: Map<number, InflightOp>): string {
 		.join(", ");
 }
 
+/** Test hook: awaited in a run of a core in this realm (an inline core), just before its runtime is built. */
+let beforeRunRuntimeForTest: ((core: WorkerCore) => Promise<void>) | undefined;
+
+/** Test-only: set (or clear) {@link beforeRunRuntimeForTest}, so a test can stop a core in that window. */
+export function setBeforeRunRuntimeForTest(hook: ((core: WorkerCore) => Promise<void>) | undefined): void {
+	beforeRunRuntimeForTest = hook;
+}
+
 export class WorkerCore {
 	#transport: Transport;
 	#browser?: Browser;
@@ -2060,6 +2068,7 @@ export class WorkerCore {
 			runPage = createRunPageScope(this.#requirePage(), () => this.#requireNetwork().restoreInterception());
 			const browser = this.#requireBrowser();
 			const tabApi = this.#createTabApi(msg.name, msg.timeoutMs, signal, msg.session, output, screenshots, active);
+			if (beforeRunRuntimeForTest) await beforeRunRuntimeForTest(this);
 			const runtime = this.#ensureRuntime(msg.session);
 			runtime.setCwd(msg.session.cwd);
 			const onFloatingRejection = (reason: unknown): void => this.#recordFloatingRejection(active, reason);
