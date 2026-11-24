@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- An error's message in bash mode now goes to the standard error the command's redirections set, as bash writes it: `: 2>/dev/null 3>"${zz?u}"` and `{ x=${y:?u}; } 2>/dev/null` print nothing, `2>&1` puts it on standard output, `2>file` in the file, and a full pipe gets it once its reader drains it. It was written after the redirections were undone, on the standard error before them.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

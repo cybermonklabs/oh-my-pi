@@ -1,0 +1,3062 @@
+[
+ {
+  "id": "r-builtin-null-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-null-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-null-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-null-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-null-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-null-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-null-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-null-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-dup-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-dup-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-dup-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-dup-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-dup-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-dup-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-dup-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-dup-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-file-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-file-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-file-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-file-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-file-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-file-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-file-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-builtin-file-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; : 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-null-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-null-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-null-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-null-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-null-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-null-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-null-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-null-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-dup-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-dup-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-dup-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-dup-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-dup-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-dup-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-dup-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-dup-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-file-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-file-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-file-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-file-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-file-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-file-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-file-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-echo-file-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; echo x 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-null-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-null-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-null-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-null-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-null-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-null-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-null-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-null-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-dup-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-dup-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-dup-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-dup-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-dup-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-dup-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-dup-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-dup-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-file-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-file-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-file-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-file-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-file-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-file-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-file-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-function-file-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; f() { :; }; f 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-null-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-null-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-null-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-null-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-null-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-null-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-null-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-null-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-dup-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-dup-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-dup-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-dup-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-dup-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-dup-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-dup-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-dup-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-file-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-file-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-file-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-file-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-file-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-file-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-file-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-file-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; { :; } 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-null-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-null-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-null-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-null-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-null-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-null-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-null-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-null-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-dup-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-dup-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-dup-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-dup-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-dup-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-dup-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-dup-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-dup-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-file-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-file-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-file-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-file-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-file-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-file-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-file-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-loop-file-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; while false; do :; done 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-null-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-null-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-null-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-null-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-null-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-null-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-null-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-null-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-dup-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-dup-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-dup-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-dup-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-dup-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-dup-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-dup-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-dup-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-file-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-file-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-file-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-file-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-file-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-file-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-file-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-null-file-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-null-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-null-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-null-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-null-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>/dev/null 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-null-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-null-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>/dev/null 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-null-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-null-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>/dev/null 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-dup-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "bash: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-dup-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>&1 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "./s.sh: line 1: zz: u\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-dup-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-dup-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>&1 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-dup-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-dup-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>&1 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: 9: Bad file descriptor\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-dup-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-dup-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>&1 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: $a: ambiguous redirect\ns=1\nexit\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-file-fatal",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "exit\nbash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-file-fatal",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>err 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "exit\n./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-file-open",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-file-open",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>err 3< /nonexistent/x; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: /nonexistent/x: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-file-badfd",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-file-badfd",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>err 3<&9; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: 9: Bad file descriptor\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-file-ambiguous",
+  "file": false,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\nbash: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-exec-file-ambiguous",
+  "file": true,
+  "script": "a='x y'; trap 'echo exit; cat err 2>/dev/null' EXIT; exec 2>err 3> $a; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\nexit\n./s.sh: line 1: $a: ambiguous redirect\n",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-assign-error",
+  "file": false,
+  "script": "{ x=${y:?u}; } 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "",
+   ""
+  ],
+  "bash52": [
+   127,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-assign-error",
+  "file": true,
+  "script": "{ x=${y:?u}; } 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-word-error",
+  "file": false,
+  "script": "{ echo ${y:?u}; } 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "",
+   ""
+  ],
+  "bash52": [
+   127,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-word-error",
+  "file": true,
+  "script": "{ echo ${y:?u}; } 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-redir-error",
+  "file": false,
+  "script": "{ :; } 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "",
+   ""
+  ],
+  "bash52": [
+   127,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "r-group-redir-error",
+  "file": true,
+  "script": "{ :; } 2>/dev/null 3>\"${zz?u}\"; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "m-group-dup-word",
+  "file": false,
+  "script": "{ echo ${y:?u}; } 2>&1; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "bash: line 1: y: u\n",
+   ""
+  ],
+  "bash52": [
+   127,
+   "bash: line 1: y: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "m-group-dup-word",
+  "file": true,
+  "script": "{ echo ${y:?u}; } 2>&1; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "./s.sh: line 1: y: u\n",
+   ""
+  ],
+  "bash52": [
+   1,
+   "./s.sh: line 1: y: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "m-loop-body",
+  "file": false,
+  "script": "for i in 1; do x=${y:?u}; done 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "",
+   ""
+  ],
+  "bash52": [
+   127,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "m-loop-body",
+  "file": true,
+  "script": "for i in 1; do x=${y:?u}; done 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "m-function-body",
+  "file": false,
+  "script": "f() { x=${y:?u}; }; f 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "",
+   ""
+  ],
+  "bash52": [
+   127,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "m-function-body",
+  "file": true,
+  "script": "f() { x=${y:?u}; }; f 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "m-eval-body",
+  "file": false,
+  "script": "eval 'x=${y:?u}' 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "",
+   ""
+  ],
+  "bash52": [
+   127,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "m-eval-body",
+  "file": true,
+  "script": "eval 'x=${y:?u}' 2>/dev/null; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "m-nounset",
+  "file": false,
+  "script": "set -u; : 2>/dev/null $nosuch; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "",
+   "bash: line 1: nosuch: unbound variable\n"
+  ],
+  "bash52": [
+   127,
+   "",
+   "bash: line 1: nosuch: unbound variable\n"
+  ]
+ },
+ {
+  "id": "m-nounset",
+  "file": true,
+  "script": "set -u; : 2>/dev/null $nosuch; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   "./s.sh: line 1: nosuch: unbound variable\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: nosuch: unbound variable\n"
+  ]
+ },
+ {
+  "id": "m-arith",
+  "file": false,
+  "script": ": 2>/dev/null 3>/dev/null$((1/0)); echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "m-arith",
+  "file": true,
+  "script": ": 2>/dev/null 3>/dev/null$((1/0)); echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "m-badsubst",
+  "file": false,
+  "script": ": 2>/dev/null 3>${a b}; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "m-badsubst",
+  "file": true,
+  "script": ": 2>/dev/null 3>${a b}; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   ""
+  ],
+  "bash52": [
+   1,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "m-plain-ctl",
+  "file": false,
+  "script": "x=${y:?u}; echo \"s=$?\"",
+  "bash53": [
+   127,
+   "",
+   "bash: line 1: y: u\n"
+  ],
+  "bash52": [
+   127,
+   "",
+   "bash: line 1: y: u\n"
+  ]
+ },
+ {
+  "id": "m-plain-ctl",
+  "file": true,
+  "script": "x=${y:?u}; echo \"s=$?\"",
+  "bash53": [
+   1,
+   "",
+   "./s.sh: line 1: y: u\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "./s.sh: line 1: y: u\n"
+  ]
+ },
+ {
+  "id": "m-exit-trap",
+  "file": false,
+  "script": "trap \"echo T >&2\" EXIT; { x=${y:?u}; } 2>/dev/null",
+  "bash53": [
+   127,
+   "",
+   "T\n"
+  ],
+  "bash52": [
+   127,
+   "",
+   "T\n"
+  ]
+ },
+ {
+  "id": "m-exit-trap",
+  "file": true,
+  "script": "trap \"echo T >&2\" EXIT; { x=${y:?u}; } 2>/dev/null",
+  "bash53": [
+   1,
+   "",
+   "T\n"
+  ],
+  "bash52": [
+   1,
+   "",
+   "T\n"
+  ]
+ },
+ {
+  "id": "m-nonfatal-ctl",
+  "file": false,
+  "script": ": 2>/dev/null < /nonexistent; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "m-nonfatal-ctl",
+  "file": true,
+  "script": ": 2>/dev/null < /nonexistent; echo \"s=$?\"",
+  "bash53": [
+   0,
+   "s=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "s=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-redir",
+  "file": false,
+  "script": "{ printf '%065536d' 0; : 2>&1 3>\"${zz?u}\"; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "bash: line 1: zz: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: zz: u\nps=1 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-redir",
+  "file": true,
+  "script": "{ printf '%065536d' 0; : 2>&1 3>\"${zz?u}\"; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: zz: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: zz: u\nps=1 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-group",
+  "file": false,
+  "script": "{ printf '%065536d' 0; { x=${y:?u}; } 2>&1; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "bash: line 1: y: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: y: u\nps=1 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-group",
+  "file": true,
+  "script": "{ printf '%065536d' 0; { x=${y:?u}; } 2>&1; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: y: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: y: u\nps=1 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-exit",
+  "file": false,
+  "script": "exec 3>&1; { printf '%065536d' 0 >&3; : 2>&3 4>\"${zz?u}\"; echo never; } 3>&1 | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }",
+  "bash53": [
+   0,
+   "bash: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-exit",
+  "file": true,
+  "script": "exec 3>&1; { printf '%065536d' 0 >&3; : 2>&3 4>\"${zz?u}\"; echo never; } 3>&1 | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }",
+  "bash53": [
+   0,
+   "./s.sh: line 1: zz: u\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: zz: u\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-nonfatal-ctl",
+  "file": false,
+  "script": "{ printf '%065536d' 0; : 2>&1 3< /nonexistent/x; echo after; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\nafter\nps=0 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: /nonexistent/x: No such file or directory\nafter\nps=0 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-nonfatal-ctl",
+  "file": true,
+  "script": "{ printf '%065536d' 0; : 2>&1 3< /nonexistent/x; echo after; } | { SECONDS=0; while [ \"$SECONDS\" -lt 2 ]; do :; done; tr -d 0; }; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\nafter\nps=0 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: /nonexistent/x: No such file or directory\nafter\nps=0 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-empty-ctl",
+  "file": false,
+  "script": "{ echo ${y:?u}; } 2>&1 | cat; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "bash: line 1: y: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "bash: line 1: y: u\nps=1 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "fp-empty-ctl",
+  "file": true,
+  "script": "{ echo ${y:?u}; } 2>&1 | cat; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "./s.sh: line 1: y: u\nps=1 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "./s.sh: line 1: y: u\nps=1 0\n",
+   ""
+  ]
+ }
+]

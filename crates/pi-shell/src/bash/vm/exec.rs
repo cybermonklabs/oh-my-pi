@@ -252,7 +252,22 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		// The hottest ops straight to their handlers, past `dispatch`'s
 		// frame.
 		let bash = unit.mode.dialect() == Dialect::Bash;
-		let flow = if bash && op.code == Opcode::Exec {
+		// The op ended in a jump whose messages a full stream held
+		// ([`super::proc::HeldFlow`]): the loop's top wrote them, so the jump
+		// is made now, by the op's own frame. A hold goes when an op of a
+		// frame below it runs, and when a new frame takes its index.
+		let jump = if k.held_flows.is_empty() {
+			None
+		} else {
+			take_hold(k, vp, fi)
+		};
+		let flow = if let Some(jump) = jump {
+			if jump.exit {
+				Flow::Exit(jump.status)
+			} else {
+				Flow::Discard(jump.status)
+			}
+		} else if bash && op.code == Opcode::Exec {
 			command::exec(k, vp, cx, unit, op, line_of(vp, op.node))
 		} else if bash
 			&& op.code == Opcode::Arith
@@ -348,6 +363,24 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		} else {
 			0
 		};
+		// bash writes an error's message at once, to the stderr the
+		// redirections in force left (`: 2>/dev/null 3>"${x:?}"` and
+		// `{ x=${y:?}; } 2>/dev/null` print none), waiting while that stream
+		// is full: before the jump that ends the command or the line undoes
+		// them (the op's own when its scratch goes, its frames' in the
+		// unwind). The jump is held meanwhile, and goes with the op's frame
+		// when something else unwinds it first (a trap's `return` or `exit`,
+		// a cancel, a kill, the vproc's end).
+		if bash
+			&& let Flow::Exit(status) | Flow::Discard(status) = flow
+			&& let Some(fd) = flush_out(k, vp)
+		{
+			let exit = matches!(flow, Flow::Exit(_));
+			let frame = u32::try_from(fi).unwrap_or(u32::MAX);
+			k.held_flows
+				.push(super::proc::HeldFlow { vproc: vp.vpid, frame, exit, status });
+			return park(k, cx, vp, WaitKey::Write { fd }, at);
+		}
 		if !matches!(flow, Flow::Block(_) | Flow::Call)
 			&& let Some(frame) = vp.frames.get_mut(fi)
 		{
@@ -454,7 +487,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			},
 		}
 		if cancel_transfer {
-			finish_cancel(&mut k.root, cx.store, vp, cancellation.expect("checked"));
+			finish_cancel(k, cx.store, vp, cancellation.expect("checked"));
 			continue;
 		}
 		let errexit = errexit_failed
@@ -625,6 +658,8 @@ fn errexit_on(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 /// `exit` inside a function runs the root's trap first, above the
 /// function's frames: bash's trap sees its `FUNCNAME` and locals.
 fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
+	// Its frames go, and the jumps they held.
+	k.forget_holds(vp.vpid);
 	// zsh `zexit` while its hooks run: the hook calls end, the status is the
 	// new one.
 	if vp.zsh.is_some()
@@ -801,6 +836,27 @@ fn end_run(k: &mut Kernel, vp: &Vproc, cx: &mut Cx<'_>, run: &super::proc::Run) 
 	k.trace_sources.remove(&vp.vpid);
 	k.trace_unit_origins.remove(&vp.vpid);
 	k.done.push_back((run.id, status));
+}
+
+/// The jump `vp`'s frame `fi` holds ([`super::proc::HeldFlow`]), taken by
+/// the op running there; the holds of the frames above it, which are gone,
+/// dropped. Every frame that takes the index of a gone frame drops its hold
+/// first: a trap's in [`push_trap`], the EXIT trap's in [`exit_shell`], a
+/// cancelled or killed vproc's in [`finish_cancel`] and `Shell::kill`.
+#[cold]
+#[inline(never)]
+fn take_hold(k: &mut Kernel, vp: &Vproc, fi: usize) -> Option<super::proc::HeldFlow> {
+	let mut jump = None;
+	k.held_flows.retain(|h| {
+		if h.vproc != vp.vpid || (h.frame as usize) < fi {
+			return true;
+		}
+		if h.frame as usize == fi {
+			jump = Some(*h);
+		}
+		false
+	});
+	jump
 }
 
 /// Park `vp` on `key` (emitting `Blocked` when the key changes).
@@ -1126,7 +1182,7 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			return None;
 		}
 		if let Some(cancel) = cancel {
-			finish_cancel(&mut k.root, cx.store, vp, cancel);
+			finish_cancel(k, cx.store, vp, cancel);
 		} else if let Some(status) = status
 			&& exit
 		{
@@ -4767,6 +4823,11 @@ fn push_trap(
 	state::push_scope(&mut k.root, cx.store, vp, scope);
 	let status = vp.status;
 	vp.blocked = None;
+	// The trap's frame takes the index of a frame that went (a trap that
+	// `return`s from the function holding a jump, then a second signal):
+	// the jumps those frames held go with them, before the trap's first op
+	// runs at their index ([`super::proc::HeldFlow`]).
+	k.forget_holds_from(vp.vpid, vp.frames.len());
 	push_script(vp, action, 1, ScriptKind::Trap {
 		key,
 		status,
@@ -4907,9 +4968,12 @@ pub fn mark_cancel(vp: &mut Vproc, status: i32) {
 /// End a cancelled vproc (after its signal trap, or at once when it has
 /// none; `Shell::apply_requests`): unwind everything with `status`. The
 /// started run still runs its EXIT trap, as bash does when a signal ends
-/// the shell; scripts queued behind it end unstarted.
-pub fn finish_cancel(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc, status: i32) {
-	unwind(root, store, vp, 0);
+/// the shell; scripts queued behind it end unstarted. The jumps its frames
+/// held go with them, before that EXIT trap or the next run starts a frame
+/// at their index ([`super::proc::HeldFlow`]).
+pub fn finish_cancel(k: &mut Kernel, store: &mut dyn StateStore, vp: &mut Vproc, status: i32) {
+	unwind(&mut k.root, store, vp, 0);
+	k.forget_holds(vp.vpid);
 	vp.status = status;
 	vp.blocked = None;
 	for (i, run) in vp.runs.iter_mut().enumerate() {
