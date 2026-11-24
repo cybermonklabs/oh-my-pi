@@ -4,7 +4,7 @@
 # forward.
 #
 # When it runs.
-#   - A push to sami-candidate tests the pushed commit (sami fast-forwards to that same commit
+#   - A push to release-candidate tests the pushed commit (sami fast-forwards to that same commit
 #     later, so sami itself is not tested again).
 #   - A dispatch tests any pushed commit, given as a full 40-character id:
 #       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
@@ -62,15 +62,16 @@
 # on every line a passing test printed (sc.py skip-lines), and both are units of the row "skip
 # prints the summary reads".
 # Docs and CHANGELOGs: the docs job runs `cargo doc --no-deps -p pi-shell` with
-# -D rustdoc::broken_intra_doc_links on the tree's toolchain, cold like the build job (docs.sh),
-# and names each broken link by path, line and link text; the changelog job runs
+# -D rustdoc::broken_intra_doc_links on the tree's toolchain, cold like the build job, twice: as
+# published (unit `public`) and with --document-private-items (unit `private`), and names each
+# broken link by path, line and link text (docs.sh). The changelog job runs
 # `bun scripts/fix-changelogs.ts --check` on a checkout with the full history and tags (the tool
 # reads its baseline from the latest v* tag) and names each CHANGELOG the tool would rewrite with
 # the first lines it changes (changelog.sh). Both start with the plan and add no time to the run.
 #
 # Caches. No job restores or saves a GitHub Actions cache (cache-mode: none for the whole run).
 # The build job compiles dev-dependencies, build scripts and proc macros that release_binary never
-# runs, and a dispatch can name any pushed commit; with cache access on sami-candidate either
+# runs, and a dispatch can name any pushed commit; with cache access on release-candidate either
 # could plant an entry release_binary restores. So every run builds cold: about 15 min for the
 # tests' cargo build and 17 min for the addon on the first runs; bun install takes about 2 s.
 # Security. permissions: contents: read; no secrets; every checkout drops its credential.
@@ -78,13 +79,13 @@ name: sami checks
 
 run-name: >-
   ${{ github.event_name == 'workflow_dispatch' && format('sami checks {0}{1}{2}', inputs.commit, inputs.silent != '' && format(' (control: {0} uploads nothing)', inputs.silent) || '', inputs.plant != '' && format(' (control: plant={0})', inputs.plant) || '')
-  || github.ref == 'refs/heads/sami-candidate' && format('sami checks {0} (sami-candidate)', github.sha)
+  || github.ref == 'refs/heads/release-candidate' && format('sami checks {0} (release-candidate)', github.sha)
   || 'sami checks: the tool''s own controls' }}
 
 on:
   push:
     branches:
-      - sami-candidate
+      - release-candidate
       - feat/sami-checks
   workflow_dispatch:
     inputs:

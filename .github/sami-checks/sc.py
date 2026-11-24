@@ -16,7 +16,7 @@
                                            SCOPE whole-unit (the default) or own-process (nextest)
   sc.py junit-merge OUT JUNIT...           one JUnit report of several (nextest.sh's two passes)
   sc.py selftest                           the counters and the summary against hand-made inputs
-  sc.py docs STREAM LOG EXIT SECS          `cargo doc --message-format=json -p pi-shell`: each broken intra-doc link (docs.sh)
+  sc.py docs UNIT STREAM LOG EXIT SECS     `cargo doc --message-format=json -p pi-shell`: each broken intra-doc link (docs.sh)
   sc.py changelog LOG EXIT SECS FILES DIFF `fix-changelogs.ts --check`: each CHANGELOG it would rewrite (changelog.sh)
   sc.py plant WHAT TREE                    the docs or changelog row's control: puts its planted fault in TREE
 
@@ -129,7 +129,7 @@ def cmd_plan():
         commit = os.environ.get("SC_INPUT_COMMIT", "")
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
             sys.exit(f"::error::the commit input must be a full 40-character lowercase id, not '{commit}'")
-    elif event == "push" and ref == "refs/heads/sami-candidate":
+    elif event == "push" and ref == "refs/heads/release-candidate":
         commit = os.environ["GITHUB_SHA"]
     else:
         # A push of this tool's own branch: its controls only (the selftest), no tree.
@@ -586,7 +586,8 @@ def expected_units(build_dir):
     exp.append(("skipforms", "tree", "runner"))
     # The run-time half, which the summary job runs on the results before the summary (sc.py skip-lines).
     exp.append(("skipforms", "runtime", "runner"))
-    exp.append(("docs", "pi-shell", "runner"))
+    for u in DOCS_UNITS:
+        exp.append(("docs", u, "runner"))
     exp.append(("changelog", "changelogs", "runner"))
     return exp, notes
 
@@ -1019,7 +1020,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         longest = max(rs, key=lambda r: r["seconds"], default=None)
         lu = f"{longest['unit']} ({longest['who']}), {fmt_secs(longest['seconds'])}" if longest else "-"
         lines.append(f"| {title} | **{verdict}** | {counts} | {tp} / {tf} / {ti} / {ts} | {lu} |")
-        verdicts[key] = (verdict, [f for r in rs for f in r["failures"]])
+        verdicts[key] = (verdict, rs)
         if verdict not in ("PASS", "KNOWN"):
             all_ok = False
         for r in rs:
@@ -1036,12 +1037,16 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     plant = os.environ.get("SC_PLANT", "")
     if plant:
         path, text, needle = PLANTS[plant]
-        v, fs = verdicts.get(plant, ("absent", []))
-        caught = v == "FAIL" and any(needle in f for f in fs)
+        v, rs = verdicts.get(plant, ("absent", []))
+        # Each unit of the row must name the plant (docs: the public and the private build).
+        missed = [r["unit"] for r in rs if r["status"] != "FAIL" or not any(needle in f for f in r["failures"])]
+        each = ", ".join(f"`{r['unit']}`" for r in rs)
         all_ok = False
         lines[2:2] = [f"**Planted run (`plant={plant}`)**: the {plant} job added `` {text} `` to `{path}` before it ran. "
-                      + (f"The control caught it: the row reads FAIL and names `{needle}`." if caught else
-                         f"**THE CONTROL FAILED**: the row reads {v} and does not name `{needle}` in a failure."), ""]
+                      + (f"The control caught it: the row reads FAIL, and each of its units ({each}) names `{needle}`."
+                         if rs and not missed else
+                         f"**THE CONTROL FAILED**: the row reads {v}, and these units do not read FAIL naming `{needle}`: "
+                         + (", ".join(f"`{u}`" for u in missed) or "the row has no unit") + "."), ""]
     lines.append("")
     # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
     # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
@@ -1769,25 +1774,124 @@ def selftest():
         os.environ.pop("SC_PLANT")
         return rc2, buf.getvalue()
 
-    docs_i = [f for f in os.listdir(res2) if json.load(open(os.path.join(res2, f)))["row"] == "docs"]
+    # parse_docs on cargo's own JSON lines, cut to the fields it reads: run 45370356750 (85936bf7),
+    # run 45370374136 (plant=docs), and cargo doc of a crate that imports a crate that does not exist.
+    planted = ('{"reason":"compiler-message","package_id":"pi-shell","message":{"level":"error","code":{"code":'
+               '"rustdoc::broken_intra_doc_links"},"message":"unresolved link to `NoSuchItemPlanted`","spans":[{"file_name":'
+               '"crates/pi-shell/src/lib.rs","line_start":36,"column_start":1,"is_primary":true,"label":null}],"rendered":'
+               '"error: unresolved link to `NoSuchItemPlanted`"}}')
+    tg = ('{"reason":"compiler-message","package_id":"pi-shell","message":{"level":"error","code":{"code":'
+          '"rustdoc::broken_intra_doc_links"},"message":"unresolved link to `TERM_GRACE`","spans":[{"file_name":'
+          '"crates/pi-shell/src/session.rs","line_start":%d,"column_start":%d,"is_primary":true,"label":'
+          '"no item named `TERM_GRACE` in scope"}],"rendered":"error: unresolved link to `TERM_GRACE`"}}')
+    nameddir = ('{"reason":"compiler-message","package_id":"pi-shell","message":{"level":"error","code":{"code":'
+                '"rustdoc::broken_intra_doc_links"},"message":"unresolved link to `crate::bash::vm::zsh::nameddir`","spans":'
+                '[{"file_name":"crates/pi-shell/src/bash/store.rs","line_start":1243,"column_start":9,"is_primary":true,'
+                '"label":"no item named `zsh` in module `vm`"}],"rendered":"error: unresolved link to '
+                '`crate::bash::vm::zsh::nameddir`"}}')
+    private_warning = ('{"reason":"compiler-message","package_id":"pi-shell","message":{"level":"warning","code":{"code":'
+                       '"rustdoc::private_intra_doc_links"},"message":"public documentation for `value` links to private '
+                       'item `ASSIGN_PREVIEW_BYTES`","spans":[{"file_name":"crates/pi-shell/src/bash/event.rs","line_start":'
+                       '812,"column_start":23,"is_primary":true,"label":"this item is private"}],"rendered":"warning: public '
+                       'documentation for `value` links to private item `ASSIGN_PREVIEW_BYTES`"}}')
+    e0432 = ('{"reason":"compiler-message","package_id":"pi-shell","message":{"level":"error","code":{"code":"E0432"},'
+             '"message":"unresolved import `nosuch`","spans":[{"file_name":"src/lib.rs","line_start":1,"column_start":5,'
+             '"is_primary":true,"label":"use of unresolved module or unlinked crate `nosuch`"}],"rendered":'
+             '"error[E0432]: unresolved import `nosuch`"}}')
+    note_e0432 = ('{"reason":"compiler-message","package_id":"pi-shell","message":{"level":"failure-note","code":null,'
+                  '"message":"For more information about this error, try `rustc --explain E0432`.","spans":[],"rendered":'
+                  '"For more information about this error, try `rustc --explain E0432`."}}')
+    artifact = '{"reason":"compiler-artifact","target":{"name":"clean","kind":["lib"]}}'
+    finished_no, finished_yes = '{"reason":"build-finished","success":false}', '{"reason":"build-finished","success":true}'
+
+    def docs(lines, code):
+        p = os.path.join(d, "docs.jsonl")
+        open(p, "w").write("\n".join(lines) + "\n")
+        r = parse_docs("public", p, os.path.join(d, "docs-absent.log"), code, 1)
+        return r["status"], r["failures"], r["note"]
+
+    pl = "crates/pi-shell/src/lib.rs:36:1: unresolved link to 'NoSuchItemPlanted'"
+    tg40 = "crates/pi-shell/src/session.rs:40:27: unresolved link to 'TERM_GRACE' (no item named 'TERM_GRACE' in scope)"
+    tg42 = "crates/pi-shell/src/session.rs:42:46: unresolved link to 'TERM_GRACE' (no item named 'TERM_GRACE' in scope)"
+    nd = ("crates/pi-shell/src/bash/store.rs:1243:9: unresolved link to 'crate::bash::vm::zsh::nameddir' "
+          "(no item named 'zsh' in module 'vm')")
+    check("docs: the planted link", docs([planted, finished_no], "101"),
+          ("FAIL", [pl], "1 broken intra-doc link(s), to 1 distinct target(s)"))
+    check("docs: two links, and a warning of another lint", docs([private_warning, tg % (40, 27), nameddir, finished_no], "101"),
+          ("FAIL", [tg40, nd], "2 broken intra-doc link(s), to 2 distinct target(s)"))
+    check("docs: one target linked twice", docs([tg % (40, 27), tg % (42, 46), finished_no], "101"),
+          ("FAIL", [tg40, tg42], "2 broken intra-doc link(s), to 1 distinct target(s)"))
+    check("docs: another error", docs([e0432, note_e0432, finished_no], "101"),
+          ("UNKNOWN", [], "exit 101, and no broken-link error: error[E0432]: unresolved import `nosuch`"))
+    check("docs: clean", docs([artifact, finished_yes], "0")[:2], ("PASS", []))
+    check("docs: exit 0 with no build-finished", docs([artifact], "0")[0], "UNKNOWN")
+    check("docs: the time bound", docs([planted], "124")[0], "UNKNOWN")
+    check("docs: no output", parse_docs("private", os.path.join(d, "absent.jsonl"), "x", "0", 1)["status"], "UNKNOWN")
+    # parse_changelog on fix-changelogs.ts's own output: run 45370388127 (plant=changelog on 85936bf7)
+    # with its diff of the planted file; the tool at 85936bf7 on a clean tagged repository, with an
+    # argument it does not take, and outside a repository (git exits 128).
+    six = ("Fixed 6 changelog(s) since v18.18.6-sami.20261123-214229 (check, not written):\n"
+           + "".join(f"  packages/{p}/CHANGELOG.md: 0 promoted item(s), 0 merged duplicate heading(s), 0 dropped released "
+                     f"duplicate(s), {e} removed empty heading(s){c}\n"
+                     for p, e, c in (("agent", 0, ""), ("ai", 0, ", 18 collapsed release(s)"), ("browser-relay", 1, ""),
+                                     ("coding-agent", 0, ", 9 collapsed release(s)"), ("natives", 0, ""),
+                                     ("tui", 0, ", 5 collapsed release(s)"))))
+    relay_diff = ("--- a/packages/browser-relay/CHANGELOG.md\n+++ b/packages/browser-relay/CHANGELOG.md\n@@ -2,8 +2,6 @@\n"
+                  " \n ## [Unreleased]\n \n-### Planted empty heading\n-\n ## [18.18.2] - 2026-11-08\n \n ### Added\n")
+
+    def clog(text, code, diff_text=""):
+        lp, dp = os.path.join(d, "changelog.log"), os.path.join(d, "changelog.diff")
+        open(lp, "w").write(text)
+        open(dp, "w").write(diff_text)
+        return parse_changelog(lp, code, 1, "14", dp)
+
+    r = clog(six, "1", relay_diff)
+    check("changelog: the planted heading", (r["status"], r["passed"], r["failed"], r["note"], r["failures"][2:3]),
+          ("FAIL", 8, 6, "6 of 14 CHANGELOGs would be rewritten (since v18.18.6-sami.20261123-214229)",
+           ["packages/browser-relay/CHANGELOG.md: 0 promoted item(s), 0 merged duplicate heading(s), 0 dropped released "
+            "duplicate(s), 1 removed empty heading(s); from line 5: -### Planted empty heading | -"]))
+    check("changelog: a file the write run left unchanged", r["failures"][:1] and r["failures"][0].endswith(
+          "; the write run left it unchanged"), True)
+    check("changelog: a list shorter than its count", clog(six.rsplit("  packages/tui", 1)[0], "1")["status"], "UNKNOWN")
+    r = clog("Changelogs already clean since v1.0.0.\n", "0")
+    check("changelog: clean", (r["status"], r["passed"], r["note"]), ("PASS", 14, "14 CHANGELOGs, clean since v1.0.0"))
+    check("changelog: an argument the tool does not take", (clog("Unknown argument: --bogus\n", "1")["status"],
+          clog("Unknown argument: --bogus\n", "1")["note"]), ("UNKNOWN", "exit 1: Unknown argument: --bogus"))
+    check("changelog: git failed", clog("Failed with exit code 128\n", "1")["note"], "exit 1: Failed with exit code 128")
+    check("changelog: the time bound", clog(six, "124")["status"], "UNKNOWN")
+    # The summary with these rows: the docs row's two units, each planted run's verdict, and a docs or
+    # changelog job that reports nothing.
+    docs_i = {json.load(open(os.path.join(res2, f)))["unit"]: f for f in os.listdir(res2)
+              if json.load(open(os.path.join(res2, f)))["row"] == "docs"}
     log_i = [f for f in os.listdir(res2) if json.load(open(os.path.join(res2, f)))["row"] == "changelog"]
+    check("the docs row's units", sorted(docs_i), ["private", "public"])
+    docs_i = {u: docs_i.get(u, f"docs-{u}.json") for u in ("public", "private")}
     _, out = summary2()
-    check("summary: docs and changelog rows pass", ("| rustdoc intra-doc links (pi-shell) | **PASS** | 1 / 0 / 0 / 0 |" in out,
+    check("summary: docs and changelog rows pass", ("| rustdoc intra-doc links (pi-shell) | **PASS** | 2 / 0 / 0 / 0 |" in out,
           "| CHANGELOG format (fix-changelogs --check) | **PASS** | 1 / 0 / 0 / 0 |" in out), (True, True))
     _, out = summary2(plant_env="docs")
     check("summary: a planted docs run whose row passed", ("**Planted run (`plant=docs`)**" in out,
-          "**THE CONTROL FAILED**: the row reads PASS" in out), (True, True))
-    json.dump(result("docs", "pi-shell", "runner", "FAIL", 101, 1, 0, 1,
-                     failures=["crates/pi-shell/src/lib.rs:36:10: unresolved link to 'NoSuchItemPlanted'"]),
-              open(os.path.join(res2, docs_i[0]), "w"))
+          "**THE CONTROL FAILED**: the row reads PASS, and these units do not read FAIL naming `NoSuchItemPlanted`: "
+          "`public`, `private`." in out), (True, True))
+    json.dump(result("docs", "public", "runner", "FAIL", "101", 1, 0, 1, failures=[pl]), open(os.path.join(res2, docs_i["public"]), "w"))
     rc, out = summary2(plant_env="docs")
-    check("summary: a planted docs run whose row names the plant",
-          ("The control caught it: the row reads FAIL and names `NoSuchItemPlanted`." in out, rc), (True, 1))
-    rc, out = summary2(drop=docs_i + log_i)
-    check("summary: no docs or changelog result", ("| rustdoc intra-doc links (pi-shell) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
+    check("summary: a planted docs run that only one unit names",
+          ("| rustdoc intra-doc links (pi-shell) | **FAIL** | 1 / 0 / 1 / 0 |" in out,
+           "**THE CONTROL FAILED**: the row reads FAIL, and these units do not read FAIL naming `NoSuchItemPlanted`: `private`." in out,
+           rc), (True, True, 1))
+    json.dump(result("docs", "private", "runner", "FAIL", "101", 1, 0, 2, failures=[pl, tg40]),
+              open(os.path.join(res2, docs_i["private"]), "w"))
+    rc, out = summary2(plant_env="docs")
+    check("summary: a planted docs run that both units name",
+          ("The control caught it: the row reads FAIL, and each of its units (`public`, `private`) names `NoSuchItemPlanted`." in out,
+           f"`private` (runner): FAILED `{tg40}`: **NEW**" in out, rc), (True, True, 1))
+    rc, out = summary2(plant_env="changelog")
+    check("summary: a planted changelog run whose row passed", "**THE CONTROL FAILED**: the row reads PASS" in out, True)
+    rc, out = summary2(drop=[f for f in docs_i.values() if os.path.exists(os.path.join(res2, f))] + log_i)
+    check("summary: no docs or changelog result", ("| rustdoc intra-doc links (pi-shell) | **UNKNOWN** | 0 / 0 / 0 / 2 |" in out,
           "| CHANGELOG format (fix-changelogs --check) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
-          "`pi-shell` (runner): UNKNOWN: no result" in out, "`changelogs` (runner): UNKNOWN: no result" in out, rc),
-          (True, True, True, True, 1))
+          "`public` (runner): UNKNOWN: no result" in out, "`private` (runner): UNKNOWN: no result" in out,
+          "`changelogs` (runner): UNKNOWN: no result" in out, rc), (True, True, True, True, True, 1))
 
     if fails:
         for f in fails:
@@ -1799,10 +1903,12 @@ def selftest():
           "their controls")
 
 
-# The docs row (docs.sh): `cargo doc --no-deps -p pi-shell` with -D rustdoc::broken_intra_doc_links.
-# cargo's JSON names each diagnostic's lint, so every form of that lint's error is read, not only
+# The docs row (docs.sh): `cargo doc --no-deps -p pi-shell` with -D rustdoc::broken_intra_doc_links,
+# once as published (public) and once with --document-private-items (private), each a unit. cargo's
+# JSON names each diagnostic's lint, so every form of that lint's error is read, not only
 # `unresolved link to`.
 DOCS_LINT = "rustdoc::broken_intra_doc_links"
+DOCS_UNITS = ("public", "private")
 # The changelog row (changelog.sh): scripts/fix-changelogs.ts --check prints the first line, or the
 # second and then each file it would rewrite, one a line; anything else is the tool's own error.
 CHANGELOG_CLEAN = re.compile(r"^Changelogs already clean since (.*)\.$", re.M)
@@ -1827,7 +1933,7 @@ def first_line(text):
     return next((line.strip() for line in text.splitlines() if line.strip()), "")
 
 
-def parse_docs(stream, log, exit_code, secs, row="docs", unit="pi-shell"):
+def parse_docs(unit, stream, log, exit_code, secs, row="docs"):
     """`cargo doc --message-format=json` (STREAM, its stdout) and its stderr (LOG). FAIL names each
     error of rustdoc's broken_intra_doc_links lint as `path:line:col: message (label)`. PASS needs
     exit 0, cargo's build-finished with success and no error. Any other end is UNKNOWN with its first
@@ -1840,7 +1946,7 @@ def parse_docs(stream, log, exit_code, secs, row="docs", unit="pi-shell"):
         err = open(log, encoding="utf-8", errors="replace").read()
     except OSError:
         err = ""
-    links, others, finished = [], [], None
+    links, targets, others, finished = [], set(), [], None
     for line in text.splitlines():
         try:
             m = json.loads(line)
@@ -1862,12 +1968,13 @@ def parse_docs(stream, log, exit_code, secs, row="docs", unit="pi-shell"):
             name = name.replace("`", "'")
             if name not in links:
                 links.append(name)
+                targets.add(d.get("message", ""))
         elif not d.get("message", "").startswith("aborting due to"):
             others.append(first_line(d.get("rendered") or d.get("message", "")))
     if stopped(exit_code):
         return result(row, unit, "runner", "UNKNOWN", exit_code, secs, note=f"exit {exit_code}: the time bound or a signal ended it")
     if links:
-        note = f"{len(links)} broken intra-doc link(s)"
+        note = f"{len(links)} broken intra-doc link(s), to {len(targets)} distinct target(s)"
         if others:
             note += f"; and {len(others)} other error(s), the first: {others[0]}"
         return result(row, unit, "runner", "FAIL", exit_code, secs, 0, len(links), failures=links, note=note)
