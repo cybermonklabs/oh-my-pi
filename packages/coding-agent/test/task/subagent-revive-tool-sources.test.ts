@@ -114,6 +114,15 @@ export default function (pi) {
 `;
 }
 
+/** A hook-only extension whose `session_start` hook writes `name` to `hookLog`. */
+function hookSource(name: string, hookLog: string): string {
+	return `import { appendFileSync } from "node:fs";
+export default function (pi) {
+	pi.on("session_start", () => appendFileSync(${JSON.stringify(hookLog)}, ${JSON.stringify(`${name}\n`)}));
+}
+`;
+}
+
 /** A custom TS command that writes the directory it runs in to `marker`. */
 function commandSource(name: string, marker: string): string {
 	return `export default api => ({
@@ -265,7 +274,8 @@ interface ToolSourceProcess {
 
 /**
  * A test process whose root starts in A; `roots`, where given, is the owner's extension-root policy over its projects,
- * else it names EX as explicit and EG as configured and merges the ambient sources.
+ * else it names EX as explicit and EG as configured and merges the ambient sources. `prepare` writes what the case
+ * adds to the projects before the root's first scan, which reads each file once.
  */
 async function openToolSourceProcess(
 	roots: (projects: Projects) => EffectiveExtensionRoots = projects => ({
@@ -274,9 +284,11 @@ async function openToolSourceProcess(
 		configured: [projects.configuredExtension],
 		configuredLevel: "user",
 	}),
+	prepare?: (projects: Projects) => Promise<void>,
 ): Promise<ToolSourceProcess> {
 	const env = await openReviveEnv({ "memory.backend": "local", "mcp.startupTimeoutMs": 0 });
 	const projects = await writeProjects(env);
+	await prepare?.(projects);
 	const root = env.createLiveParent(undefined, undefined, roots(projects));
 	const managers: MCPManager[] = [];
 	const tools = root.toolSession;
@@ -570,6 +582,43 @@ describe("a live root restarted in B whose explicit extensions name EA's file be
 
 	it("explicit EA, root in B: the cold revive binds EA, which its discovery in A finds as well, once", () => {
 		expect(eaBindings).toBe(1);
+	}, 30_000);
+});
+
+describe("a relative configured package root, a copy of which A and B each hold, its root restarted in B", () => {
+	const id = "RelativePackageRoot";
+	/** What the package's hook `hooks/pre/x.ts` writes, in A's copy and B's. */
+	const packageHook = "package_hook";
+	let process: ToolSourceProcess | undefined;
+	let hookBindings = 0;
+
+	beforeAll(async () => {
+		process = await openToolSourceProcess(undefined, async projects => {
+			// Each project's settings name `./tools/omp`, which resolves to that project's own copy of the package.
+			for (const dir of [projects.a, projects.b]) {
+				await Bun.write(path.join(dir, ".omp", "config.yml"), 'extensions: ["./tools/omp"]\n');
+				const hook = path.join(dir, "tools", "omp", "hooks", "pre", "x.ts");
+				await Bun.write(hook, hookSource(packageHook, projects.hookLog));
+			}
+		});
+		const { env, root, projects } = process;
+		await env.spawn(taskSpawn(env, root.toolSession, id));
+		await env.park(id);
+		// The root's entries now hold B's copy of the hook, at explicit scope; discovery in A finds A's copy.
+		await process.startRootIn(projects.b);
+		env.dropWarmReviver(id);
+		await fs.rm(projects.hookLog, { force: true });
+		await env.revive(id);
+		const hooks = (await readOptional(projects.hookLog))?.split("\n") ?? [];
+		hookBindings = hooks.filter(name => name === packageHook).length;
+	}, 90_000);
+
+	afterAll(async () => {
+		await process?.close();
+	}, 30_000);
+
+	it("relative package root, root in B: the cold revive in A binds the package's hook once", () => {
+		expect(hookBindings).toBe(1);
 	}, 30_000);
 });
 

@@ -21,7 +21,7 @@ import * as path from "node:path";
 import { getAgentDir, isEnoent, logger, MAIN_CONFIG_FILENAMES, tryParseJson } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { readDirEntries, readFile } from "../capability/fs";
-import type { ExtensionRootMode, LoadContext } from "../capability/types";
+import type { ExtensionRootMode, LoadContext, SourceMeta } from "../capability/types";
 import { getEnabledPlugins } from "../extensibility/plugins/loader";
 import { expandTilde } from "../tools/path-utils";
 import { listClaudePluginRoots } from "./helpers";
@@ -32,11 +32,18 @@ import { listClaudePluginRoots } from "./helpers";
  */
 export type OmpExtensionRootOrigin = "explicit" | "configured" | "installed";
 
-/** Lanes of the caller's own package roots, whose hooks load at `explicit` extension scope. */
-export const EXPLICIT_SCOPE_ROOT_ORIGINS: ReadonlySet<string> = new Set<OmpExtensionRootOrigin>([
-	"explicit",
-	"configured",
-]);
+/** Id of the provider that discovers the sub-directories of extension package roots (`omp-plugins.ts`). */
+export const OMP_PLUGINS_PROVIDER_ID = "omp-plugins";
+
+/**
+ * Whether `source`, a hook's, names a hook of the caller's own package root: one the `omp-plugins` provider found
+ * under an explicit or configured root (its origin is the root's lane). Such a hook loads at `explicit` extension
+ * scope; another provider's origin is its own vocabulary.
+ */
+export function isOwnPackageRootHook(source: SourceMeta): boolean {
+	if (source.provider !== OMP_PLUGINS_PROVIDER_ID) return false;
+	return source.origin === "explicit" || source.origin === "configured";
+}
 
 /** A resolved extension package directory wired into the discovery surfaces. */
 export interface OmpExtensionRoot {

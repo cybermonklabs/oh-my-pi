@@ -19,8 +19,8 @@ import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import {
-	type ExecutorOptions,
 	type FollowUpTurnOptions,
+	type SubagentRunOptions,
 	type SubagentRunRequest,
 	subagentRunRequest,
 } from "../task/executor";
@@ -126,8 +126,8 @@ async function callOnWorker(
  */
 export async function runSubprocessPlaced(
 	pool: SubagentWorkerPool,
-	options: ExecutorOptions,
-	runHere: (options: ExecutorOptions) => Promise<SingleResult>,
+	options: SubagentRunOptions,
+	runHere: (options: SubagentRunOptions) => Promise<SingleResult>,
 ): Promise<SingleResult> {
 	const placed = pool.place();
 	let request: SubagentRunRequest | undefined;

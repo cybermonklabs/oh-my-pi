@@ -761,7 +761,7 @@ export interface CreateAgentSessionOptions {
 	 * Pre-loaded extensions (skips file discovery and the per-session factory
 	 * call). Used by the CLI when extensions are loaded early to parse custom
 	 * flags — the same process owns the returned instances, so reusing them is
-	 * safe.
+	 * safe. A prepared extension with no `scope` is read as `explicit`.
 	 *
 	 * NEVER pass this across session boundaries (e.g. parent → subagent).
 	 * `Extension` instances close over a parent-bound `ExtensionAPI` (cwd,
@@ -771,7 +771,9 @@ export interface CreateAgentSessionOptions {
 	 *
 	 * @internal
 	 */
-	preloadedExtensions?: LoadExtensionsResult;
+	preloadedExtensions?: Omit<LoadExtensionsResult, "preparedExtensions"> & {
+		preparedExtensions?: PreparedExtensionInput[];
+	};
 	/**
 	 * Extension sources whose binding waits until the session's first
 	 * {@link AgentSession.loadDeferredExtensions} call (the CLI starts it once the
@@ -3035,7 +3037,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			extensionsResult = {
 				...options.preloadedExtensions,
 				extensions: [...options.preloadedExtensions.extensions],
-				preparedExtensions: options.preloadedExtensions.preparedExtensions?.slice(),
+				preparedExtensions: options.preloadedExtensions.preparedExtensions?.map(prepared =>
+					toExtensionPathEntry(prepared),
+				),
 			};
 			// Capture paths for downstream forwarding; inline-factory entries
 			// (`<inline-N>`) are per-session, not source paths.

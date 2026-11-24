@@ -263,10 +263,11 @@ A hook of another provider's directory keeps that directory's level. Of the
 `claude` provider's hook directories, every `.ts`/`.js` file loads; of the
 `codex` provider's, only `pre-<tool>.{ts,js}` and `post-<tool>.{ts,js}` files.
 
-`loadExtensions()`, `importExtensionModule()` and the SDK's `preloadedExtensionPaths`
-also take a bare path string, which they read as an `explicit` entry. A prepared
-extension given to `bindPreparedExtensions()` or `preloadedPreparedExtensions`
-without a `scope` is read as `explicit` too.
+`loadExtensions()`, `importExtensionModule()` and the `preloadedExtensionPaths` of the
+SDK and of the task executor (`runSubprocess`) also take a bare path string, which they
+read as an `explicit` entry. A prepared extension given to `bindPreparedExtensions()`,
+in `preloadedPreparedExtensions` (SDK or task executor) or in the SDK's
+`preloadedExtensions` without a `scope` is read as `explicit` too.
 
 Order:
 

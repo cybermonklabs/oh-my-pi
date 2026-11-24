@@ -191,6 +191,32 @@ describe("createAgentSession forwarding of extensions a caller passes without a 
 		}
 	});
 
+	it("stores a caller-loaded result's prepared extension without a scope as explicit", async () => {
+		const file = path.join(dir, "host-loaded.ts");
+		fs.writeFileSync(file, "export default function () {}\n");
+		const loaded = await loadExtensions([{ path: file, scope: "explicit" }], dir);
+		expect(loaded.errors).toEqual([]);
+
+		// A host's own loader hands back its prepared extensions without a scope.
+		const { session } = await createSession({
+			preloadedExtensions: {
+				extensions: loaded.extensions,
+				errors: loaded.errors,
+				runtime: loaded.runtime,
+				preparedExtensions: [{ path: file, resolvedPath: file, factory: () => {}, error: null }],
+			},
+		});
+
+		try {
+			// Children and cold revives take these; a revive in another project keeps only explicit and inline ones.
+			expect(session.preparedExtensions?.map(({ path, scope }) => ({ path, scope }))).toEqual([
+				{ path: file, scope: "explicit" },
+			]);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("keeps a host's inline extension factory as a prepared extension at inline scope", async () => {
 		const factory: ExtensionFactory = () => {};
 

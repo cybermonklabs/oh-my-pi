@@ -4,6 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type ExtensionModule, extensionModuleCapability } from "@oh-my-pi/pi-coding-agent/capability/extension-module";
+import { type Hook, hookCapability } from "@oh-my-pi/pi-coding-agent/capability/hook";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getCapability, initializeWithSettings } from "@oh-my-pi/pi-coding-agent/discovery";
 import { withOmpExtensionRootScope } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
@@ -853,6 +854,8 @@ describe("extensions discovery", () => {
 			// On Linux and macOS the resolver prefers `$XDG_DATA_HOME/omp` over the home config root when that
 			// directory exists, so the XDG roots are cleared too; the environment is restored after each test.
 			for (const key of ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]) delete process.env[key];
+			// Where the config-root override exists, it replaces the home config root, so it is cleared too.
+			delete process.env.OMP_CONFIG_ROOT;
 			// Rebuild the directory resolver, which reads the home directory when it is built.
 			setAgentDir(getAgentDir());
 			/** Installs plugin `name` in `pluginsDir`: a manifest module `<name>.ts` and a hook `<name>-hook.ts`. */
@@ -906,6 +909,40 @@ describe("extensions discovery", () => {
 				"from-explicit.ts": "explicit",
 				"from-configured.ts": "explicit",
 			});
+		});
+
+		it("is another provider's hook's own level even where its origin reads `explicit`; an omp-plugins hook of an explicit root is explicit", async () => {
+			const explicitRoot = tempDir.join("explicit-package");
+			const ownHook = path.join(explicitRoot, "hooks", "pre", "own.ts");
+			const foreignHook = tempDir.join("foreign-plugin", "hooks", "pre", "foreign.ts");
+			for (const hook of [ownHook, foreignHook]) {
+				fs.mkdirSync(path.dirname(hook), { recursive: true });
+				fs.writeFileSync(hook, extensionCode);
+			}
+			// A project hook of a marketplace plugin whose origin, in that provider's own vocabulary, spells `explicit`.
+			const foreign: Hook = {
+				name: "foreign",
+				path: foreignHook,
+				type: "pre",
+				tool: "*",
+				level: "project",
+				_source: {
+					provider: "claude-plugins",
+					providerName: "Claude Code Marketplace",
+					path: foreignHook,
+					level: "project",
+					origin: "explicit",
+				},
+			};
+			const provider = getCapability<Hook>(hookCapability.id)?.providers.find(item => item.id === "claude-plugins");
+			if (!provider) throw new Error("the claude-plugins hook provider is not registered");
+			vi.spyOn(provider, "load").mockResolvedValue({ items: [foreign] });
+
+			const entries = await withOmpExtensionRootScope([explicitRoot], "merge", () =>
+				discoverExtensionPaths([explicitRoot], tempDir.path(), undefined, { ambient: true }),
+			);
+
+			expect(Object.fromEntries(scopes(entries))).toEqual({ "own.ts": "explicit", "foreign.ts": "project" });
 		});
 	});
 });

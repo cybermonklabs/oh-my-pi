@@ -8,7 +8,7 @@
 
 ### Changed
 
-- `loadExtensions()` and `CreateAgentSessionOptions.preloadedExtensionPaths` also take `{ path, scope }` entries; a bare path, or a prepared extension given to `bindPreparedExtensions()` without a `scope`, is read as `explicit`
+- `loadExtensions()`, `importExtensionModule()`, and the `preloadedExtensionPaths` of `CreateAgentSessionOptions` and of `ExecutorOptions`, also take `{ path, scope }` entries; a bare path is read as `explicit`, and so is a prepared extension without a `scope` given to `bindPreparedExtensions()`, in `CreateAgentSessionOptions.preloadedPreparedExtensions` or `.preloadedExtensions`, or in `ExecutorOptions.preloadedPreparedExtensions`
 
 ### Fixed
 

@@ -11,7 +11,7 @@ import type { ExtensionScope } from "../../src/extensibility/extensions/types";
 import { type LocalProtocolOptions, resolveLocalRoot } from "../../src/internal-urls/local-protocol";
 import { MCPManager } from "../../src/mcp/manager";
 import type { MCPStdioServerConfig } from "../../src/mcp/types";
-import type { ExecutorOptions } from "../../src/task/executor";
+import type { SubagentRunOptions } from "../../src/task/executor";
 import { isMainThread } from "../../src/thread/identity";
 import { authService } from "../../src/thread/services/auth";
 import {
@@ -189,7 +189,7 @@ describe("integrations thread service", () => {
 		let artifacts = path.join(dir, "artifacts-a");
 		const local: LocalProtocolOptions = { getArtifactsDir: () => artifacts, getSessionId: () => "parent" };
 		const roots = { explicit: ["/ext"], mode: "merge" as const, configured: [], configuredLevel: "user" as const };
-		const options: ExecutorOptions = {
+		const options: SubagentRunOptions = {
 			cwd: dir,
 			agent: { name: "probe", description: "probe", systemPrompt: "", source: "bundled" },
 			task: "t",

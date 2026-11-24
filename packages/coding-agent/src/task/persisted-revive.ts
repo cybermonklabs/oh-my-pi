@@ -753,10 +753,11 @@ async function coldReviveLiveInputs(
  * paths) of the session they came from, only the explicit entries (configured ones included) and the inline ones
  * stay. Every project and user entry, plugins included, comes from one discovery in `storedCwd` under `rootRoots`,
  * the root session's extension roots (their explicit-only mode, with `settings`' disabled list), whatever the
- * record's list names and whatever that session's own roots are; it skips explicit and configured paths, which only
- * the kept entries carry. Each discovered entry is prepared there and placed first, in discovery's order; a file the
- * kept entries hold is not added again, so it is bound once, at the scope the session it came from gave it. Where
- * prepared extensions pass, the session reads no extension paths, so none pass.
+ * record's list names and whatever that session's own roots are. Of that discovery only the project and user entries
+ * are added: explicit and configured sources come only from the kept entries (a relative package root re-resolved
+ * in `storedCwd` is another copy of one they hold). Each added entry is prepared there and placed first, in
+ * discovery's order; a file the kept entries hold is not added again, so it is bound once, at the scope the session
+ * it came from gave it. Where prepared extensions pass, the session reads no extension paths, so none pass.
  */
 async function moveExtensionsToStoredDirectory(
 	live: ColdReviveLiveInputs,
@@ -767,7 +768,8 @@ async function moveExtensionsToStoredDirectory(
 	const { preloadedPreparedExtensions: preparedExtensions, preloadedExtensionPaths: extensionPaths } = live;
 	if (!preparedExtensions && !extensionPaths) return;
 	const ambientOnly = (): EffectiveExtensionRoots => ({ ...rootRoots, explicit: [], configured: [] });
-	const discovered = await discoverSessionExtensionPaths({ extensionRoots: ambientOnly }, storedCwd, settings);
+	const found = await discoverSessionExtensionPaths({ extensionRoots: ambientOnly }, storedCwd, settings);
+	const discovered = found.filter(entry => entry.scope !== "explicit");
 	const discoveredKeys = await Promise.all(discovered.map(entry => extensionPathKey(entry.path)));
 	const notHeldBy = async (keptFiles: readonly string[]): Promise<ExtensionPathEntry[]> => {
 		const held = new Set(await Promise.all(keptFiles.map(extensionPathKey)));

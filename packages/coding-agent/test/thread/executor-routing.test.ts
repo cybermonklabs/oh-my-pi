@@ -15,6 +15,7 @@ import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobManager } from "../../src/async/job-manager";
 import type { EvalToolDescriptor } from "../../src/eval/types";
 import { ModelRegistry } from "../../src/config/model-registry";
+import { importExtensionModule } from "../../src/extensibility/extensions/loader";
 import { Settings } from "../../src/config/settings";
 import { IrcBus } from "../../src/irc/bus";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
@@ -73,6 +74,22 @@ const PARENT_LOOKUP: EvalToolDescriptor = {
 };
 /** The JavaScript cell that defines {@link PARENT_LOOKUP}; `tool()` reads the name, description and parameters. */
 const DEFINE_TOOL_CODE = `tool(({ key }) => ${JSON.stringify(`${KERNEL_ANSWER}:`)} + key, ${JSON.stringify(PARENT_LOOKUP)});`;
+/** The tool {@link SCOPE_LESS_EXTENSION_SOURCE} registers; a run's requests list it once the extension binds. */
+const SCOPE_LESS_TOOL = "scope_less_probe";
+/** An extension module that registers {@link SCOPE_LESS_TOOL}. */
+const SCOPE_LESS_EXTENSION_SOURCE = `export default function (pi) {
+	pi.registerTool({
+		name: ${JSON.stringify(SCOPE_LESS_TOOL)},
+		label: ${JSON.stringify(SCOPE_LESS_TOOL)},
+		description: "Registered by a prepared extension its caller passed without a scope.",
+		parameters: pi.arktype({}),
+		loadMode: "essential",
+		async execute() {
+			return { content: [{ type: "text", text: "ok" }] };
+		},
+	});
+}
+`;
 
 interface ChatMessage {
 	role: string;
@@ -501,6 +518,24 @@ describe("subagent runs routed into pooled workers", () => {
 			// Read as stored JSON, so the file also loads where the spawn spec's reader does not exist.
 			const stored = peek.init as unknown as { spawnSpec?: { tools?: { customTools?: unknown } } };
 			expect(stored.spawnSpec?.tools?.customTools).toEqual([LOOKUP_ROWS]);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"binds a prepared extension its caller passed without a scope in a run placed in a worker",
+		async () => {
+			const file = path.join(root, "scope-less-extension.ts");
+			await Bun.write(file, SCOPE_LESS_EXTENSION_SOURCE);
+			const { path: extensionPath, resolvedPath, factory, error } = await importExtensionModule(file, cwd);
+			expect(error).toBeNull();
+			// A host-built prepared extension, as the base accepted it: no scope, which reads as `explicit`.
+			const preloadedPreparedExtensions = [{ path: extensionPath, resolvedPath, factory, error }];
+			const result = await runSubprocess(runOptions("ScopeLess", "ping", { preloadedPreparedExtensions }));
+			expect(result.output).toBe("pong");
+			expect(AgentRegistry.global().get("ScopeLess")?.session).toBeInstanceOf(RemoteAgentSession);
+			// The worker imported the module and bound it to the child's own API: the model is offered its tool.
+			expect(server.runRequests.at(-1)?.toolNames).toContain(SCOPE_LESS_TOOL);
 		},
 		TEST_TIMEOUT_MS,
 	);

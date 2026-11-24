@@ -69,7 +69,12 @@ import { type OverlayLayers, Settings } from "../config/settings";
 import type { EvalToolDescriptor } from "../eval/types";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
-import type { ExtensionPathEntry, PreparedExtension } from "../extensibility/extensions/types";
+import {
+	type ExtensionPathEntry,
+	type PreparedExtension,
+	type PreparedExtensionInput,
+	toExtensionPathEntry,
+} from "../extensibility/extensions/types";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionStateApi } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -596,13 +601,13 @@ export interface ExecutorOptions {
 	 */
 	extensionRoots?: () => EffectiveExtensionRoots;
 	/**
-	 * Parent's discovered extension source paths, each with its scope. Forwarded to skip the
-	 * extension FS scan in the subagent; the subagent then re-binds each
+	 * Parent's discovered extension source paths, each with its scope; a bare path is read as `explicit`. Forwarded
+	 * to skip the extension FS scan in the subagent; the subagent then re-binds each
 	 * extension against its own `ExtensionAPI` (cwd, eventBus, runtime).
 	 */
-	preloadedExtensionPaths?: ExtensionPathEntry[];
-	/** Parent-imported extension factories rebound to the child runtime. */
-	preloadedPreparedExtensions?: readonly PreparedExtension[];
+	preloadedExtensionPaths?: (string | ExtensionPathEntry)[];
+	/** Parent-imported extension factories rebound to the child runtime; one with no `scope` is read as `explicit`. */
+	preloadedPreparedExtensions?: readonly PreparedExtensionInput[];
 	/**
 	 * Parent's discovered custom-tool source paths. Forwarded to skip the
 	 * `.omp/tools/` FS scan in the subagent; the subagent then re-binds each
@@ -681,6 +686,18 @@ export interface ExecutorOptions {
 	deferIrcWakeRelease?: (release: () => void) => void;
 	/** Internal cleanup grace override for deterministic lifecycle tests. */
 	cleanupGraceMs?: number;
+}
+
+/**
+ * {@link ExecutorOptions} as {@link runSubprocess} passes them on, to a worker or to this thread's build: each
+ * extension input is its entry, with its scope (see {@link toExtensionPathEntry}).
+ */
+export interface SubagentRunOptions extends Omit<
+	ExecutorOptions,
+	"preloadedExtensionPaths" | "preloadedPreparedExtensions"
+> {
+	preloadedExtensionPaths?: ExtensionPathEntry[];
+	preloadedPreparedExtensions?: readonly PreparedExtension[];
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -4503,7 +4520,7 @@ export function subagentTelemetryConfig(
 
 /** Executor options a spawner reads from the spawning session's tool session: the live inputs of a subagent build. */
 export type SubagentSpawnerLiveInputs = Pick<
-	ExecutorOptions,
+	SubagentRunOptions,
 	| "costGate"
 	| "getApiKey"
 	| "authStorage"
@@ -5110,28 +5127,55 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
 	};
 }
 
+/** Whether `entry` names its scope; see {@link toExtensionPathEntry}. */
+function isScopedPath(entry: string | ExtensionPathEntry): entry is ExtensionPathEntry {
+	return typeof entry !== "string" && entry.scope !== undefined;
+}
+
+/** Whether `prepared` names its scope; see {@link toExtensionPathEntry}. */
+function isScopedPrepared(prepared: PreparedExtensionInput): prepared is PreparedExtension {
+	return prepared.scope !== undefined;
+}
+
+/**
+ * `options` with each extension input as its entry (see {@link toExtensionPathEntry}): a bare path, or a prepared
+ * extension with no scope, is `explicit`. A list whose entries all name their scope passes as is, uncopied.
+ */
+function withExtensionEntries(options: ExecutorOptions): SubagentRunOptions {
+	const { preloadedExtensionPaths: paths, preloadedPreparedExtensions: prepared } = options;
+	return {
+		...options,
+		preloadedExtensionPaths:
+			!paths || paths.every(isScopedPath) ? paths : paths.map(entry => toExtensionPathEntry(entry)),
+		preloadedPreparedExtensions:
+			!prepared || prepared.every(isScopedPrepared) ? prepared : prepared.map(entry => toExtensionPathEntry(entry)),
+	};
+}
+
 /**
  * Run a single agent. On the main thread with worker mode on, the pool places the whole run
  * on this thread or in a pooled subagent worker (the child session is homed where it runs),
  * by how many subagents run at once; otherwise — worker mode off, or already inside a
  * worker, so nested spawns stay in their worker — it runs on this thread. Worker mode is
- * read from `options.settings`; a call without settings runs here.
+ * read from `options.settings`; a call without settings runs here. The extension inputs are
+ * normalized first, so the worker, the spawn spec and a revive read each entry's scope.
  */
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
-	const pool = isMainThread() && options.settings ? subagentWorkerPool(options.settings) : undefined;
-	return pool ? runSubprocessPlaced(pool, options, runSubprocessOnThisThread) : runSubprocessOnThisThread(options);
+	const run = withExtensionEntries(options);
+	const pool = isMainThread() && run.settings ? subagentWorkerPool(run.settings) : undefined;
+	return pool ? runSubprocessPlaced(pool, run, runSubprocessOnThisThread) : runSubprocessOnThisThread(run);
 }
 
 /** A routed {@link runSubprocess} call as it crosses into a worker. */
 export interface SubagentRunRequest {
 	/** The caller's options, after `bridgeIntegrationOptions`. */
-	readonly options: ExecutorOptions;
+	readonly options: SubagentRunOptions;
 	/** Root compaction thresholds tagged on `options.settings` (a symbol property, which never crosses). */
 	readonly rootThresholds: RootCompactionThresholds | undefined;
 }
 
 /** Package `options` for a worker, carrying what the settings' symbol tag holds explicitly. */
-export function subagentRunRequest(options: ExecutorOptions): SubagentRunRequest {
+export function subagentRunRequest(options: SubagentRunOptions): SubagentRunRequest {
 	const settings: SubagentChainSettings | undefined = options.settings;
 	return { options, rootThresholds: settings?.[kRootCompactionThresholds] };
 }
@@ -5147,7 +5191,7 @@ export function runSubagentRunRequest(request: SubagentRunRequest): Promise<Sing
  * Run a single agent on the calling thread: create the child session here, drive and
  * monitor it, and finalize its lifecycle. {@link runSubprocess} routes here.
  */
-async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<SingleResult> {
+async function runSubprocessOnThisThread(options: SubagentRunOptions): Promise<SingleResult> {
 	const {
 		cwd,
 		agent,

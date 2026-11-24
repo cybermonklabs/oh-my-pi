@@ -25,6 +25,7 @@ import {
 	loadCapability,
 } from "../../../discovery";
 import { createSourceMeta, getExtensionNameFromPath } from "../../../discovery/helpers";
+import { OMP_PLUGINS_PROVIDER_ID } from "../../../discovery/omp-extension-roots";
 import {
 	extensionPathKey,
 	isExtensionFile,
@@ -70,9 +71,6 @@ function resolveState(
 	return { state: "active" };
 }
 
-/** Provider that labels installed-plugin and configured-package modules; it owns their sibling skills/tools. */
-const PACKAGE_MODULE_PROVIDER = "omp-plugins";
-
 /**
  * Extension modules the loader appends after native discovery — installed
  * plugin entries and configured `extensions` paths — that `disabledExtensions`
@@ -100,7 +98,7 @@ async function loadPackageModules(
 	const seen = new Set(
 		await Promise.all([...nativeModules.map(module => module.path), ...hookFactories].map(extensionPathKey)),
 	);
-	const providerName = getProviderInfo(PACKAGE_MODULE_PROVIDER)?.displayName ?? PACKAGE_MODULE_PROVIDER;
+	const providerName = getProviderInfo(OMP_PLUGINS_PROVIDER_ID)?.displayName ?? OMP_PLUGINS_PROVIDER_ID;
 	const modules: ExtensionModule[] = [];
 	for (const entry of [...explicit, ...configured]) {
 		if (!entry.toggleable) continue;
@@ -111,7 +109,7 @@ async function loadPackageModules(
 			name: getExtensionNameFromPath(entry.path),
 			path: entry.path,
 			level: entry.level,
-			_source: { ...createSourceMeta(PACKAGE_MODULE_PROVIDER, entry.path, entry.level), providerName },
+			_source: { ...createSourceMeta(OMP_PLUGINS_PROVIDER_ID, entry.path, entry.level), providerName },
 		});
 	}
 	return modules;

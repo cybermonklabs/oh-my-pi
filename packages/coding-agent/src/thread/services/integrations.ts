@@ -20,7 +20,7 @@
  *   extensions to main's registry, which the mirror follows (see `./auth`).
  *
  * Main-side values that are plain functions (no type to match a codec on) are converted by
- * {@link bridgeIntegrationOptions} before an `ExecutorOptions` object crosses a link, and by
+ * {@link bridgeIntegrationOptions} before a run's options cross a link, and by
  * {@link bridgePersistedReviveSpec} before a cold revive's live inputs do.
  */
 import type { TSchema } from "@oh-my-pi/pi-ai";
@@ -30,7 +30,7 @@ import { importExtensionModule } from "../../extensibility/extensions/loader";
 import type { ExtensionFactory, ExtensionScope, PreparedExtension } from "../../extensibility/extensions/types";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import { MCPManager, type MCPManagerApi, type MCPManagerGlobal, type MCPToolScope } from "../../mcp/manager";
-import type { ExecutorOptions } from "../../task/executor";
+import type { SubagentRunOptions } from "../../task/executor";
 import type { PersistedReviveSpec } from "../../task/persisted-revive";
 import { evalToolDescriptor } from "../../task/spawn-spec";
 import { isMainThread } from "../identity";
@@ -118,8 +118,8 @@ export function toWorkerCustomTool<TParams extends TSchema, TDetails>(
 
 /**
  * Main side: convert the integration fields of `options` that cannot cross as-is into forms that
- * behave identically in a worker. Call once on the options a main-thread caller hands to a
- * worker-hosted `runSubprocess`; returns a shallow copy (other fields are untouched).
+ * behave identically in a worker. Call once on the options a main-thread `runSubprocess` hands to a
+ * worker-hosted run (its extension inputs already normalized); returns a shallow copy (other fields are untouched).
  *
  * - `extensionRoots`, `preparedSession.promptSuffix`: called synchronously by the child → `rpcSync`.
  * - `customTools`: {@link toWorkerCustomTool} views, with each eval tool's descriptor in
@@ -131,8 +131,8 @@ export function toWorkerCustomTool<TParams extends TSchema, TDetails>(
  * classes (`mcpManager`, `localProtocolOptions`, `preloadedPreparedExtensions`, tool contexts);
  * `perCallModelGrants` crosses intact (its `settings` becomes the worker's live mirror).
  */
-export function bridgeIntegrationOptions(options: ExecutorOptions): ExecutorOptions {
-	const bridged: ExecutorOptions = { ...options };
+export function bridgeIntegrationOptions(options: SubagentRunOptions): SubagentRunOptions {
+	const bridged: SubagentRunOptions = { ...options };
 	const extensionRoots = options.extensionRoots;
 	if (extensionRoots) bridged.extensionRoots = rpcSync(() => extensionRoots());
 	const seance = options.preparedSession;
