@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `grep -o` in the bash tool prints a match anchored at the end of the line (`grep -oE '[0-9]+$'` printed nothing), `grep -z` selects records with `^` or `$`, and `rg --null-data -o` matches `$` at the end of each record
+
 ## [18.18.4] - 2026-11-09
 
 ### Added
