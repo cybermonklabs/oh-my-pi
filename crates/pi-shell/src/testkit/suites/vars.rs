@@ -455,6 +455,15 @@ fn random_readonly_refusals_look_it_up_first() {
 			"st=1 1\n",
 			"line 1: declare: r: readonly variable\n",
 		),
+		// A refused `+n` through a reference to a readonly `RANDOM` keeps the
+		// reference, so a later argument's `$(…)` parks and the builtin runs
+		// again, refusing again — `$RANDOM` is drawn once, as bash draws it.
+		(
+			"RANDOM=5; declare -n r=RANDOM; readonly RANDOM; a=(0); declare +n r=7 a='($(echo 2))'; \
+			 echo \"st=$? $RANDOM\"; declare -p r",
+			"st=1 6493\ndeclare -n r=\"RANDOM\"\n",
+			"line 1: declare: r: readonly variable\n",
+		),
 	] {
 		let (out, err) = run(src);
 		assert_eq!(out, want, "{src}");
@@ -1834,6 +1843,62 @@ fn attributes_given_with_and_without_the_reference() {
 			 \"${a[*]}\"",
 			"st=0\ndeclare -- q=\"a[1]\"\n1 2\n",
 			"",
+		),
+		// The no-value `+n` on a readonly reference drops `-n` and keeps
+		// `-r`, as bash does (st=0), at the global and the local level.
+		("declare -rn q; declare +n q; echo \"st=$?\"; declare -p q", "st=0\ndeclare -r q\n", ""),
+		(
+			"f() { local -rn q; local +n q; echo \"st=$?\"; declare -p q; }; f",
+			"st=0\ndeclare -r q\n",
+			"",
+		),
+		// A function's own reference to an element is left as it is before
+		// the readonly refusal, even readonly.
+		(
+			"a=(1 2); f() { local -rn q='a[1]'; local +n q=zz; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"; }; f",
+			"st=0\ndeclare -nr q=\"a[1]\"\n1 2\n",
+			"",
+		),
+		// `+n NAME=VALUE` assigns the reference the running function owns
+		// whatever its chain reaches — a caller's reference, a global one, or
+		// an element through a reference it does not own — and leaves the
+		// chain alone.
+		(
+			"y=1; f() { local -n s=y; g; }; g() { local -n q=s; local +n q=zz; echo \"st=$?\"; \
+			 declare -p q; echo \"y=$y\"; }; f",
+			"st=0\ndeclare -- q=\"zz\"\ny=1\n",
+			"",
+		),
+		(
+			"y=1; declare -n s=y; f() { local -n q=s; local +n q=zz; echo \"st=$?\"; declare -p q; \
+			 echo \"y=$y\"; }; f",
+			"st=0\ndeclare -- q=\"zz\"\ny=1\n",
+			"",
+		),
+		(
+			"RANDOM=5; declare -n g=RANDOM; f() { local -n q=g; local +n q=zz; echo \"st=$?\"; \
+			 declare -p q; echo \"$RANDOM\"; }; f",
+			"st=0\ndeclare -- q=\"zz\"\n982\n",
+			"",
+		),
+		(
+			"a=(1 2); declare -n g='a[1]'; f() { local -n q=g; local +n q=zz; echo \"st=$?\"; \
+			 declare -p q; echo \"${a[*]}\"; }; f",
+			"st=0\ndeclare -- q=\"zz\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); f() { local -n s='a[1]'; g; }; g() { local -n q=s; local +n q=zz; echo \
+			 \"st=$?\"; declare -p q; echo \"${a[*]}\"; }; f",
+			"st=0\ndeclare -- q=\"zz\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); declare -n g='a[1]'; f() { local -n q=g; local +n q=3; echo \"st=$?\"; declare \
+			 -p q; echo \"${a[*]}\"; }; f",
+			"st=1\ndeclare -n q=\"g\"\n1 2\n",
+			"bash: line 1: local: `3': not a valid identifier\n",
 		),
 	] {
 		let (out, err) = run(src);

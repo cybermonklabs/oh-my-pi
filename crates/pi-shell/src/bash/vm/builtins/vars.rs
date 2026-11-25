@@ -1262,21 +1262,18 @@ fn own_reference(ctx: &mut Ctx<'_, '_>, name: &[u8], target: &[u8]) -> Result<bo
 }
 
 /// The running function's own reference `name`, when `+n NAME=VALUE`
-/// assigns it rather than its target: one with no target yet (`local -n
-/// q`), one whose chain of the function's own references ends at an element
-/// (`local -n q='a[1]'`, or `local -n s='a[1]'; local -n q=s`), or one whose
-/// chain ends through the function's own references at a variable
-/// ([`own_reference`]).
+/// assigns the reference itself rather than following its chain: a local
+/// name reference the function binds is assigned, whatever its chain
+/// reaches — a variable, a caller's or a global reference, or an element it
+/// reaches through a reference it does not own. The one case the caller
+/// leaves alone is a chain that reaches an element through the function's
+/// own references ([`own_element`]); a loop names nothing.
 fn own_ref(ctx: &mut Ctx<'_, '_>, name: &[u8]) -> Result<Option<Var>, Need> {
 	let Some(var) = func_local(ctx, name)?.filter(|v| v.attrs.contains(Attrs::NAMEREF)) else {
 		return Ok(None);
 	};
-	Ok(match state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)? {
-		state::Deref::Plain => Some(var),
-		state::Deref::To { index: Some(_), .. } => own_element(ctx, &var)?.then_some(var),
-		state::Deref::To { name: t, index: None } => own_reference(ctx, name, &t)?.then_some(var),
-		state::Deref::Circular => None,
-	})
+	Ok((state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)? != state::Deref::Circular)
+		.then_some(var))
 }
 
 /// Whether the reference `var` reaches an element through name references
@@ -2236,6 +2233,32 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		let raw_readonly = raw
 			.as_ref()
 			.is_some_and(|v| v.attrs.contains(Attrs::READONLY));
+		// The reference `+n` assigns itself, if any: one the running function
+		// owns ([`own_ref`], whatever its chain reaches), or a global one
+		// with no target yet.
+		let own = if off.contains(Attrs::NAMEREF) && raw_ref {
+			if level == Level::Local {
+				own_ref(ctx, name)?
+			} else if state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)? == state::Deref::Plain {
+				raw.clone()
+			} else {
+				None
+			}
+		} else {
+			None
+		};
+		// A function's own reference whose own chain ends at an element is
+		// left as it is, with a value or without, before the readonly
+		// refusal below: `f() { local -n q='a[1]'; local +n q=zz; }` and
+		// `f() { local -rn q='a[1]'; local +n q=zz; }` are both quiet (bash
+		// 5.3.20 and 5.2.21). A global reference to an element gives the
+		// value to the element, below, as bash's does.
+		if let Some(var) = &own
+			&& level == Level::Local
+			&& own_element(ctx, var)?
+		{
+			continue;
+		}
 		// A readonly reference refuses `+n`, with a target or without one
 		// when a value is given (`declare -rn q; declare +n q=zz`: bash says
 		// `q: readonly variable` and keeps `-nr`), before any path below can
@@ -2260,31 +2283,6 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			// The other attributes given apply to the target too
 			// (`declare +n -i foo=7+4` makes the target 11).
 			let mut ref_on = on;
-			// A reference the running function owns, or a global one with
-			// no target yet: bash assigns the value to the reference itself,
-			// as to any name reference, and then ends it. Through any other
-			// reference the value goes to the target, below.
-			let own = if level == Level::Local {
-				own_ref(ctx, name)?
-			} else if state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)? == state::Deref::Plain {
-				raw.clone()
-			} else {
-				None
-			};
-			// A function's own reference to an element, directly or through
-			// its own references, is left as it is, with a value or without:
-			// `f() { local -n q='a[1]'; local +n q=zz; }` keeps `q` and `a`,
-			// and so does `local -n s='a[1]'; local -n q=s; local +n q=zz`
-			// (bash 5.3.20 and 5.2.21). A global one gives the value to the
-			// element and ends, below, as bash's does.
-			let own_element = own.is_some()
-				&& matches!(state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)?, state::Deref::To {
-					index: Some(_),
-					..
-				});
-			if own_element {
-				continue;
-			}
 			if let Some(value) = value
 				&& let Some(own) = own
 			{
