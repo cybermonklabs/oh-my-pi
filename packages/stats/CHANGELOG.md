@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A session holding an entry nested more than about 40,000 levels deep (a tool's `details` or arguments, say) no longer makes the trace's span drawer and the request detail answer HTTP 500 with `Maximum call stack size exceeded`; the trace shows the head of such a tool call's arguments and the tools dashboard counts their characters, where both were left out. A Spotlight experiment session's tool call whose arguments nest more than about 25,000 levels deep no longer fails its ingest
+
 ## [18.18.4] - 2026-11-09
 
 ### Fixed
