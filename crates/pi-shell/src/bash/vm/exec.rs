@@ -2992,6 +2992,21 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					},
 					None => Vec::new(),
 				};
+				// bash makes the redirections of the command a `&` job's fork
+				// was made for without an undo, so they hold to the end of
+				// the fork: its `time` report, its EXIT trap and anything
+				// else there go through them. The fds they replaced stay
+				// recorded, so a nested async command still reads the fork's
+				// stdin rather than `/dev/null` (bash's `stdin_redir`), and
+				// restoring one puts back the handle it already holds.
+				let saves = if fork_own_redir(unit, vp).is_some() {
+					saves
+						.into_iter()
+						.map(|s| Saved { fd: s.fd, prev: vp.fds.get(s.fd).cloned() })
+						.collect()
+				} else {
+					saves
+				};
 				top_frame(vp).redirs.push(saves);
 				Flow::Next
 			},
@@ -3001,8 +3016,17 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				// it; what would block is written after the restore.
 				let _ = flush_out(k, vp);
 				clear_scratch(&mut k.root, cx.store, vp);
-				vp.status = 1;
-				Flow::Jump(op.b)
+				// bash's fork leaves at once when one of them fails (`exit
+				// (invert ? EXECUTION_SUCCESS : EXECUTION_FAILURE)`), before
+				// the command is timed: no time report, and `!` decides the
+				// status there.
+				if let Some(own) = fork_own_redir(unit, vp) {
+					vp.status = i32::from(!own.invert);
+					Flow::Jump(own.exit)
+				} else {
+					vp.status = 1;
+					Flow::Jump(op.b)
+				}
 			},
 		},
 		Opcode::PopRedir => {
@@ -3884,6 +3908,68 @@ fn bash_case_hit(
 	Ok(patterns
 		.iter()
 		.any(|p| k.engine.patterns().get(p, opts).matches(subject)))
+}
+
+/// A `&` job's fork and the redirections of the command it was made for
+/// ([`fork_own_redir`]).
+struct ForkOwnRedir {
+	/// The fork's `SubExit`: where bash leaves when one of them fails.
+	exit:   u32,
+	/// `!` inverts the command's status there.
+	invert: bool,
+}
+
+/// Whether the `Redir` op the top frame is at, or the one its `PopRedir`
+/// closes, belongs to the command a `&` job's fork was made for: the job's
+/// entry is that `Redir`, after the `TimeStart` of a timed command, and
+/// nothing but `!` and the `time` report stands between its `PopRedir` and
+/// the fork's `SubExit`. bash runs such a job as a subshell whose
+/// `execute_in_subshell` makes those redirections before it times the
+/// command and without an undo (`RX_ACTIVE`, then `dispose_redirects`), so
+/// they hold to the end of the fork, and it leaves at once when one of them
+/// fails (`exit (invert ? EXECUTION_SUCCESS : EXECUTION_FAILURE)`).
+///
+/// A compound command that is not the whole job (`time { … } 2>err && :`,
+/// a pipeline stage, a `( … )` body) keeps bash's undo, and so does the
+/// `( … ) 2>err` of a subshell, whose `Redir` the shell runs before the
+/// `Spawn`.
+fn fork_own_redir(unit: &Unit, vp: &Vproc) -> Option<ForkOwnRedir> {
+	// The fork's own code: not a frame it pushed (a function, `eval`, a
+	// trap action), whose ops are the same unit's.
+	let [frame] = &vp.frames[..] else {
+		return None;
+	};
+	let at = frame.pc;
+	let code = |pc: u32| unit.ops.get(pc as usize).map(|op| op.code);
+	let after = unit.spawns.iter().find_map(|s| {
+		if s.kind != SpawnKind::Background {
+			return None;
+		}
+		let entry = s.stages.first()?.entry;
+		// `time` wraps the job's command: `TimeStart Redir … PopRedir
+		// [Not] TimeEnd`.
+		let redir = if code(entry) == Some(Opcode::TimeStart) {
+			entry + 1
+		} else {
+			entry
+		};
+		let end = unit
+			.ops
+			.get(redir as usize)
+			.filter(|op| op.code == Opcode::Redir)?
+			.b;
+		// The op dispatched is that `Redir` or the `PopRedir` before `end`.
+		(at == redir || at + 1 == end).then_some(end)
+	})?;
+	let mut pc = after;
+	let invert = code(pc) == Some(Opcode::Not);
+	if invert {
+		pc += 1;
+	}
+	if code(pc) == Some(Opcode::TimeEnd) {
+		pc += 1;
+	}
+	(code(pc) == Some(Opcode::SubExit)).then_some(ForkOwnRedir { exit: pc, invert })
 }
 
 /// bash's `subshell_level` step for a pipeline stage or (`background`) an

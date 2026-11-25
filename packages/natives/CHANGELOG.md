@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The bash tool's `time` report of a background job now goes where that job's own redirections send standard error, as in Bash: `TIMEFORMAT=T; time { :; } 2>err &` writes the report into `err`, and `2>/dev/null` discards it, instead of printing it on the shell's standard error; the job's EXIT trap and a message about an invalid `TIMEFORMAT` go there too. A background job whose own redirection fails, such as `time { :; } < nonexist &`, no longer prints a report at all, and ends with status 1, or 0 when `!` precedes it.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

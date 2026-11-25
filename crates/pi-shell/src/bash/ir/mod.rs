@@ -45,7 +45,7 @@
 //! | `LoopNote` | – | – | record `$?` as the loop status, count an iteration |
 //! | `LoopBack` | target | – | `LoopNote`, then jump |
 //! | `LoopExit` | – | – | pop the loop record, `$?` = its status, emit `LoopEnd` |
-//! | `Redir` | `redirs` index | pc after the matching `PopRedir` | apply a compound command's redirections (staged), saving the previous fds; on failure `$?` = 1 and jump to `b` |
+//! | `Redir` | `redirs` index | pc after the matching `PopRedir` | apply a compound command's redirections (staged), saving the previous fds; on failure `$?` = 1 and jump to `b`. For the command a `&` job's fork was made for, bash makes them without an undo and leaves the fork when one fails, so their saves hold what those fds already carry and a failure jumps to the fork's `SubExit` instead (`fork_own_redir`, `vm/exec.rs`) |
 //! | `PopRedir` | – | – | restore the fds saved by the matching `Redir` |
 //! | `Spawn` | `spawns` index | – | subshell, pipeline or background job (flag [`Op::DISOWN`]: zsh `&!`/`&|`, not in the job table): start child vprocs at the stage entries; `Subshell`/`Pipeline` wait and set `$?`/`PIPESTATUS`; then jump to the entry's `end` |
 //! | `SubExit` | – | – | end of a child's code: the vproc exits with `$?` |
