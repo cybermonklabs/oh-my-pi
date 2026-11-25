@@ -4,8 +4,11 @@
 # (exactly that test, not still ignored), and when it fails, like any test.
 # A target is a Bazel one (//...), or a cargo one as the test step labels it,
 # <directory>:<kind>:<name> (a cargo workspace in rust-test-cargo-workspaces.txt).
+# A Bazel one whose why starts `opt: ` runs in a -c opt build of its target,
+# after every other Bazel invocation; the job log gives its build and test
+# seconds.
 # One per line: <target> <libtest test name>  <why it is #[ignore]d>.
-//crates/pi-ast:pi-ast_test block::tests::pruned_walk_matches_unpruned_on_full_repo_corpus  a sweep of the whole repository (PI_AST_REPO_CORPUS); upstream runs it by hand in release builds
+//crates/pi-ast:pi-ast_test block::tests::pruned_walk_matches_unpruned_on_full_repo_corpus  opt: a sweep of the whole repository (PI_AST_REPO_CORPUS); upstream runs it by hand in release builds, and in fastbuild it took 1,033.6 s of run 45516812533
 //crates/pi-natives:pi_natives_test pty::zombie_repro_tests::cancelled_pty_sessions_do_not_leak_zombies  a storm of cancelled pty sessions that counts the test process's zombies, so no other test's children may be counted
 //crates/pi-vcs:pi-vcs_integration_tests_tests/worktree_add_failure_test an_add_into_an_empty_directory_someone_else_owns_succeeds  needs an empty directory another user owns that the test user can write: the job makes one as root (PI_VCS_TEST_FOREIGN_EMPTY_DIR)
 //crates/pi-vcs:pi-vcs_test git::mutate::tests::reclaim_refuses_a_tree_holding_a_mount_point  needs a mount point inside a directory the test user owns: the job mounts a tmpfs there as root (PI_VCS_TEST_MOUNT_POINT)

@@ -127,12 +127,15 @@ cfg() { jq -cn --arg l "$1" --arg k "$2" '{id:{targetConfigured:{label:$l}},conf
 # unbuilt <label>: the event Bazel writes for a target that did not build,
 # which then has no test summary at all.
 unbuilt() { jq -cn --arg l "$1" '{id: {targetCompleted: {label: $l}}, completed: {success: false}}'; }
-summary() { # label status [failed logs] [passed logs], each list split on spaces
-	jq -cn --arg l "$1" --arg s "$2" --arg f "${3:-}" --arg p "${4:-}" 'def logs($x): $x | split(" ") | map(select(. != "") | {name:"test.log",uri:("file://" + .)});
+summary() { # label status [failed logs] [passed logs], each list split on spaces; RUN_S: its totalRunDuration
+	jq -cn --arg l "$1" --arg s "$2" --arg f "${3:-}" --arg p "${4:-}" --arg d "${RUN_S:-}" 'def logs($x): $x | split(" ") | map(select(. != "") | {name:"test.log",uri:("file://" + .)});
 		{id:{testSummary:{label:$l,configuration:{id:"c"}}},testSummary:({overallStatus:$s,totalRunCount:1}
+		+ (if $d != "" then {totalRunDuration:($d + "s")} else {} end)
 		+ (if $p != "" then {passed:logs($p)} else {} end)
 		+ (if $f != "" then {failed:logs($f)} else {} end))}'
 }
+# metrics <milliseconds>: the event that gives the invocation's wall time.
+metrics() { jq -cn --arg w "$1" '{id: {buildMetrics: {}}, buildMetrics: {timingMetrics: {wallTimeInMs: $w}}}'; }
 # tpath / bpath <label>: a target's test.log and test binary, as Bazel lays
 # them out under bazel-out.
 tpath() { local l="${1#//}"; printf '%s/out/testlogs/%s/%s/test.log' "$logs" "${l%%:*}" "${l#*:}"; }
@@ -232,7 +235,11 @@ own_default() {
 # SANCTIONED_LINE (a line written as it is after SANCTIONED's), NOT_MSG (a
 # regex the output must not match), FLAKY (known-failure lines whose reason
 # is `flaky: a race`), MAIN_MUST_FLAKY (targets the main invocation must
-# give --flaky_test_attempts=^<target>$@3).
+# give --flaky_test_attempts=^<target>$@3), IGNORED_OPT (rust-test-ignored.txt
+# lines whose reason is `opt: a sweep`), IGN_OPT_BODY (the stub's answer to
+# such a test's -c opt bazel test, which must come after a -c opt bazel build
+# of its target) and OPT_BUILD_BODY (its answer to that build: by default an
+# event log with a wall time of 98765 ms, and exit 0).
 run() {
 	local name="$1" want="$2" msg="$3" entries="$4" body="$5"
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
@@ -253,6 +260,7 @@ run() {
 	list rust-test-own-process.txt "${OWN:-}" "why"
 	list rust-test-root-alone.txt "${ROOT_ALONE:-}" "why"
 	list rust-test-ignored.txt "${IGNORED_RUN:-}" "why"
+	if [ -n "${IGNORED_OPT:-}" ]; then printf '%s\n' "$IGNORED_OPT" | while read -r a b; do printf '%s %s  opt: a sweep\n' "$a" "$b"; done >>"$w/repo/.github/sami/rust-test-ignored.txt"; fi
 	list rust-test-ignored-root.txt "${IGNORED_ROOT:-}" "why"
 	list rust-test-child-entries.txt "${CHILD_ENTRIES:-}" "the parent test"
 	list rust-test-macos.txt "${MACOS:-}" "macOS only"
@@ -270,6 +278,7 @@ run() {
 	printf '# list\n%s\n' "${CARGO_WS:-sdk/rust/demo/Cargo.toml  standalone}" >"$w/repo/.github/sami/rust-test-cargo-workspaces.txt"
 	# DOCQ: the doctest targets bazel query names (the macOS job asks it).
 	if [ -n "${DOCQ:-}" ]; then printf '%s\n' "$DOCQ" >"$w/docquery.txt"; fi
+	local opt_build_body="${OPT_BUILD_BODY:-metrics 98765 >\"\$bep\"; exit 0}"
 	cat >"$w/bin/bazelisk" <<EOF
 #!/usr/bin/env bash
 set -u
@@ -277,7 +286,7 @@ W="$w"
 logs="$w/logs"
 OWN_TESTS="${OWN_TESTS:-}"
 OWN_PRINTS="${OWN_PRINTS:-}"
-$(declare -f lt_pass lt_fail lt_out lt_ignored lt_partial lt_child_summary doc_pass doc_fail cfg summary unbuilt tpath bpath fakebin record_names target rt dt nt listed sanct query_names own_default)
+$(declare -f lt_pass lt_fail lt_out lt_ignored lt_partial lt_child_summary doc_pass doc_fail cfg summary metrics unbuilt tpath bpath fakebin record_names target rt dt nt listed sanct query_names own_default)
 args=("\$@")
 if [ "\${args[0]#--bazelrc=}" != "\${args[0]}" ]; then args=("\${args[@]:1}"); fi
 if [ "\${args[0]}" = query ]; then
@@ -303,7 +312,7 @@ if [ "\${args[0]}" = query ]; then
 	fi
 	exit "\$rc"
 fi
-[ "\${args[0]}" = test ] || { echo "stub: bazelisk \${args[*]}" >&2; exit 2; }
+case "\${args[0]}" in test | build) ;; *) echo "stub: bazelisk \${args[*]}" >&2; exit 2 ;; esac
 bep="" under="" names=() targets=() ignored=0 fifo=""
 for ((i = 0; i < \${#args[@]}; i++)); do
 	case "\${args[i]}" in
@@ -319,7 +328,7 @@ for ((i = 0; i < \${#args[@]}; i++)); do
 		--) targets=("\${args[@]:i + 1}"); break ;;
 	esac
 done
-printf '%s\n' "\$bep" >>"\$W/bep.paths"
+[ "\${args[0]}" = build ] || printf '%s\n' "\$bep" >>"\$W/bep.paths"
 inv=main
 case "\$under" in sudo*) inv=root ;; esac
 if [ "\${#names[@]}" -gt 0 ]; then
@@ -333,7 +342,23 @@ if [ "\${#names[@]}" -gt 0 ]; then
 		inv=own
 	fi
 fi
-has() { case " \${args[*]} " in *" \$1 "*) return 0 ;; esac; echo "stub: bazel test (\$inv) lacks \$1" >&2; exit 2; }
+# A -c opt build is only an #[ignore]d test's, before its -c opt bazel test;
+# no other invocation changes the compilation mode, and none comes after the
+# -c opt ones (Bazel would analyze again in fastbuild).
+opt=0
+case " \${args[*]} " in *" --compilation_mode=opt "*) opt=1 ;; esac
+if [ "\${args[0]}" = build ]; then
+	[ "\$opt" = 1 ] && [ "\$inv" = ignored ] || { echo "stub: bazel build is only an #[ignore]d test's -c opt build: \${args[*]}" >&2; exit 2; }
+	inv=opt-build
+elif [ "\$opt" = 1 ]; then
+	[ "\$inv" = ignored ] || { echo "stub: bazel test (\$inv) has --compilation_mode=opt" >&2; exit 2; }
+	inv=ignored-opt
+	: >"\$W/opt-ran"
+elif [ -e "\$W/opt-ran" ]; then
+	echo "stub: bazel test (\$inv) after a -c opt one" >&2
+	exit 2
+fi
+has() { case " \${args[*]} " in *" \$1 "*) return 0 ;; esac; echo "stub: bazel \${args[0]} (\$inv) lacks \$1" >&2; exit 2; }
 has --keep_going
 has "--test_arg=-Zunstable-options --test_arg=--format=json --test_arg=--show-output"
 if [ "${LEGACY:-0}" != 1 ]; then
@@ -349,13 +374,17 @@ if [ "${LEGACY:-0}" != 1 ]; then
 	[ "\$inv" != sticky-user ] || [ "\$fifo" = "\$RUST_TEST_STICKY_FIFO" ] || { echo "stub: bazel test (\$inv) gives PI_TEST_STICKY_FIFO=[\$fifo], not [\$RUST_TEST_STICKY_FIFO]" >&2; exit 2; }
 	[ "\$inv" = sticky-user ] || [ -z "\$fifo" ] || { echo "stub: bazel test (\$inv) gives PI_TEST_STICKY_FIFO" >&2; exit 2; }
 fi
-case "\$inv" in ignored | ignored-root) has --test_timeout=1200 ;; esac
-case "\$inv" in ignored-root | sticky-user | sticky-root) has --strategy=TestRunner=local ;; esac
+case "\$inv" in ignored | ignored-root | ignored-opt | opt-build) has --test_timeout=1200 ;; esac
+case "\$inv" in ignored-root | sticky-user | sticky-root | ignored-opt | opt-build) has --strategy=TestRunner=local ;; esac
 if [ "\$inv" = main ]; then
 	[ "\${targets[0]:-}" = //crates/... ] || { echo "stub: main run's targets are [\${targets[*]}]" >&2; exit 2; }
 	for r in ${ROOTS:-}; do has "-\$r"; done
 	for s in ${MAIN_MUST_SKIP:-}; do has "--test_arg=--skip --test_arg=\$s"; done
 	for t in ${MAIN_MUST_FLAKY:-}; do has "--flaky_test_attempts=^\${t}\\\$@3"; done
+elif [ "\$inv" = opt-build ]; then
+	[ "\${#targets[@]}" = 1 ] || { echo "stub: \$inv run's targets are [\${targets[*]}]" >&2; exit 2; }
+	printf '%s\n' "\${targets[0]}" >>"\$W/opt-built.txt"
+	$(printf '%s' "$opt_build_body")
 elif [ "\$inv" = root ]; then
 	$(printf '%s' "${ROOT_BODY:-exit 9}")
 else
@@ -364,6 +393,10 @@ else
 	case "\$inv" in
 		own) $(printf '%s' "${OWN_BODY:-own_default}") ;;
 		ignored) $(printf '%s' "${IGN_BODY:-own_default}") ;;
+		ignored-opt)
+			grep -qxF -- "\$OWN_TARGET" "\$W/opt-built.txt" 2>/dev/null || { echo "stub: bazel test (ignored-opt) of \$OWN_TARGET, with no -c opt bazel build of it before" >&2; exit 2; }
+			$(printf '%s' "${IGN_OPT_BODY:-own_default}")
+			;;
 		ignored-root) $(printf '%s' "${IGN_ROOT_BODY:-own_default}") ;;
 		sticky-user) $(printf '%s' "${STICKY_BODY:-own_default}") ;;
 		sticky-root) $(printf '%s' "${STICKY_ROOT_BODY:-own_default}") ;;
@@ -640,6 +673,43 @@ IGNORED_RUN="$D d::needs_network" OWN_TESTS="d::one d::needs_network" run J98-ig
 IGNORED_RUN="$D d::renamed" OWN_TESTS="d::one d::needs_network" run J99-ignored-run-matches-nothing 1 "own invocation for d::renamed reported \\[\\]" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
 IGNORED_ROOT="$B r::cycle" OWN_TESTS="a::one r::cycle" run J100-ignored-root-run-alone 0 "Ignored root test ran alone: $B r::cycle \\(ok\\)" '' "{ $P; rt $B PASSED lt_ignored a::one r::cycle; } >\"\$bep\"; exit 0"
 IGNORED_ROOT="$B r::cycle" IGN_ROOT_BODY="FMT=json; rt $B FAILED printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 1 }\n{ \"type\": \"test\", \"name\": \"r::cycle\", \"event\": \"failed\", \"stdout\": \"mount --bind failed\" }\n{ \"type\": \"suite\", \"event\": \"failed\", \"passed\": 0, \"failed\": 1, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.0 }\n' >\"\$bep\"; exit 3" run J101-ignored-root-failing-body 1 "$B r::cycle failed and is not in" '' "{ $P; rt $B PASSED lt_ignored a::one r::cycle; } >\"\$bep\"; exit 0"
+
+# The #[ignore]d test whose reason starts `opt: ` (pi-ast's whole-repository
+# sweep) runs alone in a -c opt build of its target: a -c opt bazel build,
+# then its -c opt bazel test, after every other invocation. Its log is read as
+# any ignored test's: a failure fails (O3), a crash is a binary that ended
+# before its tests did and no pass (O4), a run that did not report it (O5) or
+# left it ignored (O6) fails; a build failure fails (O7), and a build that
+# Bazel itself failed stops the step (O8). The job log names the compilation
+# mode and gives the build and test seconds (O1). Each O case fails against
+# Cut11's step (66f6b470), which runs the sweep in the fastbuild ignored pass:
+# there the stub's fastbuild run of it passes.
+A=//crates/pi-ast:pi-ast_test
+SW=block::tests::pruned_walk_matches_unpruned_on_full_repo_corpus
+OMAIN="{ $P; rt $A PASSED lt_ignored a::one $SW; } >\"\$bep\"; exit 0"
+OKNOWN="$PR p::summary
+$A $SW"
+OPASS="FMT=json; { RUN_S=212.3 FILTERED=1 rt $A PASSED lt_out $SW 'full corpus: 8661 files, 69288 comparisons\\n'; metrics 214500; } >\"\$bep\"; exit 0"
+OSTART="printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 1 }\n"
+OEND="{ \"type\": \"suite\", \"event\": \"failed\", \"passed\": 0, \"failed\": 1, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.0 }\n'"
+OFAIL="FMT=json; rt $A FAILED $OSTART{ \"type\": \"test\", \"name\": \"$SW\", \"event\": \"failed\", \"stdout\": \"assertion left == right failed: x.ts ranges=[(1, 40)]\" }\n$OEND >\"\$bep\"; exit 3"
+OCRASH="FMT=json; rt $A FAILED $OSTART{ \"type\": \"test\", \"event\": \"started\", \"name\": \"$SW\" }\n' >\"\$bep\"; exit 3"
+OMISS="FMT=json; FILTERED=2 rt $A PASSED lt_out >\"\$bep\"; exit 0"
+OSTILL="FMT=json; rt $A PASSED $OSTART{ \"type\": \"test\", \"name\": \"$SW\", \"event\": \"ignored\" }\n{ \"type\": \"suite\", \"event\": \"ok\", \"passed\": 0, \"failed\": 0, \"ignored\": 1, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.0 }\n' >\"\$bep\"; exit 0"
+o_run() { KNOWN_OUTPUT="$OKNOWN" IGNORED_OPT="$A $SW" OWN_TESTS="a::one $SW" OWN_PRINTS="$SW" run "$@"; }
+IGN_OPT_BODY="$OPASS" NOT_MSG='::error' o_run O1-opt-sweep-names-its-mode-and-seconds 0 "^Ignored test in a -c opt build: $A $SW: compilation mode opt; build 98\\.8 s \\(bazel build, exit 0\\), test 214\\.5 s \\(bazel test; the test binary's run 212\\.3 s\\)\$" '' "$OMAIN"
+IGN_OPT_BODY="$OPASS" NOT_MSG='::error' o_run O2-opt-sweep-reads-ok 0 "^Ignored test in a -c opt build ran alone: $A $SW \\(ok\\)\$" '' "$OMAIN"
+IGN_OPT_BODY="$OFAIL" o_run O3-opt-sweep-failure-fails 1 "$A $SW failed and is not in" '' "$OMAIN"
+IGN_OPT_BODY="$OCRASH" NOT_MSG="ran alone: $A" o_run O4-opt-sweep-crash-is-no-pass 1 "$A is FAILED, but libtest planned 1 tests and reported 0, suite end none: the test binary ended before its tests did" '' "$OMAIN"
+IGN_OPT_BODY="$OMISS" NOT_MSG="ran alone: $A" o_run O5-opt-run-without-the-sweep-fails 1 "::error title=Ignored test in a -c opt build::$A's own invocation for $SW reported \\[\\], not exactly that one test" '' "$OMAIN"
+IGN_OPT_BODY="$OSTILL" NOT_MSG="ran alone: $A" o_run O6-opt-run-leaving-it-ignored-fails 1 "::error title=Ignored test in a -c opt build::$A $SW is #\\[ignore\\]d, so its own invocation ran nothing" '' "$OMAIN"
+OPT_BUILD_BODY="metrics 30000 >\"\$bep\"; exit 1" IGN_OPT_BODY="FMT=json; { unbuilt $A; metrics 1000; } >\"\$bep\"; exit 1" o_run O7-opt-build-failure-fails 1 "compilation mode opt; build 30\\.0 s \\(bazel build, exit 1\\)" '' "$OMAIN"
+OPT_BUILD_BODY="exit 37" o_run O8-opt-build-tool-error-stops 1 'bazel build exited 37 \(ignored-opt-0\)' '' "$OMAIN"
+CARGO_MODE=ignored IGNORED_OPT="sdk/rust/demo:test:wire a::slow" run O9-opt-on-a-cargo-target-stops 1 "sdk/rust/demo:test:wire a::slow is a cargo target, and .opt: . \\(a -c opt build\\) is for a Bazel one" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+# After every other invocation: an #[ignore]d root test of the same target
+# runs before it (the stub fails any invocation after a -c opt one).
+OMAIN3="{ $P; rt $A PASSED printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 3 }\n{ \"type\": \"test\", \"name\": \"a::one\", \"event\": \"ok\" }\n{ \"type\": \"test\", \"name\": \"$SW\", \"event\": \"ignored\" }\n{ \"type\": \"test\", \"name\": \"a::cycle\", \"event\": \"ignored\" }\n{ \"type\": \"suite\", \"event\": \"ok\", \"passed\": 1, \"failed\": 0, \"ignored\": 2, \"measured\": 0, \"filtered_out\": 0, \"exec_time\": 0.1 }\n'; } >\"\$bep\"; exit 0"
+IGNORED_ROOT="$A a::cycle" NOT_MSG='stub:|::error' KNOWN_OUTPUT="$OKNOWN" IGNORED_OPT="$A $SW" OWN_TESTS="a::one $SW a::cycle" OWN_PRINTS="$SW" run O10-opt-run-comes-last 0 "^Ignored test in a -c opt build ran alone: $A $SW \\(ok\\)\$" '' "$OMAIN3"
 
 # B1: an #[ignore]d cargo test runs alone (rust-test-ignored.txt), or fails
 # the job.
