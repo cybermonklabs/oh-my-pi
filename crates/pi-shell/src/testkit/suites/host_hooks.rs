@@ -391,3 +391,69 @@ fn snapshot_of_a_pending_spawn_reissues_it_without_duplicating_the_process() {
 	assert_eq!(r.parts().1.stdout.bytes(), b"status 7\n");
 	assert_eq!(tally(&gate), (2, 2, 1), "one process for one command");
 }
+
+/// A spawn that waits while its gate holds, then fails with `ENOEXEC` (no
+/// `#!`), so the shell runs the file as a script. The gate counts the
+/// spawns asked.
+struct HeldEnoexec(Arc<Mutex<(bool, Option<Waker>, u32)>>);
+
+impl Future for HeldEnoexec {
+	type Output = io::Result<Box<dyn ExtProc>>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let mut g = self.0.lock();
+		if g.0 {
+			g.1 = Some(cx.waker().clone());
+			return Poll::Pending;
+		}
+		Poll::Ready(Err(io::Error::from_raw_os_error(8)))
+	}
+}
+
+// Failure mode: a run the hash table answered, imaged and restored while its
+// spawn waits, names its program by the `$PATH` entry (`bin/u`) where the
+// plain run and bash name the hash table's entry (`./bin/u`).
+
+/// A run straight from the hash table names its program by the hash
+/// table's entry (`$0` is `./bin/u` while that is an executable file),
+/// also when the shell is imaged and restored while that run's spawn waits.
+#[cfg(unix)]
+#[test]
+fn a_hashed_run_keeps_its_name_when_imaged_while_its_spawn_waits() {
+	let host = |hold: &Arc<Mutex<(bool, Option<Waker>, u32)>>| {
+		let fs = crate::testkit::MemFs::new();
+		fs.add_file("/w/bin/u", b"echo \"0=$0\"\n", 0o755);
+		let hold = Arc::clone(hold);
+		FakeHost::new().with_fs(fs).with_spawn_future(Box::new(
+			move |_: SpawnSpec<'_>| -> SpawnFuture {
+				hold.lock().2 += 1;
+				Box::pin(HeldEnoexec(Arc::clone(&hold)))
+			},
+		))
+	};
+	let hold = Arc::new(Mutex::new((false, None, 0)));
+	let mut plain = Rig::new(host(&hold), skeleton_init(&[]));
+	let _ = run(&mut plain, "cd /w; PATH=bin; u; u");
+	let want = String::from_utf8_lossy(&plain.parts().1.stdout.bytes()).into_owned();
+	assert_eq!(want, "0=bin/u\n0=./bin/u\n", "the plain run's names");
+	let hold = Arc::new(Mutex::new((false, None, 0)));
+	let mut r = Rig::new(host(&hold), skeleton_init(&[]));
+	let _ = run(&mut r, "cd /w; PATH=bin; u");
+	hold.lock().0 = true;
+	r.parts().0.submit(Script::command(b"u".as_slice()));
+	until_blocked(&mut r);
+	r.snapshot();
+	let waker = {
+		let mut g = hold.lock();
+		g.0 = false;
+		g.1.take()
+	};
+	if let Some(w) = waker {
+		w.wake();
+	}
+	let _ = until_done(&mut r);
+	let got = String::from_utf8_lossy(&r.parts().1.stdout.bytes()).into_owned();
+	let asked = hold.lock().2;
+	assert_eq!(got, want, "restored while the hashed run's spawn waited ({asked} spawns asked)");
+	assert_eq!(asked, 3, "the restore asks the waiting spawn again");
+}

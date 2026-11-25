@@ -639,6 +639,45 @@ pub fn shown_candidate(path: &[u8], name: &[u8], idx: usize) -> Option<BString> 
 	Some(p)
 }
 
+/// A relative hash table entry (bash's `HASH_RELPATH`: `./s` from `PATH=.`,
+/// `bin/u`, `../s`), which bash's `phash_search` reads from the current
+/// directory as [`hashed_dotted`] while that is an executable file.
+pub fn hashed_relative(entry: &[u8]) -> bool {
+	!is_absolute_on(
+		entry,
+		if cfg!(windows) {
+			Platform::Windows
+		} else {
+			Platform::Linux
+		},
+	)
+}
+
+/// `./entry` (`entry` itself when it starts with `./`): the file bash's
+/// `phash_search` tries first for a relative hash table entry.
+pub fn hashed_dotted(entry: &[u8]) -> BString {
+	if entry.starts_with(b"./") {
+		return entry.into();
+	}
+	let mut p = BString::from(Vec::with_capacity(entry.len() + 2));
+	p.extend_from_slice(b"./");
+	p.extend_from_slice(entry);
+	p
+}
+
+/// A hash table entry in the current directory itself (`./s`, `././s`: its
+/// directory part all `.`). When `./name` is not an executable file there,
+/// bash's `phash_search` gives no entry and the name is searched again (it
+/// asks `same_file (".", dir)`; the spelling answers that here).
+pub fn hashed_in_cwd(entry: &[u8]) -> bool {
+	entry.first() == Some(&b'.')
+		&& entry.iter().rposition(|&c| c == b'/').is_some_and(|i| {
+			entry[..i]
+				.split(|&c| c == b'/')
+				.all(|c| c.is_empty() || c == b".")
+		})
+}
+
 pub use crate::bash::fs::url_root_len;
 
 /// `name` made absolute against `cwd`: a name starting with `/` or a URL
@@ -658,10 +697,7 @@ pub fn absolute(cwd: &[u8], name: &[u8]) -> BString {
 /// [`absolute`] for the configured shell platform: the Windows drive and UNC
 /// rule stays testable on any host instead of compiling only on Windows.
 pub fn absolute_on(cwd: &[u8], name: &[u8], platform: Platform) -> BString {
-	if name.first() == Some(&b'/') || url_root_len(name).is_some() {
-		return name.into();
-	}
-	if platform == Platform::Windows && is_windows_absolute(name) {
+	if is_absolute_on(name, platform) {
 		return name.into();
 	}
 	let mut p = BString::from(cwd);
@@ -670,6 +706,15 @@ pub fn absolute_on(cwd: &[u8], name: &[u8], platform: Platform) -> BString {
 	}
 	p.extend_from_slice(name);
 	p
+}
+
+/// Whether `name` is absolute on `platform` by the engine's rule: it starts
+/// with `/` or is a URL path ([`url_root_len`]), or on Windows it is a drive
+/// or UNC path ([`is_windows_absolute`]).
+pub fn is_absolute_on(name: &[u8], platform: Platform) -> bool {
+	name.first() == Some(&b'/')
+		|| url_root_len(name).is_some()
+		|| (platform == Platform::Windows && is_windows_absolute(name))
 }
 
 /// A Windows drive (`C:\x`, `C:/x`) or UNC (`\\srv\share`) path.
@@ -824,6 +869,22 @@ mod tests {
 		assert_eq!(shown_candidate(b":bin", b"f", 1).unwrap(), "bin/f");
 		assert_eq!(shown_candidate(b"/usr/bin/", b"ls", 0).unwrap(), "/usr/bin/ls");
 		assert!(shown_candidate(b"/bin", b"ls", 1).is_none());
+	}
+
+	#[test]
+	fn hash_entries_are_read_like_bash_phash_search() {
+		assert!(hashed_relative(b"./s") && hashed_relative(b"bin/u") && hashed_relative(b"../s"));
+		assert!(!hashed_relative(b"/usr/bin/ls"));
+		assert_eq!(hashed_dotted(b"bin/u"), "./bin/u");
+		assert_eq!(hashed_dotted(b"../s"), "./../s");
+		assert_eq!(hashed_dotted(b"./bin/u"), "./bin/u");
+		// Only an entry from the current directory itself is searched again.
+		for e in [b"./s".as_slice(), b"././s", b".//s"] {
+			assert!(hashed_in_cwd(e), "{e:?}");
+		}
+		for e in [b"./bin/u".as_slice(), b"../s", b"bin/u", b"s", b"/usr/bin/s", b".s/u"] {
+			assert!(!hashed_in_cwd(e), "{e:?}");
+		}
 	}
 
 	#[test]

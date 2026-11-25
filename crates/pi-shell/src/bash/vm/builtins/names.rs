@@ -287,20 +287,69 @@ enum Kind {
 	Hashed(BString),
 }
 
-/// The hashed path of `name`, counting the lookup as a hit, as bash's
-/// `phash_search` does.
-fn hashed(ctx: &mut Ctx<'_, '_>, name: &[u8]) -> Result<Option<BString>, Need> {
+/// The hashed file of `name` ([`hashed_file`]), and `name` on `hits` when
+/// the hash table answered and the lookup counts (`hits` is `None` for one
+/// that does not): bash's `phash_search` counts one hit per lookup, and
+/// [`count_hits`] stores them when the builtin's probes are over. The hit
+/// is not stored here because [`hashed_file`] probes: a builtin runs again
+/// from its start after each probe answer, so a hit stored before a probe
+/// is stored again on every re-run (`type u v` counted the first name once
+/// per probe of the second).
+fn hashed(
+	ctx: &mut Ctx<'_, '_>,
+	name: &[u8],
+	hits: Option<&mut Vec<BString>>,
+) -> Result<Option<BString>, Need> {
 	if name.contains(&b'/') {
 		return Ok(None);
 	}
 	match ctx.record(Key::CmdHash(BStr::new(name)))? {
-		Some(Record::CmdHash { path, hits }) => {
-			let rec = Record::CmdHash { path: path.clone(), hits: hits.saturating_add(1) };
-			ctx.store_record(KeyBuf::CmdHash(name.into()), Some(rec));
-			Ok(Some(path))
+		Some(Record::CmdHash { path, .. }) => {
+			let file = hashed_file(ctx, path)?;
+			if let Some(hits) = hits {
+				hits.push(name.into());
+			}
+			Ok(file)
 		},
 		_ => Ok(None),
 	}
+}
+
+/// Count one hit for each lookup the hash table answered, as bash's
+/// `phash_search` does. Called where the builtin asks no further probe, so
+/// that a re-run (each probe answer starts the builtin again) cannot count
+/// a lookup twice.
+fn count_hits(ctx: &mut Ctx<'_, '_>, hits: &[BString]) -> Result<(), Need> {
+	for name in hits {
+		if let Some(Record::CmdHash { path, hits }) = ctx.record(Key::CmdHash(BStr::new(name)))? {
+			let rec = Record::CmdHash { path, hits: hits.saturating_add(1) };
+			ctx.store_record(KeyBuf::CmdHash(name.clone()), Some(rec));
+		}
+	}
+	Ok(())
+}
+
+/// The file the hash table entry `entry` names now, as bash's
+/// `phash_search` reads it: a relative entry (`bin/u`) is `./bin/u` while
+/// that is an executable file, else `entry`, or none (the name is searched
+/// again) for an entry in the current directory itself (`./s`). zsh reads
+/// an entry as it is.
+fn hashed_file(ctx: &Ctx<'_, '_>, entry: BString) -> Result<Option<BString>, Need> {
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh || !probe::hashed_relative(&entry) {
+		return Ok(Some(entry));
+	}
+	let dotted = probe::hashed_dotted(&entry);
+	let abs = absolute(&ctx.vp.cwd, &dotted);
+	// bash's `executable_file`: it exists, is not a directory and may be
+	// executed.
+	let file = matches!(
+		ctx.probe(Probe::Stat { path: abs.clone(), follow: true })?,
+		ProbeResult::Stat(Some(s)) if s.kind != crate::bash::fs::StatKind::Dir
+	);
+	if file && ctx.probe(Probe::Access { path: abs, mode: 4 })? == ProbeResult::Ok(true) {
+		return Ok(Some(dotted));
+	}
+	Ok((!probe::hashed_in_cwd(&entry)).then_some(entry))
 }
 
 /// bash's `sv_path` (`phash_flush`): any assignment to `PATH`, a command's
@@ -340,14 +389,20 @@ fn search_path(ctx: &mut Ctx<'_, '_>, std_path: bool) -> Result<BString, Need> {
 
 /// Every meaning of `name` (`all`) or the first one; `path_only` skips
 /// everything but files (`type -P`); `std_path` searches the standard
-/// path instead of `$PATH` (`command -pv`).
+/// path instead of `$PATH` (`command -pv`). A lookup the hash table
+/// answers leaves `name` on `hits` for [`count_hits`]; bash's
+/// `describe_command` reads the hash table (`phash_search`, which counts
+/// the hit) unless it lists every meaning, and `-P` (a forced `$PATH`
+/// search) reads it even then: so `-a` alone counts none.
 fn kinds(
 	ctx: &mut Ctx<'_, '_>,
 	name: &[u8],
 	all: bool,
 	path_only: bool,
 	std_path: bool,
+	hits: &mut Vec<BString>,
 ) -> Result<Vec<Kind>, Need> {
+	let counts = !all || path_only;
 	let mut found = Vec::new();
 	if !path_only {
 		// Aliases count only while alias expansion is on.
@@ -394,12 +449,14 @@ fn kinds(
 					found.push(Kind::Builtin);
 				}
 			},
-			Resolved::External(p) => found.push(match hashed(ctx, name)? {
-				Some(h) => Kind::Hashed(h),
-				None => Kind::File(p),
-			}),
+			Resolved::External(p) => {
+				found.push(match hashed(ctx, name, counts.then_some(&mut *hits))? {
+					Some(h) => Kind::Hashed(h),
+					None => Kind::File(p),
+				});
+			},
 			Resolved::NotFound => {
-				if let Some(h) = hashed(ctx, name)? {
+				if let Some(h) = hashed(ctx, name, counts.then_some(&mut *hits))? {
 					found.push(Kind::Hashed(h));
 				}
 			},
@@ -407,7 +464,7 @@ fn kinds(
 		if !found.is_empty() && !all {
 			return Ok(found);
 		}
-	} else if let Some(h) = hashed(ctx, name)? {
+	} else if let Some(h) = hashed(ctx, name, counts.then_some(&mut *hits))? {
 		// `type -P`: the hash table first, as bash's `find_user_command`.
 		found.push(Kind::Hashed(h));
 		return Ok(found);
@@ -428,6 +485,18 @@ fn kinds(
 
 /// `type [-afptP] name …`.
 pub fn type_(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
+	let mut hits = Vec::new();
+	// A `Need` leaves the run unfinished (it starts again from here), so
+	// nothing is counted until it ends.
+	let out = type_into(ctx, args, &mut hits)?;
+	count_hits(ctx, &hits)?;
+	Ok(out)
+}
+
+/// `type`, with the lookups the hash table answered left on `hits` for the
+/// builtin that runs it (`command -V` runs one `type` per name and counts
+/// them all at its end).
+fn type_into(ctx: &mut Ctx<'_, '_>, args: &[BString], hits: &mut Vec<BString>) -> R {
 	let o = match opts(ctx, args, b"afptP", b"", false) {
 		Ok(o) => o,
 		Err(st) => return done(st),
@@ -436,7 +505,7 @@ pub fn type_(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	let mut out = Vec::new();
 	let mut status = 0;
 	for name in o.rest {
-		let mut found = kinds(ctx, name, all, o.has(b'P'), false)?;
+		let mut found = kinds(ctx, name, all, o.has(b'P'), false, hits)?;
 		if o.has(b'f') {
 			found.retain(|k| !matches!(k, Kind::Function(_)));
 		}
@@ -512,17 +581,22 @@ pub fn command_v(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	}
 	if o.has(b'V') {
 		let mut status = i32::from(!o.rest.is_empty());
+		let mut hits = Vec::new();
 		for name in o.rest {
-			if type_(ctx, &[BString::from("--"), name.clone()])?.status == 0 {
+			if type_into(ctx, &[BString::from("--"), name.clone()], &mut hits)?.status == 0 {
 				status = 0;
 			}
 		}
+		// One `type` per name, but one run of this builtin: the lookups
+		// count here, where no further probe can start it again.
+		count_hits(ctx, &hits)?;
 		return done(status);
 	}
 	let mut out = Vec::new();
 	let mut status = i32::from(!o.rest.is_empty());
+	let mut hits = Vec::new();
 	for name in o.rest {
-		match kinds(ctx, name, false, false, o.has(b'p'))?
+		match kinds(ctx, name, false, false, o.has(b'p'), &mut hits)?
 			.into_iter()
 			.next()
 		{
@@ -539,6 +613,8 @@ pub fn command_v(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		}
 		status = 0;
 	}
+	// Every probe is answered: the lookups count once each.
+	count_hits(ctx, &hits)?;
 	ctx.out(&out);
 	done(status)
 }
@@ -830,6 +906,11 @@ pub fn hash(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			continue;
 		}
 		if o.has(b't') {
+			// The file the entry names now, as bash's `phash_search` reads it.
+			let found = match found {
+				Some(p) => hashed_file(ctx, p)?,
+				None => None,
+			};
 			match found {
 				Some(p) if reusable => {
 					writeln!(out, "builtin hash -p {} {}", p.as_bstr(), name.as_bstr())
