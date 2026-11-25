@@ -2288,10 +2288,12 @@ export class SessionManager {
 	 * conflict as before. A fresh file that already exists is never recovered,
 	 * so a colliding sibling cannot move again. Backends that defer sync
 	 * publishes also report as before: there a conflict can be this manager
-	 * racing its own unconfirmed publish, not another writer, and a rewrite
-	 * computed from a stale view rejects so its caller retries from a fresh
-	 * load. The one exception is a write this manager queued (`queued`) on a
-	 * store that recovers queued conflicts (see {@link #recoversQueuedConflicts}).
+	 * racing its own unconfirmed publish, not another writer. The one
+	 * exception is a write this manager queued (`queued`) on a store that
+	 * recovers queued conflicts (see {@link #recoversQueuedConflicts}), which
+	 * lets this manager's own writes settle before it reads the file again; a
+	 * refused full rewrite on such a store goes to that recovery too (see
+	 * {@link #recoverQueuedConflict}).
 	 */
 	#conflictedSessionFile(error: unknown, queued = false): string | undefined {
 		const sessionFile = this.#sessionFile;
@@ -2654,17 +2656,23 @@ export class SessionManager {
 
 	/**
 	 * A write a deferred-publish store (SQL storage) queued for `sessionFile`
-	 * was refused at confirmation with a write conflict: another writer that
-	 * claims nothing (an older omp) changed the file, or it now holds another
-	 * session. Take the error over (`true`) and recover as a write-time
-	 * conflict does, once this manager's own queued writes have settled:
-	 * keep the other writer's new entries and publish the whole transcript
-	 * again, or move to a sibling (`replaced`; `contested` once
-	 * {@link MAX_WRITE_CONFLICT_RECOVERIES} recoveries in a row did not hold),
-	 * which under `OMP_SESSION_EXCLUSIVE=1` ends the process instead. Without
-	 * this the store's journal and this session diverge: the next publish,
-	 * checked against a realigned size, would erase the other writer's
-	 * entries or write this session over another one.
+	 * was refused with a write conflict: at confirmation, or at once by the
+	 * size this store's index holds (a full rewrite, synchronous or atomic,
+	 * that stated a size the store no longer has). Another writer that claims
+	 * nothing (an older omp) changed the file, it now holds another session,
+	 * or the size this manager expects lags what the store took. Take the
+	 * error over (`true`) and recover as a write-time conflict does, once this
+	 * manager's own queued writes have settled: read the file again, keep the
+	 * other writer's new entries, and publish the whole transcript checked
+	 * against the size just read, or move to a sibling (`replaced`;
+	 * `contested` once {@link MAX_WRITE_CONFLICT_RECOVERIES} recoveries in a
+	 * row did not hold), which under `OMP_SESSION_EXCLUSIVE=1` ends the
+	 * process instead. Without this the store's journal and this session
+	 * diverge: the next publish, checked against a realigned size, would erase
+	 * the other writer's entries or write this session over another one, and
+	 * a publish checked against the refused size is refused again, every time.
+	 * While the recovery runs no other write states a size (see
+	 * {@link #rewriteAtomically} and {@link #appendToCurrentSessionFile}).
 	 */
 	#recoverQueuedConflict(error: unknown, sessionFile: string): boolean {
 		if (!this.#recoversQueuedConflicts() || !(error instanceof SessionWriteConflictError)) return false;
@@ -3321,6 +3329,8 @@ export class SessionManager {
 				targetPath = sibling;
 			}
 			let body = this.#serializeBody();
+			// This manager's own atomic publish in flight: the store's index already holds its body.
+			const atomicInFlight = this.#atomicRewriteFenceEpoch !== null;
 			this.#diskEpoch++;
 			this.#diskTail = Promise.resolve();
 			this.#closeWriterEventually();
@@ -3332,9 +3342,15 @@ export class SessionManager {
 					break;
 				} catch (err) {
 					const retryPath = this.#recoverFromWriteConflictSync(err, recoveries);
-					if (!retryPath) throw err;
-					targetPath = retryPath;
-					body = this.#serializeBody();
+					if (retryPath) {
+						targetPath = retryPath;
+						body = this.#serializeBody();
+						continue;
+					}
+					// A store that publishes later reads nothing synchronously: its recovery reads the
+					// stored size again before any write states one, so the refused size is never stated again.
+					if (!atomicInFlight && this.#recoverQueuedConflict(err, targetPath)) return;
+					throw err;
 				}
 			}
 			if (this.#storage.defersSyncPublish) {
@@ -3403,24 +3419,38 @@ export class SessionManager {
 	 * synchronous rewrite from being overwritten by the stale body serialized
 	 * before it ran. `queuedRecovery` marks the publish of a queued write's
 	 * conflict recovery (see {@link #recoverQueuedConflict}), whose own
-	 * conflicts recover the same way; any other rewrite that meets a file
-	 * changed on a deferring store rejects.
+	 * conflicts recover the same way. Any other rewrite starts only once a
+	 * recovery in flight has read the stored size again, and on a store that
+	 * recovers queued conflicts hands its own refusal to that recovery and
+	 * settles with it, rejecting when it did not publish; elsewhere a rewrite
+	 * that meets a file changed on a deferring store rejects.
 	 */
 	async #rewriteAtomically(queuedRecovery = false): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
 		if (this.#released) return;
+		// A publish now would state the size the recovery is reading again.
+		if (!queuedRecovery && this.#queuedConflictRecovery) await this.#queuedConflictRecovery;
 
 		const startEpoch = this.#diskEpoch;
+		let handedOver = false;
 		await this.#scheduleDiskWork(
 			async () => {
-				if (await this.#runFencedAtomicRewrite(startEpoch, queuedRecovery)) {
-					this.#fileIsCurrent = true;
-					this.#materializeBreadcrumb();
-					this.#hasTitleSlot = true;
+				try {
+					if (await this.#runFencedAtomicRewrite(startEpoch, queuedRecovery)) {
+						this.#fileIsCurrent = true;
+						this.#materializeBreadcrumb();
+						this.#hasTitleSlot = true;
+					}
+				} catch (error) {
+					handedOver = !queuedRecovery && error instanceof Error && this.#takenOverConflicts.has(error);
+					throw error;
 				}
 			},
 			{ epoch: startEpoch },
 		);
+		if (!handedOver) return;
+		await this.#queuedConflictRecovery;
+		if (this.#rewriteRequired && this.#diskFailure) throw this.#diskFailure;
 	}
 
 	/**
@@ -3481,6 +3511,9 @@ export class SessionManager {
 						this.#atomicRewriteDirty = true;
 						continue;
 					}
+					// A store that recovers queued conflicts reads the stored size again in its recovery,
+					// which publishes this transcript: a size the store refused published nothing to read back.
+					if (!queuedRecovery && this.#recoverQueuedConflict(error, sessionFile)) throw error;
 					let landed = false;
 					try {
 						landed = await this.#bodyMatchesStorage(sessionFile, body);
@@ -3591,9 +3624,12 @@ export class SessionManager {
 		}
 		// Not written yet, a structural change, another live owner, or bytes
 		// this manager cannot account for (a publish not yet confirmed, another
-		// writer) → rewrite the whole file synchronously.
+		// writer) → rewrite the whole file synchronously, unless a recovery of a
+		// refused write is reading the stored size again: a rewrite now would
+		// state the refused size, and the recovery's publish carries this entry.
 		const durable = this.#frontierMatchingSessionFile();
 		if (!durable) {
+			if (this.#queuedConflictRecovery) return;
 			this.#rewriteSynchronously();
 			return;
 		}

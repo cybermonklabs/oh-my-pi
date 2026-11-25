@@ -69,6 +69,66 @@ async function resume(
 	return { manager, notices };
 }
 
+/** As an older build, which claims nothing, does: append a turn with id `id` to the session at `file`. */
+async function appendAsOlderBuild(db: LeaseDb, file: string, id: string, text: string): Promise<void> {
+	const older = await db.open({ claims: false });
+	const writer = older.openWriter(file);
+	await writer.append(
+		`${JSON.stringify({ type: "message", id, parentId: null, timestamp: "2026-11-17T00:00:09.000Z", message: userTurn(text) })}\n`,
+	);
+	await writer.close();
+	await older.drain();
+}
+
+/** A size-checked full write of a session: the size it stated, and, when the store refused it, the size the store held. */
+interface FullWrite {
+	expectedSize: number | null | undefined;
+	refusedAt?: number | null;
+}
+
+/** Every size-checked full write, synchronous or atomic, that `storage` takes of `file` from now on, in order. */
+function recordFullWrites(storage: SqlSessionStorage, file: string): FullWrite[] {
+	const writes: FullWrite[] = [];
+	const atomic = storage.writeLinesAtomic.bind(storage);
+	const sync = storage.writeLinesSync.bind(storage);
+	storage.writeLinesAtomic = async (target, lines, options) => {
+		if (target !== file) return atomic(target, lines, options);
+		const write: FullWrite = { expectedSize: options?.expectedSize };
+		writes.push(write);
+		try {
+			await atomic(target, lines, options);
+		} catch (err) {
+			if (err instanceof SessionWriteConflictError && err.path === file) write.refusedAt = err.actualSize;
+			throw err;
+		}
+	};
+	storage.writeLinesSync = (target, lines, options) => {
+		if (target !== file) return sync(target, lines, options);
+		const write: FullWrite = { expectedSize: options?.expectedSize };
+		writes.push(write);
+		try {
+			sync(target, lines, options);
+		} catch (err) {
+			if (err instanceof SessionWriteConflictError && err.path === file) write.refusedAt = err.actualSize;
+			throw err;
+		}
+	};
+	return writes;
+}
+
+/**
+ * The writes that follow a refused one without stating the size the store
+ * held when it refused: the refused size again, or any size not read back.
+ * Empty when every write after a refusal stated what the store held, and
+ * when nothing was refused or nothing followed a refusal.
+ */
+function retriesOfAStaleSize(writes: readonly FullWrite[]): FullWrite[] {
+	return writes.filter((write, index) => {
+		const before = writes[index - 1];
+		return before?.refusedAt !== undefined && write.expectedSize !== before.refusedAt;
+	});
+}
+
 for (const { adapter, url } of LEASE_BACKENDS) {
 	describe.skipIf(!url)(`SessionManager claims on SQL storage (${adapter})`, () => {
 		it("takes in the entries an older build appended to its session, and keeps writing it", async () => {
@@ -195,7 +255,58 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			});
 		}, 30_000);
 
-		it("rejects a caller's rewrite computed before an older build appended, and keeps that build's turn", async () => {
+		// If this regresses, a session whose stored size moved under it states the refused size again on every later
+		// full write, each refused the same way, and none of its writes lands while the process lives. The row where
+		// nothing changed the file is the control: the same check passes when no write is refused.
+		for (const olderBuildAppended of [true, false]) {
+			it(`states the size the store holds, never a refused one, on each rewrite a caller asks for (${olderBuildAppended ? "after an older build appended" : "on a file nobody else wrote"})`, async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open({ lease: STILL });
+				const file = sessionFile(db);
+				await storage.writeText(file, transcript(ID, "before"));
+				await storage.drain();
+				const { manager, notices } = await resume(storage, file);
+				manager.appendMessage(userTurn("mine before the change"));
+				await manager.flush();
+				if (olderBuildAppended) await appendAsOlderBuild(db, file, "older1", "the older build's turn");
+				const writes = recordFullWrites(storage, file);
+
+				// Two rewrites, as the close of a retry saga asked for one after each automatic retry.
+				const outcomes: string[] = [];
+				for (let attempt = 0; attempt < 2; attempt++) {
+					outcomes.push(
+						await manager.rewriteEntries().then(
+							() => "stored",
+							(err: unknown) => String(err),
+						),
+					);
+				}
+
+				const stored = await db.row(file);
+				expect({
+					outcomes,
+					refused: writes.filter(write => write.refusedAt !== undefined).length,
+					retriesOfAStaleSize: retriesOfAStaleSize(writes),
+					notices,
+					id: manager.getSessionId(),
+					kept: ["mine before the change", "the older build's turn"].map(text => stored?.content.includes(text)),
+					expectsWhatIsStored: manager.captureState().expectedDiskSize === stored?.byteLen,
+				}).toEqual({
+					outcomes: ["stored", "stored"],
+					refused: olderBuildAppended ? 1 : 0,
+					retriesOfAStaleSize: [],
+					notices: [],
+					id: ID,
+					kept: [true, olderBuildAppended],
+					expectsWhatIsStored: true,
+				});
+				await manager.close();
+			});
+		}
+
+		// If this regresses, after a session listing reloads the store's index every entry is refused against the size
+		// this manager expects, which nothing reads again, and none reaches storage while the process lives.
+		it("keeps saving its entries after a session listing reloads the size an older build left", async () => {
 			await using db = await openLeaseDb(adapter, url ?? "");
 			const storage = await db.open({ lease: STILL });
 			const file = sessionFile(db);
@@ -204,26 +315,41 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			const { manager, notices } = await resume(storage, file);
 			manager.appendMessage(userTurn("mine before the change"));
 			await manager.flush();
-			const older = await db.open({ claims: false });
-			const writer = older.openWriter(file);
-			await writer.append(
-				`${JSON.stringify({ type: "message", id: "older1", parentId: null, timestamp: "2026-11-17T00:00:09.000Z", message: userTurn("the older build's turn") })}\n`,
-			);
-			await writer.close();
-			await older.drain();
+			await appendAsOlderBuild(db, file, "older1", "the older build's turn");
+			// What every session listing does before it lists.
+			await storage.refresh();
+			const writes = recordFullWrites(storage, file);
 
-			const rejected = await manager.rewriteEntries().then(
-				() => undefined,
-				(err: unknown) => err,
-			);
+			const outcomes: string[] = [];
+			for (const text of ["mine after the change", "and my next turn"]) {
+				manager.appendMessage(userTurn(text));
+				outcomes.push(
+					await manager.flush().then(
+						() => "stored",
+						(err: unknown) => String(err),
+					),
+				);
+			}
 
-			expect(rejected).toBeInstanceOf(SessionWriteConflictError);
+			const stored = await db.row(file);
 			expect({
+				outcomes,
+				refused: writes.filter(write => write.refusedAt !== undefined).length,
+				retriesOfAStaleSize: retriesOfAStaleSize(writes),
 				notices,
-				id: manager.getSessionId(),
-				kept: ((await db.row(file))?.content ?? "").includes("the older build's turn"),
-			}).toEqual({ notices: [], id: ID, kept: true });
-			await manager.close().catch(() => undefined);
+				kept: ["mine before the change", "the older build's turn", "mine after the change", "and my next turn"].map(
+					text => stored?.content.includes(text),
+				),
+				expectsWhatIsStored: manager.captureState().expectedDiskSize === stored?.byteLen,
+			}).toEqual({
+				outcomes: ["stored", "stored"],
+				refused: 1,
+				retriesOfAStaleSize: [],
+				notices: [],
+				kept: [true, true, true, true],
+				expectsWhatIsStored: true,
+			});
+			await manager.close();
 		});
 
 		it("moves a second manager of this process off a journal another manager here writes, as file storage does", async () => {
