@@ -112,7 +112,7 @@ import type { Skill } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { GoalModeState } from "../goals/state";
-import { rebindMemoryBackendForCwd } from "../hindsight/backend";
+import { memoryBeforeCwdMove, rebindMemoryBackendForCwd } from "../hindsight/backend";
 import { copyLocalArtifacts, resolveLocalRoot } from "../internal-urls";
 import { hasNativeJudge } from "../judgment";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
@@ -3230,8 +3230,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * active session's working directory changed (`/move` relocation or resuming
 	 * a session from another project). The SessionManager's cwd MUST already
 	 * reflect `newCwd` before this is called.
+	 *
+	 * A move that commits without memory reports it through `onWarning`, shown
+	 * at once when absent; a host that re-renders the transcript afterwards
+	 * passes it to show the warning after the re-render.
 	 */
-	async applyCwdChange(newCwd: string): Promise<boolean> {
+	async applyCwdChange(newCwd: string, options?: { onWarning?: (warning: string) => void }): Promise<boolean> {
+		const onWarning = options?.onWarning ?? ((warning: string) => this.showWarning(warning));
 		const previousCwd = getProjectDir();
 		try {
 			setProjectDir(newCwd);
@@ -3245,16 +3250,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// fails, undo the chdir so `false` reliably means "nothing committed";
 		// callers roll back their own session/manager state on false.
 		try {
-			// Re-scope project settings (`.claude/settings.yml` etc.) to the new
-			// directory in place so the active session and every settings reader pick
-			// up the destination project's configuration.
-			if (isSettingsInitialized()) {
-				await settings.reloadForCwd(newCwd);
-				// The reload fired the memory scope hooks; complete the rebind
-				// before the move commits so the next prompt cannot recall or
-				// retain against the source project's memory.
-				await rebindMemoryBackendForCwd(this.session);
-			}
+			await this.#rescopeSettingsAndMemory(newCwd, onWarning);
 			// Re-warm plugin roots, capabilities, slash commands, and the ssh tool so
 			// the next prompt sees everything scoped to the new project directory.
 			clearClaudePluginRootsCache();
@@ -3268,10 +3264,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.sessionManager.setCwdWithoutRelocation(previousCwd);
 			try {
 				setProjectDir(previousCwd);
-				if (isSettingsInitialized()) {
-					await settings.reloadForCwd(previousCwd);
-					await rebindMemoryBackendForCwd(this.session);
-				}
+				await this.#rescopeSettingsAndMemory(previousCwd, onWarning);
 				clearClaudePluginRootsCache();
 				await this.refreshTitleSystemPrompt(previousCwd);
 				await this.session.refreshSkillsAndCommands();
@@ -3279,10 +3272,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				const actual = this.sessionManager.getCwd();
 				try {
 					setProjectDir(actual);
-					if (isSettingsInitialized()) {
-						await settings.reloadForCwd(actual);
-						await rebindMemoryBackendForCwd(this.session);
-					}
+					await this.#rescopeSettingsAndMemory(actual, onWarning);
 					clearClaudePluginRootsCache();
 					await this.refreshTitleSystemPrompt(actual);
 					await this.session.refreshSkillsAndCommands();
@@ -3302,6 +3292,22 @@ export class InteractiveMode implements InteractiveModeContext {
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		this.statusLine.applyCwdChange();
 		return true;
+	}
+
+	/**
+	 * Re-scope project settings (`.claude/settings.yml` etc.) to `cwd` in place,
+	 * so the active session and every settings reader pick up that project's
+	 * configuration, then rebind memory before the move commits, so the next
+	 * prompt cannot recall or retain against the previous project's memory.
+	 * Whether memory ran is read before the reload, whose memory scope hooks can
+	 * already tear the running backend down.
+	 */
+	async #rescopeSettingsAndMemory(cwd: string, onWarning: (warning: string) => void): Promise<void> {
+		if (!isSettingsInitialized()) return;
+		const memoryBefore = await memoryBeforeCwdMove(this.session);
+		await settings.reloadForCwd(cwd);
+		const warning = await rebindMemoryBackendForCwd(this.session, memoryBefore);
+		if (warning) onWarning(warning);
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {

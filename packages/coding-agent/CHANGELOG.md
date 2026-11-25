@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `/resume` of a session from another directory, and `/move`, no longer close the session when Mnemopi memory had already failed to start: the session opens in the new directory with memory off and a warning. When memory was running before, the move is still refused and the session stays where it was
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
