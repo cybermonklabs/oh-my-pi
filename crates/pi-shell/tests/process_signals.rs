@@ -5183,7 +5183,8 @@ fn set_m_kill_of_a_jobs_group_reaches_its_shell_code() {
 		// job) waits among the ends the job holds: a held `USR1` still
 		// comes first once the job is continued (`st=138`). And `KILL` is
 		// never ordered behind them: after a held `HUP` it ends the job
-		// with 137.
+		// with 137, by `%1` and by its pid (a `KILL` let in among the held
+		// ends leaves the job stopped, `st=147`).
 		(
 			format!(
 				"set -m; ( while :; do /bin/sleep 0.2; done ) & /bin/sleep 0.5; kill -STOP %1; \
@@ -5197,6 +5198,14 @@ fn set_m_kill_of_a_jobs_group_reaches_its_shell_code() {
 			format!(
 				"set -m; ( while :; do /bin/sleep 0.2; done ) & /bin/sleep 0.5; kill -STOP %1; \
 				 {job_stopped}; kill -HUP $!; echo kill=$?; /bin/sleep 0.3; kill -KILL %1; {gone}"
+			),
+			"kill=0\nst=137\n",
+			false,
+		),
+		(
+			format!(
+				"set -m; ( while :; do /bin/sleep 0.2; done ) & /bin/sleep 0.5; kill -STOP %1; \
+				 {job_stopped}; kill -HUP $!; echo kill=$?; /bin/sleep 0.3; kill -KILL $!; {gone}"
 			),
 			"kill=0\nst=137\n",
 			false,

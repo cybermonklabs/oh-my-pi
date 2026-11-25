@@ -3283,12 +3283,6 @@ impl Shell {
 				continue;
 			}
 			let terminating = trap.is_none() && sig.default_action() == DefaultAction::Terminate;
-			// `KILL` is never ordered behind pending signals (the kernel ends
-			// the process at once): the ends a stopped vproc held go with it.
-			if sig == Signal::Kill {
-				let vpid = self.procs[i].vpid;
-				self.k.held_ends.retain(|&(v, ..)| v != vpid);
-			}
 			let dialect = self.procs[i].mode.dialect();
 			let bash = dialect == crate::bash::ids::Dialect::Bash;
 			// Whether the signal continues a stopped vproc: `KILL` ends it in
@@ -3364,8 +3358,11 @@ impl Shell {
 			// continues it, so that `USR1` then `TERM` ends it of `USR1`.
 			// `KILL` ends it at once. What it runs has the signal waiting,
 			// from the kernel or here. A vproc that only waits for its `( … )`
-			// or pipeline is one process with them in bash: its pending ends
-			// are theirs, so a signal sent to it by pid waits in them.
+			// is one process with it in bash: its pending ends are the
+			// subshell's, so a signal sent to it by pid waits in the subshell.
+			// For a pipeline this holds the signal in every stopped stage,
+			// where bash's `$!` is the last stage alone and the signal ends
+			// only that stage: a known difference, not this change's.
 			if terminating
 				&& target != SigTarget::Vpid(root.0)
 				&& self.procs[i].stopped
