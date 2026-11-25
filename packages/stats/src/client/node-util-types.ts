@@ -1,12 +1,12 @@
 /**
- * `node:util/types`' boxed-primitive checks for the dashboard's browser bundle,
- * which `build.ts` resolves `node:util/types` to: Bun's browser target gives
- * that module no exports, and pi-utils' JSON writer (`stringifyDeepJson`,
- * which the dashboard uses to show a transcript entry of any depth) tells a
- * boxed number, string, boolean or bigint apart by these. Each check reads the
- * internal slot as Node's does, by calling the type's own `valueOf` on the
- * value, so a box from another realm, or one whose prototype changed, is still
- * a box, and any other object is not.
+ * `node:util/types`' boxed-primitive checks for the browser bundles of the
+ * dashboard client's code, which `client-bundle.ts` resolves `node:util/types`
+ * to: Bun's browser target gives that module no exports, and pi-utils' JSON
+ * writer (`stringifyDeepJson`, which the client uses to show a transcript entry
+ * of any depth) tells a boxed number, string, boolean or bigint apart by these.
+ * Each check reads the internal slot as Node's does, by calling the type's own
+ * `valueOf` on the value, so a box from another realm, or one whose prototype
+ * changed, is still a box, and any other object is not.
  */
 
 function hasSlot(value: unknown, valueOf: (this: unknown) => unknown): boolean {
