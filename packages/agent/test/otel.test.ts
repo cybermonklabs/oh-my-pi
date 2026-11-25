@@ -5,7 +5,7 @@
  * span names, attributes, parent/child relationships, status codes, and
  * lifecycle hook dispatch.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { agentLoop } from "@oh-my-pi/pi-agent-core/agent-loop";
 import {
@@ -376,8 +376,9 @@ describe("agent-loop OTEL instrumentation", () => {
 		expect(JSON.parse(systemAttr!)).toEqual([{ type: "text", content: "sys-instruction" }]);
 	});
 
-	// A session's messages nest as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000.
-	it("captures full content of a tool call and result nested deeper than JSON.stringify recurses", async () => {
+	// A session's messages nest as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000, after
+	// 1.5 s or more on such a value, and content capture writes the whole history on every request.
+	it("captures full content of a tool call and result nested deeper than JSON.stringify recurses, never trying JSON.stringify on them", async () => {
 		const levels = 50_000;
 		const nested = (bottom: Record<string, unknown>): Record<string, unknown> => {
 			let node = bottom;
@@ -430,7 +431,39 @@ describe("agent-loop OTEL instrumentation", () => {
 			telemetry: { captureMessageContent: true },
 		};
 		const ctx: AgentContext = { systemPrompt: [], messages: history, tools: [] };
-		await runAndDrain(agentLoop([createUserMessage("summarize")], ctx, config, undefined, mock.stream));
+		// The JSON.stringify calls that ran out of stack: each spent 1.5 s or more on a deep tree before the deep writer took it.
+		const stringify = JSON.stringify;
+		const overflows = { request: 0, toolSpan: 0 };
+		let phase: keyof typeof overflows = "request";
+		const spy = spyOn(JSON, "stringify").mockImplementation(((...args: Parameters<typeof stringify>) => {
+			try {
+				return stringify(...args);
+			} catch (error) {
+				if (error instanceof RangeError) overflows[phase]++;
+				throw error;
+			}
+		}) as typeof stringify);
+		const telemetry = resolveTelemetry({ captureMessageContent: true }, "conv-deep");
+		try {
+			await runAndDrain(agentLoop([createUserMessage("summarize")], ctx, config, undefined, mock.stream));
+			// The tool's own span records the call's arguments and its result whole, not "[object Object]".
+			phase = "toolSpan";
+			const span = startExecuteToolSpan(telemetry, {
+				tool: undefined,
+				toolName: "inspect",
+				toolCallId: "tc-2",
+				args: { tree: nested({ leaf: "args" }) },
+			});
+			finishExecuteToolSpan(telemetry, span, {
+				result: { content: [{ type: "text", text: "inspected" }], details: nested({ leaf: "details" }) },
+				isError: false,
+				toolCallId: "tc-2",
+				toolName: "inspect",
+			});
+		} finally {
+			spy.mockRestore();
+		}
+		expect(overflows).toEqual({ request: 0, toolSpan: 0 });
 
 		const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
 		expect(chat?.status.code).not.toBe(SpanStatusCode.ERROR);
@@ -443,20 +476,6 @@ describe("agent-loop OTEL instrumentation", () => {
 		const sentResult = inputs.find(message => message.role === "tool")?.parts[0];
 		expect(nesting(sentResult?.response?.details)).toEqual({ levels, bottom: { leaf: "details" } });
 
-		// The tool's own span records the call's arguments and its result whole, not "[object Object]".
-		const telemetry = resolveTelemetry({ captureMessageContent: true }, "conv-deep");
-		const span = startExecuteToolSpan(telemetry, {
-			tool: undefined,
-			toolName: "inspect",
-			toolCallId: "tc-2",
-			args: { tree: nested({ leaf: "args" }) },
-		});
-		finishExecuteToolSpan(telemetry, span, {
-			result: { content: [{ type: "text", text: "inspected" }], details: nested({ leaf: "details" }) },
-			isError: false,
-			toolCallId: "tc-2",
-			toolName: "inspect",
-		});
 		const tool = findSpan(exporter.getFinishedSpans(), "execute_tool inspect");
 		const args = JSON.parse(tool?.attributes[GenAIAttr.ToolCallArguments] as string);
 		expect(nesting(args.tree)).toEqual({ levels, bottom: { leaf: "args" } });

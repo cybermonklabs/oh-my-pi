@@ -1185,8 +1185,14 @@ function isPlainTelemetryRecord(value: unknown): value is Record<string, unknown
 	return prototype === Object.prototype || prototype === null;
 }
 
+/**
+ * Content capture writes the whole history on every request: a message nested past `JSON.stringify`'s
+ * recursion skips the attempt that would run out of stack (1.5 s or more each time) and goes to the deep writer.
+ */
+const TELEMETRY_JSON = { probeDepth: true } as const;
+
 function stringifyJsonAttribute(value: unknown): string | undefined {
-	return stringifyDeepJson(value);
+	return stringifyDeepJson(value, TELEMETRY_JSON);
 }
 
 function serializeToolCallArgumentsForTelemetry(telemetry: AgentTelemetry, args: unknown): string | undefined {
@@ -2324,7 +2330,7 @@ export { type Attributes, type Span, SpanKind, SpanStatusCode, type Tracer, trac
 
 function safeJson(value: unknown): string | undefined {
 	try {
-		return stringifyDeepJson(value);
+		return stringifyDeepJson(value, TELEMETRY_JSON);
 	} catch {
 		return String(value);
 	}
