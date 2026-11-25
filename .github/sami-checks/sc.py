@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """sami-checks: the plan, the counters and the summary of .github/workflows/sami-checks.yml.
 
-  sc.py plan                       GITHUB_OUTPUT lines: the commit, the job matrices, the control
+  sc.py plan                       GITHUB_OUTPUT lines: the commit, the rows and jobs that run, the job matrices, the controls
   sc.py shard WHO N K META WEIGHTS the pi-shell test binaries of shard N of K, one "id<TAB>path" a line
   sc.py ts-small                   the small TypeScript suites, one "unit<TAB>dir<TAB>bound<TAB>args" a line
   sc.py libtest LOG EXIT SECS ROW UNIT WHO   one libtest binary's result (JSON on stdout)
@@ -13,7 +13,8 @@
   sc.py clippy LOG EXIT SECS CRATE DIR CONTROL_LOG CONTROL_FILE   one crate's clippy result against clippy-baseline.txt
   sc.py clippy-baseline LOG CRATE DIR      one crate's findings as clippy-baseline.txt lines (to regenerate it)
   sc.py platforms PC OUT                   one result per platform from platform-checks' pc-report under PC
-  sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout; exit 1 unless every row passed
+  sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout, its verdict line also to $SC_VERDICT;
+                                           a row SC_ROWS does not name reads NOT RUN; exit 1 unless every row that ran passed
   sc.py skip-forms TREE NOT_MARKERS        each print of TREE/crates that says skip is read or named (JSON)
   sc.py skip-lines RESULTS NOT_MARKERS     each skip line a passing test printed is read or named (JSON)
   sc.py flaky-failed RESULT KNOWN          the failed tests of one result with a `flaky: ` entry, one a line
@@ -43,6 +44,7 @@ at most twice; on the platform rows, nextest's own retry of the test's own proce
 import json
 import os
 import re
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
@@ -154,6 +156,17 @@ RUST_JOBS = (
     ("Rust tests, Bazel and the other cargo workspaces (sami-rust-test.yml rust_test)", "rust_test"),
     ("Rust tests, macOS only (sami-rust-test.yml rust_test_macos)", "rust_test_macos"),
 )
+# The names the dispatch input `rows` takes, one per row of the summary.
+ROW_KEYS = tuple(k for _, k in ROWS) + tuple(k for _, k in RUST_JOBS)
+# sami-checks.yml, whose jobs' `needs:` the plan reads (the plan job checks out .github/workflows too).
+WORKFLOW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "sami-checks.yml")
+# The jobs every run has: the plan, and the summary that reads every other job.
+ALWAYS_JOBS = ("plan", "summary")
+# The rows whose results hold their passing tests' output (libtest logs, JUnit reports), which the
+# skip prints row's run-time unit reads (sc.py skip-lines, passing_outputs). The gVisor set shards
+# also hold the gVisor lib and map-limit rows' logs.
+TEST_OUTPUT_ROWS = ("set-runner", "set-root", "builtins", "workspace", "ts-small", "ts-ca", "gv-set-uid1000",
+                    "gv-set-root", "gv-builtins-uid1000", "gv-builtins-root")
 
 
 def set_matrix():
@@ -191,6 +204,100 @@ def all_job_names():
     return names
 
 
+def row_work():
+    """{row: the (job, matrix entry) pairs whose results its reading uses}. An entry of a job with no
+    matrix is named as its job. A row runs when each of its pairs is planned, so that it reads the same
+    alone as in a run of every row; rows that share entries run together:
+      - a test that skipped itself as one user is covered by the same test's pass as the other user, on
+        the same runtime (cmd_summary's passed_as), so the pi-shell set of both users and the one-process
+        lib row are one group, and so are both users' gVisor set shards (with the gVisor lib and
+        map-limit rows), and both users' gVisor pi-builtins;
+      - sami-rust-test.yml's two jobs are one call;
+      - the skip prints row's run-time unit (sc.py skip-lines) reads the output of every passing test of
+        the run, so that row needs the jobs of each row in TEST_OUTPUT_ROWS too."""
+    def entries(job, matrix, **want):
+        return frozenset((job, m["name"]) for m in matrix if all(m[k] == v for k, v in want.items()))
+
+    def one(job):
+        return frozenset({(job, job)})
+
+    work = {
+        "builtins": entries("builtins", builtins_matrix()),
+        "workspace": entries("workspace", workspace_matrix()),
+        "ts-small": one("ts-small"),
+        "ts-ca": entries("ts-ca", ts_matrix()),
+        "checkts": one("checkts"),
+        "clippy": one("clippy"),
+        "docs": one("docs"),
+        "changelog": one("changelog"),
+        "rust_test": one("rust-test"),
+        "rust_test_macos": one("rust-test"),
+    }
+    for r in ("set-runner", "set-root", "lib4"):
+        work[r] = entries("set", set_matrix())
+    for p in PLATFORMS:
+        work[p] = frozenset({("platforms", p)})
+    for w in GV_WHO:
+        for r in ("set", "lib4", "orphan"):
+            work[f"gv-{r}-{w}"] = entries("gvisor", gvisor_matrix(), part="set")
+        work[f"gv-builtins-{w}"] = entries("gvisor", gvisor_matrix(), part="builtins")
+    work["skipforms"] = one("skip-forms").union(*(work[r] for r in TEST_OUTPUT_ROWS))
+    return work
+
+
+def workflow_jobs(path=WORKFLOW):
+    """{job: {"needs": [job, ...], "if": text}} of a workflow file, read with yq (mikefarah's yq v4:
+    on the ubuntu-24.04 runner image, and in mise)."""
+    try:
+        out = subprocess.run(["yq", "-o=json", ".jobs", path], capture_output=True, text=True, check=True).stdout
+        jobs = json.loads(out)
+    except (OSError, subprocess.CalledProcessError, ValueError) as e:
+        sys.exit(f"::error::the jobs of {path} could not be read with yq: {e}")
+    if not isinstance(jobs, dict) or not jobs:
+        sys.exit(f"::error::{path} has no jobs to read")
+    out = {}
+    for job, body in jobs.items():
+        needs = body.get("needs") or []
+        out[job] = {"needs": [needs] if isinstance(needs, str) else list(needs), "if": str(body.get("if", ""))}
+    return out
+
+
+def plan_rows(selected, jobs):
+    """(the planned (job, entry) pairs, the rows that run, the jobs that run) for the selected rows,
+    given the workflow's jobs (workflow_jobs). A job runs when it has a planned entry or a job that
+    runs needs it, transitively; the prerequisite builds come only from the workflow's own `needs:`."""
+    work = row_work()
+    planned = frozenset().union(*(work[r] for r in selected))
+    rows = [k for k in ROW_KEYS if work[k] <= planned]
+    run, todo = set(), sorted({j for j, _ in planned})
+    while todo:
+        j = todo.pop()
+        if j in run or j in ALWAYS_JOBS:
+            continue
+        if j not in jobs:
+            sys.exit(f"::error::the plan needs the job '{j}', which the workflow does not have (its jobs: {', '.join(jobs)})")
+        run.add(j)
+        todo += jobs[j]["needs"]
+    return planned, rows, [j for j in jobs if j in run]
+
+
+def parse_rows(text):
+    """The rows the dispatch input `rows` selects: `all`, or a comma list of ROW_KEYS."""
+    names = [n.strip() for n in text.split(",")]
+    if names == ["all"]:
+        return list(ROW_KEYS)
+    bad = [n for n in names if n not in ROW_KEYS]
+    if bad:
+        sys.exit(f"::error::the rows input names no row: {', '.join(repr(n) for n in bad)}. Give all (alone), or a comma "
+                 f"list of row names: {', '.join(ROW_KEYS)}")
+    return names
+
+
+def gate(job):
+    """The expression each job's if: holds, so that it runs only when the plan plans it."""
+    return f"contains(fromJSON(needs.plan.outputs.jobs), '{job}')"
+
+
 def cmd_plan():
     event = os.environ["GITHUB_EVENT_NAME"]
     ref = os.environ["GITHUB_REF"]
@@ -198,33 +305,53 @@ def cmd_plan():
         commit = os.environ.get("SC_INPUT_COMMIT", "")
         if not re.fullmatch(r"[0-9a-f]{40}", commit):
             sys.exit(f"::error::the commit input must be a full 40-character lowercase id, not '{commit}'")
+        selected = parse_rows(os.environ.get("SC_INPUT_ROWS", ""))
+        silent = os.environ.get("SC_INPUT_SILENT", "")
+        plant = os.environ.get("SC_INPUT_PLANT", "")
     elif event == "push" and ref == "refs/heads/release-candidate":
+        # The cut: every row, and no control, whatever an input says.
         commit = os.environ["GITHUB_SHA"]
+        selected, silent, plant = list(ROW_KEYS), "", ""
     else:
-        # A push of this tool's own branch: its controls only (the selftest), no tree.
-        commit = ""
-    silent = os.environ.get("SC_INPUT_SILENT", "")
+        sys.exit(f"::error::sami checks runs on a push of release-candidate or a dispatch, not on {event} of {ref}")
+    planned, rows, jobs = plan_rows(selected, workflow_jobs())
     if silent and silent not in all_job_names():
         sys.exit(f"::error::the silent input names no job of the plan: '{silent}' (one of {', '.join(all_job_names())})")
-    plant = os.environ.get("SC_INPUT_PLANT", "")
+    # A control must have its job in the run: one on a row that does not run would pass quietly.
+    names = {n for _, n in planned} | ({"platforms"} if "platforms" in jobs else set())
+    names |= {"macos-bash"} if ("platforms", "macos") in planned else set()
+    if silent and silent not in names:
+        sys.exit(f"::error::the silent input names the job '{silent}', which this run does not run (its rows: {', '.join(rows)})")
     if plant and plant not in PLANTS:
         sys.exit(f"::error::the plant input names no row's control: '{plant}' (one of {', '.join(PLANTS)})")
+    if plant and plant not in rows:
+        sys.exit(f"::error::the plant input plants a fault in the row '{plant}', which this run does not run (its rows: {', '.join(rows)})")
+    print(f"PLAN rows ({len(rows)} of {len(ROW_KEYS)}): {', '.join(rows)}; jobs: {', '.join(jobs)}", file=sys.stderr)
+    if len(rows) < len(ROW_KEYS):
+        print(f"::notice title=A subset of the rows::{len(rows)} of {len(ROW_KEYS)} rows run ({', '.join(rows)}); "
+              "the summary reads the others NOT RUN", file=sys.stderr)
+
+    def only(job, matrix):
+        return json.dumps([m for m in matrix if (job, m["name"]) in planned])
+
     out = {
         "commit": commit,
+        "rows": ",".join(rows),
+        "jobs": json.dumps(jobs),
         "silent": silent,
-        "set": json.dumps(set_matrix()),
+        "set": only("set", set_matrix()),
         "set_shards": SET_SHARDS,
-        "workspace": json.dumps(workspace_matrix()),
-        "builtins": json.dumps(builtins_matrix()),
+        "workspace": only("workspace", workspace_matrix()),
+        "builtins": only("builtins", builtins_matrix()),
         "workspace_parts": WORKSPACE_PARTS,
-        "ts": json.dumps(ts_matrix()),
+        "ts": only("ts-ca", ts_matrix()),
         "ca_shards": CODING_AGENT_SHARDS,
-        "platforms": ",".join(PLATFORMS),
+        "platforms": ",".join(p for p in PLATFORMS if ("platforms", p) in planned),
         "platform_crates": PLATFORM_CRATES,
         "platform_partitions": PLATFORM_PARTITIONS,
         "platform_retries": PLATFORM_RETRIES,
         "clippy_crates": " ".join(CLIPPY_CRATES),
-        "gvisor": json.dumps(gvisor_matrix()),
+        "gvisor": only("gvisor", gvisor_matrix()),
         "gv_set_shards": GV_SET_SHARDS,
         "plant": plant,
     }
@@ -1309,6 +1436,19 @@ def record_retry(result_path, test, report, shape, scope="whole-unit"):
     return outcome
 
 
+def summary_rows():
+    """The rows this run planned: SC_ROWS (the plan's output `rows`, a comma list), or every row when
+    it is unset. A row it does not name reads NOT RUN."""
+    text = os.environ.get("SC_ROWS")
+    if text is None:
+        return list(ROW_KEYS)
+    rows = [r for r in text.split(",") if r]
+    bad = [r for r in rows if r not in ROW_KEYS]
+    if bad or not rows:
+        sys.exit(f"::error::SC_ROWS names no row of the summary: {', '.join(bad) or '(nothing)'}")
+    return rows
+
+
 def cmd_summary(results_dir, build_dir, known_path=None):
     known = read_known(known_path)
     skips = read_known_skips(known_path)
@@ -1346,7 +1486,9 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         seen = "; ".join(f"{t['outcome']} ({told(t)})" for t in tries)
         return None, f"**NEW** (listed as `{why}`, but no retry of its shape passed it: {seen}{first(tries[0])})"
 
-    results = load_results(results_dir)
+    run_rows = summary_rows()
+    # Only the rows this run planned are read: a row it did not plan reads NOT RUN, and no unit of it is expected.
+    results = [r for r in load_results(results_dir) if r["row"] in run_rows]
     got, dup = {}, set()
     for r in results:
         k = (r["row"], r["unit"], r["who"])
@@ -1364,6 +1506,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         bad = set(r["failures"]) | set(r.get("self_skipped", []))
         passed_as.setdefault((runtime(r["row"]), r["unit"], r["who"]), set()).update(n for n, _ in r["tests"] if n not in bad)
     exp, notes = expected_units(build_dir)
+    exp = [e for e in exp if e[0] in run_rows]
     lines = []
     commit = os.environ.get("SC_COMMIT", "?")
     lines.append(f"## sami checks of `{commit}`")
@@ -1381,10 +1524,14 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     lines.append("")
     lines.append("| Row | Verdict | Units: pass / known / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
-    all_ok = True
     details = []
     verdicts = {}
+    row_verdicts = {}
     for title, key in ROWS:
+        if key not in run_rows:
+            lines.append(f"| {title} | **NOT RUN** | - | - | - |")
+            row_verdicts[key] = "NOT RUN"
+            continue
         units = [e for e in exp if e[0] == key]
         rs = []
         for e in units:
@@ -1437,8 +1584,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         lu = f"{longest['unit']} ({longest['who']}), {fmt_secs(longest['seconds'])}" if longest else "-"
         lines.append(f"| {title} | **{verdict}** | {counts} | {tp} / {tf} / {ti} / {ts} | {lu} |")
         verdicts[key] = (verdict, rs)
-        if verdict not in ("PASS", "KNOWN"):
-            all_ok = False
+        row_verdicts[key] = verdict
         for r in rs:
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
@@ -1451,34 +1597,37 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`" + (f": KNOWN ({why})" if why else ""))
             for f, n, why in r.get("partial", []):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): `{f}`: partial: {n} sub-cases skipped ({why})")
-    # SC_RUST_TESTS is "rust_test=<result> rust_test_macos=<result>". Absent: a caller from before
-    # those jobs, and no Rust rows. success passes and failure fails; a job with no result, or with
-    # any other (cancelled, skipped), is UNKNOWN.
-    rust = os.environ.get("SC_RUST_TESTS")
-    if rust is not None:
-        conclusions = dict(p.split("=", 1) for p in rust.split() if "=" in p)
-        for title, job in RUST_JOBS:
-            conclusion = conclusions.get(job, "")
-            verdict = {"success": "PASS", "failure": "FAIL"}.get(conclusion, "UNKNOWN")
-            lines.append(f"| {title} | **{verdict}** | - | - | - |")
-            if verdict != "PASS":
-                all_ok = False
-                details.append(f"- **{title}**: {verdict}: the job's conclusion is [{conclusion or 'none'}]; "
-                               "its failing tests are in that job's annotations and log")
+    # SC_RUST_TESTS is "rust_test=<result> rust_test_macos=<result>". success passes and failure fails;
+    # a job with no result (SC_RUST_TESTS absent too), or with any other (cancelled, skipped), is
+    # UNKNOWN. A Rust row this run did not plan reads NOT RUN.
+    conclusions = dict(p.split("=", 1) for p in os.environ.get("SC_RUST_TESTS", "").split() if "=" in p)
+    for title, job in RUST_JOBS:
+        if job not in run_rows:
+            lines.append(f"| {title} | **NOT RUN** | - | - | - |")
+            row_verdicts[job] = "NOT RUN"
+            continue
+        conclusion = conclusions.get(job, "")
+        verdict = {"success": "PASS", "failure": "FAIL"}.get(conclusion, "UNKNOWN")
+        lines.append(f"| {title} | **{verdict}** | - | - | - |")
+        row_verdicts[job] = verdict
+        if verdict != "PASS":
+            details.append(f"- **{title}**: {verdict}: the job's conclusion is [{conclusion or 'none'}]; "
+                           "its failing tests are in that job's annotations and log")
     # A planted run (the dispatch input `plant`) says so first, and whether the control caught its plant.
     plant = os.environ.get("SC_PLANT", "")
+    top, caught = [], None
     if plant:
         path, text, needle = PLANTS[plant]
         v, rs = verdicts.get(plant, ("absent", []))
         # Each unit of the row must name the plant (docs: the public and the private build).
         missed = [r["unit"] for r in rs if r["status"] != "FAIL" or not any(needle in f for f in r["failures"])]
         each = ", ".join(f"`{r['unit']}`" for r in rs)
-        all_ok = False
-        lines[2:2] = [f"**Planted run (`plant={plant}`)**: the {plant} job added `` {text} `` to `{path}` before it ran. "
-                      + (f"The control caught it: the row reads FAIL, and each of its units ({each}) names `{needle}`."
-                         if rs and not missed else
-                         f"**THE CONTROL FAILED**: the row reads {v}, and these units do not read FAIL naming `{needle}`: "
-                         + (", ".join(f"`{u}`" for u in missed) or "the row has no unit") + "."), ""]
+        caught = bool(rs) and not missed
+        top += [f"**Planted run (`plant={plant}`)**: the {plant} job added `` {text} `` to `{path}` before it ran. "
+                + (f"The control caught it: the row reads FAIL, and each of its units ({each}) names `{needle}`."
+                   if caught else
+                   f"**THE CONTROL FAILED**: the row reads {v}, and these units do not read FAIL naming `{needle}`: "
+                   + (", ".join(f"`{u}`" for u in missed) or "the row has no unit") + "."), ""]
     lines.append("")
     # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
     # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
@@ -1518,7 +1667,6 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                 continue
             stale.append(f"- `{unit}` ({who}) `{test}`: {gone} (listed: skips `{start}`: {why})")
     if stale:
-        all_ok = False
         lines.append("### Known-failure entries to remove (their test did not fail or skip itself so)")
         lines.append("")
         lines.extend(stale)
@@ -1548,13 +1696,36 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     lines.append("|---|---|---|---|---|---|")
     for r in sorted(results, key=lambda r: -r["seconds"])[:60]:
         lines.append(f"| {r['row']} | `{r['unit']}` | {r['who']} | {r['status']} | {r['seconds']:.0f} | {r['exit']} |")
+    # The verdict over the rows that ran (KNOWN counts as a pass, as the run's colour does), in one JSON
+    # line that a reader can parse: the step summary's line here, and the file SC_VERDICT names, which
+    # sami-checks.yml gives as the summary job's output `verdict`, a notice and sc-report's verdict.json.
+    # A planted run is a control, so it fails whether or not its control caught the plant (plant_caught
+    # says which). A subset run says so: only a run of every row is a pass of the cut checks.
+    not_run = [k for k in ROW_KEYS if k not in run_rows]
+    shown = [v for v in row_verdicts.values() if v != "NOT RUN"]
+    verdict = "FAIL" if "FAIL" in shown or stale or plant else "UNKNOWN" if "UNKNOWN" in shown else "PASS"
+    record = {"commit": commit, "verdict": verdict, "subset": bool(not_run),
+              "rows_run": [k for k in ROW_KEYS if k in run_rows], "rows_not_run": not_run,
+              "rows": {k: row_verdicts[k] for k in ROW_KEYS if k in row_verdicts},
+              "plant": plant or None, "plant_caught": caught}
+    line = json.dumps(record, separators=(",", ":"))
+    if not_run:
+        top += [f"**A subset of the rows**: {len(run_rows)} of {len(ROW_KEYS)} rows ran ({', '.join(record['rows_run'])}); "
+                f"the other {len(not_run)} read NOT RUN. The verdict covers only the rows that ran: this run is no pass "
+                "of the cut checks, which only a run of every row gives (the push of release-candidate, or a dispatch "
+                "with rows=all).", ""]
+    lines[2:2] = [f"sami-checks verdict: `{line}`", ""] + top
+    if os.environ.get("SC_VERDICT"):
+        with open(os.environ["SC_VERDICT"], "w", encoding="utf-8") as f:
+            f.write(line + "\n")
     print("\n".join(lines))
-    return 0 if all_ok else 1
+    return 0 if verdict == "PASS" else 1
 
 
 def selftest():
     import contextlib
     import io
+    import shutil
     import tempfile
 
     d = tempfile.mkdtemp()
@@ -1886,10 +2057,19 @@ def selftest():
     known_file = os.path.join(d, "known.txt")
     open(known_file, "w").write("# none\n")
 
-    def summary():
+    def summary(rust="rust_test=success rust_test_macos=success"):
+        """cmd_summary on res, with rust as SC_RUST_TESTS (as sami-checks.yml always passes it), or without it for None."""
+        kept = os.environ.pop("SC_RUST_TESTS", None)
+        if rust is not None:
+            os.environ["SC_RUST_TESTS"] = rust
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc = cmd_summary(res, build, known_file)
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = cmd_summary(res, build, known_file)
+        finally:
+            os.environ.pop("SC_RUST_TESTS", None)
+            if kept is not None:
+                os.environ["SC_RUST_TESTS"] = kept
         return rc, buf.getvalue()
 
     rc, out = summary()
@@ -1973,20 +2153,17 @@ def selftest():
     rc, out = summary()
     check("a listed test that passed is to be removed", ("`p`: passed (listed for: fixed since)" in out, rc), (True, 1))
     # The Rust tests' rows, from their two jobs' conclusions: success passes, failure fails, and a
-    # missing, cancelled or skipped result is UNKNOWN. Without SC_RUST_TESTS there is no Rust row.
+    # missing, cancelled or skipped result is UNKNOWN; so is each Rust row when SC_RUST_TESTS is absent.
     open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
-    rc, out = summary()
-    check("no Rust rows without SC_RUST_TESTS", ("| Rust tests" in out, rc), (False, 0))
-    os.environ["SC_RUST_TESTS"] = "rust_test=success rust_test_macos=success"
+    rc, out = summary(rust=None)
+    check("Rust rows UNKNOWN without SC_RUST_TESTS", (f"| {RUST_JOBS[0][0]} | **UNKNOWN** |" in out,
+          f"| {RUST_JOBS[1][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, True, 1))
     rc, out = summary()
     check("both Rust jobs passed", (f"| {RUST_JOBS[0][0]} | **PASS** |" in out, f"| {RUST_JOBS[1][0]} | **PASS** |" in out, rc), (True, True, 0))
-    os.environ["SC_RUST_TESTS"] = "rust_test=failure rust_test_macos=cancelled"
-    rc, out = summary()
+    rc, out = summary(rust="rust_test=failure rust_test_macos=cancelled")
     check("a failed and a cancelled Rust job", (f"| {RUST_JOBS[0][0]} | **FAIL** |" in out, f"| {RUST_JOBS[1][0]} | **UNKNOWN** |" in out, rc), (True, True, 1))
-    os.environ["SC_RUST_TESTS"] = "rust_test= rust_test_macos=skipped"
-    rc, out = summary()
+    rc, out = summary(rust="rust_test= rust_test_macos=skipped")
     check("a Rust job with no result", (f"| {RUST_JOBS[0][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, 1))
-    del os.environ["SC_RUST_TESTS"]
     # A flaky entry (its reason starts `flaky: `): its failure reads KNOWN only when the test passed in
     # a retry of its whole unit in the same job (the unit's command again: the same binary or filter,
     # threads and user), and NEW when no retry ran, every retry failed, or it passed only in a retry
@@ -2506,25 +2683,92 @@ def selftest():
     r = ctl(list(ORPHAN_CONTROL_TESTS[1:]))
     check("a control test that did not run is UNKNOWN and named",
           (r["status"], r["note"].endswith(ORPHAN_CONTROL_TESTS[0].rsplit("::", 1)[-1])), ("UNKNOWN", True))
-    # The docs and changelog rows. The plan takes `plant` as docs, changelog or nothing.
-    for plant_in, ok in (("", True), ("docs", True), ("changelog", True), ("both", False)):
-        env = dict(GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_REF="refs/heads/x", SC_INPUT_COMMIT="a" * 40,
-                   SC_INPUT_SILENT="", SC_INPUT_PLANT=plant_in)
+    # The plan: cmd_plan's outputs for a dispatch with these inputs, or the message it stopped with.
+    def plan_out(rows="all", silent="", plant="", event="workflow_dispatch", ref="refs/heads/x"):
+        env = dict(GITHUB_EVENT_NAME=event, GITHUB_REF=ref, GITHUB_SHA="b" * 40, SC_INPUT_COMMIT="a" * 40,
+                   SC_INPUT_ROWS=rows, SC_INPUT_SILENT=silent, SC_INPUT_PLANT=plant)
         kept_env = {k: os.environ.get(k) for k in env}
         os.environ.update(env)
         buf = io.StringIO()
         try:
-            with contextlib.redirect_stdout(buf):
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
                 cmd_plan()
-            got = f"plant={plant_in}" in buf.getvalue().splitlines()
-        except SystemExit:
-            got = False
-        for k, v in kept_env.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-        check(f"plan with plant={plant_in!r}", got, ok)
+            return dict(line.split("=", 1) for line in buf.getvalue().splitlines())
+        except SystemExit as e:
+            return str(e.code)
+        finally:
+            for k, v in kept_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    # The docs and changelog rows. The plan takes `plant` as docs, changelog or nothing.
+    for plant_in, ok in (("", True), ("docs", True), ("changelog", True), ("both", False)):
+        r = plan_out(plant=plant_in)
+        check(f"plan with plant={plant_in!r}", isinstance(r, dict) and r.get("plant") == plant_in, ok)
+    # The row selection (the dispatch input `rows`). Each job of sami-checks.yml but the plan and the
+    # summary runs only when the plan names it in `jobs`, and some row's work reaches it.
+    wf = workflow_jobs()
+    gated = [j for j in wf if j not in ALWAYS_JOBS]
+    check("plan: each row has its work", sorted(row_work()), sorted(ROW_KEYS))
+    check("plan: each job's if: holds its gate", [j for j in gated if gate(j) not in wf[j]["if"]], [])
+    check("plan: each job needs the plan", [j for j in gated if "plan" not in wf[j]["needs"]], [])
+    check("plan: the summary needs each job", [j for j in gated if j not in wf["summary"]["needs"]], [])
+    check("plan: every row reaches every job", plan_rows(ROW_KEYS, wf)[2], gated)
+    r = plan_out(rows="docs,nosuch")
+    check("plan: a row name that is no row fails, naming it and listing the rows",
+          (isinstance(r, str), "'nosuch'" in r, all(k in r for k in ROW_KEYS)), (True, True, True))
+    r = plan_out(rows="all,docs")
+    check("plan: all stands alone", (isinstance(r, str), "'all'" in r), (True, True))
+    full = dict(commit="a" * 40, rows=",".join(ROW_KEYS), jobs=json.dumps(gated), silent="", plant="",
+                set=json.dumps(set_matrix()), builtins=json.dumps(builtins_matrix()), workspace=json.dumps(workspace_matrix()),
+                ts=json.dumps(ts_matrix()), gvisor=json.dumps(gvisor_matrix()), platforms=",".join(PLATFORMS))
+
+    def picked(r):
+        return {k: r.get(k) for k in full} if isinstance(r, dict) else r
+
+    check("plan: a dispatch with rows=all runs every row and every job", picked(plan_out()), full)
+    check("plan: the cut tests the pushed commit with every row and no control, whatever the inputs say",
+          picked(plan_out(rows="docs", silent="docs", plant="docs", event="push", ref="refs/heads/release-candidate")),
+          dict(full, commit="b" * 40))
+    r = plan_out(event="push", ref="refs/heads/feat/sami-checks")
+    check("plan: a push of another branch plans nothing", (isinstance(r, str), "not on push of refs/heads/feat/sami-checks" in r), (True, True))
+    # A prerequisite build runs only for a row whose job needs it (its needs: in sami-checks.yml).
+    for rows, want_rows, want_jobs in (
+            ("docs,changelog", "docs,changelog", ["docs", "changelog"]),
+            ("ts-ca", "ts-ca", ["natives", "ts-ca"]),
+            ("set-root", "set-runner,set-root,lib4", ["tools", "build", "set"]),
+            ("lib4", "set-runner,set-root,lib4", ["tools", "build", "set"]),
+            ("rust_test", "rust_test,rust_test_macos", ["natives", "rust-test"]),
+            ("gv-orphan-root", "gv-set-uid1000,gv-set-root,gv-lib4-uid1000,gv-lib4-root,gv-orphan-uid1000,gv-orphan-root",
+             ["tools", "build", "gvisor"]),
+            ("skipforms", "set-runner,set-root,lib4,builtins,workspace,ts-small,ts-ca,skipforms," + ",".join(
+                k for k in ROW_KEYS if k.startswith("gv-")),
+             ["tools", "build", "natives", "set", "builtins", "workspace", "ts-small", "ts-ca", "gvisor", "skip-forms"]),
+            ("windows", "windows", ["platforms"])):
+        r = plan_out(rows=rows)
+        check(f"plan: rows={rows} runs its rows and the jobs they need, and no other",
+              (r.get("rows"), json.loads(r.get("jobs", "null"))) if isinstance(r, dict) else r, (want_rows, want_jobs))
+    r = plan_out(rows="set-root,gv-builtins-uid1000,windows")
+    check("plan: the matrices hold only the selected rows' entries",
+          (r.get("set"), r.get("gvisor"), r.get("platforms"), r.get("builtins")) if isinstance(r, dict) else r,
+          (json.dumps(set_matrix()), json.dumps([m for m in gvisor_matrix() if m["part"] == "builtins"]), "windows", "[]"))
+    # The control: the same rows under a workflow whose docs job needs a build that needs the tools.
+    fake = os.path.join(d, "fake-workflow.yml")
+    open(fake, "w").write("jobs:\n  plan: {}\n  tools:\n    needs: plan\n  build:\n    needs: [plan, tools]\n"
+                          "  docs:\n    needs: [plan, build]\n  summary:\n    needs: [plan, tools, build, docs]\n")
+    check("plan: the jobs come from the workflow's needs (a docs job that needs a build)",
+          plan_rows(["docs"], workflow_jobs(fake))[1:], (["docs"], ["tools", "build", "docs"]))
+    # A control must be in the run: a plant or a silent job of a row it does not run fails the plan.
+    for rows, silent, plant, ok in (("changelog", "", "docs", False), ("docs", "", "docs", True),
+                                    ("docs", "set-root-2", "", False), ("set-root", "set-root-2", "", True),
+                                    ("windows", "macos-bash", "", False), ("macos", "macos-bash", "", True),
+                                    ("docs", "platforms", "", False), ("windows", "platforms", "", True)):
+        r = plan_out(rows=rows, silent=silent, plant=plant)
+        check(f"plan: rows={rows} with silent={silent!r} plant={plant!r}",
+              (r.get("silent"), r.get("plant")) if isinstance(r, dict) else "does not run" in r and repr(silent or plant) in r,
+              (silent, plant) if ok else True)
     check("docs and changelog are job names silent takes", {"docs", "changelog"} <= set(all_job_names()), True)
     # Each plant lands where the job's tool reads it.
     ptree = os.path.join(d, "ptree")
@@ -2554,15 +2798,35 @@ def selftest():
     for i, (row, unit, who) in enumerate(expected_units(build2)[0]):
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1), open(os.path.join(res2, f"{i}.json"), "w"))
 
-    def summary2(drop=(), plant_env=""):
+    def summary2(drop=(), plant_env="", rows_env=None, known_path=None, rust_env="rust_test=success rust_test_macos=success"):
+        """cmd_summary on res2; with rows_env, rust_env as SC_ROWS, SC_RUST_TESTS (None: unset). Its verdict line is in vfile."""
         for k in drop:
             os.remove(os.path.join(res2, k))
-        os.environ["SC_PLANT"] = plant_env
+        if os.path.exists(vfile):
+            os.remove(vfile)
+        env = dict(SC_PLANT=plant_env, SC_VERDICT=vfile, SC_ROWS=rows_env, SC_RUST_TESTS=rust_env)
+        kept_env = {k: os.environ.get(k) for k in env}
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc2 = cmd_summary(res2, build2, known2)
-        os.environ.pop("SC_PLANT")
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc2 = cmd_summary(res2, build2, known_path or known2)
+        finally:
+            for k, v in kept_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
         return rc2, buf.getvalue()
+
+    vfile = os.path.join(d, "verdict.json")
+
+    def verdict_record():
+        return json.load(open(vfile)) if os.path.exists(vfile) else {}
 
     # parse_docs on cargo's own JSON lines, cut to the fields it reads: run 45370356750 (85936bf7),
     # run 45370374136 (plant=docs), and cargo doc of a crate that imports a crate that does not exist.
@@ -2680,6 +2944,55 @@ def selftest():
     rc, out = summary2()
     check("summary: docs and changelog rows pass", ("| rustdoc intra-doc links (pi-shell) | **PASS** | 2 / 0 / 0 / 0 |" in out,
           "| CHANGELOG format (fix-changelogs --check) | **PASS** | 1 / 0 / 0 / 0 |" in out, rc), (True, True, 0))
+    # A subset run: each row it did not run reads NOT RUN (never PASS, never absent), its top says it
+    # covered a subset, and its verdict line names the rows that ran, those that did not, and the
+    # verdict over the first.
+    all_titles = ROWS + RUST_JOBS
+    ran = ("docs", "changelog")
+    rc, out = summary2(rows_env="docs,changelog", rust_env="rust_test=skipped rust_test_macos=skipped")
+    check("summary: each row a subset run did not run reads NOT RUN",
+          [k for t, k in all_titles if (f"| {t} | **NOT RUN** | - | - | - |" in out) == (k in ran)], [])
+    check("summary: only the rows a subset run ran read PASS",
+          [k for t, k in all_titles if f"| {t} | **PASS** |" in out], list(ran))
+    check("summary: a subset run says so at its top, and passes over the rows it ran",
+          (f"**A subset of the rows**: 2 of {len(ROW_KEYS)} rows ran (docs, changelog); the other {len(ROW_KEYS) - 2} read NOT RUN." in out, rc),
+          (True, 0))
+    rec = verdict_record()
+    check("summary: a subset run's verdict line",
+          (out.splitlines()[2:3] == [f"sami-checks verdict: `{json.dumps(rec, separators=(',', ':'))}`"],
+           {k: rec.get(k) for k in ("verdict", "subset", "rows_run", "rows_not_run", "plant", "plant_caught")},
+           rec.get("rows", {}).get("docs"), rec.get("rows", {}).get("set-runner"), rec.get("rows", {}).get("rust_test_macos")),
+          (True, {"verdict": "PASS", "subset": True, "rows_run": list(ran), "rows_not_run": [k for k in ROW_KEYS if k not in ran],
+                  "plant": None, "plant_caught": None}, "PASS", "NOT RUN", "NOT RUN"))
+    rc, out = summary2(rust_env="rust_test=success rust_test_macos=success")
+    rec = verdict_record()
+    check("summary: a run of every row has no NOT RUN row and is no subset",
+          ("NOT RUN" in out, "A subset of the rows" in out, rec.get("verdict"), rec.get("subset"), rec.get("rows_not_run"),
+           rec.get("rows_run") == list(ROW_KEYS), list(rec.get("rows", {})) == list(ROW_KEYS), rc),
+          (False, False, "PASS", False, [], True, True, 0))
+    # The Rust rows without their jobs' conclusions: each selected one reads UNKNOWN, never absent.
+    rc, out = summary2(rows_env="rust_test,rust_test_macos", rust_env=None)
+    rec = verdict_record()
+    check("summary: a selected Rust row with no conclusion reads UNKNOWN",
+          (rec.get("verdict"), rec.get("rows_run"), {k: rec.get("rows", {}).get(k) for k in ("rust_test", "rust_test_macos")}, rc),
+          ("UNKNOWN", ["rust_test", "rust_test_macos"], {"rust_test": "UNKNOWN", "rust_test_macos": "UNKNOWN"}, 1))
+    rc, out = summary2(rust_env=None)
+    rec = verdict_record()
+    check("summary: a run of every row with no Rust conclusion is UNKNOWN, each row named",
+          (rec.get("verdict"), list(rec.get("rows", {})) == list(ROW_KEYS), rc), ("UNKNOWN", True, 1))
+    rc, out = summary2(rows_env="docs", plant_env="docs")
+    rec = verdict_record()
+    check("summary: a planted subset run fails, and its verdict line says whether the control caught the plant",
+          tuple(rec.get(k) for k in ("verdict", "subset", "rows_run", "plant", "plant_caught")) + (rc,),
+          ("FAIL", True, ["docs"], "docs", False, 1))
+    # A known-failure entry of a row the run did not run is not listed for removal: its unit did not report.
+    set_unit = next(e for e in expected_units(build2)[0] if e[0] == "set-runner")
+    known3 = os.path.join(d, "known3.txt")
+    open(known3, "w").write(f"set-runner\trunner\t{set_unit[1]}\tno::such_test\tgone from the tree\n")
+    rc, out = summary2(known_path=known3)
+    check("summary: a known entry whose test is gone is listed (the control)", ("`no::such_test`: no longer in its unit" in out, rc), (True, 1))
+    rc, out = summary2(known_path=known3, rows_env="docs,changelog")
+    check("summary: a known entry of a row the run did not run is not listed", ("no::such_test" in out, rc), (False, 0))
     rc, out = summary2(plant_env="docs")
     check("summary: a planted docs run whose row passed", ("**Planted run (`plant=docs`)**" in out,
           "**THE CONTROL FAILED**: the row reads PASS, and these units do not read FAIL naming `NoSuchItemPlanted`: "
@@ -2720,6 +3033,82 @@ def selftest():
           "| CHANGELOG format (fix-changelogs --check) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
           "`public` (runner): UNKNOWN: no result" in out, "`private` (runner): UNKNOWN: no result" in out,
           "`changelogs` (runner): UNKNOWN: no result" in out, rc), (True, True, True, True, True, 1))
+    # A row reads the same in a run of that row alone as in a run of every row of the same commit. The
+    # summary step is run as the workflow runs it, on the results the planned rows' jobs upload: each
+    # row's unit results, the passing tests' output of each row that has some (TEST_OUTPUT_ROWS), and
+    # the skip prints row's run-time unit (sc.py skip-lines) computed on what is there. Among the rows:
+    # a failed set unit, an UNKNOWN workspace unit, the docs and changelog rows with no result, and a
+    # failed Rust job, beside passing rows. Each row's subset is what the plan runs for it.
+    for i, f in enumerate(sorted(os.listdir(res2))):
+        r = json.load(open(os.path.join(res2, f)))
+        if r["row"] == "set-runner" and i % 2 == 0:
+            json.dump(dict(r, status="FAIL", failed=1, failures=["x::y"]), open(os.path.join(res2, f), "w"))
+        elif r["row"] == "workspace":
+            json.dump(dict(r, status="UNKNOWN", note="the time bound ended it"), open(os.path.join(res2, f), "w"))
+        elif (r["row"], r["unit"]) == ("skipforms", "runtime"):
+            os.remove(os.path.join(res2, f))
+    # A test that skipped itself as one user and passed as the other, on the same runtime: covered, so
+    # its unit passes, but only where the other user's row ran too.
+    for skipper, passer in (("set-runner", "set-root"), ("lib4", "set-root"), ("gv-set-uid1000", "gv-set-root"),
+                            ("gv-lib4-root", "gv-set-uid1000"), ("gv-builtins-uid1000", "gv-builtins-root")):
+        rs = {f: json.load(open(os.path.join(res2, f))) for f in sorted(os.listdir(res2))}
+        f, r = next((f, r) for f, r in rs.items() if r["row"] == skipper and r["status"] == "PASS")
+        name = f"cover::{skipper}"
+        json.dump(dict(r, status="UNKNOWN", skip_only=True, self_skipped=[name], tests=[[name, 1.0]]),
+                  open(os.path.join(res2, f), "w"))
+        g, s = next((g, s) for g, s in rs.items() if s["row"] == passer and s["unit"] == r["unit"])
+        json.dump(dict(s, tests=s["tests"] + [[name, 1.0]]), open(os.path.join(res2, g), "w"))
+    outputs = os.path.join(d, "outputs")
+    for k in TEST_OUTPUT_ROWS:
+        os.makedirs(os.path.join(outputs, k))
+        open(os.path.join(outputs, k, "t.junit.xml"), "w").write(
+            f'<testsuites><testsuite name="{k}"><testcase classname="{k}" name="t" time="1"/></testsuite></testsuites>')
+    no_exceptions = os.path.join(d, "no-exceptions.txt")
+    open(no_exceptions, "w").write("# none\n")
+    title_of = {k: t for t, k in ROWS + RUST_JOBS}
+
+    def step(rows):
+        """(each row's verdict, each row's table line) in the summary step of a run of these rows."""
+        sub = os.path.join(d, "step")
+        shutil.rmtree(sub, ignore_errors=True)
+        os.makedirs(os.path.join(sub, "sc-skip-lines"))
+        for f in os.listdir(res2):
+            if json.load(open(os.path.join(res2, f)))["row"] in rows:
+                shutil.copy(os.path.join(res2, f), sub)
+        for k in TEST_OUTPUT_ROWS:
+            if k in rows:
+                shutil.copytree(os.path.join(outputs, k), os.path.join(sub, "out-" + k))
+        json.dump(cmd_skip_lines(sub, no_exceptions), open(os.path.join(sub, "sc-skip-lines", "skip-lines.json"), "w"))
+        env = dict(SC_PLANT="", SC_VERDICT=vfile, SC_ROWS=",".join(rows), SC_RUST_TESTS="rust_test=failure rust_test_macos=success")
+        kept_env = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        if os.path.exists(vfile):
+            os.remove(vfile)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                cmd_summary(sub, build2, known2)
+        finally:
+            for k, v in kept_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        got = verdict_record().get("rows", {})
+        lines = {k: ln for ln in buf.getvalue().splitlines() for k, t in title_of.items() if ln.startswith(f"| {t} | **")}
+        return {r: got.get(r) for r in rows}, {r: lines.get(r) for r in rows}
+
+    full_v, full_l = step(list(ROW_KEYS))
+    differ = []
+    for k in ROW_KEYS:
+        sub_rows = plan_rows([k], wf)[1]
+        v, ln = step(sub_rows)
+        differ += [f"rows={k}: {r} reads {v[r]} alone, {full_v[r]} in the full run" for r in sub_rows
+                   if v[r] != full_v[r] or ln[r] != full_l[r]]
+    check("summary: each row reads the same alone as in a run of every row", (differ, sorted(set(full_v.values()))),
+          ([], ["FAIL", "PASS", "UNKNOWN"]))
+    check("summary: the skip prints row's run-time unit read every test row's output in the full run",
+          full_v.get("skipforms"), "PASS")
 
     if fails:
         for f in fails:
@@ -2729,8 +3118,9 @@ def selftest():
           "platform report reader, the tree's real skip lines and partial passes, the shard assignment and "
           "per-user weights, the summary's UNKNOWN for a unit no job or two jobs reported, the known and flaky "
           "entries, skip-forms and skip-lines with their controls, the gVisor rows and their known skips, the "
-          "docs and changelog rows with their planted controls, and the Rust tests' rows from their jobs' "
-          "conclusions")
+          "docs and changelog rows with their planted controls, the Rust tests' rows from their jobs' "
+          "conclusions, the row selection (its jobs from the workflow's needs, the cut's every row, a control "
+          "on a row that does not run), and the summary's NOT RUN rows and verdict line")
 
 
 # The docs row (docs.sh): `cargo doc --no-deps -p pi-shell` with -D rustdoc::broken_intra_doc_links,
