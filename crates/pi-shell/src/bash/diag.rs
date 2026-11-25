@@ -10,7 +10,7 @@ use std::{borrow::Cow, fmt, io};
 
 use bstr::BString;
 
-use crate::bash::{event::Origin, fd::BadFd};
+use crate::bash::fd::BadFd;
 
 /// A diagnostic, by catalog entry.
 #[derive(Debug, thiserror::Error, strum::EnumDiscriminants)]
@@ -553,8 +553,11 @@ const fn posix_text(kind: io::ErrorKind) -> Option<&'static str> {
 pub struct DiagSite<'a> {
 	/// `$0` (bash uses it as the message prefix).
 	pub shell_name: &'a [u8],
-	/// Origin of the running script.
-	pub origin:     &'a Origin,
+	/// The input name a syntax error prints after `shell_name` (bash's
+	/// `parser_error`, which prints it only when it is not the error name):
+	/// `-c` for a `-c` string; none for a script or a `.` file being read,
+	/// whose name is the error name.
+	pub input:      Option<&'a [u8]>,
 	/// Current line.
 	pub line:       u32,
 	/// The locale is UTF-8 (which bytes print as they are in names).
@@ -563,8 +566,9 @@ pub struct DiagSite<'a> {
 
 /// The full stderr line for `diag` printed at `site`, newline included.
 ///
-/// Runtime errors print as `name: line N: msg`; syntax errors in a `-c`
-/// string print as `name: -c: line N: msg`, as bash 5.3 does.
+/// Runtime errors print as `name: line N: msg`; syntax errors print the
+/// input name too when there is one (`name: -c: line N: msg`), as bash 5.3
+/// does.
 pub fn render(diag: &Diag, site: DiagSite<'_>) -> Vec<u8> {
 	use std::io::Write;
 
@@ -597,8 +601,9 @@ pub fn render(diag: &Diag, site: DiagSite<'_>) -> Vec<u8> {
 		out.push(b'\n');
 		return out;
 	}
-	if syntax && matches!(site.origin, Origin::Command) {
-		out.extend_from_slice(b": -c");
+	if syntax && let Some(input) = site.input {
+		out.extend_from_slice(b": ");
+		out.extend_from_slice(input);
 	}
 	out.extend_from_slice(b": line ");
 	out.extend_from_slice(site.line.format_into(&mut fmt::NumBuffer::new()).as_bytes());
