@@ -3855,6 +3855,10 @@ fn bash_names_the_line_at_the_fork_for_a_compound_redirection_error() {
 	const X: &str = ">/nonexistent-dir/x";
 	let err =
 		|line: u32| format!("bash: line {line}: /nonexistent-dir/x: No such file or directory\n");
+	// A `( … )` in a function, its own redirections a here-document and `X`.
+	let doc_after = |body: &str, line: u32| {
+		(format!("f() {{\n:\n{body}\n) <<E {X} | :\nz\nE\n}}\nf 2>&1; echo end"), line)
+	};
 	let more = [
 		(format!("f() {{\n( (\n:\n) {X}\n) | :\n}}\nf 2>&1; echo end"), 5),
 		(format!(":\n( ( : ) {X}\n) | :\necho end"), 3),
@@ -3894,6 +3898,44 @@ fn bash_names_the_line_at_the_fork_for_a_compound_redirection_error() {
 		(format!(":\n( :\n) <<\"E F\" {X}\nx\nE F\necho end"), 3),
 		(format!("f() {{\n:\n( :\n) {{fd}}{X} | :\n}}\nf 2>&1; echo end"), 4),
 		(format!("f() {{\n:\n( :\n) {{fd}}<<\"E F\" {X} | :\nx\nE F\n}}\nf 2>&1; echo end"), 4),
+		// A backslash escapes nothing in single quotes or after another, and
+		// `\"` stays in a double-quoted delimiter: the `)` is not looked for
+		// back over a here-document's delimiter.
+		(format!("f() {{\n:\n( : ) <<'E\\' {X} | :\nx\nE\\\n}}\nf 2>&1; echo end"), 3),
+		(format!("f() {{\n:\n( :\n) <<'E\\' {X} | :\nx\nE\\\n}}\nf 2>&1; echo end"), 4),
+		(format!(":\n( :\n) <<'E\\' {X}\nx\nE\\\necho end"), 3),
+		(format!("f() {{\n:\n( : ) <<\"E\\\\\" {X} | :\nx\nE\\\n}}\nf 2>&1; echo end"), 3),
+		(format!("f() {{\n:\n( :\n) <<\"E\\\\\" {X} | :\nx\nE\\\n}}\nf 2>&1; echo end"), 4),
+		(format!("f() {{\n:\n( :\n) <<'a b\\' {X} | :\nx\na b\\\n}}\nf 2>&1; echo end"), 4),
+		(format!("f() {{\n:\n( echo 'y'\n) <<'E\\' {X} | :\nx\nE\\\n}}\nf 2>&1; echo end"), 4),
+		(format!("f() {{\n:\n( :\n) <<\"\\\\\" {X} | :\nx\n\\\n}}\nf 2>&1; echo end"), 4),
+		(format!("f() {{\n:\n( : ) <<\"E\\\"F\" {X} | :\nx\nE\"F\n}}\nf 2>&1; echo end"), 3),
+		(format!("f() {{\n:\n( :\n) <<\"E\\\"F\" {X} | :\nx\nE\"F\n}}\nf 2>&1; echo end"), 4),
+		// So with a here-document after the `)`, the `)` is found forward
+		// from the body's last command, over the bodies of the here-documents
+		// its line opened: two commands', a loop's after its body's, a `<<-`
+		// one's with tabs, a body line that is `)`, an unquoted body's
+		// `\`newline, a quoted body's backslash, a function's defined there
+		// (in a function, and at the top, whose function bodies are compiled
+		// at their first call); not an earlier line's, nor one in a `$( )`;
+		// a newline in a quoted word, in an arithmetic `for` header or in a
+		// function body compiled at its first call ends no line. Else back
+		// over the redirections' words and fds, whatever the body holds.
+		doc_after("( cat <<A; cat <<B\nx\nA\ny\nB", 8),
+		doc_after("( while read l; do cat <<A; done <<B\nx\nA\ny\nB", 8),
+		doc_after("( cat <<-A # c\n\tx\n\tA", 6),
+		doc_after("( cat <<A\n)\nA", 6),
+		doc_after("( cat <<A\nx\\\ny\nA", 7),
+		doc_after("( cat <<'A'\nx\\\nA", 6),
+		doc_after("( g() { cat <<A; }\nx\nA", 6),
+		(format!(":\n( g() {{ cat <<A; }}\nx\nA\n) <<E {X}\nz\nE\necho end"), 5),
+		doc_after("( cat <<A\nx\nA\n: <<B\ny\nB", 9),
+		doc_after("( echo $(cat <<A\nx\nA\n)", 7),
+		doc_after("( cat <<A; echo \"a\nb\" >/dev/null\nx\nA", 7),
+		doc_after("( cat <<A; for ((i=0;\ni<1;i++)); do :; done\nx\nA", 7),
+		(format!(":\n( g() {{ cat <<A; echo \"a\nb\"; }}\nx\nA\n) <<E {X}\nz\nE\necho end"), 6),
+		(format!("f() {{\n:\n( g() {{ cat <<A; }}\nx\nA\n) {X} | :\n}}\nf 2>&1; echo end"), 6),
+		(format!("f() {{\n:\n( :\n) 2{X} | :\n}}\nf 2>&1; echo end"), 4),
 	];
 	let rows = rows
 		.into_iter()
@@ -4064,8 +4106,10 @@ fn zsh_wait_reads_each_operand_at_its_turn() {
 		.collect(),
 	);
 	// A trapped signal ends the wait for one operand; zsh goes on with the
-	// next one, the status so far 128 + the signal (`bin_fg`). The sender
-	// stays alive: one that ends at once races zsh's own `SIGCHLD`.
+	// next one, the status so far 128 + the signal (`bin_fg`), which ends
+	// the command where no later operand replaces it (a pid operand of a
+	// running job is not waited for once it is not 0). The sender stays
+	// alive: one that ends at once races zsh's own `SIGCHLD`.
 	let usr1 = "(/bin/sleep 0.3; kill -USR1 $$; exec /bin/sleep 4) >/dev/null 2>&1 & k=$!; \
 	            /bin/sleep 1.5 & p=$!;";
 	let not_one = "zsh:wait:2: pid 1 is not a child of this shell\na=127\n";
@@ -4077,6 +4121,9 @@ fn zsh_wait_reads_each_operand_at_its_turn() {
 			("trap 'echo T' USR1", "$p %2", "a=0\n"),
 			("trap 'echo T' USR1", "%2 1", not_one),
 			("TRAPUSR1() { echo T; }", "%2 %2", "a=0\n"),
+			("trap 'echo T' USR1", "$p", "a=138\n"),
+			("trap 'echo T' USR1", "%2 $p", "a=138\n"),
+			("trap 'echo T' USR1", "$p $p", "a=138\n"),
 		]
 		.into_iter()
 		.map(|(trap, ops, out)| {

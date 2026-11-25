@@ -2,6 +2,7 @@
 //! per-op semantics, and frame control (calls, returns, unwinding).
 
 use std::{
+	borrow::Cow,
 	collections::HashMap,
 	fmt::NumBuffer,
 	sync::Arc,
@@ -2155,26 +2156,137 @@ fn unforked(u: &Unit, node: u32) -> Unforked {
 	Unforked::No
 }
 
-/// The byte of `( … )` `node`'s `)`: the node ends with it, or with the
-/// redirections after it, back over which it is found (a here-document's
-/// body comes after the line, out of the node).
+/// The byte of `( … )` `node`'s `)`. The node ends with it, or with the
+/// redirections after it. When each of those targets a word, the parser
+/// recorded where the word starts, and the `)` is found back over them
+/// ([`back_over_words`]), whatever the body holds. A here-document's
+/// delimiter has no such record, and quoting cannot be read backward, so
+/// with one among them the `)` is the first after the last syntax node of
+/// its body (the ops between its `Redir` and `PopRedir` run it), found
+/// forward over what can stand between a list's last command and its `)`
+/// ([`after_list`]).
 fn close_paren(u: &Unit, node: u32) -> Option<usize> {
 	let n = u.nodes.get(node as usize)?;
-	let src: &[u8] = &u.source;
-	let redirs = u
+	let redir = u
 		.ops
 		.iter()
-		.find(|op| op.code == Opcode::Redir && op.node == node)
-		.and_then(|op| u.redirs.get(op.a as usize));
-	let mut at = n.hi as usize;
-	for r in redirs.into_iter().flatten().rev() {
-		at = skip_back(src, at);
-		at = match &r.target {
-			ir::RedirTargetIr::Word(w) => {
-				u.nodes.get(u.words.get(*w as usize)?.node as usize)?.lo as usize
+		.enumerate()
+		.find(|(_, op)| op.code == Opcode::Redir && op.node == node);
+	let at = if let Some((pc, op)) = redir {
+		let redirs = u.redirs.get(op.a as usize)?;
+		if redirs
+			.iter()
+			.all(|r| matches!(r.target, ir::RedirTargetIr::Word(_)))
+		{
+			return back_over_words(u, n.hi as usize, redirs);
+		}
+		let body = u.ops.get(pc + 1..op.b as usize)?;
+		let inside = |m: &&ir::NodeInfo| m.lo > n.lo && m.hi <= n.hi;
+		let end = body
+			.iter()
+			.filter(|o| o.node != node)
+			.filter_map(|o| u.nodes.get(o.node as usize))
+			.filter(inside)
+			.map(|m| m.hi)
+			.max()? as usize;
+		// The body's here-documents, in the order of their operators: a
+		// command's come after those of the commands it holds, which end
+		// before it.
+		let mut docs = Vec::new();
+		here_docs(u, body, &inside, &mut docs);
+		docs.sort_by_key(|d| (d.hi, d.at));
+		// The bodies after the line are those of a run of the last
+		// here-documents. A body starts after the first newline that follows
+		// its operator, so those with no newline at all from their command's
+		// end to `end` are in it. Whether an earlier newline is one a body can
+		// follow (not one in a quoted word or a `$( )`) is quoting, which is
+		// not read here: the run grows back from those, one document at a
+		// time, until its bodies match the source and the scan reaches a `)`.
+		let src: &[u8] = &u.source;
+		let surely = docs
+			.iter()
+			.take_while(|d| {
+				src.get(d.hi as usize..end)
+					.is_some_and(|s| s.contains(&b'\n'))
+			})
+			.count();
+		(0..=surely).rev().find_map(|k| {
+			let at = after_list(src, end, docs[k..].iter().map(|d| (&*d.text, d.quoted)))?;
+			(src.get(at) == Some(&b')')).then_some(at)
+		})?
+	} else {
+		(n.hi as usize).checked_sub(1)?
+	};
+	(u.source.get(at) == Some(&b')')).then_some(at)
+}
+
+/// A here-document in a `( … )`'s body ([`here_docs`]).
+struct Doc<'u> {
+	/// Where its command ends.
+	hi:     u32,
+	/// Its place in the command's redirection list.
+	at:     usize,
+	text:   Cow<'u, [u8]>,
+	quoted: bool,
+}
+
+/// The here-documents of `ops`, ops of unit `u`, of commands whose nodes
+/// pass `inside`. A function defined there adds its body's (the body's unit
+/// shares `u`'s source and node ids), compiled here if it is compiled only
+/// at its first call.
+fn here_docs<'u>(
+	u: &'u Unit,
+	ops: &[Op],
+	inside: &dyn Fn(&&ir::NodeInfo) -> bool,
+	docs: &mut Vec<Doc<'u>>,
+) {
+	for o in ops {
+		let list = match o.code {
+			Opcode::Exec => u.cmds.get(o.a as usize).and_then(|c| c.redirs),
+			Opcode::Redir => Some(o.a),
+			Opcode::FuncDef => {
+				let Some(f) = u.funcs.get(o.a as usize) else {
+					continue;
+				};
+				if f.body.deferred.is_none() {
+					here_docs(&f.body, &f.body.ops, inside, docs);
+				} else if let Some(body) = ir::materialize(&f.body, false) {
+					let mut own = Vec::new();
+					here_docs(&body, &body.ops, inside, &mut own);
+					docs.extend(own.into_iter().map(|d| Doc {
+						hi:     d.hi,
+						at:     d.at,
+						text:   Cow::Owned(d.text.into_owned()),
+						quoted: d.quoted,
+					}));
+				}
+				continue;
 			},
-			ir::RedirTargetIr::HereDoc { .. } => word_back(src, at),
+			_ => continue,
 		};
+		let Some(m) = u.nodes.get(o.node as usize).filter(inside) else {
+			continue;
+		};
+		let list = list.and_then(|l| u.redirs.get(l as usize));
+		for (at, r) in list.into_iter().flatten().enumerate() {
+			if let ir::RedirTargetIr::HereDoc { text, quoted } = &r.target {
+				let text: &[u8] = text;
+				docs.push(Doc { hi: m.hi, at, text: Cow::Borrowed(text), quoted: *quoted });
+			}
+		}
+	}
+}
+
+/// The `)` before redirections `redirs`, which end at `at` and each target
+/// a word: from where the parser recorded the word starts, back over its
+/// operator and fd. `None` where no `)` is found so.
+fn back_over_words(u: &Unit, mut at: usize, redirs: &[ir::RedirIr]) -> Option<usize> {
+	let src: &[u8] = &u.source;
+	for r in redirs.iter().rev() {
+		let ir::RedirTargetIr::Word(w) = &r.target else {
+			return None;
+		};
+		at = u.nodes.get(u.words.get(*w as usize)?.node as usize)?.lo as usize;
 		at = op_back(src, skip_back(src, at));
 	}
 	let at = skip_back(src, at).checked_sub(1)?;
@@ -2194,31 +2306,10 @@ const fn skip_back(src: &[u8], mut at: usize) -> usize {
 	at
 }
 
-/// `at`, moved back over the word that ends there (a here-document's
-/// delimiter), a quoted part whole and a backslash-escaped character with
-/// its backslash.
-fn word_back(src: &[u8], mut at: usize) -> usize {
-	while let Some(&c) = at.checked_sub(1).and_then(|i| src.get(i)) {
-		if at >= 2 && src[at - 2] == b'\\' {
-			at -= 2;
-			continue;
-		}
-		match c {
-			b'\'' | b'"' => match src[..at - 1].iter().rposition(|&q| q == c) {
-				Some(open) => at = open,
-				None => break,
-			},
-			b' ' | b'\t' | b'\n' | b'<' | b'>' | b'&' | b'|' | b';' | b'(' | b')' => break,
-			_ => at -= 1,
-		}
-	}
-	at
-}
-
 /// `at`, moved back over a redirection's operator and its fd (`2>&`,
-/// `<<-`, `&>>`, `>|`, `{fd}>`).
+/// `&>>`, `>|`, `{fd}>`).
 fn op_back(src: &[u8], mut at: usize) -> usize {
-	while at > 0 && matches!(src[at - 1], b'<' | b'>' | b'&' | b'|' | b'-') {
+	while at > 0 && matches!(src[at - 1], b'<' | b'>' | b'&' | b'|') {
 		at -= 1;
 	}
 	if at > 0 && src[at - 1] == b'}' {
@@ -2231,6 +2322,102 @@ fn op_back(src: &[u8], mut at: usize) -> usize {
 		}
 	}
 	at
+}
+
+/// `at`, moved on over blanks, `;`, `&`, comments, newlines and
+/// backslash-newlines (what can stand between a list's last command and
+/// the `)` that ends it), and at the first newline over the bodies of
+/// here-documents `docs` (text, quoted), each with its delimiter's line.
+/// Each line of a body, read as bash reads it ([`DocLine`]), is that of the
+/// document's stored text, with leading tabs for `<<-`, else `None`.
+fn after_list<'a>(
+	src: &[u8],
+	mut at: usize,
+	docs: impl Iterator<Item = (&'a [u8], bool)>,
+) -> Option<usize> {
+	let mut docs = Some(docs);
+	while let Some(&c) = src.get(at) {
+		match c {
+			b' ' | b'\t' | b';' | b'&' => at += 1,
+			b'\\' if src.get(at + 1) == Some(&b'\n') => at += 2,
+			b'#' => {
+				while src.get(at).is_some_and(|&c| c != b'\n') {
+					at += 1;
+				}
+			},
+			b'\n' => {
+				at += 1;
+				for (text, quoted) in docs.take().into_iter().flatten() {
+					for want in text.lines_with_terminator() {
+						let line = DocLine::new(src, at, !quoted);
+						let want = want.iter().copied();
+						if !(line.clone().eq(want.clone())
+							|| line.clone().skip_while(|&c| c == b'\t').eq(want))
+						{
+							return None;
+						}
+						at = line.end();
+					}
+					at = DocLine::new(src, at, !quoted).end();
+				}
+			},
+			_ => break,
+		}
+	}
+	Some(at)
+}
+
+/// One line of a here-document's body as bash reads it (`read_a_line`; the
+/// parser's `read_doc_line`): its bytes from `at` through its newline, a NUL
+/// dropped and, in an unquoted document, a `\`newline removed.
+#[derive(Clone)]
+struct DocLine<'s> {
+	src:      &'s [u8],
+	at:       usize,
+	unquoted: bool,
+	/// The byte after a backslash kept with it.
+	held:     Option<u8>,
+	done:     bool,
+}
+
+impl<'s> DocLine<'s> {
+	const fn new(src: &'s [u8], at: usize, unquoted: bool) -> Self {
+		Self { src, at, unquoted, held: None, done: false }
+	}
+
+	/// Where the next line starts.
+	fn end(mut self) -> usize {
+		self.by_ref().for_each(drop);
+		self.at
+	}
+}
+
+impl Iterator for DocLine<'_> {
+	type Item = u8;
+
+	fn next(&mut self) -> Option<u8> {
+		if let Some(c) = self.held.take() {
+			return Some(c);
+		}
+		while !self.done {
+			let c = *self.src.get(self.at)?;
+			self.at += 1;
+			match c {
+				0 => {},
+				b'\\' if self.unquoted && self.src.get(self.at) == Some(&b'\n') => self.at += 1,
+				b'\\' if self.unquoted => {
+					self.held = self.src.get(self.at).copied();
+					self.at += usize::from(self.held.is_some());
+					return Some(c);
+				},
+				_ => {
+					self.done = c == b'\n';
+					return Some(c);
+				},
+			}
+		}
+		None
+	}
 }
 
 /// The line bash reports for an error of a compound command (a failed

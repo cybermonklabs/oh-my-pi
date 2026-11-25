@@ -718,9 +718,11 @@ const fn zsh_in_table(j: &crate::bash::vm::proc::Job) -> bool {
 
 /// zsh `getjob` and `bin_fg`'s in-use check for `wait SPEC`: the job's
 /// vpid, or `None` after zsh's warning (silent under `posixbuiltins`). A
-/// finished job is gone from zsh's table ([`zsh_in_table`]), so `%%`,
-/// `%+`, `%-` and `%N` naming none are `SPEC: no such job`; a name or
-/// `%?text` matching none is `job not found: …`.
+/// finished job is gone from zsh's table ([`zsh_in_table`]), so `%N`
+/// naming none is `SPEC: no such job`, and `%%`, `%+` (`%`) and `%-` are
+/// `no current job` and `no previous job` once no job is left in it, else
+/// `SPEC: no such job`; a name or `%?text` matching none is `job not
+/// found: …`.
 fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, super::Need> {
 	let rest = word.strip_prefix(b"%").unwrap_or(word);
 	let found = match ctx.vp.jobs.lookup(rest) {
