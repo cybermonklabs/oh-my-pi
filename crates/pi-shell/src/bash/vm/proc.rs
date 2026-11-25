@@ -2015,6 +2015,16 @@ pub struct ExecState {
 	/// program are this vproc's, which ends with the command; the shell
 	/// that forked it reports it.
 	pub apart:       bool,
+	/// The command is a jobspec taken at its redirections
+	/// (`command::jobspec_command`): bash runs `fg` (`bg` for a lone
+	/// `%job &`) and makes none of them. Not set for a jobspec the
+	/// `command` builtin runs, whose own redirections bash makes first.
+	/// Not imaged: it is set at that check and cleared once the dispatch
+	/// has read it, in the same step of the command (the check, the lookup
+	/// and the dispatch, with no wait between), so it is never alive at an
+	/// image; `frames::scratch_image` asserts that.
+	#[serde(skip)]
+	pub jobspec:     bool,
 }
 
 /// A `{var}` redirection bash makes in a `( … )`'s fork: the fd, and the

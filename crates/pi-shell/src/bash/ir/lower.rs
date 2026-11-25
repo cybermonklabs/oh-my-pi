@@ -419,6 +419,23 @@ fn take_body(unit: Unit, root: u32) -> Option<Unit> {
 	None
 }
 
+/// The simple command `ao` is made of alone (one pipeline of one stage, not
+/// timed; `!` allowed): what bash runs as a simple command when the list
+/// item is in the background.
+fn lone_simple(ao: st::AndOr<'_>) -> Option<st::Simple<'_>> {
+	if ao.rest().len() > 0 {
+		return None;
+	}
+	let p = ao.first();
+	if p.time().is_some() {
+		return None;
+	}
+	match p.stages().one()?.kind() {
+		st::CommandKind::Simple(s) => Some(s),
+		_ => None,
+	}
+}
+
 struct Lower {
 	unit:          Unit,
 	source_hash:   blake3::Hasher,
@@ -442,6 +459,10 @@ struct Lower {
 	/// substitution body: its words are [`WordKind::Text`] (no tilde
 	/// expansion).
 	text:          bool,
+	/// Operand `b` of the next simple command's `Exec` ([`Op::EXEC_FORKED`],
+	/// [`Op::EXEC_ASYNC`]): taken by [`Self::command`] before its words are
+	/// lowered.
+	exec_b:        u32,
 }
 
 /// The line starts of a unit's source (unit-relative offsets), scanned on
@@ -512,6 +533,7 @@ impl Lower {
 			async_bang: false,
 			features,
 			text: false,
+			exec_b: 0,
 		}
 	}
 
@@ -573,35 +595,64 @@ impl Lower {
 			// end marker, where a skipped list goes), one with `b` 2 its end.
 			let start = zsh.then(|| self.emit(Opcode::Nop, 0, Op::LIST_START, ao_id));
 			if matches!(sep, syn::Sep::Amp | syn::Sep::Disown) {
-				let spawn = self.unit.spawns.len() as u32;
-				self.unit.spawns.push(SpawnIr {
-					kind:   SpawnKind::Background,
-					stages: Vec::new(),
-					end:    0,
-				});
-				let at = self.emit(Opcode::Spawn, spawn, 0, ao_id);
-				// zsh `&|` / `&!`: disowned at once.
-				if sep == syn::Sep::Disown {
-					self.unit.ops[at as usize].flags |= Op::DISOWN;
+				// bash `execute_simple_command`: a lone simple command in the
+				// background is forked, unless its first word as written starts
+				// with `%`: then `%job &` resumes the job in the background,
+				// here.
+				let lone = if zsh { None } else { lone_simple(ao) };
+				if lone.is_some_and(Self::starts_with_jobspec) {
+					self.exec_b = Op::EXEC_ASYNC;
+					self.and_or(ao)?;
+				} else {
+					let spawn = self.unit.spawns.len() as u32;
+					self.unit.spawns.push(SpawnIr {
+						kind:   SpawnKind::Background,
+						stages: Vec::new(),
+						end:    0,
+					});
+					let at = self.emit(Opcode::Spawn, spawn, 0, ao_id);
+					// zsh `&|` / `&!`: disowned at once.
+					if sep == syn::Sep::Disown {
+						self.unit.ops[at as usize].flags |= Op::DISOWN;
+					}
+					let entry = self.here();
+					if lone.is_some() {
+						self.exec_b = Op::EXEC_FORKED;
+					}
+					// bash and zsh do not apply a background job's `!` to the job's
+					// status (bash's asynchronous child clears `CMD_INVERT_RETURN`,
+					// `execute_cmd.c:1597`); zsh 5.9 inverts a timed one.
+					let first = ao.first();
+					self.async_bang =
+						ao.rest().len() == 0 && first.bang() && !(zsh && first.time().is_some());
+					// The shell still takes that `!` when `extdebug` skips the job
+					// before it forks: the `Spawn` says the job had one.
+					if self.async_bang {
+						self.unit.ops[at as usize].flags |= Op::NEGATED;
+					}
+					self.and_or(ao)?;
+					// bash runs a pipeline that is the whole item asynchronously,
+					// every stage forked (`execute_pipeline`); `&&`/`||` and
+					// `time` (whose `TimeStart` opens the item) fork a subshell
+					// first, where `lastpipe` holds.
+					if !zsh
+						&& ao.rest().next().is_none()
+						&& let Some(op) = self.unit.ops.get_mut(entry as usize)
+						&& op.code == Opcode::Spawn
+						&& self
+							.unit
+							.spawns
+							.get(op.a as usize)
+							.is_some_and(|s| s.kind == SpawnKind::Pipeline)
+					{
+						op.b |= Op::ASYNC_PIPELINE;
+					}
+					self.emit(Opcode::SubExit, 0, 0, ao_id);
+					let end = self.here();
+					let s = &mut self.unit.spawns[spawn as usize];
+					s.stages.push(StageIr { entry, pipe_stderr: false });
+					s.end = end;
 				}
-				let entry = self.here();
-				// bash and zsh do not apply a background job's `!` to the job's
-				// status (bash's asynchronous child clears `CMD_INVERT_RETURN`,
-				// `execute_cmd.c:1597`); zsh 5.9 inverts a timed one.
-				let first = ao.first();
-				self.async_bang =
-					ao.rest().len() == 0 && first.bang() && !(zsh && first.time().is_some());
-				// The shell still takes that `!` when `extdebug` skips the job
-				// before it forks: the `Spawn` says the job had one.
-				if self.async_bang {
-					self.unit.ops[at as usize].flags |= Op::NEGATED;
-				}
-				self.and_or(ao)?;
-				self.emit(Opcode::SubExit, 0, 0, ao_id);
-				let end = self.here();
-				let s = &mut self.unit.spawns[spawn as usize];
-				s.stages.push(StageIr { entry, pipe_stderr: false });
-				s.end = end;
 			} else {
 				self.and_or(ao)?;
 			}
@@ -611,6 +662,21 @@ impl Lower {
 			}
 		}
 		Ok(())
+	}
+
+	/// Whether simple command `s`'s first word (an assignment counts) starts
+	/// with `%`: bash's test on the parsed, unexpanded words, after alias
+	/// substitution (an alias `j=%1` makes `j &` a jobspec; `"%1"` is none).
+	fn starts_with_jobspec(s: st::Simple<'_>) -> bool {
+		if !s.assigns().is_empty() {
+			return false;
+		}
+		s.words().first().is_some_and(|w| {
+			matches!(
+				w.parts().first().map(st::WordPart::get),
+				Some(st::Part::Lit(b)) if b.starts_with(b"%")
+			)
+		})
 	}
 
 	fn and_or(&mut self, ao: st::AndOr<'_>) -> R {
@@ -662,6 +728,12 @@ impl Lower {
 			let mut irs = Vec::with_capacity(stages.len());
 			for stage in stages {
 				irs.push(StageIr { entry: self.here(), pipe_stderr: stage.pipe_stderr() });
+				// bash forks each stage; a simple command runs in its child.
+				if self.unit.mode.dialect() != crate::bash::ids::Dialect::Zsh
+					&& matches!(stage.kind(), st::CommandKind::Simple(_))
+				{
+					self.exec_b = Op::EXEC_FORKED;
+				}
 				self.command(stage)?;
 				self.emit(Opcode::SubExit, 0, 0, stage.id().0);
 			}
@@ -696,6 +768,7 @@ impl Lower {
 		let id = cmd.id().0;
 		let redirs = cmd.redirs();
 		if let st::CommandKind::Simple(s) = cmd.kind() {
+			let b = std::mem::take(&mut self.exec_b);
 			self.node(cmd.id(), NodeKind::Simple, cmd.span());
 			let redirs = if redirs.is_empty() {
 				None
@@ -703,7 +776,7 @@ impl Lower {
 				Some(self.redir_list(redirs)?)
 			};
 			let c = self.simple(s, redirs)?;
-			self.emit(Opcode::Exec, c, 0, id);
+			self.emit(Opcode::Exec, c, b, id);
 			return Ok(());
 		}
 		let redir = if redirs.is_empty() {
@@ -1062,6 +1135,7 @@ impl Lower {
 			async_bang:    false,
 			features:      self.features,
 			text:          false,
+			exec_b:        0,
 		};
 		sub.command(cmd)?;
 		sub.emit(Opcode::End, 0, 0, root);

@@ -423,6 +423,14 @@ fn scratch_image(
 	fds: &mut FdImager,
 ) -> ScratchImage {
 	let exec = sc.exec.as_ref().map(|e| {
+		// `ExecState::jobspec` is not imaged: it is set and read in one step of
+		// the command, with no wait between. A wait added there would make it
+		// live across an image, and the restored jobspec would make the
+		// redirections bash never makes.
+		debug_assert!(
+			!e.jobspec,
+			"ExecState::jobspec is set at an image; it is not imaged (serde skip)"
+		);
 		let mut state = ExecState::clone(e);
 		match &mut sc.live {
 			Live::Task(task) => {

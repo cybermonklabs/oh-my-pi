@@ -5377,7 +5377,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 	if !started {
 		// Every child it starts needs a vpid: none is built unless all fit
 		// (a pipeline counts each stage but one run in the shell itself).
-		let here = info.kind == SpawnKind::Pipeline && last_stage_here(k, cx, vp, unit);
+		let here = info.kind == SpawnKind::Pipeline && last_stage_here(k, cx, vp, unit, op);
 		let needed = u32::try_from(info.stages.len() - usize::from(here)).unwrap_or(u32::MAX);
 		if let Some(flow) = fork_failed(k, vp, cx, needed, line_of(vp, op.node)) {
 			return flow;
@@ -5501,7 +5501,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 			SpawnKind::Pipeline => {
 				let n = info.stages.len();
 				let tap = cx.host.pipe_tap();
-				let lastpipe = last_stage_here(k, cx, vp, unit);
+				let lastpipe = last_stage_here(k, cx, vp, unit, op);
 				let mut stdin = vp.fds.get(0).cloned();
 				// An async pipeline's elements sit at the job's level.
 				let async_elements = async_pipeline(unit, op.a as usize);
@@ -5713,13 +5713,17 @@ pub(super) fn job_text(
 }
 
 /// Whether a pipeline's last stage runs in the shell itself: bash
-/// `lastpipe` without job control; zsh's always, but under sh emulation
-/// (`execcmd_exec`'s `last1 == 2 && input && EMULATION(EMULATE_SH)`).
-fn last_stage_here(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, unit: &Unit) -> bool {
+/// `lastpipe` without job control, unless bash runs the pipeline
+/// asynchronously (the whole background item, [`Op::ASYNC_PIPELINE`] on
+/// its `Spawn` `op`): it forks every stage. zsh's always, but under sh
+/// emulation (`execcmd_exec`'s `last1 == 2 && input &&
+/// EMULATION(EMULATE_SH)`).
+fn last_stage_here(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, unit: &Unit, op: Op) -> bool {
 	if unit.mode.dialect() == Dialect::Zsh {
 		vp.mode != ModeId::ZshSh
 	} else {
-		state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
+		op.b & Op::ASYNC_PIPELINE == 0
+			&& state::option(&mut k.root, cx.store, vp, OptId::Lastpipe).unwrap_or(false)
 			&& !job_control(k, cx, vp)
 	}
 }
