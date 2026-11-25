@@ -701,7 +701,7 @@ describe("pickElectronTarget", () => {
 	test.skipIf(process.platform !== "linux")("adopts no profile lock that names another host", async () => {
 		await withLockedProfile({}, async ({ launcher, profile, pid, port }) => {
 			const appArgs = [`--user-data-dir=${profile}`];
-			// Control: the lock as the browser wrote it is adopted.
+			// Control: the lock as written is adopted.
 			expect(await findReusableCdp(launcher, { appArgs })).toEqual({ cdpUrl: `http://127.0.0.1:${port}`, pid });
 			// The same pid on another host is another process.
 			const lockPath = path.join(profile, "SingletonLock");
@@ -716,12 +716,19 @@ describe("pickElectronTarget", () => {
 		async () => {
 			// A stale lock's pid can belong by now to a browser of another name on another profile: that browser
 			// holds nothing the caller asked for, so the call returns null rather than refusing it as the holder.
-			await withLockedProfile({ name: "brave" }, async ({ launcher, profile, pid }) => {
+			await withLockedProfile({ name: "brave" }, async ({ launcher, profile, pid, port }) => {
+				// Control: a request for brave, through a launcher of that name, adopts this browser by its own lock.
+				const braveLauncher = path.join(path.dirname(profile), "brave");
+				await Bun.write(braveLauncher, new Uint8Array([0x7f, 0x45, 0x4c, 0x46]));
+				await fs.chmod(braveLauncher, 0o755);
+				expect(await findReusableCdp(braveLauncher, { appArgs: [`--user-data-dir=${profile}`] })).toEqual({
+					cdpUrl: `http://127.0.0.1:${port}`,
+					pid,
+				});
 				const other = path.join(path.dirname(profile), "other");
 				await fs.mkdir(other);
 				await fs.symlink(`${os.hostname()}-${pid}`, path.join(other, "SingletonLock"));
-				// Control: the browser runs, on the first profile.
-				expect((await fs.readFile(`/proc/${pid}/cmdline`, "utf8")).includes(`--user-data-dir=${profile}`)).toBe(true);
+				// A chromium request for the other profile: only the argv-profile check keeps brave from being its holder.
 				expect(await findReusableCdp(launcher, { appArgs: [`--user-data-dir=${other}`] })).toBeNull();
 			});
 		},
