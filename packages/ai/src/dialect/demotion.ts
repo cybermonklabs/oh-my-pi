@@ -13,10 +13,15 @@ import { getDialectDefinition } from "./factory";
  * reasoning inside `<thinking>` / `antml:thinking` tags — it reads the
  * wrapped chain-of-thought as an attempt to duplicate model outputs and
  * refuses (Fable) or leaks it as visible reasoning (Opus / Sonnet / Haiku /
- * Mythos). Every Anthropic-dialect Claude model therefore receives prior
+ * Mythos). An Anthropic-dialect Claude model therefore receives demoted
  * reasoning as bare assistant prose: no tag, no wrapper, no trailing newline.
- * Heat is cumulative (block count and early-conversation position also raise
- * it), so this lowers per-block signal but does not license unbounded replay.
+ * That is only for its own reasoning a host cannot replay natively: the same
+ * classifier refuses another model's reasoning as bare prose too, so
+ * `transformMessages` sends Claude none of another model's thinking as text
+ * (`dropsForeignThinking`, keyed on the `classifier-cot-extraction` catalog
+ * axis). Heat is cumulative (block count and early-conversation position also
+ * raise it), so bare prose lowers per-block signal but does not license
+ * unbounded replay.
  *
  * Harmony and Gemma are the other exceptions: their `renderThinking` emits
  * chat-template control tokens (`<|channel|>analysis`, `<|channel>thought`)

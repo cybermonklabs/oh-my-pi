@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as path from "node:path";
 import type { Api, AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
+import { convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { adoptFactoryReplay } from "@oh-my-pi/pi-ai/providers/factory-droid/gemini";
 import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { convertMessages } from "@oh-my-pi/pi-ai/providers/openai-completions";
@@ -518,6 +519,100 @@ describe("chat-completions history estimate", () => {
 	});
 });
 
+// Contract: Claude gets none of another model's thinking that it would read as
+// text (`dropsForeignThinking`), and the estimate leaves out exactly what the
+// request leaves out; thinking the request carries still counts.
+describe("Claude history estimate", () => {
+	const THINKING = "Let me reason about the parser carefully. ".repeat(400);
+	const toolCall = { type: "toolCall", id: "toolu_1", name: "read", arguments: { path: "a.ts" } } as const;
+	const claude = buildModel({
+		id: "claude-opus-4-8",
+		name: "Claude Opus 4.8",
+		api: "anthropic-messages",
+		provider: "anthropic",
+		baseUrl: "https://api.anthropic.com",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 32_000,
+	});
+	const tokenizer = new Tokenizer(claude);
+	const floor = { excludeEncryptedReasoning: true };
+
+	function thinkingTurn(source: Pick<AssistantMessage, "api" | "provider" | "model">, signature: string) {
+		return {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: THINKING, thinkingSignature: signature }, toolCall],
+			...source,
+			usage: {
+				input: 100,
+				output: 3_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 3_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 1,
+		} satisfies AssistantMessage;
+	}
+
+	const toolCallOnly = tokenizer.countMessage({
+		...thinkingTurn({ api: "anthropic-messages", provider: "anthropic", model: claude.id }, "x"),
+		content: [toolCall],
+	});
+
+	test.each([
+		{
+			name: "its own signed turn",
+			source: { api: "anthropic-messages", provider: "anthropic", model: "claude-opus-4-8" },
+			signature: "sig_own",
+			carried: true,
+		},
+		{
+			name: "another Claude model's signed turn on the same deployment",
+			source: { api: "anthropic-messages", provider: "anthropic", model: "claude-sonnet-4-6" },
+			signature: "sig_sonnet",
+			carried: true,
+		},
+		{
+			name: "another model's turn on another wire",
+			source: { api: "openai-completions", provider: "vertex", model: "google/gemini-3.1-pro-preview" },
+			signature: "reasoning_content",
+			carried: false,
+		},
+		{
+			name: "another model's signed turn on another Anthropic Messages host",
+			source: { api: "anthropic-messages", provider: "kimi-code", model: "k3" },
+			signature: "kimi-issued-signature",
+			carried: false,
+		},
+	] as const)("counts thinking only when a request carries it: $name", ({ source, signature, carried }) => {
+		const turn = thinkingTurn(source, signature);
+		const params = convertAnthropicMessages(
+			[
+				{ role: "user", content: "Fix the parser.", timestamp: 0 },
+				turn,
+				{
+					role: "toolResult",
+					toolCallId: "toolu_1",
+					toolName: "read",
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+			claude,
+			false,
+		);
+		const sent = JSON.stringify(params).includes(THINKING.trim());
+		const counted = tokenizer.countMessage(turn, floor) > toolCallOnly;
+		expect({ sent, counted }).toEqual({ sent: carried, counted: carried });
+		if (!carried) expect(tokenizer.countMessage(turn)).toBe(toolCallOnly);
+	});
+});
+
 // Contract: a replayed signed thinking block costs what the reading model bills
 // for it: Claude rebuilds the full reasoning from the signature and bills it at
 // the size the turn billed as output; other readers are charged the
@@ -590,18 +685,29 @@ describe("countMessage replayed thinking", () => {
 	});
 
 	test.each([
-		// A signature is bound to the deployment that minted it.
+		// A signature is bound to the deployment that minted it, and Claude gets
+		// none of that thinking as text (`dropsForeignThinking`).
 		["a turn from another host", bedrockOpus, opus],
-		// Bedrock binds it to the model too: another model's turn replays as text.
+		// Bedrock binds it to the model too.
 		[
 			"another Claude model's turn on Bedrock",
 			bedrockOpus,
 			reader("amazon-bedrock", "global.anthropic.claude-opus-5"),
 		],
+	] as const)("charges only the answer for %s, neither its thinking nor its signature", (_case, model, from) => {
+		const tokenizer = new Tokenizer(model);
+		const answerOnly = tokenizer.countMessage({
+			...signedTurn(from, VISIBLE),
+			content: [{ type: "text", text: "Done." }],
+		});
+		expect(answerOnly).toBeGreaterThan(0);
+		expect(tokenizer.countMessage(signedTurn(from, VISIBLE, SIGNATURE))).toBe(answerOnly);
+	});
+
+	test("charges only the visible blocks for a reader that filters reasoning history, never the signature", () => {
 		// OpenRouter filters reasoning history out of the request.
-		["a reader that filters reasoning history", openRouterOpus, openRouterOpus],
-	] as const)("charges only the visible blocks for %s, never the signature", (_case, model, from) => {
-		expect(new Tokenizer(model).countMessage(signedTurn(from, VISIBLE, SIGNATURE))).toBe(VISIBLE_TOKENS);
+		const tokenizer = new Tokenizer(openRouterOpus);
+		expect(tokenizer.countMessage(signedTurn(openRouterOpus, VISIBLE, SIGNATURE))).toBe(VISIBLE_TOKENS);
 	});
 
 	test("charges only the visible thinking of an aborted turn's final, partly signed block", () => {

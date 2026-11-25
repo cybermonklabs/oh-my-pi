@@ -10,6 +10,7 @@ import type {
 	ProviderSessionState,
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 
 /**
  * Regression for the failover-proxy death loop: a gateway that routes a
@@ -35,7 +36,12 @@ const model: Model<"anthropic-messages"> = buildModel({
 	maxTokens: 8_192,
 });
 
-/** A sibling Claude on the same custom deployment, reached by a model fallback hop. */
+/**
+ * A sibling Claude on the same prefix-bound deployment, reached by a model
+ * fallback hop. Such a deployment is the one custom host that still receives a
+ * sibling model's signed thinking (`dropsForeignThinking`); any other custom
+ * host gets none of it.
+ */
 const siblingModel: Model<"anthropic-messages"> = buildModel({
 	id: "work2/claude-opus-4-8",
 	name: "Opus 4.8 (W2)",
@@ -43,6 +49,7 @@ const siblingModel: Model<"anthropic-messages"> = buildModel({
 	provider: "work2",
 	baseUrl: "https://dev.work2.im",
 	reasoning: true,
+	thinking: { mode: "anthropic-adaptive", efforts: [Effort.Medium], prefixBinding: true },
 	input: ["text"],
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 200_000,
@@ -296,12 +303,12 @@ describe("anthropic-messages foreign-signed thinking escalation", () => {
 
 	it("recovers a same-deployment model switch whose latest turn carries a sibling model's signature", async () => {
 		// A model fallback hop (e.g. the classifier-refusal walk) can move a
-		// conversation to another Claude on the same custom deployment. The
-		// latest turn keeps its signature on the wire — Anthropic's rule for its
-		// own most recent response — so a proxy that will not verify a sibling
-		// model's signature 400s. The escalation must cover that cross-model
-		// replay too, or the hop dead-ends on `Invalid signature in thinking
-		// block` instead of answering.
+		// conversation to another Claude on the same prefix-bound deployment.
+		// The latest turn keeps its signature on the wire — Anthropic's rule for
+		// its own most recent response — so a proxy that will not verify a
+		// sibling model's signature 400s. The escalation must cover that
+		// cross-model replay too, or the hop dead-ends on `Invalid signature in
+		// thinking block` instead of answering.
 		const providerSessionState = new Map<string, ProviderSessionState>();
 		const capturedPayloads: unknown[] = [];
 		let attempt = 0;

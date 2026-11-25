@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { carriesReasoning } from "@oh-my-pi/pi-catalog/compat/reasoning-carry";
-import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
+import type { CatalogPolicyInputs, ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { renderDemotedThinking } from "../dialect/demotion";
 import type {
 	Api,
@@ -14,13 +14,7 @@ import type {
 	ToolResultMessage,
 	UserMessage,
 } from "../types";
-import {
-	isDemotedThinking,
-	kCarriedReasoning,
-	kDemotedThinking,
-	kSyntheticUser,
-	type SyntheticUserCarrier,
-} from "../utils/block-symbols";
+import { kCarriedReasoning, kDemotedThinking, kSyntheticUser, type SyntheticUserCarrier } from "../utils/block-symbols";
 
 const enum ToolCallStatus {
 	/** A tool result has already been emitted for this tool call; later duplicates must be skipped. */
@@ -608,6 +602,47 @@ export function dropsForeignReasoningPayload(
 }
 
 /**
+ * Whether `turn` comes from the same Anthropic Messages deployment as
+ * `model`: the same provider on first-party Anthropic or on a prefix-bound
+ * host, where another model's signature still verifies.
+ */
+function sharesAnthropicDeployment(
+	turn: Pick<AssistantMessage, "provider" | "api">,
+	model: Pick<Model, "provider" | "api" | "thinking"> & { compat?: Model["compat"] },
+): boolean {
+	if (model.api !== "anthropic-messages" || turn.api !== "anthropic-messages") return false;
+	if (turn.provider !== model.provider) return false;
+	const compat = model.compat;
+	return (
+		(compat !== undefined && "officialEndpoint" in compat && compat.officialEndpoint === true) ||
+		model.thinking?.prefixBinding === true
+	);
+}
+
+/**
+ * Whether {@link transformMessages} drops a thinking block of `turn` on its
+ * way to `model` because `model`'s input classifier refuses reasoning quoted
+ * back to it as text (the `classifier-cot-extraction` catalog axis, set for
+ * Claude): Claude refuses a request whose earlier turns carry another model's
+ * reasoning as plain assistant prose (`reasoning_extraction`). Such a target
+ * gets another model's thinking only as a block signed on its own Anthropic
+ * deployment (`signed`: the block keeps a signature, or is redacted
+ * thinking), which replays natively; anything else of it would arrive as
+ * text and is dropped. That model's answers and tool calls stay. Context
+ * estimates count a turn's thinking by this same answer.
+ */
+export function dropsForeignThinking(
+	turn: Pick<AssistantMessage, "provider" | "api" | "model">,
+	model: CatalogPolicyInputs & { compat?: Model["compat"] },
+	signed: boolean,
+): boolean {
+	if ((DIRECT_REPLAY_APIS as Partial<Record<Api, boolean>>)[model.api] !== true) return false;
+	if (isSameModelTurn(turn, model)) return false;
+	if (resolveCatalogPolicy(model).classifierCotExtraction !== true) return false;
+	return !signed || !sharesAnthropicDeployment(turn, model);
+}
+
+/**
  * Targets that have proven they read unsigned foreign thinking when replayed
  * natively. This is a semantic-carry allowlist only: OpenAI-compatible
  * `reasoning_content` schema requirements and llama.cpp cache-prefix replay are
@@ -1022,10 +1057,7 @@ export function transformMessages<TApi extends Api>(
 			// anthropic-messages providers configured via `models.yaml` and
 			// session-level model swaps (#2257).
 			const isAnthropicReplay = isAnthropicTarget && assistantMsg.api === "anthropic-messages";
-			const sameAnthropicDeployment =
-				isAnthropicReplay &&
-				assistantMsg.provider === model.provider &&
-				(model.compat.officialEndpoint || model.thinking?.prefixBinding === true);
+			const sameAnthropicDeployment = sharesAnthropicDeployment(assistantMsg, model);
 			const isLatestSurvivingAssistant = index === latestSurvivingAssistantIndex;
 			// Signature policy is a second axis. Anthropic cryptographically
 			// binds reasoning signatures to its deployment and model lineage.
@@ -1121,6 +1153,14 @@ export function transformMessages<TApi extends Api>(
 
 			const transformedContent = assistantMsg.content.flatMap((block, blockIndex) => {
 				if (foreignCredential && (block.type === "thinking" || block.type === "redactedThinking")) return [];
+				// Another model's thinking that a classifier target would read as text.
+				if (
+					block.type === "thinking" &&
+					dropsForeignThinking(assistantMsg, model, Boolean(block.thinkingSignature?.trim()))
+				) {
+					return [];
+				}
+				if (block.type === "redactedThinking" && dropsForeignThinking(assistantMsg, model, true)) return [];
 				if (
 					invalidBoundThinkingAssistantIndexes.has(index) &&
 					(block.type === "thinking" || block.type === "redactedThinking")
@@ -1220,14 +1260,13 @@ export function transformMessages<TApi extends Api>(
 					// Mark the demoted block (symbol-keyed, never serialized) instead of
 					// baking a separator into its text: the openai-completions flatten —
 					// the one consumer that joins adjacent text blocks into a single
-					// string — inserts a paragraph break after marked blocks, so the
-					// bare Anthropic-dialect output (or any dialect's wrapped output
-					// whose closing tag isn't a natural word boundary) can't glue onto
-					// the following visible-text block, while ordinary adjacent text
-					// blocks stitched from streaming / bridges / imported transcripts
-					// stay byte-identical. A separator baked into the block text would
-					// leak to non-flattening targets: Anthropic/Bedrock reject a
-					// terminal assistant message whose text ends with whitespace.
+					// string — inserts a paragraph break after marked blocks, so a
+					// dialect's wrapped output whose closing tag isn't a natural word
+					// boundary can't glue onto the following visible-text block, while
+					// ordinary adjacent text blocks stitched from streaming / bridges /
+					// imported transcripts stay byte-identical. A separator baked into
+					// the block text would leak to non-flattening targets: Anthropic/Bedrock
+					// reject a terminal assistant message whose text ends with whitespace.
 					return {
 						type: "text" as const,
 						text: renderDemotedThinking(model.id, sanitized.thinking),
@@ -1343,28 +1382,30 @@ export function transformMessages<TApi extends Api>(
 				return block;
 			});
 
-			// A demoted-thinking block that survived as the message's final block can
-			// still end with the thinking text's own trailing whitespace (bare
-			// Anthropic-dialect demotion copies it verbatim), and Anthropic rejects a
-			// terminal assistant message whose text ends with trailing whitespace
-			// ("final assistant content cannot end with trailing whitespace").
-			// trimEnd() is safe: demoted text is synthesized context, never
-			// byte-exact replay material.
-			const finalBlock = transformedContent[transformedContent.length - 1];
-			if (finalBlock?.type === "text" && isDemotedThinking(finalBlock)) {
-				transformedContent[transformedContent.length - 1] = { ...finalBlock, text: finalBlock.text.trimEnd() };
-			}
+			// A signature stripped above leaves a kept block of another model's to
+			// be written as text by the encoder; `dropsForeignThinking` drops it.
+			const content = isSameModel
+				? transformedContent
+				: transformedContent.filter(
+						block =>
+							block.type !== "thinking" ||
+							!dropsForeignThinking(
+								assistantMsg,
+								model,
+								"thinkingSignature" in block && Boolean(block.thinkingSignature?.trim()),
+							),
+					);
 
 			// Record this turn's tool-call ids into the origin scope. Origin scope
 			// must be complete before dedup reads it: filled here off the SAME
 			// post-transform content this map emits, in document order, and never
 			// read inside the map — so by the time the dedup pass consults it the
 			// sets hold every assistant id, never a partial build.
-			recordToolCallOriginScope(assistantMsg, transformedContent, responsesComponents, opaqueCompositeCallIds);
+			recordToolCallOriginScope(assistantMsg, content, responsesComponents, opaqueCompositeCallIds);
 
 			return {
 				...assistantMsg,
-				content: transformedContent,
+				content,
 			};
 		}
 		return msg;
