@@ -3816,9 +3816,18 @@ export class SessionManager {
 		await this.#writeTitleSlot(update);
 	}
 
-	/** Write `update` into the title slot in place on the disk queue; when that fails, rewrite the whole file. */
+	/**
+	 * Write `update` into the title slot in place on the disk queue. When that
+	 * fails, rewrite the whole file as any full rewrite does
+	 * ({@link #rewriteAtomically}), once that disk work settled: it waits for a
+	 * recovery in flight, the entries recorded meanwhile follow it as one
+	 * append, and it settles with a recovery it hands its refusal to. A write
+	 * that moved the disk epoch meanwhile (a synchronous rewrite, a repair)
+	 * already published the header, and with it the title.
+	 */
 	async #writeTitleSlot(update: SessionTitleUpdate): Promise<void> {
 		const epoch = this.#diskEpoch;
+		let slotFailed = false;
 		await this.#scheduleDiskWork(
 			async () => {
 				const sessionFile = this.#sessionFile;
@@ -3832,13 +3841,12 @@ export class SessionManager {
 					await this.#storage.updateSessionTitle(sessionFile, maskTitleUpdate(update, this.storeMask()));
 				} catch {
 					this.#rewriteRequired = true;
-					if (!(await this.#runFencedAtomicRewrite(epoch))) return;
-					this.#fileIsCurrent = true;
-					this.#hasTitleSlot = true;
+					slotFailed = true;
 				}
 			},
 			{ epoch },
 		);
+		if (slotFailed && this.#diskEpoch === epoch) await this.#rewriteAtomically();
 	}
 
 	#notifyEntryAppended(entry: SessionEntry): void {

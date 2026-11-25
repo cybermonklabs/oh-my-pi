@@ -460,6 +460,164 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			await manager.close();
 		});
 
+		/**
+		 * `storage`, whose in-place write of `file`'s title slot fails once: after the writes queued for the file
+		 * settle, as the store's own title write waits for them, and after `before` runs.
+		 */
+		function failTitleSlotOnce(
+			storage: SqlSessionStorage,
+			file: string,
+			before: () => void | Promise<void> = () => undefined,
+		): void {
+			const update = storage.updateSessionTitle.bind(storage);
+			let failed = false;
+			storage.updateSessionTitle = async (target, title) => {
+				if (target !== file || failed) return update(target, title);
+				failed = true;
+				await storage.confirmWrites(file).catch(() => undefined);
+				await before();
+				throw new Error("the title slot write failed");
+			};
+		}
+
+		// If this regresses, a rename whose title-slot write falls back to a full rewrite settles before the recovery of
+		// a refused write publishes: it reports the rename as done although that recovery fails, or, when the fallback
+		// states a size while a recovery reads the stored one, the session moves to a sibling as replaced.
+		for (const { name, olderBuildAppends, recoveryPublishes, settled } of [
+			{
+				name: "the store refuses the fallback, and the recovery it hands the refusal to publishes",
+				olderBuildAppends: "after the rename's entry",
+				recoveryPublishes: true,
+				settled: { renamed: true, refusals: [true, false] },
+			},
+			{
+				name: "the store refuses the fallback, and the recovery it hands the refusal to fails",
+				olderBuildAppends: "after the rename's entry",
+				recoveryPublishes: false,
+				settled: { rejected: "Error: the recovery's publish failed", refusals: [true, false] },
+			},
+			{
+				// The store refuses the rename's own entry, so a recovery runs when the slot write fails.
+				name: "a recovery reads the stored size when the slot write fails",
+				olderBuildAppends: "before the rename",
+				recoveryPublishes: true,
+				settled: { renamed: true, refusals: [false, false] },
+			},
+		]) {
+			it(`settles a rename whose title-slot write falls back to a full rewrite with the recovery (${name})`, async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open({ lease: STILL });
+				const file = sessionFile(db);
+				await storage.writeText(file, transcript(ID, "before"));
+				await storage.drain();
+				const { manager, notices } = await resume(storage, file);
+				manager.appendMessage(userTurn("mine before the change"));
+				// The first name gives the file its title slot, so the rename below writes that slot in place.
+				await manager.setSessionName("the first name", "user");
+				await manager.flush();
+				if (olderBuildAppends === "before the rename") {
+					await appendAsOlderBuild(db, file, "older1", "the older build's turn");
+					failTitleSlotOnce(storage, file);
+				} else {
+					failTitleSlotOnce(storage, file, () => appendAsOlderBuild(db, file, "older1", "the older build's turn"));
+				}
+				const writes = recordFullWrites(storage, file);
+				if (!recoveryPublishes) {
+					const atomic = storage.writeLinesAtomic.bind(storage);
+					storage.writeLinesAtomic = async (target, lines, options) => {
+						// The first full write is the refused fallback; the second is the recovery's publish.
+						if (target === file && writes.length === 1) {
+							writes.push({ expectedSize: options?.expectedSize });
+							throw new Error("the recovery's publish failed");
+						}
+						return atomic(target, lines, options);
+					};
+				}
+
+				// The full writes of the session, each refused or not, at the moment the rename settles.
+				const outcome = await manager.setSessionName("the second name", "user").then(
+					renamed => ({ renamed, refusals: writes.map(write => write.refusedAt !== undefined) }),
+					(err: unknown) => ({
+						rejected: String(err),
+						refusals: writes.map(write => write.refusedAt !== undefined),
+					}),
+				);
+				await storage.confirmWrites(file);
+				const stored = (await db.row(file))?.content ?? "";
+
+				expect({
+					outcome,
+					notices,
+					kept: recoveryPublishes
+						? ["the second name", "the older build's turn"].map(text => stored.includes(text))
+						: undefined,
+				}).toEqual({
+					outcome: settled,
+					notices: [],
+					kept: recoveryPublishes ? [true, true] : undefined,
+				});
+				await manager.close().catch(() => undefined);
+			});
+		}
+
+		// If this regresses, an entry recorded while a rename's fallback full rewrite publishes is not appended once that
+		// rewrite lands: it waits for the session's next append, flush or close, and a crash before then loses it.
+		it("appends an entry recorded during a rename's fallback full rewrite once that rewrite lands", async () => {
+			await using db = await openLeaseDb(adapter, url ?? "");
+			let gate!: GatedClient;
+			const storage = await db.open({
+				lease: STILL,
+				// The size check that opens the swap of a full write, once its body is staged: the rewrite is publishing.
+				wrap: client => (gate = holdBefore(client, /^SELECT byte_len FROM/)).client,
+			});
+			const file = sessionFile(db);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.drain();
+			const { manager, notices } = await resume(storage, file);
+			manager.appendMessage(userTurn("mine before the rename"));
+			await manager.setSessionName("the first name", "user");
+			await manager.flush();
+			const failures: string[] = [];
+			manager.onPersistenceError(error => failures.push(error.message));
+			// Closed once the rename's own entry has landed, so the fallback rewrite is the write it holds.
+			const closed = Promise.withResolvers<void>();
+			failTitleSlotOnce(storage, file, () => {
+				gate.close();
+				closed.resolve();
+			});
+			const writes = recordFullWrites(storage, file);
+
+			const rename = manager.setSessionName("the second name", "user").then(
+				renamed => ({ renamed }),
+				(err: unknown) => ({ rejected: String(err) }),
+			);
+			await closed.promise;
+			await gate.paused();
+			manager.appendMessage(userTurn("recorded during the rename"));
+			gate.open();
+			const outcome = await rename;
+			// What the store holds once its own queued writes land, before any later write of the session.
+			await storage.confirmWrites(file);
+			const withTheRename = (await db.row(file))?.content ?? "";
+
+			expect({
+				outcome,
+				failures,
+				notices,
+				writes: writes.length,
+				landedWithTheRename: ["the second name", "recorded during the rename"].map(text =>
+					withTheRename.includes(text),
+				),
+			}).toEqual({
+				outcome: { renamed: true },
+				failures: [],
+				notices: [],
+				writes: 1,
+				landedWithTheRename: [true, true],
+			});
+			await manager.close();
+		});
+
 		it("moves a second manager of this process off a journal another manager here writes, as file storage does", async () => {
 			await using db = await openLeaseDb(adapter, url ?? "");
 			const storage = await db.open();
