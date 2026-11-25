@@ -75,6 +75,16 @@ export interface DeepJsonTextOptions extends DeepJsonOptions {
 	 * the square of its depth (30,000 levels is a 1.8 GB string).
 	 */
 	readonly space?: string | number;
+	/**
+	 * Check the depth first, as `space` does: a value nested past
+	 * {@link INDENTED_JSON_LEVELS} levels is written by
+	 * {@link stringifyJsonIteratively} at once, without the 1.5 s or more Bun's
+	 * `JSON.stringify` spends running out of stack on a value 40,000 levels deep.
+	 * The check ({@link nestsDeeperThan}) costs one step per object or array, so
+	 * it is for a caller that writes the same kind of value again and again (a
+	 * page of messages, a request's telemetry), not one that knows the depth.
+	 */
+	readonly probeDepth?: boolean;
 }
 
 /** Levels past which {@link stringifyDeepJson} writes a value without the indentation it was asked for. */
@@ -88,14 +98,17 @@ export const INDENTED_JSON_LEVELS = 1_000;
  * which gives the same bytes. Any value `JSON.stringify` writes gets its
  * result, and any other error is its own. A `RangeError` from elsewhere (a
  * `toJSON` that throws one) recurs in the second walk and surfaces from it, so
- * the `toJSON` methods ahead of it run twice on that path. With `space`, a
- * value no deeper than {@link INDENTED_JSON_LEVELS} levels
- * ({@link nestsDeeperThan}) is indented as `JSON.stringify` indents it, and any
- * other is written without indentation.
+ * the `toJSON` methods ahead of it run twice on that path. With `space` or
+ * `probeDepth`, a value nested past {@link INDENTED_JSON_LEVELS} levels
+ * ({@link nestsDeeperThan}) goes to {@link stringifyJsonIteratively} directly,
+ * without indentation, and any other is written (and indented) as
+ * `JSON.stringify` writes it.
  */
 export function stringifyDeepJson(value: unknown, options?: DeepJsonTextOptions): string | undefined {
-	const space =
-		options?.space !== undefined && !nestsDeeperThan(value, INDENTED_JSON_LEVELS) ? options.space : undefined;
+	const space = options?.space;
+	if ((space !== undefined || options?.probeDepth) && nestsDeeperThan(value, INDENTED_JSON_LEVELS)) {
+		return stringifyJsonIteratively(value, options);
+	}
 	try {
 		return options?.bigintAsString ? stringifyJson(value, space) : JSON.stringify(value, undefined, space);
 	} catch (error) {

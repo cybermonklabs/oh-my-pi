@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as vm from "node:vm";
 import {
 	jsonDeepEquals,
@@ -368,6 +368,24 @@ describe("stringifyDeepJson", () => {
 			stringifyDeepJson(deep, { space: 2, bigintAsString: true }) ===
 				stringifyJsonIteratively(deep, { bigintAsString: true }),
 		).toBe(true);
+	}, 20_000);
+
+	// Bun's `JSON.stringify` spends 1.5 s or more running out of stack on a value 40,000 levels deep before the
+	// fallback writes it; a caller that writes the same messages again and again paid that on every write.
+	it("writes a value nested past 1,000 levels without trying JSON.stringify on it, given space or probeDepth", () => {
+		let deep: unknown = { leaf: "bottom" };
+		for (let index = 0; index < 50_000; index++) deep = { next: deep };
+		const shallow = { a: [1, { b: "c" }], d: null };
+		const stringify = spyOn(JSON, "stringify");
+		try {
+			for (const options of [{ space: 2 }, { probeDepth: true }]) {
+				expect(stringifyDeepJson(deep, options) === stringifyJsonIteratively(deep)).toBe(true);
+			}
+			expect(stringify.mock.calls.filter(([value]) => value === deep)).toHaveLength(0);
+			expect(stringifyDeepJson(shallow, { probeDepth: true })).toBe(JSON.stringify(shallow));
+		} finally {
+			stringify.mockRestore();
+		}
 	}, 20_000);
 });
 

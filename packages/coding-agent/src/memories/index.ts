@@ -862,6 +862,9 @@ async function* persistableMessagesFromChunks(chunks: AsyncIterable<Uint8Array>)
 	if (carry) yield* extractPersistableMessages(decoder.decode(carry));
 }
 
+/** Each stage-1 run writes the rollout's messages again: a deep one skips the `JSON.stringify` that would fail on it. */
+const STAGE1_MESSAGE_JSON = { probeDepth: true } as const;
+
 /**
  * The stage-1 payload of the rollout whose persistable messages `messages`
  * gives in file order: the head, and when the whole does not fit, the tail,
@@ -885,7 +888,7 @@ async function stage1Items(
 	let oldest = 0;
 	let tailLength = 1;
 	for await (const message of messages) {
-		const json = stringifyDeepJson(message)!;
+		const json = stringifyDeepJson(message, STAGE1_MESSAGE_JSON)!;
 		if (!truncated) {
 			head += head.length === 1 ? json : `,${json}`;
 			truncated = head.length > maxChars;
@@ -914,7 +917,7 @@ async function stage1Items(
 		tail = "]";
 		let exhausted = true;
 		for await (const message of persistableMessagesFromBack(rollout)) {
-			tail = `,${stringifyDeepJson(message)}${tail}`;
+			tail = `,${stringifyDeepJson(message, STAGE1_MESSAGE_JSON)}${tail}`;
 			if (tail.length >= tailChars) {
 				exhausted = false;
 				break;
