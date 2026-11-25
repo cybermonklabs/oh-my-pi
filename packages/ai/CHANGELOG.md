@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed OpenAI Responses requests failing with `400 Unknown parameter: input[N].created_by` after a session replays stored output items: the `created_by` field that the API sets on output items (tool calls and outputs, compaction items, shell output entries) is now dropped from every replayed item, whatever its value, on the HTTP, Azure, Codex and WebSocket routes.
+
 ## [18.18.4] - 2026-11-09
 
 ### Added

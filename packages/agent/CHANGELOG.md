@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed an OpenAI remote compaction (V2 on the HTTP and Azure routes) sending the previous compaction's stored items with their `created_by` field, which the Responses API refuses on input.
+
 ## [18.18.2] - 2026-11-08
 
 ### Added
