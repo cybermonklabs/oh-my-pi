@@ -6,7 +6,7 @@
  * `OMP_CHECK_WINDOWS`) return.
  */
 
-import { UNVERSIONED } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
+import { UNVERSIONED } from "@oh-my-pi/pi-coding-agent/session/redis-window-generation";
 
 /** The keyspace a Redis double holds: its string keys and its hashes. */
 export interface FakeRedisKeyspace {
