@@ -2984,8 +2984,69 @@ fn hash_table(
 }
 
 /// bash's dynamic variables, computed on every read (`line` is `$LINENO`);
-/// `None` for any other name.
+/// `None` for any other name, and for a value cell `unset` removed (a plain
+/// variable from then on, [`Kernel::cell_plain`]). A value-cell variable
+/// keeps what was computed as its value, which `declare -p` and `set` list
+/// ([`dynvars::keep_cell`]).
 fn dynamic_value(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	line: u32,
+	name: &[u8],
+) -> Result<Option<DynVal>, StoreError> {
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+		&& dynvars::cell_index(name).is_some_and(|i| k.cell_plain(vp, i))
+	{
+		return Ok(None);
+	}
+	let v = dynamic_compute(k, cx, vp, line, name)?;
+	if let Some(v) = &v
+		&& dynvars::cell_attrs(name).is_some()
+	{
+		dynvars::keep_cell(k, cx.store, vp, name, v.to_value())?;
+	}
+	Ok(v)
+}
+
+/// `declare -p NAME` of bash's dynamic variable `name`: its lookup (a
+/// value-cell variable keeps the result, [`dynvars::keep_cell`]), and the
+/// variable to print for one that keeps none (the call-stack arrays,
+/// `PIPESTATUS` once a command's status is recorded). `None` for another
+/// name, in zsh code, and for a value cell (its record is printed).
+///
+/// # Errors
+/// [`StoreError`] when the store cannot be read.
+pub fn look_dynamic(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	name: &[u8],
+) -> Result<Option<Var>, StoreError> {
+	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash || !is_dynamic(name) {
+		return Ok(None);
+	}
+	if matches!(name, b"BASH_ARGC" | b"BASH_ARGV") {
+		super::callstack::read_base(k, cx.store, vp)?;
+	}
+	let line = super::exec::current_line(vp);
+	let v = dynamic_value(k, cx, vp, line, name)?;
+	if dynvars::cell_attrs(name).is_some() {
+		return Ok(None);
+	}
+	Ok(match v {
+		Some(v @ DynVal::List(_))
+			if !(name == b"PIPESTATUS" && matches!(&v, DynVal::List(l) if l.is_empty())) =>
+		{
+			Some(Var { attrs: Attrs::INDEXED, value: v.into_value() })
+		},
+		Some(v @ DynVal::Assoc(_)) => Some(Var { attrs: Attrs::ASSOC, value: v.into_value() }),
+		_ => None,
+	})
+}
+
+/// [`dynamic_value`] without the cell.
+fn dynamic_compute(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
 	vp: &mut Vproc,
@@ -3076,6 +3137,35 @@ enum DynVal {
 	List(Vec<BString>),
 	/// `(key, value)` pairs in bash's hash-table order.
 	Assoc(Vec<(BString, BString)>),
+}
+
+impl DynVal {
+	/// The value as a variable holds it.
+	fn into_value(self) -> VarValue {
+		match self {
+			Self::Str(s) => VarValue::Str(s),
+			Self::List(items) => {
+				VarValue::Indexed(items.into_iter().zip(0i64..).map(|(v, i)| (i, v)).collect())
+			},
+			Self::Assoc(pairs) => VarValue::Assoc(pairs.into_iter().collect()),
+		}
+	}
+
+	/// [`Self::into_value`] of a copy.
+	fn to_value(&self) -> VarValue {
+		match self {
+			Self::Str(s) => VarValue::Str(s.clone()),
+			Self::List(items) => VarValue::Indexed(
+				items
+					.iter()
+					.cloned()
+					.zip(0i64..)
+					.map(|(v, i)| (i, v))
+					.collect(),
+			),
+			Self::Assoc(pairs) => VarValue::Assoc(pairs.iter().cloned().collect()),
+		}
+	}
 }
 
 /// The dynamic associative arrays: the table each one shows.

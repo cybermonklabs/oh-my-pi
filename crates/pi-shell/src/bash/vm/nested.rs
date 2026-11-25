@@ -440,6 +440,7 @@ fn fresh_shell(
 		seconds,
 		seconds_plain: false,
 		random_plain: false,
+		cells_plain: 0,
 	});
 	child.rlimits.clone_from(&vp.rlimits);
 	child.lineage = vp.lineage;

@@ -59,7 +59,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 34;
+pub const FRAMES_VERSION: u32 = 47;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -714,6 +714,7 @@ impl Shell {
 			.and_then(state::parse_random_record)
 			.unwrap_or_default();
 		k.random_plain = plain;
+		k.cells_plain = parse_misc(cx.store, MiscKey::CellsPlain)?.unwrap_or(0);
 		if opts.reseed_random {
 			k.rand = state::Random::new((cx.host.random() & 0xffff_ffff) as u32);
 			k.write_random(cx.store);

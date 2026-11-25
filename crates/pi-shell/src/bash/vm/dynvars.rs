@@ -164,6 +164,148 @@ pub fn store_value(
 	Ok(())
 }
 
+/// bash's dynamic variables with a value cell besides `RANDOM` and
+/// `SECONDS` (bash 5.3.20's `initialize_dynamic_variables`), with the
+/// attributes bash gives them. A lookup runs the value function, which
+/// keeps its result as the variable's value ([`keep_cell`]); `declare -p`
+/// and `set` list that value. Before the first lookup `declare -p` lists a
+/// scalar with its attributes alone and `set` does not list it; an array is
+/// listed empty.
+pub const CELLS: &[(&[u8], Attrs)] = &[
+	(b"BASHPID", Attrs::INTEGER),
+	(b"BASH_ALIASES", Attrs::ASSOC),
+	(b"BASH_CMDS", Attrs::ASSOC),
+	(b"BASH_COMMAND", Attrs::NONE),
+	(b"BASH_SUBSHELL", Attrs::NONE),
+	(b"DIRSTACK", Attrs::INDEXED),
+	(b"EPOCHREALTIME", Attrs::NONE),
+	(b"EPOCHSECONDS", Attrs::NONE),
+	(b"LINENO", Attrs::NONE),
+	(b"SRANDOM", Attrs::INTEGER),
+];
+
+/// bash's attributes of the value-cell variable `name` ([`CELLS`]).
+pub fn cell_attrs(name: &[u8]) -> Option<Attrs> {
+	CELLS.iter().find(|(n, _)| *n == name).map(|&(_, a)| a)
+}
+
+/// The position of the value-cell variable `name` in [`CELLS`] (its bit in
+/// `Kernel::cells_plain`).
+pub fn cell_index(name: &[u8]) -> Option<usize> {
+	CELLS.iter().position(|(n, _)| *n == name)
+}
+
+/// Keep `value`, what a lookup of the value-cell variable `name` computed,
+/// as its value (a global record, the attributes it has kept). An empty
+/// associative array is kept as bash's value functions leave it
+/// (`build_hashcmd`, `build_aliasvar`: no value): `declare -p` lists it as
+/// `()`, `set` not at all ([`Attrs::INVISIBLE`]). Bash code only; not while
+/// a subshell's redirections are expanded (the cell is the child's).
+///
+/// # Errors
+/// [`StoreError`] when the store cannot be read.
+pub fn keep_cell(
+	k: &mut Kernel,
+	store: &mut dyn StateStore,
+	vp: &mut Vproc,
+	name: &[u8],
+	value: VarValue,
+) -> Result<(), StoreError> {
+	let Some(base) = cell_attrs(name) else {
+		return Ok(());
+	};
+	if vp.mode.dialect() != Dialect::Bash || k.redirs_in_child {
+		return Ok(());
+	}
+	let unset = matches!(&value, VarValue::Assoc(a) if a.is_empty());
+	let var = state::global_in(store, vp, name)?;
+	let attrs = var.map_or(base, |v| v.attrs);
+	let attrs = if unset {
+		attrs.with(Attrs::INVISIBLE)
+	} else {
+		attrs.without(Attrs::INVISIBLE)
+	};
+	if var.is_some_and(|v| v.attrs == attrs && v.value == value) {
+		return Ok(());
+	}
+	state::store_var(&mut k.root, store, vp, name, Some(Var { attrs, value }), Level::Global);
+	Ok(())
+}
+
+/// The variables `declare -p` and `set` list for bash's value cells that
+/// hold no value of their own yet, added to `vars` (sorted after): with
+/// `declared` (`declare -p`), a scalar of [`CELLS`] and a special `RANDOM`
+/// or `SECONDS` never looked up, by their attributes alone; the arrays
+/// empty; `PIPESTATUS` once a command's status is recorded (bash sets it
+/// then); an associative cell a lookup left empty as `()`. Bash code only.
+///
+/// # Errors
+/// [`StoreError`] when the store cannot be read.
+pub fn with_cells(
+	k: &Kernel,
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	vars: &mut Vec<(BString, Var)>,
+	declared: bool,
+) -> Result<(), StoreError> {
+	if vp.mode.dialect() != Dialect::Bash {
+		return Ok(());
+	}
+	if declared {
+		for (name, var) in vars.iter_mut() {
+			if matches!(name.as_slice(), b"BASH_ALIASES" | b"BASH_CMDS")
+				&& var.attrs.contains(Attrs::INVISIBLE)
+				&& matches!(&var.value, VarValue::Assoc(a) if a.is_empty())
+			{
+				var.attrs = var.attrs.without(Attrs::INVISIBLE);
+			}
+		}
+	}
+	let random = visible(k, store, vp, b"RANDOM")?.is_some();
+	let seconds = visible(k, store, vp, b"SECONDS")?.is_some();
+	let specials = [(&b"RANDOM"[..], Attrs::INTEGER, random), (b"SECONDS", Attrs::NONE, seconds)];
+	// A cell `unset` removed is a plain variable: listed as one when it has
+	// a value, not at all otherwise.
+	let cells = CELLS
+		.iter()
+		.enumerate()
+		.map(|(i, &(name, attrs))| (name, attrs, !k.cell_plain(vp, i)));
+	for (name, attrs, shown) in cells.chain(specials) {
+		// A kept cell is listed as stored (`set` leaves out an invisible
+		// one), even when this listing's scan left it out.
+		if !shown
+			|| vars.iter().any(|(n, _)| n.as_slice() == name)
+			|| state::global_in(store, vp, name)?.is_some()
+		{
+			continue;
+		}
+		let var = if attrs.contains(Attrs::ASSOC) {
+			Var { attrs, value: VarValue::Assoc(Default::default()) }
+		} else if attrs.contains(Attrs::INDEXED) {
+			Var { attrs, value: VarValue::Indexed(Vec::new()) }
+		} else if declared {
+			Var { attrs: attrs.with(Attrs::INVISIBLE), value: VarValue::Str(BString::default()) }
+		} else {
+			continue;
+		};
+		vars.push((BString::from(name), var));
+	}
+	if !vp.pipestatus.is_empty() && !vars.iter().any(|(n, _)| n.as_slice() == b"PIPESTATUS") {
+		let mut buf = NumBuffer::new();
+		let items = vp
+			.pipestatus
+			.iter()
+			.zip(0i64..)
+			.map(|(s, i)| (i, BString::from(s.format_into(&mut buf))))
+			.collect();
+		vars.push((BString::from("PIPESTATUS"), Var {
+			attrs: Attrs::INDEXED,
+			value: VarValue::Indexed(items),
+		}));
+	}
+	Ok(())
+}
+
 /// The lookups bash 5.3.20 makes of `name` at `site` when `name` is a
 /// special variable `vp`'s bash code sees; none for any other name.
 ///
