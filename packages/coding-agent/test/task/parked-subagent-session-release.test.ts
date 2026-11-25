@@ -38,6 +38,7 @@ import { cfgSecretsMaskSessionStore } from "@oh-my-pi/pi-coding-agent/secrets/se
 import { cfgContextPromotionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { __resetDirsFromEnvForTests, isRecord, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -178,6 +179,8 @@ const recallingHandler: MockHandler = context => {
 interface KeptAliveRun {
 	mock: MockModel;
 	modelRegistry: ModelRegistry;
+	/** The settings the run spawned under, as its parent session's. */
+	settings: Settings;
 	/** Drops the mock's session-bound recordings. */
 	release(): void;
 	close(): void;
@@ -208,6 +211,18 @@ async function runKeptAliveSubagent(
 	const artifactsDir = path.join(root, "artifacts");
 	await fs.mkdir(cwd, { recursive: true });
 	await fs.mkdir(artifactsDir, { recursive: true });
+	const settings = Settings.isolated({
+		// No TTL timer: the test parks explicitly through the same path the timer takes.
+		"task.agentIdleTtlMs": 0,
+		"async.enabled": false,
+		"compaction.enabled": false,
+		"retry.enabled": false,
+		"todo.enabled": false,
+		"todo.reminders": false,
+		"advisor.enabled": false,
+		modelRoles: { default: "mock/mock-model" },
+		...options.settings,
+	});
 
 	const authStorage = createInMemoryAuthStorage();
 	authStorage.keys.setRuntime("mock", "test-key");
@@ -243,18 +258,7 @@ async function runKeptAliveSubagent(
 			modelOverride,
 			authStorage,
 			modelRegistry,
-			settings: Settings.isolated({
-				// No TTL timer: the test parks explicitly through the same path the timer takes.
-				"task.agentIdleTtlMs": 0,
-				"async.enabled": false,
-				"compaction.enabled": false,
-				"retry.enabled": false,
-				"todo.enabled": false,
-				"todo.reminders": false,
-				"advisor.enabled": false,
-				modelRoles: { default: "mock/mock-model" },
-				...options.settings,
-			}),
+			settings,
 			enableLsp: false,
 			enableMCP: false,
 			enableIrc: options.enableIrc ?? false,
@@ -267,6 +271,7 @@ async function runKeptAliveSubagent(
 	return {
 		mock,
 		modelRegistry,
+		settings,
 		// Recorded mock calls carry stream options with closures bound to the session.
 		release: () => {
 			mock.reset();
@@ -607,19 +612,63 @@ async function forgeSpecSettingsKey(sessionFile: string, key: string): Promise<v
 	if (!isRecord(layers) || !isRecord(layers.overrides)) {
 		throw new Error("The spawn recorded no spec holding its settings layers");
 	}
-	layers.overrides[key] = { polluted: true };
+	// An own key, as JSON.parse makes one: assigning `__proto__` would swap the object's prototype, and the
+	// written line would not hold the key at all.
+	Object.defineProperty(layers.overrides, key, {
+		value: { polluted: true },
+		enumerable: true,
+		writable: true,
+		configurable: true,
+	});
 	lines[index] = JSON.stringify(entry);
+	if (!lines[index].includes(`${JSON.stringify(key)}:{"polluted":true}`)) {
+		throw new Error(`The forged spawn spec does not hold the key ${key}`);
+	}
 	await Bun.write(sessionFile, lines.join("\n"));
 }
 
+/**
+ * Installs the persisted reviver factory as the top-level session does (`main.ts`), over the run's auth storage, model
+ * registry and settings and a root session in the run's cwd on `model`, and counts the revivers asked of it: `count`
+ * is how many cold revives the lifecycle began. The file's `afterEach` disposes the lifecycle, which drops the factory.
+ */
+function installColdReviver(run: KeptAliveRun, model: Model<Api>): { count: number } {
+	// What a cold revive reads of a root session that holds no tool session: its cwd, its artifacts, its extension
+	// policy, and its model, which a subagent whose model the registry does not hold revives on.
+	const rootSession = {
+		sessionManager: { getCwd: () => path.join(root, "home", "work"), getArtifactManager: () => undefined },
+		effectiveExtensionRoots: { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
+		model,
+	} as unknown as AgentSession;
+	const factory = createPersistedSubagentReviverFactory({
+		session: rootSession,
+		authStorage: run.modelRegistry.authStorage,
+		modelRegistry: run.modelRegistry,
+		settings: run.settings,
+		enableLsp: false,
+	});
+	const coldRevivers = { count: 0 };
+	AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
+		async ref => {
+			coldRevivers.count++;
+			return factory(ref);
+		},
+		() => 0,
+	);
+	return coldRevivers;
+}
+
 // If this regresses, a session file whose spawn spec names a settings layer through `__proto__` (forged or damaged)
-// adds that field to every object of the process when its subagent is woken for a follow-up, and settings then fail to
-// load with `Unknown setting`.
+// adds that field to every object of the process when its subagent is woken for a follow-up, or the subagent cannot
+// be woken. An edited spec never revives warm (it is not the spec the park wrote), so the subagent revives cold, as
+// the top-level session's reviver revives it, on the settings of an older record where the stored ones do not load.
 it("revives from a spawn spec naming a settings layer through `__proto__` without changing Object.prototype", async () => {
 	const models: Model<Api>[] = [];
 	registerCustomApi(SECRET_MODEL_API, answeringStream(models), MOCK_API_SOURCE);
-	const run = await runKeptAliveSubagent({ model: providerModel({ baseUrl: "https://llm.example.test/v1" }) });
+	const model = providerModel({ baseUrl: "https://llm.example.test/v1" });
+	const run = await runKeptAliveSubagent({ model });
 	try {
+		const coldRevivers = installColdReviver(run, model);
 		await AgentLifecycleManager.global().park(AGENT_ID);
 		run.release();
 		const sessionFile = AgentRegistry.global().get(AGENT_ID)?.sessionFile;
@@ -633,6 +682,7 @@ it("revives from a spawn spec naming a settings layer through `__proto__` withou
 			storeMaskCwd: path.join(root, "home", "work"),
 		});
 		expect(followUp.exitCode).toBe(0);
+		expect(coldRevivers.count).toBe(1);
 		expect(Object.hasOwn(Object.prototype, "polluted")).toBe(false);
 	} finally {
 		Reflect.deleteProperty(Object.prototype, "polluted");
