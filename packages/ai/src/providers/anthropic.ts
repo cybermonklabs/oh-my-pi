@@ -5768,56 +5768,52 @@ export type AnthropicMessageParam = MessageParam;
  * transcript line holds.
  */
 function toWellFormedDeep(value: unknown): unknown {
-	if (typeof value === "string") return wellFormedString(value);
-	return Array.isArray(value) || isRecord(value) ? runNested(wellFormedNode(value, new ContainerPath())) : value;
+	return isWellFormedWalked(value) ? runNested(wellFormedNode(value, new ContainerPath())) : wellFormedLeaf(value);
 }
 
-function wellFormedString(value: string): string {
-	const wellFormed = value.toWellFormed();
-	return wellFormed === value ? value : wellFormed;
+/** Whether {@link toWellFormedDeep} walks into `value`: an array or a record. */
+function isWellFormedWalked(value: unknown): value is unknown[] | Record<string, unknown> {
+	return Array.isArray(value) || isRecord(value);
+}
+
+/** {@link toWellFormedDeep} of a value it does not walk into: a string well-formed, any other as it is. */
+function wellFormedLeaf(value: unknown): unknown {
+	return typeof value === "string" ? value.toWellFormed() : value;
 }
 
 /** {@link toWellFormedDeep} of `value`, an array or record `path` is inside of; each child array or record is a nested step. */
 function* wellFormedNode(value: unknown[] | Record<string, unknown>, path: ContainerPath): NestedWalk {
 	path.enter(value);
-	let changed = false;
 	if (Array.isArray(value)) {
-		const next: unknown[] = [];
-		for (const entry of value) {
-			const sanitized =
-				typeof entry === "string"
-					? wellFormedString(entry)
-					: Array.isArray(entry) || isRecord(entry)
-						? yield wellFormedNode(entry, path)
-						: entry;
-			if (sanitized !== entry) changed = true;
-			next.push(sanitized);
+		let out: unknown[] | undefined;
+		for (let index = 0; index < value.length; index++) {
+			const entry = value[index];
+			const sanitized = isWellFormedWalked(entry) ? yield wellFormedNode(entry, path) : wellFormedLeaf(entry);
+			if (sanitized === entry) continue;
+			out ??= value.slice();
+			out[index] = sanitized;
 		}
 		path.leave(value);
-		return changed ? next : value;
+		return out ?? value;
 	}
-	const next: Record<string, unknown> = {};
+	// The compaction signature covers this opaque list; don't sanitize any nested values.
+	const opaqueKey = value.type === "compaction" ? "tool_changes" : undefined;
+	let out: Record<string, unknown> | undefined;
 	for (const [key, entry] of Object.entries(value)) {
-		// The compaction signature covers this opaque list; don't sanitize any nested values.
 		const sanitized =
-			value.type === "compaction" && key === "tool_changes"
+			key === opaqueKey
 				? entry
-				: typeof entry === "string"
-					? wellFormedString(entry)
-					: Array.isArray(entry) || isRecord(entry)
-						? yield wellFormedNode(entry, path)
-						: entry;
-		if (sanitized !== entry) changed = true;
-		// Assigning `__proto__` would swap the copy's prototype instead of
-		// creating the own data property JSON.parse produces.
-		if (key === "__proto__") {
-			Object.defineProperty(next, key, { value: sanitized, enumerable: true, writable: true, configurable: true });
-		} else {
-			next[key] = sanitized;
-		}
+				: isWellFormedWalked(entry)
+					? yield wellFormedNode(entry, path)
+					: wellFormedLeaf(entry);
+		if (sanitized === entry) continue;
+		// The spread copies a `__proto__` key JSON.parse made as an own key, which this assignment then
+		// writes; assigned to a fresh object, that key would set the copy's prototype instead.
+		out ??= { ...value };
+		out[key] = sanitized;
 	}
 	path.leave(value);
-	return changed ? next : value;
+	return out ?? value;
 }
 
 /**

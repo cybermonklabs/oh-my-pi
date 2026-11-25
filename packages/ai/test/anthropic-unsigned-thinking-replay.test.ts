@@ -188,23 +188,20 @@ describe("Anthropic-compatible unsigned thinking replay (#2005)", () => {
 	});
 
 	// `JSON.parse` makes `__proto__` an own key of tool arguments; a copy that assigns it sets its prototype instead.
-	it("keeps a __proto__ key of tool arguments when it fixes a string beside it", () => {
-		const assistant: AssistantMessage = {
-			...makeAssistantThinking("plan"),
-			content: [
-				{
-					type: "toolCall",
-					id: "call_1",
-					name: "write",
-					arguments: JSON.parse('{"__proto__":{"a":1},"text":"bad \\ud83d"}'),
-				},
-			],
+	it("keeps a __proto__ key of tool arguments when it fixes a string beside it or in it", () => {
+		const replayed = (json: string) => {
+			const assistant: AssistantMessage = {
+				...makeAssistantThinking("plan"),
+				content: [{ type: "toolCall", id: "call_1", name: "write", arguments: JSON.parse(json) }],
+			};
+			const toolUse = assistantWireBlocks([makeUser(), assistant], makeModel()).find(
+				block => block.type === "tool_use",
+			) as WireToolUseBlock;
+			expect(Object.getPrototypeOf(toolUse.input)).toBe(Object.prototype);
+			return JSON.stringify(toolUse.input);
 		};
-		const toolUse = assistantWireBlocks([makeUser(), assistant], makeModel()).find(
-			block => block.type === "tool_use",
-		) as WireToolUseBlock;
-		expect(Object.getPrototypeOf(toolUse.input)).toBe(Object.prototype);
-		expect(JSON.stringify(toolUse.input)).toBe('{"__proto__":{"a":1},"text":"bad \ufffd"}');
+		expect(replayed('{"__proto__":{"a":1},"text":"bad \\ud83d"}')).toBe('{"__proto__":{"a":1},"text":"bad \ufffd"}');
+		expect(replayed('{"__proto__":"bad \\ud83d","text":"ok"}')).toBe('{"__proto__":"bad \ufffd","text":"ok"}');
 	});
 
 	it("sanitizes payload replacements before SDK JSON serialization", async () => {
