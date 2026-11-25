@@ -4593,6 +4593,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		super::wait_starts(k, cx, vp);
 	}
 	let status = vp.status;
+	let root = vp.parent.is_none();
 	let sc = scratch(vp);
 	if sc.inline() == Some(InlineStage::Running) {
 		// Back from the last stage's frame.
@@ -4603,8 +4604,19 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 			*status = k.proc_collect(cx.store, *vpid);
 		}
 	}
-	if let Some((vpid, _)) = sc.children.iter().find(|(_, s)| s.is_none()) {
-		return Flow::Block(WaitKey::Proc(*vpid));
+	if let Some(&(vpid, _)) = sc.children.iter().find(|(_, s)| s.is_none()) {
+		// bash's `set -m`: each child still waited for is a stopped program,
+		// so the pipeline or `( … )` is a stopped job now (`wait_for`).
+		let waiting = sc
+			.children
+			.iter()
+			.filter(|(_, s)| s.is_none())
+			.map(|&(v, _)| v);
+		if root && let Some((sig, tstp)) = super::jobctl::bash_stopped(k, waiting) {
+			let status = sig.exit_status(k.engine.config().platform);
+			return super::jobctl::bash_suspend(k, cx, vp, sig, status, tstp);
+		}
+		return Flow::Block(WaitKey::Proc(vpid));
 	}
 	let pipefail = state::option(&mut k.root, cx.store, vp, OptId::Pipefail).unwrap_or(false);
 	let sc = scratch(vp);
