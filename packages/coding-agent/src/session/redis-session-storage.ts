@@ -176,17 +176,21 @@ return {redis.call("STRLEN", KEYS[1]), text}`;
 // one or the other, except an append or a title update made while the token
 // holds, and an earlier version's write that sets the very mtime recorded, or
 // that sets the bytes and the mtime in two commands with this window between
-// them. Without a token the window also returns its SHA-1, which the check
-// at the read's end (CHECK_WINDOWS_SCRIPT) compares; with one, "". A window
-// starts and ends between characters, so its bytes decode to a string and
-// encode back to the same bytes: a first window from inside a character
-// starts at the byte that begins it (a later one starts where the last one
-// ended), and a window that stops short of the read's end ends before the
-// character its next byte continues, never as nothing (each backs over at
-// most three continuation bytes, and not at all where the bytes are not
-// UTF-8). Returns {size, generation, the window's byte length, its SHA-1 or
-// "", the window, the bytes it starts before ARGV[1]}; {size} alone when the
-// key is shorter than ARGV[3] now, and nil when it is missing.
+// them: a full write or an append of a release before v17.1.0 (commit
+// 4bc68b45e25 made them one script), or a move onto the session by a build
+// whose move is not one script (every upstream release through v19.1.1; this
+// fork's since commit 3b60887237b is). Without a token the window also
+// returns its SHA-1, which the check at the read's end (CHECK_WINDOWS_SCRIPT)
+// compares; with one, "". A window starts and ends between characters, so
+// its bytes decode to a string and encode back to the same bytes: a first
+// window from inside a character starts at the byte that begins it (a later
+// one starts where the last one ended), and a window that stops short of the
+// read's end ends before the character its next byte continues, never as
+// nothing (each backs over at most three continuation bytes, and not at all
+// where the bytes are not UTF-8). Returns {size, generation, the window's
+// byte length, its SHA-1 or "", the window, the bytes it starts before
+// ARGV[1]}; {size} alone when the key is shorter than ARGV[3] now, and nil
+// when it is missing.
 const READ_WINDOW_SCRIPT = `-- OMP_READ_WINDOW
 if redis.call("EXISTS", KEYS[1]) == 0 then
 	return false
