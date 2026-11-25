@@ -16,13 +16,9 @@ use std::{
 	fs, io,
 	os::unix::fs::PermissionsExt,
 	path::{Path, PathBuf},
-	time::Duration,
 };
 
 use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
-
-/// The pause between keys.
-const KEY: Duration = Duration::from_millis(80);
 
 /// The fixture directory of test `name`: files `file1`, `file2`,
 /// `other.c`, `.hidden`, directories `dir1`, `dir2/sub`, commands
@@ -61,10 +57,10 @@ fn spawn(real: bool, dir: &Path, rc: &str) -> Spawn {
 		.size(24, 80)
 }
 
-/// Type `text` key by key and wait until the line editor has handled it.
+/// Type `text`, a line at a time, and wait until the line editor has
+/// handled it ([`Pty::type_lines`]).
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
-	pty.type_keys(text, KEY)?;
-	pty.zle_sync(TIMEOUT)
+	pty.type_lines(text, TIMEOUT)
 }
 
 /// Both shells, rc sourced and screen cleared, then `drive`: the screens
@@ -73,7 +69,7 @@ fn same(name: &str, rc: &str, drive: &str) {
 	let dir = fixture(name);
 	let run = |pty: &mut Pty| -> io::Result<()> {
 		pty.wait_raw(TIMEOUT)?;
-		pty.type_keys(". ~/.zshrc\r", KEY)?;
+		pty.write(". ~/.zshrc\r")?;
 		pty.read_until("RCDONE", TIMEOUT)?;
 		pty.zle_sync(TIMEOUT)?;
 		keys(pty, "\x0c")?;

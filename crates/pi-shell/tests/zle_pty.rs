@@ -2,24 +2,20 @@
 //! `zsh -f -i`, against the real `/bin/zsh -f -i` on the same pty session
 //! (same keys, same rc file): the final screens must match.
 //!
-//! Each case types keys with short pauses (zsh skips redisplays while keys
-//! are queued), waits until the line editor has handled them and waits for
-//! the next key ([`Pty::zle_sync`]), and compares what the terminal shows.
+//! Each case types its keys a line at a time, a `^C` in a write of its own,
+//! waits until the line editor has handled them and waits for the next key
+//! ([`Pty::zle_sync`]), and compares what the terminal shows.
 
 #![cfg(unix)]
 
 mod pty_support;
 mod zsh_oracle;
 
-use std::{
-	io::{self, Write as _},
-	time::Duration,
+use std::io::{self, Write as _};
+
+use pty_support::{
+	Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh, wait_shell_blocked,
 };
-
-use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
-
-/// The pause between keys.
-const KEY: Duration = Duration::from_millis(60);
 
 /// `zsh -f -i` with `PS1`/`RPS1` and the rc file `rc` (sourced with `.`
 /// as the first command, since `-f` skips `.zshrc`), in its own home
@@ -40,10 +36,30 @@ fn spawn(real: bool, rc: &str) -> Spawn {
 		.size(24, 80)
 }
 
-/// Type `text` key by key and wait until the line editor has handled it.
+/// Type `text` and wait until the line editor has handled it. The keys go
+/// a line at a time ([`Pty::type_lines`]), and a `^C` goes in a write of
+/// its own once the editor has handled the keys before it: the terminal
+/// turns `^C` into `SIGINT` as it receives it and drops the keys still
+/// waiting to be read. The `^C` goes once the shell blocks waiting for the
+/// next key ([`wait_shell_blocked`], on Linux and macOS): a shell that has
+/// just answered a sync is still returning from that handler, and a `^C`
+/// sent then went unanswered (under gVisor the shell drew nothing after it
+/// for the whole [`TIMEOUT`]). The editor never reads that key, so the wait
+/// after it is first for the shell's answer to the interrupt (it leaves the
+/// line and draws the next one), then for the editor.
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
-	pty.type_keys(text, KEY)?;
-	pty.zle_sync(TIMEOUT)
+	for (i, part) in text.split('\x03').enumerate() {
+		if i > 0 {
+			wait_shell_blocked(pty.pid());
+			pty.write("\x03")?;
+			pty.read_some(TIMEOUT)?;
+			pty.zle_sync(TIMEOUT)?;
+		}
+		if !part.is_empty() {
+			pty.type_lines(part, TIMEOUT)?;
+		}
+	}
+	Ok(())
 }
 
 /// Run `drive` against both shells after sourcing the rc file; the final
@@ -54,7 +70,7 @@ fn screens(
 ) -> io::Result<(String, Option<String>)> {
 	let run = |pty: &mut Pty| -> io::Result<()> {
 		pty.wait_raw(TIMEOUT)?;
-		pty.type_keys(". ~/.zshrc\r", KEY)?;
+		pty.write(". ~/.zshrc\r")?;
 		pty.read_until("RCDONE", TIMEOUT)?;
 		pty.zle_sync(TIMEOUT)?;
 		// A clean screen for the case itself.
@@ -223,7 +239,7 @@ fn a_resize_while_a_handler_runs_is_redrawn_after_it() {
 	let mut run = |pty: &mut Pty| -> io::Result<()> {
 		let home = &homes[seen.len()];
 		pty.wait_raw(TIMEOUT)?;
-		pty.type_keys(". ~/.zshrc\r", KEY)?;
+		pty.write(". ~/.zshrc\r")?;
 		pty.read_until("RCDONE", TIMEOUT)?;
 		pty.zle_sync(TIMEOUT)?;
 		keys(pty, "\x0c")?;
@@ -266,10 +282,17 @@ fn vared_edits_a_parameter() {
 }
 
 /// A byte read past a key sequence (`^X` bound, `^Xe` not) is pushed back
-/// and starts the next line (zsh's `kungetbuf` outlives the line).
+/// and starts the next line (zsh's `kungetbuf` outlives the line). The `e`
+/// goes with `^X`, so the editor reads it looking for a longer sequence;
+/// the rest of the next line goes once the accepted line has run: on macOS
+/// obash's screen showed keys still unread while the line ran echoed in
+/// front of its output ([`Pty::type_lines`]).
 #[test]
 fn bytes_after_an_accepting_prefix_key_start_the_next_line() {
-	same("bindkey '^X' accept-line\n", |pty| keys(pty, "echo one\x18echo two\r"));
+	same("bindkey '^X' accept-line\n", |pty| {
+		keys(pty, "echo one\x18e")?;
+		keys(pty, "cho two\r")
+	});
 }
 
 /// `read -k` in a widget takes its key through the editor.
