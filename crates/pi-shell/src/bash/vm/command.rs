@@ -4451,6 +4451,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					(force, vp.jobs.by_vpid(v).map(|j| j.state))
 				{
 					// bash with job control: a stop ends the wait for that job.
+					// `wait -p` names it by its pid once that is settled (a job
+					// stopped before its program started, [`super::proc::Bang`]).
+					if st(vp).wait_into.is_some() && k.bang_pending(v) {
+						return Some(Flow::Block(WaitKey::Proc(v)));
+					}
 					last = sig.exit_status(platform);
 				} else {
 					// bash writes each job's notice as it reaps it (`wait_for`'s

@@ -565,12 +565,28 @@ pub struct Kernel {
 	/// pipeline a vproc waits for ([`proc::JobProc`]), by the scheduler after
 	/// it (`Shell::adopt`); empty between turns, not imaged.
 	pub settled:            Vec<(Vpid, u32)>,
+	/// `(vproc, job)`: bangs settled during the step ([`Self::settle_bang`]),
+	/// whose job a stop held for them may reach now
+	/// (`Shell::release_held_stops`, which every step ends with); empty
+	/// between steps, not imaged.
+	pub decided:            Vec<(Vpid, Vpid)>,
 	/// `(OS pid, vproc, job)`: a job's `$!` names a program a vproc other
 	/// than the job's own runs (a background pipeline's last stage), so
 	/// `kill` of that pid signals that vproc, and finds no process once it
 	/// ended though the job runs on. Dropped when the job ends; not imaged
 	/// (a restored shell signals the job's vproc).
 	pub pid_owners:         Vec<(u32, Vpid, Vpid)>,
+	/// `(vproc, signal, given)`: the terminating signals a stopped bash vproc
+	/// of shell code has pending: one that does not continue it (bash's
+	/// `kill_pid` continues a stopped job only for `TERM` and `HUP`), and one
+	/// that does, which joins them as it continues the vproc. They are taken
+	/// once the vproc is continued, the lowest signal number first, as a
+	/// stopped subshell acts on its pending signals then (`Shell::deliver`);
+	/// `KILL` ends the vproc at once instead. `given`: its programs have it
+	/// from the kernel ([`SigTarget::JobGroup`]). Dropped when the vproc
+	/// ends; not imaged (a restored shell's stopped vproc runs on once
+	/// continued).
+	pub held_ends:          Vec<(Vpid, Signal, bool)>,
 	/// The math options ([`zsh::arith::math_options`]) last read for a vproc
 	/// without an overlay, with the [`state::Root::opts_gen`] and mode they
 	/// were read under: every `(( ))` asks.
@@ -726,7 +742,9 @@ impl Kernel {
 			killed_by: None,
 			bangs: Vec::new(),
 			settled: Vec::new(),
+			decided: Vec::new(),
 			pid_owners: Vec::new(),
+			held_ends: Vec::new(),
 			math_opts: None,
 			deferrals: Vec::new(),
 			jobctl: jobctl::JobCtl::default(),
@@ -753,12 +771,14 @@ impl Kernel {
 	}
 
 	/// Settle the job vproc `vproc` decides ([`proc::Bang`]): known by the
-	/// OS pid `os`, or by its virtual pid (`None`). Wakes the readers.
+	/// OS pid `os`, or by its virtual pid (`None`). Wakes the readers; a stop
+	/// held for it reaches the job after the turn ([`Self::decided`]).
 	pub fn settle_bang(&mut self, vproc: Vpid, os: Option<u32>) {
 		let Some(i) = self.bangs.iter().position(|b| b.vproc == vproc) else {
 			return;
 		};
 		let bang = self.bangs.swap_remove(i);
+		self.decided.push((bang.vproc, bang.job));
 		if let Some(pid) = os {
 			self.settled.push((bang.job, pid));
 			if bang.vproc != bang.job {
@@ -885,6 +905,7 @@ impl Kernel {
 		status: i32,
 	) {
 		self.pid_owners.retain(|&(.., job)| job != vpid);
+		self.held_ends.retain(|&(v, ..)| v != vpid);
 		let rec = Record::Proc { parent, status: Some(status) };
 		self.root.write(store, Change::Put(Key::Proc(vpid), rec));
 	}
@@ -1846,6 +1867,15 @@ impl Shell {
 				state::set_zsh_option(&mut k.root, cx.store, &mut root, zle, true)
 					.map_err(ShellError::Store)?;
 			}
+		} else if !zsh
+			&& state::option(&mut k.root, cx.store, &root, OptId::Monitor)
+				.map_err(ShellError::Store)?
+		{
+			// A script's job control from the start: an imported `SHELLOPTS`
+			// naming `monitor` (bash `set_job_control`), or `-m` with a
+			// terminal on standard error ([`jobctl::set_monitor`] leaves that
+			// alone).
+			jobctl::set_monitor(&mut k, cx, &root, true);
 		}
 		Ok(Self {
 			k,
@@ -2058,7 +2088,9 @@ impl Shell {
 		// Subshells a host submitted since the last step.
 		self.adopt(cx);
 		self.settle_callouts();
+		self.release_held_stops();
 		let step = self.step_inner(cx, budget);
+		self.release_held_stops();
 		self.k.sync_root(cx.store, &self.procs[0]);
 		step
 	}
@@ -2114,7 +2146,13 @@ impl Shell {
 			if cont.is_none() {
 				self.rr = (i + 1) % self.procs.len();
 			}
-			let slice = left.min(budget.max_ops - ops).max(1);
+			// A vproc stopped while it decides its job's pid runs one op at a
+			// time: it stops after the op that decides ([`Self::holds_stop`]).
+			let slice = if self.procs[i].stopped {
+				1
+			} else {
+				left.min(budget.max_ops - ops).max(1)
+			};
 			let before = ops;
 			exec::run_slice(&mut self.k, &mut self.procs[i], cx, slice, &mut ops);
 			let used = ops - before;
@@ -2185,6 +2223,7 @@ impl Shell {
 				i += 1;
 			}
 		}
+		self.release_held_stops();
 	}
 
 	/// The children the turn spawned may be the stages of the pipeline that
@@ -2467,8 +2506,7 @@ impl Shell {
 		}
 	}
 
-	/// Next vproc to run, round-robin: has work, not stopped, not parked at
-	/// the current wake count.
+	/// Next vproc to run, round-robin ([`Self::runnable`]).
 	fn pick(&self, wakes: u64) -> Option<usize> {
 		let n = self.procs.len();
 		(0..n)
@@ -2477,10 +2515,57 @@ impl Shell {
 	}
 
 	/// Vproc `i` has work and is neither stopped nor waiting for a wake that
-	/// has not come.
+	/// has not come; a stopped one runs on while it decides its job's pid
+	/// ([`Self::holds_stop`]).
 	fn runnable(&self, i: usize, wakes: u64) -> bool {
 		let p = &self.procs[i];
-		p.has_work() && !p.stopped && p.blocked.as_ref().is_none_or(|b| b.at != wakes)
+		p.has_work()
+			&& (!p.stopped || self.holds_stop(i))
+			&& p.blocked.as_ref().is_none_or(|b| b.at != wakes)
+	}
+
+	/// Whether a stop of vproc `i` is held: `i` decides the pid of a job
+	/// that is still to be settled ([`proc::Bang`]), or runs below the vproc
+	/// that does (a command substitution in the words of a function's `exec`
+	/// when the function is the job's command; one in the job's own simple
+	/// command makes its code come first, so that job keeps its virtual pid
+	/// at once, [`exec::bang_stage`]). bash's job has its pid from its fork,
+	/// stopped or not, so the readers of the pid (`$!`, `jobs -l`, `jobs
+	/// -p`, `wait -p`) wait for the decision: the vproc runs on to it, and
+	/// what it runs stops then ([`Self::release_held_stops`]): neither
+	/// [`Self::take`] pauses it nor [`Self::deliver`] signals it.
+	fn holds_stop(&self, i: usize) -> bool {
+		let vpid = self.procs[i].vpid;
+		self.k.bangs.iter().any(|b| self.in_job(vpid, b.vproc))
+	}
+
+	/// A stop held while a job's pid was still to be settled
+	/// ([`Self::holds_stop`]) reaches what the job became once it is
+	/// ([`Kernel::decided`]): each vproc of the deciding one's that the stop
+	/// reached stops its programs now ([`pause_handles`]; a program reports
+	/// its stop as any other, [`jobctl::ext_event`]), and when the job's own
+	/// vproc is stopped, every vproc of the job stops (the stages its
+	/// pipeline started meanwhile). One that still decides another pid holds
+	/// its stop on.
+	fn release_held_stops(&mut self) {
+		if self.k.decided.is_empty() {
+			return;
+		}
+		let decided = std::mem::take(&mut self.k.decided);
+		if !self.procs.iter().any(|p| p.stopped) {
+			return;
+		}
+		for (vproc, job) in decided {
+			let whole = self.procs.iter().any(|p| p.vpid == job && p.stopped);
+			for i in 0..self.procs.len() {
+				let v = self.procs[i].vpid;
+				let reached =
+					(whole && self.in_job(v, job)) || (self.procs[i].stopped && self.in_job(v, vproc));
+				if reached && !self.holds_stop(i) {
+					set_stopped(&mut self.procs[i], true);
+				}
+			}
+		}
 	}
 
 	/// A finished script or an outgoing callout, if any.
@@ -2533,7 +2618,7 @@ impl Shell {
 							sc.live = Live::None;
 						}
 					}
-					signal_lives(&mut self.procs[i], sig, true);
+					signal_lives(&mut self.procs[i], sig, true, true);
 					self.procs[i].stopped = false;
 					if trapped {
 						exec::mark_cancel(&mut self.procs[i], status);
@@ -2940,7 +3025,7 @@ impl Shell {
 					return;
 				},
 			};
-			if let Err(err) = self.take(cx, i, i, Signal::Int, n, trap, false) {
+			if let Err(err) = self.take(cx, i, i, Signal::Int, n, trap, Reach::Shell) {
 				self.k.fail(err);
 				return;
 			}
@@ -2951,10 +3036,10 @@ impl Shell {
 	/// `Some(true)` an ignoring one), the trap of vproc `own` (`i`, or the
 	/// zsh `( … )` the root runs in place of itself, [`Self::in_place_end`])
 	/// is due ([`trapped`]); without one, what the shell does itself
-	/// ([`untrapped::decide`]). `pass_on`: the signal was sent to more than
-	/// the shell's own process, so what `i` runs gets it too. One step for
-	/// [`Self::deliver`] and [`Self::int_to_foreground`]: the job change of
-	/// a stop or continue, if any.
+	/// ([`untrapped::decide`]). `reach`: whether what `i` runs gets the
+	/// signal too ([`Reach`]). One step for [`Self::deliver`] and
+	/// [`Self::int_to_foreground`]: the job change of a stop or continue, if
+	/// any.
 	///
 	/// # Errors
 	///
@@ -2968,7 +3053,7 @@ impl Shell {
 		sig: Signal,
 		n: u64,
 		trap: Option<bool>,
-		pass_on: bool,
+		reach: Reach,
 	) -> Result<Option<(Vpid, Option<Signal>)>, StoreError> {
 		let platform = self.k.engine.config().platform;
 		if let Some(ignored) = trap {
@@ -2987,18 +3072,14 @@ impl Shell {
 		match decision {
 			untrapped::Untrapped::Handled | untrapped::Untrapped::Ignored => {},
 			untrapped::Untrapped::ZshHupExit => {
-				if pass_on {
-					signal_lives(&mut self.procs[i], sig, false);
-				}
+				pass(&mut self.procs[i], sig, false, reach);
 				if root {
 					self.release_foreground();
 				}
 				exec::zsh_hup_exit(&mut self.k, &mut self.procs[i], cx);
 			},
 			untrapped::Untrapped::Held(held) => {
-				if pass_on {
-					signal_lives(&mut self.procs[i], sig, false);
-				}
+				pass(&mut self.procs[i], sig, false, reach);
 				// The wait's end decides ([`end_held_sigint`]).
 				self.k.set_int_note(vpid, Some(IntNote::Held(held)));
 			},
@@ -3011,13 +3092,11 @@ impl Shell {
 					self.release_foreground();
 					self.end(cx, i, sig, status, false);
 				} else {
-					self.kill(cx, i, sig, status);
+					self.kill_reached(cx, i, sig, status, reach);
 				}
 			},
 			untrapped::Untrapped::BashExitTrapThenDie => {
-				if pass_on {
-					signal_lives(&mut self.procs[i], sig, true);
-				}
+				pass(&mut self.procs[i], sig, true, reach);
 				if root {
 					self.k.killed_by = Some(i32::from(sig.number(platform)));
 					self.release_foreground();
@@ -3039,18 +3118,38 @@ impl Shell {
 					self.release_foreground();
 					self.end(cx, i, sig, status, false);
 				},
-				DefaultAction::Terminate => self.kill(cx, i, sig, status),
+				DefaultAction::Terminate => self.kill_reached(cx, i, sig, status, reach),
 				DefaultAction::Stop | DefaultAction::Continue => {
 					let stop = sig.default_action() == DefaultAction::Stop;
+					// A stop of a vproc that decides its job's pid waits for the
+					// decision: what it runs stops then ([`Self::holds_stop`]).
+					let held = stop && self.holds_stop(i);
 					let p = &mut self.procs[i];
 					let change = (p.stopped != stop).then_some((p.vpid, stop.then_some(sig)));
-					set_stopped(p, stop);
+					if held {
+						p.stopped = true;
+					} else {
+						set_stopped(p, stop);
+					}
 					return Ok(change);
 				},
 				DefaultAction::Ignore => {},
 			},
 		}
 		Ok(None)
+	}
+
+	/// [`Self::kill`] of vproc `i` with `sig`; with [`Reach::Given`] its
+	/// externals have the signal from the kernel already: they are left to
+	/// end of it ([`exec::release_externals`]), as the children of a bash
+	/// subshell that died of a `killpg` go on with it.
+	fn kill_reached(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32, reach: Reach) {
+		if reach == Reach::Given {
+			exec::release_externals(&mut self.procs[i]);
+			self.end(cx, i, sig, status, false);
+		} else {
+			self.kill(cx, i, sig, status);
+		}
 	}
 
 	/// The vproc at the end of the chain that the process of vproc `i` is:
@@ -3078,8 +3177,12 @@ impl Shell {
 		let (target, sender) = match target {
 			SigTarget::Group(v) => (SigTarget::Vpid(v), Sender::Kernel),
 			SigTarget::Outside(v) => (SigTarget::Vpid(v), Sender::Process),
+			SigTarget::JobGroup(id) => (SigTarget::Job(id), Sender::Kernel),
 			target => (target, Sender::Shell),
 		};
+		// `kill` of a job's OS process group ([`SigTarget::JobGroup`]): the
+		// job's programs have the signal from the kernel already.
+		let given = matches!(target, SigTarget::Job(_)) && sender == Sender::Kernel;
 		let job_root = match target {
 			SigTarget::Job(id) => self
 				.procs
@@ -3095,7 +3198,9 @@ impl Shell {
 					self.procs[i].vpid == v
 				},
 				SigTarget::All => true,
-				SigTarget::Job(_) => job_root.is_some_and(|v| self.in_job(self.procs[i].vpid, v)),
+				SigTarget::Job(_) | SigTarget::JobGroup(_) => {
+					job_root.is_some_and(|v| self.in_job(self.procs[i].vpid, v))
+				},
 				SigTarget::Label(l) => l != 0 && self.procs[i].lineage.label == l,
 				SigTarget::Tree(v) => self.in_job(self.procs[i].vpid, v),
 			})
@@ -3178,10 +3283,44 @@ impl Shell {
 				continue;
 			}
 			let terminating = trap.is_none() && sig.default_action() == DefaultAction::Terminate;
+			// `KILL` is never ordered behind pending signals (the kernel ends
+			// the process at once): the ends a stopped vproc held go with it.
+			if sig == Signal::Kill {
+				let vpid = self.procs[i].vpid;
+				self.k.held_ends.retain(|&(v, ..)| v != vpid);
+			}
+			let dialect = self.procs[i].mode.dialect();
+			let bash = dialect == crate::bash::ids::Dialect::Bash;
+			// Whether the signal continues a stopped vproc: `KILL` ends it in
+			// any case; bash's `kill_pid` sends `CONT` after `TERM` or `HUP`
+			// only to a job's group (`kill %job`, `kill -- -PID`, here a
+			// [`SigTarget::Job`]), whatever the job does with the signal,
+			// where `kill PID` and a signal from elsewhere leave it stopped
+			// with the signal pending ([`continues`]).
+			let continuing = continues(sig, dialect)
+				&& (sig == Signal::Kill || !bash || matches!(target, SigTarget::Job(_)));
+			// A trapped or ignored `TERM` or `HUP` that bash's `kill` continues
+			// a stopped bash job with: the job runs again, and its trap runs
+			// then, after any end it holds ([`Kernel::held_ends`]).
+			let continued_trapped = trap.is_some()
+				&& bash
+				&& continuing
+				&& sig != Signal::Kill
+				&& target != SigTarget::Vpid(root.0)
+				&& self.procs[i].stopped;
 			// A signal to the shell PID does not also target its foreground child.
 			// A terminating child is signaled once by `kill`, not here and there.
-			if target != SigTarget::Vpid(root.0) && !terminating {
-				signal_lives(&mut self.procs[i], sig, false);
+			// A stop held for a job's pid reaches its programs once the pid is
+			// settled ([`Self::release_held_stops`]).
+			let held =
+				trap.is_none() && sig.default_action() == DefaultAction::Stop && self.holds_stop(i);
+			if target != SigTarget::Vpid(root.0) && !terminating && !held {
+				signal_lives(&mut self.procs[i], sig, continued_trapped, !given);
+			}
+			if continued_trapped {
+				let vpid = self.procs[i].vpid;
+				set_stopped(&mut self.procs[i], false);
+				changed.push((vpid, None));
 			}
 			// A vproc that is just its program (bash would have `exec`'d it:
 			// `cmd &`, a pipeline stage, `( cmd )`, `exec cmd`) or just waits
@@ -3194,16 +3333,18 @@ impl Shell {
 				if let Some(lone) = transparent(&self.procs[i], reaches_children) {
 					let p = &mut self.procs[i];
 					let stopped = p.stopped;
-					if lone {
+					if lone && !given {
 						for frame in &mut p.frames {
 							if let Some(Live::Ext(ext)) = frame.scratch.as_mut().map(|sc| &mut sc.live) {
 								let _ = ext.signal(sig);
 							}
 						}
 					}
-					if stopped {
-						// Continued so the program can act on the signal (bash
-						// `kill_pid` continues a stopped job it signals).
+					// Continued so the program can act on the signal; bash's
+					// `kill_pid` continues a stopped job only for some signals
+					// and only by its group (`continuing`): any other waits in
+					// the stopped program.
+					if stopped && continuing {
 						set_stopped(p, false);
 						changed.push((p.vpid, None));
 					}
@@ -3215,9 +3356,57 @@ impl Shell {
 			if self.procs[i].parent.is_none() && zle::signal(&mut self.procs[i], sig, trap.is_some()) {
 				continue;
 			}
-			// A signal sent to more than the shell reaches what it runs too;
-			// the shell does not wait for that to end.
-			match self.take(cx, i, own, sig, n, trap, target != SigTarget::Vpid(root.0)) {
+			// A stopped bash vproc of shell code acts on its pending ends once
+			// it is continued, the lowest signal number first, as a stopped
+			// bash subshell does ([`Kernel::held_ends`]): a terminating signal
+			// that does not continue it waits there (`kill PID` too), and one
+			// that does (`TERM`, `HUP` by `kill` of the job) joins them and
+			// continues it, so that `USR1` then `TERM` ends it of `USR1`.
+			// `KILL` ends it at once. What it runs has the signal waiting,
+			// from the kernel or here. A vproc that only waits for its `( … )`
+			// or pipeline is one process with them in bash: its pending ends
+			// are theirs, so a signal sent to it by pid waits in them.
+			if terminating
+				&& target != SigTarget::Vpid(root.0)
+				&& self.procs[i].stopped
+				&& (!continuing || (sig != Signal::Kill && bash))
+			{
+				let mut holders = vec![i];
+				if transparent(&self.procs[i], true) == Some(false) {
+					let children: Vec<Vpid> = self.procs[i]
+						.frames
+						.last()
+						.and_then(|f| f.scratch.as_ref())
+						.map_or_else(Vec::new, |sc| sc.children.iter().map(|&(v, _)| v).collect());
+					let stopped: Vec<usize> = (0..self.procs.len())
+						.filter(|&j| self.procs[j].stopped && children.contains(&self.procs[j].vpid))
+						.collect();
+					if !stopped.is_empty() {
+						holders = stopped;
+					}
+				}
+				for j in holders {
+					signal_lives(&mut self.procs[j], sig, continuing, !given);
+					let vpid = self.procs[j].vpid;
+					self.k.held_ends.push((vpid, sig, given));
+					if continuing {
+						set_stopped(&mut self.procs[j], false);
+						changed.push((vpid, None));
+					}
+				}
+				continue;
+			}
+			// A signal sent to more than the shell reaches what it runs too
+			// (from the kernel already for a job's group); the shell does not
+			// wait for that to end.
+			let reach = if given {
+				Reach::Given
+			} else if target == SigTarget::Vpid(root.0) {
+				Reach::Shell
+			} else {
+				Reach::Runs
+			};
+			match self.take(cx, i, own, sig, n, trap, reach) {
 				Ok(Some(change)) => changed.push(change),
 				Ok(None) => {},
 				Err(err) => {
@@ -3229,9 +3418,61 @@ impl Shell {
 		if let Some(targets) = foreground {
 			self.int_to_foreground(cx, n, targets);
 		}
+		// bash learns that a job it did not continue itself (`kill -CONT
+		// PID`, where `%job` marks it running) runs again only from its wait
+		// status (`waitchld`'s `WCONTINUED`): until then the job is stopped in
+		// its table (`wait` warns of it). In a script doing job control
+		// without a terminal, a job whose program reports its continue
+		// ([`jobctl::ext_event`]) waits for that report.
+		let by_pid = sig == Signal::Cont
+			&& sender == Sender::Shell
+			&& matches!(target, SigTarget::Vpid(_))
+			&& jobctl::without_terminal(&self.k);
+		let continued: Vec<Vpid> = changed
+			.iter()
+			.filter(|&&(_, stop)| stop.is_none())
+			.map(|&(v, _)| v)
+			.collect();
 		for (vpid, stop) in changed {
+			if by_pid && stop.is_none() && self.runs_external(vpid) {
+				continue;
+			}
 			self.job_changed(cx, vpid, stop);
 		}
+		// A vproc continued takes the end it held while stopped, the lowest
+		// signal number first, as the kernel delivers the pending signals
+		// of a stopped bash subshell.
+		let platform = self.k.engine.config().platform;
+		for vpid in continued {
+			while let Some((at, _)) = self
+				.k
+				.held_ends
+				.iter()
+				.enumerate()
+				.filter(|&(_, &(v, ..))| v == vpid)
+				.min_by_key(|&(_, &(_, sig, _))| sig.number(platform))
+			{
+				let (_, held, given) = self.k.held_ends.remove(at);
+				let Some(i) = self.procs.iter().position(|p| p.vpid == vpid) else {
+					break;
+				};
+				let reach = if given { Reach::Given } else { Reach::Runs };
+				if let Err(err) = self.take(cx, i, i, held, n, None, reach) {
+					self.k.fail(err);
+					return;
+				}
+			}
+		}
+	}
+
+	/// Whether vproc `vpid` waits for an external, whose stops and
+	/// continues it learns of ([`crate::bash::host::ExtProc::poll_event`]).
+	fn runs_external(&self, vpid: Vpid) -> bool {
+		self.procs.iter().find(|p| p.vpid == vpid).is_some_and(|p| {
+			p.frames
+				.iter()
+				.any(|f| matches!(f.scratch.as_deref().map(|sc| &sc.live), Some(Live::Ext(_))))
+		})
 	}
 
 	fn set_paused(&mut self, cx: &mut Cx<'_>, on: bool) {
@@ -3657,16 +3898,19 @@ fn runs_in_place(p: &Vproc) -> bool {
 		.is_some_and(|e| e.in_place || matches!(e.control, Some(proc::Transfer::Exec)))
 }
 
-/// Pass `sig` on to the builtin tasks and externals `p` runs now, and
-/// continue the externals after it when `cont` (bash's `kill_pid` continues
-/// a stopped job it ends).
-fn signal_lives(p: &mut Vproc, sig: Signal, cont: bool) {
+/// Pass `sig` on to the builtin tasks `p` runs now, and to its externals
+/// when `externals` (else they have it from the kernel already, `kill` of
+/// their job's group), and continue the externals after it when `cont`
+/// (bash's `kill_pid` continues a stopped job it ends).
+fn signal_lives(p: &mut Vproc, sig: Signal, cont: bool, externals: bool) {
 	for frame in &mut p.frames {
 		if let Some(sc) = frame.scratch.as_mut() {
 			match &mut sc.live {
 				Live::Task(task) => task.signal(sig),
 				Live::Ext(ext) => {
-					let _ = ext.signal(sig);
+					if externals {
+						let _ = ext.signal(sig);
+					}
 					if cont {
 						let _ = ext.cont();
 					}
@@ -3675,6 +3919,36 @@ fn signal_lives(p: &mut Vproc, sig: Signal, cont: bool) {
 			}
 		}
 	}
+}
+
+/// What a signal a vproc takes ([`Shell::take`]) reaches beside it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+	/// The shell's own process alone.
+	Shell,
+	/// What the vproc runs, too.
+	Runs,
+	/// What the vproc runs has it from the kernel already (`kill` of its
+	/// job's OS process group, [`SigTarget::JobGroup`]): only its builtin
+	/// tasks get it here.
+	Given,
+}
+
+/// [`signal_lives`] of vproc `p` as `reach` says.
+fn pass(p: &mut Vproc, sig: Signal, cont: bool, reach: Reach) {
+	if reach != Reach::Shell {
+		signal_lives(p, sig, cont, reach == Reach::Runs);
+	}
+}
+
+/// Whether a terminating `sig` continues the stopped job of `dialect` it
+/// reaches: bash `kill_pid` continues one it sends `TERM` or `HUP`
+/// (jobs.c), and the kernel ends a stopped process of `KILL`; any other
+/// waits, pending in the stopped processes, until they are continued.
+/// zsh mode continues it for every one, as before.
+const fn continues(sig: Signal, dialect: crate::bash::ids::Dialect) -> bool {
+	!matches!(dialect, crate::bash::ids::Dialect::Bash)
+		|| matches!(sig, Signal::Term | Signal::Hup | Signal::Kill)
 }
 
 /// Whether a terminating signal to `p` is the business of what `p` runs

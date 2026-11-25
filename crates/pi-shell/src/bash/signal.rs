@@ -493,6 +493,11 @@ pub enum SigTarget {
 	Outside(Vpid),
 	/// Every process of a job (and its externals' process group).
 	Job(JobId),
+	/// Every virtual process of a job, as `kill` signalled the job's OS
+	/// process group (bash `kill_pid`'s `killpg`): the job's programs, in
+	/// that group, have the signal from the kernel already, so only what
+	/// runs in obash's own process takes it here.
+	JobGroup(JobId),
 	/// Every virtual process of the shell.
 	All,
 	/// Every virtual process whose
