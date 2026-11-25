@@ -14,13 +14,14 @@
  * lockfile, and the holder's own publish lands cleanly once released.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { FileLock as NativeFileLock } from "@oh-my-pi/pi-natives";
 import { FileSessionStorage, SessionLockError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { startNativeLockHolder } from "../helpers/native-lock-holder";
 
 /** Mirrors the OS-gate sidecar derived in `#withPublishLock`. */
 function osGatePath(lockPath: string): string {
@@ -35,6 +36,7 @@ describe("publish lock OS gate", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		await fsp.rm(tempDir, { recursive: true, force: true });
 	});
 
@@ -94,4 +96,28 @@ describe("publish lock OS gate", () => {
 		await expect(writer.close()).rejects.toBeInstanceOf(SessionLockError);
 		expect(fs.readFileSync(sessionPath, "utf8")).toBe("original\n");
 	});
+
+	// If this regresses, a session write that waits on the gate another omp process holds makes a
+	// native claim on every poll, each blocking the thread about 50 ms on Linux, where a probe answers
+	// at once.
+	it.skipIf(process.platform !== "linux")(
+		"waits on a gate another process holds by probing it, with one claim at the end of the wait",
+		async () => {
+			const storage = new FileSessionStorage();
+			const sessionPath = path.join(tempDir, "session.jsonl");
+			storage.writeTextSync(sessionPath, "original\n");
+			const gatePath = osGatePath(path.join(tempDir, ".session.jsonl.lock"));
+			const holder = await startNativeLockHolder(gatePath, path.join(tempDir, "holder-ready"));
+			try {
+				const claim = vi.spyOn(NativeFileLock, "tryAcquire");
+				expect(() => storage.writeTextSync(sessionPath, "B-content\n")).toThrow(SessionLockError);
+				expect(claim.mock.calls.filter(([claimed]) => claimed === gatePath)).toHaveLength(1);
+			} finally {
+				holder.kill();
+				await holder.exited;
+			}
+			expect(fs.readFileSync(sessionPath, "utf8")).toBe("original\n");
+		},
+		10_000,
+	);
 });

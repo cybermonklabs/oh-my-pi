@@ -513,6 +513,36 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		expect(active?.warning).toContain(IMAGE_REMEDY_FRAGMENT);
 	});
 
+	it("does not continue for a next-run steer alone after a frame rescue that frees too little", async () => {
+		await createSession({ frameCount: SEEDED_FRAME_COUNT });
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 190000, contextWindow: 200000, percent: 95 });
+		vi.spyOn(session, "shake").mockResolvedValue({
+			mode: "elide",
+			toolResultsDropped: 0,
+			blocksDropped: 0,
+			tokensFreed: 0,
+		});
+		const firstKept = sessionManager.getBranch()[0];
+		if (!firstKept) throw new Error("Expected a seeded branch");
+		vi.spyOn(snapcompact, "compact").mockResolvedValue({
+			summary: "Rebuilt archive at a smaller frame budget.",
+			shortSummary: "rebuilt snapcompact archive",
+			firstKeptEntryId: firstKept.id,
+			tokensBefore: 150_000,
+			details: { readFiles: [], modifiedFiles: [] },
+			preserveData: makeArchivePreserveData(4),
+		});
+		await session.steer("Also check the README.", undefined, { holdUntilNextRun: true });
+
+		await triggerMaintenance();
+
+		// The steer waits for the session's next run; no queued-message continuation starts one for it.
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(session.removeQueuedMessage("Also check the README.", "steering")).toBe(true);
+	});
+
 	it("identifies irreducible fixed context instead of blaming tool output", async () => {
 		await createSession({ frameCount: SEEDED_FRAME_COUNT });
 		session.agent.setSystemPrompt(["fixed instructions ".repeat(40_000)]);

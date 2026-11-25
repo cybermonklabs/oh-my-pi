@@ -38,6 +38,7 @@ import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { ExtensionRunner, PreparedExtension } from "../extensibility/extensions";
 import type { CacheWarmer } from "./cache-warmer";
+import type { DateCwdReminderInjector } from "./date-cwd-reminder";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
 import type { Skill, SkillWarning } from "../extensibility/skills";
@@ -370,6 +371,12 @@ export interface AgentSessionConfig {
 	 * Without it, advisors share {@link transformProviderContext}.
 	 */
 	createAdvisorTransformProviderContext?: () => (context: Context, model: Model) => Context | Promise<Context>;
+	/**
+	 * The date/cwd reminder injector {@link transformProviderContext} applies. A
+	 * compaction tells it which turns the history still holds, so it keeps nothing
+	 * for the turns the compaction cut.
+	 */
+	dateCwdReminder?: DateCwdReminderInjector;
 	/** Stream wrapper for side-channel requests. */
 	sideStreamFn?: StreamFn;
 	/** Stream wrapper for advisor requests. */
@@ -498,6 +505,18 @@ export interface PromptOptions {
 	 *  an in-flight tool batch, injecting at the next step boundary instead (see
 	 *  AgentSession.sendUserMessage's `deliverAs: "aside"`). */
 	streamingBehavior?: "steer" | "followUp" | "aside";
+	/**
+	 * With `streamingBehavior: "steer"`: a session that is not streaming where this prompt
+	 * would start a turn (at its entry, or at a later re-check before dispatch) starts none.
+	 * It holds the message as a next-run steer, as
+	 * `steer(text, images, { holdUntilNextRun: true, queueId, onTaken })` queues it, calls
+	 * `onHeld`, and resolves. Held at entry, the message is handled as `steer` handles it
+	 * (prompt templates expand, an extension command is refused); held at a re-check, it keeps
+	 * what this prompt already did to it. A streaming session queues the message into its
+	 * running turn as without this option, and `onHeld` is not called. Not for use with
+	 * {@link followUps}.
+	 */
+	idleSteer?: IdleSteerOptions;
 	/** Optional tool choice override for the next LLM call. */
 	toolChoice?: ToolChoice;
 	/** Send as a developer/system message instead of user. */
@@ -543,6 +562,16 @@ export interface PromptOptions {
 	followUps?: readonly string[];
 }
 
+/** {@link PromptOptions.idleSteer}: how a steer that finds its session idle waits for the next run. */
+export interface IdleSteerOptions {
+	/** {@link SteerOptions.queueId} of the held message. */
+	queueId: string;
+	/** {@link SteerOptions.onTaken} of the held message. */
+	onTaken: () => void;
+	/** Called synchronously once the message is held on the steering queue for the next run. */
+	onHeld: () => void;
+}
+
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled
  *  before it reached the agent (an abort or usage preflight denial raced turn
  *  setup), so it was never persisted to the session. A prompt carrying
@@ -577,7 +606,36 @@ export interface SteerOptions {
 	attribution?: MessageAttribution;
 	/** Called synchronously with the messages pushed onto the steering queue. See {@link PromptOptions.onPromptQueued}. */
 	onPromptQueued?: PromptOptions["onPromptQueued"];
+	/**
+	 * Queue the message as a next-run steer: it starts no run of its own and waits on
+	 * the steering queue until a run's steering poll takes it. An idle session's next
+	 * run injects it before its first model call, and a streaming run at its next step
+	 * boundary. No queued-message drain (on queueing, when the session settles, after
+	 * an abort, a compaction or a frame rescue) starts a turn for it alone, so it never
+	 * races the prompt of whoever drives the session (the task executor for a subagent).
+	 */
+	holdUntilNextRun?: boolean;
+	/**
+	 * A name for the queued message, unique within the session: the take-back
+	 * `removeQueuedMessage({ queueId }, "steering")` removes exactly this message,
+	 * whatever else is queued with the same text. A name rather than the message
+	 * object, so it survives the copies a session homed on another thread hands across.
+	 */
+	queueId?: string;
+	/**
+	 * Called once, when a run takes exactly this queued message into its context
+	 * (the session emits its `message_end`); never for another message with the
+	 * same text, and not at all if the message is taken back first.
+	 */
+	onTaken?: () => void;
 }
+
+/**
+ * The queued message a take-back removes: the first whose submitted text (or
+ * queued chip text) is the string, or exactly the message a steer named with
+ * {@link SteerOptions.queueId}.
+ */
+export type QueuedMessageTarget = string | { readonly queueId: string };
 
 /** Options for AgentSession.sendUserMessage(). */
 export interface SendUserMessageOptions {

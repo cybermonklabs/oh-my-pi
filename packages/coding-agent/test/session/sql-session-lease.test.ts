@@ -19,6 +19,7 @@ import {
 	type SqlSessionStorageTransaction,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SQL } from "bun";
+import { dropSessionStoreTables } from "../helpers/sql-session-storage";
 import {
 	type GatedClient,
 	gatedClient,
@@ -31,10 +32,10 @@ import {
 	openLeaseDb,
 	ROW_LEASE_BACKENDS,
 	rejection,
+	STILL,
 	TcpProxy,
 	transcript,
 	until,
-	type WireStatement,
 } from "./sql-session-lease-fixture";
 
 // These tests wait in real time on purpose: a lease expires and a heartbeat
@@ -45,8 +46,6 @@ const ID = "01a1f000-0000-7000-8000-000000000001";
 const OTHER_ID = "01a1f000-0000-7000-8000-000000000002";
 /** Short timings so a test sees a heartbeat and an expiry in seconds. */
 const SHORT = { expiryMs: 3000, heartbeatMs: 500 };
-/** Timings under which a test's own changes to a lease row are never refreshed away by a heartbeat. */
-const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 /** How far past its wait a claim behind a stalled lock may answer: the lock bound and a little room. */
 const LOCK_SLACK_MS = 3500;
 
@@ -182,6 +181,29 @@ async function watchedRows(db: LeaseDb, file: string, other: string) {
 	return [await db.row(file), await db.row(other), await db.row(markerOf(file))];
 }
 
+/**
+ * A transcript of session {@link ID} past 16 MiB, each later line padded with
+ * `fill`: a staged full write of it stores more than 16 parts of 1 MiB, so it
+ * takes more than one staging batch (16 parts per transaction).
+ */
+function stagedLines(fill: string): string[] {
+	const pad = fill.repeat(1024 * 1024);
+	return [
+		transcript(ID, "staged"),
+		...Array.from(
+			{ length: 18 },
+			(_, n) =>
+				`${JSON.stringify({ type: "custom", customType: "pad", id: `p${n}`, parentId: null, timestamp: "2026-11-17T00:00:00.000Z", data: pad })}\n`,
+		),
+	];
+}
+
+/** The staging paths that hold parts (`<path>#staging-…`): a staged full write's parts not yet swapped in. */
+async function stagingPaths(db: LeaseDb): Promise<string[]> {
+	const rows = await db.sql(`SELECT DISTINCT path FROM ${db.table}_parts`);
+	return rows.map(row => String(row.path)).filter(stored => stored.includes("#staging-"));
+}
+
 for (const { adapter, url } of LEASE_BACKENDS) {
 	describe.skipIf(!url)(`SqlSessionStorage session claims (${adapter})`, () => {
 		it("claims only when asked to, and never on an in-memory SQLite database", async () => {
@@ -278,6 +300,53 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			expect((await db.leases(ID))[0]?.pid).toBe(process.pid);
 			release?.();
 		}, 30_000);
+
+		it("lets the holder's staged full write land, and refuses one once another process holds the session, changing and staging nothing", async () => {
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const file = sessionFile(db);
+			const release = await storage.acquireSessionClaim?.(ID, file);
+			expect(release).toBeFunction();
+			await storage.writeText(file, transcript(ID, "before"));
+
+			// The holder's own staged write, of more than one staging batch, lands whole.
+			const held = stagedLines("h");
+			await storage.writeLinesAtomic(file, held, { expectedSize: storage.statSync(file).size });
+			const landed = await db.row(file);
+			const [parts] = await db.sql(`SELECT count(*) AS n FROM ${db.table}_parts WHERE path = @1`, [file]);
+			expect({
+				landed: landed?.content === held.join(""),
+				moreThanOneBatch: Number(parts?.n) > 16,
+				staging: await stagingPaths(db),
+			}).toEqual({ landed: true, moreThanOneBatch: true, staging: [] });
+			if (adapter === "sqlite") {
+				// A live process's OS lock keeps every other process from taking the session.
+				release?.();
+				return;
+			}
+
+			// The holder looks dead to the database clock, and another process takes the session over.
+			await db.ageLease(ID, STILL.expiryMs + 60_000);
+			await using other = await LeaseProcess.start(processConfig(db), db.dir.join("home"));
+			expect((await other.run({ op: "claim", sessionId: ID, path: file })).held).toBe(true);
+			const before = await db.row(file);
+			expect(storage.sessionClaimLost?.(ID)).toBe(false);
+
+			const refused = await rejection(
+				storage.writeLinesAtomic(file, stagedLines("r"), { expectedSize: storage.statSync(file).size }),
+			);
+			expect(refused).toBeInstanceOf(SessionLeaseLostError);
+			expect(refused).toMatchObject({ path: file, sessionId: ID });
+			// The stored row and parts read back byte for byte as before. No staging part is left: the
+			// delete of a failed write's own staging parts is fenced too, and refused under a lost lease,
+			// so a staging part here would mean a staging batch landed before the fence refused.
+			expect({
+				lost: storage.sessionClaimLost?.(ID),
+				unchanged: Bun.deepEquals(await db.row(file), before),
+				staging: await stagingPaths(db),
+			}).toEqual({ lost: true, unchanged: true, staging: [] });
+			release?.();
+		}, 120_000);
 
 		it.skipIf(adapter !== "sqlite")(
 			"refuses a claim through another spelling of the database file while another process holds the session",
@@ -1356,9 +1425,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 					expect(await db.leases(ID)).toEqual([]);
 				} finally {
 					await client.end();
-					for (const name of [db.leaseTable, parts, blobs, refs, db.table]) {
-						await db.sql(`DROP TABLE IF EXISTS ${name}`);
-					}
+					await dropSessionStoreTables({ unsafe: query => db.sql(query) }, db.table, db.leaseTable);
 					await db.sql(`REVOKE ALL ON SCHEMA public FROM ${role}`);
 					await db.sql(`DROP ROLE IF EXISTS ${role}`);
 				}
@@ -1424,9 +1491,7 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 					expect(await db.leases(ID)).toEqual([]);
 				} finally {
 					await client.end();
-					for (const name of [db.leaseTable, parts, blobs, refs, db.table]) {
-						await db.sql(`DROP TABLE IF EXISTS ${name}`);
-					}
+					await dropSessionStoreTables({ unsafe: query => db.sql(query) }, db.table, db.leaseTable);
 					await db.sql(`DROP USER IF EXISTS '${user}'@'%'`);
 				}
 			},
@@ -1494,6 +1559,9 @@ const NON_OWNER_STARTUP: readonly RegExp[] = [
 	/^SELECT path, mtime_ms, byte_len, title, title_source, title_updated_at FROM /,
 	/^SELECT a\.attname AS name, pg_catalog\.format_type\(/,
 	/^SELECT 'trigger' AS kind, /,
+	// PostgreSQL: the collation the parts' path column compares with, and the database's: one read-only
+	// pg_catalog SELECT, matched whole so that nothing else rides under it.
+	/^SELECT pg_catalog\.to_jsonb\(c\)::pg_catalog\.text AS collation, pg_catalog\.to_jsonb\(d\)::pg_catalog\.text AS database FROM pg_catalog\.pg_attribute a JOIN pg_catalog\.pg_collation c ON c\.oid = a\.attcollation JOIN pg_catalog\.pg_database d ON d\.datname = pg_catalog\.current_database\(\) WHERE a\.attrelid = pg_catalog\.to_regclass\((\$1| \$omp\$[^$]*\$omp\$ )\) AND a\.attname = 'path' AND NOT a\.attisdropped$/,
 	/^SELECT a\.attname::text AS name FROM pg_catalog\.pg_index i /,
 	/^SELECT pg_catalog\.has_table_privilege\(/,
 	// MySQL: the blob and reference tables' keys, and statements that change no row and need one privilege each.

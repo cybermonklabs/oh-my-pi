@@ -3369,7 +3369,8 @@
 						"type": "object",
 						"properties": {},
 						"additionalProperties": {}
-					}
+					},
+					"x-deep-json": true
 				},
 				"leafId": {
 					"anyOf": [

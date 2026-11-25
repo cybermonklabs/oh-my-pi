@@ -8,7 +8,7 @@ import type {
 	ProviderPayload,
 	TextContent,
 } from "@oh-my-pi/pi-ai";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { isRecord, stringifyDeepJson } from "@oh-my-pi/pi-utils";
 import type { SessionContext } from "../session/session-context";
 import type { JsonValue, SecretObfuscator } from "./obfuscator";
 import { collectJsonRegexSecretValues, mapJsonStrings } from "./placeholder-scan";
@@ -285,7 +285,8 @@ function mapNativeReplayItem(value: unknown, transform: (text: string) => string
 			return transform(value);
 		}
 		const next = mapJsonStrings(parsed, transform);
-		return next === parsed ? value : JSON.stringify(next);
+		// The text parsed holds as many levels as JSON.parse reads, past where JSON.stringify runs out of stack.
+		return next === parsed ? value : stringifyDeepJson(next, { probeDepth: true });
 	};
 	switch (value.type) {
 		case undefined:

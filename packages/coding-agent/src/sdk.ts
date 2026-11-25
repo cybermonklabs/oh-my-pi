@@ -210,11 +210,7 @@ import {
 	CREDENTIAL_DISABLED_NOTICE_SOURCE,
 	formatCredentialDisabledNotice,
 } from "./session/credential-disabled-notice";
-import {
-	createSessionDateCwdReminderJournal,
-	type DateCwdReminderJournal,
-	DateCwdReminderInjector,
-} from "./session/date-cwd-reminder";
+import { createSessionDateCwdReminderJournal, DateCwdReminderInjector } from "./session/date-cwd-reminder";
 import { createInterruptedToolResults, createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
 import { recoverInlineSloppyEdit } from "./session/inline-edit-recovery";
 import {
@@ -4959,9 +4955,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		);
 		// One transform per conversation: the date/cwd reminder remembers what each
 		// conversation was sent, so the main loop and every advisor get their own.
-		// Only the main loop journals its reminders in the session.
-		const createTransformProviderContext = (journal?: DateCwdReminderJournal) => {
-			const dateCwdReminder = new DateCwdReminderInjector(journal);
+		// Only the main loop journals its reminders in the session, and only its
+		// injector hears of the session's compactions.
+		const createTransformProviderContext = (injector = new DateCwdReminderInjector()) => {
 			return async (context: Context, transformModel: Model): Promise<Context> => {
 				let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
 				// The archive was sized for the model active at the last context build; a model switch may have lowered the budget.
@@ -4979,16 +4975,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				// Keep per-request volatility out of the system prompt: the date/cwd
 				// reminder rides on the first user turn so open-weight providers keep
 				// their tool-schema prefix cache (#7404).
-				return dateCwdReminder.transform(
+				return injector.transform(
 					transformed,
 					formatLocalCalendarDate(),
 					normalizePromptPath(sessionManager.getCwd()),
 				);
 			};
 		};
-		const transformProviderContext = createTransformProviderContext(
-			createSessionDateCwdReminderJournal(sessionManager),
-		);
+		const dateCwdReminder = new DateCwdReminderInjector(createSessionDateCwdReminderJournal(sessionManager));
+		const transformProviderContext = createTransformProviderContext(dateCwdReminder);
 		const onPayload = async (payload: unknown, model?: Model, signal?: AbortSignal) => {
 			return await extensionRunner.emitBeforeProviderRequest(payload, model, signal);
 		};
@@ -5466,6 +5461,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			transformContext,
 			transformProviderContext,
 			createAdvisorTransformProviderContext: () => createTransformProviderContext(),
+			dateCwdReminder,
 			onPayload,
 			onResponse,
 			sideStreamFn: settingsAwareStreamFn,
@@ -5880,11 +5876,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						// The teardown stops the workers' turns and their own jobs: a vibe turn the
 						// parent's teardown interrupts is not resumed (`docs/vibe-mode.md`).
 						try {
-							await vibeRegistry.suspendScope(
-								vibeRegistry.ownerScope(vibeParentSession),
-								scopedAsyncJobManager,
-								"stop",
-							);
+							await vibeRegistry.suspendScope(vibeRegistry.ownerScope(vibeParentSession), scopedAsyncJobManager);
 						} catch (error) {
 							logger.warn("Session dispose: suspending vibe workers failed", { error: String(error) });
 						}
@@ -6100,10 +6092,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					convertToLlm: convertToLlmFinal,
 					transformContext: async messages => wrapSteeringForModel(messages),
 					// The primary's chain and reminder placements, so the capture matches its cached prompt.
-					transformProviderContext: createTransformProviderContext({
-						...createSessionDateCwdReminderJournal(sessionManager),
-						record: () => {},
-					}),
+					transformProviderContext: createTransformProviderContext(
+						new DateCwdReminderInjector({
+							...createSessionDateCwdReminderJournal(sessionManager),
+							record: () => {},
+						}),
+					),
 					temperature: agent.temperature,
 					topP: agent.topP,
 					topK: agent.topK,

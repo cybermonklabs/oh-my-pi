@@ -251,19 +251,33 @@ export declare class EditStore {
 /**
  * Process-owned cross-platform advisory lock.
  *
- * `tryAcquire()` is non-blocking; its returned handle reports whether it won
- * through `acquired`. Ownership ends on `release()`, garbage collection, or
- * process exit; `release()` is idempotent.
+ * `tryAcquire()` never waits for a holder to release the lock, but on Linux
+ * it retries a refused claim, blocking the calling thread (see `tryAcquire()`
+ * for how long). A claim of a lock this process holds answers at once, and
+ * `isHeld()` answers without that wait. The handle `tryAcquire()` returns
+ * reports whether it won through `acquired`. Ownership ends on `release()`,
+ * garbage collection, or process exit; `release()` is idempotent.
  */
 export declare class FileLock {
-  /** Try to acquire `path` without blocking. */
+  /**
+   * Try to acquire `path` without waiting for a holder to release it.
+   *
+   * On Linux a claim refused because the lock's name is in use reports the
+   * lock taken at once when this process holds it, and is otherwise retried
+   * for at most 200 ms, and for at most 50 ms while a holder answers on the
+   * name: under gVisor a probe of the name can make the claim that follows
+   * a release find the name in use for a few milliseconds.
+   */
   static tryAcquire(path: string): FileLock
   /**
    * Whether any handle, in any process including this one, holds `path`.
    *
-   * Observes without locking or opening the lock: a `connect(2)` probe on
-   * Linux, an `F_GETLK` query on other Unix platforms, a `\BaseNamedObjects`
-   * directory listing on Windows. A concurrent `tryAcquire()` never meets it.
+   * Observes without locking or opening the lock: a `connect(2)` to the
+   * lock's abstract socket name on Linux, an `F_GETLK` query on other Unix
+   * platforms, a `\BaseNamedObjects` directory listing on Windows. Under
+   * gVisor the `connect(2)` can make a concurrent `tryAcquire()` find the
+   * name in use for a few milliseconds; `tryAcquire()` retries that, so a
+   * probe does not make a claim of a free lock fail.
    */
   static isHeld(path: string): boolean
   /** Whether this handle owns the requested lock. */

@@ -12,8 +12,11 @@
 
 ### Fixed
 
+- Counting a tool call whose arguments nest more than 40,000 levels deep (a resumed session can hold one) no longer fails with `Maximum call stack size exceeded`, which failed the first prompt after the resume, each turn's end, compaction and every context-usage reading
+- With `provider.appendOnlyContext` on, a request no longer fails with `Maximum call stack size exceeded` when the conversation holds a tool call whose arguments nest more than 40,000 levels deep
 - Steering and follow-ups drained for the next turn now return to their queue when the run is aborted before that turn starts, including while `/pause` holds it, instead of being recorded with no reply ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - A run aborted before its next turn starts, with nothing left to answer once its drained steering or follow-ups go back to their queue, now ends without an empty aborted turn, as it already did when the abort came at the turn boundary
+- With full message-content capture on, a request whose history holds a tool call or result nested more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded` while its input messages are recorded, nor spends 1.5 s or more on each request recording them, and a tool span records such a tool call's arguments and result as JSON instead of `[object Object]`
 - `AgentPauseGate.dispatchHold` re-parks when the gate closes again while the caller's own hold waits, carries a synchronous `isClosed` probe the transport reads in the same step as the send, and cancels through the whole composed wait with the caller's abort reason ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - The main loop's own dispatch hold carries that probe too, and fails an aborted request instead of resolving; the remote compaction requests send inside the same step as their hold check and arm their timeout at the wire, so a transport that holds one again does not spend it ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - The placeholder result for a tool call that never ran no longer repeats the provider's error text to the model: its content is a fixed sentence, and the provider's words stay in `details.upstreamError`, which no request carries. Quoting a refusal there got every later turn of the session refused as well
@@ -23,6 +26,16 @@
 ### Breaking Changes
 
 - Removed `PruneResult.undo()` from `pruneToolOutputs` and `pruneSupersededToolResults`; persist `PruneResult.pruned` instead of rolling the prune back when saving it fails.
+
+### Changed
+
+- Prune passes look up tool calls before the compaction boundary in an index built once per boundary and branch, instead of re-reading that history on every pass that misses a call
+
+### Fixed
+
+- The context figure that the status line, compaction and the rate-limit fallback read now counts `$` Python output, `@file` mentions and a `!` command's terminal images, and no longer counts a `!!` or `$$` output that no request carries
+- Counting a stored custom message whose content is neither text nor blocks no longer throws
+- After a compaction that kept no entry (an Anthropic native compaction that summarizes everything), the prune and shake passes start at that compaction, or at the turns added while it ran, instead of walking, and reading, the whole history on every pass
 
 ## [18.18.2] - 2026-11-08
 

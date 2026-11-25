@@ -10,8 +10,8 @@ import * as path from "node:path";
 import type { WorkProfile } from "@oh-my-pi/pi-natives";
 import { APP_NAME, getLogPath, getLogsDir, getReportsDir, isEnoent, localDay, logger } from "@oh-my-pi/pi-utils";
 import { writeArchive } from "@oh-my-pi/pi-utils/ar";
-import { readSessionHeaderId } from "../session/session-loader";
-import { defaultSessionStorage, type SessionStorage } from "../session/session-storage";
+import { readSessionHeaderId, transcriptByteChunks } from "../session/session-loader";
+import { defaultSessionStorage, retryRacedRead, type SessionStorage } from "../session/session-storage";
 import { listTranscriptTree } from "../session/session-transcript-tree";
 import { collectSubSessions } from "../session/sub-sessions";
 import type { CpuProfile, MemoryStats } from "./profiler";
@@ -203,10 +203,19 @@ export async function createReportBundle(options: ReportBundleOptions): Promise<
 	return { path: outputPath, files };
 }
 
-/** A transcript's text, or `undefined` when it does not exist (yet) or cannot be read. */
-async function readTranscript(storage: SessionStorage, transcript: string): Promise<string | undefined> {
+/**
+ * A transcript's bytes, or `undefined` when it does not exist (yet) or cannot
+ * be read. They are read as the storage's chunks, so no storage read hands
+ * back the whole transcript as one string. A full rewrite between two chunks
+ * reads it again from its start, as often as {@link retryRacedRead} allows.
+ */
+async function readTranscript(storage: SessionStorage, transcript: string): Promise<Uint8Array | undefined> {
 	try {
-		return await storage.readText(transcript);
+		return await retryRacedRead(async () => {
+			const chunks: Uint8Array[] = [];
+			for await (const chunk of transcriptByteChunks(transcript, storage)) chunks.push(chunk);
+			return Buffer.concat(chunks);
+		});
 	} catch {
 		return undefined;
 	}

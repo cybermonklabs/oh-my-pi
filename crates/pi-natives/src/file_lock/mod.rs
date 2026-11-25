@@ -41,9 +41,12 @@ fn memory_lock_name(path: &str) -> String {
 
 /// Process-owned cross-platform advisory lock.
 ///
-/// `tryAcquire()` is non-blocking; its returned handle reports whether it won
-/// through `acquired`. Ownership ends on `release()`, garbage collection, or
-/// process exit; `release()` is idempotent.
+/// `tryAcquire()` never waits for a holder to release the lock, but on Linux
+/// it retries a refused claim, blocking the calling thread (see `tryAcquire()`
+/// for how long). A claim of a lock this process holds answers at once, and
+/// `isHeld()` answers without that wait. The handle `tryAcquire()` returns
+/// reports whether it won through `acquired`. Ownership ends on `release()`,
+/// garbage collection, or process exit; `release()` is idempotent.
 #[napi(js_name = "FileLock")]
 pub struct FileLock {
 	inner: Option<platform::PlatformFileLock>,
@@ -62,7 +65,13 @@ impl FileLock {
 		platform::try_acquire(path).map(|inner| Self { inner })
 	}
 
-	/// Try to acquire `path` without blocking.
+	/// Try to acquire `path` without waiting for a holder to release it.
+	///
+	/// On Linux a claim refused because the lock's name is in use reports the
+	/// lock taken at once when this process holds it, and is otherwise retried
+	/// for at most 200 ms, and for at most 50 ms while a holder answers on the
+	/// name: under gVisor a probe of the name can make the claim that follows
+	/// a release find the name in use for a few milliseconds.
 	#[napi(factory)]
 	pub fn try_acquire(path: JsString) -> napi::Result<Self> {
 		let path = js::utf8(path)?;
@@ -76,9 +85,12 @@ impl FileLock {
 
 	/// Whether any handle, in any process including this one, holds `path`.
 	///
-	/// Observes without locking or opening the lock: a `connect(2)` probe on
-	/// Linux, an `F_GETLK` query on other Unix platforms, a `\BaseNamedObjects`
-	/// directory listing on Windows. A concurrent `tryAcquire()` never meets it.
+	/// Observes without locking or opening the lock: a `connect(2)` to the
+	/// lock's abstract socket name on Linux, an `F_GETLK` query on other Unix
+	/// platforms, a `\BaseNamedObjects` directory listing on Windows. Under
+	/// gVisor the `connect(2)` can make a concurrent `tryAcquire()` find the
+	/// name in use for a few milliseconds; `tryAcquire()` retries that, so a
+	/// probe does not make a claim of a free lock fail.
 	#[napi]
 	pub fn is_held(path: JsString) -> napi::Result<bool> {
 		let path = js::utf8(path)?;

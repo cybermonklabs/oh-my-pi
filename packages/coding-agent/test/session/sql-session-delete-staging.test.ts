@@ -1,0 +1,238 @@
+/**
+ * A staged full write puts its parts under `<path>#staging-…`, with no session
+ * row, and swaps them in at the end. A process killed before the swap leaves
+ * those parts behind. When the transcript is a subagent's whose first write
+ * was staged, it has no row either, so nothing lists it. Deleting the parent
+ * session must still remove every part under the session's artifacts
+ * directory, staging parts included. Each case runs against SQLite always and
+ * against PostgreSQL and MySQL when `OMP_TEST_SQL_POSTGRES_URL` /
+ * `OMP_TEST_SQL_MYSQL_URL` name a database; the MySQL-only cases, of a name
+ * under the directory that starts below the space and of paths too long for a
+ * staging path (staged under a name made from their hash), run when the
+ * latter does.
+ */
+import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
+import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import {
+	type GatedClient,
+	gatedClient,
+	LEASE_BACKENDS,
+	type LeaseDb,
+	openLeaseDb,
+	STILL,
+	transcript,
+	until,
+} from "./sql-session-lease-fixture";
+
+const ID = "01a1f000-0000-7000-8000-0000000000e1";
+const PROCESS_SCRIPT = path.join(import.meta.dir, "sql-session-delete-staging-process.ts");
+const MYSQL_URL = LEASE_BACKENDS.find(backend => backend.adapter === "mysql")?.url;
+
+/** Every path in the parts table that starts with `dir`. */
+async function partPathsUnder(db: LeaseDb, dir: string): Promise<string[]> {
+	const rows = await db.sql(`SELECT DISTINCT path FROM ${db.table}_parts`);
+	return rows
+		.map(row => String(row.path))
+		.filter(stored => stored.startsWith(dir))
+		.sort();
+}
+
+/**
+ * Write session `file` through a store that claims it, then let another
+ * process take the session over and die inside the staged first write of
+ * `subagent`, so that only that write's first staging parts exist; then take
+ * the claim back once the dead process's lease looks expired. Returns the
+ * store and the release of its claim.
+ */
+async function killStagedFirstWrite(
+	db: LeaseDb,
+	file: string,
+	subagent: string,
+): Promise<{ store: SqlSessionStorage; release: (() => void) | null | undefined }> {
+	const store = await db.open({ lease: STILL });
+	const releaseFirst = await store.acquireSessionClaim?.(ID, file);
+	await store.writeText(file, transcript(ID, "parent"));
+	await store.drain();
+	releaseFirst?.();
+	await store.drain();
+
+	const child = Bun.spawn(
+		[
+			process.execPath,
+			PROCESS_SCRIPT,
+			JSON.stringify({
+				dsn: db.dsn,
+				table: db.table,
+				leaseTable: db.leaseTable,
+				lease: STILL,
+				id: ID,
+				sessionFile: file,
+				file: subagent,
+			}),
+		],
+		{ stdout: "pipe", stderr: "pipe", env: process.env },
+	);
+	try {
+		const reader = child.stdout.getReader();
+		let report = "";
+		while (!report.includes("\n")) {
+			const { done, value } = await reader.read();
+			if (done) throw new Error(`the writer exited early: ${await new Response(child.stderr).text()}`);
+			report += new TextDecoder().decode(value);
+		}
+		expect(JSON.parse(report)).toEqual({ staged: true });
+	} finally {
+		child.kill("SIGKILL");
+		await child.exited;
+	}
+	const left = await partPathsUnder(db, `${file.slice(0, -".jsonl".length)}/`);
+	expect(left.length).toBe(1);
+	expect(left[0]?.startsWith(`${subagent}#staging-`)).toBe(true);
+
+	// The dead process's claim is taken over (its lease row looks expired; SQLite's OS lock died with it).
+	if (db.adapter !== "sqlite") await db.ageLease(ID, STILL.expiryMs + 60_000);
+	await store.refresh();
+	let release: (() => void) | null | undefined;
+	await until(async () => {
+		release = await store.acquireSessionClaim?.(ID, file);
+		return typeof release === "function";
+	});
+	return { store, release };
+}
+
+for (const { adapter, url } of LEASE_BACKENDS) {
+	describe.skipIf(!url)(`deleting a SQL session after a killed staged write (${adapter})`, () => {
+		it("removes the staging parts a killed first write of a subagent transcript left under its artifacts directory", async () => {
+			// If this regresses, a deleted session still leaves the parts of its half-written subagent
+			// transcript in the database, where no listing shows them.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+			const artifacts = `${file.slice(0, -".jsonl".length)}/`;
+			const { store, release } = await killStagedFirstWrite(db, file, `${artifacts}Task.jsonl`);
+
+			await store.deleteSessionWithArtifacts(file);
+			await store.drain();
+			expect({ paths: await db.paths(), parts: await partPathsUnder(db, artifacts) }).toEqual({
+				paths: [],
+				parts: [],
+			});
+			release?.();
+		}, 120_000);
+	});
+}
+
+describe.skipIf(!MYSQL_URL)("deleting a MySQL session after a killed staged write of a name below the space", () => {
+	it("removes the staging parts of a transcript whose name under the artifacts directory starts below the space", async () => {
+		// If this regresses, deleting a session on MySQL leaves the parts of a half-written transcript whose name
+		// starts with a control character: `utf8mb4_bin` compares as if padded with spaces, so that name sorts
+		// below the artifacts directory itself, outside a key range that starts there.
+		await using db = await openLeaseDb("mysql", MYSQL_URL ?? "");
+		const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+		const artifacts = `${file.slice(0, -".jsonl".length)}/`;
+		const { store, release } = await killStagedFirstWrite(db, file, `${artifacts}\u0001Task.jsonl`);
+
+		await store.deleteSessionWithArtifacts(file);
+		await store.drain();
+		expect({ paths: await db.paths(), parts: await partPathsUnder(db, artifacts) }).toEqual({
+			paths: [],
+			parts: [],
+		});
+		release?.();
+	}, 120_000);
+});
+
+describe.skipIf(!MYSQL_URL)("deleting a MySQL session while another client writes a name below the space", () => {
+	it("removes the row and the parts of a transcript another client commits under the artifacts directory during the delete", async () => {
+		// If this regresses, deleting a session on MariaDB 11.8 keeps a subagent transcript whose name starts with a
+		// control character when another process wrote it after the delete listed what it deletes: its row and parts
+		// stay, under a session no listing shows any more. (MySQL 8.4 answers the prefix compare by characters either
+		// way, so there the case passes without the fix; MariaDB 11.8 turns it into a space-padded key range.)
+		await using db = await openLeaseDb("mysql", MYSQL_URL ?? "");
+		const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+		const artifacts = `${file.slice(0, -".jsonl".length)}/`;
+		const child = `${artifacts}\u0001Task.jsonl`;
+		let gate: GatedClient | undefined;
+		const store = await db.open({
+			lease: STILL,
+			wrap: client => {
+				// The delete's lock of the session's rows and of every row under its directory, its first statement
+				// on the session table: on MySQL and MariaDB it locks the rows and gaps of the directory's key range,
+				// so another client's write under the directory after it waits for the delete to end.
+				gate = gatedClient(
+					client,
+					new RegExp(`^SELECT path FROM ${db.table} WHERE path IN .* FOR UPDATE$`),
+					"before",
+				);
+				return gate.client;
+			},
+		});
+		if (!gate) throw new Error("the deleting store's client was not gated");
+		const release = await store.acquireSessionClaim?.(ID, file);
+		await store.writeText(file, transcript(ID, "parent"));
+		await store.drain();
+		const other = await db.open({ claims: false });
+
+		// The delete's transaction waits before its locks, while the other client commits the transcript, which
+		// only the delete's own statements can find.
+		gate.close();
+		const deleting = store.deleteSessionWithArtifacts(file);
+		await gate.paused();
+		await other.writeText(child, transcript(ID, "child"));
+		await other.drain();
+		expect({ row: (await db.paths()).includes(child), parts: await partPathsUnder(db, artifacts) }).toEqual({
+			row: true,
+			parts: [child],
+		});
+		gate.open();
+		await deleting;
+		await store.drain();
+
+		expect({ paths: await db.paths(), parts: await partPathsUnder(db, artifacts) }).toEqual({
+			paths: [],
+			parts: [],
+		});
+		release?.();
+	}, 120_000);
+});
+
+describe.skipIf(!MYSQL_URL)("deleting a MySQL session whose transcripts have paths too long for a staging path", () => {
+	it("removes the hashed staging sets of transcripts under the artifacts directory, one it never listed included", async () => {
+		// If this regresses, deleting a session on MySQL leaves the staging parts of a half-written subagent
+		// transcript whose path is longer than 473 characters: they are named by the path's hash, outside the
+		// key range of the artifacts directory, and no listing shows them.
+		await using db = await openLeaseDb("mysql", MYSQL_URL ?? "");
+		const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
+		const artifacts = `${file.slice(0, -".jsonl".length)}/`;
+		/** A transcript path of 490 characters under the artifacts directory. */
+		const long = (name: string): string =>
+			`${artifacts}${name}${"x".repeat(490 - artifacts.length - name.length - ".jsonl".length)}.jsonl`;
+		const listed = long("Listed-");
+		const unlisted = long("Unlisted-");
+		const store = await db.open({ claims: false });
+		const other = await db.open({ claims: false });
+		await store.writeText(file, transcript(ID, "parent"));
+		await store.writeText(listed, transcript(ID, "listed"));
+		await store.drain();
+		// Committed by another client after the deleting store last refreshed: the delete does not list it.
+		await other.writeText(unlisted, transcript(ID, "unlisted"));
+		await other.drain();
+		// What a writer killed during a staged full write of each leaves: a part under the hashed staging name.
+		for (const transcriptPath of [listed, unlisted]) {
+			const hash = new Bun.CryptoHasher("sha256").update(transcriptPath).digest("hex");
+			await db.sql(`INSERT INTO ${db.table}_parts (path, start_offset, content) VALUES (@1, 0, 'staged')`, [
+				`#omp-staging/${hash}#staging-${String(Date.now()).padStart(13, "0")}-0123456789abcdef`,
+			]);
+		}
+		expect((await partPathsUnder(db, "#omp-staging/")).length).toBe(2);
+		store.refresh = async () => {};
+
+		await store.deleteSessionWithArtifacts(file);
+		await store.drain();
+
+		expect({ paths: await db.paths(), staging: await partPathsUnder(db, "#omp-staging/") }).toEqual({
+			paths: [],
+			staging: [],
+		});
+	}, 120_000);
+});

@@ -18,7 +18,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
-import { readStoredParts, readStoredSession } from "../helpers/sql-session-storage";
+import { dropSessionStoreTables, readStoredParts, readStoredSession } from "../helpers/sql-session-storage";
 
 type SqlClient = InstanceType<typeof SQL>;
 
@@ -141,10 +141,7 @@ class Db implements AsyncDisposable {
 	}
 
 	async [Symbol.asyncDispose](): Promise<void> {
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_refs`);
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_blobs`);
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}_parts`);
-		await this.client.unsafe(`DROP TABLE IF EXISTS ${this.table}`);
+		await dropSessionStoreTables(this.client, this.table);
 		for (const client of this.#clients) await client.end();
 	}
 }

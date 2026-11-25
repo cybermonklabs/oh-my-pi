@@ -4,6 +4,7 @@ import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { withEnv } from "./helpers";
+import { nestedChain } from "./helpers/deep-nesting";
 
 const BINDING_BETA = "thinking-binding-controls-2026-08-01";
 const CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27";
@@ -205,6 +206,63 @@ describe("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", () => {
 			expect(request.beta).not.toContain(CONTEXT_MANAGEMENT_BETA);
 			// The fresh body's own betas ride, not the saved list describing the old body.
 			expect(request.beta).toContain("effort-2025-11-24");
+		});
+	});
+
+	// A frozen request replays the conversation, whose tool calls' arguments are any JSON. 30,000 levels: the client
+	// writes the request body with `JSON.stringify`, which stops at 40,000 (anthropic-client.ts, outside this change).
+	it("redeems a frozen fallback-credit request whose tool arguments nest 30,000 levels", async () => {
+		const input = nestedChain({ leaf: "bottom" }, 30_000);
+		await withEnv({ ...GATEWAY_ENV, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1" }, async () => {
+			const request = await captureRequest(anthropicModel(), {
+				fallbackCreditRedemption: {
+					token: "fct_frozen",
+					prefillClaim: false,
+					params: {
+						model: "claude-fable-5-1",
+						messages: [
+							{ role: "user", content: "hi" },
+							{ role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "inspect", input }] },
+							{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+						],
+						max_tokens: 1024,
+						stream: true,
+					},
+					betas: [],
+					expiresAt: Date.now() + 60_000,
+				},
+			});
+			// The frozen body carries no withheld field, so it is redeemed as frozen.
+			expect(request.body.fallback_credit_token).toBe("fct_frozen");
+		});
+	}, 30_000);
+
+	// The check compares a copy the switch's fields were withheld from with a second copy, not with the body: a value
+	// that is not JSON data is copied through JSON (a `Date` as its string), so no copy equals a body that holds one.
+	it("redeems a frozen fallback-credit request whose tool arguments hold a value that is not JSON data", async () => {
+		await withEnv({ ...GATEWAY_ENV, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1" }, async () => {
+			const request = await captureRequest(anthropicModel(), {
+				fallbackCreditRedemption: {
+					token: "fct_frozen",
+					prefillClaim: false,
+					params: {
+						model: "claude-fable-5-1",
+						messages: [
+							{ role: "user", content: "hi" },
+							{
+								role: "assistant",
+								content: [{ type: "tool_use", id: "toolu_1", name: "inspect", input: { when: new Date(0) } }],
+							},
+							{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+						],
+						max_tokens: 1024,
+						stream: true,
+					},
+					betas: [],
+					expiresAt: Date.now() + 60_000,
+				},
+			});
+			expect(request.body.fallback_credit_token).toBe("fct_frozen");
 		});
 	});
 

@@ -53,7 +53,7 @@ async function writeSession(cwd: string, sessionDir: string): Promise<string> {
 	return file;
 }
 
-/** Counts whole-file reads, the I/O a resume spends on a session below the streaming threshold. */
+/** Counts whole-text reads, the read a resume parses a session below the streaming threshold from. */
 class CountingFileSessionStorage extends FileSessionStorage {
 	fullReads = 0;
 
@@ -197,8 +197,9 @@ describe("SessionManager cwd adoption on resume", () => {
 		const manager = await SessionManager.open(file, undefined, storage, { throwIfMissing: true });
 
 		expect(manager.getSessionFile()).toBe(path.resolve(file));
-		// A second parse of the unchanged file would read it a third time.
-		expect(storage.fullReads).toBe(2);
+		// The confirmation hashes the file's byte stream instead of reading its
+		// text, so only the parse reads the text; a second parse would read it again.
+		expect(storage.fullReads).toBe(1);
 		await manager.close();
 	});
 

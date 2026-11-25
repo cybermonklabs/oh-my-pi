@@ -433,6 +433,53 @@ export function activeBranch(
 	return leaf ? branchPath(leaf, byId) : [];
 }
 
+/**
+ * The phases a successful `todo` tool result records, or undefined: the
+ * snapshot the to-do list restores from. A `view` changes nothing and
+ * records none.
+ */
+function todoResultPhases(entry: SessionEntry): unknown[] | undefined {
+	if (entry.type !== "message") return undefined;
+	const message = entry.message;
+	if (message.role !== "toolResult" || message.toolName !== "todo" || message.isError) return undefined;
+	const details: unknown = message.details;
+	if (typeof details !== "object" || details === null) return undefined;
+	if ("op" in details && details.op === "view") return undefined;
+	return "phases" in details && Array.isArray(details.phases) ? details.phases : undefined;
+}
+
+/** `custom` type of the entry a user's edit of the to-do list appends: its `data.phases` is the whole list. */
+export const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
+
+/**
+ * `custom` type of the entry that records whether the to-do HUD is dismissed
+ * or revealed for one canonical snapshot ({@link todoSnapshotPhases}), named
+ * by its entry id and the JSON text of its list.
+ */
+export const TODO_HUD_STATE_CUSTOM_TYPE = "todo_hud_state";
+
+/**
+ * `custom` type of the entry a completed goal appends after its `mode_change`
+ * to `none`: its `data` holds the goal's objective, its token budget and the
+ * tokens and time it used (`objective`, `tokenBudget`, `tokensUsed`, `timeUsedSeconds`).
+ */
+export const GOAL_COMPLETED_CUSTOM_TYPE = "goal-completed";
+
+/**
+ * The phases a canonical to-do snapshot records, or undefined: a user's edit
+ * of the list ({@link USER_TODO_EDIT_CUSTOM_TYPE}) or a successful `todo`
+ * result ({@link todoResultPhases}). The to-do list restores from the newest
+ * one on the branch.
+ */
+export function todoSnapshotPhases(entry: SessionEntry): unknown[] | undefined {
+	if (entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE) {
+		const data: unknown = entry.data;
+		const phases = typeof data === "object" && data !== null && "phases" in data ? data.phases : undefined;
+		return Array.isArray(phases) ? phases : undefined;
+	}
+	return todoResultPhases(entry);
+}
+
 /** Raw logical file entry after loaders strip any fixed-width title slot. */
 export type FileEntry = SessionHeader | SessionEntry;
 

@@ -10,6 +10,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import * as natives from "@oh-my-pi/pi-natives";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 import { Agent } from "../src/agent";
 import type { SessionMessageEntry } from "../src/compaction/entries";
 import { applyShakeRegions, collectShakeRegions, RESCUE_SHAKE_CONFIG } from "../src/compaction/shake";
@@ -229,6 +230,93 @@ describe("countMessage", () => {
 
 		expect(textOnly).toBeGreaterThan(0);
 		expect(withImage).toBe(textOnly + inToolResultImageEstimate(tokenizer));
+	});
+});
+
+// Contract: the coding-agent's app roles count what its `convertToLlm` sends
+// for them. A `$` Python cell or an `@file` mention that counts as free lets the
+// rate-limit fallback, compaction and the status line read a large context as
+// small; a `!!` run, which no request carries, counted as sent and read a small
+// context as large.
+describe("countMessage app roles", () => {
+	const COMMAND = "cat build.log";
+	const CODE = "print(open('build.log').read())";
+	const OUTPUT = "build step finished without warnings\n".repeat(400);
+	const IMAGE = { type: "image", data: "A".repeat(40_000), mimeType: "image/png" };
+	/** Tokens the rendering's fixed framing (lead-in, fences, `<file>` tags) may add. */
+	const FRAMING = 50;
+	const tokenizer = new Tokenizer();
+
+	/** What a user message carrying `texts` counts; the request sends each app role as such text. */
+	function asUserText(...texts: string[]): number {
+		return tokenizer.countMessage({
+			role: "user",
+			content: texts.map(text => ({ type: "text", text })),
+			timestamp: 0,
+		} as AgentMessage);
+	}
+
+	function execution(
+		role: "bashExecution" | "pythonExecution",
+		fields: { excludeFromContext?: boolean; images?: unknown[] } = {},
+	): AgentMessage {
+		return {
+			role,
+			...(role === "bashExecution" ? { command: COMMAND } : { code: CODE }),
+			output: OUTPUT,
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			timestamp: 0,
+			...fields,
+		} as unknown as AgentMessage;
+	}
+
+	function fileMention(files: Array<{ path: string; content: string; image?: unknown }>): AgentMessage {
+		return { role: "fileMention", files, timestamp: 0 } as unknown as AgentMessage;
+	}
+
+	test.each([
+		{ role: "bashExecution", source: COMMAND },
+		{ role: "pythonExecution", source: CODE },
+	] as const)("$role counts its source and output, and 0 when excluded from context", ({ role, source }) => {
+		const content = asUserText(source, OUTPUT);
+		const included = tokenizer.countMessage(execution(role));
+		expect(included).toBeGreaterThanOrEqual(content);
+		expect(included).toBeLessThan(content + FRAMING);
+		expect(tokenizer.countMessage(execution(role, { excludeFromContext: true }))).toBe(0);
+	});
+
+	test("an @file mention counts each file's path and content", () => {
+		const second = "export const answer = 42;\n".repeat(200);
+		const content = asUserText("build.log", OUTPUT, "src/answer.ts", second);
+		const mention = tokenizer.countMessage(
+			fileMention([
+				{ path: "build.log", content: OUTPUT },
+				{ path: "src/answer.ts", content: second },
+			]),
+		);
+		expect(mention).toBeGreaterThanOrEqual(content);
+		expect(mention).toBeLessThan(content + 2 * FRAMING);
+	});
+
+	test("charges a bash run's terminal images and an @file image as a user message charges them", () => {
+		const image = inToolResultImageEstimate(tokenizer);
+		expect(tokenizer.countMessage(execution("bashExecution", { images: [IMAGE] }))).toBe(
+			tokenizer.countMessage(execution("bashExecution")) + image,
+		);
+		const screenshot = { path: "screenshot.png", content: "" };
+		expect(tokenizer.countMessage(fileMention([{ ...screenshot, image: IMAGE }]))).toBe(
+			tokenizer.countMessage(fileMention([screenshot])) + image,
+		);
+	});
+
+	// A persisted custom message whose content is neither text nor blocks is
+	// dropped from every request; counting it threw, and the context figure
+	// with it.
+	test("counts 0 for custom content no request carries", () => {
+		const custom = { role: "custom", customType: "note", content: undefined, display: false, timestamp: 0 };
+		expect(tokenizer.countMessage(custom as unknown as AgentMessage)).toBe(0);
 	});
 });
 
@@ -877,3 +965,33 @@ function inToolResultImageEstimate(tokenizer: Tokenizer): number {
 		timestamp: 0,
 	} as unknown as AgentMessage);
 }
+
+// A tool call's arguments are any JSON and a transcript line holds them as deep as `JSON.parse` reads; the count
+// runs on the first prompt after a resume, at each turn's end and for every context-usage reading.
+describe("Tokenizer on a tool call nested past where JSON.stringify stops", () => {
+	test("counts the JSON text of arguments nested 50,000 levels", () => {
+		const deep = nestedChain({ leaf: "bottom" });
+		const call = (args: Record<string, unknown>) =>
+			({
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: args }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: 1,
+			}) as AgentMessage;
+		const tokenizer = new Tokenizer();
+		// `{"next":` is 8 bytes a level: 400,000 bytes of JSON text, far more tokens than the shallow call's.
+		expect(tokenizer.countMessage(call(deep))).toBeGreaterThan(50_000);
+		expect(tokenizer.countMessage(call({ leaf: "bottom" }))).toBeLessThan(100);
+	}, 20_000);
+});

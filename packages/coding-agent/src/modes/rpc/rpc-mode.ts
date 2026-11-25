@@ -36,6 +36,7 @@ import { loadSkillPrompt } from "../../extensibility/skills";
 import { type RpcSkillCommandSession, resolveRpcSkillInvocation, runRpcSkillCommand } from "./rpc-skill-invocation";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
+import { AgentRegistry } from "../../registry/agent-registry";
 import {
 	type WordCompletionEngine,
 	type WordCompletionMethod,
@@ -52,7 +53,7 @@ import {
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
 import type { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
-import type { RestoredQueuedMessage } from "../../session/agent-session-types";
+import type { IdleSteerOptions, RestoredQueuedMessage } from "../../session/agent-session-types";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession, findRecentSessionContinuation } from "../../session/session-listing";
 import { probeSessionLeases } from "../../session/session-storage";
@@ -98,7 +99,12 @@ import {
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isSessionSettled } from "../../session/session-settle";
 import { RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
-import { RpcSubagentRegistry, readRpcSubagentTranscript, resolveOwnedLiveSubagent } from "./rpc-subagents";
+import {
+	type RpcOwnedSubagent,
+	RpcSubagentRegistry,
+	readRpcSubagentTranscript,
+	resolveOwnedLiveSubagent,
+} from "./rpc-subagents";
 import type {
 	RpcAbortAndRestoreQueueResult,
 	RpcCommand,
@@ -708,6 +714,9 @@ export class RpcInputDispatcher {
  * coordinator tracks those tasks, re-checks the shutdown request whenever one
  * settles (covering a shutdown requested mid-command with no follow-up client
  * frame), and drains every tracked task before invoking `performShutdown`.
+ * `onShutdownRequested` runs once before that drain, so a task waiting on
+ * work outside the client's control (a steer waiting for a subagent's next
+ * turn) can end instead of holding the shutdown.
  * The shutdown sequence is latched so concurrent triggers (input loop and
  * settling tasks) run it exactly once.
  */
@@ -716,10 +725,16 @@ export class RpcShutdownCoordinator {
 	#shutdown: Promise<void> | undefined;
 	readonly #isShutdownRequested: () => boolean;
 	readonly #performShutdown: () => Promise<void>;
+	readonly #onShutdownRequested: (() => void) | undefined;
 
-	constructor(options: { isShutdownRequested: () => boolean; performShutdown: () => Promise<void> }) {
+	constructor(options: {
+		isShutdownRequested: () => boolean;
+		performShutdown: () => Promise<void>;
+		onShutdownRequested?: () => void;
+	}) {
 		this.#isShutdownRequested = options.isShutdownRequested;
 		this.#performShutdown = options.performShutdown;
+		this.#onShutdownRequested = options.onShutdownRequested;
 	}
 
 	/**
@@ -752,6 +767,7 @@ export class RpcShutdownCoordinator {
 	checkShutdownRequested(): Promise<void> {
 		if (!this.#shutdown) {
 			if (!this.#isShutdownRequested()) return Promise.resolve();
+			this.#onShutdownRequested?.();
 			this.#shutdown = this.drain().then(() => this.#performShutdown());
 		}
 		return this.#shutdown;
@@ -836,13 +852,18 @@ export type RpcSubagentResetRegistry = Pick<RpcSubagentRegistry, "clear">;
  * subagents through the same path as the Agent Hub / collab `kill` command.
  * Aborting the live turn and releasing the registry ref as an `aborted`
  * tombstone settles the owning `task` call (foreground or background) with an
- * aborted result, and disposing the session stops its nested children.
+ * aborted result, and disposing the session stops its nested children and
+ * its own async jobs.
  *
- * Only ids this session reported as running are reachable (see
- * {@link resolveOwnedLiveSubagent}). Returns `false` (a no-op) for unknown,
- * finished, or already-cancelled subagents so hosts can treat cancelling a
- * vanished subagent as success. Rejects when the tombstone cannot be persisted
- * or the abort fails; the subagent is still detached and disposed.
+ * Reaches a subagent this session lists as running or pending whose ref is
+ * `running`, or `idle` between two turns of a run still being driven, as a
+ * synchronous subagent waiting for its own jobs is (see
+ * {@link resolveOwnedLiveSubagent}). Returns `false` (a
+ * no-op) for unknown, finished, cancelled or other sessions' subagents, and
+ * for an idle one whose result was accepted or whose run already ended, so
+ * hosts can treat cancelling a vanished subagent as success. Rejects when the
+ * tombstone cannot be persisted or the abort fails; the subagent is still
+ * detached and disposed.
  */
 export async function handleRpcCancelSubagent(
 	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
@@ -864,31 +885,54 @@ export async function handleRpcCancelSubagent(
 	return released.value;
 }
 
+/** Roster surface the subagent steer reads: the snapshot and its change notifications. */
+export type RpcSteerSubagentRegistry = Pick<RpcSubagentRegistry, "getSubagents" | "onChange">;
+
 /**
- * Handle RPC `steer_subagent`: send the host's message to a running subagent
- * as its user, the same way Agent Hub chat does: `AgentLifecycleManager.ensureLive`,
- * then `prompt(message, { streamingBehavior: "steer" })` on the subagent's own
- * session. A mid-turn subagent is steered at its next step boundary; one
- * between turns starts its next turn. Because this is `prompt()`, extension,
- * custom and file slash commands run and prompt templates expand as in Agent
- * Hub chat (unlike RPC `steer`, which rejects extension commands). The message
- * is recorded in the subagent's transcript, never attributed to the parent.
+ * Handle RPC `steer_subagent`: send the host's message to a subagent this
+ * session lists as running in `get_subagents`, as its user. The message is
+ * recorded in the subagent's transcript, never attributed to the parent.
  *
- * Only running subagents this session lists in `get_subagents` are reachable
- * (see {@link resolveOwnedLiveSubagent}); one whose result the parent already
- * accepted is refused. A running ref always holds a live session, so
- * `ensureLive` never revives here; it only cancels an in-flight idle park.
+ * The message goes to the subagent's own session, after
+ * `AgentLifecycleManager.ensureLive`, as
+ * `prompt(message, { streamingBehavior: "steer", idleSteer })`, and that
+ * session decides, when the message reaches it, whether the subagent is
+ * mid-turn or between turns (`PromptOptions.idleSteer`). The main
+ * thread's view of the session never decides: for a subagent homed on a
+ * worker it is a mirror the worker's reports update after the fact.
  *
- * Resolves once the message is accepted: queued into a running turn, or the
- * subagent's new turn started (`agent_start`). A refusal before that —
- * including a prompt dropped by an abort, disposal or usage preflight — is
- * returned as the error; the rest of the turn is not awaited and later
- * failures are logged. Returns an error message, or `undefined` once accepted.
+ * A mid-turn subagent is steered the same way Agent Hub chat does: it takes
+ * the message at its next step boundary, and extension, custom and file slash
+ * commands run and prompt templates expand as in Agent Hub chat (unlike RPC
+ * `steer`, which rejects extension commands). Resolves once its `prompt()`
+ * resolves, with the message queued into the running turn.
+ *
+ * A subagent between turns (a synchronous subagent waiting for its own jobs,
+ * or one its executor still sets up before its first prompt, whose ref
+ * already reads running) holds the message as a next-run steer instead, and
+ * the steer resolves once its next run takes it; see
+ * {@link steerOwnedSubagent}.
+ *
+ * An idle one whose result the parent already accepted, or whose run already
+ * ended, is refused, as is an unknown, finished, cancelled or other session's
+ * subagent (see {@link resolveOwnedLiveSubagent}). A live ref holds its
+ * session, so `ensureLive` never revives here; it only cancels an in-flight
+ * idle park.
+ *
+ * A refusal — including a prompt dropped by an abort, disposal or usage
+ * preflight — is returned as the error. Returns an error message, or
+ * `undefined` once accepted.
+ *
+ * `shutdown` aborts when the RPC session shuts down: a steer still waiting
+ * between turns then takes its message back and answers an error, unless a
+ * run already holds the message; the take-back then waits for that run, and
+ * the steer answers success if the run takes the message.
  */
 export async function handleRpcSteerSubagent(
-	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
+	subagentRegistry: RpcSteerSubagentRegistry,
 	subagentId: string,
 	message: string,
+	shutdown?: AbortSignal,
 ): Promise<string | undefined> {
 	const notRunning = `Subagent not running: ${subagentId}`;
 	const owned = resolveOwnedLiveSubagent(subagentRegistry, subagentId);
@@ -903,25 +947,93 @@ export async function handleRpcSteerSubagent(
 	// or the subagent may have finished in the meantime.
 	const current = resolveOwnedLiveSubagent(subagentRegistry, subagentId);
 	if (current?.ref !== owned.ref || current.session !== session) return notRunning;
+	return steerOwnedSubagent(subagentRegistry, subagentId, current, message, shutdown);
+}
 
-	const accepted = Promise.withResolvers<void>();
-	const unsubscribe = session.subscribe(event => {
-		if (event.type === "agent_start") accepted.resolve();
-	});
-	session.prompt(message, { streamingBehavior: "steer", throwOnDrop: true }).then(
-		() => accepted.resolve(),
-		err => {
-			accepted.reject(err);
-			logger.warn("steer_subagent message failed", { subagentId, error: String(err) });
-		},
-	);
+/**
+ * Send a steer to a reachable subagent's session, which queues it into its
+ * running turn, or, idle between turns, holds it as a next-run steer
+ * (`SteerOptions.holdUntilNextRun`): starting a turn there would race the
+ * prompt its executor sends next (a yield reminder) into `AgentBusyError`.
+ * The executor's next prompt, or the turn a finished job's result starts,
+ * carries a held message into its first model call. Like RPC `steer`, a held
+ * message rejects extension commands and expands prompt templates.
+ *
+ * A message queued into the running turn answers success once queued, when
+ * the prompt resolves. A held message is named (`SteerOptions.queueId`)
+ * and followed by its own identity, never by its text or timestamp: two
+ * steers of the same text sent in one millisecond are two messages. It
+ * answers success once a run takes exactly this message into its context
+ * (`SteerOptions.onTaken`, reported by the subagent's session, wherever it is
+ * homed). When the subagent stops being reachable first (its result
+ * accepted, cancelled, aborted, or its run ended without another turn), or
+ * `shutdown` aborts, exactly this message is taken back off the queue, so no
+ * later turn delivers it, and the steer answers an error. A run that took the
+ * message off the queue but not yet into its context holds it: the take-back
+ * waits for that run, and the steer answers success if the run takes the
+ * message, or an error once the take-back removes the message the run put
+ * back. A message neither taken back nor seen delivered (someone else removed
+ * it, or the session is gone) answers an error too.
+ */
+async function steerOwnedSubagent(
+	subagentRegistry: RpcSteerSubagentRegistry,
+	subagentId: string,
+	owned: RpcOwnedSubagent,
+	message: string,
+	shutdown: AbortSignal | undefined,
+): Promise<string | undefined> {
+	const runEnded = `Subagent's run ended before the message reached it: ${subagentId}`;
+	// A shutdown already under way sends nothing.
+	if (shutdown?.aborted) return runEnded;
+	let held = false;
+	let delivered = false;
+	const outcome = Promise.withResolvers<"delivered" | "ended">();
+	const end = () => outcome.resolve("ended");
+	const checkReachable = () => {
+		const current = resolveOwnedLiveSubagent(subagentRegistry, subagentId);
+		if (current?.ref !== owned.ref || current.session !== owned.session) end();
+	};
+	// Subscribe before sending, so a shutdown or an end of the run that lands
+	// while the message is held cannot be missed.
+	shutdown?.addEventListener("abort", end, { once: true });
+	const unsubscribers = [
+		subagentRegistry.onChange(checkReachable),
+		AgentRegistry.global().onChange(checkReachable),
+		() => shutdown?.removeEventListener("abort", end),
+	];
 	try {
-		await accepted.promise;
-		return undefined;
-	} catch (err) {
-		return `Subagent refused the message: ${err instanceof Error ? err.message : String(err)}`;
+		const idleSteer: IdleSteerOptions = {
+			queueId: crypto.randomUUID(),
+			onTaken: () => {
+				delivered = true;
+				outcome.resolve("delivered");
+			},
+			onHeld: () => {
+				held = true;
+			},
+		};
+		try {
+			await owned.session.prompt(message, { streamingBehavior: "steer", throwOnDrop: true, idleSteer });
+		} catch (err) {
+			return `Subagent refused the message: ${err instanceof Error ? err.message : String(err)}`;
+		}
+		// The session reports a hold before its prompt resolves, wherever it is homed.
+		if (!held) return undefined;
+		checkReachable();
+		if ((await outcome.promise) === "delivered") return undefined;
+		let withdrawn = false;
+		try {
+			withdrawn = await owned.session.removeQueuedMessage({ queueId: idleSteer.queueId }, "steering");
+		} catch (err) {
+			logger.debug("steer_subagent could not take back a queued message", { subagentId, error: String(err) });
+		}
+		if (withdrawn) return runEnded;
+		// The session reports a run taking the message before it answers the
+		// take-back, so a delivery that raced the end of the run is known by now.
+		if (delivered) return undefined;
+		return `The message was not delivered to subagent: ${subagentId}`;
 	} finally {
-		unsubscribe();
+		for (const unsubscribe of unsubscribers) unsubscribe();
 	}
 }
 
@@ -1560,6 +1672,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		}
 	};
 	const subagentRegistry = subagentEventBus ? new RpcSubagentRegistry(subagentEventBus, output) : undefined;
+	/** Aborted when the RPC session shuts down: ends every `steer_subagent` waiting for a subagent's next turn. */
+	const betweenTurnSteers = new AbortController();
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
@@ -2521,7 +2635,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				if (typeof command.message !== "string" || !command.message.trim()) {
 					return error(id, "steer_subagent", "`message` is required for steer_subagent.");
 				}
-				const failure = await handleRpcSteerSubagent(subagentRegistry, command.subagentId, command.message);
+				const failure = await handleRpcSteerSubagent(
+					subagentRegistry,
+					command.subagentId,
+					command.message,
+					betweenTurnSteers.signal,
+				);
 				return failure ? error(id, "steer_subagent", failure) : success(id, "steer_subagent");
 			}
 
@@ -2954,6 +3073,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// re-checks the request as each task settles.
 	const shutdownCoordinator = new RpcShutdownCoordinator({
 		isShutdownRequested: () => shutdownState.requested,
+		// A steer waiting for a subagent's next turn would hold the drain for as
+		// long as the subagent's job runs: end it, taking its message back.
+		onShutdownRequested: () => betweenTurnSteers.abort(),
 		performShutdown: async () => {
 			// Route through the idempotent session.dispose() so the browser
 			// reaper (releaseTabsForOwner) and other bounded teardown run before
@@ -3085,6 +3207,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	hostToolBridge.close("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
 	dictationBridge.dispose();
+	// Steers waiting for a subagent's next turn end now, taking their messages
+	// back, instead of holding the drains below for as long as a subagent's job
+	// runs. The roster stays live through the drains: commands the client sent
+	// before closing stdin still run against it.
+	betweenTurnSteers.abort();
 	await liveBridge.stop();
 	await inputDispatcher.drain();
 	// A backgrounded builtin (e.g. a /mcp reauth browser wait) must not park
