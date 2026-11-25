@@ -1100,6 +1100,11 @@ pub fn one_part_text(p: WordPart<'_>, out: &mut Vec<u8>) {
 	part_text(p, out, Ctx::Plain);
 }
 
+/// The text bash stores for one part of the inside of `"…"`.
+pub fn dq_part_text(p: WordPart<'_>, out: &mut Vec<u8>) {
+	part_text(p, out, Ctx::Dq);
+}
+
 /// The text bash stores for an assignment.
 pub fn assign_text(a: Assign<'_>, out: &mut Vec<u8>) {
 	out.extend_from_slice(a.name());

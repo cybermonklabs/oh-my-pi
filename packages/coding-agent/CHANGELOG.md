@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the `bash` tool's `bad substitution` message in bash code naming only the `${…}`: as in bash it names what was being expanded (the word, the text inside `"…"`, also inside quotes in arithmetic, an operator's word, a here-document body or arithmetic text, a keyed array element, or only its value for an associative array); and `${x@…}` with no valid operator is now nothing when `x` is unset or an empty `$@`, `$*` or `${a[@]}` (unless the operator starts with `a` or `A`, and after `set -u`'s check), and a fatal error when it is set, as in bash
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
