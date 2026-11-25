@@ -40,6 +40,9 @@ describe("process.stdout/stderr capture in JS eval", () => {
 
 // A fresh process, so the test can read the process's real stdout. The embedder's tool-call hook stands for host code
 // a guest call runs (an RPC or print-mode writer); `lateGate` lets it start work that runs after the run ended.
+// Before the fix each of those host writes went into the run's `onText`, never to stdout; the late one, from work the
+// call started (a timer, a continuation) that fires after the run ended, went into the ended run's `onText` and was
+// lost, and reached stdout only once the runtime had been disposed.
 const hostWritesProbe = `
 import { JsRuntime } from "@oh-my-pi/pi-coding-agent/eval/js/shared/runtime";
 const runText = [];
