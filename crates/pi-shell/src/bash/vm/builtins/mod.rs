@@ -139,8 +139,9 @@ pub enum Control {
 		/// `continue`.
 		cont: bool,
 	},
-	/// `exit`.
-	Exit,
+	/// `exit`, and any other way the builtin leaves the shell: the jump
+	/// says which (it decides what the `time`s the jump leaves report).
+	Exit(crate::bash::vm::exec::Jump),
 	/// An error that abandons the rest of the line (bash's
 	/// `jump_to_top_level (DISCARD)` after `top_level_cleanup`: a bad array
 	/// subscript), status in [`Outcome::status`]: a `-c` string is abandoned

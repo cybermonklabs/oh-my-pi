@@ -328,6 +328,11 @@ impl OwnTraps {
 			_ => Self { pseudo: self.pseudo | Self::bit(key), signals: self.signals },
 		}
 	}
+
+	/// The set without `key`, a pseudo-signal (a signal key is kept).
+	pub const fn without(self, key: crate::bash::store::TrapKey) -> Self {
+		Self { pseudo: self.pseudo & !Self::bit(key), signals: self.signals }
+	}
 }
 
 /// `getopts` progress between calls (bash's `sh_optind`, `sh_curopt` and
@@ -811,6 +816,23 @@ pub struct Run {
 	pub exit_trap_started: bool,
 }
 
+/// Where the base frame of a child sits in bash's `parse_and_execute` levels
+/// ([`Frame::parse_level`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParseLevel {
+	/// Outside every level it starts: every frame but such a child's base.
+	#[default]
+	Outside,
+	/// A child forked inside an `eval`, `.` or trap action: bash's fork keeps
+	/// `parse_and_execute_level`, but the child's jumps go to its own top
+	/// (`execute_in_subshell`), which is no level of its own.
+	Kept,
+	/// A command or process substitution, whose text bash runs with
+	/// `parse_and_execute`: a level of its own (`command_substitute`,
+	/// `process_substitute`).
+	Substitution,
+}
+
 /// What kind of activation a frame is.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FrameKind {
@@ -898,13 +920,18 @@ pub enum ScriptKind {
 	Hook,
 	/// A trap action, restoring the interrupted status when it finishes.
 	Trap {
-		key:           crate::bash::store::TrapKey,
-		status:        i32,
-		cancel:        Option<i32>,
-		return_target: Option<usize>,
-		/// An ERR trap run by `set -e`: the shell exits with `status` when
-		/// the trap ends.
-		exit:          bool,
+		key:               crate::bash::store::TrapKey,
+		status:            i32,
+		cancel:            Option<i32>,
+		return_target:     Option<usize>,
+		/// An ERR trap run by `set -e`, or an EXIT trap `exit_shell`
+		/// started: the shell exits with `status` when the trap ends.
+		exit:              bool,
+		/// An EXIT trap started after `set -e` left a function where bash's
+		/// `reset_local_contexts` ran first (the `-c` string's or an `eval`'s
+		/// `parse_and_execute`, a script's `reader_loop` outside posix
+		/// mode): its jumps see no function context until it calls one.
+		outside_functions: bool,
 	},
 	/// Shell code a builtin runs as zsh's `execode`/`execstring` do with
 	/// a context name (`zstyle -e` values, `zregexparse` guards and
@@ -991,6 +1018,9 @@ pub struct Frame {
 	/// `set -e` is ignored: an `if`/`while`/`until` condition, a `&&`/`||`
 	/// list except its last command, a `!` pipeline.
 	pub ignore_errexit:    bool,
+	/// Where the base frame of a child sits in bash's `parse_and_execute`
+	/// levels ([`ParseLevel`]); every other frame is outside them.
+	pub parse_level:       ParseLevel,
 	/// The base frame of a `( … )` child: the line bash reports for errors
 	/// of the compound commands it runs directly (the subshell's last line,
 	/// where bash's parser recorded it).
@@ -1024,6 +1054,7 @@ impl Frame {
 			debug_errexit: false,
 			err_reported: false,
 			ignore_errexit: false,
+			parse_level: ParseLevel::Outside,
 			subshell_line: None,
 			getopts: None,
 		}
@@ -1530,11 +1561,28 @@ pub struct ExecState {
 	/// Run through `command`: a special builtin's failure does not end a
 	/// posix shell.
 	pub via_command: bool,
+	/// The prefix the command's words start with, as bash's
+	/// `execute_simple_command` and `execute_builtin` read it: the outer
+	/// one, not the last (`command builtin export` is `command`'s).
+	pub prefix:      Prefix,
 	/// The awaited frame was pushed by the builtin, which runs again when
 	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).
 	pub resume:      bool,
 	/// Times the builtin ran again after a frame it pushed returned.
 	pub resumed:     u32,
+}
+
+/// The prefix word a simple command starts with ([`ExecState::prefix`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Prefix {
+	/// No prefix: the command word itself.
+	#[default]
+	None,
+	/// `command` (bash's `CMD_COMMAND_BUILTIN`, every leading one).
+	Command,
+	/// `builtin`: bash runs `builtin_builtin`, which runs the builtin it
+	/// names.
+	Builtin,
 }
 
 /// Options of `exec [-cl] [-a name] command`.
@@ -1556,7 +1604,9 @@ pub enum Transfer {
 		n:    u32,
 		cont: bool,
 	},
-	Exit(i32),
+	/// The shell exits with this status by this jump (it decides what the
+	/// `time`s the jump leaves report).
+	Exit(i32, super::exec::Jump),
 	/// The rest of the line is abandoned with this status (a `-c` string
 	/// whole).
 	DiscardAll(i32),

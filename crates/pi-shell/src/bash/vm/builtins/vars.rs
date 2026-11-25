@@ -274,6 +274,20 @@ fn element_text(name: &[u8], index: &[u8]) -> BString {
 	s
 }
 
+/// Print `NAME: readonly variable` as bash's `sh_readonly` does while it
+/// expands a declaration's compound word (`make_internal_declare`): a
+/// `builtin_error`, no `report_error` (`set -e` waits for the builtin's
+/// status), under the function's name inside one (the command's own name
+/// is not set yet), else bare.
+fn compound_readonly(ctx: &mut Ctx<'_, '_>, name: &[u8]) -> Result<(), Need> {
+	let d = Diag::Usage { msg: format!("{}: readonly variable", name.as_bstr()).into() };
+	match state::func_name(&ctx.k.root, ctx.cx.store, ctx.vp)? {
+		Some(f) => ctx.diag(d.by(String::from_utf8_lossy(&f).into_owned())),
+		None => ctx.diag(d),
+	}
+	Ok(())
+}
+
 /// Assign `value` to `lhs` at `level` with bash's attribute semantics.
 pub fn set_value(
 	k: &mut Kernel,
@@ -603,10 +617,7 @@ fn set_value_plain(
 	let mut var = cur.unwrap_or_else(|| Var::scalar("", Attrs::NONE));
 	let attrs = var.attrs;
 	if let (AssignValue::Array(_), Some(idx)) = (&value, lhs.index) {
-		return Err(Diag::Usage {
-			msg: format!("{}: cannot assign list to array member", element_text(name, idx).as_bstr())
-				.into(),
-		});
+		return Err(Diag::ListToMember { shown: element_text(name, idx) });
 	}
 	match (value, lhs.index) {
 		(AssignValue::Scalar(v), None) => {
@@ -663,16 +674,18 @@ fn set_value_plain(
 				let kvpair = elems.first().is_some_and(|(key, ..)| key.is_none());
 				for (key, eappend, v) in elems {
 					let key = if let Some(key) = key {
+						// An empty key is a bad subscript, and the words after it
+						// are not assigned (bash `assign_compound_array_list`,
+						// arrayfunc.c:765: `err_badarraysub`, a `report_error`).
+						if key.is_empty() {
+							let mut shown = BString::from(if eappend { "[]+=" } else { "[]=" });
+							shown.extend_from_slice(&v);
+							deferred.push(Diag::BadSubscript { shown });
+							break;
+						}
 						key
 					} else if !kvpair {
-						deferred.push(Diag::Usage {
-							msg: format!(
-								"{}: {}: must use subscript when assigning associative array",
-								name.as_bstr(),
-								v.as_bstr()
-							)
-							.into(),
-						});
+						deferred.push(Diag::AssocSubscript { name: name.into(), word: v });
 						continue;
 					} else {
 						let Some(key) = pending_key.take() else {
@@ -720,9 +733,9 @@ fn set_value_plain(
 						key.retain(|&c| c != 0x01);
 						// An empty subscript ends the assignment there.
 						if key.is_empty() {
-							deferred.push(Diag::Usage {
-								msg: format!("[]={}: bad array subscript", v.as_bstr()).into(),
-							});
+							let mut shown = BString::from("[]=");
+							shown.extend_from_slice(&v);
+							deferred.push(Diag::BadSubscript { shown });
 							break;
 						}
 						// A bad element is reported and skipped.
@@ -734,10 +747,7 @@ fn set_value_plain(
 							s
 						};
 						if matches!(key.as_slice(), b"@" | b"*") {
-							deferred.push(Diag::Usage {
-								msg: format!("{}: cannot assign to non-numeric index", shown().as_bstr())
-									.into(),
-							});
+							deferred.push(Diag::NonNumericIndex { shown: shown() });
 							continue;
 						}
 						match index_of(k, cx, vp, tmp.next_index(), &key, &shown) {
@@ -1156,7 +1166,7 @@ pub fn define_function(
 	if let Some(d) = rejected {
 		k.diag(cx, vp, line, d);
 		if posix {
-			return Flow::Exit(2);
+			return Flow::Exit(2, exec::Jump::Other);
 		}
 		vp.status = 1;
 		return Flow::Next;
@@ -1966,8 +1976,8 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				.is_some_and(|v| v.attrs.contains(Attrs::READONLY));
 			if !in_scope && global {
 				if compound_word {
-					// The array assignment fails first, bare.
-					ctx.diag(Diag::Readonly { name: name.into() });
+					// The array assignment fails first.
+					compound_readonly(ctx, name)?;
 				}
 				ctx.err(Diag::Readonly { name: name.into() });
 				status = 1;
@@ -1996,18 +2006,13 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		{
 			let d = Diag::Readonly { name: name.into() };
 			let array_flag = on.contains(Attrs::INDEXED) || on.contains(Attrs::ASSOC);
-			if compound_word {
-				// bash reports a compound word's failed array assignment
-				// bare, or, with `-a`/`-A` inside a function, under the
-				// function's name.
-				let func = state::func_name(&ctx.k.root, ctx.cx.store, ctx.vp)?;
-				match func.filter(|_| array_flag) {
-					Some(f) => {
-						let f = String::from_utf8_lossy(&f).into_owned();
-						ctx.diag(d.by(f));
-					},
-					None => ctx.diag(d),
-				}
+			if compound_word && array_flag {
+				// bash checks a compound word's `-a`/`-A` against the variable
+				// first, while it expands the word.
+				compound_readonly(ctx, name)?;
+			} else if compound_word {
+				// Without them the assignment fails (`err_readonly`).
+				ctx.diag(d);
 			} else if value.is_some()
 				&& matches!(kind, DeclareKind::Readonly | DeclareKind::Export)
 				&& !array_flag
@@ -2291,6 +2296,7 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				let array_flag = on.bits() & (Attrs::INDEXED.bits() | Attrs::ASSOC.bits()) != 0;
 				let array_exists = exists && !matches!(var.value, VarValue::Str(_));
 				let parens = value.starts_with(b"(") && value.ends_with(b")");
+				let assoc_target = on.contains(Attrs::ASSOC) || matches!(var.value, VarValue::Assoc(_));
 				let compound = parens
 					&& (index.is_none() || array_flag)
 					&& (compound_word
@@ -2343,6 +2349,17 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					var.value = VarValue::Indexed(items);
 				}
 				ctx.set_var(name, Some(var), level);
+				// `declare a[0]=(1)`: bash declares the array first
+				// (`make_internal_declare`), then refuses the list for the
+				// element by `report_error` (subst.c:3603).
+				if let Some(idx) = index
+					&& compound_word
+					&& parens
+				{
+					ctx.diag(Diag::ListToMember { shown: element_text(name, idx) });
+					status = 1;
+					continue;
+				}
 				// bash expands a `declare` argument's subscript again (quote
 				// removal), unlike an assignment word's.
 				let index = index
@@ -2363,6 +2380,31 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					Err(d @ Diag::ArithSubscript { .. }) => {
 						ctx.diag(d);
 						return Ok(super::Outcome { status: 1, control: super::Control::DiscardAll });
+					},
+					// bash shows a compound word's element without a key as
+					// `declare` got it, single-quoted.
+					Err(Diag::AssocSubscript { name: array, word }) if compound_word => {
+						let word = quote::sh_single_quote(&word).into();
+						ctx.err(Diag::AssocSubscript { name: array, word });
+						status = 1;
+						continue;
+					},
+					// and an associative array's empty key, both words quoted:
+					// `['']='v'`.
+					Err(Diag::BadSubscript { shown }) if compound_word && assoc_target => {
+						let requoted = shown
+							.strip_prefix(b"[]+=")
+							.map(|v| ("+=", v))
+							.or_else(|| shown.strip_prefix(b"[]=").map(|v| ("=", v)))
+							.map(|(op, v)| {
+								let mut s = BString::from(format!("['']{op}"));
+								s.extend_from_slice(&quote::sh_single_quote(v));
+								s
+							});
+						let shown = requoted.unwrap_or(shown);
+						ctx.err(Diag::BadSubscript { shown });
+						status = 1;
+						continue;
 					},
 					Err(d) => {
 						ctx.err(d);
@@ -3322,8 +3364,10 @@ pub fn let_(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				ctx.diag(d);
 				return Ok(super::Outcome { status: 1, control: super::Control::DiscardAll });
 			},
-			// bash prints a readonly assignment without the `let: ` prefix.
-			Err(d @ Diag::Readonly { .. }) => {
+			// bash prints a readonly assignment and, under `set -u`, an unset
+			// variable without the `let: ` prefix (`err_readonly`,
+			// `err_unboundvar`: `report_error`).
+			Err(d @ (Diag::Readonly { .. } | Diag::Unbound { .. })) => {
 				ctx.diag(d);
 				return done(1);
 			},

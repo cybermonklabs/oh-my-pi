@@ -16,8 +16,8 @@ use super::{
 	is_ident, probe,
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
-		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		LoopKind, LoopRec, ParseLevel, ParseSnapshot, PendingSub, PendingWrite, Prefix, Probe,
+		ProbeResult, Run, Saved, Scratch, ScriptKind, Slot, Target, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -27,7 +27,7 @@ use crate::bash::{
 	event::{CompiledUnit, Construct, EventData, NodeKind, Origin, WaitKey, assign_preview},
 	fd::FdRef,
 	host::{ResolveCtx, Resolved, Via},
-	ids::{Dialect, ModeId, UnitId, Vpid},
+	ids::{Dialect, IntrinsicId, ModeId, UnitId, Vpid},
 	ir::{self, ComsubForm, Op, Opcode, SpawnKind, Unit},
 	mem::{self, Capture},
 	pattern::PatOpts,
@@ -55,8 +55,8 @@ pub enum Flow {
 		n:    u32,
 		cont: bool,
 	},
-	/// `exit n` (also a fatal expansion error).
-	Exit(i32),
+	/// `exit n` (also a fatal expansion error), by this jump ([`Jump`]).
+	Exit(i32, Jump),
 	/// An expansion or arithmetic error: abandon the current top-level command.
 	Discard(i32),
 }
@@ -368,20 +368,20 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			Flow::Call => {},
 			Flow::EndUnit => end_unit(k, vp, cx),
 			Flow::Abort(status) => {
+				k.top_level_cleanup = false;
 				// Abandon the innermost script (the run's, `eval`'s, `source`'s).
 				vp.status = status;
-				let i = vp
-					.frames
-					.iter()
-					.rposition(|f| matches!(f.kind, FrameKind::Script { .. }))
-					.unwrap_or(0);
+				let i = script_frame(vp).unwrap_or(0);
 				// zsh: a parse error is status 1; `.` of a file with one is 126
-				// (`bin_dot`'s `SOURCE_ERROR`).
+				// (`bin_dot`'s `SOURCE_ERROR`). bash: the messages queued go out
+				// through the redirections in effect at the jump.
 				if unit.mode.dialect() == Dialect::Zsh {
 					vp.status = match vp.frames.get(i).map(|f| &f.kind) {
 						Some(FrameKind::Script { what: ScriptKind::Source, .. }) => 126,
 						_ => 1,
 					};
+				} else {
+					written_before_the_unwind(k, vp);
 				}
 				// An interactive shell's own input goes on: the command is
 				// dropped and the next one read (zsh `loop`, bash
@@ -413,7 +413,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 						unwind(&mut k.root, cx.store, vp, i);
 					}
 				} else if vp.parent.is_some() && in_function_scope(k, cx, vp) {
-					exit_shell(k, vp, cx, status);
+					exit_shell(k, vp, cx, status, Jump::Other);
 				} else {
 					let line = line_of(vp, op.node);
 					let diag =
@@ -427,29 +427,60 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				zsh_break(k, vp, cx, n, cont);
 			},
 			Flow::Break { n, cont } => break_loops(k, vp, cx, n, cont, op),
-			Flow::Exit(status) if unit.mode.dialect() == Dialect::Zsh => zsh_exit(k, vp, cx, status),
-			Flow::Exit(status) => exit_shell(k, vp, cx, status),
+			Flow::Exit(status, _) if unit.mode.dialect() == Dialect::Zsh => {
+				zsh_exit(k, vp, cx, status);
+			},
+			Flow::Exit(status, jump) => {
+				report_jump(k, vp, cx, 0, jump);
+				exit_shell(k, vp, cx, status, jump);
+				k.top_level_cleanup = false;
+			},
 			Flow::Discard(status) if unit.mode.dialect() == Dialect::Zsh => {
 				zsh_discard(k, vp, cx, status);
 			},
 			Flow::Discard(status) => {
 				vp.status = status;
+				let cleanup = std::mem::take(&mut k.top_level_cleanup);
 				// bash's `parse_and_execute` (the script, `-c`, `eval`, `.`,
 				// a trap action) catches the jump: the innermost script goes
-				// on with its next command.
-				let script = vp
-					.frames
-					.iter()
-					.rposition(|f| matches!(f.kind, FrameKind::Script { .. }));
-				if let Some(i) = script {
+				// on with its next command. In a subshell it passes the jump
+				// on (`subshell_environment`) to the next catch: a running
+				// EXIT trap's `run_exit_trap`, which ends the action, else the
+				// subshell's top level, which exits.
+				let subshell = super::nested::in_subshell(cx.store, vp);
+				let catch = if subshell {
+					exit_trap_frame(vp)
+				} else {
+					script_frame(vp)
+				};
+				if let Some(i) = catch {
+					report_jump(k, vp, cx, i, Jump::Other);
 					unwind(&mut k.root, cx.store, vp, i + 1);
 					clear_scratch(&mut k.root, cx.store, vp);
 					truncate(vp, Depths::default());
 					let f = top_frame(vp);
 					f.unit = None;
 					f.loops.clear();
+					if subshell && let FrameKind::Script { src, pos, aux, .. } = &mut f.kind {
+						*pos = (src.len() as u32, pos.1);
+						if let Some(a) = aux {
+							a.pending = None;
+						}
+					}
 				} else {
-					unwind(&mut k.root, cx.store, vp, 0);
+					report_jump(k, vp, cx, 0, Jump::Other);
+					// A subshell's top level exits (bash's
+					// `execute_in_subshell`, `command_substitute`) and runs
+					// its EXIT trap, in the function context the jump left
+					// ([`leave_functions`]): after `top_level_cleanup` (an
+					// arithmetic subscript error, an integer variable's bad
+					// value, a script's own command) none ([`Jump::Cleanup`]).
+					if subshell {
+						let jump = if cleanup { Jump::Cleanup } else { Jump::Other };
+						exit_shell(k, vp, cx, status, jump);
+					} else {
+						unwind(&mut k.root, cx.store, vp, 0);
+					}
 				}
 			},
 		}
@@ -470,7 +501,8 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			}
 		} else if errexit {
 			let status = vp.status;
-			exit_shell(k, vp, cx, status);
+			report_jump(k, vp, cx, 0, Jump::Errexit);
+			exit_shell(k, vp, cx, status, Jump::Errexit);
 		} else if errreturn_failed && unit.mode.dialect() == Dialect::Zsh && zsh_errreturn(k, cx, vp)
 		{
 			// zsh `ERR_RETURN`: a failed command returns from the function
@@ -510,7 +542,7 @@ fn zsh_return_flow(
 			set_trap_line(vp, line_of(vp, op.node));
 			mark_trap_exit(vp);
 		} else {
-			exit_shell(k, vp, cx, status);
+			exit_shell(k, vp, cx, status, Jump::Other);
 		}
 	} else if run_always(k, vp, cx, target.unwrap_or(0), TryEnd::Return(status)) {
 		// The always-list runs first; it resumes the return.
@@ -542,7 +574,7 @@ fn zsh_return_flow(
 	} else {
 		// zsh `bin_break`: `return` outside a function or `.` file leaves
 		// a non-interactive shell (`zexit`).
-		exit_shell(k, vp, cx, status);
+		exit_shell(k, vp, cx, status, Jump::Other);
 	}
 }
 
@@ -609,6 +641,18 @@ fn in_function_scope(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	})
 }
 
+/// Whether `set -e` is ignored for the op frame `f` is at: the op is a
+/// condition (an `if`/`while`/`until` condition, a `&&`/`||` list except
+/// its last command, a `!` pipeline), or the frame runs in one.
+pub(super) fn errexit_ignored(f: &Frame) -> bool {
+	f.ignore_errexit
+		|| f
+			.unit
+			.as_ref()
+			.and_then(|u| u.ops.get(f.pc as usize))
+			.is_some_and(|op| op.flags & Op::COND != 0)
+}
+
 /// Whether `set -e` is on for `vp`.
 fn errexit_on(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	match state::option(&mut k.root, cx.store, vp, OptId::Errexit) {
@@ -620,11 +664,13 @@ fn errexit_on(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	}
 }
 
-/// Leave the shell with `status` (`exit`, `set -e`): unwind every frame;
-/// a subshell runs its EXIT trap here, the root at the run boundary. An
-/// `exit` inside a function runs the root's trap first, above the
-/// function's frames: bash's trap sees its `FUNCNAME` and locals.
-fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
+/// Leave the shell with `status` after `jump` (`exit`, `set -e`, a fatal
+/// error): unwind every frame; a subshell runs its EXIT trap here, the root
+/// at the run boundary. An `exit` inside a function runs the root's trap
+/// first, above the function's frames: bash's trap sees its `FUNCNAME` and
+/// locals. After `set -e` left a function bash may have reset the function
+/// context first ([`contexts_reset`]): the trap then runs outside it.
+fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32, jump: Jump) {
 	// zsh `zexit` while its hooks run: the hook calls end, the status is the
 	// new one.
 	if vp.zsh.is_some()
@@ -638,6 +684,10 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 		matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key: TrapKey::Exit, .. }, .. })
 	});
 	vp.status = status;
+	let outside_functions = !in_exit_trap && contexts_reset(k, cx, vp, jump);
+	if !in_exit_trap {
+		leave_functions(k, cx, vp, jump);
+	}
 	if vp.parent.is_none()
 		&& let Some(run) = vp.runs.front()
 	{
@@ -660,13 +710,7 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 			run.exit_trap_started = true;
 		}
 		// The trap's end exits with `status` (its saved `$?`).
-		if let Some(Frame {
-			kind: FrameKind::Script { what: ScriptKind::Trap { exit, .. }, .. },
-			..
-		}) = vp.frames.last_mut()
-		{
-			*exit = true;
-		}
+		mark_exit_trap(vp, true, outside_functions);
 		return;
 	}
 	unwind(&mut k.root, cx.store, vp, 0);
@@ -675,9 +719,172 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	if vp.parent.is_some() && vp.runs.is_empty() && vp.mode.dialect() == Dialect::Zsh {
 		super::zsh::zexit::start(k, cx, vp);
 	}
-	if !in_exit_trap && vp.transient && vp.runs.is_empty() {
-		start_exit_trap_once(k, vp, cx);
+	if !in_exit_trap && vp.transient && vp.runs.is_empty() && start_exit_trap_once(k, vp, cx) {
+		mark_exit_trap(vp, false, outside_functions);
 	}
+}
+
+/// The EXIT trap [`exit_shell`] just started (the top frame): the shell
+/// exits when it ends (`exit`; a trap started on the unwound frames ends
+/// the vproc anyway), and it runs outside the function context when bash
+/// reset it ([`contexts_reset`]).
+fn mark_exit_trap(vp: &mut Vproc, exits: bool, outside: bool) {
+	if let Some(Frame {
+		kind: FrameKind::Script { what: ScriptKind::Trap { exit, outside_functions, .. }, .. },
+		..
+	}) = vp.frames.last_mut()
+	{
+		*exit |= exits;
+		*outside_functions = outside;
+	}
+}
+
+/// Whether the EXIT trap after `jump` runs with no function context (bash's
+/// `variable_context` 0). [`Jump::Cleanup`] comes after bash's
+/// `top_level_cleanup`, which sets it to 0 (sig.c:401); `report_error`'s
+/// exit and the other exits that are no jump keep it, and so does `exit`,
+/// which keeps every level's functions while the trap is set. For the other
+/// jumps each `parse_and_execute` level the jump passes (an `eval`, `.` or
+/// trap action, a command or process substitution's text, the root's `-c`
+/// string), innermost first, keeps its redirections or undoes them, which
+/// runs the `pop_context` of each function called inside it
+/// (variables.c:5575). Under `set -e` a level that finds the context set
+/// keeps them and resets it (`reset_local_contexts`, evalstring.c:388), and
+/// one that finds it 0 undoes, which leaves it non-zero (negative) again
+/// when a function was called inside it; a script's `reader_loop` then
+/// resets it outside posix mode (eval.c:102), while a subshell's
+/// `execute_in_subshell` and the `-c` string's `run_one_command` leave it
+/// as it is. Every other jump (a posix special builtin's `ERREXIT` without
+/// `set -e` too) undoes at every level: the context is 0 when no function
+/// was called outside them, nor in the shell the vproc forked from.
+fn contexts_reset(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, jump: Jump) -> bool {
+	if vp.mode.dialect() == Dialect::Zsh || !function_context(k, cx, vp) {
+		return false;
+	}
+	let errexit = match jump {
+		Jump::Cleanup => return true,
+		Jump::Exit | Jump::Direct => return false,
+		Jump::Errexit => errexit_on(k, cx, vp),
+		Jump::Other => false,
+	};
+	let root = !vp.runs.is_empty();
+	let command = runs_command_string(cx, vp);
+	let level = |i: usize, f: &Frame| is_parse_level(command, i, f);
+	let function = |f: &Frame| matches!(f.kind, FrameKind::Function { .. });
+	if !errexit {
+		let Some(outer) = outer_parse_level(cx, vp) else {
+			return false;
+		};
+		let inherited = vp
+			.calls
+			.iter()
+			.any(|c| c.depth == 0 && matches!(c.kind, super::callstack::CallKind::Function { .. }));
+		return !inherited && !vp.frames[..outer].iter().any(function);
+	}
+	let mut context = true;
+	let mut inner = vp.frames.len();
+	for i in (0..vp.frames.len())
+		.rev()
+		.filter(|&i| level(i, &vp.frames[i]))
+	{
+		context = !context && vp.frames[i..inner].iter().any(function);
+		inner = i;
+	}
+	if context
+		&& root
+		&& !command
+		&& !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false)
+	{
+		context = false;
+	}
+	!context
+}
+
+/// Whether `vp` is the root running a `-c` string, whose text bash runs
+/// with `parse_and_execute`.
+fn runs_command_string(cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	!vp.runs.is_empty()
+		&& matches!(
+			state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
+			Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
+		)
+}
+
+/// Whether frame `i`, `f`, is one of bash's `parse_and_execute` levels: an
+/// `eval`, `.` or trap action, a command or process substitution's text,
+/// the root's `-c` string (`command`, [`runs_command_string`]).
+fn is_parse_level(command: bool, i: usize, f: &Frame) -> bool {
+	match f.kind {
+		FrameKind::Script { what: ScriptKind::Run, .. } => command && i == 0,
+		FrameKind::Script { .. } => true,
+		_ => f.parse_level == ParseLevel::Substitution,
+	}
+}
+
+/// The outermost `parse_and_execute` level among `vp`'s frames
+/// ([`is_parse_level`]).
+fn outer_parse_level(cx: &mut Cx<'_>, vp: &Vproc) -> Option<usize> {
+	let command = runs_command_string(cx, vp);
+	(0..vp.frames.len()).find(|&i| is_parse_level(command, i, &vp.frames[i]))
+}
+
+/// The function context bash's jump leaves before the EXIT trap, as
+/// frames: each `parse_and_execute` level the jump passes runs its
+/// `pe_dispose` unwind frame, which pops the functions called inside it
+/// (evalstring.c:398, :425), so for [`Jump::Other`] the frames above the
+/// outermost level go. The level's own frame stays: the `eval` or `.`
+/// command around the text keeps its redirections, and `.` its `source`
+/// on `FUNCNAME`, until the shell exits. `top_level_cleanup` runs every
+/// unwind-protect (sig.c:396), so after [`Jump::Cleanup`] every function
+/// goes, also those the shell a subshell forked from was running, with
+/// their locals. The other jumps keep them (`exit`, no jump; `set -e`,
+/// [`contexts_reset`]).
+fn leave_functions(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, jump: Jump) {
+	if vp.mode.dialect() == Dialect::Zsh {
+		return;
+	}
+	match jump {
+		Jump::Other => {
+			if let Some(outer) = outer_parse_level(cx, vp) {
+				unwind(&mut k.root, cx.store, vp, outer + 1);
+			}
+		},
+		Jump::Cleanup => {
+			unwind(&mut k.root, cx.store, vp, vp.frames.len().min(1));
+			vp.calls.retain(|c| {
+				c.depth > 0
+					|| !matches!(
+						c.kind,
+						super::callstack::CallKind::Function { .. }
+							| super::callstack::CallKind::Source { .. }
+					)
+			});
+			while state::drop_scope(&mut k.root, cx.store, vp) {}
+		},
+		Jump::Exit | Jump::Direct | Jump::Errexit => {},
+	}
+}
+
+/// Whether a function runs for bash's jumps (`variable_context`): its
+/// scope, unless the innermost EXIT trap runs outside the function context
+/// ([`contexts_reset`]) and calls none.
+fn function_context(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	for f in vp.frames.iter().rev() {
+		match f.kind {
+			FrameKind::Function { .. } => break,
+			FrameKind::Script {
+				what: ScriptKind::Trap { key: TrapKey::Exit, outside_functions, .. },
+				..
+			} => {
+				if outside_functions {
+					return false;
+				}
+				break;
+			},
+			_ => {},
+		}
+	}
+	in_function_scope(k, cx, vp)
 }
 
 /// Start this vproc's EXIT trap, at most once for a forked subshell: it has
@@ -1130,7 +1337,10 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 		} else if let Some(status) = status
 			&& exit
 		{
-			exit_shell(k, vp, cx, status);
+			// `set -e` after the ERR trap: bash's errexit jump comes once
+			// the trap ran, and `time_command` reports it.
+			report_jump(k, vp, cx, 0, Jump::Errexit);
+			exit_shell(k, vp, cx, status, Jump::Errexit);
 		} else if func_trap && trap_status != 0 && vp.mode.dialect() == Dialect::Zsh {
 			// zsh `dotrapargs`: a function trap returning non-zero forces
 			// a return from the interrupted code, with the error flag set.
@@ -1938,51 +2148,115 @@ fn truncate(vp: &mut Vproc, d: Depths) {
 }
 
 fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bool, op: Op) {
-	let mut remaining = n.max(1);
-	loop {
-		let f = top_frame(vp);
-		if let Some(rec) = f.loops.last().cloned() {
-			// More levels than loops: the outermost loop ends.
-			if remaining > 1 && f.loops.len() > 1 {
-				f.loops.pop();
-				truncate(vp, rec.depth);
-				remaining -= 1;
-				continue;
-			}
-			truncate(vp, rec.depth);
-			// The status is the builtin's: 0, or 1 for `break 0` (which
-			// leaves every loop).
-			let status = vp.status;
+	let Some(target) = loop_frame(vp) else {
+		// No loop: bash's `check_loop_level` complains (only outside posix
+		// mode) and the command after it runs.
+		if !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
+			let line = line_of(vp, op.node);
+			let name = if cont { "continue" } else { "break" };
+			let diag =
+				Diag::Usage { msg: "only meaningful in a `for', `while', or `until' loop".into() };
+			k.diag(cx, vp, line, diag.by(name));
+		}
+		vp.status = 0;
+		top_frame(vp).pc += 1;
+		return;
+	};
+	// bash's `break` is no jump: each command it leaves returns, so its
+	// redirections are undone and its `time` reports as it ends. The frames
+	// above the loop's (`eval`'s, …) end first, then the loop body.
+	let end = time_mark(&*cx.host);
+	let line = line_of(vp, op.node);
+	while vp.frames.len() > target + 1 {
+		end_left_commands(k, vp, cx, Depths::default(), end, line);
+		pop_frame(&mut k.root, cx.store, vp);
+		// The caller's op (`eval`) is abandoned with the loop.
+		clear_scratch(&mut k.root, cx.store, vp);
+	}
+	// More levels than loops: the outermost loop ends.
+	let f = top_frame(vp);
+	let keep = f.loops.len() - (n.max(1) as usize).min(f.loops.len());
+	f.loops.truncate(keep + 1);
+	let rec = f.loops[keep].clone();
+	end_left_commands(k, vp, cx, rec.depth, end, line);
+	// The status is the builtin's: 0, or 1 for `break 0` (which leaves
+	// every loop).
+	let status = vp.status;
+	let f = top_frame(vp);
+	// `continue` ends the body with its status too: the loop's status if
+	// no other body command runs.
+	if let Some(r) = f.loops.last_mut() {
+		r.status = status;
+	}
+	f.pc = if cont { rec.cont } else { rec.exit };
+}
+
+/// End, as they would end had they run to their end, the commands of the
+/// top frame that a `break` or `continue` leaves, down to the frame's
+/// stacks at `d`: in the order of the pending ops after its pc, each
+/// `PopRedir` undoes its redirections (what is queued goes out first) and
+/// each `TimeEnd` reports its `time` (`time -p`'s format for a `-p` one);
+/// pairs that start after the pc are skipped. What is left is truncated.
+fn end_left_commands(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	d: Depths,
+	end: super::proc::TimeMark,
+	line: u32,
+) {
+	if let Some(unit) = top_frame(vp).unit.clone() {
+		let (mut timed, mut redirected) = (0u32, 0u32);
+		for op in unit.ops.iter().skip(top_frame(vp).pc as usize) {
 			let f = top_frame(vp);
-			// `continue` ends the body with its status too: the loop's
-			// status if no other body command runs.
-			if let Some(r) = f.loops.last_mut() {
-				r.status = status;
+			if f.times.len() <= d.times as usize && f.redirs.len() <= d.redirs as usize {
+				break;
 			}
-			f.pc = if cont { rec.cont } else { rec.exit };
-			return;
+			match op.code {
+				Opcode::TimeStart => timed += 1,
+				Opcode::TimeEnd if timed > 0 => timed -= 1,
+				Opcode::TimeEnd => {
+					if f.times.len() > d.times as usize
+						&& let Some(start) = f.times.pop()
+					{
+						bash_time_report(k, vp, cx, op.b == 1, false, elapsed(start, end), line);
+					}
+				},
+				Opcode::Redir => redirected += 1,
+				Opcode::PopRedir if redirected > 0 => redirected -= 1,
+				Opcode::PopRedir => {
+					if f.redirs.len() > d.redirs as usize
+						&& let Some(saves) = f.redirs.pop()
+					{
+						written_before_the_unwind(k, vp);
+						restore(vp, saves);
+					}
+				},
+				_ => {},
+			}
+		}
+	}
+	written_before_the_unwind(k, vp);
+	truncate(vp, d);
+}
+
+/// The frame of the innermost loop a `break` or `continue` leaves: the top
+/// frame, or one below the `eval`, `${ ;}` and pipeline-stage frames it
+/// crosses; `None` outside every loop.
+fn loop_frame(vp: &Vproc) -> Option<usize> {
+	for (i, f) in vp.frames.iter().enumerate().rev() {
+		if !f.loops.is_empty() {
+			return Some(i);
 		}
 		let crossable = matches!(
 			f.kind,
 			FrameKind::Script { what: ScriptKind::Eval, .. } | FrameKind::NoFork | FrameKind::Stage
 		);
-		if crossable && vp.frames.len() > 1 {
-			pop_frame(&mut k.root, cx.store, vp);
-			// The caller's op (`eval`) is abandoned with the loop.
-			clear_scratch(&mut k.root, cx.store, vp);
-			continue;
+		if !crossable || i == 0 {
+			return None;
 		}
-		break;
 	}
-	// bash's `check_loop_level` complains only outside posix mode.
-	if !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
-		let line = line_of(vp, op.node);
-		let name = if cont { "continue" } else { "break" };
-		let diag = Diag::Usage { msg: "only meaningful in a `for', `while', or `until' loop".into() };
-		k.diag(cx, vp, line, diag.by(name));
-	}
-	vp.status = 0;
-	top_frame(vp).pc += 1;
+	None
 }
 
 /// The top frame's scratch, created from the vproc's spare if absent.
@@ -2153,35 +2427,51 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			k.diag(cx, vp, line, Diag::Unsupported { what: "`=cmd` in this expansion".into() });
 			Flow::Discard(1)
 		},
+		// Under `set -e` bash's `report_error` exits the shell itself.
+		Stop::Fail(d) | Stop::Fatal(d) if report_error_exits(k, cx, vp, &d) => {
+			let status = report_error_status(vp, &d);
+			k.diag(cx, vp, line, d);
+			Flow::Exit(status, Jump::Direct)
+		},
 		// A non-interactive posix shell exits on an expansion error (bash's
 		// `posixly_correct && !interactive_shell`), as on a fatal one.
 		Stop::Fail(d) if !posix_exits(k, cx, vp) => {
+			let cleanup = cleanup_jump(vp, &d);
 			k.diag(cx, vp, line, d);
-			Flow::Discard(1)
+			let flow = Flow::Discard(1);
+			jump_out(k, cx, vp, cleanup, &flow);
+			flow
 		},
 		Stop::Fail(d) | Stop::Fatal(d) => {
+			let cleanup = cleanup_jump(vp, &d);
+			let jump = top_level_jump(cx, vp, cleanup);
 			k.diag(cx, vp, line, d);
 			// The EXIT trap keeps the status the shell was exiting with.
-			// Under `set -e` bash reaches the same rows through its own
-			// errexit jump, which this change does not model, so the
-			// upstream constant stays whenever errexit is on.
-			if vp.mode.dialect() != Dialect::Zsh
+			// Under `set -e` bash's `report_error` exits on its own (the arm
+			// above); for the other errors bash reaches the same rows
+			// through its own errexit jump, which this change does not
+			// model, so the upstream constant stays whenever errexit is on.
+			let flow = if vp.mode.dialect() != Dialect::Zsh
 				&& let Some(status) = exit_trap_status(vp)
 				&& !errexit_on(k, cx, vp)
 			{
-				return Flow::Exit(status);
-			}
-			// bash exits 127 from a `-c` string (`run_one_command`), 1 from a
-			// script and from a subshell (`execute_in_subshell` keeps the
-			// failure status); a nested shell (depth 0) is its own `-c` shell.
-			// zsh exits 1 from any of them (`errflag` ends `loop` with 1).
-			let command = vp.mode.dialect() != Dialect::Zsh
-				&& super::subshell_depth(vp) == 0
-				&& matches!(
-					state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
-					Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
-				);
-			Flow::Exit(if command { 127 } else { 1 })
+				Flow::Exit(status, jump)
+			} else {
+				// bash exits 127 from a `-c` string (`run_one_command`), 1
+				// from a script and from a subshell (`execute_in_subshell`
+				// keeps the failure status); a nested shell (depth 0) is its
+				// own `-c` shell. zsh exits 1 from any of them (`errflag`
+				// ends `loop` with 1).
+				let command = vp.mode.dialect() != Dialect::Zsh
+					&& super::subshell_depth(vp) == 0
+					&& matches!(
+						state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
+						Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
+					);
+				Flow::Exit(if command { 127 } else { 1 }, jump)
+			};
+			jump_out(k, cx, vp, cleanup, &flow);
+			flow
 		},
 		Stop::Store(err) => {
 			k.fail(err);
@@ -2309,6 +2599,8 @@ pub fn start_sub(
 				child.trace_base += 1;
 				child
 			};
+			// bash runs the text with `parse_and_execute` (`command_substitute`).
+			child.frames[0].parse_level = ParseLevel::Substitution;
 			// With `-e` already off in the parent the child sees it off and
 			// `SHELLOPTS` is already right: nothing to reset.
 			if !inherit && state::option(&mut k.root, cx.store, vp, OptId::Errexit).unwrap_or(true) {
@@ -2595,7 +2887,9 @@ pub fn start_procsub(
 			fds.set(sibling, None);
 		}
 	}
-	let child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	// bash runs the text with `parse_and_execute` (`process_substitute`).
+	child.frames[0].parse_level = ParseLevel::Substitution;
 	let vpid = child.vpid;
 	// Not a job: its externals stay in the shell's group, without the
 	// terminal.
@@ -2831,6 +3125,12 @@ fn plain_arith(
 				d
 			};
 			let line = line_of(vp, op.node);
+			// Under `set -e` bash's `report_error` exits the shell itself.
+			if report_error_exits(k, cx, vp, &d) {
+				let status = report_error_status(vp, &d);
+				k.diag(cx, vp, line, d);
+				return Some(Flow::Exit(status, Jump::Direct));
+			}
 			k.diag(cx, vp, line, d);
 			vp.status = 1;
 			// `((…))` continues; an arith-for header error leaves the loop
@@ -3084,6 +3384,13 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					} else {
 						d
 					};
+					// Under `set -e` bash's `report_error` exits the shell
+					// itself.
+					if report_error_exits(k, cx, vp, &d) {
+						let status = report_error_status(vp, &d);
+						k.diag(cx, vp, line, d);
+						return Flow::Exit(status, Jump::Direct);
+					}
 					k.diag(cx, vp, line, d);
 					vp.status = 1;
 					// `((…))` continues; an arith-for header error leaves the
@@ -3117,7 +3424,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				// POSIX interpretation 383: fatal in a non-interactive shell.
 				let msg = format!("`{}': is a special builtin", f.name).into();
 				k.diag(cx, vp, line, Diag::Usage { msg });
-				return Flow::Exit(2);
+				return Flow::Exit(2, Jump::Other);
 			}
 			// zsh: defining `TRAPNAL` sets the trap (`localtraps` saves the
 			// old one).
@@ -3316,12 +3623,37 @@ fn time_end(
 	} else {
 		start
 	};
-	let format = if op.b == 1 {
+	bash_time_report(k, vp, cx, op.b == 1, posix, elapsed(start, end), line);
+}
+
+/// The real, user and system times from `start` to `end`.
+const fn elapsed(start: super::proc::TimeMark, end: super::proc::TimeMark) -> [u64; 3] {
+	[
+		end.real.saturating_sub(start.real),
+		end.user.saturating_sub(start.user),
+		end.sys.saturating_sub(start.sys),
+	]
+}
+
+/// bash's report of a `time`d pipeline's `times` on stderr: `time -p`
+/// (`dash_p`) in the POSIX format, else in `TIMEFORMAT` (unset: bash's
+/// default, or in posix mode for `time` without a pipeline (`null_posix`)
+/// the user and system times only; empty: nothing).
+fn bash_time_report(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	dash_p: bool,
+	null_posix: bool,
+	times: [u64; 3],
+	line: u32,
+) {
+	let format = if dash_p {
 		BString::from(POSIX_TIMEFORMAT)
 	} else {
 		match state::lookup(&k.root, cx.store, vp, b"TIMEFORMAT") {
 			Ok(Some(v)) => BString::from(v.as_scalar().unwrap_or_default()),
-			Ok(None) if posix => BString::from("user\t%2lU\nsys\t%2lS"),
+			Ok(None) if null_posix => BString::from("user\t%2lU\nsys\t%2lS"),
 			Ok(None) => BString::from(BASH_TIMEFORMAT),
 			Err(err) => {
 				k.fail(err);
@@ -3332,11 +3664,6 @@ fn time_end(
 	if format.is_empty() {
 		return;
 	}
-	let times = [
-		end.real.saturating_sub(start.real),
-		end.user.saturating_sub(start.user),
-		end.sys.saturating_sub(start.sys),
-	];
 	match time_report(&format, times) {
 		Ok(text) => vp
 			.out
@@ -3345,6 +3672,424 @@ fn time_end(
 			let msg = format!("TIMEFORMAT: `{}': invalid format character", char::from(c));
 			k.diag(cx, vp, line, Diag::Usage { msg: msg.into() });
 		},
+	}
+}
+
+/// A jump out of the commands that run, as bash's `parse_and_execute` (an
+/// `eval`, `.` or trap action) catches and passes it on: it decides whether
+/// that level undoes its commands' redirections first ([`kept_redirections`])
+/// and which `time`s report ([`report_jump`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Jump {
+	/// The `exit` (or `logout`) builtin: bash's `EXITBLTIN`.
+	Exit,
+	/// `set -e`'s exit, also after the ERR trap, and a posix shell's exit
+	/// on a special builtin's error (`execute_cmd.c`, lines 1005 and 4872):
+	/// bash's `ERREXIT`.
+	Errexit,
+	/// A jump after bash's `top_level_cleanup` ([`jump_out`]): `break` or
+	/// `continue` with a count that is not a number (`get_numeric_arg`), a
+	/// fatal arithmetic subscript error, and a fatal expansion or assignment
+	/// error outside every `parse_and_execute` (`exp_jump_to_top_level`):
+	/// [`top_level_jump`].
+	Cleanup,
+	/// Any other: a fatal error and a discarded command (`FORCE_EOF`,
+	/// `EXITPROG`, `DISCARD`).
+	Other,
+	/// No jump: under `set -e` bash's `report_error` calls `exit_shell`
+	/// itself ([`report_error_exits`]), as a failed `exec` does, and a
+	/// `SIGPIPE` ends the shell; no `time` reports.
+	Direct,
+}
+
+/// bash's `time_command` catches a jump out of the timed command (`exit`,
+/// `set -e`, a fatal expansion error, a discarded command): it reports the
+/// times, then jumps on (`break` and `continue` are no jumps:
+/// [`end_left_commands`]). `return` passes it (bash's `return_catch`),
+/// `exec` replaces the shell, and a jump after `top_level_cleanup` drops
+/// the marks started inside a `parse_and_execute` unreported
+/// ([`jump_out`]). Report, innermost first, the `time` marks of frames
+/// `frame` and up, and drop them. A jump that passes an `eval`, `.` or
+/// trap action (a `parse_and_execute`, which undoes its commands'
+/// redirections as it passes the jump on, except those
+/// [`kept_redirections`] leaves) reports the marks below it through the
+/// redirections in effect outside it.
+fn report_left_times(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, frame: usize, jump: Jump) {
+	if vp.frames.iter().skip(frame).all(|f| f.times.is_empty()) {
+		return;
+	}
+	let kept = kept_redirections(k, vp, cx, frame, jump);
+	let end = time_mark(&*cx.host);
+	let line = vp
+		.frames
+		.last()
+		.and_then(|f| f.unit.as_deref().and_then(|u| u.ops.get(f.pc as usize)))
+		.map_or(0, |op| line_of(vp, op.node));
+	for i in (frame..vp.frames.len()).rev() {
+		let f = &vp.frames[i];
+		let ends = pending_time_ends(f, f.times.len());
+		let left: Vec<_> = f.times.iter().rev().copied().zip(ends).collect();
+		vp.frames[i].times.clear();
+		for (start, dash_p) in left {
+			bash_time_report(k, vp, cx, dash_p, false, elapsed(start, end), line);
+		}
+		if i > frame
+			&& i < kept
+			&& parse_and_execute(&vp.frames[i])
+			&& vp.frames[frame..i].iter().any(|f| !f.times.is_empty())
+		{
+			undo_redirections(k, vp, i, kept);
+		}
+	}
+}
+
+/// The first frame whose redirections a jump out of frames `frame` and up
+/// leaves in effect (past the last frame when it leaves none). bash's
+/// `parse_and_execute` runs its `pe_dispose` unwind frame, which undoes the
+/// redirections of the commands it ran, for every jump but two while a
+/// function runs (`variable_context`, also one called inside it): for
+/// `exit` when an EXIT trap is set it discards that frame at every level,
+/// so the reports and the trap go through them; for `ERREXIT` under `set
+/// -e` it discards it at the innermost level only, which also leaves every
+/// function context (`reset_local_contexts`), so the levels outside that
+/// one undo theirs (a posix special builtin's `ERREXIT` without `set -e`
+/// undoes everywhere).
+fn kept_redirections(
+	k: &mut Kernel,
+	vp: &Vproc,
+	cx: &mut Cx<'_>,
+	frame: usize,
+	jump: Jump,
+) -> usize {
+	let none = vp.frames.len();
+	match jump {
+		Jump::Other | Jump::Cleanup => none,
+		Jump::Direct => frame,
+		Jump::Exit if function_context(k, cx, vp) && exit_trapped(k, cx, vp) => frame,
+		Jump::Errexit if function_context(k, cx, vp) && errexit_on(k, cx, vp) => vp
+			.frames
+			.iter()
+			.rposition(parse_and_execute)
+			.unwrap_or(none),
+		Jump::Exit | Jump::Errexit => none,
+	}
+}
+
+/// Whether `vp` has an EXIT trap set (bash's `signal_is_trapped (0)`), also
+/// one that ignores (`trap '' EXIT`); a subshell lists its parent's but has
+/// none of its own, and none while its own runs until the action sets one
+/// again ([`start_trap`]).
+fn exit_trapped(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	if vp.parent.is_some() && !vp.own_traps.has(TrapKey::Exit) {
+		return false;
+	}
+	match state::record(cx.store, vp, Key::Trap(TrapKey::Exit)) {
+		Ok(rec) => matches!(rec, Some(Record::Trap { .. })),
+		Err(err) => {
+			k.fail(err);
+			false
+		},
+	}
+}
+
+/// The `-p` flags of the `n` innermost `TimeEnd`s frame `f` has still to
+/// reach (its pending `time` marks, innermost first): the first ones after
+/// its pc that close no `time` started after it.
+fn pending_time_ends(f: &super::proc::Frame, n: usize) -> Vec<bool> {
+	let mut ends = Vec::with_capacity(n);
+	if let Some(unit) = f.unit.as_deref() {
+		let mut depth = 0u32;
+		for op in unit.ops.iter().skip(f.pc as usize) {
+			if ends.len() == n {
+				break;
+			}
+			match op.code {
+				Opcode::TimeStart => depth += 1,
+				Opcode::TimeEnd if depth > 0 => depth -= 1,
+				Opcode::TimeEnd => ends.push(op.b == 1),
+				_ => {},
+			}
+		}
+	}
+	ends.resize(n, false);
+	ends
+}
+
+/// A jump out of frames `frame` and up (`exit`, `set -e`, a discarded
+/// command; `jump` says which): their `time` marks report
+/// ([`report_left_times`]) and go out before the unwind
+/// ([`written_before_the_unwind`]), as the message queued before it does.
+/// bash's `top_level_cleanup` comes first for [`Jump::Cleanup`]
+/// ([`jump_out`]); [`Jump::Direct`] is no jump, and its marks go
+/// unreported. zsh mode keeps its own rules.
+pub(super) fn report_jump(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	frame: usize,
+	jump: Jump,
+) {
+	if vp.mode.dialect() == Dialect::Zsh {
+		return;
+	}
+	match jump {
+		Jump::Direct => {
+			for f in vp.frames.iter_mut().skip(frame) {
+				f.times.clear();
+			}
+		},
+		Jump::Cleanup => jump_out(k, cx, vp, true, &Flow::Exit(vp.status, jump)),
+		Jump::Exit | Jump::Errexit | Jump::Other => {},
+	}
+	report_left_times(k, vp, cx, frame, jump);
+	written_before_the_unwind(k, vp);
+}
+
+/// bash writes a jump's reports and messages while the redirections in
+/// effect at the jump still apply (`( time { exit 3; } 2>err )` reports
+/// into `err`): what is queued goes out before the unwind undoes them; what
+/// would block is written after it, as for a failed redirection.
+fn written_before_the_unwind(k: &Kernel, vp: &mut Vproc) {
+	if !vp.out.is_empty() {
+		let _ = flush_out(k, vp);
+	}
+}
+
+/// The innermost script frame (the run's, `eval`'s, `.`'s, a trap
+/// action's): a discarded or aborted command leaves it and the frames above.
+fn script_frame(vp: &Vproc) -> Option<usize> {
+	vp.frames
+		.iter()
+		.rposition(|f| matches!(f.kind, FrameKind::Script { .. }))
+}
+
+/// The innermost running EXIT trap action: in a subshell, bash's
+/// `run_exit_trap` is the only catch of a discarded command below the
+/// top level (the `parse_and_execute` of an `eval`, `.` or other trap
+/// action passes it on).
+fn exit_trap_frame(vp: &Vproc) -> Option<usize> {
+	vp.frames.iter().rposition(|f| {
+		matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key: TrapKey::Exit, .. }, .. })
+	})
+}
+
+/// Drop every pending `time` mark without a report: `exec` replaced the
+/// shell ([`report_left_times`]).
+pub(super) fn drop_times(vp: &mut Vproc) {
+	for f in &mut vp.frames {
+		f.times.clear();
+	}
+}
+
+/// An arithmetic subscript error in bash mode: bash's `array_expand_index`
+/// runs `top_level_cleanup` before its jump ([`jump_out`]).
+pub(super) fn cleanup_jump(vp: &Vproc, d: &Diag) -> bool {
+	matches!(d, Diag::ArithSubscript { .. }) && vp.mode.dialect() != Dialect::Zsh
+}
+
+/// Whether `d` is one of bash's `report_error` messages (error.c:170): a
+/// readonly variable assigned (`err_readonly`), an unbound one, `${x:?}`,
+/// `${1:=x}`, a bad substitution or array subscript, an invalid indirect
+/// expansion or variable name, a `failglob` miss, a list assigned to an
+/// array element, a compound assignment's element without a key for an
+/// associative array or with a non-numeric one for an indexed array, and
+/// a file `.` cannot read (`file_error`). A builtin's own message
+/// (`declare: r: readonly variable`) is `builtin_error`, which never exits.
+fn reports_error(d: &Diag) -> bool {
+	match d {
+		Diag::Several { diags } => diags.iter().any(reports_error),
+		_ => matches!(
+			d,
+			Diag::Readonly { .. }
+				| Diag::Unbound { .. }
+				| Diag::ParamUnset { .. }
+				| Diag::CannotAssign { .. }
+				| Diag::BadSubst { .. }
+				| Diag::BadSubscript { .. }
+				| Diag::InvalidIndirect { .. }
+				| Diag::InvalidVarName { .. }
+				| Diag::NoMatch { .. }
+				| Diag::ListToMember { .. }
+				| Diag::AssocSubscript { .. }
+				| Diag::NonNumericIndex { .. }
+				| Diag::FileError { .. }
+		),
+	}
+}
+
+/// Whether bash's `report_error` exits the shell for `d` ([`reports_error`],
+/// error.c:182): under `set -e` it calls `exit_shell` itself, with no jump,
+/// so no `time` reports ([`Jump::Direct`]). bash turns the flag off only
+/// inside an `eval`, `.` or builtin run through `command` that a condition
+/// runs (`execute_cmd.c`, line 5000), not for the condition's own commands:
+/// a frame such a builtin pushed here (the builtin's own command, on the
+/// frame below, says how it was run: [`errexit_off`]), the builtin itself
+/// in `settle_builtin`.
+pub(super) fn report_error_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, d: &Diag) -> bool {
+	reports_error(d)
+		&& vp.mode.dialect() != Dialect::Zsh
+		&& !vp.frames.iter().enumerate().any(|(i, f)| {
+			f.ignore_errexit
+				&& matches!(f.kind, FrameKind::Script {
+					what: ScriptKind::Eval | ScriptKind::Source,
+					..
+				})
+				&& i
+					.checked_sub(1)
+					.and_then(|below| vp.frames[below].scratch.as_ref())
+					.and_then(|sc| sc.exec.as_ref())
+					.is_none_or(|e| match e.target {
+						Some(Target::Intrinsic(id)) => errexit_off(e.prefix, id),
+						_ => true,
+					})
+		})
+		&& errexit_on(k, cx, vp)
+}
+
+/// Whether bash's `execute_builtin` turns `set -e` off for builtin `id` run
+/// with `prefix` in a condition (`execute_cmd.c`, line 5000): through
+/// `command`, or `eval`, `.` and `source` named directly (not through
+/// `builtin`, whose own run keeps the flag).
+pub(super) const fn errexit_off(prefix: Prefix, id: IntrinsicId) -> bool {
+	match prefix {
+		Prefix::Command => true,
+		Prefix::Builtin => false,
+		Prefix::None => matches!(id, IntrinsicId::Eval | IntrinsicId::Dot | IntrinsicId::Source),
+	}
+}
+
+/// The status [`report_error_exits`] leaves with: 1 for an error bash sets
+/// the status for before the message, else `$?`, or 1 when that is 0; for
+/// several messages, the first such one's.
+pub(super) fn report_error_status(vp: &Vproc, d: &Diag) -> i32 {
+	match d {
+		Diag::Several { diags } => diags
+			.iter()
+			.find(|d| reports_error(d))
+			.map_or(1, |d| report_error_status(vp, d)),
+		Diag::Readonly { .. }
+		| Diag::BadSubscript { .. }
+		| Diag::InvalidIndirect { .. }
+		| Diag::InvalidVarName { .. }
+		| Diag::ListToMember { .. }
+		| Diag::FileError { .. }
+			if vp.status != 0 =>
+		{
+			vp.status
+		},
+		_ => 1,
+	}
+}
+
+/// The first frame `flow` leaves: every frame for an exit, the innermost
+/// script frame and up for a discarded or aborted command; `None` for a
+/// flow that leaves none.
+fn left_frame(vp: &Vproc, flow: &Flow) -> Option<usize> {
+	match flow {
+		Flow::Exit(..) => Some(0),
+		Flow::Discard(_) | Flow::Abort(_) => Some(script_frame(vp).unwrap_or(0)),
+		_ => None,
+	}
+}
+
+/// Whether `f` runs inside one of bash's `parse_and_execute` levels it
+/// starts or keeps: `eval`, `.`, a trap action, the line editor's code (not
+/// the run's own script), and the base frame of a child that runs inside
+/// one from its start ([`Frame::parse_level`]).
+pub(super) fn parse_and_execute(f: &Frame) -> bool {
+	f.parse_level != ParseLevel::Outside
+		|| matches!(f.kind, FrameKind::Script { what, .. } if what != ScriptKind::Run)
+}
+
+/// The first frame inside a `parse_and_execute`: frame 0 under `-c` (and in
+/// its subshells, which inherit the level) and in a child that runs inside
+/// one from its start (a subshell, job or pipeline stage forked inside an
+/// `eval`, `.` or trap action; a command or process substitution), else the
+/// first `eval`, `.` or trap action frame; past the last frame for a
+/// script's own commands.
+fn parse_and_execute_frame(cx: &mut Cx<'_>, vp: &Vproc) -> usize {
+	if matches!(
+		state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
+		Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
+	) {
+		return 0;
+	}
+	vp.frames
+		.iter()
+		.position(parse_and_execute)
+		.unwrap_or(vp.frames.len())
+}
+
+/// bash's `run_unwind_protects`: what is queued goes out through the
+/// redirections in effect, then those of frames `from` up to `to` (not
+/// included) are undone (each frame's running op's own, then its compound
+/// commands', innermost first), so the reports that follow go to the fds
+/// outside them.
+fn undo_redirections(k: &Kernel, vp: &mut Vproc, from: usize, to: usize) {
+	written_before_the_unwind(k, vp);
+	let mut i = to.min(vp.frames.len());
+	while i > from {
+		i -= 1;
+		let own = vp.frames[i]
+			.scratch
+			.as_mut()
+			.and_then(|sc| sc.io.as_mut())
+			.map(|io| std::mem::take(&mut io.saved));
+		if let Some(saves) = own {
+			restore(vp, saves);
+		}
+		while let Some(saves) = vp.frames[i].redirs.pop() {
+			restore(vp, saves);
+		}
+	}
+}
+
+/// A bash-mode jump to the top level for an error whose message is queued:
+/// bash runs `top_level_cleanup` first for an arithmetic subscript error and
+/// a builtin's `no_args` (`cleanup`), and `exp_jump_to_top_level` runs it
+/// for an expansion error, a failed assignment or a `failglob` miss outside
+/// every `parse_and_execute` (a script's own command). It undoes the
+/// redirections the jump leaves, so the `time`s that catch the jump report
+/// on the shell's own stderr; for `cleanup`, the marks started inside a
+/// `parse_and_execute` are dropped unreported as well (their jump targets
+/// are gone). Frames `flow` does not leave keep theirs: their commands go
+/// on. Records on `k` whether bash ran `top_level_cleanup`
+/// ([`top_level_jump`]), for the arm that takes `flow`.
+pub(super) fn jump_out(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	cleanup: bool,
+	flow: &Flow,
+) {
+	if vp.mode.dialect() == Dialect::Zsh {
+		return;
+	}
+	let Some(leave) = left_frame(vp, flow) else {
+		return;
+	};
+	let inside = parse_and_execute_frame(cx, vp);
+	let all = vp.frames.len();
+	k.top_level_cleanup = cleanup || inside == all;
+	if cleanup {
+		undo_redirections(k, vp, leave, all);
+		for f in vp.frames.iter_mut().skip(leave.max(inside)) {
+			f.times.clear();
+		}
+	} else if inside == all {
+		undo_redirections(k, vp, leave, all);
+	}
+}
+
+/// The kind of the exit [`jump_out`] makes: [`Jump::Cleanup`] when bash runs
+/// `top_level_cleanup` before it (`cleanup`, or outside every
+/// `parse_and_execute`, where `exp_jump_to_top_level` runs it), else
+/// [`Jump::Other`].
+pub(super) fn top_level_jump(cx: &mut Cx<'_>, vp: &Vproc, cleanup: bool) -> Jump {
+	if cleanup || parse_and_execute_frame(cx, vp) == vp.frames.len() {
+		Jump::Cleanup
+	} else {
+		Jump::Other
 	}
 }
 
@@ -3659,7 +4404,7 @@ fn for_in(
 		if state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
 			// Fatal to a posix shell.
 			clear_scratch(&mut k.root, cx.store, vp);
-			return Flow::Exit(1);
+			return Flow::Exit(1, Jump::Other);
 		}
 		items.clear();
 		1
@@ -3730,10 +4475,16 @@ fn for_next(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		builtins::assign_loop_var(k, vp, cx, &var, value.clone())
 	};
 	if let Err(d) = assigned {
+		// Under `set -e` bash's `report_error` exits the shell itself.
+		if report_error_exits(k, cx, vp, &d) {
+			let status = report_error_status(vp, &d);
+			k.diag(cx, vp, line, d);
+			return Flow::Exit(status, Jump::Direct);
+		}
 		k.diag(cx, vp, line, d);
 		// An assignment error ends a posix shell.
 		if state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false) {
-			return Flow::Exit(1);
+			return Flow::Exit(1, Jump::Other);
 		}
 		if let Some(rec) = top_frame(vp).loops.last_mut() {
 			rec.status = 1;
@@ -4710,6 +5461,11 @@ pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey)
 		// A root run is a shell invocation: consume its EXIT trap when it
 		// fires, rather than carrying it into the next invocation.
 		state::store_record(&mut k.root, cx.store, vp, KeyBuf::Trap(key), None);
+	} else if started && key == TrapKey::Exit && vp.mode.dialect() == Dialect::Bash {
+		// bash's `run_exit_trap` clears `SIG_TRAPPED` before the action
+		// runs: a subshell's own trap counts no more ([`exit_trapped`])
+		// until the action sets one again; `trap -p` still lists it.
+		vp.own_traps = vp.own_traps.without(key);
 	}
 	started
 }
@@ -4773,6 +5529,7 @@ fn push_trap(
 		cancel: None,
 		return_target: None,
 		exit: false,
+		outside_functions: false,
 	});
 	if let Some(saved) = restore {
 		super::mode::set_mode(&mut k.root, cx.store, vp, trap_mode);
@@ -5100,7 +5857,7 @@ fn always_end(vp: &mut Vproc) -> Flow {
 		Some(TryEnd::Error) => Flow::Discard(if rec.status == 0 { 1 } else { rec.status }),
 		Some(TryEnd::Return(n)) => Flow::Return(n),
 		Some(TryEnd::Break { n, cont }) => Flow::Break { n, cont },
-		Some(TryEnd::Exit(n)) => Flow::Exit(n),
+		Some(TryEnd::Exit(n)) => Flow::Exit(n, Jump::Other),
 	}
 }
 
@@ -5164,7 +5921,7 @@ pub fn zsh_return(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) 
 	if let Some(i) = target {
 		zsh_leave(k, vp, cx, i);
 	} else {
-		exit_shell(k, vp, cx, status);
+		exit_shell(k, vp, cx, status, Jump::Other);
 	}
 }
 
@@ -5336,7 +6093,7 @@ fn zsh_exit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 		{
 			z.exit_from_function = true;
 		}
-		exit_shell(k, vp, cx, status);
+		exit_shell(k, vp, cx, status, Jump::Other);
 		return;
 	}
 	let level = vp
@@ -5428,7 +6185,7 @@ fn zsh_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 		vp.status = status;
 	} else {
 		unwind(&mut k.root, cx.store, vp, 0);
-		exit_shell(k, vp, cx, status);
+		exit_shell(k, vp, cx, status, Jump::Other);
 	}
 }
 

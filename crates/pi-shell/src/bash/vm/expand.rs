@@ -1627,7 +1627,10 @@ impl<'e, 'c> Expander<'e, 'c> {
 		// arithmetic syntax error). Only such text differs from the word.
 		let src = word_source(unit, wi);
 		if src.iter().any(|c| matches!(c, b'\'' | b'\\')) {
-			let n = self.arith(src)?;
+			// An error of the text's own expansion (`$((1/0))` in it) is not
+			// the subscript's: bash reports it as such.
+			let text = self.expand_text(src)?;
+			let n = self.arith_eval(&text).map_err(subscript_error)?;
 			return Ok(BString::from(n.format_into(&mut NumBuffer::new())));
 		}
 		// bash expands no tilde-prefix in an arithmetic subscript (`${b[~]}`
@@ -1637,7 +1640,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 		let Sink::Scalar(text) = sink else {
 			return Ok(BString::default());
 		};
-		let n = self.arith_eval(&text)?;
+		let n = self.arith_eval(&text).map_err(subscript_error)?;
 		Ok(BString::from(n.format_into(&mut NumBuffer::new())))
 	}
 
@@ -1656,7 +1659,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 			}
 			return self.expand_arith_text(&subscript_as_arith_text(sub));
 		}
-		let n = self.arith(sub)?;
+		let text = self.expand_text(sub)?;
+		let n = self.arith_eval(&text).map_err(subscript_error)?;
 		Ok(BString::from(n.format_into(&mut NumBuffer::new())))
 	}
 
@@ -3770,6 +3774,21 @@ fn lone_param(w: &Word) -> Option<&ParamIr> {
 		[Part::Param(p)] => Some(p),
 		[Part::Param(p), Part::Quoted(q)] if q.is_empty() => Some(p),
 		_ => None,
+	}
+}
+
+/// An indexed array subscript's arithmetic error is a subscript error, as
+/// bash's `array_expand_index` treats it: the same text, but bash runs
+/// `top_level_cleanup` before it jumps ([`Diag::ArithSubscript`]).
+fn subscript_error(e: Stop) -> Stop {
+	match e {
+		Stop::Fail(Diag::Arith { expr, msg, token }) => {
+			Stop::Fail(Diag::ArithSubscript { expr, msg, token })
+		},
+		Stop::Fatal(Diag::Arith { expr, msg, token }) => {
+			Stop::Fatal(Diag::ArithSubscript { expr, msg, token })
+		},
+		other => other,
 	}
 }
 
