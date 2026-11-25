@@ -642,6 +642,9 @@ describe("pickElectronTarget", () => {
 					...RENDERER_PRIORITY_ARGS,
 					`--user-data-dir=${root}`,
 					`--remote-debugging-port=${port}`,
+					// A start page that needs no network: Chromium's own (chrome://newtab) commits only once the network
+					// answers, and a tab whose first page has not committed does not take a viewport override's size.
+					"about:blank",
 				],
 				{ stdin: "ignore", stdout: "ignore", stderr: "pipe" },
 			);
