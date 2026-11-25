@@ -101,6 +101,10 @@ use crate::bash::{
 pub enum Chunk {
 	/// Bytes for an fd.
 	Out(i32, Vec<u8>),
+	/// A trace line (`set -x`) for an fd, written unchecked
+	/// ([`super::proc::PendingWrite::trace`]): not the builtin's own
+	/// output, so a failed write of it is neither its error nor its status.
+	Trace(i32, Vec<u8>),
 	/// A diagnostic for stderr (rendered when the builtin completes).
 	Diag(Diag),
 }
@@ -360,6 +364,21 @@ impl<'a, 'c> Ctx<'a, 'c> {
 			return;
 		}
 		self.chunks.push(Chunk::Out(fd, bytes.to_vec()));
+	}
+
+	/// Queue a trace line (`set -x`) the builtin writes as it runs, for
+	/// `fd` as its redirections left them ([`Chunk::Trace`]).
+	pub fn trace_line(&mut self, fd: i32, bytes: &[u8]) {
+		if bytes.is_empty() {
+			return;
+		}
+		if let Some(Chunk::Trace(f, buf)) = self.chunks.last_mut()
+			&& *f == fd
+		{
+			buf.extend_from_slice(bytes);
+			return;
+		}
+		self.chunks.push(Chunk::Trace(fd, bytes.to_vec()));
 	}
 
 	/// Queue `NAME: <diag>` for stderr.

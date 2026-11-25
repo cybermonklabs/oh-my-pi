@@ -663,7 +663,8 @@ fn seeded_exec(
 /// Write a fast-path builtin's output now. `Err((n, off))`: the first `n`
 /// chunks and `off` bytes of the next went out, the rest is for the
 /// staged output, which also takes all of it (`Err((0, 0))`) when it has a
-/// diagnostic to render or the shell has output queued before it.
+/// diagnostic to render or a trace line to write unchecked
+/// ([`Chunk::Trace`]), or the shell has output queued before it.
 fn write_now(k: &Kernel, vp: &Vproc, chunks: &[Chunk]) -> Result<(), (usize, usize)> {
 	if !vp.out.is_empty() || chunks.iter().any(|c| !matches!(c, Chunk::Out(..))) {
 		return Err((0, 0));
@@ -725,7 +726,13 @@ fn expand(
 	}
 	if !st(vp).expanded {
 		let words = &unit.lists[cmd.words as usize];
-		let record = words.iter().any(|&w| unit.words[w as usize].parks);
+		let zsh = unit.mode.dialect() == crate::bash::ids::Dialect::Zsh;
+		// bash's `set -x` traces a declaration's compound assignment as it
+		// expands that word (`expand_declaration_argument`), before the
+		// words after it: that expansion keeps a replay log, so a later
+		// park runs it again without a second trace line.
+		let decl = !zsh && decl_compounds(unit, words);
+		let record = decl || words.iter().any(|&w| unit.words[w as usize].parks);
 		// Expand into the state's (recycled) vectors; a replay starts over.
 		let s = st(vp);
 		let mut argv = std::mem::take(&mut s.argv);
@@ -750,11 +757,23 @@ fn expand(
 		keywords.clear();
 		let mut arrayref = std::mem::take(&mut st(vp).arrayref);
 		arrayref.clear();
-		let zsh = unit.mode.dialect() == crate::bash::ids::Dialect::Zsh;
+		// The first entry of `compound` traced after the pathname
+		// expansion of the compound words (below), not as it expands.
+		let mut late = None;
 		let res = expanding(k, vp, cx, Slot::Words, record, line, |ex| {
 			keywords.clear();
 			arrayref.clear();
+			late = None;
 			ex.pool = std::mem::take(&mut pool);
+			// The pathname expansion options that decide which compound
+			// words have their walks made here are the first pass's, and so
+			// is the choice to trace each compound word: a `${ ;}` after
+			// them can change the options (bash has made the assignments by
+			// then), and the trace and walks log entries that each replay
+			// must read in step.
+			if decl {
+				ex.first_pass_glob_opts()?;
+			}
 			// zsh `KSH_TYPESET`, read at the first argument that needs it.
 			let mut ksh_typeset = None;
 			for &w in words {
@@ -770,6 +789,29 @@ fn expand(
 				let mut elems = Vec::new();
 				let mut elem_globs = Vec::new();
 				if ex.decl_compound(unit, word, &argv, &mut prefix, &mut elems, &mut elem_globs)? {
+					// Traced once its words' pathname expansion is done too,
+					// here in the pass (a walk parks it, and it replays),
+					// unless `failglob` leaves that to the walks after the
+					// words: then it and every compound word after it is
+					// traced after them.
+					let traced = decl && late.is_none() && {
+						let on = xtrace::on(ex.k, ex.cx, ex.vp);
+						ex.first_pass(on)
+					};
+					if traced {
+						if !elem_globs.is_empty()
+							&& super::glob::compound_globs_in(ex, &mut elems, &elem_globs)?
+						{
+							elem_globs.clear();
+						}
+						if elem_globs.is_empty() {
+							let mut text = prefix.clone();
+							text.extend_from_slice(&compound_text(&elems));
+							ex.trace_once(&text);
+						} else {
+							late = Some(compound.len());
+						}
+					}
 					let at = argv.len() as u32;
 					argv.push(BString::default());
 					compound.push(at);
@@ -810,6 +852,11 @@ fn expand(
 			let mut text = BString::from(prefix);
 			text.extend_from_slice(&compound_text(&elems));
 			argv[at as usize] = text;
+		}
+		if let Some(from) = late {
+			for &i in &compound[from..] {
+				xtrace::emit(k, cx, vp, line, &argv[i as usize]);
+			}
 		}
 		scratch(vp).spare_words = pool;
 		let s = st(vp);
@@ -1147,7 +1194,8 @@ fn expand(
 		if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 			trace_zsh(k, vp, cx, unit, &cmd.assigns, line);
 		} else {
-			trace(k, vp, cx, unit, &cmd.assigns, line);
+			let traced = decl_compounds(unit, &unit.lists[cmd.words as usize]);
+			trace(k, vp, cx, unit, &cmd.assigns, traced, line);
 		}
 		// Out before the command's redirections move stderr.
 		if let Some(fd) = exec::flush_out(k, vp) {
@@ -1180,8 +1228,7 @@ fn cat_stdin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Opti
 		Ok(_) => BString::default(),
 	};
 	let s = st(vp);
-	s.writes
-		.push_back(PendingWrite { fd: 1, bytes: text, off: 0 });
+	s.writes.push_back(PendingWrite::new(1, text));
 	s.stage = Stage::Output;
 	None
 }
@@ -1507,13 +1554,25 @@ fn is_arrayref(word: &ir::Word) -> bool {
 	name > 0 && !first[0].is_ascii_digit() && first.get(name) == Some(&b'[') && last.ends_with(b"]")
 }
 
-/// `set -x`: one line per assignment, then the words.
+/// Whether one of `words` is a declaration builtin's compound assignment
+/// argument (`declare -a a=(1)`, bash's `W_COMPASSIGN|W_ASSIGNARG`).
+fn decl_compounds(unit: &Unit, words: &[u32]) -> bool {
+	words.iter().any(|&w| {
+		let word = &unit.words[w as usize];
+		word.kind == ir::WordKind::DeclArg && matches!(word.parts.last(), Some(Part::Compound(_)))
+	})
+}
+
+/// `set -x`: one line per assignment, then the words. `traced`: the
+/// compound assignment words are declaration arguments, traced as they
+/// expanded ([`expand`]).
 fn trace(
 	k: &mut Kernel,
 	vp: &mut Vproc,
 	cx: &mut Cx<'_>,
 	unit: &Unit,
 	assigns: &[ir::AssignOp],
+	traced: bool,
 	line: u32,
 ) {
 	let utf8 = xtrace::utf8(k, cx, vp);
@@ -1553,8 +1612,26 @@ fn trace(
 		lines.push(body);
 	}
 	if !s.argv.is_empty() {
+		// A declaration builtin's compound assignment (`declare -a a=(1 2)`)
+		// was traced as its word expanded (bash makes it then, and shows it
+		// as `do_assignment_internal` does: `a=('1' '2')`); the builtin
+		// gets the bare name (`declare -a a`).
+		let mut argv = s.argv.clone();
+		for &i in &s.compound {
+			let Some(word) = argv.get_mut(i as usize) else {
+				continue;
+			};
+			let Some(eq) = word.iter().position(|&c| c == b'=') else {
+				continue;
+			};
+			if !traced {
+				lines.push(word.to_vec());
+			}
+			let name = eq - usize::from(eq > 0 && word[eq - 1] == b'+');
+			word.truncate(name);
+		}
 		let mut body = Vec::new();
-		xtrace::push_words(&mut body, &s.argv, utf8);
+		xtrace::push_words(&mut body, &argv, utf8);
 		lines.push(body);
 	}
 	for body in lines {
@@ -1933,11 +2010,10 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 						let msg = format!("-{}: invalid option", argv[0][1] as char).into();
 						let line = line_of(vp, op.node);
 						k.diag(cx, vp, line, Diag::Usage { msg }.by("builtin"));
-						vp.out.push_back(PendingWrite {
-							fd:    2,
-							bytes: BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
-							off:   0,
-						});
+						vp.out.push_back(PendingWrite::new(
+							2,
+							BString::from("builtin: usage: builtin [shell-builtin [arg ...]]\n"),
+						));
 						let s = st(vp);
 						s.status = 2;
 						s.stage = Stage::Finish;
@@ -2798,8 +2874,7 @@ fn zsh_funcnest(
 		line:   zline,
 		utf8:   false,
 	});
-	vp.out
-		.push_back(super::proc::PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+	vp.out.push_back(super::proc::PendingWrite::new(2, bytes));
 	vp.status = 1;
 	Some(Flow::Discard(1))
 }
@@ -3020,8 +3095,7 @@ fn parse_autoload(
 					let site = crate::bash::diag::ZshSite { prefix: name, line, utf8: false };
 					bytes.extend_from_slice(&crate::bash::diag::render_zsh(&diag, site));
 				}
-				vp.out
-					.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+				vp.out.push_back(PendingWrite::new(2, bytes));
 				return Err(());
 			},
 		}
@@ -3991,18 +4065,15 @@ fn settle_builtin(
 		}
 	}
 	for c in chunks {
-		let (fd, bytes) = match c {
-			Chunk::Out(fd, b) => (fd, b),
+		let write = match c {
+			Chunk::Out(fd, b) => PendingWrite::new(fd, b),
+			Chunk::Trace(fd, b) => PendingWrite::traced(fd, b),
 			Chunk::Diag(d) => {
 				super::zle::display::trash_for_message(k, cx, vp);
-				(2, k.render_diag(cx, vp, line, &d))
+				PendingWrite::new(2, k.render_diag(cx, vp, line, &d))
 			},
 		};
-		sc.exec
-			.as_mut()
-			.expect("exec")
-			.writes
-			.push_back(PendingWrite { fd, bytes: bytes.into(), off: 0 });
+		sc.exec.as_mut().expect("exec").writes.push_back(write);
 	}
 	let e = sc.exec.as_mut().expect("exec");
 	e.status = outcome.status;
@@ -4153,10 +4224,8 @@ fn exec_builtin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> O
 		let text = k.render_diag(cx, vp, line, &Diag::Usage { msg: msg.into() }.by("exec"));
 		let s = st(vp);
 		s.argv = argv;
-		s.writes
-			.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
-		s.writes
-			.push_back(PendingWrite { fd: 2, bytes: USAGE.into(), off: 0 });
+		s.writes.push_back(PendingWrite::new(2, text));
+		s.writes.push_back(PendingWrite::new(2, USAGE));
 		s.status = 2;
 		s.stage = Stage::Output;
 		return None;
@@ -4593,7 +4662,8 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 			state.writes.pop_front();
 			continue;
 		}
-		let fd = pending.fd;
+		// A trace line goes to its fd unchecked (`PendingWrite::trace`).
+		let (trace, fd) = (pending.trace, pending.fd);
 		let handle = vp.fds.handle(fd);
 		let state = st(vp);
 		let pending = state.writes.front_mut().expect("checked");
@@ -4604,8 +4674,28 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 					state.writes.pop_front();
 				}
 			},
+			// bash writes it with an unchecked `fprintf`: the line is lost
+			// and the builtin's status and its other output stay. A broken
+			// pipe still raises the virtual SIGPIPE and ends the shell, as
+			// it does for any write; only the write error (the diagnostic
+			// and status 1) is dropped.
+			Poll::Ready(res) if trace => {
+				state.writes.pop_front();
+				if let Err(err) = res
+					&& err.kind() == std::io::ErrorKind::BrokenPipe
+					&& fd != 2
+					&& !sigpipe_ignored(cx.store, vp)
+				{
+					let platform = k.engine.config().platform;
+					return Some(Flow::Exit(crate::bash::signal::Signal::Pipe.exit_status(platform)));
+				}
+			},
 			Poll::Ready(res) => {
-				state.writes.retain(|queued| queued.fd != fd);
+				// The rest of the builtin's output for that fd is dropped; a
+				// queued trace line is not its output, and is still tried.
+				state
+					.writes
+					.retain(|queued| queued.fd != fd || queued.trace);
 				if fd != 2 {
 					let err = res
 						.err()
@@ -4630,9 +4720,7 @@ fn output(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<
 					// Through the command's own fd 2 (`2>&1 >&4`), while its
 					// redirections are in place.
 					let bytes = k.render_diag(cx, vp, line, &Diag::WriteError { cmd, err });
-					st(vp)
-						.writes
-						.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+					st(vp).writes.push_back(PendingWrite::new(2, bytes));
 				}
 			},
 			Poll::Pending => return Some(Flow::Block(WaitKey::Write { fd })),
@@ -4679,9 +4767,7 @@ fn zsh_write_error(
 	}
 	for d in diags {
 		let bytes = k.render_diag(cx, vp, line, &d);
-		st(vp)
-			.writes
-			.push_back(PendingWrite { fd: 2, bytes: bytes.into(), off: 0 });
+		st(vp).writes.push_back(PendingWrite::new(2, bytes));
 	}
 }
 
@@ -4765,7 +4851,7 @@ fn print_exit_value(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32
 		&& on(k, cx, vp, ZshOpt::Shinstdin)
 	{
 		let bytes = BString::from(format!("zsh: exit {status}\n"));
-		vp.out.push_back(PendingWrite { fd: 2, bytes, off: 0 });
+		vp.out.push_back(PendingWrite::new(2, bytes));
 	}
 }
 

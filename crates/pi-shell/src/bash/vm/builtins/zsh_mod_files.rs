@@ -140,17 +140,16 @@ impl<'a> Fsq<'a> {
 			},
 			Err(need) => {
 				for c in std::mem::take(&mut ctx.chunks) {
-					let (fd, bytes) = match c {
-						Chunk::Out(fd, b) => (fd, b),
-						Chunk::Diag(d) => (2, ctx.k.render_diag(ctx.cx, ctx.vp, ctx.line, &d)),
+					let write = match c {
+						Chunk::Out(fd, b) => PendingWrite::new(fd, b),
+						Chunk::Trace(fd, b) => PendingWrite::traced(fd, b),
+						Chunk::Diag(d) => {
+							PendingWrite::new(2, ctx.k.render_diag(ctx.cx, ctx.vp, ctx.line, &d))
+						},
 					};
-					ctx.vp
-						.out
-						.push_back(PendingWrite { fd, bytes: bytes.into(), off: 0 });
+					ctx.vp.out.push_back(write);
 				}
-				ctx.vp
-					.out
-					.push_back(PendingWrite { fd: 2, bytes: prompt.into(), off: 0 });
+				ctx.vp.out.push_back(PendingWrite::new(2, prompt));
 				Err(need)
 			},
 		}

@@ -1131,6 +1131,25 @@ pub struct PendingWrite {
 	pub fd:    i32,
 	pub bytes: BString,
 	pub off:   usize,
+	/// A trace line (`set -x`) a builtin wrote as it ran: a failed write
+	/// of it is dropped, as bash's unchecked `fprintf` to the trace stream
+	/// drops it (`print_cmd.c` `xtrace_print_assignment`), not reported as
+	/// the builtin's own write error. Beside the descriptor, never in it:
+	/// every `fd` here is one the shell can open.
+	pub trace: bool,
+}
+
+impl PendingWrite {
+	/// Bytes queued for `fd` from their start, written as the command's
+	/// own output (a failed write is its error).
+	pub fn new(fd: i32, bytes: impl Into<BString>) -> Self {
+		Self { fd, bytes: bytes.into(), off: 0, trace: false }
+	}
+
+	/// A trace line queued for `fd` ([`PendingWrite::trace`]).
+	pub fn traced(fd: i32, bytes: impl Into<BString>) -> Self {
+		Self { fd, bytes: bytes.into(), off: 0, trace: true }
+	}
 }
 
 /// One logged expansion step (see `expand`): replaying the log reproduces

@@ -15,20 +15,35 @@ use super::{
 use crate::bash::{store::OptId, zshopt::ZshOpt};
 
 /// bash's `indirection_level` in `vp`: 1 at the top, one more per `eval`,
-/// `.` file and trap action running, plus the level the vproc started at
+/// `.` file, trap action and `${ ;}` / `${| ;}` running (each a
+/// `parse_and_execute`), plus the level the vproc started at
 /// ([`Vproc::trace_base`]: its parent's, and one more in a command
-/// substitution).
+/// substitution). The shell's own EXIT trap runs once the commands it
+/// ends have unwound (bash's `exit_shell` after the script or the `-c`
+/// string returned), at the top level whatever frames are still below it
+/// here.
 pub fn level(vp: &Vproc) -> u32 {
-	let nested = vp
-		.frames
-		.iter()
-		.filter(|f| {
-			matches!(f.kind, FrameKind::Script {
-				what: ScriptKind::Eval | ScriptKind::Source | ScriptKind::Trap { .. },
-				..
-			})
+	let counts = |f: &&super::proc::Frame| {
+		matches!(
+			f.kind,
+			FrameKind::NoFork
+				| FrameKind::Script {
+					what: ScriptKind::Eval | ScriptKind::Source | ScriptKind::Trap { .. },
+					..
+				}
+		)
+	};
+	let exit_trap = |f: &super::proc::Frame| {
+		matches!(f.kind, FrameKind::Script {
+			what: ScriptKind::Trap { key: crate::bash::store::TrapKey::Exit, .. },
+			..
 		})
-		.count();
+	};
+	let from = match vp.frames.iter().rposition(exit_trap) {
+		Some(i) if vp.parent.is_none() => i + 1,
+		_ => 0,
+	};
+	let nested = vp.frames[from..].iter().filter(counts).count();
 	1u32
 		.saturating_add(vp.trace_base)
 		.saturating_add(u32::try_from(nested).unwrap_or(u32::MAX))
@@ -141,12 +156,33 @@ pub fn emit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, body: &[
 	write(k, cx, vp, bytes);
 }
 
+/// A trace line a builtin writes as it runs (bash's `export` and
+/// `readonly` trace each `name=value` operand as they assign it): the
+/// descriptor it goes to, as the builtin's redirections left them, and
+/// the `PS4` prefix, `body`, a newline. The caller queues the two with
+/// `Ctx::trace_line`, which marks the write a trace: a failed write of
+/// it is dropped, as bash's unchecked `fprintf` to the trace stream
+/// drops it (`print_cmd.c` `xtrace_print_assignment`), not reported as
+/// the builtin's own write error.
+pub fn builtin_line(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	line: u32,
+	body: &[u8],
+) -> (i32, Vec<u8>) {
+	let mut bytes = prefix(k, cx, vp, line);
+	bytes.extend_from_slice(body);
+	bytes.push(b'\n');
+	(trace_fd(k, cx, vp), bytes)
+}
+
 /// Queue `bytes` (a whole trace line, or zsh's pieces of one) for the
 /// trace output.
 pub fn write(k: &Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, bytes: Vec<u8>) {
 	let fd = trace_fd(k, cx, vp);
 	vp.out
-		.push_back(PendingWrite { fd, bytes: BString::from(bytes), off: 0 });
+		.push_back(PendingWrite::new(fd, BString::from(bytes)));
 }
 
 /// The trace prefix for a command on `line`: `PS4` expanded (zsh
@@ -291,8 +327,9 @@ fn zsh_trace_fd(vp: &mut Vproc) -> i32 {
 }
 
 /// `PS4` expanded as a prompt (`${PS4@P}`; as it is when the expansion
-/// would need a command substitution), its first character repeated to
-/// the nesting [`level`]. Unset or empty: no prefix.
+/// would need a command substitution), its first character (as many bytes
+/// as the locale's `mblen` makes it, as bash's `indirection_level_string`
+/// takes it) repeated to the nesting [`level`]. Unset or empty: no prefix.
 fn prefix(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Vec<u8> {
 	let ps4 = state::lookup(&k.root, cx.store, vp, b"PS4")
 		.ok()
@@ -311,9 +348,12 @@ fn prefix(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Vec<u8>
 		ps4
 	};
 	let mut out = Vec::with_capacity(expanded.len() + 4);
-	if let Some(&first) = expanded.first() {
-		for _ in 1..level(vp) {
-			out.push(first);
+	let level = level(vp);
+	if level > 1 && !expanded.is_empty() {
+		let cs = locale::charset(k, cx.store, vp);
+		let first = &expanded[..locale::char_len(cs, &expanded, false).unwrap_or(1)];
+		for _ in 1..level {
+			out.extend_from_slice(first);
 		}
 	}
 	out.extend_from_slice(&expanded);

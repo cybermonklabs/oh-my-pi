@@ -1512,8 +1512,7 @@ pub(crate) fn hend_output(
 	}
 	if let Some(mut line) = out.print {
 		line.push(b'\n');
-		vp.out
-			.push_back(PendingWrite { fd: 2, bytes: line, off: 0 });
+		vp.out.push_back(PendingWrite::new(2, line));
 	}
 	*run = out.run;
 }
@@ -2049,6 +2048,14 @@ pub fn expanding<T>(
 			Ok(v)
 		},
 		Err(Stop::Sub { unit, entry, form, text }) => {
+			// What the expansion queued so far (a declaration's compound
+			// assignment traced as its word expanded) is out before the
+			// substitution runs, as bash writes it first; the op runs again
+			// once a blocked write is done (its expansion replays).
+			if let Some(fd) = flush_out(k, vp) {
+				top_frame(vp).scratch = Some(sc);
+				return Err(Flow::Block(WaitKey::Write { fd }));
+			}
 			// A no-fork substitution pushes its frame above this op's.
 			let flow = start_sub(k, vp, cx, &mut sc, Sub { unit, entry, form, text, line });
 			vp.frames[fi].scratch = Some(sc);
@@ -2212,11 +2219,13 @@ pub fn settle_probe(
 /// The logged form of an expansion probe's answer: a PATH search's path
 /// (`None`: not found); an access check's success as an empty string; a
 /// filesystem request's ([`super::fsprobe`]) bytes, names (a list), other
-/// success (empty) or failure (`None`).
+/// success (empty) or failure (`None`); a pathname walk's matches (a list:
+/// [`super::glob::compound_globs_in`]).
 pub fn probe_atom(answer: ProbeResult) -> Atom {
 	use super::fsprobe::FsAns;
 	Atom::Str(match answer {
 		ProbeResult::Path(p) => p,
+		ProbeResult::Paths(paths) => return Atom::List(paths),
 		ProbeResult::Ok(ok) => ok.then(BString::default),
 		ProbeResult::Fs(Ok(FsAns::Names(names))) => return Atom::List(names),
 		// User database entries: name and home directory of each.
@@ -3338,9 +3347,7 @@ fn time_end(
 		end.sys.saturating_sub(start.sys),
 	];
 	match time_report(&format, times) {
-		Ok(text) => vp
-			.out
-			.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 }),
+		Ok(text) => vp.out.push_back(PendingWrite::new(2, text)),
 		Err(c) => {
 			let msg = format!("TIMEFORMAT: `{}': invalid format character", char::from(c));
 			k.diag(cx, vp, line, Diag::Usage { msg: msg.into() });
@@ -3385,8 +3392,7 @@ fn zsh_time_end(
 		text.extend_from_slice(&zsh_time_report(&format, b"children", children));
 		text
 	};
-	vp.out
-		.push_back(PendingWrite { fd: 2, bytes: text.into(), off: 0 });
+	vp.out.push_back(PendingWrite::new(2, text));
 }
 
 /// zsh's default `TIMEFMT` (`DEFAULT_TIMEFMT`).

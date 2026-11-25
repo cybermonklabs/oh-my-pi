@@ -316,6 +316,41 @@ impl<'e, 'c> Expander<'e, 'c> {
 		Ok(())
 	}
 
+	/// `set -x`: queue the trace line `body` once, however often this
+	/// expansion replays (bash traces a declaration's compound assignment
+	/// as it expands that word, before the words after it).
+	pub fn trace_once(&mut self, body: &[u8]) {
+		if self.replay().is_some() {
+			return;
+		}
+		super::xtrace::emit(self.k, self.cx, self.vp, self.line, body);
+		self.note(|| Atom::Done);
+	}
+
+	/// A choice as the first pass of this expansion made it (`now` there),
+	/// the same on every replay: an option read when bash expanded the
+	/// word, which a `${ ;}` later in the command may have changed since.
+	/// A choice that decides what the pass logs must not change between
+	/// passes, or a replay reads its log out of step.
+	pub fn first_pass(&mut self, now: bool) -> bool {
+		if let Some(Atom::Branch(then)) = self.replay() {
+			return then;
+		}
+		self.note(|| Atom::Branch(now));
+		now
+	}
+
+	/// Pathname expansion's options (`set -f`, `extglob`) for the rest of
+	/// this expansion as its first pass read them ([`Self::first_pass`]):
+	/// they decide which words have walks logged in the pass.
+	pub fn first_pass_glob_opts(&mut self) -> X<()> {
+		let now = self.glob_opts()?;
+		let noglob = self.first_pass(now.noglob);
+		let extglob = self.first_pass(now.extglob);
+		self.glob_opts = Some(GlobOpts { noglob, extglob });
+		Ok(())
+	}
+
 	fn read_atom(&mut self, f: impl FnOnce(&mut Self) -> X<Val>) -> X<Val> {
 		match self.replay() {
 			Some(Atom::Str(None)) => return Ok(Val::Unset),
@@ -3350,8 +3385,10 @@ pub struct CompoundElem {
 	pub value:  BString,
 }
 
-/// The `(…)` text a declaration builtin re-reads: each value (and key)
-/// single-quoted, `[k]=v` / `[k]+=v` for keyed elements.
+/// The `(…)` text a declaration builtin re-reads, as bash 5.3 rebuilds a
+/// compound assignment word it expanded (`expand_compound_assignment_word`):
+/// each value (and key) single-quoted, `[k]=v` / `[k]+=v` for keyed
+/// elements. `set -x` shows it as it is (`+ a=('1' '<TAB>')`).
 pub fn compound_text(elems: &[CompoundElem]) -> BString {
 	let mut text = BString::from("(");
 	for (i, e) in elems.iter().enumerate() {
@@ -3369,13 +3406,10 @@ pub fn compound_text(elems: &[CompoundElem]) -> BString {
 	text
 }
 
-/// One word of [`compound_text`]. A zsh value with a NUL byte (p10k's
-/// `typeset -a x=( $'a\0b' )`) stays raw inside single quotes: the
-/// `$'\0'` form [`quote::single`] would write ends the value when re-read.
+/// One word of [`compound_text`]: bash's `sh_single_quote`, every byte
+/// raw inside single quotes (a tab, a newline, zsh's NUL in p10k's
+/// `typeset -a x=( $'a\0b' )`), a `'` as `'\''`; never `$'…'`.
 fn compound_quote(word: &[u8]) -> BString {
-	if !word.contains(&0) {
-		return quote::single(word);
-	}
 	let mut out = Vec::with_capacity(word.len() + 2);
 	out.push(b'\'');
 	for &c in word {
