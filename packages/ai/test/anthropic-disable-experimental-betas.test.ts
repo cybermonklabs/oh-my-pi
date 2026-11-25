@@ -208,6 +208,35 @@ describe("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", () => {
 		});
 	});
 
+	// A frozen request replays the conversation, whose tool calls' arguments are any JSON. 30,000 levels: the client
+	// writes the request body with `JSON.stringify`, which stops at 40,000 (anthropic-client.ts, outside this change).
+	it("redeems a frozen fallback-credit request whose tool arguments nest 30,000 levels", async () => {
+		let input: Record<string, unknown> = { leaf: "bottom" };
+		for (let level = 0; level < 30_000; level++) input = { next: input };
+		await withEnv({ ...GATEWAY_ENV, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1" }, async () => {
+			const request = await captureRequest(anthropicModel(), {
+				fallbackCreditRedemption: {
+					token: "fct_frozen",
+					prefillClaim: false,
+					params: {
+						model: "claude-fable-5-1",
+						messages: [
+							{ role: "user", content: "hi" },
+							{ role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "inspect", input }] },
+							{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+						],
+						max_tokens: 1024,
+						stream: true,
+					},
+					betas: [],
+					expiresAt: Date.now() + 60_000,
+				},
+			});
+			// The frozen body carries no withheld field, so it is redeemed as frozen.
+			expect(request.body.fallback_credit_token).toBe("fct_frozen");
+		});
+	}, 30_000);
+
 	it("withholds the switch's controls inside server-side fallback entries", async () => {
 		await withEnv({ ...GATEWAY_ENV, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1" }, async () => {
 			const request = await captureRequest(anthropicModel(), {

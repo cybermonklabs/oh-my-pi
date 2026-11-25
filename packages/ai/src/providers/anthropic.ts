@@ -15,10 +15,15 @@ import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copil
 import {
 	$env,
 	$flag,
+	ContainerPath,
+	cloneJsonTree,
+	jsonDeepEquals,
 	logger,
+	type NestedWalk,
 	parseJsonWithRepair,
 	parseStreamingJsonThrottled,
 	readSseEvents,
+	runNested,
 } from "@oh-my-pi/pi-utils";
 import { NO_AUTH_SENTINEL } from "../auth-retry";
 import { renderDemotedThinking } from "../dialect/demotion";
@@ -3909,11 +3914,13 @@ function experimentalBetasDisabled(model: Model<"anthropic-messages">): boolean 
  * Whether a request body carries a field the kill switch withholds. A frozen
  * fallback-credit body that does cannot be redeemed under the switch. Defined
  * as "the sanitizer would change it" so detection and stripping cannot drift.
+ * The copy and the comparison keep their own stack: the body replays the
+ * conversation, whose tool calls' arguments are any JSON.
  */
 function carriesKillSwitchField(params: MessageCreateParamsStreaming): boolean {
-	const sanitized = structuredClone(params);
+	const sanitized = cloneJsonTree(params);
 	withholdKillSwitchFields(sanitized);
-	return !Bun.deepEquals(sanitized, params);
+	return !jsonDeepEquals(sanitized, params);
 }
 
 /**
@@ -5752,35 +5759,56 @@ function buildToolResultBlock(
 export type AnthropicMessageParam = MessageParam;
 
 /**
- * Recursively replace lone surrogates in string leaves. Identity-preserving:
- * returns the input object/array when nothing changed.
+ * Replace lone surrogates in string leaves. Identity-preserving: returns the
+ * input object/array when nothing changed. The walk keeps its own stack
+ * ({@link runNested}): a tool call's arguments are any JSON, as deep as a
+ * transcript line holds.
  */
 function toWellFormedDeep(value: unknown): unknown {
-	if (typeof value === "string") {
-		const wellFormed = value.toWellFormed();
-		return wellFormed === value ? value : wellFormed;
-	}
+	if (typeof value === "string") return wellFormedString(value);
+	return Array.isArray(value) || isRecord(value) ? runNested(wellFormedNode(value, new ContainerPath())) : value;
+}
+
+function wellFormedString(value: string): string {
+	const wellFormed = value.toWellFormed();
+	return wellFormed === value ? value : wellFormed;
+}
+
+/** {@link toWellFormedDeep} of `value`, an array or record `path` is inside of; each child array or record is a nested step. */
+function* wellFormedNode(value: unknown[] | Record<string, unknown>, path: ContainerPath): NestedWalk {
+	path.enter(value);
+	let changed = false;
 	if (Array.isArray(value)) {
-		let changed = false;
-		const next = value.map(entry => {
-			const sanitized = toWellFormedDeep(entry);
+		const next: unknown[] = [];
+		for (const entry of value) {
+			const sanitized =
+				typeof entry === "string"
+					? wellFormedString(entry)
+					: Array.isArray(entry) || isRecord(entry)
+						? yield wellFormedNode(entry, path)
+						: entry;
 			if (sanitized !== entry) changed = true;
-			return sanitized;
-		});
-		return changed ? next : value;
-	}
-	if (isRecord(value)) {
-		let changed = false;
-		const next: Record<string, unknown> = {};
-		for (const [key, entry] of Object.entries(value)) {
-			// The compaction signature covers this opaque list; don't sanitize any nested values.
-			const sanitized = value.type === "compaction" && key === "tool_changes" ? entry : toWellFormedDeep(entry);
-			if (sanitized !== entry) changed = true;
-			next[key] = sanitized;
+			next.push(sanitized);
 		}
+		path.leave(value);
 		return changed ? next : value;
 	}
-	return value;
+	const next: Record<string, unknown> = {};
+	for (const [key, entry] of Object.entries(value)) {
+		// The compaction signature covers this opaque list; don't sanitize any nested values.
+		const sanitized =
+			value.type === "compaction" && key === "tool_changes"
+				? entry
+				: typeof entry === "string"
+					? wellFormedString(entry)
+					: Array.isArray(entry) || isRecord(entry)
+						? yield wellFormedNode(entry, path)
+						: entry;
+		if (sanitized !== entry) changed = true;
+		next[key] = sanitized;
+	}
+	path.leave(value);
+	return changed ? next : value;
 }
 
 /**

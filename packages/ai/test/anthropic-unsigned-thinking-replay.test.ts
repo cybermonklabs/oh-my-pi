@@ -167,6 +167,26 @@ describe("Anthropic-compatible unsigned thinking replay (#2005)", () => {
 		expect((sameToolUse.input.nested as { parts: string[] }).parts[0]).toBe("broken \ufffd end");
 	});
 
+	// A tool call's arguments are any JSON, and a resumed session holds them as deep as a transcript line does.
+	it("sanitizes a lone surrogate at the bottom of tool arguments nested 50,000 levels", () => {
+		let deep: Record<string, unknown> = { text: "broken \ud83d end" };
+		for (let level = 0; level < 50_000; level++) deep = { next: deep };
+		const assistant: AssistantMessage = {
+			...makeAssistantThinking("plan"),
+			content: [{ type: "toolCall", id: "call_1", name: "write", arguments: deep }],
+		};
+		const toolUse = assistantWireBlocks([makeUser(), assistant], makeModel()).find(
+			block => block.type === "tool_use",
+		) as WireToolUseBlock;
+		let node: unknown = toolUse.input;
+		let levels = 0;
+		while (typeof node === "object" && node !== null && "next" in node) {
+			node = node.next;
+			levels++;
+		}
+		expect({ levels, node }).toEqual({ levels: 50_000, node: { text: "broken \ufffd end" } });
+	});
+
 	it("sanitizes payload replacements before SDK JSON serialization", async () => {
 		const splitSurrogate = `render \`"icon.ghost": "\\ud83d${String.fromCharCode(0xdc7b)}"\``;
 		const { promise: bodyPromise, resolve } = Promise.withResolvers<string>();
