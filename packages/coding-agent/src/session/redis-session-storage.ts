@@ -3,6 +3,7 @@ import {
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
+import { UNVERSIONED } from "./redis-window-generation";
 import { STALE_STAGING_MS, utf8Parts } from "./session-staging";
 import { SessionReadConflictError, SessionWriteConflictError } from "./session-storage";
 import { eexist, enoent } from "./session-storage-errors";
@@ -164,9 +165,6 @@ if ARGV[2] ~= "" then
 	text = redis.call("GETRANGE", KEYS[1], ARGV[1], ARGV[2])
 end
 return {redis.call("STRLEN", KEYS[1]), text}`;
-
-/** The generation a window returns for a session with no token (see `READ_WINDOW_SCRIPT`): an earlier version wrote it last. */
-export const UNVERSIONED = "?";
 
 // One window of a chunked read: the key's size, the session's generation, and
 // from byte ARGV[1] at most ARGV[2] bytes, up to ARGV[3], the size the read's
