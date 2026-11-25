@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, setSystemTime, vi } from "
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { SessionStoreMasker } from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
 import { BLOB_PREFIX, BlobStore, type SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import { convertToColdEntry, isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
@@ -686,6 +686,47 @@ describe("cold entry store", () => {
 		// Control: the entry belongs in the store, so applying the cut would have cooled it.
 		manager.recoolEntries();
 		expect(manager.coldStoreStats().coldEntries).toBe(2);
+	});
+
+	// Re-answering an `ask` from /tree selects the new answer as the leaf; the request its branch reads must not stay compressed.
+	it("makes the entries a re-answered ask's branch reads whole", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const request = `request ${BODY}`;
+		const answer = (text: string): ToolResultMessage => ({
+			role: "toolResult",
+			toolCallId: "call-ask",
+			toolName: "ask",
+			content: [{ type: "text", text }],
+			isError: false,
+			timestamp: 3,
+		});
+		const manager = await open(
+			await writeTranscript(dir.path(), [
+				{ type: "message", id: "request", message: { role: "user", content: request, timestamp: 1 } },
+				{
+					type: "message",
+					id: "ask",
+					message: {
+						...assistant("ask"),
+						content: [{ type: "toolCall", id: "call-ask", name: "ask", arguments: { question: "which?" } }],
+						stopReason: "toolUse",
+					},
+				},
+				{ type: "message", id: "old-answer", message: answer("old answer") },
+				{ type: "message", id: "later", message: { role: "user", content: `later ${BODY}`, timestamp: 4 } },
+				{ type: "compaction", id: "cut", summary: `cut ${BODY}`, firstKeptEntryId: "later", tokensBefore: 1000 },
+			]),
+		);
+		manager.buildSessionContext();
+		expect(isColdEntry(entry(manager, "request"))).toBe(true);
+
+		const next = manager.appendMessageToBranch(answer("replacement"), "ask", { preserveActiveLeaf: false });
+		manager.branch(next);
+		const context = manager.buildSessionContext();
+
+		expect(context.messages.map(message => message.role)).toEqual(["user", "assistant", "toolResult"]);
+		expect(context.messages[0]).toMatchObject({ role: "user", content: request });
+		expect(isColdEntry(entry(manager, "request"))).toBe(false);
 	});
 
 	it("applies updateEntryBody to a cold entry's nested values and keeps the entry cold", async () => {

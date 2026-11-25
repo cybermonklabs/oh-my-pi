@@ -250,6 +250,7 @@
 - A session copy or fork that fails to write frees its temporary file of older entry bodies at once instead of at the next garbage collection
 - A session whose temporary directory is read-only, full, missing or under a regular file, or whose temporary file fills the disk, now keeps its older entry bodies compressed in memory (about a fifth of their size) instead of whole
 - A session that keeps its older entry bodies compressed in memory no longer decompresses a whole block of them for each entry a full rewrite or a walk over every entry reads, which on a long session blocked for minutes
+- Re-answering an `ask` from the session tree after a compaction no longer leaves the entries the new branch reads compressed, read back from the store on every turn; they are held whole again, as after any other move in the tree
 - A long goal session no longer reads each older goal mode change back from disk every time it resumes or starts a subagent
 - RPC `get_tree` no longer fails with `Maximum call stack size exceeded` on a session deeper than about 10,000 entries
 - The Python, Go and Rust RPC SDKs read a `get_tree` answer of any depth: Python no longer raises `RecursionError` or closes the client, Go no longer closes the client or waits out its 30 s timeout (a response that fails to decode now fails its call at once), and Rust no longer closes the client
