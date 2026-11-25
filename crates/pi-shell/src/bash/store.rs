@@ -1359,6 +1359,9 @@ pub enum MiscKey {
 	/// (`Record::Misc`); absent for a user's shell. Nested shells see the
 	/// root's record.
 	Profile,
+	/// bash: the value cells `unset` removed from the shell (bits of
+	/// `dynvars::CELLS` indices, decimal; `Record::Misc`); absent: none.
+	CellsPlain,
 }
 
 crate::bash::packed_names::packed_names!(MiscKey);
@@ -1370,8 +1373,9 @@ impl MiscKey {
 	/// vproc shares (the vpid and job counters, zftp's shared status files)
 	/// and the root vproc's own fields the store persists (cwd, mode, `$?`,
 	/// `PIPESTATUS`, `$!`, the job marks, `getopts` progress, `ulimit`
-	/// values, the `$RANDOM` generator, the `$SECONDS` origin), which a
-	/// forked vproc keeps as fields of its own.
+	/// values, the `$RANDOM` generator, the `$SECONDS` origin, the value
+	/// cells `unset` removed), which a forked vproc keeps as fields of its
+	/// own.
 	pub const fn forked(self) -> bool {
 		match self {
 			Self::Cwd
@@ -1386,6 +1390,7 @@ impl MiscKey {
 			| Self::NextVpid
 			| Self::Random
 			| Self::StartNs
+			| Self::CellsPlain
 			| Self::Getopts
 			| Self::Rlimits
 			| Self::ZftpStatus => false,

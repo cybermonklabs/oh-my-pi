@@ -161,6 +161,10 @@ pub struct Clock {
 	pub seconds_plain: bool,
 	/// The same for `RANDOM`.
 	pub random_plain:  bool,
+	/// `unset` in bash code removed these value cells (bits of
+	/// `dynvars::CELLS` indices): plain variables from then on (bash removes
+	/// the dynamic variable).
+	pub cells_plain:   u16,
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's

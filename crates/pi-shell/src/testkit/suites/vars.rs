@@ -471,6 +471,36 @@ fn random_plain_survives_a_restore() {
 	}
 }
 
+/// Which value cells `unset` removed is imaged, the shell's in its store and
+/// a forked vproc's in its clock: a shell snapshotted and restored at every
+/// step keeps them removed. bash 5.3.20.
+#[test]
+fn unset_cells_survive_a_restore() {
+	let wait = "i=0; while [ $i -lt 8 ]; do i=$((i+1)); done";
+	for (src, want) in [
+		(
+			format!(
+				"unset LINENO; {wait}; echo \"[$LINENO]\"; declare -p LINENO 2> /dev/null; echo \
+				 \"st=$?\""
+			),
+			"[]\nst=1\n",
+		),
+		(format!("( unset LINENO; {wait}; echo \"[$LINENO]\" ); echo \"[$LINENO]\""), "[]\n[1]\n"),
+	] {
+		for fault in [Fault::None, Fault::Snapshot { every: 1 }] {
+			let out = run_script(FakeHost::new(), src.as_bytes(), &[], fault);
+			assert_eq!(
+				(
+					String::from_utf8_lossy(&out.stdout).as_ref(),
+					String::from_utf8_lossy(&out.stderr).as_ref()
+				),
+				(want, ""),
+				"{src} {fault:?}"
+			);
+		}
+	}
+}
+
 /// A readonly `RANDOM` refuses `((RANDOM=5))`, `unset RANDOM` and
 /// `declare -a RANDOM` (bash 5.3.20) after the lookups bash makes there,
 /// and stays special: after `RANDOM=7` and `readonly RANDOM` (one lookup),
@@ -929,6 +959,259 @@ fn dynamic_variables_are_listed_by_name() {
 		 @*c\nBASH_LINENO @*c\nBASH_ARGC @*c\nBASH_ARGV @*c\n[] []\nnone\nRANDOM\n"
 	);
 	assert_eq!(err, "");
+}
+
+/// The shell text of a `declare -p` / `set` view of bash's dynamic
+/// variable `v`: `show` prints its `declare -p` line, `showset` its `set`
+/// line, `$PWD` as `<pwd>` and a value that varies from run to run as `<v>`
+/// (the same text as the cluster rows that recorded the goldens).
+fn cell_view(v: &str, body: &str) -> String {
+	let varies =
+		matches!(v, "RANDOM" | "SRANDOM" | "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME" | "BASHPID");
+	let val = if varies { "\"${l%%=*}=<v>\"" } else { "\"$l\"" };
+	format!(
+		"show() {{ while IFS= read -r l; do l=${{l//\\\"\"$PWD\"\\\"/\\\"<pwd>\\\"}}; \
+		 n=${{l#declare -* }}; [[ ${{n%%=*}} == {v} ]] || continue; case $n in *=*) echo {val};; *) \
+		 echo \"$l\";; esac; done; echo \"end\"; }}; showset() {{ while IFS= read -r l; do \
+		 l=${{l//\\\"\"$PWD\"\\\"/\\\"<pwd>\\\"}}; [[ ${{l%%=*}} == {v} ]] || continue; echo {val}; \
+		 done; echo \"end\"; }}; {body}"
+	)
+}
+
+/// bash keeps a value cell for each dynamic variable: a lookup runs its
+/// value function and stores the result, which `declare -p` and `set` list.
+/// Never looked up, `declare -p` lists a scalar by its attributes alone and
+/// `set` not at all; an array is listed empty; `declare -p NAME` looks the
+/// name up first. A subshell's cell is its own. Goldens from bash 5.3.20.
+#[test]
+fn dynamic_variables_keep_their_value_cells() {
+	for (v, view, want) in [
+		("RANDOM", "listing", "declare -i RANDOM\nend\n"),
+		("RANDOM", "set", "end\n"),
+		("RANDOM", "used", "declare -i RANDOM=<v>\nend\nRANDOM=<v>\nend\n"),
+		("RANDOM", "direct", "declare -i RANDOM=<v>\nend\nst=0\n"),
+		("SRANDOM", "listing", "declare -i SRANDOM\nend\n"),
+		("SRANDOM", "set", "end\n"),
+		("SRANDOM", "used", "declare -i SRANDOM=<v>\nend\nSRANDOM=<v>\nend\n"),
+		("SRANDOM", "direct", "declare -i SRANDOM=<v>\nend\nst=0\n"),
+		("SECONDS", "listing", "declare -- SECONDS\nend\n"),
+		("SECONDS", "set", "end\n"),
+		("SECONDS", "used", "declare -i SECONDS=<v>\nend\nSECONDS=<v>\nend\n"),
+		("SECONDS", "direct", "declare -i SECONDS=<v>\nend\nst=0\n"),
+		("EPOCHSECONDS", "listing", "declare -- EPOCHSECONDS\nend\n"),
+		("EPOCHSECONDS", "set", "end\n"),
+		("EPOCHSECONDS", "used", "declare -- EPOCHSECONDS=<v>\nend\nEPOCHSECONDS=<v>\nend\n"),
+		("EPOCHSECONDS", "direct", "declare -- EPOCHSECONDS=<v>\nend\nst=0\n"),
+		("EPOCHREALTIME", "listing", "declare -- EPOCHREALTIME\nend\n"),
+		("EPOCHREALTIME", "set", "end\n"),
+		("EPOCHREALTIME", "used", "declare -- EPOCHREALTIME=<v>\nend\nEPOCHREALTIME=<v>\nend\n"),
+		("EPOCHREALTIME", "direct", "declare -- EPOCHREALTIME=<v>\nend\nst=0\n"),
+		("LINENO", "listing", "declare -- LINENO\nend\n"),
+		("LINENO", "set", "end\n"),
+		("LINENO", "used", "declare -- LINENO=\"1\"\nend\nLINENO=1\nend\n"),
+		("LINENO", "direct", "declare -- LINENO=\"1\"\nend\nst=0\n"),
+		("BASH_COMMAND", "listing", "declare -- BASH_COMMAND\nend\n"),
+		("BASH_COMMAND", "set", "end\n"),
+		(
+			"BASH_COMMAND",
+			"used",
+			"declare -- BASH_COMMAND=\": \\\"\\${BASH_COMMAND}\\\"\"\nend\nBASH_COMMAND=': \
+			 \"${BASH_COMMAND}\"'\nend\n",
+		),
+		(
+			"BASH_COMMAND",
+			"direct",
+			"declare -- BASH_COMMAND=\"declare -p BASH_COMMAND 2>&1\"\nend\nst=0\n",
+		),
+		("BASH_CMDS", "listing", "declare -A BASH_CMDS=()\nend\n"),
+		("BASH_CMDS", "set", "BASH_CMDS=()\nend\n"),
+		("BASH_CMDS", "used", "declare -A BASH_CMDS=()\nend\nend\n"),
+		("BASH_CMDS", "direct", "declare -A BASH_CMDS=()\nend\nst=0\n"),
+		("BASH_ALIASES", "listing", "declare -A BASH_ALIASES=()\nend\n"),
+		("BASH_ALIASES", "set", "BASH_ALIASES=()\nend\n"),
+		("BASH_ALIASES", "used", "declare -A BASH_ALIASES=()\nend\nend\n"),
+		("BASH_ALIASES", "direct", "declare -A BASH_ALIASES=()\nend\nst=0\n"),
+		("DIRSTACK", "listing", "declare -a DIRSTACK=()\nend\n"),
+		("DIRSTACK", "set", "DIRSTACK=()\nend\n"),
+		(
+			"DIRSTACK",
+			"used",
+			"declare -a DIRSTACK=([0]=\"<pwd>\")\nend\nDIRSTACK=([0]=\"<pwd>\")\nend\n",
+		),
+		("DIRSTACK", "direct", "declare -a DIRSTACK=([0]=\"<pwd>\")\nend\nst=0\n"),
+		("BASHPID", "listing", "declare -i BASHPID\nend\n"),
+		("BASHPID", "set", "end\n"),
+		("BASHPID", "used", "declare -i BASHPID=<v>\nend\nBASHPID=<v>\nend\n"),
+		("BASHPID", "direct", "declare -i BASHPID=<v>\nend\nst=0\n"),
+		("BASH_SUBSHELL", "listing", "declare -- BASH_SUBSHELL\nend\n"),
+		("BASH_SUBSHELL", "set", "end\n"),
+		("BASH_SUBSHELL", "used", "declare -- BASH_SUBSHELL=\"0\"\nend\nBASH_SUBSHELL=0\nend\n"),
+		// `declare -p BASH_SUBSHELL | …` prints 1 in bash: a pipeline stage's
+		// builtin runs one level down, which obash does not model.
+		("PIPESTATUS", "listing", "end\n"),
+		("PIPESTATUS", "set", "end\n"),
+		(
+			"PIPESTATUS",
+			"used",
+			"declare -a PIPESTATUS=([0]=\"0\")\nend\nPIPESTATUS=([0]=\"0\" [1]=\"0\")\nend\n",
+		),
+		("PIPESTATUS", "direct", "end\nst=1\n"),
+		("BASH_SOURCE", "listing", "declare -a BASH_SOURCE=()\nend\n"),
+		("BASH_SOURCE", "set", "BASH_SOURCE=()\nend\n"),
+		("BASH_SOURCE", "used", "declare -a BASH_SOURCE=()\nend\nBASH_SOURCE=()\nend\n"),
+		("BASH_SOURCE", "direct", "declare -a BASH_SOURCE=()\nend\nst=0\n"),
+		("BASH_LINENO", "listing", "declare -a BASH_LINENO=()\nend\n"),
+		("BASH_LINENO", "set", "BASH_LINENO=()\nend\n"),
+		("BASH_LINENO", "used", "declare -a BASH_LINENO=()\nend\nBASH_LINENO=()\nend\n"),
+		("BASH_LINENO", "direct", "declare -a BASH_LINENO=()\nend\nst=0\n"),
+		("BASH_ARGC", "listing", "declare -a BASH_ARGC=()\nend\n"),
+		("BASH_ARGC", "set", "BASH_ARGC=()\nend\n"),
+		("BASH_ARGC", "used", "declare -a BASH_ARGC=([0]=\"0\")\nend\nBASH_ARGC=([0]=\"0\")\nend\n"),
+		("BASH_ARGC", "direct", "declare -a BASH_ARGC=([0]=\"0\")\nend\nst=0\n"),
+		("BASH_ARGV", "listing", "declare -a BASH_ARGV=()\nend\n"),
+		("BASH_ARGV", "set", "BASH_ARGV=()\nend\n"),
+		("BASH_ARGV", "used", "declare -a BASH_ARGV=()\nend\nBASH_ARGV=()\nend\n"),
+		("BASH_ARGV", "direct", "declare -a BASH_ARGV=()\nend\nst=0\n"),
+		("FUNCNAME", "listing", "declare -a FUNCNAME\nend\n"),
+		("FUNCNAME", "set", "end\n"),
+		("FUNCNAME", "used", "declare -a FUNCNAME\nend\nend\n"),
+		("FUNCNAME", "direct", "declare -a FUNCNAME\nend\nst=0\n"),
+	] {
+		let body = match view {
+			"listing" => "declare -p | show".to_owned(),
+			"set" => "set | showset".to_owned(),
+			"used" => format!(": \"${{{v}}}\"; declare -p | show; set | showset"),
+			_ => format!("declare -p {v} 2>&1 | show; echo \"st=${{PIPESTATUS[0]}}\""),
+		};
+		assert_eq!(run(&cell_view(v, &body)), (want.to_owned(), String::new()), "{v} {view}");
+	}
+	for (v, body, want) in [
+		(
+			"BASH_CMDS",
+			"hash -p /bin/true t; : \"${BASH_CMDS}\"; declare -p | show; set | showset",
+			"declare -A BASH_CMDS=([t]=\"/bin/true\" )\nend\nBASH_CMDS=([t]=\"/bin/true\" )\nend\n",
+		),
+		(
+			"BASH_CMDS",
+			"hash -p /bin/true t; : \"${BASH_CMDS[t]}\"; declare -p | show; set | showset",
+			"declare -A BASH_CMDS=([t]=\"/bin/true\" )\nend\nBASH_CMDS=([t]=\"/bin/true\" )\nend\n",
+		),
+		(
+			"BASH_CMDS",
+			"hash -p /bin/true t; declare -p | show; set | showset",
+			"declare -A BASH_CMDS=()\nend\nBASH_CMDS=()\nend\n",
+		),
+		(
+			"BASH_ALIASES",
+			"alias a=b; : \"${BASH_ALIASES}\"; declare -p | show; set | showset",
+			"declare -A BASH_ALIASES=([a]=\"b\" )\nend\nBASH_ALIASES=([a]=\"b\" )\nend\n",
+		),
+		(
+			"BASH_ALIASES",
+			"alias a=b; declare -p | show; set | showset",
+			"declare -A BASH_ALIASES=()\nend\nBASH_ALIASES=()\nend\n",
+		),
+		(
+			"FUNCNAME",
+			"f() { declare -p | show; set | showset; }; f",
+			"declare -a FUNCNAME=([0]=\"f\")\nend\nFUNCNAME=([0]=\"f\")\nend\n",
+		),
+		(
+			"LINENO",
+			": \"$LINENO\"\n:\n:\ndeclare -p | show; echo \"$LINENO\"; declare -p | show",
+			"declare -- LINENO=\"1\"\nend\n4\ndeclare -- LINENO=\"4\"\nend\n",
+		),
+		(
+			"BASH_SUBSHELL",
+			"( : \"$BASH_SUBSHELL\"; declare -p | show ); declare -p | show",
+			"declare -- BASH_SUBSHELL=\"1\"\nend\ndeclare -- BASH_SUBSHELL\nend\n",
+		),
+		(
+			"SRANDOM",
+			"x=$((SRANDOM)); declare -p | show; set | showset",
+			"declare -i SRANDOM=<v>\nend\nSRANDOM=<v>\nend\n",
+		),
+		// A declaration before the first lookup keeps the cell's own
+		// attributes, as bash's record has them from its startup, and takes
+		// them off when it is told to.
+		(
+			"SRANDOM",
+			"readonly SRANDOM; : \"$SRANDOM\"; declare -p | show",
+			"declare -ir SRANDOM=<v>\nend\n",
+		),
+		(
+			"SRANDOM",
+			"declare +i SRANDOM; : \"$SRANDOM\"; declare -p | show",
+			"declare -- SRANDOM=<v>\nend\n",
+		),
+		(
+			"LINENO",
+			"export LINENO; : \"$LINENO\"; declare -p | show",
+			"declare -x LINENO=\"1\"\nend\n",
+		),
+		// `declare -p BASH_ARGV` outside a function pushes the positional
+		// parameters as bash's `get_bashargcv` does, so the listing after it
+		// shows them.
+		(
+			"BASH_ARGV",
+			"set -- a b; declare -p BASH_ARGV > /dev/null; declare -p | show",
+			"declare -a BASH_ARGV=([0]=\"b\" [1]=\"a\")\nend\n",
+		),
+		(
+			"BASH_ARGC",
+			"set -- a b; declare -p BASH_ARGC > /dev/null; set | showset",
+			"BASH_ARGC=([0]=\"2\")\nend\n",
+		),
+		// A function's new local of a cell name is its own plain variable.
+		("SRANDOM", "f() { local SRANDOM; declare -p SRANDOM; }; f", "declare -- SRANDOM\n"),
+		(
+			"BASHPID",
+			"f() { local BASHPID=7+1; declare -p BASHPID; }; f",
+			"declare -- BASHPID=\"7+1\"\n",
+		),
+		("SRANDOM", "f() { local SRANDOM; local -p; }; f", "declare -- SRANDOM\n"),
+		// `export`, `readonly` and `declare` look the name up, which keeps
+		// the cell, as bash's `find_variable` does.
+		(
+			"DIRSTACK",
+			"export DIRSTACK; declare -p | show; set | showset",
+			"declare -ax DIRSTACK=([0]=\"<pwd>\")\nend\nDIRSTACK=([0]=\"<pwd>\")\nend\n",
+		),
+		(
+			"DIRSTACK",
+			"readonly DIRSTACK; declare -p | show",
+			"declare -ar DIRSTACK=([0]=\"<pwd>\")\nend\n",
+		),
+		(
+			"BASH_ALIASES",
+			"export BASH_ALIASES; declare -p | show",
+			"declare -Ax BASH_ALIASES=()\nend\n",
+		),
+		("BASH_CMDS", "readonly BASH_CMDS; declare -p | show", "declare -Ar BASH_CMDS=()\nend\n"),
+		(
+			"LINENO",
+			"export LINENO; declare -p | show; set | showset",
+			"declare -x LINENO=\"1\"\nend\nLINENO=1\nend\n",
+		),
+		// `unset` removes the dynamic variable: no longer listed, no longer
+		// computed, and plain when it is assigned again. A subshell's is its
+		// own.
+		("SRANDOM", "unset SRANDOM; declare -p | show", "end\n"),
+		("LINENO", "unset LINENO; declare -p | show; echo \"[$LINENO]\"", "end\n[]\n"),
+		(
+			"EPOCHSECONDS",
+			"unset EPOCHSECONDS; declare -p EPOCHSECONDS 2> /dev/null; echo \"st=$?\"",
+			"st=1\n",
+		),
+		(
+			"SRANDOM",
+			"unset SRANDOM; declare SRANDOM=5; declare -p | show; echo \"$SRANDOM $SRANDOM\"",
+			"declare -- SRANDOM=<v>\nend\n5 5\n",
+		),
+		("LINENO", "( unset LINENO ); declare -p | show", "declare -- LINENO\nend\n"),
+	] {
+		assert_eq!(run(&cell_view(v, body)), (want.to_owned(), String::new()), "{body}");
+	}
 }
 
 /// `SECONDS=n` restarts the count from n (bash `assign_seconds`; the
