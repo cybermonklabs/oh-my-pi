@@ -10,18 +10,11 @@
  * prefix or a database file of its own and removes it.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type {
-	IndexedSessionStorage,
-	SessionStorageBackend,
-} from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
-import { RedisSessionStorage } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
-import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
-import { RedisClient, SQL } from "bun";
-import { Longest, recordMethod } from "../helpers/longest-value";
 import { pathUnderRegularFile } from "../helpers/spool-unusable";
+import { BackendWatch, openStore } from "../helpers/watched-session-store";
 
 const MiB = 1024 * 1024;
 const BOUND = 16 * MiB;
@@ -54,49 +47,6 @@ function transcriptLines(title: string, words: string, bytes: number): string[] 
 const REWRITE = transcriptLines("Long session", "the session keeps working through the module tree; ", 24 * MiB);
 const OLDER = transcriptLines("Older title", "an older copy of the session; ", 2 * MiB).join("");
 
-const METHODS = ["readFull", "readSlices", "readFrom", "readChunks", "writeFull", "writeFullStream", "append"] as const;
-
-/**
- * Open `Storage` (a direct subclass of IndexedSessionStorage) with its backend's methods recorded into
- * `longest`, and its streamed write applied and then answered with a lost connection while `lose.on` is set.
- */
-function openWatched<S>(
-	Storage: object,
-	create: () => Promise<S>,
-	longest: Longest,
-	lose: { on: boolean; lost: number },
-): Promise<S> {
-	const Base: new (backend: SessionStorageBackend) => object = Object.getPrototypeOf(Storage);
-	class Watched extends Base {
-		constructor(backend: SessionStorageBackend) {
-			const members = backend as unknown as Record<string, unknown>;
-			for (const name of METHODS) {
-				const method = members[name];
-				if (typeof method !== "function") continue;
-				members[name] = recordMethod(backend, name, method, longest);
-			}
-			const streamed = members.writeFullStream;
-			if (typeof streamed === "function") {
-				members.writeFullStream = async (...args: unknown[]): Promise<unknown> => {
-					const result = await (streamed as (...a: unknown[]) => Promise<unknown>)(...args);
-					if (!lose.on) return result;
-					lose.lost++;
-					throw Object.assign(new Error("Connection closed before the write's answer arrived"), {
-						code: "ERR_REDIS_CONNECTION_CLOSED",
-					});
-				};
-			}
-			super(backend);
-		}
-	}
-	Object.setPrototypeOf(Storage, Watched);
-	try {
-		return create();
-	} finally {
-		Object.setPrototypeOf(Storage, Base);
-	}
-}
-
 const BACKENDS: ReadonlyArray<{ kind: "sqlite" | "redis"; url: string | undefined }> = [
 	{ kind: "sqlite", url: "sqlite" },
 	{ kind: "redis", url: process.env.OMP_TEST_REDIS_URL },
@@ -114,48 +64,14 @@ for (const { kind, url } of BACKENDS) {
 			for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 		});
 
-		async function open(longest: Longest, lose: { on: boolean; lost: number }): Promise<IndexedSessionStorage> {
-			const name = `omp_unconfirmed_${process.pid}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-			if (kind === "redis") {
-				const client = new RedisClient(url ?? "");
-				const prefix = `${name}:`;
-				const storage = await openWatched(
-					RedisSessionStorage,
-					() => RedisSessionStorage.create({ client, prefix }),
-					longest,
-					lose,
-				);
-				cleanups.push(async () => {
-					await storage.drain().catch(() => {});
-					for (const key of (await client.send("KEYS", [`${prefix}*`])) as string[])
-						await client.send("DEL", [key]);
-					client.close();
-				});
-				return storage;
-			}
-			const dir = TempDir.createSync("@omp-unconfirmed-db-");
-			const client = new SQL(`sqlite:${dir.join("sessions.sqlite")}`);
-			const storage = await openWatched(
-				SqlSessionStorage,
-				() => SqlSessionStorage.create({ client, adapter: "sqlite", table: name, leaseTable: `${name}_leases` }),
-				longest,
-				lose,
-			);
-			cleanups.push(async () => {
-				await storage.drain().catch(() => {});
-				await client.end();
-				dir.removeSync();
-			});
-			return storage;
-		}
-
 		for (const spool of ["usable", "under a regular file"] as const) {
 			it(
 				`checks the stored copy in parts, never as one value, with the spool ${spool}`,
 				async () => {
-					const longest = new Longest();
-					const lose = { on: false, lost: 0 };
-					const storage = await open(longest, lose);
+					const watch = new BackendWatch();
+					const store = await openStore(kind, url ?? "", watch);
+					cleanups.push(() => store.close());
+					const { storage } = store;
 					await storage.writeText(SESSION, OLDER);
 					await storage.drain();
 					vi.spyOn(logger, "warn").mockImplementation(() => {});
@@ -166,21 +82,21 @@ for (const { kind, url } of BACKENDS) {
 						process.env.TMPDIR = pathUnderRegularFile(scratch);
 					}
 
-					longest.reset();
-					lose.on = true;
+					watch.start();
+					watch.loseAnswers.on = true;
 					const outcome = await storage
 						.writeLinesAtomic(SESSION, REWRITE, { expectedSize: Buffer.byteLength(OLDER) })
 						.then(
 							() => "stored",
 							(err: unknown) => `failed: ${err instanceof Error ? err.message : String(err)}`,
 						);
-					lose.on = false;
-					const seen = { bytes: longest.bytes, what: longest.what };
+					watch.loseAnswers.on = false;
+					const { bytes, what } = watch.stop();
 
 					// The write landed and its answer was lost; the check found it stored.
-					expect({ outcome, lost: lose.lost }).toEqual({ outcome: "stored", lost: 1 });
+					expect({ outcome, lost: watch.loseAnswers.lost }).toEqual({ outcome: "stored", lost: 1 });
 					// ... without taking the whole stored transcript back as one value.
-					expect({ ...seen, bounded: seen.bytes <= BOUND }).toMatchObject({ bounded: true });
+					expect({ bytes, what, bounded: bytes <= BOUND }).toMatchObject({ bounded: true });
 				},
 				TIMEOUT,
 			);
