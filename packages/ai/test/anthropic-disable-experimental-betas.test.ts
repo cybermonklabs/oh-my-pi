@@ -237,6 +237,35 @@ describe("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", () => {
 		});
 	}, 30_000);
 
+	// The check compares a copy the switch's fields were withheld from with a second copy, not with the body: a value
+	// that is not JSON data is copied through JSON (a `Date` as its string), so no copy equals a body that holds one.
+	it("redeems a frozen fallback-credit request whose tool arguments hold a value that is not JSON data", async () => {
+		await withEnv({ ...GATEWAY_ENV, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1" }, async () => {
+			const request = await captureRequest(anthropicModel(), {
+				fallbackCreditRedemption: {
+					token: "fct_frozen",
+					prefillClaim: false,
+					params: {
+						model: "claude-fable-5-1",
+						messages: [
+							{ role: "user", content: "hi" },
+							{
+								role: "assistant",
+								content: [{ type: "tool_use", id: "toolu_1", name: "inspect", input: { when: new Date(0) } }],
+							},
+							{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+						],
+						max_tokens: 1024,
+						stream: true,
+					},
+					betas: [],
+					expiresAt: Date.now() + 60_000,
+				},
+			});
+			expect(request.body.fallback_credit_token).toBe("fct_frozen");
+		});
+	});
+
 	it("withholds the switch's controls inside server-side fallback entries", async () => {
 		await withEnv({ ...GATEWAY_ENV, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1" }, async () => {
 			const request = await captureRequest(anthropicModel(), {

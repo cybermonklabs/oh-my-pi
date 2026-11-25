@@ -3914,13 +3914,16 @@ function experimentalBetasDisabled(model: Model<"anthropic-messages">): boolean 
  * Whether a request body carries a field the kill switch withholds. A frozen
  * fallback-credit body that does cannot be redeemed under the switch. Defined
  * as "the sanitizer would change it" so detection and stripping cannot drift.
- * The copy and the comparison keep their own stack: the body replays the
- * conversation, whose tool calls' arguments are any JSON.
+ * Both sides of the comparison are copies: `cloneJsonTree` writes a value that
+ * is not JSON data (a `Date`, a `Map`) as JSON would, so only what the
+ * sanitizer removed can differ. The copies and the comparison keep their own
+ * stack: the body replays the conversation, whose tool calls' arguments are
+ * any JSON.
  */
 function carriesKillSwitchField(params: MessageCreateParamsStreaming): boolean {
 	const sanitized = cloneJsonTree(params);
 	withholdKillSwitchFields(sanitized);
-	return !jsonDeepEquals(sanitized, params);
+	return !jsonDeepEquals(sanitized, cloneJsonTree(params));
 }
 
 /**
