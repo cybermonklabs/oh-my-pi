@@ -831,6 +831,21 @@ pub enum ParseLevel {
 	/// `parse_and_execute`: a level of its own (`command_substitute`,
 	/// `process_substitute`).
 	Substitution,
+	/// A child forked inside a substitution's text (a subshell, a job or a
+	/// pipeline element): bash's `top_level_cleanup` restores the
+	/// substitution's own jump target, so a `DISCARD` ends it with status 1,
+	/// as it ends the substitution (`command_substitute` and
+	/// `process_substitute` turn it into `EXECUTION_FAILURE`, also in a
+	/// script).
+	InSubstitution,
+}
+
+impl ParseLevel {
+	/// Whether a `DISCARD` jump that leaves this base frame ends the vproc
+	/// in a substitution's handler (status 1).
+	pub const fn substitution(self) -> bool {
+		matches!(self, Self::Substitution | Self::InSubstitution)
+	}
 }
 
 /// What kind of activation a frame is.

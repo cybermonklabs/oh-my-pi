@@ -441,6 +441,20 @@ pub enum Diag {
 		/// Remaining text at the error.
 		token: BString,
 	},
+	/// An arithmetic error in a value assigned to an integer variable
+	/// (`declare -i x; x=1/0`): bash's `make_variable_value` runs
+	/// `top_level_cleanup`, then `jump_to_top_level (DISCARD)`. Unlike
+	/// [`Diag::ArithSubscript`], a builtin reports it under its own name
+	/// (`declare: 1/0: division by 0 …`).
+	#[error("{expr}: {msg} (error token is \"{token}\")")]
+	ArithValue {
+		/// The value's expression.
+		expr:  BString,
+		/// What went wrong.
+		msg:   Cow<'static, str>,
+		/// Remaining text at the error.
+		token: BString,
+	},
 	/// An array element assignment's bad subscript (`a[-9]=x`, `printf -v
 	/// 'a[@]'`): bash's `err_badarraysub` prints it without the command's
 	/// name, so [`Diag::by`] leaves it as it is.

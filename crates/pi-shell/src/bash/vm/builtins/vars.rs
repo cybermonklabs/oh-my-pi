@@ -178,8 +178,9 @@ fn current(
 	})
 }
 
-/// A value as stored under `attrs`: integer evaluation (`+=` adds),
-/// otherwise concatenation for `+=`, then case conversion.
+/// A value as stored under `attrs`: integer evaluation (`+=` adds,
+/// [`integer_value`]), otherwise concatenation for `+=`, then case
+/// conversion.
 fn convert(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -189,9 +190,9 @@ fn convert(
 	old: Option<&[u8]>,
 ) -> Result<BString, Diag> {
 	let mut v = if attrs.contains(Attrs::INTEGER) {
-		let mut n = arith_value(k, cx, vp, value)?;
+		let mut n = integer_value(k, cx, vp, value)?;
 		if let Some(old) = old {
-			n = n.wrapping_add(arith_value(k, cx, vp, old)?);
+			n = n.wrapping_add(integer_value(k, cx, vp, old)?);
 		}
 		BString::from(n.format_into(&mut NumBuffer::new()))
 	} else {
@@ -261,6 +262,23 @@ pub fn subscript_value(
 ) -> Result<i64, Diag> {
 	arith_value(k, cx, vp, text).map_err(|d| match d {
 		Diag::Arith { expr, msg, token } => Diag::ArithSubscript { expr, msg, token },
+		d => d,
+	})
+}
+
+/// The value of `text` assigned to an integer variable. In bash mode an
+/// arithmetic error in it is [`Diag::ArithValue`]: bash's
+/// `make_variable_value` runs `top_level_cleanup`, then
+/// `jump_to_top_level (DISCARD)`, so the line is abandoned.
+fn integer_value(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	text: &[u8],
+) -> Result<i64, Diag> {
+	let bash = vp.mode.dialect() != crate::bash::ids::Dialect::Zsh;
+	arith_value(k, cx, vp, text).map_err(|d| match d {
+		Diag::Arith { expr, msg, token } if bash => Diag::ArithValue { expr, msg, token },
 		d => d,
 	})
 }
@@ -704,6 +722,8 @@ fn set_value_plain(
 						key
 					};
 					let old = eappend.then(|| tmp.key(&key).map_or_default(BString::from));
+					// An integer's arithmetic error leaves the array as it was
+					// (bash builds the new elements apart).
 					let v = convert(k, cx, vp, attrs, &v, old.as_deref().map(|o| o.as_slice()))?;
 					tmp.set_key(key, v);
 				}
@@ -767,7 +787,16 @@ fn set_value_plain(
 						}
 					}
 					let old = eappend.then(|| tmp.index(i).map_or_default(BString::from));
-					let v = convert(k, cx, vp, attrs, &v, old.as_deref().map(|o| o.as_slice()))?;
+					let v = match convert(k, cx, vp, attrs, &v, old.as_deref().map(|o| o.as_slice())) {
+						Ok(v) => v,
+						// As for a subscript's error: the elements before it
+						// stay assigned (bash's `make_variable_value`).
+						Err(d @ Diag::ArithValue { .. }) => {
+							aborted = Some(d);
+							break;
+						},
+						Err(d) => return Err(d),
+					};
 					tmp.set_index(i, v);
 					i += 1;
 				}
@@ -1059,10 +1088,12 @@ fn declared(ctx: &mut Ctx<'_, '_>, name: &[u8]) -> Result<Option<Var>, Need> {
 }
 
 /// The value a prefix assignment `name=value cmd` / `name+=value cmd`
-/// puts in the command's environment (bash's `assign_in_env` through
-/// `make_variable_value`): the visible variable's attributes apply, so
-/// `-i` evaluates (and `+=` adds), otherwise `+=` concatenates, then case
-/// conversion.
+/// puts in the command's environment. bash's `assign_in_env` makes a new
+/// variable with none of the visible one's attributes and the value as
+/// written; only `+=` goes through `make_variable_value` with them, so
+/// `-i` adds (an arithmetic error abandons the line), otherwise it
+/// concatenates, then case conversion. zsh assigns through the visible
+/// variable's attributes either way.
 pub fn prefix_value(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -1071,6 +1102,9 @@ pub fn prefix_value(
 	value: &[u8],
 	append: bool,
 ) -> Result<BString, Diag> {
+	if !append && vp.mode.dialect() != crate::bash::ids::Dialect::Zsh {
+		return Ok(BString::from(value));
+	}
 	let Some(var) = current(k, cx, vp, name, Level::Dynamic)? else {
 		return Ok(BString::from(value));
 	};
@@ -1895,7 +1929,13 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					AssignValue::Scalar(BString::from(value)),
 					level,
 				) {
+					// An integer's arithmetic error abandons the line (bash's
+					// `make_variable_value`), reported under the builtin's name.
+					let discard = exec::cleanup_jump(ctx.vp, &d);
 					ctx.err(d);
+					if discard {
+						return Ok(super::Outcome { status: 1, control: super::Control::DiscardAll });
+					}
 					status = 1;
 					continue;
 				}
@@ -2379,6 +2419,12 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					// the line (bash `jump_to_top_level (DISCARD)`).
 					Err(d @ Diag::ArithSubscript { .. }) => {
 						ctx.diag(d);
+						return Ok(super::Outcome { status: 1, control: super::Control::DiscardAll });
+					},
+					// So does one in an integer's value (bash's
+					// `make_variable_value`), reported under the builtin's name.
+					Err(d @ Diag::ArithValue { .. }) => {
+						ctx.err(d);
 						return Ok(super::Outcome { status: 1, control: super::Control::DiscardAll });
 					},
 					// bash shows a compound word's element without a key as
@@ -3027,6 +3073,13 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 							status = 1;
 							continue;
 						},
+						// An arithmetic error in the subscript abandons the
+						// line, as for `declare` (bash's `array_expand_index`:
+						// `top_level_cleanup`, then `jump_to_top_level (DISCARD)`).
+						Err(d @ Diag::ArithSubscript { .. }) => {
+							ctx.diag(d);
+							return Ok(super::Outcome { status: 1, control: super::Control::DiscardAll });
+						},
 						Err(d) => {
 							ctx.err(d);
 							status = 1;
@@ -3068,9 +3121,9 @@ pub fn shift(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		_ => args,
 	};
 	if args.len() > 1 {
-		// Not fatal to a posix shell (errors10).
+		// bash's `no_args`: the rest of the line is abandoned.
 		ctx.diag(Diag::TooManyArgs { cmd: "shift".into() });
-		return done(2);
+		return super::flow::too_many(ctx);
 	}
 	let n = match args.first() {
 		None => 1,

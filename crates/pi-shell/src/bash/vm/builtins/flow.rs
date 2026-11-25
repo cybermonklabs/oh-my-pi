@@ -265,8 +265,22 @@ fn source_args(
 enum BadArg {
 	/// Not a number (bash's `EX_USAGE`).
 	NotNumeric,
-	/// More than one argument (status 2).
+	/// More than one argument: bash's `no_args` abandons the line
+	/// ([`too_many`]).
 	TooMany,
+}
+
+/// bash's `no_args` for a builtin given more arguments than it takes
+/// (`return`, `exit`, `break`, `continue`, `shift`, `suspend`):
+/// `top_level_cleanup`, the status `EX_BADUSAGE` (2), then
+/// `jump_to_top_level (DISCARD)` ([`Control::DiscardAll`]), so the rest of
+/// the line is dropped through every function, `eval` and `.`. zsh mode
+/// (`logout`, which runs [`exit`]) goes on with status 2.
+pub(super) fn too_many(ctx: &Ctx<'_, '_>) -> R {
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		return done(2);
+	}
+	Ok(Outcome { status: 2, control: Control::DiscardAll })
 }
 
 /// The numeric argument of `return`, `exit`, `break`, `continue`, after an
@@ -332,10 +346,9 @@ pub fn return_(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				_ => None,
 			})
 			.unwrap_or(ctx.vp.status),
-		// bash returns 2 from the function; extra arguments are only an
-		// error.
+		// bash returns 2 from the function; extra arguments abandon the line.
 		Err(BadArg::NotNumeric) => 2,
-		Err(BadArg::TooMany) => return done(2),
+		Err(BadArg::TooMany) => return too_many(ctx),
 	};
 	Ok(Outcome { status, control: Control::Return })
 }
@@ -351,11 +364,13 @@ pub fn logout(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 
 /// `exit [n]`.
 pub fn exit(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
-	// A bad argument (`exit status`, too many) is reported and the shell
-	// goes on (status 2), as bash 5.3 does outside posix mode.
+	// A non-numeric argument (`exit status`) is reported and the shell goes
+	// on (status 2), as bash 5.3 does outside posix mode; extra arguments
+	// abandon the line.
 	let status = match status_arg(ctx, args) {
 		Ok(n) => n.unwrap_or(ctx.vp.status),
-		Err(_) => return done(2),
+		Err(BadArg::NotNumeric) => return done(2),
+		Err(BadArg::TooMany) => return too_many(ctx),
 	};
 	// An interactive shell with stopped jobs warns once instead.
 	if crate::bash::vm::jobctl::check_before_exit(ctx.k, ctx.cx, ctx.vp) {
@@ -398,10 +413,21 @@ fn bash_logout(ctx: &mut Ctx<'_, '_>, status: i32) -> Result<Option<Outcome>, su
 	Ok(Some(Outcome { status, control: Control::Frame }))
 }
 
-/// `break [n]` / `continue [n]`. A count below 1 is reported and leaves
-/// every loop (status 1); a non-numeric one ends the (non-interactive)
-/// shell.
+/// `break [n]` / `continue [n]`. Outside every loop the arguments are not
+/// read (bash's `check_loop_level` comes first): the loop search reports
+/// it and the command after it runs. A count below 1 is reported and
+/// leaves every loop (status 1); a non-numeric one ends the
+/// (non-interactive) shell; extra arguments abandon the line.
 pub fn break_(ctx: &mut Ctx<'_, '_>, args: &[BString], cont: bool) -> R {
+	let seen = crate::bash::vm::exec::loop_frame(ctx.vp).is_some();
+	// A forked child cannot see the loops of the shell that forked it (bash
+	// keeps the loop level in a forked pipeline element, `echo | break 1 2`
+	// in a loop): with no loop of its own it reads its arguments, and extra
+	// ones only fail the builtin (status 2), as before.
+	let forked = ctx.vp.parent.is_some();
+	if !seen && !forked {
+		return Ok(Outcome { status: 0, control: Control::Break { n: 1, cont } });
+	}
 	let n = match numeric_arg(ctx, args) {
 		Ok(None) => 1,
 		Ok(Some(n)) if n >= 1 => u32::try_from(n).unwrap_or(u32::MAX),
@@ -412,7 +438,8 @@ pub fn break_(ctx: &mut Ctx<'_, '_>, args: &[BString], cont: bool) -> R {
 		Err(BadArg::NotNumeric) => {
 			return Ok(Outcome { status: 2, control: Control::Exit(Jump::Cleanup) });
 		},
-		Err(BadArg::TooMany) => return done(2),
+		Err(BadArg::TooMany) if !seen => return done(2),
+		Err(BadArg::TooMany) => return too_many(ctx),
 	};
 	Ok(Outcome { status: 0, control: Control::Break { n, cont } })
 }
