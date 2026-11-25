@@ -17,10 +17,9 @@ use crate::bash::{
 	text,
 	vm::{
 		Cx, Kernel,
+		dynvars::{self, Site, Special},
 		exec::{self, Flow},
-		expand::{
-			self, arith_value, attr_letters, seconds_lookup, seconds_to_plain, seconds_visible,
-		},
+		expand::{self, arith_value, attr_letters},
 		is_ident,
 		proc::{AssignValue, Vproc},
 		quote,
@@ -371,6 +370,28 @@ pub fn set_value(
 			{
 				return Err(Diag::InvalidIdent { name: element_text(&target, idx) });
 			}
+			// bash looks a special variable the reference names up first,
+			// a whole one twice (`declare -n r=RANDOM; r+=1` adds to the
+			// value the second lookup left), through a global reference
+			// only: one bound in a function's scope (its own, or a
+			// caller's) resolves with no lookup (`bind_variable` finds it
+			// in that scope by name).
+			let site = if index.is_some() {
+				Site::NamerefElement
+			} else {
+				Site::NamerefAssign
+			};
+			let global_ref = match state::assigns_global(&k.root, cx.store, vp, name, Level::Dynamic) {
+				Ok(global) => global,
+				Err(e) => {
+					k.fail(e);
+					return Err(Diag::StoreFailed);
+				},
+			};
+			if global_ref && let Err(e) = dynvars::look(k, cx, vp, &target, site) {
+				k.fail(e);
+				return Err(Diag::StoreFailed);
+			}
 			let index = index.as_ref().map(|i| i.as_slice()).or(lhs.index);
 			let lhs = Lhs { name: &target, index, append: lhs.append };
 			return set_value(k, cx, vp, lhs, value, Level::Dynamic);
@@ -523,6 +544,81 @@ fn report_zsh_attrs(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, name: &[u8]
 	);
 }
 
+/// bash's `RANDOM=` (`assign_random`) on the shell's generator: not after
+/// `unset RANDOM` or an array assignment, not on a local or temporary
+/// `RANDOM` (plain variables in bash), and not on a readonly one, which
+/// the general path refuses (`false`: the caller assigns). `+=` makes the
+/// value first (`make_variable_value`: the sum while `RANDOM` is integer,
+/// as it starts, else the old text with the new after it). The seed is
+/// that value as arithmetic while `RANDOM` is integer (`evalexp`, whose
+/// error is reported, the assignment going on with status 0), else a
+/// decimal number (`legal_number`); a value that is neither seeds nothing
+/// and the variable keeps its value. Seeded, the variable's value is the
+/// seed (`set_int_value`), the text a later `RANDOM+=` adds to. A forked
+/// vproc seeds its own generator.
+fn assign_random(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	v: &[u8],
+	append: bool,
+) -> Result<bool, Diag> {
+	let cur = match dynvars::visible(k, cx.store, vp, b"RANDOM").and_then(|special| {
+		Ok(match special {
+			Some(_) => Some(state::global_in(cx.store, vp, b"RANDOM")?.cloned()),
+			None => None,
+		})
+	}) {
+		Ok(Some(cur)) => cur,
+		Ok(None) => return Ok(false),
+		Err(e) => {
+			k.fail(e);
+			return Err(Diag::StoreFailed);
+		},
+	};
+	if cur
+		.as_ref()
+		.is_some_and(|c| c.attrs.contains(Attrs::READONLY))
+	{
+		return Ok(false);
+	}
+	// bash's `RANDOM` is integer from the start.
+	let attrs = cur
+		.as_ref()
+		.map_or(Attrs::INTEGER, |c| c.attrs.without(Attrs::INVISIBLE));
+	let text = if append {
+		let old = cur
+			.as_ref()
+			.filter(|c| !c.attrs.contains(Attrs::INVISIBLE))
+			.and_then(Var::as_scalar)
+			.unwrap_or_default();
+		convert(k, cx, vp, attrs, v, Some(old))?
+	} else {
+		BString::from(v)
+	};
+	let seed = if attrs.contains(Attrs::INTEGER) {
+		match arith_value(k, cx, vp, &text) {
+			Ok(n) => n,
+			Err(Diag::StoreFailed) => return Err(Diag::StoreFailed),
+			Err(d) => {
+				k.diag(cx, vp, exec::current_line(vp), d);
+				return Ok(true);
+			},
+		}
+	} else {
+		match super::valid_number(&text) {
+			Some(n) => n,
+			None => return Ok(true),
+		}
+	};
+	k.seed_random(cx.store, vp, seed);
+	if let Err(e) = dynvars::store_value(k, cx.store, vp, Special::Random, seed, false) {
+		k.fail(e);
+		return Err(Diag::StoreFailed);
+	}
+	Ok(true)
+}
+
 /// [`set_value`] once name references are resolved.
 fn set_value_plain(
 	k: &mut Kernel,
@@ -557,29 +653,29 @@ fn set_value_plain(
 		}
 		return Ok(());
 	}
-	// bash's `RANDOM` is an integer variable whose assignment reseeds the
-	// generator (`assign_random`); reads are always fresh values. A forked
-	// vproc reseeds its own.
+	// An element or compound assignment to bash code's special `RANDOM` or
+	// `SECONDS` (`NAME[i]=`, `NAME=(…)`, `read -a`, `mapfile`) makes it a
+	// plain array first, after the lookups before it, as bash's
+	// `convert_var_to_array` does: element 0 is the last value then. A
+	// local or temporary of the name is only that one's ([`dynvars`]).
+	if (lhs.index.is_some() || matches!(value, AssignValue::Array(_))) && Special::of(name).is_some()
+	{
+		let site = if lhs.index.is_some() {
+			Site::Element
+		} else {
+			Site::Compound
+		};
+		if let Err(e) = dynvars::to_plain(k, cx, vp, name, Some(site)) {
+			k.fail(e);
+			return Err(Diag::StoreFailed);
+		}
+	}
 	if name == b"RANDOM"
 		&& lhs.index.is_none()
 		&& let AssignValue::Scalar(v) = &value
+		&& assign_random(k, cx, vp, v, lhs.append)?
 	{
-		let seed = arith_value(k, cx, vp, v)?;
-		k.seed_random(cx.store, vp, seed);
 		return Ok(());
-	}
-	// An element or compound assignment to the shell's `SECONDS`
-	// (`SECONDS[i]=`, `SECONDS=(…)`, `read -a`, `mapfile`) makes it a plain
-	// array first, as bash's `convert_var_to_array` does; element 0 is the
-	// count then. A local `SECONDS` is only that local's (`seconds_to_plain`
-	// leaves the clock alone while a local or temporary is in scope, and
-	// `declare` binds a new local before it assigns it).
-	if name == b"SECONDS"
-		&& (lhs.index.is_some() || matches!(value, AssignValue::Array(_)))
-		&& let Err(e) = seconds_to_plain(k, cx, vp)
-	{
-		k.fail(e);
-		return Err(Diag::StoreFailed);
 	}
 	// bash's `SECONDS=` (`assign_seconds`) on the shell's clock: not after
 	// `unset SECONDS`, and not on a local or temporary `SECONDS` (plain
@@ -597,7 +693,7 @@ fn set_value_plain(
 	if name == b"SECONDS"
 		&& lhs.index.is_none()
 		&& let AssignValue::Scalar(v) = &value
-		&& !k.seconds_plain(vp)
+		&& !k.plain(vp, Special::Seconds)
 	{
 		let cur = match state::assigns_global(&k.root, cx.store, vp, name, level).and_then(|global| {
 			Ok(if global {
@@ -1120,6 +1216,87 @@ fn func_binds_local(ctx: &mut Ctx<'_, '_>, name: &[u8]) -> Result<bool, Need> {
 	})
 }
 
+/// The special variable a declaration of `name` acts on through a whole
+/// name reference (`declare -n r=RANDOM; declare -i r`): with `-g`, one
+/// step from the global variable `name`, past a function's own reference
+/// of that name (as the declaration then acts); else at the end of the
+/// chain ([`dynvars::named`]).
+fn reference_target(
+	ctx: &mut Ctx<'_, '_>,
+	name: &[u8],
+	level: Level,
+	global: bool,
+) -> Result<Option<Special>, Need> {
+	if level == Level::Global && global {
+		return Ok(state::binding(&ctx.k.root, ctx.cx.store, ctx.vp, name, Level::Global)?
+			.filter(|v| v.attrs.contains(Attrs::NAMEREF))
+			.and_then(Var::as_scalar)
+			.and_then(Special::of));
+	}
+	Ok(dynvars::named(ctx.k, ctx.cx.store, ctx.vp, name)?)
+}
+
+/// Whether `name` reaches `target` through name references the running
+/// function binds itself (`local -n q=RANDOM; local q`): bash's new local
+/// is then `target` (`declare_transform_name`), not one of a reference's
+/// name that shadows it.
+fn own_reference(ctx: &mut Ctx<'_, '_>, name: &[u8], target: &[u8]) -> Result<bool, Need> {
+	let mut at = BString::from(name);
+	// A longer chain loops, and a loop names no special variable.
+	for _ in 0..64 {
+		let Some(var) = func_local(ctx, &at)? else {
+			return Ok(false);
+		};
+		let Some(next) = var
+			.as_scalar()
+			.filter(|_| var.attrs.contains(Attrs::NAMEREF))
+		else {
+			return Ok(false);
+		};
+		if next == target {
+			return Ok(true);
+		}
+		at = BString::from(next);
+	}
+	Ok(false)
+}
+
+/// The running function's own reference `name`, when `+n NAME=VALUE`
+/// assigns the reference itself rather than following its chain: a local
+/// name reference the function binds is assigned, whatever its chain
+/// reaches — a variable, a caller's or a global reference, or an element it
+/// reaches through a reference it does not own. The one case the caller
+/// leaves alone is a chain that reaches an element through the function's
+/// own references ([`own_element`]); a loop names nothing.
+fn own_ref(ctx: &mut Ctx<'_, '_>, name: &[u8]) -> Result<Option<Var>, Need> {
+	let Some(var) = func_local(ctx, name)?.filter(|v| v.attrs.contains(Attrs::NAMEREF)) else {
+		return Ok(None);
+	};
+	Ok((state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)? != state::Deref::Circular)
+		.then_some(var))
+}
+
+/// Whether the reference `var` reaches an element through name references
+/// the running function binds itself: its own value names the element, or
+/// a reference of the function's own that it names does, and so on.
+fn own_element(ctx: &mut Ctx<'_, '_>, var: &Var) -> Result<bool, Need> {
+	let mut at = var.clone();
+	// A longer chain loops, and a loop names no element.
+	for _ in 0..64 {
+		let Some(next) = at.as_scalar().filter(|_| at.attrs.contains(Attrs::NAMEREF)) else {
+			return Ok(false);
+		};
+		if next.contains(&b'[') {
+			return Ok(true);
+		}
+		let Some(v) = func_local(ctx, next)? else {
+			return Ok(false);
+		};
+		at = v;
+	}
+	Ok(false)
+}
+
 /// The top scope when it is a temporary environment (a command's prefix
 /// assignments), not a function's.
 fn temp_scope(ctx: &mut Ctx<'_, '_>) -> Result<Option<usize>, StoreError> {
@@ -1170,7 +1347,10 @@ pub fn assign(
 
 /// Assign a `for` loop's control variable: when it is a name reference,
 /// each word becomes its new target (bash: "a name reference will be
-/// established for each word"); otherwise a plain [`assign`].
+/// established for each word"); otherwise a plain [`assign`]. bash looks a
+/// special `RANDOM` or `SECONDS` up before each word ([`Site::For`]), also
+/// at the end of a reference chain (`find_variable_last_nameref`: `for r in
+/// 7` with `r` a reference to `RANDOM` draws).
 pub fn assign_loop_var(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -1178,6 +1358,10 @@ pub fn assign_loop_var(
 	name: &[u8],
 	value: BString,
 ) -> Result<(), Diag> {
+	if let Err(e) = dynvars::look_through(k, cx, vp, name, Site::For) {
+		k.fail(e);
+		return Err(Diag::StoreFailed);
+	}
 	if !state::may_be_nameref(&k.root, vp) {
 		return assign(k, vp, cx, name, value, Level::Dynamic);
 	}
@@ -1771,11 +1955,9 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			let var = if kind == DeclareKind::Local {
 				func_local(ctx, name)?
 			} else {
-				// bash's `declare -p` looks the name up (`find_variable`),
-				// which reads the shell's `SECONDS`.
-				if name == b"SECONDS" {
-					seconds_lookup(ctx.k, ctx.cx, ctx.vp)?;
-				}
+				// bash's `declare -p` looks the name up (`find_variable`): a
+				// special `RANDOM` or `SECONDS` runs its value function.
+				dynvars::look(ctx.k, ctx.cx, ctx.vp, name, Site::Declare)?;
 				declared(ctx, name)?
 			};
 			if let Some(var) = var {
@@ -1791,9 +1973,6 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		return done(status);
 	}
 	let first = args.len() - o.rest.len();
-	// `export SECONDS=…` and `readonly SECONDS=…` look `SECONDS` up after
-	// assigning it (`set_or_show_attributes`): see the loop's end.
-	let mut seconds_after = false;
 	for (j, arg) in o.rest.iter().enumerate() {
 		let compound_word = ctx.compound.contains(&((1 + first + j) as u32));
 		if kind == DeclareKind::Local && arg.as_slice() == b"-" {
@@ -1825,24 +2004,100 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			on
 		};
 		// bash looks the name up first (`find_variable` in `declare` and
-		// `local`, and in `export` or `readonly` with no value), and a
-		// lookup of the shell's `SECONDS` reads it (`get_seconds`), giving
-		// it the integer attribute: `declare SECONDS=1+1` is 2 and, after
-		// `local SECONDS`, the shell's `SECONDS` is integer.
-		if name == b"SECONDS" && index.is_none() {
-			if matches!(kind, DeclareKind::Export | DeclareKind::Readonly) && value.is_some() {
-				seconds_after = true;
-			} else {
-				seconds_lookup(ctx.k, ctx.cx, ctx.vp)?;
-			}
-			// `-a` and `-A` make the shell's `SECONDS` a plain array
-			// (`convert_var_to_array`, `convert_var_to_assoc`); a local is
-			// only that local's.
-			if on.bits() & (Attrs::INDEXED.bits() | Attrs::ASSOC.bits()) != 0
-				&& state::assigns_global(&ctx.k.root, ctx.cx.store, ctx.vp, name, level)?
-			{
-				seconds_to_plain(ctx.k, ctx.cx, ctx.vp)?;
-			}
+		// `local`, and in `export` or `readonly` with no value; with a value
+		// those look it up after assigning it, below): a special `RANDOM` or
+		// `SECONDS` runs its value function as many times as bash does at
+		// this site ([`Site`]), which gives it the integer attribute:
+		// `declare SECONDS=1+1` is 2 and, after `local SECONDS`, the shell's
+		// `SECONDS` is integer. An element, `-a` or `-A` then makes the
+		// shell's a plain array (`convert_var_to_array`,
+		// `convert_var_to_assoc`); a local is only that local's. Through a
+		// name reference (`declare -n r=RANDOM; declare -i r`) bash looks up
+		// the variable it names: as for the name itself at the global
+		// level, as [`Site::LocalShadow`] or [`Site::LocalNameref`] for
+		// a local, and none for `-n`, `-g` past a function's own reference,
+		// or an element (which removes the reference, below). Once per
+		// command: a later word's command substitution runs `declare` again.
+		// Whether this argument looks anything up is decided on the first
+		// run, from the state then, which the declaration changes (`local r`
+		// shadows a global reference `r`, `+n` ends one); `first`: this run
+		// decides, for the lookups of `+n`'s assignment too.
+		let export_after =
+			matches!(kind, DeclareKind::Export | DeclareKind::Readonly) && value.is_some();
+		let plain_site = if index.is_some() {
+			Site::DeclareElement
+		} else if matches!(kind, DeclareKind::Export | DeclareKind::Readonly) {
+			Site::Declare
+		} else if on.contains(Attrs::NAMEREF) && value.is_none() {
+			Site::DeclareNameref
+		} else if on != Attrs::NONE || off != Attrs::NONE || o.has(b'g') || value.is_some() {
+			Site::DeclareChange
+		} else {
+			Site::Declare
+		};
+		let mut first = false;
+		if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash {
+			ctx.once(|ctx| -> Result<(), Need> {
+				first = true;
+				let looked = if let Some(special) = Special::of(name) {
+					let site = if level == Level::Local {
+						Site::Local
+					} else {
+						plain_site
+					};
+					(!export_after).then_some((special, site))
+				} else if let Some(special) = reference_target(ctx, name, level, o.has(b'g'))? {
+					let nameref = on.contains(Attrs::NAMEREF) || off.contains(Attrs::NAMEREF);
+					let site = match level {
+						// `export` and `readonly`: with a value, the
+						// assignment's lookups through a global reference
+						// ([`set_value`]); the one after it is below.
+						Level::Dynamic if value.is_some() => {
+							state::assigns_global(&ctx.k.root, ctx.cx.store, ctx.vp, name, Level::Dynamic)?
+								.then_some(Site::NamerefAssign)
+						},
+						Level::Dynamic => Some(Site::Declare),
+						// `+n NAME=VALUE` looks up as `+n NAME` does
+						// ([`Site::LocalNameref`], below): bash looks the
+						// target up twice before it assigns.
+						Level::Local => {
+							let own = own_reference(ctx, name, special.name())?;
+							// `-n` with no value on a reference the function
+							// does not own makes a new local, as a plain
+							// `local` does.
+							let new_ref = on.contains(Attrs::NAMEREF) && value.is_none() && !own;
+							Some(if nameref && !new_ref {
+								Site::LocalNameref
+							} else if own {
+								Site::Local
+							} else {
+								Site::LocalShadow
+							})
+						},
+						Level::Global if index.is_some() || on.contains(Attrs::NAMEREF) => None,
+						Level::Global if off.contains(Attrs::NAMEREF) => {
+							value.is_none().then_some(Site::Declare)
+						},
+						Level::Global => Some(plain_site),
+					};
+					site.map(|site| (special, site))
+				} else {
+					None
+				};
+				let Some((special, site)) = looked else {
+					return Ok(());
+				};
+				let target = special.name();
+				let array = site != Site::NamerefAssign
+					&& (index.is_some()
+						|| on.bits() & (Attrs::INDEXED.bits() | Attrs::ASSOC.bits()) != 0);
+				if array && state::assigns_global(&ctx.k.root, ctx.cx.store, ctx.vp, target, level)? {
+					dynvars::to_plain(ctx.k, ctx.cx, ctx.vp, target, Some(site))?;
+				} else {
+					dynvars::look(ctx.k, ctx.cx, ctx.vp, target, site)?;
+				}
+				Ok(())
+			})?;
 		}
 		if on.contains(Attrs::NAMEREF)
 			&& (index.is_some() || (value.is_none() && arg.contains(&b'[')))
@@ -1930,18 +2185,21 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			.as_ref()
 			.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF));
 		// `declare -n xref; declare -a xref[1]=one`: an element assignment
-		// to a reference whose target does not exist makes the reference
-		// a plain array (bash warns and drops its value); so does a
-		// compound value to a reference naming no target (`declare -n b;
-		// declare b=(y)`). A compound value to a named but unset target
-		// assigns the target (`declare -n ref=var; declare ref=(X)`).
+		// to a reference makes the reference a plain array (bash warns and
+		// drops its value), outside a function or with `-g` whether or not
+		// its target exists (`declare -n r=RANDOM; declare 'r[1]=8'` leaves
+		// `RANDOM` alone); so does a compound value to a reference naming
+		// no target (`declare -n b; declare b=(y)`). A compound value to a
+		// named but unset target assigns the target (`declare -n ref=var;
+		// declare ref=(X)`).
 		let element_or_compound =
 			index.is_some() || (compound_word && value.is_some_and(|v| v.starts_with(b"(")));
 		if raw_ref && element_or_compound && value.is_some() && !on.contains(Attrs::NAMEREF) {
 			let target_set = match state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)? {
 				state::Deref::To { name: t, index: None } => {
 					index.is_none()
-						|| declared(ctx, &t)?.is_some_and(|v| !v.attrs.contains(Attrs::INVISIBLE))
+						|| (level == Level::Local
+							&& declared(ctx, &t)?.is_some_and(|v| !v.attrs.contains(Attrs::INVISIBLE)))
 				},
 				_ => false,
 			};
@@ -1975,7 +2233,38 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		let raw_readonly = raw
 			.as_ref()
 			.is_some_and(|v| v.attrs.contains(Attrs::READONLY));
-		if off.contains(Attrs::NAMEREF) && raw_ref && raw_readonly && !raw_unset {
+		// The reference `+n` assigns itself, if any: one the running function
+		// owns ([`own_ref`], whatever its chain reaches), or a global one
+		// with no target yet.
+		let own = if off.contains(Attrs::NAMEREF) && raw_ref {
+			if level == Level::Local {
+				own_ref(ctx, name)?
+			} else if state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)? == state::Deref::Plain {
+				raw.clone()
+			} else {
+				None
+			}
+		} else {
+			None
+		};
+		// A function's own reference whose own chain ends at an element is
+		// left as it is, with a value or without, before the readonly
+		// refusal below: `f() { local -n q='a[1]'; local +n q=zz; }` and
+		// `f() { local -rn q='a[1]'; local +n q=zz; }` are both quiet (bash
+		// 5.3.20 and 5.2.21). A global reference to an element gives the
+		// value to the element, below, as bash's does.
+		if let Some(var) = &own
+			&& level == Level::Local
+			&& own_element(ctx, var)?
+		{
+			continue;
+		}
+		// A readonly reference refuses `+n`, with a target or without one
+		// when a value is given (`declare -rn q; declare +n q=zz`: bash says
+		// `q: readonly variable` and keeps `-nr`), before any path below can
+		// assign or drop the reference itself.
+		if off.contains(Attrs::NAMEREF) && raw_ref && raw_readonly && (!raw_unset || value.is_some())
+		{
 			ctx.err(Diag::Readonly { name: BString::from(name) });
 			status = 1;
 			continue;
@@ -1994,7 +2283,49 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			// The other attributes given apply to the target too
 			// (`declare +n -i foo=7+4` makes the target 11).
 			let mut ref_on = on;
+			if let Some(value) = value
+				&& let Some(own) = own
+			{
+				// The value is the reference's own, after `+=` (the target's
+				// name and the word) and the attributes given (`-i`
+				// evaluates it, `-u`/`-l`/`-c` change its case); it must
+				// name a variable or an element (`valid_nameref_value`).
+				// A refusal names the word as written, except where `-i`
+				// made a name a number (`zz=4; local +n -i q=zz`: status 1,
+				// no message), and keeps the reference, with the attributes
+				// given (`declare -in q="y"`).
+				let old = append.then(|| own.as_scalar().unwrap_or_default());
+				let new = match convert(ctx.k, ctx.cx, ctx.vp, on, value, old) {
+					Ok(v) => Some(v).filter(|v| valid_ref_target(v)),
+					Err(d) => {
+						ctx.err(d);
+						None
+					},
+				};
+				if let Some(new) = new {
+					let attrs = own.attrs.without(off).without(Attrs::INVISIBLE).with(on);
+					ctx.set_var(name, Some(Var::scalar(new, attrs)), level);
+				} else {
+					if !(on.contains(Attrs::INTEGER) && valid_ref_target(value)) {
+						ctx.err(Diag::InvalidIdent { name: BString::from(value) });
+					}
+					if level == Level::Global {
+						// The global one is dropped (`declare -n q; declare +n
+						// q=3` leaves no `q`).
+						ctx.set_var(name, None, level);
+					} else {
+						let mut kept = own;
+						kept.attrs = kept.attrs.with(on);
+						ctx.set_var(name, Some(kept), level);
+					}
+					status = 1;
+				}
+				continue;
+			}
 			if let Some(value) = value {
+				// A special target through a global reference: the
+				// assignment's lookups ([`set_value`]'s), on the first run.
+				let mut special = None;
 				if let state::Deref::To { name: t, index: None } =
 					state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)?
 				{
@@ -2006,16 +2337,30 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 						.with(on.without(Attrs::READONLY));
 					ctx.set_var(&t, Some(target), Level::Dynamic);
 					ref_on = Attrs::NONE;
+					if index.is_none()
+						&& state::assigns_global(&ctx.k.root, ctx.cx.store, ctx.vp, name, Level::Dynamic)?
+					{
+						special = Special::of(&t);
+					}
 				}
-				let lhs = Lhs { name, index, append };
-				if let Err(d) = set_value(
-					ctx.k,
-					ctx.cx,
-					ctx.vp,
-					lhs,
-					AssignValue::Scalar(BString::from(value)),
-					level,
-				) {
+				let value = AssignValue::Scalar(BString::from(value));
+				let res = match special {
+					Some(s) => {
+						if first {
+							dynvars::look(ctx.k, ctx.cx, ctx.vp, s.name(), Site::NamerefAssign)?;
+						}
+						let lhs = Lhs { name: s.name(), index: None, append };
+						set_value(ctx.k, ctx.cx, ctx.vp, lhs, value, Level::Dynamic)
+					},
+					None => set_value(ctx.k, ctx.cx, ctx.vp, Lhs { name, index, append }, value, level),
+				};
+				// A refusal names the word as written, not the target the
+				// reference names (`declare: r: readonly variable`).
+				let res = res.map_err(|d| match d {
+					Diag::Readonly { .. } => Diag::Readonly { name: name.into() },
+					d => d,
+				});
+				if let Err(d) = res {
 					ctx.err(d);
 					status = 1;
 					continue;
@@ -2030,6 +2375,7 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		// Other attributes given to a reference act on its target. A
 		// reference to an element (`declare -n r=a[0]`) is no name for
 		// `readonly`/`export`; `declare -r r` makes its array `a`.
+		let written = name;
 		let target_name;
 		let mut on = on;
 		let name = if raw_ref && !on.contains(Attrs::NAMEREF) && index.is_none() {
@@ -2137,7 +2483,18 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				|| off.contains(Attrs::READONLY)
 				|| (on.bits() | off.bits()) & fixed != 0)
 		{
-			let d = Diag::Readonly { name: name.into() };
+			// `declare` refuses a value under the word as written, through
+			// a reference too (`declare r=7`: `r: readonly variable`); `+r`
+			// and the attributes under the variable's own name, as do a
+			// local (its new name is the target's) and `export`'s or
+			// `readonly`'s assignment.
+			let shown = if value.is_some() && !off.contains(Attrs::READONLY) && level == Level::Global
+			{
+				written
+			} else {
+				name
+			};
+			let d = Diag::Readonly { name: shown.into() };
 			let array_flag = on.contains(Attrs::INDEXED) || on.contains(Attrs::ASSOC);
 			if compound_word {
 				// bash reports a compound word's failed array assignment
@@ -2160,6 +2517,11 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				ctx.diag(d);
 			} else {
 				ctx.err(d);
+			}
+			// `export` and `readonly` look the name up after a refused
+			// assignment too (`set_or_show_attributes`), once per command.
+			if export_after && first {
+				dynvars::look(ctx.k, ctx.cx, ctx.vp, name, Site::ExportAfter)?;
 			}
 			status = 1;
 			continue;
@@ -2520,11 +2882,13 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					ctx.set_var(name, Some(v), level);
 				}
 				propagate_temp(ctx, name, kind, on, level);
+				// `set_or_show_attributes`: `export`/`readonly` look the name up
+				// after assigning it ([`Site::ExportAfter`]).
+				if export_after {
+					dynvars::look(ctx.k, ctx.cx, ctx.vp, name, Site::ExportAfter)?;
+				}
 			},
 		}
-	}
-	if seconds_after {
-		seconds_lookup(ctx.k, ctx.cx, ctx.vp)?;
 	}
 	done(status)
 }
@@ -3012,17 +3376,22 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				state::Deref::Plain | state::Deref::Circular => (name, index),
 			}
 		};
-		// `unset 'SECONDS[i]'` looks the shell's `SECONDS` up first
-		// (`find_variable`, which reads the clock), so it is an integer
-		// scalar here: element 0 unsets it, which removes the special
-		// meaning as `unset SECONDS` does; another is no array element.
-		let seconds_clock = name == b"SECONDS"
-			&& index.is_some()
-			&& !o.has(b'n')
-			&& ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash
-			&& seconds_visible(ctx.k, ctx.cx.store, ctx.vp)?;
-		if seconds_clock {
-			seconds_lookup(ctx.k, ctx.cx, ctx.vp)?;
+		// `unset NAME` and `unset 'NAME[i]'` look a special `RANDOM` or
+		// `SECONDS` up first (`find_variable`, which runs its value
+		// function), so it is an integer scalar here: element 0 unsets it,
+		// which removes the special meaning as `unset NAME` does; another
+		// is no array element. `unset -n` looks up the end of the reference
+		// chain (`find_variable_last_nameref`), `RANDOM` itself or what a
+		// reference names, and removes nothing special. Once per command,
+		// by name (an index's command substitution runs `unset` again, after
+		// this name is plain).
+		let special = if o.has(b'n') {
+			None
+		} else {
+			dynvars::visible(ctx.k, ctx.cx.store, ctx.vp, name)?
+		};
+		if dynvars::named(ctx.k, ctx.cx.store, ctx.vp, name)?.is_some() {
+			ctx.once(|ctx| dynvars::look_through(ctx.k, ctx.cx, ctx.vp, name, Site::Unset))?;
 		}
 		let var = state::lookup_declared(&ctx.k.root, ctx.cx.store, ctx.vp, name)?.map(|v| {
 			(
@@ -3032,21 +3401,18 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				v.next_index(),
 			)
 		});
-		// bash's `unset SECONDS` removes the shell's dynamic variable:
-		// `SECONDS` is a plain variable from then on (a local `SECONDS` is
-		// only that local's, and a readonly one stays, refused below).
-		if name == b"SECONDS"
+		// bash's `unset RANDOM`/`unset SECONDS` removes the shell's dynamic
+		// variable: a plain variable from then on (a local one is only that
+		// local's, and a readonly one stays, refused below).
+		if let Some(s) = special
 			&& index.is_none()
-			&& !o.has(b'n')
 			&& !var
 				.as_ref()
 				.is_some_and(|(attrs, ..)| attrs.contains(Attrs::READONLY))
-			&& ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash
-			&& seconds_visible(ctx.k, ctx.cx.store, ctx.vp)?
 		{
 			let keep = ctx.option(OptId::LocalvarUnset)?;
 			state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keep);
-			ctx.k.set_seconds_plain(ctx.cx.store, ctx.vp);
+			ctx.k.set_plain(ctx.cx.store, ctx.vp, s);
 			continue;
 		}
 		if var.is_none() && !o.has(b'v') && !o.has(b'n') && index.is_none() {
@@ -3176,8 +3542,8 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 					}
 					if scalar && i == 0 {
 						ctx.set_var(name, None, Level::Dynamic);
-						if seconds_clock {
-							ctx.k.set_seconds_plain(ctx.cx.store, ctx.vp);
+						if let Some(s) = special {
+							ctx.k.set_plain(ctx.cx.store, ctx.vp, s);
 						}
 						continue;
 					}

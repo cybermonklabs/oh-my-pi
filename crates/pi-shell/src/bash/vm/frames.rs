@@ -59,7 +59,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 32;
+pub const FRAMES_VERSION: u32 = 33;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -710,15 +710,16 @@ impl Shell {
 		k.next_vpid = parse_misc(cx.store, MiscKey::NextVpid)?.unwrap_or(base + 1);
 		k.written_vpid = k.next_vpid;
 		k.next_job = parse_misc(cx.store, MiscKey::NextJob)?.unwrap_or(1);
-		k.rand = if opts.reseed_random {
-			let rand = state::Random::new((cx.host.random() & 0xffff_ffff) as u32);
-			k.root.set_misc(cx.store, MiscKey::Random, rand.encode());
-			rand
+		let (rand, plain) = state::root_misc(cx.store, MiscKey::Random)?
+			.and_then(state::parse_random_record)
+			.unwrap_or_default();
+		k.random_plain = plain;
+		if opts.reseed_random {
+			k.rand = state::Random::new((cx.host.random() & 0xffff_ffff) as u32);
+			k.write_random(cx.store);
 		} else {
-			state::root_misc(cx.store, MiscKey::Random)?
-				.and_then(state::Random::decode)
-				.unwrap_or_default()
-		};
+			k.rand = rand;
+		}
 		let clock = parse_misc::<super::StartRecord>(cx.store, MiscKey::StartNs)?;
 		k.start_ns = clock.map_or_else(|| cx.host.now_ns(), |c| c.start);
 		k.seconds = clock.map_or(0, |c| c.seconds);

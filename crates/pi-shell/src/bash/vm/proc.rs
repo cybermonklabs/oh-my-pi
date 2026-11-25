@@ -141,23 +141,26 @@ pub struct Vproc {
 /// keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Clock {
-	pub rand:     Random,
+	pub rand:          Random,
 	/// The generator is reseeded on the vproc's first `$RANDOM` in bash code
 	/// unless `RANDOM` was assigned first, as bash reseeds a subshell's
 	/// (`get_random_number`'s `seeded_subshell`); zsh draws on from the copy.
-	pub reseed:   bool,
+	pub reseed:        bool,
 	/// The host clock reading of the shell's start, or of the last
 	/// `SECONDS=` in bash code (bash's `shellstart`, which `assign_seconds`
 	/// resets to now): `printf '%(…)T' -2` and the shell's `time` report
 	/// count from it.
-	pub start_ns: u64,
+	pub start_ns:      u64,
 	/// The value of the last `SECONDS=` in bash code (bash's
 	/// `seconds_value_assigned`): `$SECONDS` is it plus the seconds since
 	/// `start_ns`. zsh's `SECONDS=` moves `start_ns` instead and sets it to 0.
-	pub seconds:  i64,
-	/// `unset SECONDS` in bash code removed the special meaning of `SECONDS`: a
-	/// plain variable from then on (bash removes the dynamic variable).
-	pub plain:    bool,
+	pub seconds:       i64,
+	/// `unset SECONDS` or an array assignment in bash code removed the
+	/// special meaning of `SECONDS`: a plain variable from then on (bash
+	/// removes the dynamic variable).
+	pub seconds_plain: bool,
+	/// The same for `RANDOM`.
+	pub random_plain:  bool,
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's

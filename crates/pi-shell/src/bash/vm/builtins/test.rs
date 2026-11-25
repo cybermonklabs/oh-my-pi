@@ -15,6 +15,7 @@ use crate::bash::{
 	store::{Attrs, OptId, OptKind, VarValue},
 	vm::{
 		Cx, Kernel,
+		dynvars::{self, Site},
 		exec::{Flow, expanding},
 		expand::arith_value,
 		probe::{self, absolute},
@@ -100,8 +101,12 @@ fn stat(ctx: &Ctx<'_, '_>, arg: &[u8], follow: bool) -> T<Option<Stat>> {
 	}
 }
 
-/// A unary primary (bash's `unary_test`).
-fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
+/// A unary primary (bash's `unary_test`). `cond`: in `[[ ]]`; `written`:
+/// the name `[[ ]]` looks up first for its operand as written, the text
+/// before the word's first `[` when that is a name (bash's
+/// `valid_array_reference` with `VA_NOEXPAND`: `RANDOM[1]""` yes,
+/// `'RANDOM[1]'` no), whatever follows it.
+fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool, written: Option<&[u8]>) -> T<bool> {
 	Ok(match op {
 		b'z' => arg.is_empty(),
 		b'n' => !arg.is_empty(),
@@ -112,6 +117,13 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 			}
 		},
 		b'v' => {
+			if let Some(w) = written
+				&& dynvars::named(ctx.k, ctx.cx.store, ctx.vp, w)
+					.map_err(Need::from)?
+					.is_some()
+			{
+				ctx.once(|ctx| dynvars::look_through(ctx.k, ctx.cx, ctx.vp, w, Site::Test))?;
+			}
 			let expand_once = ctx.option(OptId::AssocExpandOnce)?;
 			// In `[[ ]]` under `assoc_expand_once` the operand is one array
 			// reference: an associative subscript runs to its final `]`
@@ -120,6 +132,16 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 				super::vars::array_reference(ctx, arg, expand_once, cond && expand_once)?
 			{
 				let (name, i) = (&arg[..open], &arg[open + 1..close]);
+				// bash looks the name up (`find_variable`): a special `RANDOM`
+				// or `SECONDS` runs its value function; once per command
+				// although a probe or a key's command substitution runs `test`
+				// again.
+				if dynvars::named(ctx.k, ctx.cx.store, ctx.vp, name)
+					.map_err(Need::from)?
+					.is_some()
+				{
+					ctx.once(|ctx| dynvars::look_through(ctx.k, ctx.cx, ctx.vp, name, Site::Test))?;
+				}
 				let v = ctx.var(name)?;
 				// A key is expanded once more (bash's
 				// `expand_subscript_string`) unless `assoc_expand_once`;
@@ -153,6 +175,12 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool) -> T<bool> {
 			if let Some(n) = number(arg) {
 				let count = ctx.positional()?.len();
 				return Ok(usize::try_from(n).is_ok_and(|n| n <= count));
+			}
+			if dynvars::named(ctx.k, ctx.cx.store, ctx.vp, arg)
+				.map_err(Need::from)?
+				.is_some()
+			{
+				ctx.once(|ctx| dynvars::look_through(ctx.k, ctx.cx, ctx.vp, arg, Site::Test))?;
 			}
 			match ctx.var(arg)? {
 				None => false,
@@ -320,7 +348,7 @@ trait Primaries {
 
 impl Primaries for Ctx<'_, '_> {
 	fn unary(&mut self, op: u8, arg: &[u8]) -> T<bool> {
-		unary(self, op, arg, false)
+		unary(self, op, arg, false, None)
 	}
 
 	fn binary(&mut self, op: &[u8], l: &[u8], r: &[u8]) -> T<bool> {
@@ -683,7 +711,16 @@ pub fn cond_test(
 		let (res, chunks) = {
 			let mut ctx = Ctx::new(k, cx, vp, sc.probes(), line, "[[");
 			let res = match c {
-				CondIr::Unary { op, .. } if is_unary(op) => unary(&mut ctx, op[1], &vals[0], true),
+				CondIr::Unary { op, arg, .. } if is_unary(op) => {
+					let word = &unit.words[*arg as usize];
+					let written = unit
+						.nodes
+						.get(word.node as usize)
+						.and_then(|n| unit.source.get(n.lo as usize..n.hi as usize))
+						.and_then(|src| src.iter().position(|&c| c == b'[').map(|open| &src[..open]))
+						.filter(|name| crate::bash::vm::is_ident(name));
+					unary(&mut ctx, op[1], &vals[0], true, written)
+				},
 				CondIr::Unary { op, .. } => {
 					Err(syntax(format!("{}: unary operator expected", op.as_bstr())))
 				},
