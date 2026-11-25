@@ -213,6 +213,7 @@
 - A session whose entries carry a `runtime` nested more than about 25,000 levels deep resumes instead of failing with `Maximum call stack size exceeded`
 - An entry nested more than 10,000 levels deep that holds a bigint (an extension hook can put one in an entry) is written with the bigint as its decimal string, as a shallower entry is, instead of every write of the session failing with `JSON.stringify cannot serialize BigInt`
 - An entry nested more than about 18,000 levels deep that holds an image keeps the image in the blob store when it leaves memory, as a shallower entry does, instead of inline in the body omp keeps for it, the same entry no longer stored one way on the main thread and the other on a worker
+- Writing a session that holds an entry nested more than 1,000 levels deep no longer rescans the entry at each of its first 1,000 levels (a 3,000-level entry with 100 fields per level took 605 ms a write, now 10 ms), and resuming a session whose older entry nests 50,000 levels deep takes 36 ms instead of 1.7 s
 - A session imported with `--from-claude` or `--from-codex`, and every session that process switches to afterwards, now moves its older entries out of memory as other sessions do
 - omp no longer keeps older entry bodies in a temporary directory that another account made or can enter; the session keeps them compressed in memory instead
 - Reading older screenshots back, as an extension reading every message does, no longer keeps up to eight of them in memory past the 16 MiB the cache allows
