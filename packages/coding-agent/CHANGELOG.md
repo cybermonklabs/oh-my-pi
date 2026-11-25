@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed host output written while a browser run's tool call ran (in RPC mode a protocol frame, in print mode a record) going into the cmux, Tern or inline-worker run's output instead of omp's stdout, and output from work that call started being lost once the run ended: the embedder's side of a tool call now runs outside the run, so it no longer writes into the run
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
