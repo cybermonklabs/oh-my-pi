@@ -1254,11 +1254,13 @@ fn errexit_out_of_a_function_resets_its_context_before_the_exit_trap() {
 
 /// Other jumps out of a function change the function context before the
 /// EXIT trap too. bash's `top_level_cleanup` sets it to 0 (`break` with a
-/// bad count; an expansion error in a script's own commands), and each
-/// `eval`, `.`, `-c` string or command substitution a jump passes undoes,
-/// which pops the functions called inside it (an expansion error under
-/// `-c`; a posix special builtin's error without `set -e`). A command
-/// substitution's text is such a level for `set -e` too. `set -e` in the
+/// bad count; an arithmetic subscript error; an expansion error or a
+/// discarded command in a script's own commands), and each `eval`, `.`,
+/// `-c` string or command substitution a jump passes undoes, which pops
+/// the functions called inside it (an expansion error under `-c`; a posix
+/// special builtin's error without `set -e`). A command substitution's
+/// text is such a level for `set -e` too. A discarded command that ends a
+/// subshell or a command substitution counts as well. `set -e` in the
 /// trap's `eval` then undoes its redirections, so the report goes out of
 /// them. A function called outside every level keeps the context, and so
 /// does `report_error`'s exit, which is no jump.
@@ -1267,6 +1269,7 @@ fn a_jump_out_of_a_function_changes_its_context_before_the_exit_trap() {
 	const TRAP: &str = "trap 'set -e; time eval \"{ false; } 2>/dev/null\"' EXIT; ";
 	const BREAK: &str = "SH: break: x: numeric argument required\n";
 	const MISSING: &str = "SH: missing: No such file or directory\n";
+	const DIV: &str = "SH: 1/0: division by 0 (error token is \"0\")\n";
 	let in_sub = |f: &str| {
 		format!(
 			"{f}x=$( set -e; trap 'time eval \"{{ false; }} 2>/dev/null\"' EXIT; g() {{ false; }}; g \
@@ -1356,6 +1359,24 @@ fn a_jump_out_of_a_function_changes_its_context_before_the_exit_trap() {
 			"w=1\n".to_owned(),
 			0,
 		),
+		(
+			"an arithmetic subscript error ends a subshell",
+			format!("( {TRAP}f() {{ a[1/0]=v; }}; f ); echo w=$?"),
+			format!("{DIV}report\nw=1\n"),
+			0,
+		),
+		(
+			"an arithmetic subscript error ends a command substitution",
+			format!("x=$( {TRAP}f() {{ a[1/0]=v; }}; f ); echo \"x=[$x] s=$?\""),
+			format!("{DIV}report\nx=[] s=1\n"),
+			0,
+		),
+		(
+			"an arithmetic subscript error ends a subshell, no function",
+			format!("( {TRAP}a[1/0]=v ); echo w=$?"),
+			format!("{DIV}report\nw=1\n"),
+			0,
+		),
 	];
 	let rows: Vec<_> = rows
 		.iter()
@@ -1364,6 +1385,9 @@ fn a_jump_out_of_a_function_changes_its_context_before_the_exit_trap() {
 	assert_rows(&rows);
 	let subshell = format!("( {TRAP}f() {{ echo ${{x:?u}}; }}; f ); echo w=$?");
 	let in_eval = format!("{TRAP}f() {{ eval 'echo ${{x:?u}}'; }}; f");
+	let readonly = format!("( {TRAP}readonly r=1; f() {{ r=2; }}; f; echo after ); echo w=$?");
+	let failglob =
+		format!("( shopt -s failglob; {TRAP}f() {{ : /nonexistent*; }}; f; echo after ); echo w=$?");
 	assert_rows_by_mode(&[
 		(
 			"an expansion error, a subshell",
@@ -1372,6 +1396,46 @@ fn a_jump_out_of_a_function_changes_its_context_before_the_exit_trap() {
 			("SH: x: u\nreport\nw=1\n", 0),
 		),
 		("an expansion error, an eval", &in_eval, ("SH: x: u\nreport\n", 1), ("SH: x: u\n", 1)),
+		(
+			"a failed assignment ends a subshell",
+			&readonly,
+			("SH: r: readonly variable\nw=1\n", 0),
+			("SH: r: readonly variable\nreport\nw=1\n", 0),
+		),
+		(
+			"a failglob miss ends a subshell",
+			&failglob,
+			("SH: no match: /nonexistent*\nw=1\n", 0),
+			("SH: no match: /nonexistent*\nreport\nw=1\n", 0),
+		),
+	]);
+}
+
+/// A discarded command (a failed assignment, an arithmetic subscript error)
+/// that leaves a subshell or a command substitution ends it through its
+/// own top, which runs its EXIT trap as at its end (bash's
+/// `execute_in_subshell`, `command_substitute`), with the status 1.
+#[test]
+fn a_discarded_command_that_ends_a_subshell_runs_its_exit_trap() {
+	assert_rows(&[
+		(
+			"a failed assignment",
+			"( trap 'echo T $?' EXIT; readonly r=1; r=2; echo after ); echo w=$?",
+			"SH: r: readonly variable\nT 1\nw=1\n",
+			0,
+		),
+		(
+			"a command substitution",
+			"x=$( trap 'echo T $? >&2' EXIT; readonly r=1; r=2; echo in ); echo \"x=[$x] s=$?\"",
+			"SH: r: readonly variable\nT 1\nx=[] s=1\n",
+			0,
+		),
+		(
+			"an arithmetic subscript error",
+			"( trap 'echo T $?' EXIT; a[1/0]=v; echo after ); echo w=$?",
+			"SH: 1/0: division by 0 (error token is \"0\")\nT 1\nw=1\n",
+			0,
+		),
 	]);
 }
 
@@ -1550,6 +1614,18 @@ fn report_error_under_set_e_leaves_without_a_report() {
 		("command", ro("command export r=2"), RO),
 		("builtin in a condition", ro("builtin export r=2 || echo no"), RO),
 		(
+			"command builtin in a condition",
+			ro("command builtin export r=2 || echo no"),
+			"no\nreport\nafter\nw=0\ne1:\nSH: r: readonly variable\n",
+		),
+		(
+			"builtin . in a condition",
+			format!("( set -e; time {{ builtin . ./missing || echo no{TAIL}"),
+			"w=1\ne1:\nSH: ./missing: No such file or directory\n",
+		),
+		("builtin command in a condition", ro("builtin command export r=2 || echo no"), RO),
+		("builtin eval in a condition", ro("builtin eval 'r=2' || echo no"), RO),
+		(
 			"command in an && list",
 			ro("command export r=2 && echo yes"),
 			"report\nafter\nw=0\ne1:\nSH: r: readonly variable\n",
@@ -1629,6 +1705,16 @@ fn report_error_under_set_e_leaves_without_a_report() {
 			"let, unbound",
 			format!("( set -eu; time {{ let u{TAIL}"),
 			"w=1\ne1:\nSH: u: unbound variable\n",
+		),
+		(
+			"an empty key",
+			format!("( set -e; declare -A A; time {{ A=([]=x){TAIL}"),
+			"w=1\ne1:\nSH: []=x: bad array subscript\n",
+		),
+		(
+			"declare, a list to an element",
+			format!("( set -e; time {{ declare a[0]=(1){TAIL}"),
+			"w=1\ne1:\nSH: a[0]: cannot assign list to array member\n",
 		),
 	];
 	let rows: Vec<_> = rows

@@ -16,8 +16,8 @@ use super::{
 	is_ident, probe,
 	proc::{
 		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
-		LoopKind, LoopRec, ParseLevel, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult,
-		Run, Saved, Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		LoopKind, LoopRec, ParseLevel, ParseSnapshot, PendingSub, PendingWrite, Prefix, Probe,
+		ProbeResult, Run, Saved, Scratch, ScriptKind, Slot, Target, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -27,7 +27,7 @@ use crate::bash::{
 	event::{CompiledUnit, Construct, EventData, NodeKind, Origin, WaitKey, assign_preview},
 	fd::FdRef,
 	host::{ResolveCtx, Resolved, Via},
-	ids::{Dialect, ModeId, UnitId, Vpid},
+	ids::{Dialect, IntrinsicId, ModeId, UnitId, Vpid},
 	ir::{self, ComsubForm, Op, Opcode, SpawnKind, Unit},
 	mem::{self, Capture},
 	pattern::PatOpts,
@@ -368,6 +368,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			Flow::Call => {},
 			Flow::EndUnit => end_unit(k, vp, cx),
 			Flow::Abort(status) => {
+				k.top_level_cleanup = false;
 				// Abandon the innermost script (the run's, `eval`'s, `source`'s).
 				vp.status = status;
 				let i = script_frame(vp).unwrap_or(0);
@@ -432,16 +433,27 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			Flow::Exit(status, jump) => {
 				report_jump(k, vp, cx, 0, jump);
 				exit_shell(k, vp, cx, status, jump);
+				k.top_level_cleanup = false;
 			},
 			Flow::Discard(status) if unit.mode.dialect() == Dialect::Zsh => {
 				zsh_discard(k, vp, cx, status);
 			},
 			Flow::Discard(status) => {
 				vp.status = status;
+				let cleanup = std::mem::take(&mut k.top_level_cleanup);
 				// bash's `parse_and_execute` (the script, `-c`, `eval`, `.`,
 				// a trap action) catches the jump: the innermost script goes
-				// on with its next command.
-				if let Some(i) = script_frame(vp) {
+				// on with its next command. In a subshell it passes the jump
+				// on (`subshell_environment`) to the next catch: a running
+				// EXIT trap's `run_exit_trap`, which ends the action, else the
+				// subshell's top level, which exits.
+				let subshell = super::nested::in_subshell(cx.store, vp);
+				let catch = if subshell {
+					exit_trap_frame(vp)
+				} else {
+					script_frame(vp)
+				};
+				if let Some(i) = catch {
 					report_jump(k, vp, cx, i, Jump::Other);
 					unwind(&mut k.root, cx.store, vp, i + 1);
 					clear_scratch(&mut k.root, cx.store, vp);
@@ -449,9 +461,34 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 					let f = top_frame(vp);
 					f.unit = None;
 					f.loops.clear();
+					if subshell && let FrameKind::Script { src, pos, aux, .. } = &mut f.kind {
+						*pos = (src.len() as u32, pos.1);
+						if let Some(a) = aux {
+							a.pending = None;
+						}
+					}
 				} else {
 					report_jump(k, vp, cx, 0, Jump::Other);
-					unwind(&mut k.root, cx.store, vp, 0);
+					// A subshell's top level exits (bash's
+					// `execute_in_subshell`, `command_substitute`) and runs
+					// its EXIT trap. After `top_level_cleanup` (an arithmetic
+					// subscript error; a script's own command) its
+					// `run_unwind_protects` has popped the functions the
+					// subshell called and `variable_context` is 0 (sig.c:401):
+					// the trap runs outside every function ([`Jump::Cleanup`]).
+					// Otherwise it runs in the function the jump left.
+					if subshell {
+						let jump = if cleanup {
+							let base = vp.frames.len().min(1);
+							unwind(&mut k.root, cx.store, vp, base);
+							Jump::Cleanup
+						} else {
+							Jump::Other
+						};
+						exit_shell(k, vp, cx, status, jump);
+					} else {
+						unwind(&mut k.root, cx.store, vp, 0);
+					}
 				}
 			},
 		}
@@ -3774,6 +3811,16 @@ fn script_frame(vp: &Vproc) -> Option<usize> {
 		.rposition(|f| matches!(f.kind, FrameKind::Script { .. }))
 }
 
+/// The innermost running EXIT trap action: in a subshell, bash's
+/// `run_exit_trap` is the only catch of a discarded command below the
+/// top level (the `parse_and_execute` of an `eval`, `.` or other trap
+/// action passes it on).
+fn exit_trap_frame(vp: &Vproc) -> Option<usize> {
+	vp.frames.iter().rposition(|f| {
+		matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key: TrapKey::Exit, .. }, .. })
+	})
+}
+
 /// Drop every pending `time` mark without a report: `exec` replaced the
 /// shell ([`report_left_times`]).
 pub(super) fn drop_times(vp: &mut Vproc) {
@@ -3823,19 +3870,40 @@ fn reports_error(d: &Diag) -> bool {
 /// so no `time` reports ([`Jump::Direct`]). bash turns the flag off only
 /// inside an `eval`, `.` or builtin run through `command` that a condition
 /// runs (`execute_cmd.c`, line 5000), not for the condition's own commands:
-/// a frame such a builtin pushed here, the builtin itself in
-/// `settle_builtin`.
+/// a frame such a builtin pushed here (the builtin's own command, on the
+/// frame below, says how it was run: [`errexit_off`]), the builtin itself
+/// in `settle_builtin`.
 pub(super) fn report_error_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, d: &Diag) -> bool {
 	reports_error(d)
 		&& vp.mode.dialect() != Dialect::Zsh
-		&& !vp.frames.iter().any(|f| {
+		&& !vp.frames.iter().enumerate().any(|(i, f)| {
 			f.ignore_errexit
 				&& matches!(f.kind, FrameKind::Script {
 					what: ScriptKind::Eval | ScriptKind::Source,
 					..
 				})
+				&& i
+					.checked_sub(1)
+					.and_then(|below| vp.frames[below].scratch.as_ref())
+					.and_then(|sc| sc.exec.as_ref())
+					.is_none_or(|e| match e.target {
+						Some(Target::Intrinsic(id)) => errexit_off(e.prefix, id),
+						_ => true,
+					})
 		})
 		&& errexit_on(k, cx, vp)
+}
+
+/// Whether bash's `execute_builtin` turns `set -e` off for builtin `id` run
+/// with `prefix` in a condition (`execute_cmd.c`, line 5000): through
+/// `command`, or `eval`, `.` and `source` named directly (not through
+/// `builtin`, whose own run keeps the flag).
+pub(super) const fn errexit_off(prefix: Prefix, id: IntrinsicId) -> bool {
+	match prefix {
+		Prefix::Command => true,
+		Prefix::Builtin => false,
+		Prefix::None => matches!(id, IntrinsicId::Eval | IntrinsicId::Dot | IntrinsicId::Source),
+	}
 }
 
 /// The status [`report_error_exits`] leaves with: 1 for an error bash sets
@@ -3933,8 +4001,15 @@ fn undo_redirections(k: &Kernel, vp: &mut Vproc, from: usize, to: usize) {
 /// on the shell's own stderr; for `cleanup`, the marks started inside a
 /// `parse_and_execute` are dropped unreported as well (their jump targets
 /// are gone). Frames `flow` does not leave keep theirs: their commands go
-/// on.
-pub(super) fn jump_out(k: &Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, cleanup: bool, flow: &Flow) {
+/// on. Records on `k` whether bash ran `top_level_cleanup`
+/// ([`top_level_jump`]), for the arm that takes `flow`.
+pub(super) fn jump_out(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	cleanup: bool,
+	flow: &Flow,
+) {
 	if vp.mode.dialect() == Dialect::Zsh {
 		return;
 	}
@@ -3943,6 +4018,7 @@ pub(super) fn jump_out(k: &Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, cleanup: boo
 	};
 	let inside = parse_and_execute_frame(cx, vp);
 	let all = vp.frames.len();
+	k.top_level_cleanup = cleanup || inside == all;
 	if cleanup {
 		undo_redirections(k, vp, leave, all);
 		for f in vp.frames.iter_mut().skip(leave.max(inside)) {

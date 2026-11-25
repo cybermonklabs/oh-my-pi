@@ -674,6 +674,15 @@ fn set_value_plain(
 				let kvpair = elems.first().is_some_and(|(key, ..)| key.is_none());
 				for (key, eappend, v) in elems {
 					let key = if let Some(key) = key {
+						// An empty key is a bad subscript, and the words after it
+						// are not assigned (bash `assign_compound_array_list`,
+						// arrayfunc.c:765: `err_badarraysub`, a `report_error`).
+						if key.is_empty() {
+							let mut shown = BString::from(if eappend { "[]+=" } else { "[]=" });
+							shown.extend_from_slice(&v);
+							deferred.push(Diag::BadSubscript { shown });
+							break;
+						}
 						key
 					} else if !kvpair {
 						deferred.push(Diag::AssocSubscript { name: name.into(), word: v });
@@ -2287,6 +2296,7 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				let array_flag = on.bits() & (Attrs::INDEXED.bits() | Attrs::ASSOC.bits()) != 0;
 				let array_exists = exists && !matches!(var.value, VarValue::Str(_));
 				let parens = value.starts_with(b"(") && value.ends_with(b")");
+				let assoc_target = on.contains(Attrs::ASSOC) || matches!(var.value, VarValue::Assoc(_));
 				let compound = parens
 					&& (index.is_none() || array_flag)
 					&& (compound_word
@@ -2339,6 +2349,17 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					var.value = VarValue::Indexed(items);
 				}
 				ctx.set_var(name, Some(var), level);
+				// `declare a[0]=(1)`: bash declares the array first
+				// (`make_internal_declare`), then refuses the list for the
+				// element by `report_error` (subst.c:3603).
+				if let Some(idx) = index
+					&& compound_word
+					&& parens
+				{
+					ctx.diag(Diag::ListToMember { shown: element_text(name, idx) });
+					status = 1;
+					continue;
+				}
 				// bash expands a `declare` argument's subscript again (quote
 				// removal), unlike an assignment word's.
 				let index = index
@@ -2365,6 +2386,23 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					Err(Diag::AssocSubscript { name: array, word }) if compound_word => {
 						let word = quote::sh_single_quote(&word).into();
 						ctx.err(Diag::AssocSubscript { name: array, word });
+						status = 1;
+						continue;
+					},
+					// and an associative array's empty key, both words quoted:
+					// `['']='v'`.
+					Err(Diag::BadSubscript { shown }) if compound_word && assoc_target => {
+						let requoted = shown
+							.strip_prefix(b"[]+=")
+							.map(|v| ("+=", v))
+							.or_else(|| shown.strip_prefix(b"[]=").map(|v| ("=", v)))
+							.map(|(op, v)| {
+								let mut s = BString::from(format!("['']{op}"));
+								s.extend_from_slice(&quote::sh_single_quote(v));
+								s
+							});
+						let shown = requoted.unwrap_or(shown);
+						ctx.err(Diag::BadSubscript { shown });
 						status = 1;
 						continue;
 					},

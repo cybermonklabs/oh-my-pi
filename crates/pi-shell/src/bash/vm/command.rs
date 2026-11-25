@@ -21,8 +21,8 @@ use super::{
 	probe::{self, Search, absolute, candidates},
 	proc::{
 		AssignValue, Awaited, BangStage, DeferPhase, ExecAs, ExecState, Frame, FrameKind, JobState,
-		Live, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot, Stage, Target,
-		Transfer, Vproc,
+		Live, PathSearch, PendingWrite, Prefix, Probe, ProbeResult, Scratch, ScriptKind, Slot, Stage,
+		Target, Transfer, Vproc,
 	},
 	state::{self, Level, Scope, Var, VarMap},
 	xtrace,
@@ -71,6 +71,7 @@ impl ExecState {
 			exec_as: None,
 			wait_into: None,
 			via_command: false,
+			prefix: Prefix::None,
 			resume: false,
 			resumed: 0,
 		}
@@ -102,6 +103,7 @@ impl ExecState {
 			exec_as,
 			wait_into,
 			via_command,
+			prefix,
 			resume,
 			resumed,
 		} = self;
@@ -128,6 +130,7 @@ impl ExecState {
 		*exec_as = None;
 		*wait_into = None;
 		*via_command = false;
+		*prefix = Prefix::None;
 		*resume = false;
 		*resumed = 0;
 	}
@@ -1862,6 +1865,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 		let posix = state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 			.unwrap_or(false);
 		let mut via = Via::Plain;
+		let mut prefix = Prefix::None;
 		let target = loop {
 			// Borrowed (the resolution only reads `vp`): no copy of the
 			// name per command.
@@ -1939,6 +1943,9 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 					external_only = zsh
 						&& !state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Posixbuiltins)
 							.unwrap_or(false);
+					if via == Via::Plain {
+						prefix = Prefix::Command;
+					}
 					via = if std_path {
 						Via::CommandP
 					} else {
@@ -1966,6 +1973,9 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 						s.stage = Stage::Finish;
 						return None;
 					}
+					if via == Via::Plain {
+						prefix = Prefix::Builtin;
+					}
 					via = Via::Builtin;
 				},
 				_ if via == Via::Builtin && !matches!(resolved, Resolved::Intrinsic(_)) => {
@@ -1991,6 +2001,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 		let s = st(vp);
 		s.target = Some(target);
 		s.via_command = matches!(via, Via::Command | Via::CommandP);
+		s.prefix = prefix;
 	}
 	if st(vp).target == Some(Target::Search) {
 		// File-system probes: `CmdExpanded` reads the clock after them.
@@ -4020,9 +4031,9 @@ fn settle_builtin(
 	// exits where it is printed ([`exec::report_error_exits`]), and what
 	// would follow it never comes. bash turns `set -e` off while a
 	// condition runs `eval`, `.` or any builtin through `command`
-	// (`execute_cmd.c`, line 5000).
-	let errexit_off = (matches!(id, IntrinsicId::Eval | IntrinsicId::Dot | IntrinsicId::Source)
-		|| sc.exec.as_ref().is_some_and(|e| e.via_command))
+	// (`execute_cmd.c`, line 5000): it reads the outer word, so `command
+	// builtin export` turns it off and `builtin .` does not.
+	let errexit_off = exec::errexit_off(sc.exec.as_ref().map_or(Prefix::None, |e| e.prefix), id)
 		&& vp.frames.last().is_some_and(exec::errexit_ignored);
 	if !errexit_off
 		&& !matches!(outcome.control, Control::Frame | Control::Resume | Control::Wait(_))

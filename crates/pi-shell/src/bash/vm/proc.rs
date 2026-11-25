@@ -1561,11 +1561,28 @@ pub struct ExecState {
 	/// Run through `command`: a special builtin's failure does not end a
 	/// posix shell.
 	pub via_command: bool,
+	/// The prefix the command's words start with, as bash's
+	/// `execute_simple_command` and `execute_builtin` read it: the outer
+	/// one, not the last (`command builtin export` is `command`'s).
+	pub prefix:      Prefix,
 	/// The awaited frame was pushed by the builtin, which runs again when
 	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).
 	pub resume:      bool,
 	/// Times the builtin ran again after a frame it pushed returned.
 	pub resumed:     u32,
+}
+
+/// The prefix word a simple command starts with ([`ExecState::prefix`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Prefix {
+	/// No prefix: the command word itself.
+	#[default]
+	None,
+	/// `command` (bash's `CMD_COMMAND_BUILTIN`, every leading one).
+	Command,
+	/// `builtin`: bash runs `builtin_builtin`, which runs the builtin it
+	/// names.
+	Builtin,
 }
 
 /// Options of `exec [-cl] [-a name] command`.

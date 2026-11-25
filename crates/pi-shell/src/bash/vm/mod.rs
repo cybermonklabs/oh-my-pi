@@ -461,6 +461,10 @@ pub struct Kernel {
 	/// Which DEBUG/ERR/RETURN traps may be set: lets `exec::start_trap`
 	/// skip its checks before every command; not imaged.
 	pub pseudo_traps:       exec::PseudoTraps,
+	/// The jump the running op makes comes after bash's `top_level_cleanup`
+	/// ([`exec::jump_out`]); the arm that takes the op's flow reads and
+	/// clears it. Not imaged: set and read within one op.
+	pub top_level_cleanup:  bool,
 	/// Re-parsed `${ ;}` bodies ([`exec::NoforkUnits`]); not imaged.
 	pub nofork_units:       exec::NoforkUnits,
 	/// The functions each zsh word code digest (`.zwc`) holds, by path,
@@ -617,6 +621,7 @@ impl Kernel {
 			start_ns: 0,
 			startup: Vec::new(),
 			pseudo_traps: exec::PseudoTraps::default(),
+			top_level_cleanup: false,
 			nofork_units: HashMap::new(),
 			zsh_dumps: parking_lot::Mutex::new(HashMap::new()),
 			spare_tree: crate::bash::syntax::Tree::default(),
