@@ -28,8 +28,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { getConfigRootDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
-import { paddedTranscript, raceAfterFirstChunk, STILL } from "../session/chunked-read-race";
-import { LEASE_BACKENDS, openLeaseDb } from "../session/sql-session-lease-fixture";
+import { paddedTranscript, raceAfterFirstChunk } from "../session/chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb, STILL } from "../session/sql-session-lease-fixture";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const originalXdgStateHome = process.env.XDG_STATE_HOME;

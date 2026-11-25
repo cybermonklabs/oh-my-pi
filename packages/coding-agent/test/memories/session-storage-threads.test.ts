@@ -22,8 +22,8 @@ import {
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { parseJsonlLenient, TempDir } from "@oh-my-pi/pi-utils";
 import { MemoryBackend } from "../helpers/memory-session-backend";
-import { raceAfterFirstChunk, STILL } from "../session/chunked-read-race";
-import { LEASE_BACKENDS, openLeaseDb } from "../session/sql-session-lease-fixture";
+import { raceAfterFirstChunk } from "../session/chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb, STILL } from "../session/sql-session-lease-fixture";
 
 const previous = defaultSessionStorage();
 const clients: SQL[] = [];

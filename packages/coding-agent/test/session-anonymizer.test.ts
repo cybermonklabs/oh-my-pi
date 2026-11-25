@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { stringifyJsonIteratively } from "@oh-my-pi/pi-utils";
 import { anonymizeSessionTranscripts, SessionAnonymizer } from "../src/session/session-anonymizer";
 import type { SessionEntry } from "../src/session/session-entries";
+import { DEEP_LEVELS, nestedChain } from "../../ai/test/helpers/deep-nesting";
 
 const SECRET_WORDS = ["acme", "hunter2", "invoiceParser", "Probe", "alice", "launch codes"];
 
@@ -563,10 +564,10 @@ describe("SessionAnonymizer", () => {
 	});
 });
 
-/** Levels past what `JSON.stringify` (Bun's stops at 40,000) and a recursive walk reach; a transcript line holds 400,000. */
-const DEEP_LEVELS = 50_000;
-
-/** `bottom` wrapped {@link DEEP_LEVELS} times by `wrap`. */
+/**
+ * `bottom` wrapped {@link DEEP_LEVELS} times by `wrap`: a chain of another key
+ * than `next`, or of arrays, around any bottom, which `nestedChain` does not build.
+ */
 function nest(bottom: unknown, wrap: (inner: unknown) => unknown): unknown {
 	let node = bottom;
 	for (let level = 0; level < DEEP_LEVELS; level++) node = wrap(node);
@@ -608,7 +609,7 @@ describe("anonymizing records nested deeper than a recursive walk reaches", () =
 					toolCallId: "call-1",
 					toolName: "mcp__crm_lookup",
 					content: [{ type: "text", text: "found" }],
-					details: nest({ customer: "acme" }, inner => ({ next: inner })),
+					details: nestedChain({ customer: "acme" }),
 					isError: false,
 					timestamp: 1,
 				},

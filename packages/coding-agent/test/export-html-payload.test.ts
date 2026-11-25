@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { stringifyJsonIteratively } from "@oh-my-pi/pi-utils";
 import { writeBase64Json } from "../src/export/html/payload";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 
 /**
  * Contract: the streamed `#session-data` payload decodes exactly like the
@@ -38,8 +39,7 @@ describe("writeBase64Json", () => {
 
 	// A tool returns any JSON, and a transcript line holds it as deep as `JSON.parse` reads (400,000 levels).
 	test("writes an entry nested 50,000 levels, past where JSON.stringify stops", async () => {
-		let details: unknown = { leaf: "bottom" };
-		for (let level = 0; level < 50_000; level++) details = { next: details };
+		const details = nestedChain({ leaf: "bottom" });
 		const deep = { header: null, entries: [{ id: "1", message: { role: "toolResult", details } }], leafId: "1" };
 		expect(await streamed(deep)).toBe(Buffer.from(stringifyJsonIteratively(deep)!).toBase64());
 	}, 20_000);

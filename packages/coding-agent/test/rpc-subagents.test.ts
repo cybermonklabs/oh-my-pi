@@ -23,8 +23,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
-import { STILL } from "./session/chunked-read-race";
-import { LEASE_BACKENDS, openLeaseDb } from "./session/sql-session-lease-fixture";
+import { LEASE_BACKENDS, openLeaseDb, STILL } from "./session/sql-session-lease-fixture";
 
 const tempPaths: string[] = [];
 

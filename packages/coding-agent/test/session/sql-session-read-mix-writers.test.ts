@@ -19,10 +19,9 @@ import {
 	RACED_SESSION_ID,
 	raceAfterFirstChunk,
 	sharedPadBody,
-	STILL,
 	startedByOlderWriter,
 } from "./chunked-read-race";
-import { type LeaseDb, openLeaseDb } from "./sql-session-lease-fixture";
+import { type LeaseDb, openLeaseDb, STILL } from "./sql-session-lease-fixture";
 
 const ID = RACED_SESSION_ID;
 

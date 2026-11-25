@@ -11,11 +11,9 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { LEASE_BACKENDS, type LeaseDb, openLeaseDb, transcript } from "./sql-session-lease-fixture";
+import { LEASE_BACKENDS, type LeaseDb, openLeaseDb, STILL, transcript } from "./sql-session-lease-fixture";
 
 const ID = "01a1f000-0000-7000-8000-0000000000d1";
-/** Timings under which no heartbeat runs during a case. */
-const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 const MiB = 1024 * 1024;
 const TIMESTAMP = "2026-11-17T00:00:00.000Z";
 

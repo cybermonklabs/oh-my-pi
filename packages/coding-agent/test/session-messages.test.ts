@@ -10,6 +10,7 @@ import {
 	wrapSteeringForModel,
 } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 
 function expectAttribution(message: Message | undefined, expected: "user" | "agent" | undefined): void {
 	expect(message).toBeDefined();
@@ -473,11 +474,9 @@ describe("wrapSteeringForModel", () => {
 // and a transcript line holds them as deep as `JSON.parse` reads.
 describe("didSessionMessagesChange", () => {
 	const assistant = (leaf: string): AgentMessage => {
-		let deep: Record<string, unknown> = { leaf };
-		for (let level = 0; level < 50_000; level++) deep = { next: deep };
 		return {
 			role: "assistant",
-			content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: deep }],
+			content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: nestedChain({ leaf }) }],
 			api: "anthropic-messages",
 			provider: "anthropic",
 			model: "claude-sonnet-4-5",

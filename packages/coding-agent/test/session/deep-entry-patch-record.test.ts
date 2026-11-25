@@ -1,33 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { isRecord, stringifyJsonIteratively, TempDir } from "@oh-my-pi/pi-utils";
+import { stringifyJsonIteratively, TempDir } from "@oh-my-pi/pi-utils";
+import { DEEP_LEVELS, nestedChain, nestingOf } from "../../../ai/test/helpers/deep-nesting";
 import { runAnonymizeCommand } from "../../src/cli/anonymize-cli";
 import { ENTRY_PATCH_CUSTOM_TYPE } from "../../src/session/entry-patches";
 import { CURRENT_SESSION_VERSION, type SessionEntry } from "../../src/session/session-entries";
 import { SessionManager } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 
-/** Levels past what a recursive copy (about 22,500) and `JSON.stringify` (40,000) reach; a transcript line holds 400,000. */
-const DEEP_LEVELS = 50_000;
 const TIMESTAMP = "2026-01-01T00:00:00.000Z";
-
-/** `{ next: … }` nested {@link DEEP_LEVELS} levels around `{ leaf: "bottom" }`. */
-function deepArguments(): Record<string, unknown> {
-	let node: Record<string, unknown> = { leaf: "bottom" };
-	for (let level = 0; level < DEEP_LEVELS; level++) node = { next: node };
-	return node;
-}
-
-/** How many `next` levels `value` nests, and the value at the bottom. */
-function nestingOf(value: unknown): { levels: number; bottom: unknown } {
-	let levels = 0;
-	let node = value;
-	while (isRecord(node) && "next" in node) {
-		node = node.next;
-		levels++;
-	}
-	return { levels, bottom: node };
-}
 
 /** The arguments of the tool call `entry`, an assistant message entry, holds. */
 function toolCallArguments(entry: SessionEntry | undefined): unknown {
@@ -54,7 +35,7 @@ const usage = {
 async function writeSession(dir: string): Promise<string> {
 	const content = [
 		{ type: "text", text: "[elided]" },
-		{ type: "toolCall", id: "call-1", name: "inspect", arguments: deepArguments() },
+		{ type: "toolCall", id: "call-1", name: "inspect", arguments: nestedChain() },
 	];
 	const lines: unknown[] = [
 		{ type: "session", version: CURRENT_SESSION_VERSION, id: path.basename(dir), timestamp: TIMESTAMP, cwd: dir },

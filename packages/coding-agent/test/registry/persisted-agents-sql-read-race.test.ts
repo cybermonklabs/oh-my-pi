@@ -14,8 +14,8 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
-import { line, MiB, raceAfterFirstChunk, STILL, TIMESTAMP } from "../session/chunked-read-race";
-import { LEASE_BACKENDS, type LeaseDb, openLeaseDb } from "../session/sql-session-lease-fixture";
+import { line, MiB, raceAfterFirstChunk, TIMESTAMP } from "../session/chunked-read-race";
+import { LEASE_BACKENDS, type LeaseDb, openLeaseDb, STILL } from "../session/sql-session-lease-fixture";
 
 const ID = "01a1f000-0000-7000-8000-0000000000a1";
 

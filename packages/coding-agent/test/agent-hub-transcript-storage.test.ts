@@ -21,8 +21,7 @@ import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session
 import { type AgentTranscriptSource, AgentTranscriptViewer } from "@oh-my-pi/pi-tui/overlays/agent-transcript-viewer";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { STILL } from "./session/chunked-read-race";
-import { LEASE_BACKENDS, openLeaseDb } from "./session/sql-session-lease-fixture";
+import { LEASE_BACKENDS, openLeaseDb, STILL } from "./session/sql-session-lease-fixture";
 
 const TS = "2026-11-02T00:00:00.000Z";
 const AGENT_ID = "Worker";

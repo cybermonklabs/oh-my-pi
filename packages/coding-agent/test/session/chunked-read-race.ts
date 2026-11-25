@@ -19,12 +19,10 @@ import type {
 	SqlSessionStorageResult,
 	SqlSessionStorageTransaction,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { type LeaseDb, reserveWrapped, transcript } from "./sql-session-lease-fixture";
+import { type LeaseDb, reserveWrapped, STILL, transcript } from "./sql-session-lease-fixture";
 
 export const MiB = 1024 * 1024;
 export const TIMESTAMP = "2026-11-18T00:00:00.000Z";
-/** Lease timings under which no heartbeat runs during a case. */
-export const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 
 /** `entry` as one JSONL line, its newline included. */
 export function line(entry: Record<string, unknown>): string {

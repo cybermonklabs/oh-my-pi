@@ -45,6 +45,7 @@ import {
 	type ReadableSpan,
 	SimpleSpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
+import { DEEP_LEVELS, nestedChain, nestingOf } from "../../ai/test/helpers/deep-nesting";
 import { createUserMessage } from "./helpers";
 
 const MOCK_IDENT = { id: "mock-model", provider: "mock-provider" } as const;
@@ -379,27 +380,14 @@ describe("agent-loop OTEL instrumentation", () => {
 	// A session's messages nest as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000, after
 	// 1.5 s or more on such a value, and content capture writes the whole history on every request.
 	it("captures full content of a tool call and result nested deeper than JSON.stringify recurses, never trying JSON.stringify on them", async () => {
-		const levels = 50_000;
-		const nested = (bottom: Record<string, unknown>): Record<string, unknown> => {
-			let node = bottom;
-			for (let level = 0; level < levels; level++) node = { next: node };
-			return node;
-		};
-		const nesting = (value: unknown): { levels: number; bottom: unknown } => {
-			let depth = 0;
-			let node = value as { next?: unknown };
-			while (node.next !== undefined) {
-				node = node.next as { next?: unknown };
-				depth++;
-			}
-			return { levels: depth, bottom: node };
-		};
 		// The tool call and its result from an earlier turn: the next request sends both back.
 		const history: AgentMessage[] = [
 			createUserMessage("inspect it"),
 			{
 				role: "assistant",
-				content: [{ type: "toolCall", id: "tc-1", name: "inspect", arguments: { tree: nested({ leaf: "args" }) } }],
+				content: [
+					{ type: "toolCall", id: "tc-1", name: "inspect", arguments: { tree: nestedChain({ leaf: "args" }) } },
+				],
 				api: "openai-completions",
 				provider: MOCK_IDENT.provider,
 				model: MOCK_IDENT.id,
@@ -419,7 +407,7 @@ describe("agent-loop OTEL instrumentation", () => {
 				toolCallId: "tc-1",
 				toolName: "inspect",
 				content: [{ type: "text", text: "inspected" }],
-				details: nested({ leaf: "details" }),
+				details: nestedChain({ leaf: "details" }),
 				isError: false,
 				timestamp: 2,
 			},
@@ -452,10 +440,10 @@ describe("agent-loop OTEL instrumentation", () => {
 				tool: undefined,
 				toolName: "inspect",
 				toolCallId: "tc-2",
-				args: { tree: nested({ leaf: "args" }) },
+				args: { tree: nestedChain({ leaf: "args" }) },
 			});
 			finishExecuteToolSpan(telemetry, span, {
-				result: { content: [{ type: "text", text: "inspected" }], details: nested({ leaf: "details" }) },
+				result: { content: [{ type: "text", text: "inspected" }], details: nestedChain({ leaf: "details" }) },
 				isError: false,
 				toolCallId: "tc-2",
 				toolName: "inspect",
@@ -472,15 +460,15 @@ describe("agent-loop OTEL instrumentation", () => {
 			parts: Array<{ arguments?: { tree: unknown }; response?: { details: unknown } }>;
 		}>;
 		const sentCall = inputs.find(message => message.role === "assistant")?.parts[0];
-		expect(nesting(sentCall?.arguments?.tree)).toEqual({ levels, bottom: { leaf: "args" } });
+		expect(nestingOf(sentCall?.arguments?.tree)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "args" } });
 		const sentResult = inputs.find(message => message.role === "tool")?.parts[0];
-		expect(nesting(sentResult?.response?.details)).toEqual({ levels, bottom: { leaf: "details" } });
+		expect(nestingOf(sentResult?.response?.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "details" } });
 
 		const tool = findSpan(exporter.getFinishedSpans(), "execute_tool inspect");
 		const args = JSON.parse(tool?.attributes[GenAIAttr.ToolCallArguments] as string);
-		expect(nesting(args.tree)).toEqual({ levels, bottom: { leaf: "args" } });
+		expect(nestingOf(args.tree)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "args" } });
 		const result = JSON.parse(tool?.attributes[GenAIAttr.ToolCallResult] as string);
-		expect(nesting(result.details)).toEqual({ levels, bottom: { leaf: "details" } });
+		expect(nestingOf(result.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "details" } });
 	}, 30_000);
 
 	it("captures string systemPrompt without crashing when captureMessageContent is true", async () => {

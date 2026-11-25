@@ -17,8 +17,8 @@ import type { FileEntry } from "@oh-my-pi/pi-coding-agent/session/session-entrie
 import { visitEntriesFromFileStream } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionReadConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { padFills, paddedTranscript, raceAfterFirstChunk, STILL } from "./chunked-read-race";
-import { LEASE_BACKENDS, type LeaseDb, openLeaseDb } from "./sql-session-lease-fixture";
+import { padFills, paddedTranscript, raceAfterFirstChunk } from "./chunked-read-race";
+import { LEASE_BACKENDS, type LeaseDb, openLeaseDb, STILL } from "./sql-session-lease-fixture";
 
 const ID = "01a1f000-0000-7000-8000-0000000000f8";
 /**

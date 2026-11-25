@@ -20,8 +20,8 @@ import type {
 	SqlSessionStorageResult,
 	SqlSessionStorageTransaction,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { line, MiB, partRace, STILL, TIMESTAMP } from "./chunked-read-race";
-import { LEASE_BACKENDS, openLeaseDb, rejection, reserveWrapped } from "./sql-session-lease-fixture";
+import { line, MiB, partRace, TIMESTAMP } from "./chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb, rejection, reserveWrapped, STILL } from "./sql-session-lease-fixture";
 
 const ID = "01a1f000-0000-7000-8000-0000000000f1";
 const LOST_REPLY = "the connection closed before the commit's reply came back";

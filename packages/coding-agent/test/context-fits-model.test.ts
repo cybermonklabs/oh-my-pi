@@ -15,6 +15,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SessionMaintenance, type SessionMaintenanceHost } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 
 const active = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-6.1-sol");
 // Same encoding, another model: it gets the turns re-encoded without their reasoning.
@@ -203,8 +204,7 @@ describe("SessionMaintenance.contextFitsModel", () => {
 			},
 		});
 		sessionManager.appendMessage({ role: "user", content: "After compaction.", timestamp: 2 });
-		let deep: Record<string, unknown> = { leaf: "bottom" };
-		for (let level = 0; level < 50_000; level++) deep = { next: deep };
+		const deep = nestedChain({ leaf: "bottom" });
 		const failed: AssistantMessage = {
 			...codexTurn("", 5),
 			content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: deep }],

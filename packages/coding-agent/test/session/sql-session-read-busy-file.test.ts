@@ -10,8 +10,8 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { loadSessionFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionReadConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { appendLines, firstPrompt, padFills, paddedTranscript, STILL } from "./chunked-read-race";
-import { type LeaseDb, openLeaseDb, transcript, until } from "./sql-session-lease-fixture";
+import { appendLines, firstPrompt, padFills, paddedTranscript } from "./chunked-read-race";
+import { type LeaseDb, openLeaseDb, STILL, transcript, until } from "./sql-session-lease-fixture";
 
 /** The session the case loads, and the one the other process appends to meanwhile. */
 const LONG_ID = "01a1f000-0000-7000-8000-000000000081";

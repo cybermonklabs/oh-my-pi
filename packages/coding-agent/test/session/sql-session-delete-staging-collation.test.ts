@@ -19,12 +19,10 @@ import type {
 import { SQL } from "bun";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { type LeaseDb, openLeaseDb, reserveWrapped, transcript, until } from "./sql-session-lease-fixture";
+import { type LeaseDb, openLeaseDb, reserveWrapped, STILL, transcript, until } from "./sql-session-lease-fixture";
 
 const SERVER_URL = process.env.OMP_TEST_SQL_POSTGRES_URL;
 const ID = "01a1f000-0000-7000-8000-0000000000e2";
-/** Timings under which no heartbeat runs during a case; the test ages the lease itself. */
-const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 const PROCESS_SCRIPT = path.join(import.meta.dir, "sql-session-delete-staging-process.ts");
 const DATABASE = `omp_th_${process.pid}_${Date.now().toString(36)}`;
 

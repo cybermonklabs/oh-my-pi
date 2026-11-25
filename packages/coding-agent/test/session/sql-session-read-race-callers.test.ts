@@ -29,11 +29,10 @@ import {
 	RACED_SESSION_ID,
 	type Race,
 	raceAfterFirstChunk,
-	STILL,
 	sharedPadBody,
 	startedByOlderWriter,
 } from "./chunked-read-race";
-import { type LeaseDb, openLeaseDb } from "./sql-session-lease-fixture";
+import { type LeaseDb, openLeaseDb, STILL } from "./sql-session-lease-fixture";
 
 /** The body the session holds when a read starts, and the one the older release re-creates it as after the first chunk. */
 const BEFORE = sharedPadBody("first", "b");

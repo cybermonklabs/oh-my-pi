@@ -13,6 +13,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { clientBundlePlugins } from "../src/client-bundle";
 import { JsonBlock } from "../src/client/ui/JsonBlock";
+import { nestedChain, nestedChainJson } from "../../ai/test/helpers/deep-nesting";
 
 const originalGlobals = new Map<string, PropertyDescriptor | undefined>();
 let root: Root | null = null;
@@ -63,8 +64,7 @@ describe("JsonBlock", () => {
 		const shallow = { type: "message", message: { role: "user", content: [{ type: "text", text: "hi" }] } };
 		expect(await renderedJson(shallow)).toBe(JSON.stringify(shallow, null, 2));
 
-		let deep: unknown = { leaf: "bottom" };
-		for (let level = 0; level < 50_000; level++) deep = { next: deep };
+		const deep = nestedChain();
 		expect((await renderedJson(deep)) === stringifyJsonIteratively(deep)).toBe(true);
 	}, 20_000);
 });
@@ -88,7 +88,7 @@ describe("the dashboard's browser bundle", () => {
 		expect(printed.stderr.toString()).toBe("");
 		expect(JSON.parse(printed.stdout.toString())).toEqual({
 			boxed: '{"n":5,"b":true,"s":"x","plain":{"a":[1]}}',
-			deepLength: 50_000 * '{"next":}'.length + '{"leaf":"bottom"}'.length,
+			deepLength: nestedChainJson().length,
 		});
 	}, 20_000);
 });

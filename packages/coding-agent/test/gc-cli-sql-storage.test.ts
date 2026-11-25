@@ -22,8 +22,8 @@ import {
 	hashPath,
 } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
-import { paddedTranscript, raceAfterFirstChunk, STILL } from "./session/chunked-read-race";
-import { LEASE_BACKENDS, openLeaseDb } from "./session/sql-session-lease-fixture";
+import { paddedTranscript, raceAfterFirstChunk } from "./session/chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb, STILL } from "./session/sql-session-lease-fixture";
 
 let root: string;
 let client: SQL | undefined;

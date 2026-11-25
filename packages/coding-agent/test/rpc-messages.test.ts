@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { encodeRpcFrame, MAX_RPC_FRAME_BYTES } from "../src/modes/rpc/rpc-frame";
 import { pageRpcMessages, type RpcMessageSnapshot } from "../src/modes/rpc/rpc-messages";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 
 function message(index: number, bytes = 32 * 1024): AgentMessage {
 	return { role: "user", content: `${index}:${"x".repeat(bytes)}`, timestamp: index };
@@ -64,8 +65,7 @@ describe("RPC message pagination", () => {
 
 	// A tool result's details nest as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000.
 	it("pages past a message nested deeper than JSON.stringify recurses, counting its bytes", () => {
-		let details: unknown = { leaf: "bottom" };
-		for (let level = 0; level < 50_000; level++) details = { next: details };
+		const details = nestedChain({ leaf: "bottom" });
 		const deep: AgentMessage = {
 			role: "toolResult",
 			toolCallId: "call-1",

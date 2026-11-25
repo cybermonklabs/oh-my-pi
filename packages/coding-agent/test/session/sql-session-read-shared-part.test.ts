@@ -17,8 +17,8 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { SessionReadConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { MiB, paddedTranscript, raceAfterFirstChunk, STILL } from "./chunked-read-race";
-import { LEASE_BACKENDS, openLeaseDb } from "./sql-session-lease-fixture";
+import { MiB, paddedTranscript, raceAfterFirstChunk } from "./chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb, STILL } from "./sql-session-lease-fixture";
 
 const ID = "01a1f000-0000-7000-8000-0000000000f7";
 const MYSQL_URL = LEASE_BACKENDS.find(backend => backend.adapter === "mysql")?.url;

@@ -4,6 +4,7 @@ import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { withEnv } from "./helpers";
+import { nestedChain } from "./helpers/deep-nesting";
 
 const BINDING_BETA = "thinking-binding-controls-2026-08-01";
 const CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27";
@@ -211,8 +212,7 @@ describe("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", () => {
 	// A frozen request replays the conversation, whose tool calls' arguments are any JSON. 30,000 levels: the client
 	// writes the request body with `JSON.stringify`, which stops at 40,000 (anthropic-client.ts, outside this change).
 	it("redeems a frozen fallback-credit request whose tool arguments nest 30,000 levels", async () => {
-		let input: Record<string, unknown> = { leaf: "bottom" };
-		for (let level = 0; level < 30_000; level++) input = { next: input };
+		const input = nestedChain({ leaf: "bottom" }, 30_000);
 		await withEnv({ ...GATEWAY_ENV, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1" }, async () => {
 			const request = await captureRequest(anthropicModel(), {
 				fallbackCreditRedemption: {

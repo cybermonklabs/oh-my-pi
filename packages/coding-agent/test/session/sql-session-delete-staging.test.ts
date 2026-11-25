@@ -20,13 +20,12 @@ import {
 	LEASE_BACKENDS,
 	type LeaseDb,
 	openLeaseDb,
+	STILL,
 	transcript,
 	until,
 } from "./sql-session-lease-fixture";
 
 const ID = "01a1f000-0000-7000-8000-0000000000e1";
-/** Timings under which no heartbeat runs during a case; the test ages the lease itself. */
-const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 const PROCESS_SCRIPT = path.join(import.meta.dir, "sql-session-delete-staging-process.ts");
 const MYSQL_URL = LEASE_BACKENDS.find(backend => backend.adapter === "mysql")?.url;
 

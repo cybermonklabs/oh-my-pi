@@ -5,6 +5,7 @@ import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction/messa
 import type { AgentContext, AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import type { Message, Tool, ToolExample } from "@oh-my-pi/pi-ai";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { nestedChain, nestingOf } from "../../ai/test/helpers/deep-nesting";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -908,11 +909,10 @@ describe("syncMessages detects tool_calls mutation", () => {
 // request digests every synced message.
 describe("syncMessages over a tool call nested 50,000 levels", () => {
 	it("keeps a stable message stable and sees a change at its bottom", () => {
-		const call = (leaf: string) => {
-			let deep: Record<string, unknown> = { leaf };
-			for (let level = 0; level < 50_000; level++) deep = { next: deep };
-			return { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: deep }] };
-		};
+		const call = (leaf: string) => ({
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: nestedChain({ leaf }) }],
+		});
 		const mgr = new AppendOnlyContextManager();
 		mgr.build(makeContext(), BUILD_OPTS);
 		const first = call("a");
@@ -925,8 +925,7 @@ describe("syncMessages over a tool call nested 50,000 levels", () => {
 		mgr.syncMessages([{ role: "user", content: "q1" }, call("b"), { role: "user", content: "q2" }]);
 		const synced = mgr.log.toMessages() as unknown as Array<{ content: unknown }>;
 		expect(synced).toHaveLength(3);
-		let node: unknown = (synced[1]!.content as Array<{ arguments: unknown }>)[0]!.arguments;
-		while (typeof node === "object" && node !== null && "next" in node) node = node.next;
-		expect(node).toEqual({ leaf: "b" });
+		const { bottom } = nestingOf((synced[1]!.content as Array<{ arguments: unknown }>)[0]!.arguments);
+		expect(bottom).toEqual({ leaf: "b" });
 	}, 30_000);
 });
