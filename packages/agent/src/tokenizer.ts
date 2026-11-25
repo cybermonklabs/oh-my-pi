@@ -9,6 +9,7 @@ import {
 	replaysNativeResponsesTurn,
 } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import {
+	dropsForeignThinking,
 	dropsForeignReasoningPayload,
 	isSameModelTurn,
 	shouldDropTruncatedThinkingOnlyAssistant,
@@ -225,6 +226,8 @@ export class Tokenizer {
 	readonly #readsDeploymentSignatures: boolean;
 	/** Factory's Gemini generate wire, whose replay pass keeps only Google-origin reasoning. */
 	readonly #factoryGeminiWire: boolean;
+	/** The reader {@link dropsForeignThinking} judges another model's thinking for. */
+	readonly #thinkingReader: Parameters<typeof dropsForeignThinking>[1] | undefined;
 	readonly reasoningReplayKey: string;
 	/** How the reader bills replayed signed thinking (catalog `thinking-replay-tokens`). */
 	readonly thinkingReplayTokens: ThinkingReplayTokens;
@@ -271,6 +274,18 @@ export class Tokenizer {
 			model?.api === "factory-droid-agent" &&
 			model.id !== undefined &&
 			isFactoryDroidGeminiWire({ id: model.id, requestModelId: model.requestModelId });
+		this.#thinkingReader =
+			model?.api && model.provider && model.id
+				? {
+						api: model.api,
+						provider: model.provider,
+						id: model.id,
+						reasoning: model.reasoning === true,
+						requestModelId: model.requestModelId,
+						thinking: model.thinking,
+						compat: model.compat,
+					}
+				: undefined;
 		this.reasoningReplayKey = reasoningReplayKey(model);
 		this.thinkingReplayTokens = resolveThinkingReplayTokens(model ?? {});
 		this.nativeHistoryReplay = options?.nativeHistoryReplay ?? true;
@@ -456,6 +471,7 @@ export class Tokenizer {
 					completionsReader !== undefined && isSameModelTurn(message, completionsReader);
 				if (typeof replayedReasoning === "number") extra += replayedReasoning;
 				const signaturesPriced = this.thinkingReplayTokens === "signature";
+				const thinkingReader = this.#thinkingReader;
 				// The replay's signature rule (`transformMessages`): an aborted or
 				// errored turn's final block can hold a partial signature, and a turn
 				// whose tool calls ended without a tool-use stop is abandoned, so all
@@ -480,6 +496,12 @@ export class Tokenizer {
 					if (block.type === "text") {
 						fragments.push(block.text);
 					} else if (block.type === "thinking") {
+						// The request carries none of another model's thinking that this
+						// reader would read as text: the rule `transformMessages` applies,
+						// on the signature it keeps (stripped from an untrusted block).
+						const signed =
+							Boolean(block.thinkingSignature?.trim()) && !abandonedToolUse && index !== untrustedIndex;
+						if (thinkingReader && dropsForeignThinking(message, thinkingReader, signed)) continue;
 						// `transformMessages` drops another model's empty thinking and demotes the
 						// rest to visible text; only the reader's own thinking stays native.
 						if (ollamaReader && !ownOllamaTurn) {
@@ -511,6 +533,7 @@ export class Tokenizer {
 						fragments.push(block.name);
 						fragments.push(stringifyJson(block.arguments) ?? "null");
 					} else if (block.type === "redactedThinking") {
+						if (thinkingReader && dropsForeignThinking(message, thinkingReader, true)) continue;
 						// Encrypted reasoning blob the provider still bills for wherever it
 						// survives replay, as above; excluded from the compaction floor for
 						// the same reason.

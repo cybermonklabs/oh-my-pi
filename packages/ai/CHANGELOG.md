@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Claude refusing requests (`reasoning_extraction`) after a session moved to another model and back: Claude models no longer receive another model's thinking as plain assistant text. That model's replies and tool calls are still sent, another Claude model's thinking signed on the same Anthropic deployment still replays natively, and Claude's own thinking replays as before. The rule (`dropsForeignThinking`) follows the `classifier-cot-extraction` catalog axis.
+
 ## [18.18.4] - 2026-11-09
 
 ### Added

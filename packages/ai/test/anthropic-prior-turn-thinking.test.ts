@@ -1,5 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import { renderDemotedThinking } from "@oh-my-pi/pi-ai/dialect";
 import { convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type {
 	AssistantMessage,
@@ -217,11 +216,11 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 		expect(redacted?.data).toBe("encrypted-blob");
 	});
 
-	it("strips foreign signatures and drops redacted_thinking when the target is official Anthropic", () => {
+	it("drops foreign thinking and its redacted_thinking when the target is official Anthropic", () => {
 		// 3p → official Anthropic. The official endpoint rejects foreign
-		// signatures cryptographically, and `replayUnsignedThinking: false`
-		// demotes the unsigned visible thinking to text downstream, so the
-		// matching redacted sibling must not remain as a lone native
+		// signatures cryptographically, and Claude refuses another model's
+		// reasoning written as text, so the unsigned visible thinking is dropped
+		// and the matching redacted sibling must not remain as a lone native
 		// redacted_thinking block.
 		const target = makeAnthropicModel({
 			provider: "anthropic",
@@ -256,8 +255,8 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 		const params = convertAnthropicMessages(messages, target, false);
 		const assistants = params.filter(p => p.role === "assistant");
 		const priorBlocks = assistants[0].content as WireBlock[];
-		const text = priorBlocks.find(b => b.type === "text") as WireTextBlock | undefined;
-		expect(text?.text).toBe(renderDemotedThinking(target.id, "visible reasoning"));
+		expect(JSON.stringify(priorBlocks)).not.toContain("visible reasoning");
+		expect(priorBlocks.find(b => b.type === "tool_use")).toBeDefined();
 		expect(priorBlocks.find(b => b.type === "thinking")).toBeUndefined();
 		expect(priorBlocks.find(b => b.type === "redacted_thinking")).toBeUndefined();
 	});
@@ -636,11 +635,11 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 		const thinking = priorBlocks.find(b => b.type === "thinking") as WireThinkingBlock | undefined;
 		// Signature-only replay is unsafe on a signing target with a stale
 		// (cross-model) source signature — that's the whole 400 failure class.
-		// The transform strips the signature (so `signingEndpoint` demotes the
-		// unsigned block to text) and no stale `sig_prior` reaches the wire.
+		// The transform strips the signature, and the unsigned block of another
+		// model is dropped rather than written as text for a Claude target.
 		expect(thinking).toBeUndefined();
-		const text = priorBlocks.find(b => b.type === "text") as WireTextBlock | undefined;
-		expect(text?.text).toContain("prior reasoning");
+		expect(JSON.stringify(priorBlocks)).not.toContain("prior reasoning");
+		expect(priorBlocks.find(b => b.type === "tool_use")).toBeDefined();
 		const wireBlobs = JSON.stringify(priorBlocks);
 		expect(wireBlobs).not.toContain("sig_prior");
 	});
@@ -678,8 +677,8 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 		const priorBlocks = assistants[0].content as WireBlock[];
 		const thinking = priorBlocks.find(b => b.type === "thinking") as WireThinkingBlock | undefined;
 		expect(thinking).toBeUndefined();
-		const text = priorBlocks.find(b => b.type === "text") as WireTextBlock | undefined;
-		expect(text?.text).toContain("sonnet reasoning");
+		expect(JSON.stringify(priorBlocks)).not.toContain("sonnet reasoning");
+		expect(priorBlocks.find(b => b.type === "tool_use")).toBeDefined();
 		const wireBlobs = JSON.stringify(priorBlocks);
 		expect(wireBlobs).not.toContain("sig_sonnet");
 	});
@@ -731,10 +730,10 @@ describe("Latest-turn foreign thinking signatures (model switch mid tool-loop)",
 		// verify, and official Anthropic never replays unsigned thinking.
 		expect(blocks.find(b => b.type === "thinking")).toBeUndefined();
 		expect(JSON.stringify(blocks)).not.toContain(KIMI_SIG);
-		// The reasoning survives as demoted text ahead of the visible text.
+		// The reasoning is dropped; the visible text stays.
 		const texts = blocks.filter(b => b.type === "text") as WireTextBlock[];
-		expect(texts[0]?.text).toBe(renderDemotedThinking(target.id, reasoning));
-		expect(texts.some(t => t.text.includes("렌더링"))).toBe(true);
+		expect(texts.map(t => t.text)).toEqual(["한 군데 렌더링 닛: 빈 줄 하나 추가."]);
+		expect(JSON.stringify(blocks)).not.toContain(reasoning);
 		// The pending tool loop stays intact.
 		const toolUse = blocks.find(b => b.type === "tool_use") as WireToolUseBlock | undefined;
 		expect(toolUse?.id).toBe("toolu_send");
@@ -786,8 +785,8 @@ describe("Latest-turn foreign thinking signatures (model switch mid tool-loop)",
 		const blocks = assistants[0].content as WireBlock[];
 		expect(blocks.find(b => b.type === "thinking")).toBeUndefined();
 		expect(JSON.stringify(blocks)).not.toContain(KIMI_SIG);
-		const text = blocks.find(b => b.type === "text") as WireTextBlock | undefined;
-		expect(text?.text).toBe(renderDemotedThinking(target.id, reasoning));
+		expect(JSON.stringify(blocks)).not.toContain(reasoning);
+		expect(blocks.find(b => b.type === "tool_use")).toBeDefined();
 	});
 
 	it("keeps the latest ABANDONED same-model turn untouched (byte-for-byte rule)", () => {

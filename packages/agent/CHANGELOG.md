@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the context estimate for a Claude model counting another model's thinking that the request leaves out: the tokenizer now follows `dropsForeignThinking`, the rule the request applies.
+
 ## [18.18.2] - 2026-11-08
 
 ### Added
