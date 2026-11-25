@@ -698,6 +698,35 @@ describe("pickElectronTarget", () => {
 		},
 	);
 
+	test.skipIf(process.platform !== "linux")("adopts no profile lock that names another host", async () => {
+		await withLockedProfile({}, async ({ launcher, profile, pid, port }) => {
+			const appArgs = [`--user-data-dir=${profile}`];
+			// Control: the lock as the browser wrote it is adopted.
+			expect(await findReusableCdp(launcher, { appArgs })).toEqual({ cdpUrl: `http://127.0.0.1:${port}`, pid });
+			// The same pid on another host is another process.
+			const lockPath = path.join(profile, "SingletonLock");
+			await fs.rm(lockPath);
+			await fs.symlink(`not-${os.hostname()}-${pid}`, lockPath);
+			expect(await findReusableCdp(launcher, { appArgs })).toBeNull();
+		});
+	});
+
+	test.skipIf(process.platform !== "linux")(
+		"takes no browser on another profile for the owner of a stale lock",
+		async () => {
+			// A stale lock's pid can belong by now to a browser of another name on another profile: that browser
+			// holds nothing the caller asked for, so the call returns null rather than refusing it as the holder.
+			await withLockedProfile({ name: "brave" }, async ({ launcher, profile, pid }) => {
+				const other = path.join(path.dirname(profile), "other");
+				await fs.mkdir(other);
+				await fs.symlink(`${os.hostname()}-${pid}`, path.join(other, "SingletonLock"));
+				// Control: the browser runs, on the first profile.
+				expect((await fs.readFile(`/proc/${pid}/cmdline`, "utf8")).includes(`--user-data-dir=${profile}`)).toBe(true);
+				expect(await findReusableCdp(launcher, { appArgs: [`--user-data-dir=${other}`] })).toBeNull();
+			});
+		},
+	);
+
 	test.skipIf(!CHROMIUM_AVAILABLE)(
 		"keeps profile tabs isolated and never kills a borrowed Chrome on close",
 		async () => {
