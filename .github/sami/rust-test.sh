@@ -18,7 +18,8 @@
 #     args, or a skip this script passes, took it out), unless
 #     .github/sami/rust-test-sanctioned-skips.txt names it;
 #   - an #[ignore]d test runs nowhere: each one is run alone with --ignored
-#     (.github/sami/rust-test-ignored.txt, a Bazel target or a cargo one, or
+#     (.github/sami/rust-test-ignored.txt, a Bazel target or a cargo one; a
+#     Bazel one whose reason starts `opt: ` in a -c opt build; or
 #     as root .github/sami/rust-test-ignored-root.txt), or is a child
 #     process's entry point that another test starts
 #     (.github/sami/rust-test-child-entries.txt), or runs in the macOS job
@@ -140,6 +141,14 @@ libtest_event='def libtest_event:
 entries() {
 	list_entries "$sami/$1" "$2" >"$tmp/$3" || stop "$sami/$1 has a malformed line (above)"
 }
+# marked <list> <marker>: `<first>\t<second>` of each line of .github/sami/<list>
+# whose why starts with <marker> (`flaky: `, `opt: `), sorted.
+marked() {
+	awk -v m="$2" '/^[[:space:]]*(#|$)/ { next }
+		{ i = index($0, " "); first = substr($0, 1, i - 1); rest = substr($0, i + 1)
+		  j = index(rest, "  "); why = substr(rest, j); sub(/^ +/, "", why)
+		  if (index(why, m) == 1) print first "\t" substr(rest, 1, j - 1) }' "$sami/$1" | LC_ALL=C sort -u
+}
 entries rust-test-known-failures.txt 2 known-failures.tsv
 # Flaky entries: a known-failure line whose reason starts with `flaky: `.
 # Bazel runs each such target up to 3 times (--flaky_test_attempts, on the
@@ -149,10 +158,7 @@ entries rust-test-known-failures.txt 2 known-failures.tsv
 # is KNOWN; failed on every attempt is NEW; passed on the first is a pass,
 # with a notice. A test with a plain known-failure line, or none, is judged
 # as before, on every attempt it failed.
-awk '/^[[:space:]]*(#|$)/ { next }
-	{ i = index($0, " "); first = substr($0, 1, i - 1); rest = substr($0, i + 1)
-	  j = index(rest, "  "); why = substr(rest, j); sub(/^ +/, "", why)
-	  if (why ~ /^flaky: /) print first "\t" substr(rest, 1, j - 1) }' "$sami/rust-test-known-failures.txt" | LC_ALL=C sort -u >"$tmp/flaky.tsv"
+marked rust-test-known-failures.txt 'flaky: ' >"$tmp/flaky.tsv"
 # label_regex <label>: a regex that matches exactly the label. A comma
 # would split Bazel's filter list; no label of this repository has one.
 label_regex() {
@@ -242,12 +248,26 @@ sticky_word=refused_in_a_sticky_directory
 skip_flags+=(--test_arg=--skip --test_arg="$sticky_word")
 # .github/sami/rust-test-ignored.txt names Bazel targets (`//…`) and cargo
 # ones (`<directory>:<kind>:<name>`, as the cargo branch below labels them).
+# A Bazel one whose reason starts `opt: ` runs in a -c opt build (below).
+marked rust-test-ignored.txt 'opt: ' >"$tmp/ignored-opt.tsv"
 ignored_run=()
+ignored_opt=()
 ignored_cargo=()
 while IFS=$'\t' read -r target name; do
 	case "$target" in
-		//*) ignored_run+=("$target"$'\t'"$name") ;;
-		*) ignored_cargo+=("$target"$'\t'"$name") ;;
+		//*)
+			if grep -qxF -- "$target"$'\t'"$name" "$tmp/ignored-opt.tsv"; then
+				ignored_opt+=("$target"$'\t'"$name")
+			else
+				ignored_run+=("$target"$'\t'"$name")
+			fi
+			;;
+		*)
+			if grep -qxF -- "$target"$'\t'"$name" "$tmp/ignored-opt.tsv"; then
+				stop "$sami/rust-test-ignored.txt: $target $name is a cargo target, and \`opt: \` (a -c opt build) is for a Bazel one"
+			fi
+			ignored_cargo+=("$target"$'\t'"$name")
+			;;
 	esac
 done <"$tmp/ignored-run.tsv"
 ignored_root=()
@@ -308,9 +328,9 @@ bep_rows() {
 # The rows of every log, one per line, tab-separated: target, rule, status,
 # kind (passed, failed or none), the log's copy, the test binary beside the
 # original log (bin/ for testlogs/), and the invocation (main, root, own-<n>,
-# ignored-<n>, ignored-root-<n>, sticky-user-<n>, sticky-root-<n>, only-<n>,
-# cargo or ignored-cargo-<n>). An empty field is `-`: bash's read joins
-# adjacent tabs.
+# ignored-<n>, ignored-root-<n>, sticky-user-<n>, sticky-root-<n>,
+# root-alone-<n>, ignored-opt-<n>, only-<n>, cargo or ignored-cargo-<n>). An
+# empty field is `-`: bash's read joins adjacent tabs.
 rows="$tmp/rows.tsv"
 : >"$tmp/unbuilt.txt"
 : >"$tmp/present.txt"
@@ -396,6 +416,22 @@ collect() {
 		fi
 		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$rule" "$status" "$kind" "$copy" "$bin" "$inv" >>"$rows"
 	done <"$tmp/bep-rows.tsv"
+}
+
+# bep_seconds <event log> [<test target>]: from a build event log, Bazel's
+# wall time of the invocation (its `Elapsed time`) in seconds, or with a
+# target the run of its test (the test summary's totalRunDuration); UNKNOWN
+# where the log holds neither as a finite number of 0 or more (jq 1.6 reads
+# "NaN" as a number, which awk would print as 0.0). A figure for the job
+# log: it changes no verdict.
+bep_seconds() {
+	local s=""
+	if [ "$#" = 1 ]; then
+		s="$(jq -r 'select(.id.buildMetrics) | .buildMetrics.timingMetrics.wallTimeInMs // empty | tonumber / 1000 | select(. >= 0 and . < 1e9)' "$1" 2>/dev/null | sed -n 1p)" || s=""
+	else
+		s="$(jq -r --arg t "$2" 'select(.id.testSummary.label == $t) | .testSummary.totalRunDuration // empty | rtrimstr("s") | tonumber | select(. >= 0 and . < 1e9)' "$1" 2>/dev/null | sed -n 1p)" || s=""
+	fi
+	if [ -n "$s" ]; then LC_ALL=C awk -v s="$s" 'BEGIN { printf "%.1f", s }'; else printf 'UNKNOWN'; fi
 }
 
 # bazel_test <invocation> <run_under> <arguments>...: one bazel test, its
@@ -541,6 +577,35 @@ if [ -z "$only" ]; then
 		absent_entry "Root test" "$sami/rust-test-root-alone.txt" "$target" "$name" && continue
 		bazel_test "root-alone-$i" "$root_under" --strategy=TestRunner=local --test_tmpdir="$RUST_TEST_TMPDIR/bazel-root-alone" --test_arg=--exact --test_arg="$name" -- "$target"
 	done
+	# Each #[ignore]d test whose reason in rust-test-ignored.txt starts
+	# `opt: `, alone, as the ignored tests above, in a -c opt build of its
+	# target. pi-ast's whole-repository sweep, which upstream runs by hand in
+	# release builds, took 1,033.6 s of run 45516812533 in fastbuild; its
+	# verdict is two assert!s, the same in either build. Last, since Bazel
+	# discards its analysis cache when the compilation mode changes, so no
+	# invocation after it analyzes again. bazel build first, with the test's
+	# flags (bazel build takes test options too), so that the job log gives
+	# the build and the test their own seconds (Bazel's wall time of each
+	# invocation, from its event log); the bazel test after it builds
+	# nothing. A build failure (exit 1) is the bazel test's to report, as for
+	# any target.
+	for i in "${!ignored_opt[@]}"; do
+		IFS=$'\t' read -r target name <<<"${ignored_opt[$i]}"
+		absent_entry "Ignored test in a -c opt build" "$sami/rust-test-ignored.txt" "$target" "$name" && continue
+		opt_flags=(--compilation_mode=opt --strategy=TestRunner=local --test_timeout=1200 --test_arg=--ignored --test_arg=--exact --test_arg="$name")
+		build_bep="$tmp/bep-ignored-opt-$i-build.json"
+		build_code=0
+		bazelisk --bazelrc="$OMP_BAZEL_RC" build --keep_going "${env_flags[@]}" --run_under="$tmpdir_under" "${json_flags[@]}" --build_event_json_file="$build_bep" "${opt_flags[@]}" -- "$target" || build_code=$?
+		case "$build_code" in
+			0 | 1) ;;
+			*)
+				echo "::error title=Rust tests::bazel build exited $build_code (ignored-opt-$i), which is neither a success nor a build failure"
+				exit "$build_code"
+				;;
+		esac
+		bazel_test "ignored-opt-$i" "$tmpdir_under" "${opt_flags[@]}" -- "$target"
+		echo "Ignored test in a -c opt build: $target $name: compilation mode opt; build $(bep_seconds "$build_bep") s (bazel build, exit $build_code), test $(bep_seconds "$tmp/bep-ignored-opt-$i.json") s (bazel test; the test binary's run $(bep_seconds "$tmp/bep-ignored-opt-$i.json" "$target") s)"
+	done
 else
 	# Only the listed tests, and the canary: each target once, with libtest's
 	# --exact filters for its names.
@@ -589,6 +654,10 @@ if [ -z "$only" ]; then
 	for i in "${!ignored_run[@]}"; do
 		IFS=$'\t' read -r target name <<<"${ignored_run[$i]}"
 		check_alone "Ignored test" "ignored-$i" "$target" "$name"
+	done
+	for i in "${!ignored_opt[@]}"; do
+		IFS=$'\t' read -r target name <<<"${ignored_opt[$i]}"
+		check_alone "Ignored test in a -c opt build" "ignored-opt-$i" "$target" "$name"
 	done
 	for i in "${!ignored_root[@]}"; do
 		IFS=$'\t' read -r target name <<<"${ignored_root[$i]}"

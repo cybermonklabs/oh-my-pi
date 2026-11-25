@@ -169,6 +169,12 @@ fn run(world: &World, src: &str, zsh: bool) -> (String, String, i32) {
 fn run_with(world: &World, src: &str, zsh: bool, fault: Fault) -> (String, String, i32) {
 	let mut rig = Rig::new(world.host(), init(zsh));
 	let status = rig.run(Script::command(src.as_bytes().to_vec()), fault);
+	outputs(&mut rig, status)
+}
+
+/// The stdout, stderr and `status` of `rig`'s run, once its host's leak
+/// check passes.
+fn outputs(rig: &mut Rig, status: i32) -> (String, String, i32) {
 	let (shell, host, store) = rig.parts();
 	let out = (
 		String::from_utf8_lossy(&host.stdout.bytes()).into_owned(),
@@ -628,28 +634,27 @@ fn a_builtin_that_goes_on_unanswered_withdraws_its_ask() {
 	assert_eq!(err, "");
 }
 
-/// How long [`run_bounded`] waits: at least twice the longest correct run
-/// it bounds, read where these tests run. Its runs are those of
+/// How many turns [`run_bounded`] gives a run ([`Rig::run_turns`]): at least
+/// twice the longest correct run it bounds. Its runs are those of
 /// `an_ask_outlives_a_snapshot` (14 scripts, each with a pause and with a
 /// snapshot every 1, 2, 3, 5 and 8 ops), whose failure was a run that never
-/// ends. On gVisor beside 192 busy loops, with this file's other tests in
-/// parallel, that whole test took 15.1-34.8 s in 20 runs (on runc beside
-/// 64 busy loops, 5.2-7.8 s), so no one of its runs took longer than
-/// 34.8 s; 120 s is more than three times that.
-const RUN_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+/// ends. A turn is one return of the trampoline (at most `every` ops), and
+/// the count reads no clock: its 140 runs took the same turns, run by run,
+/// in 12 runs of the test on runc and on gVisor, with and without 64 busy
+/// loops beside it. The longest takes 1,032 turns (the busy-loop job that
+/// `jobs; kill %1` stops, with a pause or a snapshot every op); 4,096 is
+/// about four times that.
+const RUN_TURNS: u64 = 4096;
 
-/// [`run_with`] on a world of its own, in a thread of its own: a run that
-/// has not finished after [`RUN_BOUND`] fails the test (`what` names the
-/// fault). The thread of a run that never ends spins on until the test
-/// process exits.
-fn run_bounded(src: &'static str, zsh: bool, fault: Fault, what: &str) -> (String, String, i32) {
-	let (tx, rx) = std::sync::mpsc::channel();
-	std::thread::spawn(move || {
-		let _ = tx.send(run_with(&World::new(), src, zsh, fault));
-	});
-	rx.recv_timeout(RUN_BOUND).unwrap_or_else(|_| {
-		panic!("`{src}` (zsh={zsh}) did not finish within {RUN_BOUND:?} with {what}")
-	})
+/// [`run_with`] on a world of its own, counted: a run not done after
+/// [`RUN_TURNS`] turns, or one whose every vproc waits with nothing left to
+/// wake it, fails the test (`what` names the fault).
+fn run_bounded(src: &str, zsh: bool, fault: Fault, what: &str) -> (String, String, i32) {
+	let mut rig = Rig::new(World::new().host(), init(zsh));
+	match rig.run_turns(Script::command(src.as_bytes().to_vec()), fault, RUN_TURNS) {
+		Ok(status) => outputs(&mut rig, status),
+		Err(why) => panic!("`{src}` (zsh={zsh}) did not finish with {what}: {why:?}"),
+	}
 }
 
 // Failure mode: a snapshot taken while a builtin waited for the answer to

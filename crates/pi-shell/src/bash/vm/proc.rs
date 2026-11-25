@@ -1012,8 +1012,20 @@ impl Vproc {
 		})
 	}
 
-	pub const fn has_work(&self) -> bool {
+	/// Code left to run: a run or a frame.
+	pub const fn has_code(&self) -> bool {
 		!self.runs.is_empty() || !self.frames.is_empty()
+	}
+
+	/// Anything left to do: code ([`Self::has_code`]) or diagnostics still
+	/// going out (`out`). A subshell is not over until its last message is
+	/// out, as bash's child is not until its last `write(2)` returns: a fatal
+	/// error queues its message and unwinds every frame in one op, and a
+	/// writer thread ([`crate::sys::StdFile`] on a terminal, a socket, a pipe
+	/// it could not reopen, and every Darwin pipe) can still hold the message
+	/// then, so the vproc must get turns until the thread has settled it.
+	pub const fn has_work(&self) -> bool {
+		self.has_code() || !self.out.is_empty()
 	}
 
 	/// Bash defers trapped signals while waiting for a foreground command.

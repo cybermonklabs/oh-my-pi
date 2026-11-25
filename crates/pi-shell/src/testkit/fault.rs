@@ -6,7 +6,10 @@
 //! `--fault-mode=pause`). The oracle is that output, status and
 //! events equal those of the unfaulted run.
 
-use std::sync::Arc;
+use std::{
+	sync::Arc,
+	task::{Context, Waker},
+};
 
 use bstr::BString;
 use serde_json::Value;
@@ -67,6 +70,16 @@ impl Fault {
 		};
 		Budget { max_ops: if max_ops == 0 { 1 } else { max_ops }, max_ns: u64::MAX }
 	}
+}
+
+/// Why [`Rig::run_turns`] gave up on a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unfinished {
+	/// It was not done after this many turns.
+	Turns(u64),
+	/// At this turn every vproc waited, no timer was due and nothing had
+	/// woken the shell: nothing could end the wait.
+	Hung(u64),
 }
 
 /// A shell with its host, store and engine, which survives snapshots.
@@ -132,6 +145,34 @@ impl Rig {
 
 	/// Run `script` to completion under `fault`; its status.
 	pub fn run(&mut self, script: Script, fault: Fault) -> i32 {
+		match self.drive(script, fault, None) {
+			Ok(status) => status,
+			Err(why) => unreachable!("a run without a bound ends only when it is done: {why:?}"),
+		}
+	}
+
+	/// [`Self::run`], counted: each return of the trampoline ([`advance`]:
+	/// at most the fault's budget of ops, or every vproc waiting) is one
+	/// turn. A run not done after `turns` turns, or one whose every vproc
+	/// waits with no timer due and nothing that woke the shell, is `Err`.
+	/// For a run whose wakes all come from the shell's own steps (the fake
+	/// host's programs and timers): it reads no clock, so its count is the
+	/// same on every machine.
+	pub fn run_turns(
+		&mut self,
+		script: Script,
+		fault: Fault,
+		turns: u64,
+	) -> Result<i32, Unfinished> {
+		self.drive(script, fault, Some(turns))
+	}
+
+	fn drive(
+		&mut self,
+		script: Script,
+		fault: Fault,
+		turns: Option<u64>,
+	) -> Result<i32, Unfinished> {
 		if let Fault::Mixed { seed, .. } | Fault::RandomPause { seed, .. } = fault {
 			self.coin = Rng::new(seed);
 		}
@@ -142,20 +183,36 @@ impl Rig {
 		let snapshots =
 			!matches!(fault, Fault::None | Fault::PauseResume { .. } | Fault::RandomPause { .. });
 		let mut snap_blocked = snapshots;
+		let mut taken = 0;
 		loop {
+			if turns.is_some_and(|turns| taken >= turns) {
+				return Err(Unfinished::Turns(taken));
+			}
+			taken += 1;
 			let shell = self
 				.shell
 				.as_mut()
 				.expect("rig holds a shell between steps");
-			let stop = if snap_blocked {
+			// A counted run waits for nothing: `advance` would park here.
+			let stop = if snap_blocked || turns.is_some() {
 				advance_or_blocked(shell, &mut self.host, &mut self.store, id, budget)
 			} else {
 				advance(shell, &mut self.host, &mut self.store, id, budget)
 			};
+			let snap = snap_blocked;
 			snap_blocked = snapshots && !snap_blocked;
 			match stop {
-				Stop::Done(status) => return status,
-				Stop::Blocked => self.snapshot(),
+				Stop::Done(status) => return Ok(status),
+				Stop::Blocked if snap => self.snapshot(),
+				Stop::Blocked => {
+					let woken = shell
+						.control()
+						.poll_runnable(&mut Context::from_waker(Waker::noop()))
+						.is_ready();
+					if !self.host.fire_next_timer() && !woken {
+						return Err(Unfinished::Hung(taken));
+					}
+				},
 				Stop::Paused => shell.control().resume(),
 				Stop::Yield => match fault {
 					Fault::None => {},

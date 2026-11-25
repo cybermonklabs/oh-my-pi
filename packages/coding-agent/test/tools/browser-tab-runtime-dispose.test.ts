@@ -15,7 +15,9 @@ import {
 	getTabsMapForTest,
 	releaseTab,
 	runInTab,
+	setAfterInProcessImportForTest,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import { setBeforeRunRuntimeForTest } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { chromiumAvailable } from "./chromium-probe";
 import { type FakeAnswer, type FakeDaemon, startFakeDaemon } from "./tern-fake-daemon";
@@ -52,9 +54,35 @@ async function sizesAcrossCycles(
 	return { before, after };
 }
 
+/** A cmux socket that answers every request a tab's open, run and close make, with nothing behind it. */
+function mockCmuxSocket(): void {
+	spyOn(CmuxSocketClient.prototype, "connect").mockResolvedValue(undefined);
+	spyOn(CmuxSocketClient.prototype, "close").mockImplementation(() => undefined);
+	let surfaces = 0;
+	spyOn(CmuxSocketClient.prototype, "request").mockImplementation(
+		async (method: string): Promise<Record<string, unknown>> => {
+			switch (method) {
+				case "browser.open_split":
+					surfaces++;
+					return { surface_id: `surface-dispose-${surfaces}`, url: "about:blank" };
+				case "browser.url.get":
+					return { url: "about:blank" };
+				case "browser.snapshot":
+					return { page: { html: "" } };
+				case "browser.eval":
+					return { value: "" };
+				default:
+					return {};
+			}
+		},
+	);
+}
+
 let daemon: FakeDaemon | undefined;
 
 afterEach(async () => {
+	setAfterInProcessImportForTest(undefined);
+	setBeforeRunRuntimeForTest(undefined);
 	// oxlint-disable-next-line unicorn/no-useless-spread -- releasing tabs mutates the map
 	for (const name of [...getTabsMapForTest().keys()]) await releaseTab(name, { kill: false }).catch(() => undefined);
 	await daemon?.close();
@@ -64,26 +92,7 @@ afterEach(async () => {
 
 describe("a dead tab's runtime leaves the realm's global table", () => {
 	it("disposes a cmux tab's runtime when the tab is closed", async () => {
-		spyOn(CmuxSocketClient.prototype, "connect").mockResolvedValue(undefined);
-		spyOn(CmuxSocketClient.prototype, "close").mockImplementation(() => undefined);
-		let surfaces = 0;
-		spyOn(CmuxSocketClient.prototype, "request").mockImplementation(
-			async (method: string): Promise<Record<string, unknown>> => {
-				switch (method) {
-					case "browser.open_split":
-						surfaces++;
-						return { surface_id: `surface-dispose-${surfaces}`, url: "about:blank" };
-					case "browser.url.get":
-						return { url: "about:blank" };
-					case "browser.snapshot":
-						return { page: { html: "" } };
-					case "browser.eval":
-						return { value: "" };
-					default:
-						return {};
-				}
-			},
-		);
+		mockCmuxSocket();
 		const session = makeSession();
 		const sizes = await sizesAcrossCycles(async index => {
 			const name = `cmux-dispose-${index}`;
@@ -96,6 +105,28 @@ describe("a dead tab's runtime leaves the realm's global table", () => {
 			expect(await releaseTab(name, { kill: false })).toBe(true);
 		});
 		expect(sizes.after).toEqual(Array.from({ length: CYCLES }, () => sizes.before));
+	});
+
+	it("builds no runtime for a cmux run whose tab is closed while the in-process runner loads", async () => {
+		mockCmuxSocket();
+		const session = makeSession();
+		const name = "cmux-closed-during-import";
+		const browser = await acquireBrowser(
+			{ kind: "cmux", socketPath: "/tmp/omp-test-dispose-import.sock", surface: "surface-dispose-import" },
+			{ cwd: os.tmpdir() },
+		);
+		expect((await acquireTab(name, browser, { timeoutMs: 5_000 })).tab.backend).toBe("cmux");
+		const before = globalTableSizeForTest();
+		// The close lands after the runner's import, before the run starts: the window the supervisor's guard closes.
+		let closedInWindow = false;
+		setAfterInProcessImportForTest(async () => {
+			closedInWindow = await releaseTab(name, { kill: false });
+		});
+		await expect(runInTab(name, { code: "1 + 1;", timeoutMs: 5_000, session })).rejects.toThrow(
+			`Tab "${name}" was closed`,
+		);
+		expect(closedInWindow).toBe(true);
+		expect(globalTableSizeForTest()).toEqual(before);
 	});
 
 	it("disposes a Tern tab's runtime when the tab is closed", async () => {
@@ -183,6 +214,23 @@ describe("a dead tab's runtime leaves the realm's global table", () => {
 				expect(getTabsMapForTest().has(name)).toBe(false);
 			});
 			expect(sizes.after).toEqual(Array.from({ length: CYCLES }, () => sizes.before));
+		}, 120_000);
+
+		it("builds no runtime when the core stops before the run builds it", async () => {
+			refuseWorkers();
+			const session = makeSession();
+			const name = "inline-stopped-before-runtime";
+			await openInlineTab(name);
+			const before = globalTableSizeForTest();
+			// The core stops while the run is under way, before it builds the runtime: the window the core's guard closes.
+			let stoppedInWindow = false;
+			setBeforeRunRuntimeForTest(async core => {
+				core.terminate();
+				stoppedInWindow = true;
+			});
+			await expect(runInTab(name, { code: "1 + 1;", timeoutMs: 300, session })).rejects.toThrow();
+			expect(stoppedInWindow).toBe(true);
+			expect(globalTableSizeForTest()).toEqual(before);
 		}, 120_000);
 	});
 });

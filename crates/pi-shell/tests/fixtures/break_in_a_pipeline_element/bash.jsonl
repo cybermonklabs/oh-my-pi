@@ -241,7 +241,7 @@
 {"id":"fork/x0/element-break-cat","script":"break | cat; echo top:$?","stdout":"top:0\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
 {"id":"fork/x0/element-cmdsub-break-inside","script":": | echo \"[$(break; echo s)]\" | cat; echo top:$?","stdout":"[s]\ntop:0\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
 {"id":"fork/x0/element-cmdsub-word","script":": | break $(echo 1); echo top:$?","stdout":"top:0\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
-{"id":"fork/x0/element-jobs-cmdsub-word","script":"sleep 5 & jobs -p $(:) | wc -l; kill $!; echo top:$?","stdout":"1\ntop:0\n","stderr":"","status":0}
+{"id":"fork/x0/element-jobs-cmdsub-word","script":"sleep 5 & jobs -p $(:) | wc -l | tr -d ' '; kill $!; echo top:$?","stdout":"1\ntop:0\n","stderr":"","status":0}
 {"id":"fork/x0/element-procsub-break-inside","script":": | cat <(break; echo s); echo top:$?","stdout":"s\ntop:0\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
 {"id":"fork/x0/element-procsub-word","script":": | x=<(:) break; echo top:$?","stdout":"top:0\n","stderr":"SH: line 1: break: only meaningful in a `for', `while', or `until' loop\n","status":0}
 {"id":"fork/x0/element-subshell-level-cmdsub-word","script":"echo $BASH_SUBSHELL $(:) | cat; echo top:$?","stdout":"0\ntop:0\n","stderr":"","status":0}

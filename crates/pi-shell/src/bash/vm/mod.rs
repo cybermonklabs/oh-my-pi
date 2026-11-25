@@ -2297,8 +2297,9 @@ impl Shell {
 		let mut i = 0;
 		while i < self.procs.len() {
 			let p = &self.procs[i];
-			// A subshell vproc exits once its frames and diagnostics are done.
-			if p.transient && !p.has_work() && p.out.is_empty() {
+			// A subshell vproc exits once its frames are done and its
+			// diagnostics are out ([`proc::Vproc::has_work`]).
+			if p.transient && !p.has_work() {
 				let p = self.procs.remove(i);
 				self.k.trace_sources.remove(&p.vpid);
 				self.k.trace_unit_origins.remove(&p.vpid);
@@ -2676,13 +2677,15 @@ impl Shell {
 				let vpid = self.procs[i].vpid;
 				self.drop_take_in(vpid);
 				let key = crate::bash::store::TrapKey::Signal(sig);
+				// Only a vproc with code left runs a trap: one that has ended
+				// and only writes its last message has nowhere to run it.
 				let trapped = sig != Signal::Kill
-					&& self.procs[i].has_work()
+					&& self.procs[i].has_code()
 					&& exec::start_trap(&mut self.k, &mut self.procs[i], cx, key);
 				// bash runs the EXIT trap when a signal ends it: an untrapped
 				// TERM/INT/… ends the shell's own vprocs through it too.
 				let unwinds = trapped
-					|| (sig != Signal::Kill && self.procs[i].has_work() && !self.procs[i].transient);
+					|| (sig != Signal::Kill && self.procs[i].has_code() && !self.procs[i].transient);
 				if unwinds {
 					for frame in &mut self.procs[i].frames {
 						if let Some(sc) = frame.scratch.as_mut() {
@@ -3843,5 +3846,223 @@ mod cancelled_take_in {
 				);
 			}
 		}
+	}
+}
+
+// A subshell whose last op queues its message and ends it ends once the
+// message is out, also when a writer thread holds the message then. A fatal
+// expansion error queues its message and unwinds every frame in one op; a
+// `StdFile` on a terminal, a socket, a Linux pipe it could not reopen and
+// every Darwin pipe writes through its writer thread, which can still hold
+// the message when the frames are gone. The vproc, with no run and no frame,
+// had no work, so no turn came to see the thread settle the message, and
+// `adopt` reaps a subshell only once its queue is empty: it never ended, and
+// its parent waited for it for ever. Each test holds the writer threads
+// ([`crate::sys::hold_writers`], in a process of its own) while the shell
+// runs as far as it can, then lets them go.
+#[cfg(all(test, target_os = "linux"))]
+mod ended_subshell_output {
+	use std::{
+		io::Read as _,
+		os::unix::net::UnixStream,
+		time::{Duration, Instant},
+	};
+
+	use super::*;
+	use crate::testkit::{FakeHost, Rig, fault::skeleton_init};
+
+	/// A shell whose fd 2 is a socket, which its `StdFile` writes on its
+	/// writer thread; and the socket's other end.
+	fn shell_with_stderr_on_a_thread() -> (Rig, UnixStream) {
+		let mut rig = Rig::new(FakeHost::default(), skeleton_init(&[]));
+		let (ours, peer) = UnixStream::pair().unwrap();
+		peer
+			.set_read_timeout(Some(Duration::from_secs(10)))
+			.unwrap();
+		let file = crate::sys::StdFile::new(std::fs::File::from(std::os::fd::OwnedFd::from(ours)));
+		rig.shell().procs[0]
+			.fds
+			.set(2, Some(FdRef::open(Box::new(file), FdOrigin::Host)));
+		(rig, peer)
+	}
+
+	/// Step until the shell blocks or the run ends, at most 1,000 steps: the
+	/// run's status when it ended.
+	fn step_until_blocked_or_done(rig: &mut Rig) -> Option<i32> {
+		for _ in 0..1_000 {
+			let (shell, host, store) = rig.parts();
+			match shell.step(&mut Cx { host, store }, Budget::default()) {
+				Step::Blocked => return None,
+				Step::Done { status, .. } => return Some(status),
+				_ => {},
+			}
+		}
+		panic!("the shell neither blocked nor ended its run within 1,000 steps");
+	}
+
+	/// The socket's other end, read up to and with the first newline (each
+	/// read bounded by the socket's 10 s timeout).
+	fn read_line(peer: &mut UnixStream) -> String {
+		let mut got = Vec::new();
+		let mut byte = [0u8; 1];
+		while !got.ends_with(b"\n") {
+			match peer.read(&mut byte) {
+				Ok(1) => got.push(byte[0]),
+				Ok(_) => break,
+				Err(e) => panic!("reading fd 2: {e}, after {:?}", String::from_utf8_lossy(&got)),
+			}
+		}
+		String::from_utf8_lossy(&got).into_owned()
+	}
+
+	/// Submit `script` with the writer threads held, and step until the shell
+	/// blocks: the run must not end while fd 2's message is held, and a
+	/// subshell of it is still there. `edit` changes the shell then. Also the
+	/// kernel's wake count just before the threads are let go: the thread's
+	/// wake can come as soon as they are.
+	fn run_until_held(script: &[u8], edit: impl FnOnce(&mut Rig)) -> (Rig, UnixStream, u64) {
+		let (mut rig, peer) = shell_with_stderr_on_a_thread();
+		let held = crate::sys::hold_writers();
+		rig.shell().submit(Script::command(script.to_vec()));
+		assert_eq!(
+			step_until_blocked_or_done(&mut rig),
+			None,
+			"the run ended while its message to fd 2 was held"
+		);
+		assert!(
+			rig.shell().procs.iter().any(|p| p.transient),
+			"no subshell left while its message to fd 2 was held"
+		);
+		edit(&mut rig);
+		let before = rig.shell().k.ctl.wakes();
+		drop(held);
+		(rig, peer, before)
+	}
+
+	/// Let fd 2's line out (it ends with `message`), wait for the writer
+	/// thread's wake past `before` (it marks the chunk done, then wakes the
+	/// kernel), then step: the run must end without the shell blocking, since
+	/// nothing it waits for is left. Its status and stdout.
+	fn finish_after_the_line(
+		(mut rig, mut peer, before): (Rig, UnixStream, u64),
+		message: &str,
+	) -> (i32, String) {
+		let line = read_line(&mut peer);
+		assert!(line.ends_with(message), "fd 2 got {line:?}, not a line ending {message:?}");
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while rig.shell().k.ctl.wakes() == before {
+			assert!(Instant::now() < deadline, "DEADLINE: the writer thread did not wake the kernel");
+			std::thread::sleep(Duration::from_millis(1));
+		}
+		for _ in 0..1_000 {
+			let (shell, host, store) = rig.parts();
+			match shell.step(&mut Cx { host, store }, Budget::default()) {
+				Step::Done { status, .. } => {
+					return (status, String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned());
+				},
+				Step::Blocked => panic!(
+					"the shell blocked with fd 2's line out and nothing left to wait for: the ended \
+					 subshell was never reaped (stdout {:?})",
+					String::from_utf8_lossy(&rig.host.stdout.bytes())
+				),
+				_ => {},
+			}
+		}
+		panic!("the run did not end within 1,000 steps of fd 2's line going out");
+	}
+
+	/// A fatal expansion error in a subshell, a command substitution and a
+	/// background job: each ends once its message is out, with bash's status.
+	#[test]
+	fn a_fatal_message_held_by_the_writer_thread_ends_its_subshell_once_out() {
+		crate::sys::in_blocking_writer_process(
+			concat!(
+				module_path!(),
+				"::a_fatal_message_held_by_the_writer_thread_ends_its_subshell_once_out"
+			),
+			|| {
+				for script in [
+					&b"( : ${x:?u} ); echo \"st=$?\""[..],
+					b"v=$(: ${x:?u}); echo \"st=$?\"",
+					b"( : ${x:?u} ) & wait $!; echo \"st=$?\"",
+				] {
+					let held = run_until_held(script, |_| {});
+					let got = finish_after_the_line(held, "line 1: x: u\n");
+					assert_eq!(got, (0, "st=1\n".to_owned()), "{}", String::from_utf8_lossy(script));
+				}
+			},
+		);
+	}
+
+	/// The control: a subshell's write that is not its last op (`echo e >&2`
+	/// settles before the subshell goes on) ended before the fix and still
+	/// does, once its line is out and not before.
+	#[test]
+	fn a_subshells_write_that_is_not_its_last_op_ends_it_once_out() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_subshells_write_that_is_not_its_last_op_ends_it_once_out"),
+			|| {
+				let held = run_until_held(b"( echo e >&2 ); echo \"st=$?\"", |_| {});
+				assert_eq!(finish_after_the_line(held, "e\n"), (0, "st=0\n".to_owned()));
+			},
+		);
+	}
+
+	/// A signal trap pending in a subshell that has ended and only waits for
+	/// its message to go out does not run there: the vproc's turns are for
+	/// the message alone, as bash's child, gone, runs nothing.
+	#[test]
+	fn an_ended_subshells_pending_trap_does_not_run() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::an_ended_subshells_pending_trap_does_not_run"),
+			|| {
+				let held =
+					run_until_held(b"( trap 'echo trapped' USR1; : ${x:?u} ); echo \"st=$?\"", |rig| {
+						let p = rig
+							.shell()
+							.procs
+							.iter_mut()
+							.find(|p| p.transient)
+							.expect("the subshell");
+						p.pending_traps = p.pending_traps.with(Signal::Usr1);
+					});
+				assert_eq!(finish_after_the_line(held, "line 1: x: u\n"), (0, "st=1\n".to_owned()));
+			},
+		);
+	}
+
+	/// A cancel (`TERM`) while an ended subshell's message is held starts no
+	/// trap in that subshell: it has no code left to run one in, and is ended
+	/// with the run. The cancelled run's end is reported before any other
+	/// vproc runs again, so the shell is stepped on until it idles: a trap
+	/// started in the subshell would run then.
+	#[test]
+	fn a_cancel_runs_no_trap_in_an_ended_subshell() {
+		crate::sys::in_blocking_writer_process(
+			concat!(module_path!(), "::a_cancel_runs_no_trap_in_an_ended_subshell"),
+			|| {
+				let (mut rig, mut peer, _) =
+					run_until_held(b"( trap 'echo trapped' TERM; : ${x:?u} ); echo \"st=$?\"", |rig| {
+						rig.shell().k.ctl.request_cancel(Signal::Term);
+					});
+				let line = read_line(&mut peer);
+				assert!(line.ends_with("line 1: x: u\n"), "fd 2 got {line:?}");
+				let (mut ended, mut idle) = (false, false);
+				for _ in 0..1_000 {
+					let (shell, host, store) = rig.parts();
+					match shell.step(&mut Cx { host, store }, Budget::default()) {
+						Step::Done { .. } => ended = true,
+						Step::Idle if ended => {
+							idle = true;
+							break;
+						},
+						_ => {},
+					}
+				}
+				assert!(ended && idle, "the cancelled run did not end and idle within 1,000 steps");
+				let out = String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned();
+				assert!(!out.contains("trapped"), "a trap ran in the ended subshell: stdout {out:?}");
+			},
+		);
 	}
 }

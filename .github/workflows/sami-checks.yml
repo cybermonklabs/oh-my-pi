@@ -8,16 +8,30 @@
 #     later, so sami itself is not tested again).
 #   - A dispatch tests any pushed commit, given as a full 40-character id:
 #       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
-#         -f commit=<sha> [-f silent=<job name>] [-f plant=docs|changelog]
+#         -f commit=<sha> [-f rows=<row>,<row>...] [-f silent=<job name>] [-f plant=docs|changelog]
+#     `rows` selects the rows the run runs: all (the default), or a comma list of the summary's row
+#     names (sc.py ROW_KEYS): set-runner, set-root, lib4, builtins, workspace, ts-small, ts-ca,
+#     checkts, macos, windows, clippy, skipforms, gv-set-uid1000, gv-set-root, gv-lib4-uid1000,
+#     gv-lib4-root, gv-builtins-uid1000, gv-builtins-root, gv-orphan-uid1000, gv-orphan-root, docs,
+#     changelog, rust_test, rust_test_macos. A name that is no row fails the plan, which lists them.
+#     The plan runs the jobs whose results the selected rows read and the jobs those need by their
+#     `needs:` (the reference tools, the test archive, the host addon), and no other job: a proof of
+#     the docs row builds nothing else. A row reads the same alone as in a run of every row, so rows
+#     that read the same jobs run together (sc.py row_work): both users' pi-shell sets and lib4 (a
+#     self-skip as one user is covered by the other user's pass); both users' gVisor set, lib4 and
+#     orphan rows; both users' gVisor pi-builtins; rust_test and rust_test_macos; and skipforms with
+#     every row whose passing tests' output its run-time half reads. The summary reads every other
+#     row NOT RUN and says that the run covered a subset. A push to release-candidate (the cut) runs
+#     every row, and no control, whatever an input says.
 #     `silent` is the summary's control: the named job (for example set-root-2) uploads nothing,
 #     and the summary must then read its units and its row UNKNOWN. `silent=macos-bash` instead
 #     makes the macOS legs skip their bash 5 install, and the macOS row must read UNKNOWN.
 #     `plant` is the docs or changelog row's control: that job first adds a fault to the tree
 #     (sc.py PLANTS: a doc comment with a broken intra-doc link, or an empty CHANGELOG heading),
-#     and the summary says at its top whether the row then read FAIL naming it.
-#   - A push of feat/sami-checks (this tool's own branch) runs only the plan job's selftest: the
-#     counters and the summary against hand-made inputs. GitHub dispatches only a workflow it has
-#     seen run, and this file is not on the default branch; that push run registers it.
+#     and the summary says at its top whether the row then read FAIL naming it. A silent or plant
+#     whose job or row the run does not run fails the plan: that control would pass quietly.
+#   GitHub dispatches only a workflow it has seen run, and this file is not on the default branch
+#   (main); the pushes of release-candidate run it.
 #
 # What it runs. One cargo build of every test target of the root workspace, archived by
 # `cargo nextest archive`; the test jobs run that archive and compile nothing:
@@ -60,9 +74,17 @@
 # the other user, or each skip line is a sub-case .github/sami-checks/partial-skips.txt lets that
 # test skip and its witness line is in its output: a partial pass, listed), whose platform the
 # platform checks gave no verdict, or that no job or two jobs reported, is UNKNOWN, and so is its
-# row. The summary job fails unless every row passed, so the run's colour is the result.
-# Artifacts: sc-report (summary.md), sc-res-<job> (each unit's result and log), sc-build, and the
-# platform checks' own (pc-report, pc-results-*, pc-build-*).
+# row. A row the run did not select reads NOT RUN, never PASS. The summary job fails unless every
+# row that ran passed (a planted run always fails), so the run's colour is the result over those
+# rows. The step summary's first line, `sami-checks verdict: {...}`, is that result as one JSON
+# object (also the summary job's output `verdict`, a notice on the summary job and sc-report's
+# verdict.json): `verdict` over the rows that ran (FAIL when a row failed, a known-failure entry is
+# listed for removal or the run is planted; else UNKNOWN when a row is UNKNOWN; else PASS, KNOWN
+# rows passing), `subset` (true unless every row ran), `rows_run`, `rows_not_run`, `rows` (each
+# row's verdict, or NOT RUN), and `plant` and `plant_caught` (null unless a row was planted). Only
+# a run with subset false and verdict PASS is a pass of the cut checks.
+# Artifacts: sc-report (summary.md, verdict.json), sc-res-<job> (each unit's result and log),
+# sc-build, and the platform checks' own (pc-report, pc-results-*, pc-build-*).
 # Known failures: .github/sami-checks/known-failures.txt names tests that fail on every tree for a
 # reason the tree does not own yet; the summary shows each failure KNOWN (with the reason) or NEW, a
 # unit whose only failures are known reads KNOWN unless a test in it skipped itself and passed as no
@@ -103,20 +125,23 @@
 name: sami checks
 
 run-name: >-
-  ${{ github.event_name == 'workflow_dispatch' && format('sami checks {0}{1}{2}', inputs.commit, inputs.silent != '' && format(' (control: silent={0})', inputs.silent) || '', inputs.plant != '' && format(' (control: plant={0})', inputs.plant) || '')
-  || github.ref == 'refs/heads/release-candidate' && format('sami checks {0} (release-candidate)', github.sha)
-  || 'sami checks: the tool''s own controls' }}
+  ${{ github.event_name == 'workflow_dispatch' && format('sami checks {0}{1}{2}{3}', inputs.commit, inputs.rows != 'all' && format(' (rows: {0})', inputs.rows) || '', inputs.silent != '' && format(' (control: silent={0})', inputs.silent) || '', inputs.plant != '' && format(' (control: plant={0})', inputs.plant) || '')
+  || github.ref == 'refs/heads/release-candidate' && format('sami checks {0} (release-candidate)', github.sha) }}
 
 on:
   push:
     branches:
       - release-candidate
-      - feat/sami-checks
   workflow_dispatch:
     inputs:
       commit:
         description: "Commit to test: a full 40-character id, pushed to this repository"
         required: true
+        type: string
+      rows:
+        description: "Rows to run: all, or a comma list of the summary's row names (for example docs,changelog); the others read NOT RUN"
+        required: false
+        default: "all"
         type: string
       silent:
         description: "Control: a job name (for example set-root-2) that uploads nothing, or macos-bash (the macOS legs skip their bash 5 install)"
@@ -158,6 +183,10 @@ jobs:
     timeout-minutes: 10
     outputs:
       commit: ${{ steps.plan.outputs.commit }}
+      # The rows this run runs (a comma list of sc.py ROW_KEYS), and the jobs it runs (a JSON list):
+      # every job but this one and the summary runs only when its if: finds its id in `jobs`.
+      rows: ${{ steps.plan.outputs.rows }}
+      jobs: ${{ steps.plan.outputs.jobs }}
       silent: ${{ steps.plan.outputs.silent }}
       set: ${{ steps.plan.outputs.set }}
       set_shards: ${{ steps.plan.outputs.set_shards }}
@@ -175,17 +204,21 @@ jobs:
       gv_set_shards: ${{ steps.plan.outputs.gv_set_shards }}
       plant: ${{ steps.plan.outputs.plant }}
     steps:
+      # .github/workflows: the plan reads each job's needs: from sami-checks.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: tool
           persist-credentials: false
-          sparse-checkout: .github/sami-checks
-      - name: Controls of the counters and the summary (hand-made inputs)
+          sparse-checkout: |
+            .github/sami-checks
+            .github/workflows
+      - name: Controls of the counters, the plan and the summary (hand-made inputs)
         run: python3 tool/.github/sami-checks/sc.py selftest
       - name: Plan
         id: plan
         env:
           SC_INPUT_COMMIT: ${{ inputs.commit }}
+          SC_INPUT_ROWS: ${{ inputs.rows }}
           SC_INPUT_SILENT: ${{ inputs.silent }}
           SC_INPUT_PLANT: ${{ inputs.plant }}
         run: python3 tool/.github/sami-checks/sc.py plan | tee -a "$GITHUB_OUTPUT"
@@ -194,7 +227,7 @@ jobs:
     # zsh 5.9, rsync 3.5.1 and jj 0.46.0 from pinned sources; no tree code runs here.
     name: reference tools
     needs: plan
-    if: needs.plan.outputs.commit != ''
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'tools')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -215,7 +248,7 @@ jobs:
   build:
     name: build the tests
     needs: plan
-    if: needs.plan.outputs.commit != ''
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'build')
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
@@ -258,7 +291,7 @@ jobs:
     # The host addon the TypeScript tests load, built as `bun run build:native` builds it.
     name: build the host addon
     needs: plan
-    if: needs.plan.outputs.commit != ''
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'natives')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     # What it built, for sami-rust-test.yml's check of the bytes it downloads.
@@ -325,7 +358,7 @@ jobs:
   set:
     name: pi-shell set ${{ matrix.who }} ${{ matrix.shard }}
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'set') && needs.build.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -374,7 +407,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.builtins) }}
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'builtins') && needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -418,7 +451,7 @@ jobs:
   workspace:
     name: workspace ${{ matrix.who }} ${{ matrix.part }}
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'workspace') && needs.build.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -465,7 +498,7 @@ jobs:
   ts-small:
     name: TypeScript suites
     needs: [plan, natives]
-    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.natives.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'ts-small') && needs.natives.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -507,7 +540,7 @@ jobs:
   ts-ca:
     name: coding-agent ${{ matrix.shard }}
     needs: [plan, natives]
-    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.natives.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'ts-ca') && needs.natives.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -552,7 +585,7 @@ jobs:
   checkts:
     name: check:ts
     needs: plan
-    if: needs.plan.outputs.commit != ''
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'checkts')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -587,7 +620,7 @@ jobs:
     # and fail by name without its addon.
     name: rust tests
     needs: [plan, natives]
-    if: ${{ !cancelled() && needs.plan.outputs.commit != '' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'rust-test') }}
     permissions:
       contents: read
     cache-mode: none
@@ -603,7 +636,7 @@ jobs:
     # pc-report is what the summary reads.
     name: platforms
     needs: plan
-    if: needs.plan.outputs.commit != ''
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'platforms')
     # The most the called workflow may ask. GitHub checks each called job's permissions against
     # these before the run starts, whether or not the job runs, and platform-checks.yml's
     # cache-prune job asks for actions: write. That job runs only on a dispatch of
@@ -628,7 +661,7 @@ jobs:
   clippy:
     name: clippy
     needs: plan
-    if: needs.plan.outputs.commit != ''
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'clippy')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     # Clippy compiles the candidate's crates, their tests and their dependencies cold, as the build
@@ -665,7 +698,7 @@ jobs:
   gvisor:
     name: gVisor
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'gvisor') && needs.build.result == 'success' }}
     uses: ./.github/workflows/sami-checks-gvisor.yml
     with:
       commit: ${{ needs.plan.outputs.commit }}
@@ -678,9 +711,13 @@ jobs:
     # rust-test is here so that the summary runs last and reads its two jobs' results (SC_RUST_TESTS).
     needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms,
             platforms, clippy, gvisor, docs, changelog, rust-test]
-    if: ${{ always() && needs.plan.outputs.commit != '' }}
+    if: ${{ always() && needs.plan.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # The step summary's verdict line as one JSON object (sc.py cmd_summary: verdict, subset, rows_run,
+    # rows_not_run, rows, plant, plant_caught); empty when the summary wrote none.
+    outputs:
+      verdict: ${{ steps.summary.outputs.verdict }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -694,7 +731,9 @@ jobs:
         with:
           pattern: sc-res-*
           path: ${{ github.workspace }}/sc/results
+      # The build record and the platform artifacts exist only when their job ran.
       - name: Build record
+        if: contains(fromJSON(needs.plan.outputs.jobs), 'build')
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -703,12 +742,14 @@ jobs:
       # The platform checks' report, each leg's record and JUnit report (for its times), and each
       # build's record and log (an UNKNOWN names a failed build's first compiler error).
       - name: Platform report
+        if: contains(fromJSON(needs.plan.outputs.jobs), 'platforms')
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pc-report
           path: ${{ github.workspace }}/sc/pc
       - name: Platform legs
+        if: contains(fromJSON(needs.plan.outputs.jobs), 'platforms')
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -716,6 +757,7 @@ jobs:
           merge-multiple: true
           path: ${{ github.workspace }}/sc/pc
       - name: Platform builds
+        if: contains(fromJSON(needs.plan.outputs.jobs), 'platforms')
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -723,15 +765,20 @@ jobs:
           merge-multiple: true
           path: ${{ github.workspace }}/sc/pc
       - name: Summary
+        id: summary
         env:
           SC_COMMIT: ${{ needs.plan.outputs.commit }}
+          SC_ROWS: ${{ needs.plan.outputs.rows }}
+          SC_PLATFORMS: ${{ needs.plan.outputs.platforms }}
           SC_RUST_TESTS: "rust_test=${{ needs.rust-test.outputs.rust-test }} rust_test_macos=${{ needs.rust-test.outputs.rust-test-macos }}"
           SC_SILENT: ${{ needs.plan.outputs.silent }}
           SC_PLANT: ${{ needs.plan.outputs.plant }}
+          SC_VERDICT: ${{ github.workspace }}/sc/report/verdict.json
         run: |
           mkdir -p "$SC/report" "$SC/results/sc-skip-lines" "$SC/build" "$SC/pc"
           # The control `silent=platforms`: the platform results are not read, so both rows must be UNKNOWN.
-          if [ "$SC_SILENT" != platforms ]; then
+          # A run whose rows are neither platform's has no platform report to read.
+          if [ -n "$SC_PLATFORMS" ] && [ "$SC_SILENT" != platforms ]; then
             python3 tool/.github/sami-checks/sc.py platforms "$SC/pc" "$SC/results/sc-res-platforms" ||
               echo "::error::the platform report reader failed, so the platform rows read UNKNOWN"
           fi
@@ -742,6 +789,12 @@ jobs:
             > "$SC/results/sc-skip-lines/skip-lines.json" || echo "::error title=skip-lines::sc.py skip-lines failed; its unit reads UNKNOWN"
           python3 tool/.github/sami-checks/sc.py summary "$SC/results" "$SC/build" tool/.github/sami-checks/known-failures.txt > "$SC/report/summary.md" || rc=$?
           cat "$SC/report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ -s "$SC_VERDICT" ]; then
+            echo "verdict=$(cat "$SC_VERDICT")" >> "$GITHUB_OUTPUT"
+            echo "::notice title=sami-checks verdict::$(cat "$SC_VERDICT")"
+          else
+            echo "::error title=sami-checks verdict::the summary wrote no verdict"
+          fi
           python3 -c 'import json,os,sys; sys.path.insert(0, "tool/.github/sami-checks"); import sc; json.dump(sc.load_results(sys.argv[1]), open(sys.argv[2], "w"))' "$SC/results" "$SC/report/results.json"
           exit "$rc"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -756,7 +809,7 @@ jobs:
     # SKIP_MARKER or named in skip-forms-not-markers.txt; a new form fails this job and its row.
     name: skip prints the summary reads
     needs: plan
-    if: needs.plan.outputs.commit != ''
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'skip-forms')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -787,7 +840,7 @@ jobs:
     # rustdoc's broken intra-doc links in pi-shell (docs.sh), on the tree's toolchain, built cold.
     name: rustdoc intra-doc links
     needs: plan
-    if: needs.plan.outputs.commit != ''
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'docs')
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
@@ -823,7 +876,7 @@ jobs:
     # and its archive links from the history, so this checkout has both.
     name: CHANGELOG format
     needs: plan
-    if: needs.plan.outputs.commit != ''
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'changelog')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

@@ -695,6 +695,17 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 return true;
             }
         }
+        // FIXME: This works around another grep-regex limitation. A regex
+        // with a text anchor (`^` or `$` outside of multi-line mode) reports
+        // no line terminator, and grep-regex keeps it off this path only by
+        // removing `\n` from its non-matching bytes. With any other line
+        // terminator, such a regex would run over a buffer of many lines,
+        // where `$` matches only at the end of the buffer. The slow
+        // line-by-line searcher strips each line's terminator, so the anchors
+        // match at the start and end of each line.
+        if self.config.line_term.as_byte() != b'\n' {
+            return false;
+        }
         if let Some(non_matching) = self.matcher.non_matching_bytes() {
             // If the line terminator is CRLF, we don't actually need to care
             // whether the regex can match `\r` or not. Namely, a `\r` is
