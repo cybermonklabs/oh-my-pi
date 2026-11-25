@@ -8,6 +8,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, test, vi } from "bun:test";
+import type { PathLike, StatOptions } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -499,6 +500,238 @@ describe("pickElectronTarget", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	test.skipIf(process.platform !== "linux")(
+		"reuses Chromium started by a compiled launcher through its profile lock",
+		async () => {
+			// Arch's /usr/bin/chromium is an ELF that execs /usr/lib/chromium/chromium.
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-launcher-"));
+			const launcher = path.join(root, "chromium");
+			const browser = path.join(root, "lib", "chromium");
+			const profile = path.join(root, "profile");
+			const cdp = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("{}") });
+			await Bun.write(launcher, new Uint8Array([0x7f, 0x45, 0x4c, 0x46]));
+			await Bun.write(browser, Bun.file(process.execPath));
+			await fs.chmod(launcher, 0o755);
+			await fs.chmod(browser, 0o755);
+			await fs.mkdir(profile);
+			const staleProfile = path.join(root, "stale");
+			await fs.mkdir(staleProfile);
+			const child = Bun.spawn(
+				[
+					browser,
+					"--eval",
+					'process.stdout.write("ready\\n"); await Bun.stdin.text()',
+					`--user-data-dir=${profile}`,
+					`--remote-debugging-port=${cdp.port}`,
+				],
+				{ stdin: "pipe", stdout: "pipe", stderr: "ignore" },
+			);
+			const readiness = child.stdout.getReader();
+			await readiness.read();
+			readiness.releaseLock();
+			try {
+				await fs.symlink(`${os.hostname()}-${child.pid}`, path.join(profile, "SingletonLock"));
+				expect(await findReusableCdp(launcher, { appArgs: [`--user-data-dir=${profile}`] })).toEqual({
+					cdpUrl: `http://127.0.0.1:${cdp.port}`,
+					pid: child.pid,
+				});
+				// Another Chromium-family browser holding the profile is refused, not adopted.
+				await expect(
+					findReusableCdp(path.join(root, "chrome"), { appArgs: [`--user-data-dir=${profile}`] }),
+				).rejects.toThrow(`held by another browser, ${await fs.realpath(browser)} (pid ${child.pid})`);
+				// A stale lock whose pid now belongs to a browser on another profile.
+				await fs.symlink(`${os.hostname()}-${child.pid}`, path.join(staleProfile, "SingletonLock"));
+				expect(await findReusableCdp(launcher, { appArgs: [`--user-data-dir=${staleProfile}`] })).toBeNull();
+			} finally {
+				child.kill();
+				await child.exited;
+				cdp.stop(true);
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	/**
+	 * A fake Chromium (a copy of bun named `name`, argv[0] `argv0`) that holds `profile` with its
+	 * `SingletonLock` and names a live CDP port; `run` gets the launcher path to look it up by.
+	 */
+	async function withLockedProfile(
+		options: { name?: string; argv0?: string; asUid?: number },
+		run: (paths: { launcher: string; browser: string; profile: string; pid: number; port: number }) => Promise<void>,
+	): Promise<void> {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-lock-owner-"));
+		const launcher = path.join(root, "chromium");
+		const browser = path.join(root, "lib", options.name ?? "chromium");
+		const profile = path.join(root, "profile");
+		const cdp = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("{}") });
+		const port = cdp.port;
+		if (port === undefined) throw new Error("the fake CDP server has no port");
+		await Bun.write(launcher, new Uint8Array([0x7f, 0x45, 0x4c, 0x46]));
+		await Bun.write(browser, Bun.file(process.execPath));
+		await fs.chmod(launcher, 0o755);
+		await fs.chmod(browser, 0o755);
+		await fs.mkdir(profile);
+		const command = [
+			browser,
+			"--eval",
+			'process.stdout.write("ready\\n"); await Bun.stdin.text()',
+			`--user-data-dir=${profile}`,
+			`--remote-debugging-port=${port}`,
+		];
+		if (options.asUid !== undefined) {
+			// Root only: the browser runs as another user, who also owns its profile and lock.
+			await fs.chmod(root, 0o755);
+			await fs.chmod(path.join(root, "lib"), 0o755);
+			await fs.chown(profile, options.asUid, options.asUid);
+			command.unshift("setpriv", `--reuid=${options.asUid}`, `--regid=${options.asUid}`, "--clear-groups");
+		}
+		const child = Bun.spawn(command, {
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "ignore",
+			argv0: options.argv0,
+		});
+		const readiness = child.stdout.getReader();
+		await readiness.read();
+		readiness.releaseLock();
+		try {
+			const lockPath = path.join(profile, "SingletonLock");
+			await fs.symlink(`${os.hostname()}-${child.pid}`, lockPath);
+			if (options.asUid !== undefined) await fs.lchown(lockPath, options.asUid, options.asUid);
+			await run({ launcher, browser, profile, pid: child.pid, port });
+		} finally {
+			child.kill();
+			await child.exited;
+			cdp.stop(true);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}
+
+	test.skipIf(process.platform !== "linux")("adopts no profile lock that another user owns", async () => {
+		await withLockedProfile({}, async ({ launcher, profile, pid, port }) => {
+			const appArgs = [`--user-data-dir=${profile}`];
+			// Control: this user's own lock and browser are adopted.
+			expect(await findReusableCdp(launcher, { appArgs })).toEqual({ cdpUrl: `http://127.0.0.1:${port}`, pid });
+			const lockPath = path.join(profile, "SingletonLock");
+			const realLstat = fs.lstat;
+			const lstat = vi.spyOn(fs, "lstat").mockImplementation((async (file: PathLike, opts?: StatOptions) => {
+				const stats = await realLstat(file, opts as never);
+				return file === lockPath ? Object.assign(stats, { uid: Number(stats.uid) + 1 }) : stats;
+			}) as typeof fs.lstat);
+			try {
+				expect(await findReusableCdp(launcher, { appArgs })).toBeNull();
+				expect(lstat).toHaveBeenCalledWith(lockPath);
+			} finally {
+				lstat.mockRestore();
+			}
+		});
+	});
+
+	test.skipIf(process.platform !== "linux")("adopts no lock owner that runs as another user", async () => {
+		await withLockedProfile({}, async ({ launcher, profile, pid }) => {
+			const statusPath = `/proc/${pid}/status`;
+			const realReadFile = fs.readFile;
+			const readFile = vi.spyOn(fs, "readFile").mockImplementation((async (file: PathLike, opts?: unknown) => {
+				const text = await realReadFile(file, opts as never);
+				if (file !== statusPath) return text;
+				const uid = process.getuid!() + 1;
+				return String(text).replace(/^Uid:.*$/m, `Uid:\t${uid}\t${uid}\t${uid}\t${uid}`);
+			}) as typeof fs.readFile);
+			try {
+				expect(await findReusableCdp(launcher, { appArgs: [`--user-data-dir=${profile}`] })).toBeNull();
+				expect(readFile).toHaveBeenCalledWith(statusPath, "utf8");
+			} finally {
+				readFile.mockRestore();
+			}
+		});
+	});
+
+	test.skipIf(process.platform !== "linux")(
+		"names the lock owner by the executable it runs, not by its argv[0]",
+		async () => {
+			// Any program can claim to be chromium in argv[0]; /proc/<pid>/exe names what it runs.
+			await withLockedProfile({ name: "notabrowser", argv0: "chromium" }, async ({ launcher, profile, pid }) => {
+				// Control: the owner does claim to be chromium.
+				expect((await fs.readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0")[0]).toBe("chromium");
+				expect(await findReusableCdp(launcher, { appArgs: [`--user-data-dir=${profile}`] })).toBeNull();
+			});
+		},
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"probes no browser found by its path that runs as another user",
+		async () => {
+			// Root resolves every user's /proc/<pid>/exe, so the lookup by path can find other users' browsers.
+			await withLockedProfile({}, async ({ browser, profile, pid, port }) => {
+				const appArgs = [`--user-data-dir=${profile}`];
+				// Control: this user's browser, found by its path, is reused.
+				expect(await findReusableCdp(browser, { appArgs })).toEqual({ cdpUrl: `http://127.0.0.1:${port}`, pid });
+				const statusPath = `/proc/${pid}/status`;
+				const realReadFile = fs.readFile;
+				const readFile = vi.spyOn(fs, "readFile").mockImplementation((async (file: PathLike, opts?: unknown) => {
+					const text = await realReadFile(file, opts as never);
+					if (file !== statusPath) return text;
+					const uid = process.getuid!() + 1;
+					return String(text).replace(/^Uid:.*$/m, `Uid:\t${uid}\t${uid}\t${uid}\t${uid}`);
+				}) as typeof fs.readFile);
+				try {
+					expect(await findReusableCdp(browser, { appArgs })).toBeNull();
+					expect(readFile).toHaveBeenCalledWith(statusPath, "utf8");
+				} finally {
+					readFile.mockRestore();
+				}
+			});
+		},
+	);
+
+	// Needs root, to run a browser as a second user; the same check applies to every user, root included.
+	test.skipIf(process.platform !== "linux" || process.getuid?.() !== 0)(
+		"adopts no browser that a second user runs on its own profile, even as root",
+		async () => {
+			await withLockedProfile({ asUid: 65534 }, async ({ launcher, profile, pid }) => {
+				// Control: the owner runs, as the second user.
+				expect(await fs.readFile(`/proc/${pid}/status`, "utf8")).toMatch(/^Uid:\s+65534\s+65534\s/m);
+				expect(await findReusableCdp(launcher, { appArgs: [`--user-data-dir=${profile}`] })).toBeNull();
+			});
+		},
+	);
+
+	test.skipIf(process.platform !== "linux")("adopts no profile lock that names another host", async () => {
+		await withLockedProfile({}, async ({ launcher, profile, pid, port }) => {
+			const appArgs = [`--user-data-dir=${profile}`];
+			// Control: the lock as written is adopted.
+			expect(await findReusableCdp(launcher, { appArgs })).toEqual({ cdpUrl: `http://127.0.0.1:${port}`, pid });
+			// The same pid on another host is another process.
+			const lockPath = path.join(profile, "SingletonLock");
+			await fs.rm(lockPath);
+			await fs.symlink(`not-${os.hostname()}-${pid}`, lockPath);
+			expect(await findReusableCdp(launcher, { appArgs })).toBeNull();
+		});
+	});
+
+	test.skipIf(process.platform !== "linux")(
+		"takes no browser on another profile for the owner of a stale lock",
+		async () => {
+			// A stale lock's pid can belong by now to a browser of another name on another profile: that browser
+			// holds nothing the caller asked for, so the call returns null rather than refusing it as the holder.
+			await withLockedProfile({ name: "brave" }, async ({ launcher, profile, pid, port }) => {
+				// Control: a request for brave, through a launcher of that name, adopts this browser by its own lock.
+				const braveLauncher = path.join(path.dirname(profile), "brave");
+				await Bun.write(braveLauncher, new Uint8Array([0x7f, 0x45, 0x4c, 0x46]));
+				await fs.chmod(braveLauncher, 0o755);
+				expect(await findReusableCdp(braveLauncher, { appArgs: [`--user-data-dir=${profile}`] })).toEqual({
+					cdpUrl: `http://127.0.0.1:${port}`,
+					pid,
+				});
+				const other = path.join(path.dirname(profile), "other");
+				await fs.mkdir(other);
+				await fs.symlink(`${os.hostname()}-${pid}`, path.join(other, "SingletonLock"));
+				// A chromium request for the other profile: only the argv-profile check keeps brave from being its holder.
+				expect(await findReusableCdp(launcher, { appArgs: [`--user-data-dir=${other}`] })).toBeNull();
+			});
+		},
+	);
 
 	test.skipIf(!CHROMIUM_AVAILABLE)(
 		"keeps profile tabs isolated and never kills a borrowed Chrome on close",

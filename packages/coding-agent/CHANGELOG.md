@@ -435,6 +435,7 @@
 - Fixed array subscripts in the `bash` tool's bash code behaving unlike bash's: a negative subscript of a scalar (`x=abc; ${x[-1]}`) now warns `bad array subscript` and is unset; arithmetic counts a negative subscript back from the end of an array (`$((a[-1]))` read 0 and `((a[-1]=7))` made an element -1); `$((x[@]))` warns and is 0 instead of a syntax error; `${x[1]:?}` names `x[1]`; a scalar's `${x[@]@A}`, `@K` and `@k` print its quoted value; and `${r@a}`/`${r@A}` of a name reference describe its target
 - Fixed `test -v` and `[[ -v` in the `bash` tool's bash code on array subscripts: a command substitution in the subscript runs as in bash (`[[ -v 'a[$(echo 1)]' ]]` was an arithmetic syntax error), and `-v` sees bash's dynamic arrays (`[[ -v PIPESTATUS[0] ]]` was false)
 - Fixed arithmetic through a name reference to an associative array in the `bash` tool's bash code: `declare -n r=A; $((r[k]))` read element 0 instead of the key `k`, and `$((r[@]))` was a syntax error
+- `browser.open` with `app: "/usr/bin/chromium"` on Arch now reuses the Chromium already running on that profile instead of failing with "Timed out waiting for CDP endpoint" ([#19235](https://github.com/can1357/oh-my-pi/pull/19235) by [@tuschla](https://github.com/tuschla))
 
 ### Security
 
