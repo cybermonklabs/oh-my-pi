@@ -1,5 +1,5 @@
 import { isBigIntObject, isBooleanObject, isNumberObject, isStringObject } from "node:util/types";
-import { ContainerPath, type NestedWalk, runNested } from "./nested-walk";
+import { ContainerPath, type NestedWalk, nestsDeeperThan, runNested } from "./nested-walk";
 
 /**
  * Try to parse JSON, returning null on failure.
@@ -67,6 +67,19 @@ export interface DeepJsonOptions {
 	readonly bigintAsString?: boolean;
 }
 
+/** {@link DeepJsonOptions} of {@link stringifyDeepJson}, which can also indent. */
+export interface DeepJsonTextOptions extends DeepJsonOptions {
+	/**
+	 * `JSON.stringify`'s `space`. A value nested past {@link INDENTED_JSON_LEVELS}
+	 * levels is written without indentation: indented, a value's text grows with
+	 * the square of its depth (30,000 levels is a 1.8 GB string).
+	 */
+	readonly space?: string | number;
+}
+
+/** Levels past which {@link stringifyDeepJson} writes a value without the indentation it was asked for. */
+export const INDENTED_JSON_LEVELS = 1_000;
+
 /**
  * `JSON.stringify(value)` ({@link stringifyJson} with `bigintAsString`), also
  * for a value nested deeper than the engine's recursion allows (Bun's throws a
@@ -75,11 +88,16 @@ export interface DeepJsonOptions {
  * which gives the same bytes. Any value `JSON.stringify` writes gets its
  * result, and any other error is its own. A `RangeError` from elsewhere (a
  * `toJSON` that throws one) recurs in the second walk and surfaces from it, so
- * the `toJSON` methods ahead of it run twice on that path.
+ * the `toJSON` methods ahead of it run twice on that path. With `space`, a
+ * value no deeper than {@link INDENTED_JSON_LEVELS} levels
+ * ({@link nestsDeeperThan}) is indented as `JSON.stringify` indents it, and any
+ * other is written without indentation.
  */
-export function stringifyDeepJson(value: unknown, options?: DeepJsonOptions): string | undefined {
+export function stringifyDeepJson(value: unknown, options?: DeepJsonTextOptions): string | undefined {
+	const space =
+		options?.space !== undefined && !nestsDeeperThan(value, INDENTED_JSON_LEVELS) ? options.space : undefined;
 	try {
-		return options?.bigintAsString ? stringifyJson(value) : JSON.stringify(value);
+		return options?.bigintAsString ? stringifyJson(value, space) : JSON.stringify(value, undefined, space);
 	} catch (error) {
 		if (!(error instanceof RangeError)) throw error;
 		return stringifyJsonIteratively(value, options);

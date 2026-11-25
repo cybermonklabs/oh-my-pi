@@ -21,6 +21,7 @@
 - Added `stringifyDeepJson`, `JSON.stringify` that also serializes a value nested deeper than the engine's recursion allows, and `stringifyJsonIteratively`, the explicit-stack writer it falls back to on that `RangeError`, which gives `JSON.stringify`'s bytes
 - Added a `bigintAsString` option to `stringifyDeepJson` and `stringifyJsonIteratively`, which writes a bigint as its decimal string, as `stringifyJson` does
 - Added `jsonDeepEquals`, `Bun.deepEquals` (not strict) for JSON-shaped data of any depth, which walks arrays and plain objects on its own stack
+- Added a `space` option to `stringifyDeepJson`, which indents as `JSON.stringify` does a value nested at most `INDENTED_JSON_LEVELS` (1,000) levels deep and writes a deeper one without indentation, and `nestsDeeperThan`, the depth check it uses, which imports nothing so a browser bundle can use it
 
 ### Changed
 

@@ -356,6 +356,19 @@ describe("stringifyDeepJson", () => {
 		}
 		expect(stringifyDeepJson(chain, { bigintAsString: true }) === expected).toBe(true);
 	}, 60_000);
+
+	// The /dump request JSON is indented for a reader; indented, a value's text grows with the square of its depth
+	// (30,000 levels is a 1.8 GB string), and past 40,000 levels `JSON.stringify` throws.
+	it("indents as JSON.stringify does, and writes a value nested past 1,000 levels without indentation", () => {
+		const shallow = { a: [1, { b: "c" }], d: null };
+		expect(stringifyDeepJson(shallow, { space: 2 })).toBe(JSON.stringify(shallow, undefined, 2));
+		let deep: unknown = { leaf: 1n };
+		for (let index = 0; index < 50_000; index++) deep = { next: deep };
+		expect(
+			stringifyDeepJson(deep, { space: 2, bigintAsString: true }) ===
+				stringifyJsonIteratively(deep, { bigintAsString: true }),
+		).toBe(true);
+	}, 20_000);
 });
 
 // Session code compares messages (a reload, the fallback model's fit, an RPC terminal frame, an Anthropic

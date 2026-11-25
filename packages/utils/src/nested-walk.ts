@@ -76,3 +76,32 @@ export class ContainerPath {
 		if (this.#depth-- > CYCLE_CHECK_DEPTH) this.#open?.delete(container);
 	}
 }
+
+/**
+ * Whether `value` nests objects or arrays past `levels` levels, read by a walk
+ * that keeps its own stack and stops at the first node past them, so a cycle
+ * answers true. It imports nothing, so a browser bundle can use it too.
+ */
+export function nestsDeeperThan(value: unknown, levels: number): boolean {
+	const nodes: unknown[] = [value];
+	const depths: number[] = [0];
+	while (nodes.length > 0) {
+		const node = nodes.pop();
+		const depth = depths.pop()!;
+		if (typeof node !== "object" || node === null) continue;
+		if (depth >= levels) return true;
+		if (Array.isArray(node)) {
+			for (const item of node) {
+				nodes.push(item);
+				depths.push(depth + 1);
+			}
+			continue;
+		}
+		for (const key in node) {
+			if (!Object.hasOwn(node, key)) continue;
+			nodes.push(Reflect.get(node, key));
+			depths.push(depth + 1);
+		}
+	}
+	return false;
+}

@@ -219,6 +219,8 @@
 - Switching to the session already open (a reload) no longer fails with `Maximum call stack size exceeded` when one of its tool calls' arguments nests more than about 8,400 levels deep
 - Choosing a retry fallback model that stands on another compaction boundary no longer fails with `Maximum call stack size exceeded` when the failed turn's tool call has arguments nested more than about 16,000 levels deep
 - `/resume --from-claude` and `--from-codex` import a session holding an entry nested more than 40,000 levels deep instead of failing with `Maximum call stack size exceeded`
+- A side question (`/btw`, the RPC ephemeral turn) asked in a session holding an entry nested more than 40,000 levels deep, or passed such a history, is sent instead of failing with `Maximum call stack size exceeded`
+- `/dump` writes the request JSON of a conversation whose tool call's arguments nest more than 40,000 levels deep instead of leaving it out; a request nested more than 1,000 levels deep is written without indentation, which grows with the square of the depth (30,000 levels made a 1.8 GB file)
 - A session imported with `--from-claude` or `--from-codex`, and every session that process switches to afterwards, now moves its older entries out of memory as other sessions do
 - omp no longer keeps older entry bodies in a temporary directory that another account made or can enter; the session keeps them compressed in memory instead
 - Reading older screenshots back, as an extension reading every message does, no longer keeps up to eight of them in memory past the 16 MiB the cache allows
