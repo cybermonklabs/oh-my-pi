@@ -14,6 +14,7 @@ import {
 	type SqlSessionStorageOptions,
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SQL } from "bun";
+import { dropSessionStoreTables } from "../helpers/sql-session-storage";
 import { until } from "./sql-session-lease-fixture";
 
 const primaryUrl = process.env.OMP_TEST_SQL_POSTGRES_URL;
@@ -73,8 +74,7 @@ describe.skipIf(!primaryUrl || !standbyUrl)("SqlSessionStorage on a PostgreSQL s
 				onThePrimary: "opened",
 			});
 		} finally {
-			for (const name of [`${table}_parts`, `${table}_blobs`, table, leaseTable])
-				await primary.unsafe(`DROP TABLE IF EXISTS ${name}`);
+			await dropSessionStoreTables(primary, table, leaseTable);
 			await standby.end();
 			await primary.end();
 		}

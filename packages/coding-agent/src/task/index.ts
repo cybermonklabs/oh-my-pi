@@ -500,7 +500,19 @@ async function resolveTaskFile(owner: object, session: ToolSession, item: TaskIt
 		const approved = approvedTaskFile(owner, item.taskFile);
 		const filePath = approved?.path ?? taskFilePath(session, item.taskFile);
 		if (filePath === undefined) throw new Error("does not resolve to a local file");
-		// On POSIX, a non-blocking open lets fstat reject a FIFO without waiting for a writer.
+		// Read the type before the open: opening a FIFO, even non-blocking, releases a writer blocked in its own open.
+		// Like the O_NOFOLLOW open below, the read does not follow an approved path. A path the read cannot reach goes
+		// on to the open, which reports it.
+		const entry = await (approved ? fs.lstat(filePath, { bigint: true }) : fs.stat(filePath, { bigint: true })).catch(
+			() => undefined,
+		);
+		if (entry) {
+			if (approved && !taskFileMatchesApproval(entry, approved)) {
+				throw new Error("changed after approval; retry the call");
+			}
+			if (!entry.isFile()) throw new Error("must resolve to a regular file");
+		}
+		// On POSIX, a non-blocking open lets fstat reject a FIFO swapped in after that read without waiting for a writer.
 		const file = await fs
 			.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (approved ? fs.constants.O_NOFOLLOW : 0))
 			.catch(error => {

@@ -21,7 +21,9 @@
  * ({@link prewarmSubagentWorker}), and terminates after `idleMs` with neither
  * runs nor resident sessions. {@link subagentWorkerPool} returns the
  * process-wide pool, or `undefined` when worker mode is off (subagents then run
- * in-process); `task.workerThreads` is read live on every placement.
+ * in-process); `task.workerThreads` is read live on every placement. Each
+ * placement and each worker exit the pool observes writes one debug record
+ * with the runs in flight and the live workers.
  */
 import { MessageChannel } from "node:worker_threads";
 import { getProjectDir, logger, postmortem } from "@oh-my-pi/pi-utils";
@@ -132,6 +134,7 @@ export class SubagentWorker implements WorkerPeer {
 	readonly #options: SubagentWorkerOptions;
 	readonly #replyPort: MessagePort;
 	readonly #handshake = Promise.withResolvers<void>();
+	readonly #ended = Promise.withResolvers<void>();
 	#runs = 0;
 	#holds = 0;
 	#booted = false;
@@ -175,7 +178,10 @@ export class SubagentWorker implements WorkerPeer {
 			this.#die(`worker crashed: ${message}`);
 		});
 		worker.addEventListener("messageerror", () => this.#die("worker sent an undeliverable message"));
-		worker.addEventListener("close", event => this.#die(`worker exited with code ${event.code}`));
+		worker.addEventListener("close", event => {
+			this.#die(`worker exited with code ${event.code}`);
+			this.#ended.resolve();
+		});
 		this.#handshake.promise.catch(() => {});
 		this.ready = this.#start(channel.port2, counter);
 		// Callers that never await `ready` must not turn a failed start into an unhandled rejection.
@@ -205,6 +211,15 @@ export class SubagentWorker implements WorkerPeer {
 	/** Why the worker died, once it has. */
 	get exitReason(): string | undefined {
 		return this.#exitReason;
+	}
+
+	/**
+	 * Settles once the worker's thread has stopped, after {@link terminate} or its own exit: Bun
+	 * stops the thread after `terminate()` returns, and the descriptors it opened (its session
+	 * leases among them) close only then. See {@link WorkerPeer.ended}.
+	 */
+	get ended(): Promise<void> {
+		return this.#ended.promise;
 	}
 
 	/**
@@ -392,8 +407,11 @@ export class SubagentWorkerPool {
 	place(): SubagentPlacement {
 		if (this.#disposed) throw new Error("Subagent worker pool is disposed");
 		const worker = this.#select();
-		if (!worker) return { worker: undefined, release: this.beginMainRun() };
-		return { worker, release: worker.beginRun() };
+		const placement: SubagentPlacement = worker
+			? { worker, release: worker.beginRun() }
+			: { worker: undefined, release: this.beginMainRun() };
+		this.#logPlacement(worker?.threadId ?? "main");
+		return placement;
 	}
 
 	/** Wait until `placement`'s worker is ready; a failed start releases the placement and rejects. */
@@ -505,6 +523,18 @@ export class SubagentWorkerPool {
 		return onMain ? undefined : least;
 	}
 
+	/** One debug record per placement: where the run went, then the runs in flight on main and on each live worker. */
+	#logPlacement(where: ThreadId): void {
+		const workerRuns: Record<string, number> = {};
+		for (const [id, worker] of this.#workers) workerRuns[id] = worker.runs;
+		logger.debug("Subagent run placed", {
+			where,
+			mainRuns: this.#mainRuns,
+			workerRuns,
+			liveWorkers: this.#workers.size,
+		});
+	}
+
 	/** Start a worker; `warm` ones run the configured warm-up before they report ready. */
 	#spawn(warm: boolean): SubagentWorker {
 		const worker = new SubagentWorker({
@@ -534,6 +564,7 @@ export class SubagentWorkerPool {
 
 	#onExit(worker: SubagentWorker, reason: string): void {
 		this.#workers.delete(worker.threadId);
+		logger.debug("Subagent worker exited", { threadId: worker.threadId, reason, liveWorkers: this.#workers.size });
 		const timer = this.#idleTimers.get(worker.threadId);
 		if (timer) {
 			clearTimeout(timer);

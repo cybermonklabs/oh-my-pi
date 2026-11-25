@@ -8,9 +8,16 @@
  * {@link SubagentWorkerInit}; everything after it is an RPC frame.
  *
  * Its first import routes every log record to main (`./worker-log-install`)
- * before the rest of its graph evaluates. Like the CLI's network bootstrap, it
- * then installs PI_PROXY handling on this realm's `globalThis.fetch` (each
- * worker realm has its own), before any service can make a request.
+ * before the rest of its graph evaluates. Its second
+ * (`./text-format-forwarding`), also before the rest of the graph, replaces
+ * this realm's `Bun.YAML`, `Bun.TOML`, `Bun.JSONC`, `Bun.JSON5` and `Bun.XML`
+ * parsers with forwarders that parse on main while this worker lives, so a
+ * stopped worker leaks no per-thread parser heap unless it had to parse on its
+ * own thread (see that module); `start()` gives them the link through the
+ * first worker hook it runs, the `textFormat` service's
+ * (`./services/text-format`). Like the CLI's network bootstrap, it then
+ * installs PI_PROXY handling on this realm's `globalThis.fetch` (each worker
+ * realm has its own), before any service can make a request.
  *
  * This module only wires the link: thread identity, every service's worker
  * hooks, and the `boot`/`ping` handlers. It deliberately performs no
@@ -18,6 +25,7 @@
  * belongs to the main thread.
  */
 import "./worker-log-install";
+import "./text-format-forwarding";
 import { MessagePort, parentPort } from "node:worker_threads";
 import { installGlobalProxyFetch } from "@oh-my-pi/pi-ai/utils/proxy";
 import { logger } from "@oh-my-pi/pi-utils";

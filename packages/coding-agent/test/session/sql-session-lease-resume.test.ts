@@ -472,7 +472,7 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 	describe.skipIf(!url)(
 		`omp --resume <id> under OMP_SESSION_EXCLUSIVE=1 when an older build writes the file (${adapter})`,
 		() => {
-			// Through an append: a rewrite a caller asks for rejects a stale view instead (see the manager rows).
+			// Through an append; a rewrite a caller asks for recovers the same way (see the manager rows).
 			it("exits non-zero naming contested when an append and every full write meet a file an older build changed", async () => {
 				await using db = await openLeaseDb(adapter, url ?? "");
 				const session = await storedSession(db);

@@ -47,6 +47,7 @@ import {
 	StructuredSubagentError,
 	type StructuredSubagentRequest,
 } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
+import { createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/subagent-settings";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -1834,10 +1835,10 @@ describe("per-call model preflight", () => {
 		const taskConfig = 'task:\n  perCallModel: "on"\n  isolation:\n    enabled: false\n';
 		await Bun.write(configPath, `${taskConfig}modelRoles:\n  review: mock/target\n`);
 		const liveSettings = await Settings.loadIsolated({ cwd: projectDir, agentDir });
-		const child = executorModule.createSubagentSettings(liveSettings, {
+		const child = createSubagentSettings(liveSettings, {
 			modelRoles: { ...liveSettings.getModelRoles(), advisor: "mock/other" },
 		});
-		const settings = kind === "SDK overlay" ? liveSettings.overlay({}) : executorModule.createSubagentSettings(child);
+		const settings = kind === "SDK overlay" ? liveSettings.overlay({}) : createSubagentSettings(child);
 		const liveSession = Object.assign(perCallSession({}), { cwd: projectDir, settings });
 		const call = request({ session: liveSession, perCallModel: "mock/target:high" });
 		mockDiscovery();

@@ -5,7 +5,7 @@ import { syncAllSessions } from "@oh-my-pi/omp-stats/aggregator";
 import { closeDb, initDb } from "@oh-my-pi/omp-stats/db";
 import type { SpotlightAgentScope, SpotlightDashboardStats } from "@oh-my-pi/omp-stats/shared-types";
 import { buildSpotlightDashboard, getSpotlightSessionContext } from "@oh-my-pi/omp-stats/spotlight-aggregator";
-import { argumentTokens } from "@oh-my-pi/omp-stats/spotlight-ingest";
+import { argumentTokens } from "@oh-my-pi/omp-stats/spotlight-arguments";
 import { getSessionsDir } from "@oh-my-pi/pi-utils";
 import { SpotlightSessionBuilder } from "./helpers/spotlight-session";
 import { installStatsTestIsolation } from "./helpers/temp-agent";

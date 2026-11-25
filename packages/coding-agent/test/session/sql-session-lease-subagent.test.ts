@@ -21,17 +21,12 @@ import {
 	LeaseProcess,
 	openLeaseDb,
 	ROW_LEASE_BACKENDS,
+	STILL,
+	userTurn,
 } from "./sql-session-lease-fixture";
 
 // A holder process loads the whole module graph before it opens a session,
 // which takes seconds on a loaded box; these tests wait in real time for that.
-
-/** Timings under which no heartbeat runs during a test, so a lease moved back stays put. */
-const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
-
-function userTurn(text: string) {
-	return { role: "user" as const, content: text, timestamp: Date.now() };
-}
 
 /** `file`'s artifacts directory, under which its subagent transcripts are keyed. */
 function stemOf(file: string): string {

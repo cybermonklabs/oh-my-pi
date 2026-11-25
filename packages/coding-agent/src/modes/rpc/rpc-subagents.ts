@@ -1,9 +1,10 @@
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { type AgentRef, AgentRegistry } from "../../registry/agent-registry";
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
+import { applyEntryPatchesInWindow } from "../../session/entry-patches";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
-import { defaultSessionStorage, readSessionTextFrom, type SessionStorage } from "../../session/session-storage";
+import { defaultSessionStorage, readSessionLinesFrom, type SessionStorage } from "../../session/session-storage";
 import { type AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import {
 	type SubagentEventPayload,
@@ -67,15 +68,26 @@ function addPruned(set: Set<string>, value: string, maxSize: number): void {
 	}
 }
 
+/**
+ * The complete entries of `sessionFile` from byte `fromByte`, read in a window
+ * of at most 8 MiB (more only for a line longer than 4 MiB), so a long
+ * transcript is never held whole; a caller reads on from `nextByte`. A cursor
+ * past the end, or one no record ends right before (the transcript was
+ * rewritten since the caller's last read), reads the transcript again from its
+ * start and reports `reset`, so the caller drops what it read before. A
+ * rewrite that still ends a record right before the cursor goes unseen: the
+ * read then goes on from the cursor in the new body.
+ */
 export async function readRpcSubagentTranscript(
 	sessionFile: string,
 	fromByte = 0,
 	storage: SessionStorage = defaultSessionStorage(),
 ): Promise<RpcSubagentMessagesResult> {
 	let startByte = Number.isFinite(fromByte) ? Math.max(0, Math.trunc(fromByte)) : 0;
-	let read: { text: string; size: number };
+	let text: string;
 	try {
-		read = await readSessionTextFrom(storage, sessionFile, startByte);
+		// From the byte before the cursor: the newline of the record the caller read last.
+		({ text } = await readSessionLinesFrom(storage, sessionFile, Math.max(0, startByte - 1)));
 	} catch (err) {
 		if (!isEnoent(err)) throw err;
 		return {
@@ -88,17 +100,19 @@ export async function readRpcSubagentTranscript(
 		};
 	}
 	let reset = false;
-	if (startByte > read.size) {
-		// The transcript was rewritten shorter: read it again from the start.
+	if (startByte > 0 && text.startsWith("\n")) {
+		text = text.slice(1);
+	} else if (startByte > 0) {
+		// The transcript was rewritten shorter, or with no record ending at the cursor: read it again from the start.
 		startByte = 0;
 		reset = true;
-		read = await readSessionTextFrom(storage, sessionFile, 0);
+		text = (await readSessionLinesFrom(storage, sessionFile, 0)).text;
 	}
 
-	const text = read.text;
 	const lastNewline = text.lastIndexOf("\n");
 	const completeText = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : "";
 	const entries = completeText.length > 0 ? parseSessionEntries(completeText) : [];
+	applyEntryPatchesInWindow(entries);
 	const nextByte = startByte + Buffer.byteLength(completeText, "utf8");
 
 	return {
@@ -120,6 +134,7 @@ export class RpcSubagentRegistry {
 	#observabilityBus: EventBus | undefined;
 	#output: RpcSubagentOutput;
 	#subscriptionLevel: RpcSubagentSubscriptionLevel = "off";
+	#changeListeners = new Set<() => void>();
 
 	constructor(observabilityBus: EventBus, output: RpcSubagentOutput) {
 		this.#observabilityBus = observabilityBus;
@@ -143,6 +158,8 @@ export class RpcSubagentRegistry {
 		this.#subagents.clear();
 		this.#transcriptSessionFilesBySubagentId.clear();
 		this.#staleSubagentIds.clear();
+		this.#notifyChange();
+		this.#changeListeners.clear();
 	}
 
 	clear(): void {
@@ -154,6 +171,21 @@ export class RpcSubagentRegistry {
 		}
 		this.#subagents.clear();
 		this.#transcriptSessionFilesBySubagentId.clear();
+		this.#notifyChange();
+	}
+
+	/**
+	 * Call `listener` after every change to the roster `getSubagents` returns: a
+	 * subagent starts, reports progress or finishes, or the roster is cleared or
+	 * disposed. Returns the unsubscribe function.
+	 */
+	onChange(listener: () => void): () => void {
+		this.#changeListeners.add(listener);
+		return () => this.#changeListeners.delete(listener);
+	}
+
+	#notifyChange(): void {
+		for (const listener of this.#changeListeners) listener();
 	}
 
 	setSubscriptionLevel(level: RpcSubagentSubscriptionLevel): void {
@@ -229,6 +261,7 @@ export class RpcSubagentRegistry {
 		if (this.#subscriptionLevel !== "off") {
 			this.#output({ type: "subagent_lifecycle", payload });
 		}
+		this.#notifyChange();
 	}
 
 	handleProgress(payload: SubagentProgressPayload): void {
@@ -256,6 +289,7 @@ export class RpcSubagentRegistry {
 		if (this.#subscriptionLevel !== "off") {
 			this.#output({ type: "subagent_progress", payload });
 		}
+		this.#notifyChange();
 	}
 
 	handleEvent(payload: SubagentEventPayload): void {
@@ -283,23 +317,32 @@ export class RpcSubagentRegistry {
 	}
 }
 
-/** A running subagent from this session's roster, bound to its live registry ref. */
+/** A subagent from this session's roster, bound to its live registry ref. */
 export interface RpcOwnedSubagent {
 	ref: AgentRef;
 	session: AgentSessionHandle;
 }
 
 /**
- * Resolve a `get_subagents` id to its running, live registry ref, or
- * `undefined` when the host must not reach it (unknown, finished, accepted,
- * parked, aborted, or another session's agent).
+ * Resolve a `get_subagents` id to its live registry ref, or `undefined` when
+ * the host must not reach it (unknown, finished, accepted, parked, aborted, or
+ * another session's agent).
  *
  * Agent ids are unique only within one parent session's artifacts scope, and
  * the process-global registry keeps the latest ref per id, so the ref must
  * carry the transcript file this session's roster recorded
- * (`<artifactsDir>/<id>.jsonl`). The ref must also still be `running`: it goes
- * `idle` once the parent accepts its result, before the terminal lifecycle
- * frame prunes the roster, and a running ref always holds a live session.
+ * (`<artifactsDir>/<id>.jsonl`) and still hold its live session. The ref must
+ * be `running`, or `idle` between two turns of a run still being driven: its
+ * run neither ended nor accepted. A synchronous subagent waiting for its own
+ * async jobs (an eval `agent()` handle) is idle there while `get_subagents`
+ * still lists it running. The executor stamps `lifecycle.endedAt` once a run's
+ * drive ends (a first run, a follow-up turn or an IRC wake turn), whatever the
+ * outcome, a thrown drive included, and once a first run fails in its setup
+ * before its drive; acceptance also stamps
+ * `lifecycle.acceptedAt`; both happen before the cleanup and the terminal
+ * lifecycle frame that prunes the roster, so an accepted idle ref, and one
+ * whose run failed or stopped and is only being cleaned up, stay out of reach.
+ * A ref still `running` is reachable either way.
  */
 export function resolveOwnedLiveSubagent(
 	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
@@ -310,8 +353,9 @@ export function resolveOwnedLiveSubagent(
 	// lifecycle frame prunes the snapshot; treat that as not running.
 	if ((snapshot?.status !== "running" && snapshot?.status !== "pending") || !snapshot.sessionFile) return undefined;
 	const ref = AgentRegistry.global().get(subagentId);
-	if (ref?.kind !== "sub" || ref.status !== "running" || !ref.session || ref.sessionFile !== snapshot.sessionFile) {
-		return undefined;
-	}
-	return { ref, session: ref.session };
+	if (ref?.kind !== "sub" || !ref.session || ref.sessionFile !== snapshot.sessionFile) return undefined;
+	const reachable =
+		ref.status === "running" ||
+		(ref.status === "idle" && ref.lifecycle?.endedAt === undefined && ref.lifecycle?.acceptedAt === undefined);
+	return reachable ? { ref, session: ref.session } : undefined;
 }

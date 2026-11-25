@@ -2,25 +2,30 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type FileLockHandle, getBlobsDir, logger, postmortem, toError } from "@oh-my-pi/pi-utils";
-import type { SessionBlobSweep, SessionBlobTier } from "./blob-store";
+import { type FileLockHandle, getBlobsDir, isEnoent, logger, postmortem, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { digestStream } from "../utils/file-hash";
+import { BLOB_PREFIX, type SessionBlobSweep, type SessionBlobTier } from "./blob-store";
 import {
 	IndexedSessionStorage,
+	SessionAppendBatchRolledBackError,
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
+import { STALE_STAGING_MS, utf8PartEnd, utf8Parts } from "./session-staging";
 import {
 	type SessionAcquireOptions,
 	type SessionClaimHolder,
 	type SessionClaimOptions,
 	SessionLeaseLostError,
+	SessionReadConflictError,
 	type SessionStorage,
 	SessionWriteConflictError,
+	claimSessionLease,
+	sessionHeaderIdInPrefix,
 	sessionLeaseId,
-	tryAcquireSessionLease,
 } from "./session-storage";
 import { eexist, enoent } from "./session-storage-errors";
-import { parseTitleSlotFromContent, type SessionTitleUpdate } from "./session-title-slot";
+import type { SessionTitleUpdate } from "./session-title-slot";
 
 /**
  * Supported `bun:sql` adapter dialects. `Bun.SQL` reports this string on
@@ -142,6 +147,21 @@ export const SESSION_LEASE_HEARTBEAT_MS = 10_000;
  * stops): one expiry and 5 s.
  */
 export const SESSION_OPEN_CLAIM_WAIT_MS = SESSION_LEASE_EXPIRY_MS + 5000;
+/**
+ * How long, from when it begins, a claim of a session on a SQLite file keeps
+ * trying to take the session's OS lock while another process holds it: a
+ * claim made while that process lets the session go (it closes the session,
+ * or exits) then takes the session instead of moving it to a sibling. The
+ * native claim of a held lock may itself wait about this long for a live
+ * holder to let go (the abstract-socket lock does, in builds that retry a
+ * refused bind) or answer "taken" at once (the open-file-description lock of
+ * newer builds does). The store tries again from the event loop, every
+ * {@link SQLITE_CLAIM_RETRY_MS}, so it never blocks the thread itself; and
+ * since the window counts from the claim's start, a native claim that waited
+ * has used it up and is not tried again. Never longer than a claim's
+ * `waitMs`.
+ */
+export const SQLITE_CLAIM_RELEASE_WINDOW_MS = 50;
 
 /** A dialect-rendered statement and the names of the values it binds, in binding order. */
 interface Statement {
@@ -149,7 +169,7 @@ interface Statement {
 	readonly params: readonly string[];
 }
 
-type StatementValues = Readonly<Record<string, string | number | Uint8Array | null>>;
+type StatementValues = Readonly<Record<string, string | number | bigint | Uint8Array | null>>;
 
 interface DialectQueries {
 	createTable: string;
@@ -166,10 +186,19 @@ interface DialectQueries {
 	loadIndex: string;
 	/**
 	 * One append: grow the session row's `byte_len` (taking its row lock), then
-	 * insert the line as a part at the old length. PostgreSQL does both in one
-	 * statement; every dialect runs its list in one transaction.
+	 * insert the line as a part at the old length, on SQLite with a rowid from
+	 * `@now` (see {@link partRowids}). PostgreSQL does both in one statement;
+	 * every dialect runs its list in one transaction.
 	 */
 	append: readonly Statement[];
+	/**
+	 * A batch of appends' row: grow the session row's `byte_len` by `@len`
+	 * (taking its row lock, inserting the row when it is missing) and set its
+	 * `mtime_ms`. PostgreSQL and SQLite return the new `byte_len`; on MySQL,
+	 * which returns no rows from a write, {@link lockSize} reads it after. The
+	 * batch then inserts its parts ({@link insertPart}) from the old length.
+	 */
+	growRow: Statement;
 	/** The session's `byte_len`, row-locked for the rest of the transaction where the dialect can. */
 	lockSize: Statement;
 	/** Insert or replace the session row of a full write. */
@@ -182,15 +211,67 @@ interface DialectQueries {
 	deleteParts: Statement;
 	/**
 	 * Delete every session row whose path starts with `@dir` (its first `@len`
-	 * characters equal it; a character comparison, not `LIKE`, so `%` and `_`
-	 * stay literal and SQLite's ASCII-insensitive `LIKE` cannot match another
-	 * case) and exactly those rows' parts. PostgreSQL and MySQL do both in one
-	 * statement, so the parts deleted are those of the rows deleted: a row
-	 * another client commits between two statements would otherwise keep its
-	 * row and lose its parts under READ COMMITTED. SQLite runs the two
-	 * statements inside `BEGIN IMMEDIATE`, where no other writer runs.
+	 * characters equal it, compared exactly whatever the `path` column's
+	 * collation: not by `LIKE`, so `%` and `_` stay literal and SQLite's
+	 * ASCII-insensitive `LIKE` cannot match another case; on PostgreSQL as
+	 * code points, as a nondeterministic collation finds "R/A/" equal to
+	 * "R/a/"; on MySQL and MariaDB as bytes, see below) and exactly those
+	 * rows' parts, then every part under `@dir` that has no row:
+	 * a staged full write's parts that its killed writer never swapped in, of
+	 * a path the delete may not know of (on MySQL, not those of a path too
+	 * long for a staging path under `@dir`, staged under its hash, see
+	 * `#stagingPrefix`).
+	 * PostgreSQL and MySQL delete the rows and their parts in one statement,
+	 * so the parts deleted are those of the rows deleted: a row another
+	 * client commits between two statements would
+	 * otherwise keep its row and lose its parts under READ COMMITTED; the
+	 * second statement deletes only parts whose row it does not see, found by
+	 * a range of the parts' primary key, from `@stem` (`@dir` without its
+	 * final "/") up to `@dir_end` (`@dir` with its final "/" made "0"), with
+	 * the prefix compared too. That range holds every path under `@dir` where
+	 * the `path` column compares by code point: such a path extends `@stem`,
+	 * and differs from `@dir_end` first at its "/". It holds under MySQL's
+	 * `utf8mb4_bin` too, which compares two strings as if the shorter were
+	 * padded with spaces (PAD SPACE): "/" sorts above the space, while a path
+	 * whose character after `@dir` sorts below the space sorts below `@dir`
+	 * itself, so the range starts at `@stem`. For the same reason MySQL and
+	 * MariaDB compare the prefix as bytes: MariaDB 11.8 finds no such path by
+	 * `substr(path, 1, n) = @dir`, as a key range from `@dir` in PAD SPACE
+	 * order would not. PostgreSQL takes the range only
+	 * under a code-point collation (see
+	 * {@link pathCollationKeepsDirectoryRange}). SQLite runs its statements
+	 * inside `BEGIN IMMEDIATE`, where no other writer runs; its parts delete
+	 * takes every part under `@dir`.
 	 */
 	deleteUnder: Statement[];
+	/**
+	 * {@link deleteUnder} without the key range: on PostgreSQL the second
+	 * statement compares the prefix alone, a scan of the parts, for a `path`
+	 * column whose collation does not compare by code point. Such a collation
+	 * can sort a path under `@dir` outside the range: a libc locale such as
+	 * `en_US.UTF-8` ignores "/" at its first level, ICU's Thai collation
+	 * ignores punctuation there (`'/s/a/b' < '/s/a0'` is false under
+	 * `th-x-icu`), and any locale's tailoring or rules can do the same. The
+	 * other dialects' statements are {@link deleteUnder}'s.
+	 */
+	deleteUnderScan: Statement[];
+	/**
+	 * Delete the staging parts named from `@low` (a path's staging prefix,
+	 * `<path>#staging-` or its hashed form, see `#stagingPrefix`) up to, not
+	 * including, `@high`: a primary-key range, and the prefix compared exactly
+	 * too (on PostgreSQL as code points, on MySQL and MariaDB as bytes, as in
+	 * {@link deleteUnder}), so a collation that orders the range otherwise, or
+	 * finds two paths equal, can never reach another path's parts. A staging
+	 * name has a digit after `@low`, and a "-" after the epoch `@high` ends
+	 * with, both above the space, so MySQL's PAD SPACE orders these names as
+	 * code-point order does.
+	 */
+	deleteStaging: Statement;
+	/** Whether {@link deleteStaging} would find any part, read without locking. */
+	hasStaging: Statement;
+	/** The byte length of each staging part of `@path`, row-locked where the dialect can, so no peer deletes one before the swap. */
+	stagedBytes: Statement;
+	/** Insert a part; on SQLite with a rowid from `@now` (see {@link partRowids}). */
 	insertPart: Statement;
 	renameRow: Statement;
 	renameParts: Statement;
@@ -203,6 +284,78 @@ interface DialectQueries {
 	readSlices: Statement;
 	/** The session's size and its bytes from an offset: the session row's and those of the parts covering the window. */
 	readFrom: Statement;
+	/**
+	 * The session's size, the byte length of the row's own content and its bytes
+	 * from `@offset` on, and the part the read starts at: its start
+	 * (`first_part`, -1 when there is none) and its row identity (`first_id`,
+	 * see {@link partRowids}; null on MySQL, which has none). That part is the
+	 * last one starting at or before `@offset`, or, for a read from inside the
+	 * row's own content, the first one. On MySQL also the session's last part,
+	 * the last one starting before the size: its start (`tail_part`) and the
+	 * SHA-256 in hex of its start in decimal, ":" and its bytes
+	 * (`tail_digest`), both null when there is none.
+	 */
+	readChunksStart: Statement;
+	/**
+	 * The parts that start from `@next` up to, not including, `@end`, in
+	 * `start_offset` order: one page. On PostgreSQL and SQLite the page is
+	 * empty unless the part at `@anchor` still has the row identity
+	 * `@anchor_id`, checked in the same statement. On SQLite it is also empty
+	 * unless the part at `@last` (the last one the read has fetched, -1 before
+	 * the first page) still holds `@last_content`. MySQL checks neither; its
+	 * read checks the session's last part against `tail_digest` when it fetches
+	 * it, and what it yielded, when it ends or is closed, with
+	 * {@link readChunksDigest}.
+	 */
+	readParts: Statement;
+	/**
+	 * MySQL only, which has no row identity: the digest of what a chunked read
+	 * yielded, as the parts table holds it now, which the read computes the
+	 * same way over what it fetched ({@link addChunkDigest}). Its items are the
+	 * row's own content from `@offset` on (`@row_from` as in
+	 * {@link readChunksStart}), when `@offset` is inside it, and the parts that
+	 * start from `@first` up to, not including, `@end`: the end of the last
+	 * part the read yielded. An item's digest is the first 128 bits of the
+	 * SHA-256 of its offset in decimal, ":" and its bytes; the digest is their
+	 * XOR, in 32 upper-case hex digits (`digest`). One aggregate, so the server
+	 * never holds the session whole. SHA-256 rather than MD5, which a MySQL
+	 * server in FIPS mode answers with NULL.
+	 */
+	readChunksDigest: Statement | undefined;
+	/**
+	 * SQLite only: the first rowid a full write's parts take, as decimal text
+	 * (a rowid can reach 2^63 - 1, which a JavaScript number holds exactly only
+	 * up to 2^53, so the write counts up in a `bigint`), and an insert that
+	 * sets a part's rowid. A part's row identity, which a chunked read
+	 * checks, is its `xmin` on PostgreSQL (the transaction that wrote it) and
+	 * its `rowid` on SQLite. SQLite gives a new row the largest rowid plus one,
+	 * which hands the rowid of a deleted last row out again; so every part
+	 * insert on SQLite (the append's, {@link insertPart}'s, and a full write's
+	 * through these) takes a rowid above every one handed out before the
+	 * current millisecond `@now`: the largest rowid plus one, or `@now * 1024`
+	 * when that is more. A full write reads its first rowid before it deletes
+	 * the parts it replaces and counts up from there, so none of its parts
+	 * takes the rowid of one of those. A part inserted in a later millisecond
+	 * than a deleted one never takes its rowid as long as the table takes at
+	 * most 1024 rowids a millisecond, far more than SQLite inserts. It can
+	 * when the clock goes back (or another process's clock, on a database file
+	 * several hosts share, is behind), or when a part is deleted and another
+	 * inserted in the millisecond of the deleted part's own insert. A writer
+	 * older than this rule still hands out the largest rowid plus one.
+	 *
+	 * A part whose rowid by the rule would pass {@link SQLITE_MAX_ROWID}, the
+	 * largest SQLite has (as when another program stored a row under it), goes
+	 * in with no rowid of its own: `next_rowid` is null when the largest rowid
+	 * is that already, and a full write binds null for every part it would
+	 * count past it. SQLite then picks one, as it does for an older writer: the
+	 * largest rowid plus one, or, while the table holds rowid 2^63 - 1, an
+	 * unused one at random. The rule does not hold for that table then, and a
+	 * new part can take the rowid of a deleted one: what still finds a
+	 * replacement during a chunked read is the part at its anchor no longer
+	 * having the rowid the read started with, or the last part it fetched no
+	 * longer holding the same bytes at its offset (see {@link readParts}).
+	 */
+	partRowids: { next: Statement; insert: Statement } | undefined;
 	/** The blob table, `<table>_blobs`: one row per SHA-256 of a blob a session references and cannot draw again. */
 	createBlobsTable: string;
 	/** Add a blob row unless its hash has one; answers a row only when it added one (MySQL: `affectedRows`). */
@@ -242,7 +395,7 @@ interface DialectQueries {
 	insertRef: Statement;
 	/** The references of `count` paths (path and hash), bound as `@p0` to `@p<count - 1>`. */
 	refsOf(count: number): Statement;
-	/** The references (path and hash) of the paths under `@dir` (its first `@len` characters). */
+	/** The references (path and hash) of the paths under `@dir` (its first `@len` characters, compared as {@link deleteUnder} compares them). */
 	refsUnder: Statement;
 	/** Of `count` hashes, the ones a reference row names (PostgreSQL and SQLite; MySQL's is {@link referencedOne}). */
 	referenced(count: number): Statement;
@@ -257,7 +410,16 @@ interface DialectQueries {
 	danglingRefs: Statement;
 	/** PostgreSQL and SQLite: drop the reference of `@path` to `@sha256` while `@path` has no session row. */
 	deleteDanglingRef: Statement;
-	/** PostgreSQL and MySQL: lock exclusive, in path order, the session rows of `count` paths, with `under` every row under `@dir` too (MySQL's caller names, without `under`, only rows there are). */
+	/**
+	 * PostgreSQL and MySQL: lock exclusive, in path order, the session rows of
+	 * `count` paths, with `under` every row under `@dir` too, as
+	 * {@link deleteUnder} compares the prefix (MySQL's caller names, without
+	 * `under`, only rows there are). On MySQL and MariaDB the rows under
+	 * `@dir` are read by {@link deleteUnder}'s key range, from `@stem` up to
+	 * `@dir_end`, with the prefix compared as bytes too: a compare as bytes is
+	 * no key range, and an `OR` with no key range on one side scans the whole
+	 * session table, locking every row and gap until COMMIT.
+	 */
 	lockSessionRowsForWrite: ((count: number, under: boolean) => Statement) | undefined;
 	/** MySQL: the paths of `count` paths that have a session row, read without a lock. */
 	sessionRowsOf: ((count: number) => Statement) | undefined;
@@ -439,6 +601,78 @@ interface ReadFromRow {
 	bytes: Uint8Array | null;
 }
 
+/**
+ * `readChunksStart` row: `head` is the row's own content from the offset on,
+ * `first_part` the start of the part the read starts at, -1 when there is none,
+ * and `first_id` that part's row identity (a rowid on SQLite, as text past
+ * 2^53, which a JavaScript number does not hold exactly; `xmin` as text on
+ * PostgreSQL), null on MySQL or when there is no such part.
+ */
+interface ChunksStartRow {
+	byte_len: number | bigint | string | null;
+	content_len: number | bigint | string;
+	head: Uint8Array | null;
+	first_part: number | bigint | string;
+	first_id: number | string | null;
+	/** MySQL: the start of the session's last part (see `DialectQueries.readChunksStart`), null when there is none. */
+	tail_part?: number | bigint | string | null;
+	/** MySQL: the SHA-256 in hex of that part's start in decimal, ":" and its bytes. */
+	tail_digest?: string | null;
+}
+
+/** `readParts` row. */
+interface PartRow {
+	start_offset: number | bigint | string;
+	content: string;
+}
+
+/** `stagedBytes` row. */
+interface StagedPartRow {
+	len: number | bigint | string;
+}
+
+/** `readChunksDigest` row: the digest in upper-case hex. */
+interface ChunksDigestRow {
+	digest: string;
+}
+
+/** `partRowids.next` row: the rowid in decimal, or null when SQLite is to pick it (see `DialectQueries.partRowids`). */
+interface RowidRow {
+	next_rowid: string | null;
+}
+
+/** `PRAGMA data_version` row (SQLite). */
+interface DataVersionRow {
+	data_version: number | bigint | string;
+}
+
+/** What one pass of a chunked read read (see `SqlSessionStorageBackend.readChunks`), which the checks at its end compare. */
+interface ChunksPass {
+	/** MySQL: the digest of the head and of every part the pass read, each part whole (see `DialectQueries.readChunksDigest`). */
+	readonly digest?: Buffer;
+	/** SQLite, the read's own pass: the SHA-256 of the bytes the pass yielded. */
+	readonly hash?: Bun.CryptoHasher;
+	/**
+	 * SQLite, the pass with `hash`: the read's start mark (see
+	 * `SqlSessionStorageBackend.#sqliteMark`), which the pass takes in the call
+	 * queue's turn of its first query, right before it.
+	 */
+	mark?: string;
+	/**
+	 * MySQL: the session's last part as the first query saw it, its start and
+	 * its {@link partDigest}, and whether the pass fetched it.
+	 */
+	tail?: { readonly start: number; readonly digest: Buffer; fetched: boolean };
+	/** Bytes the pass yielded. */
+	yielded: number;
+	/** Where the parts the pass read start: the part it started in, or the end of the row's own content. */
+	first: number;
+	/** The end of the last part the pass read. */
+	next: number;
+	/** The queries whose bytes the pass yielded: the first one's head, and each page. */
+	sources: number;
+}
+
 /** `selectBlobs` row. */
 interface BlobRow {
 	sha256: string;
@@ -460,6 +694,26 @@ interface HashRow {
 /** A row with only a path column. */
 interface PathRow {
 	path: string;
+}
+
+/** The values a directory delete binds (see `DialectQueries.deleteUnder`); a type, so it binds as statement values. */
+type UnderDirectory = {
+	/** The directory, with its final "/". */
+	dir: string;
+	/** Its length in characters. */
+	len: number;
+	/** The directory without its final "/": where its key range starts. */
+	stem: string;
+	/** The directory with its final "/" made "0": where its key range ends. */
+	dir_end: string;
+};
+
+/** What `#lockSessionRowsForWrite` answers. */
+interface LockedSessionRows {
+	/** MySQL and MariaDB without `under`: the paths whose rows it locked, the only ones the caller changes. Elsewhere `undefined`. */
+	present: ReadonlySet<string> | undefined;
+	/** PostgreSQL and MySQL with `under`: every row it locked, of the paths named and under the directory. Elsewhere none. */
+	locked: readonly PathRow[];
 }
 
 /** A reference row. */
@@ -593,10 +847,61 @@ function withinBound(work: Promise<void>, ms: number): Promise<"done" | "timeout
 const SESSION_HEADER_PREFIX_BYTES = 64 * 1024;
 /** How often a claim waiting for another holder's lease reads that lease again. */
 const LEASE_WAIT_POLL_MS = 1000;
+/** How often a SQLite claim tries a lock another process holds again, within {@link SQLITE_CLAIM_RELEASE_WINDOW_MS}. */
+const SQLITE_CLAIM_RETRY_MS = 5;
 /** How often a write waiting for its claim's heartbeat to be confirmed again looks. */
 const LAPSE_POLL_MS = 50;
-/** Largest part a full write stores; an append stores its line as one part. */
+/**
+ * Largest part a full write, or a batch of appends, stores: a batch's short
+ * lines share a part and a long one spans several. A line appended alone is
+ * one part of its own length.
+ */
 const PART_BYTES = 1024 * 1024;
+/** The largest rowid SQLite has, 2^63 - 1 (see `DialectQueries.partRowids`). */
+const SQLITE_MAX_ROWID = 2n ** 63n - 1n;
+/**
+ * Bytes the first page of a `readChunks` read spans, from the byte it starts
+ * at. A reader that stops within this window (the Agent Hub roster's
+ * metadata read stops after a transcript's first records) fetches about this
+ * much plus the part the window ends in, and the head of the part it starts
+ * in; each next page spans twice the last, up to {@link PAGE_SPAN_BYTES}, so
+ * a whole read takes only a few more queries.
+ */
+const FIRST_PAGE_SPAN_BYTES = 1024 * 1024;
+/**
+ * Most bytes one `readChunks` page spans: a later page holds the parts that
+ * start within its span of where the read is, so at most this much plus the
+ * part that starts last. The parts of a full write and of a batch of appends
+ * are at most {@link PART_BYTES}; a line appended alone is one part of its own
+ * length, so a page stays within 16 MiB while no line appended alone is
+ * longer than 4 MiB.
+ */
+const PAGE_SPAN_BYTES = 12 * 1024 * 1024;
+/**
+ * Characters MySQL's `path` columns hold (`VARCHAR(512)` in both tables).
+ * PostgreSQL and SQLite store `path` as `TEXT`, with no such limit.
+ */
+const MYSQL_PATH_CHARS = 512;
+/** Staging parts one transaction of a streamed full write inserts. */
+const STAGING_PARTS_PER_TRANSACTION = 16;
+/** Starts a staging path's suffix: `<staging prefix><epoch ms, STAGING_EPOCH_DIGITS wide>-<id>`. */
+const STAGING_MARK = "#staging-";
+/** Digits of the epoch in a staging path, fixed so that the names of one path sort by age. */
+const STAGING_EPOCH_DIGITS = 13;
+/** Characters a staging path adds to its prefix: the epoch, "-" and a 16-hex Snowflake id. */
+const STAGING_ID_CHARS = STAGING_EPOCH_DIGITS + 1 + 16;
+/**
+ * The longest path whose staging path, `<path>#staging-<epoch>-<id>`, fits
+ * MySQL's `path` column; a longer one stages under its hash (see
+ * `#stagingPrefix`).
+ */
+const MYSQL_PLAIN_STAGING_CHARS = MYSQL_PATH_CHARS - STAGING_MARK.length - STAGING_ID_CHARS;
+/**
+ * Starts the staging prefix of a path longer than
+ * {@link MYSQL_PLAIN_STAGING_CHARS} on MySQL, followed by the path's SHA-256
+ * in hex and {@link STAGING_MARK}. No session path starts with "#".
+ */
+const HASHED_STAGING = "#omp-staging/";
 /** Hashes one blob size read asks for. */
 const BLOB_READ_BATCH = 100;
 /** Bytes one blob read asks for (a larger blob is read alone), so a read holds at most about this much at a time. */
@@ -612,10 +917,10 @@ const MYSQL_PACKET_HEADROOM = 1024 * 1024;
 /**
  * The path prefix of a parted blob's references: a blob larger than one row
  * takes is stored as parts, each a blob row under its own hash, and the row
- * of its own hash lists them; `<prefix><hash>` references each part, so no
- * sweep takes a part of a kept blob.
+ * of its own hash lists them; `<prefix><hash>`, the parted blob's own
+ * reference, references each part, so no sweep takes a part of a kept blob.
  */
-const BLOB_PARTS_PATH = "blob:sha256:";
+const BLOB_PARTS_PATH = BLOB_PREFIX;
 const SCHEMA_DOCS = 'docs/session.md ("SQL session storage")';
 /** How long a SQLite connection waits for another process's write lock, when the client sets no wait itself. */
 const SQLITE_BUSY_TIMEOUT_MS = 5000;
@@ -664,6 +969,16 @@ const sqliteFileQueues = new Map<string, SqliteQueue>();
 const sqliteClientQueues = new WeakMap<SqlSessionStorageClient, SqliteQueue>();
 
 /**
+ * Whether a SQLite `filename` opens a database that only its own connection
+ * sees: `":memory:"`, an in-memory database, or `""`, a private temporary one
+ * that SQLite deletes when the connection closes. No other connection can
+ * open it, so none can commit to it.
+ */
+function isPrivateSqliteDatabase(filename: unknown): boolean {
+	return filename === "" || filename === ":memory:";
+}
+
+/**
  * The call queue every store in this process shares for `client`'s database.
  * Bun's SQLite adapter runs each client's statements on one connection, so a
  * statement issued while another call's transaction is open would join that
@@ -672,12 +987,13 @@ const sqliteClientQueues = new WeakMap<SqlSessionStorageClient, SqliteQueue>();
  * process for the whole busy timeout, then fails. So calls queue per database
  * file, by its identity ({@link sqliteFileIdentity} of `options.filename`,
  * which `Bun.SQL` sets), so two spellings of one file share a queue, and the
- * busy wait only ever waits on other processes. In-memory databases, and
- * wrappers that hide `options.filename`, queue per client object.
+ * busy wait only ever waits on other processes. Private databases
+ * ({@link isPrivateSqliteDatabase}), and wrappers that hide
+ * `options.filename`, queue per client object.
  */
 function sqliteQueue(client: SqlSessionStorageClient): SqliteQueue {
 	const filename = client.options.filename;
-	if (typeof filename !== "string" || filename === "" || filename === ":memory:") {
+	if (typeof filename !== "string" || isPrivateSqliteDatabase(filename)) {
 		let queue = sqliteClientQueues.get(client);
 		if (!queue) {
 			queue = { tail: Promise.resolve() };
@@ -692,6 +1008,50 @@ function sqliteQueue(client: SqlSessionStorageClient): SqliteQueue {
 		sqliteFileQueues.set(key, queue);
 	}
 	return queue;
+}
+
+/** Slots of {@link SqliteWrites.slots}: a client keeps this many write counts, however many paths it writes. */
+const SQLITE_WRITE_SLOTS = 1024;
+
+/**
+ * SQLite: the writes one client made that can change the bytes of a session
+ * path. A chunked read compares them, with `PRAGMA data_version`, before its
+ * first query and at its end (see `SqlSessionStorageBackend.readChunks`). The
+ * pragma moves when another connection, of this process or another, commits
+ * to the database file, and never for the connection's own commits; these
+ * counts cover those. A write counts in the slot of its path
+ * ({@link sqliteWriteSlot}), one of {@link SQLITE_WRITE_SLOTS}, so the counts
+ * hold the same memory however many paths a process writes in its life. Two
+ * paths that share a slot only cause extra check passes of a read (at most
+ * two), never a missed one: a parent's appends make its subagents' reads check again only
+ * when their paths share a slot. A slot's count wraps at 2^32, which makes a
+ * read's end mark equal its start mark only when 2^32 writes of its slot land
+ * between them. A directory delete, which can change every path under the
+ * directory, counts once for every path.
+ */
+interface SqliteWrites {
+	/** Writes that can change every path: directory deletes. */
+	every: number;
+	/** Writes of the paths of each slot: appends, full writes and the swaps of staged ones, deletes, both paths of a rename. */
+	readonly slots: Uint32Array;
+}
+
+/** The slot of {@link SqliteWrites.slots} that counts the writes of `path`. */
+function sqliteWriteSlot(path: string): number {
+	return Bun.hash.xxHash32(path) % SQLITE_WRITE_SLOTS;
+}
+
+/** {@link SqliteWrites} by client: a store has one client, and stores that share a client share its connection. */
+const sqliteClientWrites = new WeakMap<SqlSessionStorageClient, SqliteWrites>();
+
+/** The write counts of `client`'s connection (see {@link SqliteWrites}), shared by every store on that client. */
+function sqliteWrites(client: SqlSessionStorageClient): SqliteWrites {
+	let writes = sqliteClientWrites.get(client);
+	if (!writes) {
+		writes = { every: 0, slots: new Uint32Array(SQLITE_WRITE_SLOTS) };
+		sqliteClientWrites.set(client, writes);
+	}
+	return writes;
 }
 
 /**
@@ -1028,6 +1388,51 @@ interface TableObjectRow {
 	name: string;
 }
 
+/**
+ * The collation the parts table's `path` column compares with, and the
+ * database's, as `to_jsonb` prints their catalog rows: the column's own
+ * collation, or for the default collation (provider `d`) the database's. The
+ * rows are read whole so the columns of every version since PostgreSQL 10
+ * can be read by name (`datlocprovider` exists since 15).
+ */
+const PG_PATH_COLLATION = statement(
+	"postgres",
+	"SELECT pg_catalog.to_jsonb(c)::pg_catalog.text AS collation, pg_catalog.to_jsonb(d)::pg_catalog.text AS database " +
+		"FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_collation c ON c.oid = a.attcollation " +
+		"JOIN pg_catalog.pg_database d ON d.datname = pg_catalog.current_database() " +
+		"WHERE a.attrelid = pg_catalog.to_regclass(@table) AND a.attname = 'path' AND NOT a.attisdropped",
+);
+
+/** {@link PG_PATH_COLLATION} row. */
+interface PathCollationRow {
+	collation: string;
+	database: string;
+}
+
+/**
+ * Whether the collation of {@link PG_PATH_COLLATION}'s row compares by code
+ * point, so that it sorts every path under a directory `<stem>/` above
+ * `<stem>` and below `<stem>0`, and the directory delete may find them by a
+ * key range (see `deleteUnder`): the builtin provider, and libc's `C` and
+ * `POSIX`. Any other collation may sort a path under the directory outside
+ * that range, and the delete then compares the prefix alone. A libc locale
+ * such as `en_US.UTF-8` ignores "/" at its first level; ICU's Thai collation
+ * makes punctuation ignorable at its first level (`'/s/a/b' < '/s/a0'` is
+ * false under `th-x-icu`), and any ICU locale's tailoring, extension keywords
+ * (`-u-ka-shifted`, `-u-kr-`) or rules can do the same.
+ */
+function pathCollationKeepsDirectoryRange(row: PathCollationRow | undefined): boolean {
+	if (!row) return false;
+	const collation = JSON.parse(row.collation) as Record<string, unknown>;
+	const database = JSON.parse(row.database) as Record<string, unknown>;
+	const own = collation.collprovider !== "d";
+	const provider = own ? collation.collprovider : (database.datlocprovider ?? "c");
+	if (provider === "b") return true;
+	if (provider !== "c") return false;
+	const locale = own ? collation.collcollate : database.datcollate;
+	return locale === "C" || locale === "POSIX";
+}
+
 /** `schema` as a PostgreSQL identifier, quoted. */
 function quoteIdentifier(schema: string): string {
 	return `"${schema.replaceAll('"', '""')}"`;
@@ -1060,10 +1465,21 @@ function buildQueries(
 		mysql: "cast(content AS binary)",
 		sqlite: "cast(content AS blob)",
 	}[adapter];
-	const contentByteLength = {
-		postgres: "octet_length(content)",
-		mysql: "length(content)",
-		sqlite: "length(cast(content AS blob))",
+	const byteLengthOf = (column: string): string =>
+		({
+			postgres: `octet_length(${column})`,
+			mysql: `length(${column})`,
+			sqlite: `length(cast(${column} AS blob))`,
+		})[adapter];
+	const contentByteLength = byteLengthOf("content");
+	// A part's row identity (see DialectQueries.partRowids), which readChunksStart reads and readParts compares with
+	// what it read; MySQL has none. A SQLite rowid past 2^53, which a JavaScript number does not hold exactly, is text.
+	const partId = {
+		postgres: "CAST(p.xmin AS text)",
+		mysql: undefined,
+		sqlite:
+			`CASE WHEN p.rowid BETWEEN ${-Number.MAX_SAFE_INTEGER} AND ${Number.MAX_SAFE_INTEGER} THEN p.rowid ` +
+			"ELSE CAST(p.rowid AS text) END",
 	}[adapter];
 	const emptyBytes = { postgres: "''::bytea", mysql: "cast('' AS binary)", sqlite: "x''" }[adapter];
 	const greatest = adapter === "sqlite" ? "max" : "greatest";
@@ -1073,9 +1489,75 @@ function buildQueries(
 	const bigint = (expr: string): string => (adapter === "postgres" ? `CAST(${expr} AS bigint)` : expr);
 	const rowColumns = "path, content, mtime_ms, title, title_source, title_updated_at, byte_len";
 	const rowValues = "@path, '', @mtime, @title, @title_source, @title_updated_at, @len";
-	const appendRow = `INSERT INTO ${table} (path, content, mtime_ms, byte_len) VALUES (@path, '', @mtime, @len) `;
+	// Grow the session row by `@len` bytes, inserting it when missing: the first step of an append and of a batch.
+	const growRow =
+		`INSERT INTO ${table} (path, content, mtime_ms, byte_len) VALUES (@path, '', @mtime, @len) ` +
+		(mysql
+			? "ON DUPLICATE KEY UPDATE byte_len = byte_len + @len, mtime_ms = @mtime"
+			: `ON CONFLICT (path) DO UPDATE SET byte_len = ${table}.byte_len + excluded.byte_len, mtime_ms = excluded.mtime_ms`);
 	// Scalar subqueries rather than a CTE, so MySQL 5.7 runs this too.
 	const tailStart = `(SELECT byte_len FROM ${table} WHERE path = @path) - @suffix`;
+	// The parts of `r`'s session that start at or before where a chunked read
+	// starts, or, when that is inside `r`'s own content, where that content ends.
+	const startPart =
+		`FROM ${parts} AS p WHERE p.path = @path ` +
+		`AND p.start_offset <= ${greatest}(${bigint("@offset")}, ${byteLengthOf("r.content")})`;
+	// MySQL: the last part of `r`'s session that starts before its size, the one a chunked read to the end fetches last.
+	const tailPart = `FROM ${parts} AS t WHERE t.path = @path AND t.start_offset < r.byte_len ORDER BY t.start_offset DESC LIMIT 1`;
+	// MySQL: the SHA-256 in hex of `offset` in decimal, ":" and `bytes`, which partDigest computes on the client.
+	const partDigestOf = (offset: string, bytes: string): string => `SHA2(CONCAT(${offset}, ':', ${bytes}), 256)`;
+	// `<column>` starts with `<value>`: its first `@len` characters equal it, exactly, whatever the column's collation.
+	// On PostgreSQL as code points (`COLLATE "C"`): `substr` of a column takes the column's collation, and under a
+	// nondeterministic one (a case-insensitive ICU collation, say) "R/A/" equals "R/a/". On MySQL and MariaDB as bytes,
+	// so that no collation, and no key range the server makes of the compare, answers it: MariaDB 11.8 finds no path
+	// whose character after the prefix sorts below the space by `substr(path, 1, n) = …`, as utf8mb4_bin's PAD SPACE
+	// orders it. SQLite compares a function's result, which is not a column, with BINARY (memcmp), whatever the
+	// column's collation (https://www.sqlite.org/datatype3.html#assigning_collating_sequences_from_sql).
+	const startsWith = (column: string, value: string): string =>
+		({
+			postgres: `substr(${column}, 1, @len) COLLATE "C" = ${value}`,
+			mysql: `CAST(substr(${column}, 1, @len) AS BINARY) = CAST(${value} AS BINARY)`,
+			sqlite: `substr(${column}, 1, @len) = ${value}`,
+		})[adapter];
+	// `<column>` is a path under `@dir`: with `range`, within the directory's key range from `@stem` up to
+	// `@dir_end` first, so the server reads (and a locking statement locks) only that range, then the prefix itself
+	// (see deleteUnder).
+	const underDirectory = (column: string, range: boolean): string =>
+		`${range ? `${column} >= @stem AND ${column} < @dir_end AND ` : ""}${startsWith(column, "@dir")}`;
+	// SQLite only: the rowid a part inserted at `@now` (ms since the epoch) takes, see DialectQueries.partRowids; null,
+	// for SQLite to pick one, when the largest rowid is SQLITE_MAX_ROWID already, whose `+ 1` is a REAL no rowid takes.
+	// `@now * 1024` stays below 2^63 for every date a `Date` holds.
+	const nextRowid =
+		`CASE WHEN coalesce(max(rowid), 0) < ${SQLITE_MAX_ROWID} ` +
+		"THEN max(coalesce(max(rowid), 0) + 1, CAST(@now AS INTEGER) * 1024) END";
+	const deleteUnder = (range: boolean): Statement[] =>
+		({
+			postgres: [
+				sql(
+					`WITH gone AS (DELETE FROM ${table} WHERE ${startsWith("path", "@dir")} RETURNING path) ` +
+						`DELETE FROM ${parts} WHERE path IN (SELECT path FROM gone)`,
+				),
+				sql(
+					`DELETE FROM ${parts} AS p WHERE ${underDirectory("p.path", range)} ` +
+						`AND NOT EXISTS (SELECT 1 FROM ${table} AS r WHERE r.path = p.path)`,
+				),
+			],
+			mysql: [
+				sql(
+					`DELETE r, p FROM ${table} AS r LEFT JOIN ${parts} AS p ON p.path = r.path ` +
+						// The key range first, so the delete reads and locks only the rows under `@dir`.
+						`WHERE ${underDirectory("r.path", range)}`,
+				),
+				sql(
+					`DELETE p FROM ${parts} AS p LEFT JOIN ${table} AS r ON r.path = p.path ` +
+						`WHERE ${underDirectory("p.path", range)} AND r.path IS NULL`,
+				),
+			],
+			sqlite: [
+				sql(`DELETE FROM ${parts} WHERE ${startsWith("path", "@dir")}`),
+				sql(`DELETE FROM ${table} WHERE ${startsWith("path", "@dir")}`),
+			],
+		})[adapter];
 
 	return {
 		createTable: mysql
@@ -1140,26 +1622,23 @@ function buildQueries(
 			adapter === "postgres"
 				? [
 						sql(
-							`WITH s AS (${appendRow}` +
-								`ON CONFLICT (path) DO UPDATE SET byte_len = ${table}.byte_len + excluded.byte_len, ` +
-								`mtime_ms = excluded.mtime_ms RETURNING byte_len) ` +
+							`WITH s AS (${growRow} RETURNING byte_len) ` +
 								`INSERT INTO ${parts} (path, start_offset, content) ` +
 								`SELECT @path, s.byte_len - @len, @content FROM s WHERE @len > 0`,
 						),
 					]
 				: [
+						sql(growRow),
 						sql(
-							appendRow +
-								(mysql
-									? "ON DUPLICATE KEY UPDATE byte_len = byte_len + @len, mtime_ms = @mtime"
-									: `ON CONFLICT (path) DO UPDATE SET byte_len = ${table}.byte_len + excluded.byte_len, ` +
-										"mtime_ms = excluded.mtime_ms"),
-						),
-						sql(
-							`INSERT INTO ${parts} (path, start_offset, content) ` +
-								`SELECT path, byte_len - @len, @content FROM ${table} WHERE path = @path AND @len > 0`,
+							mysql
+								? `INSERT INTO ${parts} (path, start_offset, content) ` +
+										`SELECT path, byte_len - @len, @content FROM ${table} WHERE path = @path AND @len > 0`
+								: `INSERT INTO ${parts} (rowid, path, start_offset, content) ` +
+										`SELECT (SELECT ${nextRowid} FROM ${parts}), path, byte_len - @len, @content ` +
+										`FROM ${table} WHERE path = @path AND @len > 0`,
 						),
 					],
+		growRow: sql(mysql ? growRow : `${growRow} RETURNING byte_len`),
 		lockSize: sql(`SELECT byte_len FROM ${table} WHERE path = @path${adapter === "sqlite" ? "" : " FOR UPDATE"}`),
 		upsertRow: sql(
 			`INSERT INTO ${table} (${rowColumns}) VALUES (${rowValues}) ` +
@@ -1178,25 +1657,23 @@ function buildQueries(
 		deleteRow: sql(`DELETE FROM ${table} WHERE path = @path`),
 		hasParts: sql(`SELECT 1 AS found FROM ${parts} WHERE path = @path LIMIT 1`),
 		deleteParts: sql(`DELETE FROM ${parts} WHERE path = @path`),
-		deleteUnder: {
-			postgres: [
-				sql(
-					`WITH gone AS (DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir RETURNING path) ` +
-						`DELETE FROM ${parts} WHERE path IN (SELECT path FROM gone)`,
-				),
-			],
-			mysql: [
-				sql(
-					`DELETE r, p FROM ${table} AS r LEFT JOIN ${parts} AS p ON p.path = r.path ` +
-						`WHERE substr(r.path, 1, @len) = @dir`,
-				),
-			],
-			sqlite: [
-				sql(`DELETE FROM ${parts} WHERE substr(path, 1, @len) = @dir`),
-				sql(`DELETE FROM ${table} WHERE substr(path, 1, @len) = @dir`),
-			],
-		}[adapter],
-		insertPart: sql(`INSERT INTO ${parts} (path, start_offset, content) VALUES (@path, @offset, @content)`),
+		deleteUnder: deleteUnder(true),
+		// Only PostgreSQL's `path` column can carry a collation the range misses: MySQL's tables are `utf8mb4_bin`,
+		// whose PAD SPACE the range's start at `@stem` allows for (see DialectQueries.deleteUnder).
+		deleteUnderScan: deleteUnder(adapter !== "postgres"),
+		deleteStaging: sql(`DELETE FROM ${parts} WHERE path >= @low AND path < @high AND ${startsWith("path", "@low")}`),
+		hasStaging: sql(
+			`SELECT 1 AS found FROM ${parts} WHERE path >= @low AND path < @high AND ${startsWith("path", "@low")} LIMIT 1`,
+		),
+		stagedBytes: sql(
+			`SELECT ${contentByteLength} AS len FROM ${parts} WHERE path = @path${adapter === "sqlite" ? "" : " FOR UPDATE"}`,
+		),
+		insertPart: sql(
+			adapter === "sqlite"
+				? `INSERT INTO ${parts} (rowid, path, start_offset, content) ` +
+						`VALUES ((SELECT ${nextRowid} FROM ${parts}), @path, @offset, @content)`
+				: `INSERT INTO ${parts} (path, start_offset, content) VALUES (@path, @offset, @content)`,
+		),
 		renameRow: sql(
 			`UPDATE ${table} SET path = @dst, mtime_ms = @mtime WHERE path = @src${mysql ? "" : " RETURNING path"}`,
 		),
@@ -1246,6 +1723,61 @@ function buildQueries(
 				`SELECT coalesce(max(start_offset), -1) FROM ${parts} WHERE path = @path ` +
 				`AND start_offset <= ${bigint("@offset")})`,
 		),
+		// Only the row's own bytes from `@offset` on (`@row_from` is the 1-based
+		// `@offset + 1`, clamped as in readFrom), so a read from inside the content
+		// of a row an older version wrote never fetches what precedes it. The part
+		// the read starts at is the last one starting at or before `@offset`, or,
+		// when `@offset` is inside the row's own content, the one starting where
+		// that content ends.
+		readChunksStart: sql(
+			`SELECT byte_len, ${contentByteLength} AS content_len, ` +
+				`CASE WHEN ${bigint("@offset")} < ${contentByteLength} ` +
+				`THEN substr(${contentBytes}, ${position("@row_from")}) ELSE ${emptyBytes} END AS head, ` +
+				`(SELECT coalesce(max(p.start_offset), -1) ${startPart}) AS first_part, ` +
+				`${partId ? `(SELECT ${partId} ${startPart} ORDER BY p.start_offset DESC LIMIT 1)` : "NULL"} AS first_id` +
+				(mysql
+					? `, (SELECT t.start_offset ${tailPart}) AS tail_part, ` +
+						`(SELECT ${partDigestOf("t.start_offset", "cast(t.content AS binary)")} ${tailPart}) AS tail_digest`
+					: "") +
+				` FROM ${table} AS r WHERE r.path = @path`,
+		),
+		readParts: sql(
+			`SELECT start_offset, content FROM ${parts} WHERE path = @path AND start_offset >= ${bigint("@next")} ` +
+				`AND start_offset < ${bigint("@end")} ` +
+				(partId
+					? `AND EXISTS (SELECT 1 FROM ${parts} AS p WHERE p.path = @path ` +
+						`AND p.start_offset = ${bigint("@anchor")} AND ${partId} = @anchor_id) `
+					: "") +
+				// PostgreSQL's `xmin` changes with every insert, so the first part's identity is enough there. SQLite
+				// also finds the last part fetched unchanged, as a writer older than its rowid rule reuses rowids, and so
+				// does SQLite for a part the rule has no room for (see DialectQueries.partRowids).
+				(adapter === "sqlite"
+					? `AND (@last < 0 OR EXISTS (SELECT 1 FROM ${parts} AS q WHERE q.path = @path AND q.start_offset = @last ` +
+						"AND q.content = @last_content)) "
+					: "") +
+				"ORDER BY start_offset",
+		),
+		// The halves of each item's SHA-256 in hex, read as unsigned 64-bit integers, XORed and printed in hex
+		// again. `CAST(content AS binary)` keeps the bytes (utf8mb4_bin's PAD SPACE only affects comparisons).
+		readChunksDigest: mysql
+			? sql(
+					"SELECT CONCAT(LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTR(d.h, 1, 16), 16, 10) AS UNSIGNED))), 16, '0'), " +
+						"LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTR(d.h, 17, 16), 16, 10) AS UNSIGNED))), 16, '0')) AS digest FROM (" +
+						`SELECT ${partDigestOf("CAST(@offset AS SIGNED)", `substr(${contentBytes}, @row_from)`)} AS h ` +
+						`FROM ${table} WHERE path = @path AND @offset < ${contentByteLength} ` +
+						`UNION ALL SELECT ${partDigestOf("start_offset", contentBytes)} FROM ${parts} ` +
+						"WHERE path = @path AND start_offset >= @first AND start_offset < @end) AS d",
+				)
+			: undefined,
+		partRowids:
+			adapter === "sqlite"
+				? {
+						next: sql(`SELECT CAST(${nextRowid} AS TEXT) AS next_rowid FROM ${parts}`),
+						insert: sql(
+							`INSERT INTO ${parts} (rowid, path, start_offset, content) VALUES (@rowid, @path, @offset, @content)`,
+						),
+					}
+				: undefined,
 		createBlobsTable: mysql
 			? `CREATE TABLE IF NOT EXISTS ${blobs} (` +
 				`sha256 CHAR(64) NOT NULL PRIMARY KEY, ` +
@@ -1302,7 +1834,8 @@ function buildQueries(
 				(mysql ? "ON DUPLICATE KEY UPDATE path = path" : "ON CONFLICT (path, sha256) DO NOTHING"),
 		),
 		refsOf: count => sql(`SELECT sha256, path FROM ${refs} WHERE path IN (${inList("p", count)})`),
-		refsUnder: sql(`SELECT sha256, path FROM ${refs} WHERE substr(path, 1, @len) = @dir`),
+		// Exactly the paths whose rows the directory delete takes (see deleteUnder), whatever the column's collation.
+		refsUnder: sql(`SELECT sha256, path FROM ${refs} WHERE ${startsWith("path", "@dir")}`),
 		referenced: count => sql(`SELECT sha256 FROM ${refs} WHERE sha256 IN (${inList("h", count)})`),
 		referencedOne: mysql ? sql(`SELECT sha256 FROM ${refs} WHERE sha256 = @h LIMIT 1 LOCK IN SHARE MODE`) : undefined,
 		deleteRef: sql(`DELETE FROM ${refs} WHERE path = @path AND sha256 = @sha256`),
@@ -1324,7 +1857,10 @@ function buildQueries(
 				: (count, under) =>
 						sql(
 							`SELECT path FROM ${table} WHERE path IN (${inList("p", count)})` +
-								(under ? " OR substr(path, 1, @len) = @dir" : "") +
+								// The rows under `@dir` that the directory delete takes: those whose prefix is exactly
+								// `@dir`, whatever the column's collation (see deleteUnder), on MySQL and MariaDB within its
+								// key range, so the lock reads and locks only those rows and the gaps around them.
+								(under ? ` OR (${underDirectory("path", mysql)})` : "") +
 								" ORDER BY path FOR UPDATE",
 						),
 		sessionRowsOf: mysql
@@ -1565,22 +2101,88 @@ function joinSliceBytes(first: Uint8Array | null, pieces: Array<{ offset: number
 	return Buffer.concat(chunks);
 }
 
+/** Bytes of a chunked read's digest on MySQL (see `DialectQueries.readChunksDigest`). */
+const CHUNKS_DIGEST_BYTES = 16;
+
+/**
+ * The digest of the bytes a chunked read fetched at `offset` on MySQL, a part
+ * or the row's own content from there, as `DialectQueries.readChunksStart`
+ * (`tail_digest`) and `DialectQueries.readChunksDigest` compute it: the
+ * SHA-256 of `offset` in decimal, ":" and `bytes`.
+ */
+function partDigest(offset: number, bytes: Uint8Array): Buffer {
+	return new Bun.CryptoHasher("sha256").update(`${offset}:`).update(bytes).digest();
+}
+
+/**
+ * XOR into `digest` the first {@link CHUNKS_DIGEST_BYTES} of the
+ * {@link partDigest} of one item a chunked read yielded, as
+ * `DialectQueries.readChunksDigest` folds it.
+ */
+function addChunkDigest(digest: Buffer, item: Buffer): void {
+	for (let i = 0; i < CHUNKS_DIGEST_BYTES; i++) digest[i] ^= item[i];
+}
+
+/**
+ * The parts a batch of appends stores for `lines`, in order, each at most
+ * {@link PART_BYTES}: whole lines share a part while they fit, and a longer
+ * line is cut at character boundaries, its last piece starting the next part.
+ * No part, and no string made, is longer than that. A part holds each line's
+ * own UTF-8 encoding, so its bytes are the sum the batch adds to `byte_len`.
+ */
+function* appendedParts(lines: readonly string[]): Generator<{ content: string; bytes: number }> {
+	let pieces: string[] = [];
+	let size = 0;
+	for (const line of lines) {
+		const bytes = Buffer.byteLength(line, "utf8");
+		if (size > 0 && size + bytes > PART_BYTES) {
+			yield { content: pieces.join(""), bytes: size };
+			pieces = [];
+			size = 0;
+		}
+		if (bytes <= PART_BYTES) {
+			// Well formed, as its UTF-8 encoding is (a lone surrogate as U+FFFD): joined raw, a line that ends in a
+			// lone high surrogate and the next, starting with the lone low one, would make one 4-byte character of
+			// the 6 bytes their lengths count.
+			pieces.push(line.toWellFormed());
+			size += bytes;
+			continue;
+		}
+		const encoded = Buffer.from(line, "utf8");
+		let start = 0;
+		for (let end = utf8PartEnd(encoded, start, PART_BYTES); end < encoded.byteLength;) {
+			yield { content: encoded.toString("utf8", start, end), bytes: end - start };
+			start = end;
+			end = utf8PartEnd(encoded, start, PART_BYTES);
+		}
+		pieces.push(encoded.toString("utf8", start));
+		size = encoded.byteLength - start;
+	}
+	if (size > 0) yield { content: pieces.join(""), bytes: size };
+}
+
 /**
  * SQL-backed implementation of {@link SessionStorage} using `bun:sql`. Each
  * session JSONL file is a row of the session table keyed by `path`, holding
  * its metadata (`byte_len`, `mtime_ms`, title fields), plus rows of
- * `<table>_parts` keyed by (`path`, `start_offset`): an append inserts one
- * part, a full write replaces them with parts of at most 1 MiB. A session's
- * content is the row's `content` (non-empty only for rows an older version
- * wrote) followed by its parts in offset order. This process keeps only a
- * metadata index (`size`, `mtimeMs`) in memory for synchronous `existsSync` /
- * `statSync` / `listFilesSync` calls.
+ * `<table>_parts` keyed by (`path`, `start_offset`): an append inserts its
+ * line as one part, a batch of appends its lines as parts of at most 1 MiB,
+ * a full write replaces them with parts of at most 1 MiB (a streamed
+ * one stages them under `<path>#staging-…`, or on MySQL for a path too long
+ * for that a name made from its hash, first and swaps them in). A
+ * session's content is the row's `content` (non-empty only for rows an older
+ * version wrote) followed by its parts in offset order, which reads stream in
+ * pages of parts. This process keeps only a metadata index (`size`,
+ * `mtimeMs`) in memory for synchronous `existsSync` / `statSync` /
+ * `listFilesSync` calls.
  *
  * Works against PostgreSQL, MySQL/MariaDB, and SQLite by selecting the
  * dialect-correct DDL, upsert, row-lock, byte-length, and byte-slice syntax
  * at construction.
  */
 export class SqlSessionStorage extends IndexedSessionStorage {
+	/** Always set: the SQL backend reads a session part by part. */
+	declare readonly readChunks: (path: string, fromByte?: number) => AsyncIterable<Uint8Array>;
 	readonly #backend: SqlSessionStorageBackend;
 	/**
 	 * Set only when the store claims sessions (`claims` on a database other
@@ -1907,14 +2509,34 @@ function listValues(prefix: string, items: readonly string[]): StatementValues {
 	return Object.fromEntries(items.map((item, index) => [`${prefix}${index}`, item]));
 }
 
-const BLOB_REF_IN_TEXT = /blob:sha256:([0-9a-f]{64})/g;
+const BLOB_REF_IN_TEXT = new RegExp(`${BLOB_PREFIX}([0-9a-f]{64})`, "g");
 
 /** The blob hashes `text` (a transcript, or one line of it) names. */
 function namedBlobHashes(text: string): Set<string> {
 	const hashes = new Set<string>();
-	if (!text.includes("blob:sha256:")) return hashes;
+	if (!text.includes(BLOB_PREFIX)) return hashes;
 	for (const match of text.matchAll(BLOB_REF_IN_TEXT)) hashes.add(match[1] ?? "");
 	return hashes;
+}
+
+/** Characters a blob reference spans in text: {@link BLOB_PREFIX} and its 64 hex digits. */
+const BLOB_REF_CHARS = BLOB_PREFIX.length + 64;
+
+/**
+ * The blob hashes a text that arrives in pieces names, as {@link namedBlobHashes} finds them in the whole text: a
+ * reference that straddles two pieces too, found where the end of the text so far meets the next piece.
+ */
+class StreamedBlobHashes {
+	readonly hashes = new Set<string>();
+	/** The last characters of the text so far, where a reference that ends in a later piece can start. */
+	#tail = "";
+
+	add(piece: string): void {
+		for (const hash of namedBlobHashes(this.#tail + piece.slice(0, BLOB_REF_CHARS))) this.hashes.add(hash);
+		for (const hash of namedBlobHashes(piece)) this.hashes.add(hash);
+		this.#tail =
+			piece.length >= BLOB_REF_CHARS ? piece.slice(-BLOB_REF_CHARS) : (this.#tail + piece).slice(-BLOB_REF_CHARS);
+	}
 }
 
 /** A write names blobs of this store's that a delete took after they landed; they are landed again, and the write runs once more. */
@@ -2028,20 +2650,6 @@ interface LeaseFence {
 	readonly file: string;
 }
 
-/** The session id in the header at the start of `prefix` (past the title slot), or `undefined` when it has none. */
-function headerSessionId(prefix: string): string | undefined {
-	const text = parseTitleSlotFromContent(prefix) ? prefix.slice(prefix.indexOf("\n") + 1) : prefix;
-	const end = text.indexOf("\n");
-	if (end === -1) return undefined;
-	try {
-		const entry: unknown = JSON.parse(text.slice(0, end));
-		if (entry && typeof entry === "object" && "type" in entry && entry.type === "session" && "id" in entry) {
-			return typeof entry.id === "string" ? entry.id : undefined;
-		}
-	} catch {}
-	return undefined;
-}
-
 class SqlSessionStorageBackend implements SessionStorageBackend {
 	readonly #client: SqlSessionStorageClient;
 	readonly #adapter: SqlSessionStorageAdapter;
@@ -2053,6 +2661,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	readonly #createTable: boolean;
 	/** The shared call queue for this client's SQLite database; unset on other dialects. */
 	readonly #sqliteQueue: SqliteQueue | undefined;
+	/** This client's writes of session paths on SQLite (see {@link SqliteWrites}); unset on other dialects. */
+	readonly #sqliteWrites: SqliteWrites | undefined;
+	/** Whether the SQLite database is private ({@link isPrivateSqliteDatabase}): its connection's alone, where no other connection commits. */
+	readonly #sqlitePrivate: boolean;
 	/**
 	 * How this store claims sessions: `row`, a lease row (PostgreSQL, MySQL);
 	 * `lock`, an OS lock on the database file and session id (a SQLite file);
@@ -2085,6 +2697,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	#mysqlLocks: MysqlLockForm | undefined;
 	/** The version a MySQL-family server reported at start-up, as a refusal names it. */
 	#mysqlVersion = "";
+	/**
+	 * Whether the directory delete finds the parts under a directory by a key
+	 * range ({@link DialectQueries.deleteUnder}) or by the prefix alone
+	 * ({@link DialectQueries.deleteUnderScan}); on PostgreSQL set at start-up
+	 * from the `path` column's collation ({@link pathCollationKeepsDirectoryRange}).
+	 */
+	#directoryRange = true;
 	/** The largest blob the table takes on this server, once read (see {@link maxBlobBytes}). */
 	#maxBlobBytes: Promise<number> | undefined;
 	/** The `maxBlobBytes` option, or {@link MAX_BLOB_BYTES}. */
@@ -2124,14 +2743,16 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		this.#createTable = options.createTable !== false;
 		this.#maxRowBlobBytes = options.maxBlobBytes ?? MAX_BLOB_BYTES;
 		this.#sqliteQueue = this.#adapter === "sqlite" ? sqliteQueue(options.client) : undefined;
+		this.#sqliteWrites = this.#adapter === "sqlite" ? sqliteWrites(options.client) : undefined;
 		const filename = options.client.options.filename;
 		this.#sqliteFile =
-			this.#adapter === "sqlite" && typeof filename === "string" && filename !== "" && filename !== ":memory:"
+			this.#adapter === "sqlite" && typeof filename === "string" && !isPrivateSqliteDatabase(filename)
 				? path.resolve(filename)
 				: undefined;
+		this.#sqlitePrivate = this.#adapter === "sqlite" && isPrivateSqliteDatabase(filename);
 		if (options.claims === true) {
 			if (this.#adapter !== "sqlite") this.#gate = "row";
-			// An in-memory database is this process's alone: nobody else can open its sessions.
+			// A private database is this connection's alone: nobody else can open its sessions.
 			else if (this.#sqliteFile) this.#gate = "lock";
 		}
 	}
@@ -2187,6 +2808,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			if (!this.#createTable) {
 				await this.#assertSchema();
 				await this.#checkTables();
+				await this.#readPathCollation();
 				await this.#checkLockSyntax();
 				return;
 			}
@@ -2229,6 +2851,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}
 			if (createIndex && holder && !holder.indexed && !holder.nameTakenBy) await this.#setup(createIndex);
 			await this.#checkTables();
+			await this.#readPathCollation();
 			await this.#checkLockSyntax();
 		});
 	}
@@ -2297,14 +2920,23 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	/**
 	 * Claim `sessionId` at `file` and wait for the answer: the claim when it
 	 * is held, `null` when `file` holds another session or another holder has
-	 * the session. With `waitMs`, a holder's lease is read again every second
-	 * until it is gone or expired on the database clock, `onWait` hearing the
-	 * holder once, and the session claimed then, all within `waitMs`: a claim
-	 * statement that waited past its lock bound behind another process's
-	 * write is refused, and tried again only while the wait lasts. A claim
-	 * statement that fails for another reason (the database is unreachable)
-	 * counts as held, as a file claim that cannot be probed does: it never
-	 * refuses a session, and the first write under it runs the statement again.
+	 * the session. On a SQLite file, whose claim is an OS lock, the claim of
+	 * a lock another process holds keeps trying it until
+	 * {@link SQLITE_CLAIM_RELEASE_WINDOW_MS} after the claim began, so a
+	 * holder that lets the session go meanwhile does not move it: the store
+	 * tries again every {@link SQLITE_CLAIM_RETRY_MS}, never past `waitMs`,
+	 * after a native claim that answered at once, and not after one that
+	 * itself waited out the window. A SQLite claim waits about that long at
+	 * most, and `onWait` never hears a holder there, since the lock names
+	 * none. Elsewhere, with `waitMs`, a holder's lease is read again every
+	 * second until it is gone or expired on the database clock, `onWait`
+	 * hearing the holder once, and the session claimed then, all within
+	 * `waitMs`: a claim statement that waited past its lock bound behind
+	 * another process's write is refused, and tried again only while the
+	 * wait lasts. A claim statement that fails for another reason (the
+	 * database is unreachable) counts as held, as a file claim that cannot be
+	 * probed does: it never refuses a session, and the first write under it
+	 * runs the statement again.
 	 */
 	async acquire(
 		sessionId: string,
@@ -2312,12 +2944,21 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		options: SessionAcquireOptions,
 		settle: (paths: readonly string[]) => Promise<void>,
 	): Promise<LeaseClaim | null> {
-		const deadline = performance.now() + (options.waitMs ?? 0);
+		const started = performance.now();
+		const deadline = started + (options.waitMs ?? 0);
+		const lockDeadline =
+			started + Math.min(SQLITE_CLAIM_RELEASE_WINDOW_MS, options.waitMs ?? Number.POSITIVE_INFINITY);
 		let waiting = false;
 		for (;;) {
 			const lockBound = options.waitMs === undefined ? LEASE_CLAIM_LOCK_BOUND_MS : deadline - performance.now();
 			const claim = this.claim(sessionId, file, options.onLost, lockBound);
-			if (!claim) return null;
+			if (!claim) {
+				// Only a SQLite claim's OS lock refuses here: another process holds it, and may be letting it go.
+				const left = lockDeadline - performance.now();
+				if (left <= 0) return null;
+				await Bun.sleep(Math.min(SQLITE_CLAIM_RETRY_MS, left));
+				continue;
+			}
 			try {
 				if (await this.#ensureClaimed(claim)) return claim;
 			} catch (err) {
@@ -2534,9 +3175,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (!lock) {
 			let lease: FileLockHandle | null;
 			try {
-				lease = tryAcquireSessionLease(key);
+				lease = claimSessionLease(key);
 			} catch (err) {
-				// As a file claim that cannot be probed: counts as held, guards nothing.
+				// As a file claim whose lock cannot be taken: counts as held, guards nothing.
 				logger.debug("SqlSessionStorage could not take a session lock", { sessionId, error: toError(err).message });
 				lease = { release: () => {} };
 			}
@@ -2591,7 +3232,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		await claim.after;
 		for (const file of claim.paths.keys()) {
 			const [head] = await this.readSlices(file, SESSION_HEADER_PREFIX_BYTES, 0).catch(() => [""]);
-			const id = headerSessionId(head ?? "");
+			const id = sessionHeaderIdInPrefix(head ?? "");
 			if (id !== undefined && id !== (claim.headers.get(file) ?? claim.sessionId)) {
 				claim.foreign = true;
 				return false;
@@ -3277,6 +3918,15 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return { indexed: indexes.size > 0, nameTakenBy };
 	}
 
+	/** On PostgreSQL, read once whether the parts' `path` collation keeps the directory delete's key range ({@link #directoryRange}). */
+	async #readPathCollation(): Promise<void> {
+		if (this.#adapter !== "postgres") return;
+		const rows = (await this.#readOne(PG_PATH_COLLATION, {
+			table: this.#relation(`${this.#table}_parts`),
+		})) as PathCollationRow[];
+		this.#directoryRange = pathCollationKeepsDirectoryRange(rows[0]);
+	}
+
 	/**
 	 * PostgreSQL: refuse to start on tables that would run code the store did
 	 * not declare on its writes. A login that owned a table (before an
@@ -3431,12 +4081,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	async loadIndex(): Promise<SessionStorageIndexEntry[]> {
 		const rows = (await this.#exclusive(() => this.#readOne(this.#q.loadIndex))) as IndexRow[];
 		return rows.map(row => {
-			if (row.byte_len === null) {
-				throw new Error(
-					`SqlSessionStorage: ${this.#table} row ${JSON.stringify(row.path)} has no byte_len; ` +
-						`run the byte_len backfill in ${SCHEMA_DOCS}.`,
-				);
-			}
+			if (row.byte_len === null) throw this.#unmeasured(row.path);
 			return {
 				path: row.path,
 				size: rowNumber(row.byte_len),
@@ -3503,12 +4148,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				pieces.push({ offset: rowNumber(row.start_offset), bytes: row.bytes });
 				continue;
 			}
-			if (row.byte_len === null) {
-				throw new Error(
-					`SqlSessionStorage: ${this.#table} row ${JSON.stringify(path)} has no byte_len; ` +
-						`run the byte_len backfill in ${SCHEMA_DOCS}.`,
-				);
-			}
+			if (row.byte_len === null) throw this.#unmeasured(path);
 			size = rowNumber(row.byte_len);
 			head = row.bytes;
 		}
@@ -3516,6 +4156,278 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		const bytes = joinSliceBytes(head, pieces);
 		// Each piece is capped on its own; the window is capped as a whole.
 		return { text: utf8Decoder.decode(maxBytes === undefined ? bytes : bytes.subarray(0, take)), size };
+	}
+
+	/**
+	 * The stored bytes from `fromByte`: the row's own content from there when
+	 * it holds any, then the parts in `start_offset` order, one page per query:
+	 * the parts that start within the page's span of where the read is, each
+	 * part a chunk of its own. The first page spans
+	 * {@link FIRST_PAGE_SPAN_BYTES} from `fromByte` and each next one twice the
+	 * last, up to {@link PAGE_SPAN_BYTES}, so a reader that stops early fetches
+	 * little past where it stopped. The read stops at the size its first query
+	 * saw, so an append made meanwhile, which only adds parts past it, is left
+	 * out.
+	 *
+	 * A full write or a delete replaces every part of the session, the one the
+	 * read starts at included. So on PostgreSQL and SQLite the query of each
+	 * page also checks, in the same statement, that this part still has the row
+	 * identity the first query saw, and finds no parts when it does not: its
+	 * `xmin`, which changes with every insert, or its rowid, which no part
+	 * inserted in a later millisecond takes over (see
+	 * `DialectQueries.partRowids`). A page with no part where the read is, a
+	 * part that does not start where the previous one ended, or parts that end
+	 * short of the size mean a full write or a delete replaced the parts during
+	 * the read; it then fails with {@link SessionReadConflictError} instead of
+	 * yielding a mix of two bodies.
+	 *
+	 * A writer older than SQLite's rowid rule still hands a new part the
+	 * largest rowid plus one, which after a delete or a truncate can be the
+	 * rowid of the part the read started at; so does SQLite itself for a part
+	 * the rule finds no room for below 2^63, and so can the rule in the cases
+	 * `partRowids` names (a part deleted and another inserted in the same
+	 * millisecond, a clock that went back). So on SQLite the query of each
+	 * page also checks, in the same statement, that the last part already
+	 * fetched is still at its offset with the same bytes. A re-create that
+	 * gives the part the read started at its rowid back and holds exactly the
+	 * bytes of that last part at its offset, while it differs before and
+	 * after it, passes both page checks; the check at the read's end catches
+	 * it. Right before its first query, in the same turn of the call queue,
+	 * the read takes `PRAGMA data_version`, which moves when any other
+	 * connection commits to the database file and never for this
+	 * connection's own commits (a private database has no other connection,
+	 * so there the read takes no pragma), and this client's counts of its
+	 * writes, of every path and of the path's hashed slot (see
+	 * {@link SqliteWrites}); at its end it takes
+	 * them again. When any of them moved, it reads exactly the bytes it yielded
+	 * again, from `fromByte` for as many bytes, with the same page checks,
+	 * and compares their SHA-256 with that of the bytes it yielded: a
+	 * difference, a page check that fails, or a range that is no longer all
+	 * there is a read conflict; an append past the range is not. When they
+	 * moved again during that check pass, a write may have made it read the
+	 * same mix the read yielded, so it reads the range once more and accepts
+	 * it only when that second check pass matches too: at most two check
+	 * passes, and a pass that differs is a read conflict at once.
+	 *
+	 * MySQL has no row identity. Its first query also takes the session's last
+	 * part, the last one starting before the size, in the same statement and so
+	 * from the same state as the size: its start and its SHA-256. When the read
+	 * fetches the part at that start it must hold those bytes, and a read that
+	 * ends must have fetched it, or the read is a conflict: a full write between
+	 * two pages that grows the session past the old size, a part of the new
+	 * body ending right there, passes the page checks and holds the bytes the
+	 * read fetched, but it changes that last part, as does any rewrite that
+	 * grows or shifts it. The read also checks what it yielded with one query,
+	 * which computes the digest of those bytes as the database holds them then
+	 * (`DialectQueries.readChunksDigest`): the head, and every part from the one
+	 * the read started at to the last one it yielded, whole even where the read
+	 * yielded it from `fromByte` on. One that differs from the digest the read
+	 * computed over the same parts, each added before it went out, is a read
+	 * conflict too. Neither sees a full write between two pages that keeps
+	 * every part boundary up to the old size and the old last part byte for
+	 * byte and differs only in same-length bytes of parts fetched after it; the
+	 * read then yields the start of the new body as a whole one. Taking the
+	 * digest of the whole read in the first query would see it, but makes every
+	 * read, a probe that stops after its first page included, hash the whole
+	 * session on the server (a probe of a 256 MiB session took 5,723 ms instead
+	 * of 49 ms on MySQL 8.4). PostgreSQL and SQLite see it by row identity.
+	 *
+	 * Both end checks run once the bytes the read yielded come from more than
+	 * one query (the first query's head and a page, or two pages): when the
+	 * read ends, and also when its consumer closes it before that (a `break`
+	 * out of its loop, which resumes the read at its `yield` to return). A
+	 * closed read rejects its `return()` with the conflict, so the consumer's
+	 * loop throws it. Bytes from one query alone come from one snapshot and
+	 * need no check.
+	 */
+	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
+		const digestQuery = this.#q.readChunksDigest;
+		const pass: ChunksPass = {
+			digest: digestQuery ? Buffer.alloc(CHUNKS_DIGEST_BYTES) : undefined,
+			// SQLite: with it the pass takes the mark the check at the read's end compares (see above).
+			hash: this.#sqliteWrites ? new Bun.CryptoHasher("sha256") : undefined,
+			yielded: 0,
+			first: 0,
+			next: 0,
+			sources: 0,
+		};
+		let failed = false;
+		try {
+			yield* this.#readPass(path, fromByte, pass);
+		} catch (err) {
+			failed = true;
+			throw err;
+		} finally {
+			// At the read's end, or where its consumer closed it, unless it is failing already.
+			if (!failed && pass.sources > 1) {
+				if (digestQuery && pass.digest) {
+					await this.#confirmChunksDigest(
+						path,
+						{ query: digestQuery, digest: pass.digest },
+						{
+							path,
+							offset: fromByte,
+							row_from: Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1,
+							first: pass.first,
+							end: pass.next,
+						},
+					);
+				} else if (pass.mark !== undefined) {
+					await this.#confirmChunks(path, fromByte, pass);
+				}
+			}
+		}
+	}
+
+	/**
+	 * One pass of {@link readChunks} over `path` from `fromByte`, with the
+	 * checks of every page, recording in `pass` what the checks at the read's
+	 * end compare. It ends at the size its first query saw; with `length` (the
+	 * SQLite end check), after `length` bytes, or where the session ends when
+	 * that is sooner.
+	 */
+	async *#readPass(path: string, fromByte: number, pass: ChunksPass, length?: number): AsyncGenerator<Uint8Array> {
+		const rowFrom = Math.min(fromByte, MAX_PIECE_BYTES - 1) + 1;
+		const [row] = (await this.#exclusive(async () => {
+			// The read's own pass on SQLite: its start mark, with no write of this client between it and the query.
+			if (pass.hash) pass.mark = await this.#sqliteMark(path);
+			return this.#readOne(this.#q.readChunksStart, { path, offset: fromByte, row_from: rowFrom });
+		})) as ChunksStartRow[];
+		if (!row) throw enoent(path);
+		if (row.byte_len === null) throw this.#unmeasured(path);
+		const size = rowNumber(row.byte_len);
+		if (row.tail_digest && row.tail_part !== null && row.tail_part !== undefined) {
+			pass.tail = { start: rowNumber(row.tail_part), digest: Buffer.from(row.tail_digest, "hex"), fetched: false };
+		}
+		const stop = length === undefined ? size : Math.min(size, fromByte + length);
+		const firstPart = rowNumber(row.first_part);
+		const anchor = { anchor: firstPart, anchor_id: row.first_id };
+		pass.first = firstPart < 0 ? rowNumber(row.content_len) : firstPart;
+		pass.next = pass.first;
+		let skip = Math.max(0, fromByte - pass.next);
+		// SQLite: the last part fetched, which the next page's query finds unchanged; none yet.
+		let last = this.#adapter === "sqlite" ? { last: -1, last_content: "" } : undefined;
+		if (row.head && row.head.byteLength > 0) {
+			if (pass.digest) addChunkDigest(pass.digest, partDigest(fromByte, row.head));
+			pass.sources++;
+			const head = row.head.subarray(0, Math.max(0, stop - fromByte));
+			pass.hash?.update(head);
+			pass.yielded += head.byteLength;
+			yield head;
+		}
+		if (fromByte >= stop) return;
+		for (let span = FIRST_PAGE_SPAN_BYTES; pass.next < stop; span = Math.min(span * 2, PAGE_SPAN_BYTES)) {
+			// The first page starts at the part `fromByte` lies in, but spans from `fromByte` itself.
+			const end = Math.max(pass.next, fromByte) + span;
+			const parts = (await this.#exclusive(() =>
+				this.#readOne(this.#q.readParts, { path, next: pass.next, end, ...anchor, ...last }),
+			)) as PartRow[];
+			if (parts.length === 0) throw new SessionReadConflictError(path);
+			pass.sources++;
+			for (const part of parts) {
+				const start = rowNumber(part.start_offset);
+				if (start !== pass.next) throw new SessionReadConflictError(path);
+				if (start >= stop) break;
+				if (last) last = { last: start, last_content: part.content };
+				const bytes = Buffer.from(part.content, "utf8");
+				// MySQL: the part's digest, computed once when the tail check and the read's digest both take it.
+				let digest: Buffer | undefined;
+				if (pass.tail?.start === start) {
+					digest = partDigest(start, bytes);
+					if (!digest.equals(pass.tail.digest)) throw new SessionReadConflictError(path);
+					pass.tail.fetched = true;
+				}
+				// Whole, before the part goes out: the read may be closed at its `yield`.
+				if (pass.digest) addChunkDigest(pass.digest, digest ?? partDigest(start, bytes));
+				pass.next = start + bytes.byteLength;
+				if (skip >= bytes.byteLength) {
+					skip -= bytes.byteLength;
+					continue;
+				}
+				// The end check's range can end inside a part.
+				const out = skip > 0 || pass.next > stop ? bytes.subarray(skip, stop - start) : bytes;
+				skip = 0;
+				pass.hash?.update(out);
+				pass.yielded += out.byteLength;
+				yield out;
+			}
+		}
+		if (length === undefined && pass.next !== size) throw new SessionReadConflictError(path);
+		// MySQL: a read that reached the size through another last part than the first query saw read another body.
+		if (pass.tail && !pass.tail.fetched) throw new SessionReadConflictError(path);
+	}
+
+	/**
+	 * SQLite: what a chunked read of `path` compares right before its first
+	 * query and at its end (see {@link readChunks}): this client's writes of
+	 * every path and of `path`'s slot (see {@link SqliteWrites}), and
+	 * `PRAGMA data_version` of the store's connection. Its caller holds the
+	 * call queue, so no write of this client runs between the counts and the
+	 * pragma. A private database ({@link isPrivateSqliteDatabase}) is the
+	 * connection's alone, where no other connection commits: there the counts
+	 * are all.
+	 */
+	async #sqliteMark(path: string): Promise<string> {
+		const writes = this.#sqliteWrites;
+		const counts = `${writes?.every ?? 0}:${writes?.slots[sqliteWriteSlot(path)] ?? 0}`;
+		if (this.#sqlitePrivate) return counts;
+		const [row] = (await this.#readOne("PRAGMA data_version")) as DataVersionRow[];
+		if (!row) throw new Error("SqlSessionStorage: SQLite answered PRAGMA data_version with no row");
+		return `${counts}:${row.data_version}`;
+	}
+
+	/**
+	 * SQLite: fail with {@link SessionReadConflictError} unless the bytes a
+	 * chunked read yielded (`read`, from `fromByte`) are still stored there,
+	 * when the database or this client's writes of `path` moved since the read
+	 * took `read.mark` (see {@link #sqliteMark}). A check pass then reads exactly
+	 * that range again, with the checks of every page, and must give as many
+	 * bytes with the same SHA-256, or the read is a conflict at once. A write
+	 * during that pass can make it read the same mix the read yielded, so when
+	 * the mark moved during it a second check pass must match too: a read end
+	 * runs at most two check passes.
+	 */
+	async #confirmChunks(path: string, fromByte: number, read: ChunksPass): Promise<void> {
+		const before = await this.#exclusive(() => this.#sqliteMark(path));
+		if (before === read.mark) return;
+		const yieldedHash = read.hash?.digest("hex");
+		const check = async (): Promise<void> => {
+			let stored: { hash: string; bytes: number };
+			try {
+				stored = await digestStream(
+					this.#readPass(path, fromByte, { yielded: 0, first: 0, next: 0, sources: 0 }, read.yielded),
+				);
+			} catch (err) {
+				// The session is gone: what the read yielded is no longer all there.
+				if (isEnoent(err)) throw new SessionReadConflictError(path);
+				throw err;
+			}
+			if (stored.bytes !== read.yielded || stored.hash !== yieldedHash) throw new SessionReadConflictError(path);
+		};
+		await check();
+		// A write that made this pass read the read's mix again would have to do it once more to pass a second one.
+		if ((await this.#exclusive(() => this.#sqliteMark(path))) !== before) await check();
+	}
+
+	/**
+	 * MySQL: fail with {@link SessionReadConflictError} unless the database
+	 * computes `check.digest`, the digest of what a chunked read yielded, over
+	 * what it holds now (`check.query`, `DialectQueries.readChunksDigest`).
+	 */
+	async #confirmChunksDigest(
+		path: string,
+		check: { query: Statement; digest: Buffer },
+		values: StatementValues,
+	): Promise<void> {
+		const [stored] = (await this.#exclusive(() => this.#readOne(check.query, values))) as ChunksDigestRow[];
+		if (stored?.digest !== check.digest.toString("hex").toUpperCase()) throw new SessionReadConflictError(path);
+	}
+
+	#unmeasured(path: string): Error {
+		return new Error(
+			`SqlSessionStorage: ${this.#table} row ${JSON.stringify(path)} has no byte_len; ` +
+				`run the byte_len backfill in ${SCHEMA_DOCS}.`,
+		);
 	}
 
 	async writeFull(
@@ -3526,14 +4438,6 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		expectedSize?: number | null,
 	): Promise<void> {
 		const bytes = Buffer.from(content, "utf8");
-		const row = {
-			path,
-			mtime: mtimeMs,
-			title: title?.title ?? null,
-			title_source: title?.source ?? null,
-			title_updated_at: title?.updatedAt ?? null,
-			len: bytes.byteLength,
-		};
 		// The blobs this content names land first (see SqlBlobTier); no other blob holds it up.
 		const named = namedBlobHashes(content);
 		await this.blobs.land(named);
@@ -3541,27 +4445,138 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		await this.#awaitClaims(fences);
 		await this.#withBlobRefs(named, allowGone =>
 			this.#fencedTransaction(fences, async transaction => {
-				if (expectedSize === null) {
-					const result = await run(transaction, this.#q.insertRowIfMissing, row);
-					const inserted = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
-					if (!inserted) throw new SessionWriteConflictError(path, null, await this.#lockSize(transaction, path));
-				} else {
-					// The size check reads `byte_len` under the row lock rather than
-					// trusting a conditional UPDATE's row count, which MySQL reports
-					// as 0 for a matched row whose values did not change.
-					if (expectedSize !== undefined) {
-						const actualSize = await this.#lockSize(transaction, path);
-						if (actualSize !== expectedSize) throw new SessionWriteConflictError(path, expectedSize, actualSize);
-					}
-					await run(transaction, this.#q.upsertRow, row);
-				}
+				this.#wrote(path);
+				await this.#replaceRow(transaction, path, mtimeMs, title, bytes.byteLength, expectedSize);
 				// A created session also drops parts orphaned under its path.
-				await this.#deleteParts(transaction, path);
-				await this.#insertParts(transaction, path, bytes);
+				await this.#replaceParts(transaction, path, bytes);
 				// The content is replaced whole, and so are its references: dropped only after the blob rows' locks.
 				await this.#addRefs(transaction, path, named, allowGone, true);
 			}),
 		);
+	}
+
+	/**
+	 * {@link writeFull} from a stream. The parts go in under a staging path,
+	 * `<staging prefix><epoch ms>-<id>` (see {@link #stagingPrefix}),
+	 * {@link STAGING_PARTS_PER_TRANSACTION} per transaction; then one
+	 * transaction checks the session's size, deletes the path's staging sets
+	 * older than {@link STALE_STAGING_MS} (a dead writer's), checks that every
+	 * staged byte is still there (a staging set another writer removed is a
+	 * conflict), and swaps the staged parts in for the session's. Staging parts
+	 * have no row, so no listing or index sees them. On failure it removes its
+	 * own. Each of these transactions writes under `path`'s lease, as
+	 * {@link writeFull}'s one transaction does: behind the claim fence, so the
+	 * swap commits only while this store may write the session.
+	 */
+	async writeFullStream(
+		path: string,
+		chunks: AsyncIterable<Uint8Array>,
+		byteLength: number,
+		mtimeMs: number,
+		title?: SessionTitleUpdate,
+		expectedSize?: number | null,
+	): Promise<void> {
+		const now = Date.now();
+		const prefix = this.#stagingPrefix(path);
+		const stagingAt = (epochMs: number): string => `${prefix}${String(epochMs).padStart(STAGING_EPOCH_DIGITS, "0")}`;
+		const staging = `${stagingAt(now)}-${Snowflake.next()}`;
+		const fences = this.#fencesOf([path]);
+		const fenced = async (work: (transaction: SqlSessionStorageTransaction) => Promise<void>): Promise<void> => {
+			await this.#awaitClaims(fences);
+			await this.#fencedTransaction(fences, work);
+		};
+		try {
+			let staged = 0;
+			let batch: Array<{ offset: number; content: string }> = [];
+			// The blobs the content names, as writeFull finds them in its whole text.
+			const named = new StreamedBlobHashes();
+			const insertBatch = async (): Promise<void> => {
+				const parts = batch;
+				batch = [];
+				await fenced(async transaction => {
+					for (const part of parts) {
+						await run(transaction, this.#q.insertPart, { path: staging, ...part, now: Date.now() });
+					}
+				});
+			};
+			for await (const part of utf8Parts(chunks, PART_BYTES)) {
+				named.add(part.text);
+				batch.push({ offset: staged, content: part.text });
+				staged += part.byteLength;
+				if (batch.length === STAGING_PARTS_PER_TRANSACTION) await insertBatch();
+			}
+			if (batch.length > 0) await insertBatch();
+			if (staged !== byteLength) {
+				throw new Error(`SqlSessionStorage: a full write of ${path} streamed ${staged} bytes, not ${byteLength}`);
+			}
+			// As in writeFull, the blobs this content names land first (see SqlBlobTier); no other blob holds it up.
+			await this.blobs.land(named.hashes);
+			await this.#withBlobRefs(named.hashes, allowGone =>
+				fenced(async transaction => {
+					this.#wrote(path);
+					// The session's size as this write finds it under the row lock: the
+					// size check's, or, for a write without one, read here.
+					const sessionSize = expectedSize === undefined ? await this.#lockSize(transaction, path) : expectedSize;
+					await this.#replaceRow(transaction, path, mtimeMs, title, byteLength, expectedSize);
+					await this.#deleteStaging(transaction, prefix, stagingAt(now - STALE_STAGING_MS));
+					const stagedParts = (await run(transaction, this.#q.stagedBytes, { path: staging })) as StagedPartRow[];
+					const found = stagedParts.reduce((total, part) => total + rowNumber(part.len), 0);
+					// A delete or rename of the session deleted this write's staging parts after they were written.
+					if (found !== byteLength) throw new SessionWriteConflictError(path, sessionSize, sessionSize);
+					await this.#deleteParts(transaction, path);
+					// As a rename moves `src`'s parts (see #moveOnce), only when there are some: on MySQL an update
+					// that finds no row still locks a gap.
+					if (stagedParts.length > 0) await run(transaction, this.#q.renameParts, { src: staging, dst: path });
+					// As in writeFull, the content is replaced whole, and so are its references: dropped only after
+					// the blob rows' locks.
+					await this.#addRefs(transaction, path, named.hashes, allowGone, true);
+				}),
+			);
+		} catch (err) {
+			try {
+				await fenced(transaction => this.#deleteParts(transaction, staging));
+			} catch {
+				// The write's own failure is the one to report; the path's next full write removes this set once it is stale.
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * Lock `path`'s row for a full write and give it the new metadata: insert
+	 * it when `expectedSize` is null (a conflict when it exists), otherwise
+	 * check its `byte_len` against `expectedSize` when given, then upsert it.
+	 */
+	async #replaceRow(
+		transaction: SqlSessionStorageTransaction,
+		path: string,
+		mtimeMs: number,
+		title: SessionTitleUpdate | undefined,
+		byteLength: number,
+		expectedSize: number | null | undefined,
+	): Promise<void> {
+		const row = {
+			path,
+			mtime: mtimeMs,
+			title: title?.title ?? null,
+			title_source: title?.source ?? null,
+			title_updated_at: title?.updatedAt ?? null,
+			len: byteLength,
+		};
+		if (expectedSize === null) {
+			const result = await run(transaction, this.#q.insertRowIfMissing, row);
+			const inserted = this.#adapter === "mysql" ? result.affectedRows === 1 : result.length === 1;
+			if (!inserted) throw new SessionWriteConflictError(path, null, await this.#lockSize(transaction, path));
+			return;
+		}
+		// The size check reads `byte_len` under the row lock rather than
+		// trusting a conditional UPDATE's row count, which MySQL reports
+		// as 0 for a matched row whose values did not change.
+		if (expectedSize !== undefined) {
+			const actualSize = await this.#lockSize(transaction, path);
+			if (actualSize !== expectedSize) throw new SessionWriteConflictError(path, expectedSize, actualSize);
+		}
+		await run(transaction, this.#q.upsertRow, row);
 	}
 
 	async #lockSize(transaction: SqlSessionStorageTransaction, path: string): Promise<number | null> {
@@ -3570,16 +4585,29 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return row ? rowNumber(row.byte_len) : null;
 	}
 
-	/** Store `bytes` as parts of at most {@link PART_BYTES}, each ending on a UTF-8 character boundary. */
-	async #insertParts(transaction: SqlSessionStorageTransaction, path: string, bytes: Buffer): Promise<void> {
+	/**
+	 * Replace `path`'s parts with `bytes`, as parts of at most
+	 * {@link PART_BYTES}, each ending on a UTF-8 character boundary. On SQLite
+	 * the new parts take rowids counting up, exactly in a `bigint`, from the
+	 * first one free above every part's and the clock's floor, read before the
+	 * old ones go, so none takes the rowid of a part it replaces. A part the
+	 * count would take past {@link SQLITE_MAX_ROWID}, and every part when the
+	 * largest rowid is that already, goes in with none, for SQLite to pick
+	 * (see `DialectQueries.partRowids`).
+	 */
+	async #replaceParts(transaction: SqlSessionStorageTransaction, path: string, bytes: Buffer): Promise<void> {
+		const rowids = this.#q.partRowids;
+		const [first] = rowids ? ((await run(transaction, rowids.next, { now: Date.now() })) as RowidRow[]) : [];
+		const next = first?.next_rowid;
+		let rowid = typeof next === "string" ? BigInt(next) : undefined;
+		await this.#deleteParts(transaction, path);
 		for (let start = 0; start < bytes.byteLength;) {
-			let end = Math.min(start + PART_BYTES, bytes.byteLength);
-			// Back off continuation bytes (0b10xxxxxx) so no character straddles two parts.
-			while (end < bytes.byteLength && (bytes[end] & 0xc0) === 0x80) end--;
-			await run(transaction, this.#q.insertPart, {
+			const end = utf8PartEnd(bytes, start, PART_BYTES);
+			await run(transaction, rowids ? rowids.insert : this.#q.insertPart, {
 				path,
 				offset: start,
 				content: bytes.toString("utf8", start, end),
+				rowid: rowid !== undefined && rowid <= SQLITE_MAX_ROWID ? rowid++ : null,
 			});
 			start = end;
 		}
@@ -3608,17 +4636,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		await this.#awaitClaims(fences);
 		await this.#withBlobRefs(named, allowGone =>
 			this.#fencedTransaction(fences, async transaction => {
-				// A store that claims sessions refuses to append onto bytes it did not
-				// write (another writer that claims nothing, such as an older omp,
-				// changed or replaced the file), so `SessionManager` can read the file
-				// back and keep that writer's entries, or move off, instead of mixing
-				// this session's lines into whatever the file now holds.
-				if (expectedSize !== undefined && this.#gate) {
-					const actualSize = await this.#lockSize(transaction, path);
-					if ((actualSize ?? 0) !== expectedSize)
-						throw new SessionWriteConflictError(path, expectedSize, actualSize);
-				}
-				for (const query of this.#q.append) await run(transaction, query, values);
+				this.#wrote(path);
+				await this.#checkAppendSize(transaction, path, expectedSize);
+				// On SQLite the part's rowid comes from the clock read here, after any delete it follows (see partRowids).
+				for (const query of this.#q.append) await run(transaction, query, { ...values, now: Date.now() });
 				await this.#addRefs(transaction, path, named, allowGone);
 			}),
 		);
@@ -3932,26 +4953,131 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return sweep;
 	}
 
+	/**
+	 * {@link SessionStorageBackend.appendBatch}: as {@link append} does for
+	 * one line, the blobs the lines name land first, then one transaction
+	 * behind the write fence checks the size once, grows the session row by
+	 * the bytes of every line, inserts the lines from its old length as parts
+	 * ({@link appendedParts}) and references the blobs they name. It throws
+	 * {@link SessionAppendBatchRolledBackError} when a statement of the
+	 * transaction failed, which rolled it back before COMMIT. Any other
+	 * failure (the COMMIT's own, which may have landed; the fence's or the
+	 * claim's, which have their own errors) is thrown as it is.
+	 */
+	async appendBatch(path: string, lines: readonly string[], mtimeMs: number, expectedSize?: number): Promise<void> {
+		// The blobs these lines name land first (see SqlBlobTier), as each line's own append lands its own.
+		const named = new Set<string>();
+		for (const line of lines) for (const hash of namedBlobHashes(line)) named.add(hash);
+		await this.blobs.land(named);
+		const fences = this.#fencesOf([path]);
+		await this.#awaitClaims(fences);
+		// What a statement of the transaction's last attempt threw, which rolled it back before COMMIT.
+		let statementFailure: { error: unknown } | undefined;
+		try {
+			await this.#withBlobRefs(named, allowGone =>
+				this.#fencedTransaction(fences, async transaction => {
+					statementFailure = undefined;
+					try {
+						this.#wrote(path);
+						await this.#checkAppendSize(transaction, path, expectedSize);
+						let len = 0;
+						for (const line of lines) len += Buffer.byteLength(line, "utf8");
+						const [grown] = (await run(transaction, this.#q.growRow, { path, mtime: mtimeMs, len })) as SizeRow[];
+						const size =
+							this.#adapter === "mysql"
+								? await this.#lockSize(transaction, path)
+								: grown
+									? rowNumber(grown.byte_len)
+									: null;
+						if (size === null) throw new Error(`SqlSessionStorage: an append batch found no row of ${path}`);
+						let offset = size - len;
+						for (const part of appendedParts(lines)) {
+							// On SQLite each part's rowid comes from the clock read here (see partRowids).
+							await run(transaction, this.#q.insertPart, {
+								path,
+								offset,
+								content: part.content,
+								now: Date.now(),
+							});
+							offset += part.bytes;
+						}
+						await this.#addRefs(transaction, path, named, allowGone);
+					} catch (err) {
+						statementFailure = { error: err };
+						throw err;
+					}
+				}),
+			);
+		} catch (err) {
+			if (statementFailure?.error === err) throw new SessionAppendBatchRolledBackError(path, err);
+			throw err;
+		}
+	}
+
+	/**
+	 * A store that claims sessions refuses to append onto bytes it did not
+	 * write (another writer that claims nothing, such as an older omp, changed
+	 * or replaced the file), so `SessionManager` can read the file back and
+	 * keep that writer's entries, or move off, instead of mixing this
+	 * session's lines into whatever the file now holds.
+	 */
+	async #checkAppendSize(
+		transaction: SqlSessionStorageTransaction,
+		path: string,
+		expectedSize: number | undefined,
+	): Promise<void> {
+		if (expectedSize === undefined || !this.#gate) return;
+		const actualSize = await this.#lockSize(transaction, path);
+		if ((actualSize ?? 0) !== expectedSize) throw new SessionWriteConflictError(path, expectedSize, actualSize);
+	}
+
 	async truncate(path: string, mtimeMs: number): Promise<void> {
 		await this.writeFull(path, "", mtimeMs);
 	}
 
 	async remove(paths: string[], dir?: string): Promise<void> {
-		const under = dir === undefined ? undefined : { dir, len: [...dir].length };
+		// The key range under `dir` runs from `dir` without its final "/" up to `dir` with that "/" made "0": in
+		// code-point order and under MySQL's PAD SPACE every path under `dir` sorts within it, whatever follows the
+		// "/" (see DialectQueries.deleteUnder). On MySQL the lock of the rows under `dir` reads that range too
+		// (#lockSessionRowsForWrite). On PostgreSQL the parts delete takes the range only under a code-point
+		// collation, and compares the prefix alone under any other (#directoryRange).
+		const under: UnderDirectory | undefined =
+			dir === undefined
+				? undefined
+				: { dir, len: [...dir].length, stem: dir.slice(0, -1), dir_end: `${dir.slice(0, -1)}0` };
 		const fences = this.#fencesOf(paths);
 		await this.#awaitClaims(fences);
 		const there = under ? undefined : await this.#sessionRowsThere(paths);
 		await this.#fencedTransaction(fences, async transaction => {
 			// Every session row first, in path order, those under `dir` with them (see #lockSessionRowsForWrite);
 			// all their locks are then held before the first parts look (see #deleteParts).
-			const present = await this.#lockSessionRowsForWrite(transaction, paths, there, under);
+			const { present, locked } = await this.#lockSessionRowsForWrite(transaction, paths, there, under);
 			const ordered = [...new Set(paths)].sort();
 			// Only rows there are: a delete that finds no row still locks a gap on MySQL.
 			for (const path of ordered) {
+				this.#wrote(path);
 				if (!present || present.has(path)) await run(transaction, this.#q.deleteRow, { path });
 			}
-			if (under) for (const query of this.#q.deleteUnder) await run(transaction, query, under);
+			// The staging sets the directory delete does not take: those of a path not under `dir`, and on
+			// MySQL those of a path too long for `<path>#staging-` names, named by its hash instead
+			// (#stagingPrefix): the explicit paths', and those of every row under `dir`, locked above.
+			const staged = new Set(
+				paths.filter(path => !under || !path.startsWith(under.dir) || this.#hashesStaging(path)),
+			);
+			if (under) {
+				if (this.#sqliteWrites) this.#sqliteWrites.every++;
+				for (const { path } of locked) {
+					if (path.startsWith(under.dir) && this.#hashesStaging(path)) staged.add(path);
+				}
+				const deletes = this.#directoryRange ? this.#q.deleteUnder : this.#q.deleteUnderScan;
+				for (const query of deletes) await run(transaction, query, under);
+			}
 			for (const path of ordered) await this.#deleteParts(transaction, path);
+			// In ascending order of the key ranges they lock, each from a path's staging prefix (#stagingPrefix),
+			// as every other delete of this transaction takes its locks.
+			for (const prefix of [...staged].map(path => this.#stagingPrefix(path)).sort()) {
+				await this.#deleteStagingFrom(transaction, prefix);
+			}
 			// Then the blobs only the deleted sessions named: their rows are locked before their references go.
 			await this.#deleteOrphans(transaction, await this.#takeRefs(transaction, ordered, under));
 		});
@@ -3992,9 +5118,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	): Promise<void> {
 		const there = await this.#sessionRowsThere([src, dst]);
 		await this.#fencedTransaction(fences, async transaction => {
+			this.#wrote(src);
+			this.#wrote(dst);
 			// Both session rows first, in path order, before either changes; only rows there are change. A `dst`
 			// with no row is taken by the UPDATE below, after `src`'s (see docs/session.md, "Races").
-			const present = await this.#lockSessionRowsForWrite(transaction, [src, dst], there);
+			const { present } = await this.#lockSessionRowsForWrite(transaction, [src, dst], there);
 			if (present && !present.has(src)) throw enoent(src);
 			if (!noReplace && (!present || present.has(dst))) await run(transaction, this.#q.deleteRow, { path: dst });
 			// One statement renames the row, so the primary key refuses a `dst`
@@ -4011,6 +5139,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			if (this.#adapter !== "mysql" || (await run(transaction, this.#q.hasParts, { path: src })).length > 0) {
 				await run(transaction, this.#q.renameParts, { src, dst });
 			}
+			// Staging sets stay under the name their writer staged them for: the
+			// source's are left with no session, and so are a replaced destination's.
+			// They are parts under those paths, so they go before any blob row is locked.
+			await this.#deleteStagingFrom(transaction, this.#stagingPrefix(src));
+			if (!noReplace) await this.#deleteStagingFrom(transaction, this.#stagingPrefix(dst));
 			// The references change last, the rows of every blob they name locked first: the replaced session's
 			// (exclusive, since its blobs may go with it) and `src`'s, which move to `dst` (shared). Each moves by
 			// its key: an UPDATE of `src`'s range would lock, on MySQL, next-key ranges over it and the gap after,
@@ -4097,28 +5230,32 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * locked (see {@link #sessionRowsThere}), as {@link #lockBlobRows} does for
 	 * blob rows: a locking read of a missing path locks its gap, and an insert
 	 * into that gap at another path (a rename's destination, a new session)
-	 * would wait for it. Then it answers the paths whose rows it locked, and
-	 * the caller changes only those. With `under` MySQL can use no index
-	 * (`substr`), so the lock scans and locks every row, gaps too, in path
-	 * order, as the directory's `DELETE` that follows does anyway. PostgreSQL
-	 * locks no gap. Elsewhere nothing is answered; SQLite runs one writer at a
-	 * time.
+	 * would wait for it. Then it answers, as `present`, the paths whose rows
+	 * it locked, and the caller changes only those. With `under` it answers,
+	 * as `locked`, every row it locked, and no `present`: the caller changes
+	 * every path. On MySQL and MariaDB the rows under the directory are read
+	 * by the directory's key range (see
+	 * {@link DialectQueries.lockSessionRowsForWrite}): the lock takes those
+	 * rows, the gaps between them and the gaps at either end of the range, up
+	 * to the nearest row outside it (MariaDB locks the first row past the
+	 * range too), and no other row or gap. PostgreSQL locks no gap.
+	 * Elsewhere nothing is answered; SQLite runs one writer at a time.
 	 */
 	async #lockSessionRowsForWrite(
 		transaction: SqlSessionStorageTransaction,
 		paths: readonly string[],
 		there: ReadonlySet<string> | undefined,
-		under?: { dir: string; len: number },
-	): Promise<ReadonlySet<string> | undefined> {
+		under?: UnderDirectory,
+	): Promise<LockedSessionRows> {
 		const lock = this.#q.lockSessionRowsForWrite;
-		if (!lock) return undefined;
+		if (!lock) return { present: undefined, locked: [] };
 		const ordered = [...new Set(paths)].sort();
 		if (!there || under) {
-			await run(transaction, lock(ordered.length, under !== undefined), {
+			const rows = (await run(transaction, lock(ordered.length, under !== undefined), {
 				...listValues("p", ordered),
-				...(under ?? {}),
-			});
-			return undefined;
+				...under,
+			})) as PathRow[];
+			return { present: undefined, locked: under ? rows : [] };
 		}
 		// One key per statement (see #lockBlobRows): MySQL may plan an IN list as a scan, which locks other rows.
 		const present = new Set<string>();
@@ -4127,7 +5264,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			const rows = (await run(transaction, lock(1, false), listValues("p", [path]))) as PathRow[];
 			for (const row of rows) present.add(row.path);
 		}
-		return present;
+		return { present, locked: [] };
 	}
 
 	/** The references of `paths`, read without a lock. */
@@ -4309,5 +5446,58 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		this.blobs.forget(orphans);
 		logger.info("Deleted session blobs no session names any more", { blobs: orphans.length });
 		return [...orphans, ...(await this.#deleteOrphans(transaction, parts))];
+	}
+
+	/**
+	 * SQLite: count a write of `path` by this client, in its slot (wrapping at
+	 * 2^32). Called inside the write's transaction, which holds the call
+	 * queue, so a chunked read of `path` that this write lands within takes
+	 * another count at its end (see {@link SqliteWrites}).
+	 */
+	#wrote(path: string): void {
+		const slots = this.#sqliteWrites?.slots;
+		if (slots) slots[sqliteWriteSlot(path)]++;
+	}
+
+	/**
+	 * Whether `path`'s staging sets are named by its hash: on MySQL, a path
+	 * longer than {@link MYSQL_PLAIN_STAGING_CHARS} characters, whose
+	 * `<path>#staging-<epoch>-<id>` would not fit the 512-character `path`
+	 * column.
+	 */
+	#hashesStaging(path: string): boolean {
+		return this.#adapter === "mysql" && [...path].length > MYSQL_PLAIN_STAGING_CHARS;
+	}
+
+	/**
+	 * Starts the names of `path`'s staging sets: `<path>#staging-`, or, where
+	 * {@link #hashesStaging}, {@link HASHED_STAGING}, the SHA-256 of `path` in
+	 * hex and `#staging-` (86 characters, so every staging path of it fits).
+	 * Either is `path`'s alone, so a range from it reaches no other path's
+	 * staging sets.
+	 */
+	#stagingPrefix(path: string): string {
+		if (!this.#hashesStaging(path)) return `${path}${STAGING_MARK}`;
+		return `${HASHED_STAGING}${new Bun.CryptoHasher("sha256").update(path).digest("hex")}${STAGING_MARK}`;
+	}
+
+	/**
+	 * Delete every staging set named from `prefix`, a path's staging prefix
+	 * ({@link #stagingPrefix}), whatever its age: a path that goes takes its
+	 * unfinished full writes with it.
+	 */
+	#deleteStagingFrom(transaction: SqlSessionStorageTransaction, prefix: string): Promise<void> {
+		// The largest epoch bounds every name: code-point and locale collations alike order
+		// staging names by their epoch digits, while a punctuation bound sorts before digits
+		// in some (ICU puts ":" before "0").
+		return this.#deleteStaging(transaction, prefix, `${prefix}${"9".repeat(STAGING_EPOCH_DIGITS)}`);
+	}
+
+	/** Delete the staging parts whose names run from `low` (a path's staging prefix) up to, not including, `high`. */
+	async #deleteStaging(transaction: SqlSessionStorageTransaction, low: string, high: string): Promise<void> {
+		const range = { low, high, len: [...low].length };
+		// As in #deleteParts: on MySQL a DELETE that matches nothing still takes a gap lock.
+		if (this.#adapter === "mysql" && (await run(transaction, this.#q.hasStaging, range)).length === 0) return;
+		await run(transaction, this.#q.deleteStaging, range);
 	}
 }

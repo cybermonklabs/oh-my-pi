@@ -15,7 +15,7 @@ import {
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
-import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import type { SessionEntry, UsageStatistics } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { parseSessionContent } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SESSION_TAIL_APPEND_CHUNK_BYTES, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
@@ -38,8 +38,6 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 class ControlledRewriteStorage extends FileSessionStorage {
 	/** Every full rewrite fails while set. */
 	failRewrites = false;
-	/** The next full rewrite fails. */
-	failNextRewrite = false;
 	/** Every in-place title-slot write fails while set. */
 	failTitleSlots = false;
 	/** The next `statSync` throws EACCES. */
@@ -140,10 +138,6 @@ class ControlledRewriteStorage extends FileSessionStorage {
 	}
 
 	#rewriteFailure(): Error | undefined {
-		if (this.failNextRewrite) {
-			this.failNextRewrite = false;
-			return new Error("EROFS: synthetic full rewrite failure");
-		}
 		return this.failRewrites ? new Error("EROFS: synthetic full rewrite failure") : undefined;
 	}
 
@@ -1912,7 +1906,18 @@ describe("a durably discarded entry", () => {
 		return { ...session, discardedId };
 	}
 
-	function expectDiscardSurvivesRestart(branch: readonly SessionEntry[], discardedId: string): void {
+	/**
+	 * What a reader of the reopened session sees after the discard: a branch
+	 * without the discarded turn that keeps its service tier and every later
+	 * turn, and totals that still count the discarded turn's billed usage,
+	 * because the turn stays in the journal off the branch.
+	 */
+	function expectDiscardSurvivesRestart(
+		reopened: SessionManager,
+		discardedId: string,
+		usageBeforeDiscard: UsageStatistics,
+	): void {
+		const branch = reopened.getBranch();
 		expect(branch.some(entry => entry.id === discardedId)).toBe(false);
 		expect(branch.flatMap(entry => (entry.type === "service_tier_change" ? [entry.serviceTier] : []))).toContainEqual(
 			{
@@ -1920,20 +1925,26 @@ describe("a durably discarded entry", () => {
 			},
 		);
 		expect(userTurnsOf(branch)).toEqual(["before", "after", "after2"]);
+		expect(reopened.getEntries().some(entry => entry.id === discardedId)).toBe(true);
+		expect(reopened.getUsageStatistics()).toEqual(usageBeforeDiscard);
 	}
 
-	it("stays discarded after its rewrite failed once and storage healed", async () => {
+	it("is appended alone, so it survives a restart while full rewrites fail", async () => {
 		const { storage, manager, sessionDir, sessionFile, discardedId } = await sessionWithDiscardableTurn();
-		storage.failNextRewrite = true;
-		await manager.discardEntryDurably(discardedId).catch(() => undefined);
+		const usageBeforeDiscard = manager.getUsageStatistics();
+		storage.failRewrites = true;
+		const rewritesBefore = storage.fullRewrites;
+		await expect(manager.discardEntryDurably(discardedId)).resolves.toBeUndefined();
+		expect(storage.fullRewrites).toBe(rewritesBefore);
 		manager.appendMessage(userTurn("after"));
 		manager.appendMessage(userTurn("after2"));
 
-		expectDiscardSurvivesRestart((await reopen(sessionFile, sessionDir)).getBranch(), discardedId);
+		expectDiscardSurvivesRestart(await reopen(sessionFile, sessionDir), discardedId, usageBeforeDiscard);
 	});
 
 	it("stays discarded when it was queued behind a parked rewrite and its own publish failed", async () => {
 		const { storage, manager, sessionDir, sessionFile, discardedId } = await sessionWithDiscardableTurn();
+		const usageBeforeDiscard = manager.getUsageStatistics();
 		const parked = storage.parkNextAtomicRewrite();
 		const unrelated = manager.rewriteEntries();
 		await parked.started;
@@ -1946,7 +1957,7 @@ describe("a durably discarded entry", () => {
 		manager.appendMessage(userTurn("after"));
 		manager.appendMessage(userTurn("after2"));
 
-		expectDiscardSurvivesRestart((await reopen(sessionFile, sessionDir)).getBranch(), discardedId);
+		expectDiscardSurvivesRestart(await reopen(sessionFile, sessionDir), discardedId, usageBeforeDiscard);
 	});
 });
 

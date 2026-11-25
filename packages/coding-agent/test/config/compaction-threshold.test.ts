@@ -19,7 +19,7 @@ import {
 	resolveModelCompactionSettings,
 	setModelCompactionPoint,
 } from "@oh-my-pi/pi-coding-agent/session/model-compaction-threshold";
-import { compactionThresholdSettings, createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { compactionThresholdSettings, createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/subagent-settings";
 import { cfgTaskAgentCompactionThresholdOverrides } from "@oh-my-pi/pi-coding-agent/task/settings";
 
 async function withConfigDirs(run: (dirs: { root: string; agentDir: string; cwd: string }) => Promise<void>) {

@@ -137,6 +137,45 @@ export class SessionWriteConflictError extends Error {
 }
 
 /**
+ * A chunked read ({@link SessionStorage.readChunks}) met a session that a full
+ * write or a delete replaced after the read began, so the bytes it had yielded
+ * and the rest would mix two bodies. Reading the session again from its start
+ * sees one body.
+ */
+export class SessionReadConflictError extends Error {
+	readonly path: string;
+
+	constructor(path: string) {
+		super(`Session file ${JSON.stringify(path)} was replaced or removed while it was read; read it again.`);
+		this.name = "SessionReadConflictError";
+		this.path = path;
+	}
+}
+
+/**
+ * Times a reader of a stored transcript reads it again from its start after a
+ * {@link SessionReadConflictError}, before that error surfaces. Each retry
+ * streams again; none falls back to reading the transcript whole.
+ */
+export const RACED_READ_RETRIES = 3;
+
+/**
+ * Run `pass`, a read of a stored transcript from its start, and run it again
+ * after each {@link SessionReadConflictError}, at most
+ * {@link RACED_READ_RETRIES} more times. Any other error, and a conflict past
+ * the last retry, is thrown.
+ */
+export async function retryRacedRead<T>(pass: () => Promise<T>): Promise<T> {
+	for (let retries = 0; ; retries++) {
+		try {
+			return await pass();
+		} catch (error) {
+			if (!(error instanceof SessionReadConflictError) || retries >= RACED_READ_RETRIES) throw error;
+		}
+	}
+}
+
+/**
  * The file publish lock is held by another live writer, so freshness cannot
  * be established. Fail-closed: the staged rewrite is discarded without
  * publishing.
@@ -239,7 +278,11 @@ export interface SessionClaimOptions {
 export interface SessionAcquireOptions extends SessionClaimOptions {
 	/**
 	 * While another process holds the claim, wait up to this long for its
-	 * lease to go or expire, then claim. Without it a held claim refuses at once.
+	 * lease to go or expire, then claim. Without it a held claim refuses at
+	 * once. A SQLite claim, an OS lock that names no lease, does neither:
+	 * either way it keeps trying the lock for a moment, and never tries it
+	 * again past this (see `SQLITE_CLAIM_RELEASE_WINDOW_MS` in
+	 * sql-session-storage.ts).
 	 */
 	waitMs?: number;
 	/** Called once, when the claim must wait, with the process that holds it. */
@@ -370,6 +413,13 @@ export interface SessionStorage {
 	 */
 	readTextFrom?(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }>;
 	/**
+	 * The file's bytes from byte `fromByte` (default 0) to its end, as chunks in
+	 * order, so a reader never holds the whole transcript. Iterating a missing
+	 * file rejects with ENOENT. Optional: callers on backends without it read the
+	 * whole text.
+	 */
+	readChunks?(path: string, fromByte?: number): AsyncIterable<Uint8Array>;
+	/**
 	 * Feed each line of the file to `visit`, in order, until it returns true or
 	 * the file ends. Lets callers find records that fall between the bounded
 	 * {@link readTextSlices} windows. Optional: backends without cheap full scans
@@ -478,6 +528,14 @@ export interface SessionStorage {
 	 * `writeTextSync` publish is still on the wire.
 	 */
 	drain(): Promise<void>;
+	/**
+	 * Resolve once this process may queue more transcript appends: at once while the transcript appends it has
+	 * queued and not yet settled are at or under the point where its turns start to wait (not a bound on what it
+	 * queues), otherwise once enough of them settle; at once when `signal` fires. An agent session awaits it before
+	 * each model request and before each tool result it appends, so a backend that falls behind slows the turns
+	 * instead of holding their lines in memory. Storage that never makes turns wait omits it.
+	 */
+	waitForAppendAdmission?(signal?: AbortSignal): Promise<void>;
 }
 
 // FinalizationRegistry to clean up leaked file descriptors
@@ -829,20 +887,6 @@ const SESSION_HEADER_FIRST_READ_BYTES = 8 * 1024;
 /** Reused across calls: reading a header never yields, so one buffer serves every read. */
 const sessionHeaderBuffer = Buffer.allocUnsafe(SESSION_HEADER_PREFIX_BYTES);
 
-/** The session id in the first header line of `prefix`, past the title slot. */
-function parseSessionHeaderId(prefix: string): string | undefined {
-	const body = parseTitleSlotFromContent(prefix) ? prefix.slice(prefix.indexOf("\n") + 1) : prefix;
-	const end = body.indexOf("\n");
-	if (end === -1) return undefined;
-	try {
-		const entry: unknown = JSON.parse(body.slice(0, end));
-		if (entry && typeof entry === "object" && "type" in entry && entry.type === "session" && "id" in entry) {
-			return typeof entry.id === "string" ? entry.id : undefined;
-		}
-	} catch {}
-	return undefined;
-}
-
 /**
  * The session id in the header of the file at `sessionPath`, read
  * synchronously from a bounded prefix (past the title slot), or `undefined`
@@ -853,11 +897,11 @@ function readSessionHeaderIdSync(sessionPath: string): string | undefined {
 		const fd = fs.openSync(sessionPath, "r");
 		try {
 			const read = fs.readSync(fd, sessionHeaderBuffer, 0, SESSION_HEADER_FIRST_READ_BYTES, 0);
-			const id = parseSessionHeaderId(sessionHeaderBuffer.toString("utf8", 0, read));
+			const id = sessionHeaderIdInPrefix(sessionHeaderBuffer.toString("utf8", 0, read));
 			// Only a file whose header line did not fit is read again.
 			if (id !== undefined || read < SESSION_HEADER_FIRST_READ_BYTES) return id;
 			const full = fs.readSync(fd, sessionHeaderBuffer, 0, SESSION_HEADER_PREFIX_BYTES, 0);
-			return parseSessionHeaderId(sessionHeaderBuffer.toString("utf8", 0, full));
+			return sessionHeaderIdInPrefix(sessionHeaderBuffer.toString("utf8", 0, full));
 		} finally {
 			fs.closeSync(fd);
 		}
@@ -968,13 +1012,38 @@ function sessionLeasePath(sessionId: string, createDir: boolean): string {
 }
 
 /**
- * Take a session's ownership lease without waiting, or `null` while another
- * process holds it. A process writing the session holds it (see
- * `FileSessionStorage.claimSession`) until it exits; `omp gc` takes it to
- * delete a session no running process owns. Throws when the lock cannot be
- * probed.
+ * Take a session's ownership lease without waiting for its holder, or `null`
+ * while a process, this one included, holds it. On Linux it probes the lease
+ * first (`isFileLockHeld`) and answers `null` at once when the probe finds a
+ * holder; it claims only a lease the probe finds free, so a native claim that
+ * waits on a refusal (the abstract-socket lock's, see `tryAcquireFileLock`;
+ * the open-file-description lock of newer builds of the addon answers at
+ * once) waits only when another process claims the lease between the probe
+ * and the claim, or when a probe made a free lease look taken. Elsewhere the
+ * claim alone answers at once. `omp gc` takes it to delete a session no
+ * running process owns; a lease released while it is probed can read as held,
+ * which leaves that session for gc's next run. Throws when the lock cannot be
+ * probed or taken.
  */
 export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null {
+	const lockPath = sessionLeasePath(sessionId, true);
+	// On Linux a native claim may wait on a refusal (see tryAcquireFileLock); the probe answers at once.
+	if (process.platform === "linux" && isFileLockHeld(lockPath)) return null;
+	return tryAcquireFileLock(lockPath);
+}
+
+/**
+ * Claim a session's ownership lease to write the session, or `null` while a
+ * process, this one included, holds it. A process writing the session holds
+ * it (see `FileSessionStorage.claimSession`) until it exits. It claims without
+ * probing first, so a concurrent probe never makes it refuse a free lease: a
+ * probe of the open-file-description lock of newer builds of the addon takes
+ * nothing, and a claim of the abstract-socket lock retries the moment a probe
+ * makes a free lease look taken. A lease another process holds is refused, at
+ * once or after the native claim's own wait (see `tryAcquireFileLock`). Throws
+ * when the lock cannot be taken.
+ */
+export function claimSessionLease(sessionId: string): FileLockHandle | null {
 	return tryAcquireFileLock(sessionLeasePath(sessionId, true));
 }
 
@@ -1010,27 +1079,42 @@ export function probeSessionLeases(sessionIds: readonly string[]): SessionLeaseR
 	return report;
 }
 
-/** Approximate size (UTF-16 units synchronously, bytes through a sink) buffered per staging-file write when streaming a body. */
-const LINE_STREAM_CHUNK = 1 << 20;
+/** Approximate size (UTF-16 units synchronously, bytes through a sink or a spool read) buffered per write or read when streaming a body. */
+export const LINE_STREAM_CHUNK = 1 << 20;
+
+/**
+ * Write `lines` at `fd`'s position in chunks of about {@link LINE_STREAM_CHUNK}
+ * UTF-16 units, never holding their full concatenation, iterating them once.
+ * Returns the UTF-8 bytes written.
+ */
+export function writeLinesToDescriptorSync(fd: number, lines: Iterable<string>): number {
+	let bytes = 0;
+	let chunk = "";
+	const flush = (): void => {
+		const encoded = Buffer.from(chunk, "utf8");
+		fs.writeFileSync(fd, encoded);
+		bytes += encoded.byteLength;
+		chunk = "";
+	};
+	for (const line of lines) {
+		if (line.length >= LINE_STREAM_CHUNK) {
+			if (chunk.length > 0) flush();
+			chunk = line;
+			flush();
+			continue;
+		}
+		chunk += line;
+		if (chunk.length >= LINE_STREAM_CHUNK) flush();
+	}
+	if (chunk.length > 0) flush();
+	return bytes;
+}
 
 /** Write `lines` to a new file at `target` in bounded chunks, never holding their full concatenation. */
 function writeLinesToFileSync(target: string, lines: Iterable<string>): void {
 	const fd = fs.openSync(target, "w");
 	try {
-		let chunk = "";
-		for (const line of lines) {
-			if (line.length >= LINE_STREAM_CHUNK) {
-				if (chunk.length > 0) fs.writeFileSync(fd, chunk);
-				chunk = "";
-				fs.writeFileSync(fd, line);
-				continue;
-			}
-			chunk += line;
-			if (chunk.length < LINE_STREAM_CHUNK) continue;
-			fs.writeFileSync(fd, chunk);
-			chunk = "";
-		}
-		if (chunk.length > 0) fs.writeFileSync(fd, chunk);
+		writeLinesToDescriptorSync(fd, lines);
 	} finally {
 		fs.closeSync(fd);
 	}
@@ -1172,15 +1256,32 @@ export class FileSessionStorage implements SessionStorage {
 	 * Claim the process-owned gate at `gatePath` ({@link #osGatePath}) for
 	 * `fpath`, failing closed after the same bounded wait the lockfile claim
 	 * uses. The native handle keeps ownership, never the file content, so
-	 * suspension and SIGKILL cannot strand it as stealable.
+	 * suspension and SIGKILL cannot strand it as stealable. On Linux a claim
+	 * of a gate another process holds blocks this thread for about 50 ms with
+	 * the abstract-socket lock (see `tryAcquireFileLock`) and answers at once
+	 * with the open-file-description lock of newer builds of the addon, so
+	 * every attempt but the last probes the gate first and claims only one the
+	 * probe finds free; a probe that reads a just-released gate as held costs
+	 * one poll.
 	 */
 	#acquireOsPublishLock(fpath: string, gatePath: string): NativeFileLock {
 		const deadline = Date.now() + SESSION_PUBLISH_LOCK_WAIT_MS;
 		for (;;) {
-			const gate = NativeFileLock.tryAcquire(gatePath);
-			if (gate.acquired) return gate;
-			gate.release();
-			if (Date.now() >= deadline) {
+			const lastAttempt = Date.now() >= deadline;
+			let held = false;
+			if (!lastAttempt && process.platform === "linux") {
+				try {
+					held = NativeFileLock.isHeld(gatePath);
+				} catch {
+					// The probe failed: the claim decides.
+				}
+			}
+			if (!held) {
+				const gate = NativeFileLock.tryAcquire(gatePath);
+				if (gate.acquired) return gate;
+				gate.release();
+			}
+			if (lastAttempt || (!held && Date.now() >= deadline)) {
 				throw new SessionLockError(fpath, "another writer holds the publish lock");
 			}
 			sleepSyncMs(SESSION_PUBLISH_LOCK_POLL_MS);
@@ -1489,6 +1590,12 @@ export class FileSessionStorage implements SessionStorage {
 		return { text: await Bun.file(path).slice(offset, end).text(), size };
 	}
 
+	readChunks(path: string, fromByte?: number): AsyncIterable<Uint8Array> {
+		const file = Bun.file(path);
+		// A read from the start streams the file itself, as every whole-file stream here does.
+		return (fromByte ? file.slice(fromByte) : file).stream();
+	}
+
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		// A gzip member cannot be read end-first, so an archived transcript is
 		// inflated whole and then windowed. Only the listing of an archive hits
@@ -1751,7 +1858,7 @@ export class FileSessionStorage implements SessionStorage {
 		} else {
 			let lease: FileLockHandle | null;
 			try {
-				lease = tryAcquireSessionLease(sessionId);
+				lease = claimSessionLease(sessionId);
 			} catch (err) {
 				logger.debug("Session ownership lease unavailable", { sessionId, error: toError(err).message });
 				return () => {};
@@ -1921,6 +2028,35 @@ export async function readSessionTextFrom(
 	if (offset >= bytes.length) return { text: "", size: bytes.length };
 	const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
 	return { text: bytes.subarray(offset, end).toString("utf8"), size: bytes.length };
+}
+
+/**
+ * Bytes {@link readSessionLinesFrom} reads at once. A key-indexed backend may
+ * fetch more than the window: SQL fetches the rest of the stored part the
+ * window ends in, at most the window's length again (an appended line is one
+ * part of its own length).
+ */
+const TRANSCRIPT_WINDOW_BYTES = 8 * 1024 * 1024;
+
+/**
+ * {@link readSessionTextFrom} of a window of at most 8 MiB from `offset`, for
+ * a caller that tails a transcript: it keeps the complete lines and reads on
+ * from where they end, so a long transcript is never held whole. A window that
+ * stops short of the end with no newline in its second half is doubled until
+ * it has one, so the caller moves forward even when it starts up to half a
+ * window before the lines it has not seen (the Agent Hub viewer re-reads the
+ * end of what it rendered); only a line longer than half a window makes a
+ * window larger.
+ */
+export async function readSessionLinesFrom(
+	storage: SessionStorage,
+	filePath: string,
+	offset: number,
+): Promise<{ text: string; size: number }> {
+	for (let window = TRANSCRIPT_WINDOW_BYTES; ; window *= 2) {
+		const read = await readSessionTextFrom(storage, filePath, offset, window);
+		if (offset + window >= read.size || read.text.lastIndexOf("\n") >= read.text.length / 2) return read;
+	}
 }
 
 function matchesPatternSegment(name: string, pattern: string): boolean {

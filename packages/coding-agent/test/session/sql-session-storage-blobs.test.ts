@@ -12,12 +12,15 @@ import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { BlobStore } from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import { isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import type { FileEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import {
 	loadSessionMessagesReadOnly,
 	resolveBlobRefsInEntriesSync,
 } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { entryRecordText } from "@oh-my-pi/pi-coding-agent/session/session-persistence";
+import { copyTranscript } from "@oh-my-pi/pi-coding-agent/session/session-transcript-tree";
 import {
 	SessionRenameRaceError,
 	SqlSessionStorage,
@@ -36,6 +39,7 @@ import {
 	openLeaseDb,
 	ROW_LEASE_BACKENDS,
 	rejection,
+	STILL,
 	transcript,
 	until,
 } from "./sql-session-lease-fixture";
@@ -56,8 +60,6 @@ const REF_DELETE = /^DELETE FROM \S*_refs WHERE path = /;
 const BLOB_SHARE_LOCK = /^SELECT sha256 FROM \S*_blobs WHERE .* (?:FOR SHARE|LOCK IN SHARE MODE)$/;
 /** An exclusive lock on blob rows. */
 const BLOB_EXCLUSIVE_LOCK = /^SELECT sha256 FROM \S*_blobs WHERE .* FOR UPDATE$/;
-/** A lease whose heartbeat stays out of the way, so the write's fence is what finds another holder. */
-const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 
 function sha256(data: Buffer): string {
 	return new Bun.SHA256().update(data).digest("hex");
@@ -706,6 +708,196 @@ describe("session blobs in the SQL session storage", () => {
 					);
 				},
 			);
+
+			// A body the spool streams to `writeFullStream` (a session's full rewrite) replaces its path's references as
+			// a whole write's does, from every reference the staged parts hold, one cut across two parts included.
+			it("replaces a session's references through a streamed full write, and the sweep keeps only the blob it names", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const queries: string[] = [];
+				const storage = await db.open({ wrap: client => recordingClient(client, queries) });
+				const [dropped, named] = [imageBytes(21), imageBytes(22)];
+				for (const data of [dropped, named]) storage.blobTier.store(sha256(data), data, "image/png");
+				await storage.drain();
+				const file = db.dir.join("sessions", "streamed.jsonl");
+				await storage.writeText(file, transcript(ID, `blob:sha256:${sha256(dropped)}`));
+				await storage.drain();
+				// The new body names the other image 20 bytes before 1 MiB, where the first staged part ends.
+				const at = transcript(ID, "@").indexOf("@");
+				const body = transcript(ID, `${"x".repeat(1024 * 1024 - 20 - at)}blob:sha256:${sha256(named)} seen`);
+				queries.length = 0;
+				await storage.writeLinesAtomic(file, body.split(/(?<=\n)/));
+				await storage.drain();
+				// The staged swap ran: its rename of the staging parts is the only `UPDATE … SET path` here.
+				expect(queries.filter(query => /^UPDATE \S*_parts SET path\b/.test(query))).toHaveLength(1);
+				expect((await db.row(file))?.content).toBe(body);
+				const refs = await db.sql(`SELECT sha256 FROM ${db.table}_refs WHERE path = @1`, [file]);
+				expect(refs.map(row => String(row.sha256))).toEqual([sha256(named)]);
+
+				// Both rows are older than the sweep's grace: only the reference keeps one.
+				await db.sql(`UPDATE ${db.table}_blobs SET created_ms = @1`, [Date.now() - 3 * 86_400_000]);
+				expect(await storage.blobTier.sweep(new Set(), Date.now() - 60_000, true)).toEqual({
+					candidates: 1,
+					deleted: 1,
+					bytes: dropped.byteLength,
+				});
+				expect(await blobHashes(db)).toEqual([sha256(named)]);
+			});
+
+			// As a rename moves no parts its source lacks (on MySQL an update that finds no row still locks a gap).
+			it("renames no staging parts when a streamed full write stages none", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const queries: string[] = [];
+				const storage = await db.open({ wrap: client => recordingClient(client, queries) });
+				const file = db.dir.join("sessions", "emptied.jsonl");
+				await storage.writeText(file, transcript(ID, "something"));
+				await storage.drain();
+				queries.length = 0;
+				await storage.writeLinesAtomic(file, []);
+				await storage.drain();
+				expect((await db.row(file))?.content).toBe("");
+				// The swap ran (its look at the staged parts), and renamed nothing.
+				expect(queries.filter(query => /AS len FROM \S*_parts WHERE path = /.test(query))).toHaveLength(1);
+				expect(queries.filter(query => /^UPDATE \S*_parts SET path\b/.test(query))).toEqual([]);
+			});
+
+			// A copy (`copyTranscript`, as a session's subagent transcripts are copied to a fork) appends the source's
+			// text in batches; each append references the blobs it names, so no batch may cut a reference.
+			it("references from a copied transcript a blob whose reference the source's stored parts cut, so deleting the source keeps it", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open();
+				const image = imageBytes(24);
+				storage.blobTier.store(sha256(image), image, "image/png");
+				await storage.drain();
+				const from = db.dir.join("sessions", "from.jsonl");
+				const to = db.dir.join("sessions", "to.jsonl");
+				// The reference starts 20 bytes before 1 MiB, where the source's first stored part ends.
+				const at = transcript(ID, "@").indexOf("@");
+				const body = transcript(ID, `${"x".repeat(1024 * 1024 - 20 - at)}blob:sha256:${sha256(image)} seen`);
+				await storage.writeText(from, body);
+				await storage.drain();
+
+				expect(await copyTranscript(storage, from, to)).toBe(true);
+				await storage.drain();
+				expect((await db.row(to))?.content).toBe(body);
+				const refs = await db.sql(`SELECT sha256 FROM ${db.table}_refs WHERE path = @1`, [to]);
+				expect(refs.map(row => String(row.sha256))).toEqual([sha256(image)]);
+				await storage.unlink(from);
+				expect(await blobHashes(db)).toEqual([sha256(image)]);
+			});
+
+			// Lines a writer queues on a path before its next append starts go to the database in one batch of appends
+			// (`appendBatch`), which references the blobs its lines name as each line's own append does.
+			it("references the blobs every line of a batch of appends names, so deleting another session that names them keeps them", async () => {
+				// If this regresses, a session whose lines were stored in one batch (a busy session's, or a copy of
+				// another's transcript) keeps no reference to its images: deleting another session that names the same
+				// image deletes the image's row, and the session, resumed on another machine, shows the image as missing.
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const queries: string[] = [];
+				const storage = await db.open({ wrap: client => recordingClient(client, queries) });
+				const source = await writeImageSession(db, storage, [IMAGE_BYTES]);
+				// The source's lines as the store wrote them: its header, the user turn naming the image, the reply.
+				const lines = ((await db.row(source))?.content ?? "").split(/(?<=\n)/);
+				expect(lines.length).toBeGreaterThan(1);
+				const batched = path.join(path.dirname(source), "batched.jsonl");
+
+				queries.length = 0;
+				const writer = storage.openWriter(batched);
+				const appendSync = writer.appendSync?.bind(writer);
+				if (!appendSync) throw new Error("the SQL store's writer appends synchronously");
+				// Queued in one tick: they join the path's batch before its append operation starts.
+				for (const line of lines) appendSync(line);
+				await writer.close();
+				// One batch stored every line: one part insert of a batch's, and no single line's append (PostgreSQL's
+				// inside its `WITH`).
+				expect(queries.filter(query => /^INSERT INTO \S*_parts \([^)]*\) VALUES/.test(query))).toHaveLength(1);
+				expect(queries.filter(query => /INSERT INTO \S*_parts \([^)]*\) SELECT/.test(query))).toEqual([]);
+				expect((await db.row(batched))?.content).toBe(lines.join(""));
+
+				await storage.unlink(source);
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+				const refs = await db.sql(`SELECT sha256 FROM ${db.table}_refs WHERE path = @1`, [batched]);
+				expect(refs.map(row => String(row.sha256))).toEqual([IMAGE_HASH]);
+
+				await fsp.rm(getBlobsDir(), { recursive: true, force: true });
+				const resumed = await SessionManager.open(batched, path.dirname(batched), await db.open());
+				expect(imagesOf(resumed)).toEqual([IMAGE]);
+				await resumed.close();
+			});
+
+			// A streamed load keeps entries before a compaction's kept start out of memory; the open still writes back,
+			// and references from the session, every blob the whole session names.
+			it("writes back and references, when a session opens, a blob only an entry the load keeps out of memory names", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const sessionDir = db.dir.join("sessions");
+				const writer = SessionManager.create(db.dir.join("project"), sessionDir, await db.open());
+				const imageId = writer.appendMessage({
+					role: "user",
+					content: [
+						{ type: "text", text: "look ".repeat(100) },
+						{ type: "image", data: IMAGE, mimeType: "image/png" },
+					],
+					timestamp: 1,
+				});
+				writer.appendMessage(assistant("seen"));
+				const keptId = writer.appendMessage({ role: "user", content: "later", timestamp: 3 });
+				writer.appendMessage(assistant("again"));
+				writer.appendCompaction("summary", undefined, keptId, 1000);
+				await writer.flush();
+				const sessionFile = writer.getSessionFile() ?? "";
+				await writer.close();
+				// A session written before the reference table: its image only on this machine, no row, no reference.
+				await db.sql(`DELETE FROM ${db.table}_refs`);
+				await db.sql(`DELETE FROM ${db.table}_blobs`);
+
+				const store = await db.open();
+				const opened = await SessionManager.open(sessionFile, sessionDir, store);
+				const imageEntry = opened.getEntry(imageId);
+				expect(imageEntry !== undefined && isColdEntry(imageEntry)).toBe(true);
+				await opened.close();
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+				const refs = await db.sql(`SELECT sha256 FROM ${db.table}_refs WHERE path = @1`, [sessionFile]);
+				expect(refs.map(row => String(row.sha256))).toEqual([IMAGE_HASH]);
+				// Another session naming the image is written and deleted: the opened session's reference keeps the row.
+				await store.unlink(await writeImageSession(db, store, [IMAGE_BYTES]));
+				expect(await blobHashes(db)).toEqual([IMAGE_HASH]);
+			});
+
+			// An entry's record text (a cold entry's, kept out of memory) externalizes its images as a persisted line
+			// does: each one goes to the tier too, so a transcript naming it never waits on a blob the table lacks.
+			it("hands the tier each image an entry's record externalizes, and no snapcompact frame", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const storage = await db.open();
+				const blobs = new BlobStore(getBlobsDir(), storage.blobTier);
+				const image = imageBytes(25);
+				const turn: FileEntry = {
+					type: "message",
+					id: "u1",
+					parentId: null,
+					timestamp: "2026-11-20T00:00:00.000Z",
+					message: {
+						role: "user",
+						content: [
+							{ type: "text", text: "look" },
+							{ type: "image", data: image.toString("base64"), mimeType: "image/png" },
+						],
+						timestamp: 1,
+					},
+				};
+				const compaction: FileEntry = {
+					type: "compaction",
+					id: "c1",
+					parentId: "u1",
+					timestamp: "2026-11-20T00:00:01.000Z",
+					summary: "summary",
+					firstKeptEntryId: "u1",
+					tokensBefore: 1000,
+					preserveData: { [snapcompact.PRESERVE_KEY]: await frameArchive() },
+				};
+				expect(entryRecordText(turn, blobs)).toContain(`blob:sha256:${sha256(image)}`);
+				expect(entryRecordText(compaction, blobs)).toContain("blob:sha256:");
+				await storage.drain();
+				expect(await blobHashes(db)).toEqual([sha256(image)]);
+			});
 		});
 	}
 
@@ -788,6 +980,41 @@ describe("session blobs in the SQL session storage", () => {
 				const sessionRow = new RegExp(`^INSERT (?:IGNORE )?INTO \\S*\\b${db.table} \\(`);
 				expect(queries.filter(query => sessionRow.test(query))).toHaveLength(1);
 				await manager.close();
+			});
+
+			it("writes no streamed full transcript naming an image before its blob's row commits", async () => {
+				await using db = await openLeaseDb(adapter, url ?? "");
+				let gate: GatedClient | undefined;
+				const storage = await db.open({
+					wrap: client => {
+						gate = gatedClient(client, BLOB_INSERT);
+						return gate.client;
+					},
+				});
+				const file = db.dir.join("sessions", "streamed.jsonl");
+				const image = imageBytes(23);
+				gate?.close();
+				storage.blobTier.store(sha256(image), image, "image/png");
+				// Through the spool and `writeFullStream`: staged parts, then one swap.
+				const writing = storage
+					.writeLinesAtomic(file, transcript(ID, `blob:sha256:${sha256(image)}`).split(/(?<=\n)/))
+					.then(() => storage.drain());
+				try {
+					const first = await Promise.race([
+						gate?.paused().then(() => "blob insert held"),
+						writing.then(() => "transcript written"),
+					]);
+					expect(first).toBe("blob insert held");
+					// A real wait: what must not happen is a commit on the database server, which no fake clock reaches.
+					await Bun.sleep(500);
+					// The blob's row is inserted, not committed: the swap that publishes the body naming it waits.
+					expect(await db.row(file)).toBeUndefined();
+				} finally {
+					gate?.open();
+				}
+				await writing;
+				expect((await db.row(file))?.content ?? "").toContain(sha256(image));
+				expect(await blobHashes(db)).toEqual([sha256(image)]);
 			});
 
 			it("keeps a blob another session's delete would take while a write adding a reference to it is open", async () => {
@@ -1466,12 +1693,14 @@ describe("session blobs in the SQL session storage", () => {
 
 			// The one deadlock the lock order leaves (docs/session.md, "Races"): a rename whose destination has no
 			// row takes that key by its UPDATE, after the source's lock, and a delete with the artifacts directory
-			// locks every row and gap of the session table in path order on MySQL and MariaDB (it can use no index).
-			// The rename D → B is paused before its UPDATE, holding D; the delete of A with its artifacts locks A,
-			// then C with the gap before it, where B goes, and waits for D; the rename's UPDATE then waits for that
-			// gap. InnoDB rolls one back, and the deadlock retry runs it again: both end as they would alone.
+			// locks, on MySQL and MariaDB, the rows under the directory and the gaps around them, in path order. The
+			// rename D → B, both under the directory of A, is paused before its UPDATE, holding D; the delete of A
+			// with its artifacts locks A, then M with the gap before it, where B goes, and waits for D; the rename's
+			// UPDATE then waits for that gap. InnoDB rolls one back, and the deadlock retry runs it again: they end
+			// as one after the other does, the rename first (the delete then takes B) or the delete first (the
+			// rename then finds no D).
 			it.skipIf(adapter !== "mysql")(
-				"deadlocks once, and runs the rolled-back side again, when a delete with artifacts scans past a rename's destination that has no row",
+				"deadlocks once, and runs the rolled-back side again, when a delete with artifacts locks the gap of a rename's destination under the directory",
 				async () => {
 					await using db = await openLeaseDb(adapter, url ?? "");
 					const deadlocks: string[] = [];
@@ -1488,33 +1717,117 @@ describe("session blobs in the SQL session storage", () => {
 						},
 					});
 					const deleter = await db.open({ claims: false, wrap: client => deadlockLog(client, deadlocks) });
-					const [a, b, c, d] = ["a", "b-dst", "c", "d-src"].map(name =>
-						db.dir.join("sessions", `${name}.jsonl`),
-					) as [string, string, string, string];
-					const moved = transcript(ID, "moved");
-					for (const path of [a, c]) await renamer.writeText(path, transcript(ID, "kept apart"));
-					await renamer.writeText(d, moved);
+					const [a, c] = ["a", "c"].map(name => db.dir.join("sessions", `${name}.jsonl`)) as [string, string];
+					const [b, m, d] = ["b-dst", "m", "z-src"].map(name => db.dir.join("sessions", "a", `${name}.jsonl`)) as [
+						string,
+						string,
+						string,
+					];
+					for (const path of [a, m, d, c]) await renamer.writeText(path, transcript(ID, "kept apart"));
 					await renamer.drain();
 					await deleter.refresh();
 
 					gate?.close();
-					const renaming = renamer.rename(d, b);
+					const renaming = renamer.rename(d, b).then(
+						() => "renamed",
+						(err: unknown) => (err instanceof Error && "code" in err ? String(err.code) : String(err)),
+					);
 					let deleting: Promise<void> | undefined;
 					try {
 						await Promise.race([gate?.paused(), renaming]);
 						deleting = deleter.deleteSessionWithArtifacts(a);
-						// A real wait: the delete's scan must reach the rename's row on the server before the UPDATE runs.
+						// A real wait: the delete's lock must reach the rename's row on the server before the UPDATE runs.
 						await Promise.race([deleting, Bun.sleep(1000)]);
 					} finally {
 						gate?.open();
 					}
-					await Promise.all([renaming, deleting]);
-					expect({
-						deadlocks: deadlocks.length,
-						paths: await db.paths(),
-						b: (await db.row(b))?.content,
-					}).toEqual({ deadlocks: 1, paths: [b, c], b: moved });
+					const [renamed] = await Promise.all([renaming, deleting]);
+					expect({ deadlocks: deadlocks.length, paths: await db.paths() }).toEqual({ deadlocks: 1, paths: [c] });
+					// The rename first, or the delete first, which leaves it no source.
+					expect(["renamed", "ENOENT"]).toContain(renamed);
 				},
+			);
+
+			// A delete with the artifacts directory locks, on MySQL and MariaDB, the session rows under the directory
+			// by its key range: those rows, the gaps between them and the gaps at either end, up to the nearest row
+			// outside (MariaDB locks the first row past the range too). Another session's row, or a gap away from the
+			// directory, is not locked: its writes commit while the delete runs.
+			it.skipIf(adapter !== "mysql")(
+				"commits another client's append, full write and new session away from the directory while a delete with artifacts holds its locks",
+				async () => {
+					// If this regresses, on MySQL and MariaDB a session delete with its artifacts locks every row and gap of
+					// the session table until it commits: every other session's append, full write and new session on that
+					// database waits for it.
+					await using db = await openLeaseDb(adapter, url ?? "");
+					let gate: GatedClient | undefined;
+					const deleter = await db.open({
+						claims: false,
+						wrap: client => {
+							gate = gatedClient(
+								client,
+								new RegExp(`^SELECT path FROM \\S*\\b${db.table} WHERE path IN \\(.* FOR UPDATE$`),
+							);
+							return gate.client;
+						},
+					});
+					const other = await db.open({ claims: false });
+					// Sorted: the session before the deleted one, the deleted one and its transcript, the next session (by
+					// which the directory's range ends), one after it, and a new session at the end.
+					const [before, deleted, next, after, fresh] = [
+						"a-before",
+						"b-deleted",
+						"c-next",
+						"d-after",
+						"e-fresh",
+					].map(name => db.dir.join("sessions", `${name}.jsonl`)) as [string, string, string, string, string];
+					const child = db.dir.join("sessions", "b-deleted", "task.jsonl");
+					const kept = transcript(ID, "kept");
+					for (const path of [before, deleted, child, next, after]) await deleter.writeText(path, kept);
+					await deleter.drain();
+					await other.refresh();
+					const line = `${JSON.stringify({ type: "custom", customType: "note", data: "appended" })}\n`;
+					const rewritten = transcript(ID, "rewritten");
+					const created = transcript(ID, "created");
+					// Whether `write` commits within 10 s while the delete holds its locks. A real wait: a write that waits
+					// for a lock sits in the server, which tells the client nothing until the lock wait ends (50 s).
+					const outcome = (write: () => Promise<void>): Promise<string> =>
+						Promise.race([
+							write().then(() => "committed"),
+							Bun.sleep(10_000).then(() => "waited for the delete"),
+						]);
+
+					gate?.close();
+					const deleting = deleter.deleteSessionWithArtifacts(deleted);
+					let writes: string[] = [];
+					let seen: Record<string, string | undefined> = {};
+					try {
+						await Promise.race([gate?.paused(), deleting]);
+						writes = await Promise.all([
+							outcome(async () => {
+								const writer = other.openWriter(before);
+								await writer.append(line);
+								await writer.close();
+							}),
+							outcome(() => other.writeText(after, rewritten)),
+							outcome(() => other.writeText(fresh, created)),
+						]);
+						seen = {
+							before: (await db.row(before))?.content,
+							after: (await db.row(after))?.content,
+							fresh: (await db.row(fresh))?.content,
+						};
+					} finally {
+						gate?.open();
+					}
+					await deleting;
+					await other.drain();
+					expect({ writes, seen, paths: await db.paths() }).toEqual({
+						writes: ["committed", "committed", "committed"],
+						seen: { before: kept + line, after: rewritten, fresh: created },
+						paths: [before, next, after, fresh],
+					});
+				},
+				120_000,
 			);
 
 			// A rename moves its source's references one key at a time, from a read after it locks the source's row:

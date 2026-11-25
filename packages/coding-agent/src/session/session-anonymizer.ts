@@ -13,12 +13,14 @@
  * `name: "Probe"` → `PLACEHOLDER_7` and `agent://Probe` → `agent://seg7`.
  */
 import { editErrorKinds } from "@oh-my-pi/pi-natives";
-import { logger } from "@oh-my-pi/pi-utils";
+import { ContainerPath, logger, type NestedWalk, runNested, stringifyDeepJson } from "@oh-my-pi/pi-utils";
 import { getBundledAgentsMap } from "../task/agents";
 import { BUILTIN_TOOL_NAMES, isMCPToolName } from "../tools/builtin-names";
 import { lexShellCommand } from "../tools/shell-tokenize";
+import { ENTRY_PATCH_CUSTOM_TYPE, NO_PATCHES } from "./entry-patches";
 import type { SessionEntry, SessionHeader } from "./session-entries";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
+import { EMPTY_TOOL_RESULT_PRUNE_DATA, TOOL_RESULT_PRUNE_CUSTOM_TYPE } from "./tool-result-prunes";
 
 type JsonObject = Record<string, unknown>;
 
@@ -39,7 +41,8 @@ export const ANONYMIZED_REVIEW_NOTE =
  * - `tool`/`name`/`customType`: code-chosen identifiers kept; MCP (user-configured) names tokenized.
  * - `content`: string or content blocks. `struct`: nested omp structure.
  * - `args`/`details`/`data`: tool-call args, tool-result details, custom-entry data — walked only
- *   for built-in tools / omp's own entries, otherwise opaque.
+ *   for built-in tools / omp's own entries, otherwise opaque; `entry_patch` and `tool_result_prune`
+ *   records export their kind's empty payload.
  * - `runtime`: the build stamp; version and commit kept, branch/diff/label tokenized.
  * - `opaque`: replaced whole by a marker.
  */
@@ -179,6 +182,7 @@ const FIELD_RULES: Record<string, Rule> = {
 		"__interrupted",
 		"__synthetic",
 		"executed",
+		"continued",
 		"interrupted",
 		"conflictCount",
 		"madeExecutable",
@@ -1274,10 +1278,17 @@ function looksLikePath(value: string): boolean {
 	return SCHEME.test(value) || /[\\/]/.test(value) || value.startsWith("~") || DRIVE.test(value);
 }
 
+/**
+ * Anonymizes session records. A record's walk keeps its own stack ({@link runNested}): each method
+ * that descends is a step that yields the step for a child, so a record nests as deep as `JSON.parse`
+ * reads a transcript line (400,000 levels), where a recursive walk stops near 22,000.
+ */
 export class SessionAnonymizer {
 	#tokens = new Map<string, number>();
 	/** Ids of tool calls seen in assistant messages; the execution log may only echo these raw. */
 	#toolCallIds = new Set<string>();
+	/** The containers the current record's walk is inside, so a cycle throws as `JSON.stringify` does. */
+	#path = new ContainerPath();
 
 	#index(value: string): number {
 		let index = this.#tokens.get(value);
@@ -1332,7 +1343,9 @@ export class SessionAnonymizer {
 
 	/** Anonymize one session record (header or entry). */
 	entry(value: unknown): unknown {
-		return isObject(value) ? this.#struct(value) : this.#opaque(value);
+		if (!isObject(value)) return this.#opaque(value);
+		this.#path = new ContainerPath();
+		return runNested(this.#struct(value));
 	}
 
 	#name(value: string): string {
@@ -1391,31 +1404,34 @@ export class SessionAnonymizer {
 	/** Opaque marker for a value with no export rule; keeps only its size and an equality index. */
 	#opaque(value: unknown): unknown {
 		if (value === undefined) return value;
-		return this.redactText(typeof value === "string" ? value : JSON.stringify(value));
+		return this.redactText(typeof value === "string" ? value : (stringifyDeepJson(value) as string));
 	}
 
 	/**
 	 * Walk an omp-defined object: ruled fields by rule, unknown fields opaque under a tokenized key.
 	 * `fromTool` marks built-in tool details, whose writer cannot be verified from the transcript.
 	 */
-	#struct(object: JsonObject, fromTool = false): JsonObject {
+	*#struct(object: JsonObject, fromTool = false): NestedWalk<JsonObject> {
 		// Real tool-call ids, so execution-log entries (which extensions can spoof) only keep ids that exist.
 		if (!fromTool && TOOL_CALL_TYPES[String(object.type)] === true && typeof object.id === "string") {
 			this.#toolCallIds.add(object.id);
 		}
+		this.#path.enter(object);
 		const out: JsonObject = {};
 		for (const [key, value] of Object.entries(object)) {
 			const rule = Object.hasOwn(FIELD_RULES, key) ? FIELD_RULES[key] : undefined;
 			if (rule === undefined) out[this.placeholder(key)] = this.#opaque(value);
-			else out[key] = this.#field(rule, value, object, key, fromTool);
+			else out[key] = yield this.#field(rule, value, object, key, fromTool);
 		}
+		this.#path.leave(object);
 		return out;
 	}
 
 	/** A content block projected onto its type's fields; extra fields become opaque under tokenized keys. */
-	#contentBlock(block: JsonObject, fromTool: boolean): unknown {
+	*#contentBlock(block: JsonObject, fromTool: boolean): NestedWalk {
 		const allowed = typeof block.type === "string" ? CONTENT_BLOCK_KEYS[block.type] : undefined;
 		if (!allowed) return this.#opaque(block);
+		this.#path.enter(block);
 		const out: JsonObject = {};
 		for (const [key, value] of Object.entries(block)) {
 			const rule = allowed.has(key) && Object.hasOwn(FIELD_RULES, key) ? FIELD_RULES[key] : undefined;
@@ -1423,8 +1439,9 @@ export class SessionAnonymizer {
 			// The block type is already allowlisted; replay consumers use it to distinguish text from images.
 			else if (key === "type") out[key] = value;
 			// A tool call is the model's own request (its id must stay joinable with the result).
-			else out[key] = this.#field(rule, value, block, key, fromTool && block.type !== "toolCall");
+			else out[key] = yield this.#field(rule, value, block, key, fromTool && block.type !== "toolCall");
 		}
+		this.#path.leave(block);
 		if (block.type === "toolCall" && typeof block.id === "string") this.#toolCallIds.add(block.id);
 		return out;
 	}
@@ -1434,13 +1451,14 @@ export class SessionAnonymizer {
 	 * under any `customType`, so nothing beyond these fields is trusted, and the call id stays raw only
 	 * when it names a tool call already seen in the transcript.
 	 */
-	#executionLog(data: JsonObject): JsonObject {
+	*#executionLog(data: JsonObject): NestedWalk<JsonObject> {
+		this.#path.enter(data);
 		const out: JsonObject = {};
 		for (const [key, value] of Object.entries(data)) {
 			switch (key) {
 				case "toolCallId":
 					// A known call id gets the same treatment as in its message; anything else is tokenized.
-					out[key] = this.#field(
+					out[key] = yield this.#field(
 						"id",
 						value,
 						data,
@@ -1449,21 +1467,22 @@ export class SessionAnonymizer {
 					);
 					break;
 				case "toolName":
-					out[key] = this.#field("tool", value, data, key, true);
+					out[key] = yield this.#field("tool", value, data, key, true);
 					break;
 				case "startedAt":
-					out[key] = this.#field("time", value, data, key, true);
+					out[key] = yield this.#field("time", value, data, key, true);
 					break;
 				case "args":
-					out[key] = this.#toolArgs(value, data);
+					out[key] = yield this.#toolArgs(value, data);
 					break;
 				case "intent":
-					out[key] = this.#field("label", value, data, key, true);
+					out[key] = yield this.#field("label", value, data, key, true);
 					break;
 				default:
 					out[this.placeholder(key)] = this.#opaque(value);
 			}
 		}
+		this.#path.leave(data);
 		return out;
 	}
 
@@ -1480,7 +1499,7 @@ export class SessionAnonymizer {
 		return out;
 	}
 
-	#field(rule: Rule, value: unknown, parent: JsonObject, key: string, fromTool: boolean): unknown {
+	*#field(rule: Rule, value: unknown, parent: JsonObject, key: string, fromTool: boolean): NestedWalk {
 		// Payload scopes come first: a primitive inside an untrusted payload is still untrusted.
 		switch (rule) {
 			case "opaque":
@@ -1488,23 +1507,32 @@ export class SessionAnonymizer {
 			case "args":
 				// `input` is also a usage counter; only a tool-call envelope makes it arguments.
 				if (typeof parent.name === "string" || typeof parent.toolName === "string") {
-					return this.#toolArgs(value, parent);
+					return yield this.#toolArgs(value, parent);
 				}
 				break;
 			case "details":
 				// Built-in tools write their own details; anything else is an extension payload.
 				return parent.role === "toolResult" && isBuiltinTool(parent.toolName) && isObject(value)
-					? this.#struct(value, true)
+					? yield this.#struct(value, true)
 					: this.#opaque(value);
 			case "data":
-				// omp's execution log mirrors the tool call; every other custom entry is extension state.
-				return parent.type === "custom" && parent.customType === "tool_execution_start" && isObject(value)
-					? this.#executionLog(value)
-					: this.#opaque(value);
+				if (parent.type !== "custom") return this.#opaque(value);
+				switch (parent.customType) {
+					// The entries already hold these records' effects; an empty payload reopens as a no-op record.
+					case ENTRY_PATCH_CUSTOM_TYPE:
+						return NO_PATCHES;
+					case TOOL_RESULT_PRUNE_CUSTOM_TYPE:
+						return EMPTY_TOOL_RESULT_PRUNE_DATA;
+					// omp's execution log mirrors the tool call; every other custom entry is extension state.
+					case "tool_execution_start":
+						return isObject(value) ? yield this.#executionLog(value) : this.#opaque(value);
+					default:
+						return this.#opaque(value);
+				}
 			case "runtime":
 				return isObject(value) ? this.#runtimeStamp(value) : this.#opaque(value);
 			case "name":
-				return this.#field(
+				return yield this.#field(
 					TOOL_CALL_TYPES[String(parent.type)] === true ? "tool" : "label",
 					value,
 					parent,
@@ -1515,7 +1543,13 @@ export class SessionAnonymizer {
 		if (value === null || typeof value === "number" || typeof value === "boolean") {
 			return rule === "label" ? this.placeholder(String(value)) : value;
 		}
-		if (Array.isArray(value)) return value.map(item => this.#field(rule, item, parent, key, fromTool));
+		if (Array.isArray(value)) {
+			this.#path.enter(value);
+			const out: unknown[] = [];
+			for (const item of value) out.push(yield this.#field(rule, item, parent, key, fromTool));
+			this.#path.leave(value);
+			return out;
+		}
 		if (isObject(value)) {
 			if (rule === "content") {
 				// Tool results and extension messages carry tool-built blocks: their enum fields are untrusted.
@@ -1525,17 +1559,17 @@ export class SessionAnonymizer {
 					parent.role === "custom" ||
 					parent.role === "hookMessage" ||
 					parent.type === "custom_message";
-				return this.#contentBlock(value, untrusted);
+				return yield this.#contentBlock(value, untrusted);
 			}
 			// Only structural rules descend; a scalar field holding an object is not omp's shape.
 			const descends = rule === "struct" || rule === "enum" || rule === "id" || rule === "path" || rule === "tool";
 			if (rule === "transforms") {
 				// Provider input transformations address transcript slots (`messages.3.content.0`), not files.
-				const out = this.#struct(value, fromTool);
+				const out = (yield this.#struct(value, fromTool)) as JsonObject;
 				if (typeof value.path === "string" && MESSAGE_ADDRESS.test(value.path)) out.path = value.path;
 				return out;
 			}
-			return descends ? this.#struct(value, fromTool) : this.#opaque(value);
+			return descends ? yield this.#struct(value, fromTool) : this.#opaque(value);
 		}
 		if (typeof value !== "string") return this.#opaque(value);
 		return this.#string(rule, value, key, fromTool);
@@ -1600,14 +1634,14 @@ export class SessionAnonymizer {
 	}
 
 	/** Tool-call args: built-in tools walk their known schema; any other tool's args are opaque. */
-	#toolArgs(value: unknown, parent: JsonObject): unknown {
+	*#toolArgs(value: unknown, parent: JsonObject): NestedWalk {
 		const toolName = typeof parent.name === "string" ? parent.name : parent.toolName;
 		const schema = typeof toolName === "string" && isBuiltinTool(toolName) ? ARG_SCHEMAS[toolName] : undefined;
 		if (!schema) return this.#opaque(value);
-		if (typeof value !== "string") return this.#argValue(value, undefined, schema);
+		if (typeof value !== "string") return yield this.#argValue(value, undefined, schema);
 		// Wire payloads carry arguments as JSON text; partial streams may not parse.
 		try {
-			return JSON.stringify(this.#argValue(JSON.parse(value), undefined, schema));
+			return stringifyDeepJson(yield this.#argValue(JSON.parse(value), undefined, schema));
 		} catch {
 			return this.redactText(value);
 		}
@@ -1617,20 +1651,28 @@ export class SessionAnonymizer {
 	 * One built-in tool argument. Only keys the tool's schema declares stay (a shadowing extension can
 	 * send any record), and numbers stay only in the schema's numeric fields (limits, timeouts, lines).
 	 */
-	#argValue(value: unknown, key: string | undefined, schema: ArgSchema): unknown {
+	*#argValue(value: unknown, key: string | undefined, schema: ArgSchema): NestedWalk {
 		if (value === null || typeof value === "boolean") return value;
 		if (typeof value === "number") {
 			return key !== undefined && schema.numeric.has(key) ? value : this.placeholder(String(value));
 		}
-		if (Array.isArray(value)) return value.map(item => this.#argValue(item, key, schema));
+		if (Array.isArray(value)) {
+			this.#path.enter(value);
+			const out: unknown[] = [];
+			for (const item of value) out.push(yield this.#argValue(item, key, schema));
+			this.#path.leave(value);
+			return out;
+		}
 		if (isObject(value)) {
+			this.#path.enter(value);
 			const out: JsonObject = {};
 			for (const [childKey, child] of Object.entries(value)) {
 				if (OPAQUE_ARG_KEYS[childKey] === true) out[childKey] = this.#opaque(child);
 				else if (schema.keys.has(childKey) || COMMON_ARG_KEYS.has(childKey)) {
-					out[childKey] = this.#argValue(child, childKey, schema);
+					out[childKey] = yield this.#argValue(child, childKey, schema);
 				} else out[this.placeholder(childKey)] = this.#opaque(child);
 			}
+			this.#path.leave(value);
 			return out;
 		}
 		if (typeof value !== "string") return this.#opaque(value);
@@ -1766,6 +1808,11 @@ export class SessionAnonymizer {
 /** A session transcript to anonymize: its header, entries, and file (for subagent discovery). */
 export interface AnonymizeSessionInput {
 	header: SessionHeader | null;
+	/**
+	 * Entries carrying the effects of their `entry_patch` and `tool_result_prune` records inline, as live
+	 * entries do or as `applyToolResultPrunes` then `applyEntryPatches` leave loaded ones: the export
+	 * writes those records with empty payloads.
+	 */
 	entries: readonly SessionEntry[];
 	sessionFile?: string;
 	/** Malformed records the caller skipped while loading the main transcript. */
@@ -1793,7 +1840,7 @@ export async function anonymizeSessionTranscripts(session: AnonymizeSessionInput
 	const anonymizer = new SessionAnonymizer();
 	const toJsonl = (header: SessionHeader | null, entries: readonly SessionEntry[]): string => {
 		const records: unknown[] = header ? [header, ...entries] : [...entries];
-		return `${records.map(record => JSON.stringify(anonymizer.entry(record))).join("\n")}\n`;
+		return `${records.map(record => stringifyDeepJson(anonymizer.entry(record))).join("\n")}\n`;
 	};
 	const files: Array<readonly [string, string]> = [["session.jsonl", toJsonl(session.header, session.entries)]];
 	const malformed: Array<readonly [string, number]> = [];
