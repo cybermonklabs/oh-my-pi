@@ -14,6 +14,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 type FallbackApplied = Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>;
 type RetryEnd = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
+type RetryStart = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
 
 /** One classifier refusal shape per row: each category and stream position takes the same path. */
 const REFUSALS: Array<{ name: string; content: MockContent[]; stopDetails: StopDetails }> = [
@@ -103,6 +104,7 @@ describe("a classifier refusal is retried on the model that refused it before th
 		requested: string[];
 		fallbacks: FallbackApplied[];
 		retryEnds: RetryEnd[];
+		retryStarts: RetryStart[];
 		last: AssistantMessage;
 	}> {
 		const startModel = options.startModel ?? primary;
@@ -128,16 +130,18 @@ describe("a classifier refusal is retried on the model that refused it before th
 		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
 		const fallbacks: FallbackApplied[] = [];
 		const retryEnds: RetryEnd[] = [];
+		const retryStarts: RetryStart[] = [];
 		session.subscribe(event => {
 			if (event.type === "retry_fallback_applied") fallbacks.push(event);
 			if (event.type === "auto_retry_end") retryEnds.push(event);
+			if (event.type === "auto_retry_start") retryStarts.push(event);
 		});
 		await session.prompt("Answer the question");
 		await session.waitForIdle();
 		// A turn that ends on a refusal prunes it from the active context; the settled outcome stays readable.
 		const last = session.getLastAssistantMessage();
 		if (!last) throw new Error("Expected a settled assistant message");
-		return { requested, fallbacks, retryEnds, last };
+		return { requested, fallbacks, retryEnds, retryStarts, last };
 	}
 
 	it.each(REFUSALS)("answers on the refused model when a retry there is served: $name", async shape => {
@@ -253,5 +257,8 @@ describe("a classifier refusal is retried on the model that refused it before th
 		expect(result.requested).toEqual([selector(firstFallback), selector(primary)]);
 		expect(session?.model?.id).toBe(primary.id);
 		expect(result.last.content).toEqual([{ type: "text", text: "claude answered" }]);
+		// One retry in all, the switch: no same-model retry was even scheduled, whether or not
+		// something below turn recovery would have held its request.
+		expect(result.retryStarts).toHaveLength(1);
 	});
 });
