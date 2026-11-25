@@ -11,7 +11,7 @@ import * as path from "node:path";
 import { getRecentRequests, initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
 import { parseSessionFile } from "@oh-my-pi/omp-stats/parser";
 import { handleApi } from "@oh-my-pi/omp-stats/server";
-import { argumentTokens, callTarget, SPOTLIGHT_TARGET_CHARS } from "@oh-my-pi/omp-stats/spotlight-ingest";
+import { argumentTokens, callTarget, SPOTLIGHT_TARGET_CHARS } from "@oh-my-pi/omp-stats/spotlight-arguments";
 import { getSessionsDir } from "@oh-my-pi/pi-utils";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
