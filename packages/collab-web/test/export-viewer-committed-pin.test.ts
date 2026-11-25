@@ -19,7 +19,10 @@ afterAll(() => temp[Symbol.dispose]());
 describe("the committed export viewer manifest", () => {
 	it("pins the exact viewer the committed sources build", async () => {
 		const committed: ExportViewerMetadata = await Bun.file(manifestPath).json();
-		const built = await buildExportViewer({ outDir: temp.path(), metadataPath: path.join(temp.path(), "built.json") });
+		const built = await buildExportViewer({
+			outDir: temp.path(),
+			metadataPath: path.join(temp.path(), "built.json"),
+		});
 		expect(built).toEqual(committed);
 	}, 30_000);
 });
