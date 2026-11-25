@@ -336,6 +336,7 @@
 - A session copy or fork that fails to write frees its temporary file of older entry bodies at once instead of at the next garbage collection
 - A session whose close the store refused frees its temporary file of older entry bodies at once when the entries it kept are released (an unpack that failed, or an owner that kept the entries after the failed close) instead of at the next garbage collection
 - A session whose temporary directory is read-only, full, missing or under a regular file, or whose temporary file fills the disk, now keeps its older entry bodies compressed in memory (about a fifth of their size) instead of whole
+- Re-answering an `ask` from the session tree after a compaction no longer leaves the entries the new branch reads compressed, read back from the store on every turn; they are held whole again, as after any other move in the tree
 - A session that keeps its older entry bodies compressed in memory no longer decompresses a whole block of them for each entry a full rewrite or a walk over every entry reads, which on a long session blocked for minutes
 - A long goal session no longer reads each older goal mode change back from disk every time it resumes or starts a subagent
 - RPC `get_tree` no longer fails with `Maximum call stack size exceeded` on a session deeper than about 10,000 entries
