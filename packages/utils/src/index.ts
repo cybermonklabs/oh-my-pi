@@ -1,3 +1,5 @@
+import { ContainerPath, type NestedWalk, runNested } from "./nested-walk";
+
 export { once, untilAborted } from "./abortable";
 export * from "./async";
 export * from "./binary";
@@ -77,10 +79,14 @@ export function structuredCloneJSON<T>(value: T): T {
  *
  * Copies own enumerable string keys only. Any other object (class instance,
  * Date, Map, inherited-prototype object) is copied with {@link structuredCloneJSON}.
- * Not cycle-safe: callers MUST pass acyclic data, as any JSON-serializable value is.
+ * The copy keeps its own stack ({@link runNested}), so it copies a tree of any
+ * depth `JSON.parse` reads (a session entry read from a transcript line, say),
+ * where a recursive copy stops near 22,500 levels; a cycle, which JSON data
+ * never holds, throws the `TypeError` `JSON.stringify` throws.
  */
 export function cloneJsonTree<T>(value: T): T {
-	return cloneJsonNode(value) as T;
+	if (value === null || typeof value !== "object") return value;
+	return runNested(cloneJsonNode(value, new ContainerPath())) as T;
 }
 
 function isJsonRecord(value: object): value is Record<string, unknown> {
@@ -88,14 +94,30 @@ function isJsonRecord(value: object): value is Record<string, unknown> {
 	return proto === Object.prototype || proto === null;
 }
 
-function cloneJsonNode(value: unknown): unknown {
-	if (value === null || typeof value !== "object") return value;
-	if (Array.isArray(value)) return value.map(cloneJsonNode);
+/** {@link cloneJsonTree} of `value`, an object `path` is inside of; each child object is a nested step. */
+function* cloneJsonNode(value: object, path: ContainerPath): NestedWalk {
+	if (Array.isArray(value)) {
+		path.enter(value);
+		const out: unknown[] = [];
+		for (let index = 0; index < value.length; index++) {
+			// A hole stays a hole, as `Array.prototype.map` leaves it.
+			if (!(index in value)) {
+				out.length = index + 1;
+				continue;
+			}
+			const item: unknown = value[index];
+			out.push(item !== null && typeof item === "object" ? yield cloneJsonNode(item, path) : item);
+		}
+		path.leave(value);
+		return out;
+	}
 	if (!isJsonRecord(value)) return structuredCloneJSON(value);
+	path.enter(value);
 	const out: Record<string, unknown> = {};
 	for (const key in value) {
 		if (!Object.hasOwn(value, key)) continue;
-		const child = cloneJsonNode(value[key]);
+		const item = value[key];
+		const child = item !== null && typeof item === "object" ? yield cloneJsonNode(item, path) : item;
 		// Assigning `__proto__` would swap the copy's prototype instead of
 		// creating the own data property JSON.parse produces.
 		if (key === "__proto__") {
@@ -104,5 +126,6 @@ function cloneJsonNode(value: unknown): unknown {
 			out[key] = child;
 		}
 	}
+	path.leave(value);
 	return out;
 }

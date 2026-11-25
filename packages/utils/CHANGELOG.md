@@ -27,6 +27,7 @@
 
 ### Fixed
 
+- Fixed `cloneJsonTree` failing with `Maximum call stack size exceeded` on a tree nested more than about 22,500 levels deep; it keeps its own stack, and a cycle throws a `TypeError`
 - Fixed `extractRetryHint` ignoring a wait or reset window stated as a Go duration such as `try again in 6m0s`, `try again in 1m30s` or `resets in 1h30m`: its parts now add up, so a caller waits the time the provider states instead of its own backoff
 - Fixed test processes (`PI_TEST_RUNTIME=1` or a Bun test entrypoint) loading `~/.env` and the config root's `.env` (`~/.omp/.env`), which put the developer's auth broker, tokens and provider keys back into a test's environment; the agent directory's and project's `.env` files still load
 - Fixed `ChildProcess.kill()` and disposing a `ChildProcess` reporting the process's exit as an unhandled rejection when the process exits before anyone waits on it
