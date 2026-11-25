@@ -626,10 +626,7 @@ function* stripContainerImages(container: object, inside: ContainerPath): Nested
 		let out: unknown[] | undefined;
 		for (let index = 0; index < container.length; index++) {
 			const item: unknown = container[index];
-			const data = isRecord(item) && item.type === "image" ? item.data : undefined;
-			let next = typeof data === "string" && data.length > 1024 ? { type: "text", text: IMAGE_OMITTED_TEXT } : item;
-			if (next === item && typeof item === "object" && item !== null)
-				next = yield stripContainerImages(item, inside);
+			const next = strippedImageBlock(item) ?? (isContainer(item) ? yield stripContainerImages(item, inside) : item);
 			if (next === item) continue;
 			out ??= container.slice();
 			out[index] = next;
@@ -641,15 +638,29 @@ function* stripContainerImages(container: object, inside: ContainerPath): Nested
 	let out: Record<string, unknown> | undefined;
 	for (const key of Object.keys(holder)) {
 		const item = holder[key];
-		let next =
-			typeof item === "string" && item.length > 1024 && item.startsWith("data:") ? BLANK_IMAGE_DATA_URL : item;
-		if (next === item && typeof item === "object" && item !== null) next = yield stripContainerImages(item, inside);
+		const next = isContainer(item) ? yield stripContainerImages(item, inside) : strippedDataUrl(item);
 		if (next === item) continue;
 		out ??= { ...holder };
 		out[key] = next;
 	}
 	inside.leave(container);
 	return out ?? container;
+}
+
+/** Whether {@link stripContainerImages} walks into `value`: an object or an array. */
+function isContainer(value: unknown): value is object {
+	return typeof value === "object" && value !== null;
+}
+
+/** The text block that stands in for `item` when it is an image block whose string `data` is over 1024 characters; undefined when not. */
+function strippedImageBlock(item: unknown): TextContent | undefined {
+	const data = isRecord(item) && item.type === "image" ? item.data : undefined;
+	return typeof data === "string" && data.length > 1024 ? { type: "text", text: IMAGE_OMITTED_TEXT } : undefined;
+}
+
+/** {@link BLANK_IMAGE_DATA_URL} in place of `item` when it is a `data:` URL over 1024 characters; `item` itself when not. */
+function strippedDataUrl(item: unknown): unknown {
+	return typeof item === "string" && item.length > 1024 && item.startsWith("data:") ? BLANK_IMAGE_DATA_URL : item;
 }
 
 /** Create a secret gist holding base64 of the sealed blob; null when `gh` is unusable. */
