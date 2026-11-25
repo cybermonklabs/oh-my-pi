@@ -1384,6 +1384,8 @@ export interface AgentModelSelection {
 	patterns: string[];
 	/** Role alias the patterns came from (`@task` -> `task`), when the source named one. */
 	role: string | undefined;
+	/** Set when no request, override or agent definition named a model, so the patterns are the parent session's. */
+	inherited?: true;
 }
 
 /**
@@ -1394,6 +1396,7 @@ export interface AgentModelSelection {
  */
 export function resolveAgentModelSelection(options: AgentModelPatternResolutionOptions): AgentModelSelection {
 	const { source, patterns } = resolveEffectiveAgentModelSelection(options);
+	if (source === undefined) return { patterns, role: undefined, inherited: true };
 	return { patterns, role: resolveExplicitModelRole(source, options.settings) };
 }
 
@@ -1844,14 +1847,16 @@ export async function resolveModelOverrideWithAuthFallback(
 	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
 	settings?: Settings,
 	sessionId?: string,
-	options?: { exactOnly?: boolean },
+	options?: { exactOnly?: boolean; allowParentFallback?: boolean },
 ): Promise<{
 	model?: Model<Api>;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	explicitThinkingLevel: boolean;
 	authFallbackUsed: boolean;
+	unauthenticatedModels?: string[];
 	warning?: string;
 }> {
+	const allowParentFallback = options?.allowParentFallback !== false;
 	const disabledProviders = disabledProviderIds(settings);
 	let lookupRegistry: ModelLookupRegistry = modelRegistry;
 	if (disabledProviders.size > 0) {
@@ -1859,7 +1864,7 @@ export async function resolveModelOverrideWithAuthFallback(
 		lookupRegistry = { getAvailable: () => enabledModels };
 	}
 	const primary = resolveModelOverride(modelPatterns, lookupRegistry, settings, options);
-	if (!primary.model || !parentActiveModelPattern) {
+	if (!primary.model || (allowParentFallback && !parentActiveModelPattern)) {
 		return { ...primary, authFallbackUsed: false };
 	}
 
@@ -1869,6 +1874,7 @@ export async function resolveModelOverrideWithAuthFallback(
 	}
 	// The ordered override list is the caller's own fallback chain: an
 	// authenticated later entry beats the parent's model.
+	const unauthenticatedModels = [formatModelStringWithRouting(primary.model)];
 	for (const pattern of resolveConfiguredModelPatterns(modelPatterns, settings)) {
 		const candidate = resolveModelOverride([pattern], lookupRegistry, settings);
 		if (!candidate.model || modelsAreEqual(candidate.model, primary.model)) continue;
@@ -1876,6 +1882,12 @@ export async function resolveModelOverrideWithAuthFallback(
 		if (candidateKey === kNoAuth || isAuthenticated(candidateKey)) {
 			return { ...candidate, authFallbackUsed: false };
 		}
+		const selector = formatModelStringWithRouting(candidate.model);
+		if (!unauthenticatedModels.includes(selector)) unauthenticatedModels.push(selector);
+	}
+
+	if (!allowParentFallback || !parentActiveModelPattern) {
+		return { explicitThinkingLevel: false, authFallbackUsed: false, unauthenticatedModels, warning: primary.warning };
 	}
 
 	const fallback = resolveModelOverride([parentActiveModelPattern], lookupRegistry, settings);
