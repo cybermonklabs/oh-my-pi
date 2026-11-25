@@ -1106,6 +1106,84 @@ fn fifo_opens_through_a_cancellable_view_keep_nofollow() {
 	assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err}");
 }
 
+/// Through a cancellable view, a failed look before a FIFO open is the
+/// open's error, through the view's blocking open and its async open, for
+/// reading and for writing. A plain open in its place, of a FIFO with no
+/// other end, waits in `open(2)` on the calling thread or runtime worker,
+/// where the token does not reach it. A look that finds nothing still
+/// leaves the open to the plain open: a regular file whose look is planted
+/// `ENOENT` opens. Each open runs on a thread of its own, so a wait fails
+/// the test instead of hanging it.
+#[cfg(unix)]
+#[test]
+fn a_failed_look_through_a_cancellable_view_is_the_opens_error() {
+	use std::{os::unix::fs::OpenOptionsExt, sync::mpsc};
+	let dir = TempDir::new("fifo-look");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let (mut read, mut write) = (OpenOptions::new(), OpenOptions::new());
+	read.read(true);
+	write.write(true);
+	let open = |path: &Path, options: &OpenOptions, is_async: bool| {
+		let (tx, rx) = mpsc::channel();
+		let (path, options) = (path.to_path_buf(), options.clone());
+		std::thread::spawn(move || {
+			let opened = if is_async {
+				tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.unwrap()
+					.block_on(
+						Fs::native()
+							.with_cancellation(CancellationToken::new())
+							.open_with(&path, &options),
+					)
+			} else {
+				BlockingFs::native()
+					.with_cancellation(CancellationToken::new())
+					.open_with(&path, &options)
+			};
+			let _ = tx.send(opened.map(drop).map_err(|e| e.raw_os_error()));
+		});
+		rx.recv_timeout(Duration::from_secs(5))
+	};
+	let mut wrong = Vec::new();
+	for (label, options, is_async) in [
+		("blocking read", &read, false),
+		("blocking write", &write, false),
+		("async read", &read, true),
+		("async write", &write, true),
+	] {
+		crate::fifo::hooks::fail_next_look(&fifo, libc::EIO);
+		let got = open(&fifo, options, is_async);
+		if got.is_err() {
+			// Waiting in open(2): the other end lets it return.
+			let _ = std::fs::OpenOptions::new()
+				.read(!options.is_read())
+				.write(options.is_read())
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&fifo);
+		}
+		crate::fifo::hooks::clear_look_failures(&fifo);
+		if got != Ok(Err(Some(libc::EIO))) {
+			wrong.push(format!("{label}: {got:?}"));
+		}
+	}
+	let file = dir.0.join("file");
+	std::fs::write(&file, b"x").unwrap();
+	for is_async in [false, true] {
+		crate::fifo::hooks::fail_next_look(&file, libc::ENOENT);
+		let got = open(&file, &read, is_async);
+		crate::fifo::hooks::clear_look_failures(&file);
+		if got != Ok(Ok(())) {
+			wrong.push(format!("a regular file whose look is ENOENT (async {is_async}): {got:?}"));
+		}
+	}
+	assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// FIFO opens that create, by label: the shell's `>` and `>>`, and a write
 /// with a custom `O_CREAT`.
 #[cfg(target_os = "linux")]

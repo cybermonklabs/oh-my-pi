@@ -1419,8 +1419,17 @@ mod fifo {
 	/// A FIFO open in flight.
 	struct Pending(FifoOpen<fs::File>);
 
-	/// `Some` when `path` is a FIFO opened for reading only or writing only
-	/// (`O_RDWR` never blocks on a FIFO). `umask` is the process's
+	/// A one-way FIFO open the engine polls.
+	type OneWay = Box<dyn FsPending<Box<dyn File>>>;
+
+	/// `Ok(Some)` when `path` is a FIFO opened for reading only or writing
+	/// only (`O_RDWR` never blocks on a FIFO); `Ok(None)` when the open is
+	/// the plain open's: another kind of open or file, or a look ([`look`])
+	/// that finds nothing at the path or a component that is no directory,
+	/// where the plain open creates the file or fails as `open(2)` does. Any
+	/// other failure of the look is the open's result: a plain open of a FIFO
+	/// the look could not see would wait in `open(2)` on the calling thread
+	/// for the other end. `umask` is the process's
 	/// file-creation mask when known ([`super::StdFs::umask`]): an open of
 	/// the path that creates a file (the FIFO was removed since the look)
 	/// gives it exactly `mode`, as [`create_with_mode`] gives every other one.
@@ -1432,15 +1441,23 @@ mod fifo {
 		flags: OpenFlags,
 		mode: u32,
 		umask: Option<u32>,
-	) -> Option<Box<dyn FsPending<Box<dyn File>>>> {
+	) -> io::Result<Option<OneWay>> {
 		let write = flags.contains(OpenFlags::WRITE);
 		if flags.contains(OpenFlags::READ) == write {
-			return None;
+			return Ok(None);
 		}
-		let host = host_path(path).ok()?;
-		let meta = fs::metadata(host).ok()?;
+		let Ok(host) = host_path(path) else {
+			return Ok(None);
+		};
+		let meta = match look(host) {
+			Ok(meta) => meta,
+			Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+				return Ok(None);
+			},
+			Err(e) => return Err(e),
+		};
 		if !meta.file_type().is_fifo() {
-			return None;
+			return Ok(None);
 		}
 		let nofollow = flags.contains(OpenFlags::NOFOLLOW);
 		let creates = flags.contains(OpenFlags::CREATE);
@@ -1482,8 +1499,27 @@ mod fifo {
 			OPENED.lock().push(name);
 			opened
 		});
-		Some(Box::new(Pending(open)))
+		Ok(Some(Box::new(Pending(open))))
 	}
+
+	/// The look at `host` ([`fs::metadata`]), or the failure a test planted
+	/// for it ([`LOOK_FAILS`]).
+	fn look(host: &std::path::Path) -> io::Result<fs::Metadata> {
+		#[cfg(test)]
+		{
+			let mut fails = LOOK_FAILS.lock();
+			if let Some(at) = fails.iter().position(|(path, _)| path == host) {
+				return Err(io::Error::from_raw_os_error(fails.remove(at).1));
+			}
+		}
+		fs::metadata(host)
+	}
+
+	/// Test hook: each entry makes the next look at its path fail with its
+	/// errno.
+	#[cfg(test)]
+	static LOOK_FAILS: parking_lot::Mutex<Vec<(std::path::PathBuf, i32)>> =
+		parking_lot::Mutex::new(Vec::new());
 
 	/// Test record of the way each FIFO helper opened its FIFO, by the path
 	/// its open was given: through the pin's `/proc/self/fd/N` (`true`) or by
@@ -1588,8 +1624,11 @@ mod fifo {
 			// SAFETY: `c` is a NUL-terminated string that outlives the call.
 			assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
 			let flags = OpenFlags::READ.with(OpenFlags::NOFOLLOW);
-			let start =
-				|p: &Path| pending(BStr::new(p.as_os_str().as_bytes()), flags, 0, None).unwrap();
+			let start = |p: &Path| {
+				pending(BStr::new(p.as_os_str().as_bytes()), flags, 0, None)
+					.unwrap()
+					.unwrap()
+			};
 
 			let mut open = start(&path);
 			// Be the writer the helper waits for, once it waits.
@@ -1612,6 +1651,82 @@ mod fifo {
 				Err(e) => assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{e}"),
 				Ok(_) => panic!("the symbolic link was followed"),
 			}
+		}
+
+		/// A look at a FIFO that fails with anything but "not found" or "not a
+		/// directory" is the open's result. A plain open in its place, of a
+		/// FIFO with no other end, waits in `open(2)` on the calling thread: a
+		/// read until a writer comes, a write (after its non-blocking try fails
+		/// with `ENXIO` and the look fails again) until a reader comes. Each
+		/// open runs on a thread of its own, so that wait fails the test
+		/// instead of hanging it.
+		#[test]
+		fn a_failed_look_at_a_fifo_is_the_opens_error() {
+			use crate::bash::{Fs as _, FsPoll};
+			for (label, flags) in [("read", OpenFlags::READ), ("write", OpenFlags::WRITE)] {
+				let dir = tempfile::tempdir().unwrap();
+				let path = make_fifo(dir.path());
+				// Two: a write looks again after its non-blocking try.
+				LOOK_FAILS
+					.lock()
+					.extend([(path.clone(), libc::EIO), (path.clone(), libc::EIO)]);
+				let (tx, rx) = std::sync::mpsc::channel();
+				let name = path.clone();
+				thread::spawn(move || {
+					let name = BStr::new(name.as_os_str().as_bytes());
+					let opened = match super::super::StdFs::default().open(name, flags, 0) {
+						FsPoll::Ready(Err(e)) => Ok(e.raw_os_error()),
+						FsPoll::Ready(Ok(f)) => Err(format!("opened a {:?}", f.kind())),
+						FsPoll::Pending(_) => Err("pending".to_owned()),
+					};
+					let _ = tx.send(opened);
+				});
+				let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+				if got.is_err() {
+					// Waiting in open(2): the other end lets it return.
+					let _ = OpenOptions::new()
+						.read(!flags.contains(OpenFlags::READ))
+						.write(flags.contains(OpenFlags::READ))
+						.custom_flags(libc::O_NONBLOCK)
+						.open(&path);
+				}
+				LOOK_FAILS.lock().retain(|(failing, _)| *failing != path);
+				assert_eq!(got, Ok(Ok(Some(libc::EIO))), "{label}");
+			}
+		}
+
+		/// A write whose first look finds nothing meets a FIFO with no reader
+		/// (`ENXIO`) and looks again: that second look's failure is the open's
+		/// result too, not a blocking plain open.
+		#[test]
+		fn a_failed_look_after_enxio_is_the_opens_error() {
+			use crate::bash::{Fs as _, FsPoll};
+			let dir = tempfile::tempdir().unwrap();
+			let path = make_fifo(dir.path());
+			LOOK_FAILS
+				.lock()
+				.extend([(path.clone(), libc::ENOENT), (path.clone(), libc::EIO)]);
+			let (tx, rx) = std::sync::mpsc::channel();
+			let name = path.clone();
+			thread::spawn(move || {
+				let name = BStr::new(name.as_os_str().as_bytes());
+				let opened = match super::super::StdFs::default().open(name, OpenFlags::WRITE, 0) {
+					FsPoll::Ready(Err(e)) => Ok(e.raw_os_error()),
+					FsPoll::Ready(Ok(f)) => Err(format!("opened a {:?}", f.kind())),
+					FsPoll::Pending(_) => Err("pending".to_owned()),
+				};
+				let _ = tx.send(opened);
+			});
+			let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+			if got.is_err() {
+				// Waiting in open(2): a reader lets it return.
+				let _ = OpenOptions::new()
+					.read(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&path);
+			}
+			LOOK_FAILS.lock().retain(|(failing, _)| *failing != path);
+			assert_eq!(got, Ok(Ok(Some(libc::EIO))), "write after ENXIO");
 		}
 
 		/// A FIFO named `f` in `dir`.
@@ -1654,8 +1769,9 @@ mod fifo {
 				("< (read)", OpenFlags::READ, false),
 			];
 			for (label, flags, _) in cases {
-				let mut open =
-					pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
+				let mut open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None)
+					.unwrap()
+					.unwrap();
 				if let Err(e) = result(&mut *open, || {}) {
 					panic!("{label}: {e}");
 				}
@@ -1711,7 +1827,7 @@ mod fifo {
 					wrong.push(format!("{label}, the plain open: {plain:?}, not EACCES"));
 				}
 				let by_helper =
-					outcome(result(&mut *pending(name, flags, 0o666, None).unwrap(), || {}));
+					outcome(result(&mut *pending(name, flags, 0o666, None).unwrap().unwrap(), || {}));
 				let by_shell = outcome(match super::super::StdFs::default().open(name, flags, 0o666) {
 					FsPoll::Ready(opened) => opened,
 					FsPoll::Pending(mut open) => result(&mut *open, || {}),
@@ -1791,6 +1907,7 @@ mod fifo {
 					.lock()
 					.push((path.clone(), Box::new(move || fs::remove_file(&gone).unwrap())));
 				let mut open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, umask)
+					.unwrap()
 					.unwrap_or_else(|| panic!("{label}: no FIFO open"));
 				if let Err(err) = result(&mut *open, || {}) {
 					panic!("{label}: {err}");
@@ -1841,7 +1958,9 @@ mod fifo {
 				let flags = OpenFlags::WRITE
 					.with(OpenFlags::CREATE)
 					.with(OpenFlags::TRUNC);
-				let open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
+				let open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None)
+					.unwrap()
+					.unwrap();
 				if reached.recv_timeout(LIMIT).is_err() {
 					wrong.push(format!("{late}: the helper never reached its open"));
 					continue;
@@ -1902,8 +2021,9 @@ mod fifo {
 			let flags = OpenFlags::WRITE
 				.with(OpenFlags::CREATE)
 				.with(OpenFlags::TRUNC);
-			let mut open =
-				pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None).unwrap();
+			let mut open = pending(BStr::new(path.as_os_str().as_bytes()), flags, 0o666, None)
+				.unwrap()
+				.unwrap();
 			let limit = std::time::Duration::from_secs(10);
 			let start = std::time::Instant::now();
 			let opened = loop {
@@ -2044,7 +2164,7 @@ mod fifo {
 					return;
 				}
 				let by_helper =
-					outcome(result(&mut *pending(name, flags, 0o666, None).unwrap(), || {}));
+					outcome(result(&mut *pending(name, flags, 0o666, None).unwrap().unwrap(), || {}));
 				let by_shell = outcome(match super::super::StdFs::default().open(name, flags, 0o666) {
 					FsPoll::Ready(opened) => opened,
 					FsPoll::Pending(mut open) => result(&mut *open, || {}),
@@ -2368,8 +2488,10 @@ impl Fs for StdFs {
 		// reader then inside a blocking open of the FIFO returns with no writer
 		// and reads end of file, while this writer waits for a reader for ever.
 		#[cfg(unix)]
-		if let Some(pending) = fifo::pending(path, flags, mode, self.umask) {
-			return FsPoll::Pending(pending);
+		match fifo::pending(path, flags, mode, self.umask) {
+			Ok(Some(pending)) => return FsPoll::Pending(pending),
+			Err(err) => return FsPoll::Ready(Err(err)),
+			Ok(None) => {},
 		}
 		#[cfg(unix)]
 		if flags.contains(OpenFlags::WRITE) && !flags.contains(OpenFlags::READ) {
@@ -2377,8 +2499,10 @@ impl Fs for StdFs {
 				// A FIFO made since the check above, with no reader yet (or no
 				// FIFO at all: `pending` tells).
 				Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {
-					if let Some(pending) = fifo::pending(path, flags, mode, self.umask) {
-						return FsPoll::Pending(pending);
+					match fifo::pending(path, flags, mode, self.umask) {
+						Ok(Some(pending)) => return FsPoll::Pending(pending),
+						Err(err) => return FsPoll::Ready(Err(err)),
+						Ok(None) => {},
 					}
 				},
 				opened => return FsPoll::Ready(opened),

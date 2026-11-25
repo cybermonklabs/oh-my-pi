@@ -1480,6 +1480,76 @@ mod unix {
 		);
 	}
 
+	/// Under a cancellable facade, a failed look at a handle's entry before a
+	/// FIFO open is the open's error, through `open_at` and `open_at_async`,
+	/// for reading and for writing. A plain open in its place, of a FIFO with
+	/// no other end, waits in `open(2)` on the calling thread or runtime
+	/// worker, where the token does not reach it. A look that finds nothing
+	/// still leaves the open to the plain open: a regular file whose look is
+	/// planted `ENOENT` opens. Each open runs on a thread of its own, so a
+	/// wait fails the test instead of hanging it. The entry names are this
+	/// test's own, as the planted failures are keyed by the entry's name.
+	#[test]
+	fn a_failed_look_at_an_entry_is_the_opens_error() {
+		use std::os::unix::fs::OpenOptionsExt;
+		let tree = Tree::new("fifo-look-at");
+		let fifo_name = "look-fails-fifo";
+		let file_name = "look-fails-file";
+		mkfifo(&tree.at(fifo_name));
+		std::fs::write(tree.at(file_name), b"x").unwrap();
+		let dir = tree.at("");
+		let (mut read, mut write) = (OpenOptions::new(), OpenOptions::new());
+		read.read(true);
+		write.write(true);
+		let open = |name: &'static str, options: &OpenOptions, is_async: bool| {
+			let (tx, rx) = std::sync::mpsc::channel();
+			let (dir, options) = (dir.clone(), options.clone());
+			std::thread::spawn(move || {
+				let fs = Fs::native().with_cancellation(tokio_util::sync::CancellationToken::new());
+				let root = fs.blocking().open_dir(&dir, true).unwrap();
+				let opened = if is_async {
+					runtime().block_on(root.open_at_async(n(name), &options))
+				} else {
+					root.open_at(n(name), &options)
+				};
+				let _ = tx.send(opened.map(drop).map_err(|e| e.raw_os_error()));
+			});
+			rx.recv_timeout(Duration::from_secs(5))
+		};
+		let planted = Path::new(fifo_name);
+		let mut wrong = Vec::new();
+		for (label, options, is_async) in [
+			("open_at, read", &read, false),
+			("open_at, write", &write, false),
+			("open_at_async, read", &read, true),
+			("open_at_async, write", &write, true),
+		] {
+			crate::fifo::hooks::fail_next_look(planted, libc::EIO);
+			let got = open(fifo_name, options, is_async);
+			if got.is_err() {
+				// Waiting in open(2): the other end lets it return.
+				let _ = std::fs::OpenOptions::new()
+					.read(!options.is_read())
+					.write(options.is_read())
+					.custom_flags(libc::O_NONBLOCK)
+					.open(tree.at(fifo_name));
+			}
+			crate::fifo::hooks::clear_look_failures(planted);
+			if got != Ok(Err(Some(libc::EIO))) {
+				wrong.push(format!("{label}: {got:?}"));
+			}
+		}
+		for is_async in [false, true] {
+			crate::fifo::hooks::fail_next_look(Path::new(file_name), libc::ENOENT);
+			let got = open(file_name, &read, is_async);
+			crate::fifo::hooks::clear_look_failures(Path::new(file_name));
+			if got != Ok(Ok(())) {
+				wrong.push(format!("a regular file whose look is ENOENT (async {is_async}): {got:?}"));
+			}
+		}
+		assert!(wrong.is_empty(), "{wrong:#?}");
+	}
+
 	/// A FIFO helper's hook (see `fifo_seam`): `started` is told when the
 	/// helper reaches the hook; with `hold`, the helper then waits until
 	/// `hold` is released before its `open`. Returns the channel the helper
