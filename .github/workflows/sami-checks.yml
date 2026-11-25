@@ -8,7 +8,7 @@
 #     later, so sami itself is not tested again).
 #   - A dispatch tests any pushed commit, given as a full 40-character id:
 #       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
-#         -f commit=<sha> [-f silent=<job name>]
+#         -f commit=<sha> [-f silent=<job name>] [-f frames_base=<sha>]
 #     `silent` is the summary's control: the named job (for example set-root-2) uploads nothing,
 #     and the summary must then read its units and its row UNKNOWN.
 #   - A push of feat/sami-checks (this tool's own branch) runs only the plan job's selftest: the
@@ -28,6 +28,10 @@
 #   - TypeScript: natives, utils, scripts/ci-release-publish.test.ts and mnemopi --isolate in one
 #     job; coding-agent --isolate over 10 shards by file; check:ts. The host addon they load is
 #     built once, in the natives job.
+#   - the frames row (sami-checks-frames.yml): pi-shell frames the previous release's build
+#     stored, read by this build, which must restore them or refuse them cleanly. frames_base
+#     names the previous release on a dispatch; by default it is the newest v*-sami.* tag on a
+#     strict ancestor of the commit.
 # The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
 # in the tools job (.github/sami-checks/tools.sh), on hosts .github/sami-checks/host.sh sets up.
 # sdk/rust/omp-rpc is its own cargo workspace and is not built here.
@@ -85,6 +89,11 @@ on:
         type: string
       silent:
         description: "Control: a job name (for example set-root-2) that uploads nothing"
+        required: false
+        default: ""
+        type: string
+      frames_base:
+        description: "The frames row's previous release: a full 40-character id; empty: the newest v*-sami.* tag on a strict ancestor of commit"
         required: false
         default: ""
         type: string
@@ -509,9 +518,19 @@ jobs:
           path: ${{ github.workspace }}/sc/res/
           retention-days: 14
 
+  frames:
+    name: frames
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    uses: ./.github/workflows/sami-checks-frames.yml
+    with:
+      commit: ${{ needs.plan.outputs.commit }}
+      frames_base: ${{ inputs.frames_base }}
+      silent: ${{ needs.plan.outputs.silent }}
+
   summary:
     name: summary
-    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms]
+    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms, frames]
     if: ${{ always() && needs.plan.outputs.commit != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15

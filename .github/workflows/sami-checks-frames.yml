@@ -1,0 +1,163 @@
+# sami checks, the frames row: called by sami-checks.yml for each release candidate. Report only,
+# like its caller: nothing here gates a release.
+#
+# What it checks. A release must read the frames (pi-shell's stored execution state, the Frames
+# blob) that the release before it stored: frames of its own build id restore and run on, and
+# frames of another build id are refused, kept, and recovered with drop_frames. So a change of the
+# frames layout raises FRAMES_VERSION (frames.rs), which is part of the build id.
+#   - frames-base picks the previous release, builds its pi-shell lib tests with a writer test
+#     appended (.github/sami-checks/frames_write.rs), and runs it: the frames of a loop externalized
+#     mid-run, with the IR units they name.
+#   - frames-build builds the candidate's pi-shell lib tests with the reader and the fork's
+#     hand-run kit row appended (frames_read.rs), then again with the kit's plant, widened to the
+#     IR test: frames.rs check() refuses frames of no other IR version, frames version or build.
+#   - frames runs the reader and the kit row in both binaries, and sc.py frames turns the four runs
+#     into the row's units and its controls (each control passes when its plant was caught). See
+#     frames.sh and sc.py's frames_units.
+#
+# The previous release: the frames_base input when given, else the newest v*-sami.* tag (by the cut
+# time in its name) on a strict ancestor of the candidate. Not sami's head: publish fast-forwards
+# sami to the candidate, possibly before this job reads it, and on a dispatch of an older commit
+# sami names a later release. The tag rule gives one answer for a candidate at any time, and strict
+# ancestry skips the candidate's own tag.
+#
+# Caches. No job restores or saves a GitHub Actions cache (cache-mode: none for the whole run):
+# every job compiles or runs a tree's code.
+# Security. permissions: contents: read; no secrets; every checkout drops its credential.
+name: sami checks frames
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: "The candidate: a full 40-character id"
+        required: true
+        type: string
+      frames_base:
+        description: "The previous release (a full 40-character id); empty: the newest v*-sami.* tag on a strict ancestor of commit"
+        required: false
+        default: ""
+        type: string
+      silent:
+        description: "The caller's control: when it is 'frames', the frames job uploads no result"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+cache-mode: none
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  SC: ${{ github.workspace }}/sc
+  SC_TREE: ${{ github.workspace }}/tree
+  SC_COMMIT: ${{ inputs.commit }}
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+jobs:
+  frames-base:
+    name: frames base (the previous release writes its frames)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - name: The previous release
+        id: pick
+        env:
+          SC_FRAMES_BASE_INPUT: ${{ inputs.frames_base }}
+          SC_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: bash tool/.github/sami-checks/frames.sh pick
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: base
+          ref: ${{ steps.pick.outputs.base }}
+          persist-credentials: false
+      - name: Toolchain (the previous release's rust-toolchain.toml channel, minimal profile)
+        run: |
+          ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' base/rust-toolchain.toml | head -n 1)
+          [ -n "$ch" ] || { echo "::error::no channel in the previous release's rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$ch" >> "$GITHUB_ENV"
+      - name: Build the writer and write the frames
+        run: bash tool/.github/sami-checks/frames.sh base
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: sc-frames-base
+          path: |
+            ${{ github.workspace }}/sc/frames/
+            !${{ github.workspace }}/sc/frames/writer.bin
+          retention-days: 3
+
+  frames-build:
+    name: frames build (the reader, then the kit's plant)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+      - name: Toolchain (the tree's rust-toolchain.toml channel, minimal profile)
+        run: |
+          ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SC_TREE/rust-toolchain.toml" | head -n 1)
+          [ -n "$ch" ] || { echo "::error::no channel in the tree's rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$ch" >> "$GITHUB_ENV"
+      - name: Build the reader, then the kit's plant
+        run: bash tool/.github/sami-checks/frames.sh build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: sc-frames-bin
+          path: ${{ github.workspace }}/sc/frames/
+          retention-days: 1
+
+  frames:
+    name: frames (this build reads them)
+    needs: [frames-base, frames-build]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      # A job that failed may have uploaded nothing: frames.sh then names what is missing.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: sc-frames-base
+          path: ${{ github.workspace }}/sc/frames
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: sc-frames-bin
+          path: ${{ github.workspace }}/sc/frames
+      - name: Read the previous release's frames
+        run: bash tool/.github/sami-checks/frames.sh run
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && inputs.silent != 'frames' }}
+        with:
+          name: sc-res-frames
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
