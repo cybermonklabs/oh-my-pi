@@ -1,3 +1,4 @@
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_shared_library", "rust_test")
 load("//bazel/toolchains/swift:defs.bzl", "applefm_bridge")
@@ -225,8 +226,28 @@ rust_test(
     rustc_env_files = _DARWIN_RUSTC_ENV_FILES,
 )
 
+# Two tests of the tokenizer scanners each compare the scanner with its regex
+# on 2000 random strings: about 77 s each on a 4-vCPU runner, side by side, of
+# about 90 s for the whole target (sami-checks measurement run 45508657730,
+# GitHub ubuntu-22.04, nothing else running). Beside the gate's other test
+# actions on the same 4 vCPU they once reached Bazel's 300 s limit for a
+# medium test (sami-checks run 45484907076). They run from a target of their
+# own with timeout "long" (900 s), so the main target keeps 300 s and a hang
+# among its tests still fails there. It runs the main target's test binary,
+# so the two cannot differ in what they build.
+PI_NATIVES_SCANNER_TESTS = [
+    "utok::scan::deepseek::tests::deepseek_scanner_matches_regex_on_random_text",
+    "utok::scan::kimi::tests::kimi_scanner_matches_regex_on_random_text",
+]
+
 rust_test(
     name = "pi_natives_test",
+    args = [
+        "--skip",
+        PI_NATIVES_SCANNER_TESTS[0],
+        "--skip",
+        PI_NATIVES_SCANNER_TESTS[1],
+    ],
     crate = ":pi_natives",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
@@ -236,4 +257,12 @@ rust_test(
         # the linux-only normal dep entry; restore it for the test build.
         "@crates//:xkeysym",
     ],
+)
+
+native_test(
+    name = "pi_natives_scanner_test",
+    timeout = "long",
+    src = ":pi_natives_test",
+    out = "pi_natives_scanner_test.bin",
+    args = ["--exact"] + PI_NATIVES_SCANNER_TESTS,
 )
