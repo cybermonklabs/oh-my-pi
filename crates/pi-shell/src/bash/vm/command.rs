@@ -2080,11 +2080,12 @@ fn fork_redirections(
 	let pc = vp.frames.last().map_or(0, |f| f.pc);
 	let one = OneCommand { trap_exit: exec::exit_trap_status(vp) };
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), pc, vp.fds.clone());
-	// The fork keeps the shell's loop level (`make_child`, no
-	// `execute_in_subshell`): a `break` or `continue` in a `${ }` of its
-	// redirections waits there ([`super::proc::PendingBreak`]) and ends with
-	// the fork, after the program.
-	child.outer_loops = exec::fork_loops(vp, true);
+	// The fork keeps the shell's loop level and its running trap
+	// (`make_child`, no `execute_in_subshell`; [`exec::fork_state`]): a
+	// `break` or `continue` in a `${ }` of its redirections waits there
+	// ([`super::proc::PendingBreak`]) and ends with the fork, after the
+	// program, and a trap action's fork keeps the trapped `BASH_COMMAND`.
+	exec::fork_state(&mut child, vp, true);
 	// One command's fork: `$BASH_SUBSHELL` stays the shell's, a fatal
 	// error reaches what the shell's reach (a null command's fork catches
 	// its own), and no EXIT trap runs (bash `exit`s the fork, or `exec`s).
@@ -5698,7 +5699,7 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 	}
 	let mut child = vp.child_text(k, cx.store, &text, line, vp.fds.clone());
 	// The command's own fork: bash and zsh keep the loop level.
-	child.outer_loops = super::exec::fork_loops(vp, true);
+	super::exec::fork_state(&mut child, vp, true);
 	let vpid = child.vpid;
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));

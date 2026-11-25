@@ -15,10 +15,10 @@ use super::{
 	expand::{self, Expander, Stop},
 	is_ident, probe,
 	proc::{
-		AssignValue, Atom, Bang, BangStage, Coproc, DebugSkip, Depths, ForkedCmd, Frame, FrameKind,
-		InlineStage, LastBg, LoopKind, LoopRec, OneCommand, ParseSnapshot, PendingBreak, PendingSub,
-		PendingWrite, Probe, ProbeResult, Run, Saved, Saves, Scratch, ScriptKind, Slot, TryEnd,
-		Vproc, WriteKey,
+		AssignValue, Atom, Bang, BangStage, BashCommand, Coproc, DebugSkip, Depths, ForkedCmd, Frame,
+		FrameKind, InlineStage, LastBg, LoopKind, LoopRec, OneCommand, ParseSnapshot, PendingBreak,
+		PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved, Saves, Scratch, ScriptKind, Slot,
+		TryEnd, Vproc, WriteKey,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -255,8 +255,9 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			if let Some((i, entry)) = next {
 				vp.frames[fi].debug_pc = Some(SPAWN_DEBUG - u32::try_from(i + 1).unwrap_or(MAX_STAGES));
 				// The stage's `Exec`, past its words' substitution bodies.
-				let stage_op = unit.ops[skip_blocks(unit, entry) as usize];
-				note_command(vp, unit, stage_op);
+				let stage_pc = skip_blocks(unit, entry);
+				let stage_op = unit.ops[stage_pc as usize];
+				note_command(vp, unit, stage_pc);
 				let line = line_of(vp, stage_op.node);
 				if start_trap(k, vp, cx, TrapKey::Debug) {
 					set_trap_line(vp, line);
@@ -266,29 +267,31 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			vp.frames[fi].debug_pc = Some(vp.frames[fi].pc);
 		}
 		let starts = starts_command(unit, op);
-		let fresh = vp.frames[fi].scratch.is_none();
-		if fresh && starts {
-			note_command(vp, unit, op);
-		}
 		// bash's DEBUG trap: before a simple command, `[[ ]]`, `(( ))`, each
 		// arith-for expression, a `case` or `select` command and each `for`
-		// iteration that assigns a word. zsh's runs at its list markers.
-		let debug_point = unit.mode.dialect() == Dialect::Bash
-			&& (starts
-				|| match op.code {
-					Opcode::Arith => unit
-						.nodes
-						.get(op.node as usize)
-						.is_some_and(|n| n.kind == NodeKind::ArithFor),
-					Opcode::CaseWord => true,
-					Opcode::ForIn => op.flags & Op::SELECT != 0,
-					Opcode::ForNext => vp.frames[fi].loops.last().is_some_and(
-						|r| matches!(&r.kind, LoopKind::For { items, next, .. } if (*next as usize) < items.len()),
-					),
-					_ => false,
-				});
-		if debug_point && vp.frames[fi].debug_pc != Some(vp.frames[fi].pc) {
-			vp.frames[fi].debug_pc = Some(vp.frames[fi].pc);
+		// iteration that assigns a word. The last four are heads: like a
+		// command, a head names `BASH_COMMAND` when it runs (not again when
+		// its op resumes); an arith-for expression with something to expand
+		// does so, and has its point, after the expansion, in its op
+		// ([`dispatch`]). zsh's runs at its list markers.
+		let head = unit.mode.dialect() == Dialect::Bash
+			&& match op.code {
+				Opcode::Arith => op.b == Op::LITERAL && in_arith_for(unit, op),
+				Opcode::CaseWord => true,
+				Opcode::ForIn => op.flags & Op::SELECT != 0,
+				Opcode::ForNext => vp.frames[fi].loops.last().is_some_and(
+					|r| matches!(&r.kind, LoopKind::For { items, next, .. } if (*next as usize) < items.len()),
+				),
+				_ => false,
+			};
+		let fresh = vp.frames[fi].scratch.is_none();
+		let pc = vp.frames[fi].pc;
+		if fresh && (starts || head) {
+			note_command(vp, unit, pc);
+		}
+		let debug_point = head || (starts && unit.mode.dialect() == Dialect::Bash);
+		if debug_point && vp.frames[fi].debug_pc != Some(pc) {
+			vp.frames[fi].debug_pc = Some(pc);
 			if pseudo_trap_maybe(k, cx, TrapKey::Debug) {
 				let line = line_of(vp, op.node);
 				if start_trap(k, vp, cx, TrapKey::Debug) {
@@ -356,9 +359,17 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			op.flags & Op::COND != 0 || vp.frames.get(fi).is_some_and(|frame| frame.ignore_errexit);
 		if matches!(flow, Flow::Call) && ignore_errexit {
 			// Frames the op pushed (function, `eval`, `source`, `${ ;}`)
-			// run in its context.
+			// run in its context; not the DEBUG trap an arith-for
+			// expression starts after its expansion, which runs as one
+			// started before an op does.
 			for frame in vp.frames.iter_mut().skip(fi + 1) {
-				frame.ignore_errexit = true;
+				if !(op.code == Opcode::Arith
+					&& matches!(frame.kind, FrameKind::Script {
+						what: ScriptKind::Trap { key: TrapKey::Debug, .. },
+						..
+					})) {
+					frame.ignore_errexit = true;
+				}
 			}
 		}
 		// An `exit N` in the cancel trap is `exit_shell`'s (the EXIT trap, then
@@ -656,25 +667,108 @@ pub fn set_trap_line(vp: &mut Vproc, line: u32) {
 	}
 }
 
-/// Record the command `op` starts (a simple command, `[[ ]]` or `(( ))`:
-/// the caller checked [`starts_command`]) as `BASH_COMMAND`; not while a
-/// trap action runs, nor in a DEBUG trap action's command substitution
-/// (bash keeps the trapped command).
-fn note_command(vp: &mut Vproc, unit: &Arc<Unit>, op: Op) {
-	if !runs_no_debug_trap(vp)
-		&& (vp.trap_frames == 0
-			|| !vp
-				.frames
-				.iter()
-				.any(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. })))
+/// Record the op at `pc` of `unit` as `BASH_COMMAND`
+/// ([`BashCommand::Op`]): a command [`starts_command`] accepts, or a head
+/// at its DEBUG trap point; not while a trap action runs, nor in a DEBUG
+/// trap action's substitution ([`runs_no_debug_trap`]): bash keeps the
+/// trapped command.
+fn note_command(vp: &mut Vproc, unit: &Arc<Unit>, pc: u32) {
+	if runs_no_debug_trap(vp) || in_trap_action_or_fork(vp) {
+		return;
+	}
+	if let Some(BashCommand::Op(u, at)) = &mut vp.command
+		&& Arc::ptr_eq(u, unit)
 	{
-		if let Some((u, node)) = &mut vp.command
-			&& Arc::ptr_eq(u, unit)
-		{
-			*node = op.node;
-		} else {
-			vp.command = Some((Arc::clone(unit), op.node));
-		}
+		*at = pc;
+	} else {
+		vp.command = Some(BashCommand::Op(Arc::clone(unit), pc));
+	}
+}
+
+/// Record arith-for expression `expr`, as expanded, as `BASH_COMMAND`
+/// ([`BashCommand::Expanded`]; the box of an earlier one is reused); not
+/// while a trap action runs, nor in a DEBUG trap action's substitution.
+fn note_expanded(vp: &mut Vproc, expr: BString) {
+	if runs_no_debug_trap(vp) || in_trap_action_or_fork(vp) {
+		return;
+	}
+	if let Some(BashCommand::Expanded(text)) = &mut vp.command {
+		**text = expr;
+	} else {
+		vp.command = Some(BashCommand::Expanded(Box::new(expr)));
+	}
+}
+
+/// Whether a trap action runs in `vp`, or `vp` is a fork of one that keeps
+/// its trapped command ([`OwnTraps::trap_fork`]); its frame count first: no
+/// scan outside one. Any trap's action: [`in_trap_action`] asks about one
+/// trap's own.
+///
+/// [`OwnTraps::trap_fork`]: super::proc::OwnTraps::trap_fork
+fn in_trap_action_or_fork(vp: &Vproc) -> bool {
+	if vp.own_traps.trap_fork() {
+		return true;
+	}
+	vp.trap_frames != 0
+		&& vp
+			.frames
+			.iter()
+			.any(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }))
+}
+
+/// Whether `op` is an expression of an arith-for header.
+fn in_arith_for(unit: &Unit, op: Op) -> bool {
+	unit
+		.nodes
+		.get(op.node as usize)
+		.is_some_and(|n| n.kind == NodeKind::ArithFor)
+}
+
+/// What a failing DEBUG trap skips under `extdebug` at the top frame's op,
+/// as bash does: the command; an arith-for expression, which is 0 (bash
+/// `eval_arith_for_expr`: a skipped test ends the loop); the rest of a
+/// `for` iteration, without its assignment (`execute_for_command`'s
+/// `continue`: the next word comes, the loop's status is the trap's); a
+/// whole `select` or `case`, with status 0.
+fn skip_after_debug(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, trap_status: i32) {
+	let f = top_frame(vp);
+	f.debug_pc = None;
+	let Some(unit) = f.unit.clone() else {
+		return;
+	};
+	let Some(&op) = unit.ops.get(f.pc as usize) else {
+		return;
+	};
+	match op.code {
+		Opcode::ForNext => {
+			let rec = f.loops.last_mut();
+			if let Some(LoopRec { kind: LoopKind::For { next, .. }, status, .. }) = rec {
+				*next += 1;
+				*status = trap_status;
+			}
+		},
+		Opcode::ForIn | Opcode::CaseWord => {
+			// Past the command's `LoopExit` or `CaseEnd`: its `Leave`.
+			let end = if op.code == Opcode::ForIn {
+				Opcode::LoopExit
+			} else {
+				Opcode::CaseEnd
+			};
+			if let Some(at) = (f.pc as usize + 1..unit.ops.len())
+				.find(|&i| unit.ops[i].code == end && unit.ops[i].node == op.node)
+			{
+				f.pc = at as u32 + 1;
+			}
+			vp.status = 0;
+		},
+		Opcode::Arith if in_arith_for(&unit, op) => {
+			f.pc += 1;
+			// An expression with something to expand kept its expansion's
+			// log for its evaluation.
+			clear_scratch(&mut k.root, cx.store, vp);
+			vp.status = 1;
+		},
+		_ => f.pc += 1,
 	}
 }
 
@@ -1422,16 +1516,14 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 				&& trap_status != 0
 				&& state::option(&mut k.root, cx.store, vp, OptId::Extdebug).unwrap_or(false)
 			{
-				// `extdebug`: a failing DEBUG trap skips the command; at a
-				// function's entry, the whole body (and its RETURN trap).
+				// `extdebug`: a failing DEBUG trap skips what it ran before
+				// ([`skip_after_debug`]); at a function's entry, the whole
+				// body (and its RETURN trap).
 				let f = top_frame(vp);
 				let at = f
 					.unit
 					.as_ref()
 					.and_then(|u| Some((u.ops.get(f.pc as usize).copied()?, u)));
-				let skippable = at.is_some_and(|(op, _)| {
-					!matches!(op.code, Opcode::ForIn | Opcode::ForNext | Opcode::CaseWord)
-				});
 				// A stage's trap run in the shell before the fork, as bash's: a
 				// lone background command's skips the job (no job, `$!` and
 				// `PIPESTATUS` as they were), with status 0, or 1 for `! cmd &`;
@@ -1463,9 +1555,8 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 					} else if let Some(entry) = entry {
 						note_debug_skip(k, vp, entry);
 					}
-				} else if f.debug_pc == Some(f.pc) && skippable {
-					f.pc += 1;
-					f.debug_pc = None;
+				} else if f.debug_pc == Some(f.pc) {
+					skip_after_debug(k, cx, vp, trap_status);
 				}
 			}
 		}
@@ -1609,11 +1700,13 @@ pub(super) fn literal_script_origin(
 	source: &[u8],
 	shell: bool,
 ) -> Option<crate::bash::event::SourceOrigin> {
-	let (unit, node) = vp.command.as_ref()?;
+	let Some(BashCommand::Op(unit, pc)) = vp.command.as_ref() else {
+		return None;
+	};
 	let op = unit
 		.ops
-		.iter()
-		.find(|op| op.code == Opcode::Exec && op.node == *node)?;
+		.get(*pc as usize)
+		.filter(|op| op.code == Opcode::Exec)?;
 	let command = unit.cmds.get(op.a as usize)?;
 	let words = unit.lists.get(command.words as usize)?;
 	let literal = |index: usize| -> Option<Vec<u8>> {
@@ -2363,15 +2456,20 @@ pub(super) fn redirected_subshell_starts(f: &Frame) -> bool {
 	redir.is_some_and(|at| subshell_redirection_at(unit, at))
 }
 
-/// The loops a child forked from `vp` runs inside ([`Vproc::outer_loops`]):
-/// a zsh fork keeps all of them (zsh's `loops`); bash keeps them
-/// (`loop_level`) only when `keeps`, a fork made without
-/// `execute_in_subshell`: a simple command run as a pipeline element or a
-/// job of one pipeline, a command or process substitution. bash zeroes the
-/// level for `( … )`, a compound element, an and-or, compound or timed job
-/// and a coprocess, and so for a substitution in a `( … )`'s own
-/// redirection, which bash forks from that child ([`subshell_redirection`]).
-pub fn fork_loops(vp: &Vproc, keeps: bool) -> u16 {
+/// What a child forked from `vp` inherits of bash's fork, which copies the
+/// whole shell: the loops it runs inside ([`Vproc::outer_loops`]) and the
+/// running trap ([`OwnTraps::trap_fork`]). bash keeps both only when `keeps`,
+/// a fork made without `execute_in_subshell`: a simple command run as a
+/// pipeline element or a job of one pipeline, a command or process
+/// substitution. `execute_in_subshell` zeroes the loop level and
+/// `running_trap` for `( … )`, a compound element, an and-or, compound or
+/// timed job and a coprocess, and so for a substitution in a `( … )`'s
+/// own redirection, which bash forks from that child
+/// ([`subshell_redirection`]). A zsh fork keeps all its loops (zsh's
+/// `loops`).
+///
+/// [`OwnTraps::trap_fork`]: super::proc::OwnTraps::trap_fork
+pub fn fork_state(child: &mut Vproc, vp: &Vproc, keeps: bool) {
 	let n = if vp.mode.dialect() == Dialect::Zsh {
 		zsh_loop_count(vp)
 	} else if keeps && !vp.frames.last().is_some_and(subshell_redirection) {
@@ -2380,7 +2478,10 @@ pub fn fork_loops(vp: &Vproc, keeps: bool) -> u16 {
 		0
 	};
 	// Past `u16::MAX` loops the count saturates ([`Vproc::outer_loops`]).
-	u16::try_from(n).unwrap_or(u16::MAX)
+	child.outer_loops = u16::try_from(n).unwrap_or(u16::MAX);
+	child.own_traps = child
+		.own_traps
+		.with_trap_fork(keeps && in_trap_action_or_fork(vp));
 }
 
 /// The first op at or after `at` that is not the jump over a command or
@@ -2402,7 +2503,7 @@ fn skip_blocks(unit: &Unit, mut at: u32) -> u32 {
 }
 
 /// Whether bash forks the job whose body starts at `entry` without
-/// `execute_in_subshell`, so that it keeps the loop level ([`fork_loops`]):
+/// `execute_in_subshell`, so that it keeps the loop level ([`fork_state`]):
 /// a body of one pipeline, with or without `!`, whose simple commands bash
 /// forks from the shell itself. An and-or list, a compound command or a
 /// timed pipeline is run as a subshell (`CMD_FORCE_SUBSHELL`).
@@ -3215,7 +3316,7 @@ pub fn start_sub(
 			// lists the parent's jobs, `fg` finds no current job.
 			child.jobs = inherited_jobs(vp, vp.jobs.subshell);
 			// bash and zsh keep the loop level: a `break` ends the substitution.
-			child.outer_loops = fork_loops(vp, true);
+			fork_state(&mut child, vp, true);
 			sub_runs_no_debug_trap(vp, &mut child);
 			// Its externals stay in the shell's process group.
 			super::jobctl::set_leader(k, child.vpid, None);
@@ -3295,7 +3396,7 @@ pub fn start_zsh_sub(
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
 	k.bang_kin_add(vp.vpid, child.vpid);
 	child.jobs = inherited_jobs(vp, vp.jobs.subshell);
-	child.outer_loops = fork_loops(vp, true);
+	fork_state(&mut child, vp, true);
 	sub_runs_no_debug_trap(vp, &mut child);
 	// Its externals stay in the shell's process group (zsh
 	// `ESUB_NOMONITOR`).
@@ -3344,7 +3445,7 @@ pub fn start_zsh_procsub(
 	fds.set(their_fd, Some(theirs));
 	let line = line_of(vp, 0);
 	let mut child = vp.child_text(k, cx.store, text, line, fds);
-	child.outer_loops = fork_loops(vp, true);
+	fork_state(&mut child, vp, true);
 	sub_runs_no_debug_trap(vp, &mut child);
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
@@ -3505,7 +3606,7 @@ pub fn start_procsub(
 	}
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
 	// bash keeps the loop level in a process substitution.
-	child.outer_loops = fork_loops(vp, true);
+	fork_state(&mut child, vp, true);
 	sub_runs_no_debug_trap(vp, &mut child);
 	let vpid = child.vpid;
 	// Not a job: its externals stay in the shell's group, without the
@@ -3708,7 +3809,8 @@ fn control_flow(
 				return None;
 			}
 			if starts {
-				note_command(vp, unit, op);
+				let pc = top_frame(vp).pc;
+				note_command(vp, unit, pc);
 			}
 			let f = top_frame(vp);
 			if starts {
@@ -4112,6 +4214,13 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			Flow::Call
 		},
 		Opcode::CaseWord => {
+			// bash 5.3 traces the head before it expands the word
+			// (`execute_case_command`), once (not when the op resumes); zsh
+			// after.
+			let bash = unit.mode.dialect() == Dialect::Bash;
+			if bash && top_frame(vp).scratch.is_none() && super::xtrace::on(k, cx, vp) {
+				trace_head_now(k, cx, vp, unit, op, line);
+			}
 			let w = &unit.words[op.a as usize];
 			let subject =
 				match expanding(k, vp, cx, Slot::Words, w.parks, line, |ex| ex.scalar(unit, w)) {
@@ -4119,10 +4228,8 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					Err(flow) => return flow,
 				};
 			clear_scratch(&mut k.root, cx.store, vp);
-			if super::xtrace::on(k, cx, vp) {
-				let mut body = b"case ".to_vec();
-				body.extend_from_slice(word_source(unit, op.a));
-				body.extend_from_slice(b" in");
+			if !bash && super::xtrace::on(k, cx, vp) {
+				let body = traced_head(unit, op);
 				super::xtrace::emit(k, cx, vp, line, &body);
 			}
 			// `$?` stays the previous command's until an arm decides it.
@@ -4137,37 +4244,64 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		Opcode::Arith if unit.mode.dialect() == Dialect::Zsh => zsh_arith(k, vp, cx, unit, op, line),
 		Opcode::Arith => {
 			let text = &unit.ariths[op.a as usize];
-			let arith_for = unit
-				.nodes
-				.get(op.node as usize)
-				.is_some_and(|n| n.kind == NodeKind::ArithFor);
+			let arith_for = in_arith_for(unit, op);
+			// An arith-for expression with something to expand: bash expands
+			// it, names it `BASH_COMMAND` and runs its DEBUG trap, then
+			// traces and evaluates it (`eval_arith_for_expr`). The trap
+			// starts once the expansion is done; the op runs again when the
+			// trap returns and replays the expansion from its log.
+			let pc = top_frame(vp).pc;
+			let debug_first = arith_for
+				&& op.b != Op::LITERAL
+				&& top_frame(vp).debug_pc != Some(pc)
+				&& pseudo_trap_maybe(k, cx, TrapKey::Debug);
 			// One inlined pass (each `<[u8]>::contains` is a call).
 			let record = text.iter().any(|&c| c == b'$' || c == b'`');
 			let res = expanding(k, vp, cx, Slot::Words, record, line, |ex| {
 				// Warnings carry the command's name.
 				ex.arith_cmd = Some("((");
 				let expanded = ex.expand_text(text)?;
+				// bash names it as expanded before its DEBUG trap and its
+				// trace: a `PS4` that reads `BASH_COMMAND` reads it.
+				if arith_for && op.b != Op::LITERAL {
+					note_expanded(&mut *ex.vp, BString::from(expanded.to_vec()));
+				}
+				if debug_first {
+					return Ok(None);
+				}
 				// bash traces the expanded text before evaluating it (a
 				// replay after a parked substitution gets here once).
 				if super::xtrace::on(ex.k, ex.cx, ex.vp) {
-					trace_arith(ex.k, ex.cx, ex.vp, line, &expanded, arith_for);
+					trace_arith(ex.k, ex.cx, ex.vp, line, &expanded);
 				}
-				match ex.arith_eval(&expanded) {
-					Ok(v) => Ok(Ok(v)),
+				let value = match ex.arith_eval(&expanded) {
+					Ok(v) => Ok(v),
 					// An error in a subscript abandons the line (an expansion
 					// failure).
-					Err(Stop::Fail(d @ (Diag::Arith { .. } | Diag::Readonly { .. }))) => Ok(Err(d)),
-					Err(stop) => Err(stop),
-				}
+					Err(Stop::Fail(d @ (Diag::Arith { .. } | Diag::Readonly { .. }))) => Err(d),
+					Err(stop) => return Err(stop),
+				};
+				Ok(Some(value))
 			});
-			match res {
-				Ok(Ok(v)) => {
-					clear_scratch(&mut k.root, cx.store, vp);
+			let value = match res {
+				Ok(v) => v,
+				Err(flow) => return flow,
+			};
+			let Some(value) = value else {
+				// The scratch keeps the expansion's log for the replay.
+				top_frame(vp).debug_pc = Some(pc);
+				if start_trap(k, vp, cx, TrapKey::Debug) {
+					set_trap_line(vp, line);
+				}
+				return Flow::Call;
+			};
+			clear_scratch(&mut k.root, cx.store, vp);
+			match value {
+				Ok(v) => {
 					vp.status = i32::from(v == 0);
 					Flow::Next
 				},
-				Ok(Err(d)) => {
-					clear_scratch(&mut k.root, cx.store, vp);
+				Err(d) => {
 					let d = if matches!(d, Diag::Arith { .. }) {
 						d.by("((")
 					} else {
@@ -4183,7 +4317,6 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 						Flow::Next
 					}
 				},
-				Err(flow) => flow,
 			}
 		},
 		Opcode::CondTest if unit.mode.dialect() == Dialect::Zsh => {
@@ -4674,6 +4807,14 @@ fn for_in(
 	let pc = top_frame(vp).pc;
 	let exit = unit.ops.get(pc as usize + 1).map_or(pc + 1, |next| next.a);
 	let var = unit.names[op.b as usize].clone();
+	// `set -x`: bash shows a `select` header once, before it expands the
+	// list (bash 5.3 `execute_select_command`; zsh after), a `for` header
+	// per word ([`for_next`]).
+	let select = op.flags & Op::SELECT != 0;
+	let bash = unit.mode.dialect() == Dialect::Bash;
+	if select && bash && top_frame(vp).scratch.is_none() && super::xtrace::on(k, cx, vp) {
+		trace_head_now(k, cx, vp, unit, op, line);
+	}
 	// The list is evaluated once per loop; it is logged because the op can
 	// be re-entered (a comsub, or a glob whose fs answer is pending), so the
 	// expansion's side effects run once.
@@ -4729,7 +4870,6 @@ fn for_in(
 	} else {
 		// bash checks a `select` name before it sets the line, so the
 		// message carries the line in effect: in a function, its body's.
-		let select = op.flags & Op::SELECT != 0;
 		let shown = match (select, vp.frames.last()) {
 			(true, Some(f)) if matches!(f.kind, FrameKind::Function { .. }) => unit
 				.ops
@@ -4747,14 +4887,13 @@ fn for_in(
 		1
 	};
 	clear_scratch(&mut k.root, cx.store, vp);
-	// `set -x`: bash shows a `select` header once, a `for` header per word.
-	if op.flags & Op::SELECT != 0 && super::xtrace::on(k, cx, vp) {
-		let body = loop_header(unit, op);
+	if select && !bash && super::xtrace::on(k, cx, vp) {
+		let body = traced_head(unit, op);
 		super::xtrace::emit(k, cx, vp, line, &body);
 	}
 	let f = top_frame(vp);
 	let depth = depths(f);
-	let kind = if op.flags & Op::SELECT != 0 {
+	let kind = if select {
 		LoopKind::Select { var, items, first: true, more: 0 }
 	} else if multi {
 		let vars = var.split(|&c| c == b'\n').map(BString::from).collect();
@@ -4826,7 +4965,7 @@ fn for_next(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		let f = top_frame(vp);
 		let header = f.unit.as_ref().and_then(|u| {
 			let forin = *u.ops.get(header_pc? as usize)?;
-			(forin.code == Opcode::ForIn).then(|| loop_header(u, forin))
+			(forin.code == Opcode::ForIn).then(|| traced_head(u, forin))
 		});
 		if let Some(body) = header {
 			super::xtrace::emit(k, cx, vp, line, &body);
@@ -5861,7 +6000,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				}
 				let keeps =
 					info.kind == SpawnKind::Background && bash_job_keeps(unit, info.stages[0].entry);
-				child.outer_loops = fork_loops(vp, keeps);
+				fork_state(&mut child, vp, keeps);
 				// The shell ran a background simple command's DEBUG trap, or
 				// the traps of the pipeline the job is: under `extdebug` the
 				// job's pipeline skips the stages whose trap failed.
@@ -6019,7 +6158,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						.ops
 						.get(skip_blocks(unit, stage.entry) as usize)
 						.is_some_and(|op| op.code == Opcode::Exec);
-					child.outer_loops = fork_loops(vp, simple);
+					fork_state(&mut child, vp, simple);
 					forked_for(&mut child, vp, unit, stage.entry);
 					let level = if async_elements {
 						0
@@ -6320,7 +6459,7 @@ fn start_coproc(
 	fds.set(0, Some(FdRef::mem(in_r)));
 	fds.set(1, Some(FdRef::mem(out_w)));
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
-	child.outer_loops = fork_loops(vp, false);
+	fork_state(&mut child, vp, false);
 	// bash runs a coprocess as a subshell (`CMD_WANT_SUBSHELL`) fed by a
 	// pipe: its async commands keep that pipe (`stdin_redir`).
 	child.jobs.stdin_redir = true;
@@ -6432,12 +6571,9 @@ pub fn coproc_fd_closed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, fd: i32
 	}
 }
 
-/// `set -x` for `(( … ))` and an arith-for expression: `(( text ))` of the
-/// expanded text (an arith-for one without its leading blanks, `1` when
-/// empty).
 /// Source text of word `w` of `unit` (bash's `set -x` shows compound
-/// command headers and compound assignment values unexpanded; also
-/// `command::trace`).
+/// assignment values unexpanded, `command::trace`; a header's words when
+/// the unit's tree cannot be had, [`head_text`]).
 pub fn word_source(unit: &Unit, w: u32) -> &[u8] {
 	unit
 		.words
@@ -6447,8 +6583,8 @@ pub fn word_source(unit: &Unit, w: u32) -> &[u8] {
 		.unwrap_or_default()
 }
 
-/// `for NAME in WORDS` / `select NAME in WORDS` of a `ForIn` op, as `set -x`
-/// shows it (`"$@"` without a list).
+/// `for NAME in WORDS` / `select NAME in WORDS` of a `ForIn` op from the
+/// words' source text (`"$@"` without a list).
 fn loop_header(unit: &Unit, forin: Op) -> Vec<u8> {
 	let mut body = Vec::new();
 	body.extend_from_slice(if forin.flags & Op::SELECT != 0 {
@@ -6474,20 +6610,86 @@ fn loop_header(unit: &Unit, forin: Op) -> Vec<u8> {
 	body
 }
 
-fn trace_arith(
-	k: &mut Kernel,
-	cx: &mut Cx<'_>,
-	vp: &mut Vproc,
-	line: u32,
-	text: &[u8],
-	arith_for: bool,
-) {
-	let text = if arith_for {
-		let t = text.trim_ascii_start();
-		if t.is_empty() { b"1".as_slice() } else { t }
-	} else {
+/// The head of the `for`, `select` or `case` command of `op` (its `ForIn`
+/// or `CaseWord`) as `BASH_COMMAND` names it
+/// ([`crate::bash::syntax::bash_command`]: the words as bash stores them,
+/// `case WORD in ` with its blank); from the words' source text in a zsh
+/// unit, or when the unit's tree cannot be had.
+fn head_text(unit: &Unit, op: Op) -> Vec<u8> {
+	if unit.mode.dialect() == Dialect::Bash
+		&& let Some(text) = unit
+			.with_command(op.node, crate::bash::syntax::bash_command)
+			.flatten()
+	{
+		return text;
+	}
+	if op.code == Opcode::CaseWord {
+		let mut text = b"case ".to_vec();
+		text.extend_from_slice(word_source(unit, op.a));
+		text.extend_from_slice(b" in ");
 		text
+	} else {
+		loop_header(unit, op)
+	}
+}
+
+/// `set -x`'s line for the head of `op` (a `ForIn` or `CaseWord`): bash
+/// prints the words `BASH_COMMAND` holds (`xtrace_print_for_command_head`
+/// and its kin), a `case` head without its last blank.
+fn traced_head(unit: &Unit, op: Op) -> Vec<u8> {
+	let mut text = head_text(unit, op);
+	if op.code == Opcode::CaseWord && text.last() == Some(&b' ') {
+		text.pop();
+	}
+	text
+}
+
+/// Trace the head of `op` (a bash `case` or `select`) before its words
+/// expand, as bash 5.3 does, and write it out at once: a substitution in
+/// the words runs in a child whose own trace must follow it. A write that
+/// would block leaves the line queued.
+fn trace_head_now(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, unit: &Unit, op: Op, line: u32) {
+	let body = traced_head(unit, op);
+	super::xtrace::emit(k, cx, vp, line, &body);
+	let _ = flush_out(k, vp);
+}
+
+/// `BASH_COMMAND` of the op at `pc` of `unit` ([`BashCommand::Op`]): the
+/// command or head as bash prints it ([`crate::bash::syntax::bash_command`]),
+/// an arith-for expression evaluated as written as `((…))`; a zsh unit's
+/// command, or one whose tree cannot be had, as its source text.
+pub(super) fn command_text(unit: &Unit, pc: u32) -> BString {
+	let Some(&op) = unit.ops.get(pc as usize) else {
+		return BString::default();
 	};
+	let text = match op.code {
+		Opcode::Arith => crate::bash::syntax::arith_command(&unit.ariths[op.a as usize]),
+		Opcode::CaseWord | Opcode::ForIn => head_text(unit, op),
+		// A `for` iteration: the head of its `ForIn`, the op before.
+		Opcode::ForNext => match pc.checked_sub(1).and_then(|at| unit.ops.get(at as usize)) {
+			Some(&forin) if forin.code == Opcode::ForIn => head_text(unit, forin),
+			_ => Vec::new(),
+		},
+		_ => {
+			let printed = if unit.mode.dialect() == Dialect::Bash {
+				unit
+					.with_command(op.node, crate::bash::syntax::bash_command)
+					.flatten()
+			} else {
+				None
+			};
+			match printed {
+				Some(text) => text,
+				None => return node_text(unit, op.node),
+			}
+		},
+	};
+	BString::from(text)
+}
+
+/// `set -x` for `(( … ))` and an arith-for expression: `(( text ))` of the
+/// expanded text (an empty arith-for one is `1`, lowered so).
+fn trace_arith(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32, text: &[u8]) {
 	let mut body = Vec::with_capacity(text.len() + 6);
 	body.extend_from_slice(b"(( ");
 	body.extend_from_slice(text);

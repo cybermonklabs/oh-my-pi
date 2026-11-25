@@ -229,6 +229,16 @@ impl Engine {
 			);
 			Self::share_syntax(&unit, &syntax);
 			(unit, None)
+		} else if !cc.source_replay
+			&& mode.dialect() == crate::bash::ids::Dialect::Bash
+			&& unit.kept_syntax.get().is_none()
+		{
+			// `BASH_COMMAND` is printed from the tree, and the source of a
+			// command an alias expanded in does not parse back to it.
+			let syntax =
+				crate::bash::trace::syntax::UnitSyntax::list(cc).with_context(mode, features.bits());
+			let _ = unit.kept_syntax.set(Some(Arc::new(syntax)));
+			(unit, None)
 		} else {
 			(unit, Some(cc.tree))
 		}

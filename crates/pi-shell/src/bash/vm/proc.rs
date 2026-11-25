@@ -100,17 +100,17 @@ pub struct Vproc {
 	pub subshell:      u32,
 	/// Loops of the shell that forked this vproc that its code runs inside
 	/// (bash's inherited `loop_level`, zsh's `loops`), set by
-	/// [`super::exec::fork_loops`]: a `break` or `continue` that reaches
+	/// [`super::exec::fork_state`]: a `break` or `continue` that reaches
 	/// past this vproc's own loops ends the vproc, as the end of its code
 	/// would. Zero for the shell itself and for a fork bash runs through
 	/// `execute_in_subshell`, which zeroes the level. A `u16` (saturating
 	/// past 65,535 loops) that shares `trap_frames`'s former 4 bytes, so
 	/// `Vproc` keeps its size.
 	pub outer_loops:   u16,
-	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
+	/// The command being run (`BASH_COMMAND`, [`BashCommand`]).
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
-	pub command:       Option<(Arc<Unit>, u32)>,
+	pub command:       Option<BashCommand>,
 	/// Pushes onto bash's call-stack arrays (`FUNCNAME`, `BASH_SOURCE`,
 	/// `BASH_LINENO`, `BASH_ARGC`, `BASH_ARGV`), oldest first; a subshell
 	/// starts with its parent's.
@@ -470,7 +470,7 @@ impl Vproc {
 }
 
 /// A set of trap keys ([`Vproc::own_traps`]): the pseudo-signals and the
-/// signals.
+/// signals; and one flag beside them, [`OwnTraps::trap_fork`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnTraps {
 	pseudo:  u8,
@@ -480,6 +480,9 @@ pub struct OwnTraps {
 impl OwnTraps {
 	/// The empty set.
 	pub const EMPTY: Self = Self { pseudo: 0, signals: SigSet::EMPTY };
+	/// The bit of [`OwnTraps::trap_fork`], above the pseudo-signals' (a spare
+	/// bit, so `Vproc` keeps its size).
+	const TRAP_FORK: u8 = 16;
 
 	const fn bit(key: crate::bash::store::TrapKey) -> u8 {
 		use crate::bash::store::TrapKey;
@@ -508,6 +511,28 @@ impl OwnTraps {
 			},
 			_ => Self { pseudo: self.pseudo | Self::bit(key), signals: self.signals },
 		}
+	}
+
+	/// Whether the vproc was forked by a trap action, or by such a fork,
+	/// without bash's `execute_in_subshell` (a command or process
+	/// substitution, a simple command as a pipeline element or job:
+	/// [`fork_state`]'s `keeps`). bash's fork copies `running_trap` and the
+	/// DEBUG trap's in-progress mark, so its commands keep the trapped
+	/// command as `BASH_COMMAND`.
+	///
+	/// [`fork_state`]: super::exec::fork_state
+	pub const fn trap_fork(self) -> bool {
+		self.pseudo & Self::TRAP_FORK != 0
+	}
+
+	/// The set with [`OwnTraps::trap_fork`] set to `on`.
+	pub const fn with_trap_fork(self, on: bool) -> Self {
+		let pseudo = if on {
+			self.pseudo | Self::TRAP_FORK
+		} else {
+			self.pseudo & !Self::TRAP_FORK
+		};
+		Self { pseudo, signals: self.signals }
 	}
 }
 
@@ -1058,16 +1083,34 @@ pub struct Coproc {
 	pub write: i32,
 }
 
+/// What `BASH_COMMAND` names (bash's `the_printed_command_except_trap`),
+/// printed when it is read. 16 bytes, as the `(unit, node)` pair it
+/// replaced: `Vproc` keeps its size.
+#[derive(Clone, Debug)]
+pub enum BashCommand {
+	/// The op at pc `.1` of the unit: a simple command's `Exec`, the `Enter`
+	/// of `[[ ]]` or `(( ))`, the head of a `for` iteration (`ForNext`), of a
+	/// `select` (`ForIn`) or a `case` (`CaseWord`), or an arith-for
+	/// expression evaluated as written (`Arith`, [`Op::LITERAL`]).
+	///
+	/// [`Op::LITERAL`]: crate::bash::ir::Op::LITERAL
+	Op(Arc<Unit>, u32),
+	/// An arith-for expression as expanded (bash prints it `((…))` after
+	/// expanding it, before its DEBUG trap).
+	Expanded(Box<BString>),
+}
+
 impl Vproc {
-	/// `BASH_COMMAND`: the source text of the current command.
-	pub fn command_text(&self) -> &[u8] {
-		self.command.as_ref().map_or(&[][..], |(unit, node)| {
-			unit
-				.nodes
-				.get(*node as usize)
-				.and_then(|n| unit.source.get(n.lo as usize..n.hi as usize))
-				.unwrap_or_default()
-		})
+	/// `BASH_COMMAND`: the current command as bash prints it
+	/// ([`BashCommand`]).
+	pub fn command_text(&self) -> BString {
+		match &self.command {
+			None => BString::default(),
+			Some(BashCommand::Expanded(expr)) => {
+				BString::from(crate::bash::syntax::arith_command(expr))
+			},
+			Some(BashCommand::Op(unit, pc)) => super::exec::command_text(unit, *pc),
+		}
 	}
 
 	pub const fn has_work(&self) -> bool {

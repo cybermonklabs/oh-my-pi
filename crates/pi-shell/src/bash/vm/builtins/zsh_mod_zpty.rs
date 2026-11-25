@@ -597,7 +597,7 @@ fn newptycmd(
 	// zsh's zpty child is not a subshell level of its own.
 	set_subshell_depth(&mut child, subshell_depth(ctx.vp));
 	// A fork: it keeps zsh's `loops` (a `break` there ends the command).
-	child.outer_loops = crate::bash::vm::exec::fork_loops(ctx.vp, true);
+	crate::bash::vm::exec::fork_state(&mut child, ctx.vp, true);
 	child.set_fork(if ctx.vp.fork().catches() {
 		Fork::SHELL
 	} else {

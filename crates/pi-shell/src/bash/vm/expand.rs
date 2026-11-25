@@ -3120,7 +3120,7 @@ fn dynamic_value(
 			DynVal::Str(BString::from(format!("{}.{:06}", w.secs, w.nanos / 1000)))
 		},
 		b"LINENO" => DynVal::Str(BString::from(line.format_into(&mut NumBuffer::new()))),
-		b"BASH_COMMAND" => DynVal::Str(BString::from(vp.command_text())),
+		b"BASH_COMMAND" => DynVal::Str(vp.command_text()),
 		b"BASH_CMDS" => DynVal::Assoc(hash_table(k, cx, vp, crate::bash::store::Table::CmdHash)?),
 		b"BASH_ALIASES" => DynVal::Assoc(hash_table(k, cx, vp, crate::bash::store::Table::Alias)?),
 		b"DIRSTACK" => DynVal::List(super::builtins::dirstack::dirstack_value(cx.store, vp)?),

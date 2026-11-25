@@ -64,7 +64,10 @@ pub use crate::bash::syntax::{
 	features::{AliasLookup, Features, NO_ALIASES, NoAliases},
 	json::to_json,
 	parser::{ParseError, ParseErrorKind, Parser, Resume, TextMode, parse_text},
-	print::{PrintStyle, command_string, print, print_function_as, print_list, word_text},
+	print::{
+		PrintStyle, arith_command, bash_command, command_string, print, print_function_as,
+		print_list, word_text,
+	},
 	span::{NodeId, Pos, Span},
 	tree::{
 		AndOr, ArithText, ArrayElem, Assign, AssignValue, Command, CommandKind, Cond, CondExpr,
