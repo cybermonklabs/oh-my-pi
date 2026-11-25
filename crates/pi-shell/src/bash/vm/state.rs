@@ -3212,6 +3212,8 @@ pub fn load_root(
 			.and_then(|s| parse(&s))
 			.unwrap_or(0),
 		subshell: false,
+		// No store record: the frames image keeps it.
+		stdin_redir: vp.jobs.stdin_redir,
 		bgp,
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);

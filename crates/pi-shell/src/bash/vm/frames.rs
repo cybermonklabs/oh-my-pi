@@ -41,7 +41,7 @@ use crate::bash::{
 	error::{ExtError, Incompatibility, RestoreError},
 	event::{EventData, EventMask, OriginChain, WaitKey},
 	fd::{FdOrigin, FdRef, FdTable},
-	fs::FileKind,
+	fs::{FileKind, FsPoll, OpenFlags},
 	host::{Host, StdFd},
 	ids::{CallId, ModeId, RunId, UnitId, Vpid},
 	image::ImageDiff,
@@ -58,7 +58,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 39;
+pub const FRAMES_VERSION: u32 = 40;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -126,6 +126,9 @@ enum FdObjImage {
 	Lost(FdOrigin),
 	/// Closed.
 	Closed,
+	/// The shell's shared `/dev/null` ([`Kernel::dev_null`]; read-write if
+	/// `rw`), opened again through the host's filesystem.
+	DevNull { rw: bool },
 }
 
 /// Numbers the fd and memory objects of an image, once each.
@@ -135,6 +138,9 @@ struct FdImager {
 	by_obj: HashMap<usize, u32>,
 	mems:   Vec<MemImage>,
 	by_mem: HashMap<usize, u32>,
+	/// Identities of the kernel's two shared `/dev/null` objects, imaged
+	/// as [`FdObjImage::DevNull`] (not lost).
+	nulls:  [Option<usize>; 2],
 }
 
 impl FdImager {
@@ -152,13 +158,17 @@ impl FdImager {
 				m.image().map(|img| (self.mem(key, || img), end))
 			})
 			.flatten();
-		let img = match (mem, h.origin(), h.kind()) {
-			(Some((obj, end)), ..) => FdObjImage::Mem { obj, end },
-			(None, FdOrigin::Std(s), _) => FdObjImage::Std(s),
-			(None, FdOrigin::Host, Some(kind)) => FdObjImage::Host(kind),
-			(None, FdOrigin::Mem, Some(kind)) if h.is_os_pipe() => FdObjImage::Host(kind),
-			(None, origin @ (FdOrigin::Host | FdOrigin::Mem), _) => FdObjImage::Lost(origin),
-			(None, FdOrigin::Closed, _) => FdObjImage::Closed,
+		let img = if let Some(slot) = self.nulls.iter().position(|k| *k == Some(h.key())) {
+			FdObjImage::DevNull { rw: slot == 1 }
+		} else {
+			match (mem, h.origin(), h.kind()) {
+				(Some((obj, end)), ..) => FdObjImage::Mem { obj, end },
+				(None, FdOrigin::Std(s), _) => FdObjImage::Std(s),
+				(None, FdOrigin::Host, Some(kind)) => FdObjImage::Host(kind),
+				(None, FdOrigin::Mem, Some(kind)) if h.is_os_pipe() => FdObjImage::Host(kind),
+				(None, origin @ (FdOrigin::Host | FdOrigin::Mem), _) => FdObjImage::Lost(origin),
+				(None, FdOrigin::Closed, _) => FdObjImage::Closed,
+			}
 		};
 		let i = self.objs.len() as u32;
 		self.objs.push(img);
@@ -188,12 +198,43 @@ struct FdRebuild<'s> {
 	mems:  Vec<MemObj>,
 	built: Vec<Option<FdRef>>,
 	stdio: &'s mut [Option<FdRef>; 3],
+	/// The kernel's shared `/dev/null` objects ([`Kernel::dev_null`]), opened
+	/// again on first use (a restore's kernel is new and holds none). Only
+	/// an open object is kept: the kernel takes these back, and a later job
+	/// opens `/dev/null` anew where the restore could not.
+	nulls: [Option<FdRef>; 2],
 }
 
 impl FdRebuild<'_> {
 	/// Fd object `i`.
 	fn fd(&mut self, host: &mut dyn Host, i: u32) -> FdRef {
+		if let Some(&FdObjImage::DevNull { rw }) = self.objs.get(i as usize) {
+			if let Some(Some(h)) = self.built.get(i as usize) {
+				return h.clone();
+			}
+			let slot = &mut self.nulls[usize::from(rw)];
+			if slot.is_none() {
+				*slot = reopen_null(host, rw);
+			}
+			// Not reopened: lost (an external reads it as the null device),
+			// and reported by the restore ([`Self::lost_null`]).
+			let h = slot.clone().unwrap_or_else(|| FdRef::lost(FdOrigin::Host));
+			if let Some(built) = self.built.get_mut(i as usize) {
+				*built = Some(h.clone());
+			}
+			return h;
+		}
 		self.build(i, |s| host.stdio(s))
+	}
+
+	/// Whether fd object `i` is a shared `/dev/null` the restore could not
+	/// open again (after [`Self::fd`] built it).
+	fn lost_null(&self, i: u32) -> bool {
+		matches!(self.objs.get(i as usize), Some(FdObjImage::DevNull { .. }))
+			&& self
+				.built
+				.get(i as usize)
+				.is_some_and(|h| h.as_ref().is_some_and(|h| !h.is_open()))
 	}
 
 	/// Fd object `i`; a standard stream comes from `stream` (once).
@@ -224,6 +265,9 @@ impl FdRebuild<'_> {
 				.map_or_else(|| FdRef::lost(FdOrigin::Mem), FdRef::mem),
 			Some(FdObjImage::Lost(origin)) => FdRef::lost(*origin),
 			Some(FdObjImage::Closed) | None => FdRef::closed(),
+			// Built without a host: lost, which an external reads as the
+			// null device.
+			Some(FdObjImage::DevNull { .. }) => FdRef::lost(FdOrigin::Host),
 		};
 		if let Some(slot) = self.built.get_mut(i) {
 			*slot = Some(h.clone());
@@ -255,6 +299,21 @@ impl FdRebuild<'_> {
 	}
 }
 
+/// The shared `/dev/null` ([`Kernel::dev_null`], `rw`: read-write), opened
+/// again for a restore. A restore cannot wait: `None` when the host's
+/// filesystem does not answer at once or the open fails.
+fn reopen_null(host: &mut dyn Host, rw: bool) -> Option<FdRef> {
+	let flags = if rw {
+		OpenFlags::READ.with(OpenFlags::WRITE)
+	} else {
+		OpenFlags::READ
+	};
+	match host.fs().open(BStr::new(b"/dev/null"), flags, 0) {
+		FsPoll::Ready(Ok(file)) => Some(FdRef::open(file, FdOrigin::Host)),
+		_ => None,
+	}
+}
+
 /// One vproc. The fields in [`Fields`] are the root vproc's store records
 /// (`state::sync_root`), so the root's image has none.
 #[derive(Serialize, Deserialize)]
@@ -274,6 +333,9 @@ struct ProcImage {
 	/// This vproc's EXIT trap has already been started (a forked subshell
 	/// has no `Run` to keep the flag on).
 	exit_trap_run: bool,
+	/// bash's `stdin_redir` (`JobTable::stdin_redir`; not in `Fields`, so
+	/// the root vproc keeps it too).
+	stdin_redir:   bool,
 	procsubs:      Vec<(u32, i32)>,
 	coprocs:       Vec<super::proc::Coproc>,
 	restore_opts:  Vec<BString>,
@@ -587,7 +649,14 @@ impl Shell {
 		}
 		let mut procs = Vec::with_capacity(self.procs.len());
 		let mut runs = Vec::new();
-		let mut fds = FdImager::default();
+		// The kernel's shared `/dev/null`s are carried (opened again on
+		// restore), not lost.
+		let nulls = self
+			.k
+			.dev_null
+			.each_ref()
+			.map(|h| h.as_ref().map(FdRef::key));
+		let mut fds = FdImager { nulls, ..FdImager::default() };
 		for (p, diff) in self.procs.iter_mut().zip(&mut diffs) {
 			let mut frames = Vec::with_capacity(p.frames.len());
 			for f in &mut p.frames {
@@ -640,6 +709,7 @@ impl Shell {
 			}
 			for (fd, h) in p.fds.iter() {
 				if (h.origin() == FdOrigin::Host || h.is_os_pipe())
+					&& !nulls.contains(&Some(h.key()))
 					&& let Some(kind) = h.kind()
 				{
 					report.lost.push(Lost::Fd { vpid: p.vpid, fd, kind });
@@ -686,6 +756,7 @@ impl Shell {
 				stopped: p.stopped,
 				transient: p.transient,
 				exit_trap_run: p.exit_trap_run,
+				stdin_redir: p.jobs.stdin_redir,
 				procsubs: p.procsubs.clone(),
 				coprocs: p.coprocs.clone(),
 				restore_opts: p.restore_opts.clone(),
@@ -919,6 +990,7 @@ impl Shell {
 				.collect(),
 			built,
 			stdio,
+			nulls: [None, None],
 		};
 		// The root's global state as saved: a forked vproc's image is what
 		// it changed from it.
@@ -933,6 +1005,11 @@ impl Shell {
 						report.lost.push(Lost::Fd { vpid, fd: fd as i32, kind });
 					}
 					fds.set(fd as i32, Some(objs.fd(cx.host, obj)));
+					if objs.lost_null(obj) {
+						report
+							.lost
+							.push(Lost::Fd { vpid, fd: fd as i32, kind: FileKind::Device });
+					}
 				}
 			}
 			let mut vp = if let Some(f) = p.fields {
@@ -960,6 +1037,7 @@ impl Shell {
 			vp.pending_traps = p.pending_traps;
 			vp.stopped = p.stopped;
 			vp.exit_trap_run = p.exit_trap_run;
+			vp.jobs.stdin_redir = p.stdin_redir;
 			vp.procsubs = p.procsubs;
 			vp.coprocs = p.coprocs;
 			vp.restore_opts = p.restore_opts;
@@ -1183,6 +1261,7 @@ impl Shell {
 			}
 			procs.push(Box::new(vp));
 		}
+		k.dev_null = objs.nulls;
 		if procs.is_empty() {
 			self.procs.push(loaded);
 			return Ok(());
@@ -1498,8 +1577,38 @@ fn valid(u: &Unit) -> bool {
 mod tests {
 	use std::task::{Context, Poll, Waker};
 
-	use super::{FdImager, FdRebuild};
-	use crate::bash::{fd::FdRef, mem::MemObj};
+	use super::{FdImager, FdObjImage, FdRebuild};
+	use crate::{
+		bash::{fd::FdRef, mem::MemObj},
+		testkit::{FakeHost, FaultKind, MemFs},
+	};
+
+	/// A restore that cannot open the shared `/dev/null` again (its
+	/// filesystem answers later, or fails) leaves the job's fd lost and keeps
+	/// nothing for the kernel, so a later job opens `/dev/null` anew; one it
+	/// can open is kept.
+	#[test]
+	fn a_dev_null_a_restore_cannot_open_is_lost_and_not_kept() {
+		for (what, fs, opened) in [
+			("answered later", MemFs::with_latency(1, 1.0, 1), false),
+			("failed", MemFs::new().with_faults(1.0, &[FaultKind::Eio]), false),
+			("opened", MemFs::new(), true),
+		] {
+			let mut host = FakeHost::new().with_fs(fs);
+			let mut stdio = [None, None, None];
+			let mut back = FdRebuild {
+				objs:  vec![FdObjImage::DevNull { rw: false }],
+				mems:  Vec::new(),
+				built: vec![None],
+				stdio: &mut stdio,
+				nulls: [None, None],
+			};
+			let h = back.fd(&mut host, 0);
+			assert_eq!(h.is_open(), opened, "{what}: the job's fd 0");
+			assert_eq!(back.nulls[0].is_some(), opened, "{what}: kept for the kernel");
+			assert!(back.nulls[0].as_ref().is_none_or(FdRef::is_open), "{what}: a lost one kept");
+		}
+	}
 
 	#[test]
 	fn a_pipe_and_its_shared_ends_survive_an_image() {
@@ -1525,6 +1634,7 @@ mod tests {
 				.map(|m| MemObj::rebuild(m, Waker::noop()))
 				.collect(),
 			stdio: &mut stdio,
+			nulls: [None, None],
 		};
 		let [r, w, w_again, w2] = ids.map(|i| back.build(i, |_| None));
 		// The rebuild table holds every built fd until restore ends.
@@ -1562,7 +1672,13 @@ mod tests {
 		// names the kind of the object the image held.
 		let mut stdio = [None, None, None];
 		let built = vec![None; img.objs.len()];
-		let rebuild = FdRebuild { objs: img.objs, mems: Vec::new(), built, stdio: &mut stdio };
+		let rebuild = FdRebuild {
+			objs: img.objs,
+			mems: Vec::new(),
+			built,
+			stdio: &mut stdio,
+			nulls: [None, None],
+		};
 		assert_eq!(rebuild.host_kind(ids[0]), Some(FileKind::Pipe), "the read end is reported lost");
 		assert_eq!(rebuild.host_kind(ids[1]), Some(FileKind::Pipe), "the write end is reported lost");
 		assert_eq!(rebuild.host_kind(ids[2]), None, "a memory pipe is rebuilt, not lost");

@@ -15,6 +15,7 @@ fn fixtures(sub: &str) -> PathBuf {
 	Path::new("crates/pi-shell/src/testkit/fixtures").join(sub)
 }
 
+mod background_stdin;
 mod bang_pid;
 mod cancel_latency;
 mod cancel_traps;

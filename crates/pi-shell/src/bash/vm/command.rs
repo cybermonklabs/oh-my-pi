@@ -203,11 +203,15 @@ pub fn exec(
 	// alone: a block ended the slice (`run_slice` starts stale), and a called
 	// frame's ops kept it current, so a `FuncExit` shares the reading of the
 	// function's last `CmdEnd`.
+	// A lone simple background command whose `/dev/null` is still to come
+	// takes the stages: the fast paths skip the redirection stage that
+	// places it ([`exec::deferred_job_null`]).
 	if vp
 		.frames
 		.last()
 		.and_then(|f| f.scratch.as_ref())
 		.is_none_or(|s| s.exec.is_none())
+		&& !exec::deferred_null_due(vp)
 		&& let Some(flow) = assignment_statement(k, vp, cx, unit, op, line)
 			.or_else(|| plain_statement(k, vp, cx, unit, op, line))
 	{
@@ -288,6 +292,11 @@ pub fn exec(
 				s.stage = Stage::Lookup;
 			},
 			Stage::Redirect => {
+				// A lone simple background command's `/dev/null` comes now,
+				// its words expanded (bash `execute_disk_command`).
+				if let Some(flow) = exec::deferred_job_null(k, vp, cx, line) {
+					return flow;
+				}
 				let bash = unit.mode.dialect() == crate::bash::ids::Dialect::Bash;
 				// bash looks the name up in the shell (hashing it) before it
 				// makes any of the command's redirections: a program's are then
