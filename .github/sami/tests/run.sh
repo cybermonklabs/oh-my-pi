@@ -1476,6 +1476,8 @@ prun() {
 		printf '[package]\nname = "demo"\n' >crates/demo/Cargo.toml
 		printf '[package]\nname = "x"\n' >sdk/rust/x/Cargo.toml
 		printf '# list\n%s\n' "${PARITY_WS:-sdk/rust/x/Cargo.toml  standalone}" >.github/sami/rust-test-cargo-workspaces.txt
+		printf '# list\n%s\n' "${PARITY_UNTESTED:-# none}" >.github/sami/rust-test-untested-manifests.txt
+		if [ -n "${PARITY_FIXTURE:-}" ]; then mkdir -p "$(dirname "$PARITY_FIXTURE")" && printf '[package]\nname = "fixture"\n\n[workspace]\n' >"$PARITY_FIXTURE"; fi
 		{ echo '# sanctioned'; [ -n "${PARITY_SANCTIONED:-}" ] && printf '%s  ruling\n' "$PARITY_SANCTIONED"; [ -n "${PARITY_SANCTIONED_LINE:-}" ] && printf '%s\n' "$PARITY_SANCTIONED_LINE"; } >.github/sami/rust-test-sanctioned-skips.txt
 		git init -q . && git add -A && git -c user.email=h@example.invalid -c user.name=harness commit -qm fixture
 	) || { verdict "$name" "$want" 97 "$msg" "could not make the fixture repository"; return 0; }
@@ -1515,7 +1517,16 @@ $DOCT
 $(rule rust_test //crates/demo:other_test "$(strs srcs //crates/demo:tests/other.rs)")"
 prun P3-doctest-missing 1 "demo's doctest target demo \\(crates/demo/src/lib.rs\\) has no Bazel rust_doc_test" "$LIB
 $(rule rust_test //crates/demo:demo_test "$(str crate //crates/demo:demo)")"
-PARITY_WS='# none' prun P4-cargo-toml-unlisted 1 'sdk/rust/x/Cargo.toml is outside the root workspace and not in' "$(covered)"
+PARITY_WS='# none' prun P4-cargo-toml-unlisted 1 'sdk/rust/x/Cargo.toml is outside the root workspace and in neither' "$(covered)"
+# A manifest outside the root workspace whose tests no job runs, on purpose,
+# is in rust-test-untested-manifests.txt (P14; without its line it fails as
+# P4 does, P15); a line naming no tracked Cargo.toml (P16), one naming the
+# root workspace's (P17), and a manifest in both lists (P18) fail.
+PARITY_FIXTURE=.github/platform-checks/fixture/Cargo.toml PARITY_UNTESTED='.github/platform-checks/fixture/Cargo.toml  the tool fixture' NOT_MSG='and in neither' prun P14-untested-manifest-listed 0 'Cargo manifests: 4 tracked, 0 outside the root workspace and unlisted' "$(covered)"
+PARITY_FIXTURE=.github/platform-checks/fixture/Cargo.toml prun P15-untested-manifest-unlisted 1 '.github/platform-checks/fixture/Cargo.toml is outside the root workspace and in neither' "$(covered)"
+PARITY_UNTESTED='.github/platform-checks/fixture/Cargo.toml  the tool fixture' prun P16-untested-line-names-no-manifest 1 '.github/platform-checks/fixture/Cargo.toml is in .github/sami/rust-test-untested-manifests.txt, but the tree under test tracks no such Cargo.toml' "$(covered)"
+PARITY_UNTESTED='crates/demo/Cargo.toml  a root member' prun P17-untested-line-names-a-root-member 1 'crates/demo/Cargo.toml is in .github/sami/rust-test-untested-manifests.txt, but it is the root workspace.s' "$(covered)"
+PARITY_UNTESTED='sdk/rust/x/Cargo.toml  both' prun P18-manifest-in-both-lists 1 'sdk/rust/x/Cargo.toml is in both' "$(covered)"
 prun P5-skip-covered-by-another-target 0 "Skips in test targets' args: 1, 0 run nowhere" "$(covered "$(strs args --skip ::slow::)")
 $(rule native_test //crates/demo:slow_test "$(str src //crates/demo:demo_test)" "$(strs args ::slow::)")"
 prun P6-skip-uncovered 1 "//crates/demo:demo_test's args skip ::slow::, and no other test target of that binary runs it" "$(covered "$(strs args --skip ::slow::)")"
