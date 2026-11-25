@@ -31,7 +31,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { extractSessionInit, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { ModelMentionRegistry } from "@oh-my-pi/pi-coding-agent/session/model-mentions";
 import {
 	findRetryFallbackCandidates,
@@ -2740,10 +2740,13 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		expect(coldRevivers.count).toBe(1);
 	});
 
-	// If this regresses, a subagent whose transcript holds another subagent's spawn spec (a seance consult's
-	// transcript is a copy of its source's, which can be another subagent's) comes back warm as that other
-	// subagent: on its spec, with its prompt and its tools.
-	it("revives cold, never warm from another subagent's spawn spec its transcript holds", async () => {
+	// If this regresses, a subagent whose transcript holds another subagent's spawn spec comes back as that other
+	// subagent: on its spec, with its prompt and its tools. A transcript holds one only before its own newest
+	// session_init: a seance fork keeps its source's session_init only as an inert `source_session_init` entry
+	// (`SessionManager.forkFrom`), a `/tan` clone's plain fork keeps its source's and appends its own after it, the
+	// own one a consult or a clone writes holds no spawn spec, and every later session_init copies the newest. So a
+	// revive reads the newest session_init, never an older one's spec.
+	it("revives as itself, never from another subagent's spawn spec its transcript holds", async () => {
 		const sourceCwd = makeTempDir("@pi-revive-foreign-source-");
 		await spawn(sourceCwd, subagentPrompt, spawnResponses(), undefined, undefined, undefined, "source charter");
 		await AgentLifecycleManager.global().park("prompt-blocks");
@@ -2757,21 +2760,27 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		const spawned = await spawn(cwd, subagentPrompt, spawnResponses());
 		const lifecycle = AgentLifecycleManager.global();
 		const coldRevivers = countColdRevivers(lifecycle, cwd);
-		// The source's session_init, copied in as a fork of its transcript copies it: the newest holds its spec.
-		spawned.session.sessionManager.appendSessionInit({
+		const manager = spawned.session.sessionManager;
+		const own = extractSessionInit(manager.getEntries());
+		if (!own) throw new Error("Expected the subagent's own session_init");
+		// The source's session_init as a plain fork keeps it, and as a seance fork keeps it inert.
+		manager.appendSessionInit({
 			systemPrompt: sourceInit.systemPrompt as string[],
 			task: sourceInit.task as string,
 			tools: sourceInit.tools as string[],
 			spawnSpec: sourceSpec as unknown as SubagentSpawnSpec,
 		});
+		manager.appendCustomEntry("source_session_init", sourceInit);
+		// Then its own, newest and without a spawn spec, as a seance consult's or a `/tan` clone's spawn writes it.
+		manager.appendSessionInit({ ...own, spawnSpec: undefined });
 		await lifecycle.park("prompt-blocks");
+		// The newest spec the transcript holds is the source's: a revive that took it would come back as the source.
 		expect((await reviveRecords(cwd)).at(-1)).toEqual(sourceSpec);
 
+		// The newest session_init holds no spec, so the warm revive goes cold, and the cold revive replays its own prompt.
 		const revive = stubColdRevive();
 		const revived = localSession(await lifecycle.ensureLive("prompt-blocks"));
-		const cold = revive.recording;
-		if (!cold || revived !== cold.session) throw new Error("Expected a cold revive through the lifecycle");
-		// Its own working directory, through the cold reviver: the warm revive refused a spec its park never wrote.
+		await expectColdReplay(revive, revived, spawned);
 		expect(revive.cwd).toBe(cwd);
 		expect(coldRevivers.count).toBe(1);
 	});

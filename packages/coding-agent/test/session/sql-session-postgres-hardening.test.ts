@@ -441,6 +441,36 @@ interface NoCreateLogin extends AsyncDisposable {
 }
 
 let noCreateDatabases = 0;
+let scratchDatabases = 0;
+
+/**
+ * A database of its own on the same server, for a test that plants objects in `public` under names
+ * nothing can suffix: `public.*(numeric,integer)`, `public.=(oid,regclass)`, `public.convert_to` and
+ * `public.substr` must be exactly the names the store's statements would meet. In a database shared
+ * with other test workers, their own unqualified SQL (the lease fixture's
+ * `extract(epoch from clock_timestamp()) * 1000`, an `oid = regclass` compare) runs those objects and
+ * writes the planting test's log, and two workers planting them at once collide on the name.
+ */
+async function scratchDatabase(label: string): Promise<{ url: string } & AsyncDisposable> {
+	const database = `omp_${label}_${process.pid}_${scratchDatabases++}`;
+	const admin = new SQL(pgUrl ?? "");
+	const url = new URL(pgUrl ?? "");
+	url.pathname = `/${database}`;
+	await admin.unsafe(`CREATE DATABASE ${database}`);
+	return {
+		url: url.toString(),
+		async [Symbol.asyncDispose]() {
+			try {
+				await admin.unsafe(
+					`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${database}' AND pid <> pg_backend_pid()`,
+				);
+				await admin.unsafe(`DROP DATABASE IF EXISTS ${database}`);
+			} finally {
+				await admin.end();
+			}
+		},
+	};
+}
 
 /**
  * A database where the tables' owner (the test's own login) made the store's
@@ -725,7 +755,10 @@ describe.skipIf(!pgUrl)("SqlSessionStorage start-up on PostgreSQL", () => {
 
 describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects", () => {
 	it("never runs a function or an operator another login planted in public", async () => {
-		await using db = await openLeaseDb("postgres", pgUrl ?? "");
+		// Its own database: the planted names are the ones every login's statements meet, so another
+		// worker sharing this server neither runs them nor plants them again.
+		await using scratch = await scratchDatabase("planted");
+		await using db = await openLeaseDb("postgres", scratch.url);
 		const attacker = `shadow_attacker_${process.pid}`;
 		const log = `public.shadow_log_${process.pid}`;
 		await db.sql(`CREATE TABLE ${log} (what TEXT)`);
