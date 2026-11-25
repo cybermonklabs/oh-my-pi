@@ -1448,7 +1448,7 @@ describe("batch model placement", () => {
 	//
 	// It is upstream's, not this member's. The same probe at pristine upstream main
 	// 7027a619a41c1eccdae6a5f07de91c43e2a487e3, with no fork code present, returns the same arguments
-	// without `model`. The probe and both measurements are in the fork's history.
+	// without `model`.
 	// Un-skip this test with the fix; do not re-aim it at the guarantee that happens to hold.
 	it.skip("keeps a repaired batch item's real model, so the disabled gate still refuses it", async () => {
 		mockDiscovery();
