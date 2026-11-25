@@ -772,6 +772,13 @@ impl Shell {
 			shell.lose_running(cx, &mut report)?;
 		}
 		shell.k.sync_root(cx.store, &shell.procs[0]);
+		// bash's `set -m` in a script comes back with its option (the job
+		// control state is not imaged); the groups of the jobs from before
+		// the restore are not known.
+		let monitor = crate::bash::store::OptId::Monitor;
+		if state::option(&mut shell.k.root, cx.store, &shell.procs[0], monitor).unwrap_or(false) {
+			super::jobctl::set_monitor(&mut shell.k, cx, &shell.procs[0], true);
+		}
 		if let Some(err) = shell.k.root.take_fault() {
 			return Err(RestoreError::Store(err));
 		}
