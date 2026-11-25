@@ -5210,6 +5210,24 @@ fn set_m_kill_of_a_jobs_group_reaches_its_shell_code() {
 			"kill=0\nst=137\n",
 			false,
 		),
+		// The same `KILL` after a `HUP` by pid, on a stopped pipeline job:
+		// the `HUP` is held in every stage, and `kill -KILL %1` still ends
+		// the job with 137 (without the `KILL` step a continued stage took
+		// its held `HUP` first: 129). The row waits until every process of
+		// the job's group is gone (`kill -0 -- -PGID` fails, the group from
+		// `jobs -p %1`), as bash, before it has reaped the first stage, can
+		// still list the job stopped (`st=147`, 1 to 4 runs in 16 per cell
+		// with a wait on `$!` alone; 0 of 64 with this wait).
+		(
+			format!(
+				"set -m; ( while :; do /bin/sleep 0.2; done ) | ( while :; do /bin/sleep 0.2; done ) \
+				 & /bin/sleep 0.5; jobs -p %1 >\"$F.pg\"; read pg <\"$F.pg\"; kill -STOP %1; \
+				 {job_stopped}; kill -HUP $!; echo kill=$?; /bin/sleep 0.3; kill -KILL %1; until ! \
+				 kill -0 -- -$pg 2>/dev/null; do {bound}; done; wait $!; echo st=$?"
+			),
+			"kill=0\nst=137\n",
+			false,
+		),
 	];
 	let dir = tempfile::tempdir().expect("a directory for the script and the output");
 	for form in Form::BOTH {

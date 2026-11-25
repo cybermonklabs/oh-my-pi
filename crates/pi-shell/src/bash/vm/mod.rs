@@ -3283,6 +3283,15 @@ impl Shell {
 				continue;
 			}
 			let terminating = trap.is_none() && sig.default_action() == DefaultAction::Terminate;
+			// `KILL` is never ordered behind pending signals (the kernel ends
+			// the process at once): the ends a stopped vproc held go with it.
+			// Needed before the vproc is continued below: a stage of a stopped
+			// pipeline that holds a signal sent by pid would else take it
+			// once continued, before `KILL`'s status lands.
+			if sig == Signal::Kill {
+				let vpid = self.procs[i].vpid;
+				self.k.held_ends.retain(|&(v, ..)| v != vpid);
+			}
 			let dialect = self.procs[i].mode.dialect();
 			let bash = dialect == crate::bash::ids::Dialect::Bash;
 			// Whether the signal continues a stopped vproc: `KILL` ends it in
