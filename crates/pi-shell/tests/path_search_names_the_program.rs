@@ -207,3 +207,165 @@ fn a_hashed_entry_is_read_from_the_current_directory() {
 		),
 	]);
 }
+
+/// `exec` of a program the hash table gave from a relative entry names it
+/// as bash's `full_pathname` does: the working directory, `/` and the
+/// entry less one leading `./` (bash 5.3.20; the review's rows y1, y2,
+/// y3, y5, y19 for the entry `./bin/u`, and y25: only one leading `./` goes).
+#[test]
+fn exec_of_a_hashed_relative_entry_names_its_full_path() {
+	check(&[
+		(
+			r#"mkdir bin; printf "echo \$0\n" > bin/u; chmod +x bin/u; PATH=bin:$PATH; u >/dev/null; exec u"#,
+			"D/bin/u\n",
+			"",
+			0,
+		),
+		(
+			r#"printf "echo \$0\n" > s; chmod +x s; mkdir sub; cd sub; PATH=..:$PATH; s >/dev/null; exec s"#,
+			"D/sub/../s\n",
+			"",
+			0,
+		),
+		(
+			r#"mkdir bin; printf "echo \$0\n" > bin/u; chmod +x bin/u; PATH=bin:$PATH; u >/dev/null; chmod -x bin/u; exec u"#,
+			"",
+			"PFX: line 1: D/bin/u: Permission denied\n",
+			126,
+		),
+		(
+			r#"mkdir bin; printf "echo \$0\n" > bin/u; chmod +x bin/u; hash -p bin/u u; exec u"#,
+			"D/bin/u\n",
+			"",
+			0,
+		),
+		(
+			r#"mkdir bin; printf "echo \$0\n" > bin/u; chmod +x bin/u; PATH=./bin:$PATH; u >/dev/null; exec u"#,
+			"D/bin/u\n",
+			"",
+			0,
+		),
+		(
+			r#"mkdir bin; printf "echo \$0\n" > bin/u; chmod +x bin/u; hash -p ././bin/u u; exec u"#,
+			"D/./bin/u\n",
+			"",
+			0,
+		),
+	]);
+}
+
+/// A search that tries the hashed file first (`checkhash`) names the file
+/// by what found it: the hash table's entry when it is that file, the
+/// `$PATH` entry when the hashed file is gone and the search goes on
+/// (bash 5.3.20, row y21).
+#[test]
+fn a_checkhash_search_names_the_file_by_what_found_it() {
+	check(&[(
+		r#"mkdir bin; printf "echo \$0\n" > bin/u; chmod +x bin/u; mkdir m; printf "echo \$0\n" > m/u; chmod +x m/u; shopt -s checkhash; PATH=bin:m:$PATH; u; rm bin/u; u"#,
+		"bin/u\nm/u\n",
+		"",
+		0,
+	)]);
+}
+
+/// `exec` of a program a relative `$PATH` entry found names it by its full
+/// path, one leading `./` dropped, also after a first run hashed it as
+/// `./s` (bash 5.3.20; the review's rows n2, n15, n17, x45, x10, and y26:
+/// only one leading `./` goes).
+#[test]
+fn exec_of_a_relative_find_names_its_full_path() {
+	check(&[
+		(r#"printf "echo \$0\n" > s; chmod +x s; PATH=.:$PATH; exec s"#, "D/s\n", "", 0),
+		(r": > f; PATH=.:$PATH; exec f", "", "PFX: line 1: D/f: Permission denied\n", 126),
+		(r##"printf "#!/bin/sh\necho \$0\n" > t; chmod +x t; PATH=.:$PATH; exec t"##, "D/t\n", "", 0),
+		(
+			r#"mkdir bin; printf "echo \$0\n" > bin/u; chmod +x bin/u; PATH=./bin:$PATH; exec u"#,
+			"D/bin/u\n",
+			"",
+			0,
+		),
+		(r#"printf "echo \$0\n" > s; chmod +x s; PATH=.:$PATH; s; exec s"#, "./s\nD/s\n", "", 0),
+		(
+			r#"mkdir bin; printf "echo \$0\n" > bin/u; chmod +x bin/u; PATH=././bin:$PATH; exec u"#,
+			"D/./bin/u\n",
+			"",
+			0,
+		),
+	]);
+}
+
+/// `hash -t` reads an entry whose `./entry` is not executable as the entry
+/// itself (bash 5.3.20; the review's row n27).
+#[test]
+fn hash_t_of_a_non_executable_entry_reads_the_entry() {
+	check(&[(
+		r#"mkdir bin; printf "echo \$0\n" > bin/u; chmod +x bin/u; PATH=bin:$PATH; u; chmod -x bin/u; u; echo "st=$?"; hash -t u"#,
+		"bin/u\nst=126\nbin/u\n",
+		"PFX: line 1: bin/u: Permission denied\n",
+		0,
+	)]);
+}
+
+/// `type` and `command -v` of two hashed names count one hit each, as
+/// bash's `phash_search` does per lookup (bash 5.3.20; the review's row
+/// y9).
+#[test]
+fn type_of_two_names_counts_one_hit_each() {
+	check(&[(
+		r#"mkdir bin; printf "echo \$0\n" > bin/u; printf "echo \$0\n" > bin/v; chmod +x bin/u bin/v; PATH=bin:$PATH; hash -r; u; v; type u v; command -v u v; hash"#,
+		"bin/u\nbin/v\nu is hashed (./bin/u)\nv is hashed \
+		 (./bin/v)\n./bin/u\n./bin/v\nhits\tcommand\n   3\tbin/v\n   3\tbin/u\n",
+		"",
+		0,
+	)]);
+}
+
+/// `type -P` reads the hash table and counts the hit, `type -a` lists every
+/// meaning without reading it and counts none, as bash's `describe_command`
+/// does (bash 5.3.20, rows y23 and y24).
+#[test]
+fn type_p_counts_a_hit_and_type_a_none() {
+	check(&[
+		(
+			r#"mkdir bin; printf "echo \$0\n" > bin/u; printf "echo \$0\n" > bin/v; chmod +x bin/u bin/v; PATH=bin:$PATH; hash -r; u; v; type -P u v; hash"#,
+			"bin/u\nbin/v\n./bin/u\n./bin/v\nhits\tcommand\n   2\tbin/v\n   2\tbin/u\n",
+			"",
+			0,
+		),
+		(
+			r#"mkdir bin; printf "echo \$0\n" > bin/u; printf "echo \$0\n" > bin/v; chmod +x bin/u bin/v; PATH=bin:$PATH; hash -r; u; v; type -a u v >/dev/null; hash"#,
+			"bin/u\nbin/v\nhits\tcommand\n   1\tbin/v\n   1\tbin/u\n",
+			"",
+			0,
+		),
+	]);
+}
+
+/// An assignment to `PATH` empties the hash table, one that changes the
+/// variable in place included, and so does the end of a function whose
+/// `local PATH` goes away: the next command is searched with the `PATH`
+/// in effect, so the new program runs (bash's `sv_path`; bash 5.3.20, rows
+/// f1, f2 and f9). `m/u` prints `new`, `bin/u` prints `old`.
+#[test]
+fn a_path_assignment_empties_the_hash_table() {
+	check(&[
+		(
+			r#"mkdir m bin; printf "echo new\n" > m/u; chmod +x m/u; printf "echo old\n" > bin/u; chmod +x bin/u; PATH=bin:$PATH; u; PATH=$PWD/m:$PATH; u"#,
+			"old\nnew\n",
+			"",
+			0,
+		),
+		(
+			r#"mkdir m bin; printf "echo new\n" > m/u; chmod +x m/u; printf "echo old\n" > bin/u; chmod +x bin/u; export PATH=bin:$PATH; u; export PATH=$PWD/m:$PATH; u"#,
+			"old\nnew\n",
+			"",
+			0,
+		),
+		(
+			r#"mkdir m bin; printf "echo new\n" > m/u; chmod +x m/u; printf "echo old\n" > bin/u; chmod +x bin/u; f() { local PATH=$PWD/m:$PATH; u; }; PATH=bin:$PATH; u; f; u"#,
+			"old\nnew\nold\n",
+			"",
+			0,
+		),
+	]);
+}

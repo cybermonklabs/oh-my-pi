@@ -566,6 +566,15 @@ fn set_value_plain(
 		return Ok(());
 	}
 	let Some(value) = assign_in_place(k, cx, vp, lhs, value, level)? else {
+		// bash's `sv_path` (`phash_flush`): an assignment to `PATH` empties
+		// the command hash table, an in-place one included, so the next
+		// command is searched again (`PATH=$PWD/m:$PATH; ls` runs `m/ls`).
+		if name == b"PATH"
+			&& let Err(e) = super::names::flush_hash(&mut k.root, cx.store, vp)
+		{
+			k.fail(e);
+			return Err(Diag::StoreFailed);
+		}
 		return Ok(());
 	};
 	let cur = current(k, cx, vp, name, level)?;

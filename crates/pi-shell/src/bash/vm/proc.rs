@@ -1509,6 +1509,13 @@ pub struct ExecState {
 	/// references ([`super::builtins::Ctx::arrayref`]).
 	pub arrayref:    Vec<u32>,
 	pub target:      Option<Target>,
+	/// `target` is the file the hash table gave (bash's `phash_search`), not
+	/// one a `$PATH` search found: the hash table's entry names the program
+	/// (`./bin/u` while that is an executable file, else `bin/u`). Never
+	/// imaged, like the search itself: a restored command names its
+	/// program by the `$PATH` entry that finds it.
+	#[serde(skip)]
+	pub from_hash:   bool,
 	pub waiting:     Option<Awaited>,
 	/// A temporary scope (builtin environment) was pushed for this command.
 	pub scoped:      bool,

@@ -1707,7 +1707,25 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 			| FrameKind::NoFork
 			| FrameKind::Script { what: ScriptKind::Trap { .. }, .. }
 	) {
+		// bash's `sv_path` runs for a local `PATH` that goes away
+		// (`unbind_variable`), as for one assigned: the command hash table
+		// is emptied, so the next command is searched with the `PATH` that
+		// comes back. Read before the scope goes, and only for a scope
+		// that may bind at all.
+		let path_local = match top.filter(|&t| state::scope_may_bind(root, vp, t)) {
+			Some(t) => match state::scope_binds(store, vp, t, b"PATH") {
+				Ok(binds) => binds,
+				Err(err) => {
+					root.fail(err);
+					false
+				},
+			},
+			None => false,
+		};
 		state::drop_scope(root, store, vp);
+		if path_local && let Err(err) = super::builtins::flush_hash(root, store, vp) {
+			root.fail(err);
+		}
 	}
 	if let Some(saved) = zsh_optind
 		&& let Err(err) = super::builtins::zsh_vars::optind_leave(root, store, vp, saved)

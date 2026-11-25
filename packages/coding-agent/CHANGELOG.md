@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed the `bash` tool's bash code naming a program found through a relative `$PATH` entry by an absolute path with `./` in it (`/dir/./s`): as bash, it is `./s` (for `PATH=.` or an empty entry), `bin/s` or `../s`, as the `$0` of a script without `#!`, in messages and in `hash -t`; a later run from the hash table reads such an entry as bash does (`./bin/s` while it is an executable file), and only a `./s` entry is searched again after a `cd`
+- Fixed the `bash` tool's bash code naming a program found through a relative `$PATH` entry by an absolute path with `./` in it (`/dir/./s`): as bash, it is `./s` (for `PATH=.` or an empty entry), `bin/s` or `../s`, as the `$0` of a script without `#!`, in messages and in `hash -t`; a later run from the hash table reads such an entry as bash does (`./bin/s` while it is an executable file), and only a `./s` entry is searched again after a `cd`. `exec` of such a program now runs and names the full path bash builds (`/dir/s`, `/dir/bin/s`), `type` and `command -v` of several names count one hash-table hit each (`type -P` one, `type -a` none), and a change to `PATH` empties the hash table even when an assignment changes the variable in place or a function's `local PATH` goes away, so the next command is searched again and the new program runs
 
 ## [18.18.6] - 2026-11-09
 

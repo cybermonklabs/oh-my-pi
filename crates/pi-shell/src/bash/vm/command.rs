@@ -60,6 +60,7 @@ impl ExecState {
 			keywords: Vec::new(),
 			arrayref: Vec::new(),
 			target: None,
+			from_hash: false,
 			waiting: None,
 			scoped: false,
 			control: None,
@@ -91,6 +92,7 @@ impl ExecState {
 			keywords,
 			arrayref,
 			target,
+			from_hash,
 			waiting,
 			scoped,
 			control,
@@ -117,6 +119,7 @@ impl ExecState {
 		keywords.clear();
 		arrayref.clear();
 		*target = None;
+		*from_hash = false;
 		*waiting = None;
 		*scoped = false;
 		*control = None;
@@ -1982,6 +1985,17 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 			.any(|(n, _)| n.as_slice() == b"PATH" || (windows && n.as_slice() == b"PATHEXT"));
 		let mut sc = exec::take_scratch(vp);
 		let name = sc.exec.as_ref().map_or_default(|e| e.argv[0].clone());
+		let platform = k.engine.config().platform;
+		// bash's `phash_search`: an entry in the current directory itself
+		// (`./s`, as bash hashes a find through `PATH=.` or an empty
+		// entry) is taken only while it is an executable file there, else
+		// the name is searched again (`HASH_CHKDOT`); zsh takes any entry.
+		let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
+		// bash's `exec` (`exec.def`) runs the file by the name its search
+		// built, made absolute ([`full_pathname`]): `PATH=.` runs `D/s`,
+		// the hash entry `bin/u` runs `D/bin/u`. That name is the program's
+		// `$0` and the one its messages give. zsh runs the probed path.
+		let exec_target = !zsh && sc.exec.as_ref().is_some_and(|e| e.exec_as.is_some());
 		if sc.io.as_ref().is_none_or(|io| io.search.is_none()) {
 			let hashed = if std_path || temp_path {
 				None
@@ -1994,11 +2008,6 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 			let checkhash =
 				state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Checkhash)
 					.unwrap_or(false);
-			// bash's `phash_search`: an entry in the current directory itself
-			// (`./s`, as bash hashes a find through `PATH=.` or an empty
-			// entry) is taken only while it is an executable file there, else
-			// the name is searched again (`HASH_CHKDOT`); zsh takes any entry.
-			let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
 			match hashed {
 				// bash runs a hashed name without searching PATH.
 				Some((path, hits)) if !checkhash && (zsh || !probe::hashed_in_cwd(&path)) => {
@@ -2006,9 +2015,16 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 					let key = KeyBuf::CmdHash(name.clone());
 					state::store_record(&mut k.root, cx.store, vp, key, Some(rec));
 					// `hash` keeps bash's display path (`./e` for an empty
-					// PATH entry, `bin/u`): a file relative to the shell's cwd.
-					let target = hashed_target(vp, &path);
-					sc.exec.as_mut().expect("exec").target = Some(Target::External(target));
+					// PATH entry, `bin/u`): a file relative to the shell's cwd,
+					// which names the program ([`ExecState::from_hash`]).
+					let target = if exec_target {
+						full_pathname(&vp.cwd, &path, platform)
+					} else {
+						absolute(&vp.cwd, &path)
+					};
+					let exec = sc.exec.as_mut().expect("exec");
+					exec.target = Some(Target::External(target));
+					exec.from_hash = true;
 				},
 				hashed => {
 					let path = if std_path {
@@ -2025,7 +2041,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 					// zsh `pathdirs` (a name with a slash searched): the name
 					// itself first.
 					let mut cands: Vec<BString> = hashed
-						.map(|(p, _)| hashed_target(vp, &p))
+						.map(|(p, _)| absolute(&vp.cwd, &p))
 						.into_iter()
 						.chain((zsh && name.contains(&b'/')).then(|| absolute(&vp.cwd, &name)))
 						.collect();
@@ -2053,21 +2069,40 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 			None => None,
 			Some(Search::Found(path)) => {
 				sc.io().search = None;
+				// The hash table gave the file when the search took the entry
+				// it put first (the record the search started from: nothing
+				// runs while it probes); else a `$PATH` entry did. Only a
+				// relative entry names the program ([`searched_name`]).
+				let hashed = if std_path || temp_path {
+					None
+				} else {
+					match state::record(cx.store, vp, Key::CmdHash(BStr::new(&name))) {
+						Ok(Some(Record::CmdHash { path: entry, .. }))
+							if probe::hashed_relative(entry) && absolute(&vp.cwd, entry) == path =>
+						{
+							Some(entry.clone())
+						},
+						_ => None,
+					}
+				};
+				// The file as bash built it (`./s` for `PATH=.`, `./bin/u`
+				// from the hash table): what it hashes, and what its `exec`
+				// makes absolute. zsh names the probed path.
+				let hashing = !temp_path
+					&& (!zsh || !name.contains(&b'/'))
+					&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Hashall)
+						.unwrap_or(true);
+				let shown = (hashing || exec_target).then(|| {
+					if zsh {
+						path.clone()
+					} else {
+						searched_name(k, cx, vp, &name, &path, false, hashed.as_ref())
+					}
+				});
 				// bash hashes every command it finds in PATH (not with a
 				// temporary PATH).
 				// zsh `pathdirs` names (with a slash) are not hashed.
-				if !temp_path
-					&& (vp.mode.dialect() != crate::bash::ids::Dialect::Zsh || !name.contains(&b'/'))
-					&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Hashall)
-						.unwrap_or(true)
-				{
-					// bash hashes the file as it built it (`./s` for `PATH=.`);
-					// a file the hash table gave keeps its entry.
-					let shown = if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
-						path.clone()
-					} else {
-						searched_name(k, cx, vp, &name, &path, false)
-					};
+				if let Some(shown) = shown.clone().filter(|_| hashing) {
 					let hits = match state::record(cx.store, vp, Key::CmdHash(BStr::new(&name))) {
 						Ok(Some(Record::CmdHash { path: old, hits })) if *old == shown => {
 							hits.saturating_add(1)
@@ -2077,7 +2112,13 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 					let rec = Record::CmdHash { path: shown, hits };
 					state::store_record(&mut k.root, cx.store, vp, KeyBuf::CmdHash(name), Some(rec));
 				}
-				sc.exec.as_mut().expect("exec").target = Some(Target::External(path));
+				let target = match shown.filter(|_| exec_target) {
+					Some(shown) => full_pathname(&vp.cwd, &shown, platform),
+					None => path,
+				};
+				let exec = sc.exec.as_mut().expect("exec");
+				exec.target = Some(Target::External(target));
+				exec.from_hash = hashed.is_some();
 				None
 			},
 			Some(Search::NotFound) => {
@@ -4866,8 +4907,9 @@ fn run_script_file(
 /// built it, `dir/name` with the entry as written (`./s` for `PATH=.`,
 /// `bin/s`), not the absolute path `path` the search probed. `executable`:
 /// the file proved to be one (the OS ran it, or refused it as a script or
-/// a binary file of another format). zsh names `path`, and so does `exec`
-/// (bash's `exec` names the file made absolute, `full_pathname`).
+/// a binary file of another format). zsh names `path`, and so does `exec`,
+/// whose `path` is already the name its search built made absolute
+/// ([`full_pathname`], set where the search ends).
 fn program_name(
 	k: &Kernel,
 	cx: &mut Cx<'_>,
@@ -4882,15 +4924,25 @@ fn program_name(
 	if st(vp).exec_as.is_some() || vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		return path.clone();
 	}
-	searched_name(k, cx, vp, &argv0, path, executable)
+	// The hash table's entry, when the hash table gave the file
+	// ([`ExecState::from_hash`]).
+	let hashed = if st(vp).from_hash {
+		match state::record(cx.store, vp, Key::CmdHash(BStr::new(&argv0))) {
+			Ok(Some(Record::CmdHash { path: entry, .. })) => Some(entry.clone()),
+			_ => None,
+		}
+	} else {
+		None
+	};
+	searched_name(k, cx, vp, &argv0, path, executable, hashed.as_ref())
 }
 
 /// The file the search for `name` found at `path` (absolute) as bash built
-/// it: `dir/name` for the `$PATH` entry `path` came from
-/// ([`probe::shown_candidate`]), or the hash table's relative entry when
-/// the hash table gave `path` (`bin/u`, read as `./bin/u` while it is an
-/// `executable` file, as bash's `phash_search` reads it); `path` itself on
-/// Windows (`PATHEXT` spellings) or when no entry gave it (`command -p`).
+/// it: the hash table's entry `hashed` when the hash table gave `path`
+/// (`bin/u`, read as `./bin/u` while it is an `executable` file, as bash's
+/// `phash_search` reads it), else `dir/name` for the `$PATH` entry `path`
+/// came from ([`probe::shown_candidate`]); `path` itself on Windows
+/// (`PATHEXT` spellings) or when no entry gave it (`command -p`).
 fn searched_name(
 	k: &Kernel,
 	cx: &mut Cx<'_>,
@@ -4898,19 +4950,18 @@ fn searched_name(
 	name: &[u8],
 	path: &BString,
 	executable: bool,
+	hashed: Option<&BString>,
 ) -> BString {
 	let platform = k.engine.config().platform;
 	if platform == crate::bash::ids::Platform::Windows {
 		return path.clone();
 	}
-	if let Ok(Some(Record::CmdHash { path: hashed, .. })) =
-		state::record(cx.store, vp, Key::CmdHash(BStr::new(name)))
-		&& probe::hashed_relative(hashed)
-	{
-		let dotted = probe::hashed_dotted(hashed);
-		if absolute(&vp.cwd, &dotted) == *path {
-			return if executable { dotted } else { hashed.clone() };
-		}
+	if let Some(hashed) = hashed.filter(|h| probe::hashed_relative(h)) {
+		return if executable {
+			probe::hashed_dotted(hashed)
+		} else {
+			hashed.clone()
+		};
 	}
 	let var = state::lookup(&k.root, cx.store, vp, b"PATH")
 		.ok()
@@ -4924,15 +4975,21 @@ fn searched_name(
 		.unwrap_or_else(|| path.clone())
 }
 
-/// The file the hash table entry `entry` names: bash's `phash_search`
-/// reads a relative entry (`bin/u`) from the current directory as
-/// `./bin/u` ([`probe::hashed_dotted`]); zsh runs an entry as it is.
-fn hashed_target(vp: &Vproc, entry: &[u8]) -> BString {
-	if vp.mode.dialect() != crate::bash::ids::Dialect::Zsh && probe::hashed_relative(entry) {
-		absolute(&vp.cwd, &probe::hashed_dotted(entry))
-	} else {
-		absolute(&vp.cwd, entry)
+/// bash's `full_pathname`: an absolute name as it is, else the working
+/// directory `cwd`, `/` and `name` with one leading `./` dropped
+/// (`sh_makepath` with `MP_RMDOT`): `.//x` is `cwd//x`, not `/x`. A name is
+/// absolute by the engine's rule for `platform` ([`probe::is_absolute_on`]:
+/// `/`, a URL path, and on Windows a drive or UNC path).
+fn full_pathname(cwd: &[u8], name: &[u8], platform: crate::bash::ids::Platform) -> BString {
+	if probe::is_absolute_on(name, platform) {
+		return name.into();
 	}
+	let mut p = BString::from(cwd);
+	if !p.ends_with(b"/") {
+		p.push(b'/');
+	}
+	p.extend_from_slice(name.strip_prefix(b"./").unwrap_or(name));
+	p
 }
 
 /// The answer to `probe` for the command running in `vp` (cached in its
