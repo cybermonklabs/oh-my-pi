@@ -38,11 +38,13 @@
 mod obash_support;
 
 use std::{
+	any::Any,
 	collections::BTreeMap,
 	env,
 	fmt::Write as _,
 	fs,
 	os::unix::process::CommandExt,
+	panic::{self, AssertUnwindSafe},
 	path::{Path, PathBuf},
 	sync::atomic::{AtomicUsize, Ordering},
 	thread,
@@ -52,7 +54,7 @@ use serde_json::{Value, json};
 
 use crate::obash_support::{command, obash, output};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dialect {
 	Bash,
 	Zsh,
@@ -1252,7 +1254,7 @@ fn normalized_stderr(stderr: &[u8]) -> String {
 type Outcome = (String, String, i32);
 
 /// What runs a row.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Runner<'a> {
 	/// The obash under test.
 	Obash,
@@ -1340,7 +1342,10 @@ fn recorded(dialect: Dialect) -> BTreeMap<String, (String, Outcome)> {
 		.collect()
 }
 
-/// Run every row (on a few threads), in order.
+/// Run every row (on a few threads), in order. A row whose run panics (its
+/// obash past [`obash_support::LIMIT`] among them) fails the test with that
+/// panic's text and the row: its index, id, dialect, runner and command, so a
+/// failure says which row it was.
 fn run_all(dialect: Dialect, runner: Runner<'_>, rows: &[Row]) -> Vec<Outcome> {
 	let next = AtomicUsize::new(0);
 	let mut slots: Vec<Option<Outcome>> = vec![None; rows.len()];
@@ -1354,18 +1359,64 @@ fn run_all(dialect: Dialect, runner: Runner<'_>, rows: &[Row]) -> Vec<Outcome> {
 						let Some((id, script)) = rows.get(i) else {
 							break;
 						};
-						mine.push((i, run_row(dialect, runner, id, script)));
+						let outcome =
+							panic::catch_unwind(AssertUnwindSafe(|| run_row(dialect, runner, id, script)))
+								.unwrap_or_else(|payload| {
+									panic!(
+										"row {i} of {} ({id}, {dialect:?}, {runner:?}) failed: {}\n  its \
+										 command: {script}",
+										rows.len(),
+										panic_text(&*payload)
+									)
+								});
+						mine.push((i, outcome));
 					}
 					mine
 				})
 			})
 			.collect();
-		workers.into_iter().map(|w| w.join().unwrap()).collect()
+		// A worker's panic names its row; the test's failure is that text, not
+		// the join's `Any`.
+		workers
+			.into_iter()
+			.map(|w| {
+				w.join()
+					.unwrap_or_else(|payload| panic!("{}", panic_text(&*payload)))
+			})
+			.collect()
 	});
 	for (i, outcome) in results.into_iter().flatten() {
 		slots[i] = Some(outcome);
 	}
 	slots.into_iter().map(Option::unwrap).collect()
+}
+
+/// A panic's text: its message, or a note that it had none.
+fn panic_text(payload: &(dyn Any + Send)) -> &str {
+	payload
+		.downcast_ref::<String>()
+		.map(String::as_str)
+		.or_else(|| payload.downcast_ref::<&str>().copied())
+		.unwrap_or("(a panic with no text)")
+}
+
+/// A row whose run fails is named in the failure: its index, id, dialect and
+/// runner, and its command, beside the text of what failed (here, an oracle
+/// shell that does not exist, which fails at once).
+#[test]
+fn a_row_that_fails_is_named() {
+	let rows = [("named/0".to_owned(), "echo one".to_owned())];
+	let err = panic::catch_unwind(|| {
+		run_all(Dialect::Bash, Runner::Oracle("/nonexistent/oracle-shell"), &rows)
+	})
+	.expect_err("a row whose shell does not exist fails");
+	let text = panic_text(&*err);
+	assert!(
+		text
+			.starts_with("row 0 of 1 (named/0, Bash, Oracle(\"/nonexistent/oracle-shell\")) failed: "),
+		"{text}"
+	);
+	assert!(text.ends_with("\n  its command: echo one"), "{text}");
 }
 
 /// Assert that each row did what the record says, reporting every row that
