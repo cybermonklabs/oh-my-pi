@@ -1121,9 +1121,12 @@ interface DiskQueueOptions {
 }
 
 /**
- * What a fenced atomic rewrite did: published the transcript, published
- * nothing (a later write carries it), or handed the store's refusal of it to
- * the queued-conflict recovery, which publishes it.
+ * What a fenced atomic rewrite did. `published`: it published the transcript.
+ * `skipped`: it stopped before publishing (a released manager, a pending drop,
+ * a move) or the disk epoch moved under it, so the file is not marked current
+ * and a later write publishes the transcript; a body that landed before the
+ * epoch moved is still recorded as durable. `handedOver`: it handed the
+ * store's refusal of it to the queued-conflict recovery, which publishes it.
  */
 type FencedRewriteOutcome = "published" | "skipped" | "handedOver";
 
@@ -2790,13 +2793,19 @@ export class SessionManager {
 		return to;
 	}
 
-	#scheduleDiskWork(work: () => Promise<void>, options: DiskQueueOptions = {}): Promise<void> {
+	/**
+	 * Run `work` on the disk queue once the work queued before it settled.
+	 * Resolves with what `work` returned, or with `undefined` where it did not
+	 * run (the disk epoch moved since it was queued, unless `ignoreEpoch`) or
+	 * ended with an error the queue swallows; rejects with any other error.
+	 */
+	#scheduleDiskWork<T>(work: () => Promise<T>, options: DiskQueueOptions = {}): Promise<T | undefined> {
 		const epoch = options.epoch ?? this.#diskEpoch;
 		const scheduled = this.#diskTail
 			.catch(() => undefined)
 			.then(async () => {
-				if (!options.ignoreEpoch && epoch !== this.#diskEpoch) return;
-				await work();
+				if (!options.ignoreEpoch && epoch !== this.#diskEpoch) return undefined;
+				return await work();
 			});
 
 		const reported = scheduled.catch(err => {
@@ -2805,13 +2814,17 @@ export class SessionManager {
 			// #onSessionClaimLost): nothing failed.
 			if (err instanceof SessionLeaseLostError) {
 				this.#followParentMove();
-				return;
+				return undefined;
 			}
 			// The same error the store's drain reports again, for a conflict a recovery took over.
-			if (err instanceof Error && this.#takenOverConflicts.has(err)) return;
+			if (err instanceof Error && this.#takenOverConflicts.has(err)) return undefined;
 			throw this.#noteDiskFailure(err);
 		});
-		this.#diskTail = reported.catch(() => undefined);
+		// The tail only orders the queue: it neither fails nor holds the work's result.
+		this.#diskTail = reported.then(
+			() => undefined,
+			() => undefined,
+		);
 		return reported;
 	}
 
@@ -3439,25 +3452,31 @@ export class SessionManager {
 		if (!queuedRecovery && this.#queuedConflictRecovery) await this.#queuedConflictRecovery;
 
 		const startEpoch = this.#diskEpoch;
-		let published = false;
-		let handedOver = false;
-		await this.#scheduleDiskWork(
-			async () => {
-				const outcome = await this.#runFencedAtomicRewrite(startEpoch, queuedRecovery);
-				published = outcome === "published";
-				handedOver = outcome === "handedOver";
-				if (!published) return;
-				this.#fileIsCurrent = true;
-				this.#materializeBreadcrumb();
-				this.#hasTitleSlot = true;
-			},
-			{ epoch: startEpoch },
-		);
-		// Entries recorded while it published follow it as one append (see #appendToCurrentSessionFile).
-		if (published && !this.#released && this.#hasUnsavedEntries()) this.#appendToCurrentSessionFile();
-		if (!handedOver) return;
-		await this.#queuedConflictRecovery;
-		if (this.#rewriteRequired && this.#diskFailure) throw this.#diskFailure;
+		const outcome: FencedRewriteOutcome =
+			(await this.#scheduleDiskWork(
+				async () => {
+					const rewrite = await this.#runFencedAtomicRewrite(startEpoch, queuedRecovery);
+					if (rewrite === "published") {
+						this.#fileIsCurrent = true;
+						this.#materializeBreadcrumb();
+						this.#hasTitleSlot = true;
+					}
+					return rewrite;
+				},
+				{ epoch: startEpoch },
+			)) ?? "skipped";
+		switch (outcome) {
+			case "published":
+				// Entries recorded while it published follow it as one append (see #appendToCurrentSessionFile).
+				if (!this.#released && this.#hasUnsavedEntries()) this.#appendToCurrentSessionFile();
+				return;
+			case "handedOver":
+				await this.#queuedConflictRecovery;
+				if (this.#rewriteRequired && this.#diskFailure) throw this.#diskFailure;
+				return;
+			case "skipped":
+				return;
+		}
 	}
 
 	/**
@@ -3471,7 +3490,7 @@ export class SessionManager {
 	 * readback. A refusal it hands to the queued-conflict recovery is
 	 * `handedOver`, not thrown: the caller settles with that recovery.
 	 */
-	async #runFencedAtomicRewrite(epoch: number, queuedRecovery = false): Promise<FencedRewriteOutcome> {
+	async #runFencedAtomicRewrite(epoch: number, queuedRecovery: boolean): Promise<FencedRewriteOutcome> {
 		if (this.#released) return "skipped";
 		if (this.#deferRewriteForPendingDrop()) return "skipped";
 		this.#atomicRewriteFenceEpoch = epoch;
@@ -3832,21 +3851,21 @@ export class SessionManager {
 	 */
 	async #writeTitleSlot(update: SessionTitleUpdate): Promise<void> {
 		const epoch = this.#diskEpoch;
-		let slotFailed = false;
-		await this.#scheduleDiskWork(
+		const slotFailed = await this.#scheduleDiskWork(
 			async () => {
 				const sessionFile = this.#sessionFile;
-				if (this.#released || !sessionFile) return;
+				if (this.#released || !sessionFile) return false;
 				const drop = this.#pendingDropOfSessionFile();
 				if (drop) {
 					drop.titleHeld = true;
-					return;
+					return false;
 				}
 				try {
 					await this.#storage.updateSessionTitle(sessionFile, maskTitleUpdate(update, this.storeMask()));
+					return false;
 				} catch {
 					this.#rewriteRequired = true;
-					slotFailed = true;
+					return true;
 				}
 			},
 			{ epoch },
