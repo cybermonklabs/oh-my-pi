@@ -3917,8 +3917,10 @@ mod ended_subshell_output {
 
 	/// Submit `script` with the writer threads held, and step until the shell
 	/// blocks: the run must not end while fd 2's message is held, and a
-	/// subshell of it is still there. `edit` changes the shell then.
-	fn run_until_held(script: &[u8], edit: impl FnOnce(&mut Rig)) -> (Rig, UnixStream) {
+	/// subshell of it is still there. `edit` changes the shell then. Also the
+	/// kernel's wake count just before the threads are let go: the thread's
+	/// wake can come as soon as they are.
+	fn run_until_held(script: &[u8], edit: impl FnOnce(&mut Rig)) -> (Rig, UnixStream, u64) {
 		let (mut rig, peer) = shell_with_stderr_on_a_thread();
 		let held = crate::sys::hold_writers();
 		rig.shell().submit(Script::command(script.to_vec()));
@@ -3932,16 +3934,19 @@ mod ended_subshell_output {
 			"no subshell left while its message to fd 2 was held"
 		);
 		edit(&mut rig);
+		let before = rig.shell().k.ctl.wakes();
 		drop(held);
-		(rig, peer)
+		(rig, peer, before)
 	}
 
 	/// Let fd 2's line out (it ends with `message`), wait for the writer
-	/// thread's wake (it marks the chunk done, then wakes the kernel), then
-	/// step: the run must end without the shell blocking, since nothing it
-	/// waits for is left. Its status and stdout.
-	fn finish_after_the_line(mut rig: Rig, mut peer: UnixStream, message: &str) -> (i32, String) {
-		let before = rig.shell().k.ctl.wakes();
+	/// thread's wake past `before` (it marks the chunk done, then wakes the
+	/// kernel), then step: the run must end without the shell blocking, since
+	/// nothing it waits for is left. Its status and stdout.
+	fn finish_after_the_line(
+		(mut rig, mut peer, before): (Rig, UnixStream, u64),
+		message: &str,
+	) -> (i32, String) {
 		let line = read_line(&mut peer);
 		assert!(line.ends_with(message), "fd 2 got {line:?}, not a line ending {message:?}");
 		let deadline = Instant::now() + Duration::from_secs(10);
@@ -3981,8 +3986,8 @@ mod ended_subshell_output {
 					b"v=$(: ${x:?u}); echo \"st=$?\"",
 					b"( : ${x:?u} ) & wait $!; echo \"st=$?\"",
 				] {
-					let (rig, peer) = run_until_held(script, |_| {});
-					let got = finish_after_the_line(rig, peer, "line 1: x: u\n");
+					let held = run_until_held(script, |_| {});
+					let got = finish_after_the_line(held, "line 1: x: u\n");
 					assert_eq!(got, (0, "st=1\n".to_owned()), "{}", String::from_utf8_lossy(script));
 				}
 			},
@@ -3997,8 +4002,8 @@ mod ended_subshell_output {
 		crate::sys::in_blocking_writer_process(
 			concat!(module_path!(), "::a_subshells_write_that_is_not_its_last_op_ends_it_once_out"),
 			|| {
-				let (rig, peer) = run_until_held(b"( echo e >&2 ); echo \"st=$?\"", |_| {});
-				assert_eq!(finish_after_the_line(rig, peer, "e\n"), (0, "st=0\n".to_owned()));
+				let held = run_until_held(b"( echo e >&2 ); echo \"st=$?\"", |_| {});
+				assert_eq!(finish_after_the_line(held, "e\n"), (0, "st=0\n".to_owned()));
 			},
 		);
 	}
@@ -4011,7 +4016,7 @@ mod ended_subshell_output {
 		crate::sys::in_blocking_writer_process(
 			concat!(module_path!(), "::an_ended_subshells_pending_trap_does_not_run"),
 			|| {
-				let (rig, peer) =
+				let held =
 					run_until_held(b"( trap 'echo trapped' USR1; : ${x:?u} ); echo \"st=$?\"", |rig| {
 						let p = rig
 							.shell()
@@ -4021,40 +4026,40 @@ mod ended_subshell_output {
 							.expect("the subshell");
 						p.pending_traps = p.pending_traps.with(Signal::Usr1);
 					});
-				assert_eq!(
-					finish_after_the_line(rig, peer, "line 1: x: u\n"),
-					(0, "st=1\n".to_owned())
-				);
+				assert_eq!(finish_after_the_line(held, "line 1: x: u\n"), (0, "st=1\n".to_owned()));
 			},
 		);
 	}
 
 	/// A cancel (`TERM`) while an ended subshell's message is held starts no
 	/// trap in that subshell: it has no code left to run one in, and is ended
-	/// with the run.
+	/// with the run. The cancelled run's end is reported before any other
+	/// vproc runs again, so the shell is stepped on until it idles: a trap
+	/// started in the subshell would run then.
 	#[test]
 	fn a_cancel_runs_no_trap_in_an_ended_subshell() {
 		crate::sys::in_blocking_writer_process(
 			concat!(module_path!(), "::a_cancel_runs_no_trap_in_an_ended_subshell"),
 			|| {
-				let (mut rig, mut peer) =
+				let (mut rig, mut peer, _) =
 					run_until_held(b"( trap 'echo trapped' TERM; : ${x:?u} ); echo \"st=$?\"", |rig| {
 						rig.shell().k.ctl.request_cancel(Signal::Term);
 					});
 				let line = read_line(&mut peer);
 				assert!(line.ends_with("line 1: x: u\n"), "fd 2 got {line:?}");
-				let mut ended = false;
+				let (mut ended, mut idle) = (false, false);
 				for _ in 0..1_000 {
 					let (shell, host, store) = rig.parts();
-					if matches!(
-						shell.step(&mut Cx { host, store }, Budget::default()),
-						Step::Done { .. }
-					) {
-						ended = true;
-						break;
+					match shell.step(&mut Cx { host, store }, Budget::default()) {
+						Step::Done { .. } => ended = true,
+						Step::Idle if ended => {
+							idle = true;
+							break;
+						},
+						_ => {},
 					}
 				}
-				assert!(ended, "the cancelled run did not end within 1,000 steps");
+				assert!(ended && idle, "the cancelled run did not end and idle within 1,000 steps");
 				let out = String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned();
 				assert!(!out.contains("trapped"), "a trap ran in the ended subshell: stdout {out:?}");
 			},
