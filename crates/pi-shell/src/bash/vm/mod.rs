@@ -433,6 +433,19 @@ impl std::str::FromStr for StartRecord {
 	}
 }
 
+/// The arithmetic results of one argument of a builtin that runs again
+/// ([`Kernel::arith_replay`]).
+#[derive(Debug, Default)]
+pub struct ArithReplay {
+	/// Each result in the order the argument evaluated them.
+	pub values: Vec<i64>,
+	/// The next result to take.
+	pub next:   usize,
+	/// An evaluation is under way: arithmetic it runs inside (a variable's
+	/// value evaluated as an expression) is its own, not one to take.
+	pub inside: bool,
+}
+
 /// Shell-wide state shared by all vprocs (kept apart from `procs` so ops can
 /// borrow a vproc and the kernel at once).
 pub struct Kernel {
@@ -526,6 +539,12 @@ pub struct Kernel {
 	/// ([`Kernel::fork_clock`]). Set only during that call, which restores
 	/// both before it returns; not imaged.
 	pub redirs_in_child:    bool,
+	/// The arithmetic results a builtin's argument evaluates while
+	/// [`builtins::Ctx::arith_once`] runs ([`expand::arith_value`]): taken
+	/// in order on a run again after a later argument's `$(…)` or a probe,
+	/// logged on the first run. Set only during that call; not imaged (the
+	/// replay log holds the results).
+	pub arith_replay:       Option<ArithReplay>,
 	/// Startup files (`path`, contents) the root vproc sources when its
 	/// first run starts ([`ShellInit::startup`]); not imaged (the first run
 	/// starts at the first step).
@@ -693,6 +712,7 @@ impl Kernel {
 			seconds: 0,
 			seconds_plain: false,
 			redirs_in_child: false,
+			arith_replay: None,
 			startup: Vec::new(),
 			pseudo_traps: exec::PseudoTraps::default(),
 			nofork_units: HashMap::new(),

@@ -3905,13 +3905,37 @@ fn lone_param(w: &Word) -> Option<&ParamIr> {
 }
 
 /// Evaluate already-expanded arithmetic text (`let`, `declare -i`
-/// values, array subscripts set by builtins).
+/// values, array subscripts set by builtins). Under
+/// [`Ctx::arith_once`](super::builtins::Ctx::arith_once) a run again takes
+/// the first run's result instead, so the text's own assignments
+/// (`w++`) and `RANDOM` draws happen once; a result the first run did
+/// not reach (an error) is evaluated.
 pub fn arith_value(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
 	vp: &mut Vproc,
 	text: &[u8],
 ) -> Result<i64, Diag> {
+	let Some(replay) = k.arith_replay.as_mut().filter(|r| !r.inside) else {
+		return arith_eval(k, cx, vp, text);
+	};
+	if let Some(&n) = replay.values.get(replay.next) {
+		replay.next += 1;
+		return Ok(n);
+	}
+	replay.inside = true;
+	let res = arith_eval(k, cx, vp, text);
+	if let Some(replay) = k.arith_replay.as_mut() {
+		replay.inside = false;
+		if let Ok(n) = res {
+			replay.values.push(n);
+			replay.next += 1;
+		}
+	}
+	res
+}
+
+fn arith_eval(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, text: &[u8]) -> Result<i64, Diag> {
 	let mut env =
 		Vars { k, cx, vp, prefix: None, expanded: false, element: dynvars::Site::ArithElement };
 	arith::eval(text, &mut env).map_err(Diag::from)
