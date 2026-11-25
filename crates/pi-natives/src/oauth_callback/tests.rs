@@ -304,26 +304,28 @@ async fn wait_wakes_on_callback_published_after_it_starts() {
 	let home = temp_home("late-callback");
 	fs::create_dir_all(&home).unwrap();
 	let callback = home.join("callback.url");
-	let publisher = {
-		let callback = callback.clone();
-		tokio::spawn(async move {
-			// Lets the wait fail its first claim and park on the watch.
-			tokio::time::sleep(Duration::from_millis(50)).await;
-			let published = std::time::Instant::now();
-			publication::publish_once(&callback, b"omp-test://callback?code=late").unwrap();
-			published
-		})
-	};
-	let url = wait_for_callback_async(
+	let cancel = CancelToken::default();
+	let mut wait = std::pin::pin!(wait_for_callback_async(
 		&callback,
 		"omp-test",
 		"0123456789abcdef0123456789abcdef",
 		1,
-		&CancelToken::default(),
-	)
-	.await
-	.unwrap();
-	let latency = publisher.await.unwrap().elapsed();
+		&cancel,
+	));
+	// Publish only once the wait has armed its watch, failed its first claim
+	// and parked: its first poll returns `Pending` at exactly that point.
+	std::future::poll_fn(|cx| {
+		assert!(
+			wait.as_mut().poll(cx).is_pending(),
+			"the wait finished before anything was published"
+		);
+		std::task::Poll::Ready(())
+	})
+	.await;
+	let published = std::time::Instant::now();
+	publication::publish_once(&callback, b"omp-test://callback?code=late").unwrap();
+	let url = wait.await.unwrap();
+	let latency = published.elapsed();
 	assert_eq!(url, "omp-test://callback?code=late");
 	// A poll would claim it most of a POLL_INTERVAL later (2 s in tests); only
 	// the directory watch wakes the wait well inside a quarter of that, even

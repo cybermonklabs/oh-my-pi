@@ -1516,14 +1516,22 @@ async fn a_dropped_run_gives_the_next_run_a_new_session() {
 async fn persistent_shell_reaps_background_child_without_followup_run() {
 	let _guard = shell_test_lock().lock().await;
 	let shell = Shell::new(None);
-	// `$!` names the job for `wait`; the child reports its OS pid itself.
+	// `$!` names the job for `wait`; the child reports its OS pid itself. It
+	// exits once the test releases `gate`, after the run has returned, so
+	// only the idle shell can reap it.
 	let pidfile = tempfile::NamedTempFile::new().expect("child pidfile");
+	let gates = tempfile::tempdir().expect("gate directory");
+	let gate = gates.path().join("gate");
+	gate_fifo(&gate);
+	let child = "echo $$ > \"$1\"; read _ < \"$2\"; exit 7";
 	let started = shell
 		.run(
 			ShellRunOptions {
 				command: format!(
-					"/bin/sh -c 'echo $$ > \"$1\"; sleep 1; exit 7' _ {} >/dev/null 2>&1 & pid=$!",
-					quote_arg(&pidfile.path().to_string_lossy())
+					"/bin/sh -c {} _ {} {} >/dev/null 2>&1 & pid=$!",
+					quote_arg(child),
+					quote_arg(&pidfile.path().to_string_lossy()),
+					quote_arg(&gate.to_string_lossy())
 				),
 				..Default::default()
 			},
@@ -1544,6 +1552,7 @@ async fn persistent_shell_reaps_background_child_without_followup_run() {
 		time::sleep(Duration::from_millis(20)).await;
 	};
 	assert!(pid > 0);
+	let _released = release_gate(&gate);
 
 	// No calls to the shell (including the live-job counter) until this
 	// child has exited and its parent has reaped it. Waits as long as that
@@ -1583,13 +1592,20 @@ async fn persistent_shell_reaps_early_exiting_background_pipeline_stage() {
 	let last_pidfile = tempfile::NamedTempFile::new().expect("last stage pidfile");
 	// `$!` names the job for `wait`; each stage reports its OS pid itself.
 	// The first stage's `sleep 600` (`testkit::child::LIFETIME`) outlives the
-	// test runner's bound, so only the test ends it.
+	// test runner's bound, so only the test ends it. The last stage exits
+	// once the test releases `gate`, after the run has returned.
+	let gates = tempfile::tempdir().expect("gate directory");
+	let gate = gates.path().join("gate");
+	gate_fifo(&gate);
+	let first = format!("echo $$ > \"$1\"; exec {} 600", crate::testkit::child::on_path("sleep"));
+	let last = "echo $$ > \"$1\"; read _ < \"$2\"; exit 9";
 	let command = format!(
-		"/bin/sh -c 'echo $$ > \"$1\"; exec {} 600' _ {} | /bin/sh -c 'echo $$ > \"$1\"; sleep 1; \
-		 exit 9' _ {} >/dev/null 2>&1 & pid=$!",
-		crate::testkit::child::on_path("sleep"),
+		"/bin/sh -c {} _ {} | /bin/sh -c {} _ {} {} >/dev/null 2>&1 & pid=$!",
+		quote_arg(&first),
 		quote_arg(&first_pidfile.path().to_string_lossy()),
-		quote_arg(&last_pidfile.path().to_string_lossy())
+		quote_arg(last),
+		quote_arg(&last_pidfile.path().to_string_lossy()),
+		quote_arg(&gate.to_string_lossy())
 	);
 	let started = shell
 		.run(ShellRunOptions { command, ..Default::default() }, None, CancelToken::default())
@@ -1615,6 +1631,7 @@ async fn persistent_shell_reaps_early_exiting_background_pipeline_stage() {
 	assert!(last_pid > 0);
 	let first_pid = recorded(first_pidfile.path()).await;
 	assert_ne!(first_pid, last_pid, "pipeline stages need distinct pids");
+	let _released = release_gate(&gate);
 
 	// A zombie still responds to signal 0. The last stage must disappear
 	// while the first is alive, without another shell/tool invocation. Waits
@@ -2234,15 +2251,36 @@ async fn segmented_timeout_in_first_segment_prevents_later_segments() {
 async fn segmented_cancel_in_first_segment_prevents_later_segments() {
 	let root = unique_temp_dir("cancel");
 	let minimizer = printf_minimizer(&root.join("minimizer.toml"), None);
+	// The first segment's redirection makes `started` as the segment begins,
+	// before its sleep.
+	let started = root.join("started");
+	let command = format!("sleep 1 > {} && printf later", quote_arg(&started.to_string_lossy()));
 	let mut cancel_token = CancelToken::default();
 	let abort_token = cancel_token.emplace_abort_token();
 	let cancel_task = tokio::spawn(async move {
-		time::sleep(Duration::from_millis(10)).await;
+		// Only polling sees the file appear: checks 1 ms apart at first, at
+		// most 20 ms apart later.
+		let mut backoff = crate::testkit::Backoff::new();
+		while !started.exists() {
+			time::sleep(backoff.pause()).await;
+		}
 		abort_token.abort(AbortReason::Signal);
 	});
-	let (result, output) =
-		run_command_capture("sleep 1 && printf later", None, Some(minimizer), cancel_token).await;
-	let _ = cancel_task.await;
+	let (result, output) = run_command_capture_within(
+		Duration::from_secs(10),
+		&command,
+		None,
+		Some(minimizer),
+		cancel_token,
+	)
+	.await
+	.expect("the cancelled run did not end within 10 s");
+	// Still waiting when the first segment never started: the run, which its
+	// own sleep ends, bounds the wait.
+	cancel_task.abort();
+	cancel_task
+		.await
+		.expect("the first segment never started before the run ended");
 	let _ = std::fs::remove_dir_all(&root);
 	assert!(result.exit_code.is_none());
 	assert!(result.cancelled);
@@ -2623,15 +2661,22 @@ async fn cancelling_one_run_spares_a_concurrent_runs_child() {
 	};
 	assert_eq!(b_ready.trim(), "ready", "run B should reach its long sleep before run A starts");
 
+	// Run A's child lives until the test releases `gate`, after run B's
+	// cancel has run its course: a TERM that cancel sent it would end it
+	// first.
+	let gates = tempfile::tempdir().expect("gate directory");
+	let gate = gates.path().join("gate");
+	gate_fifo(&gate);
+	let command_a = format!(
+		"sh -c 'printf \"%d\\n\" \"$$\"; read _ < \"$1\"' sh {}",
+		quote_arg(&gate.to_string_lossy())
+	);
 	let shell_a = Shell::new(None);
 	let (tx_a, rx_a) = flume::unbounded::<String>();
 	let handle_a = tokio::spawn(async move {
 		shell_a
 			.run(
-				ShellRunOptions {
-					command: "sh -c 'printf \"%d\\n\" \"$$\"; sleep 2'".into(),
-					..Default::default()
-				},
+				ShellRunOptions { command: command_a, ..Default::default() },
 				Some(tx_a),
 				CancelToken::default(),
 			)
@@ -2656,14 +2701,21 @@ async fn cancelling_one_run_spares_a_concurrent_runs_child() {
 
 	abort_b.abort(AbortReason::Signal);
 
-	let result_a = handle_a
+	let result_b = time::timeout(Duration::from_secs(10), handle_b)
 		.await
-		.expect("run A task panicked")
-		.expect("run A failed");
-	let result_b = handle_b
-		.await
+		.expect("run B timed out")
 		.expect("run B task panicked")
 		.expect("run B failed");
+	// Run B's cancel goes on after B returns: a kill thread waits TERM_GRACE,
+	// then KILLs B's child and sweeps B's session, and reports nothing. A's
+	// child must still be alive then, so this time is the claim.
+	time::sleep(crate::host::TERM_GRACE + Duration::from_millis(500)).await;
+	let _released = release_gate(&gate);
+	let result_a = time::timeout(Duration::from_secs(10), handle_a)
+		.await
+		.expect("run A timed out")
+		.expect("run A task panicked")
+		.expect("run A failed");
 
 	assert_eq!(result_a.exit_code, Some(0), "cancelling run B must not SIGTERM run A's child");
 	assert!(!result_a.cancelled, "run A was never cancelled");
@@ -2962,9 +3014,13 @@ async fn read_output_stops_when_cancelled_before_pipe_eof() {
 	let (reader, _writer) = pipe_to_files("test").expect("test pipe should be created");
 	let cancel = CancellationToken::new();
 	let (activity_tx, _activity_rx) = flume::bounded(1);
-	let handle = tokio::spawn(read_output(reader, None, cancel.clone(), activity_tx));
+	let mut reading = Box::pin(read_output(reader, None, cancel.clone(), activity_tx));
+	// One poll registers the pipe and parks the reader on its readiness, so
+	// the cancel reaches a reader that waits for data.
+	let first = std::future::poll_fn(|cx| std::task::Poll::Ready(reading.as_mut().poll(cx))).await;
+	assert!(first.is_pending(), "the reader ended before it waited for data");
+	let handle = tokio::spawn(reading);
 
-	time::sleep(Duration::from_millis(10)).await;
 	cancel.cancel();
 
 	// The writer stays open, so only the cancel ends the reader.

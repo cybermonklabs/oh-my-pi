@@ -4006,6 +4006,33 @@ mod testing {
 		}
 	}
 
+	/// The pauses between the checks of a wait only polling can see: 1 ms
+	/// at first, twice as long after each failed check, and at most 20 ms, so
+	/// a long wait costs almost no CPU.
+	#[cfg(any(
+		all(feature = "util.rsync", any(unix, windows)),
+		all(feature = "util.cat", target_os = "linux")
+	))]
+	pub(crate) struct Backoff(std::time::Duration);
+
+	#[cfg(any(
+		all(feature = "util.rsync", any(unix, windows)),
+		all(feature = "util.cat", target_os = "linux")
+	))]
+	impl Backoff {
+		pub(crate) const fn new() -> Self {
+			Self(std::time::Duration::from_millis(1))
+		}
+
+		/// The pause before the next check; it doubles the one after, up to
+		/// 20 ms.
+		pub(crate) fn pause(&mut self) -> std::time::Duration {
+			let pause = self.0;
+			self.0 = (pause * 2).min(std::time::Duration::from_millis(20));
+			pause
+		}
+	}
+
 	/// Runs the extra `argv` through [`run`](crate::extras::run) from `cwd`
 	/// with `stdin` on fd 0 and the process environment plus `env`, returning
 	/// its status, stdout, and stderr.
@@ -5383,4 +5410,9 @@ pub(crate) use testing::{SHOW_ARGS, exec_limits, exec_refusal, lines_run};
 pub(crate) use testing::{drain_once_the_write_waits, drain_runtime};
 #[cfg(all(test, target_os = "linux", any(feature = "util.rg", feature = "util.find")))]
 pub(crate) use testing::sent_within_5s;
+#[cfg(all(
+	test,
+	any(all(feature = "util.rsync", any(unix, windows)), all(feature = "util.cat", target_os = "linux"))
+))]
+pub(crate) use testing::Backoff;
 

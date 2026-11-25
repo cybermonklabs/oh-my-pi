@@ -6,9 +6,13 @@
 
 mod pty_support;
 
-use std::{io, time::Duration};
+use std::{
+	io,
+	time::{Duration, Instant},
+};
 
-use pty_support::{Screen, Spawn, TIMEOUT, differential, have_real_zsh};
+use pi_shell::sys::proc;
+use pty_support::{Pty, Screen, Spawn, TIMEOUT, differential, have_real_zsh};
 
 #[test]
 fn the_screen_model_prints_wraps_and_erases() {
@@ -88,12 +92,14 @@ fn a_resize_is_seen_by_both() -> io::Result<()> {
 	if !have_real_zsh() {
 		return Ok(());
 	}
-	let script = "read x; stty size";
+	// The first size shows the shell has started and run a child: the
+	// resize comes while it runs, not before it has seen the terminal.
+	let script = "stty size; read x; stty size";
 	let (obash, zsh) = differential(
 		Spawn::zsh().args(["-f", "-c", script]),
 		Spawn::real_zsh().args(["-f", "-c", script]),
 		|pty| {
-			pty.settle(Duration::from_millis(200), TIMEOUT)?;
+			pty.read_until("24 80", TIMEOUT)?;
 			pty.resize(30, 100)?;
 			pty.write("\r")?;
 			pty.read_until("30 100", TIMEOUT)?;
@@ -114,10 +120,30 @@ fn ctrl_c_ends_a_foreground_command_like_zsh() -> io::Result<()> {
 	let mut statuses = Vec::new();
 	for spawn in [Spawn::zsh(), Spawn::real_zsh()] {
 		let mut pty = spawn.args(["-f", "-c", "sleep 100"]).spawn()?;
-		std::thread::sleep(Duration::from_millis(300));
+		wait_for_sleep(&pty)?;
 		pty.write("\x03")?;
 		statuses.push(std::os::unix::process::ExitStatusExt::signal(&pty.wait(TIMEOUT)?));
 	}
 	assert_eq!(statuses, [Some(libc::SIGINT), Some(libc::SIGINT)]);
+	Ok(())
+}
+
+/// Wait until `sleep` has exec'd in the terminal's session (forked by the
+/// shell or exec'd in its place): `^C` then comes while the command runs,
+/// not while a shell starts. It looks 1 ms apart at first, at most 20 ms
+/// apart later.
+fn wait_for_sleep(pty: &Pty) -> io::Result<()> {
+	let deadline = Instant::now() + TIMEOUT;
+	let mut pause = Duration::from_millis(1);
+	while !proc::session_members(pty.pid())?
+		.iter()
+		.any(|p| p.name == "sleep" && p.state != proc::ProcState::Zombie)
+	{
+		if Instant::now() >= deadline {
+			return Err(io::Error::new(io::ErrorKind::TimedOut, "sleep never ran on the terminal"));
+		}
+		std::thread::sleep(pause);
+		pause = (pause * 2).min(Duration::from_millis(20));
+	}
 	Ok(())
 }

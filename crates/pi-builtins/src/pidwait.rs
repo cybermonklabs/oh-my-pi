@@ -52,7 +52,36 @@ mod tests {
 		let pid = child.id();
 
 		// Leave the child unreaped so it remains visible in the process snapshot,
-		// while giving the trivial command enough time to reach its exited state.
+		// and wait until it has exited: `WNOWAIT` sees the exit without reaping.
+		// The wait blocks in `waitid` on a thread of its own: the runtime's
+		// shutdown would wait for a blocking-pool thread, and the timeout would
+		// not end the test.
+		#[cfg(target_os = "linux")]
+		{
+			use nix::{
+				errno::Errno,
+				sys::wait::{Id, WaitPidFlag, waitid},
+				unistd::Pid,
+			};
+			let child_pid = Pid::from_raw(i32::try_from(pid)?);
+			let (sender, exited) = tokio::sync::oneshot::channel();
+			std::thread::spawn(move || {
+				let done = loop {
+					match waitid(Id::Pid(child_pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT) {
+						Err(Errno::EINTR) => {},
+						done => break done,
+					}
+				};
+				let _ = sender.send(done);
+			});
+			let Ok(exited) = tokio::time::timeout(Duration::from_secs(10), exited).await else {
+				let _ = child.kill();
+				anyhow::bail!("the child did not exit");
+			};
+			exited??;
+		}
+		// Elsewhere, give the trivial command time to reach its exited state.
+		#[cfg(not(target_os = "linux"))]
 		tokio::time::sleep(Duration::from_millis(100)).await;
 		let code = execute_bounded(&["-p", &pid.to_string()]).await;
 		let _ = child.kill();
@@ -235,16 +264,20 @@ mod tests {
 				.stdout(std::process::Stdio::null())
 				.spawn()?;
 			let pid = child.id().to_string();
-			let probe = async {
-				// Give pidwait time to select the process and start waiting.
-				tokio::time::sleep(Duration::from_millis(200)).await;
-				tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| {})).await
-			};
 			let argv = ["pidwait", "-p", &pid];
+			let mut pidwait = std::pin::pin!(run_proc::<PidwaitCommand>(&argv, None));
 			// `None`: pidwait returned while its process was still running.
-			let probed = tokio::select! {
-				_ = run_proc::<PidwaitCommand>(&argv, None) => None,
-				probed = probe => Some(probed),
+			let probed = if futures::poll!(pidwait.as_mut()).is_pending() {
+				// Pending: pidwait selected the process and waits for its exit,
+				// its first await. Only now does a blocking task show whether
+				// that wait holds the pool's one thread.
+				let probe = tokio::task::spawn_blocking(|| {});
+				tokio::select! {
+					_ = pidwait => None,
+					probed = tokio::time::timeout(Duration::from_secs(5), probe) => Some(probed),
+				}
+			} else {
+				None
 			};
 			let _ = child.kill();
 			let _ = child.wait();

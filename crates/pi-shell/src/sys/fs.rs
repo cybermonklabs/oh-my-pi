@@ -2769,15 +2769,31 @@ mod tests {
 		fn reading_a_fifo_is_pending_until_a_writer_opens() {
 			let path = fifo();
 			let mut p = pending(StdFs::default().open(path.as_bstr(), OpenFlags::READ, 0));
+			assert!(
+				p.poll(&mut Context::from_waker(Waker::noop())).is_pending(),
+				"no writer yet: Pending"
+			);
 			let host = host_path(&path).unwrap().to_path_buf();
 			let writer = thread::spawn(move || {
-				thread::sleep(Duration::from_millis(50));
-				fs::OpenOptions::new()
-					.write(true)
-					.open(host)
-					.unwrap()
-					.write_all(b"x")
-					.unwrap();
+				// The writer comes once the helper waits in open(2) for it: until
+				// then a non-blocking write open finds no reader (ENXIO).
+				// Tried 1 ms apart at first, at most 20 ms apart later.
+				let deadline = Instant::now() + Duration::from_secs(10);
+				let mut backoff = crate::testkit::Backoff::new();
+				let mut file = loop {
+					match fs::OpenOptions::new()
+						.write(true)
+						.custom_flags(libc::O_NONBLOCK)
+						.open(&host)
+					{
+						Ok(file) => break file,
+						Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {},
+						Err(e) => panic!("{e}"),
+					}
+					assert!(Instant::now() < deadline, "the open never waited for a writer");
+					thread::sleep(backoff.pause());
+				};
+				file.write_all(b"x").unwrap();
 			});
 			let mut f = finish(&mut p);
 			writer.join().unwrap();
