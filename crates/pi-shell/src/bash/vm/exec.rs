@@ -83,8 +83,12 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		}
 		if !vp.out.is_empty() {
 			let at = k.ctl.wakes();
-			match flush_out(k, vp) {
-				Some(fd) => return park(k, cx, vp, WaitKey::Write { fd }, at),
+			match flush_out(k, cx, vp) {
+				Some(Unflushed::Block(fd)) => return park(k, cx, vp, WaitKey::Write { fd }, at),
+				Some(Unflushed::Pipe(status)) => {
+					sigpipe_exit_now(k, vp, cx, status);
+					continue;
+				},
 				None => unblock(k, cx, vp),
 			}
 		}
@@ -993,9 +997,30 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	}
 }
 
+/// What [`flush_out`] left undone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unflushed {
+	/// A write to this fd would block: the vproc waits for it.
+	Block(i32),
+	/// A write met a pipe without readers and `SIGPIPE` is neither ignored
+	/// nor trapped: the virtual `SIGPIPE` ends the shell with this status
+	/// ([`command::sigpipe_exit`]). Nothing queued after it is written.
+	Pipe(i32),
+}
+
+impl Unflushed {
+	/// The op's flow: wait for the fd, or leave the shell.
+	pub const fn flow(self) -> Flow {
+		match self {
+			Self::Block(fd) => Flow::Block(WaitKey::Write { fd }),
+			Self::Pipe(status) => Flow::Exit(status),
+		}
+	}
+}
+
 /// Write queued diagnostics (`Kernel::diag`, xtrace lines, `fc -s`'s echo);
-/// the fd that would block, if any. An entry is done once it is written and
-/// the object that took its bytes has settled them
+/// what is left undone, if anything. An entry is done once it is written
+/// and the object that took its bytes has settled them
 /// ([`crate::bash::File::poll_settle_marked`], the entry's
 /// [`HandedOff`](super::proc::HandedOff)), so a command that runs next (an
 /// external that inherits the fd, a builtin writing to another fd of the
@@ -1003,14 +1028,17 @@ fn unpark(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 /// then: a failed compound redirection restores the fds between the write
 /// and the settle. The chunk handed off last settles before the next one
 /// goes, and an entry stops at its first failed chunk; write errors on a
-/// diagnostic stream are dropped, as bash does.
-pub fn flush_out(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
+/// diagnostic stream are dropped, as bash does, but for a pipe without
+/// readers, whose `SIGPIPE` ends the shell at that write ([`Unflushed::Pipe`]),
+/// ends only the child a message is from ([`childs_messages`]), or runs its
+/// trap after the command.
+pub fn flush_out(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Option<Unflushed> {
 	// The shell's job notices still going out to its terminal come first
 	// ([`jobctl::notice`]): zsh wrote them with blocking writes.
 	if super::jobctl::shout_waits(k, vp) {
-		return Some(super::zle::tty::FD);
+		return Some(Unflushed::Block(super::zle::tty::FD));
 	}
-	flush_queued(k, vp)
+	flush_queued(k, cx, vp)
 }
 
 /// Whether [`flush_out`] would wait now, without writing anything: the
@@ -1041,7 +1069,7 @@ pub fn output_waits(k: &Kernel, vp: &Vproc) -> bool {
 /// queues a notice. So this does what [`flush_out`] would; it is kept so
 /// that a notice a later change queues there still leaves the message on
 /// the redirected fd 2.
-fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
+fn flush_queued(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Option<Unflushed> {
 	use super::zle::tty;
 	// The editor's display bytes still pending were queued before any output
 	// in `vp.out` (later ones wait in it, as `tty::FD` entries; a hold there
@@ -1050,13 +1078,13 @@ fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 	if let Some(t) = vp.zle.as_deref_mut().and_then(|z| z.tty.as_mut())
 		&& t.flush(k).is_some()
 	{
-		return Some(tty::FD);
+		return Some(Unflushed::Block(tty::FD));
 	}
 	if vp.out.is_empty() {
 		return None;
 	}
 	let waker = k.waker.clone();
-	let mut cx = Context::from_waker(&waker);
+	let mut tcx = Context::from_waker(&waker);
 	while let Some(w) = vp.out.front_mut() {
 		if w.fd == tty::FD {
 			if let Some(t) = vp.zle.as_deref_mut().and_then(|z| z.tty.as_mut()) {
@@ -1068,7 +1096,7 @@ fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 					.and_then(|z| z.tty.as_mut())
 					.is_some_and(|t| t.flush(k).is_some())
 				{
-					return Some(tty::FD);
+					return Some(Unflushed::Block(tty::FD));
 				}
 				continue;
 			}
@@ -1083,12 +1111,18 @@ fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 		if let Some(held) = &w.handed.file
 			&& (done || !held.same(&handle) || w.handed.mark.is_some())
 		{
-			let Poll::Ready(settled) = held.poll_settle_marked(&mut cx, w.handed.mark.as_slice())
+			let Poll::Ready(settled) = held.poll_settle_marked(&mut tcx, w.handed.mark.as_slice())
 			else {
-				return Some(w.fd);
+				return Some(Unflushed::Block(w.fd));
 			};
 			w.handed = super::proc::HandedOff::default();
-			if settled.is_err() {
+			if let Err(err) = settled {
+				if let Some(status) = super::command::sigpipe_exit(k, cx, vp, &err) {
+					if let Some(left) = sigpipe_out(k, vp, status) {
+						return Some(left);
+					}
+					continue;
+				}
 				pop_out(k, vp);
 				continue;
 			}
@@ -1097,19 +1131,113 @@ fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 			pop_out(k, vp);
 			continue;
 		}
-		match handle.poll_write_marked(&mut cx, &w.bytes[w.off..]) {
+		match handle.poll_write_marked(&mut tcx, &w.bytes[w.off..]) {
 			Poll::Ready(Ok((n, mark))) if n > 0 => {
 				w.off += n;
 				w.handed.mark = mark;
 				w.handed.file.get_or_insert(handle);
 			},
-			Poll::Ready(_) => {
+			Poll::Ready(res) => {
+				if let Err(err) = res
+					&& let Some(status) = super::command::sigpipe_exit(k, cx, vp, &err)
+				{
+					if let Some(left) = sigpipe_out(k, vp, status) {
+						return Some(left);
+					}
+					continue;
+				}
 				pop_out(k, vp);
 			},
-			Poll::Pending => return Some(w.fd),
+			Poll::Pending => return Some(Unflushed::Block(w.fd)),
 		}
 	}
 	None
+}
+
+/// A write of the front of `vp.out` raised the virtual `SIGPIPE`. A child's
+/// message ([`PendingWrite::child`](super::proc::PendingWrite::child)): the
+/// signal ends that child, so the rest of its messages go with it, the
+/// command fails with `status` ([`command::child_died`]), and `None` lets
+/// the flush go on. Else bash dies at that write, so nothing queued after
+/// it goes out: [`Unflushed::Pipe`]. The entries are dropped as
+/// [`pop_out`] drops them (a job one held back is continued, as the kernel
+/// continues a stopped group its shell left behind).
+fn sigpipe_out(k: &mut Kernel, vp: &mut Vproc, status: i32) -> Option<Unflushed> {
+	if vp.out.front().is_some_and(|w| w.child) {
+		while vp.out.front().is_some_and(|w| w.child) {
+			pop_out(k, vp);
+		}
+		super::command::child_died(vp, status);
+		return None;
+	}
+	while !vp.out.is_empty() {
+		pop_out(k, vp);
+	}
+	Some(Unflushed::Pipe(status))
+}
+
+/// What is queued in `vp.out` now is the child's that bash forks for the
+/// command on top ([`PendingWrite::child`](super::proc::PendingWrite::child)).
+/// Queued since the op's step began: the run loop runs an op only with
+/// `vp.out` empty, and the stages before a command's messages (its trace
+/// line) are written before it goes on. The editor's display bytes stay
+/// the shell's.
+pub(super) fn childs_messages(vp: &mut Vproc) {
+	for w in vp.out.iter_mut().filter(|w| w.fd != super::zle::tty::FD) {
+		w.child = true;
+	}
+}
+
+/// [`Unflushed::Pipe`] from a [`flush_out`] made between ops (the run loop,
+/// the interactive reader): the shell leaves with `status` as an op's
+/// `Flow::Exit` does, and an op parked on top, which will not run again,
+/// is over.
+pub(super) fn sigpipe_exit_now(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
+	unblock(k, cx, vp);
+	let mode = vp
+		.frames
+		.last()
+		.and_then(|f| f.unit.as_ref())
+		.map_or(vp.mode, |u| u.mode);
+	if let Some(fi) = vp.frames.len().checked_sub(1) {
+		end_op(k, cx, vp, fi);
+	}
+	if mode.dialect() == Dialect::Zsh {
+		zsh_exit(k, vp, cx, status);
+	} else {
+		exit_shell(k, vp, cx, status);
+	}
+}
+
+/// Whether the `Redir` op at `pc` of `unit` holds a `( … )`'s own
+/// redirections (the `Enter` and `Spawn` of a subshell follow it).
+fn opens_a_subshell(unit: &Unit, pc: u32) -> bool {
+	matches!(
+		unit.ops.get(pc as usize + 1..pc as usize + 3),
+		Some([enter, spawn])
+			if enter.code == Opcode::Enter
+				&& spawn.code == Opcode::Spawn
+				&& unit.spawns.get(spawn.a as usize).is_some_and(|s| s.kind == SpawnKind::Subshell)
+	)
+}
+
+/// Whether frame `i` of `vp` is making a `( … )`'s own redirections in the
+/// shell, which bash makes in the subshell's fork: its `Redir` op is under
+/// way (its scratch holds the redirections so far), and `vp` is not itself
+/// the fork made for that `( … )` (its base frame's command).
+pub(super) fn makes_a_subshells_redirections(vp: &Vproc, i: usize) -> bool {
+	let Some(frame) = vp.frames.get(i) else {
+		return false;
+	};
+	let forked = i == 0 && vp.fork().at_entry();
+	!forked
+		&& frame.scratch.is_some()
+		&& frame.unit.as_ref().is_some_and(|u| {
+			u.ops
+				.get(frame.pc as usize)
+				.is_some_and(|op| op.code == Opcode::Redir)
+				&& opens_a_subshell(u, frame.pc)
+		})
 }
 
 /// The front of `vp.out` is out (written and settled, or dropped): pop it,
@@ -3881,8 +4009,8 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			// in a target), for a notice queued meanwhile. No redirection
 			// moves the terminal, so a failed redirection's message comes
 			// after them and goes to the fd 2 the redirections left.
-			if let Some(fd) = flush_out(k, vp) {
-				return Flow::Block(WaitKey::Write { fd });
+			if let Some(left) = flush_out(k, cx, vp) {
+				return left.flow();
 			}
 			let pc = top_frame(vp).pc;
 			// The own redirections of the command a fork was made for, and of
@@ -3895,13 +4023,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				// back): it exits now, and they are not made again.
 				return Flow::Exit(vp.status);
 			}
-			let subshell = matches!(
-				unit.ops.get(pc as usize + 1..pc as usize + 3),
-				Some([enter, spawn])
-					if enter.code == Opcode::Enter
-						&& spawn.code == Opcode::Spawn
-						&& unit.spawns.get(spawn.a as usize).is_some_and(|s| s.kind == SpawnKind::Subshell)
-			);
+			let subshell = opens_a_subshell(unit, pc);
 			// A bash `( … )`'s own `{var}`s are its fork's: the shell keeps
 			// none (zsh code keeps its own rule).
 			let fork = subshell && !forked && unit.mode.dialect() != Dialect::Zsh;
@@ -3939,11 +4061,15 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					redir::forget_var_fds(k, vp, cx);
 					// The message goes to stderr as the redirections so far
 					// left it (`2>/dev/null < ${x:?}` prints none), after a
-					// queued notice, as in the failure path below.
+					// queued notice, as in the failure path below; from the
+					// fork, whose `SIGPIPE` ends only it, with its status
+					// ([`childs_messages`]). What would block goes out after
+					// the restore.
 					super::jobctl::drain_shout(k);
-					let _ = flush_queued(k, vp);
-					clear_scratch(&mut k.root, cx.store, vp);
 					vp.status = code;
+					childs_messages(vp);
+					flush_queued(k, cx, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
 					Flow::Jump(op.b)
 				},
 				// In the job's own fork (an async compound command or pipeline
@@ -3959,10 +4085,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				{
 					vp.status = code;
 					vp.set_fork(vp.fork().end());
-					match flush_out(k, vp) {
-						Some(fd) => Flow::Block(WaitKey::Write { fd }),
-						None => Flow::Exit(code),
-					}
+					flush_out(k, cx, vp).map_or(Flow::Exit(code), Unflushed::flow)
 				},
 				Err(redir::Halt::Flow(f)) => f,
 				Err(redir::Halt::Failed) => {
@@ -3979,11 +4102,20 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					// gate ([`flush_queued`]) are kept for a notice a later change
 					// queues in between: it goes to the terminal first, and the
 					// message still goes to the fd 2 the redirections left, since
-					// the restore follows in this step.
+					// the restore follows in this step. A `SIGPIPE` of that write
+					// ends the shell, or only the fork of a `( … )` (bash's and
+					// zsh's make their own redirections), which fails with its
+					// status ([`childs_messages`]).
 					super::jobctl::drain_shout(k);
-					let _ = flush_queued(k, vp);
-					clear_scratch(&mut k.root, cx.store, vp);
 					vp.status = 1;
+					if subshell && !forked {
+						childs_messages(vp);
+					}
+					let left = flush_queued(k, cx, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
+					if let Some(Unflushed::Pipe(status)) = left {
+						return Flow::Exit(status);
+					}
 					Flow::Jump(op.b)
 				},
 			}

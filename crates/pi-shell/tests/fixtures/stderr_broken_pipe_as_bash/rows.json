@@ -1,0 +1,2162 @@
+[
+ {
+  "id": "sp-xtrace-fd2-export",
+  "file": false,
+  "script": "{ exec 2>&1; set -x; sleep 0.3; export X=1; echo after > f4; } | :; echo \"p=$?\"; [ -e f4 ]; echo \"f4=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf4=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf4=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-xtrace-fd2-export",
+  "file": true,
+  "script": "{ exec 2>&1; set -x; sleep 0.3; export X=1; echo after > f4; } | :; echo \"p=$?\"; [ -e f4 ]; echo \"f4=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf4=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf4=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-xtrace-fd7-true",
+  "file": false,
+  "script": "{ exec 7>&1 >/dev/null; BASH_XTRACEFD=7; set -x; sleep 0.3; true; echo after > f6; } | :; echo \"p=$?\"; [ -e f6 ]; echo \"f6=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf6=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf6=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-xtrace-fd7-true",
+  "file": true,
+  "script": "{ exec 7>&1 >/dev/null; BASH_XTRACEFD=7; set -x; sleep 0.3; true; echo after > f6; } | :; echo \"p=$?\"; [ -e f6 ]; echo \"f6=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf6=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf6=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-xtrace-fd7-bintrue",
+  "file": false,
+  "script": "{ exec 7>&1 >/dev/null; BASH_XTRACEFD=7; set -x; sleep 0.3; /bin/true; echo after > f6; } | :; echo \"p=$?\"; [ -e f6 ]; echo \"f6=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf6=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf6=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-xtrace-fd7-bintrue",
+  "file": true,
+  "script": "{ exec 7>&1 >/dev/null; BASH_XTRACEFD=7; set -x; sleep 0.3; /bin/true; echo after > f6; } | :; echo \"p=$?\"; [ -e f6 ]; echo \"f6=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf6=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf6=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-xtrace-fd7-export",
+  "file": false,
+  "script": "{ exec 7>&1; BASH_XTRACEFD=7; set -x; sleep 0.3; export X=1; echo after > f2; } | :; echo \"p=$?\"; [ -e f2 ]; echo \"f2=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf2=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf2=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-xtrace-fd7-export",
+  "file": true,
+  "script": "{ exec 7>&1; BASH_XTRACEFD=7; set -x; sleep 0.3; export X=1; echo after > f2; } | :; echo \"p=$?\"; [ -e f2 ]; echo \"f2=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf2=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf2=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-xtrace-fd2-external",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; set -x; /bin/true; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-xtrace-fd2-external",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; set -x; /bin/true; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-xtrace-fd2-assign",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; set -x; x=1; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-xtrace-fd2-assign",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; set -x; x=1; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-cd-missing",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-cd-missing",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-type-missing",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; type nosuch_cmd_xyz; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-type-missing",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; type nosuch_cmd_xyz; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-declare-p-missing",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; declare -p nosuch_var_xyz; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-declare-p-missing",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; declare -p nosuch_var_xyz; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-printf-badnum",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; printf '%d' abc; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-printf-badnum",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; printf '%d' abc; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-kill-nojob",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; kill %9; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-kill-nojob",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; kill %9; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-test-int",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; [ 1 -eq a ]; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-test-int",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; [ 1 -eq a ]; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-getopts-bad",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; getopts a o -z; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-getopts-bad",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; getopts a o -z; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-bind-warning",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; bind; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-bind-warning",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; bind; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-export-bad",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; export 'a b=1'; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-export-bad",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; export 'a b=1'; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-unset-readonly",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; readonly r=1; unset r; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-unset-readonly",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; readonly r=1; unset r; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-builtin-bad",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; builtin nosuch_builtin; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-builtin-bad",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; builtin nosuch_builtin; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-shift-quiet",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; shift 5; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-shift-quiet",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; shift 5; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-read-p-not-tty",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; read -p 'prompt> ' v < /dev/null; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-read-p-not-tty",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; read -p 'prompt> ' v < /dev/null; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-echo-full",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo x > /dev/full; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-echo-full",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo x > /dev/full; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-assign-readonly",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; readonly r=1; r=2; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-assign-readonly",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; readonly r=1; r=2; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-arith-div0",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo $((1/0)); echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-arith-div0",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo $((1/0)); echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-param-q",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo ${UNSET_V:?gone}; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-param-q",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo ${UNSET_V:?gone}; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-eval-syntax",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; eval 'if'; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-eval-syntax",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; eval 'if'; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-builtin",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; : < /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-builtin",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; : < /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-null-out",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; > /nonexistent/x; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-null-out",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; > /nonexistent/x; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-group",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; { :; } < /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-group",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; { :; } < /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-time",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; time :; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-time",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; time :; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-select",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; select x in a b; do break; done < /dev/null; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-select",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; select x in a b; do break; done < /dev/null; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-bg-signaled",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; sleep 5 & kill $!; wait $!; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-bg-signaled",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; sleep 5 & kill $!; wait $!; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-notfound",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; nosuch_cmd_xyz; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-notfound",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; nosuch_cmd_xyz; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-notfound-command",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; command nosuch_cmd_xyz; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-notfound-command",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; command nosuch_cmd_xyz; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-notfound-last",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; nosuch_cmd_xyz; } | :; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "ps=141 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-notfound-last",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; nosuch_cmd_xyz; } | :; echo \"ps=${PIPESTATUS[*]}\"",
+  "bash53": [
+   0,
+   "ps=141 0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-noexec",
+  "file": false,
+  "script": ": > nx; chmod 644 nx; { exec 2>&1 >/dev/null; sleep 0.3; ./nx; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-noexec",
+  "file": true,
+  "script": ": > nx; chmod 644 nx; { exec 2>&1 >/dev/null; sleep 0.3; ./nx; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-isdir",
+  "file": false,
+  "script": "mkdir d; { exec 2>&1 >/dev/null; sleep 0.3; ./d; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-isdir",
+  "file": true,
+  "script": "mkdir d; { exec 2>&1 >/dev/null; sleep 0.3; ./d; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-external",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; cat < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-external",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; cat < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-null-in",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-null-in",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-subshell",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; ( : ) < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-subshell",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; ( : ) < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-external-q",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; cat < ${UNSET_V:?gone}; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-external-q",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; cat < ${UNSET_V:?gone}; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-builtin-s",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; : < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-builtin-s",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; : < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-group-s",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; { :; } < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-redir-group-s",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; { :; } < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-exec-notfound",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; exec nosuch_cmd_xyz; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-exec-notfound",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; exec nosuch_cmd_xyz; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\ns=none\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-exit-trap-fd2",
+  "file": false,
+  "script": "{ trap 'echo t > ft' EXIT; exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e ft ]; echo \"ft=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\nft=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\nft=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-exit-trap-fd2",
+  "file": true,
+  "script": "{ trap 'echo t > ft' EXIT; exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e ft ]; echo \"ft=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\nft=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\nft=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-exit-trap-fd1",
+  "file": false,
+  "script": "{ trap 'echo t > ft' EXIT; exec 2>/dev/null; sleep 0.3; echo out; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e ft ]; echo \"ft=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\nft=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\nft=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-exit-trap-fd1",
+  "file": true,
+  "script": "{ trap 'echo t > ft' EXIT; exec 2>/dev/null; sleep 0.3; echo out; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e ft ]; echo \"ft=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\nft=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\nft=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-pipe-trap-fd2",
+  "file": false,
+  "script": "{ trap 'echo p >> fp' PIPE; exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs fp",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\np\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\np\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-pipe-trap-fd2",
+  "file": true,
+  "script": "{ trap 'echo p >> fp' PIPE; exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs fp",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\np\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\np\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-pipe-trap-fd1",
+  "file": false,
+  "script": "{ trap 'echo p >> fp' PIPE; exec 2>/dev/null; sleep 0.3; echo out; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs fp",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\np\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\np\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-pipe-trap-fd1",
+  "file": true,
+  "script": "{ trap 'echo p >> fp' PIPE; exec 2>/dev/null; sleep 0.3; echo out; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs fp",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\np\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\np\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-pipe-trap-top",
+  "file": false,
+  "script": "trap 'echo p >&3' PIPE; exec 3>&1 2> >(:); sleep 0.3; cd /nonexistent; echo \"after $?\" >&3",
+  "bash53": [
+   0,
+   "p\nafter 1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p\nafter 1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-pipe-trap-top",
+  "file": true,
+  "script": "trap 'echo p >&3' PIPE; exec 3>&1 2> >(:); sleep 0.3; cd /nonexistent; echo \"after $?\" >&3",
+  "bash53": [
+   0,
+   "p\nafter 1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p\nafter 1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-pipe-trap-inherited",
+  "file": false,
+  "script": "trap 'echo p >> fp' PIPE; { exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fp ]; echo \"fp=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\nfp=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\nfp=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-pipe-trap-inherited",
+  "file": true,
+  "script": "trap 'echo p >> fp' PIPE; { exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fp ]; echo \"fp=$?\"",
+  "bash53": [
+   0,
+   "ps=141 0\nf=1\nfp=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=141 0\nf=1\nfp=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-inherited",
+  "file": false,
+  "script": "trap '' PIPE; { exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-inherited",
+  "file": true,
+  "script": "trap '' PIPE; { exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; [ -e fs ] && cat fs || echo s=none",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-cd",
+  "file": false,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-cd",
+  "file": true,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-trace",
+  "file": false,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; set -x; export X=1; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-trace",
+  "file": true,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; set -x; export X=1; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-bind",
+  "file": false,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; bind; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-bind",
+  "file": true,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; bind; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-echo-full",
+  "file": false,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; echo x > /dev/full; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-echo-full",
+  "file": true,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; echo x > /dev/full; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-out",
+  "file": false,
+  "script": "{ trap '' PIPE; exec 2>e; sleep 0.3; echo out; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs e",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\nbash: line 1: echo: write error: Broken pipe\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\nbash: line 1: echo: write error: Broken pipe\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-out",
+  "file": true,
+  "script": "{ trap '' PIPE; exec 2>e; sleep 0.3; echo out; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs e",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\n./s.sh: line 1: echo: write error: Broken pipe\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\n./s.sh: line 1: echo: write error: Broken pipe\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-fd7",
+  "file": false,
+  "script": "{ trap '' PIPE; exec 7>&1 >/dev/null; BASH_XTRACEFD=7; set -x; sleep 0.3; true; export X=1; echo after > f6; } | :; echo \"p=$?\"; [ -e f6 ]; echo \"f6=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf6=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf6=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ignored-fd7",
+  "file": true,
+  "script": "{ trap '' PIPE; exec 7>&1 >/dev/null; BASH_XTRACEFD=7; set -x; sleep 0.3; true; export X=1; echo after > f6; } | :; echo \"p=$?\"; [ -e f6 ]; echo \"f6=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf6=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf6=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-top-level",
+  "file": false,
+  "script": "exec 3>&1 2> >(:); sleep 0.3; cd /nonexistent; echo after >&3",
+  "bash53": [
+   141,
+   "",
+   ""
+  ],
+  "bash52": [
+   141,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "sp-top-level",
+  "file": true,
+  "script": "exec 3>&1 2> >(:); sleep 0.3; cd /nonexistent; echo after >&3",
+  "bash53": [
+   141,
+   "",
+   ""
+  ],
+  "bash52": [
+   141,
+   "",
+   ""
+  ]
+ },
+ {
+  "id": "sp-top-level-exit-trap",
+  "file": false,
+  "script": "trap 'echo t >&3' EXIT; exec 3>&1 2> >(:); sleep 0.3; cd /nonexistent; echo after >&3",
+  "bash53": [
+   141,
+   "t\n",
+   ""
+  ],
+  "bash52": [
+   141,
+   "t\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-top-level-exit-trap",
+  "file": true,
+  "script": "trap 'echo t >&3' EXIT; exec 3>&1 2> >(:); sleep 0.3; cd /nonexistent; echo after >&3",
+  "bash53": [
+   141,
+   "t\n",
+   ""
+  ],
+  "bash52": [
+   141,
+   "t\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ctl-out",
+  "file": false,
+  "script": "{ sleep 0.3; echo out; echo after > f3; } | :; echo \"p=$?\"; [ -e f3 ]; echo \"f3=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf3=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf3=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ctl-out",
+  "file": true,
+  "script": "{ sleep 0.3; echo out; echo after > f3; } | :; echo \"p=$?\"; [ -e f3 ]; echo \"f3=$?\"",
+  "bash53": [
+   0,
+   "p=0\nf3=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "p=0\nf3=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ctl-stderr-file",
+  "file": false,
+  "script": "{ exec 2>e >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat e",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\nbash: line 1: cd: /nonexistent: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\nbash: line 1: cd: /nonexistent: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ctl-stderr-file",
+  "file": true,
+  "script": "{ exec 2>e >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat e",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\n./s.sh: line 1: cd: /nonexistent: No such file or directory\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\n./s.sh: line 1: cd: /nonexistent: No such file or directory\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ctl-stderr-full",
+  "file": false,
+  "script": "{ exec 2>/dev/full >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ctl-stderr-full",
+  "file": true,
+  "script": "{ exec 2>/dev/full >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ctl-stderr-closed",
+  "file": false,
+  "script": "{ exec 2>&- >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ctl-stderr-closed",
+  "file": true,
+  "script": "{ exec 2>&- >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat fs",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ctl-stderr-live",
+  "file": false,
+  "script": "{ cd /nonexistent; set -x; true; echo after > f; } 2>&1 | cat > o; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat o",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\nbash: line 1: cd: /nonexistent: No such file or directory\n+ true\n+ echo after\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\nbash: line 1: cd: /nonexistent: No such file or directory\n+ true\n+ echo after\n",
+   ""
+  ]
+ },
+ {
+  "id": "sp-ctl-stderr-live",
+  "file": true,
+  "script": "{ cd /nonexistent; set -x; true; echo after > f; } 2>&1 | cat > o; echo \"ps=${PIPESTATUS[*]}\"; [ -e f ]; echo \"f=$?\"; cat o",
+  "bash53": [
+   0,
+   "ps=0 0\nf=0\n./s.sh: line 1: cd: /nonexistent: No such file or directory\n+ true\n+ echo after\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nf=0\n./s.sh: line 1: cd: /nonexistent: No such file or directory\n+ true\n+ echo after\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0028-k-cat-body",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > nul$(< /dev/null${f:=x}); echo \"[$f]\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0028-k-cat-body",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > nul$(< /dev/null${f:=x}); echo \"[$f]\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0204-z-break-noloop-valsub",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > ${| break; REPLY=/dev/null; }; echo \"ok $?\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0204-z-break-noloop-valsub",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > ${| break; REPLY=/dev/null; }; echo \"ok $?\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0205-z-break-noloop-funsub",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > ${ break; echo /dev/null; }; echo \"ok $?\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0205-z-break-noloop-funsub",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > ${ break; echo /dev/null; }; echo \"ok $?\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0206-z-continue-noloop-valsub",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > ${| continue; REPLY=/dev/null; }; echo \"ok $?\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0206-z-continue-noloop-valsub",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > ${| continue; REPLY=/dev/null; }; echo \"ok $?\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0207-z-break-in-func-in-loop",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\nf() { /bin/true > ${| break; REPLY=/dev/null; }; echo \"in $?\"; }; for i in 1 2; do f; echo \"it $i\"; done; echo out\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0207-z-break-in-func-in-loop",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\nf() { /bin/true > ${| break; REPLY=/dev/null; }; echo \"in $?\"; }; for i in 1 2; do f; echo \"it $i\"; done; echo out\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0211-z-break-noloop-eval",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > ${| eval break; REPLY=/dev/null; }; echo \"ok $?\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0211-z-break-noloop-eval",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > ${| eval break; REPLY=/dev/null; }; echo \"ok $?\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0213-z-break-noloop-after-inner",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > ${| for j in 1; do :; done; break; REPLY=/dev/null; }; echo \"ok $?\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0213-z-break-noloop-after-inner",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n/bin/true > ${| for j in 1; do :; done; break; REPLY=/dev/null; }; echo \"ok $?\"\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0218-z-break-noloop-subshell",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n( echo s ) > ${| break; REPLY=f; }; echo \"ok $?\"; cat f\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0218-z-break-noloop-subshell",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\n( echo s ) > ${| break; REPLY=f; }; echo \"ok $?\"; cat f\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0219-z-break-loop-subshell",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\nfor i in 1 2; do ( echo \"s $i\" ) > ${| break; REPLY=f; }; echo \"in $i $?\"; done; cat f; echo out\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0219-z-break-loop-subshell",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\nfor i in 1 2; do ( echo \"s $i\" ) > ${| break; REPLY=f; }; echo \"in $i $?\"; done; cat f; echo out\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0220-z-continue-loop-subshell",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\nfor i in 1 2; do ( echo \"s $i\" ) > ${| continue; REPLY=f; }; echo \"in $i $?\"; done; cat f; echo out\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "c0220-z-continue-loop-subshell",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3\nfor i in 1 2; do ( echo \"s $i\" ) > ${| continue; REPLY=f; }; echo \"in $i $?\"; done; cat f; echo out\n: > census.end; } | :; echo \"ps=${PIPESTATUS[*]}\"; [ -e census.end ]; echo \"end=$?\"",
+  "bash53": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ],
+  "bash52": [
+   0,
+   "ps=0 0\nend=0\n",
+   ""
+  ]
+ }
+]

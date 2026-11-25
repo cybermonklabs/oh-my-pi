@@ -2544,7 +2544,10 @@ mod tests {
 	}
 
 	/// A diagnostic of two chunks (`Kernel::diag`, written by `flush_out`)
-	/// stops at the first one that fails, and the next command runs.
+	/// stops at the first one that fails, and the next command runs. The
+	/// message is a name not found, which bash writes in the child it forked
+	/// for the command: the pipe's `SIGPIPE` ends that child (141), not the
+	/// shell.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn a_diagnostic_stops_at_its_first_failed_chunk() {
@@ -2555,7 +2558,7 @@ mod tests {
 					"big=$(printf '%070000d' 0); \"$big\"; echo \"after=$?\"",
 					2,
 				);
-				assert!(out.contains("after=127"), "the next command: {out:?}");
+				assert!(out.contains("after=141"), "the next command: {out:?}");
 				assert_eq!(failed, 1, "chunks handed off after the first one failed");
 			},
 		);

@@ -94,6 +94,10 @@ pub struct Reader {
 	addret:           i32,
 	/// The logout files were sourced (zsh does it once).
 	logged_out:       bool,
+	/// A write of the prompt or of the notices before it raised the
+	/// virtual `SIGPIPE` ([`crate::bash::vm::exec::Unflushed::Pipe`]): the
+	/// shell leaves with this status once the step is over ([`read_line`]).
+	sigpipe:          Option<i32>,
 }
 
 /// The expanded prompts of a line.
@@ -217,7 +221,17 @@ pub fn read_line(
 	cont: bool,
 	cmdstack: Vec<&'static str>,
 ) -> Option<WaitKey> {
-	with_reader(k, cx, vp, |r, k, cx, vp| r.step(k, cx, vp, cont, cmdstack))
+	let key = with_reader(k, cx, vp, |r, k, cx, vp| r.step(k, cx, vp, cont, cmdstack));
+	if let Some(status) = vp
+		.zle
+		.as_deref_mut()
+		.and_then(|z| z.reader.as_mut())
+		.and_then(|r| r.sigpipe.take())
+	{
+		crate::bash::vm::exec::sigpipe_exit_now(k, vp, cx, status);
+		return None;
+	}
+	key
 }
 
 /// Before the command parsed at `pos` of the stdin frame runs: zsh's
@@ -527,6 +541,9 @@ impl Reader {
 					if let Some(key) = self.preprompt(k, cx, vp) {
 						return Some(key);
 					}
+					if self.sigpipe.is_some() {
+						return None;
+					}
 					if vp.mode.dialect() == Dialect::Zsh {
 						hook_batch(self, k, cx, vp, b"precmd", &[]);
 					} else {
@@ -614,8 +631,11 @@ impl Reader {
 						self.phase = Phase::Plain;
 						self.print_plain_prompt(vp);
 						// The prompt is out before the line is waited for.
-						if let Some(fd) = crate::bash::vm::exec::flush_out(k, vp) {
-							return Some(WaitKey::Write { fd });
+						if let Some(key) = self.flush(k, cx, vp) {
+							return Some(key);
+						}
+						if self.sigpipe.is_some() {
+							return None;
 						}
 					}
 				},
@@ -663,8 +683,11 @@ impl Reader {
 		// Job lines first: zsh prints `[n] pid` at the fork, before the
 		// next prompt's `PROMPT_SP`.
 		jobctl::notices_before_prompt(k, cx, vp);
-		if let Some(fd) = crate::bash::vm::exec::flush_out(k, vp) {
-			return Some(WaitKey::Write { fd });
+		if let Some(key) = self.flush(k, cx, vp) {
+			return Some(key);
+		}
+		if self.sigpipe.is_some() {
+			return None;
 		}
 		let zsh = vp.mode.dialect() == Dialect::Zsh;
 		if zsh
@@ -683,6 +706,20 @@ impl Reader {
 			.as_ref()
 			.and_then(|z| z.tty.as_ref())
 			.is_some_and(|t| t.caps.is_some())
+	}
+
+	/// The shell's queued output out ([`crate::bash::vm::exec::flush_out`]):
+	/// `Some` parks on a write that would block; after the virtual `SIGPIPE`
+	/// it is `None` with [`Self::sigpipe`] set, and the step ends.
+	fn flush(&mut self, k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> Option<WaitKey> {
+		use crate::bash::vm::exec::Unflushed;
+		match crate::bash::vm::exec::flush_out(k, cx, vp)? {
+			Unflushed::Block(fd) => Some(WaitKey::Write { fd }),
+			Unflushed::Pipe(status) => {
+				self.sigpipe = Some(status);
+				None
+			},
+		}
 	}
 
 	/// zsh's `PROMPT_SP` heuristic: `PROMPT_EOL_MARK` (default
