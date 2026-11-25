@@ -21,10 +21,14 @@ function backToStart(bytes: Buffer, at: number, floor: number): number {
 	return back > 0 && lead !== undefined && lead >= 0xc0 ? back : 0;
 }
 
-/** A generation hash value, `<token> <mtime>`, as its token and its mtime; neither when it has no such shape. */
-function splitGeneration(held: string | undefined): [token?: string, mtime?: string] {
+/**
+ * The token a generation hash value `held` (`<token> <mtime>`) holds while the
+ * mtime recorded beside it is the meta hash's `mtime`, as `HELD_TOKEN` reads
+ * it; `undefined` when it holds none.
+ */
+function heldToken(held: string | undefined, mtime: string | undefined): string | undefined {
 	const match = held === undefined ? null : /^(\S+) (.*)$/.exec(held);
-	return match ? [match[1], match[2]] : [];
+	return match && match[2] === mtime ? match[1] : undefined;
 }
 
 /** The generation hash value a full write or a move leaves: its new `token` and the mtime it sets. */
@@ -35,8 +39,7 @@ export function newGeneration(token: string, mtimeMs: string): string {
 /**
  * The generation hash value an append or a title update leaves, given the
  * value `held` and the meta hash's `mtime` before it, its new `token` and the
- * mtime it sets: the held token while the mtime recorded beside it is the meta
- * hash's, else the new one.
+ * mtime it sets: the held token, else the new one.
  */
 export function keptGeneration(
 	held: string | undefined,
@@ -44,18 +47,15 @@ export function keptGeneration(
 	token: string,
 	mtimeMs: string,
 ): string {
-	const [kept, recorded] = splitGeneration(held);
-	return newGeneration(kept !== undefined && recorded === mtime ? kept : token, mtimeMs);
+	return newGeneration(heldToken(held, mtime) ?? token, mtimeMs);
 }
 
 /**
  * The generation a window returns, given the generation hash's value `held`
- * and the meta hash's `mtime`: the token while the mtime recorded beside it is
- * the meta hash's, else "?" and the meta hash's mtime.
+ * and the meta hash's `mtime`: the held token, else "?".
  */
 export function windowGeneration(held: string | undefined, mtime: string | undefined): string {
-	const [token, recorded] = splitGeneration(held);
-	return token !== undefined && recorded === mtime ? token : `?${mtime ?? ""}`;
+	return heldToken(held, mtime) ?? "?";
 }
 
 /**
@@ -81,7 +81,7 @@ export function readWindow(
 	let end = Math.min(start + Number(most), stop);
 	if (end < stop) end -= backToStart(bytes, end, start + 1);
 	const window = bytes.subarray(start, end);
-	const digest = generation.startsWith("?") ? new Bun.CryptoHasher("sha1").update(window).digest("hex") : "";
+	const digest = generation === "?" ? new Bun.CryptoHasher("sha1").update(window).digest("hex") : "";
 	return [bytes.length, generation, window.length, digest, window.toString("utf-8"), from - start];
 }
 

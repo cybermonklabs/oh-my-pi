@@ -120,33 +120,33 @@ end
 redis.call("HSET", KEYS[5], ARGV[1], ARGV[7] .. " " .. ARGV[2])
 return {1, staged}`;
 
-// The token an append or a title update leaves a session's generation with:
-// the one the generation hash holds, while the mtime recorded beside it is
-// the one the meta hash holds; else the new token it was passed, because a
-// write that keeps no generation (an earlier version's) changed the session
-// since. Run before the script sets the new mtime.
-const KEPT_GENERATION = `local function kept_generation(meta, generation, path, token)
+// The token a session's generation holds: the one the generation hash holds,
+// while the mtime recorded beside it is the one the meta hash holds; nil when
+// not, because a write that keeps no generation (an earlier version's)
+// changed the session since. An append or a title update keeps it, or takes
+// the new token it was passed, before it sets the new mtime.
+const HELD_TOKEN = `local function held_token(meta, generation, path)
 	local held = redis.call("HGET", generation, path)
 	if held then
-		local kept, mtime = string.match(held, "^(%S+) (.*)$")
-		if kept and mtime == redis.call("HGET", meta, path) then
-			return kept
+		local token, mtime = string.match(held, "^(%S+) (.*)$")
+		if token and mtime == redis.call("HGET", meta, path) then
+			return token
 		end
 	end
-	return token
+	return nil
 end`;
 
 const APPEND_SCRIPT = `-- OMP_APPEND
-${KEPT_GENERATION}
-local token = kept_generation(KEYS[2], KEYS[3], ARGV[2], ARGV[4])
+${HELD_TOKEN}
+local token = held_token(KEYS[2], KEYS[3], ARGV[2]) or ARGV[4]
 local size = redis.call("APPEND", KEYS[1], ARGV[1])
 redis.call("HSET", KEYS[2], ARGV[2], ARGV[3])
 redis.call("HSET", KEYS[3], ARGV[2], token .. " " .. ARGV[3])
 return size`;
 
 const UPDATE_TITLE_SCRIPT = `-- OMP_UPDATE_TITLE
-${KEPT_GENERATION}
-local token = kept_generation(KEYS[1], KEYS[3], ARGV[1], ARGV[4])
+${HELD_TOKEN}
+local token = held_token(KEYS[1], KEYS[3], ARGV[1]) or ARGV[4]
 redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
 redis.call("HSET", KEYS[2], ARGV[1], ARGV[3])
 redis.call("HSET", KEYS[3], ARGV[1], token .. " " .. ARGV[2])
@@ -169,13 +169,13 @@ return {redis.call("STRLEN", KEYS[1]), text}`;
 // from byte ARGV[1] at most ARGV[2] bytes, up to ARGV[3], the size the read's
 // first window saw ("" for the first window, which reads up to the size it
 // finds). KEYS[2] is the meta hash, KEYS[3] the generation hash and ARGV[4]
-// the session's path in both. The generation is its token while the mtime
-// the generation hash records beside it is the one the meta hash holds, and
-// "?" with the meta hash's mtime when not (a write that keeps no generation,
-// an earlier version's, came after the last one that did): every write moves
-// one or the other, except an append or a title update made while the token
-// holds, and an earlier version's write that sets the very mtime recorded, or
-// that sets the bytes and the mtime in two commands with this window between
+// the session's path in both. The generation is its held token (see
+// `HELD_TOKEN`), and "?" when it holds none (a write that keeps no
+// generation, an earlier version's, came after the last one that did):
+// every write moves the mtime or the token, except an append or a title
+// update made while the token holds, and an earlier version's write that
+// sets the very mtime recorded, or that sets the bytes and the mtime in two
+// commands with this window between
 // them: a full write or an append of a release before v17.1.0 (commit
 // 4bc68b45e25 made them one script), or a move onto the session by a build
 // whose move is not one script (every upstream release through v19.1.1; this
@@ -192,6 +192,7 @@ return {redis.call("STRLEN", KEYS[1]), text}`;
 // ARGV[1]}; {size} alone when the key is shorter than ARGV[3] now, and nil
 // when it is missing.
 const READ_WINDOW_SCRIPT = `-- OMP_READ_WINDOW
+${HELD_TOKEN}
 if redis.call("EXISTS", KEYS[1]) == 0 then
 	return false
 end
@@ -203,15 +204,7 @@ if ARGV[3] ~= "" then
 		return {size}
 	end
 end
-local mtime = redis.call("HGET", KEYS[2], ARGV[4])
-local generation = "?" .. (mtime or "")
-local held = redis.call("HGET", KEYS[3], ARGV[4])
-if held then
-	local token, recorded = string.match(held, "^(%S+) (.*)$")
-	if token and recorded == mtime then
-		generation = token
-	end
-end
+local generation = held_token(KEYS[2], KEYS[3], ARGV[4]) or "?"
 -- The continuation bytes (10xxxxxx), at most three and none before byte
 -- floor, that run back from byte at to the byte that begins their character;
 -- 0 when byte at begins one, or when no such byte is found.
@@ -244,7 +237,7 @@ if last + 1 < stop then
 end
 local text = redis.call("GETRANGE", KEYS[1], start, last)
 local digest = ""
-if string.sub(generation, 1, 1) == "?" then
+if generation == "?" then
 	digest = redis.sha1hex(text)
 end
 return {size, generation, string.len(text), digest, text, first - start}`;
@@ -362,13 +355,8 @@ function writeReply(result: unknown): [status: number, size: number] {
 	return Array.isArray(result) ? [Number(result[0]), Number(result[1])] : [Number.NaN, Number.NaN];
 }
 
-/**
- * Whether a window's generation (see `READ_WINDOW_SCRIPT`) is the "?" one of
- * a session with no token: an earlier version wrote it last.
- */
-function isUnversioned(generation: string): boolean {
-	return generation.startsWith("?");
-}
+/** The generation a window returns for a session with no token (see `READ_WINDOW_SCRIPT`): an earlier version wrote it last. */
+const UNVERSIONED = "?";
 
 /**
  * Redis-backed implementation of {@link SessionStorage}. Each session JSONL
@@ -525,13 +513,8 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 				const size = Number(reply[0]);
 				const generation = String(reply[1]);
 				if (first === undefined) first = { stop: size, generation };
-				else if (
-					size < first.stop ||
-					// Without a token at either window, the check at the read's end decides.
-					(generation !== first.generation && !(isUnversioned(first.generation) && isUnversioned(generation)))
-				) {
-					throw new SessionReadConflictError(path);
-				}
+				// Without a token at either window both read "?", and the check at the read's end decides.
+				else if (size < first.stop || generation !== first.generation) throw new SessionReadConflictError(path);
 				const length = Number(reply[2]);
 				if (length === 0) return;
 				// Only a first window from inside a character starts before `at`.
@@ -547,7 +530,7 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 			throw err;
 		} finally {
 			// Without a token, more than one window: at the read's end, or where its consumer closed it, unless failing.
-			if (!failed && first && isUnversioned(first.generation) && windows.length > 3) {
+			if (!failed && first?.generation === UNVERSIONED && windows.length > 3) {
 				await this.#confirmWindows(path, key, windows);
 			}
 		}
