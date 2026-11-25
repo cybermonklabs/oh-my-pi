@@ -464,11 +464,12 @@ pub struct GetoptsState {
 pub struct JobList {
 	jobs:    Vec<Job>,
 	/// The lowest index changed since [`Self::take_changed`], or
-	/// [`Self::NONE`]. 0 (every job) in a new, deserialized or cloned list.
+	/// [`Self::NONE`]. 0 (every job) in a new or deserialized list; a clone
+	/// copies it.
 	#[serde(skip)]
 	changed: u32,
 	/// No job is [`Job::unreaped`]: [`JobTable::all_reaped`] has nothing to
-	/// do. False (look) in a new, deserialized or cloned list.
+	/// do. False (look) in a new or deserialized list; a clone copies it.
 	#[serde(skip)]
 	reaped:  bool,
 }
