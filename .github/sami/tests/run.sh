@@ -8,7 +8,7 @@
 #     them out, with a test binary beside each log that lists its tests.
 #   - fetch-verified.sh, with a stub in place of curl.
 #   - rust-test-parity.sh, against stubs of cargo and bazelisk query.
-#   - rust-test-tmpdir.sh.
+#   - rust-test-tmpdir.sh, and libtest-bound.py (its own selftest) under it.
 #   - release-candidate.sh, publish's checks, by release-candidate-harness.sh
 #     with a stub in place of gh (cases RC-*).
 #   - sami-build.yml and .github/actions/bun-install: only release_binary
@@ -136,6 +136,15 @@ summary() { # label status [failed logs] [passed logs], each list split on space
 }
 # metrics <milliseconds>: the event that gives the invocation's wall time.
 metrics() { jq -cn --arg w "$1" '{id: {buildMetrics: {}}, buildMetrics: {timingMetrics: {wallTimeInMs: $w}}}'; }
+# attempt <label> <status> <attempt> <seconds>: the testResult event of one
+# test attempt, its run time as testAttemptDuration (MILLIS=1: as the older
+# testAttemptDurationMillis, <seconds> then in milliseconds; CACHED=1: a
+# result Bazel reused from an earlier run; SHARD: its shard, 1 by default).
+attempt() {
+	jq -cn --arg l "$1" --arg s "$2" --argjson a "$3" --arg d "$4" --arg m "${MILLIS:-}" --arg c "${CACHED:-}" --argjson sh "${SHARD:-1}" '{id:{testResult:{label:$l,run:1,shard:$sh,attempt:$a,configuration:{id:"c"}}},testResult:({status:$s}
+		+ (if $m != "" then {testAttemptDurationMillis:$d} else {testAttemptDuration:($d + "s")} end)
+		+ (if $c != "" then {cachedLocally:true} else {} end))}'
+}
 # tpath / bpath <label>: a target's test.log and test binary, as Bazel lays
 # them out under bazel-out.
 tpath() { local l="${1#//}"; printf '%s/out/testlogs/%s/%s/test.log' "$logs" "${l%%:*}" "${l#*:}"; }
@@ -286,7 +295,7 @@ W="$w"
 logs="$w/logs"
 OWN_TESTS="${OWN_TESTS:-}"
 OWN_PRINTS="${OWN_PRINTS:-}"
-$(declare -f lt_pass lt_fail lt_out lt_ignored lt_partial lt_child_summary doc_pass doc_fail cfg summary metrics unbuilt tpath bpath fakebin record_names target rt dt nt listed sanct query_names own_default)
+$(declare -f lt_pass lt_fail lt_out lt_ignored lt_partial lt_child_summary doc_pass doc_fail cfg summary metrics attempt unbuilt tpath bpath fakebin record_names target rt dt nt listed sanct query_names own_default)
 args=("\$@")
 if [ "\${args[0]#--bazelrc=}" != "\${args[0]}" ]; then args=("\${args[@]:1}"); fi
 if [ "\${args[0]}" = query ]; then
@@ -715,6 +724,19 @@ IGNORED_ROOT="$A a::cycle" NOT_MSG='stub:|::error' KNOWN_OUTPUT="$OKNOWN" IGNORE
 # the verdict stays the test's.
 OPT_BUILD_BODY="metrics NaN >\"\$bep\"; exit 0" IGN_OPT_BODY="FMT=json; { RUN_S=-1 FILTERED=1 rt $A PASSED lt_out $SW 'full corpus: 8661 files, 69288 comparisons\\n'; metrics 1e999; } >\"\$bep\"; exit 0" NOT_MSG='::error' o_run O11-opt-malformed-timings-read-unknown 0 "compilation mode opt; build UNKNOWN s \\(bazel build, exit 0\\), test UNKNOWN s \\(bazel test; the test binary's run UNKNOWN s\\)\$" '' "$OMAIN"
 
+# TT: each test attempt's run time, from the build event log's testResult
+# events (Bazel's own summary names only the targets that did not pass): the
+# measure a target's timeout is set from. It changes no verdict.
+NOT_MSG='::error' run TT1-each-attempt-prints-its-run-time 0 "^Test time \\(main\\): $D attempt 1: PASSED in 412\\.3 s\$" '' "{ $P; rt $D PASSED lt_pass a::one; attempt $D PASSED 1 412.345; } >\"\$bep\"; exit 0"
+TT2="{ $P; rt $D PASSED lt_pass a::one; attempt $D FAILED 1 61.5; attempt $D PASSED 2 50.9; } >\"\$bep\"; exit 0"
+NOT_MSG='::error' run TT2a-a-retried-target-prints-its-first-attempt 0 "^Test time \\(main\\): $D attempt 1: FAILED in 61\\.5 s\$" '' "$TT2"
+NOT_MSG='::error' run TT2b-a-retried-target-prints-its-second-attempt 0 "^Test time \\(main\\): $D attempt 2: PASSED in 50\\.9 s\$" '' "$TT2"
+NOT_MSG='::error' run TT3-the-older-millisecond-field-is-read 0 "^Test time \\(main\\): $D attempt 1: PASSED in 212\\.3 s\$" '' "{ $P; rt $D PASSED lt_pass a::one; MILLIS=1 attempt $D PASSED 1 212345; } >\"\$bep\"; exit 0"
+NOT_MSG='::error|in 0\.0 s' run TT4-a-time-that-is-no-finite-number-is-unknown 0 "^Test time \\(main\\): $D attempt 1: PASSED in UNKNOWN s\$" '' "{ $P; rt $D PASSED lt_pass a::one; attempt $D PASSED 1 NaN; } >\"\$bep\"; exit 0"
+NOT_MSG='::error' run TT5-a-reused-result-says-so 0 "^Test time \\(main\\): $D attempt 1: PASSED in 3\\.0 s \\(cached: an earlier run's result\\)\$" '' "{ $P; rt $D PASSED lt_pass a::one; CACHED=1 attempt $D PASSED 1 3; } >\"\$bep\"; exit 0"
+NOT_MSG='::error|^Test time ' run TT6-a-log-without-attempts-says-so 0 "^Test times \\(main\\): the build event log names no test attempt\$" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+NOT_MSG='::error' run TT7-a-shard-is-named 0 "^Test time \\(main\\): $D attempt 1, shard 2: TIMEOUT in 300\\.0 s\$" '' "{ $P; rt $D PASSED lt_pass a::one; SHARD=2 attempt $D TIMEOUT 1 300; } >\"\$bep\"; exit 0"
+
 # B1: an #[ignore]d cargo test runs alone (rust-test-ignored.txt), or fails
 # the job.
 CARGO_MODE=ignored run J102-cargo-ignored-unlisted 1 "sdk/rust/demo:test:wire a::slow is #\\[ignore\\]d and runs in no invocation" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
@@ -1022,6 +1044,32 @@ if [ -z "$only" ] || [[ T1-each-action-its-own-tmpdir =~ $only ]]; then
 	rc=0
 	{ [ "$a" != "$b" ] && [ -d "$a" ] && [ -d "$b" ] && [ "$(dirname "$a")" = "$t" ] && [ "$(dirname "$b")" = "$t" ]; } || rc=1
 	verdict T1-each-action-its-own-tmpdir 0 "$rc" '' "$a $b"
+fi
+
+# T2: a test binary that asks for libtest's JSON runs under libtest-bound.py
+# (shown by its --list, which this one fails); T3: a doctest target does not.
+for c in T2-a-libtest-binary-runs-under-the-bound T3-a-doctest-target-runs-as-it-is; do
+	if [ -n "$only" ] && ! [[ $c =~ $only ]]; then continue; fi
+	t="$(mktemp -d "$scratch/tmpdir.XXXXXX")"
+	target=//crates/demo:demo_test
+	[ "$c" = T3-a-doctest-target-runs-as-it-is ] && target=//crates/demo:demo_doc_test
+	out="$(TEST_TARGET=$target sh "$repo/.github/sami/rust-test-tmpdir.sh" "$t" sh -c 'case "$1" in --list) exit 3 ;; esac; echo ran' _ -Zunstable-options --format=json 2>&1)"
+	rc=$?
+	if [ "$c" = T2-a-libtest-binary-runs-under-the-bound ]; then
+		verdict "$c" 0 "$rc" 'libtest-bound: .* runs without a bound per test: its --list failed' "$out"
+	else
+		NOT_MSG='libtest-bound' verdict "$c" 0 "$rc" '^ran$' "$out"
+	fi
+done
+
+# --- libtest-bound.py ------------------------------------------------------------
+# Its own controls (tests/libtest-bound-selftest.py, against tests/fake-libtest.py),
+# with the tree's .config/nextest.toml for its config reader.
+if [ -z "$only" ] || [[ L1-libtest-bound-selftest =~ $only ]]; then
+	out="$(python3 "$here/libtest-bound-selftest.py" --config "$repo/.config/nextest.toml" 2>&1)"
+	rc=$?
+	verdict L1-libtest-bound-selftest 0 "$rc" '^SELFTEST [0-9]+ of [0-9]+ cases as expected$' "$out"
+	printf '%s\n' "$out" | grep -E '^FAIL ' | sed 's/^/    | /'
 fi
 
 # --- release-candidate.sh ------------------------------------------------------

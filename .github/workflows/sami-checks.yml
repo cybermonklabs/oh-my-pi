@@ -373,7 +373,10 @@ jobs:
         with:
           path: tool
           persist-credentials: false
-          sparse-checkout: .github/sami-checks
+          # .github/sami for libtest-bound.py, which bounds each test of a binary set.sh runs.
+          sparse-checkout: |
+            .github/sami-checks
+            .github/sami
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: tree

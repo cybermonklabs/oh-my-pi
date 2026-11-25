@@ -434,6 +434,44 @@ bep_seconds() {
 	if [ -n "$s" ]; then LC_ALL=C awk -v s="$s" 'BEGIN { printf "%.1f", s }'; else printf 'UNKNOWN'; fi
 }
 
+# test_times <invocation> <event log>: a line for each test attempt Bazel
+# ran in the invocation (its testResult events): the target, the attempt (and
+# its shard and run, when not the first), the attempt's status, and how long
+# it ran in seconds (testAttemptDuration, or the older
+# testAttemptDurationMillis; UNKNOWN where the log holds neither as a finite
+# number of 0 or more), marked when Bazel reused an earlier run's result.
+# Bazel's own summary names only the targets that did not pass, and a
+# target's timeout bounds each attempt, so these lines are what a target's
+# timeout is measured from. A figure for the job log: it changes no verdict.
+test_times() {
+	local inv="$1" label attempt shard run status s cached where
+	if ! jq -r '
+		select(.id.testResult)
+		| .id.testResult as $id
+		| .testResult as $r
+		| ([($r.testAttemptDuration // empty | tostring | rtrimstr("s") | tonumber?),
+		    ($r.testAttemptDurationMillis // empty | tostring | tonumber? | . / 1000)]
+		   | map(select(. >= 0 and . < 1e9)) | .[0]) as $s
+		| [$id.label, ($id.attempt // 1), ($id.shard // 1), ($id.run // 1), ($r.status // "NO_STATUS"),
+		   (if $s == null then "-" else $s end), (if $r.cachedLocally == true then "cached" else "-" end)]
+		| @tsv' "$2" >"$tmp/test-times.tsv" 2>/dev/null; then
+		echo "Test times ($inv): UNKNOWN, jq could not read the build event log"
+		return 0
+	fi
+	if [ ! -s "$tmp/test-times.tsv" ]; then
+		echo "Test times ($inv): the build event log names no test attempt"
+		return 0
+	fi
+	while IFS=$'\t' read -r label attempt shard run status s cached; do
+		where="attempt $attempt"
+		[ "$shard" = 1 ] || where="$where, shard $shard"
+		[ "$run" = 1 ] || where="$where, run $run"
+		if [ "$s" = - ]; then s=UNKNOWN; else s="$(LC_ALL=C awk -v s="$s" 'BEGIN { printf "%.1f", s }')"; fi
+		if [ "$cached" = cached ]; then cached=" (cached: an earlier run's result)"; else cached=""; fi
+		echo "Test time ($inv): $label $where: $status in $s s$cached"
+	done <"$tmp/test-times.tsv"
+}
+
 # bazel_test <invocation> <run_under> <arguments>...: one bazel test, its
 # logs collected. Bazel exits 0 when every test passed, 3 when every target
 # built and a test failed, and 1 when a target failed to build (the others
@@ -456,6 +494,7 @@ bazel_test() {
 			;;
 	esac
 	collect "$inv" "$bep"
+	if [ -f "$bep" ]; then test_times "$inv" "$bep"; fi
 }
 
 # did_not_build <target>: the target has no result but FAILED_TO_BUILD, and
@@ -980,7 +1019,11 @@ doc_ignored() {
 # doctest that cannot be merged): the planned count is the sum of every
 # suite's test_count, and every started suite must end. The failed tests are
 # its `failed` events. A log that ended early (a timeout, a crash) is named
-# once here; the accounting below leaves its binary out.
+# once here; the accounting below leaves its binary out. When
+# libtest-bound.py (rust-test-tmpdir.sh) stopped a binary that had stopped
+# making progress, the error names the tests it failed (their record's stdout
+# starts `libtest-bound:`); its tests that never started have no result, so
+# the log stays incomplete.
 check_libtest() {
 	local label="$1" status="$2" kind="$3" log="$4" inv="$5" record planned reported ended filtered names
 	record="$(jq -R -s -r '
@@ -1001,7 +1044,8 @@ check_libtest() {
 		return 0
 	fi
 	if [ "$reported" != "$planned" ] || [ "$ended" = none ]; then
-		error "Rust tests" "$label is $status, but libtest planned $planned tests and reported $reported, suite end $ended: the test binary ended before its tests did"
+		names="$(jq -R -r 'fromjson? | select(type == "object" and .type == "test" and .event == "failed" and ((.stdout // "") | startswith("libtest-bound:"))) | .name' "$log" | paste -s -d, -)"
+		error "Rust tests" "$label is $status, but libtest planned $planned tests and reported $reported, suite end $ended: the test binary ended before its tests did${names:+; libtest-bound.py stopped it while these had run past their bound: $names}"
 		printf '%s\n' "$log" >>"$incomplete"
 		return 0
 	fi
