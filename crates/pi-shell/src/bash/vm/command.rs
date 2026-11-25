@@ -807,7 +807,7 @@ fn expand(
 						if elem_globs.is_empty() {
 							let mut text = prefix.clone();
 							text.extend_from_slice(&compound_text(&elems));
-							ex.trace_once(&text);
+							ex.trace_once(&text)?;
 						} else {
 							late = Some(compound.len());
 						}
@@ -854,8 +854,13 @@ fn expand(
 			argv[at as usize] = text;
 		}
 		if let Some(from) = late {
-			for &i in &compound[from..] {
-				xtrace::emit(k, cx, vp, line, &argv[i as usize]);
+			let bodies = &compound[from..];
+			let prefixes = match xtrace::prefixes(k, cx, vp, line, bodies.len()) {
+				Ok(p) => p,
+				Err(flow) => return Some(flow),
+			};
+			for (prefix, &i) in prefixes.into_iter().zip(bodies) {
+				xtrace::line_out(k, cx, vp, prefix, &argv[i as usize]);
 			}
 		}
 		scratch(vp).spare_words = pool;
@@ -1169,7 +1174,19 @@ fn expand(
 		// `$?` of `x=$(cmd)` is the status of the last substitution.
 		s.status = s.sub_status.unwrap_or(0);
 	}
-	s.stage = Stage::Redirect;
+	// bash's trace lines, made while the stage is still this one: a
+	// substitution in `PS4` parks the op, which comes back here.
+	let tracing = xtrace::on(k, cx, vp);
+	let lines = if tracing && unit.mode.dialect() != crate::bash::ids::Dialect::Zsh {
+		let traced = decl_compounds(unit, &unit.lists[cmd.words as usize]);
+		match trace(k, vp, cx, unit, &cmd.assigns, traced, line) {
+			Ok(lines) => lines,
+			Err(flow) => return Some(flow),
+		}
+	} else {
+		Vec::new()
+	};
+	st(vp).stage = Stage::Redirect;
 	if assign_only
 		&& k.mask.contains(crate::bash::event::EventKind::CmdExpanded)
 		&& let Some(e) = current_exec(vp)
@@ -1190,12 +1207,12 @@ fn expand(
 			t_ns,
 		);
 	}
-	if xtrace::on(k, cx, vp) {
+	if tracing {
 		if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 			trace_zsh(k, vp, cx, unit, &cmd.assigns, line);
-		} else {
-			let traced = decl_compounds(unit, &unit.lists[cmd.words as usize]);
-			trace(k, vp, cx, unit, &cmd.assigns, traced, line);
+		}
+		for (prefix, body) in lines {
+			xtrace::line_out(k, cx, vp, prefix, &body);
 		}
 		// Out before the command's redirections move stderr.
 		if let Some(fd) = exec::flush_out(k, vp) {
@@ -1563,9 +1580,11 @@ fn decl_compounds(unit: &Unit, words: &[u32]) -> bool {
 	})
 }
 
-/// `set -x`: one line per assignment, then the words. `traced`: the
-/// compound assignment words are declaration arguments, traced as they
-/// expanded ([`expand`]).
+/// `set -x`: one line per assignment, then the words, each after its own
+/// `PS4` ([`xtrace::prefixes`]), as (prefix, body) to write
+/// ([`xtrace::line_out`]); the flow to park on while a substitution in
+/// `PS4` runs. `traced`: the compound assignment words are declaration
+/// arguments, traced as they expanded ([`expand`]).
 fn trace(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -1574,7 +1593,7 @@ fn trace(
 	assigns: &[ir::AssignOp],
 	traced: bool,
 	line: u32,
-) {
+) -> Result<Vec<(xtrace::Prefix, Vec<u8>)>, Flow> {
 	let utf8 = xtrace::utf8(k, cx, vp);
 	let mut lines = Vec::new();
 	let s = st(vp);
@@ -1634,9 +1653,8 @@ fn trace(
 		xtrace::push_words(&mut body, &argv, utf8);
 		lines.push(body);
 	}
-	for body in lines {
-		xtrace::emit(k, cx, vp, line, &body);
-	}
+	let prefixes = xtrace::prefixes(k, cx, vp, line, lines.len())?;
+	Ok(prefixes.into_iter().zip(lines).collect())
 }
 
 /// zsh's `set -x` of a simple command (`addvars`, then `execbuiltin`,
@@ -4006,10 +4024,10 @@ fn run_builtin(
 					return Some(flow);
 				}
 			},
-			Err(Need::Sub(Stop::Sub { unit, entry, form, text })) => {
+			Err(Need::Sub(Stop::Sub { unit, entry, form, text, untraced })) => {
 				// A no-fork substitution pushes its frame above this op's.
 				let fi = vp.frames.len() - 1;
-				let sub = exec::Sub { unit, entry, form, text, line };
+				let sub = exec::Sub { unit, entry, form, text, line, untraced };
 				let flow = exec::start_sub(k, vp, cx, &mut sc, sub);
 				vp.frames[fi].scratch = Some(sc);
 				return Some(flow);

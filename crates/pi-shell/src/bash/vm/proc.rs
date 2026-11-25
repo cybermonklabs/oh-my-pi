@@ -83,7 +83,7 @@ pub struct Vproc {
 	pub lineage:       crate::bash::host::Lineage,
 	/// `set -x` nesting this vproc starts at, beyond the first level (bash's
 	/// `indirection_level`): its parent's, plus one in a command
-	/// substitution.
+	/// substitution, which also sets [`super::xtrace::TRACE_SUB`].
 	pub trace_base:    u32,
 	/// `$BASH_SUBSHELL`: the subshell nesting (0 for the shell itself and a
 	/// nested shell). A field, not an overlay record: a record would cost
@@ -980,7 +980,9 @@ pub struct Frame {
 	pub return_trap_local: bool,
 	/// A zsh function call with `PM_TAGGED_LOCAL` in effect (`functions
 	/// -T`, `function -T`, or an anonymous function called from such a
-	/// call): the named functions it calls run with `xtrace` off.
+	/// call): the named functions it calls run with `xtrace` off. A bash
+	/// `${ ;}` that `PS4` runs: `xtrace` is off while it runs, back on when
+	/// it ends.
 	pub trace_local:       bool,
 	/// zsh: `ERR_EXIT` as it was when the DEBUG trap at this frame's list
 	/// marker ([`Self::debug_pc`]) started, put back when it ends.

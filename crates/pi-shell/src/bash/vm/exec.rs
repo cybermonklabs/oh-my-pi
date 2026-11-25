@@ -1652,6 +1652,10 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 	super::callstack::truncate(root, store, vp, keep);
 	if f.kind == FrameKind::NoFork {
 		pass_reply(root, store, vp);
+		// A `${ ;}` that `PS4` ran with `set -x` off ([`start_sub`]).
+		if f.trace_local {
+			state::store_record(root, store, vp, KeyBuf::Opt(OptId::Xtrace), Some(Record::Opt(true)));
+		}
 	}
 	// A zsh function's caller gets its `OPTIND` back without
 	// `POSIX_BUILTINS`, decided before the function's options go (zsh
@@ -2047,7 +2051,7 @@ pub fn expanding<T>(
 			top_frame(vp).scratch = Some(sc);
 			Ok(v)
 		},
-		Err(Stop::Sub { unit, entry, form, text }) => {
+		Err(Stop::Sub { unit, entry, form, text, untraced }) => {
 			// What the expansion queued so far (a declaration's compound
 			// assignment traced as its word expanded) is out before the
 			// substitution runs, as bash writes it first; the op runs again
@@ -2057,7 +2061,8 @@ pub fn expanding<T>(
 				return Err(Flow::Block(WaitKey::Write { fd }));
 			}
 			// A no-fork substitution pushes its frame above this op's.
-			let flow = start_sub(k, vp, cx, &mut sc, Sub { unit, entry, form, text, line });
+			let sub = Sub { unit, entry, form, text, line, untraced };
+			let flow = start_sub(k, vp, cx, &mut sc, sub);
 			vp.frames[fi].scratch = Some(sc);
 			Err(flow)
 		},
@@ -2242,15 +2247,17 @@ pub fn probe_atom(answer: ProbeResult) -> Atom {
 /// that runs it.
 pub struct Sub {
 	/// Unit holding the body.
-	pub unit:  Arc<Unit>,
+	pub unit:     Arc<Unit>,
 	/// Entry pc of the body.
-	pub entry: u32,
+	pub entry:    u32,
 	/// Syntax form.
-	pub form:  ComsubForm,
+	pub form:     ComsubForm,
 	/// `strs` index of the body's source text.
-	pub text:  Option<u32>,
+	pub text:     Option<u32>,
 	/// Line of the command running it.
-	pub line:  u32,
+	pub line:     u32,
+	/// `PS4`'s: run with `set -x` off ([`Stop::Sub`]'s `untraced`).
+	pub untraced: bool,
 }
 
 /// Start a command substitution for the op whose scratch is `sc`.
@@ -2261,7 +2268,7 @@ pub fn start_sub(
 	sc: &mut Scratch,
 	sub: Sub,
 ) -> Flow {
-	let Sub { unit, entry, form, text, line } = sub;
+	let Sub { unit, entry, form, text, line, untraced } = sub;
 	let first = unit
 		.ops
 		.get(entry as usize)
@@ -2291,10 +2298,14 @@ pub fn start_sub(
 				.ops
 				.get(entry as usize)
 				.is_some_and(|op| op.flags & ir::Op::CAT != 0);
+			// A `PS4` substitution (`untraced`) is re-parsed too, so its
+			// `$LINENO` counts from the command's line as bash's does, not
+			// from 1 in the compiled `${PS4@P}` unit.
 			let reparse = text.and_then(|i| unit.strs.get(i as usize)).filter(|_| {
-				!posix
-					&& !cat
-					&& (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))
+				untraced
+					|| (!posix
+						&& !cat
+						&& (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_)))))
 			});
 			let mut child = if let Some(src) = reparse {
 				vp.child_text(k, cx.store, src, base, fds)
@@ -2315,7 +2326,7 @@ pub fn start_sub(
 					child.status = 0;
 				}
 				// A re-parsed one counts its `eval`-like frame instead.
-				child.trace_base += 1;
+				child.trace_base = (child.trace_base + 1) | super::xtrace::TRACE_SUB;
 				child
 			};
 			// With `-e` already off in the parent the child sees it off and
@@ -2326,6 +2337,20 @@ pub fn start_sub(
 					cx.store,
 					&mut child,
 					KeyBuf::Opt(OptId::Errexit),
+					Some(Record::Opt(false)),
+				);
+				if let Err(err) = state::sync_option_vars(&mut k.root, cx.store, &mut child) {
+					k.fail(err);
+				}
+			}
+			// `PS4`'s runs with `set -x` off (bash `indirection_level_string`),
+			// as its `SHELLOPTS` says (the child's `set_shellopts`).
+			if untraced {
+				state::store_record(
+					&mut k.root,
+					cx.store,
+					&mut child,
+					KeyBuf::Opt(OptId::Xtrace),
 					Some(Record::Opt(false)),
 				);
 				if let Err(err) = state::sync_option_vars(&mut k.root, cx.store, &mut child) {
@@ -2371,6 +2396,18 @@ pub fn start_sub(
 			frame.line_shift = shift;
 			// It shares the shell's options, so `-e` is ignored instead.
 			frame.ignore_errexit = !inherit;
+			// `PS4`'s runs with `set -x` off (bash `indirection_level_string`),
+			// back on when it ends ([`pop_frame`]).
+			if untraced && state::option(&mut k.root, cx.store, vp, OptId::Xtrace).unwrap_or(false) {
+				state::store_record(
+					&mut k.root,
+					cx.store,
+					vp,
+					KeyBuf::Opt(OptId::Xtrace),
+					Some(Record::Opt(false)),
+				);
+				frame.trace_local = true;
+			}
 			let prev = vp.fds.get(1).cloned();
 			if form == ComsubForm::NoFork {
 				vp.fds.set(1, Some(out));
@@ -3033,18 +3070,24 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		},
 		Opcode::CaseWord => {
 			let w = &unit.words[op.a as usize];
-			let subject =
-				match expanding(k, vp, cx, Slot::Words, w.parks, line, |ex| ex.scalar(unit, w)) {
-					Ok(s) => s,
-					Err(flow) => return flow,
-				};
+			// bash traces the header before the word is expanded (its
+			// `xtrace_print_case_command_head`), with `PS4` expanded in the
+			// same pass (its substitutions replay with the word's).
+			let tracing = super::xtrace::on(k, cx, vp);
+			let record = w.parks || (tracing && super::xtrace::ps4_parks(k, cx, vp));
+			let subject = match expanding(k, vp, cx, Slot::Words, record, line, |ex| {
+				if tracing {
+					let mut body = b"case ".to_vec();
+					body.extend_from_slice(word_source(unit, op.a));
+					body.extend_from_slice(b" in");
+					ex.trace_once(&body)?;
+				}
+				ex.scalar(unit, w)
+			}) {
+				Ok(v) => v,
+				Err(flow) => return flow,
+			};
 			clear_scratch(&mut k.root, cx.store, vp);
-			if super::xtrace::on(k, cx, vp) {
-				let mut body = b"case ".to_vec();
-				body.extend_from_slice(word_source(unit, op.a));
-				body.extend_from_slice(b" in");
-				super::xtrace::emit(k, cx, vp, line, &body);
-			}
 			// `$?` stays the previous command's until an arm decides it.
 			top_frame(vp).cases.push((subject, false));
 			Flow::Next
@@ -3062,15 +3105,19 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				.get(op.node as usize)
 				.is_some_and(|n| n.kind == NodeKind::ArithFor);
 			// One inlined pass (each `<[u8]>::contains` is a call).
-			let record = text.iter().any(|&c| c == b'$' || c == b'`');
+			let tracing = super::xtrace::on(k, cx, vp);
+			let record = text.iter().any(|&c| c == b'$' || c == b'`')
+				|| (tracing && super::xtrace::ps4_parks(k, cx, vp));
 			let res = expanding(k, vp, cx, Slot::Words, record, line, |ex| {
 				// Warnings carry the command's name.
 				ex.arith_cmd = Some("((");
 				let expanded = ex.expand_text(text)?;
-				// bash traces the expanded text before evaluating it (a
-				// replay after a parked substitution gets here once).
-				if super::xtrace::on(ex.k, ex.cx, ex.vp) {
-					trace_arith(ex.k, ex.cx, ex.vp, line, &expanded, arith_for);
+				// bash traces the expanded text before evaluating it, after
+				// `PS4` expanded in the same pass (a replay after a parked
+				// substitution gets here once).
+				if tracing {
+					let prefix = super::xtrace::ps4_in(ex, line)?;
+					trace_arith(ex.k, ex.cx, ex.vp, prefix, &expanded, arith_for);
 				}
 				match ex.arith_eval(&expanded) {
 					Ok(v) => Ok(Ok(v)),
@@ -3600,9 +3647,16 @@ fn for_in(
 	let var = unit.names[op.b as usize].clone();
 	// The list is evaluated once per loop; it is logged because the op can
 	// be re-entered (a comsub, or a glob whose fs answer is pending), so the
-	// expansion's side effects run once.
-	let record = op.a != Op::POSITIONAL;
+	// expansion's side effects run once. A `select` header is traced before
+	// the list is expanded, its `PS4` expanded in the same pass (its
+	// substitutions replayed with the list's).
+	let traced = op.flags & Op::SELECT != 0 && super::xtrace::on(k, cx, vp);
+	let record = op.a != Op::POSITIONAL || (traced && super::xtrace::ps4_parks(k, cx, vp));
 	let (mut items, globs, sub) = match expanding(k, vp, cx, Slot::Words, record, line, |ex| {
+		if traced {
+			let body = loop_header(unit, op);
+			ex.trace_once(&body)?;
+		}
 		let mut globs = Vec::new();
 		let items = if op.a == Op::POSITIONAL {
 			state::positional(&ex.k.root, ex.cx.store, ex.vp)?
@@ -3671,11 +3725,6 @@ fn for_in(
 		1
 	};
 	clear_scratch(&mut k.root, cx.store, vp);
-	// `set -x`: bash shows a `select` header once, a `for` header per word.
-	if op.flags & Op::SELECT != 0 && super::xtrace::on(k, cx, vp) {
-		let body = loop_header(unit, op);
-		super::xtrace::emit(k, cx, vp, line, &body);
-	}
 	let f = top_frame(vp);
 	let depth = depths(f);
 	let kind = if op.flags & Op::SELECT != 0 {
@@ -3700,6 +3749,31 @@ fn for_next(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 	}
 	let n = rec.iterations + 1;
 	let header_pc = rec.cont.checked_sub(1);
+	let more =
+		matches!(&rec.kind, LoopKind::For { items, next, .. } if (*next as usize) < items.len());
+	// bash traces a `for` header before it binds the next word: `PS4` sees
+	// the variable as it was, and a substitution in it parks the op before
+	// a word is taken.
+	let bash = vp.mode.dialect() != crate::bash::ids::Dialect::Zsh;
+	let traced = if more && super::xtrace::on(k, cx, vp) {
+		let f = top_frame(vp);
+		let header = f.unit.as_ref().and_then(|u| {
+			let forin = *u.ops.get(header_pc? as usize)?;
+			(forin.code == Opcode::ForIn).then(|| loop_header(u, forin))
+		});
+		match header {
+			Some(body) => match super::xtrace::prefixes(k, cx, vp, line, 1) {
+				Ok(mut prefix) => Some((prefix.pop().unwrap_or_default(), body)),
+				Err(flow) => return flow,
+			},
+			None => None,
+		}
+	} else {
+		None
+	};
+	let Some(rec) = top_frame(vp).loops.last_mut() else {
+		return Flow::Jump(op.a);
+	};
 	let (var, value) = if matches!(rec.kind, LoopKind::Select { .. }) {
 		match builtins::select_next(k, vp, cx, line) {
 			Ok(Some(pair)) => pair,
@@ -3723,6 +3797,10 @@ fn for_next(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		}
 	};
 	clear_scratch(&mut k.root, cx.store, vp);
+	let (bash_line, zsh_line) = if bash { (traced, None) } else { (None, traced) };
+	if let Some((prefix, body)) = bash_line {
+		super::xtrace::line_out(k, cx, vp, prefix, &body);
+	}
 	let select = top_frame(vp)
 		.loops
 		.last()
@@ -3746,15 +3824,9 @@ fn for_next(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 		}
 		return Flow::Jump(op.a);
 	}
-	if !select && super::xtrace::on(k, cx, vp) {
-		let f = top_frame(vp);
-		let header = f.unit.as_ref().and_then(|u| {
-			let forin = *u.ops.get(header_pc? as usize)?;
-			(forin.code == Opcode::ForIn).then(|| loop_header(u, forin))
-		});
-		if let Some(body) = header {
-			super::xtrace::emit(k, cx, vp, line, &body);
-		}
+	// zsh traces it after the assignment.
+	if let Some((prefix, body)) = zsh_line {
+		super::xtrace::line_out(k, cx, vp, prefix, &body);
 	}
 	if k.mask.any_op(op.ev) {
 		// Bash/select setters emit at their actual commit seam. The zsh
@@ -4526,11 +4598,13 @@ fn loop_header(unit: &Unit, forin: Op) -> Vec<u8> {
 	body
 }
 
+/// Trace a `(( ))` command, or an arithmetic `for`'s expression, after
+/// `prefix` ([`super::xtrace::ps4_in`]).
 fn trace_arith(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
 	vp: &mut Vproc,
-	line: u32,
+	prefix: super::xtrace::Prefix,
 	text: &[u8],
 	arith_for: bool,
 ) {
@@ -4544,7 +4618,7 @@ fn trace_arith(
 	body.extend_from_slice(b"(( ");
 	body.extend_from_slice(text);
 	body.extend_from_slice(b" ))");
-	super::xtrace::emit(k, cx, vp, line, &body);
+	super::xtrace::line_out(k, cx, vp, prefix, &body);
 }
 
 /// Line of the op at the top frame's pc (for diagnostics raised outside an

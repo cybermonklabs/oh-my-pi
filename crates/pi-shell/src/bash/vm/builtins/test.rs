@@ -618,7 +618,11 @@ pub fn cond_test(
 		},
 		CondIr::Word(w) => std::slice::from_ref(w),
 	};
-	let record = words.iter().any(|&w| unit.words[w as usize].parks);
+	// bash traces the primary after its operands, with `PS4` expanded in
+	// the same pass (its substitutions replay with the operands'), traced
+	// once however often a file-test probe re-enters the op.
+	let tracing = crate::bash::vm::xtrace::on(k, cx, vp);
+	let record = tracing || words.iter().any(|&w| unit.words[w as usize].parks);
 	let rhs_op: &[u8] = match c {
 		CondIr::Binary { op, .. } => op.as_slice(),
 		_ => &[],
@@ -652,28 +656,31 @@ pub fn cond_test(
 				_ => ex.scalar(unit, word)?,
 			});
 		}
+		// `set -x`: bash shows a pattern operand with its quoting as
+		// backslashes (`[[ b == c\* ]]`), which is how it is expanded here.
+		if tracing {
+			let body = {
+				let mut terms: Vec<&[u8]> = match c {
+					CondIr::Unary { op, .. } => vec![op.as_slice(), vals[0].as_slice()],
+					CondIr::Binary { op, .. } => {
+						vec![vals[0].as_slice(), op.as_slice(), vals[1].as_slice()]
+					},
+					CondIr::Word(_) => vec![b"-n".as_slice(), vals[0].as_slice()],
+				};
+				// An odd run of `!` directly on the primary (`[[ ! x ]]` →
+				// `[[ ! -n x ]]`).
+				if op.flags & crate::bash::ir::Op::NEGATED != 0 {
+					terms.insert(0, b"!");
+				}
+				crate::bash::vm::xtrace::cond_body(&terms)
+			};
+			ex.trace_once(&body)?;
+		}
 		Ok(vals)
 	}) {
 		Ok(v) => v,
 		Err(flow) => return flow,
 	};
-	// `set -x`: bash shows a pattern operand with its quoting as
-	// backslashes (`[[ b == c\* ]]`), which is how it is expanded here.
-	if crate::bash::vm::xtrace::on(k, cx, vp) {
-		let mut terms: Vec<&[u8]> = match c {
-			CondIr::Unary { op, .. } => vec![op.as_slice(), vals[0].as_slice()],
-			CondIr::Binary { op, .. } => {
-				vec![vals[0].as_slice(), op.as_slice(), vals[1].as_slice()]
-			},
-			CondIr::Word(_) => vec![b"-n".as_slice(), vals[0].as_slice()],
-		};
-		// An odd run of `!` directly on the primary (`[[ ! x ]]` →
-		// `[[ ! -n x ]]`).
-		if op.flags & crate::bash::ir::Op::NEGATED != 0 {
-			terms.insert(0, b"!");
-		}
-		crate::bash::vm::xtrace::cond(k, cx, vp, line, &terms);
-	}
 	loop {
 		let mut sc = vp
 			.frames
