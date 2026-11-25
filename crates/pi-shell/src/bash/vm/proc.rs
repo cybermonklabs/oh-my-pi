@@ -916,7 +916,8 @@ impl LastBg {
 /// known by that program's OS pid ([`Job::os_pid`], `$!`); anything else
 /// (a builtin, a native task, a subshell, a non-`exec` external in a
 /// compound body, the vproc's end) leaves its virtual pid. Readers of the
-/// pid (`$!`, `jobs -l`/`-p`/`-x`) wait for the decision.
+/// pid (`$!`, `jobs -l`/`-p`/`-x`) wait for the decision; `kill` does not,
+/// it leaves its signal for the decision ([`Self::held`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bang {
 	/// The vproc that decides: the job's own, or the subshell a callout of
@@ -926,6 +927,12 @@ pub struct Bang {
 	pub job:   Vpid,
 	/// What may still give the job its program.
 	pub stage: BangStage,
+	/// The signals `kill` sent the job before it decided
+	/// ([`super::Kernel::hold_signal`]). The decision delivers them: to the
+	/// program it spawned, or, when it spawns none, to the vproc before it
+	/// runs its command, as bash's child, forked at `&`, has them before it
+	/// `exec`s its program or fails to.
+	pub held:  SigSet,
 }
 
 /// The redirections of a background job's lone command whose open would

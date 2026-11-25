@@ -754,16 +754,66 @@ impl Kernel {
 	}
 
 	/// The pid of background job `job` is still to be settled
-	/// ([`proc::Bang`]): readers of it wait (`WaitKey::Proc(job)`).
+	/// ([`proc::Bang`]): readers of it wait (`WaitKey::Proc(job)`), and
+	/// `kill` leaves its signal for the decision ([`Self::hold_signal`]).
 	pub fn bang_pending(&self, job: Vpid) -> bool {
 		self.bangs.iter().any(|b| b.job == job)
 	}
 
-	/// Settle the job vproc `vproc` decides ([`proc::Bang`]): known by the
-	/// OS pid `os`, or by its virtual pid (`None`). Wakes the readers.
-	pub fn settle_bang(&mut self, vproc: Vpid, os: Option<u32>) {
-		let Some(i) = self.bangs.iter().position(|b| b.vproc == vproc) else {
+	/// Whether vproc `vproc` decides a background job's pid
+	/// ([`proc::Bang`]) for which `kill` holds signals
+	/// ([`Self::hold_signal`]).
+	pub fn holds(&self, vproc: Vpid) -> bool {
+		self
+			.bangs
+			.iter()
+			.any(|b| b.vproc == vproc && b.held != crate::bash::SigSet::EMPTY)
+	}
+
+	/// Vproc `vproc`, still deciding a job's pid ([`proc::Bang`]), acts
+	/// with no program (it reports an error, or ends): if `kill` held
+	/// signals for the job ([`Self::holds`]), the job is known by its
+	/// virtual pid and they go first ([`Self::settle_bang`]). Whether they
+	/// did: the caller returns `Flow::Block(WaitKey::Signal)`, and its op
+	/// runs again after them.
+	pub fn take_held(&mut self, vproc: Vpid) -> bool {
+		self.holds(vproc) && self.settle_bang(vproc, None)
+	}
+
+	/// `kill` sends `sig` to background job `job` while its pid is still to
+	/// be settled ([`Self::bang_pending`]): the signal waits for the decision
+	/// ([`proc::Bang::held`]), and `kill` does not. A stop discards a held
+	/// `CONT`, and a `CONT` the held stops, as the kernel does for the
+	/// signals pending on a process.
+	pub fn hold_signal(&mut self, job: Vpid, sig: Signal) {
+		let Some(bang) = self.bangs.iter_mut().find(|b| b.job == job) else {
 			return;
+		};
+		let mut held = bang.held;
+		match sig.default_action() {
+			DefaultAction::Stop => held = held.without(Signal::Cont),
+			DefaultAction::Continue => {
+				for stop in [Signal::Stop, Signal::Tstp, Signal::Ttin, Signal::Ttou] {
+					held = held.without(stop);
+				}
+			},
+			_ => {},
+		}
+		bang.held = held.with(sig);
+	}
+
+	/// Settle the job vproc `vproc` decides ([`proc::Bang`]): known by the
+	/// OS pid `os`, or by its virtual pid (`None`). Wakes the readers. The
+	/// signals `kill` held for the job ([`Self::hold_signal`]) go on the
+	/// bus to the deciding vproc and what it runs, which take them at the
+	/// next safepoint: the program `os` names gets them, or, with no
+	/// program, the vproc before it runs its command. Whether there were
+	/// any: a caller about to run that command returns
+	/// `Flow::Block(WaitKey::Signal)` then, and its op runs again after them
+	/// (as for a signal that comes before a spawn).
+	pub fn settle_bang(&mut self, vproc: Vpid, os: Option<u32>) -> bool {
+		let Some(i) = self.bangs.iter().position(|b| b.vproc == vproc) else {
+			return false;
 		};
 		let bang = self.bangs.swap_remove(i);
 		if let Some(pid) = os {
@@ -774,6 +824,10 @@ impl Kernel {
 		}
 		jobctl::bang_settled(self, bang.vproc, os);
 		self.ctl.notify();
+		for sig in bang.held.iter() {
+			ControlHandle(self.ctl.clone()).signal(SigTarget::Tree(bang.vproc), sig);
+		}
+		bang.held != crate::bash::SigSet::EMPTY
 	}
 
 	/// The vpids reserved for the stages of the pipeline that is job vproc
@@ -2169,6 +2223,14 @@ impl Shell {
 		let mut i = 0;
 		while i < self.procs.len() {
 			let p = &self.procs[i];
+			// A job that ends still deciding its pid, with signals `kill` held
+			// for it, takes them first ([`Kernel::take_held`]): what it queued
+			// waits for them.
+			if p.transient && !p.has_work() && !self.k.bangs.is_empty() && self.k.take_held(p.vpid) {
+				i += 1;
+				continue;
+			}
+			let p = &self.procs[i];
 			// A subshell vproc exits once its frames and diagnostics are done.
 			if p.transient && !p.has_work() && p.out.is_empty() {
 				let p = self.procs.remove(i);
@@ -2216,7 +2278,9 @@ impl Shell {
 	/// ([`Kernel::settled`]) into every job table listing them (the
 	/// parent's, a command substitution's copies), every `$!` naming them,
 	/// and the records of the processes of jobs and of the pipelines vprocs
-	/// wait for ([`proc::JobProc`]).
+	/// wait for ([`proc::JobProc`]). A job a `kill` before the decision
+	/// marked as ended with no program ([`proc::Job::unreaped`]) has one now:
+	/// its end comes as the host reaps it.
 	fn apply_settled(&mut self) {
 		for (job, pid) in std::mem::take(&mut self.k.settled) {
 			for p in &mut self.procs {
@@ -2225,6 +2289,7 @@ impl Shell {
 				}
 				if let Some(entry) = p.jobs.by_vpid_mut(job) {
 					entry.os_pid = Some(pid);
+					entry.unreaped = false;
 				}
 				p.jobs.proc_settled(job, pid);
 				let waited = p

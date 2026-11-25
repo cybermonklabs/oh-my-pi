@@ -618,14 +618,17 @@ pub struct Job {
 	/// job runs until then, as bash's does until `waitchld` reaps it. But
 	/// `kill` ends a job, or a process of it, that is no program obash
 	/// spawned ([`Self::os_pid`], [`JobProc::os_pid`] unset: a subshell or
-	/// group, which is no OS process here, or a lone command zsh's `kill %1`
-	/// names right after `&`; bash's `kill` has that command's program
-	/// spawned first) at once, in obash's kernel. Set by that `kill`; cleared
-	/// where bash would have reaped it: as the shell waits for a foreground
-	/// program or child (bash's `waitchld` takes in every child that ended),
-	/// once a `kill` finds the job gone (bash's `kill -0` answers for a zombie
-	/// until bash reaps it) or `jobs` finds it done (bash shows a job done only
-	/// once it reaped it). Read by `wait` (`builtins::flow`'s `wait_all`).
+	/// group, which is no OS process here, a lone command zsh's `kill %1`
+	/// names right after `&`, or one that takes the signal bash's `kill`
+	/// left for its pid's decision and spawns no program,
+	/// `crate::bash::vm::proc::Bang::held`) in obash's kernel. Set by that
+	/// `kill`, and cleared if the lone command spawns its program after all;
+	/// cleared where bash would have reaped it: as the shell waits for a
+	/// foreground program or child (bash's `waitchld` takes in every child
+	/// that ended), once a `kill` finds the job gone (bash's `kill -0`
+	/// answers for a zombie until bash reaps it) or `jobs` finds it done
+	/// (bash shows a job done only once it reaped it). Read by `wait`
+	/// (`builtins::flow`'s `wait_all`).
 	/// Kept in memory only: a job restored from the store or the frames image
 	/// counts as reaped.
 	#[serde(skip)]

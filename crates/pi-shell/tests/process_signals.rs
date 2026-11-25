@@ -848,17 +848,329 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 /// pids start at 2^30 (`Vpid::BASE`), and a job killed before obash spawned
 /// its program named its own there.
 fn names_a_program_pid(wrong: &mut Vec<String>, script: &str, out: &[u8]) {
-	let text = String::from_utf8_lossy(out);
-	let pid = text.lines().find_map(|line| {
-		let (_, rest) = line.split_once(": line ")?;
-		let (_, rest) = rest.split_once(": ")?;
-		rest.split_whitespace().next()?.parse::<u64>().ok()
-	});
+	let pid = notice_pid(out);
 	if pid.is_none_or(|pid| pid >= 1 << 30) {
+		let text = String::from_utf8_lossy(out);
 		wrong.push(format!(
 			"{script:?}\n  the notice names {pid:?}, not a program's pid\n  out: {text:?}"
 		));
 	}
+}
+
+/// The pid the first long job notice in `out` (`NAME: line N: PID …`)
+/// names.
+fn notice_pid(out: &[u8]) -> Option<u64> {
+	String::from_utf8_lossy(out).lines().find_map(|line| {
+		let (_, rest) = line.split_once(": line ")?;
+		let (_, rest) = rest.split_once(": ")?;
+		rest.split_whitespace().next()?.parse::<u64>().ok()
+	})
+}
+
+/// A job `kill %N` names before obash decided its pid (`proc::Bang`: no
+/// `$!` read yet) whose program never starts (a command not found, a file
+/// that does not exist, one without execute permission) takes the signal
+/// before it runs its command, as bash's child, forked at `&`, takes it
+/// before its search or its `exec` fails: no error line, `kill` returns 0,
+/// and `wait` reaps the job killed. So does a job that runs no program at
+/// all: a builtin, an assignment, words that fail to expand, a redirection
+/// that fails, and each stage of a pipeline; under `set -x` it traces
+/// nothing, also when it calls a function, whose call is traced in an op
+/// before the one that takes the signal. The signal waited for the job's
+/// decision, so it also waits across the shell's own snapshot and restore
+/// at every op (the frames image keeps it with the decision; the fault
+/// injector's settings as in
+/// [`a_killed_jobs_notice_survives_a_restore`]). The notice names the pid
+/// `$!` shows for the job afterwards, compared unmasked: bash's, its
+/// child's; obash's, the job's virtual pid, as no process ever existed for
+/// it. A job whose program would run with a redirection takes the signal
+/// before it opens the file, as bash's child does: no file is left. And a
+/// job stopped before it decided, then continued, runs its command then,
+/// as bash's child does once continued: the error line, status 127. Each
+/// form runs as a `-c` string and in a script file. The first form and the
+/// stopped ones are compared live with bash 5.3.20 (pids masked), bash's
+/// side of a row run until it shows none of bash's own races
+/// ([`bash_without_its_races`]); the others with its goldens only. The real
+/// bash sometimes loses the signal to its child (the error line and no
+/// notice; measured over three runs of 10 on gVisor, up to 3 for
+/// `nosuchcmd` and `/no/such/file`, 6 for `./f` and 8 for the pipeline; on
+/// runc, once in 10 for the `set -x` form):
+/// bash's own race, made wider by the gVisor defect of google/gvisor#17983
+/// (a signal sent to a process in `execve` is dropped; filed for
+/// `SIGSTOP`). Compare them live again once gVisor fixes it.
+#[test]
+fn bash_reports_a_job_killed_before_its_program_fails_to_start() {
+	let dir = tempfile::tempdir().expect("a directory for the scripts");
+	let noexec = dir.path().join("f");
+	fs::write(&noexec, "#!/bin/sh\necho ran\n").expect("write a file without execute permission");
+	let noexec = noexec.display().to_string();
+	let path = dir.path().join("s.sh");
+	let file = path.display().to_string();
+	let obash = env!("CARGO_BIN_EXE_obash");
+	let bash = real_bash_golden();
+	let mut wrong = Vec::new();
+	let mut check = |script: &str, want: &dyn Fn(&str) -> String, group: bool, live: bool| {
+		let script = format!("exec 2>&1; {script}");
+		fs::write(&path, format!("{script}\n")).expect("write the script");
+		let runs = [
+			(
+				"bash",
+				Run::script(obash, "bash", &script),
+				bash
+					.as_ref()
+					.filter(|_| live)
+					.map(|b| Run::script(b, "bash", &script)),
+			),
+			(
+				file.as_str(),
+				Run::new(obash, "bash", &[&path]),
+				bash
+					.as_ref()
+					.filter(|_| live)
+					.map(|b| Run::new(b, "bash", &[&path])),
+			),
+		];
+		for (name, ours, theirs) in runs {
+			let (ours, theirs) = if group {
+				(ours.own_group(), theirs.map(Run::own_group))
+			} else {
+				(ours, theirs)
+			};
+			let ours = ours.go();
+			let got = (
+				String::from_utf8_lossy(&mask_stage_pids(&mask_pids(&ours.stdout))).into_owned(),
+				ours.end(),
+			);
+			let out = want(name);
+			if got != (out.clone(), Some(Exit(0))) {
+				wrong.push(format!("{name}: {script:?}\n  got:  {got:?}\n  want: {out:?}"));
+			}
+			if let Some(theirs) = theirs {
+				let theirs = bash_without_its_races(&theirs, &out);
+				assert_eq!(masked_stages(&ours), masked_stages(&theirs), "{name}: {script:?}");
+			}
+		}
+	};
+	let killed = |name: &str, cmd: &str| {
+		format!("st=0\n{name}: line 1: PID {:<27}{cmd}\nw=0\n", desc(libc::SIGKILL))
+	};
+	let forms = [
+		"nosuchcmd",
+		"/no/such/file",
+		noexec.as_str(),
+		"echo hi",
+		"x=1",
+		": ${u?unset}",
+		"/bin/true > /no/such/dir/f",
+	];
+	for (i, cmd) in forms.into_iter().enumerate() {
+		let script = format!("{cmd} & kill -KILL %1; echo \"st=$?\"; wait; echo \"w=$?\"");
+		check(&script, &|name| killed(name, cmd), false, i == 0);
+	}
+	let k = desc(libc::SIGKILL);
+	let stages = [(k.as_str(), "nosuchcmd"), (k.as_str(), "nosuch2")];
+	check(
+		"nosuchcmd | nosuch2 & kill -KILL %1; echo \"st=$?\"; wait; echo \"w=$?\"",
+		&|name| format!("st=0\n{}w=0\n", job_notice(name, 1, &stages, "")),
+		false,
+		false,
+	);
+	// A redirection the job's program would have opened: no file is left.
+	let out = dir.path().join("out").display().to_string();
+	check(
+		&format!(
+			"/bin/true > {out} & kill -KILL %1; echo \"st=$?\"; wait; echo \"w=$?\"; [ -e {out} ] && \
+			 echo out=created || echo out=absent"
+		),
+		&|name| format!("{}out=absent\n", killed(name, &format!("/bin/true > {out}"))),
+		false,
+		false,
+	);
+	// Under `set -x` the job's trace line goes with it: it never traced.
+	check(
+		"set -x; nosuchcmd & kill -KILL %1; echo \"st=$?\"; wait; echo \"w=$?\"",
+		&|name| {
+			let notice = killed(name, "nosuchcmd");
+			let notice = notice.lines().nth(1).expect("the notice line");
+			format!("+ kill -KILL %1\n+ echo st=0\nst=0\n+ wait\n{notice}\n+ echo w=0\nw=0\n")
+		},
+		false,
+		false,
+	);
+	// A function job traces its call in an op before the one that takes the
+	// signal: the trace line waits there, and goes with the job.
+	check(
+		"f() { nosuchcmd; }; set -x; f & kill -KILL %1; echo \"st=$?\"; wait; echo \"w=$?\"",
+		&|name| {
+			let notice = killed(name, "f");
+			let notice = notice.lines().nth(1).expect("the notice line");
+			format!("+ kill -KILL %1\n+ echo st=0\nst=0\n+ wait\n{notice}\n+ echo w=0\nw=0\n")
+		},
+		false,
+		false,
+	);
+	let not_found = |name: &str| format!("{name}: line 1: nosuchcmd: command not found\nw=127\n");
+	check(
+		"nosuchcmd & kill -STOP %1; kill -CONT %1; wait %1; echo \"w=$?\"",
+		&not_found,
+		false,
+		true,
+	);
+	check(
+		"set -m; nosuchcmd & kill -STOP %1; /bin/sleep 0.3; jobs; kill -CONT %1; wait %1; echo \
+		 \"w=$?\"",
+		&|name| format!("[1]+  {:<27}nosuchcmd\n{}", "Stopped", not_found(name)),
+		true,
+		true,
+	);
+	// Its notice names `$!`.
+	let script = "exec 2>&1; nosuchcmd & kill -KILL %1; echo \"bang=$!\"; wait";
+	let shells = std::iter::once(std::path::PathBuf::from(obash)).chain(bash.clone());
+	for (i, shell) in shells.enumerate() {
+		let run = Run::script(&shell, "bash", script);
+		let outcome = if i == 0 {
+			run.go()
+		} else {
+			bash_without_its_races(&run, &killed("bash", "nosuchcmd"))
+		};
+		let out = outcome.stdout;
+		let text = String::from_utf8_lossy(&out);
+		let bang = text
+			.lines()
+			.find_map(|l| l.strip_prefix("bang=")?.parse::<u64>().ok());
+		if bang.is_none() || bang != notice_pid(&out) {
+			wrong
+				.push(format!("{shell:?}: {script:?}\n  the notice does not name $!\n  out: {text:?}"));
+		}
+	}
+	// Across the shell's own snapshot and restore at every op.
+	let script = "exec 2>&1; nosuchcmd & kill -KILL %1; echo \"st=$?\"; wait; echo \"w=$?\"";
+	let want = (killed("bash", "nosuchcmd"), Some(Exit(0)));
+	for seed in 1..=3 {
+		for mode in ["step", "exec"] {
+			let ours = Run::script(obash, "bash", script)
+				.env("PI_SHELL_FAULT", format!("{seed}:1"))
+				.env("PI_SHELL_FAULT_MODE", mode)
+				.env("PI_SHELL_FAULT_LOST", "defer")
+				.go();
+			let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+			if got != want {
+				wrong
+					.push(format!("{mode}, seed {seed}: {script:?}\n  got:  {got:?}\n  want: {want:?}"));
+			}
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// One of the real bash's own races that a live row's run of it can show,
+/// known by its mark in bash's output where the row's golden has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BashRace {
+	/// The child reached its error before the parent's `kill`: no `Killed`
+	/// notice.
+	LostKill,
+	/// The child reached its error before the parent's `kill` took it: its
+	/// `command not found` line, where the golden has none, and then its
+	/// `Killed` notice.
+	LateKill,
+	/// bash reaped the killed job only after `wait` returned: its `w=` line
+	/// comes before its `Killed` notice.
+	LateReap,
+	/// The child reached its error before the parent's `kill -STOP`: its
+	/// `command not found` line comes before its `Stopped` line, or no
+	/// `Stopped` line comes.
+	LostStop,
+}
+
+impl BashRace {
+	/// The race `out`, a run of the real bash, shows where `want`, the row's
+	/// golden, shows none; `None` when it shows none.
+	fn in_run(want: &str, out: &[u8]) -> Option<Self> {
+		fn first(text: &str, mark: fn(&str) -> bool) -> Option<usize> {
+			text.lines().position(mark)
+		}
+		fn killed(line: &str) -> bool {
+			line.contains("Killed")
+		}
+		fn waited(line: &str) -> bool {
+			line.starts_with("w=")
+		}
+		fn stopped(line: &str) -> bool {
+			line.contains("Stopped")
+		}
+		fn not_found(line: &str) -> bool {
+			line.contains("command not found")
+		}
+		let text = String::from_utf8_lossy(out);
+		if let Some(notice) = first(want, killed) {
+			let Some(theirs) = first(&text, killed) else {
+				return Some(Self::LostKill);
+			};
+			if first(want, not_found).is_none() && first(&text, not_found).is_some() {
+				return Some(Self::LateKill);
+			}
+			let after = first(want, waited).is_none_or(|w| w > notice);
+			if after && first(&text, waited).is_some_and(|w| w < theirs) {
+				return Some(Self::LateReap);
+			}
+		}
+		if let Some(stop) = first(want, stopped) {
+			let theirs = first(&text, stopped);
+			let after = first(want, not_found).is_none_or(|e| e > stop);
+			if after && first(&text, not_found).is_some_and(|e| theirs.is_none_or(|s| e < s)) {
+				return Some(Self::LostStop);
+			}
+		}
+		None
+	}
+
+	/// What bash's output showed.
+	const fn what(self) -> &'static str {
+		match self {
+			Self::LostKill => "no `Killed` notice: its child reached its error before the kill",
+			Self::LateKill => {
+				"its `command not found` line came with its `Killed` notice: its child reached its \
+				 error before the kill took it"
+			},
+			Self::LateReap => "its `w=` line came before its `Killed` notice: it reaped the job late",
+			Self::LostStop => {
+				"its `command not found` line came before `Stopped`: its child reached its error \
+				 before the stop"
+			},
+		}
+	}
+}
+
+/// Run bash's side of a live row `run` until a run shows none of bash's own
+/// races ([`BashRace`]) where the row's golden `want` shows none, at most 5
+/// times, and give that run. The real bash loses the signal or the stop to
+/// its child in some runs (the child reaches its error before the parent's
+/// `kill`; seen once in 10 runs on runc, and up to 8 in 10 for a pipeline on
+/// gVisor, google/gvisor#17983), its child prints its error before the kill
+/// takes it (seen on runc), and it reaps a killed job before or after `wait`
+/// returns (its notice before or after the `w=` line; seen on runc); a row
+/// compares what bash prints once none of that happened. A bash that
+/// shows a race in all 5 runs fails the test, naming the race: a row never
+/// passes without a run of bash it compared. obash's side runs once and
+/// must equal its golden: its job takes a held signal before it acts, in
+/// every run.
+fn bash_without_its_races(run: &Run, want: &str) -> Outcome {
+	let mut races = Vec::new();
+	let mut last = String::new();
+	for _ in 0..5 {
+		let theirs = run.go();
+		let Some(race) = BashRace::in_run(want, &theirs.stdout) else {
+			return theirs;
+		};
+		races.push(format!("{race:?} ({})", race.what()));
+		last = String::from_utf8_lossy(&theirs.stdout).into_owned();
+	}
+	panic!(
+		"the real bash showed one of its own races in all 5 runs, so the row compared none: {}\n  \
+		 want: {want:?}\n  bash's last run: {last:?}",
+		races.join("; ")
+	);
 }
 
 /// A job `kill` named before obash spawned its program keeps its notice, and

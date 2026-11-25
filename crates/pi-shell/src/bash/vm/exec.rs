@@ -31,6 +31,7 @@ use crate::bash::{
 	ir::{self, ComsubForm, Op, Opcode, SpawnKind, Unit},
 	mem::{self, Capture},
 	pattern::PatOpts,
+	signal::SigSet,
 	store::{Attrs, Key, KeyBuf, MiscKey, OptId, Record, StateStore, StoreError, TrapKey},
 	syntax::{CompleteCommand, Features, ParseError, ParseErrorKind, Parser, Pos, Resume},
 	zshopt::ZshOpt,
@@ -80,7 +81,10 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		if k.root.has_fault() {
 			return;
 		}
-		if !vp.out.is_empty() {
+		// A job deciding its pid that holds signals `kill` sent it writes
+		// nothing before it takes them (`Kernel::take_held`): bash's child
+		// had them before it traced or reported anything.
+		if !vp.out.is_empty() && (k.bangs.is_empty() || !k.holds(vp.vpid)) {
 			let at = k.ctl.wakes();
 			match flush_out(k, vp) {
 				Some(fd) => return park(k, cx, vp, WaitKey::Write { fd }, at),
@@ -4310,7 +4314,11 @@ fn async_subshell_body(unit: &Unit, pc: u32, info: &crate::bash::ir::SpawnIr) ->
 /// own vproc under `lastpipe`): its last stage decides the job's pid as a
 /// job body of its own would (bash and zsh name the last process in `$!`).
 /// While the job's `[n] pid…` line waits, every earlier stage decides the
-/// pid that line shows for it the same way (zsh names each process).
+/// pid that line shows for it the same way (zsh names each process). The
+/// signals `kill` held for the job ([`Bang::held`]) are each stage's
+/// before it runs, as each of bash's forks has them: one that decides
+/// takes them at its decision, any other at once; under `lastpipe` the
+/// job's own vproc takes them for all at its decision.
 fn retarget_bang(k: &mut Kernel, job_vproc: Vpid, unit: &Unit, stages: &[(Vpid, u32)]) {
 	let Some(i) = k
 		.bangs
@@ -4323,26 +4331,48 @@ fn retarget_bang(k: &mut Kernel, job_vproc: Vpid, unit: &Unit, stages: &[(Vpid, 
 		return;
 	};
 	let lone = |entry: u32| bang_stage(unit, entry).filter(|s| *s != BangStage::Pipeline);
-	if super::jobctl::announcing(k, job_vproc) {
+	let announcing = super::jobctl::announcing(k, job_vproc);
+	let held = if last == job_vproc {
+		SigSet::EMPTY
+	} else {
+		k.bangs[i].held
+	};
+	if announcing || held != SigSet::EMPTY {
 		let mut pids = Vec::with_capacity(stages.len());
 		for &(stage, entry) in stages {
 			let decides = lone(entry);
-			if let Some(kind) = decides
-				&& stage != last
-			{
-				k.bangs.push(Bang { vproc: stage, job: stage, stage: kind });
+			if stage != last {
+				if let Some(kind) = decides {
+					k.bangs
+						.push(Bang { vproc: stage, job: stage, stage: kind, held });
+				} else {
+					send_held(k, stage, held);
+				}
 			}
 			pids.push((stage, decides.is_some()));
 		}
-		super::jobctl::pipeline_started(k, job_vproc, &pids);
+		if announcing {
+			super::jobctl::pipeline_started(k, job_vproc, &pids);
+		}
 	}
-	match lone(last_entry) {
-		Some(stage) => {
-			let bang = &mut k.bangs[i];
-			bang.vproc = last;
-			bang.stage = stage;
-		},
-		None => k.settle_bang(job_vproc, None),
+	if let Some(stage) = lone(last_entry) {
+		let bang = &mut k.bangs[i];
+		bang.vproc = last;
+		bang.stage = stage;
+	} else {
+		if last != job_vproc {
+			let held = std::mem::take(&mut k.bangs[i].held);
+			send_held(k, last, held);
+		}
+		k.settle_bang(job_vproc, None);
+	}
+}
+
+/// Queue the signals `held` for vproc `stage` alone (a stage of a job's
+/// pipeline that has not run yet, [`retarget_bang`]).
+fn send_held(k: &Kernel, stage: Vpid, held: SigSet) {
+	for sig in held.iter() {
+		super::ControlHandle(k.ctl.clone()).signal(crate::bash::SigTarget::Vpid(stage), sig);
 	}
 }
 
@@ -4366,16 +4396,17 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		.is_some_and(|s| !s.children.is_empty());
 	if !started {
 		// A job that forks (a subshell, pipeline, job or coprocess of its
-		// own) is not just one program: it keeps its virtual pid. The
-		// pipeline a job's body is passes the decision to its last stage
+		// own) is not just one program: it keeps its virtual pid, and takes
+		// the signals `kill` held for it before it forks. The pipeline a
+		// job's body is passes the decision to its last stage
 		// ([`retarget_bang`]).
 		let own_pipeline = info.kind == SpawnKind::Pipeline
 			&& k
 				.bangs
 				.iter()
 				.any(|b| b.vproc == vp.vpid && b.stage == BangStage::Pipeline);
-		if !k.bangs.is_empty() && !own_pipeline {
-			k.settle_bang(vp.vpid, None);
+		if !k.bangs.is_empty() && !own_pipeline && k.settle_bang(vp.vpid, None) {
+			return Flow::Block(WaitKey::Signal);
 		}
 		let mut children = Vec::with_capacity(info.stages.len());
 		// bash's `stop_pipeline` (each fork it makes a job of) first deletes
@@ -4455,7 +4486,8 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					// spawns it (bash's subshell `exec`s a lone simple command):
 					// readers of the pid wait for that decision.
 					if let Some(stage) = bang_stage(unit, info.stages[0].entry) {
-						k.bangs.push(Bang { vproc: vpid, job: vpid, stage });
+						k.bangs
+							.push(Bang { vproc: vpid, job: vpid, stage, held: SigSet::EMPTY });
 					}
 					let job = k.job_id(cx.store);
 					// zsh `&|` / `&!`: disowned at once (no job entry).

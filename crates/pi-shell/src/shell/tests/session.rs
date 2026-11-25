@@ -633,22 +633,96 @@ async fn subshell_exit_ends_its_background_builtins() {
 	assert!(!still_written(output.path()).await, "background `yes` outlived its subshell");
 }
 
+/// The most [`kill_jobspec_ends_in_process_background_job`] lets the
+/// in-process `yes` put in its file. On the builds pods that `yes` writes
+/// about 1.5 GB/s, and nothing at all once `kill %1` works: a `kill` that
+/// never returns, or a `yes` it does not end, passes this within a few
+/// milliseconds, where a time bound alone lets it write gigabytes.
+const YES_OUTPUT_CAP: u64 = 16 << 20;
+
 /// `kill %N` ends a background job running inside the shell, which has no
-/// process to deliver the signal to.
+/// process to deliver the signal to. Bounded in what `yes` may write
+/// ([`YES_OUTPUT_CAP`]) and in time: a `kill` that waits for ever, or a
+/// `yes` it does not end, fails by name within milliseconds, the run
+/// cancelled and the shell dropped first, which ends `yes`; the failure
+/// says how much the file holds then.
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_jobspec_ends_in_process_background_job() {
 	let _guard = shell_test_lock().lock().await;
 	let output = tempfile::NamedTempFile::new().expect("output file");
+	let path = output.path();
 	let shell = Shell::new(None);
-	let command = format!("yes > {} & kill %1", quote_arg(&output.path().to_string_lossy()));
+	let mut cancel = CancelToken::default();
+	let abort = cancel.emplace_abort_token();
+	let command = format!("yes > {} & kill %1", quote_arg(&path.to_string_lossy()));
+	let run = shell.run(ShellRunOptions { command, ..Default::default() }, None, cancel);
 
-	let result = shell
-		.run(ShellRunOptions { command, ..Default::default() }, None, CancelToken::default())
-		.await
-		.expect("run kill");
-
+	let result = match within_output_cap(path, &abort, run).await {
+		Ok(result) => result.expect("run kill"),
+		Err(why) => {
+			drop(shell);
+			panic!("{why}; {} bytes once the shell was dropped", settled_len(path).await);
+		},
+	};
 	assert_eq!(result.exit_code, Some(0), "kill %1 failed");
-	assert!(!still_written(output.path()).await, "`yes` kept running after kill %1");
+	let written = match within_output_cap(path, &abort, still_written(path)).await {
+		Ok(written) => written,
+		Err(why) => {
+			drop(shell);
+			panic!("{why}; {} bytes once the shell was dropped", settled_len(path).await);
+		},
+	};
+	assert!(!written, "`yes` kept running after kill %1");
+}
+
+/// Run `body`, checking every 5 ms that the file at `path` holds at most
+/// [`YES_OUTPUT_CAP`] bytes and that `body` has run under 10 s (the bound
+/// the retained-session test below puts on each call). Once either fails:
+/// the run `abort` cancels is cancelled, given 2 s, and `Err` says why.
+async fn within_output_cap<T>(
+	path: &std::path::Path,
+	abort: &AbortToken,
+	body: impl Future<Output = T>,
+) -> Result<T, String> {
+	let start = time::Instant::now();
+	let mut body = std::pin::pin!(body);
+	let why = loop {
+		tokio::select! {
+			biased;
+			outcome = &mut body => return Ok(outcome),
+			() = time::sleep(Duration::from_millis(5)) => {
+				let len = file_len(path);
+				if len > YES_OUTPUT_CAP {
+					break format!("`yes` wrote {len} bytes, more than {YES_OUTPUT_CAP}: kill %1 did not end it");
+				}
+				if start.elapsed() >= Duration::from_secs(10) {
+					break format!("kill %1 and its check did not end in 10 s ({len} bytes written)");
+				}
+			},
+		}
+	};
+	abort.abort(AbortReason::Signal);
+	let _ = time::timeout(Duration::from_secs(2), body).await;
+	Err(why)
+}
+
+/// The length of the file at `path` once it stops growing: two looks
+/// 50 ms apart agree, or 5 s have passed.
+async fn settled_len(path: &std::path::Path) -> u64 {
+	let mut last = file_len(path);
+	for _ in 0..100 {
+		time::sleep(Duration::from_millis(50)).await;
+		let now = file_len(path);
+		if now == last {
+			break;
+		}
+		last = now;
+	}
+	last
+}
+
+fn file_len(path: &std::path::Path) -> u64 {
+	std::fs::metadata(path).map_or(0, |m| m.len())
 }
 
 /// `VictorCano`'s #12309 follow-up trigger (2026-10-21): a backgrounded
