@@ -12,3 +12,10 @@ paths:
    .github/workflows/sami-rust-test.yml:
       ignore:
          - 'property "result" is not defined in object type \{outputs: \{\}\}'
+# actionlint 1.7.12 does not know cache-mode either (a workflow's and a job's
+# GitHub Actions cache access), which sami-checks.yml and sami-rust-test.yml
+# set to none on the workflow and on each calling job. Any other unknown key,
+# a misspelled cache-mode among them, still fails.
+   .github/workflows/*.yml:
+      ignore:
+         - 'unexpected key "cache-mode" for "(workflow|job)" section'

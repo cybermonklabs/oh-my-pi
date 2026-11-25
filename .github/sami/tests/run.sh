@@ -8,6 +8,9 @@
 #     them out, with a test binary beside each log that lists its tests.
 #   - fetch-verified.sh, with a stub in place of curl.
 #   - rust-test-parity.sh, against stubs of cargo and bazelisk query.
+#   - rust-test-early-listings.sh, against stubs of cargo metadata and
+#     bazelisk query, build and info, and test binaries that list their tests
+#     (cases E*); rust-test-listings-drift.sh (cases D*).
 #   - rust-test-tmpdir.sh.
 #   - release-candidate.sh, publish's checks, by release-candidate-harness.sh
 #     with a stub in place of gh (cases RC-*).
@@ -701,8 +704,8 @@ CARGO_MODE=doc-skip run J107-crate-doctest-skips-itself 1 "crates/pi-diff:doc sr
 CARGO_MODE=doc-raw-skip run J110-doctest-raw-skip-line 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) skipped itself and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 CARGO_MODE=doc-raw-print run J111-doctest-raw-output 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in .github/sami/rust-test-known-output.txt" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 run J107b-crate-doctests-run-under-cargo 0 '' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-# B4: the listings the macOS job's inventory reads.
-run J108-listings-for-macos 0 'Listings for the macOS inventory: 2 binaries' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+# B4: the listings the drift check compares with the early ones.
+run J108-listings-for-the-drift-check 0 'Listings for the drift check: 2 binaries' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 # R3: cargo's readable doctest run must have run the same doctests as Bazel's
 # doctest target of the crate, both ways.
 CARGO_MODE=doc-empty run J113b-bazel-doctest-without-cargo-counterpart 1 "crates/pi-diff src/lib.rs - f \\(line 3\\) ran in Bazel's doctest target and not in cargo's doctest run" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
@@ -1695,6 +1698,191 @@ PARITY_SANCTIONED_LINE='//crates/demo:demo_test x::flaky ruling' prun P13-sancti
 prun P10-filter-of-another-binary-does-not-cover 1 "//crates/demo:demo_test's args skip ::slow::" "$(covered "$(strs args --skip ::slow::)")
 $(rule native_test //crates/demo:slow_test "$(str src //crates/other:other_test)" "$(strs args ::slow::)")"
 prun P11-query-names-no-rust-test 1 'bazel query names no crate root of any rust_test' "$LIB"
+
+# --- rust-test-early-listings.sh -------------------------------------------------
+# erun <name> <want> <message regex> <rules: JSON lines> <binaries>: the early
+# listings in a repository with two packages, demo (a library, and the test
+# target tests/wire.rs) and vendored (a library test:rs leaves out), against
+# stubs of cargo metadata and bazelisk query, build and info. <binaries>:
+# lines of `<binary-id> <package> <kind> <name> <tests...>`, each a test
+# binary of the archive, recorded under another target directory, whose
+# --list names those tests. BAZEL_BIN: lines of `<label> <tests...>`, the
+# binaries a bazel build leaves in bazel-bin; BUILD_RC, that build's exit. The
+# output then names each index.tsv line with its listing (`<label>: <tests>`).
+# EARLY_MODE: both (one call, the default), halves (the Bazel half, then the
+# archive half, as the build job runs them) or unfinished (the archive half
+# beside a Bazel half that has not ended). WIRE_TEST: false makes cargo
+# metadata say cargo does not test tests/wire.rs. RUST_TEST_EARLY_SH runs
+# another copy of the script.
+early_sh="${RUST_TEST_EARLY_SH:-$repo/.github/sami/rust-test-early-listings.sh}"
+erun() {
+	local name="$1" want="$2" msg="$3" rules="$4" bins="$5" w out rc id package kind bname tests t label file
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(cd "$(mktemp -d "$scratch/early.XXXXXX")" && pwd -P)"
+	mkdir -p "$w/bin" "$w/repo/scripts" "$w/target/debug/deps" "$w/binroot"
+	printf 'const VENDORED_FORK_EXCLUDES = [\n\t"--exclude",\n\t"vendored",\n];\n' >"$w/repo/scripts/run-rs-task.ts"
+	printf '%s\n' "$rules" >"$w/rules.json"
+	# fake <path> <tests...>: a test binary that lists these tests, as libtest does.
+	fake() {
+		local f="$1"
+		shift
+		mkdir -p "$(dirname "$f")"
+		{ printf '#!/bin/sh\n[ "$1" = --list ] || exit 2\n'; for t in "$@"; do printf "echo '%s: test'\n" "$t"; done; printf "echo; echo '%s tests, 0 benchmarks'\n" "$#"; } >"$f"
+		chmod +x "$f"
+	}
+	: >"$w/bins.jsonl"
+	while read -r id package kind bname tests; do
+		[ -n "$id" ] || continue
+		# shellcheck disable=SC2086 # one test name a word
+		fake "$w/target/debug/deps/$bname-${id//[^a-z]/x}" $tests
+		jq -cn --arg id "$id" --arg p "path+file://$w/repo/crates/$package#0.1.0" --arg k "$kind" --arg n "$bname" --arg path "/home/runner/target/debug/deps/$bname-${id//[^a-z]/x}" \
+			'{key: $id, value: {"binary-id": $id, "binary-name": $n, "package-id": $p, kind: $k, "binary-path": $path, "build-platform": "target"}}' >>"$w/bins.jsonl"
+	done <<<"$bins"
+	jq -s '{"rust-build-meta": {"target-directory": "/home/runner/target"}, "rust-binaries": from_entries}' "$w/bins.jsonl" >"$w/binaries-metadata.json"
+	while read -r label tests; do
+		[ -n "$label" ] || continue
+		t="${label#//}"
+		# shellcheck disable=SC2086 # one test name a word
+		fake "$w/binroot/${t%%:*}/${t#*:}" $tests
+	done <<<"${BAZEL_BIN-//crates/demo:relay_test r::one tests::two}"
+	cat >"$w/bin/cargo" <<EOF
+#!/bin/sh
+[ "\$1" = metadata ] || exit 2
+r="$w/repo"
+printf '{"packages":[{"id":"path+file://%s/crates/demo#0.1.0","name":"demo","targets":[{"name":"demo","kind":["lib"],"src_path":"%s/crates/demo/src/lib.rs","test":true},{"name":"wire","kind":["test"],"src_path":"%s/crates/demo/tests/wire.rs","test":${WIRE_TEST:-true}}]},{"id":"path+file://%s/crates/vendored#0.1.0","name":"vendored","targets":[{"name":"vendored","kind":["lib"],"src_path":"%s/crates/vendored/src/lib.rs","test":true}]}]}\n' "\$r" "\$r" "\$r" "\$r" "\$r"
+EOF
+	cat >"$w/bin/bazelisk" <<EOF
+#!/bin/sh
+case "\$1" in
+	query) cat "$w/rules.json" ;;
+	build) exit "\${BUILD_RC:-0}" ;;
+	info) echo "$w/binroot" ;;
+	*) echo "stub: bazelisk \$*" >&2; exit 2 ;;
+esac
+EOF
+	chmod +x "$w/bin/cargo" "$w/bin/bazelisk"
+	case "${EARLY_MODE:-both}" in
+	both)
+		out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" bash "$early_sh" "$w/binaries-metadata.json" "$w/target" "$w/out" 2>&1)"
+		rc=$?
+		;;
+	halves)
+		out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" bash "$early_sh" bazel "$w/state" 2>&1; echo "--- bazel half: exit $?, bazel.rc [$(cat "$w/state/bazel.rc" 2>/dev/null)]")"
+		out+=$'\n'"$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" bash "$early_sh" archive "$w/state" "$w/binaries-metadata.json" "$w/target" "$w/out" 2>&1)"
+		rc=$?
+		;;
+	unfinished)
+		mkdir -p "$w/state/bazel"
+		out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" bash "$early_sh" archive "$w/state" "$w/binaries-metadata.json" "$w/target" "$w/out" 2>&1)"
+		rc=$?
+		;;
+	esac
+	if [ -f "$w/out/index.tsv" ]; then
+		out+=$'\n'"--- index"
+		while IFS=$'\t' read -r label file; do out+=$'\n'"$label: $(tr '\n' ' ' <"$w/out/$file" | sed 's/ $//')"; done <"$w/out/index.tsv"
+	fi
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+ELIB="$(rule rust_library //crates/demo:demo "$(strs srcs //crates/demo:src/lib.rs)")"
+EDEMO="$(rule rust_test //crates/demo:demo_test "$(str crate //crates/demo:demo)")"
+EWIRE="$(rule rust_test //crates/demo:wire_test "$(strs srcs //crates/demo:tests/wire.rs)")"
+# The Bazel-only target, as //crates/pi-natives:oauth_callback_relay_test:
+# cargo builds its crate root through build.rs, as no test target.
+ERELAY="$(rule rust_test //crates/demo:relay_test "$(str crate_root //crates/demo:src/relay.rs)" "$(strs srcs //crates/demo:src/relay.rs //crates/demo:src/publication.rs)")"
+ERULES="$ELIB
+$EDEMO
+$EWIRE
+$ERELAY"
+EBINS="demo demo lib demo a::one a::two
+demo::wire demo test wire w::one
+vendored vendored lib vendored v::one"
+# A clean tree: each binary is the one rust_test whose crate root is its
+# source, the Bazel-only target is built and listed, and vendored's binary,
+# which no rust_test is, is left out by name (E1); each listing is the
+# binary's test names, the summary line dropped (E2). A native_test that runs
+# a rust_test's binary (the pi_natives_test scanner split) needs no listing of
+# its own (E3).
+NOT_MSG='::error' erun E1-early-listings-clean 0 "Early listings: 3 of 3 rust_test targets, 2 from the archive's 3 test binaries, 1 Bazel-only built by Bazel \\(//crates/demo:relay_test\\); 1 binaries of packages test:rs leaves out not listed \\(vendored\\)" "$ERULES" "$EBINS"
+erun E2-early-listing-is-the-binarys-names 0 '^//crates/demo:demo_test: a::one a::two$' "$ERULES" "$EBINS"
+NOT_MSG='::error' erun E3-native-test-of-a-listed-binary 0 'Early listings: 3 of 3 rust_test targets' "$ERULES
+$(rule native_test //crates/demo:demo_slow_test "$(str src //crates/demo:demo_test)" "$(strs args --exact a::two)")" "$EBINS"
+# A binary whose source is no rust_test's crate root fails by name (E4),
+# and so does one whose source is two rust_tests' (E5).
+erun E4-binary-maps-to-no-label 1 'test binary demo::wire \(crates/demo/tests/wire.rs\) maps to no Bazel rust_test' "$ELIB
+$EDEMO
+$ERELAY" "$EBINS"
+erun E5-binary-maps-to-two-labels 1 'test binary demo \(crates/demo/src/lib.rs\) maps to 2 Bazel rust_tests, which all have crates/demo/src/lib.rs as their crate root: //crates/demo:demo_again_test //crates/demo:demo_test' "$ERULES
+$(rule rust_test //crates/demo:demo_again_test "$(str crate //crates/demo:demo)")" "$EBINS"
+# A binary that is no cargo target fails (E6). A Bazel-only target whose
+# Linux build fails (E7), or that leaves no binary (E8), fails by its label.
+erun E6-binary-of-no-cargo-target 1 'test binary demo::ghost \(test ghost of .*\) is 0 cargo targets in cargo metadata' "$ERULES" "$EBINS
+demo::ghost demo test ghost g::one"
+BUILD_RC=1 erun E7-bazel-only-build-fails 1 '//crates/demo:relay_test: Bazel-only \(no test binary of the archive is it\), and the bazel build of it for Linux exited 1' "$ERULES" "$EBINS"
+BAZEL_BIN='' erun E8-bazel-only-without-a-binary 1 '//crates/demo:relay_test: its binary .* cannot list its tests' "$ERULES" "$EBINS"
+# Nothing to list is UNKNOWN, never a pass: no rust_test (E9), no binary (E10).
+erun E9-query-names-no-rust-test 1 'UNKNOWN: bazel query names no rust_test under //crates' "$ELIB" "$EBINS"
+erun E10-archive-names-no-binary 1 'UNKNOWN: .*binaries-metadata.json names no test binary' "$ERULES" ''
+# The two halves the build job runs, the Bazel one in the background, give
+# the same listings (E11, E11b). The archive half beside a Bazel half that has
+# not ended is UNKNOWN (E12). A cargo test target with no binary in the
+# archive leaves its rust_test without a listing (E13); a binary of a target
+# cargo metadata says it does not test is the Bazel half's Bazel-only target
+# too, and is listed twice (E14).
+EARLY_MODE=halves NOT_MSG='::error' erun E11-early-listings-in-two-halves 0 "Early listings: 3 of 3 rust_test targets, 2 from the archive's 3 test binaries, 1 Bazel-only built by Bazel \\(//crates/demo:relay_test\\)" "$ERULES" "$EBINS"
+EARLY_MODE=halves erun E11b-two-halves-list-the-bazel-only-target 0 '^//crates/demo:relay_test: r::one tests::two$' "$ERULES" "$EBINS"
+EARLY_MODE=unfinished erun E12-archive-half-before-the-bazel-half-ends 1 'UNKNOWN: the Bazel half has not finished' "$ERULES" "$EBINS"
+erun E13-cargo-test-target-without-a-binary 1 '//crates/demo:wire_test: a rust_test bazel query names, with no listing' "$ERULES" "demo demo lib demo a::one a::two
+vendored vendored lib vendored v::one"
+WIRE_TEST=false BAZEL_BIN='//crates/demo:relay_test r::one
+//crates/demo:wire_test w::one' erun E14-binary-of-a-target-bazel-built-too 1 '//crates/demo:wire_test is listed twice: test binary demo::wire of the archive is it, and the Bazel half built it as Bazel-only' "$ERULES" "$EBINS"
+
+# --- rust-test-listings-drift.sh -------------------------------------------------
+# drun <name> <want> <message regex> <early> <Bazel's>: the drift check of two
+# listings directories, each given as lines of `<label> <tests...>`.
+# EARLY_INDEX=none leaves the early index out. RUST_TEST_DRIFT_SH runs
+# another copy of the script.
+drift_sh="${RUST_TEST_DRIFT_SH:-$repo/.github/sami/rust-test-listings-drift.sh}"
+drun() {
+	local name="$1" want="$2" msg="$3" w out rc side label tests i=0
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/drift.XXXXXX")"
+	for side in early bazel; do
+		mkdir -p "$w/$side"
+		[ "$side" = early ] && [ "${EARLY_INDEX:-}" = none ] && continue
+		: >"$w/$side/index.tsv"
+		while read -r label tests; do
+			[ -n "$label" ] || continue
+			i=$((i + 1))
+			# shellcheck disable=SC2086 # one test name a word
+			if [ -n "$tests" ]; then printf '%s\n' $tests | LC_ALL=C sort -u >"$w/$side/$i.txt"; else : >"$w/$side/$i.txt"; fi
+			printf '%s\t%s.txt\n' "$label" "$i" >>"$w/$side/index.tsv"
+		done <<<"$([ "$side" = early ] && printf '%s' "$4" || printf '%s' "$5")"
+	done
+	out="$(PATH="${TOOLBIN:+$TOOLBIN:}$PATH" bash "$drift_sh" "$w/early" "$w/bazel" 2>&1)"
+	rc=$?
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+DT1=//crates/pi-shell:pi-shell_test
+DT2=//crates/pi-natives:oauth_callback_relay_test
+DT3=//crates/vendor/tree-sitter-go:tree-sitter-go_test
+# The same listings pass, a target with no tests included (D1). A renamed
+# test fails, named on each side (D2, D3); a target on one side only fails
+# (D4, D5); the plant a dispatch makes, one renamed test and one missing
+# target, fails with each named (D6). No early listings is UNKNOWN (D7).
+NOT_MSG='::error' drun D1-drift-clean-pair 0 'Listing drift: 0 differences in 3 targets' "$DT1 a::one a::two
+$DT2 p::one
+$DT3" "$DT1 a::one a::two
+$DT2 p::one
+$DT3"
+drun D2-drift-renamed-test-in-rust-tests 1 "$DT1 a::two: in rust_test's listing, not in the early one the macOS inventory read" "$DT1 a::one a::two_renamed" "$DT1 a::one a::two"
+drun D3-drift-renamed-test-in-early 1 "$DT1 a::two_renamed: in the early listing the macOS inventory read, not in rust_test's" "$DT1 a::one a::two_renamed" "$DT1 a::one a::two"
+drun D4-drift-target-missing-from-early 1 "$DT2 has a listing of rust_test's \\(1 tests\\) and no early listing" "$DT1 a::one" "$DT1 a::one
+$DT2 p::one"
+drun D5-drift-target-only-in-early 1 "$DT2 has an early listing \\(1 tests\\) and no listing of rust_test's" "$DT1 a::one
+$DT2 p::one" "$DT1 a::one"
+drun D6-drift-plant-rename-and-missing-target 1 'Listing drift: 3 differences in 2 targets \(early 1, rust_test.s 2\)' "$DT1 a::one a::two_renamed" "$DT1 a::one a::two
+$DT2 p::one"
+EARLY_INDEX=none drun D7-drift-no-early-listings 1 'UNKNOWN: .*/early/index.tsv \(early\) is missing or empty' '' "$DT1 a::one"
 
 echo "rust_test job scripts: $pass passed, $fail failed, $skip skipped"
 [ "$fail" = 0 ] && [ "$pass" -gt 0 ]

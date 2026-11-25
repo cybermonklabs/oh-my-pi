@@ -37,10 +37,11 @@
 #     RUST_TEST_STICKY_FIFO names and as root, or prints there (`UNKNOWN:`,
 #     it checked nothing).
 # It leaves each test binary's listing in $RUNNER_TEMP/rust-test/listings
-# (index.tsv names the binary of each), for the macOS job's inventory
-# (.github/sami/rust-test-macos-inventory.sh), and cargo's --timings report of
-# each cargo test in $RUNNER_TEMP/rust-test/cargo-timings, with each one's
-# build and test seconds in the job log and the step summary.
+# (index.tsv names the binary of each), which sami-checks.yml's
+# rust-test-drift job compares with the early listings the macOS job's
+# inventory read (.github/sami/rust-test-listings-drift.sh), and cargo's
+# --timings report of each cargo test in $RUNNER_TEMP/rust-test/cargo-timings,
+# with each one's build and test seconds in the job log and the step summary.
 # With RUST_TEST_ONLY naming a list (the macOS job names that inventory), it
 # runs only the tests that list names, each target once with --exact, and
 # fails unless each of them ran here; the failure, skip and output rules are
@@ -138,6 +139,10 @@ libtest_event='def libtest_event:
 # rust-test-parity.sh and rust-test-macos-inventory.sh.
 # shellcheck source=.github/sami/rust-test-lists.sh
 . "$(dirname "${BASH_SOURCE[0]}")/rust-test-lists.sh"
+# listing_names, the one reading of a binary's `--list`, shared with
+# rust-test-early-listings.sh and rust-test-macos-inventory.sh.
+# shellcheck source=.github/sami/rust-test-targets.sh
+. "$(dirname "${BASH_SOURCE[0]}")/rust-test-targets.sh"
 
 # entries <list> <fields> <tsv>: list_entries of .github/sami/<list>.
 entries() {
@@ -1358,7 +1363,7 @@ while IFS=$'\t' read -r label rule _ _ log bin inv; do
 			error "Rust test skips" "$label's binary $bin cannot list its tests"
 			continue
 		fi
-		sed -n -e 's/: test$//p' -e 's/: benchmark$//p' "$listings/$k.raw" | LC_ALL=C sort -u >"$listings/$k.txt"
+		listing_names "$listings/$k.raw" >"$listings/$k.txt"
 		listing_of["$binary"]="$listings/$k.txt"
 	fi
 	listing="${listing_of[$binary]}"
@@ -1452,10 +1457,10 @@ for list in child-entries macos; do
 	done < <(LC_ALL=C comm -13 "$tmp/ignored.tsv" "$tmp/$list.tsv")
 done
 echo "Test binaries listed: ${#listing_of[@]}; #[ignore]d tests no invocation ran: $(count "$tmp/ignored.tsv")"
-# The macOS job's inventory reads each binary's listing: index.tsv names the
+# The listings drift check reads each binary's listing: index.tsv names the
 # listing file of each (a native_test's binary is its src's).
 for binary in "${!listing_of[@]}"; do
 	printf '%s\t%s\n' "$binary" "$(basename "${listing_of[$binary]}")"
 done | LC_ALL=C sort >"$listings/index.tsv"
-echo "Listings for the macOS inventory: $(count "$listings/index.tsv") binaries in $listings"
+echo "Listings for the drift check: $(count "$listings/index.tsv") binaries in $listings"
 exit "$bad"

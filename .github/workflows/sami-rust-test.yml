@@ -1,10 +1,18 @@
-# The Rust tests of a release candidate, report only. sami-checks.yml calls this workflow on
-# each push of release-candidate and on its dispatch. rust_test runs `bazel test //crates/...` and
-# the repository's other cargo workspaces against the known-failure gate
-# (.github/sami/rust-test.sh); rust_test_macos runs the tests only macOS can run. These were
-# sami-build.yml's rust_test and rust_test_macos jobs, where a red one held the release. Here a
-# red one holds nothing: publish reads only sami-build.yml's run, and a red test is fixed forward.
-# sami-checks.yml's summary has a row for each job, read from the job's result (this workflow's outputs).
+# The Rust tests of a release candidate, report only. sami-checks.yml calls this workflow twice on
+# each push of release-candidate and on its dispatch, once for each job (input `job`): rust_test
+# (linux) runs `bazel test //crates/...` and the repository's other cargo workspaces against the
+# known-failure gate (.github/sami/rust-test.sh); rust_test_macos (macos) runs the tests only
+# macOS can run. These were sami-build.yml's rust_test and rust_test_macos jobs, where a red one
+# held the release. Here a red one holds nothing: publish reads only sami-build.yml's run, and a
+# red test is fixed forward. sami-checks.yml's summary has a row for each job, read from the
+# job's result (this workflow's outputs).
+#
+# rust_test_macos reads the Linux listing of each rust_test target from the artifact
+# rust-test-early-listings, which sami-checks.yml's build job writes from its cargo test binaries
+# (.github/sami/rust-test-early-listings.sh), so it starts when that job ends, not after
+# rust_test. sami-checks.yml's rust-test-drift job compares them with rust_test's own Bazel
+# listings (artifact rust-test-listings) as soon as rust_test ends
+# (.github/sami/rust-test-listings-drift.sh), and any difference fails rust_test's row.
 #
 # The tree under test is inputs.commit, checked out at tree/. The gate's scripts and lists
 # (.github/sami) and the actions these jobs use (.github/actions) come from the commit this run
@@ -25,6 +33,11 @@ name: sami rust tests
 on:
   workflow_call:
     inputs:
+      # Which job this call runs: linux (rust_test) or macos (rust_test_macos).
+      job:
+        description: "linux (rust_test) or macos (rust_test_macos)"
+        required: true
+        type: string
       commit:
         description: "Commit to test: a full 40-character id"
         required: true
@@ -92,6 +105,7 @@ jobs:
     # A test that returns early and prints nothing passes: no log shows it,
     # so each test that can skip prints the marker before it returns.
     name: Rust tests (bazel)
+    if: inputs.job == 'linux'
     runs-on: ubuntu-22.04
     # Uncached, the build and the tests took 17 to 25 minutes (runs
     # 44696018007, 44841451861), and run 44879022489's 35 with the #[ignore]d
@@ -544,7 +558,8 @@ jobs:
           path: ${{ runner.temp }}/rust-test/cargo-timings
           retention-days: 14
           if-no-files-found: warn
-      # Each Linux test binary's listing, for rust_test_macos's inventory.
+      # Each Linux test binary's listing, which sami-checks.yml's rust-test-drift job compares
+      # with the early ones the macOS inventory read.
       - name: The test binaries' listings
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -566,18 +581,18 @@ jobs:
 
   rust_test_macos:
     # The tests only macOS can run: those compiled only on macOS (in a macOS
-    # test binary's listing and not in the Linux binary's of the same target,
-    # the rust_test job's listings), and the twelve pi-shell tests that
+    # test binary's listing and not in the Linux listing of the same target,
+    # which sami-checks.yml's build job wrote from its cargo test binaries:
+    # artifact rust-test-early-listings), and the twelve pi-shell tests that
     # expect macOS's libc, libm or terminfo and are #[ignore]d on other
     # targets (.github/sami/rust-test-macos.txt). This job builds every test
     # target on macos-15, the host release_binary builds darwin-arm64 on,
     # lists them (.github/sami/rust-test-macos-inventory.sh), and runs those
     # tests through the same test step with the same failure, skip and output
     # rules; it fails unless each of them ran. A known printing test runs
-    # beside them as the skip scan's canary.
-    needs: rust_test
-    # It runs whatever rust_test's verdict, once its listings are uploaded.
-    if: ${{ !cancelled() }}
+    # beside them as the skip scan's canary. It needs no job of this call:
+    # the caller starts it once the early listings exist.
+    if: inputs.job == 'macos'
     name: Rust tests (bazel, macOS-only tests)
     runs-on: macos-15
     timeout-minutes: 120
@@ -645,11 +660,11 @@ jobs:
         uses: ./tool/.github/actions/bazel-cache
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: rust-test-listings
+          name: rust-test-early-listings
           path: ${{ runner.temp }}/linux-listings
       # It lists every target it can read and exits 1 for a target with no
-      # Linux listing (UNKNOWN: it did not build on Linux); complete=true
-      # still lets the next step run the tests it listed.
+      # Linux listing (UNKNOWN); complete=true still lets the next step run
+      # the tests it listed.
       - name: The tests only macOS can run
         id: inventory
         shell: bash

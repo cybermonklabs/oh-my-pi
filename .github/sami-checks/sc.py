@@ -212,7 +212,8 @@ def row_work():
         the same runtime (cmd_summary's passed_as), so the pi-shell set of both users and the one-process
         lib row are one group, and so are both users' gVisor set shards (with the gVisor lib and
         map-limit rows), and both users' gVisor pi-builtins;
-      - sami-rust-test.yml's two jobs are one call;
+      - sami-rust-test.yml runs in two calls, rust-test (the rust_test row) and rust-test-macos (the
+        rust_test_macos row); rust-test-drift's result is part of the rust_test row (SC_RUST_TESTS);
       - the skip prints row's run-time unit (sc.py skip-lines) reads the output of every passing test of
         the run, so that row needs the jobs of each row in TEST_OUTPUT_ROWS too."""
     def entries(job, matrix, **want):
@@ -230,8 +231,8 @@ def row_work():
         "clippy": one("clippy"),
         "docs": one("docs"),
         "changelog": one("changelog"),
-        "rust_test": one("rust-test"),
-        "rust_test_macos": one("rust-test"),
+        "rust_test": one("rust-test") | one("rust-test-drift"),
+        "rust_test_macos": one("rust-test-macos"),
     }
     for r in ("set-runner", "set-root", "lib4"):
         work[r] = entries("set", set_matrix())
@@ -2740,7 +2741,8 @@ def selftest():
             ("ts-ca", "ts-ca", ["natives", "ts-ca"]),
             ("set-root", "set-runner,set-root,lib4", ["tools", "build", "set"]),
             ("lib4", "set-runner,set-root,lib4", ["tools", "build", "set"]),
-            ("rust_test", "rust_test,rust_test_macos", ["natives", "rust-test"]),
+            ("rust_test", "rust_test", ["build", "natives", "rust-test", "rust-test-drift"]),
+            ("rust_test_macos", "rust_test_macos", ["build", "rust-test-macos"]),
             ("gv-orphan-root", "gv-set-uid1000,gv-set-root,gv-lib4-uid1000,gv-lib4-root,gv-orphan-uid1000,gv-orphan-root",
              ["tools", "build", "gvisor"]),
             ("skipforms", "set-runner,set-root,lib4,builtins,workspace,ts-small,ts-ca,skipforms," + ",".join(

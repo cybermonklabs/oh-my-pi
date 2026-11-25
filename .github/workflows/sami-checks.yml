@@ -48,8 +48,12 @@
 #     built once, in the natives job.
 #   - the Rust tests under Bazel (`bazel test //crates/...` with the known-failure gate, the other
 #     cargo workspaces, sdk/rust/omp-rpc among them, and the tests only macOS can run): the
-#     rust-test job calls .github/workflows/sami-rust-test.yml, whose jobs build their own tests.
-#     The summary has a row for each of its two jobs, read from that job's result.
+#     rust-test and rust-test-macos jobs call .github/workflows/sami-rust-test.yml, one for each of
+#     its two jobs, which build their own tests. rust-test-macos starts when the build job ends:
+#     that job writes each Bazel rust_test's Linux listing from its test binaries
+#     (.github/sami/rust-test-early-listings.sh), and rust-test-drift compares them with rust_test's
+#     own as soon as it ends. The summary has a row for each of the two jobs, read from that job's
+#     result; a drift fails rust_test's row.
 #   - macOS and Windows: platform-checks.yml (the fork's platform checks, a called workflow) builds
 #     pi-shell's tests once per platform on macos-15 and windows-2025 and runs them under nextest;
 #     the summary reads its own report (pc-report) as one unit per platform.
@@ -115,7 +119,7 @@
 # runs, and a dispatch can name any pushed commit; with cache access on release-candidate either
 # could plant an entry release_binary restores. So every run builds cold: about 15 min for the
 # tests' cargo build and 17 min for the addon on the first runs; bun install takes about 2 s. The
-# rust-test job calls its workflow with cache-mode none, and that workflow declares none too; the
+# rust-test jobs call their workflow with cache-mode none, and that workflow declares none too; the
 # called platform checks get none too, because GitHub passes this run's cache-mode to them as their
 # limit.
 # Security. permissions: contents: read; no secrets; every checkout drops its credential. The one
@@ -251,12 +255,17 @@ jobs:
     if: contains(fromJSON(needs.plan.outputs.jobs), 'build')
     runs-on: ubuntu-24.04
     timeout-minutes: 150
+    # The listing step's outcome: rust-test-macos runs only on a success.
+    outputs:
+      listings: ${{ steps.listings.outcome }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: tool
           persist-credentials: false
-          sparse-checkout: .github/sami-checks
+          sparse-checkout: |
+            .github/sami-checks
+            .github/sami
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: tree
@@ -271,6 +280,18 @@ jobs:
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      # The Bazel half of the listing step below (rust-test-early-listings.sh bazel): cargo
+      # metadata, the query of each rust_test's crate root, and a Linux Bazel build of the
+      # rust_tests no cargo test target is. It needs no cargo build, so it runs in the
+      # background while cargo builds: its analysis alone fetched for 10 min in run 45559853019.
+      # It writes its exit status to early-state/bazel.rc last, and stops its Bazel server.
+      - name: The Bazel half of the Linux listings, in the background
+        working-directory: tree
+        run: |
+          mkdir -p "$SC"
+          (bash ../tool/.github/sami/rust-test-early-listings.sh bazel "$SC/early-state"; bazelisk shutdown) </dev/null >"$SC/early-bazel.log" 2>&1 &
+          echo "$!" >"$SC/early-bazel.pid"
+          echo "the Bazel half runs as process $(cat "$SC/early-bazel.pid"), into $SC/early-state"
       - name: Build and archive
         run: bash tool/.github/sami-checks/build.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -279,6 +300,33 @@ jobs:
           path: ${{ github.workspace }}/sc/up/tests.tar.zst
           compression-level: 0
           retention-days: 1
+          if-no-files-found: error
+      # Each Bazel rust_test's Linux listing, for rust_test_macos's inventory: from the archive's
+      # test binaries, mapped to their targets by crate root as rust-test-parity.sh maps them, and
+      # the Bazel half's listings of the rust_tests no binary is
+      # (.github/sami/rust-test-early-listings.sh archive). It waits for the Bazel half (at most
+      # its 20 min). A binary that maps to no target or to two, or a target left without a
+      # listing, fails the step by name; rust-test-macos then does not run (its row reads UNKNOWN)
+      # and rust-test-drift fails, while every job that needs only the archive still runs.
+      - name: Linux listings for the macOS inventory
+        id: listings
+        continue-on-error: true
+        timeout-minutes: 20
+        working-directory: tree
+        run: |
+          s=$(date +%s)
+          pid="$(cat "$SC/early-bazel.pid")"
+          while [ ! -e "$SC/early-state/bazel.rc" ] && kill -0 "$pid" 2>/dev/null; do sleep 5; done
+          echo "waited $(($(date +%s) - s)) s for the Bazel half; its output:"
+          cat "$SC/early-bazel.log"
+          bash ../tool/.github/sami/rust-test-early-listings.sh archive "$SC/early-state" "$SC/build/binaries-metadata.json" "$CARGO_TARGET_DIR" "$SC/listings"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ steps.listings.outcome == 'success' }}
+        with:
+          name: rust-test-early-listings
+          path: ${{ github.workspace }}/sc/listings/
+          # As long as GitHub lets a job be re-run: a re-run of rust_test reads them again.
+          retention-days: 30
           if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
@@ -614,10 +662,11 @@ jobs:
           retention-days: 14
 
   rust-test:
-    # sami-rust-test.yml: the Rust tests under Bazel and the macOS-only tests, with the addon
-    # the natives job built. The summary reads no unit of theirs: it has a row for each of the two
-    # jobs that workflow runs, from the job's result. They run whatever the natives job's verdict,
-    # and fail by name without its addon.
+    # sami-rust-test.yml's rust_test (job: linux): the Rust tests under Bazel and the other cargo
+    # workspaces, with the addon the natives job built. The summary reads no unit of theirs: it has
+    # a row for each of that workflow's two jobs, from the job's result. It runs whatever the
+    # natives job's verdict, and fails by name without its addon. rust-test-drift compares its
+    # Bazel listings with the build job's early ones, which rust-test-macos's inventory read.
     name: rust tests
     needs: [plan, natives]
     if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'rust-test') }}
@@ -626,10 +675,63 @@ jobs:
     cache-mode: none
     uses: ./.github/workflows/sami-rust-test.yml
     with:
+      job: linux
       commit: ${{ needs.plan.outputs.commit }}
       addon-file: ${{ needs.natives.outputs.addon-file }}
       addon-sha256: ${{ needs.natives.outputs.addon-sha256 }}
       addon-commit: ${{ needs.natives.outputs.addon-commit }}
+
+  rust-test-macos:
+    # sami-rust-test.yml's rust_test_macos (job: macos): the tests only macOS can run, found by
+    # comparing each macOS test binary with the Linux listing of its target. Those listings are
+    # the build job's (rust-test-early-listings.sh), so it starts when that job ends, not when
+    # rust_test's Bazel build does (run 45516812533 waited 71 min for it). It runs only when the
+    # build job's listing step passed.
+    name: rust tests macOS
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'rust-test-macos') && needs.build.outputs.listings == 'success' }}
+    permissions:
+      contents: read
+    cache-mode: none
+    uses: ./.github/workflows/sami-rust-test.yml
+    with:
+      job: macos
+      commit: ${{ needs.plan.outputs.commit }}
+
+  rust-test-drift:
+    # rust_test's Bazel listings (artifact rust-test-listings) against the early ones the build job
+    # wrote and rust-test-macos's inventory read (rust-test-early-listings), as soon as rust_test
+    # ends (.github/sami/rust-test-listings-drift.sh). A job of its own, since a job can count on
+    # an artifact only of a job it needs, and rust_test does not need the build job: it starts when
+    # the natives job ends. A test or a target listed on one side only is an error naming it, and a
+    # missing artifact or listing is UNKNOWN; either fails this job, and the summary then reads
+    # rust_test's row as failed, since that run's macOS inventory came from a wrong listing.
+    name: rust test listings, early against Bazel's
+    needs: [plan, build, rust-test]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'rust-test-drift') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami
+      # A missing artifact is the drift check's UNKNOWN, by name, not a download error.
+      - name: The early listings
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rust-test-early-listings
+          path: ${{ github.workspace }}/sc/early-listings
+      - name: rust_test's listings
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rust-test-listings
+          path: ${{ github.workspace }}/sc/bazel-listings
+      - name: The early listings against rust_test's
+        run: bash tool/.github/sami/rust-test-listings-drift.sh "$SC/early-listings" "$SC/bazel-listings"
 
   platforms:
     # macOS and Windows: the fork's platform checks, called on the candidate. Its report job's
@@ -708,9 +810,10 @@ jobs:
 
   summary:
     name: summary
-    # rust-test is here so that the summary runs last and reads its two jobs' results (SC_RUST_TESTS).
+    # rust-test, rust-test-macos and rust-test-drift are here so that the summary runs last and
+    # reads their results (SC_RUST_TESTS).
     needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms,
-            platforms, clippy, gvisor, docs, changelog, rust-test]
+            platforms, clippy, gvisor, docs, changelog, rust-test, rust-test-macos, rust-test-drift]
     if: ${{ always() && needs.plan.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -770,7 +873,10 @@ jobs:
           SC_COMMIT: ${{ needs.plan.outputs.commit }}
           SC_ROWS: ${{ needs.plan.outputs.rows }}
           SC_PLATFORMS: ${{ needs.plan.outputs.platforms }}
-          SC_RUST_TESTS: "rust_test=${{ needs.rust-test.outputs.rust-test }} rust_test_macos=${{ needs.rust-test.outputs.rust-test-macos }}"
+          # rust_test's row is rust_test's result while rust-test-drift passed; a drift (or a
+          # listing missing) reads failure, and a drift check that did not run, its result
+          # (skipped or cancelled: UNKNOWN, or NOT RUN when the run did not plan the row).
+          SC_RUST_TESTS: "rust_test=${{ needs.rust-test-drift.result != 'success' && (needs.rust-test-drift.result == 'failure' && 'failure' || needs.rust-test-drift.result) || needs.rust-test.outputs.rust-test }} rust_test_macos=${{ needs.rust-test-macos.outputs.rust-test-macos }}"
           SC_SILENT: ${{ needs.plan.outputs.silent }}
           SC_PLANT: ${{ needs.plan.outputs.plant }}
           SC_VERDICT: ${{ github.workspace }}/sc/report/verdict.json
