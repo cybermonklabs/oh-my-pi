@@ -298,6 +298,58 @@ impl Signal {
 		})
 	}
 
+	/// zsh's name of the signal on `platform`: its entry in zsh's `sigs`
+	/// table, which zsh's build makes from the C library's headers
+	/// (`Src/signames1.awk` lists every `#define SIG…` of them,
+	/// `Src/signames2.awk` keeps the first name per number, except that
+	/// `CHLD` replaces `CLD`, `POLL` replaces `IO` and `ABRT` replaces
+	/// `IOT`). On Linux `POLL` names 29. That `ABRT` replaces `IOT` is zsh
+	/// after 5.9 (zsh-users/zsh@6d40d9b6): zsh 5.9 built against glibc 2.32
+	/// or later, which defines `SIGIOT` first, names 6 `IOT` and refuses
+	/// `ABRT`; zsh after it, zsh on macOS and bash name 6 `ABRT`.
+	/// Elsewhere the name is the signal's own.
+	pub fn zsh_name(self, platform: Platform) -> &'static str {
+		match (self, platform) {
+			(Self::Io, Platform::Linux) => "POLL",
+			_ => self.into(),
+		}
+	}
+
+	/// zsh's `alt_sigs` for the signal on `platform`: other names zsh takes
+	/// for it (as input, and as `TRAPNAL` function names). On Linux `CLD`
+	/// names `SIGCHLD` and `IO` names `SIGPOLL` (`SIGCLD` and `SIGIO` are
+	/// defined as those); `IOT` names `SIGABRT`, as in zsh after 5.9 where
+	/// the C library defines both as one number (Linux and macOS); zsh's
+	/// `ERR` names its `ZERR` pseudo-signal, not a signal.
+	pub const fn zsh_alternates(self, platform: Platform) -> &'static [&'static str] {
+		match (self, platform) {
+			(Self::Chld, Platform::Linux) => &["CLD"],
+			(Self::Io, Platform::Linux) => &["IO"],
+			(Self::Abrt, _) => &["IOT"],
+			_ => &[],
+		}
+	}
+
+	/// The signal zsh's `getsigidx` finds for `name` (without `SIG`): a name
+	/// of zsh's `sigs` table ([`Self::zsh_name`]; zsh 5.9 has no real-time
+	/// signals), else one of its alternates ([`Self::zsh_alternates`]).
+	/// `nocase` compares ignoring case (`kill -l`).
+	pub fn from_zsh_name(name: &[u8], platform: Platform, nocase: bool) -> Option<Self> {
+		use strum::IntoEnumIterator;
+		let eq = |a: &str| {
+			if nocase {
+				a.as_bytes().eq_ignore_ascii_case(name)
+			} else {
+				a.as_bytes() == name
+			}
+		};
+		let zsh =
+			|| Self::iter().filter(|s| s.number(platform) != 0 && (*s as u8) < Self::Rtmin as u8);
+		zsh()
+			.find(|s| eq(s.zsh_name(platform)))
+			.or_else(|| zsh().find(|s| s.zsh_alternates(platform).iter().any(|a| eq(a))))
+	}
+
 	/// Exit status of a process killed by this signal.
 	pub const fn exit_status(self, platform: Platform) -> i32 {
 		128 + self.number(platform) as i32
@@ -431,6 +483,14 @@ impl SigSet {
 pub enum SigTarget {
 	/// One virtual process.
 	Vpid(Vpid),
+	/// One virtual process, as the kernel signalled its OS process group (a
+	/// terminal's `INT`, `QUIT` or hangup `HUP`): a program it runs in place
+	/// of itself, in that group too, has the signal from the kernel already.
+	Group(Vpid),
+	/// One virtual process, as another process signalled its OS process
+	/// (`SI_USER`: a `kill`): that process alone, or its whole process group
+	/// (`kill -INT -PGID`, `timeout`), which the signal does not tell apart.
+	Outside(Vpid),
 	/// Every process of a job (and its externals' process group).
 	Job(JobId),
 	/// Every virtual process of the shell.

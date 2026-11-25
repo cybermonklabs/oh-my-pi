@@ -19,6 +19,7 @@ mod frames;
 mod fsprobe;
 mod glob;
 mod jobctl;
+mod killed;
 mod locale;
 mod mode;
 mod nested;
@@ -29,6 +30,7 @@ mod proc;
 pub mod quote;
 mod redir;
 mod state;
+mod untrapped;
 mod xtrace;
 mod zle;
 mod zsh;
@@ -55,7 +57,7 @@ pub use self::{
 	zsh::zpattern::Cache as ZshPatternCache,
 };
 use self::{
-	control::{CANCEL, Ctl, PAUSE, RESUME, SIGNAL, SUSPEND},
+	control::{CANCEL, Ctl, OS_SIGNAL, PAUSE, RESUME, SIGNAL, SUSPEND},
 	proc::{Frame, FrameKind, Live, PendingWrite, ScriptKind},
 	state::{Root, Var},
 };
@@ -160,6 +162,10 @@ pub struct ShellInit {
 	pub zsh_fpath:   Option<Vec<BString>>,
 	/// Whose shell it is: a user's, or a program's ([`Profile::Tool`]).
 	pub profile:     Profile,
+	/// bash sets `HOME` from the password database when the environment has
+	/// none: a login shell by `argv[0]` outside posix mode
+	/// ([`crate::bash::invocation::ShellArgs::login_home`]).
+	pub login_home:  bool,
 }
 
 /// Whose shell a [`Shell`] is, which decides whether it may touch its
@@ -211,6 +217,7 @@ impl Default for ShellInit {
 			zsh_params:  Vec::new(),
 			zsh_fpath:   None,
 			profile:     Profile::User,
+			login_home:  false,
 		}
 	}
 }
@@ -560,6 +567,45 @@ pub struct Kernel {
 	/// Which DEBUG/ERR/RETURN traps may be set: lets `exec::start_trap`
 	/// skip its checks before every command; not imaged.
 	pub pseudo_traps:       exec::PseudoTraps,
+	/// bash's `INT` as each vproc that has one has it ([`IntNote`]): where its
+	/// last wait began, or noted while it waits for its foreground job or reads
+	/// a command substitution. Kept here, not on the vproc, which stays in its
+	/// size budget; an entry goes when its vproc ends. Not imaged: a snapshot
+	/// drops a wait in flight.
+	pub int_notes:          Vec<(Vpid, IntNote)>,
+	/// The subshell vprocs that die of a signal, not reaped yet, with the
+	/// signal: by their own end at its default action (`Shell`'s `kill`), as
+	/// the program they are ([`external_ended`]), as the one `( … )` they
+	/// wait for ([`Shell::reaped`]: one process in bash), or through their
+	/// own EXIT trap (bash `termsig_handler` kills the subshell with the
+	/// signal once the trap has run). Their parent reads it at the reap
+	/// ([`Shell::reaped`]): a hold of `INT` for its foreground job, and the
+	/// job of a background one (bash `WIFSIGNALED`). Apart from
+	/// [`Self::int_notes`]: a wait the EXIT trap begins rewrites those. In
+	/// the frames image: a snapshot between the death and the reap keeps it.
+	pub deaths:             Vec<(Vpid, Signal)>,
+	/// Notices of foreground subshells a signal killed
+	/// ([`killed::subshell_ended`]) held until the `( … )`'s own
+	/// redirections are undone: the vproc, the depth of its frame, the
+	/// notice. An entry goes when its vproc ends. In the frames image.
+	pub held_notices:       Vec<(Vpid, u32, BString)>,
+	/// The vprocs whose pending `INT` trap bash runs with the job list
+	/// frozen ([`proc::ScriptKind::Trap`]'s `frozen`): the `INT` came while
+	/// the vproc waited for a forked foreground command (bash's `wait_for`
+	/// runs the trap). Kept here, not on the vproc, which stays in its size
+	/// budget; an entry goes when the trap starts or its vproc ends. Not
+	/// imaged: a snapshot drops the wait in flight.
+	pub frozen_ints:        Vec<Vpid>,
+	/// Signals sent to the shell while the program the root runs in place
+	/// of itself (`exec`, [`proc::ExecState::in_place`]) was still being
+	/// spawned: the program gets them once it exists (a spawn that fails
+	/// drops them). Not imaged: a snapshot drops a spawn in flight.
+	pub forward:            crate::bash::SigSet,
+	/// The root's process runs a program in place of the shell (`exec`, or
+	/// the last command of a `-c` string, in the root or a zsh `( … )` run in
+	/// place): each signal whose default action ends the process is caught
+	/// for it and forwarded ([`untrapped::program_in_place`]). Not imaged.
+	pub program_in_place:   bool,
 	/// Re-parsed `${ ;}` bodies ([`exec::NoforkUnits`]); not imaged.
 	pub nofork_units:       exec::NoforkUnits,
 	/// The functions each zsh word code digest (`.zwc`) holds, by path,
@@ -616,6 +662,8 @@ pub struct Kernel {
 	pub exec_refusals:      HashMap<RunId, ExecRefusal>,
 	/// Refusal associated with the most recently reported run.
 	pub reported_refusal:   Option<(RunId, ExecRefusal)>,
+	/// The signal the root shell died of ([`Shell::killed_by`]); not imaged.
+	pub killed_by:          Option<i32>,
 	/// Background jobs whose pid is still to be settled
 	/// ([`proc::Bang`]): imaged (a restored job still decides).
 	pub bangs:              Vec<proc::Bang>,
@@ -638,10 +686,12 @@ pub struct Kernel {
 	/// when it starts. Dropped when the job settles; not imaged (a vpid is
 	/// never reused).
 	pub bang_kin:           Vec<(Vpid, Vpid)>,
-	/// `(job, OS pid)`: jobs settled on their program's OS pid during the
-	/// turn, written into the job tables and `$!` of every vproc by the
-	/// scheduler after it (`Shell::adopt`); empty between turns, not
-	/// imaged.
+	/// `(vproc, OS pid)`: jobs settled on their program's OS pid during the
+	/// turn, and pipeline stages that are just the program they spawned
+	/// ([`stage_spawned`]), written into the job tables and `$!` of every
+	/// vproc, and into the records of the processes of a job and of a
+	/// pipeline a vproc waits for ([`proc::JobProc`]), by the scheduler after
+	/// it (`Shell::adopt`); empty between turns, not imaged.
 	pub settled:            Vec<(Vpid, u32)>,
 	/// `(OS pid, vproc, job)`: a job's `$!` names a program a vproc other
 	/// than the job's own runs (a background pipeline's last stage), so
@@ -703,6 +753,44 @@ impl ProcState {
 type DumpFuncs = ((i64, u64), Arc<std::collections::HashSet<BString>>);
 
 impl Kernel {
+	/// Vproc `vpid`'s [`IntNote`].
+	pub(super) fn int_note(&self, vpid: Vpid) -> Option<IntNote> {
+		self
+			.int_notes
+			.iter()
+			.find(|(v, _)| *v == vpid)
+			.map(|&(_, note)| note)
+	}
+
+	/// Set vproc `vpid`'s [`IntNote`] (`None`: drop it).
+	pub(super) fn set_int_note(&mut self, vpid: Vpid, note: Option<IntNote>) {
+		let at = self.int_notes.iter().position(|(v, _)| *v == vpid);
+		match (at, note) {
+			(Some(i), Some(note)) => self.int_notes[i].1 = note,
+			(Some(i), None) => {
+				self.int_notes.swap_remove(i);
+			},
+			(None, Some(note)) => self.int_notes.push((vpid, note)),
+			(None, None) => {},
+		}
+	}
+
+	/// Subshell vproc `vpid` dies of `sig` ([`Self::deaths`]): of the last
+	/// signal that ends it.
+	pub(super) fn dies_of(&mut self, vpid: Vpid, sig: Signal) {
+		match self.deaths.iter_mut().find(|(v, _)| *v == vpid) {
+			Some(death) => death.1 = sig,
+			None => self.deaths.push((vpid, sig)),
+		}
+	}
+
+	/// The signal vproc `vpid` died of ([`Self::deaths`]), if any; its entry
+	/// goes.
+	pub(super) fn died_of(&mut self, vpid: Vpid) -> Option<Signal> {
+		let at = self.deaths.iter().position(|(v, _)| *v == vpid)?;
+		Some(self.deaths.swap_remove(at).1)
+	}
+
 	/// The functions (metafied names) of the digest `path` as this shell
 	/// last read it, while its modification time and size are `stamp`.
 	pub(crate) fn dump_funcs(
@@ -731,7 +819,8 @@ impl Kernel {
 			.insert(BString::from(path), (stamp, funcs));
 	}
 
-	fn new(engine: &Arc<Engine>, root: Root, argv0: BString, shell_pid: u32) -> Self {
+	fn new(engine: &Arc<Engine>, mut root: Root, argv0: BString, shell_pid: u32) -> Self {
+		root.set_platform(engine.config().platform);
 		let ctl = Ctl::new();
 		Self {
 			engine: Arc::clone(engine),
@@ -765,6 +854,12 @@ impl Kernel {
 			start_ns: 0,
 			startup: Vec::new(),
 			pseudo_traps: exec::PseudoTraps::default(),
+			int_notes: Vec::new(),
+			deaths: Vec::new(),
+			held_notices: Vec::new(),
+			frozen_ints: Vec::new(),
+			forward: crate::bash::SigSet::EMPTY,
+			program_in_place: false,
 			nofork_units: HashMap::new(),
 			zsh_dumps: parking_lot::Mutex::new(HashMap::new()),
 			spare_tree: crate::bash::syntax::Tree::default(),
@@ -779,6 +874,7 @@ impl Kernel {
 			reported_signal: None,
 			exec_refusals: HashMap::new(),
 			reported_refusal: None,
+			killed_by: None,
 			bangs: Vec::new(),
 			debug_skips: Vec::new(),
 			bang_spent: Vec::new(),
@@ -1266,7 +1362,7 @@ impl Kernel {
 	/// queue the bytes with their own output to keep stdout/stderr order.
 	pub fn render_diag(&mut self, cx: &mut Cx<'_>, vp: &Vproc, line: u32, diag: &Diag) -> Vec<u8> {
 		let bytes = self.render_quiet(cx, vp, line, diag);
-		self.diag_event(cx, vp, diag);
+		self.diag_event(cx, vp, diag, b"");
 		bytes
 	}
 
@@ -1276,7 +1372,9 @@ impl Kernel {
 	pub fn render_quiet(&mut self, cx: &mut Cx<'_>, vp: &Vproc, line: u32, diag: &Diag) -> Vec<u8> {
 		if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 			let (mut prefix, mut zline) = self.zsh_site(cx, vp, line);
-			if self.zsh_shinstdin(cx, vp) {
+			if let Some(caller) = widget_caller_line(vp) {
+				zline = caller;
+			} else if self.zsh_shinstdin(cx, vp) {
 				prefix.clear();
 				zline = 0;
 			}
@@ -1306,10 +1404,13 @@ impl Kernel {
 		render(diag, DiagSite { shell_name, origin, line, utf8 })
 	}
 
-	/// The `Diag` event of a diagnostic `vp` prints.
-	fn diag_event(&mut self, cx: &mut Cx<'_>, vp: &Vproc, diag: &Diag) {
+	/// The `Diag` event of a diagnostic `vp` prints, `tail` after its text
+	/// (bytes, which a diagnostic's text is not: the command of bash's
+	/// killed-command notice).
+	fn diag_event(&mut self, cx: &mut Cx<'_>, vp: &Vproc, diag: &Diag, tail: &[u8]) {
 		if self.mask.contains(crate::bash::event::EventKind::Diag) {
-			let message = BString::from(diag.to_string());
+			let mut message = BString::from(diag.to_string());
+			message.extend_from_slice(tail);
 			self.emit(cx, (vp.vpid, vp.mode), vp.runs.front(), EventData::Diag {
 				code:    diag.code(),
 				message: BStr::new(&message),
@@ -1330,9 +1431,14 @@ impl Kernel {
 	/// zsh `zwarning`'s `isset(SHINSTDIN) && !locallevel`: commands read
 	/// from standard input, outside functions (`locallevel`) and sourced
 	/// files (`source` turns `shinstdin` off), report without a script name
-	/// or line ([`crate::bash::diag::ZshSite`] with an empty prefix). A subshell
-	/// decides by the site it inherited.
+	/// or line ([`crate::bash::diag::ZshSite`] with an empty prefix). A
+	/// widget runs in a parameter scope of its own (`execzlefunc` and
+	/// `callcompfunc` call `startparamscope`, which raises `locallevel`). A
+	/// subshell decides by the site it inherited.
 	fn zsh_shinstdin(&mut self, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+		if zle::editor(vp).is_some_and(|ed| ed.in_widget > 0) {
+			return false;
+		}
 		let mut top = false;
 		for f in &vp.frames {
 			match f.kind {
@@ -1425,6 +1531,30 @@ impl Kernel {
 	}
 }
 
+/// zsh's `lineno` for a diagnostic of the code the line editor runs for a
+/// widget ([`ScriptKind::Hook`] frames on top of the stack, inside a
+/// widget): zsh calls the widget's function directly, so before the
+/// function runs (its autoload stub failing, zsh `loadautofn`) the line is
+/// that of the code the editor runs for: the line being read at the
+/// prompt (the reader's next line), or the line of the command that
+/// started the editor (`vared`). `None` outside that case.
+fn widget_caller_line(vp: &Vproc) -> Option<u32> {
+	let hook = |f: &Frame| matches!(f.kind, FrameKind::Script { what: ScriptKind::Hook, .. });
+	if zle::editor(vp).is_none_or(|ed| ed.in_widget == 0) || !vp.frames.last().is_some_and(hook) {
+		return None;
+	}
+	let fi = vp.frames.iter().rposition(|f| !hook(f))?;
+	let caller = &vp.frames[fi];
+	match (&caller.unit, &caller.kind) {
+		(Some(u), _) => u
+			.ops
+			.get(caller.pc as usize)
+			.map(|op| exec::line_in(vp, fi, op.node)),
+		(None, FrameKind::Script { pos, .. }) => Some(pos.1),
+		(None, _) => None,
+	}
+}
+
 /// The level an imported `SHLVL` gives (before the shell adds one): bash
 /// takes a whole number or 0, zsh (`zstrtol`, never evaluated) the leading
 /// number. Called at shell startup and for nested shells.
@@ -1486,6 +1616,7 @@ fn startup_vars(k: &mut Kernel, cx: &mut Cx<'_>, init: &ShellInit) -> Result<(),
 		startup_values(cx, &init.argv0, ppid, k.engine.config().platform, StartupVars {
 			lookup_shell: need_shell && !deferred_shell,
 			interactive:  init.interactive,
+			login_home:   init.login_home,
 		})
 	};
 	// zsh started as sh or ksh has no `MANPATH` and no prompt aliases
@@ -1595,16 +1726,24 @@ pub fn zsh_startup_values(
 	for (name, value) in integers {
 		out.push((name, Var::scalar(value, Attrs::INTEGER), false));
 	}
-	// zsh exports `HOME` and `LOGNAME` (`addenv` when not imported).
-	if !user.home.is_empty() {
-		let home = if platform == crate::bash::ids::Platform::Windows {
-			builtins::zsh_dir::windows_spelling(&user.home, &user.home)
-		} else {
-			user.home.clone()
-		};
-		out.push((&b"HOME"[..], Var::scalar(home, Attrs::EXPORT), false));
-	}
-	out.push((&b"LOGNAME"[..], Var::scalar(user.name, Attrs::EXPORT), false));
+	// zsh exports `HOME` and `LOGNAME` (`addenv` when not imported); `HOME`
+	// is `/` for a user without a password database entry (`setupvals`), and
+	// `LOGNAME` the session's login name when it has one (`params.c`, which
+	// tries `getlogin` first), else the password database's name.
+	let home = if user.home.is_empty() {
+		BString::from("/")
+	} else if platform == crate::bash::ids::Platform::Windows {
+		builtins::zsh_dir::windows_spelling(&user.home, &user.home)
+	} else {
+		user.home.clone()
+	};
+	out.push((&b"HOME"[..], Var::scalar(home, Attrs::EXPORT), false));
+	let logname = cx
+		.host
+		.login_name()
+		.filter(|name| !name.is_empty())
+		.unwrap_or(user.name);
+	out.push((&b"LOGNAME"[..], Var::scalar(logname, Attrs::EXPORT), false));
 	let (_, release, machine) = cx.host.uname().unwrap_or_default();
 	let macos = cfg!(target_os = "macos");
 	// The configure-time `MACHTYPE`, `VENDOR` and `OSTYPE` of the system's
@@ -1662,11 +1801,11 @@ pub fn zsh_startup_values(
 	for (name, value, forced) in fixed {
 		out.push((name, Var::scalar(value, Attrs::NONE), forced));
 	}
-	// `signals`: `EXIT`, the signal names by number, `ZERR`, `DEBUG`.
+	// `signals`: `EXIT`, zsh's signal names by number, `ZERR`, `DEBUG`.
 	let mut signals = vec![BString::from("EXIT")];
 	for n in 1..=31u8 {
 		match crate::bash::signal::Signal::from_number(n, platform) {
-			Some(s) => signals.push(BString::from(s.to_string())),
+			Some(s) => signals.push(BString::from(s.zsh_name(platform))),
 			None => signals.push(BString::from(format!("SIG{n}"))),
 		}
 	}
@@ -1693,6 +1832,9 @@ pub fn zsh_startup_values(
 pub struct StartupVars {
 	lookup_shell: bool,
 	interactive:  bool,
+	/// bash sets `HOME` when the environment has none
+	/// ([`crate::bash::invocation::ShellArgs::login_home`]).
+	login_home:   bool,
 }
 
 /// bash's startup variables of a new shell named `argv0` whose `$PPID` is
@@ -1713,7 +1855,17 @@ pub fn startup_values(
 	} else {
 		BString::default()
 	};
-	let defaults: [(&'static [u8], BString); 17] = [
+	let home = if options.login_home {
+		// bash `sh_get_home_dir`: the entry's home, `/` without one.
+		Some(if user.home.is_empty() {
+			BString::from("/")
+		} else {
+			user.home.clone()
+		})
+	} else {
+		None
+	};
+	let defaults: [(&'static [u8], BString); 16] = [
 		(b"IFS", BString::from(" \t\n")),
 		(b"PS2", BString::from("> ")),
 		(b"PS4", BString::from("+ ")),
@@ -1727,7 +1879,6 @@ pub fn startup_values(
 		(b"EUID", BString::from(user.euid.to_string())),
 		(b"HOSTTYPE", BString::from(std::env::consts::ARCH)),
 		(b"OSTYPE", BString::from(std::env::consts::OS)),
-		(b"HOME", user.home),
 		(b"SHELL", shell),
 		(b"TERM", BString::from("dumb")),
 		// bash's `DEFAULT_PATH_VALUE` when the environment has no PATH.
@@ -1737,9 +1888,14 @@ pub fn startup_values(
 	if options.interactive {
 		out.push((&b"PS1"[..], Var::scalar(BString::from(r"\s-\v\$ "), Attrs::NONE), false));
 	}
+	if let Some(home) = home {
+		out.push((&b"HOME"[..], Var::scalar(home, Attrs::NONE), false));
+	}
 	for (name, value) in defaults {
-		// bash sets HOME and SHELL from the passwd entry only when known.
-		if matches!(name, b"HOME" | b"SHELL") && value.is_empty() {
+		// bash sets `SHELL` from the password database entry
+		// (`set_shell_var`: the entry's shell, `/bin/sh` without one); `HOME`
+		// only for a login shell, above: else `~` reads the entry.
+		if name == b"SHELL" && value.is_empty() {
 			continue;
 		}
 		// `PPID` and `EUID` (and `UID` when not imported) are readonly
@@ -1918,27 +2074,6 @@ impl Shell {
 		k.root
 			.set_misc(cx.store, MiscKey::Umask, format!("{:04o}", cx.host.umask() & 0o7777));
 		k.root.set_positional(cx.store, init.args);
-		for sig in cx.host.ignored_signals().iter() {
-			// zsh `init_signals`: of the signals ignored on entry only `QUIT`
-			// is recorded as ignored (`ZSIG_IGNORED`), and any of them may be
-			// trapped.
-			if zsh {
-				cx.host.forget_ignored(sig);
-				if sig != crate::bash::Signal::Quit {
-					continue;
-				}
-				k.root.set_record(
-					cx.store,
-					KeyBuf::Misc(MiscKey::ZshEntryIgnored),
-					Some(Record::Words(vec![BString::from(sig.to_string())])),
-				);
-			}
-			k.root.set_record(
-				cx.store,
-				KeyBuf::Trap(crate::bash::store::TrapKey::Signal(sig)),
-				Some(Record::Trap { mode: init.mode, action: BString::default() }),
-			);
-		}
 		let vpid = k.vpid(cx.store);
 		if let Some(err) = k.root.take_fault() {
 			return Err(ShellError::Store(err));
@@ -1951,6 +2086,10 @@ impl Shell {
 		}
 		let mut root = Vproc::new(vpid, None, fds, cwd, None, false);
 		root.mode = init.mode;
+		untrapped::init(&mut k, cx, &root, init.mode).map_err(ShellError::Store)?;
+		if let Some(err) = k.root.take_fault() {
+			return Err(ShellError::Store(err));
+		}
 		if zsh {
 			let start = mode::ZshStart {
 				mode:        init.mode,
@@ -2102,6 +2241,9 @@ impl Shell {
 		}
 		let cwd = script.cwd.unwrap_or_else(|| p.cwd.clone());
 		let status = p.status;
+		// The parent's asynchronous ignore ([`Vproc::async_ignored`]) comes
+		// with the traps the child's image copies.
+		let async_ignored = p.async_ignored;
 		// The parent's global state now; a host's submission (no store) to
 		// the root takes it when the scheduler adopts the subshell, before
 		// the root runs again.
@@ -2135,6 +2277,7 @@ impl Shell {
 		let mut vp = Vproc::new(vpid, Some(parent_vpid), fds, cwd, Some(Image::default()), true);
 		vp.lineage = lineage.unwrap_or(parent_lineage);
 		vp.status = status;
+		vp.async_ignored = async_ignored;
 		vp.mode = mode;
 		vp.runs.push_back(run);
 		match base {
@@ -2214,6 +2357,11 @@ impl Shell {
 			if let Some(step) = self.report() {
 				return step;
 			}
+			// A substitution's output read to its end while its reader held an
+			// `INT` ([`HeldInt::Comsub`]).
+			if !self.k.int_notes.is_empty() {
+				self.comsub_reads_ended();
+			}
 			if self.k.ctl.word() != 0 {
 				if let Some(step) = self.apply_requests(cx) {
 					return step;
@@ -2291,6 +2439,7 @@ impl Shell {
 				.write(cx.store, Change::Put(Key::Proc(p.vpid), rec));
 		}
 		self.fresh.extend(self.k.spawned.iter().map(|p| p.vpid));
+		self.stages_started();
 		self.procs.append(&mut self.k.spawned);
 		self.k.disowned.clear();
 		self.apply_settled();
@@ -2309,18 +2458,102 @@ impl Shell {
 				self.k.proc_exited(cx.store, p.vpid, p.parent, p.status);
 				self.k.ctl.notify();
 				self.rr = 0;
+				// A subshell the parent ran in place of itself died with the
+				// command it ran in place: so does the parent's process.
+				if let (true, Some(signal)) = (p.in_place(), p.died_of())
+					&& let Some(parent) = self.procs.iter_mut().find(|q| Some(q.vpid) == p.parent)
+				{
+					match parent.runs.front().map(|run| run.id) {
+						Some(run) if parent.parent.is_none() => {
+							self.k.exec_signals.insert(run, signal);
+						},
+						_ if parent.in_place() => parent.zsh_state().died_of = Some(signal),
+						_ => {},
+					}
+				}
+				// Its traps were the process's: the parent's come back.
+				if p.in_place()
+					&& let Some(parent) = self.procs.iter().find(|q| Some(q.vpid) == p.parent)
+					&& (parent.parent.is_none() || parent.in_place())
+				{
+					untrapped::in_place_ended(&mut self.k, cx, parent);
+				}
+				let died = self.k.died_of(p.vpid);
+				self.k.set_int_note(p.vpid, None);
+				self.k.frozen_ints.retain(|v| *v != p.vpid);
+				self.k.held_notices.retain(|(v, ..)| *v != p.vpid);
 				self.ended(p.vpid, p.parent);
-				self.reaped(cx, p.parent, p.vpid, p.status);
+				self.reaped(cx, p.parent, p.vpid, p.status, died, false);
 			} else {
 				i += 1;
 			}
 		}
 	}
 
-	/// Write the OS pids jobs settled on during the turn
+	/// The children the turn spawned may be the stages of the pipeline that
+	/// is the whole command of a background job (`a | b &`), which its vproc
+	/// starts ([`runs_pipeline`]): the job's processes
+	/// ([`proc::Job::procs`], recorded as the job started) are those vprocs
+	/// from now on. Children that are not the pipeline's stages (a trap's
+	/// substitution before it) leave the record waiting: a job's facts never
+	/// go while the job does.
+	fn stages_started(&mut self) {
+		let mut seen = None;
+		for child in &self.k.spawned {
+			let parent = child.parent;
+			if parent == seen {
+				continue;
+			}
+			seen = parent;
+			let Some(j) = parent.and_then(|v| self.procs.iter().position(|p| p.vpid == v)) else {
+				continue;
+			};
+			let jp = &self.procs[j];
+			let Some(s) = jp
+				.parent
+				.and_then(|v| self.procs.iter().position(|p| p.vpid == v))
+			else {
+				continue;
+			};
+			let job = jp.vpid;
+			// Its processes still name the job's vproc ([`exec::pipeline_job`]).
+			let waiting = self.procs[s].jobs.by_vpid(job).is_some_and(|entry| {
+				!entry.inherited
+					&& entry
+						.procs
+						.as_ref()
+						.is_some_and(|procs| procs.list.first().is_some_and(|p| p.vpid == job))
+			});
+			if !waiting {
+				continue;
+			}
+			let stages: Vec<Vpid> = jp
+				.frames
+				.first()
+				.and_then(|f| f.scratch.as_deref())
+				.filter(|_| runs_pipeline(jp))
+				.map_or_else(Vec::new, |sc| sc.children.iter().map(|&(v, _)| v).collect());
+			let Some(procs) = self.procs[s]
+				.jobs
+				.by_vpid_mut(job)
+				.and_then(|entry| entry.procs.as_deref_mut())
+			else {
+				continue;
+			};
+			let n = procs.list.len();
+			if !stages.is_empty() && stages.len() == n {
+				for (p, vpid) in procs.list.iter_mut().zip(stages) {
+					p.vpid = vpid;
+				}
+			}
+		}
+	}
+
+	/// Write the OS pids jobs and processes settled on during the turn
 	/// ([`Kernel::settled`]) into every job table listing them (the
-	/// parent's, a command substitution's copies) and every `$!` naming
-	/// them.
+	/// parent's, a command substitution's copies), every `$!` naming them,
+	/// and the records of the processes of jobs and of the pipelines vprocs
+	/// wait for ([`proc::JobProc`]).
 	fn apply_settled(&mut self) {
 		for (job, pid) in std::mem::take(&mut self.k.settled) {
 			for p in &mut self.procs {
@@ -2329,6 +2562,15 @@ impl Shell {
 				}
 				if let Some(entry) = p.jobs.by_vpid_mut(job) {
 					entry.os_pid = Some(pid);
+				}
+				p.jobs.proc_settled(job, pid);
+				let waited = p
+					.frames
+					.iter_mut()
+					.filter_map(|f| f.scratch.as_deref_mut())
+					.find_map(|sc| sc.process_mut(job));
+				if let Some(q) = waited {
+					q.os_pid = Some(pid);
 				}
 			}
 		}
@@ -2546,10 +2788,31 @@ impl Shell {
 		(true, on_its_way)
 	}
 
-	/// Child vproc `vpid` of `parent` ended with `status`: the parent's job
-	/// for it is done (`jobs`, `wait` see it) and a parent trapping
-	/// `SIGCHLD` owes one more run of the trap.
-	fn reaped(&mut self, cx: &mut Cx<'_>, parent: Option<Vpid>, vpid: Vpid, status: i32) {
+	/// Child vproc `vpid` of `parent` ended with `status` (`died_of`: by
+	/// that signal, [`Kernel::deaths`]): the record of that process of a
+	/// pipeline says so ([`Self::process_ended`]), the parent's job for it is
+	/// done (`jobs`, `wait` see it, and the notice of a job a signal killed,
+	/// [`killed::waited`], [`killed::line_read`]: by the signal that ended
+	/// the process whose end is the job's status, of a pipeline's job
+	/// [`proc::Job::procs`]; of a job without those, not when `pipeline`, a
+	/// signal ended its vproc as it ran a pipeline, [`runs_pipeline`]), a
+	/// parent trapping `SIGCHLD` owes one more run of the trap for each
+	/// process that ended (bash's `waitchld` counts each child it reaps: a
+	/// pipeline job's own vproc is none of bash's processes, so its end owes
+	/// a run only for each process of the job that ended with it; each other
+	/// one owed its run as the job's vproc reaped it, [`Self::process_ended`];
+	/// zsh runs the trap once per job, [`owe_chld`]), and one holding an
+	/// `INT` for its foreground job learns how this process of it ended (bash
+	/// `waitchld`'s `child_caught_sigint`, [`HeldInt::Job`]).
+	fn reaped(
+		&mut self,
+		cx: &mut Cx<'_>,
+		parent: Option<Vpid>,
+		vpid: Vpid,
+		status: i32,
+		died_of: Option<Signal>,
+		pipeline: bool,
+	) {
 		// Its own children are orphans now.
 		if self.k.engine.config().end_orphan_jobs {
 			self.gone.push(vpid);
@@ -2557,14 +2820,96 @@ impl Shell {
 		let Some(i) = parent.and_then(|v| self.procs.iter().position(|p| p.vpid == v)) else {
 			return;
 		};
+		let owner = self.process_ended(i, vpid, proc::ProcState::ended(status, died_of));
 		let job = self.procs[i].jobs.by_vpid_mut(vpid);
 		let background = job.is_some();
+		// The runs of the `CHLD` trap this end owes: one for the process it
+		// is, or one for each process of its pipeline job that ended with it.
+		let mut owed = 1;
 		if let Some(job) = job {
 			job.state = proc::JobState::Done(status);
+			job.signal = match job.procs.as_deref_mut() {
+				None => died_of.filter(|_| !pipeline),
+				Some(procs) => {
+					// Processes not reaped as its own (its vproc ended before
+					// it started them, or without them) ended with it.
+					owed = 0;
+					for p in &mut procs.list {
+						if p.state == proc::ProcState::Running {
+							p.state = proc::ProcState::ended(status, died_of);
+							owed += 1;
+						}
+					}
+					procs.signal()
+				},
+			};
 			job.notified = false;
 		}
+		let parent = self.procs[i].vpid;
+		if !background && let Some(IntNote::Held(HeldInt::Job { .. })) = self.k.int_note(parent) {
+			let caught = died_of != Some(Signal::Int);
+			self
+				.k
+				.set_int_note(parent, Some(IntNote::Held(HeldInt::Job { caught })));
+		}
+		if let (false, Some(sig)) = (background, died_of) {
+			// bash runs a `( … )` that is the whole command of a `( … )`, a
+			// job or a stage in that process (`CMD_NO_FORK`): the process dies
+			// of the signal too, and its own parent reports it.
+			if waits_for_its_subshell(&self.procs[i]) {
+				self.k.dies_of(parent, sig);
+			} else if !pipeline {
+				// A foreground subshell that died of a signal gets a notice.
+				killed::subshell_ended(&mut self.k, cx, &mut self.procs[i], vpid, sig);
+			}
+		}
 		jobctl::job_done(&mut self.k, cx, &mut self.procs[i], vpid);
-		owe_chld(&mut self.k, cx, &mut self.procs[i], background);
+		// bash reaped every child that had ended as it waited for this
+		// foreground one ([`proc::Job::unreaped`]).
+		if !background {
+			self.procs[i].jobs.all_reaped();
+		}
+		if self.procs[i].mode.dialect() == crate::bash::ids::Dialect::Zsh {
+			owed = 1;
+		}
+		for _ in 0..owed {
+			owe_chld(&mut self.k, cx, &mut self.procs[i], background.then_some(vpid));
+		}
+		// A process of a pipeline job, reaped by the job's vproc: bash's
+		// parent of the job reaps it (zsh owes none for it, [`owe_chld`]).
+		if let Some(s) = owner {
+			owe_chld(&mut self.k, cx, &mut self.procs[s], None);
+		}
+	}
+
+	/// Child `vpid` of vproc `i` ended as `end`: the record of that process
+	/// of a pipeline says so ([`proc::JobProc`]), of one `i` waits for
+	/// ([`proc::PipelineWait::procs`]) or of the one that is the whole
+	/// command of the job `i` is the vproc of ([`proc::Job::procs`], in its
+	/// parent's table). Returns that parent, in the last case.
+	fn process_ended(&mut self, i: usize, vpid: Vpid, end: proc::ProcState) -> Option<usize> {
+		let p = &mut self.procs[i];
+		let waited = p
+			.frames
+			.iter_mut()
+			.rev()
+			.filter_map(|f| f.scratch.as_deref_mut())
+			.find_map(|sc| sc.process_mut(vpid));
+		if let Some(q) = waited {
+			q.state = end;
+			return None;
+		}
+		let job = p.vpid;
+		let s = p
+			.parent
+			.and_then(|v| self.procs.iter().position(|q| q.vpid == v))?;
+		let q = self.procs[s]
+			.jobs
+			.by_vpid_mut(job)
+			.and_then(|j| j.procs.as_deref_mut())
+			.and_then(|procs| procs.get_mut(vpid))?;
+		q.state = end;
+		Some(s)
 	}
 
 	/// Vproc `vpid` stopped (`Some(signal)`) or continued (`None`). If it
@@ -2645,7 +2990,13 @@ impl Shell {
 
 	/// Apply pending control requests.
 	fn apply_requests(&mut self, cx: &mut Cx<'_>) -> Option<Step> {
-		let req = self.k.ctl.take();
+		let mut req = self.k.ctl.take();
+		// The OS signals a handler caught while shell code ran: the host
+		// queues them now ([`ControlHandle::signal_word`]).
+		if req & OS_SIGNAL != 0 {
+			cx.host.forward_signals();
+			req |= self.k.ctl.take();
+		}
 		if req & (CANCEL | SIGNAL) != 0 {
 			// A cancel or signal concerns blocked vprocs too: let them run
 			// (pause/resume deliberately do not).
@@ -2684,23 +3035,16 @@ impl Shell {
 				let unwinds = trapped
 					|| (sig != Signal::Kill && self.procs[i].has_work() && !self.procs[i].transient);
 				if unwinds {
+					// A spawn still pending never starts: the cancelled command
+					// is not resumed (the trap is the last action).
 					for frame in &mut self.procs[i].frames {
-						if let Some(sc) = frame.scratch.as_mut() {
-							// A spawn still pending never starts: the cancelled
-							// command is not resumed (the trap is the last action).
-							if matches!(sc.live, Live::Spawn(_)) {
-								sc.live = Live::None;
-							}
-							match &mut sc.live {
-								Live::Task(task) => task.signal(sig),
-								Live::Ext(ext) => {
-									let _ = ext.signal(sig);
-									let _ = ext.cont();
-								},
-								_ => {},
-							}
+						if let Some(sc) = frame.scratch.as_mut()
+							&& matches!(sc.live, Live::Spawn(_))
+						{
+							sc.live = Live::None;
 						}
 					}
+					signal_lives(&mut self.procs[i], sig, true);
 					self.procs[i].stopped = false;
 					if trapped {
 						exec::mark_cancel(&mut self.procs[i], status);
@@ -2711,6 +3055,9 @@ impl Shell {
 					self.kill(cx, i, sig, status);
 				}
 			}
+			// The root's process runs no program in place of the shell now: a
+			// pending spawn went, and the program got the signal.
+			untrapped::program_ended(&mut self.k, cx, &self.procs[0]);
 			// Calls of the cancelled vprocs are void; the spared ones' go on.
 			let kept: Vec<CallId> = self
 				.k
@@ -2731,8 +3078,9 @@ impl Shell {
 			self.k.paused = false;
 		}
 		if req & SIGNAL != 0 {
-			for (target, sig) in self.k.ctl.take_signals() {
-				self.deliver(cx, target, sig);
+			let (signals, first) = self.k.ctl.take_signals();
+			for (n, (target, sig)) in (first..).zip(signals) {
+				self.deliver(cx, target, sig, n);
 			}
 		}
 		if req & PAUSE != 0 && !self.k.paused {
@@ -2762,16 +3110,32 @@ impl Shell {
 	}
 
 	/// Terminate vproc `i` with `status`: signal its task or external, end its
-	/// scripts. Transient vprocs are removed.
+	/// scripts. Transient vprocs are removed. One with a parent died of `sig`
+	/// ([`Kernel::deaths`]), though an `INT` began its end (its EXIT trap,
+	/// which the signal ends).
 	fn kill(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32) {
+		self.end(cx, i, sig, status, true);
+	}
+
+	/// [`Self::kill`], `externals`: signalling its externals too; else they
+	/// run on (released: the root's process died of `sig`,
+	/// [`Self::release_foreground`]).
+	fn end(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32, externals: bool) {
 		let vpid = self.procs[i].vpid;
 		self.drop_take_in(vpid);
+		let pipeline = runs_pipeline(&self.procs[i]);
+		self.k.set_int_note(vpid, None);
+		if self.procs[i].parent.is_some() {
+			self.k.dies_of(vpid, sig);
+		} else {
+			self.k.died_of(vpid);
+		}
 		let p = &mut self.procs[i];
 		for f in &mut p.frames {
 			if let Some(sc) = f.scratch.as_mut() {
 				match &mut sc.live {
 					Live::Task(t) => t.signal(sig),
-					Live::Ext(e) => {
+					Live::Ext(e) if externals => {
 						let _ = e.signal(sig);
 						let _ = e.cont();
 					},
@@ -2797,6 +3161,10 @@ impl Shell {
 			}
 			self.k.done.push_back((run.id, status));
 		}
+		// The root's process runs no program in place of the shell now.
+		if self.procs[i].parent.is_none() {
+			untrapped::program_ended(&mut self.k, cx, &self.procs[i]);
+		}
 		if self.procs[i].transient {
 			let p = self.procs.remove(i);
 			self.k.trace_sources.remove(&p.vpid);
@@ -2805,9 +3173,13 @@ impl Shell {
 			self.k.forget_deferral(p.vpid);
 			self.k.proc_exited(cx.store, p.vpid, p.parent, status);
 			self.rr = 0;
+			self.k.set_int_note(p.vpid, None);
+			self.k.frozen_ints.retain(|v| *v != p.vpid);
+			self.k.held_notices.retain(|(v, ..)| *v != p.vpid);
+			let died = self.k.died_of(p.vpid);
 			self.ended(p.vpid, p.parent);
 			self.k.ctl.notify();
-			self.reaped(cx, p.parent, p.vpid, status);
+			self.reaped(cx, p.parent, p.vpid, status, died, pipeline);
 		}
 	}
 
@@ -2910,13 +3282,360 @@ impl Shell {
 		self.procs.iter().position(|q| q.vpid == *child)
 	}
 
-	/// Deliver a virtual signal to its target or its configured trap.
-	fn deliver(&mut self, cx: &mut Cx<'_>, target: SigTarget, sig: Signal) {
+	/// What vproc `i` waits for, for bash's `INT` hold ([`HeldInt`]), when
+	/// signal number `n` ([`control::Ctl::take_signals`]) reaches it: its
+	/// foreground job (bash `wait_for` with `wait_sigint_handler`), when its
+	/// innermost frame awaits an external or the stages or subshell of a
+	/// `Spawn` still running (not one it runs itself, `lastpipe`); the output
+	/// of a command substitution it reads while something still writes it
+	/// (`command_substitute` blocks `SIGINT` around `read_comsub`, in every
+	/// bash process), then the substitution's process, as a job
+	/// (`wait_for`). `None`: it runs shell code, or did when the signal came,
+	/// before its wait began ([`IntNote::WaitFrom`]).
+	fn waits(&self, i: usize, n: u64) -> Option<HeldInt> {
+		let p = &self.procs[i];
+		if let Some(IntNote::WaitFrom(from)) = self.k.int_note(p.vpid)
+			&& n <= from
+		{
+			return None;
+		}
+		let sc = p.frames.last()?.scratch.as_ref()?;
+		let external = matches!(sc.live, Live::Ext(_))
+			&& sc
+				.exec
+				.as_ref()
+				.is_some_and(|e| matches!(e.waiting, Some(proc::Awaited::Ext { .. })));
+		let stages = sc.inline().is_none() && sc.children.iter().any(|(_, status)| status.is_none());
+		if external || stages {
+			return Some(HeldInt::Job { caught: false });
+		}
+		match &sc.sub {
+			Some(proc::PendingSub::Fork { capture, .. }) if capture.has_writers() => {
+				Some(HeldInt::Comsub)
+			},
+			Some(proc::PendingSub::Fork { .. }) => Some(HeldInt::Job { caught: false }),
+			_ => None,
+		}
+	}
+
+	/// A vproc that holds an `INT` while it reads a substitution's output
+	/// ([`HeldInt::Comsub`]), whose output nothing writes any more (its
+	/// process closed or moved its standard output, and no program of it
+	/// holds a copy): the read is over, and it acts on the `INT` now, as
+	/// bash does once `read_comsub` reads end of file and `SIGINT` is
+	/// unblocked, before it waits for the substitution's process; that wait
+	/// begins after the signal ([`IntNote::WaitFrom`]), and holds a later
+	/// one as for a job ([`Self::waits`]).
+	fn comsub_reads_ended(&mut self) {
+		let ended: Vec<Vpid> = self
+			.k
+			.int_notes
+			.iter()
+			.filter(|&&(_, note)| note == IntNote::Held(HeldInt::Comsub))
+			.map(|&(vpid, _)| vpid)
+			.filter(|&vpid| {
+				self
+					.procs
+					.iter()
+					.find(|p| p.vpid == vpid)
+					.and_then(|p| p.frames.last()?.scratch.as_ref())
+					.is_some_and(|sc| {
+						matches!(&sc.sub, Some(proc::PendingSub::Fork { capture, .. }) if !capture.has_writers())
+					})
+			})
+			.collect();
+		for vpid in ended {
+			ControlHandle(Arc::clone(&self.k.ctl)).signal(SigTarget::Vpid(vpid), Signal::Int);
+			let from = self.k.ctl.signals_queued();
+			self.k.set_int_note(vpid, Some(IntNote::WaitFrom(from)));
+		}
+	}
+
+	/// The vprocs of the root's foreground command, parents first: each
+	/// child of the root (a stage, a subshell, a command or process
+	/// substitution), then each of theirs, and so on, but a job of its own
+	/// (in its parent's job table). `shell_group`: only those bash runs in
+	/// the shell's own process group under job control (`set -m`): not the
+	/// stages or subshell of the foreground job the root waits for, which
+	/// bash runs in a group of their own, nor theirs.
+	fn foreground_tree(&self, shell_group: bool) -> Vec<Vpid> {
+		let root = &self.procs[0];
+		let job: Vec<Vpid> = if shell_group {
+			root
+				.frames
+				.iter()
+				.filter_map(|f| f.scratch.as_ref())
+				.flat_map(|sc| sc.children.iter().map(|&(vpid, _)| vpid))
+				.collect()
+		} else {
+			Vec::new()
+		};
+		let mut tree = vec![root.vpid];
+		let mut next = 0;
+		while let Some(&parent) = tree.get(next) {
+			next += 1;
+			let Some(owner) = self.procs.iter().find(|p| p.vpid == parent) else {
+				continue;
+			};
+			for p in &self.procs {
+				if p.parent == Some(parent)
+					&& owner.jobs.by_vpid(p.vpid).is_none()
+					&& !tree.contains(&p.vpid)
+					&& !job.contains(&p.vpid)
+				{
+					tree.push(p.vpid);
+				}
+			}
+		}
+		tree.remove(0);
+		tree
+	}
+
+	/// Let the externals of the root's foreground command outlive the shell
+	/// ([`exec::release_externals`]): the root's own and those of each vproc
+	/// of [`Self::foreground_tree`]. bash's `termsig_handler` and zsh's
+	/// `zexit` end the shell's process alone, and so does a signal's default
+	/// action: the processes of its foreground command go on. Shell code of
+	/// a stage or a subshell runs in obash's process, and ends with it.
+	fn release_foreground(&mut self) {
+		let tree = self.foreground_tree(false);
+		for p in self
+			.procs
+			.iter_mut()
+			.filter(|p| p.parent.is_none() || tree.contains(&p.vpid))
+		{
+			exec::release_externals(p);
+		}
+	}
+
+	/// The vprocs of the root's foreground command that get the `INT` of
+	/// the shell's process group ([`Self::int_to_foreground`]), parents
+	/// first: each bash process of the command bash runs in the shell's
+	/// group. Without job control that is each stage, subshell and
+	/// substitution, where obash runs their code in its own process, which
+	/// gets the signal once; under `set -m` the stages and subshell of a
+	/// foreground job are in a group of their own, and get none, while its
+	/// substitutions are in the shell's ([`Self::foreground_tree`]). Not
+	/// those made when a wait began after the signal came: the kernel's
+	/// signal did not reach the processes bash forks after it. Taken before
+	/// the root takes the signal, whose end (its EXIT trap, or its death)
+	/// unwinds the frames that name its foreground job. `None` after a store
+	/// failure.
+	fn int_targets(&mut self, cx: &mut Cx<'_>, n: u64) -> Option<Vec<Vpid>> {
+		let monitor = match state::option(&mut self.k.root, cx.store, &self.procs[0], OptId::Monitor)
+		{
+			Ok(monitor) => monitor,
+			Err(err) => {
+				self.k.fail(err);
+				return None;
+			},
+		};
+		let mut later: Vec<Vpid> = Vec::new();
+		let mut targets = Vec::new();
+		for vpid in self.foreground_tree(monitor) {
+			let Some(p) = self.procs.iter().find(|p| p.vpid == vpid) else {
+				continue;
+			};
+			if let Some(parent) = p.parent
+				&& (later.contains(&parent)
+					|| matches!(self.k.int_note(parent), Some(IntNote::WaitFrom(from)) if n <= from))
+			{
+				later.push(vpid);
+				continue;
+			}
+			targets.push(vpid);
+		}
+		Some(targets)
+	}
+
+	/// The `INT` of the shell's process group, as each bash process of the
+	/// root's foreground command gets it: `targets`, from
+	/// [`Self::int_targets`]. Parents first, so that each one's end reaches
+	/// its parent's hold ([`Self::reaped`]). One that is just its program
+	/// ([`transparent`]) leaves the signal to the program, which has it from
+	/// the kernel; one with an `INT` trap of its own runs it, or ignores it
+	/// (`trap ''`, a background job's); else it holds it while it waits for a
+	/// job of its own or reads a substitution ([`HeldInt`]), and dies of it
+	/// (after an EXIT trap of its own) while it runs shell code, as a bash
+	/// subshell does ([`Self::take`], as [`Self::deliver`] gives a signal).
+	///
+	/// An `INT` from another process ([`SigTarget::Outside`]) is taken as the
+	/// group's, though a `kill` of the shell's pid alone sends one too: taken
+	/// as the shell's alone, a `kill` of the group (`timeout`, a runner's
+	/// cancel) would leave a stage of shell code running on, a loop forever
+	/// (`while :; do sleep 1; done | cmd`), where bash's stage dies. So
+	/// without job control a `kill -INT` of obash's pid alone also ends the
+	/// shell code of its foreground command, which bash's subshells would
+	/// run on: a known difference.
+	fn int_to_foreground(&mut self, cx: &mut Cx<'_>, n: u64, targets: Vec<Vpid>) {
+		let key = crate::bash::store::TrapKey::Signal(Signal::Int);
+		for vpid in targets {
+			let Some(i) = self.procs.iter().position(|p| p.vpid == vpid) else {
+				continue;
+			};
+			let p = &self.procs[i];
+			if p.mode.dialect() != crate::bash::ids::Dialect::Bash
+				|| transparent(p, false) == Some(true)
+			{
+				continue;
+			}
+			// An ignoring trap stays in a subshell; one with an action only
+			// where the subshell set it.
+			let trap = match state::record(cx.store, p, crate::bash::store::Key::Trap(key)) {
+				Ok(Some(Record::Trap { action, .. })) if action.is_empty() => Some(true),
+				Ok(Some(Record::Trap { .. })) if p.own_traps.has(key) => Some(false),
+				Ok(_) => match exec::async_ignored(cx.store, p, Signal::Int, false) {
+					Ok(ignored) => ignored.then_some(true),
+					Err(err) => {
+						self.k.fail(err);
+						return;
+					},
+				},
+				Err(err) => {
+					self.k.fail(err);
+					return;
+				},
+			};
+			if let Err(err) = self.take(cx, i, i, Signal::Int, n, trap, false) {
+				self.k.fail(err);
+				return;
+			}
+		}
+	}
+
+	/// Vproc `i` takes signal number `n`, `sig`. With a trap (`trap`:
+	/// `Some(true)` an ignoring one), the trap of vproc `own` (`i`, or the
+	/// zsh `( … )` the root runs in place of itself, [`Self::in_place_end`])
+	/// is due ([`trapped`]); without one, what the shell does itself
+	/// ([`untrapped::decide`]). `pass_on`: the signal was sent to more than
+	/// the shell's own process, so what `i` runs gets it too. One step for
+	/// [`Self::deliver`] and [`Self::int_to_foreground`]: the job change of
+	/// a stop or continue, if any.
+	///
+	/// # Errors
+	///
+	/// A store failure reading the held set, an option or the EXIT trap.
+	#[expect(clippy::too_many_arguments, reason = "the signal, its trap and its reach, one step")]
+	fn take(
+		&mut self,
+		cx: &mut Cx<'_>,
+		i: usize,
+		own: usize,
+		sig: Signal,
+		n: u64,
+		trap: Option<bool>,
+		pass_on: bool,
+	) -> Result<Option<(Vpid, Option<Signal>)>, StoreError> {
+		let platform = self.k.engine.config().platform;
+		if let Some(ignored) = trap {
+			if !ignored {
+				trapped(&mut self.k, &mut self.procs[own], sig, platform);
+			}
+			return Ok(None);
+		}
+		// Without job control bash holds an `INT` while it waits for a job,
+		// and while it reads a command substitution ([`Self::waits`]).
+		let waits = self.waits(i, n);
+		let decision = untrapped::decide(&mut self.k, cx, &mut self.procs[i], sig, waits)?;
+		let status = sig.exit_status(platform);
+		let root = self.procs[i].parent.is_none();
+		let vpid = self.procs[i].vpid;
+		match decision {
+			untrapped::Untrapped::Handled | untrapped::Untrapped::Ignored => {},
+			untrapped::Untrapped::ZshHupExit => {
+				if pass_on {
+					signal_lives(&mut self.procs[i], sig, false);
+				}
+				if root {
+					self.release_foreground();
+				}
+				exec::zsh_hup_exit(&mut self.k, &mut self.procs[i], cx);
+			},
+			untrapped::Untrapped::Held(held) => {
+				if pass_on {
+					signal_lives(&mut self.procs[i], sig, false);
+				}
+				// The wait's end decides ([`end_held_sigint`]).
+				self.k.set_int_note(vpid, Some(IntNote::Held(held)));
+			},
+			// bash `termsig_sighandler`: a terminating signal that comes while
+			// the EXIT trap a first one began runs ends the shell at once, by
+			// itself; obash had begun the trap again, and again.
+			untrapped::Untrapped::BashExitTrapThenDie if exec::terminating(&self.procs[i]) => {
+				if root {
+					self.k.killed_by = Some(i32::from(sig.number(platform)));
+					self.release_foreground();
+					self.end(cx, i, sig, status, false);
+				} else {
+					self.kill(cx, i, sig, status);
+				}
+			},
+			untrapped::Untrapped::BashExitTrapThenDie => {
+				if pass_on {
+					signal_lives(&mut self.procs[i], sig, true);
+				}
+				if root {
+					self.k.killed_by = Some(i32::from(sig.number(platform)));
+					self.release_foreground();
+				} else {
+					// bash's subshell kills itself with the signal once the trap
+					// has run: its parent's reap reads a death by it, not by an
+					// `INT` that began its end.
+					self.k.dies_of(vpid, sig);
+				}
+				exec::bash_termsig(&mut self.k, &mut self.procs[i], cx, status);
+			},
+			untrapped::Untrapped::Default => match sig.default_action() {
+				DefaultAction::Terminate if root => {
+					// The root shell dies of the signal: a process host dies of it
+					// too ([`Shell::killed_by`]), and leaves its foreground command
+					// running, its own program too, as the kernel's signal to a
+					// real shell does.
+					self.k.killed_by = Some(i32::from(sig.number(platform)));
+					self.release_foreground();
+					self.end(cx, i, sig, status, false);
+				},
+				DefaultAction::Terminate => self.kill(cx, i, sig, status),
+				DefaultAction::Stop | DefaultAction::Continue => {
+					let stop = sig.default_action() == DefaultAction::Stop;
+					let p = &mut self.procs[i];
+					let change = (p.stopped != stop).then_some((p.vpid, stop.then_some(sig)));
+					set_stopped(p, stop);
+					return Ok(change);
+				},
+				DefaultAction::Ignore => {},
+			},
+		}
+		Ok(None)
+	}
+
+	/// The vproc at the end of the chain that the process of vproc `i` is:
+	/// `i`, or the zsh `( … )` it runs in place of itself
+	/// ([`proc::VprocZsh::in_place`]), and so on down.
+	fn in_place_end(&self, mut i: usize) -> usize {
+		while let Some(j) = self
+			.procs
+			.iter()
+			.position(|q| q.parent == Some(self.procs[i].vpid) && q.in_place())
+		{
+			i = j;
+		}
+		i
+	}
+
+	/// Deliver virtual signal number `n` ([`control::Ctl::take_signals`]) to
+	/// its target or its configured trap.
+	fn deliver(&mut self, cx: &mut Cx<'_>, target: SigTarget, sig: Signal, n: u64) {
 		let root = (self.procs[0].vpid, self.procs[0].mode);
 		self
 			.k
 			.emit(cx, root, None, EventData::Signal { sig, target });
 		let platform = self.k.engine.config().platform;
+		let (target, sender) = match target {
+			SigTarget::Group(v) => (SigTarget::Vpid(v), Sender::Kernel),
+			SigTarget::Outside(v) => (SigTarget::Vpid(v), Sender::Process),
+			target => (target, Sender::Shell),
+		};
 		let job_root = match target {
 			SigTarget::Job(id) => self
 				.procs
@@ -2928,7 +3647,9 @@ impl Shell {
 		};
 		let mut hits: Vec<usize> = (0..self.procs.len())
 			.filter(|&i| match target {
-				SigTarget::Vpid(v) => self.procs[i].vpid == v,
+				SigTarget::Vpid(v) | SigTarget::Group(v) | SigTarget::Outside(v) => {
+					self.procs[i].vpid == v
+				},
 				SigTarget::All => true,
 				SigTarget::Job(_) => job_root.is_some_and(|v| self.in_job(self.procs[i].vpid, v)),
 				SigTarget::Label(l) => l != 0 && self.procs[i].lineage.label == l,
@@ -2957,38 +3678,88 @@ impl Shell {
 				at = Some(child);
 			}
 		}
+		// The kernel's `INT` reaches every process of the group: each bash
+		// process of the foreground command has it too. One from another
+		// process may be the group's or the shell's alone, which a signal does
+		// not tell apart: it is taken as the group's
+		// ([`Self::int_to_foreground`]). Who gets it is fixed before the root
+		// takes it ([`Self::int_targets`]).
+		let foreground = if sender != Sender::Shell
+			&& sig == Signal::Int
+			&& target == SigTarget::Vpid(root.0)
+			&& root.1.dialect() == crate::bash::ids::Dialect::Bash
+		{
+			match self.int_targets(cx, n) {
+				Some(targets) => Some(targets),
+				None => return,
+			}
+		} else {
+			None
+		};
 		self.callout_trees(&mut hits);
 		// Vprocs this signal stopped or continued (job states follow).
 		let mut changed: Vec<(Vpid, Option<Signal>)> = Vec::new();
 		for &i in hits.iter().rev() {
+			// A signal to the shell is the process's: its trap is the one of
+			// the zsh `( … )` the root runs in place of itself, if it does
+			// ([`Self::in_place_end`]), which runs it.
+			let own = if target == SigTarget::Vpid(root.0) && sig != Signal::Chld {
+				self.in_place_end(i)
+			} else {
+				i
+			};
 			let trap = if matches!(sig, Signal::Kill | Signal::Stop) {
 				None
 			} else {
 				let key = crate::bash::store::TrapKey::Signal(sig);
-				match state::record(cx.store, &self.procs[i], crate::bash::store::Key::Trap(key)) {
-					Ok(Some(Record::Trap { action, .. })) => Some(action.is_empty()),
-					Ok(_) => None,
+				let p = &self.procs[own];
+				let recorded = match state::record(cx.store, p, crate::bash::store::Key::Trap(key)) {
+					Ok(Some(Record::Trap { action, .. })) => Ok(Some(action.is_empty())),
+					Ok(_) => Ok(None),
+					Err(err) => Err(err),
+				};
+				// zsh: a `TRAPNAL` function is the trap (`ZSIG_FUNC`).
+				let found = recorded.and_then(|trap| match trap {
+					None if p.mode.dialect() == crate::bash::ids::Dialect::Zsh => {
+						builtins::trap::find_func_trap(cx.store, p, key, platform, |_, _| false)
+					},
+					trap => Ok(trap),
+				});
+				// bash: an asynchronous command ignores `INT` and `QUIT` sent
+				// to it while it has no trap for them ([`exec::async_ignored`]).
+				let found = found.and_then(|trap| match trap {
+					None if matches!(sig, Signal::Int | Signal::Quit) => {
+						exec::async_ignored(cx.store, p, sig, false)
+							.map(|ignored| ignored.then_some(true))
+					},
+					trap => Ok(trap),
+				});
+				match found {
+					Ok(trap) => trap,
 					Err(err) => {
 						self.k.fail(err);
 						return;
 					},
 				}
 			};
+			// The program the root runs in place of the shell (`exec`, or a
+			// command the real shell runs without a fork, in the root or in a
+			// zsh `( … )` it runs in place) is the real shell's process: a
+			// signal sent to the shell is the program's (one the shell ignores
+			// the program inherits ignored), and the shell ends as the program
+			// does. `CHLD` comes from the engine's children.
+			if target == SigTarget::Vpid(root.0)
+				&& sig != Signal::Chld
+				&& trap != Some(true)
+				&& forward_to_program(&mut self.k, &mut self.procs[own], sig, sender != Sender::Kernel)
+			{
+				continue;
+			}
 			let terminating = trap.is_none() && sig.default_action() == DefaultAction::Terminate;
 			// A signal to the shell PID does not also target its foreground child.
 			// A terminating child is signaled once by `kill`, not here and there.
 			if target != SigTarget::Vpid(root.0) && !terminating {
-				for frame in &mut self.procs[i].frames {
-					if let Some(sc) = frame.scratch.as_mut() {
-						match &mut sc.live {
-							Live::Task(task) => task.signal(sig),
-							Live::Ext(ext) => {
-								let _ = ext.signal(sig);
-							},
-							_ => {},
-						}
-					}
-				}
+				signal_lives(&mut self.procs[i], sig, false);
 			}
 			// A vproc that is just its program (bash would have `exec`'d it:
 			// `cmd &`, a pipeline stage, `( cmd )`, `exec cmd`) or just waits
@@ -3023,41 +3794,19 @@ impl Shell {
 			if self.procs[i].parent.is_none() && zle::signal(&mut self.procs[i], sig, trap.is_some()) {
 				continue;
 			}
-			if let Some(ignored) = trap {
-				if !ignored {
-					let process = &mut self.procs[i];
-					process.pending_traps = process.pending_traps.with(sig);
-					if !process.waiting_foreground() {
-						process.blocked = None;
-					}
-					// bash: a trapped signal ends the `wait` builtin with 128 + n
-					// (then the trap runs); `SIGCHLD` does not.
-					if sig != Signal::Chld {
-						interrupt_wait(process, sig.exit_status(platform));
-					}
-				}
-				continue;
-			}
-			// The interactive shell itself: zsh's handlers (`INT` abandons
-			// the command line; `QUIT`, `TERM`, `ALRM` and, with job
-			// control, the terminal stop signals do nothing).
-			if self.procs[i].parent.is_none()
-				&& jobctl::untrapped(&mut self.k, cx, &mut self.procs[i], sig)
-			{
-				continue;
-			}
-			match sig.default_action() {
-				DefaultAction::Terminate => self.kill(cx, i, sig, sig.exit_status(platform)),
-				DefaultAction::Stop | DefaultAction::Continue => {
-					let stop = sig.default_action() == DefaultAction::Stop;
-					let p = &mut self.procs[i];
-					if p.stopped != stop {
-						changed.push((p.vpid, stop.then_some(sig)));
-					}
-					set_stopped(p, stop);
+			// A signal sent to more than the shell reaches what it runs too;
+			// the shell does not wait for that to end.
+			match self.take(cx, i, own, sig, n, trap, target != SigTarget::Vpid(root.0)) {
+				Ok(Some(change)) => changed.push(change),
+				Ok(None) => {},
+				Err(err) => {
+					self.k.fail(err);
+					return;
 				},
-				DefaultAction::Ignore => {},
 			}
+		}
+		if let Some(targets) = foreground {
+			self.int_to_foreground(cx, n, targets);
 		}
 		for (vpid, stop) in changed {
 			self.job_changed(cx, vpid, stop);
@@ -3142,6 +3891,14 @@ impl Shell {
 			.reported_refusal
 			.filter(|(id, _)| *id == run)
 			.map(|(_, refusal)| refusal)
+	}
+
+	/// The signal the root shell took the default action of (`kill -TERM
+	/// $$` without a trap), ending its scripts: a process host dies of it
+	/// too, as zsh and bash do, so that its parent sees `WIFSIGNALED`.
+	/// Ordinary `exit 128+n` is not a signal death.
+	pub const fn killed_by(&self) -> Option<i32> {
+		self.k.killed_by
 	}
 
 	/// Number of the root's background jobs that still wait for a running
@@ -3261,13 +4018,28 @@ pub fn imported_function(k: &Kernel, name: &[u8], value: &[u8]) -> Option<Record
 
 /// A child of `p` finished: if `p` traps `SIGCHLD`, it owes one more run of
 /// the trap (bash's `waitchld` counts the children it reaped and runs the
-/// trap that many times). Called by the scheduler for child vprocs and by
-/// `Exec` for externals `p` ran itself; `background`: the child was one of
-/// `p`'s background jobs. zsh (`update_job`) runs the trap (a `trap` action
-/// or the `TRAPCHLD` function) only for those, not for the foreground job.
-pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool) {
+/// trap that many times). Called by the scheduler for child vprocs, for each
+/// process of one of `p`'s pipeline jobs as the job's vproc reaps it
+/// ([`Shell::reaped`]), and by `Exec` for externals `p` ran itself; `job`:
+/// the child was this one of `p`'s background jobs. zsh (`update_job`) runs
+/// the trap (a `trap` action or the `TRAPCHLD` function) only for those, not
+/// for the foreground job, one run per job ([`proc::VprocZsh::chld_jobs`]).
+/// A child reaped while the `CHLD` trap runs owes none: bash queues the trap
+/// and then drops it (`run_pending_traps` finds the trap's slot busy and
+/// warns `bad value in trap_list[17]`), and zsh 5.9 runs it once too, even
+/// for a job the trap's `wait` waited for, or one of its own children (a
+/// `$( )`, a program).
+pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, job: Option<Vpid>) {
 	let zsh = p.mode.dialect() == crate::bash::ids::Dialect::Zsh;
-	if zsh && !background {
+	if zsh && job.is_none() {
+		return;
+	}
+	let chld = crate::bash::store::TrapKey::Signal(Signal::Chld);
+	if p.trap_frames != 0
+		&& p.frames.iter().any(|f| {
+			matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key, .. }, .. } if key == chld)
+		})
+	{
 		return;
 	}
 	let key = crate::bash::store::Key::Trap(crate::bash::store::TrapKey::Signal(Signal::Chld));
@@ -3286,8 +4058,16 @@ pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool
 	if trapped {
 		p.jobs.chld += 1;
 		p.pending_traps = p.pending_traps.with(Signal::Chld);
+		if let (true, Some(job)) = (zsh, job) {
+			p.zsh_state().chld_jobs.push_back(job);
+		}
 		if !p.waiting_foreground() {
 			p.blocked = None;
+		}
+		// bash in posix mode queues the trap and ends a `wait` it is in,
+		// with 128 + `SIGCHLD` (`jobs.c:4240-4250`); the trap runs after.
+		if !zsh && state::option(&mut k.root, cx.store, p, OptId::Posix).unwrap_or(false) {
+			interrupt_wait(p, Signal::Chld.exit_status(k.engine.config().platform));
 		}
 	}
 }
@@ -3301,7 +4081,7 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 		};
 		let waiting = matches!(
 			e.waiting,
-			Some(proc::Awaited::Jobs { .. } | proc::Awaited::AllJobs | proc::Awaited::AnyJob)
+			Some(proc::Awaited::Jobs { .. } | proc::Awaited::AllJobs | proc::Awaited::AnyJob { .. })
 		);
 		if waiting && e.target == Some(proc::Target::Intrinsic(crate::bash::ids::IntrinsicId::Wait)) {
 			e.waiting = Some(proc::Awaited::Jobs { force: true });
@@ -3312,17 +4092,205 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 	}
 }
 
+/// A signal reaches vproc `p`, whose trap for it has an action (bash
+/// `trap_handler`): the trap is due, at once unless `p` waits for its
+/// foreground command (bash runs it once the command has ended), and a
+/// `wait` builtin `p` is in ends with 128 + the signal's number (then the
+/// trap runs); `SIGCHLD` ends none.
+fn trapped(k: &mut Kernel, p: &mut Vproc, sig: Signal, platform: crate::bash::ids::Platform) {
+	p.pending_traps = p.pending_traps.with(sig);
+	// bash's `wait_for` runs the `INT` trap itself, the job list frozen,
+	// once the forked foreground command it waits for has ended.
+	if sig == Signal::Int && p.waiting_for_a_fork() && !k.frozen_ints.contains(&p.vpid) {
+		k.frozen_ints.push(p.vpid);
+	}
+	if !p.waiting_foreground() {
+		p.blocked = None;
+	}
+	if sig != Signal::Chld {
+		interrupt_wait(p, sig.exit_status(platform));
+	}
+}
+
+/// Who sent a signal `Shell::deliver` gives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sender {
+	/// The shell: `kill`, a job's or the engine's own signal.
+	Shell,
+	/// The kernel, to the root's OS process group ([`SigTarget::Group`]): a
+	/// terminal's `INT`, `QUIT` or hangup `HUP`. A program the root runs in
+	/// place of itself, in that group too, has it already.
+	Kernel,
+	/// Another process ([`SigTarget::Outside`], `SI_USER`): to the shell's
+	/// pid alone or to its process group, which the signal does not tell
+	/// apart.
+	Process,
+}
+
+/// bash's `INT` as a vproc has it ([`Kernel::int_notes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntNote {
+	/// Noted while it waits ([`HeldInt`]), to act on once the wait ends
+	/// ([`end_held_sigint`]).
+	Held(HeldInt),
+	/// Its wait began ([`wait_starts`]) once the signals up to this number
+	/// were queued ([`control::Ctl::signals_queued`]): one of them came while
+	/// it ran shell code ([`Shell::waits`]), and did not reach the vprocs
+	/// it made then.
+	WaitFrom(u64),
+}
+
+/// An `INT` a bash vproc noted ([`IntNote::Held`]), and what it does once
+/// what it waits for has ended ([`end_held_sigint`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldInt {
+	/// While it waited, without job control, for its foreground job (bash
+	/// `wait_for`'s `wait_sigint_handler`): it acts only if the last process
+	/// of the job to end died of `SIGINT`; `caught`: that process ended
+	/// otherwise (bash `child_caught_sigint`, which `waitchld` sets again for
+	/// each child it reaps: [`external_ended`], [`Shell::reaped`]).
+	Job { caught: bool },
+	/// While it read a command substitution's output, with or without an
+	/// EXIT trap and job control (bash blocks `SIGINT` around
+	/// `read_comsub`): once the read ends (nothing writes the output any
+	/// more, [`Shell::comsub_reads_ended`], or the substitution's process
+	/// ended) it acts whatever the substitution's processes did.
+	Comsub,
+}
+
+/// The external `vp` ran ended (`killed`: by that signal): the last
+/// process of the job `vp` holds an `INT` for ended so ([`HeldInt::Job`]).
+/// Where `vp` is that program (`replacing`: it `exec`ed it; or it is just
+/// that program, [`transparent`]), the program's end is `vp`'s: a death by
+/// a signal is `vp`'s ([`Kernel::deaths`]), and an exit clears one a
+/// signal began (an EXIT trap that `exec`s a program). Then `vp`'s wait
+/// for it is over ([`end_held_sigint`]).
+fn external_ended(k: &mut Kernel, vp: &Vproc, killed: Option<Signal>, replacing: bool) {
+	if let Some(IntNote::Held(HeldInt::Job { .. })) = k.int_note(vp.vpid) {
+		let caught = killed != Some(Signal::Int);
+		k.set_int_note(vp.vpid, Some(IntNote::Held(HeldInt::Job { caught })));
+	}
+	if vp.parent.is_some() && (replacing || transparent(vp, false) == Some(true)) {
+		match killed {
+			Some(sig) => k.dies_of(vp.vpid, sig),
+			None => {
+				k.died_of(vp.vpid);
+			},
+		}
+	}
+	end_held_sigint(k, vp, false);
+}
+
+/// `vp`'s wait for what it held an `INT` for is over: its foreground job,
+/// or (`comsub`) the command substitution it read. It acts on the
+/// `INT` now, as on one that comes while it waits for nothing
+/// ([`untrapped::decide`]), unless the last process of the job caught it;
+/// then it goes on.
+fn end_held_sigint(k: &mut Kernel, vp: &Vproc, comsub: bool) {
+	let act = match k.int_note(vp.vpid) {
+		Some(IntNote::Held(HeldInt::Job { caught })) if !comsub => !caught,
+		Some(IntNote::Held(HeldInt::Comsub)) if comsub => true,
+		_ => return,
+	};
+	k.set_int_note(vp.vpid, None);
+	if act {
+		ControlHandle(Arc::clone(&k.ctl)).signal(SigTarget::Vpid(vp.vpid), Signal::Int);
+	}
+}
+
+/// `vp` begins to wait for what it runs: an external, the stages or
+/// subshell of a `Spawn`, a command substitution (bash `wait_for`, which
+/// clears `wait_sigint_received` and only then installs
+/// `wait_sigint_handler`). A signal that came before reached a process
+/// running shell code, and none that bash forked after it: the host hands
+/// over each signal its handler has seen by now (on the engine's thread,
+/// which the kernel gives a signal to the process first), and the vproc
+/// takes those as come before its wait ([`IntNote::WaitFrom`]). A later
+/// one finds it waiting.
+fn wait_starts(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) {
+	cx.host.forward_signals();
+	let from = k.ctl.signals_queued();
+	k.set_int_note(vp.vpid, Some(IntNote::WaitFrom(from)));
+}
+
+/// Give `sig` to the external `p`'s innermost frame runs in place of the
+/// shell: one it `exec`s, or one the real shell runs without a fork
+/// ([`runs_in_place`]). The real shell's process is then the program, so a
+/// signal sent to the shell is the program's: given at once, or once the
+/// program's spawn has finished ([`Kernel::forward`]). One the kernel sent
+/// the whole process group (`give` false) the running program has already;
+/// the spawn of one may not have forked yet, so it is given then. `false`
+/// when `p` runs no such program.
+fn forward_to_program(k: &mut Kernel, p: &mut Vproc, sig: Signal, give: bool) -> bool {
+	if !runs_in_place(p) {
+		return false;
+	}
+	let Some(sc) = p.frames.last_mut().and_then(|f| f.scratch.as_mut()) else {
+		return false;
+	};
+	let waits = sc
+		.exec
+		.as_deref()
+		.is_some_and(|e| matches!(e.waiting, Some(proc::Awaited::Ext { .. })));
+	match &mut sc.live {
+		Live::Ext(ext) if waits => {
+			if give {
+				let _ = ext.signal(sig);
+			}
+			true
+		},
+		Live::Spawn(_) => {
+			k.forward = k.forward.with(sig);
+			true
+		},
+		_ => false,
+	}
+}
+
+/// Whether `p`'s innermost frame runs, or is starting, an external in place
+/// of the shell: one it `exec`s, or one the real shell runs without a fork
+/// ([`proc::ExecState::in_place`]).
+fn runs_in_place(p: &Vproc) -> bool {
+	p.frames
+		.last()
+		.and_then(|f| f.scratch.as_ref())
+		.and_then(|sc| sc.exec.as_deref())
+		.is_some_and(|e| e.in_place || matches!(e.control, Some(proc::Transfer::Exec)))
+}
+
+/// Pass `sig` on to the builtin tasks and externals `p` runs now, and
+/// continue the externals after it when `cont` (bash's `kill_pid` continues
+/// a stopped job it ends).
+fn signal_lives(p: &mut Vproc, sig: Signal, cont: bool) {
+	for frame in &mut p.frames {
+		if let Some(sc) = frame.scratch.as_mut() {
+			match &mut sc.live {
+				Live::Task(task) => task.signal(sig),
+				Live::Ext(ext) => {
+					let _ = ext.signal(sig);
+					if cont {
+						let _ = ext.cont();
+					}
+				},
+				_ => {},
+			}
+		}
+	}
+}
+
 /// Whether a terminating signal to `p` is the business of what `p` runs
-/// rather than of `p` itself, as when bash `exec`s a subshell's last
-/// command: `Some(true)` when `p` is a subshell vproc (no `EXIT` trap of its
-/// own) whose one frame awaits the external that is its last command (`cmd
-/// &`, a pipeline stage, `( cmd )`) or one it `exec`s; `Some(false)` when it
-/// only waits for the stages of its pipeline or its `( … )` (with that
-/// command's redirections, `( list ) >file &`) before it exits (the job
-/// vproc of `a | b &`), and the signal reaches those too (`children`: a
-/// job, label or broadcast target, or a pid target that
-/// [`Shell::deliver`] forwards to its `( … )`); `None` otherwise.
-fn transparent(p: &Vproc, children: bool) -> Option<bool> {
+/// rather than of `p` itself, as when bash runs it in `p`'s own process:
+/// `Some(true)` when `p` is a subshell vproc (no `EXIT` trap of its own)
+/// whose one frame awaits the external bash runs with `exec` there (bash:
+/// [`killed::subshell_exec`], decided as it started; zsh: its last command,
+/// `cmd &`, a pipeline stage, `( cmd )`) or one it `exec`s; `Some(false)`
+/// when it only waits for the stages of its pipeline or its `( … )` (with
+/// that command's redirections, `( list ) >file &`) before it exits (the job
+/// vproc of `a | b &`; bash: only a pipeline or a `( … )` that is its whole
+/// command, which bash runs in that process, `( ( … ) )`), and the signal
+/// reaches those too (`children`: a job, label or broadcast target, or a pid
+/// target that [`Shell::deliver`] forwards to its `( … )`); `None` otherwise.
+pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 	if !p.transient || p.own_traps.has(crate::bash::store::TrapKey::Exit) {
 		return None;
 	}
@@ -3333,10 +4301,16 @@ fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 	let sc = frame.scratch.as_ref()?;
 	let op = unit.ops.get(frame.pc as usize)?;
 	let code_at = |pc: u32| unit.ops.get(pc as usize).map(|op| op.code);
+	let bash = p.mode.dialect() == crate::bash::ids::Dialect::Bash;
 	match (&sc.live, op.code) {
 		(Live::Ext(_), ir::Opcode::Exec) => {
 			let exec = sc.exec.as_ref().is_some_and(|e| e.exec_as.is_some());
-			(exec || code_at(frame.pc + 1) == Some(ir::Opcode::SubExit)).then_some(true)
+			let last = if bash {
+				sc.exec.as_ref().is_some_and(|e| e.subshell_exec)
+			} else {
+				code_at(frame.pc + 1) == Some(ir::Opcode::SubExit)
+			};
+			(exec || last).then_some(true)
 		},
 		(_, ir::Opcode::Spawn) if children && !sc.children.is_empty() => {
 			let spawn = unit.spawns.get(op.a as usize)?;
@@ -3350,6 +4324,22 @@ fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 				(ir::SpawnKind::Subshell | ir::SpawnKind::Pipeline, _) => spawn.end,
 				_ => return None,
 			};
+			if bash {
+				// `[Redir] Enter Spawn … Leave [PopRedir]` for a `( … )`, the
+				// whole code of `p`'s own command.
+				let mut start = frame.pc;
+				if spawn.kind == ir::SpawnKind::Subshell {
+					start = start.checked_sub(1)?;
+					if start > 0 && code_at(start - 1) == Some(ir::Opcode::Redir) {
+						start -= 1;
+					}
+				}
+				let whole =
+					killed::base_spawn(unit, frame.pc).is_some_and(|(s, i)| s.stages[i].entry == start);
+				if !whole {
+					return None;
+				}
+			}
 			(code_at(end) == Some(ir::Opcode::SubExit)).then_some(false)
 		},
 		_ => None,
@@ -3389,6 +4379,59 @@ fn whole_stage(unit: &Unit, pc: u32) -> bool {
 		.spawns
 		.iter()
 		.any(|spawn| spawn.stages.iter().any(|stage| stage.entry == entry))
+}
+
+/// Whether `p` only waits for the one `( … )` that is its whole command
+/// ([`transparent`]'s `Some(false)` for a `( … )`): bash runs that
+/// subshell in `p`'s own process (`execute_in_subshell`'s `CMD_NO_FORK`).
+fn waits_for_its_subshell(p: &Vproc) -> bool {
+	p.mode.dialect() == crate::bash::ids::Dialect::Bash
+		&& transparent(p, true) == Some(false)
+		&& p.frames.first().is_some_and(|f| {
+			f.unit.as_ref().is_some_and(|u| {
+				u.ops
+					.get(f.pc as usize)
+					.and_then(|op| u.spawns.get(op.a as usize))
+					.is_some_and(|s| s.kind == ir::SpawnKind::Subshell)
+			})
+		})
+}
+
+/// Whether `p` is just the job process of a pipeline (`a | b &`): its one
+/// frame waits for the stages and exits after them ([`transparent`]'s
+/// `Some(false)`). bash's job is that pipeline's processes
+/// ([`proc::Job::procs`], [`Shell::stages_started`]): a signal that ends
+/// this vproc itself ends none of them.
+fn runs_pipeline(p: &Vproc) -> bool {
+	let [frame] = p.frames.as_slice() else {
+		return false;
+	};
+	transparent(p, true) == Some(false)
+		&& frame.unit.as_ref().is_some_and(|unit| {
+			unit
+				.ops
+				.get(frame.pc as usize)
+				.and_then(|op| unit.spawns.get(op.a as usize))
+				.is_some_and(|spawn| matches!(spawn.kind, ir::SpawnKind::Pipeline))
+		})
+}
+
+/// `vp` spawned the program of OS pid `pid`: where `vp` is a pipeline's
+/// stage that is just that program (bash's process for the stage `exec`s
+/// it, [`transparent`]), the record of the process the stage is
+/// ([`proc::JobProc`]) is known by that pid ([`Kernel::settled`]).
+pub(super) fn stage_spawned(k: &mut Kernel, vp: &Vproc, pid: u32) {
+	let stage = vp.parent.is_some()
+		&& transparent(vp, false) == Some(true)
+		&& vp.frames.first().is_some_and(|f| {
+			f.unit
+				.as_deref()
+				.and_then(|u| killed::base_spawn(u, f.pc))
+				.is_some_and(|(s, _)| s.kind == ir::SpawnKind::Pipeline)
+		});
+	if stage {
+		k.settled.push((vp.vpid, pid));
+	}
 }
 
 fn set_stopped(p: &mut Vproc, on: bool) {
@@ -3565,6 +4608,7 @@ impl Vproc {
 			spare: Vec::new(),
 			calls: Vec::new(),
 			own_traps: proc::OwnTraps::EMPTY,
+			async_ignored: proc::AsyncIgnored::NONE,
 			trap_frames: 0,
 			pending_break: None,
 			mode: ModeId::Bash,
@@ -3584,8 +4628,10 @@ impl Vproc {
 		fds: FdTable,
 	) -> Self {
 		let line_shift = self.frames.last().map_or(0, |f| f.line_shift);
-		// A `( … )` body follows its `Spawn` op.
-		let subshell_line = entry
+		// bash's `line_number` as it forks: a `( … )`'s own line, the last
+		// (`Subshell->line`; its body follows its `Spawn` op), else the line
+		// the parent has reached ([`killed::wait_line`]).
+		let fork_line = entry
 			.checked_sub(1)
 			.and_then(|pc| unit.ops.get(pc as usize))
 			.filter(|op| {
@@ -3595,11 +4641,21 @@ impl Vproc {
 						.get(op.a as usize)
 						.is_some_and(|s| s.kind == ir::SpawnKind::Subshell)
 			})
-			.map(|op| (unit.line + exec::end_line(&unit, op.node)).saturating_sub(line_shift));
+			.map_or_else(
+				|| {
+					let node = self
+						.frames
+						.last()
+						.and_then(|f| f.unit.as_ref()?.ops.get(f.pc as usize))
+						.map_or(0, |op| op.node);
+					killed::wait_line(self, node)
+				},
+				|op| (unit.line + exec::end_line(&unit, op.node)).saturating_sub(line_shift),
+			);
 		let mut frame = Frame::new(Some(unit), entry, proc::FrameKind::Subshell);
 		// A subshell runs code of the same unit: it keeps the line numbering.
 		frame.line_shift = line_shift;
-		frame.subshell_line = subshell_line;
+		frame.fork_line = Some(fork_line);
 		self.child_running(k, store, fds, frame)
 	}
 
@@ -3693,6 +4749,14 @@ impl Vproc {
 		{
 			vp.jobs = exec::inherited_jobs(self, true);
 		}
+		// A fork of a command or process substitution is not one (bash
+		// `execute_in_subshell` starts a new `subshell_environment`); the
+		// substitution sets its own process's ([`exec::start_sub`],
+		// [`exec::start_procsub`]).
+		vp.jobs.comsub = self.jobs.comsub.forked();
+		// bash: a fork of an asynchronous command that trapped a signal it
+		// ignored with an action starts with that signal at its default.
+		exec::fork_async_ignored(k, store, self, &mut vp);
 		vp.calls = callstack::inherited(self);
 		vp.trace_base = xtrace::level(self) - 1;
 		// bash's fork copies `top_level`: a fatal error in a forked simple

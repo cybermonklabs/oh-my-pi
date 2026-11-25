@@ -24,7 +24,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use bstr::{BStr, BString};
+use bstr::BString;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -50,15 +50,16 @@ use crate::bash::{
 		materialize,
 	},
 	mem::{Capture, MemEnd, MemImage, MemObj},
-	signal::{SigSet, Signal},
+	signal::SigSet,
 	snapshot::{ExternalizeReport, Lost, RestoreOpts, RestoreReport},
-	store::{BlobSlot, Change, Key, MiscKey, Record, StateStore, StoreError, Table, TrapKey},
+	store::{BlobSlot, Change, Key, MiscKey, Record, StateStore, StoreError, Table},
 };
 
 /// Version of the [`Image`] layout; part of the header and the build id.
-/// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
-/// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 37;
+/// Raised with every change to it (a field of a serialized type, an enum
+/// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
+/// a variant: an exec target holds it by index.
+pub const FRAMES_VERSION: u32 = 38;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -102,6 +103,11 @@ struct Image {
 	/// `Shell::taking_in`, `Shell::fresh`): a builtin that asked stays
 	/// parked across a snapshot, so its ask and its answer go with it.
 	take_in:     TakeInImage,
+	/// Subshells dying of a signal, not reaped yet ([`Kernel::deaths`]).
+	deaths:      Vec<(Vpid, crate::bash::signal::Signal)>,
+	/// Subshell notices held for a redirection's end
+	/// ([`Kernel::held_notices`]).
+	held:        Vec<(Vpid, u32, BString)>,
 }
 
 /// The take-in's state, as the image keeps it ([`Image::take_in`]).
@@ -287,6 +293,8 @@ struct ProcImage {
 	/// A `break` from `${ }` or `${| }` waiting for its loop: its command
 	/// may be parked.
 	pending_break: Option<super::proc::PendingBreak>,
+	/// The signals it ignores as an asynchronous command.
+	async_ignored: super::proc::AsyncIgnored,
 	/// Current mode (the root's is also `MiscKey::Mode`).
 	mode:          ModeId,
 	/// zsh state (sticky emulation, frames' restores).
@@ -310,6 +318,10 @@ struct Fields {
 	/// ([`crate::bash::Image::diff`]).
 	image:      ImageDiff,
 	jobs:       super::proc::JobTable,
+	/// The facts of `jobs`' jobs ([`crate::bash::store::Job::facts`]),
+	/// which their serialized form leaves out: by job id, those that have
+	/// any.
+	job_facts:  Vec<(crate::bash::ids::JobId, Vec<crate::bash::store::JobFact>)>,
 	last_bg:    super::proc::LastBg,
 	getopts:    super::proc::GetoptsState,
 	rlimits:    Vec<(crate::bash::host::Rlimit, Option<u64>, Option<u64>)>,
@@ -354,7 +366,7 @@ struct FrameImage {
 	err_reported:      bool,
 	ignore_errexit:    bool,
 	command_loop:      bool,
-	subshell_line:     Option<u32>,
+	fork_line:         Option<u32>,
 	getopts:           super::proc::GetoptsState,
 	/// A [`FrameKind::Cat`] frame's capture: its memory object.
 	capture:           Option<u32>,
@@ -406,6 +418,9 @@ struct ScratchImage {
 	/// ([`ScratchIo::var_fds`]).
 	var_fds:      Option<Vec<super::proc::VarFd>>,
 	children:     Vec<(Vpid, Option<i32>)>,
+	/// How the stages of a pipeline the shell waits for ended so far
+	/// ([`super::proc::PipelineWait::procs`]).
+	procs:        super::proc::JobProcs,
 	inline:       Option<super::proc::InlineStage>,
 }
 
@@ -506,7 +521,8 @@ fn scratch_image(
 		saved: saved_image(io.map_or_default(|io| io.saved.as_slice()), fds),
 		var_fds: io.and_then(|io| io.var_fds.as_deref().cloned()),
 		children: sc.children.clone(),
-		inline: sc.inline,
+		procs: sc.pipeline.as_ref().map_or_default(|p| p.procs.clone()),
+		inline: sc.inline(),
 	}
 }
 
@@ -616,7 +632,7 @@ impl Shell {
 					err_reported: f.err_reported,
 					ignore_errexit: f.ignore_errexit,
 					command_loop: f.flags.command_loop(),
-					subshell_line: f.subshell_line,
+					fork_line: f.fork_line,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
 					capture: match &f.kind {
 						FrameKind::Cat { capture } => Some(fds.capture(capture)),
@@ -656,6 +672,12 @@ impl Shell {
 				pipestatus: p.pipestatus.clone(),
 				image,
 				jobs: p.jobs.clone(),
+				job_facts: p
+					.jobs
+					.iter()
+					.map(|j| (j.id, j.facts()))
+					.filter(|(_, facts)| !facts.is_empty())
+					.collect(),
 				last_bg: p.last_bg,
 				getopts: p.getopts.clone(),
 				rlimits: p.rlimits.clone(),
@@ -682,6 +704,7 @@ impl Shell {
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
 				pending_break: p.pending_break.as_deref().copied(),
+				async_ignored: p.async_ignored,
 				mode: p.mode,
 				zsh: p.zsh.clone(),
 				lineage: p.lineage,
@@ -720,6 +743,8 @@ impl Shell {
 				asks:  self.taking_in.clone(),
 				fresh: self.fresh.clone(),
 			},
+			deaths: k.deaths.clone(),
+			held: k.held_notices.clone(),
 		};
 		let mut bytes = postcard::to_stdvec(&header).map_err(ExtError::Encode)?;
 		bytes.extend_from_slice(&postcard::to_stdvec(&image).map_err(ExtError::Encode)?);
@@ -840,7 +865,14 @@ impl Shell {
 		if let Some(err) = shell.k.root.take_fault() {
 			return Err(RestoreError::Store(err));
 		}
-		reinstall_signal_traps(cx)?;
+		// A restore in a new process starts with default dispositions
+		// (handlers do not survive `exec`): the root asks the host again for
+		// each signal's, its traps' and its own rules' alike.
+		if let Err((sig, source)) =
+			super::untrapped::reinstall(&shell.k, cx, &shell.procs[0]).map_err(RestoreError::Store)?
+		{
+			return Err(RestoreError::SignalSetup { sig, source });
+		}
 		let root = (shell.procs[0].vpid, shell.procs[0].mode);
 		shell
 			.k
@@ -895,6 +927,16 @@ impl Shell {
 			.into_iter()
 			.filter(|s| img.procs.iter().any(|p| p.vpid == s.vproc))
 			.collect();
+		k.deaths = img
+			.deaths
+			.into_iter()
+			.filter(|(v, _)| img.procs.iter().any(|p| p.vpid == *v))
+			.collect();
+		k.held_notices = img
+			.held
+			.into_iter()
+			.filter(|(v, ..)| img.procs.iter().any(|p| p.vpid == *v))
+			.collect();
 		let built = (0..img.fd_objs.len()).map(|_| None).collect();
 		let mut objs = FdRebuild {
 			objs: img.fd_objs,
@@ -928,6 +970,11 @@ impl Shell {
 				vp.status = f.status;
 				vp.pipestatus = f.pipestatus;
 				vp.jobs = f.jobs;
+				for (id, facts) in &f.job_facts {
+					if let Some(job) = vp.jobs.list.iter_mut().find(|j| j.id == *id) {
+						job.set_facts(facts);
+					}
+				}
 				vp.last_bg = f.last_bg;
 				vp.getopts = f.getopts;
 				vp.rlimits = f.rlimits;
@@ -955,6 +1002,7 @@ impl Shell {
 			vp.calls = p.calls;
 			vp.own_traps = p.own_traps;
 			vp.pending_break = p.pending_break.map(Box::new);
+			vp.async_ignored = p.async_ignored;
 			vp.mode = p.mode;
 			vp.zsh = p.zsh;
 			vp.lineage = p.lineage;
@@ -1058,7 +1106,7 @@ impl Shell {
 									| Awaited::Frame
 									| Awaited::Jobs { .. }
 									| Awaited::AllJobs
-									| Awaited::AnyJob,
+									| Awaited::AnyJob { .. },
 								)
 								| None => {},
 							}
@@ -1125,7 +1173,12 @@ impl Shell {
 							io,
 							live,
 							children: img.children,
-							inline: img.inline,
+							pipeline: (img.inline.is_some() || !img.procs.list.is_empty()).then(|| {
+								Box::new(super::proc::PipelineWait {
+									inline: img.inline,
+									procs:  img.procs,
+								})
+							}),
 							..Scratch::default()
 						}))
 					},
@@ -1160,7 +1213,7 @@ impl Shell {
 				frame.err_reported = f.err_reported;
 				frame.ignore_errexit = f.ignore_errexit;
 				frame.flags.set_command_loop(f.command_loop);
-				frame.subshell_line = f.subshell_line;
+				frame.fork_line = f.fork_line;
 				frame.getopts =
 					(f.getopts != super::proc::GetoptsState::default()).then(|| Box::new(f.getopts));
 				if matches!(frame.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }) {
@@ -1226,35 +1279,6 @@ impl Shell {
 		}
 		Ok(())
 	}
-}
-
-/// Give the host the OS disposition of every trapped or ignored signal in
-/// the root trap table: a restore in a new process starts with default
-/// dispositions (handlers do not survive `exec`), so a trapped signal
-/// would otherwise kill it. `KILL` and `STOP` cannot be trapped; `CHLD`
-/// traps run from the engine (one per reaped child), with no OS handler,
-/// as the `trap` builtin sets them.
-///
-/// # Errors
-///
-/// [`RestoreError::Store`] when the trap table cannot be read,
-/// [`RestoreError::SignalSetup`] when the host refuses a disposition.
-fn reinstall_signal_traps(cx: &mut Cx<'_>) -> Result<(), RestoreError> {
-	let mut traps = Vec::new();
-	cx.store.scan(Table::Trap, &mut |key, rec| {
-		if let (Key::Trap(TrapKey::Signal(sig)), Record::Trap { action, .. }) = (key, rec)
-			&& !matches!(sig, Signal::Kill | Signal::Stop | Signal::Chld)
-		{
-			traps.push((sig, action.clone()));
-		}
-	})?;
-	for (sig, action) in traps {
-		// `Ok(false)`: ignored on entry, which the trap table already says.
-		cx.host
-			.set_signal_trap(sig, Some(BStr::new(&action)))
-			.map_err(|source| RestoreError::SignalSetup { sig, source })?;
-	}
-	Ok(())
 }
 
 fn run_image(r: &Run) -> RunImage {
@@ -1485,8 +1509,27 @@ fn valid(u: &Unit) -> bool {
 mod tests {
 	use std::task::{Context, Poll, Waker};
 
-	use super::{FdImager, FdRebuild};
-	use crate::bash::{fd::FdRef, mem::MemObj};
+	use super::{FRAMES_VERSION, FdImager, FdRebuild, Header, IR_VERSION, MAGIC, check};
+	use crate::bash::{engine::Engine, error::Incompatibility, fd::FdRef, mem::MemObj};
+
+	/// A blob of this IR but another frames layout is refused as another
+	/// build's; one of another IR names both versions.
+	#[test]
+	fn the_header_check_refuses_another_layout() {
+		let header = |ir, frames| Header {
+			magic: MAGIC,
+			ir,
+			frames,
+			build: Engine::build_id(),
+			runs: Vec::new(),
+		};
+		assert_eq!(check(&header(IR_VERSION, FRAMES_VERSION)), Ok(()));
+		assert_eq!(check(&header(IR_VERSION, FRAMES_VERSION - 1)), Err(Incompatibility::Build));
+		assert_eq!(
+			check(&header(IR_VERSION - 1, FRAMES_VERSION)),
+			Err(Incompatibility::IrVersion { found: IR_VERSION - 1, expected: IR_VERSION })
+		);
+	}
 
 	#[test]
 	fn a_pipe_and_its_shared_ends_survive_an_image() {

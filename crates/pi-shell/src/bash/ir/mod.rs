@@ -95,8 +95,9 @@ use crate::bash::{
 	ids::{AstNodeId, ModeId, UnitId},
 };
 
-/// IR version; part of the frames header.
-pub const IR_VERSION: u32 = 19;
+/// IR version; part of the frames header. Raised with every change to a
+/// serialized IR type.
+pub const IR_VERSION: u32 = 20;
 
 /// Opcodes.
 #[derive(
@@ -297,6 +298,18 @@ pub struct Unit {
 	pub conds:               Vec<CondIr>,
 	/// Function definitions.
 	pub funcs:               Vec<FuncIr>,
+	/// The syntax node ids, sorted, of the commands the real shell may run
+	/// with `exec` and no fork. bash: when this complete command is the last
+	/// of its `-c` string, its one simple command with no redirection
+	/// (`lower::bash_tails`); and the simple command with no redirection that
+	/// ends a `( … )`'s `;`, `&&` or `||` list, which bash runs so in the
+	/// subshell's process while no trap counts (`optimize_subshell_command`,
+	/// `vm::killed::subshell_exec`). zsh's, with `last1` (`lower::zsh_tails`):
+	/// simple commands it runs with `exec` and no fork, and `( … )` subshells
+	/// it runs in place, one in a `for` body only on the loop's last word,
+	/// which the run decides.
+	#[serde(default)]
+	pub tails:               Vec<u32>,
 }
 
 impl Unit {
@@ -371,6 +384,7 @@ impl Unit {
 			ariths: Vec::new(),
 			conds: Vec::new(),
 			funcs: Vec::new(),
+			tails: Vec::new(),
 		}
 	}
 
@@ -633,8 +647,11 @@ pub enum Part {
 		kind:   ComsubForm,
 		/// Inside double quotes.
 		quoted: bool,
-		/// `$( )`: `strs` index of the body's source text, re-parsed with
-		/// the aliases in effect when it runs (outside posix mode).
+		/// `$( )`, `${ ;}`, `${| ;}`: `strs` index of the body's source text,
+		/// re-parsed with the aliases in effect when it runs (outside posix
+		/// mode); bash re-parses it through its reader as it expands it, which
+		/// reports finished jobs (`vm::killed::expanded`). `None` for a
+		/// backquote.
 		text:   Option<u32>,
 	},
 	/// `$((…))`: arithmetic text, expanded then evaluated.

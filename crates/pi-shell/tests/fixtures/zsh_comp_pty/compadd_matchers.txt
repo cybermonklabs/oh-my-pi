@@ -3,7 +3,7 @@
 @ 0,9
 ### "\u{14}"
 % : Fooba
-Foobar  FooBaz
+FooBaz  Foobar
 @ 0,9
 ### "\u{15}: c.s.u\u{14}"
 % : comp.sources.unix

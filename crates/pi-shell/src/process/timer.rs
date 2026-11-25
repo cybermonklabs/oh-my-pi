@@ -55,10 +55,13 @@ impl Timers {
 		if !st.started {
 			st.started = true;
 			let shared = Arc::clone(&self.0);
-			thread::Builder::new()
-				.name("shell-timers".into())
-				.spawn(move || run(&shared))
-				.expect("spawning the timer thread");
+			crate::sys::thread::spawn_helper(
+				thread::Builder::new().name("shell-timers".into()),
+				move || {
+					run(&shared);
+				},
+			)
+			.expect("spawning the timer thread");
 		}
 		drop(st);
 		self.0.cv.notify_one();

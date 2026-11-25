@@ -27,13 +27,13 @@ use std::{
 	task::{Context, Poll, Waker},
 };
 
-use bstr::{BStr, BString};
+use bstr::BString;
 
 use super::{
 	Cx, Kernel, Shell,
 	exec::{self, Flow},
 	proc::{Frame, FrameKind, JobState, PendingWrite, Saved, Saves, Scratch, ScriptKind, Vproc},
-	state,
+	state, untrapped as rule,
 };
 use crate::bash::{
 	ControlHandle,
@@ -41,16 +41,11 @@ use crate::bash::{
 	host::{ExtProc, OsHandle, PgroupSpec, ProcEvent},
 	ids::{Dialect, JobId, Platform, Vpid},
 	ir::{Opcode, Unit},
-	signal::{SigSet, SigTarget, Signal},
-	store::{KeyBuf, OptId, TrapKey},
+	signal::{SigTarget, Signal},
+	store::{KeyBuf, MiscKey, OptId, TrapKey},
 	term::{SetWhen, TermFlag, Termios},
 	zshopt::ZshOpt,
 };
-
-/// The action text handed to [`crate::bash::Host::set_signal_trap`] for a
-/// signal the interactive shell catches itself (any non-empty action
-/// catches; the text is not run).
-const CATCH: &[u8] = b"interactive";
 
 /// The interactive shell's process groups (zsh `mypgrp`, `origpgrp`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,9 +149,13 @@ impl JobCtl {
 	}
 }
 
-/// zsh `sigmsg`: how a signal is named in job notices.
-pub const fn sigmsg(sig: Signal) -> &'static str {
+/// zsh `sigmsg`: how a signal is named in job notices on `platform`. The
+/// text is that of the name zsh's build gave the signal's number
+/// ([`Signal::zsh_name`]): on Linux 29 is `POLL` (`pollable event
+/// occurred`), and 6 is `ABRT` (`abort`), as in zsh after 5.9.
+pub const fn sigmsg(sig: Signal, platform: Platform) -> &'static str {
 	match sig {
+		Signal::Io if matches!(platform, Platform::Linux) => "pollable event occurred",
 		Signal::Hup => "hangup",
 		Signal::Int => "interrupt",
 		Signal::Quit => "quit",
@@ -226,10 +225,10 @@ pub fn format_job(vp: &Vproc, number: u32, how: JobLine, platform: Platform) -> 
 	let word: String = match job.state {
 		JobState::Running if how.conted => "continued".into(),
 		JobState::Running => "running".into(),
-		JobState::Stopped(sig) => sigmsg(sig).into(),
+		JobState::Stopped(sig) => sigmsg(sig, platform).into(),
 		JobState::Done(0) => "done".into(),
 		JobState::Done(status) => match death_signal(status, platform) {
-			Some(sig) => sigmsg(sig).into(),
+			Some(sig) => sigmsg(sig, platform).into(),
 			None => format!("exit {status:<4}"),
 		},
 	};
@@ -387,7 +386,8 @@ pub fn init_io(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	k.jobctl.fg = Some(vp.vpid);
 	// zsh `init_signals`: an interactive zsh starts every signal at its
 	// default, so what was ignored on entry is not passed on to its
-	// commands (except `QUIT`, which it records as ignored).
+	// commands (except `QUIT`, which it records as ignored), and its own
+	// handlers decide what an untrapped signal does ([`untrapped`]).
 	if vp.mode.dialect() == Dialect::Zsh {
 		for sig in cx.host.ignored_signals().iter() {
 			if sig != Signal::Quit {
@@ -395,6 +395,8 @@ pub fn init_io(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 					.set_record(cx.store, KeyBuf::Trap(TrapKey::Signal(sig)), None);
 			}
 		}
+		k.root
+			.set_record(cx.store, KeyBuf::Misc(MiscKey::HeldIgnored), None);
 	}
 	open_shtty(k, cx);
 	let monitor = state::option(&mut k.root, cx.store, vp, OptId::Monitor).unwrap_or(false);
@@ -404,11 +406,11 @@ pub fn init_io(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	{
 		k.fail(err);
 	}
-	for sig in [Signal::Int, Signal::Winch, Signal::Alrm] {
-		let _ = cx.host.set_signal_trap(sig, Some(BStr::new(CATCH)));
-	}
-	for sig in held_ignored(k).iter() {
-		let _ = cx.host.set_signal_trap(sig, Some(BStr::new(b"")));
+	// Its own catches and ignores ([`catches`], [`ignores`]), asked for
+	// through the one rule ([`rule::reinstall_these`]).
+	let own = CAUGHT.into_iter().chain(IGNORED).chain(STOPS);
+	if let Err(err) = rule::reinstall_these(k, cx, vp, own) {
+		k.fail(err);
 	}
 }
 
@@ -428,15 +430,27 @@ fn open_shtty(k: &mut Kernel, cx: &mut Cx<'_>) {
 	}
 }
 
-/// The signals the interactive shell ignores itself (zsh `init_signals`):
-/// `QUIT` and `TERM`, and the terminal stop signals while it does job
-/// control.
-const fn held_ignored(k: &Kernel) -> SigSet {
-	let mut set = SigSet::EMPTY.with(Signal::Quit).with(Signal::Term);
-	if k.jobctl.pgrp.is_some() {
-		set = set.with(Signal::Tstp).with(Signal::Ttin).with(Signal::Ttou);
-	}
-	set
+/// The signals the interactive root catches for its own handlers.
+const CAUGHT: [Signal; 3] = [Signal::Int, Signal::Winch, Signal::Alrm];
+
+/// The signals the interactive root ignores.
+const IGNORED: [Signal; 2] = [Signal::Quit, Signal::Term];
+
+/// The terminal stop signals a shell doing job control ignores.
+const STOPS: [Signal; 3] = [Signal::Tstp, Signal::Ttin, Signal::Ttou];
+
+/// Whether the root catches `sig` for its interactive handler
+/// ([`untrapped`]): [`CAUGHT`], interactive only.
+pub fn catches(k: &Kernel, sig: Signal) -> bool {
+	k.jobctl.interactive && CAUGHT.contains(&sig)
+}
+
+/// Whether the root ignores `sig` itself (zsh `init_signals`,
+/// `acquire_pgrp`): [`IGNORED`] when interactive, and [`STOPS`] while it
+/// does job control.
+pub fn ignores(k: &Kernel, sig: Signal) -> bool {
+	(k.jobctl.interactive && IGNORED.contains(&sig))
+		|| (k.jobctl.pgrp.is_some() && STOPS.contains(&sig))
 }
 
 /// zsh `acquire_pgrp`: wait until the shell's group owns the terminal (a
@@ -516,26 +530,13 @@ pub fn enable_monitor(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 		k.jobctl.root = Some(vp.vpid);
 		k.jobctl.fg = Some(vp.vpid);
 	}
-	if k.jobctl.pgrp.is_none() && acquire(k, cx) {
-		for sig in [Signal::Tstp, Signal::Ttin, Signal::Ttou] {
-			let _ = cx.host.set_signal_trap(sig, Some(BStr::new(b"")));
-		}
+	if k.jobctl.pgrp.is_none()
+		&& acquire(k, cx)
+		&& let Err(err) = rule::reinstall_these(k, cx, vp, STOPS.into_iter())
+	{
+		k.fail(err);
 	}
 	true
-}
-
-/// The OS disposition the root shell asks for when its trap for `sig`
-/// changes to `action` (`None`: removed): an interactive shell keeps its
-/// own (`INT`, `WINCH`, `ALRM` caught; `QUIT`, `TERM` and, with job
-/// control, `TSTP`/`TTIN`/`TTOU` ignored) instead of the entry disposition.
-pub fn trap_disposition<'a>(k: &Kernel, sig: Signal, action: Option<&'a BStr>) -> Option<&'a BStr> {
-	if action.is_some() || !k.jobctl.interactive {
-		return action;
-	}
-	if matches!(sig, Signal::Int | Signal::Winch | Signal::Alrm) {
-		return Some(BStr::new(CATCH));
-	}
-	held_ignored(k).contains(sig).then(|| BStr::new(b""))
 }
 
 /// The interactive root got `sig` with no trap set: what zsh's handler
@@ -1127,7 +1128,8 @@ pub fn fg_done(
 		Some(Signal::Int) => notice(k, vp, b"\n"),
 		Some(Signal::Pipe) | None => {},
 		Some(sig) => {
-			let line = format!("zsh: {:<w$}", sigmsg(sig), w = sigmsg(sig).len().max(9) + 2);
+			let msg = sigmsg(sig, k.engine.config().platform);
+			let line = format!("zsh: {msg:<w$}", w = msg.len().max(9) + 2);
 			let mut line = line.into_bytes();
 			line.extend_from_slice(text);
 			line.push(b'\n');
@@ -1227,10 +1229,17 @@ fn settle_report(vp: &mut Vproc, number: u32) {
 
 /// zsh `deletejob` after a report: the current job falls back to the
 /// previous one (`curjob = prevjob; prevjob = job`, then `setprevjob`);
-/// bash `cleanup_dead_jobs`.
+/// bash `cleanup_dead_jobs`, which deletes none while no job may be deleted
+/// (the job stays, reported: [`Vproc::jobs_kept`]).
 fn forget(vp: &mut Vproc, number: u32) {
 	if vp.mode.dialect() != Dialect::Zsh {
-		vp.jobs.remove(number);
+		if vp.jobs_kept() {
+			if let Some(job) = vp.jobs.get_mut(number) {
+				job.notified = true;
+			}
+		} else {
+			vp.jobs.remove(number);
+		}
 		return;
 	}
 	let Some(i) = vp.jobs.list.iter().position(|j| j.number == number) else {
@@ -1404,14 +1413,17 @@ pub fn check_before_exit(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> boo
 /// zsh `bin_suspend` in a shell doing job control: stop ignoring the
 /// terminal stop signals, give the terminal back to the group the shell
 /// came from (`release_pgrp`), stop with `SIGTSTP` to that group, and when
-/// continued take the terminal over again (`acquire_pgrp`). `false` without
-/// job control (the caller stops the shell as a plain process).
-pub fn suspend_shell(k: &mut Kernel, cx: &mut Cx<'_>) -> bool {
+/// continued take the terminal over again (`acquire_pgrp`), the stop
+/// signals asked for again through the one rule ([`rule::reinstall_these`]).
+/// `false` without job control (the caller stops the shell as a plain
+/// process).
+pub fn suspend_shell(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	let Some(pgrp) = k.jobctl.pgrp else {
 		return false;
 	};
-	let stops = [Signal::Ttin, Signal::Tstp, Signal::Ttou];
-	for sig in stops {
+	// zsh `signal_default` of each, trapped or not, so that the stop below
+	// stops the shell: the rule's disposition does not apply here.
+	for sig in STOPS {
 		let _ = cx.host.set_signal_trap(sig, None);
 	}
 	if pgrp.orig != pgrp.mine
@@ -1424,10 +1436,10 @@ pub fn suspend_shell(k: &mut Kernel, cx: &mut Cx<'_>) -> bool {
 	}
 	let _ = cx.host.signal_process(-pgrp.orig, Some(Signal::Tstp));
 	k.jobctl.pgrp = None;
-	if acquire(k, cx) {
-		for sig in stops {
-			let _ = cx.host.set_signal_trap(sig, Some(BStr::new(b"")));
-		}
+	if acquire(k, cx)
+		&& let Err(err) = rule::reinstall_these(k, cx, vp, STOPS.into_iter())
+	{
+		k.fail(err);
 	}
 	true
 }
@@ -1678,8 +1690,9 @@ impl Shell {
 		// A continue queued behind those notices (zsh `bg` as the shell's
 		// last command) was requested on the control word, which no step
 		// applies any more: it reaches its job here.
-		for (target, sig) in self.k.ctl.take_signals() {
-			self.deliver(cx, target, sig);
+		let (signals, first) = self.k.ctl.take_signals();
+		for (n, (target, sig)) in (first..).zip(signals) {
+			self.deliver(cx, target, sig, n);
 		}
 		let Some(pgrp) = self.k.jobctl.pgrp else {
 			return;
@@ -2739,5 +2752,23 @@ mod tests {
 				assert_eq!(read_terminal(&mut master, want.len()), want);
 			},
 		);
+	}
+}
+
+#[cfg(test)]
+mod signal_messages {
+	use super::{Platform, Signal, sigmsg};
+
+	/// zsh's `sig_msg` texts, which follow its build's name for the number
+	/// (`Src/signames2.awk`): on Linux 29 is `POLL`, and 6 `ABRT` as in zsh
+	/// after 5.9 (zsh 5.9 against glibc 2.32 or later says `IOT
+	/// instruction`).
+	#[test]
+	fn job_messages_follow_zshs_names_on_each_platform() {
+		assert_eq!(sigmsg(Signal::Abrt, Platform::Linux), "abort");
+		assert_eq!(sigmsg(Signal::Io, Platform::Linux), "pollable event occurred");
+		assert_eq!(sigmsg(Signal::Abrt, Platform::MacOs), "abort");
+		assert_eq!(sigmsg(Signal::Io, Platform::MacOs), "i/o ready");
+		assert_eq!(sigmsg(Signal::Kill, Platform::Linux), "killed");
 	}
 }

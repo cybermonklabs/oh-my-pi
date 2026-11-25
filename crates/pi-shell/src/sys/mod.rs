@@ -52,6 +52,7 @@ pub mod shebang;
 #[cfg(unix)]
 pub mod socket;
 mod spawn;
+pub mod thread;
 pub mod tty;
 pub mod uname;
 pub mod user;
