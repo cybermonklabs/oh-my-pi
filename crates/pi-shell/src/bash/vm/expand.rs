@@ -2984,10 +2984,13 @@ fn hash_table(
 }
 
 /// bash's dynamic variables, computed on every read (`line` is `$LINENO`);
-/// `None` for any other name, and for a value cell `unset` removed (a plain
-/// variable from then on, [`Kernel::cell_plain`]). A value-cell variable
-/// keeps what was computed as its value, which `declare -p` and `set` list
-/// ([`dynvars::keep_cell`]).
+/// `None` for any other name; for a value cell `unset` removed (a plain
+/// variable from then on, [`Kernel::cell_plain`]); and for a value cell a
+/// visible local or temporary of the name hides, which is that one's plain
+/// variable (`make_local_variable` and `assign_in_env` copy no value
+/// function), as for `RANDOM` and `SECONDS` ([`dynvars::visible`]). A
+/// value-cell variable keeps what was computed as its value, which
+/// `declare -p` and `set` list ([`dynvars::keep_cell`]).
 fn dynamic_value(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -2996,7 +2999,11 @@ fn dynamic_value(
 	name: &[u8],
 ) -> Result<Option<DynVal>, StoreError> {
 	if vp.mode.dialect() == crate::bash::ids::Dialect::Bash
-		&& dynvars::cell_index(name).is_some_and(|i| k.cell_plain(vp, i))
+		&& let Some(i) = dynvars::cell_index(name)
+		&& (k.cell_plain(vp, i)
+			|| state::lookup_declared_scoped(&k.root, cx.store, vp, name)?
+				.1
+				.is_some())
 	{
 		return Ok(None);
 	}

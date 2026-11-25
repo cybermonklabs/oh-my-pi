@@ -219,7 +219,15 @@ pub fn keep_cell(
 	}
 	let unset = matches!(&value, VarValue::Assoc(a) if a.is_empty());
 	let var = state::global_in(store, vp, name)?;
+	// bash's value functions for `SRANDOM` and `BASHPID` set the integer
+	// attribute again each time they run, so a lookup after `declare +i
+	// SRANDOM` lists `declare -i SRANDOM` again.
 	let attrs = var.map_or(base, |v| v.attrs);
+	let attrs = if base.contains(Attrs::INTEGER) {
+		attrs.with(Attrs::INTEGER)
+	} else {
+		attrs
+	};
 	let attrs = if unset {
 		attrs.with(Attrs::INVISIBLE)
 	} else {

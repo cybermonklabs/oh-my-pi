@@ -1132,17 +1132,49 @@ fn dynamic_variables_keep_their_value_cells() {
 			"declare -i SRANDOM=<v>\nend\nSRANDOM=<v>\nend\n",
 		),
 		// A declaration before the first lookup keeps the cell's own
-		// attributes, as bash's record has them from its startup, and takes
-		// them off when it is told to.
+		// attributes, as bash's record has them from its startup.
 		(
 			"SRANDOM",
 			"readonly SRANDOM; : \"$SRANDOM\"; declare -p | show",
 			"declare -ir SRANDOM=<v>\nend\n",
 		),
+		// `declare +i` takes the integer attribute off, but bash's value
+		// functions for SRANDOM and BASHPID set it again on every lookup:
+		// after a read the record is `-i` again, and only a listing with no
+		// lookup between shows it off.
 		(
 			"SRANDOM",
 			"declare +i SRANDOM; : \"$SRANDOM\"; declare -p | show",
-			"declare -- SRANDOM=<v>\nend\n",
+			"declare -i SRANDOM=<v>\nend\n",
+		),
+		("SRANDOM", "declare +i SRANDOM; declare -p | show", "declare -- SRANDOM=<v>\nend\n"),
+		("SRANDOM", "declare +i SRANDOM; declare -p SRANDOM | show", "declare -i SRANDOM=<v>\nend\n"),
+		(
+			"BASHPID",
+			"declare +i BASHPID; x=$BASHPID; declare -p BASHPID | show",
+			"declare -i BASHPID=<v>\nend\n",
+		),
+		("BASHPID", "declare +i BASHPID; declare -p | show", "declare -- BASHPID=<v>\nend\n"),
+		// A visible local or temporary of a cell name is that one's plain
+		// variable: its value is read, not the cell's, and `unset` acts on
+		// it, leaving the cell.
+		(
+			"SRANDOM",
+			"f() { local SRANDOM=5; declare -p SRANDOM; echo \"[$SRANDOM]\"; }; f",
+			"declare -- SRANDOM=\"5\"\n[5]\n",
+		),
+		("BASHPID", "f() { local BASHPID=7; echo \"[$BASHPID]\"; }; f", "[7]\n"),
+		("SRANDOM", "SRANDOM=5 eval 'echo \"[$SRANDOM]\"'", "[5]\n"),
+		(
+			"SRANDOM",
+			"f() { local SRANDOM=5; unset SRANDOM; echo \"st=$?\"; }; f; declare -p SRANDOM > \
+			 /dev/null; echo \"after st=$?\"",
+			"st=0\nafter st=0\n",
+		),
+		(
+			"SRANDOM",
+			"SRANDOM=3 eval 'unset SRANDOM'; declare -p SRANDOM > /dev/null; echo \"after st=$?\"",
+			"after st=0\n",
 		),
 		(
 			"LINENO",
