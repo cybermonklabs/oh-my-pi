@@ -72,6 +72,12 @@ export type LeaseServer = SqlSessionStorageAdapter | "mariadb";
 /** The backends whose claim is a lease row with a heartbeat. */
 export const ROW_LEASE_BACKENDS = LEASE_BACKENDS.filter(backend => backend.adapter !== "sqlite");
 
+/**
+ * Lease timings under which no heartbeat runs during a test: a lease row the
+ * test changes or ages stays as the test left it.
+ */
+export const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
+
 /** Milliseconds since the epoch on the database clock, as the store writes lease times. */
 const DB_NOW: Record<SqlSessionStorageAdapter, string> = {
 	postgres: "(extract(epoch from clock_timestamp()) * 1000)::bigint",
@@ -240,6 +246,22 @@ export function transcript(id: string, text: string, cwd = "/project"): string {
 	]
 		.map(entry => JSON.stringify(entry))
 		.join("\n")}\n`;
+}
+
+/** A user message, as `SessionManager.appendMessage` takes it. */
+export function userTurn(content: string) {
+	return { role: "user" as const, content, timestamp: Date.now() };
+}
+
+/** As an older build, which claims nothing, does: append the user turn `text`, with id `id`, to the session at `file`. */
+export async function appendAsOlderBuild(db: LeaseDb, file: string, id: string, text: string): Promise<void> {
+	const older = await db.open({ claims: false });
+	const writer = older.openWriter(file);
+	await writer.append(
+		`${JSON.stringify({ type: "message", id, parentId: null, timestamp: "2026-11-17T00:00:09.000Z", message: userTurn(text) })}\n`,
+	);
+	await writer.close();
+	await older.drain();
 }
 
 /**

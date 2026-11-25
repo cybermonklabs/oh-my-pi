@@ -51,7 +51,7 @@ const READ_WINDOW_BYTES = 1024 * 1024;
 // Every script that writes a session's mtime keeps its write generation, the
 // value `<token> <mtime>` under its path in the generation hash: a full write
 // or a move gives it the new token its caller passes, an append or a title
-// update keeps the token (see KEPT_GENERATION), and a delete removes it. A
+// update keeps the token (see HELD_TOKEN), and a delete removes it. A
 // chunked read compares the generation at each window (READ_WINDOW_SCRIPT).
 const WRITE_FULL_SCRIPT = `-- OMP_WRITE_FULL
 local expected = ARGV[6]
@@ -165,12 +165,15 @@ if ARGV[2] ~= "" then
 end
 return {redis.call("STRLEN", KEYS[1]), text}`;
 
+/** The generation a window returns for a session with no token (see `READ_WINDOW_SCRIPT`): an earlier version wrote it last. */
+export const UNVERSIONED = "?";
+
 // One window of a chunked read: the key's size, the session's generation, and
 // from byte ARGV[1] at most ARGV[2] bytes, up to ARGV[3], the size the read's
 // first window saw ("" for the first window, which reads up to the size it
 // finds). KEYS[2] is the meta hash, KEYS[3] the generation hash and ARGV[4]
 // the session's path in both. The generation is its held token (see
-// `HELD_TOKEN`), and "?" when it holds none (a write that keeps no
+// `HELD_TOKEN`), and `UNVERSIONED` when it holds none (a write that keeps no
 // generation, an earlier version's, came after the last one that did):
 // every write moves the mtime or the token, except an append or a title
 // update made while the token holds, and an earlier version's write that
@@ -204,7 +207,7 @@ if ARGV[3] ~= "" then
 		return {size}
 	end
 end
-local generation = held_token(KEYS[2], KEYS[3], ARGV[4]) or "?"
+local generation = held_token(KEYS[2], KEYS[3], ARGV[4]) or "${UNVERSIONED}"
 -- The continuation bytes (10xxxxxx), at most three and none before byte
 -- floor, that run back from byte at to the byte that begins their character;
 -- 0 when byte at begins one, or when no such byte is found.
@@ -237,7 +240,7 @@ if last + 1 < stop then
 end
 local text = redis.call("GETRANGE", KEYS[1], start, last)
 local digest = ""
-if generation == "?" then
+if generation == "${UNVERSIONED}" then
 	digest = redis.sha1hex(text)
 end
 return {size, generation, string.len(text), digest, text, first - start}`;
@@ -354,9 +357,6 @@ function sizeConflict(path: string, expectedSize: number | null, actual: number)
 function writeReply(result: unknown): [status: number, size: number] {
 	return Array.isArray(result) ? [Number(result[0]), Number(result[1])] : [Number.NaN, Number.NaN];
 }
-
-/** The generation a window returns for a session with no token (see `READ_WINDOW_SCRIPT`): an earlier version wrote it last. */
-const UNVERSIONED = "?";
 
 /**
  * Redis-backed implementation of {@link SessionStorage}. Each session JSONL
@@ -513,7 +513,7 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 				const size = Number(reply[0]);
 				const generation = String(reply[1]);
 				if (first === undefined) first = { stop: size, generation };
-				// Without a token at either window both read "?", and the check at the read's end decides.
+				// Without a token at either window both read `UNVERSIONED`, and the check at the read's end decides.
 				else if (size < first.stop || generation !== first.generation) throw new SessionReadConflictError(path);
 				const length = Number(reply[2]);
 				if (length === 0) return;

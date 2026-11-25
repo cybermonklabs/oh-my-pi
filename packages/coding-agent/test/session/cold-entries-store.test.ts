@@ -24,7 +24,6 @@ import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-st
 import {
 	getBlobsDir,
 	getConfigRootDir,
-	isRecord,
 	logger,
 	setAgentDir,
 	stringifyJsonIteratively,
@@ -32,6 +31,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { coldDirIn, withoutAccountId } from "../helpers/account-id";
 import { HAS_PROC_FD } from "../helpers/open-descriptors";
+import { DEEP_LEVELS, nestedChain, nestingOf } from "../../../ai/test/helpers/deep-nesting";
 
 /** Larger than any value a cold entry keeps in memory. */
 const BODY = "x".repeat(4096);
@@ -110,29 +110,8 @@ function writeSession(dir: string, runtime?: RuntimeIdentity): Promise<string> {
 	return writeTranscript(dir, runtime ? records.map(record => ({ ...record, runtime })) : records);
 }
 
-/** Levels past what `JSON.stringify` recurses (Bun's stops near 40,000) and a recursive walk; `JSON.parse` reads 400,000. */
-const DEEP_LEVELS = 50_000;
-
-/** `{ next: … }` nested {@link DEEP_LEVELS} levels around `bottom`. */
-function deepDetails(bottom: Record<string, unknown> = { leaf: "bottom" }): unknown {
-	let node: unknown = bottom;
-	for (let level = 0; level < DEEP_LEVELS; level++) node = { next: node };
-	return node;
-}
-
 /** Raw subprocess events a tool kept; a written line leaves them out. */
 const JSONL_EVENTS = [{ type: "stdout", text: "event" }];
-
-/** How many `next` levels `value` nests, and the value at the bottom. */
-function nestingOf(value: unknown): { levels: number; bottom: unknown } {
-	let levels = 0;
-	let node = value;
-	while (isRecord(node) && "next" in node) {
-		node = node.next;
-		levels++;
-	}
-	return { levels, bottom: node };
-}
 
 /**
  * A session whose tool result `r1` has `details` nested {@link DEEP_LEVELS}
@@ -167,7 +146,7 @@ function writeDeepSession(
 				toolCallId: "call-1",
 				toolName: "inspect",
 				content: [{ type: "text", text: `r1 ${BODY}` }],
-				details: deepDetails({ ...bottom, ...events }),
+				details: nestedChain({ ...bottom, ...events }),
 				isError: false,
 				timestamp: 2,
 				...events,
@@ -593,7 +572,7 @@ describe("cold entry store", () => {
 				toolCallId: "call-1",
 				toolName: "inspect",
 				content: [{ type: "text", text: "r1" }],
-				details: deepDetails({ leaf: 123n }),
+				details: nestedChain({ leaf: 123n }),
 				isError: false,
 				timestamp: 2,
 			},
@@ -617,7 +596,7 @@ describe("cold entry store", () => {
 				toolCallId: "call-1",
 				toolName: "inspect",
 				content: [{ type: "text", text: "r1" }],
-				details: deepDetails({ content: [{ type: "image", data: image, mimeType: "image/png" }] }),
+				details: nestedChain({ content: [{ type: "image", data: image, mimeType: "image/png" }] }),
 				isError: false,
 				timestamp: 2,
 			},
@@ -641,7 +620,7 @@ describe("cold entry store", () => {
 
 	it("resumes entries carrying a runtime nested deeper than JSON.stringify recurses, and reads it back", async () => {
 		using dir = TempDir.createSync("@omp-cold-entries-");
-		const runtime = deepDetails();
+		const runtime = nestedChain();
 		const file = await writeTranscript(dir.path(), [
 			{ type: "message", id: "u1", message: { role: "user", content: `u1 ${BODY}`, timestamp: 1 }, runtime },
 			{ type: "message", id: "a1", message: assistant(`a1 ${BODY}`), runtime },
@@ -831,7 +810,7 @@ describe("cold entry store", () => {
 			toolCallId: "call-1",
 			toolName: "inspect",
 			content: [{ type: "text", text: "r1" }],
-			details: deepDetails(),
+			details: nestedChain(),
 			isError: false,
 			timestamp: 2,
 		});

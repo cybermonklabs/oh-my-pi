@@ -32,6 +32,7 @@ import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { removeWithRetries, TempDir } from "@oh-my-pi/pi-utils";
 
 import { cfgCompactionExperimentalContextManagement } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import { nestedChainJson } from "../../../ai/test/helpers/deep-nesting";
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "history-protocol-"));
@@ -343,8 +344,7 @@ describe("history:// protocol", () => {
 
 	// A branch's entries nest as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000.
 	it("renders entries nested deeper than JSON.stringify recurses, without indentation", async () => {
-		const levels = 50_000;
-		const deepText = `${'{"next":'.repeat(levels)}{"leaf":"bottom"}${"}".repeat(levels)}`;
+		const deepText = nestedChainJson();
 		const timestamp = new Date(0).toISOString();
 		const branch = [
 			{

@@ -35,6 +35,7 @@ import {
 	ROW_LEASE_BACKENDS,
 	rejection,
 	reserveWrapped,
+	STILL,
 	TcpProxy,
 	transcript,
 	until,
@@ -48,8 +49,6 @@ const ID = "01a1f000-0000-7000-8000-000000000001";
 const OTHER_ID = "01a1f000-0000-7000-8000-000000000002";
 /** Short timings so a test sees a heartbeat and an expiry in seconds. */
 const SHORT = { expiryMs: 3000, heartbeatMs: 500 };
-/** Timings under which a test's own changes to a lease row are never refreshed away by a heartbeat. */
-const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 /** How far past its wait a claim behind a stalled lock may answer: the lock bound and a little room. */
 const LOCK_SLACK_MS = 3500;
 

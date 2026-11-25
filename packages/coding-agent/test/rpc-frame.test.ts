@@ -9,6 +9,7 @@ import {
 } from "../src/modes/rpc/rpc-frame";
 import type { SessionTreeNode } from "../src/session/session-entries";
 import { SessionManager } from "../src/session/session-manager";
+import { DEEP_LEVELS, nestedChain, nestingOf } from "../../ai/test/helpers/deep-nesting";
 
 function decode(frame: string): Record<string, unknown> {
 	return JSON.parse(frame) as Record<string, unknown>;
@@ -220,6 +221,20 @@ describe("RPC frame encoding", () => {
 		expect(encoded).toContain("rpcFrameElidedKeys");
 	});
 
+	// A tool call's arguments come from JSON.parse, which makes `__proto__` an own key; a shrunk frame
+	// that drops it shows the client the arguments without one the model sent.
+	it("keeps a tool call argument's own __proto__ key when it shrinks the frame", () => {
+		const text = "x".repeat(2 * MAX_RPC_FRAME_BYTES);
+		const args: unknown = JSON.parse(`{"__proto__":{"a":1},"text":${JSON.stringify(text)}}`);
+		const encoded = encodeRpcFrame({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "write", args });
+		const decoded = decode(encoded).args as Record<string, unknown>;
+
+		expect(Buffer.byteLength(encoded, "utf8")).toBeLessThanOrEqual(MAX_RPC_FRAME_BYTES);
+		expect(String(decoded.text)).toContain("chars elided for RPC frame");
+		expect(Object.hasOwn(decoded, "__proto__")).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(decoded, "__proto__")?.value).toEqual({ a: 1 });
+	});
+
 	it("fails oversized responses instead of returning partial success data", () => {
 		const encoded = encodeRpcFrame({
 			id: "request-2",
@@ -400,31 +415,19 @@ describe("RPC frame encoding", () => {
 	// A tool returns any JSON and its result rides an event frame as deep as a transcript line holds; a frame
 	// over 1 MiB is shrunk, and an `agent_end` over it drops the messages already streamed.
 	describe("a frame over 1 MiB holding a value nested 50,000 levels", () => {
-		const nested = (leaf: string): Record<string, unknown> => {
-			let node: Record<string, unknown> = { leaf };
-			for (let level = 0; level < 50_000; level++) node = { next: node };
-			return node;
-		};
-		const levelsOf = (value: unknown): number => {
-			let levels = 0;
-			for (let node = value; typeof node === "object" && node !== null && "next" in node; node = node.next) levels++;
-			return levels;
-		};
 		const big = "z".repeat(2 * MAX_RPC_FRAME_BYTES);
 
 		it("shrinks the frame's strings and keeps the nested value", () => {
-			const frame = decode(
-				encodeRpcFrame({ type: "tool_execution_end", result: { details: nested("bottom"), big } }),
-			);
+			const frame = decode(encodeRpcFrame({ type: "tool_execution_end", result: { details: nestedChain(), big } }));
 			const result = frame.result as Record<string, unknown>;
-			expect(levelsOf(result.details)).toBe(50_000);
+			expect(nestingOf(result.details).levels).toBe(DEEP_LEVELS);
 			expect(String(result.big).length).toBeLessThan(big.length);
 		}, 60_000);
 
 		it("drops the streamed message from an agent_end", () => {
-			const message = { role: "toolResult", details: nested("bottom") };
+			const message = { role: "toolResult", details: nestedChain() };
 			const streamed = JSON.parse(JSON.stringify({ role: "toolResult", details: { leaf: "stand-in" } }));
-			streamed.details = nested("bottom");
+			streamed.details = nestedChain();
 			const frame = decode(
 				encodeRpcFrame({ type: "agent_end", messages: [message, { role: "user", content: big }] }, 0, [streamed]),
 			);

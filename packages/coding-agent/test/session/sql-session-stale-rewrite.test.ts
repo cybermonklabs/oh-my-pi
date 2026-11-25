@@ -24,7 +24,7 @@ import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-se
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { byteSize, Longest, recordClient, recordStorage } from "../helpers/longest-value";
 import { mockSchedulerWaitWithClock } from "../helpers/mock-scheduler-clock";
-import { LEASE_BACKENDS, type LeaseDb, openLeaseDb } from "./sql-session-lease-fixture";
+import { appendAsOlderBuild, LEASE_BACKENDS, type LeaseDb, openLeaseDb, STILL } from "./sql-session-lease-fixture";
 
 const ID = "01a1f100-0000-7000-8000-0000000000c5";
 const MiB = 1024 * 1024;
@@ -34,8 +34,6 @@ const BOUND = 16 * MiB;
 const TRANSCRIPT_BYTES = 64 * MiB;
 const CONFLICTS = 3;
 const TIMESTAMP = "2026-11-24T00:00:00.000Z";
-/** Timings under which no heartbeat runs during a test. */
-const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 /** The refusal an over-quota gateway answered the turn with, as the live log shows it. */
 const RATE_LIMITED =
 	'429 {"type":"error","error":{"type":"rate_limit_error","message":"rate_limit_error: the team is held back; retry after 1 s"}}';
@@ -47,10 +45,6 @@ const USAGE = {
 	totalTokens: 2,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
-
-function userTurn(content: string) {
-	return { role: "user" as const, content, timestamp: Date.now() };
-}
 
 /**
  * Store, as an older build that claims nothing writes it, a transcript of
@@ -91,17 +85,6 @@ async function storeLongTranscript(db: LeaseDb, file: string): Promise<void> {
 		batch = "";
 	}
 	if (batch) await writer.append(batch);
-	await writer.close();
-	await older.drain();
-}
-
-/** As an older build, which claims nothing, does: append a turn with id `id` to the stored transcript at `file`. */
-async function appendAsOlderBuild(db: LeaseDb, file: string, id: string): Promise<void> {
-	const older = await db.open({ claims: false });
-	const writer = older.openWriter(file);
-	await writer.append(
-		`${JSON.stringify({ type: "message", id, parentId: null, timestamp: TIMESTAMP, message: userTurn(`the older build's turn ${id}`) })}\n`,
-	);
 	await writer.close();
 	await older.drain();
 }
@@ -225,7 +208,8 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			});
 			const outcomes: string[] = [];
 			for (let conflict = 0; conflict < CONFLICTS; conflict++) {
-				await appendAsOlderBuild(db, file, `older${conflict}`);
+				const id = `older${conflict}`;
+				await appendAsOlderBuild(db, file, id, `the older build's turn ${id}`);
 				// The session's next write after the older build's append: no append of the session's comes before it.
 				outcomes.push(
 					await manager.rewriteEntries().then(

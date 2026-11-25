@@ -35,6 +35,7 @@ import type {
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import {
+	appendAsOlderBuild,
 	type GatedClient,
 	gatedClient,
 	LEASE_BACKENDS,
@@ -43,9 +44,11 @@ import {
 	openLeaseDb,
 	ROW_LEASE_BACKENDS,
 	reserveWrapped,
+	STILL,
 	TcpProxy,
 	transcript,
 	until,
+	userTurn,
 } from "./sql-session-lease-fixture";
 
 // These tests wait in real time on purpose: a lease expires and a heartbeat
@@ -55,15 +58,9 @@ import {
 const ID = "01a1f100-0000-7000-8000-000000000001";
 /** Short timings: a heartbeat every half second, an expiry in three. */
 const SHORT = { expiryMs: 3000, heartbeatMs: 500 };
-/** Timings under which no heartbeat runs during a test. */
-const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 
 function sessionFile(db: LeaseDb): string {
 	return path.join(db.dir.path(), "sessions", "-project-", `2026-11-17T00-00-00-000Z_${ID}.jsonl`);
-}
-
-function userTurn(content: string) {
-	return { role: "user" as const, content, timestamp: Date.now() };
 }
 
 /** Open the session at `file` in `storage` as a resume does, claiming it, and collect its notices. */
@@ -76,17 +73,6 @@ async function resume(
 	manager.onPersistenceNotice(notice => notices.push(notice));
 	await manager.claimOpenedSession();
 	return { manager, notices };
-}
-
-/** As an older build, which claims nothing, does: append a turn with id `id` to the session at `file`. */
-async function appendAsOlderBuild(db: LeaseDb, file: string, id: string, text: string): Promise<void> {
-	const older = await db.open({ claims: false });
-	const writer = older.openWriter(file);
-	await writer.append(
-		`${JSON.stringify({ type: "message", id, parentId: null, timestamp: "2026-11-17T00:00:09.000Z", message: userTurn(text) })}\n`,
-	);
-	await writer.close();
-	await older.drain();
 }
 
 /** A size-checked full write of a session: the size it stated, and, when the store refused it, the size the store held. */

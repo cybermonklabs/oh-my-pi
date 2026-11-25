@@ -162,9 +162,12 @@ function shrinkString(value: string, cap: number): string {
  * result, as deep as a transcript line holds.
  */
 function shrinkValue(value: unknown, pass: ShrinkPass): unknown {
-	return Array.isArray(value) || isRecord(value)
-		? runNested(shrunkNode(value, pass, new ContainerPath()))
-		: shrunkLeaf(value, pass);
+	return isShrinkWalked(value) ? runNested(shrunkNode(value, pass, new ContainerPath())) : shrunkLeaf(value, pass);
+}
+
+/** Whether {@link shrinkValue} walks into `value`: an array or a record. */
+function isShrinkWalked(value: unknown): value is unknown[] | Record<string, unknown> {
+	return Array.isArray(value) || isRecord(value);
 }
 
 /** {@link shrinkValue} of `value`, no array or record: a string past the pass's cap shortened, anything else as it is. */
@@ -181,8 +184,7 @@ function* shrunkNode(value: object, pass: ShrinkPass, path: ContainerPath): Nest
 		const output: unknown[] = new Array(keep + (keep < value.length ? 1 : 0));
 		for (let index = 0; index < keep; index++) {
 			const item: unknown = value[index];
-			output[index] =
-				Array.isArray(item) || isRecord(item) ? yield shrunkNode(item, pass, path) : shrunkLeaf(item, pass);
+			output[index] = isShrinkWalked(item) ? yield shrunkNode(item, pass, path) : shrunkLeaf(item, pass);
 		}
 		if (keep < value.length) output[keep] = `…[${value.length - keep} items elided for RPC frame]`;
 		path.leave(value);
@@ -193,7 +195,14 @@ function* shrunkNode(value: object, pass: ShrinkPass, path: ContainerPath): Nest
 	const output: Record<string, unknown> = {};
 	for (let index = 0; index < keep; index++) {
 		const [key, item] = entries[index];
-		output[key] = Array.isArray(item) || isRecord(item) ? yield shrunkNode(item, pass, path) : shrunkLeaf(item, pass);
+		const child = isShrinkWalked(item) ? yield shrunkNode(item, pass, path) : shrunkLeaf(item, pass);
+		// Assigning `__proto__` would swap the copy's prototype instead of
+		// creating the own data property JSON.parse produces.
+		if (key === "__proto__") {
+			Object.defineProperty(output, key, { value: child, enumerable: true, writable: true, configurable: true });
+		} else {
+			output[key] = child;
+		}
 	}
 	if (keep < entries.length) output.rpcFrameElidedKeys = entries.length - keep;
 	path.leave(value);

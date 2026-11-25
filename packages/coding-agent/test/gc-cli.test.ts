@@ -39,6 +39,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { runCli } from "../src/cli";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
+import { DEEP_LEVELS, nestedChainJson, nestingOf } from "../../ai/test/helpers/deep-nesting";
 
 let root: string;
 let writes: string[] = [];
@@ -3114,8 +3115,7 @@ describe("runGcCommand replay data stripping", () => {
 
 	// A line holds JSON as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000.
 	test("strips a turn whose tool call's arguments nest deeper than JSON.stringify recurses", async () => {
-		const levels = 50_000;
-		const deepArguments = `${'{"next":'.repeat(levels)}{"leaf":"bottom"}${"}".repeat(levels)}`;
+		const deepArguments = nestedChainJson();
 		const id = Bun.randomUUIDv7();
 		const file = path.join(getSessionsDir(root), "project", `${id}.jsonl`);
 		const lines = [
@@ -3142,12 +3142,6 @@ describe("runGcCommand replay data stripping", () => {
 		const [thinking, call] = JSON.parse(after[1]).message.content;
 		expect(thinking).toEqual({ type: "thinking", thinking: "earlier" });
 		expect(call.thoughtSignature).toBeUndefined();
-		let nested = call.arguments;
-		let depth = 0;
-		while (nested.next !== undefined) {
-			nested = nested.next;
-			depth++;
-		}
-		expect({ depth, nested }).toEqual({ depth: levels, nested: { leaf: "bottom" } });
+		expect(nestingOf(call.arguments)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
 	}, 20_000);
 });

@@ -40,6 +40,7 @@ import {
 	ROW_LEASE_BACKENDS,
 	rejection,
 	reserveWrapped,
+	STILL,
 	transcript,
 	until,
 } from "./sql-session-lease-fixture";
@@ -60,8 +61,6 @@ const REF_DELETE = /^DELETE FROM \S*_refs WHERE path = /;
 const BLOB_SHARE_LOCK = /^SELECT sha256 FROM \S*_blobs WHERE .* (?:FOR SHARE|LOCK IN SHARE MODE)$/;
 /** An exclusive lock on blob rows. */
 const BLOB_EXCLUSIVE_LOCK = /^SELECT sha256 FROM \S*_blobs WHERE .* FOR UPDATE$/;
-/** A lease whose heartbeat stays out of the way, so the write's fence is what finds another holder. */
-const STILL = { expiryMs: 600_000, heartbeatMs: 300_000 };
 
 function sha256(data: Buffer): string {
 	return new Bun.SHA256().update(data).digest("hex");

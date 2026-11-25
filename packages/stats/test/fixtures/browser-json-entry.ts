@@ -2,9 +2,9 @@
 // what pi-utils' JSON writer gives there for boxed primitives (which it tells apart through `node:util/types`)
 // and for a value nested past the depth `JSON.stringify` reaches.
 import { stringifyDeepJson, stringifyJsonIteratively } from "@oh-my-pi/pi-utils/json";
+import { nestedChain } from "../../../ai/test/helpers/deep-nesting";
 
-let deep: unknown = { leaf: "bottom" };
-for (let level = 0; level < 50_000; level++) deep = { next: deep };
+const deep = nestedChain();
 
 console.log(
 	JSON.stringify({

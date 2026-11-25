@@ -8,6 +8,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 
 const model = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
 
@@ -442,8 +443,7 @@ describe("one-shot side request state", () => {
 	// question's context holds the conversation, measured against `maxContextBytes`, and its history what the caller
 	// passes, which the turn copies.
 	it("measures and sends a side question whose conversation and history hold arguments nested 50,000 levels", async () => {
-		let deep: Record<string, unknown> = { leaf: "bottom" };
-		for (let level = 0; level < 50_000; level++) deep = { next: deep };
+		const deep = nestedChain({ leaf: "bottom" });
 		const usage = {
 			input: 1,
 			output: 1,

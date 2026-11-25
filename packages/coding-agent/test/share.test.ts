@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AssistantMessage, TextContent, ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
+import { DEEP_LEVELS, nestedChain, nestingOf } from "../../ai/test/helpers/deep-nesting";
 import type { SessionData } from "../src/export/html";
 import {
 	buildShareSnapshot,
@@ -66,27 +67,6 @@ function sessionData(entries: SessionEntry[], leafId: string): SessionData {
 /** Incompressible filler so gzip cannot absorb the payload. */
 function randomHex(words: number): string {
 	return Array.from(crypto.getRandomValues(new Uint32Array(words)), v => v.toString(16)).join("");
-}
-
-/** Levels past what a recursive walk reaches (about 22,000) and `JSON.stringify` (40,000); `JSON.parse` reads 400,000. */
-const DEEP_LEVELS = 50_000;
-
-/** `{ next: … }` nested {@link DEEP_LEVELS} levels around `bottom`. */
-function nested(bottom: Record<string, unknown>): Record<string, unknown> {
-	let node = bottom;
-	for (let level = 0; level < DEEP_LEVELS; level++) node = { next: node };
-	return node;
-}
-
-/** How many `next` levels `value` nests, and the object at the bottom. */
-function nesting(value: unknown): { levels: number; bottom: Record<string, unknown> } {
-	let levels = 0;
-	let node = value as Record<string, unknown>;
-	while (node.next !== undefined) {
-		node = node.next as Record<string, unknown>;
-		levels++;
-	}
-	return { levels, bottom: node };
 }
 
 describe("sealToFit", () => {
@@ -161,7 +141,7 @@ describe("sealToFit", () => {
 					{ type: "text", text },
 					{ type: "image", data: image, mimeType: "image/png" },
 				],
-				details: nested({ leaf: "bottom" }),
+				details: nestedChain({ leaf: "bottom" }),
 				isError: false,
 				timestamp: 1,
 			},
@@ -179,14 +159,14 @@ describe("sealToFit", () => {
 		expect(trimmed.endsWith("\n…[truncated for share]")).toBe(true);
 		expect(trimmed.length).toBeLessThan(text.length);
 		expect(message.content[1]).toEqual({ type: "text", text: "[image omitted from share]" });
-		expect(nesting(message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+		expect(nestingOf(message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
 		// The trim works on its own copy: the session's entry keeps its text, its image and its details.
 		const source = (entry as Extract<SessionEntry, { type: "message" }>).message as ToolResultMessage;
 		expect(source.content).toEqual([
 			{ type: "text", text },
 			{ type: "image", data: image, mimeType: "image/png" },
 		]);
-		expect(nesting(source.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+		expect(nestingOf(source.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
 	}, 20_000);
 });
 
@@ -802,7 +782,9 @@ describe("buildShareSnapshot", () => {
 				timestamp: "2026-06-12T00:00:00.000Z",
 				message: {
 					role: "assistant",
-					content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: nested({ leaf: regexSecret }) }],
+					content: [
+						{ type: "toolCall", id: "call-1", name: "inspect", arguments: nestedChain({ leaf: regexSecret }) },
+					],
 					timestamp: 1,
 				},
 			} as unknown as SessionEntry,
@@ -818,10 +800,9 @@ describe("buildShareSnapshot", () => {
 
 		const message = snapshot.entries[0] as Extract<SessionEntry, { type: "message" }>;
 		const call = (message.message as AssistantMessage).content[0] as ToolCall;
-		const { levels, bottom } = nesting(call.arguments);
-		expect(levels).toBe(DEEP_LEVELS);
-		expect(bottom).toEqual({ leaf: obfuscator.obfuscate(regexSecret) });
-		expect(bottom.leaf).not.toContain(regexSecret);
+		const hidden = obfuscator.obfuscate(regexSecret);
+		expect(nestingOf(call.arguments)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: hidden } });
+		expect(hidden).not.toContain(regexSecret);
 	});
 });
 
@@ -939,7 +920,7 @@ describe("shareSession", () => {
 				toolCallId: "call-1",
 				toolName: "inspect",
 				content: [{ type: "text", text: "inspected" }],
-				details: nested({ leaf: "bottom" }),
+				details: nestedChain({ leaf: "bottom" }),
 				isError: false,
 				timestamp: 1,
 			},
@@ -974,7 +955,7 @@ describe("shareSession", () => {
 			expect(opened.entries[0]).toEqual(entries[0]);
 			const message = (opened.entries[1] as Extract<SessionEntry, { type: "message" }>).message as ToolResultMessage;
 			expect(message.content).toEqual([{ type: "text", text: "inspected" }]);
-			expect(nesting(message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+			expect(nestingOf(message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
 		} finally {
 			server.stop(true);
 		}

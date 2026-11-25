@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type Context, createContext, runInContext, runInNewContext } from "node:vm";
+import type { SessionTrace } from "@oh-my-pi/omp-stats/client/traces";
 import { type Document, HTMLElement, parseHTML } from "@oh-my-pi/pi-utils/dom";
 import { stringifyJsonIteratively } from "@oh-my-pi/pi-utils/json";
 import { Marked, type MarkedExtension } from "@oh-my-pi/pi-utils/marked";
@@ -372,7 +373,7 @@ describe("hosted export viewer build", () => {
 				unpricedRequests: 0,
 				toolStats: [],
 			},
-		};
+		} satisfies SessionTrace;
 		const copied: string[] = [];
 		const errors: unknown[] = [];
 		const page = runViewer(

@@ -10,6 +10,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import * as natives from "@oh-my-pi/pi-natives";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 import { Agent } from "../src/agent";
 import type { SessionMessageEntry } from "../src/compaction/entries";
 import { applyShakeRegions, collectShakeRegions, RESCUE_SHAKE_CONFIG } from "../src/compaction/shake";
@@ -969,8 +970,7 @@ function inToolResultImageEstimate(tokenizer: Tokenizer): number {
 // runs on the first prompt after a resume, at each turn's end and for every context-usage reading.
 describe("Tokenizer on a tool call nested past where JSON.stringify stops", () => {
 	test("counts the JSON text of arguments nested 50,000 levels", () => {
-		let deep: Record<string, unknown> = { leaf: "bottom" };
-		for (let level = 0; level < 50_000; level++) deep = { next: deep };
+		const deep = nestedChain({ leaf: "bottom" });
 		const call = (args: Record<string, unknown>) =>
 			({
 				role: "assistant",

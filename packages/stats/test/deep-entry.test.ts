@@ -13,14 +13,14 @@ import { parseSessionFile } from "@oh-my-pi/omp-stats/parser";
 import { handleApi } from "@oh-my-pi/omp-stats/server";
 import { argumentTokens, callTarget, SPOTLIGHT_TARGET_CHARS } from "@oh-my-pi/omp-stats/spotlight-arguments";
 import { getSessionsDir } from "@oh-my-pi/pi-utils";
+import { DEEP_LEVELS, nestedChainJson, nestingOf } from "../../ai/test/helpers/deep-nesting";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 installStatsTestIsolation("@pi-stats-deep-entry-");
 
 const T = 1_700_000_000_000;
-const DEEP_LEVELS = 50_000;
-/** `{ "next": … }` as JSON text nested {@link DEEP_LEVELS} levels around `{ "leaf": "bottom" }`, written without `JSON.stringify`. */
-const DEEP_JSON = `${'{"next":'.repeat(DEEP_LEVELS)}{"leaf":"bottom"}${"}".repeat(DEEP_LEVELS)}`;
+/** The JSON text of `{ "next": … }` nested {@link DEEP_LEVELS} levels around `{ "leaf": "bottom" }`. */
+const DEEP_JSON = nestedChainJson();
 
 const iso = (ms: number) => new Date(ms).toISOString();
 
@@ -73,17 +73,6 @@ async function writeDeepFixture(): Promise<string> {
 	await fs.mkdir(path.dirname(file), { recursive: true });
 	await Bun.write(file, `${lines.join("\n")}\n`);
 	return file;
-}
-
-/** How many `next` levels `value` nests, and the value at the bottom. */
-function nestingOf(value: unknown): { levels: number; bottom: unknown } {
-	let levels = 0;
-	let node = value as { next?: unknown };
-	while (node.next !== undefined) {
-		node = node.next as { next?: unknown };
-		levels++;
-	}
-	return { levels, bottom: node };
 }
 
 describe("a transcript holding an entry nested deeper than JSON.stringify recurses", () => {

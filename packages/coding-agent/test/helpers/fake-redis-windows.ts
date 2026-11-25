@@ -6,6 +6,8 @@
  * `OMP_CHECK_WINDOWS`) return.
  */
 
+import { UNVERSIONED } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
+
 /** The keyspace a Redis double holds: its string keys and its hashes. */
 export interface FakeRedisKeyspace {
 	readonly strings: Map<string, string>;
@@ -54,7 +56,7 @@ export function byteRange(bytes: Buffer, start: number, end: number): string {
  * window): a first window from inside a character starts at the byte that
  * begins it, and a window that stops short of the read's end ends before the
  * character its next byte continues, never as nothing; its SHA-1 when the
- * generation is "?" (no token), else ""; `[size]` alone when the key is
+ * generation is `UNVERSIONED` (no token), else ""; `[size]` alone when the key is
  * shorter than that end.
  */
 function readWindow(bytes: Buffer | undefined, generation: string, [first, most, until]: string[]): unknown[] | null {
@@ -67,7 +69,7 @@ function readWindow(bytes: Buffer | undefined, generation: string, [first, most,
 	let end = Math.min(start + Number(most), stop);
 	if (end < stop) end -= backToStart(bytes, end, start + 1);
 	const window = bytes.subarray(start, end);
-	const digest = generation === "?" ? new Bun.CryptoHasher("sha1").update(window).digest("hex") : "";
+	const digest = generation === UNVERSIONED ? new Bun.CryptoHasher("sha1").update(window).digest("hex") : "";
 	return [bytes.length, generation, window.length, digest, window.toString("utf-8"), from - start];
 }
 
@@ -231,7 +233,7 @@ export function runSessionScript(
 		checkFailure("getrange");
 		const [fileKey, metaKey, generationKey] = keys;
 		const filePath = argv[3];
-		const generation = heldToken(hash(generationKey).get(filePath), hash(metaKey).get(filePath)) ?? "?";
+		const generation = heldToken(hash(generationKey).get(filePath), hash(metaKey).get(filePath)) ?? UNVERSIONED;
 		return readWindow(bytesOf(fileKey), generation, argv);
 	}
 	if (script.includes("OMP_CHECK_WINDOWS")) return holdsWindows(bytesOf(keys[0]), argv);

@@ -10,6 +10,7 @@ import type {
 	UserMessage,
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { DEEP_LEVELS, nestedChain, nestingOf } from "./helpers/deep-nesting";
 
 /**
  * Regression: Anthropic-compatible reasoning endpoints often emit `thinking`
@@ -169,22 +170,16 @@ describe("Anthropic-compatible unsigned thinking replay (#2005)", () => {
 
 	// A tool call's arguments are any JSON, and a resumed session holds them as deep as a transcript line does.
 	it("sanitizes a lone surrogate at the bottom of tool arguments nested 50,000 levels", () => {
-		let deep: Record<string, unknown> = { text: "broken \ud83d end" };
-		for (let level = 0; level < 50_000; level++) deep = { next: deep };
 		const assistant: AssistantMessage = {
 			...makeAssistantThinking("plan"),
-			content: [{ type: "toolCall", id: "call_1", name: "write", arguments: deep }],
+			content: [
+				{ type: "toolCall", id: "call_1", name: "write", arguments: nestedChain({ text: "broken \ud83d end" }) },
+			],
 		};
 		const toolUse = assistantWireBlocks([makeUser(), assistant], makeModel()).find(
 			block => block.type === "tool_use",
 		) as WireToolUseBlock;
-		let node: unknown = toolUse.input;
-		let levels = 0;
-		while (typeof node === "object" && node !== null && "next" in node) {
-			node = node.next;
-			levels++;
-		}
-		expect({ levels, node }).toEqual({ levels: 50_000, node: { text: "broken \ufffd end" } });
+		expect(nestingOf(toolUse.input)).toEqual({ levels: DEEP_LEVELS, bottom: { text: "broken \ufffd end" } });
 	});
 
 	// `JSON.parse` makes `__proto__` an own key of tool arguments; a copy that assigns it sets its prototype instead.

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { buildStage1RolloutItems } from "@oh-my-pi/pi-coding-agent/memories";
 import { parseJsonlLenient } from "@oh-my-pi/pi-utils";
+import { nestedChainJson } from "../../../ai/test/helpers/deep-nesting";
 
 /** Reference: the whole-file read + stringify + head/tail truncation the streaming builder replaces. */
 function referenceItems(raw: string, tokenLimit: number): string {
@@ -121,8 +122,7 @@ describe("buildStage1RolloutItems", () => {
 
 	// A transcript line holds JSON as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000.
 	it("writes a message nested deeper than JSON.stringify recurses, whole and in the tail of a truncated payload", async () => {
-		const levels = 50_000;
-		const deepArguments = `${'{"next":'.repeat(levels)}{"leaf":"bottom"}${"}".repeat(levels)}`;
+		const deepArguments = nestedChainJson();
 		const messages = [
 			JSON.stringify({ role: "user", content: [{ type: "text", text: "Inspect the tree" }] }),
 			JSON.stringify({
