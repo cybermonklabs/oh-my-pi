@@ -17,13 +17,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import {
-	holdsWindows,
-	keptGeneration,
-	newGeneration,
-	readWindow,
-	windowGeneration,
-} from "../helpers/fake-redis-windows";
+import { byteRange, runSessionScript } from "../helpers/fake-redis-windows";
 
 interface FakeRedis extends RedisSessionStorageClient {
 	strings: Map<string, string>;
@@ -34,133 +28,18 @@ function createFakeRedis(): FakeRedis {
 	const strings = new Map<string, string>();
 	const hashes = new Map<string, Map<string, string>>();
 
-	const getHash = (key: string): Map<string, string> => {
-		let h = hashes.get(key);
-		if (!h) {
-			h = new Map();
-			hashes.set(key, h);
-		}
-		return h;
-	};
-
 	return {
 		strings,
 		hashes,
 		async send(command, args) {
 			if (command !== "EVAL") throw new Error(`Unsupported Redis command: ${command}`);
-			const script = args[0] ?? "";
-			const keyCount = Number(args[1] ?? "0");
-			const keys = args.slice(2, 2 + keyCount);
-			const argv = args.slice(2 + keyCount);
-			if (script.includes("OMP_WRITE_FULL")) {
-				const [fileKey, metaKey, titleKey, generationKey] = keys;
-				const [content, filePath, mtimeMs, hasTitle, title, expectedSize, token] = argv;
-				const current = strings.get(fileKey);
-				const actualSize = current === undefined ? -1 : Buffer.byteLength(current, "utf8");
-				if (expectedSize !== "" && actualSize !== Number(expectedSize)) return [0, actualSize];
-				strings.set(fileKey, content);
-				getHash(metaKey).set(filePath, mtimeMs);
-				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
-				else getHash(titleKey).delete(filePath);
-				getHash(generationKey).set(filePath, newGeneration(token, mtimeMs));
-				return [1, Buffer.byteLength(content, "utf8")];
-			}
-			if (script.includes("OMP_STAGE_PART")) {
-				const [stagingKey] = keys;
-				const [part] = argv;
-				const next = (strings.get(stagingKey) ?? "") + part;
-				strings.set(stagingKey, next);
-				return Buffer.byteLength(next, "utf-8");
-			}
-			if (script.includes("OMP_WRITE_STAGED")) {
-				const [stagingKey, fileKey, metaKey, titleKey, generationKey] = keys;
-				const [filePath, mtimeMs, hasTitle, title, expectedSize, byteLength, token] = argv;
-				const current = strings.get(fileKey);
-				const actualSize = current === undefined ? -1 : Buffer.byteLength(current, "utf8");
-				const staged = strings.get(stagingKey) ?? "";
-				const stagedSize = Buffer.byteLength(staged, "utf8");
-				strings.delete(stagingKey);
-				if (expectedSize !== "" && actualSize !== Number(expectedSize)) return [0, actualSize];
-				if (stagedSize !== Number(byteLength)) return [-1, stagedSize];
-				strings.set(fileKey, staged);
-				getHash(metaKey).set(filePath, mtimeMs);
-				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
-				else getHash(titleKey).delete(filePath);
-				getHash(generationKey).set(filePath, newGeneration(token, mtimeMs));
-				return [1, stagedSize];
-			}
-			if (script.includes("OMP_APPEND")) {
-				const [fileKey, metaKey, generationKey] = keys;
-				const [line, filePath, mtimeMs, token] = argv;
-				const generation = keptGeneration(
-					getHash(generationKey).get(filePath),
-					getHash(metaKey).get(filePath),
-					token,
-					mtimeMs,
-				);
-				const next = (strings.get(fileKey) ?? "") + line;
-				strings.set(fileKey, next);
-				getHash(metaKey).set(filePath, mtimeMs);
-				getHash(generationKey).set(filePath, generation);
-				return Buffer.byteLength(next, "utf-8");
-			}
-			if (script.includes("OMP_UPDATE_TITLE")) {
-				const [metaKey, titleKey, generationKey] = keys;
-				const [filePath, mtimeMs, title, token] = argv;
-				const generation = keptGeneration(
-					getHash(generationKey).get(filePath),
-					getHash(metaKey).get(filePath),
-					token,
-					mtimeMs,
-				);
-				getHash(metaKey).set(filePath, mtimeMs);
-				getHash(titleKey).set(filePath, title);
-				getHash(generationKey).set(filePath, generation);
-				return 1;
-			}
-			if (script.includes("OMP_REMOVE")) {
-				const [metaKey, titleKey, generationKey] = keys;
-				const [filePrefix, pattern, ...paths] = argv;
-				if (pattern) {
-					const keyPrefix = pattern.slice(0, -1).replace(/\\(.)/g, "$1");
-					for (const key of strings.keys()) {
-						if (key.startsWith(keyPrefix)) paths.push(key.slice(filePrefix.length));
-					}
-				}
-				for (const filePath of paths) {
-					strings.delete(filePrefix + filePath);
-					getHash(metaKey).delete(filePath);
-					getHash(titleKey).delete(filePath);
-					getHash(generationKey).delete(filePath);
-				}
-				return paths.length;
-			}
-			if (script.includes("OMP_READ_WINDOW")) {
-				const [fileKey, metaKey, generationKey] = keys;
-				const value = strings.get(fileKey);
-				const filePath = argv[3];
-				return readWindow(
-					value === undefined ? undefined : Buffer.from(value, "utf-8"),
-					windowGeneration(getHash(generationKey).get(filePath), getHash(metaKey).get(filePath)),
-					argv,
-				);
-			}
-			if (script.includes("OMP_CHECK_WINDOWS")) {
-				const value = strings.get(keys[0]);
-				return holdsWindows(value === undefined ? undefined : Buffer.from(value, "utf-8"), argv);
-			}
-			throw new Error("Unsupported Redis script");
+			return runSessionScript({ strings, hashes }, args);
 		},
 		async get(key) {
 			return strings.has(key) ? (strings.get(key) as string) : null;
 		},
 		async getrange(key, start, end) {
-			const bytes = Buffer.from(strings.get(key) ?? "", "utf-8");
-			if (bytes.length === 0) return "";
-			const from = Math.max(0, start < 0 ? bytes.length + start : start);
-			const to = Math.min(bytes.length - 1, end < 0 ? bytes.length + end : end);
-			if (to < from) return "";
-			return bytes.subarray(from, to + 1).toString("utf-8");
+			return byteRange(Buffer.from(strings.get(key) ?? "", "utf-8"), start, end);
 		},
 		async strlen(key) {
 			return Buffer.byteLength(strings.get(key) ?? "", "utf-8");

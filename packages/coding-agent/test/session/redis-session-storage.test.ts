@@ -26,13 +26,7 @@ import {
 import { SessionReadConflictError, SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import {
-	holdsWindows,
-	keptGeneration,
-	newGeneration,
-	readWindow,
-	windowGeneration,
-} from "../helpers/fake-redis-windows";
+import { byteRange, runSessionScript } from "../helpers/fake-redis-windows";
 
 /** A session body as a full rewrite hands it over: a title slot, a header, then `count` entries carrying `text`. */
 function rewriteLines(text: string, count = 3): string[] {
@@ -216,15 +210,6 @@ interface FakeRedis extends RedisSessionStorageClient {
 	failNext(method: string, error: Error): void;
 }
 
-/** What GETRANGE returns for `bytes` from `start` to `end`, both inclusive, a negative one counted from the end. */
-function byteRange(bytes: Buffer, start: number, end: number): string {
-	if (bytes.length === 0) return "";
-	const from = Math.max(0, start < 0 ? bytes.length + start : start);
-	const to = Math.min(bytes.length - 1, end < 0 ? bytes.length + end : end);
-	if (to < from) return "";
-	return bytes.subarray(from, to + 1).toString("utf-8");
-}
-
 function createFakeRedis(): FakeRedis {
 	const strings = new Map<string, string>();
 	const hashes = new Map<string, Map<string, string>>();
@@ -241,15 +226,6 @@ function createFakeRedis(): FakeRedis {
 		calls.push({ method, args });
 	};
 
-	const getHash = (key: string): Map<string, string> => {
-		let h = hashes.get(key);
-		if (!h) {
-			h = new Map();
-			hashes.set(key, h);
-		}
-		return h;
-	};
-
 	const client: FakeRedis = {
 		calls,
 		strings,
@@ -263,145 +239,7 @@ function createFakeRedis(): FakeRedis {
 			record("send", [command, args]);
 			checkFailure("send");
 			if (command !== "EVAL") throw new Error(`Unsupported Redis command: ${command}`);
-			const script = args[0] ?? "";
-			const keyCount = Number(args[1] ?? "0");
-			const keys = args.slice(2, 2 + keyCount);
-			const argv = args.slice(2 + keyCount);
-			if (script.includes("OMP_WRITE_FULL")) {
-				checkFailure("set");
-				checkFailure("hset");
-				const [fileKey, metaKey, titleKey, generationKey] = keys;
-				const [content, filePath, mtimeMs, hasTitle, title, , token] = argv;
-				strings.set(fileKey, content);
-				getHash(metaKey).set(filePath, mtimeMs);
-				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
-				else getHash(titleKey).delete(filePath);
-				getHash(generationKey).set(filePath, newGeneration(token, mtimeMs));
-				return 1;
-			}
-			if (script.includes("OMP_STAGE_PART")) {
-				checkFailure("append");
-				const [stagingKey] = keys;
-				const [part] = argv;
-				const next = (strings.get(stagingKey) ?? "") + part;
-				strings.set(stagingKey, next);
-				return Buffer.byteLength(next, "utf-8");
-			}
-			if (script.includes("OMP_WRITE_STAGED")) {
-				// As the script runs on a Redis 7 server: refused ({0, actual} or {-1, staged}) after deleting the staging key.
-				checkFailure("rename");
-				checkFailure("hset");
-				const [stagingKey, fileKey, metaKey, titleKey, generationKey] = keys;
-				const [filePath, mtimeMs, hasTitle, title, expectedSize, byteLength, token] = argv;
-				const current = strings.get(fileKey);
-				const actualSize = current === undefined ? -1 : Buffer.byteLength(current, "utf-8");
-				const staged = strings.get(stagingKey) ?? "";
-				const stagedSize = Buffer.byteLength(staged, "utf-8");
-				strings.delete(stagingKey);
-				if (expectedSize !== "" && actualSize !== Number(expectedSize)) return [0, actualSize];
-				if (stagedSize !== Number(byteLength)) return [-1, stagedSize];
-				strings.set(fileKey, staged);
-				getHash(metaKey).set(filePath, mtimeMs);
-				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
-				else getHash(titleKey).delete(filePath);
-				getHash(generationKey).set(filePath, newGeneration(token, mtimeMs));
-				return [1, stagedSize];
-			}
-			if (script.includes("OMP_APPEND")) {
-				checkFailure("append");
-				checkFailure("hset");
-				const [fileKey, metaKey, generationKey] = keys;
-				const [line, filePath, mtimeMs, token] = argv;
-				const generation = keptGeneration(
-					getHash(generationKey).get(filePath),
-					getHash(metaKey).get(filePath),
-					token,
-					mtimeMs,
-				);
-				const next = (strings.get(fileKey) ?? "") + line;
-				strings.set(fileKey, next);
-				getHash(metaKey).set(filePath, mtimeMs);
-				getHash(generationKey).set(filePath, generation);
-				return Buffer.byteLength(next, "utf-8");
-			}
-			if (script.includes("OMP_UPDATE_TITLE")) {
-				checkFailure("hset");
-				const [metaKey, titleKey, generationKey] = keys;
-				const [filePath, mtimeMs, title, token] = argv;
-				const generation = keptGeneration(
-					getHash(generationKey).get(filePath),
-					getHash(metaKey).get(filePath),
-					token,
-					mtimeMs,
-				);
-				getHash(metaKey).set(filePath, mtimeMs);
-				getHash(titleKey).set(filePath, title);
-				getHash(generationKey).set(filePath, generation);
-				return 1;
-			}
-			if (script.includes("OMP_MOVE")) {
-				// As the script runs on a Redis 7 server: 0 when a no-replace destination exists.
-				checkFailure("rename");
-				const [srcKey, dstKey, metaKey, titleKey, generationKey] = keys;
-				const [src, dst, mtimeMs, noReplace, token] = argv;
-				if (noReplace === "1" && strings.has(dstKey)) return 0;
-				if (!strings.has(srcKey)) throw new Error("ERR no such key");
-				strings.set(dstKey, strings.get(srcKey) as string);
-				if (srcKey !== dstKey) strings.delete(srcKey);
-				getHash(metaKey).delete(src);
-				getHash(metaKey).set(dst, mtimeMs);
-				const title = getHash(titleKey).get(src);
-				getHash(titleKey).delete(src);
-				if (title !== undefined) getHash(titleKey).set(dst, title);
-				else getHash(titleKey).delete(dst);
-				getHash(generationKey).delete(src);
-				getHash(generationKey).set(dst, newGeneration(token, mtimeMs));
-				return 1;
-			}
-			if (script.includes("OMP_REMOVE")) {
-				checkFailure("del");
-				const [metaKey, titleKey, generationKey] = keys;
-				const [filePrefix, pattern, ...paths] = argv;
-				if (pattern) {
-					// The pattern is an escaped key prefix followed by `*`.
-					const keyPrefix = pattern.slice(0, -1).replace(/\\(.)/g, "$1");
-					for (const key of strings.keys()) {
-						if (key.startsWith(keyPrefix)) paths.push(key.slice(filePrefix.length));
-					}
-				}
-				for (const filePath of paths) {
-					strings.delete(filePrefix + filePath);
-					getHash(metaKey).delete(filePath);
-					getHash(titleKey).delete(filePath);
-					getHash(generationKey).delete(filePath);
-				}
-				return paths.length;
-			}
-			if (script.includes("OMP_READ_FROM")) {
-				checkFailure("getrange");
-				const [fileKey] = keys;
-				const [first, last] = argv;
-				const value = strings.get(fileKey);
-				if (value === undefined) return null;
-				const bytes = Buffer.from(value, "utf-8");
-				return [bytes.length, last === "" ? "" : byteRange(bytes, Number(first), Number(last))];
-			}
-			if (script.includes("OMP_READ_WINDOW")) {
-				checkFailure("getrange");
-				const [fileKey, metaKey, generationKey] = keys;
-				const value = strings.get(fileKey);
-				const filePath = argv[3];
-				return readWindow(
-					value === undefined ? undefined : Buffer.from(value, "utf-8"),
-					windowGeneration(getHash(generationKey).get(filePath), getHash(metaKey).get(filePath)),
-					argv,
-				);
-			}
-			if (script.includes("OMP_CHECK_WINDOWS")) {
-				const value = strings.get(keys[0]);
-				return holdsWindows(value === undefined ? undefined : Buffer.from(value, "utf-8"), argv);
-			}
-			throw new Error("Unsupported Redis script");
+			return runSessionScript({ strings, hashes }, args, checkFailure);
 		},
 		async get(key) {
 			record("get", [key]);
