@@ -172,11 +172,11 @@ pub(crate) fn for_each_nonempty_match<M: Matcher>(
 	Ok(())
 }
 
-/// The part of a selected `line` that `-o` searches for matches: the line
+/// The part of a selected `line` searched for the matches in it: the line
 /// without the terminator `searcher` ended it with, as the searcher matches a
 /// line to select it, so that `$` matches at the end of the line as in GNU
-/// grep. A multi-line search keeps the whole span, since a match in it may end
-/// with a line terminator.
+/// grep and ripgrep. A multi-line search keeps the whole span, since a match
+/// in it may end with a line terminator.
 pub(crate) fn line_text<'a, M: Matcher>(
 	searcher: &Searcher,
 	matcher: M,
@@ -2949,7 +2949,7 @@ mod tests {
 	/// `-o` searches a line without its terminator, as GNU grep does. It used
 	/// to search the line with its newline, where a `$` that ends the pattern
 	/// cannot match, so `grep -oE '[0-9]+$'` printed nothing while `grep -c`
-	/// counted both lines. Every expectation is GNU grep 3.11's output for the
+	/// counted both lines. Every expectation is GNU grep 3.8's output for the
 	/// same input, read from a file and from stdin.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn only_matching_prints_a_match_anchored_at_the_line_end() {
@@ -2982,7 +2982,7 @@ mod tests {
 	}
 
 	/// A last line with no terminator is searched to its end, next to lines
-	/// that have one. Expectations are GNU grep 3.11's output.
+	/// that have one. Expectations are GNU grep 3.8's output.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn only_matching_anchors_at_the_end_of_an_unterminated_last_line() {
 		for (args, input, want) in [
@@ -2996,7 +2996,7 @@ mod tests {
 	}
 
 	/// `-x -o` prints a line that is the whole match, and nothing for a line
-	/// that only contains it. Expectations are GNU grep 3.11's output.
+	/// that only contains it. Expectations are GNU grep 3.8's output.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn whole_line_only_matching_prints_the_line() {
 		let (code, out, err) = run(&["-xo", "abc"], "abc\nabcd\nxabc\n").await;
@@ -3009,7 +3009,7 @@ mod tests {
 	/// searcher used to run such a pattern over a buffer of many records, where
 	/// `$` matches only at the end of the buffer, so no record was selected;
 	/// and `-o` searched each record with its NUL. Expectations are GNU grep
-	/// 3.11's output.
+	/// 3.8's output.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn null_data_anchors_at_the_end_of_each_record() {
 		let input = "a1\0b2\0";

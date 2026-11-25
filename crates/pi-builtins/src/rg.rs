@@ -608,18 +608,22 @@ impl<M: Matcher, W: Write> RgSink<'_, M, W> {
 		Ok(())
 	}
 
-	fn write_replaced_line(&mut self, line: &[u8]) -> io::Result<()> {
+	/// Writes `line`; under `--replace`, with each match in `text`, the line
+	/// without its terminator (`line_text`), replaced.
+	fn write_replaced_line(&mut self, line: &[u8], text: &[u8]) -> io::Result<()> {
 		let Some(replacement) = self.opts.replacement.as_deref() else {
 			return self.write_line(line);
 		};
 		self.scratch.clear();
 		let matcher = self.matcher;
 		matcher
-			.replace_with_captures(line, &mut self.captures, &mut self.scratch, |captures, output| {
-				captures.interpolate(|name| matcher.capture_index(name), line, replacement, output);
+			.replace_with_captures(text, &mut self.captures, &mut self.scratch, |captures, output| {
+				captures.interpolate(|name| matcher.capture_index(name), text, replacement, output);
 				true
 			})
 			.map_err(|error| io::Error::other(error.to_string()))?;
+		// `text` is `line` up to its terminator, which ends the replaced line.
+		self.scratch.extend_from_slice(&line[text.len()..]);
 		let mut output = std::mem::take(&mut self.scratch);
 		let result = self.write_line(&output);
 		output.clear();
@@ -657,18 +661,21 @@ impl<M: Matcher, W: Write> RgSink<'_, M, W> {
 		})
 	}
 
+	/// Prints `line` once for each match in `text`, the line without its
+	/// terminator (`line_text`), or once at column 1 if `text` has none.
 	fn print_vimgrep(
 		&mut self,
 		line: &[u8],
+		text: &[u8],
 		line_number: Option<u64>,
 		line_offset: u64,
 	) -> io::Result<()> {
 		let mut at = 0usize;
 		let mut printed = false;
-		while at <= line.len() {
+		while at <= text.len() {
 			let Some(found) = self
 				.matcher
-				.find_at(line, at)
+				.find_at(text, at)
 				.map_err(|error| io::Error::other(error.to_string()))?
 			else {
 				break;
@@ -682,13 +689,13 @@ impl<M: Matcher, W: Write> RgSink<'_, M, W> {
 				u64::try_from(found.start()).map_err(|error| io::Error::other(error.to_string()))?,
 			);
 			self.write_prefix(line_number, Some(found.start() + 1), match_offset, b':')?;
-			self.write_replaced_line(line)?;
+			self.write_replaced_line(line, text)?;
 			printed = true;
 			at = next;
 		}
 		if !printed {
 			self.write_prefix(line_number, Some(1), line_offset, b':')?;
-			self.write_replaced_line(line)?;
+			self.write_replaced_line(line, text)?;
 		}
 		Ok(())
 	}
@@ -701,7 +708,8 @@ impl<M: Matcher, W: Write> Sink for RgSink<'_, M, W> {
 		self.any_match = true;
 		self.line_count += 1;
 		let line = mat.bytes();
-		let matches_on_line = count_matches(self.matcher, line)?;
+		let text = line_text(searcher, self.matcher, line);
+		let matches_on_line = count_matches(self.matcher, text)?;
 		self.match_count += if self.opts.count_matches || self.opts.only_matching {
 			matches_on_line.max(1)
 		} else {
@@ -715,18 +723,17 @@ impl<M: Matcher, W: Write> Sink for RgSink<'_, M, W> {
 			return Ok(true);
 		}
 		if self.opts.vimgrep {
-			self.print_vimgrep(line, mat.line_number(), mat.absolute_byte_offset())?;
+			self.print_vimgrep(line, text, mat.line_number(), mat.absolute_byte_offset())?;
 		} else if self.opts.only_matching {
-			let text = line_text(searcher, self.matcher, line);
 			self.print_only_matching(text, mat.line_number(), mat.absolute_byte_offset())?;
 		} else {
 			let column = if self.opts.column {
-				first_column(self.matcher, line)?
+				first_column(self.matcher, text)?
 			} else {
 				None
 			};
 			self.write_prefix(mat.line_number(), column, mat.absolute_byte_offset(), b':')?;
-			self.write_replaced_line(line)?;
+			self.write_replaced_line(line, text)?;
 		}
 		Ok(true)
 	}
@@ -2523,6 +2530,118 @@ mod tests {
 		assert_eq!((code, out.as_str()), (0, "1\n2\n"), "{err}");
 		let (code, out, err) = run(&["--null-data", "-xo", "a1", "-"], "a1\0b2\0").await;
 		assert_eq!((code, out.as_str()), (0, "a1\n"), "{err}");
+	}
+
+	/// Under `--null-data`, `--count-matches` counts the matches in a record
+	/// without its NUL, as `-o` finds them, so a `$` matches at the end of each
+	/// record. It used to search the record with its NUL, where `$` cannot
+	/// match, and counted `[a-z]|[0-9]$` once in each record. ripgrep 14.1.1
+	/// and 15.2.0 give the same counts, ended by NUL instead of a newline.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_count_matches_counts_a_match_at_the_end_of_each_record() {
+		for (pattern, want) in [("[0-9]$", "2\n"), ("[a-z]|[0-9]$", "4\n")] {
+			let (code, out, err) =
+				run(&["--null-data", "--count-matches", pattern, "-"], "a1\0b2\0").await;
+			assert_eq!((code, out.as_str()), (0, want), "{pattern}: {err}");
+		}
+	}
+
+	/// Under `--null-data`, `--column` is the column of the first match in a
+	/// record without its NUL, so a `$` matches at the end of each record. It
+	/// used to search the record with its NUL, where `$` cannot match, and
+	/// printed column 1. ripgrep 14.1.1 and 15.2.0 print the same records, with
+	/// no newline after the NUL.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_column_is_that_of_a_match_at_the_end_of_the_record() {
+		let (code, out, err) = run(&["--null-data", "--column", "[0-9]$", "-"], "a1\0b2\0").await;
+		assert_eq!((code, out.as_str()), (0, concat!("1:2:a1\0\n", "2:2:b2\0\n")), "{err}");
+	}
+
+	/// Under `--null-data`, `--vimgrep` prints a record once for each match in
+	/// it without its NUL, so a `$` matches at the end of each record. It used
+	/// to search the record with its NUL, where `$` cannot match, and printed
+	/// each record once, at column 1 or at its other match. ripgrep 14.1.1 and
+	/// 15.2.0 print the same records, with no newline after the NUL.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_vimgrep_prints_a_match_at_the_end_of_each_record() {
+		for (pattern, want) in [
+			("[0-9]$", concat!("<stdin>:1:2:a1\0\n", "<stdin>:2:2:b2\0\n")),
+			(
+				"[a-z]|[0-9]$",
+				concat!(
+					"<stdin>:1:1:a1\0\n",
+					"<stdin>:1:2:a1\0\n",
+					"<stdin>:2:1:b2\0\n",
+					"<stdin>:2:2:b2\0\n"
+				),
+			),
+		] {
+			let (code, out, err) = run(&["--null-data", "--vimgrep", pattern, "-"], "a1\0b2\0").await;
+			assert_eq!((code, out.as_str()), (0, want), "{pattern}: {err}");
+		}
+	}
+
+	/// Under `--null-data`, `--replace` replaces the matches in a record
+	/// without its NUL and keeps the NUL, so a `$` matches at the end of each
+	/// record. It used to search the record with its NUL, where `$` cannot
+	/// match, and left that match in place. ripgrep 14.1.1 and 15.2.0 print the
+	/// same records, with no newline after the NUL.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_replace_replaces_a_match_at_the_end_of_each_record() {
+		for (pattern, want) in
+			[("[0-9]$", concat!("aX\0\n", "bX\0\n")), ("[a-z]|[0-9]$", concat!("XX\0\n", "XX\0\n"))]
+		{
+			let (code, out, err) =
+				run(&["--null-data", "--replace=X", pattern, "-"], "a1\0b2\0").await;
+			assert_eq!((code, out.as_str()), (0, want), "{pattern}: {err}");
+		}
+	}
+
+	/// On newline-terminated lines, `--count-matches`, `--column`, `--vimgrep`
+	/// and `--replace` find a match at the end of each line. Expectations are
+	/// the output of ripgrep 13.0.0, 14.1.1 and 15.2.0.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_match_at_the_end_of_a_line_is_counted_located_and_replaced() {
+		for (args, want) in [
+			(["--count-matches", "[0-9]$"], "2\n"),
+			(["--count-matches", "[a-z]|[0-9]$"], "4\n"),
+			(["--column", "[0-9]$"], concat!("1:2:a1\n", "2:2:b2\n")),
+			(["--vimgrep", "[0-9]$"], concat!("<stdin>:1:2:a1\n", "<stdin>:2:2:b2\n")),
+			(
+				["--vimgrep", "[a-z]|[0-9]$"],
+				concat!("<stdin>:1:1:a1\n", "<stdin>:1:2:a1\n", "<stdin>:2:1:b2\n", "<stdin>:2:2:b2\n"),
+			),
+			(["--replace=X", "[0-9]$"], concat!("aX\n", "bX\n")),
+			(["--replace=X", "[a-z]|[0-9]$"], concat!("XX\n", "XX\n")),
+		] {
+			let (code, out, err) = run(&[args[0], args[1], "-"], "a1\nb2\n").await;
+			assert_eq!((code, out.as_str()), (0, want), "{args:?}: {err}");
+		}
+	}
+
+	/// `--replace` and `--vimgrep` search a line without its newline, so an
+	/// empty match is not also found after the newline. It was, so `--replace`
+	/// printed an extra line and `--vimgrep` a match past the end of each line.
+	/// Expectations are the output of ripgrep 13.0.0, 14.1.1 and 15.2.0.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn an_empty_match_is_not_found_after_the_line_terminator() {
+		for (args, want) in [
+			(["--replace=X", "x*"], concat!("XaX1X\n", "XbX2X\n")),
+			(
+				["--vimgrep", "x*"],
+				concat!(
+					"<stdin>:1:1:a1\n",
+					"<stdin>:1:2:a1\n",
+					"<stdin>:1:3:a1\n",
+					"<stdin>:2:1:b2\n",
+					"<stdin>:2:2:b2\n",
+					"<stdin>:2:3:b2\n"
+				),
+			),
+		] {
+			let (code, out, err) = run(&[args[0], args[1], "-"], "a1\nb2\n").await;
+			assert_eq!((code, out.as_str()), (0, want), "{args:?}: {err}");
+		}
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
