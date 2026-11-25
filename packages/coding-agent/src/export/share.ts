@@ -21,7 +21,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage, AgentState } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { $which, logger } from "@oh-my-pi/pi-utils";
+import {
+	$which,
+	ContainerPath,
+	isRecord,
+	logger,
+	type NestedWalk,
+	runNested,
+	stringifyDeepJson,
+	stringifyJsonIteratively,
+} from "@oh-my-pi/pi-utils";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { $ } from "bun";
 import { obfuscateToolArguments } from "../secrets/message-transform";
@@ -102,7 +111,7 @@ export function buildShareSnapshot(sm: SessionManager, options?: ShareSessionOpt
  * Redact secrets from a share snapshot. A share blob leaves the machine, so
  * every text-bearing field is rewritten through the obfuscator. The walk is
  * typed end-to-end (no generic object traversal): inline image bytes are left
- * intact (size-trimmed later by {@link stripImagePayloads}) and opaque,
+ * intact (size-trimmed later by {@link strippedImagePayload}) and opaque,
  * untyped payloads we cannot redact field-by-field (`compaction.preserveData`,
  * extension `details`/`data`, `mode_change.data`, structured output schemas)
  * are dropped so they cannot leak.
@@ -552,36 +561,48 @@ interface SealedSession {
 	truncated: boolean;
 }
 
+/**
+ * Levels past which a snapshot is written by `stringifyJsonIteratively`: Bun's
+ * `JSON.stringify` takes milliseconds below them, seconds past about 25,000
+ * levels, and runs out of stack near 40,000.
+ */
+const DEEP_SNAPSHOT_LEVELS = 10_000;
+
 /** Seal `data`, trimming content until the sealed blob fits `maxBytes`. Exported for tests. */
 export async function sealToFit(key: CryptoKey, data: SessionData, maxBytes: number): Promise<SealedSession> {
-	let sealed = await sealSessionData(key, data);
+	let sealed = await sealSessionData(key, stringifyDeepJson(data)!);
 	if (sealed.byteLength <= maxBytes) return { sealed, truncated: false };
 
-	// Work on a deep copy; the caller may re-fit the original at another budget.
-	const working = structuredClone(data);
-	stripImagePayloads(working);
-	sealed = await sealSessionData(key, working);
+	// Each trim copies only the containers it changes, so `data` stays whole: the caller may re-fit it at another budget.
+	const stripped = trimSnapshot(data, strippedImagePayload);
+	let working = stripped.snapshot;
+	// The trim measured the depth: a deep snapshot skips the `JSON.stringify` that would run out of stack on it.
+	const seal = (snapshot: SessionData): Promise<Uint8Array<ArrayBuffer>> =>
+		sealSessionData(key, stripped.deep ? stringifyJsonIteratively(snapshot)! : JSON.stringify(snapshot));
+	sealed = await seal(working);
 	if (sealed.byteLength <= maxBytes) return { sealed, truncated: true };
 
 	for (const cap of TEXT_CAPS) {
-		capLongStrings(working, cap);
-		sealed = await sealSessionData(key, working);
+		working = trimSnapshot(working, child =>
+			typeof child === "string" && child.length > cap ? `${child.slice(0, cap)}\n…[truncated for share]` : child,
+		).snapshot;
+		sealed = await seal(working);
 		if (sealed.byteLength <= maxBytes) return { sealed, truncated: true };
 	}
 
 	// Last resort: drop oldest entries (orphaned children render as roots).
 	while (working.entries.length > 4) {
-		working.entries = working.entries.slice(Math.ceil(working.entries.length / 2));
-		sealed = await sealSessionData(key, working);
+		working = { ...working, entries: working.entries.slice(Math.ceil(working.entries.length / 2)) };
+		sealed = await seal(working);
 		if (sealed.byteLength <= maxBytes) return { sealed, truncated: true };
 	}
 
 	throw new Error(`Session too large to share: ${sealed.byteLength} bytes sealed exceeds the ${maxBytes} byte limit`);
 }
 
-/** `[12B IV][AES-256-GCM(gzip(JSON))]` — decrypted and gunzipped by share-loader.js. */
-async function sealSessionData(key: CryptoKey, data: SessionData): Promise<Uint8Array<ArrayBuffer>> {
-	const compressed = Bun.gzipSync(new TextEncoder().encode(JSON.stringify(data)));
+/** `[12B IV][AES-256-GCM(gzip(json))]` — decrypted and gunzipped by share-loader.js. */
+async function sealSessionData(key: CryptoKey, json: string): Promise<Uint8Array<ArrayBuffer>> {
+	const compressed = Bun.gzipSync(new TextEncoder().encode(json));
 	const iv = new Uint8Array(IV_LENGTH);
 	crypto.getRandomValues(iv);
 	const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, compressed));
@@ -591,53 +612,60 @@ async function sealSessionData(key: CryptoKey, data: SessionData): Promise<Uint8
 	return out;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
+/** `child` of a container with its inline image payload replaced by a tiny placeholder: an image block in an array, a `data:` URL under a key. */
+function strippedImagePayload(child: unknown, inArray: boolean): unknown {
+	if (inArray) {
+		const data = isRecord(child) && child.type === "image" ? child.data : undefined;
+		return typeof data === "string" && data.length > 1024 ? { type: "text", text: IMAGE_OMITTED_TEXT } : child;
+	}
+	return typeof child === "string" && child.length > 1024 && child.startsWith("data:") ? BLANK_IMAGE_DATA_URL : child;
 }
 
-/** Replace inline image payloads (image blocks + data: URLs) with tiny placeholders, in place. */
-function stripImagePayloads(value: unknown): void {
-	if (Array.isArray(value)) {
-		for (let i = 0; i < value.length; i++) {
-			const item: unknown = value[i];
-			if (isRecord(item) && item.type === "image" && typeof item.data === "string" && item.data.length > 1024) {
-				value[i] = { type: "text", text: IMAGE_OMITTED_TEXT };
-				continue;
-			}
-			stripImagePayloads(item);
-		}
-		return;
-	}
-	if (!isRecord(value)) return;
-	for (const k in value) {
-		const v = value[k];
-		if (typeof v === "string") {
-			if (v.length > 1024 && v.startsWith("data:")) value[k] = BLANK_IMAGE_DATA_URL;
-			continue;
-		}
-		stripImagePayloads(v);
-	}
+/** A walk {@link trimSnapshot} runs. */
+interface SnapshotTrim {
+	/** A child of a container (an element when `inArray`), or what replaces it; the walk goes down into a child it keeps. */
+	readonly replace: (child: unknown, inArray: boolean) => unknown;
+	readonly path: ContainerPath;
+	/** The deepest level the walk reached. */
+	deepest: number;
 }
 
-/** Truncate every string longer than `cap`, in place. */
-function capLongStrings(value: unknown, cap: number): void {
-	if (Array.isArray(value)) {
-		for (let i = 0; i < value.length; i++) {
-			const item: unknown = value[i];
-			if (typeof item === "string" && item.length > cap) value[i] = `${item.slice(0, cap)}\n…[truncated for share]`;
-			else capLongStrings(item, cap);
-		}
-		return;
+/**
+ * `snapshot` with every child of every container that `replace` replaces
+ * replaced, and whether it nests past {@link DEEP_SNAPSHOT_LEVELS}. A
+ * container nothing in which is replaced is shared with `snapshot`, and
+ * `snapshot` itself is never changed. The walk keeps its own stack
+ * ({@link runNested}), so it trims a snapshot of any depth a session entry
+ * holds.
+ */
+function trimSnapshot(
+	snapshot: SessionData,
+	replace: (child: unknown, inArray: boolean) => unknown,
+): { snapshot: SessionData; deep: boolean } {
+	const trim: SnapshotTrim = { replace, path: new ContainerPath(), deepest: 0 };
+	const trimmed = runNested(trimContainer(snapshot, trim, 0)) as SessionData;
+	return { snapshot: trimmed, deep: trim.deepest > DEEP_SNAPSHOT_LEVELS };
+}
+
+/** {@link trimSnapshot} of `container`, `level` levels down. */
+function* trimContainer(container: object, trim: SnapshotTrim, level: number): NestedWalk<object> {
+	trim.path.enter(container);
+	if (level > trim.deepest) trim.deepest = level;
+	const inArray = Array.isArray(container);
+	// An array's own keys are its indices, so it is read and copied as a record of them.
+	const holder = container as Record<string, unknown>;
+	let out: Record<string, unknown> | undefined;
+	for (const key of Object.keys(holder)) {
+		const child = holder[key];
+		let next = trim.replace(child, inArray);
+		if (next === child && typeof child === "object" && child !== null)
+			next = yield trimContainer(child, trim, level + 1);
+		if (next === child) continue;
+		out ??= inArray ? ((container as unknown[]).slice() as unknown as Record<string, unknown>) : { ...holder };
+		out[key] = next;
 	}
-	if (!isRecord(value)) return;
-	for (const k in value) {
-		const v = value[k];
-		if (typeof v === "string") {
-			if (v.length > cap) value[k] = `${v.slice(0, cap)}\n…[truncated for share]`;
-			continue;
-		}
-		capLongStrings(v, cap);
-	}
+	trim.path.leave(container);
+	return out ?? container;
 }
 
 /** Create a secret gist holding base64 of the sealed blob; null when `gh` is unusable. */

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
-import type { AssistantMessage, ToolCall } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, TextContent, ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import type { SessionData } from "../src/export/html";
@@ -136,6 +136,52 @@ describe("sealToFit", () => {
 		expect(flat).toContain("[image omitted from share]");
 		expect(flat).toContain("see screenshot");
 	});
+
+	// JSON.stringify gives out at 40,000 levels and structuredClone with it; a recursive trim at about 22,800.
+	test("trims a snapshot holding a tool result nested deeper than JSON.stringify recurses, and keeps the source whole", async () => {
+		const key = await makeKey();
+		const image = randomHex(2_000);
+		const text = randomHex(10_000);
+		const entry = {
+			type: "message",
+			id: "r1",
+			parentId: null,
+			timestamp: "2026-06-12T00:00:00.000Z",
+			message: {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "inspect",
+				content: [
+					{ type: "text", text },
+					{ type: "image", data: image, mimeType: "image/png" },
+				],
+				details: nested({ leaf: "bottom" }),
+				isError: false,
+				timestamp: 1,
+			},
+		} as unknown as SessionEntry;
+		const data = sessionData([entry], "r1");
+
+		const { sealed, truncated } = await sealToFit(key, data, TEST_MAX_SEALED_BYTES);
+
+		expect(truncated).toBe(true);
+		expect(sealed.byteLength).toBeLessThanOrEqual(TEST_MAX_SEALED_BYTES);
+		const opened = (await open(key, sealed)).entries[0] as Extract<SessionEntry, { type: "message" }>;
+		const message = opened.message as ToolResultMessage;
+		const trimmed = (message.content[0] as TextContent).text;
+		expect(trimmed.startsWith(text.slice(0, 512))).toBe(true);
+		expect(trimmed.endsWith("\n…[truncated for share]")).toBe(true);
+		expect(trimmed.length).toBeLessThan(text.length);
+		expect(message.content[1]).toEqual({ type: "text", text: "[image omitted from share]" });
+		expect(nesting(message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+		// The trim works on its own copy: the session's entry keeps its text, its image and its details.
+		const source = (entry as Extract<SessionEntry, { type: "message" }>).message as ToolResultMessage;
+		expect(source.content).toEqual([
+			{ type: "text", text },
+			{ type: "image", data: image, mimeType: "image/png" },
+		]);
+		expect(nesting(source.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+	}, 20_000);
 });
 
 describe("buildShareSnapshot", () => {
@@ -820,6 +866,58 @@ describe("shareSession", () => {
 			server.stop(true);
 		}
 	});
+
+	test("uploads a session holding a tool result nested deeper than JSON.stringify recurses", async () => {
+		const deep = {
+			type: "message",
+			id: "r1",
+			parentId: "e1",
+			timestamp: "2026-06-12T00:00:00.000Z",
+			message: {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "inspect",
+				content: [{ type: "text", text: "inspected" }],
+				details: nested({ leaf: "bottom" }),
+				isError: false,
+				timestamp: 1,
+			},
+		} as unknown as SessionEntry;
+		const entries = [messageEntry("e1", null, "share me"), deep];
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => entries,
+			getLeafId: () => "r1",
+		} as unknown as SessionManager;
+		let uploaded: Uint8Array<ArrayBuffer> | undefined;
+		const server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				uploaded = new Uint8Array(await req.arrayBuffer());
+				return Response.json({ id: "deepshareid01" });
+			},
+		});
+		try {
+			const result = await shareSession(sm, { serverUrl: `http://localhost:${server.port}` });
+
+			expect(result.truncated).toBe(false);
+			if (!uploaded) throw new Error("Share server received no upload");
+			const key = await crypto.subtle.importKey(
+				"raw",
+				Buffer.from(result.url.split("#")[1], "base64url"),
+				"AES-GCM",
+				false,
+				["decrypt"],
+			);
+			const opened = await open(key, uploaded);
+			expect(opened.entries[0]).toEqual(entries[0]);
+			const message = (opened.entries[1] as Extract<SessionEntry, { type: "message" }>).message as ToolResultMessage;
+			expect(message.content).toEqual([{ type: "text", text: "inspected" }]);
+			expect(nesting(message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+		} finally {
+			server.stop(true);
+		}
+	}, 20_000);
 });
 
 describe("share command", () => {
