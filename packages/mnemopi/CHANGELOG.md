@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed a memory store failing to open, or a model-change embedding rebuild aborting, when one memory row holds a non-text id or content (such as a row SQLite's `.recover` restored from a damaged database): the rebuild now skips that row and logs a warning naming its table and rowid
+- Fixed a memory store failing to open, or a model-change embedding rebuild aborting, when one memory row holds a non-text id or content (such as a row SQLite's `.recover` restored from a damaged database): the rebuild now skips that row and logs a warning naming its table and rowid, at most 10 such warnings per open and then one line with the total
 
 ## [18.18.4] - 2026-11-09
 

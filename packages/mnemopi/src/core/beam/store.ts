@@ -360,28 +360,42 @@ interface LiveMemoryRow {
 	readonly content: unknown;
 }
 
+/** How many skipped rows one embedding rebuild names one by one; one more line counts them all. */
+const SKIPPED_ROWS_LOGGED = 10;
+
 /**
  * The rows an embedding rebuild can embed: those with a text id and text to embed.
  *
  * SQLite does not hold a row to its declared column types: a TEXT column keeps a BLOB as it
  * was written, and `id TEXT PRIMARY KEY` on a rowid table admits NULL. A file rebuilt by
  * SQLite's `.recover` can hold such a row. One of them must neither stop the store from
- * opening nor abort the rebuild for every other memory, so it is skipped, and each one is
- * logged with the table and rowid that find it.
+ * opening nor abort the rebuild for every other memory, so it is skipped. A skipped row gets
+ * no vector, so a later open can select and skip it again: each open logs the first
+ * `SKIPPED_ROWS_LOGGED` skipped rows with the table and rowid that find them, and, when it
+ * skips more, one line with the total, so a badly damaged file cannot flood the log.
  */
 function embeddableRows(rows: readonly LiveMemoryRow[]): EmbedItem[] {
 	const items: EmbedItem[] = [];
+	let skipped = 0;
 	for (const { tableName, rowid, memoryId, content } of rows) {
 		if (typeof memoryId === "string" && typeof content === "string") {
 			items.push({ memoryId, content });
 			continue;
 		}
+		skipped += 1;
+		if (skipped > SKIPPED_ROWS_LOGGED) continue;
 		logger.warn("mnemopi: embedding rebuild skipped a memory row that has no text id or no text", {
 			table: tableName,
 			rowid,
 			id: typeof memoryId === "string" ? memoryId : null,
 			idType: sqliteStorageClass(memoryId),
 			contentType: sqliteStorageClass(content),
+		});
+	}
+	if (skipped > SKIPPED_ROWS_LOGGED) {
+		logger.warn("mnemopi: embedding rebuild skipped more memory rows that have no text id or no text", {
+			skipped,
+			logged: SKIPPED_ROWS_LOGGED,
 		});
 	}
 	return items;
