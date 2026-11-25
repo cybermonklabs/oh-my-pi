@@ -11,7 +11,9 @@
 # was started from, checked out at tool/. The gate's are copied over the tree's .github/sami,
 # since its scripts read their lists at .github/sami in the directory they run in. On a push of
 # release-candidate both are the same commit; a dispatch of an older commit (one from before this
-# gate, for example) is judged by the lists at the dispatched ref.
+# gate, for example) is judged by the lists at the dispatched ref. tool/ also holds
+# .github/workflows and .github/sami-checks, which the gate's regression tests read (cache_lint,
+# and the candidate branch every one of those files names).
 #
 # Caches: cache-mode is none here and on the calling job. Test code runs here with the runner's
 # passwordless sudo and can read the job's token; with cache-mode none that token can neither
@@ -108,6 +110,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             .github/sami
+            .github/sami-checks
             .github/actions
             .github/workflows
       - name: Check out the tree under test
@@ -575,6 +578,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             .github/sami
+            .github/sami-checks
             .github/actions
             .github/workflows
       - name: Check out the tree under test

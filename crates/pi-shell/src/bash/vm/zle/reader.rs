@@ -1063,18 +1063,12 @@ impl Reader {
 			vp.status = 1;
 		}
 		if let Some(kind) = ed.tty_error {
-			if let Some(t) = z.tty.as_mut() {
-				let _ = t.flush(k);
-			}
 			if kind != std::io::ErrorKind::UnexpectedEof {
 				let e = std::io::Error::from(kind);
 				let msg = format!("error on TTY read: {}", crate::bash::diag::strerror(&e));
 				k.diag(cx, vp, 0, crate::bash::diag::Diag::Usage { msg: msg.into() });
 			}
 			return Ok(Line::Lost);
-		}
-		if let Some(t) = z.tty.as_mut() {
-			let _ = t.flush(k);
 		}
 		Ok(match got {
 			Got::Status(0) if !ed.eofsent && !ed.aborted => {
@@ -1469,20 +1463,24 @@ fn end_input(vp: &mut Vproc) {
 
 /// Write display bytes to the editing terminal (zsh `shout`), standard
 /// error without one. Behind output the shell still has queued, they wait
-/// their turn there (`exec::flush_out`): zsh's writes block, so nothing
-/// reaches the terminal out of order.
-fn put_tty(k: &Kernel, vp: &mut Vproc, bytes: &[u8]) {
+/// their turn there (`exec::flush_out`). Behind only a hold (an earlier
+/// write still going out, [`super::tty::hold`]) they join the display, so
+/// what the editor draws next comes after them: `PROMPT_SP`, the mail
+/// notice, then the prompt, as zsh writes them. Bytes the terminal does not
+/// take at once hold the vproc's next op ([`Tty::flush_or_hold`]): zsh's
+/// writes block, so nothing reaches the terminal out of order.
+pub(crate) fn put_tty(k: &Kernel, vp: &mut Vproc, bytes: &[u8]) {
 	if bytes.is_empty() {
 		return;
 	}
-	if !vp.out.is_empty() {
+	if super::tty::has_output(&vp.out) {
 		vp.out
 			.push_back(PendingWrite::new(super::tty::FD, BString::from(bytes)));
 		return;
 	}
 	if let Some(t) = vp.zle.as_deref_mut().and_then(|z| z.tty.as_mut()) {
 		t.put(bytes);
-		let _ = t.flush(k);
+		t.flush_or_hold(k, &mut vp.out);
 		return;
 	}
 	vp.out.push_back(PendingWrite::new(2, BString::from(bytes)));

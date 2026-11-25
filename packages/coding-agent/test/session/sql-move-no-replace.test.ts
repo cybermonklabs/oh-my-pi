@@ -20,7 +20,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { getSessionsDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "../helpers/settings-test-state";
-import { readStoredSession } from "../helpers/sql-session-storage";
+import { dropSessionStoreTables, readStoredSession } from "../helpers/sql-session-storage";
 import { reserveWrapped } from "./sql-session-lease-fixture";
 
 const BACKENDS: ReadonlyArray<{ adapter: SqlSessionStorageAdapter; url: string | undefined }> = [
@@ -74,9 +74,7 @@ async function seed(adapter: SqlSessionStorageAdapter, url: string) {
 	};
 	const { client, storage } = await connect();
 	cleanups.push(async () => {
-		await client.unsafe(`DROP TABLE IF EXISTS ${table}_parts`);
-		await client.unsafe(`DROP TABLE IF EXISTS ${table}_blobs`);
-		await client.unsafe(`DROP TABLE IF EXISTS ${table}`);
+		await dropSessionStoreTables(client, table);
 	});
 	const cwd = tempDir.join("from");
 	const sessionDir = path.join(getSessionsDir(), "--from--");

@@ -3074,7 +3074,10 @@ pub(crate) mod tests {
 			let (done, finished) = std::sync::mpsc::channel::<()>();
 			thread::spawn(move || {
 				if finished.recv_timeout(limit) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-					eprintln!("DEADLINE fired: {what} did not return within {limit:?}");
+					// Straight to fd 2: libtest's capture takes `eprintln!`
+					// in this thread too, and `exit` drops what it took.
+					let line = format!("DEADLINE fired: {what} did not return within {limit:?}\n");
+					let _ = io::stderr().write_all(line.as_bytes());
 					std::process::exit(1);
 				}
 			});
@@ -3489,6 +3492,51 @@ pub(crate) mod tests {
 					reader.read_to_end(&mut rest).unwrap();
 					drop(finished);
 					assert_eq!(rest, b"second\n");
+				},
+			);
+		}
+
+		/// A settle and a flush wait until the writer thread is done with the
+		/// chunk it holds, whichever writer handed it off: what runs next
+		/// comes after it. A plain write drops its chunk's mark, so here only
+		/// the unmarked settle ([`File::poll_settle`]) and the flush can wait
+		/// for that chunk. Both are `Pending` while it waits for room in the
+		/// full pipe, and both finish once the pipe drains.
+		#[cfg(target_os = "linux")]
+		#[test]
+		fn a_settle_and_a_flush_wait_for_the_chunk_the_writer_thread_holds() {
+			in_blocking_writer_process(
+				concat!(
+					module_path!(),
+					"::a_settle_and_a_flush_wait_for_the_chunk_the_writer_thread_holds"
+				),
+				|| {
+					let (mut writer, mut reader) = pipe_with_free(0);
+					assert!(!writer.has_private_writer());
+					let flag = Arc::new(Flag::default());
+					let waker = Waker::from(Arc::clone(&flag));
+					let mut cx = Context::from_waker(&waker);
+					let finished = deadline("a settle of a held chunk", Duration::from_secs(5));
+					let wrote = writer.poll_write(&mut cx, b"held\n");
+					assert!(matches!(wrote, Poll::Ready(Ok(5))), "{wrote:?}");
+					assert!(
+						writer.poll_settle(&mut cx).is_pending(),
+						"the settle did not wait for the chunk"
+					);
+					assert!(
+						writer.poll_flush(&mut cx).is_pending(),
+						"the flush did not wait for the chunk"
+					);
+					let mut fill = vec![0u8; pipe_capacity(&reader)];
+					reader.read_exact(&mut fill).unwrap();
+					let mut line = [0u8; 5];
+					reader.read_exact(&mut line).unwrap();
+					assert_eq!(&line, b"held\n");
+					while writer.poll_settle(&mut cx).is_pending() {
+						flag.wait("the writer thread finished the chunk");
+					}
+					flush(&mut writer, &flag, &mut cx);
+					drop(finished);
 				},
 			);
 		}

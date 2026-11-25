@@ -709,7 +709,9 @@ fn is_zombie(pid: u32) -> bool {
 /// write of up to `PIPE_BUF` then waited in the kernel on the runtime's only
 /// worker, where the capture's reader and every timer run. On a one-worker
 /// runtime the run must deliver all its bytes, and a timer started beside
-/// it must fire.
+/// it must fire. That the timer fires is the claim, not its length: a write
+/// that waits in the kernel there holds the capture's reader too, so the run
+/// never returns and the bound fails the test, whatever the timer's length.
 #[cfg(unix)]
 #[test]
 fn a_run_that_overfills_its_capture_lets_a_timer_beside_it_fire() {
@@ -723,7 +725,7 @@ fn a_run_that_overfills_its_capture_lets_a_timer_beside_it_fire() {
 			.build()
 			.expect("single-worker runtime");
 		let _ = tx.send(runtime.block_on(async {
-			let timer = tokio::spawn(tokio::time::sleep(Duration::from_secs(2)));
+			let timer = tokio::spawn(tokio::time::sleep(Duration::from_millis(1)));
 			let run = capture_unlocked(
 				"printf x; printf '%0300000d\\n' 0",
 				None,
@@ -742,17 +744,206 @@ fn a_run_that_overfills_its_capture_lets_a_timer_beside_it_fire() {
 	assert_eq!(output.len(), 300_002, "every byte of the run reached the capture");
 }
 
+/// The pid `pidfile` names once the external that wrote it is gone from
+/// procfs: reaped, since an exited child nobody reaped stays there as a
+/// zombie (the control of the test below shows it). `Err` names what was
+/// not seen within `limit`.
+#[cfg(target_os = "linux")]
+fn reaped_external(pidfile: &std::path::Path, limit: Duration) -> Result<u32, String> {
+	let deadline = std::time::Instant::now() + limit;
+	let pid = loop {
+		// `echo $$ >` writes the whole line at once; until then it is empty.
+		if let Some(pid) = std::fs::read_to_string(pidfile)
+			.ok()
+			.and_then(|line| line.strip_suffix('\n')?.parse::<u32>().ok())
+		{
+			break pid;
+		}
+		if std::time::Instant::now() >= deadline {
+			return Err(format!(
+				"the external wrote no pid to {} within {limit:?}",
+				pidfile.display()
+			));
+		}
+		std::thread::sleep(Duration::from_millis(1));
+	};
+	while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+		if std::time::Instant::now() >= deadline {
+			return Err(format!(
+				"the external {pid} was not reaped within {limit:?} (a zombie: {})",
+				is_zombie(pid)
+			));
+		}
+		std::thread::sleep(Duration::from_millis(1));
+	}
+	Ok(pid)
+}
+
+/// The name of the reap tests' runtime threads.
+#[cfg(target_os = "linux")]
+const REAP_RUNTIME: &str = "reap-runtime";
+
+/// The tid and scheduler state (`R`, `S`, ...) of each of this process's
+/// threads named `comm`, by tid.
+#[cfg(target_os = "linux")]
+fn thread_states(comm: &str) -> Vec<(u32, char)> {
+	let mut states: Vec<(u32, char)> = std::fs::read_dir("/proc/self/task")
+		.expect("this process's threads in /proc/self/task")
+		.flatten()
+		.filter_map(|task| {
+			let name = std::fs::read_to_string(task.path().join("comm")).ok()?;
+			if name.trim() != comm {
+				return None;
+			}
+			let stat = std::fs::read_to_string(task.path().join("stat")).ok()?;
+			let state = stat.rsplit_once(") ")?.1.chars().next()?;
+			Some((task.file_name().to_str()?.parse().ok()?, state))
+		})
+		.collect();
+	states.sort_unstable();
+	states
+}
+
+/// Until the builtin's write to the full output pipe is seen waiting for
+/// room. On both routes it reads: the run's output channel full (its reader
+/// parks on it, so nothing drains the pipe any more); then, on two polls
+/// 1 ms apart, every thread of the runtime ([`REAP_RUNTIME`]) asleep (`S`)
+/// and, read after them, `runtime`'s only worker parked with one park/unpark
+/// count (odd while parked) at both polls. A write that waits in the kernel
+/// holds that worker instead.
+///
+/// On the private-reopen route the worker parks only while the write waits
+/// for room (a readiness watch, or a retry timer where the pipe polls
+/// writable with too little free: `StdFile::wait_for_room` in
+/// `crates/pi-shell/src/sys/fs.rs`), so that is enough. On the writer-thread
+/// route (`writers`: the `obash-write` threads there were before the run)
+/// the worker also parks for each hand-off, while the writer thread writes
+/// the chunk; so there it also reads the writer threads the run started,
+/// asleep at both polls (read first). The builtin echoes forever, so a
+/// hand-off that completes wakes the worker at once (the writer thread wakes
+/// its waiters before it waits for the next chunk, `BlockingWriter::start`),
+/// and a writer thread writes to a pipe with room without sleeping: a writer
+/// asleep, then the worker asleep and parked with the same count, means the
+/// hand-off waits, the writer asleep in its write to the full pipe. Linux
+/// shows a woken thread as `R` at once, so a worker woken but not yet run
+/// fails the check. gVisor shows a woken task as `S` until it runs, so there
+/// the check cannot rule out a woken writer thread or worker that has not
+/// run for 1 ms or more on a loaded runner, just after a hand-off was made
+/// or completed. `Err` names what was not seen within `limit`.
+#[cfg(target_os = "linux")]
+fn the_builtin_waits_for_room(
+	undrained: &flume::Receiver<String>,
+	runtime: &tokio::runtime::RuntimeMetrics,
+	writers: Option<&std::collections::HashSet<u32>>,
+	limit: Duration,
+) -> Result<(), String> {
+	let start = std::time::Instant::now();
+	while !undrained.is_full() {
+		if start.elapsed() >= limit {
+			return Err(format!("the shell wrote nothing within {limit:?}"));
+		}
+		std::thread::sleep(Duration::from_millis(1));
+	}
+	let parked = || Some(runtime.worker_park_unpark_count(0)).filter(|n| !n.is_multiple_of(2));
+	// The threads that must sleep, writer threads first; `None` while one
+	// of them does not.
+	let asleep = || -> Option<Vec<u32>> {
+		let mut tids = Vec::new();
+		if let Some(before) = writers {
+			let started: Vec<(u32, char)> = thread_states("obash-write")
+				.into_iter()
+				.filter(|(tid, _)| !before.contains(tid))
+				.collect();
+			if started.is_empty() || started.iter().any(|&(_, state)| state != 'S') {
+				return None;
+			}
+			tids.extend(started.into_iter().map(|(tid, _)| tid));
+		}
+		let threads = thread_states(REAP_RUNTIME);
+		if threads.is_empty() || threads.iter().any(|&(_, state)| state != 'S') {
+			return None;
+		}
+		tids.extend(threads.into_iter().map(|(tid, _)| tid));
+		Some(tids)
+	};
+	let mut ever_parked = false;
+	while start.elapsed() < limit {
+		let first = asleep().zip(parked());
+		std::thread::sleep(Duration::from_millis(1));
+		if let Some((threads, count)) = first {
+			ever_parked = true;
+			if asleep().as_ref() == Some(&threads) && parked() == Some(count) {
+				return Ok(());
+			}
+		}
+		ever_parked |= parked().is_some();
+	}
+	Err(if ever_parked {
+		format!(
+			"the builtin's write was never seen waiting for room within {limit:?}: runtime threads \
+			 {:?}, writer threads {:?}",
+			thread_states(REAP_RUNTIME),
+			thread_states("obash-write")
+		)
+	} else {
+		"the runtime's only worker never went idle: the builtin's write held it".to_owned()
+	})
+}
+
+/// Lets the external that reads `fifo` (`read _ < FIFO`) end: a line from a
+/// writer that connects without waiting, once the external holds the read
+/// end (until then the open fails with `ENXIO`). The writer is returned, to
+/// stay open until the test ends. `Err` once `limit` passed without a
+/// reader.
+#[cfg(target_os = "linux")]
+fn let_the_external_end(fifo: &std::path::Path, limit: Duration) -> Result<std::fs::File, String> {
+	use std::os::unix::fs::OpenOptionsExt as _;
+
+	let start = std::time::Instant::now();
+	loop {
+		match std::fs::OpenOptions::new()
+			.write(true)
+			.custom_flags(libc::O_NONBLOCK)
+			.open(fifo)
+		{
+			Ok(mut writer) => {
+				std::io::Write::write_all(&mut writer, b"\n")
+					.map_err(|e| format!("the line to the external: {e}"))?;
+				return Ok(writer);
+			},
+			Err(e) if e.raw_os_error() == Some(libc::ENXIO) && start.elapsed() < limit => {
+				std::thread::sleep(Duration::from_millis(1));
+			},
+			Err(e) => return Err(format!("the external never opened {}: {e}", fifo.display())),
+		}
+	}
+}
+
 /// A real external child that exits while a builtin writes to a full
-/// output pipe nothing drains must be reaped: its `waitpid` runs on the
-/// runtime (`UnixProc`'s `Drop` and `reap`,
+/// output pipe nothing drains must be reaped while that builtin still
+/// writes: its `waitpid` runs on the runtime (the external's vproc drops it
+/// once it exits, and `UnixProc`'s `Drop` reaps it,
 /// `crates/pi-shell/src/sys/spawn/unix.rs`), which a write that waited in the
 /// kernel would hold for good. The child is `/bin/sh` by absolute path, so it
-/// is an external process, and it writes its own pid. A control first shows
-/// that the check sees a child nobody reaped.
+/// is an external process; it writes its own pid, then waits on a FIFO that
+/// the test writes to once the builtin's write is seen waiting for room, so
+/// it exits while that write waits (on gVisor, see the limit in
+/// `the_builtin_waits_for_room`). A control first shows that the check
+/// sees a child nobody reaped. The run never ends on its own: it is
+/// cancelled once the external is seen reaped, so it ends by that cancel,
+/// not by a timeout, and a cancelled run still ran when the reap was seen.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_external_child_of_a_run_with_a_full_output_pipe_is_reaped() {
+	external_child_is_reaped(false);
+}
+
+/// [`an_external_child_of_a_run_with_a_full_output_pipe_is_reaped`], on the
+/// writer-thread route when `writer_thread` (in a test's child process).
+#[cfg(target_os = "linux")]
+fn external_child_is_reaped(writer_thread: bool) {
 	const BOUND: Duration = Duration::from_secs(15);
+	const LIMIT: Duration = Duration::from_secs(10);
 	let mut control = std::process::Command::new("/bin/true")
 		.spawn()
 		.expect("spawn the control");
@@ -765,46 +956,56 @@ fn an_external_child_of_a_run_with_a_full_output_pipe_is_reaped() {
 	assert!(!is_zombie(control.id()), "the control was reaped");
 
 	let _guard = shell_test_lock().blocking_lock();
-	let stamp = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.unwrap()
-		.as_nanos();
-	let pidfile = std::env::temp_dir().join(format!("pi-shell-reap-{}-{stamp}", std::process::id()));
+	let dir = tempfile::tempdir().expect("scratch directory");
+	let (pidfile, fifo) = (dir.path().join("pid"), dir.path().join("fifo"));
+	pi_vfs::BlockingFs::native()
+		.make_node(&fifo, pi_vfs::NodeKind::Fifo, 0o600)
+		.expect("create FIFO");
 	let command = format!(
-		"/bin/sh -c 'echo $$ > {}; sleep 0.3' & while :; do echo 0123456789abcdefghi; done",
-		pidfile.display()
+		"/bin/sh -c 'echo $$ > {}; read _ < {}' & while :; do echo 0123456789abcdefghi; done",
+		pidfile.display(),
+		fifo.display()
 	);
 	let (chunks, undrained) = flume::bounded::<String>(1);
+	let mut cancel = CancelToken::default();
+	let abort = cancel.emplace_abort_token();
+	let writers = writer_thread.then(crate::session::held::writer_threads);
+	let runtime = tokio::runtime::Builder::new_multi_thread()
+		.worker_threads(1)
+		.thread_name(REAP_RUNTIME)
+		.enable_all()
+		.build()
+		.expect("single-worker runtime");
+	let metrics = runtime.metrics();
 	let (tx, rx) = std::sync::mpsc::channel();
 	std::thread::spawn(move || {
-		let runtime = tokio::runtime::Builder::new_multi_thread()
-			.worker_threads(1)
-			.enable_all()
-			.build()
-			.expect("single-worker runtime");
-		let options = ShellExecuteOptions { command, timeout_ms: Some(2000), ..Default::default() };
-		let result =
-			runtime.block_on(execute_shell(options, Some(chunks), CancelToken::new(Some(2000))));
+		let options = ShellExecuteOptions { command, ..Default::default() };
+		let result = runtime.block_on(execute_shell(options, Some(chunks), cancel));
 		runtime.shutdown_timeout(Duration::from_secs(3));
 		let _ = tx.send(result);
 	});
+	// The external is let go on every path, so it never waits on its FIFO
+	// past the test.
+	let waits = the_builtin_waits_for_room(&undrained, &metrics, writers.as_ref(), LIMIT);
+	let writer = let_the_external_end(&fifo, LIMIT);
+	waits.unwrap_or_else(|missed| panic!("{missed}"));
+	let _writer = writer.unwrap_or_else(|missed| panic!("{missed}"));
+	// The cancel comes once the reap was seen, or once 10 s passed without it.
+	let reaped = reaped_external(&pidfile, LIMIT);
+	abort.abort(AbortReason::Signal);
+	// Drained from now on, the cancelled run ends at once; it does not end
+	// on its own, so its end is still the cancel.
+	let drain = std::thread::spawn(move || while undrained.recv().is_ok() {});
 	let result = rx
 		.recv_timeout(BOUND)
-		.unwrap_or_else(|_| panic!("DEADLINE fired: the run did not return within {BOUND:?}"))
+		.unwrap_or_else(|_| {
+			panic!("DEADLINE fired: the run did not return within {BOUND:?} (the reap: {reaped:?})")
+		})
 		.expect("execute_shell");
-	drop(undrained);
-	assert!(result.timed_out, "{result:?}");
-	let pid: u32 = std::fs::read_to_string(&pidfile)
-		.expect("the external wrote its pid")
-		.trim()
-		.parse()
-		.expect("a pid");
-	let _ = std::fs::remove_file(&pidfile);
-	let reaped = std::time::Instant::now();
-	while is_zombie(pid) {
-		assert!(reaped.elapsed() < Duration::from_secs(2), "the external {pid} is left a zombie");
-		std::thread::sleep(Duration::from_millis(10));
-	}
+	drain.join().expect("the drain");
+	let pid = reaped.unwrap_or_else(|missed| panic!("{missed}"));
+	// The end is the cancel that followed the reap, not the run's timeout.
+	assert!(result.cancelled, "the run ended before the external {pid} was seen reaped: {result:?}");
 }
 
 /// The same through the writer-thread route, forced on Linux in this
@@ -817,7 +1018,7 @@ fn an_external_child_of_a_run_with_a_full_output_pipe_through_the_writer_thread_
 			module_path!(),
 			"::an_external_child_of_a_run_with_a_full_output_pipe_through_the_writer_thread_is_reaped"
 		),
-		an_external_child_of_a_run_with_a_full_output_pipe_is_reaped,
+		|| external_child_is_reaped(true),
 	);
 }
 

@@ -39,7 +39,7 @@ import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { sessionLocalProtocolOptions } from "@oh-my-pi/pi-coding-agent/internal-urls/context";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { MCPManager, type MCPToolScope } from "@oh-my-pi/pi-coding-agent/mcp/manager";
-import { AgentLifecycleManager, type AgentReviver } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { type AdoptedReviver, AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -921,7 +921,7 @@ export class ReviveEnv {
 	/** Drop the warm reviver of `id`, as `MainSessionBridge.exit` does when the subagent's worker exits. */
 	dropWarmReviver(id: string): void {
 		const opts = this.#adopt.mock.calls.findLast(([adopted]) => adopted === id)?.[1];
-		const revive: AgentReviver | undefined = opts?.revive;
+		const revive: AdoptedReviver | undefined = opts?.revive;
 		if (!revive || !this.#lifecycle.forgetReviver(id, revive)) throw new Error(`${id} has no warm reviver to drop`);
 	}
 

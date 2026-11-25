@@ -181,6 +181,11 @@ pub struct Expander<'e, 'c> {
 	/// The command evaluating arithmetic here (`((` for `(( ))` and the
 	/// arith-`for` header): it prefixes non-fatal arithmetic warnings.
 	pub arith_cmd:  Option<&'static str>,
+	/// How many times a read of a missing element warns `name: bad array
+	/// subscript` ([`Self::var_value`]): bash's `@a` and `@A` look the
+	/// element up twice (`parameter_brace_transform`), every other
+	/// expansion once.
+	sub_looks:      u8,
 	ifs:            IfsCache,
 	/// `set -f` and `shopt extglob`, looked up once per expansion.
 	glob_opts:      Option<GlobOpts>,
@@ -271,6 +276,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 			line,
 			sub_status: None,
 			arith_cmd: None,
+			sub_looks: 1,
 			ifs: IfsCache::Unknown,
 			glob_opts: None,
 			pool: Vec::new(),
@@ -610,14 +616,82 @@ impl<'e, 'c> Expander<'e, 'c> {
 		Ok(Cow::Owned(expanded.into()))
 	}
 
+	/// `[[ -v name[sub] ]]`'s operand once its subscript is expanded here,
+	/// as bash's `-v` does again (`execute_cond_node` runs it with
+	/// `array_expand_once` off: `[[ -v 'a[$(echo 1)]' ]]` finds `a[1]`): an
+	/// index as arithmetic text, a key of an associative array (a declared
+	/// empty one, or one a name reference names, too) as a key, the result
+	/// backslash-quoted for the evaluator. Here the expansion can run a
+	/// command substitution and park, which the `[[ ]]` primary cannot.
+	/// Any other operand comes back as it is.
+	pub fn cond_v_operand(&mut self, operand: BString) -> X<BString> {
+		let (Some(open), true) = (operand.find_byte(b'['), operand.ends_with(b"]")) else {
+			return Ok(operand);
+		};
+		let (name, sub) = (&operand[..open], &operand[open + 1..operand.len() - 1]);
+		// Only a `$` or `` ` `` the words' expansion left unquoted is
+		// expanded here: one written in single quotes, or in the value of
+		// an expansion outside any subscript (`[[ -v $ref ]]`), which bash
+		// expands here too. A subscript's expansion, unquoted or in double
+		// quotes, came back backslash-quoted ([`Self::arith_operand`]): its
+		// value is the primary's to unquote, never expanded again.
+		let mut live = false;
+		let mut i = 0;
+		while i < sub.len() {
+			match sub[i] {
+				b'\\' => i += 2,
+				b'$' | b'`' => {
+					live = true;
+					break;
+				},
+				_ => i += 1,
+			}
+		}
+		if !live || !super::is_ident(name) {
+			return Ok(operand);
+		}
+		let target = match state::deref(&self.k.root, self.cx.store, self.vp, name)? {
+			state::Deref::To { name: t, index: None } => Some(t),
+			_ => None,
+		};
+		let assoc = self.is_assoc(target.as_ref().map_or(name, |t| t.as_slice()))?;
+		let mut value = if assoc {
+			self.expand_arith_text(&subscript_as_arith_text(sub))?
+		} else {
+			BString::from(self.expand_text(sub)?.into_owned())
+		};
+		// An empty index evaluates to 0, as any empty arithmetic does
+		// (`[[ -v 'a[$(echo)]' ]]` asks for `a[0]`).
+		if !assoc && value.is_empty() {
+			value.push(b'0');
+		}
+		// Quoted as the words' expansion quotes a subscript's value (bash
+		// `sh_backslash_quote` with `expand_array_subscript`'s table).
+		let mut out = BString::from(name);
+		out.push(b'[');
+		for &c in value.iter() {
+			if matches!(c, b'[' | b']' | b'$' | b'`' | b'~' | b'\\' | b'\'' | b'"') {
+				out.push(b'\\');
+			}
+			out.push(c);
+		}
+		out.push(b']');
+		Ok(out)
+	}
+
 	/// An arithmetic operand of `[[ ]]` (`-eq` … `-ge`) or the `-v`
-	/// operand (bash `cond_expand_word` with `Q_ARITH`): one unquoted word,
-	/// neither split nor globbed, except that each unquoted subscript
-	/// (`name[…]`) is expanded on its own (no process substitution) and
-	/// comes back backslash-quoted for the evaluator (bash
-	/// `expand_array_subscript`): `assoc[$key]` with `key='x]'` is
-	/// `assoc[x\]]`. Without `quote` (`[[ -v ]]` under `assoc_expand_once`,
-	/// whose key is used as it is) the expansion comes back unquoted.
+	/// operand (bash `cond_expand_word` with `Q_ARITH`): one word, neither
+	/// split nor globbed, except that each subscript (a `[` with a matching
+	/// `]` and something between), unquoted or in double quotes, is
+	/// expanded on its own like an unquoted word (no process substitution)
+	/// and comes back backslash-quoted for the evaluator (bash
+	/// `expand_array_subscript`): `assoc[$key]` and `"assoc[$key]"` with
+	/// `key='x]'` are `assoc[x\]]`, and what a value holds is never
+	/// expanded again (`key='$(cmd)'` runs nothing). Only text written in
+	/// single quotes reaches the evaluator unquoted (`'a[$(cmd)]'` runs
+	/// `cmd` there). Without `quote` (`[[ -v ]]` under
+	/// `assoc_expand_once`, whose key is used as it is) the expansion comes
+	/// back unquoted.
 	pub fn arith_operand(&mut self, unit: &Arc<Unit>, w: &Word, quote: bool) -> X<BString> {
 		let src = unit
 			.nodes
@@ -639,47 +713,95 @@ impl<'e, 'c> Expander<'e, 'c> {
 						.position(|&c| c == b'\'')
 						.map_or(src.len(), |n| i + n + 2);
 				},
-				b'"' => i = skip_dquoted(src, i + 1).map_or(src.len(), |e| e + 1),
+				// bash expands a double-quoted part with `Q_ARITH` too, so a
+				// subscript in it is expanded and quoted as an unquoted one
+				// is; the text around it is double-quoted as before.
+				b'"' => {
+					let close = skip_dquoted(src, i + 1).unwrap_or(src.len());
+					// The double-quoted text not yet in `out`.
+					let mut piece = i + 1;
+					let mut j = i + 1;
+					while j < close {
+						match src[j] {
+							b'\\' => j += 2,
+							b'`' => j = skip_backquote(src, j + 1).map_or(close, |e| e + 1),
+							b'$' if matches!(src.get(j + 1), Some(b'(' | b'{' | b'[')) => {
+								let (open, end) = pair_of(src[j + 1]);
+								j = skip_pair(src, j + 2, open, end).map_or(close, |e| e + 1);
+							},
+							b'[' => match skip_pair(&src[..close], j + 1, b'[', b']') {
+								Some(end) if end > j + 1 => {
+									if piece == i + 1 {
+										out.extend_from_slice(&subscript_as_arith_text(&src[last..i]));
+									}
+									out.push(b'"');
+									out.extend_from_slice(&src[piece..=j]);
+									out.push(b'"');
+									self.push_subscript(&mut out, &src[j + 1..end], quote)?;
+									piece = end;
+									j = end + 1;
+								},
+								_ => j += 1,
+							},
+							_ => j += 1,
+						}
+					}
+					if piece != i + 1 {
+						out.push(b'"');
+						out.extend_from_slice(&src[piece..close.min(src.len())]);
+						out.push(b'"');
+						last = (close + 1).min(src.len());
+					}
+					i = close + 1;
+				},
 				b'`' => i = skip_backquote(src, i + 1).map_or(src.len(), |e| e + 1),
 				b'$' if matches!(src.get(i + 1), Some(b'(' | b'{' | b'[')) => {
 					let (open, close) = pair_of(src[i + 1]);
 					i = skip_pair(src, i + 2, open, close).map_or(src.len(), |e| e + 1);
 				},
-				b'[' if i > 0 && (src[i - 1].is_ascii_alphanumeric() || src[i - 1] == b'_') => {
-					match skip_pair(src, i + 1, b'[', b']') {
-						Some(end) if end > i + 1 => {
-							let sub = &src[i + 1..end];
-							let value = if sub
-								.iter()
-								.any(|c| matches!(c, b'$' | b'`' | b'\\' | b'"' | b'\''))
-							{
-								self.expand_arith_text(&subscript_as_arith_text(sub))?
-							} else {
-								BString::from(sub)
-							};
-							out.extend_from_slice(&subscript_as_arith_text(&src[last..=i]));
-							if quote {
-								push_quoted_subscript(&mut out, &value);
-							} else {
-								for &c in value.iter() {
-									// Escaped only for the arithmetic-text parse.
-									if matches!(c, b'$' | b'`' | b'"' | b'\\') {
-										out.push(b'\\');
-									}
-									out.push(c);
-								}
-							}
-							last = end;
-							i = end + 1;
-						},
-						_ => i += 1,
-					}
+				b'[' => match skip_pair(src, i + 1, b'[', b']') {
+					Some(end) if end > i + 1 => {
+						out.extend_from_slice(&subscript_as_arith_text(&src[last..=i]));
+						self.push_subscript(&mut out, &src[i + 1..end], quote)?;
+						last = end;
+						i = end + 1;
+					},
+					_ => i += 1,
 				},
 				_ => i += 1,
 			}
 		}
 		out.extend_from_slice(&subscript_as_arith_text(&src[last.min(src.len())..]));
 		self.expand_arith_text(&out)
+	}
+
+	/// Append the subscript `sub`, expanded as an unquoted word (bash
+	/// `expand_subscript_string`), to the arithmetic text `out`:
+	/// backslash-quoted for the evaluator when `quote`, else escaped only
+	/// for the arithmetic-text parse.
+	fn push_subscript(&mut self, out: &mut Vec<u8>, sub: &[u8], quote: bool) -> X<()> {
+		let expanded;
+		let value = if sub
+			.iter()
+			.any(|c| matches!(c, b'$' | b'`' | b'\\' | b'"' | b'\''))
+		{
+			expanded = self.expand_arith_text(&subscript_as_arith_text(sub))?;
+			expanded.as_slice()
+		} else {
+			sub
+		};
+		if quote {
+			push_quoted_subscript(out, value);
+		} else {
+			for &c in value {
+				// Escaped only for the arithmetic-text parse.
+				if matches!(c, b'$' | b'`' | b'"' | b'\\') {
+					out.push(b'\\');
+				}
+				out.push(c);
+			}
+		}
+		Ok(())
 	}
 
 	/// Expand `text` parsed as arithmetic text.
@@ -1247,7 +1369,15 @@ impl<'e, 'c> Expander<'e, 'c> {
 						None if *colon => BString::from("parameter null or not set"),
 						None => BString::from("parameter not set"),
 					};
-					return Err(Stop::Fatal(Diag::ParamUnset { name: Self::param_name(p), msg }));
+					// bash names the parameter as written: `x[$i]`, `u[@]`,
+					// `!v` (`parameter_brace_expand_error`).
+					let mut name = Self::unbound_name(unit, p, p.indirect);
+					match p.index {
+						Some(SubIr::At) => name.extend_from_slice(b"[@]"),
+						Some(SubIr::Star) => name.extend_from_slice(b"[*]"),
+						_ => {},
+					}
+					return Err(Stop::Fatal(Diag::ParamUnset { name, msg }));
 				}
 				self.push(sink, v, quoted, rhs)?;
 			},
@@ -1428,7 +1558,12 @@ impl<'e, 'c> Expander<'e, 'c> {
 					None
 				};
 				let q = target.as_ref().unwrap_or(p);
-				let v = self.value(unit, q)?;
+				if matches!(*op, b'a' | b'A') {
+					self.sub_looks = 2;
+				}
+				let v = self.value(unit, q);
+				self.sub_looks = 1;
+				let v = v?;
 				// `set -u`: an unset value is an error, except that `@a` and
 				// `@A` of a whole variable need only some element
 				// (`declare -a a=([1]=x); ${a@a}` is fine, `${a@Q}`,
@@ -2265,13 +2400,20 @@ impl<'e, 'c> Expander<'e, 'c> {
 	}
 
 	/// The plain reference `${!v@op}` turns into: `name` taken from `v`'s
-	/// value; `None` when `v` is no plain variable or names no variable
-	/// name (the general indirection path handles those).
+	/// value; `None` when `v` is a name reference or no plain variable, or
+	/// names no variable name (the general indirection path handles those:
+	/// a reference's `${!r@op}` applies the operator to `${!r}`, the name it
+	/// refers to, and `@a`/`@A` describe the target).
 	fn indirect_target(&mut self, p: &ParamIr) -> X<Option<ParamIr>> {
 		let (ParamRef::Var(n), None) = (&p.param, &p.index) else {
 			return Ok(None);
 		};
 		let n = n.clone();
+		if state::lookup_declared(&self.k.root, self.cx.store, self.vp, &n)?
+			.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF))
+		{
+			return Ok(None);
+		}
 		let Val::Str(target) = self.read_atom(|ex| ex.var_value(&n, None, false))? else {
 			return Ok(None);
 		};
@@ -2447,16 +2589,24 @@ impl<'e, 'c> Expander<'e, 'c> {
 	/// `list`), including bash's dynamic variables.
 	fn var_value(&mut self, name: &[u8], index: Option<&[u8]>, list: bool) -> X<Val> {
 		if let Some(v) = self.dynamic(name)? {
+			let n: i64 = index
+				.and_then(|i| std::str::from_utf8(i).ok()?.parse().ok())
+				.unwrap_or(0);
 			return Ok(match (v, list) {
 				(DynVal::Str(s), true) => Val::List { items: vec![s], star: false },
 				(DynVal::Str(s), false) if index.is_none_or(|i| i == b"0") => Val::Str(s),
+				// A scalar has no element to count back from.
+				(DynVal::Str(_), false) if n < 0 => {
+					self.warn_bad_sub(name);
+					Val::Unset
+				},
 				(DynVal::Str(_), false) => Val::Unset,
 				(DynVal::List(items), true) => Val::List { items, star: false },
 				(DynVal::List(items), false) => {
-					let i: i64 = index
-						.and_then(|i| std::str::from_utf8(i).ok()?.parse().ok())
-						.unwrap_or(0);
-					let i = if i < 0 { items.len() as i64 + i } else { i };
+					let i = if n < 0 { items.len() as i64 + n } else { n };
+					if i < 0 {
+						self.warn_bad_sub(name);
+					}
 					usize::try_from(i)
 						.ok()
 						.and_then(|i| items.get(i).cloned())
@@ -2513,16 +2663,18 @@ impl<'e, 'c> Expander<'e, 'c> {
 		let Some(var) = state::lookup(&self.k.root, self.cx.store, self.vp, name)? else {
 			// A negative subscript of an unset (or declared, unset) array
 			// has no element to count back from: bash warns as for one
-			// past the start (`declare -ar c; ${c[-4]}`).
+			// past the start (`declare -ar c; ${c[-4]}`). Outside a function
+			// `FUNCNAME` is invisible but holds elements to count back from
+			// ([`hidden_funcname_len`](super::callstack::hidden_funcname_len)).
 			if !list
 				&& let Some(i) = index
 				&& i.starts_with(b"-")
 				&& !self.is_assoc(name)?
+				&& super::callstack::hidden_funcname_len(self.cx.store, self.vp, name)?
+					.is_none_or(|len| len + parse_index(i) < 0)
 			{
-				let msg = format!("{}: bad array subscript", name.as_bstr()).into();
-				self
-					.k
-					.diag(self.cx, self.vp, self.line, Diag::Usage { msg });
+				let shown = self.resolved_name(name)?;
+				self.warn_bad_sub(&shown);
 			}
 			return Ok(Val::Unset);
 		};
@@ -2542,20 +2694,59 @@ impl<'e, 'c> Expander<'e, 'c> {
 						.ok()
 						.and_then(|i| i.parse().ok())
 						.unwrap_or(0);
-					let n = if n < 0 { var.next_index() + n } else { n };
+					// bash counts a negative subscript back from the end of an
+					// array; a scalar has none, so it warns and expands to
+					// nothing (`x=abc; ${x[-1]}`), as for one before the start
+					// of an array (`${c[-4]}` of a 2-element array).
+					let n = match &var.value {
+						VarValue::Indexed(_) if n < 0 => var.next_index() + n,
+						_ => n,
+					};
 					if n < 0 {
-						// bash warns and expands to nothing (`${c[-4]}` of a
-						// 2-element array).
-						let msg = format!("{}: bad array subscript", name.as_bstr()).into();
-						self
-							.k
-							.diag(self.cx, self.vp, self.line, Diag::Usage { msg });
+						let shown = self.resolved_name(name)?;
+						self.warn_bad_sub(&shown);
 						return Ok(Val::Unset);
 					}
 					var.index(n)
 						.map_or(Val::Unset, |s| Val::Str(BString::from(s)))
 				}
 			},
+		})
+	}
+
+	/// bash's `name: bad array subscript` for a read of an element `name`
+	/// cannot have, once per lookup the expansion makes
+	/// ([`Self::sub_looks`]).
+	fn warn_bad_sub(&mut self, name: &[u8]) {
+		for _ in 0..self.sub_looks {
+			let msg = format!("{}: bad array subscript", name.as_bstr()).into();
+			self
+				.k
+				.diag(self.cx, self.vp, self.line, Diag::Usage { msg });
+		}
+	}
+
+	/// The variable `name` stands for: a name reference's target (bash
+	/// names it in messages), else `name`.
+	fn resolved_name(&mut self, name: &[u8]) -> X<BString> {
+		Ok(match state::deref(&self.k.root, self.cx.store, self.vp, name)? {
+			state::Deref::To { name: target, index: None } => target,
+			_ => BString::from(name),
+		})
+	}
+
+	/// The variable `${name@a}` and `${name@A}` describe: a name reference's
+	/// target (bash's `find_variable` follows it); `None` when the reference
+	/// names no variable (none set, an array element, a loop).
+	fn described(&mut self, name: &[u8]) -> X<Option<BString>> {
+		if !state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)?
+			.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF))
+		{
+			return Ok(Some(BString::from(name)));
+		}
+		Ok(match state::deref(&self.k.root, self.cx.store, self.vp, name)? {
+			state::Deref::To { name: target, index: None } => Some(target),
+			_ => None,
 		})
 	}
 
@@ -2690,13 +2881,17 @@ impl<'e, 'c> Expander<'e, 'c> {
 			b'U' => map_val(v, |s| BString::from(s.to_uppercase())),
 			b'L' => map_val(v, |s| BString::from(s.to_lowercase())),
 			b'u' => map_val(v, |s| case_convert(s, CaseIr::Upper, false, None)),
-			// Declared-but-unset variables keep their attributes here.
+			// Declared-but-unset variables keep their attributes here; a name
+			// reference's are its target's.
 			b'a' => {
-				let attrs = match &p.param {
-					ParamRef::Var(n) => {
-						state::lookup_declared(&self.k.root, self.cx.store, self.vp, n)?.map(attr_letters)
-					},
+				let target = match &p.param {
+					ParamRef::Var(n) => self.described(n)?,
 					_ => None,
+				};
+				let attrs = match target {
+					Some(t) => state::lookup_declared(&self.k.root, self.cx.store, self.vp, &t)?
+						.map(attr_letters),
+					None => None,
 				};
 				let attrs = attrs.unwrap_or_default();
 				// One copy per element of `${a[@]@a}`.
@@ -2707,7 +2902,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 					_ => Val::Str(attrs),
 				}
 			},
-			// bash `string_var_assignment` / `array_var_assignment`.
+			// bash `string_var_assignment` / `array_var_assignment`, of a name
+			// reference's target.
 			b'A' => match (&p.param, &p.index) {
 				(ParamRef::At | ParamRef::Star, _) => {
 					let Val::List { items, .. } = v else {
@@ -2720,21 +2916,26 @@ impl<'e, 'c> Expander<'e, 'c> {
 					}
 					Val::Str(out)
 				},
-				(ParamRef::Var(name), Some(SubIr::At | SubIr::Star)) => {
+				(ParamRef::Var(name), sub) => {
+					let Some(name) = self.described(name)? else {
+						return Ok(Val::Unset);
+					};
 					let Some(var) =
-						state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)?.cloned()
+						state::lookup_declared(&self.k.root, self.cx.store, self.vp, &name)?.cloned()
 					else {
 						return Ok(Val::Unset);
 					};
-					let mut out = Vec::new();
-					super::builtins::declare_line(name, Some(&var), &mut out);
-					Val::Str(BString::from(out))
-				},
-				(ParamRef::Var(name), _) => {
-					let Some(var) =
-						state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)?.cloned()
-					else {
-						return Ok(Val::Unset);
+					let whole = matches!(sub, Some(SubIr::At | SubIr::Star));
+					// A scalar's `${x[@]@A}` is its `${x@A}`.
+					if whole && !matches!(var.value, VarValue::Str(_)) {
+						let mut out = Vec::new();
+						super::builtins::declare_line(&name, Some(&var), &mut out);
+						return Ok(Val::Str(BString::from(out)));
+					}
+					let value = match v {
+						Val::Str(s) => Some(s),
+						Val::List { items, .. } if whole => items.into_iter().next(),
+						_ => None,
 					};
 					let letters = attr_letters(&var);
 					let mut out = BString::default();
@@ -2743,14 +2944,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 						out.extend_from_slice(&letters);
 						out.push(b' ');
 					}
-					match v {
-						Val::Str(s) => {
-							out.extend_from_slice(name);
+					match value {
+						Some(s) => {
+							out.extend_from_slice(&name);
 							out.push(b'=');
 							out.extend_from_slice(&quote::single(&s));
 						},
-						_ if !letters.is_empty() => out.extend_from_slice(name),
-						_ => return Ok(Val::Unset),
+						None if !letters.is_empty() => out.extend_from_slice(&name),
+						None => return Ok(Val::Unset),
 					}
 					Val::Str(out)
 				},
@@ -2776,6 +2977,10 @@ impl<'e, 'c> Expander<'e, 'c> {
 				else {
 					return Ok(Val::Unset);
 				};
+				// A scalar's one value, quoted as `@Q` quotes it.
+				if matches!(var.value, VarValue::Str(_)) {
+					return Ok(map_val(v, quote::single));
+				}
 				let assoc = matches!(var.value, VarValue::Assoc(_));
 				let pairs: Vec<(BString, BString)> = var.keys().into_iter().zip(var.values()).collect();
 				if op == b'K' {
@@ -4035,23 +4240,48 @@ impl arith::Env for Vars<'_, '_> {
 		if is_dynamic(name) {
 			let line = super::exec::current_line(self.vp);
 			if let Ok(Some(v)) = dynamic_value(self.k, self.cx, self.vp, line, name) {
-				let text = match v {
-					DynVal::Str(s) => index.is_none_or(|i| i == b"0").then_some(s),
+				let n: i64 = index
+					.and_then(|i| std::str::from_utf8(i).ok()?.parse().ok())
+					.unwrap_or(0);
+				// A negative index counts back from the end of an array; a
+				// scalar has none (as for [`arith_element`]).
+				let (text, bad) = match v {
+					DynVal::Str(s) => (index.is_none_or(|i| i == b"0").then_some(s), n < 0),
 					DynVal::List(items) => {
-						let i: usize = index
-							.and_then(|i| std::str::from_utf8(i).ok()?.parse().ok())
-							.unwrap_or(0);
-						items.into_iter().nth(i)
+						let i = if n < 0 { items.len() as i64 + n } else { n };
+						(
+							usize::try_from(i)
+								.ok()
+								.and_then(|i| items.into_iter().nth(i)),
+							i < 0,
+						)
 					},
 					DynVal::Assoc(pairs) => {
 						let key = index.unwrap_or(b"0");
-						pairs
+						let v = pairs
 							.into_iter()
 							.find(|(k, _)| k.as_slice() == key)
-							.map(|(_, v)| v)
+							.map(|(_, v)| v);
+						(v, false)
 					},
 				};
+				if bad {
+					self.warn_bad_sub(name);
+				}
 				return Ok(text.map(|t| arith::Value::of(&t)));
+			}
+			// Outside a function `FUNCNAME` is invisible, but a negative
+			// subscript counts back from the elements it holds
+			// ([`hidden_funcname_len`](super::callstack::hidden_funcname_len)):
+			// `$((FUNCNAME[-1]))` in a script file reads an unset element,
+			// silently.
+			if let Some(i) = index
+				&& i.first() == Some(&b'-')
+				&& let Ok(Some(len)) =
+					super::callstack::hidden_funcname_len(self.cx.store, self.vp, name)
+				&& len + parse_index(i) >= 0
+			{
+				return self.unbound_checked(name, None);
 			}
 		}
 		// One walk for a variable that is no name reference (the common
@@ -4062,19 +4292,32 @@ impl arith::Env for Vars<'_, '_> {
 		let target = if declared.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF)) {
 			state::deref(&self.k.root, self.cx.store, self.vp, name).unwrap_or(state::Deref::Plain)
 		} else {
-			let value = declared
-				.filter(|v| !v.attrs.contains(Attrs::INVISIBLE))
-				.and_then(|v| arith_element(v, index))
-				.map(arith::Value::of);
+			let unset = declared.is_none_or(|v| v.attrs.contains(Attrs::INVISIBLE));
+			let (text, bad) = arith_element(declared, index);
+			let value = text.map(arith::Value::of);
+			if bad {
+				// Under `set -u` an unset variable is the unbound error, not
+				// the warning (bash `expr_streval` checks it first).
+				if unset {
+					self.nounset_error(name)?;
+				}
+				self.warn_bad_sub(name);
+			}
 			return self.unbound_checked(name, value);
 		};
 		let (name, index) = deref_target(&target, name, index);
-		let var = state::lookup(&self.k.root, self.cx.store, self.vp, name)
+		let var = state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
 			.ok()
 			.flatten();
-		let value = var
-			.and_then(|v| arith_element(v, index))
-			.map(arith::Value::of);
+		let unset = var.is_none_or(|v| v.attrs.contains(Attrs::INVISIBLE));
+		let (text, bad) = arith_element(var, index);
+		let value = text.map(arith::Value::of);
+		if bad {
+			if unset {
+				self.nounset_error(name)?;
+			}
+			self.warn_bad_sub(name);
+		}
 		self.unbound_checked(name, value)
 	}
 
@@ -4082,6 +4325,17 @@ impl arith::Env for Vars<'_, '_> {
 		let target =
 			state::deref(&self.k.root, self.cx.store, self.vp, name).unwrap_or(state::Deref::Plain);
 		let (name, index) = deref_target(&target, name, index);
+		// A negative index of bash's dynamic `LINENO`, `PIPESTATUS`, …
+		// counts back from its elements (a scalar's one).
+		let dynamic_next = match index {
+			Some(i) if i.first() == Some(&b'-') && is_dynamic(name) => {
+				dynamic_elements(self.k, self.cx, self.vp, name)
+					.ok()
+					.flatten()
+					.map(|(items, list)| if list { items.len() as i64 } else { 1 })
+			},
+			_ => None,
+		};
 		let mut buf = NumBuffer::new();
 		let text = value.format_into(&mut buf).as_bytes();
 		let cur = state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
@@ -4100,6 +4354,44 @@ impl arith::Env for Vars<'_, '_> {
 			arith::Env::warn(self, Diag::InvalidIdent { name: BString::from(text) });
 			return Ok(());
 		}
+		// A negative index counts back from the end of an indexed array; a
+		// scalar, declared but unset too, is its element 0 (bash's
+		// `assign_array_element` takes the variable `find_variable` finds,
+		// which may be invisible). Before an array's start, or of an
+		// unset variable, it names no element: bash reports `name[i]: bad
+		// array subscript` and assigns nothing.
+		let mut counted = NumBuffer::new();
+		let assoc = cur
+			.is_some_and(|v| matches!(v.value, VarValue::Assoc(_)) || v.attrs.contains(Attrs::ASSOC));
+		let index = match index {
+			Some(i) if i.first() == Some(&b'-') && !assoc => {
+				let n: i64 = std::str::from_utf8(i)
+					.ok()
+					.and_then(|s| s.parse().ok())
+					.unwrap_or(0);
+				let next = match cur {
+					// A name reference here names no variable (an unset one:
+					// `deref` gave `Plain`); bash's `find_variable` finds none,
+					// so the subscript names no element.
+					Some(v) if v.attrs.contains(Attrs::NAMEREF) => None,
+					Some(v) if matches!(v.value, VarValue::Str(_)) => Some(1),
+					Some(v) => Some(v.next_index()),
+					None => dynamic_next,
+				};
+				match next.map(|next| next + n) {
+					Some(j) if j >= 0 => Some(j.format_into(&mut counted).as_bytes()),
+					_ => {
+						let mut shown = BString::from(name);
+						shown.push(b'[');
+						shown.extend_from_slice(i);
+						shown.push(b']');
+						arith::Env::warn(self, Diag::BadSubscript { shown });
+						return Ok(());
+					},
+				}
+			},
+			other => other,
+		};
 		// In place where the variable is bound (`edit_var` at the dynamic
 		// level is where `lookup_declared` found it): the store gets the
 		// element or value, not a copy of the variable (an array element
@@ -4151,11 +4443,57 @@ impl arith::Env for Vars<'_, '_> {
 		self.k.arith_recent.get(text, self.k.engine.arith())
 	}
 
+	/// Whether `name` is an associative array, a declared empty one too;
+	/// a name reference answers for its target (`declare -n r=A;
+	/// $((r[@]))` reads `A`'s key `@`).
 	fn is_assoc(&mut self, name: &[u8]) -> bool {
-		state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
+		let assoc = |v: &Var| matches!(v.value, VarValue::Assoc(_)) || v.attrs.contains(Attrs::ASSOC);
+		let Some((is_ref, is_assoc)) =
+			state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
+				.ok()
+				.flatten()
+				.map(|v| (v.attrs.contains(Attrs::NAMEREF), assoc(v)))
+		else {
+			return false;
+		};
+		if !is_ref {
+			return is_assoc;
+		}
+		match state::deref(&self.k.root, self.cx.store, self.vp, name) {
+			Ok(state::Deref::To { name: t, index: None }) => {
+				state::lookup_declared(&self.k.root, self.cx.store, self.vp, &t)
+					.ok()
+					.flatten()
+					.is_some_and(assoc)
+			},
+			_ => false,
+		}
+	}
+
+	fn check_set(&mut self, name: &[u8]) -> Result<(), arith::Error> {
+		if is_dynamic(name) {
+			// Outside a function `FUNCNAME` is invisible, so unset
+			// (`set -u; $((FUNCNAME[@]))` is `FUNCNAME: unbound variable`).
+			if matches!(
+				super::callstack::hidden_funcname_len(self.cx.store, self.vp, name),
+				Ok(Some(_))
+			) {
+				self.nounset_error(name)?;
+			}
+			return Ok(());
+		}
+		let target = match state::deref(&self.k.root, self.cx.store, self.vp, name) {
+			Ok(state::Deref::To { name: t, index: None }) => t,
+			_ => BString::from(name),
+		};
+		let unset = state::lookup_declared(&self.k.root, self.cx.store, self.vp, &target)
 			.ok()
 			.flatten()
-			.is_some_and(|v| matches!(v.value, VarValue::Assoc(_)) || v.attrs.contains(Attrs::ASSOC))
+			.is_none_or(|v| v.attrs.contains(Attrs::INVISIBLE));
+		if unset {
+			self.nounset_error(name)?;
+		}
+		Ok(())
 	}
 }
 
@@ -4175,21 +4513,42 @@ fn func_binds(
 	Ok(false)
 }
 
-/// The text of `v` (element `index`) arithmetic evaluates.
-fn arith_element<'v>(v: &'v Var, index: Option<&[u8]>) -> Option<&'v [u8]> {
-	match index {
-		None => v.as_scalar(),
-		Some(i) => {
-			if let VarValue::Assoc(_) = &v.value {
-				v.key(i)
-			} else {
-				let n: i64 = std::str::from_utf8(i)
-					.ok()
-					.and_then(|s| s.parse().ok())
-					.unwrap_or(0);
-				v.index(n)
-			}
+/// An evaluated subscript (decimal text) as a number; 0 when it is none.
+fn parse_index(i: &[u8]) -> i64 {
+	std::str::from_utf8(i)
+		.ok()
+		.and_then(|s| s.parse().ok())
+		.unwrap_or(0)
+}
+
+/// The text of `v` (element `index`) arithmetic evaluates, from the
+/// declared variable `v` (`None`: undeclared), and whether the index names
+/// no element bash can count back to: a negative index counts back from
+/// the end of an indexed array, but one before its start, or any of a
+/// scalar or an unset variable, reads as unset and bash warns `name: bad
+/// array subscript` (`array_value_internal`).
+fn arith_element<'v>(v: Option<&'v Var>, index: Option<&[u8]>) -> (Option<&'v [u8]>, bool) {
+	let assoc =
+		v.is_some_and(|v| matches!(v.value, VarValue::Assoc(_)) || v.attrs.contains(Attrs::ASSOC));
+	let v = v.filter(|v| !v.attrs.contains(Attrs::INVISIBLE));
+	let Some(i) = index else {
+		return (v.and_then(Var::as_scalar), false);
+	};
+	if assoc {
+		return (v.and_then(|v| v.key(i)), false);
+	}
+	let n: i64 = std::str::from_utf8(i)
+		.ok()
+		.and_then(|s| s.parse().ok())
+		.unwrap_or(0);
+	if n >= 0 {
+		return (v.and_then(|v| v.index(n)), false);
+	}
+	match v {
+		Some(v) if matches!(v.value, VarValue::Indexed(_)) && v.next_index() + n >= 0 => {
+			(v.index(v.next_index() + n), false)
 		},
+		_ => (None, true),
 	}
 }
 
@@ -4237,6 +4596,40 @@ impl Vars<'_, '_> {
 		}
 		Ok(value)
 	}
+
+	/// bash's `name: bad array subscript` for a read of an element `name`
+	/// cannot have.
+	fn warn_bad_sub(&mut self, name: &[u8]) {
+		arith::Env::warn(self, Diag::BadSubscript { shown: BString::from(name) });
+	}
+
+	/// Under `set -u`, the unbound error for the unset variable `name`.
+	fn nounset_error(&mut self, name: &[u8]) -> Result<(), arith::Error> {
+		if state::option(&mut self.k.root, self.cx.store, self.vp, OptId::Nounset).unwrap_or(false) {
+			return Err(arith::Error::Unbound { name: BString::from(name) });
+		}
+		Ok(())
+	}
+}
+
+/// The elements of bash's dynamic variable `name` (`PIPESTATUS`,
+/// `FUNCNAME`, …; a dynamic scalar is its one element) and whether it is
+/// an array; `None` for any other name and for a dynamic associative one.
+///
+/// # Errors
+/// [`StoreError`] when the store cannot be read.
+pub fn dynamic_elements(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	name: &[u8],
+) -> Result<Option<(Vec<BString>, bool)>, StoreError> {
+	let line = super::exec::current_line(vp);
+	Ok(match dynamic_value(k, cx, vp, line, name)? {
+		Some(DynVal::Str(s)) => Some((vec![s], false)),
+		Some(DynVal::List(items)) => Some((items, true)),
+		Some(DynVal::Assoc(_)) | None => None,
+	})
 }
 
 #[cfg(test)]

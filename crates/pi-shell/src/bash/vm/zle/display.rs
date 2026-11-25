@@ -478,7 +478,7 @@ pub fn zle_refresh(
 		zw.zle.display.clearlist = ocl;
 		zw.ed.statusline = saved;
 		if let Some(tty) = zw.zle.tty.as_mut() {
-			let _ = tty.flush(zw.k);
+			tty.flush_or_hold(zw.k, &mut zw.vp.out);
 		}
 	});
 }
@@ -501,7 +501,7 @@ pub fn print_above(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, bytes: &[u8]
 		}
 		refresh(zw);
 		if let Some(t) = zw.zle.tty.as_mut() {
-			let _ = t.flush(zw.k);
+			t.flush_or_hold(zw.k, &mut zw.vp.out);
 		}
 	});
 	true
@@ -524,7 +524,7 @@ pub fn trash_for_message(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	on_editor(k, cx, vp, |zw| {
 		trashzle(zw);
 		if let Some(tty) = zw.zle.tty.as_mut() {
-			let _ = tty.flush(zw.k);
+			tty.flush_or_hold(zw.k, &mut zw.vp.out);
 		}
 	});
 }
@@ -540,7 +540,7 @@ pub fn invalidate(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 				tty.settyinfo(zw.k, zw.cx);
 			}
 			tty.fetch = true;
-			let _ = tty.flush(zw.k);
+			tty.flush_or_hold(zw.k, &mut zw.vp.out);
 		}
 	});
 }

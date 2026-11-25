@@ -374,6 +374,58 @@ describe("loadEntriesFromFileStream (Bun.JSONL parity)", () => {
 		}
 	});
 
+	/** Three newline-terminated chunks of a transcript; `pulls` counts the chunks a reader asked for. */
+	function countedChunks() {
+		const encoder = new TextEncoder();
+		const lines = [HEADER, msg("m1", "s1", "one"), msg("m2", "m1", "two")].map(line =>
+			encoder.encode(`${JSON.stringify(line)}\n`),
+		);
+		const counter = { pulls: 0 };
+		return {
+			counter,
+			sync: function* () {
+				for (const line of lines) {
+					counter.pulls++;
+					yield line;
+				}
+			},
+			async: async function* () {
+				for (const line of lines) {
+					counter.pulls++;
+					yield line;
+				}
+			},
+		};
+	}
+
+	it("pulls no further chunk once the visitor stops", async () => {
+		const source = countedChunks();
+		const visited: string[] = [];
+		await sessionLoader.visitEntriesFromFileStream(
+			"/nonexistent/session.jsonl",
+			entry => {
+				visited.push(entry.type === "session" ? entry.id : entry.type);
+				return false;
+			},
+			{ chunks: source.async() },
+		);
+
+		expect(visited).toEqual(["s1"]);
+		expect(source.counter.pulls).toBe(1);
+	});
+
+	it("pulls no further chunk once the visitor stops, synchronously", () => {
+		const source = countedChunks();
+		const visited: string[] = [];
+		sessionLoader.visitEntriesFromChunksSync(source.sync(), entry => {
+			visited.push(entry.type === "session" ? entry.id : entry.type);
+			return false;
+		});
+
+		expect(visited).toEqual(["s1"]);
+		expect(source.counter.pulls).toBe(1);
+	});
+
 	it("retains an unfinished value across embedded newlines before the trailing fragment", async () => {
 		const content = `${JSON.stringify(HEADER)}\n{\n"type":"message","id":"multiline","parentId":"s1","timestamp":"${ISO}","message":{"role":"user","content":"continued","timestamp":0}}`;
 		const file = await writeTemp(content);

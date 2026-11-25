@@ -231,11 +231,7 @@ import {
 	CREDENTIAL_DISABLED_NOTICE_SOURCE,
 	formatCredentialDisabledNotice,
 } from "./session/credential-disabled-notice";
-import {
-	createSessionDateCwdReminderJournal,
-	type DateCwdReminderJournal,
-	DateCwdReminderInjector,
-} from "./session/date-cwd-reminder";
+import { createSessionDateCwdReminderJournal, DateCwdReminderInjector } from "./session/date-cwd-reminder";
 import { createInterruptedToolResults, createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
 import { recoverInlineSloppyEdit } from "./session/inline-edit-recovery";
 import {
@@ -5156,15 +5152,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// One transform per conversation: the date/cwd reminder remembers what each
 		// conversation was sent, and the image clamp what each request dropped, so
 		// the main loop and every advisor get their own. Only the main loop
-		// journals its reminders in the session and asks the session's cut rule
-		// about its forced image drops: an advisor's history is not the session's.
-		// A side request (`buildSideRequestContext`) is no part of the history
-		// either: it reads the conversation's image drops and changes none.
+		// journals its reminders in the session, only its injector hears of the
+		// session's compactions, and only it asks the session's cut rule about its
+		// forced image drops: an advisor's history is not the session's. A side
+		// request (`buildSideRequestContext`) is no part of the history either: it
+		// reads the conversation's image drops and changes none.
 		const createTransformProviderContext = (
-			journal?: DateCwdReminderJournal,
+			injector = new DateCwdReminderInjector(),
 			imageClamp = new ProviderImageClamp(),
 		) => {
-			const dateCwdReminder = new DateCwdReminderInjector(journal);
 			const sideImageClamp = imageClamp.sideRequestClamp();
 			return async (context: Context, transformModel: Model, request?: ProviderContextRequest): Promise<Context> => {
 				const clamp = request?.sideRequest ? sideImageClamp : imageClamp;
@@ -5184,23 +5180,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				// Keep per-request volatility out of the system prompt: the date/cwd
 				// reminder rides on the first user turn so open-weight providers keep
 				// their tool-schema prefix cache (#7404).
-				return dateCwdReminder.transform(
+				return injector.transform(
 					transformed,
 					formatLocalCalendarDate(),
 					normalizePromptPath(sessionManager.getCwd()),
 				);
 			};
 		};
+		const dateCwdReminder = new DateCwdReminderInjector(createSessionDateCwdReminderJournal(sessionManager));
 		// A request past the image budget cannot be served without the drop, so the rule admits it
 		// as forced; asking it logs the decision. Each forced drop is kept in the session, so a resumed
 		// process drops the same images.
 		const mainImageClamp = new ProviderImageClamp(site => {
 			if (session) session.admitsProviderContextCut(providerContextCut(site));
 		}, sessionImageDropRecord(sessionManager));
-		const transformProviderContext = createTransformProviderContext(
-			createSessionDateCwdReminderJournal(sessionManager),
-			mainImageClamp,
-		);
+		const transformProviderContext = createTransformProviderContext(dateCwdReminder, mainImageClamp);
 		const onPayload = async (payload: unknown, model?: Model, signal?: AbortSignal) => {
 			return await extensionRunner.emitBeforeProviderRequest(payload, model, signal);
 		};
@@ -5712,6 +5706,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			transformContext,
 			transformProviderContext,
 			createAdvisorTransformProviderContext: () => createTransformProviderContext(),
+			dateCwdReminder,
 			onPayload,
 			onResponse,
 			sideStreamFn: settingsAwareStreamFn,
@@ -6171,11 +6166,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						// The teardown stops the workers' turns and their own jobs: a vibe turn the
 						// parent's teardown interrupts is not resumed (`docs/vibe-mode.md`).
 						try {
-							await vibeRegistry.suspendScope(
-								vibeRegistry.ownerScope(vibeParentSession),
-								scopedAsyncJobManager,
-								"stop",
-							);
+							await vibeRegistry.suspendScope(vibeRegistry.ownerScope(vibeParentSession), scopedAsyncJobManager);
 						} catch (error) {
 							logger.warn("Session dispose: suspending vibe workers failed", { error: String(error) });
 						}
@@ -6394,7 +6385,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					// cached prompt; a drop of its own (a forced count drop, its byte-clamp drops) stays its own, out of
 					// the session's record, and never asks the session's cut rule.
 					transformProviderContext: createTransformProviderContext(
-						{ ...createSessionDateCwdReminderJournal(sessionManager), record: () => {} },
+						new DateCwdReminderInjector({
+							...createSessionDateCwdReminderJournal(sessionManager),
+							record: () => {},
+						}),
 						mainImageClamp.sideRequestClamp(),
 					),
 					temperature: agent.temperature,

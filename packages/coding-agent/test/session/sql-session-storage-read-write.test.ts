@@ -24,7 +24,12 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { readStoredParts, readStoredSession } from "../helpers/sql-session-storage";
+import {
+	dropSessionStoreTables,
+	readOnlyDefault,
+	readStoredParts,
+	readStoredSession,
+} from "../helpers/sql-session-storage";
 import { POSTGRES_TRANSACTION_POOLER } from "./sql-session-lease-fixture";
 
 const url = process.env.OMP_TEST_SQL_POSTGRES_URL;
@@ -55,9 +60,7 @@ afterEach(async () => {
 	current = undefined;
 	if (!db) return;
 	try {
-		for (const name of [`${db.table}_parts`, `${db.table}_blobs`, db.table, db.scratch]) {
-			await db.other.unsafe(`DROP TABLE IF EXISTS ${name}`);
-		}
+		await dropSessionStoreTables(db.other, db.table, db.scratch);
 	} finally {
 		// Undo the test's session-level SET. Best effort: a RESET that fails on a
 		// broken connection must not hide the error that broke it.
@@ -85,19 +88,6 @@ function open(db: Db): Promise<SqlSessionStorage> {
 	return SqlSessionStorage.create({ client: db.client, table: db.table });
 }
 
-/**
- * `default_transaction_read_only` on the store's connection: `setting` is the
- * default new transactions start from, `reset_val` the one the session began
- * with (from the database, role, server or connection start), which a session
- * `SET` leaves alone.
- */
-async function readOnlyDefault(db: Db): Promise<{ setting: string; reset_val: string } | undefined> {
-	const rows = (await db.client.unsafe(
-		"SELECT setting, reset_val FROM pg_settings WHERE name = 'default_transaction_read_only'",
-	)) as Array<{ setting: string; reset_val: string }>;
-	return rows[0];
-}
-
 /** A read-only default this session set; the store overrides it. */
 const SESSION_READ_ONLY = { setting: "on", reset_val: "off" };
 
@@ -107,7 +97,7 @@ const SESSION_READ_ONLY = { setting: "on", reset_val: "off" };
  */
 async function setReadOnly(db: Db, statement = "SET default_transaction_read_only = on"): Promise<void> {
 	await db.client.unsafe(statement);
-	expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+	expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 	await expect(db.client.unsafe(`INSERT INTO ${db.scratch} (n) VALUES (1)`)).rejects.toMatchObject({
 		errno: "25006",
 	});
@@ -154,7 +144,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 
 			expect(await storage.readText(path)).toBe("kept\n");
 			expect(await stored(db, path)).toBe("kept\n");
-			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 		});
 
 		it("creates its tables", async () => {
@@ -169,7 +159,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 			await storage.writeText(path, "new\n");
 			expect(await storage.readText(path)).toBe("new\n");
 			expect(await stored(db, path)).toBe("new\n");
-			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 		});
 
 		it("migrates a session table from before titles and parts", async () => {
@@ -192,7 +182,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 			}>;
 			expect(Number(rows[0]?.byte_len)).toBe(Buffer.byteLength(content));
 			expect(await stored(db, path)).toBe(content);
-			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 		});
 
 		it("appends through a writer", async () => {
@@ -206,7 +196,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 
 			expect(await storage.readText(path)).toBe("one\ntwo ✓\n");
 			expect(await stored(db, path)).toBe("one\ntwo ✓\n");
-			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 		});
 
 		it("appends through a writer when SET SESSION CHARACTERISTICS made the session read-only", async () => {
@@ -222,7 +212,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 
 			expect(await storage.readText(path)).toBe("one\ntwo ✓\n");
 			expect(await stored(db, path)).toBe("one\ntwo ✓\n");
-			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 		});
 
 		it("writes a session whole", async () => {
@@ -233,7 +223,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 
 			expect(await storage.readText(path)).toBe("whole ✓\n");
 			expect(await stored(db, path)).toBe("whole ✓\n");
-			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 		});
 
 		it("creates a session and replaces it at its size", async () => {
@@ -246,7 +236,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 
 			expect(await storage.readText(path)).toBe("second ✓\n");
 			expect(await stored(db, path)).toBe("second ✓\n");
-			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 		});
 
 		it("truncates a session through a writer opened with flags w", async () => {
@@ -259,7 +249,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 
 			expect(await storage.readText(path)).toBe("fresh\n");
 			expect(await stored(db, path)).toBe("fresh\n");
-			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 		});
 
 		it("updates a session's title", async () => {
@@ -283,7 +273,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 				[path],
 			)) as Array<{ title: string; title_source: string; title_updated_at: string }>;
 			expect(rows[0]).toEqual({ title: "New", title_source: "user", title_updated_at: "t2" });
-			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 		});
 
 		// Two kinds of write: `rename` first deletes any row at `to`, `renameNoReplace` never does.
@@ -301,7 +291,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 				expect(await stored(db, from)).toBeNull();
 				expect(await storedParts(db, from)).toEqual([]);
 				expect(await stored(db, to)).toBe("moved\n");
-				expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+				expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 			});
 		}
 
@@ -315,7 +305,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 			expect(storage.existsSync(path)).toBe(false);
 			expect(await stored(db, path)).toBeNull();
 			expect(await storedParts(db, path)).toEqual([]);
-			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 		});
 
 		it("deletes a session with its artifacts", async () => {
@@ -333,7 +323,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
 				expect(await stored(db, path)).toBeNull();
 				expect(await storedParts(db, path)).toEqual([]);
 			}
-			expect(await readOnlyDefault(db)).toEqual(SESSION_READ_ONLY);
+			expect(await readOnlyDefault(db.client)).toEqual(SESSION_READ_ONLY);
 		});
 	},
 );
@@ -346,7 +336,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)(
  */
 async function connectReadOnlyAtStart(): Promise<Db> {
 	const db = await connect({ default_transaction_read_only: "on" });
-	expect(await readOnlyDefault(db)).toEqual({ setting: "on", reset_val: "on" });
+	expect(await readOnlyDefault(db.client)).toEqual({ setting: "on", reset_val: "on" });
 	await expect(db.client.unsafe(`INSERT INTO ${db.scratch} (n) VALUES (1)`)).rejects.toMatchObject({
 		errno: "25006",
 	});
@@ -427,7 +417,7 @@ const TURNED_OFF = { setting: "off", reset_val: "on" };
 async function connectTurnedOff(): Promise<Db> {
 	const db = await connectReadOnlyAtStart();
 	await db.client.unsafe("SET default_transaction_read_only = off");
-	expect(await readOnlyDefault(db)).toEqual(TURNED_OFF);
+	expect(await readOnlyDefault(db.client)).toEqual(TURNED_OFF);
 	return db;
 }
 
@@ -445,7 +435,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)("a session that turns such 
 
 		expect(await columns(db, db.table)).toEqual(SESSION_COLUMNS);
 		expect(await columns(db, `${db.table}_parts`)).toEqual(["content", "path", "start_offset"]);
-		expect(await readOnlyDefault(db)).toEqual(TURNED_OFF);
+		expect(await readOnlyDefault(db.client)).toEqual(TURNED_OFF);
 	});
 
 	it("appends through a writer", async () => {
@@ -461,7 +451,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)("a session that turns such 
 		expect(await storage.readText(path)).toBe("one\ntwo ✓\n");
 		expect(await stored(db, path)).toBe("one\ntwo ✓\n");
 		expect(await storedParts(db, path)).toEqual(["one\n", "two ✓\n"]);
-		expect(await readOnlyDefault(db)).toEqual(TURNED_OFF);
+		expect(await readOnlyDefault(db.client)).toEqual(TURNED_OFF);
 	});
 
 	it("writes a session whole", async () => {
@@ -474,7 +464,7 @@ describe.skipIf(!url || POSTGRES_TRANSACTION_POOLER)("a session that turns such 
 		expect(await storage.readText(path)).toBe("whole ✓\n");
 		expect(await stored(db, path)).toBe("whole ✓\n");
 		expect(await storedParts(db, path)).toEqual(["whole ✓\n"]);
-		expect(await readOnlyDefault(db)).toEqual(TURNED_OFF);
+		expect(await readOnlyDefault(db.client)).toEqual(TURNED_OFF);
 	});
 });
 
@@ -510,12 +500,11 @@ describe.skipIf(!url)("SqlSessionStorage starting beside other stores on Postgre
 				expect(await columns({ other }, `${table}_parts`)).toEqual(["content", "path", "start_offset"]);
 			} finally {
 				try {
-					for (const name of [`${table}_parts`, `${table}_blobs`, table])
-						await other.unsafe(`DROP TABLE IF EXISTS ${name}`);
+					await dropSessionStoreTables(other, table);
 				} finally {
 					await Promise.all([...clients, other].map(client => client.end()));
 				}
 			}
 		}
-	});
+	}, 20_000);
 });

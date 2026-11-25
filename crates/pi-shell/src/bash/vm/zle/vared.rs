@@ -272,9 +272,6 @@ fn run(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	let Some(mut ed) = z.ed.take() else {
 		return done(1);
 	};
-	if let Some(t) = z.tty.as_mut() {
-		let _ = t.flush(ctx.k);
-	}
 	if !ed.interrupted {
 		z.kunget = std::mem::take(&mut ed.unget);
 	}

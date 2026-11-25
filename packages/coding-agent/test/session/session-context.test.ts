@@ -2,8 +2,13 @@ import { describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as snapcompact from "@oh-my-pi/snapcompact";
+import { CONTEXT_NOTES_ENTRY_TYPE } from "../../src/session/context-notes";
 import { type CompactionSummaryMessage, INTERRUPTED_THINKING_MESSAGE_TYPE } from "../../src/session/messages";
-import { buildSessionContext, type StrippedToolCallsMarker } from "../../src/session/session-context";
+import {
+	buildSessionContext,
+	CONTINUE_REMINDER_MESSAGE_TYPE,
+	type StrippedToolCallsMarker,
+} from "../../src/session/session-context";
 import type { SessionEntry } from "../../src/session/session-entries";
 
 const timestamp = "2026-07-09T00:00:00.000Z";
@@ -378,5 +383,67 @@ describe("buildSessionContext failed replay tails", () => {
 		);
 
 		expect(context.messages.map(message => message.role)).toEqual(["user", "assistant", "toolResult"]);
+	});
+});
+
+describe("buildSessionContext continue reminders", () => {
+	// Regression: after a native Anthropic compaction whose kept region starts
+	// at a kept turn, the context notes go right after that turn, in front of
+	// its continue reminder, and the rebuild then dropped the reminder as if it
+	// followed no kept turn: the model read the continuation without the
+	// reminder it read live.
+	it("keeps a kept turn's reminder when the context notes sit between them", () => {
+		const keptTurn = assistantEntry("kept", "notes", "error", "Here is the first part", 2);
+		if (keptTurn.type !== "message" || keptTurn.message.role !== "assistant") throw new Error("Expected assistant");
+		keptTurn.message.continued = true;
+		const entries: SessionEntry[] = [
+			userEntry("user", null, "answer in two parts", 1),
+			{
+				type: "custom",
+				customType: CONTEXT_NOTES_ENTRY_TYPE,
+				data: { version: 1, text: "Keep the rollback plan." },
+				id: "notes",
+				parentId: "user",
+				timestamp,
+			},
+			keptTurn,
+			{
+				type: "custom_message",
+				id: "reminder",
+				parentId: "kept",
+				timestamp,
+				customType: CONTINUE_REMINDER_MESSAGE_TYPE,
+				content: "Continue exactly where it stopped.",
+				display: false,
+				attribution: "agent",
+			},
+			assistantEntry("continuation", "reminder", "stop", ", and here is the rest.", 3),
+			{
+				type: "compaction",
+				id: "compaction",
+				parentId: "continuation",
+				timestamp,
+				summary: "Native summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 100,
+				preserveData: {
+					anthropicCompaction: { provider: "anthropic", content: "Native summary", signature: "sig" },
+				},
+			},
+			userEntry("next", "compaction", "and then?", 4),
+		];
+
+		const context = buildSessionContext(entries);
+
+		expect(
+			context.messages.map(message => (message.role === "custom" ? `custom:${message.customType}` : message.role)),
+		).toEqual([
+			"compactionSummary",
+			"assistant",
+			`custom:${CONTEXT_NOTES_ENTRY_TYPE}`,
+			`custom:${CONTINUE_REMINDER_MESSAGE_TYPE}`,
+			"assistant",
+			"user",
+		]);
 	});
 });

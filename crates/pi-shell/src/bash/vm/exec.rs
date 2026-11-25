@@ -1060,9 +1060,10 @@ pub fn output_waits(k: &Kernel, vp: &Vproc) -> bool {
 /// the redirected fd 2.
 fn flush_queued(k: &mut Kernel, vp: &mut Vproc) -> Option<i32> {
 	use super::zle::tty;
-	// The editor's display bytes still pending were queued before anything
-	// in `vp.out` (later ones wait in it, as `tty::FD` entries): the
-	// terminal gets them first, as zsh's blocking writes order them.
+	// The editor's display bytes still pending were queued before any output
+	// in `vp.out` (later ones wait in it, as `tty::FD` entries; a hold there
+	// writes nothing): the terminal gets them first, as zsh's blocking writes
+	// order them.
 	if let Some(t) = vp.zle.as_deref_mut().and_then(|z| z.tty.as_mut())
 		&& t.flush(k).is_some()
 	{

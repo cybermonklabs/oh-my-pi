@@ -5625,16 +5625,35 @@ mod tests {
 		run_async_util::<Find>(&args, "", root).await
 	}
 
+	/// How many descriptors of this process name the file at `path`.
+	#[cfg(target_os = "linux")]
+	fn descriptors_on(path: &std::path::Path) -> usize {
+		use std::os::unix::fs::MetadataExt as _;
+
+		let file = fs::metadata(path).unwrap();
+		fs::read_dir("/proc/self/fd")
+			.expect("/proc/self/fd")
+			.flatten()
+			.filter(|fd| fs::metadata(fd.path()).is_ok_and(|m| m.dev() == file.dev() && m.ino() == file.ino()))
+			.count()
+	}
+
 	/// `-fprint*` and `-fls` open their target through pi-vfs. A native
 	/// target can be the full capture pipe, so `write_all_async` must run
-	/// outside the async worker and let the reader below run.
+	/// outside the async worker and let the reader below run. The reader
+	/// drains once find's write is seen waiting on the blocking pool: the
+	/// FIFO then has a fifth descriptor in this process. The test holds two
+	/// (its reader and the writer that filled it), find two (the target it
+	/// opened and the copy it keeps to close after the search,
+	/// `get_or_create_file`), and the fifth is the copy a write hands to the
+	/// blocking pool for as long as it runs (`pi_vfs::File::write_all_async`).
 	#[cfg(target_os = "linux")]
 	fn print_to_a_full_pipe_yields_to_the_reader(action: &str) {
 		use std::{
 			io::{Read as _, Write as _},
 			os::fd::AsRawFd,
 			sync::mpsc::channel,
-			time::Duration,
+			time::{Duration, Instant},
 		};
 
 		let (_dir, root) = fixture();
@@ -5659,13 +5678,21 @@ mod tests {
 		let (done, finished) = channel();
 		let action = action.to_owned();
 		let label = action.clone();
+		let fifo = target_path.clone();
 		std::thread::spawn(move || {
 			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 			let result = runtime.block_on(async {
 				let args = vec![".".to_string(), action, target];
 				let run = run(&root, &args);
 				let drain = async {
-					tokio::time::sleep(Duration::from_millis(100)).await;
+					let start = Instant::now();
+					while descriptors_on(&fifo) < 5 {
+						assert!(
+							start.elapsed() < Duration::from_secs(4),
+							"find's write into the full FIFO was never seen waiting on the blocking pool"
+						);
+						tokio::time::sleep(Duration::from_millis(1)).await;
+					}
 					let mut reader = reader;
 					reader.read_exact(&mut vec![0; capacity]).unwrap();
 					reader
@@ -5675,8 +5702,7 @@ mod tests {
 			});
 			let _ = done.send(result);
 		});
-		let (code, stderr) =
-			finished.recv_timeout(Duration::from_secs(5)).expect("DEADLINE fired: find did not return");
+		let (code, stderr) = crate::host::sent_within_5s(&finished, "find did not return");
 		assert_eq!(code, 0, "{label}: {stderr}");
 	}
 

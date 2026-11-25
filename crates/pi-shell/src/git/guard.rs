@@ -1709,9 +1709,11 @@ mod tests {
 	/// The guard's note about the changes it saved is out before git runs.
 	/// Here stderr is a full pipe, on the writer-thread route (the test's
 	/// child process), so the note stays on fd 2's writer thread until the
-	/// pipe drains after 2 s: until then git must not have started, so the
-	/// file it restores still holds the edit. Once the pipe drains, git runs
-	/// and restores it, and the note reached fd 2.
+	/// pipe drains, once the shell is seen waiting with no git process
+	/// running ([`crate::session::held::once_the_shell_waits`]): until then
+	/// git must not have run, so the file it restores still holds the edit.
+	/// Once the pipe drains, git runs and restores it, and the note reached
+	/// fd 2.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn the_save_note_is_out_before_git_runs() {
@@ -1741,18 +1743,22 @@ mod tests {
 						.unwrap();
 				std::io::Write::write_all(&mut &held_w, &vec![b'q'; capacity]).unwrap();
 				let file = worktree.join("tracked.txt");
-				let held_thread = std::thread::spawn(move || {
-					std::thread::sleep(std::time::Duration::from_secs(2));
-					let while_held = std::fs::read_to_string(&file).expect("read tracked");
-					let mut all = Vec::new();
-					held_r.read_to_end(&mut all).unwrap();
-					(while_held, all)
-				});
 				let runtime = tokio::runtime::Builder::new_multi_thread()
 					.worker_threads(2)
 					.enable_all()
 					.build()
 					.unwrap();
+				let (driver, writers) =
+					(runtime.handle().clone(), crate::session::held::writer_threads());
+				let held_thread = std::thread::spawn(move || {
+					let while_held =
+						crate::session::held::once_the_shell_waits(&driver, &writers, || {
+							std::fs::read_to_string(&file).expect("read tracked")
+						});
+					let mut all = Vec::new();
+					held_r.read_to_end(&mut all).unwrap();
+					(while_held, all)
+				});
 				runtime.block_on(async {
 					let mut env: Vec<(BString, BString)> = std::env::vars_os()
 						.filter(|(name, _)| {
@@ -1785,6 +1791,7 @@ mod tests {
 				});
 				drop(runtime);
 				let (while_held, all) = held_thread.join().unwrap();
+				let while_held = while_held.unwrap_or_else(|missed| panic!("{missed}"));
 				let drained = String::from_utf8_lossy(&all[capacity.min(all.len())..]).into_owned();
 				assert_eq!(while_held, "mine\n", "git ran before the guard's note was out");
 				assert_eq!(read(&worktree), "tracked\n", "git never ran once fd 2 drained");

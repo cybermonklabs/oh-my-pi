@@ -174,9 +174,13 @@ describe("non-message figure on a session whose roster was emptied on a model th
 			// Precondition: the request declared no tool, and its reply is the newest message.
 			expect(requests.at(-1)?.tools ?? []).toEqual([]);
 			expect(session.messages.at(-1)?.role).toBe("assistant");
+			const reply = session.messages.at(-1);
+			if (!reply) throw new Error("Expected the reply");
 
-			// Nothing was added after the reply, so the context is the 5000 input tokens the provider reported.
-			expect(session.getContextBreakdown({ contextWindow: CONTEXT_WINDOW })?.usedTokens).toBe(5000);
+			// Nothing was added after the reply, so the context is the 5000 input tokens the provider reported and the reply the next request carries on top of them.
+			expect(session.getContextBreakdown({ contextWindow: CONTEXT_WINDOW })?.usedTokens).toBe(
+				5000 + session.agent.tokenizer.countMessage(reply),
+			);
 		});
 	}, 60_000);
 });

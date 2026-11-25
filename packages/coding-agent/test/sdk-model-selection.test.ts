@@ -22,6 +22,7 @@ import {
 import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import { compactionThresholdSettings, createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/subagent-settings";
 import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -2992,9 +2993,9 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			"compaction.modelThresholds": { "openai/gpt-5.6-terra": 400_000 },
 		});
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"), { settings: root });
-		const child = executorModule.createSubagentSettings(
+		const child = createSubagentSettings(
 			root,
-			executorModule.compactionThresholdSettings({ thresholdPercent: 80, thresholdTokens: -1 }),
+			compactionThresholdSettings({ thresholdPercent: 80, thresholdTokens: -1 }),
 		);
 		const open = (settings: Settings) =>
 			createAgentSession({

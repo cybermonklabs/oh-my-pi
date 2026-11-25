@@ -36,6 +36,7 @@
 - An asynchronous simple command's or a pipeline stage's fatal error in its words, its redirections or a function it calls, and one in an asynchronous compound command's or a compound stage's own redirections (`{ cmd; } < ${x:?} &`), now exits 127 under `-c`, as bash's does (a fatal error in a `{ }` stage's body still exits 1), also after a `!` (`! /bin/cat < ${x:?} &`); a fatal error in those redirections prints its message where they so far sent it (`2>/dev/null` hides it), as bash's does. A builtin the job or stage runs exits 1 on a fatal error it meets (`eval 'echo ${x:?}' &`), as in bash. An asynchronous null command, or a pipeline stage, that redirects standard input or a `{var}` now exits 0 whatever its redirections do (`< missing &`), as bash's does; it exited 1. Under `set -e` the shell's own fatal error under `-c` (`set -e; echo < ${x:?}`) now exits 1, as bash's does; it exited 127.
 - A redirection that duplicates a descriptor that is not open now names it as bash does (`<&07` names `7`, `3<&$fd` names `3`, `<&$fd-` names `0`), and a move the shell undoes, or a `{var}` copy, first prints bash's `redirection error: cannot duplicate fd: Bad file descriptor`.
 - A timed background compound command whose own redirections meet a fatal expansion error (`time { :; } 2>/dev/null < ${x:?} &`) prints its message where those redirections so far sent it (`2>/dev/null` hides it), as bash's does: bash makes them in the job's process before it times the command. It printed the message on the job's original standard error.
+- Fixed the embedded shell's interactive line editor running an accepted line before the line was on the terminal: the line's last display could still be in the terminal's writer thread when the command started, so an external command's output came above the line it ran from (`cat ~/log` printed its lines, then `cat ~/log`). The editor now hands on a line it read (and `vared` assigns, and a `zle` call in a widget returns) only once its display is out, as zsh's blocking writes order them; a trap that runs while the editor waits for its display to go out (a signal, or `TMOUT` with `TRAPALRM`) waits for it too, and the command after a job notice (`zsh: killed`) waits for the notice
 - Fixed the embedded shell losing up to 64 KiB written through a zsh multios redirection (`{ ... } >&1 >/dev/null`, `exec >&1 >/dev/null`) by `syswrite`, `sysread -o` or a builtin whose output went out at once: the tee only queued the bytes, the writer counted them as written, and the queue was dropped when the redirection or the run ended. Each write through the tee now ends once every target of the tee has it
 - Once the last program of a background pipeline is gone (`kill -0 $!` fails) and its other programs have ended, `jobs` (also `-r`, `-n`, `%1`), `$(jobs)`, `fg`, `bg`, `disown -r` and `kill %1` see the job done, as bash does: `jobs` no longer lists it `Running`, `fg`/`bg` say `job has terminated` instead of waiting for it or calling it already in the background. The builtins that report or decide by a job's state, zsh's too, first take in the exits already available, so the end of a pipeline's stage reaches its job before such a builtin reads it. `kill %1` of a finished job no longer says `no such job`: as bash 5.3 does, it succeeds and signals nothing without job control, and reports `(pid) - No such process` with it.
 - The `!` of a background job (`! cmd &`, `! a | b &`) no longer inverts the job's status, as in bash and zsh: `wait $!` returns the command's own status, and `set -e` acts on it. A `!` inside the job, or before an `&&`/`||` list, inverts as before; zsh mode still inverts a timed job's `!`, as zsh does. `jobs` shows such a job of simple commands without its `!` (`false &`), as bash does.
@@ -139,6 +140,7 @@
 - External commands a shell starts on Linux with glibc no longer start with signals 32 and 33 ignored when the shell does not ignore them. Where `posix_spawn` does not use `clone3` (glibc before 2.38, or a seccomp profile that answers `clone3` with `ENOSYS`), glibc sets these two, its own signals, to `SIG_IGN` in the child before the exec, so `kill -s 33` could not end such a command; bash leaves them at their default. A shell program (`obash`) on glibc 2.34 or later that was started with them ignored passes that on, as bash does. This addon is the exception: it loads into a process that already runs threads, where glibc has replaced an inherited ignore of 33 with its own handler, so its commands get 33 at the default. On glibc 2.33 or older, glibc replaces both before any other code runs, so the commands of `obash` and of this addon get both at the default.
 - The bash tool's `ps -M` lists a thread whose name is not UTF-8 (the kernel cuts a name at 15 bytes, inside a character too, and writes it into the thread's `/proc/<pid>/task/<tid>/stat` unescaped; a process's threads take its name); it left such a thread out, so a process of such a name had no thread lines. The end of a `locale` utility's process group counts a member whose main thread exited while another of its threads runs as live whatever its name, where a name that is not UTF-8 made it read as gone, so the end could stop while that thread ran. Both now read those files as bytes.
 - A program's redirections (also a name not found's, `command X`'s, `A=1 X`'s, and a null command's that redirect standard input or a `{var}`) and a `( … )`'s own now expand in a process of their own when they can change the shell, as bash expands them after it forks: `/bin/true > ${f:=out}`, `( : ) > ${f:=out}`, `/bin/cat < /dev/null$((x++))`, `${| x=5; …; }`, `$RANDOM`, a `{var}` and the like leave the shell's variables as they were, `exit` in a `${ ;}` there ends only that process (the command's status), and a fatal error there is its status. `break` or `continue` in such a `${ ;}` ends it when a loop encloses a program or a null command, and otherwise (a `( … )`'s process included, as in bash) warns and lets the `${ ;}` go on. The name is looked up before the redirections, as bash does, so `{PATH}</dev/null cat </dev/null` runs `cat`; a jobspec (`%1 > out`) runs `fg` without them, as in bash, but a pipeline stage still makes them.
+- `rm -f` now ignores only a name that names no file, as GNU rm does (an entry already gone, a path through a non-directory, or a name the filesystem rejects: ENOENT, ENOTDIR, EINVAL, EILSEQ), and reports every other error with exit status 1: a directory it cannot open or list (for want of a file descriptor, say) is named with that reason instead of being skipped and a directory above it reported as not empty, and an operand in a directory it may not search is reported instead of ignored. Without `-f` such an operand is reported with its own reason instead of "No such file or directory", and messages no longer end with ` (os error N)`
 
 ## [18.18.6] - 2026-11-09
 
@@ -1982,55 +1984,4 @@
 - Updated `check` script to separately call `check:types` for type checking
 - Modified tsconfig.json to extend `tsconfig.workspace.json` instead of `tsconfig.base.json`
 
-## [14.0.0] - 2026-04-08
-
-### Breaking Changes
-
-- Changed `ChunkRegion.Inner` enum value to `ChunkRegion.Body` to align with region semantics
-- Changed `ChunkRegion` enum values from `Container`, `Prologue`, `Body`, `Epilogue` to `Head`, `Inner`, `Tail` with updated semantics for region targeting
-- Replaced `ChunkEditOp` enum values — `AppendChild`, `PrependChild`, `AppendSibling`, `PrependSibling`, and `ReplaceBody` are now `Before`, `After`, `Prepend`, and `Append` with updated semantics for region-scoped operations
-- Removed `ReplaceBody` operation — use `Replace` with `region: ChunkRegion.Body` to replace only chunk body content
-- Moved package entry point from `src/index.ts` to `native/index.js` — consumers must update imports to use the new native module path
-- Removed TypeScript source files from `src/` directory — all APIs now exported from auto-generated `native/index.js` with types in `native/index.d.ts`
-- Changed enum exports to runtime objects — `const enum` values are now available at runtime via generated enum exports in `native/index.js`
-
-### Added
-
-- Added `ChunkRegion` enum with `Container`, `Prologue`, `Body`, and `Epilogue` values for targeting specific regions within chunks
-- Added `region` parameter to `EditOperation` to specify which chunk region to target (defaults to `Container`)
-- Added `UnsupportedRegion` status to `ChunkReadStatus` enum to indicate when a chunk does not support the requested region
-- Added `normalizeIndent` parameter to `RenderParams` and `ReadRenderParams` to normalize displayed indentation to canonical tabs
-- Added `ReplaceBody` chunk edit operation to replace only the inner body of a chunk while preserving signature and closing delimiter
-- Added `ChunkFocusMode` enum with `Expanded`, `Collapsed`, and `Container` modes for controlling chunk participation in focus-scoped render passes
-- Added `FocusedPath` interface to pair paths with focus modes for the N-API boundary
-- Added `focusedPaths` parameter to `RenderParams` to restrict rendering to specified chunks with their focus modes
-- Generated native module bindings in `native/index.js` and `native/index.d.ts` from napi-rs build output
-- Added `gen-enums.ts` script to extract and export runtime enum values from TypeScript const enums
-- Added `embedded-addon.js` for managing embedded native addon variants and metadata
-- Added `MacOSPowerAssertion` for session-scoped macOS idle-sleep prevention without shelling out
-
-### Changed
-
-- Changed `ChunkInfo.name` field to optional `identifier` field — now provides bare chunk identifier without kind prefix instead of display name
-- Updated `region` parameter documentation in `EditOperation` to clarify full chunk targeting when omitted instead of container-scoped default
-- Updated `ChunkEditOp` documentation to reflect region-scoped semantics — operations now target specific regions rather than chunk structure positions
-- Changed `ChunkEditOp.Replace` documentation to clarify substring replacement via `find` parameter instead of line-based replacement
-- Changed `EditOperation` interface to use `find` parameter for scoped find/replace operations instead of `line` and `endLine` parameters
-- Changed `EditParams` documentation to remove mention of scheduling reordering for line-scoped groups
-- Simplified native build pipeline by removing `--dev` flag support; debug builds no longer available through npm scripts
-- Updated native module loader to check `XDG_DATA_HOME` environment variable for native addon location before falling back to `~/.omp/natives`
-- Removed native binding validation function that checked for required exports at load time
-- Refactored build pipeline to use napi-rs generated bindings instead of hand-written TypeScript wrappers
-- Updated `build-native.ts` to generate runtime enum exports after native compilation
-- Updated `embed-native.ts` to output JavaScript instead of TypeScript for embedded addon metadata
-
-### Removed
-
-- Removed `dev:native` npm script — use `build:native` for all build scenarios
-- Removed inline pi-utils helpers and dependency on `@oh-my-pi/pi-utils` from native module loader
-- Removed `logger.time()` wrapper calls from native module loading
-- Removed all TypeScript wrapper modules from `src/` directory (appearance, ast, chunk, clipboard, glob, grep, highlight, html, image, keys, projfs, ps, pty, shell, text, work)
-- Removed `src/bindings.ts` and `src/index.ts` entry points
-- Removed `src/search-db.ts` and `src/search-db-types.ts`
-
-Older entries are archived in [packages/natives/CHANGELOG.md@85936bf7f9b0](https://github.com/cybermonklabs/oh-my-pi/blob/85936bf7f9b063ed4480929e97f6ad326b1677ec/packages/natives/CHANGELOG.md).
+Older entries are archived in [packages/natives/CHANGELOG.md@2de014179b6a](https://github.com/cybermonklabs/oh-my-pi/blob/2de014179b6a9a8b0842663752cb9e804687dc62/packages/natives/CHANGELOG.md).

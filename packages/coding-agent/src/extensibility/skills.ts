@@ -243,6 +243,21 @@ export function resetActiveSkillsForTests(): void {
 }
 
 /**
+ * The skill list of every subagent spawned from a session with no skills: one frozen list, since every writer of a
+ * session's skills replaces the list rather than changing it in place.
+ */
+const NO_SKILLS = Object.freeze<Skill[]>([]) as Skill[];
+
+/**
+ * The skills of a subagent spawned from a session with `skills`: a copy of the list, or {@link NO_SKILLS} when there
+ * are none. A kept-alive subagent keeps the list for as long as it can be revived, so a parent with no skills would
+ * otherwise leave an empty list of its own in every subagent it parks.
+ */
+export function spawnedSubagentSkills(skills: readonly Skill[] | undefined): Skill[] {
+	return skills?.length ? [...skills] : NO_SKILLS;
+}
+
+/**
  * Whether `name` is already claimed by an active authored (non-managed) skill.
  *
  * Managed (auto-learn) skills resolve dead-last in discovery, so an authored

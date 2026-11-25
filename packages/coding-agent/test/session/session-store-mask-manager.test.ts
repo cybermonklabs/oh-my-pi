@@ -39,6 +39,7 @@ import { getConfigRootDir, isRecord, setAgentDir, stringifyJson, TempDir } from 
 import { SQL } from "bun";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "../collab/helpers/in-memory-relay";
 import { failNextReads, plainYml, settledClock, sourceReadWarnings, YML_MARKER } from "../helpers/masker-sources";
+import { dropSessionStoreTables } from "../helpers/sql-session-storage";
 
 const ENV_VALUE = "zq9-synthetic-service-4821";
 const FILE_VALUE = "file-held-token-7310";
@@ -83,7 +84,7 @@ function sqlBackend(name: string, connect: () => InstanceType<typeof SQL>, table
 				},
 				async close() {
 					for (const each of opened) await each.drain().catch(() => {});
-					if (options.table) await client.unsafe(`DROP TABLE IF EXISTS ${options.table}`);
+					if (options.table) await dropSessionStoreTables(client, options.table);
 					await client.end();
 				},
 			};

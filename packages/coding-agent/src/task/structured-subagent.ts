@@ -27,6 +27,7 @@ import type { Settings } from "../config/settings";
 import { isProviderEnabled, isUserSourceEnabled } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import type { CustomTool } from "../extensibility/custom-tools/types";
+import { spawnedSubagentSkills } from "../extensibility/skills";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -44,13 +45,8 @@ import { isIrcEnabled } from "../irc/messaging";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
-import {
-	type ExecutorOptions,
-	liveAgentAccountPools,
-	runSubprocess,
-	type SubagentSpawnerLiveInputs,
-	type SubagentToolResult,
-} from "./executor";
+import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "./executor";
+import { liveAgentAccountPools, type SubagentSpawnerLiveInputs } from "./subagent-session-options";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -836,7 +832,8 @@ export function subagentLiveInputs(session: ToolSession): SubagentSpawnerLiveInp
 		mcpManager: session.mcpManager,
 		contextFiles: session.contextFiles,
 		noContextFiles: session.noContextFiles,
-		skills: [...(session.skills ?? [])],
+		// A kept-alive subagent keeps this list while it can be revived: none of its own when the parent has none.
+		skills: spawnedSubagentSkills(session.skills),
 		workspaceTree: session.workspaceTree,
 		promptTemplates: session.promptTemplates,
 		rules: session.rules,

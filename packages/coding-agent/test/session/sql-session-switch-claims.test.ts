@@ -648,22 +648,33 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			await base.writeText(target, transcript(targetId, "the session it switches to"));
 			await base.drain();
 			// The recovery's read of the session left waits until the switch is over (or 3 s pass): a switch that does
-			// not wait for the recovery has set its new file by then.
+			// not wait for the recovery has set its new file by then. The recovery reads whole (`readText`) or streams
+			// (`readChunks`), so both wait.
 			const switchDone = Promise.withResolvers<void>();
 			let armed = false;
 			let recoveryReads = 0;
+			const holdRecoveryRead = async (readPath: string): Promise<void> => {
+				if (!armed || path.resolve(readPath) !== path.resolve(own)) return;
+				recoveryReads++;
+				await Promise.race([switchDone.promise, Bun.sleep(3000)]);
+			};
 			const store = new Proxy(base, {
 				get(t, property) {
 					const value: unknown = Reflect.get(t, property, t);
 					if (typeof value !== "function") return value;
-					if (property !== "readText") return value.bind(t);
-					return async (readPath: string, ...rest: unknown[]) => {
-						if (armed && path.resolve(readPath) === path.resolve(own)) {
-							recoveryReads++;
-							await Promise.race([switchDone.promise, Bun.sleep(3000)]);
-						}
-						return value.call(t, readPath, ...rest);
-					};
+					if (property === "readText") {
+						return async (readPath: string, ...rest: unknown[]) => {
+							await holdRecoveryRead(readPath);
+							return value.call(t, readPath, ...rest);
+						};
+					}
+					if (property === "readChunks") {
+						return async function* (readPath: string, ...rest: unknown[]): AsyncGenerator<Uint8Array> {
+							await holdRecoveryRead(readPath);
+							yield* value.call(t, readPath, ...rest) as AsyncIterable<Uint8Array>;
+						};
+					}
+					return value.bind(t);
 				},
 			}) as SqlSessionStorage;
 			const manager = await SessionManager.open(own, path.dirname(own), store, { suppressBreadcrumb: true });
@@ -1130,22 +1141,32 @@ for (const { adapter, url } of ROW_LEASE_BACKENDS) {
 			const other = fileOf(db, otherId);
 			await parentBase.writeText(other, transcript(otherId, "another session"));
 			await parentBase.drain();
-			// The parent's move to a sibling copies its subagent transcripts there; that copy reads the transcript, and
-			// waits for the gate.
+			// The parent's move to a sibling copies its subagent transcripts there; that copy reads the transcript, whole
+			// (`readText`) or streamed (`readChunks`), and waits for the gate.
 			const copyGate = Promise.withResolvers<void>();
 			let copyAsked = false;
+			const holdCopyRead = async (readPath: string): Promise<void> => {
+				if (path.resolve(readPath) !== path.resolve(child)) return;
+				copyAsked = true;
+				await copyGate.promise;
+			};
 			const parentStore = new Proxy(parentBase, {
 				get(t, property) {
 					const value: unknown = Reflect.get(t, property, t);
 					if (typeof value !== "function") return value;
-					if (property !== "readText") return value.bind(t);
-					return async (readPath: string, ...rest: unknown[]) => {
-						if (path.resolve(readPath) === path.resolve(child)) {
-							copyAsked = true;
-							await copyGate.promise;
-						}
-						return value.call(t, readPath, ...rest);
-					};
+					if (property === "readText") {
+						return async (readPath: string, ...rest: unknown[]) => {
+							await holdCopyRead(readPath);
+							return value.call(t, readPath, ...rest);
+						};
+					}
+					if (property === "readChunks") {
+						return async function* (readPath: string, ...rest: unknown[]): AsyncGenerator<Uint8Array> {
+							await holdCopyRead(readPath);
+							yield* value.call(t, readPath, ...rest) as AsyncIterable<Uint8Array>;
+						};
+					}
+					return value.bind(t);
 				},
 			}) as SqlSessionStorage;
 			const parentManager = await SessionManager.open(parent, path.dirname(parent), parentStore, {
