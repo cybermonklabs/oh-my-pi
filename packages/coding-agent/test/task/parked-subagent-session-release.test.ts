@@ -623,6 +623,121 @@ it("revives from revive inputs naming a model field through `__proto__` without 
 	}
 }, 30_000);
 
+/** A `__proto__` key's value, as a forged or damaged transcript holds it. */
+const FORGED_PROTO = { polluted: true };
+
+/** The field at `keys` (own fields, from the outermost in) within `value`; `undefined` when there is none. */
+function fieldAt(value: unknown, ...keys: string[]): unknown {
+	let field = value;
+	for (const key of keys) field = isRecord(field) && Object.hasOwn(field, key) ? field[key] : undefined;
+	return field;
+}
+
+/** What `holder` holds for a `__proto__` key: whether it is its own, its value, and whether its prototype is plain. */
+function protoKeyOf(holder: unknown): { own: boolean; value: unknown; plainPrototype: boolean } | undefined {
+	if (!isRecord(holder)) return undefined;
+	return {
+		own: Object.hasOwn(holder, "__proto__"),
+		value: Object.getOwnPropertyDescriptor(holder, "__proto__")?.value,
+		plainPrototype: Object.getPrototypeOf(holder) === Object.prototype,
+	};
+}
+
+/** Sets `__proto__` as an own field of `holder`, as JSON.parse does for a line that holds the key. */
+function defineProtoKey(holder: unknown, value: object): void {
+	if (!isRecord(holder)) throw new Error("The park recorded revive inputs without the record to forge");
+	Object.defineProperty(holder, "__proto__", { value, enumerable: true, writable: true, configurable: true });
+}
+
+/**
+ * Gives the newest revive inputs of the transcript at `sessionFile` an own `__proto__` key in their options, their wake
+ * inputs and each layer of their settings writes, as a forged or damaged file would. Returns the inputs as the park
+ * wrote them.
+ */
+async function forgeProtoKeys(
+	sessionFile: string,
+	values: { options: object; wake: object; global: object; overrides: object },
+): Promise<unknown> {
+	const lines = (await Bun.file(sessionFile).text()).split("\n");
+	const index = lines.findLastIndex(line => line.includes('"customType":"subagent-revive-state"'));
+	if (index === -1) throw new Error("The park recorded no revive inputs");
+	const recorded: unknown = JSON.parse(lines[index]!);
+	const entry: unknown = JSON.parse(lines[index]!);
+	defineProtoKey(fieldAt(entry, "data", "options"), values.options);
+	defineProtoKey(fieldAt(entry, "data", "wake"), values.wake);
+	defineProtoKey(fieldAt(entry, "data", "settingsWrites", "global", "set"), values.global);
+	const settingsWrites = fieldAt(entry, "data", "settingsWrites");
+	const overrides = {};
+	defineProtoKey(overrides, values.overrides);
+	if (isRecord(settingsWrites)) settingsWrites.overrides = { set: overrides };
+	const forged = JSON.stringify(entry);
+	expect(forged.includes('"__proto__":{"polluted":true}')).toBe(true);
+	expect(forged.includes('"overrides":{"set":{"__proto__":{}}}')).toBe(true);
+	lines[index] = forged;
+	await Bun.write(sessionFile, lines.join("\n"));
+	return fieldAt(recorded, "data");
+}
+
+// If this regresses, a session file whose revive inputs hold a `__proto__` key (forged or damaged) gives the subagent
+// woken from it spawn options, wake inputs and settings layers whose prototype is the key's value: they read the fields
+// they lack from it, the settings it revives with lose the key, and its next park records those fields and not the key.
+it("revives from revive inputs holding a `__proto__` key and keeps the key as data through its next park", async () => {
+	const run = await runKeptAliveSubagent();
+	try {
+		writeAndObserveLiveSettings(AGENT_ID);
+		await AgentLifecycleManager.global().park(AGENT_ID);
+		run.release();
+		const sessionFile = AgentRegistry.global().get(AGENT_ID)?.sessionFile;
+		if (!sessionFile) throw new Error(`subagent ${AGENT_ID} names no session file`);
+		// The options' and wake inputs' keys name a field they lack. The empty one equals Object.prototype, which a layer
+		// without the key reads there.
+		const recorded = await forgeProtoKeys(sessionFile, {
+			options: { ...FORGED_PROTO, thinkingLevel: "high" },
+			wake: { ...FORGED_PROTO, description: "forged" },
+			global: FORGED_PROTO,
+			overrides: {},
+		});
+
+		const revived = localSession(await AgentLifecycleManager.global().ensureLive(AGENT_ID));
+		const layers = revived.settings.overlayLayers();
+		const revivedWith = {
+			contextPromotion: cfgContextPromotionEnabled.get(revived),
+			global: protoKeyOf(layers.global),
+			overrides: protoKeyOf(layers.overrides),
+		};
+		// A write of the revived run, so that its park records its inputs again.
+		const baseUrl = "https://llm.example.test/v1";
+		cfgMnemopiLlmBaseUrl.set(revived, baseUrl);
+		await AgentLifecycleManager.global().park(AGENT_ID);
+		const parked = storedCustomData(await Bun.file(sessionFile).text(), "subagent-revive-state");
+
+		const kept = { own: true, value: FORGED_PROTO, plainPrototype: true };
+		expect({
+			revivedWith,
+			parked: {
+				options: fieldAt(parked, "options"),
+				wake: fieldAt(parked, "wake"),
+				global: protoKeyOf(fieldAt(parked, "settingsWrites", "global", "set")),
+				baseUrl: fieldAt(parked, "settingsWrites", "global", "set", ...cfgMnemopiLlmBaseUrl.segments),
+				overrides: protoKeyOf(fieldAt(parked, "settingsWrites", "overrides", "set")),
+			},
+		}).toEqual({
+			revivedWith: { contextPromotion: true, global: kept, overrides: { ...kept, value: {} } },
+			parked: {
+				options: fieldAt(recorded, "options"),
+				wake: fieldAt(recorded, "wake"),
+				global: kept,
+				baseUrl,
+				overrides: { ...kept, value: {} },
+			},
+		});
+		expect(Object.hasOwn(Object.prototype, "polluted")).toBe(false);
+	} finally {
+		Reflect.deleteProperty(Object.prototype, "polluted");
+		run.close();
+	}
+}, 30_000);
+
 const REGISTRY_MODEL_API = "test-parked-release-registry-model";
 const REGISTRY_PROVIDER = "registry-provider";
 const REGISTRY_MODEL_ID = "registry-model";

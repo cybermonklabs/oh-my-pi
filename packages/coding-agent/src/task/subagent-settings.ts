@@ -196,14 +196,29 @@ export interface SubagentSettingsWrites {
 	readonly overrides?: SettingsLayerWrites;
 }
 
+/**
+ * Sets `record[key]` as an own data property. Assigning `__proto__` would swap the record's prototype instead of
+ * creating the own data property JSON.parse produces.
+ */
+function setOwnField(record: Record<string, unknown>, key: string, value: unknown): void {
+	if (key === "__proto__") {
+		Object.defineProperty(record, key, { value, enumerable: true, writable: true, configurable: true });
+	} else {
+		record[key] = value;
+	}
+}
+
 /** The top-level keys whose value in `layer` differs from `baseline`'s; `undefined` when none does. */
 export function layerWrites(baseline: RawSettings, layer: RawSettings): SettingsLayerWrites | undefined {
 	let set: Record<string, unknown> | undefined;
 	let removed: string[] | undefined;
 	for (const key of new Set([...Object.keys(baseline), ...Object.keys(layer)])) {
-		if (Bun.deepEquals(baseline[key], layer[key])) continue;
-		if (layer[key] === undefined) (removed ??= []).push(key);
-		else (set ??= {})[key] = layer[key];
+		// Own fields only: a layer without a `__proto__` key would read its prototype there.
+		const before = Object.hasOwn(baseline, key) ? baseline[key] : undefined;
+		const after = Object.hasOwn(layer, key) ? layer[key] : undefined;
+		if (Bun.deepEquals(before, after)) continue;
+		if (after === undefined) (removed ??= []).push(key);
+		else setOwnField((set ??= {}), key, after);
 	}
 	return set || removed ? { set, removed } : undefined;
 }
@@ -216,7 +231,7 @@ export function withLayerWrites(layer: RawSettings, writes: SettingsLayerWrites 
 	const written: RawSettings = {};
 	for (const key of new Set([...Object.keys(layer), ...Object.keys(set)])) {
 		const value = Object.hasOwn(set, key) ? set[key] : removed.has(key) ? undefined : layer[key];
-		if (value !== undefined) written[key] = value;
+		if (value !== undefined) setOwnField(written, key, value);
 	}
 	return written;
 }

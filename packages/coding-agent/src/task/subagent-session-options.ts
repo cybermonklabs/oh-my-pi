@@ -349,7 +349,15 @@ export function withoutUndefinedFields<T extends object>(
 ): Partial<T> {
 	const defined: Partial<T> = {};
 	for (const key of keys) {
-		if (fields[key] !== undefined) defined[key] = fields[key];
+		const value = fields[key];
+		if (value === undefined) continue;
+		// Assigning `__proto__` would swap the copy's prototype instead of
+		// creating the own data property JSON.parse produces.
+		if (key === "__proto__") {
+			Object.defineProperty(defined, key, { value, enumerable: true, writable: true, configurable: true });
+		} else {
+			defined[key] = value;
+		}
 	}
 	return defined;
 }
