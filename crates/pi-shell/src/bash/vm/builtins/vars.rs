@@ -1263,19 +1263,41 @@ fn own_reference(ctx: &mut Ctx<'_, '_>, name: &[u8], target: &[u8]) -> Result<bo
 
 /// The running function's own reference `name`, when `+n NAME=VALUE`
 /// assigns it rather than its target: one with no target yet (`local -n
-/// q`), one that names an element (`local -n q='a[1]'`), or one whose chain
-/// ends through the function's own references ([`own_reference`]).
+/// q`), one whose chain of the function's own references ends at an element
+/// (`local -n q='a[1]'`, or `local -n s='a[1]'; local -n q=s`), or one whose
+/// chain ends through the function's own references at a variable
+/// ([`own_reference`]).
 fn own_ref(ctx: &mut Ctx<'_, '_>, name: &[u8]) -> Result<Option<Var>, Need> {
 	let Some(var) = func_local(ctx, name)?.filter(|v| v.attrs.contains(Attrs::NAMEREF)) else {
 		return Ok(None);
 	};
-	let names_element = var.as_scalar().is_some_and(|s| s.contains(&b'['));
 	Ok(match state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)? {
 		state::Deref::Plain => Some(var),
-		state::Deref::To { index: Some(_), .. } => names_element.then_some(var),
+		state::Deref::To { index: Some(_), .. } => own_element(ctx, &var)?.then_some(var),
 		state::Deref::To { name: t, index: None } => own_reference(ctx, name, &t)?.then_some(var),
 		state::Deref::Circular => None,
 	})
+}
+
+/// Whether the reference `var` reaches an element through name references
+/// the running function binds itself: its own value names the element, or
+/// a reference of the function's own that it names does, and so on.
+fn own_element(ctx: &mut Ctx<'_, '_>, var: &Var) -> Result<bool, Need> {
+	let mut at = var.clone();
+	// A longer chain loops, and a loop names no element.
+	for _ in 0..64 {
+		let Some(next) = at.as_scalar().filter(|_| at.attrs.contains(Attrs::NAMEREF)) else {
+			return Ok(false);
+		};
+		if next.contains(&b'[') {
+			return Ok(true);
+		}
+		let Some(v) = func_local(ctx, next)? else {
+			return Ok(false);
+		};
+		at = v;
+	}
+	Ok(false)
 }
 
 /// The top scope when it is a temporary environment (a command's prefix
@@ -2214,7 +2236,12 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		let raw_readonly = raw
 			.as_ref()
 			.is_some_and(|v| v.attrs.contains(Attrs::READONLY));
-		if off.contains(Attrs::NAMEREF) && raw_ref && raw_readonly && !raw_unset {
+		// A readonly reference refuses `+n`, with a target or without one
+		// when a value is given (`declare -rn q; declare +n q=zz`: bash says
+		// `q: readonly variable` and keeps `-nr`), before any path below can
+		// assign or drop the reference itself.
+		if off.contains(Attrs::NAMEREF) && raw_ref && raw_readonly && (!raw_unset || value.is_some())
+		{
 			ctx.err(Diag::Readonly { name: BString::from(name) });
 			status = 1;
 			continue;
@@ -2244,14 +2271,18 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			} else {
 				None
 			};
-			// A function's own reference to an element is left as it is, with
-			// a value or without: `f() { local -n q='a[1]'; local +n q=zz; }`
-			// keeps `q` and `a` (bash 5.3.20 and 5.2.21). A global one gives
-			// the value to the element and ends, below, as bash's does.
-			if own
-				.as_ref()
-				.is_some_and(|v| v.as_scalar().is_some_and(|s| s.contains(&b'[')))
-			{
+			// A function's own reference to an element, directly or through
+			// its own references, is left as it is, with a value or without:
+			// `f() { local -n q='a[1]'; local +n q=zz; }` keeps `q` and `a`,
+			// and so does `local -n s='a[1]'; local -n q=s; local +n q=zz`
+			// (bash 5.3.20 and 5.2.21). A global one gives the value to the
+			// element and ends, below, as bash's does.
+			let own_element = own.is_some()
+				&& matches!(state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)?, state::Deref::To {
+					index: Some(_),
+					..
+				});
+			if own_element {
 				continue;
 			}
 			if let Some(value) = value

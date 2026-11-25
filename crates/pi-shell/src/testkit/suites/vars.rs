@@ -1769,6 +1769,36 @@ fn attributes_given_with_and_without_the_reference() {
 			"st=1\n",
 			"bash: line 1: declare: q: not found\n",
 		),
+		// A readonly reference refuses `+n` with a value, with or without a
+		// target, and stays as it is: it is neither assigned nor dropped.
+		(
+			"declare -rn q; declare +n q=zz; echo \"st=$?\"; declare -p q",
+			"st=1\ndeclare -nr q\n",
+			"bash: line 1: declare: q: readonly variable\n",
+		),
+		(
+			"declare -rn q; declare +n q=3; echo \"st=$?\"; declare -p q",
+			"st=1\ndeclare -nr q\n",
+			"bash: line 1: declare: q: readonly variable\n",
+		),
+		(
+			"f() { local -rn q; local +n q=zz; echo \"st=$?\"; declare -p q; }; f",
+			"st=1\ndeclare -nr q\n",
+			"bash: line 1: local: q: readonly variable\n",
+		),
+		(
+			"f() { local -rn q; local +n q=3; echo \"st=$?\"; declare -p q; }; f",
+			"st=1\ndeclare -nr q\n",
+			"bash: line 1: local: q: readonly variable\n",
+		),
+		// A chain of the function's own references to an element is left as
+		// it is, as a direct one is.
+		(
+			"a=(1 2); f() { local -n s='a[1]'; local -n q=s; local +n q=zz; declare -p q s; echo \
+			 \"${a[*]}\"; }; f",
+			"declare -n q=\"s\"\ndeclare -n s=\"a[1]\"\n1 2\n",
+			"",
+		),
 		(
 			"a=(1 2); f() { local -n q='a[1]'; local +n q=zz; echo \"st=$?\"; declare -p q; echo \
 			 \"${a[*]}\"; }; f",
