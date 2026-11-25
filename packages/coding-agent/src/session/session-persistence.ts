@@ -1,5 +1,13 @@
 import { isAnthropicServerToolHistoryBlock } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
-import { countNewlines, isRecord, stringifyDeepJson, stringifyJsonIteratively } from "@oh-my-pi/pi-utils";
+import {
+	ContainerPath,
+	countNewlines,
+	isRecord,
+	type NestedWalk,
+	runNested,
+	stringifyDeepJson,
+	stringifyJsonIteratively,
+} from "@oh-my-pi/pi-utils";
 import { PRESERVE_KEY as SNAPCOMPACT_PRESERVE_KEY } from "@oh-my-pi/snapcompact";
 import {
 	type BlobStore,
@@ -8,7 +16,6 @@ import {
 	isBlobRef,
 	isImageDataUrl,
 } from "./blob-store";
-import { ContainerPath, type NestedWalk, runNested } from "./nested-walk";
 import type { FileEntry } from "./session-entries";
 
 const MAX_PERSIST_CHARS = 500_000;

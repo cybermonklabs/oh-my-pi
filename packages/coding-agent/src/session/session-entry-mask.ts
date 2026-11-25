@@ -47,10 +47,17 @@
  *   other blob reference in free content, and image data that is no blob reference, are masked.
  */
 import { isBoxedPrimitive } from "node:util/types";
-import { countNewlines, isRecord, stringifyDeepJson, tryParseJson } from "@oh-my-pi/pi-utils";
+import {
+	ContainerPath,
+	countNewlines,
+	isRecord,
+	type NestedWalk,
+	runNested,
+	stringifyDeepJson,
+	tryParseJson,
+} from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
 import { BLOB_HASH_RE, BLOB_PREFIX, isBlobRef } from "./blob-store";
-import { ContainerPath, type NestedWalk, runNested } from "./nested-walk";
 import { type ImageSite, imageAt, resolvedImageSiteOf } from "./session-persistence";
 import type { SessionTitleUpdate } from "./session-title-slot";
 

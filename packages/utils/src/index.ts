@@ -21,6 +21,7 @@ export * from "./math-delimiters";
 export * from "./materialize-string";
 export * from "./mermaid-ascii";
 export * from "./mime";
+export * from "./nested-walk";
 export * from "./path";
 export * from "./path-tree";
 export * from "./peek-file";

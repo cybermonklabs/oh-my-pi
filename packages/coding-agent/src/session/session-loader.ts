@@ -10,8 +10,10 @@ import {
 	isEnotdir,
 	jsonContainerEnd,
 	logger,
+	type NestedWalk,
 	parseJsonlLenient,
 	peekFile,
+	runNested,
 	tryParseJson,
 } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
@@ -38,7 +40,6 @@ import {
 	type SessionHeader,
 } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
-import { type NestedWalk, runNested } from "./nested-walk";
 import { imageAt, isPersistenceTruncatedString, resolvedImageSiteOf } from "./session-persistence";
 import { defaultSessionStorage, FileSessionStorage, retryRacedRead, type SessionStorage } from "./session-storage";
 import { enotdir } from "./session-storage-errors";
