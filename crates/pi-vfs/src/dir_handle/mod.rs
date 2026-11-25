@@ -73,8 +73,8 @@ use crate::{
 use crate::{
 	fifo::{FifoName, FifoOpen, FifoPin},
 	fs::{
-		by_name_options, creates, fifo_open_waits, reopen_options, truncates, wait_fifo,
-		wait_fifo_async,
+		by_name_options, creates, fifo_open_waits, plain_after_failed_look, reopen_options,
+		truncates, wait_fifo, wait_fifo_async,
 	},
 };
 
@@ -559,7 +559,7 @@ fn host_open_at(
 ) -> io::Result<File> {
 	#[cfg(unix)]
 	if let Some(token) = &scope.cancel
-		&& let Some(pin) = host_fifo_pin(s, handle, name, options)
+		&& let Some(pin) = host_fifo_pin(s, handle, name, options)?
 	{
 		let file = wait_fifo(host_fifo_open(handle, scope, name, options, pin, token)?, token)?;
 		return Ok(file.bind_host(token.clone(), true));
@@ -582,7 +582,7 @@ async fn host_open_at_async(
 	options: &OpenOptions,
 ) -> io::Result<File> {
 	#[cfg(unix)]
-	if let Some(pin) = with_scratch(|s| host_fifo_pin(s, handle, name, options)) {
+	if let Some(pin) = with_scratch(|s| host_fifo_pin(s, handle, name, options))? {
 		let token = scope.cancel.clone().unwrap_or_default();
 		let file =
 			wait_fifo_async(host_fifo_open(handle, scope, name, options, pin, &token)?, &token)
@@ -614,6 +614,10 @@ fn open_host_entry(
 /// does not follow a symlink there (the open refuses one anyway), with the
 /// FIFO pinned ([`FifoPin`]; `None` when it was gone by the pin). The pin is
 /// a second call: a FIFO put at the name in between is the one pinned.
+/// `None` too when the `fstatat` finds nothing there, or a component that is
+/// no directory ([`plain_after_failed_look`]): the plain open creates the
+/// file or fails as `open(2)` does. Any other failure of the `fstatat` is
+/// the open's error.
 #[cfg(unix)]
 #[allow(
 	clippy::option_option,
@@ -624,19 +628,38 @@ fn host_fifo_pin(
 	handle: &native::Handle,
 	name: &[u8],
 	options: &OpenOptions,
-) -> Option<Option<FifoPin>> {
+) -> io::Result<Option<Option<FifoPin>>> {
 	use std::os::fd::AsRawFd;
 	if !fifo_open_waits(options) {
-		return None;
+		return Ok(None);
 	}
-	let meta = native::stat_at(s, handle, name, false).ok()?;
+	let meta = match look_at(s, handle, name) {
+		Ok(meta) => meta,
+		Err(err) if plain_after_failed_look(&err) => return Ok(None),
+		Err(err) => return Err(err),
+	};
 	if !meta.file_type().is_fifo() {
-		return None;
+		return Ok(None);
 	}
 	let pin = std::ffi::CString::new(name)
 		.ok()
 		.and_then(|name| FifoPin::at(handle.as_raw_fd(), &name, false).ok().flatten());
-	Some(pin)
+	Ok(Some(pin))
+}
+
+/// The `fstatat` of `name` in `handle` before a FIFO open, not following a
+/// symlink there ([`host_fifo_pin`]), or the failure a test planted for
+/// `name` ([`crate::fifo::hooks::fail_next_look`]).
+#[cfg(unix)]
+fn look_at(s: &mut native::Scratch, handle: &native::Handle, name: &[u8]) -> io::Result<Metadata> {
+	#[cfg(test)]
+	{
+		use std::os::unix::ffi::OsStrExt;
+		if let Some(err) = crate::fifo::hooks::take_look_failure(Path::new(OsStr::from_bytes(name))) {
+			return Err(err);
+		}
+	}
+	native::stat_at(s, handle, name, false)
 }
 
 /// Starts the open of the FIFO `name` in `handle`, pinned as `pin`, on a

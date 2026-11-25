@@ -995,11 +995,16 @@ pub(crate) mod seam {
 /// `/proc/self/fd/N` reaches the pin), between its check that the name names
 /// the pinned FIFO and its open of the name; one run once by a drop that has
 /// its peer and did not leave the helper at once, whichever the helper opens,
-/// before it waits for the helper; and a record of the helpers that have
-/// ended.
+/// before it waits for the helper; a record of the helpers that have ended;
+/// and failures planted for the look before a FIFO open (the `stat` of a
+/// path under a cancellable scope, keyed by the path; the `fstatat` of a
+/// directory handle's entry, keyed by the entry's name).
 #[cfg(test)]
 pub(crate) mod hooks {
-	use std::path::{Path, PathBuf};
+	use std::{
+		io,
+		path::{Path, PathBuf},
+	};
 
 	use parking_lot::Mutex;
 
@@ -1009,6 +1014,25 @@ pub(crate) mod hooks {
 	static BEFORE_PEER_OPEN: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 	static WHEN_JOINING: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 	static ENDED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+	static LOOK_FAILS: Mutex<Vec<(PathBuf, i32)>> = Mutex::new(Vec::new());
+
+	/// Makes the next look before a FIFO open given `name` fail with
+	/// `errno`.
+	pub(crate) fn fail_next_look(name: &Path, errno: i32) {
+		LOOK_FAILS.lock().push((name.to_path_buf(), errno));
+	}
+
+	/// Drops the failures still planted for `name`.
+	pub(crate) fn clear_look_failures(name: &Path) {
+		LOOK_FAILS.lock().retain(|(path, _)| path != name);
+	}
+
+	/// The failure planted for the next look given `name`, taken.
+	pub(crate) fn take_look_failure(name: &Path) -> Option<io::Error> {
+		let mut fails = LOOK_FAILS.lock();
+		let at = fails.iter().position(|(path, _)| path == name)?;
+		Some(io::Error::from_raw_os_error(fails.remove(at).1))
+	}
 
 	/// Runs `hook` once, in the next helper of an open given `name`, just
 	/// before its open.

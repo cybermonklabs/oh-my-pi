@@ -1695,6 +1695,40 @@ mod fifo {
 			}
 		}
 
+		/// A write whose first look finds nothing meets a FIFO with no reader
+		/// (`ENXIO`) and looks again: that second look's failure is the open's
+		/// result too, not a blocking plain open.
+		#[test]
+		fn a_failed_look_after_enxio_is_the_opens_error() {
+			use crate::bash::{Fs as _, FsPoll};
+			let dir = tempfile::tempdir().unwrap();
+			let path = make_fifo(dir.path());
+			LOOK_FAILS
+				.lock()
+				.extend([(path.clone(), libc::ENOENT), (path.clone(), libc::EIO)]);
+			let (tx, rx) = std::sync::mpsc::channel();
+			let name = path.clone();
+			thread::spawn(move || {
+				let name = BStr::new(name.as_os_str().as_bytes());
+				let opened = match super::super::StdFs::default().open(name, OpenFlags::WRITE, 0) {
+					FsPoll::Ready(Err(e)) => Ok(e.raw_os_error()),
+					FsPoll::Ready(Ok(f)) => Err(format!("opened a {:?}", f.kind())),
+					FsPoll::Pending(_) => Err("pending".to_owned()),
+				};
+				let _ = tx.send(opened);
+			});
+			let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+			if got.is_err() {
+				// Waiting in open(2): a reader lets it return.
+				let _ = OpenOptions::new()
+					.read(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&path);
+			}
+			LOOK_FAILS.lock().retain(|(failing, _)| *failing != path);
+			assert_eq!(got, Ok(Ok(Some(libc::EIO))), "write after ENXIO");
+		}
+
 		/// A FIFO named `f` in `dir`.
 		fn make_fifo(dir: &Path) -> std::path::PathBuf {
 			let path = dir.join("f");

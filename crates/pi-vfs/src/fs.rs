@@ -213,12 +213,15 @@ enum ScopedOpen {
 /// one `stat` first. It says whether the file's reads must poll (see
 /// [`crate::reads_can_block`]) and whether the open itself can block: a
 /// FIFO's open waits for the other end, unless the open never waits on a
-/// FIFO it finds ([`fifo_open_waits`]). Without a token, for any other open,
-/// or when the `stat` fails, the open is [`ScopedOpen::Plain`]. If the path
-/// changes between the `stat` and the open, the file is opened as the `stat`
-/// described it.
+/// FIFO it finds ([`fifo_open_waits`]). Without a token, or for any other
+/// open, the open is [`ScopedOpen::Plain`]; so it is when the `stat` finds
+/// nothing at the path or a component that is no directory, where the plain
+/// open creates the file or fails as `open(2)` does
+/// ([`plain_after_failed_look`]). Any other failure of the `stat` is the
+/// open's error. If the path changes between the `stat` and the open, the
+/// file is opened as the `stat` described it.
 #[cfg_attr(not(unix), allow(clippy::missing_const_for_fn, reason = "const only off Unix"))]
-fn plan_scoped_open(scope: &Scope, path: &Path, options: &OpenOptions) -> ScopedOpen {
+fn plan_scoped_open(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<ScopedOpen> {
 	#[cfg(unix)]
 	if let Some(token) = &scope.cancel
 		&& !options.is_create_new()
@@ -227,30 +230,55 @@ fn plan_scoped_open(scope: &Scope, path: &Path, options: &OpenOptions) -> Scoped
 		match (options.is_read(), options.is_writable()) {
 			(true, false) if !options.is_create() => {},
 			(false, true) => {},
-			_ => return ScopedOpen::Plain,
+			_ => return Ok(ScopedOpen::Plain),
 		}
-		let Ok(meta) = std::fs::metadata(path) else {
-			return ScopedOpen::Plain;
+		let meta = match look(path) {
+			Ok(meta) => meta,
+			Err(err) if plain_after_failed_look(&err) => return Ok(ScopedOpen::Plain),
+			Err(err) => return Err(err),
 		};
 		if meta.file_type().is_fifo() && fifo_open_waits(options) {
 			let follow = options.get_custom_flags() & libc::O_NOFOLLOW == 0;
 			let pin = std::ffi::CString::new(path.as_os_str().as_bytes())
 				.ok()
 				.and_then(|path| FifoPin::at(libc::AT_FDCWD, &path, follow).ok().flatten());
-			return ScopedOpen::Fifo { token: token.clone(), pin };
+			return Ok(ScopedOpen::Fifo { token: token.clone(), pin });
 		}
-		return ScopedOpen::Typed { token: token.clone(), poll: crate::reads_can_block(&meta) };
+		return Ok(ScopedOpen::Typed { token: token.clone(), poll: crate::reads_can_block(&meta) });
 	}
 	#[cfg(not(unix))]
 	let _ = (scope, path, options);
-	ScopedOpen::Plain
+	Ok(ScopedOpen::Plain)
+}
+
+/// The `stat` before a host open under a cancellable scope
+/// ([`plan_scoped_open`]), or the failure a test planted for `path`
+/// ([`crate::fifo::hooks::fail_next_look`]).
+#[cfg(unix)]
+fn look(path: &Path) -> io::Result<std::fs::Metadata> {
+	#[cfg(test)]
+	if let Some(err) = crate::fifo::hooks::take_look_failure(path) {
+		return Err(err);
+	}
+	std::fs::metadata(path)
+}
+
+/// Whether an open whose look at the entry failed with `err` is left to the
+/// plain open: nothing is at the path, or a component of it is no
+/// directory, where the plain open creates the file or fails as `open(2)`
+/// does. Any other failure of the look is the open's error: a plain open
+/// of a FIFO the look could not see waits in `open(2)` for the other end,
+/// on the caller's thread or runtime worker, where no token reaches it.
+#[cfg(unix)]
+pub(crate) fn plain_after_failed_look(err: &io::Error) -> bool {
+	matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }
 
 /// Opens a host path for a facade and binds the file to the facade's scope,
 /// so its reads observe the scope's cancellation (see [`File`]). For blocking
 /// callers; async callers use [`native_open_scoped_async`].
 fn native_open_scoped(scope: &Scope, path: &Path, options: &OpenOptions) -> io::Result<File> {
-	match plan_scoped_open(scope, path, options) {
+	match plan_scoped_open(scope, path, options)? {
 		#[cfg(unix)]
 		ScopedOpen::Typed { token, poll } => {
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
@@ -276,7 +304,7 @@ async fn native_open_scoped_async(
 	path: &Path,
 	options: &OpenOptions,
 ) -> io::Result<File> {
-	match plan_scoped_open(scope, path, options) {
+	match plan_scoped_open(scope, path, options)? {
 		#[cfg(unix)]
 		ScopedOpen::Typed { token, poll } => {
 			Ok(native_open(scope, path, options)?.bind_host(token, poll))
