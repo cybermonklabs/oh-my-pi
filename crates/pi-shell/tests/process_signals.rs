@@ -4901,12 +4901,16 @@ fn set_m_jobs_run_in_a_process_group_of_their_own_without_a_terminal() {
 /// then `kill -CONT %1`, ends it of `USR1` (`st=138`), as does `USR1` then
 /// `TERM` (`st=138`, by `%1` and by `-PID`), and `USR2` then `HUP` ends it
 /// of `HUP` (`st=129`). Only `kill` of the job (`%1`, `-PID`) continues
-/// it after `TERM` or `HUP` (bash `kill_pid` sends `CONT` to the group),
+/// it after `TERM` or `HUP` (bash `kill_pid` sends `CONT` to the group, so
+/// a stopped program the job left in its group dies of it too),
 /// whatever the job does with the signal: a trapped `TERM` runs its trap
 /// once the job runs again, and a held `USR1` still comes first, before a
 /// trapped `HUP`'s trap. `kill -TERM PID` of the job's program sends no
 /// `CONT`: the job stays stopped with `TERM` pending until `kill -CONT
-/// %1`. The shell has no terminal. The
+/// %1`; sent so to a job of shell code, it waits among the ends the job
+/// holds (a held `USR1` still wins, `st=138`). `KILL` ends a stopped job
+/// at once whatever it holds (137 after a held `HUP`). The shell has no
+/// terminal. The
 /// goldens are bash 5.3.20's (compared live only with a bash 5.3 or later,
 /// [`real_bash_golden`]); bash 5.2.21 gives the same output, and prints
 /// its `[1]+  Terminated` notices besides. The rows of a job a `USR1`,
@@ -5155,6 +5159,47 @@ fn set_m_kill_of_a_jobs_group_reaches_its_shell_code() {
 			),
 			"kill=0\nstopped\nst=143\n",
 			true,
+		),
+		// bash's `CONT` after `TERM` goes to the whole group: a stopped
+		// program the stopped job left in its group dies of the `TERM` too
+		// (`left-gone`), not only the job's own processes. The job is
+		// stopped once its `/bin/sh` has ended (`$F.loop`, made by the job's
+		// own code after it), so that only that `CONT` can reach the
+		// leftover: while the job still waits for a program, continuing that
+		// program continues its group as well.
+		(
+			format!(
+				"/bin/rm -f \"$F.left\" \"$F.loop\"; set -m; {{ /bin/sh -c '/bin/sleep 30 >/dev/null \
+				 2>&1 & echo $! > \"$0.left\"' \"$F\"; : > \"$F.loop\"; while :; do {bound}; done; }} \
+				 & until [ -e \"$F.loop\" ]; do {bound}; done; read l < \"$F.left\"; kill -STOP %1; \
+				 {job_stopped}; kill -TERM %1; echo kill=$?; {gone}; i=0; while kill -0 $l \
+				 2>/dev/null && [ $i -lt 100 ]; do i=$((i+1)); /bin/sleep 0.05; done; kill -0 $l \
+				 2>/dev/null && echo left-alive || echo left-gone; kill -KILL $l 2>/dev/null; :"
+			),
+			"kill=0\nst=143\nleft-gone\n",
+			true,
+		),
+		// `TERM` by `kill PID` of a stopped job of shell code (`$!` names the
+		// job) waits among the ends the job holds: a held `USR1` still
+		// comes first once the job is continued (`st=138`). And `KILL` is
+		// never ordered behind them: after a held `HUP` it ends the job
+		// with 137.
+		(
+			format!(
+				"set -m; ( while :; do /bin/sleep 0.2; done ) & /bin/sleep 0.5; kill -STOP %1; \
+				 {job_stopped}; kill -USR1 %1; kill -TERM $!; echo kill=$?; /bin/sleep 0.3; {listed}; \
+				 kill -CONT %1; {gone}"
+			),
+			"kill=0\nstopped\nst=138\n",
+			false,
+		),
+		(
+			format!(
+				"set -m; ( while :; do /bin/sleep 0.2; done ) & /bin/sleep 0.5; kill -STOP %1; \
+				 {job_stopped}; kill -HUP $!; echo kill=$?; /bin/sleep 0.3; kill -KILL %1; {gone}"
+			),
+			"kill=0\nst=137\n",
+			false,
 		),
 	];
 	let dir = tempfile::tempdir().expect("a directory for the script and the output");
@@ -5630,6 +5675,77 @@ fn set_m_wait_warns_of_a_job_continued_by_pid() {
 		if let Some(real) = real_bash_golden() {
 			let theirs = run(real.as_os_str());
 			assert!(bash_agrees(&theirs, &expected), "bash {form:?}: {script}: {theirs:?}");
+		}
+	}
+}
+
+/// A known difference, pinned so that the change that closes it flips
+/// these rows: under `set -m` without a terminal, a foreground command of
+/// the shell that stops takes zsh's way (`jobctl::suspend`). obash prints
+/// `zsh: suspended (signal)  CMD` and goes on, and a stop inside a loop
+/// makes the whole loop the job and ends the rest of the line (the shell
+/// exits with 147). bash makes the stopped command alone a stopped job and
+/// runs on (`st=147`, then `jobs` lists it). The member that takes the stop
+/// in bash's way (`fix/a-stop-under-set-m-returns-without-a-terminal`)
+/// flips both rows; with a terminal nothing changes here, which is this
+/// member's scope. bash's output is compared live only with a bash 5.3 or
+/// later ([`real_bash_golden`]). Each stopped program writes its pid to
+/// `$F.pids`, and the test ends each one after the run, as obash's loop
+/// row leaves it stopped. The rows run as a `-c` string and as a script
+/// file ([`Form`]), bounded ([`bounded_to_files`]).
+#[cfg(target_os = "linux")]
+#[test]
+fn set_m_foreground_stop_without_a_terminal_takes_zshs_suspend() {
+	const OUT: &str = "exec >\"$F.out\" 2>\"$F.err\"; /bin/rm -f \"$F.pids\"; ";
+	let cmd = r#"/bin/sh -c 'echo $$ >> "$0.pids"; kill -STOP $$' "$F""#;
+	let zsh = format!("zsh: suspended (signal)  {cmd}\n");
+	let one = format!("[1]+  Stopped                    {cmd}\n");
+	let two =
+		format!("[1]-  Stopped                    {cmd}\n[2]+  Stopped                    {cmd}\n");
+	// (script, obash's output and end, bash's output and end)
+	let rows = [
+		(
+			format!("set -m; {cmd}; echo st=$?; jobs; kill -CONT %1; wait; echo end"),
+			(format!("{zsh}st=147\n{one}end\n"), Exit(0)),
+			(format!("st=147\n{one}end\n"), Exit(0)),
+		),
+		(
+			format!(
+				"set -m; for i in 1 2; do {cmd}; echo st=$?; done; jobs; kill -CONT %1 %2; wait; echo \
+				 end"
+			),
+			(zsh, Exit(147)),
+			(format!("st=147\nst=147\n{two}end\n"), Exit(0)),
+		),
+	];
+	let dir = tempfile::tempdir().expect("a directory for the script and the output");
+	// The programs that stopped, ended after the run.
+	let end_stopped = || {
+		let pids = fs::read_to_string(dir.path().join("f.pids")).unwrap_or_default();
+		for pid in pids
+			.lines()
+			.filter_map(|p| p.trim().parse::<libc::pid_t>().ok())
+		{
+			// SAFETY: a plain signal to a pid the row wrote; one gone is ESRCH.
+			unsafe { libc::kill(pid, libc::SIGKILL) };
+		}
+	};
+	for form in Form::BOTH {
+		for (script, (ours, ours_end), (theirs, theirs_end)) in &rows {
+			let script = format!("{OUT}{script}");
+			let obash = OsStr::new(env!("CARGO_BIN_EXE_obash"));
+			let got = bounded_to_files(obash, form, &script, dir.path());
+			end_stopped();
+			assert_eq!(got, (ours.clone(), String::new(), Some(*ours_end)), "{form:?}: {script}");
+			if let Some(real) = real_bash_golden() {
+				let got = bounded_to_files(real.as_os_str(), form, &script, dir.path());
+				end_stopped();
+				assert_eq!(
+					got,
+					(theirs.clone(), String::new(), Some(*theirs_end)),
+					"bash {form:?}: {script}"
+				);
+			}
 		}
 	}
 }

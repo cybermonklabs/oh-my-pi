@@ -3283,6 +3283,12 @@ impl Shell {
 				continue;
 			}
 			let terminating = trap.is_none() && sig.default_action() == DefaultAction::Terminate;
+			// `KILL` is never ordered behind pending signals (the kernel ends
+			// the process at once): the ends a stopped vproc held go with it.
+			if sig == Signal::Kill {
+				let vpid = self.procs[i].vpid;
+				self.k.held_ends.retain(|&(v, ..)| v != vpid);
+			}
 			let dialect = self.procs[i].mode.dialect();
 			let bash = dialect == crate::bash::ids::Dialect::Bash;
 			// Whether the signal continues a stopped vproc: `KILL` ends it in
@@ -3353,22 +3359,40 @@ impl Shell {
 			// A stopped bash vproc of shell code acts on its pending ends once
 			// it is continued, the lowest signal number first, as a stopped
 			// bash subshell does ([`Kernel::held_ends`]): a terminating signal
-			// that does not continue it waits there, and one that does
-			// (`TERM`, `HUP` by `kill` of the job) joins them and continues it,
-			// so that `USR1` then `TERM` ends it of `USR1`. `KILL` ends it at
-			// once. What it runs has the signal waiting, from the kernel or
-			// here.
+			// that does not continue it waits there (`kill PID` too), and one
+			// that does (`TERM`, `HUP` by `kill` of the job) joins them and
+			// continues it, so that `USR1` then `TERM` ends it of `USR1`.
+			// `KILL` ends it at once. What it runs has the signal waiting,
+			// from the kernel or here. A vproc that only waits for its `( … )`
+			// or pipeline is one process with them in bash: its pending ends
+			// are theirs, so a signal sent to it by pid waits in them.
 			if terminating
 				&& target != SigTarget::Vpid(root.0)
 				&& self.procs[i].stopped
 				&& (!continuing || (sig != Signal::Kill && bash))
 			{
-				signal_lives(&mut self.procs[i], sig, continuing, !given);
-				let vpid = self.procs[i].vpid;
-				self.k.held_ends.push((vpid, sig, given));
-				if continuing {
-					set_stopped(&mut self.procs[i], false);
-					changed.push((vpid, None));
+				let mut holders = vec![i];
+				if transparent(&self.procs[i], true) == Some(false) {
+					let children: Vec<Vpid> = self.procs[i]
+						.frames
+						.last()
+						.and_then(|f| f.scratch.as_ref())
+						.map_or_else(Vec::new, |sc| sc.children.iter().map(|&(v, _)| v).collect());
+					let stopped: Vec<usize> = (0..self.procs.len())
+						.filter(|&j| self.procs[j].stopped && children.contains(&self.procs[j].vpid))
+						.collect();
+					if !stopped.is_empty() {
+						holders = stopped;
+					}
+				}
+				for j in holders {
+					signal_lives(&mut self.procs[j], sig, continuing, !given);
+					let vpid = self.procs[j].vpid;
+					self.k.held_ends.push((vpid, sig, given));
+					if continuing {
+						set_stopped(&mut self.procs[j], false);
+						changed.push((vpid, None));
+					}
 				}
 				continue;
 			}
