@@ -426,8 +426,10 @@ enum Scan<'t> {
 	/// A word as bash stores it (an operator's word, a brace-expanded word).
 	Word(st::Word<'t>),
 	/// The inside of `"…"` (also of a pair of quotes arithmetic text drops,
-	/// which bash expands as a string of its own).
-	Dq(st::Seq<'t, st::WordPart<'t>>),
+	/// which bash expands as a string of its own, `arith`), and the index of
+	/// the part that fails; `dq_param`: the quotes are in a word of a `${…}`
+	/// that is itself inside `"…"`.
+	Dq { parts: st::Seq<'t, st::WordPart<'t>>, at: usize, arith: bool, dq_param: bool },
 	/// A keyed array element, `\[key\]=value`.
 	Elem(st::ArrayElem<'t>),
 	/// Text parsed when it runs (a here-document body, arithmetic): all of
@@ -444,7 +446,35 @@ impl Scan<'_> {
 		let mut value = None;
 		match self {
 			Self::Word(w) => syn::word_text(w, &mut out),
-			Self::Dq(parts) => syn::dq_text(parts, &mut out),
+			Self::Dq { parts, at, arith, dq_param } => {
+				// bash's `string_extract_double_quoted` drops the backslash of
+				// an escaped `"` (only of that: `\$`, `\\` keep theirs); the
+				// word of a `${…}` inside `"…"` keeps it (`\"${x!}`).
+				let mut quotes = Vec::new();
+				let mut start = 0;
+				for (i, p) in parts.iter().enumerate() {
+					if i == at {
+						start = out.len();
+					}
+					match p.get() {
+						st::Part::Escaped(b"\"") if !dq_param => {
+							quotes.push(out.len());
+							out.push(b'"');
+						},
+						_ => syn::dq_part_text(p, &mut out),
+					}
+				}
+				// In arithmetic such a `"` is a quote again: it opens a string
+				// of its own up to the next one (or the end), and a part that
+				// fails inside it names only that string (`b${x!}` for
+				// `"a\"b${x!}"`); outside one, the whole string.
+				let before = quotes.iter().filter(|&&q| q < start).count();
+				if arith && before % 2 == 1 {
+					let end = quotes.get(before).copied().unwrap_or(out.len());
+					out.truncate(end);
+					out.drain(..=quotes[before - 1]);
+				}
+			},
 			Self::Elem(e) => {
 				out.extend_from_slice(b"\\[");
 				if let Some(key) = e.key() {
@@ -520,6 +550,10 @@ struct Lower {
 	/// substitution body: its words are [`WordKind::Text`] (no tilde
 	/// expansion).
 	text:          bool,
+	/// Lowering the words of a `${…}` that is itself inside `"…"`: bash
+	/// keeps the backslash of a `\"` in their quotes when it names them
+	/// ([`Scan::Dq`]).
+	dq_param:      bool,
 }
 
 /// The line starts of a unit's source (unit-relative offsets), scanned on
@@ -589,6 +623,7 @@ impl Lower {
 			cond: 0,
 			features,
 			text: false,
+			dq_param: false,
 		}
 	}
 
@@ -1121,6 +1156,7 @@ impl Lower {
 			cond:          0,
 			features:      self.features,
 			text:          false,
+			dq_param:      false,
 		};
 		sub.command(cmd)?;
 		sub.emit(Opcode::End, 0, 0, root);
@@ -1463,7 +1499,8 @@ impl Lower {
 		// Arithmetic text keeps the quotes it drops as a pair of
 		// `DroppedQuote` markers: bash expands their inside as a string of
 		// its own, which a `bad substitution` names.
-		let mut quoted: Option<st::Seq<'_, st::WordPart<'_>>> = None;
+		// The quoted parts and the index of the first of them.
+		let mut quoted: Option<(st::Seq<'_, st::WordPart<'_>>, usize)> = None;
 		for (i, part) in all.iter().enumerate() {
 			if matches!(scan, Scan::Text) && matches!(part.get(), st::Part::DroppedQuote) {
 				quoted = if quoted.is_some() {
@@ -1474,11 +1511,17 @@ impl Lower {
 						.iter()
 						.position(|p| matches!(p.get(), st::Part::DroppedQuote))
 						.unwrap_or(rest.len());
-					Some(rest.take(n))
+					Some((rest.take(n), i + 1))
 				};
 				continue;
 			}
-			self.part(part, false, &mut parts, quoted.map_or(scan, Scan::Dq))?;
+			let scan = quoted.map_or(scan, |(parts, first)| Scan::Dq {
+				parts,
+				at: i - first,
+				arith: true,
+				dq_param: false,
+			});
+			self.part(part, false, &mut parts, scan)?;
 		}
 		let parks = parts.iter().any(|p| self.part_parks(p));
 		let idx = self.unit.words.len() as u32;
@@ -1602,8 +1645,10 @@ impl Lower {
 				// empty too (`"$xxx$@"` is no word, `"$xxx""$@"` one).
 				let start = out.len();
 				// bash expands the inside of the quotes as a string of its own.
-				for p in inner {
-					self.part(p, true, out, Scan::Dq(inner))?;
+				let dq_param = self.dq_param;
+				for (j, p) in inner.iter().enumerate() {
+					let scan = Scan::Dq { parts: inner, at: j, arith: false, dq_param };
+					self.part(p, true, out, scan)?;
 				}
 				let group = &out[start..];
 				let literal = group
@@ -1679,6 +1724,16 @@ impl Lower {
 				syn::Special::LastBg => ParamRef::LastBg,
 			},
 		};
+		// The subscript and operator words of a `${…}` inside `"…"`.
+		let outer = std::mem::replace(&mut self.dq_param, quoted);
+		let words = self.param_words(p);
+		self.dq_param = outer;
+		let (index, op) = words?;
+		Ok(ParamIr { param, index, op, indirect: p.indirect(), quoted, braced: p.braced() })
+	}
+
+	/// The subscript and the operator of `p`, their words lowered.
+	fn param_words(&mut self, p: st::Param<'_>) -> Result<(Option<SubIr>, OpIr), &'static str> {
 		let index = match p.index() {
 			None => None,
 			Some(st::Subscript::At) => Some(SubIr::At),
@@ -1723,7 +1778,7 @@ impl Lower {
 			},
 			st::ParamOp::Transform(c) => OpIr::Transform(c),
 		};
-		Ok(ParamIr { param, index, op, indirect: p.indirect(), quoted, braced: p.braced() })
+		Ok((index, op))
 	}
 }
 

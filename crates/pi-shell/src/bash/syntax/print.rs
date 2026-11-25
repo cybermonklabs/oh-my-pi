@@ -1100,10 +1100,9 @@ pub fn one_part_text(p: WordPart<'_>, out: &mut Vec<u8>) {
 	part_text(p, out, Ctx::Plain);
 }
 
-/// The text bash stores for the inside of `"…"` (the parts of a
-/// double-quoted group, without the quotes).
-pub fn dq_text(parts: Seq<'_, WordPart<'_>>, out: &mut Vec<u8>) {
-	parts_ctx(parts, out, Ctx::Dq);
+/// The text bash stores for one part of the inside of `"…"`.
+pub fn dq_part_text(p: WordPart<'_>, out: &mut Vec<u8>) {
+	part_text(p, out, Ctx::Dq);
 }
 
 /// The text bash stores for an assignment.

@@ -72,7 +72,7 @@ pub use crate::bash::syntax::{
 	},
 };
 pub(crate) use crate::bash::syntax::{
-	print::{dq_text, word_text},
+	print::{dq_part_text, word_text},
 	util::ansi_decode_all,
 };
 

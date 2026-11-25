@@ -258,6 +258,24 @@ fn names_the_operator_word() {
 			1,
 			1,
 		),
+		// An escaped `"` in the quotes loses its backslash, and the quote
+		// stays (bash's `string_extract_double_quoted`; Rev273r2's row).
+		(
+			"echo ${y:-\"\\\"${x!}\"}\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		// The word of a `${…}` that is itself inside `"…"` keeps the
+		// backslash (row e12).
+		(
+			"echo \"${y:-\"\\\"${x!}\"}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
 	]);
 }
 
@@ -410,6 +428,55 @@ echo "after $?""#,
 			"PFX: line 1: ${x@Z}: bad substitution\n",
 			127,
 			1,
+		),
+		// An escaped `"` in the quotes: bash drops its backslash, and in
+		// arithmetic the quote it leaves opens a string of its own, which
+		// is what a part failing after it names (Rev273r2's rows; q10).
+		(
+			"echo $(( \"\\\"${x!}\" + 1 ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: ${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( \"a\\\"b${x!}\" ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: b${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=1\necho $(( \"\\\"${x@Z}\" ))\necho \"after $?\"",
+			"",
+			"PFX: line 2: ${x@Z}: bad substitution\n",
+			127,
+			1,
+		),
+		// A part failing outside such a quote names the whole string, the
+		// quotes kept and their backslashes gone (row e8).
+		(
+			"echo $(( \"\\\"a\\\"${x!}\" ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \"a\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		// The string such a quote opens ends at the next one (row e13); a
+		// part failing before any names the whole string (row e6).
+		(
+			"echo $(( \"\\\"${x!}\\\"\" ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: ${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( \"${x!}\\\"\" ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: ${x!}\": bad substitution\n",
+			0,
+			0,
 		),
 	]);
 }
