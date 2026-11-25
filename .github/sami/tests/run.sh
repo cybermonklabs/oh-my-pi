@@ -1521,9 +1521,9 @@ wlint W67-attest-artifact-ids-quoted-hash-folded 1 "attest's artifact-ids line h
 # is pushed to names one branch. The places: sami-build.yml's push trigger
 # (beside sami), each github.ref test in its jobs and steps (beside sami:
 # release_binary's cache bound and save steps, attest, release_cache_prune),
-# publish's CANDIDATE_BRANCH, sami-checks.yml's push trigger (beside
-# feat/sami-checks) and its run name's github.ref test, sc.py plan's push
-# ref, and release-candidate-harness.sh's CANDIDATE_BRANCH. release-candidate.sh
+# publish's CANDIDATE_BRANCH, sami-checks.yml's push trigger and its run
+# name's github.ref test, sc.py plan's push ref, and
+# release-candidate-harness.sh's CANDIDATE_BRANCH. release-candidate.sh
 # names the branch only as $CANDIDATE_BRANCH: once in its run search, once in
 # its signer and once in its --source-ref, and no refs/heads/<name> literally.
 # A place that names no branch, or a file it cannot read, is UNKNOWN, and
@@ -1562,7 +1562,7 @@ candidate_lint() {
 		push_branches "$build" | grep -vx sami | sed 's/^/sami-build.yml push trigger	/'
 		refs_in "$build" "github[.]ref == ${q}refs/heads/" "$q" | grep -vx sami | sed 's/^/sami-build.yml github.ref tests	/'
 		awk '/^[[:space:]]*#/ { next } /^[[:space:]]+CANDIDATE_BRANCH:[[:space:]]/ { v = $2; gsub(/["'\'']/, "", v); print v }' "$build" | sed 's/^/sami-build.yml CANDIDATE_BRANCH	/'
-		push_branches "$checks" | grep -vx feat/sami-checks | sed 's/^/sami-checks.yml push trigger	/'
+		push_branches "$checks" | sed 's/^/sami-checks.yml push trigger	/'
 		refs_in "$checks" "github[.]ref == ${q}refs/heads/" "$q" | sed 's/^/sami-checks.yml github.ref tests	/'
 		refs_in "$d/.github/sami-checks/sc.py" 'ref == "refs/heads/' '"' | sed 's/^/sc.py plan push ref	/'
 		refs_in "$d/.github/sami/tests/release-candidate-harness.sh" 'CANDIDATE_BRANCH=' ' ' | sed 's/^/release-candidate-harness.sh CANDIDATE_BRANCH	/'
