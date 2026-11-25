@@ -584,7 +584,9 @@ impl<M: Matcher, W: Write> RgSink<'_, M, W> {
 			.map(drop)
 	}
 
+	/// Writes `line`, ended by the record terminator unless it ends with one.
 	fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
+		let terminator = self.opts.record.terminator;
 		let mut bytes = line;
 		if self.opts.trim {
 			bytes = trim_ascii_start(bytes);
@@ -595,15 +597,14 @@ impl<M: Matcher, W: Write> RgSink<'_, M, W> {
 		{
 			if self.opts.max_columns_preview {
 				self.out.write_all(&bytes[..limit.min(bytes.len())])?;
-				self.out.write_all(b"\n")?;
 			} else {
-				writeln!(self.out, "[Omitted long matching line]")?;
+				self.out.write_all(b"[Omitted long matching line]")?;
 			}
-			return Ok(());
+			return self.out.write_all(&[terminator]);
 		}
 		self.out.write_all(bytes)?;
-		if !bytes.ends_with(b"\n") {
-			self.out.write_all(b"\n")?;
+		if bytes.last().copied() != Some(terminator) {
+			self.out.write_all(&[terminator])?;
 		}
 		Ok(())
 	}
@@ -657,7 +658,7 @@ impl<M: Matcher, W: Write> RgSink<'_, M, W> {
 			} else {
 				self.out.write_all(&line[found.start()..found.end()])?;
 			}
-			self.out.write_all(b"\n")
+			self.out.write_all(&[self.opts.record.terminator])
 		})
 	}
 
@@ -762,7 +763,8 @@ impl<M: Matcher, W: Write> Sink for RgSink<'_, M, W> {
 			|| self.opts.vimgrep
 			|| self.opts.passthru)
 		{
-			self.out.write_all(b"--\n")?;
+			self.out.write_all(b"--")?;
+			self.out.write_all(&[self.opts.record.terminator])?;
 		}
 		Ok(true)
 	}
@@ -1007,6 +1009,8 @@ fn search_options(cli: &Rg) -> SearchOptions {
 	let context = cli.context.unwrap_or(0);
 	let count_matches = cli.count_matches || (cli.count && cli.only_matching);
 	let line_number = (cli.line_number || cli.column || cli.vimgrep) && !cli.no_line_number;
+	// ripgrep ends each record of a search with NUL under --null-data.
+	let terminator = if cli.null_data { b'\0' } else { b'\n' };
 	SearchOptions {
 		line_number,
 		column: cli.column || cli.vimgrep,
@@ -1027,7 +1031,12 @@ fn search_options(cli: &Rg) -> SearchOptions {
 		max_columns_preview: cli.max_columns_preview && !cli.no_max_columns_preview,
 		// The validated --path-separator and the line-number default are
 		// applied in run() once paths are known.
-		record: RecordFormat { path_separator: None, null_paths: cli.null, terminator: b'\n' },
+		record: RecordFormat {
+			path_separator: None,
+			null_paths:     cli.null,
+			terminator,
+			summary_term:   terminator,
+		},
 		no_messages: cli.no_messages && !cli.messages,
 		replacement: cli
 			.replacement
@@ -2283,7 +2292,9 @@ impl AsyncUtility for Rg {
 	);
 	opts.line_number = effective_line_number(&cli);
 	if cli.files {
-		let outcome = list_files(host, &cli, &paths, &opts.record, &mut out).await;
+		// ripgrep ends each `--files` path with `\n` under --null-data too.
+		let record = RecordFormat { summary_term: b'\n', ..opts.record };
+		let outcome = list_files(host, &cli, &paths, &record, &mut out).await;
 		let _ = out.flush();
 		return exit_status(false, outcome.any_match, outcome.had_error);
 	}
@@ -2340,80 +2351,177 @@ mod tests {
 		assert_eq!(out, "2\n");
 	}
 
-	/// `-o` searches a record without its terminator, so under `--null-data` a
-	/// `$` or `-x` matches at the end of each record. It used to search the
-	/// record with its NUL, where neither can match, and printed nothing.
+	/// Runs `rg --null-data` with `args` on `input` from stdin (`-`) and from a
+	/// file named `f`, checking both against ripgrep 15.2.0's bytes.
+	async fn assert_null_data(args: &[&str], input: &str, want_stdin: &str, want_file: &str) {
+		let mut stdin_args = Vec::with_capacity(args.len() + 2);
+		stdin_args.push("--null-data");
+		stdin_args.extend_from_slice(args);
+		stdin_args.push("-");
+		let (code, out, err) = run(&stdin_args, input).await;
+		assert_eq!((code, out.as_str()), (0, want_stdin), "stdin {args:?}: {err}");
+
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("f"), input).unwrap();
+		let mut file_args = Vec::with_capacity(args.len() + 2);
+		file_args.push("--null-data");
+		file_args.extend_from_slice(args);
+		file_args.push("f");
+		let (code, capture) = run_async_util::<Rg>(&file_args, "", tree.path()).await;
+		let out = capture.out();
+		assert_eq!((code, out.as_str()), (0, want_file), "file {args:?}: {}", capture.err());
+	}
+
+	/// Under `--null-data`, plain matching records end with NUL (also an
+	/// unterminated last record), with no newline added. Expectations are
+	/// ripgrep 15.2.0's bytes.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_plain_records_end_with_nul() {
+		assert_null_data(&["[0-9]$"], "a1\0b2\0", "a1\0b2\0", "a1\0b2\0").await;
+		assert_null_data(&["[0-9]$"], "a1\0b2", "a1\0b2\0", "a1\0b2\0").await;
+	}
+
+	/// Under `--null-data`, `-n` ends each record with NUL. Expectations are
+	/// ripgrep 15.2.0's bytes.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_line_number_records_end_with_nul() {
+		assert_null_data(
+			&["-n", "[0-9]$"],
+			"a1\0b2\0",
+			concat!("1:a1\0", "2:b2\0"),
+			concat!("1:a1\0", "2:b2\0"),
+		)
+		.await;
+	}
+
+	/// `-o` searches a record without its terminator and ends each match with
+	/// NUL under `--null-data`, so `$` and `-x` match at the end of each
+	/// record. Expectations are ripgrep 15.2.0's bytes.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn only_matching_anchors_at_the_end_of_each_null_data_record() {
-		let (code, out, err) = run(&["--null-data", "-o", "[0-9]$", "-"], "a1\0b2\0").await;
-		assert_eq!((code, out.as_str()), (0, "1\n2\n"), "{err}");
-		let (code, out, err) = run(&["--null-data", "-xo", "a1", "-"], "a1\0b2\0").await;
-		assert_eq!((code, out.as_str()), (0, "a1\n"), "{err}");
+		assert_null_data(&["-o", "[0-9]$"], "a1\0b2\0", concat!("1\0", "2\0"), concat!("1\0", "2\0"))
+			.await;
+		assert_null_data(&["-xo", "a1"], "a1\0b2\0", "a1\0", "a1\0").await;
+	}
+
+	/// Under `--null-data`, `-c` ends each count record with NUL. Expectations
+	/// are ripgrep 15.2.0's bytes.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_count_records_end_with_nul() {
+		assert_null_data(&["-c", "[0-9]$"], "a1\0b2\0", "2\0", "2\0").await;
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("f"), "a1\0b2\0").unwrap();
+		std::fs::write(tree.path().join("g"), "xx\0").unwrap();
+		let (code, capture) =
+			run_async_util::<Rg>(&["--null-data", "-c", "[0-9]$", "f", "g"], "", tree.path()).await;
+		assert_eq!((code, capture.out().as_str()), (0, "f:2\0"), "{}", capture.err());
 	}
 
 	/// Under `--null-data`, `--count-matches` counts the matches in a record
-	/// without its NUL, as `-o` finds them, so a `$` matches at the end of each
-	/// record. It used to search the record with its NUL, where `$` cannot
-	/// match, and counted `[a-z]|[0-9]$` once in each record. ripgrep 14.1.1
-	/// and 15.2.0 give the same counts, ended by NUL instead of a newline.
+	/// without its NUL and ends the count with NUL. It used to search the
+	/// record with its NUL, where `$` cannot match, and counted `[a-z]|[0-9]$`
+	/// once in each record. Expectations are ripgrep 15.2.0's bytes.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn null_data_count_matches_counts_a_match_at_the_end_of_each_record() {
-		for (pattern, want) in [("[0-9]$", "2\n"), ("[a-z]|[0-9]$", "4\n")] {
-			let (code, out, err) =
-				run(&["--null-data", "--count-matches", pattern, "-"], "a1\0b2\0").await;
-			assert_eq!((code, out.as_str()), (0, want), "{pattern}: {err}");
+		for (pattern, want) in [("[0-9]$", "2\0"), ("[a-z]|[0-9]$", "4\0")] {
+			assert_null_data(&["--count-matches", pattern], "a1\0b2\0", want, want).await;
 		}
 	}
 
 	/// Under `--null-data`, `--column` is the column of the first match in a
-	/// record without its NUL, so a `$` matches at the end of each record. It
-	/// used to search the record with its NUL, where `$` cannot match, and
-	/// printed column 1. ripgrep 14.1.1 and 15.2.0 print the same records, with
-	/// no newline after the NUL.
+	/// record without its NUL and ends each record with NUL. It used to search
+	/// the record with its NUL, where `$` cannot match, and printed column 1.
+	/// Expectations are ripgrep 15.2.0's bytes.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn null_data_column_is_that_of_a_match_at_the_end_of_the_record() {
-		let (code, out, err) = run(&["--null-data", "--column", "[0-9]$", "-"], "a1\0b2\0").await;
-		assert_eq!((code, out.as_str()), (0, concat!("1:2:a1\0\n", "2:2:b2\0\n")), "{err}");
+		let want = concat!("1:2:a1\0", "2:2:b2\0");
+		assert_null_data(&["--column", "[0-9]$"], "a1\0b2\0", want, want).await;
 	}
 
 	/// Under `--null-data`, `--vimgrep` prints a record once for each match in
-	/// it without its NUL, so a `$` matches at the end of each record. It used
-	/// to search the record with its NUL, where `$` cannot match, and printed
-	/// each record once, at column 1 or at its other match. ripgrep 14.1.1 and
-	/// 15.2.0 print the same records, with no newline after the NUL.
+	/// it without its NUL and ends each record with NUL. It used to search the
+	/// record with its NUL, where `$` cannot match, and printed each record
+	/// once, at column 1 or at its other match. Expectations are ripgrep
+	/// 15.2.0's bytes.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn null_data_vimgrep_prints_a_match_at_the_end_of_each_record() {
-		for (pattern, want) in [
-			("[0-9]$", concat!("<stdin>:1:2:a1\0\n", "<stdin>:2:2:b2\0\n")),
+		for (pattern, want_stdin, want_file) in [
+			(
+				"[0-9]$",
+				concat!("<stdin>:1:2:a1\0", "<stdin>:2:2:b2\0"),
+				concat!("f:1:2:a1\0", "f:2:2:b2\0"),
+			),
 			(
 				"[a-z]|[0-9]$",
 				concat!(
-					"<stdin>:1:1:a1\0\n",
-					"<stdin>:1:2:a1\0\n",
-					"<stdin>:2:1:b2\0\n",
-					"<stdin>:2:2:b2\0\n"
+					"<stdin>:1:1:a1\0",
+					"<stdin>:1:2:a1\0",
+					"<stdin>:2:1:b2\0",
+					"<stdin>:2:2:b2\0"
 				),
+				concat!("f:1:1:a1\0", "f:1:2:a1\0", "f:2:1:b2\0", "f:2:2:b2\0"),
 			),
 		] {
-			let (code, out, err) = run(&["--null-data", "--vimgrep", pattern, "-"], "a1\0b2\0").await;
-			assert_eq!((code, out.as_str()), (0, want), "{pattern}: {err}");
+			assert_null_data(&["--vimgrep", pattern], "a1\0b2\0", want_stdin, want_file).await;
 		}
 	}
 
 	/// Under `--null-data`, `--replace` replaces the matches in a record
-	/// without its NUL and keeps the NUL, so a `$` matches at the end of each
-	/// record. It used to search the record with its NUL, where `$` cannot
-	/// match, and left that match in place. ripgrep 14.1.1 and 15.2.0 print the
-	/// same records, with no newline after the NUL.
+	/// without its NUL and ends each record with NUL. It used to search the
+	/// record with its NUL, where `$` cannot match, and left that match in
+	/// place. Expectations are ripgrep 15.2.0's bytes.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn null_data_replace_replaces_a_match_at_the_end_of_each_record() {
 		for (pattern, want) in
-			[("[0-9]$", concat!("aX\0\n", "bX\0\n")), ("[a-z]|[0-9]$", concat!("XX\0\n", "XX\0\n"))]
+			[("[0-9]$", concat!("aX\0", "bX\0")), ("[a-z]|[0-9]$", concat!("XX\0", "XX\0"))]
 		{
-			let (code, out, err) =
-				run(&["--null-data", "--replace=X", pattern, "-"], "a1\0b2\0").await;
-			assert_eq!((code, out.as_str()), (0, want), "{pattern}: {err}");
+			assert_null_data(&["--replace=X", pattern], "a1\0b2\0", want, want).await;
 		}
+	}
+
+	/// Under `--null-data`, `-b` ends each record with NUL. Expectations are
+	/// ripgrep 15.2.0's bytes.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_byte_offset_records_end_with_nul() {
+		let want = concat!("0:a1\0", "3:b2\0");
+		assert_null_data(&["-b", "[0-9]$"], "a1\0b2\0", want, want).await;
+	}
+
+	/// Under `--null-data`, `-l` ends each matching path with NUL. Expectations
+	/// are ripgrep 15.2.0's bytes.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_files_with_matches_ends_with_nul() {
+		assert_null_data(&["-l", "[0-9]$"], "a1\0b2\0", "<stdin>\0", "f\0").await;
+	}
+
+	/// Under `--null-data`, context records and the `--` separator between
+	/// context groups end with NUL. Expectations are ripgrep 15.2.0's bytes.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_context_and_separator_end_with_nul() {
+		let want = concat!("a1\0", "bb\0", "--\0", "e2\0");
+		assert_null_data(&["-A", "1", "[0-9]$"], "a1\0bb\0cc\0dd\0e2\0", want, want).await;
+	}
+
+	/// Under `--null-data`, `--max-columns` ends each omitted-line notice with
+	/// NUL. Expectations are ripgrep 15.2.0's bytes.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_max_columns_omission_ends_with_nul() {
+		let want = concat!("[Omitted long matching line]\0", "[Omitted long matching line]\0");
+		assert_null_data(&["-M", "1", "[0-9]$"], "a1\0b2\0", want, want).await;
+	}
+
+	/// `--files` lists paths ended by `\n` under `--null-data` too, and by NUL
+	/// under `-0`. Expectations are ripgrep 15.2.0's bytes.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_files_listing_keeps_newline_terminator() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("f"), "a1\0").unwrap();
+		let (code, capture) =
+			run_async_util::<Rg>(&["--null-data", "--files", "f"], "", tree.path()).await;
+		assert_eq!((code, capture.out().as_str()), (0, "f\n"), "{}", capture.err());
+		let (code, capture) =
+			run_async_util::<Rg>(&["--null-data", "--files", "-0", "f"], "", tree.path()).await;
+		assert_eq!((code, capture.out().as_str()), (0, "f\0"), "{}", capture.err());
 	}
 
 	/// On newline-terminated lines, `--count-matches`, `--column`, `--vimgrep`

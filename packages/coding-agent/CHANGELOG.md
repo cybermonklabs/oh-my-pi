@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `grep -o` in the bash tool prints a match anchored at the end of the line (`grep -oE '[0-9]+$'` printed nothing), `grep -z` selects records with `^` or `$`, and `rg --null-data` with `-o`, `--count-matches`, `--column`, `--vimgrep` or `--replace` matches `$` at the end of each record
+- `grep -o` in the bash tool prints a match anchored at the end of the line (`grep -oE '[0-9]+$'` printed nothing), `grep -z` selects records with `^` or `$` and ends `-c`, `-l`, `-L` and `--` separators with a newline as GNU grep does, and `rg --null-data` matches `$` at the end of each record (`-o`, `--count-matches`, `--column`, `--vimgrep`, `--replace`) and ends each record with NUL as ripgrep does
 
 ## [18.18.4] - 2026-11-09
 
