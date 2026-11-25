@@ -5,7 +5,7 @@ use std::{collections::VecDeque, sync::Arc};
 use bstr::BString;
 use serde::{Deserialize, Serialize};
 
-use super::state::Scope;
+use super::state::{Random, Scope};
 pub use crate::bash::store::{Job, JobState};
 use crate::bash::{
 	Image,
@@ -164,6 +164,37 @@ pub struct Vproc {
 	/// move it, so its targets go on from where they got; a suspended job
 	/// takes both. Never serialized (a restored queue starts again).
 	pub out_key:       Option<WriteKey>,
+	/// A forked vproc's `$RANDOM` generator and `$SECONDS` origin
+	/// ([`Clock`]): its parent's at the fork. `None` for the root vproc,
+	/// whose are the kernel's.
+	pub clock:         Option<Clock>,
+}
+
+/// A forked vproc's `$RANDOM` generator and `$SECONDS` clock
+/// ([`Vproc::clock`]). Both are process state that a fork copies, as
+/// `fork(2)` copies memory, so neither side's draws, `RANDOM=` or
+/// `SECONDS=` reach the other. The shell's own are the kernel's
+/// (`Kernel::rand`, `Kernel::start_ns`, `Kernel::seconds`), which the store
+/// keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Clock {
+	pub rand:     Random,
+	/// The generator is reseeded on the vproc's first `$RANDOM` in bash code
+	/// unless `RANDOM` was assigned first, as bash reseeds a subshell's
+	/// (`get_random_number`'s `seeded_subshell`); zsh draws on from the copy.
+	pub reseed:   bool,
+	/// The host clock reading of the shell's start, or of the last
+	/// `SECONDS=` in bash code (bash's `shellstart`, which `assign_seconds`
+	/// resets to now): `printf '%(…)T' -2` and the shell's `time` report
+	/// count from it.
+	pub start_ns: u64,
+	/// The value of the last `SECONDS=` in bash code (bash's
+	/// `seconds_value_assigned`): `$SECONDS` is it plus the seconds since
+	/// `start_ns`. zsh's `SECONDS=` moves `start_ns` instead and sets it to 0.
+	pub seconds:  i64,
+	/// `unset SECONDS` in bash code removed the special meaning of `SECONDS`: a
+	/// plain variable from then on (bash removes the dynamic variable).
+	pub plain:    bool,
 }
 
 /// A `break` or `continue` that ran inside `${ }` or `${| }`
@@ -2382,6 +2413,11 @@ impl Live {
 // write by the shell between the forks, and 2,213 to 2,321 B with the
 // bench's loop, whose `i` each fork keeps an earlier copy of (its image
 // shares the shell's maps).
+// A forked vproc's own `$RANDOM` generator and `$SECONDS` origin
+// (`Vproc::clock`, 32 B) brings `Vproc` to 728 B, exactly this bound,
+// with no byte to spare: 656 B on Cut10's release with #156 and #158,
+// 696 B with the write keys, 728 B with the clock. One field more needs
+// a measured raise of this bound, or the bytes found elsewhere.
 const _: () = assert!(size_of::<Vproc>() <= 728, "Vproc grew (idle vproc ≤ 2,048 B back to back)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2,048 B back to back)");
 const _: () =

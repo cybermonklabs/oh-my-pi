@@ -1026,6 +1026,21 @@ fn var_at<'a>(
 	})
 }
 
+/// Whether an assignment to `name` at `level` sets `vp`'s global variable
+/// (no local or temporary scope of `vp`'s takes it).
+///
+/// # Errors
+/// [`StoreError`] when the store cannot be read.
+pub fn assigns_global(
+	root: &Root,
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	name: &[u8],
+	level: Level,
+) -> Result<bool, StoreError> {
+	Ok(level_at(root, store, vp, name, level)?.is_none())
+}
+
 /// Where an assignment to `name` at `level` lands among `vp`'s scopes;
 /// `None`: its global state.
 #[inline]

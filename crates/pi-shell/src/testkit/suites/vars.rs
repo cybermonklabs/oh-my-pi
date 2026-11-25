@@ -5,7 +5,12 @@
 //! filled by `mapfile` and its callbacks.
 //! Goldens: bash 5.3.20 (`bash -c`).
 
-use crate::testkit::{FakeHost, Fault, MemFs, run_script};
+use bstr::BString;
+
+use crate::{
+	bash::{Script, ShellInit},
+	testkit::{FakeHost, Fault, MemFs, Rig, fault::skeleton_init, run_script},
+};
 
 fn run(src: &str) -> (String, String) {
 	let out = run_script(FakeHost::new(), src.as_bytes(), &[], Fault::None);
@@ -120,6 +125,402 @@ fn attributes_apply_on_every_assignment() {
 fn random_is_seeded_by_assignment() {
 	let (out, _) = run("RANDOM=42; echo $RANDOM $RANDOM $RANDOM; RANDOM=1+1; echo $RANDOM");
 	assert_eq!(out, "17772 26794 1435\n846\n");
+}
+
+/// A subshell, a background job and a command substitution draw `$RANDOM`
+/// from their own copy of the generator: neither their draws nor their
+/// `RANDOM=` move the shell's sequence (bash keeps it in process memory).
+/// The shell's first value after `RANDOM=7` is 19344 with or without the
+/// child.
+#[test]
+fn random_children_leave_the_shell_sequence() {
+	for child in [
+		"( : $RANDOM $RANDOM )",
+		"( : $RANDOM $RANDOM ) & wait",
+		"x=$(echo $RANDOM $RANDOM)",
+		"( RANDOM=99 ) & wait",
+		"( RANDOM=99; : $RANDOM )",
+	] {
+		let (out, err) = run(&format!("RANDOM=7; {child}; echo $RANDOM"));
+		assert_eq!((out.as_str(), err.as_str()), ("19344\n", ""), "{child}");
+	}
+}
+
+/// bash reseeds a subshell's generator on its first `$RANDOM` unless the
+/// subshell assigned `RANDOM` first (`get_random_number`'s
+/// `seeded_subshell`): an unseeded child does not continue the shell's
+/// sequence (19344 after `RANDOM=7`), a seeded one repeats it.
+#[test]
+fn random_subshell_reseeds_unless_assigned() {
+	let (out, err) = run(
+		"RANDOM=7; u=$(echo $RANDOM); s=$(RANDOM=7; echo $RANDOM); n=$RANDOM; [ \"$u\" != 19344 ] \
+		 && echo own; echo $s $n",
+	);
+	assert_eq!((out.as_str(), err.as_str()), ("own\n19344 19344\n", ""));
+}
+
+/// `SECONDS=n` restarts the count from n (bash `assign_seconds`; the
+/// fake host's clock moves 1 µs per read); a fork counts from its own copy,
+/// so neither side's assignment reaches the other.
+#[test]
+fn seconds_assignment_counts_from_the_value_in_each_process() {
+	let (out, err) = run(
+		"SECONDS=5000; echo $SECONDS; ( SECONDS=9000; echo c=$SECONDS ); echo p=$SECONDS; x=$( \
+		 SECONDS=1; echo $SECONDS ); echo $x $SECONDS; ( (( SECONDS < 7000 )) && echo kept ) & \
+		 SECONDS=7000; wait; echo $SECONDS; SECONDS=-5; echo $SECONDS",
+	);
+	assert_eq!((out.as_str(), err.as_str()), ("5000\nc=9000\np=5000\n1 5000\nkept\n7000\n-5\n", ""));
+}
+
+/// bash's `SECONDS=` takes a decimal number (`valid_number`, else 0; out of
+/// `i64`'s range too) until the variable is an integer: after `declare -i
+/// SECONDS`, or once `$SECONDS` was read (`get_seconds` sets the
+/// attribute), the value is arithmetic, and an arithmetic error is
+/// reported, counts as 0 and the script goes on with status 0. Each `$(…)`
+/// below is a shell that has not read `$SECONDS` before its assignment.
+/// Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_assignment_takes_a_decimal_number_until_seconds_is_an_integer() {
+	let (out, err) = run(
+		"x=7; for v in 1+1 x 0x10 ' 7 ' abc 5.5 -3 99999999999999999999 -9223372036854775808 \
+		 -9223372036854775809; do r=$(SECONDS=$v; echo \"$SECONDS st=$?\"); echo \"[$v] $r\"; done; \
+		 r=$(: $SECONDS; SECONDS=1+1; a=$SECONDS; SECONDS=x; b=$SECONDS; SECONDS=0x10; echo $a $b \
+		 $SECONDS); echo \"after a read: $r\"; r=$(: $SECONDS; SECONDS=5.5; echo \"st=$? \
+		 $SECONDS\"; f() { SECONDS=5.5; echo \"f st=$?\"; }; f; echo \"after f st=$?\"); echo $r; \
+		 declare -i SECONDS; SECONDS=1+1; echo $SECONDS",
+	);
+	assert_eq!(
+		out,
+		"[1+1] 0 st=0\n[x] 0 st=0\n[0x10] 0 st=0\n[ 7 ] 7 st=0\n[abc] 0 st=0\n[5.5] 0 st=0\n[-3] -3 \
+		 st=0\n[99999999999999999999] 0 st=0\n[-9223372036854775808] -9223372036854775808 \
+		 st=0\n[-9223372036854775809] 0 st=0\nafter a read: 2 7 16\nst=0 0 f st=0 after f st=0\n2\n"
+	);
+	assert_eq!(err.matches("5.5: arithmetic syntax error").count(), 2, "{err}");
+}
+
+/// bash's `SECONDS+=` makes the value first (`make_variable_value`): the old
+/// value's text with the new one after it, or their sum once `SECONDS` is
+/// integer; the old value is the last assignment's or read's.
+#[test]
+fn seconds_append_adds_to_the_last_value() {
+	for (src, want) in [
+		("SECONDS=5; SECONDS+=5; echo $SECONDS", "55\n"),
+		(": $SECONDS; SECONDS=5; SECONDS+=5; echo $SECONDS", "10\n"),
+		("SECONDS+=5; echo $SECONDS", "5\n"),
+		("SECONDS=7; : $SECONDS; SECONDS+=1+1; echo $SECONDS", "9\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// A local or temporary `SECONDS` is a plain variable (bash's
+/// `make_local_variable` copies no dynamic value), and the shell's clock
+/// goes on unmoved; `local`, `declare` and `export` with no value look the
+/// name up first (`find_variable`), which reads the shell's `SECONDS` and
+/// so makes it integer. `unset SECONDS` removes the special meaning for
+/// good unless a local is what it unsets. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_locals_lookups_and_unset() {
+	for (src, want) in [
+		("f() { local SECONDS=3; echo $SECONDS; }; f; echo $SECONDS", "3\n0\n"),
+		(
+			"f() { local SECONDS; echo \"[$SECONDS]\"; SECONDS=7; echo $SECONDS; }; SECONDS=50; f; \
+			 echo $SECONDS",
+			"[]\n7\n50\n",
+		),
+		("f() { local SECONDS=1+1; echo $SECONDS; }; f; SECONDS=1+1; echo $SECONDS", "1+1\n2\n"),
+		("f() { local SECONDS=4; unset SECONDS; }; f; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("declare SECONDS=1+1; echo $SECONDS", "2\n"),
+		("export SECONDS=1+1; echo $SECONDS; SECONDS=1+1; echo $SECONDS", "0\n2\n"),
+		("export SECONDS; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("declare -p SECONDS", "declare -i SECONDS=\"0\"\n"),
+		("SECONDS=5; declare -p SECONDS", "declare -i SECONDS=\"5\"\n"),
+		(
+			"unset SECONDS; echo \"[$SECONDS]\"; SECONDS=1+1; echo $SECONDS; declare -p SECONDS",
+			"[]\n1+1\ndeclare -- SECONDS=\"1+1\"\n",
+		),
+		("f() { unset SECONDS; }; f; SECONDS=1+1; echo $SECONDS", "1+1\n"),
+		("( unset SECONDS; SECONDS=1+1; echo $SECONDS ); SECONDS=1+1; echo $SECONDS", "1+1\n0\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `SECONDS` in the environment is the count's starting value, a decimal
+/// number (bash's `init_seconds_var`), for the shell and for a nested
+/// `bash`. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_from_the_environment() {
+	for (value, want) in [("100", "100\n"), ("abc", "0\n"), (" 7 ", "7\n")] {
+		let init = ShellInit {
+			env: vec![
+				(BString::from("PATH"), BString::from("/usr/bin:/bin")),
+				(BString::from("SECONDS"), BString::from(value)),
+			],
+			..skeleton_init(&[])
+		};
+		let mut rig = Rig::new(FakeHost::new(), init);
+		rig.run(Script::command(b"echo $SECONDS".to_vec()), Fault::None);
+		assert_eq!(String::from_utf8_lossy(&rig.host.stdout.bytes()), want, "{value}");
+	}
+	for (src, want) in [
+		("SECONDS=100 bash -c 'echo $SECONDS'", "100\n"),
+		("SECONDS=100; export SECONDS; bash -c 'echo $SECONDS'", "100\n"),
+		("SECONDS=abc bash -c 'echo $SECONDS'", "0\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// Two seconds pass on the fake host's clock: `read -t 2` from a coproc
+/// that waits for its input blocks until the clock jumps to its deadline,
+/// then the coproc is given its line and reaped.
+const WAIT_2S: &str =
+	"coproc { read x; }; read -t 2 -u ${COPROC[0]} y; echo hi >&${COPROC[1]}; wait $COPROC_PID; ";
+
+/// bash's arithmetic assignment (`bind_int_variable`) runs `SECONDS`'s
+/// assign function as `SECONDS=` does: `((…))`, `let`, `$((…))`, an
+/// integer variable's value and a subscript all set the clock, which then
+/// counts on. A local `SECONDS` is only that local's; after `unset SECONDS`
+/// the name is a plain variable. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_arithmetic_assignment_sets_the_clock() {
+	let counts = format!("((SECONDS=100)); {WAIT_2S}echo $SECONDS");
+	for (src, want) in [
+		("((SECONDS=100)); echo $SECONDS", "100\n"),
+		("let SECONDS=200; echo $SECONDS", "200\n"),
+		(": $((SECONDS=50)); echo $SECONDS", "50\n"),
+		("((SECONDS+=5)); echo $SECONDS", "5\n"),
+		("((SECONDS++)); echo $SECONDS", "1\n"),
+		("declare -i x; x='SECONDS=100'; echo $x $SECONDS", "100 100\n"),
+		("a[SECONDS=100]=1; echo $SECONDS", "100\n"),
+		("f() { local SECONDS; ((SECONDS=7)); echo $SECONDS; }; f; echo $SECONDS", "7\n0\n"),
+		(
+			"unset SECONDS; ((SECONDS=7)); echo $SECONDS; declare -p SECONDS",
+			"7\ndeclare -- SECONDS=\"7\"\n",
+		),
+		(counts.as_str(), "102\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// An element, compound or array-attribute assignment to the shell's
+/// `SECONDS` makes it a plain array (bash's `convert_var_to_array`): the
+/// lookup before it reads the clock, so element 0 is the count and the
+/// variable is integer, and it counts no more. A local `SECONDS` is only
+/// that local's: `local -a`, `local -A`, `declare -a` and a compound value
+/// in a function leave the shell's clock counting. Goldens from bash
+/// 5.2.21 and 5.3.20.
+#[test]
+fn seconds_array_forms_make_it_a_plain_array() {
+	let stopped = format!("SECONDS[0]=60; {WAIT_2S}echo $SECONDS");
+	let counting = format!("SECONDS=60; {WAIT_2S}echo $SECONDS");
+	let local_a =
+		format!("f() {{ local -a SECONDS=(1 2); echo \"$SECONDS\"; }}; f; {WAIT_2S}echo $SECONDS");
+	let declare_a = format!("f() {{ declare -a SECONDS=(1 2); }}; f; {WAIT_2S}echo $SECONDS");
+	let local_assoc = format!("f() {{ local -A SECONDS; }}; f; {WAIT_2S}echo $SECONDS");
+	let local_compound = format!("f() {{ local SECONDS=(1 2); }}; f; {WAIT_2S}echo $SECONDS");
+	for (src, want) in [
+		(
+			"SECONDS[0]=60; echo \"$SECONDS\"; declare -p SECONDS",
+			"60\ndeclare -ai SECONDS=([0]=\"60\")\n",
+		),
+		(
+			"SECONDS[1]=60; echo \"[$SECONDS]\"; declare -p SECONDS",
+			"[0]\ndeclare -ai SECONDS=([0]=\"0\" [1]=\"60\")\n",
+		),
+		("SECONDS=5; SECONDS[0]+=5; echo \"$SECONDS\"", "10\n"),
+		(
+			"SECONDS=(1 2); echo \"$SECONDS\"; declare -p SECONDS",
+			"1\ndeclare -ai SECONDS=([0]=\"1\" [1]=\"2\")\n",
+		),
+		(
+			"SECONDS=5; SECONDS+=(6); declare -p SECONDS",
+			"declare -ai SECONDS=([0]=\"5\" [1]=\"6\")\n",
+		),
+		(
+			"read -a SECONDS <<< \"7 8\"; declare -p SECONDS",
+			"declare -ai SECONDS=([0]=\"7\" [1]=\"8\")\n",
+		),
+		(
+			"mapfile -t SECONDS <<< $'7\\n8'; declare -p SECONDS",
+			"declare -ai SECONDS=([0]=\"7\" [1]=\"8\")\n",
+		),
+		("declare -a SECONDS; declare -p SECONDS", "declare -ai SECONDS=([0]=\"0\")\n"),
+		("declare -A SECONDS; declare -p SECONDS", "declare -Ai SECONDS=([0]=\"0\" )\n"),
+		("((SECONDS[0]=60)); declare -p SECONDS", "declare -ai SECONDS=([0]=\"60\")\n"),
+		("let 'SECONDS[1]=60'; declare -p SECONDS", "declare -ai SECONDS=([0]=\"0\" [1]=\"60\")\n"),
+		("declare 'SECONDS[0]=60'; declare -p SECONDS", "declare -ai SECONDS=([0]=\"60\")\n"),
+		("f() { local SECONDS; SECONDS[0]=60; echo \"$SECONDS\"; }; f; echo \"$SECONDS\"", "60\n0\n"),
+		(stopped.as_str(), "60\n"),
+		(counting.as_str(), "62\n"),
+		(local_a.as_str(), "1\n2\n"),
+		(declare_a.as_str(), "2\n"),
+		(local_assoc.as_str(), "2\n"),
+		(local_compound.as_str(), "2\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `unset 'SECONDS[i]'` looks `SECONDS` up first, so it is an integer
+/// scalar: element 0 unsets it and removes the special meaning, as `unset
+/// SECONDS` does; another index is no element of it. Goldens from bash
+/// 5.2.21 and 5.3.20.
+#[test]
+fn seconds_unset_of_an_element() {
+	for (src, want) in [
+		("unset 'SECONDS[0]'; echo \"[$SECONDS]\"; SECONDS=1+1; echo $SECONDS", "[]\n1+1\n"),
+		("unset 'SECONDS[1-1]'; echo \"[$SECONDS]\"", "[]\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+	let (out, err) = run("unset 'SECONDS[1]'; echo \"st=$? [$SECONDS]\"");
+	assert_eq!(out, "st=1 [0]\n");
+	assert!(err.contains("unset: SECONDS: not an array variable"), "{err}");
+}
+
+/// A readonly `SECONDS` refuses `SECONDS=` and an element assignment, which
+/// end the script, the arithmetic forms, which fail the command with status
+/// 1, and `declare -a`/`-A`, which fail with status 1 (bash 5.3.20; 5.2.21
+/// converts it); the clock is unmoved and counts on. Goldens from bash
+/// 5.3.20 (and 5.2.21 but for `declare`).
+#[test]
+fn seconds_readonly_is_refused() {
+	let element =
+		format!("readonly SECONDS; ((SECONDS[0]=5)); echo \"st=$?\"; {WAIT_2S}echo $SECONDS");
+	let declare_a =
+		format!("readonly SECONDS; declare -a SECONDS; echo \"st=$?\"; {WAIT_2S}echo $SECONDS");
+	let declare_assoc =
+		format!("readonly SECONDS; declare -A SECONDS; echo \"st=$?\"; {WAIT_2S}echo $SECONDS");
+	for (src, want, diag) in [
+		("readonly SECONDS; SECONDS=5; echo next", "", "SECONDS: readonly variable"),
+		(
+			"readonly SECONDS; ((SECONDS=5)); echo \"st=$? $SECONDS\"",
+			"st=1 0\n",
+			"SECONDS: readonly variable",
+		),
+		("readonly SECONDS; SECONDS[0]=60; echo next", "", "SECONDS: readonly variable"),
+		(element.as_str(), "st=1\n2\n", "SECONDS: readonly variable"),
+		(declare_a.as_str(), "st=1\n2\n", "declare: SECONDS: readonly variable"),
+		(declare_assoc.as_str(), "st=1\n2\n", "declare: SECONDS: readonly variable"),
+	] {
+		let (out, err) = run(src);
+		assert_eq!(out, want, "{src}");
+		assert!(err.contains(diag), "{src}: {err}");
+	}
+}
+
+/// `declare` gives or takes no array, integer or case attribute of a
+/// readonly variable (bash 5.3.20's `invalid_readonly_attrs`): it fails
+/// with status 1 and the variable stays as it was; the export and trace
+/// attributes still change. bash 5.2.21 changes them all. Goldens from bash
+/// 5.3.20.
+#[test]
+fn declare_keeps_a_readonly_variables_array_integer_and_case_attributes() {
+	for flag in ["-a", "-A", "-i", "-l", "-u", "-c", "+i", "+a", "-ai"] {
+		let src = format!("readonly x=1; declare {flag} x; echo st=$?; declare -p x");
+		let (out, err) = run(&src);
+		assert_eq!(out, "st=1\ndeclare -r x=\"1\"\n", "{src}");
+		assert!(err.contains("declare: x: readonly variable"), "{src}: {err}");
+	}
+	for (src, want) in [
+		("readonly x=1; declare -x x; echo st=$?; declare -p x", "st=0\ndeclare -rx x=\"1\"\n"),
+		("readonly x=1; declare -t x; echo st=$?; declare -p x", "st=0\ndeclare -rt x=\"1\"\n"),
+		(
+			"readonly -a a=(1); declare -a a; echo st=$?; declare -p a",
+			"st=1\ndeclare -ar a=([0]=\"1\")\n",
+		),
+	] {
+		let (out, err) = run(src);
+		assert_eq!(out, want, "{src}");
+		assert_eq!(err.is_empty(), want.starts_with("st=0"), "{src}: {err}");
+	}
+}
+
+/// `readonly` and `export` take `-a` and `-A` only with a value (bash's
+/// `set_or_show_attributes` then declares the name `-g[rx]a`/`-g[rx]A`);
+/// without one the name gets only the builtin's own attribute, a readonly
+/// one too: status 0, no array made, the value kept. Goldens from bash
+/// 5.3.20, the same in 5.2.21.
+#[test]
+fn readonly_and_export_take_array_flags_only_with_a_value() {
+	for (src, want) in [
+		("readonly x=1; readonly -a x; echo st=$?; declare -p x", "st=0\ndeclare -r x=\"1\"\n"),
+		("readonly x=1; readonly -A x; echo st=$?; declare -p x", "st=0\ndeclare -r x=\"1\"\n"),
+		("readonly x=1; export -a x; echo st=$?; declare -p x", "st=0\ndeclare -rx x=\"1\"\n"),
+		("readonly x=1; export -A x; echo st=$?; declare -p x", "st=0\ndeclare -rx x=\"1\"\n"),
+		("set -o posix; readonly x=1; readonly -a x; echo st=$?", "st=0\n"),
+		(
+			"readonly -a x=(1); export -a x; echo st=$?; declare -p x",
+			"st=0\ndeclare -arx x=([0]=\"1\")\n",
+		),
+		("readonly -a y; echo st=$?; declare -p y", "st=0\ndeclare -r y\n"),
+		("z=5; export -a z; echo st=$?; declare -p z", "st=0\ndeclare -x z=\"5\"\n"),
+		("z=5; readonly -A z; echo st=$?; declare -p z", "st=0\ndeclare -r z=\"5\"\n"),
+		("export -a y=5; echo st=$?; declare -p y", "st=0\ndeclare -ax y=([0]=\"5\")\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `SECONDS+=` adds to the value the last lookup stored, as bash's
+/// `make_variable_value` reads the variable's cell: a lookup two seconds
+/// on stores the count then (7); without one, the 5 stored before is what
+/// it adds to. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_append_adds_to_the_last_lookups_value() {
+	let looked_up = format!("SECONDS=5; : $SECONDS; {WAIT_2S}: $SECONDS; SECONDS+=0; echo $SECONDS");
+	let stale = format!("SECONDS=5; : $SECONDS; {WAIT_2S}SECONDS+=0; echo $SECONDS");
+	assert_eq!(run(&looked_up), ("7\n".to_owned(), String::new()));
+	assert_eq!(run(&stale), ("5\n".to_owned(), String::new()));
+}
+
+/// `export` and `readonly` take no subscript, with a value either (bash's
+/// `legal_identifier` of the name before `=`): nothing is assigned, the
+/// status is 1 and the script goes on. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn export_and_readonly_refuse_a_subscript() {
+	for (src, want, diag) in [
+		(
+			"export 'x[0]=60'; echo st=$?; declare -p x",
+			"st=1\n",
+			"export: `x[0]': not a valid identifier",
+		),
+		(
+			"x=1; readonly 'x[0]=60'; echo st=$?; declare -p x",
+			"st=1\ndeclare -- x=\"1\"\n",
+			"readonly: `x[0]': not a valid identifier",
+		),
+		(
+			"export 'SECONDS[0]=60'; echo $SECONDS; declare -p SECONDS",
+			"0\ndeclare -i SECONDS=\"0\"\n",
+			"export: `SECONDS[0]': not a valid identifier",
+		),
+	] {
+		let (out, err) = run(src);
+		assert_eq!(out, want, "{src}");
+		assert!(err.contains(diag), "{src}: {err}");
+	}
+}
+
+/// bash's `SECONDS=` keeps the value apart and moves the start to now
+/// (`assign_seconds`): `printf '%(%s)T' -2` then gives the assignment's
+/// time, and posix `time` with no pipeline counts from it. The host's clock
+/// starts at 1,000 s: a start moved back by the value would not wrap past
+/// 0, where these readers saturate.
+#[test]
+fn seconds_assignment_moves_the_start_to_now() {
+	let out = run_script(
+		FakeHost::new().with_clock_at(1_000_000_000_000),
+		b"SECONDS=100; a=$(printf '%(%s)T' -2); b=$(printf '%(%s)T' -1); [ \"$a\" = \"$b\" ] && \
+		  echo now; echo $SECONDS; set -o posix; TIMEFORMAT=%0R; SECONDS=100; { time; } 2>&1",
+		&[],
+		Fault::None,
+	);
+	let (out, err) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+	assert_eq!((&*out, &*err), ("now\n100\n0\n", ""));
 }
 
 #[test]

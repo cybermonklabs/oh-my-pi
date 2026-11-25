@@ -4397,7 +4397,7 @@ fn time_end(
 	}
 	let posix = null && state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
 	let start = if posix {
-		super::proc::TimeMark { real: k.start_ns, user: 0, sys: 0 }
+		super::proc::TimeMark { real: k.start_of(vp), user: 0, sys: 0 }
 	} else {
 		start
 	};
@@ -4462,7 +4462,7 @@ fn zsh_time_end(
 		zsh_time_report(&format, desc, times)
 	} else {
 		let cpu = cx.host.cpu_times().unwrap_or_default();
-		let real = end.real.saturating_sub(k.start_ns);
+		let real = end.real.saturating_sub(k.start_of(vp));
 		let mut text = zsh_time_report(&format, b"shell", [real, cpu.user_ns, cpu.sys_ns]);
 		let children = [real, cpu.child_user_ns, cpu.child_sys_ns];
 		text.extend_from_slice(&zsh_time_report(&format, b"children", children));

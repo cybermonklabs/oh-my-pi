@@ -232,6 +232,26 @@ fn misc_local_of_a_computed_special_is_the_special_restored_at_return() {
 	);
 }
 
+/// A zsh fork copies the `$RANDOM` generator (`rand()`'s state) and the
+/// `$SECONDS` clock (`shtimer`): a child draws on from the shell's sequence
+/// without moving it, and neither side's `SECONDS=` reaches the other (the
+/// background job runs after the shell's `SECONDS=1000`). Goldens from
+/// zsh 5.9.
+#[test]
+fn misc_forks_copy_random_and_seconds() {
+	let (out, err, st) = zsh(
+		"RANDOM=7; c=$( print $RANDOM ); p=$RANDOM; [[ $c == $p ]] && print continues; RANDOM=7; \
+		 a=$RANDOM; RANDOM=7; ( : $RANDOM $RANDOM ) & wait; b=$RANDOM; [[ $a == $b ]] && print \
+		 kept; SECONDS=100; ( SECONDS=5000 ) & wait; (( SECONDS < 5000 )) && print parent; ( (( \
+		 SECONDS < 1000 )) && print child ) & SECONDS=1000; wait; print $SECONDS; x=$( SECONDS=7; \
+		 print $SECONDS ); print $x",
+	);
+	assert_eq!(
+		(out.as_str(), err.as_str(), st),
+		("continues\nkept\nparent\nchild\n1000\n7\n", "", 0)
+	);
+}
+
 #[test]
 fn misc_started_as_sh_has_no_zsh_only_specials_and_no_ties() {
 	let host = FakeHost::new();

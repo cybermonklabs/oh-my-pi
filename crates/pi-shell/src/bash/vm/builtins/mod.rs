@@ -643,6 +643,31 @@ pub fn number(arg: &[u8]) -> Option<i64> {
 	Some(if neg { v.wrapping_neg() } else { v })
 }
 
+/// bash's `valid_number` (general.c): a decimal integer as `strtoimax`
+/// reads it, with blanks before it (C `isspace`) and after it, and an
+/// optional sign; `None` for anything else and for a number out of `i64`'s
+/// range (`strtoimax`'s `ERANGE`), where [`number`] wraps.
+pub fn valid_number(arg: &[u8]) -> Option<i64> {
+	let space = |c: &u8| matches!(c, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r');
+	let start = arg.iter().position(|c| !space(c))?;
+	let end = arg.iter().rposition(|c| !space(c))? + 1;
+	let t = &arg[start..end];
+	let (neg, digits) = match t.first() {
+		Some(b'-') => (true, &t[1..]),
+		Some(b'+') => (false, &t[1..]),
+		_ => (false, t),
+	};
+	if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+		return None;
+	}
+	// Counted down, so `i64::MIN` fits.
+	let mut v: i64 = 0;
+	for &c in digits {
+		v = v.checked_mul(10)?.checked_sub(i64::from(c - b'0'))?;
+	}
+	if neg { Some(v) } else { v.checked_neg() }
+}
+
 /// Leading option words of a builtin's arguments.
 pub struct Opts<'a> {
 	/// `(letter, on, argument)` in order; `on` is false for `+x`.
