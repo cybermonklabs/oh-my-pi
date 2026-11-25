@@ -2339,11 +2339,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 	/// `$!`: the pid of the last asynchronous child, its program's OS pid
 	/// for a job known by it ([`super::proc::Bang`]). While that job is
 	/// still deciding, a recording expansion waits for it
-	/// ([`Stop::Wait`]); one that cannot park sees the virtual pid.
-	pub fn last_bg(&self) -> X<Option<u32>> {
+	/// ([`Stop::Wait`]); one that cannot park sees the virtual pid. A reader
+	/// that waited finds the job unreaped until it spends time
+	/// ([`Kernel::pid_readers`]).
+	pub fn last_bg(&mut self) -> X<Option<u32>> {
 		let bg = self.vp.last_bg;
 		match bg.vpid() {
 			Some(v) if bg.os().is_none() && self.record && self.k.bang_pending(v) => {
+				self.k.read_pid(self.vp.vpid, v);
 				Err(Stop::Wait(WaitKey::Proc(v)))
 			},
 			_ => Ok(bg.pid()),

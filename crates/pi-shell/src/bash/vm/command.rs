@@ -4544,6 +4544,10 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 		None => st(vp).status,
 	};
 	if reaped {
+		// Bash's `waitchld` reaps every exited child here, so a reader that
+		// read `$!` has spent time ([`Kernel::reaped_program`]): the end it
+		// held is no longer at once.
+		k.reaped_program(vp.vpid);
 		super::owe_chld(k, cx, vp, false);
 	}
 	// Tested first: a function call's wait holds none, and the assignment

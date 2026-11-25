@@ -63,7 +63,7 @@ use crate::bash::{
 	diag::{Diag, DiagSite, render},
 	engine::Engine,
 	error::ShellError,
-	event::{AssignScope, Event, EventData, EventMask, Origin, OriginChain, OriginLink},
+	event::{AssignScope, Event, EventData, EventMask, Origin, OriginChain, OriginLink, WaitKey},
 	fd::{FdOrigin, FdRef, FdTable},
 	fs::File,
 	host::{EnvView, Host, StdFd, Verdict},
@@ -395,6 +395,35 @@ pub struct Shell {
 	/// Orphaned job trees still watched for in-engine work (see the
 	/// `orphans` module); empty unless [`Self::gone`] ever had entries.
 	orphans: Vec<Vpid>,
+	/// Ends held from a reader of the job's pid ([`Kernel::pid_readers`]):
+	/// the vproc is gone, but its record still runs and its parent has not
+	/// been told, as a child bash has not reaped yet. Each happens once
+	/// its reader spends time ([`Self::close_windows`]). Imaged.
+	held:    Vec<Held>,
+}
+
+/// The end of a job, or of the vproc its `$!` names, held from a reader
+/// of its pid ([`Shell::held`]).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(super) struct Held {
+	vpid:   Vpid,
+	parent: Option<Vpid>,
+	status: i32,
+	/// The reader it is held from, and the job whose pid that reader read
+	/// ([`PidReader`]).
+	reader: Vpid,
+	job:    Vpid,
+}
+
+/// A vproc that waited for a job's pid decision and has not spent time
+/// since ([`Kernel::pid_readers`]).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PidReader {
+	reader: Vpid,
+	job:    Vpid,
+	/// Ops the reader has run since its wait for the pid ended: at `SLICE`
+	/// it has spent time.
+	spent:  u32,
 }
 
 /// Shell-wide state shared by all vprocs (kept apart from `procs` so ops can
@@ -521,6 +550,17 @@ pub struct Kernel {
 	/// ended though the job runs on. Dropped when the job ends; not imaged
 	/// (a restored shell signals the job's vproc).
 	pub pid_owners:         Vec<(u32, Vpid, Vpid)>,
+	/// Vprocs that waited for a job's pid decision ([`proc::Bang`]) and
+	/// have not spent time since. Bash's parent knows `$!` at the fork and
+	/// runs on at once, so a child that ends at once is still unreaped when
+	/// the parent's next commands look: the end of the job (or of the vproc
+	/// its `$!` names) is held from its reader (`Shell::adopt`) until the
+	/// reader parks on anything but a pid decision, reaps a program it ran
+	/// ([`Self::reaped_program`]), or has run as many ops as a scheduler
+	/// slice since its wait, counting while it waits for another job's pid
+	/// the ops of whichever vproc runs (`PidReader::spent`,
+	/// `Shell::close_windows`). Imaged, with the ends held.
+	pub pid_readers:        Vec<PidReader>,
 	/// The math options ([`zsh::arith::math_options`]) last read for a vproc
 	/// without an overlay, with the [`state::Root::opts_gen`] and mode they
 	/// were read under: every `(( ))` asks.
@@ -631,6 +671,7 @@ impl Kernel {
 			bangs: Vec::new(),
 			settled: Vec::new(),
 			pid_owners: Vec::new(),
+			pid_readers: Vec::new(),
 			math_opts: None,
 			deferrals: Vec::new(),
 			jobctl: jobctl::JobCtl::default(),
@@ -671,6 +712,26 @@ impl Kernel {
 		}
 		jobctl::bang_settled(self, bang.vproc, os);
 		self.ctl.notify();
+	}
+
+	/// `reader` waits for `job`'s pid decision ([`Self::pid_readers`]).
+	pub fn read_pid(&mut self, reader: Vpid, job: Vpid) {
+		if !self
+			.pid_readers
+			.iter()
+			.any(|r| r.reader == reader && r.job == job)
+		{
+			self.pid_readers.push(PidReader { reader, job, spent: 0 });
+		}
+	}
+
+	/// `reader` reaped a program it waited for: bash's `waitchld` then reaps
+	/// every child that has exited, so the reader has spent time
+	/// ([`Self::pid_readers`]), even when the program's exit was there at the
+	/// first poll and it never parked. The ends held from the reader happen
+	/// after its turn (`Shell::close_windows`).
+	pub fn reaped_program(&mut self, reader: Vpid) {
+		self.pid_readers.retain(|r| r.reader != reader);
 	}
 
 	/// Next `$RANDOM` (0..=32767); the generator state is written through.
@@ -1715,6 +1776,7 @@ impl Shell {
 			slice: None,
 			gone: Vec::new(),
 			orphans: Vec::new(),
+			held: Vec::new(),
 		})
 	}
 
@@ -1975,6 +2037,9 @@ impl Shell {
 			self.slice = (used < left && p.has_work() && p.blocked.is_none() && !p.stopped)
 				.then_some((ran, left - used));
 			self.adopt(cx);
+			if !self.k.pid_readers.is_empty() || !self.held.is_empty() {
+				self.close_windows(cx, Some((ran, used)));
+			}
 			self.end_orphans(cx, Some(ran));
 			self.job_events(cx);
 		}
@@ -2001,17 +2066,118 @@ impl Shell {
 				self.k.trace_sources.remove(&p.vpid);
 				self.k.trace_unit_origins.remove(&p.vpid);
 				jobctl::forget_vproc(&mut self.k, p.vpid);
+				// The end of a job whose pid a reader waited for is held from
+				// that reader (`Kernel::pid_readers`).
+				let reader = self.reader_of(p.vpid);
 				// A job that ended undecided keeps its virtual pid.
 				self.k.settle_bang(p.vpid, None);
 				self.k.forget_deferral(p.vpid);
-				self.k.proc_exited(cx.store, p.vpid, p.parent, p.status);
-				self.k.ctl.notify();
-				self.rr = 0;
-				self.reaped(cx, p.parent, p.vpid, p.status);
+				match reader {
+					Some(r) => self.held.push(Held {
+						vpid:   p.vpid,
+						parent: p.parent,
+						status: p.status,
+						reader: r.reader,
+						job:    r.job,
+					}),
+					None => self.end(cx, p.vpid, p.parent, p.status),
+				}
 			} else {
 				i += 1;
 			}
 		}
+	}
+
+	/// Child vproc `vpid` of `parent` ended with `status`, now that no
+	/// reader of its pid holds the end ([`Self::held`]): its record shows
+	/// the status and its parent takes the end in.
+	fn end(&mut self, cx: &mut Cx<'_>, vpid: Vpid, parent: Option<Vpid>, status: i32) {
+		self.k.proc_exited(cx.store, vpid, parent, status);
+		self.k.ctl.notify();
+		self.rr = 0;
+		self.reaped(cx, parent, vpid, status);
+	}
+
+	/// The reader the end of `vpid` is held from ([`Kernel::pid_readers`]):
+	/// one that waited for the pid of the job `vpid` is, or of the job whose
+	/// `$!` names the program `vpid` runs (a pipeline's last stage).
+	fn reader_of(&self, vpid: Vpid) -> Option<PidReader> {
+		self.k.pid_readers.iter().copied().find(|r| {
+			r.job == vpid
+				|| self
+					.k
+					.pid_owners
+					.iter()
+					.any(|&(_, v, j)| v == vpid && j == r.job)
+		})
+	}
+
+	/// The readers of a job's pid ([`Kernel::pid_readers`]) that spent time
+	/// lose their hold, and the ends held from them happen ([`Self::end`]),
+	/// in the order they came. `ran` is the vproc that just ran and the ops
+	/// it used, `None` when nothing ran.
+	fn close_windows(&mut self, cx: &mut Cx<'_>, ran: Option<(Vpid, u32)>) {
+		let mut i = 0;
+		while let Some(&r) = self.k.pid_readers.get(i) {
+			if let Some(spent) = self.unspent(r, ran) {
+				self.k.pid_readers[i].spent = spent;
+				i += 1;
+			} else {
+				self.k.pid_readers.remove(i);
+			}
+		}
+		let mut i = 0;
+		while let Some(&h) = self.held.get(i) {
+			if self
+				.k
+				.pid_readers
+				.iter()
+				.any(|r| r.reader == h.reader && r.job == h.job)
+			{
+				i += 1;
+				continue;
+			}
+			self.held.remove(i);
+			self.end(cx, h.vpid, h.parent, h.status);
+		}
+	}
+
+	/// The ops reader `r` of a job's pid has run since its wait for the pid
+	/// ended ([`PidReader::spent`]), or `None` once it has spent time: it is
+	/// gone, stopped or out of work, it parked on anything but a pid
+	/// decision (a program, a `wait`, a read), or [`SLICE`] ops have run
+	/// since that wait: its own, and while it is parked on another job's pid
+	/// decision, those of whichever vproc runs (bash's parent runs on at
+	/// once, so time passes for it). A program the reader reaped at once
+	/// never parks and spends through [`Kernel::reaped_program`], not here.
+	/// `ran` is the vproc that just ran and the ops it used; the turn that
+	/// parked the reader for this pid is its wait.
+	fn unspent(&self, r: PidReader, ran: Option<(Vpid, u32)>) -> Option<u32> {
+		let p = self.procs.iter().find(|p| p.vpid == r.reader)?;
+		if p.stopped {
+			return None;
+		}
+		let Some((ran, used)) = ran else {
+			return Some(r.spent);
+		};
+		let reads = |job: Vpid| {
+			self.k.bang_pending(job)
+				&& self
+					.k
+					.pid_readers
+					.iter()
+					.any(|q| q.reader == r.reader && q.job == job)
+		};
+		match p.blocked.as_ref().map(|b| &b.key) {
+			Some(&WaitKey::Proc(job)) if job == r.job && reads(job) => return Some(r.spent),
+			Some(&WaitKey::Proc(job)) if reads(job) => {},
+			_ if ran != r.reader => return Some(r.spent),
+			Some(_) => return None,
+			None if !p.has_work() => return None,
+			None => {},
+		}
+		let spent = r.spent.saturating_add(used);
+		(spent < SLICE).then_some(spent)
 	}
 
 	/// Write the OS pids jobs settled on during the turn

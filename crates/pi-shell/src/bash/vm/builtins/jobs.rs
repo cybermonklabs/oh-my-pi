@@ -266,14 +266,20 @@ pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 
 /// Wait until each job of `numbers` has settled on the pid it is known by
 /// (its program's OS pid or its virtual pid, [`crate::bash::vm::proc::Bang`])
-/// before `jobs -l`/`-p`/`-x` shows it: the builtin runs again then.
-fn settled(ctx: &Ctx<'_, '_>, numbers: &[u32]) -> Result<(), Need> {
+/// before `jobs -l`/`-p`/`-x` shows it: the builtin runs again then, and
+/// finds the job unreaped until it spends time
+/// ([`crate::bash::vm::Kernel::pid_readers`]).
+fn settled(ctx: &mut Ctx<'_, '_>, numbers: &[u32]) -> Result<(), Need> {
 	let pending = numbers
 		.iter()
 		.filter_map(|&n| ctx.vp.jobs.get(n))
-		.find(|j| j.os_pid.is_none() && ctx.k.bang_pending(j.vpid));
+		.find(|j| j.os_pid.is_none() && ctx.k.bang_pending(j.vpid))
+		.map(|j| j.vpid);
 	match pending {
-		Some(job) => Err(Need::Sub(Stop::Wait(WaitKey::Proc(job.vpid)))),
+		Some(job) => {
+			ctx.k.read_pid(ctx.vp.vpid, job);
+			Err(Need::Sub(Stop::Wait(WaitKey::Proc(job))))
+		},
 		None => Ok(()),
 	}
 }
