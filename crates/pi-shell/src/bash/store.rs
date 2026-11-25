@@ -617,25 +617,19 @@ pub struct Job {
 	/// takes a job's end in when the host reaps its program's OS status: the
 	/// job runs until then, as bash's does until `waitchld` reaps it. But
 	/// `kill` ends a job, or a process of it, that is no program obash
-	/// spawned ([`Self::os_pid`], [`JobProc::os_pid`] unset: `kill %1` right
-	/// after `&`, or a subshell or group, which is no OS process here) at
-	/// once, in obash's kernel. Set by that `kill`; cleared where bash would
-	/// have reaped it: as the shell waits for a foreground program or child
-	/// (bash's `waitchld` takes in every child that ended), once a `kill`
-	/// finds the job gone (bash's `kill -0` answers for a zombie until bash
-	/// reaps it) or `jobs` finds it done (bash shows a job done only once it
-	/// reaped it). Read by `wait` (`builtins::flow`'s `wait_all`).
+	/// spawned ([`Self::os_pid`], [`JobProc::os_pid`] unset: a subshell or
+	/// group, which is no OS process here, or a lone command zsh's `kill %1`
+	/// names right after `&`; bash's `kill` has that command's program
+	/// spawned first) at once, in obash's kernel. Set by that `kill`; cleared
+	/// where bash would have reaped it: as the shell waits for a foreground
+	/// program or child (bash's `waitchld` takes in every child that ended),
+	/// once a `kill` finds the job gone (bash's `kill -0` answers for a zombie
+	/// until bash reaps it) or `jobs` finds it done (bash shows a job done only
+	/// once it reaped it). Read by `wait` (`builtins::flow`'s `wait_all`).
 	/// Kept in memory only: a job restored from the store or the frames image
 	/// counts as reaped.
 	#[serde(skip)]
 	pub unreaped:  bool,
-	/// No killed-job notice: this shell's `kill` ended the job while it was
-	/// stopped, and bash prints none for such a job (`notify_of_job_status`
-	/// reports a job killed while it ran, not one killed while stopped), so
-	/// the killed-job notice code leaves it out. Set by that `kill`. Kept in
-	/// memory only.
-	#[serde(skip)]
-	pub no_notice: bool,
 }
 
 impl Job {
@@ -784,7 +778,6 @@ impl Job {
 			signal:    None,
 			procs:     None,
 			unreaped:  false,
-			no_notice: false,
 		}
 	}
 
@@ -806,7 +799,6 @@ impl Job {
 			signal: _,
 			procs: _,
 			unreaped: _,
-			no_notice: _,
 		} = self;
 		have.signal.is_none()
 			&& have.procs.is_none()

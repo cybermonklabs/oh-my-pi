@@ -749,36 +749,77 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 			assert_eq!(masked(&obash_in().go()), masked(&theirs), "stdin: {script:?}");
 		}
 	}
-	// A job this shell's `kill` ended while it was stopped gets no notice:
-	// obash reported one, naming the job's vproc id for a `set -m` job stopped
-	// before it ran (the a6 rows of the bisect that found this). Checked with
-	// a next line left to read after the kill, and at the end of a script
-	// file. A job killed while running is still reported (the cases above).
-	//
-	// Pinned against the authoritative golden (bash 5.3.20 on runc, where it
-	// prints nothing) and NOT live-compared with the runner's bash, because
-	// bash is runtime-dependent here and the live comparison is an un-fixable
-	// flake: on gVisor bash reaps the job before the next-line read and
-	// reports it WITH A REAL PID, 1 to 2 runs in 3:
-	//   obash: `next`
-	//   bash : `NAME: line 2: PID Killed  /bin/sleep 20` then `next`
-	// obash never spawned the stopped-before-spawn job, so it has no pid to
-	// print; inventing one is the very defect this fixes, so obash is
-	// deterministically silent. `bash_keeps_finished_jobs_while_the_job_list_
-	// is_frozen` and `bash_keeps_a_waited_status_and_deletes_a_reported_job_
-	// after_the_freeze` are the same class, accepted since round 3.
-	let stopped = "set -m; /bin/sleep 20 & kill -STOP %1; /bin/sleep 0.3; kill -KILL %1";
-	let cstr = format!("exec 2>&1; {stopped}\necho next");
-	let ours = Run::script(env!("CARGO_BIN_EXE_obash"), "bash", &cstr).go();
-	let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
-	if got != ("next\n".to_string(), Some(Exit(0))) {
-		wrong.push(format!("-c {cstr:?}\n  got:  {got:?}\n  want: \"next\\n\""));
+	// A job killed while it was stopped is reported as one killed while it
+	// ran: bash reports a dead job a signal killed once it reaped it, at the
+	// next report point, whatever state it died in (`notify_of_job_status`
+	// looks at no earlier state). Here by `%job` and by pid, for `HUP` too
+	// (which `kill` follows with `CONT`), with `set -m` and without it, and a
+	// job killed by `%job` as it ran. A job `kill` names before obash spawned
+	// its program (nothing read `$!` first) has the program spawned first, as
+	// bash forked it at `&`: its notice names the program's pid
+	// ([`names_a_program_pid`]), where it named the job's virtual pid. Each
+	// row closes the reap race ([`GONE`]): with nothing between the kill and
+	// the next line, bash prints the notice only when it reaped the job in
+	// time. Each shell leads a process group of its own here, inside the
+	// runner's session, as bash's jobs do: obash keeps a `set -m` job in the
+	// shell's group, and a stop in an orphaned group hangs that group up.
+	let stop = "/bin/sleep 30 & kill -STOP %1; /bin/sleep 0.3;";
+	let by_kill = [
+		(format!("set -m; {stop} kill -KILL %1; {GONE}"), killed(2), true),
+		(
+			format!(
+				"set -m; /bin/sleep 30 & p=$!; kill -STOP %1; /bin/sleep 0.3; kill -KILL %1; {GONE}"
+			),
+			killed(2),
+			false,
+		),
+		(
+			format!(
+				"set -m; /bin/sleep 30 & p=$!; kill -STOP $p; /bin/sleep 0.3; kill -KILL $p; {GONE}"
+			),
+			killed(2),
+			false,
+		),
+		(
+			format!("set -m; {stop} kill -HUP %1; {GONE}"),
+			notice(2, libc::SIGHUP, "/bin/sleep 30"),
+			true,
+		),
+		(format!("{stop} kill -KILL %1; {GONE}"), killed(2), true),
+		(format!("/bin/sleep 30 & kill -KILL %1; {GONE}"), killed(2), true),
+		(format!("/bin/sleep 30 & p=$!; kill -KILL %1; {GONE}"), killed(2), false),
+	];
+	for (script, notice_line, spawned_by_kill) in by_kill {
+		let script = format!("exec 2>&1; {script}\necho next");
+		let out = format!("{notice_line}next\n");
+		let ours = Run::script(env!("CARGO_BIN_EXE_obash"), "bash", &script)
+			.own_group()
+			.go();
+		let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+		if got != (out.clone(), Some(Exit(0))) {
+			wrong.push(format!("{script:?}\n  got:  {got:?}\n  want: {out:?}"));
+		}
+		if spawned_by_kill {
+			names_a_program_pid(&mut wrong, &script, &ours.stdout);
+		}
+		if let Some(bash) = real_bash_golden() {
+			let theirs = Run::script(bash, "bash", &script).own_group().go();
+			assert_eq!(masked(&ours), masked(&theirs), "{script:?}");
+		}
 	}
-	fs::write(&path, format!("exec 2>&1; {stopped}\n")).expect("write the script");
-	let ours = obash().go();
+	// The same at the end of a script file: at the read that finds the end.
+	let ends = format!("exec 2>&1; set -m; {stop} kill -KILL %1; {GONE}\n");
+	fs::write(&path, &ends).expect("write the script");
+	let ours = obash().own_group().go();
+	let out = format!("{file}: line 2: PID {:<27}/bin/sleep 30\n", desc(libc::SIGKILL));
 	let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
-	if got != (String::new(), Some(Exit(0))) {
-		wrong.push(format!("file stopped-kill\n  got:  {got:?}\n  want: \"\""));
+	if got != (out.clone(), Some(Exit(0))) {
+		wrong.push(format!("file {ends:?}\n  got:  {got:?}\n  want: {out:?}"));
+	}
+	names_a_program_pid(&mut wrong, &ends, &ours.stdout);
+	if let Some(bash) = real_bash_golden() {
+		let theirs = Run::new(&bash, "bash", &[&path]).own_group().go();
+		assert_eq!(masked(&ours), masked(&theirs), "file: {ends:?}");
 	}
 	// A substitution and `jobs` in a script file.
 	for (script, line, out) in [
@@ -800,6 +841,63 @@ fn bash_reports_a_background_job_killed_by_a_signal() {
 		}
 	}
 	assert!(wrong.is_empty(), "{} of the cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// Push to `wrong` unless the long killed-job notice in `out`
+/// (`NAME: line N: PID Killed …`) names a program's pid: obash's virtual
+/// pids start at 2^30 (`Vpid::BASE`), and a job killed before obash spawned
+/// its program named its own there.
+fn names_a_program_pid(wrong: &mut Vec<String>, script: &str, out: &[u8]) {
+	let text = String::from_utf8_lossy(out);
+	let pid = text.lines().find_map(|line| {
+		let (_, rest) = line.split_once(": line ")?;
+		let (_, rest) = rest.split_once(": ")?;
+		rest.split_whitespace().next()?.parse::<u64>().ok()
+	});
+	if pid.is_none_or(|pid| pid >= 1 << 30) {
+		wrong.push(format!(
+			"{script:?}\n  the notice names {pid:?}, not a program's pid\n  out: {text:?}"
+		));
+	}
+}
+
+/// A job `kill` named before obash spawned its program keeps its notice, and
+/// the program's pid in it, across the shell's own snapshot and restore: the
+/// fault injector's `step` and `exec` modes externalize and restore the shell
+/// as a host does, here at every op (`PI_SHELL_FAULT=SEED:1`), a snapshot
+/// that would lose a program in flight retried until none is
+/// (`PI_SHELL_FAULT_LOST=defer`). What the notice rests on is stored: the
+/// job's end and signal (its facts), its program's pid (`Job::os_pid`) and
+/// the pid decisions still pending (the frames image's bangs). The sleep
+/// after the kill closes the reap race with few ops to restore.
+#[test]
+fn a_killed_jobs_notice_survives_a_restore() {
+	let killed = String::from_utf8(long_notice(2, libc::SIGKILL, b"/bin/sleep 30")).expect("ASCII");
+	let want = (format!("{killed}next\n"), Some(Exit(0)));
+	let mut wrong = Vec::new();
+	for body in [
+		"set -m; /bin/sleep 30 & kill -STOP %1; /bin/sleep 0.3; kill -KILL %1; /bin/sleep 0.5",
+		"/bin/sleep 30 & kill -KILL %1; /bin/sleep 0.5",
+	] {
+		let script = format!("exec 2>&1; {body}\necho next");
+		for seed in 1..=3 {
+			for mode in ["step", "exec"] {
+				let ours = Run::script(env!("CARGO_BIN_EXE_obash"), "bash", &script)
+					.own_group()
+					.env("PI_SHELL_FAULT", format!("{seed}:1"))
+					.env("PI_SHELL_FAULT_MODE", mode)
+					.env("PI_SHELL_FAULT_LOST", "defer")
+					.go();
+				let run = format!("{mode}, seed {seed}: {script:?}");
+				let got = (String::from_utf8_lossy(&mask_pids(&ours.stdout)).into_owned(), ours.end());
+				if got != want {
+					wrong.push(format!("{run}\n  got:  {got:?}\n  want: {want:?}"));
+				}
+				names_a_program_pid(&mut wrong, &run, &ours.stdout);
+			}
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the runs differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
 /// `out` with the pid of each line after the first of bash's notice of a
@@ -1859,7 +1957,8 @@ fn job_row(row: &str) -> String {
 /// command waits until `jobs -r` lists no job, so the notices come before
 /// the prompt after it. The rows from the first command on are
 /// compared ([`job_row`]) with the goldens, which follow bash 5.3's
-/// `jobs.c`, and live with a bash 5.3 or later ([`real_bash_golden`]).
+/// `jobs.c`, and live with a bash 5.3 or later ([`real_bash_golden`]),
+/// but for the two jobs' shell (its comment says why).
 #[test]
 fn an_interactive_bash_announces_a_job_as_jobs_lists_it() -> io::Result<()> {
 	let wait = "while jobs -r >\"$F.r\"; [ -s \"$F.r\" ]; do /bin/sleep 0.01; done";
@@ -1902,18 +2001,28 @@ fn an_interactive_bash_announces_a_job_as_jobs_lists_it() -> io::Result<()> {
 	let exit_first = format!("{exits} &");
 	let two_first = format!("{ends} & {exit3} &");
 	let wd_first = format!("cd \"$F.d\"; {ends} &");
-	// Each shell's first command, the next one (none after the stop), and
-	// the rows after the first command's.
+	// Each shell's first command, the next one (none after the stop), the
+	// rows after the first command's, and whether a live bash is compared.
 	let cases = [
-		("/bin/sleep 30", None, stop),
-		(exit_first.as_str(), Some(wait), exit),
-		("/bin/sleep 30 &", Some(kill_next.as_str()), kill),
-		(two_first.as_str(), Some(wait), two),
-		(wd_first.as_str(), Some(wd_next.as_str()), wd),
+		("/bin/sleep 30", None, stop, true),
+		(exit_first.as_str(), Some(wait), exit, true),
+		("/bin/sleep 30 &", Some(kill_next.as_str()), kill, true),
+		// The two jobs end within milliseconds of each other, and bash reaps
+		// each at a report point of its own, so it can report one before the
+		// other has ended (`[2]+  Exit 3`, then `[1]+  Done` at the prompt).
+		// Measured with bash 5.3.20: 2 of 6 runs on gVisor and 1 of 12 on
+		// runc, as uid 1000 and root; a wait with builtins only does not avoid
+		// it (4 of 6 on gVisor). So this shell is not compared live: obash
+		// reports both at the prompt, as bash does once it reaped both (the
+		// golden).
+		(two_first.as_str(), Some(wait), two, false),
+		(wd_first.as_str(), Some(wd_next.as_str()), wd, true),
 	];
-	for (first, next, want) in &cases {
+	for (first, next, want, live) in &cases {
 		let ours = Spawn::obash_as("bash");
-		let real = real_bash_golden().map(|bash| Spawn::new(bash).argv0("bash"));
+		let real = real_bash_golden()
+			.filter(|_| *live)
+			.map(|bash| Spawn::new(bash).argv0("bash"));
 		let shells =
 			std::iter::once(("obash", ours)).chain(real.map(|spawn| ("the real shell", spawn)));
 		for (who, spawn) in shells {

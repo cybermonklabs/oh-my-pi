@@ -541,7 +541,7 @@ fn reports_jobs(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 /// another signal killed unreported, for `jobs`.
 fn unreported(cx: &mut Cx<'_>, vp: &Vproc, number: u32) -> Option<Signal> {
 	let job = vp.jobs.get(number)?;
-	if job.inherited || job.notified || job.no_notice || !matches!(job.state, JobState::Done(_)) {
+	if job.inherited || job.notified || !matches!(job.state, JobState::Done(_)) {
 		return None;
 	}
 	let sig = job.signal?;

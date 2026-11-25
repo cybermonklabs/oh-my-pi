@@ -287,7 +287,6 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				signal:    None,
 				procs:     None,
 				unreaped:  false,
-				no_notice: false,
 			}),
 		),
 		(
@@ -307,7 +306,6 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				signal:    None,
 				procs:     None,
 				unreaped:  false,
-				no_notice: false,
 			}),
 		),
 		(
@@ -350,7 +348,6 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				signal:    None,
 				procs:     None,
 				unreaped:  false,
-				no_notice: false,
 			}),
 		),
 		(
@@ -370,7 +367,6 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 				signal:    None,
 				procs:     None,
 				unreaped:  false,
-				no_notice: false,
 			}),
 		),
 		(

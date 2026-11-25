@@ -7,9 +7,15 @@ use std::fmt::Write as _;
 use bstr::{BString, ByteSlice};
 use strum::IntoEnumIterator;
 
-use super::{Ctx, R, done};
+use super::{Ctx, Need, R, done};
 use crate::bash::{
-	ControlHandle, Platform, SigTarget, Signal, Vpid, diag::Diag, vm::proc::JobState,
+	ControlHandle, Platform, SigTarget, Signal, Vpid,
+	diag::Diag,
+	event::WaitKey,
+	vm::{
+		expand::Stop,
+		proc::{JobLookup, JobState},
+	},
 };
 
 /// What `kill` sends.
@@ -107,6 +113,16 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		ctx.builtin_usage();
 		return done(2);
 	}
+	// A job is signalled as the process bash forked for it at `&`: one whose
+	// pid is still to be settled (obash spawns its program lazily,
+	// [`crate::bash::vm::proc::Bang`]) settles it first, as `$!` and
+	// `jobs -l` let it, and the builtin runs again then, before it sends
+	// anything. Its signal then reaches the program, and its notice names the
+	// program's pid, as bash's does; killed undecided, its notice named its
+	// virtual pid.
+	if let Some(vpid) = undecided(ctx, &args[i..]) {
+		return Err(Need::Sub(Stop::Wait(WaitKey::Proc(vpid))));
+	}
 	let mut status = 0;
 	for arg in &args[i..] {
 		match target(ctx, arg, send, None) {
@@ -170,11 +186,6 @@ pub(super) fn target(
 			job.set_running();
 			job.notified = true;
 		}
-		// bash reports a job killed while it ran, not one killed while
-		// stopped: leave the latter unreported ([`Job::no_notice`]).
-		if ends(send) && matches!(job.state, JobState::Stopped(_)) {
-			job.no_notice = true;
-		}
 		if ends(send) && !has_program(job) {
 			job.unreaped = true;
 		}
@@ -205,9 +216,6 @@ pub(super) fn target(
 	// it ends that has no program yet, or one it finds gone, which bash's
 	// `kill` (that still finds a zombie) finds gone only once it reaped it.
 	if let Some(job) = named.and_then(|v| ctx.vp.jobs.by_vpid_mut(v)) {
-		if ends(send) && matches!(job.state, JobState::Stopped(_)) {
-			job.no_notice = true;
-		}
 		match live {
 			Some(_) if ends(send) && !has_program(job) => job.unreaped = true,
 			Some(_) => {},
@@ -227,6 +235,25 @@ pub(super) fn target(
 			.map(|()| None)
 			.map_err(TargetError::Host),
 	}
+}
+
+/// The job of the first `%job` operand of `operands` that has not settled on
+/// the pid it is known by ([`crate::bash::vm::proc::Bang`]) and can still
+/// settle it: a job stopped undecided cannot run to its decision. A pid
+/// operand names a job by a pid the shell showed, which `$!` and `jobs -l`
+/// settle first.
+fn undecided(ctx: &Ctx<'_, '_>, operands: &[BString]) -> Option<Vpid> {
+	operands.iter().find_map(|arg| {
+		let rest = arg.as_slice().strip_prefix(b"%")?;
+		let JobLookup::Job(number) = ctx.vp.jobs.lookup(rest) else {
+			return None;
+		};
+		let job = ctx.vp.jobs.get(number)?;
+		(job.os_pid.is_none()
+			&& ctx.k.bang_pending(job.vpid)
+			&& !matches!(job.state, JobState::Stopped(_) | JobState::Done(_)))
+		.then_some(job.vpid)
+	})
 }
 
 /// Whether `send` ends a process that neither traps nor ignores it
