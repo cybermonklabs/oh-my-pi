@@ -14,6 +14,7 @@ import {
 	type CostEstimatorContext,
 	classifyGatewayResponseCacheStatus,
 	detectGatewayFromHeaders,
+	finishExecuteToolSpan,
 	GenAIAttr,
 	GenAIOperation,
 	OpenAIAttr,
@@ -22,6 +23,7 @@ import {
 	recordJudgmentTelemetry,
 	recordManualChatTelemetry,
 	resolveTelemetry,
+	startExecuteToolSpan,
 	type TelemetryHookContext,
 } from "@oh-my-pi/pi-agent-core/telemetry";
 import type {
@@ -373,6 +375,94 @@ describe("agent-loop OTEL instrumentation", () => {
 		]);
 		expect(JSON.parse(systemAttr!)).toEqual([{ type: "text", content: "sys-instruction" }]);
 	});
+
+	// A session's messages nest as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000.
+	it("captures full content of a tool call and result nested deeper than JSON.stringify recurses", async () => {
+		const levels = 50_000;
+		const nested = (bottom: Record<string, unknown>): Record<string, unknown> => {
+			let node = bottom;
+			for (let level = 0; level < levels; level++) node = { next: node };
+			return node;
+		};
+		const nesting = (value: unknown): { levels: number; bottom: unknown } => {
+			let depth = 0;
+			let node = value as { next?: unknown };
+			while (node.next !== undefined) {
+				node = node.next as { next?: unknown };
+				depth++;
+			}
+			return { levels: depth, bottom: node };
+		};
+		// The tool call and its result from an earlier turn: the next request sends both back.
+		const history: AgentMessage[] = [
+			createUserMessage("inspect it"),
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "tc-1", name: "inspect", arguments: { tree: nested({ leaf: "args" }) } }],
+				api: "openai-completions",
+				provider: MOCK_IDENT.provider,
+				model: MOCK_IDENT.id,
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: 1,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "tc-1",
+				toolName: "inspect",
+				content: [{ type: "text", text: "inspected" }],
+				details: nested({ leaf: "details" }),
+				isError: false,
+				timestamp: 2,
+			},
+		];
+		const mock = createMockModel({ ...MOCK_IDENT, responses: [{ content: ["done"], stopReason: "stop" }] });
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			telemetry: { captureMessageContent: true },
+		};
+		const ctx: AgentContext = { systemPrompt: [], messages: history, tools: [] };
+		await runAndDrain(agentLoop([createUserMessage("summarize")], ctx, config, undefined, mock.stream));
+
+		const chat = findSpan(exporter.getFinishedSpans(), "chat mock-model");
+		expect(chat?.status.code).not.toBe(SpanStatusCode.ERROR);
+		const inputs = JSON.parse(chat?.attributes[GenAIAttr.InputMessages] as string) as Array<{
+			role: string;
+			parts: Array<{ arguments?: { tree: unknown }; response?: { details: unknown } }>;
+		}>;
+		const sentCall = inputs.find(message => message.role === "assistant")?.parts[0];
+		expect(nesting(sentCall?.arguments?.tree)).toEqual({ levels, bottom: { leaf: "args" } });
+		const sentResult = inputs.find(message => message.role === "tool")?.parts[0];
+		expect(nesting(sentResult?.response?.details)).toEqual({ levels, bottom: { leaf: "details" } });
+
+		// The tool's own span records the call's arguments and its result whole, not "[object Object]".
+		const telemetry = resolveTelemetry({ captureMessageContent: true }, "conv-deep");
+		const span = startExecuteToolSpan(telemetry, {
+			tool: undefined,
+			toolName: "inspect",
+			toolCallId: "tc-2",
+			args: { tree: nested({ leaf: "args" }) },
+		});
+		finishExecuteToolSpan(telemetry, span, {
+			result: { content: [{ type: "text", text: "inspected" }], details: nested({ leaf: "details" }) },
+			isError: false,
+			toolCallId: "tc-2",
+			toolName: "inspect",
+		});
+		const tool = findSpan(exporter.getFinishedSpans(), "execute_tool inspect");
+		const args = JSON.parse(tool?.attributes[GenAIAttr.ToolCallArguments] as string);
+		expect(nesting(args.tree)).toEqual({ levels, bottom: { leaf: "args" } });
+		const result = JSON.parse(tool?.attributes[GenAIAttr.ToolCallResult] as string);
+		expect(nesting(result.details)).toEqual({ levels, bottom: { leaf: "details" } });
+	}, 30_000);
 
 	it("captures string systemPrompt without crashing when captureMessageContent is true", async () => {
 		const mock = createMockModel({

@@ -44,7 +44,7 @@ import {
 	type Usage,
 } from "@oh-my-pi/pi-ai";
 import { isAnthropicOAuthToken } from "@oh-my-pi/pi-catalog/utils";
-import { $otelEnv } from "@oh-my-pi/pi-utils";
+import { $otelEnv, stringifyDeepJson } from "@oh-my-pi/pi-utils";
 import {
 	type Attributes,
 	type AttributeValue,
@@ -1186,8 +1186,7 @@ function isPlainTelemetryRecord(value: unknown): value is Record<string, unknown
 }
 
 function stringifyJsonAttribute(value: unknown): string | undefined {
-	const serialized = JSON.stringify(value);
-	return serialized === undefined ? undefined : serialized;
+	return stringifyDeepJson(value);
 }
 
 function serializeToolCallArgumentsForTelemetry(telemetry: AgentTelemetry, args: unknown): string | undefined {
@@ -2323,9 +2322,9 @@ export function setSpanAttribute(span: Span | undefined, key: string, value: Att
 /** Re-exports so consumers can write hooks without depending on @opentelemetry/api directly. */
 export { type Attributes, type Span, SpanKind, SpanStatusCode, type Tracer, trace };
 
-function safeJson(value: unknown): string {
+function safeJson(value: unknown): string | undefined {
 	try {
-		return JSON.stringify(value);
+		return stringifyDeepJson(value);
 	} catch {
 		return String(value);
 	}
