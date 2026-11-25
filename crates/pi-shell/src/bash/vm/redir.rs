@@ -1713,7 +1713,7 @@ fn zsh_close(
 
 /// The most a tee holds that not every target has taken yet; a write past
 /// it waits.
-const TEE_HOLD: usize = 64 << 10;
+pub(crate) const TEE_HOLD: usize = 64 << 10;
 
 /// A write of at most this many bytes goes into a tee whole or not at all,
 /// as a pipe keeps a write of at most `PIPE_BUF` bytes whole. It is Linux's
@@ -1745,14 +1745,16 @@ const TEE_WHOLE: usize = 4096;
 /// the rest of the write that chunk belongs to (a target that is gone is
 /// skipped); the next write starts afresh. A tee reports no target's
 /// failure to its writers. The tee polls its targets with a waker of its
-/// own, which wakes every caller waiting on the tee ([`Waiters`]): a target
-/// keeps one waker (a host file's readiness watch keeps the latest), so a
-/// caller's own waker there would be replaced by the next caller's, and the
-/// first would sleep on bytes another caller moved out, or that no caller
-/// moves once the other is cancelled. Each write the tee takes comes with a
-/// [`Mark`] ([`File::poll_write_marked`]), done once every target has
-/// written that write out, so a writer that settles its marks counts its
-/// bytes only once they are out of the tee: an engine command's output,
+/// own, which wakes every caller waiting on the tee ([`Waiters`]), and with
+/// a key of its own per target ([`crate::sys::WaitKey`]), so its wait on a
+/// target is not replaced by another writer's there (the engine's own, as
+/// it writes the run's stdout). A caller's own waker on a target would be
+/// replaced by the next caller's, and the first would sleep on bytes
+/// another caller moved out, or that no caller moves once the other is
+/// cancelled. Each write the tee takes comes with a [`Mark`]
+/// ([`File::poll_write_marked`]), done once every target has written that
+/// write out, so a writer that settles its marks counts its bytes only
+/// once they are out of the tee: an engine command's output,
 /// [`FdRef::poll_write_out`]'s writers (`syswrite`, a job notice), a pump.
 /// What the queue holds when the tee's last handle closes is lost; none of
 /// it is a write whose writer settled its mark.
@@ -1875,6 +1877,9 @@ struct TeeState {
 	next:    u64,
 	/// Each target's place in the queue.
 	places:  Vec<Place>,
+	/// The tee's own wait on each target ([`crate::sys::WaitKey`]): a
+	/// target the engine or another tee writes too keeps each wait apart.
+	keys:    Vec<crate::sys::WaitKey>,
 	/// The last drive moved the queue on: a target took bytes or settled a
 	/// chunk, or the queue let a write go.
 	moved:   bool,
@@ -1898,6 +1903,10 @@ impl Tee {
 		Self(Arc::new(TeeShared {
 			state: parking_lot::Mutex::new(TeeState {
 				places: vec![Place::default(); targets.len()],
+				keys: targets
+					.iter()
+					.map(|_| crate::sys::WaitKey::default())
+					.collect(),
 				targets,
 				queue: std::collections::VecDeque::new(),
 				queued: 0,
@@ -1944,7 +1953,12 @@ impl TeeState {
 	fn drive(&mut self, cx: &mut Context<'_>) -> Poll<()> {
 		let first = self.queue.front().map_or(self.next, |(seq, ..)| *seq);
 		let mut done = true;
-		for (t, place) in self.targets.iter().zip(&mut self.places) {
+		for ((t, place), key) in self
+			.targets
+			.iter()
+			.zip(&mut self.places)
+			.zip(&mut self.keys)
+		{
 			loop {
 				if let Some(taken) = &place.last {
 					match t.poll_settle_marked(cx, std::slice::from_ref(taken)) {
@@ -1978,7 +1992,7 @@ impl TeeState {
 					place.off = 0;
 					continue;
 				}
-				match t.poll_write_marked(cx, &bytes[place.off..]) {
+				match t.poll_write_marked_keyed(cx, &bytes[place.off..], key) {
 					Poll::Ready(Ok((n, taken))) if n > 0 => {
 						place.off += n;
 						place.last = taken;
@@ -2120,21 +2134,46 @@ impl File for Tee {
 }
 
 /// zsh's multio cat (`closemn` for input): reads each source to its end in
-/// turn.
+/// turn. It waits on one source at a time, so a task reading with a key of
+/// its own waits with that key.
 struct Cat {
 	sources: Vec<FdRef>,
 	at:      usize,
 }
 
-impl File for Cat {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+impl Cat {
+	fn read(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		mut key: Option<&mut crate::sys::WaitKey>,
+	) -> Poll<std::io::Result<usize>> {
 		while let Some(src) = self.sources.get(self.at) {
-			match src.poll_read(cx, buf) {
+			let polled = match key.as_deref_mut() {
+				Some(key) => src.poll_read_keyed(cx, buf, key),
+				None => src.poll_read(cx, buf),
+			};
+			match polled {
 				Poll::Ready(Ok(0)) => self.at += 1,
 				other => return other,
 			}
 		}
 		Poll::Ready(Ok(0))
+	}
+}
+
+impl File for Cat {
+	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+		self.read(cx, buf, None)
+	}
+
+	fn poll_read_keyed(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut crate::sys::WaitKey,
+	) -> Poll<std::io::Result<usize>> {
+		self.read(cx, buf, Some(key))
 	}
 
 	fn poll_write(&mut self, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
@@ -3174,5 +3213,170 @@ mod tests {
 		});
 		assert!(settled.is_ok(), "{settled:?}");
 		assert_eq!(held.lock().got, bytes, "the second target's bytes, once");
+	}
+}
+
+/// The tee's and the cat's waits on their targets and sources, beside the
+/// engine's own.
+#[cfg(all(test, unix))]
+mod keyed {
+	use std::{io::Write, os::fd::OwnedFd, task::Waker};
+
+	use super::*;
+	use crate::sys::{
+		StdFile, WaitKey,
+		test_fifos::{Flag, FullFifo, drain},
+	};
+
+	fn fd(file: StdFile) -> FdRef {
+		FdRef::from_file(Box::new(file))
+	}
+
+	fn cx(flag: &Arc<Flag>) -> Waker {
+		Waker::from(Arc::clone(flag))
+	}
+
+	// Failure mode (review of #111 at 3b9fe7ab): a native extra writing
+	// through a zsh multios tee (`head … >&1 >/dev/null &`) waited on the
+	// run's stdout with the engine's own wait, which the engine's next write
+	// replaced: the extra was never woken. The tee takes the write and moves
+	// it out itself, waiting on each target with a key of its own, so the
+	// engine's write to the same target leaves the tee's wait in place.
+	#[test]
+	fn a_tee_waits_on_each_target_with_a_key_of_its_own() {
+		let FullFifo { writer: a, reader: mut drain_a } = FullFifo::new();
+		let FullFifo { writer: b, reader: mut drain_b } = FullFifo::new();
+		let (a, b) = (fd(a), fd(b));
+		let mut tee = Tee::new(vec![a.clone(), b]);
+		let (extra, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+		let mut key = WaitKey::default();
+		let (xw, ew) = (cx(&extra), cx(&engine));
+		assert!(
+			matches!(
+				tee.poll_write_keyed(&mut Context::from_waker(&xw), b"x", None, &mut key),
+				Poll::Ready(Ok((1, _)))
+			),
+			"the tee takes the byte"
+		);
+		assert!(tee.poll_settle(&mut Context::from_waker(&xw)).is_pending(), "both targets are full");
+		// The engine writes the first target too, as its owner.
+		assert!(
+			a.poll_write(&mut Context::from_waker(&ew), b"y")
+				.is_pending(),
+			"no room"
+		);
+		drain(&mut drain_a);
+		extra.wait("the extra, settling the tee, woken by its first target's drain");
+		engine.wait("the engine, waiting on the same target, woken by the same drain");
+		assert!(
+			tee.poll_settle(&mut Context::from_waker(&xw)).is_pending(),
+			"the second target is full"
+		);
+		drain(&mut drain_b);
+		extra.wait("the extra, settling the tee, woken by its second target's drain");
+		assert!(matches!(tee.poll_settle(&mut Context::from_waker(&xw)), Poll::Ready(Ok(()))));
+	}
+
+	// Failure mode (review of #111 at bd60965e): a tee kept one progress for
+	// all its writers. An extra's write stopped after the 10 bytes its target
+	// had room for; the engine's write went on from byte 10, and its end reset
+	// the progress, so the extra wrote all its bytes again: 110 `A`s and 90
+	// `B`s. The tee owns what it takes, so each writer's bytes go out once.
+	#[test]
+	#[expect(clippy::naive_bytecount, reason = "a few hundred bytes; no bytecount dependency")]
+	fn two_writers_on_one_tee_each_write_once() {
+		use crate::bash::mem::{PIPE_CAPACITY, pipe};
+		fn drain(r: &mut crate::bash::mem::PipeReader, out: &mut Vec<u8>) {
+			let mut buf = vec![0u8; PIPE_CAPACITY];
+			while let Poll::Ready(Ok(n)) =
+				r.poll_read(&mut Context::from_waker(Waker::noop()), &mut buf)
+			{
+				if n == 0 {
+					break;
+				}
+				out.extend_from_slice(&buf[..n]);
+			}
+		}
+		let noop = &mut Context::from_waker(Waker::noop());
+		let (mut r, mut w) = pipe();
+		let fill = vec![b'.'; PIPE_CAPACITY - 10];
+		assert!(matches!(w.poll_write(noop, &fill), Poll::Ready(Ok(n)) if n == fill.len()));
+		let mut tee = Tee::new(vec![FdRef::from_file(Box::new(w))]);
+		let mut key = WaitKey::default();
+		let (a, b) = ([b'A'; 100], [b'B'; 100]);
+		assert!(
+			matches!(tee.poll_write_keyed(noop, &a, None, &mut key), Poll::Ready(Ok((100, _)))),
+			"the extra's write is taken"
+		);
+		assert!(matches!(tee.poll_write(noop, &b), Poll::Ready(Ok(100))), "the engine's write");
+		let mut out = Vec::new();
+		loop {
+			drain(&mut r, &mut out);
+			if tee.poll_settle(noop).is_ready() {
+				break;
+			}
+		}
+		drain(&mut r, &mut out);
+		let count = |c: u8| out.iter().filter(|&&b| b == c).count();
+		assert_eq!((count(b'.'), count(b'A'), count(b'B')), (fill.len(), 100, 100));
+	}
+
+	// Failure mode: a native extra reading through a zsh multios cat waited
+	// on its source with the engine's own wait, which the engine's next read
+	// replaced.
+	#[test]
+	fn a_cat_waits_on_its_source_with_the_callers_key() {
+		let (r, mut w) = std::io::pipe().unwrap();
+		let src = fd(StdFile::new(std::fs::File::from(OwnedFd::from(r))));
+		let mut cat = Cat { sources: vec![src.clone()], at: 0 };
+		let (extra, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+		let mut key = WaitKey::default();
+		let (xw, ew) = (cx(&extra), cx(&engine));
+		let mut buf = [0u8; 8];
+		assert!(
+			cat.poll_read_keyed(&mut Context::from_waker(&xw), &mut buf, &mut key)
+				.is_pending(),
+			"no input"
+		);
+		assert!(
+			src.poll_read(&mut Context::from_waker(&ew), &mut buf)
+				.is_pending(),
+			"no input"
+		);
+		w.write_all(b"x").unwrap();
+		extra.wait("the extra, reading through the cat, woken by the input");
+		engine.wait("the engine, reading the same source, woken by the same input");
+	}
+
+	// The tee takes up to `TEE_HOLD` bytes beyond what its slowest target
+	// has room for, so a write through it waits only past the target's room
+	// and the hold. The session's tee tests size their writes by this
+	// (`TEE_WAITS` there); a change to the hold fails here first.
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn a_tee_waits_only_past_its_targets_room_and_its_hold() {
+		use std::os::fd::AsRawFd;
+		let (reader, writer) = std::io::pipe().unwrap();
+		let room = crate::sys::pipe_capacity(writer.as_raw_fd());
+		let mut tee = Tee::new(vec![fd(StdFile::new(std::fs::File::from(OwnedFd::from(writer))))]);
+		let noop = &mut Context::from_waker(Waker::noop());
+		let fits = vec![b'0'; room + TEE_HOLD - 1];
+		let mut taken = 0;
+		while taken < fits.len() {
+			match tee.poll_write(noop, &fits[taken..]) {
+				Poll::Ready(Ok(n)) if n > 0 => taken += n,
+				other => panic!("the tee waited after {taken} of {} bytes: {other:?}", fits.len()),
+			}
+		}
+		assert!(
+			tee.poll_write(noop, b"12").is_pending(),
+			"a write past the pipe's {room} bytes and the hold's {TEE_HOLD} did not wait"
+		);
+		assert!(
+			matches!(tee.poll_write(noop, b"1"), Poll::Ready(Ok(1))),
+			"the last byte of the pipe's room and the hold was not taken"
+		);
+		assert!(tee.poll_write(noop, b"2").is_pending(), "the tee took more than its hold");
+		drop(reader);
 	}
 }

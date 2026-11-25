@@ -80,22 +80,35 @@ impl End {
 	/// Linux cannot reopen a socket through `/dev/fd/N` (`cat <(…)`, ENXIO).
 	pub fn direction(&mut self) -> (bool, bool) {
 		let mut cx = Context::from_waker(Waker::noop());
-		let readable = !matches!(self.poll_read(&mut cx, &mut []), Poll::Ready(Err(_)));
-		let writable = !matches!(self.poll_write_marked(&mut cx, &[]), Poll::Ready(Err(_)));
+		let readable =
+			!matches!(self.poll_read(&mut cx, &mut [], &mut WaitKey::default()), Poll::Ready(Err(_)));
+		let writable = !matches!(
+			self.poll_write_marked(&mut cx, &[], &mut WaitKey::default()),
+			Poll::Ready(Err(_))
+		);
 		(readable, writable)
 	}
 }
 
-/// Pollable I/O on either side of a pump.
+/// Pollable I/O on either side of a pump. `key` is the pump's own wait on
+/// an engine object that the engine and other tasks may wait on too
+/// ([`File::poll_read_keyed`]); a copy keeps one per direction.
 pub(super) trait PollIo {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>>;
+	fn poll_read(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut WaitKey,
+	) -> Poll<io::Result<usize>>;
 	fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 	/// A write, with the mark of the chunk a writer thread took
-	/// ([`File::poll_write_marked`]; `None` when it wrote as it took).
+	/// ([`File::poll_write_keyed`]; `None` when it wrote as it took), as the
+	/// task `key` names.
 	fn poll_write_marked(
 		&mut self,
 		cx: &mut Context<'_>,
 		buf: &[u8],
+		key: &mut WaitKey,
 	) -> Poll<io::Result<(usize, Option<Mark>)>>;
 	/// Ready once the chunks of `marks` are out, with their first error
 	/// ([`File::poll_settle_marked`]).
@@ -106,11 +119,18 @@ pub(super) trait PollIo {
 }
 
 impl PollIo for End {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+	fn poll_read(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		key: &mut WaitKey,
+	) -> Poll<io::Result<usize>> {
 		match self {
-			// The pump's own read: past the object's feeds, this one among them.
-			Self::Fd(f) => f.poll_read_direct(cx, buf),
-			Self::File(f) => f.poll_read(cx, buf),
+			// The pump's own read: past the object's feeds, this one among them,
+			// and with the copy's key, so its wait stays apart from the engine's
+			// and other tasks' waits on the object.
+			Self::Fd(f) => f.poll_read_direct_keyed(cx, buf, key),
+			Self::File(f) => f.poll_read_keyed(cx, buf, key),
 		}
 	}
 
@@ -125,10 +145,11 @@ impl PollIo for End {
 		&mut self,
 		cx: &mut Context<'_>,
 		buf: &[u8],
+		key: &mut WaitKey,
 	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		match self {
-			Self::Fd(f) => f.poll_write_marked(cx, buf),
-			Self::File(f) => f.poll_write_marked(cx, buf),
+			Self::Fd(f) => f.poll_write_marked_keyed(cx, buf, key),
+			Self::File(f) => f.poll_write_keyed(cx, buf, None, key),
 		}
 	}
 
@@ -149,7 +170,12 @@ impl PollIo for End {
 }
 
 impl PollIo for OsPipe {
-	fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+	fn poll_read(
+		&mut self,
+		cx: &mut Context<'_>,
+		buf: &mut [u8],
+		_key: &mut WaitKey,
+	) -> Poll<io::Result<usize>> {
 		Self::poll_read(self, cx, buf)
 	}
 
@@ -158,6 +184,7 @@ impl PollIo for OsPipe {
 		&mut self,
 		cx: &mut Context<'_>,
 		buf: &[u8],
+		_key: &mut WaitKey,
 	) -> Poll<io::Result<(usize, Option<Mark>)>> {
 		Self::poll_write(self, cx, buf).map_ok(|n| (n, None))
 	}
@@ -196,11 +223,20 @@ struct Chunk {
 	/// The chunk a writer thread of `dst` took last: settled before the next
 	/// one goes, and its failure is `dst`'s refusal.
 	mark:  Option<Mark>,
+	/// This copy's wait on its engine-side object (only one side is one).
+	key:   WaitKey,
 }
 
 impl Chunk {
 	fn new() -> Self {
-		Self { buf: vec![0; BUF].into_boxed_slice(), start: 0, end: 0, eof: false, mark: None }
+		Self {
+			buf:   vec![0; BUF].into_boxed_slice(),
+			start: 0,
+			end:   0,
+			eof:   false,
+			mark:  None,
+			key:   WaitKey::default(),
+		}
 	}
 
 	/// Read but not written yet.
@@ -236,7 +272,7 @@ impl Chunk {
 					let _ = std::task::ready!(dst.poll_flush(cx));
 					return Poll::Ready(());
 				}
-				let read = match src.poll_read(cx, &mut self.buf) {
+				let read = match src.poll_read(cx, &mut self.buf, &mut self.key) {
 					Poll::Ready(read) => read,
 					Poll::Pending => {
 						// Nothing to copy now: what `dst` took moves on out
@@ -262,7 +298,11 @@ impl Chunk {
 			if !std::task::ready!(self.settle(cx, dst)) {
 				return Poll::Ready(());
 			}
-			match std::task::ready!(dst.poll_write_marked(cx, &self.buf[self.start..self.end])) {
+			match std::task::ready!(dst.poll_write_marked(
+				cx,
+				&self.buf[self.start..self.end],
+				&mut self.key
+			)) {
 				Ok((n, mark)) if n > 0 => {
 					self.start += n;
 					self.mark = mark;
@@ -939,6 +979,42 @@ mod tests {
 		);
 	}
 
+	// Failure mode (review of #111 at 3b9fe7ab): no test covered the pump's
+	// key. A pump copying a program's output into an engine object that the
+	// engine writes too waits there with its copy's key; with a key dropped
+	// after each poll, its wait went with it and the drain woke only the
+	// engine.
+	#[test]
+	fn a_pump_and_the_engine_waiting_for_room_are_both_woken() {
+		use std::io::Write;
+
+		use crate::sys::test_fifos::{Flag, FullFifo, drain};
+		let FullFifo { writer, mut reader } = FullFifo::new();
+		let sink = FdRef::from_file(Box::new(writer));
+		let (mut ours, child) = os::pipe(false).unwrap();
+		(&child).write_all(b"x").unwrap();
+		let mut dst = End::Fd(sink.clone());
+		let mut chunk = Chunk::new();
+		let (pump, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+		let (pw, ew) = (Waker::from(Arc::clone(&pump)), Waker::from(Arc::clone(&engine)));
+		assert!(
+			chunk
+				.poll_copy(&mut Context::from_waker(&pw), &mut ours, &mut dst)
+				.is_pending(),
+			"no room"
+		);
+		assert_eq!(chunk.pending(), b"x", "the byte read waits for room");
+		assert!(
+			sink
+				.poll_write(&mut Context::from_waker(&ew), b"y")
+				.is_pending(),
+			"no room"
+		);
+		drain(&mut reader);
+		pump.wait("the pump, waiting for room, woken by the drain");
+		engine.wait("the engine, waiting for room in the same object, woken by the same drain");
+	}
+
 	#[derive(Default)]
 	struct Woken(std::sync::atomic::AtomicBool);
 
@@ -1330,5 +1406,196 @@ mod tests {
 			.zip(0u32..)
 			.find(|(w, i)| *w != i.to_be_bytes());
 		assert!(first_wrong.is_none(), "out of order at word {:?}", first_wrong.map(|(_, i)| i));
+	}
+
+	// Failure mode: a read with a key of its own (a native extra's, zsh's
+	// multios cat's with the caller's key) went to the engine pipe past its
+	// feeds, so it took the pipe's next bytes before those a feed holds.
+	#[test]
+	fn a_keyed_read_takes_what_a_feed_holds_first() {
+		let (read, write, feed) = fed_engine_pipe();
+		let mut cx = Context::from_waker(Waker::noop());
+		let (held, next) = (&b"the feed holds these\n"[..], &b"the engine pipe's next\n"[..]);
+		assert!(matches!(write.poll_write(&mut cx, held), Poll::Ready(Ok(n)) if n == held.len()));
+		feed.poll(&cx, &mut WaitKey::default());
+		assert_eq!(
+			feed.drain.as_ref().expect("a drain").available(),
+			held.len(),
+			"the feed's OS pipe holds the first bytes"
+		);
+		assert!(matches!(write.poll_write(&mut cx, next), Poll::Ready(Ok(n)) if n == next.len()));
+		let mut key = WaitKey::default();
+		let mut buf = [0u8; 64];
+		let mut got = Vec::new();
+		while got.len() < held.len() + next.len() {
+			match read.poll_read_keyed(&mut cx, &mut buf, &mut key) {
+				Poll::Ready(Ok(n)) if n > 0 => got.extend_from_slice(&buf[..n]),
+				other => panic!("read: {other:?} after {:?}", String::from_utf8_lossy(&got)),
+			}
+		}
+		assert_eq!(
+			String::from_utf8_lossy(&got),
+			String::from_utf8_lossy(&[held, next].concat()),
+			"the feed's bytes first, then the engine pipe's"
+		);
+	}
+
+	// Failure mode: the pump read the engine object it fills an OS pipe from
+	// with no key of its own, as the engine reads it: on an object that keeps
+	// its waits by key (an OS pipe or FIFO, a provider file) the pump's wait
+	// and the engine's replaced each other, and the input woke only one.
+	#[test]
+	fn a_pump_and_the_engine_waiting_for_input_are_both_woken() {
+		use std::io::Write;
+
+		use crate::sys::{StdFile, test_fifos::Flag};
+		let (r, mut w) = io::pipe().unwrap();
+		let src =
+			FdRef::from_file(Box::new(StdFile::new(fs::File::from(std::os::fd::OwnedFd::from(r)))));
+		let mut end = End::Fd(src.clone());
+		let (pump, engine) = (Arc::new(Flag::default()), Arc::new(Flag::default()));
+		let (pw, ew) = (Waker::from(Arc::clone(&pump)), Waker::from(Arc::clone(&engine)));
+		let mut key = WaitKey::default();
+		let mut buf = [0u8; 8];
+		assert!(
+			end.poll_read(&mut Context::from_waker(&pw), &mut buf, &mut key)
+				.is_pending(),
+			"no input"
+		);
+		assert!(
+			src.poll_read(&mut Context::from_waker(&ew), &mut buf)
+				.is_pending(),
+			"no input"
+		);
+		w.write_all(b"x").unwrap();
+		engine.wait("the engine, waiting for input, woken by it");
+		// The same readiness round wakes both; 10 s only bounds a wake that
+		// never comes.
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while !pump.woken() && std::time::Instant::now() < deadline {
+			std::thread::sleep(std::time::Duration::from_millis(1));
+		}
+		assert!(
+			pump.woken(),
+			"the pump, waiting for input in the same object, was never woken: only the last wait was \
+			 kept"
+		);
+	}
+
+	// Failure mode: two tasks read one fed pipe while the pump's write is in
+	// hand and the OS pipe is empty, so both wait on the feed's drain. If the
+	// drain keeps one readiness registration, the second task's replaces the
+	// first's, and when the pump's bytes land in the pipe only the second
+	// task is woken: the first waits until something else wakes it, and
+	// where nothing does (an extra reading on a tokio task of its own beside
+	// the shell), never. Every task that waits on the drain must be woken
+	// once the pipe holds bytes.
+	#[test]
+	fn every_task_waiting_on_a_feed_is_woken_when_its_bytes_come() {
+		let (read, write, feed) = fed_engine_pipe();
+		let mut cx = Context::from_waker(Waker::noop());
+		let bytes = b"bytes for two readers\n";
+		assert!(matches!(write.poll_write(&mut cx, bytes), Poll::Ready(Ok(n)) if n == bytes.len()));
+		feed
+			.state
+			.lock()
+			.pipe
+			.as_mut()
+			.expect("the pump's end")
+			.hold_writes(true);
+		let mut key = WaitKey::default();
+		feed.poll(&cx, &mut key);
+		assert_eq!(feed.state.lock().chunk.pending(), bytes, "the pump holds the bytes");
+		assert_eq!(feed.drain.as_ref().expect("a drain").available(), 0, "the OS pipe is empty");
+		// Two readers, each with a waker of its own, each waiting on the feed.
+		let first = Arc::new(Woken::default());
+		let second = Arc::new(Woken::default());
+		let mut buf = [0u8; 64];
+		for reader in [&first, &second] {
+			let waker = Waker::from(Arc::clone(reader));
+			let mut rcx = Context::from_waker(&waker);
+			assert!(
+				read.poll_read(&mut rcx, &mut buf).is_pending(),
+				"the pump's bytes are not in the pipe yet"
+			);
+		}
+		// The pump's write is let go and made: its bytes land in the OS pipe.
+		feed
+			.state
+			.lock()
+			.pipe
+			.as_mut()
+			.expect("the pump's end")
+			.hold_writes(false);
+		feed.poll(&cx, &mut key);
+		let woke = |w: &Woken| w.0.load(std::sync::atomic::Ordering::SeqCst);
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		while !(woke(&first) && woke(&second)) && std::time::Instant::now() < deadline {
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		assert_eq!(
+			feed.drain.as_ref().expect("a drain").available(),
+			bytes.len(),
+			"the pump's bytes are in the pipe"
+		);
+		assert!(woke(&second), "the second reader was woken within 5 s");
+		assert!(
+			woke(&first),
+			"the first reader was woken within 5 s: its wait was not replaced by the second's"
+		);
+		assert_eq!(read_all(&read, &[&feed], bytes.len()), bytes, "the pump's bytes, once");
+	}
+
+	// Failure mode: the drain's one readiness registration fires once and is
+	// then forgotten by the readiness thread. A wait that comes after it
+	// fired must register again; if it keeps the fired registration (or
+	// registers only when it holds none), the next bytes wake nobody. Two
+	// rounds of wait, bytes, read: the reader is woken in each.
+	#[test]
+	fn a_wait_after_the_drains_registration_fired_is_woken_too() {
+		let (read, write, feed) = fed_engine_pipe();
+		let mut cx = Context::from_waker(Waker::noop());
+		let mut key = WaitKey::default();
+		let mut buf = [0u8; 64];
+		let hold = |on: bool| {
+			feed
+				.state
+				.lock()
+				.pipe
+				.as_mut()
+				.expect("the pump's end")
+				.hold_writes(on);
+		};
+		for round in 0..2u8 {
+			let bytes = [b'a' + round; 8];
+			assert!(matches!(write.poll_write(&mut cx, &bytes), Poll::Ready(Ok(8))));
+			hold(true);
+			feed.poll(&cx, &mut key);
+			assert_eq!(
+				feed.state.lock().chunk.pending(),
+				&bytes[..],
+				"round {round}: the pump holds the bytes"
+			);
+			let woken = Arc::new(Woken::default());
+			let waker = Waker::from(Arc::clone(&woken));
+			let mut rcx = Context::from_waker(&waker);
+			assert!(
+				read.poll_read(&mut rcx, &mut buf).is_pending(),
+				"round {round}: nothing in the pipe yet"
+			);
+			hold(false);
+			feed.poll(&cx, &mut key);
+			let woke = || woken.0.load(std::sync::atomic::Ordering::SeqCst);
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+			while !woke() && std::time::Instant::now() < deadline {
+				std::thread::sleep(std::time::Duration::from_millis(5));
+			}
+			assert!(woke(), "round {round}: the reader was woken within 5 s");
+			assert_eq!(
+				read_all(&read, &[&feed], bytes.len()),
+				bytes.to_vec(),
+				"round {round}: the bytes, once"
+			);
+		}
 	}
 }

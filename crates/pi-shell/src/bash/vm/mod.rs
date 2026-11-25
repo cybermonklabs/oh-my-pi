@@ -28,6 +28,10 @@ mod probe;
 mod proc;
 pub mod quote;
 mod redir;
+/// Test only: a tee's hold, which the session's tee tests size their
+/// writes by.
+#[cfg(test)]
+pub(crate) use redir::TEE_HOLD;
 mod state;
 mod xtrace;
 mod zle;
@@ -441,7 +445,7 @@ pub struct Shell {
 	k:         Kernel,
 	/// Boxed: a `Vproc` is ~650 bytes and the vector doubles, so idle
 	/// subshells would pay up to twice that in spare capacity (target:
-	/// ≤ 2 KiB per idle vproc).
+	/// ≤ 2,048 B per idle vproc back to back).
 	#[expect(clippy::vec_box, reason = "slack capacity of 8-byte slots, not of whole vprocs")]
 	procs:     Vec<Box<Vproc>>,
 	rr:        usize,
@@ -535,7 +539,8 @@ pub struct Kernel {
 	/// [`Kernel::proc_collect`]). Boxed as `Shell::procs` holds them:
 	/// adoption moves pointers, and the capacity a burst leaves behind is 8
 	/// bytes a slot, not a whole vproc (`cmd &` in a loop spawns ~200 per
-	/// slice: that kept ~600 bytes per idle vproc; the target is ≤ 2 KiB).
+	/// slice: that kept ~600 bytes per idle vproc; the target is ≤ 2,048 B back
+	/// to back).
 	#[expect(clippy::vec_box, reason = "slack capacity of 8-byte slots, not of whole vprocs")]
 	pub spawned:            Vec<Box<Vproc>>,
 	/// The records an asynchronous command's signal ignores
@@ -589,8 +594,8 @@ pub struct Kernel {
 	/// The empty document an async command without job control reads as
 	/// `/dev/null`, shared by all of them (it never yields a byte, so one
 	/// object serves every reader): an fd object and two buffers less per
-	/// background vproc (idle vproc ≤ 2 KiB). Not imaged (a restored
-	/// child keeps its own object).
+	/// background vproc (idle vproc ≤ 2,048 B back to back). Not imaged (a
+	/// restored child keeps its own object).
 	pub null_input:         Option<FdRef>,
 	/// `(label, caller)`: the labeled subshell trees host callouts started
 	/// ([`ShellApi::run_subshell_in`]) and the vproc that ran each callout;
@@ -2790,7 +2795,13 @@ impl Shell {
 		}
 		exec::unwind(&mut self.k.root, cx.store, p, 0);
 		while state::drop_scope(&mut self.k.root, cx.store, p) {}
-		p.out.clear();
+		// Queued output may be part way under its key (`Vproc::out_key`): it
+		// goes with the key, as a dropped op's does ([`exec::drop_scratch`]).
+		if !p.out.is_empty() {
+			p.out.clear();
+			p.out_key = None;
+			p.write_key = proc::WriteKey::default();
+		}
 		p.blocked = None;
 		p.stopped = false;
 		p.status = status;
@@ -3036,8 +3047,19 @@ impl Shell {
 				if !ignored {
 					let process = &mut self.procs[i];
 					process.pending_traps = process.pending_traps.with(sig);
-					if !process.waiting_foreground() {
+					// A `CHLD` or `WINCH` trap waits while the command it would
+					// interrupt writes; another runs now, under its own key
+					// ([`Vproc::holds_trap`]).
+					if !process.holds_trap(sig) {
 						process.blocked = None;
+					}
+					#[cfg(test)]
+					if matches!(sig, Signal::Chld | Signal::Winch) && process.writing_now() {
+						self
+							.k
+							.engine
+							.traps_held()
+							.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 					}
 					// bash: a trapped signal ends the `wait` builtin with 128 + n
 					// (then the trap runs); `SIGCHLD` does not.
@@ -3295,8 +3317,17 @@ pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, background: bool
 	if trapped {
 		p.jobs.chld += 1;
 		p.pending_traps = p.pending_traps.with(Signal::Chld);
-		if !p.waiting_foreground() {
+		// While the command the trap would interrupt is part way in a write,
+		// the vproc stays as it is: the trap runs once the write ends
+		// ([`Vproc::holds_trap`]).
+		if !p.holds_trap(Signal::Chld) {
 			p.blocked = None;
+		}
+		#[cfg(test)]
+		if p.writing_now() {
+			k.engine
+				.traps_held()
+				.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		}
 	}
 }
@@ -3579,6 +3610,10 @@ impl Vproc {
 			mode: ModeId::Bash,
 			zsh: None,
 			zle: None,
+			// A key of its own, a subshell's too (`child_running`).
+			write_key: proc::WriteKey::default(),
+			trap_keys: Vec::new(),
+			out_key: None,
 		}
 	}
 
@@ -3720,7 +3755,7 @@ impl Vproc {
 					.is_some_and(|op| op.flags & ir::Op::COND != 0)
 		});
 		// Room for exactly this frame: a `Frame` is ~300 bytes and a first
-		// push reserves four (idle vproc ≤ 2 KiB); calls grow it.
+		// push reserves four (idle vproc ≤ 2,048 B back to back); calls grow it.
 		vp.frames.reserve_exact(1);
 		vp.frames.push(frame);
 		vp

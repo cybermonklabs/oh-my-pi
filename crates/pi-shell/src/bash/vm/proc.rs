@@ -95,8 +95,7 @@ pub struct Vproc {
 	/// nested shell) in its low 24 bits ([`super::subshell_depth`]), and the
 	/// vproc's [`Fork`] in its top byte ([`Vproc::fork`]). A field, not an
 	/// image record: a record would cost every subshell a ~530-byte map
-	/// allocation (idle vproc ≤ 2 KiB, which leaves no byte for a field of
-	/// its own).
+	/// allocation (idle vproc ≤ 2,048 B back to back).
 	pub subshell:      u32,
 	/// Loops of the shell that forked this vproc that its code runs inside
 	/// (bash's inherited `loop_level`, zsh's `loops`), set by
@@ -145,6 +144,25 @@ pub struct Vproc {
 	/// Inherited (copied) by children; never serialized: a restored shell
 	/// starts with zsh's defaults and no line in progress.
 	pub zle:           Option<Box<super::zle::Zle>>,
+	/// The key this vproc writes with ([`crate::sys::WaitKey`]): an object
+	/// that several writers write at once (a zsh multios tee, a provider
+	/// file) keeps each writer's progress by it. Every vproc has its own: a
+	/// subshell gets a new one, never its parent's; each trap run writes
+	/// with a new one ([`Self::trap_keys`]); and a host callout writes with
+	/// a key of the call's own ([`super::api::ShellApi::write_keyed`]).
+	/// Never serialized.
+	pub write_key:     WriteKey,
+	/// The keys the running traps interrupted, innermost last: a trap
+	/// starts with a new [`Self::write_key`] (a command it interrupted may
+	/// have a write part way under the old one), and popping its frame puts
+	/// the old key back. Never serialized (a restored trap frame finds none
+	/// and leaves the key as it is).
+	pub trap_keys:     Vec<WriteKey>,
+	/// The key the first write in [`Self::out`] goes on with once it is part
+	/// way: a key change meanwhile (a trap's, a dropped command's) does not
+	/// move it, so its targets go on from where they got; a suspended job
+	/// takes both. Never serialized (a restored queue starts again).
+	pub out_key:       Option<WriteKey>,
 }
 
 /// A `break` or `continue` that ran inside `${ }` or `${| }`
@@ -249,6 +267,10 @@ impl Vproc {
 		self.subshell = (self.subshell & SUBSHELL_DEPTH) | ((fork.0 as u32) << 24);
 	}
 }
+
+/// [`Vproc::write_key`], behind an `Arc` so a write site can hold it while
+/// it borrows other parts of the vproc; never shared with another vproc.
+pub type WriteKey = Arc<parking_lot::Mutex<crate::sys::WaitKey>>;
 
 /// The terminal of the session a vproc runs in when it is not the shell's
 /// ([`VprocZsh::ctty`]).
@@ -805,7 +827,7 @@ impl JobTable {
 /// background job, a process substitution, a coprocess) and the
 /// OS pid of the program it runs, once known ([`Job::os_pid`]). Two words,
 /// zero meaning none (no vpid or OS pid is zero): an `Option` pair would
-/// grow every vproc (idle vproc ≤ 2 KiB).
+/// grow every vproc (idle vproc ≤ 2,048 B back to back).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastBg {
 	vpid: u32,
@@ -1079,6 +1101,38 @@ impl Vproc {
 		};
 		ours.then_some(v)
 	}
+
+	/// Whether a trap for `sig` waits before it runs: while the vproc waits
+	/// for a foreground command ([`Self::waiting_foreground`]), and, for
+	/// `SIGCHLD` and `SIGWINCH`, while the command it would interrupt is part
+	/// way in a write ([`Self::writing_now`]). bash 5.2/5.3 and zsh 5.9 run a
+	/// `CHLD` trap after the command's write; inside another trap's action
+	/// they run it between that action's commands, so a trap that waits for
+	/// the `CHLD` trap's work goes on, and so does this shell. They run a
+	/// `WINCH` trap after the write too: its bytes come after all of the
+	/// command's, and its marker on the terminal shows only once the reader
+	/// drains (bash 5.2.21 and 5.3.20 interactive and with `-c`, zsh 5.9
+	/// interactive, to a FIFO and through a multios). Another trap (`USR1`)
+	/// runs at once, in bash and zsh and here, under a key of the trap's own
+	/// ([`Self::trap_keys`]), so the interrupted write keeps its progress.
+	pub fn holds_trap(&self, sig: crate::bash::signal::Signal) -> bool {
+		use crate::bash::signal::Signal;
+		self.waiting_foreground()
+			|| (matches!(sig, Signal::Chld | Signal::Winch) && self.writing_now())
+	}
+
+	/// Whether the vproc is parked on a write ([`WaitKey::Write`]).
+	pub const fn parked_on_write(&self) -> bool {
+		matches!(self.blocked, Some(Blocked { key: WaitKey::Write { .. }, .. }))
+	}
+
+	/// Whether the command a trap would interrupt now is part way in a
+	/// write: the vproc is parked on one, or the top frame's op is
+	/// ([`FrameFlags::write_parked`]). A write that a trap interrupted is in a
+	/// frame below that trap's and does not count while the trap runs.
+	pub fn writing_now(&self) -> bool {
+		self.parked_on_write() || self.frames.last().is_some_and(|f| f.flags.write_parked())
+	}
 }
 
 /// Why a vproc is parked, and the wake count it parked at.
@@ -1292,14 +1346,16 @@ impl FrameKind {
 	}
 }
 
-/// Bits of a [`Frame`] that only a vproc's base frame or a run's first frame
-/// sets, two in one byte ([`Frame::flags`]).
+/// Bits of a [`Frame`] in one byte ([`Frame::flags`]): two that only a
+/// vproc's base frame or a run's first frame sets, and
+/// [`Self::write_parked`], which any frame's op sets.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameFlags(u8);
 
 impl FrameFlags {
 	const COMMAND_LOOP: u8 = 1;
 	const NO_DEBUG_TRAP: u8 = 2;
+	const WRITE_PARKED: u8 = 4;
 
 	/// The base frame of a fork: a fatal error in it, run as a forked
 	/// simple command, reaches bash's command loop when its forking
@@ -1323,6 +1379,17 @@ impl FrameFlags {
 		self.0 & Self::NO_DEBUG_TRAP != 0
 	}
 
+	/// The op at the pc is parked on a write ([`WaitKey::Write`]): its
+	/// bytes may be part way under the vproc's write key
+	/// ([`Vproc::write_key`]), which a zsh multios tee keeps its progress
+	/// by. Dropping the op gives the vproc a new key
+	/// ([`super::exec::forget_parked_write`]). Set after each step of the op
+	/// ([`super::exec::run_slice`]); never serialized.
+	#[must_use]
+	pub const fn write_parked(self) -> bool {
+		self.0 & Self::WRITE_PARKED != 0
+	}
+
 	/// Sets [`Self::command_loop`].
 	pub const fn set_command_loop(&mut self, on: bool) {
 		self.set(Self::COMMAND_LOOP, on);
@@ -1331,6 +1398,11 @@ impl FrameFlags {
 	/// Sets [`Self::no_debug_trap`].
 	pub const fn set_no_debug_trap(&mut self, on: bool) {
 		self.set(Self::NO_DEBUG_TRAP, on);
+	}
+
+	/// Sets [`Self::write_parked`].
+	pub const fn set_write_parked(&mut self, on: bool) {
+		self.set(Self::WRITE_PARKED, on);
 	}
 
 	const fn set(&mut self, bit: u8, on: bool) {
@@ -1384,9 +1456,10 @@ pub struct Frame {
 	/// `set -e` is ignored: an `if`/`while`/`until` condition, a `&&`/`||`
 	/// list except its last command, a `!` pipeline.
 	pub ignore_errexit:    bool,
-	/// Bits of a base frame ([`FrameFlags`]). One byte: it takes the padding
-	/// byte after `Frame`'s fields smaller than 8 B (two `u32`s, two
-	/// `Option<u32>`s and seven `bool`s: 31 B), so `Frame` keeps its size.
+	/// Bits of a frame ([`FrameFlags`]).
+	/// One byte: it takes the padding byte after `Frame`'s fields smaller
+	/// than 8 B (two `u32`s, two `Option<u32>`s and seven `bool`s: 31 B), so
+	/// `Frame` keeps its size.
 	pub flags:             FrameFlags,
 	/// The base frame of a `( … )` child: the line bash reports for errors
 	/// of the compound commands it runs directly (the subshell's last line,
@@ -1396,7 +1469,7 @@ pub struct Frame {
 	/// when the function made `OPTIND` local (bash
 	/// `sh_getopt_save_istate`/`sh_getopt_restore_istate`). `None` is the
 	/// default state: no allocation per call, and 40 bytes less per frame
-	/// (idle vproc ≤ 2 KiB).
+	/// (idle vproc ≤ 2,048 B back to back).
 	pub getopts:           Option<Box<GetoptsState>>,
 }
 
@@ -1697,8 +1770,8 @@ impl Scratch {
 /// probes, PATH search, fd reads and pathname-expansion walks. Most ops need
 /// none of it (an idle background job's parked `Exec` neither), so a
 /// [`Scratch`] holds it boxed and creates it on first use: 232 bytes less per
-/// scratch (idle vproc ≤ 2 KiB). A recycled scratch keeps it cleared, so
-/// an op that redirects or probes in a loop allocates it once.
+/// scratch (idle vproc ≤ 2,048 B back to back). A recycled scratch keeps it
+/// cleared, so an op that redirects or probes in a loop allocates it once.
 #[derive(Default)]
 pub struct ScratchIo {
 	/// Progress of a `Redir` op or the redirection stage of an `Exec`.
@@ -2252,27 +2325,35 @@ impl Live {
 	}
 }
 
-// Size guards for the idle-vproc target (≤ 2 KiB): an idle background job
-// holds one boxed `Vproc`, one `Frame`, one boxed `Scratch` and one boxed
-// `ExecState`, so every byte here is a byte per idle vproc. Raise a bound
-// only with the testkit `memory` bench's numbers in hand.
-// zsh support added the boxed zsh side table `Vproc::zsh` (8 B; `Frame` is
-// unchanged, its zsh state lives there and in `FrameKind`): the memory
-// bench measured 1,785 B per idle vproc with it (target ≤ 2,048).
-// Host lineage (`Vproc::lineage`, 8 B: a `u32` label and a flag) added at
-// most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
-// (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
-// vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B. The forking shell's loop count
-// (`Vproc::outer_loops`) is a `u16` beside a `u16` `Vproc::trap_frames`,
-// in the 4 bytes `trap_frames` had; a `break` waiting in `${ }`
-// (`Vproc::pending_break`, boxed, 8 B) brings it to at most 1,848 B, and
-// bash's kept statuses (`JobTable::bgp`, one pointer, `None` while empty)
-// to at most 1,856 B.
-const _: () = assert!(size_of::<Vproc>() <= 688, "Vproc grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
+// Size guards for the idle-vproc targets (the testkit `memory` bench's
+// `MAX_VPROC_NOWRITE_BYTES`, 2,048 B, and `MAX_RETAINED_BYTES`, which
+// say how they were set): an idle background job holds one boxed `Vproc`,
+// one `Frame`, one boxed `Scratch` and one boxed `ExecState`, so every byte
+// here is a byte per idle vproc.
+// Raise a bound only with the bench's numbers in hand. Each of these added
+// a pointer or less: the boxed zsh side table `Vproc::zsh` (`Frame` is
+// unchanged, its zsh state lives there and in `FrameKind`), host lineage
+// (`Vproc::lineage`, a `u32` label and a flag), the resumable `mapfile -C`
+// counter (`ExecState::resumed`, 368 → 376 B), the line editor's boxed
+// state (`Vproc::zle`), the forking shell's loop count (`Vproc::outer_loops`,
+// a `u16` in the 4 bytes beside `Vproc::trap_frames`), a `break` waiting in
+// `${ }` (`Vproc::pending_break`, boxed) and bash's kept statuses
+// (`JobTable::bgp`, `None` while empty). Each vproc's write key
+// (`Vproc::write_key`, 8 B and one allocation of 64-71 B), the keys traps
+// interrupted (`Vproc::trap_keys`, an empty `Vec`, 24 B and no allocation)
+// and the key a part-way queued write goes on with (`Vproc::out_key`, 8 B,
+// no allocation while idle) added 40 B of `Vproc` and 104 B per idle vproc.
+// The bench at Cut10 chain step 5 (a460228e): `Vproc` 696 B, `Frame` 256 B,
+// `Scratch` 216 B, `ExecState` 376 B; 2,013 B per idle vproc forked with no
+// write by the shell between the forks, and 2,213 to 2,321 B with the
+// bench's loop, whose `i` each fork keeps an earlier copy of (its image
+// shares the shell's maps).
+const _: () = assert!(size_of::<Vproc>() <= 728, "Vproc grew (idle vproc ≤ 2,048 B back to back)");
+const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2,048 B back to back)");
+const _: () =
+	assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2,048 B back to back)");
+const _: () =
+	assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2,048 B back to back)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one
 // pointer only; `RedirProgress` not at all).
@@ -2295,7 +2376,7 @@ pub const fn vproc_layout() -> [(&'static str, usize); 5] {
 
 #[cfg(test)]
 mod tests {
-	use super::{BGP_MAX, JobTable};
+	use super::{BGP_MAX, FrameFlags, JobTable};
 	use crate::bash::ids::Vpid;
 
 	// Failure mode: past `BGP_MAX` the status of the smallest vproc number
@@ -2319,6 +2400,36 @@ mod tests {
 		assert_eq!(gone.map(|s| s.vpid), Some(Vpid(top - 2)));
 		assert_eq!(jobs.bgp_search(Vpid(top - 1)), Some(3));
 		assert_eq!(jobs.bgp.as_ref().map_or(0, |list| list.len()), BGP_MAX);
+	}
+
+	/// Each of [`FrameFlags`]'s bits with its getter and setter.
+	type Bit = (&'static str, fn(FrameFlags) -> bool, fn(&mut FrameFlags, bool));
+	const BITS: [Bit; 3] = [
+		("command_loop", FrameFlags::command_loop, FrameFlags::set_command_loop),
+		("no_debug_trap", FrameFlags::no_debug_trap, FrameFlags::set_no_debug_trap),
+		("write_parked", FrameFlags::write_parked, FrameFlags::set_write_parked),
+	];
+
+	// Failure mode: two of a frame's flags share a bit, a getter reads
+	// another flag's bit, or a setter does not clear what it set: a frame
+	// then reads a flag nobody set (a parked write where none is, so a `CHLD`
+	// trap waits; a forked command's fatal error that ends the wrong shell).
+	// Each flag alone set reads set, and only it; cleared again, none does.
+	#[test]
+	fn each_frame_flag_is_its_own_bit() {
+		assert!(BITS.iter().all(|(_, get, _)| !get(FrameFlags::default())), "a flag set at first");
+		for (name, _, set) in BITS {
+			let mut flags = FrameFlags::default();
+			set(&mut flags, true);
+			let on: Vec<&str> = BITS
+				.iter()
+				.filter(|(_, get, _)| get(flags))
+				.map(|(n, ..)| *n)
+				.collect();
+			assert_eq!(on, [name], "{name} set alone");
+			set(&mut flags, false);
+			assert_eq!(flags, FrameFlags::default(), "{name} set, then cleared");
+		}
 	}
 }
 

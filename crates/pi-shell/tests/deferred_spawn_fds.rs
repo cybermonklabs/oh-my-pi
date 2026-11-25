@@ -126,6 +126,41 @@ fn a_deferred_spawn_holds_no_fd_its_redirections_close_or_replace() {
 	assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// fd 4 a here-string, which the engine keeps in memory: an external handed
+/// fd 4 gets it through a pipe the engine fills from the here-string's own
+/// position. A, whose `< fifo` open waits, is spawned with `@FD4@`; the
+/// shell then reads fd 4 itself and must find `x`, as in bash, whose A
+/// applies `@FD4@` and never reads fd 4.
+const HERE_STRING: &str = r#"
+exec 4<<<x
+/bin/cat < "$D/fifo" > /dev/null @FD4@ &
+@OPEN@
+read -r v <&4
+echo "v=$v"
+exec 6>&-
+"#;
+
+// Failure mode: a deferred spawn was handed fd 4 though its own
+// redirections close or replace it: for a here-string on fd 4 the engine
+// then moves the here-string's bytes into the spawn's pipe, which the child
+// never reads, and the shell's own `read` of fd 4 finds them gone.
+#[test]
+fn a_deferred_spawn_takes_no_here_string_its_redirections_close_or_replace() {
+	let mut wrong = Vec::new();
+	for (name, shell) in shells() {
+		for (row, fd4, open) in ROWS {
+			let open = if *open { "exec 6> \"$D/fifo\"" } else { ":" };
+			match run(&shell, &HERE_STRING.replace("@FD4@", fd4).replace("@OPEN@", open)) {
+				Ok(line) if line == "v=x" => {},
+				got => {
+					wrong.push(format!("{name} {row}: {got:?}, want v=x (A took fd 4's here-string)"));
+				},
+			}
+		}
+	}
+	assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// An fd the child reads, or keeps, is still handed over. Each redirection
 /// that reads fd 4 or 5 comes after the waiting `> fifo`, so the child
 /// applies it itself: fd 4 kept as it is; `3<&5 5<&-`, where fd 5 is read

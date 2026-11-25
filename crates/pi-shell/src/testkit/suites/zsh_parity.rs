@@ -582,6 +582,20 @@ fn trace_debug_trap_setting_errexit_skips_the_list() {
 	assert_eq!((out.as_str(), err.as_str(), st), ("one\nthree\n1\n", "", 0));
 }
 
+// Failure mode: a DEBUG trap gave `ERR_EXIT` back other than as it was when
+// the trap started (`Frame::debug_errexit`): off before the trap, the next
+// failing command ended the shell; on, it did not.
+#[test]
+fn trace_debug_trap_puts_errexit_back_as_it_was() {
+	let (out, err, st) = zsh("fn() { trap 'true' DEBUG; false; echo after $?; }; fn");
+	assert_eq!((out.as_str(), err.as_str(), st), ("after 1\n", "", 0), "errexit off");
+	let (out, err, st) = zsh(
+		"fn() { setopt localoptions errexit; trap 'true' DEBUG; false; echo after; }; fn; echo out \
+		 $?",
+	);
+	assert_eq!((out.as_str(), err.as_str(), st), ("", "", 1), "errexit on");
+}
+
 #[test]
 fn trace_debug_trap_without_debug_before_cmd_runs_after_each_list() {
 	let (out, err, st) = zsh(
