@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { SessionStoreMasker } from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
-import { BlobStore, type SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import { BLOB_PREFIX, BlobStore, type SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import { convertToColdEntry, isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import { ColdEntryStore } from "@oh-my-pi/pi-coding-agent/session/cold-entry-store";
 import type { RuntimeIdentity } from "@oh-my-pi/pi-coding-agent/session/runtime-identity";
@@ -15,7 +15,11 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { maskSessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entry-mask";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { persistedEntryText, prepareEntryForPersistence } from "@oh-my-pi/pi-coding-agent/session/session-persistence";
+import {
+	entryRecordText,
+	persistedEntryText,
+	prepareEntryForPersistence,
+} from "@oh-my-pi/pi-coding-agent/session/session-persistence";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import {
 	getBlobsDir,
@@ -597,6 +601,42 @@ describe("cold entry store", () => {
 
 		const line = JSON.parse(persistedEntryText(entry, new BlobStore(dir.path())));
 		expect(nestingOf(line.message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "123" } });
+	});
+
+	// A cold record holds an entry's images as blob references, as its session line does, at any depth.
+	it("puts the image at the bottom of an entry nested deeper than JSON.stringify recurses in the blob store for its cold record", () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const image = Buffer.alloc(3000, 7).toString("base64");
+		const entry: SessionEntry = {
+			type: "message",
+			id: "r1",
+			parentId: null,
+			timestamp: TIMESTAMP,
+			message: {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "inspect",
+				content: [{ type: "text", text: "r1" }],
+				details: deepDetails({ content: [{ type: "image", data: image, mimeType: "image/png" }] }),
+				isError: false,
+				timestamp: 2,
+			},
+		};
+
+		const text = entryRecordText(entry, new BlobStore(dir.path()));
+		expect(text).not.toContain(image);
+		expect(nestingOf(JSON.parse(text).message.details)).toEqual({
+			levels: DEEP_LEVELS,
+			bottom: {
+				content: [
+					{
+						type: "image",
+						data: expect.stringMatching(new RegExp(`^${BLOB_PREFIX}[0-9a-f]{64}$`)),
+						mimeType: "image/png",
+					},
+				],
+			},
+		});
 	});
 
 	it("resumes entries carrying a runtime nested deeper than JSON.stringify recurses, and reads it back", async () => {

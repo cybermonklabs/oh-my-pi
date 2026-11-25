@@ -778,37 +778,78 @@ function preparedEntry(entry: FileEntry, blobStore: BlobStore, shape: PersistedS
 }
 
 /**
+ * One walk of {@link externalizedImagesNode}: its blob store, the containers it
+ * is inside (a cycle fails), and the deepest level it reached.
+ */
+interface ExternalizeWalk {
+	readonly blobStore: BlobStore;
+	readonly path: ContainerPath;
+	deepest: number;
+}
+
+/**
  * `value` with each image payload a persisted line externalizes (content image
  * blocks, `images[]`, snapcompact frames, image data URLs, generated images)
  * replaced by its blob reference, and nothing else changed. A block a persisted
  * line keeps verbatim ({@link isAtomicPersistenceNode}) keeps its images inline,
- * as the line does. Untouched subtrees are shared.
+ * as the line does. Untouched subtrees are shared. The walk keeps its own
+ * stack ({@link runNested}), so it reaches the images of a value of any depth
+ * `JSON.parse` reads; past {@link DEEP_JSON_LEVELS} levels it sets `shape.deep`.
  */
-function externalizeImagesOnly(value: unknown, blobStore: BlobStore, key?: string): unknown {
-	const image = externalizeImageNode(value, blobStore, key);
+function externalizeImagesOnly(value: unknown, blobStore: BlobStore, shape: PersistedShape): unknown {
+	const image = externalizeImageNode(value, blobStore, undefined);
 	if (image !== undefined) return image;
-	if (typeof value !== "object" || value === null) return value;
+	if (!isContainer(value)) return value;
+	const walk: ExternalizeWalk = { blobStore, path: new ContainerPath(), deepest: 0 };
+	const externalized = runNested(externalizedImagesNode(value, undefined, walk, 0));
+	if (walk.deepest > DEEP_JSON_LEVELS) shape.deep = true;
+	return externalized;
+}
+
+/** {@link externalizeImagesOnly} of `value`, an object under `key` of its holder at `depth` levels. */
+function* externalizedImagesNode(
+	value: object,
+	key: string | undefined,
+	walk: ExternalizeWalk,
+	depth: number,
+): NestedWalk {
+	if (depth > walk.deepest) walk.deepest = depth;
 	if (isAtomicPersistenceNode(value, key)) return value;
+	walk.path.enter(value);
 	if (Array.isArray(value)) {
 		let changed: unknown[] | undefined;
 		for (let index = 0; index < value.length; index++) {
 			const item: unknown = value[index];
-			const next = externalizeImagesOnly(item, blobStore, key);
+			const image = externalizeImageNode(item, walk.blobStore, key);
+			const next =
+				image !== undefined
+					? image
+					: isContainer(item)
+						? yield externalizedImagesNode(item, key, walk, depth + 1)
+						: item;
 			if (next === item) continue;
 			changed ??= value.slice();
 			changed[index] = next;
 		}
+		walk.path.leave(value);
 		return changed ?? value;
 	}
 	let changed: Record<string, unknown> | undefined;
 	for (const childKey in value) {
 		if (!Object.hasOwn(value, childKey)) continue;
 		const child: unknown = Reflect.get(value, childKey);
-		const next = externalizeImagesOnly(child, blobStore, childKey);
+		const image = externalizeImageNode(child, walk.blobStore, childKey);
+		const next =
+			image !== undefined
+				? image
+				: isContainer(child)
+					? yield externalizedImagesNode(child, childKey, walk, depth + 1)
+					: child;
 		if (next === child) continue;
 		changed ??= { ...value };
 		changed[childKey] = next;
 	}
+	walk.path.leave(value);
 	return changed ?? value;
 }
 
@@ -819,36 +860,26 @@ function externalizeImagesOnly(value: unknown, blobStore: BlobStore, key?: strin
  * parsing the text and resolving its blob references gives the entry back,
  * but for snapcompact frames, which resolving leaves as references where the
  * entry may have held their base64 data; their readers resolve a reference as
- * they read it (`lazyImageDataSync`). Where the images cannot be replaced (the
- * walk runs out of stack on a value nested deeper than it recurses, or the
- * blob store cannot take an image, as on a full disk), the text is the
- * entry's JSON with its images inline, which parses back to the entry as
- * well. Throws only for a value JSON cannot write: a cycle, a getter or
- * `toJSON` that throws, or a text longer than the engine's longest string
- * (2^31 - 1 units). A value parsed from a transcript line holds none of the
- * first two, and the last needs a line about that long.
+ * they read it (`lazyImageDataSync`). An entry nested past
+ * {@link DEEP_JSON_LEVELS} levels is written by `stringifyJsonIteratively`, as
+ * its session line is. Where the blob store cannot take an image (a full
+ * disk), the text is the entry's JSON with its images inline, which parses
+ * back to the entry as well. Throws only for a value JSON cannot write: a
+ * cycle, a getter or `toJSON` that throws, or a text longer than the engine's
+ * longest string (2^31 - 1 units). A value parsed from a transcript line holds
+ * none of the first two, and the last needs a line about that long.
  */
 export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string {
+	const shape: PersistedShape = { deep: false };
 	let externalized: unknown;
 	try {
-		externalized = externalizeImagesOnly(entry, blobStore);
+		externalized = externalizeImagesOnly(entry, blobStore, shape);
 	} catch (error) {
-		let json: string | undefined;
-		if (error instanceof RangeError) {
-			// The walk ran out of stack, so `JSON.stringify` would take seconds on
-			// the entry or run out too: the writer that keeps its own stack writes it.
-			try {
-				json = stringifyJsonIteratively(entry, BIGINT_AS_STRING);
-			} catch {
-				throw error;
-			}
-			if (json === undefined) throw error;
-			return json;
-		}
 		// A library object in `details` can carry a getter that throws when the
 		// walk probes it (see prepareEntryForPersistence); its plain JSON has none,
 		// and the walk replaces the images in that. A value JSON cannot write
 		// fails here: the first error is kept.
+		let json: string | undefined;
 		try {
 			json = stringifyDeepJson(entry, BIGINT_AS_STRING);
 		} catch {
@@ -856,11 +887,11 @@ export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string 
 		}
 		if (json === undefined) throw error;
 		try {
-			externalized = externalizeImagesOnly(JSON.parse(json), blobStore);
+			externalized = externalizeImagesOnly(JSON.parse(json), blobStore, shape);
 		} catch {
-			// The walk fails on the clone too: an image the blob store cannot take (a full disk), or the depth.
+			// The walk fails on the clone too: an image the blob store cannot take (a full disk).
 			return json;
 		}
 	}
-	return stringifyDeepJson(externalized, BIGINT_AS_STRING) ?? "null";
+	return persistedJson(externalized, shape);
 }
