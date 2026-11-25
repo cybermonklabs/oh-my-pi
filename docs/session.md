@@ -458,6 +458,9 @@ when no model of the chain is known and approved. These fields
 are preserved in anonymized exports under the same flag, model-identity and
 effort rules as other session metadata.
 `isolated: true` marks an isolation-worktree child that cannot be cold-revived.
+`retryFallback.exclusive: true` marks a child whose named model was held to its own list
+(`task.namedModelFallback: false`); cold revival of a file without `spawnSpec` keeps that hold,
+and `spawnSpec` records it as `exclusiveRetryFallbackRole`.
 `mountedTools` names the entries of `tools` presented as `xd://` devices rather than top-level
 tools; cold revival mounts them again, so the revived session sends the same tool list and tool
 inventory. Files without it revive every name in `tools` top-level, and a seance restore uses its
@@ -473,8 +476,9 @@ that goes out with that change: a cold revive holds nothing, so it sends that pr
 the held one, as a held settings change's hidden settings notice announced.
 Older files store one joined string, which revives as a single block.
 `spawnSpec` (absent from older files, a seance consult and a `/tan` clone) records, as plain data
-with a version `v`, the inputs the subagent was spawned with: the exact model it started on, its
-thinking level and effort ceiling, the tool names, mounted tools and the descriptor of each eval
+with a version `v`, the inputs the subagent was spawned with: the exact model it started on and the
+`subagent:<id>` role a named model is held to, its thinking level and effort ceiling, the tool
+names, mounted tools and the descriptor of each eval
 custom tool, the LSP, IRC, MCP, Python-preflight and cache-warming values, the prewalk target,
 the settings overlay the spawn wrote (with its `subagent:<id>` retry-fallback role), the inputs
 of the subagent's prompt block, the wake-turn inputs (agent, description, index, spawning tool

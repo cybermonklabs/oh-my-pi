@@ -503,6 +503,7 @@ export async function prepareColdRevive(
 			ceiling: liveEffortCeiling(parts.thinking?.thinkingLevelCeiling, settingsParent),
 			// The model of the parent's live session; the root's where the parent ref holds no session.
 			fallback: parentSession?.model ?? root.model,
+			held: parts.model.exclusiveRetryFallbackRole !== undefined,
 		});
 	}
 	let prewalkTarget: Model | undefined;
@@ -900,7 +901,8 @@ function retryFallbackChain(
  * it, after its discovery ran; else the first model of the subagent's retry-fallback chain that the live
  * retry walk would switch to (its provider enabled and credentialed, within the effort ceiling); else
  * `fallback`, the live parent's (or the root's) model. Each move is logged with the spawn's own message for
- * a model the registry does not know.
+ * a model the registry does not know. A named model held to its own list (`held`) takes no `fallback`: the
+ * revive is refused where neither it nor a model of its chain can serve.
  */
 async function chooseColdReviveModel(args: {
 	id: string;
@@ -912,6 +914,8 @@ async function chooseColdReviveModel(args: {
 	modelRegistry: ModelRegistry;
 	ceiling: Effort | undefined;
 	fallback: Model | undefined;
+	/** The spawn held its named model to its own list (`task.namedModelFallback` off). */
+	held: boolean;
 }): Promise<ExplicitBuildModel> {
 	const { id, identity, level, modelRegistry, ceiling } = args;
 	// A spawn that started on no model left it to the session, as the warm revive does.
@@ -930,6 +934,11 @@ async function chooseColdReviveModel(args: {
 		moved(model);
 		const thinkingLevel = retryFallbackThinkingLevel(model, candidate.thinkingLevel ?? level, ceiling);
 		return { kind: "model", model, thinkingLevel };
+	}
+	if (args.held) {
+		throw new Error(
+			`Cannot revive subagent "${id}": its named model ${identity} is no longer available, nor is any later model of its list, and its spawn held it to that list (task.namedModelFallback: false). The agent was not revived.`,
+		);
 	}
 	moved(args.fallback);
 	return { kind: "model", model: args.fallback, thinkingLevel: level };
@@ -1272,6 +1281,13 @@ function coldReviveSpawnSpec(
 				? cfgTaskMaxEffort.get(settingsParent)
 				: undefined,
 		perCallModel: perCall,
+		// A named model held to its own list at spawn stays held: the spec's role, else the `subagent:<id>` role
+		// where the record's `retryFallback` is marked `exclusive`.
+		exclusiveRetryFallbackRole: parts.model
+			? parts.model.exclusiveRetryFallbackRole
+			: init.retryFallback?.exclusive
+				? subagentRetryFallbackRole(id)
+				: undefined,
 		prewalk: parts.prewalk,
 		// The constructor records it for the revived session; a record with no spec holds none.
 		startupFallback: parts.startupFallback,

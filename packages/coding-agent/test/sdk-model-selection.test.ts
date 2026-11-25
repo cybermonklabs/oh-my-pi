@@ -1096,6 +1096,57 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		expect(message).toContain("runtime-provider/runtime-model");
 	});
 
+	test("refuses a held subagent model without working credentials instead of walking a configured chain or taking the parent's model", async () => {
+		const { authStorage, modelRegistry, parentPattern } = registryWithKeys(["runtime-fallback-model"]);
+		const settings = Settings.isolated({
+			"retry.fallbackChains": {
+				"runtime-provider/runtime-model": ["runtime-provider/runtime-fallback-model"],
+				"runtime-provider/*": ["runtime-provider/runtime-fallback-model"],
+				default: ["runtime-provider/runtime-fallback-model"],
+			},
+		});
+
+		const message = await creationError(
+			createAgentSession({
+				...subagentSessionOptions(
+					modelRegistry,
+					authStorage,
+					settings,
+					"runtime-provider/runtime-model",
+					parentPattern,
+				),
+				exclusiveRetryFallbackRole: "subagent:unavailable",
+			}),
+		);
+
+		expect(message).toBe("No working credentials for named subagent model: runtime-provider/runtime-model.");
+	});
+
+	test("starts a held subagent on a later named model, not on its chain, when the first has no working credentials", async () => {
+		const { authStorage, modelRegistry, parentPattern } = registryWithKeys(["runtime-fallback-model"]);
+		const settings = Settings.isolated({
+			"retry.fallbackChains": { "runtime-provider/runtime-model": [parentPattern] },
+		});
+
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...subagentSessionOptions(
+				modelRegistry,
+				authStorage,
+				settings,
+				"runtime-provider/runtime-model,runtime-provider/runtime-fallback-model",
+				parentPattern,
+			),
+			exclusiveRetryFallbackRole: "subagent:unavailable",
+		});
+
+		try {
+			expect(`${session.model?.provider}/${session.model?.id}`).toBe("runtime-provider/runtime-fallback-model");
+			expect(modelFallbackMessage).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	const highOnlyProviderExtension: ExtensionFactory = pi => {
 		pi.registerProvider("effort-provider", {
 			baseUrl: "https://effort.example.com/v1",

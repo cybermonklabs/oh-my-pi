@@ -72,6 +72,7 @@ import {
 	enabledProviderModels,
 	formatModelString,
 	formatModelStringWithRouting,
+	formatUnauthenticatedNamedModelsError,
 	getModelMatchPreferences,
 	type ModelMatchPreferences,
 	modelNotFoundMessage,
@@ -726,6 +727,15 @@ export interface CreateAgentSessionOptions {
 	 * the model session_init recorded.
 	 */
 	modelPatternChainFallback?: boolean;
+	/**
+	 * The one `retry.fallbackChains` key this session's own model walks: no model-selector, wildcard,
+	 * other role or `default` chain applies to it, and context promotion is off. A hinted role (the
+	 * advisor's) keeps its own chain. A deferred pattern without working credentials is replaced by
+	 * neither a configured chain nor `modelPatternAuthFallback`, only by a later pattern; when none
+	 * has them, session creation fails naming them. A subagent whose model a selector named sets its
+	 * `subagent:<id>` role while `task.namedModelFallback` is off.
+	 */
+	exclusiveRetryFallbackRole?: string;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Hard ceiling on the session's thinking effort (e.g. a task spawn's `task.maxEffort`-capped hint); retry-fallback recovery re-clamps to it. */
@@ -3489,12 +3499,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// empty or exhausted chain refuses the spawn instead of letting another
 			// model answer as the one requested.
 			const chainFallback = options.modelPatternChainFallback === true;
+			// A subagent held to its named models (`exclusiveRetryFallbackRole`) takes no configured chain and
+			// no parent model here: only a later entry of its own list replaces one without working
+			// credentials, and when none can, the session is refused naming them.
+			const heldToNamedModels = options.exclusiveRetryFallbackRole !== undefined;
+			const unauthenticatedNamedModels: string[] = [];
 			const replaceUnavailableSubagentModel = async (
 				requestedSelector: string,
 				requestedModel: Model | undefined,
 				cause: string,
 			) => {
-				if (!cfgRetryModelFallback.get(settings)) return undefined;
+				if (!cfgRetryModelFallback.get(settings) || heldToNamedModels) return undefined;
 				const replacement = await resolveUnavailableModelReplacement(
 					{
 						chains: cfgRetryFallbackChains.get(settings),
@@ -3669,7 +3684,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				// (#5325): a false "no credentials" here now walks or refuses the chain.
 				// A pool-restricted session rejects instead of resolving nothing, and
 				// that is this model's unavailability, not a startup failure.
-				if (options.modelPatternAuthFallback || chainFallback) {
+				if (options.modelPatternAuthFallback || chainFallback || heldToNamedModels) {
 					const primaryKey = await probeModelApiKey(modelRegistry, primary.model, providerSessionId);
 					if (primaryKey !== kNoAuth && !isAuthenticated(primaryKey)) {
 						const cause = "has no working credentials";
@@ -3682,6 +3697,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							selectedExplicitThinkingLevel = replacement.thinkingLevel !== undefined;
 							authFallbackUsed = true;
 							startupReplacement = describeStartupReplacement(pattern, replacement.chainKey, cause);
+						} else if (heldToNamedModels) {
+							const named = formatModelStringWithRouting(primary.model);
+							if (!unauthenticatedNamedModels.includes(named)) unauthenticatedNamedModels.push(named);
+							continue;
 						} else if (options.modelPatternAuthFallback) {
 							const fallback = parseModelPattern(
 								options.modelPatternAuthFallback,
@@ -3775,6 +3794,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 				settleDeferredModel(selectedModel, startupReplacement ?? usageFallbackReason);
 				break;
+			}
+			if (!model && unauthenticatedNamedModels.length > 0) {
+				throw new Error(formatUnauthenticatedNamedModelsError(unauthenticatedNamedModels));
 			}
 			if (!model && chainFallback) {
 				const requestedSelector = expandedModelPatterns[0]?.pattern ?? deferredModelPatterns[0];
@@ -5646,6 +5668,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			thinkingLevel: autoThinking ? AUTO_THINKING : effectiveThinkingLevel,
 			thinkingLevelCeiling: options.thinkingLevelCeiling,
 			disableModelFallback: options.disableModelFallback,
+			exclusiveRetryFallbackRole: options.exclusiveRetryFallbackRole,
 			initialRetryFallback,
 			deferRetryFallbackValidation: options.deferRetryFallbackValidation,
 			prewalk,

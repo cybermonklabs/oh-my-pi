@@ -1131,6 +1131,39 @@ describe("a chain whose every model is gone after discovery", () => {
 	}, 30_000);
 });
 
+describe("a named model held to its own list whose model is gone", () => {
+	const id = "HeldModelGone";
+	let env: ReviveEnv | undefined;
+	let failure: unknown;
+
+	beforeAll(async () => {
+		const opened = await openTestProcess({
+			"task.namedModelFallback": false,
+			"retry.fallbackChains": { [LEAVING_MODEL]: [CHAIN_MODEL], default: [CHAIN_MODEL] },
+		});
+		env = opened.env;
+		env.scriptDiscovery();
+		env.addModel("mock-leaving");
+		env.addModel("mock-chain");
+		await spawnAndPark(env, taskSpawn(env, opened.root.toolSession, id, { modelOverride: LEAVING_MODEL }));
+		env.removeModel(LEAVING_MODEL);
+		try {
+			await reviveCold(env, id);
+		} catch (error) {
+			failure = error;
+		}
+	}, 60_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("refuses the cold revive instead of starting on the live parent's model", () => {
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).toContain(`its named model ${LEAVING_MODEL} is no longer available`);
+	}, 30_000);
+});
+
 describe("a warm revive whose model left the registry", () => {
 	const id = "WarmModelGone";
 	let env: ReviveEnv | undefined;
