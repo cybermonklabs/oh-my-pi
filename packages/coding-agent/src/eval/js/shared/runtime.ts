@@ -596,6 +596,16 @@ export class JsRuntime {
 		return filename && path.isAbsolute(filename) ? filename : undefined;
 	}
 
+	/**
+	 * Run the embedder's side of a tool call outside the run's async context. The stdio routing sends a write to the
+	 * run whose context the writing code inherited, so host code a call runs, and anything it starts (timers,
+	 * continuations that outlive the run), would otherwise write into the run's output instead of the process's own
+	 * streams: an RPC frame or a print-mode record lost in a browser run. The guest's own writes stay in the run.
+	 */
+	#hostCall<T>(call: () => T): T {
+		return this.#als.exit(call);
+	}
+
 	#activeHooks(action: string): RuntimeHooks | undefined {
 		const hooks = this.#als.getStore()?.hooks;
 		if (!hooks) {
@@ -654,13 +664,14 @@ export class JsRuntime {
 			__omp_call_tool__: async (name: string, args: unknown) => {
 				const hooks = this.#activeHooks("tool");
 				if (!hooks) return undefined;
-				return surfaceBridgedToolImages(await hooks.callTool(name, args, this.#callSiteAls.getStore()), hooks);
+				const callSite = this.#callSiteAls.getStore();
+				return surfaceBridgedToolImages(await this.#hostCall(() => hooks.callTool(name, args, callSite)), hooks);
 			},
 			__omp_prelude__: async (name: string, parameters: unknown) => {
 				const hooks = this.#activeHooks("prelude");
 				if (!hooks) return undefined;
 				const payload = { name, parameters };
-				return surfaceBridgedToolImages(await hooks.callTool("__prelude__", payload), hooks);
+				return surfaceBridgedToolImages(await this.#hostCall(() => hooks.callTool("__prelude__", payload)), hooks);
 			},
 			__omp_import__: async (source: string, options?: ImportCallOptions) => {
 				const filename = this.#activeFilename();
