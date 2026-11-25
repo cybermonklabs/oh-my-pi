@@ -870,6 +870,21 @@ function enterGlobalRun(owner: symbol, action: string): () => void {
 /** Resolvers for each live runtime's active-run hooks (one per JsRuntime instance). */
 const RUN_HOOK_RESOLVERS = new Set<() => RuntimeHooks | undefined>();
 
+/** How much of the realm's shared global table live runtimes hold. */
+export interface GlobalTableSize {
+	/** Owner entries over every reserved global's stack. */
+	entries: number;
+	/** Runtimes whose active-run hooks the stdio routing consults. */
+	runtimes: number;
+}
+
+/** Test hook: a runtime that ends without {@link JsRuntime.dispose} leaves its entries here for good. */
+export function globalTableSizeForTest(): GlobalTableSize {
+	let entries = 0;
+	for (const stack of GLOBAL_STACKS.values()) entries += stack.entries.length;
+	return { entries, runtimes: RUN_HOOK_RESOLVERS.size };
+}
+
 /** Streams whose `write` the runtime has already wrapped (patch-once guard). */
 const PATCHED_STDIO_STREAMS = new WeakSet<NodeJS.WriteStream>();
 
