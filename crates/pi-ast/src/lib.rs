@@ -12,3 +12,11 @@ pub mod summary;
 mod testing;
 
 pub use language::SupportLang;
+
+/// A doctest planted on a scratch branch, never a release member: the gate
+/// runs pi-ast's cargo doctests once its source holds one.
+///
+/// ```
+/// assert_eq!(1 + 1, 2);
+/// ```
+pub fn planted_doctest() {}
