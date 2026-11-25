@@ -820,6 +820,37 @@ describe("cold entry store", () => {
 		}
 	});
 
+	// /resume --from-claude persists an imported in-memory session, which holds what its source transcript held: a
+	// tool's result nests as deep as `JSON.parse` reads.
+	it("persists a copy of an in-memory session holding an entry nested deeper than JSON.stringify recurses", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const source = SessionManager.inMemory(dir.path());
+		source.appendMessage({ role: "user", content: "u1", timestamp: 1 });
+		const r1 = source.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "inspect",
+			content: [{ type: "text", text: "r1" }],
+			details: deepDetails(),
+			isError: false,
+			timestamp: 2,
+		});
+
+		const copy = await source.persistCopy(
+			{ sessionDir: path.join(dir.path(), "sessions"), suppressBreadcrumb: true },
+			new FileSessionStorage(),
+		);
+		const file = copy.getSessionFile();
+		await copy.close();
+		if (!file) throw new Error("the copy has no session file");
+		const reopened = await open(file);
+		expect(nestingOf(toolResultOf(entry(reopened, r1)).details)).toEqual({
+			levels: DEEP_LEVELS,
+			bottom: { leaf: "bottom" },
+		});
+		await reopened.close();
+	}, 20_000);
+
 	// bash detach on /delete keeps a clone of the dropped session; closing both must free the store's disk now.
 	it.skipIf(!HAS_PROC_FD)(
 		"closes the store once the manager and a clone made without persistence are both closed",

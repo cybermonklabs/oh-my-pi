@@ -10,6 +10,7 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import {
+	cloneJsonTree,
 	directoryIsEnterable,
 	directoryIsMissing,
 	getBlobsDir,
@@ -5353,10 +5354,9 @@ export class SessionManager {
 		manager.#additionalDirectories = [...this.#additionalDirectories];
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
-		// A whole entry is cloned; a cold one is copied as a new cold entry over the same record.
-		manager.#entries = this.#entries.map(entry =>
-			isColdEntry(entry) ? copyColdEntry(entry) : structuredClone(entry),
-		);
+		// A whole entry is copied (as deep as a transcript line holds, on the copy's own stack); a cold
+		// one is copied as a new cold entry over the same record.
+		manager.#entries = this.#entries.map(entry => (isColdEntry(entry) ? copyColdEntry(entry) : cloneJsonTree(entry)));
 		manager.#adoptColdStore(this.#coldStore);
 		manager.#reindexEntries();
 		manager.#forceFileCreation = true;

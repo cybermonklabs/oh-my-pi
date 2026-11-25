@@ -218,6 +218,7 @@
 - A session holding an `entry_patch` record nested more than about 22,500 levels deep (an elide pass writes a turn's whole content into one, its tool calls' arguments included) resumes, forks and is exported by `omp anonymize` instead of each failing with `Maximum call stack size exceeded`
 - Switching to the session already open (a reload) no longer fails with `Maximum call stack size exceeded` when one of its tool calls' arguments nests more than about 8,400 levels deep
 - Choosing a retry fallback model that stands on another compaction boundary no longer fails with `Maximum call stack size exceeded` when the failed turn's tool call has arguments nested more than about 16,000 levels deep
+- `/resume --from-claude` and `--from-codex` import a session holding an entry nested more than 40,000 levels deep instead of failing with `Maximum call stack size exceeded`
 - A session imported with `--from-claude` or `--from-codex`, and every session that process switches to afterwards, now moves its older entries out of memory as other sessions do
 - omp no longer keeps older entry bodies in a temporary directory that another account made or can enter; the session keeps them compressed in memory instead
 - Reading older screenshots back, as an extension reading every message does, no longer keeps up to eight of them in memory past the 16 MiB the cache allows
