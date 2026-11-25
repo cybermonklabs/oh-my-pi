@@ -3,7 +3,9 @@
 use crate::{
 	bash::{
 		Budget, Cx, Engine, EngineConfig, Incompatibility, MemStore, RestoreError, RestoreOpts,
-		RunId, Script, Shell, SigTarget, Signal, StateStore, Step, ir::IR_VERSION, store::BlobSlot,
+		RunId, Script, Shell, SigTarget, Signal, StateStore, Step,
+		ir::IR_VERSION,
+		store::{BlobSlot, Change, Key, Table},
 	},
 	testkit::{
 		FakeHost, Fault, Rig,
@@ -233,7 +235,12 @@ const OLD_ROOT_JOBS_STORE: &[u8] = include_bytes!("../fixtures/frames/c55f78f6_r
 /// are in the store's own records, which keep their layout (what came later
 /// is a record of its own, [`crate::bash::store::Record::JobFacts`]). Its
 /// frames are refused; with `drop_frames` it restores, the run abandoned,
-/// the variable kept, job 1 lost (137) and job 2 listed as `KILL` ended it.
+/// the variable kept, job 1 lost (137) and job 2 done with 137, and `jobs`
+/// lists both as `Exit 137`, with no notice. Neither has a signal recorded:
+/// obash did not see job 1 end, and job 2's store kept only its status,
+/// which does not say that a signal ended it
+/// ([`crate::bash::store::Job::set_facts`]); `Killed` would claim a signal
+/// nobody saw.
 #[test]
 fn an_older_store_whose_root_has_jobs_restores() {
 	let engine = Engine::new(EngineConfig::default());
@@ -262,12 +269,55 @@ fn an_older_store_whose_root_has_jobs_restores() {
 	let budget = Budget::default();
 	assert_eq!(advance(&mut shell, &mut host, &mut store, RunId(1), budget), Stop::Done(255));
 	assert_eq!(advance(&mut shell, &mut host, &mut store, next, budget), Stop::Done(0));
-	let killed = Signal::Kill.description(EngineConfig::default().platform);
 	let text = "{ while :; do\n    :;\ndone; }";
+	let exited = "Exit 137";
 	assert_eq!(
 		String::from_utf8_lossy(&host.stdout.bytes()),
-		format!("kept\n[1]-  {killed:<27}{text}\n[2]+  {killed:<27}{text}\nend\n")
+		format!("kept\n[1]-  {exited:<27}{text}\n[2]+  {exited:<27}{text}\nend\n")
 	);
+	assert_eq!(String::from_utf8_lossy(&host.stderr.bytes()), "");
+}
+
+/// A root job that exited with 137, restored from a store that holds no
+/// facts for it, as a store written before the job's signal was kept holds
+/// none (the store's image, `MemStore::to_bytes` and `from_bytes`, with
+/// each [`crate::bash::store::Record::JobFacts`] deleted): `jobs` lists it
+/// as `Exit 137`, with no notice. Its status alone does not say that a
+/// signal ended it, and `Killed` would claim a signal nobody saw.
+#[test]
+fn an_older_stores_job_that_ended_with_137_lists_exit_137() {
+	let mut r = rig();
+	let job = format!("{{ exit 137; }} & {NONE_RUNNING}");
+	r.run(Script::command(job.as_bytes()), Fault::None);
+	r.snapshot();
+	let mut store = MemStore::from_bytes(&r.store.to_bytes()).expect("the store image decodes");
+	let mut facts = Vec::new();
+	store
+		.scan(Table::JobFacts, &mut |key, _| {
+			if let Key::JobFacts(id) = key {
+				facts.push(id);
+			}
+		})
+		.expect("scan the job facts");
+	for id in facts {
+		store
+			.apply(Change::Del(Key::JobFacts(id)))
+			.expect("delete the job facts");
+	}
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let (mut shell, _) = Shell::restore(
+		&engine,
+		&mut Cx { host: &mut host, store: &mut store },
+		RestoreOpts::default(),
+	)
+	.expect("restore");
+	let next = shell.submit(Script::command(&b"jobs"[..]));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, next, Budget::default()), Stop::Done(0));
+	let out = String::from_utf8_lossy(&host.stdout.bytes()).into_owned();
+	let err = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+	let listed = format!("[1]+  {:<27}{{ exit 137; }}\n", "Exit 137");
+	assert_eq!((out, err), (listed, String::new()));
 }
 
 /// The signal that ended a root job outlives a store image
@@ -308,6 +358,50 @@ fn a_subshells_killed_job_keeps_its_signal_across_snapshots() {
 		plain.1 == b"st=137\n" && String::from_utf8_lossy(&plain.2).contains(&*killed),
 		"the uninterrupted run: {plain:?}"
 	);
+	assert_eq!(run(Fault::Snapshot { every: 1 }), plain);
+}
+
+/// Until no job of the shell's table runs (`jobs -r` into `/tmp/running`,
+/// the test host's in-memory file; builtins only, which report nothing), at
+/// most 100,000 passes; then the shell says so on standard error and exits
+/// with 97.
+const NONE_RUNNING: &str = "n=0; while jobs -r >/tmp/running; [ -s /tmp/running ]; do n=$((n + \
+                            1)); [ $n -le 100000 ] || { echo still running >&2; exit 97; }; done";
+
+/// How a root job ended outlives a store image (`MemStore::to_bytes`,
+/// `from_bytes`) and a restore: one that exited with 137 is still listed as
+/// `Exit 137`, with no notice (it has no signal recorded,
+/// [`crate::bash::store::Job::signal`]). bash 5.3.20 lists
+/// `{ exit 137; } &` as `Exit 137`.
+#[test]
+fn a_root_jobs_exit_with_137_outlives_a_store_image() {
+	let mut r = rig();
+	let job = format!("{{ exit 137; }} & {NONE_RUNNING}");
+	r.run(Script::command(job.as_bytes()), Fault::None);
+	r.snapshot();
+	assert_eq!(r.run(Script::command(&b"jobs"[..]), Fault::None), 0);
+	let out = String::from_utf8_lossy(&r.host.stdout.bytes()).into_owned();
+	let err = String::from_utf8_lossy(&r.host.stderr.bytes()).into_owned();
+	let listed = format!("[1]+  {:<27}{{ exit 137; }}\n", "Exit 137");
+	assert_eq!((out, err), (listed, String::new()));
+}
+
+/// How a subshell's job ended outlives every snapshot of a run (a
+/// subshell's job table is in the frames image, its jobs' facts beside it;
+/// a job that exited has no signal recorded): under
+/// `Fault::Snapshot { every: 1 }` the subshell's `jobs` lists the job that
+/// exited with 137 as the uninterrupted run does, as `Exit 137`.
+#[test]
+fn a_subshells_job_that_exited_with_137_keeps_its_end_across_snapshots() {
+	let src = format!("( {{ exit 137; }} & {NONE_RUNNING}; jobs )");
+	let run = |fault| {
+		let mut r = rig();
+		let status = r.run(Script::command(src.as_bytes()), fault);
+		(status, r.host.stdout.bytes(), r.host.stderr.bytes())
+	};
+	let plain = run(Fault::None);
+	let listed = format!("[1]+  {:<27}{{ exit 137; }}\n", "Exit 137");
+	assert_eq!(plain, (0, listed.into_bytes(), Vec::new()), "the uninterrupted run");
 	assert_eq!(run(Fault::Snapshot { every: 1 }), plain);
 }
 
@@ -375,21 +469,22 @@ fn a_killed_externals_death_outlives_every_snapshot() {
 /// The processes of a root pipeline job ([`crate::bash::store::Job::procs`])
 /// outlive a store image (`MemStore::to_bytes`, `from_bytes`) and a
 /// restore: the next run's first line reports the job as the run without
-/// the image does, a line for each process `kill %1` ended. Those the job's
-/// vproc started (`$!` waits for that) are named by their own vprocs; those
-/// it had not started yet ended with it, and name it. The first run ends
-/// once `jobs -r` lists no running job (`GONE`: builtins only, which report
-/// nothing; `/tmp` is the test host's in-memory one): `kill -0 %1`
-/// succeeds for a finished job still listed, in bash 5.3.20 and 5.2.21 too,
-/// so a loop on it never ends there. The loop stops after 100,000 passes,
-/// and says so on standard error.
+/// the image does, a line for each process `kill %1` ended, each with a pid
+/// of its own, as bash forks each stage as it starts the job: those the
+/// job's vproc started (`$!` waits for that) and those it had not started
+/// yet, which ended with it (their vpids reserved as the job started). The
+/// first run ends once `jobs -r` lists no running job (`GONE`: builtins
+/// only, which report nothing; `/tmp` is the test host's in-memory one):
+/// `kill -0 %1` succeeds for a finished job still listed, in bash 5.3.20
+/// and 5.2.21 too, so a loop on it never ends there. The loop stops after
+/// 100,000 passes, and says so on standard error.
 #[test]
 fn a_root_pipeline_jobs_processes_outlive_a_store_image() {
 	const GONE: &str = "n=0; while jobs -r >/tmp/running; [ -s /tmp/running ]; do n=$((n+1)); [ $n \
 	                    -le 100000 ] || { echo still running >&2; exit 97; }; done";
 	let killed = Signal::Kill.description(EngineConfig::default().platform);
 	let text = "{ while :; do\n    :;\ndone; }";
-	for (start, started) in [(": $!; ", true), ("", false)] {
+	for start in [": $!; ", ""] {
 		let run = |snapshot: bool| {
 			let mut r = rig();
 			let job = format!("{text} | {text} & {start}kill -KILL %1; {GONE}");
@@ -413,9 +508,7 @@ fn a_root_pipeline_jobs_processes_outlive_a_store_image() {
 		let first = pid(lines.first(), "bash: line 1: ", &format!(" {killed:<27}{{ while :; do"));
 		let second = pid(lines.get(3), "     ", &format!(" {:<25}| {{ while :; do", ""));
 		assert!(
-			plain.1 == "next\n"
-				&& lines.len() == 6
-				&& first.zip(second).is_some_and(|(a, b)| (a != b) == started),
+			plain.1 == "next\n" && lines.len() == 6 && first.zip(second).is_some_and(|(a, b)| a != b),
 			"{start}without an image: {plain:?}"
 		);
 		assert_eq!(run(true), plain, "{start}");

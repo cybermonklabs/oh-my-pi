@@ -883,13 +883,14 @@ pub fn suspend(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, sig: Signal) -> 
 	k.spawned.push(Box::new(job));
 	reclaim(k, cx, Some(jvpid), false);
 	// zsh `printjob`: a newline first after a `^Z` of the job itself
-	// (`doputnl`), not after a construct's.
+	// (`doputnl`), not after a construct's; bash's line has its own
+	// ([`notice_line`]).
 	let mut line = Vec::new();
-	if sig == Signal::Tstp && !construct {
+	if sig == Signal::Tstp && !construct && vp.mode.dialect() == Dialect::Zsh {
 		line.push(b'\n');
 	}
 	let how = JobLine { thisfmt: true, pid: long_list(k, cx, vp), ..JobLine::default() };
-	if let Some(text) = format_job(vp, number, how, platform) {
+	if let Some(text) = notice_line(k, cx, vp, number, how, platform) {
 		line.extend_from_slice(&text);
 	}
 	notice(k, vp, &line);
@@ -979,15 +980,22 @@ pub fn give_terminal(k: &mut Kernel, cx: &mut Cx<'_>, leader: Vpid) {
 
 /// The root's foreground command (a lone external or a pipeline) is over:
 /// its group is done with, the terminal comes back. One killed by a signal
-/// other than `INT` or `PIPE` is reported (`zsh: terminated  cmd`); `INT`
-/// moves to a new line (zsh `printjob`'s `doputnl`). A pipeline's last
-/// stage running here ends only with the pipeline.
+/// other than `INT` or `PIPE` is reported: bash prints `shown` (how its
+/// last process ended; `None` for the signal's description) padded and its
+/// command `text` (`notify_of_job_status` for a foreground job:
+/// `print_pipeline` with `JLIST_STANDARD`, [`super::killed::short_notice`]),
+/// zsh `zsh: terminated  cmd`; `INT` moves to a new line (bash `wait_for`,
+/// zsh `printjob`'s `doputnl`). bash writes `(core dumped) ` before the
+/// command when the process dumped a core, which obash does not learn: a
+/// program's end reaches it as the signal alone (`ExitStatus::Signaled`).
+/// A pipeline's last stage running here ends only with the pipeline.
 pub fn fg_done(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
 	vp: &mut Vproc,
 	killed: Option<Signal>,
 	text: &[u8],
+	shown: Option<&str>,
 ) {
 	if vp.parent.is_some() || k.jobctl.pgrp.is_none() {
 		return;
@@ -1000,6 +1008,13 @@ pub fn fg_done(
 	match killed {
 		Some(Signal::Int) => notice(k, vp, b"\n"),
 		Some(Signal::Pipe) | None => {},
+		Some(sig) if vp.mode.dialect() == Dialect::Bash => {
+			let platform = k.engine.config().platform;
+			let status: std::borrow::Cow<'_, str> =
+				shown.map_or_else(|| sig.description(platform).into(), Into::into);
+			let line = super::killed::short_notice(&status, text);
+			notice(k, vp, &line);
+		},
 		Some(sig) => {
 			let msg = sigmsg(sig, k.engine.config().platform);
 			let line = format!("zsh: {msg:<w$}", w = msg.len().max(9) + 2);
@@ -1034,16 +1049,28 @@ pub fn job_done(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, vpid: Vpid) {
 	};
 	if k.jobctl.fg == Some(vpid) {
 		reclaim(k, cx, None, super::zle::active(vp));
-		let killed = match vp.jobs.get(number).map(|j| j.state) {
-			Some(JobState::Done(status)) => death_signal(status, platform),
-			_ => None,
-		};
+		// bash: a job a signal killed (`Job::signal`, set as it ends), not one
+		// that exited with 128 + a signal's number (an exit with 130 prints
+		// no newline). zsh mode still reads the status.
+		let killed = vp
+			.jobs
+			.get(number)
+			.and_then(|j| match (vp.mode.dialect(), j.state) {
+				(Dialect::Zsh, JobState::Done(status)) => death_signal(status, platform),
+				(Dialect::Zsh, _) => None,
+				_ => j.signal,
+			});
 		if let Some(job) = vp.jobs.get_mut(number) {
 			job.notified = true;
 		}
 		match killed {
 			Some(Signal::Int) => notice(k, vp, b"\n"),
 			Some(Signal::Pipe) | None => {},
+			Some(_) if vp.mode.dialect() == Dialect::Bash => {
+				if let Some(line) = super::killed::fg_job_line(k, cx, vp, number) {
+					notice(k, vp, &line);
+				}
+			},
 			Some(_) => {
 				let how = JobLine { thisfmt: true, pid: long_list(k, cx, vp), ..JobLine::default() };
 				if let Some(line) = format_job(vp, number, how, platform) {
@@ -1059,17 +1086,17 @@ pub fn job_done(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, vpid: Vpid) {
 }
 
 /// [`report`] at any time under `notify` (zsh `update_job` from the
-/// `SIGCHLD` handler): while the line editor waits for a key the notice
-/// goes above the line it redraws.
+/// `SIGCHLD` handler; bash `set -b`): while the line editor waits for a key
+/// the notice goes above the line it redraws.
 fn report_async(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, number: u32, platform: Platform) {
 	let how = JobLine { pid: long_list(k, cx, vp), ..JobLine::default() };
-	if let Some(line) = format_job(vp, number, how, platform)
+	if let Some(line) = notice_line(k, cx, vp, number, how, platform)
 		&& super::zle::display::print_above(k, cx, vp, &line)
 	{
 		settle_report(vp, number);
 		return;
 	}
-	report(k, vp, number, platform, how);
+	report(k, cx, vp, number, platform, how);
 }
 
 /// zsh `LONG_LIST_JOBS`: job notices show the pid (`printjob`'s `lng`).
@@ -1078,10 +1105,59 @@ fn long_list(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 		&& state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Longlistjobs).unwrap_or(false)
 }
 
+/// Job `number`'s notice in `vp`'s dialect, for a job that stopped, or
+/// ended while not in the foreground. zsh: `printjob` ([`format_job`] with
+/// `how`). bash: `notify_of_job_status` with job control, the line `jobs`
+/// prints for the job (bash `pretty_print_job` with `JLIST_STANDARD`,
+/// [`super::builtins::jobs::job_line`]: how the job ended, from its signal
+/// and its processes, never from its status alone, so an exit with 137 is
+/// `Exit 137` and only a signal seen to end it is named), after a newline
+/// for a stop, then `(wd now: DIR)` when the shell's directory is not the
+/// one the job started in. `None` when there is no such job.
+pub fn notice_line(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	number: u32,
+	how: JobLine,
+	platform: Platform,
+) -> Option<Vec<u8>> {
+	if vp.mode.dialect() == Dialect::Zsh {
+		return format_job(vp, number, how, platform);
+	}
+	let posix = state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
+	let home = state::lookup(&k.root, cx.store, vp, b"HOME")
+		.ok()
+		.flatten()
+		.and_then(|v| v.as_scalar().map(BString::from));
+	let home = home.as_ref().map(|h| h.as_slice());
+	let show = super::builtins::jobs::Show { posix, home, platform };
+	let job = vp.jobs.get(number)?;
+	let mut line = Vec::new();
+	if matches!(job.state, JobState::Stopped(_)) {
+		line.push(b'\n');
+	}
+	line.extend_from_slice(&super::builtins::jobs::job_line(vp, number, false, &show)?);
+	if job.wd != vp.cwd {
+		line.extend_from_slice(b"(wd now: ");
+		line.extend_from_slice(&super::builtins::dirstack::polite(home, &vp.cwd, false));
+		line.extend_from_slice(b")\n");
+	}
+	Some(line)
+}
+
 /// Print job `number`'s changed state (zsh `printjob` from `scanjobs` or
-/// `update_job`) and forget it when it is done (`deletejob`).
-fn report(k: &Kernel, vp: &mut Vproc, number: u32, platform: Platform, how: JobLine) {
-	if let Some(line) = format_job(vp, number, how, platform) {
+/// `update_job`; bash `notify_of_job_status`: [`notice_line`]) and forget
+/// it when it is done (`deletejob`).
+fn report(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	number: u32,
+	platform: Platform,
+	how: JobLine,
+) {
+	if let Some(line) = notice_line(k, cx, vp, number, how, platform) {
 		notice(k, vp, &line);
 	}
 	settle_report(vp, number);
@@ -1162,8 +1238,22 @@ pub fn notices_before_prompt(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 		.map(|j| j.number)
 		.collect();
 	let how = JobLine { pid: long_list(k, cx, vp), ..JobLine::default() };
+	if vp.mode.dialect() == Dialect::Zsh {
+		for number in changed {
+			report(k, cx, vp, number, platform, how);
+		}
+		return;
+	}
+	// bash reports every changed job (`notify_of_job_status`), then deletes
+	// the finished ones (`cleanup_dead_jobs`): each notice carries the marks
+	// the jobs had before any of them went.
+	for &number in &changed {
+		if let Some(line) = notice_line(k, cx, vp, number, how, platform) {
+			notice(k, vp, &line);
+		}
+	}
 	for number in changed {
-		report(k, vp, number, platform, how);
+		settle_report(vp, number);
 	}
 }
 
@@ -1437,20 +1527,36 @@ impl Shell {
 					self.k.ctl.notify();
 				},
 				ProcEvent::Stopped(sig) => {
-					// Every process of a stopped job reports; the job stops once.
-					let already = self.procs.iter().any(|p| {
-						p.jobs
-							.by_vpid(leader)
-							.is_some_and(|j| !j.inherited && matches!(j.state, JobState::Stopped(_)))
-					});
-					if already {
-						continue;
+					// A process of a pipeline job (bash's `waitchld` records it):
+					// the job stops once none of its processes runs
+					// ([`super::proc::Job::process_changed`]). A stop the terminal
+					// sends (`TSTP`, `TTIN`, `TTOU`) reaches the job's process
+					// group: each of its processes, those obash runs itself too.
+					if let Some(process) = self.job_process_of(leader, vpid) {
+						let was = self.job_stopped(leader);
+						let terminal = matches!(sig, Signal::Tstp | Signal::Ttin | Signal::Ttou);
+						let reached = if terminal {
+							self.job_vpids(leader)
+						} else {
+							vec![process]
+						};
+						for p in reached {
+							self.job_changed(cx, p, Some(sig));
+						}
+						if was || !self.job_stopped(leader) {
+							continue;
+						}
+					} else {
+						// Every process of a stopped job reports; the job stops once.
+						if self.job_stopped(leader) {
+							continue;
+						}
+						self.job_changed(cx, leader, Some(sig));
 					}
 					let fg = self.k.jobctl.fg == Some(leader);
 					if let Some(p) = self.procs.iter_mut().find(|p| p.vpid == leader) {
 						p.stopped = true;
 					}
-					self.job_changed(cx, leader, Some(sig));
 					let Some(owner) = self
 						.procs
 						.iter()
@@ -1465,12 +1571,14 @@ impl Shell {
 					if fg {
 						reclaim(&mut self.k, cx, Some(leader), false);
 						let mut line = Vec::new();
-						if sig == Signal::Tstp {
+						let zsh = self.procs[owner].mode.dialect() == Dialect::Zsh;
+						if sig == Signal::Tstp && zsh {
 							line.push(b'\n');
 						}
 						let pid = long_list(&mut self.k, cx, &self.procs[owner]);
 						let how = JobLine { thisfmt: true, pid, ..JobLine::default() };
-						if let Some(text) = format_job(&self.procs[owner], number, how, platform) {
+						let ovp = &self.procs[owner];
+						if let Some(text) = notice_line(&mut self.k, cx, ovp, number, how, platform) {
 							line.extend_from_slice(&text);
 						}
 						notice(&self.k, &mut self.procs[owner], &line);
@@ -1492,10 +1600,59 @@ impl Shell {
 					self.procs[owner].blocked = None;
 					self.k.ctl.notify();
 				},
-				ProcEvent::Continued => self.job_changed(cx, leader, None),
+				ProcEvent::Continued => {
+					let process = self.job_process_of(leader, vpid).unwrap_or(leader);
+					self.job_changed(cx, process, None);
+				},
 				ProcEvent::Exited(_) => {},
 			}
 		}
+	}
+
+	/// Whether the owner of job `leader` lists it stopped.
+	fn job_stopped(&self, leader: Vpid) -> bool {
+		self.procs.iter().any(|p| {
+			p.jobs
+				.by_vpid(leader)
+				.is_some_and(|j| !j.inherited && matches!(j.state, JobState::Stopped(_)))
+		})
+	}
+
+	/// The processes of pipeline job `leader` ([`super::proc::Job::procs`]):
+	/// `None` for a job of one process, which stops as a whole.
+	fn job_procs(&self, leader: Vpid) -> Option<&super::proc::JobProcs> {
+		self
+			.procs
+			.iter()
+			.find_map(|p| p.jobs.by_vpid(leader).filter(|j| !j.inherited))
+			.and_then(|j| j.procs.as_deref())
+	}
+
+	/// The vpids of the processes of pipeline job `leader`
+	/// ([`Self::job_procs`]).
+	fn job_vpids(&self, leader: Vpid) -> Vec<Vpid> {
+		self
+			.job_procs(leader)
+			.map_or_else(Vec::new, |procs| procs.list.iter().map(|q| q.vpid).collect())
+	}
+
+	/// The process of pipeline job `leader` ([`Self::job_procs`]) that the
+	/// program vproc `vpid` waits for is part of: the stage `vpid` is, or the
+	/// one it runs below.
+	fn job_process_of(&self, leader: Vpid, vpid: Vpid) -> Option<Vpid> {
+		let procs = self.job_procs(leader)?;
+		let mut at = Some(vpid);
+		while let Some(v) = at {
+			if procs.list.iter().any(|q| q.vpid == v) {
+				return Some(v);
+			}
+			at = self
+				.procs
+				.iter()
+				.find(|p| p.vpid == v)
+				.and_then(|p| p.parent);
+		}
+		None
 	}
 
 	/// Whether the program vproc `vpid` waits for is stopped now (`true`

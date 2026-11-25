@@ -555,7 +555,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				status = 1;
 				break;
 			};
-			let child = ctx.vp.vpid_of(pid);
+			let child = waited_vproc(ctx.vp, pid);
 			if is_child(ctx, child) {
 				list.push(child);
 			} else {
@@ -629,6 +629,22 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 		}
 	}
 	Ok(found)
+}
+
+/// The vproc `wait PID` waits for: the one `pid` names
+/// ([`crate::bash::vm::proc::Vproc::vpid_of`]), else in bash mode the job
+/// one of whose processes it names (bash `find_pipeline`: a pid of any
+/// process of a job waits for the job, and `wait_for` returns the job's
+/// status).
+fn waited_vproc(vp: &crate::bash::vm::proc::Vproc, pid: u32) -> Vpid {
+	let v = vp.vpid_of(pid);
+	if v.0 != pid
+		|| vp.jobs.by_vpid(v).is_some()
+		|| vp.mode.dialect() != crate::bash::ids::Dialect::Bash
+	{
+		return v;
+	}
+	vp.jobs.by_process_pid(pid).map_or(v, |j| j.vpid)
 }
 
 /// Whether `pid` is a child this shell can wait for: a job of its own, a
@@ -742,7 +758,7 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 		// bash `check_nonjobs`: a pid no longer in the job table whose
 		// status is kept.
 		let kept = args.iter().find_map(|a| {
-			let pid = ctx.vp.vpid_of(u32::try_from(number(a)?).ok()?);
+			let pid = waited_vproc(ctx.vp, u32::try_from(number(a)?).ok()?);
 			let kept = ctx.vp.jobs.bgp_search(pid).is_some()
 				|| (matches!(
 					ctx.k.proc_state(ctx.cx.store, pid),
@@ -757,7 +773,7 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 		for a in args {
 			let pid = number(a)
 				.and_then(|n| u32::try_from(n).ok())
-				.map(|n| ctx.vp.vpid_of(n));
+				.map(|n| waited_vproc(ctx.vp, n));
 			let found = match pid {
 				Some(p) => ctx
 					.vp

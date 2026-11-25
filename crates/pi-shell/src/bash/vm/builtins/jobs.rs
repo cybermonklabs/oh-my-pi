@@ -18,8 +18,8 @@ use crate::bash::{
 	vm::{
 		exec::push_script,
 		expand::Stop,
-		jobctl,
-		proc::{Job, JobLookup, JobState, LastBg, ScriptKind},
+		jobctl, killed,
+		proc::{Job, JobLookup, JobProc, JobState, LastBg, ProcState, ScriptKind, Vproc},
 		quote,
 	},
 };
@@ -70,28 +70,37 @@ pub fn no_such_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) {
 	ctx.usage(format!("{}: no such job", word.as_bstr()));
 }
 
-/// The signal that killed a job whose status is `status` (128 + n).
-pub fn signaled(status: i32, platform: Platform) -> Option<Signal> {
-	status
-		.checked_sub(128)
-		.and_then(|n| u8::try_from(n).ok())
-		.and_then(|n| Signal::from_number(n, platform))
-}
-
-/// bash `printable_job_status`; `long` is `jobs -l`, where a stopped job
-/// shows the stop signal's description.
+/// bash `printable_job_status` of a job in `jobs`' one line; `long` is
+/// `jobs -l`, where a stopped job shows the stop signal's description. A
+/// finished job shows how its last process ended (`print_pipeline`'s
+/// `last`: [`Job::procs`]' last, under `pipefail` too, where the job's
+/// status is another's), else how the job did (killed by its
+/// [`Job::signal`], else exited with its status): an exit with 137 is
+/// `Exit 137`, a `KILL` is `Killed`.
 fn status_text(job: &Job, long: bool, posix: bool, platform: Platform) -> String {
 	match job.state {
 		JobState::Running => String::from("Running"),
 		JobState::Stopped(sig) if long => sig.description(platform),
 		JobState::Stopped(sig) if posix => format!("Stopped(SIG{sig})"),
 		JobState::Stopped(_) => String::from("Stopped"),
-		JobState::Done(0) => String::from("Done"),
-		JobState::Done(status) => match signaled(status, platform) {
-			Some(sig) => sig.description(platform),
-			None if posix => format!("Done({status})"),
-			None => format!("Exit {status}"),
+		JobState::Done(status) => {
+			let last = job.procs.as_deref().and_then(|procs| procs.list.last());
+			let end = last.map_or_else(|| ProcState::ended(status, job.signal), |p| p.state);
+			killed::ended_text(end, posix, platform)
 		},
+	}
+}
+
+/// How process `p` of a job in state `job` shows in `jobs -l` (bash
+/// `printable_job_status` with `JLIST_LONG`): `Running` for each one of a
+/// running job (one stopped too), else how it is: the description of the
+/// signal that stopped it ([`ProcState::Stopped`]; the job's for one the
+/// record holds as running) or how it ended.
+fn process_text(job: JobState, p: ProcState, posix: bool, platform: Platform) -> String {
+	match (job, p) {
+		(JobState::Running, _) => String::from("Running"),
+		(JobState::Stopped(sig), ProcState::Running) => sig.description(platform),
+		(_, state) => killed::ended_text(state, posix, platform),
 	}
 }
 
@@ -108,60 +117,88 @@ enum Form {
 }
 
 /// What `jobs` prints a line for besides its text.
-struct Show<'h> {
-	posix:    bool,
-	home:     Option<&'h [u8]>,
-	platform: Platform,
+pub struct Show<'h> {
+	/// `set -o posix` (`Done(N)`, `Stopped(SIGTSTP)`).
+	pub posix:    bool,
+	/// `$HOME`, for the `(wd: …)` note.
+	pub home:     Option<&'h [u8]>,
+	/// The signal numbers and descriptions.
+	pub platform: Platform,
 }
 
-/// One `jobs` line for job `number` (bash `pretty_print_job`), marking the
-/// job reported (`-p` does not).
+/// One `jobs` entry for job `number` (bash `pretty_print_job`), marking the
+/// job reported (`-p` does not): one line, or with `-l` one line for each
+/// of its processes ([`Job::procs`], bash `print_pipeline` with
+/// `JLIST_LONG`), ` &` and the `(wd: …)` note after the last command. `-p`
+/// prints the pid of the job's first process (bash's `pipe->pid`, the
+/// process group's leader), not `$!`'s, which names the last one.
 fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 	let Some(job) = ctx.vp.jobs.get(number) else {
 		return;
 	};
 	if form == Form::Pids {
-		let line = format!("{}\n", job.pid());
+		let first = job.procs.as_deref().and_then(|procs| procs.list.first());
+		let line = format!("{}\n", first.map_or_else(|| job.pid(), JobProc::pid));
 		ctx.out(line.as_bytes());
 		return;
 	}
 	if form == Form::Changed && job.notified {
 		return;
 	}
-	let long = form == Form::Long;
-	let mark = if ctx.vp.jobs.current == Some(number) {
+	if let Some(line) = job_line(ctx.vp, number, form == Form::Long, show) {
+		ctx.out(&line);
+	}
+	if let Some(job) = ctx.vp.jobs.get_mut(number) {
+		job.notified = true;
+	}
+}
+
+/// Job `number`'s `jobs` line (bash `pretty_print_job` with
+/// `JLIST_STANDARD`, or with `long` `JLIST_LONG`, one line for each of its
+/// processes): `[n]+  `, how it is ([`status_text`], from how the job and
+/// its processes ended, never from its status alone) padded to bash's
+/// column, then its command. Also the line of bash's notice of a job that
+/// stopped or ended in the background ([`jobctl::notice_line`]). `None`
+/// when there is no such job.
+pub fn job_line(vp: &Vproc, number: u32, long: bool, show: &Show<'_>) -> Option<Vec<u8>> {
+	let job = vp.jobs.get(number)?;
+	let mark = if vp.jobs.current == Some(number) {
 		'+'
-	} else if ctx.vp.jobs.previous == Some(number) {
+	} else if vp.jobs.previous == Some(number) {
 		'-'
 	} else {
 		' '
 	};
-	let status = status_text(job, long, show.posix, show.platform);
-	let mut line = Vec::with_capacity(64);
+	let mut tail = Vec::new();
+	if job.state == JobState::Running {
+		tail.extend_from_slice(b" &");
+	}
+	if job.wd != vp.cwd {
+		tail.extend_from_slice(b"  (wd: ");
+		tail.extend_from_slice(&dirstack::polite(show.home, &job.wd, false));
+		tail.push(b')');
+	}
+	let (posix, platform) = (show.posix, show.platform);
+	let shown = |p| process_text(job.state, p, posix, platform);
+	let each = match job.procs.as_deref() {
+		Some(procs) if long => killed::process_lines(&procs.list, shown, &tail),
+		_ => None,
+	};
+	let (pid, status, text) = each.unwrap_or_else(|| {
+		(job.pid(), status_text(job, long, posix, platform), [job.text.as_slice(), &tail].concat())
+	});
+	let mut line = Vec::with_capacity(64 + text.len());
 	let _ = write!(line, "[{number}]{mark} ");
 	if long {
-		let _ = write!(line, "{:5} ", job.pid());
+		let _ = write!(line, "{pid:5} ");
 	} else {
 		line.push(b' ');
 	}
 	line.extend_from_slice(status.as_bytes());
-	// C's `%*s` with a negative width pads to its absolute value.
-	let pad = (27 - i64::try_from(status.len()).unwrap_or(27)).unsigned_abs();
-	line.resize(line.len() + usize::try_from(pad).unwrap_or(0), b' ');
-	line.extend_from_slice(&job.text);
-	if job.state == JobState::Running {
-		line.extend_from_slice(b" &");
-	}
-	if job.wd != ctx.vp.cwd {
-		line.extend_from_slice(b"  (wd: ");
-		line.extend_from_slice(&dirstack::polite(show.home, &job.wd, false));
-		line.push(b')');
-	}
+	line.resize(line.len() + killed::padding(&status), b' ');
+	line.extend_from_slice(&text);
 	line.push(b'\n');
-	ctx.out(&line);
-	if let Some(job) = ctx.vp.jobs.get_mut(number) {
-		job.notified = true;
-	}
+	Some(line)
 }
 
 /// Forget finished jobs whose state was reported (bash
@@ -434,7 +471,7 @@ fn resume(ctx: &mut Ctx<'_, '_>, number: u32) {
 		return;
 	};
 	if matches!(job.state, JobState::Stopped(_)) {
-		job.state = JobState::Running;
+		job.set_running();
 		let id = job.id;
 		ControlHandle(ctx.k.ctl.clone()).signal(SigTarget::Job(id), Signal::Cont);
 	}
