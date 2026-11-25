@@ -531,6 +531,10 @@ pub struct Kernel {
 	/// then on (kept in `MiscKey::StartNs`, [`StartRecord`]); a forked vproc
 	/// has its own ([`proc::Clock`]).
 	pub seconds_plain:      bool,
+	/// `unset` in bash code removed these value cells of the shell (bits of
+	/// `dynvars::CELLS` indices): plain variables from then on (kept in
+	/// `MiscKey::CellsPlain`); a forked vproc has its own ([`proc::Clock`]).
+	pub cells_plain:        u16,
 	/// A subshell's redirections are being expanded
 	/// ([`redir::apply_in_child`]): bash expands them in the child, after
 	/// the fork, so a lookup of the special `RANDOM` or `SECONDS` there
@@ -711,6 +715,7 @@ impl Kernel {
 			start_ns: 0,
 			seconds: 0,
 			seconds_plain: false,
+			cells_plain: 0,
 			redirs_in_child: false,
 			arith_replay: None,
 			startup: Vec::new(),
@@ -783,6 +788,7 @@ impl Kernel {
 			seconds:       p.clock.map_or(self.seconds, |c| c.seconds),
 			seconds_plain: self.plain(p, dynvars::Special::Seconds),
 			random_plain:  self.plain(p, dynvars::Special::Random),
+			cells_plain:   p.clock.map_or(self.cells_plain, |c| c.cells_plain),
 		}
 	}
 
@@ -903,6 +909,25 @@ impl Kernel {
 				self.write_start(store);
 			},
 		}
+	}
+
+	/// Whether `unset` removed the value cell `dynvars::CELLS[i]` of `vp` in
+	/// bash code.
+	pub fn cell_plain(&self, vp: &Vproc, i: usize) -> bool {
+		(vp.clock.map_or(self.cells_plain, |c| c.cells_plain) & (1 << i)) != 0
+	}
+
+	/// `unset` of the value cell `dynvars::CELLS[i]` in bash code: a plain
+	/// variable of `vp` from now on. The shell's is written through.
+	pub fn set_cell_plain(&mut self, store: &mut dyn StateStore, vp: &mut Vproc, i: usize) {
+		if let Some(c) = vp.clock.as_mut() {
+			c.cells_plain |= 1 << i;
+			return;
+		}
+		self.cells_plain |= 1 << i;
+		self
+			.root
+			.set_misc(store, MiscKey::CellsPlain, self.cells_plain.to_string());
 	}
 
 	/// The shell's clock record ([`StartRecord`]).

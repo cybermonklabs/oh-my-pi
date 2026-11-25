@@ -1647,27 +1647,17 @@ fn all_vars(ctx: &mut Ctx<'_, '_>, declared: bool) -> Result<Vec<(BString, Var)>
 			_ => None,
 		})
 		.collect();
-	// bash lists its alias and command-hash tables as the associative
-	// arrays `BASH_ALIASES` and `BASH_CMDS`.
-	for (name, table) in [(&b"BASH_ALIASES"[..], Table::Alias), (b"BASH_CMDS", Table::CmdHash)] {
-		if vars.iter().any(|(n, _)| n.as_slice() == name) {
-			continue;
-		}
-		let items = state::scan(&ctx.k.root, ctx.cx.store, ctx.vp, table)?
-			.into_iter()
-			.filter_map(|(k, r)| match (k, r) {
-				(KeyBuf::Alias(n), Record::Alias(v))
-				| (KeyBuf::CmdHash(n), Record::CmdHash { path: v, .. }) => Some((n, v)),
-				_ => None,
-			})
-			.collect();
-		vars.push((BString::from(name), Var { attrs: Attrs::NONE, value: VarValue::Assoc(items) }));
-	}
-	// bash's call-stack arrays and `DIRSTACK` are real arrays there.
+	// bash's call-stack arrays are real arrays there.
 	for (name, var) in crate::bash::vm::callstack::listed(ctx.k, ctx.cx.store, ctx.vp)? {
 		if !vars.iter().any(|(n, _)| *n == name) {
 			vars.push((name, var));
 		}
+	}
+	// bash's value cells (`BASH_ALIASES`, `BASH_CMDS`, `DIRSTACK`, `LINENO`,
+	// …): what their last lookup left, by attributes alone before one.
+	dynvars::with_cells(ctx.k, ctx.cx.store, ctx.vp, &mut vars, declared)?;
+	if !declared {
+		vars.retain(|(_, v)| !v.attrs.contains(Attrs::INVISIBLE));
 	}
 	vars.sort_by(|a, b| a.0.cmp(&b.0));
 	Ok(vars)
@@ -1956,9 +1946,29 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				func_local(ctx, name)?
 			} else {
 				// bash's `declare -p` looks the name up (`find_variable`): a
-				// special `RANDOM` or `SECONDS` runs its value function.
+				// special `RANDOM` or `SECONDS`, or another dynamic variable,
+				// runs its value function (a value cell keeps the result).
 				dynvars::look(ctx.k, ctx.cx, ctx.vp, name, Site::Declare)?;
-				declared(ctx, name)?
+				let computed = crate::bash::vm::expand::look_dynamic(ctx.k, ctx.cx, ctx.vp, name)?;
+				let bash = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
+				match declared(ctx, name)?.or(computed) {
+					// `FUNCNAME` outside a function is declared and invisible.
+					None if bash && name.as_slice() == b"FUNCNAME" => Some(Var {
+						attrs: Attrs::INDEXED.with(Attrs::INVISIBLE),
+						value: VarValue::Indexed(Vec::new()),
+					}),
+					// An associative cell a lookup left without a value
+					// ([`dynvars::keep_cell`]) prints as `()`.
+					Some(mut v)
+						if bash
+							&& matches!(name.as_slice(), b"BASH_ALIASES" | b"BASH_CMDS")
+							&& matches!(&v.value, VarValue::Assoc(a) if a.is_empty()) =>
+					{
+						v.attrs = v.attrs.without(Attrs::INVISIBLE);
+						Some(v)
+					},
+					v => v,
+				}
 			};
 			if let Some(var) = var {
 				declare_line(name, Some(&var), &mut out);
@@ -2468,6 +2478,13 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		} else {
 			level
 		};
+		// bash's `export`, `readonly` and `declare` look the name up
+		// (`find_variable`), which runs a value cell's function and keeps the
+		// value: `export DIRSTACK; declare -p` is `declare -ax DIRSTACK=(…)`.
+		// A function's new local of the name is its own plain variable.
+		if level != Level::Local && dynvars::cell_attrs(name).is_some() {
+			crate::bash::vm::expand::look_dynamic(ctx.k, ctx.cx, ctx.vp, name)?;
+		}
 		let mut cur = match current(ctx.k, ctx.cx, ctx.vp, name, level) {
 			Ok(v) => v,
 			Err(d) => {
@@ -2628,6 +2645,25 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			continue;
 		}
 		let exists = cur.is_some();
+		// bash's value-cell variables exist from its startup with their
+		// attributes ([`dynvars::CELLS`]), so a declaration that makes the
+		// record keeps them unless it takes them off: `readonly SRANDOM` is
+		// `declare -ir SRANDOM`, `declare +i SRANDOM` is `declare --`. The
+		// array kinds are left out: the value a lookup keeps carries them,
+		// and `declare -p` prints them from it (`export DIRSTACK` is
+		// `declare -ax DIRSTACK`). A function's new local of the name, and
+		// the name after `unset` removed the cell, are plain variables.
+		let cell = if level != Level::Local
+			&& ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+			&& !dynvars::cell_index(name).is_some_and(|i| ctx.k.cell_plain(ctx.vp, i))
+		{
+			dynvars::cell_attrs(name)
+				.unwrap_or(Attrs::NONE)
+				.without(Attrs::INDEXED)
+				.without(Attrs::ASSOC)
+		} else {
+			Attrs::NONE
+		};
 		let mut var = cur.unwrap_or_else(|| {
 			let value = if on.contains(Attrs::ASSOC) {
 				VarValue::Assoc(Default::default())
@@ -2636,7 +2672,7 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			} else {
 				VarValue::Str(BString::default())
 			};
-			Var { attrs: Attrs::NONE, value }
+			Var { attrs: cell, value }
 		});
 		// A declared local is no longer the call's prefix variable.
 		if level == Level::Local {
@@ -3460,6 +3496,28 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			let keep = ctx.option(OptId::LocalvarUnset)?;
 			state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keep);
 			ctx.k.set_plain(ctx.cx.store, ctx.vp, s);
+			continue;
+		}
+		// The same for a value cell (`unset SRANDOM`, `unset LINENO`): bash
+		// removes the dynamic variable, so `declare -p` and `set` no longer
+		// list it and a lookup no longer computes it. A local or temporary
+		// of the name is only that one's, and a readonly one is refused
+		// below.
+		if !o.has(b'n')
+			&& !o.has(b'f')
+			&& index.is_none()
+			&& ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+			&& let Some(i) = dynvars::cell_index(name)
+			&& state::lookup_declared_scoped(&ctx.k.root, ctx.cx.store, ctx.vp, name)?
+				.1
+				.is_none()
+			&& !var
+				.as_ref()
+				.is_some_and(|(attrs, ..)| attrs.contains(Attrs::READONLY))
+		{
+			let keep = ctx.option(OptId::LocalvarUnset)?;
+			state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keep);
+			ctx.k.set_cell_plain(ctx.cx.store, ctx.vp, i);
 			continue;
 		}
 		if var.is_none() && !o.has(b'v') && !o.has(b'n') && index.is_none() {
