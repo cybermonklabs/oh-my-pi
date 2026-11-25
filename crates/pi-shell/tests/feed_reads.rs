@@ -244,21 +244,26 @@ kill $h 2>/dev/null
 :"#,
 		"v=p r=ready",
 	),
+	// 30,000 lines are 168,894 bytes: more than the feed's OS pipe (64 KiB)
+	// and the pump's chunk (64 KiB) behind it, so the pump's write waits for
+	// room while the shell reads. A pump that lost the bytes of a write that
+	// waited failed this row from 30,000 lines on gVisor and from 20,000 on
+	// runc; 10,000 lines (48,894 bytes) never fill the pipe and pass it.
 	(
 		"every line once and in order past a full pipe",
-		r#"exec 4< <(seq 1 100000; read -r _ < "$D/gate")
+		r#"exec 4< <(seq 1 30000; read -r _ < "$D/gate")
 /bin/sleep 1000 <&4 &
 h=$!
 sleep 1
 i=0
-while [ $i -lt 100000 ] && read -r l <&4; do
+while [ $i -lt 30000 ] && read -r l <&4; do
 	i=$((i + 1))
 	[ "$l" = "$i" ] || break
 done
 echo "n=$i"
 kill $h 2>/dev/null
 :"#,
-		"n=100000",
+		"n=30000",
 	),
 ];
 
@@ -266,9 +271,10 @@ kill $h 2>/dev/null
 /// then for its shell to end once the line came. Each is at least twice the
 /// longest correct run of the row, obash's or bash's, measured on gVisor at
 /// 1952m CPU beside 64 busy loops (builds Jobs, tags `fb-20261124T1057` and
-/// `fb-20261124T1613`, 54 runs as uid 1000 and as root), and at least
-/// [`HANG`]. A shell that does not
-/// end within its bound fails its row, so a hang still fails.
+/// `fb-20261124T1613`, 54 runs as uid 1000 and as root; the full-pipe row at
+/// 30,000 lines, tag `fb-20261124T2347`, 12 runs), and at least [`HANG`]. A
+/// shell that does not end within its bound fails its row, so a hang still
+/// fails.
 const BOUNDS: &[(&str, Duration, Duration)] = &[
 	// Longest correct run: line 2.69 s, end 0.70 s.
 	("a holder that never reads", HANG, HANG),
@@ -284,8 +290,8 @@ const BOUNDS: &[(&str, Duration, Duration)] = &[
 	("stdin a deferral's own redirection replaces", HANG, HANG),
 	// Longest correct run: line 3.01 s, end 0.60 s.
 	("readiness after a read through the feed", HANG, HANG),
-	// Longest correct run: line 455.4 s (bash; obash 221.3 s), end 0.65 s.
-	("every line once and in order past a full pipe", Duration::from_mins(20), HANG),
+	// Longest correct run: line 153.4 s (bash; obash 91.8 s), end 0.50 s.
+	("every line once and in order past a full pipe", Duration::from_mins(6), HANG),
 ];
 
 /// The bounds of `row` ([`BOUNDS`]): its line's, then its end's.
