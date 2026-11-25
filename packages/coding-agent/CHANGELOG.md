@@ -332,6 +332,7 @@
 - Fixed `test -v` and `[[ -v` in the `bash` tool's bash code on array subscripts: a command substitution in the subscript runs as in bash (`[[ -v 'a[$(echo 1)]' ]]` was an arithmetic syntax error), and `-v` sees bash's dynamic arrays (`[[ -v PIPESTATUS[0] ]]` was false)
 - Fixed arithmetic through a name reference to an associative array in the `bash` tool's bash code: `declare -n r=A; $((r[k]))` read element 0 instead of the key `k`, and `$((r[@]))` was a syntax error
 - Fixed a session tool that browser code called (`tool.<name>(…)`) running on after its tab was killed or its tab worker replaced (as after a run timed out): the call is now aborted
+- Fixed host output written while a browser run's tool call ran (in RPC mode a protocol frame, in print mode a record) going into the cmux, Tern or inline-worker run's output instead of omp's stdout, and output from work that call started being lost once the run ended: the embedder's side of a tool call now runs outside the run, so it no longer writes into the run
 
 ### Security
 
