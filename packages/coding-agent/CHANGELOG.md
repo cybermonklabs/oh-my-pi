@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- `task.namedModelFallback` (default `true`): set it to `false` and a subagent whose model is named by selector (agent `model`, `task.agentModelOverrides`, SDK `modelOverride`) runs only on the models it names, in order, and fails instead of substituting the parent's model on missing credentials or moving to a `retry.fallbackChains` or context promotion model; role aliases such as `@task` keep their role's chain
+- `retry.fallbackNotice` (default `false`): with it on, a session whose model changed through a retry fallback, or that returned to its primary, gets one hidden notice naming the model now serving it and why, once a turn has been served on it; a running session sees it on its next model request
+
 ## [18.18.4] - 2026-11-09
 
 ### Added

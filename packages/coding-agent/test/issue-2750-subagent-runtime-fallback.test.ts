@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -861,5 +861,251 @@ describe("subagent runtime fallback on a real provider error", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.resolvedModel).toBe("fallback/working-model");
 		expect(result.resolvedModelIsFallback).toBe(true);
+	});
+
+	const NAMED = "anthropic/claude-opus-4";
+	const LISTED = "anthropic/claude-sonnet-4";
+	const OTHER = "google/gemini-2.5-pro";
+
+	/** A child model that fails every request with {@link OVERLOADED}, or yields at once. */
+	function workerModel(selector: string, fails: boolean, contextWindow?: number): MockModel {
+		const [provider, id] = selector.split("/");
+		if (fails) return createMockModel({ provider, id, contextWindow, handler: () => ({ throw: OVERLOADED }) });
+		return createMockModel({
+			provider,
+			id,
+			contextWindow,
+			handler: context =>
+				context.messages.at(-1)?.role === "toolResult"
+					? { content: ["ok"] }
+					: { content: [{ type: "toolCall", name: "yield", arguments: { type: "result", data: "recovered" } }] },
+		});
+	}
+
+	/** Parent settings for a `named-worker` run; `extra` adds roles, chains and `task.namedModelFallback`. */
+	function namedWorkerSettings(extra: Record<string, unknown>): Settings {
+		return Settings.isolated({
+			"task.agentIdleTtlMs": 0,
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxRetries": 2,
+			"todo.enabled": false,
+			"todo.reminders": false,
+			"advisor.enabled": false,
+			...extra,
+		});
+	}
+
+	/** Spawns a real `named-worker` child that can reach exactly `models`. */
+	async function runNamedWorker(
+		id: string,
+		models: MockModel[],
+		settings: Settings,
+		spawn: {
+			agentModel?: string[];
+			modelOverride?: string[];
+			modelRole?: string;
+			parentActiveModelPattern?: string;
+			authedProviders?: string[];
+		},
+	) {
+		const authStorage = createInMemoryAuthStorage();
+		const authed = spawn.authedProviders ?? models.map(mock => mock.provider);
+		for (const provider of authed) authStorage.keys.setRuntime(provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const find = modelRegistry.find.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "find").mockImplementation(
+			(provider, modelId) =>
+				models.find(m => m.provider === provider && m.id === modelId) ?? find(provider, modelId),
+		);
+		const hasProvider = modelRegistry.hasProvider.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "hasProvider").mockImplementation(
+			provider => models.some(m => m.provider === provider) || hasProvider(provider),
+		);
+		vi.spyOn(modelRegistry, "getAvailable").mockImplementation(() => models);
+		try {
+			return await runSubprocess({
+				cwd: path.join(root, "home", "work"),
+				agent: {
+					name: "named-worker",
+					description: "test",
+					systemPrompt: "test",
+					tools: ["read"],
+					source: "bundled",
+					model: spawn.agentModel,
+				},
+				task: "work",
+				index: 0,
+				id,
+				modelOverride: spawn.modelOverride,
+				modelRole: spawn.modelRole,
+				parentActiveModelPattern: spawn.parentActiveModelPattern,
+				authStorage,
+				modelRegistry,
+				settings,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			});
+		} finally {
+			authStorage.close();
+		}
+	}
+
+	it("fails on a named agent model instead of walking its model-keyed chain when task.namedModelFallback is off", async () => {
+		const named = workerModel(NAMED, true);
+		const other = workerModel(OTHER, false);
+		const result = await runNamedWorker(
+			"NamedSingle",
+			[named, other],
+			namedWorkerSettings({
+				"task.namedModelFallback": false,
+				modelRoles: { default: NAMED },
+				"retry.fallbackChains": { [NAMED]: [OTHER], "anthropic/*": [OTHER], default: [OTHER] },
+			}),
+			{ agentModel: [NAMED] },
+		);
+		expect(named.calls.length).toBeGreaterThan(0);
+		expect(other.calls).toHaveLength(0);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.resolvedModelIsFallback).toBeFalsy();
+		expect(result.error).toContain(`[${NAMED}]`);
+		expect(result.error).toContain(OVERLOADED);
+	});
+
+	it("falls back only to the later entries of a named model list when task.namedModelFallback is off", async () => {
+		const named = workerModel(NAMED, true);
+		const listed = workerModel(LISTED, true);
+		const other = workerModel(OTHER, false);
+		const result = await runNamedWorker(
+			"NamedList",
+			[named, listed, other],
+			namedWorkerSettings({
+				"task.namedModelFallback": false,
+				"retry.fallbackChains": { [NAMED]: [OTHER], [LISTED]: [OTHER], default: [OTHER] },
+			}),
+			{ modelOverride: [NAMED, LISTED] },
+		);
+		expect(named.calls.length).toBeGreaterThan(0);
+		expect(listed.calls.length).toBeGreaterThan(0);
+		expect(other.calls).toHaveLength(0);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.error).toContain(`[${LISTED}]`);
+		expect(result.error).toContain(OVERLOADED);
+	});
+
+	it("keeps a role alias on its role's chain when task.namedModelFallback is off", async () => {
+		const named = workerModel(NAMED, true);
+		const other = workerModel(OTHER, false);
+		const result = await runNamedWorker(
+			"RoleAlias",
+			[named, other],
+			namedWorkerSettings({
+				"task.namedModelFallback": false,
+				modelRoles: { "worker-role": NAMED },
+				"retry.fallbackChains": { "worker-role": [OTHER] },
+			}),
+			{ agentModel: ["@worker-role"], modelOverride: [NAMED], modelRole: "worker-role" },
+		);
+		expect(other.calls.length).toBeGreaterThan(0);
+		expect(result.exitCode).toBe(0);
+		expect(result.resolvedModel).toBe(OTHER);
+		expect(result.resolvedModelIsFallback).toBe(true);
+	});
+
+	it("keeps the parent session's own model-keyed chain while a named child runs held to its list", async () => {
+		const named = workerModel(NAMED, true);
+		const other = workerModel(OTHER, false);
+		const models = [named, other];
+		const settings = namedWorkerSettings({
+			"task.namedModelFallback": false,
+			modelRoles: { default: NAMED },
+			"retry.fallbackChains": { [NAMED]: [OTHER] },
+		});
+		await runNamedWorker("NamedChildParent", models, settings, { agentModel: [NAMED] });
+		const parent = new TurnRecovery(
+			{
+				model: () => named,
+				thinkingLevel: () => undefined,
+				sessionManager: {},
+				settings,
+				modelRegistry: {
+					find: (provider: string, id: string) => models.find(m => m.provider === provider && m.id === id),
+					hasProvider: (provider: string) => models.some(m => m.provider === provider),
+					getAvailable: () => models,
+				},
+				configWarnings: [],
+			} as unknown as TurnRecoveryHost,
+			{ deferFallbackChainValidation: true },
+		);
+		const candidates = parent
+			.retryFallbackChainKeys(NAMED)
+			.flatMap(role => parent.findRetryFallbackCandidates(role, NAMED).map(candidate => candidate.raw));
+		expect(candidates).toEqual([OTHER]);
+	});
+
+	it("does not move a named model to its context promotion target when task.namedModelFallback is off", async () => {
+		const named = Object.assign(
+			createMockModel({
+				provider: "anthropic",
+				id: "claude-opus-4",
+				contextWindow: 4_000,
+				handler: () => ({ throw: "prompt is too long: 5000 tokens > 4000 maximum" }),
+			}),
+			{ contextPromotionTarget: OTHER },
+		);
+		const other = workerModel(OTHER, false, 1_000_000);
+		const result = await runNamedWorker(
+			"NamedPromotion",
+			[named, other],
+			namedWorkerSettings({ "task.namedModelFallback": false, "contextPromotion.enabled": true }),
+			{ agentModel: [NAMED] },
+		);
+		expect(other.calls).toHaveLength(0);
+		expect(result.exitCode).not.toBe(0);
+	});
+
+	it("still walks a named agent model's model-keyed chain by default", async () => {
+		const named = workerModel(NAMED, true);
+		const other = workerModel(OTHER, false);
+		const result = await runNamedWorker(
+			"NamedDefault",
+			[named, other],
+			namedWorkerSettings({ "retry.fallbackChains": { [NAMED]: [OTHER] } }),
+			{ agentModel: [NAMED] },
+		);
+		expect(other.calls.length).toBeGreaterThan(0);
+		expect(result.exitCode).toBe(0);
+		expect(result.resolvedModel).toBe(OTHER);
+		expect(result.resolvedModelIsFallback).toBe(true);
+	});
+
+	it("fails spawn naming a named model with no credential instead of substituting the parent when task.namedModelFallback is off", async () => {
+		const named = workerModel(NAMED, false);
+		const parent = workerModel(OTHER, false);
+		const result = await runNamedWorker(
+			"NamedNoCredOff",
+			[named, parent],
+			namedWorkerSettings({ "task.namedModelFallback": false }),
+			{ agentModel: [NAMED], parentActiveModelPattern: OTHER, authedProviders: ["google"] },
+		);
+		expect(named.calls).toHaveLength(0);
+		expect(parent.calls).toHaveLength(0);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.error).toContain(NAMED);
+	});
+
+	it("still substitutes the parent's model on missing spawn credentials by default", async () => {
+		const named = workerModel(NAMED, false);
+		const parent = workerModel(OTHER, false);
+		const result = await runNamedWorker("NamedNoCredDefault", [named, parent], namedWorkerSettings({}), {
+			agentModel: [NAMED],
+			parentActiveModelPattern: OTHER,
+			authedProviders: ["google"],
+		});
+		expect(named.calls).toHaveLength(0);
+		expect(parent.calls.length).toBeGreaterThan(0);
+		expect(result.exitCode).toBe(0);
+		expect(result.resolvedModel).toBe(OTHER);
 	});
 });
