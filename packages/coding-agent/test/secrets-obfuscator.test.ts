@@ -50,6 +50,27 @@ import {
 import { compileSecretRegex } from "@oh-my-pi/pi-coding-agent/secrets/regex";
 import { getActiveProfile, getAgentDir, setProfile } from "@oh-my-pi/pi-utils/dirs";
 
+/** Levels past what a recursive walk reaches (about 22,000) and `JSON.stringify` (40,000); `JSON.parse` reads 400,000. */
+const DEEP_ARGUMENT_LEVELS = 50_000;
+
+/** `{ next: … }` nested {@link DEEP_ARGUMENT_LEVELS} levels around `bottom`. */
+function nestedArguments(bottom: Record<string, string>): Record<string, unknown> {
+	let node: Record<string, unknown> = bottom;
+	for (let level = 0; level < DEEP_ARGUMENT_LEVELS; level++) node = { next: node };
+	return node;
+}
+
+/** How many `next` levels `value` nests, and the object at the bottom. */
+function argumentsNesting(value: unknown): { levels: number; bottom: Record<string, string> } {
+	let levels = 0;
+	let node = value as Record<string, unknown>;
+	while (node.next !== undefined) {
+		node = node.next as Record<string, unknown>;
+		levels++;
+	}
+	return { levels, bottom: node as Record<string, string> };
+}
+
 describe("compileSecretRegex", () => {
 	it("adds global flag when not provided", () => {
 		const regex = compileSecretRegex("api[_-]?key\\s*=\\s*\\w+", "i");
@@ -3334,6 +3355,44 @@ describe("SecretObfuscator cross-turn cache stability", () => {
 		// bytes, matching the cache-stability guarantee `obfuscateMessages` gives
 		// full conversation batches.
 		expect(JSON.stringify(obfuscateToolArguments(obfuscator, obfuscated))).toEqual(serialized);
+	});
+
+	// A tool call's arguments nest as deep as JSON.parse reads (400,000 levels); a recursive walk stops near 22,000.
+	it("hides and restores a secret at the bottom of tool-call arguments nested deeper than a recursive walk reaches", () => {
+		const obfuscator = new SecretObfuscator([{ type: "regex", content: "tok_[a-z0-9]+" }]);
+		const args = { root: nestedArguments({ leaf: "tok_abc123" }) };
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-deep", name: "inspect", arguments: args }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 1,
+		};
+
+		const obfuscated = obfuscateToolArguments(obfuscator, args);
+		const hidden = argumentsNesting(obfuscated.root);
+		expect(hidden.levels).toBe(DEEP_ARGUMENT_LEVELS);
+		expect(hidden.bottom.leaf).not.toContain("tok_abc123");
+		expect(argumentsNesting(deobfuscateToolArguments(obfuscator, obfuscated).root)).toEqual({
+			levels: DEEP_ARGUMENT_LEVELS,
+			bottom: { leaf: "tok_abc123" },
+		});
+
+		// The request a provider gets: the replayed assistant turn's arguments with the secret hidden.
+		const [sent] = obfuscateMessages(obfuscator, [assistant]);
+		const call = (sent as AssistantMessage).content[0];
+		if (call.type !== "toolCall") throw new Error("expected the tool call");
+		expect(argumentsNesting(call.arguments.root)).toEqual(hidden);
 	});
 
 	it("strips a stale friendly prefix from persisted assistant history once a later message reveals the colliding regex secret", () => {

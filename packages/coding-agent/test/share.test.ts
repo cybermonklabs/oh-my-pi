@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
+import type { AssistantMessage, ToolCall } from "@oh-my-pi/pi-ai";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import type { SessionData } from "../src/export/html";
@@ -59,6 +60,27 @@ function sessionData(entries: SessionEntry[], leafId: string): SessionData {
 /** Incompressible filler so gzip cannot absorb the payload. */
 function randomHex(words: number): string {
 	return Array.from(crypto.getRandomValues(new Uint32Array(words)), v => v.toString(16)).join("");
+}
+
+/** Levels past what a recursive walk reaches (about 22,000) and `JSON.stringify` (40,000); `JSON.parse` reads 400,000. */
+const DEEP_LEVELS = 50_000;
+
+/** `{ next: … }` nested {@link DEEP_LEVELS} levels around `bottom`. */
+function nested(bottom: Record<string, unknown>): Record<string, unknown> {
+	let node = bottom;
+	for (let level = 0; level < DEEP_LEVELS; level++) node = { next: node };
+	return node;
+}
+
+/** How many `next` levels `value` nests, and the object at the bottom. */
+function nesting(value: unknown): { levels: number; bottom: Record<string, unknown> } {
+	let levels = 0;
+	let node = value as Record<string, unknown>;
+	while (node.next !== undefined) {
+		node = node.next as Record<string, unknown>;
+		levels++;
+	}
+	return { levels, bottom: node };
 }
 
 describe("sealToFit", () => {
@@ -661,6 +683,38 @@ describe("buildShareSnapshot", () => {
 		expect(flat).not.toContain(plainSecret);
 		expect(flat).not.toContain(regexSecret);
 		expect(flat).not.toContain(`${friendlyName}_`);
+	});
+
+	test("redacts a regex secret at the bottom of tool arguments nested deeper than a recursive walk reaches", () => {
+		const regexSecret = "tok_abc123";
+		const entries: SessionEntry[] = [
+			{
+				type: "message",
+				id: "a1",
+				parentId: null,
+				timestamp: "2026-06-12T00:00:00.000Z",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: nested({ leaf: regexSecret }) }],
+					timestamp: 1,
+				},
+			} as unknown as SessionEntry,
+		];
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => entries,
+			getLeafId: () => "a1",
+		} as unknown as SessionManager;
+		const obfuscator = new SecretObfuscator([{ type: "regex", content: "tok_[a-z0-9]+" }]);
+
+		const snapshot = buildShareSnapshot(sm, { obfuscator });
+
+		const message = snapshot.entries[0] as Extract<SessionEntry, { type: "message" }>;
+		const call = (message.message as AssistantMessage).content[0] as ToolCall;
+		const { levels, bottom } = nesting(call.arguments);
+		expect(levels).toBe(DEEP_LEVELS);
+		expect(bottom).toEqual({ leaf: obfuscator.obfuscate(regexSecret) });
+		expect(bottom.leaf).not.toContain(regexSecret);
 	});
 });
 

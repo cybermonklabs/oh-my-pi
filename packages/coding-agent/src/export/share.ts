@@ -25,8 +25,9 @@ import { $which, logger } from "@oh-my-pi/pi-utils";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { $ } from "bun";
 import { obfuscateToolArguments } from "../secrets/message-transform";
-import type { SecretObfuscator } from "../secrets/obfuscator";
+import type { JsonValue, SecretObfuscator } from "../secrets/obfuscator";
 import { SecretValueSet } from "../secrets/placeholder";
+import { collectJsonRegexSecretValues } from "../secrets/placeholder-scan";
 import { type SessionEntry, type SessionHeader, TITLE_CHANGE_ENTRY_TYPE } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
@@ -114,18 +115,6 @@ function collectShareRegexSecretValues(o: SecretObfuscator, data: SessionData): 
 			values.add(secretValue);
 		}
 	};
-	const addJsonStrings = (value: unknown): void => {
-		if (typeof value === "string") {
-			add(value);
-			return;
-		}
-		if (Array.isArray(value)) {
-			for (const item of value) addJsonStrings(item);
-			return;
-		}
-		if (!isRecord(value)) return;
-		for (const item of Object.values(value)) addJsonStrings(item);
-	};
 	const addContent = (content: string | (TextContent | ImageContent)[]): void => {
 		if (typeof content === "string") {
 			add(content);
@@ -159,7 +148,7 @@ function collectShareRegexSecretValues(o: SecretObfuscator, data: SessionData): 
 					if (block.type === "text") add(block.text);
 					else if (block.type === "thinking") add(block.thinking);
 					else if (block.type === "toolCall") {
-						addJsonStrings(block.arguments);
+						for (const value of collectJsonRegexSecretValues(o, block.arguments as JsonValue)) values.add(value);
 						add(block.intent);
 						add(block.rawBlock);
 					}
