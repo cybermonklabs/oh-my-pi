@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- A classifier refusal (`stopDetails.type` `refusal` or `sensitive`, of any category) is now sent again, unchanged, to the model that refused it, up to two times for each model and inside `retry.maxRetries`, before turn recovery walks `retry.fallbackChains`; with no chain, the turn ends only after those retries. An advisor resends a refused batch to its model the same two times before it strips the primary's reasoning or switches models. A refusal usually judges the sampled reply rather than the request, so the same request is usually answered on the next try
+
+### Fixed
+
+- An abort that cuts a retried request short now ends its retry saga with an `auto_retry_end` (`Retry cancelled`), as an abort during the backoff wait already did; the next turn's retries no longer start with the aborted saga's attempts spent
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

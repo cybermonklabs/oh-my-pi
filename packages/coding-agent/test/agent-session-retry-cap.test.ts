@@ -1715,21 +1715,23 @@ describe("AgentSession retry delay cap", () => {
 		authStorage.keys.setRuntime("opencode-go", "opencode-go-test-key");
 		authStorage.keys.setRuntime("openai", "openai-test-key");
 
+		// The two refusals walk the chain to the exhausted model; each model is refused on its two
+		// same-model retries too before the walk leaves it.
+		const refusal: MockResponse = {
+			content: [{ type: "thinking", thinking: "Classifier refusal." }],
+			errorMessage: "Refusal (cyber): Declined.",
+			stopDetails: { type: "refusal", category: "cyber", explanation: "Declined." },
+			stopReason: "error",
+		};
 		const mock = createMockModel({
 			responses: [
 				{ throw: "503 service unavailable: overloaded_error retry-after-ms=60000" },
-				{
-					content: [{ type: "thinking", thinking: "Classifier refusal." }],
-					errorMessage: "Refusal (cyber): Declined.",
-					stopDetails: { type: "refusal", category: "cyber", explanation: "Declined." },
-					stopReason: "error",
-				},
-				{
-					content: [{ type: "thinking", thinking: "Classifier refusal." }],
-					errorMessage: "Refusal (cyber): Declined.",
-					stopDetails: { type: "refusal", category: "cyber", explanation: "Declined." },
-					stopReason: "error",
-				},
+				refusal,
+				refusal,
+				refusal,
+				refusal,
+				refusal,
+				refusal,
 				{
 					throw: "429 Weekly usage limit reached. Resets in 55min. type=GoUsageLimitError retry-after-ms=3242000",
 				},
@@ -1783,6 +1785,10 @@ describe("AgentSession retry delay cap", () => {
 		expect(requestedModels).toEqual([
 			`${primaryModel.provider}/${primaryModel.id}`,
 			`${alternateOpenCodeModel.provider}/${alternateOpenCodeModel.id}`,
+			`${alternateOpenCodeModel.provider}/${alternateOpenCodeModel.id}`,
+			`${alternateOpenCodeModel.provider}/${alternateOpenCodeModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 			`${exhaustedModel.provider}/${exhaustedModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
