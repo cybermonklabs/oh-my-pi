@@ -1,5 +1,5 @@
-import { isDeepStrictEqual } from "node:util";
-import { stringifyDeepJson, stringifyJsonIteratively } from "@oh-my-pi/pi-utils/json";
+import { jsonDeepEquals, stringifyDeepJson, stringifyJsonIteratively } from "@oh-my-pi/pi-utils/json";
+import { ContainerPath, type NestedWalk, runNested } from "@oh-my-pi/pi-utils/nested-walk";
 import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 import type { RpcChunkFrame } from "./rpc-types";
 
@@ -156,28 +156,51 @@ function shrinkString(value: string, cap: number): string {
 	return `${value.slice(0, headLength)}\n…[${value.length - headLength} chars elided for RPC frame]`;
 }
 
+/**
+ * `value` with each string past the pass's cap shortened and each array and object past its
+ * limits cut. The walk keeps its own stack ({@link runNested}): an event frame carries a tool's
+ * result, as deep as a transcript line holds.
+ */
 function shrinkValue(value: unknown, pass: ShrinkPass): unknown {
 	if (typeof value === "string") return shrinkString(value, pass.stringCap);
+	return Array.isArray(value) || isRecord(value) ? runNested(shrunkNode(value, pass, new ContainerPath())) : value;
+}
+
+/** {@link shrinkValue} of `value`, an array or record `path` is inside of; each child array or record is a nested step. */
+function* shrunkNode(value: object, pass: ShrinkPass, path: ContainerPath): NestedWalk {
+	path.enter(value);
 	if (Array.isArray(value)) {
 		const keep = Math.min(value.length, pass.arrayLimit);
 		// oxlint-disable-next-line unicorn/no-new-array -- length preallocation
 		const output: unknown[] = new Array(keep + (keep < value.length ? 1 : 0));
-		for (let index = 0; index < keep; index++) output[index] = shrinkValue(value[index], pass);
-		if (keep < value.length) output[keep] = `…[${value.length - keep} items elided for RPC frame]`;
-		return output;
-	}
-	if (isRecord(value)) {
-		const entries = Object.entries(value);
-		const keep = Math.min(entries.length, pass.objectLimit);
-		const output: Record<string, unknown> = {};
 		for (let index = 0; index < keep; index++) {
-			const [key, item] = entries[index];
-			output[key] = shrinkValue(item, pass);
+			const item: unknown = value[index];
+			output[index] =
+				typeof item === "string"
+					? shrinkString(item, pass.stringCap)
+					: Array.isArray(item) || isRecord(item)
+						? yield shrunkNode(item, pass, path)
+						: item;
 		}
-		if (keep < entries.length) output.rpcFrameElidedKeys = entries.length - keep;
+		if (keep < value.length) output[keep] = `…[${value.length - keep} items elided for RPC frame]`;
+		path.leave(value);
 		return output;
 	}
-	return value;
+	const entries = Object.entries(value);
+	const keep = Math.min(entries.length, pass.objectLimit);
+	const output: Record<string, unknown> = {};
+	for (let index = 0; index < keep; index++) {
+		const [key, item] = entries[index];
+		output[key] =
+			typeof item === "string"
+				? shrinkString(item, pass.stringCap)
+				: Array.isArray(item) || isRecord(item)
+					? yield shrunkNode(item, pass, path)
+					: item;
+	}
+	if (keep < entries.length) output.rpcFrameElidedKeys = entries.length - keep;
+	path.leave(value);
+	return output;
 }
 
 function jsonSnapshot(value: unknown): unknown {
@@ -308,10 +331,7 @@ function compactTerminalFrame(
 	if (streamedMessages) {
 		streamed = 0;
 		const limit = Math.min(streamedMessages.length, frame.messages.length);
-		while (
-			streamed < limit &&
-			isDeepStrictEqual(streamedMessages[streamed], jsonSnapshot(frame.messages[streamed]))
-		) {
+		while (streamed < limit && jsonDeepEquals(streamedMessages[streamed], jsonSnapshot(frame.messages[streamed]))) {
 			streamed++;
 		}
 	}

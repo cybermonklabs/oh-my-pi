@@ -396,4 +396,40 @@ describe("RPC frame encoding", () => {
 		expect(nativePass).toBe(false);
 		expect(encoded).toBe(`${JSON.stringify(frame)}\n`);
 	});
+
+	// A tool returns any JSON and its result rides an event frame as deep as a transcript line holds; a frame
+	// over 1 MiB is shrunk, and an `agent_end` over it drops the messages already streamed.
+	describe("a frame over 1 MiB holding a value nested 50,000 levels", () => {
+		const nested = (leaf: string): Record<string, unknown> => {
+			let node: Record<string, unknown> = { leaf };
+			for (let level = 0; level < 50_000; level++) node = { next: node };
+			return node;
+		};
+		const levelsOf = (value: unknown): number => {
+			let levels = 0;
+			for (let node = value; typeof node === "object" && node !== null && "next" in node; node = node.next) levels++;
+			return levels;
+		};
+		const big = "z".repeat(2 * MAX_RPC_FRAME_BYTES);
+
+		it("shrinks the frame's strings and keeps the nested value", () => {
+			const frame = decode(
+				encodeRpcFrame({ type: "tool_execution_end", result: { details: nested("bottom"), big } }),
+			);
+			const result = frame.result as Record<string, unknown>;
+			expect(levelsOf(result.details)).toBe(50_000);
+			expect(String(result.big).length).toBeLessThan(big.length);
+		}, 60_000);
+
+		it("drops the streamed message from an agent_end", () => {
+			const message = { role: "toolResult", details: nested("bottom") };
+			const streamed = JSON.parse(JSON.stringify({ role: "toolResult", details: { leaf: "stand-in" } }));
+			streamed.details = nested("bottom");
+			const frame = decode(
+				encodeRpcFrame({ type: "agent_end", messages: [message, { role: "user", content: big }] }, 0, [streamed]),
+			);
+			expect(frame.messageCount).toBe(2);
+			expect((frame.messages as Array<Record<string, unknown>>).map(entry => entry.role)).toEqual(["user"]);
+		}, 60_000);
+	});
 });
