@@ -13,7 +13,7 @@ use crate::bash::{
 	vm::{
 		exec::push_script,
 		locale,
-		probe::{absolute, candidates},
+		probe::{absolute, candidates, shown_candidate},
 		proc::{Probe, ProbeResult, ScriptKind},
 		quote,
 	},
@@ -69,6 +69,10 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	};
 	let posix = ctx.option(OptId::Posix)?;
 	let mut path = None;
+	// bash's `_evalfile` names the file it found: the name as given, or
+	// the `$PATH` candidate as `find_path_file` built it, `dir/name` with
+	// the entry as written (`./s2` for `PATH=.`), not the probed path.
+	let mut shown = None;
 	if !file.contains(&b'/') {
 		let search = match search_arg {
 			Some(p) if p.is_empty() => Some(BString::from(".")),
@@ -78,11 +82,19 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		};
 		if let Some(search) = search {
 			let cwd = ctx.vp.cwd.clone();
-			for cand in candidates(&search, file, &cwd, ctx.k.engine.config().platform, &[]) {
+			let platform = ctx.k.engine.config().platform;
+			for (i, cand) in candidates(&search, file, &cwd, platform, &[])
+				.into_iter()
+				.enumerate()
+			{
 				if let ProbeResult::Stat(Some(st)) =
 					ctx.probe(Probe::Stat { path: cand.clone(), follow: true })?
 					&& st.kind == StatKind::File
 				{
+					// `PATHEXT` spellings name the file itself on Windows.
+					if platform != crate::bash::ids::Platform::Windows {
+						shown = shown_candidate(&search, file, i);
+					}
 					path = Some(cand);
 					break;
 				}
@@ -96,8 +108,9 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			}
 		}
 	}
-	// bash's `_evalfile` names the file it found.
-	let shown = path.clone().unwrap_or_else(|| file.clone());
+	let shown = shown
+		.or_else(|| path.clone())
+		.unwrap_or_else(|| file.clone());
 	let path = path.unwrap_or_else(|| absolute(&ctx.vp.cwd, file));
 	let text = match ctx.probe(Probe::Read { path: path.clone() })? {
 		ProbeResult::Bytes(Ok(text)) => text,
@@ -133,12 +146,13 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	let restore = source_args(ctx, rest, true)?;
 	// As for `eval`: the file sees the caller's `$?`.
 	push_script(ctx.vp, &text, 1, ScriptKind::Source);
-	// `BASH_SOURCE` shows the name as given.
+	// `BASH_SOURCE` shows the file `_evalfile` found: the name as given,
+	// or the candidate a `$PATH` search chose (`./s` for `PATH=.`).
 	crate::bash::vm::callstack::push_source(
 		ctx.k,
 		ctx.cx.store,
 		ctx.vp,
-		file.clone(),
+		shown,
 		ctx.line,
 		rest,
 		restore,

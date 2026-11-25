@@ -1027,16 +1027,37 @@ impl Kernel {
 			.and_then(|r| r.chain.links.first())
 			.map_or(&COMMAND, |l| &l.origin);
 		let utf8 = locale::is_utf8(self, cx.store, vp);
-		// An in-engine nested shell names itself (its `$0`).
-		let shell_name = match vp
-			.overlay
-			.as_ref()
-			.and_then(|o| o.records.get(&KeyBuf::Misc(MiscKey::Argv0)))
-		{
-			Some(Some(Record::Misc(name))) => name.as_slice(),
-			_ => self.argv0.as_slice(),
+		// bash's `get_name_for_error`: a shell that is not interactive names
+		// the file it is reading (`BASH_SOURCE[0]`: a `.` file, or the file
+		// the running function was defined in) while that is not empty.
+		let interactive = matches!(
+			state::record(cx.store, vp, Key::Misc(MiscKey::Interactive)),
+			Ok(Some(Record::Misc(v))) if v.as_slice() == b"1"
+		);
+		let sourced = if interactive {
+			None
+		} else {
+			callstack::error_name(vp)
 		};
-		render(diag, DiagSite { shell_name, origin, line, utf8 })
+		// bash's `parser_error` prints the input name only when it is not
+		// the error name: a `-c` string's `-c`, but not while a `.` file is
+		// read, whose name is then both (a script names neither twice).
+		let input = (matches!(origin, Origin::Command)
+			&& !(sourced.is_some() && callstack::reading_dot_file(vp)))
+		.then_some(b"-c".as_slice());
+		// An in-engine nested shell names itself (its `$0`).
+		let shell_name = match sourced {
+			Some(file) => file.as_slice(),
+			None => match vp
+				.overlay
+				.as_ref()
+				.and_then(|o| o.records.get(&KeyBuf::Misc(MiscKey::Argv0)))
+			{
+				Some(Some(Record::Misc(name))) => name.as_slice(),
+				_ => self.argv0.as_slice(),
+			},
+		};
+		render(diag, DiagSite { shell_name, input, line, utf8 })
 	}
 
 	/// The `Diag` event of a diagnostic `vp` prints.

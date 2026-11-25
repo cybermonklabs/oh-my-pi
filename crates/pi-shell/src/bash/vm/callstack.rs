@@ -51,7 +51,8 @@ pub enum CallKind {
 	/// A `.` file: a `source` level, and on `BASH_ARGV`/`BASH_ARGC` the file
 	/// name (no arguments) or, under `extdebug`, its arguments.
 	Source {
-		/// `BASH_SOURCE` entry: the file name as given.
+		/// `BASH_SOURCE` entry: the file as bash's `_evalfile` names it (the
+		/// name as given, or the `$PATH` candidate as it built it).
 		file:    BString,
 		/// `BASH_LINENO` entry: the line of the `.` command.
 		line:    u32,
@@ -237,6 +238,32 @@ pub fn listed(
 	);
 	vars.push((BString::from("FUNCNAME"), funcname));
 	Ok(vars)
+}
+
+/// bash's `get_name_for_error`: the file a shell that is not interactive
+/// names in its messages, `BASH_SOURCE[0]` (the `.` file it is reading, or
+/// the file the running function was defined in) while that is not empty.
+/// `None` leaves the shell's own name (bash's `dollar_vars[0]`, `$0`).
+pub fn error_name(vp: &Vproc) -> Option<&BString> {
+	vp.calls
+		.iter()
+		.rev()
+		.find_map(|c| match &c.kind {
+			CallKind::Function { file, .. } | CallKind::Source { file, .. } => Some(file),
+			CallKind::Args(_) => None,
+		})
+		.filter(|f| !f.is_empty())
+}
+
+/// The innermost `BASH_SOURCE` push is a `.` file: the input the shell is
+/// reading is that file (a function's push is not an input), so a syntax
+/// error's input name is its error name ([`error_name`]).
+pub fn reading_dot_file(vp: &Vproc) -> bool {
+	vp.calls
+		.iter()
+		.rev()
+		.find(|c| !matches!(c.kind, CallKind::Args(_)))
+		.is_some_and(|c| matches!(c.kind, CallKind::Source { .. }))
 }
 
 /// The file a function defined now records as its source (bash's
