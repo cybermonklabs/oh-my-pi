@@ -290,7 +290,10 @@ interface DialectQueries {
 	 * (`first_part`, -1 when there is none) and its row identity (`first_id`,
 	 * see {@link partRowids}; null on MySQL, which has none). That part is the
 	 * last one starting at or before `@offset`, or, for a read from inside the
-	 * row's own content, the first one.
+	 * row's own content, the first one. On MySQL also the session's last part,
+	 * the last one starting before the size: its start (`tail_part`) and the
+	 * SHA-256 in hex of its start in decimal, ":" and its bytes
+	 * (`tail_digest`), both null when there is none.
 	 */
 	readChunksStart: Statement;
 	/**
@@ -300,7 +303,8 @@ interface DialectQueries {
 	 * `@anchor_id`, checked in the same statement. On SQLite it is also empty
 	 * unless the part at `@last` (the last one the read has fetched, -1 before
 	 * the first page) still holds `@last_content`. MySQL checks neither; its
-	 * read checks what it yielded, when it ends or is closed, with
+	 * read checks the session's last part against `tail_digest` when it fetches
+	 * it, and what it yielded, when it ends or is closed, with
 	 * {@link readChunksDigest}.
 	 */
 	readParts: Statement;
@@ -610,6 +614,10 @@ interface ChunksStartRow {
 	head: Uint8Array | null;
 	first_part: number | bigint | string;
 	first_id: number | string | null;
+	/** MySQL: the start of the session's last part (see `DialectQueries.readChunksStart`), null when there is none. */
+	tail_part?: number | bigint | string | null;
+	/** MySQL: the SHA-256 in hex of that part's start in decimal, ":" and its bytes. */
+	tail_digest?: string | null;
 }
 
 /** `readParts` row. */
@@ -650,6 +658,12 @@ interface ChunksPass {
 	 * queue's turn of its first query, right before it.
 	 */
 	mark?: string;
+	/**
+	 * MySQL: the session's last part as the first query saw it, its start and
+	 * the SHA-256 in lower-case hex of that start in decimal, ":" and its
+	 * bytes, and whether the pass fetched it.
+	 */
+	tail?: { readonly start: number; readonly digest: string; fetched: boolean };
 	/** Bytes the pass yielded. */
 	yielded: number;
 	/** Where the parts the pass read start: the part it started in, or the end of the row's own content. */
@@ -1489,6 +1503,8 @@ function buildQueries(
 	const startPart =
 		`FROM ${parts} AS p WHERE p.path = @path ` +
 		`AND p.start_offset <= ${greatest}(${bigint("@offset")}, ${byteLengthOf("r.content")})`;
+	// MySQL: the last part of `r`'s session that starts before its size, the one a chunked read to the end fetches last.
+	const tailPart = `FROM ${parts} AS t WHERE t.path = @path AND t.start_offset < r.byte_len ORDER BY t.start_offset DESC LIMIT 1`;
 	// `<column>` starts with `<value>`: its first `@len` characters equal it, exactly, whatever the column's collation.
 	// On PostgreSQL as code points (`COLLATE "C"`): `substr` of a column takes the column's collation, and under a
 	// nondeterministic one (a case-insensitive ICU collation, say) "R/A/" equals "R/a/". On MySQL and MariaDB as bytes,
@@ -1717,8 +1733,12 @@ function buildQueries(
 				`CASE WHEN ${bigint("@offset")} < ${contentByteLength} ` +
 				`THEN substr(${contentBytes}, ${position("@row_from")}) ELSE ${emptyBytes} END AS head, ` +
 				`(SELECT coalesce(max(p.start_offset), -1) ${startPart}) AS first_part, ` +
-				`${partId ? `(SELECT ${partId} ${startPart} ORDER BY p.start_offset DESC LIMIT 1)` : "NULL"} AS first_id ` +
-				`FROM ${table} AS r WHERE r.path = @path`,
+				`${partId ? `(SELECT ${partId} ${startPart} ORDER BY p.start_offset DESC LIMIT 1)` : "NULL"} AS first_id` +
+				(mysql
+					? `, (SELECT t.start_offset ${tailPart}) AS tail_part, ` +
+						`(SELECT SHA2(CONCAT(t.start_offset, ':', cast(t.content AS binary)), 256) ${tailPart}) AS tail_digest`
+					: "") +
+				` FROM ${table} AS r WHERE r.path = @path`,
 		),
 		readParts: sql(
 			`SELECT start_offset, content FROM ${parts} WHERE path = @path AND start_offset >= ${bigint("@next")} ` +
@@ -4180,13 +4200,28 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	 * it only when that second check pass matches too: at most two check
 	 * passes, and a pass that differs is a read conflict at once.
 	 *
-	 * MySQL has no row identity: the read checks what it yielded with one
-	 * query, which computes the digest of those bytes as the database holds
-	 * them then (`DialectQueries.readChunksDigest`): the head, and every part
-	 * from the one the read started at to the last one it yielded, whole even
-	 * where the read yielded it from `fromByte` on. One that differs from the
-	 * digest the read computed over the same parts, each added before it went
-	 * out, is a read conflict too.
+	 * MySQL has no row identity. Its first query also takes the session's last
+	 * part, the last one starting before the size, in the same statement and so
+	 * from the same state as the size: its start and its SHA-256. When the read
+	 * fetches the part at that start it must hold those bytes, and a read that
+	 * ends must have fetched it, or the read is a conflict: a full write between
+	 * two pages that grows the session past the old size, a part of the new
+	 * body ending right there, passes the page checks and holds the bytes the
+	 * read fetched, but it changes that last part, as does any rewrite that
+	 * grows or shifts it. The read also checks what it yielded with one query,
+	 * which computes the digest of those bytes as the database holds them then
+	 * (`DialectQueries.readChunksDigest`): the head, and every part from the one
+	 * the read started at to the last one it yielded, whole even where the read
+	 * yielded it from `fromByte` on. One that differs from the digest the read
+	 * computed over the same parts, each added before it went out, is a read
+	 * conflict too. Neither sees a full write between two pages that keeps
+	 * every part boundary up to the old size and the old last part byte for
+	 * byte and differs only in same-length bytes of parts fetched after it; the
+	 * read then yields the start of the new body as a whole one. Taking the
+	 * digest of the whole read in the first query would see it, but makes every
+	 * read, a probe that stops after its first page included, hash the whole
+	 * session on the server (a probe of a 256 MiB session took 5,723 ms instead
+	 * of 49 ms on MySQL 8.4). PostgreSQL and SQLite see it by row identity.
 	 *
 	 * Both end checks run once the bytes the read yielded come from more than
 	 * one query (the first query's head and a page, or two pages): when the
@@ -4252,6 +4287,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (!row) throw enoent(path);
 		if (row.byte_len === null) throw this.#unmeasured(path);
 		const size = rowNumber(row.byte_len);
+		if (row.tail_digest && row.tail_part !== null && row.tail_part !== undefined) {
+			pass.tail = { start: rowNumber(row.tail_part), digest: row.tail_digest.toLowerCase(), fetched: false };
+		}
 		const stop = length === undefined ? size : Math.min(size, fromByte + length);
 		const firstPart = rowNumber(row.first_part);
 		const anchor = { anchor: firstPart, anchor_id: row.first_id };
@@ -4283,6 +4321,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				if (start >= stop) break;
 				if (last) last = { last: start, last_content: part.content };
 				const bytes = Buffer.from(part.content, "utf8");
+				if (pass.tail?.start === start) {
+					const digest = new Bun.CryptoHasher("sha256").update(`${start}:`).update(bytes).digest("hex");
+					if (digest !== pass.tail.digest) throw new SessionReadConflictError(path);
+					pass.tail.fetched = true;
+				}
 				// Whole, before the part goes out: the read may be closed at its `yield`.
 				if (pass.digest) addChunkDigest(pass.digest, start, bytes);
 				pass.next = start + bytes.byteLength;
@@ -4299,6 +4342,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			}
 		}
 		if (length === undefined && pass.next !== size) throw new SessionReadConflictError(path);
+		// MySQL: a read that reached the size through another last part than the first query saw read another body.
+		if (pass.tail && !pass.tail.fetched) throw new SessionReadConflictError(path);
 	}
 
 	/**

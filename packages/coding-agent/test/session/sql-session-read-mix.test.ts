@@ -93,6 +93,33 @@ function laterLines(fill: string, count: number): string[] {
 }
 
 /**
+ * Session {@link ID}'s header and first turn, then pads of "a" up to exactly
+ * `mib` MiB. All of it is ASCII, so a full write's parts end at whole MiB, and
+ * the body's end is where a part of any longer full write that holds the same
+ * bytes up to there ends.
+ */
+function wholeMiBBody(mib: number): string {
+	const pad = (n: number, bytes: number) =>
+		`${JSON.stringify({ type: "custom", customType: "pad", id: `p${n}`, parentId: null, timestamp: TIMESTAMP, data: "a".repeat(bytes) })}\n`;
+	const lines = [transcript(ID, "first")];
+	let total = Buffer.byteLength(lines[0] ?? "");
+	for (let n = 0; ; n++) {
+		const left = mib * MiB - total - Buffer.byteLength(pad(n, 0));
+		if (left <= MiB) {
+			lines.push(pad(n, left));
+			return lines.join("");
+		}
+		lines.push(pad(n, MiB));
+		total += Buffer.byteLength(lines.at(-1) ?? "");
+	}
+}
+
+/** `text`, whose last line is a pad ending `"}` and a newline, with that pad's data `bytes` longer. */
+function grownLastPad(text: string, bytes: number): string {
+	return `${text.slice(0, -3)}${"a".repeat(bytes)}${text.slice(-3)}`;
+}
+
+/**
  * Read `file` through `reader` from `fromByte`, running `race` once, right
  * after the first chunk. What the read gave: the name of the entry of `bodies`
  * its bytes equal, "read conflict", "a short body" (the start of one of
@@ -196,6 +223,27 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			expect(["old body", "new body", "read conflict"]).toContain(outcome);
 			release?.();
 		}, 120_000);
+
+		for (const end of ["inside a part", "where a part of the new body ends"] as const) {
+			it(`yields one body's bytes or a read conflict when the other store rewrites the session to more bytes between two pages, keeping the pages already read, and the old body ends ${end}`, async () => {
+				// If this regresses, a read of a session another process rewrote meanwhile to more bytes, changing
+				// only its last entry, yields the new body cut at the old one's size: its last line cut, as a whole read.
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const { writer, file, release } = await sessionOf(db);
+				const before = end === "inside a part" ? body("a").join("") : wholeMiBBody(5);
+				const after = grownLastPad(before, 30_000);
+				await writer.writeText(file, before);
+				const reader = await readerOf(db);
+
+				const outcome = await racedRead(reader, file, 0, () => writer.writeText(file, after), {
+					"old body": before,
+					"new body": after,
+				});
+
+				expect(["old body", "new body", "read conflict"]).toContain(outcome);
+				release?.();
+			}, 120_000);
+		}
 	});
 }
 
