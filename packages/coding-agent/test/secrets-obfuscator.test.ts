@@ -4385,6 +4385,37 @@ describe("native replay secret obfuscation", () => {
 		expect(nextReplay.providerPayload.items[1]).toBe(opaque);
 		expect(obfuscateMessages(obfuscator, next)).toBe(next);
 	});
+
+	// If this regresses, a request whose native replay holds a tool call's arguments, as text, nested past the 40,000
+	// levels JSON.stringify writes fails with "Maximum call stack size exceeded" once a secret in them is hidden.
+	it("hides a secret at the bottom of native function-call arguments nested deeper than JSON.stringify recurses", () => {
+		const obfuscator = new SecretObfuscator([{ type: "regex", content: "tok_[a-z0-9]+" }]);
+		const item = {
+			type: "function_call",
+			call_id: "call-deep",
+			name: "inspect",
+			// JSON.parse reads 400,000 levels; JSON.stringify could not have written this text.
+			arguments: `${'{"next":'.repeat(DEEP_ARGUMENT_LEVELS)}{"leaf":"tok_abc123"}${"}".repeat(DEEP_ARGUMENT_LEVELS)}`,
+		};
+		const messages: Message[] = [
+			{
+				role: "developer",
+				attribution: "agent",
+				content: "native replay",
+				timestamp: 1,
+				providerPayload: { type: "openaiResponsesHistory", provider: "openai", items: [item] },
+			},
+		];
+
+		const [sent] = obfuscateMessages(obfuscator, messages);
+		if (sent?.role !== "developer" || sent.providerPayload?.type !== "openaiResponsesHistory")
+			throw new Error("Missing native replay");
+		const hidden = argumentsNesting(JSON.parse(sent.providerPayload.items[0]?.arguments as string));
+		expect({ levels: hidden.levels, leaked: hidden.bottom.leaf.includes("tok_abc123") }).toEqual({
+			levels: DEEP_ARGUMENT_LEVELS,
+			leaked: false,
+		});
+	});
 });
 
 describe("deobfuscateAgentMessages (display restore)", () => {
