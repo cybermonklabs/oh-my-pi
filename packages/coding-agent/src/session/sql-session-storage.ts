@@ -660,10 +660,9 @@ interface ChunksPass {
 	mark?: string;
 	/**
 	 * MySQL: the session's last part as the first query saw it, its start and
-	 * the SHA-256 in lower-case hex of that start in decimal, ":" and its
-	 * bytes, and whether the pass fetched it.
+	 * its {@link partDigest}, and whether the pass fetched it.
 	 */
-	tail?: { readonly start: number; readonly digest: string; fetched: boolean };
+	tail?: { readonly start: number; readonly digest: Buffer; fetched: boolean };
 	/** Bytes the pass yielded. */
 	yielded: number;
 	/** Where the parts the pass read start: the part it started in, or the end of the row's own content. */
@@ -1505,6 +1504,8 @@ function buildQueries(
 		`AND p.start_offset <= ${greatest}(${bigint("@offset")}, ${byteLengthOf("r.content")})`;
 	// MySQL: the last part of `r`'s session that starts before its size, the one a chunked read to the end fetches last.
 	const tailPart = `FROM ${parts} AS t WHERE t.path = @path AND t.start_offset < r.byte_len ORDER BY t.start_offset DESC LIMIT 1`;
+	// MySQL: the SHA-256 in hex of `offset` in decimal, ":" and `bytes`, which partDigest computes on the client.
+	const partDigestOf = (offset: string, bytes: string): string => `SHA2(CONCAT(${offset}, ':', ${bytes}), 256)`;
 	// `<column>` starts with `<value>`: its first `@len` characters equal it, exactly, whatever the column's collation.
 	// On PostgreSQL as code points (`COLLATE "C"`): `substr` of a column takes the column's collation, and under a
 	// nondeterministic one (a case-insensitive ICU collation, say) "R/A/" equals "R/a/". On MySQL and MariaDB as bytes,
@@ -1736,7 +1737,7 @@ function buildQueries(
 				`${partId ? `(SELECT ${partId} ${startPart} ORDER BY p.start_offset DESC LIMIT 1)` : "NULL"} AS first_id` +
 				(mysql
 					? `, (SELECT t.start_offset ${tailPart}) AS tail_part, ` +
-						`(SELECT SHA2(CONCAT(t.start_offset, ':', cast(t.content AS binary)), 256) ${tailPart}) AS tail_digest`
+						`(SELECT ${partDigestOf("t.start_offset", "cast(t.content AS binary)")} ${tailPart}) AS tail_digest`
 					: "") +
 				` FROM ${table} AS r WHERE r.path = @path`,
 		),
@@ -1762,9 +1763,9 @@ function buildQueries(
 			? sql(
 					"SELECT CONCAT(LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTR(d.h, 1, 16), 16, 10) AS UNSIGNED))), 16, '0'), " +
 						"LPAD(HEX(BIT_XOR(CAST(CONV(SUBSTR(d.h, 17, 16), 16, 10) AS UNSIGNED))), 16, '0')) AS digest FROM (" +
-						`SELECT SHA2(CONCAT(CAST(@offset AS SIGNED), ':', substr(${contentBytes}, @row_from)), 256) AS h ` +
+						`SELECT ${partDigestOf("CAST(@offset AS SIGNED)", `substr(${contentBytes}, @row_from)`)} AS h ` +
 						`FROM ${table} WHERE path = @path AND @offset < ${contentByteLength} ` +
-						`UNION ALL SELECT SHA2(CONCAT(start_offset, ':', ${contentBytes}), 256) FROM ${parts} ` +
+						`UNION ALL SELECT ${partDigestOf("start_offset", contentBytes)} FROM ${parts} ` +
 						"WHERE path = @path AND start_offset >= @first AND start_offset < @end) AS d",
 				)
 			: undefined,
@@ -2104,13 +2105,21 @@ function joinSliceBytes(first: Uint8Array | null, pieces: Array<{ offset: number
 const CHUNKS_DIGEST_BYTES = 16;
 
 /**
- * XOR into `digest` the digest of one item a chunked read yielded, as
- * `DialectQueries.readChunksDigest` computes it: the first
- * {@link CHUNKS_DIGEST_BYTES} of the SHA-256 of `offset` in decimal, ":" and
- * `bytes`.
+ * The digest of the bytes a chunked read fetched at `offset` on MySQL, a part
+ * or the row's own content from there, as `DialectQueries.readChunksStart`
+ * (`tail_digest`) and `DialectQueries.readChunksDigest` compute it: the
+ * SHA-256 of `offset` in decimal, ":" and `bytes`.
  */
-function addChunkDigest(digest: Buffer, offset: number, bytes: Uint8Array): void {
-	const item = new Bun.CryptoHasher("sha256").update(`${offset}:`).update(bytes).digest();
+function partDigest(offset: number, bytes: Uint8Array): Buffer {
+	return new Bun.CryptoHasher("sha256").update(`${offset}:`).update(bytes).digest();
+}
+
+/**
+ * XOR into `digest` the first {@link CHUNKS_DIGEST_BYTES} of the
+ * {@link partDigest} of one item a chunked read yielded, as
+ * `DialectQueries.readChunksDigest` folds it.
+ */
+function addChunkDigest(digest: Buffer, item: Buffer): void {
 	for (let i = 0; i < CHUNKS_DIGEST_BYTES; i++) digest[i] ^= item[i];
 }
 
@@ -4288,7 +4297,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (row.byte_len === null) throw this.#unmeasured(path);
 		const size = rowNumber(row.byte_len);
 		if (row.tail_digest && row.tail_part !== null && row.tail_part !== undefined) {
-			pass.tail = { start: rowNumber(row.tail_part), digest: row.tail_digest.toLowerCase(), fetched: false };
+			pass.tail = { start: rowNumber(row.tail_part), digest: Buffer.from(row.tail_digest, "hex"), fetched: false };
 		}
 		const stop = length === undefined ? size : Math.min(size, fromByte + length);
 		const firstPart = rowNumber(row.first_part);
@@ -4299,7 +4308,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		// SQLite: the last part fetched, which the next page's query finds unchanged; none yet.
 		let last = this.#adapter === "sqlite" ? { last: -1, last_content: "" } : undefined;
 		if (row.head && row.head.byteLength > 0) {
-			if (pass.digest) addChunkDigest(pass.digest, fromByte, row.head);
+			if (pass.digest) addChunkDigest(pass.digest, partDigest(fromByte, row.head));
 			pass.sources++;
 			const head = row.head.subarray(0, Math.max(0, stop - fromByte));
 			pass.hash?.update(head);
@@ -4321,13 +4330,15 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				if (start >= stop) break;
 				if (last) last = { last: start, last_content: part.content };
 				const bytes = Buffer.from(part.content, "utf8");
+				// MySQL: the part's digest, computed once when the tail check and the read's digest both take it.
+				let digest: Buffer | undefined;
 				if (pass.tail?.start === start) {
-					const digest = new Bun.CryptoHasher("sha256").update(`${start}:`).update(bytes).digest("hex");
-					if (digest !== pass.tail.digest) throw new SessionReadConflictError(path);
+					digest = partDigest(start, bytes);
+					if (!digest.equals(pass.tail.digest)) throw new SessionReadConflictError(path);
 					pass.tail.fetched = true;
 				}
 				// Whole, before the part goes out: the read may be closed at its `yield`.
-				if (pass.digest) addChunkDigest(pass.digest, start, bytes);
+				if (pass.digest) addChunkDigest(pass.digest, digest ?? partDigest(start, bytes));
 				pass.next = start + bytes.byteLength;
 				if (skip >= bytes.byteLength) {
 					skip -= bytes.byteLength;
