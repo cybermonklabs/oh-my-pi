@@ -26,7 +26,13 @@ import {
 import { SessionReadConflictError, SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { holdsWindows, readWindow } from "../helpers/fake-redis-windows";
+import {
+	holdsWindows,
+	keptGeneration,
+	newGeneration,
+	readWindow,
+	windowGeneration,
+} from "../helpers/fake-redis-windows";
 
 /** A session body as a full rewrite hands it over: a title slot, a header, then `count` entries carrying `text`. */
 function rewriteLines(text: string, count = 3): string[] {
@@ -44,18 +50,128 @@ function rewriteLines(text: string, count = 3): string[] {
 const MiB = 1024 * 1024;
 
 /**
- * A session of about 3.2 MB: a header, then three entries of "a" and `fill`.
- * With a `fill` of three bytes, the windows of a read from its start end
- * inside a character, and two such fills give two bodies of one size.
+ * A session of about 3.2 MB: a header, then three entries of "a" and `fill`,
+ * the last one with `grow` more fills. With a `fill` of three bytes, the
+ * windows of a read from its start end inside a character, and two such fills
+ * give two bodies of one size.
  */
-function paddedBody(fill: string): string {
+function paddedBody(fill: string, grow = 0): string {
 	const header = `${JSON.stringify({ type: "session", version: 3, id: "redis-chunks", timestamp: "t0", cwd: "/cwd" })}\n`;
 	const pads = Array.from(
 		{ length: 3 },
 		(_, n) =>
-			`${JSON.stringify({ type: "custom", customType: "pad", id: `p${n}`, parentId: null, data: `a${fill.repeat(350_000)}` })}\n`,
+			`${JSON.stringify({ type: "custom", customType: "pad", id: `p${n}`, parentId: null, data: `a${fill.repeat(350_000 + (n === 2 ? grow : 0))}` })}\n`,
 	);
 	return [header, ...pads].join("");
+}
+
+/** What another client writes over `paddedBody("€")` in {@link racedRewriteCases}, by the name of the race. */
+const RACED_REWRITES = {
+	"a rewrite to the same size": () => paddedBody("₤"),
+	"a delete and a re-create": () => paddedBody("₤"),
+	"a rewrite to fewer bytes": () => paddedBody("é"),
+	// Only the last entry grows, so the bytes of every window but the last stay as they were.
+	"a rewrite to more bytes that keeps the windows already read": () => paddedBody("€", 10_000),
+	"an earlier version's rewrite to more bytes that keeps the windows already read": () => paddedBody("€", 10_000),
+};
+
+/**
+ * omp's writes from before the generation hash, each in one script that sets
+ * the session's bytes and its mtime and nothing else.
+ */
+interface EarlierVersion {
+	write(path: string, body: string, mtimeMs: string): Promise<void>;
+	append(path: string, line: string, mtimeMs: string): Promise<void>;
+}
+
+/**
+ * Each of {@link RACED_REWRITES} landing between two windows of a read, on
+ * the Redis that `open` reaches (it opens one more store on it each call),
+ * then the races on a session an earlier version wrote last.
+ */
+function racedRewriteCases(open: () => Promise<{ storage: RedisSessionStorage }>, earlier: EarlierVersion): void {
+	// If this regresses, loading, copying or checking a session another process rewrote meanwhile
+	// on Redis yields its first windows from the old transcript and the rest from the new one, or
+	// the new one cut at the old one's size.
+	for (const [race, rewrite] of Object.entries(RACED_REWRITES)) {
+		// From the start, and from inside a character with windows left to read.
+		for (const fromByte of [0, MiB / 2 + 1]) {
+			it(`yields one body's bytes or a read conflict when ${race} lands between two windows of a read from byte ${fromByte}`, async () => {
+				const { storage } = await open();
+				const other = await open();
+				const before = Buffer.from(paddedBody("€"));
+				const after = Buffer.from(rewrite());
+				await storage.writeText("/s/raced.jsonl", before.toString("utf-8"));
+				await other.storage.refresh();
+
+				const outcome = await racedRead(
+					storage,
+					"/s/raced.jsonl",
+					fromByte,
+					async () => {
+						if (race.startsWith("an earlier version's")) {
+							// An earlier version's mtime, never the one this version recorded.
+							await earlier.write("/s/raced.jsonl", after.toString("utf-8"), "1");
+							return;
+						}
+						if (race === "a delete and a re-create") await other.storage.unlink("/s/raced.jsonl");
+						await other.storage.writeText("/s/raced.jsonl", after.toString("utf-8"));
+					},
+					{ "old body": before.subarray(fromByte), "new body": after.subarray(fromByte) },
+				);
+
+				expect(["old body", "new body", "read conflict"]).toContain(outcome);
+			});
+		}
+	}
+
+	// A session an earlier version wrote last carries no generation a read can use.
+	for (const fromByte of [0, MiB / 2 + 1]) {
+		// If this regresses, while a fleet runs this version beside an earlier one, a read of a long
+		// session that a process of the earlier version keeps appending to fails as raced on every
+		// pass, and the resume, copy or gc that made it fails.
+		it(`yields the body its first window saw when an earlier version appends between two windows of a read from byte ${fromByte} of a session it wrote last`, async () => {
+			const { storage } = await open();
+			const before = Buffer.from(paddedBody("€"));
+			const line = `${JSON.stringify({ type: "custom", customType: "pad", id: "q", parentId: null, data: "c" })}\n`;
+			await storage.writeText("/s/earlier.jsonl", before.toString("utf-8"));
+			await earlier.write("/s/earlier.jsonl", before.toString("utf-8"), "1");
+
+			const outcome = await racedRead(
+				storage,
+				"/s/earlier.jsonl",
+				fromByte,
+				() => earlier.append("/s/earlier.jsonl", line, "2"),
+				{
+					"old body": before.subarray(fromByte),
+					"old body and the appended line": Buffer.concat([before, Buffer.from(line)]).subarray(fromByte),
+				},
+			);
+
+			expect(outcome).toBe("old body");
+		});
+
+		// If this regresses, a read of a session an earlier version wrote last, which that version
+		// rewrites meanwhile, yields its first windows from the old transcript and the rest from the
+		// new one.
+		it(`yields one body's bytes or a read conflict when an earlier version rewrites a session it wrote last to the same size between two windows of a read from byte ${fromByte}`, async () => {
+			const { storage } = await open();
+			const before = Buffer.from(paddedBody("€"));
+			const after = Buffer.from(paddedBody("₤"));
+			await storage.writeText("/s/earlier.jsonl", before.toString("utf-8"));
+			await earlier.write("/s/earlier.jsonl", before.toString("utf-8"), "1");
+
+			const outcome = await racedRead(
+				storage,
+				"/s/earlier.jsonl",
+				fromByte,
+				() => earlier.write("/s/earlier.jsonl", after.toString("utf-8"), "2"),
+				{ "old body": before.subarray(fromByte), "new body": after.subarray(fromByte) },
+			);
+
+			expect(["old body", "new body", "read conflict"]).toContain(outcome);
+		});
+	}
 }
 
 /**
@@ -154,12 +270,13 @@ function createFakeRedis(): FakeRedis {
 			if (script.includes("OMP_WRITE_FULL")) {
 				checkFailure("set");
 				checkFailure("hset");
-				const [fileKey, metaKey, titleKey] = keys;
-				const [content, filePath, mtimeMs, hasTitle, title] = argv;
+				const [fileKey, metaKey, titleKey, generationKey] = keys;
+				const [content, filePath, mtimeMs, hasTitle, title, , token] = argv;
 				strings.set(fileKey, content);
 				getHash(metaKey).set(filePath, mtimeMs);
 				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
 				else getHash(titleKey).delete(filePath);
+				getHash(generationKey).set(filePath, newGeneration(token, mtimeMs));
 				return 1;
 			}
 			if (script.includes("OMP_STAGE_PART")) {
@@ -174,8 +291,8 @@ function createFakeRedis(): FakeRedis {
 				// As the script runs on a Redis 7 server: refused ({0, actual} or {-1, staged}) after deleting the staging key.
 				checkFailure("rename");
 				checkFailure("hset");
-				const [stagingKey, fileKey, metaKey, titleKey] = keys;
-				const [filePath, mtimeMs, hasTitle, title, expectedSize, byteLength] = argv;
+				const [stagingKey, fileKey, metaKey, titleKey, generationKey] = keys;
+				const [filePath, mtimeMs, hasTitle, title, expectedSize, byteLength, token] = argv;
 				const current = strings.get(fileKey);
 				const actualSize = current === undefined ? -1 : Buffer.byteLength(current, "utf-8");
 				const staged = strings.get(stagingKey) ?? "";
@@ -187,31 +304,46 @@ function createFakeRedis(): FakeRedis {
 				getHash(metaKey).set(filePath, mtimeMs);
 				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
 				else getHash(titleKey).delete(filePath);
+				getHash(generationKey).set(filePath, newGeneration(token, mtimeMs));
 				return [1, stagedSize];
 			}
 			if (script.includes("OMP_APPEND")) {
 				checkFailure("append");
 				checkFailure("hset");
-				const [fileKey, metaKey] = keys;
-				const [line, filePath, mtimeMs] = argv;
+				const [fileKey, metaKey, generationKey] = keys;
+				const [line, filePath, mtimeMs, token] = argv;
+				const generation = keptGeneration(
+					getHash(generationKey).get(filePath),
+					getHash(metaKey).get(filePath),
+					token,
+					mtimeMs,
+				);
 				const next = (strings.get(fileKey) ?? "") + line;
 				strings.set(fileKey, next);
 				getHash(metaKey).set(filePath, mtimeMs);
+				getHash(generationKey).set(filePath, generation);
 				return Buffer.byteLength(next, "utf-8");
 			}
 			if (script.includes("OMP_UPDATE_TITLE")) {
 				checkFailure("hset");
-				const [metaKey, titleKey] = keys;
-				const [filePath, mtimeMs, title] = argv;
+				const [metaKey, titleKey, generationKey] = keys;
+				const [filePath, mtimeMs, title, token] = argv;
+				const generation = keptGeneration(
+					getHash(generationKey).get(filePath),
+					getHash(metaKey).get(filePath),
+					token,
+					mtimeMs,
+				);
 				getHash(metaKey).set(filePath, mtimeMs);
 				getHash(titleKey).set(filePath, title);
+				getHash(generationKey).set(filePath, generation);
 				return 1;
 			}
 			if (script.includes("OMP_MOVE")) {
 				// As the script runs on a Redis 7 server: 0 when a no-replace destination exists.
 				checkFailure("rename");
-				const [srcKey, dstKey, metaKey, titleKey] = keys;
-				const [src, dst, mtimeMs, noReplace] = argv;
+				const [srcKey, dstKey, metaKey, titleKey, generationKey] = keys;
+				const [src, dst, mtimeMs, noReplace, token] = argv;
 				if (noReplace === "1" && strings.has(dstKey)) return 0;
 				if (!strings.has(srcKey)) throw new Error("ERR no such key");
 				strings.set(dstKey, strings.get(srcKey) as string);
@@ -222,11 +354,13 @@ function createFakeRedis(): FakeRedis {
 				getHash(titleKey).delete(src);
 				if (title !== undefined) getHash(titleKey).set(dst, title);
 				else getHash(titleKey).delete(dst);
+				getHash(generationKey).delete(src);
+				getHash(generationKey).set(dst, newGeneration(token, mtimeMs));
 				return 1;
 			}
 			if (script.includes("OMP_REMOVE")) {
 				checkFailure("del");
-				const [metaKey, titleKey] = keys;
+				const [metaKey, titleKey, generationKey] = keys;
 				const [filePrefix, pattern, ...paths] = argv;
 				if (pattern) {
 					// The pattern is an escaped key prefix followed by `*`.
@@ -239,6 +373,7 @@ function createFakeRedis(): FakeRedis {
 					strings.delete(filePrefix + filePath);
 					getHash(metaKey).delete(filePath);
 					getHash(titleKey).delete(filePath);
+					getHash(generationKey).delete(filePath);
 				}
 				return paths.length;
 			}
@@ -253,8 +388,14 @@ function createFakeRedis(): FakeRedis {
 			}
 			if (script.includes("OMP_READ_WINDOW")) {
 				checkFailure("getrange");
-				const value = strings.get(keys[0]);
-				return readWindow(value === undefined ? undefined : Buffer.from(value, "utf-8"), argv);
+				const [fileKey, metaKey, generationKey] = keys;
+				const value = strings.get(fileKey);
+				const filePath = argv[3];
+				return readWindow(
+					value === undefined ? undefined : Buffer.from(value, "utf-8"),
+					windowGeneration(getHash(generationKey).get(filePath), getHash(metaKey).get(filePath)),
+					argv,
+				);
 			}
 			if (script.includes("OMP_CHECK_WINDOWS")) {
 				const value = strings.get(keys[0]);
@@ -642,7 +783,7 @@ describe("RedisSessionStorage", () => {
 
 	// If this regresses, resuming, scanning or checking a long session on Redis storage reads its
 	// whole transcript as one value, or splits a character between two chunks and corrupts it.
-	it("reads in windows of at most 1 MiB by script, each between characters, checked once at the end, never GETting the whole value", async () => {
+	it("reads in windows of at most 1 MiB by script, each between characters, never GETting the whole value", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
 		const path = "/sessions/p/chunked.jsonl";
 		// One byte, then 2.4 MB of four-byte characters: a window of 1 MiB from the start ends inside one.
@@ -666,18 +807,9 @@ describe("RedisSessionStorage", () => {
 			decodeWhole: [true, true, true],
 			fromInside: true,
 		});
-		const window = ["send", "-- OMP_READ_WINDOW"];
-		const check = ["send", "-- OMP_CHECK_WINDOWS"];
-		expect(redis.calls.map(call => [call.method, String((call.args[1] as string[])[0]).split("\n")[0]])).toEqual([
-			window,
-			window,
-			window,
-			check,
-			window,
-			window,
-			window,
-			check,
-		]);
+		expect(redis.calls.map(call => [call.method, String((call.args[1] as string[])[0]).split("\n")[0]])).toEqual(
+			Array.from({ length: 6 }, () => ["send", "-- OMP_READ_WINDOW"]),
+		);
 	});
 
 	it("custom prefix isolates keyspaces", async () => {
@@ -756,6 +888,17 @@ describe("RedisSessionStorage", () => {
 
 		expect(redis.strings.get(`omp:sessions:file:${sessionPath}`)).toBe("theirs, longer\n");
 		expect([...redis.strings.keys()].filter(key => key.includes(":staging:"))).toEqual([]);
+	});
+
+	racedRewriteCases(async () => ({ storage: await RedisSessionStorage.create({ client: redis }) }), {
+		async write(path, body, mtimeMs) {
+			redis.strings.set(`omp:sessions:file:${path}`, body);
+			redis.hashes.get("omp:sessions:meta")?.set(path, mtimeMs);
+		},
+		async append(path, line, mtimeMs) {
+			redis.strings.set(`omp:sessions:file:${path}`, (redis.strings.get(`omp:sessions:file:${path}`) ?? "") + line);
+			redis.hashes.get("omp:sessions:meta")?.set(path, mtimeMs);
+		},
 	});
 });
 
@@ -960,38 +1103,31 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 		expect(outcome).toBe("old body");
 	});
 
-	// If this regresses, loading, copying or checking a session another process rewrote meanwhile
-	// on Redis yields its first windows from the old transcript and the rest from the new one.
-	for (const race of ["a rewrite to the same size", "a delete and a re-create", "a rewrite to fewer bytes"] as const) {
-		// From the start, and from inside a character with windows left to read.
-		for (const fromByte of [0, MiB / 2 + 1]) {
-			it(`yields one body's bytes or a read conflict when ${race} lands between two windows of a read from byte ${fromByte}`, async () => {
-				const { storage } = await open();
-				const other = await open();
-				const before = Buffer.from(paddedBody("€"));
-				const after = Buffer.from(race === "a rewrite to fewer bytes" ? paddedBody("é") : paddedBody("₤"));
-				await storage.writeText("/s/raced.jsonl", before.toString("utf-8"));
-				await other.storage.refresh();
-
-				const outcome = await racedRead(
-					storage,
-					"/s/raced.jsonl",
-					fromByte,
-					async () => {
-						if (race === "a delete and a re-create") await other.storage.unlink("/s/raced.jsonl");
-						await other.storage.writeText("/s/raced.jsonl", after.toString("utf-8"));
-					},
-					{ "old body": before.subarray(fromByte), "new body": after.subarray(fromByte) },
-				);
-
-				expect(["old body", "new body", "read conflict"]).toContain(outcome);
-			});
-		}
-	}
+	// The scripts of omp's writes before the generation hash.
+	const earlierScript = async (script: string, path: string, value: string, mtimeMs: string): Promise<void> => {
+		const { client } = await open();
+		await client.send("EVAL", [script, "2", `${prefix}file:${path}`, `${prefix}meta`, value, path, mtimeMs]);
+	};
+	racedRewriteCases(open, {
+		write: (path, body, mtimeMs) =>
+			earlierScript(
+				'redis.call("SET", KEYS[1], ARGV[1]) redis.call("HSET", KEYS[2], ARGV[2], ARGV[3]) return 1',
+				path,
+				body,
+				mtimeMs,
+			),
+		append: (path, line, mtimeMs) =>
+			earlierScript(
+				'local size = redis.call("APPEND", KEYS[1], ARGV[1]) redis.call("HSET", KEYS[2], ARGV[2], ARGV[3]) return size',
+				path,
+				line,
+				mtimeMs,
+			),
+	});
 
 	// If this regresses, a reader that stops early (a header probe, the Agent Hub roster) keeps
 	// the head of one body and the next window of another without a word.
-	it("rejects the close of a read stopped after two windows that a rewrite between them mixed", async () => {
+	it("fails a read meant to stop after two windows at the second, before yielding it, when a rewrite lands between them", async () => {
 		const { storage } = await open();
 		const other = await open();
 		await storage.writeText("/s/stopped.jsonl", paddedBody("€"));
@@ -1009,6 +1145,6 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 			(err: unknown) => err,
 		);
 
-		expect({ chunks: chunks.length, error }).toEqual({ chunks: 2, error: expect.any(SessionReadConflictError) });
+		expect({ chunks: chunks.length, error }).toEqual({ chunks: 1, error: expect.any(SessionReadConflictError) });
 	});
 });

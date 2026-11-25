@@ -48,6 +48,11 @@ const STAGING_PART_BYTES = 1024 * 1024;
 /** Most bytes one window of a chunked read (`readChunks`) fetches. */
 const READ_WINDOW_BYTES = 1024 * 1024;
 
+// Every script that writes a session's mtime keeps its write generation, the
+// value `<token> <mtime>` under its path in the generation hash: a full write
+// or a move gives it the new token its caller passes, an append or a title
+// update keeps the token (see KEPT_GENERATION), and a delete removes it. A
+// chunked read compares the generation at each window (READ_WINDOW_SCRIPT).
 const WRITE_FULL_SCRIPT = `-- OMP_WRITE_FULL
 local expected = ARGV[6]
 if expected ~= "" then
@@ -66,6 +71,7 @@ if ARGV[4] == "1" then
 else
 	redis.call("HDEL", KEYS[3], ARGV[2])
 end
+redis.call("HSET", KEYS[4], ARGV[2], ARGV[7] .. " " .. ARGV[3])
 return {1, string.len(ARGV[1])}`;
 
 // One part of a streamed full write: appended to the write's staging key,
@@ -76,11 +82,12 @@ redis.call("PEXPIRE", KEYS[1], ARGV[2])
 return size`;
 
 // One script, so the size check, the swap of the staging key (KEYS[1]) over
-// the file key, and its mtime and title run with no other client's command
-// between. ARGV[5] is the expected size ("" for none, "-1" for no key),
-// ARGV[6] the body's byte length. Returns {1, size} once swapped; {0, actual}
-// when the size check refuses, and {-1, staged} when the staging key does not
-// hold the body (it expired), both after deleting the staging key.
+// the file key, and its mtime, title and generation run with no other
+// client's command between. ARGV[5] is the expected size ("" for none, "-1"
+// for no key), ARGV[6] the body's byte length, ARGV[7] the new generation's
+// token. Returns {1, size} once swapped; {0, actual} when the size check
+// refuses, and {-1, staged} when the staging key does not hold the body (it
+// expired), both after deleting the staging key.
 const WRITE_STAGED_SCRIPT = `-- OMP_WRITE_STAGED
 local expected = ARGV[5]
 if expected ~= "" then
@@ -110,16 +117,39 @@ if ARGV[3] == "1" then
 else
 	redis.call("HDEL", KEYS[4], ARGV[1])
 end
+redis.call("HSET", KEYS[5], ARGV[1], ARGV[7] .. " " .. ARGV[2])
 return {1, staged}`;
 
+// The token an append or a title update leaves a session's generation with:
+// the one the generation hash holds, while the mtime recorded beside it is
+// the one the meta hash holds; else the new token it was passed, because a
+// write that keeps no generation (an earlier version's) changed the session
+// since. Run before the script sets the new mtime.
+const KEPT_GENERATION = `local function kept_generation(meta, generation, path, token)
+	local held = redis.call("HGET", generation, path)
+	if held then
+		local kept, mtime = string.match(held, "^(%S+) (.*)$")
+		if kept and mtime == redis.call("HGET", meta, path) then
+			return kept
+		end
+	end
+	return token
+end`;
+
 const APPEND_SCRIPT = `-- OMP_APPEND
+${KEPT_GENERATION}
+local token = kept_generation(KEYS[2], KEYS[3], ARGV[2], ARGV[4])
 local size = redis.call("APPEND", KEYS[1], ARGV[1])
 redis.call("HSET", KEYS[2], ARGV[2], ARGV[3])
+redis.call("HSET", KEYS[3], ARGV[2], token .. " " .. ARGV[3])
 return size`;
 
 const UPDATE_TITLE_SCRIPT = `-- OMP_UPDATE_TITLE
+${KEPT_GENERATION}
+local token = kept_generation(KEYS[1], KEYS[3], ARGV[1], ARGV[4])
 redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
 redis.call("HSET", KEYS[2], ARGV[1], ARGV[3])
+redis.call("HSET", KEYS[3], ARGV[1], token .. " " .. ARGV[2])
 return 1`;
 
 // One script, so the size and the bytes come from one read: no client's write
@@ -135,18 +165,28 @@ if ARGV[2] ~= "" then
 end
 return {redis.call("STRLEN", KEYS[1]), text}`;
 
-// One window of a chunked read: the key's size, and from byte ARGV[1] at most
-// ARGV[2] bytes, up to ARGV[3], the size the read's first window saw ("" for
-// the first window, which reads up to the size it finds). A window starts and
-// ends between characters, so its bytes decode to a string and encode back to
-// the same bytes: a first window from inside a character starts at the byte
-// that begins it (a later one starts where the last one ended), and a window
-// that stops short of the read's end ends before the character its next byte
-// continues, never as nothing (each backs over at most three continuation
-// bytes, and not at all where the bytes are not UTF-8). Returns {size, the
-// window's byte length, its SHA-1, the window, the bytes it starts before
-// ARGV[1]}; {size} alone when the key is shorter than ARGV[3] now, and nil
-// when it is missing.
+// One window of a chunked read: the key's size, the session's generation, and
+// from byte ARGV[1] at most ARGV[2] bytes, up to ARGV[3], the size the read's
+// first window saw ("" for the first window, which reads up to the size it
+// finds). KEYS[2] is the meta hash, KEYS[3] the generation hash and ARGV[4]
+// the session's path in both. The generation is its token while the mtime
+// the generation hash records beside it is the one the meta hash holds, and
+// "?" with the meta hash's mtime when not (a write that keeps no generation,
+// an earlier version's, came after the last one that did): every write moves
+// one or the other, except an append or a title update made while the token
+// holds, and an earlier version's write that sets the very mtime recorded, or
+// that sets the bytes and the mtime in two commands with this window between
+// them. Without a token the window also returns its SHA-1, which the check
+// at the read's end (CHECK_WINDOWS_SCRIPT) compares; with one, "". A window
+// starts and ends between characters, so its bytes decode to a string and
+// encode back to the same bytes: a first window from inside a character
+// starts at the byte that begins it (a later one starts where the last one
+// ended), and a window that stops short of the read's end ends before the
+// character its next byte continues, never as nothing (each backs over at
+// most three continuation bytes, and not at all where the bytes are not
+// UTF-8). Returns {size, generation, the window's byte length, its SHA-1 or
+// "", the window, the bytes it starts before ARGV[1]}; {size} alone when the
+// key is shorter than ARGV[3] now, and nil when it is missing.
 const READ_WINDOW_SCRIPT = `-- OMP_READ_WINDOW
 if redis.call("EXISTS", KEYS[1]) == 0 then
 	return false
@@ -157,6 +197,15 @@ if ARGV[3] ~= "" then
 	stop = tonumber(ARGV[3])
 	if size < stop then
 		return {size}
+	end
+end
+local mtime = redis.call("HGET", KEYS[2], ARGV[4])
+local generation = "?" .. (mtime or "")
+local held = redis.call("HGET", KEYS[3], ARGV[4])
+if held then
+	local token, recorded = string.match(held, "^(%S+) (.*)$")
+	if token and recorded == mtime then
+		generation = token
 	end
 end
 -- The continuation bytes (10xxxxxx), at most three and none before byte
@@ -179,7 +228,7 @@ local function back_to_start(at, floor)
 end
 local first = tonumber(ARGV[1])
 if first >= stop then
-	return {size, 0, "", "", 0}
+	return {size, generation, 0, "", "", 0}
 end
 local start = first
 if first > 0 and ARGV[3] == "" then
@@ -190,12 +239,17 @@ if last + 1 < stop then
 	last = last - back_to_start(last + 1, start + 1)
 end
 local text = redis.call("GETRANGE", KEYS[1], start, last)
-return {size, string.len(text), redis.sha1hex(text), text, first - start}`;
+local digest = ""
+if string.sub(generation, 1, 1) == "?" then
+	digest = redis.sha1hex(text)
+end
+return {size, generation, string.len(text), digest, text, first - start}`;
 
-// The check at the end of a chunked read, in one script, so it compares one
-// state of the key: 1 when the key holds, from byte ARGV[1] on, the windows
-// the read yielded, given as each one's byte length and SHA-1 in order
-// (ARGV[2], ARGV[3], then the next window's); 0 when it does not, or is gone.
+// The check at the end of a chunked read that found no generation, in one
+// script, so it compares one state of the key: 1 when the key holds, from
+// byte ARGV[1] on, the windows the read yielded, given as each one's byte
+// length and SHA-1 in order (ARGV[2], ARGV[3], then the next window's); 0
+// when it does not, or is gone.
 const CHECK_WINDOWS_SCRIPT = `-- OMP_CHECK_WINDOWS
 if redis.call("EXISTS", KEYS[1]) == 0 then
 	return 0
@@ -211,9 +265,10 @@ for i = 2, #ARGV, 2 do
 end
 return 1`;
 
-// One script, so the key, its mtime and its title move together: no client's
-// write to either path can land between them. With ARGV[4] == "1" a taken
-// destination leaves everything as it was (returns 0).
+// One script, so the key, its mtime, its title and its generation move
+// together: no client's write to either path can land between them. With
+// ARGV[4] == "1" a taken destination leaves everything as it was (returns 0);
+// ARGV[5] is the destination's new generation token.
 const MOVE_SCRIPT = `-- OMP_MOVE
 if ARGV[4] == "1" and redis.call("EXISTS", KEYS[2]) == 1 then
 	return 0
@@ -228,13 +283,16 @@ if title then
 else
 	redis.call("HDEL", KEYS[4], ARGV[2])
 end
+redis.call("HDEL", KEYS[5], ARGV[1])
+redis.call("HSET", KEYS[5], ARGV[2], ARGV[5] .. " " .. ARGV[3])
 return 1`;
 
 // One script, so finding the keys under a directory, deleting them and
-// deleting their mtime and title run with no other client's command between:
-// a child set after the scan cannot survive, and a replacement written after
-// the delete keeps its metadata. ARGV[1] is the file-key prefix, ARGV[2] a
-// SCAN pattern for the directory ("" for none), ARGV[3..] explicit paths.
+// deleting their mtime, title and generation run with no other client's
+// command between: a child set after the scan cannot survive, and a
+// replacement written after the delete keeps its metadata. ARGV[1] is the
+// file-key prefix, ARGV[2] a SCAN pattern for the directory ("" for none),
+// ARGV[3..] explicit paths.
 const REMOVE_SCRIPT = `-- OMP_REMOVE
 local prefix = ARGV[1]
 local paths = {}
@@ -255,6 +313,7 @@ for _, path in ipairs(paths) do
 	redis.call("DEL", prefix .. path)
 	redis.call("HDEL", KEYS[1], path)
 	redis.call("HDEL", KEYS[2], path)
+	redis.call("HDEL", KEYS[3], path)
 end
 return #paths`;
 
@@ -300,16 +359,25 @@ function writeReply(result: unknown): [status: number, size: number] {
 }
 
 /**
+ * Whether a window's generation (see `READ_WINDOW_SCRIPT`) is the "?" one of
+ * a session with no token: an earlier version wrote it last.
+ */
+function isUnversioned(generation: string): boolean {
+	return generation.startsWith("?");
+}
+
+/**
  * Redis-backed implementation of {@link SessionStorage}. Each session JSONL
- * file maps to a Redis STRING key, with per-key metadata (mtime) tracked in a
- * single sibling HASH. This process keeps only a metadata index (`size`,
- * `mtimeMs`) in memory so synchronous `existsSync` / `statSync` /
- * `listFilesSync` calls remain available without mirroring full content. A
- * full rewrite streams its body in parts to a staging key of its own and
- * swaps it in (see `writeFullStream`), and a chunked read (`readChunks`),
- * which the check after a failed publish and the loaders of long sessions
- * take, fetches the stored text in windows of at most
- * {@link READ_WINDOW_BYTES}, so neither holds the body as one value.
+ * file maps to a Redis STRING key, with per-key metadata (mtime, title, and
+ * the write generation a chunked read checks) tracked in sibling HASHes. This
+ * process keeps only a metadata index (`size`, `mtimeMs`) in memory so
+ * synchronous `existsSync` / `statSync` / `listFilesSync` calls remain
+ * available without mirroring full content. A full rewrite streams its body
+ * in parts to a staging key of its own and swaps it in (see
+ * `writeFullStream`), and a chunked read (`readChunks`), which the check
+ * after a failed publish and the loaders of long sessions take, fetches the
+ * stored text in windows of at most {@link READ_WINDOW_BYTES}, so neither
+ * holds the body as one value.
  */
 export class RedisSessionStorage extends IndexedSessionStorage {
 	/** Always set: the Redis backend reads a session window by window. */
@@ -401,60 +469,83 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 	 * one chunk. A window starts and ends between characters, so its text
 	 * decodes and encodes back to its bytes; a read from inside a character
 	 * fetches that character whole and yields its bytes from `fromByte` on.
-	 * The read stops at the size its first window saw, so an append made
-	 * meanwhile is left out; a key that is gone or shorter than that at a later
-	 * window was deleted or rewritten during the read, which then fails with
-	 * {@link SessionReadConflictError}.
 	 *
-	 * A full rewrite to as many bytes or more is not seen by a window, so once
-	 * the bytes the read yielded come from more than one window, one script at
-	 * the read's end (`CHECK_WINDOWS_SCRIPT`) checks that the key holds them
-	 * still, by each window's byte length and SHA-1 as the window script gave
-	 * them; one that does not is a read conflict too. The check runs when the
-	 * read ends, and also when its consumer closes it before that (a `break`
-	 * out of its loop), whose `return()` then rejects with the conflict. A
-	 * read that fails runs no check.
+	 * The read stops at the size its first window saw, so an append made
+	 * meanwhile is left out. Each later window fails the read with
+	 * {@link SessionReadConflictError}, before it yields anything, when the key
+	 * is gone or shorter than that size. When the first window found the
+	 * session's generation token, a later window at another generation fails
+	 * it too: a full write, a move or a delete gives the session a new token
+	 * whatever bytes it leaves, and a write of an earlier version takes the
+	 * token away (with the exceptions `READ_WINDOW_SCRIPT` names), so the
+	 * windows the read yields come from the session as its first window saw
+	 * it, and a read that its consumer stops early needs no check.
+	 *
+	 * When the first window found none (an earlier version wrote the session
+	 * last), the read runs as it did before generations: a later window that
+	 * finds a token (this version wrote since) fails it, an earlier version's
+	 * append does not, and once the bytes the read yielded come from more than
+	 * one window, one script at its end (`CHECK_WINDOWS_SCRIPT`) checks that
+	 * the key holds them still, by each window's byte length and SHA-1. That
+	 * check runs when the read ends, and also when its consumer closes it
+	 * before that (a `break` out of its loop), whose `return()` then rejects
+	 * with the conflict; a read that fails runs none. Such a read does not see
+	 * an earlier version's rewrite to more bytes that keeps the windows it
+	 * read.
 	 */
 	async *readChunks(path: string, fromByte: number): AsyncGenerator<Uint8Array> {
 		const key = this.#fileKey(path);
-		// The check's arguments: the byte the first window starts at, then each window's byte length and SHA-1.
+		// The size and the generation the first window saw.
+		let first: { stop: number; generation: string } | undefined;
+		// The end check's arguments: the byte the first window starts at, then each window's byte length and SHA-1.
 		const windows: string[] = [];
 		let failed = false;
 		try {
 			let at = Math.max(0, Math.trunc(fromByte));
-			let stop: number | undefined;
 			do {
 				const reply = await this.#client.send("EVAL", [
 					READ_WINDOW_SCRIPT,
-					"1",
+					"3",
 					key,
+					this.#metaKey(),
+					this.#generationKey(),
 					String(at),
 					String(READ_WINDOW_BYTES),
-					stop === undefined ? "" : String(stop),
+					first === undefined ? "" : String(first.stop),
+					path,
 				]);
 				if (!Array.isArray(reply)) {
-					if (stop === undefined) throw enoent(path);
+					if (first === undefined) throw enoent(path);
 					throw new SessionReadConflictError(path);
 				}
 				const size = Number(reply[0]);
-				if (stop === undefined) stop = size;
-				else if (size < stop) throw new SessionReadConflictError(path);
-				const length = Number(reply[1]);
+				const generation = String(reply[1]);
+				if (first === undefined) first = { stop: size, generation };
+				else if (
+					size < first.stop ||
+					// Without a token at either window, the check at the read's end decides.
+					(generation !== first.generation && !(isUnversioned(first.generation) && isUnversioned(generation)))
+				) {
+					throw new SessionReadConflictError(path);
+				}
+				const length = Number(reply[2]);
 				if (length === 0) return;
 				// Only a first window from inside a character starts before `at`.
-				const before = Number(reply[4]);
+				const before = Number(reply[5]);
 				if (windows.length === 0) windows.push(String(at - before));
-				windows.push(String(length), String(reply[2]));
+				windows.push(String(length), String(reply[3]));
 				at += length - before;
-				const bytes = Buffer.from(String(reply[3]), "utf8");
+				const bytes = Buffer.from(String(reply[4]), "utf8");
 				yield before > 0 ? bytes.subarray(before) : bytes;
-			} while (at < stop);
+			} while (at < first.stop);
 		} catch (err) {
 			failed = true;
 			throw err;
 		} finally {
-			// More than one window: at the read's end, or where its consumer closed it, unless it is failing already.
-			if (!failed && windows.length > 3) await this.#confirmWindows(path, key, windows);
+			// Without a token, more than one window: at the read's end, or where its consumer closed it, unless failing.
+			if (!failed && first && isUnversioned(first.generation) && windows.length > 3) {
+				await this.#confirmWindows(path, key, windows);
+			}
 		}
 	}
 
@@ -477,16 +568,18 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 	): Promise<void> {
 		const result = await this.#client.send("EVAL", [
 			WRITE_FULL_SCRIPT,
-			"3",
+			"4",
 			this.#fileKey(path),
 			this.#metaKey(),
 			this.#titleMetaKey(),
+			this.#generationKey(),
 			content,
 			path,
 			String(mtimeMs),
 			title ? "1" : "0",
 			title ? encodeTitleMeta(title) : "",
 			expectedSize === undefined ? "" : String(expectedSize ?? -1),
+			crypto.randomUUID(),
 		]);
 		if (expectedSize === undefined) return;
 		const [status, size] = writeReply(result);
@@ -501,9 +594,9 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 	 * UUID>`, which expires {@link STALE_STAGING_MS} after its last part, so a
 	 * killed writer's goes; then one script checks the session's size, checks
 	 * that the staging key holds the whole body, renames it over the file key
-	 * and sets the mtime and title. No other write knows the staging key, so
-	 * none can rename it, and no listing sees it (they scan file keys). A
-	 * failure deletes it and leaves the session as it was.
+	 * and sets the mtime, title and generation. No other write knows the
+	 * staging key, so none can rename it, and no listing sees it (they scan
+	 * file keys). A failure deletes it and leaves the session as it was.
 	 */
 	async writeFullStream(
 		path: string,
@@ -526,17 +619,19 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 			}
 			result = await this.#client.send("EVAL", [
 				WRITE_STAGED_SCRIPT,
-				"4",
+				"5",
 				staging,
 				this.#fileKey(path),
 				this.#metaKey(),
 				this.#titleMetaKey(),
+				this.#generationKey(),
 				path,
 				String(mtimeMs),
 				title ? "1" : "0",
 				title ? encodeTitleMeta(title) : "",
 				expectedSize === undefined ? "" : String(expectedSize ?? -1),
 				String(byteLength),
+				crypto.randomUUID(),
 			]);
 		} catch (err) {
 			try {
@@ -557,24 +652,28 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 	async append(path: string, line: string, mtimeMs: number): Promise<void> {
 		await this.#client.send("EVAL", [
 			APPEND_SCRIPT,
-			"2",
+			"3",
 			this.#fileKey(path),
 			this.#metaKey(),
+			this.#generationKey(),
 			line,
 			path,
 			String(mtimeMs),
+			crypto.randomUUID(),
 		]);
 	}
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void> {
 		await this.#client.send("EVAL", [
 			UPDATE_TITLE_SCRIPT,
-			"2",
+			"3",
 			this.#metaKey(),
 			this.#titleMetaKey(),
+			this.#generationKey(),
 			path,
 			String(mtimeMs),
 			encodeTitleMeta(title),
+			crypto.randomUUID(),
 		]);
 	}
 
@@ -586,9 +685,10 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		if (paths.length === 0 && dir === undefined) return;
 		await this.#client.send("EVAL", [
 			REMOVE_SCRIPT,
-			"2",
+			"3",
 			this.#metaKey(),
 			this.#titleMetaKey(),
+			this.#generationKey(),
 			this.#fileKey(""),
 			dir === undefined ? "" : keysStartingWith(this.#fileKey(dir)),
 			...paths,
@@ -598,15 +698,17 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 	async move(src: string, dst: string, mtimeMs: number, noReplace = false): Promise<void> {
 		const moved = await this.#client.send("EVAL", [
 			MOVE_SCRIPT,
-			"4",
+			"5",
 			this.#fileKey(src),
 			this.#fileKey(dst),
 			this.#metaKey(),
 			this.#titleMetaKey(),
+			this.#generationKey(),
 			src,
 			dst,
 			String(mtimeMs),
 			noReplace ? "1" : "0",
+			crypto.randomUUID(),
 		]);
 		if (Number(moved) !== 1) throw eexist(dst);
 	}
@@ -634,5 +736,10 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 
 	#titleMetaKey(): string {
 		return `${this.#prefix}title`;
+	}
+
+	/** The hash of each session's write generation, `<token> <mtime>`; see `WRITE_FULL_SCRIPT`. */
+	#generationKey(): string {
+		return `${this.#prefix}generation`;
 	}
 }
