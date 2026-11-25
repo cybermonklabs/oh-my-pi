@@ -87,7 +87,6 @@
 - Fixed confirming a session rewrite whose acknowledgement failed by reading the whole stored transcript into one string when its storage can stream it; the stored bytes are now compared by size and SHA-256 as they stream.
 - Parked task subagents keep only plain data for their revival, so a session that runs many subagents no longer grows with each one; a revived subagent reads the peer list its prompt showed back from its transcript and takes its settings from its parent as they are now, plus the settings it changed itself
 - A session that finds another writer's entries in its file while rewriting it reads the file back in pieces instead of all at once, so keeping those entries no longer holds a whole long transcript in memory
-- A `task` call whose `taskFile` names a FIFO is refused without opening the FIFO, so a program waiting to write to it stays blocked instead of losing its write or being killed by SIGPIPE
 - A session that ran background tasks no longer keeps each delivered job, such as a finished subagent's recent tool output, in memory for the rest of its life once the job's result is in its context
 - A finished background `task` call no longer keeps every subagent's recent output and tool calls in memory for the rest of the session
 - Checking whether another omp process runs a session, as `omp gc` does, no longer blocks about 50 ms for each session another omp process runs
