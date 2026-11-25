@@ -5706,34 +5706,30 @@ fn set_m_wait_warns_of_a_job_continued_by_pid() {
 	}
 }
 
-/// A known difference, pinned so that the change that closes it flips
-/// these rows: under `set -m` without a terminal, a foreground command of
-/// the shell that stops takes zsh's way (`jobctl::suspend`). obash prints
-/// `zsh: suspended (signal)  CMD` and goes on, and a stop inside a loop
-/// makes the whole loop the job and ends the rest of the line (the shell
-/// exits with 147). bash makes the stopped command alone a stopped job and
-/// runs on (`st=147`, then `jobs` lists it). The member that takes the stop
-/// in bash's way (`fix/a-stop-under-set-m-returns-without-a-terminal`)
-/// flips both rows; with a terminal nothing changes here, which is this
-/// member's scope. bash's output is compared live only with a bash 5.3 or
-/// later ([`real_bash_golden`]). Each stopped program writes its pid to
-/// `$F.pids`, and the test ends each one after the run, as obash's loop
-/// row leaves it stopped. The rows run as a `-c` string and as a script
-/// file ([`Form`]), bounded ([`bounded_to_files`]).
+/// Under `set -m` without a terminal, a foreground command of the shell
+/// that stops is a stopped job, as in bash (`jobctl::bash_suspend`): `$?`
+/// is 147, the shell runs on, also inside a loop, and `jobs` lists each
+/// stopped command; nothing is printed at the stop. Before the stop path
+/// took bash's way, obash took zsh's (`jobctl::suspend`): it printed
+/// `zsh: suspended (signal)  CMD`, and a stop inside a loop made the whole
+/// loop the job and ended the rest of the line. bash's output is compared
+/// live only with a bash 5.3 or later ([`real_bash_golden`]). Each stopped
+/// program writes its pid to `$F.pids`, and the test ends each one after
+/// the run, so a shell that leaves one stopped leaves nothing behind. The
+/// rows run as a `-c` string and as a script file ([`Form`]), bounded
+/// ([`bounded_to_files`]).
 #[cfg(target_os = "linux")]
 #[test]
-fn set_m_foreground_stop_without_a_terminal_takes_zshs_suspend() {
+fn set_m_foreground_stop_without_a_terminal_takes_bashs_way() {
 	const OUT: &str = "exec >\"$F.out\" 2>\"$F.err\"; /bin/rm -f \"$F.pids\"; ";
 	let cmd = r#"/bin/sh -c 'echo $$ >> "$0.pids"; kill -STOP $$' "$F""#;
-	let zsh = format!("zsh: suspended (signal)  {cmd}\n");
 	let one = format!("[1]+  Stopped                    {cmd}\n");
 	let two =
 		format!("[1]-  Stopped                    {cmd}\n[2]+  Stopped                    {cmd}\n");
-	// (script, obash's output and end, bash's output and end)
+	// (script, bash's output and end: obash's too)
 	let rows = [
 		(
 			format!("set -m; {cmd}; echo st=$?; jobs; kill -CONT %1; wait; echo end"),
-			(format!("{zsh}st=147\n{one}end\n"), Exit(0)),
 			(format!("st=147\n{one}end\n"), Exit(0)),
 		),
 		(
@@ -5741,7 +5737,6 @@ fn set_m_foreground_stop_without_a_terminal_takes_zshs_suspend() {
 				"set -m; for i in 1 2; do {cmd}; echo st=$?; done; jobs; kill -CONT %1 %2; wait; echo \
 				 end"
 			),
-			(zsh, Exit(147)),
 			(format!("st=147\nst=147\n{two}end\n"), Exit(0)),
 		),
 	];
@@ -5758,20 +5753,17 @@ fn set_m_foreground_stop_without_a_terminal_takes_zshs_suspend() {
 		}
 	};
 	for form in Form::BOTH {
-		for (script, (ours, ours_end), (theirs, theirs_end)) in &rows {
+		for (script, (want, end)) in &rows {
 			let script = format!("{OUT}{script}");
+			let want = (want.clone(), String::new(), Some(*end));
 			let obash = OsStr::new(env!("CARGO_BIN_EXE_obash"));
 			let got = bounded_to_files(obash, form, &script, dir.path());
 			end_stopped();
-			assert_eq!(got, (ours.clone(), String::new(), Some(*ours_end)), "{form:?}: {script}");
+			assert_eq!(got, want, "{form:?}: {script}");
 			if let Some(real) = real_bash_golden() {
 				let got = bounded_to_files(real.as_os_str(), form, &script, dir.path());
 				end_stopped();
-				assert_eq!(
-					got,
-					(theirs.clone(), String::new(), Some(*theirs_end)),
-					"bash {form:?}: {script}"
-				);
+				assert_eq!(got, want, "bash {form:?}: {script}");
 			}
 		}
 	}

@@ -1872,9 +1872,9 @@ impl Shell {
 				.map_err(ShellError::Store)?
 		{
 			// A script's job control from the start: an imported `SHELLOPTS`
-			// naming `monitor` (bash `set_job_control`), or `-m` with a
-			// terminal on standard error ([`jobctl::set_monitor`] leaves that
-			// alone).
+			// naming `monitor` (bash `set_job_control`), or `-m`, with a
+			// terminal on standard error lent to the foreground jobs
+			// ([`jobctl::set_monitor`]).
 			jobctl::set_monitor(&mut k, cx, &root, true);
 		}
 		Ok(Self {
@@ -3427,13 +3427,13 @@ impl Shell {
 		// bash learns that a job it did not continue itself (`kill -CONT
 		// PID`, where `%job` marks it running) runs again only from its wait
 		// status (`waitchld`'s `WCONTINUED`): until then the job is stopped in
-		// its table (`wait` warns of it). In a script doing job control
-		// without a terminal, a job whose program reports its continue
-		// ([`jobctl::ext_event`]) waits for that report.
+		// its table (`wait` warns of it). Under bash's `set -m` in a script,
+		// a job whose program reports its continue ([`jobctl::ext_event`])
+		// waits for that report.
 		let by_pid = sig == Signal::Cont
 			&& sender == Sender::Shell
 			&& matches!(target, SigTarget::Vpid(_))
-			&& jobctl::without_terminal(&self.k);
+			&& jobctl::bash_jobs(&self.k);
 		let continued: Vec<Vpid> = changed
 			.iter()
 			.filter(|&&(_, stop)| stop.is_none())

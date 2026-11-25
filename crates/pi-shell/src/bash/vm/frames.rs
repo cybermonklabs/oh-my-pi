@@ -772,6 +772,24 @@ impl Shell {
 			shell.lose_running(cx, &mut report)?;
 		}
 		shell.k.sync_root(cx.store, &shell.procs[0]);
+		// bash's `set -m` in a script comes back with its option (the job
+		// control state is not imaged); the groups of the jobs from before
+		// the restore are not known. Only a bash script's, as
+		// [`Shell::create`] guards its own call: zsh's `MONITOR` is the same
+		// option, and an interactive shell's job control is `init_io`'s, which
+		// a restore does not run, so both come back without job control.
+		let root = &shell.procs[0];
+		let monitor = crate::bash::store::OptId::Monitor;
+		let interactive = matches!(
+			state::record(cx.store, root, Key::Misc(MiscKey::Interactive)),
+			Ok(Some(Record::Misc(v))) if v.as_slice() == b"1"
+		);
+		if root.mode.dialect() == crate::bash::ids::Dialect::Bash
+			&& !interactive
+			&& state::option(&mut shell.k.root, cx.store, root, monitor).unwrap_or(false)
+		{
+			super::jobctl::set_monitor(&mut shell.k, cx, &shell.procs[0], true);
+		}
 		if let Some(err) = shell.k.root.take_fault() {
 			return Err(RestoreError::Store(err));
 		}
