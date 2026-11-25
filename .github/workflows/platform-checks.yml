@@ -10,9 +10,16 @@
 #
 #   gh workflow run platform-checks.yml --repo cybermonklabs/oh-my-pi --ref platform-checks \
 #     -f head=<sha> [-f base=<sha>] [-f plant=<sha>] [-f platforms=macos,windows,ubuntu] \
-#     [-f crates=pi-shell] [-f filter='<nextest filterset>'] [-f repeat=1] [-f legs=1] \
-#     [-f retries=0] [-f flaky_passes=false] [-f timeout_minutes=10] [-f as_root=false]
-#     [-f skip_bash_install=false] [-f keep_success_output=false]
+#     [-f crates=pi-shell] [-f filter='<nextest filterset>'] [-f repeat=1] \
+#     [-f timeout_minutes=10] [-f options='<name=value ...>']
+#
+# GitHub takes at most 10 workflow_dispatch inputs, so the settings a dispatch rarely changes go
+# in `options`, as `name=value` pairs separated by spaces, in any order: legs, retries,
+# flaky_passes, partitions, as_root, keep_success_output, skip_bash_install (pc.py OPTIONS; it
+# refuses a pair that does not parse, a name that is no setting, and a name given twice). Each is
+# an input of its own for a caller (workflow_call), which passes them one by one, and the plan
+# prints every setting it resolved, whichever way it came, for the jobs to read. For example
+# `-f options='legs=4 retries=1 as_root=true'`.
 #
 # Inputs are used exactly as given: no spaces in lists, whole numbers written plainly. A plant
 # is a commit whose own change (plant^..plant) is applied to head; the plan fails when it does
@@ -85,8 +92,10 @@ run-name: >-
   inputs.head, inputs.base && format(' vs {0}', inputs.base) || '', inputs.plant && format(' + plant {0}', inputs.plant) || '', inputs.platforms) }}
 
 on:
+  # At most 10 inputs here, as GitHub allows: the settings a dispatch rarely changes go in
+  # `options` (pc.py OPTIONS), which a caller never gives.
   workflow_dispatch:
-    inputs: &inputs
+    inputs:
       head:
         description: "Commit to test: a full 40-character id, pushed to this repository"
         required: true
@@ -121,49 +130,80 @@ on:
         required: false
         default: "1"
         type: string
-      legs:
-        description: "Parallel jobs the repeats are split over (each runs the same archive)"
-        required: false
-        default: "1"
-        type: string
-      retries:
-        description: "nextest retries of a failed test (0: none)"
-        required: false
-        default: "0"
-        type: string
-      flaky_passes:
-        description: "Count a test that passes only on a retry (FLAKY) as a pass"
-        required: false
-        default: false
-        type: boolean
       timeout_minutes:
         description: "Time bound per test, in minutes (nextest ends the test: TIMEOUT)"
         required: false
         default: "10"
         type: string
+      options:
+        description: "name=value pairs, space-separated: legs, retries, flaky_passes, partitions, as_root, keep_success_output, skip_bash_install"
+        required: false
+        default: ""
+        type: string
+  # A call from another workflow of this repository: the same settings, each its own input, so
+  # every reader of this file (actionlint among them) sees what a call may pass. A caller gives
+  # no `options`.
+  workflow_call:
+    inputs:
+      head:
+        required: true
+        type: string
+      base:
+        required: false
+        default: ""
+        type: string
+      plant:
+        required: false
+        default: ""
+        type: string
+      platforms:
+        required: false
+        default: "macos,windows,ubuntu"
+        type: string
+      crates:
+        required: false
+        default: "pi-shell"
+        type: string
+      filter:
+        required: false
+        default: "all()"
+        type: string
+      repeat:
+        required: false
+        default: "1"
+        type: string
+      timeout_minutes:
+        required: false
+        default: "10"
+        type: string
+      legs:
+        required: false
+        default: "1"
+        type: string
+      retries:
+        required: false
+        default: "0"
+        type: string
+      flaky_passes:
+        required: false
+        default: false
+        type: boolean
       partitions:
-        description: "Parallel legs that split the selected tests (nextest --partition count:k/N)"
         required: false
         default: "1"
         type: string
       as_root:
-        description: "Also run the ubuntu legs as root"
         required: false
         default: false
         type: boolean
       keep_success_output:
-        description: "Keep passing tests' output too (nextest success-output final, and in the JUnit report)"
         required: false
         default: false
         type: boolean
       skip_bash_install:
-        description: "Control: the macOS legs skip the Homebrew bash install, and must read UNKNOWN"
         required: false
         default: false
         type: boolean
-  # A call from another workflow of this repository: the same inputs.
-  workflow_call:
-    inputs: *inputs
   # GitHub dispatches only a workflow it has seen run, and this file lives off the default
   # branch: a push that changes the tool runs it once, which registers it. That run is the
   # tool's own test: the classifier and scan controls, and the controls on real nextest output
@@ -198,12 +238,17 @@ env:
   PC_CRATES: ${{ inputs.crates }}
   PC_FILTER: ${{ inputs.filter }}
   PC_REPEAT: ${{ inputs.repeat }}
+  PC_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+  # A dispatch gives these in `options` and a caller as inputs of its own; the plan resolves both
+  # and prints each one, and every other job reads the plan's output, never these.
+  PC_OPTIONS: ${{ inputs.options }}
   PC_LEGS: ${{ inputs.legs }}
   PC_PARTITIONS: ${{ inputs.partitions }}
   PC_RETRIES: ${{ inputs.retries }}
   PC_FLAKY_PASSES: ${{ inputs.flaky_passes }}
-  PC_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
   PC_AS_ROOT: ${{ inputs.as_root }}
+  PC_KEEP_SUCCESS_OUTPUT: ${{ inputs.keep_success_output }}
+  PC_SKIP_BASH_INSTALL: ${{ inputs.skip_bash_install }}
 
 jobs:
   plan:
@@ -222,6 +267,15 @@ jobs:
       legs_ubuntu: ${{ steps.plan.outputs.legs_ubuntu }}
       plant_tree: ${{ steps.trees.outputs.plant_tree }}
       called: ${{ steps.plan.outputs.called }}
+      # Every setting a dispatch may give in `options`, resolved: the jobs read these.
+      legs_n: ${{ steps.plan.outputs.legs_n }}
+      retries: ${{ steps.plan.outputs.retries }}
+      timeout_minutes: ${{ steps.plan.outputs.timeout_minutes }}
+      partitions: ${{ steps.plan.outputs.partitions }}
+      flaky_passes: ${{ steps.plan.outputs.flaky_passes }}
+      as_root: ${{ steps.plan.outputs.as_root }}
+      keep_success_output: ${{ steps.plan.outputs.keep_success_output }}
+      skip_bash_install: ${{ steps.plan.outputs.skip_bash_install }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -303,10 +357,10 @@ jobs:
       plant: ${{ inputs.plant }}
       crates: ${{ inputs.crates }}
       filter: ${{ inputs.filter }}
-      retries: ${{ inputs.retries }}
-      timeout_minutes: ${{ inputs.timeout_minutes }}
-      keep_success_output: ${{ inputs.keep_success_output }}
-      skip_bash_install: ${{ inputs.skip_bash_install }}
+      retries: ${{ needs.plan.outputs.retries }}
+      timeout_minutes: ${{ needs.plan.outputs.timeout_minutes }}
+      keep_success_output: ${{ needs.plan.outputs.keep_success_output == 'true' }}
+      skip_bash_install: ${{ needs.plan.outputs.skip_bash_install == 'true' }}
 
   windows:
     name: windows
@@ -323,10 +377,10 @@ jobs:
       plant: ${{ inputs.plant }}
       crates: ${{ inputs.crates }}
       filter: ${{ inputs.filter }}
-      retries: ${{ inputs.retries }}
-      timeout_minutes: ${{ inputs.timeout_minutes }}
-      keep_success_output: ${{ inputs.keep_success_output }}
-      skip_bash_install: ${{ inputs.skip_bash_install }}
+      retries: ${{ needs.plan.outputs.retries }}
+      timeout_minutes: ${{ needs.plan.outputs.timeout_minutes }}
+      keep_success_output: ${{ needs.plan.outputs.keep_success_output == 'true' }}
+      skip_bash_install: ${{ needs.plan.outputs.skip_bash_install == 'true' }}
 
   ubuntu:
     name: ubuntu
@@ -343,10 +397,10 @@ jobs:
       plant: ${{ inputs.plant }}
       crates: ${{ inputs.crates }}
       filter: ${{ inputs.filter }}
-      retries: ${{ inputs.retries }}
-      timeout_minutes: ${{ inputs.timeout_minutes }}
-      keep_success_output: ${{ inputs.keep_success_output }}
-      skip_bash_install: ${{ inputs.skip_bash_install }}
+      retries: ${{ needs.plan.outputs.retries }}
+      timeout_minutes: ${{ needs.plan.outputs.timeout_minutes }}
+      keep_success_output: ${{ needs.plan.outputs.keep_success_output == 'true' }}
+      skip_bash_install: ${{ needs.plan.outputs.skip_bash_install == 'true' }}
 
   report:
     name: report
@@ -380,6 +434,12 @@ jobs:
           PC_LEGS_JSON: ${{ needs.plan.outputs.legs }}
           PC_BUILDS_JSON: ${{ needs.plan.outputs.builds }}
           PC_PLANT_TREE: ${{ needs.plan.outputs.plant_tree }}
+          # The settings the plan resolved, which the report names in its header.
+          PC_LEGS: ${{ needs.plan.outputs.legs_n }}
+          PC_RETRIES: ${{ needs.plan.outputs.retries }}
+          PC_TIMEOUT_MINUTES: ${{ needs.plan.outputs.timeout_minutes }}
+          PC_FLAKY_PASSES: ${{ needs.plan.outputs.flaky_passes }}
+          PC_AS_ROOT: ${{ needs.plan.outputs.as_root }}
         run: |
           python3 .github/platform-checks/pc.py report "$RUNNER_TEMP/results" "$RUNNER_TEMP/builds" "$RUNNER_TEMP/report/pc-report" >> "$GITHUB_STEP_SUMMARY"
       - name: Scan the report
