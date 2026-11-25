@@ -224,8 +224,10 @@ own_default() {
 # --- the test step's cases -------------------------------------------------------
 # run <name> <want: 0 or 1> <message regex or ''> <known failures> <stub body>
 # Environment of a case: KNOWN_SKIPS, KNOWN_OUTPUT, SANCTIONED, OWN, ROOT_ALONE,
-# IGNORED_RUN, IGNORED_ROOT, CHILD_ENTRIES, MACOS, ONLY (lines of `<target>
-# <name>`; ONLY sets RUST_TEST_ONLY, with CANARY as RUST_TEST_CANARY), ROOTS
+# IGNORED_RUN, IGNORED_ROOT, MACOS, ONLY (lines of `<target> <name>`; ONLY sets
+# RUST_TEST_ONLY, with CANARY as RUST_TEST_CANARY), CHILD_ENTRIES (lines of
+# `<target> <name> <why>`, the why written as it is: `<parent>[ and
+# <parent>...]: <reason>`), ROOTS
 # and ROOT_COUNT, ROOT_BODY, OWN_BODY, IGN_BODY, IGN_ROOT_BODY, STICKY_BODY
 # and STICKY_ROOT_BODY (the stub's answer to those invocations), OWN_TESTS and
 # OWN_PRINTS (for own_default), MAIN_MUST_SKIP, CARGO_MODE, CARGO_WS,
@@ -262,7 +264,7 @@ run() {
 	list rust-test-ignored.txt "${IGNORED_RUN:-}" "why"
 	if [ -n "${IGNORED_OPT:-}" ]; then printf '%s\n' "$IGNORED_OPT" | while read -r a b; do printf '%s %s  opt: a sweep\n' "$a" "$b"; done >>"$w/repo/.github/sami/rust-test-ignored.txt"; fi
 	list rust-test-ignored-root.txt "${IGNORED_ROOT:-}" "why"
-	list rust-test-child-entries.txt "${CHILD_ENTRIES:-}" "the parent test"
+	{ echo '# header'; echo; [ -n "${CHILD_ENTRIES:-}" ] && printf '%s\n' "$CHILD_ENTRIES" | while read -r a b c; do [ -n "$a" ] && printf '%s %s  %s\n' "$a" "$b" "$c"; done; } >"$w/repo/.github/sami/rust-test-child-entries.txt"
 	list rust-test-macos.txt "${MACOS:-}" "macOS only"
 	if [ -n "${RAW_LIST:-}" ]; then
 		cp -- "$RAW_LIST" "$w/repo/.github/sami/rust-test-known-raw-output.txt"
@@ -550,7 +552,7 @@ run J27-planned-more-than-reported 1 'planned 3 tests and reported 1' '' "{ $P; 
 run J28-real-libtest-exit-zero 1 'pi-diff_test is PASSED' '' "{ $P; rt $D PASSED cat $fixtures/early.json; } >\"\$bep\"; exit 0"
 run J29-real-libtest-pass 0 '' '' "{ $P; rt $D PASSED cat $fixtures/fine.json; } >\"\$bep\"; exit 0"
 # fail.json holds an #[ignore]d test, t::c_ignored: named a child entry here.
-CHILD_ENTRIES="$D t::c_ignored" run J30-real-libtest-fail-listed 0 'Known failure, failed as expected: //crates/pi-diff:pi-diff_test t::b_fails' "$D t::b_fails" "{ $P; rt $D FAILED cat $fixtures/fail.json; } >\"\$bep\"; exit 3"
+CHILD_ENTRIES="$D t::c_ignored t::a_passes: the parent test" run J30-real-libtest-fail-listed 0 'Known failure, failed as expected: //crates/pi-diff:pi-diff_test t::b_fails' "$D t::b_fails" "{ $P; rt $D FAILED cat $fixtures/fail.json; } >\"\$bep\"; exit 3"
 run J31-real-libtest-fail-unlisted 1 't::b_fails failed and is not in' '' "{ $P; rt $D FAILED cat $fixtures/fail.json; } >\"\$bep\"; exit 3"
 
 # A test target the query names but bazel test left without a result.
@@ -665,10 +667,10 @@ NOT_MSG='ran in no invocation|but its binary lists' run J94-timeout-named-once 1
 # or is a child entry point, or runs in the macOS job; any other fails.
 IGN="rt $D PASSED lt_ignored d::one d::needs_network"
 run J93-ignored-test-runs-nowhere 1 "$D d::needs_network is #\\[ignore\\]d and runs in no invocation" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
-CHILD_ENTRIES="$D d::needs_network" run J95-ignored-child-entry 0 "a child process's entry point another test starts: $D d::needs_network" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network d::one: the parent test" run J95-ignored-child-entry 0 "a child process's entry point another test starts: $D d::needs_network" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
 MACOS="$D d::needs_network" run J96-ignored-runs-on-macos 0 "run by the macOS job: $D d::needs_network" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
-CHILD_ENTRIES="$D d::needs_network
-$D d::one" run J97-child-entry-that-ran 1 "$D d::one is in .github/sami/rust-test-child-entries.txt but is no #\\[ignore\\]d test" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network d::one: the parent test
+$D d::one d::needs_network: the parent test" run J97-child-entry-that-ran 1 "$D d::one is in .github/sami/rust-test-child-entries.txt but is no #\\[ignore\\]d test" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
 IGNORED_RUN="$D d::needs_network" OWN_TESTS="d::one d::needs_network" run J98-ignored-test-run-alone 0 "Ignored test ran alone: $D d::needs_network \\(ok\\)" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
 IGNORED_RUN="$D d::renamed" OWN_TESTS="d::one d::needs_network" run J99-ignored-run-matches-nothing 1 "own invocation for d::renamed reported \\[\\]" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
 IGNORED_ROOT="$B r::cycle" OWN_TESTS="a::one r::cycle" run J100-ignored-root-run-alone 0 "Ignored root test ran alone: $B r::cycle \\(ok\\)" '' "{ $P; rt $B PASSED lt_ignored a::one r::cycle; } >\"\$bep\"; exit 0"
@@ -837,10 +839,10 @@ SANCTIONED_LINE="$D a::two ruling" run J147-list-line-without-its-why-stops 1 "r
 # child-entries line (J148), a sanctioned skip (J149), an #[ignore]d root test
 # run alone (J150); and a summary that says FAILED_TO_BUILD (J151).
 UB="unbuilt $B"
-NOT_MSG='rust-test-child-entries.txt but is no' CHILD_ENTRIES="$B b::child" run J148-child-entry-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; $UB; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
+NOT_MSG='rust-test-child-entries.txt but is no|is no test of' CHILD_ENTRIES="$B b::child b::parent: the parent test" run J148-child-entry-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; $UB; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
 NOT_MSG='takes out 0 tests' SANCTIONED="$B s::x::byte_totals" run J149-sanctioned-skip-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so what its skip s::x::byte_totals" '' "{ $P; cfg $B 'rust_test rule'; $UB; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
 NOT_MSG='has no one test log' IGNORED_ROOT="$B r::cycle" IGN_ROOT_BODY="{ cfg $B 'rust_test rule'; $UB; } >\"\$bep\"; exit 1" run J150-ignored-root-test-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so its own invocation for r::cycle" '' "{ $P; cfg $B 'rust_test rule'; $UB; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
-NOT_MSG='rust-test-child-entries.txt but is no' CHILD_ENTRIES="$B b::child" run J151-child-entry-of-a-target-summarized-failed-to-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
+NOT_MSG='rust-test-child-entries.txt but is no|is no test of' CHILD_ENTRIES="$B b::child b::parent: the parent test" run J151-child-entry-of-a-target-summarized-failed-to-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
 # A test of rust-test-root-alone.txt is taken out of the main invocation and
 # runs alone as root (J152); one that prints UNKNOWN: there checked nothing
 # (J153); one the main invocation still runs fails (J154).
@@ -858,6 +860,19 @@ NOT_MSG='bazel test exited|reported \[' IGNORED_RUN="//crates/pi-vcs:gone_test x
 FLAKY="$B x::f" MAIN_MUST_FLAKY="$B" run J156-flaky-listed-failed-then-passed 0 "Known flaky test, failed on 1 of 2 attempts and passed on another: $B x::f" '' "f=\"\$(tpath $B)\"; a=\"\$(dirname \"\$f\")/test_attempts/attempt_1.log\"; mkdir -p \"\$(dirname \"\$a\")\"; lt_fail x::f >\"\$a\"; lt_pass x::passes x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B FLAKY \"\$a\" \"\$f\"; } >\"\$bep\"; exit 0"
 NOT_MSG='Known flaky test, failed on' FLAKY="$B x::f" run J157-flaky-listed-failed-every-attempt 1 "$B x::f is listed flaky in .github/sami/rust-test-known-failures.txt, but failed on every attempt \\(2 of 2\\): NEW" '' "f=\"\$(tpath $B)\"; a=\"\$(dirname \"\$f\")/test_attempts/attempt_1.log\"; mkdir -p \"\$(dirname \"\$a\")\"; lt_fail x::f >\"\$a\"; lt_fail x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B FAILED \"\$a \$f\"; } >\"\$bep\"; exit 3"
 NOT_MSG='Known failure did not happen|failed and is not in' FLAKY="$B x::f" run J158-flaky-listed-passed-first 0 "$B x::f is listed flaky in .github/sami/rust-test-known-failures.txt and did not fail" '' "f=\"\$(tpath $B)\"; mkdir -p \"\$(dirname \"\$f\")\"; lt_pass x::passes x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B PASSED '' \"\$f\"; } >\"\$bep\"; exit 0"
+
+# A child entry names the tests that start it (`<parent>[ and <parent>...]:
+# <reason>`), and each must be a test of the binary: a valid pair passes
+# (J159); a parent renamed since the line was written (d::starts_the_child,
+# now d::starts_the_child_now) fails (J160), also as the second of two
+# (J161); a line with no `<parent>: <reason>` stops the job (J162), and so
+# does a parent in prose, which is no test name (J163).
+IGN_RENAMED="rt $D PASSED lt_ignored d::starts_the_child_now d::needs_network"
+NOT_MSG='is no test of' CHILD_ENTRIES="$D d::needs_network d::one: the parent test" run J159-child-entry-parent-is-a-test 0 "Child entry's parent is a test of its binary: $D d::one starts d::needs_network" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network d::starts_the_child: the parent test" run J160-child-entry-parent-renamed 1 "d::starts_the_child, which .github/sami/rust-test-child-entries.txt names as the test that starts $D d::needs_network, is no test of $D \\(renamed or deleted\\)" '' "{ $P; $IGN_RENAMED; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network d::needs_network and d::starts_the_child: the parent tests" run J161-child-entry-second-parent-renamed 1 "d::starts_the_child, which .github/sami/rust-test-child-entries.txt names as the test that starts $D d::needs_network, is no test of $D" '' "{ $P; $IGN_RENAMED; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network d::one" run J162-child-entry-without-a-reason 1 "rust-test-child-entries.txt:3: no \"<parent test>: <reason>\"" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network the parent test: it starts the binary again" run J163-child-entry-parent-in-prose 1 "rust-test-child-entries.txt:3: \"the parent test\" is no full libtest test name" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.
@@ -1675,6 +1690,8 @@ prun() {
 		printf '[package]\nname = "demo"\n' >crates/demo/Cargo.toml
 		printf '[package]\nname = "x"\n' >sdk/rust/x/Cargo.toml
 		printf '# list\n%s\n' "${PARITY_WS:-sdk/rust/x/Cargo.toml  standalone}" >.github/sami/rust-test-cargo-workspaces.txt
+		printf '# list\n%s\n' "${PARITY_UNTESTED:-# none}" >.github/sami/rust-test-untested-manifests.txt
+		if [ -n "${PARITY_FIXTURE:-}" ]; then mkdir -p "$(dirname "$PARITY_FIXTURE")" && printf '[package]\nname = "fixture"\n\n[workspace]\n' >"$PARITY_FIXTURE"; fi
 		{ echo '# sanctioned'; [ -n "${PARITY_SANCTIONED:-}" ] && printf '%s  ruling\n' "$PARITY_SANCTIONED"; [ -n "${PARITY_SANCTIONED_LINE:-}" ] && printf '%s\n' "$PARITY_SANCTIONED_LINE"; } >.github/sami/rust-test-sanctioned-skips.txt
 		git init -q . && git add -A && git -c user.email=h@example.invalid -c user.name=harness commit -qm fixture
 	) || { verdict "$name" "$want" 97 "$msg" "could not make the fixture repository"; return 0; }
@@ -1714,7 +1731,16 @@ $DOCT
 $(rule rust_test //crates/demo:other_test "$(strs srcs //crates/demo:tests/other.rs)")"
 prun P3-doctest-missing 1 "demo's doctest target demo \\(crates/demo/src/lib.rs\\) has no Bazel rust_doc_test" "$LIB
 $(rule rust_test //crates/demo:demo_test "$(str crate //crates/demo:demo)")"
-PARITY_WS='# none' prun P4-cargo-toml-unlisted 1 'sdk/rust/x/Cargo.toml is outside the root workspace and not in' "$(covered)"
+PARITY_WS='# none' prun P4-cargo-toml-unlisted 1 'sdk/rust/x/Cargo.toml is outside the root workspace and in neither' "$(covered)"
+# A manifest outside the root workspace whose tests no job runs, on purpose,
+# is in rust-test-untested-manifests.txt (P14; without its line it fails as
+# P4 does, P15); a line naming no tracked Cargo.toml (P16), one naming the
+# root workspace's (P17), and a manifest in both lists (P18) fail.
+PARITY_FIXTURE=.github/platform-checks/fixture/Cargo.toml PARITY_UNTESTED='.github/platform-checks/fixture/Cargo.toml  the tool fixture' NOT_MSG='and in neither' prun P14-untested-manifest-listed 0 'Cargo manifests: 4 tracked, 0 outside the root workspace and unlisted' "$(covered)"
+PARITY_FIXTURE=.github/platform-checks/fixture/Cargo.toml prun P15-untested-manifest-unlisted 1 '.github/platform-checks/fixture/Cargo.toml is outside the root workspace and in neither' "$(covered)"
+PARITY_UNTESTED='.github/platform-checks/fixture/Cargo.toml  the tool fixture' prun P16-untested-line-names-no-manifest 1 '.github/platform-checks/fixture/Cargo.toml is in .github/sami/rust-test-untested-manifests.txt, but the tree under test tracks no such Cargo.toml' "$(covered)"
+PARITY_UNTESTED='crates/demo/Cargo.toml  a root member' prun P17-untested-line-names-a-root-member 1 'crates/demo/Cargo.toml is in .github/sami/rust-test-untested-manifests.txt, but it is the root workspace.s' "$(covered)"
+PARITY_UNTESTED='sdk/rust/x/Cargo.toml  both' prun P18-manifest-in-both-lists 1 'sdk/rust/x/Cargo.toml is in both' "$(covered)"
 prun P5-skip-covered-by-another-target 0 "Skips in test targets' args: 1, 0 run nowhere" "$(covered "$(strs args --skip ::slow::)")
 $(rule native_test //crates/demo:slow_test "$(str src //crates/demo:demo_test)" "$(strs args ::slow::)")"
 prun P6-skip-uncovered 1 "//crates/demo:demo_test's args skip ::slow::, and no other test target of that binary runs it" "$(covered "$(strs args --skip ::slow::)")"

@@ -22,8 +22,9 @@
 #     Bazel one whose reason starts `opt: ` in a -c opt build; or
 #     as root .github/sami/rust-test-ignored-root.txt), or is a child
 #     process's entry point that another test starts
-#     (.github/sami/rust-test-child-entries.txt), or runs in the macOS job
-#     (.github/sami/rust-test-macos.txt);
+#     (.github/sami/rust-test-child-entries.txt, whose line names each
+#     starting test, and fails when one of them is no test of the binary),
+#     or runs in the macOS job (.github/sami/rust-test-macos.txt);
 #   (An ```ignore doc block is not a test: upstream marks it so that rustdoc
 #   never runs it. It counts neither as run nor against the job; the step
 #   prints how many there are and where.)
@@ -184,6 +185,39 @@ entries rust-test-cargo-workspaces.txt 1 cargo-workspaces.txt
 entries rust-test-ignored.txt 2 ignored-run.tsv
 entries rust-test-ignored-root.txt 2 ignored-root.tsv
 entries rust-test-child-entries.txt 2 child-entries.tsv
+# A child entry's why is `<parent>[ and <parent>...]: <reason>`: each parent
+# is the full libtest name of a test of the same binary that starts the child,
+# and the accounting below fails when a parent is not in that binary's
+# listing (renamed or deleted, it would leave the child running nowhere, with
+# nothing to say so). child-parents.tsv holds one line per parent.
+awk '
+	function malformed(what) {
+		printf "%s:%d: %s: %s\n", FILENAME, FNR, what, $0 > "/dev/stderr"
+		bad = 1
+	}
+	/^[[:space:]]*(#|$)/ { next }
+	{
+		line = $0
+		sub(/[[:space:]]+$/, "", line)
+		i = index(line, " ")
+		target = substr(line, 1, i - 1)
+		rest = substr(line, i + 1)
+		j = index(rest, "  ")
+		child = substr(rest, 1, j - 1)
+		why = substr(rest, j)
+		sub(/^ +/, "", why)
+		k = index(why, ": ")
+		if (!k) { malformed("no \"<parent test>: <reason>\" (a child entry names the test that starts it, and why)"); next }
+		reason = substr(why, k + 2)
+		if (reason ~ /^ *$/) { malformed("no reason after its parent tests"); next }
+		n = split(substr(why, 1, k - 1), parents, / and /)
+		for (p = 1; p <= n; p++) {
+			if (parents[p] !~ /^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$/) { malformed("\"" parents[p] "\" is no full libtest test name"); next }
+		}
+		for (p = 1; p <= n; p++) print target "\t" child "\t" parents[p]
+	}
+	END { exit bad }' "$sami/rust-test-child-entries.txt" >"$tmp/child-parents.tsv" ||
+	stop "$sami/rust-test-child-entries.txt has a line without its parent tests or its reason (above)"
 entries rust-test-macos.txt 2 macos.tsv
 if [ -n "$only" ]; then
 	list_entries "$only" 2 >"$tmp/only.tsv" || stop "$only has a malformed line (above)"
@@ -1436,6 +1470,23 @@ for list in child-entries macos; do
 		fi
 	done < <(LC_ALL=C comm -13 "$tmp/ignored.tsv" "$tmp/$list.tsv")
 done
+# Each parent a child entry names is a test of the child's binary: a parent
+# renamed or deleted fails here, before the child silently runs nowhere. A
+# binary that did not build, or whose listing could not be read, is not
+# looked in: UNKNOWN, in a notice (the build or listing error fails the job).
+while IFS=$'\t' read -r binary child parent; do
+	if did_not_build "$binary"; then
+		echo "::notice title=Rust test child entry::UNKNOWN: $binary did not build, so whether $parent, which starts $child, is a test of it is not known (the build failure fails the job)"
+	elif ! in_tree "$binary"; then
+		error "Rust test child entry" "$binary $child is in $sami/rust-test-child-entries.txt, but the tree under test has no target $binary: that line is for another tree"
+	elif [ -z "${listing_of[$binary]:-}" ]; then
+		echo "::notice title=Rust test child entry::UNKNOWN: $binary's tests could not be listed, so whether $parent, which starts $child, is a test of it is not known (the listing error fails the job)"
+	elif grep -qxF -- "$parent" "${listing_of[$binary]}"; then
+		echo "Child entry's parent is a test of its binary: $binary $parent starts $child"
+	else
+		error "Rust test child entry" "$parent, which $sami/rust-test-child-entries.txt names as the test that starts $binary $child, is no test of $binary (renamed or deleted), so nothing would show that $child runs nowhere: name the test that starts it now"
+	fi
+done <"$tmp/child-parents.tsv"
 echo "Test binaries listed: ${#listing_of[@]}; #[ignore]d tests no invocation ran: $(count "$tmp/ignored.tsv")"
 # The macOS job's inventory reads each binary's listing: index.tsv names the
 # listing file of each (a native_test's binary is its src's).
