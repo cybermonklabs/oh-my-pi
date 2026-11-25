@@ -3353,6 +3353,7 @@ pub fn start_zsh_procsub(
 	// terminal (zsh `ESUB_ASYNC`).
 	super::jobctl::set_leader(k, vpid, None);
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
+	note_procsub(k, &child);
 	k.spawned.push(Box::new(child));
 	vp.fds.set(fd, Some(mine));
 	vp.procsubs.push((vp.frames.len() as u32, fd));
@@ -3510,12 +3511,30 @@ pub fn start_procsub(
 	// terminal.
 	super::jobctl::set_leader(k, vpid, None);
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
+	note_procsub(k, &child);
 	k.spawned.push(Box::new(child));
 	vp.fds.set(fd, Some(mine));
 	vp.procsubs.push((vp.frames.len() as u32, fd));
 	// bash: a process substitution sets `$!` (`wait $!` waits for it).
 	vp.last_bg = LastBg::new(vpid);
 	Some(BString::from(format!("/dev/fd/{fd}")))
+}
+
+/// Process substitution `child` starts: a process shell's exit waits for it
+/// ([`super::Shell::substitutions_left`]), and a command substitution whose
+/// output it inherited reads until it ends ([`settle_sub`]), as bash's reads
+/// its pipe until the substitution too has closed it.
+fn note_procsub(k: &mut Kernel, child: &Vproc) {
+	k.procsubs.push(child.vpid);
+	for fd in child.fds.slots().iter().flatten() {
+		let held = fd.with_mem(|m| match m {
+			mem::MemFile::Capture(capture) => Some(capture.clone()),
+			_ => None,
+		});
+		if let Some(Some(capture)) = held {
+			k.procsub_captures.push((child.vpid, capture));
+		}
+	}
 }
 
 /// The op of frame `fi` is over: drop its scratch, close its process
@@ -3583,6 +3602,17 @@ pub fn settle_sub(
 	}
 	let (out, status, value) = match pending {
 		PendingSub::Fork { vpid, capture } => {
+			// The output is read until end of file, as bash reads its pipe: a
+			// process substitution the body started (`$(cmd > >(filter))`)
+			// still writes there after the body ends.
+			let wait = match k.proc_state(cx.store, vpid).and_then(|s| s.exited()) {
+				Some(_) => k.capture_holder(&capture),
+				None => Some(vpid),
+			};
+			if let Some(wait) = wait {
+				sc.sub = Some(PendingSub::Fork { vpid, capture });
+				return Some(Flow::Block(WaitKey::Proc(wait)));
+			}
 			let Some(status) = k.proc_collect(cx.store, vpid) else {
 				sc.sub = Some(PendingSub::Fork { vpid, capture });
 				return Some(Flow::Block(WaitKey::Proc(vpid)));

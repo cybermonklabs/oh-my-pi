@@ -40,7 +40,7 @@ use pi_shell::{
 		Budget, Cx, Engine, EngineConfig, EventMask, ExtError, ExternalizeReport, Lost, MemStore,
 		Platform, RestoreError, RestoreOpts, RunId, Shell, SigSet, Signal, Step, StoreError, Vpid,
 	},
-	process::{NativeHost, no_callouts, wait_runnable},
+	process::{NativeHost, finish_substitutions, no_callouts, wait_runnable},
 	sys::Parker,
 	testkit::Rng,
 };
@@ -648,6 +648,8 @@ impl Injector {
 				Step::Idle => break 0,
 			}
 		};
+		// As `process::drive`: the substitutions the exit leaves running end.
+		finish_substitutions(&mut host, &mut store, &mut shell, root, &mut self.parker);
 		host.flush()?;
 		Ok(status)
 	}

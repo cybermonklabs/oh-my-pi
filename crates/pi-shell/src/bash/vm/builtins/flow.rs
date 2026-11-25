@@ -677,6 +677,12 @@ fn is_child(ctx: &mut Ctx<'_, '_>, pid: Vpid) -> bool {
 	if ctx.vp.jobs.by_vpid(pid).is_some_and(|j| !j.inherited) {
 		return true;
 	}
+	// A child started in this slice has no record until the scheduler
+	// adopts it: it runs (`echo hi > >(cmd); wait $!`). bash finds such a
+	// child in its job table, which `wait` searches before the bgp list.
+	if ctx.k.spawned_by(ctx.vp.vpid, pid) {
+		return ctx.vp.last_bg.is(pid);
+	}
 	if ctx.vp.jobs.bgp_search(pid).is_some() {
 		return true;
 	}
@@ -722,11 +728,13 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	for (number, pid) in stopped {
 		ctx.err(Diag::Warning { msg: format!("warning: job {number}[{pid}] stopped").into() });
 	}
-	// bash also waits for the process substitution `$!` names.
+	// bash also waits for the process substitution `$!` names (one started
+	// in this slice has no record yet: `echo hi > >(cmd); wait`).
 	if let Some(last) = ctx.vp.last_bg.vpid()
 		&& ctx.vp.jobs.by_vpid(last).is_none()
-		&& ctx.k.proc_state(ctx.cx.store, last) == Some(crate::bash::vm::ProcState::Running)
-		&& ctx.k.started(ctx.cx.store, ctx.vp.vpid, last)
+		&& (ctx.k.spawned_by(ctx.vp.vpid, last)
+			|| (ctx.k.proc_state(ctx.cx.store, last) == Some(crate::bash::vm::ProcState::Running)
+				&& ctx.k.started(ctx.cx.store, ctx.vp.vpid, last)))
 	{
 		list.push(last);
 	}

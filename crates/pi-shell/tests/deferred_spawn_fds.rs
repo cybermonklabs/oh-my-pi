@@ -98,10 +98,24 @@ fn run(shell: &str, script: &str) -> Result<String, String> {
 	let got = line.recv_timeout(HANG);
 	// Let the producer and A go in any case: open each FIFO's other end if
 	// something waits on it. A blocking open would wait forever where nothing
-	// does any more (obash's process substitution ends with the shell).
-	poke(&dir.path().join("gate"));
-	poke(&dir.path().join("fifo"));
-	let status = child.wait().unwrap();
+	// does any more. obash's process stays for a process substitution still
+	// running at its exit (as bash's substitution outlives bash), and the
+	// producer may reach its open of `gate` only after a first poke: poke
+	// until the shell ends, at most `HANG`.
+	let deadline = std::time::Instant::now() + HANG;
+	let status = loop {
+		poke(&dir.path().join("gate"));
+		poke(&dir.path().join("fifo"));
+		if let Some(status) = child.try_wait().unwrap() {
+			break status;
+		}
+		if std::time::Instant::now() >= deadline {
+			let _ = child.kill();
+			let _ = child.wait();
+			return Err(format!("{got:?}: the shell did not end within {HANG:?} of the pokes"));
+		}
+		std::thread::sleep(Duration::from_millis(20));
+	};
 	match got {
 		Ok(Some(Ok(line))) if status.success() => Ok(line),
 		other => Err(format!("{other:?} {status}")),
