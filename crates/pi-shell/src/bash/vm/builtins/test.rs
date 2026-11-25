@@ -164,8 +164,12 @@ fn unary(ctx: &mut Ctx<'_, '_>, op: u8, arg: &[u8], cond: bool, written: Option<
 					return Ok(v.is_some_and(|v| !v.values().is_empty()));
 				}
 				// bash evaluates an index even when the variable is unset
-				// (`array_value_internal`).
-				return match super::vars::subscript_value(ctx.k, ctx.cx, ctx.vp, i) {
+				// (`array_value_internal`), once per command: a probe runs
+				// `test` again (`test -v 'c[w++]' -a -e /`).
+				ctx.arith_argument();
+				let n = super::vars::subscript_value(ctx.k, ctx.cx, ctx.vp, i);
+				ctx.arith_end();
+				return match n {
 					Ok(n) => Ok(v.is_some_and(|v| v.index(n).is_some())),
 					Err(d @ Diag::ArithSubscript { .. }) => Err(Fail::Discard(d)),
 					Err(_) => Ok(false),

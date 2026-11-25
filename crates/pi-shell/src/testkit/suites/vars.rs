@@ -20,6 +20,77 @@ fn run(src: &str) -> (String, String) {
 	)
 }
 
+/// How long a script of the run-again tests may take before the test fails:
+/// each takes milliseconds, so this only ends one that would never end.
+const RERUN_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `f` on a thread, ending the test binary with a failure that names the test
+/// when `f` has not returned within [`RERUN_BOUND`]. A builtin that runs
+/// again after a `$(…)` replays its log; a replay that misreads it parks
+/// again without end, and the test should say so by name rather than hang.
+///
+/// On a timeout this writes the test's name and the bound to stderr, past
+/// libtest's output capture, and exits with 101, libtest's failure code. It
+/// does not panic: a panic fails the test but cannot stop the worker
+/// thread, which keeps allocating until the binary aborts at its memory
+/// limit with no test named. Ending the process also ends the other tests
+/// of the binary, which then read as not run; the abort it replaces lost
+/// them too, and unnamed.
+fn bounded(src: &str, f: fn(&str) -> (String, String)) -> (String, String) {
+	let src = src.to_owned();
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let _ = tx.send(f(&src));
+	});
+	rx.recv_timeout(RERUN_BOUND).unwrap_or_else(|_| {
+		use std::io::Write;
+		let test = std::thread::current()
+			.name()
+			.unwrap_or("<unnamed>")
+			.to_owned();
+		let _ = writeln!(
+			std::io::stderr(),
+			"test {test} ... FAILED: did not end within {RERUN_BOUND:?}, a run again without end; \
+			 ending the test binary"
+		);
+		std::process::exit(101)
+	})
+}
+
+/// [`run`], bounded ([`bounded`]).
+fn run_bounded(src: &str) -> (String, String) {
+	bounded(src, run)
+}
+
+/// `src` with events off (a builtin first runs on the fast path): its
+/// stdout and stderr, bounded ([`bounded`]).
+fn run_events_off_bounded(src: &str) -> (String, String) {
+	bounded(src, |src| {
+		let mut rig = Rig::new(FakeHost::new(), skeleton_init(&[]));
+		rig.shell().set_event_mask(EventMask::NONE);
+		rig.run(Script::command(src.as_bytes().to_vec()), Fault::None);
+		(
+			String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned(),
+			String::from_utf8_lossy(&rig.host.stderr.bytes()).into_owned(),
+		)
+	})
+}
+
+/// The run-again bound fails a run that never ends, not one that is merely
+/// slow: a run made two seconds slower than it needs still passes it, so
+/// tightening [`RERUN_BOUND`] toward the scripts' real time would be caught
+/// here. The script has no `$(…)` and so never runs again: under a plant
+/// whose replay never ends it adds no runaway of its own, which would push
+/// the binary over its memory limit before the bound named the hung test.
+#[test]
+fn a_harmless_delay_passes_the_rerun_bound() {
+	let (out, err) = bounded("x=1; declare x+=1; echo \"$x\"", |src| {
+		std::thread::sleep(std::time::Duration::from_secs(2));
+		run(src)
+	});
+	assert_eq!((out.as_str(), err.as_str()), ("11\n", ""));
+}
+
 #[test]
 fn background_children_keep_each_loop_value() {
 	let (out, err) = run("for h in alpha beta; do ( echo \"bg:$h\" ) & done; wait");
@@ -465,7 +536,8 @@ fn random_readonly_refusals_look_it_up_first() {
 			"line 1: declare: r: readonly variable\n",
 		),
 	] {
-		let (out, err) = run(src);
+		// Bounded: the last form parks and runs again ([`bounded`]).
+		let (out, err) = run_bounded(src);
 		assert_eq!(out, want, "{src}");
 		assert!(err.ends_with(diag), "{src}: {err}");
 	}
@@ -511,13 +583,140 @@ fn random_lookups_happen_once_when_a_command_runs_again() {
 		("declare -n r; r=${r:=RANDOM}$(echo 1) true", "[] 18498\n"),
 	] {
 		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
-		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
-		let mut rig = Rig::new(FakeHost::new(), skeleton_init(&[]));
-		rig.shell().set_event_mask(EventMask::NONE);
-		rig.run(Script::command(src.into_bytes()), Fault::None);
-		let out = String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned();
-		let err = String::from_utf8_lossy(&rig.host.stderr.bytes()).into_owned();
+		assert_eq!(run_bounded(&src), (want.to_owned(), String::new()), "{form}");
+		let (out, err) = run_events_off_bounded(&src);
 		assert_eq!((out.as_str(), err.as_str()), (want, ""), "{form} (events off)");
+	}
+}
+
+/// A `$(…)` in a later argument's compound string (`a='($(echo 2))'` on an
+/// array) makes `declare`, `local` and `export` run again from their first
+/// argument; each earlier argument still applies once, as in bash: `x+=1`
+/// adds 1, `-r` is not refused as readonly, an integer, exported, element
+/// or reference target adds once. Each form runs with events on and off
+/// (with them off the builtin first runs on the fast path). Goldens from
+/// bash 5.3.20 (5.2.21 agrees).
+#[test]
+fn declaration_applies_each_argument_once_when_it_runs_again() {
+	let a = "a=(0); b=(0); ";
+	for (form, want) in [
+		("x=1; declare x+=1 a='($(echo 2))'; echo \"$x ${a[0]}\"", "11 2\n"),
+		(
+			"x=1; declare x+=1 a='($(echo 2))' x+=1 b='($(echo 3))'; echo \"$x ${a[0]} ${b[0]}\"",
+			"111 2 3\n",
+		),
+		("declare -r x=1 a='($(echo 2))'; echo \"st=$? $x ${a[0]}\"", "st=0 1 2\n"),
+		("declare -i n=1; declare n+=1 a='($(echo 2))'; echo \"$n ${a[0]}\"", "2 2\n"),
+		("X=a; declare -x X+=b a='($(echo 2))'; echo \"$X ${a[0]}\"", "ab 2\n"),
+		("y=1; declare -n r=y; declare r+=1 a='($(echo 2))'; echo \"$y ${a[0]}\"", "11 2\n"),
+		("declare -A h=([k]=a); declare h[k]+=b a='($(echo 2))'; echo \"${h[k]} ${a[0]}\"", "ab 2\n"),
+		("RANDOM=5; declare RANDOM+=1 a='($(echo 2))'; echo $RANDOM", "889\n"),
+		("f() { declare -g g+=1 a='($(echo 2))'; }; f; f; echo \"$g\"", "11\n"),
+		("f() { local x=1 a=(0); local x+=1 a='($(echo 2))'; echo \"$x ${a[0]}\"; }; f", "11 2\n"),
+		(
+			"f() { local a=(0); local -r x=1 a='($(echo 2))'; echo \"st=$? $x ${a[0]}\"; }; f",
+			"st=0 1 2\n",
+		),
+		(
+			"x=g; f() { local a=(0); local x+=1 a='($(echo 2))'; echo \"[$x] ${a[0]}\"; }; f; echo \
+			 \"$x\"",
+			"[1] 2\ng\n",
+		),
+		("X=a; export X+=b; declare -x X+=c a='($(echo 2))'; echo \"$X\"", "abc\n"),
+		("x=1; declare x+=1 a=(2); echo \"$x ${a[0]}\"", "11 2\n"),
+		// A temporary of the name is the binding the argument changes: it
+		// is put back too (`-r` then refuses nothing).
+		("x=1; x=5 declare -x x+=1 a='($(echo 2))'; echo \"[$x]\"", "[51]\n"),
+		("x=1; x=5 declare -r x+=1 a='($(echo 2))'; echo \"[$x]\"", "[51]\n"),
+		("x=1; x=5 declare -x x+=1 x+=2 a='($(echo 2))'; echo \"[$x]\"", "[512]\n"),
+		// `-g` acts on the global past the temporary and copies nothing out
+		// (older than this rollback: the same without a park).
+		("x=1; x=5 declare -gx x+=1; echo \"[$x]\"", "[11]\n"),
+		("x=1; f() { x=5 declare -gx x+=1; echo \"in [$x]\"; }; f; echo \"[$x]\"", "in [11]\n[11]\n"),
+		("x=1; x=5 declare -gx x+=1 a='($(echo 2))'; echo \"[$x]\"", "[11]\n"),
+		// Two arguments that park: every argument is still redone from the
+		// binding and the target the first run kept.
+		("x=1; x=5 declare -x x+=1 b='($(echo 3))' a='($(echo 2))'; echo \"[$x]\"", "[51]\n"),
+		("y=1; declare -n r=y; declare r+=1 b='($(echo 3))' a='($(echo 2))'; echo \"$y\"", "11\n"),
+		// An argument's arithmetic runs once: its own assignments and
+		// `RANDOM` draws, an integer value's, a subscript's, a compound
+		// value's keys.
+		("w=0; declare -i y=w++ a='($(echo 2))'; echo $y $w", "0 1\n"),
+		("declare -i y='z+=1' a='($(echo 2))'; echo \"$y $z\"", "1 1\n"),
+		("i=0; declare 'c[i++]=x' a='($(echo 2))'; echo \"$i ${!c[@]}\"", "1 0\n"),
+		("w=0; declare -ai a2='([w++]=x)' a='($(echo 2))'; echo $w ${!a2[@]}", "1 0\n"),
+		("RANDOM=5; declare -i y=RANDOM a='($(echo 2))'; echo $y $RANDOM", "18498 29338\n"),
+		("w=0; declare -i y='(w+=2)*3' a='($(echo 2))'; echo \"$y $w\"", "6 2\n"),
+		// An assignment the arithmetic itself makes to `RANDOM` is part of
+		// its one evaluation, not a result of its own.
+		("RANDOM=5; declare -i y='(RANDOM=3)+10' a='($(echo 2))'; echo \"$y $RANDOM\"", "13 17653\n"),
+		// `RANDOM+=` adds to the value its lookups (through a reference)
+		// left, kept through the binding put back.
+		("RANDOM=5; declare -n r=RANDOM; declare r+=1 a='($(echo 2))'; echo $RANDOM", "889\n"),
+		("RANDOM=5; declare -n r=RANDOM; declare +n r+=1 a='($(echo 2))'; echo $RANDOM", "889\n"),
+		(
+			"RANDOM=5; declare -n r=RANDOM; declare +i r+=1 a='($(echo 2))'; echo $RANDOM; declare \
+			 -p RANDOM",
+			"31651\ndeclare -i RANDOM=\"20345\"\n",
+		),
+		// `unset` and `test -v` evaluate an index once too.
+		(
+			"w=0; c=(1 2 3); b=(1 2); unset 'c[w++]' 'b[$(echo 1)]'; echo $w ${#c[@]} ${#b[@]}",
+			"1 2 1\n",
+		),
+		("w=0; c=5; b=(1 2); unset 'c[w++]' 'b[$(echo 1)]'; echo $w ${c-u} ${#b[@]}", "1 u 1\n"),
+		("w=0; c=(1 2); test -v 'c[w++]' -a -e /; echo $w", "1\n"),
+	] {
+		let src = format!("{a}{form}");
+		assert_eq!(run_bounded(&src), (want.to_owned(), String::new()), "{form}");
+		let (out, err) = run_events_off_bounded(&src);
+		assert_eq!((out.as_str(), err.as_str()), (want, ""), "{form} (events off)");
+	}
+	// An argument that fails is reported once.
+	let (out, err) = run_bounded("a=(0); declare 1x=2 a='($(echo 2))'; echo \"st=$? ${a[0]}\"");
+	assert_eq!(out, "st=1 2\n");
+	assert_eq!(err.matches("not a valid identifier").count(), 1, "{err}");
+	// A refused argument leaves nothing a run again could find: a function's
+	// local over a readonly global is refused again, and a name it could not
+	// bind is not left declared (`local -p`). Goldens from bash 5.3.20 (5.2.21
+	// agrees).
+	for (form, want, msg) in [
+		(
+			"x=1; readonly x; f() { local a=(0); local x=2 a='($(echo 2))'; echo \"st=$? [$x] \
+			 ${a[0]}\"; }; f; echo \"[$x]\"",
+			"st=1 [1] 2\n[1]\n",
+			"local: x: readonly variable\n",
+		),
+		(
+			"x=1; readonly x; f() { local a=(0); declare x=2 a='($(echo 2))'; echo \"st=$? [$x] \
+			 ${a[0]}\"; }; f; echo \"[$x]\"",
+			"st=1 [1] 2\n[1]\n",
+			"declare: x: readonly variable\n",
+		),
+		(
+			"x=1; readonly x; f() { local a=(0); local x a='($(echo 2))'; echo \"st=$? [$x] \
+			 ${a[0]}\"; declare -p x; }; f; echo \"[$x]\"",
+			"st=1 [1] 2\ndeclare -r x=\"1\"\n[1]\n",
+			"local: x: readonly variable\n",
+		),
+		(
+			"x=1; readonly x; f() { local a=(0); local -i x=2 a='($(echo 2))'; echo \"st=$? [$x]\"; \
+			 }; f",
+			"st=1 [1]\n",
+			"local: x: readonly variable\n",
+		),
+		(
+			"f() { local a=(0); local 1x=2 a='($(echo 2))'; echo \"st=$?\"; local -p; }; f",
+			"st=1\ndeclare -a a=([0]=\"2\")\n",
+			"local: `1x=2': not a valid identifier\n",
+		),
+	] {
+		let (out, err) = run_bounded(form);
+		assert_eq!(out, want, "{form}");
+		assert!(err.ends_with(msg) && err.lines().count() == 1, "{form}: {err}");
+		let (out, err) = run_events_off_bounded(form);
+		assert_eq!(out, want, "{form} (events off)");
+		assert!(err.ends_with(msg) && err.lines().count() == 1, "{form} (events off): {err}");
 	}
 }
 

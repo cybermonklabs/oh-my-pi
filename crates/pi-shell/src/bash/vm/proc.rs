@@ -5,7 +5,7 @@ use std::{collections::VecDeque, sync::Arc};
 use bstr::BString;
 use serde::{Deserialize, Serialize};
 
-use super::state::{Random, Scope};
+use super::state::{Level, Random, Scope, Var};
 pub use crate::bash::store::{Job, JobState};
 use crate::bash::{
 	Image,
@@ -1196,6 +1196,31 @@ pub enum Atom {
 	/// assigns again as it replays, so it sees the first pass's state at
 	/// every point.
 	Wrote { name: BString, old: Box<Self>, new: Option<BString> },
+	/// The binding of `name` at `level` an argument of a declaration
+	/// builtin (`declare`, `typeset`, `local`, `export`, `readonly`) was
+	/// about to change, as it was on the builtin's first run (`old`: its
+	/// value, `None` when unset; `bound`: whether the place an assignment at
+	/// `level` lands had the name at all). A run again after a later
+	/// argument's `$(…)` parked it puts the binding back before the
+	/// argument is redone, so each argument applies once (`declare x+=1
+	/// a='($(echo 2))'`); a binding the first run did not have is removed,
+	/// not left declared but unset, so a function's `local x` refused over
+	/// a readonly global `x` is refused again.
+	Bound { name: BString, level: Level, old: Option<Var>, bound: bool },
+	/// No binding to put back at this point of a declaration builtin's
+	/// replay log: on its first run the argument had none there (its name
+	/// is no name reference, no temporary binds it). A run again keeps
+	/// that, because the argument's own effect changes what a run again
+	/// would find (`local r` shadows the global reference `r` whose target
+	/// the first run kept), and a run that logged nothing here would read
+	/// the next point's atom
+	/// ([`Ctx::rollback_point_once`](super::builtins::Ctx::rollback_point_once)).
+	Unbound,
+	/// The results, in order, of the arithmetic an argument of a builtin
+	/// evaluated on its first run (`declare -i y=w++`, `unset 'c[w++]'`): a
+	/// run again takes them and evaluates nothing, so the arithmetic's own
+	/// assignments and `RANDOM` draws happen once.
+	Arith(Vec<i64>),
 }
 
 /// Per-op scratch: expansion replay logs, staged progress and transient

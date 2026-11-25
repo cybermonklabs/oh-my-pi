@@ -1080,7 +1080,7 @@ fn level_at(
 }
 
 /// Where an assignment lands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Level {
 	/// The innermost scope that declares the name, else global.
 	Dynamic,
@@ -2766,6 +2766,47 @@ pub fn scope_unbind(
 			}
 		},
 		In::Store(depth) => root.write(store, Change::Del(local_key(depth, name))),
+	}
+}
+
+/// Whether the scope an assignment to `name` at `level` lands in binds it,
+/// set or declared but unset; `None`: such an assignment lands in the
+/// global state, which has no declared-but-unset binding.
+///
+/// # Errors
+/// [`StoreError`] when the store cannot be read.
+pub fn binds_at(
+	root: &Root,
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	name: &[u8],
+	level: Level,
+) -> Result<Option<bool>, StoreError> {
+	Ok(match level_at(root, store, vp, name, level)? {
+		Some(In::Vec(i)) => Some(vp.scopes.get(i).is_some_and(|s| s.vars.contains_key(name))),
+		Some(In::Store(depth)) => Some(store.get(local_key(depth, name))?.is_some()),
+		None => None,
+	})
+}
+
+/// Remove `name`'s binding where an assignment at `level` lands: from the
+/// scope, so it is no longer declared there, or unset in the global state.
+pub fn unbind_at(
+	root: &mut Root,
+	store: &mut dyn StateStore,
+	vp: &mut Vproc,
+	name: &[u8],
+	level: Level,
+) {
+	match level_at(root, store, vp, name, level) {
+		Ok(Some(In::Vec(i))) => {
+			if let Some(s) = vp.scopes.get_mut(i) {
+				s.vars.remove(name);
+			}
+		},
+		Ok(Some(In::Store(depth))) => root.write(store, Change::Del(local_key(depth, name))),
+		Ok(None) => put_outer(root, store, vp, name, None),
+		Err(err) => root.fail(err),
 	}
 }
 

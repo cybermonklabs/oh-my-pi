@@ -2075,8 +2075,21 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 							})
 						},
 						Level::Global if index.is_some() || on.contains(Attrs::NAMEREF) => None,
-						Level::Global if off.contains(Attrs::NAMEREF) => {
-							value.is_none().then_some(Site::Declare)
+						Level::Global if off.contains(Attrs::NAMEREF) => match value {
+							None => Some(Site::Declare),
+							// `+n r=v` assigns the target through a global
+							// reference first ([`set_value`]'s lookups), made
+							// here, before the rollback point below keeps
+							// their value for a run again.
+							Some(_) if index.is_none() => state::assigns_global(
+								&ctx.k.root,
+								ctx.cx.store,
+								ctx.vp,
+								name,
+								Level::Dynamic,
+							)?
+							.then_some(Site::NamerefAssign),
+							Some(_) => None,
 						},
 						Level::Global => Some(plain_site),
 					};
@@ -2099,6 +2112,38 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				Ok(())
 			})?;
 		}
+		// A later argument's `$(…)` runs `declare` again from its first
+		// argument: this one is redone from the binding it first saw (and
+		// a name reference's target from its own), so it applies once.
+		ctx.rollback_point(name, level)?;
+		// Which target a name reference names is decided on the first run,
+		// as the lookups above are: the declaration changes what a run
+		// again would find (`local r` shadows a global reference `r`, `+n`
+		// ends one), and a run that kept nothing here would read the next
+		// point's atom.
+		ctx.rollback_point_once(|ctx| {
+			Ok(match state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)? {
+				state::Deref::To { name: target, .. } => Some((target, Level::Dynamic)),
+				state::Deref::Plain | state::Deref::Circular => None,
+			})
+		})?;
+		// Outside a function the binding a temporary of the name gives
+		// (`x=5 declare -x x+=1`) is the one the argument changes; whether
+		// there is one is decided on the first run too (`declare -x` copies
+		// the temporary out).
+		ctx.rollback_point_once(|ctx| {
+			if level != Level::Global || o.has(b'g') {
+				return Ok(None);
+			}
+			let Some(top) = temp_scope(ctx)? else {
+				return Ok(None);
+			};
+			Ok(state::scope_binds(ctx.cx.store, ctx.vp, top, name)?
+				.then(|| (BString::from(name), Level::Dynamic)))
+		})?;
+		// So is its arithmetic (an integer value, a subscript): a run again
+		// takes the first run's results.
+		ctx.arith_argument();
 		if on.contains(Attrs::NAMEREF)
 			&& (index.is_some() || (value.is_none() && arg.contains(&b'[')))
 		{
@@ -2323,8 +2368,8 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				continue;
 			}
 			if let Some(value) = value {
-				// A special target through a global reference: the
-				// assignment's lookups ([`set_value`]'s), on the first run.
+				// A special target through a global reference (its lookups
+				// are made with the argument's, above).
 				let mut special = None;
 				if let state::Deref::To { name: t, index: None } =
 					state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)?
@@ -2346,9 +2391,6 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 				let value = AssignValue::Scalar(BString::from(value));
 				let res = match special {
 					Some(s) => {
-						if first {
-							dynvars::look(ctx.k, ctx.cx, ctx.vp, s.name(), Site::NamerefAssign)?;
-						}
 						let lhs = Lhs { name: s.name(), index: None, append };
 						set_value(ctx.k, ctx.cx, ctx.vp, lhs, value, Level::Dynamic)
 					},
@@ -3016,12 +3058,14 @@ fn new_local_start(ctx: &mut Ctx<'_, '_>, name: &[u8], inherit: bool) -> Result<
 
 /// bash copies a variable out of the temporary environment when
 /// `export`/`readonly` (or `declare` with attributes) acts on it there:
-/// `x=5 export x` leaves `x=5` exported after the command.
+/// `x=5 export x` leaves `x=5` exported after the command. `declare -g`
+/// acts on the global past the temporary (`level` stays global), so there
+/// is nothing to copy out: `x=1; x=5 declare -gx x+=1` leaves `x=11`.
 fn propagate_temp(ctx: &mut Ctx<'_, '_>, name: &[u8], kind: DeclareKind, on: Attrs, level: Level) {
 	let applies = match kind {
 		DeclareKind::Export => on.contains(Attrs::EXPORT),
 		DeclareKind::Readonly => true,
-		DeclareKind::Declare => on != Attrs::NONE && level != Level::Local,
+		DeclareKind::Declare => on != Attrs::NONE && level == Level::Dynamic,
 		DeclareKind::Local => false,
 	};
 	if !applies {
@@ -3393,6 +3437,9 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		if dynvars::named(ctx.k, ctx.cx.store, ctx.vp, name)?.is_some() {
 			ctx.once(|ctx| dynvars::look_through(ctx.k, ctx.cx, ctx.vp, name, Site::Unset))?;
 		}
+		// An index's arithmetic (`unset 'c[w++]'`) once per command: a later
+		// argument's `$(…)` runs `unset` again.
+		ctx.arith_argument();
 		let var = state::lookup_declared(&ctx.k.root, ctx.cx.store, ctx.vp, name)?.map(|v| {
 			(
 				v.attrs,
