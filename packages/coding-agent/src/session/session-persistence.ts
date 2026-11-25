@@ -839,13 +839,16 @@ interface ExternalizeWalk {
  * `JSON.parse` reads; past {@link DEEP_JSON_LEVELS} levels it sets `shape.deep`.
  */
 function externalizeImagesOnly(value: unknown, blobStore: BlobStore, shape: PersistedShape): unknown {
-	const image = externalizeImageNode(value, blobStore, undefined);
-	if (image !== undefined) return image;
-	if (!isContainer(value)) return value;
+	if (!isContainer(value)) return externalizedImagesLeaf(value, undefined, blobStore);
 	const walk: ExternalizeWalk = { blobStore, path: new ContainerPath(), deepest: 0 };
 	const externalized = runNested(externalizedImagesNode(value, undefined, walk, 0));
 	if (walk.deepest > DEEP_JSON_LEVELS) shape.deep = true;
 	return externalized;
+}
+
+/** {@link externalizeImagesOnly} of `value`, no object, under `key` of its holder. */
+function externalizedImagesLeaf(value: unknown, key: string | undefined, blobStore: BlobStore): unknown {
+	return externalizeImageNode(value, blobStore, key) ?? value;
 }
 
 /** {@link externalizeImagesOnly} of `value`, an object under `key` of its holder at `depth` levels. */
@@ -855,6 +858,9 @@ function* externalizedImagesNode(
 	walk: ExternalizeWalk,
 	depth: number,
 ): NestedWalk {
+	// An image is replaced before its level counts toward `walk.deepest`: the walk does not go into it.
+	const image = externalizeImageNode(value, walk.blobStore, key);
+	if (image !== undefined) return image;
 	if (depth > walk.deepest) walk.deepest = depth;
 	if (isAtomicPersistenceNode(value, key)) return value;
 	walk.path.enter(value);
@@ -862,13 +868,9 @@ function* externalizedImagesNode(
 		let changed: unknown[] | undefined;
 		for (let index = 0; index < value.length; index++) {
 			const item: unknown = value[index];
-			const image = externalizeImageNode(item, walk.blobStore, key);
-			const next =
-				image !== undefined
-					? image
-					: isContainer(item)
-						? yield externalizedImagesNode(item, key, walk, depth + 1)
-						: item;
+			const next = isContainer(item)
+				? yield externalizedImagesNode(item, key, walk, depth + 1)
+				: externalizedImagesLeaf(item, key, walk.blobStore);
 			if (next === item) continue;
 			changed ??= value.slice();
 			changed[index] = next;
@@ -880,13 +882,9 @@ function* externalizedImagesNode(
 	for (const childKey in value) {
 		if (!Object.hasOwn(value, childKey)) continue;
 		const child: unknown = Reflect.get(value, childKey);
-		const image = externalizeImageNode(child, walk.blobStore, childKey);
-		const next =
-			image !== undefined
-				? image
-				: isContainer(child)
-					? yield externalizedImagesNode(child, childKey, walk, depth + 1)
-					: child;
+		const next = isContainer(child)
+			? yield externalizedImagesNode(child, childKey, walk, depth + 1)
+			: externalizedImagesLeaf(child, childKey, walk.blobStore);
 		if (next === child) continue;
 		changed ??= { ...value };
 		changed[childKey] = next;

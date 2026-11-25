@@ -162,8 +162,14 @@ function shrinkString(value: string, cap: number): string {
  * result, as deep as a transcript line holds.
  */
 function shrinkValue(value: unknown, pass: ShrinkPass): unknown {
-	if (typeof value === "string") return shrinkString(value, pass.stringCap);
-	return Array.isArray(value) || isRecord(value) ? runNested(shrunkNode(value, pass, new ContainerPath())) : value;
+	return Array.isArray(value) || isRecord(value)
+		? runNested(shrunkNode(value, pass, new ContainerPath()))
+		: shrunkLeaf(value, pass);
+}
+
+/** {@link shrinkValue} of `value`, no array or record: a string past the pass's cap shortened, anything else as it is. */
+function shrunkLeaf(value: unknown, pass: ShrinkPass): unknown {
+	return typeof value === "string" ? shrinkString(value, pass.stringCap) : value;
 }
 
 /** {@link shrinkValue} of `value`, an array or record `path` is inside of; each child array or record is a nested step. */
@@ -176,11 +182,7 @@ function* shrunkNode(value: object, pass: ShrinkPass, path: ContainerPath): Nest
 		for (let index = 0; index < keep; index++) {
 			const item: unknown = value[index];
 			output[index] =
-				typeof item === "string"
-					? shrinkString(item, pass.stringCap)
-					: Array.isArray(item) || isRecord(item)
-						? yield shrunkNode(item, pass, path)
-						: item;
+				Array.isArray(item) || isRecord(item) ? yield shrunkNode(item, pass, path) : shrunkLeaf(item, pass);
 		}
 		if (keep < value.length) output[keep] = `…[${value.length - keep} items elided for RPC frame]`;
 		path.leave(value);
@@ -191,12 +193,7 @@ function* shrunkNode(value: object, pass: ShrinkPass, path: ContainerPath): Nest
 	const output: Record<string, unknown> = {};
 	for (let index = 0; index < keep; index++) {
 		const [key, item] = entries[index];
-		output[key] =
-			typeof item === "string"
-				? shrinkString(item, pass.stringCap)
-				: Array.isArray(item) || isRecord(item)
-					? yield shrunkNode(item, pass, path)
-					: item;
+		output[key] = Array.isArray(item) || isRecord(item) ? yield shrunkNode(item, pass, path) : shrunkLeaf(item, pass);
 	}
 	if (keep < entries.length) output.rpcFrameElidedKeys = entries.length - keep;
 	path.leave(value);
