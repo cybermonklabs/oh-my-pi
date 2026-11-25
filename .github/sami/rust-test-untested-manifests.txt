@@ -1,0 +1,9 @@
+# Cargo manifests outside the root workspace whose tests no job runs, for the
+# rust_test job in .github/workflows/sami-rust-test.yml. Bazel does not build
+# them, and, unlike .github/sami/rust-test-cargo-workspaces.txt, the job does
+# not run them under cargo either. .github/sami/rust-test-parity.sh fails while
+# a Cargo.toml outside the root workspace is in neither list, when a line here
+# names no tracked Cargo.toml outside the root workspace, and when a manifest
+# is in both lists.
+# One per line: <Cargo.toml path>  <what it is, and why no job runs its tests>.
+.github/platform-checks/fixture/Cargo.toml  the platform-checks workflow's control fixture (#254): a crate of known outcomes that controls.sh builds to prove the workflow's own classifier ("A crate of known outcomes for the tool's own controls (controls.sh) ... Not part of the repository's workspace", its Cargo.toml); not part of omp. Its tests fail and hang on purpose (fails_with_timeout_in_its_name, hangs), so the gate never builds or runs them
