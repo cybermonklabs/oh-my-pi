@@ -23,6 +23,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SQL } from "bun";
 import {
+	cliDatabase,
 	type LeaseDb,
 	openLeaseDb,
 	TcpProxy,
@@ -716,7 +717,13 @@ describe.skipIf(!pgUrl)("SqlSessionStorage start-up on PostgreSQL", () => {
 
 describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects", () => {
 	it("never runs a function or an operator another login planted in public", async () => {
-		await using db = await openLeaseDb("postgres", pgUrl ?? "");
+		// A database of its own: `public.*(numeric,integer)`, `public.=(oid,regclass)`, `public.convert_to` and
+		// `public.substr` must be the very names the store's statements would meet, so no suffix can set them
+		// apart. In a database shared with other test workers, their own unqualified SQL (the lease fixture's
+		// `extract(epoch from clock_timestamp()) * 1000`, an `oid = regclass` compare) runs these objects and
+		// writes this case's log, and two workers planting them at once collide on the names.
+		await using scratch = await cliDatabase("postgres", pgUrl ?? "");
+		await using db = await openLeaseDb("postgres", scratch.dsn);
 		const attacker = `shadow_attacker_${process.pid}`;
 		const log = `public.shadow_log_${process.pid}`;
 		await db.sql(`CREATE TABLE ${log} (what TEXT)`);
