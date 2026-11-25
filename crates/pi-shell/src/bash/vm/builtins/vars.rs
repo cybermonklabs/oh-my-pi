@@ -1261,6 +1261,23 @@ fn own_reference(ctx: &mut Ctx<'_, '_>, name: &[u8], target: &[u8]) -> Result<bo
 	Ok(false)
 }
 
+/// The running function's own reference `name`, when `+n NAME=VALUE`
+/// assigns it rather than its target: one with no target yet (`local -n
+/// q`), one that names an element (`local -n q='a[1]'`), or one whose chain
+/// ends through the function's own references ([`own_reference`]).
+fn own_ref(ctx: &mut Ctx<'_, '_>, name: &[u8]) -> Result<Option<Var>, Need> {
+	let Some(var) = func_local(ctx, name)?.filter(|v| v.attrs.contains(Attrs::NAMEREF)) else {
+		return Ok(None);
+	};
+	let names_element = var.as_scalar().is_some_and(|s| s.contains(&b'['));
+	Ok(match state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)? {
+		state::Deref::Plain => Some(var),
+		state::Deref::To { index: Some(_), .. } => names_element.then_some(var),
+		state::Deref::To { name: t, index: None } => own_reference(ctx, name, &t)?.then_some(var),
+		state::Deref::Circular => None,
+	})
+}
+
 /// The top scope when it is a temporary environment (a command's prefix
 /// assignments), not a function's.
 fn temp_scope(ctx: &mut Ctx<'_, '_>) -> Result<Option<usize>, StoreError> {
@@ -2216,32 +2233,67 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			// The other attributes given apply to the target too
 			// (`declare +n -i foo=7+4` makes the target 11).
 			let mut ref_on = on;
-			if let Some(value) = value {
-				// On a reference the running function owns, bash assigns
-				// the name itself as it assigns to any name reference: the
-				// value must be an identifier (`local -n q=RANDOM; local +n
-				// q=3` is refused and `q` stays a reference), and the name
-				// keeps the value as a plain variable. Through a global or
-				// a caller's reference the value goes to the target, below.
-				if level == Level::Local
-					&& let state::Deref::To { name: t, .. } =
-						state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)?
-					&& own_reference(ctx, name, &t)?
-				{
-					if !is_ident(value) {
+			// A reference the running function owns, or a global one with
+			// no target yet: bash assigns the value to the reference itself,
+			// as to any name reference, and then ends it. Through any other
+			// reference the value goes to the target, below.
+			let own = if level == Level::Local {
+				own_ref(ctx, name)?
+			} else if state::deref(&ctx.k.root, ctx.cx.store, ctx.vp, name)? == state::Deref::Plain {
+				raw.clone()
+			} else {
+				None
+			};
+			// A function's own reference to an element is left as it is, with
+			// a value or without: `f() { local -n q='a[1]'; local +n q=zz; }`
+			// keeps `q` and `a` (bash 5.3.20 and 5.2.21). A global one gives
+			// the value to the element and ends, below, as bash's does.
+			if own
+				.as_ref()
+				.is_some_and(|v| v.as_scalar().is_some_and(|s| s.contains(&b'[')))
+			{
+				continue;
+			}
+			if let Some(value) = value
+				&& let Some(own) = own
+			{
+				// The value is the reference's own, after `+=` (the target's
+				// name and the word) and the attributes given (`-i`
+				// evaluates it, `-u`/`-l`/`-c` change its case); it must
+				// name a variable or an element (`valid_nameref_value`).
+				// A refusal names the word as written, except where `-i`
+				// made a name a number (`zz=4; local +n -i q=zz`: status 1,
+				// no message), and keeps the reference, with the attributes
+				// given (`declare -in q="y"`).
+				let old = append.then(|| own.as_scalar().unwrap_or_default());
+				let new = match convert(ctx.k, ctx.cx, ctx.vp, on, value, old) {
+					Ok(v) => Some(v).filter(|v| valid_ref_target(v)),
+					Err(d) => {
+						ctx.err(d);
+						None
+					},
+				};
+				if let Some(new) = new {
+					let attrs = own.attrs.without(off).without(Attrs::INVISIBLE).with(on);
+					ctx.set_var(name, Some(Var::scalar(new, attrs)), level);
+				} else {
+					if !(on.contains(Attrs::INTEGER) && valid_ref_target(value)) {
 						ctx.err(Diag::InvalidIdent { name: BString::from(value) });
-						status = 1;
-						continue;
 					}
-					let attrs = raw
-						.as_ref()
-						.map_or(Attrs::NONE, |v| v.attrs)
-						.without(off)
-						.without(Attrs::INVISIBLE)
-						.with(on);
-					ctx.set_var(name, Some(Var::scalar(value, attrs)), level);
-					continue;
+					if level == Level::Global {
+						// The global one is dropped (`declare -n q; declare +n
+						// q=3` leaves no `q`).
+						ctx.set_var(name, None, level);
+					} else {
+						let mut kept = own;
+						kept.attrs = kept.attrs.with(on);
+						ctx.set_var(name, Some(kept), level);
+					}
+					status = 1;
 				}
+				continue;
+			}
+			if let Some(value) = value {
 				// A special target through a global reference: the
 				// assignment's lookups ([`set_value`]'s), on the first run.
 				let mut special = None;

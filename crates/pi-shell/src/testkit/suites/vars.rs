@@ -1661,6 +1661,154 @@ fn attributes_given_with_and_without_the_reference() {
 	);
 	assert_eq!(out, "declare -- q=\"zz\"\n1\ndeclare -n p=\"y\"\n1\n");
 	assert!(err.ends_with("local: `3': not a valid identifier\n"), "{err}");
+	// The rest of that rule. The value is the reference's own after `+=`
+	// (the target's name, then the word) and the attributes given: `-i`
+	// evaluates it, so a number is refused, silently when the word itself
+	// was a name; `-u`/`-l` change its case. It may name an element
+	// (`valid_nameref_value`). A refusal keeps the reference, with the
+	// attributes given. Goldens from bash 5.3.20 (5.2.21 agrees).
+	for (body, want_out, want_err) in [
+		("local +n q+=zz", "st=0\ndeclare -- q=\"yzz\"\ny=1 w=0\n", ""),
+		("local +n q+=3", "st=0\ndeclare -- q=\"y3\"\ny=1 w=0\n", ""),
+		("local +n q+='[1]'", "st=0\ndeclare -- q=\"y[1]\"\ny=1 w=0\n", ""),
+		(
+			"local +n q+=-",
+			"st=1\ndeclare -n q=\"y\"\ny=1 w=0\n",
+			"local: `-': not a valid identifier\n",
+		),
+		("local +n q='a[1]'", "st=0\ndeclare -- q=\"a[1]\"\ny=1 w=0\n", ""),
+		(
+			"local +n q='a[x'",
+			"st=1\ndeclare -n q=\"y\"\ny=1 w=0\n",
+			"local: `a[x': not a valid identifier\n",
+		),
+		("local +n -i q=zz", "st=1\ndeclare -in q=\"y\"\ny=1 w=0\n", ""),
+		("local +n -i q+=zz", "st=1\ndeclare -in q=\"y\"\ny=1 w=0\n", ""),
+		(
+			"local +n -i q=3+4",
+			"st=1\ndeclare -in q=\"y\"\ny=1 w=0\n",
+			"local: `3+4': not a valid identifier\n",
+		),
+		(
+			"local +n -i q=w++",
+			"st=1\ndeclare -in q=\"y\"\ny=1 w=1\n",
+			"local: `w++': not a valid identifier\n",
+		),
+		("local +n -u q=zz", "st=0\ndeclare -u q=\"ZZ\"\ny=1 w=0\n", ""),
+		("local +n -l q=ZZ", "st=0\ndeclare -l q=\"zz\"\ny=1 w=0\n", ""),
+		(
+			"local +n -u q=3",
+			"st=1\ndeclare -nu q=\"y\"\ny=1 w=0\n",
+			"local: `3': not a valid identifier\n",
+		),
+		(
+			"local +n -r q=3",
+			"st=1\ndeclare -nr q=\"y\"\ny=1 w=0\n",
+			"local: `3': not a valid identifier\n",
+		),
+		("local +n -x q+=zz", "st=0\ndeclare -x q=\"yzz\"\ny=1 w=0\n", ""),
+		("declare +n q+=zz", "st=0\ndeclare -- q=\"yzz\"\ny=1 w=0\n", ""),
+		("typeset +n -r q='a[1]'", "st=0\ndeclare -r q=\"a[1]\"\ny=1 w=0\n", ""),
+	] {
+		let src = format!(
+			"y=1; zz=4; w=0; f() {{ local -n q=y; {body}; echo \"st=$?\"; declare -p q; echo \"y=$y \
+			 w=$w\"; }}; f"
+		);
+		let (out, err) = run(&src);
+		assert_eq!(out, want_out, "{body}");
+		if want_err.is_empty() {
+			assert_eq!(err, "", "{body}");
+		} else {
+			assert!(err.ends_with(want_err), "{body}: {err}");
+		}
+	}
+	// A reference with no target takes the value. A function's own reference
+	// to an element is left as it is; a global one gives the value to the
+	// element and ends (bash 5.3.20, each form at the top level of the
+	// script; 5.2.21 agrees but for the `-c` name in a message).
+	for (src, want_out, want_err) in [
+		(
+			"f() { local -n q; local +n q=zz; echo \"st=$?\"; declare -p q; }; f",
+			"st=0\ndeclare -- q=\"zz\"\n",
+			"",
+		),
+		(
+			"f() { local -n q; local +n q+=zz; echo \"st=$?\"; declare -p q; }; f",
+			"st=0\ndeclare -- q=\"zz\"\n",
+			"",
+		),
+		(
+			"f() { local -n q; local +n q=3; echo \"st=$?\"; declare -p q; }; f",
+			"st=1\ndeclare -n q\n",
+			"bash: line 1: local: `3': not a valid identifier\n",
+		),
+		(
+			"zz=4; f() { local -n q; local +n -i q=zz; echo \"st=$?\"; declare -p q; }; f",
+			"st=1\ndeclare -in q\n",
+			"",
+		),
+		(
+			"declare -n q; declare +n q=zz; echo \"st=$?\"; declare -p q",
+			"st=0\ndeclare -- q=\"zz\"\n",
+			"",
+		),
+		(
+			"declare -n q; declare +n q+=zz; echo \"st=$?\"; declare -p q",
+			"st=0\ndeclare -- q=\"zz\"\n",
+			"",
+		),
+		// A global one that refuses its value is dropped.
+		(
+			"declare -n q; declare +n q=3; echo \"st=$?\"; declare -p q",
+			"st=1\n",
+			"bash: line 1: declare: `3': not a valid identifier\nbash: line 1: declare: q: not \
+			 found\n",
+		),
+		(
+			"zz=4; declare -n q; declare +n -i q=zz; echo \"st=$?\"; declare -p q",
+			"st=1\n",
+			"bash: line 1: declare: q: not found\n",
+		),
+		(
+			"a=(1 2); f() { local -n q='a[1]'; local +n q=zz; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"; }; f",
+			"st=0\ndeclare -n q=\"a[1]\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); f() { local -n q='a[1]'; local +n q=3; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"; }; f",
+			"st=0\ndeclare -n q=\"a[1]\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); f() { local -n q='a[1]'; local +n q+=zz; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"; }; f",
+			"st=0\ndeclare -n q=\"a[1]\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); f() { local -n q='a[1]'; local +n q; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"; }; f",
+			"st=0\ndeclare -n q=\"a[1]\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); declare -n q='a[1]'; declare +n q=zz; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"",
+			"st=0\ndeclare -- q=\"a[1]\"\n1 zz\n",
+			"",
+		),
+		(
+			"a=(1 2); declare -n q='a[1]'; declare +n q; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"",
+			"st=0\ndeclare -- q=\"a[1]\"\n1 2\n",
+			"",
+		),
+	] {
+		let (out, err) = run(src);
+		assert_eq!((out.as_str(), err.as_str()), (want_out, want_err), "{src}");
+	}
 }
 
 // Golden: bash 5.3.20 (upstream exp8.sub, array32.sub): an arithmetic
