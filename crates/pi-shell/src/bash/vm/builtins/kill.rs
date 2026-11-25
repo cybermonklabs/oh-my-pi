@@ -183,11 +183,14 @@ pub(super) fn target(
 		if zsh.is_none() {
 			job.notified = false;
 		}
+		// A foreground job's processes are the shell's children, and its
+		// vproc names only the first of them: its state alone says it ended.
 		if matches!(job.state, JobState::Done(_))
-			|| matches!(
-				ctx.k.proc_state(ctx.cx.store, job.vpid),
-				Some(crate::bash::vm::ProcState::Exited(_))
-			) {
+			|| (!job.foreground
+				&& matches!(
+					ctx.k.proc_state(ctx.cx.store, job.vpid),
+					Some(crate::bash::vm::ProcState::Exited(_))
+				)) {
 			// bash's `kill` finds the job gone once it reaped it.
 			job.unreaped = false;
 			if zsh.is_some() {
@@ -208,10 +211,15 @@ pub(super) fn target(
 			job.state = JobState::Running;
 			job.notified = true;
 		}
-		if ends(send) && !has_program(job) {
+		let unreaped = ends(send) && !has_program(job);
+		if unreaped {
 			job.unreaped = true;
 		}
-		return Ok(Some(SigTarget::Job(job.id)));
+		let id = job.id;
+		if unreaped {
+			ctx.vp.jobs.unreaped_marked();
+		}
+		return Ok(Some(SigTarget::Job(id)));
 	}
 	let pid = std::str::from_utf8(arg)
 		.ok()
@@ -241,7 +249,10 @@ pub(super) fn target(
 	// `kill` (that still finds a zombie) finds gone only once it reaped it.
 	if let Some(job) = named.and_then(|v| ctx.vp.jobs.by_vpid_mut(v)) {
 		match live {
-			Some(_) if ends(send) && !has_program(job) => job.unreaped = true,
+			Some(_) if ends(send) && !has_program(job) => {
+				job.unreaped = true;
+				ctx.vp.jobs.unreaped_marked();
+			},
 			Some(_) => {},
 			None => job.unreaped = false,
 		}

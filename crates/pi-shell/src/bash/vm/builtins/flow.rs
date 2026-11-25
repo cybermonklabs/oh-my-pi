@@ -702,8 +702,12 @@ fn in_chld_trap(vp: &crate::bash::vm::proc::Vproc) -> bool {
 /// `wait` without operands: every running job (bash
 /// `wait_for_background_pids`); with job control a stopped job is skipped
 /// with a warning. A command substitution's copies of its parent's jobs
-/// are not its children. A job this shell's `kill` ended with no OS status
-/// for obash to reap is still running for bash, which has not reaped it
+/// are not its children: it waits for none of them, and they stay (bash
+/// 5.3 lists a finished one after the `wait`, measured, in a fork of a
+/// frozen shell or not). A foreground job
+/// ([`crate::bash::vm::proc::Job::foreground`]) is none bash waits for. A
+/// job this shell's `kill` ended with no OS status for obash to reap is
+/// still running for bash, which has not reaped it
 /// ([`crate::bash::store::Job::unreaped`]): it takes its place in the list,
 /// as bash waits for the first job still running. `Awaited::AllJobs`
 /// reports the first job it waits for, drops each other one that ended
@@ -714,13 +718,14 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 		.vp
 		.jobs
 		.iter()
-		.filter(|j| j.inherited && j.state == crate::bash::vm::proc::JobState::Running)
+		.filter(|j| {
+			j.inherited && !j.foreground && j.state == crate::bash::vm::proc::JobState::Running
+		})
 		.map(crate::bash::vm::proc::Job::pid)
 		.collect();
 	for pid in foreign {
 		ctx.usage(format!("pid {pid} is not a child of this shell"));
 	}
-	ctx.vp.jobs.remove_where(|j| j.inherited);
 	let bash = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
 	let held = |j: &crate::bash::vm::proc::Job| {
 		bash
@@ -731,7 +736,7 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	};
 	let mut list = Vec::new();
 	let mut stopped = Vec::new();
-	for job in ctx.vp.jobs.iter() {
+	for job in ctx.vp.jobs.iter().filter(|j| !j.foreground && !j.inherited) {
 		match job.state {
 			crate::bash::vm::proc::JobState::Stopped(_) if control => {
 				stopped.push((job.number, job.pid()));
@@ -763,8 +768,15 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 	let mut list = Vec::new();
 	if args.is_empty() {
 		// bash `wait_for_any_job` takes a finished job already reported only
-		// once it waited for a child (`Awaited::AnyJob`).
-		list.extend(ctx.vp.jobs.iter().filter(|j| !j.inherited).map(|j| j.vpid));
+		// once it waited for a child (`Awaited::AnyJob`); it passes a
+		// foreground job by.
+		list.extend(
+			ctx.vp
+				.jobs
+				.iter()
+				.filter(|j| !j.inherited && !j.foreground)
+				.map(|j| j.vpid),
+		);
 	} else {
 		// bash `check_nonjobs`: a pid no longer in the job table whose
 		// status is kept.
@@ -799,10 +811,15 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 							&& ctx.k.started(ctx.cx.store, ctx.vp.vpid, p))
 						.then_some(p)
 					}),
-				None => super::jobs::spec(ctx, a)
+				None => match super::jobs::spec(ctx, a)
 					.ok()
 					.and_then(|n| ctx.vp.jobs.get(n))
-					.map(|j| j.vpid),
+				{
+					// bash marks it waited for, and `wait_for_any_job` passes
+					// it by.
+					Some(j) if j.foreground => continue,
+					found => found.map(|j| j.vpid),
+				},
 			};
 			match found {
 				Some(v) => {

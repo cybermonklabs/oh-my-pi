@@ -15,7 +15,7 @@ use bstr::{BStr, BString};
 use hashbrown::DefaultHashBuilder;
 use serde::{Deserialize, Serialize};
 
-use super::proc::{GetoptsState, JobTable, LastBg, SavedStatus, Vproc};
+use super::proc::{GetoptsState, JobList, JobTable, LastBg, SavedStatus, Vproc};
 pub use crate::bash::store::Var;
 use crate::bash::{
 	host::Rlimit,
@@ -3058,67 +3058,84 @@ fn decode_rlimits(words: &[BString]) -> Vec<(Rlimit, Option<u64>, Option<u64>)> 
 		.collect()
 }
 
-/// Write the root job table's changes since the last sync: each job is
+/// Write the root job table's changes since the last sync: each job from
+/// the lowest index any of them changed at ([`JobList::take_changed`]) is
 /// compared with its store record (the store holds what was written last,
-/// so the engine keeps no copy of the table), jobs gone from the table are
-/// deleted. A job's facts ([`Job::facts`]) are a record of their own,
-/// written with the job's record when it changes, and when they change
-/// without it (a pipeline's processes start and end while the job runs,
-/// [`Job::procs`]): those of a job that has any are compared with their
-/// record too. A job's facts never go, so one without any has none written.
-fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
+/// so the engine keeps no copy of the table), and jobs gone from there are
+/// deleted; the jobs before it are as they were. So a step costs the jobs
+/// it changed, not every job a `lastpipe` stage or a function substitution
+/// keeps (one more per fork in a loop of externals). A job's facts
+/// ([`Job::facts`]) are a record of their own, written with the job's
+/// record when it changes, and when they change without it (a pipeline's
+/// processes start and end while the job runs, [`Job::procs`]): those of a
+/// job that has any are compared with their record too. A job's facts
+/// never go, so one without any has none written.
+fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &mut JobTable) {
+	let changed = jobs.list.take_changed();
 	let mut ids = std::mem::take(&mut root.synced.job_ids);
-	let same_ids =
-		ids.len() == jobs.list.len() && ids.iter().zip(&jobs.list).all(|(id, j)| *id == j.id);
-	if !same_ids {
-		for id in &ids {
-			if !jobs.list.iter().any(|j| j.id == *id) {
-				root.write(store, Change::Del(Key::Job(*id)));
-				root.write(store, Change::Del(Key::JobFacts(*id)));
+	if let Some(from) = changed.map(|at| at.min(ids.len()).min(jobs.list.len())) {
+		// Each id written from `from` on that the table no longer holds there
+		// goes: a lookup per id, not a scan of the table per id.
+		if ids.len() > from {
+			let live: std::collections::HashSet<JobId> =
+				jobs.list[from..].iter().map(|j| j.id).collect();
+			for id in &ids[from..] {
+				if !live.contains(id) {
+					root.write(store, Change::Del(Key::Job(*id)));
+					root.write(store, Change::Del(Key::JobFacts(*id)));
+				}
 			}
 		}
-		ids.clear();
-		ids.extend(jobs.list.iter().map(|j| j.id));
-	}
-	root.synced.job_ids = ids;
-	for job in &jobs.list {
-		let written = match store.get(Key::Job(job.id)) {
-			Ok(Some(Record::Job(have))) => job.same_record(have),
-			Ok(_) => false,
-			Err(err) => {
-				root.fail(err);
-				return;
-			},
-		};
-		if !written {
-			root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.record())));
-		}
-		let facts_written = if !written {
-			false
-		} else if !job.has_facts() {
-			true
-		} else {
-			match store.get(Key::JobFacts(job.id)) {
-				Ok(Some(Record::JobFacts(have))) => job.same_facts(have),
+		ids.truncate(from);
+		ids.extend(jobs.list[from..].iter().map(|j| j.id));
+		let mut fault = None;
+		for job in &jobs.list[from..] {
+			let written = match store.get(Key::Job(job.id)) {
+				Ok(Some(Record::Job(have))) => job.same_record(have),
 				Ok(_) => false,
 				Err(err) => {
-					root.fail(err);
-					return;
+					fault = Some(err);
+					break;
 				},
+			};
+			if !written {
+				root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.record())));
 			}
-		};
-		if !facts_written {
-			let facts = job.facts();
-			root.write(
-				store,
-				if facts.is_empty() {
-					Change::Del(Key::JobFacts(job.id))
-				} else {
-					Change::Put(Key::JobFacts(job.id), Record::JobFacts(facts))
-				},
-			);
+			let facts_written = if !written {
+				false
+			} else if !job.has_facts() {
+				true
+			} else {
+				match store.get(Key::JobFacts(job.id)) {
+					Ok(Some(Record::JobFacts(have))) => job.same_facts(have),
+					Ok(_) => false,
+					Err(err) => {
+						fault = Some(err);
+						break;
+					},
+				}
+			};
+			if !facts_written {
+				let facts = job.facts();
+				root.write(
+					store,
+					if facts.is_empty() {
+						Change::Del(Key::JobFacts(job.id))
+					} else {
+						Change::Put(Key::JobFacts(job.id), Record::JobFacts(facts))
+					},
+				);
+			}
+		}
+		if let Some(err) = fault {
+			// Written again in full from `from` at the next sync.
+			root.fail(err);
+			jobs.list.unsynced(from);
+			root.synced.job_ids = ids;
+			return;
 		}
 	}
+	root.synced.job_ids = ids;
 	let (current, previous, chld) = root.synced.job_marks;
 	for (key, new, was) in [
 		(MiscKey::JobCurrent, jobs.current, current),
@@ -3176,8 +3193,9 @@ pub fn clear_statuses(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vpro
 /// (`$?`, `PIPESTATUS`, `$!`, the job table, `getopts` progress, `ulimit`
 /// values). Called at the end of every `step` (the one returning a
 /// `Step::Call` included), by `externalize` and by `restore`: the store
-/// contract's granularity for these fields.
-pub fn sync_root(root: &mut Root, store: &mut dyn StateStore, vp: &Vproc) {
+/// contract's granularity for these fields. `vp` is mutable for its job
+/// table's record of what changed ([`JobList::take_changed`]).
+pub fn sync_root(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 	debug_assert!(vp.overlay.is_none(), "only the root vproc's fields are in the store");
 	if vp.status != root.synced.status {
 		root.synced.status = vp.status;
@@ -3198,12 +3216,12 @@ pub fn sync_root(root: &mut Root, store: &mut dyn StateStore, vp: &Vproc) {
 		});
 		root.set_record(store, KeyBuf::Misc(MiscKey::LastBg), rec);
 	}
-	// Jobs are compared with their records: only an empty table that was
-	// written empty is skipped without a read.
+	// The jobs that changed are compared with their records: a table
+	// without a change since the last sync costs nothing.
 	let marks = (vp.jobs.current, vp.jobs.previous, vp.jobs.chld);
 	if !vp.jobs.list.is_empty() || !root.synced.job_ids.is_empty() || marks != root.synced.job_marks
 	{
-		write_jobs(root, store, &vp.jobs);
+		write_jobs(root, store, &mut vp.jobs);
 	}
 	if vp.getopts != root.synced.getopts {
 		root.synced.getopts.clone_from(&vp.getopts);
@@ -3264,9 +3282,13 @@ pub fn load_root(
 			list.push(job.clone());
 		}
 	})?;
+	// Each facts record finds its job by an index, not a scan of the jobs:
+	// a store can hold thousands of kept foreground jobs, each with facts.
+	let at: std::collections::HashMap<JobId, usize> =
+		list.iter().enumerate().map(|(i, j)| (j.id, i)).collect();
 	store.scan(Table::JobFacts, &mut |key, rec| {
 		if let (Key::JobFacts(id), Record::JobFacts(facts)) = (key, rec)
-			&& let Some(job) = list.iter_mut().find(|j| j.id == id)
+			&& let Some(job) = at.get(&id).and_then(|&i| list.get_mut(i))
 		{
 			job.set_facts(facts);
 		}
@@ -3288,7 +3310,7 @@ pub fn load_root(
 	bgp.sort_by_key(|s| s.seq);
 	let bgp = (!bgp.is_empty()).then(|| Box::new(bgp.into_iter().collect()));
 	vp.jobs = JobTable {
-		list,
+		list: JobList::synced(list),
 		current: misc(store, MiscKey::JobCurrent)?.and_then(|s| parse(&s)),
 		previous: misc(store, MiscKey::JobPrevious)?.and_then(|s| parse(&s)),
 		chld: misc(store, MiscKey::ChldOwed)?
@@ -3296,7 +3318,7 @@ pub fn load_root(
 			.unwrap_or(0),
 		subshell: false,
 		comsub: super::proc::Comsub::No,
-		kept: false,
+		freeze: super::proc::Freeze::No,
 		bgp,
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);
@@ -4066,7 +4088,7 @@ mod tests {
 	#[test]
 	fn sync_root_writes_what_changed_and_load_root_reads_it_back() {
 		let (mut store, mut root, mut vp) = shell();
-		sync_root(&mut root, &mut store, &vp);
+		sync_root(&mut root, &mut store, &mut vp);
 		assert!(store.is_empty(), "nothing changed since the defaults");
 		vp.status = 3;
 		vp.pipestatus = vec![0, 3];
@@ -4078,7 +4100,7 @@ mod tests {
 		vp.jobs.chld = 2;
 		vp.getopts = GetoptsState { optind: Some("2".into()), next: Some((1, 2)), at: None };
 		vp.rlimits = vec![(Rlimit::Nofile, Some(64), None)];
-		sync_root(&mut root, &mut store, &vp);
+		sync_root(&mut root, &mut store, &mut vp);
 		let misc = |store: &crate::bash::MemStore, key| store.record(Key::Misc(key)).cloned();
 		assert_eq!(misc(&store, MiscKey::Status), Some(Record::Misc("3".into())));
 		// `$!` keeps the OS pid its job is known by.
@@ -4092,7 +4114,7 @@ mod tests {
 		assert!(matches!(store.record(Key::Job(JobId(4))), Some(Record::Job(j)) if j.number == 1));
 		// A job's state change rewrites that job only; a removed job goes.
 		vp.jobs.get_mut(1).unwrap().state = JobState::Stopped(Signal::Tstp);
-		sync_root(&mut root, &mut store, &vp);
+		sync_root(&mut root, &mut store, &mut vp);
 		let stopped = |store: &crate::bash::MemStore| {
 			matches!(
 				store.record(Key::Job(JobId(4))),
@@ -4112,13 +4134,13 @@ mod tests {
 		assert_eq!(fresh.rlimits, vp.rlimits);
 		// Loaded fields count as written: no rewrite.
 		let before = store.clone();
-		sync_root(&mut root2, &mut store, &fresh);
+		sync_root(&mut root2, &mut store, &mut fresh);
 		assert_eq!(store, before);
 		vp.jobs.remove(1);
 		vp.jobs.chld = 0;
 		vp.getopts = GetoptsState::default();
 		vp.rlimits.clear();
-		sync_root(&mut root, &mut store, &vp);
+		sync_root(&mut root, &mut store, &mut vp);
 		assert_eq!(store.record(Key::Job(JobId(4))), None);
 		assert_eq!(misc(&store, MiscKey::JobCurrent), None);
 		assert_eq!(misc(&store, MiscKey::ChldOwed), None);

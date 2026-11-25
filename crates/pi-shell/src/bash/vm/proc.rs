@@ -52,7 +52,8 @@ pub struct Vproc {
 	/// all go back to their pre-trap values once the trap's frame is popped,
 	/// so without this the trap could start a second time.
 	pub exit_trap_run: bool,
-	/// Background jobs not yet waited for or reported, current/previous
+	/// Background jobs not yet waited for or reported (and foreground ones
+	/// while no job may be deleted, [`Job::foreground`]), current/previous
 	/// job and the `SIGCHLD` trap runs owed.
 	pub jobs:          JobTable,
 	/// `$!`: the last asynchronous child and the OS pid it is known by.
@@ -449,6 +450,120 @@ pub struct GetoptsState {
 	pub at:     Option<u32>,
 }
 
+/// A job table's jobs in start order ([`JobTable::list`]), with the lowest
+/// index at which any of them changed since the root's table was last
+/// written to the store ([`Self::take_changed`]): the sync at the end of
+/// every step compares only the jobs from there with their records
+/// ([`super::state::sync_root`]), not each of the thousands a loop of
+/// externals in a `lastpipe` stage or a function substitution keeps.
+/// Reads go through the slice; a change goes through a method here, which
+/// notes the index it changes, or through the slice's `&mut`
+/// ([`DerefMut`](std::ops::DerefMut)), which notes every job.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JobList {
+	jobs:    Vec<Job>,
+	/// The lowest index changed since [`Self::take_changed`], or
+	/// [`Self::NONE`]. 0 (every job) in a new or deserialized list; a clone
+	/// copies it.
+	#[serde(skip)]
+	changed: u32,
+	/// No job is [`Job::unreaped`]: [`JobTable::all_reaped`] has nothing to
+	/// do. False (look) in a new or deserialized list; a clone copies it.
+	#[serde(skip)]
+	reaped:  bool,
+}
+
+impl JobList {
+	/// [`Self::changed`] when no job changed.
+	const NONE: u32 = u32::MAX;
+
+	/// `jobs` as they are in the store: none changed since it was written.
+	pub const fn synced(jobs: Vec<Job>) -> Self {
+		Self { jobs, changed: Self::NONE, reaped: false }
+	}
+
+	/// Note that the job at `index` (or one at a higher index) changed.
+	fn note(&mut self, index: usize) {
+		self.changed = self.changed.min(u32::try_from(index).unwrap_or(0));
+	}
+
+	/// The lowest index changed since the last call, if any: the jobs before
+	/// it are as they were, at the same indices.
+	pub fn take_changed(&mut self) -> Option<usize> {
+		let at = std::mem::replace(&mut self.changed, Self::NONE);
+		(at != Self::NONE).then_some(at as usize)
+	}
+
+	/// The jobs from `index` on are not in the store as they are: the next
+	/// [`Self::take_changed`] returns `index` or lower.
+	pub fn unsynced(&mut self, index: usize) {
+		self.note(index);
+	}
+
+	/// The job at `index`, to change it.
+	pub fn at_mut(&mut self, index: usize) -> Option<&mut Job> {
+		self.note(index);
+		self.jobs.get_mut(index)
+	}
+
+	/// Add `job` after the others.
+	pub fn push(&mut self, job: Job) {
+		self.note(self.jobs.len());
+		self.jobs.push(job);
+	}
+
+	/// Remove the job at `index`.
+	pub fn remove(&mut self, index: usize) -> Job {
+		self.note(index);
+		self.jobs.remove(index)
+	}
+
+	/// Keep only the jobs `keep` selects.
+	pub fn retain(&mut self, mut keep: impl FnMut(&Job) -> bool) {
+		let Some(first) = self.jobs.iter().position(|j| !keep(j)) else {
+			return;
+		};
+		self.note(first);
+		let mut i = 0;
+		self.jobs.retain(|j| {
+			let kept = i < first || (i > first && keep(j));
+			i += 1;
+			kept
+		});
+	}
+}
+
+impl From<Vec<Job>> for JobList {
+	fn from(jobs: Vec<Job>) -> Self {
+		Self { jobs, changed: 0, reaped: false }
+	}
+}
+
+impl PartialEq for JobList {
+	fn eq(&self, other: &Self) -> bool {
+		self.jobs == other.jobs
+	}
+}
+
+impl Eq for JobList {}
+
+impl std::ops::Deref for JobList {
+	type Target = [Job];
+
+	fn deref(&self) -> &[Job] {
+		&self.jobs
+	}
+}
+
+impl std::ops::DerefMut for JobList {
+	fn deref_mut(&mut self) -> &mut [Job] {
+		self.note(0);
+		self.reaped = false;
+		&mut self.jobs
+	}
+}
+
 /// The job table of one shell: bash's `jobs` array with `js.j_current` and
 /// `js.j_previous`. Called by the job builtins, `wait`, `kill`, the
 /// scheduler (state changes) and `$!`/`\j`. The root vproc's table is
@@ -458,7 +573,7 @@ pub struct GetoptsState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobTable {
 	/// Jobs in start order (ascending numbers).
-	pub list:     Vec<Job>,
+	pub list:     JobList,
 	/// The current job (`%+`, `%%`), by number.
 	pub current:  Option<u32>,
 	/// The previous job (`%-`), by number.
@@ -473,14 +588,12 @@ pub struct JobTable {
 	/// Where a command or process substitution leaves this shell: which
 	/// background jobs a signal killed it reports ([`super::killed`]).
 	pub comsub:   Comsub,
-	/// This shell is a fork (a subshell, a pipeline stage, a background
-	/// job, a command or process substitution) of a shell whose job list
-	/// was kept as it forked ([`Vproc::jobs_kept`], or this flag of that
-	/// shell): bash's fork keeps `jobs_list_frozen`, so this shell, and a
-	/// command or process substitution it starts, drops no finished job
-	/// ([`super::killed`]'s `mark_unreported`,
-	/// [`super::exec::drop_finished_jobs`]).
-	pub kept:     bool,
+	/// The `jobs_list_frozen` this shell forked with ([`Freeze`]): bash's
+	/// fork (a subshell, a pipeline stage, a background job, a command or
+	/// process substitution) copies the value its shell had, and nothing in
+	/// the fork ends that freeze, so it holds for the fork's whole life
+	/// ([`Vproc::freeze`]). bash only.
+	pub freeze:   Freeze,
 	/// The statuses of background jobs that left the table (bash's bgp
 	/// list: `delete_job`'s `bgp_add`), oldest first, at most [`BGP_MAX`]:
 	/// `wait PID` finds one once its job left the table, and a `wait` a trap
@@ -542,6 +655,24 @@ impl Comsub {
 	}
 }
 
+/// bash's `jobs_list_frozen`: whether jobs may be reported and deleted
+/// now. Set by the shell while it runs the last stage of a `lastpipe`
+/// pipeline and a trap run with the list frozen (`freeze_jobs_list (1)`),
+/// and a function substitution (`freeze_jobs_list (-1)`), each restoring
+/// the value it found; a fork keeps the value its shell had
+/// ([`JobTable::freeze`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Freeze {
+	/// 0: jobs are reported and deleted.
+	#[default]
+	No,
+	/// -1: jobs are reported and marked reported, but none is deleted;
+	/// `wait -n` takes a finished job and marks it.
+	Marks,
+	/// 1: no job is reported or deleted, and `wait -n` returns at once.
+	Frozen,
+}
+
 /// What a job spec names (bash `get_job_spec`), without its `%`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobLookup {
@@ -553,14 +684,25 @@ pub enum JobLookup {
 	Ambiguous,
 }
 
+/// The status of a job whose processes `procs` all ended (bash
+/// `raw_job_exit_status`): that of the process whose end is the job's
+/// ([`JobProcs::status_process`]), 0 when none failed under `pipefail`.
+fn procs_status(procs: &JobProcs, platform: crate::bash::Platform) -> i32 {
+	match procs.status_process().map(|p| p.state) {
+		Some(ProcState::Exited(n)) => n,
+		Some(ProcState::Killed(sig)) => sig.exit_status(platform),
+		Some(ProcState::Running) | None => 0,
+	}
+}
+
 impl JobTable {
 	/// Number of jobs (prompt `\j`).
-	pub const fn len(&self) -> usize {
+	pub fn len(&self) -> usize {
 		self.list.len()
 	}
 
 	/// No jobs.
-	pub const fn is_empty(&self) -> bool {
+	pub fn is_empty(&self) -> bool {
 		self.list.is_empty()
 	}
 
@@ -569,38 +711,70 @@ impl JobTable {
 		self.list.iter()
 	}
 
+	/// The index of the newest job `pick` selects. The lookups search from
+	/// the newest job: the one a step changes is nearly always among the
+	/// last, in a table that can keep thousands ([`JobList`]).
+	fn newest(&self, pick: impl FnMut(&Job) -> bool) -> Option<usize> {
+		self.list.iter().rposition(pick)
+	}
+
 	/// Job `%number`.
 	pub fn get(&self, number: u32) -> Option<&Job> {
-		self.list.iter().find(|j| j.number == number)
+		self.newest(|j| j.number == number).map(|i| &self.list[i])
 	}
 
 	/// Job `%number`, to update it.
 	pub fn get_mut(&mut self, number: u32) -> Option<&mut Job> {
-		self.list.iter_mut().find(|j| j.number == number)
+		let i = self.newest(|j| j.number == number)?;
+		self.list.at_mut(i)
 	}
 
-	/// The job whose root vproc is `vpid`.
+	/// The background job whose root vproc is `vpid`. A foreground job
+	/// ([`Job::foreground`]) is none: what follows a child's end, a stop or
+	/// a `wait PID` passes it by.
 	pub fn by_vpid(&self, vpid: Vpid) -> Option<&Job> {
-		self.list.iter().find(|j| j.vpid == vpid)
+		self
+			.newest(|j| j.vpid == vpid && !j.foreground)
+			.map(|i| &self.list[i])
 	}
 
-	/// The job whose root vproc is `vpid`, to update it.
+	/// The background job whose root vproc is `vpid`, to update it.
 	pub fn by_vpid_mut(&mut self, vpid: Vpid) -> Option<&mut Job> {
-		self.list.iter_mut().find(|j| j.vpid == vpid)
+		let i = self.newest(|j| j.vpid == vpid && !j.foreground)?;
+		self.list.at_mut(i)
 	}
 
-	/// The job `pid` names: its virtual pid or its program's OS pid
-	/// ([`Job::os_pid`]).
+	/// The background job `pid` names: its virtual pid or its program's OS
+	/// pid ([`Job::os_pid`]).
 	pub fn by_pid(&self, pid: u32) -> Option<&Job> {
-		self.list.iter().find(|j| j.named_by(pid))
+		self.list.iter().find(|j| j.named_by(pid) && !j.foreground)
+	}
+
+	/// The foreground job ([`Job::foreground`]) whose root vproc is `vpid`,
+	/// this shell's own: the key `wait %N` waits by.
+	pub fn foreground(&self, vpid: Vpid) -> Option<&Job> {
+		self
+			.newest(|j| j.vpid == vpid && j.foreground && !j.inherited)
+			.map(|i| &self.list[i])
+	}
+
+	/// The foreground job whose root vproc is `vpid`, to update it.
+	pub fn foreground_mut(&mut self, vpid: Vpid) -> Option<&mut Job> {
+		let i = self.newest(|j| j.vpid == vpid && j.foreground && !j.inherited)?;
+		self.list.at_mut(i)
+	}
+
+	/// The number the next job takes: the one after the highest in use
+	/// (bash does not reuse lower freed numbers until the table is empty).
+	fn next_number(&self) -> u32 {
+		self.list.last().map_or(1, |j| j.number.saturating_add(1))
 	}
 
 	/// Add a background job (bash `stop_pipeline` for an async list): it
-	/// takes the number after the highest one in use (bash does not reuse
-	/// lower freed numbers until the table is empty) and becomes current
-	/// as `reset_current` decides. Returns its number.
+	/// takes the next number ([`Self::next_number`]) and becomes current as
+	/// `reset_current` decides. Returns its number.
 	pub fn add(&mut self, id: JobId, vpid: Vpid, text: BString, control: bool, wd: BString) -> u32 {
-		let number = self.list.last().map_or(1, |j| j.number.saturating_add(1));
+		let number = self.next_number();
 		self.list.push(Job {
 			id,
 			number,
@@ -615,20 +789,182 @@ impl JobTable {
 			os_pid: None,
 			signal: None,
 			procs: None,
+			foreground: false,
 			unreaped: false,
 		});
 		self.reset_current();
 		number
 	}
 
+	/// Add the job of a command the shell forked and waits for (bash
+	/// `stop_pipeline` for a foreground command, [`Job::foreground`]), vproc
+	/// `vpid`, with `procs` for a pipeline: it takes the next number as
+	/// [`Self::add`] does, and the current and previous jobs stay (bash's
+	/// `reset_current` is for an asynchronous one). Returns its number.
+	pub fn add_foreground(
+		&mut self,
+		id: JobId,
+		vpid: Vpid,
+		text: BString,
+		wd: BString,
+		procs: Option<JobProcs>,
+	) -> u32 {
+		let number = self.next_number();
+		self.list.push(Job {
+			id,
+			number,
+			vpid,
+			text,
+			state: JobState::Running,
+			control: false,
+			notified: false,
+			nohup: false,
+			inherited: false,
+			wd,
+			os_pid: None,
+			signal: None,
+			procs: procs.map(Box::new),
+			foreground: true,
+			unreaped: false,
+		});
+		number
+	}
+
+	/// Child `vpid` of this shell ended as `end`, with `status`: the
+	/// foreground job it is, or the last of whose processes it is, is done
+	/// ([`Job::foreground`]), its status that of the process whose end is
+	/// the job's ([`JobProcs::status_process`]) and its signal the one that
+	/// ended that process (bash `waitchld` and `set_job_status_and_cleanup`;
+	/// for a `( … )`, none when `pipeline`: a signal ended its vproc as it
+	/// ran a pipeline); `notified` as bash's wait for it leaves it
+	/// (`notify_and_cleanup`).
+	pub fn foreground_reaped(
+		&mut self,
+		vpid: Vpid,
+		end: ProcState,
+		status: i32,
+		pipeline: bool,
+		notified: bool,
+		platform: crate::bash::Platform,
+	) {
+		let Some(i) = self.newest(|j| {
+			j.foreground
+				&& !j.inherited
+				&& j.state == JobState::Running
+				&& match j.procs.as_deref() {
+					Some(procs) => procs.list.iter().any(|p| p.vpid == vpid),
+					None => j.vpid == vpid,
+				}
+		}) else {
+			return;
+		};
+		let Some(job) = self.list.at_mut(i) else {
+			return;
+		};
+		let (status, signal) = match job.procs.as_deref_mut() {
+			None => (status, end.signal().filter(|_| !pipeline)),
+			Some(procs) => {
+				if let Some(p) = procs.get_mut(vpid) {
+					p.state = end;
+				}
+				if procs.list.iter().any(|p| p.state == ProcState::Running) {
+					return;
+				}
+				(procs_status(procs, platform), procs.signal())
+			},
+		};
+		job.state = JobState::Done(status);
+		job.signal = signal;
+		job.notified = notified;
+	}
+
+	/// The last stage of the `lastpipe` pipeline whose first forked stage is
+	/// vproc `first` ended with `status`: bash appends it to the pipeline's
+	/// job (`execute_pipeline`'s `append_process`) as a process of the shell
+	/// `shell` that exited so, its command the last one the stage ran (bash
+	/// `the_printed_command_except_trap`, `$BASH_COMMAND`): the job's text
+	/// ends with it, `jobs` shows how it ended, and once every stage ended
+	/// the job's status is the pipeline's ([`JobProcs::status_process`]).
+	pub fn lastpipe_stage_ended(
+		&mut self,
+		first: Vpid,
+		shell: Vpid,
+		text: BString,
+		status: i32,
+		platform: crate::bash::Platform,
+	) {
+		let Some(i) = self.newest(|j| j.vpid == first && j.foreground && !j.inherited) else {
+			return;
+		};
+		let Some(job) = self.list.at_mut(i) else {
+			return;
+		};
+		let Some(procs) = job.procs.as_deref_mut() else {
+			return;
+		};
+		job.text.extend_from_slice(b" | ");
+		job.text.extend_from_slice(&text);
+		procs.list.push(JobProc {
+			vpid: shell,
+			os_pid: None,
+			text,
+			state: ProcState::Exited(status & 0xff),
+		});
+		if matches!(job.state, JobState::Done(_)) {
+			job.state = JobState::Done(procs_status(procs, platform));
+			job.signal = procs.signal();
+		}
+	}
+
+	/// The job of the external this shell starts or waits for
+	/// ([`super::killed::foreground_job`]): the last job, a foreground one of
+	/// no processes still running that knows no program yet. The shell runs
+	/// nothing else meanwhile, so no job comes after it.
+	pub fn pending_external_mut(&mut self) -> Option<&mut Job> {
+		let last = self.list.last()?;
+		let pending = last.foreground
+			&& !last.inherited
+			&& last.state == JobState::Running
+			&& last.procs.is_none()
+			&& last.os_pid.is_none();
+		if !pending {
+			return None;
+		}
+		let i = self.list.len() - 1;
+		self.list.at_mut(i)
+	}
+
+	/// The foreground external of OS pid `pid` ended with `status`, killed
+	/// by `signal` (bash `wait_for`): its job, if it has one, is done;
+	/// `notified` as [`Self::foreground_reaped`].
+	pub fn external_ended(&mut self, pid: u32, status: i32, signal: Option<Signal>, notified: bool) {
+		let Some(i) = self.newest(|j| {
+			j.foreground && !j.inherited && j.state == JobState::Running && j.os_pid == Some(pid)
+		}) else {
+			return;
+		};
+		if let Some(job) = self.list.at_mut(i) {
+			job.state = JobState::Done(status);
+			job.signal = signal;
+			job.notified = notified;
+		}
+	}
+
 	/// The process of vproc `vpid` of one of the jobs ([`Job::procs`]) is
 	/// the program of OS pid `pid`.
 	pub fn proc_settled(&mut self, vpid: Vpid, pid: u32) {
+		let Some(i) = self.newest(|j| {
+			j.procs
+				.as_deref()
+				.is_some_and(|procs| procs.list.iter().any(|p| p.vpid == vpid))
+		}) else {
+			return;
+		};
 		if let Some(p) = self
 			.list
-			.iter_mut()
-			.filter_map(|j| j.procs.as_deref_mut())
-			.find_map(|procs| procs.get_mut(vpid))
+			.at_mut(i)
+			.and_then(|j| j.procs.as_deref_mut())
+			.and_then(|procs| procs.get_mut(vpid))
 		{
 			p.os_pid = Some(pid);
 		}
@@ -637,7 +973,7 @@ impl JobTable {
 	/// Remove job `number` (bash `delete_job`); a removed current or
 	/// previous job makes `reset_current` pick new ones.
 	pub fn remove(&mut self, number: u32) -> Option<Job> {
-		let i = self.list.iter().position(|j| j.number == number)?;
+		let i = self.newest(|j| j.number == number)?;
 		let job = self.list.remove(i);
 		if self.current == Some(number) || self.previous == Some(number) {
 			self.reset_current();
@@ -647,11 +983,27 @@ impl JobTable {
 
 	/// bash reaped every child that had ended ([`Job::unreaped`]): it does as
 	/// it waits for a foreground command (`wait_for`'s `waitchld` takes in
-	/// each child that ended, not only the one it waits for).
+	/// each child that ended, not only the one it waits for). Nothing to do
+	/// in the common case, where no job was marked since
+	/// ([`Self::unreaped_marked`]).
 	pub fn all_reaped(&mut self) {
-		for job in &mut self.list {
-			job.unreaped = false;
+		if self.list.reaped {
+			return;
 		}
+		for i in 0..self.list.len() {
+			if self.list[i].unreaped
+				&& let Some(job) = self.list.at_mut(i)
+			{
+				job.unreaped = false;
+			}
+		}
+		self.list.reaped = true;
+	}
+
+	/// A job was just marked [`Job::unreaped`] (`kill`'s, the one place that
+	/// marks one): [`Self::all_reaped`] has work again.
+	pub const fn unreaped_marked(&mut self) {
+		self.list.reaped = false;
 	}
 
 	/// Remove every job `pick` selects, as [`Self::remove`] does.
@@ -744,9 +1096,25 @@ impl JobTable {
 		self.state(number) == Some(JobState::Running)
 	}
 
+	/// Mark each finished foreground job reported ([`Job::foreground`],
+	/// bash's `mark_dead_jobs_as_notified` for them): only those not marked
+	/// yet change, so the next store sync compares no other.
+	pub fn foreground_done_reported(&mut self) {
+		for i in 0..self.list.len() {
+			let j = &self.list[i];
+			if j.foreground
+				&& !j.notified
+				&& matches!(j.state, JobState::Done(_))
+				&& let Some(job) = self.list.at_mut(i)
+			{
+				job.notified = true;
+			}
+		}
+	}
+
 	/// The newest job older than `before` (all jobs for `None`) that is
 	/// stopped (`stopped`) or running (bash `most_recent_job_in_state`).
-	fn newest(&self, before: Option<u32>, stopped: bool) -> Option<u32> {
+	fn most_recent(&self, before: Option<u32>, stopped: bool) -> Option<u32> {
 		self
 			.list
 			.iter()
@@ -773,15 +1141,15 @@ impl JobTable {
 			return;
 		}
 		if self.is_stopped(self.current)
-			&& let Some(candidate) = self.newest(self.current, true)
+			&& let Some(candidate) = self.most_recent(self.current, true)
 		{
 			self.previous = Some(candidate);
 			return;
 		}
 		let candidate = if self.is_running(self.current) {
-			self.newest(self.current, false)
+			self.most_recent(self.current, false)
 		} else {
-			self.newest(None, false)
+			self.most_recent(None, false)
 		};
 		self.previous = candidate.or(self.current);
 	}
@@ -795,7 +1163,9 @@ impl JobTable {
 		} else if self.is_stopped(self.previous) {
 			self.previous
 		} else {
-			self.newest(None, true).or_else(|| self.newest(None, false))
+			self
+				.most_recent(None, true)
+				.or_else(|| self.most_recent(None, false))
 		};
 		if let Some(job) = candidate {
 			self.set_current(job);
@@ -1080,30 +1450,44 @@ impl Vproc {
 		})
 	}
 
-	/// Whether bash runs with its job list frozen (`jobs_list_frozen` > 0): in
-	/// a trap it runs so ([`ScriptKind::Trap`]'s `frozen`), or in the last
-	/// stage of a pipeline it runs in the shell (`lastpipe`,
-	/// `execute_pipeline`'s `freeze_jobs_list (1)`). No job is reported or
-	/// deleted meanwhile, and `wait -n` returns at once.
-	pub fn jobs_frozen(&self) -> bool {
-		let trap = self.trap_frames != 0
-			&& self.frames.iter().any(|f| {
-				matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { frozen: true, .. }, .. })
-			});
-		trap
-			|| (self.mode.dialect() == crate::bash::ids::Dialect::Bash
-				&& self.frames.iter().any(|f| f.kind == FrameKind::Stage))
+	/// bash's `jobs_list_frozen` now ([`Freeze`]): the innermost freeze of
+	/// this vproc's frames, as each one sets it and puts back the value it
+	/// found: a trap run with the list frozen ([`ScriptKind::Trap`]'s
+	/// `frozen`) or the last stage of a pipeline it runs in the shell
+	/// (`lastpipe`, `execute_pipeline`'s `freeze_jobs_list (1)`) freeze it;
+	/// a function substitution (`${ …; }`, `${| …; }`: `function_substitute`'s
+	/// `freeze_jobs_list (-1)`) only marks. Outside them, the value the
+	/// vproc forked with ([`JobTable::freeze`]): a fork keeps it for its
+	/// whole life.
+	pub fn freeze(&self) -> Freeze {
+		let bash = self.mode.dialect() == crate::bash::ids::Dialect::Bash;
+		let traps = self.trap_frames != 0;
+		for f in self.frames.iter().rev() {
+			match &f.kind {
+				FrameKind::Script { what: ScriptKind::Trap { frozen: true, .. }, .. } if traps => {
+					return Freeze::Frozen;
+				},
+				FrameKind::Stage if bash => return Freeze::Frozen,
+				FrameKind::NoFork if bash => return Freeze::Marks,
+				_ => {},
+			}
+		}
+		if bash { self.jobs.freeze } else { Freeze::No }
 	}
 
-	/// Whether bash deletes no job now (`jobs_list_frozen` ≠ 0): its job list
-	/// is frozen ([`Self::jobs_frozen`]), or it runs a function substitution
-	/// (`${ …; }`, `${| …; }`: `function_substitute`'s `freeze_jobs_list
-	/// (-1)`), where jobs are still reported and marked reported. The next
-	/// cleanup outside deletes what was marked.
+	/// Whether bash runs with its job list frozen (`jobs_list_frozen` > 0,
+	/// [`Self::freeze`]): no job is reported or deleted meanwhile, and
+	/// `wait -n` returns at once.
+	pub fn jobs_frozen(&self) -> bool {
+		self.freeze() == Freeze::Frozen
+	}
+
+	/// Whether bash deletes no job now (`jobs_list_frozen` ≠ 0,
+	/// [`Self::freeze`]): frozen, or only marking, where jobs are still
+	/// reported and marked reported. The next cleanup outside deletes what
+	/// was marked.
 	pub fn jobs_kept(&self) -> bool {
-		self.jobs_frozen()
-			|| (self.mode.dialect() == crate::bash::ids::Dialect::Bash
-				&& self.frames.iter().any(|f| f.kind == FrameKind::NoFork))
+		self.freeze() != Freeze::No
 	}
 }
 
@@ -2164,7 +2548,12 @@ impl Live {
 // and `QUIT`: 587 B (a 532-byte map, a 48-byte word list, the two names).
 // It is a field now (`Vproc::async_ignored`, one byte: Vproc 680 → 688 B),
 // and the bench (debug) measured 2,458 → 1,879 B per idle vproc.
-const _: () = assert!(size_of::<Vproc>() <= 688, "Vproc grew (idle vproc ≤ 2 KiB)");
+// The job list's record of what changed since the root's last sync
+// (`JobList::changed`, a `u32`, and `JobList::reaped`: JobTable 56 → 64 B,
+// Vproc 688 → 696 B) keeps the per-step store sync from comparing every job
+// a `lastpipe` loop keeps: the bench (release) measured 1,909 B per idle
+// vproc with it, 1,901 B without.
+const _: () = assert!(size_of::<Vproc>() <= 696, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 384, "ExecState grew (idle vproc ≤ 2 KiB)");

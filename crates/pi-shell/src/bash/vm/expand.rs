@@ -967,8 +967,10 @@ impl<'e, 'c> Expander<'e, 'c> {
 			Part::Quoted(b) => sink.lit(b, true),
 			Part::Param(p) => {
 				// bash's `extract_dollar_brace_string` re-parses what the
-				// `${ … }` holds even where it does not expand it.
-				if super::killed::reports_due(self.vp) && param_reparsed(unit, p) {
+				// `${ … }` holds even where it does not expand it. The
+				// `${ … }` test first: `reports_due` reads every job, which a
+				// plain `$name` beside thousands of kept jobs must not pay.
+				if param_reparsed(unit, p) && super::killed::reports_due(self.vp) {
 					super::killed::expanded(self.k, self.cx, self.vp, self.line);
 				}
 				self.param(unit, p, sink, inq || p.quoted, rhs)?;
