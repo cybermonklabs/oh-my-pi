@@ -3319,6 +3319,7 @@ pub fn load_root(
 		subshell: false,
 		comsub: super::proc::Comsub::No,
 		freeze: super::proc::Freeze::No,
+		stage_words: false,
 		bgp,
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);

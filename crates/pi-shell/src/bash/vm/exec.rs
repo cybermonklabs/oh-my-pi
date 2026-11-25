@@ -4495,6 +4495,20 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					&& vp.mode.dialect() == Dialect::Zsh
 					&& super::killed::in_place(k, cx, vp, op);
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				// bash forks a background pipeline's stages from the shell itself,
+				// so a stage that expands its words sees the shell's job list
+				// ([`super::proc::JobTable::stage_words`]). The job's vproc stands
+				// between them here: it holds copies (which it neither reports
+				// nor waits for) only to hand them to such a stage.
+				if info.kind == SpawnKind::Background
+					&& vp.mode.dialect() == Dialect::Bash
+					&& !vp.jobs.is_empty()
+					&& job_pipeline(unit, info.stages[0].entry)
+				{
+					let comsub = child.jobs.comsub;
+					child.jobs = inherited_jobs(vp, true);
+					child.jobs.comsub = comsub;
+				}
 				if in_place {
 					child.zsh_state().in_place = true;
 				}
@@ -4653,10 +4667,19 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						super::subshell_depth(vp) + stage_level(unit, stage.entry, false)
 					};
 					super::set_subshell_depth(&mut child, depth);
-					// bash keeps the job list for a `jobs` builtin run as a pipeline
-					// stage (`jobs -p | xargs kill`).
-					if !vp.jobs.is_empty() && runs_jobs(unit, stage.entry) {
+					// bash forks a simple command's stage first and expands its
+					// words in the child, which keeps the shell's job list until
+					// it runs its command (`echo "$(jobs)" | cat`, `jobs -p |
+					// xargs kill`; [`super::proc::JobTable::stage_words`]). Only
+					// a substitution in its words or redirections, or the `jobs`
+					// builtin itself, can read the list, so only such a stage gets
+					// a copy. zsh keeps it only for a `jobs` builtin.
+					let bash = vp.mode.dialect() == Dialect::Bash;
+					if !vp.jobs.is_empty()
+						&& (runs_jobs(unit, stage.entry) || bash && substituting_stage(unit, stage.entry))
+					{
 						child.jobs = inherited_jobs(vp, true);
+						child.jobs.stage_words = bash;
 					}
 					children.push(child.vpid);
 					k.spawned.push(Box::new(child));
@@ -4920,6 +4943,7 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 		subshell,
 		comsub: parent.comsub,
 		freeze: vp.freeze(),
+		stage_words: false,
 		bgp: parent.bgp.clone(),
 	}
 }
@@ -4989,17 +5013,50 @@ fn drop_finished_jobs(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, child: &mut V
 }
 
 /// Whether the pipeline stage starting at `entry` is a simple command
-/// named `jobs` (bash keeps the job list only for that builtin).
+/// named `jobs` (zsh keeps the job list only for that builtin); in bash
+/// also `command jobs`, which bash runs as the `jobs` builtin itself
+/// (`execute_simple_command` drops the `command` word), so it keeps the
+/// list (measured: `command jobs | cat` lists the running job).
 fn runs_jobs(unit: &Unit, entry: u32) -> bool {
 	let Some(op) = unit.ops.get(entry as usize) else {
 		return false;
 	};
+	let names_jobs = |text: &[u8]| {
+		text.strip_prefix(b"jobs").is_some_and(|rest| {
+			rest
+				.first()
+				.is_none_or(|c| matches!(c, b' ' | b'\t' | b'\n' | b';' | b'|'))
+		})
+	};
 	let text = node_text(unit, op.node);
-	text.strip_prefix(b"jobs").is_some_and(|rest| {
-		rest
-			.first()
-			.is_none_or(|c| matches!(c, b' ' | b'\t' | b'\n' | b';' | b'|'))
-	})
+	let text: &[u8] = &text;
+	names_jobs(text)
+		|| (unit.mode.dialect() == Dialect::Bash
+			&& text
+				.strip_prefix(b"command")
+				.and_then(|rest| rest.strip_prefix(b" ").or_else(|| rest.strip_prefix(b"\t")))
+				.is_some_and(|rest| names_jobs(rest.trim_ascii_start())))
+}
+
+/// Whether the pipeline stage starting at `entry` is a simple command whose
+/// words or redirections hold a substitution: past the redirections it
+/// starts with ([`stage_level`]'s shape), the substitutions' bodies sit
+/// before the command, each jumped over (`Lower::block`). bash expands the
+/// words in the stage's child, where such a substitution reads the list.
+fn substituting_stage(unit: &Unit, entry: u32) -> bool {
+	let mut pc = entry as usize;
+	if unit.ops.get(pc).is_some_and(|op| op.code == Opcode::Redir) {
+		pc += 1;
+	}
+	let mut bodies = 0;
+	while let Some(op) = unit.ops.get(pc)
+		&& op.code == Opcode::Jmp
+		&& op.a as usize > pc
+	{
+		pc = op.a as usize;
+		bodies += 1;
+	}
+	bodies > 0 && unit.ops.get(pc).is_some_and(|op| op.code == Opcode::Exec)
 }
 
 /// `coproc NAME cmd`: run the body at `entry` as a background child whose

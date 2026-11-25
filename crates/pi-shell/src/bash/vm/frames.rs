@@ -57,7 +57,7 @@ use crate::bash::{
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
 /// a variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 40;
+pub const FRAMES_VERSION: u32 = 41;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 

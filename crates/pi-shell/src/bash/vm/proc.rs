@@ -532,6 +532,15 @@ impl JobList {
 			kept
 		});
 	}
+
+	/// Remove every job (a pipeline stage dropping the list it expanded its
+	/// words with, [`JobTable::stage_words`]).
+	pub fn clear(&mut self) {
+		if !self.jobs.is_empty() {
+			self.note(0);
+			self.jobs.clear();
+		}
+	}
 }
 
 impl From<Vec<Job>> for JobList {
@@ -573,27 +582,36 @@ impl std::ops::DerefMut for JobList {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobTable {
 	/// Jobs in start order (ascending numbers).
-	pub list:     JobList,
+	pub list:        JobList,
 	/// The current job (`%+`, `%%`), by number.
-	pub current:  Option<u32>,
+	pub current:     Option<u32>,
 	/// The previous job (`%-`), by number.
-	pub previous: Option<u32>,
+	pub previous:    Option<u32>,
 	/// `SIGCHLD` trap runs owed: bash runs the trap once per child that
 	/// finished while it was set, however many finished at once.
-	pub chld:     u32,
+	pub chld:        u32,
 	/// A forked subshell (`( )`, `&`, a pipeline stage, `<( )`): bash runs
 	/// it without job control and with an empty job table. A command
 	/// substitution keeps both (it lists its parent's jobs).
-	pub subshell: bool,
+	pub subshell:    bool,
 	/// Where a command or process substitution leaves this shell: which
 	/// background jobs a signal killed it reports ([`super::killed`]).
-	pub comsub:   Comsub,
+	pub comsub:      Comsub,
 	/// The `jobs_list_frozen` this shell forked with ([`Freeze`]): bash's
 	/// fork (a subshell, a pipeline stage, a background job, a command or
 	/// process substitution) copies the value its shell had, and nothing in
 	/// the fork ends that freeze, so it holds for the fork's whole life
 	/// ([`Vproc::freeze`]). bash only.
-	pub freeze:   Freeze,
+	pub freeze:      Freeze,
+	/// A pipeline stage that is a simple command, forked with its shell's
+	/// job list: bash forks the stage first and expands its words in the
+	/// child, which keeps the list until it runs its command; a builtin
+	/// other than `jobs`, or a function, drops it there
+	/// (`execute_subshell_builtin_or_function`'s `without_job_control`), so
+	/// `echo "$(jobs)" | cat` lists the jobs and `kill %1 | cat` finds none.
+	/// Set only by bash's stage spawn; cleared at the stage's command
+	/// ([`super::command`]'s `dispatch`).
+	pub stage_words: bool,
 	/// The statuses of background jobs that left the table (bash's bgp
 	/// list: `delete_job`'s `bgp_add`), oldest first, at most [`BGP_MAX`]:
 	/// `wait PID` finds one once its job left the table, and a `wait` a trap
@@ -601,7 +619,7 @@ pub struct JobTable {
 	/// is in the store too ([`crate::bash::store::Key::BgPid`]). Boxed and
 	/// `None` while empty: one pointer per idle vproc.
 	#[expect(clippy::box_collection, reason = "one pointer per idle vproc; a `VecDeque` is four")]
-	pub bgp:      Option<Box<VecDeque<SavedStatus>>>,
+	pub bgp:         Option<Box<VecDeque<SavedStatus>>>,
 }
 
 /// How many statuses [`JobTable::bgp`] keeps: bash's `MAX_CHILD_MAX`, the

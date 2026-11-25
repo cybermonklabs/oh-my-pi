@@ -267,6 +267,14 @@ pub fn exec(
 			},
 			Stage::Redirect => {
 				if let Some(list) = cmd.redirs {
+					// bash looks a stage's command up before its redirections and
+					// drops the stage's job list there for a builtin other than
+					// `jobs`, or a function ([`stage_command_runs`]): a
+					// substitution in such a command's redirection sees no job,
+					// one in an external's does.
+					if vp.jobs.stage_words && stage_runs_in_shell(k, cx, vp) {
+						stage_command_runs(vp, false);
+					}
 					// Opens: `CmdExpanded` reads the clock after them.
 					k.clock_stale();
 					// Redirections do not see the command's temporary
@@ -1903,6 +1911,13 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 					return Some(Flow::Discard(1));
 				},
 			};
+			// `builtin …` is a builtin other than `jobs` to bash, which drops a
+			// stage's job list before it runs it, and so the command it names
+			// ([`stage_command_runs`]). `command …` is not: `command jobs | cat`
+			// lists the jobs (measured), so the command it names decides.
+			if matches!(resolved, Resolved::Intrinsic(IntrinsicId::Builtin)) {
+				stage_command_runs(vp, false);
+			}
 			let ExecState { argv, arrayref, .. } = st(vp);
 			match resolved {
 				Resolved::Intrinsic(IntrinsicId::Command)
@@ -2180,12 +2195,53 @@ fn prefix_var(value: &AssignValue) -> Var {
 	}
 }
 
+/// A pipeline stage's simple command expanded its words with its shell's
+/// job list ([`super::proc::JobTable::stage_words`]) and now runs (`jobs`:
+/// it is the `jobs` builtin): bash's child drops the list there
+/// (`execute_subshell_builtin_or_function`'s `without_job_control`), but for
+/// the `jobs` builtin (`kill_current_pipeline` instead). An external
+/// command replaces bash's child, so dropping the list there too is the
+/// same.
+fn stage_command_runs(vp: &mut Vproc, jobs: bool) {
+	if std::mem::take(&mut vp.jobs.stage_words) && !jobs {
+		let table = &mut vp.jobs;
+		table.list.clear();
+		table.current = None;
+		table.previous = None;
+		table.chld = 0;
+		table.bgp = None;
+	}
+}
+
+/// Whether the expanded command of `vp` is a function or a builtin other
+/// than `jobs` (`command` and `builtin` are builtins), as the lookup will
+/// find it: what bash runs in the stage's child itself, after
+/// `without_job_control`. A name it cannot tell without a probe (a path, a
+/// host's answer that needs one) is not.
+fn stage_runs_in_shell(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> bool {
+	let Some(name) = st(vp).argv.first().cloned() else {
+		return false;
+	};
+	if name.contains(&b'/') {
+		return false;
+	}
+	if matches!(state::record(cx.store, vp, Key::Func(BStr::new(&name))), Ok(Some(_))) {
+		return true;
+	}
+	let rctx = ResolveCtx { has_slash: false, via: Via::Plain };
+	matches!(
+		resolve(k, cx, vp, &name, exec::mode_of(vp), rctx),
+		Ok(Resolved::Intrinsic(id)) if id != IntrinsicId::Jobs
+	)
+}
+
 /// Start the resolved command.
 fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) -> Option<Flow> {
 	let target = st(vp).target.clone().unwrap_or(Target::NotFound);
 	// The command name, for diagnostics only.
 	let argv0 = |vp: &mut Vproc| st(vp).argv[0].clone();
 	let jobspec = st(vp).exec_as.is_none() && st(vp).argv[0].starts_with(b"%");
+	stage_command_runs(vp, matches!(target, Target::Intrinsic(IntrinsicId::Jobs)));
 	if !k.bangs.is_empty() {
 		let exec = st(vp).exec_as.is_some();
 		bang_dispatch(k, vp.vpid, &target, exec);
