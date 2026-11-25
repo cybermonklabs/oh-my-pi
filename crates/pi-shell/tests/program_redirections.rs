@@ -32,7 +32,7 @@ mod obash_support;
 use std::{fs, os::unix::process::CommandExt as _, path::Path};
 
 use obash_support::{obash, output};
-use pi_shell::testkit::{FakeHost, Fault, MemFs, golden, run_script};
+use pi_shell::testkit::{FakeHost, Fault, MemFs, golden, run_script, run_script_until};
 use serde_json::Value;
 
 /// The rows, as bash 5.3.20 and 5.2.21 ran them: `{id, file, script,
@@ -301,6 +301,9 @@ fn a_programs_fork_holds_across_a_restore() {
 		("( : ) 2>/err > /in${f:=x}; echo \"st=$? f=[$f]\"", "st=0 f=[]\n", 0),
 		("< /in${f:=}; echo \"st=$? f=[${f-unset}]\"", "st=0 f=[unset]\n", 0),
 	];
+	// The imaged run stops at the bound: a shell that runs again at each wake
+	// of the fork images without end, and fails here rather than running on.
+	const BOUND: u32 = 100;
 	let host = || {
 		let fs = MemFs::with_latency(5, 1.0, 1);
 		fs.add_file("/in", b"x\n", 0o644);
@@ -308,9 +311,11 @@ fn a_programs_fork_holds_across_a_restore() {
 	};
 	for &(src, want, fewest) in SCRIPTS {
 		let plain = run_script(host(), src.as_bytes(), &[], Fault::None);
-		let imaged = run_script(host(), src.as_bytes(), &[], Fault::Snapshot { every: 1 });
+		let imaged =
+			run_script_until(host(), src.as_bytes(), &[], Fault::Snapshot { every: 1 }, BOUND)
+				.unwrap_or_else(|n| panic!("`{src}`: {n} snapshots, the run not ended"));
 		assert!(
-			(fewest + 1..100).contains(&imaged.snapshots),
+			(fewest + 1..BOUND).contains(&imaged.snapshots),
 			"`{src}`: {} snapshots",
 			imaged.snapshots
 		);

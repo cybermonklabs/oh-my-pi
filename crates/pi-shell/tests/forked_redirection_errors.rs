@@ -66,7 +66,7 @@ use pi_shell::{
 		FakeHost, Fault, MemFs, Outcome, Rig,
 		fault::{comparable, skeleton_init},
 		run::{Stop, advance, advance_or_blocked, wait_runnable},
-		run_script,
+		run_script, run_script_until,
 	},
 };
 
@@ -4010,18 +4010,22 @@ fn a_subshells_own_var_is_its_forks_across_a_restore() {
 	const SRC: &[u8] =
 		b"( read -r l <&$v; echo \"in=[$v] l=$l\" ) {v}<<<x; echo \"out=[$v]\"; ( : ) \
 	                     {w}</in {x}</in {y}</in < /missing; echo \"w=[$w] x=[$x] y=[$y]\"";
+	// The imaged runs stop at the bound: a shell that runs again at each wake
+	// of the fork images without end, and fails here rather than running on.
+	const BOUND: u32 = 100;
 	let host = || {
 		let fs = MemFs::with_latency(5, 1.0, 1);
 		fs.add_file("/in", b"x\n", 0o644);
 		FakeHost::new().with_fs(fs)
 	};
 	let plain = run_script(host(), SRC, &[], Fault::None);
-	let imaged = run_script(host(), SRC, &[], Fault::Snapshot { every: 1 });
+	let imaged = run_script_until(host(), SRC, &[], Fault::Snapshot { every: 1 }, BOUND)
+		.unwrap_or_else(|n| panic!("{n} snapshots, the run not ended"));
 	// The shell runs again only once a fork it waits for ends: 13 images at
 	// a6a2639b, where the shell made these redirections itself; not one more
 	// at each wake of the fork's own opens.
-	assert!((11..100).contains(&imaged.snapshots), "{} snapshots", imaged.snapshots);
-	let mid_list = imaged_at_every_other_wait(host(), SRC);
+	assert!((11..BOUND).contains(&imaged.snapshots), "{} snapshots", imaged.snapshots);
+	let mid_list = imaged_at_every_other_wait(host(), SRC, BOUND);
 	assert!(mid_list.snapshots > 0, "no snapshot mid-list");
 	let want = (0, "in=[10] l=x\nout=[]\nw=[] x=[] y=[]\n".to_owned());
 	// Each run's difference is reported, not only the first one's.
@@ -4041,12 +4045,14 @@ fn a_subshells_own_var_is_its_forks_across_a_restore() {
 /// Run `src` as a `-c` script, imaged and restored at every other wait of
 /// the shell and waiting at the others: unlike `Rig::run`, which runs on to
 /// the op's end after each wait it images, an op that waits at several opens
-/// is imaged between them.
-fn imaged_at_every_other_wait(host: FakeHost, src: &[u8]) -> Outcome {
+/// is imaged between them. It fails once `bound` images were taken and the
+/// script has not ended.
+fn imaged_at_every_other_wait(host: FakeHost, src: &[u8], bound: u32) -> Outcome {
 	let mut rig = Rig::new(host, skeleton_init(&[]));
 	let id = rig.shell().submit(Script::command(src.to_vec()));
 	let mut image = true;
 	let status = loop {
+		assert!(rig.snapshots < bound, "{} snapshots mid-list, the run not ended", rig.snapshots);
 		let (shell, host, store) = rig.parts();
 		match advance_or_blocked(shell, host, store, id, Budget::default()) {
 			Stop::Done(status) => break status,

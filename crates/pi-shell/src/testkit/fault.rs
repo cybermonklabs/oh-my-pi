@@ -132,6 +132,17 @@ impl Rig {
 
 	/// Run `script` to completion under `fault`; its status.
 	pub fn run(&mut self, script: Script, fault: Fault) -> i32 {
+		self
+			.run_until(script, fault, u32::MAX)
+			.expect("a run with no snapshot cap runs to its end")
+	}
+
+	/// [`Self::run`], stopped once `max_snapshots` snapshots are taken:
+	/// `None` when the script has not ended by then. A run that would image
+	/// the shell without end (a shell that runs again at every wake, its
+	/// pending work dropped at each image) fails at the cap instead of
+	/// running on.
+	pub fn run_until(&mut self, script: Script, fault: Fault, max_snapshots: u32) -> Option<i32> {
 		if let Fault::Mixed { seed, .. } | Fault::RandomPause { seed, .. } = fault {
 			self.coin = Rng::new(seed);
 		}
@@ -143,6 +154,9 @@ impl Rig {
 			!matches!(fault, Fault::None | Fault::PauseResume { .. } | Fault::RandomPause { .. });
 		let mut snap_blocked = snapshots;
 		loop {
+			if self.snapshots >= max_snapshots {
+				return None;
+			}
 			let shell = self
 				.shell
 				.as_mut()
@@ -154,7 +168,7 @@ impl Rig {
 			};
 			snap_blocked = snapshots && !snap_blocked;
 			match stop {
-				Stop::Done(status) => return status,
+				Stop::Done(status) => return Some(status),
 				Stop::Blocked => self.snapshot(),
 				Stop::Paused => shell.control().resume(),
 				Stop::Yield => match fault {
@@ -302,8 +316,24 @@ pub fn skeleton_init(args: &[&str]) -> ShellInit {
 /// Panics when the case leaks vprocs, tasks or externals
 /// ([`FakeHost::assert_no_leaks`]).
 pub fn run_script(host: FakeHost, src: &[u8], args: &[&str], fault: Fault) -> Outcome {
+	run_script_until(host, src, args, fault, u32::MAX)
+		.expect("a run with no snapshot cap runs to its end")
+}
+
+/// [`run_script`], stopped once `max_snapshots` snapshots are taken
+/// ([`Rig::run_until`]): `Err` with the snapshots taken when the script had
+/// not ended by then, and no leak check (the shell is still running).
+pub fn run_script_until(
+	host: FakeHost,
+	src: &[u8],
+	args: &[&str],
+	fault: Fault,
+	max_snapshots: u32,
+) -> Result<Outcome, u32> {
 	let mut rig = Rig::new(host, skeleton_init(args));
-	let status = rig.run(Script::command(src.to_vec()), fault);
+	let Some(status) = rig.run_until(Script::command(src.to_vec()), fault, max_snapshots) else {
+		return Err(rig.snapshots);
+	};
 	let outcome = Outcome {
 		status,
 		stdout: rig.host.stdout.bytes(),
@@ -316,7 +346,7 @@ pub fn run_script(host: FakeHost, src: &[u8], args: &[&str], fault: Fault) -> Ou
 	// the check fails; an idle shell holds no task or external.
 	let (shell, host, store) = rig.parts();
 	host.assert_no_leaks(shell, store);
-	outcome
+	Ok(outcome)
 }
 
 /// Events with what legitimately differs between fault plans removed.

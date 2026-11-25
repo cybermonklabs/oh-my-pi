@@ -282,6 +282,42 @@ fn a_break_in_a_programs_redirection_stays_in_its_child() {
 	]);
 }
 
+/// `exec` makes its redirections in the shell and looks its name up after
+/// them (`exec_builtin` goes back to `Stage::Lookup`): a `break` or
+/// `continue` in a `${ }` there waits, and when the program is not found
+/// (`execfail` keeps the shell) the loop takes it, as in bash. Each failed
+/// `exec` reports on one line; the words are not checked, because the
+/// release's differ from bash's (`exec: nosuch: not found` for `nosuch: not
+/// found`, `./nosuch` for the absolute path) and are another change's.
+#[cfg(unix)]
+#[test]
+fn a_break_in_a_failed_execs_redirection_leaves_the_loop() {
+	const FORMS: &[(&str, &str, usize)] = &[
+		("exec nosuch 3>e${| break; }", "out\n", 1),
+		("exec ./nosuch 3>e${| break; }", "out\n", 1),
+		("exec nosuch 3>e${| continue; }", "out\n", 2),
+		("command exec nosuch 3>e${| break; }", "out\n", 1),
+		("exec -a x nosuch 3>e${| break; }", "out\n", 1),
+	];
+	let wrong: Vec<String> = FORMS
+		.iter()
+		.filter_map(|&(cmd, want, reports)| {
+			let src =
+				format!("shopt -s execfail; for i in 1 2; do {cmd}; echo \"in $?\"; done; echo out");
+			let (out, err, status) = run("bash", &src);
+			(out != want || status != 0 || err.lines().count() != reports)
+				.then(|| format!("`{src}`: stdout {out:?}, stderr {err:?}, status {status}"))
+		})
+		.collect();
+	assert!(
+		wrong.is_empty(),
+		"{} of {} forms differ:\n{}",
+		wrong.len(),
+		FORMS.len(),
+		wrong.join("\n")
+	);
+}
+
 /// A `break` or `continue` in a `${ }` of a `( … )`'s own redirection sees
 /// no loop: bash expands those redirections in the subshell, where
 /// `loop_level` is 0, so the builtin complains (outside posix mode), does

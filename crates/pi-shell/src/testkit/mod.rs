@@ -23,7 +23,7 @@ pub mod run;
 
 pub use crate::testkit::{
 	conformance::store_conformance,
-	fault::{Fault, Outcome, Rig, run_script},
+	fault::{Fault, Outcome, Rig, run_script, run_script_until},
 	host::{
 		Capture, Countdown, FakeHost, NativeFn, RestoreFn, SpawnFn, SpawnFutureFn, ToolFn, VerdictFn,
 	},
