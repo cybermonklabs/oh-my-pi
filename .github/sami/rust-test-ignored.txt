@@ -13,5 +13,6 @@
 //crates/pi-vcs:pi-vcs_integration_tests_tests/worktree_add_failure_test an_add_into_an_empty_directory_someone_else_owns_succeeds  needs an empty directory another user owns that the test user can write: the job makes one as root (PI_VCS_TEST_FOREIGN_EMPTY_DIR)
 //crates/pi-vcs:pi-vcs_test git::mutate::tests::reclaim_refuses_a_tree_holding_a_mount_point  needs a mount point inside a directory the test user owns: the job mounts a tmpfs there as root (PI_VCS_TEST_MOUNT_POINT)
 //crates/pi-vcs:pi-vcs_test git::mutate::tests::reclaim_refuses_a_tree_holding_a_mounted_file  needs a file bind-mounted inside a directory the test user owns: the job mounts one as root (PI_VCS_TEST_MOUNTED_FILE)
+sdk/rust/omp-rpc:test:smoke smoke_get_tree_deep_chain  runs the repository's tree RPC fixture (bun packages/coding-agent/test/fixtures/tree-rpc-agent.ts, with a mock model) over a session of 100,000 chained entries, which needs bun, the dependencies and the native addon
 sdk/rust/omp-rpc:test:smoke smoke_real_server  runs the repository's omp server (bun packages/coding-agent/src/cli.ts --mode rpc), which needs bun, the dependencies and the native addon
 sdk/rust/omp-rpc:test:smoke smoke_scripted_model  runs the omp server against the scripted model server (packages/coding-agent/test/rpc-wire/fake-openai-server.ts)
