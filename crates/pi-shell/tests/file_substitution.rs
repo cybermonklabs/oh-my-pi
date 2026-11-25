@@ -318,6 +318,27 @@ fn a_break_in_a_failed_execs_redirection_leaves_the_loop() {
 	);
 }
 
+/// With no loop in reach, a `break` in a `${ }` of `exec`'s redirection only
+/// warns, and the `exec` goes on: the program is not found, the shell ends
+/// with 127 and nothing after it runs, as in bash. This pins `break_`'s own
+/// answer to a `break` with no loop in reach (its `bash_loop_count(..) == 0`
+/// arm, builtins/flow.rs:431 at a3f20606, from the release 2de01417): it
+/// warns, succeeds and moves no control. Before it (9058ab9d), `break_loops`
+/// left the command, so the `exec` was skipped and `after 0` printed. The
+/// words of the two reports are not checked: obash names the builtin
+/// (`exec: nosuch: not found`) where bash 5.3 drops it after a substitution
+/// in the redirection (`nosuch: not found`, its global `this_command_name`),
+/// a known difference that no member changes.
+#[cfg(unix)]
+#[test]
+fn a_break_with_no_loop_in_execs_redirection_lets_the_exec_run() {
+	let (out, err, status) = run("bash", "exec nosuch 3>e${| break; }\necho \"after $?\"");
+	assert!(
+		out.is_empty() && status == 127 && err.lines().count() == 2,
+		"stdout {out:?}, stderr {err:?}, status {status}"
+	);
+}
+
 /// A `break` or `continue` in a `${ }` of a `( … )`'s own redirection sees
 /// no loop: bash expands those redirections in the subshell, where
 /// `loop_level` is 0, so the builtin complains (outside posix mode), does
@@ -825,9 +846,11 @@ fn a_loop_takes_a_break_from_its_own_redirection() {
 /// A trap that a command in a `${ }` sets off runs before the next command
 /// there, as bash runs a pending trap as each command ends, so a `break`
 /// after it does not leave the trap with nothing to run: in a command's
-/// words, and in a group's, `if`'s, `case`'s or loop's own redirection. In
-/// a program's or a `( … )`'s own redirection, which bash expands in the
-/// forked child, the trap waits for that child.
+/// words, in a builtin's, function's or `exec`'s redirection, and in a
+/// group's, `if`'s, `case`'s or loop's own redirection. In a program's or a
+/// `( … )`'s own redirection, which bash expands in the forked child, the
+/// shell's trap waits for that child; a trap of that child's own runs there
+/// at once.
 #[cfg(unix)]
 #[test]
 fn a_trap_runs_before_a_break_in_a_substitution() {
@@ -880,9 +903,8 @@ fn a_trap_runs_before_a_break_in_a_substitution() {
 			0,
 		),
 		// A program's redirection: bash expands it in the child, and the trap
-		// waits for the child (a builtin's, expanded in the shell, runs it at
-		// once: not yet here, as the shell holds a trap back while any simple
-		// command's redirections are made).
+		// waits for the child. So does a name not found's, and a null
+		// command's that redirects standard input, which bash forks for.
 		(
 			"trap \"echo trapped\" USR1; for i in 1; do /bin/echo e 2> ${| kill -USR1 $$; \
 			 REPLY=/dev/null; break; }; echo in; done; echo out",
@@ -891,9 +913,143 @@ fn a_trap_runs_before_a_break_in_a_substitution() {
 			0,
 		),
 		(
+			"trap \"echo trapped\" USR1; /bin/echo e 2> ${| kill -USR1 $$; REPLY=/dev/null; echo \
+			 after; }; echo out",
+			"after\ne\ntrapped\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; nosuch 2> ${| kill -USR1 $$; REPLY=/dev/null; echo after; \
+			 }; echo \"out $?\"",
+			"after\ntrapped\nout 127\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; < ${| kill -USR1 $$; REPLY=/dev/null; echo after; }; echo \
+			 out",
+			"after\ntrapped\nout\n",
+			"",
+			0,
+		),
+		// A builtin's or function's redirection, `exec`'s, and a null
+		// command's that bash makes in the shell: bash looks the name up, makes
+		// them in the shell and runs the trap at once, before the `break`.
+		(
+			"trap \"echo trapped\" USR1; for i in 1; do echo e 2> ${| kill -USR1 $$; \
+			 REPLY=/dev/null; break; }; echo in; done; echo out",
+			"trapped\ne\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; for i in 1 2; do echo e$i 2> ${| kill -USR1 $$; \
+			 REPLY=/dev/null; continue; }; echo in; done; echo out",
+			"trapped\ne1\ntrapped\ne2\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; echo e 2> ${| kill -USR1 $$; REPLY=/dev/null; echo after; \
+			 }; echo out",
+			"trapped\nafter\ne\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; for i in 1; do command echo e 2> ${| kill -USR1 $$; \
+			 REPLY=/dev/null; break; }; echo in; done; echo out",
+			"trapped\ne\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; f() { echo f; }; for i in 1; do f 2> ${| kill -USR1 $$; \
+			 REPLY=/dev/null; break; }; echo in; done; echo out",
+			"trapped\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; f() { echo f; }; f 2> ${| kill -USR1 $$; REPLY=/dev/null; \
+			 echo after; }; echo out",
+			"trapped\nafter\nf\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; exec 2> ${| kill -USR1 $$; REPLY=/dev/null; echo after; }; \
+			 echo out",
+			"trapped\nafter\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; 2> ${| kill -USR1 $$; REPLY=/dev/null; echo after; }; echo \
+			 out",
+			"trapped\nafter\nout\n",
+			"",
+			0,
+		),
+		// A trap of the process that makes a program's or a `( … )`'s
+		// redirections, or of a job's or pipeline stage's own process, runs
+		// there at once, as in bash's child; a `kill $$` there, or a
+		// builtin's in a pipeline stage, sets off the shell's trap, which
+		// waits for that child or the pipeline.
+		(
+			"/bin/echo e 2> ${| trap \"echo T\" USR1; kill -USR1 $BASHPID; REPLY=/dev/null; }; echo \
+			 \"out $?\"",
+			"T\ne\nout 0\n",
+			"",
+			0,
+		),
+		(
+			"/bin/echo e 2> ${| trap \"echo T\" USR1; kill -USR1 $BASHPID; REPLY=/dev/null; } & wait \
+			 $!; echo \"out $?\"",
+			"T\ne\nout 0\n",
+			"",
+			0,
+		),
+		(
+			"echo e 2> ${| trap \"echo T\" USR1; kill -USR1 $BASHPID; REPLY=/dev/null; } & wait $!; \
+			 echo \"out $?\"",
+			"T\ne\nout 0\n",
+			"",
+			0,
+		),
+		(
+			"{ trap \"echo T\" USR1; echo e 2> ${| kill -USR1 $BASHPID; REPLY=/dev/null; }; echo in; \
+			 } | cat; echo out",
+			"T\ne\nin\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; echo e 2> ${| kill -USR1 $$; REPLY=/dev/null; } | cat; echo \
+			 out",
+			"e\ntrapped\nout\n",
+			"",
+			0,
+		),
+		(
 			"trap \"echo trapped\" USR1; ( echo s ) 2> ${| kill -USR1 $$; REPLY=/dev/null; }; echo \
 			 out",
 			"s\ntrapped\nout\n",
+			"",
+			0,
+		),
+		(
+			"trap \"echo trapped\" USR1; ( echo s ) 2> ${| trap \"echo T\" USR1; kill -USR1 \
+			 $BASHPID; REPLY=/dev/null; }; echo out",
+			"T\ns\nout\n",
+			"",
+			0,
+		),
+		(
+			"( echo s ) 2> ${| trap \"echo T\" USR1; kill -USR1 $BASHPID; echo after; \
+			 REPLY=/dev/null; }; echo out",
+			"T\nafter\ns\nout\n",
 			"",
 			0,
 		),
