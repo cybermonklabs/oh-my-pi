@@ -5,58 +5,24 @@
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { parseHTML } from "@oh-my-pi/pi-utils/dom";
 import { stringifyJsonIteratively } from "@oh-my-pi/pi-utils/json";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import { act } from "react";
-import { createRoot, type Root } from "react-dom/client";
 import { clientBundlePlugins } from "../src/client-bundle";
 import { JsonBlock } from "../src/client/ui/JsonBlock";
 import { nestedChain, nestedChainJson } from "../../ai/test/helpers/deep-nesting";
+import { mountDomRoot, tearDownDomRoot } from "./helpers/dom-root";
 
-const originalGlobals = new Map<string, PropertyDescriptor | undefined>();
-let root: Root | null = null;
-
-function installGlobal(name: string, value: unknown): void {
-	originalGlobals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
-	Object.defineProperty(globalThis, name, { configurable: true, value, writable: true });
-}
-
-afterEach(async () => {
-	const activeRoot = root;
-	if (activeRoot) {
-		await act(async () => {
-			activeRoot.unmount();
-		});
-		root = null;
-	}
-	for (const [name, descriptor] of originalGlobals) {
-		if (descriptor) Object.defineProperty(globalThis, name, descriptor);
-		else Reflect.deleteProperty(globalThis, name);
-	}
-	originalGlobals.clear();
-});
+afterEach(tearDownDomRoot);
 
 /** The text of the `<code>` a JsonBlock of `data` renders. */
 async function renderedJson(data: unknown): Promise<string | null | undefined> {
-	const domWindow = parseHTML('<html><body><div id="root"></div></body></html>').window;
-	// JsonBlock clears its "Copied" timer through `window` when it unmounts.
-	Object.assign(domWindow, { setTimeout, clearTimeout });
-	installGlobal("window", domWindow);
-	installGlobal("document", domWindow.document);
-	installGlobal("navigator", domWindow.navigator);
-	installGlobal("Node", domWindow.Node);
-	installGlobal("Element", domWindow.Element);
-	installGlobal("HTMLElement", domWindow.HTMLElement);
-	installGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-	const container = domWindow.document.getElementById("root");
-	if (!container) throw new Error("Expected test root");
-	root = createRoot(container as unknown as Element);
+	const root = await mountDomRoot();
 	await act(async () => {
-		root?.render(<JsonBlock data={data} title="Raw entry" />);
+		root.render(<JsonBlock data={data} title="Raw entry" />);
 	});
-	return container.querySelector("code")?.textContent;
+	return document.querySelector("code")?.textContent;
 }
 
 describe("JsonBlock", () => {
