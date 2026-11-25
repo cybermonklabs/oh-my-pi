@@ -1,5 +1,5 @@
 /**
- * INFRA-3530 (R3, check c-no-join): a full rewrite of a long session whose publish cannot be confirmed (the
+ * R3, check c-no-join: a full rewrite of a long session whose publish cannot be confirmed (the
  * backend applied the streamed write, then its answer was lost, as a dropped connection loses it) checks
  * whether the store holds the rewrite before it reports the write (FullBody.isStored in session-body.ts). No
  * step of a running session builds the whole transcript in memory as one value, so that check reads the

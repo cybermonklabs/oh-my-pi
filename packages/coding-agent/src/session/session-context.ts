@@ -284,8 +284,8 @@ export function isTranscriptEntry(entry: SessionEntry): entry is TranscriptEntry
  * True when `message` is a not-executed synthetic tool result that `branch`
  * cannot pair: no assistant turn there emitted its tool call.
  *
- * This is the shape that got every later turn of a session refused
- * (INFRA-1191). A refused turn is not stored, but the placeholder results its
+ * This is the shape that got every later turn of a session refused.
+ * A refused turn is not stored, but the placeholder results its
  * started calls produced were, so the stored result had no `tool_use` to pair
  * with and each later request replayed it as a bare user message.
  *
@@ -883,8 +883,8 @@ export function buildSessionContext(
 	// path. A refused turn was dropped at persist time while the placeholders its
 	// calls produced were stored, so every later request replayed them as bare
 	// user messages — and the provider's refusal text used to be quoted inside
-	// them, which made the classifier refuse the next turn too, forever
-	// (INFRA-1191). Nothing below re-pairs such a result: the dangling-call pass
+	// them, which made the classifier refuse the next turn too, forever.
+	// Nothing below re-pairs such a result: the dangling-call pass
 	// above strips unanswered calls, never unanchored results.
 	//
 	// The predicate is the pairing itself, so it cannot miss a case or invent

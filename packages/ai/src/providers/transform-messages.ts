@@ -1581,7 +1581,7 @@ export function transformMessages<TApi extends Api>(
 				// placeholder carries no tool output: no `tool.execute()` ran, and its
 				// text is a fixed sentence (historically the provider's own error text,
 				// which is how a refused turn got every later turn of the session
-				// refused — INFRA-1191). Replaying it as a `<stale-tool-result>` user
+				// refused). Replaying it as a `<stale-tool-result>` user
 				// note re-sends that text on every request and tells the model nothing.
 				// Drop it. This is the one place that catches a live in-memory orphan
 				// too: a long-lived process that never reloads never rebuilds its

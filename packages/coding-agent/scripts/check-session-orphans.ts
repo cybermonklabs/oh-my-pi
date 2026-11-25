@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 /**
  * Report whether a stored session still replays an orphaned synthetic tool
- * result — the shape that got every later turn of a session refused
- * (INFRA-1191): a not-executed placeholder whose `tool_use` is in no stored
+ * result — the shape that got every later turn of a session refused: a
+ * not-executed placeholder whose `tool_use` is in no stored
  * assistant turn, which the provider request then carried as a bare user
  * message.
  *

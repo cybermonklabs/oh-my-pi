@@ -232,7 +232,7 @@ describe("formatTaskResultSummary", () => {
 		// A child that cooperates with the budget notice and yields normally
 		// before the force-stop settles as an ordinary "completed" result
 		// (aborted: false). Without this, the parent has no signal that budget
-		// was crossed at all (dispatch://INFRA-28).
+		// was crossed at all.
 		const result = { ...settledResult("final report"), budgetCrossed: true, softRequestBudget: 90 };
 		const summary = formatTaskResultSummary(result, { totalDurationMs: 5 });
 

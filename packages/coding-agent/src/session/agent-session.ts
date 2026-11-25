@@ -5389,7 +5389,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// A classifier refusal and an empty error turn are dropped above, but the
 		// synthetic results that turn's started calls produced arrive afterwards
 		// and used to be stored anyway — an orphan every later request replayed
-		// as a bare user message (INFRA-1191). The refused turn itself must stay
+		// as a bare user message. The refused turn itself must stay
 		// unstored (storing it would put the refusal and its arguments back into
 		// history, which is what the drop exists to prevent), so its result goes
 		// with it. `buildSessionContext` applies the same predicate on load,
