@@ -750,11 +750,11 @@ fn forks(dialect: Dialect) -> Vec<Row> {
 	}
 	// A `jobs` element with a substitution word keeps the job list (one
 	// level only: bash 5.3.20 also lists the job the first iteration
-	// killed).
+	// killed). `tr -d ' '` takes the count as it is: macOS's wc pads it.
 	if dialect == Dialect::Bash {
 		rows.push((
 			"fork/x0/element-jobs-cmdsub-word".to_owned(),
-			"sleep 5 & jobs -p $(:) | wc -l; kill $!; echo top:$?".to_owned(),
+			"sleep 5 & jobs -p $(:) | wc -l | tr -d ' '; kill $!; echo top:$?".to_owned(),
 		));
 	}
 	rows.push((
