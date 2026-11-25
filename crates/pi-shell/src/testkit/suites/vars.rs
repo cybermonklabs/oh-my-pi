@@ -31,11 +31,14 @@ const RERUN_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 ///
 /// On a timeout this writes the test's name and the bound to stderr, past
 /// libtest's output capture, and exits with 101, libtest's failure code. It
-/// does not panic: a panic fails the test but cannot stop the worker
-/// thread, which keeps allocating until the binary aborts at its memory
-/// limit with no test named. Ending the process also ends the other tests
-/// of the binary, which then read as not run; the abort it replaces lost
-/// them too, and unnamed.
+/// does not panic: a panic fails the test and libtest names it, but the
+/// worker thread cannot be stopped and keeps allocating, so a binary that
+/// runs on after the hang aborts at its memory limit before libtest prints
+/// its result line, and the run reads as killed rather than as a failure.
+/// Ending the process at 60 s gives the 101 instead. It also ends the other
+/// tests of the binary, which then read as not run, and it names only the
+/// first test to reach the bound; the abort it replaces lost the other
+/// tests too.
 fn bounded(src: &str, f: fn(&str) -> (String, String)) -> (String, String) {
 	let src = src.to_owned();
 	let (tx, rx) = std::sync::mpsc::channel();
@@ -80,8 +83,8 @@ fn run_events_off_bounded(src: &str) -> (String, String) {
 /// slow: a run made two seconds slower than it needs still passes it, so
 /// tightening [`RERUN_BOUND`] toward the scripts' real time would be caught
 /// here. The script has no `$(…)` and so never runs again: under a plant
-/// whose replay never ends it adds no runaway of its own, which would push
-/// the binary over its memory limit before the bound named the hung test.
+/// whose replay never ends it adds no runaway of its own, so the test the
+/// bound ends is the one whose replay hangs.
 #[test]
 fn a_harmless_delay_passes_the_rerun_bound() {
 	let (out, err) = bounded("x=1; declare x+=1; echo \"$x\"", |src| {
