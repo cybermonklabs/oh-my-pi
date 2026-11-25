@@ -41,13 +41,15 @@ zpty -d x",
 	);
 }
 
-/// `-b`: the read takes what is there (cat has not answered yet).
+/// `-b`: a line read takes what is there and does not wait for more. Here
+/// nothing is there: the test writes nothing, and the command prints only
+/// after 5 s. A read that waited would get `hi` after 5 s; so would a shell
+/// that took 5 s from starting the command to its read.
 #[test]
 fn zsh_mod_zpty_non_blocking_read_takes_what_is_there() {
 	check(
 		"zmodload zsh/zpty
-zpty -b x cat
-zpty -w x hello
+zpty -b x 'sleep 5; print hi'
 zpty -r x line
 print -r -- st=$? ${(q+)line}
 zpty -d x",

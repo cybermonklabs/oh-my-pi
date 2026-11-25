@@ -30,6 +30,5 @@
 //crates/pi-shell:pi-shell_integration_tests_tests/zsh_jobs_pty_test a_suspended_pipeline_is_one_job  flaky: typing before the prompt is drawn; removed in Cut11 by #53/#237
 //crates/pi-shell:pi-shell_integration_tests_tests/zsh_jobs_pty_test bg_then_fg_then_ctrl_c  flaky: typing before the shell wrote its line; #53's zle_sync and #237 remove these in Cut11
 //crates/pi-shell:pi-shell_integration_tests_tests/zsh_jobs_pty_test exit_with_a_stopped_job_warns_once  flaky: typing before the prompt is drawn; removed in Cut11 by #53/#237
-//crates/pi-shell:pi-shell_integration_tests_tests/zsh_mod_zpty_test zsh_mod_zpty_non_blocking_read_takes_what_is_there  flaky: the non-blocking zpty read races the writer (sami-checks run 45305306657: passed as the runner's user, failed as root)
 //crates/pi-shell:pi-shell_integration_tests_tests/zsh_zcompile_test zcompile_digest_and_listing_match_zsh  the runner's zsh refuses the .zwc obash writes (can't open file, invalid zwc file), as in sami-checks' set rows; no fix yet
 //crates/pi-shell:pi-shell_integration_tests_tests/zsh_zcompile_test zcompile_lists_dumps_zsh_wrote  the runner's zsh refuses the .zwc obash writes (can't open file, invalid zwc file), as in sami-checks' set rows; no fix yet
