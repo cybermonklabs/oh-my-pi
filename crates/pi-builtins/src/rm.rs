@@ -2373,17 +2373,19 @@ mod tests {
 		let (mut host, capture) = Host::for_test(Rm::NAME, "", cwd.path());
 		let rm = Rm::try_parse_from(["rm", "-rf", "tree"]).unwrap();
 
-		// Four descriptors are left above the highest one open now.
-		let highest = std::fs::read_dir("/proc/self/fd")
-			.unwrap()
-			.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<libc::rlim_t>().ok())
-			.max()
-			.unwrap();
+		// Five descriptors are left below the limit, wherever they are: it is
+		// set just above the fifth descriptor not open now. A free one below a
+		// descriptor the process inherited counts among the five, so the walk
+		// gets five whatever descriptors the harness left open.
+		// SAFETY: F_GETFD only reads a descriptor's flags, and fails (EBADF)
+		// for one that is not open.
+		let open = |fd: libc::c_int| unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+		let fifth_free = (0..libc::c_int::MAX).filter(|&fd| !open(fd)).nth(4).unwrap();
 		let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
 		// SAFETY: getrlimit and setrlimit only read and write `limit`.
 		assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
 		let saved = limit.rlim_cur;
-		limit.rlim_cur = highest + 1 + 4;
+		limit.rlim_cur = fifth_free as libc::rlim_t + 1;
 		// SAFETY: as above.
 		assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
 		let code = rm.run(&mut host);
