@@ -5,7 +5,6 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import {
 	MemorySessionStorage,
 	type SessionStorage,
-	SessionWriteConflictError,
 	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
@@ -101,12 +100,12 @@ describe("a superseded atomic publish", () => {
 	});
 });
 
-describe("a superseded atomic publish on SQL storage (SQLite)", () => {
-	// Regressed: another store's full write of the same bytes cuts off the read-back of a publish that landed
-	// while a synchronous rewrite (which the store refused) superseded it, and the manager records nothing:
-	// its next full write expects the size from before the publish, conflicts with its own body, and reads
-	// the session back once more before it can save.
-	it("records the size that landed when another store's rewrite of the same bytes races its read-back", async () => {
+describe("an atomic publish an entry races on SQL storage (SQLite)", () => {
+	// Regressed: an entry recorded while a rewrite's publish is in flight took a synchronous rewrite that the store
+	// refused against the body the publish had already put in its index, reported as a failure; that refused
+	// rewrite superseded the publish, which landed and then had to be read back whole, a read-back another store's
+	// full write of the same bytes could cut off.
+	it("lands the rewrite without reading it back and appends the entry after it, once", async () => {
 		using dir = TempDir.createSync("@omp-superseded-sql-");
 		const dsn = `sqlite://${dir.join("sessions.db")}`;
 		const clients = [new SQL(dsn), new SQL(dsn)];
@@ -124,7 +123,7 @@ describe("a superseded atomic publish on SQL storage (SQLite)", () => {
 			const publish = storage.writeLinesAtomic.bind(storage);
 			const readChunks = storage.readChunks.bind(storage);
 			const store: SessionStorage = storage;
-			// The store commits the next atomic publish, and the manager moves on before it hears back.
+			// The store commits the next atomic publish, and the manager hears back only once the test lets it.
 			const parked = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
 			let parkNext = true;
@@ -135,7 +134,7 @@ describe("a superseded atomic publish on SQL storage (SQLite)", () => {
 				parked.resolve();
 				await release.promise;
 			};
-			// Another store writes the same bytes again right after the first chunk of the read-back.
+			// Another store writes the same bytes again right after the first chunk of any read-back.
 			let readingBack = false;
 			let raced = false;
 			store.readChunks = (filePath, fromByte) =>
@@ -151,24 +150,42 @@ describe("a superseded atomic publish on SQL storage (SQLite)", () => {
 					}
 				})();
 
-			// A rewrite that prunes an entry, and a synchronous rewrite while its publish is in flight, which
-			// the store refuses: the file changed size under the size the manager last recorded.
+			// A rewrite that prunes an entry, and an entry recorded and flushed while its publish is in flight.
 			const pruned = manager.getEntries().find(entry => entry.type === "custom");
 			if (pruned?.type !== "custom") throw new Error("Expected a custom entry");
 			pruned.data = "pruned";
 			const rewrite = manager.rewriteEntries();
 			await parked.promise;
 			manager.appendCustomEntry("during_rewrite", { data: "x" });
-			expect(() => manager.flushSync()).toThrow(SessionWriteConflictError);
+			let flushSyncError: string | undefined;
+			try {
+				manager.flushSync();
+			} catch (err) {
+				flushSyncError = String(err);
+			}
 			readingBack = true;
 			release.resolve();
 			await rewrite;
+			await manager.flush();
 
-			expect(raced).toBe(true);
 			await other.refresh();
 			const stored = await other.readText(sessionFile);
-			expect(stored).not.toContain("during_rewrite");
-			expect(manager.captureState().expectedDiskSize).toBe(Buffer.byteLength(stored, "utf8"));
+			expect({
+				flushSyncError,
+				readBack: raced,
+				failure: manager.getPersistenceFailure()?.message,
+				pruned: stored.includes('"data":"pruned"'),
+				// One copy: the type splits the transcript in two.
+				entryCopies: stored.split('"customType":"during_rewrite"').length,
+				expectsWhatIsStored: manager.captureState().expectedDiskSize === Buffer.byteLength(stored, "utf8"),
+			}).toEqual({
+				flushSyncError: undefined,
+				readBack: false,
+				failure: undefined,
+				pruned: true,
+				entryCopies: 2,
+				expectsWhatIsStored: true,
+			});
 			await manager.close();
 		} finally {
 			for (const client of clients) await client.end();

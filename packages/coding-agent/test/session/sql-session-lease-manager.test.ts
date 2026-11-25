@@ -23,7 +23,11 @@ import {
 	SessionWriteConflictError,
 	setDefaultSessionStorage,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import type { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import type {
+	SqlSessionStorage,
+	SqlSessionStorageClient,
+	SqlSessionStorageTransaction,
+} from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import {
@@ -34,6 +38,7 @@ import {
 	LeaseProcess,
 	openLeaseDb,
 	ROW_LEASE_BACKENDS,
+	reserveWrapped,
 	TcpProxy,
 	transcript,
 	until,
@@ -127,6 +132,47 @@ function retriesOfAStaleSize(writes: readonly FullWrite[]): FullWrite[] {
 		const before = writes[index - 1];
 		return before?.refusedAt !== undefined && write.expectedSize !== before.refusedAt;
 	});
+}
+
+/**
+ * `client`, whose statements, its transactions' and a SQLite store's (which
+ * runs its own BEGIN on the client), wait right before the first one `pause`
+ * matches once the gate is closed, until the test opens it.
+ */
+function holdBefore(client: SqlSessionStorageClient, pause: RegExp): GatedClient {
+	let gate: PromiseWithResolvers<void> | undefined;
+	let reached = Promise.withResolvers<void>();
+	const held = (executor: SqlSessionStorageTransaction): SqlSessionStorageTransaction => ({
+		async unsafe(query, values) {
+			if (gate && pause.test(query)) {
+				const waiting = gate;
+				gate = undefined;
+				reached.resolve();
+				await waiting.promise;
+			}
+			return executor.unsafe(query, values);
+		},
+	});
+	let open: (() => void) | undefined;
+	return {
+		client: {
+			options: client.options,
+			unsafe: held(client).unsafe,
+			transaction: callback => client.transaction(transaction => callback(held(transaction))),
+			end: () => client.end?.() ?? Promise.resolve(),
+			...reserveWrapped(client, held),
+		},
+		close() {
+			gate = Promise.withResolvers<void>();
+			open = gate.resolve;
+			reached = Promise.withResolvers<void>();
+		},
+		paused: () => reached.promise,
+		open() {
+			open?.();
+			open = undefined;
+		},
+	};
 }
 
 for (const { adapter, url } of LEASE_BACKENDS) {
@@ -347,6 +393,68 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 				retriesOfAStaleSize: [],
 				notices: [],
 				kept: [true, true, true, true],
+				expectsWhatIsStored: true,
+			});
+			await manager.close();
+		});
+
+		// If this regresses, an entry recorded while the session's own full rewrite is publishing is checked against
+		// the body that rewrite already put in the store's index: it is refused, "Session persistence failed" is
+		// reported for a write nothing else changed, and the rewrite is superseded, so the entry waits for a later write.
+		it("appends an entry recorded during its own full rewrite once that rewrite lands, reporting no failure", async () => {
+			await using db = await openLeaseDb(adapter, url ?? "");
+			let gate!: GatedClient;
+			const storage = await db.open({
+				lease: STILL,
+				// The size check that opens the swap of a full write, once its body is staged: the rewrite is publishing.
+				wrap: client => (gate = holdBefore(client, /^SELECT byte_len FROM/)).client,
+			});
+			const file = sessionFile(db);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.drain();
+			const { manager, notices } = await resume(storage, file);
+			manager.appendMessage(userTurn("mine before the rewrite"));
+			await manager.flush();
+			const failures: string[] = [];
+			manager.onPersistenceError(error => failures.push(error.message));
+			const turn = manager.getEntries().findLast(entry => entry.type === "message");
+			if (turn?.type !== "message" || turn.message.role !== "user") throw new Error("Expected the user turn");
+			turn.message.content = "pruned before the rewrite";
+			const writes = recordFullWrites(storage, file);
+
+			gate.close();
+			const rewrite = manager.rewriteEntries().then(
+				() => "stored",
+				(err: unknown) => String(err),
+			);
+			await gate.paused();
+			manager.appendMessage(userTurn("recorded during the rewrite"));
+			gate.open();
+			const outcome = await rewrite;
+			// What the store holds once its own queued writes land, before any later write of the session.
+			await storage.confirmWrites(file);
+			const withTheRewrite = (await db.row(file))?.content ?? "";
+			await manager.flush();
+			const stored = await db.row(file);
+
+			expect({
+				outcome,
+				failures,
+				notices,
+				writes,
+				landedWithTheRewrite: ["pruned before the rewrite", "recorded during the rewrite"].map(text =>
+					withTheRewrite.includes(text),
+				),
+				copies: stored?.content.split("recorded during the rewrite").length,
+				expectsWhatIsStored: manager.captureState().expectedDiskSize === stored?.byteLen,
+			}).toEqual({
+				outcome: "stored",
+				failures: [],
+				notices: [],
+				writes: [{ expectedSize: writes[0]?.expectedSize }],
+				landedWithTheRewrite: [true, true],
+				// One copy: the text splits the transcript in two.
+				copies: 2,
 				expectsWhatIsStored: true,
 			});
 			await manager.close();

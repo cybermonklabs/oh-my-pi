@@ -3432,11 +3432,13 @@ export class SessionManager {
 		if (!queuedRecovery && this.#queuedConflictRecovery) await this.#queuedConflictRecovery;
 
 		const startEpoch = this.#diskEpoch;
+		let published = false;
 		let handedOver = false;
 		await this.#scheduleDiskWork(
 			async () => {
 				try {
 					if (await this.#runFencedAtomicRewrite(startEpoch, queuedRecovery)) {
+						published = true;
 						this.#fileIsCurrent = true;
 						this.#materializeBreadcrumb();
 						this.#hasTitleSlot = true;
@@ -3448,6 +3450,8 @@ export class SessionManager {
 			},
 			{ epoch: startEpoch },
 		);
+		// Entries recorded while it published follow it as one append (see #appendToCurrentSessionFile).
+		if (published && !this.#released && this.#hasUnsavedEntries()) this.#appendToCurrentSessionFile();
 		if (!handedOver) return;
 		await this.#queuedConflictRecovery;
 		if (this.#rewriteRequired && this.#diskFailure) throw this.#diskFailure;
@@ -3612,12 +3616,20 @@ export class SessionManager {
 		//   without recreating a vacated source.
 		// - in-place atomic fence: supersede the pending publish with a
 		//   synchronous full-body rewrite; bumping `#diskEpoch` abandons the
-		//   in-flight atomic via its `commitGuard`.
+		//   in-flight atomic via its `commitGuard`. Not on a store that
+		//   publishes later: its index already holds the in-flight body, so a
+		//   synchronous rewrite checked against the size before it is refused.
+		//   There the entry waits: it follows the rewrite as one append once
+		//   the rewrite lands, and a repair publishes again with it.
 		if (this.#sessionFileRelocating) {
 			this.#rewriteSynchronously();
 			return;
 		}
 		if (this.#atomicRewriteFenceEpoch !== null && this.#atomicRewriteFenceEpoch === this.#diskEpoch) {
+			if (this.#storage.defersSyncPublish) {
+				if (this.#authoritativeRepair) this.#atomicRewriteDirty = true;
+				return;
+			}
 			this.#atomicRewriteDirty = true;
 			this.#rewriteSynchronously();
 			return;
