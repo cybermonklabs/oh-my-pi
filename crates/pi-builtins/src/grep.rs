@@ -172,6 +172,22 @@ pub(crate) fn for_each_nonempty_match<M: Matcher>(
 	Ok(())
 }
 
+/// The part of a selected `line` that `-o` searches for matches: the line
+/// without the terminator `searcher` ended it with, as the searcher matches a
+/// line to select it, so that `$` matches at the end of the line as in GNU
+/// grep. A multi-line search keeps the whole span, since a match in it may end
+/// with a line terminator.
+pub(crate) fn line_text<'a, M: Matcher>(
+	searcher: &Searcher,
+	matcher: M,
+	line: &'a [u8],
+) -> &'a [u8] {
+	if searcher.multi_line_with_matcher(matcher) {
+		return line;
+	}
+	line.strip_suffix(searcher.line_terminator().as_bytes()).unwrap_or(line)
+}
+
 #[derive(Parser, Debug)]
 #[command(
 	name = "grep",
@@ -913,7 +929,7 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 	type Error = io::Error;
 
-	fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
+	fn matched(&mut self, searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
 		if self.binary && self.opts.binary_files == BinaryFiles::WithoutMatch {
 			return Ok(false);
 		}
@@ -930,7 +946,8 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 			return Ok(true);
 		}
 		if self.opts.only_matching {
-			self.print_only_matching(mat.bytes(), mat.line_number(), mat.absolute_byte_offset())?;
+			let line = line_text(searcher, self.matcher, mat.bytes());
+			self.print_only_matching(line, mat.line_number(), mat.absolute_byte_offset())?;
 		} else {
 			self.write_prefix(mat.line_number(), mat.absolute_byte_offset(), b':')?;
 			self.write_record(mat.bytes())?;
@@ -2393,6 +2410,85 @@ mod tests {
 		for pattern in ["a{1,2", "{1}"] {
 			let (code, out, _) = run(&["-Ec", pattern], input).await;
 			assert_eq!(code, 2, "-E {pattern} must stay an error, got {out:?}");
+		}
+	}
+
+	/// `-o` searches a line without its terminator, as GNU grep does. It used
+	/// to search the line with its newline, where a `$` that ends the pattern
+	/// cannot match, so `grep -oE '[0-9]+$'` printed nothing while `grep -c`
+	/// counted both lines. Every expectation is GNU grep 3.11's output for the
+	/// same input, read from a file and from stdin.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn only_matching_prints_a_match_anchored_at_the_line_end() {
+		let input = "const DaemonAPIVersion = 258\nx 7\n";
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("f"), input).unwrap();
+		for (args, want) in [
+			(vec!["-oE", "[0-9]+$"], "258\n7\n"),
+			(vec!["-o", "8$"], "8\n"),
+			(vec!["-noE", "[0-9]+$"], "1:258\n2:7\n"),
+			(vec!["-no", "8$"], "1:8\n"),
+			(vec!["-boE", "[0-9]+$"], "25:258\n31:7\n"),
+			(vec!["-bo", "8$"], "27:8\n"),
+			// `-c` counts selected lines, with or without `-o`.
+			(vec!["-coE", "[0-9]+$"], "2\n"),
+			(vec!["-co", "8$"], "1\n"),
+		] {
+			let (code, out, err) = run(&args, input).await;
+			assert_eq!((code, out.as_str()), (0, want), "stdin {args:?}: {err}");
+			let mut file_args = args.clone();
+			file_args.push("f");
+			let (code, capture) = run_async_util::<Grep>(&file_args, "", tree.path()).await;
+			let out = capture.out();
+			assert_eq!((code, out.as_str()), (0, want), "file {args:?}: {}", capture.err());
+		}
+
+		// Nor is the terminator itself part of a match.
+		let (code, out, err) = run(&["-o", "[^b]"], "a\n").await;
+		assert_eq!((code, out.as_str()), (0, "a\n"), "{err}");
+	}
+
+	/// A last line with no terminator is searched to its end, next to lines
+	/// that have one. Expectations are GNU grep 3.11's output.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn only_matching_anchors_at_the_end_of_an_unterminated_last_line() {
+		for (args, input, want) in [
+			(["-oE", "[0-9]+$"], "a 12", "12\n"),
+			(["-no", "8$"], "x 7\nv 258", "2:8\n"),
+			(["-noE", "[0-9]+$"], "const DaemonAPIVersion = 258\nx 7", "1:258\n2:7\n"),
+		] {
+			let (code, out, err) = run(&args, input).await;
+			assert_eq!((code, out.as_str()), (0, want), "{args:?} on {input:?}: {err}");
+		}
+	}
+
+	/// `-x -o` prints a line that is the whole match, and nothing for a line
+	/// that only contains it. Expectations are GNU grep 3.11's output.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn whole_line_only_matching_prints_the_line() {
+		let (code, out, err) = run(&["-xo", "abc"], "abc\nabcd\nxabc\n").await;
+		assert_eq!((code, out.as_str()), (0, "abc\n"), "{err}");
+		let (code, out, err) = run(&["-xoE", "[0-9]+"], "258\nx 7\n").await;
+		assert_eq!((code, out.as_str()), (0, "258\n"), "{err}");
+	}
+
+	/// Under `-z`, `$` matches at the end of each NUL-terminated record. The
+	/// searcher used to run such a pattern over a buffer of many records, where
+	/// `$` matches only at the end of the buffer, so no record was selected;
+	/// and `-o` searched each record with its NUL. Expectations are GNU grep
+	/// 3.11's output.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn null_data_anchors_at_the_end_of_each_record() {
+		let input = "a1\0b2\0";
+		for (args, want) in [
+			(["-z", "[0-9]$"], "a1\0b2\0"),
+			(["-zo", "[0-9]$"], concat!("1\0", "2\0")),
+			(["-zno", "[0-9]$"], concat!("1:1\0", "2:2\0")),
+			(["-zbo", "[0-9]$"], concat!("1:1\0", "4:2\0")),
+			(["-zxo", "a1"], "a1\0"),
+		] {
+			let (code, out, err) = run(&args, input).await;
+			assert_eq!((code, out.as_str()), (0, want), "{args:?}: {err}");
 		}
 	}
 }

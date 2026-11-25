@@ -1118,6 +1118,16 @@ async fn grep_quiet_and_line_regexp() {
 	let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// `grep -o` with a pattern that ends in `$` prints the match at the end of
+/// each piped line, as GNU grep does; it used to print nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn grep_only_matching_prints_a_match_anchored_at_the_line_end_of_a_pipe() {
+	let (result, output) =
+		execute_captured("printf 'v = 258\\nx 7\\n' | grep -oE '[0-9]+$'".into()).await;
+	assert_eq!(result.exit_code, Some(0), "{output}");
+	assert_eq!(output, "258\n7\n");
+}
+
 /// The destructive uutils builtins (`rm`, `mv`) must operate on paths
 /// resolved against the shell working directory, not the host process cwd.
 #[tokio::test(flavor = "multi_thread")]

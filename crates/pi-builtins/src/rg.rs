@@ -38,7 +38,7 @@ use tokio::{
 
 use crate::grep::{
 	MAX_LINE_BYTES, RecordFormat, SEARCH_HEAP_LIMIT, bound_terminator, check_run,
-	describe_search_error, exit_status, for_each_nonempty_match,
+	describe_search_error, exit_status, for_each_nonempty_match, line_text,
 };
 use crate::host::{AsyncUtility, Host, StdoutFile, StreamWriter, forward_slash_display};
 use crate::stdio;
@@ -697,7 +697,7 @@ impl<M: Matcher, W: Write> RgSink<'_, M, W> {
 impl<M: Matcher, W: Write> Sink for RgSink<'_, M, W> {
 	type Error = io::Error;
 
-	fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
+	fn matched(&mut self, searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
 		self.any_match = true;
 		self.line_count += 1;
 		let line = mat.bytes();
@@ -717,7 +717,8 @@ impl<M: Matcher, W: Write> Sink for RgSink<'_, M, W> {
 		if self.opts.vimgrep {
 			self.print_vimgrep(line, mat.line_number(), mat.absolute_byte_offset())?;
 		} else if self.opts.only_matching {
-			self.print_only_matching(line, mat.line_number(), mat.absolute_byte_offset())?;
+			let text = line_text(searcher, self.matcher, line);
+			self.print_only_matching(text, mat.line_number(), mat.absolute_byte_offset())?;
 		} else {
 			let column = if self.opts.column {
 				first_column(self.matcher, line)?
@@ -2330,6 +2331,17 @@ mod tests {
 		let (code, out, err) = run(&["--crlf", "-c", "x$", "-"], "ax\r\nbx\nc\r\n").await;
 		assert_eq!(code, 0, "{err}");
 		assert_eq!(out, "2\n");
+	}
+
+	/// `-o` searches a record without its terminator, so under `--null-data` a
+	/// `$` or `-x` matches at the end of each record. It used to search the
+	/// record with its NUL, where neither can match, and printed nothing.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn only_matching_anchors_at_the_end_of_each_null_data_record() {
+		let (code, out, err) = run(&["--null-data", "-o", "[0-9]$", "-"], "a1\0b2\0").await;
+		assert_eq!((code, out.as_str()), (0, "1\n2\n"), "{err}");
+		let (code, out, err) = run(&["--null-data", "-xo", "a1", "-"], "a1\0b2\0").await;
+		assert_eq!((code, out.as_str()), (0, "a1\n"), "{err}");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
