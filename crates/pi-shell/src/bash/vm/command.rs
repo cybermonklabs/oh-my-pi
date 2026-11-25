@@ -312,8 +312,11 @@ pub fn exec(
 						s.status = 0;
 						s.control = Some(Transfer::Exit(0));
 						s.stage = Stage::Finish;
-						if let Some(fd) = exec::flush_out(k, vp) {
-							return Flow::Block(WaitKey::Write { fd });
+						// The message is the second fork's, whose `SIGPIPE`
+						// ends only it: the job's fork still exits 0.
+						exec::childs_messages(vp);
+						if let Some(left) = exec::flush_out(k, cx, vp) {
+							return left.flow();
 						}
 						continue;
 					}
@@ -332,8 +335,8 @@ pub fn exec(
 							s.status = code;
 							s.control = Some(Transfer::Exit(code));
 							s.stage = Stage::Finish;
-							if let Some(fd) = exec::flush_out(k, vp) {
-								return Flow::Block(WaitKey::Write { fd });
+							if let Some(left) = exec::flush_out(k, cx, vp) {
+								return left.flow();
 							}
 							continue;
 						},
@@ -362,9 +365,12 @@ pub fn exec(
 								Stage::FailedLookup
 							};
 							// The message goes to stderr as the redirections so far
-							// left it (`2>/dev/null < ${x:?}` prints none).
-							if let Some(fd) = exec::flush_out(k, vp) {
-								return Flow::Block(WaitKey::Write { fd });
+							// left it (`2>/dev/null < ${x:?}` prints none), from the
+							// fork: a `SIGPIPE` there ends only the fork, and the
+							// command fails with its status.
+							exec::childs_messages(vp);
+							if let Some(left) = exec::flush_out(k, cx, vp) {
+								return left.flow();
 							}
 							continue;
 						},
@@ -410,9 +416,16 @@ pub fn exec(
 								s.control = Some(Transfer::Exit(1));
 							}
 							// The message goes to stderr as the redirections so far
-							// left it (`2>&1 >&bad`), before they are undone.
-							if let Some(fd) = exec::flush_out(k, vp) {
-								return Flow::Block(WaitKey::Write { fd });
+							// left it (`2>&1 >&bad`), before they are undone; from the
+							// fork when the shell makes them in one (a program's,
+							// bash's and zsh's; a null command's:
+							// `execute_null_command`'s), whose `SIGPIPE` ends only the
+							// fork, and the command fails with its status.
+							if (null && null_forks) || (!null && runs_in_a_fork(k, cx, vp)) {
+								exec::childs_messages(vp);
+							}
+							if let Some(left) = exec::flush_out(k, cx, vp) {
+								return left.flow();
 							}
 							continue;
 						},
@@ -483,8 +496,13 @@ pub fn exec(
 				}
 			},
 			Stage::Output => {
-				if let Some(fd) = exec::flush_out(k, vp) {
-					return Flow::Block(WaitKey::Write { fd });
+				// A name not found, or a program refused, is reported by the
+				// child the shell forked for it.
+				if failed_in_fork(vp) {
+					exec::childs_messages(vp);
+				}
+				if let Some(left) = exec::flush_out(k, cx, vp) {
+					return left.flow();
 				}
 				if let Some(flow) = output(k, vp, cx, line) {
 					return flow;
@@ -1310,8 +1328,8 @@ fn expand(
 			trace(k, vp, cx, unit, &cmd.assigns, line);
 		}
 		// Out before the command's redirections move stderr.
-		if let Some(fd) = exec::flush_out(k, vp) {
-			return Some(Flow::Block(WaitKey::Write { fd }));
+		if let Some(left) = exec::flush_out(k, cx, vp) {
+			return Some(left.flow());
 		}
 	}
 	None
@@ -1985,15 +2003,26 @@ fn forget_var_fds(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, scoped: Optio
 /// expanded, its name not yet looked up) in a fork that makes its
 /// redirections itself (`execute_disk_command`): a name that is not a
 /// function or a builtin (an external, one not found), also behind
-/// `command`. Read only: [`lookup`] still resolves it.
+/// `command`. Read only: [`lookup`] still resolves it. zsh code keeps its
+/// own rule for what follows from that (its `{var}`s, its fatal errors).
 pub(super) fn forks_for(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
-	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
-		return false;
-	}
+	vp.mode.dialect() != crate::bash::ids::Dialect::Zsh && runs_in_a_fork(k, cx, vp)
+}
+
+/// Whether the shell forks a child for the simple command on top of `vp`
+/// before it looks the program up and makes its redirections, as bash's
+/// `execute_disk_command` and zsh's `execcmd_exec` do: a name that is not a
+/// function or a builtin (an external, one not found), also behind
+/// `command`. Read only.
+fn runs_in_a_fork(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	words_run_in_a_fork(k, cx, vp, current_argv(vp))
+}
+
+/// [`runs_in_a_fork`] for the command of expanded words `argv`.
+fn words_run_in_a_fork(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, argv: &[BString]) -> bool {
 	let mode = exec::mode_of(vp);
 	let posix =
 		state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false);
-	let argv = current_argv(vp);
 	let mut at = 0;
 	let mut via = Via::Plain;
 	while let Some(name) = argv.get(at) {
@@ -2036,6 +2065,35 @@ pub(super) fn forks_for(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 		}
 	}
 	false
+}
+
+/// Whether the message queued at the `Output` stage of the command on top
+/// of `vp` is one the shell writes in the child it forked for the command
+/// (bash's `execute_disk_command`, zsh's `execute`): its name was not
+/// found, or the OS refused to run it, not under `exec`. Such a name is
+/// no builtin and no function, so the shell forked for it. A `SIGPIPE` of
+/// that write ends the child only ([`exec::childs_messages`]): the command
+/// fails with its status, and the shell goes on.
+fn failed_in_fork(vp: &mut Vproc) -> bool {
+	let s = st(vp);
+	matches!(s.target, Some(Target::NotFound | Target::Search | Target::Refused { .. }))
+		&& s.exec_as.is_none()
+}
+
+/// A child's message ([`exec::childs_messages`]) met a pipe without
+/// readers: the signal ended that child, and the command it ran fails with
+/// `status`. The command is the one on top of `vp` (its `Exec` op, parked
+/// on the write or not), else the `( … )` whose own redirections failed.
+pub(super) fn child_died(vp: &mut Vproc, status: i32) {
+	match vp
+		.frames
+		.last_mut()
+		.and_then(|f| f.scratch.as_mut())
+		.and_then(|s| s.exec.as_deref_mut())
+	{
+		Some(e) => e.status = status,
+		None => vp.status = status,
+	}
 }
 
 /// Resolve the command name: `command`/`builtin` prefixes, functions,
@@ -2873,6 +2931,10 @@ fn spawned_external(
 			let s = st(vp);
 			s.status = status;
 			s.stage = Stage::Output;
+			// What bash's refusal ends with ([`refused`]): the message is the
+			// child's, as zsh's `execute` writes it after the fork
+			// ([`failed_in_fork`]).
+			s.target = Some(Target::Refused { path, code: err.raw_os_error().unwrap_or_default() });
 			exec_failed(k, cx, vp);
 		},
 		Err(err) if err.raw_os_error().is_some() => {
@@ -5194,10 +5256,10 @@ fn zsh_write_error(
 	}
 }
 
-/// A write to `fd` failed: drop what is queued for it, and report the error
-/// as the command's (bash's `write error`, zsh's through
-/// [`zsh_write_error`]), or end the shell on `SIGPIPE`. A failed write to
-/// fd 2 is dropped without a report.
+/// A write to `fd` failed: drop what is queued for it, and end the shell
+/// on `SIGPIPE` ([`sigpipe_exit`]), on fd 2 too; else report the error as
+/// the command's (bash's `write error`, zsh's through [`zsh_write_error`]),
+/// but for fd 2, whose failed write is dropped without a report.
 fn write_failed(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -5210,14 +5272,11 @@ fn write_failed(
 	st(vp)
 		.writes
 		.retain(|queued| queued.fd != fd || queued.cont.is_some());
+	if let Some(status) = sigpipe_exit(k, cx, vp, &err) {
+		return Some(Flow::Exit(status));
+	}
 	if fd == 2 {
 		return None;
-	}
-	if err.kind() == std::io::ErrorKind::BrokenPipe && !sigpipe_ignored(cx.store, vp) {
-		// The virtual SIGPIPE ends this shell silently, as it ends
-		// a bash pipeline child.
-		let platform = k.engine.config().platform;
-		return Some(Flow::Exit(crate::bash::signal::Signal::Pipe.exit_status(platform)));
 	}
 	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		zsh_write_error(k, vp, cx, line, fd, &err);
@@ -5237,14 +5296,88 @@ fn write_failed(
 	None
 }
 
-/// Whether `SIGPIPE` is ignored (`trap '' PIPE`), so a write to a pipe
-/// without readers reports `Broken pipe` instead of ending the shell.
-fn sigpipe_ignored(store: &mut dyn StateStore, vp: &Vproc) -> bool {
-	let key = Key::Trap(crate::bash::store::TrapKey::Signal(crate::bash::signal::Signal::Pipe));
-	matches!(
-		state::record(store, vp, key),
-		Ok(Some(Record::Trap { action, .. })) if action.is_empty()
-	)
+/// The status the virtual `SIGPIPE` ends the shell with after a write of
+/// its own failed with `err`: a pipe without readers, and `SIGPIPE` neither
+/// ignored nor trapped. bash's write raises the signal whatever it writes
+/// and to whichever fd: a command's output, its diagnostics on fd 2, the
+/// shell's own diagnostics and trace lines ([`exec::flush_out`]). `None`:
+/// the write just failed (`trap '' PIPE`; with a trap action the trap runs
+/// between commands, as bash's handler only notes the signal, and the
+/// write fails with `EPIPE`). A caught trap a subshell inherited is no
+/// trap there ([`state::record`]). A write made while the shell expands
+/// the redirection words of a command it forks for is that child's
+/// ([`in_a_forks_redirection`]).
+pub(super) fn sigpipe_exit(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	err: &std::io::Error,
+) -> Option<i32> {
+	use crate::bash::signal::Signal;
+	if err.kind() != std::io::ErrorKind::BrokenPipe || in_a_forks_redirection(k, cx, vp) {
+		return None;
+	}
+	let key = Key::Trap(crate::bash::store::TrapKey::Signal(Signal::Pipe));
+	let ignored = match state::record(cx.store, vp, key) {
+		Ok(Some(Record::Trap { action, .. })) => Some(action.is_empty()),
+		_ => None,
+	};
+	match ignored {
+		Some(true) => None,
+		Some(false) => {
+			vp.pending_traps = vp.pending_traps.with(Signal::Pipe);
+			None
+		},
+		// The virtual SIGPIPE ends this shell silently, as it ends a bash
+		// pipeline child.
+		None => Some(Signal::Pipe.exit_status(k.engine.config().platform)),
+	}
+}
+
+/// Whether a substitution the shell runs in itself (`${ }`, `${| }`, `$(<
+/// file)`) is expanding a redirection word of a command the shell forks for:
+/// a program's (also one not found), a null command's that forks
+/// (`execute_null_command`'s `forcefork`) or a `( … )`'s. bash and zsh
+/// expand those words in the child, so a `SIGPIPE` of what the substitution
+/// writes ends only the child; obash expands them in the shell, which must
+/// not end, so the write just fails. What still differs from bash is the
+/// command: bash's child dies before it runs, here it runs.
+fn in_a_forks_redirection(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	(0..vp.frames.len().saturating_sub(1)).rev().any(|i| {
+		if !matches!(vp.frames[i + 1].kind, FrameKind::NoFork | FrameKind::Cat { .. }) {
+			return false;
+		}
+		match vp.frames[i]
+			.scratch
+			.as_ref()
+			.and_then(|s| s.exec.as_deref())
+		{
+			Some(e) if e.stage != Stage::Redirect => false,
+			Some(e) if e.argv.is_empty() => null_command_forks(vp, i),
+			Some(e) => words_run_in_a_fork(k, cx, vp, &e.argv),
+			None => exec::makes_a_subshells_redirections(vp, i),
+		}
+	})
+}
+
+/// Whether the `Exec` op frame `i` of `vp` runs is a null command bash
+/// forks for (the `null_forks` of its `Redirect` stage).
+fn null_command_forks(vp: &Vproc, i: usize) -> bool {
+	let Some(frame) = vp.frames.get(i) else {
+		return false;
+	};
+	let Some(unit) = frame.unit.as_ref() else {
+		return false;
+	};
+	unit.ops.get(frame.pc as usize).is_some_and(|op| {
+		op.code == ir::Opcode::Exec
+			&& op.flags & ir::Op::CAT == 0
+			&& unit
+				.cmds
+				.get(op.a as usize)
+				.and_then(|cmd| cmd.redirs)
+				.is_some_and(|list| super::redir::null_forks(&unit.redirs[list as usize]))
+	})
 }
 
 /// Report the command and leave the op (or transfer control).

@@ -794,11 +794,14 @@ mod tests {
 						Chunk::Diag(_) => panic!("bg reported an error"),
 					}
 				}
-				assert!(exec::flush_out(&mut k, &mut vp).is_some(), "the line went out while held");
+				assert!(
+					exec::flush_out(&mut k, &mut cx, &mut vp).is_some(),
+					"the line went out while held"
+				);
 				assert_eq!(k.ctl.word(), 0, "the job was continued while its line was not out");
 				drop(held);
 				let deadline = Instant::now() + Duration::from_secs(10);
-				while exec::flush_out(&mut k, &mut vp).is_some() {
+				while exec::flush_out(&mut k, &mut cx, &mut vp).is_some() {
 					assert!(Instant::now() < deadline, "DEADLINE: the line was not out within 10 s");
 					std::thread::sleep(Duration::from_millis(5));
 				}

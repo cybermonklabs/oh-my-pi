@@ -1515,12 +1515,21 @@ pub struct PendingWrite {
 	/// fails.
 	#[serde(default)]
 	pub cont:   Option<JobId>,
+	/// A message the shell writes in the child it forked for the command (a
+	/// name not found, a program refused, a redirection made in the fork):
+	/// a `SIGPIPE` of its write ends that child, not the shell, and the
+	/// command fails with the signal's status
+	/// ([`crate::bash::vm::exec::flush_out`]). Carried by the entry, so a
+	/// failure that surfaces only when a writer thread settles the chunk, after
+	/// the op parked, still ends the child.
+	#[serde(default)]
+	pub child:  bool,
 }
 
 impl PendingWrite {
 	/// `bytes` for fd `fd`, nothing written yet.
 	pub fn new(fd: i32, bytes: BString) -> Self {
-		Self { fd, bytes, off: 0, handed: HandedOff::default(), cont: None }
+		Self { fd, bytes, off: 0, handed: HandedOff::default(), cont: None, child: false }
 	}
 
 	/// Continue job `id` once what is queued before this entry is out.

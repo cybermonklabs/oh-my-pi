@@ -1,0 +1,422 @@
+[
+ {
+  "id": "zsp-xtrace",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; setopt xtrace; true; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-xtrace",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; setopt xtrace; true; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-cd-missing",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-cd-missing",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-print-u2",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; print -u2 x; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-print-u2",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; print -u2 x; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-typeset-missing",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; typeset -p nosuch_var_xyz; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-typeset-missing",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; typeset -p nosuch_var_xyz; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-kill-nojob",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; kill %9; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-kill-nojob",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; kill %9; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-test-int",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; [ 1 -eq a ]; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-test-int",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; [ 1 -eq a ]; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-echo-full",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo x > /dev/full; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-echo-full",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo x > /dev/full; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-arith-div0",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo $((1/0)); echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-arith-div0",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo $((1/0)); echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-param-q",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo ${UNSET_V:?gone}; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-param-q",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; echo ${UNSET_V:?gone}; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-redir-builtin",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; : < /nonexistent; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-redir-builtin",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; : < /nonexistent; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-redir-group",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; { :; } < /nonexistent; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-redir-group",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; { :; } < /nonexistent; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"",
+  "zsh59": [
+   0,
+   "ps=141 0\nf=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-notfound",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; nosuch_cmd_xyz; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-notfound",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; nosuch_cmd_xyz; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-noexec",
+  "file": false,
+  "script": ": > nx; chmod 644 nx; { exec 2>&1 >/dev/null; sleep 0.3; ./nx; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-noexec",
+  "file": true,
+  "script": ": > nx; chmod 644 nx; { exec 2>&1 >/dev/null; sleep 0.3; ./nx; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-redir-external",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; cat < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-redir-external",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; cat < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-redir-subshell",
+  "file": false,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; ( : ) < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-redir-subshell",
+  "file": true,
+  "script": "{ exec 2>&1 >/dev/null; sleep 0.3; ( : ) < /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=141\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-ignored-cd",
+  "file": false,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-ignored-cd",
+  "file": true,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-ignored-xtrace",
+  "file": false,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; setopt xtrace; true; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-ignored-xtrace",
+  "file": true,
+  "script": "{ trap '' PIPE; exec 2>&1 >/dev/null; sleep 0.3; setopt xtrace; true; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=0\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-pipe-trap-cd",
+  "file": false,
+  "script": "{ trap 'echo p >> fp' PIPE; exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; cat fs fp",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=1\np\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-pipe-trap-cd",
+  "file": true,
+  "script": "{ trap 'echo p >> fp' PIPE; exec 2>&1 >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; cat fs fp",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=1\np\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-out",
+  "file": false,
+  "script": "{ sleep 0.3; echo out; echo after > f3; } | :; echo \"p=$?\"; [[ -e f3 ]]; echo \"f3=$?\"",
+  "zsh59": [
+   0,
+   "p=0\nf3=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-out",
+  "file": true,
+  "script": "{ sleep 0.3; echo out; echo after > f3; } | :; echo \"p=$?\"; [[ -e f3 ]]; echo \"f3=$?\"",
+  "zsh59": [
+   0,
+   "p=0\nf3=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-ctl-stderr-file",
+  "file": false,
+  "script": "{ exec 2>e >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; cat e",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\nzsh:cd:1: no such file or directory: /nonexistent\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-ctl-stderr-file",
+  "file": true,
+  "script": "{ exec 2>e >/dev/null; sleep 0.3; cd /nonexistent; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; cat e",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\n./s.sh:cd:1: no such file or directory: /nonexistent\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-ctl-stderr-full",
+  "file": false,
+  "script": "{ exec 2>/dev/full >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ },
+ {
+  "id": "zsp-ctl-stderr-full",
+  "file": true,
+  "script": "{ exec 2>/dev/full >/dev/null; sleep 0.3; cd /nonexistent; echo \"s=$?\" > fs; echo after > f; } | :; echo \"ps=${pipestatus[*]}\"; [[ -e f ]]; echo \"f=$?\"; [[ -e fs ]] && cat fs || echo s=none",
+  "zsh59": [
+   0,
+   "ps=0 0\nf=0\ns=1\n",
+   ""
+  ]
+ }
+]

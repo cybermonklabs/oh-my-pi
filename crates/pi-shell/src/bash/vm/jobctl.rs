@@ -1739,9 +1739,10 @@ mod tests {
 	use crate::bash::{Engine, EngineConfig, File as _, FileKind, MemStore, fd::FdTable};
 
 	/// A kernel whose shell terminal (zsh `SHTTY`) is the terminal side of a
-	/// new pty, the shell's root vproc, and the pty's other side, to read
-	/// what the shell wrote. A terminal's writes go to its writer thread.
-	fn shell_on_a_pty() -> (Kernel, Vproc, std::fs::File) {
+	/// new pty, the shell's root vproc, its store, and the pty's other side,
+	/// to read what the shell wrote. A terminal's writes go to its writer
+	/// thread.
+	fn shell_on_a_pty() -> (Kernel, Vproc, MemStore, std::fs::File) {
 		let mut store = MemStore::new();
 		let root = state::Root::load(&mut store).unwrap();
 		let engine = Engine::new(EngineConfig::default());
@@ -1754,7 +1755,7 @@ mod tests {
 		k.jobctl.root = Some(vp.vpid);
 		let master = std::fs::File::from(master);
 		crate::sys::test_probe::set_nonblocking(&master);
-		(k, vp, master)
+		(k, vp, store, master)
 	}
 
 	/// What the terminal shows: the pty's other side, read until `want`
@@ -1778,9 +1779,11 @@ mod tests {
 
 	/// The shell's next output waits for its notices: polled until it does
 	/// not, for at most 10 s.
-	fn flush(k: &mut Kernel, vp: &mut Vproc) {
+	fn flush(k: &mut Kernel, store: &mut MemStore, vp: &mut Vproc) {
+		let mut host = crate::testkit::FakeHost::new();
+		let cx = &mut Cx { host: &mut host, store };
 		let deadline = Instant::now() + Duration::from_secs(10);
-		while exec::flush_out(k, vp).is_some() {
+		while exec::flush_out(k, cx, vp).is_some() {
 			assert!(Instant::now() < deadline, "DEADLINE: the notices were not out within 10 s");
 			std::thread::sleep(Duration::from_millis(5));
 		}
@@ -1799,12 +1802,12 @@ mod tests {
 				"::a_notice_while_the_writer_thread_holds_the_one_before_is_not_lost"
 			),
 			|| {
-				let (mut k, mut vp, mut master) = shell_on_a_pty();
+				let (mut k, mut vp, mut store, mut master) = shell_on_a_pty();
 				let held = crate::sys::hold_writers();
 				notice(&mut k, &mut vp, b"[1]  - continued  sleep 1\n");
 				notice(&mut k, &mut vp, b"[2]  + continued  sleep 2\n");
 				drop(held);
-				flush(&mut k, &mut vp);
+				flush(&mut k, &mut store, &mut vp);
 				let want = "[1]  - continued  sleep 1\r\n[2]  + continued  sleep 2\r\n";
 				assert_eq!(read_terminal(&mut master, want.len()), want);
 			},
@@ -1819,13 +1822,13 @@ mod tests {
 		crate::sys::in_blocking_writer_process(
 			concat!(module_path!(), "::a_job_is_continued_only_once_its_notice_is_out"),
 			|| {
-				let (mut k, mut vp, mut master) = shell_on_a_pty();
+				let (mut k, mut vp, mut store, mut master) = shell_on_a_pty();
 				let held = crate::sys::hold_writers();
 				notice(&mut k, &mut vp, b"[1]  + continued  sleep 1\n");
 				continue_job(&mut k, JobId(1));
 				assert_eq!(k.ctl.word(), 0, "the job was continued while its line was not out");
 				drop(held);
-				flush(&mut k, &mut vp);
+				flush(&mut k, &mut store, &mut vp);
 				assert_ne!(k.ctl.word(), 0, "the job was not continued once its line was out");
 				let want = "[1]  + continued  sleep 1\r\n";
 				assert_eq!(read_terminal(&mut master, want.len()), want);
@@ -2692,7 +2695,7 @@ mod tests {
 			concat!(module_path!(), "::the_mail_notice_reaches_the_terminal_before_the_prompt"),
 			|| {
 				use super::super::zle::reader;
-				let (mut shell, _host, _store, mut master) = shell_with_a_terminal();
+				let (mut shell, _host, mut store, mut master) = shell_with_a_terminal();
 				let _ = editing_with_display(&mut shell, b"", |_| zexec::WResult::Done(0));
 				let held = crate::sys::hold_writers();
 				reader::put_tty(&shell.k, &mut shell.procs[0], b"%  \r");
@@ -2705,7 +2708,7 @@ mod tests {
 					.expect("the editor's terminal")
 					.put(b"% ");
 				drop(held);
-				flush(&mut shell.k, &mut shell.procs[0]);
+				flush(&mut shell.k, &mut store, &mut shell.procs[0]);
 				let want = "%  \rYou have new mail.\r\n% ";
 				assert_eq!(read_terminal(&mut master, want.len()), want);
 			},
@@ -2723,7 +2726,7 @@ mod tests {
 			concat!(module_path!(), "::display_bytes_wait_behind_a_message_queued_before_them"),
 			|| {
 				use super::super::zle::reader;
-				let (mut shell, _host, _store, mut master) =
+				let (mut shell, _host, mut store, mut master) =
 					shell_with_fd_on_its_terminal_written_at_once(2);
 				let _ = editing_with_display(&mut shell, b"", |_| zexec::WResult::Done(0));
 				let held = crate::sys::hold_writers();
@@ -2734,7 +2737,7 @@ mod tests {
 				));
 				reader::put_tty(&shell.k, &mut shell.procs[0], b"You have new mail.\n");
 				drop(held);
-				flush(&mut shell.k, &mut shell.procs[0]);
+				flush(&mut shell.k, &mut store, &mut shell.procs[0]);
 				let want = "%  \rzsh: empty MAILPATH component: ?x\r\nYou have new mail.\r\n";
 				assert_eq!(read_terminal(&mut master, want.len()), want);
 			},
