@@ -896,7 +896,7 @@ describe("subagent runtime fallback on a real provider error", () => {
 		});
 	}
 
-	/** Spawns a real `named-worker` child that can reach exactly `models`. */
+	/** Spawns a real child (`named-worker` unless `agentName` says otherwise) that can reach exactly `models`. */
 	async function runNamedWorker(
 		id: string,
 		models: MockModel[],
@@ -907,6 +907,9 @@ describe("subagent runtime fallback on a real provider error", () => {
 			modelRole?: string;
 			parentActiveModelPattern?: string;
 			authedProviders?: string[];
+			agentName?: string;
+			tools?: string[];
+			prewalk?: string;
 		},
 	) {
 		const authStorage = createInMemoryAuthStorage();
@@ -927,12 +930,13 @@ describe("subagent runtime fallback on a real provider error", () => {
 			return await runSubprocess({
 				cwd: path.join(root, "home", "work"),
 				agent: {
-					name: "named-worker",
+					name: spawn.agentName ?? "named-worker",
 					description: "test",
 					systemPrompt: "test",
-					tools: ["read"],
+					tools: spawn.tools ?? ["read"],
 					source: "bundled",
 					model: spawn.agentModel,
+					prewalk: spawn.prewalk,
 				},
 				task: "work",
 				index: 0,
@@ -1078,6 +1082,68 @@ describe("subagent runtime fallback on a real provider error", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.resolvedModel).toBe(OTHER);
 		expect(result.resolvedModelIsFallback).toBe(true);
+	});
+
+	/** A child model that writes a file, then yields: the write is the first edit/write an armed prewalk hands off at. */
+	function writingModel(selector: string): MockModel {
+		const [provider, id] = selector.split("/");
+		return createMockModel({
+			provider,
+			id,
+			handler: context => {
+				const ran = new Set(
+					context.messages.flatMap(message => (message.role === "toolResult" ? [message.toolName] : [])),
+				);
+				if (ran.has("yield")) return { content: ["ok"] };
+				if (ran.has("write")) {
+					return {
+						content: [{ type: "toolCall", name: "yield", arguments: { type: "result", data: "written" } }],
+					};
+				}
+				return {
+					content: [{ type: "toolCall", name: "write", arguments: { path: "out.txt", content: "done\n" } }],
+				};
+			},
+		});
+	}
+
+	/** Each way prewalk reaches a subagent: its frontmatter, `task.agentPrewalk`, and `task.prewalk` (bundled `task` only). */
+	const PREWALK_SOURCES = [
+		["frontmatter", { prewalk: OTHER }, {}],
+		["task.agentPrewalk", {}, { "task.agentPrewalk": { "named-worker": OTHER } }],
+		["task.prewalk", { agentName: "task" }, { "task.prewalk": true, modelRoles: { smol: OTHER } }],
+	] as const;
+
+	it.each(PREWALK_SOURCES)(
+		"does not prewalk a named model to another model when task.namedModelFallback is off (%s)",
+		async (_label, spawn, extra) => {
+			const named = writingModel(NAMED);
+			const target = writingModel(OTHER);
+			const result = await runNamedWorker(
+				"NamedPrewalkOff",
+				[named, target],
+				namedWorkerSettings({ "task.namedModelFallback": false, ...extra }),
+				{ agentModel: [NAMED], tools: ["read", "write"], ...spawn },
+			);
+			expect(target.calls).toHaveLength(0);
+			expect(named.calls.length).toBeGreaterThan(0);
+			expect(result.exitCode).toBe(0);
+			expect(result.resolvedModel).toBe(NAMED);
+		},
+	);
+
+	it.each(PREWALK_SOURCES)("still prewalks a named model by default (%s)", async (_label, spawn, extra) => {
+		const named = writingModel(NAMED);
+		const target = writingModel(OTHER);
+		const result = await runNamedWorker("NamedPrewalkDefault", [named, target], namedWorkerSettings(extra), {
+			agentModel: [NAMED],
+			tools: ["read", "write"],
+			...spawn,
+		});
+		expect(named.calls.length).toBeGreaterThan(0);
+		expect(target.calls.length).toBeGreaterThan(0);
+		expect(result.exitCode).toBe(0);
+		expect(result.resolvedModel).toBe(OTHER);
 	});
 
 	it("fails spawn naming a named model with no credential instead of substituting the parent when task.namedModelFallback is off", async () => {

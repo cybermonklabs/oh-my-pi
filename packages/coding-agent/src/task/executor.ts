@@ -4903,11 +4903,12 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			// session-level --prewalk. The bundled generic `task` agent has no
 			// frontmatter default; the `task.prewalk` toggle (default off) arms it.
 			// Resolution failures skip prewalk instead of failing the spawn. A per-call
-			// worker never switches models, so it never prewalks.
+			// worker never switches models, so it never prewalks; nor does a named model
+			// held to its own list (`namedModelsOnly`).
 			const perCallModelGrants = options.perCallModelGrants;
 			let prewalk: Prewalk | undefined;
 			const prewalkPattern =
-				preparedSession || perCallModelGrants
+				preparedSession || perCallModelGrants || namedModelsOnly
 					? undefined
 					: resolveAgentPrewalkPattern({
 							settingsOverride: cfgTaskAgentPrewalk.get(settings)[agent.name],
