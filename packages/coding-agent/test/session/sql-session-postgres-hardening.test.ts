@@ -204,8 +204,9 @@ const BARE_RELATION_VALUE = new RegExp(`^(${SESSION_TABLE}(_parts)?|${LEASE_TABL
  * that neither opens with the search_path lock (a one-statement read) nor
  * names only `pg_catalog` functions and operators (the heartbeat), a
  * statement of a transaction before its `search_path` lock (its
- * `SET TRANSACTION`s aside), and a table, or a relation argument, without its
- * schema.
+ * `SET TRANSACTION`s aside; the lock is sent alone, or first in one simple
+ * query with the transaction's own bounds, as the heartbeat opens), and a
+ * table, or a relation argument, without its schema.
  */
 function unlockedStatements(sent: readonly Sent[]): string[] {
 	const problems: string[] = [];
@@ -223,9 +224,9 @@ function unlockedStatements(sent: readonly Sent[]): string[] {
 		byTransaction.set(statement.transaction, statements);
 	}
 	for (const statements of byTransaction.values()) {
-		const locked = statements.findIndex(statement => statement.sql === SEARCH_PATH);
+		const locked = statements.findIndex(({ sql }) => sql === SEARCH_PATH || sql.startsWith(LOCKED));
 		for (const [index, statement] of statements.entries()) {
-			if (statement.sql === SEARCH_PATH || statement.sql.startsWith("SET TRANSACTION ")) continue;
+			if (index === locked || statement.sql.startsWith("SET TRANSACTION ")) continue;
 			if (locked < 0 || index < locked) problems.push(`before the search_path lock: ${statement.sql}`);
 		}
 	}
@@ -581,8 +582,9 @@ const TRANSACTION_CONTROL = /^(BEGIN|START TRANSACTION|COMMIT|END|ROLLBACK|SAVEP
 
 /**
  * Every statement `record` saw that ran without the search_path lock: outside
- * a transaction, or in one before its `SET LOCAL search_path`, unless it is
- * one simple query that opens with the lock (a one-statement read), a
+ * a transaction, or in one before its `SET LOCAL search_path` (alone, or first
+ * in one simple query, as the heartbeat opens), unless it is one simple query
+ * that opens with the lock (a one-statement read), a
  * transaction-control statement, or a statement alone outside a transaction
  * that names only `pg_catalog` functions and operators (the heartbeat).
  * Tracked per connection, in the order sent.
@@ -602,8 +604,10 @@ function unlockedOnTheWire(record: WireRecord): string[] {
 			current.locked = false;
 		} else if (text === SEARCH_PATH && current.inTransaction) {
 			current.locked = true;
-		} else if (protocol === "query" && text.startsWith(`${SEARCH_PATH}; `)) {
-			// One simple query runs as one implicit transaction, its lock first.
+		} else if (protocol === "query" && text.startsWith(LOCKED)) {
+			// One simple query that opens with the lock: alone it runs as one implicit transaction, and inside a
+			// transaction (the heartbeat's opening, with its two bounds) it locks the statements that follow.
+			if (current.inTransaction) current.locked = true;
 		} else if (!current.inTransaction && unqualifiedNames(text).length === 0) {
 			// Alone, and nothing in it is found through the connection's search_path.
 		} else if (!TRANSACTION_CONTROL.test(text) && !/^SET TRANSACTION\b/i.test(text) && !current.locked) {
