@@ -216,6 +216,7 @@
 - Writing a session that holds an entry nested more than 1,000 levels deep no longer rescans the entry at each of its first 1,000 levels (a 3,000-level entry with 100 fields per level took 605 ms a write, now 10 ms), and resuming a session whose older entry nests 50,000 levels deep takes 36 ms instead of 1.7 s
 - `omp anonymize` and the anonymized session dump write a session holding an entry nested more than about 22,000 levels deep (a tool's `details` or a tool call's arguments) instead of failing with `Maximum call stack size exceeded` and writing nothing
 - A session holding an `entry_patch` record nested more than about 22,500 levels deep (an elide pass writes a turn's whole content into one, its tool calls' arguments included) resumes, forks and is exported by `omp anonymize` instead of each failing with `Maximum call stack size exceeded`
+- Switching to the session already open (a reload) no longer fails with `Maximum call stack size exceeded` when one of its tool calls' arguments nests more than about 8,400 levels deep
 - A session imported with `--from-claude` or `--from-codex`, and every session that process switches to afterwards, now moves its older entries out of memory as other sessions do
 - omp no longer keeps older entry bodies in a temporary directory that another account made or can enter; the session keeps them compressed in memory instead
 - Reading older screenshots back, as an extension reading every message does, no longer keeps up to eight of them in memory past the 16 MiB the cache allows

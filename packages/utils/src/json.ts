@@ -1,4 +1,5 @@
 import { isBigIntObject, isBooleanObject, isNumberObject, isStringObject } from "node:util/types";
+import { ContainerPath, type NestedWalk, runNested } from "./nested-walk";
 
 /**
  * Try to parse JSON, returning null on failure.
@@ -263,4 +264,79 @@ export function stableStringifyJson(value: unknown): string {
 	const serialized = JSON.stringify(stableJsonClone(value));
 	if (serialized === undefined) throw new TypeError("Value is not JSON-serializable");
 	return serialized;
+}
+
+/**
+ * `Bun.deepEquals(a, b)` (not strict) for JSON-shaped data of any depth: it
+ * walks arrays and plain or null-prototype objects on its own stack
+ * ({@link runNested}), where `Bun.deepEquals` recurses and runs out of stack
+ * near 16,000 levels, while a value parsed from a transcript line nests
+ * 400,000. It keeps `Bun.deepEquals`' rules: an array equals an array whose
+ * element at each index (a hole and a missing trailing element read as
+ * `undefined`) is equal, other keys of an array ignored; an object equals an
+ * object with the same own enumerable string and symbol keys holding equal
+ * values, in any order, a key holding `undefined` read as absent and a
+ * prototype ignored; an array never equals an object. Every other pair (two
+ * primitives, compared as `Object.is` compares them; a `Date`, `Map`, boxed
+ * primitive or class instance) is compared by `Bun.deepEquals` itself. A
+ * cycle in `a`, which JSON data never holds, throws the `TypeError`
+ * `JSON.stringify` throws.
+ */
+export function jsonDeepEquals(a: unknown, b: unknown): boolean {
+	return isWalkedContainer(a) && isWalkedContainer(b)
+		? runNested(equalContainers(a, b, new ContainerPath()))
+		: Bun.deepEquals(a, b);
+}
+
+/** Whether {@link jsonDeepEquals} walks `value` itself: an array, or an object whose prototype is `Object.prototype` or `null`. */
+function isWalkedContainer(value: unknown): value is object {
+	if (typeof value !== "object" || value === null) return false;
+	if (Array.isArray(value)) return true;
+	const prototype = Object.getPrototypeOf(value);
+	return prototype === Object.prototype || prototype === null;
+}
+
+/** `value`'s own enumerable keys, strings in `Object.keys` order and then symbols. */
+function ownEnumerableKeys(value: object): Array<string | symbol> {
+	const keys: Array<string | symbol> = Object.keys(value);
+	for (const symbol of Object.getOwnPropertySymbols(value)) {
+		if (Object.prototype.propertyIsEnumerable.call(value, symbol)) keys.push(symbol);
+	}
+	return keys;
+}
+
+/** {@link jsonDeepEquals} of two containers it walks, `a` one `path` is inside of; each pair of child containers is a nested step. */
+function* equalContainers(a: object, b: object, path: ContainerPath): NestedWalk<boolean> {
+	if (a === b) return true;
+	const isArray = Array.isArray(a);
+	if (isArray !== Array.isArray(b)) return false;
+	path.enter(a);
+	if (isArray) {
+		const left = a as readonly unknown[];
+		const right = b as readonly unknown[];
+		const length = Math.max(left.length, right.length);
+		for (let index = 0; index < length; index++) {
+			const x = left[index];
+			const y = right[index];
+			const equal =
+				isWalkedContainer(x) && isWalkedContainer(y) ? yield equalContainers(x, y, path) : Bun.deepEquals(x, y);
+			if (!equal) return false;
+		}
+	} else {
+		let defined = 0;
+		for (const key of ownEnumerableKeys(a)) {
+			const x: unknown = Reflect.get(a, key);
+			if (x === undefined) continue;
+			defined++;
+			if (!Object.prototype.propertyIsEnumerable.call(b, key)) return false;
+			const y: unknown = Reflect.get(b, key);
+			const equal =
+				isWalkedContainer(x) && isWalkedContainer(y) ? yield equalContainers(x, y, path) : Bun.deepEquals(x, y);
+			if (!equal) return false;
+		}
+		for (const key of ownEnumerableKeys(b)) if (Reflect.get(b, key) !== undefined) defined--;
+		if (defined !== 0) return false;
+	}
+	path.leave(a);
+	return true;
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import * as vm from "node:vm";
 import {
+	jsonDeepEquals,
 	stableStringifyJson,
 	stringifyDeepJson,
 	stringifyJson,
@@ -355,4 +356,74 @@ describe("stringifyDeepJson", () => {
 		}
 		expect(stringifyDeepJson(chain, { bigintAsString: true }) === expected).toBe(true);
 	}, 60_000);
+});
+
+// Session code compares messages (a reload, the fallback model's fit, an RPC terminal frame, an Anthropic
+// request) by `Bun.deepEquals`, which recurses; an answer that differs from its answer changes what those
+// callers decide.
+describe("jsonDeepEquals", () => {
+	const symbol = Symbol("s");
+	const shared = { x: 1 };
+	const hole: unknown[] = [1];
+	hole[2] = 3;
+	class Point {
+		constructor(readonly x: number) {}
+	}
+	const cases: Record<string, readonly [unknown, unknown]> = {
+		nan: [Number.NaN, Number.NaN],
+		negativeZero: [0, -0],
+		numberAndString: [1, "1"],
+		undefinedAndNull: [{ a: undefined }, { a: null }],
+		holeAndUndefined: [hole, [1, undefined, 3]],
+		holeAndNull: [hole, [1, null, 3]],
+		trailingUndefined: [[1], [1, undefined]],
+		sharedAndCopies: [
+			{ a: shared, b: shared },
+			{ a: { x: 1 }, b: { x: 1 } },
+		],
+		keyOrder: [
+			{ a: 1, b: 2 },
+			{ b: 2, a: 1 },
+		],
+		undefinedProperty: [{ a: 1, u: undefined }, { a: 1 }],
+		nestedUndefinedProperty: [{ a: { u: undefined } }, { a: {} }],
+		symbolKeyDiffers: [
+			{ a: 1, [symbol]: 1 },
+			{ a: 1, [symbol]: 2 },
+		],
+		symbolKeyMissing: [{ a: 1, [symbol]: 1 }, { a: 1 }],
+		dateEqual: [new Date(0), new Date(0)],
+		dateDiffers: [new Date(0), new Date(1)],
+		dateAndObject: [new Date(0), {}],
+		mapEqual: [new Map([[1, { a: 2 }]]), new Map([[1, { a: 2 }]])],
+		mapDiffers: [new Map([[1, 2]]), new Map([[1, 3]])],
+		arrayAndObject: [[1, 2], { 0: 1, 1: 2 }],
+		classAndPlain: [new Point(1), { x: 1 }],
+		nullPrototypeAndPlain: [Object.assign(Object.create(null), { a: 1 }), { a: 1 }],
+		boxedAndPrimitive: [new Number(1), 1],
+		boxedEqual: [new Number(1), new Number(1)],
+		hidden: [Object.defineProperty({ a: 1 }, "h", { value: 2, enumerable: false }), { a: 1 }],
+		inherited: [Object.assign(Object.create({ inherited: 1 }), { a: 1 }), { a: 1 }],
+		arrayExtraKey: [Object.assign([1], { p: 1 }), [1]],
+		nestedDiffers: [{ a: [{ b: [1, 2] }] }, { a: [{ b: [1, 3] }] }],
+		nestedEqual: [{ a: [{ b: [1, { c: "x" }] }] }, { a: [{ b: [1, { c: "x" }] }] }],
+		extraKey: [{ a: 1 }, { a: 1, b: 2 }],
+	};
+	const answers = (equals: (a: unknown, b: unknown) => boolean): Record<string, readonly [boolean, boolean]> =>
+		Object.fromEntries(Object.entries(cases).map(([name, [a, b]]) => [name, [equals(a, b), equals(b, a)]]));
+
+	it("answers as Bun.deepEquals does for each kind of value, both ways round", () => {
+		expect(answers(jsonDeepEquals)).toEqual(answers((a, b) => Bun.deepEquals(a, b)));
+	});
+
+	// A transcript line nests 400,000 levels; `Bun.deepEquals` runs out of stack near 16,000.
+	it("compares values nested 50,000 levels", () => {
+		const chain = (bottom: unknown): unknown => {
+			let node = bottom;
+			for (let level = 0; level < 50_000; level++) node = level % 2 === 0 ? { next: node } : [node];
+			return node;
+		};
+		expect(jsonDeepEquals(chain({ leaf: "a" }), chain({ leaf: "a" }))).toBe(true);
+		expect(jsonDeepEquals(chain({ leaf: "a" }), chain({ leaf: "b" }))).toBe(false);
+	});
 });

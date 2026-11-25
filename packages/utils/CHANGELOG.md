@@ -20,6 +20,7 @@
 - Added `tryAcquireFileLockUnlessHeld`, which on Linux answers `null` at once from a probe while another holder owns the lease, for a caller that tries again later
 - Added `stringifyDeepJson`, `JSON.stringify` that also serializes a value nested deeper than the engine's recursion allows, and `stringifyJsonIteratively`, the explicit-stack writer it falls back to on that `RangeError`, which gives `JSON.stringify`'s bytes
 - Added a `bigintAsString` option to `stringifyDeepJson` and `stringifyJsonIteratively`, which writes a bigint as its decimal string, as `stringifyJson` does
+- Added `jsonDeepEquals`, `Bun.deepEquals` (not strict) for JSON-shaped data of any depth, which walks arrays and plain objects on its own stack
 
 ### Changed
 
