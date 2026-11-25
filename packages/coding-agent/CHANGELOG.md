@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `grep -o` in the bash tool prints a match anchored at the end of the line (`grep -oE '[0-9]+$'` printed nothing), and `grep -z` selects records with `^` or `$`. Under `-z`, the lines that `grep -c`, `-l` and `-L` print, and the `--` between context groups, end with a newline as in GNU grep, not with NUL
+- `rg --null-data` matches `$` at the end of each record with `-o`, `--count-matches`, `--column`, `--vimgrep` or `--replace`, and ends each record it prints with NUL, as ripgrep does: no newline follows a matched or context record any more, and `-o` matches, counts, file names and the `--` between context groups end with NUL instead of a newline. `rg --files` still ends each path with a newline
+
 ## [18.18.4] - 2026-11-09
 
 ### Added

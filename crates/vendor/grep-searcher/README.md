@@ -33,6 +33,13 @@ can be fed bytes as they come.
   (`pub(crate)`) for the `LineBuffer` methods the push search drives.
 - `src/searcher/mod.rs`, `src/lib.rs`: the `push` module and the `PushSearch`
   re-export.
+- `src/searcher/core.rs`: `Core::is_line_by_line_fast` takes the fast
+  line-by-line path for a line terminator other than `\n` (NUL under
+  `grep -z`) only when the matcher reports that same terminator. grep-regex
+  reports none for a regex with a text anchor (`^` or `$` outside multi-line
+  mode) and keeps such a regex off the fast path only for `\n`; under NUL the
+  regex ran over a buffer of many records, so `grep -z '[0-9]$'` selected no
+  NUL-terminated record.
 - `Cargo.toml`: `publish = false`. The crates.io `Cargo.toml.orig`, `Cargo.lock`
   and VCS metadata are dropped; `BUILD.bazel` and `rustfmt.toml` are workspace
   wiring.
