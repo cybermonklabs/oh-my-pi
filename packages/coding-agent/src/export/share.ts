@@ -36,7 +36,7 @@ import { $ } from "bun";
 import { obfuscateToolArguments } from "../secrets/message-transform";
 import type { JsonValue, SecretObfuscator } from "../secrets/obfuscator";
 import { SecretValueSet } from "../secrets/placeholder";
-import { collectJsonRegexSecretValues } from "../secrets/placeholder-scan";
+import { collectJsonRegexSecretValues, mapJsonStrings } from "../secrets/placeholder-scan";
 import { type SessionEntry, type SessionHeader, TITLE_CHANGE_ENTRY_TYPE } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
@@ -574,18 +574,18 @@ export async function sealToFit(key: CryptoKey, data: SessionData, maxBytes: num
 	if (sealed.byteLength <= maxBytes) return { sealed, truncated: false };
 
 	// Each trim copies only the containers it changes, so `data` stays whole: the caller may re-fit it at another budget.
-	const stripped = trimSnapshot(data, strippedImagePayload);
+	const stripped = stripSnapshotImages(data);
 	let working = stripped.snapshot;
-	// The trim measured the depth: a deep snapshot skips the `JSON.stringify` that would run out of stack on it.
+	// The image pass measured the depth: a deep snapshot skips the `JSON.stringify` that would run out of stack on it.
 	const seal = (snapshot: SessionData): Promise<Uint8Array<ArrayBuffer>> =>
 		sealSessionData(key, stripped.deep ? stringifyJsonIteratively(snapshot)! : JSON.stringify(snapshot));
 	sealed = await seal(working);
 	if (sealed.byteLength <= maxBytes) return { sealed, truncated: true };
 
 	for (const cap of TEXT_CAPS) {
-		working = trimSnapshot(working, child =>
-			typeof child === "string" && child.length > cap ? `${child.slice(0, cap)}\n…[truncated for share]` : child,
-		).snapshot;
+		working = mapJsonStrings(working as unknown as JsonValue, text =>
+			text.length > cap ? `${text.slice(0, cap)}\n…[truncated for share]` : text,
+		) as unknown as SessionData;
 		sealed = await seal(working);
 		if (sealed.byteLength <= maxBytes) return { sealed, truncated: true };
 	}
@@ -612,59 +612,59 @@ async function sealSessionData(key: CryptoKey, json: string): Promise<Uint8Array
 	return out;
 }
 
-/** `child` of a container with its inline image payload replaced by a tiny placeholder: an image block in an array, a `data:` URL under a key. */
-function strippedImagePayload(child: unknown, inArray: boolean): unknown {
-	if (inArray) {
-		const data = isRecord(child) && child.type === "image" ? child.data : undefined;
-		return typeof data === "string" && data.length > 1024 ? { type: "text", text: IMAGE_OMITTED_TEXT } : child;
-	}
-	return typeof child === "string" && child.length > 1024 && child.startsWith("data:") ? BLANK_IMAGE_DATA_URL : child;
-}
-
-/** A walk {@link trimSnapshot} runs. */
-interface SnapshotTrim {
-	/** A child of a container (an element when `inArray`), or what replaces it; the walk goes down into a child it keeps. */
-	readonly replace: (child: unknown, inArray: boolean) => unknown;
+/** The walk {@link stripSnapshotImages} runs: the containers it is inside, and the deepest level it reached. */
+interface ImageStrip {
 	readonly path: ContainerPath;
-	/** The deepest level the walk reached. */
 	deepest: number;
 }
 
 /**
- * `snapshot` with every child of every container that `replace` replaces
- * replaced, and whether it nests past {@link DEEP_SNAPSHOT_LEVELS}. A
+ * `snapshot` with each inline image payload replaced by a tiny placeholder
+ * (an image block in an array by a text block, a `data:` URL under a key by a
+ * blank image), and whether it nests past {@link DEEP_SNAPSHOT_LEVELS}. A
  * container nothing in which is replaced is shared with `snapshot`, and
  * `snapshot` itself is never changed. The walk keeps its own stack
- * ({@link runNested}), so it trims a snapshot of any depth a session entry
+ * ({@link runNested}), so it strips a snapshot of any depth a session entry
  * holds.
  */
-function trimSnapshot(
-	snapshot: SessionData,
-	replace: (child: unknown, inArray: boolean) => unknown,
-): { snapshot: SessionData; deep: boolean } {
-	const trim: SnapshotTrim = { replace, path: new ContainerPath(), deepest: 0 };
-	const trimmed = runNested(trimContainer(snapshot, trim, 0)) as SessionData;
-	return { snapshot: trimmed, deep: trim.deepest > DEEP_SNAPSHOT_LEVELS };
+function stripSnapshotImages(snapshot: SessionData): { snapshot: SessionData; deep: boolean } {
+	const strip: ImageStrip = { path: new ContainerPath(), deepest: 0 };
+	const stripped = runNested(stripContainerImages(snapshot, strip, 0)) as SessionData;
+	return { snapshot: stripped, deep: strip.deepest > DEEP_SNAPSHOT_LEVELS };
 }
 
-/** {@link trimSnapshot} of `container`, `level` levels down. */
-function* trimContainer(container: object, trim: SnapshotTrim, level: number): NestedWalk<object> {
-	trim.path.enter(container);
-	if (level > trim.deepest) trim.deepest = level;
-	const inArray = Array.isArray(container);
-	// An array's own keys are its indices, so it is read and copied as a record of them.
+/** {@link stripSnapshotImages} of `container`, `level` levels down. */
+function* stripContainerImages(container: object, strip: ImageStrip, level: number): NestedWalk<object> {
+	strip.path.enter(container);
+	if (level > strip.deepest) strip.deepest = level;
+	if (Array.isArray(container)) {
+		let out: unknown[] | undefined;
+		for (let index = 0; index < container.length; index++) {
+			const item: unknown = container[index];
+			const data = isRecord(item) && item.type === "image" ? item.data : undefined;
+			let next = typeof data === "string" && data.length > 1024 ? { type: "text", text: IMAGE_OMITTED_TEXT } : item;
+			if (next === item && typeof item === "object" && item !== null)
+				next = yield stripContainerImages(item, strip, level + 1);
+			if (next === item) continue;
+			out ??= container.slice();
+			out[index] = next;
+		}
+		strip.path.leave(container);
+		return out ?? container;
+	}
 	const holder = container as Record<string, unknown>;
 	let out: Record<string, unknown> | undefined;
 	for (const key of Object.keys(holder)) {
-		const child = holder[key];
-		let next = trim.replace(child, inArray);
-		if (next === child && typeof child === "object" && child !== null)
-			next = yield trimContainer(child, trim, level + 1);
-		if (next === child) continue;
-		out ??= inArray ? ((container as unknown[]).slice() as unknown as Record<string, unknown>) : { ...holder };
+		const item = holder[key];
+		let next =
+			typeof item === "string" && item.length > 1024 && item.startsWith("data:") ? BLANK_IMAGE_DATA_URL : item;
+		if (next === item && typeof item === "object" && item !== null)
+			next = yield stripContainerImages(item, strip, level + 1);
+		if (next === item) continue;
+		out ??= { ...holder };
 		out[key] = next;
 	}
-	trim.path.leave(container);
+	strip.path.leave(container);
 	return out ?? container;
 }
 
