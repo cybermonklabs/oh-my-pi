@@ -240,6 +240,16 @@ run() {
 	w="$(mktemp -d "$scratch/case.XXXXXX")"
 	mkdir -p "$w/bin" "$w/repo/.github/sami" "$w/tmp" "$w/logs" "$w/reflink"
 	: >"$w/native.tsv"
+	# The source of $DOC's crate, which the step scans before it runs cargo's
+	# doctests: one plain code block. DOC_SRC replaces it; DOC_SRC=none
+	# leaves the crate's directory with no .rs file; DOC_TOML is its Cargo.toml;
+	# DOC_LINK=1 makes src/lib.rs a symlink to a file outside it with DOC_SRC;
+	# DOC_TARGET_MOD=1 adds a module src/target/mod.rs with one plain block.
+	mkdir -p "$w/repo/crates/pi-diff/src"
+	[ "${DOC_SRC:-}" = none ] || printf '%s\n' "${DOC_SRC:-$doc_src_plain}" >"$w/repo/crates/pi-diff/src/lib.rs"
+	[ -z "${DOC_TOML:-}" ] || printf '%s\n' "$DOC_TOML" >"$w/repo/crates/pi-diff/Cargo.toml"
+	if [ -n "${DOC_LINK:-}" ]; then mv "$w/repo/crates/pi-diff/src/lib.rs" "$w/outside-lib.rs" && ln -s "$w/outside-lib.rs" "$w/repo/crates/pi-diff/src/lib.rs"; fi
+	if [ -n "${DOC_TARGET_MOD:-}" ]; then mkdir -p "$w/repo/crates/pi-diff/src/target" && printf '%s\n' "$doc_src_plain" >"$w/repo/crates/pi-diff/src/target/mod.rs"; fi
 	list() { # <file> <lines of `<a> <b>`> <why>
 		{ echo '# header'; echo; [ -n "$2" ] && printf '%s\n' "$2" | while read -r a b; do [ -n "$a" ] && printf '%s %s  %s\n' "$a" "$b" "$3"; done; } >"$w/repo/.github/sami/$1"
 	}
@@ -480,6 +490,8 @@ B=//crates/pi-builtins:pi-builtins_test
 D=//crates/pi-diff:pi-diff_test
 V=//crates/pi-vcs:pi-vcs_test
 DOC=//crates/pi-diff:pi-diff_doc_test
+# $DOC's crate source by default: one code block rustdoc runs, at line 3.
+doc_src_plain=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\npub fn f() {}'
 RT=//crates/pi-builtins:rsync_root_test
 # A passing test with output the known-output list names: the skip scan's
 # liveness check sees output in every case that expects a pass.
@@ -679,6 +691,120 @@ run J115-doctests-match 0 "Doctests that ran in Bazel and in cargo's readable re
 # build each dependency once (run 45553300236: 1148.5 s, nearly all of it
 # building the same dependencies again); the stub refuses a run without it.
 NOT_MSG='stub:|::error' run U1-crate-doctests-unify-features-over-the-workspace 0 "Doctests that ran in Bazel and in cargo's readable re-run: 1" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# V1-V9: a crate's cargo doctests run only when its source holds something
+# rustdoc could run (rust-test-doctests.awk). A crate with only ```ignore and
+# ```text blocks is skipped, with a line naming it; one plain block, an
+# include_str! doc attribute, an indented code block, no .rs file at all, or
+# a Cargo.toml source path that may be outside the crate (`..`, or quoted in
+# a way the check does not read), a symlinked source, or a doctest in a
+# module named target, runs it; and a
+# doctest Bazel ran in a skipped crate fails the comparison, naming the scan.
+DOCIGN1="dt $DOC PASSED printf 'running 1 test\ntest src/lib.rs - f (line 3) ... ignored\n\ntest result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s\n'"
+DOC_SRC=$'//! ```ignore\n//! f();\n//! ```\n//!\n//! ```text\n//! output\n//! ```\npub fn f() {}' NOT_MSG='stub:|::error|Cargo doctests run: crates/' run V1-crate-with-only-ignore-and-text-blocks-skipped 0 '^Cargo doctests not run: crates/pi-diff: its sources hold no code block rustdoc would run' '' "{ $P; rt $D PASSED lt_pass a::one; $DOCIGN1; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! ```text\n//! output\n//! ```\n//!\n//! ```\n//! assert!(true);\n//! ```\npub fn f() {}' NOT_MSG='stub:|::error|Cargo doctests not run' run V2-crate-with-one-plain-block-runs 0 '^Cargo doctests run: crates/pi-diff: crates/pi-diff/src/lib.rs:5: a code block rustdoc runs' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'#![doc = include_str!("../README.md")]\npub fn f() {}' NOT_MSG='stub:|::error|Cargo doctests not run' run V3-include-str-doc-counts-as-doctests 0 '^Cargo doctests run: crates/pi-diff: crates/pi-diff/src/lib.rs:1: a doc attribute, whose text this scan does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! ```text\n//! output\n//! ```\npub fn f() {}' run V4-doctest-the-scan-missed-fails-the-comparison 1 "crates/pi-diff src/lib.rs - f \\(line 3\\) ran in Bazel's doctest target, and cargo did not run crates/pi-diff's doctests: the source scan" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! Example:\n//!\n//!     assert!(true);\npub fn f() {}' NOT_MSG='stub:|::error|Cargo doctests not run' run V5-indented-code-block-runs 0 '^Cargo doctests run: crates/pi-diff: crates/pi-diff/src/lib.rs:3: an indented code block' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=none NOT_MSG='stub:|::error|Cargo doctests not run' run V6-crate-with-no-source-runs 0 '^Cargo doctests run: crates/pi-diff: no .rs file under crates/pi-diff rules doctests out' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! ```text\n//! output\n//! ```\npub fn f() {}' DOC_TOML=$'[package]\nname = "pi-diff"\n\n[lib]\npath = "../shared/lib.rs"' NOT_MSG='stub:|::error|Cargo doctests not run' run V7-cargo-toml-source-outside-the-crate-runs 0 '^Cargo doctests run: crates/pi-diff: crates/pi-diff/Cargo.toml:5: a source path that may be outside crates/pi-diff' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! ```text\n//! output\n//! ```\npub fn f() {}' DOC_TOML=$'[package]\nname = "pi-diff"\n\n[lib]\npath = \'src/lib.rs\'' NOT_MSG='stub:|::error|Cargo doctests not run' run V8-cargo-toml-single-quoted-path-runs 0 '^Cargo doctests run: crates/pi-diff: crates/pi-diff/Cargo.toml:5: a source path that may be outside crates/pi-diff' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! ```text\n//! output\n//! ```\npub fn f() {}' DOC_TOML=$'[package]\nname = "pi-diff"\n\n[lib]\n\"path\" = \"../shared/lib.rs\"' NOT_MSG='stub:|::error|Cargo doctests not run' run V9-cargo-toml-quoted-path-key-runs 0 '^Cargo doctests run: crates/pi-diff: crates/pi-diff/Cargo.toml:5: a source path that may be outside crates/pi-diff' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! ```text\n//! output\n//! ```\npub fn f() {}' DOC_LINK=1 NOT_MSG='stub:|::error|Cargo doctests not run' run V7b-symlinked-source-runs 0 '^Cargo doctests run: crates/pi-diff: crates/pi-diff/src/lib.rs:0: a symlink, which the scan does not follow' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! ```text\n//! output\n//! ```\npub mod target;' DOC_TARGET_MOD=1 NOT_MSG='stub:|::error|Cargo doctests not run' run V9b-module-named-target-runs 0 '^Cargo doctests run: crates/pi-diff: crates/pi-diff/src/target/mod.rs:3: a code block rustdoc runs' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# vscan <name> <yes|no> <source>: rust-test-doctests.awk on one file, which
+# must find something rustdoc runs (yes) or print `none` (no).
+vscan() {
+	if [ -n "$only" ] && ! [[ "$1" =~ $only ]]; then return 0; fi
+	local d out rc want=0 msg='lib\.rs:[0-9]+: '
+	d="$(mktemp -d "$scratch/scan.XXXXXX")"
+	printf '%s\n' "$3" >"$d/lib.rs"
+	out="$(LC_ALL=C awk -f "$repo/.github/sami/rust-test-doctests.awk" "$d/lib.rs" 2>&1)"
+	if [ "$out" = none ]; then rc=1; else rc=0; fi
+	if [ "$2" = no ]; then want=1; msg='^none$'; fi
+	verdict "$1" "$want" "$rc" "$msg" "$out"
+}
+vscan V10-plain-fence yes $'/// ```\n/// f();\n/// ```'
+vscan V11-rust-fence yes $'/// ```rust\n/// f();\n/// ```'
+vscan V12-no-run-fence yes $'/// ```no_run\n/// f();\n/// ```'
+vscan V13-compile-fail-fence yes $'/// ```compile_fail\n/// f();\n/// ```'
+vscan V14-edition-fence yes $'/// ```edition2021\n/// f();\n/// ```'
+vscan V15-ignore-fence no $'/// ```ignore\n/// f();\n/// ```'
+vscan V16-rust-ignore-fence no $'/// ```rust,ignore\n/// f();\n/// ```'
+vscan V17-text-fence no $'/// ```text\n/// out\n/// ```'
+vscan V18-sh-fence no $'/// ```sh\n/// ls\n/// ```'
+vscan V19-ignore-target-fence-runs-elsewhere yes $'/// ```ignore-windows\n/// f();\n/// ```'
+vscan V20-ignore-target-beats-ignore yes $'/// ```rust,ignore,ignore-windows\n/// f();\n/// ```'
+vscan V21-rust-tag-with-another-word yes $'/// ```rust,editable\n/// f();\n/// ```'
+vscan V22-quoted-info-string yes $'/// ```"rust"\n/// f();\n/// ```'
+vscan V23-class-only-info-string yes $'/// ```{.example}\n/// f();\n/// ```'
+vscan V24-tilde-fence yes $'/// ~~~\n/// f();\n/// ~~~'
+vscan V25-closing-fence-is-no-opening no $'/// ```text\n/// out\n/// ```\n/// More text.'
+vscan V26-unclosed-text-fence-ends-with-its-item yes $'/// ```text\n/// out\nfn a() {}\n/// ```\n/// f();\n/// ```\nfn b() {}'
+vscan V27-fence-inside-a-longer-text-fence no $'/// ````text\n/// ```\n/// f();\n/// ```\n/// ````'
+vscan V28-text-fence-in-a-list-item-ends-with-the-item yes $'/// - ```text\n///   out\n/// ```\n/// f();\n/// ```'
+vscan V29-text-fence-in-a-quote-ends-with-the-quote yes $'/// > ```text\n/// > out\n///\n/// ~~~rust\n/// f();\n/// ~~~'
+vscan V30-indented-code-block yes $'/// Example:\n///\n///     f();'
+vscan V31-indented-code-after-a-heading yes $'/// # Example\n///     f();'
+vscan V32-indented-code-in-a-quote yes $'/// > Example:\n/// >\n/// >     f();'
+vscan V33-indented-code-by-space-and-tab yes $'/// Example:\n///\n/// \tf();'
+vscan V34-paragraph-continuation-is-no-code no $'/// Some text\n///     continued.'
+vscan V35-block-doc-comment-fence yes $'/**\n * ```\n * f();\n * ```\n */\nfn a() {}'
+vscan V36-any-block-doc-runs yes $'/*!\n```text\nout\n```\n*/'
+vscan V37-block-doc-after-code-on-its-line yes $'pub mod m { /** ```\nf();\n``` */ pub fn f() {} }'
+vscan V38-doc-comment-after-code-on-its-line yes $'let x = 1; /// ```\n/// f();\n/// ```'
+vscan V39-four-slashes-is-no-doc no $'//// ```\n//// f();\n//// ```'
+vscan V40-doc-text-in-a-string-is-no-doc no $'let s = "/// ```\\n/// f();\\n/// ```";'
+vscan V41-doc-lines-in-a-raw-string-run yes $'let s = r#"\n/// ```\n/// f();\n/// ```\n"#;'
+vscan V42-doc-after-an-escaped-quote yes $'let s = "a\\"b"; /// ```\n/// f();\n/// ```'
+vscan V43-doc-after-a-quote-char yes $'let c = \'"\';\n/// ```\n/// f();\n/// ```\nfn g() {}'
+vscan V44-doc-after-a-lifetime yes $'fn f<\'a>(x: &\'a str) {}\n/// ```\n/// f();\n/// ```\nfn g() {}'
+vscan V45-doc-after-a-nested-block-comment yes $'/* a /* b */ c */\n/// ```\n/// f();\n/// ```\nfn g() {}'
+vscan V46-block-doc-inside-a-plain-comment-is-no-doc no $'/* plain /** ```\nf();\n``` */ still plain */'
+vscan V47-plain-doc-attribute yes '#[doc = "Plain words."]'
+vscan V48-doc-attribute-with-indented-code yes '#[doc = "Example:\n\n    assert!(true);"]'
+vscan V49-doc-attribute-over-lines yes $'#[\n    doc = include_str!("README.md")\n]'
+vscan V50-cfg-attr-doc yes '#![cfg_attr(docsrs, doc = concat!("a", "b"))]'
+vscan V51-doc-attribute-of-a-macro-variable yes '#[doc = $doc]'
+vscan V52-a-doc-variable-is-no-attribute no $'let doc = "x";\nlet mut doc = String::new();'
+vscan V53-include-of-code yes 'include!(concat!(env!("OUT_DIR"), "/gen.rs"));'
+vscan V54-include-spaced yes 'include ! ("generated.rs");'
+vscan V55-an-include-variable-is-no-macro no $'if include != other { f(include) }\nlet x = include\n    && y;'
+vscan V56-path-module-from-outside yes $'#[path = "../../shared/x.rs"]\nmod x;'
+vscan V57-path-module-absolute yes $'#[path = "/other/shared.rs"]\nmod x;'
+vscan V58-path-module-inside no $'#[path = "tcp/sock_unix.rs"]\nmod sock;'
+vscan V59-string-that-looks-like-a-block-doc no $'let s = b"/**";\nlet t = "x";'
+vscan V60-capitalised-ignore-runs yes $'/// ```rust,IGNORE\n/// f();\n/// ```'
+vscan V61-quote-after-a-paragraph yes $'/// Words.\n/// >     f();'
+vscan V62-raw-identifier-doc-attribute yes '#[r#doc = "x"]'
+vscan V63-doc-attribute-after-long-whitespace yes "$(printf '#[\n%100s\ndoc = include_str!("x")]' '')"
+vscan V64-escaped-path-module yes $'#[path = "\\x2fother/shared.rs"]\nmod x;'
+vscan V65-list-item-opening-with-indented-code yes $'/// -     f();'
+vscan V66-separator-only-info-string yes $'/// ```,,\n/// f();\n/// ```'
+vscan V67-quoted-target-ignore-beats-ignore yes $'/// ```ignore,"ignore-windows"\n/// f();\n/// ```'
+vscan V68-fence-in-an-html-block yes $'/// <pre>\n/// ```text\n/// </pre>\n///\n/// ```rust\n/// f();\n/// ```'
+vscan V69-fence-after-an-html-comment yes $'/// <!--\n/// ```text\n/// -->\n///\n/// ```\n/// f();\n/// ```'
+vscan V70-text-fence-after-a-list-ends-it no $'/// - item\n///\n/// ```text\n/// out\n/// ```'
+vscan V72-text-fence-in-a-list-item yes $'/// - item\n///\n///   ```text\n///   out\n///   ```'
+vscan V73-text-fence-in-a-quote yes $'/// > ```text\n/// > out\n/// > ```'
+vscan V71-crlf-closing-fence no $'/// ```text\r\n/// out\r\n/// ```\r\n/// More.\r'
+vscan V74-indented-code-after-an-html-comment yes $'/// <!-- c -->\n///     f();'
+vscan V75-indented-code-after-a-pre-block yes $'/// <pre>\n/// x\n/// </pre>\n///     f();'
+vscan V76-path-module-in-a-non-rs-file yes $'#[path = "shared.inc"]\npub mod shared;'
+vscan V77-fence-in-a-reference-title yes $'/// [label]: /url "\n/// ```text\n/// title"\n///\n/// ```rust\n/// f();\n/// ```'
+vscan V78-indented-code-after-a-reference-title yes $'/// [label]: /url "\n/// title"\n///     f();'
+vscan V79-indented-code-after-a-whole-reference yes $'/// [label]: /url "title"\n///     f();'
+vscan V80-text-fence-after-a-whole-reference no $'/// [label]: crate::x\n///\n/// ```text\n/// out\n/// ```'
+vscan V81-text-fence-after-a-footnote no $'/// [^1]: a note\n///\n/// ```text\n/// out\n/// ```'
+vscan V82-text-fence-after-a-list-of-links no $'/// - [`fs`]: the filesystem layer.\n///\n/// ```text\n/// out\n/// ```'
+vscan V83-fence-after-a-reference-with-a-title-below yes $'/// [label]: /url\n/// "title\n/// ```text\n/// still title"\n///\n/// ```\n/// f();\n/// ```'
+vscan V84-kept-star-before-indented-code yes $'/**\nExample:\nExplanation.\n*     f();\n*/\npub fn f() {}'
+vscan V85-decorated-block-doc-text-fence yes $'/**\n * ```text\n * out\n * ```\n */\npub fn f() {}'
+vscan V86-decoration-makes-a-blank-and-indented-code yes $'/**\n *Example:\n *Explanation.\n *\n *    f();\n */\npub fn f() {}'
+vscan V87-selective-decoration yes $'/**\n *```text\n *Explanation.\n *\n *    f();\n */\npub fn f() {}'
+vscan V88-form-feed-in-a-doc-attribute yes "$(printf '#[\fdoc = "x"]')"
+vscan V89-line-separator-in-code yes "$(printf 'include\342\200\250!("x.rs");')"
+vscan V90-carriage-return-inside-a-line yes "$(printf '#[\rdoc = "x"]')"
+vscan V71-crlf-closing-fence no $'/// ```text\r\n/// out\r\n/// ```\r\n/// More.\r'
 # R3-1: a line a test binary writes outside libtest's record (a child's or a
 # thread's write to the inherited stream) is a skip if it has a skip word,
 # and must match rust-test-known-raw-output.txt otherwise, or the job fails.
@@ -807,6 +933,10 @@ ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strfti
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$D m::langinfo" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="m::langinfo" run K4-only-canary-silent 1 "UNKNOWN: the canary $PR p::canary printed nothing" '' 'exit 9'
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" OWN_BODY="if [ \"\$OWN_TARGET\" = $D ]; then FMT=json rt $D FAILED printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 2 }\n{ \"type\": \"test\", \"name\": \"m::langinfo\", \"event\": \"failed\", \"stdout\": \"left: 1\" }\n{ \"type\": \"test\", \"name\": \"m::strftime\", \"event\": \"ok\" }\n{ \"type\": \"suite\", \"event\": \"failed\", \"passed\": 1, \"failed\": 1, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 1, \"exec_time\": 0.0 }\n' >\"\$bep\"; exit 3; fi; own_default" run K5-only-listed-test-fails 1 "$D m::langinfo failed and is not in" '' 'exit 9'
 ONLY="$ONLYT" OWN_TESTS="m::langinfo m::strftime" run K6-only-without-canary 1 'RUST_TEST_ONLY is set and RUST_TEST_CANARY is not' '' 'exit 9'
+# K12: with RUST_TEST_ONLY (the macOS job) every crate's cargo doctests run,
+# also one whose source holds only ```ignore and ```text blocks: no
+# comparison with Bazel's doctests backs a skip there.
+DOC_SRC=$'//! ```ignore\n//! f();\n//! ```\n//!\n//! ```text\n//! output\n//! ```\npub fn f() {}' ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" NOT_MSG='::error|Cargo doctests not run' run K12-only-runs-every-crates-doctests 0 '^Cargo doctests run: crates/pi-diff: with RUST_TEST_ONLY no comparison' '' 'exit 9'
 # R2: the macOS job runs the cargo workspaces and the cargo doctests too, with
 # the same rules; the #[ignore]d cargo tests are left to the Linux job.
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" CARGO_MODE=fail-lib run K7-only-cargo-test-fails 1 "sdk/rust/demo:lib:demo demo::broken failed and is not in" '' 'exit 9'

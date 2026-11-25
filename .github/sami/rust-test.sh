@@ -135,6 +135,9 @@ libtest_event='def libtest_event:
 # rust-test-parity.sh and rust-test-macos-inventory.sh.
 # shellcheck source=.github/sami/rust-test-lists.sh
 . "$(dirname "${BASH_SOURCE[0]}")/rust-test-lists.sh"
+# The scan of a crate's source for doctests (run_cargo).
+doc_scan="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rust-test-doctests.awk"
+[ -f "$doc_scan" ] || stop "$doc_scan is missing"
 
 # entries <list> <fields> <tsv>: list_entries of .github/sami/<list>.
 entries() {
@@ -681,7 +684,7 @@ cargo_test() {
 	fi
 }
 run_cargo() {
-	local n=0 manifest dir label selector name kind rest i target test
+	local n=0 manifest dir label selector name kind rest i target test scan scan_rc why link
 	channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
 	[ -n "$channel" ] || stop "rust-toolchain.toml names no channel"
 	rustup toolchain install "$channel" --profile minimal --no-self-update
@@ -725,9 +728,67 @@ run_cargo() {
 	# the tree this was measured on, the same doctests ran, by name, with
 	# and without it. The comparison with Bazel's doctests below catches a
 	# doctest added or lost, not a change in what one does.
+	# On Linux, a crate's cargo doctests run only when its sources hold
+	# something rustdoc could run as a doctest (.github/sami/rust-test-doctests.awk
+	# lexes every .rs file under the crate's directory, and says yes to
+	# whatever it cannot read; a Cargo.toml path that may be outside the
+	# directory is a yes too). In run 45590681744, 10 of the 13 crates ran
+	# no doctest and their builds took 558 s; pi-ast, pi-builtins and
+	# pi-voice alone 557 s. The scan reads the source, not an earlier run's
+	# count, so a doctest added to a skipped crate brings its cargo run back
+	# by itself.
+	# What the scan cannot see: a doc comment that another crate's macro
+	# (a derive, an attribute macro, an item macro) generates is in no
+	# source file. On Linux the comparison of Bazel's doctests with cargo's
+	# below catches it: a doctest Bazel runs in a skipped crate fails the
+	# job and names the scan. With RUST_TEST_ONLY (the macOS job) there is
+	# no such comparison, so there every crate's doctests run.
+	: >"$tmp/doc-skipped.txt"
 	while read -r dir; do
+		scan_rc=0
+		if [ -n "$only" ]; then
+			echo "Cargo doctests run: $dir: with RUST_TEST_ONLY no comparison with Bazel's doctests backs a skip, so every crate runs"
+			cargo_test "$dir:doc" "$dir/Cargo.toml" cargo --doc -Zfeature-unification --config 'resolver.feature-unification="workspace"' --
+			continue
+		fi
+		# A Cargo.toml path that is not a plain double-quoted relative path
+		# to a .rs file inside the directory (single quotes, escapes, `..`,
+		# absolute, another extension), a
+		# lib table written inline or dotted, a quoted path or lib key, or a
+		# key with an escape, can name a source the scan does not read; so
+		# can a symlink under the directory (find -type f does not follow
+		# it, and cargo does).
+		scan="$(awk '/^[ \t]*[^[#=]*\\[^=]*=/ { print FNR; exit }
+			/^[ \t]*("lib"|'"'"'lib'"'"'|lib)[ \t]*[=.]/ { print FNR; exit }
+			/^[ \t]*("path"|'"'"'path'"'"'|path)[ \t]*=/ { v = $0; sub(/^[^=]*=[ \t]*/, "", v)
+				if ($0 !~ /^[ \t]*path[ \t]*=/ || v !~ /^"[A-Za-z0-9_][^"\\]*\.rs"[ \t]*(#.*)?$/ || index(v, "..")) { print FNR; exit } }' "$dir/Cargo.toml" 2>/dev/null || true)"
+		link="$(find "$dir" -type l -print -quit 2>/dev/null || true)"
+		if [ -n "$scan" ]; then
+			scan="$dir/Cargo.toml:$scan: a source path that may be outside $dir, which the scan does not read"
+		elif [ -n "$link" ]; then
+			scan="$link:0: a symlink, which the scan does not follow"
+		else
+			scan="$(find "$dir" -name '*.rs' -type f -exec env LC_ALL=C awk -f "$doc_scan" {} + 2>&1)" || scan_rc=$?
+		fi
+		# Each awk run prints one finding or `none`. Only `none` from every
+		# run, and a clean exit, is a no; anything else runs cargo.
+		why="$(printf '%s\n' "$scan" | grep -v -x -m 1 none || true)"
+		if [ -z "$why" ] && [ -n "$scan" ] && [ "$scan_rc" = 0 ]; then
+			echo "Cargo doctests not run: $dir: its sources hold no code block rustdoc would run (no fenced block whose info string rustdoc may run, no indented code block, and no doc attribute, include! or outside path module, which the scan does not read)"
+			printf '%s\n' "$dir" >>"$tmp/doc-skipped.txt"
+			continue
+		fi
+		if [ -z "$scan" ]; then
+			why="no .rs file under $dir rules doctests out"
+		elif [ -z "$why" ]; then
+			why="the scan exited $scan_rc, so nothing rules doctests out"
+		elif [[ ! "$why" =~ ^.+:[0-9]+:\  ]]; then
+			why="the scan failed ($why), so nothing rules doctests out"
+		fi
+		echo "Cargo doctests run: $dir: $why"
 		cargo_test "$dir:doc" "$dir/Cargo.toml" cargo --doc -Zfeature-unification --config 'resolver.feature-unification="workspace"' --
 	done <"$tmp/doc-dirs.txt"
+	echo "Crates whose cargo doctests the source scan skipped: $(count "$tmp/doc-skipped.txt")"
 	# The #[ignore]d cargo tests run alone on Linux, where the network can be
 	# taken away (rust-test-offline.sh).
 	[ -z "$only" ] || return 0
@@ -1144,7 +1205,11 @@ if [ -z "$only" ]; then
 	awk -F'\t' '{ d = $1; n = $2; if (index(n, d "/") == 1) n = substr(n, length(d) + 2); print d "\t" n }' "$tmp/doc-names-cargo.tsv" | LC_ALL=C sort -u >"$tmp/doc-cargo.tsv"
 	LC_ALL=C sort -u "$tmp/doc-names-bazel.tsv" >"$tmp/doc-bazel.tsv"
 	while IFS=$'\t' read -r dir name; do
-		error "Rust tests" "$dir $name ran in Bazel's doctest target and not in cargo's doctest run of $dir, whose output the skip scan reads: give cargo the same features"
+		if grep -qxF -- "$dir" "$tmp/doc-skipped.txt"; then
+			error "Rust tests" "$dir $name ran in Bazel's doctest target, and cargo did not run $dir's doctests: the source scan (.github/sami/rust-test-doctests.awk) found nothing rustdoc runs in $dir and missed this doctest"
+		else
+			error "Rust tests" "$dir $name ran in Bazel's doctest target and not in cargo's doctest run of $dir, whose output the skip scan reads: give cargo the same features"
+		fi
 	done < <(LC_ALL=C comm -23 "$tmp/doc-bazel.tsv" "$tmp/doc-cargo.tsv")
 	while IFS=$'\t' read -r dir name; do
 		error "Rust tests" "$dir $name ran in cargo's doctest run and not in Bazel's doctest target of $dir"
