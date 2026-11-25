@@ -72,7 +72,7 @@ import { getHeadersFromError, getRetryAfterMsFromHeaders } from "@oh-my-pi/pi-ai
 import { resolvePromptCacheLookback } from "@oh-my-pi/pi-catalog/compat/prompt-cache-lookback";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
-import { isRecord, logger, prompt, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { isRecord, jsonDeepEquals, logger, prompt, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { writeArtifact } from "./artifacts";
 import type { ModelRegistry } from "../config/model-registry";
@@ -4535,15 +4535,15 @@ export class SessionMaintenance {
 			// counted: the session stays on its model, so the cut stays on it too.
 			const readerMessages = this.#host.buildDisplaySessionContext(model, { measureOnly: true }).messages;
 			// The rebuild can return copies (secret deobfuscation), so the failed turn also matches by what
-			// it holds; at most one message is dropped, newest first, so an earlier reply sharing its
-			// millisecond stays counted.
+			// it holds, compared on its own stack (a tool call's arguments are any JSON); at most one message
+			// is dropped, newest first, so an earlier reply sharing its millisecond stays counted.
 			const excludedIndex = activeExcludedMessage
 				? readerMessages.findLastIndex(
 						message =>
 							message === activeExcludedMessage ||
 							(message.role === "assistant" &&
 								message.timestamp === activeExcludedMessage.timestamp &&
-								Bun.deepEquals(message.content, activeExcludedMessage.content)),
+								jsonDeepEquals(message.content, activeExcludedMessage.content)),
 					)
 				: -1;
 			const sentMessages =
