@@ -347,19 +347,14 @@ export function withoutUndefinedFields<T extends object>(
 	fields: T,
 	keys: readonly (keyof T)[] = Object.keys(fields) as (keyof T)[],
 ): Partial<T> {
-	const defined: Partial<T> = {};
+	// Own fields only: a key list naming `__proto__` would read the prototype of fields without that key. Object.fromEntries
+	// defines each key as an own field, as JSON.parse does, where assigning `__proto__` would swap the copy's prototype.
+	const defined: [keyof T, unknown][] = [];
 	for (const key of keys) {
-		const value = fields[key];
-		if (value === undefined) continue;
-		// Assigning `__proto__` would swap the copy's prototype instead of
-		// creating the own data property JSON.parse produces.
-		if (key === "__proto__") {
-			Object.defineProperty(defined, key, { value, enumerable: true, writable: true, configurable: true });
-		} else {
-			defined[key] = value;
-		}
+		const value = Object.hasOwn(fields, key) ? fields[key] : undefined;
+		if (value !== undefined) defined.push([key, value]);
 	}
-	return defined;
+	return Object.fromEntries(defined) as Partial<T>;
 }
 
 /**

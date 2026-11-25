@@ -7,7 +7,7 @@ import type { ServiceTierByFamily } from "@oh-my-pi/pi-ai";
 import type { CompactionThresholdPair } from "../config/compaction-threshold";
 import { all as allSettings, lookup as lookupSetting } from "../config/registry";
 import { buildServiceTierByFamily, isServiceTierForFamily, resolveSubagentServiceTier } from "../config/service-tier";
-import { deleteByPath, getByPath, type RawSettings, type Settings, setByPath } from "../config/settings";
+import { deleteByPath, getByPath, type RawSettings, type Settings, setByPath, setOwn } from "../config/settings";
 import {
 	cfgCompactionModelThresholdsEnabled,
 	cfgCompactionThresholdPercent,
@@ -196,18 +196,6 @@ export interface SubagentSettingsWrites {
 	readonly overrides?: SettingsLayerWrites;
 }
 
-/**
- * Sets `record[key]` as an own data property. Assigning `__proto__` would swap the record's prototype instead of
- * creating the own data property JSON.parse produces.
- */
-function setOwnField(record: Record<string, unknown>, key: string, value: unknown): void {
-	if (key === "__proto__") {
-		Object.defineProperty(record, key, { value, enumerable: true, writable: true, configurable: true });
-	} else {
-		record[key] = value;
-	}
-}
-
 /** The top-level keys whose value in `layer` differs from `baseline`'s; `undefined` when none does. */
 export function layerWrites(baseline: RawSettings, layer: RawSettings): SettingsLayerWrites | undefined {
 	let set: Record<string, unknown> | undefined;
@@ -218,7 +206,7 @@ export function layerWrites(baseline: RawSettings, layer: RawSettings): Settings
 		const after = Object.hasOwn(layer, key) ? layer[key] : undefined;
 		if (Bun.deepEquals(before, after)) continue;
 		if (after === undefined) (removed ??= []).push(key);
-		else setOwnField((set ??= {}), key, after);
+		else setOwn((set ??= {}), key, after);
 	}
 	return set || removed ? { set, removed } : undefined;
 }
@@ -231,7 +219,7 @@ export function withLayerWrites(layer: RawSettings, writes: SettingsLayerWrites 
 	const written: RawSettings = {};
 	for (const key of new Set([...Object.keys(layer), ...Object.keys(set)])) {
 		const value = Object.hasOwn(set, key) ? set[key] : removed.has(key) ? undefined : layer[key];
-		if (value !== undefined) setOwnField(written, key, value);
+		if (value !== undefined) setOwn(written, key, value);
 	}
 	return written;
 }

@@ -577,22 +577,40 @@ for (const { where, secret, fields } of [
 	}, 30_000);
 }
 
-/** Sets `modelUndefinedFields` in the newest revive inputs of the transcript at `sessionFile`, as a forged file would. */
-async function forgeModelUndefinedFields(sessionFile: string, fieldPaths: string[][]): Promise<void> {
+/**
+ * Changes the newest revive inputs of the transcript at `sessionFile`, as a forged or damaged file would: `edit` changes
+ * them in place as JSON.parse reads them, and the file then holds them as JSON.stringify writes them. Returns their line
+ * as the park wrote it and as it is now.
+ */
+async function rewriteNewestReviveEntry(
+	sessionFile: string,
+	edit: (entry: unknown) => void,
+): Promise<{ recorded: string; forged: string }> {
 	const lines = (await Bun.file(sessionFile).text()).split("\n");
 	const index = lines.findLastIndex(line => line.includes('"customType":"subagent-revive-state"'));
-	const entry: unknown = index === -1 ? undefined : JSON.parse(lines[index]!);
-	if (
-		!isRecord(entry) ||
-		!isRecord(entry.data) ||
-		!isRecord(entry.data.options) ||
-		!isRecord(entry.data.options.model)
-	) {
-		throw new Error("The park recorded no revive inputs holding the model");
-	}
-	entry.data.modelUndefinedFields = fieldPaths;
-	lines[index] = JSON.stringify(entry);
+	if (index === -1) throw new Error("The park recorded no revive inputs");
+	const recorded = lines[index]!;
+	const entry: unknown = JSON.parse(recorded);
+	edit(entry);
+	const forged = JSON.stringify(entry);
+	lines[index] = forged;
 	await Bun.write(sessionFile, lines.join("\n"));
+	return { recorded, forged };
+}
+
+/** Sets `modelUndefinedFields` in the newest revive inputs of the transcript at `sessionFile`, as a forged file would. */
+async function forgeModelUndefinedFields(sessionFile: string, fieldPaths: string[][]): Promise<void> {
+	await rewriteNewestReviveEntry(sessionFile, entry => {
+		if (
+			!isRecord(entry) ||
+			!isRecord(entry.data) ||
+			!isRecord(entry.data.options) ||
+			!isRecord(entry.data.options.model)
+		) {
+			throw new Error("The park recorded no revive inputs holding the model");
+		}
+		entry.data.modelUndefinedFields = fieldPaths;
+	});
 }
 
 // If this regresses, a session file whose revive inputs name a model field through `__proto__` (forged or damaged)
@@ -658,24 +676,18 @@ async function forgeProtoKeys(
 	sessionFile: string,
 	values: { options: object; wake: object; global: object; overrides: object },
 ): Promise<unknown> {
-	const lines = (await Bun.file(sessionFile).text()).split("\n");
-	const index = lines.findLastIndex(line => line.includes('"customType":"subagent-revive-state"'));
-	if (index === -1) throw new Error("The park recorded no revive inputs");
-	const recorded: unknown = JSON.parse(lines[index]!);
-	const entry: unknown = JSON.parse(lines[index]!);
-	defineProtoKey(fieldAt(entry, "data", "options"), values.options);
-	defineProtoKey(fieldAt(entry, "data", "wake"), values.wake);
-	defineProtoKey(fieldAt(entry, "data", "settingsWrites", "global", "set"), values.global);
-	const settingsWrites = fieldAt(entry, "data", "settingsWrites");
-	const overrides = {};
-	defineProtoKey(overrides, values.overrides);
-	if (isRecord(settingsWrites)) settingsWrites.overrides = { set: overrides };
-	const forged = JSON.stringify(entry);
+	const { recorded, forged } = await rewriteNewestReviveEntry(sessionFile, entry => {
+		defineProtoKey(fieldAt(entry, "data", "options"), values.options);
+		defineProtoKey(fieldAt(entry, "data", "wake"), values.wake);
+		defineProtoKey(fieldAt(entry, "data", "settingsWrites", "global", "set"), values.global);
+		const settingsWrites = fieldAt(entry, "data", "settingsWrites");
+		const overrides = {};
+		defineProtoKey(overrides, values.overrides);
+		if (isRecord(settingsWrites)) settingsWrites.overrides = { set: overrides };
+	});
 	expect(forged.includes('"__proto__":{"polluted":true}')).toBe(true);
 	expect(forged.includes('"overrides":{"set":{"__proto__":{}}}')).toBe(true);
-	lines[index] = forged;
-	await Bun.write(sessionFile, lines.join("\n"));
-	return fieldAt(recorded, "data");
+	return fieldAt(JSON.parse(recorded), "data");
 }
 
 // If this regresses, a session file whose revive inputs hold a `__proto__` key (forged or damaged) gives the subagent

@@ -218,8 +218,9 @@ export function setByPath(obj: RawSettings, segments: readonly string[], value: 
  * Assign `obj[key]` as an own property. Plain assignment of a parsed
  * `__proto__` key (an agent name, say) would replace the prototype instead,
  * silently dropping that entry.
+ * Other modules that copy parsed records use it too.
  */
-function setOwn(obj: RawSettings, key: string, value: unknown): void {
+export function setOwn(obj: RawSettings, key: string, value: unknown): void {
 	if (key === "__proto__") {
 		Object.defineProperty(obj, key, { value, enumerable: true, writable: true, configurable: true });
 	} else {
