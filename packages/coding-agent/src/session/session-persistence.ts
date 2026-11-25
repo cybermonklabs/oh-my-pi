@@ -2,8 +2,10 @@ import { isAnthropicServerToolHistoryBlock } from "@oh-my-pi/pi-ai/providers/ant
 import {
 	ContainerPath,
 	countNewlines,
+	DEEP_JSON_LEVELS,
 	isRecord,
 	type NestedWalk,
+	nestsDeeperThan,
 	runNested,
 	stringifyDeepJson,
 	stringifyJsonIteratively,
@@ -267,13 +269,6 @@ type PersistenceScan = "clean" | "dirty" | "deep";
  */
 const PERSISTENCE_SCAN_DEPTH = 1_000;
 
-/**
- * Levels past which a persisted value is written by `stringifyJsonIteratively`:
- * Bun's `JSON.stringify` takes seconds past about 25,000 levels and runs out
- * of stack at 40,000, while a transcript line can nest 400,000.
- */
-const DEEP_JSON_LEVELS = 10_000;
-
 /** A session line holds a bigint (an extension hook can put one in an entry) as its decimal string. */
 const BIGINT_AS_STRING = { bigintAsString: true } as const;
 
@@ -516,12 +511,12 @@ function containerStep(
 
 /**
  * The JSON text {@link entryRecordText} writes for `entry`, an entry parsed from a session file, whose
- * images are blob references already: by `stringifyJsonIteratively` when {@link persistenceScan} finds
- * it deeper than it scans, where `JSON.stringify` would take seconds or run out of stack, else by
- * `JSON.stringify`.
+ * images are blob references already: by `stringifyJsonIteratively` past {@link DEEP_JSON_LEVELS} levels,
+ * as {@link persistedEntryText} writes its line, where `JSON.stringify` would take seconds or run out of
+ * stack, else by `JSON.stringify`.
  */
 export function loadedEntryRecordText(entry: FileEntry): string {
-	return persistedJson(entry, { deep: persistenceScan(entry) === "deep" });
+	return persistedJson(entry, { deep: nestsDeeperThan(entry, DEEP_JSON_LEVELS) });
 }
 
 /** The first `count` own enumerable fields of `holder`, in `for…in` order, as key-value pairs. */

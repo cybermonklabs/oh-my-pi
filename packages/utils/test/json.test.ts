@@ -371,17 +371,28 @@ describe("stringifyDeepJson", () => {
 	}, 20_000);
 
 	// Bun's `JSON.stringify` spends 1.5 s or more running out of stack on a value 40,000 levels deep before the
-	// fallback writes it; a caller that writes the same messages again and again paid that on every write.
-	it("writes a value nested past 1,000 levels without trying JSON.stringify on it, given space or probeDepth", () => {
-		let deep: unknown = { leaf: "bottom" };
-		for (let index = 0; index < 50_000; index++) deep = { next: deep };
+	// fallback writes it; a caller that writes the same messages again and again paid that on every write. Below
+	// 10,000 levels it takes milliseconds, faster than the iterative writer, so `probeDepth` leaves such a value to it.
+	it("writes a value without trying JSON.stringify on it past 1,000 levels given space, and past 10,000 given probeDepth", () => {
+		const nested = (levels: number): unknown => {
+			let node: unknown = { leaf: "bottom" };
+			for (let index = 0; index < levels; index++) node = { next: node };
+			return node;
+		};
+		const deep = nested(50_000);
+		const middle = nested(5_000);
 		const shallow = { a: [1, { b: "c" }], d: null };
 		const stringify = spyOn(JSON, "stringify");
 		try {
 			for (const options of [{ space: 2 }, { probeDepth: true }]) {
 				expect(stringifyDeepJson(deep, options) === stringifyJsonIteratively(deep)).toBe(true);
 			}
-			expect(stringify.mock.calls.filter(([value]) => value === deep)).toHaveLength(0);
+			expect(stringifyDeepJson(middle, { space: 2 }) === stringifyJsonIteratively(middle)).toBe(true);
+			expect(stringifyDeepJson(middle, { probeDepth: true }) === stringifyJsonIteratively(middle)).toBe(true);
+			expect({
+				deep: stringify.mock.calls.filter(([value]) => value === deep).length,
+				middle: stringify.mock.calls.filter(([value]) => value === middle).length,
+			}).toEqual({ deep: 0, middle: 1 });
 			expect(stringifyDeepJson(shallow, { probeDepth: true })).toBe(JSON.stringify(shallow));
 		} finally {
 			stringify.mockRestore();

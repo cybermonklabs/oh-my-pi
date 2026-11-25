@@ -22,7 +22,7 @@
 - Added a `bigintAsString` option to `stringifyDeepJson` and `stringifyJsonIteratively`, which writes a bigint as its decimal string, as `stringifyJson` does
 - Added `jsonDeepEquals`, `Bun.deepEquals` (not strict) for JSON-shaped data of any depth, which walks arrays and plain objects on its own stack
 - Added a `space` option to `stringifyDeepJson`, which indents as `JSON.stringify` does a value nested at most `INDENTED_JSON_LEVELS` (1,000) levels deep and writes a deeper one without indentation, and `nestsDeeperThan`, the depth check it uses, which imports nothing so a browser bundle can use it
-- Added a `probeDepth` option to `stringifyDeepJson`: like `space`, it checks the depth first, so a value nested past `INDENTED_JSON_LEVELS` levels goes straight to the iterative writer instead of first spending 1.5 s or more in a `JSON.stringify` that runs out of stack; with `space`, such a value no longer pays that attempt either
+- Added a `probeDepth` option to `stringifyDeepJson`: it checks the depth first, so a value nested past `DEEP_JSON_LEVELS` (10,000) levels, the new export where a writer should switch to the iterative one, goes straight to it instead of first spending 1.5 s or more in a `JSON.stringify` that runs out of stack; with `space`, a value past `INDENTED_JSON_LEVELS` no longer pays that attempt either
 
 ### Changed
 

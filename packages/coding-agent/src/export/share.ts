@@ -24,11 +24,12 @@ import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-a
 import {
 	$which,
 	ContainerPath,
+	DEEP_JSON_LEVELS,
 	isRecord,
 	logger,
 	type NestedWalk,
+	nestsDeeperThan,
 	runNested,
-	stringifyDeepJson,
 	stringifyJsonIteratively,
 } from "@oh-my-pi/pi-utils";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
@@ -561,24 +562,18 @@ interface SealedSession {
 	truncated: boolean;
 }
 
-/**
- * Levels past which a snapshot is written by `stringifyJsonIteratively`: Bun's
- * `JSON.stringify` takes milliseconds below them, seconds past about 25,000
- * levels, and runs out of stack near 40,000.
- */
-const DEEP_SNAPSHOT_LEVELS = 10_000;
-
 /** Seal `data`, trimming content until the sealed blob fits `maxBytes`. Exported for tests. */
 export async function sealToFit(key: CryptoKey, data: SessionData, maxBytes: number): Promise<SealedSession> {
-	let sealed = await sealSessionData(key, stringifyDeepJson(data)!);
+	// One rule for every seal: a snapshot nested past DEEP_JSON_LEVELS skips the `JSON.stringify` that takes seconds
+	// or runs out of stack on it. No trim makes a snapshot deeper.
+	const deep = nestsDeeperThan(data, DEEP_JSON_LEVELS);
+	const seal = (snapshot: SessionData): Promise<Uint8Array<ArrayBuffer>> =>
+		sealSessionData(key, deep ? stringifyJsonIteratively(snapshot)! : JSON.stringify(snapshot));
+	let sealed = await seal(data);
 	if (sealed.byteLength <= maxBytes) return { sealed, truncated: false };
 
 	// Each trim copies only the containers it changes, so `data` stays whole: the caller may re-fit it at another budget.
-	const stripped = stripSnapshotImages(data);
-	let working = stripped.snapshot;
-	// The image pass measured the depth: a deep snapshot skips the `JSON.stringify` that would run out of stack on it.
-	const seal = (snapshot: SessionData): Promise<Uint8Array<ArrayBuffer>> =>
-		sealSessionData(key, stripped.deep ? stringifyJsonIteratively(snapshot)! : JSON.stringify(snapshot));
+	let working = stripSnapshotImages(data);
 	sealed = await seal(working);
 	if (sealed.byteLength <= maxBytes) return { sealed, truncated: true };
 
@@ -612,31 +607,21 @@ async function sealSessionData(key: CryptoKey, json: string): Promise<Uint8Array
 	return out;
 }
 
-/** The walk {@link stripSnapshotImages} runs: the containers it is inside, and the deepest level it reached. */
-interface ImageStrip {
-	readonly path: ContainerPath;
-	deepest: number;
-}
-
 /**
  * `snapshot` with each inline image payload replaced by a tiny placeholder
  * (an image block in an array by a text block, a `data:` URL under a key by a
- * blank image), and whether it nests past {@link DEEP_SNAPSHOT_LEVELS}. A
- * container nothing in which is replaced is shared with `snapshot`, and
- * `snapshot` itself is never changed. The walk keeps its own stack
- * ({@link runNested}), so it strips a snapshot of any depth a session entry
- * holds.
+ * blank image). A container nothing in which is replaced is shared with
+ * `snapshot`, and `snapshot` itself is never changed. The walk keeps its own
+ * stack ({@link runNested}), so it strips a snapshot of any depth a session
+ * entry holds.
  */
-function stripSnapshotImages(snapshot: SessionData): { snapshot: SessionData; deep: boolean } {
-	const strip: ImageStrip = { path: new ContainerPath(), deepest: 0 };
-	const stripped = runNested(stripContainerImages(snapshot, strip, 0)) as SessionData;
-	return { snapshot: stripped, deep: strip.deepest > DEEP_SNAPSHOT_LEVELS };
+function stripSnapshotImages(snapshot: SessionData): SessionData {
+	return runNested(stripContainerImages(snapshot, new ContainerPath())) as SessionData;
 }
 
-/** {@link stripSnapshotImages} of `container`, `level` levels down. */
-function* stripContainerImages(container: object, strip: ImageStrip, level: number): NestedWalk<object> {
-	strip.path.enter(container);
-	if (level > strip.deepest) strip.deepest = level;
+/** {@link stripSnapshotImages} of `container`; `inside`, the containers it is in, makes a cycle fail instead of walking on. */
+function* stripContainerImages(container: object, inside: ContainerPath): NestedWalk<object> {
+	inside.enter(container);
 	if (Array.isArray(container)) {
 		let out: unknown[] | undefined;
 		for (let index = 0; index < container.length; index++) {
@@ -644,12 +629,12 @@ function* stripContainerImages(container: object, strip: ImageStrip, level: numb
 			const data = isRecord(item) && item.type === "image" ? item.data : undefined;
 			let next = typeof data === "string" && data.length > 1024 ? { type: "text", text: IMAGE_OMITTED_TEXT } : item;
 			if (next === item && typeof item === "object" && item !== null)
-				next = yield stripContainerImages(item, strip, level + 1);
+				next = yield stripContainerImages(item, inside);
 			if (next === item) continue;
 			out ??= container.slice();
 			out[index] = next;
 		}
-		strip.path.leave(container);
+		inside.leave(container);
 		return out ?? container;
 	}
 	const holder = container as Record<string, unknown>;
@@ -658,13 +643,12 @@ function* stripContainerImages(container: object, strip: ImageStrip, level: numb
 		const item = holder[key];
 		let next =
 			typeof item === "string" && item.length > 1024 && item.startsWith("data:") ? BLANK_IMAGE_DATA_URL : item;
-		if (next === item && typeof item === "object" && item !== null)
-			next = yield stripContainerImages(item, strip, level + 1);
+		if (next === item && typeof item === "object" && item !== null) next = yield stripContainerImages(item, inside);
 		if (next === item) continue;
 		out ??= { ...holder };
 		out[key] = next;
 	}
-	strip.path.leave(container);
+	inside.leave(container);
 	return out ?? container;
 }
 

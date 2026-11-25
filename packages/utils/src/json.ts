@@ -76,19 +76,27 @@ export interface DeepJsonTextOptions extends DeepJsonOptions {
 	 */
 	readonly space?: string | number;
 	/**
-	 * Check the depth first, as `space` does: a value nested past
-	 * {@link INDENTED_JSON_LEVELS} levels is written by
-	 * {@link stringifyJsonIteratively} at once, without the 1.5 s or more Bun's
-	 * `JSON.stringify` spends running out of stack on a value 40,000 levels deep.
-	 * The check ({@link nestsDeeperThan}) costs one step per object or array, so
-	 * it is for a caller that writes the same kind of value again and again (a
-	 * page of messages, a request's telemetry), not one that knows the depth.
+	 * Check the depth first: a value nested past {@link DEEP_JSON_LEVELS}
+	 * levels is written by {@link stringifyJsonIteratively} at once, without
+	 * the 1.5 s or more Bun's `JSON.stringify` spends running out of stack on
+	 * a value 40,000 levels deep. The check ({@link nestsDeeperThan}) costs one
+	 * step per object or array, so it is for a caller that writes the same
+	 * kind of value again and again (a page of messages, a request's
+	 * telemetry), not one that knows the depth.
 	 */
 	readonly probeDepth?: boolean;
 }
 
 /** Levels past which {@link stringifyDeepJson} writes a value without the indentation it was asked for. */
 export const INDENTED_JSON_LEVELS = 1_000;
+
+/**
+ * Levels past which a value is written by {@link stringifyJsonIteratively}:
+ * Bun's `JSON.stringify` takes milliseconds below them, seconds past about
+ * 25,000 levels, and runs out of stack at 40,000, while `JSON.parse` reads
+ * 400,000.
+ */
+export const DEEP_JSON_LEVELS = 10_000;
 
 /**
  * `JSON.stringify(value)` ({@link stringifyJson} with `bigintAsString`), also
@@ -98,17 +106,16 @@ export const INDENTED_JSON_LEVELS = 1_000;
  * which gives the same bytes. Any value `JSON.stringify` writes gets its
  * result, and any other error is its own. A `RangeError` from elsewhere (a
  * `toJSON` that throws one) recurs in the second walk and surfaces from it, so
- * the `toJSON` methods ahead of it run twice on that path. With `space` or
- * `probeDepth`, a value nested past {@link INDENTED_JSON_LEVELS} levels
- * ({@link nestsDeeperThan}) goes to {@link stringifyJsonIteratively} directly,
- * without indentation, and any other is written (and indented) as
- * `JSON.stringify` writes it.
+ * the `toJSON` methods ahead of it run twice on that path. With `space`, a
+ * value nested past {@link INDENTED_JSON_LEVELS} levels, and with
+ * `probeDepth` one nested past {@link DEEP_JSON_LEVELS} ({@link nestsDeeperThan}),
+ * goes to {@link stringifyJsonIteratively} directly, without indentation;
+ * any other is written (and indented) as `JSON.stringify` writes it.
  */
 export function stringifyDeepJson(value: unknown, options?: DeepJsonTextOptions): string | undefined {
 	const space = options?.space;
-	if ((space !== undefined || options?.probeDepth) && nestsDeeperThan(value, INDENTED_JSON_LEVELS)) {
-		return stringifyJsonIteratively(value, options);
-	}
+	const levels = space !== undefined ? INDENTED_JSON_LEVELS : options?.probeDepth ? DEEP_JSON_LEVELS : undefined;
+	if (levels !== undefined && nestsDeeperThan(value, levels)) return stringifyJsonIteratively(value, options);
 	try {
 		return options?.bigintAsString ? stringifyJson(value, space) : JSON.stringify(value, undefined, space);
 	} catch (error) {
