@@ -46,7 +46,11 @@
 
 mod obash_support;
 
-use std::{fs, os::unix::process::CommandExt as _, path::Path};
+use std::{
+	fs,
+	os::unix::{fs::PermissionsExt as _, process::CommandExt as _},
+	path::Path,
+};
 
 use bstr::BStr;
 use obash_support::{obash, output};
@@ -1638,7 +1642,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		false,
 		"cat < ${x:?u}; hash",
 		0,
-		"hits	command\n   1	/usr/bin/cat\n",
+		"hits	command\n   1	@cat@\n",
 		"bash: line 1: x: u\n",
 	),
 	(
@@ -1646,7 +1650,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		true,
 		"cat < ${x:?u}; hash",
 		0,
-		"hits	command\n   1	/usr/bin/cat\n",
+		"hits	command\n   1	@cat@\n",
 		"./s.sh: line 1: x: u\n",
 	),
 	(
@@ -1654,7 +1658,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		false,
 		"cat < nonexist; hash",
 		0,
-		"hits	command\n   1	/usr/bin/cat\n",
+		"hits	command\n   1	@cat@\n",
 		"bash: line 1: nonexist: No such file or directory\n",
 	),
 	(
@@ -1662,7 +1666,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		true,
 		"cat < nonexist; hash",
 		0,
-		"hits	command\n   1	/usr/bin/cat\n",
+		"hits	command\n   1	@cat@\n",
 		"./s.sh: line 1: nonexist: No such file or directory\n",
 	),
 	(
@@ -1686,7 +1690,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		false,
 		"cat < nonexist; cat < nonexist; hash",
 		0,
-		"hits	command\n   2	/usr/bin/cat\n",
+		"hits	command\n   2	@cat@\n",
 		"bash: line 1: nonexist: No such file or directory\nbash: line 1: nonexist: No such file or \
 		 directory\n",
 	),
@@ -1695,7 +1699,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		true,
 		"cat < nonexist; cat < nonexist; hash",
 		0,
-		"hits	command\n   2	/usr/bin/cat\n",
+		"hits	command\n   2	@cat@\n",
 		"./s.sh: line 1: nonexist: No such file or directory\n./s.sh: line 1: nonexist: No such \
 		 file or directory\n",
 	),
@@ -1745,7 +1749,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r3-and-second",
 		false,
-		"/bin/true && echo ${x:?u} & wait $!; echo \"st=$?\"",
+		"@true@ && echo ${x:?u} & wait $!; echo \"st=$?\"",
 		0,
 		"st=1\n",
 		"bash: line 1: x: u\n",
@@ -1753,7 +1757,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r3-and-second",
 		true,
-		"/bin/true && echo ${x:?u} & wait $!; echo \"st=$?\"",
+		"@true@ && echo ${x:?u} & wait $!; echo \"st=$?\"",
 		0,
 		"st=1\n",
 		"./s.sh: line 1: x: u\n",
@@ -1809,7 +1813,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r3-and-group-move",
 		false,
-		"/bin/true && { :; } <&7- & wait $!; echo \"st=$?\"",
+		"@true@ && { :; } <&7- & wait $!; echo \"st=$?\"",
 		0,
 		"st=1\n",
 		"bash: redirection error: cannot duplicate fd: Bad file descriptor\nbash: line 1: 7: Bad \
@@ -1818,7 +1822,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r3-and-group-move",
 		true,
-		"/bin/true && { :; } <&7- & wait $!; echo \"st=$?\"",
+		"@true@ && { :; } <&7- & wait $!; echo \"st=$?\"",
 		0,
 		"st=1\n",
 		"./s.sh: redirection error: cannot duplicate fd: Bad file descriptor\n./s.sh: line 1: 7: \
@@ -1843,7 +1847,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r3-and-ext-fail",
 		false,
-		"/bin/true && /bin/cat < nonexist & wait $!; echo \"st=$?\"",
+		"@true@ && /bin/cat < nonexist & wait $!; echo \"st=$?\"",
 		0,
 		"st=1\n",
 		"bash: line 1: nonexist: No such file or directory\n",
@@ -1851,7 +1855,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r3-and-ext-fail",
 		true,
-		"/bin/true && /bin/cat < nonexist & wait $!; echo \"st=$?\"",
+		"@true@ && /bin/cat < nonexist & wait $!; echo \"st=$?\"",
 		0,
 		"st=1\n",
 		"./s.sh: line 1: nonexist: No such file or directory\n",
@@ -2021,7 +2025,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r4-ext-var",
 		false,
-		"/bin/true {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		"@true@ {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
 		1,
 		"v=[]\n",
 		"bash: line 1: 10: Bad file descriptor\n",
@@ -2029,7 +2033,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r4-ext-var",
 		true,
-		"/bin/true {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		"@true@ {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
 		1,
 		"v=[]\n",
 		"./s.sh: line 1: 10: Bad file descriptor\n",
@@ -2102,26 +2106,19 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	),
 	("r4-ext-var-used", false, "/bin/cat {v}<in <&$v; echo \"v=[$v]\"", 0, "hello\nv=[]\n", ""),
 	("r4-ext-var-used", true, "/bin/cat {v}<in <&$v; echo \"v=[$v]\"", 0, "hello\nv=[]\n", ""),
-	("r4-ext-var-kept", false, "v=old; /bin/true {v}<in; echo \"v=[$v]\"", 0, "v=[old]\n", ""),
-	("r4-ext-var-kept", true, "v=old; /bin/true {v}<in; echo \"v=[$v]\"", 0, "v=[old]\n", ""),
-	("r4-ext-var-assign", false, "v=1 /bin/true {v}<in; echo \"v=[$v]\"", 0, "v=[]\n", ""),
-	("r4-ext-var-assign", true, "v=1 /bin/true {v}<in; echo \"v=[$v]\"", 0, "v=[]\n", ""),
+	("r4-ext-var-kept", false, "v=old; @true@ {v}<in; echo \"v=[$v]\"", 0, "v=[old]\n", ""),
+	("r4-ext-var-kept", true, "v=old; @true@ {v}<in; echo \"v=[$v]\"", 0, "v=[old]\n", ""),
+	("r4-ext-var-assign", false, "v=1 @true@ {v}<in; echo \"v=[$v]\"", 0, "v=[]\n", ""),
+	("r4-ext-var-assign", true, "v=1 @true@ {v}<in; echo \"v=[$v]\"", 0, "v=[]\n", ""),
 	(
 		"r4-ext-var-assign-old",
 		false,
-		"v=old; v=1 /bin/true {v}<in; echo \"v=[$v]\"",
+		"v=old; v=1 @true@ {v}<in; echo \"v=[$v]\"",
 		0,
 		"v=[old]\n",
 		"",
 	),
-	(
-		"r4-ext-var-assign-old",
-		true,
-		"v=old; v=1 /bin/true {v}<in; echo \"v=[$v]\"",
-		0,
-		"v=[old]\n",
-		"",
-	),
+	("r4-ext-var-assign-old", true, "v=old; v=1 @true@ {v}<in; echo \"v=[$v]\"", 0, "v=[old]\n", ""),
 	(
 		"r4-notfound-var",
 		false,
@@ -2141,7 +2138,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r4-command-ext-var",
 		false,
-		"command /bin/true {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		"command @true@ {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
 		1,
 		"v=[]\n",
 		"bash: line 1: 10: Bad file descriptor\n",
@@ -2149,7 +2146,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r4-command-ext-var",
 		true,
-		"command /bin/true {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
+		"command @true@ {v}<in; echo \"v=[$v]\"; read -r l <&10 && echo open",
 		1,
 		"v=[]\n",
 		"./s.sh: line 1: 10: Bad file descriptor\n",
@@ -2239,7 +2236,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		false,
 		"{PATH}</dev/null cat < nonexist; hash",
 		0,
-		"hits	command\n   1	/usr/bin/cat\n",
+		"hits	command\n   1	@cat@\n",
 		"bash: line 1: nonexist: No such file or directory\n",
 	),
 	(
@@ -2247,7 +2244,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		true,
 		"{PATH}</dev/null cat < nonexist; hash",
 		0,
-		"hits	command\n   1	/usr/bin/cat\n",
+		"hits	command\n   1	@cat@\n",
 		"./s.sh: line 1: nonexist: No such file or directory\n",
 	),
 	(
@@ -2255,7 +2252,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		false,
 		"{PATH}</dev/null cat < ${x:?u}; hash",
 		0,
-		"hits	command\n   1	/usr/bin/cat\n",
+		"hits	command\n   1	@cat@\n",
 		"bash: line 1: x: u\n",
 	),
 	(
@@ -2263,13 +2260,13 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 		true,
 		"{PATH}</dev/null cat < ${x:?u}; hash",
 		0,
-		"hits	command\n   1	/usr/bin/cat\n",
+		"hits	command\n   1	@cat@\n",
 		"./s.sh: line 1: x: u\n",
 	),
 	(
 		"r4-var-errexit",
 		false,
-		"set -e; /bin/true {v}<in; echo \"v=[$v]\"; /bin/false {w}<in; echo not",
+		"set -e; @true@ {v}<in; echo \"v=[$v]\"; @false@ {w}<in; echo not",
 		1,
 		"v=[]\n",
 		"",
@@ -2277,7 +2274,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r4-var-errexit",
 		true,
-		"set -e; /bin/true {v}<in; echo \"v=[$v]\"; /bin/false {w}<in; echo not",
+		"set -e; @true@ {v}<in; echo \"v=[$v]\"; @false@ {w}<in; echo not",
 		1,
 		"v=[]\n",
 		"",
@@ -2285,7 +2282,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r4-var-err-trap",
 		false,
-		"trap 'echo \"err=$? v=[$v]\"' ERR; /bin/false {v}<in; echo \"st=$? v=[$v]\"",
+		"trap 'echo \"err=$? v=[$v]\"' ERR; @false@ {v}<in; echo \"st=$? v=[$v]\"",
 		0,
 		"err=1 v=[]\nst=1 v=[]\n",
 		"",
@@ -2293,7 +2290,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r4-var-err-trap",
 		true,
-		"trap 'echo \"err=$? v=[$v]\"' ERR; /bin/false {v}<in; echo \"st=$? v=[$v]\"",
+		"trap 'echo \"err=$? v=[$v]\"' ERR; @false@ {v}<in; echo \"st=$? v=[$v]\"",
 		0,
 		"err=1 v=[]\nst=1 v=[]\n",
 		"",
@@ -2301,7 +2298,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r4-var-err-trap-e",
 		false,
-		"set -e; trap 'echo \"err=$? v=[$v]\"' ERR; /bin/false {v}<in; echo not",
+		"set -e; trap 'echo \"err=$? v=[$v]\"' ERR; @false@ {v}<in; echo not",
 		1,
 		"err=1 v=[]\n",
 		"",
@@ -2309,7 +2306,7 @@ const ROWS: &[(&str, bool, &str, i32, &str, &str)] = &[
 	(
 		"r4-var-err-trap-e",
 		true,
-		"set -e; trap 'echo \"err=$? v=[$v]\"' ERR; /bin/false {v}<in; echo not",
+		"set -e; trap 'echo \"err=$? v=[$v]\"' ERR; @false@ {v}<in; echo not",
 		1,
 		"err=1 v=[]\n",
 		"",
@@ -3404,11 +3401,43 @@ fn files(dir: &Path) {
 	assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "mkfifo");
 }
 
+/// The path a `PATH` lookup finds for `name` (the first directory of the
+/// `PATH` obash inherits that holds an executable `name`), which is what
+/// bash's `hash` lists for it.
+fn on_path(name: &str) -> String {
+	let path = std::env::var_os("PATH").unwrap_or_default();
+	std::env::split_paths(&path)
+		.map(|dir| dir.join(name))
+		.find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+		.unwrap_or_else(|| panic!("no {name} on PATH {path:?}"))
+		.to_string_lossy()
+		.into_owned()
+}
+
+/// A row's script or expected output with its tools named where this
+/// platform has them: `@cat@`, `@true@` and `@false@` become [`on_path`]'s
+/// answers. bash's rows were recorded on Linux, whose `hash` lists
+/// `/usr/bin/cat` and which has `/bin/true`; macOS lists `/bin/cat` and has
+/// `true` and `false` only in `/usr/bin`.
+fn with_tools(text: &str) -> String {
+	["cat", "true", "false"]
+		.into_iter()
+		.fold(text.to_owned(), |text, name| {
+			let token = format!("@{name}@");
+			if text.contains(&token) {
+				text.replace(&token, &on_path(name))
+			} else {
+				text
+			}
+		})
+}
+
 /// How row `(id, file, script, status, out, err)` differs from bash, if it
 /// does.
 fn differs(
 	&(id, file, script, status, out, err): &(&str, bool, &str, i32, &str, &str),
 ) -> Option<String> {
+	let (script, out, err) = (with_tools(script), with_tools(out), with_tools(err));
 	let dir = tempfile::tempdir().unwrap();
 	files(dir.path());
 	let mut cmd = obash();
@@ -3417,7 +3446,7 @@ fn differs(
 		fs::write(dir.path().join("s.sh"), format!("{script}\n")).unwrap();
 		cmd.arg("./s.sh");
 	} else {
-		cmd.arg("-c").arg(script);
+		cmd.arg("-c").arg(&script);
 	}
 	let how = if file { "./s.sh" } else { "-c" };
 	// `output` panics on a process past the obash tests' bound: the row hung,
@@ -3435,7 +3464,7 @@ fn differs(
 			.replace(&*dir.path().to_string_lossy(), "DIR")
 	};
 	let got = (got.status.code(), clean(&got.stdout), clean(&got.stderr));
-	(got != (Some(status), out.to_owned(), err.to_owned())).then(|| {
+	(got != (Some(status), out.clone(), err.clone())).then(|| {
 		format!(
 			"{id} ({how}): `{script}`\n  bash: {status} {out:?} {err:?}\n  got:  {:?} {:?} {:?}",
 			got.0, got.1, got.2
