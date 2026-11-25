@@ -2,6 +2,7 @@
 //! per-op semantics, and frame control (calls, returns, unwinding).
 
 use std::{
+	borrow::Cow,
 	collections::HashMap,
 	fmt::NumBuffer,
 	sync::Arc,
@@ -87,7 +88,13 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				None => unblock(k, cx, vp),
 			}
 		}
-		if vp.pending_traps != crate::bash::signal::SigSet::EMPTY && !vp.waiting_foreground() {
+		// A builtin parked on its take-in (`Kernel::asking`) is still in its
+		// command, with the command's redirections: a trap waits until the
+		// command is over, as bash runs a trap between commands.
+		if vp.pending_traps != crate::bash::signal::SigSet::EMPTY
+			&& !vp.waiting_foreground()
+			&& !k.asking(vp.vpid)
+		{
 			let pending = vp.pending_traps.iter().find(|sig| {
 				!vp.frames.iter().any(|frame| {
 					matches!(frame.kind, FrameKind::Script {
@@ -177,6 +184,16 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		let unit = held.as_ref().expect("just set");
 		let op = unit.ops[frame.pc as usize];
 		let fi = vp.frames.len() - 1;
+		// bash's `;` connection: the second command starts
+		// ([`super::killed::connected`]), once per arrival (not as a staged op
+		// runs again, nor after the DEBUG trap it ran).
+		if !vp.jobs.list.is_empty()
+			&& unit.semis.binary_search(&vp.frames[fi].pc).is_ok()
+			&& vp.frames[fi].scratch.is_none()
+			&& vp.frames[fi].debug_pc != Some(vp.frames[fi].pc)
+		{
+			super::killed::connected(k, cx, vp);
+		}
 		// Control flow of a bash unit: it starts no command, cannot fail as
 		// one or block, and keeps the clock, so none of the bookkeeping
 		// below applies to it.
@@ -1203,18 +1220,15 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 		}
 		pop_frame(&mut k.root, cx.store, vp);
 		if frozen_int {
-			super::killed::cleanup_dead_jobs(vp);
+			super::killed::cleanup_dead_jobs(k, cx, vp);
 		}
 		if debug && !vp.frames.is_empty() {
 			zsh_debug_done(k, vp, cx);
 			// bash's `run_debug_trap` ends with `notify_and_cleanup (-1)`
-			// (`trap.c:1304`), naming the line of the command it ran for.
+			// (`trap.c:1304`), at the line it holds for the command the trap
+			// ran for ([`super::killed::command_line`]).
 			if mode.dialect() == Dialect::Bash {
-				let node = vp
-					.frames
-					.last()
-					.and_then(|f| f.unit.as_ref()?.ops.get(f.pc as usize).map(|o| o.node));
-				let line = node.map_or(0, |node| line_of(vp, node));
+				let line = super::killed::command_line(vp);
 				super::killed::line_read(k, cx, vp, line);
 			}
 		}
@@ -1391,9 +1405,12 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 /// of a line, nothing pushed back (`aux.pending`), with text left; or a
 /// script file at its end (bash's `reader_loop` reads until it finds the
 /// end, where `parse_and_execute`, which runs a `-c` string, an `eval`'s, a
-/// trap's or a sourced file's text, stops before).
+/// trap's or a sourced file's text, stops before). An interactive shell
+/// reports and cleans up only as it prompts (`interactive_shell == 0 ||
+/// SHOULD_PROMPT ()`, `parse.y:2526`), never as it reads such text.
 fn line_to_read(cx: &mut Cx<'_>, vp: &Vproc) -> Option<u32> {
-	if vp.mode.dialect() != Dialect::Bash || vp.jobs.is_empty() {
+	if vp.mode.dialect() != Dialect::Bash || vp.jobs.is_empty() || super::killed::interactive(cx, vp)
+	{
 		return None;
 	}
 	let Some(Frame { kind: FrameKind::Script { src, pos, aux, what, stdin: false }, .. }) =
@@ -2060,6 +2077,349 @@ pub fn end_line(unit: &Unit, node: u32) -> u32 {
 	})
 }
 
+/// bash's line for the redirections of `( … )` `node` of the top frame's
+/// unit: the line its `)` closes on, which bash sets where it forks the
+/// subshell (`execute_command_internal`, `SET_LINE_NUMBER
+/// (command->value.Subshell->line)` before `make_child`), as a pipeline
+/// stage or a job too. A `( … )` bash runs without a fork of its own keeps
+/// the line it finds: the sole command of another `( … )` (`CMD_NO_FORK`,
+/// not under `!` or `time`) that of the `( … )` around it, and a coproc's
+/// command the fork's (`None`: [`super::killed::compound_fork_line`]).
+pub(super) fn subshell_line(vp: &Vproc, node: u32) -> Option<u32> {
+	let f = vp.frames.last()?;
+	let u = f.unit.as_deref()?;
+	let mut node = node;
+	loop {
+		match unforked(u, node) {
+			Unforked::No => break,
+			Unforked::Sole(outer) => node = outer,
+			Unforked::Coproc => return None,
+		}
+	}
+	let n = u.nodes.get(node as usize)?;
+	let close = close_paren(u, node)?;
+	let text = u.source.get(n.lo as usize..close)?;
+	#[expect(clippy::naive_bytecount, reason = "one command's text; no bytecount dependency")]
+	let lines = text.iter().filter(|&&c| c == b'\n').count();
+	let line = n.line + u32::try_from(lines).ok()?;
+	Some((u.line + line).saturating_sub(f.line_shift))
+}
+
+/// Whether bash forks `( … )` `node` itself ([`subshell_line`]).
+enum Unforked {
+	/// It does.
+	No,
+	/// It is the sole command of this `( … )`.
+	Sole(u32),
+	/// It is a coproc's command.
+	Coproc,
+}
+
+/// From the unit's code, not its text (a here-document body, a comment or
+/// a word can hold anything): `node`'s ops begin a coproc's or a `( … )`'s
+/// child, and for a `( … )` they are all of it, up to its `SubExit` (a
+/// `!`, a `time`, an `&` or another command adds ops of its own).
+fn unforked(u: &Unit, node: u32) -> Unforked {
+	// `node`'s first op: its `Redir`, else its `Enter`.
+	let Some(first) = u
+		.ops
+		.iter()
+		.position(|op| op.node == node && matches!(op.code, Opcode::Redir | Opcode::Enter))
+	else {
+		return Unforked::No;
+	};
+	// The op after them: past its `PopRedir`, else its `Leave`.
+	let end = match u.ops.get(first) {
+		Some(op) if op.code == Opcode::Redir => Some(op.b as usize),
+		_ => u.ops[first..]
+			.iter()
+			.position(|op| op.node == node && op.code == Opcode::Leave)
+			.map(|i| first + i + 1),
+	};
+	for (i, s) in u.spawns.iter().enumerate() {
+		if s.stages.first().map(|st| st.entry as usize) != Some(first) {
+			continue;
+		}
+		match s.kind {
+			SpawnKind::Coproc { .. } => return Unforked::Coproc,
+			SpawnKind::Subshell if end.is_some_and(|end| end + 1 == s.end as usize) => {
+				let outer = u
+					.ops
+					.iter()
+					.find(|op| op.code == Opcode::Spawn && op.a as usize == i)
+					.map(|op| op.node);
+				return outer.map_or(Unforked::No, Unforked::Sole);
+			},
+			_ => {},
+		}
+	}
+	Unforked::No
+}
+
+/// The byte of `( … )` `node`'s `)`. The node ends with it, or with the
+/// redirections after it. When each of those targets a word, the parser
+/// recorded where the word starts, and the `)` is found back over them
+/// ([`back_over_words`]), whatever the body holds. A here-document's
+/// delimiter has no such record, and quoting cannot be read backward, so
+/// with one among them the `)` is the first after the last syntax node of
+/// its body (the ops between its `Redir` and `PopRedir` run it), found
+/// forward over what can stand between a list's last command and its `)`
+/// ([`after_list`]).
+fn close_paren(u: &Unit, node: u32) -> Option<usize> {
+	let n = u.nodes.get(node as usize)?;
+	let redir = u
+		.ops
+		.iter()
+		.enumerate()
+		.find(|(_, op)| op.code == Opcode::Redir && op.node == node);
+	let at = if let Some((pc, op)) = redir {
+		let redirs = u.redirs.get(op.a as usize)?;
+		if redirs
+			.iter()
+			.all(|r| matches!(r.target, ir::RedirTargetIr::Word(_)))
+		{
+			return back_over_words(u, n.hi as usize, redirs);
+		}
+		let body = u.ops.get(pc + 1..op.b as usize)?;
+		let inside = |m: &&ir::NodeInfo| m.lo > n.lo && m.hi <= n.hi;
+		let end = body
+			.iter()
+			.filter(|o| o.node != node)
+			.filter_map(|o| u.nodes.get(o.node as usize))
+			.filter(inside)
+			.map(|m| m.hi)
+			.max()? as usize;
+		// The body's here-documents, in the order of their operators: a
+		// command's come after those of the commands it holds, which end
+		// before it.
+		let mut docs = Vec::new();
+		here_docs(u, body, &inside, &mut docs);
+		docs.sort_by_key(|d| (d.hi, d.at));
+		// The bodies after the line are those of a run of the last
+		// here-documents. A body starts after the first newline that follows
+		// its operator, so those with no newline at all from their command's
+		// end to `end` are in it. Whether an earlier newline is one a body can
+		// follow (not one in a quoted word or a `$( )`) is quoting, which is
+		// not read here: the run grows back from those, one document at a
+		// time, until its bodies match the source and the scan reaches a `)`.
+		let src: &[u8] = &u.source;
+		let surely = docs
+			.iter()
+			.take_while(|d| {
+				src.get(d.hi as usize..end)
+					.is_some_and(|s| s.contains(&b'\n'))
+			})
+			.count();
+		(0..=surely).rev().find_map(|k| {
+			let at = after_list(src, end, docs[k..].iter().map(|d| (&*d.text, d.quoted)))?;
+			(src.get(at) == Some(&b')')).then_some(at)
+		})?
+	} else {
+		(n.hi as usize).checked_sub(1)?
+	};
+	(u.source.get(at) == Some(&b')')).then_some(at)
+}
+
+/// A here-document in a `( … )`'s body ([`here_docs`]).
+struct Doc<'u> {
+	/// Where its command ends.
+	hi:     u32,
+	/// Its place in the command's redirection list.
+	at:     usize,
+	text:   Cow<'u, [u8]>,
+	quoted: bool,
+}
+
+/// The here-documents of `ops`, ops of unit `u`, of commands whose nodes
+/// pass `inside`. A function defined there adds its body's (the body's unit
+/// shares `u`'s source and node ids), compiled here if it is compiled only
+/// at its first call.
+fn here_docs<'u>(
+	u: &'u Unit,
+	ops: &[Op],
+	inside: &dyn Fn(&&ir::NodeInfo) -> bool,
+	docs: &mut Vec<Doc<'u>>,
+) {
+	for o in ops {
+		let list = match o.code {
+			Opcode::Exec => u.cmds.get(o.a as usize).and_then(|c| c.redirs),
+			Opcode::Redir => Some(o.a),
+			Opcode::FuncDef => {
+				let Some(f) = u.funcs.get(o.a as usize) else {
+					continue;
+				};
+				if f.body.deferred.is_none() {
+					here_docs(&f.body, &f.body.ops, inside, docs);
+				} else if let Some(body) = ir::materialize(&f.body, false) {
+					let mut own = Vec::new();
+					here_docs(&body, &body.ops, inside, &mut own);
+					docs.extend(own.into_iter().map(|d| Doc {
+						hi:     d.hi,
+						at:     d.at,
+						text:   Cow::Owned(d.text.into_owned()),
+						quoted: d.quoted,
+					}));
+				}
+				continue;
+			},
+			_ => continue,
+		};
+		let Some(m) = u.nodes.get(o.node as usize).filter(inside) else {
+			continue;
+		};
+		let list = list.and_then(|l| u.redirs.get(l as usize));
+		for (at, r) in list.into_iter().flatten().enumerate() {
+			if let ir::RedirTargetIr::HereDoc { text, quoted } = &r.target {
+				let text: &[u8] = text;
+				docs.push(Doc { hi: m.hi, at, text: Cow::Borrowed(text), quoted: *quoted });
+			}
+		}
+	}
+}
+
+/// The `)` before redirections `redirs`, which end at `at` and each target
+/// a word: from where the parser recorded the word starts, back over its
+/// operator and fd. `None` where no `)` is found so.
+fn back_over_words(u: &Unit, mut at: usize, redirs: &[ir::RedirIr]) -> Option<usize> {
+	let src: &[u8] = &u.source;
+	for r in redirs.iter().rev() {
+		let ir::RedirTargetIr::Word(w) = &r.target else {
+			return None;
+		};
+		at = u.nodes.get(u.words.get(*w as usize)?.node as usize)?.lo as usize;
+		at = op_back(src, skip_back(src, at));
+	}
+	let at = skip_back(src, at).checked_sub(1)?;
+	(src.get(at) == Some(&b')')).then_some(at)
+}
+
+/// `at`, moved back over blanks, newlines and backslash-newlines.
+const fn skip_back(src: &[u8], mut at: usize) -> usize {
+	while at > 0 {
+		match src[at - 1] {
+			b' ' | b'\t' => at -= 1,
+			b'\n' if at >= 2 && src[at - 2] == b'\\' => at -= 2,
+			b'\n' => at -= 1,
+			_ => break,
+		}
+	}
+	at
+}
+
+/// `at`, moved back over a redirection's operator and its fd (`2>&`,
+/// `&>>`, `>|`, `{fd}>`).
+fn op_back(src: &[u8], mut at: usize) -> usize {
+	while at > 0 && matches!(src[at - 1], b'<' | b'>' | b'&' | b'|') {
+		at -= 1;
+	}
+	if at > 0 && src[at - 1] == b'}' {
+		if let Some(open) = src[..at].iter().rposition(|&c| c == b'{') {
+			at = open;
+		}
+	} else {
+		while at > 0 && src[at - 1].is_ascii_digit() {
+			at -= 1;
+		}
+	}
+	at
+}
+
+/// `at`, moved on over blanks, `;`, `&`, comments, newlines and
+/// backslash-newlines (what can stand between a list's last command and
+/// the `)` that ends it), and at the first newline over the bodies of
+/// here-documents `docs` (text, quoted), each with its delimiter's line.
+/// Each line of a body, read as bash reads it ([`DocLine`]), is that of the
+/// document's stored text, with leading tabs for `<<-`, else `None`.
+fn after_list<'a>(
+	src: &[u8],
+	mut at: usize,
+	docs: impl Iterator<Item = (&'a [u8], bool)>,
+) -> Option<usize> {
+	let mut docs = Some(docs);
+	while let Some(&c) = src.get(at) {
+		match c {
+			b' ' | b'\t' | b';' | b'&' => at += 1,
+			b'\\' if src.get(at + 1) == Some(&b'\n') => at += 2,
+			b'#' => {
+				while src.get(at).is_some_and(|&c| c != b'\n') {
+					at += 1;
+				}
+			},
+			b'\n' => {
+				at += 1;
+				for (text, quoted) in docs.take().into_iter().flatten() {
+					for want in text.lines_with_terminator() {
+						let line = DocLine::new(src, at, !quoted);
+						let want = want.iter().copied();
+						if !(line.clone().eq(want.clone())
+							|| line.clone().skip_while(|&c| c == b'\t').eq(want))
+						{
+							return None;
+						}
+						at = line.end();
+					}
+					at = DocLine::new(src, at, !quoted).end();
+				}
+			},
+			_ => break,
+		}
+	}
+	Some(at)
+}
+
+/// One line of a here-document's body as bash reads it (`read_a_line`; the
+/// parser's `read_doc_line`): its bytes from `at` through its newline, a NUL
+/// dropped and, in an unquoted document, a `\`newline removed.
+#[derive(Clone)]
+struct DocLine<'s> {
+	src:      &'s [u8],
+	at:       usize,
+	unquoted: bool,
+	/// The byte after a backslash kept with it.
+	held:     Option<u8>,
+	done:     bool,
+}
+
+impl<'s> DocLine<'s> {
+	const fn new(src: &'s [u8], at: usize, unquoted: bool) -> Self {
+		Self { src, at, unquoted, held: None, done: false }
+	}
+
+	/// Where the next line starts.
+	fn end(mut self) -> usize {
+		self.by_ref().for_each(drop);
+		self.at
+	}
+}
+
+impl Iterator for DocLine<'_> {
+	type Item = u8;
+
+	fn next(&mut self) -> Option<u8> {
+		if let Some(c) = self.held.take() {
+			return Some(c);
+		}
+		while !self.done {
+			let c = *self.src.get(self.at)?;
+			self.at += 1;
+			match c {
+				0 => {},
+				b'\\' if self.unquoted && self.src.get(self.at) == Some(&b'\n') => self.at += 1,
+				b'\\' if self.unquoted => {
+					self.held = self.src.get(self.at).copied();
+					self.at += usize::from(self.held.is_some());
+					return Some(c);
+				},
+				_ => {
+					self.done = c == b'\n';
+					return Some(c);
+				},
+			}
+		}
+		None
+	}
+}
+
 /// The line bash reports for an error of a compound command (a failed
 /// redirection, a rejected function definition): in the base frame of a
 /// `( … )` child the subshell's last line ([`Frame::fork_line`]), else
@@ -2075,7 +2435,7 @@ fn compound_line(vp: &Vproc, line: u32) -> u32 {
 						.is_some_and(|(s, _)| s.kind == SpawnKind::Subshell)
 				})
 		})
-		.and_then(|f| f.fork_line)
+		.and_then(super::killed::fork_line)
 		.unwrap_or(line)
 }
 
@@ -2133,7 +2493,7 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 			}
 			f.pc = if cont { rec.cont } else { rec.exit };
 			if reap {
-				super::killed::cleanup_dead_jobs(vp);
+				super::killed::reap(k, cx, vp);
 			}
 			return;
 		}
@@ -2493,7 +2853,14 @@ pub fn start_sub(
 				vp.child_text(k, cx.store, src, base, fds)
 			} else {
 				let mut child = vp.child(k, cx.store, Arc::clone(&unit), entry, fds);
-				if let Some(f) = child.frames.last_mut() {
+				if let Some(f) = child.frames.last_mut()
+					&& f.line_shift != shift
+				{
+					// The fork's line is numbered as the parent's lines are: found
+					// before the substitution numbers its own.
+					if let Some(line) = super::killed::fork_line(f) {
+						f.fork_line = super::proc::ForkLine::new(super::proc::ForkAt::Line(line));
+					}
 					f.line_shift = shift;
 				}
 				// A body without a command (`$()`, `$( )`, only comments)
@@ -2970,10 +3337,10 @@ fn control_flow(
 		Opcode::Nop => Some(Flow::Next),
 		Opcode::Jmp => Some(Flow::Jump(op.a)),
 		Opcode::BrOk | Opcode::BrFail if !k.mask.any_op(op.ev) => {
-			reap_after_arith_test(vp, unit, op);
+			reap_after_arith_test(k, cx, vp, unit, op);
 			Some(branch(op, (vp.status == 0) == (op.code == Opcode::BrOk)))
 		},
-		Opcode::LoopNote | Opcode::LoopBack => Some(loop_note(vp, op)),
+		Opcode::LoopNote | Opcode::LoopBack => Some(loop_note(k, cx, vp, op)),
 		Opcode::LoopEnter => Some(loop_enter(vp, op)),
 		Opcode::LoopExit if !k.mask.any_op(op.ev) => {
 			if let Some(rec) = top_frame(vp).loops.pop() {
@@ -3096,15 +3463,15 @@ const fn branch(op: Op, jump: bool) -> Flow {
 /// `LoopNote`/`LoopBack`: the innermost loop's status and iteration count;
 /// `LoopBack` jumps back to the loop's test, after bash's `REAP` (the body
 /// of a `for`, `select`, `while` or `until` loop ended: the finished jobs
-/// reported go, `execute_cmd.c:3105`, `3606`, `3838`).
-fn loop_note(vp: &mut Vproc, op: Op) -> Flow {
+/// reported go, `execute_cmd.c:3105`, `3606`, `3838`; [`super::killed::reap`]).
+fn loop_note(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, op: Op) -> Flow {
 	let status = vp.status;
 	if let Some(rec) = top_frame(vp).loops.last_mut() {
 		rec.status = status;
 		rec.iterations += 1;
 	}
 	if op.code == Opcode::LoopBack {
-		super::killed::cleanup_dead_jobs(vp);
+		super::killed::reap(k, cx, vp);
 		Flow::Jump(op.a)
 	} else {
 		Flow::Next
@@ -3113,8 +3480,8 @@ fn loop_note(vp: &mut Vproc, op: Op) -> Flow {
 
 /// bash's `REAP` once an arithmetic `for` loop evaluated its test
 /// (`execute_cmd.c:3267`), the `BrFail` after it: the finished jobs reported
-/// go.
-fn reap_after_arith_test(vp: &mut Vproc, unit: &Unit, op: Op) {
+/// go ([`super::killed::reap`]).
+fn reap_after_arith_test(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, unit: &Unit, op: Op) {
 	if op.code == Opcode::BrFail
 		&& !vp.jobs.list.is_empty()
 		&& unit
@@ -3122,7 +3489,7 @@ fn reap_after_arith_test(vp: &mut Vproc, unit: &Unit, op: Op) {
 			.get(op.node as usize)
 			.is_some_and(|n| n.kind == NodeKind::ArithFor)
 	{
-		super::killed::cleanup_dead_jobs(vp);
+		super::killed::reap(k, cx, vp);
 	}
 }
 
@@ -3141,7 +3508,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					EventData::Branch { construct: Construct::from_u32(op.b), taken: !jump, status };
 				k.emit_op(cx, vp, op.node, data);
 			}
-			reap_after_arith_test(vp, unit, op);
+			reap_after_arith_test(k, cx, vp, unit, op);
 			branch(op, jump)
 		},
 		Opcode::Not => {
@@ -3209,7 +3576,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		Opcode::LoopEnter => loop_enter(vp, op),
 		Opcode::ForIn => for_in(k, vp, cx, unit, op, line),
 		Opcode::ForNext => for_next(k, vp, cx, op, line),
-		Opcode::LoopNote | Opcode::LoopBack => loop_note(vp, op),
+		Opcode::LoopNote | Opcode::LoopBack => loop_note(k, cx, vp, op),
 		Opcode::LoopExit => {
 			if let Some(rec) = top_frame(vp).loops.pop() {
 				vp.status = rec.status;
@@ -3219,39 +3586,52 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			}
 			Flow::Next
 		},
-		Opcode::Redir => match redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line)) {
-			Ok(()) => {
-				let saves = match top_frame(vp).scratch.take() {
-					Some(mut sc) => {
-						let saves = sc
-							.io
-							.as_mut()
-							.map_or_default(|io| std::mem::take(&mut io.saved));
-						drop_scratch(&mut k.root, cx.store, vp, sc);
-						saves
-					},
-					None => Vec::new(),
-				};
-				top_frame(vp).redirs.push(saves);
-				Flow::Next
-			},
-			Err(redir::Halt::Flow(f)) => f,
-			Err(redir::Halt::Failed) => {
-				// The message goes to stderr as the redirections so far left
-				// it; what would block is written after the restore.
-				let _ = flush_out(k, vp);
-				clear_scratch(&mut k.root, cx.store, vp);
-				vp.status = 1;
-				Flow::Jump(op.b)
-			},
+		Opcode::Redir => {
+			// A bash `( … )` names its own line ([`subshell_line`]); any
+			// other compound command's, in a fork's base frame, the line bash
+			// had as it forked it, and zsh's the line of its `(`. Each looked
+			// for only once a diagnostic or an expansion needs it.
+			let subshell = unit.mode.dialect() == Dialect::Bash
+				&& unit
+					.nodes
+					.get(op.node as usize)
+					.is_some_and(|n| n.kind == NodeKind::Subshell);
+			let line = if subshell {
+				redir::Line::subshell(op.node, compound_line(vp, line))
+			} else {
+				redir::Line::fork(op.node, compound_line(vp, line))
+			};
+			match redir::apply(k, vp, cx, unit, op.a, &line) {
+				Ok(()) => {
+					let saves = match top_frame(vp).scratch.take() {
+						Some(mut sc) => {
+							let saves = sc
+								.io
+								.as_mut()
+								.map_or_default(|io| std::mem::take(&mut io.saved));
+							drop_scratch(&mut k.root, cx.store, vp, sc);
+							saves
+						},
+						None => Vec::new(),
+					};
+					top_frame(vp).redirs.push(saves);
+					Flow::Next
+				},
+				Err(redir::Halt::Flow(f)) => f,
+				Err(redir::Halt::Failed) => {
+					// The message goes to stderr as the redirections so far left
+					// it; what would block is written after the restore.
+					let _ = flush_out(k, vp);
+					clear_scratch(&mut k.root, cx.store, vp);
+					vp.status = 1;
+					Flow::Jump(op.b)
+				},
+			}
 		},
 		Opcode::PopRedir => {
 			if let Some(saves) = top_frame(vp).redirs.pop() {
 				restore(vp, saves);
 			}
-			// A subshell's notice waited for its redirections to go.
-			let depth = u32::try_from(vp.frames.len()).unwrap_or(u32::MAX);
-			super::killed::redirections_undone(k, vp, depth);
 			Flow::Next
 		},
 		Opcode::Spawn => spawn(k, vp, cx, unit, op),
@@ -4230,19 +4610,26 @@ fn bang_stage(unit: &Unit, entry: u32) -> Option<BangStage> {
 }
 
 /// Whether the pipeline `Spawn` at `pc` is the whole command of a
-/// background job (`a | b &`): bash runs that pipeline as the job
-/// (`execute_pipeline`'s `asynchronous`), so its stages are the job's
+/// background job (`a | b &`, `! a | b &`): bash runs that pipeline as the
+/// job (`execute_pipeline`'s `asynchronous`), so its stages are the job's
 /// processes ([`crate::bash::store::Job::procs`]). bash runs one of an `&&`
-/// or `||` list, or one under `time`, in a subshell of its own; obash's
-/// `!` follows the spawn (`Not`), so it counts none under `!` either.
+/// or `||` list, or one under `time`, in a subshell of its own. The `!` of
+/// an asynchronous pipeline changes nothing there (`execute_command_internal`
+/// drops it, `execute_cmd.c:1119-1120`): obash's `Not` after the spawn
+/// still leaves the pipeline the job's whole command.
 pub(super) fn job_pipeline(unit: &Unit, pc: u32) -> bool {
 	let code = |at: u32| unit.ops.get(at as usize).map(|op| op.code);
+	let ends_job = |end: u32| match code(end) {
+		Some(Opcode::SubExit) => true,
+		Some(Opcode::Not) => code(end + 1) == Some(Opcode::SubExit),
+		_ => false,
+	};
 	unit.ops.get(pc as usize).is_some_and(|op| {
 		op.code == Opcode::Spawn
 			&& unit
 				.spawns
 				.get(op.a as usize)
-				.is_some_and(|s| s.kind == SpawnKind::Pipeline && code(s.end) == Some(Opcode::SubExit))
+				.is_some_and(|s| s.kind == SpawnKind::Pipeline && ends_job(s.end))
 	}) && unit
 		.spawns
 		.iter()
@@ -4379,7 +4766,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		// pipeline it runs with the job list frozen (`execute_pipeline`),
 		// deleting none.
 		if info.kind != SpawnKind::Pipeline {
-			super::killed::cleanup_dead_jobs(vp);
+			super::killed::cleanup_dead_jobs(k, cx, vp);
 		}
 		match info.kind {
 			SpawnKind::Subshell | SpawnKind::Background => {
@@ -4441,6 +4828,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// A job of its own: its processes get their own group.
 					super::jobctl::own_job(k, child.vpid);
+					copy_jobs(vp, &mut child, unit, info.end, false);
 				}
 				children.push(child.vpid);
 				let vpid = child.vpid;
@@ -4500,7 +4888,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						&& !job_stages
 				};
 				if !lastpipe {
-					super::killed::cleanup_dead_jobs(vp);
+					super::killed::cleanup_dead_jobs(k, cx, vp);
 				}
 				let mut stdin = vp.fds.get(0).cloned();
 				for (i, stage) in info.stages.iter().enumerate() {
@@ -4559,10 +4947,10 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					};
 					super::set_subshell_depth(&mut child, depth);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline
-					// stage (`jobs -p | xargs kill`).
-					if !vp.jobs.is_empty() && runs_jobs(unit, stage.entry) {
-						child.jobs = inherited_jobs(vp, true);
-					}
+					// stage (`jobs -p | xargs kill`), and for a simple command until
+					// its words are expanded.
+					let end = info.stages.get(i + 1).map_or(info.end, |next| next.entry);
+					copy_jobs(vp, &mut child, unit, end, runs_jobs(unit, stage.entry));
 					children.push(child.vpid);
 					k.spawned.push(Box::new(child));
 				}
@@ -4793,8 +5181,10 @@ pub(super) fn fork_async_ignored(
 
 /// The job table a child that lists its parent's jobs starts with (a
 /// command substitution, a `jobs` pipeline stage): copies of them, which
-/// are not its children, and none of the statuses its parent's `wait`
-/// collected; `subshell` turns job control off.
+/// are not its children, and the statuses its parent kept, which a `$( )`
+/// inherits (bash clears them in a `( … )` through `without_job_control`,
+/// `execute_cmd.c:1706`, `jobs.c:5363`, `5103`, not in a substitution);
+/// `subshell` turns job control off.
 pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTable {
 	let parent = &vp.jobs;
 	let mut list = parent.list.clone();
@@ -4808,12 +5198,68 @@ pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTabl
 		chld: 0,
 		subshell,
 		comsub: parent.comsub,
-		bgp: None,
+		copied: super::proc::Copied::No,
+		bgp: parent.bgp.clone(),
+	}
+}
+
+/// The parent's jobs that `child`, a pipeline stage or job of `vp` whose
+/// code ends before `end`, holds ([`super::proc::Copied`]): bash forks one
+/// simple command before it expands its words. Such code ends with the
+/// command's `Exec` and the `SubExit`, whose node is the command's (what
+/// comes before is the bodies of its substitutions, jumped over). `jobs`:
+/// the stage runs `jobs`, which keeps them.
+fn copy_jobs(vp: &Vproc, child: &mut Vproc, unit: &Unit, end: u32, jobs: bool) {
+	let op = |back: u32| {
+		end.checked_sub(back)
+			.and_then(|pc| unit.ops.get(pc as usize))
+	};
+	let simple = unit.mode.dialect() == Dialect::Bash
+		&& match (op(2), op(1)) {
+			(Some(exec), Some(exit)) if exec.code == Opcode::Exec && exit.code == Opcode::SubExit => {
+				let (cmd, whole) =
+					(unit.nodes.get(exec.node as usize), unit.nodes.get(exit.node as usize));
+				cmd.zip(whole).is_some_and(|(cmd, whole)| {
+					cmd.kind == NodeKind::Simple && (cmd.lo, cmd.hi) == (whole.lo, whole.hi)
+				})
+			},
+			_ => false,
+		};
+	if vp.jobs.is_empty() || !(simple || jobs) {
+		return;
+	}
+	// A fork of a substitution's process is no substitution's.
+	let comsub = child.jobs.comsub;
+	child.jobs = inherited_jobs(vp, true);
+	child.jobs.comsub = comsub;
+	if simple {
+		child.jobs.copied = if jobs {
+			super::proc::Copied::Keep
+		} else {
+			super::proc::Copied::Drop
+		};
+	}
+}
+
+/// `vp` expanded the words of the simple command bash forked it for: the
+/// parent's jobs it held go, or stay listed only for `jobs`
+/// ([`super::proc::Copied`]).
+pub(super) fn copied_jobs_expanded(vp: &mut Vproc) {
+	match vp.jobs.copied {
+		super::proc::Copied::No => {},
+		super::proc::Copied::Keep => vp.jobs.copied = super::proc::Copied::No,
+		super::proc::Copied::Drop => {
+			vp.jobs = super::proc::JobTable {
+				subshell: true,
+				comsub: vp.jobs.comsub,
+				..super::proc::JobTable::default()
+			};
+		},
 	}
 }
 
 /// Whether the pipeline stage starting at `entry` is a simple command
-/// named `jobs` (bash keeps the job list only for that builtin).
+/// named `jobs` (bash keeps the job list as that builtin runs, `jobs_hack`).
 fn runs_jobs(unit: &Unit, entry: u32) -> bool {
 	let Some(op) = unit.ops.get(entry as usize) else {
 		return false;
@@ -5180,6 +5626,16 @@ pub fn start_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, key: TrapKey)
 			matches!(f.kind,
 		FrameKind::Script { what: ScriptKind::Trap { key: active, .. }, .. }
 			if active == key || (key == TrapKey::Return && active == TrapKey::Debug))
+		}) {
+		return false;
+	}
+	// bash: a fork made while the trap ran is inside it too
+	// (`SIG_INPROGRESS`, which the child keeps; and a function called while
+	// the DEBUG trap runs gets no RETURN trap: `execute_function` sets it
+	// aside on `signal_in_progress (DEBUG_TRAP)`, `execute_cmd.c:5295`).
+	if vp.mode.dialect() == Dialect::Bash
+		&& vp.frames.first().is_some_and(|f| {
+			f.traced.running(key) || (key == TrapKey::Return && f.traced.running(TrapKey::Debug))
 		}) {
 		return false;
 	}

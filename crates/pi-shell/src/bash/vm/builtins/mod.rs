@@ -159,6 +159,16 @@ pub enum Control {
 pub struct Wait {
 	/// The children, in order.
 	pub children: Vec<Vpid>,
+	/// The children are the command's operands (`wait id …`, `wait -n id
+	/// …`), not every job: bash waits for each pid operand with
+	/// `wait_for_single_pid`, whose posix-mode deletion forgets the status
+	/// it returned (beside a job spec too), and `wait -n` with operands
+	/// (`JWAIT_WAITING`) takes no kept status before it waits for them.
+	pub operands: bool,
+	/// The status of the operands after the last child, when one of them
+	/// failed (`pid N is not a child of this shell`, `%N: no such job`):
+	/// bash returns the last operand's status.
+	pub after:    Option<i32>,
 	/// `wait` without operands: the status stays 0 rather than the last
 	/// child's.
 	pub all:      bool,
@@ -168,6 +178,10 @@ pub struct Wait {
 	pub into:     Option<BString>,
 	/// `wait -f`: a stopped job does not end the wait.
 	pub force:    bool,
+	/// zsh `wait id …` waits for one operand's child at a time: once it
+	/// ended the builtin runs again, [`Ctx::resumed`] this (the next
+	/// operand's index in `argv`) and [`Ctx::waited`] the wait's status.
+	pub resume:   Option<u32>,
 }
 
 /// `name` and the subscript of a `name[subscript]` variable reference.
@@ -233,8 +247,12 @@ pub struct Ctx<'a, 'c> {
 	/// key as is.
 	pub arrayref:    Vec<u32>,
 	/// Times the builtin ran again after a frame it pushed returned
-	/// ([`Control::Resume`]).
+	/// ([`Control::Resume`]); for zsh `wait`, the `argv` index of the
+	/// operand it goes on from ([`Wait::resume`]).
 	pub resumed:     u32,
+	/// The status of the wait a zsh `wait` ran again after
+	/// ([`Wait::resume`]).
+	pub waited:      i32,
 }
 
 impl<'a, 'c> Ctx<'a, 'c> {
@@ -261,6 +279,7 @@ impl<'a, 'c> Ctx<'a, 'c> {
 			log_cursor: 0,
 			arrayref: Vec::new(),
 			resumed: 0,
+			waited: 0,
 		}
 	}
 

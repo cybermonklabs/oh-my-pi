@@ -382,26 +382,52 @@ pub enum CallOutcome {
 /// caches). Persistent state lives in the [`StateStore`]. `Send`; holds no
 /// host references.
 pub struct Shell {
-	k:       Kernel,
+	k:         Kernel,
 	/// Boxed: a `Vproc` is ~650 bytes and the vector doubles, so idle
 	/// subshells would pay up to twice that in spare capacity (target:
 	/// ≤ 2 KiB per idle vproc).
 	#[expect(clippy::vec_box, reason = "slack capacity of 8-byte slots, not of whole vprocs")]
-	procs:   Vec<Box<Vproc>>,
-	rr:      usize,
+	procs:     Vec<Box<Vproc>>,
+	rr:        usize,
 	/// A slice cut short by the step budget or a control request: the vproc
 	/// and the ops it has left. The next step continues it, so which vproc
 	/// runs when depends only on op counts, never on where the host's steps,
 	/// pauses or snapshots fall.
-	slice:   Option<(Vpid, u32)>,
+	slice:     Option<(Vpid, u32)>,
 	/// Subshell vprocs that ended since the last orphan check: their
 	/// children are orphans ([`EngineConfig::end_orphan_jobs`] only).
 	///
 	/// [`EngineConfig::end_orphan_jobs`]: crate::bash::EngineConfig::end_orphan_jobs
-	gone:    Vec<Vpid>,
+	gone:      Vec<Vpid>,
 	/// Orphaned job trees still watched for in-engine work (see the
 	/// `orphans` module); empty unless [`Self::gone`] ever had entries.
-	orphans: Vec<Vpid>,
+	orphans:   Vec<Vpid>,
+	/// Builtins' asks to take in the exits already available, not answered
+	/// yet ([`Kernel::ask_exits`], [`Self::take_in_exits`]). Imaged, as
+	/// [`Self::slice`] is: the asker stays parked across a snapshot, and
+	/// only the answer wakes it.
+	taking_in: Vec<TakeIn>,
+	/// Vprocs adopted that have not had a turn yet: a take-in owes none of
+	/// the asker's own such jobs a turn ([`Self::take_in_exits`]). Imaged
+	/// with [`Self::taking_in`].
+	fresh:     Vec<Vpid>,
+}
+
+/// One builtin's ask to take in the exits already available
+/// ([`Kernel::ask_exits`]), until the scheduler answers it
+/// ([`Shell::take_in_exits`]). Every vproc keeps its place in the
+/// round-robin; nothing runs out of turn.
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct TakeIn {
+	/// The vproc whose builtin asked.
+	asker: Vpid,
+	/// The vprocs that had work when it asked, but for the asker's own jobs
+	/// that had not had a turn yet.
+	seen:  Vec<Vpid>,
+	/// The turns still owed before the answer: each vproc of `seen` once,
+	/// and once more the parent of each of them that ended since (it takes
+	/// that end in).
+	owed:  Vec<Vpid>,
 }
 
 /// Shell-wide state shared by all vprocs (kept apart from `procs` so ops can
@@ -485,11 +511,13 @@ pub struct Kernel {
 	/// [`Self::int_notes`]: a wait the EXIT trap begins rewrites those. In
 	/// the frames image: a snapshot between the death and the reap keeps it.
 	pub deaths:             Vec<(Vpid, Signal)>,
-	/// Notices of foreground subshells a signal killed
-	/// ([`killed::subshell_ended`]) held until the `( … )`'s own
-	/// redirections are undone: the vproc, the depth of its frame, the
-	/// notice. An entry goes when its vproc ends. In the frames image.
-	pub held_notices:       Vec<(Vpid, u32, BString)>,
+	/// The processes of bash pipeline jobs that `disown` deleted while they
+	/// ran ([`proc::Job::procs`]), by the job's vproc: bash still reaps each
+	/// of them and runs the `CHLD` trap once for each (`waitchld` counts
+	/// every child it reaps, a pid it has no job for too, `jobs.c:4161-4166`),
+	/// so the record outlives the job ([`Shell::reaped`]). An entry goes
+	/// with its vproc. In the frames image.
+	pub disowned_procs:     Vec<(Vpid, Box<proc::JobProcs>)>,
 	/// The vprocs whose pending `INT` trap bash runs with the job list
 	/// frozen ([`proc::ScriptKind::Trap`]'s `frozen`): the `INT` came while
 	/// the vproc waited for a forked foreground command (bash's `wait_for`
@@ -571,6 +599,20 @@ pub struct Kernel {
 	/// ended though the job runs on. Dropped when the job ends; not imaged
 	/// (a restored shell signals the job's vproc).
 	pub pid_owners:         Vec<(u32, Vpid, Vpid)>,
+	/// Vprocs whose builtin is about to report job state and asked first to
+	/// take in the exits already available ([`Kernel::ask_exits`]). Each
+	/// stays here until the scheduler answers it after a turn
+	/// (`Shell::take_in_exits`) or its builtin goes on without the answer
+	/// ([`Kernel::withdraw_exits`]). Imaged: the asker stays parked across a
+	/// snapshot.
+	pub exits_asked:        Vec<Vpid>,
+	/// Vprocs whose ask the scheduler answered: their builtin, run again,
+	/// reports now ([`Kernel::exits_taken`]). Imaged.
+	pub exits_taken:        Vec<Vpid>,
+	/// Jobs `disown` dropped before the scheduler adopted them: their
+	/// record names no parent (`Shell::adopt`, [`Kernel::disown`]). Empty
+	/// between turns; not imaged.
+	pub disowned:           Vec<Vpid>,
 	/// The math options ([`zsh::arith::math_options`]) last read for a vproc
 	/// without an overlay, with the [`state::Root::opts_gen`] and mode they
 	/// were read under: every `(( ))` asks.
@@ -708,7 +750,7 @@ impl Kernel {
 			pseudo_traps: exec::PseudoTraps::default(),
 			int_notes: Vec::new(),
 			deaths: Vec::new(),
-			held_notices: Vec::new(),
+			disowned_procs: Vec::new(),
 			frozen_ints: Vec::new(),
 			forward: crate::bash::SigSet::EMPTY,
 			program_in_place: false,
@@ -727,6 +769,9 @@ impl Kernel {
 			bangs: Vec::new(),
 			settled: Vec::new(),
 			pid_owners: Vec::new(),
+			exits_asked: Vec::new(),
+			exits_taken: Vec::new(),
+			disowned: Vec::new(),
 			math_opts: None,
 			deferrals: Vec::new(),
 			jobctl: jobctl::JobCtl::default(),
@@ -743,6 +788,58 @@ impl Kernel {
 	pub fn forget_deferral(&mut self, vproc: Vpid) {
 		if !self.deferrals.is_empty() {
 			self.deferrals.retain(|d| d.vproc != vproc);
+		}
+	}
+
+	/// `vpid`'s builtin is about to report job state: the scheduler first
+	/// takes in the exits already available ([`Kernel::exits_asked`]), then
+	/// the builtin runs again.
+	pub fn ask_exits(&mut self, vpid: Vpid) {
+		if !self.exits_asked.contains(&vpid) {
+			self.exits_asked.push(vpid);
+		}
+	}
+
+	/// Whether the scheduler answered `vpid`'s [`Kernel::ask_exits`]; the
+	/// answer is used up.
+	pub fn exits_taken(&mut self, vpid: Vpid) -> bool {
+		let Some(i) = self.exits_taken.iter().position(|&v| v == vpid) else {
+			return false;
+		};
+		self.exits_taken.swap_remove(i);
+		true
+	}
+
+	/// `vpid`'s builtin goes on without the answer to its ask: every job of
+	/// its vproc ended before the answer came (a parked asker runs again at
+	/// each wake), so nothing is left to take in, and it asks no more.
+	pub fn withdraw_exits(&mut self, vpid: Vpid) {
+		self.exits_asked.retain(|&v| v != vpid);
+	}
+
+	/// Whether `vpid`'s builtin asked to take in exits and has not run again
+	/// since its answer ([`Kernel::exits_asked`], [`Kernel::exits_taken`]):
+	/// its command is still running, with that command's redirections.
+	pub fn asking(&self, vpid: Vpid) -> bool {
+		self.exits_asked.contains(&vpid) || self.exits_taken.contains(&vpid)
+	}
+
+	/// `disown` dropped the job whose vproc is `vpid`: it is no child of the
+	/// shell for `wait` any more (bash deletes the job; `wait` neither waits
+	/// for it nor finds it, unless by the status bash keeps), so its record
+	/// names no parent ([`Self::started`] is false) and keeps doing so once it
+	/// ends ([`Self::proc_exited`]); `kill` still finds the process while it
+	/// runs. It is still the shell's child for its end: bash's `waitchld`
+	/// counts every child it reaps, so the end owes a `SIGCHLD` trap run as
+	/// any child's does (`Shell::reaped` takes the vproc's parent).
+	pub fn disown(&mut self, store: &mut dyn StateStore, vpid: Vpid) {
+		if self.spawned.iter().any(|p| p.vpid == vpid) {
+			self.disowned.push(vpid);
+			return;
+		}
+		if let Ok(Some(&Record::Proc { status, .. })) = store.get(Key::Proc(vpid)) {
+			let rec = Record::Proc { parent: None, status };
+			self.root.write(store, Change::Put(Key::Proc(vpid), rec));
 		}
 	}
 
@@ -876,7 +973,9 @@ impl Kernel {
 	}
 
 	/// Child vproc `vpid` of `parent` ended with `status`; the record stays
-	/// until the status is collected ([`Self::proc_collect`]).
+	/// until the status is collected ([`Self::proc_collect`]). A record
+	/// `disown` left with no parent ([`Self::disown`]) keeps naming none:
+	/// `wait` does not find it, and `kill` of `$!` still sees the child gone.
 	pub fn proc_exited(
 		&mut self,
 		store: &mut dyn StateStore,
@@ -885,6 +984,10 @@ impl Kernel {
 		status: i32,
 	) {
 		self.pid_owners.retain(|&(.., job)| job != vpid);
+		let parent = match store.get(Key::Proc(vpid)) {
+			Ok(Some(Record::Proc { parent: None, .. })) => None,
+			_ => parent,
+		};
 		let rec = Record::Proc { parent, status: Some(status) };
 		self.root.write(store, Change::Put(Key::Proc(vpid), rec));
 	}
@@ -1118,23 +1221,31 @@ impl Kernel {
 				utf8,
 			});
 		}
-		static COMMAND: Origin = Origin::Command;
-		let origin = vp
+		let command = vp
 			.runs
 			.front()
 			.and_then(|r| r.chain.links.first())
-			.map_or(&COMMAND, |l| &l.origin);
+			.is_none_or(|l| matches!(l.origin, Origin::Command));
 		let utf8 = locale::is_utf8(self, cx.store, vp);
-		// An in-engine nested shell names itself (its `$0`).
-		let shell_name = match vp
+		// bash's `get_name_for_error`: a non-interactive shell names it after
+		// `BASH_SOURCE[0]` (a `.` file, the file a function was defined in),
+		// else `$0`; an in-engine nested shell names itself (its `$0`).
+		let source = callstack::error_source(vp).filter(|_| !killed::interactive(cx, vp));
+		let nested = match vp
 			.overlay
 			.as_ref()
 			.and_then(|o| o.records.get(&KeyBuf::Misc(MiscKey::Argv0)))
 		{
-			Some(Some(Record::Misc(name))) => name.as_slice(),
-			_ => self.argv0.as_slice(),
+			Some(Some(Record::Misc(name))) => Some(name.as_slice()),
+			_ => None,
 		};
-		render(diag, DiagSite { shell_name, origin, line, utf8 })
+		let shell_name = source
+			.map(|s| s.as_slice())
+			.or(nested)
+			.unwrap_or(self.argv0.as_slice());
+		// A `.` file's own syntax error names the file, with no `-c`.
+		let command = command && source.is_none();
+		render(diag, DiagSite { shell_name, command, line, utf8 })
 	}
 
 	/// The `Diag` event of a diagnostic `vp` prints, `tail` after its text
@@ -1854,6 +1965,8 @@ impl Shell {
 			slice: None,
 			gone: Vec::new(),
 			orphans: Vec::new(),
+			taking_in: Vec::new(),
+			fresh: Vec::new(),
 		})
 	}
 
@@ -2120,11 +2233,15 @@ impl Shell {
 			let used = ops - before;
 			let p = &self.procs[i];
 			let ran = p.vpid;
+			self.fresh.retain(|&v| v != ran);
 			self.slice = (used < left && p.has_work() && p.blocked.is_none() && !p.stopped)
 				.then_some((ran, left - used));
 			self.adopt(cx);
 			self.end_orphans(cx, Some(ran));
 			self.job_events(cx);
+			if !self.k.exits_asked.is_empty() || !self.taking_in.is_empty() {
+				self.take_in_exits(ran);
+			}
 		}
 	}
 
@@ -2132,14 +2249,18 @@ impl Shell {
 	/// subshell vprocs that finished.
 	fn adopt(&mut self, cx: &mut Cx<'_>) {
 		for p in &self.k.spawned {
-			let rec = Record::Proc { parent: p.parent, status: None };
+			// A job `disown` dropped before it got here is no child.
+			let parent = p.parent.filter(|_| !self.k.disowned.contains(&p.vpid));
+			let rec = Record::Proc { parent, status: None };
 			self
 				.k
 				.root
 				.write(cx.store, Change::Put(Key::Proc(p.vpid), rec));
 		}
 		self.stages_started();
+		self.fresh.extend(self.k.spawned.iter().map(|p| p.vpid));
 		self.procs.append(&mut self.k.spawned);
+		self.k.disowned.clear();
 		self.apply_settled();
 		let mut i = 0;
 		while i < self.procs.len() {
@@ -2179,7 +2300,10 @@ impl Shell {
 				let died = self.k.died_of(p.vpid);
 				self.k.set_int_note(p.vpid, None);
 				self.k.frozen_ints.retain(|v| *v != p.vpid);
-				self.k.held_notices.retain(|(v, ..)| *v != p.vpid);
+				// A job `disown` dropped is still the shell's child: bash reaps
+				// it and runs the `CHLD` trap for it (`waitchld`,
+				// `jobs.c:4161-4166`).
+				self.ended(p.vpid, p.parent);
 				self.reaped(cx, p.parent, p.vpid, p.status, died, false);
 			} else {
 				i += 1;
@@ -2213,27 +2337,15 @@ impl Shell {
 				continue;
 			};
 			let job = jp.vpid;
-			// Its processes still name the job's vproc ([`exec::pipeline_job`]).
-			let waiting = self.procs[s].jobs.by_vpid(job).is_some_and(|entry| {
-				!entry.inherited
-					&& entry
-						.procs
-						.as_ref()
-						.is_some_and(|procs| procs.list.first().is_some_and(|p| p.vpid == job))
-			});
-			if !waiting {
-				continue;
-			}
 			let stages: Vec<Vpid> = jp
 				.frames
 				.first()
 				.and_then(|f| f.scratch.as_deref())
 				.filter(|_| runs_pipeline(jp))
 				.map_or_else(Vec::new, |sc| sc.children.iter().map(|&(v, _)| v).collect());
-			let Some(procs) = self.procs[s]
-				.jobs
-				.by_vpid_mut(job)
-				.and_then(|entry| entry.procs.as_deref_mut())
+			// Its processes still name the job's vproc ([`exec::pipeline_job`]).
+			let Some(procs) = job_procs(&mut self.procs, &mut self.k.disowned_procs, s, job)
+				.filter(|procs| procs.list.first().is_some_and(|p| p.vpid == job))
 			else {
 				continue;
 			};
@@ -2269,6 +2381,116 @@ impl Shell {
 				if let Some(q) = waited {
 					q.os_pid = Some(pid);
 				}
+			}
+		}
+	}
+
+	/// Builtins about to report job state asked to take in the exits
+	/// already available first ([`Kernel::exits_asked`]): bash's job states
+	/// follow its children's exits at once (`waitchld`, run by its
+	/// `SIGCHLD` handler), before a builtin reads them. The asker is
+	/// answered ([`Kernel::exits_taken`]) once every other vproc that had
+	/// work when it asked has had its next turn of the round-robin, and the
+	/// parent of each of those that ended since one turn more
+	/// ([`Self::ended`]): a vproc that waits for an exited program or for
+	/// ended children polls again and takes the end in, and an end climbs
+	/// its job. Waking every parked vproc at the ask makes each of them
+	/// runnable; until the answer the asker parks again whenever it runs. A
+	/// job the asker started that has not had a turn yet ([`Self::fresh`])
+	/// has not run, so it has no exit to take in and is owed nothing:
+	/// `{ exit 3; } & jobs` lists the job `Running`, as bash does when its
+	/// child has not ended yet.
+	///
+	/// Nothing runs out of turn, so the round-robin's fairness is the one
+	/// the scheduler has without a take-in: only the asker waits, for at
+	/// most two turns of each of the `n` vprocs it saw (`2n`); one that runs
+	/// on parks or runs on, and is not waited for. An owed vproc that cannot
+	/// run (stopped, gone, out of work) owes nothing. An owed vproc is never
+	/// parked here: the ask wakes every parked vproc, a vproc leaves `owed`
+	/// at its turn, and the end that owes a parent its turn wakes it too.
+	///
+	/// An ask stays in [`Kernel::exits_asked`] until it is answered or the
+	/// builtin withdraws it ([`Kernel::withdraw_exits`]); a gone asker asks
+	/// no more. Until its builtin has used the answer ([`Kernel::asking`]),
+	/// no signal trap starts in the asker (`exec::run_slice`): its command
+	/// still runs, with its redirections, and the trap runs once that
+	/// command is over, as bash runs a trap between commands.
+	fn take_in_exits(&mut self, ran: Vpid) {
+		for t in &mut self.taking_in {
+			t.owed.retain(|&v| v != ran);
+		}
+		let procs = &self.procs;
+		self
+			.k
+			.exits_asked
+			.retain(|&v| procs.iter().any(|p| p.vpid == v));
+		let asking = &self.k.exits_asked;
+		self.taking_in.retain(|t| asking.contains(&t.asker));
+		let mut asked = false;
+		for &asker in &self.k.exits_asked {
+			if self.taking_in.iter().any(|t| t.asker == asker) {
+				continue;
+			}
+			let seen: Vec<Vpid> = self
+				.procs
+				.iter()
+				.filter(|p| {
+					p.vpid != asker
+						&& p.has_work()
+						&& !p.stopped
+						&& !(p.parent == Some(asker) && self.fresh.contains(&p.vpid))
+				})
+				.map(|p| p.vpid)
+				.collect();
+			self
+				.taking_in
+				.push(TakeIn { asker, owed: seen.clone(), seen });
+			asked = true;
+		}
+		if asked {
+			// Parked vprocs poll again: each owed one is runnable.
+			self.k.ctl.notify();
+		}
+		let mut answered = Vec::new();
+		let procs = &self.procs;
+		self.taking_in.retain(|t| {
+			let owing = t.owed.iter().any(|&v| {
+				procs
+					.iter()
+					.any(|p| p.vpid == v && p.has_work() && !p.stopped)
+			});
+			if !owing {
+				answered.push(t.asker);
+			}
+			owing
+		});
+		if answered.is_empty() {
+			return;
+		}
+		self.k.exits_asked.retain(|v| !answered.contains(v));
+		self
+			.k
+			.exits_taken
+			.retain(|&v| self.procs.iter().any(|p| p.vpid == v));
+		// Each asker answered is one still here: its take-in is one of
+		// `exits_asked`, which keeps only those.
+		self.k.exits_taken.extend(answered);
+		// The askers are parked: they run again.
+		self.k.ctl.notify();
+	}
+
+	/// Vproc `vpid`, a child of `parent`, ended: a take-in that saw it owes
+	/// its parent one turn more, in which the parent takes the end in
+	/// ([`Self::take_in_exits`]).
+	fn ended(&mut self, vpid: Vpid, parent: Option<Vpid>) {
+		self.fresh.retain(|&v| v != vpid);
+		let Some(parent) = parent else {
+			return;
+		};
+		for t in &mut self.taking_in {
+			t.owed.retain(|&v| v != vpid);
+			if t.seen.contains(&vpid) && parent != t.asker && !t.owed.contains(&parent) {
+				t.owed.push(parent);
 			}
 		}
 	}
@@ -2327,6 +2549,13 @@ impl Shell {
 		if self.k.engine.config().end_orphan_jobs {
 			self.gone.push(vpid);
 		}
+		// The processes of a pipeline job `disown` deleted go with its vproc.
+		let disowned = self
+			.k
+			.disowned_procs
+			.iter()
+			.position(|(v, _)| *v == vpid)
+			.map(|at| self.k.disowned_procs.swap_remove(at).1);
 		let Some(i) = parent.and_then(|v| self.procs.iter().position(|p| p.vpid == v)) else {
 			return;
 		};
@@ -2334,8 +2563,15 @@ impl Shell {
 		let job = self.procs[i].jobs.by_vpid_mut(vpid);
 		let background = job.is_some();
 		// The runs of the `CHLD` trap this end owes: one for the process it
-		// is, or one for each process of its pipeline job that ended with it.
-		let mut owed = 1;
+		// is, or one for each process of its pipeline job that ended with it
+		// (a job `disown` deleted too: bash reaps its processes all the same).
+		let mut owed: usize = disowned.filter(|_| !background).map_or(1, |procs| {
+			procs
+				.list
+				.iter()
+				.filter(|p| p.state == proc::ProcState::Running)
+				.count()
+		});
 		if let Some(job) = job {
 			job.state = proc::JobState::Done(status);
 			job.signal = match job.procs.as_deref_mut() {
@@ -2396,7 +2632,8 @@ impl Shell {
 	/// of a pipeline says so ([`proc::JobProc`]), of one `i` waits for
 	/// ([`proc::PipelineWait::procs`]) or of the one that is the whole
 	/// command of the job `i` is the vproc of ([`proc::Job::procs`], in its
-	/// parent's table). Returns that parent, in the last case.
+	/// parent's table, or kept since `disown` deleted the job,
+	/// [`Kernel::disowned_procs`]). Returns that parent, in the last case.
 	fn process_ended(&mut self, i: usize, vpid: Vpid, end: proc::ProcState) -> Option<usize> {
 		let p = &mut self.procs[i];
 		let waited = p
@@ -2413,10 +2650,7 @@ impl Shell {
 		let s = p
 			.parent
 			.and_then(|v| self.procs.iter().position(|q| q.vpid == v))?;
-		let q = self.procs[s]
-			.jobs
-			.by_vpid_mut(job)
-			.and_then(|j| j.procs.as_deref_mut())
+		let q = job_procs(&mut self.procs, &mut self.k.disowned_procs, s, job)
 			.and_then(|procs| procs.get_mut(vpid))?;
 		q.state = end;
 		Some(s)
@@ -2515,6 +2749,9 @@ impl Shell {
 				if self.procs[i].lineage.detached {
 					continue;
 				}
+				// Its builtin parked on a take-in never runs again.
+				let vpid = self.procs[i].vpid;
+				self.drop_take_in(vpid);
 				let key = crate::bash::store::TrapKey::Signal(sig);
 				let trapped = sig != Signal::Kill
 					&& self.procs[i].has_work()
@@ -2617,6 +2854,7 @@ impl Shell {
 	/// [`Self::release_foreground`]).
 	fn end(&mut self, cx: &mut Cx<'_>, i: usize, sig: Signal, status: i32, externals: bool) {
 		let vpid = self.procs[i].vpid;
+		self.drop_take_in(vpid);
 		let pipeline = runs_pipeline(&self.procs[i]);
 		self.k.set_int_note(vpid, None);
 		if self.procs[i].parent.is_some() {
@@ -2668,8 +2906,9 @@ impl Shell {
 			self.rr = 0;
 			self.k.set_int_note(p.vpid, None);
 			self.k.frozen_ints.retain(|v| *v != p.vpid);
-			self.k.held_notices.retain(|(v, ..)| *v != p.vpid);
 			let died = self.k.died_of(p.vpid);
+			self.ended(p.vpid, p.parent);
+			self.k.ctl.notify();
 			self.reaped(cx, p.parent, p.vpid, status, died, pipeline);
 		}
 	}
@@ -3261,6 +3500,16 @@ impl Shell {
 		}
 	}
 
+	/// `vpid`'s command ended early (a cancel, a kill, a store failure): a
+	/// builtin of it parked on its take-in will not run again to use the
+	/// answer, so its ask and its answer go. Kept, either would hold every
+	/// later signal trap of the vproc for good ([`Kernel::asking`]).
+	fn drop_take_in(&mut self, vpid: Vpid) {
+		self.k.exits_asked.retain(|&v| v != vpid);
+		self.k.exits_taken.retain(|&v| v != vpid);
+		self.taking_in.retain(|t| t.asker != vpid);
+	}
+
 	/// Whether a vproc carrying lineage label `label` still exists (running,
 	/// or submitted and not adopted yet): the label's tree has not ended.
 	pub fn label_live(&self, label: u32) -> bool {
@@ -3472,7 +3721,11 @@ pub fn owe_chld(k: &mut Kernel, cx: &mut Cx<'_>, p: &mut Vproc, job: Option<Vpid
 }
 
 /// End a `wait` builtin that `p` is in with `status` (a trapped signal
-/// arrived): its `Exec` completes at once, keeping the jobs it waited for.
+/// arrived): its wait for the child ends at once, keeping the jobs it
+/// waited for. bash's `wait` completes with that status; zsh's goes on with
+/// its next operand, the status so far `status` (`bin_fg` keeps the 128 +
+/// signal of `waitforpid` and `zwaitjob` in `retval` and reads the next
+/// operand, jobs.c:2437-2451, 2552-2569; [`proc::ExecState::resume`]).
 fn interrupt_wait(p: &mut Vproc, status: i32) {
 	for frame in &mut p.frames {
 		let Some(e) = frame.scratch.as_mut().and_then(|sc| sc.exec.as_mut()) else {
@@ -3483,7 +3736,7 @@ fn interrupt_wait(p: &mut Vproc, status: i32) {
 			Some(proc::Awaited::Jobs { .. } | proc::Awaited::AllJobs | proc::Awaited::AnyJob { .. })
 		);
 		if waiting && e.target == Some(proc::Target::Intrinsic(crate::bash::ids::IntrinsicId::Wait)) {
-			e.waiting = Some(proc::Awaited::Jobs { force: true });
+			e.waiting = Some(proc::Awaited::Jobs { force: true, operands: false, after: None });
 			e.wait_for.clear();
 			e.wait_into = None;
 			e.status = status;
@@ -3734,6 +3987,15 @@ pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 				if !whole {
 					return None;
 				}
+				// `! a | b &`: bash drops the `!` of an asynchronous
+				// pipeline, which is still the job's processes
+				// ([`exec::job_pipeline`]).
+				if spawn.kind == ir::SpawnKind::Pipeline
+					&& code_at(end) == Some(ir::Opcode::Not)
+					&& exec::job_pipeline(unit, frame.pc)
+				{
+					end += 1;
+				}
 			}
 			(code_at(end) == Some(ir::Opcode::SubExit)).then_some(false)
 		},
@@ -3774,6 +4036,26 @@ fn runs_pipeline(p: &Vproc) -> bool {
 				.and_then(|op| unit.spawns.get(op.a as usize))
 				.is_some_and(|spawn| matches!(spawn.kind, ir::SpawnKind::Pipeline))
 		})
+}
+
+/// The record of the processes of the pipeline job whose vproc is `job`, a
+/// child of vproc `s` ([`proc::Job::procs`]): in `s`'s job table, or kept
+/// since `disown` deleted the job while they ran
+/// ([`Kernel::disowned_procs`]).
+fn job_procs<'a>(
+	procs: &'a mut [Box<Vproc>],
+	disowned: &'a mut [(Vpid, Box<proc::JobProcs>)],
+	s: usize,
+	job: Vpid,
+) -> Option<&'a mut proc::JobProcs> {
+	match procs.get_mut(s)?.jobs.by_vpid_mut(job) {
+		Some(entry) if !entry.inherited => entry.procs.as_deref_mut(),
+		Some(_) => None,
+		None => disowned
+			.iter_mut()
+			.find(|(v, _)| *v == job)
+			.map(|(_, rec)| &mut **rec),
+	}
 }
 
 /// `vp` spawned the program of OS pid `pid`: where `vp` is a pipeline's
@@ -3869,7 +4151,7 @@ impl Vproc {
 	/// A child of `self` (subshell, pipeline stage, background job, command
 	/// substitution) that starts running `unit` at `entry` with `fds`.
 	pub fn child(
-		&self,
+		&mut self,
 		k: &mut Kernel,
 		store: &mut dyn StateStore,
 		unit: Arc<Unit>,
@@ -3879,7 +4161,8 @@ impl Vproc {
 		let line_shift = self.frames.last().map_or(0, |f| f.line_shift);
 		// bash's `line_number` as it forks: a `( … )`'s own line, the last
 		// (`Subshell->line`; its body follows its `Spawn` op), else the line
-		// the parent has reached ([`killed::wait_line`]).
+		// the parent has reached ([`killed::fork_at`], found only when a
+		// notice or an error names it).
 		let fork_line = entry
 			.checked_sub(1)
 			.and_then(|pc| unit.ops.get(pc as usize))
@@ -3891,20 +4174,17 @@ impl Vproc {
 						.is_some_and(|s| s.kind == ir::SpawnKind::Subshell)
 			})
 			.map_or_else(
-				|| {
-					let node = self
-						.frames
-						.last()
-						.and_then(|f| f.unit.as_ref()?.ops.get(f.pc as usize))
-						.map_or(0, |op| op.node);
-					killed::wait_line(self, node)
+				|| killed::fork_at(self, &unit),
+				|op| {
+					proc::ForkLine::new(proc::ForkAt::Line(
+						(unit.line + exec::end_line(&unit, op.node)).saturating_sub(line_shift),
+					))
 				},
-				|op| (unit.line + exec::end_line(&unit, op.node)).saturating_sub(line_shift),
 			);
 		let mut frame = Frame::new(Some(unit), entry, proc::FrameKind::Subshell);
 		// A subshell runs code of the same unit: it keeps the line numbering.
 		frame.line_shift = line_shift;
-		frame.fork_line = Some(fork_line);
+		frame.fork_line = fork_line;
 		self.child_running(k, store, fds, frame)
 	}
 
@@ -3966,6 +4246,32 @@ impl Vproc {
 		vp.rlimits.clone_from(&self.rlimits);
 		vp.lineage = self.lineage;
 		jobctl::inherit(k, vp.vpid, self.vpid);
+		// bash `reset_or_restore_signal_handlers` (`trap.c:1467-1473`): a
+		// child keeps the ERR trap only with `errtrace`, and the DEBUG and
+		// RETURN traps only with `functrace`, as they are when it forks. A
+		// trap running then stays marked running in the child
+		// (`SIG_INPROGRESS`), which so does not run it: `set -T; trap ': $(:)'
+		// DEBUG` runs the substitution without the trap.
+		let mut traced = proc::Traced::forked(
+			state::option(&mut k.root, store, self, OptId::Errtrace).unwrap_or(false),
+			state::option(&mut k.root, store, self, OptId::Functrace).unwrap_or(false),
+		);
+		let inherited = self.frames.first().map_or(proc::Traced::ROOT, |f| f.traced);
+		for key in [
+			crate::bash::store::TrapKey::Debug,
+			crate::bash::store::TrapKey::Err,
+			crate::bash::store::TrapKey::Return,
+		] {
+			let running = inherited.running(key)
+				|| (self.trap_frames != 0
+					&& self.frames.iter().any(|f| {
+						matches!(f.kind,
+							proc::FrameKind::Script { what: proc::ScriptKind::Trap { key: active, .. }, .. }
+								if active == key)
+					}));
+			traced = traced.with_running(key, running);
+		}
+		frame.traced = traced;
 		vp.mode = self.mode;
 		vp.zle.clone_from(&self.zle);
 		vp.set_sticky(self.sticky().cloned());
@@ -4046,5 +4352,109 @@ pub const fn assign_scope(vp: &Vproc) -> AssignScope {
 		AssignScope::Subshell
 	} else {
 		AssignScope::Global
+	}
+}
+
+// Failure mode: a run cancelled, or ended by a signal to the shell, while
+// its `jobs` waited on its take-in (the ask made, or made and answered)
+// left the ask in `Kernel::exits_asked` or the answer in
+// `Kernel::exits_taken`; `Kernel::asking` then held every later signal trap
+// of the root for good: the next run's `USR1` trap never ran (the
+// reviewer's probe at 2bfc6ca3: `tail` alone). In the bash tool's shell a
+// timed-out command would silence the session's traps.
+#[cfg(test)]
+mod cancelled_take_in {
+	use super::*;
+	use crate::testkit::{FakeHost, Fault, Rig, fault::skeleton_init};
+
+	/// What ends the run while its `jobs` waits on the take-in.
+	#[derive(Clone, Copy, Debug)]
+	enum End {
+		/// The host cancels the run (a timeout): the cancel's handling.
+		Cancel(Signal),
+		/// A signal sent to the shell's pid: `Shell::kill` of the root.
+		Signal(Signal),
+	}
+
+	/// `while :; do :; done & jobs` one op per step until the root's `jobs`
+	/// has its answer (`answered`), or has asked and waits for it; then
+	/// `end`; then `USR1` is pending for the next run. That run's output.
+	/// The ask waits only when the loop has had a turn before it (`(:)`
+	/// first): a job that has not run yet is owed none, so an ask right
+	/// after `&` is answered in the step that makes it.
+	fn end_at_the_ask(answered: bool, end: End) -> Vec<u8> {
+		let mut rig = Rig::new(FakeHost::default(), skeleton_init(&[]));
+		assert_eq!(rig.run(Script::command(b"trap 'echo signal' USR1".to_vec()), Fault::None), 0);
+		let root = rig.shell().procs[0].vpid;
+		let src: &[u8] = if answered {
+			b"while :; do :; done & jobs"
+		} else {
+			b"while :; do :; done & (:); jobs"
+		};
+		let run = rig.shell().submit(Script::command(src.to_vec()));
+		let one = Budget { max_ops: 1, max_ns: u64::MAX };
+		let mut reached = false;
+		for _ in 0..50_000 {
+			let (shell, host, store) = rig.parts();
+			let step = shell.step(&mut Cx { host, store }, one);
+			let k = &shell.k;
+			if (answered && k.exits_taken.contains(&root))
+				|| (!answered && k.exits_asked.contains(&root) && !k.exits_taken.contains(&root))
+			{
+				reached = true;
+				break;
+			}
+			assert!(!matches!(step, Step::Done { run: id, .. } if id == run), "the run ended first");
+		}
+		assert!(reached, "`jobs` asked (answered: {answered})");
+		match end {
+			End::Cancel(sig) => rig.shell().k.ctl.request_cancel(sig),
+			End::Signal(sig) => rig.shell().control().signal(SigTarget::Vpid(root), sig),
+		}
+		let mut ended = false;
+		for _ in 0..50_000 {
+			let (shell, host, store) = rig.parts();
+			if matches!(shell.step(&mut Cx { host, store }, one), Step::Done { run: id, .. } if id == run)
+			{
+				ended = true;
+				break;
+			}
+		}
+		assert!(ended, "the run ends ({end:?})");
+		let n = rig.host.stdout.bytes().len();
+		let p = &mut rig.shell().procs[0];
+		p.pending_traps = p.pending_traps.with(Signal::Usr1);
+		assert_eq!(rig.run(Script::command(b"echo tail".to_vec()), Fault::None), 0);
+		rig.host.stdout.bytes()[n..].to_vec()
+	}
+
+	#[test]
+	fn a_cancel_after_the_answer_leaves_no_ask() {
+		for sig in [Signal::Kill, Signal::Term] {
+			let out = end_at_the_ask(true, End::Cancel(sig));
+			assert_eq!(String::from_utf8_lossy(&out), "signal\ntail\n", "{sig:?}");
+		}
+	}
+
+	#[test]
+	fn a_cancel_before_the_answer_leaves_no_ask() {
+		for sig in [Signal::Kill, Signal::Term] {
+			let out = end_at_the_ask(false, End::Cancel(sig));
+			assert_eq!(String::from_utf8_lossy(&out), "signal\ntail\n", "{sig:?}");
+		}
+	}
+
+	#[test]
+	fn a_signal_that_ends_the_run_at_the_ask_leaves_no_ask() {
+		for answered in [true, false] {
+			for sig in [Signal::Kill, Signal::Term] {
+				let out = end_at_the_ask(answered, End::Signal(sig));
+				assert_eq!(
+					String::from_utf8_lossy(&out),
+					"signal\ntail\n",
+					"{sig:?} (answered: {answered})"
+				);
+			}
+		}
 	}
 }

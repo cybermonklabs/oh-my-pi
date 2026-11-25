@@ -262,6 +262,7 @@ fn samples() -> Vec<(KeyBuf, Record)> {
 		),
 		(KeyBuf::ZshAlias { suffix: true, name: bytes(b"G\xff") }, Record::Alias(bytes(b"vi"))),
 		(KeyBuf::Misc(MiscKey::Mode), Record::Misc(bytes(b"zsh-sh"))),
+		(KeyBuf::BgPid(Vpid(Vpid::BASE + 2)), Record::Misc(bytes(b"5:4242:0"))),
 		(KeyBuf::Alias(bytes(b"l\xffl")), Record::Alias(bytes(b"ls -l \xfe"))),
 		(KeyBuf::Opt(OptId::Errexit), Record::Opt(true)),
 		(KeyBuf::Opt(OptId::Nullglob), Record::Opt(false)),

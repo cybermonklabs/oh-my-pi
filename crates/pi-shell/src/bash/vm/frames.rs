@@ -56,8 +56,15 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
-/// a variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 37;
+/// a variant: an exec target holds it by index. Each layout has a number of
+/// its own: two trees that share a number share a layout. 41 holds, beyond
+/// 37's: `Frame::fork_line` as a `ForkLine`, `Frame::traced`,
+/// `JobTable::copied`, `Awaited::Jobs::operands` (once `by_pid`) and
+/// `Awaited::Jobs::after`, `Awaited::AnyJob::operands`,
+/// [`Kernel::disowned_procs`], the take-in (`TakeInImage`), and no held
+/// subshell notices; 38, 39 and 40 are other layouts of the same work (40
+/// lacks `Awaited::Jobs::after`).
+pub const FRAMES_VERSION: u32 = 41;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -97,9 +104,22 @@ struct Image {
 	deferrals: Vec<super::proc::Deferral>,
 	/// Subshells dying of a signal, not reaped yet ([`Kernel::deaths`]).
 	deaths:    Vec<(Vpid, crate::bash::signal::Signal)>,
-	/// Subshell notices held for a redirection's end
-	/// ([`Kernel::held_notices`]).
-	held:      Vec<(Vpid, u32, BString)>,
+	/// The processes of pipeline jobs `disown` deleted
+	/// ([`Kernel::disowned_procs`]).
+	disowned:  Vec<(Vpid, Box<super::proc::JobProcs>)>,
+	/// The take-in's state ([`Kernel::exits_asked`], [`Kernel::exits_taken`],
+	/// `Shell::taking_in`, `Shell::fresh`): a builtin that asked stays
+	/// parked across a snapshot, so its ask and its answer go with it.
+	take_in:   TakeInImage,
+}
+
+/// The take-in's state, as the image keeps it ([`Image::take_in`]).
+#[derive(Serialize, Deserialize)]
+struct TakeInImage {
+	asked: Vec<Vpid>,
+	taken: Vec<Vpid>,
+	asks:  Vec<super::TakeIn>,
+	fresh: Vec<Vpid>,
 }
 
 /// One fd object.
@@ -340,7 +360,8 @@ struct FrameImage {
 	debug_errexit:     bool,
 	err_reported:      bool,
 	ignore_errexit:    bool,
-	fork_line:         Option<u32>,
+	fork_line:         super::proc::ForkLine,
+	traced:            super::proc::Traced,
 	getopts:           super::proc::GetoptsState,
 }
 
@@ -574,6 +595,7 @@ impl Shell {
 					err_reported: f.err_reported,
 					ignore_errexit: f.ignore_errexit,
 					fork_line: f.fork_line,
+					traced: f.traced,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
 				});
 			}
@@ -672,7 +694,13 @@ impl Shell {
 			bangs: k.bangs.clone(),
 			deferrals: k.deferrals.clone(),
 			deaths: k.deaths.clone(),
-			held: k.held_notices.clone(),
+			disowned: k.disowned_procs.clone(),
+			take_in: TakeInImage {
+				asked: k.exits_asked.clone(),
+				taken: k.exits_taken.clone(),
+				asks:  self.taking_in.clone(),
+				fresh: self.fresh.clone(),
+			},
 		};
 		let mut bytes = postcard::to_stdvec(&header).map_err(ExtError::Encode)?;
 		bytes.extend_from_slice(&postcard::to_stdvec(&image).map_err(ExtError::Encode)?);
@@ -747,6 +775,8 @@ impl Shell {
 			slice: None,
 			gone: Vec::new(),
 			orphans: Vec::new(),
+			taking_in: Vec::new(),
+			fresh: Vec::new(),
 		};
 		let mut report = RestoreReport::default();
 		let mut restored = false;
@@ -831,10 +861,10 @@ impl Shell {
 			.into_iter()
 			.filter(|(v, _)| img.procs.iter().any(|p| p.vpid == *v))
 			.collect();
-		k.held_notices = img
-			.held
+		k.disowned_procs = img
+			.disowned
 			.into_iter()
-			.filter(|(v, ..)| img.procs.iter().any(|p| p.vpid == *v))
+			.filter(|(v, _)| img.procs.iter().any(|p| p.vpid == *v))
 			.collect();
 		let built = (0..img.fd_objs.len()).map(|_| None).collect();
 		let mut objs = FdRebuild {
@@ -1085,6 +1115,7 @@ impl Shell {
 				frame.err_reported = f.err_reported;
 				frame.ignore_errexit = f.ignore_errexit;
 				frame.fork_line = f.fork_line;
+				frame.traced = f.traced;
 				frame.getopts =
 					(f.getopts != super::proc::GetoptsState::default()).then(|| Box::new(f.getopts));
 				if matches!(frame.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }) {
@@ -1102,6 +1133,18 @@ impl Shell {
 		self.procs = procs;
 		self.rr = (img.rr as usize).min(self.procs.len() - 1);
 		self.slice = img.slice;
+		// The take-in of the vprocs restored: a builtin parked on its ask is
+		// answered as it would have been without the snapshot.
+		let restored = |v: &Vpid| self.procs.iter().any(|p| p.vpid == *v);
+		let ti = img.take_in;
+		let asked = ti.asked.into_iter().filter(|v| restored(v)).collect();
+		let taken = ti.taken.into_iter().filter(|v| restored(v)).collect();
+		let asks = ti.asks.into_iter().filter(|t| restored(&t.asker)).collect();
+		let fresh = ti.fresh.into_iter().filter(|v| restored(v)).collect();
+		self.k.exits_asked = asked;
+		self.k.exits_taken = taken;
+		self.taking_in = asks;
+		self.fresh = fresh;
 		Ok(())
 	}
 

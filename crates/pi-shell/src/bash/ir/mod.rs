@@ -97,7 +97,7 @@ use crate::bash::{
 
 /// IR version; part of the frames header. Raised with every change to a
 /// serialized IR type.
-pub const IR_VERSION: u32 = 19;
+pub const IR_VERSION: u32 = 20;
 
 /// Opcodes.
 #[derive(
@@ -306,6 +306,13 @@ pub struct Unit {
 	/// which the run decides.
 	#[serde(default)]
 	pub tails:               Vec<u32>,
+	/// bash: the pcs, sorted, where a command of a list starts that follows
+	/// a `;` or a newline (bash's `;` connection, `execute_connection`): an
+	/// interactive shell with job control reports and cleans up there
+	/// (`notify_and_cleanup`, `execute_cmd.c:2883-2884`;
+	/// `vm::killed::connected`).
+	#[serde(default)]
+	pub semis:               Vec<u32>,
 }
 
 impl Unit {
@@ -346,6 +353,7 @@ impl Unit {
 			conds: Vec::new(),
 			funcs: Vec::new(),
 			tails: Vec::new(),
+			semis: Vec::new(),
 		}
 	}
 

@@ -244,6 +244,7 @@ pub fn bin_fg(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString], func: JobFunc)
 		ctx.usage("no job control in this shell.");
 		return done(1);
 	}
+	super::jobs::take_in_exits(ctx)?;
 	scanjobs(ctx, jobbing)?;
 	setcurjob(ctx.vp);
 	if func == JobFunc::Jobs {
@@ -371,15 +372,18 @@ pub fn bin_fg(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString], func: JobFunc)
 				if f == JobFunc::Fg {
 					let wait = Wait {
 						children: vec![vpid],
+						operands: false,
+						after:    None,
 						all:      false,
 						any:      false,
 						into:     None,
 						force:    false,
+						resume:   None,
 					};
 					return Ok(Outcome { status: 0, control: Control::Wait(wait) });
 				}
 				if func == JobFunc::Disown {
-					delete(ctx.vp, job);
+					disown(ctx, job);
 				}
 			},
 			JobFunc::Jobs => print_listed(ctx, job, lng)?,
@@ -392,11 +396,26 @@ pub fn bin_fg(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString], func: JobFunc)
 						.map_or(0, |j| jobctl::group(ctx.k, j.vpid).unwrap_or_else(|| j.pid()));
 					ctx.usage(format!("warning: job is suspended, use `kill -CONT -{pid}' to resume"));
 				}
-				delete(ctx.vp, job);
+				disown(ctx, job);
 			},
 		}
 	}
 	done(retval)
+}
+
+/// zsh `disown` of job `number`: deleted, and no child of this shell any
+/// more (`wait` does not wait for it; [`crate::bash::vm::Kernel::disown`]).
+fn disown(ctx: &mut Ctx<'_, '_>, number: u32) {
+	if let Some(vpid) = ctx
+		.vp
+		.jobs
+		.get(number)
+		.filter(|j| !j.inherited)
+		.map(|j| j.vpid)
+	{
+		ctx.k.disown(ctx.cx.store, vpid);
+	}
+	delete(ctx.vp, number);
 }
 
 /// The values of zsh/parameter's `jobstates`, `jobtexts` or `jobdirs`

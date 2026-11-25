@@ -388,6 +388,21 @@ pub fn source_argzero(vp: &Vproc) -> Option<&BString> {
 	})?
 }
 
+/// bash's `get_name_for_error` in a non-interactive shell: `BASH_SOURCE[0]`,
+/// the file of the innermost `.` level or function call (the file the
+/// function was defined in), when it is not empty; else the caller names
+/// the diagnostic after `$0`.
+pub fn error_source(vp: &Vproc) -> Option<&BString> {
+	vp.calls
+		.iter()
+		.rev()
+		.find_map(|c| match &c.kind {
+			CallKind::Function { file, .. } | CallKind::Source { file, .. } => Some(file),
+			CallKind::Args(_) => None,
+		})
+		.filter(|file| !file.is_empty())
+}
+
 /// The calls a subshell of `vp` starts with: all of them, none tied to its
 /// own frames.
 pub fn inherited(vp: &Vproc) -> Vec<Call> {

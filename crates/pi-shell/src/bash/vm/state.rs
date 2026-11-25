@@ -1829,18 +1829,33 @@ pub fn record<'a>(
 }
 
 /// Whether `record` (the `key` trap as `vp`'s overlay or the root holds
-/// it) is a caught-signal trap `vp` inherited instead of setting it: a
-/// subshell lists it (bash 5.3, [`listed_traps`]) but does not run it.
-/// Called by [`record`] and [`scan`]; the `trap` builtin drops them when a
-/// subshell changes a trap.
+/// it) is a trap `vp` inherited instead of setting it, and does not run: a
+/// caught-signal trap, which a subshell lists (bash 5.3,
+/// [`listed_traps`]); and the ERR, DEBUG or RETURN trap of a fork made
+/// without `errtrace` or `functrace`
+/// (`reset_or_restore_signal_handlers`, `trap.c:1467-1473`;
+/// [`super::proc::Traced`]). Called by [`record`] and [`scan`]; the `trap`
+/// builtin drops them when a subshell changes a trap.
 pub fn inherited_trap(
 	vp: &Vproc,
 	key: crate::bash::store::TrapKey,
 	record: Option<&Record>,
 ) -> bool {
-	matches!(key, crate::bash::store::TrapKey::Signal(_))
+	use crate::bash::store::TrapKey;
+	if vp.own_traps.has(key) || record.is_none() {
+		return false;
+	}
+	if matches!(key, TrapKey::Err | TrapKey::Debug | TrapKey::Return)
+		&& !vp
+			.frames
+			.first()
+			.map_or(super::proc::Traced::ROOT, |f| f.traced)
+			.keeps(key)
+	{
+		return true;
+	}
+	matches!(key, TrapKey::Signal(_))
 		&& vp.parent.is_some()
-		&& !vp.own_traps.has(key)
 		&& matches!(record, Some(Record::Trap { action, .. }) if !action.is_empty())
 }
 
@@ -3132,9 +3147,10 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	root.synced.job_marks = (jobs.current, jobs.previous, jobs.chld);
 }
 
-/// Keep the status `status` that `vp`'s `wait` collected for child `vpid`,
-/// shown as `pid` ([`JobTable::bgp`], bash `bgp_add`); the root's is written
-/// to the store at once ([`Key::BgPid`], `STATUS:PID:SEQ`), one record each.
+/// Keep the status `status` of `vp`'s background job `vpid` that left the
+/// table, shown as `pid` ([`JobTable::bgp`], bash `bgp_add`); the root's is
+/// written to the store at once ([`Key::BgPid`], `STATUS:PID:SEQ`), one
+/// record each.
 pub fn save_status(
 	root: &mut Root,
 	store: &mut dyn StateStore,
@@ -3285,7 +3301,7 @@ pub fn load_root(
 		}
 	})?;
 	bgp.sort_by_key(|s| s.seq);
-	let bgp = (!bgp.is_empty()).then(|| Box::new(bgp.into_iter().collect()));
+	let bgp = (!bgp.is_empty()).then(|| std::sync::Arc::new(bgp.into_iter().collect()));
 	vp.jobs = JobTable {
 		list,
 		current: misc(store, MiscKey::JobCurrent)?.and_then(|s| parse(&s)),
@@ -3295,6 +3311,7 @@ pub fn load_root(
 			.unwrap_or(0),
 		subshell: false,
 		comsub: super::proc::Comsub::No,
+		copied: super::proc::Copied::No,
 		bgp,
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);
@@ -4122,5 +4139,36 @@ mod tests {
 		assert_eq!(misc(&store, MiscKey::ChldOwed), None);
 		assert_eq!(misc(&store, MiscKey::Getopts), None);
 		assert_eq!(misc(&store, MiscKey::Rlimits), None);
+	}
+
+	// Failure mode: the root's kept statuses ([`JobTable::bgp`]) were not in
+	// the store, so a shell loaded from it lost them (`wait PID`: not a
+	// child), or kept them out of their order, so the wrong one went first.
+	#[test]
+	fn kept_statuses_load_back_in_their_order_and_go_from_the_store() {
+		let (mut store, mut root, mut vp) = shell();
+		save_status(&mut root, &mut store, &mut vp, Vpid(9), 4242, 5);
+		save_status(&mut root, &mut store, &mut vp, Vpid(7), 4243, 3);
+		// Kept again: the latest.
+		save_status(&mut root, &mut store, &mut vp, Vpid(9), 4242, 6);
+		let mut fresh =
+			Vproc::new(Vpid(1), None, FdTable::default(), BString::from("/"), None, false);
+		let mut root2 = Root::load(&mut store).unwrap();
+		load_root(&mut root2, &mut store, &mut fresh).unwrap();
+		assert_eq!(fresh.jobs.bgp, vp.jobs.bgp);
+		let order: Vec<Vpid> = fresh
+			.jobs
+			.bgp
+			.iter()
+			.flat_map(|l| l.iter())
+			.map(|s| s.vpid)
+			.collect();
+		assert_eq!(order, [Vpid(7), Vpid(9)]);
+		assert_eq!(fresh.vpid_of(4242), Vpid(9), "its pid names it");
+		forget_status(&mut root, &mut store, &mut vp, Vpid(7));
+		assert_eq!(store.record(Key::BgPid(Vpid(7))), None);
+		clear_statuses(&mut root, &mut store, &mut vp);
+		assert_eq!(store.record(Key::BgPid(Vpid(9))), None);
+		assert_eq!(vp.jobs.bgp, None);
 	}
 }

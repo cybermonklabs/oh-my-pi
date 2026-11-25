@@ -371,7 +371,7 @@ fn launch(
 	k.spawned.push(Box::new(child));
 	let s = st(vp);
 	s.wait_for = vec![vpid];
-	s.waiting = Some(Awaited::Jobs { force: true });
+	s.waiting = Some(Awaited::Jobs { force: true, operands: false, after: None });
 	s.stage = Stage::Await;
 	Some(Flow::Block(WaitKey::Proc(vpid)))
 }
