@@ -267,6 +267,8 @@ export interface HindsightConversationTracking {
 	readonly lastRetainedPrefixKey: string;
 	readonly mentalModelsSnippet: string | undefined;
 	readonly mentalModelsLoadedAt: number | undefined;
+	/** The entries the full-session transcript cache covers; undefined when it covers none. */
+	readonly retainedEntries: RetainedEntries | undefined;
 }
 
 /**
@@ -275,7 +277,7 @@ export interface HindsightConversationTracking {
  * same objects and none of their user or assistant messages was rewritten in
  * place: every in-place rewrite bumps its message's estimate version.
  */
-interface RetainedEntries {
+export interface RetainedEntries {
 	first: SessionEntry;
 	last: SessionEntry;
 	lastIndex: number;
@@ -403,6 +405,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 			lastRetainedPrefixKey: this.#lastRetainedPrefixKey,
 			mentalModelsSnippet: this.mentalModelsSnippet,
 			mentalModelsLoadedAt: this.mentalModelsLoadedAt,
+			retainedEntries: this.#retainedEntries,
 		};
 	}
 
@@ -422,6 +425,7 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		this.#lastRetainedPrefixKey = tracking.lastRetainedPrefixKey;
 		this.mentalModelsSnippet = tracking.mentalModelsSnippet;
 		this.mentalModelsLoadedAt = tracking.mentalModelsLoadedAt;
+		this.#retainedEntries = tracking.retainedEntries;
 	}
 
 	/**

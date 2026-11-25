@@ -3190,7 +3190,7 @@ export class SessionManager {
 			// #onSessionClaimLost): nothing failed, unless the session was sealed
 			// (see #noteDiskFailure).
 			if (err instanceof SessionLeaseLostError) {
-				this.#followParentMove();
+				this.#noteDiskFailure(err);
 				return undefined;
 			}
 			// The same error the store's drain reports again, for a conflict a recovery took over.
