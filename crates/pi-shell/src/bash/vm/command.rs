@@ -4592,6 +4592,11 @@ fn settle_builtin(
 			e.stage = Stage::Output;
 			None
 		},
+		Control::Discard => {
+			e.control = Some(Transfer::Discard(outcome.status));
+			e.stage = Stage::Output;
+			None
+		},
 		Control::Exit => {
 			e.control = Some(Transfer::Exit(outcome.status));
 			e.stage = Stage::Output;
@@ -5486,6 +5491,7 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 			}
 		},
 		Some(Transfer::Exec) => Flow::Exit(status),
+		Some(Transfer::Discard(n)) => Flow::Discard(n),
 	}
 }
 

@@ -20,6 +20,16 @@ fn run(src: &str) -> (String, String) {
 	)
 }
 
+/// [`run`] with the shell's exit status.
+fn run_status(src: &str) -> (String, String, i32) {
+	let out = run_script(FakeHost::new(), src.as_bytes(), &[], Fault::None);
+	(
+		String::from_utf8_lossy(&out.stdout).into_owned(),
+		String::from_utf8_lossy(&out.stderr).into_owned(),
+		out.status,
+	)
+}
+
 #[test]
 fn background_children_keep_each_loop_value() {
 	let (out, err) = run("for h in alpha beta; do ( echo \"bg:$h\" ) & done; wait");
@@ -462,6 +472,323 @@ fn readonly_and_export_take_array_flags_only_with_a_value() {
 		("export -a y=5; echo st=$?; declare -p y", "st=0\ndeclare -ax y=([0]=\"5\")\n"),
 	] {
 		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// A compound `name=(…)` argument of `declare`, `typeset`, `local`,
+/// `export` or `readonly` is declared and assigned while bash expands the
+/// words (`expand_declaration_argument`), before the builtin runs. When
+/// that fails (a readonly variable, an array that cannot convert), the rest
+/// of the command line is abandoned (`DISCARD`): the script goes on with
+/// its next line, `$?` 1; a subshell or `$(…)` ends (also from an `eval` in
+/// it, with its EXIT trap), an `eval` ends its command. The arguments
+/// before it that are not compound were never assigned. Only `declare`,
+/// `typeset` or `local` in a function skip a failed declaration
+/// (`W_FORCELOCAL`) and report the name again; `export -a` and `readonly
+/// -a` there do not. The declaration gets no `+r`, so `declare +r x=(2)`
+/// fails its value. A failed declaration does not end a `set -e` shell; a
+/// failed value does (bash's `report_error`), with status 1. Goldens from
+/// bash 5.3.20; bash 5.2.21 gives the same output but for `set -e` with
+/// `-a`, where it exits.
+#[test]
+fn a_failed_compound_declaration_abandons_the_line() {
+	const NEXT: &str = "echo \"next st=$? x=${x[*]}\"";
+	for (src, want) in [
+		(format!("readonly x=1\ndeclare -a x=(2); echo \"same st=$?\"\n{NEXT}"), "next st=1 x=1\n"),
+		(format!("readonly x=1\ntypeset x+=(3); echo \"same st=$?\"\n{NEXT}"), "next st=1 x=1\n"),
+		(format!("readonly x=1\nexport x=(2); echo \"same st=$?\"\n{NEXT}"), "next st=1 x=1\n"),
+		(
+			format!("readonly x=1\nreadonly -A x=([k]=2); echo \"same st=$?\"\n{NEXT}"),
+			"next st=1 x=1\n",
+		),
+		(
+			format!("set -e\nreadonly x=1\ndeclare -a x=(2); echo \"same st=$?\"\n{NEXT}"),
+			"next st=1 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\n( declare -a x=(2); echo \"in-sub st=$?\" ); echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"same st=1\nnext st=0 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\ny=$(declare -a x=(2); echo in); echo \"same st=$? y=[$y]\"\n{NEXT}"
+			),
+			"same st=1 y=[]\nnext st=0 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\neval 'declare -a x=(2); echo \"in-eval st=$?\"'; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"same st=1\nnext st=0 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\nf() {{ export x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"next st=1 x=1\n",
+		),
+		(
+			format!(
+				"f() {{ local -r x=1; local x=(2); echo \"in-f st=$? x=${{x[*]}}\"; }}\nf; echo \
+				 \"same st=$?\"\n{NEXT}"
+			),
+			"next st=1 x=\n",
+		),
+		(
+			format!(
+				"readonly x=1\nfor i in 1 2; do declare -a x=(2); echo \"in-loop $i\"; done; echo \
+				 \"same st=$?\"\n{NEXT}"
+			),
+			"next st=1 x=1\n",
+		),
+		(
+			"readonly x=1\ndeclare a=1 x=(2) b=2; echo \"same st=$?\"\necho \"next a=${a-unset} \
+			 b=${b-unset}\""
+				.to_owned(),
+			"next a=unset b=unset\n",
+		),
+		(
+			"readonly x=1\ndeclare -a y=(1) x=(2) z=(3); echo \"same st=$?\"\necho \"next \
+			 y=${y[*]-unset} z=${z[*]-unset}\""
+				.to_owned(),
+			"next y=1 z=unset\n",
+		),
+		(
+			format!("declare -a x=(1)\ndeclare -A x=([k]=2); echo \"same st=$?\"\n{NEXT}"),
+			"next st=1 x=1\n",
+		),
+		(
+			format!(
+				"f() {{ local -r x=1; declare +r x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"next st=1 x=\n",
+		),
+		(
+			format!(
+				"readonly x=1\nf() {{ declare -g +r x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"next st=1 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\nf() {{ export -a x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"next st=1 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\nf() {{ readonly -a x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"next st=1 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\n( eval 'declare -a x=(2); echo a'; echo b ); echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"same st=1\nnext st=0 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\ny=$(eval 'declare x=(2); echo a'; echo b); echo \"same st=$? \
+				 y=[$y]\"\n{NEXT}"
+			),
+			"same st=1 y=[]\nnext st=0 x=1\n",
+		),
+		(
+			format!(
+				"readonly x=1\n( trap 'echo \"sub-exit $?\"' EXIT; eval 'declare x=(2); echo a'; echo \
+				 b ); echo \"same st=$?\"\n{NEXT}"
+			),
+			"sub-exit 1\nsame st=1\nnext st=0 x=1\n",
+		),
+		(
+			format!(
+				"declare -a x=(1)\n( eval 'declare -A x=([k]=2); echo a'; echo b ); echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"same st=1\nnext st=0 x=1\n",
+		),
+	] {
+		let (out, err) = run(&src);
+		assert_eq!(out, want, "{src}");
+		assert!(
+			err.contains("x: readonly variable") || err.contains("x: cannot convert"),
+			"{src}: {err}"
+		);
+	}
+	// A function's `declare` (also with `-g`) skips the failed declaration
+	// and reports the name twice; the function goes on.
+	for (src, diag) in [
+		(
+			format!(
+				"readonly x=1\nf() {{ declare -a x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"x: readonly variable",
+		),
+		(
+			format!(
+				"readonly x=1\nf() {{ declare -ga x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"x: readonly variable",
+		),
+		(
+			format!(
+				"declare -a x=(1)\nf() {{ declare -gA x=([k]=2); echo \"in-f st=$?\"; }}\nf; echo \
+				 \"same st=$?\"\n{NEXT}"
+			),
+			"x: cannot convert indexed to associative array",
+		),
+		(
+			format!(
+				"readonly x=1\nf() {{ declare +r x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+				 st=$?\"\n{NEXT}"
+			),
+			"x: readonly variable",
+		),
+	] {
+		let (out, err) = run(&src);
+		assert_eq!(out, "in-f st=1\nsame st=0\nnext st=0 x=1\n", "{src}");
+		assert_eq!(err.matches(diag).count(), 2, "{src}: {err}");
+	}
+	// A failed value (not a failed declaration) is reported once, as bash's
+	// `report_error` reports it, which under `set -e` ends the shell with
+	// status 1.
+	for src in [
+		format!("set -e\nreadonly x=1\ndeclare x=(2); echo \"same st=$?\"\n{NEXT}"),
+		format!("set -e\nreadonly x=1\ntypeset x+=(3); echo \"same st=$?\"\n{NEXT}"),
+		format!("set -e\nreadonly x=1\nreadonly x=(2); echo \"same st=$?\"\n{NEXT}"),
+		format!("set -e\nreadonly x=1\ndeclare +r x=(2); echo \"same st=$?\"\n{NEXT}"),
+		format!("set -e\nreadonly x=1\ntypeset +r x=(2); echo \"same st=$?\"\n{NEXT}"),
+		format!(
+			"set -e\nf() {{ local -r x=1; local +r x=(2); echo \"in-f st=$?\"; }}\nf; echo \"same \
+			 st=$?\"\n{NEXT}"
+		),
+	] {
+		let (out, err, status) = run_status(&src);
+		assert_eq!((out.as_str(), status), ("", 1), "{src}");
+		assert_eq!(err.matches("x: readonly variable").count(), 1, "{src}: {err}");
+	}
+	// A conversion failure is a failed declaration, which `declare` reports
+	// (`builtin_error`), not a failed value: it does not end a `set -e`
+	// shell.
+	let (out, err, status) = run_status(&format!(
+		"set -e\ndeclare -a x=(1)\ndeclare -A x=([k]=2); echo \"same st=$?\"\n{NEXT}"
+	));
+	assert_eq!((out.as_str(), status), ("next st=1 x=1\n", 0));
+	assert_eq!(err.matches("x: cannot convert").count(), 1, "{err}");
+	// The same rule when the readonly variable has no value, and through a
+	// name reference.
+	for src in [
+		format!("readonly x\ndeclare x=(1); echo \"same st=$?\"\n{NEXT}"),
+		format!("readonly x\ndeclare -n r=x\ndeclare r=(1); echo \"same st=$?\"\n{NEXT}"),
+	] {
+		let (out, err, status) = run_status(&src);
+		assert_eq!((out.as_str(), status), ("next st=1 x=\n", 0), "{src}");
+		assert_eq!(err.matches(": readonly variable").count(), 1, "{src}: {err}");
+	}
+}
+
+/// In posix mode an assignment error of `readonly` or `export` (special
+/// builtins) ends a non-interactive shell with status 1; `declare`'s does
+/// not. Goldens from bash 5.3.20 and 5.2.21.
+#[test]
+fn posix_readonly_and_export_assignment_errors_end_the_shell() {
+	for src in [
+		"set -o posix\nreadonly x=1\nreadonly x=2; echo \"same st=$?\"\necho next",
+		"set -o posix\nreadonly x=1\nexport x=2; echo \"same st=$?\"\necho next",
+		"set -o posix\nreadonly x=1\nreadonly -a x=2; echo \"same st=$?\"\necho next",
+	] {
+		let (out, err, status) = run_status(src);
+		assert_eq!((out.as_str(), status), ("", 1), "{src}");
+		assert!(err.contains("x: readonly variable"), "{src}: {err}");
+	}
+	let (out, _, status) =
+		run_status("set -o posix\nreadonly x=1\ndeclare x=2; echo \"same st=$?\"\necho next");
+	assert_eq!((out.as_str(), status), ("same st=1\nnext\n", 0));
+}
+
+/// Under `set -e` a failed compound value does not end the shell inside an
+/// `eval` or `.` whose status is ignored (an `if` or `while` condition, a
+/// `!` pipeline, before `&&` or `||`, also through a function called
+/// there): bash turns `exit_immediately_on_error` off for them
+/// (`builtin_ignoring_errexit`), and the `eval` or `.` only ends that
+/// command. A function called there, or a plain `eval`, still ends the
+/// shell, and a subshell still ends (its `DISCARD` goes on to the
+/// subshell's top level). Goldens from bash 5.3.20 and 5.2.21.
+#[test]
+fn set_e_spares_a_failed_value_in_an_eval_whose_status_is_ignored() {
+	let fs = MemFs::new();
+	fs.add_file("/w/f", b"declare x=(2)\necho in-src\n", 0o644);
+	for (src, want, want_status) in [
+		(
+			"set -e\nreadonly x=1\nif eval 'declare x=(2)'; then echo t; else echo f; fi\necho \
+			 \"next st=$?\"",
+			"f\nnext st=0\n",
+			0,
+		),
+		(
+			"set -e\nreadonly x=1\neval 'declare x=(2)' || echo or\necho \"next st=$?\"",
+			"or\nnext st=0\n",
+			0,
+		),
+		("set -e\nreadonly x=1\n! eval 'declare x=(2)'\necho \"next st=$?\"", "next st=0\n", 0),
+		(
+			"set -e\nreadonly x=1\nwhile eval 'declare x=(2)'; do :; done\necho \"next st=$?\"",
+			"next st=0\n",
+			0,
+		),
+		(
+			"set -e\nreadonly x=1\nif . /w/f; then echo t; else echo f; fi\necho \"next st=$?\"",
+			"in-src\nt\nnext st=0\n",
+			0,
+		),
+		(
+			"set -e\nreadonly x=1\nf() { eval 'export x=(2)'; echo \"in-f st=$?\"; }\nf || echo \
+			 or\necho \"next st=$?\"",
+			"in-f st=1\nnext st=0\n",
+			0,
+		),
+		(
+			"set -e\nreadonly x=1\nif ( eval 'declare x=(2)'; echo in-sub ); then echo t; else echo \
+			 f; fi\necho \"next st=$?\"",
+			"f\nnext st=0\n",
+			0,
+		),
+		(
+			"set -e\nreadonly x=1\ng() { export x=(2); echo in-g; }\nif eval 'g; echo after-g'; then \
+			 echo t; else echo f; fi\necho \"next st=$?\"",
+			"f\nnext st=0\n",
+			0,
+		),
+		(
+			"set -e\nreadonly x=1\nf() { export x=(2); echo in-f; }\nif f; then echo t; else echo f; \
+			 fi\necho \"next st=$?\"",
+			"",
+			1,
+		),
+		("set -e\nreadonly x=1\neval 'declare x=(2)\necho in-eval'\necho \"next st=$?\"", "", 1),
+		("set -e\nreadonly x=1\n. /w/f\necho \"next st=$?\"", "", 1),
+	] {
+		let out = run_script(FakeHost::new().with_fs(fs.clone()), src.as_bytes(), &[], Fault::None);
+		let err = String::from_utf8_lossy(&out.stderr);
+		assert_eq!(
+			(String::from_utf8_lossy(&out.stdout).as_ref(), out.status),
+			(want, want_status),
+			"{src}"
+		);
+		assert_eq!(err.matches("x: readonly variable").count(), 1, "{src}: {err}");
 	}
 }
 
