@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Counting a tool call whose arguments nest more than 40,000 levels deep (a resumed session can hold one) no longer fails with `Maximum call stack size exceeded`, which failed the first prompt after the resume, each turn's end, compaction and every context-usage reading
 - Steering and follow-ups drained for the next turn now return to their queue when the run is aborted before that turn starts, including while `/pause` holds it, instead of being recorded with no reply ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - A run aborted before its next turn starts, with nothing left to answer once its drained steering or follow-ups go back to their queue, now ends without an empty aborted turn, as it already did when the abort came at the turn boundary
 - `AgentPauseGate.dispatchHold` re-parks when the gate closes again while the caller's own hold waits, carries a synchronous `isClosed` probe the transport reads in the same step as the send, and cancels through the whole composed wait with the caller's abort reason ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
