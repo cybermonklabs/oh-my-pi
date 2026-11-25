@@ -106,6 +106,10 @@ type Row<'a> = (&'a str, &'a str, &'a str, i32);
 /// and status under `-c`, then from the script file.
 type ModeRow<'a> = (&'a str, &'a str, (&'a str, i32), (&'a str, i32));
 
+/// A [`ModeRow`] built at run time: its name, script and wanted outputs
+/// owned.
+type OwnedModeRow = (String, String, (String, i32), (String, i32));
+
 /// Every row whose output or status differs, in either mode, is listed.
 fn assert_rows(rows: &[Row<'_>]) {
 	let rows: Vec<ModeRow<'_>> = rows
@@ -1437,6 +1441,236 @@ fn a_discarded_command_that_ends_a_subshell_runs_its_exit_trap() {
 			0,
 		),
 	]);
+}
+
+/// The EXIT trap after a jump sees the functions bash leaves running, by
+/// `FUNCNAME`, a local and `$#`. Each `eval`, `.`, trap action, command or
+/// process substitution or `-c` string the jump leaves pops the functions
+/// called inside it (its `pe_dispose`); the `.` command itself stays, with
+/// its `source`. After `top_level_cleanup` (an arithmetic subscript error,
+/// an integer variable's bad value, `break` with a bad count, a script's
+/// own command) or `run_unwind_protects` (a function past `FUNCNEST`) none
+/// runs, not even one the shell a subshell forked from was running. `exit`
+/// keeps them all. bash's script mode adds `main`.
+#[test]
+fn the_exit_trap_sees_the_functions_a_jump_leaves() {
+	const T1: &str = "trap 'echo \"T ${FUNCNAME[*]-none} l=${l-unset} n=$#\"' EXIT; ";
+	const T2: &str = "trap 'echo \"T ${FUNCNAME[*]-none} l=${l-unset} n=$#\" >&2' EXIT; ";
+	const DIV: &str = "SH: 1/0: division by 0 (error token is \"0\")\n";
+	const RO: &str = "SH: r: readonly variable\n";
+	const SUB: &str = "; echo \"x=[$x] s=$?\"";
+	const NONE: &str = "T none l=unset n=0\n";
+	let rows = [
+		(
+			"an integer variable's bad value",
+			format!(
+				"( {T1}f() {{ local l=1; local -i n; n=1/0; echo in; }}; f x y; echo after ); echo \
+				 w=$?"
+			),
+			format!("{DIV}{NONE}w=1\n"),
+			0,
+		),
+		(
+			"an integer variable's bad value, a command substitution",
+			format!("x=$( {T2}f() {{ local l=1; local -i n; n=1/0; }}; f x y ){SUB}"),
+			format!("{DIV}{NONE}x=[] s=1\n"),
+			0,
+		),
+		(
+			"an integer variable's bad value, a function's subshell",
+			format!("f() {{ local l=0; ( {T1}local -i n; n=1/0; echo in ); echo w=$?; }}; f x y"),
+			format!("{DIV}{NONE}w=1\n"),
+			0,
+		),
+		(
+			"an integer variable's bad value in posix mode",
+			"set -o posix; declare -i n; n=1/0; echo after; echo s=$?".to_owned(),
+			DIV.to_owned(),
+			1,
+		),
+		(
+			"an arithmetic subscript error, a function's subshell",
+			format!("f() {{ local l=0; ( {T1}a[1/0]=v ); echo w=$?; }}; f x y"),
+			format!("{DIV}{NONE}w=1\n"),
+			0,
+		),
+		(
+			"an arithmetic subscript error, a function's command substitution",
+			format!("f() {{ local l=0; x=$( {T2}a[1/0]=v ){SUB}; }}; f x y"),
+			format!("{DIV}{NONE}x=[] s=1\n"),
+			0,
+		),
+		(
+			"break, a subshell",
+			format!("( {T1}f() {{ local l=1; for i in 1; do break x; done; }}; f x y ); echo w=$?"),
+			format!("SH: break: x: numeric argument required\n{NONE}w=2\n"),
+			0,
+		),
+		(
+			"FUNCNEST, a subshell",
+			format!("( {T1}FUNCNEST=3; f() {{ local l=1; f; }}; f x y; echo after ); echo w=$?"),
+			format!("SH: f: maximum function nesting level exceeded (3)\n{NONE}w=1\n"),
+			0,
+		),
+		(
+			"FUNCNEST, a function's subshell",
+			format!(
+				"f() {{ local l=0; ( {T1}FUNCNEST=5; g() {{ local l=1; g; }}; g p ); echo w=$?; }}; f \
+				 x y"
+			),
+			format!("SH: g: maximum function nesting level exceeded (5)\n{NONE}w=1\n"),
+			0,
+		),
+	];
+	let rows: Vec<_> = rows
+		.iter()
+		.map(|(n, s, w, st)| (*n, s.as_str(), w.as_str(), *st))
+		.collect();
+	assert_rows(&rows);
+	// Rows whose `FUNCNAME` bash's script mode ends with `main`, or that it
+	// runs differently: (name, script, -c output and status, script's).
+	let in_sub = |body: &str| {
+		format!(
+			"readonly r=1; shopt -s failglob; f() {{ local l=0; x=$( {T2}g() {{ local l=1; {body}; \
+			 }}; g p ){SUB}; }}; f x y"
+		)
+	};
+	let by_mode = [
+		("a readonly variable in a command substitution", in_sub("r=2"), RO.to_owned()),
+		(
+			"failglob in a command substitution",
+			in_sub(": /nonexistent*"),
+			"SH: no match: /nonexistent*\n".to_owned(),
+		),
+		("arithmetic in a command substitution", in_sub(": $((1/0))"), DIV.to_owned()),
+		("an eval in a command substitution", in_sub("eval 'r=2'"), RO.to_owned()),
+		(
+			"an expansion error in a command substitution",
+			in_sub("echo ${x:?u}"),
+			"SH: x: u\n".to_owned(),
+		),
+	];
+	let mut mode_rows: Vec<OwnedModeRow> = by_mode
+		.into_iter()
+		.map(|(n, s, msg)| {
+			(
+				n.to_owned(),
+				s,
+				(format!("{msg}T f l=0 n=2\nx=[] s=1\n"), 0),
+				(format!("{msg}T f main l=0 n=2\nx=[] s=1\n"), 0),
+			)
+		})
+		.collect();
+	let both =
+		|c: &str, s: &str, tail: &str, st: i32| (format!("{c}{tail}"), st, format!("{s}{tail}"), st);
+	for (name, script, (c, cs, s, ss)) in [
+		(
+			"a process substitution",
+			format!(
+				"readonly r=1; f() {{ local l=0; cat <( {T1}g() {{ local l=1; r=2; }}; g p ); echo \
+				 done; }}; f x y"
+			),
+			both(&format!("{RO}T f l=0 n=2\n"), &format!("{RO}T f main l=0 n=2\n"), "done\n", 0),
+		),
+		(
+			"an eval in a subshell",
+			format!(
+				"readonly r=1; ( {T1}f() {{ local l=1; eval 'g() {{ local l=2; r=2; }}; g p'; }}; f x \
+				 y; echo after ); echo w=$?"
+			),
+			both(&format!("{RO}T f l=1 n=2\n"), &format!("{RO}T f main l=1 n=2\n"), "w=1\n", 0),
+		),
+		(
+			"a . file in a subshell",
+			format!(
+				"readonly r=1; printf 'g() {{ local l=2; r=2; }}; g p\\n' > d.sh; ( {T1}f() {{ local \
+				 l=1; . ./d.sh; }}; f x y; echo after ); echo w=$?"
+			),
+			both(
+				&format!("{RO}T source f l=1 n=2\n"),
+				&format!("{RO}T source f main l=1 n=2\n"),
+				"w=1\n",
+				0,
+			),
+		),
+		(
+			"a trap action in a subshell",
+			format!(
+				"readonly r=1; ( {T1}trap 'g p' USR1; f() {{ local l=1; kill -USR1 $BASHPID; echo in; \
+				 }}; g() {{ local l=3; r=2; }}; f x y; echo after ); echo w=$?"
+			),
+			both(&format!("{RO}T f l=1 n=2\n"), &format!("{RO}T f main l=1 n=2\n"), "w=1\n", 0),
+		),
+		(
+			"a readonly variable in a subshell",
+			format!("readonly r=1; ( {T1}f() {{ local l=1; r=2; }}; f x y; echo after ); echo w=$?"),
+			both(&format!("{RO}T f l=1 n=2\n"), &format!("{RO}{NONE}"), "w=1\n", 0),
+		),
+		(
+			"a readonly variable, a function's subshell",
+			format!("readonly r=1; f() {{ local l=0; ( {T1}r=2 ); echo w=$?; }}; f x y"),
+			both(&format!("{RO}T f l=0 n=2\n"), &format!("{RO}{NONE}"), "w=1\n", 0),
+		),
+		(
+			"an expansion error",
+			format!("{T1}f() {{ local l=1; echo ${{x:?u}}; }}; f x y"),
+			(format!("SH: x: u\n{NONE}"), 127, format!("SH: x: u\n{NONE}"), 1),
+		),
+		(
+			"an expansion error in an eval",
+			format!("{T1}f() {{ local l=1; eval 'echo ${{x:?u}}'; }}; f x y"),
+			(format!("SH: x: u\n{NONE}"), 127, "SH: x: u\nT f main l=1 n=2\n".to_owned(), 1),
+		),
+		(
+			"exit",
+			format!("( {T1}f() {{ local l=1; exit 3; }}; f x y ); echo w=$?"),
+			both("T f l=1 n=2\n", "T f main l=1 n=2\n", "w=3\n", 0),
+		),
+	] {
+		mode_rows.push((name.to_owned(), script, (c, cs), (s, ss)));
+	}
+	let mode_rows: Vec<_> = mode_rows
+		.iter()
+		.map(|(n, s, (c, cs), (w, ws))| {
+			(n.as_str(), s.as_str(), (c.as_str(), *cs), (w.as_str(), *ws))
+		})
+		.collect();
+	assert_rows_by_mode(&mode_rows);
+}
+
+/// An associative array's compound value with an empty key reports it and
+/// assigns none of the words after it (bash's `break`); `declare` shows the
+/// word quoted. bash 5.3 also discards the rest of a `declare` line, so the
+/// array is read on the next one.
+#[test]
+fn an_empty_key_stops_a_compound_value() {
+	assert_rows(&[
+		(
+			"declare",
+			"declare -A A=([k]=v []=x [j]=w)\ndeclare -p A",
+			"SH: ['']='x': bad array subscript\ndeclare -A A=([k]=\"v\" )\n",
+			0,
+		),
+		(
+			"an assignment",
+			"declare -A A; A=([k]=v []=x [j]=w)\ndeclare -p A",
+			"SH: []=x: bad array subscript\ndeclare -A A=([k]=\"v\" )\n",
+			0,
+		),
+	]);
+}
+
+/// In posix mode an integer variable's bad value discards the command and
+/// the script's next line runs: bash's `make_variable_value` jumps before
+/// the assignment can fail and exit (variables.c:2944). Only the script
+/// mode is asserted: under `-c` bash ends the whole string after its
+/// `top_level_cleanup`, which pi-shell does not yet do (the whole-line
+/// discard of #256).
+#[test]
+fn an_integer_value_error_in_posix_mode_discards_the_line() {
+	let got = run("set -o posix; declare -i n; n=1/0\necho after", Mode::Script);
+	let want = "SH: 1/0: division by 0 (error token is \"0\")\nafter\n";
+	assert_eq!(got, (want.to_owned(), Some(0)), "script mode");
 }
 
 /// `break` or `continue` with a count that is not a number runs bash's

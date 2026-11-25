@@ -471,20 +471,12 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 					report_jump(k, vp, cx, 0, Jump::Other);
 					// A subshell's top level exits (bash's
 					// `execute_in_subshell`, `command_substitute`) and runs
-					// its EXIT trap. After `top_level_cleanup` (an arithmetic
-					// subscript error; a script's own command) its
-					// `run_unwind_protects` has popped the functions the
-					// subshell called and `variable_context` is 0 (sig.c:401):
-					// the trap runs outside every function ([`Jump::Cleanup`]).
-					// Otherwise it runs in the function the jump left.
+					// its EXIT trap, in the function context the jump left
+					// ([`leave_functions`]): after `top_level_cleanup` (an
+					// arithmetic subscript error, an integer variable's bad
+					// value, a script's own command) none ([`Jump::Cleanup`]).
 					if subshell {
-						let jump = if cleanup {
-							let base = vp.frames.len().min(1);
-							unwind(&mut k.root, cx.store, vp, base);
-							Jump::Cleanup
-						} else {
-							Jump::Other
-						};
+						let jump = if cleanup { Jump::Cleanup } else { Jump::Other };
 						exit_shell(k, vp, cx, status, jump);
 					} else {
 						unwind(&mut k.root, cx.store, vp, 0);
@@ -693,6 +685,9 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32, jump
 	});
 	vp.status = status;
 	let outside_functions = !in_exit_trap && contexts_reset(k, cx, vp, jump);
+	if !in_exit_trap {
+		leave_functions(k, cx, vp, jump);
+	}
 	if vp.parent.is_none()
 		&& let Some(run) = vp.runs.front()
 	{
@@ -773,19 +768,11 @@ fn contexts_reset(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, jump: Jump) -> bo
 		Jump::Other => false,
 	};
 	let root = !vp.runs.is_empty();
-	let command = root
-		&& matches!(
-			state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
-			Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
-		);
-	let level = |i: usize, f: &Frame| match f.kind {
-		FrameKind::Script { what: ScriptKind::Run, .. } => command && i == 0,
-		FrameKind::Script { .. } => true,
-		_ => f.parse_level == ParseLevel::Substitution,
-	};
+	let command = runs_command_string(cx, vp);
+	let level = |i: usize, f: &Frame| is_parse_level(command, i, f);
 	let function = |f: &Frame| matches!(f.kind, FrameKind::Function { .. });
 	if !errexit {
-		let Some(outer) = (0..vp.frames.len()).find(|&i| level(i, &vp.frames[i])) else {
+		let Some(outer) = outer_parse_level(cx, vp) else {
 			return false;
 		};
 		let inherited = vp
@@ -811,6 +798,71 @@ fn contexts_reset(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, jump: Jump) -> bo
 		context = false;
 	}
 	!context
+}
+
+/// Whether `vp` is the root running a `-c` string, whose text bash runs
+/// with `parse_and_execute`.
+fn runs_command_string(cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	!vp.runs.is_empty()
+		&& matches!(
+			state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
+			Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
+		)
+}
+
+/// Whether frame `i`, `f`, is one of bash's `parse_and_execute` levels: an
+/// `eval`, `.` or trap action, a command or process substitution's text,
+/// the root's `-c` string (`command`, [`runs_command_string`]).
+fn is_parse_level(command: bool, i: usize, f: &Frame) -> bool {
+	match f.kind {
+		FrameKind::Script { what: ScriptKind::Run, .. } => command && i == 0,
+		FrameKind::Script { .. } => true,
+		_ => f.parse_level == ParseLevel::Substitution,
+	}
+}
+
+/// The outermost `parse_and_execute` level among `vp`'s frames
+/// ([`is_parse_level`]).
+fn outer_parse_level(cx: &mut Cx<'_>, vp: &Vproc) -> Option<usize> {
+	let command = runs_command_string(cx, vp);
+	(0..vp.frames.len()).find(|&i| is_parse_level(command, i, &vp.frames[i]))
+}
+
+/// The function context bash's jump leaves before the EXIT trap, as
+/// frames: each `parse_and_execute` level the jump passes runs its
+/// `pe_dispose` unwind frame, which pops the functions called inside it
+/// (evalstring.c:398, :425), so for [`Jump::Other`] the frames above the
+/// outermost level go. The level's own frame stays: the `eval` or `.`
+/// command around the text keeps its redirections, and `.` its `source`
+/// on `FUNCNAME`, until the shell exits. `top_level_cleanup` runs every
+/// unwind-protect (sig.c:396), so after [`Jump::Cleanup`] every function
+/// goes, also those the shell a subshell forked from was running, with
+/// their locals. The other jumps keep them (`exit`, no jump; `set -e`,
+/// [`contexts_reset`]).
+fn leave_functions(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, jump: Jump) {
+	if vp.mode.dialect() == Dialect::Zsh {
+		return;
+	}
+	match jump {
+		Jump::Other => {
+			if let Some(outer) = outer_parse_level(cx, vp) {
+				unwind(&mut k.root, cx.store, vp, outer + 1);
+			}
+		},
+		Jump::Cleanup => {
+			unwind(&mut k.root, cx.store, vp, vp.frames.len().min(1));
+			vp.calls.retain(|c| {
+				c.depth > 0
+					|| !matches!(
+						c.kind,
+						super::callstack::CallKind::Function { .. }
+							| super::callstack::CallKind::Source { .. }
+					)
+			});
+			while state::drop_scope(&mut k.root, cx.store, vp) {}
+		},
+		Jump::Exit | Jump::Direct | Jump::Errexit => {},
+	}
 }
 
 /// Whether a function runs for bash's jumps (`variable_context`): its
