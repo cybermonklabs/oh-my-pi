@@ -19,9 +19,6 @@ use std::{io, time::Duration};
 
 use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
 
-/// The pause between keys.
-const KEY: Duration = Duration::from_millis(60);
-
 /// The history file every case starts with (oldest first). Its `ls` line
 /// lists only `/`, which every machine has.
 const HIST: &str = "echo café crème\necho one\necho two\nls -d /\necho three\nprint -r -- Two \
@@ -52,10 +49,10 @@ fn spawn(real: bool, rc: &str) -> Spawn {
 		.size(24, 80)
 }
 
-/// Type `text` key by key and wait until the line editor has handled it.
+/// Type `text`, a line at a time, and wait until the line editor has
+/// handled it ([`Pty::type_lines`]).
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
-	pty.type_keys(text, KEY)?;
-	pty.zle_sync(TIMEOUT)
+	pty.type_lines(text, TIMEOUT)
 }
 
 /// The final screens of `drive` against both shells after sourcing the rc
@@ -68,7 +65,7 @@ fn screens(
 		// Do not send input until the line editor, rather than the kernel's
 		// canonical/echoing line discipline, owns the terminal.
 		pty.wait_raw(TIMEOUT)?;
-		pty.type_keys(". ~/.zshrc\r", KEY)?;
+		pty.write(". ~/.zshrc\r")?;
 		pty.read_until("RCDONE", TIMEOUT)?;
 		pty.zle_sync(TIMEOUT)?;
 		// A clean screen for the case itself.
@@ -87,7 +84,14 @@ fn screens(
 /// Assert both screens (with the cursor position) are the same; zsh's
 /// screen when the screens were compared.
 fn same(rc: &str, typed: &str) -> Option<String> {
-	let (ours, real) = match screens(rc, |pty| keys(pty, typed)) {
+	same_steps(rc, &[typed])
+}
+
+/// [`same`] with the keys typed in steps, each once the line editor has
+/// handled the one before: a key that runs a command (not `\r`) ends a
+/// step, so the keys after it come once the command has run.
+fn same_steps(rc: &str, steps: &[&str]) -> Option<String> {
+	let (ours, real) = match screens(rc, |pty| steps.iter().try_for_each(|s| keys(pty, s))) {
 		Ok(s) => s,
 		Err(e) => panic!("pty session failed: {e}"),
 	};
@@ -307,8 +311,9 @@ fn history_beginning_search_multibyte_cursor() {
 
 #[test]
 fn incremental_search_accept_and_hold() {
-	// ESC-a is accept-and-hold: the match runs and comes back.
-	same_log(SHOW, "\x12thr\x1ba\x18p");
+	// ESC-a is accept-and-hold: the match runs and comes back. The keys
+	// after it go once the match has run ([`same_steps`]).
+	same_steps(SHOW, &["\x12thr\x1ba", "\x18p\x18q"]);
 }
 
 #[test]
@@ -483,4 +488,23 @@ fn the_mail_notice_comes_before_the_prompt() {
 		ours.contains("You have new mail.") && !after_a_prompt(&ours),
 		"obash:\n{ours}\n--- zsh:\n{real}"
 	);
+}
+
+/// The keys reach the line editor however long the rc file takes: with an
+/// rc file that sleeps 2 s first, `^R` still starts an incremental search,
+/// whose status line each shell shows. The harness waits for the rc file's
+/// end (`RCDONE`) and for the line editor ([`Pty::zle_sync`]). One that
+/// typed once the output had gone quiet typed into the terminal's line
+/// discipline while the rc file ran, in both shells alike, so the two
+/// screens matched with no search on either.
+#[test]
+fn a_slow_rc_file_still_gets_the_keys_to_the_line_editor() {
+	let (ours, real) = match screens("sleep 2\n", |pty| keys(pty, "\x12ech")) {
+		Ok(s) => s,
+		Err(e) => panic!("pty session failed: {e}"),
+	};
+	assert!(ours.contains("bck-i-search: ech"), "obash screen:\n{ours}");
+	if let Some(real) = real {
+		assert!(real.contains("bck-i-search: ech"), "zsh screen:\n{real}");
+	}
 }

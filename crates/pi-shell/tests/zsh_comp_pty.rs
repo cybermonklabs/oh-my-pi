@@ -33,8 +33,6 @@ use std::{fmt::Write as _, fs, io, path::PathBuf, time::Duration};
 use comp_support::{bless, compsys_fpath, fpath_words, oracle, sgr_transcript, shell};
 use pty_support::{Pty, ZLE_SYNC_SCRIPT};
 
-/// The pause between keys.
-const KEY: Duration = Duration::from_millis(60);
 /// Bound of the startup and the rc file (obash's `compinit`).
 const STARTUP: Duration = Duration::from_secs(60);
 /// Bound of one step (completion functions print nothing while they work).
@@ -85,16 +83,16 @@ fn snapshot_path(name: &str) -> PathBuf {
 	root.join(format!("{name}.txt"))
 }
 
-/// Type `keys` and wait until the line editor has handled them and drawn
-/// everything it draws before it waits for the next key. One answer of the
-/// [`Pty::zle_sync`] handler comes after the work the keys started; the
-/// second comes after what the editor drew once that handler returned,
-/// which in zsh is nothing unless the handler invalidated the display. A
-/// redraw there (obash once redrew after every handler) is then on every
-/// screen read, not only on the ones it reached first.
+/// Type `keys`, a line at a time ([`Pty::type_lines`]), and wait until the
+/// line editor has handled them and drawn everything it draws before it
+/// waits for the next key. One answer of the [`Pty::zle_sync`] handler
+/// comes after the work the keys started; the second comes after what the
+/// editor drew once that handler returned, which in zsh is nothing unless
+/// the handler invalidated the display. A redraw there (obash once redrew
+/// after every handler) is then on every screen read, not only on the ones
+/// it reached first.
 fn step(pty: &mut Pty, keys: &str) -> io::Result<()> {
-	pty.type_keys(keys, KEY)?;
-	pty.zle_sync(STEP)?;
+	pty.type_lines(keys, STEP)?;
 	pty.zle_sync(STEP)
 }
 
@@ -115,7 +113,7 @@ fn record(fpath: &str, setup: Setup, rc: &str, steps: &[&str], what: Record) -> 
 		.size(24, 80)
 		.spawn()?;
 	pty.wait_raw(STARTUP)?;
-	pty.type_keys(". ~/.zshrc\r", Duration::from_millis(20))?;
+	pty.write(". ~/.zshrc\r")?;
 	pty.read_until("READY", STARTUP)?;
 	pty.zle_sync(STARTUP)?;
 	// A clean screen for the case itself.
