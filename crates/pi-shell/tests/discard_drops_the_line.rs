@@ -7,18 +7,29 @@
 //! `jump_to_top_level (DISCARD)`: a `-c` string ends with status 1, a script
 //! goes on with its next line, a subshell exits, and a command or process
 //! substitution exits 1. Other expansion errors (`x=$((1/0))`, a readonly
-//! variable) drop only the innermost `eval` or `.` string, as before.
+//! variable) drop only the innermost `eval` or `.` string, as before. So
+//! does a declaration's compound word that bash cannot declare or assign
+//! (`declare -A A=([]=x)`, `declare a[0]=(1)`, a readonly variable): bash
+//! drops the command while it still expands the words, a plain
+//! `exp_jump_to_top_level (DISCARD)`.
 //!
 //! Each row runs twice, as `-c` text and from a script file. Every row was
 //! measured against bash 5.3.20 and 5.2.21 both ways; the test follows
-//! 5.3.20. They differ in three ways. After a `no_args` discard, a script's
+//! 5.3.20. They differ in these ways. After a `no_args` discard, a script's
 //! next line and a subshell's exit see 2 in 5.3.20 and 1 in 5.2.21. In a
 //! script, the EXIT trap of a subshell such a discard ends sees `FUNCNAME`
 //! empty in 5.3.20 and `main` in 5.2.21. A function past `FUNCNEST` in
 //! 5.2.21 neither pops the functions nor leaves its `eval`. bash 5.2.21
-//! names the error of a function in a `-c` string `environment: line 1:`,
-//! and bash names an error in a `.` file by the file where pi-shell names
-//! the shell; the rows print every error as `SH: …`.
+//! goes on after an associative array's empty key or a bad element in a
+//! compound value, and assigns the elements after the bad one; it drops
+//! the command after a readonly variable's `-a` in a function too, names a
+//! message made while it expands a declaration's words by no command,
+//! keeps an EXIT trap's saved status in a subshell under `-c` too, and
+//! crashes where a function's `time` meets a list for an element in a
+//! script. bash 5.2.21 names the error of a function in a `-c` string
+//! `environment: line 1:`, and bash names an error in a `.` file by the
+//! file where pi-shell names the shell; the rows print every error as
+//! `SH: …`.
 
 #![cfg(unix)]
 
@@ -659,6 +670,523 @@ fn a_cleanup_discard_lands_at_the_run_s_top() {
 			format!("eval 'shift 1 2'\nreadonly r=1; ( {FN}f() {{ eval 'r=2'; }}; f ); echo w=$?"),
 			(SHIFT.into(), 1),
 			(format!("{SHIFT}{RO}T[f main]\nw=1\n"), 0),
+		),
+	];
+	assert_rows(&rows);
+}
+
+/// A row whose script prints the same and exits with `status` in both
+/// modes.
+fn both(name: &str, script: &str, out: &str, status: i32) -> Row {
+	(name.into(), script.into(), (out.into(), status), (out.into(), status))
+}
+
+/// bash 5.3 drops a command while it still expands a declaration's compound
+/// word (`name=(…)` given to `declare`, `typeset`, `local`, `export` or
+/// `readonly`), before the builtin runs (`expand_declaration_argument`):
+/// when the word's assignment fails (`do_word_assignment`, then
+/// `bash_variable_assignment_error`, subst.c:13046). That is a plain
+/// `exp_jump_to_top_level (DISCARD)`: the innermost `eval` or `.` catches
+/// it, a function's line and a script's or `-c` string's line are dropped,
+/// a subshell exits 1, in posix mode too.
+#[test]
+fn a_compound_word_bash_cannot_assign_drops_the_command() {
+	let mut rows = Vec::new();
+	let key = "SH: ['']='x': bad array subscript\n";
+	rows.extend(stays("an empty key", "declare -A A=([k]=v []=x [j]=w)", key));
+	rows.extend(stays("typeset", "typeset -A A=([]=x)", key));
+	rows.extend(stays(
+		"a list for an element",
+		"declare a[0]=(1)",
+		"SH: a[0]: cannot assign list to array member\n",
+	));
+	rows.extend(stays(
+		"a bad element",
+		"declare -a a=(1 [-9]=x 3)",
+		"SH: [-9]=x: bad array subscript\n",
+	));
+	rows.extend(stays(
+		"a non-numeric index",
+		"declare -a a=([@]=x)",
+		"SH: [@]=x: cannot assign to non-numeric index\n",
+	));
+	rows.extend(stays(
+		"an element without a key",
+		"declare -A A=([k]=v x)",
+		"SH: A: 'x': must use subscript when assigning associative array\n",
+	));
+	rows.push(same(
+		"posix mode",
+		"set -o posix; declare -A A=([]=x); echo s=$?\necho next s=$?",
+		&format!("{key}next s=1\n"),
+	));
+	rows.push(same(
+		"the array a list for an element leaves",
+		"declare a[0]=(1); echo s=$?\necho next s=$?; declare -p a",
+		"SH: a[0]: cannot assign list to array member\nnext s=1\ndeclare -a a\n",
+	));
+	rows.push(same(
+		"a key-value list goes on past an empty key",
+		"declare -A A=(k v '' x j w); echo s=$?\necho next s=$?; declare -p A",
+		"SH: '': bad array subscript\ns=0\nnext s=0\ndeclare -A A=([k]=\"v\" [j]=\"w\" )\n",
+	));
+	// `set -e` exits first, at bash's `report_error`.
+	rows.push(same(
+		"set -e",
+		"( set -e; declare -A A=([]=x); echo in ); echo w=$?",
+		&format!("{key}w=1\n"),
+	));
+	assert_rows(&rows);
+}
+
+/// A compound word whose `make_internal_declare` fails (a readonly variable
+/// given `-a` or `-A`, an array of the other kind) drops the command too
+/// (subst.c:13037), except for `declare`, `typeset` and `local` inside a
+/// function (`W_FORCELOCAL`, `execute_cmd.c:4338`): those go on and fail again
+/// under their own name. A readonly variable without `-a` or `-A` fails the
+/// assignment, which drops the command in a function as well.
+#[test]
+fn a_compound_word_bash_cannot_declare_drops_the_command_outside_a_function() {
+	const RO: &str = "SH: r: readonly variable\n";
+	const CONV: &str = "i: cannot convert indexed to associative array\n";
+	let after = "; echo in s=$?; }; f; echo after s=$?";
+	let rows: Vec<Row> = vec![
+		same(
+			"readonly, -a",
+			"readonly r=1; declare -a r=(1); echo in s=$?\necho next s=$?",
+			&format!("{RO}next s=1\n"),
+		),
+		same(
+			"readonly",
+			"readonly r=1; declare r=(1); echo in s=$?\necho next s=$?",
+			&format!("{RO}next s=1\n"),
+		),
+		same(
+			"readonly, the readonly builtin",
+			"readonly r=1; readonly r=(1); echo in s=$?\necho next s=$?",
+			&format!("{RO}next s=1\n"),
+		),
+		same(
+			"a readonly associative array",
+			"declare -A A=([k]=v); readonly A; declare -A A=([j]=w); echo s=$?\necho next s=$?",
+			"SH: A: readonly variable\nnext s=1\n",
+		),
+		same(
+			"an indexed array made associative",
+			"declare -a i=(1); declare -A i=([k]=v); echo in s=$?\necho next s=$?; declare -p i",
+			&format!("SH: {CONV}next s=1\ndeclare -a i=([0]=\"1\")\n"),
+		),
+		same(
+			"local, a readonly global",
+			&format!("readonly r=1; f() {{ local -a r=(1){after}"),
+			"SH: f: r: readonly variable\nSH: local: r: readonly variable\nin s=1\nafter s=0\n",
+		),
+		same(
+			"declare, a readonly local",
+			&format!("f() {{ local -r r=1; declare -a r=(1){after}"),
+			&format!("{RO}SH: declare: r: readonly variable\nin s=1\nafter s=0\n"),
+		),
+		same(
+			"declare -g, a readonly global",
+			&format!("readonly r=1; f() {{ declare -g -a r=(1){after}"),
+			"SH: f: r: readonly variable\nSH: declare: r: readonly variable\nin s=1\nafter s=0\n",
+		),
+		both(
+			"declare without -a in a function",
+			&format!("f() {{ local -r r=1; declare r=(1){after}"),
+			RO,
+			1,
+		),
+		both(
+			"local without -a in a function",
+			&format!("f() {{ local -r r=1; local r=(1){after}"),
+			RO,
+			1,
+		),
+		both(
+			"the readonly builtin in a function",
+			&format!("readonly r=1; f() {{ readonly -a r=(1){after}"),
+			&format!("SH: f: {}", &RO[4..]),
+			1,
+		),
+		both("export in a function", &format!("readonly r=1; f() {{ export r=(1){after}"), RO, 1),
+		same(
+			"declare -g, an array of the other kind",
+			&format!("declare -a i=(1); f() {{ declare -gA i=([k]=v){after}"),
+			&format!("SH: f: {CONV}SH: declare: {CONV}in s=1\nafter s=0\n"),
+		),
+		both(
+			"readonly, an array of the other kind",
+			&format!("declare -a i=(1); f() {{ readonly -A i=([k]=v){after}"),
+			&format!("SH: f: {CONV}"),
+			1,
+		),
+		same(
+			"set -e",
+			"( set -e; readonly r=1; declare -a r=(1); echo in ); echo w=$?",
+			&format!("{RO}w=1\n"),
+		),
+	];
+	assert_rows(&rows);
+}
+
+/// bash names a message made while it expands a declaration's words by its
+/// `this_command_name` (the command's own name is not set yet): the
+/// function call, `eval` or `.` around it until a simple command inside it
+/// ends, then none (an assignment alone, a `for` item and `select` starting
+/// clear it too); `((` and `[[` set it. A subshell keeps its parent's.
+#[test]
+fn a_declaration_s_expansion_message_names_this_command_name() {
+	const AGAIN: &str = "SH: declare: r: readonly variable\nin s=1\nafter s=0\n";
+	let row = |name: &str, before: &str, by: &str| {
+		same(
+			name,
+			&format!(
+				"readonly r=1; f() {{ {before}declare -a r=(1); echo in s=$?; }}; f; echo after s=$?"
+			),
+			&format!("SH: {by}r: readonly variable\n{AGAIN}"),
+		)
+	};
+	let rows: Vec<Row> = vec![
+		row("the function", "", "f: "),
+		row("after a simple command", "[[ 1 ]]; local x=1; ", ""),
+		row("after an assignment", "x=1; ", ""),
+		row("after a function call", "h() { (( 1 )); }; h; ", ""),
+		row("after ((", "(( 1 )); ", "((: "),
+		row("after [[", "[[ 1 ]]; ", "[[: "),
+		row("after an arithmetic for", "for ((i=0; i<1; i++)); do :; done; ", "((: "),
+		row("after a for loop of ((", "for x in 1; do (( 1 )); done; ", "((: "),
+		row("after a for loop of no item", "for x in; do :; done; ", "f: "),
+		row("after select", "select x in; do :; done; ", ""),
+		same(
+			"in a for item",
+			"readonly r=1; f() { for x in 1; do declare -a r=(1); done; echo in s=$?; }; f; echo \
+			 after s=$?",
+			&format!("SH: r: readonly variable\n{AGAIN}"),
+		),
+		same(
+			"the innermost function",
+			"readonly r=1; g() { declare -a r=(1); echo in s=$?; }; f() { g; }; f; echo after s=$?",
+			&format!("SH: g: r: readonly variable\n{AGAIN}"),
+		),
+		same(
+			"a subshell",
+			"readonly r=1; f() { ( declare -a r=(1); echo in ); echo w=$?; }; f; echo after s=$?",
+			"SH: f: r: readonly variable\nSH: declare: r: readonly variable\nin\nw=0\nafter s=0\n",
+		),
+		same(
+			"eval in a function",
+			"readonly r=1; f() { :; eval 'declare -a r=(1)'; echo f s=$?; }; f; echo after s=$?",
+			"SH: eval: r: readonly variable\nSH: declare: r: readonly variable\nf s=1\nafter s=0\n",
+		),
+		same(
+			"eval",
+			"readonly r=1; eval 'declare -a r=(1); echo in'; echo after s=$?",
+			"SH: eval: r: readonly variable\nafter s=1\n",
+		),
+		same(
+			".",
+			"readonly r=1; printf 'declare -a r=(1); echo in\\necho src2\\n' > g; . ./g; echo after \
+			 s=$?",
+			"SH: .: r: readonly variable\nsrc2\nafter s=0\n",
+		),
+	];
+	assert_rows(&rows);
+}
+
+/// bash assigns a declaration's compound words while it expands the words,
+/// before the builtin runs, so they come before its other arguments: one
+/// that fails leaves those unassigned, and the values see the variables as
+/// they were.
+#[test]
+fn a_declaration_assigns_its_compound_words_first() {
+	let rows: Vec<Row> = vec![
+		same(
+			"a plain argument before",
+			"declare x=1 A=([]=v); echo s=$?\necho x=${x-unset} s=$?",
+			"SH: []=v: bad array subscript\nx=unset s=1\n",
+		),
+		same(
+			"a list for an element",
+			"declare x=1 a[0]=(1); echo s=$?\necho x=${x-unset}",
+			"SH: a[0]: cannot assign list to array member\nx=unset\n",
+		),
+		same(
+			"a compound word before",
+			"declare -A B=([a]=1) x=2 A=([]=v); echo s=$?\ndeclare -p B; echo x=${x-unset}",
+			"SH: ['']='v': bad array subscript\ndeclare -A B=([a]=\"1\" )\nx=unset\n",
+		),
+		both(
+			"a compound word after",
+			"declare -A A=([]=x) B=([k]=v); echo s=$?\ndeclare -p B",
+			"SH: ['']='x': bad array subscript\nSH: declare: B: not found\n",
+			1,
+		),
+		same(
+			"a readonly variable",
+			"readonly r=1; declare x=1 r=(1); echo s=$?\necho x=${x-unset}",
+			"SH: r: readonly variable\nx=unset\n",
+		),
+		same(
+			"an integer's value",
+			"declare -i n=5 a=(n); declare -p a",
+			"declare -ai a=([0]=\"0\")\n",
+		),
+		both("a bad name", "declare 1x=2 A=([]=v); echo s=$?", "SH: []=v: bad array subscript\n", 1),
+	];
+	assert_rows(&rows);
+}
+
+/// A compound assignment stops at its first bad element (bash 5.3's
+/// `assign_compound_array_list`: `any_failed++; break`): the elements before
+/// it are assigned, those after it are not, for a declaration and a plain
+/// assignment alike.
+#[test]
+fn a_compound_assignment_stops_at_its_first_bad_element() {
+	let rows: Vec<Row> = vec![
+		same(
+			"declare, a bad index",
+			"declare -a a=(1 [-9]=x 3); echo s=$?\necho next s=$?; declare -p a",
+			"SH: [-9]=x: bad array subscript\nnext s=1\ndeclare -a a=([0]=\"1\")\n",
+		),
+		same(
+			"an assignment, a bad index",
+			"a=(1 [-9]=x 3); echo s=$?\necho next s=$?; declare -p a",
+			"SH: [-9]=x: bad array subscript\nnext s=1\ndeclare -a a=([0]=\"1\")\n",
+		),
+		same(
+			"declare, a non-numeric index",
+			"declare -a a=(1 [@]=x 3); echo s=$?\necho next s=$?; declare -p a",
+			"SH: [@]=x: cannot assign to non-numeric index\nnext s=1\ndeclare -a a=([0]=\"1\")\n",
+		),
+		same(
+			"an assignment, a non-numeric index",
+			"a=(1 [@]=x 3); echo s=$?\necho next s=$?; declare -p a",
+			"SH: [@]=x: cannot assign to non-numeric index\nnext s=1\ndeclare -a a=([0]=\"1\")\n",
+		),
+		same(
+			"declare, an element without a key",
+			"declare -A A=([k]=v x [j]=w); echo s=$?\necho next s=$?; declare -p A",
+			"SH: A: 'x': must use subscript when assigning associative array\nnext s=1\ndeclare -A \
+			 A=([k]=\"v\" )\n",
+		),
+		same(
+			"an assignment, an element without a key",
+			"declare -A A; A=([k]=v x [j]=w); echo s=$?\necho next s=$?; declare -p A",
+			"SH: A: x: must use subscript when assigning associative array\nnext s=1\ndeclare -A \
+			 A=([k]=\"v\" )\n",
+		),
+		same(
+			"declare, an empty key",
+			"declare -A A=([k]=v []=x [j]=w); echo s=$?\necho next s=$?; declare -p A",
+			"SH: ['']='x': bad array subscript\nnext s=1\ndeclare -A A=([k]=\"v\" )\n",
+		),
+	];
+	assert_rows(&rows);
+}
+
+/// The plain discard's kind: at a script's own level bash runs
+/// `top_level_cleanup` first (a subshell's EXIT trap runs outside every
+/// function; the redirections the jump leaves are undone, so `time`
+/// reports on the shell's stderr), under `-c` and inside `eval` it does not.
+#[test]
+fn a_compound_word_s_discard_cleans_up_only_at_a_script_s_level() {
+	const TRAP: &str = "( trap 'echo \"T ${FUNCNAME[*]-none} l=${l-unset}\"' EXIT; ";
+	const KEY: &str = "SH: ['']='x': bad array subscript\n";
+	const LIST: &str = "SH: a[0]: cannot assign list to array member\n";
+	let by_mode = |name: &str, script: String, c: String, s: String| -> Row {
+		(name.into(), script, (c, 0), (s, 0))
+	};
+	let rows: Vec<Row> = vec![
+		by_mode(
+			"an empty key in a subshell's function",
+			format!(
+				"{TRAP}f() {{ local l=1; declare -A A=([]=x); echo in; }}; f; echo after ); echo w=$?"
+			),
+			format!("{KEY}T f l=1\nw=1\n"),
+			format!("{KEY}T none l=unset\nw=1\n"),
+		),
+		by_mode(
+			"a list for an element in a subshell's function",
+			format!("{TRAP}f() {{ local l=1; local a[0]=(1); echo in; }}; f; echo after ); echo w=$?"),
+			format!("{LIST}T f l=1\nw=1\n"),
+			format!("{LIST}T none l=unset\nw=1\n"),
+		),
+		by_mode(
+			"readonly in a subshell's function",
+			format!(
+				"readonly r=1; {TRAP}f() {{ local l=1; readonly -a r=(1); echo in; }}; f; echo after \
+				 ); echo w=$?"
+			),
+			"SH: r: readonly variable\nT f l=1\nw=1\n".into(),
+			"SH: r: readonly variable\nT none l=unset\nw=1\n".into(),
+		),
+		by_mode(
+			"time in a subshell",
+			"TIMEFORMAT='[R]'; ( time { declare -A A=([]=x); } 2>e1; echo after ); echo w=$?; echo \
+			 e1:; cat e1"
+				.into(),
+			format!("w=1\ne1:\n{KEY}[R]\n"),
+			format!("[R]\nw=1\ne1:\n{KEY}"),
+		),
+		same(
+			"time in eval",
+			"TIMEFORMAT='[R]'; eval 'time { declare a[0]=(1); } 2>e1; echo in'; echo after; echo \
+			 e1:; cat e1",
+			&format!("after\ne1:\n{LIST}[R]\n"),
+		),
+		by_mode(
+			"time in a function",
+			"TIMEFORMAT='[R]'; f() { time { declare a[0]=(1); } 2>e1; echo in; }; f; echo \
+			 after\necho next; echo e1:; cat e1"
+				.into(),
+			format!("next\ne1:\n{LIST}[R]\n"),
+			format!("[R]\nnext\ne1:\n{LIST}"),
+		),
+	];
+	assert_rows(&rows);
+}
+
+/// A discard inside a running EXIT trap ends the trap action, and the shell
+/// exits with the status the trap saved (bash's `run_exit_trap`:
+/// `trap_saved_exit_value`), after `top_level_cleanup` too (too many
+/// arguments, `FUNCNEST`, a subscript error). A subshell forked inside a
+/// `-c` string is the exception: `top_level_cleanup` restores the string's
+/// jump target, and the subshell exits with status 1.
+#[test]
+fn a_discard_in_an_exit_trap_keeps_the_trap_s_status() {
+	const NEST: &str = "SH: g: maximum function nesting level exceeded (2)\n";
+	const SHIFT: &str = "SH: shift: too many arguments\n";
+	const KEY: &str = "SH: ['']='x': bad array subscript\n";
+	let nest = "FUNCNEST=2; g() { g; }; g; echo in-trap";
+	let by_mode = |name: &str, script: String, c: String, s: String| -> Row {
+		(name.into(), script, (c, 0), (s, 0))
+	};
+	let rows: Vec<Row> = vec![
+		by_mode(
+			"FUNCNEST in a subshell's trap",
+			format!("( trap '{nest}' EXIT; echo body ); echo w=$?"),
+			format!("body\n{NEST}w=1\n"),
+			format!("body\n{NEST}w=0\n"),
+		),
+		by_mode(
+			"FUNCNEST in a function in a subshell's trap",
+			"( trap 'FUNCNEST=2; g() { g; }; f() { g; }; f; echo in-trap' EXIT; echo body ); echo \
+			 w=$?"
+				.into(),
+			format!("body\n{NEST}w=1\n"),
+			format!("body\n{NEST}w=0\n"),
+		),
+		by_mode(
+			"FUNCNEST, a saved status",
+			format!("( trap '{nest}' EXIT; (exit 3) ); echo w=$?"),
+			format!("{NEST}w=1\n"),
+			format!("{NEST}w=3\n"),
+		),
+		by_mode(
+			"FUNCNEST, exit 3",
+			format!("( trap '{nest}' EXIT; echo body; exit 3 ); echo w=$?"),
+			format!("body\n{NEST}w=1\n"),
+			format!("body\n{NEST}w=3\n"),
+		),
+		by_mode(
+			"FUNCNEST in a command substitution's trap",
+			format!("x=$( trap '{nest}' EXIT; echo body ); echo \"x=$x s=$?\""),
+			format!("{NEST}x=body s=1\n"),
+			format!("{NEST}x=body s=0\n"),
+		),
+		by_mode(
+			"FUNCNEST in a subshell forked in a function",
+			format!("f() {{ ( trap '{nest}' EXIT; echo body ); echo w=$?; }}; f"),
+			format!("body\n{NEST}w=1\n"),
+			format!("body\n{NEST}w=0\n"),
+		),
+		by_mode(
+			"FUNCNEST in eval in a subshell's trap",
+			format!("( trap 'eval \"{nest}\"' EXIT; echo body ); echo w=$?"),
+			format!("body\n{NEST}w=1\n"),
+			format!("body\n{NEST}w=0\n"),
+		),
+		by_mode(
+			"too many arguments in a subshell's trap",
+			"( trap 'shift 1 2; echo in-trap' EXIT; echo body ); echo w=$?".into(),
+			format!("body\n{SHIFT}w=1\n"),
+			format!("body\n{SHIFT}w=0\n"),
+		),
+		by_mode(
+			"too many arguments, a saved status",
+			"( trap 'shift 1 2; echo in-trap' EXIT; exit 4 ); echo w=$?".into(),
+			format!("{SHIFT}w=1\n"),
+			format!("{SHIFT}w=4\n"),
+		),
+		same(
+			"too many arguments, a saved failure",
+			"( trap 'shift 1 2; echo in-trap' EXIT; false ); echo w=$?",
+			&format!("{SHIFT}w=1\n"),
+		),
+		by_mode(
+			"too many arguments in eval in a subshell's trap",
+			"( trap 'eval \"shift 1 2\"; echo in-trap' EXIT; echo body ); echo w=$?".into(),
+			format!("body\n{SHIFT}w=1\n"),
+			format!("body\n{SHIFT}w=0\n"),
+		),
+		by_mode(
+			"a subscript error in a subshell's trap",
+			"( trap 'a[1/0]=v; echo in-trap' EXIT; echo body ); echo w=$?".into(),
+			format!("body\n{DIV}w=1\n"),
+			format!("body\n{DIV}w=0\n"),
+		),
+		by_mode(
+			"a command substitution's trap",
+			"x=$( trap 'shift 1 2; echo in-trap >&2' EXIT; echo body ); echo \"x=$x w=$?\"".into(),
+			format!("{SHIFT}x=body w=1\n"),
+			format!("{SHIFT}x=body w=0\n"),
+		),
+		same(
+			"FUNCNEST in the shell's trap",
+			&format!("trap '{nest}' EXIT; echo body"),
+			&format!("body\n{NEST}"),
+		),
+		same(
+			"too many arguments in the shell's trap",
+			"trap 'shift 1 2; echo in-trap' EXIT; echo body",
+			&format!("body\n{SHIFT}"),
+		),
+		both(
+			"too many arguments in the shell's trap, a saved status",
+			"trap 'shift 1 2; echo in-trap' EXIT; (exit 5)",
+			SHIFT,
+			5,
+		),
+		both("FUNCNEST in the shell's trap, exit 3", &format!("trap '{nest}' EXIT; exit 3"), NEST, 3),
+		both(
+			"too many arguments in the shell's trap, exit 3",
+			"trap 'shift 1 2; echo in-trap' EXIT; exit 3",
+			SHIFT,
+			3,
+		),
+		same(
+			"a compound word in a subshell's trap",
+			"( trap 'declare -A A=([]=x); echo in-trap' EXIT; echo body ); echo w=$?",
+			&format!("body\n{KEY}w=0\n"),
+		),
+		same(
+			"a compound word, a saved status",
+			"( trap 'declare -A A=([]=x); echo in-trap' EXIT; exit 6 ); echo w=$?",
+			&format!("{KEY}w=6\n"),
+		),
+		// Another trap's action is no catch: the jump passes it.
+		(
+			"too many arguments in a signal trap".into(),
+			"trap 'shift 1 2; echo in-trap' USR1; kill -USR1 $$; echo after s=$?".into(),
+			(SHIFT.into(), 1),
+			(SHIFT.into(), 2),
+		),
+		(
+			"too many arguments in the ERR trap".into(),
+			"trap 'shift 1 2; echo in-trap' ERR; false; echo after s=$?".into(),
+			(SHIFT.into(), 1),
+			(SHIFT.into(), 2),
 		),
 	];
 	assert_rows(&rows);

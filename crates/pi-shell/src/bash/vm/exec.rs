@@ -15,9 +15,9 @@ use super::{
 	expand::{self, Expander, Stop},
 	is_ident, probe,
 	proc::{
-		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
-		LoopKind, LoopRec, ParseLevel, ParseSnapshot, PendingSub, PendingWrite, Prefix, Probe,
-		ProbeResult, Run, Saved, Scratch, ScriptKind, Slot, Target, TryEnd, Vproc,
+		AssignValue, Atom, Bang, BangStage, CommandName, Coproc, Depths, Frame, FrameKind,
+		InlineStage, LastBg, LoopKind, LoopRec, ParseLevel, ParseSnapshot, PendingSub, PendingWrite,
+		Prefix, Probe, ProbeResult, Run, Saved, Scratch, ScriptKind, Slot, Target, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -3130,6 +3130,8 @@ fn plain_arith(
 	if op.b != Op::LITERAL || super::xtrace::on(k, cx, vp) {
 		return None;
 	}
+	// bash's `this_command_name` ([`Vproc::command_name`]).
+	vp.command_name = Some(CommandName::Arith);
 	let text = &unit.ariths[op.a as usize];
 	Some(match expand::arith_command(k, cx, vp, text) {
 		Ok(v) => {
@@ -3287,8 +3289,22 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			Flow::Next
 		},
 		Opcode::LoopEnter => loop_enter(vp, op),
-		Opcode::ForIn => for_in(k, vp, cx, unit, op, line),
-		Opcode::ForNext => for_next(k, vp, cx, op, line),
+		// bash's `this_command_name` ([`Vproc::command_name`]) is cleared
+		// when `select` starts and before each `for` item is assigned.
+		Opcode::ForIn => {
+			if op.flags & Op::SELECT != 0 {
+				vp.command_name = None;
+			}
+			for_in(k, vp, cx, unit, op, line)
+		},
+		Opcode::ForNext => {
+			if top_frame(vp).loops.last().is_some_and(
+				|r| matches!(&r.kind, LoopKind::For { items, next, .. } if (*next as usize) < items.len()),
+			) {
+				vp.command_name = None;
+			}
+			for_next(k, vp, cx, op, line)
+		},
 		Opcode::LoopNote | Opcode::LoopBack => loop_note(vp, op),
 		Opcode::LoopExit => {
 			if let Some(rec) = top_frame(vp).loops.pop() {
@@ -3367,6 +3383,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		},
 		Opcode::Arith if unit.mode.dialect() == Dialect::Zsh => zsh_arith(k, vp, cx, unit, op, line),
 		Opcode::Arith => {
+			vp.command_name = Some(CommandName::Arith);
 			let text = &unit.ariths[op.a as usize];
 			let arith_for = unit
 				.nodes
@@ -3431,7 +3448,10 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 		Opcode::CondTest if unit.mode.dialect() == Dialect::Zsh => {
 			super::zsh::cond::cond_test(k, vp, cx, unit, op, line)
 		},
-		Opcode::CondTest => builtins::cond_test(k, vp, cx, unit, op, line),
+		Opcode::CondTest => {
+			vp.command_name = Some(CommandName::Cond);
+			builtins::cond_test(k, vp, cx, unit, op, line)
+		},
 		Opcode::FuncDef => {
 			let f = &unit.funcs[op.a as usize];
 			// bash records a definition's line at its end.
@@ -3917,26 +3937,23 @@ pub(super) fn cleanup_jump(vp: &Vproc, d: &Diag) -> bool {
 /// associative array or with a non-numeric one for an indexed array, and
 /// a file `.` cannot read (`file_error`). A builtin's own message
 /// (`declare: r: readonly variable`) is `builtin_error`, which never exits.
-fn reports_error(d: &Diag) -> bool {
-	match d {
-		Diag::Several { diags } => diags.iter().any(reports_error),
-		_ => matches!(
-			d,
-			Diag::Readonly { .. }
-				| Diag::Unbound { .. }
-				| Diag::ParamUnset { .. }
-				| Diag::CannotAssign { .. }
-				| Diag::BadSubst { .. }
-				| Diag::BadSubscript { .. }
-				| Diag::InvalidIndirect { .. }
-				| Diag::InvalidVarName { .. }
-				| Diag::NoMatch { .. }
-				| Diag::ListToMember { .. }
-				| Diag::AssocSubscript { .. }
-				| Diag::NonNumericIndex { .. }
-				| Diag::FileError { .. }
-		),
-	}
+const fn reports_error(d: &Diag) -> bool {
+	matches!(
+		d,
+		Diag::Readonly { .. }
+			| Diag::Unbound { .. }
+			| Diag::ParamUnset { .. }
+			| Diag::CannotAssign { .. }
+			| Diag::BadSubst { .. }
+			| Diag::BadSubscript { .. }
+			| Diag::InvalidIndirect { .. }
+			| Diag::InvalidVarName { .. }
+			| Diag::NoMatch { .. }
+			| Diag::ListToMember { .. }
+			| Diag::AssocSubscript { .. }
+			| Diag::NonNumericIndex { .. }
+			| Diag::FileError { .. }
+	)
 }
 
 /// Whether bash's `report_error` exits the shell for `d` ([`reports_error`],
@@ -3981,14 +3998,9 @@ pub(super) const fn errexit_off(prefix: Prefix, id: IntrinsicId) -> bool {
 }
 
 /// The status [`report_error_exits`] leaves with: 1 for an error bash sets
-/// the status for before the message, else `$?`, or 1 when that is 0; for
-/// several messages, the first such one's.
-pub(super) fn report_error_status(vp: &Vproc, d: &Diag) -> i32 {
+/// the status for before the message, else `$?`, or 1 when that is 0.
+pub(super) const fn report_error_status(vp: &Vproc, d: &Diag) -> i32 {
 	match d {
-		Diag::Several { diags } => diags
-			.iter()
-			.find(|d| reports_error(d))
-			.map_or(1, |d| report_error_status(vp, d)),
 		Diag::Readonly { .. }
 		| Diag::BadSubscript { .. }
 		| Diag::InvalidIndirect { .. }
@@ -4051,6 +4063,20 @@ fn top_level_frame(cx: &mut Cx<'_>, vp: &Vproc) -> usize {
 /// command or process substitution exits with status 1 in a script too
 /// (`command_substitute` and `process_substitute` set `EXECUTION_FAILURE`).
 fn discard_top(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
+	// bash's `run_exit_trap` sets its own jump target: a discard inside a
+	// running EXIT trap action ends the action, and the shell exits with the
+	// trap's saved status (`trap_saved_exit_value`), not the discard's. A
+	// child whose fork kept a running `parse_and_execute` (a `-c` string,
+	// an `eval`, `.` or trap action, a substitution's text) is the exception:
+	// `top_level_cleanup` restores that level's jump target, which ends the
+	// child with status 1 below.
+	if let Some(i) = exit_trap_frame(vp)
+		&& !(super::nested::in_subshell(cx.store, vp) && kept_parse_level(cx, vp))
+	{
+		report_jump(k, vp, cx, i, Jump::Cleanup);
+		end_exit_trap(k, vp, cx, i);
+		return;
+	}
 	let command = runs_c(cx, vp);
 	let substitution = vp
 		.frames
@@ -4093,6 +4119,37 @@ fn discard_top(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 				unwind(&mut k.root, cx.store, vp, 0);
 			}
 		},
+	}
+}
+
+/// Whether a child runs inside a `parse_and_execute` level of the shell it
+/// forked from, still running in it: the run's `-c` string, or an `eval`,
+/// `.`, trap action or substitution's text ([`ParseLevel::Kept`],
+/// [`ParseLevel::InSubstitution`]). A command or process substitution's own
+/// text has ended by the time its EXIT trap runs.
+fn kept_parse_level(cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	runs_c(cx, vp)
+		|| vp
+			.frames
+			.first()
+			.is_some_and(|f| matches!(f.parse_level, ParseLevel::Kept | ParseLevel::InSubstitution))
+}
+
+/// End the EXIT trap action at frame `i` where bash's `run_exit_trap`
+/// catches a jump: the frames above it go, and the action reads no more
+/// commands, so it ends with the status it saved.
+fn end_exit_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, i: usize) {
+	unwind(&mut k.root, cx.store, vp, i + 1);
+	clear_scratch(&mut k.root, cx.store, vp);
+	truncate(vp, Depths::default());
+	let f = top_frame(vp);
+	f.unit = None;
+	f.loops.clear();
+	if let FrameKind::Script { src, pos, aux, .. } = &mut f.kind {
+		*pos = (src.len() as u32, pos.1);
+		if let Some(a) = aux {
+			a.pending = None;
+		}
 	}
 }
 

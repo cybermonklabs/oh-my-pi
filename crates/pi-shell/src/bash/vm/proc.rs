@@ -93,6 +93,13 @@ pub struct Vproc {
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
 	pub command:       Option<(Arc<Unit>, u32)>,
+	/// bash's `this_command_name` as a message made while a command's words
+	/// expand names it (a declaration's compound word that fails in
+	/// `make_internal_declare`): the function call, `eval` or `.` that runs
+	/// the commands around it until a simple command inside it ends, then
+	/// none; `((` and `[[` set it, each `for` item clears it. A subshell
+	/// starts with its parent's.
+	pub command_name:  Option<CommandName>,
 	/// Pushes onto bash's call-stack arrays (`FUNCNAME`, `BASH_SOURCE`,
 	/// `BASH_LINENO`, `BASH_ARGC`, `BASH_ARGV`), oldest first; a subshell
 	/// starts with its parent's.
@@ -1625,8 +1632,25 @@ pub enum Transfer {
 	/// The rest of the line is abandoned with this status (a `-c` string
 	/// whole).
 	DiscardAll(i32),
+	/// The command is abandoned with this status by a plain `DISCARD`
+	/// (bash's `exp_jump_to_top_level`): the innermost script (the run's,
+	/// `eval`'s, `.`'s) goes on with its next command.
+	Discard(i32),
 	/// `exec command`: the shell exits with the command's status.
 	Exec,
+}
+
+/// What bash's `this_command_name` names ([`Vproc::command_name`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandName {
+	/// A function call: the innermost function's name.
+	Function,
+	/// A builtin that runs commands of its own (`eval`, `.`, `source`).
+	Builtin(crate::bash::ids::IntrinsicId),
+	/// `((`, also an arithmetic `for`'s expressions.
+	Arith,
+	/// `[[`.
+	Cond,
 }
 
 /// An expanded assignment value.
@@ -1819,8 +1843,9 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B.
-const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
+// that to at most 1,840 B, and bash's `this_command_name`
+// (`Vproc::command_name`, 8 B with alignment) to at most 1,848 B.
+const _: () = assert!(size_of::<Vproc>() <= 680, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");

@@ -20,7 +20,7 @@ use crate::bash::{
 		exec::{self, Flow},
 		expand::{self, arith_value, attr_letters},
 		is_ident,
-		proc::{AssignValue, Vproc},
+		proc::{AssignValue, CommandName, Vproc},
 		quote,
 		state::{self, Level, Var, VarEdit},
 	},
@@ -295,15 +295,53 @@ fn element_text(name: &[u8], index: &[u8]) -> BString {
 /// Print `NAME: readonly variable` as bash's `sh_readonly` does while it
 /// expands a declaration's compound word (`make_internal_declare`): a
 /// `builtin_error`, no `report_error` (`set -e` waits for the builtin's
-/// status), under the function's name inside one (the command's own name
-/// is not set yet), else bare.
+/// status), under the name [`expanding_name`] gives.
 fn compound_readonly(ctx: &mut Ctx<'_, '_>, name: &[u8]) -> Result<(), Need> {
 	let d = Diag::Usage { msg: format!("{}: readonly variable", name.as_bstr()).into() };
-	match state::func_name(&ctx.k.root, ctx.cx.store, ctx.vp)? {
-		Some(f) => ctx.diag(d.by(String::from_utf8_lossy(&f).into_owned())),
+	match expanding_name(ctx)? {
+		Some(cmd) => ctx.diag(d.by(cmd)),
 		None => ctx.diag(d),
 	}
 	Ok(())
+}
+
+/// The name bash's `builtin_error` puts on a message made while a command's
+/// words expand (the command's own name is not set yet): its
+/// `this_command_name` ([`Vproc::command_name`]), the function call, `eval`
+/// or `.` running the commands around it until a simple command inside it
+/// ends, `((` or `[[` after one of those; none otherwise.
+fn expanding_name(ctx: &mut Ctx<'_, '_>) -> Result<Option<std::borrow::Cow<'static, str>>, Need> {
+	use std::borrow::Cow;
+	Ok(match ctx.vp.command_name {
+		None => None,
+		Some(CommandName::Function) => state::func_name(&ctx.k.root, ctx.cx.store, ctx.vp)?
+			.map(|f| Cow::Owned(String::from_utf8_lossy(&f).into_owned())),
+		Some(CommandName::Builtin(id)) => Some(Cow::Borrowed(id.into())),
+		Some(CommandName::Arith) => Some(Cow::Borrowed("((")),
+		Some(CommandName::Cond) => Some(Cow::Borrowed("[[")),
+	})
+}
+
+/// The outcome of a declaration bash abandons while it is still expanding a
+/// compound word (`name=(…)`) given to `declare`, `typeset`, `local`,
+/// `export` or `readonly`, before the builtin runs
+/// (`expand_declaration_argument`): when `make_internal_declare` fails
+/// (subst.c:13037) or the word's assignment does (`do_word_assignment`, then
+/// `bash_variable_assignment_error`, subst.c:13046). Both are a plain
+/// `exp_jump_to_top_level (DISCARD)` ([`super::Control::Discard`]), not
+/// `top_level_cleanup` then `DISCARD`. `None` in zsh mode, where the
+/// builtin goes on.
+fn expansion_discard(ctx: &Ctx<'_, '_>) -> Option<R> {
+	(ctx.vp.mode.dialect() != crate::bash::ids::Dialect::Zsh)
+		.then(|| Ok(super::Outcome { status: 1, control: super::Control::Discard }))
+}
+
+/// Whether a failed `make_internal_declare` for a compound word lets the
+/// builtin go on: `declare`, `typeset` and `local` inside a function mark
+/// the word `W_FORCELOCAL` (`execute_cmd.c:4338`), whose failure is not fatal
+/// (subst.c:13034); the builtin itself then fails the same way.
+const fn force_local(kind: DeclareKind, in_function: bool) -> bool {
+	in_function && matches!(kind, DeclareKind::Declare | DeclareKind::Local)
 }
 
 /// Assign `value` to `lhs` at `level` with bash's attribute semantics.
@@ -625,9 +663,9 @@ fn set_value_plain(
 	let assoc = cur
 		.as_ref()
 		.is_some_and(|v| matches!(v.value, VarValue::Assoc(_)) || v.attrs.contains(Attrs::ASSOC));
-	// Element errors of a compound assignment: reported after the rest is
-	// assigned.
-	let mut deferred: Vec<Diag> = Vec::new();
+	// The element error that ends a compound assignment: reported once the
+	// elements before it are assigned.
+	let mut deferred: Option<Diag> = None;
 	// An arithmetic error in a compound element's subscript: the elements
 	// before it are assigned, then the whole command is abandoned.
 	let mut aborted: Option<Diag> = None;
@@ -687,8 +725,9 @@ fn set_value_plain(
 				let mut tmp = Var { attrs, value: VarValue::Assoc(std::mem::take(&mut items)) };
 				let mut pending_key: Option<BString> = None;
 				// bash pairs up unkeyed words only when the first word has no
-				// `[key]=`; otherwise an unkeyed word is an error (reported
-				// after the rest is assigned).
+				// `[key]=`; otherwise an unkeyed word is an error, and the
+				// words after it are not assigned (bash 5.3's
+				// `assign_compound_array_list`: `any_failed++; break`).
 				let kvpair = elems.first().is_some_and(|(key, ..)| key.is_none());
 				for (key, eappend, v) in elems {
 					let key = if let Some(key) = key {
@@ -698,13 +737,13 @@ fn set_value_plain(
 						if key.is_empty() {
 							let mut shown = BString::from(if eappend { "[]+=" } else { "[]=" });
 							shown.extend_from_slice(&v);
-							deferred.push(Diag::BadSubscript { shown });
+							deferred = Some(Diag::BadSubscript { shown });
 							break;
 						}
 						key
 					} else if !kvpair {
-						deferred.push(Diag::AssocSubscript { name: name.into(), word: v });
-						continue;
+						deferred = Some(Diag::AssocSubscript { name: name.into(), word: v });
+						break;
 					} else {
 						let Some(key) = pending_key.take() else {
 							pending_key = Some(v);
@@ -755,10 +794,12 @@ fn set_value_plain(
 						if key.is_empty() {
 							let mut shown = BString::from("[]=");
 							shown.extend_from_slice(&v);
-							deferred.push(Diag::BadSubscript { shown });
+							deferred = Some(Diag::BadSubscript { shown });
 							break;
 						}
-						// A bad element is reported and skipped.
+						// A bad element ends the assignment there, the elements
+						// before it assigned (bash 5.3's
+						// `assign_compound_array_list`: `any_failed++; break`).
 						let shown = || {
 							let mut s = BString::from("[");
 							s.extend_from_slice(&key);
@@ -767,8 +808,8 @@ fn set_value_plain(
 							s
 						};
 						if matches!(key.as_slice(), b"@" | b"*") {
-							deferred.push(Diag::NonNumericIndex { shown: shown() });
-							continue;
+							deferred = Some(Diag::NonNumericIndex { shown: shown() });
+							break;
 						}
 						match index_of(k, cx, vp, tmp.next_index(), &key, &shown) {
 							Ok(n) => i = n,
@@ -781,8 +822,8 @@ fn set_value_plain(
 								break;
 							},
 							Err(d) => {
-								deferred.push(d);
-								continue;
+								deferred = Some(d);
+								break;
 							},
 						}
 					}
@@ -879,11 +920,7 @@ fn set_value_plain(
 	if let Some(d) = aborted {
 		return Err(d);
 	}
-	match deferred.len() {
-		0 => Ok(()),
-		1 => Err(deferred.remove(0)),
-		_ => Err(Diag::Several { diags: deferred }),
-	}
+	deferred.map_or(Ok(()), Err)
 }
 
 /// A posix-mode special builtin's prefix assignment, which persists like
@@ -1742,8 +1779,21 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		return done(status);
 	}
 	let first = args.len() - o.rest.len();
-	for (j, arg) in o.rest.iter().enumerate() {
+	// bash assigns each compound word while it expands the command's words
+	// (`expand_declaration_argument`), before the builtin runs: those words
+	// come first, then the others, each set in its order, so a compound word
+	// bash discards leaves every other argument unassigned (`declare x=1
+	// A=([]=v)` sets no `x`). zsh takes them in order.
+	let bash = ctx.vp.mode.dialect() != crate::bash::ids::Dialect::Zsh;
+	let n = o.rest.len();
+	let steps = if bash { 2 * n } else { n };
+	for step in 0..steps {
+		let j = step % n;
 		let compound_word = ctx.compound.contains(&((1 + first + j) as u32));
+		if bash && compound_word != (step < n) {
+			continue;
+		}
+		let arg = &o.rest[j];
 		if kind == DeclareKind::Local && arg.as_slice() == b"-" {
 			// `local -`: the `set` options, restored when the function
 			// returns.
@@ -2048,11 +2098,25 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 			let array_flag = on.contains(Attrs::INDEXED) || on.contains(Attrs::ASSOC);
 			if compound_word && array_flag {
 				// bash checks a compound word's `-a`/`-A` against the variable
-				// first, while it expands the word.
+				// first, while it expands the word (`make_internal_declare`):
+				// that abandons the command, unless `W_FORCELOCAL` lets the
+				// builtin go on and fail the same way.
 				compound_readonly(ctx, name)?;
+				if !force_local(kind, in_function)
+					&& let Some(r) = expansion_discard(ctx)
+				{
+					return r;
+				}
+				if bash {
+					ctx.err(d);
+				}
 			} else if compound_word {
-				// Without them the assignment fails (`err_readonly`).
+				// Without them the word's assignment fails (`err_readonly`),
+				// which abandons the command.
 				ctx.diag(d);
+				if let Some(r) = expansion_discard(ctx) {
+					return r;
+				}
 			} else if value.is_some()
 				&& matches!(kind, DeclareKind::Readonly | DeclareKind::Export)
 				&& !array_flag
@@ -2095,16 +2159,22 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 		if let Some(msg) = conversion {
 			let msg = format!("{}: {msg}", name.as_bstr());
 			if compound_word {
-				// bash reports a failed compound assignment bare at top
-				// level, and in a function under the function's name and
-				// again under `declare`'s.
-				let func = state::func_name(&ctx.k.root, ctx.cx.store, ctx.vp)?;
-				match func.map(|f| String::from_utf8_lossy(&f).into_owned()) {
-					Some(f) => {
-						ctx.diag(Diag::Usage { msg: msg.clone().into() }.by(f));
-						ctx.err(Diag::Usage { msg: msg.into() });
-					},
-					None => ctx.diag(Diag::Usage { msg: msg.into() }),
+				// `make_internal_declare` fails first, while bash expands the
+				// word ([`expanding_name`]): that abandons the command, unless
+				// `W_FORCELOCAL` lets `declare` go on and fail again under its
+				// own name.
+				let made = Diag::Usage { msg: msg.clone().into() };
+				match expanding_name(ctx)? {
+					Some(cmd) => ctx.diag(made.by(cmd)),
+					None => ctx.diag(made),
+				}
+				if !force_local(kind, in_function)
+					&& let Some(r) = expansion_discard(ctx)
+				{
+					return r;
+				}
+				if in_function {
+					ctx.err(Diag::Usage { msg: msg.into() });
 				}
 			} else {
 				ctx.err(Diag::Usage { msg: msg.into() });
@@ -2388,18 +2458,26 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					};
 					var.value = VarValue::Indexed(items);
 				}
-				ctx.set_var(name, Some(var), level);
 				// `declare a[0]=(1)`: bash declares the array first
-				// (`make_internal_declare`), then refuses the list for the
-				// element by `report_error` (subst.c:3603).
+				// (`make_internal_declare`, with no value when it is new),
+				// then refuses the list for the element by `report_error`
+				// (subst.c:3603), which abandons the command.
 				if let Some(idx) = index
 					&& compound_word
 					&& parens
 				{
+					if !exists {
+						var.attrs = var.attrs.with(Attrs::INVISIBLE);
+					}
+					ctx.set_var(name, Some(var), level);
 					ctx.diag(Diag::ListToMember { shown: element_text(name, idx) });
+					if let Some(r) = expansion_discard(ctx) {
+						return r;
+					}
 					status = 1;
 					continue;
 				}
+				ctx.set_var(name, Some(var), level);
 				// bash expands a `declare` argument's subscript again (quote
 				// removal), unlike an assignment word's.
 				let index = index
@@ -2413,8 +2491,8 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					continue;
 				}
 				let lhs = Lhs { name, index: index.as_ref().map(|i| i.as_slice()), append };
-				match set_value(ctx.k, ctx.cx, ctx.vp, lhs, assign_value, level) {
-					Ok(()) => {},
+				let failed = match set_value(ctx.k, ctx.cx, ctx.vp, lhs, assign_value, level) {
+					Ok(()) => None,
 					// An arithmetic error in a subscript abandons the rest of
 					// the line (bash `jump_to_top_level (DISCARD)`).
 					Err(d @ Diag::ArithSubscript { .. }) => {
@@ -2431,9 +2509,7 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					// `declare` got it, single-quoted.
 					Err(Diag::AssocSubscript { name: array, word }) if compound_word => {
 						let word = quote::sh_single_quote(&word).into();
-						ctx.err(Diag::AssocSubscript { name: array, word });
-						status = 1;
-						continue;
+						Some(Diag::AssocSubscript { name: array, word })
 					},
 					// and an associative array's empty key, both words quoted:
 					// `['']='v'`.
@@ -2447,16 +2523,19 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 								s.extend_from_slice(&quote::sh_single_quote(v));
 								s
 							});
-						let shown = requoted.unwrap_or(shown);
-						ctx.err(Diag::BadSubscript { shown });
-						status = 1;
-						continue;
+						Some(Diag::BadSubscript { shown: requoted.unwrap_or(shown) })
 					},
-					Err(d) => {
-						ctx.err(d);
-						status = 1;
-						continue;
-					},
+					Err(d) => Some(d),
+				};
+				if let Some(d) = failed {
+					ctx.err(d);
+					// A compound word whose assignment fails (bash's
+					// `do_word_assignment`) abandons the command.
+					if compound_word && let Some(r) = expansion_discard(ctx) {
+						return r;
+					}
+					status = 1;
+					continue;
 				}
 				if on.contains(Attrs::READONLY)
 					&& let Some(mut v) = current(ctx.k, ctx.cx, ctx.vp, name, level).ok().flatten()

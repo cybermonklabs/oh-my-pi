@@ -154,13 +154,6 @@ pub enum Diag {
 		/// The reference.
 		name: BString,
 	},
-	/// Several messages from one operation (a compound array assignment
-	/// reports each bad element); each is printed as its own line.
-	#[error("{}", .diags.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))]
-	Several {
-		/// The messages, in order.
-		diags: Vec<Self>,
-	},
 	/// `[[ s =~ re ]]` with a regex that does not compile (status 2).
 	#[error("invalid regular expression `{pattern}': {err}")]
 	InvalidRegex {
@@ -623,9 +616,6 @@ pub struct DiagSite<'a> {
 pub fn render(diag: &Diag, site: DiagSite<'_>) -> Vec<u8> {
 	use std::io::Write;
 
-	if let Diag::Several { diags } = diag {
-		return diags.iter().flat_map(|d| render(d, site)).collect();
-	}
 	let syntax = matches!(diag, Diag::Syntax { .. } | Diag::SyntaxContext { .. });
 	let mut out = Vec::with_capacity(64);
 	out.extend_from_slice(site.shell_name);
@@ -682,9 +672,6 @@ pub struct ZshSite<'a> {
 /// `zwarning`): `PREFIX:LINE: msg`, or `PREFIX:CMD:LINE: msg` for a
 /// builtin's ([`Diag::Prefixed`]); without a line, `PREFIX: msg`.
 pub fn render_zsh(diag: &Diag, site: ZshSite<'_>) -> Vec<u8> {
-	if let Diag::Several { diags } = diag {
-		return diags.iter().flat_map(|d| render_zsh(d, site)).collect();
-	}
 	let mut out = Vec::with_capacity(64);
 	let prefixed = matches!(diag, Diag::Prefixed { .. });
 	if !site.prefix.is_empty() {

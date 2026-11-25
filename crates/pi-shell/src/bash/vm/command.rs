@@ -20,9 +20,9 @@ use super::{
 	expand::{CompoundElem, Expander, Stop, compound_text},
 	probe::{self, Search, absolute, candidates},
 	proc::{
-		AssignValue, Awaited, BangStage, DeferPhase, ExecAs, ExecState, Frame, FrameKind, JobState,
-		Live, PathSearch, PendingWrite, Prefix, Probe, ProbeResult, Scratch, ScriptKind, Slot, Stage,
-		Target, Transfer, Vproc,
+		AssignValue, Awaited, BangStage, CommandName, DeferPhase, ExecAs, ExecState, Frame,
+		FrameKind, JobState, Live, PathSearch, PendingWrite, Prefix, Probe, ProbeResult, Scratch,
+		ScriptKind, Slot, Stage, Target, Transfer, Vproc,
 	},
 	state::{self, Level, Scope, Var, VarMap},
 	xtrace,
@@ -461,6 +461,8 @@ fn assignment_statement(
 			return Some(assign_failed(k, vp, cx, line, d));
 		}
 	}
+	// A simple command ended (bash's `execute_null_command`).
+	vp.command_name = None;
 	vp.status = 0;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(0);
@@ -631,6 +633,8 @@ fn plain_statement(
 	};
 	if let (Ok(outcome), Ok(())) = (&res, written) {
 		state::drop_scope(&mut k.root, cx.store, vp);
+		// A simple command ended: bash's `this_command_name` is empty.
+		vp.command_name = None;
 		vp.status = outcome.status;
 		vp.pipestatus.clear();
 		vp.pipestatus.push(outcome.status);
@@ -2807,6 +2811,9 @@ fn call_function(
 	let trace_once = attrs.contains(Attrs::ZSH_TRACE_ONCE);
 	let callee = Callee { name, body, mode, sticky, file, traced, trace_once, warn_nested };
 	let call = Call { args, vars, line, node: op.node, depth, argzero: None };
+	// bash's `this_command_name` names the function while its commands
+	// expand their words, until one of them ends.
+	vp.command_name = Some(CommandName::Function);
 	Some(push_call(k, vp, cx, callee, call))
 }
 
@@ -4082,15 +4089,19 @@ fn settle_builtin(
 			e.stage = Stage::Output;
 			None
 		},
+		// bash's `this_command_name` names the builtin while the commands
+		// it runs (`eval`, `.`) expand their words, until one of them ends.
 		Control::Frame => {
 			e.waiting = Some(Awaited::Frame);
 			e.stage = Stage::Await;
+			vp.command_name = Some(CommandName::Builtin(id));
 			Some(Flow::Call)
 		},
 		Control::Resume => {
 			e.waiting = Some(Awaited::Frame);
 			e.resume = true;
 			e.stage = Stage::Await;
+			vp.command_name = Some(CommandName::Builtin(id));
 			Some(Flow::Call)
 		},
 		Control::Wait(w) => {
@@ -4118,6 +4129,11 @@ fn settle_builtin(
 		},
 		Control::DiscardAll => {
 			e.control = Some(Transfer::DiscardAll(outcome.status));
+			e.stage = Stage::Output;
+			None
+		},
+		Control::Discard => {
+			e.control = Some(Transfer::Discard(outcome.status));
 			e.stage = Stage::Output;
 			None
 		},
@@ -4773,6 +4789,9 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
 	vp.status = status;
+	// A simple command ended: bash's `this_command_name` is empty
+	// (`execute_simple_command`, execute_cmd.c:4952).
+	vp.command_name = None;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(status);
 	if k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
@@ -4809,6 +4828,7 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		Some(Transfer::Break { n, cont }) => Flow::Break { n, cont },
 		Some(Transfer::Exit(n, jump)) => Flow::Exit(n, jump),
 		Some(Transfer::DiscardAll(n)) => cleanup_discard(k, vp, cx, n),
+		Some(Transfer::Discard(n)) => plain_discard(k, vp, cx, n),
 		Some(Transfer::Exec) => {
 			// The program replaced the shell (or `exec` failed and the shell
 			// exits, `exit_shell` with no jump): bash's `time` around it
@@ -4834,6 +4854,19 @@ fn cleanup_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: i32) -> F
 	}
 	let flow = Flow::DiscardTop(n);
 	exec::jump_out(k, cx, vp, true, &flow);
+	flow
+}
+
+/// The flow of a command bash abandons while it still expands its words
+/// (`exp_jump_to_top_level (DISCARD)`: a declaration's compound word whose
+/// `make_internal_declare` or assignment fails). A plain discard, not
+/// [`cleanup_discard`]'s: `top_level_cleanup` runs only at a script's own
+/// level ([`exec::jump_out`]), and the innermost `parse_and_execute` (the
+/// script, `-c`, `eval`, `.`) catches the jump and goes on with its next
+/// command ([`Flow::Discard`]).
+fn plain_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: i32) -> Flow {
+	let flow = Flow::Discard(n);
+	exec::jump_out(k, cx, vp, false, &flow);
 	flow
 }
 

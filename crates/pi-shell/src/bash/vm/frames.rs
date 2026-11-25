@@ -56,7 +56,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 35;
+pub const FRAMES_VERSION: u32 = 36;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -261,6 +261,8 @@ struct ProcImage {
 	/// trap action that runs after the restore still names the trapped
 	/// command.
 	command:       Option<(UnitId, u32)>,
+	/// bash's `this_command_name` ([`Vproc::command_name`]).
+	command_name:  Option<super::proc::CommandName>,
 	/// Pushes onto bash's call-stack arrays.
 	calls:         Vec<super::callstack::Call>,
 	/// The pseudo-signal traps the vproc set itself.
@@ -617,6 +619,7 @@ impl Shell {
 				trace_base: p.trace_base,
 				subshell: p.subshell,
 				command,
+				command_name: p.command_name,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
 				mode: p.mode,
@@ -853,6 +856,7 @@ impl Shell {
 			vp.mode = p.mode;
 			vp.zsh = p.zsh;
 			vp.lineage = p.lineage;
+			vp.command_name = p.command_name;
 			if let Some((id, node)) = p.command {
 				let unit = load_unit(
 					engine,
