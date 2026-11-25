@@ -221,6 +221,20 @@ describe("RPC frame encoding", () => {
 		expect(encoded).toContain("rpcFrameElidedKeys");
 	});
 
+	// A tool call's arguments come from JSON.parse, which makes `__proto__` an own key; a shrunk frame
+	// that drops it shows the client the arguments without one the model sent.
+	it("keeps a tool call argument's own __proto__ key when it shrinks the frame", () => {
+		const text = "x".repeat(2 * MAX_RPC_FRAME_BYTES);
+		const args: unknown = JSON.parse(`{"__proto__":{"a":1},"text":${JSON.stringify(text)}}`);
+		const encoded = encodeRpcFrame({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "write", args });
+		const decoded = decode(encoded).args as Record<string, unknown>;
+
+		expect(Buffer.byteLength(encoded, "utf8")).toBeLessThanOrEqual(MAX_RPC_FRAME_BYTES);
+		expect(String(decoded.text)).toContain("chars elided for RPC frame");
+		expect(Object.hasOwn(decoded, "__proto__")).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(decoded, "__proto__")?.value).toEqual({ a: 1 });
+	});
+
 	it("fails oversized responses instead of returning partial success data", () => {
 		const encoded = encodeRpcFrame({
 			id: "request-2",
