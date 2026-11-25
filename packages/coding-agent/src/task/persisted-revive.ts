@@ -46,30 +46,7 @@ import type { EventBus } from "../utils/event-bus";
 import { isCompletionProbeEnabled } from "./completion-probe";
 import { discoverAgents, getAgent } from "./discovery";
 import { definedEvalCustomTools, unavailableEvalCustomTool } from "./eval-tools";
-import {
-	buildSubagentSession,
-	captureSubagentSettings,
-	compactionThresholdSettings,
-	createSubagentSettings,
-	type ExplicitBuildModel,
-	type LegacyBuildModel,
-	liveEffortCeiling,
-	perCallModelAssertion,
-	RevivedModels,
-	reopenParkedSubagent,
-	restoreSubagentSettings,
-	SUBAGENT_OVERLAY_SETTINGS,
-	type SubagentBuildInput,
-	type SubagentLegacyRevive,
-	type SubagentLiveInputs,
-	type SubagentLivePolicy,
-	type SubagentOverlayOverrides,
-	type SubagentSpawnerLiveInputs,
-	softRequestBudgetFor,
-	spawnerLiveInputs,
-	subagentRetryFallbackRole,
-	switchedOrHeldModel,
-} from "./executor";
+import { softRequestBudgetFor, subagentRetryFallbackRole } from "./executor";
 import {
 	assertPerCallModelApproved,
 	PerCallModelError,
@@ -92,6 +69,27 @@ import {
 	spawnSpecSettings,
 } from "./spawn-spec";
 import { subagentLiveInputs, subagentSpawnerPolicy } from "./structured-subagent";
+import { RevivedModels, reopenParkedSubagent, type SubagentLegacyRevive, switchedOrHeldModel } from "./subagent-revive";
+import {
+	buildSubagentSession,
+	type ExplicitBuildModel,
+	type LegacyBuildModel,
+	liveEffortCeiling,
+	perCallModelAssertion,
+	type SubagentBuildInput,
+	type SubagentLiveInputs,
+	type SubagentLivePolicy,
+	type SubagentSpawnerLiveInputs,
+	spawnerLiveInputs,
+} from "./subagent-session-options";
+import {
+	captureSubagentSettings,
+	compactionThresholdSettings,
+	createSubagentSettings,
+	restoreSubagentSettings,
+	SUBAGENT_OVERLAY_SETTINGS,
+	type SubagentOverlayOverrides,
+} from "./subagent-settings";
 import type { AgentDefinition } from "./types";
 
 /** Custom type of the message that names a revived subagent's unavailable custom tools to its model. */
@@ -316,7 +314,7 @@ export function persistedAgentDefinition(displayName: string, init: PersistedSes
  * Build the factory the {@link AgentLifecycleManager} uses to cold-revive a
  * `parked` subagent ref restored from disk (Agent Hub scan, collab mirror, or a
  * resumed process). Such a ref carries a sessionFile but no in-memory adoption —
- * the executor's live reviver closure died with the process/turn that spawned
+ * the executor's warm revive state died with the process/turn that spawned
  * it — so `ensureLive` (IRC sends, hub focus) would otherwise refuse it.
  *
  * Each revive builds the subagent through {@link buildSubagentSession} from the spawn spec

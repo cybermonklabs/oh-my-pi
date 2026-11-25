@@ -15,14 +15,23 @@
  *   (the next `ensureLive` cold-revives through the persisted factory), every
  *   registry ref holding a session homed there is detached and turns `parked`
  *   (session file on disk) or `aborted`, and the mirrors close, so in-flight
- *   commands reject with an error naming the worker.
+ *   commands reject with an error naming the worker. The thread holds each
+ *   such agent's journal until it has stopped, so the lifecycle holds a ref
+ *   with a session file as a park in flight until then
+ *   (`AgentLifecycleManager.parkUntil`), and a revive waits for it.
  *
  * Worker side: proxies installed with `installGlobal`, the bridge handed to
  * peer handles, and a `SessionPublisher` for every session constructed here.
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import { IrcBus } from "../../irc/bus";
-import { type AdoptOptions, type AgentReviver, AgentLifecycleManager } from "../../registry/agent-lifecycle";
+import {
+	type AdoptOptions,
+	type AgentReviver,
+	AgentLifecycleManager,
+	runReviver,
+	WarmReviveInputsMissingError,
+} from "../../registry/agent-lifecycle";
 import { AgentRegistry, type RegisterInput, type RegistryListener } from "../../registry/agent-registry";
 import { PromptDroppedError, SessionBusyError } from "../../session/agent-session";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -65,6 +74,8 @@ export interface AgentsThreadGlobals {
 function registerSessionErrors(): void {
 	registerRpcError("PromptDroppedError", message => Object.assign(new PromptDroppedError(), { message }));
 	registerRpcError("SessionBusyError", message => Object.assign(new SessionBusyError("continue"), { message }));
+	// A worker's warm reviver throws it to main's lifecycle, which then revives cold.
+	registerRpcError("WarmReviveInputsMissingError", message => new WarmReviveInputsMissingError(message));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,7 +173,9 @@ export class MainSessionBridge {
 	/**
 	 * Record a reviver this worker handed to `lifecycle` for `id`; returns the adopt options
 	 * to pass on, whose reviver holds the worker (and its idle shutdown off) while a revive
-	 * runs there. The record is dropped when the adoption lets go of the reviver.
+	 * runs there. The record is dropped when the adoption lets go of the reviver. A worker
+	 * sends even a plain-data reviver as a function it keeps (see `RemoteAgentLifecycle.adopt`):
+	 * main holds that function's proxy, wrapped here, until the adoption drops it or the worker exits.
 	 */
 	adopted(lifecycle: AgentLifecycleManager, id: string, opts: AdoptOptions): AdoptOptions {
 		const revive = opts.revive;
@@ -171,7 +184,7 @@ export class MainSessionBridge {
 		const held: AgentReviver = async expected => {
 			const release = peer.retain?.();
 			try {
-				return await revive(expected);
+				return await runReviver(revive, expected);
 			} finally {
 				release?.();
 			}
@@ -204,9 +217,16 @@ export class MainSessionBridge {
 		this.#revivers.clear();
 		for (const { lifecycle, id, revive } of revivers) lifecycle.forgetReviver(id, revive);
 		const registry = AgentRegistry.global();
+		const mainLifecycle = AgentLifecycleManager.global();
+		const ended = this.#peer.ended;
 		for (const ref of registry.list()) {
 			const session = ref.session;
 			if (!(session instanceof RemoteAgentSession) || session.home !== this.#peer.threadId) continue;
+			// The thread holds the agent's journal until it has stopped; a revive waits for that. Held
+			// before the ref turns parked, so even a listener that revives at that change waits.
+			if (ended && ref.sessionFile && mainLifecycle instanceof AgentLifecycleManager) {
+				mainLifecycle.parkUntil(ref.id, ref, ended);
+			}
 			registry.detachSession(ref.id, ref);
 			if (ref.status !== "aborted") registry.setStatus(ref.id, ref.sessionFile ? "parked" : "aborted", ref);
 		}
@@ -237,6 +257,7 @@ function serveBridge(): RpcServe<MainSessionBridge, SessionBridgeProtocol> {
 			bridge.forward(listener, forward => session.subscribeRunState(forward)),
 		prompt: (_bridge, session, text, options) => session.prompt(text, options),
 		steer: (_bridge, session, text, images, options) => session.steer(text, images, options),
+		removeQueuedMessage: (_bridge, session, target, queue) => session.removeQueuedMessage(target, queue),
 		abort: (_bridge, session, options) => session.abort(options),
 		dispose: (_bridge, session, options) => session.dispose(options),
 		deliverIrcMessage: (_bridge, session, msg) => session.deliverIrcMessage(msg),
@@ -271,6 +292,8 @@ export function serveRegistry(bridge: MainSessionBridge): RpcServe<AgentRegistry
 		setHistory: (registry, id, history, expectedSessionFile) => registry.setHistory(id, history, expectedSessionFile),
 		setStatus: (registry, id, status, expected) => registry.setStatus(id, status, expected),
 		markResultAccepted: (registry, id, expected, responseAt) => registry.markResultAccepted(id, expected, responseAt),
+		markRunEnded: (registry, id, expected) => registry.markRunEnded(id, expected),
+		startRun: (registry, id, expected) => registry.startRun(id, expected),
 		staleAcceptedRuns: registry => registry.staleAcceptedRuns(),
 		setActivity: (registry, id, activity) => registry.setActivity(id, activity),
 		attachSession: (registry, id, session, sessionFile, expected) =>
@@ -324,6 +347,9 @@ function serveBus(bridge: MainSessionBridge): RpcServe<IrcBus, IrcBusProtocol> {
 		take: (bus, agentId, from) => bus.take(agentId, from),
 		unreadCount: (bus, agentId) => bus.unreadCount(agentId),
 		recordReply: (bus, from, to) => bus.recordReply(from, to),
+		forgetAgent: (bus, agentId) => bus.forgetAgent(agentId),
+		// A hold a dead worker took must not keep its agent's marks for the rest of the session.
+		holdSentMarks: (bus, agentId) => bridge.track(bus.holdSentMarks(agentId)),
 	};
 }
 

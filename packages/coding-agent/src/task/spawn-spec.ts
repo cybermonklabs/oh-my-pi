@@ -14,15 +14,10 @@ import { isRecord } from "@oh-my-pi/pi-utils";
 import type { EvalToolDescriptor } from "../eval/types";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../sdk";
 import type { PersistedSessionInit } from "../session/session-manager";
-import type {
-	IrcWakeTurnMonitorOptions,
-	RootCompactionThresholds,
-	SubagentLiveInputs,
-	SubagentPromptInputs,
-	SubagentSettingsSnapshot,
-	WarmReviveCache,
-	WarmReviveCapture,
-} from "./executor";
+import type { IrcWakeTurnMonitorOptions } from "./executor";
+import type { WarmReviveCache, WarmReviveState } from "./subagent-revive";
+import type { SubagentLiveInputs, SubagentPromptInputs } from "./subagent-session-options";
+import type { RootCompactionThresholds, SubagentSettingsSnapshot } from "./subagent-settings";
 import type { AgentDefinition } from "./types";
 
 /** Version of the stored spec; a record whose `v` differs reads as having none. */
@@ -92,7 +87,7 @@ export type SpawnSpecIdentity = Pick<
 >;
 
 /** Prompt inputs that only the live process holds; the spec does not store them. */
-type ProcessLocalPromptKeys = "ircRoot" | "ircRenders";
+type ProcessLocalPromptKeys = "ircRoot" | "ircRenders" | "ircRecorded";
 
 /** The inputs of the subagent's own prompt block. */
 export interface SpawnSpecPrompt extends Omit<SubagentPromptInputs, ProcessLocalPromptKeys | "outputSchema"> {
@@ -376,26 +371,31 @@ const subagentPromptInputClasses: InputClasses<SubagentPromptInputs> = {
 	ircEnabled: "S",
 	// Resolved again at each build (`refreshSubagentIrcRoot`).
 	ircRoot: "D",
-	ircRenders: "P",
+	// Made by each build; a warm revive's read again from the roster records its transcript holds
+	// (`IRC_ROSTER_ENTRY`, subagent-session-options.ts), so a parked subagent keeps none.
+	ircRenders: "D",
+	ircRecorded: "D",
 };
 
-const warmReviveCaptureClasses: InputClasses<WarmReviveCapture> = {
-	sessionFile: "L",
+const warmReviveStateClasses: InputClasses<WarmReviveState> = {
 	// The session store the transcript lives in: never stored in the spec, never sent to a worker.
 	storage: "L",
-	// The spawn spec itself, the same object the spawn wrote to session_init.
-	spec: "S",
 	live: "L",
+	// A per-call worker's approval is built again at each revive over these.
+	perCallGrants: "L",
 	cache: "nested",
+	// Of the spec the transcript stores, which a warm revive reads back: a spec it does not match revives cold.
+	specDigest: "P",
 };
 
 const warmReviveCacheClasses: InputClasses<WarmReviveCache> = {
-	// The models the spec's identities name, which a warm revive holds rather than resolves.
+	// The models the spec's identities name, which a warm revive holds rather than resolves while the model
+	// registry holds no equal one.
 	model: "S",
 	prewalkTarget: "S",
-	settings: "S+P",
+	// The runs' writes beyond the layers the spec stores.
+	settingsWrites: "S+P",
 	pendingCacheCandidate: "P",
-	ircRenders: "P",
 };
 
 const startupModelFallbackClasses: InputClasses<SpawnSpecStartupFallback> = {
@@ -433,7 +433,7 @@ const ircWakeTurnMonitorOptionClasses: InputClasses<IrcWakeTurnMonitorOptions> =
 export const SPAWN_INPUT_CLASSES = {
 	createAgentSessionOptions: createAgentSessionOptionClasses,
 	subagentPromptInputs: subagentPromptInputClasses,
-	warmReviveCapture: warmReviveCaptureClasses,
+	warmReviveState: warmReviveStateClasses,
 	warmReviveCache: warmReviveCacheClasses,
 	ircWakeTurnMonitorOptions: ircWakeTurnMonitorOptionClasses,
 	startupModelFallback: startupModelFallbackClasses,

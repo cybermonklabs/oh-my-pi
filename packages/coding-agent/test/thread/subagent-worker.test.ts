@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { RpcClosedError } from "../../src/thread/rpc";
@@ -6,23 +6,13 @@ import type { ThreadService, WorkerPeer } from "../../src/thread/services";
 import { THREAD_SERVICES } from "../../src/thread/services/index";
 import {
 	allowedSubagentWorkers,
-	SubagentWorker,
-	type SubagentWorkerOptions,
+	type SubagentWorker,
 	SubagentWorkerPool,
 	type SubagentWorkerPoolOptions,
 } from "../../src/thread/subagent-worker";
+import { useWorkerTests } from "./worker-test-helpers";
 
-const cleanups: Array<() => void> = [];
-
-afterEach(() => {
-	for (const cleanup of cleanups.splice(0)) cleanup();
-});
-
-function startWorker(options: SubagentWorkerOptions = {}): SubagentWorker {
-	const worker = new SubagentWorker(options);
-	cleanups.push(() => worker.terminate());
-	return worker;
-}
+const { cleanups, startWorker, nextRecord } = useWorkerTests();
 
 /** Resolves after a prewarm's spawn (setImmediate callbacks run in FIFO order). */
 function nextImmediate(): Promise<void> {
@@ -122,14 +112,10 @@ describe("SubagentWorker", () => {
 			logger.setTransports({ file: true });
 			void dir.remove();
 		});
-		const after = Promise.withResolvers<void>();
 		const worker = startWorker({ entry: new URL("../fixtures/early-log-worker.ts", import.meta.url) });
-		const unregisterAfter = logger.registerLogSink(event => {
-			if (event.message === "early-log: after init") after.resolve();
-		});
-		cleanups.push(unregisterAfter);
+		const after = nextRecord("early-log: after init");
 		await worker.ready;
-		await after.promise;
+		await after;
 		expect(events.map(event => [event.message, event.context])).toEqual([
 			["early-log: during evaluation", { phase: "evaluation", thread: worker.threadId }],
 			["early-log: after init", { phase: "init", thread: worker.threadId }],
@@ -149,15 +135,10 @@ describe("SubagentWorker", () => {
 		Bun.env.PI_PROXY = `http://127.0.0.1:${proxy.port}`;
 		delete Bun.env.NO_PROXY;
 		delete Bun.env.no_proxy;
-		const probed = Promise.withResolvers<logger.LogEvent>();
-		cleanups.push(
-			logger.registerLogSink(event => {
-				if (event.message.startsWith("proxy-probe:")) probed.resolve(event);
-			}),
-		);
+		const probed = nextRecord(event => event.message.startsWith("proxy-probe:"));
 		const worker = startWorker({ entry: new URL("../fixtures/proxy-probe-worker.ts", import.meta.url) });
 		await worker.ready;
-		const event = await probed.promise;
+		const event = await probed;
 		expect([event.message, event.context?.body]).toEqual(["proxy-probe: done", "via http://proxied.invalid/probe"]);
 	});
 });
@@ -302,5 +283,37 @@ describe("SubagentWorkerPool", () => {
 		expect(pool.workers()).toEqual([worker]);
 		vi.advanceTimersByTime(400);
 		expect(worker.exitReason).toBe("idle");
+	});
+
+	it("logs each placement and each worker exit with its runs in flight and its live workers", async () => {
+		// If this regresses, the omp log no longer shows where each subagent ran, how many runs were in
+		// flight, or when the pool had no live worker left: the record of c-subagent-memory configuration
+		// (B) cannot show placement, so a (B) run cannot be counted.
+		const records: Array<[string, Record<string, unknown> | undefined]> = [];
+		cleanups.push(
+			logger.registerLogSink(event => {
+				if (event.message === "Subagent run placed" || event.message === "Subagent worker exited") {
+					records.push([event.message, event.context]);
+				}
+			}),
+		);
+		// Threshold 2: the second concurrent run opens the first worker slot.
+		const pool = startPool(4, { idleMs: 1_000, threshold: 2 });
+		const placements = [pool.place(), pool.place(), pool.place()];
+		const worker = placements[1]?.worker;
+		if (!worker) throw new Error("the second run started no worker");
+		const id = worker.threadId;
+		expect(placements.map(placement => placement.worker?.threadId ?? "main")).toEqual(["main", id, id]);
+		await worker.ready;
+		useFakeTimers();
+		for (const placement of placements) placement.release();
+		vi.advanceTimersByTime(1_000);
+		expect(worker.exitReason).toBe("idle");
+		expect(records).toEqual([
+			["Subagent run placed", { where: "main", mainRuns: 1, workerRuns: {}, liveWorkers: 0 }],
+			["Subagent run placed", { where: id, mainRuns: 1, workerRuns: { [id]: 1 }, liveWorkers: 1 }],
+			["Subagent run placed", { where: id, mainRuns: 1, workerRuns: { [id]: 2 }, liveWorkers: 1 }],
+			["Subagent worker exited", { threadId: id, reason: "idle", liveWorkers: 0 }],
+		]);
 	});
 });

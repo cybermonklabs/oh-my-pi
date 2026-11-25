@@ -7,6 +7,7 @@
  * the producing model still is.
  */
 import { describe, expect, it } from "bun:test";
+import { cloneJsonTree } from "@oh-my-pi/pi-utils";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
@@ -188,4 +189,53 @@ describe("SessionMaintenance.contextFitsModel", () => {
 		// Leaving the failed turn out still counts the earlier reply Claude would be sent.
 		expect(maintenance(live, { sessionManager }).contextFitsModel(claude, failed)).toBe(false);
 	});
+
+	// A tool call's arguments are any JSON and a transcript line holds them as deep as `JSON.parse` reads; the rebuilt
+	// history holds the failed turn as a copy (a resume, secret deobfuscation), matched by what it holds.
+	it("drops a failed turn whose arguments nest 50,000 levels from a candidate's rebuilt history by what it holds", () => {
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage({ role: "user", content: "Question?", timestamp: 0 });
+		const keptId = sessionManager.appendMessage(codexTurn("Compacted answer.", 1));
+		const compactionItem = { type: "compaction", encrypted_content: "native-state" };
+		sessionManager.appendCompaction("Remote compaction placeholder", undefined, keptId, 100, {
+			preserveData: {
+				openaiRemoteCompaction: { provider: active.provider, replacementHistory: [compactionItem], compactionItem },
+			},
+		});
+		sessionManager.appendMessage({ role: "user", content: "After compaction.", timestamp: 2 });
+		let deep: Record<string, unknown> = { leaf: "bottom" };
+		for (let level = 0; level < 50_000; level++) deep = { next: deep };
+		const failed: AssistantMessage = {
+			...codexTurn("", 5),
+			content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: deep }],
+			providerPayload: undefined,
+			usage: {
+				input: 0,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+		};
+		sessionManager.appendMessage(failed);
+		sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "inspect",
+			content: [{ type: "text", text: "ok" }],
+			isError: false,
+			timestamp: 6,
+		});
+		const liveFailed = cloneJsonTree(failed);
+		const live = sessionManager
+			.buildSessionContext({ model: active })
+			.messages.map(m => (m === failed ? liveFailed : m));
+		const claude = { ...getBundledModel("anthropic", "claude-sonnet-4-5"), contextWindow: 2_000 };
+
+		// The failed turn's 400,000 bytes of arguments overflow Claude's window; without it the history fits.
+		expect(maintenance(live, { sessionManager }).contextFitsModel(claude)).toBe(false);
+		expect(maintenance(live, { sessionManager }).contextFitsModel(claude, liveFailed)).toBe(true);
+	}, 30_000);
 });

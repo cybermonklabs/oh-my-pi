@@ -12,7 +12,7 @@ import { type CreateAgentSessionOptions, createAgentSession } from "@oh-my-pi/pi
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { createSubagentSettings } from "@oh-my-pi/pi-coding-agent/task/subagent-settings";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 import { cfgDisabledProviders } from "@oh-my-pi/pi-coding-agent/config/model-settings";

@@ -903,3 +903,30 @@ describe("syncMessages detects tool_calls mutation", () => {
 		expect(rebuiltTc.function.arguments).toBe('{"path":"/b"}');
 	});
 });
+
+// A tool call's arguments are any JSON and a resumed session holds them as deep as a transcript line does; each
+// request digests every synced message.
+describe("syncMessages over a tool call nested 50,000 levels", () => {
+	it("keeps a stable message stable and sees a change at its bottom", () => {
+		const call = (leaf: string) => {
+			let deep: Record<string, unknown> = { leaf };
+			for (let level = 0; level < 50_000; level++) deep = { next: deep };
+			return { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: deep }] };
+		};
+		const mgr = new AppendOnlyContextManager();
+		mgr.build(makeContext(), BUILD_OPTS);
+		const first = call("a");
+		mgr.syncMessages([{ role: "user", content: "q1" }, first, { role: "user", content: "q2" }]);
+
+		// The same messages again: nothing diverged, so the log keeps all three.
+		mgr.syncMessages([{ role: "user", content: "q1" }, first, { role: "user", content: "q2" }]);
+		expect(mgr.log.length).toBe(3);
+		// The middle message rewritten at its bottom: the log keeps only the prefix before it, then re-syncs.
+		mgr.syncMessages([{ role: "user", content: "q1" }, call("b"), { role: "user", content: "q2" }]);
+		const synced = mgr.log.toMessages() as unknown as Array<{ content: unknown }>;
+		expect(synced).toHaveLength(3);
+		let node: unknown = (synced[1]!.content as Array<{ arguments: unknown }>)[0]!.arguments;
+		while (typeof node === "object" && node !== null && "next" in node) node = node.next;
+		expect(node).toEqual({ leaf: "b" });
+	}, 30_000);
+});

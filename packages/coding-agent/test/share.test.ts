@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
+import type { AssistantMessage, TextContent, ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import type { SessionData } from "../src/export/html";
@@ -11,8 +12,16 @@ import {
 	shareSession,
 } from "../src/export/share";
 import { SecretObfuscator } from "../src/secrets/obfuscator";
-import type { SessionEntry, SessionHeader, SessionInitEntry } from "../src/session/session-entries";
+import { isColdEntry } from "../src/session/cold-entries";
+import { TOOL_EXECUTION_START_CUSTOM_TYPE } from "../src/session/exit-diagnostics";
+import {
+	CURRENT_SESSION_VERSION,
+	type SessionEntry,
+	type SessionHeader,
+	type SessionInitEntry,
+} from "../src/session/session-entries";
 import { SessionManager } from "../src/session/session-manager";
+import { FileSessionStorage } from "../src/session/session-storage";
 import { SqlSessionStorage } from "../src/session/sql-session-storage";
 import type { SubagentSpawnSpec } from "../src/task/spawn-spec";
 
@@ -57,6 +66,27 @@ function sessionData(entries: SessionEntry[], leafId: string): SessionData {
 /** Incompressible filler so gzip cannot absorb the payload. */
 function randomHex(words: number): string {
 	return Array.from(crypto.getRandomValues(new Uint32Array(words)), v => v.toString(16)).join("");
+}
+
+/** Levels past what a recursive walk reaches (about 22,000) and `JSON.stringify` (40,000); `JSON.parse` reads 400,000. */
+const DEEP_LEVELS = 50_000;
+
+/** `{ next: … }` nested {@link DEEP_LEVELS} levels around `bottom`. */
+function nested(bottom: Record<string, unknown>): Record<string, unknown> {
+	let node = bottom;
+	for (let level = 0; level < DEEP_LEVELS; level++) node = { next: node };
+	return node;
+}
+
+/** How many `next` levels `value` nests, and the object at the bottom. */
+function nesting(value: unknown): { levels: number; bottom: Record<string, unknown> } {
+	let levels = 0;
+	let node = value as Record<string, unknown>;
+	while (node.next !== undefined) {
+		node = node.next as Record<string, unknown>;
+		levels++;
+	}
+	return { levels, bottom: node };
 }
 
 describe("sealToFit", () => {
@@ -112,6 +142,52 @@ describe("sealToFit", () => {
 		expect(flat).toContain("[image omitted from share]");
 		expect(flat).toContain("see screenshot");
 	});
+
+	// JSON.stringify gives out at 40,000 levels and structuredClone with it; a recursive trim at about 22,800.
+	test("trims a snapshot holding a tool result nested deeper than JSON.stringify recurses, and keeps the source whole", async () => {
+		const key = await makeKey();
+		const image = randomHex(2_000);
+		const text = randomHex(10_000);
+		const entry = {
+			type: "message",
+			id: "r1",
+			parentId: null,
+			timestamp: "2026-06-12T00:00:00.000Z",
+			message: {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "inspect",
+				content: [
+					{ type: "text", text },
+					{ type: "image", data: image, mimeType: "image/png" },
+				],
+				details: nested({ leaf: "bottom" }),
+				isError: false,
+				timestamp: 1,
+			},
+		} as unknown as SessionEntry;
+		const data = sessionData([entry], "r1");
+
+		const { sealed, truncated } = await sealToFit(key, data, TEST_MAX_SEALED_BYTES);
+
+		expect(truncated).toBe(true);
+		expect(sealed.byteLength).toBeLessThanOrEqual(TEST_MAX_SEALED_BYTES);
+		const opened = (await open(key, sealed)).entries[0] as Extract<SessionEntry, { type: "message" }>;
+		const message = opened.message as ToolResultMessage;
+		const trimmed = (message.content[0] as TextContent).text;
+		expect(trimmed.startsWith(text.slice(0, 512))).toBe(true);
+		expect(trimmed.endsWith("\n…[truncated for share]")).toBe(true);
+		expect(trimmed.length).toBeLessThan(text.length);
+		expect(message.content[1]).toEqual({ type: "text", text: "[image omitted from share]" });
+		expect(nesting(message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+		// The trim works on its own copy: the session's entry keeps its text, its image and its details.
+		const source = (entry as Extract<SessionEntry, { type: "message" }>).message as ToolResultMessage;
+		expect(source.content).toEqual([
+			{ type: "text", text },
+			{ type: "image", data: image, mimeType: "image/png" },
+		]);
+		expect(nesting(source.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+	}, 20_000);
 });
 
 describe("buildShareSnapshot", () => {
@@ -715,6 +791,38 @@ describe("buildShareSnapshot", () => {
 		expect(flat).not.toContain(regexSecret);
 		expect(flat).not.toContain(`${friendlyName}_`);
 	});
+
+	test("redacts a regex secret at the bottom of tool arguments nested deeper than a recursive walk reaches", () => {
+		const regexSecret = "tok_abc123";
+		const entries: SessionEntry[] = [
+			{
+				type: "message",
+				id: "a1",
+				parentId: null,
+				timestamp: "2026-06-12T00:00:00.000Z",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: nested({ leaf: regexSecret }) }],
+					timestamp: 1,
+				},
+			} as unknown as SessionEntry,
+		];
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => entries,
+			getLeafId: () => "a1",
+		} as unknown as SessionManager;
+		const obfuscator = new SecretObfuscator([{ type: "regex", content: "tok_[a-z0-9]+" }]);
+
+		const snapshot = buildShareSnapshot(sm, { obfuscator });
+
+		const message = snapshot.entries[0] as Extract<SessionEntry, { type: "message" }>;
+		const call = (message.message as AssistantMessage).content[0] as ToolCall;
+		const { levels, bottom } = nesting(call.arguments);
+		expect(levels).toBe(DEEP_LEVELS);
+		expect(bottom).toEqual({ leaf: obfuscator.obfuscate(regexSecret) });
+		expect(bottom.leaf).not.toContain(regexSecret);
+	});
 });
 
 describe("normalizeShareServerUrl", () => {
@@ -819,6 +927,58 @@ describe("shareSession", () => {
 			server.stop(true);
 		}
 	});
+
+	test("uploads a session holding a tool result nested deeper than JSON.stringify recurses", async () => {
+		const deep = {
+			type: "message",
+			id: "r1",
+			parentId: "e1",
+			timestamp: "2026-06-12T00:00:00.000Z",
+			message: {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "inspect",
+				content: [{ type: "text", text: "inspected" }],
+				details: nested({ leaf: "bottom" }),
+				isError: false,
+				timestamp: 1,
+			},
+		} as unknown as SessionEntry;
+		const entries = [messageEntry("e1", null, "share me"), deep];
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => entries,
+			getLeafId: () => "r1",
+		} as unknown as SessionManager;
+		let uploaded: Uint8Array<ArrayBuffer> | undefined;
+		const server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				uploaded = new Uint8Array(await req.arrayBuffer());
+				return Response.json({ id: "deepshareid01" });
+			},
+		});
+		try {
+			const result = await shareSession(sm, { serverUrl: `http://localhost:${server.port}` });
+
+			expect(result.truncated).toBe(false);
+			if (!uploaded) throw new Error("Share server received no upload");
+			const key = await crypto.subtle.importKey(
+				"raw",
+				Buffer.from(result.url.split("#")[1], "base64url"),
+				"AES-GCM",
+				false,
+				["decrypt"],
+			);
+			const opened = await open(key, uploaded);
+			expect(opened.entries[0]).toEqual(entries[0]);
+			const message = (opened.entries[1] as Extract<SessionEntry, { type: "message" }>).message as ToolResultMessage;
+			expect(message.content).toEqual([{ type: "text", text: "inspected" }]);
+			expect(nesting(message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+		} finally {
+			server.stop(true);
+		}
+	}, 20_000);
 });
 
 describe("share command", () => {
@@ -908,4 +1068,156 @@ describe("share command", () => {
 			server.stop(true);
 		}
 	}, 30_000);
+});
+
+describe("buildShareSnapshot over cold entries", () => {
+	/** Tool start markers before the cut of a compaction, so a session opened with its cold store holds them cold. */
+	async function writeSessionWithColdMarkers(dir: string, secret: string): Promise<string> {
+		const timestamp = "2026-06-12T00:00:00.000Z";
+		const file = path.join(dir, "session.jsonl");
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "cold",
+			timestamp,
+			cwd: dir,
+		};
+		const ids = ["x1", "x2", "x3", "u1", "c1"];
+		const entries = ids.map((id, index) => {
+			const parentId = index === 0 ? null : ids[index - 1]!;
+			if (id === "u1") return messageEntry(id, parentId, "the token is in the markers");
+			if (id === "c1") {
+				return {
+					type: "compaction",
+					id,
+					parentId,
+					timestamp,
+					summary: "done",
+					firstKeptEntryId: "u1",
+					tokensBefore: 10,
+				};
+			}
+			return {
+				type: "custom",
+				id,
+				parentId,
+				timestamp,
+				customType: TOOL_EXECUTION_START_CUSTOM_TYPE,
+				data: {
+					toolCallId: `call_${id}`,
+					toolName: "bash",
+					args: { command: `echo ${secret} ${"x".repeat(512)}` },
+				},
+			};
+		});
+		await Bun.write(file, [header, ...entries].map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		return file;
+	}
+
+	function openSession(file: string, coldStore: boolean): Promise<SessionManager> {
+		return SessionManager.open(file, undefined, new FileSessionStorage(), { suppressBreadcrumb: true, coldStore });
+	}
+
+	// Regression: a share with secrets masked reads back from the cold store, and resolves, the record of
+	// every cold extension entry only to drop its `data`, which costs a read and parse per entry on each share.
+	test("drops a cold custom entry's data without reading its record, and shares what a whole entry gives", async () => {
+		using dir = TempDir.createSync("@omp-share-cold-");
+		const secret = "hunter2-XYZZY";
+		const file = await writeSessionWithColdMarkers(dir.path(), secret);
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const cold = await openSession(file, true);
+		const whole = await openSession(file, false);
+		try {
+			const markers = cold.getEntries().filter(entry => entry.type === "custom");
+			expect(markers.map(entry => isColdEntry(entry))).toEqual([true, true, true]);
+			const readsBefore = cold.coldStoreStats().materializations;
+
+			const snapshot = buildShareSnapshot(cold, { obfuscator });
+
+			expect(cold.coldStoreStats().materializations).toBe(readsBefore);
+			expect(JSON.stringify(snapshot)).toBe(JSON.stringify(buildShareSnapshot(whole, { obfuscator })));
+			expect(JSON.stringify(snapshot)).not.toContain(secret);
+		} finally {
+			await cold.close();
+			await whole.close();
+		}
+	});
+
+	// Regression: a share with secrets masked reads back from the cold store, and resolves, the record of
+	// every older compaction, branch summary and custom message whose kept text is short, only to drop
+	// its details or preserved data, which costs a read and parse per entry on each share.
+	test("drops the details of cold summaries and custom messages without reading their records", async () => {
+		using dir = TempDir.createSync("@omp-share-cold-");
+		const secret = "hunter2-XYZZY";
+		const timestamp = "2026-06-12T00:00:00.000Z";
+		const dropped = { notes: [`${secret} ${"x".repeat(2048)}`] };
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "cold",
+			timestamp,
+			cwd: dir.path(),
+		};
+		// Only the three kinds lie before the cut: a cold message's content is read back whatever its size.
+		const entries = [
+			{
+				type: "custom_message",
+				id: "m0",
+				parentId: null,
+				timestamp,
+				customType: "note",
+				content: "short",
+				display: true,
+				details: dropped,
+			},
+			{
+				type: "branch_summary",
+				id: "b0",
+				parentId: "m0",
+				timestamp,
+				fromId: "m0",
+				summary: "left",
+				details: dropped,
+			},
+			{
+				type: "compaction",
+				id: "c0",
+				parentId: "b0",
+				timestamp,
+				summary: "done",
+				firstKeptEntryId: "b0",
+				tokensBefore: 10,
+				details: dropped,
+				preserveData: dropped,
+			},
+			messageEntry("u1", "c0", "the token is in the details"),
+			{
+				type: "compaction",
+				id: "c1",
+				parentId: "u1",
+				timestamp,
+				summary: "done",
+				firstKeptEntryId: "u1",
+				tokensBefore: 10,
+			},
+		];
+		const file = path.join(dir.path(), "session.jsonl");
+		await Bun.write(file, [header, ...entries].map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const cold = await openSession(file, true);
+		const whole = await openSession(file, false);
+		try {
+			expect(["c0", "b0", "m0"].map(id => isColdEntry(cold.getEntry(id)!))).toEqual([true, true, true]);
+			const readsBefore = cold.coldStoreStats().materializations;
+
+			const snapshot = buildShareSnapshot(cold, { obfuscator });
+
+			expect(cold.coldStoreStats().materializations).toBe(readsBefore);
+			expect(JSON.stringify(snapshot)).toBe(JSON.stringify(buildShareSnapshot(whole, { obfuscator })));
+			expect(JSON.stringify(snapshot)).not.toContain(secret);
+		} finally {
+			await cold.close();
+			await whole.close();
+		}
+	});
 });

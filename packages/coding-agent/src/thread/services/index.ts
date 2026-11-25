@@ -17,8 +17,11 @@ import { runtimeThreadService } from "./runtime";
 import { runtimeIdentityThreadService } from "./runtime-identity";
 import { settingsThreadService } from "./settings";
 import { telemetryThreadService } from "./telemetry";
+import { textFormatThreadService } from "./text-format";
 
 export const THREAD_SERVICES: readonly ThreadService[] = [
+	// First, so a worker's YAML, TOML, JSONC, JSON5 and XML parses go to main from the first service hook on.
+	textFormatThreadService,
 	identityThreadService,
 	// Early, so a worker's `logger.flush()` waits for main from the first service boot on.
 	loggerThreadService,

@@ -309,19 +309,20 @@ describe("a session the store refused is sent again once another session's write
 		const file = child.getSessionFile() as string;
 		disk.full = false;
 
-		// A held send's first step reads its stored file: note each read of the child's file, inside a
-		// landing write or after it. All file stores share one queue, and sessions other test files left in
+		// A held send's first step reads its stored file, in parts: note each read of the child's file, inside
+		// a landing write or after it. All file stores share one queue, and sessions other test files left in
 		// it can come before this child, so writes land until the child's send has started.
 		let landing = false;
 		const inside: string[] = [];
 		const after: string[] = [];
-		const readText = FileSessionStorage.prototype.readText;
-		vi.spyOn(FileSessionStorage.prototype, "readText").mockImplementation(function (
+		const readChunks = FileSessionStorage.prototype.readChunks;
+		vi.spyOn(FileSessionStorage.prototype, "readChunks").mockImplementation(function (
 			this: FileSessionStorage,
 			fpath: string,
+			fromByte?: number,
 		) {
 			if (fpath === file) (landing ? inside : after).push(fpath);
-			return readText.call(this, fpath);
+			return readChunks.call(this, fpath, fromByte);
 		});
 		const parent = SessionManager.create(dir.path(), dir.join("main"));
 		for (let landed = 0; landed < 200 && inside.length + after.length === 0; landed++) {
@@ -500,16 +501,22 @@ describe("a held send never replaces a file another writer changed", () => {
 		fs.writeFileSync(file, theirs);
 		let unreadable = true;
 		const reads: string[] = [];
-		const readText = FileSessionStorage.prototype.readText;
-		vi.spyOn(FileSessionStorage.prototype, "readText").mockImplementation(function (
+		const readChunks = FileSessionStorage.prototype.readChunks;
+		vi.spyOn(FileSessionStorage.prototype, "readChunks").mockImplementation(function (
 			this: FileSessionStorage,
 			fpath: string,
+			fromByte?: number,
 		) {
 			if (fpath === file) {
 				reads.push(fpath);
-				if (unreadable) return Promise.reject(fsError("EIO", "EIO: i/o error, read"));
+				if (unreadable)
+					return {
+						[Symbol.asyncIterator]: () => ({
+							next: () => Promise.reject(fsError("EIO", "EIO: i/o error, read")),
+						}),
+					};
 			}
-			return readText.call(this, fpath);
+			return readChunks.call(this, fpath, fromByte);
 		});
 
 		disk.full = false;

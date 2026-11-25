@@ -28,6 +28,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { getConfigRootDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { paddedTranscript, raceAfterFirstChunk, STILL } from "../session/chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb } from "../session/sql-session-lease-fixture";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const originalXdgStateHome = process.env.XDG_STATE_HOME;
@@ -167,4 +169,46 @@ describe("debug report bundle over the session storage", () => {
 			expect(goneExists).toBe(false);
 		},
 	);
+
+	for (const { adapter, url } of LEASE_BACKENDS) {
+		it.skipIf(!url)(
+			`bundles one body of a subagent transcript another store rewrites after the first chunk (${adapter})`,
+			async () => {
+				// If this regresses, a debug report of a SQL session whose subagent transcript another process
+				// is rewriting silently leaves that transcript out of the bundle.
+				const root = await reportRoot();
+				await using db = await openLeaseDb(adapter, url ?? "");
+				const sessionFile = path.join(root, "sessions", "project", "2026-11-02T00-00-00_CURRENT.jsonl");
+				const subagent = path.join(sessionFile.slice(0, -6), "SubTask.jsonl");
+				const before = paddedTranscript("SubTask", "work", "a", 3);
+				const after = paddedTranscript("SubTask", "work", "b", 3);
+				const holder = await db.open({ lease: STILL });
+				await holder.writeText(sessionFile, '{"type":"session","id":"CURRENT"}\n');
+				await holder.writeLinesAtomic(subagent, before);
+				await holder.drain();
+				const reader = await db.open({ lease: STILL });
+				const race = raceAfterFirstChunk(reader, subagent, async () => {
+					await holder.writeLinesAtomic(subagent, after, { expectedSize: holder.statSync(subagent).size });
+					await holder.drain();
+				});
+
+				const result = await createReportBundle({ sessionFile, storage: reader });
+				const texts = await archiveTexts(result.path);
+				await fs.rm(result.path, { force: true });
+
+				const bundled = texts.get("artifacts/SubTask.jsonl");
+				const outcome =
+					bundled === undefined
+						? "left out"
+						: bundled === before.join("")
+							? "old body"
+							: bundled === after.join("")
+								? "new body"
+								: "a mix";
+				expect(race.ran).toBe(true);
+				expect(["old body", "new body"]).toContain(outcome);
+			},
+			120_000,
+		);
+	}
 });

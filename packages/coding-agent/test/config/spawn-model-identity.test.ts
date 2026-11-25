@@ -14,7 +14,7 @@ import {
 	resolveSpawnModelIdentity,
 } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { RevivedModels } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { RevivedModels } from "@oh-my-pi/pi-coding-agent/task/subagent-revive";
 
 const models: Model<Api>[] = [
 	buildModel({

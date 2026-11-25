@@ -16,6 +16,8 @@ export type FixtureMainApi = {
 	echoToken: RpcMethod<[unknown], unknown>;
 	echo: RpcMethod<[unknown], unknown>;
 	callBack: RpcMethod<[(value: number) => number], number>;
+	/** Blocks main for `ms`, then answers. */
+	stall: RpcMethod<[ms: number], number>;
 };
 
 /** Methods the fixture worker serves. */
@@ -31,6 +33,8 @@ export type FixtureWorkerApi = {
 	hang: RpcMethod<[], never>;
 	bumpCounter: RpcMethod<[unknown], { value: number; sameOnMain: boolean }>;
 	returnArg: RpcMethod<[unknown], unknown>;
+	/** Sync-calls main's `stall(stallMs)` with a deadline of `timeoutMs`. */
+	stallWithin: RpcMethod<[timeoutMs: number, stallMs: number], number>;
 };
 
 class RemoteCounter {
@@ -131,5 +135,6 @@ port.once("message", (init: { sync: MessagePort; counter: SharedArrayBuffer }) =
 		return { value, sameOnMain };
 	});
 	link.handle("returnArg", value => value);
+	link.handle("stallWithin", (timeoutMs, stallMs) => link.callSyncWithin(timeoutMs, "stall", stallMs));
 	port.postMessage({ ready: true });
 });

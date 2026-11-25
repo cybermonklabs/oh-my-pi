@@ -16,7 +16,7 @@ import {
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
-import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import type { SessionEntry, UsageStatistics } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { parseSessionContent } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SESSION_TAIL_APPEND_CHUNK_BYTES, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
@@ -453,22 +453,26 @@ describe("SessionManager + indexed backend durability", () => {
 		await manager.close();
 	});
 
-	// A maintenance rewrite holds the fence while its publish is on the wire, so
-	// an append made then is persisted only by a synchronous full rewrite. When
-	// that rewrite fails, its successor (parented to it) must not reach the
-	// backend as a bare append: a reload would find a record whose parent is gone.
+	// A maintenance rewrite holds the fence while its publish is on the wire.
+	// On a store that publishes later its body is already in the store's index,
+	// so an entry recorded then waits and follows the rewrite as one append once
+	// it lands. When that append fails, the entry's successor (parented to it)
+	// must not reach the backend as a bare append: a reload would find a record
+	// whose parent is gone. When nothing fails, nothing is reported: the store
+	// held the rewrite's own body, not another writer's.
 	it.each([
-		{ failure: "the backend rejects its deferred publish", rewritesContent: false, failWrites: 1 },
+		{ when: "the append that follows the rewrite is refused", rewritesContent: false, failAppends: 1, reports: true },
 		{
 			// Tool-output pruning changes a durable turn's length in place, so the held
 			// publish moves the optimistic index past the last confirmed size.
-			failure: "its size check meets the held rewrite's optimistic index",
+			when: "the held rewrite moved the store's index past the last confirmed size",
 			rewritesContent: true,
-			failWrites: 0,
+			failAppends: 0,
+			reports: false,
 		},
 	])(
-		"never lands a successor of a fenced append whose rewrite failed when $failure",
-		async ({ rewritesContent, failWrites }) => {
+		"never lands a successor of an entry recorded during a held rewrite without that entry when $when",
+		async ({ rewritesContent, failAppends, reports }) => {
 			const { backend, storage, manager } = await makeManager();
 			const sessionFile = manager.getSessionFile();
 			if (!sessionFile) throw new Error("expected a session file");
@@ -492,7 +496,7 @@ describe("SessionManager + indexed backend durability", () => {
 			backend.holdNextWrite = hold;
 			const rewritePublished = manager.rewriteEntries();
 			await backend.writeHeld.promise;
-			backend.failWrites = failWrites;
+			backend.failAppends = failAppends;
 			manager.appendMessage({ role: "user", content: "fenced append", timestamp: Date.now() });
 			manager.appendMessage({ role: "user", content: "after fenced append", timestamp: Date.now() });
 			hold.resolve();
@@ -504,8 +508,12 @@ describe("SessionManager + indexed backend durability", () => {
 			await storage.drain().catch(() => {});
 			await manager.close().catch(() => {});
 
-			expect(orphanedRecords(backend.files.get(sessionFile) ?? "")).toEqual([]);
-			expect(errors.length).toBeGreaterThan(0);
+			const body = backend.files.get(sessionFile) ?? "";
+			expect({
+				orphaned: orphanedRecords(body),
+				stored: ["fenced append", "after fenced append", "next turn"].map(text => body.includes(text)),
+				reported: errors.length > 0,
+			}).toEqual({ orphaned: [], stored: [true, true, true], reported: reports });
 		},
 	);
 
@@ -826,8 +834,20 @@ describe("an indexed durably discarded entry", () => {
 		return { ...session, discardedId };
 	}
 
-	async function expectDiscardSurvivesRestart(backend: FakeBackend, sessionFile: string, discardedId: string) {
-		const branch = (await reopenIndexed(backend, sessionFile)).getBranch();
+	/**
+	 * What a restart reads after the discard: a branch without the discarded
+	 * turn that keeps its service tier and every later turn, and totals that
+	 * still count the discarded turn's billed usage, because the turn stays in
+	 * the journal off the branch.
+	 */
+	async function expectDiscardSurvivesRestart(
+		backend: FakeBackend,
+		sessionFile: string,
+		discardedId: string,
+		usageBeforeDiscard: UsageStatistics,
+	) {
+		const reopened = await reopenIndexed(backend, sessionFile);
+		const branch = reopened.getBranch();
 		expect(branch.some(entry => entry.id === discardedId)).toBe(false);
 		expect(branch.flatMap(entry => (entry.type === "service_tier_change" ? [entry.serviceTier] : []))).toContainEqual(
 			{
@@ -835,22 +855,28 @@ describe("an indexed durably discarded entry", () => {
 			},
 		);
 		expect(userTurnsOf(branch)).toEqual(["before", "after", "after2"]);
+		expect(reopened.getEntries().some(entry => entry.id === discardedId)).toBe(true);
+		expect(reopened.getUsageStatistics()).toEqual(usageBeforeDiscard);
 	}
 
-	it("stays discarded after its publish failed once and the backend healed", async () => {
+	it("is appended alone, so it survives a restart while every whole-journal publish fails", async () => {
 		const { backend, storage, manager, sessionFile, discardedId } = await sessionWithDiscardableTurn();
-		backend.failWrites = 1;
-		await manager.discardEntryDurably(discardedId).catch(() => {});
+		const usageBeforeDiscard = manager.getUsageStatistics();
+		backend.failWrites = Number.POSITIVE_INFINITY;
+		const fullWritesBefore = backend.fullWriteCalls;
+		await expect(manager.discardEntryDurably(discardedId)).resolves.toBeUndefined();
 		await settle(manager, storage);
+		expect(backend.fullWriteCalls).toBe(fullWritesBefore);
 		manager.appendMessage({ role: "user", content: "after", timestamp: Date.now() });
 		manager.appendMessage({ role: "user", content: "after2", timestamp: Date.now() });
 		await settle(manager, storage);
 
-		await expectDiscardSurvivesRestart(backend, sessionFile, discardedId);
+		await expectDiscardSurvivesRestart(backend, sessionFile, discardedId, usageBeforeDiscard);
 	});
 
 	it("stays discarded when queued behind a held publish and its own publish failed", async () => {
 		const { backend, storage, manager, sessionFile, discardedId } = await sessionWithDiscardableTurn();
+		const usageBeforeDiscard = manager.getUsageStatistics();
 		const hold = Promise.withResolvers<void>();
 		backend.holdNextWrite = hold;
 		const unrelated = manager.rewriteEntries();
@@ -865,7 +891,7 @@ describe("an indexed durably discarded entry", () => {
 		manager.appendMessage({ role: "user", content: "after2", timestamp: Date.now() });
 		await settle(manager, storage);
 
-		await expectDiscardSurvivesRestart(backend, sessionFile, discardedId);
+		await expectDiscardSurvivesRestart(backend, sessionFile, discardedId, usageBeforeDiscard);
 	});
 });
 

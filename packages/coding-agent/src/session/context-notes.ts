@@ -39,13 +39,28 @@ function isContextNotesData(data: unknown): data is ContextNotesEntry {
  * earlier valid notebook revision.
  */
 export function getContextNotes(entries: readonly SessionEntry[]): ContextNotesRevision | undefined {
+	const revision = contextNotesEntriesRead(entries).at(-1);
+	if (!revision || !isContextNotesData(revision.data)) return undefined;
+	return { text: revision.data.text, entryId: revision.id };
+}
+
+/**
+ * The notebook entries {@link getContextNotes} reads, newest first: each from
+ * the newest after the context-reset boundary back to the valid revision it
+ * returns. Every context build reads them, so they stay whole when older
+ * entries go to the cold store; the revisions older than these are read by
+ * nothing.
+ */
+export function contextNotesEntriesRead(entries: readonly SessionEntry[]): CustomEntry<unknown>[] {
+	const read: CustomEntry<unknown>[] = [];
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index];
-		if (entry.type === "reset_boundary") return undefined;
-		if (!isContextNotesEntry(entry) || !isContextNotesData(entry.data)) continue;
-		return { text: entry.data.text, entryId: entry.id };
+		if (entry.type === "reset_boundary") break;
+		if (!isContextNotesEntry(entry)) continue;
+		read.push(entry);
+		if (isContextNotesData(entry.data)) break;
 	}
-	return undefined;
+	return read;
 }
 
 /**

@@ -296,6 +296,41 @@ function setEnv(key: string, value: string | undefined): void {
 	}
 }
 
+/** Every run goes to a worker here (no concurrency needed); placement itself is covered in subagent-worker.test.ts. */
+function workerPool(entry?: URL): SubagentWorkerPool {
+	return new SubagentWorkerPool({
+		maxWorkers: () => 1,
+		idleMs: 600_000,
+		hostsOnMain: false,
+		worker: { initTimeoutMs: 60_000, entry },
+	});
+}
+
+/** Named in `test/fixtures/subagent-stall-hook.ts`, which listens on it in each worker. */
+const STALL_CHANNEL = "omp-test-subagent-stall";
+
+/** Replace the test's pool, before it spawned a worker, with one whose workers {@link stallWorkers} can stall. */
+function useStallableWorkers(): void {
+	pool.dispose();
+	pool = workerPool(new URL("../fixtures/subagent-stall-worker.ts", import.meta.url));
+	setSubagentWorkerPoolForTests(pool);
+}
+
+/** Block the one live worker's thread for `ms` (see the stall hook); resolves once it is blocked. */
+async function stallWorkers(ms: number): Promise<void> {
+	const channel = new BroadcastChannel(STALL_CHANNEL);
+	try {
+		const stalled = Promise.withResolvers<void>();
+		channel.onmessage = event => {
+			if (event.data === "stalled") stalled.resolve();
+		};
+		channel.postMessage(ms);
+		await stalled.promise;
+	} finally {
+		channel.close();
+	}
+}
+
 beforeEach(async () => {
 	savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
 	root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-executor-routing-"));
@@ -341,13 +376,7 @@ beforeEach(async () => {
 			status: String(Reflect.get(payload, "status")),
 		});
 	});
-	// Every run goes to a worker here (no concurrency needed); placement itself is covered in subagent-worker.test.ts.
-	pool = new SubagentWorkerPool({
-		maxWorkers: () => 1,
-		idleMs: 600_000,
-		hostsOnMain: false,
-		worker: { initTimeoutMs: 60_000 },
-	});
+	pool = workerPool();
 	setSubagentWorkerPoolForTests(pool);
 });
 
@@ -982,6 +1011,53 @@ describe("subagent runs routed into pooled workers", () => {
 			);
 			expect({ tookRoot: tookRoot.length, fellBack: fellBack.length }).toEqual({ tookRoot: 1, fellBack: 1 });
 			await waitFor(() => !woken.isStreaming && !woken.ircWakesPending);
+		},
+		TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"revives an agent whose worker just died only once the dead thread has let go of its transcript",
+		async () => {
+			useStallableWorkers();
+			const first = await runSubprocess(runOptions("Dying", "ping"));
+			expect(first.output).toBe("pong");
+			const ref = AgentRegistry.global().get("Dying");
+			const home = mirrorOf(ref?.session).home;
+			const sessionFile = ref?.sessionFile;
+			if (!sessionFile) throw new Error("no session file on the ref");
+			const worker = pool.forThread(home);
+			if (!worker) throw new Error("home worker missing");
+			const lifecycle = AgentLifecycleManager.global();
+			lifecycle.setPersistedSubagentReviverFactory(
+				createPersistedSubagentReviverFactory({
+					session: rootSession(),
+					authStorage,
+					modelRegistry,
+					settings,
+					enableLsp: false,
+					eventBus,
+				}),
+				() => 0,
+			);
+
+			// The worker's thread holds the transcript's ownership lease until it has stopped, after
+			// `terminate` returns: here a second later, as a thread busy in a native call stops. Its
+			// death parks the agent at once; a revive asked for then must wait for the thread, neither
+			// refusing the transcript as another process's live session nor moving it to another file.
+			await stallWorkers(1_000);
+			worker.terminate("worker crashed: boom");
+			expect(AgentRegistry.global().get("Dying")?.status).toBe("parked");
+			const revived = mirrorOf(await lifecycle.ensureLive("Dying"));
+			expect(revived.home).not.toBe(home);
+			expect(AgentRegistry.global().get("Dying")?.sessionFile).toBe(sessionFile);
+			const again = await runSubagentFollowUpTurn({
+				id: "Dying",
+				agent: AGENT,
+				message: "again",
+				structured: false,
+				storeMaskCwd: cwd,
+			});
+			expect(again.output).toBe("pong");
 		},
 		TEST_TIMEOUT_MS,
 	);

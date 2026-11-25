@@ -2,9 +2,11 @@ import { encodeAsar } from "./asar";
 import { gzipCompress } from "./codecs/gzip";
 import { zstdCompress } from "./codecs/zstd";
 import { memberContentToBytes } from "./open";
-import { encodeTar } from "./tar";
+import { encodeTar, type TarMemberPayload, writeTarFile } from "./tar";
 import type { ArchiveFormat, ArchiveMemberContent, WritableArchiveFormat } from "./types";
 import { encodeZip } from "./zip";
+
+const TEXT_ENCODER = new TextEncoder();
 
 const WRITABLE_FORMATS: Record<WritableArchiveFormat, true> = {
 	zip: true,
@@ -20,6 +22,18 @@ export function isWritableArchiveFormat(format: ArchiveFormat): format is Writab
 }
 
 /**
+ * `entries` as they are packed, one at a time: member names normalized to
+ * forward slashes, string members encoded as UTF-8, a `Blob` left unread.
+ */
+function* packedMembers(
+	entries: Iterable<readonly [string, ArchiveMemberContent]>,
+): Generator<readonly [string, TarMemberPayload]> {
+	for (const [name, content] of entries) {
+		yield [name.replace(/\\/g, "/"), typeof content === "string" ? TEXT_ENCODER.encode(content) : content];
+	}
+}
+
+/**
  * Serialize `entries` into an archive of `format` in memory. String members
  * are encoded as UTF-8; member names are normalized to forward slashes.
  */
@@ -28,8 +42,8 @@ export async function encodeArchive(
 	entries: Iterable<readonly [string, ArchiveMemberContent]>,
 ): Promise<Uint8Array> {
 	const members: (readonly [string, Uint8Array])[] = [];
-	for (const [name, content] of entries) {
-		members.push([name.replace(/\\/g, "/"), await memberContentToBytes(content)] as const);
+	for (const [name, payload] of packedMembers(entries)) {
+		members.push([name, await memberContentToBytes(payload)] as const);
 	}
 	switch (format) {
 		case "zip":
@@ -52,4 +66,20 @@ export async function writeArchive(
 	entries: Iterable<readonly [string, ArchiveMemberContent]>,
 ): Promise<void> {
 	await Bun.write(destPath, await encodeArchive(format, entries));
+}
+
+/**
+ * {@link writeArchive} for a plain tar, written member by member: the same
+ * bytes, but a `Blob` member (e.g. `Bun.file`) streams from its source, so the
+ * archive is never built in memory. Parent directories are auto-created.
+ * Unlike `writeArchive`, which builds the whole archive before it writes,
+ * this empties `destPath` first, so a failure leaves a truncated file there:
+ * write to a staging file and rename it over the target on success, as its
+ * one caller (`packSession`) does.
+ */
+export async function writeTarArchive(
+	destPath: string,
+	entries: Iterable<readonly [string, ArchiveMemberContent]>,
+): Promise<void> {
+	await writeTarFile(destPath, packedMembers(entries));
 }

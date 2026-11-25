@@ -24,6 +24,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SQL } from "bun";
 import {
+	cliDatabase,
 	type LeaseDb,
 	openLeaseDb,
 	reserveWrapped,
@@ -412,6 +413,16 @@ function urlAs(db: LeaseDb, role: string): string {
 	return url.toString();
 }
 
+/**
+ * The statements that make login `role` and make the test's own login a member of it, so the test may act as
+ * the role with SET ROLE and the clean-up may end the role's connections and drop what it owns: a login with
+ * CREATEROLE and no superuser holds only ADMIN OPTION on a role it makes (PostgreSQL 16 and later), and SET
+ * ROLE, pg_terminate_backend and DROP OWNED BY need membership in the role.
+ */
+function createLogin(role: string): string[] {
+	return [`CREATE ROLE ${role} LOGIN`, `GRANT ${role} TO CURRENT_USER`];
+}
+
 /** Session {@link ID}'s path in `db`'s directory. */
 function sessionPath(db: LeaseDb): string {
 	return `${db.dir.path()}/sessions/p/2026-11-17T00-00-00-000Z_${ID}.jsonl`;
@@ -468,7 +479,7 @@ async function noCreateLogin(without: readonly string[] = []): Promise<NoCreateL
 			table => !without.includes(table),
 		);
 		for (const statement of [
-			`CREATE ROLE ${agent} LOGIN`,
+			...createLogin(agent),
 			`GRANT CONNECT ON DATABASE ${database} TO ${agent}`,
 			`GRANT USAGE ON SCHEMA public TO ${agent}`,
 			`GRANT SELECT, INSERT, UPDATE, DELETE ON ${kept.join(", ")} TO ${agent}`,
@@ -715,12 +726,18 @@ describe.skipIf(!pgUrl)("SqlSessionStorage start-up on PostgreSQL", () => {
 
 describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects", () => {
 	it("never runs a function or an operator another login planted in public", async () => {
-		await using db = await openLeaseDb("postgres", pgUrl ?? "");
+		// A database of its own: `public.*(numeric,integer)`, `public.=(oid,regclass)`, `public.convert_to` and
+		// `public.substr` must be the very names the store's statements would meet, so no suffix can set them
+		// apart. In a database shared with other test workers, their own unqualified SQL (the lease fixture's
+		// `extract(epoch from clock_timestamp()) * 1000`, an `oid = regclass` compare) runs these objects and
+		// writes this case's log, and two workers planting them at once collide on the names.
+		await using scratch = await cliDatabase("postgres", pgUrl ?? "");
+		await using db = await openLeaseDb("postgres", scratch.dsn);
 		const attacker = `shadow_attacker_${process.pid}`;
 		const log = `public.shadow_log_${process.pid}`;
 		await db.sql(`CREATE TABLE ${log} (what TEXT)`);
 		await db.sql(`GRANT INSERT, SELECT ON ${log} TO PUBLIC`);
-		await db.sql(`CREATE ROLE ${attacker} LOGIN`);
+		for (const statement of createLogin(attacker)) await db.sql(statement);
 		await db.sql(`GRANT USAGE, CREATE ON SCHEMA public TO ${attacker}`);
 		const planter = new SQL(urlAs(db, attacker));
 		const record = (what: string) => `INSERT INTO ${log} VALUES ('${what}')`;
@@ -959,7 +976,7 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects
 			statements: (db, log) => [
 				plantedLogger(log),
 				`GRANT EXECUTE ON FUNCTION public.planted_logged_${process.pid}(text) TO PUBLIC`,
-				`CREATE ROLE ${planter}`,
+				...createLogin(planter),
 				`GRANT USAGE, CREATE ON SCHEMA public TO ${planter}`,
 				`GRANT REFERENCES ON ${db.table} TO ${planter}`,
 				`SET ROLE ${planter}; CREATE TABLE public.planted_fkref_${process.pid} (path text REFERENCES ${db.table} (path) ON DELETE CASCADE); CREATE FUNCTION public.planted_fkref_trg_${process.pid}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM public.planted_logged_${process.pid}('referencing table trigger'); RETURN OLD; END $$; CREATE TRIGGER planted BEFORE DELETE ON public.planted_fkref_${process.pid} FOR EACH ROW EXECUTE FUNCTION public.planted_fkref_trg_${process.pid}(); RESET ROLE`,
@@ -996,7 +1013,7 @@ describe.skipIf(!pgUrl)("SqlSessionStorage on PostgreSQL against planted objects
 				// The store made the tables as this login, which owns them, and plants as their owner.
 				await (await db.open()).drain();
 				for (const statement of plant.statements(db, log)) await db.sql(statement);
-				await db.sql(`CREATE ROLE ${storeRole} LOGIN`);
+				for (const statement of createLogin(storeRole)) await db.sql(statement);
 				await db.sql(`GRANT USAGE, CREATE ON SCHEMA public TO ${storeRole}`);
 				await db.sql(
 					`GRANT SELECT, INSERT, UPDATE, DELETE ON ${db.table}, ${db.table}_parts, ${db.table}_blobs, ${db.table}_refs, ${db.leaseTable} TO ${storeRole}`,

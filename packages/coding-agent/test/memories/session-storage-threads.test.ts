@@ -11,14 +11,19 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { buildStage1RolloutItems, collectThreads } from "@oh-my-pi/pi-coding-agent/memories";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { IndexedSessionStorage } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import {
 	defaultSessionStorage,
 	FileSessionStorage,
+	SessionReadConflictError,
 	type SessionStorage,
 	setDefaultSessionStorage,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { parseJsonlLenient, TempDir } from "@oh-my-pi/pi-utils";
+import { MemoryBackend } from "../helpers/memory-session-backend";
+import { raceAfterFirstChunk, STILL } from "../session/chunked-read-race";
+import { LEASE_BACKENDS, openLeaseDb } from "../session/sql-session-lease-fixture";
 
 const previous = defaultSessionStorage();
 const clients: SQL[] = [];
@@ -78,6 +83,16 @@ function messageLine(index: number, body: string): string {
 	return JSON.stringify({ type: "message", id: `m${index}`, message });
 }
 
+/** Sessions in a map, read only whole as an SDK backend without `readChunks` reads them. */
+class WholeReadBackend extends MemoryBackend {
+	override readSlices(): Promise<[string, string]> {
+		return Promise.reject(new Error("stage 1 reads no slices"));
+	}
+	override move(): Promise<void> {
+		return Promise.reject(new Error("stage 1 moves nothing"));
+	}
+}
+
 describe("memories over the session storage", () => {
 	it.each(backends)("collects the sibling sessions the %s storage holds", async (_name, open) => {
 		using tmp = TempDir.createSync("@omp-memories-storage-");
@@ -128,4 +143,69 @@ describe("memories over the session storage", () => {
 			expect(await buildStage1RolloutItems(rollout, limit, storage)).toBe(referenceItems(raw, limit));
 		}
 	});
+
+	it("reads a rollout whole once, not once per window, from an indexed backend without chunked reads", async () => {
+		const backend = new WholeReadBackend();
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+		const lines = ['{"type":"session","id":"s"}'];
+		let size = 0;
+		// Several 1 MiB windows from either end.
+		for (let i = 0; size < 5_000_000; i++) {
+			const line = messageLine(i, `${i}:${"é".repeat(20_000)}`);
+			lines.push(line);
+			size += line.length + 1;
+		}
+		const raw = `${lines.join("\n")}\n`;
+		const rollout = "/sessions/project/rollout.jsonl";
+		await storage.writeText(rollout, raw);
+
+		for (const limit of [100_000, 10_000_000]) {
+			backend.readFullPaths.length = 0;
+			expect(await buildStage1RolloutItems(rollout, limit, storage)).toBe(referenceItems(raw, limit));
+			expect({ limit, fullReads: backend.readFullPaths.length }).toEqual({ limit, fullReads: 1 });
+		}
+	});
 });
+
+for (const { adapter, url } of LEASE_BACKENDS) {
+	describe.skipIf(!url)(`memories over a SQL rollout another store rewrites (${adapter})`, () => {
+		it("builds one body's stage-1 input, or fails as a read conflict, when the rollout is rewritten after its head was read", async () => {
+			// If this regresses, a memory extracted from a SQL session another process rewrote meanwhile is
+			// built from the first turns of the old transcript and the last turns of the new one.
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const rollout = path.join(db.dir.path(), "sessions", "project", "rollout.jsonl");
+			// About 4 MB of turns of 20,000 characters: the head and the tail budget each fit in one 1 MiB window.
+			const body = (tag: string) =>
+				`${['{"type":"session","id":"s"}', ...Array.from({ length: 100 }, (_, i) => messageLine(i, `${tag}${i}:${"é".repeat(20_000)}`))].join("\n")}\n`;
+			const limit = 100_000;
+			const holder = await db.open({ lease: STILL });
+			await holder.writeText(rollout, body("a"));
+			const reader = await db.open({ lease: STILL });
+			const race = raceAfterFirstChunk(
+				reader,
+				rollout,
+				() => holder.writeText(rollout, body("b")),
+				// Past the head: the turns the input starts with are read by then.
+				1024 * 1024,
+			);
+
+			let outcome: string;
+			try {
+				const built = await buildStage1RolloutItems(rollout, limit, reader);
+				outcome =
+					built === referenceItems(body("a"), limit)
+						? "old body"
+						: built === referenceItems(body("b"), limit)
+							? "new body"
+							: "a mix";
+			} catch (err) {
+				if (!(err instanceof SessionReadConflictError)) throw err;
+				outcome = "read conflict";
+			}
+
+			expect(race.ran).toBe(true);
+			expect(["old body", "new body", "read conflict"]).toContain(outcome);
+		}, 120_000);
+	});
+}
