@@ -560,6 +560,10 @@ pub struct Kernel {
 	/// Which DEBUG/ERR/RETURN traps may be set: lets `exec::start_trap`
 	/// skip its checks before every command; not imaged.
 	pub pseudo_traps:       exec::PseudoTraps,
+	/// The jump the running op makes comes after bash's `top_level_cleanup`
+	/// ([`exec::jump_out`]); the arm that takes the op's flow reads and
+	/// clears it. Not imaged: set and read within one op.
+	pub top_level_cleanup:  bool,
 	/// Re-parsed `${ ;}` bodies ([`exec::NoforkUnits`]); not imaged.
 	pub nofork_units:       exec::NoforkUnits,
 	/// The functions each zsh word code digest (`.zwc`) holds, by path,
@@ -765,6 +769,7 @@ impl Kernel {
 			start_ns: 0,
 			startup: Vec::new(),
 			pseudo_traps: exec::PseudoTraps::default(),
+			top_level_cleanup: false,
 			nofork_units: HashMap::new(),
 			zsh_dumps: parking_lot::Mutex::new(HashMap::new()),
 			spare_tree: crate::bash::syntax::Tree::default(),
@@ -3702,14 +3707,13 @@ impl Vproc {
 			.set_command_loop(exec::fatal_reaches_command_loop(self));
 		// Started from a context where `set -e` is ignored (the parent's op
 		// is a condition, or its frame runs in one): so is the child.
-		frame.ignore_errexit = self.frames.last().is_some_and(|f| {
-			f.ignore_errexit
-				|| f
-					.unit
-					.as_ref()
-					.and_then(|u| u.ops.get(f.pc as usize))
-					.is_some_and(|op| op.flags & ir::Op::COND != 0)
-		});
+		frame.ignore_errexit = self.frames.last().is_some_and(exec::errexit_ignored);
+		// bash's fork keeps `parse_and_execute_level`: a child started
+		// inside an `eval`, `.` or trap action (or a child of one) runs
+		// inside that level.
+		if self.frames.iter().any(exec::parse_and_execute) {
+			frame.flags.set_parse_level(proc::ParseLevel::Kept);
+		}
 		// Room for exactly this frame: a `Frame` is ~300 bytes and a first
 		// push reserves four (idle vproc ≤ 2 KiB); calls grow it.
 		vp.frames.reserve_exact(1);

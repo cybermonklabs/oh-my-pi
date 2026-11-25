@@ -11,7 +11,7 @@ use crate::bash::{
 	ids::Vpid,
 	store::{Key, KeyBuf, MiscKey, OptId, Record},
 	vm::{
-		exec::push_script,
+		exec::{Jump, push_script},
 		locale,
 		probe::{absolute, candidates, dev_fd},
 		proc::{Probe, ProbeResult, ScriptKind},
@@ -106,13 +106,15 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			ctx.err(Diag::Usage { msg: format!("{}: is a directory", shown.as_bstr()).into() });
 			return done(1);
 		},
+		// bash's `file_error`: a `report_error` (`set -e` exits at once).
 		ProbeResult::Bytes(Err(msg)) => {
-			ctx.diag(Diag::Usage { msg: format!("{}: {}", file.as_bstr(), msg.as_bstr()).into() });
+			ctx.diag(Diag::FileError { path: file.clone(), msg });
 			ctx.usage_error = true;
 			return done(1);
 		},
 		_ => {
-			ctx.diag(Diag::NoSuchFile { name: file.clone() });
+			let msg = BString::from("No such file or directory");
+			ctx.diag(Diag::FileError { path: file.clone(), msg });
 			ctx.usage_error = true;
 			return done(1);
 		},
@@ -393,7 +395,7 @@ pub fn exit(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if let Some(outcome) = bash_logout(ctx, status)? {
 		return Ok(outcome);
 	}
-	Ok(Outcome { status, control: Control::Exit })
+	Ok(Outcome { status, control: Control::Exit(Jump::Exit) })
 }
 
 /// bash's `bash_logout`: `exit`/`logout` in a login shell (not a subshell)
@@ -443,7 +445,9 @@ pub fn break_(ctx: &mut Ctx<'_, '_>, args: &[BString], cont: bool) -> R {
 			ctx.err(Diag::Usage { msg: format!("{n}: loop count out of range").into() });
 			return Ok(Outcome { status: 1, control: Control::Break { n: u32::MAX, cont: false } });
 		},
-		Err(BadArg::NotNumeric) => return Ok(Outcome { status: 2, control: Control::Exit }),
+		Err(BadArg::NotNumeric) => {
+			return Ok(Outcome { status: 2, control: Control::Exit(Jump::Cleanup) });
+		},
 		Err(BadArg::TooMany) => return done(2),
 	};
 	Ok(Outcome { status: 0, control: Control::Break { n, cont } })
@@ -524,7 +528,7 @@ pub fn zsh_exit(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if let Some(o) = crate::bash::vm::zle::reader::logout_on_exit(ctx, status)? {
 		return Ok(o);
 	}
-	Ok(Outcome { status, control: Control::Exit })
+	Ok(Outcome { status, control: Control::Exit(Jump::Exit) })
 }
 
 /// `wait [-fn] [-p var] [id …]` (bash `wait.def`): wait for background

@@ -462,6 +462,11 @@ impl OwnTraps {
 			_ => Self { pseudo: self.pseudo | Self::bit(key), signals: self.signals },
 		}
 	}
+
+	/// The set without `key`, a pseudo-signal (a signal key is kept).
+	pub const fn without(self, key: crate::bash::store::TrapKey) -> Self {
+		Self { pseudo: self.pseudo & !Self::bit(key), signals: self.signals }
+	}
 }
 
 /// `getopts` progress between calls (bash's `sh_optind`, `sh_curopt` and
@@ -1098,6 +1103,23 @@ pub struct Run {
 	pub callout:           bool,
 }
 
+/// Where the base frame of a child sits in bash's `parse_and_execute` levels
+/// ([`FrameFlags::parse_level`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParseLevel {
+	/// Outside every level it starts: every frame but such a child's base.
+	#[default]
+	Outside,
+	/// A child forked inside an `eval`, `.` or trap action: bash's fork keeps
+	/// `parse_and_execute_level`, but the child's jumps go to its own top
+	/// (`execute_in_subshell`), which is no level of its own.
+	Kept,
+	/// A command or process substitution, whose text bash runs with
+	/// `parse_and_execute`: a level of its own (`command_substitute`,
+	/// `process_substitute`).
+	Substitution,
+}
+
 /// What kind of activation a frame is.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FrameKind {
@@ -1195,18 +1217,23 @@ pub enum ScriptKind {
 	Hook,
 	/// A trap action, restoring the interrupted status when it finishes.
 	Trap {
-		key:           crate::bash::store::TrapKey,
-		status:        i32,
-		cancel:        Option<i32>,
-		return_target: Option<usize>,
-		/// An ERR trap run by `set -e`: the shell exits with `status` when
-		/// the trap ends.
-		exit:          bool,
+		key:               crate::bash::store::TrapKey,
+		status:            i32,
+		cancel:            Option<i32>,
+		return_target:     Option<usize>,
+		/// An ERR trap run by `set -e`, or an EXIT trap `exit_shell`
+		/// started: the shell exits with `status` when the trap ends.
+		exit:              bool,
 		/// zsh: the `TRAPNAL` function this frame called ended by `return`
 		/// (zsh's `trapreturn`). Only such a non-zero status ends the
 		/// interrupted code; a function that falls off its end with one
 		/// does not.
-		returned:      bool,
+		returned:          bool,
+		/// An EXIT trap started after `set -e` left a function where bash's
+		/// `reset_local_contexts` ran first (the `-c` string's or an `eval`'s
+		/// `parse_and_execute`, a script's `reader_loop` outside posix
+		/// mode): its jumps see no function context until it calls one.
+		outside_functions: bool,
 	},
 	/// Shell code a builtin runs as zsh's `execode`/`execstring` do with
 	/// a context name (`zstyle -e` values, `zregexparse` guards and
@@ -1253,13 +1280,16 @@ impl FrameKind {
 }
 
 /// Bits of a [`Frame`] that only a vproc's base frame or a run's first frame
-/// sets, two in one byte ([`Frame::flags`]).
+/// sets, in one byte ([`Frame::flags`]): two flags and a [`ParseLevel`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameFlags(u8);
 
 impl FrameFlags {
 	const COMMAND_LOOP: u8 = 1;
 	const NO_DEBUG_TRAP: u8 = 2;
+	/// The two bits of [`Self::parse_level`].
+	const PARSE_LEVEL: u8 = 0b1100;
+	const PARSE_LEVEL_SHIFT: u32 = 2;
 
 	/// The base frame of a fork: a fatal error in it, run as a forked
 	/// simple command, reaches bash's command loop when its forking
@@ -1291,6 +1321,27 @@ impl FrameFlags {
 	/// Sets [`Self::no_debug_trap`].
 	pub const fn set_no_debug_trap(&mut self, on: bool) {
 		self.set(Self::NO_DEBUG_TRAP, on);
+	}
+
+	/// Where the base frame of a child sits in bash's `parse_and_execute`
+	/// levels; every other frame is outside them.
+	#[must_use]
+	pub const fn parse_level(self) -> ParseLevel {
+		match (self.0 & Self::PARSE_LEVEL) >> Self::PARSE_LEVEL_SHIFT {
+			0 => ParseLevel::Outside,
+			1 => ParseLevel::Kept,
+			_ => ParseLevel::Substitution,
+		}
+	}
+
+	/// Sets [`Self::parse_level`].
+	pub const fn set_parse_level(&mut self, level: ParseLevel) {
+		let bits: u8 = match level {
+			ParseLevel::Outside => 0,
+			ParseLevel::Kept => 1,
+			ParseLevel::Substitution => 2,
+		};
+		self.0 = (self.0 & !Self::PARSE_LEVEL) | (bits << Self::PARSE_LEVEL_SHIFT);
 	}
 
 	const fn set(&mut self, bit: u8, on: bool) {
@@ -1959,6 +2010,10 @@ pub struct ExecState {
 	/// Run through `command`: a special builtin's failure does not end a
 	/// posix shell.
 	pub via_command: bool,
+	/// The prefix the command's words start with, as bash's
+	/// `execute_simple_command` and `execute_builtin` read it: the outer
+	/// one, not the last (`command builtin export` is `command`'s).
+	pub prefix:      Prefix,
 	/// The awaited frame was pushed by the builtin, which runs again when
 	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).
 	pub resume:      bool,
@@ -1991,6 +2046,19 @@ pub struct VarFd {
 	pub prior: Option<crate::bash::store::Var>,
 }
 
+/// The prefix word a simple command starts with ([`ExecState::prefix`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Prefix {
+	/// No prefix: the command word itself.
+	#[default]
+	None,
+	/// `command` (bash's `CMD_COMMAND_BUILTIN`, every leading one).
+	Command,
+	/// `builtin`: bash runs `builtin_builtin`, which runs the builtin it
+	/// names.
+	Builtin,
+}
+
 /// Options of `exec [-cl] [-a name] command`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecAs {
@@ -2010,7 +2078,9 @@ pub enum Transfer {
 		n:    u32,
 		cont: bool,
 	},
-	Exit(i32),
+	/// The shell exits with this status by this jump (it decides what the
+	/// `time`s the jump leaves report).
+	Exit(i32, super::exec::Jump),
 	/// The rest of the line is abandoned with this status (a `-c` string
 	/// whole).
 	DiscardAll(i32),

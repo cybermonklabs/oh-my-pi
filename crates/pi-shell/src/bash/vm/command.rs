@@ -21,8 +21,8 @@ use super::{
 	probe::{self, Search, absolute, candidates},
 	proc::{
 		AssignValue, Awaited, BangStage, BusySpawn, DeferPhase, ExecAs, ExecState, Frame, FrameKind,
-		JobState, Live, PathSearch, PendingWrite, Probe, ProbeResult, Scratch, ScriptKind, Slot,
-		Stage, Target, Transfer, Vproc,
+		JobState, Live, PathSearch, PendingWrite, Prefix, Probe, ProbeResult, Scratch, ScriptKind,
+		Slot, Stage, Target, Transfer, Vproc,
 	},
 	state::{self, Level, Scope, Var, VarMap},
 	xtrace,
@@ -71,6 +71,7 @@ impl ExecState {
 			exec_as: None,
 			wait_into: None,
 			via_command: false,
+			prefix: Prefix::None,
 			resume: false,
 			resumed: 0,
 			raised: false,
@@ -104,6 +105,7 @@ impl ExecState {
 			exec_as,
 			wait_into,
 			via_command,
+			prefix,
 			resume,
 			resumed,
 			raised,
@@ -132,6 +134,7 @@ impl ExecState {
 		*exec_as = None;
 		*wait_into = None;
 		*via_command = false;
+		*prefix = Prefix::None;
 		*resume = false;
 		*resumed = 0;
 		*raised = false;
@@ -305,12 +308,14 @@ pub fn exec(
 							Ok(())
 								| Err(
 									super::redir::Halt::Failed
-										| super::redir::Halt::Flow(Flow::Exit(_) | Flow::Discard(_))
+										| super::redir::Halt::Flow(Flow::Exit(..) | Flow::Discard(_))
 								)
 						) {
 						let s = st(vp);
 						s.status = 0;
-						s.control = Some(Transfer::Exit(0));
+						// `sh_exit` in the fork: no jump, so no `time` reports.
+						k.top_level_cleanup = false;
+						s.control = Some(Transfer::Exit(0, exec::Jump::Direct));
 						s.stage = Stage::Finish;
 						if let Some(fd) = exec::flush_out(k, vp) {
 							return Flow::Block(WaitKey::Write { fd });
@@ -325,12 +330,22 @@ pub fn exec(
 						// command runs (a `!` included). The fork ends after its
 						// message is written to stderr as the redirections so far
 						// left it (`2>/dev/null < ${x:?}` prints none).
-						Err(super::redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
+						Err(super::redir::Halt::Flow(flow @ (Flow::Exit(..) | Flow::Discard(_))))
 							if entry =>
 						{
+							// The fork leaves by the jump the error made (#241): an
+							// exit's own kind, or a discard's, which follows
+							// `top_level_cleanup` when [`exec::jump_out`] recorded it.
+							let cleanup = std::mem::take(&mut k.top_level_cleanup);
+							let (code, jump) = match flow {
+								Flow::Exit(code, jump) => (code, jump),
+								Flow::Discard(code) if cleanup => (code, exec::Jump::Cleanup),
+								Flow::Discard(code) => (code, exec::Jump::Other),
+								_ => unreachable!("matched above"),
+							};
 							let s = st(vp);
 							s.status = code;
-							s.control = Some(Transfer::Exit(code));
+							s.control = Some(Transfer::Exit(code, jump));
 							s.stage = Stage::Finish;
 							if let Some(fd) = exec::flush_out(k, vp) {
 								return Flow::Block(WaitKey::Write { fd });
@@ -344,7 +359,7 @@ pub fn exec(
 						// status the fork exits with, as the shell itself would (127
 						// or 1; 1 after an arithmetic error; 1 for a null command,
 						// whose fork bash 5.3 gives a catcher of its own).
-						Err(super::redir::Halt::Flow(Flow::Exit(code) | Flow::Discard(code)))
+						Err(super::redir::Halt::Flow(Flow::Exit(code, _) | Flow::Discard(code)))
 							if if null {
 								null_forks
 							} else {
@@ -406,8 +421,9 @@ pub fn exec(
 							} else {
 								Stage::Finish
 							};
+							// bash's `ERREXIT` (execute_cmd.c:4872).
 							if fatal {
-								s.control = Some(Transfer::Exit(1));
+								s.control = Some(Transfer::Exit(1, exec::Jump::Errexit));
 							}
 							// The message goes to stderr as the redirections so far
 							// left it (`2>&1 >&bad`), before they are undone.
@@ -569,21 +585,45 @@ fn assignment_statement(
 			Err(stop) => return Some(exec::stop_flow(k, vp, cx, line, stop)),
 		};
 		if let Err(d) = assign_now(k, vp, cx, &a.name, None, a.append, AssignValue::Scalar(value)) {
-			k.diag(cx, vp, line, d);
-			// bash abandons the rest of the command line after a failed
-			// assignment statement; a posix shell exits.
-			if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
-				.unwrap_or(false)
-			{
-				return Some(Flow::Exit(1));
-			}
-			return Some(Flow::Discard(1));
+			return Some(assign_failed(k, vp, cx, line, d));
 		}
 	}
 	vp.status = 0;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(0);
 	Some(Flow::Next)
+}
+
+/// A failed assignment statement: bash reports it and abandons the rest of
+/// the command line; a posix shell exits ([`exec::jump_out`]: an
+/// arithmetic subscript error's jump comes after `top_level_cleanup`).
+/// Under `set -e` a readonly variable or a bad subscript exits at once
+/// ([`exec::report_error_exits`]).
+fn assign_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: Diag) -> Flow {
+	if exec::report_error_exits(k, cx, vp, &d) {
+		let status = exec::report_error_status(vp, &d);
+		k.diag(cx, vp, line, d);
+		return Flow::Exit(status, exec::Jump::Direct);
+	}
+	// An integer variable's value that is no valid arithmetic (`local -i n;
+	// n=1/0`): bash's `make_variable_value` runs `top_level_cleanup` and
+	// discards the command whatever the level, also in posix mode, where the
+	// assignment never comes back to exit (variables.c:2944). Its error is
+	// the only arithmetic one an assignment returns: one in the value's
+	// expansion stops before it, a subscript's is `ArithSubscript`.
+	let integer =
+		matches!(d, Diag::Arith { .. }) && vp.mode.dialect() != crate::bash::ids::Dialect::Zsh;
+	let cleanup = integer || exec::cleanup_jump(vp, &d);
+	k.diag(cx, vp, line, d);
+	let flow = if !integer
+		&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false)
+	{
+		Flow::Exit(1, exec::top_level_jump(cx, vp, cleanup))
+	} else {
+		Flow::Discard(1)
+	};
+	exec::jump_out(k, cx, vp, cleanup, &flow);
+	flow
 }
 
 /// A simple command of plain words (`[ "$i" -lt 9 ]`, `f "$x"`,
@@ -1063,11 +1103,17 @@ fn expand(
 			{
 				let mut shown = a.name.clone();
 				shown.extend_from_slice(b"[]");
-				k.diag(cx, vp, line, Diag::BadSubscript { shown });
+				let d = Diag::BadSubscript { shown };
+				if exec::report_error_exits(k, cx, vp, &d) {
+					let status = exec::report_error_status(vp, &d);
+					k.diag(cx, vp, line, d);
+					return Some(Flow::Exit(status, exec::Jump::Direct));
+				}
+				k.diag(cx, vp, line, d);
 				if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 					.unwrap_or(false)
 				{
-					return Some(Flow::Exit(1));
+					return Some(Flow::Exit(1, exec::Jump::Other));
 				}
 				return Some(Flow::Discard(1));
 			}
@@ -1157,8 +1203,16 @@ fn expand(
 			if readonly {
 				// bash reports it and runs the command without the
 				// assignment; in posix mode the command does not run, and a
-				// special builtin's assignment error ends the shell.
-				k.diag(cx, vp, line, Diag::Readonly { name: name.clone() });
+				// special builtin's assignment error ends the shell. Under
+				// `set -e` the message itself exits the shell
+				// ([`exec::report_error_exits`]).
+				let d = Diag::Readonly { name: name.clone() };
+				if exec::report_error_exits(k, cx, vp, &d) {
+					let status = exec::report_error_status(vp, &d);
+					k.diag(cx, vp, line, d);
+					return Some(Flow::Exit(status, exec::Jump::Direct));
+				}
+				k.diag(cx, vp, line, d);
 				// zsh: an error (`errflag`); the command does not run.
 				if unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 					return Some(Flow::Discard(1));
@@ -1167,7 +1221,7 @@ fn expand(
 					.unwrap_or(false)
 				{
 					if IntrinsicId::from_name(&st(vp).argv[0]).is_some_and(is_special) {
-						return Some(Flow::Exit(1));
+						return Some(Flow::Exit(1, exec::Jump::Other));
 					}
 					let s = st(vp);
 					s.status = 1;
@@ -1227,15 +1281,7 @@ fn expand(
 			if let Err(d) =
 				assign_now(k, vp, cx, &name, index.as_ref().map(|i| i.as_slice()), append, value)
 			{
-				k.diag(cx, vp, line, d);
-				// bash abandons the rest of the command line after a failed
-				// assignment statement; a posix shell exits.
-				if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
-					.unwrap_or(false)
-				{
-					return Some(Flow::Exit(1));
-				}
-				return Some(Flow::Discard(1));
+				return Some(assign_failed(k, vp, cx, line, d));
 			}
 			if k.mask.contains(crate::bash::event::EventKind::Assign)
 				&& matches!(name.as_slice(), b"BASH_ALIASES" | b"BASH_CMDS" | b"DIRSTACK" | b"RANDOM")
@@ -2058,6 +2104,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 		let posix = state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
 			.unwrap_or(false);
 		let mut via = Via::Plain;
+		let mut prefix = Prefix::None;
 		let target = loop {
 			// Borrowed (the resolution only reads `vp`): no copy of the
 			// name per command.
@@ -2135,6 +2182,9 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 					external_only = zsh
 						&& !state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Posixbuiltins)
 							.unwrap_or(false);
+					if via == Via::Plain {
+						prefix = Prefix::Command;
+					}
 					via = if std_path {
 						Via::CommandP
 					} else {
@@ -2161,6 +2211,9 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 						s.stage = Stage::Finish;
 						return None;
 					}
+					if via == Via::Plain {
+						prefix = Prefix::Builtin;
+					}
 					via = Via::Builtin;
 				},
 				_ if via == Via::Builtin && !matches!(resolved, Resolved::Intrinsic(_)) => {
@@ -2186,6 +2239,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 		let s = st(vp);
 		s.target = Some(target);
 		s.via_command = matches!(via, Via::Command | Via::CommandP);
+		s.prefix = prefix;
 	}
 	if st(vp).target == Some(Target::Search) {
 		// File-system probes: `CmdExpanded` reads the clock after them.
@@ -3140,7 +3194,8 @@ fn call_function(
 		return Some(flow);
 	}
 	// `FUNCNEST` > 0 lowers the engine's limit; exceeding it abandons the
-	// whole command, as bash's `jump_to_top_level (DISCARD)`.
+	// whole command after bash's `run_unwind_protects` (execute_cmd.c:5203),
+	// which ends every function, as `top_level_cleanup` does.
 	let funcnest = match state::lookup(&k.root, cx.store, vp, b"FUNCNEST") {
 		Ok(v) => v
 			.and_then(|v| v.as_scalar())
@@ -3156,7 +3211,7 @@ fn call_function(
 	if depth >= max {
 		let max = funcnest.map_or(max, |n| u32::try_from(n).unwrap_or(u32::MAX));
 		k.diag(cx, vp, line, Diag::FuncNest { name, max });
-		return Some(Flow::Discard(1));
+		return Some(cleanup_discard(k, vp, cx, 1));
 	}
 	let (unit_id, mode, sticky, file, attrs) =
 		match state::record(cx.store, vp, Key::Func(BStr::new(&name))) {
@@ -4059,7 +4114,7 @@ pub fn call_anon(
 		exec::clear_scratch(&mut k.root, cx.store, vp);
 		vp.status = status;
 		if let Some(pending) = exec::zsh_exit_pending(vp) {
-			return Flow::Exit(pending);
+			return Flow::Exit(pending, exec::Jump::Other);
 		}
 		if status != 0 {
 			print_exit_value(k, vp, cx, status);
@@ -4405,17 +4460,18 @@ fn settle_builtin(
 	id: IntrinsicId,
 	mut sc: Box<Scratch>,
 	mut outcome: builtins::Outcome,
-	chunks: Vec<Chunk>,
+	mut chunks: Vec<Chunk>,
 	fatal: bool,
 ) -> Option<Flow> {
-	// A special builtin's usage error ends a posix shell.
+	// A special builtin's usage error ends a posix shell: bash's `ERREXIT`
+	// (execute_cmd.c:1005).
 	if fatal
 		&& outcome.status != 0
 		&& is_special(id)
 		&& matches!(outcome.control, Control::None | Control::Return)
 		&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false)
 	{
-		outcome.control = Control::Exit;
+		outcome.control = Control::Exit(exec::Jump::Errexit);
 	}
 	// zsh `execcmd`'s `fatal:`: under `posixbuiltins` an error
 	// (`errflag`) of a `BINF_PSPECIAL` builtin exits a
@@ -4431,8 +4487,30 @@ fn settle_builtin(
 		} else if !state::zsh_option(&mut k.root, cx.store, vp, ZshOpt::Interactive).unwrap_or(false)
 		{
 			outcome.status = 1;
-			outcome.control = Control::Exit;
+			outcome.control = Control::Exit(exec::Jump::Other);
 		}
+	}
+	// A message the builtin prints that is bash's `report_error` (`let`,
+	// `read`, `printf -v`, `export` on a readonly variable, `declare`'s bad
+	// array subscript, a file `.` cannot read): under `set -e` the shell
+	// exits where it is printed ([`exec::report_error_exits`]), and what
+	// would follow it never comes. bash turns `set -e` off while a
+	// condition runs `eval`, `.` or any builtin through `command`
+	// (`execute_cmd.c`, line 5000): it reads the outer word, so `command
+	// builtin export` turns it off and `builtin .` does not.
+	let errexit_off = exec::errexit_off(sc.exec.as_ref().map_or(Prefix::None, |e| e.prefix), id)
+		&& vp.frames.last().is_some_and(exec::errexit_ignored);
+	if !errexit_off
+		&& !matches!(outcome.control, Control::Frame | Control::Resume | Control::Wait(_))
+		&& let Some(at) = chunks
+			.iter()
+			.position(|c| matches!(c, Chunk::Diag(d) if exec::report_error_exits(k, cx, vp, d)))
+	{
+		if let Chunk::Diag(d) = &chunks[at] {
+			outcome.status = exec::report_error_status(vp, d);
+		}
+		outcome.control = Control::Exit(exec::Jump::Direct);
+		chunks.truncate(at + 1);
 	}
 	for c in chunks {
 		let write = match c {
@@ -4491,8 +4569,8 @@ fn settle_builtin(
 			e.stage = Stage::Output;
 			None
 		},
-		Control::Exit => {
-			e.control = Some(Transfer::Exit(outcome.status));
+		Control::Exit(jump) => {
+			e.control = Some(Transfer::Exit(outcome.status, jump));
 			e.stage = Stage::Output;
 			None
 		},
@@ -4816,7 +4894,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			if vp.zsh.is_some()
 				&& let Some(pending) = exec::zsh_exit_pending(vp)
 			{
-				st(vp).control = Some(Transfer::Exit(pending));
+				st(vp).control = Some(Transfer::Exit(pending, exec::Jump::Other));
 			}
 			status
 		},
@@ -5217,7 +5295,8 @@ fn write_failed(
 		// The virtual SIGPIPE ends this shell silently, as it ends
 		// a bash pipeline child.
 		let platform = k.engine.config().platform;
-		return Some(Flow::Exit(crate::bash::signal::Signal::Pipe.exit_status(platform)));
+		let status = crate::bash::signal::Signal::Pipe.exit_status(platform);
+		return Some(Flow::Exit(status, exec::Jump::Direct));
 	}
 	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
 		zsh_write_error(k, vp, cx, line, fd, &err);
@@ -5268,6 +5347,14 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		let data = EventData::CmdEnd { status, dur_ns, pipestatus: &[] };
 		k.emit_op_at(cx, vp, op.node, data, end);
 	}
+	// `exit` jumps while its own redirections are in effect: bash's
+	// `time_command` reports through them (`time exit 3 2>/dev/null` prints
+	// nothing), so the report goes out before they are undone below. A
+	// `break` with a non-numeric count runs bash's `top_level_cleanup` first
+	// ([`exec::Jump::Cleanup`]).
+	if let Some(Transfer::Exit(_, jump)) = control {
+		exec::report_jump(k, vp, cx, 0, jump);
+	}
 	let sc = vp
 		.frames
 		.last_mut()
@@ -5284,29 +5371,46 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		None => Flow::Next,
 		Some(Transfer::Return(n)) => Flow::Return(n),
 		Some(Transfer::Break { n, cont }) => Flow::Break { n, cont },
-		Some(Transfer::Exit(n)) => Flow::Exit(n),
-		Some(Transfer::DiscardAll(n)) => {
-			let command = matches!(
-				state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
-				Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
-			);
-			let in_run = vp
-				.frames
-				.iter()
-				.rev()
-				.find(|f| matches!(f.kind, FrameKind::Script { .. }))
-				.is_some_and(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Run, .. }));
-			// zsh: a builtin's `zerr` (`errflag`) unwinds through `zsh_discard`
-			// (always-lists run, the builtin's status stays); `Abort` is the
-			// parse-error path.
-			if command && in_run && vp.mode.dialect() != crate::bash::ids::Dialect::Zsh {
-				Flow::Abort(n)
-			} else {
-				Flow::Discard(n)
-			}
+		Some(Transfer::Exit(n, jump)) => Flow::Exit(n, jump),
+		Some(Transfer::DiscardAll(n)) => cleanup_discard(k, vp, cx, n),
+		Some(Transfer::Exec) => {
+			// The program replaced the shell (or `exec` failed and the shell
+			// exits, `exit_shell` with no jump): bash's `time` around it
+			// never reports.
+			exec::drop_times(vp);
+			Flow::Exit(status, exec::Jump::Direct)
 		},
-		Some(Transfer::Exec) => Flow::Exit(status),
 	}
+}
+
+/// The flow of a command abandoned after bash runs every unwind-protect
+/// (`top_level_cleanup`, or `run_unwind_protects` alone): a builtin's
+/// arithmetic subscript error or `suspend`'s usage error, a function past
+/// `FUNCNEST`. The jump then goes to the outermost catch: the whole `-c`
+/// string when the run's own text is running ([`Flow::Abort`]). zsh: a
+/// builtin's `zerr` (`errflag`) unwinds through `zsh_discard` (always-lists
+/// run, the builtin's status stays); `Abort` is the parse-error path.
+fn cleanup_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: i32) -> Flow {
+	let command = matches!(
+		state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
+		Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
+	);
+	let in_run = vp
+		.frames
+		.iter()
+		.rev()
+		.find(|f| matches!(f.kind, FrameKind::Script { .. }))
+		.is_some_and(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Run, .. }));
+	let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
+	let flow = if command && in_run && !zsh {
+		Flow::Abort(n)
+	} else {
+		Flow::Discard(n)
+	};
+	if !zsh {
+		exec::jump_out(k, cx, vp, true, &flow);
+	}
+	flow
 }
 
 /// zsh `execcmd`/`execshfunc` under `printexitvalue` with `shinstdin`: a

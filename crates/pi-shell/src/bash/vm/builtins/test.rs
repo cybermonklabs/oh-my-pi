@@ -15,7 +15,7 @@ use crate::bash::{
 	store::{Attrs, OptId, OptKind, VarValue},
 	vm::{
 		Cx, Kernel,
-		exec::{Flow, expanding},
+		exec::{Flow, cleanup_jump, expanding, jump_out},
 		expand::arith_value,
 		probe::{self, absolute},
 		proc::{PendingWrite, Probe, ProbeResult, Slot, Vproc},
@@ -803,7 +803,9 @@ pub fn cond_test(
 			},
 			Err(Fail::Discard(d)) => {
 				report(k, cx, vp, line, chunks);
+				let cleanup = cleanup_jump(vp, &d);
 				k.diag(cx, vp, line, d);
+				jump_out(k, cx, vp, cleanup, &Flow::Discard(1));
 				return Flow::Discard(1);
 			},
 			Err(Fail::Arith(d)) => {
