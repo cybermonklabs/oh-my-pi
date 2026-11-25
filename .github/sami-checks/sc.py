@@ -24,7 +24,9 @@
   sc.py selftest                           the counters and the summary against hand-made inputs
   sc.py docs UNIT STREAM LOG EXIT SECS     `cargo doc --message-format=json -p pi-shell`: each broken intra-doc link (docs.sh)
   sc.py changelog LOG EXIT SECS FILES DIFF WRITE_EXIT  `fix-changelogs.ts --check`: each CHANGELOG it would rewrite (changelog.sh)
-  sc.py plant WHAT TREE                    the docs or changelog row's control: puts its planted fault in TREE
+  sc.py plant WHAT TREE                    the docs, changelog or rustfmt row's control: puts its planted fault in TREE
+  sc.py rustfmt-workspaces                 the manifests of the cargo workspaces the rustfmt row checks, one a line
+  sc.py rustfmt UNIT LOG EXIT SECS TREE    one workspace's `cargo fmt --all --check -v`: each place rustfmt would change (rustfmt.sh)
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
 binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 nor 100, a bun run
@@ -149,6 +151,7 @@ ROWS = (
     ("pi-shell orphan_jobs at 4 threads, gVisor: the map-limit control (root)", "gv-orphan-root"),
     ("rustdoc intra-doc links (pi-shell)", "docs"),
     ("CHANGELOG format (fix-changelogs --check)", "changelog"),
+    ("rustfmt: cargo fmt --check, per cargo workspace", "rustfmt"),
 )
 # The Rust tests (sami-rust-test.yml) report no units here: each of its two jobs is a row of its own,
 # read from the job's conclusion, which sami-checks.yml passes as SC_RUST_TESTS.
@@ -200,7 +203,7 @@ def all_job_names():
     # skip_bash_install), whose check must then stop the legs, so the macOS row reads UNKNOWN.
     names += ["ts-small", "checkts", "skip-forms", "platforms", "clippy", "macos-bash"]
     names += [m["name"] for m in gvisor_matrix()]
-    names += ["docs", "changelog"]
+    names += ["docs", "changelog", "rustfmt"]
     return names
 
 
@@ -230,6 +233,7 @@ def row_work():
         "clippy": one("clippy"),
         "docs": one("docs"),
         "changelog": one("changelog"),
+        "rustfmt": one("rustfmt"),
         "rust_test": one("rust-test"),
         "rust_test_macos": one("rust-test"),
     }
@@ -1127,6 +1131,12 @@ def expected_units(build_dir):
     for u in DOCS_UNITS:
         exp.append(("docs", u, "runner"))
     exp.append(("changelog", "changelogs", "runner"))
+    ws = rustfmt_workspaces()
+    if ws is None:
+        notes["rustfmt"] = f"no list of cargo workspaces at {RUSTFMT_WORKSPACES_LIST}, so no workspace can be checked"
+    else:
+        for m in ws:
+            exp.append(("rustfmt", m, "runner"))
     return exp, notes
 
 
@@ -1516,7 +1526,8 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                  "runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with its summary line, clippy "
                  "0/101), when a passing test printed a skip marker and passed as no other user (even when every "
                  "failure of the unit is known), when a clean clippy crate's planted control was not caught, when the "
-                 "platform checks gave its platform no verdict, or when no job (or more than one) reported it; its "
+                 "platform checks gave its platform no verdict, when cargo fmt listed no target root or rustfmt could "
+                 "not read a file, or when no job (or more than one) reported it; its "
                  "row is then UNKNOWN too. A test whose only skip lines are sub-cases the partial-skip list names for "
                  "it, with that entry's witness line in its output, passes and is listed as partial. A self-skip the "
                  "known-failure list names (`skips: `, for that row and user) reads KNOWN; a failure with a `flaky: ` "
@@ -1623,7 +1634,9 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         missed = [r["unit"] for r in rs if r["status"] != "FAIL" or not any(needle in f for f in r["failures"])]
         each = ", ".join(f"`{r['unit']}`" for r in rs)
         caught = bool(rs) and not missed
-        top += [f"**Planted run (`plant={plant}`)**: the {plant} job added `` {text} `` to `{path}` before it ran. "
+        # A plant in more than one file names its place in words (rustfmt: one file per workspace).
+        where = f"`{path}`" if " " not in path else path
+        top += [f"**Planted run (`plant={plant}`)**: the {plant} job added `` {text} `` to {where} before it ran. "
                 + (f"The control caught it: the row reads FAIL, and each of its units ({each}) names `{needle}`."
                    if caught else
                    f"**THE CONTROL FAILED**: the row reads {v}, and these units do not read FAIL naming `{needle}`: "
@@ -2031,9 +2044,76 @@ def selftest():
     check("platform report of another commit", {r["status"] for r in platform_results(pc, commit)}, {"UNKNOWN"})
     check("no platform report", {r["status"] for r in platform_results(os.path.join(d, "nopc"), commit)}, {"UNKNOWN"})
 
+    # The rustfmt row: one workspace's `cargo fmt --all --check -v`, in the shape cargo prints it (the
+    # target roots, the rustfmt command, then `Diff in` and the lines of each place).
+    ftree = os.path.join(d, "ftree")
+    os.makedirs(os.path.join(ftree, "sdk", "w"))
+    for m in ("Cargo.toml", "sdk/w/Cargo.toml"):
+        open(os.path.join(ftree, m), "w").write("[workspace]\n")
+    roots = f'[lib (2024)] "{ftree}/sdk/w/src/lib.rs"\n[test (2024)] "{ftree}/sdk/w/tests/t.rs"\n'
+    roots += f"rustfmt --edition 2024 --check {ftree}/sdk/w/src/lib.rs {ftree}/sdk/w/tests/t.rs\n"
+    wrap = (f"Diff in {ftree}/sdk/w/src/a.rs:476:\n \t\t}},\n-\t\t// A comment past eighty columns, which `rustfmt` wraps.\n"
+            "+\t\t// A comment past eighty columns, which `rustfmt`\n+\t\t// wraps.\n \t\tx();\n")
+    added = f"Diff in {ftree}/sdk/w/tests/t.rs:9:\n fn a() {{}}\n+\n fn b() {{}}\n"
+    blank = f"Diff in {ftree}/sdk/w/tests/t.rs:20:\n fn c() {{}}\n-\n-\n fn d() {{}}\n"
+    unclosed = "error: this file contains an unclosed delimiter\n --> sdk/w/src/b.rs:1:12\n"
+    unresolved = f"Error writing files: failed to resolve mod `gone`: {ftree}/sdk/w/src/gone.rs does not exist\n"
+    # Two changes with fewer than three unchanged lines between them: one block, two places, each at
+    # its own line of the file as it is (the block's number is that of its first line).
+    two = (f"Diff in {ftree}/sdk/w/src/lib.rs:1:\n-// a comment past eighty columns\n+// a comment past\n+// eighty columns\n"
+           " fn x() {}\n-fn sc_rustfmt_plant(){}\n+fn sc_rustfmt_plant() {}\n")
+    crlf = f"Incorrect newline style in {ftree}/sdk/w/src/c.rs\n"
+
+    def fm(text, ex, unit="sdk/w/Cargo.toml"):
+        r = parse_rustfmt(unit, write("fmt.log", text), str(ex), 2, ftree)
+        return r["status"], r["failures"], r["note"]
+
+    wrapped = "sdk/w/src/a.rs:477: // A comment past eighty columns, which 'rustfmt' wraps."
+    check("rustfmt: formatted", fm(roots, 0), ("PASS", [], "2 target root(s), formatted"))
+    check("rustfmt: each place named by path, line and the first line it rewrites, once",
+          fm(roots + wrap + added + blank + wrap, 1),
+          ("FAIL", [wrapped, "sdk/w/tests/t.rs:10: adds a blank line", "sdk/w/tests/t.rs:21: removes a blank line"],
+           "3 place(s) in 2 file(s) rustfmt would change, from 2 target root(s)"))
+    check("rustfmt: each run of changed lines in one block is a place, at its own line", fm(roots + two, 1)[:2],
+          ("FAIL", ["sdk/w/src/lib.rs:1: // a comment past eighty columns", "sdk/w/src/lib.rs:3: fn sc_rustfmt_plant(){}"]))
+    check("rustfmt: a file with forbidden line endings", fm(roots + crlf, 1)[:2],
+          ("FAIL", ["sdk/w/src/c.rs: newline style (rustfmt.toml's newline_style)"]))
+    check("rustfmt: a module rustfmt could not resolve, beside places it read", fm(roots + wrap + unresolved, 1),
+          ("UNKNOWN", [wrapped], f"rustfmt could not read every file: {unresolved.strip()}; 1 place(s) in 1 file(s) rustfmt would change"))
+    check("rustfmt: a file rustfmt could not read", fm(roots + unclosed, 1),
+          ("UNKNOWN", [], "rustfmt could not read every file: error: this file contains an unclosed delimiter"))
+    check("rustfmt: a file rustfmt could not read, beside places it read", fm(roots + wrap + unclosed, 1),
+          ("UNKNOWN", [wrapped], "rustfmt could not read every file: error: this file contains an unclosed delimiter; "
+                                 "1 place(s) in 1 file(s) rustfmt would change"))
+    check("rustfmt: no target root listed", fm("rustfmt --edition 2024 --check\n", 0)[0::2],
+          ("UNKNOWN", "exit 0, and cargo fmt listed no target root, so it checked nothing: rustfmt --edition 2024 --check"))
+    check("rustfmt: exit 0 with a place", fm(roots + wrap, 0), ("UNKNOWN", [wrapped], "exit 0 with 1 place(s) in 1 file(s) rustfmt would change"))
+    check("rustfmt: exit 1 with no place", fm(roots, 1)[0], "UNKNOWN")
+    check("rustfmt: killed", fm(roots + wrap, 137)[0::2], ("UNKNOWN", "exit 137: the time bound or a signal ended it"))
+    check("rustfmt: no log", parse_rustfmt("sdk/w/Cargo.toml", os.path.join(d, "absent.log"), "0", 1, ftree)["note"], "no log")
+    check("rustfmt: a workspace the tree lacks", fm(roots, 0, "sdk/gone/Cargo.toml")[0::2], ("UNKNOWN", "the tree has no sdk/gone/Cargo.toml"))
+    check("rustfmt: the workspaces, the root's first, from the list's entry lines",
+          rustfmt_workspaces(write("ws.txt", "# a comment\nsdk/a/Cargo.toml  why\n\nsdk/b/Cargo.toml  why\nsdk/a/Cargo.toml  again\n")),
+          ["Cargo.toml", "sdk/a/Cargo.toml", "sdk/b/Cargo.toml"])
+    check("rustfmt: no list", rustfmt_workspaces(os.path.join(d, "absent.txt")), None)
+    check("rustfmt: the gate's list names a workspace beside the root's", len(rustfmt_workspaces() or []) > 1, True)
+    # The plant's place: the first library (else binary) root by manifest path.
+    def pkg(manifest, *targets):
+        return {"manifest_path": f"{ftree}/{manifest}", "targets": [{"kind": k, "src_path": f"{ftree}/{s}"} for k, s in targets]}
+    check("rustfmt plant: a library first, by manifest path",
+          rustfmt_plant_target({"packages": [pkg("crates/pi-vcs/Cargo.toml", (["lib"], "crates/pi-vcs/src/lib.rs")),
+                                             pkg("crates/pi-ast/Cargo.toml", (["bin"], "crates/pi-ast/src/main.rs"),
+                                                 (["test"], "crates/pi-ast/tests/a.rs"), (["cdylib", "rlib"], "crates/pi-ast/src/lib.rs"))]}, ftree),
+          "crates/pi-ast/src/lib.rs")
+    check("rustfmt plant: a binary when there is no library",
+          rustfmt_plant_target({"packages": [pkg("Cargo.toml", (["bin"], "src/main.rs"), (["test"], "tests/a.rs"))]}, ftree), "src/main.rs")
+    check("rustfmt plant: no library or binary", rustfmt_plant_target({"packages": [pkg("Cargo.toml", (["test"], "tests/a.rs"))]}, ftree), None)
+
     # The summary: a unit no job reported is UNKNOWN, and so is its row (the silent-shard control):
-    # a pi-shell binary, a clippy crate and a platform.
-    silent = {("set-root", "pi-shell::zle_pty", "root"), ("clippy", "pi-vfs", "runner"), ("windows", PLATFORM_CRATES, "runner")}
+    # a pi-shell binary, a clippy crate, a platform and a cargo workspace of the rustfmt row.
+    fmt_ws = rustfmt_workspaces() or ["Cargo.toml"]
+    silent = {("set-root", "pi-shell::zle_pty", "root"), ("clippy", "pi-vfs", "runner"), ("windows", PLATFORM_CRATES, "runner"),
+              ("rustfmt", fmt_ws[-1], "runner")}
     res = os.path.join(d, "res")
     build = os.path.join(d, "build")
     os.makedirs(res)
@@ -2082,6 +2162,9 @@ def selftest():
           "| clippy --tests -D warnings, per crate (failed: findings beyond clippy-baseline.txt) | **UNKNOWN** | 5 / 0 / 0 / 1 |" in out, True)
     check("summary row of the silent platform", "| Windows: pi-shell, platform checks | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
     check("summary row of a platform that reported", "| macOS: pi-shell, platform checks | **PASS** | 1 / 0 / 0 / 0 |" in out, True)
+    check("summary names the silent rustfmt workspace UNKNOWN", f"`{fmt_ws[-1]}` (runner): UNKNOWN: no result" in out, True)
+    check("summary row of the silent rustfmt workspace",
+          f"| rustfmt: cargo fmt --check, per cargo workspace | **UNKNOWN** | {len(fmt_ws) - 1} / 0 / 0 / 1 |" in out, True)
     # And the same with every unit present passes.
     for row, unit, who in sorted(silent):
         # The root unit's file is silent.json: a later case replaces it under that name.
@@ -2703,8 +2786,8 @@ def selftest():
                 else:
                     os.environ[k] = v
 
-    # The docs and changelog rows. The plan takes `plant` as docs, changelog or nothing.
-    for plant_in, ok in (("", True), ("docs", True), ("changelog", True), ("both", False)):
+    # The docs, changelog and rustfmt rows. The plan takes `plant` as docs, changelog, rustfmt or nothing.
+    for plant_in, ok in (("", True), ("docs", True), ("changelog", True), ("rustfmt", True), ("both", False)):
         r = plan_out(plant=plant_in)
         check(f"plan with plant={plant_in!r}", isinstance(r, dict) and r.get("plant") == plant_in, ok)
     # The row selection (the dispatch input `rows`). Each job of sami-checks.yml but the plan and the
@@ -2746,7 +2829,8 @@ def selftest():
             ("skipforms", "set-runner,set-root,lib4,builtins,workspace,ts-small,ts-ca,skipforms," + ",".join(
                 k for k in ROW_KEYS if k.startswith("gv-")),
              ["tools", "build", "natives", "set", "builtins", "workspace", "ts-small", "ts-ca", "gvisor", "skip-forms"]),
-            ("windows", "windows", ["platforms"])):
+            ("windows", "windows", ["platforms"]),
+            ("rustfmt", "rustfmt", ["rustfmt"])):
         r = plan_out(rows=rows)
         check(f"plan: rows={rows} runs its rows and the jobs they need, and no other",
               (r.get("rows"), json.loads(r.get("jobs", "null"))) if isinstance(r, dict) else r, (want_rows, want_jobs))
@@ -2769,7 +2853,7 @@ def selftest():
         check(f"plan: rows={rows} with silent={silent!r} plant={plant!r}",
               (r.get("silent"), r.get("plant")) if isinstance(r, dict) else "does not run" in r and repr(silent or plant) in r,
               (silent, plant) if ok else True)
-    check("docs and changelog are job names silent takes", {"docs", "changelog"} <= set(all_job_names()), True)
+    check("docs, changelog and rustfmt are job names silent takes", {"docs", "changelog", "rustfmt"} <= set(all_job_names()), True)
     # Each plant lands where the job's tool reads it.
     ptree = os.path.join(d, "ptree")
     for what, body in (("docs", "//! pi-shell\n#![allow(x)]\nmod a;\npub mod bash;\npub mod b;\n"),
@@ -3028,6 +3112,24 @@ def selftest():
     check("summary: a planted changelog run that names the plant",
           ("The control caught it: the row reads FAIL, and each of its units (`changelogs`) names `Planted empty heading`." in out,
            rc), (True, 1))
+    # The rustfmt plant: each workspace's unit must name it, and the summary names its place in words.
+    fmt_files = {json.load(open(os.path.join(res2, f)))["unit"]: f for f in os.listdir(res2)
+                 if json.load(open(os.path.join(res2, f)))["row"] == "rustfmt"}
+    check("the rustfmt row's units", sorted(fmt_files), sorted(fmt_ws))
+    planted_fmt = "crates/pi-ast/src/lib.rs:90: fn sc_rustfmt_plant(){}"
+    for u, f in fmt_files.items():
+        json.dump(result("rustfmt", u, "runner", "FAIL", "1", 1, 0, 1, failures=[planted_fmt]), open(os.path.join(res2, f), "w"))
+    rc, out = summary2(rows_env="rustfmt", plant_env="rustfmt")
+    check("summary: a planted rustfmt run that each workspace names",
+          ("added `` fn sc_rustfmt_plant(){} `` to the first target root of each cargo workspace the row checks before it ran. "
+           "The control caught it" in out, rc), (True, 1))
+    json.dump(result("rustfmt", fmt_ws[-1], "runner", "PASS", "0", 1, 2), open(os.path.join(res2, fmt_files[fmt_ws[-1]]), "w"))
+    rc, out = summary2(rows_env="rustfmt", plant_env="rustfmt")
+    check("summary: a planted rustfmt run that one workspace does not name",
+          (f"**THE CONTROL FAILED**: the row reads FAIL, and these units do not read FAIL naming `sc_rustfmt_plant`: `{fmt_ws[-1]}`." in out,
+           rc), (True, 1))
+    for u, f in fmt_files.items():
+        json.dump(result("rustfmt", u, "runner", "PASS", "0", 1, 2), open(os.path.join(res2, f), "w"))
     rc, out = summary2(drop=[f for f in docs_i.values() if os.path.exists(os.path.join(res2, f))] + log_i)
     check("summary: no docs or changelog result", ("| rustdoc intra-doc links (pi-shell) | **UNKNOWN** | 0 / 0 / 0 / 2 |" in out,
           "| CHANGELOG format (fix-changelogs --check) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
@@ -3137,10 +3239,13 @@ CHANGELOG_FILE = re.compile(r"^  (\S+): (\d+ promoted item\(s\), .*)$", re.M)
 # Each row's control, the dispatch input `plant`: row key -> (the file, the line the job adds to it
 # before it runs, the words a failure of the row must then hold). pi-shell's first public module
 # gets a doc comment that links to no item; a small CHANGELOG gets an empty category heading after
-# its first `## [` heading ([Unreleased] in this tree), which fix-changelogs removes.
+# its first `## [` heading ([Unreleased] in this tree), which fix-changelogs removes; each cargo
+# workspace the rustfmt row checks gets a function rustfmt would space out at the end of its first
+# target root (rustfmt_plant_target), so each unit of the row must name it.
 PLANTS = {
     "docs": ("crates/pi-shell/src/lib.rs", "/// See [`NoSuchItemPlanted`].", "NoSuchItemPlanted"),
     "changelog": ("packages/browser-relay/CHANGELOG.md", "### Planted empty heading", "Planted empty heading"),
+    "rustfmt": ("the first target root of each cargo workspace the row checks", "fn sc_rustfmt_plant(){}", "sc_rustfmt_plant"),
 }
 
 
@@ -3281,8 +3386,166 @@ def parse_changelog(log, exit_code, secs, files, diff, write_exit="0", row="chan
     return result(row, unit, "runner", "UNKNOWN", exit_code, secs, note=f"exit {exit_code}: {said[:400] or 'no output'}")
 
 
+# The rustfmt row (rustfmt.sh): `cargo fmt --all --check -v` in each cargo workspace the gate builds,
+# the root one and each one .github/sami/rust-test-cargo-workspaces.txt lists (rust-test-parity.sh
+# fails while a tracked Cargo.toml outside the root workspace is missing there; the Rust tests run
+# each one listed). rustfmt reads the rustfmt.toml nearest each file, so a workspace with none of its
+# own takes the root's, as a developer's `cargo fmt` there does.
+RUSTFMT_WORKSPACES_LIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sami", "rust-test-cargo-workspaces.txt")
+# `cargo fmt -v` lists each target root it gives rustfmt (`[lib (2024)] "<path>"`); `--check` prints
+# `Diff in <path>:<line>:` before each block of changes, then its lines (` `, `-`, `+`), and
+# `Incorrect newline style in <path>` for a file whose line endings rustfmt.toml's newline_style
+# forbids. rustfmt's own errors start `error` or `Error` (`Error writing files: failed to resolve
+# mod ...` skips a whole crate root).
+RUSTFMT_TARGET = re.compile(r'^\[[^\]]+\] "(.+)"$')
+RUSTFMT_DIFF = re.compile(r"^Diff in (.+):(\d+):$")
+RUSTFMT_NEWLINE = re.compile(r"^Incorrect newline style in (.+)$")
+
+
+def rustfmt_workspaces(path=RUSTFMT_WORKSPACES_LIST):
+    """The manifests of the cargo workspaces the rustfmt row checks, relative to the tree: Cargo.toml,
+    then the first word of each entry line of the list (as rust-test-lists.sh's list_entries reads
+    it), in its order. None when the list cannot be read."""
+    lines = read_lines(path)
+    if lines is None:
+        return None
+    out = ["Cargo.toml"]
+    for line in lines:
+        if line.strip() and not line.startswith("#") and line.split()[0] not in out:
+            out.append(line.split()[0])
+    return out
+
+
+def parse_rustfmt(unit, log, exit_code, secs, tree, row="rustfmt"):
+    """One workspace's `cargo fmt --all --check -v` (LOG: its stdout and stderr), run in the directory
+    of the manifest UNIT under TREE. FAIL names each place rustfmt would change as `path:line: the
+    first line it rewrites` (each run of changed lines in a block is a place, at its line in the
+    file as it is), and each file with forbidden line endings as `path: newline style`, the path
+    from the tree's root. PASS needs exit 0, a target root listed and no place. Anything else is
+    UNKNOWN: a manifest the tree lacks, no log, the time bound or a signal, no target root listed
+    (nothing was checked), an error line (a file or crate rustfmt could not read, so its places are
+    unread; those it read are still named), or an exit that disagrees with the places (0 with some,
+    1 with none). Backticks become ' so that a line reads as one code span."""
+    def r(status, passed=0, failures=(), note=""):
+        return result(row, unit, "runner", status, exit_code, secs, passed, len(failures), failures=failures, note=note)
+
+    if not os.path.isfile(os.path.join(tree, unit)):
+        return r("UNKNOWN", note=f"the tree has no {unit}")
+    try:
+        lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return r("UNKNOWN", note="no log")
+    if stopped(exit_code):
+        return r("UNKNOWN", note=f"exit {exit_code}: the time bound or a signal ended it")
+    prefix = tree.rstrip("/") + "/"
+
+    def rel(p):
+        return p[len(prefix):] if p.startswith(prefix) else p
+
+    def what(run):
+        """The words for one run of changed lines: its first removed line, else what it adds."""
+        gone = next((b[1:].strip() for b in run if b.startswith("-") and b[1:].strip()), None)
+        if gone:
+            return gone
+        if any(b.startswith("-") for b in run):
+            return "removes a blank line"
+        new = next((b[1:].strip() for b in run if b.startswith("+") and b[1:].strip()), None)
+        return f"adds {new}" if new else "adds a blank line"
+
+    targets, places, errors = [], [], []
+
+    def add(place):
+        place = place.replace("`", "'")
+        if place not in places:
+            places.append(place)
+
+    for i, line in enumerate(lines):
+        t, d, nl = RUSTFMT_TARGET.match(line), RUSTFMT_DIFF.match(line), RUSTFMT_NEWLINE.match(line)
+        if t:
+            targets.append(rel(t.group(1)))
+        elif d:
+            # A block holds every change with fewer than three unchanged lines between them, and its
+            # number is the original file's line of its first line: each run of changed lines is a
+            # place, at the original line its first removed line had (an added run: the line it
+            # goes before). Unchanged and removed lines move the original line on; added ones do not.
+            at, run, start = int(d.group(2)), [], None
+            for b in lines[i + 1:] + [""]:
+                if b[:1] in ("-", "+") and not RUSTFMT_DIFF.match(b):
+                    start = at if start is None else start
+                    run.append(b)
+                    at += b[:1] == "-"
+                    continue
+                if run:
+                    add(f"{rel(d.group(1))}:{start}: {what(run)[:160]}")
+                    run, start = [], None
+                if b[:1] != " " or RUSTFMT_DIFF.match(b):
+                    break
+                at += 1
+        elif nl:
+            add(f"{rel(nl.group(1))}: newline style (rustfmt.toml's newline_style)")
+        elif line.startswith(("error", "Error")):
+            errors.append(line.strip())
+    files = len({p.split(":", 1)[0] for p in places})
+    found = f"{len(places)} place(s) in {files} file(s) rustfmt would change"
+    if errors:
+        return r("UNKNOWN", failures=places, note=f"rustfmt could not read every file: {errors[0][:300]}" + (f"; {found}" if places else ""))
+    if not targets:
+        said = next((line.strip() for line in lines if line.strip()), "no output")
+        return r("UNKNOWN", note=f"exit {exit_code}, and cargo fmt listed no target root, so it checked nothing: {said[:300]}")
+    if exit_code == "0" and not places:
+        return r("PASS", len(targets), note=f"{len(targets)} target root(s), formatted")
+    if exit_code == "1" and places:
+        return r("FAIL", failures=places, note=f"{found}, from {len(targets)} target root(s)")
+    return r("UNKNOWN", failures=places, note=f"exit {exit_code} with {found}")
+
+
+def rustfmt_plant_target(meta, tree):
+    """Where the rustfmt plant goes in one workspace (META: its `cargo metadata --no-deps`): the root
+    source file of its first library or binary target, by manifest path, a library first (in this
+    tree, pi-ast's lib.rs for the root workspace, outside rustfmt.toml's ignore), relative to TREE.
+    None when it has neither."""
+    prefix = tree.rstrip("/") + "/"
+    best = None
+    for p in meta.get("packages", []):
+        for t in p.get("targets", []):
+            kinds = set(t.get("kind", []))
+            rank = 0 if kinds & {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"} else 1 if "bin" in kinds else None
+            if rank is not None:
+                key = (p.get("manifest_path", ""), rank, t.get("src_path", ""))
+                best = key if best is None or key < best else best
+    if best is None:
+        return None
+    return best[2][len(prefix):] if best[2].startswith(prefix) else best[2]
+
+
+def plant_rustfmt(tree):
+    """The rustfmt row's plant: PLANTS' function line appended to each listed workspace's first
+    target root."""
+    _, text, _ = PLANTS["rustfmt"]
+    workspaces = rustfmt_workspaces()
+    if workspaces is None:
+        sys.exit(f"::error::no list of cargo workspaces at {RUSTFMT_WORKSPACES_LIST} for the rustfmt plant")
+    for m in workspaces:
+        try:
+            meta = json.loads(subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1", "--manifest-path",
+                                              os.path.join(tree, m)], capture_output=True, text=True, check=True).stdout)
+        except (OSError, subprocess.CalledProcessError, ValueError) as e:
+            sys.exit(f"::error::cargo metadata of {m} failed, so the rustfmt plant has no place there: {e}")
+        path = rustfmt_plant_target(meta, tree)
+        if path is None:
+            sys.exit(f"::error::{m} has no library or binary target for the rustfmt plant")
+        p = os.path.join(tree, path)
+        body = open(p, encoding="utf-8").read()
+        # A blank line first, so that a last line rustfmt would change too stays a place of its own.
+        body += ("" if body.endswith("\n") else "\n") + "\n" + text + "\n"
+        open(p, "w", encoding="utf-8").write(body)
+        print(f"PLANT rustfmt: {m}: {path}:{body.count(chr(10))}: {text}")
+
+
 def cmd_plant(what, tree):
     """Puts a row's planted fault (PLANTS) in TREE and prints where."""
+    if what == "rustfmt":
+        return plant_rustfmt(tree)
     path, text, _ = PLANTS[what]
     p = os.path.join(tree, path)
     lines = open(p, encoding="utf-8").read().split("\n")
@@ -3343,6 +3606,13 @@ def main(argv):
         print(json.dumps(parse_docs(*a)))
     elif c == "changelog":
         print(json.dumps(parse_changelog(*a)))
+    elif c == "rustfmt-workspaces":
+        ws = rustfmt_workspaces()
+        if ws is None:
+            sys.exit(f"::error::no list of cargo workspaces at {RUSTFMT_WORKSPACES_LIST}")
+        print("\n".join(ws))
+    elif c == "rustfmt":
+        print(json.dumps(parse_rustfmt(*a)))
     elif c == "plant":
         cmd_plant(*a)
     elif c == "selftest":

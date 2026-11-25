@@ -8,12 +8,13 @@
 #     later, so sami itself is not tested again).
 #   - A dispatch tests any pushed commit, given as a full 40-character id:
 #       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
-#         -f commit=<sha> [-f rows=<row>,<row>...] [-f silent=<job name>] [-f plant=docs|changelog]
+#         -f commit=<sha> [-f rows=<row>,<row>...] [-f silent=<job name>] [-f plant=docs|changelog|rustfmt]
 #     `rows` selects the rows the run runs: all (the default), or a comma list of the summary's row
 #     names (sc.py ROW_KEYS): set-runner, set-root, lib4, builtins, workspace, ts-small, ts-ca,
 #     checkts, macos, windows, clippy, skipforms, gv-set-uid1000, gv-set-root, gv-lib4-uid1000,
 #     gv-lib4-root, gv-builtins-uid1000, gv-builtins-root, gv-orphan-uid1000, gv-orphan-root, docs,
-#     changelog, rust_test, rust_test_macos. A name that is no row fails the plan, which lists them.
+#     changelog, rustfmt, rust_test, rust_test_macos. A name that is no row fails the plan, which
+#     lists them.
 #     The plan runs the jobs whose results the selected rows read and the jobs those need by their
 #     `needs:` (the reference tools, the test archive, the host addon), and no other job: a proof of
 #     the docs row builds nothing else. A row reads the same alone as in a run of every row, so rows
@@ -26,8 +27,9 @@
 #     `silent` is the summary's control: the named job (for example set-root-2) uploads nothing,
 #     and the summary must then read its units and its row UNKNOWN. `silent=macos-bash` instead
 #     makes the macOS legs skip their bash 5 install, and the macOS row must read UNKNOWN.
-#     `plant` is the docs or changelog row's control: that job first adds a fault to the tree
-#     (sc.py PLANTS: a doc comment with a broken intra-doc link, or an empty CHANGELOG heading),
+#     `plant` is the docs, changelog or rustfmt row's control: that job first adds a fault to the
+#     tree (sc.py PLANTS: a doc comment with a broken intra-doc link, an empty CHANGELOG heading, or
+#     a function rustfmt would space out at the end of each cargo workspace's first target root),
 #     and the summary says at its top whether the row then read FAIL naming it. A silent or plant
 #     whose job or row the run does not run fails the plan: that control would pass quietly.
 #   GitHub dispatches only a workflow it has seen run, and this file is not on the default branch
@@ -60,6 +62,11 @@
 #     release already has (the cut's rule, at no second build); its header says how to regenerate
 #     it. It lints Linux code only; code built only for macOS or Windows is compiled, not linted, in
 #     the platform rows.
+#   - rustfmt: cargo fmt --all --check -v in each cargo workspace the gate builds, the root one and
+#     each one .github/sami/rust-test-cargo-workspaces.txt lists (sdk/rust/omp-rpc), one unit per
+#     workspace, each place rustfmt would change named by path and line (.github/sami-checks/
+#     rustfmt.sh). rustfmt reads the rustfmt.toml nearest each file, so those workspaces take the
+#     root's, as a developer's cargo fmt there does.
 #   - under gVisor (sami-checks-gvisor.yml): the pi-shell set (and so the one-process lib) and
 #     pi-builtins again, from the same archive, in a runsc container, as uid 1000 and as root.
 # The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
@@ -149,7 +156,7 @@ on:
         default: ""
         type: string
       plant:
-        description: "Control: docs or changelog, a row whose job first plants a fault the row must name"
+        description: "Control: docs, changelog or rustfmt, a row whose job first plants a fault the row must name"
         required: false
         default: ""
         type: string
@@ -211,6 +218,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             .github/sami-checks
+            .github/sami
             .github/workflows
       - name: Controls of the counters, the plan and the summary (hand-made inputs)
         run: python3 tool/.github/sami-checks/sc.py selftest
@@ -710,7 +718,7 @@ jobs:
     name: summary
     # rust-test is here so that the summary runs last and reads its two jobs' results (SC_RUST_TESTS).
     needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms,
-            platforms, clippy, gvisor, docs, changelog, rust-test]
+            platforms, clippy, gvisor, docs, changelog, rustfmt, rust-test]
     if: ${{ always() && needs.plan.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -723,7 +731,10 @@ jobs:
         with:
           path: tool
           persist-credentials: false
-          sparse-checkout: .github/sami-checks
+          # .github/sami: the rustfmt row's units are the workspaces its rust-test-cargo-workspaces.txt lists.
+          sparse-checkout: |
+            .github/sami-checks
+            .github/sami
       # Each artifact lands in a folder of its own name (no merge), so no job's files replace another's.
       - name: Results
         continue-on-error: true
@@ -904,5 +915,43 @@ jobs:
         if: ${{ always() && needs.plan.outputs.silent != 'changelog' }}
         with:
           name: sc-res-changelog
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  rustfmt:
+    # cargo fmt --check in each cargo workspace the gate builds (rustfmt.sh), on the tree's toolchain.
+    # A formatter only: no build and no code of the tree runs, so it needs no cache.
+    name: rustfmt
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'rustfmt')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: |
+            .github/sami-checks
+            .github/sami
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: Toolchain (the tree's rust-toolchain.toml channel, minimal profile, rustfmt)
+        run: |
+          ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SC_TREE/rust-toolchain.toml" | head -n 1)
+          [ -n "$ch" ] || { echo "::error::no channel in the tree's rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$ch" --profile minimal -c rustfmt --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$ch" >> "$GITHUB_ENV"
+      - name: cargo fmt --check, each workspace
+        env:
+          SC_PLANT: ${{ needs.plan.outputs.plant }}
+        run: bash tool/.github/sami-checks/rustfmt.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'rustfmt' }}
+        with:
+          name: sc-res-rustfmt
           path: ${{ github.workspace }}/sc/res/
           retention-days: 14
