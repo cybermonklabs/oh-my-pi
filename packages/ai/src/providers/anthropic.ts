@@ -5808,7 +5808,13 @@ function* wellFormedNode(value: unknown[] | Record<string, unknown>, path: Conta
 						? yield wellFormedNode(entry, path)
 						: entry;
 		if (sanitized !== entry) changed = true;
-		next[key] = sanitized;
+		// Assigning `__proto__` would swap the copy's prototype instead of
+		// creating the own data property JSON.parse produces.
+		if (key === "__proto__") {
+			Object.defineProperty(next, key, { value: sanitized, enumerable: true, writable: true, configurable: true });
+		} else {
+			next[key] = sanitized;
+		}
 	}
 	path.leave(value);
 	return changed ? next : value;

@@ -187,6 +187,26 @@ describe("Anthropic-compatible unsigned thinking replay (#2005)", () => {
 		expect({ levels, node }).toEqual({ levels: 50_000, node: { text: "broken \ufffd end" } });
 	});
 
+	// `JSON.parse` makes `__proto__` an own key of tool arguments; a copy that assigns it sets its prototype instead.
+	it("keeps a __proto__ key of tool arguments when it fixes a string beside it", () => {
+		const assistant: AssistantMessage = {
+			...makeAssistantThinking("plan"),
+			content: [
+				{
+					type: "toolCall",
+					id: "call_1",
+					name: "write",
+					arguments: JSON.parse('{"__proto__":{"a":1},"text":"bad \\ud83d"}'),
+				},
+			],
+		};
+		const toolUse = assistantWireBlocks([makeUser(), assistant], makeModel()).find(
+			block => block.type === "tool_use",
+		) as WireToolUseBlock;
+		expect(Object.getPrototypeOf(toolUse.input)).toBe(Object.prototype);
+		expect(JSON.stringify(toolUse.input)).toBe('{"__proto__":{"a":1},"text":"bad \ufffd"}');
+	});
+
 	it("sanitizes payload replacements before SDK JSON serialization", async () => {
 		const splitSurrogate = `render \`"icon.ghost": "\\ud83d${String.fromCharCode(0xdc7b)}"\``;
 		const { promise: bodyPromise, resolve } = Promise.withResolvers<string>();
