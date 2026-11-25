@@ -1120,6 +1120,13 @@ interface DiskQueueOptions {
 	epoch?: number;
 }
 
+/**
+ * What a fenced atomic rewrite did: published the transcript, published
+ * nothing (a later write carries it), or handed the store's refusal of it to
+ * the queued-conflict recovery, which publishes it.
+ */
+type FencedRewriteOutcome = "published" | "skipped" | "handedOver";
+
 /** A {@link SessionManager.dropSession} of the current session file whose delete has not settled. */
 interface PendingDrop {
 	sessionFile: string;
@@ -3436,17 +3443,13 @@ export class SessionManager {
 		let handedOver = false;
 		await this.#scheduleDiskWork(
 			async () => {
-				try {
-					if (await this.#runFencedAtomicRewrite(startEpoch, queuedRecovery)) {
-						published = true;
-						this.#fileIsCurrent = true;
-						this.#materializeBreadcrumb();
-						this.#hasTitleSlot = true;
-					}
-				} catch (error) {
-					handedOver = !queuedRecovery && error instanceof Error && this.#takenOverConflicts.has(error);
-					throw error;
-				}
+				const outcome = await this.#runFencedAtomicRewrite(startEpoch, queuedRecovery);
+				published = outcome === "published";
+				handedOver = outcome === "handedOver";
+				if (!published) return;
+				this.#fileIsCurrent = true;
+				this.#materializeBreadcrumb();
+				this.#hasTitleSlot = true;
 			},
 			{ epoch: startEpoch },
 		);
@@ -3462,13 +3465,15 @@ export class SessionManager {
 	 * `#atomicRewriteActive` across
 	 * the writer close and the full-file replace, and loops on
 	 * `#atomicRewriteDirty` so any fenced append that lands during the rewrite
-	 * is captured before the task resolves. Returns `false` when the disk epoch
-	 * moved so callers skip current-marking updates; a body that landed before
-	 * that change still advances the durable byte record after readback.
+	 * is captured before the task resolves. Skips (`skipped`) when the disk
+	 * epoch moved so callers skip current-marking updates; a body that landed
+	 * before that change still advances the durable byte record after
+	 * readback. A refusal it hands to the queued-conflict recovery is
+	 * `handedOver`, not thrown: the caller settles with that recovery.
 	 */
-	async #runFencedAtomicRewrite(epoch: number, queuedRecovery = false): Promise<boolean> {
-		if (this.#released) return false;
-		if (this.#deferRewriteForPendingDrop()) return false;
+	async #runFencedAtomicRewrite(epoch: number, queuedRecovery = false): Promise<FencedRewriteOutcome> {
+		if (this.#released) return "skipped";
+		if (this.#deferRewriteForPendingDrop()) return "skipped";
 		this.#atomicRewriteFenceEpoch = epoch;
 		let recoveries = 0;
 		try {
@@ -3482,11 +3487,11 @@ export class SessionManager {
 				if (unconfirmed !== undefined && unconfirmed === this.#sessionFile) {
 					await this.#storage.confirmWrites?.(unconfirmed).catch(() => undefined);
 				}
-				if (this.#holdForParentMove()) return false;
-				if (this.#sessionOwnedElsewhere() && !this.#moveOffSessionFile("open-elsewhere")) return false;
+				if (this.#holdForParentMove()) return "skipped";
+				if (this.#sessionOwnedElsewhere() && !this.#moveOffSessionFile("open-elsewhere")) return "skipped";
 				const sessionFile = this.#sessionFile;
-				if (!sessionFile) return false;
-				if (this.#diskEpoch !== epoch) return false;
+				if (!sessionFile) return "skipped";
+				if (this.#diskEpoch !== epoch) return "skipped";
 				const body = this.#serializeBody();
 				const options = {
 					expectedSize: this.#expectedDiskSize,
@@ -3517,7 +3522,7 @@ export class SessionManager {
 					}
 					// A store that recovers queued conflicts reads the stored size again in its recovery,
 					// which publishes this transcript: a size the store refused published nothing to read back.
-					if (!queuedRecovery && this.#recoverQueuedConflict(error, sessionFile)) throw error;
+					if (!queuedRecovery && this.#recoverQueuedConflict(error, sessionFile)) return "handedOver";
 					let landed = false;
 					try {
 						landed = await this.#bodyMatchesStorage(sessionFile, body);
@@ -3544,11 +3549,11 @@ export class SessionManager {
 					} catch {
 						// A superseding rewrite owns the durability record when its body cannot be read back.
 					}
-					return false;
+					return "skipped";
 				}
 				this.#recordPublish(body.stamp, body.bytes);
 			} while (this.#atomicRewriteDirty);
-			return true;
+			return "published";
 		} finally {
 			// Only relinquish the fence if we still own it. A superseding
 			// synchronous rewrite (`flushSync` → `#rewriteSynchronously`) may
