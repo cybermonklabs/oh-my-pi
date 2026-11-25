@@ -7,3 +7,7 @@
 # here needs the reason no GitHub-hosted runner can run the test, its owner,
 # and the change that will make it run.
 # One per line: <bazel test target> <libtest test name>  <reason, owner, fix>.
+//crates/pi-builtins:pi-builtins_test cp::tests::a_copied_link_replaces_a_special_file_as_gnu_does  "skipped: a device node cannot be made here" (cp.rs:5555): its device row needs mknod, which the runner's user may not do; the fifo and socket rows run. Owner: the gate. Fix: run it as root (rust-test-root-alone.txt)
+//crates/pi-builtins:pi-builtins_test cp::tests::a_file_another_user_owns_gets_its_attributes_as_it_is  "skipped: only root can make a file another user owns" (cp.rs:6039): as the runner's user it runs nothing. Owner: the gate. Fix: run it as root (rust-test-root-alone.txt), where its uid 1000 child must also reach the test's directory (cp.rs:6026)
+//crates/pi-builtins:pi-builtins_test cp::tests::a_name_that_appears_during_the_copy_is_kept  "skipped: the row of a FIFO of mode 440 needs root" (cp.rs:5460): its other four rows run. Owner: the gate. Fix: run it as root (rust-test-root-alone.txt)
+//crates/pi-builtins:pi-builtins_test cp::tests::only_a_read_only_file_cp_owns_is_made_writable_for_its_attributes  "skipped: only root can make a file another user owns" (cp.rs:6113): its two rows of cp's own files run; the row of another user's file needs root. Owner: the gate. Fix: run it as root (rust-test-root-alone.txt)

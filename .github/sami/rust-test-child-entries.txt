@@ -4,21 +4,27 @@
 # that test, and not as tests of their own. The job fails for an #[ignore]d
 # test that no invocation runs and no list names, and for a line here that
 # names no such test.
-# One per line: <bazel test target> <libtest test name>  <the test that starts it>.
-//crates/pi-builtins:pi-builtins_test locale::tests::the_ignored_signal_probe  an_inherited_handler_does_not_run_in_the_child_before_exec's stand-in utility
-//crates/pi-builtins:pi-builtins_test proc_snapshot::tests::walk_from_a_process_named_p_377q  an_ancestor_whose_name_is_no_utf8_is_walked
-//crates/pi-natives:pi_natives_test desktop::linux::x11::mpx::tests::leader_exits_first  a_live_owner_whose_leader_has_exited_keeps_its_masters and an_owner_with_only_its_exited_leader_left_is_stale (LeaderGone::start)
-//crates/pi-shell:pi-shell_test proctree::tests::a_second_thread_until_stdin_closes  threads_of_a_child_are_not_children
-//crates/pi-shell:pi-shell_test proctree::tests::a_thread_that_forked_a_sleep  a_thread_that_left_before_its_children_were_read_loses_no_child
-//crates/pi-shell:pi-shell_test proctree::tests::kill_tree_with_no_descriptor_left  kill_tree_kills_the_group_and_reports_a_walk_it_could_not_finish
-//crates/pi-shell:pi-shell_test proctree::tests::mark_never_read_with_no_descriptor_left  a_boot_id_that_cannot_be_read_never_changes_a_mark
-//crates/pi-shell:pi-shell_test proctree::tests::mark_read_again_with_no_descriptor_left  a_boot_id_that_cannot_be_read_never_changes_a_mark
-//crates/pi-shell:pi-shell_test session::tests::signal_target_with_no_descriptor_left  signals_are_refused_while_the_ancestors_cannot_be_read
-//crates/pi-shell:pi-shell_test shell::tests::process_test_sleeper  the process-control tests (shell/tests/mod.rs spawns it)
-//crates/pi-shell:pi-shell_test sys::proc::tests::ended_with_no_descriptor_left  ended_does_not_count_a_process_it_cannot_read
-//crates/pi-shell:pi-shell_test sys::proc::tests::leader_exits_first  a_group_kill_reaches_a_process_whose_leader_has_exited and a_process_with_only_its_exited_leader_left_stays_a_zombie (LeaderGone::start)
-//crates/pi-shell:pi-shell_test sys::proc::tests::pinned_signal_with_one_descriptor_left  a_pinned_signal_fails_when_it_cannot_read_the_process
-//crates/pi-shell:pi-shell_test sys::proc::tests::running_with_no_descriptor_left  running_needs_a_read_that_shows_the_process_running
-//crates/pi-shell:pi-shell_test sys::proc::tests::scan_with_one_descriptor_left  a_scan_fails_when_it_cannot_read_a_process
-//crates/pi-shell:pi-shell_test tools::tests::live_with_no_descriptor_left  the_live_externals_include_a_running_one_that_cannot_be_read
-//crates/pi-vcs:pi-vcs_test git::mutate::tests::wide_tree_under_a_low_descriptor_limit  reclaim_of_a_wide_tree_needs_few_descriptors, under a descriptor limit of 128
+# Each line names the tests that start the child, so that a rename shows: the
+# job fails when one of them is no test of the binary, since the child would
+# then run nowhere and nothing would say so.
+# One per line: <bazel test target> <libtest test name>  <parent>[ and <parent>...]: <reason>
+# (each <parent> the full libtest name of a test of the same binary).
+//crates/pi-builtins:pi-builtins_test locale::tests::the_ignored_signal_probe  locale::tests::an_inherited_handler_does_not_run_in_the_child_before_exec: its stand-in utility
+//crates/pi-builtins:pi-builtins_test pidwait::tests::leader_exits_first  pidwait::tests::waits_for_a_process_whose_leader_has_exited and pidwait::tests::a_killed_process_whose_leader_had_exited_has_exited: they start it through LeaderGone::start (pidwait.rs:166, :211); #[ignore = "run in a child process by LeaderGone::start"] (pidwait.rs:76)
+//crates/pi-builtins:pi-builtins_test proc_snapshot::tests::threads_of_a_process_named_p_377q  proc_snapshot::tests::the_threads_of_a_process_whose_name_is_no_utf8_are_listed: it runs '--ignored --exact proc_snapshot::tests::threads_of_a_process_named_p_377q' (proc_snapshot.rs:2484); #[ignore = "run as a child process by the_threads_of_a_process_whose_name_is_no_utf8_are_listed"] (proc_snapshot.rs:2529)
+//crates/pi-builtins:pi-builtins_test proc_snapshot::tests::walk_from_a_process_named_p_377q  proc_snapshot::tests::an_ancestor_whose_name_is_no_utf8_is_walked: the process whose name is no UTF-8 that it walks from
+//crates/pi-natives:pi_natives_test desktop::linux::x11::mpx::tests::leader_exits_first  desktop::linux::x11::mpx::tests::a_live_owner_whose_leader_has_exited_keeps_its_masters and desktop::linux::x11::mpx::tests::an_owner_with_only_its_exited_leader_left_is_stale: they start it through LeaderGone::start
+//crates/pi-shell:pi-shell_test proctree::tests::a_second_thread_until_stdin_closes  proctree::tests::threads_of_a_child_are_not_children: the child whose second thread it reads
+//crates/pi-shell:pi-shell_test proctree::tests::a_thread_that_forked_a_sleep  proctree::tests::a_thread_that_left_before_its_children_were_read_loses_no_child: the child whose thread forks a sleep
+//crates/pi-shell:pi-shell_test proctree::tests::kill_tree_with_no_descriptor_left  proctree::tests::kill_tree_kills_the_group_and_reports_a_walk_it_could_not_finish: kill_tree in a process with no descriptor left
+//crates/pi-shell:pi-shell_test proctree::tests::mark_never_read_with_no_descriptor_left  proctree::tests::a_boot_id_that_cannot_be_read_never_changes_a_mark: a mark in a process with no descriptor left
+//crates/pi-shell:pi-shell_test proctree::tests::mark_read_again_with_no_descriptor_left  proctree::tests::a_boot_id_that_cannot_be_read_never_changes_a_mark: a mark read again in a process with no descriptor left
+//crates/pi-shell:pi-shell_test session::tests::signal_target_with_no_descriptor_left  session::tests::signals_are_refused_while_the_ancestors_cannot_be_read: a signal target in a process with no descriptor left
+//crates/pi-shell:pi-shell_test shell::tests::process_test_sleeper  shell::tests::process_control::pgrep_matches_name_and_pkills_signal_probe and shell::tests::process_control::pkill_queue_option_consumes_its_value and shell::tests::process_control::pgrep_reads_pidfile_from_standard_input and shell::tests::process_control::pgrep_requires_an_externally_locked_pidfile and shell::tests::process_control::pkill_signals_every_matching_process and shell::tests::process_control::pidwait_returns_after_the_matching_process_exits: the sleeping process they match, started through process_test_child (shell/tests/mod.rs:361); pkill_interactive_prompt_honors_cancellation starts it too, on macOS only (process_control.rs:88)
+//crates/pi-shell:pi-shell_test sys::proc::tests::ended_with_no_descriptor_left  sys::proc::tests::ended_does_not_count_a_process_it_cannot_read: ended in a process with no descriptor left
+//crates/pi-shell:pi-shell_test sys::proc::tests::leader_exits_first  sys::proc::tests::a_group_kill_reaches_a_process_whose_leader_has_exited and sys::proc::tests::a_process_with_only_its_exited_leader_left_stays_a_zombie: they start it through LeaderGone::start
+//crates/pi-shell:pi-shell_test sys::proc::tests::pinned_signal_with_one_descriptor_left  sys::proc::tests::a_pinned_signal_fails_when_it_cannot_read_the_process: a pinned signal in a process with one descriptor left
+//crates/pi-shell:pi-shell_test sys::proc::tests::running_with_no_descriptor_left  sys::proc::tests::running_needs_a_read_that_shows_the_process_running: running in a process with no descriptor left
+//crates/pi-shell:pi-shell_test sys::proc::tests::scan_with_one_descriptor_left  sys::proc::tests::a_scan_fails_when_it_cannot_read_a_process: a scan in a process with one descriptor left
+//crates/pi-shell:pi-shell_test tools::tests::live_with_no_descriptor_left  tools::tests::the_live_externals_include_a_running_one_that_cannot_be_read: the live externals in a process with no descriptor left
+//crates/pi-vcs:pi-vcs_test git::mutate::tests::wide_tree_under_a_low_descriptor_limit  git::mutate::tests::reclaim_of_a_wide_tree_needs_few_descriptors: the reclaim of a wide tree under a descriptor limit of 128
