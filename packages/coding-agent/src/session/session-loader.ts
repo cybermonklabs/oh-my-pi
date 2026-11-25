@@ -38,6 +38,7 @@ import {
 	type SessionHeader,
 } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
+import { type NestedWalk, runNested } from "./nested-walk";
 import { imageAt, isPersistenceTruncatedString, resolvedImageSiteOf } from "./session-persistence";
 import { defaultSessionStorage, FileSessionStorage, retryRacedRead, type SessionStorage } from "./session-storage";
 import { enotdir } from "./session-storage-errors";
@@ -951,80 +952,60 @@ interface BlobRefSite {
 	asDataUrl: boolean;
 }
 
-/** A container {@link collectBlobRefSites} is walking, and the next of its members to walk. */
-type BlobRefWalkFrame =
-	| { readonly array: unknown[]; readonly key: string | undefined; index: number }
-	| { readonly object: Record<string, unknown>; readonly keys: readonly string[]; index: number };
-
 /**
  * Collect the blob references in `value` and below it, wherever persistence
  * externalizes an image and a load resolves it ({@link resolvedImageSiteOf}),
  * in the order a depth-first walk meets them. An array's elements, a string
  * one too, sit under the array's key. Snapcompact frames stay as references
- * until context rebuilding selects them. The walk keeps its own stack, so it
- * reads a value as deep as `JSON.parse` reads (about ten times what a
- * recursive walk's stack allows): the record of a cold entry is one. A
- * container met again inside itself (a cycle, never in parsed JSON) is not
- * walked again.
+ * until context rebuilding selects them. The walk keeps its own stack
+ * ({@link runNested}), so it reads a value as deep as `JSON.parse` reads
+ * (about ten times what a recursive walk's stack allows): the record of a
+ * cold entry is one. A container met again inside itself (a cycle, never in
+ * parsed JSON) is not walked again.
  */
 function collectBlobRefSites(value: unknown, sites: BlobRefSite[]): void {
-	const stack: BlobRefWalkFrame[] = [];
-	const open = new Set<object>();
-	const enter = (node: unknown, key: string | undefined): void => {
-		if (typeof node !== "object" || node === null || open.has(node)) return;
-		if (Array.isArray(node)) {
-			open.add(node);
-			stack.push({ array: node, key, index: 0 });
-			return;
-		}
-		const holder = node as Record<string, unknown>;
-		const site = resolvedImageSiteOf(holder, key);
-		const ref = site === undefined ? undefined : imageAt(holder, site);
-		if (site !== undefined && typeof ref === "string" && isBlobRef(ref)) {
-			sites.push({ holder, key: site, ref, asDataUrl: false });
-			// An image payload's other fields hold no image.
-			if (site === "data") return;
-		}
-		const keys: string[] = [];
-		for (const childKey in holder) keys.push(childKey);
-		open.add(holder);
-		stack.push({ object: holder, keys, index: 0 });
-	};
-	enter(value, undefined);
-	while (stack.length > 0) {
-		const frame = stack[stack.length - 1]!;
-		if ("array" in frame) {
-			const { array, key } = frame;
-			if (frame.index >= array.length) {
-				open.delete(array);
-				stack.pop();
-				continue;
-			}
-			const index = frame.index++;
-			const item = array[index];
-			if (typeof item !== "string") {
-				enter(item, key);
-			} else if (resolvedImageSiteOf(item, key) !== undefined && isBlobRef(item)) {
+	if (typeof value === "object" && value !== null) runNested(blobRefSitesIn(value, undefined, sites, new Set()));
+}
+
+/** {@link collectBlobRefSites} of `node`, under `key` of its holder, skipping a container in `open`, which it is inside. */
+function* blobRefSitesIn(
+	node: object,
+	key: string | undefined,
+	sites: BlobRefSite[],
+	open: Set<object>,
+): NestedWalk<void> {
+	if (open.has(node)) return;
+	if (Array.isArray(node)) {
+		open.add(node);
+		for (let index = 0; index < node.length; index++) {
+			const item: unknown = node[index];
+			if (typeof item === "object" && item !== null) yield blobRefSitesIn(item, key, sites, open);
+			else if (typeof item === "string" && resolvedImageSiteOf(item, key) !== undefined && isBlobRef(item)) {
 				// A provider image's URL listed under `image_url`: its blob holds the whole data URL.
-				sites.push({ holder: array, key: index, ref: item, asDataUrl: true });
+				sites.push({ holder: node, key: index, ref: item, asDataUrl: true });
 			}
-			continue;
 		}
-		const { object: holder, keys } = frame;
-		if (frame.index >= keys.length) {
-			open.delete(holder);
-			stack.pop();
-			continue;
-		}
-		const childKey = keys[frame.index++]!;
+		open.delete(node);
+		return;
+	}
+	const holder = node as Record<string, unknown>;
+	const site = resolvedImageSiteOf(holder, key);
+	const ref = site === undefined ? undefined : imageAt(holder, site);
+	if (site !== undefined && typeof ref === "string" && isBlobRef(ref)) {
+		sites.push({ holder, key: site, ref, asDataUrl: false });
+		// An image payload's other fields hold no image.
+		if (site === "data") return;
+	}
+	open.add(holder);
+	for (const childKey in holder) {
 		const child = holder[childKey];
-		if (typeof child !== "string") {
-			enter(child, childKey);
-		} else if (resolvedImageSiteOf(child, childKey) !== undefined && isBlobRef(child)) {
+		if (typeof child === "object" && child !== null) yield blobRefSitesIn(child, childKey, sites, open);
+		else if (typeof child === "string" && resolvedImageSiteOf(child, childKey) !== undefined && isBlobRef(child)) {
 			// A provider image's URL: its blob holds the whole data URL.
 			sites.push({ holder, key: childKey, ref: child, asDataUrl: true });
 		}
 	}
+	open.delete(holder);
 }
 
 /**

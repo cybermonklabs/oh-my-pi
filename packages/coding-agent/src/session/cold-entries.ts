@@ -269,17 +269,32 @@ function staysInMemory(value: unknown): boolean {
 
 /**
  * Whether `value`'s JSON text fits in `limit` UTF-8 bytes and holds no blob
- * reference. A walk that counts each UTF-16 unit as one byte bounds the text
- * from below and stops as soon as it passes the limit, so a large value is
- * rejected without serializing it.
+ * reference. {@link jsonTextMayFit} rejects a large value without serializing
+ * it, and a value it accepts serializes, however it nests.
  */
 function jsonFits(value: object, limit: number): boolean {
+	if (!jsonTextMayFit(value, limit, isBlobRef)) return false;
+	const text = stringifyJson(value);
+	return text === undefined || Buffer.byteLength(text, "utf8") <= limit;
+}
+
+/**
+ * Whether `value`'s JSON text can be at most `limit` UTF-16 units long, and
+ * holds no string `rejects` matches. A walk that counts each unit of each
+ * string and key, and at least one for each node, bounds the text from below
+ * and stops as soon as it passes `limit`, so a large value is rejected without
+ * serializing it: one nested deeper than `JSON.stringify` recurses (a
+ * transcript line can nest 400,000 levels) raises no `RangeError`. Every node
+ * adds at least one unit, so the walk reads at most `limit` nodes, a cycle
+ * included; a value it accepts nests at most `limit` levels, so it serializes.
+ */
+export function jsonTextMayFit(value: object, limit: number, rejects?: (text: string) => boolean): boolean {
 	let lowerBound = 0;
 	const pending: unknown[] = [value];
 	while (pending.length > 0) {
 		const item = pending.pop();
 		if (typeof item === "string") {
-			if (isBlobRef(item)) return false;
+			if (rejects?.(item)) return false;
 			lowerBound += item.length + 2;
 		} else if (typeof item === "number" || typeof item === "boolean" || item === null) lowerBound += 1;
 		else if (Array.isArray(item)) {
@@ -298,8 +313,7 @@ function jsonFits(value: object, limit: number): boolean {
 		}
 		if (lowerBound > limit) return false;
 	}
-	const text = stringifyJson(value);
-	return text === undefined || Buffer.byteLength(text, "utf8") <= limit;
+	return true;
 }
 
 /**

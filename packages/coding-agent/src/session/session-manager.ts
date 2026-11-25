@@ -48,6 +48,7 @@ import {
 	hydrateColdEntry,
 	hydrateKeptEntries,
 	isColdEntry,
+	jsonTextMayFit,
 	wholeTargetsOf,
 } from "./cold-entries";
 import {
@@ -1073,36 +1074,13 @@ class LoadedValueInterner {
 /**
  * The JSON text of `runtime` as the key the loaded entries share it under, or
  * `undefined` when it is longer than {@link INTERNED_RUNTIME_MAX_UNITS} and so
- * shared with nothing. A walk that counts each UTF-16 unit of the text it
- * would write, as `jsonFits` in `cold-entries.ts` does, bounds the length from
- * below and stops as soon as it passes the limit, so a large runtime is
- * rejected without serializing it: an entry carrying one nested deeper than
- * `JSON.stringify` recurses (a transcript line can nest 400,000 levels) is
- * read without the `RangeError` serializing it raises. Every node adds at
- * least one unit, so the walk reads at most that many nodes, a cycle included;
- * a runtime it leaves under the limit holds at most that many units of JSON,
- * so it nests at most that many levels and serializes.
+ * shared with nothing. {@link jsonTextMayFit} rejects a large runtime without
+ * serializing it, so an entry carrying one nested deeper than `JSON.stringify`
+ * recurses (a transcript line can nest 400,000 levels) is read without the
+ * `RangeError` serializing it raises, and one it accepts serializes.
  */
 function internedRuntimeKey(runtime: object): string | undefined {
-	let lowerBound = 0;
-	const pending: unknown[] = [runtime];
-	while (pending.length > 0) {
-		const item = pending.pop();
-		if (typeof item === "string") lowerBound += item.length + 2;
-		else if (Array.isArray(item)) {
-			lowerBound += item.length + 1;
-			for (const element of item) pending.push(element);
-		} else if (typeof item === "object" && item !== null) {
-			lowerBound += 1;
-			for (const key in item) {
-				const child: unknown = Reflect.get(item, key);
-				if (child === undefined || typeof child === "function") continue;
-				lowerBound += key.length + 3;
-				pending.push(child);
-			}
-		} else lowerBound += 1;
-		if (lowerBound > INTERNED_RUNTIME_MAX_UNITS) return undefined;
-	}
+	if (!jsonTextMayFit(runtime, INTERNED_RUNTIME_MAX_UNITS)) return undefined;
 	const key = stringifyJson(runtime);
 	return key !== undefined && key.length <= INTERNED_RUNTIME_MAX_UNITS ? key : undefined;
 }
