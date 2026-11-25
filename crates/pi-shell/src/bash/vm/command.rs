@@ -468,10 +468,12 @@ fn assignment_statement(
 }
 
 /// A failed assignment statement: bash reports it and abandons the rest of
-/// the command line; a posix shell exits ([`exec::jump_out`]: an
-/// arithmetic subscript error's jump comes after `top_level_cleanup`).
-/// Under `set -e` a readonly variable or a bad subscript exits at once
-/// ([`exec::report_error_exits`]).
+/// the command line; a posix shell exits. An arithmetic error in a
+/// subscript (`a[1/0]=v`, bash's `array_expand_index`) or in an integer
+/// variable's value (`x=1/0`, `make_variable_value`) runs
+/// `top_level_cleanup`, then `jump_to_top_level (DISCARD)`
+/// ([`Flow::DiscardTop`]), in posix mode too. Under `set -e` a readonly
+/// variable or a bad subscript exits at once ([`exec::report_error_exits`]).
 fn assign_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: Diag) -> Flow {
 	if exec::report_error_exits(k, cx, vp, &d) {
 		let status = exec::report_error_status(vp, &d);
@@ -479,19 +481,18 @@ fn assign_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: 
 		return Flow::Exit(status, exec::Jump::Direct);
 	}
 	// An integer variable's value that is no valid arithmetic (`local -i n;
-	// n=1/0`): bash's `make_variable_value` runs `top_level_cleanup` and
-	// discards the command whatever the level, also in posix mode, where the
-	// assignment never comes back to exit (variables.c:2944). Its error is
-	// the only arithmetic one an assignment returns: one in the value's
-	// expansion stops before it, a subscript's is `ArithSubscript`.
-	let integer =
-		matches!(d, Diag::Arith { .. }) && vp.mode.dialect() != crate::bash::ids::Dialect::Zsh;
-	let cleanup = integer || exec::cleanup_jump(vp, &d);
+	// n=1/0`) is `Diag::ArithValue`: bash's `make_variable_value` runs
+	// `top_level_cleanup` and discards the command whatever the level, also
+	// in posix mode, where the assignment never comes back to exit
+	// (variables.c:2944).
+	let cleanup = exec::cleanup_jump(vp, &d);
 	k.diag(cx, vp, line, d);
-	let flow = if !integer
-		&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false)
+	let flow = if cleanup {
+		Flow::DiscardTop(1)
+	} else if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+		.unwrap_or(false)
 	{
-		Flow::Exit(1, exec::top_level_jump(cx, vp, cleanup))
+		Flow::Exit(1, exec::top_level_jump(cx, vp, false))
 	} else {
 		Flow::Discard(1)
 	};
@@ -1065,12 +1066,16 @@ fn expand(
 				continue;
 			}
 		}
-		// A prefix assignment's value takes the visible variable's attributes
-		// (`-i`, case conversion) and `+=`.
+		// A prefix assignment's value as the command's environment holds it
+		// ([`builtins::prefix_value`]).
 		let value = match (assign_only, &index, value) {
 			(false, None, AssignValue::Scalar(raw)) => {
 				match builtins::prefix_value(k, cx, vp, &name, &raw, append) {
 					Ok(converted) => AssignValue::Scalar(converted),
+					// `x+=1/0 cmd` with an integer `x` abandons the line.
+					Err(diag) if exec::cleanup_jump(vp, &diag) => {
+						return Some(assign_failed(k, vp, cx, line, diag));
+					},
 					Err(diag) => {
 						k.diag(cx, vp, line, diag);
 						// bash does not run the command.
@@ -4816,31 +4821,19 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 
 /// The flow of a command abandoned after bash runs every unwind-protect
 /// (`top_level_cleanup`, or `run_unwind_protects` alone): a builtin's
-/// arithmetic subscript error or `suspend`'s usage error, a function past
-/// `FUNCNEST`. The jump then goes to the outermost catch: the whole `-c`
-/// string when the run's own text is running ([`Flow::Abort`]). zsh: a
-/// builtin's `zerr` (`errflag`) unwinds through `zsh_discard` (always-lists
-/// run, the builtin's status stays); `Abort` is the parse-error path.
+/// arithmetic subscript error, integer value error or extra arguments
+/// (`no_args`), a function past `FUNCNEST`. Running every unwind-protect
+/// restores each `parse_and_execute`'s saved jump target, so the jump passes
+/// every `eval`, `.` and trap action to the run's own top
+/// ([`Flow::DiscardTop`]): a `-c` string ends, a script goes on with its next
+/// line. zsh: a builtin's `zerr` (`errflag`) unwinds through `zsh_discard`
+/// (always-lists run, the builtin's status stays).
 fn cleanup_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: i32) -> Flow {
-	let command = matches!(
-		state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
-		Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
-	);
-	let in_run = vp
-		.frames
-		.iter()
-		.rev()
-		.find(|f| matches!(f.kind, FrameKind::Script { .. }))
-		.is_some_and(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Run, .. }));
-	let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
-	let flow = if command && in_run && !zsh {
-		Flow::Abort(n)
-	} else {
-		Flow::Discard(n)
-	};
-	if !zsh {
-		exec::jump_out(k, cx, vp, true, &flow);
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		return Flow::Discard(n);
 	}
+	let flow = Flow::DiscardTop(n);
+	exec::jump_out(k, cx, vp, true, &flow);
 	flow
 }
 

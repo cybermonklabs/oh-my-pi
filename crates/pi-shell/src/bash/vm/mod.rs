@@ -2950,8 +2950,15 @@ impl Vproc {
 		frame.ignore_errexit = self.frames.last().is_some_and(exec::errexit_ignored);
 		// bash's fork keeps `parse_and_execute_level`: a child started
 		// inside an `eval`, `.` or trap action (or a child of one) runs
-		// inside that level.
-		if self.frames.iter().any(exec::parse_and_execute) {
+		// inside that level; one started inside a substitution's text keeps
+		// the substitution's jump target.
+		if self
+			.frames
+			.first()
+			.is_some_and(|f| f.parse_level.substitution())
+		{
+			frame.parse_level = proc::ParseLevel::InSubstitution;
+		} else if self.frames.iter().any(exec::parse_and_execute) {
 			frame.parse_level = proc::ParseLevel::Kept;
 		}
 		// Room for exactly this frame: a `Frame` is ~300 bytes and a first
