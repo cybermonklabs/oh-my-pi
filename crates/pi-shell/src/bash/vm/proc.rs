@@ -1012,16 +1012,15 @@ impl Vproc {
 
 	/// Bash defers trapped signals while waiting for a foreground command.
 	/// Not between the commands of a `${ ;}` or `${| ;}` body that bash runs
-	/// in the shell itself (in a simple command's words, a compound
-	/// command's own redirection): bash runs a pending trap as each command
-	/// there ends (`run_pending_traps`), before a later `break` can leave the
-	/// trap nothing to run. bash expands a program's redirections, and a
-	/// `( … )`'s, in its forked child, so a trap set off there waits for
-	/// that child, as it does here for the fork made for them
-	/// ([`Awaited::Fork`], the `( … )`'s child). A builtin's or function's
-	/// redirections are made in the shell, where bash runs such a trap at
-	/// once; this shell still holds it back while any simple command's
-	/// redirections are made.
+	/// in the shell itself (in a simple command's words, a builtin's or
+	/// function's redirections, a compound command's own redirection): bash
+	/// runs a pending trap as each command there ends (`run_pending_traps`),
+	/// before a later `break` can leave the trap nothing to run. bash expands
+	/// a program's redirections, and a `( … )`'s, in its forked child, so a
+	/// trap that a `kill $$` there sets off waits for that child, as it does
+	/// here for the fork made for them ([`Awaited::Fork`], the `( … )`'s
+	/// child). That fork, or a job's or pipeline stage's own fork that makes
+	/// them itself, runs a trap of its own at once, as bash's child does.
 	pub fn waiting_foreground(&self) -> bool {
 		self
 			.frames
@@ -1031,17 +1030,10 @@ impl Vproc {
 				frame.scratch.as_ref().is_some_and(|scratch| {
 					!scratch.children.is_empty()
 						|| match scratch.sub {
-							Some(PendingSub::NoFork { .. }) => {
-								!self
-									.frames
-									.get(i + 1)
-									.is_some_and(|above| above.kind == FrameKind::NoFork)
-									|| scratch
-										.exec
-										.as_deref()
-										.is_some_and(|exec| exec.stage == Stage::Redirect)
-									|| super::exec::subshell_redirection(frame)
-							},
+							Some(PendingSub::NoFork { .. }) => !self
+								.frames
+								.get(i + 1)
+								.is_some_and(|above| above.kind == FrameKind::NoFork),
 							Some(_) => true,
 							None => false,
 						}
