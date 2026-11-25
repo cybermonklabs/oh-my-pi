@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { untilAborted } from "@oh-my-pi/pi-utils/abortable";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
+import { throwIfRunAbandoned } from "../eval/js/shared/abandoned-run";
 import { throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
@@ -346,6 +347,9 @@ export function waitForRun(
 	opts?: WaitPredicateOptions,
 ): Promise<unknown> {
 	const promise = (async (): Promise<unknown> => {
+		// Code of an abandoned run that calls the bare `wait` gets the next run's; it must not wait (or count as
+		// in flight) under that run.
+		throwIfRunAbandoned();
 		throwIfAborted(signal);
 		if (typeof msOrPredicate === "number") {
 			await untilAborted(signal, async () => await Bun.sleep(msOrPredicate));
@@ -374,7 +378,10 @@ export function waitForRun(
 	return trackBrowserRunPromise(promise);
 }
 
-/** Binds a long-lived scope facade (page/tab/desktop objects) to one evaluated run's abort signal. */
+/**
+ * Binds a long-lived scope facade (page/tab/desktop objects) to one evaluated run's abort signal. Code of an
+ * abandoned run is refused too, so it cannot drive the facade of the run that owns the realm now.
+ */
 export function bindRunFacade<T extends object>(
 	target: T,
 	signal: AbortSignal,
@@ -385,12 +392,14 @@ export function bindRunFacade<T extends object>(
 	return new Proxy(target, {
 		get(current, prop) {
 			throwIfAborted(signal);
+			throwIfRunAbandoned();
 			const cached = cache.get(prop);
 			if (cached) return cached;
 			const value = Reflect.get(current, prop, current);
 			if (typeof value === "function") {
 				const wrapped = (...args: unknown[]): unknown => {
 					throwIfAborted(signal);
+					throwIfRunAbandoned();
 					const result = Reflect.apply(value, current, args);
 					if (result && typeof result === "object") {
 						const then = Reflect.get(result, "then");

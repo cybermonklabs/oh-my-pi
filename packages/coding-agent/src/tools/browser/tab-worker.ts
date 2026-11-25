@@ -2054,6 +2054,9 @@ export class WorkerCore {
 		let failure: { error: unknown } | undefined;
 		let recoverTab = false;
 		let runPage: RunPageScope | undefined;
+		// Whether the run's code started and settled; code still running past its cancel or timeout is discarded.
+		let runStarted = false;
+		let runSettled = false;
 		try {
 			throwIfAborted(signal);
 			await untilAborted(signal, () => this.#emulation?.reapply() ?? Promise.resolve());
@@ -2127,15 +2130,22 @@ export class WorkerCore {
 				returnValue = await withBrowserPromiseCombinatorTracking(
 					active.rejectionOwner,
 					onFloatingRejection,
-					async () =>
-						await Promise.race([
-							runtime.run(msg.code, `browser-run-${msg.id}.js`, hooks, {
-								runId: msg.id,
-								cwd: msg.session.cwd,
-							}),
-							cancelRejection,
-							floatingFailure.promise,
-						]),
+					async () => {
+						const running = runtime.run(msg.code, `browser-run-${msg.id}.js`, hooks, {
+							runId: msg.id,
+							cwd: msg.session.cwd,
+						});
+						runStarted = true;
+						running.then(
+							() => {
+								runSettled = true;
+							},
+							() => {
+								runSettled = true;
+							},
+						);
+						return await Promise.race([running, cancelRejection, floatingFailure.promise]);
+					},
 				);
 				completed = true;
 			} finally {
@@ -2144,6 +2154,12 @@ export class WorkerCore {
 		} catch (error) {
 			failure = { error };
 		} finally {
+			// Code still running past its cancel or timeout holds the realm, which an inline worker shares with omp:
+			// drop its runtime so other runs can start (as `runInProcessTab` does); the next run gets a fresh one.
+			if (runStarted && !runSettled) {
+				this.#runtime?.dispose();
+				this.#runtime = null;
+			}
 			runAc.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Browser run ended")));
 			await Bun.sleep(0);
 			// Detach first: the stop below fails the cancelled requests, and run handlers that see
@@ -2226,6 +2242,8 @@ export class WorkerCore {
 	}
 
 	#ensureRuntime(session: SessionSnapshot): JsRuntime {
+		// A core that stopped while a run waited builds no runtime: nothing would dispose it.
+		if (this.#stopped) throw new ToolAbortError("Tab worker stopped");
 		if (this.#runtime) return this.#runtime;
 		this.#runtime = new JsRuntime({
 			initialCwd: session.cwd,
@@ -3655,6 +3673,9 @@ export class WorkerCore {
 		this.#stopped = true;
 		this.#unsub();
 		this.#uninstallRejectionGuard();
+		// The tab's runtime ends with the core: an inline core shares omp's realm, whose global table would keep it.
+		this.#runtime?.dispose();
+		this.#runtime = null;
 		return true;
 	}
 

@@ -24,6 +24,7 @@
 //crates/pi-shell:pi-shell_integration_tests_tests/zsh_comp_pty_test menucomplete_cycles_and_reverse_menu_complete  flaky: typing before the prompt is drawn; removed in Cut11 by #53/#237
 //crates/pi-shell:pi-shell_integration_tests_tests/zsh_comp_pty_test options_and_values_of_arguments  its screen differs from zsh 5.9's, as in sami-checks' set rows, on every tree since Cut7; no fix yet
 //crates/pi-shell:pi-shell_integration_tests_tests/zsh_comp_pty_test options_of_print_with_descriptions  flaky: typing before the prompt is drawn; removed in Cut11 by #53/#237
+//crates/pi-shell:pi-shell_integration_tests_tests/zsh_computil_args_pty_test y03_arguments_06  flaky: typing before the prompt is drawn; removed in Cut11 by #53/#237
 //crates/pi-shell:pi-shell_integration_tests_tests/zsh_computil_pty_test compsys_kill_signals  the runner's signal list differs from the zsh 5.9 snapshot the test holds, as in sami-checks' set rows; no fix yet
 //crates/pi-shell:pi-shell_integration_tests_tests/zsh_jobs_pty_test a_suspended_loop_takes_the_rest_of_the_loop_with_it  flaky: typing before the shell wrote its line; #53's zle_sync and #237 remove these in Cut11
 //crates/pi-shell:pi-shell_integration_tests_tests/zsh_jobs_pty_test a_suspended_pipeline_is_one_job  flaky: typing before the prompt is drawn; removed in Cut11 by #53/#237

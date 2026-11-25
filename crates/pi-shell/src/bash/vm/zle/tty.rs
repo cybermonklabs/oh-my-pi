@@ -6,13 +6,18 @@
 //! belong to job control (`jobctl`), which opens the terminal at
 //! interactive startup: ZLE borrows them.
 
-use std::task::{Context, Poll};
+use std::{
+	collections::VecDeque,
+	task::{Context, Poll},
+};
+
+use bstr::BString;
 
 use crate::bash::{
 	event::WaitKey,
 	fd::FdRef,
 	term::{CtlChar, SetWhen, TermFlag},
-	vm::{Cx, Kernel, jobctl},
+	vm::{Cx, Kernel, jobctl, proc::PendingWrite},
 };
 
 /// The descriptor number that stands for the editing terminal: in a
@@ -195,6 +200,18 @@ impl Tty {
 		None
 	}
 
+	/// [`Self::flush`] where shell code runs next (a line read, a widget's
+	/// function, the command after `vared`, `zle -I` or `zle -R`, a hook
+	/// after `PROMPT_SP`): what the terminal does not take now holds the
+	/// vproc's next op back ([`hold`]), as zsh's blocking `fflush(shout)`
+	/// does. An external writes to the terminal itself: started while
+	/// display bytes were going out, its output came before them.
+	pub fn flush_or_hold(&mut self, k: &Kernel, out: &mut VecDeque<PendingWrite>) {
+		if self.flush(k).is_some() {
+			hold(out);
+		}
+	}
+
 	/// One byte typed, if one is there (`Ok(None)`: nothing yet, the
 	/// engine's waker is registered); `Err` at end of file
 	/// (`UnexpectedEof`) or on a read error.
@@ -217,4 +234,20 @@ impl Tty {
 		let mut tcx = Context::from_waker(waker);
 		usize::from(self.file.poll_read(&mut tcx, &mut []).is_ready())
 	}
+}
+
+/// Hold the vproc's next op until its terminal output is out: `out` is the
+/// vproc's queued output, which it writes before its next op, the editor's
+/// display and the shell's job notices first (`exec::flush_out`); an empty
+/// entry for [`FD`] makes it wait when nothing else is queued.
+pub fn hold(out: &mut VecDeque<PendingWrite>) {
+	if out.is_empty() {
+		out.push_back(PendingWrite::new(FD, BString::default()));
+	}
+}
+
+/// Whether `out` holds output still to write: anything but a [`hold`],
+/// which writes nothing.
+pub fn has_output(out: &VecDeque<PendingWrite>) -> bool {
+	out.iter().any(|w| w.fd != FD || !w.bytes.is_empty())
 }

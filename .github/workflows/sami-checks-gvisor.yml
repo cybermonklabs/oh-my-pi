@@ -1,0 +1,116 @@
+# sami checks' gVisor rows, called by sami-checks.yml once its build and tools jobs are done. Report
+# only, as the rest of sami checks.
+#
+# What it runs. The tests of the sami-checks rows the gate kit also ran under gVisor, from the same
+# build archive, in a gVisor sandbox instead of on the runner's kernel:
+#   - the pi-shell set, each test binary in a libtest process of its own at --test-threads=4 with
+#     the hang bound, over 4 shards per user; the lib binary's run is also the one-process lib row;
+#   - pi-builtins under nextest's default profile, with the tree's own .config/nextest.toml;
+#   - the control of the host's map limit: the lib's testkit::suites::orphan_jobs module at 4
+#     threads, after the lib in the shard that holds it (it died of SIGSEGV at the runner's default
+#     vm.max_map_count);
+# each as uid 1000 and as root: one job per (user, set shard) and per (user, pi-builtins).
+#
+# How. Each job raises the host's vm.max_map_count (gvisor-host.sh says why), installs gVisor's
+# runsc from a pinned release, registers it with
+# Docker on the systrap platform (no KVM needed), proves a runsc container runs on gVisor's kernel
+# (its dmesg banner, with runc as the control), and builds the test image sc-gv: ubuntu 24.04 (the
+# gate kit's image), the packages the tests call, the reference tools of the tools job at /, the
+# locales, and the user runner (uid 1000). gvisor.sh then starts one runsc container with the
+# archive and the tool read-only and the tree, each at its host path, and gvisor-run.sh runs the
+# tests inside it, as uid 1000 through setpriv or as root.
+#
+# Where the result is. Each job uploads sc-res-<job name> (one sc.py result per unit, and the
+# logs); sami-checks.yml's summary reads them with every other row. sc.py expected_units() names
+# each unit, so a gVisor job that reported nothing makes its units and rows UNKNOWN.
+#
+# Security. permissions: contents: read; no secrets; every checkout drops its credential; no cache.
+name: sami checks gVisor
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: "The commit under test (the plan's)"
+        required: true
+        type: string
+      silent:
+        description: "The summary's control: a job name that uploads nothing"
+        required: false
+        default: ""
+        type: string
+      matrix:
+        description: "The plan's gVisor jobs (sc.py gvisor_matrix(), JSON)"
+        required: true
+        type: string
+      set_shards:
+        description: "The number of pi-shell set shards per user"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+cache-mode: none
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # As sami-checks.yml sets them: a called workflow does not see its caller's env.
+  NEXTEST_VERSION: "0.9.151"
+  SC: ${{ github.workspace }}/sc
+  SC_TREE: ${{ github.workspace }}/tree
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  SC_TEST_PATH: /opt/sc-ref/bin:/usr/local/bin:/usr/bin:/bin
+  SC_BIN_BOUND: "1800"
+  SC_GV_SET_SHARDS: ${{ inputs.set_shards }}
+  # pi-builtins' check_folded_sources tests, which run their host half where names fold (as in
+  # sami-checks.yml's pi-builtins job).
+  SC_FOLDED: 'test(/::a_source_whose_name_folds_to_the_backup_is_not_/)'
+
+jobs:
+  gvisor:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-tools
+          path: ${{ github.workspace }}/sc/tools
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sc-archive
+          path: ${{ github.workspace }}/sc/archive
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        if: matrix.part == 'builtins'
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: gVisor and the test image
+        run: bash tool/.github/sami-checks/gvisor-host.sh "$SC/tools/sc-tools.tgz"
+      - name: Unpack the archive where it was built
+        run: tar --zstd -xf "$SC/archive/tests.tar.zst" -C "$GITHUB_WORKSPACE" && du -sh "$CARGO_TARGET_DIR"
+      - name: Tests
+        run: bash tool/.github/sami-checks/gvisor.sh "${{ matrix.who }}" "${{ matrix.part }}" "${{ matrix.shard }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && inputs.silent != matrix.name }}
+        with:
+          name: sc-res-${{ matrix.name }}
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14

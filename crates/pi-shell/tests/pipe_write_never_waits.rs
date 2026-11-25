@@ -22,7 +22,10 @@ fn deadline(what: &'static str, limit: Duration) -> std::sync::mpsc::Sender<()> 
 	let (done, finished) = channel::<()>();
 	thread::spawn(move || {
 		if finished.recv_timeout(limit) == Err(RecvTimeoutError::Timeout) {
-			eprintln!("DEADLINE fired: {what} did not return within {limit:?}");
+			// Straight to fd 2: libtest's capture takes `eprintln!`
+			// in this thread too, and `exit` drops what it took.
+			let line = format!("DEADLINE fired: {what} did not return within {limit:?}\n");
+			let _ = io::Write::write_all(&mut io::stderr(), line.as_bytes());
 			std::process::exit(1);
 		}
 	});

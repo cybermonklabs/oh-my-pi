@@ -60,3 +60,31 @@ fn functions_and_sourced_text_called_from_a_condition_ignore_it() {
 	assert_eq!(out, "in g\nt\nev\nt2\n");
 	assert_eq!(status, 0);
 }
+
+// Failure mode: the `!` of a background job inverted the job's status, so
+// `wait $!` of `! false &` returned 0 and `set -e` let the shell run on.
+// bash 5.3.20 (and 5.2.21, zsh 5.9) do not invert it: the asynchronous
+// child clears `CMD_INVERT_RETURN`, and errexit stays off in the job's
+// pipeline. Controls: a `!` inside the job, a timed one (bash: not
+// inverted) and an and-or list keep their meaning.
+#[test]
+fn a_background_jobs_negation_does_not_invert_its_status() {
+	let (out, status) = run(
+		"! false & wait $!; echo a=$?; ! true & wait $!; echo b=$?; ! ( exit 3 ) & wait $!; echo \
+		 c=$?; f() { return 2; }; ! f & wait $!; echo d=$?; ! false & echo q=$?; wait",
+	);
+	assert_eq!(out, "a=1\nb=0\nc=3\nd=2\nq=0\n");
+	assert_eq!(status, 0);
+	let (out, status) = run("set -e; ! { false; echo after; } & wait $!; echo st=$?");
+	assert_eq!(out, "after\nst=0\n", "errexit is off in the job");
+	assert_eq!(status, 0);
+	let (out, status) = run("set -e; ! false & wait $!; echo no");
+	assert_eq!(out, "", "wait returns 1, and set -e exits");
+	assert_eq!(status, 1);
+	let (out, status) = run(
+		"{ ! false; } & wait $!; echo e=$?; ! false && true & wait $!; echo f=$?; TIMEFORMAT=; time \
+		 ! false & wait $!; echo g=$?",
+	);
+	assert_eq!(out, "e=0\nf=0\ng=1\n", "controls");
+	assert_eq!(status, 0);
+}

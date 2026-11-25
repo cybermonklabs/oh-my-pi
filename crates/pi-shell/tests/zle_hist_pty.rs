@@ -414,3 +414,53 @@ fn edited_history_lines_are_kept_until_accept() {
 fn edited_history_lines_are_forgotten_after_accept() {
 	same_log(SHOW, "\x10\x10XX\x0e\x0eecho hi\r\x10\x10\x10\x18p");
 }
+
+/// The mail notice comes before the prompt (zsh `preprompt` writes
+/// `PROMPT_SP`, then the notice; `zleread` draws the prompt after them):
+/// a mailbox that grows while the shell waits, `MAILCHECK=1`, one empty
+/// line. With `PROMPT_SP` still going out, the notice waited behind it and
+/// went out after the prompt (`% You have new mail.`).
+#[test]
+fn the_mail_notice_comes_before_the_prompt() {
+	assert!(have_real_zsh(), "no real zsh");
+	let dir = tempfile::tempdir().unwrap();
+	let mbox = dir.path().join("mbox");
+	std::fs::write(&mbox, "From someone\nhello\n").unwrap();
+	let mk = |real: bool| {
+		let s = if real {
+			Spawn::real_zsh()
+		} else {
+			Spawn::zsh()
+		};
+		s.args(["-f", "-i"])
+			.env("PS1", "%# ")
+			.env("MAIL", &mbox)
+			.env("MAILCHECK", "1")
+			.cwd("/tmp")
+			.size(24, 80)
+	};
+	// `MAILCHECK` counts whole seconds: the mailbox grows more than a second
+	// after the first prompt's check, and the line comes more than a second
+	// after that.
+	let run = |pty: &mut Pty| -> io::Result<()> {
+		pty.settle(QUIET, TIMEOUT)?;
+		std::thread::sleep(Duration::from_millis(1200));
+		let mut f = std::fs::OpenOptions::new().append(true).open(&mbox)?;
+		io::Write::write_all(&mut f, b"From someone else\nmore\n")?;
+		drop(f);
+		std::thread::sleep(Duration::from_millis(1200));
+		keys(pty, "\r")
+	};
+	let (ours, real) = differential(mk(false), mk(true), run).unwrap();
+	let after_a_prompt = |s: &str| {
+		s.lines().any(|l| {
+			let t = l.trim_start();
+			(t.starts_with('%') || t.starts_with('#')) && t.contains("You have new mail.")
+		})
+	};
+	assert!(real.contains("You have new mail.") && !after_a_prompt(&real), "zsh:\n{real}");
+	assert!(
+		ours.contains("You have new mail.") && !after_a_prompt(&ours),
+		"obash:\n{ours}\n--- zsh:\n{real}"
+	);
+}

@@ -8,9 +8,13 @@
 #     later, so sami itself is not tested again).
 #   - A dispatch tests any pushed commit, given as a full 40-character id:
 #       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
-#         -f commit=<sha> [-f silent=<job name>]
+#         -f commit=<sha> [-f silent=<job name>] [-f plant=docs|changelog]
 #     `silent` is the summary's control: the named job (for example set-root-2) uploads nothing,
-#     and the summary must then read its units and its row UNKNOWN.
+#     and the summary must then read its units and its row UNKNOWN. `silent=macos-bash` instead
+#     makes the macOS legs skip their bash 5 install, and the macOS row must read UNKNOWN.
+#     `plant` is the docs or changelog row's control: that job first adds a fault to the tree
+#     (sc.py PLANTS: a doc comment with a broken intra-doc link, or an empty CHANGELOG heading),
+#     and the summary says at its top whether the row then read FAIL naming it.
 #   - A push of feat/sami-checks (this tool's own branch) runs only the plan job's selftest: the
 #     counters and the summary against hand-made inputs. GitHub dispatches only a workflow it has
 #     seen run, and this file is not on the default branch; that push run registers it.
@@ -32,6 +36,18 @@
 #     cargo workspaces, sdk/rust/omp-rpc among them, and the tests only macOS can run): the
 #     rust-test job calls .github/workflows/sami-rust-test.yml, whose jobs build their own tests.
 #     The summary has a row for each of its two jobs, read from that job's result.
+#   - macOS and Windows: platform-checks.yml (the fork's platform checks, a called workflow) builds
+#     pi-shell's tests once per platform on macos-15 and windows-2025 and runs them under nextest;
+#     the summary reads its own report (pc-report) as one unit per platform.
+#   - clippy: cargo clippy --tests --no-deps --keep-going --message-format=json -- -D warnings of
+#     pi-shell, pi-vcs, pi-vfs, pi-walker, pi-builtins and pi-natives, one unit per crate, then each
+#     crate again with an unused import planted as its control (.github/sami-checks/clippy.sh). A
+#     crate fails only on findings beyond .github/sami-checks/clippy-baseline.txt, the findings the
+#     release already has (the cut's rule, at no second build); its header says how to regenerate
+#     it. It lints Linux code only; code built only for macOS or Windows is compiled, not linted, in
+#     the platform rows.
+#   - under gVisor (sami-checks-gvisor.yml): the pi-shell set (and so the one-process lib) and
+#     pi-builtins again, from the same archive, in a runsc container, as uid 1000 and as root.
 # The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
 # in the tools job (.github/sami-checks/tools.sh), on hosts .github/sami-checks/host.sh sets up.
 # sdk/rust/omp-rpc is its own cargo workspace and is not in the archive (sami-rust-test.yml runs it).
@@ -39,12 +55,14 @@
 # Where the result is. The summary job's step summary: a row per check (PASS, FAIL or UNKNOWN),
 # its units' counts, each failing test by name, each UNKNOWN with its reason, the 20 slowest tests
 # and the units by time. A unit whose runner did not end normally (libtest 0 or 101, nextest 0 or
-# 100, bun 0 or 1 with its summary line, JUnit report and matching counts), in which a passing test
-# printed a skip marker (unless the same test passed as the other user, or each skip line is a
-# sub-case .github/sami-checks/partial-skips.txt lets that test skip and its witness line is in its
-# output: a partial pass, listed), or that no job or two jobs reported, is UNKNOWN, and so is its
+# 100, bun 0 or 1 with its summary line, JUnit report and matching counts, clippy 0 or 101 with its
+# control caught), in which a passing test printed a skip marker (unless the same test passed as
+# the other user, or each skip line is a sub-case .github/sami-checks/partial-skips.txt lets that
+# test skip and its witness line is in its output: a partial pass, listed), whose platform the
+# platform checks gave no verdict, or that no job or two jobs reported, is UNKNOWN, and so is its
 # row. The summary job fails unless every row passed, so the run's colour is the result.
-# Artifacts: sc-report (summary.md), sc-res-<job> (each unit's result and log), sc-build.
+# Artifacts: sc-report (summary.md), sc-res-<job> (each unit's result and log), sc-build, and the
+# platform checks' own (pc-report, pc-results-*, pc-build-*).
 # Known failures: .github/sami-checks/known-failures.txt names tests that fail on every tree for a
 # reason the tree does not own yet; the summary shows each failure KNOWN (with the reason) or NEW, a
 # unit whose only failures are known reads KNOWN unless a test in it skipped itself and passed as no
@@ -62,18 +80,30 @@
 # tree that says skip and that the summary's rule does not read; the summary job runs the same check
 # on every line a passing test printed (sc.py skip-lines), and both are units of the row "skip
 # prints the summary reads".
+# Docs and CHANGELOGs: the docs job runs `cargo doc --no-deps -p pi-shell` with
+# -D rustdoc::broken_intra_doc_links on the tree's toolchain, cold like the build job, twice: as
+# published (unit `public`) and with --document-private-items (unit `private`), and names each
+# broken link by path, line and link text (docs.sh). The changelog job runs
+# `bun scripts/fix-changelogs.ts --check` on a checkout with the full history and tags (the tool
+# reads its baseline from the latest v* tag) and names each CHANGELOG the tool would rewrite with
+# the first lines it changes (changelog.sh). Both start with the plan and add no time to the run.
 #
 # Caches. No job restores or saves a GitHub Actions cache (cache-mode: none for the whole run).
 # The build job compiles dev-dependencies, build scripts and proc macros that release_binary never
 # runs, and a dispatch can name any pushed commit; with cache access on release-candidate either
 # could plant an entry release_binary restores. So every run builds cold: about 15 min for the
-# tests' cargo build and 17 min for the addon on the first runs; bun install takes about 2 s.
-# The rust-test job calls its workflow with cache-mode none, and that workflow declares none too.
-# Security. permissions: contents: read; no secrets; every checkout drops its credential.
+# tests' cargo build and 17 min for the addon on the first runs; bun install takes about 2 s. The
+# rust-test job calls its workflow with cache-mode none, and that workflow declares none too; the
+# called platform checks get none too, because GitHub passes this run's cache-mode to them as their
+# limit.
+# Security. permissions: contents: read; no secrets; every checkout drops its credential. The one
+# exception is on paper only: the platforms job grants actions: write, because GitHub checks the
+# called platform-checks.yml's cache-prune job against it before the run starts; that job runs only
+# on a dispatch of platform-checks.yml itself, so no job of this workflow ever holds the grant.
 name: sami checks
 
 run-name: >-
-  ${{ github.event_name == 'workflow_dispatch' && format('sami checks {0}{1}', inputs.commit, inputs.silent != '' && format(' (control: {0} uploads nothing)', inputs.silent) || '')
+  ${{ github.event_name == 'workflow_dispatch' && format('sami checks {0}{1}{2}', inputs.commit, inputs.silent != '' && format(' (control: silent={0})', inputs.silent) || '', inputs.plant != '' && format(' (control: plant={0})', inputs.plant) || '')
   || github.ref == 'refs/heads/release-candidate' && format('sami checks {0} (release-candidate)', github.sha)
   || 'sami checks: the tool''s own controls' }}
 
@@ -89,7 +119,12 @@ on:
         required: true
         type: string
       silent:
-        description: "Control: a job name (for example set-root-2) that uploads nothing"
+        description: "Control: a job name (for example set-root-2) that uploads nothing, or macos-bash (the macOS legs skip their bash 5 install)"
+        required: false
+        default: ""
+        type: string
+      plant:
+        description: "Control: docs or changelog, a row whose job first plants a fault the row must name"
         required: false
         default: ""
         type: string
@@ -131,6 +166,14 @@ jobs:
       builtins: ${{ steps.plan.outputs.builtins }}
       ts: ${{ steps.plan.outputs.ts }}
       ca_shards: ${{ steps.plan.outputs.ca_shards }}
+      platforms: ${{ steps.plan.outputs.platforms }}
+      platform_crates: ${{ steps.plan.outputs.platform_crates }}
+      platform_partitions: ${{ steps.plan.outputs.platform_partitions }}
+      platform_retries: ${{ steps.plan.outputs.platform_retries }}
+      clippy_crates: ${{ steps.plan.outputs.clippy_crates }}
+      gvisor: ${{ steps.plan.outputs.gvisor }}
+      gv_set_shards: ${{ steps.plan.outputs.gv_set_shards }}
+      plant: ${{ steps.plan.outputs.plant }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -144,6 +187,7 @@ jobs:
         env:
           SC_INPUT_COMMIT: ${{ inputs.commit }}
           SC_INPUT_SILENT: ${{ inputs.silent }}
+          SC_INPUT_PLANT: ${{ inputs.plant }}
         run: python3 tool/.github/sami-checks/sc.py plan | tee -a "$GITHUB_OUTPUT"
 
   tools:
@@ -554,10 +598,86 @@ jobs:
       addon-sha256: ${{ needs.natives.outputs.addon-sha256 }}
       addon-commit: ${{ needs.natives.outputs.addon-commit }}
 
+  platforms:
+    # macOS and Windows: the fork's platform checks, called on the candidate. Its report job's
+    # pc-report is what the summary reads.
+    name: platforms
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    # The most the called workflow may ask. GitHub checks each called job's permissions against
+    # these before the run starts, whether or not the job runs, and platform-checks.yml's
+    # cache-prune job asks for actions: write. That job runs only on a dispatch of
+    # platform-checks.yml itself, so in this workflow no job holds actions: write; every other
+    # called job asks only for contents: read.
+    permissions:
+      actions: write
+      contents: read
+    # No cache-mode here: the workflow's none is the called workflows' limit, so their builds
+    # restore and save nothing (platform-checks declares read or write nowhere a call reaches).
+    uses: ./.github/workflows/platform-checks.yml
+    with:
+      head: ${{ needs.plan.outputs.commit }}
+      platforms: ${{ needs.plan.outputs.platforms }}
+      crates: ${{ needs.plan.outputs.platform_crates }}
+      partitions: ${{ needs.plan.outputs.platform_partitions }}
+      retries: ${{ needs.plan.outputs.platform_retries }}
+      # The control `silent=macos-bash`: the macOS legs skip the Homebrew bash install, and their
+      # check stops them, so the macOS row must read UNKNOWN.
+      skip_bash_install: ${{ needs.plan.outputs.silent == 'macos-bash' }}
+
+  clippy:
+    name: clippy
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # Clippy compiles the candidate's crates, their tests and their dependencies cold, as the build
+    # job does: no cache (the workflow's cache-mode none).
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-clippy
+      SC_CLIPPY_CRATES: ${{ needs.plan.outputs.clippy_crates }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: Toolchain (the tree's rust-toolchain.toml channel, minimal profile, clippy)
+        run: |
+          ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SC_TREE/rust-toolchain.toml" | head -n 1)
+          [ -n "$ch" ] || { echo "::error::no channel in the tree's rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$ch" --profile minimal -c clippy --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$ch" >> "$GITHUB_ENV"
+      - name: Clippy, then its control
+        run: bash tool/.github/sami-checks/clippy.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'clippy' }}
+        with:
+          name: sc-res-clippy
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  gvisor:
+    name: gVisor
+    needs: [plan, tools, build]
+    if: ${{ !cancelled() && needs.plan.outputs.commit != '' && needs.build.result == 'success' }}
+    uses: ./.github/workflows/sami-checks-gvisor.yml
+    with:
+      commit: ${{ needs.plan.outputs.commit }}
+      silent: ${{ needs.plan.outputs.silent }}
+      matrix: ${{ needs.plan.outputs.gvisor }}
+      set_shards: ${{ needs.plan.outputs.gv_set_shards }}
+
   summary:
     name: summary
     # rust-test is here so that the summary runs last and reads its two jobs' results (SC_RUST_TESTS).
-    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms, rust-test]
+    needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms,
+            platforms, clippy, gvisor, docs, changelog, rust-test]
     if: ${{ always() && needs.plan.outputs.commit != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -580,12 +700,41 @@ jobs:
         with:
           name: sc-build
           path: ${{ github.workspace }}/sc/build
+      # The platform checks' report, each leg's record and JUnit report (for its times), and each
+      # build's record and log (an UNKNOWN names a failed build's first compiler error).
+      - name: Platform report
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pc-report
+          path: ${{ github.workspace }}/sc/pc
+      - name: Platform legs
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: pc-results-*
+          merge-multiple: true
+          path: ${{ github.workspace }}/sc/pc
+      - name: Platform builds
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: pc-build-*
+          merge-multiple: true
+          path: ${{ github.workspace }}/sc/pc
       - name: Summary
         env:
           SC_COMMIT: ${{ needs.plan.outputs.commit }}
           SC_RUST_TESTS: "rust_test=${{ needs.rust-test.outputs.rust-test }} rust_test_macos=${{ needs.rust-test.outputs.rust-test-macos }}"
+          SC_SILENT: ${{ needs.plan.outputs.silent }}
+          SC_PLANT: ${{ needs.plan.outputs.plant }}
         run: |
-          mkdir -p "$SC/report" "$SC/results/sc-skip-lines" "$SC/build"
+          mkdir -p "$SC/report" "$SC/results/sc-skip-lines" "$SC/build" "$SC/pc"
+          # The control `silent=platforms`: the platform results are not read, so both rows must be UNKNOWN.
+          if [ "$SC_SILENT" != platforms ]; then
+            python3 tool/.github/sami-checks/sc.py platforms "$SC/pc" "$SC/results/sc-res-platforms" ||
+              echo "::error::the platform report reader failed, so the platform rows read UNKNOWN"
+          fi
           rc=0
           # The run-time half of skip-forms, a unit of its row: a result the summary reads like any other
           # (no file, as when this command fails, reads UNKNOWN).
@@ -631,5 +780,76 @@ jobs:
         if: ${{ always() && needs.plan.outputs.silent != 'skip-forms' }}
         with:
           name: sc-res-skip-forms
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  docs:
+    # rustdoc's broken intra-doc links in pi-shell (docs.sh), on the tree's toolchain, built cold.
+    name: rustdoc intra-doc links
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: Toolchain (the tree's rust-toolchain.toml channel, minimal profile)
+        run: |
+          ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SC_TREE/rust-toolchain.toml" | head -n 1)
+          [ -n "$ch" ] || { echo "::error::no channel in the tree's rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$ch" >> "$GITHUB_ENV"
+      - name: cargo doc -p pi-shell
+        env:
+          SC_PLANT: ${{ needs.plan.outputs.plant }}
+        run: bash tool/.github/sami-checks/docs.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'docs' }}
+        with:
+          name: sc-res-docs
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  changelog:
+    # fix-changelogs.ts --check (changelog.sh). The tool reads its baseline from the latest v* tag
+    # and its archive links from the history, so this checkout has both.
+    name: CHANGELOG format
+    needs: plan
+    if: needs.plan.outputs.commit != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: bun 1.4.5
+        run: bash tool/.github/sami-checks/bun.sh
+      - name: bun install
+        working-directory: tree
+        run: bun install --frozen-lockfile
+      - name: fix-changelogs --check
+        env:
+          SC_PLANT: ${{ needs.plan.outputs.plant }}
+        run: bash tool/.github/sami-checks/changelog.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'changelog' }}
+        with:
+          name: sc-res-changelog
           path: ${{ github.workspace }}/sc/res/
           retention-days: 14

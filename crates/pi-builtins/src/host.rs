@@ -4999,36 +4999,191 @@ mod testing {
 		(std::fs::File::from(OwnedFd::from(reader)), writer, capacity)
 	}
 
+	/// A current-thread runtime for a test that drains a full pipe, and the
+	/// name that its blocking-pool threads carry and no other thread does
+	/// ([`once_the_write_waits`] looks at them).
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	pub(crate) fn drain_runtime() -> (tokio::runtime::Runtime, String) {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+
+		static RUNTIMES: AtomicUsize = AtomicUsize::new(0);
+		// Within the 15 bytes Linux keeps of a thread's name.
+		let pool = format!("drain-pool-{}", RUNTIMES.fetch_add(1, Ordering::Relaxed));
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.thread_name(pool.as_str())
+			.enable_all()
+			.build()
+			.unwrap();
+		(runtime, pool)
+	}
+
+	/// The bytes in the pipe `reader` reads (`FIONREAD`).
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	fn queued(reader: &std::fs::File) -> std::io::Result<usize> {
+		use std::os::fd::AsRawFd;
+
+		let mut queued: libc::c_int = 0;
+		// SAFETY: `FIONREAD` writes one `c_int` through the pointer, which is
+		// valid for the call; `reader` owns the fd.
+		if unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &raw mut queued) } != 0 {
+			return Err(std::io::Error::last_os_error());
+		}
+		usize::try_from(queued).map_err(std::io::Error::other)
+	}
+
+	/// Whether every thread named `pool` is asleep (`S` in procfs), and the
+	/// tids of those that are not; `None` when the scan of this process's
+	/// threads did not see the calling one, and so saw nothing.
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	fn pool_awake(pool: &str) -> Option<Vec<String>> {
+		// SAFETY: `gettid` has no preconditions.
+		let me = unsafe { libc::gettid() }.to_string();
+		let (mut seen_me, mut awake) = (false, Vec::new());
+		for task in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
+			let tid = task.file_name().to_string_lossy().into_owned();
+			seen_me |= tid == me;
+			if !std::fs::read_to_string(task.path().join("comm")).is_ok_and(|comm| comm.trim() == pool) {
+				continue;
+			}
+			// `tid (comm) state ...`; a thread gone since the listing runs
+			// nothing.
+			let running = std::fs::read_to_string(task.path().join("stat"))
+				.ok()
+				.is_some_and(|stat| stat.rsplit_once(") ").is_some_and(|(_, rest)| !rest.starts_with('S')));
+			if running {
+				awake.push(tid);
+			}
+		}
+		seen_me.then_some(awake)
+	}
+
+	/// Ready once the write into the full pipe `reader` reads is seen
+	/// waiting for room: the pipe holds all its `capacity` bytes, every
+	/// worker of this runtime is parked (an odd park/unpark count), and no
+	/// thread of its blocking pool (named `pool`, [`drain_runtime`]) is
+	/// running, all of it unchanged over two polls 10 ms apart. The runs
+	/// these tests make have nothing else to wait on by then: the write is
+	/// the only work left, and the pipe it writes to is full. A write that
+	/// waits in the kernel on the runtime's thread leaves that worker in a
+	/// poll, not parked, so it is never seen waiting and the panic below
+	/// says so; a write on the blocking pool sleeps in `write(2)` there and
+	/// leaves the worker parked, so it is. The route the write takes is not
+	/// read: any writer that leaves the runtime's thread free passes.
+	///
+	/// A thread of its own looks, so that the runtime's thread can park
+	/// (a poll on the runtime would unpark it) and so that a write holding
+	/// that thread is seen. Panics once 4 s pass, naming what was seen last.
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	async fn once_the_write_waits(reader: &std::fs::File, capacity: usize, pool: &str) {
+		use std::time::{Duration, Instant};
+
+		/// How long the waiting state must hold, over two polls at least.
+		const STEADY: Duration = Duration::from_millis(10);
+
+		let metrics = tokio::runtime::Handle::current().metrics();
+		let pipe = reader.try_clone().expect("a second descriptor of the pipe's read end");
+		let pool = pool.to_owned();
+		let (seen, waits) = tokio::sync::oneshot::channel::<Result<(), String>>();
+		std::thread::spawn(move || {
+			let start = Instant::now();
+			let mut pause = Duration::from_millis(1);
+			let mut steady: Option<(Vec<u64>, Instant)> = None;
+			while !seen.is_closed() {
+				let parks: Vec<u64> =
+					(0..metrics.num_workers()).map(|worker| metrics.worker_park_unpark_count(worker)).collect();
+				let in_pipe = queued(&pipe);
+				let awake = pool_awake(&pool);
+				let waiting = parks.iter().all(|n| !n.is_multiple_of(2))
+					&& in_pipe.as_ref().ok() == Some(&capacity)
+					&& awake.as_deref().is_some_and(<[String]>::is_empty);
+				steady = match (waiting, steady.take()) {
+					(false, _) => None,
+					(true, Some((before, since))) if before == parks => {
+						if since.elapsed() >= STEADY {
+							let _ = seen.send(Ok(()));
+							return;
+						}
+						Some((before, since))
+					},
+					(true, _) => Some((parks.clone(), Instant::now())),
+				};
+				if start.elapsed() >= Duration::from_secs(4) {
+					let _ = seen.send(Err(format!(
+						"the write into the full pipe was never seen waiting for room within 4 s: worker \
+						 park/unpark counts {parks:?} (odd: parked), {in_pipe:?} of {capacity} bytes in the \
+						 pipe, blocking-pool threads running: {awake:?} (None: the scan of this process's \
+						 threads saw nothing)"
+					)));
+					return;
+				}
+				std::thread::sleep(pause);
+				pause = (pause * 2).min(Duration::from_millis(20));
+			}
+		});
+		match waits.await {
+			Ok(Ok(())) => {},
+			Ok(Err(missed)) => panic!("{missed}"),
+			Err(_) => panic!("the thread looking for the waiting write ended without a result"),
+		}
+	}
+
+	/// Reads the `capacity` bytes the fill left in the full pipe `reader`
+	/// reads, once the write into that pipe is seen waiting for room
+	/// ([`once_the_write_waits`]). Read before that, the write would find
+	/// room, and a write that waits in the kernel would pass too.
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	pub(crate) async fn drain_once_the_write_waits(
+		mut reader: std::fs::File,
+		capacity: usize,
+		pool: &str,
+	) -> std::fs::File {
+		once_the_write_waits(&reader, capacity, pool).await;
+		reader.read_exact(&mut vec![0; capacity]).unwrap();
+		reader
+	}
+
+	/// What a test's runtime thread sent on `finished` within 5 s. Panics
+	/// with `DEADLINE fired: {deadline}` when it sent nothing by then, and
+	/// says so when the thread ended without sending: it panicked, and its
+	/// message is above.
+	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
+	pub(crate) fn sent_within_5s<T>(finished: &std::sync::mpsc::Receiver<T>, deadline: &str) -> T {
+		use std::sync::mpsc::RecvTimeoutError;
+
+		match finished.recv_timeout(std::time::Duration::from_secs(5)) {
+			Ok(sent) => sent,
+			Err(RecvTimeoutError::Timeout) => panic!("DEADLINE fired: {deadline}"),
+			Err(RecvTimeoutError::Disconnected) => {
+				panic!("the runtime's thread panicked before it sent its result; its message is above")
+			},
+		}
+	}
+
 	/// Runs `run` on a current-thread runtime while a task on the same
-	/// thread drains the full stdout pipe, and returns its status; ends the
-	/// test naming `what` once 5 s pass. A write that waits in the kernel
-	/// holds the only thread, so the drain never runs.
+	/// thread drains the full stdout pipe ([`drain_once_the_write_waits`]),
+	/// and returns its status; ends the test naming `what` once 5 s pass. A
+	/// write that waits in the kernel holds the only thread, so the drain
+	/// never runs.
 	#[cfg(all(target_os = "linux", any(feature = "util.cat", feature = "util.rg", feature = "util.find")))]
 	fn status_while_a_reader_drains<F: Future<Output = i32>>(
 		what: &'static str,
-		mut reader: std::fs::File,
+		reader: std::fs::File,
 		capacity: usize,
 		run: impl FnOnce() -> F + Send + 'static,
 	) -> i32 {
-		use std::{sync::mpsc::channel, time::Duration};
+		use std::sync::mpsc::channel;
 
 		let (done, finished) = channel();
 		std::thread::spawn(move || {
-			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+			let (runtime, pool) = drain_runtime();
 			let status = runtime.block_on(async {
-				let drain = async {
-					tokio::time::sleep(Duration::from_millis(100)).await;
-					reader.read_exact(&mut vec![0; capacity]).unwrap();
-					reader
-				};
+				let drain = drain_once_the_write_waits(reader, capacity, &pool);
 				let (status, _reader) = tokio::join!(run(), drain);
 				status
 			});
 			let _ = done.send(status);
 		});
-		finished
-			.recv_timeout(Duration::from_secs(5))
-			.unwrap_or_else(|_| panic!("DEADLINE fired: {what} did not return"))
+		sent_within_5s(&finished, &format!("{what} did not return"))
 	}
 
 	/// `argv` as an invocation in a scratch directory with a file `f`
@@ -5061,22 +5216,24 @@ mod testing {
 	}
 
 	/// Usage text to a pipe nothing drains ends once the run is cancelled
-	/// (its timeout): the report must not keep the run.
+	/// (its timeout): the report must not keep the run. The cancel comes
+	/// once the report is seen waiting for room ([`once_the_write_waits`]).
 	#[cfg(all(target_os = "linux", feature = "util.cat"))]
 	#[test]
 	fn help_to_a_pipe_nothing_drains_ends_when_the_run_is_cancelled() {
-		use std::{sync::mpsc::channel, time::Duration};
+		use std::sync::mpsc::channel;
 
-		let (reader, writer, _) = full_pipe();
+		let (reader, writer, capacity) = full_pipe();
+		let observed = reader.try_clone().expect("a second descriptor of the pipe's read end");
 		let (mut invocation, _tree) = invocation_to(&["cat", "--help"], writer);
 		let token = tokio_util::sync::CancellationToken::new();
 		invocation.cancel = Some(token.clone());
 		let (done, finished) = channel();
 		std::thread::spawn(move || {
-			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+			let (runtime, pool) = drain_runtime();
 			let status = runtime.block_on(async {
 				let cancel = async {
-					tokio::time::sleep(Duration::from_millis(200)).await;
+					once_the_write_waits(&observed, capacity, &pool).await;
 					token.cancel();
 				};
 				let (status, ()) = tokio::join!(run_utility::<crate::cat::Cat>(invocation), cancel);
@@ -5084,9 +5241,7 @@ mod testing {
 			});
 			let _ = done.send(status);
 		});
-		finished
-			.recv_timeout(Duration::from_secs(5))
-			.expect("DEADLINE fired: cat --help outlived the run's cancellation");
+		sent_within_5s(&finished, "cat --help outlived the run's cancellation");
 		drop(reader);
 	}
 
@@ -5224,4 +5379,8 @@ pub(crate) use testing::{Refused, Refusing, on_path, widowed_pipe};
 #[cfg(all(test, target_os = "linux"))]
 #[allow(unused_imports, reason = "used by utility test modules, which are feature-gated")]
 pub(crate) use testing::{SHOW_ARGS, exec_limits, exec_refusal, lines_run};
+#[cfg(all(test, target_os = "linux", feature = "util.rg"))]
+pub(crate) use testing::{drain_once_the_write_waits, drain_runtime};
+#[cfg(all(test, target_os = "linux", any(feature = "util.rg", feature = "util.find")))]
+pub(crate) use testing::sent_within_5s;
 
