@@ -4,26 +4,20 @@
 //! the port of zsh's `Test/comptest` harness ([`comptest`]).
 //!
 //! Environment switches (both crates read them):
-//! - `PI_COMP_ORACLE=1` runs `/bin/zsh` instead of obash, checking the stored
-//!   expectations against zsh itself.
+//! - `PI_COMP_ORACLE=1` runs the real zsh ([`crate::zsh_oracle::path`]) instead
+//!   of obash, checking the stored expectations against zsh itself.
 //! - `PI_COMP_BLESS=1` (with `PI_COMP_ORACLE=1`) rewrites the stored screen
-//!   snapshots of `zsh_comp_pty` from `/bin/zsh`.
-//! - `PI_COMP_QUIET_MS` how long output must stay quiet before a screen is read
-//!   (default 400).
+//!   snapshots of `zsh_comp_pty` from the real zsh.
 
 #![allow(dead_code, reason = "each test crate uses a subset")]
 
 pub mod comptest;
 
-use std::{
-	env,
-	path::{Path, PathBuf},
-	time::Duration,
-};
+use std::{env, path::PathBuf};
 
-use crate::pty_support::{REAL_ZSH, Spawn, have_real_zsh};
+use crate::pty_support::{Spawn, have_real_zsh};
 
-/// Whether `/bin/zsh` runs instead of obash (`PI_COMP_ORACLE`).
+/// Whether the real zsh runs instead of obash (`PI_COMP_ORACLE`).
 #[must_use]
 pub fn oracle() -> bool {
 	flag("PI_COMP_ORACLE")
@@ -39,25 +33,15 @@ fn flag(name: &str) -> bool {
 	env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// How long output must stay quiet before a screen is read.
-#[must_use]
-pub fn quiet() -> Duration {
-	let ms = env::var("PI_COMP_QUIET_MS")
-		.ok()
-		.and_then(|v| v.parse().ok())
-		.unwrap_or(400);
-	Duration::from_millis(ms)
-}
-
 /// The shell under test: obash as `zsh`, or the real zsh in oracle mode.
 ///
 /// # Panics
 ///
-/// In oracle mode without `/bin/zsh`.
+/// In oracle mode without the real zsh ([`crate::zsh_oracle::path`]).
 #[must_use]
 pub fn shell() -> Spawn {
 	if oracle() {
-		assert!(have_real_zsh(), "PI_COMP_ORACLE needs {REAL_ZSH}");
+		assert!(have_real_zsh(), "PI_COMP_ORACLE needs {}", crate::zsh_oracle::path().display());
 		Spawn::real_zsh()
 	} else {
 		Spawn::zsh()
@@ -65,39 +49,23 @@ pub fn shell() -> Spawn {
 }
 
 /// The directories of zsh 5.9's shell-code completion functions
-/// (`_main_complete`, `compinit`, ...) as installed: one flat directory
-/// (macOS, `/usr/share/zsh/5.9/functions`) or the source-tree layout
-/// (Debian, `/usr/share/zsh/functions/Completion/Base`, ...). `None` when
-/// neither exists; the tests then skip.
+/// (`_main_complete`, `compinit`, ...) as the real zsh installed them
+/// ([`crate::zsh_oracle::own_function_dirs`]): one flat directory (macOS,
+/// `/usr/share/zsh/5.9/functions`) or the source-tree layout (Debian,
+/// `/usr/share/zsh/functions/Completion/Base`, ...). `None` without them:
+/// the tests then compare nothing, and the calling test is reported
+/// [`crate::zsh_oracle::uncompared`].
 #[must_use]
 pub fn compsys_fpath() -> Option<Vec<PathBuf>> {
-	for root in ["/usr/share/zsh/5.9/functions", "/usr/share/zsh/functions"] {
-		let root = Path::new(root);
-		if root.join("_main_complete").is_file() && root.join("compinit").is_file() {
-			return Some(vec![root.to_owned()]);
-		}
-		if root.join("Completion/Base/_main_complete").is_file() {
-			let mut dirs = Vec::new();
-			for top in sorted_dirs(root) {
-				dirs.extend(sorted_dirs(&top));
-				dirs.push(top);
-			}
-			return Some(dirs);
-		}
+	let (root, dirs) = crate::zsh_oracle::own_function_dirs()?;
+	if dirs.iter().any(|d| d.join("_main_complete").is_file()) {
+		return Some(dirs);
 	}
+	crate::zsh_oracle::uncompared(&format!(
+		"zsh 5.9's completion functions are not installed (no _main_complete under {})",
+		root.display()
+	));
 	None
-}
-
-fn sorted_dirs(dir: &Path) -> Vec<PathBuf> {
-	let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
-		.into_iter()
-		.flatten()
-		.flatten()
-		.map(|e| e.path())
-		.filter(|p| p.is_dir())
-		.collect();
-	dirs.sort();
-	dirs
 }
 
 /// `fpath=( ... )` words for [`compsys_fpath`] (the paths need no quoting).

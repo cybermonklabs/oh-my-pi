@@ -18,7 +18,11 @@ use crate::{
 		ModeId, NativeRef, ProcEvent, ResolveCtx, Resolved, Rlimit, SpawnFuture, SpawnSpec, StdFd,
 		SystemTimeLike, Task, Timer, TtyInfo, UserInfo, Verdict, Vpid,
 	},
-	process::{pending_fs::PendingFs, signals::Signals, timer::Timers},
+	process::{
+		pending_fs::PendingFs,
+		signals::{Signals, WakeOnSignal},
+		timer::Timers,
+	},
 	sys::{Exits, NativeSpawner, Sessions, SpawnConfig, StdFs, std_stream},
 };
 
@@ -47,8 +51,10 @@ pub struct NativeHost {
 	/// five times: 20 id and `getgroups` syscalls).
 	user:      std::cell::OnceCell<UserInfo>,
 	/// The shell caught OS signals go to ([`Self::bind_signals`]): every
-	/// external this host spawns hands them over when its exit is observed.
-	bridge:    Option<(ControlHandle, Vpid)>,
+	/// external this host spawns hands them over when its exit is observed,
+	/// and each one caught stops the running vproc at its next op
+	/// ([`WakeOnSignal`]).
+	bridge:    Option<(ControlHandle, Vpid, WakeOnSignal)>,
 	/// The process's terminals ([`crate::bash::Host::terminal`]).
 	#[cfg(any(unix, windows))]
 	terminal:  crate::sys::tty::NativeTerminal,
@@ -58,6 +64,9 @@ pub struct NativeHost {
 	/// pi's builtin utilities standing in for tools `PATH` lacks
 	/// ([`crate::bash::Host::fallback`]); `None` offers none.
 	extras:    Option<Extras>,
+	/// The shell runs inside another runtime's process
+	/// ([`crate::process::ProcessOptions::embedded`]).
+	embedded:  bool,
 }
 
 /// The utilities a process shell offers where `PATH` has none (`ls`,
@@ -175,6 +184,7 @@ impl NativeHost {
 			#[cfg(unix)]
 			sockets: crate::sys::socket::NativeSockets,
 			extras: None,
+			embedded,
 		}
 	}
 
@@ -196,18 +206,24 @@ impl NativeHost {
 		self.extras = Some(Extras { tools, runtime: None });
 	}
 
-	/// Deliver the OS signals caught before an external's exit to the root
-	/// vproc `root` of the shell `ctl` controls as soon as the engine
-	/// observes that exit, before the command after it runs. bash handles a
-	/// signal that arrived while it waited for a foreground child before
-	/// its next command; obash's run loop forwards caught signals only
-	/// between steps, and a step that reaps the child would otherwise run
-	/// on into the next command first (`/bin/kill -USR1 $$; echo after`
-	/// printed `after` without the trap's output). Called by `main` and
-	/// the fault injector right after `Shell::create` / `Shell::restore`;
-	/// externals spawned for an earlier shell keep its handle.
+	/// Deliver the OS signals caught to the root vproc `root` of the shell
+	/// `ctl` controls: each one caught stops the running vproc at its next
+	/// op, which has the engine ask for it ([`WakeOnSignal`],
+	/// [`crate::bash::Host::forward_signals`]); one caught before an
+	/// external's exit is handed over as soon as the engine observes that
+	/// exit, before the command after it runs. bash handles a signal as it
+	/// comes while it runs shell code, and one that came while it waited for
+	/// a foreground child before its next command (`/bin/kill -USR1 $$; echo
+	/// after` printed `after` without the trap's output, as did a trap whose
+	/// signal came while a loop of builtins ran the script to its end).
+	/// Called by `main` and the fault injector right after `Shell::create` /
+	/// `Shell::restore`; externals spawned for an earlier shell keep its
+	/// handle.
 	pub fn bind_signals(&mut self, ctl: ControlHandle, root: Vpid) {
-		self.bridge = Some((ctl, root));
+		// The signals wake one shell at a time: the earlier one first stops.
+		self.bridge = None;
+		let wake = WakeOnSignal::new(&ctl);
+		self.bridge = Some((ctl, root, wake));
 	}
 
 	/// The signals ignored on entry this host reports
@@ -273,7 +289,10 @@ impl crate::bash::Host for NativeHost {
 	/// (`ETXTBSY`), which is tried again after waits on this host's timers
 	/// ([`crate::sys::Started::settle`]): the engine runs on meanwhile.
 	fn spawn(&mut self, spec: SpawnSpec<'_>) -> SpawnFuture {
-		let bridge = self.bridge.clone();
+		let bridge = self
+			.bridge
+			.as_ref()
+			.map(|(ctl, root, _)| (ctl.clone(), *root));
 		let bridged = move |child: Box<dyn ExtProc>| -> Box<dyn ExtProc> {
 			match bridge {
 				Some((ctl, root)) => Box::new(SignalsOnExit { child, ctl, root }),
@@ -333,6 +352,19 @@ impl crate::bash::Host for NativeHost {
 		self.signals.forget_ignored(signal);
 	}
 
+	/// Embedded, only the signals the runtime hands over
+	/// ([`crate::process::ProcessOptions::embedded`]): the runtime's own
+	/// handlers of the others (its fault handlers) stay.
+	fn may_catch(&self, signal: crate::bash::Signal) -> bool {
+		!self.embedded || crate::process::signals::handed_over(signal)
+	}
+
+	fn forward_signals(&mut self) {
+		if let Some((ctl, root, _)) = &self.bridge {
+			Signals::dispatch(ctl, *root);
+		}
+	}
+
 	fn fs(&mut self) -> &mut dyn Fs {
 		&mut *self.fs
 	}
@@ -377,6 +409,35 @@ impl crate::bash::Host for NativeHost {
 
 	fn user(&self) -> UserInfo {
 		self.user.get_or_init(crate::sys::user::read_user).clone()
+	}
+
+	fn login_name(&self) -> Option<BString> {
+		#[cfg(unix)]
+		{
+			// POSIX `getlogin_r`, which the `libc` crate does not bind: the
+			// name goes into a buffer of ours, so another thread of an
+			// embedding process that calls `getlogin` cannot overwrite it.
+			unsafe extern "C" {
+				fn getlogin_r(name: *mut libc::c_char, size: libc::size_t) -> libc::c_int;
+			}
+			let mut buf = vec![0u8; 256];
+			loop {
+				// SAFETY: `buf` is writable for its whole length, which is
+				// passed as the size.
+				let rc = unsafe { getlogin_r(buf.as_mut_ptr().cast(), buf.len()) };
+				if rc == libc::ERANGE && buf.len() < 1 << 16 {
+					buf.resize(buf.len() * 2, 0);
+					continue;
+				}
+				if rc != 0 {
+					return None;
+				}
+				let name = std::ffi::CStr::from_bytes_until_nul(&buf).ok()?.to_bytes();
+				return (!name.is_empty()).then(|| BString::from(name));
+			}
+		}
+		#[cfg(not(unix))]
+		None
 	}
 
 	fn login_shell(&self) -> Option<BString> {
@@ -557,6 +618,10 @@ impl ExtProc for SignalsOnExit {
 	fn cont(&mut self) -> io::Result<()> {
 		self.child.cont()
 	}
+
+	fn release(&mut self) {
+		self.child.release();
+	}
 }
 
 /// The signals this process ignores now: call at startup, before any trap,
@@ -727,39 +792,20 @@ pub fn inherited_fds(_embedded: bool) -> Vec<(i32, Box<dyn File>)> {
 	Vec::new()
 }
 
+/// bash `get_current_user_info` for `SHELL`: the login shell of the user's
+/// password database entry; `/bin/sh` for a uid without one; else
+/// `$SHELL` (off Unix, or an entry with no shell).
 fn read_login_shell() -> Option<BString> {
+	let from_env = || std::env::var_os("SHELL").map(|v| BString::from(v.as_encoded_bytes()));
 	#[cfg(unix)]
 	{
 		// SAFETY: getuid has no preconditions.
-		login_shell(unsafe { libc::getuid() })
-			.or_else(|| std::env::var_os("SHELL").map(|v| BString::from(v.as_encoded_bytes())))
+		match crate::sys::user::passwd_entry(unsafe { libc::getuid() }) {
+			Some(pw) if !pw.shell.is_empty() => Some(pw.shell),
+			Some(_) => from_env(),
+			None => Some(BString::from("/bin/sh")),
+		}
 	}
 	#[cfg(not(unix))]
-	std::env::var_os("SHELL").map(|v| BString::from(v.as_encoded_bytes()))
-}
-
-/// The login shell of `uid` from the password database (bash sets `SHELL`
-/// from it when the environment has none).
-#[cfg(unix)]
-fn login_shell(uid: libc::uid_t) -> Option<BString> {
-	let mut buf = vec![0u8; 4096];
-	let mut pw = std::mem::MaybeUninit::<libc::passwd>::zeroed();
-	let mut found: *mut libc::passwd = std::ptr::null_mut();
-	// SAFETY: every pointer is valid for the call; `buf` holds the strings
-	// `pw` points into and outlives their use below.
-	let rc = unsafe {
-		libc::getpwuid_r(uid, pw.as_mut_ptr(), buf.as_mut_ptr().cast(), buf.len(), &raw mut found)
-	};
-	if rc != 0 || found.is_null() {
-		return None;
-	}
-	// SAFETY: getpwuid_r succeeded, so `pw` is initialized and `pw_shell`
-	// is null or a NUL-terminated string inside `buf`.
-	let shell = unsafe { pw.assume_init().pw_shell };
-	if shell.is_null() {
-		return None;
-	}
-	// SAFETY: see above.
-	let bytes = unsafe { std::ffi::CStr::from_ptr(shell) }.to_bytes();
-	(!bytes.is_empty()).then(|| BString::from(bytes))
+	from_env()
 }

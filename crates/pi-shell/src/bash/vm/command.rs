@@ -75,6 +75,9 @@ impl ExecState {
 			resumed: 0,
 			raised: false,
 			var_fds: None,
+			notice: None,
+			in_place: false,
+			subshell_exec: false,
 		}
 	}
 
@@ -108,6 +111,9 @@ impl ExecState {
 			resumed,
 			raised,
 			var_fds,
+			notice,
+			in_place,
+			subshell_exec,
 		} = self;
 		*stage = Stage::Expand;
 		*old_tag = tag;
@@ -136,6 +142,9 @@ impl ExecState {
 		*resumed = 0;
 		*raised = false;
 		*var_fds = None;
+		*notice = None;
+		*in_place = false;
+		*subshell_exec = false;
 	}
 }
 
@@ -483,10 +492,7 @@ pub fn exec(
 				}
 			},
 			Stage::Output => {
-				if let Some(fd) = exec::flush_out(k, vp) {
-					return Flow::Block(WaitKey::Write { fd });
-				}
-				if let Some(flow) = output(k, vp, cx, line) {
+				if let Some(flow) = write_out(k, vp, cx, line) {
 					return flow;
 				}
 				st(vp).stage = Stage::Finish;
@@ -2614,6 +2620,16 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 					},
 				};
 			}
+			// A signal that came before the program exists is the shell's as it
+			// runs shell code: the host hands it over now, and it is delivered
+			// before the spawn, as bash takes one that comes before it forks (the
+			// program would not have it). One that comes during the spawn is
+			// taken so when the wait begins ([`super::wait_starts`]). The op runs
+			// again then.
+			cx.host.forward_signals();
+			if k.ctl.word() & super::control::SIGNAL != 0 {
+				return Some(Flow::Block(WaitKey::Signal));
+			}
 			let exec_as = st(vp).exec_as.clone();
 			let env = if exec_as.as_ref().is_some_and(|e| e.clear_env) {
 				EnvView::new(Vec::new())
@@ -2651,6 +2667,18 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 					sigmask_ign = sigmask_ign.with(sig);
 				}
 			}
+			// bash: what an asynchronous command starts inherits its
+			// ignored `INT` and `QUIT` ([`exec::async_ignored`]).
+			for sig in [crate::bash::signal::Signal::Int, crate::bash::signal::Signal::Quit] {
+				match exec::async_ignored(cx.store, vp, sig, true) {
+					Ok(true) => sigmask_ign = sigmask_ign.with(sig),
+					Ok(false) => {},
+					Err(err) => {
+						k.fail(err);
+						return Some(Flow::Discard(1));
+					},
+				}
+			}
 			let job = k.job_id(cx.store);
 			let pgroup = super::jobctl::pgroup(k, cx, vp, job);
 			let argv = spawn_argv(&st(vp).argv, exec_as.as_deref());
@@ -2680,6 +2708,22 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			let replaced = redirs
 				.as_ref()
 				.map_or_else(Vec::new, |r| replaced_before_read(&r.list));
+			// Known before the spawn: a signal can come while it is in flight.
+			st(vp).in_place = super::killed::in_place(k, cx, vp, op);
+			st(vp).subshell_exec = super::killed::subshell_exec(k, cx, vp, op);
+			// bash forks the program (`stop_pipeline` first deletes the
+			// finished jobs reported, `jobs.c:572`) unless it runs it with
+			// `exec` in its own process.
+			if !st(vp).in_place && !st(vp).subshell_exec {
+				super::killed::cleanup_dead_jobs(vp);
+			}
+			// The root's process becomes the program's: each signal that would
+			// end it is caught, to be the program's
+			// ([`super::untrapped::program_in_place`]). Before the spawn, so
+			// the program starts with its default.
+			if (vp.parent.is_none() || vp.in_place()) && super::runs_in_place(vp) {
+				super::untrapped::program_in_place(k, cx, vp, true);
+			}
 			let spec = SpawnSpec {
 				path: BStr::new(&path),
 				argv: &argv,
@@ -2807,6 +2851,12 @@ fn spawned_external(
 	if spawned.is_err() && !k.bangs.is_empty() {
 		k.settle_bang(vp.vpid, None);
 	}
+	// No program to give them to: the signals sent while it was spawned go,
+	// and the process is the shell's again
+	// ([`super::untrapped::program_ended`]).
+	if spawned.is_err() && (vp.parent.is_none() || vp.in_place()) {
+		super::untrapped::program_ended(k, cx, vp);
+	}
 	match spawned {
 		Err(_) if child_redirs => {
 			// The redirections are applied here after all, then the spawn
@@ -2819,7 +2869,7 @@ fn spawned_external(
 			}
 			st(vp).stage = Stage::Redirect;
 		},
-		Ok(child) => {
+		Ok(mut child) => {
 			k.forget_deferral(vp.vpid);
 			super::jobctl::spawned(k, vp, child.as_ref());
 			let pid = child.pid();
@@ -2829,10 +2879,20 @@ fn spawned_external(
 			if !k.bangs.is_empty() {
 				k.settle_bang(vp.vpid, Some(pid));
 			}
+			// Sent to the shell while the program it runs in place of itself
+			// was being spawned: the program's.
+			if vp.parent.is_none() || vp.in_place() {
+				for sig in std::mem::take(&mut k.forward).iter() {
+					let _ = child.signal(sig);
+				}
+			}
 			scratch(vp).live = Live::Ext(child);
+			// A pipeline stage that is just this program: its process's pid.
+			super::stage_spawned(k, vp, pid);
 			let s = st(vp);
 			s.waiting = Some(Awaited::Ext { pid });
 			s.stage = Stage::Await;
+			super::wait_starts(k, cx, vp);
 			k.emit_op(cx, vp, op.node, EventData::Spawn { pid, argv });
 		},
 		Err(err) if let Some(too_long) = refusal_to_host(vp, &err, &path, argv) => {
@@ -4467,7 +4527,7 @@ fn settle_builtin(
 			e.wait_for = w.children;
 			e.wait_into = w.into.map(Box::new);
 			e.waiting = Some(if w.any {
-				Awaited::AnyJob
+				Awaited::AnyJob { waited: None }
 			} else if w.all {
 				Awaited::AllJobs
 			} else {
@@ -4823,35 +4883,18 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 		Some(Awaited::Jobs { force }) => {
 			let mut last = st(vp).status;
 			let mut waited = None;
+			let keep = keeps_statuses(k, cx, vp);
 			while let Some(&v) = st(vp).wait_for.first() {
 				// `wait -p` names the child by the pid the user knows (its
 				// program's OS pid), read before the job is forgotten.
 				let shown = vp.shown_pid(v);
-				// A child whose job left the table answers at once with the
-				// status kept for it (bash `wait_for_single_pid`'s
-				// `bgp_search`); a posix shell forgets it (`bgp_delete`).
-				if vp.jobs.by_vpid(v).is_none()
-					&& let Some(s) = vp.jobs.bgp_search(v)
-				{
+				if let Some(s) = waited_status(k, vp, cx, v, keep) {
 					last = s;
-					if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
-						.unwrap_or(false)
-					{
-						state::forget_status(&mut k.root, cx.store, vp, v);
-					}
-				} else if let Some(s) = k.proc_collect(cx.store, v) {
-					last = s;
-					// bash's `wait PID` only marks a job in the table notified:
-					// it leaves later with its status kept (`delete_job`'s
-					// `bgp_add`), so a second `wait PID` returns it again; a
-					// posix shell forgets it (`bgp_delete`).
-					let kept = vp.jobs.by_vpid(v).filter(|j| !j.inherited).map(|j| j.pid());
+					waited_notice(k, vp, cx, v, line);
 					forget_job(vp, v);
-					if let Some(pid) = kept
-						&& !state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
-							.unwrap_or(false)
-					{
-						state::save_status(&mut k.root, cx.store, vp, v, pid, s);
+					// A posix `wait PID` forgets the status (`bgp_delete`).
+					if !keep {
+						state::forget_status(&mut k.root, cx.store, vp, v);
 					}
 					exec::reap_coproc(k, vp, cx, v);
 				} else if let (false, Some(JobState::Stopped(sig))) =
@@ -4860,6 +4903,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					// bash with job control: a stop ends the wait for that job.
 					last = sig.exit_status(platform);
 				} else {
+					// bash writes each job's notice as it reaps it (`wait_for`'s
+					// `notify_and_cleanup`), before it waits for the next.
+					if let Some(flow) = write_out(k, vp, cx, line) {
+						return Some(flow);
+					}
 					return Some(Flow::Block(WaitKey::Proc(v)));
 				}
 				waited = Some(shown);
@@ -4871,60 +4919,121 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			last
 		},
 		Some(Awaited::AllJobs) => {
+			// bash waits for the first job still running, again and again
+			// (`wait_for_background_pids`): it reports that one, and drops a
+			// later one that ended meanwhile unreported, as it drops one that
+			// ended while it wrote a notice (still queued here: the write, not
+			// the job, woke this pass); but not the job `$!` names, which
+			// `mark_dead_jobs_as_notified` keeps for the next line's notice
+			// (`jobs.c:5196`). The list holds the jobs running when `wait`
+			// began, `$!` last: it ends in the pass that keeps it.
+			let last = vp.last_bg;
+			let bash = vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
+			let mut kept = None;
+			let mut first = st(vp).writes.is_empty();
 			while let Some(&v) = st(vp).wait_for.first() {
-				if k.proc_collect(cx.store, v).is_some() {
+				let keep = !first
+					&& last.is(v)
+					&& (matches!(k.proc_state(cx.store, v), Some(super::ProcState::Exited(_)))
+						|| known_status(vp, v).is_some());
+				if keep {
+					kept = Some(v);
+				} else if waited_status(k, vp, cx, v, false).is_some() {
+					if first {
+						waited_notice(k, vp, cx, v, line);
+					}
 					exec::reap_coproc(k, vp, cx, v);
 				} else if !matches!(vp.jobs.by_vpid(v).map(|j| j.state), Some(JobState::Stopped(_))) {
-					// A job stopped meanwhile is skipped (job control).
+					// A job stopped meanwhile is skipped (job control). The
+					// notices so far are out before the wait for this one.
+					if let Some(flow) = write_out(k, vp, cx, line) {
+						return Some(flow);
+					}
 					return Some(Flow::Block(WaitKey::Proc(v)));
 				}
+				first = false;
 				st(vp).wait_for.remove(0);
 			}
-			// bash: `wait` forgets every finished job, except the one `$!`
-			// names when it finished before the wait (POSIX keeps the last
-			// async status until it is waited for or reported). A job this
-			// shell just killed is still being reaped when bash's `wait`
-			// looks, so that wait collects it (jobs.tests).
-			let last = vp.last_bg;
+			// bash: `wait` forgets every finished job but the one `$!` names
+			// (`mark_dead_jobs_as_notified`, `jobs.c:5196`; POSIX keeps the
+			// last async status until it is waited for or reported), unless
+			// this wait waited for it (its process is reaped by then, which
+			// drops it here, as bash's `wait_for_single_pid` marks it
+			// reported) or its status went elsewhere: one that ended before
+			// the wait, or while it waited for another, the next line
+			// reports. zsh forgets the `$!` job a signal ended.
 			let done: Vec<crate::bash::ids::Vpid> = vp
 				.jobs
 				.iter()
 				.filter(|j| match j.state {
 					JobState::Done(status) => {
 						!last.is(j.vpid)
-							|| status > 128
-							|| !matches!(k.proc_state(cx.store, j.vpid), Some(super::ProcState::Exited(_)))
+							|| (kept != Some(j.vpid)
+								&& ((if bash { j.notified } else { status > 128 })
+									|| !matches!(
+										k.proc_state(cx.store, j.vpid),
+										Some(super::ProcState::Exited(_))
+									)))
 					},
 					_ => false,
 				})
 				.map(|j| j.vpid)
 				.collect();
-			for v in done {
-				k.proc_collect(cx.store, v);
-				forget_job(vp, v);
+			// While no job may be deleted, `cleanup_dead_jobs` keeps them
+			// (`jobs.c:1470`).
+			if !vp.jobs_kept() {
+				for v in done {
+					k.proc_collect(cx.store, v);
+					forget_job(vp, v);
+				}
 			}
 			// And bash forgets every status kept (`wait_for_background_pids`'
 			// `bgp_clear`).
 			state::clear_statuses(&mut k.root, cx.store, vp);
 			st(vp).status
 		},
-		Some(Awaited::AnyJob) => {
-			let waiting_for = st(vp).wait_for.clone();
-			let finished = waiting_for.iter().find_map(|&v| {
-				k.proc_state(cx.store, v)
-					.and_then(super::ProcState::exited)
-					// A job that left the table: the status kept for it.
-					.or_else(|| {
-						vp.jobs
-							.by_vpid(v)
-							.is_none()
-							.then(|| vp.jobs.bgp_search(v))
-							.flatten()
-					})
-					.map(|s| (v, s))
-			});
+		Some(Awaited::AnyJob { waited }) => {
+			// While the job list is frozen, bash's `wait_for_any_job` returns
+			// at once (`jobs.c:3465`): `wait -n` ends with 127. Its first pass
+			// takes the first finished job not reported yet (`jobs.c:3470-3474`);
+			// else it waits for a child, and then takes the first finished
+			// job in job order, a reported one too (`jobs.c:3614-3619`): one a
+			// function substitution or `lastpipe` marked reported but kept
+			// comes back before the one that just ended.
+			let frozen = vp.jobs_frozen();
+			let (mut first, mut any, mut running, mut done) = (None, None, None, 0u32);
+			if !frozen {
+				for i in 0..st(vp).wait_for.len() {
+					let v = st(vp).wait_for[i];
+					let reported = vp
+						.jobs
+						.by_vpid(v)
+						.is_some_and(|j| j.notified && matches!(j.state, JobState::Done(_)));
+					let status = k.proc_state(cx.store, v).and_then(super::ProcState::exited);
+					match status.or_else(|| known_status(vp, v)) {
+						Some(s) => {
+							done += 1;
+							any.get_or_insert((v, s));
+							if !reported {
+								first.get_or_insert((v, s));
+							}
+						},
+						None => {
+							running.get_or_insert(v);
+						},
+					}
+				}
+			}
+			// The second pass once a job finished since it blocked (a `CHLD`
+			// trap's `wait` may have reported it meanwhile), not on any wake.
+			let finished = match waited {
+				Some(then) if done > then => any,
+				Some(_) => None,
+				None => first,
+			};
 			let Some((v, status)) = finished else {
-				if let Some(&v) = st(vp).wait_for.first() {
+				if let Some(v) = running {
+					st(vp).waiting = Some(Awaited::AnyJob { waited: Some(waited.unwrap_or(done)) });
 					return Some(Flow::Block(WaitKey::Proc(v)));
 				}
 				let s = st(vp);
@@ -4934,7 +5043,14 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				return None;
 			};
 			let shown = vp.shown_pid(v);
-			k.proc_collect(cx.store, v);
+			// Kept but in posix mode (`delete_job`'s `DEL_NOBGPID`).
+			let keep = keeps_statuses(k, cx, vp);
+			waited_status(k, vp, cx, v, keep);
+			// No notice in a function substitution: bash marks the job
+			// reported there (`jobs.c:3484-3492`).
+			if !vp.jobs_kept() {
+				waited_notice(k, vp, cx, v, line);
+			}
 			forget_job(vp, v);
 			st(vp).wait_for.clear();
 			exec::reap_coproc(k, vp, cx, v);
@@ -5029,6 +5145,11 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				},
 				None => lost(k, vp, cx, op, line, Lost::Ext { vpid: vp.vpid, pid }),
 			};
+			// The shell's process was the program it `exec`ed: bash and zsh
+			// run no EXIT trap after it.
+			if replacing && reaped {
+				super::exec::spend_exit_trap(vp);
+			}
 			if reaped && vp.parent.is_none() && k.jobctl.has_pgrp() {
 				let text = vp
 					.frames
@@ -5043,12 +5164,44 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 					.unwrap_or_default();
 				super::jobctl::fg_done(k, cx, vp, killed, &text);
 			}
+			let in_place = st(vp).in_place;
+			if let (Some(sig), false) = (killed, replacing) {
+				let end = super::killed::killed(k, cx, vp, op, pid, sig, in_place);
+				// bash ran it with `exec`: its process is the command's. In a
+				// subshell zsh ran in place of itself, that process is the
+				// root's too ([`super::proc::VprocZsh::died_of`]). A bash
+				// subshell that ran it with `exec` dies of the signal through
+				// [`super::external_ended`] ([`super::killed::subshell_exec`]).
+				if end.no_fork {
+					let signal = i32::from(sig.number(platform));
+					match run {
+						Some(run) if vp.parent.is_none() => {
+							k.exec_signals.insert(run, signal);
+						},
+						_ if vp.in_place() => vp.zsh_state().died_of = Some(signal),
+						_ => {},
+					}
+				}
+				st(vp).notice = end.notice.map(Box::new);
+			}
+			super::external_ended(k, vp, killed, replacing);
+			// bash reaped every child that had ended as it waited for the
+			// program.
+			if reaped {
+				vp.jobs.all_reaped();
+			}
+			// The program run in place has ended (or is lost): the process is
+			// the shell's own again, with the shell's signal rules; a session
+			// runs its next command ([`super::untrapped::program_ended`]).
+			if vp.parent.is_none() || vp.in_place() {
+				super::untrapped::program_ended(k, cx, vp);
+			}
 			status
 		},
 		None => st(vp).status,
 	};
 	if reaped {
-		super::owe_chld(k, cx, vp, false);
+		super::owe_chld(k, cx, vp, None);
 	}
 	// Tested first: a function call's wait holds none, and the assignment
 	// would call the drop glue anyway.
@@ -5064,10 +5217,87 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 }
 
 /// Drop the job led by `v` from the table once it was waited for (bash
-/// `wait_for_job` marks it notified; `cleanup_dead_jobs` deletes it).
+/// `wait_for_job` marks it notified; `cleanup_dead_jobs` deletes it), and
+/// the other finished jobs already reported (`wait_for`'s
+/// `notify_and_cleanup`, [`super::killed::cleanup_dead_jobs`]).
 fn forget_job(vp: &mut Vproc, v: crate::bash::ids::Vpid) {
+	// While no job may be deleted (a frozen job list, a function
+	// substitution), `delete_job` keeps it (`jobs.c:1492`), marked reported:
+	// a `wait` a trap interrupted still finds it, and prints no notice; the
+	// next cleanup once that is over deletes it.
+	if vp.jobs_kept() {
+		if let Some(job) = vp.jobs.by_vpid_mut(v) {
+			job.notified = true;
+		}
+		return;
+	}
 	if let Some(number) = vp.jobs.by_vpid(v).map(|j| j.number) {
 		vp.jobs.remove(number);
+	}
+	super::killed::cleanup_dead_jobs(vp);
+}
+
+/// Whether `wait` keeps the statuses it collects for a later `wait PID`
+/// (bash's bgp list): bash outside posix mode, where `wait` forgets a
+/// status it returns (`bgp_delete`, `DEL_NOBGPID`). zsh keeps none.
+fn keeps_statuses(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+		&& !state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+			.unwrap_or(false)
+}
+
+/// The status of child `v` that `wait` waits for, once it ended. A child
+/// whose job left the table answers with the status kept for it (bash
+/// `wait_for_single_pid`'s `bgp_search`: a job `disown` dropped while it
+/// ran keeps 0), its own record collected. Else its process's, collected
+/// now and, with `keep`, kept for a later `wait PID` ([`keeps_statuses`]);
+/// else as [`known_status`] has it; `None` while it runs.
+fn waited_status(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	v: crate::bash::ids::Vpid,
+	keep: bool,
+) -> Option<i32> {
+	if vp.jobs.by_vpid(v).is_none()
+		&& let Some(kept) = vp.jobs.bgp_search(v)
+	{
+		let _ = k.proc_collect(cx.store, v);
+		return Some(kept);
+	}
+	if let Some(status) = k.proc_collect(cx.store, v) {
+		if keep {
+			let pid = vp.shown_pid(v);
+			state::save_status(&mut k.root, cx.store, vp, v, pid, status);
+		}
+		return Some(status);
+	}
+	known_status(vp, v)
+}
+
+/// The status of child `v` whose process was collected: its finished job's
+/// in the table (the job's process, which bash's `wait_for` reads), else
+/// the one kept ([`super::proc::JobTable::bgp`], bash `bgp_search`).
+fn known_status(vp: &Vproc, v: crate::bash::ids::Vpid) -> Option<i32> {
+	match vp.jobs.by_vpid(v).map(|j| j.state) {
+		Some(JobState::Done(status)) => Some(status),
+		_ => vp.jobs.bgp_search(v),
+	}
+}
+
+/// `wait` waited for job vproc `v`: bash's notice of the job when a signal
+/// killed it ([`super::killed::waited`]), queued for the command's own
+/// standard error; `wait` writes it ([`write_out`]) before it blocks on its
+/// next job.
+fn waited_notice(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	v: crate::bash::ids::Vpid,
+	line: u32,
+) {
+	if let Some(bytes) = super::killed::waited(k, cx, vp, v, line) {
+		st(vp).writes.push_back(PendingWrite::new(2, bytes.into()));
 	}
 }
 
@@ -5082,6 +5312,17 @@ fn waited_into(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, pid: 
 	if let Err(d) = builtins::set_value(k, cx, vp, lhs, value, Level::Dynamic) {
 		k.diag(cx, vp, line, d);
 	}
+}
+
+/// What is queued, out in order: the shell's own diagnostics
+/// ([`exec::flush_out`]), then the command's output ([`output`]). The flow
+/// to return while a write would block; a write that blocked partway keeps
+/// its progress (`PendingWrite::off`) for the next call.
+fn write_out(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> Option<Flow> {
+	if let Some(fd) = exec::flush_out(k, vp) {
+		return Some(Flow::Block(WaitKey::Write { fd }));
+	}
+	output(k, vp, cx, line)
 }
 
 /// Write the command's own output in order (pollable). A write is done once
@@ -5251,6 +5492,7 @@ fn sigpipe_ignored(store: &mut dyn StateStore, vp: &Vproc) -> bool {
 fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = st(vp);
 	let (status, t0, control) = (e.status, e.t0, e.control);
+	let notice = e.notice.take();
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
 	vp.status = status;
 	// bash's in-shell read of `$(< file)` runs no command: `PIPESTATUS`
@@ -5274,6 +5516,11 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		.and_then(|f| f.scratch.take())
 		.expect("exec scratch");
 	exec::drop_scratch(&mut k.root, cx.store, vp, sc);
+	// bash writes it from the shell, after the command's redirections,
+	// which only its child had.
+	if let Some(bytes) = notice {
+		vp.out.push_back(PendingWrite::new(2, *bytes));
+	}
 	if k.mask.bits() != 0 {
 		vp.fds.set_command_tag(None);
 	}

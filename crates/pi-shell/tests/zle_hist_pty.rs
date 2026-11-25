@@ -5,27 +5,31 @@
 //!
 //! Cases end where the screen shows what the widget did (the line, the
 //! cursor, the incremental search status line, `zle -M` messages from
-//! hooks), or run a command printing the editor state afterwards.
+//! hooks), or run a command printing the editor state afterwards. Each
+//! screen is read once the line editor has handled every key typed and
+//! waits for the next one ([`Pty::zle_sync`]; zsh serves `zle -F` handlers
+//! in every key read, an incremental search's too).
 
 #![cfg(unix)]
 
 mod pty_support;
+mod zsh_oracle;
 
 use std::{io, time::Duration};
 
-use pty_support::{Pty, Spawn, TIMEOUT, differential, have_real_zsh};
+use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
 
 /// The pause between keys.
 const KEY: Duration = Duration::from_millis(60);
-/// How long output must stay quiet before the screen is read.
-const QUIET: Duration = Duration::from_millis(300);
 
-/// The history file every case starts with (oldest first).
-const HIST: &str = "echo café crème\necho one\necho two\nls -l /tmp\necho three\nprint -r -- Two \
+/// The history file every case starts with (oldest first). Its `ls` line
+/// lists only `/`, which every machine has.
+const HIST: &str = "echo café crème\necho one\necho two\nls -d /\necho three\nprint -r -- Two \
                     Words\necho two\ngit status\n";
 
 /// `zsh -f -i` with the history file, `PS1`/`RPS1` and the rc file `rc`
-/// (sourced with `.` as the first command, since `-f` skips `.zshrc`).
+/// (sourced with `.` as the first command, since `-f` skips `.zshrc`), in
+/// its own home directory.
 fn spawn(real: bool, rc: &str) -> Spawn {
 	let s = if real {
 		Spawn::real_zsh()
@@ -37,19 +41,21 @@ fn spawn(real: bool, rc: &str) -> Spawn {
 		"HISTSIZE=100\nfc -R ~/hist\nq() {{ BUFFER='cat ~/log'; zle .accept-line }}\nzle -N \
 		 q\nbindkey -M emacs '^Xq' q\nbindkey -M viins '^Xq' q\nbindkey -M vicmd '^Xq' q\n{rc}"
 	);
+	let home = s.home().to_owned();
 	s.args(["-f", "-i"])
 		.env("PS1", "%~ %# ")
 		.env("RPS1", "[%?]")
 		.rc_file("hist", HIST)
-		.rc_file(".zshrc", rc)
-		.cwd("/tmp")
+		.rc_file(".zshrc", format!("{rc}\n. ~/{ZLE_SYNC_SCRIPT}\nprint -r -- RCDONE\n"))
+		.zle_sync()
+		.cwd(home)
 		.size(24, 80)
 }
 
-/// Type `text` key by key.
+/// Type `text` key by key and wait until the line editor has handled it.
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
 	pty.type_keys(text, KEY)?;
-	pty.settle(QUIET, TIMEOUT)
+	pty.zle_sync(TIMEOUT)
 }
 
 /// The final screens of `drive` against both shells after sourcing the rc
@@ -59,8 +65,12 @@ fn screens(
 	drive: impl Fn(&mut Pty) -> io::Result<()>,
 ) -> io::Result<(String, Option<String>)> {
 	let run = |pty: &mut Pty| -> io::Result<()> {
-		pty.settle(QUIET, TIMEOUT)?;
-		keys(pty, ". ~/.zshrc\r")?;
+		// Do not send input until the line editor, rather than the kernel's
+		// canonical/echoing line discipline, owns the terminal.
+		pty.wait_raw(TIMEOUT)?;
+		pty.type_keys(". ~/.zshrc\r", KEY)?;
+		pty.read_until("RCDONE", TIMEOUT)?;
+		pty.zle_sync(TIMEOUT)?;
 		// A clean screen for the case itself.
 		keys(pty, "\x0c")?;
 		drive(pty)
@@ -74,21 +84,23 @@ fn screens(
 	Ok((ours, Some(real)))
 }
 
-/// Assert both screens (with the cursor position) are the same.
-fn same(rc: &str, typed: &str) {
+/// Assert both screens (with the cursor position) are the same; zsh's
+/// screen when the screens were compared.
+fn same(rc: &str, typed: &str) -> Option<String> {
 	let (ours, real) = match screens(rc, |pty| keys(pty, typed)) {
 		Ok(s) => s,
 		Err(e) => panic!("pty session failed: {e}"),
 	};
-	if let Some(real) = real {
-		assert_eq!(ours, real, "obash screen:\n{ours}\n--- zsh screen:\n{real}");
+	if let Some(real) = &real {
+		assert_eq!(&ours, real, "obash screen:\n{ours}\n--- zsh screen:\n{real}");
 	}
+	real
 }
 
 /// [`same`], then `~/log` shown in place of the line: what the widgets
-/// logged on the way.
-fn same_log(rc: &str, typed: &str) {
-	same(rc, &format!("{typed}\x18q"));
+/// logged on the way. zsh's screen when the screens were compared.
+fn same_log(rc: &str, typed: &str) -> Option<String> {
+	same(rc, &format!("{typed}\x18q"))
 }
 
 /// A widget logging `BUFFER`, `CURSOR` and `HISTNO` to `~/log`, bound to
@@ -158,15 +170,20 @@ fn history_beginning_search_with_histfindnodups() {
 	same_log(&rc, "echo t\x14\x18p\x14\x18p\x14\x18p");
 }
 
+/// The widgets come from each shell's own `$fpath` (zsh's compiled-in one,
+/// obash's from the installed zsh), so the case runs them rather than
+/// their absence.
 #[test]
 fn history_beginning_search_end_functions() {
 	let rc = format!(
-		"{SHOW}fpath=(/usr/share/zsh/5.9/functions)\nautoload -Uz history-search-end\nzle -N \
-		 history-beginning-search-backward-end history-search-end\nzle -N \
-		 history-beginning-search-forward-end history-search-end\nbindkey '^T' \
-		 history-beginning-search-backward-end\nbindkey '^Y' history-beginning-search-forward-end\n"
+		"{SHOW}autoload -Uz history-search-end\nzle -N history-beginning-search-backward-end \
+		 history-search-end\nzle -N history-beginning-search-forward-end \
+		 history-search-end\nbindkey '^T' history-beginning-search-backward-end\nbindkey '^Y' \
+		 history-beginning-search-forward-end\n"
 	);
-	same_log(&rc, "echo t\x14\x18p\x14\x18p\x19\x18p");
+	if let Some(real) = same_log(&rc, "echo t\x14\x18p\x14\x18p\x19\x18p") {
+		assert!(!real.contains("function definition file not found"), "{real}");
+	}
 }
 
 #[test]
@@ -345,7 +362,7 @@ fn insert_last_word_from_the_line_itself() {
 #[test]
 fn infer_next_history_and_accept_and_infer() {
 	let rc = format!("{SHOW}bindkey '^T' accept-and-infer-next-history\n");
-	same(&rc, "ls -l /tmp\x18\x0e\x18p\x15ls -l /tmp\x14");
+	same(&rc, "ls -d /\x18\x0e\x18p\x15ls -d /\x14");
 }
 
 #[test]
@@ -443,13 +460,16 @@ fn the_mail_notice_comes_before_the_prompt() {
 	// after the first prompt's check, and the line comes more than a second
 	// after that.
 	let run = |pty: &mut Pty| -> io::Result<()> {
-		pty.settle(QUIET, TIMEOUT)?;
+		// The line editor, not the kernel's line discipline, owns the
+		// terminal: the first prompt (and its mail check) is out.
+		pty.wait_raw(TIMEOUT)?;
 		std::thread::sleep(Duration::from_millis(1200));
 		let mut f = std::fs::OpenOptions::new().append(true).open(&mbox)?;
 		io::Write::write_all(&mut f, b"From someone else\nmore\n")?;
 		drop(f);
 		std::thread::sleep(Duration::from_millis(1200));
-		keys(pty, "\r")
+		pty.write("\r")?;
+		pty.read_until("You have new mail.", TIMEOUT).map(drop)
 	};
 	let (ours, real) = differential(mk(false), mk(true), run).unwrap();
 	let after_a_prompt = |s: &str| {

@@ -195,9 +195,12 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 }
 
 /// Forget finished jobs whose state was reported (bash
-/// `cleanup_dead_jobs`); bash keeps each one's status for `wait PID`
-/// (`delete_job`'s `bgp_add`).
+/// `cleanup_dead_jobs`, which deletes none while the job list is frozen);
+/// bash keeps each one's status for `wait PID` (`delete_job`'s `bgp_add`).
 fn cleanup(ctx: &mut Ctx<'_, '_>) {
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash && ctx.vp.jobs_kept() {
+		return;
+	}
 	let dead = |j: &Job| j.notified && matches!(j.state, JobState::Done(_));
 	let kept: Vec<(Vpid, u32, i32, bool)> = ctx
 		.vp
@@ -234,6 +237,16 @@ fn keep_status(ctx: &mut Ctx<'_, '_>, vpid: Vpid, pid: u32, status: i32, inherit
 	}
 }
 
+/// bash's `notify_and_cleanup (-1)` as `jobs` ends: the background jobs a
+/// signal killed that it did not list are reported through its own
+/// standard error, and go (`killed::jobs_ended`).
+fn ended(ctx: &mut Ctx<'_, '_>) {
+	let line = ctx.line;
+	if let Some(bytes) = super::super::killed::jobs_ended(ctx.k, ctx.cx, ctx.vp, line) {
+		ctx.out_fd(2, &bytes);
+	}
+}
+
 /// `jobs [-lnprs] [jobspec …]`, `jobs -x command [args]`: list jobs as
 /// `[N]±  Status  command`; finished jobs are listed once, then forgotten.
 pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
@@ -266,6 +279,20 @@ pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		return execute_with_pids(ctx, o.rest);
 	}
 	take_in_exits(ctx)?;
+	// A job `jobs` finds done is one bash's `jobs` shows done only once it
+	// reaped it ([`crate::bash::store::Job::unreaped`]).
+	let finished: Vec<u32> = ctx
+		.vp
+		.jobs
+		.iter()
+		.filter(|j| j.unreaped && matches!(j.state, JobState::Done(_)))
+		.map(|j| j.number)
+		.collect();
+	for n in finished {
+		if let Some(job) = ctx.vp.jobs.get_mut(n) {
+			job.unreaped = false;
+		}
+	}
 	let home = ctx.scalar(b"HOME")?;
 	let show = Show {
 		posix:    ctx.option(OptId::Posix)?,
@@ -291,8 +318,10 @@ pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		for number in picked {
 			print_job(ctx, number, form, &show);
 		}
+		// bash's `-r` and `-s` listings return without `notify_and_cleanup`.
 		if state.is_none() {
 			cleanup(ctx);
+			ended(ctx);
 		}
 		return done(0);
 	}
@@ -324,6 +353,7 @@ pub fn jobs(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		}
 	}
 	cleanup(ctx);
+	ended(ctx);
 	done(status)
 }
 
@@ -376,6 +406,9 @@ fn execute_with_pids(ctx: &mut Ctx<'_, '_>, words: &[BString]) -> R {
 	}
 	ctx.vp.status = 0;
 	push_script(ctx.vp, &src, ctx.line, ScriptKind::Eval);
+	// bash runs it with `execute_command`, reading no input line: it reports
+	// no job ([`crate::bash::vm::killed::line_read`]).
+	crate::bash::vm::exec::script_reads_no_line(ctx.vp);
 	ctx.k.emit_op(ctx.cx, ctx.vp, 0, EventData::EvalEnter);
 	Ok(Outcome { status: 0, control: Control::Frame })
 }
@@ -622,12 +655,16 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 /// (bash warns when that drops a stopped job) and is no child of this shell
 /// any more: `wait` neither waits for it nor finds it, except by the status
 /// `keep` keeps (bash `delete_job`'s `bgp_add`, the status it had then: 0
-/// while it runs).
+/// while it runs), but not while no job may be deleted (bash `delete_job`
+/// returns at once, `jobs.c:1492`).
 fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool, keep: bool) {
 	if nohup {
 		if let Some(job) = ctx.vp.jobs.get_mut(number) {
 			job.nohup = true;
 		}
+		return;
+	}
+	if ctx.vp.jobs_kept() {
 		return;
 	}
 	let Some(job) = ctx.vp.jobs.remove(number) else {

@@ -1540,3 +1540,55 @@ fn a_read_only_fifo_open_that_truncates_asks_the_write_permission_of_the_plain_o
 		assert_eq!(plain, Err(Some(libc::EACCES)), "the plain open");
 	}
 }
+
+/// The helper thread of a FIFO open runs with every signal blocked but
+/// those a fault raises in the faulting thread, so a signal sent to the
+/// process goes to a thread of the caller's, never to the helper (pi-shell
+/// starts each of its helper threads so, and its signal handlers count on
+/// it). The mask is read on the helper itself, inside the open it runs; the
+/// open then waits for a writer that never comes, and the drop releases it.
+#[cfg(unix)]
+#[test]
+fn a_fifo_opens_helper_thread_runs_with_the_callers_signals_blocked() {
+	use std::sync::mpsc;
+	let dir = TempDir::new("fifo-mask");
+	let fifo = dir.0.join("fifo");
+	BlockingFs::native()
+		.make_node(&fifo, crate::NodeKind::Fifo, 0o600)
+		.unwrap();
+	let meta = std::fs::metadata(&fifo).unwrap();
+	let (tx, rx) = mpsc::channel();
+	let open = FifoOpen::start(&fifo, &meta, false, false, false, move |path, _| {
+		// SAFETY: plain data, filled by pthread_sigmask.
+		let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+		// SAFETY: a null new set only reads this thread's mask into `mask`.
+		unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &raw mut mask) };
+		// SAFETY: `mask` is a valid set and each number a valid signal.
+		let blocked = |sig| unsafe { libc::sigismember(&raw const mask, sig) } == 1;
+		let open_ones: Vec<libc::c_int> = [
+			libc::SIGINT,
+			libc::SIGQUIT,
+			libc::SIGTERM,
+			libc::SIGHUP,
+			libc::SIGWINCH,
+			libc::SIGCHLD,
+			libc::SIGUSR1,
+		]
+		.into_iter()
+		.filter(|&s| !blocked(s))
+		.collect();
+		let blocked_faults: Vec<libc::c_int> =
+			[libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGTRAP, libc::SIGSYS]
+				.into_iter()
+				.filter(|&s| blocked(s))
+				.collect();
+		tx.send((open_ones, blocked_faults)).unwrap();
+		std::fs::File::open(path)
+	});
+	let (open_ones, blocked_faults) = rx
+		.recv_timeout(Duration::from_secs(30))
+		.expect("the helper ran the open within 30 s");
+	drop(open);
+	assert!(open_ones.is_empty(), "signals open on the helper: {open_ones:?}");
+	assert!(blocked_faults.is_empty(), "fault signals blocked on the helper: {blocked_faults:?}");
+}

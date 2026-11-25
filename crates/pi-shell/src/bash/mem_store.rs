@@ -193,7 +193,11 @@ impl MemStore {
 			// The env options live in `Table::Opt` only (`ZshOpt::env_twin`).
 			Key::ZshOpt(opt) => matches!(record, Record::Opt(_)) && opt.env_twin().is_none(),
 			Key::ZshAlias { .. } => matches!(record, Record::Alias(_)),
-			_ => !matches!(record, Record::Var(_) | Record::Unset | Record::Scope { .. }),
+			Key::JobFacts(_) => matches!(record, Record::JobFacts(_)),
+			_ => !matches!(
+				record,
+				Record::Var(_) | Record::Unset | Record::Scope { .. } | Record::JobFacts(_)
+			),
 		};
 		if !fits {
 			return Err(shape(key));

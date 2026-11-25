@@ -570,6 +570,20 @@ pub fn reset_prompt(zw: &mut Zw<'_, '_>) -> WResult {
 	redisplay(zw)
 }
 
+/// zsh `adjustwinsize` for a line being edited (`zleactive`): the window
+/// size changed, so the prompts are expanded again and the cursor goes
+/// back to the start of the prompt as it was drawn (zsh `zle_resetprompt`:
+/// up the old prompt's extra lines, which a prompt wrapped over several
+/// lines has), and the line is drawn again at once (`ZLE_CMD_REFRESH`).
+pub fn resized(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
+	on_editor(k, cx, vp, |zw| {
+		zw.ed.winch = false;
+		zw.zle.display.winchanged = true;
+		let _ = reset_prompt(zw);
+	});
+	zle_refresh(k, cx, vp, None, false);
+}
+
 /// The `read-command` widget (zsh `readcommand`): the next key command's
 /// widget name in `$REPLY`.
 pub fn read_command(_zw: &mut Zw<'_, '_>) -> WResult {

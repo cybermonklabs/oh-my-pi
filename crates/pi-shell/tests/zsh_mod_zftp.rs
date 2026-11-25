@@ -349,7 +349,7 @@ fn zsh(port: u16, script: &str) -> (String, String, i32) {
 #[test]
 fn zsh_mod_zftp_passive_session() {
 	let Some(server) = Server::start() else {
-		eprintln!("no free /etc/services port: nothing to test");
+		eprintln!("skipped: no free /etc/services port between 20000 and 60000");
 		return;
 	};
 	let (out, err, st) = zsh(
@@ -470,7 +470,7 @@ zsh:zftp ls:24: not connected.
 #[test]
 fn zsh_mod_zftp_sendport_sessions_and_hooks() {
 	let Some(server) = Server::start() else {
-		eprintln!("no free /etc/services port: nothing to test");
+		eprintln!("skipped: no free /etc/services port between 20000 and 60000");
 		return;
 	};
 	let (out, err, st) = zsh(
@@ -560,7 +560,7 @@ zsh:zftp ls:19: not connected.
 #[test]
 fn zsh_mod_zftp_block_mode_timeout_and_local_files() {
 	let Some(server) = Server::start() else {
-		eprintln!("no free /etc/services port: nothing to test");
+		eprintln!("skipped: no free /etc/services port between 20000 and 60000");
 		return;
 	};
 	let (out, err, st) = zsh(
@@ -622,7 +622,7 @@ zsh:zftp open:13: Can't find port for service `nosuchservice'
 #[test]
 fn zsh_mod_zftp_session_quits_at_shell_exit() {
 	let Some(server) = Server::start() else {
-		eprintln!("no free /etc/services port: nothing to test");
+		eprintln!("skipped: no free /etc/services port between 20000 and 60000");
 		return;
 	};
 	let (out, err, st) = zsh(
@@ -652,7 +652,7 @@ false",
 #[test]
 fn zsh_mod_zftp_exit_runs_zftp_chpwd() {
 	let Some(server) = Server::start() else {
-		eprintln!("no free /etc/services port: nothing to test");
+		eprintln!("skipped: no free /etc/services port between 20000 and 60000");
 		return;
 	};
 	let (out, err, st) = zsh(

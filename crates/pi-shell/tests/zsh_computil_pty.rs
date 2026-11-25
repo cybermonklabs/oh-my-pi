@@ -14,7 +14,9 @@
 
 #![cfg(unix)]
 
+mod comp_support;
 mod pty_support;
+mod zsh_oracle;
 
 use std::{fs, io, path::Path, time::Duration};
 
@@ -25,7 +27,9 @@ const KEY: Duration = Duration::from_millis(60);
 /// The bound of waits that run `compinit` or completion functions.
 const SLOW: Duration = Duration::from_secs(120);
 
-/// `zsh -f -i` with a plain prompt and the rc file `rc`, in `cwd`.
+/// `zsh -f -i` with a plain prompt (a literal `%`, not `%#`, which is `#`
+/// for root: [`compsys_kill_signals`]'s screen holds for any user) and the
+/// rc file `rc`, in `cwd`.
 fn spawn(real: bool, rc: &str, cwd: &Path) -> Spawn {
 	let s = if real {
 		Spawn::real_zsh()
@@ -33,7 +37,7 @@ fn spawn(real: bool, rc: &str, cwd: &Path) -> Spawn {
 		Spawn::zsh()
 	};
 	s.args(["-f", "-i"])
-		.env("PS1", "%# ")
+		.env("PS1", "%% ")
 		.rc_file(".zshrc", rc)
 		.zle_sync()
 		.size(24, 80)
@@ -46,20 +50,24 @@ fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
 	pty.zle_sync(SLOW)
 }
 
+/// Source the rc file, clear the screen, then `drive` (each shell's
+/// session).
+fn prepared(pty: &mut Pty, drive: &impl Fn(&mut Pty) -> io::Result<()>) -> io::Result<()> {
+	pty.wait_raw(SLOW)?;
+	// `compinit` prints nothing while it works: wait for the marker (the
+	// echoed command line has it quoted apart), which also says the sync
+	// FIFO is open.
+	pty.write(format!(". ~/.zshrc; . ~/{ZLE_SYNC_SCRIPT}; print -r -- RC''DONE\r"))?;
+	pty.read_until("RCDONE", SLOW)?;
+	pty.zle_sync(SLOW)?;
+	keys(pty, "\x0c")?;
+	drive(pty)
+}
+
 /// Run `drive` against both shells in `cwd` after sourcing the rc file;
 /// panic when the final screens differ.
 fn same_in(cwd: &Path, rc: &str, drive: impl Fn(&mut Pty) -> io::Result<()>) {
-	let run = |pty: &mut Pty| -> io::Result<()> {
-		pty.wait_raw(SLOW)?;
-		// `compinit` prints nothing while it works: wait for the marker
-		// (the echoed command line has it quoted apart), which also says the
-		// sync FIFO is open.
-		pty.write(format!(". ~/.zshrc; . ~/{ZLE_SYNC_SCRIPT}; print -r -- RC''DONE\r"))?;
-		pty.read_until("RCDONE", SLOW)?;
-		pty.zle_sync(SLOW)?;
-		keys(pty, "\x0c")?;
-		drive(pty)
-	};
+	let run = |pty: &mut Pty| prepared(pty, &drive);
 	if !have_real_zsh() {
 		let mut ours = spawn(false, rc, cwd).spawn().expect("spawn obash");
 		run(&mut ours).expect("pty session");
@@ -280,9 +288,58 @@ fn compsys_ssh_hosts_and_options() {
 	});
 }
 
+/// zsh 5.9's screen for `kill -<Tab>` on Linux: the signal names of its
+/// build against glibc 2.32 or later (6 is `IOT`, 29 `POLL`), as the
+/// Debian/Ubuntu zsh 5.9 shows them. A live `/bin/zsh` would test the C
+/// library it was built against, not obash.
+#[cfg(target_os = "linux")]
+const KILL_SIGNALS_5_9: &str =
+	"% kill -\n-l  -- list signal names or numbers of specified signals\n-n  -- specify signal \
+	 number\n-s  -- specify signal name\n-ALRM    -FPE     -IOT     -PROF    -STKFLT  -TRAP    \
+	 -URG     -WINCH\n-BUS     -HUP     -KILL    -PWR     -STOP    -TSTP    -USR1    -XCPU\n-CHLD    \
+	 -ILL     -PIPE    -QUIT    -SYS     -TTIN    -USR2    -XFSZ\n-CONT    -INT     -POLL    -SEGV    \
+	 -TERM    -TTOU    -VTALRM";
+
+/// The same screen with zsh after 5.9's names (zsh-users/zsh@6d40d9b6):
+/// 6 is `ABRT`, which sorts first.
+#[cfg(target_os = "linux")]
+const KILL_SIGNALS_AFTER_5_9: &str =
+	"% kill -\n-l  -- list signal names or numbers of specified signals\n-n  -- specify signal \
+	 number\n-s  -- specify signal name\n-ABRT    -CONT    -INT     -PROF    -STKFLT  -TRAP    \
+	 -URG     -WINCH\n-ALRM    -FPE     -KILL    -PWR     -STOP    -TSTP    -USR1    -XCPU\n-BUS     \
+	 -HUP     -PIPE    -QUIT    -SYS     -TTIN    -USR2    -XFSZ\n-CHLD    -ILL     -POLL    -SEGV    \
+	 -TERM    -TTOU    -VTALRM";
+
+/// On Linux obash's screen is zsh after 5.9's ([`KILL_SIGNALS_AFTER_5_9`]),
+/// which names 6 `ABRT` where zsh 5.9's names it `IOT`
+/// ([`KILL_SIGNALS_5_9`]), with zsh 5.9's installed completion functions;
+/// elsewhere it is compared with the real zsh.
+#[cfg(target_os = "linux")]
 #[test]
 fn compsys_kill_signals() {
-	same(COMPINIT, |pty| keys(pty, "kill -\t"));
+	let drive = |pty: &mut Pty| keys(pty, "kill -\t");
+	let Some(fpath) = comp_support::compsys_fpath() else {
+		return;
+	};
+	let rc = format!("fpath=( {} )\n{COMPINIT}", comp_support::fpath_words(&fpath));
+	let dir = tempdir();
+	let mut ours = spawn(false, &rc, &dir).spawn().expect("spawn obash");
+	prepared(&mut ours, &drive).expect("pty session");
+	// obash names 6 `ABRT` (`IOT` its second name), as zsh after 5.9
+	// does: a screen with `-IOT`, zsh 5.9's, is a regression.
+	let screen = ours.screen().contents();
+	assert_eq!(
+		screen, KILL_SIGNALS_AFTER_5_9,
+		"obash screen:\n{screen}\n--- zsh 5.9 (6 is IOT there):\n{KILL_SIGNALS_5_9}"
+	);
+}
+
+/// Off Linux obash's screen is compared with the real zsh's (on Linux with
+/// zsh after 5.9's: the definition above).
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn compsys_kill_signals() {
+	same(COMPINIT, |pty: &mut Pty| keys(pty, "kill -\t"));
 }
 
 #[test]

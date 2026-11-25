@@ -202,3 +202,31 @@ fn wait_for_a_missing_job() {
 	let (out, err, _) = zsh("wait %2; echo $?");
 	assert_eq!((out.as_str(), err.as_str()), ("127\n", "zsh:wait:1: %2: no such job\n"));
 }
+
+/// Every stage of a background job's pipeline is one level below the shell
+/// (`$ZSH_SUBSHELL` 1): the stages the job's process forks, and its last
+/// stage, which it runs itself (`last1`), a `( … )` there too, with no fork
+/// of its own. A pipeline inside a job's group counts the group's level.
+/// Goldens: zsh 5.9.
+#[test]
+fn each_stage_of_a_jobs_pipeline_is_one_subshell_level_down() {
+	const READ: &str = "{ read l; print -r -- $l; }";
+	let mut wrong = Vec::new();
+	for (src, want) in [
+		(format!("{{ print g=$ZSH_SUBSHELL; }} | {READ} & wait"), "g=1\n"),
+		("true | ( print p=$ZSH_SUBSHELL ) & wait".into(), "p=1\n"),
+		("true | ( ( print pp=$ZSH_SUBSHELL ) ) & wait".into(), "pp=2\n"),
+		("true | { print l=$ZSH_SUBSHELL; } & wait".into(), "l=1\n"),
+		(format!("print s=$ZSH_SUBSHELL | {READ} & wait"), "s=1\n"),
+		("true | ( print a=$ZSH_SUBSHELL; print b=$ZSH_SUBSHELL ) & wait".into(), "a=1\nb=1\n"),
+		("true | ( print r=$ZSH_SUBSHELL ) 2>/dev/null & wait".into(), "r=1\n"),
+		("{ true | ( print n=$ZSH_SUBSHELL ); } & wait".into(), "n=2\n"),
+		("true | ( print fp=$ZSH_SUBSHELL )".into(), "fp=1\n"),
+	] {
+		let (out, ..) = zsh(&src);
+		if out != want {
+			wrong.push(format!("{src:?}: got {out:?}, want {want:?}"));
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the rows differ:\n{}", wrong.len(), wrong.join("\n"));
+}

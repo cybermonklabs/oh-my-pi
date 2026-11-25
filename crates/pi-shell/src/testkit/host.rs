@@ -307,6 +307,10 @@ impl ExtProc for CountedExt {
 	fn cont(&mut self) -> io::Result<()> {
 		self.ext.cont()
 	}
+
+	fn release(&mut self) {
+		self.ext.release();
+	}
 }
 
 impl Drop for CountedExt {
@@ -365,6 +369,14 @@ pub struct FakeHost {
 	/// Stderr too, into stdout's capture: one pipe for fds 1 and 2
 	/// ([`Self::with_buffered_output`]).
 	merged:      bool,
+	/// Signals whose disposition the host cannot change:
+	/// [`Host::set_signal_trap`](crate::bash::Host::set_signal_trap)
+	/// answers `false` for them, as for a signal ignored on entry.
+	pub fixed:   crate::bash::SigSet,
+	/// Every disposition the shell asked for
+	/// ([`Host::set_signal_trap`](crate::bash::Host::set_signal_trap)), in
+	/// order: the signal and the action (`None`: the default back).
+	pub asked:   Vec<(Signal, Option<BString>)>,
 }
 
 impl Default for FakeHost {
@@ -400,6 +412,8 @@ impl FakeHost {
 			logins:      None,
 			buffered:    false,
 			merged:      false,
+			fixed:       crate::bash::SigSet::EMPTY,
+			asked:       Vec::new(),
 		}
 	}
 
@@ -815,6 +829,11 @@ impl crate::bash::Host for FakeHost {
 			.logins
 			.clone()
 			.ok_or_else(|| io::ErrorKind::Unsupported.into())
+	}
+
+	fn set_signal_trap(&mut self, signal: Signal, action: Option<&BStr>) -> io::Result<bool> {
+		self.asked.push((signal, action.map(BString::from)));
+		Ok(!self.fixed.contains(signal))
 	}
 
 	fn event(&mut self, ev: &Event<'_>) -> Verdict {
