@@ -22,7 +22,7 @@
  * Accessor functions are shared per field name and find their entry's record
  * through a symbol-keyed property, so a cold entry costs no closure.
  */
-import { isRecord, stringifyJson } from "@oh-my-pi/pi-utils";
+import { isRecord, stringifyDeepJson, stringifyJson } from "@oh-my-pi/pi-utils";
 import { isBlobRef } from "./blob-store";
 import {
 	approvedPlanFileOf,
@@ -42,7 +42,7 @@ import { forgetConvertMemo } from "./messages";
 import { isRolloverRequestEntry } from "./session-context";
 import type { FileEntry, SessionEntry } from "./session-entries";
 import { repairTruncatedSnapcompactFrames } from "./session-loader";
-import { entryJsonText, entryRecordText } from "./session-persistence";
+import { entryRecordText } from "./session-persistence";
 
 /**
  * A string value of a cold entry stays in memory up to this many UTF-16 units:
@@ -494,12 +494,14 @@ export function convertToColdEntry(
 	if (!store.writable) return false;
 	let text: string;
 	try {
-		text = options?.imagesExternalized ? (entryJsonText(entry) ?? "null") : entryRecordText(entry, store.blobs);
+		text = options?.imagesExternalized
+			? (stringifyDeepJson(entry, { bigintAsString: true }) ?? "null")
+			: entryRecordText(entry, store.blobs);
 	} catch (error) {
 		// Only a value JSON cannot write gets here (a cycle, a getter or `toJSON`
-		// that throws, a bigint in a value too deep for a recursive walk, a text
-		// past the engine's longest string): never an entry parsed from a
-		// transcript line shorter than that, and its transcript write fails too.
+		// that throws, a text past the engine's longest string): never an entry
+		// parsed from a transcript line shorter than that, and its transcript
+		// write fails too.
 		store.noteRecordFailure(error);
 		return false;
 	}

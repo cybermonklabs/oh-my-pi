@@ -19,6 +19,7 @@
 - `postmortem.exitAfterCleanup(code, { exit })`: runs every cleanup callback, then exits, and does not return, for a caller that must not go on; unlike `process.exit`, it waits for asynchronous cleanup callbacks first, and unlike `exitProcess`, it runs them at all. `exit: "native"` ends through `exitProcess`, past the extension-load guard, for a host-owned exit that can come while extensions load.
 - Added `tryAcquireFileLockUnlessHeld`, which on Linux answers `null` at once from a probe while another holder owns the lease, for a caller that tries again later
 - Added `stringifyDeepJson`, `JSON.stringify` that also serializes a value nested deeper than the engine's recursion allows, and `stringifyJsonIteratively`, the explicit-stack writer it falls back to on that `RangeError`, which gives `JSON.stringify`'s bytes
+- Added a `bigintAsString` option to `stringifyDeepJson` and `stringifyJsonIteratively`, which writes a bigint as its decimal string, as `stringifyJson` does
 
 ### Changed
 

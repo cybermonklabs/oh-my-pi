@@ -1,5 +1,5 @@
 import { isAnthropicServerToolHistoryBlock } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
-import { countNewlines, isRecord, stringifyJson, stringifyJsonIteratively } from "@oh-my-pi/pi-utils";
+import { countNewlines, isRecord, stringifyDeepJson, stringifyJsonIteratively } from "@oh-my-pi/pi-utils";
 import { PRESERVE_KEY as SNAPCOMPACT_PRESERVE_KEY } from "@oh-my-pi/snapcompact";
 import {
 	type BlobStore,
@@ -255,9 +255,12 @@ const PERSISTENCE_SCAN_DEPTH = 1_000;
 /**
  * Levels past which a persisted value is written by `stringifyJsonIteratively`:
  * Bun's `JSON.stringify` takes seconds past about 25,000 levels and runs out
- * of stack near 40,000, while a transcript line can nest 400,000.
+ * of stack at 40,000, while a transcript line can nest 400,000.
  */
 const DEEP_JSON_LEVELS = 10_000;
+
+/** A session line holds a bigint (an extension hook can put one in an entry) as its decimal string. */
+const BIGINT_AS_STRING = { bigintAsString: true } as const;
 
 function isContainer(value: unknown): value is object {
 	return typeof value === "object" && value !== null;
@@ -728,16 +731,19 @@ export function prepareEntryForPersistence(entry: FileEntry, blobStore: BlobStor
  */
 export function persistedEntryText(entry: FileEntry, blobStore: BlobStore): string {
 	const shape: PersistedShape = { deep: false };
-	const prepared = preparedEntry(entry, blobStore, shape);
-	if (shape.deep) {
-		try {
-			return stringifyJsonIteratively(prepared) ?? "null";
-		} catch (error) {
-			// A bigint, which `stringifyJson` writes as a decimal string.
-			if (!(error instanceof TypeError)) throw error;
-		}
-	}
-	return entryJsonText(prepared) ?? "null";
+	return persistedJson(preparedEntry(entry, blobStore, shape), shape);
+}
+
+/**
+ * The JSON text of `value` as a session line holds it: by `stringifyJsonIteratively`
+ * where `shape` says it nests past {@link DEEP_JSON_LEVELS} levels, else by
+ * `JSON.stringify`; a bigint as its decimal string either way.
+ */
+function persistedJson(value: unknown, shape: PersistedShape): string {
+	return (
+		(shape.deep ? stringifyJsonIteratively(value, BIGINT_AS_STRING) : stringifyDeepJson(value, BIGINT_AS_STRING)) ??
+		"null"
+	);
 }
 
 /** {@link prepareEntryForPersistence}, setting `shape.deep` for an entry nested past {@link DEEP_JSON_LEVELS} levels. */
@@ -756,7 +762,7 @@ function preparedEntry(entry: FileEntry, blobStore: BlobStore, shape: PersistedS
 		// line would serialize, and no accessors.
 		let json: string | undefined;
 		try {
-			json = entryJsonText(projected);
+			json = stringifyDeepJson(projected, BIGINT_AS_STRING);
 		} catch {
 			throw error;
 		}
@@ -807,23 +813,6 @@ function externalizeImagesOnly(value: unknown, blobStore: BlobStore, key?: strin
 }
 
 /**
- * The JSON text {@link stringifyJson} writes for `value`, also for a value
- * nested deeper than `JSON.stringify` recurses (Bun's slows past about 20,000
- * levels and runs out of stack near 40,000, while `JSON.parse`, and so a
- * transcript line, reads 400,000): on that `RangeError` the value is written
- * again by `stringifyJsonIteratively`, which gives the same bytes but writes
- * no bigint.
- */
-export function entryJsonText(value: unknown): string | undefined {
-	try {
-		return stringifyJson(value);
-	} catch (error) {
-		if (!(error instanceof RangeError)) throw error;
-		return stringifyJsonIteratively(value);
-	}
-}
-
-/**
  * The JSON text of `entry` as the manager holds it, with image payloads
  * replaced by blob references (the blob store keeps their bytes). Unlike
  * {@link prepareEntryForPersistence} nothing is truncated, stripped or masked:
@@ -835,10 +824,9 @@ export function entryJsonText(value: unknown): string | undefined {
  * blob store cannot take an image, as on a full disk), the text is the
  * entry's JSON with its images inline, which parses back to the entry as
  * well. Throws only for a value JSON cannot write: a cycle, a getter or
- * `toJSON` that throws, a bigint in a value nested deeper than the walk
- * recurses, or a text longer than the engine's longest string (2^31 - 1
- * units). A value parsed from a transcript line holds none of the first
- * three, and the last needs a line about that long.
+ * `toJSON` that throws, or a text longer than the engine's longest string
+ * (2^31 - 1 units). A value parsed from a transcript line holds none of the
+ * first two, and the last needs a line about that long.
  */
 export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string {
 	let externalized: unknown;
@@ -850,7 +838,7 @@ export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string 
 			// The walk ran out of stack, so `JSON.stringify` would take seconds on
 			// the entry or run out too: the writer that keeps its own stack writes it.
 			try {
-				json = stringifyJsonIteratively(entry);
+				json = stringifyJsonIteratively(entry, BIGINT_AS_STRING);
 			} catch {
 				throw error;
 			}
@@ -862,7 +850,7 @@ export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string 
 		// and the walk replaces the images in that. A value JSON cannot write
 		// fails here: the first error is kept.
 		try {
-			json = entryJsonText(entry);
+			json = stringifyDeepJson(entry, BIGINT_AS_STRING);
 		} catch {
 			throw error;
 		}
@@ -874,5 +862,5 @@ export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string 
 			return json;
 		}
 	}
-	return entryJsonText(externalized) ?? "null";
+	return stringifyDeepJson(externalized, BIGINT_AS_STRING) ?? "null";
 }

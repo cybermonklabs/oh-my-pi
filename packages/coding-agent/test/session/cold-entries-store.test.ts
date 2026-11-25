@@ -15,7 +15,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { maskSessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entry-mask";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { prepareEntryForPersistence } from "@oh-my-pi/pi-coding-agent/session/session-persistence";
+import { persistedEntryText, prepareEntryForPersistence } from "@oh-my-pi/pi-coding-agent/session/session-persistence";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import {
 	getBlobsDir,
@@ -574,6 +574,29 @@ describe("cold entry store", () => {
 
 		expect(() => prepareEntryForPersistence(cyclic, new BlobStore(dir.path()))).toThrow(TypeError);
 		expect(() => maskSessionEntry(cyclic, mask)).toThrow(TypeError);
+	});
+
+	// An extension hook can put a bigint in an entry; a line holds it as its decimal string at any depth.
+	it("writes a bigint at the bottom of an entry nested deeper than JSON.stringify recurses as its decimal string", () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const entry: SessionEntry = {
+			type: "message",
+			id: "r1",
+			parentId: null,
+			timestamp: TIMESTAMP,
+			message: {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "inspect",
+				content: [{ type: "text", text: "r1" }],
+				details: deepDetails({ leaf: 123n }),
+				isError: false,
+				timestamp: 2,
+			},
+		};
+
+		const line = JSON.parse(persistedEntryText(entry, new BlobStore(dir.path())));
+		expect(nestingOf(line.message.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "123" } });
 	});
 
 	it("resumes entries carrying a runtime nested deeper than JSON.stringify recurses, and reads it back", async () => {

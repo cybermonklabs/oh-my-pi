@@ -47,11 +47,11 @@
  *   other blob reference in free content, and image data that is no blob reference, are masked.
  */
 import { isBoxedPrimitive } from "node:util/types";
-import { countNewlines, isRecord, tryParseJson } from "@oh-my-pi/pi-utils";
+import { countNewlines, isRecord, stringifyDeepJson, tryParseJson } from "@oh-my-pi/pi-utils";
 import type { SessionStoreMask } from "../secrets/session-store-mask";
 import { BLOB_HASH_RE, BLOB_PREFIX, isBlobRef } from "./blob-store";
 import { ContainerPath, type NestedWalk, runNested } from "./nested-walk";
-import { entryJsonText, type ImageSite, imageAt, resolvedImageSiteOf } from "./session-persistence";
+import { type ImageSite, imageAt, resolvedImageSiteOf } from "./session-persistence";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /** A child the parent copy leaves out: an object key omitted, an array item removed. */
@@ -733,7 +733,7 @@ function* maskStoredForm(value: object | bigint, key: string | number, walk: Mas
 	// plain object always serializes; `ownValue`, so a key nothing is written under reads no
 	// `Object.prototype` member.
 	const name = String(key);
-	const holder: Record<string, unknown> = JSON.parse(entryJsonText({ [name]: value })!);
+	const holder: Record<string, unknown> = JSON.parse(stringifyDeepJson({ [name]: value }, { bigintAsString: true })!);
 	const stored = ownValue(holder, name);
 	return walksInto(stored) ? yield maskFree(stored, name, walk) : maskScalar(stored, name, walk);
 }

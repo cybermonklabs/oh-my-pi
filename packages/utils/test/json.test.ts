@@ -299,6 +299,19 @@ describe("stringifyJsonIteratively", () => {
 		expect(outcomes(arrays(), stringifyJsonIteratively)).toEqual(outcomes(arrays(), value => JSON.stringify(value)));
 	});
 
+	// A session line holds a bigint an extension hook put in an entry as its decimal string; a deep
+	// line is written by this writer, which threw for it, so the entry could not be written at all.
+	it("writes a bigint as stringifyJson does when asked to, and still throws for a boxed one", () => {
+		const cases: Record<string, unknown> = {
+			bigint: { n: 1n, list: [2n, { m: -3n }] },
+			root: 4n,
+			boxedBigInt: [Object(1n)],
+		};
+		expect(outcomes(cases, value => stringifyJsonIteratively(value, { bigintAsString: true }))).toEqual(
+			outcomes(cases, value => stringifyJson(value)),
+		);
+	});
+
 	// Every shape of `deepValue` appears 500 times and the text crosses the writer's chunk join many
 	// times; deeper, Bun's `JSON.stringify` takes seconds (its time grows with the square of the
 	// depth), so the 100,000-deep chain below tests the writer alone.
@@ -331,5 +344,15 @@ describe("stringifyDeepJson", () => {
 			"TypeError",
 			"JSON.stringify cannot serialize cyclic structures.",
 		]);
+	}, 60_000);
+
+	it("writes a bigint at the bottom of a 100,000-deep chain as its decimal string when asked to", () => {
+		let chain: unknown = { n: 7n };
+		let expected = '{"n":"7"}';
+		for (let index = 0; index < 100_000; index++) {
+			chain = { child: chain };
+			expected = `{"child":${expected}}`;
+		}
+		expect(stringifyDeepJson(chain, { bigintAsString: true }) === expected).toBe(true);
 	}, 60_000);
 });

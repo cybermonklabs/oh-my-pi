@@ -60,22 +60,28 @@ export function stringifyJson(value: unknown, space?: string | number): string |
 	}
 }
 
+/** What {@link stringifyDeepJson} and {@link stringifyJsonIteratively} write that `JSON.stringify` does not. */
+export interface DeepJsonOptions {
+	/** Write a bigint as its decimal string, as {@link stringifyJson} does, where `JSON.stringify` throws. */
+	readonly bigintAsString?: boolean;
+}
+
 /**
- * `JSON.stringify(value)`, also for a value nested deeper than the engine's
- * recursion allows (Bun's throws a `RangeError` between 10,000 and 40,000
- * levels, while its `JSON.parse` reads 400,000): on that `RangeError` the
- * value is written again by {@link stringifyJsonIteratively}, which gives the
- * same bytes. Any value `JSON.stringify` writes gets its result, and any other
- * error is its own. A `RangeError` from elsewhere (a `toJSON` that throws one)
- * recurs in the second walk and surfaces from it, so the `toJSON` methods
- * ahead of it run twice on that path.
+ * `JSON.stringify(value)` ({@link stringifyJson} with `bigintAsString`), also
+ * for a value nested deeper than the engine's recursion allows (Bun's throws a
+ * `RangeError` at 40,000 levels, while its `JSON.parse` reads 400,000): on that
+ * `RangeError` the value is written again by {@link stringifyJsonIteratively},
+ * which gives the same bytes. Any value `JSON.stringify` writes gets its
+ * result, and any other error is its own. A `RangeError` from elsewhere (a
+ * `toJSON` that throws one) recurs in the second walk and surfaces from it, so
+ * the `toJSON` methods ahead of it run twice on that path.
  */
-export function stringifyDeepJson(value: unknown): string | undefined {
+export function stringifyDeepJson(value: unknown, options?: DeepJsonOptions): string | undefined {
 	try {
-		return JSON.stringify(value);
+		return options?.bigintAsString ? stringifyJson(value) : JSON.stringify(value);
 	} catch (error) {
 		if (!(error instanceof RangeError)) throw error;
-		return stringifyJsonIteratively(value);
+		return stringifyJsonIteratively(value, options);
 	}
 }
 
@@ -106,15 +112,17 @@ const JSON_PIECES_PER_CHUNK = 1024;
  * as `JSON.stringify` does, without calling its `toJSON` a second time
  * ({@link scalarJson}): a boxed primitive, told by its internal slot as that
  * function tells it, is unwrapped, a bigint throws that function's
- * `TypeError`, and a string, number, boolean or `null` is written by
- * `JSON.stringify` itself. It takes several times as long as
- * `JSON.stringify` on a shallow value, but Bun's slows with depth:
+ * `TypeError` (with `bigintAsString`, a bigint primitive is its decimal string
+ * instead, as {@link stringifyJson} writes it), and a string, number, boolean
+ * or `null` is written by `JSON.stringify` itself. It takes several times as
+ * long as `JSON.stringify` on a shallow value, but Bun's slows with depth:
  * {@link stringifyDeepJson} runs this writer where `JSON.stringify` runs out
  * of stack, and a caller that knows a value is deep can call it directly.
  */
-export function stringifyJsonIteratively(value: unknown): string | undefined {
+export function stringifyJsonIteratively(value: unknown, options?: DeepJsonOptions): string | undefined {
+	const bigintAsString = options?.bigintAsString === true;
 	const root = jsonValueOf(value, "");
-	if (!isJsonContainer(root)) return scalarJson(root);
+	if (!isJsonContainer(root)) return scalarJson(root, bigintAsString);
 	// The text so far: chunks of joined pieces, and the pieces since, so the engine holds a few
 	// long strings instead of one short string per value (millions for a long session's tree).
 	const chunks: string[] = [];
@@ -169,7 +177,7 @@ export function stringifyJsonIteratively(value: unknown): string | undefined {
 			enter(member);
 			continue;
 		}
-		const text = scalarJson(member);
+		const text = scalarJson(member, bigintAsString);
 		if (text === undefined && frame.keys) continue;
 		write(prefix(frame, key) + (text ?? "null"));
 		frame.written = true;
@@ -209,10 +217,13 @@ function isJsonContainer(value: unknown): value is object {
  * that is not an object or array to it ({@link isJsonContainer}): `undefined`
  * for `undefined`, a function or a symbol; a boxed primitive unwrapped by its
  * internal slot (a number and a string converted, so through an overridden
- * `valueOf` or `toString`); a bigint a `TypeError`. Its `toJSON` is not
- * called again, as `JSON.stringify(value)` would call it.
+ * `valueOf` or `toString`); a bigint a `TypeError`, or with `bigintAsString`
+ * a bigint primitive its decimal string, as {@link stringifyJson}'s replacer
+ * writes it (a boxed bigint still throws there). Its `toJSON` is not called
+ * again, as `JSON.stringify(value)` would call it.
  */
-function scalarJson(value: unknown): string | undefined {
+function scalarJson(value: unknown, bigintAsString: boolean): string | undefined {
+	if (bigintAsString && typeof value === "bigint") return JSON.stringify(value.toString());
 	let primitive = value;
 	// Unary plus is the ToNumber `JSON.stringify` applies: `Number()` would convert a bigint
 	// an overridden `valueOf` returns, where ToNumber throws.
