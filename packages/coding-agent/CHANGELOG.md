@@ -226,6 +226,7 @@
 - RPC `get_messages_page` no longer fails with `Maximum call stack size exceeded` at a message nested more than about 40,000 levels deep (a tool result's `details`, say), which stopped every later page at that message; it counts the message's bytes as it counts any other's
 - `omp gc --strip` strips a transcript holding a line nested more than about 40,000 levels deep instead of reporting `Maximum call stack size exceeded` for the file and skipping it
 - Memory extraction no longer marks a session's stage-1 job failed with `Maximum call stack size exceeded` when the session holds a message nested more than about 40,000 levels deep
+- `/export` and `omp export` write a session holding an entry nested more than 40,000 levels deep instead of failing with `Maximum call stack size exceeded` and removing the file
 - A session imported with `--from-claude` or `--from-codex`, and every session that process switches to afterwards, now moves its older entries out of memory as other sessions do
 - omp no longer keeps older entry bodies in a temporary directory that another account made or can enter; the session keeps them compressed in memory instead
 - Reading older screenshots back, as an extension reading every message does, no longer keeps up to eight of them in memory past the 16 MiB the cache allows
