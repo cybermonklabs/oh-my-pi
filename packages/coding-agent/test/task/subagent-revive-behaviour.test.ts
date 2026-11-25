@@ -1164,6 +1164,43 @@ describe("a named model held to its own list whose model is gone", () => {
 	}, 30_000);
 });
 
+// The spawn names its model (`SPAWN_MODEL`, no role alias): with task.namedModelFallback off its spawn spec holds
+// it to the `subagent:<id>` role, and a warm and a cold revive of the record build on that role as the spawn did.
+for (const held of [true, false]) {
+	const setting = held ? "with task.namedModelFallback off" : "at the default task.namedModelFallback";
+	const expectedRole = held ? "the subagent's exclusive role" : "no exclusive role";
+	describe(`a named model spawned ${setting}, revived warm and cold`, () => {
+		const warmId = held ? "HeldWarm" : "UnheldWarm";
+		const coldId = held ? "HeldCold" : "UnheldCold";
+		let env: ReviveEnv | undefined;
+		let warm: RevivedSubagent | undefined;
+		let cold: RevivedSubagent | undefined;
+
+		beforeAll(async () => {
+			const opened = await openTestProcess(held ? { "task.namedModelFallback": false } : {});
+			env = opened.env;
+			for (const id of [warmId, coldId]) {
+				await spawnAndPark(env, taskSpawn(env, opened.root.toolSession, id));
+			}
+			warm = await env.revive(warmId);
+			cold = await reviveCold(env, coldId);
+		}, 60_000);
+
+		afterAll(async () => {
+			await env?.close();
+		}, 30_000);
+
+		it(`the spawn, the warm revive and the cold revive each build on ${expectedRole}`, () => {
+			if (!env || !warm || !cold) throw new Error("The test process did not start");
+			const role = (id: string) => (held ? `subagent:${id}` : undefined);
+			expect(spawnBuildOptions(env, warmId).exclusiveRetryFallbackRole).toBe(role(warmId));
+			expect(spawnBuildOptions(env, coldId).exclusiveRetryFallbackRole).toBe(role(coldId));
+			expect(warm.build.options.exclusiveRetryFallbackRole).toBe(role(warmId));
+			expect(cold.build.options.exclusiveRetryFallbackRole).toBe(role(coldId));
+		}, 30_000);
+	});
+}
+
 describe("a warm revive whose model left the registry", () => {
 	const id = "WarmModelGone";
 	let env: ReviveEnv | undefined;

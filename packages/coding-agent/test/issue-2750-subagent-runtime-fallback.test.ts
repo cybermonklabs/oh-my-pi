@@ -17,8 +17,11 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { RetryFallbackRole, ServingModel } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { TurnRecovery, type TurnRecoveryHost } from "@oh-my-pi/pi-coding-agent/session/turn-recovery";
+import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
@@ -917,24 +920,10 @@ describe("subagent runtime fallback on a real provider error", () => {
 		});
 	}
 
-	/** Spawns a real `named-worker` child that can reach exactly `models`. */
-	async function runNamedWorker(
-		id: string,
-		models: MockModel[],
-		settings: Settings,
-		spawn: {
-			agentModel?: string[];
-			modelOverride?: string[];
-			modelRole?: string;
-			parentActiveModelPattern?: string;
-			authedProviders?: string[];
-			tools?: string[];
-			prewalk?: string;
-		},
-	) {
+	/** An auth store with a key for each of `authedProviders`, and a registry that lists exactly `models`. */
+	function namedWorkerRegistry(models: MockModel[], authedProviders = models.map(mock => mock.provider)) {
 		const authStorage = createInMemoryAuthStorage();
-		const authed = spawn.authedProviders ?? models.map(mock => mock.provider);
-		for (const provider of authed) authStorage.keys.setRuntime(provider, "test-key");
+		for (const provider of authedProviders) authStorage.keys.setRuntime(provider, "test-key");
 		const modelRegistry = new ModelRegistry(authStorage);
 		const find = modelRegistry.find.bind(modelRegistry);
 		vi.spyOn(modelRegistry, "find").mockImplementation(
@@ -946,11 +935,31 @@ describe("subagent runtime fallback on a real provider error", () => {
 			provider => models.some(m => m.provider === provider) || hasProvider(provider),
 		);
 		vi.spyOn(modelRegistry, "getAvailable").mockImplementation(() => models);
+		return { authStorage, modelRegistry };
+	}
+
+	/** Spawns a real child (`named-worker` unless `agentName` says otherwise) that can reach exactly `models`. */
+	async function runNamedWorker(
+		id: string,
+		models: MockModel[],
+		settings: Settings,
+		spawn: {
+			agentName?: string;
+			agentModel?: string[];
+			modelOverride?: string[];
+			modelRole?: string;
+			parentActiveModelPattern?: string;
+			authedProviders?: string[];
+			tools?: string[];
+			prewalk?: string;
+		},
+	) {
+		const { authStorage, modelRegistry } = namedWorkerRegistry(models, spawn.authedProviders);
 		try {
 			return await runSubprocess({
 				cwd: path.join(root, "home", "work"),
 				agent: {
-					name: "named-worker",
+					name: spawn.agentName ?? "named-worker",
 					description: "test",
 					systemPrompt: "test",
 					tools: spawn.tools ?? ["read"],
@@ -971,6 +980,47 @@ describe("subagent runtime fallback on a real provider error", () => {
 				enableMCP: false,
 				enableIrc: false,
 			});
+		} finally {
+			authStorage.close();
+		}
+	}
+
+	/**
+	 * Spawns a real child the way the task tool does, through `runStructuredSubagent`: an agent that names no
+	 * model, from a parent session whose active model is `parentModel`, so the child inherits that model.
+	 */
+	async function runInheritingWorker(id: string, models: MockModel[], settings: Settings, parentModel: string) {
+		const { authStorage, modelRegistry } = namedWorkerRegistry(models);
+		const agent: AgentDefinition = {
+			name: "inheriting-worker",
+			description: "test",
+			systemPrompt: "test",
+			tools: ["read"],
+			source: "bundled",
+		};
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
+		const parent = {
+			cwd: path.join(root, "home", "work"),
+			hasUI: false,
+			settings,
+			authStorage,
+			modelRegistry,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			getActiveModelString: () => parentModel,
+			enableMCP: false,
+			enableLsp: false,
+			enableIrc: false,
+		} as unknown as ToolSession;
+		try {
+			const settled = await runStructuredSubagent({
+				session: parent,
+				invocationKind: "task",
+				assignment: "work",
+				agent: agent.name,
+				identity: { id },
+			});
+			return settled.result;
 		} finally {
 			authStorage.close();
 		}
@@ -1031,6 +1081,22 @@ describe("subagent runtime fallback on a real provider error", () => {
 			}),
 			{ agentModel: ["@worker-role"], modelOverride: [NAMED], modelRole: "worker-role" },
 		);
+		expect(other.calls.length).toBeGreaterThan(0);
+		expect(result.exitCode).toBe(0);
+		expect(result.resolvedModel).toBe(OTHER);
+		expect(result.resolvedModelIsFallback).toBe(true);
+	});
+
+	it("keeps an inherited parent model on its model-keyed chain when task.namedModelFallback is off", async () => {
+		const named = workerModel(NAMED, true);
+		const other = workerModel(OTHER, false);
+		const result = await runInheritingWorker(
+			"InheritedModel",
+			[named, other],
+			namedWorkerSettings({ "task.namedModelFallback": false, "retry.fallbackChains": { [NAMED]: [OTHER] } }),
+			NAMED,
+		);
+		expect(named.calls.length).toBeGreaterThan(0);
 		expect(other.calls.length).toBeGreaterThan(0);
 		expect(result.exitCode).toBe(0);
 		expect(result.resolvedModel).toBe(OTHER);
@@ -1133,31 +1199,42 @@ describe("subagent runtime fallback on a real provider error", () => {
 		expect(result.resolvedModel).toBe(OTHER);
 	});
 
-	it("does not prewalk a named model to its prewalk target when task.namedModelFallback is off", async () => {
-		const named = writerModel(NAMED);
-		const target = writerModel(OTHER);
-		const result = await runNamedWorker(
-			"NamedPrewalkOff",
-			[named, target],
-			namedWorkerSettings({ "task.namedModelFallback": false }),
-			{ agentModel: [NAMED], prewalk: OTHER, tools: ["read", "write"] },
-		);
-		expect(target.calls).toHaveLength(0);
-		expect(named.calls.length).toBeGreaterThan(1);
-		expect(result.exitCode).toBe(0);
-		expect(result.resolvedModel).toBe(NAMED);
-	});
+	/** Each way prewalk reaches a subagent: its frontmatter, `task.agentPrewalk`, and `task.prewalk` (bundled `task` only). */
+	const PREWALK_SOURCES = [
+		["frontmatter", { prewalk: OTHER }, {}],
+		["task.agentPrewalk", {}, { "task.agentPrewalk": { "named-worker": OTHER } }],
+		["task.prewalk", { agentName: "task" }, { "task.prewalk": true, modelRoles: { smol: OTHER } }],
+	] as const;
 
-	it("still prewalks a named model to its prewalk target by default", async () => {
+	it.each(PREWALK_SOURCES)(
+		"does not prewalk a named model to another model when task.namedModelFallback is off (%s)",
+		async (_label, spawn, extra) => {
+			const named = writerModel(NAMED);
+			const target = writerModel(OTHER);
+			const result = await runNamedWorker(
+				"NamedPrewalkOff",
+				[named, target],
+				namedWorkerSettings({ "task.namedModelFallback": false, ...extra }),
+				{ agentModel: [NAMED], tools: ["read", "write"], ...spawn },
+			);
+			expect(target.calls).toHaveLength(0);
+			expect(named.calls.length).toBeGreaterThan(1);
+			expect(result.exitCode).toBe(0);
+			expect(result.resolvedModel).toBe(NAMED);
+		},
+	);
+
+	it.each(PREWALK_SOURCES)("still prewalks a named model by default (%s)", async (_label, spawn, extra) => {
 		const named = writerModel(NAMED);
 		const target = writerModel(OTHER);
-		const result = await runNamedWorker("NamedPrewalkDefault", [named, target], namedWorkerSettings({}), {
+		const result = await runNamedWorker("NamedPrewalkDefault", [named, target], namedWorkerSettings(extra), {
 			agentModel: [NAMED],
-			prewalk: OTHER,
 			tools: ["read", "write"],
+			...spawn,
 		});
 		expect(named.calls).toHaveLength(1);
 		expect(target.calls.length).toBeGreaterThan(0);
 		expect(result.exitCode).toBe(0);
+		expect(result.resolvedModel).toBe(OTHER);
 	});
 });
