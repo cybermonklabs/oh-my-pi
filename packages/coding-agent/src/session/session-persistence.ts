@@ -237,11 +237,12 @@ function isSnapcompactArchiveSlot(
 }
 
 /**
- * One rebuild of a value for persistence ({@link truncateNode}): its blob
- * store, the containers it is inside (a cycle fails), and the deepest level it
- * reached.
+ * One walk of a value for persistence, a rebuild ({@link truncateNode}) or an
+ * image externalization ({@link externalizedImagesNode}): its blob store, the
+ * containers it is inside (a cycle fails), and the deepest level it reached,
+ * which says whether the value nests past {@link DEEP_JSON_LEVELS}.
  */
-interface TruncateWalk {
+interface PersistenceWalk {
 	readonly blobStore: BlobStore;
 	readonly path: ContainerPath;
 	deepest: number;
@@ -288,7 +289,7 @@ function isContainer(value: unknown): value is object {
  */
 function* persistSnapcompactArchive(
 	archive: Record<string, unknown>,
-	walk: TruncateWalk,
+	walk: PersistenceWalk,
 	depth: number,
 	scan: boolean,
 ): NestedWalk<Record<string, unknown>> {
@@ -344,7 +345,7 @@ function truncateForPersistence(value: unknown, blobStore: BlobStore, shape?: Pe
 	if (!isContainer(value)) return truncateLeaf(value, undefined, blobStore);
 	const found = Array.isArray(value) ? "dirty" : persistenceScan(value);
 	if (found === "clean") return value;
-	const walk: TruncateWalk = { blobStore, path: new ContainerPath(), deepest: 0 };
+	const walk: PersistenceWalk = { blobStore, path: new ContainerPath(), deepest: 0 };
 	const persisted = runNested(truncateNode(value, undefined, walk, 0, found === "dirty"));
 	if (shape && walk.deepest > DEEP_JSON_LEVELS) shape.deep = true;
 	return persisted;
@@ -377,7 +378,7 @@ function truncateLeaf(value: unknown, key: string | undefined, blobStore: BlobSt
 function* truncateNode(
 	obj: object,
 	key: string | undefined,
-	walk: TruncateWalk,
+	walk: PersistenceWalk,
 	depth: number,
 	scan: boolean,
 ): NestedWalk {
@@ -504,7 +505,7 @@ function* truncateNode(
 function containerStep(
 	value: object,
 	key: string | undefined,
-	walk: TruncateWalk,
+	walk: PersistenceWalk,
 	depth: number,
 	scan: boolean,
 ): NestedWalk | undefined {
@@ -820,16 +821,6 @@ function preparedEntry(entry: FileEntry, blobStore: BlobStore, shape: PersistedS
 }
 
 /**
- * One walk of {@link externalizedImagesNode}: its blob store, the containers it
- * is inside (a cycle fails), and the deepest level it reached.
- */
-interface ExternalizeWalk {
-	readonly blobStore: BlobStore;
-	readonly path: ContainerPath;
-	deepest: number;
-}
-
-/**
  * `value` with each image payload a persisted line externalizes (content image
  * blocks, `images[]`, snapcompact frames, image data URLs, generated images)
  * replaced by its blob reference, and nothing else changed. A block a persisted
@@ -840,7 +831,7 @@ interface ExternalizeWalk {
  */
 function externalizeImagesOnly(value: unknown, blobStore: BlobStore, shape: PersistedShape): unknown {
 	if (!isContainer(value)) return externalizedImagesLeaf(value, undefined, blobStore);
-	const walk: ExternalizeWalk = { blobStore, path: new ContainerPath(), deepest: 0 };
+	const walk: PersistenceWalk = { blobStore, path: new ContainerPath(), deepest: 0 };
 	const externalized = runNested(externalizedImagesNode(value, undefined, walk, 0));
 	if (walk.deepest > DEEP_JSON_LEVELS) shape.deep = true;
 	return externalized;
@@ -855,7 +846,7 @@ function externalizedImagesLeaf(value: unknown, key: string | undefined, blobSto
 function* externalizedImagesNode(
 	value: object,
 	key: string | undefined,
-	walk: ExternalizeWalk,
+	walk: PersistenceWalk,
 	depth: number,
 ): NestedWalk {
 	// An image is replaced before its level counts toward `walk.deepest`: the walk does not go into it.
