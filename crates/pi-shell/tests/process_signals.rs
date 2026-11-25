@@ -4400,7 +4400,7 @@ fn an_embedded_bash_dies_of_the_int_it_acts_on() {
 /// `INT` the root acts on at once (under `set -m`, which holds none) too.
 ///
 /// A known difference, until `fix/shell-external-stages-share-a-kernel-pipe`
-/// (INFRA-1484's architect ruled so on 2026-11-21 at 03:22Z): obash joins
+/// (the fork's architect ruled so on 2026-11-21): obash joins
 /// two external stages with a pipe its own process pumps (`mem::pipe`,
 /// `vm/exec.rs`), so the output a stage writes after the shell died is
 /// lost, where bash's and zsh's stages share a kernel pipe. The rows of
