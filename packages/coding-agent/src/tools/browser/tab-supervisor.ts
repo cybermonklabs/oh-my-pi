@@ -1883,6 +1883,17 @@ export function setAfterInProcessImportForTest(hook: (() => Promise<void>) | und
 	afterInProcessImportForTest = hook;
 }
 
+/**
+ * Test-only: recycle a Worker-backed tab's worker, as the supervisor does after a run of it timed out. Under the Bun test
+ * runner the worker's own run timeout cannot be relied on to fire (see {@link raceWithTimeout}), so a test of what the
+ * recycle does to the run it replaces calls it directly.
+ */
+export async function recycleTimedOutWorkerTabForTest(name: string, timeoutMs: number): Promise<boolean> {
+	const tab = tabs.get(name);
+	if (tab?.backend !== "worker") throw new Error(`recycleTimedOutWorkerTabForTest: ${name} is not a worker tab`);
+	return await recycleTimedOutWorkerTab(tab, timeoutMs);
+}
+
 function isLastSurfaceCloseError(err: unknown): boolean {
 	const message = err instanceof Error ? err.message : String(err);
 	return /last/i.test(message);
@@ -2161,6 +2172,13 @@ async function recycleTimedOutWorkerTab(
 	// must not restart the recycle's init budget.
 	const startedAt = performance.now();
 	const oldWorker = tab.worker;
+	// Host tool calls the replaced worker's run started would otherwise keep running, and reply to the new worker.
+	const recycled = postmortem.markExpectedCleanupError(
+		new ToolError("Browser tab worker was replaced; the run that started this tool call has ended"),
+	);
+	for (const pending of tab.pending.values()) {
+		for (const ctrl of pending.toolCalls.values()) ctrl.abort(recycled);
+	}
 	await oldWorker.terminate().catch(() => undefined);
 	const browserWSEndpoint = tab.browser.wsEndpoint;
 	const payload: WorkerInitPayload = {
@@ -2240,6 +2258,8 @@ async function forceKillTab(tab: WorkerTabSession, reason: string): Promise<void
 	tab.state = "dead";
 	const error = postmortem.markExpectedCleanupError(new ToolError(reason));
 	for (const pending of tab.pending.values()) {
+		// Host tool calls the run started would otherwise keep running with no one to answer, as on a release.
+		for (const ctrl of pending.toolCalls.values()) ctrl.abort(error);
 		// As a release does. Only cmux and Tern runs listen to closeAc, and they never reach a kill; the worker's
 		// terminate below ends a worker run.
 		pending.closeAc?.abort(error);
