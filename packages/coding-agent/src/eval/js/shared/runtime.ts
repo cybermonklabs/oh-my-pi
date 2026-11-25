@@ -617,6 +617,19 @@ export class JsRuntime {
 		return filename && path.isAbsolute(filename) ? filename : undefined;
 	}
 
+	/**
+	 * Run the embedder's side of a tool call outside the run's async context. The stdio routing sends a write to the
+	 * run whose context the writing code inherited, so host code a call runs, and anything it starts (timers,
+	 * continuations that outlive the run), would otherwise write into the run's output instead of the process's own
+	 * streams: an RPC frame or a print-mode record lost in a browser run. The guest's own writes stay in the run.
+	 * It leaves the realm's run record too ({@link REALM_RUN}): the stdio routing drops an abandoned run's writes, and
+	 * host work a call started must still reach the streams after its run is abandoned. Callers check the run with
+	 * {@link throwIfRunAbandoned} after the call returns, back in the run's context; inside this call it sees no run.
+	 */
+	#hostCall<T>(call: () => T): T {
+		return REALM_RUN.exit(() => this.#als.exit(call));
+	}
+
 	#activeHooks(action: string): RuntimeHooks | undefined {
 		const hooks = this.#activeRun()?.hooks;
 		if (!hooks) {
@@ -675,7 +688,8 @@ export class JsRuntime {
 			__omp_call_tool__: async (name: string, args: unknown) => {
 				const hooks = this.#activeHooks("tool");
 				if (!hooks) return undefined;
-				const result = await hooks.callTool(name, args, this.#callSiteAls.getStore());
+				const callSite = this.#callSiteAls.getStore();
+				const result = await this.#hostCall(() => hooks.callTool(name, args, callSite));
 				// The run may have been abandoned while the tool ran: its hooks take nothing more.
 				throwIfRunAbandoned();
 				return surfaceBridgedToolImages(result, hooks);
@@ -684,7 +698,7 @@ export class JsRuntime {
 				const hooks = this.#activeHooks("prelude");
 				if (!hooks) return undefined;
 				const payload = { name, parameters };
-				const result = await hooks.callTool("__prelude__", payload);
+				const result = await this.#hostCall(() => hooks.callTool("__prelude__", payload));
 				throwIfRunAbandoned();
 				return surfaceBridgedToolImages(result, hooks);
 			},
@@ -956,8 +970,10 @@ function patchStdioOnce(): void {
 		const routed = (chunk: unknown, encoding?: unknown, callback?: unknown): boolean => {
 			const cb = typeof encoding === "function" ? encoding : callback;
 			// A disposed runtime's resolver is gone, so an abandoned run's write would reach the real stream. Drop it,
-			// as a live run's write never reaches the stream either; no throw, since host code (an RPC or print-mode
-			// writer a tool call of the run started) shares the run's async context and treats a throw as fatal.
+			// as a live run's write never reaches the stream either; no throw, since host code that runs in the run's
+			// async context (reached through its objects `tab`, `page`, `browser`, `wait`, `assert`, its helpers, its
+			// hooks or the console bridge) treats a throw as fatal. Host code a tool call runs does not: it runs outside
+			// the run (`#hostCall`), so its writes are never dropped.
 			if (REALM_RUN.getStore()?.abandoned) {
 				if (typeof cb === "function") (cb as (error?: Error | null) => void)();
 				return true;
