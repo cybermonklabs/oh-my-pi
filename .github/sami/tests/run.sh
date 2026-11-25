@@ -400,6 +400,11 @@ echo "   Compiling demo v0.1.0" >&2
 if [ "\$sel" = --doc ]; then
 	case " \${RUSTDOCFLAGS:-} " in *" -Zunstable-options --no-capture "*) ;; *) echo "stub: cargo test --doc without RUSTDOCFLAGS --no-capture (\${RUSTDOCFLAGS:-})" >&2; exit 2 ;; esac
 	[ "\$threads" = 1 ] || { echo "stub: cargo test --doc without --test-threads=1" >&2; exit 2; }
+	# A crate's doctests under //crates build their dependencies with the
+	# features of the whole workspace, so every crate's run reuses them.
+	case " \$* " in *" --manifest-path crates/"*)
+		case " \$* " in *' -Zfeature-unification --config resolver.feature-unification="workspace" '*) ;; *) echo "stub: cargo test --doc of a crate under crates/ without workspace feature unification (\$*)" >&2; exit 2 ;; esac ;;
+	esac
 fi
 if [ "\$ign" = 1 ]; then
 	# An #[ignore]d test's run goes --offline, under RUST_TEST_OFFLINE_UNDER.
@@ -669,6 +674,11 @@ run J108-listings-for-macos 0 'Listings for the macOS inventory: 2 binaries' '' 
 CARGO_MODE=doc-empty run J113b-bazel-doctest-without-cargo-counterpart 1 "crates/pi-diff src/lib.rs - f \\(line 3\\) ran in Bazel's doctest target and not in cargo's doctest run" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 CARGO_MODE=doc-extra run J114-cargo-doctest-without-bazel-counterpart 1 "crates/pi-diff src/lib.rs - h \\(line 20\\) ran in cargo's doctest run and not in Bazel's doctest target" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 run J115-doctests-match 0 "Doctests that ran in Bazel and in cargo's readable re-run: 1" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# U1: a crate's cargo doctest run builds its dependencies with the features of
+# the whole workspace (cargo's -Zfeature-unification), so the 13 crates' runs
+# build each dependency once (run 45553300236: 1148.5 s, nearly all of it
+# building the same dependencies again); the stub refuses a run without it.
+NOT_MSG='stub:|::error' run U1-crate-doctests-unify-features-over-the-workspace 0 "Doctests that ran in Bazel and in cargo's readable re-run: 1" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 # R3-1: a line a test binary writes outside libtest's record (a child's or a
 # thread's write to the inherited stream) is a skip if it has a skip word,
 # and must match rust-test-known-raw-output.txt otherwise, or the job fails.

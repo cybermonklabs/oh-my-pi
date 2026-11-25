@@ -712,8 +712,21 @@ run_cargo() {
 		bazelisk query --output=label 'kind("rust_doc_test rule", //crates/...) - attr(tags, "manual", //crates/...)' >"$tmp/doc-targets.txt" || stop "bazel query for the doctest targets failed"
 		sed -e 's|^//||' -e 's|:.*||' "$tmp/doc-targets.txt" | LC_ALL=C sort -u >"$tmp/doc-dirs.txt"
 	fi
+	# Each crate's doctests are a cargo invocation of their own, and cargo
+	# picks the features of the crates they depend on per invocation: a
+	# dependency another crate's run built is built again whenever its
+	# features, or a dependency's, differ (pi-shell, jj-lib, syn and tokio,
+	# among others). In run 45553300236 these 13 runs took 1148.5 s of the
+	# cargo phase's 1181.9 s, all but 12 s of it building. With cargo's
+	# feature unification over the workspace, every invocation resolves a
+	# dependency's features the same way, so the later runs reuse almost
+	# every unit an earlier run built (cold, on 15 CPUs: 495.8 s -> 234.0 s
+	# for the 13 runs). The crates under test keep their own features; on
+	# the tree this was measured on, the same doctests ran, by name, with
+	# and without it. The comparison with Bazel's doctests below catches a
+	# doctest added or lost, not a change in what one does.
 	while read -r dir; do
-		cargo_test "$dir:doc" "$dir/Cargo.toml" cargo --doc --
+		cargo_test "$dir:doc" "$dir/Cargo.toml" cargo --doc -Zfeature-unification --config 'resolver.feature-unification="workspace"' --
 	done <"$tmp/doc-dirs.txt"
 	# The #[ignore]d cargo tests run alone on Linux, where the network can be
 	# taken away (rust-test-offline.sh).
