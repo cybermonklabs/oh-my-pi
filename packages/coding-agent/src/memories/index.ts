@@ -5,7 +5,15 @@ import * as path from "node:path";
 import { type AgentMessage, agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import { type ApiKey, completeSimple, Effort, type Model, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
-import { getAgentDbPath, getMemoriesDir, isEnoent, logger, parseJsonlLenient, prompt } from "@oh-my-pi/pi-utils";
+import {
+	getAgentDbPath,
+	getMemoriesDir,
+	isEnoent,
+	logger,
+	parseJsonlLenient,
+	prompt,
+	stringifyDeepJson,
+} from "@oh-my-pi/pi-utils";
 
 import { type ModelRegistry, probeModelApiKey } from "../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
@@ -877,7 +885,7 @@ async function stage1Items(
 	let oldest = 0;
 	let tailLength = 1;
 	for await (const message of messages) {
-		const json = JSON.stringify(message);
+		const json = stringifyDeepJson(message)!;
 		if (!truncated) {
 			head += head.length === 1 ? json : `,${json}`;
 			truncated = head.length > maxChars;
@@ -906,7 +914,7 @@ async function stage1Items(
 		tail = "]";
 		let exhausted = true;
 		for await (const message of persistableMessagesFromBack(rollout)) {
-			tail = `,${JSON.stringify(message)}${tail}`;
+			tail = `,${stringifyDeepJson(message)}${tail}`;
 			if (tail.length >= tailChars) {
 				exhausted = false;
 				break;
