@@ -61,4 +61,31 @@ describe("RPC message pagination", () => {
 		expect(first.messages).toEqual([messages[0]]);
 		expect(first.nextCursor).toBeDefined();
 	});
+
+	// A tool result's details nest as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000.
+	it("pages past a message nested deeper than JSON.stringify recurses, counting its bytes", () => {
+		let details: unknown = { leaf: "bottom" };
+		for (let level = 0; level < 50_000; level++) details = { next: details };
+		const deep: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "inspect",
+			content: [{ type: "text", text: "inspected" }],
+			details,
+			isError: false,
+			timestamp: 1,
+		};
+		// About 410 KB, then about 450 KB for `deep`: the two together pass the 768 KB a page holds.
+		const messages = [message(0, 400 * 1024), deep, message(2, 128)];
+		const deepSnapshot = { sessionId: "session-3", leafId: "leaf-3", messageCount: messages.length };
+
+		const first = pageRpcMessages(messages, deepSnapshot);
+		const second = pageRpcMessages(messages, deepSnapshot, { cursor: first.nextCursor });
+
+		expect(first.messages).toEqual([messages[0]]);
+		expect(second.messages).toHaveLength(2);
+		expect(second.messages[0]).toBe(deep);
+		expect(second.messages[1]).toEqual(messages[2]);
+		expect(second.nextCursor).toBeUndefined();
+	});
 });
