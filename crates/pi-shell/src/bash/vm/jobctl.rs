@@ -29,7 +29,8 @@
 //! its own ([`Pgrp`]), and has no terminal handle. Its own dispositions
 //! stay (bash leaves `TSTP`, `TTIN` and `TTOU` at their defaults), it
 //! prints no job notice (bash 5.3 holds a script's), and a command of its
-//! own that stops is waited for as before job control.
+//! own that stops is suspended as with a terminal ([`suspend`], zsh's way:
+//! bash makes the stopped command alone a stopped job and goes on).
 
 use std::{
 	fmt::Write as _,
@@ -723,15 +724,11 @@ pub fn pipeline_started(k: &mut Kernel, job: Vpid, stages: &[(Vpid, bool)]) {
 
 /// An external `vp` waits for stopped or continued ([`ExtProc::poll_event`]).
 /// The root's own foreground job stopping is suspended at once (`Some`:
-/// the flow of the op that waited), but in a script doing job control
-/// without a terminal, which waits on for it as without job control (a
-/// known difference: bash goes on, with the command a stopped job); any
-/// other change is applied to the job table after the turn. `None`: the
-/// vproc goes on waiting.
+/// the flow of the op that waited); any other change is applied to the job
+/// table after the turn. `None`: the vproc goes on waiting.
 pub fn ext_event(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, ev: ProcEvent) -> Option<Flow> {
 	k.jobctl.pgrp?;
 	match ev {
-		ProcEvent::Stopped(_) if vp.parent.is_none() && without_terminal(k) => None,
 		ProcEvent::Stopped(sig) if vp.parent.is_none() => Some(suspend(k, cx, vp, sig)),
 		ProcEvent::Exited(_) => None,
 		ProcEvent::Continued if vp.parent.is_none() => None,
@@ -1520,8 +1517,7 @@ impl Shell {
 	/// stop of the shell's own foreground job suspends it, [`suspend`]; of
 	/// the job `fg` resumed, gives the terminal back and ends the `fg`),
 	/// and settled background jobs get their `[n] pid` line. Without a
-	/// terminal (bash's `set -m` in a script) a stop is not reported, and
-	/// the shell's own foreground job is waited for on ([`ext_event`]).
+	/// terminal (bash's `set -m` in a script) a stop is not reported.
 	pub(super) fn job_events(&mut self, cx: &mut Cx<'_>) {
 		let jc = &self.k.jobctl;
 		if jc.events.is_empty() && jc.reparent.is_empty() {
