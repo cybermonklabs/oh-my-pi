@@ -210,7 +210,7 @@ pub fn in_function(vp: &Vproc) -> bool {
 /// `${FUNCNAME[-1]}` at a script file's top level, or in a `.` file, names
 /// an unset element silently, where a `-c` string has none to count back
 /// to and warns. `None` for any other name, and inside a function, where
-/// [`array`] lists the elements.
+/// [`array()`] lists the elements.
 ///
 /// # Errors
 ///
