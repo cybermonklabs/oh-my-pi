@@ -436,3 +436,22 @@ fn edited_history_lines_are_kept_until_accept() {
 fn edited_history_lines_are_forgotten_after_accept() {
 	same_log(SHOW, "\x10\x10XX\x0e\x0eecho hi\r\x10\x10\x10\x18p");
 }
+
+/// The keys reach the line editor however long the rc file takes: with an
+/// rc file that sleeps 2 s first, `^R` still starts an incremental search,
+/// whose status line each shell shows. The harness waits for the rc file's
+/// end (`RCDONE`) and for the line editor ([`Pty::zle_sync`]). One that
+/// typed once the output had gone quiet typed into the terminal's line
+/// discipline while the rc file ran, in both shells alike, so the two
+/// screens matched with no search on either.
+#[test]
+fn a_slow_rc_file_still_gets_the_keys_to_the_line_editor() {
+	let (ours, real) = match screens("sleep 2\n", |pty| keys(pty, "\x12ech")) {
+		Ok(s) => s,
+		Err(e) => panic!("pty session failed: {e}"),
+	};
+	assert!(ours.contains("bck-i-search: ech"), "obash screen:\n{ours}");
+	if let Some(real) = real {
+		assert!(real.contains("bck-i-search: ech"), "zsh screen:\n{real}");
+	}
+}
