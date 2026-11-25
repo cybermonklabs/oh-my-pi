@@ -72,6 +72,19 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 	let mut held: Option<Arc<Unit>> = None;
 	// Time passed since the last turn (`Kernel::clock`).
 	k.clock_stale();
+	// An ended vproc (no run, no frame) gets turns only to finish writing
+	// what it queued ([`Vproc::has_work`]): its last message, which a writer
+	// thread may still hold. Nothing else runs in it: no trap, no suspend.
+	if !vp.has_code() {
+		if !k.root.has_fault() {
+			let at = k.ctl.wakes();
+			match flush_out(k, vp) {
+				Some(fd) => park(k, cx, vp, WaitKey::Write { fd }, at),
+				None => unblock(k, cx, vp),
+			}
+		}
+		return;
+	}
 	// A process of the shell's foreground job stopped while it waited for
 	// something else: the job is suspended before anything else runs.
 	if k.jobctl.has_fg_stop() {
