@@ -90,15 +90,42 @@ fn run(script: &str, via: Via) -> (Option<i32>, String, String) {
 
 /// Runs each row through `obash -c` and from a script file, and fails with
 /// every run whose status (0), output or error text differs from bash's,
-/// each as a line `NAME: `, or `NAME (file): `, and the script.
+/// each as a line `NAME: `, or `NAME (file): `, and the script. A run that
+/// does not end within `obash_support`'s bound (its panic) is a difference
+/// of its row too, and the rows before and after it keep theirs; after
+/// [`HUNG`] such runs the test runs no more of them (each costs the bound)
+/// and names each it did not run.
 fn assert_both(rows: &[Both]) {
 	let mut found = Vec::new();
+	let mut hung = 0;
 	for via in [Via::Command, Via::File] {
 		for row in rows {
 			let want = if via == Via::File { row.file } else { row.out };
-			let (status, got, got_err) = run(row.script, via);
+			let how = if via == Via::File { " (file)" } else { "" };
+			if hung >= HUNG {
+				found.push(format!(
+					"{}{how}: `{}`\n  not run: {HUNG} runs did not end",
+					row.name, row.script
+				));
+				continue;
+			}
+			let (status, got, got_err) = match std::panic::catch_unwind(|| run(row.script, via)) {
+				Ok(ran) => ran,
+				Err(panic) => {
+					hung += 1;
+					let why = panic
+						.downcast_ref::<String>()
+						.map(String::as_str)
+						.or_else(|| panic.downcast_ref::<&str>().copied())
+						.unwrap_or("panicked");
+					found.push(format!(
+						"{}{how}: `{}`\n  bash: Some(0) {want:?} {:?}\n  omp:  {why}",
+						row.name, row.script, row.err
+					));
+					continue;
+				},
+			};
 			if (status, got.as_str(), got_err.as_str()) != (Some(0), want, row.err) {
-				let how = if via == Via::File { " (file)" } else { "" };
 				found.push(format!(
 					"{}{how}: `{}`\n  bash: Some(0) {want:?} {:?}\n  omp:  {status:?} {got:?} \
 					 {got_err:?}",
@@ -115,6 +142,11 @@ fn assert_both(rows: &[Both]) {
 		found.join("\n")
 	);
 }
+
+/// The runs that may hit `obash_support`'s bound before [`assert_both`]
+/// stops running rows: a test that hangs on every row would otherwise take
+/// the bound once per row.
+const HUNG: usize = 2;
 
 /// A command substitution started in a function substitution keeps every
 /// job it starts: a finished one stays listed after `wait`, `wait PID`,
@@ -199,11 +231,21 @@ fn a_substitution_of_a_function_substitution_keeps_every_job() {
 			file:   "[w=0\n[1]+  Done                       sleep 0.1\ne]\nend\n",
 			err:    "",
 		},
+		// The second job blocks on a fifo the shell opens only after the first
+		// `wait -n`, so it still runs then (with both ended first, bash's third
+		// `wait -n` is 127: the next row).
 		Both {
 			name:   "wait-n-three-times",
-			script: r#"y=${ x=$({ sleep 0.1 & sleep 0.2 & wait -n; echo "rc=$?"; wait -n; echo "rc=$?"; wait -n; echo "rc=$?"; jobs; echo e; } 2>&1); echo "[$x]"; }; echo "$y"; echo end"#,
-			out:    "[rc=0\nrc=0\nrc=0\n[1]-  Done                       sleep 0.1\n[2]+  Done                       sleep 0.2\ne]\nend\n",
-			file:   "[rc=0\nrc=0\nrc=0\n[1]-  Done                       sleep 0.1\n[2]+  Done                       sleep 0.2\ne]\nend\n",
+			script: r#"F=$(mktemp -u); mkfifo "$F"; y=${ x=$({ sleep 0.1 & { read -r _ < "$F"; } & wait -n; echo "rc=$?"; echo > "$F"; wait -n; echo "rc=$?"; wait -n; echo "rc=$?"; jobs; echo e; } 2>&1); echo "[$x]"; }; echo "$y"; rm -f "$F"; echo end"#,
+			out:    "[rc=0\nrc=0\nrc=0\n[1]-  Done                       sleep 0.1\n[2]+  Done                       { read -r _ < \"$F\"; }\ne]\nend\n",
+			file:   "[rc=0\nrc=0\nrc=0\n[1]-  Done                       sleep 0.1\n[2]+  Done                       { read -r _ < \"$F\"; }\ne]\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "wait-n-three-times-both-ended-first",
+			script: r#"y=${ x=$({ sleep 0.1 & p1=$!; sleep 0.2 & p2=$!; while kill -0 $p1 2>/dev/null || kill -0 $p2 2>/dev/null; do :; done; wait -n; echo "rc=$?"; wait -n; echo "rc=$?"; wait -n; echo "rc=$?"; jobs; echo e; } 2>&1); echo "[$x]"; }; echo "$y"; echo end"#,
+			out:    "[rc=0\nrc=0\nrc=127\n[1]-  Done                       sleep 0.1\n[2]+  Done                       sleep 0.2\ne]\nend\n",
+			file:   "[rc=0\nrc=0\nrc=127\n[1]-  Done                       sleep 0.1\n[2]+  Done                       sleep 0.2\ne]\nend\n",
 			err:    "",
 		},
 		Both {
@@ -1279,6 +1321,124 @@ fn a_function_substitution_s_marks_go_at_the_next_clean_up() {
 			script: r"shopt -s lastpipe; ( sleep 0.1 & p=$!; /bin/true & q=$!; echo | { while kill -0 $p 2>/dev/null || kill -0 $q 2>/dev/null; do :; done; z=$(:); jobs -n | wc -l; echo m; } )",
 			out:    "2\nm\n",
 			file:   "2\nm\n",
+			err:    "",
+		},
+	]);
+}
+
+/// A command substitution's copy of its shell's job (`Job::inherited`) is
+/// no child of it. `wait %N` of a finished foreground copy returns its
+/// status at once (and again: the copy stays), and of one still running,
+/// foreground or not, bash's -1 at once; a plain `wait` waits for no copy
+/// and leaves each in the table, frozen or not, so `jobs %N` still finds it.
+/// bash 5.3.20's output, measured: the -1 too.
+#[test]
+fn a_copied_job_answers_wait_and_stays() {
+	assert_both(&[
+		Both {
+			name:   "wait-a-finished-foreground-copy",
+			script: r#"x=${ /bin/sh -c "exit 7"; y=$(wait %1; printf "w=%s" "$?"); printf "%s" "$y"; }; printf "%s\n" "$x""#,
+			out:    "w=7\n",
+			file:   "w=7\n",
+			err:    "",
+		},
+		Both {
+			name:   "wait-it-twice",
+			script: r#"x=${ /bin/sh -c "exit 7"; y=$(wait %1; echo "w=$?"; wait %1; echo "v=$?"; jobs %1 >/dev/null 2>&1; echo "j=$?"); echo "$y"; }; echo "$x""#,
+			out:    "w=7\nv=7\nj=0\n",
+			file:   "w=7\nv=7\nj=0\n",
+			err:    "",
+		},
+		Both {
+			name:   "wait-a-running-foreground-copy",
+			script: r#"shopt -s lastpipe; sleep 1 | { x=$(wait %1; echo "w=$?"); echo "[$x]"; }; echo end"#,
+			out:    "[w=-1]\nend\n",
+			file:   "[w=-1]\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "wait-a-running-background-copy",
+			script: r#"sleep 1 & x=$(wait %1; echo "w=$?"); echo "[$x]"; wait; echo end"#,
+			out:    "[w=-1]\nend\n",
+			file:   "[w=-1]\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "a-plain-wait-keeps-a-foreground-copy",
+			script: r#"x=${ /bin/true; y=$(wait; jobs %1 2>/dev/null; printf "found=%s" "$?"); printf "%s" "$y"; }; printf "%s\n" "$x""#,
+			out:    "found=0\n",
+			file:   "found=0\n",
+			err:    "",
+		},
+		Both {
+			name:   "in-a-lastpipe-stage",
+			script: r#"shopt -s lastpipe; echo | { /bin/true; x=$(wait; jobs %2 >/dev/null 2>&1; echo "found=$?"); echo "$x"; }"#,
+			out:    "found=0\n",
+			file:   "found=0\n",
+			err:    "",
+		},
+		Both {
+			name:   "a-plain-wait-keeps-a-background-copy",
+			script: r#"/bin/sh -c 'exit 3' & p=$!; while kill -0 $p 2>/dev/null; do :; done; x=$(wait; jobs %1 2>/dev/null; echo "found=$?"); echo "$x""#,
+			out:    "[1]+  Exit 3                     /bin/sh -c 'exit 3'\nfound=0\n",
+			file:   "[1]+  Exit 3                     /bin/sh -c 'exit 3'\nfound=0\n",
+			err:    "",
+		},
+	]);
+}
+
+/// `break` or `continue` out of the last stage of a `lastpipe` pipeline:
+/// bash still appends the stage to the pipeline's job as it ends, with the
+/// builtin's status, so `wait %1` returns 0, not the forked stage's 7.
+/// bash 5.3.20's output, measured. Not covered: bash also waits for the
+/// forked stages there (`sleep 2 | break` takes 2 s), obash goes on at once.
+#[test]
+fn break_out_of_a_lastpipe_stage_ends_its_job() {
+	assert_both(&[
+		Both {
+			name:   "break",
+			script: r#"shopt -s lastpipe; x=${ for i in 1; do /bin/sh -c "exit 7" | break; done; wait %1; printf "w=%s" "$?"; }; printf "%s\n" "$x""#,
+			out:    "w=0\n",
+			file:   "w=0\n",
+			err:    "",
+		},
+		Both {
+			name:   "continue",
+			script: r#"shopt -s lastpipe; x=${ for i in 1; do /bin/sh -c "exit 7" | continue; done; wait %1; printf "w=%s" "$?"; }; printf "%s\n" "$x""#,
+			out:    "w=0\n",
+			file:   "w=0\n",
+			err:    "",
+		},
+		Both {
+			name:   "its-job-unlisted",
+			script: r#"shopt -s lastpipe; x=${ for i in 1; do echo | break; done; jobs %1; }; echo "$x""#,
+			out:    "\n",
+			file:   "\n",
+			err:    "",
+		},
+	]);
+}
+
+/// A job this shell's `kill` ended before obash spawned its program stays
+/// unreaped for bash until the next foreground command reaps it, also when
+/// one ran before the `kill` (obash takes that only from a flag it sets
+/// again at the kill): the plain `wait` then finds no job running, and
+/// `jobs` reports the job killed. bash 5.3.20's output, measured.
+#[test]
+fn a_kill_after_a_foreground_command_is_reaped_by_the_next() {
+	assert_both(&[
+		Both {
+			name:   "subshell",
+			script: r#"/bin/true; ( sleep 30 ) & kill -KILL %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Killed                     ( sleep 30 )\nend\n",
+			file:   "w=0\n[1]+  Killed                     ( sleep 30 )\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "pipeline",
+			script: r#"/bin/true; sleep 30 | cat & kill -KILL %1; /bin/true; wait; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\n[1]+  Killed                     sleep 30 | cat\nend\n",
+			file:   "w=0\n[1]+  Killed                     sleep 30 | cat\nend\n",
 			err:    "",
 		},
 	]);

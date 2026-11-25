@@ -940,7 +940,7 @@ impl Kernel {
 	/// Write the root vproc's in-place fields ([`state::sync_root`]) and a
 	/// vpid counter advanced without the store (`Shell::submit`): called
 	/// before every engine call returns.
-	pub fn sync_root(&mut self, store: &mut dyn StateStore, root: &Vproc) {
+	pub fn sync_root(&mut self, store: &mut dyn StateStore, root: &mut Vproc) {
 		state::sync_root(&mut self.root, store, root);
 		if self.next_vpid != self.written_vpid {
 			self.written_vpid = self.next_vpid;
@@ -2162,7 +2162,7 @@ impl Shell {
 		self.adopt(cx);
 		self.settle_callouts();
 		let step = self.step_inner(cx, budget);
-		self.k.sync_root(cx.store, &self.procs[0]);
+		self.k.sync_root(cx.store, &mut self.procs[0]);
 		step
 	}
 

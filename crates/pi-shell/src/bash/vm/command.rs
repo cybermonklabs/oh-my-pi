@@ -4447,6 +4447,27 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			let mut waited = None;
 			let keep = keeps_statuses(k, cx, vp);
 			while let Some(&v) = st(vp).wait_for.first() {
+				// A job this shell copied from its parent (a command
+				// substitution's, [`super::proc::Job::inherited`]) is no child
+				// of it. bash's `wait_for_job` answers a finished foreground
+				// one with its status at once, and one still running, foreground
+				// or not, with the -1 of a process it cannot wait for (both
+				// measured in bash 5.3.20). Waiting for its vproc would wait for
+				// ever; a finished background copy goes on below, to the status
+				// kept for it.
+				if let Some(i) = vp.jobs.iter().rposition(|j| {
+					j.vpid == v && j.inherited && (j.foreground || j.state == JobState::Running)
+				}) {
+					last = match vp.jobs.list[i].state {
+						JobState::Done(s) => s,
+						_ => -1,
+					};
+					if let Some(job) = vp.jobs.list.at_mut(i) {
+						job.notified = true;
+					}
+					st(vp).wait_for.remove(0);
+					continue;
+				}
 				// A foreground job (`wait %N`, [`super::proc::Job::foreground`])
 				// ends as its processes, the shell's own children, end: bash's
 				// `wait_for_job` waits for them, returns the job's status and
@@ -4598,11 +4619,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			// shell took in already; the cleanup deletes them, but none while
 			// no job may be deleted.
 			if bash && vp.jobs.iter().any(|j| j.foreground) {
-				for job in &mut vp.jobs.list {
-					if job.foreground && matches!(job.state, JobState::Done(_)) {
-						job.notified = true;
-					}
-				}
+				vp.jobs.foreground_done_reported();
 				super::killed::cleanup_dead_jobs(vp);
 			}
 			// And the statuses kept go (`bgp_clear`), frozen or not.

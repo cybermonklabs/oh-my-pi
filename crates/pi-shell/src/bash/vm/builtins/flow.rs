@@ -702,7 +702,9 @@ fn in_chld_trap(vp: &crate::bash::vm::proc::Vproc) -> bool {
 /// `wait` without operands: every running job (bash
 /// `wait_for_background_pids`); with job control a stopped job is skipped
 /// with a warning. A command substitution's copies of its parent's jobs
-/// are not its children. A foreground job
+/// are not its children: it waits for none of them, and they stay (bash
+/// 5.3 lists a finished one after the `wait`, measured, in a fork of a
+/// frozen shell or not). A foreground job
 /// ([`crate::bash::vm::proc::Job::foreground`]) is none bash waits for. A
 /// job this shell's `kill` ended with no OS status for obash to reap is
 /// still running for bash, which has not reaped it
@@ -724,7 +726,6 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	for pid in foreign {
 		ctx.usage(format!("pid {pid} is not a child of this shell"));
 	}
-	ctx.vp.jobs.remove_where(|j| j.inherited);
 	let bash = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
 	let held = |j: &crate::bash::vm::proc::Job| {
 		bash
@@ -735,7 +736,7 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	};
 	let mut list = Vec::new();
 	let mut stopped = Vec::new();
-	for job in ctx.vp.jobs.iter().filter(|j| !j.foreground) {
+	for job in ctx.vp.jobs.iter().filter(|j| !j.foreground && !j.inherited) {
 		match job.state {
 			crate::bash::vm::proc::JobState::Stopped(_) if control => {
 				stopped.push((job.number, job.pid()));

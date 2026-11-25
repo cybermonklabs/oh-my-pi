@@ -211,10 +211,15 @@ pub(super) fn target(
 			job.state = JobState::Running;
 			job.notified = true;
 		}
-		if ends(send) && !has_program(job) {
+		let unreaped = ends(send) && !has_program(job);
+		if unreaped {
 			job.unreaped = true;
 		}
-		return Ok(Some(SigTarget::Job(job.id)));
+		let id = job.id;
+		if unreaped {
+			ctx.vp.jobs.unreaped_marked();
+		}
+		return Ok(Some(SigTarget::Job(id)));
 	}
 	let pid = std::str::from_utf8(arg)
 		.ok()
@@ -244,7 +249,10 @@ pub(super) fn target(
 	// `kill` (that still finds a zombie) finds gone only once it reaped it.
 	if let Some(job) = named.and_then(|v| ctx.vp.jobs.by_vpid_mut(v)) {
 		match live {
-			Some(_) if ends(send) && !has_program(job) => job.unreaped = true,
+			Some(_) if ends(send) && !has_program(job) => {
+				job.unreaped = true;
+				ctx.vp.jobs.unreaped_marked();
+			},
 			Some(_) => {},
 			None => job.unreaped = false,
 		}

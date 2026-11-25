@@ -513,7 +513,7 @@ impl Shell {
 		// Subshells a host submitted since the last step become vprocs (and
 		// proc records) first.
 		self.adopt(cx);
-		self.k.sync_root(cx.store, &self.procs[0]);
+		self.k.sync_root(cx.store, &mut self.procs[0]);
 		// The root's frames pop every scope they pushed: a restored shell
 		// must count the empty ones too.
 		self.k.root.materialize(cx.store);
@@ -792,7 +792,7 @@ impl Shell {
 		if !restored {
 			shell.lose_running(cx, &mut report)?;
 		}
-		shell.k.sync_root(cx.store, &shell.procs[0]);
+		shell.k.sync_root(cx.store, &mut shell.procs[0]);
 		if let Some(err) = shell.k.root.take_fault() {
 			return Err(RestoreError::Store(err));
 		}
@@ -886,8 +886,17 @@ impl Shell {
 				vp.status = f.status;
 				vp.pipestatus = f.pipestatus;
 				vp.jobs = f.jobs;
+				// Each job found by an index, not a scan per facts record: a
+				// vproc can keep thousands of foreground jobs, each with facts.
+				let at: std::collections::HashMap<_, usize> = vp
+					.jobs
+					.list
+					.iter()
+					.enumerate()
+					.map(|(i, j)| (j.id, i))
+					.collect();
 				for (id, facts) in &f.job_facts {
-					if let Some(job) = vp.jobs.list.iter_mut().find(|j| j.id == *id) {
+					if let Some(job) = at.get(id).and_then(|&i| vp.jobs.list.at_mut(i)) {
 						job.set_facts(facts);
 					}
 				}
@@ -1171,7 +1180,7 @@ impl Shell {
 		}
 		// A foreground job's command went with the frames
 		// ([`super::proc::Job::foreground`]): it is done too.
-		for job in &mut self.procs[0].jobs.list {
+		for job in self.procs[0].jobs.list.iter_mut() {
 			if job.foreground && job.state == JobState::Running {
 				job.state = JobState::Done(137);
 				job.notified = false;

@@ -450,6 +450,119 @@ pub struct GetoptsState {
 	pub at:     Option<u32>,
 }
 
+/// A job table's jobs in start order ([`JobTable::list`]), with the lowest
+/// index at which any of them changed since the root's table was last
+/// written to the store ([`Self::take_changed`]): the sync at the end of
+/// every step compares only the jobs from there with their records
+/// ([`super::state::sync_root`]), not each of the thousands a loop of
+/// externals in a `lastpipe` stage or a function substitution keeps.
+/// Reads go through the slice; a change goes through a method here, which
+/// notes the index it changes, or through the slice's `&mut`
+/// ([`DerefMut`](std::ops::DerefMut)), which notes every job.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JobList {
+	jobs:    Vec<Job>,
+	/// The lowest index changed since [`Self::take_changed`], or
+	/// [`Self::NONE`]. 0 (every job) in a new, deserialized or cloned list.
+	#[serde(skip)]
+	changed: u32,
+	/// No job is [`Job::unreaped`]: [`JobTable::all_reaped`] has nothing to
+	/// do. False (look) in a new, deserialized or cloned list.
+	#[serde(skip)]
+	reaped:  bool,
+}
+
+impl JobList {
+	/// [`Self::changed`] when no job changed.
+	const NONE: u32 = u32::MAX;
+
+	/// `jobs` as they are in the store: none changed since it was written.
+	pub const fn synced(jobs: Vec<Job>) -> Self {
+		Self { jobs, changed: Self::NONE, reaped: false }
+	}
+
+	/// Note that the job at `index` (or one at a higher index) changed.
+	fn note(&mut self, index: usize) {
+		self.changed = self.changed.min(u32::try_from(index).unwrap_or(0));
+	}
+
+	/// The lowest index changed since the last call, if any: the jobs before
+	/// it are as they were, at the same indices.
+	pub fn take_changed(&mut self) -> Option<usize> {
+		let at = std::mem::replace(&mut self.changed, Self::NONE);
+		(at != Self::NONE).then_some(at as usize)
+	}
+
+	/// The jobs from `index` on are not in the store as they are: the next
+	/// [`Self::take_changed`] returns `index` or lower.
+	pub fn unsynced(&mut self, index: usize) {
+		self.note(index);
+	}
+
+	/// The job at `index`, to change it.
+	pub fn at_mut(&mut self, index: usize) -> Option<&mut Job> {
+		self.note(index);
+		self.jobs.get_mut(index)
+	}
+
+	/// Add `job` after the others.
+	pub fn push(&mut self, job: Job) {
+		self.note(self.jobs.len());
+		self.jobs.push(job);
+	}
+
+	/// Remove the job at `index`.
+	pub fn remove(&mut self, index: usize) -> Job {
+		self.note(index);
+		self.jobs.remove(index)
+	}
+
+	/// Keep only the jobs `keep` selects.
+	pub fn retain(&mut self, mut keep: impl FnMut(&Job) -> bool) {
+		let Some(first) = self.jobs.iter().position(|j| !keep(j)) else {
+			return;
+		};
+		self.note(first);
+		let mut i = 0;
+		self.jobs.retain(|j| {
+			let kept = i < first || (i > first && keep(j));
+			i += 1;
+			kept
+		});
+	}
+}
+
+impl From<Vec<Job>> for JobList {
+	fn from(jobs: Vec<Job>) -> Self {
+		Self { jobs, changed: 0, reaped: false }
+	}
+}
+
+impl PartialEq for JobList {
+	fn eq(&self, other: &Self) -> bool {
+		self.jobs == other.jobs
+	}
+}
+
+impl Eq for JobList {}
+
+impl std::ops::Deref for JobList {
+	type Target = [Job];
+
+	fn deref(&self) -> &[Job] {
+		&self.jobs
+	}
+}
+
+impl std::ops::DerefMut for JobList {
+	fn deref_mut(&mut self) -> &mut [Job] {
+		self.note(0);
+		self.reaped = false;
+		&mut self.jobs
+	}
+}
+
 /// The job table of one shell: bash's `jobs` array with `js.j_current` and
 /// `js.j_previous`. Called by the job builtins, `wait`, `kill`, the
 /// scheduler (state changes) and `$!`/`\j`. The root vproc's table is
@@ -459,7 +572,7 @@ pub struct GetoptsState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobTable {
 	/// Jobs in start order (ascending numbers).
-	pub list:     Vec<Job>,
+	pub list:     JobList,
 	/// The current job (`%+`, `%%`), by number.
 	pub current:  Option<u32>,
 	/// The previous job (`%-`), by number.
@@ -583,12 +696,12 @@ fn procs_status(procs: &JobProcs, platform: crate::bash::Platform) -> i32 {
 
 impl JobTable {
 	/// Number of jobs (prompt `\j`).
-	pub const fn len(&self) -> usize {
+	pub fn len(&self) -> usize {
 		self.list.len()
 	}
 
 	/// No jobs.
-	pub const fn is_empty(&self) -> bool {
+	pub fn is_empty(&self) -> bool {
 		self.list.is_empty()
 	}
 
@@ -597,29 +710,37 @@ impl JobTable {
 		self.list.iter()
 	}
 
+	/// The index of the newest job `pick` selects. The lookups search from
+	/// the newest job: the one a step changes is nearly always among the
+	/// last, in a table that can keep thousands ([`JobList`]).
+	fn newest(&self, pick: impl FnMut(&Job) -> bool) -> Option<usize> {
+		self.list.iter().rposition(pick)
+	}
+
 	/// Job `%number`.
 	pub fn get(&self, number: u32) -> Option<&Job> {
-		self.list.iter().find(|j| j.number == number)
+		self.newest(|j| j.number == number).map(|i| &self.list[i])
 	}
 
 	/// Job `%number`, to update it.
 	pub fn get_mut(&mut self, number: u32) -> Option<&mut Job> {
-		self.list.iter_mut().find(|j| j.number == number)
+		let i = self.newest(|j| j.number == number)?;
+		self.list.at_mut(i)
 	}
 
 	/// The background job whose root vproc is `vpid`. A foreground job
 	/// ([`Job::foreground`]) is none: what follows a child's end, a stop or
 	/// a `wait PID` passes it by.
 	pub fn by_vpid(&self, vpid: Vpid) -> Option<&Job> {
-		self.list.iter().find(|j| j.vpid == vpid && !j.foreground)
+		self
+			.newest(|j| j.vpid == vpid && !j.foreground)
+			.map(|i| &self.list[i])
 	}
 
 	/// The background job whose root vproc is `vpid`, to update it.
 	pub fn by_vpid_mut(&mut self, vpid: Vpid) -> Option<&mut Job> {
-		self
-			.list
-			.iter_mut()
-			.find(|j| j.vpid == vpid && !j.foreground)
+		let i = self.newest(|j| j.vpid == vpid && !j.foreground)?;
+		self.list.at_mut(i)
 	}
 
 	/// The background job `pid` names: its virtual pid or its program's OS
@@ -632,17 +753,14 @@ impl JobTable {
 	/// this shell's own: the key `wait %N` waits by.
 	pub fn foreground(&self, vpid: Vpid) -> Option<&Job> {
 		self
-			.list
-			.iter()
-			.find(|j| j.vpid == vpid && j.foreground && !j.inherited)
+			.newest(|j| j.vpid == vpid && j.foreground && !j.inherited)
+			.map(|i| &self.list[i])
 	}
 
 	/// The foreground job whose root vproc is `vpid`, to update it.
 	pub fn foreground_mut(&mut self, vpid: Vpid) -> Option<&mut Job> {
-		self
-			.list
-			.iter_mut()
-			.find(|j| j.vpid == vpid && j.foreground && !j.inherited)
+		let i = self.newest(|j| j.vpid == vpid && j.foreground && !j.inherited)?;
+		self.list.at_mut(i)
 	}
 
 	/// The number the next job takes: the one after the highest in use
@@ -728,7 +846,7 @@ impl JobTable {
 		notified: bool,
 		platform: crate::bash::Platform,
 	) {
-		let Some(job) = self.list.iter_mut().find(|j| {
+		let Some(i) = self.newest(|j| {
 			j.foreground
 				&& !j.inherited
 				&& j.state == JobState::Running
@@ -737,6 +855,9 @@ impl JobTable {
 					None => j.vpid == vpid,
 				}
 		}) else {
+			return;
+		};
+		let Some(job) = self.list.at_mut(i) else {
 			return;
 		};
 		let (status, signal) = match job.procs.as_deref_mut() {
@@ -771,11 +892,10 @@ impl JobTable {
 		status: i32,
 		platform: crate::bash::Platform,
 	) {
-		let Some(job) = self
-			.list
-			.iter_mut()
-			.find(|j| j.vpid == first && j.foreground && !j.inherited)
-		else {
+		let Some(i) = self.newest(|j| j.vpid == first && j.foreground && !j.inherited) else {
+			return;
+		};
+		let Some(job) = self.list.at_mut(i) else {
 			return;
 		};
 		let Some(procs) = job.procs.as_deref_mut() else {
@@ -800,22 +920,29 @@ impl JobTable {
 	/// no processes still running that knows no program yet. The shell runs
 	/// nothing else meanwhile, so no job comes after it.
 	pub fn pending_external_mut(&mut self) -> Option<&mut Job> {
-		self.list.last_mut().filter(|j| {
-			j.foreground
-				&& !j.inherited
-				&& j.state == JobState::Running
-				&& j.procs.is_none()
-				&& j.os_pid.is_none()
-		})
+		let last = self.list.last()?;
+		let pending = last.foreground
+			&& !last.inherited
+			&& last.state == JobState::Running
+			&& last.procs.is_none()
+			&& last.os_pid.is_none();
+		if !pending {
+			return None;
+		}
+		let i = self.list.len() - 1;
+		self.list.at_mut(i)
 	}
 
 	/// The foreground external of OS pid `pid` ended with `status`, killed
 	/// by `signal` (bash `wait_for`): its job, if it has one, is done;
 	/// `notified` as [`Self::foreground_reaped`].
 	pub fn external_ended(&mut self, pid: u32, status: i32, signal: Option<Signal>, notified: bool) {
-		if let Some(job) = self.list.iter_mut().rev().find(|j| {
+		let Some(i) = self.newest(|j| {
 			j.foreground && !j.inherited && j.state == JobState::Running && j.os_pid == Some(pid)
-		}) {
+		}) else {
+			return;
+		};
+		if let Some(job) = self.list.at_mut(i) {
 			job.state = JobState::Done(status);
 			job.signal = signal;
 			job.notified = notified;
@@ -825,11 +952,18 @@ impl JobTable {
 	/// The process of vproc `vpid` of one of the jobs ([`Job::procs`]) is
 	/// the program of OS pid `pid`.
 	pub fn proc_settled(&mut self, vpid: Vpid, pid: u32) {
+		let Some(i) = self.newest(|j| {
+			j.procs
+				.as_deref()
+				.is_some_and(|procs| procs.list.iter().any(|p| p.vpid == vpid))
+		}) else {
+			return;
+		};
 		if let Some(p) = self
 			.list
-			.iter_mut()
-			.filter_map(|j| j.procs.as_deref_mut())
-			.find_map(|procs| procs.get_mut(vpid))
+			.at_mut(i)
+			.and_then(|j| j.procs.as_deref_mut())
+			.and_then(|procs| procs.get_mut(vpid))
 		{
 			p.os_pid = Some(pid);
 		}
@@ -838,7 +972,7 @@ impl JobTable {
 	/// Remove job `number` (bash `delete_job`); a removed current or
 	/// previous job makes `reset_current` pick new ones.
 	pub fn remove(&mut self, number: u32) -> Option<Job> {
-		let i = self.list.iter().position(|j| j.number == number)?;
+		let i = self.newest(|j| j.number == number)?;
 		let job = self.list.remove(i);
 		if self.current == Some(number) || self.previous == Some(number) {
 			self.reset_current();
@@ -848,11 +982,27 @@ impl JobTable {
 
 	/// bash reaped every child that had ended ([`Job::unreaped`]): it does as
 	/// it waits for a foreground command (`wait_for`'s `waitchld` takes in
-	/// each child that ended, not only the one it waits for).
+	/// each child that ended, not only the one it waits for). Nothing to do
+	/// in the common case, where no job was marked since
+	/// ([`Self::unreaped_marked`]).
 	pub fn all_reaped(&mut self) {
-		for job in &mut self.list {
-			job.unreaped = false;
+		if self.list.reaped {
+			return;
 		}
+		for i in 0..self.list.len() {
+			if self.list[i].unreaped
+				&& let Some(job) = self.list.at_mut(i)
+			{
+				job.unreaped = false;
+			}
+		}
+		self.list.reaped = true;
+	}
+
+	/// A job was just marked [`Job::unreaped`] (`kill`'s, the one place that
+	/// marks one): [`Self::all_reaped`] has work again.
+	pub const fn unreaped_marked(&mut self) {
+		self.list.reaped = false;
 	}
 
 	/// Remove every job `pick` selects, as [`Self::remove`] does.
@@ -945,9 +1095,25 @@ impl JobTable {
 		self.state(number) == Some(JobState::Running)
 	}
 
+	/// Mark each finished foreground job reported ([`Job::foreground`],
+	/// bash's `mark_dead_jobs_as_notified` for them): only those not marked
+	/// yet change, so the next store sync compares no other.
+	pub fn foreground_done_reported(&mut self) {
+		for i in 0..self.list.len() {
+			let j = &self.list[i];
+			if j.foreground
+				&& !j.notified
+				&& matches!(j.state, JobState::Done(_))
+				&& let Some(job) = self.list.at_mut(i)
+			{
+				job.notified = true;
+			}
+		}
+	}
+
 	/// The newest job older than `before` (all jobs for `None`) that is
 	/// stopped (`stopped`) or running (bash `most_recent_job_in_state`).
-	fn newest(&self, before: Option<u32>, stopped: bool) -> Option<u32> {
+	fn most_recent(&self, before: Option<u32>, stopped: bool) -> Option<u32> {
 		self
 			.list
 			.iter()
@@ -974,15 +1140,15 @@ impl JobTable {
 			return;
 		}
 		if self.is_stopped(self.current)
-			&& let Some(candidate) = self.newest(self.current, true)
+			&& let Some(candidate) = self.most_recent(self.current, true)
 		{
 			self.previous = Some(candidate);
 			return;
 		}
 		let candidate = if self.is_running(self.current) {
-			self.newest(self.current, false)
+			self.most_recent(self.current, false)
 		} else {
-			self.newest(None, false)
+			self.most_recent(None, false)
 		};
 		self.previous = candidate.or(self.current);
 	}
@@ -996,7 +1162,9 @@ impl JobTable {
 		} else if self.is_stopped(self.previous) {
 			self.previous
 		} else {
-			self.newest(None, true).or_else(|| self.newest(None, false))
+			self
+				.most_recent(None, true)
+				.or_else(|| self.most_recent(None, false))
 		};
 		if let Some(job) = candidate {
 			self.set_current(job);
@@ -2379,7 +2547,12 @@ impl Live {
 // and `QUIT`: 587 B (a 532-byte map, a 48-byte word list, the two names).
 // It is a field now (`Vproc::async_ignored`, one byte: Vproc 680 → 688 B),
 // and the bench (debug) measured 2,458 → 1,879 B per idle vproc.
-const _: () = assert!(size_of::<Vproc>() <= 688, "Vproc grew (idle vproc ≤ 2 KiB)");
+// The job list's record of what changed since the root's last sync
+// (`JobList::changed`, a `u32`, and `JobList::reaped`: JobTable 56 → 64 B,
+// Vproc 688 → 696 B) keeps the per-step store sync from comparing every job
+// a `lastpipe` loop keeps: the bench (release) measured 1,909 B per idle
+// vproc with it, 1,901 B without.
+const _: () = assert!(size_of::<Vproc>() <= 696, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 384, "ExecState grew (idle vproc ≤ 2 KiB)");

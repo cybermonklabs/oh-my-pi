@@ -2147,7 +2147,11 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 			f.kind,
 			FrameKind::Script { what: ScriptKind::Eval, .. } | FrameKind::NoFork | FrameKind::Stage
 		);
+		let stage = matches!(f.kind, FrameKind::Stage);
 		if crossable && vp.frames.len() > 1 {
+			if stage {
+				lastpipe_stage_left(k, vp);
+			}
 			pop_frame(&mut k.root, cx.store, vp);
 			// The caller's op (`eval`) is abandoned with the loop.
 			clear_scratch(&mut k.root, cx.store, vp);
@@ -2164,6 +2168,29 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 	}
 	vp.status = 0;
 	top_frame(vp).pc += 1;
+}
+
+/// A `break` or `continue` leaves the last stage of a `lastpipe` pipeline,
+/// the top frame, with its status: bash's `execute_pipeline` still appends
+/// the stage to the pipeline's job as it ends (`append_process`), as the
+/// stage's normal end does ([`super::proc::JobTable::lastpipe_stage_ended`]),
+/// before the loop goes.
+fn lastpipe_stage_left(k: &Kernel, vp: &mut Vproc) {
+	let n = vp.frames.len();
+	let Some(first) = n
+		.checked_sub(2)
+		.and_then(|i| vp.frames.get(i))
+		.and_then(|f| f.scratch.as_ref())
+		.and_then(|sc| sc.children.first())
+		.map(|&(v, _)| v)
+	else {
+		return;
+	};
+	let text = BString::from(vp.command_text());
+	let platform = k.engine.config().platform;
+	let (shell, status) = (vp.vpid, vp.status);
+	vp.jobs
+		.lastpipe_stage_ended(first, shell, text, status, platform);
 }
 
 /// Whether bash runs `REAP` as `break` or `continue` at `pc` ends the body
@@ -4881,12 +4908,12 @@ pub(super) fn fork_async_ignored(
 /// ([`super::proc::Job::foreground`]).
 pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTable {
 	let parent = &vp.jobs;
-	let mut list = parent.list.clone();
+	let mut list = parent.list.to_vec();
 	for job in &mut list {
 		job.inherited = true;
 	}
 	super::proc::JobTable {
-		list,
+		list: list.into(),
 		current: parent.current,
 		previous: parent.previous,
 		chld: 0,

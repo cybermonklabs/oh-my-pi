@@ -831,11 +831,7 @@ fn report_all(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Opt
 	}
 	mark_unreported(k, cx, vp);
 	if vp.mode.dialect() == Dialect::Bash && !vp.jobs_frozen() {
-		for job in &mut vp.jobs.list {
-			if job.foreground && matches!(job.state, JobState::Done(_)) {
-				job.notified = true;
-			}
-		}
+		vp.jobs.foreground_done_reported();
 	}
 	cleanup_dead_jobs(vp);
 	(!out.is_empty()).then_some(out)
@@ -862,11 +858,12 @@ fn report_all(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Opt
 /// interactive shell, nor in zsh.
 fn mark_unreported(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 	let open = |j: &super::proc::Job| !j.notified && matches!(j.state, JobState::Done(_));
+	// The scan of the table last: a frozen list keeps thousands of jobs.
 	if vp.mode.dialect() != Dialect::Bash
 		|| vp.jobs_frozen()
-		|| !vp.jobs.iter().any(open)
 		|| (vp.jobs.comsub == Comsub::No && !misc_is(cx, vp, MiscKey::RunOrigin, b"c"))
 		|| misc_is(cx, vp, MiscKey::Interactive, b"1")
+		|| !vp.jobs.iter().rev().any(open)
 	{
 		return;
 	}
@@ -921,7 +918,8 @@ fn mark_unreported(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
 /// `3838`, also as `break` or `continue` ends the body:
 /// `exec::break_loops`).
 pub(super) fn cleanup_dead_jobs(vp: &mut Vproc) {
-	if vp.jobs.iter().any(deletable) && vp.mode.dialect() == Dialect::Bash && !vp.jobs_kept() {
+	// The scan of the table last: a list no job may leave keeps thousands.
+	if vp.mode.dialect() == Dialect::Bash && !vp.jobs_kept() && vp.jobs.iter().any(deletable) {
 		vp.jobs.remove_where(deletable);
 	}
 }

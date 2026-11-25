@@ -153,6 +153,63 @@ fn a_frozen_foreground_job_survives_a_snapshot() {
 	}
 }
 
+/// The root's job table reaches the store only as it changes (the sync
+/// compares the jobs from the first one that changed, [`JobList`]), so a
+/// snapshot at every op sees each change: a job added, one that ended (an
+/// early one, after later ones were added), one `wait` deleted, many kept
+/// while the list is frozen and deleted after it, and one `disown` deleted
+/// among others. Each row's output is the same with and without snapshots,
+/// and is bash 5.3.20's (measured, `-c` and from a script file).
+///
+/// [`JobList`]: crate::bash::vm::proc::JobList
+#[test]
+fn each_job_change_reaches_a_snapshot() {
+	let count = "n=0; for p in $(jobs -p); do n=$((n+1)); done; echo \"n=$n\"";
+	let rows: [(String, &str); 6] = [
+		(format!(": & wait; {count}; jobs; echo end"), "n=0\nend\n"),
+		(
+			format!(
+				"( exit 3 ) & ( exit 4 ) & wait %1; echo \"a=$?\"; {count}; wait %2; echo \"b=$?\"; \
+				 {count}"
+			),
+			"a=3\nn=1\nb=4\nn=0\n",
+		),
+		(
+			"( exit 7 ) & p=$!; for i in 1 2 3 4; do ( exit $i ) & done; wait $p; echo \"a=$?\"; \
+			 wait $!; echo \"b=$?\"; wait; echo end"
+				.to_owned(),
+			"a=7\nb=4\nend\n",
+		),
+		(
+			"for i in 1 2 3 4 5; do ( exit $i ) & done; wait $!; echo \"c=$?\"; wait; echo \"w=$?\""
+				.to_owned(),
+			"c=5\nw=0\n",
+		),
+		(
+			format!(
+				"y=${{ for i in 1 2 3 4 5 6; do ( exit $i ); done; wait %4; echo \"d=$?\"; ( exit 9 ) \
+				 & {count}; wait %7; echo \"e=$?\"; }}; echo \"$y\"; {count}"
+			),
+			"d=4\nn=1\ne=9\nn=0\n",
+		),
+		(
+			"( exit 1 ) & ( exit 2 ) & ( exit 3 ) & disown %2; x=$(jobs %2); echo \"j=$?\"; wait %3; \
+			 echo \"f=$?\"; wait %1; echo \"g=$?\""
+				.to_owned(),
+			"j=1\nf=3\ng=1\n",
+		),
+	];
+	for (src, want) in rows {
+		let (out, err) = same_under_snapshots(src.as_bytes());
+		assert_eq!(
+			String::from_utf8_lossy(&out),
+			want,
+			"{src} (stderr {:?})",
+			String::from_utf8_lossy(&err)
+		);
+	}
+}
+
 /// A foreground job a function substitution keeps whose command still runs
 /// goes with the frames: restored without them (`drop_frames`), the job is
 /// done as a lost vproc is (137), so it is reported once at most and then
