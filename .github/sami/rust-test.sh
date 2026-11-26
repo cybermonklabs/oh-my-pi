@@ -4,16 +4,14 @@
 # reported there, and holds no release.
 #
 # On Linux (the rust_test job) it runs every Bazel test target under
-# //crates, every test target of the cargo workspaces Bazel does not build,
-# and, under cargo too, the doctests of every crate that has a Bazel doctest
-# target (whose runner shows no passing doctest's output), reads each test
-# log, and fails when:
+# //crates (doctests too) and every test target of the cargo workspaces
+# Bazel does not build, reads each test log, and fails when:
 #   - a test fails that .github/sami/rust-test-known-failures.txt does not
 #     name, or a test it names does not fail;
 #   - a target fails to build or has no result, or its test binary ends
 #     before its tests do;
-#   - a test or doctest skips itself or prints (see "Skips" below), unless a
-#     list names it;
+#   - a test skips itself or prints (see "Skips" below), unless a list names
+#     it; a doctest prints or skips in its source (see "Skips");
 #   - a test of a test binary runs in no invocation (a filter in its target's
 #     args, or a skip this script passes, took it out), unless
 #     .github/sami/rust-test-sanctioned-skips.txt names it;
@@ -64,6 +62,19 @@
 # A test that returns early and prints nothing passes here: no reading of
 # the logs can tell it from a test that ran. Every test that can skip prints
 # the marker; one that returns silently is a defect of that test, fixed in it.
+#
+# Doctests. On Linux they run only in Bazel's doctest targets, whose runner
+# shows no passing doctest's output, so the scan above cannot read it, and
+# their source is read instead, with no build
+# (.github/sami/rust-test-doctest-forms.awk): a line of a doctest rustdoc
+# runs that holds the word print, println, eprint, eprintln, dbg, stdout or
+# stderr, or one of the skip words, fails the job, named by file and line,
+# and so does doc text the reader does not read. Every doctest
+# Bazel ran must be one the reader found at its file and line, or the job
+# fails as UNKNOWN. A doctest that a macro of another crate generates is in
+# no source file the reader reads; Bazel runs it, and the job fails as
+# UNKNOWN for it. The macOS job runs the crates' doctests under cargo, whose
+# output the scan reads.
 #
 # Usage: rust-test.sh, from the repository root, with these set:
 #   RUNNER_TEMP         a scratch directory for the event logs and log copies
@@ -135,6 +146,9 @@ libtest_event='def libtest_event:
 # rust-test-parity.sh and rust-test-macos-inventory.sh.
 # shellcheck source=.github/sami/rust-test-lists.sh
 . "$(dirname "${BASH_SOURCE[0]}")/rust-test-lists.sh"
+# The doctest reader (Linux; see "Doctests" above).
+doctest_forms="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rust-test-doctest-forms.awk"
+[ -f "$doctest_forms" ] || stop "$doctest_forms is missing"
 
 # entries <list> <fields> <tsv>: list_entries of .github/sami/<list>.
 entries() {
@@ -612,14 +626,16 @@ fi
 # as a rust_test log, with the stderr cargo kept beside it. The target is
 # `<directory>:<kind>:<name>` (kind lib, bin, test, example, bench or doc). A
 # failed cargo metadata stops the step.
-# Then the doctests of each crate with a Bazel doctest target run again under
-# cargo, as `<directory>:doc`: rules_rust's doctest runner takes no test
-# arguments, so its log shows neither a passing doctest's output nor one in
-# JSON. Even under cargo, rustdoc keeps a passing doctest's output out of the
-# record (`--show-output` reaches only libtest), so these run with rustdoc's
-# `--no-capture` and one thread, and doc_attribute gives each doctest the
-# lines printed between its start and its result (run 44889772803: a planted
-# doctest's `skipped:` line reached no record without them).
+# Then, in the macOS job (RUST_TEST_ONLY), the doctests of each crate with a
+# Bazel doctest target run under cargo, as `<directory>:doc`: that job runs
+# no Bazel doctest target, and rules_rust's doctest runner takes no test
+# arguments anyway, so its log shows neither a passing doctest's output nor
+# one in JSON. Even under cargo, rustdoc keeps a passing doctest's output out
+# of the record (`--show-output` reaches only libtest), so these run with
+# rustdoc's `--no-capture` and one thread, and doc_attribute gives each
+# doctest the lines printed between its start and its result (run
+# 44889772803: a planted doctest's `skipped:` line reached no record without
+# them). On Linux the doctests' source is read instead (the doctest reader).
 # Then each #[ignore]d cargo test that .github/sami/rust-test-ignored.txt
 # names runs alone, with --ignored and --exact.
 channel=""
@@ -703,9 +719,9 @@ run_cargo() {
 		done <"$tmp/cargo-targets.tsv"
 	done <"$tmp/cargo-workspaces.txt"
 	[ "$n" != 0 ] || stop "$sami/rust-test-cargo-workspaces.txt names no workspace with a test target"
-	# The crates whose doctests run again under cargo: those with a Bazel
-	# doctest target, from this run's rows (Linux) or, when this run ran no
-	# doctest target (RUST_TEST_ONLY, the macOS job), from bazel query.
+	# The crates with a Bazel doctest target: from this run's rows (Linux),
+	# or, when this run ran no doctest target (RUST_TEST_ONLY, the macOS
+	# job), from bazel query.
 	if [ -z "$only" ]; then
 		awk -F'\t' '$2 == "rust_doc_test rule" { d = $1; sub(/^\/\//, "", d); sub(/:.*/, "", d); print d }' "$rows" | LC_ALL=C sort -u >"$tmp/doc-dirs.txt"
 	else
@@ -723,11 +739,16 @@ run_cargo() {
 	# every unit an earlier run built (cold, on 15 CPUs: 495.8 s -> 234.0 s
 	# for the 13 runs). The crates under test keep their own features; on
 	# the tree this was measured on, the same doctests ran, by name, with
-	# and without it. The comparison with Bazel's doctests below catches a
-	# doctest added or lost, not a change in what one does.
-	while read -r dir; do
-		cargo_test "$dir:doc" "$dir/Cargo.toml" cargo --doc -Zfeature-unification --config 'resolver.feature-unification="workspace"' --
-	done <"$tmp/doc-dirs.txt"
+	# and without it.
+	# On Linux the doctests run only in Bazel's doctest targets, and their
+	# source is read for what Bazel's runner does not show (the doctest
+	# reader, below). The macOS job runs no Bazel doctest target, so there
+	# they run here, and the skip scan reads their output.
+	if [ -n "$only" ]; then
+		while read -r dir; do
+			cargo_test "$dir:doc" "$dir/Cargo.toml" cargo --doc -Zfeature-unification --config 'resolver.feature-unification="workspace"' --
+		done <"$tmp/doc-dirs.txt"
+	fi
 	# The #[ignore]d cargo tests run alone on Linux, where the network can be
 	# taken away (rust-test-offline.sh).
 	[ -z "$only" ] || return 0
@@ -770,8 +791,9 @@ check_results_exist() {
 	done < <(LC_ALL=C comm -23 "$tmp/test-targets.txt" "$tmp/with-result.txt")
 }
 
-# The cargo workspaces and the cargo doctests run in both jobs: on macOS,
-# that is how a cargo test or a doctest compiled only there runs.
+# The cargo workspaces run in both jobs; the crates' cargo doctests run only
+# in the macOS job (above): there, that is how a cargo test or a doctest
+# compiled only on macOS runs.
 run_cargo
 if [ -z "$only" ]; then
 	for i in "${!ignored_cargo[@]}"; do
@@ -782,9 +804,11 @@ if [ -z "$only" ]; then
 fi
 
 # The skip scan (see "Skips" above). skip_line matches a skip line in a
-# passing test's output; raw_skip_line matches one outside the record.
-skip_line='^([A-Za-z0-9_:]+: )?(skipped|skipping|SKIP|not run|UNCOMPARED)[ :]'
-raw_skip_line='(^|: )(skipped|skipping|SKIP|not run|UNCOMPARED)[ :]'
+# passing test's output; raw_skip_line matches one outside the record. The
+# doctest reader (below) looks for the same words in a doctest's code.
+skip_words='skipped|skipping|SKIP|not run|UNCOMPARED'
+skip_line="^([A-Za-z0-9_:]+: )?($skip_words)[ :]"
+raw_skip_line="(^|: )($skip_words)[ :]"
 failed="$tmp/failed.tsv"
 : >"$tmp/failed-at.tsv"
 skips="$tmp/skips.tsv"
@@ -959,13 +983,6 @@ check_libtest() {
 			# Its #[ignore]d tests (and ```ignore doctests) ran nothing; they
 			# are reconciled below.
 			jq -R -r --arg target "$label" 'fromjson? | select(type == "object" and .type == "test" and .event == "ignored") | "\($target)\t\(.name)"' "$log" >>"$tmp/cargo-ignored.tsv"
-			# A crate's cargo doctests that ran, against its Bazel doctests
-			# (below).
-			case "$label" in
-				*:doc)
-					jq -R -r --arg dir "$(doc_dir "$label")" 'fromjson? | select(type == "object" and .type == "test" and (.event == "ok" or .event == "failed")) | "\($dir)\t\(.name)"' "$log" >>"$tmp/doc-names-cargo.tsv"
-					;;
-			esac
 			;;
 		ignored-cargo-*) scan_output "$label" "$log" "$log.err" ;;
 		*) scan_output "$label" "$log" ;;
@@ -994,8 +1011,8 @@ check_libtest() {
 # each failed doctest indented four spaces, a blank line and `test result:
 # FAILED.`. No doctest may be filtered out: no list names one. An ```ignore
 # block is no test: each `test <name> ... ignored` line is counted apart (an
-# ignored count whose names the log does not give fails). The doctests that
-# ran are compared with cargo's re-run of the same crate (below).
+# ignored count whose names the log does not give fails). On Linux, each
+# doctest that ran must be one the doctest reader found in the source (below).
 check_doctest() {
 	local label="$1" status="$2" kind="$3" log="$4" counts header summed verdict filtered ignored names name
 	counts="$(awk '
@@ -1135,21 +1152,45 @@ while IFS=$'\t' read -r _ label re; do
 done < <(awk -F'\t' '$1 == "unused"' "$tmp/raw-verdict.tsv")
 echo "Lines outside libtest's record: $(cut -f1,2 "$raw_output" | LC_ALL=C sort -u | awk 'END { print NR }') distinct, $(awk -F'\t' '$1 == "unknown"' "$tmp/raw-verdict.tsv" | awk 'END { print NR }') named by no entry"
 
-# The cargo re-run reads each doctest's output, so it must have run the same
-# doctests as Bazel's doctest target of the crate (whose crate features can
-# differ from cargo's defaults): each crate's names, both ways, without the
-# crate's directory.
+# On Linux the doctests run only in Bazel's doctest targets, whose runner
+# (rules_rust's) takes no test arguments and shows no passing doctest's
+# output, so the skip scan above never reads what a doctest prints. In its
+# place, with no build, each crate with a Bazel doctest target has its
+# doctests read from its source ($doctest_forms): a line of a doctest
+# rustdoc runs that holds the word print, println, eprint, eprintln, dbg,
+# stdout or stderr (a word: a print split from its `!` counts), or one of the
+# skip scan's words, fails the job, named by file and line, and so does doc
+# text the reader does not read (a doc attribute it does not decode, a
+# doctest still open where the text it joined ends). The read must account for every doctest Bazel ran: each
+# one its log names (`<file> - <item> (line <n>)`) must be a doctest the
+# reader found at that file and line, or the reader did not see it, and the
+# job fails as UNKNOWN. (Until 2026-11 the doctests ran a second time under
+# cargo, about 576 s a job, to read their output: in the 57 gate jobs from
+# 2026-11-21 to 11-25 where that re-run's comparison with Bazel ran, it saw
+# no doctest, failure, skip or print that Bazel's run did not.)
 if [ -z "$only" ]; then
-	touch "$tmp/doc-names-bazel.tsv" "$tmp/doc-names-cargo.tsv"
-	awk -F'\t' '{ d = $1; n = $2; if (index(n, d "/") == 1) n = substr(n, length(d) + 2); print d "\t" n }' "$tmp/doc-names-cargo.tsv" | LC_ALL=C sort -u >"$tmp/doc-cargo.tsv"
+	: >"$tmp/doc-read.tsv"
+	while read -r dir; do
+		find "$dir" -name '*.rs' -type f -exec env LC_ALL=C awk -v words="$skip_words" -f "$doctest_forms" {} + >>"$tmp/doc-read.tsv" || stop "the doctest reader could not read the source of $dir"
+	done <"$tmp/doc-dirs.txt"
+	awk -F'\t' '$1 == "test" { print $2 ":" $3 }' "$tmp/doc-read.tsv" | LC_ALL=C sort -u >"$tmp/doc-read-tests.txt"
+	touch "$tmp/doc-names-bazel.tsv"
 	LC_ALL=C sort -u "$tmp/doc-names-bazel.tsv" >"$tmp/doc-bazel.tsv"
 	while IFS=$'\t' read -r dir name; do
-		error "Rust tests" "$dir $name ran in Bazel's doctest target and not in cargo's doctest run of $dir, whose output the skip scan reads: give cargo the same features"
-	done < <(LC_ALL=C comm -23 "$tmp/doc-bazel.tsv" "$tmp/doc-cargo.tsv")
-	while IFS=$'\t' read -r dir name; do
-		error "Rust tests" "$dir $name ran in cargo's doctest run and not in Bazel's doctest target of $dir"
-	done < <(LC_ALL=C comm -13 "$tmp/doc-bazel.tsv" "$tmp/doc-cargo.tsv")
-	echo "Doctests that ran in Bazel and in cargo's readable re-run: $(LC_ALL=C comm -12 "$tmp/doc-bazel.tsv" "$tmp/doc-cargo.tsv" | awk 'END { print NR }')"
+		file="${name%% - *}"
+		line="$(printf '%s\n' "$name" | sed -n 's/.*(line \([0-9][0-9]*\)).*/\1/p')"
+		if [ -z "$line" ] || ! grep -qxF -- "$dir/$file:$line" "$tmp/doc-read-tests.txt"; then
+			error "Rust test skips" "UNKNOWN: $dir $name ran in Bazel's doctest target, and the doctest reader found no doctest at $dir/$file line ${line:-?}, so it could not see whether it prints"
+		fi
+	done <"$tmp/doc-bazel.tsv"
+	while IFS=$'\t' read -r what file line text; do
+		case "$what" in
+			print) error "Rust test printed" "$file:$line: a doctest rustdoc runs prints ($text); no record the skip scan reads holds a doctest's output on Linux, so a doctest must not print" ;;
+			skip) error "Rust test skips" "$file:$line: a doctest rustdoc runs holds a skip word ($text); no record the skip scan reads holds a doctest's output on Linux, so a doctest must not skip" ;;
+			unread) error "Rust test skips" "UNKNOWN: $file:$line: $text, so the doctest reader did not read the doctests in it" ;;
+		esac
+	done <"$tmp/doc-read.tsv"
+	echo "Doctests read from the source of $(count "$tmp/doc-dirs.txt") crates: $(count "$tmp/doc-read-tests.txt"); Bazel ran $(count "$tmp/doc-bazel.tsv"); lines that print or skip: $(awk -F'\t' '$1 == "print" || $1 == "skip"' "$tmp/doc-read.tsv" | awk 'END { print NR }')"
 fi
 
 # reconcile <found> <list> <listed> <noun> <verb> <title> <stale>: the tests

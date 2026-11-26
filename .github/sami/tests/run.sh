@@ -270,6 +270,11 @@ run() {
 	printf '# list\n%s\n' "${CARGO_WS:-sdk/rust/demo/Cargo.toml  standalone}" >"$w/repo/.github/sami/rust-test-cargo-workspaces.txt"
 	# DOCQ: the doctest targets bazel query names (the macOS job asks it).
 	if [ -n "${DOCQ:-}" ]; then printf '%s\n' "$DOCQ" >"$w/docquery.txt"; fi
+	# The source of $DOC's crate, which the Linux job's doctest reader reads:
+	# one plain doctest, its fence at line 3 (doc_pass's name). DOC_SRC
+	# replaces it; DOC_SRC=none leaves the crate with no .rs file.
+	mkdir -p "$w/repo/crates/pi-diff/src"
+	[ "${DOC_SRC:-}" = none ] || printf '%s\n' "${DOC_SRC:-$doc_src_plain}" >"$w/repo/crates/pi-diff/src/lib.rs"
 	cat >"$w/bin/bazelisk" <<EOF
 #!/usr/bin/env bash
 set -u
@@ -400,9 +405,11 @@ echo "   Compiling demo v0.1.0" >&2
 if [ "\$sel" = --doc ]; then
 	case " \${RUSTDOCFLAGS:-} " in *" -Zunstable-options --no-capture "*) ;; *) echo "stub: cargo test --doc without RUSTDOCFLAGS --no-capture (\${RUSTDOCFLAGS:-})" >&2; exit 2 ;; esac
 	[ "\$threads" = 1 ] || { echo "stub: cargo test --doc without --test-threads=1" >&2; exit 2; }
-	# A crate's doctests under //crates build their dependencies with the
-	# features of the whole workspace, so every crate's run reuses them.
+	# A crate's doctests under //crates run under cargo only in the macOS job
+	# (RUST_TEST_ONLY), and build their dependencies with the features of the
+	# whole workspace, so every crate's run reuses them.
 	case " \$* " in *" --manifest-path crates/"*)
+		[ -n "\${RUST_TEST_ONLY:-}" ] || { echo "stub: cargo test --doc of a crate under crates/ in the Linux job, where Bazel's doctest targets run the doctests" >&2; exit 2; }
 		case " \$* " in *' -Zfeature-unification --config resolver.feature-unification="workspace" '*) ;; *) echo "stub: cargo test --doc of a crate under crates/ without workspace feature unification (\$*)" >&2; exit 2 ;; esac ;;
 	esac
 fi
@@ -480,6 +487,8 @@ B=//crates/pi-builtins:pi-builtins_test
 D=//crates/pi-diff:pi-diff_test
 V=//crates/pi-vcs:pi-vcs_test
 DOC=//crates/pi-diff:pi-diff_doc_test
+# $DOC's crate source by default: one plain doctest, its fence at line 3.
+doc_src_plain=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\npub fn f() {}'
 RT=//crates/pi-builtins:rsync_root_test
 # A passing test with output the known-output list names: the skip scan's
 # liveness check sees output in every case that expects a pass.
@@ -660,25 +669,47 @@ NOT_MSG='::error' run J105-bazel-ignore-doc-block-is-no-test 0 '```ignore doc bl
 CARGO_MODE=doc-ignored NOT_MSG='::error' run J106-cargo-ignore-doc-block-is-no-test 0 'sdk/rust/demo src/lib.rs - g \(line 9\) \(cargo.s log\)' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 run J109-no-ignore-doc-blocks 0 '```ignore doc blocks, not tests, marked ignore by upstream: 0' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 CARGO_MODE=ignored-and-doc-ignored NOT_MSG='ignore doctest|src/lib.rs - g.*(fail|runs in no invocation)' run J112-ignore-doc-block-passes-ignored-cargo-test-fails 1 "sdk/rust/demo:test:wire a::slow is #\\[ignore\\]d and runs in no invocation" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
-# B3: a doctest's output is read: the crate's doctests run again under cargo,
-# with rustdoc's --no-capture and one thread, and the lines printed between a
-# doctest's start and its result are its output (stdout and stderr).
-CARGO_MODE=doc-skip run J107-crate-doctest-skips-itself 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) skipped itself and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-CARGO_MODE=doc-raw-skip run J110-doctest-raw-skip-line 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) skipped itself and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-CARGO_MODE=doc-raw-print run J111-doctest-raw-output 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in .github/sami/rust-test-known-output.txt" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-run J107b-crate-doctests-run-under-cargo 0 '' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# B3: on Linux the crates' doctests run only in Bazel: the stub refuses a
+# cargo test --doc of a crate under crates/ there (W1 shows none ran), and
+# the job reads the doctests from the source instead (W1-W23 below).
 # B4: the listings the macOS job's inventory reads.
 run J108-listings-for-macos 0 'Listings for the macOS inventory: 2 binaries' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
-# R3: cargo's readable doctest run must have run the same doctests as Bazel's
-# doctest target of the crate, both ways.
-CARGO_MODE=doc-empty run J113b-bazel-doctest-without-cargo-counterpart 1 "crates/pi-diff src/lib.rs - f \\(line 3\\) ran in Bazel's doctest target and not in cargo's doctest run" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-CARGO_MODE=doc-extra run J114-cargo-doctest-without-bazel-counterpart 1 "crates/pi-diff src/lib.rs - h \\(line 20\\) ran in cargo's doctest run and not in Bazel's doctest target" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-run J115-doctests-match 0 "Doctests that ran in Bazel and in cargo's readable re-run: 1" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-# U1: a crate's cargo doctest run builds its dependencies with the features of
-# the whole workspace (cargo's -Zfeature-unification), so the 13 crates' runs
-# build each dependency once (run 45553300236: 1148.5 s, nearly all of it
-# building the same dependencies again); the stub refuses a run without it.
-NOT_MSG='stub:|::error' run U1-crate-doctests-unify-features-over-the-workspace 0 "Doctests that ran in Bazel and in cargo's readable re-run: 1" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# W1-W23: on Linux each crate with a Bazel doctest target has its doctests
+# read from its source (.github/sami/rust-test-doctest-forms.awk, no build):
+# a line of a doctest rustdoc runs that prints or holds a skip word fails the
+# job, named by file and line; a doc attribute the reader does not read
+# fails as UNKNOWN; and every doctest Bazel ran must be one the reader found
+# at its file and line, or the job fails as UNKNOWN. W1 is the plain
+# doctest, W2 the planted one that prints.
+NOT_MSG='stub:|::error' run W1-plain-doctest-passes 0 'Doctests read from the source of 1 crates: 1; Bazel ran 1; lines that print or skip: 0' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! println!("planted");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W2-doctest-that-prints-fails 1 '::error title=Rust test printed::crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints \(println!\("planted"\);\)' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let why = "skipped: no reference rsync";\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W3-doctest-with-a-skip-word-fails 1 '::error title=Rust test skips::crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs holds a skip word' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! eprintln!("x");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W4-doctest-eprintln-fails 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! dbg!(1);\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W5-doctest-dbg-fails 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! use std::io::Write; writeln!(std::io::stdout(), "x").unwrap();\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W6-doctest-stdout-write-fails 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! # println!("hidden");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W7-hidden-line-that-prints-fails 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n//!\n//! ```ignore\n//! println!("never run");\n//! ```\n//!\n//! ```text\n//! skipped: words, not code\n//! ```\npub fn f() {}' NOT_MSG='stub:|::error' run W8-ignore-and-text-blocks-pass 0 'Doctests read from the source of 1 crates: 1; Bazel ran 1; lines that print or skip: 0' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n//!\n//! Example:\n//!\n//!     println!("indented");\npub fn f() {}' NOT_MSG='stub:' run W9-indented-doctest-that-prints-fails 1 'crates/pi-diff/src/lib.rs:9: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/**\n * ```\n * let _ = 1;\n * println!("x");\n * ```\n */\npub fn f() {}' NOT_MSG='stub:' run W10-block-doc-doctest-that-prints-fails 1 'crates/pi-diff/src/lib.rs:9: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n//!\n//! - an item:\n//!   ```\n//!   println!("x");\n//!   ```\npub fn f() {}' NOT_MSG='stub:' run W11-doctest-in-a-list-item-that-prints-fails 1 'crates/pi-diff/src/lib.rs:9: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc = "```\\nprintln!(\\"x\\");\\n```"]\npub fn f() {}' NOT_MSG='stub:' run W12-literal-doc-attribute-doctest-that-prints-fails 1 'crates/pi-diff/src/lib.rs:6: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#![doc = include_str!("../README.md")]\npub fn f() {}' NOT_MSG='stub:' run W13-include-str-doc-attribute-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute whose value is not a one-line string literal' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! Words.\n//!\n//! ```\n//! assert!(true);\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W14-bazel-doctest-the-reader-did-not-find-fails 1 'UNKNOWN: crates/pi-diff src/lib.rs - f \(line 3\) ran in Bazel.s doctest target, and the doctest reader found no doctest at crates/pi-diff/src/lib.rs line 3' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=none NOT_MSG='stub:' run W15-crate-without-source-fails 1 'UNKNOWN: crates/pi-diff src/lib.rs - f \(line 3\) ran in Bazel.s doctest target, and the doctest reader found no doctest' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let s = "UNCOMPARED: x";\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W16-skip-words-are-the-scans 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs holds a skip word' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# W17-W21, from the GPT-6.1 Sol review of 4379925a: a doctest's text across a
+# blank source line, a nested comment in a block doc, a doc attribute escape,
+# a print split from its `!`, and a doctest still open at its text's end.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W17-doctest-body-after-a-blank-source-line-fails 1 'crates/pi-diff/src/lib.rs:6: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/**\n * ```\n * /* a nested comment */\n * println!("missed");\n * ```\n */\npub fn f() {}' NOT_MSG='stub:' run W18-nested-comment-in-a-block-doc-doctest-fails 1 'crates/pi-diff/src/lib.rs:9: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc = "```\\nprint\\x6cn!(\\"x\\");\\n```"]\npub fn f() {}' NOT_MSG='stub:' run W19-doc-attribute-escape-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute whose value is not a one-line string literal' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! println\n//! !("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W20-println-split-from-its-bang-fails 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/// ```\n/// let _ = 1;\npub fn f() {}' NOT_MSG='stub:' run W21-doctest-open-at-the-end-of-its-text-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doctest still open where the doc text the reader joined ends' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# W22, W23, from the second round of that review: a no_run block whose info
+# string rustdoc reads otherwise is read, and a quoted fence-like line inside
+# a doctest does not end it.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n//! ```rust (reason no_run here)\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W22-no-run-block-that-prints-fails 1 'crates/pi-diff/src/lib.rs:7: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let _ = r#"\n//! > ```\n//! > ```text\n//! "#;\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W23-quoted-fence-inside-a-doctest-fails 1 'crates/pi-diff/src/lib.rs:8: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 # R3-1: a line a test binary writes outside libtest's record (a child's or a
 # thread's write to the inherited stream) is a skip if it has a skip word,
 # and must match rust-test-known-raw-output.txt otherwise, or the job fails.
@@ -721,7 +752,6 @@ cl4_raw() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ 
 CL4RAW="$(declare -f cl4_raw)"
 run J127-brace-raw-line-fails 1 "$D wrote 1 lines outside libtest's record .*: \\{ no free port: nothing to test \\}" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '{ no free port: nothing to test }'; } >\"\$bep\"; exit 0"
 run J128-json-raw-line-fails 1 "$D wrote 1 lines outside libtest's record .*status" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '{\"status\": \"no free port: nothing to test\"}'; } >\"\$bep\"; exit 0"
-CARGO_MODE=doc-raw-nonl NOT_MSG='ended before' run J129-doctest-output-without-newline-fails 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in .github/sami/rust-test-known-output.txt" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 cl4_two_children() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n\nrunning 1 test\ntest a::x ... \nrunning 1 test\nok\n{ "type": "test", "name": "wt::carry", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; }
 cl4_two_whole() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n\nrunning 1 test\n\nrunning 1 test\ntest a::x ... ok\n{ "type": "test", "name": "wt::carry", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; }
 CL4TWO="$(declare -f cl4_two_children cl4_two_whole)"
@@ -737,12 +767,9 @@ $D $SN" OWN_TESTS="d::one $SN" STICKY_BODY="FMT=json; FILTERED=1 rt $D PASSED lt
 x_tail() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "event": "started", "name": "wt::carry" }\nno free port: nothing to test{ "type": "test", "name": "wt::carry", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; }
 XTAIL="$(declare -f x_tail)"
 NOT_MSG='ended before' run J134-piece-before-the-last-event-is-read 1 "$D wrote 1 lines outside libtest's record .*: no free port: nothing to test" '' "$XTAIL; { $P; rt $D PASSED x_tail; } >\"\$bep\"; exit 0"
-# From the Claude-family review of 6b0eca04: doc_attribute uses the same event
-# test, so a doctest that prints an object that only names its type printed;
-# a bench-typed object with no result's fields, an array and a number are
-# output too.
-CARGO_MODE=doc-typed run J135-doctest-prints-typed-test-object 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-CARGO_MODE=doc-typed-suite run J136-doctest-prints-typed-suite-object 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# From the Claude-family review of 6b0eca04: a bench-typed object with no
+# result's fields, an array and a number are output (a doctest's typed
+# objects: K15, K16).
 run J137-bench-typed-object-is-output 1 "$D wrote 1 lines outside libtest's record" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '{\"type\": \"bench\", \"name\": \"x\", \"note\": \"no free port: nothing to test\"}'; } >\"\$bep\"; exit 0"
 run J138-array-line-is-output 1 "$D wrote 1 lines outside libtest's record .*: \\[\"no free port: nothing to test\"\\]" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '[\"no free port: nothing to test\"]'; } >\"\$bep\"; exit 0"
 run J139-number-line-is-output 1 "$D wrote 1 lines outside libtest's record .*: 42" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '42'; } >\"\$bep\"; exit 0"
@@ -816,6 +843,17 @@ ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strfti
 # says nothing (sami-checks run 45351216411: the macOS job read each
 # Linux-only flaky line as a target with no result).
 FLAKY="$B x::f" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='listed flaky' run K10-only-flaky-line-of-a-test-not-run-here 0 "Ran here, as .github/sami/only.txt names: $D m::strftime" '' 'exit 9'
+# K12-K17: the macOS job (RUST_TEST_ONLY) still runs the crates' doctests
+# under cargo and reads their output (doc_attribute, one thread), as the
+# Linux job did until its doctests ran only in Bazel: a doctest that skips
+# itself, prints, prints with no newline, or prints an object that only
+# names its type fails; the run builds with workspace feature unification.
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-skip run K12-only-crate-doctest-skips-itself 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) skipped itself and is not in" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-raw-print run K13-only-doctest-raw-output 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in .github/sami/rust-test-known-output.txt" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-raw-nonl NOT_MSG='ended before' run K14-only-doctest-output-without-newline-fails 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in .github/sami/rust-test-known-output.txt" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-typed run K15-only-doctest-prints-typed-test-object 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-typed-suite run K16-only-doctest-prints-typed-suite-object 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-ignored NOT_MSG='stub:|::error' run K17-only-crate-doctests-unify-features-over-the-workspace 0 'crates/pi-diff src/lib.rs - g \(line 9\) \(cargo.s log\)' '' 'exit 9'
 # X1-X3 (CiReview2 at 32e3af7a): a flaky test the RUST_TEST_ONLY run does run.
 # X1 failed, then passed: KNOWN, and the stub refuses an only-* invocation
 # without the retry flag. X2 failed on every attempt: NEW, exit 1. X3
