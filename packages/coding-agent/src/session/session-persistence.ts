@@ -394,8 +394,11 @@ function* truncateNode(
 	}
 
 	walk.path.enter(obj);
+	// Each field and element is read once and kept as read: a getter read again for the rebuilt copy could
+	// answer differently from the value the walk checked.
 	if (Array.isArray(obj)) {
-		let result: unknown[] | undefined;
+		const result: unknown[] = [];
+		let changed = false;
 		for (let i = 0; i < obj.length; i++) {
 			const item: unknown = obj[i];
 			let next: unknown;
@@ -404,25 +407,23 @@ function* truncateNode(
 				const step = containerStep(item, key, walk, depth + 1, scan);
 				next = step === undefined ? item : yield step;
 			}
-			if (next !== item) result ??= obj.slice(0, i);
-			result?.push(next);
+			if (next !== item) changed = true;
+			result.push(next);
 		}
 		walk.path.leave(obj);
-		return result ?? obj;
+		return changed ? result : obj;
 	}
 
 	const holder = obj as Record<string, unknown>;
-	// The fields so far, from the first change on; until then the object stays as it is.
-	let entries: Array<readonly [string, unknown]> | undefined;
-	let seen = 0;
+	const entries: Array<readonly [string, unknown]> = [];
+	let changed = false;
 	for (const childKey in holder) {
 		if (!Object.hasOwn(holder, childKey)) continue;
 		const value = holder[childKey];
 		// Strip transient/redundant properties that shouldn't be persisted.
 		// - jsonlEvents: raw subprocess streaming events (already saved to artifact files)
 		if (childKey === "jsonlEvents") {
-			entries ??= ownEntriesBefore(holder, seen);
-			seen++;
+			changed = true;
 			continue;
 		}
 		let next: unknown;
@@ -433,12 +434,11 @@ function* truncateNode(
 			const step = containerStep(value, childKey, walk, depth + 1, scan);
 			next = step === undefined ? value : yield step;
 		}
-		if (next !== value) entries ??= ownEntriesBefore(holder, seen);
-		entries?.push([childKey, next]);
-		seen++;
+		if (next !== value) changed = true;
+		entries.push([childKey, next]);
 	}
 	walk.path.leave(obj);
-	if (!entries) return obj;
+	if (!changed) return obj;
 
 	const contentEntry = entries.find(([childKey]) => childKey === "content");
 	const lineCountEntry = entries.find(([childKey]) => childKey === "lineCount");
@@ -471,18 +471,6 @@ function containerStep(
 	if (!scan || depth >= PERSISTENCE_SCAN_DEPTH) return truncateNode(value, key, walk, depth, false);
 	const found = persistenceScan(value, key);
 	return found === "clean" ? undefined : truncateNode(value, key, walk, depth, found === "dirty");
-}
-
-/** The first `count` own enumerable fields of `holder`, in `for…in` order, as key-value pairs. */
-function ownEntriesBefore(holder: Record<string, unknown>, count: number): Array<readonly [string, unknown]> {
-	const entries: Array<readonly [string, unknown]> = [];
-	if (count === 0) return entries;
-	for (const childKey in holder) {
-		if (!Object.hasOwn(holder, childKey)) continue;
-		entries.push([childKey, holder[childKey]]);
-		if (entries.length === count) break;
-	}
-	return entries;
 }
 
 /**

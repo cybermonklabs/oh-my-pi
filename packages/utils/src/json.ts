@@ -1,5 +1,5 @@
 import { isBigIntObject, isBooleanObject, isNumberObject, isStringObject } from "node:util/types";
-import { ContainerPath, type NestedWalk, nestsDeeperThan, runNested } from "./nested-walk";
+import { ContainerPath, isStackOverflow, type NestedWalk, nestsDeeperThan, runNested } from "./nested-walk";
 
 /**
  * Try to parse JSON, returning null on failure.
@@ -82,7 +82,9 @@ export interface DeepJsonTextOptions extends DeepJsonOptions {
 	 * a value 40,000 levels deep. The check ({@link nestsDeeperThan}) costs one
 	 * step per object or array, so it is for a caller that writes the same
 	 * kind of value again and again (a page of messages, a request's
-	 * telemetry), not one that knows the depth.
+	 * telemetry), not one that knows the depth. It calls no getter or `toJSON`,
+	 * so a value nested that deep only below one is written as without the
+	 * check: by `JSON.stringify` until it runs out of stack.
 	 */
 	readonly probeDepth?: boolean;
 }
@@ -101,16 +103,17 @@ export const DEEP_JSON_LEVELS = 10_000;
 /**
  * `JSON.stringify(value)` ({@link stringifyJson} with `bigintAsString`), also
  * for a value nested deeper than the engine's recursion allows (Bun's throws a
- * `RangeError` at 40,000 levels, while its `JSON.parse` reads millions): on that
- * `RangeError` the value is written again by {@link stringifyJsonIteratively},
- * which gives the same bytes. Any value `JSON.stringify` writes gets its
- * result, and any other error is its own. A `RangeError` from elsewhere (a
- * `toJSON` that throws one) recurs in the second walk and surfaces from it, so
- * the `toJSON` methods ahead of it run twice on that path. With `space`, a
- * value nested past {@link INDENTED_JSON_LEVELS} levels, and with
- * `probeDepth` one nested past {@link DEEP_JSON_LEVELS} ({@link nestsDeeperThan}),
- * goes to {@link stringifyJsonIteratively} directly, without indentation;
- * any other is written (and indented) as `JSON.stringify` writes it.
+ * `RangeError` at 40,000 levels, while its `JSON.parse` reads millions): on
+ * that stack overflow ({@link isStackOverflow}) the value is written again by
+ * {@link stringifyJsonIteratively}, which gives the same bytes, so the getters
+ * and `toJSON` methods ahead of the overflow run twice on that path. Any value
+ * `JSON.stringify` writes gets its result, and any other error is its own,
+ * a `RangeError` the value's code throws (a `toJSON`, a getter) included:
+ * that value is not written again. With `space`, a value nested past
+ * {@link INDENTED_JSON_LEVELS} levels, and with `probeDepth` one nested past
+ * {@link DEEP_JSON_LEVELS} ({@link nestsDeeperThan}), goes to
+ * {@link stringifyJsonIteratively} directly, without indentation; any other is
+ * written (and indented) as `JSON.stringify` writes it.
  */
 export function stringifyDeepJson(value: unknown, options?: DeepJsonTextOptions): string | undefined {
 	const space = options?.space;
@@ -119,7 +122,7 @@ export function stringifyDeepJson(value: unknown, options?: DeepJsonTextOptions)
 	try {
 		return options?.bigintAsString ? stringifyJson(value, space) : JSON.stringify(value, undefined, space);
 	} catch (error) {
-		if (!(error instanceof RangeError)) throw error;
+		if (!isStackOverflow(error)) throw error;
 		return stringifyJsonIteratively(value, options);
 	}
 }

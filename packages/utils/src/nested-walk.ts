@@ -81,7 +81,14 @@ export class ContainerPath {
 /**
  * Whether `value` nests objects or arrays past `levels` levels, read by a walk
  * that keeps its own stack and stops at the first node past them, so a cycle
- * answers true. It imports nothing, so a browser bundle can use it too.
+ * answers true. It calls no getter or `toJSON` of the value, so the writer
+ * that walks the value next calls each once, as `JSON.stringify` alone would:
+ * it reads no accessor property, does not go into an object that has a
+ * `toJSON` (`JSON.stringify` writes what that returns instead), and reads an
+ * array by index, not through its iterator. A value nested past `levels` only
+ * below one of those answers false; a writer that relies on the answer still
+ * falls back on the engine's stack overflow ({@link isStackOverflow}) for it.
+ * It imports nothing, so a browser bundle can use it too.
  */
 export function nestsDeeperThan(value: unknown, levels: number): boolean {
 	const nodes: unknown[] = [value];
@@ -89,20 +96,37 @@ export function nestsDeeperThan(value: unknown, levels: number): boolean {
 	while (nodes.length > 0) {
 		const node = nodes.pop();
 		const depth = depths.pop()!;
-		if (typeof node !== "object" || node === null) continue;
+		if (typeof node !== "object" || node === null || "toJSON" in node) continue;
 		if (depth >= levels) return true;
 		if (Array.isArray(node)) {
-			for (const item of node) {
-				nodes.push(item);
+			const length = node.length;
+			for (let index = 0; index < length; index++) {
+				nodes.push(ownDataValue(node, index));
 				depths.push(depth + 1);
 			}
 			continue;
 		}
-		for (const key in node) {
-			if (!Object.hasOwn(node, key)) continue;
-			nodes.push(Reflect.get(node, key));
+		for (const key of Object.keys(node)) {
+			nodes.push(ownDataValue(node, key));
 			depths.push(depth + 1);
 		}
 	}
 	return false;
+}
+
+/** The value of `holder`'s own data property `key`, or `undefined` for an accessor (not called) or a missing key. */
+function ownDataValue(holder: object, key: string | number): unknown {
+	const descriptor = Object.getOwnPropertyDescriptor(holder, key);
+	return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+}
+
+/**
+ * Whether `error` is the `RangeError` the engine throws when a recursion
+ * (`JSON.stringify`'s, `structuredClone`'s) runs out of stack: its message is
+ * `Maximum call stack size exceeded` (JavaScriptCore ends it with a period).
+ * A `RangeError` that the value's own code threw (a `toJSON`, a getter) is not
+ * one, so a walk that falls back on this error does not run that code again.
+ */
+export function isStackOverflow(error: unknown): error is RangeError {
+	return error instanceof RangeError && error.message.startsWith("Maximum call stack size exceeded");
 }

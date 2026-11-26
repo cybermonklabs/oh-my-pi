@@ -5,6 +5,7 @@
 ### Fixed
 
 - An HTML export's trace view shows a span's raw entry nested more than 1,000 levels deep on one line instead of indented; an entry nested past the browser's `JSON.stringify` stack limit is shown, and its copy buttons copy it, instead of failing to render the span's details; a shallower entry is indented as before
+- The card of a tool without a view of its own (an MCP or extension tool) shows a call whose arguments nest more than 1,000 levels deep as the start of their JSON on one line, where it showed `[object Object]`; shallower arguments are shown as before
 
 ## [19.1.0] - 2026-11-21
 

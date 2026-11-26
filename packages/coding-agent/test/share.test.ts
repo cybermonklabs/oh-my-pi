@@ -157,6 +157,39 @@ describe("sealToFit", () => {
 		]);
 		expect(nestingOf(source.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
 	}, 20_000);
+
+	// The depth check reads no getter, so a snapshot deep only below one goes to `JSON.stringify`, which runs out of
+	// stack at 40,000 levels; the seal must fall back to the deep writer instead of failing the share.
+	test("seals a snapshot whose getter returns a value nested 50,000 levels", async () => {
+		const key = await makeKey();
+		const details = nestedChain({ leaf: "bottom" });
+		const entry = {
+			type: "message",
+			id: "r1",
+			parentId: null,
+			timestamp: "2026-06-12T00:00:00.000Z",
+			message: {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "inspect",
+				content: [{ type: "text", text: "ok" }],
+				get details() {
+					return details;
+				},
+				isError: false,
+				timestamp: 1,
+			},
+		} as unknown as SessionEntry;
+
+		const { sealed, truncated } = await sealToFit(key, sessionData([entry], "r1"), SERVER_MAX_SEALED_BYTES);
+
+		expect(truncated).toBe(false);
+		const opened = (await open(key, sealed)).entries[0] as Extract<SessionEntry, { type: "message" }>;
+		expect(nestingOf((opened.message as ToolResultMessage).details)).toEqual({
+			levels: DEEP_LEVELS,
+			bottom: { leaf: "bottom" },
+		});
+	}, 20_000);
 });
 
 describe("buildShareSnapshot", () => {

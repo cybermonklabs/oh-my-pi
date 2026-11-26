@@ -39,6 +39,30 @@ describe("cloneJsonTree", () => {
 		expect(copy.holes).toHaveLength(3);
 	});
 
+	// `Array.prototype.map`, which a recursive copy used, reads the length once: a getter that shortens the array
+	// leaves a hole in the copy, where reading the length again on each step ended the copy short.
+	test("reads an array's length once, as Array.prototype.map does", () => {
+		const shrinking = (): unknown[] => {
+			const list: unknown[] = ["a", "b"];
+			Object.defineProperty(list, 0, {
+				enumerable: true,
+				configurable: true,
+				get() {
+					list.length = 1;
+					return "a";
+				},
+			});
+			return list;
+		};
+		const mapped = shrinking().map(item => item);
+
+		const copy = cloneJsonTree(shrinking());
+
+		expect(copy).toHaveLength(mapped.length);
+		expect(copy[0]).toBe("a");
+		expect(1 in copy).toBe(false);
+	});
+
 	// The copy keeps its own stack, so a cycle must end it as the end of the call stack ended the recursion.
 	test("throws a TypeError for a cycle instead of copying until memory runs out", () => {
 		const bottom: Record<string, unknown> = { leaf: "bottom" };
@@ -98,5 +122,82 @@ describe("structuredCloneDeep", () => {
 		}
 		expect(levels).toBe(DEEP_LEVELS);
 		expect(node).toEqual({ leaf: "bottom" });
+	});
+
+	// Past `structuredClone`'s stack the whole value is copied again: a Map in a tool result's details beside one
+	// deep tool call must come back a Map, not the `{}` a JSON copy makes of it.
+	test("keeps each value structuredClone keeps beside a branch nested 50,000 levels", () => {
+		const shared = { name: "shared" };
+		let deep: Record<string, unknown> = { leaf: "bottom" };
+		for (let level = 0; level < DEEP_LEVELS; level++) deep = { next: deep };
+		const source = {
+			deep,
+			map: new Map([["x", 1]]),
+			set: new Set(["y"]),
+			date: new Date(1_000),
+			regexp: /a+/gi,
+			bytes: new Uint8Array([1, 2]),
+			buffer: new Uint8Array([3, 4]).buffer,
+			first: shared,
+			second: shared,
+		};
+		expect(() => structuredClone(source)).toThrow(RangeError);
+
+		const copy = structuredCloneDeep(source);
+
+		expect(copy.map).toBeInstanceOf(Map);
+		expect([...copy.map]).toEqual([["x", 1]]);
+		expect(copy.set).toBeInstanceOf(Set);
+		expect([...copy.set]).toEqual(["y"]);
+		expect(copy.date).toBeInstanceOf(Date);
+		expect(copy.date.getTime()).toBe(1_000);
+		expect(copy.regexp).toBeInstanceOf(RegExp);
+		expect(copy.regexp.source).toBe("a+");
+		expect(copy.regexp.flags).toBe("gi");
+		expect(copy.bytes).toBeInstanceOf(Uint8Array);
+		expect([...copy.bytes]).toEqual([1, 2]);
+		expect(copy.buffer).toBeInstanceOf(ArrayBuffer);
+		expect([...new Uint8Array(copy.buffer)]).toEqual([3, 4]);
+		expect(copy.first).toBe(copy.second);
+		expect(copy.first).not.toBe(shared);
+		expect(copy.first).toEqual(shared);
+	});
+
+	// `structuredClone` keeps a cycle and throws for a function; the copy past its stack must do the same, not throw
+	// a TypeError for the cycle and hand the function back.
+	test("keeps a cycle and throws DataCloneError for a function beside a branch nested 50,000 levels", () => {
+		let deep: Record<string, unknown> = { leaf: "bottom" };
+		for (let level = 0; level < DEEP_LEVELS; level++) deep = { next: deep };
+		const cyclic: Record<string, unknown> = { deep };
+		cyclic.self = cyclic;
+
+		const copy = structuredCloneDeep(cyclic);
+
+		expect(copy).not.toBe(cyclic);
+		expect(copy.self).toBe(copy);
+		let error: unknown;
+		try {
+			structuredCloneDeep({ deep, run: () => 1 });
+		} catch (caught) {
+			error = caught;
+		}
+		expect(error).toBeInstanceOf(DOMException);
+		expect((error as DOMException).name).toBe("DataCloneError");
+	});
+
+	// Only the engine's stack overflow is copied again: a RangeError a getter throws is the copy's error, as
+	// `structuredClone` throws it, and the getter does not run a second time.
+	test("throws the RangeError a getter throws without reading the getter again", () => {
+		let reads = 0;
+		const source = {
+			get value() {
+				reads++;
+				if (reads === 1) throw new RangeError("first read");
+				return 7;
+			},
+		};
+
+		expect(() => structuredCloneDeep(source)).toThrow("first read");
+		expect(reads).toBe(1);
 	});
 });

@@ -32,6 +32,7 @@ import {
 	type NestedWalk,
 	nestsDeeperThan,
 	runNested,
+	stringifyDeepJson,
 	stringifyJsonIteratively,
 } from "@oh-my-pi/pi-utils";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
@@ -549,10 +550,12 @@ interface SealedSession {
 /** Seal `data`, trimming content until the sealed blob fits `maxBytes`. Exported for tests. */
 export async function sealToFit(key: CryptoKey, data: SessionData, maxBytes: number): Promise<SealedSession> {
 	// One rule for every seal: a snapshot nested past DEEP_JSON_LEVELS skips the `JSON.stringify` that takes seconds
-	// or runs out of stack on it. No trim makes a snapshot deeper.
+	// or runs out of stack on it. No trim makes a snapshot deeper. The check reads no getter and goes into no `toJSON`,
+	// so a snapshot that deep only below one is written by `stringifyDeepJson`, which falls back when `JSON.stringify`
+	// runs out of stack.
 	const deep = nestsDeeperThan(data, DEEP_JSON_LEVELS);
 	const seal = (snapshot: SessionData): Promise<Uint8Array<ArrayBuffer>> =>
-		sealSessionData(key, deep ? stringifyJsonIteratively(snapshot)! : JSON.stringify(snapshot));
+		sealSessionData(key, deep ? stringifyJsonIteratively(snapshot)! : stringifyDeepJson(snapshot)!);
 	let sealed = await seal(data);
 	if (sealed.byteLength <= maxBytes) return { sealed, truncated: false };
 

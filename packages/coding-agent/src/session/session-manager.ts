@@ -11,7 +11,6 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import {
 	$env,
-	cloneJsonTree,
 	directoryIsEnterable,
 	directoryIsMissing,
 	getBlobsDir,
@@ -25,6 +24,7 @@ import {
 	logger,
 	pathIsWithin,
 	spillIdOfFileName,
+	structuredCloneDeep,
 	toError,
 	withLoopPhase,
 } from "@oh-my-pi/pi-utils";
@@ -2912,8 +2912,8 @@ export class SessionManager {
 		manager.#additionalDirectories = [...this.#additionalDirectories];
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
-		// Entries are copied on the copy's own stack, as deep as a transcript line holds.
-		manager.#entries = this.#entries.map(entry => cloneJsonTree(entry));
+		// As `structuredClone` copies (a `Date` or `Map` in a custom entry stays one), as deep as a transcript line holds.
+		manager.#entries = structuredCloneDeep(this.#entries);
 		manager.#index.rebuild(manager.#entries);
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();

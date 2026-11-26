@@ -14,10 +14,10 @@
 ### Fixed
 
 - A turn whose tool call has arguments nested more than about 22,000 levels deep no longer fails with `Maximum call stack size exceeded` when the repeated-tool-call guard records it, and the guard still reports such a call when it repeats
-- A request to Anthropic whose conversation holds a tool call with arguments nested more than about 22,500 levels deep is sent instead of failing with `Maximum call stack size exceeded`, and a frozen fallback-credit request holding one past about 16,000 levels is redeemed under `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`
+- A request to Anthropic whose conversation holds a tool call with arguments nested more than about 22,500 levels deep is sent instead of failing with `Maximum call stack size exceeded`, and a refused turn whose request or output holds one keeps its fallback credit and is redeemed (under `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` too), where the refusal failed with that error
 - An OpenAI Chat Completions request replays a tool call whose arguments nest more than about 40,000 levels deep with those arguments, where it sent `{}` in their place
 - An OpenAI Responses request that encodes an earlier tool call again (after a model switch, or when a resumed session rebuilds its history) no longer fails with `Maximum call stack size exceeded` when the call's arguments nest more than about 40,000 levels deep
-- A tool call whose arguments nest tens of thousands of levels deep is validated before its tool runs, instead of its result being `Maximum call stack size exceeded`; when such a call fails its schema, the result is the validation error, with the arguments on one line past 1,000 levels
+- A tool call whose arguments nest tens of thousands of levels deep is validated before its tool runs, against a recursive JSON Schema (`$ref`) too, instead of its result being `Maximum call stack size exceeded`; when such a call fails its schema, the result is the validation error, with the arguments on one line past 1,000 levels
 - Dialect transcripts, which summary compaction renders the conversation in, write a tool call whose arguments nest tens of thousands of levels deep instead of failing with `Maximum call stack size exceeded`
 - The mock provider streams scripted tool-call arguments nested more than about 40,000 levels deep instead of failing the response
 - A request to Anthropic keeps a tool call's `__proto__` argument key when it replaces a lone surrogate in another string of the same object, where it dropped that key from the request

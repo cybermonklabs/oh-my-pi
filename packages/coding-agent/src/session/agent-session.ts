@@ -100,7 +100,6 @@ import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
 import { EditStore, type PowerAssertionOptions } from "@oh-my-pi/pi-natives";
 import {
 	$env,
-	cloneJsonTree,
 	escapeXmlText,
 	formatDuration,
 	getAgentDbPath,
@@ -115,6 +114,7 @@ import {
 	Snowflake,
 	stringifyDeepJson,
 	stringProperty,
+	structuredCloneDeep,
 	toError,
 	untilAborted,
 	withTimeout,
@@ -14660,8 +14660,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		messages.push(reminder);
 		if (history?.length) {
 			// Detach before the conversion pipeline can await or mutate caller-owned messages; the copy
-			// keeps its own stack, as deep as a transcript line holds.
-			const detachedHistory = cloneJsonTree(history);
+			// keeps what `structuredClone` keeps (a Map in a tool result's details), as deep as a transcript line holds.
+			const detachedHistory = structuredCloneDeep(history);
 			if (!conversationKey) for (const message of detachedHistory) markPerCallContextMessage(message);
 			messages.push(...detachedHistory);
 		}

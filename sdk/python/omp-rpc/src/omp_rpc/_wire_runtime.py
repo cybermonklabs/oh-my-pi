@@ -7,6 +7,7 @@ about specific protocol types.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, TypeAlias, TypeVar, cast
 
@@ -28,19 +29,6 @@ class UnknownNotification:
 
 
 _JSON_SCALARS = (str, int, float, bool)
-
-
-def _json_container(value: object, path: str, pending: list[tuple[object, object]]) -> JsonValue:
-    """An empty container of `value`'s kind, queued in `pending` with `value` to fill it from."""
-    copy: JsonValue
-    if isinstance(value, list):
-        copy = []
-    elif isinstance(value, dict):
-        copy = {}
-    else:
-        raise ValueError(f"{path} must be JSON-serializable")
-    pending.append((value, copy))
-    return copy
 
 
 def decode_json(value: object, path: str) -> JsonValue:
@@ -66,41 +54,76 @@ def _copy_json(value: object, path: str) -> JsonValue:
     if isinstance(value, dict):
         cloned: JsonObject = {}
         for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError(f"{path} must contain string keys")
-            cloned[key] = _copy_json(item, path)
+            cloned[_json_key(key, path)] = _copy_json(item, path)
         return cloned
     raise ValueError(f"{path} must be JSON-serializable")
 
 
+def _json_key(key: object, path: str) -> str:
+    """`key` as the name of a JSON object's member; any other key raises `ValueError` naming `path`."""
+    if isinstance(key, str):
+        return key
+    raise ValueError(f"{path} must contain string keys")
+
+
 def _copy_json_deep(value: object, path: str) -> JsonValue:
-    """`decode_json` with a stack of its own, for a value of any depth."""
+    """`decode_json` with a stack of its own, for a value of any depth.
+
+    It keeps the containers it is inside, so a container met inside itself (a
+    cycle: JSON text holds none, but a caller that builds the value can make
+    one) raises `ValueError`, where the copy would grow until memory ran out. A
+    container that two branches share is copied in each, as recursion copies it.
+    """
     scalars = _JSON_SCALARS
     if value is None or isinstance(value, scalars):
         return cast(JsonValue, value)
-    pending: list[tuple[object, object]] = []
-    copy = _json_container(value, path, pending)
-    while pending:
-        source, target = pending.pop()
+    inside: set[int] = set()
+    # Each container being copied, innermost last: the source, its copy, and the members still to copy.
+    frames: list[tuple[object, JsonValue, Iterator[object]]] = []
+
+    def enter(source: object) -> JsonValue:
+        """An empty copy of the list or dict `source`, pushed on `frames` to be filled."""
+        if id(source) in inside:
+            raise ValueError(f"{path} must not contain a cycle")
+        copy: JsonValue
         if isinstance(source, list):
-            append = cast(list[object], target).append
-            for item in source:
-                append(
-                    item
-                    if item is None or isinstance(item, scalars)
-                    else _json_container(item, path, pending)
-                )
+            copy = []
+            frames.append((source, copy, iter(source)))
+            inside.add(id(source))
+            return copy
+        if isinstance(source, dict):
+            copy = {}
+            frames.append((source, copy, iter(source.items())))
+            inside.add(id(source))
+            return copy
+        raise ValueError(f"{path} must be JSON-serializable")
+
+    root = enter(value)
+    while frames:
+        source, target, members = frames[-1]
+        if isinstance(target, list):
+            for item in members:
+                if item is None or isinstance(item, scalars):
+                    target.append(cast(JsonValue, item))
+                else:
+                    target.append(enter(item))
+                    break
+            else:
+                frames.pop()
+                inside.discard(id(source))
             continue
-        members = cast(dict[str, object], target)
-        for key, item in cast(dict[object, object], source).items():
-            if not isinstance(key, str):
-                raise ValueError(f"{path} must contain string keys")
-            members[key] = (
-                item
-                if item is None or isinstance(item, scalars)
-                else _json_container(item, path, pending)
-            )
-    return copy
+        copied = cast(JsonObject, target)
+        for key, item in cast(Iterator[tuple[object, object]], members):
+            name = _json_key(key, path)
+            if item is None or isinstance(item, scalars):
+                copied[name] = cast(JsonValue, item)
+            else:
+                copied[name] = enter(item)
+                break
+        else:
+            frames.pop()
+            inside.discard(id(source))
+    return root
 
 
 def decode_json_object(value: object, path: str) -> JsonObject:

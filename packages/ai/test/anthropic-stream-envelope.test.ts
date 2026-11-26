@@ -8,6 +8,7 @@ import {
 	type AnthropicRequestOptions,
 } from "@oh-my-pi/pi-ai/providers/anthropic-client";
 import type {
+	MessageCreateParams,
 	ToolSearchToolResultBlockParam,
 	WebSearchToolResultBlockParam,
 } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
@@ -23,6 +24,7 @@ import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { withEnv, withOfficialAnthropicEndpoint } from "./helpers";
+import { DEEP_LEVELS, nestedChain, nestedChainJson, nestingOf } from "./helpers/deep-nesting";
 
 const model: Model<"anthropic-messages"> = buildModel({
 	id: "claude-sonnet-4-5",
@@ -2350,6 +2352,122 @@ describe("anthropic stream envelope handling", () => {
 		expect(redeemed.errorMessage).toBe("Refusal (reasoning_extraction)");
 		expect(redeemed.demotedReasoningBlocks).toBe(2);
 	});
+
+	// A refused request replays the conversation, whose tool calls' arguments are any JSON, as deep as a transcript
+	// line holds. The turn freezes its request body and its content for the redemption; a copy that runs out of
+	// stack (`structuredClone` near 40,000 levels) fails the turn with that error and leaves no credit to redeem.
+	it("freezes and redeems a refused request whose history and refused turn hold tool calls nested 50,000 levels", async () => {
+		const deepContext: Context = {
+			messages: [
+				{ role: "user", content: "Inspect it", timestamp: 0 },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "toolu_deep", name: "inspect", arguments: nestedChain() }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 0,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "toolu_deep",
+					toolName: "inspect",
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+					timestamp: 0,
+				},
+				{ role: "user", content: "Go on", timestamp: 0 },
+			],
+		};
+		const sent: MessageCreateParams[] = [];
+		const replying = (events: MockAnthropicEvent[]): AnthropicMessagesClientLike => ({
+			messages: {
+				create(params) {
+					sent.push(params);
+					return createMockRequest(events);
+				},
+			},
+		});
+		const refused = await streamAnthropic(model, deepContext, {
+			client: replying([
+				{
+					type: "message_start",
+					message: { id: "msg_deep_refusal", usage: { input_tokens: 10, output_tokens: 0 } },
+				},
+				{
+					type: "content_block_start",
+					index: 0,
+					content_block: { type: "tool_use", id: "toolu_refused", name: "inspect", input: {} },
+				},
+				{
+					type: "content_block_delta",
+					index: 0,
+					delta: { type: "input_json_delta", partial_json: nestedChainJson() },
+				},
+				{ type: "content_block_stop", index: 0 },
+				{
+					type: "message_delta",
+					delta: {
+						stop_reason: "refusal",
+						stop_sequence: null,
+						stop_details: {
+							type: "refusal",
+							category: "cyber",
+							explanation: null,
+							fallback_credit_token: "fct_deep",
+						},
+					},
+					usage: { input_tokens: 10, output_tokens: 4 },
+				},
+				{ type: "message_stop" },
+			]),
+		}).result();
+
+		const handle = refused.fallbackCreditHandle;
+		expect(handle?.token).toBe("fct_deep");
+		const refusedCall = handle?.refusedContent?.find(block => block.type === "toolCall");
+		expect(refusedCall?.type === "toolCall" && nestingOf(refusedCall.arguments)).toEqual({
+			levels: DEEP_LEVELS,
+			bottom: { leaf: "bottom" },
+		});
+
+		const redeemed = await streamAnthropic({ ...model, id: "claude-opus-4-8" }, deepContext, {
+			client: replying([
+				{ type: "message_start", message: { id: "msg_redeemed", usage: { input_tokens: 10, output_tokens: 0 } } },
+				{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+				{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Resumed" } },
+				{ type: "content_block_stop", index: 0 },
+				{
+					type: "message_delta",
+					delta: { stop_reason: "end_turn", stop_sequence: null },
+					usage: { input_tokens: 10, output_tokens: 1 },
+				},
+				{ type: "message_stop" },
+			]),
+			fallbackCreditRedemption: handle,
+		}).result();
+
+		expect(redeemed.stopReason).toBe("stop");
+		expect(sent).toHaveLength(2);
+		expect(sent[1]?.fallback_credit_token).toBe("fct_deep");
+		const replayedCall = sent[1]?.messages[1]?.content;
+		const replayedInput = Array.isArray(replayedCall)
+			? replayedCall.find(block => block.type === "tool_use")
+			: undefined;
+		expect(replayedInput?.type === "tool_use" && nestingOf(replayedInput.input)).toEqual({
+			levels: DEEP_LEVELS,
+			bottom: { leaf: "bottom" },
+		});
+	}, 30_000);
 
 	it("redeems fallback credit token with frozen request body and continuation prefill", async () => {
 		let capturedParams: any;

@@ -16,7 +16,6 @@ import {
 	$env,
 	$flag,
 	ContainerPath,
-	cloneJsonTree,
 	jsonDeepEquals,
 	logger,
 	type NestedWalk,
@@ -24,6 +23,7 @@ import {
 	parseStreamingJsonThrottled,
 	readSseEvents,
 	runNested,
+	structuredCloneDeep,
 } from "@oh-my-pi/pi-utils";
 import { NO_AUTH_SENTINEL } from "../auth-retry";
 import { renderDemotedThinking } from "../dialect/demotion";
@@ -1366,7 +1366,7 @@ function fallbackCreditRequestBody(
 	targetModelId: string,
 	continuation: ContentBlockParam[] | undefined,
 ): MessageCreateParamsStreaming {
-	const body = structuredClone(redemption.params);
+	const body = structuredCloneDeep(redemption.params);
 	body.model = targetModelId;
 	body.fallback_credit_token = redemption.token;
 	delete body.fallbacks;
@@ -3303,11 +3303,11 @@ const streamAnthropicOnce = (
 									output.fallbackCreditHandle = {
 										token: stopDetails.fallback_credit_token,
 										prefillClaim: stopDetails.fallback_has_prefill_claim,
-										params: structuredClone(params),
+										params: structuredCloneDeep(params),
 										betas: Array.from(requestExtraBetas),
 										betaHeader: sentBetaHeader,
 										expiresAt: Date.now() + FALLBACK_CREDIT_TTL_MS,
-										refusedContent: output.content ? structuredClone(output.content) : undefined,
+										refusedContent: output.content ? structuredCloneDeep(output.content) : undefined,
 										demotedReasoningBlocks,
 									};
 								}
@@ -3982,16 +3982,13 @@ function experimentalBetasDisabled(model: Model<"anthropic-messages">): boolean 
  * Whether a request body carries a field the kill switch withholds. A frozen
  * fallback-credit body that does cannot be redeemed under the switch. Defined
  * as "the sanitizer would change it" so detection and stripping cannot drift.
- * Both sides of the comparison are copies: `cloneJsonTree` writes a value that
- * is not JSON data (a `Date`, a `Map`) as JSON would, so only what the
- * sanitizer removed can differ. The copies and the comparison keep their own
- * stack: the body replays the conversation, whose tool calls' arguments are
- * any JSON.
+ * The copy and the comparison keep their own stack: the body replays the
+ * conversation, whose tool calls' arguments are any JSON.
  */
 function carriesKillSwitchField(params: MessageCreateParamsStreaming): boolean {
-	const sanitized = cloneJsonTree(params);
+	const sanitized = structuredCloneDeep(params);
 	withholdKillSwitchFields(sanitized);
-	return !jsonDeepEquals(sanitized, cloneJsonTree(params));
+	return !jsonDeepEquals(sanitized, params);
 }
 
 /**

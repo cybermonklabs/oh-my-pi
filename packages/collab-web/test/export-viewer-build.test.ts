@@ -56,7 +56,8 @@ function runViewer(session: unknown, globals: Record<string, unknown>): ViewerPa
 	);
 	const sessionData = document.getElementById("session-data");
 	if (!sessionData) throw new Error("Missing test session data");
-	sessionData.textContent = Buffer.from(JSON.stringify(session)).toBase64();
+	// As the export writes it: a session of any depth, where `JSON.stringify` stops near 40,000 levels.
+	sessionData.textContent = Buffer.from(stringifyJsonIteratively(session)!).toBase64();
 	Object.defineProperty(window, "location", { value: new URL("https://example.test/export.html") });
 	const matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
 	Object.defineProperty(window, "matchMedia", { value: matchMedia });
@@ -429,4 +430,118 @@ describe("hosted export viewer build", () => {
 			page.flushWork();
 		}
 	}, 30_000);
+
+	// A call to a tool the viewer has no view of its own for (an MCP or extension tool) is labelled in the session
+	// tree and shown in the generic card by its arguments' JSON; a session entry nests as deep as `JSON.parse` reads,
+	// past the browser's `JSON.stringify`, which failed the whole page ("Failed to load viewer").
+	for (const levels of [0, 50_000]) {
+		it(`labels and shows a call to an unnamed tool whose arguments nest ${levels.toLocaleString("en-US")} levels`, () => {
+			let args: Record<string, unknown> = { leaf: "bottom" };
+			for (let level = 0; level < levels; level++) args = { next: args };
+			const timestamp = "2026-01-01T00:00:01Z";
+			const page = runViewer(
+				{
+					header: sessionHeader,
+					leafId: "result-1",
+					entries: [
+						{
+							type: "message",
+							id: "assistant-1",
+							parentId: null,
+							timestamp,
+							message: {
+								role: "assistant",
+								content: [{ type: "toolCall", id: "call-1", name: "inspect_deep", arguments: args }],
+								stopReason: "toolUse",
+								timestamp: 1,
+							},
+						},
+						{
+							type: "message",
+							id: "result-1",
+							parentId: "assistant-1",
+							timestamp,
+							message: {
+								role: "toolResult",
+								toolCallId: "call-1",
+								toolName: "inspect_deep",
+								content: [{ type: "text", text: "ok" }],
+								isError: false,
+								timestamp: 2,
+							},
+						},
+					],
+				},
+				{ ompMarkdown: { Marked }, hljs: { getLanguage() {}, highlight() {}, highlightAuto() {} } },
+			);
+			const { document } = page;
+			const status = document.getElementById("viewer-status");
+			expect(status, status?.textContent ?? "").toBeNull();
+
+			const json = stringifyJsonIteratively(args)!;
+			const labels = [...document.querySelectorAll(".tree-role-tool")].map(element => element.textContent);
+			expect(labels).toContain(`[inspect_deep: ${json.slice(0, 40)}${json.length > 40 ? "..." : ""}]`);
+
+			// The page hands the card its call through the element's data key; a browser then upgrades the element.
+			runInContext(
+				`
+				const placeholder = document.querySelector("omp-tool-view");
+				const tool = new (customElements.get("omp-tool-view"))();
+				tool.setAttribute("data-key", placeholder.getAttribute("data-key"));
+				tool.setAttribute("open", "");
+				placeholder.replaceWith(tool);
+				tool.connectedCallback();
+			`,
+				page.context,
+			);
+			try {
+				page.flushWork();
+				const summary = document.querySelector("omp-tool-view .tv-head")?.textContent ?? "";
+				expect(summary).toContain(json.length > 96 ? `${json.slice(0, 96)}…` : json);
+				const shown = document.querySelector("omp-tool-view .tv-out pre")?.textContent ?? "";
+				if (levels === 0) {
+					expect(shown).toBe(JSON.stringify(args, null, 2));
+				} else {
+					// One line, cut: the start of the arguments' JSON and an ellipsis.
+					expect(shown.length).toBeLessThan(json.length);
+					expect(shown === `${json.slice(0, shown.length - 1)}…`).toBe(true);
+				}
+			} finally {
+				runInContext("tool.remove(); tool.disconnectedCallback();", page.context);
+				page.flushWork();
+			}
+		}, 30_000);
+	}
+
+	// An extension's custom message is shown by its content, written as JSON when it is not a string; a session entry
+	// nests as deep as `JSON.parse` reads, past the browser's `JSON.stringify`, which failed the whole page.
+	for (const levels of [0, 50_000]) {
+		it(`shows a custom message whose content nests ${levels.toLocaleString("en-US")} levels`, () => {
+			let content: Record<string, unknown> = { leaf: "bottom" };
+			for (let level = 0; level < levels; level++) content = { next: content };
+			const { document } = runViewer(
+				{
+					header: sessionHeader,
+					leafId: "custom-1",
+					entries: [
+						{
+							type: "custom_message",
+							id: "custom-1",
+							parentId: null,
+							timestamp: "2026-01-01T00:00:01Z",
+							customType: "probe",
+							content,
+							display: true,
+						},
+					],
+				},
+				{ ompMarkdown: { Marked }, hljs: { getLanguage() {}, highlight() {}, highlightAuto() {} } },
+			);
+			const status = document.getElementById("viewer-status");
+			expect(status, status?.textContent ?? "").toBeNull();
+
+			const shown = document.querySelector(".hook-message .markdown-content")?.textContent?.trim();
+			expect(shown === stringifyJsonIteratively(content)).toBe(true);
+		}, 30_000);
+	}
 });
