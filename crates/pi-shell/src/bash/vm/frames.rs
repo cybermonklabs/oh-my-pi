@@ -263,6 +263,8 @@ struct ProcImage {
 	command:       Option<(UnitId, u32)>,
 	/// bash's `this_command_name` ([`Vproc::command_name`]).
 	command_name:  Option<super::proc::CommandName>,
+	/// bash's `trap_saved_exit_value` ([`Vproc::trap_saved`]).
+	trap_saved:    i32,
 	/// Pushes onto bash's call-stack arrays.
 	calls:         Vec<super::callstack::Call>,
 	/// The pseudo-signal traps the vproc set itself.
@@ -620,6 +622,7 @@ impl Shell {
 				subshell: p.subshell,
 				command,
 				command_name: p.command_name,
+				trap_saved: p.trap_saved,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
 				mode: p.mode,
@@ -857,6 +860,7 @@ impl Shell {
 			vp.zsh = p.zsh;
 			vp.lineage = p.lineage;
 			vp.command_name = p.command_name;
+			vp.trap_saved = p.trap_saved;
 			if let Some((id, node)) = p.command {
 				let unit = load_unit(
 					engine,

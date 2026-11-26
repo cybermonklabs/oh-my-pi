@@ -2815,6 +2815,7 @@ impl Vproc {
 			subshell: 0,
 			command: None,
 			command_name: None,
+			trap_saved: 0,
 			spare: Vec::new(),
 			calls: Vec::new(),
 			own_traps: proc::OwnTraps::EMPTY,
@@ -2911,6 +2912,7 @@ impl Vproc {
 		vp.getopts.clone_from(&self.getopts);
 		vp.command.clone_from(&self.command);
 		vp.command_name = self.command_name;
+		vp.trap_saved = self.trap_saved;
 		vp.rlimits.clone_from(&self.rlimits);
 		vp.lineage = self.lineage;
 		jobctl::inherit(k, vp.vpid, self.vpid);

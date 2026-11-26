@@ -2622,8 +2622,9 @@ pub fn start_sub(
 				child.trace_base += 1;
 				child
 			};
-			// bash runs the text with `parse_and_execute` (`command_substitute`).
-			child.frames[0].parse_level = ParseLevel::Substitution;
+			// bash runs the text with `parse_and_execute` (`command_substitute`):
+			// a level of its own unless the fork kept an older one.
+			child.frames[0].parse_level = child.frames[0].parse_level.substitution_base();
 			// With `-e` already off in the parent the child sees it off and
 			// `SHELLOPTS` is already right: nothing to reset.
 			if !inherit && state::option(&mut k.root, cx.store, vp, OptId::Errexit).unwrap_or(true) {
@@ -2911,8 +2912,9 @@ pub fn start_procsub(
 		}
 	}
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
-	// bash runs the text with `parse_and_execute` (`process_substitute`).
-	child.frames[0].parse_level = ParseLevel::Substitution;
+	// bash runs the text with `parse_and_execute` (`process_substitute`): a
+	// level of its own unless the fork kept an older one.
+	child.frames[0].parse_level = child.frames[0].parse_level.substitution_base();
 	let vpid = child.vpid;
 	// Not a job: its externals stay in the shell's group, without the
 	// terminal.
@@ -4112,8 +4114,8 @@ fn top_level_frame(cx: &mut Cx<'_>, vp: &Vproc) -> usize {
 /// (`command_substitute` and `process_substitute` set `EXECUTION_FAILURE`).
 fn discard_top(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	// bash's `run_exit_trap` sets its own jump target: a discard inside a
-	// running EXIT trap action ends the action, and the shell exits with the
-	// trap's saved status (`trap_saved_exit_value`), not the discard's. A
+	// running EXIT trap action ends the action, and the shell exits with
+	// `trap_saved_exit_value` ([`Vproc::trap_saved`]), not the discard's. A
 	// child whose fork kept an older running `parse_and_execute` (a `-c`
 	// string, an `eval`, `.` or other trap action, a substitution's text) is
 	// the exception: `top_level_cleanup` restores that level's jump target,
@@ -4124,6 +4126,23 @@ fn discard_top(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	{
 		report_jump(k, vp, cx, i, Jump::Cleanup);
 		end_exit_trap(k, vp, cx, i);
+		return;
+	}
+	// A child forked where an EXIT trap action was the outermost level:
+	// `top_level_cleanup` restores that action's jump target, so the child
+	// returns into the trap it was forked in (`run_exit_trap`), which ends
+	// it with `trap_saved_exit_value`; the child's own EXIT trap does not
+	// run, its `exit_shell` being the one that ran the trap.
+	if vp
+		.frames
+		.first()
+		.is_some_and(|f| f.parse_level == ParseLevel::InExitTrap)
+		&& super::nested::in_subshell(cx.store, vp)
+	{
+		report_jump(k, vp, cx, 0, Jump::Cleanup);
+		vp.exit_trap_run = true;
+		let saved = vp.trap_saved;
+		exit_shell(k, vp, cx, saved, Jump::Cleanup);
 		return;
 	}
 	let command = runs_c(cx, vp);
@@ -4221,18 +4240,24 @@ fn exit_trap_keeps_level(
 
 /// End the EXIT trap action at frame `i` where bash's `run_exit_trap`
 /// catches a jump: the frames above it go, and the action reads no more
-/// commands, so it ends with the status it saved.
+/// commands, so it ends with `trap_saved_exit_value` then
+/// ([`Vproc::trap_saved`]): its own saved `$?`, unless a trap that started
+/// inside the action saved another.
 fn end_exit_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, i: usize) {
 	unwind(&mut k.root, cx.store, vp, i + 1);
 	clear_scratch(&mut k.root, cx.store, vp);
 	truncate(vp, Depths::default());
+	let saved = vp.trap_saved;
 	let f = top_frame(vp);
 	f.unit = None;
 	f.loops.clear();
-	if let FrameKind::Script { src, pos, aux, .. } = &mut f.kind {
+	if let FrameKind::Script { src, pos, aux, what, .. } = &mut f.kind {
 		*pos = (src.len() as u32, pos.1);
 		if let Some(a) = aux {
 			a.pending = None;
+		}
+		if let ScriptKind::Trap { status, .. } = what {
+			*status = saved;
 		}
 	}
 }
@@ -5772,6 +5797,10 @@ fn push_trap(
 	);
 	state::push_scope(&mut k.root, cx.store, vp, scope);
 	let status = vp.status;
+	// bash's `trap_saved_exit_value`: every trap that starts saves `$?`
+	// there (`run_exit_trap`, `run_pending_traps`, `_run_trap_internal`),
+	// and nothing restores it when the trap ends.
+	vp.trap_saved = status;
 	vp.blocked = None;
 	push_script(vp, action, 1, ScriptKind::Trap {
 		key,

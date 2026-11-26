@@ -25,12 +25,15 @@
 //! the command after a readonly variable's `-a` in a function too, names a
 //! message made while it expands a declaration's words by no command,
 //! keeps an EXIT trap's saved status in every subshell (also one forked
-//! inside an `eval`, `.` or other trap action, or under `-c`), and
-//! crashes where a function's `time` meets a list for an element in a
-//! script. bash 5.2.21 names the error of a function in a `-c` string
-//! `environment: line 1:`, and bash names an error in a `.` file by the
-//! file where pi-shell names the shell; the rows print every error as
-//! `SH: …`.
+//! inside an `eval`, `.` or other trap action, or under `-c`), ends a child
+//! forked in an EXIT trap with 1 after a function past `FUNCNEST`, keeps
+//! the EXIT trap's own saved status after such a function where 5.3.20
+//! takes the last trap's, gives a `$( )` forked in `eval` status 1 in a
+//! script, and crashes where a function's `time` meets a list for an
+//! element in a script. bash 5.2.21 names the error of a function in a
+//! `-c` string `environment: line 1:`, and bash names an error in a `.`
+//! file by the file where pi-shell names the shell; the rows print every
+//! error as `SH: …`.
 
 #![cfg(unix)]
 
@@ -282,10 +285,11 @@ fn in_posix_mode_a_subscript_error_drops_the_line() {
 	assert_rows(&rows);
 }
 
-/// A command or process substitution that drops its line exits with status
-/// 1, also in a script (bash's `command_substitute` and `process_substitute`
-/// turn the jump into `EXECUTION_FAILURE`); so does a subshell inside it
-/// (bash's `top_level_cleanup` restores the substitution's jump target).
+/// A command or process substitution forked where no level runs that drops
+/// its line exits with status 1, also in a script (bash's
+/// `command_substitute` and `process_substitute` turn the jump into
+/// `EXECUTION_FAILURE`); so does a subshell inside it (bash's
+/// `top_level_cleanup` restores the substitution's jump target).
 #[test]
 fn a_substitution_exits_with_status_1() {
 	const SHIFT: &str = "SH: shift: too many arguments\n";
@@ -1383,6 +1387,330 @@ fn a_discard_in_an_exit_trap_ends_where_the_child_was_forked() {
 			"FUNCNEST, forked in the trap exit starts in a subshell forked in eval",
 			&format!("{}eval '( f() {{ exit 0; }}; trap t EXIT; f ); echo v=$?'", t(nest)),
 			&format!("{NEST}w=1\nv=0\n"),
+		),
+	];
+	assert_rows(&rows);
+}
+
+/// A command or process substitution keeps the level its fork kept, the
+/// outermost one running there, and is a level of its own only where none
+/// ran: forked inside the shell's EXIT trap, the subshells it forks keep
+/// their own trap's saved status (the trap action is still the outermost
+/// level); forked inside `eval`, a discard in it, or in the trap of a
+/// subshell it forks, leaves with the discard's status (1 under `-c`).
+#[test]
+fn a_substitution_keeps_the_level_its_fork_kept() {
+	const SHIFT: &str = "SH: shift: too many arguments\n";
+	let by_mode = |name: &str, script: &str, c: String, s: String| -> Row {
+		(name.into(), script.into(), (c, 0), (s, 0))
+	};
+	let rows: Vec<Row> = vec![
+		same(
+			"FUNCNEST, a subshell's trap in a $( ) in the shell's trap",
+			r#"trap 'x=$( ( trap "FUNCNEST=2; g() { g; }; g; echo in-trap" EXIT; exit 4 ); echo w=$? ); echo "x=[$x]"' EXIT; echo top"#,
+			&format!("top\n{NEST}x=[w=4]\n"),
+		),
+		same(
+			"too many arguments, a subshell's trap in a $( ) in the shell's trap",
+			r#"trap 'x=$( ( trap "shift 1 2; echo in-trap" EXIT; exit 4 ); echo w=$? ); echo "x=[$x]"' EXIT; echo top"#,
+			&format!("top\n{SHIFT}x=[w=4]\n"),
+		),
+		same(
+			"a subshell's trap in a <( ) in the shell's trap",
+			r#"trap 'cat <( ( trap "shift 1 2; echo in-trap" EXIT; exit 4 ); echo w=$? )' EXIT; echo top"#,
+			&format!("top\n{SHIFT}w=4\n"),
+		),
+		same(
+			"a subshell's trap in a $( ) in a $( ) in the shell's trap",
+			r#"trap 'x=$( y=$( ( trap "shift 1 2; echo in-trap" EXIT; exit 4 ); echo w=$? ); echo "$y" ); echo "x=[$x]"' EXIT; echo top"#,
+			&format!("top\n{SHIFT}x=[w=4]\n"),
+		),
+		same(
+			"a subshell's trap in a $( ) in eval in the shell's trap",
+			r#"trap 'eval "x=\$( ( trap \"shift 1 2; echo in-trap\" EXIT; exit 4 ); echo w=\$? ); echo \"x=[\$x]\""' EXIT; echo top"#,
+			&format!("top\n{SHIFT}x=[w=4]\n"),
+		),
+		by_mode(
+			"a $( ) in eval",
+			r#"eval 'x=$( shift 1 2; echo in ); echo "s=$? x=[$x]"'"#,
+			format!("{SHIFT}s=1 x=[]\n"),
+			format!("{SHIFT}s=2 x=[]\n"),
+		),
+		by_mode(
+			"a subshell's trap in a $( ) in eval",
+			r#"eval 'x=$( ( trap "shift 1 2; echo in-trap" EXIT; exit 4 ); echo w=$? ); echo "x=[$x]"'"#,
+			format!("{SHIFT}x=[w=1]\n"),
+			format!("{SHIFT}x=[w=2]\n"),
+		),
+	];
+	assert_rows(&rows);
+}
+
+/// A discard that cleans up first (too many arguments, a subscript error, a
+/// function past `FUNCNEST`) in the body of a child forked where an EXIT
+/// trap action was the outermost level returns into that action (bash's
+/// `top_level_cleanup` restores its jump target): `run_exit_trap` ends the
+/// child with bash's single `trap_saved_exit_value`, and the child's own
+/// EXIT trap does not run. Also in a job, a pipeline stage, a grandchild, a
+/// substitution, a function or `eval` in the trap. Under `-c` a subshell of
+/// the string kept the string's level, and exits with status 1. A plain
+/// discard (a compound word) stops at the child's own top.
+#[test]
+fn a_discard_in_a_child_forked_in_an_exit_trap_returns_into_the_trap() {
+	const SHIFT: &str = "SH: shift: too many arguments\n";
+	let by_mode = |name: &str, script: &str, c: String, s: String| -> Row {
+		(name.into(), script.into(), (c, 0), (s, 0))
+	};
+	let top = |out: &str| format!("top\n{out}");
+	let rows: Vec<Row> = vec![
+		same(
+			"too many arguments",
+			"trap '( shift 1 2; echo in ); echo w=$?' EXIT; echo top",
+			&top(&format!("{SHIFT}w=0\n")),
+		),
+		both(
+			"after exit 5",
+			"trap '( shift 1 2; echo in ); echo w=$?' EXIT; exit 5",
+			&format!("{SHIFT}w=5\n"),
+			5,
+		),
+		same(
+			"FUNCNEST",
+			"trap '( FUNCNEST=2; g() { g; }; g; echo in ); echo w=$?' EXIT; echo top",
+			&top(&format!("{NEST}w=0\n")),
+		),
+		same(
+			"a subscript error",
+			"trap '( a[1/0]=v; echo in ); echo w=$?' EXIT; echo top",
+			&top(&format!("{DIV}w=0\n")),
+		),
+		same(
+			"a compound word",
+			"trap '( declare -A A=([]=x); echo in ); echo w=$?' EXIT; echo top",
+			"top\nSH: ['']='x': bad array subscript\nw=1\n",
+		),
+		same(
+			"the child's own EXIT trap does not run",
+			r#"trap '( trap "echo T" EXIT; shift 1 2; echo in ); echo w=$?' EXIT; echo top"#,
+			&top(&format!("{SHIFT}w=0\n")),
+		),
+		same(
+			"the child's own EXIT trap after exit",
+			r#"trap '( trap "echo T" EXIT; exit 3 ); echo w=$?' EXIT; echo top"#,
+			"top\nT\nw=3\n",
+		),
+		same(
+			"a $( )",
+			r#"trap 'x=$( shift 1 2; echo in ); echo "s=$? x=[$x]"' EXIT; echo top"#,
+			&top(&format!("{SHIFT}s=0 x=[]\n")),
+		),
+		both(
+			"a $( ) after exit 5",
+			r#"trap 'x=$( shift 1 2; echo in ); echo "s=$? x=[$x]"' EXIT; exit 5"#,
+			&format!("{SHIFT}s=5 x=[]\n"),
+			5,
+		),
+		same(
+			"a subshell in a $( )",
+			r#"trap 'x=$( ( shift 1 2; echo in ); echo w=$? ); echo "x=[$x]"' EXIT; echo top"#,
+			&top(&format!("{SHIFT}x=[w=0]\n")),
+		),
+		both(
+			"a subshell in a $( ) after exit 5",
+			r#"trap 'x=$( ( shift 1 2; echo in ); echo w=$? ); echo "x=[$x]"' EXIT; exit 5"#,
+			&format!("{SHIFT}x=[w=5]\n"),
+			5,
+		),
+		same(
+			"a <( )",
+			"trap 'cat <( shift 1 2; echo in ); echo s=$?' EXIT; echo top",
+			&top(&format!("{SHIFT}s=0\n")),
+		),
+		same(
+			"eval",
+			r#"trap 'eval "( shift 1 2; echo in ); echo w=\$?"' EXIT; echo top"#,
+			&top(&format!("{SHIFT}w=0\n")),
+		),
+		same(
+			"a grandchild",
+			"trap '( ( shift 1 2; echo in ); echo v=$? ); echo w=$?' EXIT; echo top",
+			&top(&format!("{SHIFT}v=0\nw=0\n")),
+		),
+		same(
+			"a job",
+			"trap '( shift 1 2; echo in ) & wait $!; echo w=$?' EXIT; echo top",
+			&top(&format!("{SHIFT}w=0\n")),
+		),
+		same(
+			"a pipeline stage",
+			"trap '( shift 1 2; echo in ) | cat; echo w=${PIPESTATUS[0]}' EXIT; echo top",
+			&top(&format!("{SHIFT}w=0\n")),
+		),
+		both(
+			"exit in a function",
+			"f() { exit 3; }; trap '( shift 1 2; echo in ); echo w=$?' EXIT; f",
+			&format!("{SHIFT}w=3\n"),
+			3,
+		),
+		same(
+			"a function the trap runs",
+			"t() { ( shift 1 2; echo in ); echo w=$?; }; trap t EXIT; echo top",
+			&top(&format!("{SHIFT}w=0\n")),
+		),
+		both(
+			"the saved status, not $?",
+			"trap '(exit 7); ( shift 1 2; echo in ); echo w=$?' EXIT; exit 5",
+			&format!("{SHIFT}w=5\n"),
+			5,
+		),
+		both(
+			"the saved status after false",
+			"trap 'false; ( shift 1 2; echo in ); echo v=$?' EXIT; exit 5",
+			&format!("{SHIFT}v=5\n"),
+			5,
+		),
+		both(
+			"the saved status in a $( )",
+			r#"trap 'x=$( (exit 6); ( shift 1 2; echo in ); echo v=$? ); echo "x=[$x]"' EXIT; exit 5"#,
+			&format!("{SHIFT}x=[v=5]\n"),
+			5,
+		),
+		by_mode(
+			"a subshell's trap",
+			"( trap '( shift 1 2; echo in ); echo w=$?' EXIT; echo body ); echo v=$?",
+			format!("body\n{SHIFT}w=1\nv=0\n"),
+			format!("body\n{SHIFT}w=0\nv=0\n"),
+		),
+		by_mode(
+			"a subshell's trap after exit 6",
+			"( trap '( shift 1 2; echo in ); echo w=$?' EXIT; exit 6 ); echo v=$?",
+			format!("{SHIFT}w=1\nv=6\n"),
+			format!("{SHIFT}w=6\nv=6\n"),
+		),
+		by_mode(
+			"a $( )'s trap",
+			r#"x=$( trap '( shift 1 2; echo in ); echo w=$?' EXIT; echo body ); echo "x=[$x]""#,
+			format!("{SHIFT}x=[body\nw=1]\n"),
+			format!("{SHIFT}x=[body\nw=0]\n"),
+		),
+		same(
+			"the child's own trap's saved status",
+			r#"trap '( trap "( shift 1 2; echo in ); echo v=\$?" EXIT; exit 4 ); echo w=$?' EXIT; echo top"#,
+			&top(&format!("{SHIFT}v=4\nw=4\n")),
+		),
+		same(
+			"a $( ) in a subshell's trap",
+			r#"trap '( trap "x=\$( ( shift 1 2; echo in ); echo v=\$? ); echo \"x=[\$x]\"" EXIT; exit 4 ); echo w=$?' EXIT; echo top"#,
+			&top(&format!("{SHIFT}x=[v=4]\nw=4\n")),
+		),
+		by_mode(
+			"a subshell's trap in a subshell's trap",
+			r#"( trap '( trap "( shift 1 2; echo in ); echo u=\$?" EXIT; exit 4 ); echo v=$?' EXIT; exit 6 ); echo w=$?"#,
+			format!("{SHIFT}u=1\nv=4\nw=6\n"),
+			format!("{SHIFT}u=4\nv=4\nw=6\n"),
+		),
+	];
+	assert_rows(&rows);
+}
+
+/// bash keeps one `trap_saved_exit_value`: every trap that starts saves `$?`
+/// there, and nothing restores it when the trap ends. `run_exit_trap` ends
+/// the shell with it when it catches a discard, in its own action or in
+/// the body of a child it forked, so a signal or ERR trap that ran inside
+/// the EXIT trap, or inside the child, decides the status.
+#[test]
+fn an_exit_trap_ends_with_the_status_the_last_trap_saved() {
+	const SHIFT: &str = "SH: shift: too many arguments\n";
+	let rows: Vec<Row> = vec![
+		both(
+			"a USR1 trap that ran",
+			r#"trap 'trap "(exit 3)" USR1; false; kill -USR1 $$; FUNCNEST=2; g() { g; }; g; echo in' EXIT; exit 5"#,
+			NEST,
+			0,
+		),
+		both(
+			"a USR1 trap that ran, too many arguments",
+			r#"trap 'trap "(exit 3)" USR1; (exit 7); kill -USR1 $$; shift 1 2; echo in' EXIT; exit 5"#,
+			SHIFT,
+			0,
+		),
+		both(
+			"an ERR trap that ran",
+			r#"trap 'trap "(exit 3)" ERR; false; FUNCNEST=2; g() { g; }; g; echo in' EXIT; exit 5"#,
+			NEST,
+			1,
+		),
+		both(
+			"an ERR trap that ran in a function",
+			r#"trap 'trap "(exit 3)" ERR; f() { false; }; f; FUNCNEST=2; g() { g; }; g; echo in' EXIT; exit 5"#,
+			NEST,
+			1,
+		),
+		both(
+			"an ERR trap that ran, a subscript error",
+			r#"trap 'trap "(exit 3)" ERR; false; a[1/0]=v' EXIT; exit 5"#,
+			DIV,
+			1,
+		),
+		both(
+			"no other trap",
+			"trap 'false; FUNCNEST=2; g() { g; }; g; echo in' EXIT; exit 5",
+			NEST,
+			5,
+		),
+		same(
+			"an ERR trap in a subshell's trap",
+			r#"( trap 'trap "(exit 3)" ERR; false; shift 1 2; echo in' EXIT; exit 6 ); echo w=$?"#,
+			&format!("{SHIFT}w=1\n"),
+		),
+		both(
+			"a USR1 trap in the trap, a child forked in it",
+			r#"trap 'trap "( shift 1 2; echo in ); echo v=\$?" USR1; false; kill -USR1 $$; echo w=$?' EXIT; exit 5"#,
+			&format!("{SHIFT}v=0\nw=0\n"),
+			5,
+		),
+		both(
+			"a USR1 trap that ran, a child",
+			r#"trap 'trap "(exit 3)" USR1; false; kill -USR1 $$; ( shift 1 2; echo in ); echo v=$?' EXIT; exit 5"#,
+			&format!("{SHIFT}v=0\n"),
+			5,
+		),
+		both(
+			"an ERR trap that ran, a child",
+			r#"trap 'trap "(exit 3)" ERR; false; ( shift 1 2; echo in ); echo v=$?' EXIT; exit 5"#,
+			&format!("{SHIFT}v=1\n"),
+			5,
+		),
+		both(
+			"a DEBUG trap",
+			r#"trap 'trap "(exit 3)" DEBUG; false; ( shift 1 2; echo in ); echo v=$?' EXIT; exit 5"#,
+			&format!("{SHIFT}v=0\n"),
+			5,
+		),
+		both(
+			"a RETURN trap a function does not inherit",
+			r#"trap 'f() { :; }; trap "(exit 3)" RETURN; false; f; ( shift 1 2; echo in ); echo v=$?' EXIT; exit 5"#,
+			&format!("{SHIFT}v=5\n"),
+			5,
+		),
+		both(
+			"a RETURN trap before the EXIT trap",
+			"trap '( shift 1 2; echo in ); echo w=$?' EXIT; f() { return 3; }; trap 'f' RETURN; set \
+			 -T; g() { :; }; g; exit 5",
+			&format!("{SHIFT}w=5\n"),
+			5,
+		),
+		both(
+			"a USR1 trap in the child",
+			r#"trap '( trap "(exit 3)" USR1; false; kill -USR1 $BASHPID; shift 1 2; echo in ); echo w=$?' EXIT; exit 5"#,
+			&format!("{SHIFT}w=0\n"),
+			5,
+		),
+		both(
+			"an ERR trap in the child",
+			r#"trap '( trap "(exit 3)" ERR; false; shift 1 2; echo in ); echo w=$?' EXIT; exit 5"#,
+			&format!("{SHIFT}w=1\n"),
+			5,
 		),
 	];
 	assert_rows(&rows);

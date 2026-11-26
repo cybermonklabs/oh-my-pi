@@ -100,6 +100,13 @@ pub struct Vproc {
 	/// none; `((` and `[[` set it, each `for` item clears it. A subshell
 	/// starts with its parent's.
 	pub command_name:  Option<CommandName>,
+	/// bash's `trap_saved_exit_value`: the `$?` saved by the last trap
+	/// action that started (EXIT, a signal, ERR, DEBUG or RETURN), kept after
+	/// it ends and across a fork. `run_exit_trap` ends the shell with it when
+	/// it catches a discard: one in its own action, or one in the body of a
+	/// child forked where it was the outermost level
+	/// ([`ParseLevel::InExitTrap`]).
+	pub trap_saved:    i32,
 	/// Pushes onto bash's call-stack arrays (`FUNCNAME`, `BASH_SOURCE`,
 	/// `BASH_LINENO`, `BASH_ARGC`, `BASH_ARGV`), oldest first; a subshell
 	/// starts with its parent's.
@@ -836,9 +843,11 @@ pub enum ParseLevel {
 	/// child's own EXIT trap passes the trap: `top_level_cleanup` restores
 	/// the outermost level's saved jump target, and the child exits.
 	Kept,
-	/// A command or process substitution, whose text bash runs with
-	/// `parse_and_execute`: a level of its own (`command_substitute`,
-	/// `process_substitute`).
+	/// A command or process substitution forked where no level was running
+	/// (its fork kept none): its text, which bash runs with
+	/// `parse_and_execute`, is a level of its own (`command_substitute`,
+	/// `process_substitute`). A substitution whose fork kept a level keeps
+	/// that one ([`Self::substitution_base`]).
 	Substitution,
 	/// A child forked inside a substitution's text (a subshell, a job or a
 	/// pipeline element): bash's `top_level_cleanup` restores the
@@ -851,8 +860,11 @@ pub enum ParseLevel {
 	/// action (the shell's own or a subshell's), with no `-c` string still
 	/// running below it: a level as for [`Self::Kept`], but the saved jump
 	/// target `top_level_cleanup` restores is that trap's own
-	/// (`run_exit_trap`), so a discard in the child's own EXIT trap keeps
-	/// the trap's saved status.
+	/// (`run_exit_trap`). A discard in the child's own EXIT trap ends that
+	/// trap; one in the child's body returns into the trap action it was
+	/// forked in, and does not run the child's own EXIT trap. Either way the
+	/// child exits with bash's `trap_saved_exit_value` then
+	/// ([`Vproc::trap_saved`]).
 	InExitTrap,
 }
 
@@ -861,6 +873,17 @@ impl ParseLevel {
 	/// in a substitution's handler (status 1).
 	pub const fn substitution(self) -> bool {
 		matches!(self, Self::Substitution | Self::InSubstitution)
+	}
+
+	/// The base level of a command or process substitution whose fork
+	/// recorded this one: the level its fork kept ([`Self::Kept`],
+	/// [`Self::InSubstitution`], [`Self::InExitTrap`]), the outermost still
+	/// running, else its own text's ([`Self::Substitution`]).
+	pub const fn substitution_base(self) -> Self {
+		match self {
+			Self::Outside | Self::Substitution => Self::Substitution,
+			kept => kept,
+		}
 	}
 }
 
