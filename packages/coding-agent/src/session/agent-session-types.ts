@@ -40,6 +40,7 @@ import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { ExtensionRunner, PreparedExtension } from "../extensibility/extensions";
 import type { MCPLoadResult } from "../mcp";
 import type { CacheWarmer } from "./cache-warmer";
+import type { DateCwdReminderInjector } from "./date-cwd-reminder";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
 import type { MCPEvalNamespaceCatalog } from "../mcp/eval-namespaces";
@@ -357,6 +358,12 @@ export interface AgentSessionConfig {
 		model: Model,
 		signal?: AbortSignal,
 	) => Context | Promise<Context>;
+	/**
+	 * The date/cwd reminder injector {@link transformProviderContext} applies. A
+	 * compaction tells it which turns the history still holds, so it keeps nothing
+	 * for the turns the compaction cut.
+	 */
+	dateCwdReminder?: DateCwdReminderInjector;
 	/**
 	 * Descriptions of input images for text-only models, shared with {@link transformProviderContext}. Summaries
 	 * and advisor transcripts, which carry history as text, use them for a summary or advisor model that cannot

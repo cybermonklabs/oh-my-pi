@@ -11,6 +11,7 @@ import { IrcBus, type IrcBusApi } from "../irc/bus";
 import { type AgentLifecycleApi, AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { isSessionTreeRef, registerPersistedSubagents, sessionFileBelongsToRoot } from "../registry/persisted-agents";
+import { applyEntryPatchesInWindow } from "../session/entry-patches";
 import { normalizeAssistantUsage, parseSessionEntries } from "../session/session-loader";
 import type { AgentHubProps } from "../ui/overlays/pickers/agent-hub";
 
@@ -18,9 +19,10 @@ import type { AgentHubProps } from "../ui/overlays/pickers/agent-hub";
 export const agentTranscriptSource: AgentTranscriptSource = {
 	fs,
 	parseEntries: text => {
-		const entries = parseSessionEntries(text).filter(
-			entry => entry.type === "message" || entry.type === "model_change",
-		);
+		const records = parseSessionEntries(text);
+		// Each entry in the window carries every `entry_patch` record the window holds.
+		applyEntryPatchesInWindow(records);
+		const entries = records.filter(entry => entry.type === "message" || entry.type === "model_change");
 		for (const entry of entries) {
 			if (entry.type === "message" && entry.message.role === "assistant") normalizeAssistantUsage(entry.message);
 		}

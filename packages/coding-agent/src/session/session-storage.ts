@@ -63,6 +63,33 @@ export interface SessionStorageStat {
 	mtime: Date;
 }
 
+/**
+ * A session file opened for reading once, through one descriptor: every range
+ * comes from the file it opened, however the session path changes afterwards
+ * (see {@link SessionStorageWriter.openReaderSync}).
+ */
+export interface SessionFileReader {
+	/** UTF-8 bytes the file held when the reader opened it. */
+	readonly size: number;
+	/**
+	 * Where the last line written by the writer that opened this reader ends
+	 * in this file, or `undefined` when that writer wrote no line to this file:
+	 * none yet, or the session path named another file since.
+	 */
+	readonly writtenEnd: number | undefined;
+	/** The UTF-8 bytes `[start, end)` of the file, or fewer when it ends sooner. */
+	readTextRangeSync(start: number, end: number): string;
+	close(): void;
+}
+
+/** Where {@link SessionStorageWriter.appendExpectedSync} may land a line. */
+export interface SessionAppendExpectation {
+	/** UTF-8 bytes the file must hold before the line. */
+	size: number;
+	/** When set, the file must also be the one this reader opened, and the session path must still name it. */
+	file?: SessionFileReader;
+}
+
 export interface SessionStorageWriter {
 	/**
 	 * Append one newline-terminated line.
@@ -84,6 +111,17 @@ export interface SessionStorageWriter {
 	 * Indexed backends update the local index immediately and queue remote I/O.
 	 */
 	appendSync?(line: string): void;
+	/**
+	 * {@link appendSync} that lands the line only where `expected` allows. The
+	 * check runs under the lock the append takes, right before the write, so
+	 * no writer that takes that lock changes the file between them. When it
+	 * fails, nothing is written, no error is latched, and it throws a
+	 * {@link SessionWriteConflictError} whose `actualSize` is what the file
+	 * held. Optional, with {@link openReaderSync}: file storage implements both.
+	 */
+	appendExpectedSync?(line: string, expected: SessionAppendExpectation): void;
+	/** Open the file the session path names for reading (see {@link SessionFileReader}). */
+	openReaderSync?(): SessionFileReader;
 	/** Resolve once all queued appends complete. No fsync. */
 	flush(): Promise<void>;
 	/** Drain synchronously flushable queued work when the backend supports it. No fsync. */
@@ -117,6 +155,45 @@ export class SessionWriteConflictError extends Error {
 		this.path = path;
 		this.expectedSize = expectedSize;
 		this.actualSize = actualSize;
+	}
+}
+
+/**
+ * A chunked read ({@link SessionStorage.readChunks}) met a session that a full
+ * write or a delete replaced after the read began, so the bytes it had yielded
+ * and the rest would mix two bodies. Reading the session again from its start
+ * sees one body.
+ */
+export class SessionReadConflictError extends Error {
+	readonly path: string;
+
+	constructor(path: string) {
+		super(`Session file ${JSON.stringify(path)} was replaced or removed while it was read; read it again.`);
+		this.name = "SessionReadConflictError";
+		this.path = path;
+	}
+}
+
+/**
+ * Times a reader of a stored transcript reads it again from its start after a
+ * {@link SessionReadConflictError}, before that error surfaces. Each retry
+ * streams again; none falls back to reading the transcript whole.
+ */
+export const RACED_READ_RETRIES = 3;
+
+/**
+ * Run `pass`, a read of a stored transcript from its start, and run it again
+ * after each {@link SessionReadConflictError}, at most
+ * {@link RACED_READ_RETRIES} more times. Any other error, and a conflict past
+ * the last retry, is thrown.
+ */
+export async function retryRacedRead<T>(pass: () => Promise<T>): Promise<T> {
+	for (let retries = 0; ; retries++) {
+		try {
+			return await pass();
+		} catch (error) {
+			if (!(error instanceof SessionReadConflictError) || retries >= RACED_READ_RETRIES) throw error;
+		}
 	}
 }
 
@@ -208,6 +285,13 @@ export interface SessionStorage {
 	/** Read the requested UTF-8 byte windows from the head and tail of the file. */
 	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	/**
+	 * The file's bytes from byte `fromByte` (default 0) to its end, as chunks in
+	 * order, so a reader never holds the whole transcript. Iterating a missing
+	 * file rejects with ENOENT. Optional: callers on backends without it read the
+	 * whole text.
+	 */
+	readChunks?(path: string, fromByte?: number): AsyncIterable<Uint8Array>;
+	/**
 	 * Feed each line of the file to `visit`, in order, until it returns true or
 	 * the file ends. Lets callers find records that fall between the bounded
 	 * {@link readTextSlices} windows. Optional: backends without cheap full scans
@@ -265,6 +349,14 @@ export interface SessionStorage {
 	 * `writeTextSync` publish is still on the wire.
 	 */
 	drain(): Promise<void>;
+	/**
+	 * Resolve once this process may queue more transcript appends: at once while the transcript appends it has
+	 * queued and not yet settled are at or under the point where its turns start to wait (not a bound on what it
+	 * queues), otherwise once enough of them settle; at once when `signal` fires. An agent session awaits it before
+	 * each model request and before each tool result it appends, so a backend that falls behind slows the turns
+	 * instead of holding their lines in memory. Storage that never makes turns wait omits it.
+	 */
+	waitForAppendAdmission?(signal?: AbortSignal): Promise<void>;
 }
 
 // FinalizationRegistry to clean up leaked file descriptors
@@ -301,6 +393,48 @@ function statPathByHandle(filePath: string): fs.BigIntStats | undefined {
 	}
 }
 
+/** {@link SessionFileReader} of the file backend: one read-only descriptor. */
+class FileSessionReader implements SessionFileReader {
+	readonly size: number;
+	readonly writtenEnd: number | undefined;
+	/** Identity of the file the reader opened, read through its descriptor. */
+	readonly ino: bigint;
+	readonly dev: bigint;
+	#fd: number;
+
+	/** Open `fpath`; `writtenEnd` holds only when that is `written`, the file it ends in. */
+	constructor(fpath: string, written: { ino: bigint; dev: bigint }, writtenEnd: number | undefined) {
+		const fd = fs.openSync(fpath, "r");
+		let opened: fs.BigIntStats;
+		try {
+			opened = fs.fstatSync(fd, { bigint: true });
+		} catch (err) {
+			fs.closeSync(fd);
+			throw err;
+		}
+		this.#fd = fd;
+		this.ino = opened.ino;
+		this.dev = opened.dev;
+		this.size = Number(opened.size);
+		this.writtenEnd = opened.ino === written.ino && opened.dev === written.dev ? writtenEnd : undefined;
+	}
+
+	readTextRangeSync(start: number, end: number): string {
+		const buffer = Buffer.allocUnsafe(Math.max(0, end - start));
+		let read = 0;
+		while (read < buffer.length) {
+			const bytes = fs.readSync(this.#fd, buffer, read, buffer.length - read, start + read);
+			if (bytes === 0) break;
+			read += bytes;
+		}
+		return buffer.toString("utf8", 0, read);
+	}
+
+	close(): void {
+		fs.closeSync(this.#fd);
+	}
+}
+
 class FileSessionStorageWriter implements SessionStorageWriter {
 	#fd: number;
 	/** Identity of the file `#fd` is open on: fixed for the descriptor's lifetime, so read once per descriptor. */
@@ -310,6 +444,8 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 	 * last found it naming `#fd`; reset whenever `#fd` changes.
 	 */
 	#pathIdentity: { ino: bigint; dev: bigint } | undefined;
+	/** Where the last line this writer wrote ends in the file `#fd` holds: `undefined` before the first and after a re-open. */
+	#writtenEnd: number | undefined;
 	#fpath: string;
 	#publishLock: ((append: () => void, landed: () => boolean) => void) | undefined;
 	#closed = false;
@@ -398,6 +534,7 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		this.#fd = nextFd;
 		this.#heldIdentity = undefined;
 		this.#pathIdentity = undefined;
+		this.#writtenEnd = undefined;
 		writerRegistry.register(this, nextFd, this);
 		const next = fs.fstatSync(nextFd, { bigint: true });
 		this.#heldIdentity = { ino: next.ino, dev: next.dev };
@@ -420,8 +557,8 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		return error;
 	}
 
-	/** Append `line` at the end of the held descriptor, rolling back to `originalSize` on failure. */
-	#writeNow(line: string, originalSize: number): void {
+	/** Append `line` at the end of the held descriptor, rolling back to `originalSize` on failure. Returns where it ends. */
+	#writeNow(line: string, originalSize: number): number {
 		const buf = Buffer.from(line, "utf-8");
 		let offset = 0;
 		try {
@@ -461,9 +598,25 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 			}
 			throw writeError;
 		}
+		return originalSize + buf.length;
 	}
 
 	appendSync(line: string): void {
+		this.#append(line, undefined);
+	}
+
+	appendExpectedSync(line: string, expected: SessionAppendExpectation): void {
+		const refused = this.#append(line, expected);
+		if (refused) throw refused;
+	}
+
+	openReaderSync(): SessionFileReader {
+		if (this.#closed) throw new Error("Writer closed");
+		return new FileSessionReader(this.#fpath, this.#heldFile(), this.#writtenEnd);
+	}
+
+	/** Append `line`; with `expected`, only when the file it would land in meets it, else write nothing and return the conflict. */
+	#append(line: string, expected: SessionAppendExpectation | undefined): SessionWriteConflictError | undefined {
 		if (this.#closed) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
 		// Write in-body so software crash after the call still sees the entry.
@@ -472,18 +625,40 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		// post-checkpoint event. flush/flushSync remain no-op drains (no fsync).
 		// The publish lock serializes the append against a concurrent rewrite's
 		// check-then-rename, which would otherwise erase the appended turn.
+		let refused: SessionWriteConflictError | undefined;
+		const write = (size: number): void => {
+			refused = undefined;
+			if (expected) {
+				let lands = size === expected.size;
+				const { file } = expected;
+				if (lands && file) {
+					const held = this.#heldFile();
+					lands =
+						file instanceof FileSessionReader &&
+						file.ino === held.ino &&
+						file.dev === held.dev &&
+						this.#pathNamesHeld() === true;
+				}
+				if (!lands) {
+					refused = new SessionWriteConflictError(this.#fpath, expected.size, size);
+					return;
+				}
+			}
+			this.#writtenEnd = this.#writeNow(line, size);
+		};
 		try {
 			if (this.#publishLock) {
 				this.#publishLock(
-					() => this.#writeNow(line, this.#reopenIfReplaced()),
+					() => write(this.#reopenIfReplaced()),
 					() => this.#holdsLivePath(),
 				);
 			} else {
-				this.#writeNow(line, fs.fstatSync(this.#fd).size);
+				write(fs.fstatSync(this.#fd).size);
 			}
 		} catch (err) {
 			throw this.#recordError(err);
 		}
+		return refused;
 	}
 
 	async append(line: string): Promise<void> {
@@ -644,6 +819,24 @@ function sessionLeasePath(sessionId: string, createDir: boolean): string {
  * probed.
  */
 export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null {
+	const lockPath = sessionLeasePath(sessionId, true);
+	// On Linux a native claim may wait on a refusal (see tryAcquireFileLock); the probe answers at once.
+	if (process.platform === "linux" && isFileLockHeld(lockPath)) return null;
+	return tryAcquireFileLock(lockPath);
+}
+
+/**
+ * Claim a session's ownership lease to write the session, or `null` while a
+ * process, this one included, holds it. A process writing the session holds
+ * it (see `FileSessionStorage.claimSession`) until it exits. It claims without
+ * probing first, so a concurrent probe never makes it refuse a free lease: a
+ * probe of the open-file-description lock of newer builds of the addon takes
+ * nothing, and a claim of the abstract-socket lock retries the moment a probe
+ * makes a free lease look taken. A lease another process holds is refused, at
+ * once or after the native claim's own wait (see `tryAcquireFileLock`). Throws
+ * when the lock cannot be taken.
+ */
+export function claimSessionLease(sessionId: string): FileLockHandle | null {
 	return tryAcquireFileLock(sessionLeasePath(sessionId, true));
 }
 
@@ -678,8 +871,36 @@ export function probeSessionLeases(sessionIds: readonly string[]): SessionLeaseR
 	return report;
 }
 
-/** Approximate size (UTF-16 units synchronously, bytes through a sink) buffered per staging-file write when streaming a body. */
-const LINE_STREAM_CHUNK = 1 << 20;
+/** Approximate size (UTF-16 units synchronously, bytes through a sink or a spool read) buffered per write or read when streaming a body. */
+export const LINE_STREAM_CHUNK = 1 << 20;
+
+/**
+ * Write `lines` at `fd`'s position in chunks of about {@link LINE_STREAM_CHUNK}
+ * UTF-16 units, never holding their full concatenation, iterating them once.
+ * Returns the UTF-8 bytes written.
+ */
+export function writeLinesToDescriptorSync(fd: number, lines: Iterable<string>): number {
+	let bytes = 0;
+	let chunk = "";
+	const flush = (): void => {
+		const encoded = Buffer.from(chunk, "utf8");
+		fs.writeFileSync(fd, encoded);
+		bytes += encoded.byteLength;
+		chunk = "";
+	};
+	for (const line of lines) {
+		if (line.length >= LINE_STREAM_CHUNK) {
+			if (chunk.length > 0) flush();
+			chunk = line;
+			flush();
+			continue;
+		}
+		chunk += line;
+		if (chunk.length >= LINE_STREAM_CHUNK) flush();
+	}
+	if (chunk.length > 0) flush();
+	return bytes;
+}
 
 /**
  * Write `lines` to a new file at `target` in bounded chunks, never holding their full concatenation.
@@ -1121,6 +1342,12 @@ export class FileSessionStorage implements SessionStorage {
 		return fs.readFileSync(path, "utf8");
 	}
 
+	readChunks(path: string, fromByte?: number): AsyncIterable<Uint8Array> {
+		const file = Bun.file(path);
+		// A read from the start streams the file itself, as every whole-file stream here does.
+		return (fromByte ? file.slice(fromByte) : file).stream();
+	}
+
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		return peekFileEnds(path, prefixBytes, suffixBytes, (head, tail) => [
 			utf8Decoder.decode(head),
@@ -1357,7 +1584,7 @@ export class FileSessionStorage implements SessionStorage {
 		if (!held) {
 			let lease: FileLockHandle | null;
 			try {
-				lease = tryAcquireSessionLease(sessionId);
+				lease = claimSessionLease(sessionId);
 			} catch (err) {
 				logger.debug("Session ownership lease unavailable", { sessionId, error: toError(err).message });
 				return () => {};

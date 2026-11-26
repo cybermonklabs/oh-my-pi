@@ -8,6 +8,7 @@ import type {
 	ArchiveIndexEntry,
 	ArchiveNode,
 	ExtractedArchiveFile,
+	MemberSource,
 } from "./types";
 
 /** Raise the canonical error for a symlink whose target cannot be materialized. */
@@ -15,6 +16,21 @@ export function throwUnreadableArchiveLink(targetPath: string, memberPath: strin
 	throw new ArchiveError(
 		`Archive symlink '${formatArchivePathForError(memberPath)}' cannot be materialized from target '${formatArchivePathForError(targetPath)}'`,
 	);
+}
+
+/**
+ * `source.chunks(...args)`, or for a source without bounded reads the one
+ * `source.read(...args)` as a single chunk (see {@link MemberSource.chunks}).
+ */
+export async function* chunksOrWhole<Args extends unknown[]>(
+	source: {
+		read(...args: Args): Promise<Uint8Array>;
+		chunks?(...args: Args): AsyncIterable<Uint8Array>;
+	},
+	...args: Args
+): AsyncGenerator<Uint8Array> {
+	if (source.chunks) yield* source.chunks(...args);
+	else yield await source.read(...args);
 }
 
 /**
@@ -125,6 +141,30 @@ export class ArchiveReader {
 
 	/** Extract one file member's bytes, following symlink aliases. */
 	async readFile(subPath: string): Promise<ExtractedArchiveFile> {
+		const { path, entry, source } = this.#fileMember(subPath);
+		const bytes = await source.read(entry.size, path);
+		return {
+			path,
+			isDirectory: false,
+			size: entry.size,
+			mtimeMs: entry.mtimeMs,
+			mode: entry.mode,
+			bytes,
+		};
+	}
+
+	/**
+	 * {@link readFile}'s bytes as chunks, so a member too large to hold is never
+	 * read whole: a plain tar on disk yields reads of at most 1 MiB, and a
+	 * format without chunked reads yields the member as one chunk.
+	 */
+	async *readFileChunks(subPath: string): AsyncGenerator<Uint8Array> {
+		const { path, entry, source } = this.#fileMember(subPath);
+		yield* chunksOrWhole(source, entry.size, path);
+	}
+
+	/** The file member `subPath` names, following symlink aliases; throws when it is not a readable file. */
+	#fileMember(subPath: string): { path: string; entry: ArchiveIndexEntry; source: MemberSource } {
 		const normalizedPath = normalizeArchiveLookupPath(subPath);
 		if (!normalizedPath) {
 			throw new ArchiveError("Archive file path is required");
@@ -149,14 +189,6 @@ export class ArchiveReader {
 		if (entry.storage.type === "link") {
 			throwUnreadableArchiveLink(entry.storage.targetPath, normalizedPath);
 		}
-		const bytes = await entry.storage.source.read(entry.size, normalizedPath);
-		return {
-			path: normalizedPath,
-			isDirectory: false,
-			size: entry.size,
-			mtimeMs: entry.mtimeMs,
-			mode: entry.mode,
-			bytes,
-		};
+		return { path: normalizedPath, entry, source: entry.storage.source };
 	}
 }

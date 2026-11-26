@@ -12,13 +12,12 @@ import type { AgentSession } from "../../session/agent-session";
 import { escapeHarnessTags } from "../../session/harness-tags";
 import { BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE, buildTitleDriftTurns } from "../../session/messages";
 import { isHiddenUserCompanion } from "../../session/queued-messages";
-import { TAN_FORK_BOUNDARY_CUSTOM_TYPE } from "../../session/session-entries";
+import { TAN_FORK_BOUNDARY_CUSTOM_TYPE, USER_TODO_EDIT_CUSTOM_TYPE } from "../../session/session-entries";
 import { SessionManager } from "../../session/session-manager";
 import { createSubagentSettings, followMCPTools } from "../../task/executor";
 import { generateTaskName } from "../../task/name-generator";
 import { AgentOutputManager } from "../../task/output-manager";
 import { cleanTinyMessage, formatTitleConversationContext, MAX_TINY_MESSAGE_CHARS } from "../../tiny/message-preproc";
-import { USER_TODO_EDIT_CUSTOM_TYPE } from "../../tools/todo";
 import type { InteractiveModeContext } from "../types";
 
 import { cfgTaskEnableLsp } from "../../task/settings";

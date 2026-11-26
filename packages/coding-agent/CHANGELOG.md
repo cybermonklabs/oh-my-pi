@@ -10,6 +10,10 @@
 ### Added
 
 - Dictation now works with xAI speech-to-text models such as `xai-oauth/grok-voice-transcribe-2.0` ([#19184](https://github.com/can1357/oh-my-pi/pull/19184) by [@Xytronix](https://github.com/Xytronix))
+- Session storages can implement an optional `readChunks(path, fromByte?)` that streams a transcript's bytes, and an `IndexedSessionStorage` backend (`SessionStorageBackend`, which SDK stores may implement) optional `readChunks` and `writeFullStream` methods, so long sessions resume and rewrite without holding the whole transcript in memory
+- An `IndexedSessionStorage` backend (`SessionStorageBackend`) can implement an optional `appendBatch(path, lines, mtimeMs)` that stores the lines a session queued while one of its appends was in flight in one write; it throws `SessionAppendBatchRolledBackError` when that write stored none of them, and the lines are then appended again one at a time. A backend without it gets one `append` per line, as before
+- Session storages can implement an optional `waitForAppendAdmission(signal?)` that resolves once the process may queue more transcript appends, or when `signal` fires; `IndexedSessionStorage` makes it wait while more than 64 MiB of appends are queued across every session of the process (appends made meanwhile still queue, so that is where turns wait, not a bound on the queue), and logs a warning once after 10 s
+- The SDK exports `applyEntryPatches`, so a caller of `loadSessionFile` or `loadEntriesFromFile` can apply a session's patch records to the raw entries it reads
 
 ### Changed
 
@@ -17,6 +21,16 @@
 - URL reads keep cookies across redirects, follow meta refresh, and fall back to the headless browser when a site blocks plain fetch.
 - URL reads use the native reader for X, YouTube, docs.rs, Discourse, and Mastodon; raw reads still skip site-specific rendering.
 - Debugger attach detects the target executable natively, and Windows eval probes no longer need `taskkill.exe` for cleanup.
+- A resumed session keeps in memory only the entries since its latest compaction: older message bodies, tool results and summaries wait in a temporary file and are read back when something asks for them, so long sessions take far less memory
+- Oh My Pi frees the temporary file for older entries when the last session or copy using it closes.
+- A resumed session keeps less of each older entry in memory: an older message keeps only the few small fields every turn reads, and older tool start markers and every to-do list edit except the one the list restores from wait in the temporary file with the older bodies, so memory grows far less as a session gets longer
+- A recovered retry and the stamps written after a compaction (its dead-end warning, its corrected context size, and content an elide pass shortened) now append a small record to the session file instead of rewriting the whole file, so those writes no longer grow with session length
+- Discarding a failed assistant turn now appends a branch marker instead of rewriting the session file; the discarded turn stays in the file off the active branch and keeps counting toward usage totals.
+- Hindsight auto-retain, the pending-tool-call warning on resume and the exit record read only recent messages on each turn instead of the whole history
+- `.jsonl.gz` subagent transcripts in exports are decompressed as they are read instead of all at once
+- `omp session pack` and `omp session unpack` stream the transcript and its artifacts instead of reading them whole, so moving a long session between machines no longer holds copies of it in memory
+- A turn waits before its next model request or tool result while the session storage has too many transcript appends queued, so a backlogged store slows the turn instead of growing memory
+- On Windows, a session's older entries stay in memory, compressed to about a quarter of their size or less, and a full rewrite on indexed session storage keeps a compressed copy of its body in memory while it is queued, instead of files under the temporary directory: Windows gives no account id to check that directory's owner against, and a file there takes the directory's access list
 
 ### Fixed
 
@@ -26,6 +40,7 @@
 - Shake no longer fails with `Maximum call stack size exceeded` on a session holding a tool call whose arguments nest tens of thousands of levels deep
 - Extension `context` and `assistant_message` handlers run over a conversation holding a tool call whose arguments nest tens of thousands of levels deep, instead of failing with `Maximum call stack size exceeded` or letting a `context` handler's in-place edit reach the stored history
 - A successful `todo` retry clears the failure reminder it corrects even when the calls carry arguments nested tens of thousands of levels deep
+- Restored sessions show images stored in `image_url` lists instead of leaving blob references in their place.
 - A session holding an entry nested more than about 25,000 levels deep is written and rewritten again, instead of every write failing with `Maximum call stack size exceeded`: the passes that write a line, with `secrets.maskSessionStore` on the masking too, read an entry as deep as a session file can hold (millions of levels), and a line that deep is written in milliseconds instead of the seconds `JSON.stringify` takes past about 25,000 levels
 - A session whose entries carry a `runtime` nested more than about 25,000 levels deep resumes instead of failing with `Maximum call stack size exceeded`
 - An entry nested more than 10,000 levels deep that holds a bigint (an extension hook can put one in an entry) is written with the bigint as its decimal string, as a shallower entry is, instead of every write of the session failing with `JSON.stringify cannot serialize BigInt`
@@ -45,6 +60,7 @@
 - `/export` and `omp export` write a session holding an entry nested more than 40,000 levels deep instead of failing with `Maximum call stack size exceeded` and removing the file
 - An exported or shared session holding a call to a tool without a view of its own (an MCP or extension tool) whose arguments nest past the browser's `JSON.stringify`, or a displayed custom message whose content does, opens, with the call labelled in the session tree and the message's content shown, instead of showing `Failed to load viewer: Maximum call stack size exceeded`
 - RPC mode sends an event frame over 1 MiB that holds a tool result nested more than about 18,000 levels deep, and an `agent_end` over 1 MiB whose messages nest more than about 10,000 levels deep, instead of failing to encode them with `Maximum call stack size exceeded`
+- A long goal session no longer reads each older goal mode change back from disk every time it resumes or starts a subagent
 - RPC `get_tree` no longer fails with `Maximum call stack size exceeded` on a session deeper than about 10,000 entries
 - The Python, Go and Rust RPC SDKs read a `get_tree` answer of any depth: Python no longer raises `RecursionError` or closes the client, Go no longer closes the client or waits out its 30 s timeout (a response that fails to decode now fails its call at once), and Rust no longer closes the client
 - Python RPC SDK: a value holding a cycle passed to a decoder (`parse_session_tree`, say) raises `ValueError` instead of `RecursionError`
@@ -65,6 +81,9 @@
 - Renaming a session from `/resume` accepts keyboard input again and returns focus to the picker after saving or cancelling ([#20548](https://github.com/can1357/oh-my-pi/issues/20548)).
 - Custom composer shapes can add blank rows above the input and keep the caret on the text row ([#20532](https://github.com/can1357/oh-my-pi/issues/20532)).
 - Fixed ACP and RPC `/mcp` commands to respect project-server precedence, enable/disable overrides, and the session working directory. ([#20499](https://github.com/can1357/oh-my-pi/pull/20499) by [@eggpeat](https://github.com/eggpeat))
+- A subagent's transcript read over RPC (`get_subagent_messages`) or in the Agent Hub now shows a recovered retry as recovered and an elided tool result as its placeholder, as the session itself does
+- A retry marker or other stamp that another process appended to the session file is no longer dropped when this session next rewrites the file, and a stamp whose content does not fit its entry is skipped with a warning instead of corrupting that entry
+- An `omp anonymize` export shows a recovered retry as recovered, and reopens without malformed-record warnings
 
 ### Removed
 

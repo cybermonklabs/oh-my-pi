@@ -2,6 +2,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { customMessageEntryMessage, isUserRequestEntry } from "./transcript/transcript-entry";
 import {
 	canReplayRemoteCompaction,
+	compactionKeptStart,
 	getAnthropicCompactionPayload,
 	isTurnStartEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
@@ -24,11 +25,13 @@ import {
 	REWIND_REPORT_MESSAGE_TYPE,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
+import { coldRolloverRequestMark } from "./cold-message";
 import { CONTEXT_NOTES_ENTRY_TYPE, getContextNotes, renderContextNotes } from "./context-notes";
 import {
 	type CompactionEntry,
 	type CustomMessageEntry,
 	EPHEMERAL_MODEL_CHANGE_ROLE,
+	type ModeChangeEntry,
 	resolveSessionLeafId,
 	type SessionEntry,
 	type SessionMessageEntry,
@@ -44,13 +47,39 @@ const LEGACY_SNAPCOMPACT_TRUNCATED_CHARS_GUARD = 1_000_000;
 const SUPERSEDED_COMPACTION_SUMMARY = "[Superseded compaction summary elided after a newer compaction]";
 const SUPERSEDED_COMPACTION_SHORT_SUMMARY = "Superseded compaction elided";
 
-function isRolloverRequestEntry(entry: SessionEntry): boolean {
+/**
+ * Custom message type of the hidden reminder that continues a failed turn the
+ * session kept in context (a rate limit or a cut stream after visible text, a
+ * malformed call): pick up where that turn stopped. A rebuilt context keeps it
+ * exactly while it keeps the turn the reminder follows.
+ */
+export const CONTINUE_REMINDER_MESSAGE_TYPE = "continue-reminder";
+
+/**
+ * Whether `message` may sit between a kept turn and its continue reminder in a
+ * rebuilt context: the turn's tool results, and the context notes placed after
+ * a retained assistant turn a native Anthropic summary folds.
+ */
+function sitsBetweenTurnAndReminder(message: AgentMessage | undefined): boolean {
+	return (
+		message?.role === "toolResult" || (message?.role === "custom" && message.customType === CONTEXT_NOTES_ENTRY_TYPE)
+	);
+}
+
+/**
+ * Whether `entry` is a request the context of an `experimental-context-rollover`
+ * compaction can take from before its kept entries: a user's request, or the
+ * parent's IRC message delivered while idle. A cold `custom_message` answers
+ * from the mark it took as it went cold (`coldRolloverRequestMark`), so the
+ * walk over the older entries on every context build reads no record back.
+ */
+export function isRolloverRequestEntry(entry: SessionEntry): boolean {
+	if (entry.type !== "custom_message") return isUserRequestEntry(entry);
+	const marked = coldRolloverRequestMark(entry);
+	if (marked !== undefined) return marked;
 	return (
 		isUserRequestEntry(entry) ||
-		(entry.type === "custom_message" &&
-			entry.customType === "irc:incoming" &&
-			isRecord(entry.details) &&
-			entry.details.fromParent === true)
+		(entry.customType === "irc:incoming" && isRecord(entry.details) && entry.details.fromParent === true)
 	);
 }
 
@@ -335,8 +364,8 @@ export function buildSessionContext(
 	const models: Record<string, string> = {};
 	let compaction: CompactionEntry | null = null;
 	const injectedTtsrRulesSet = new Set<string>();
-	let mode = "none";
-	let modeData: Record<string, unknown> | undefined;
+	// The last mode change on the path: only its data is read, since an older one's lies in the cold store.
+	let lastModeChange: ModeChangeEntry | undefined;
 	// Track whether an explicit `model_change` with role="default" has been
 	// seen on this path. Once a user (or the agent itself) records an
 	// explicit default, later assistant-message inference must NOT overwrite
@@ -395,8 +424,7 @@ export function buildSessionContext(
 				injectedTtsrRulesSet.add(ruleName);
 			}
 		} else if (entry.type === "mode_change") {
-			mode = entry.mode;
-			modeData = entry.data;
+			lastModeChange = entry;
 		}
 		previous = entry;
 	}
@@ -404,6 +432,8 @@ export function buildSessionContext(
 		thinkingLevel = preFallbackThinking.thinkingLevel;
 		configuredThinkingLevel = preFallbackThinking.configured;
 	}
+	const mode = lastModeChange?.mode ?? "none";
+	const modeData = lastModeChange?.data;
 
 	if (options?.model && !options.transcript) {
 		compaction = getReadableCompactionEntry(path, options.model);
@@ -476,15 +506,20 @@ export function buildSessionContext(
 		}
 	}
 
+	// Whether the latest assistant entry was left out of model context: the
+	// continue reminder recorded right after a turn goes with it.
+	let turnLeftOut = false;
 	const appendMessage = (entry: SessionEntry) => {
 		handleEntryResetTracking(entry);
 		if (entry.type === "message") {
-			if (
-				!options?.transcript &&
-				entry.message.role === "assistant" &&
-				(entry.message.retryRecovery || isEmptyErrorTurn(entry.message))
-			) {
-				return;
+			// A failed turn automatic retry replaced carries `retryRecovery` and
+			// leaves model context; one a later turn continued from (`continued`:
+			// a retry, a stream-stall or a malformed-call continuation kept it, and
+			// the continuation succeeded) stays, as it does in the live context.
+			if (!options?.transcript && entry.message.role === "assistant") {
+				const { retryRecovery, continued } = entry.message;
+				turnLeftOut = (Boolean(retryRecovery) && continued !== true) || isEmptyErrorTurn(entry.message);
+				if (turnLeftOut) return;
 			}
 			pushMessage(entry.message);
 		} else if (entry.type === "custom_message") {
@@ -492,7 +527,8 @@ export function buildSessionContext(
 				!options?.transcript &&
 				(entry.customType === PREWALK_PLAN_MESSAGE_TYPE ||
 					entry.customType === VIBE_MODE_CONTEXT_MESSAGE_TYPE ||
-					entry.customType === PLAN_MODE_CONTEXT_MESSAGE_TYPE)
+					entry.customType === PLAN_MODE_CONTEXT_MESSAGE_TYPE ||
+					(entry.customType === CONTINUE_REMINDER_MESSAGE_TYPE && turnLeftOut))
 			) {
 				return;
 			}
@@ -583,15 +619,8 @@ export function buildSessionContext(
 		// still retires the tail's pre-compaction usage reports.
 		let historyRewriteAt: number | undefined;
 		if (anthropicPayload !== undefined) {
-			const firstKeptIdx = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
-			const snapshotIdx =
-				compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId
-					? path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId)
-					: -1;
-			const firstRetained =
-				(firstKeptIdx >= 0 && firstKeptIdx < compactionIdx ? path[firstKeptIdx] : undefined) ??
-				(snapshotIdx >= 0 && snapshotIdx < compactionIdx - 1 ? path[snapshotIdx + 1] : undefined) ??
-				path[compactionIdx + 1];
+			const keptStart = compactionKeptStart(path, compaction, compactionIdx);
+			const firstRetained = keptStart < compactionIdx ? path[keptStart] : path[compactionIdx + 1];
 			// The message's own time, not the entry's: an assistant message is
 			// stamped when its stream starts and saved after it ends, so a marker
 			// derived from the entry would postdate that turn and strip its thinking.
@@ -659,15 +688,12 @@ export function buildSessionContext(
 		// turns visible instead of showing only the summary and post-compaction.
 		if (!remoteReplacementHistory || options?.transcript) {
 			// Emit kept messages (before compaction, starting from firstKeptEntryId).
-			const firstKeptIdx = path.findIndex(
-				(entry, index) => index < compactionIdx && entry.id === compaction.firstKeptEntryId,
-			);
-			const snapshotIdx =
-				anthropicPayload && compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId
-					? path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId)
-					: -1;
-			const retainedStart = firstKeptIdx >= 0 ? firstKeptIdx : snapshotIdx >= 0 ? snapshotIdx + 1 : -1;
-			if (retainedStart >= 0 && retainedStart < compactionIdx) {
+			// A replay-through boundary bounds the kept region only for a native Anthropic summary.
+			const retainedStart =
+				compaction.firstKeptEntryId === "" && !anthropicPayload
+					? compactionIdx
+					: compactionKeptStart(path, compaction, compactionIdx);
+			if (retainedStart < compactionIdx) {
 				let displayStartIdx = retainedStart;
 				if (options?.transcript) {
 					// `findCutPoint` may leave the collapsed display's kept region
@@ -819,12 +845,25 @@ export function buildSessionContext(
 	// and can spend minutes reprocessing old context before the new prompt.
 	// Keep the interrupted-thinking continuity pair: convertToLlm strips the
 	// unsafe trailing thinking from that assistant and sends the hidden
-	// continuity note instead.
+	// continuity note instead. Keep a failed turn a later turn continued from
+	// (`continued`): the turns after it pick up from it. A continue reminder
+	// stays exactly while the turn before it (see `sitsBetweenTurnAndReminder`
+	// for what may sit between them) is such a kept turn: after a turn this
+	// rebuild leaves out (no continuation finished it, or a compaction cut it
+	// off), it would ask the model to pick up from nothing.
 	if (!options?.transcript) {
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i];
+			if (message?.role === "custom" && message.customType === CONTINUE_REMINDER_MESSAGE_TYPE) {
+				let turnIndex = i - 1;
+				while (sitsBetweenTurnAndReminder(messages[turnIndex])) turnIndex--;
+				const turn = messages[turnIndex];
+				if (turn?.role !== "assistant" || turn.continued !== true) messages.splice(i, 1);
+				continue;
+			}
 			if (message?.role !== "assistant") continue;
 			if (message.stopReason !== "aborted" && message.stopReason !== "error") continue;
+			if (message.continued === true) continue;
 			const next = messages[i + 1];
 			if (next?.role === "custom" && next.customType === INTERRUPTED_THINKING_MESSAGE_TYPE) continue;
 			// A failed turn that emitted tool calls persists paired synthetic

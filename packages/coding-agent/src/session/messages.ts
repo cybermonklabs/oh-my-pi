@@ -71,6 +71,7 @@ import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import { readerIncludesThinking } from "@oh-my-pi/snapcompact";
 import userInterjectionTemplate from "../prompts/steering/user-interjection.md" with { type: "text" };
 import { cleanTinyMessage, formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
+import { isColdMessage } from "./cold-message";
 
 export {
 	type BranchSummaryMessage,
@@ -830,8 +831,9 @@ function wrapSteeringUserMessage(message: SteeringUserMessage): UserMessage {
 
 // One wrapper per steering message. Per-request transforms key on identity (the
 // date/cwd reminder treats an unseen user turn as new), so a fresh wrapper each
-// request would read as a never-sent turn. Owner edits evict it below.
-const steeringWrapperCache = new WeakMap<AgentMessage, UserMessage>();
+// request would read as a never-sent turn. Owner edits evict it below; a cold
+// message (see `forgetConvertMemo`) gets none.
+const steeringWrapperCache = new WeakMap<object, UserMessage>();
 
 export function wrapSteeringForModel(messages: AgentMessage[]): AgentMessage[] {
 	// Wrap EVERY steering message, not just a trailing run. The wire bytes of a
@@ -847,7 +849,7 @@ export function wrapSteeringForModel(messages: AgentMessage[]): AgentMessage[] {
 		let wrappedMessage = steeringWrapperCache.get(message);
 		if (wrappedMessage === undefined) {
 			wrappedMessage = wrapSteeringUserMessage(message);
-			steeringWrapperCache.set(message, wrappedMessage);
+			if (!isColdMessage(message)) steeringWrapperCache.set(message, wrappedMessage);
 		}
 		if (wrappedMessage === message) continue;
 		if (wrappedMessages === undefined) {
@@ -895,19 +897,32 @@ function stripImagesFromArrayContent(content: (TextContent | ImageContent)[]): S
  * pure local mutation and intentionally does neither.
  */
 export function stripImagesFromMessage(message: AgentMessage): number {
-	const removed = stripImagesFromMessageContent(message);
+	const removed = walkImageSites(message, true);
 	// The mutated message keeps its identity across context rebuilds, so drop its
 	// cached estimate/convert before the next pass counts/converts the new shape.
 	if (removed > 0) invalidateMessageCache(message);
 	return removed;
 }
 
-function stripImagesFromMessageContent(message: AgentMessage): number {
+/** Whether {@link stripImagesFromMessage} would remove an image from `message`, which stays unchanged. */
+export function hasStrippableImages(message: AgentMessage): boolean {
+	return walkImageSites(message, false) > 0;
+}
+
+/**
+ * The one walk of `message`'s image sites behind both
+ * {@link stripImagesFromMessage} and {@link hasStrippableImages}, so a role
+ * whose images one of them finds the other never misses: image blocks in
+ * `content` (every role that carries `ImageContent`), manual Bash `images`, a
+ * tool result's `details.images`, and file mentions' attachments. Returns how
+ * many images there are; with `strip`, also removes them in place.
+ */
+function walkImageSites(message: AgentMessage, strip: boolean): number {
 	switch (message.role) {
 		case "bashExecution": {
-			const removed = message.images?.length ?? 0;
-			if (removed > 0) message.images = undefined;
-			return removed;
+			const found = message.images?.length ?? 0;
+			if (strip && found > 0) message.images = undefined;
+			return found;
 		}
 		case "user":
 		case "developer":
@@ -915,7 +930,7 @@ function stripImagesFromMessageContent(message: AgentMessage): number {
 		case "hookMessage": {
 			if (typeof message.content === "string") return 0;
 			const { content, removed } = stripImagesFromArrayContent(message.content);
-			if (removed > 0) {
+			if (strip && removed > 0) {
 				// All four roles type `content` as `string | (TextContent | ImageContent)[]`;
 				// TypeScript can't narrow the assignment across the union, so cast once.
 				(message as { content: typeof content }).content = content;
@@ -923,12 +938,9 @@ function stripImagesFromMessageContent(message: AgentMessage): number {
 			return removed;
 		}
 		case "toolResult": {
-			let removed = 0;
 			const { content, removed: contentRemoved } = stripImagesFromArrayContent(message.content);
-			if (contentRemoved > 0) {
-				message.content = content;
-				removed += contentRemoved;
-			}
+			if (strip && contentRemoved > 0) message.content = content;
+			let found = contentRemoved;
 			const details = message.details as { images?: unknown } | null | undefined;
 			if (details && Array.isArray(details.images)) {
 				const original = details.images as unknown[];
@@ -937,26 +949,25 @@ function stripImagesFromMessageContent(message: AgentMessage): number {
 					const looksLikeImageBlock =
 						!!candidate && typeof candidate === "object" && (candidate as { type?: unknown }).type === "image";
 					if (looksLikeImageBlock) {
-						removed++;
+						found++;
 					} else {
 						kept.push(candidate);
 					}
 				}
-				if (kept.length !== original.length) {
+				if (strip && kept.length !== original.length) {
 					details.images = kept;
 				}
 			}
-			return removed;
+			return found;
 		}
 		case "fileMention": {
-			let removed = 0;
+			let found = 0;
 			for (const file of message.files) {
-				if (file.image) {
-					file.image = undefined;
-					removed++;
-				}
+				if (!file.image) continue;
+				if (strip) file.image = undefined;
+				found++;
 			}
-			return removed;
+			return found;
 		}
 		default:
 			return 0;
@@ -1115,12 +1126,16 @@ function convertImageBearingCustomMessage(message: CustomMessage | HookMessage):
  * `deobfuscateAgentMessages` spread messages into fresh variants with different
  * content; a symbol-keyed fragment would ride that spread and mis-convert the
  * copy. Identity keying keeps the cache off spread copies.
+ *
+ * A cold session entry's message keeps its identity while its bodies leave
+ * memory for the store, so no fragment is kept for it while it is cold
+ * ({@link forgetConvertMemo}): one would hold the bodies for the session's life.
  */
 interface ConvertMemoEntry {
 	interruptedNext: boolean;
 	fragment: Message[];
 }
-const convertCache = new WeakMap<AgentMessage, ConvertMemoEntry>();
+const convertCache = new WeakMap<object, ConvertMemoEntry>();
 
 // Array-level shortcuts over the per-message memo. The live agent mutates one
 // `AgentMessage[]` identity across a turn: appending new messages and swapping
@@ -1155,10 +1170,20 @@ export function invalidateConvertToLlmArrayCache(messages: AgentMessage[]): void
 }
 
 registerMessageCacheInvalidator(message => {
-	steeringWrapperCache.delete(message);
-	convertCache.delete(message);
+	forgetConvertMemo(message);
 	convertGeneration++;
 });
+
+/**
+ * Drop the conversion of `message` that {@link convertToLlm} and
+ * {@link wrapSteeringForModel} keep, for a session entry's message going cold:
+ * its bodies leave memory, and a kept conversion would hold them. While the
+ * message is cold, neither keeps a new one.
+ */
+export function forgetConvertMemo(message: object): void {
+	convertCache.delete(message);
+	steeringWrapperCache.delete(message);
+}
 
 /** Convert one message to its LLM fragment. `interruptedNext` is true only for an
  *  assistant turn immediately followed by its interrupted-thinking marker. */
@@ -1358,7 +1383,7 @@ function convertOneCached(m: AgentMessage, interruptedNext: boolean): Message[] 
 	if (cached !== undefined && cached.interruptedNext === interruptedNext) return cached.fragment;
 	const fragment = convertOne(m, interruptedNext);
 	for (const message of fragment) copyPerCallContextMessage(message, m);
-	convertCache.set(m, { interruptedNext, fragment });
+	if (!isColdMessage(m)) convertCache.set(m, { interruptedNext, fragment });
 	return fragment;
 }
 

@@ -379,21 +379,6 @@ def _terminate_process_group(process: subprocess.Popen[Any], pgid: int | None) -
     return True
 
 
-def _clone_json_value(value: object) -> JsonValue:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return cast(JsonValue, value)
-    if isinstance(value, list):
-        return [_clone_json_value(item) for item in value]
-    if isinstance(value, dict):
-        cloned: JsonObject = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise RpcError("RPC payload objects must use string keys")
-            cloned[key] = _clone_json_value(item)
-        return cloned
-    raise RpcError("RPC payload must be JSON-serializable")
-
-
 def _clone_json_object(value: object) -> JsonObject:
     if not isinstance(value, dict):
         raise RpcError("RPC response payload must be an object")

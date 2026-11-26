@@ -1418,6 +1418,14 @@ export interface AssistantMessage {
 	credentialId?: number;
 	contextSnapshot?: ContextSnapshot;
 	retryRecovery?: AssistantRetryRecovery;
+	/**
+	 * A later turn continued from this failed turn instead of sending it again
+	 * (a cut stream after visible text, a cut stream or a reasonless abort after
+	 * complete tool calls, a malformed function call), so a model context rebuilt
+	 * from the session keeps it, as the live context does. Set once the
+	 * continuation succeeded.
+	 */
+	continued?: true;
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
 	/** Provider request id (Anthropic's `request-id` response header); provider support asks for it when a request is refused or fails. */
 	requestId?: string;

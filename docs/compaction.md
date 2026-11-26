@@ -237,6 +237,8 @@ The archive is sized from the room under the compaction trigger, not from the wi
 
 Automatic maintenance checks that the rewritten context creates real headroom (normally at or below 80% of the resolved threshold) before scheduling continuation. No-progress passes can try local rescue: re-render an existing snapcompact archive with a smaller frame budget, elide heavy blocks to recoverable artifacts, or drop attached images. Archive rescue can truncate the oldest carried source text; image dropping is destructive. If maintenance still cannot create headroom, it emits a warning and blocks automatic continuation instead of looping on the same oversized context.
 
+The dead-end `warning` stamped on the compaction entry, the `tokensAfter` projected again after the rescue tiers ran, and the snapcompact archive view without reasoning stored in `preserveData` are appended as `entry_patch` records (see [session format](./session.md)) instead of rewriting the session file; the image-drop tier still rewrites it.
+
 ### Display transcript
 
 Compaction no longer visually restarts the conversation. The TUI renders the **display transcript** (`buildSessionContext({ transcript: true })` / `AgentSession.buildTranscriptSessionContext()`): every path entry in chronological order, with each compaction shown inline as a slim divider — `── 📷 compacted · ctrl+o ──` — at the point it fired. Expanding (ctrl+o) reveals the summary. Only the LLM context resets at the compaction boundary; the scrollback above the divider stays intact, including across session resume.

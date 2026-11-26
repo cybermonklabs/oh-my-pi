@@ -12,6 +12,11 @@
 - Added `structuredCloneDeep`, `structuredClone` that also copies a value nested deeper than its recursion allows (Bun's runs out of stack near 40,000 levels): such a value is copied again on its own stack with `structuredClone`'s rules, so its `Map`s, `Date`s, typed arrays, shared objects and cycles stay as they are and a function throws `DataCloneError`, and any other value is copied by `structuredClone` itself
 - Added `isStackOverflow`, which tells the `RangeError` the engine throws when a recursion runs out of stack from one a value's own code throws
 - Added `getBunStubDir()`, the cache directory holding the `bun` stub a compiled omp appends to its JS eval kernel's PATH ([#19241](https://github.com/can1357/oh-my-pi/pull/19241) by [@mccraigmccraig](https://github.com/mccraigmccraig))
+- Added `writeTarArchive` to write a plain tar member by member, streaming `Blob` members such as `Bun.file`, with the same bytes as `writeArchive`; unlike `writeArchive` it empties `destPath` before it writes, so a failure leaves a truncated file there (write to a staging file and rename it on success)
+- Added `ArchiveReader.readFileChunks` to read an archive member in bounded chunks; plain tar files on disk yield reads of at most 1 MiB
+- Added `readByteSourceChunks` to read a byte range of a `ByteSource` as reads of at most 1 MiB
+- Added the optional `MemberSource.chunks` so a format can serve a member in bounded chunks, and `chunksOrWhole` to read a source through it or, without it, as one chunk
+- Added `writeChunksToFile` to write an async iterable of byte chunks to a file one awaited write at a time
 
 ### Breaking Changes
 

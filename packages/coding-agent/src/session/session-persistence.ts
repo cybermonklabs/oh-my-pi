@@ -5,6 +5,7 @@ import {
 	DEEP_JSON_LEVELS,
 	isRecord,
 	type NestedWalk,
+	nestsDeeperThan,
 	runNested,
 	stringifyDeepJson,
 	stringifyJsonIteratively,
@@ -90,6 +91,16 @@ export function isExternalizableImagePosition(
 	return (key === TEXT_CONTENT_KEY && isImageBlock(value)) || key === "images" || key === SNAPCOMPACT_FRAMES_KEY;
 }
 
+/**
+ * True for a string under `image_url` of its holder (an array element under its
+ * array's key, at any depth): where a provider image's URL sits, whose data URL
+ * a persisted line stores whole as one blob. The eager load path resolves a
+ * blob reference at the same position.
+ */
+export function isImageUrlPosition(value: unknown, key: string | undefined): value is string {
+	return typeof value === "string" && key === IMAGE_URL_KEY;
+}
+
 /** Whether `image`, base64, is no blob reference yet and long enough to externalize (a smaller image stays inline). */
 function isExternalizableBase64(image: string): boolean {
 	return !isBlobRef(image) && image.length >= BLOB_EXTERNALIZE_THRESHOLD;
@@ -98,19 +109,21 @@ function isExternalizableBase64(image: string): boolean {
 /**
  * Where a node of a session entry holds an image a persisted line externalizes:
  * `data` or `result`, the field of an object node that holds the image's base64,
- * or `url`, a string node that is itself a data URL under `image_url`, stored whole.
+ * or `url`, a string node that is itself a data URL at an image URL position
+ * ({@link isImageUrlPosition}), stored whole.
  */
 type ImageSite = "data" | "result" | "url";
 
 /**
  * The {@link ImageSite} of `value`, a node under `key` of its holder (an array
  * element under its array's key, at any depth), whose image a persisted line
- * externalizes: a data URL under `image_url`, the `result` of a generated image
- * (`type: "image_generation_call"`), or the `data` of an image payload at an
- * image position ({@link isExternalizableImagePosition}).
+ * externalizes: a data URL at an image URL position ({@link isImageUrlPosition}),
+ * the `result` of a generated image (`type: "image_generation_call"`), or the
+ * `data` of an image payload at an image position
+ * ({@link isExternalizableImagePosition}).
  */
 function externalizedImageSite(value: unknown, key: string | undefined): ImageSite | undefined {
-	if (typeof value === "string") return key === IMAGE_URL_KEY && isImageDataUrl(value) ? "url" : undefined;
+	if (isImageUrlPosition(value, key)) return isImageDataUrl(value) ? "url" : undefined;
 	if (typeof value !== "object" || value === null) return undefined;
 	if (
 		"type" in value &&
@@ -755,4 +768,121 @@ function preparedEntry(entry: FileEntry, blobStore: BlobStore, shape: PersistedS
 			throw error;
 		}
 	}
+}
+
+/**
+ * `value` with each image payload a persisted line externalizes (content image
+ * blocks, `images[]`, snapcompact frames, image data URLs, generated images)
+ * replaced by its blob reference, and nothing else changed. A block a persisted
+ * line keeps verbatim ({@link isAtomicPersistenceNode}) keeps its images inline,
+ * as the line does. Untouched subtrees are shared. The walk keeps its own
+ * stack ({@link runNested}), so it reaches the images of a value of any depth
+ * `JSON.parse` reads; past {@link DEEP_JSON_LEVELS} levels it sets `shape.deep`.
+ */
+function externalizeImagesOnly(value: unknown, blobStore: BlobStore, shape: PersistedShape): unknown {
+	if (!isContainer(value)) return externalizedImagesLeaf(value, undefined, blobStore);
+	const walk: PersistenceWalk = { blobStore, path: new ContainerPath(), deepest: 0 };
+	const externalized = runNested(externalizedImagesNode(value, undefined, walk, 0));
+	if (walk.deepest > DEEP_JSON_LEVELS) shape.deep = true;
+	return externalized;
+}
+
+/** {@link externalizeImagesOnly} of `value`, no object, under `key` of its holder. */
+function externalizedImagesLeaf(value: unknown, key: string | undefined, blobStore: BlobStore): unknown {
+	return externalizeImageNode(value, blobStore, key) ?? value;
+}
+
+/** {@link externalizeImagesOnly} of `value`, an object under `key` of its holder at `depth` levels. */
+function* externalizedImagesNode(
+	value: object,
+	key: string | undefined,
+	walk: PersistenceWalk,
+	depth: number,
+): NestedWalk {
+	// An image is replaced before its level counts toward `walk.deepest`: the walk does not go into it.
+	const image = externalizeImageNode(value, walk.blobStore, key);
+	if (image !== undefined) return image;
+	if (depth > walk.deepest) walk.deepest = depth;
+	if (isAtomicPersistenceNode(value, key)) return value;
+	walk.path.enter(value);
+	if (Array.isArray(value)) {
+		let changed: unknown[] | undefined;
+		for (let index = 0; index < value.length; index++) {
+			const item: unknown = value[index];
+			const next = isContainer(item)
+				? yield externalizedImagesNode(item, key, walk, depth + 1)
+				: externalizedImagesLeaf(item, key, walk.blobStore);
+			if (next === item) continue;
+			changed ??= value.slice();
+			changed[index] = next;
+		}
+		walk.path.leave(value);
+		return changed ?? value;
+	}
+	let changed: Record<string, unknown> | undefined;
+	for (const childKey in value) {
+		if (!Object.hasOwn(value, childKey)) continue;
+		const child: unknown = Reflect.get(value, childKey);
+		const next = isContainer(child)
+			? yield externalizedImagesNode(child, childKey, walk, depth + 1)
+			: externalizedImagesLeaf(child, childKey, walk.blobStore);
+		if (next === child) continue;
+		changed ??= { ...value };
+		changed[childKey] = next;
+	}
+	walk.path.leave(value);
+	return changed ?? value;
+}
+
+/**
+ * The JSON text of `entry` as the manager holds it, with image payloads
+ * replaced by blob references (the blob store keeps their bytes). Unlike
+ * {@link prepareEntryForPersistence} nothing is truncated, stripped or masked:
+ * parsing the text and resolving its blob references gives the entry back,
+ * but for snapcompact frames, which resolving leaves as references where the
+ * entry may have held their base64 data; their readers resolve a reference as
+ * they read it (`lazyImageDataSync`). An entry nested past
+ * {@link DEEP_JSON_LEVELS} levels is written by `stringifyJsonIteratively`, as
+ * its session line is. Where the blob store cannot take an image (a full
+ * disk), the text is the entry's JSON with its images inline, which parses
+ * back to the entry as well. Throws only for a value JSON cannot write: a
+ * cycle, a getter or `toJSON` that throws, or a text longer than the engine's
+ * longest string (2^31 - 1 units). A value parsed from a transcript line holds
+ * none of the first two, and the last needs a line about that long.
+ */
+export function entryRecordText(entry: FileEntry, blobStore: BlobStore): string {
+	const shape: PersistedShape = { deep: false };
+	let externalized: unknown;
+	try {
+		externalized = externalizeImagesOnly(entry, blobStore, shape);
+	} catch (error) {
+		// A library object in `details` can carry a getter that throws when the
+		// walk probes it (see prepareEntryForPersistence); its plain JSON has none,
+		// and the walk replaces the images in that. A value JSON cannot write
+		// fails here: the first error is kept.
+		let json: string | undefined;
+		try {
+			json = stringifyDeepJson(entry, BIGINT_AS_STRING);
+		} catch {
+			throw error;
+		}
+		if (json === undefined) throw error;
+		try {
+			externalized = externalizeImagesOnly(JSON.parse(json), blobStore, shape);
+		} catch {
+			// The walk fails on the clone too: an image the blob store cannot take (a full disk).
+			return json;
+		}
+	}
+	return persistedJson(externalized, shape);
+}
+
+/**
+ * The JSON text {@link entryRecordText} writes for `entry`, an entry parsed from a session file, whose
+ * images are blob references already: by `stringifyJsonIteratively` past {@link DEEP_JSON_LEVELS} levels,
+ * as {@link persistedEntryText} writes its line, where `JSON.stringify` would take seconds or run out of
+ * stack, else by `JSON.stringify`.
+ */
+export function loadedEntryRecordText(entry: FileEntry): string {
+	return persistedJson(entry, { deep: nestsDeeperThan(entry, DEEP_JSON_LEVELS) });
 }

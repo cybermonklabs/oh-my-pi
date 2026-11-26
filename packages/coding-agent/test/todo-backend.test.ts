@@ -19,7 +19,7 @@ import { type CreateAgentSessionOptions, createAgentSession } from "@oh-my-pi/pi
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgTodoBackend } from "@oh-my-pi/pi-coding-agent/tools/settings";
-import { USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools/todo";
+import { USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { createRoot } from "@oh-my-pi/pi-tui";
 import { jsx } from "@oh-my-pi/pi-tui/jsx-runtime";

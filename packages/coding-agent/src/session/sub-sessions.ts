@@ -12,9 +12,8 @@ import { isEnoent } from "@oh-my-pi/pi-utils";
 import { isAdvisorTranscriptName } from "../advisor/transcript-names";
 import { getAgentTombstonePath } from "../registry/agent-tombstone";
 import { resolveSessionLeafId, type SessionEntry, type SessionHeader } from "./session-entries";
-import { loadSessionFile, parseSessionContent, type SessionLoadResult } from "./session-loader";
-
-const utf8Decoder = new TextDecoder();
+import { loadEntriesFromFileStream, loadSessionFile, type SessionLoadResult } from "./session-loader";
+import { applyEntryPatches } from "./entry-patches";
 
 /** Persisted child transcript (subagent or opted-in advisor), keyed by slash-joined path. */
 export interface SubSession {
@@ -80,6 +79,7 @@ export async function collectSubSessions(
 		// Empty files load as [] and are skipped; a corrupt or missing header is reported so exports do
 		// not look complete while omitting the transcript.
 		if (!invalidHeader && fileEntries.length > 0) {
+			applyEntryPatches(fileEntries);
 			const header = (fileEntries.find(e => e.type === "session") as SessionHeader | undefined) ?? null;
 			const entries = fileEntries.filter((e): e is SessionEntry => e.type !== "session");
 			result[found.key] = {
@@ -112,11 +112,14 @@ export async function listSubSessionFiles(sessionFile: string, scope: SubSession
 	return found;
 }
 
-/** Decompress archives before handing their JSONL to the central session parser. */
+/** Decompress archives as the central session parser reads them: neither the archive nor its JSONL is held whole. */
 async function loadCollectedSession(file: string): Promise<SessionLoadResult | null> {
 	if (!file.endsWith(".jsonl.gz")) return loadSessionFile(file);
 	try {
-		return parseSessionContent(utf8Decoder.decode(Bun.gunzipSync(await Bun.file(file).bytes())));
+		return await loadEntriesFromFileStream(file, {
+			throwIfMissing: true,
+			chunks: Bun.file(file).stream().pipeThrough(new DecompressionStream("gzip")),
+		});
 	} catch (err) {
 		// Match the plain loader when gc removes a transcript after discovery.
 		if (isEnoent(err)) return null;

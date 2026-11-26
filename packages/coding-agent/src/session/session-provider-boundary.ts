@@ -20,7 +20,7 @@ import {
 	type SessionContext,
 	type TranscriptSessionContextOptions,
 } from "./session-context";
-import type { SessionManager } from "./session-manager";
+import type { SessionContextBuildOptions, SessionManager } from "./session-manager";
 
 import {
 	cfgModelLoopGuardCheckAssistantContent,
@@ -109,14 +109,19 @@ export class SessionProviderBoundary {
 	/**
 	 * Builds the current deobfuscated context for agent display and replay as `model` reads it: sized for its
 	 * frame budget, standing on the newest compaction it can replay (the active model unless a caller is about
-	 * to adopt another).
+	 * to adopt another). Pass `measureOnly` for a build that only measures and does not become the agent's
+	 * context.
 	 */
-	buildDisplaySessionContext(model = this.#host.model()): SessionContext {
+	buildDisplaySessionContext(
+		model = this.#host.model(),
+		options?: Pick<SessionContextBuildOptions, "measureOnly">,
+	): SessionContext {
 		return deobfuscateSessionContext(
 			this.#host.sessionManager.buildSessionContext({
 				inFlightToolCallIds: this.#inFlightToolCallIds(),
 				maxFrameDataBytes: snapcompact.frameDataBytesBudget(model),
 				model,
+				measureOnly: options?.measureOnly,
 			}),
 			this.#host.obfuscator(),
 		);

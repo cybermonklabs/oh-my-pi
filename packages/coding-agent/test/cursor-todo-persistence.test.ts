@@ -4,9 +4,9 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { CursorExecHandlers } from "@oh-my-pi/pi-coding-agent/cursor";
 import type { TodoPhase } from "@oh-my-pi/pi-coding-agent/tools/details/todo";
-import { getLatestTodoPhasesFromEntries, USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools/todo";
+import { getLatestTodoPhasesFromEntries } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { buildSessionContext } from "../src/session/session-context";
-import type { SessionEntry } from "../src/session/session-entries";
+import { type SessionEntry, USER_TODO_EDIT_CUSTOM_TYPE } from "../src/session/session-entries";
 import { toolText } from "./helpers/tool-text";
 
 const TIMESTAMP = "2026-07-25T00:00:00.000Z";

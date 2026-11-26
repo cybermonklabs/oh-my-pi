@@ -72,16 +72,7 @@ import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { resolvePromptCacheLookback } from "@oh-my-pi/pi-catalog/compat/prompt-cache-lookback";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
-import {
-	isRecord,
-	logger,
-	prompt,
-	Snowflake,
-	spillUrl,
-	structuredCloneDeep,
-	toError,
-	withLoopPhase,
-} from "@oh-my-pi/pi-utils";
+import { isRecord, logger, prompt, Snowflake, spillUrl, toError, withLoopPhase } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import * as fs from "node:fs/promises";
 import { writeArtifact } from "./artifacts";
@@ -111,9 +102,11 @@ import {
 	resolveMethodSettings,
 	resolveSpeculationMethod,
 } from "./compaction-methods";
+import type { EntryPatch } from "./entry-patches";
 import {
 	assistantTurnDelivered,
 	convertToLlm,
+	hasStrippableImages,
 	invalidateConvertToLlmArrayCache,
 	INTERRUPTED_THINKING_MESSAGE_TYPE,
 	isUserAuthoredMessage,
@@ -136,7 +129,7 @@ import {
 } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
 import type { HandoffGenerationOptions } from "./session-handoff";
-import type { SessionManager } from "./session-manager";
+import type { SessionContextBuildOptions, SessionManager } from "./session-manager";
 import type { SessionProviderBoundary } from "./session-provider-boundary";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { resolveSpeculationLeadTokens, SPECULATION_LEAD_MIN_TOKENS } from "./speculation-lead";
@@ -297,6 +290,38 @@ function findUsageAnchorIndex(branchEntries: readonly SessionEntry[], compaction
 		return index;
 	}
 	return -1;
+}
+
+/**
+ * One patch per entry an elide pass rewrote, read from the entry after the
+ * pass: its shortened content and the `prunedAt` or `elidedOutputTokens` the
+ * pass stamped on it.
+ */
+function elidePatches(items: readonly { region: ShakeRegion }[]): EntryPatch[] {
+	const patches = new Map<string, EntryPatch>();
+	for (const { region } of items) {
+		const entry = region.entry;
+		if (patches.has(entry.id)) continue;
+		if (entry.type === "custom_message") {
+			patches.set(entry.id, { entryId: entry.id, entry: { content: entry.content } });
+			continue;
+		}
+		const message = entry.message;
+		if (message.role === "toolResult") {
+			patches.set(entry.id, {
+				entryId: entry.id,
+				message: { content: message.content, prunedAt: message.prunedAt },
+			});
+		} else if (message.role === "assistant") {
+			patches.set(entry.id, {
+				entryId: entry.id,
+				message: { content: message.content, elidedOutputTokens: message.elidedOutputTokens },
+			});
+		} else if (message.role === "user" || message.role === "developer") {
+			patches.set(entry.id, { entryId: entry.id, message: { content: message.content } });
+		}
+	}
+	return [...patches.values()];
 }
 
 /** A terminal payload rejection may be byte-sized history or irreducible media, not necessarily token overflow. */
@@ -534,8 +559,11 @@ export interface SessionMaintenanceHost {
 	disconnectFromAgent(): void;
 	reconnectToAgent(): void;
 	drainStrandedQueuedMessages(): void;
-	/** The stored context as `model` reads it (the active model when omitted). */
-	buildDisplaySessionContext(model?: Model): SessionContext;
+	/**
+	 * The stored context as `model` reads it (the active model when omitted); `measureOnly` for a build
+	 * that only measures and does not become the agent's context.
+	 */
+	buildDisplaySessionContext(model?: Model, options?: Pick<SessionContextBuildOptions, "measureOnly">): SessionContext;
 	/** Adopt a {@link buildDisplaySessionContext} result as the live history, persisting any snapshot it appended. */
 	replaceMessagesFromSessionContext(messages: AgentMessage[]): void;
 	/** Preserve the eval runtime snapshot at the history rewrite boundary for replay. */
@@ -566,6 +594,14 @@ export interface SessionMaintenanceHost {
 	/** Re-aligns advisors after an in-place prune their own contexts already cover (no re-prime). */
 	rebaseAdvisorPrefix(reason: string): void;
 	rebaseAfterCompaction(): void;
+	/**
+	 * After a compaction moved the cut, with the live history rebuilt: drop what the session keeps for the
+	 * messages before the cut. What mirrors the last request sent, the append-only log and the prompt-cache
+	 * warmer's armed request, holds them until the next request, which syncs the log from the compacted history
+	 * before it builds and arms the warmer again. The persisted-message key index and the date/cwd reminder's
+	 * turn state keep only the turns from the cut on.
+	 */
+	releaseBeforeCut(): void;
 	recordAnchoredHistoryRewrite(tokensRemoved: number): void;
 	getContextBreakdown(options?: {
 		contextWindow?: number;
@@ -958,10 +994,16 @@ export class SessionMaintenance {
 			// hides everything before its cutoff from the wire.
 			const anchored = index < anchorIndex && (!hasRemoteReplacementHistory || index > compactionIndex);
 			if (entry.type === "message") {
-				const before = this.#tokenizer.countMessage(entry.message, countOptions);
-				const dropped = stripImagesFromMessage(entry.message);
+				// A body read back from the cold store is frozen: only an entry that
+				// carries images is made whole and rewritten.
+				if (!hasStrippableImages(entry.message)) continue;
+				const { dropped, saved } = this.#host.sessionManager.updateEntryBody(entry.id, () => {
+					const before = this.#tokenizer.countMessage(entry.message, countOptions);
+					const strippedCount = stripImagesFromMessage(entry.message);
+					const after = this.#tokenizer.countMessage(entry.message, countOptions);
+					return { dropped: strippedCount, saved: Math.max(0, before - after) };
+				});
 				if (dropped === 0) continue;
-				const saved = Math.max(0, before - this.#tokenizer.countMessage(entry.message, countOptions));
 				removed += dropped;
 				tokensFreed += saved;
 				if (anchored) anchoredTokensRemoved += saved;
@@ -986,7 +1028,9 @@ export class SessionMaintenance {
 			if (kept.length === 0) {
 				kept.push({ type: "text", text: "[image removed]" });
 			}
-			entry.content = kept;
+			this.#host.sessionManager.updateEntryBody(entry.id, () => {
+				entry.content = kept;
+			});
 			// A spread keeps the second count off the projected message's memoized identity.
 			const saved = Math.max(
 				0,
@@ -1031,7 +1075,9 @@ export class SessionMaintenance {
 	 * - `elide` replaces whole tool-call results and large fenced/XML blocks
 	 *   with short placeholders that embed a `local://N.log` recovery link.
 	 *
-	 * Mutates the branch in place, persists via `rewriteEntries`, replays the
+	 * Mutates the branch in place, persists it (`images` and `thinking` by
+	 * rewriting the session file through `rewriteEntries`; `elide` as one
+	 * appended `entry_patch` record through `patchEntries`), replays the
 	 * rebuilt context through the agent, and tears down provider sessions that
 	 * cache message identity — same rewrite contract as {@link dropImages}.
 	 *
@@ -1246,24 +1292,28 @@ export class SessionMaintenance {
 			return { region, replacement, replacementTokens: replacementTokenCount };
 		});
 
-		// As `structuredClone` copies, at any depth a transcript line holds (a tool call's arguments are any JSON).
-		const entrySnapshots = new Map<SessionEntry, SessionEntry>();
-		for (const { region } of items) {
-			if (!entrySnapshots.has(region.entry)) entrySnapshots.set(region.entry, structuredCloneDeep(region.entry));
+		// A body read back from the cold store is frozen: each entry is made whole
+		// for its rewrite and goes back to the store with it.
+		for (const [entry, entryItems] of Map.groupBy(items, item => item.region.entry)) {
+			this.#host.sessionManager.updateEntryBody(entry.id, () => applyShakeRegions(entryItems));
 		}
-		const anchorEntry = anchorIndex >= 0 ? branchEntries[anchorIndex] : undefined;
-		if (anchorEntry && !entrySnapshots.has(anchorEntry))
-			entrySnapshots.set(anchorEntry, structuredCloneDeep(anchorEntry));
-		applyShakeRegions(items);
-		try {
-			this.#host.recordAnchoredHistoryRewrite(anchoredTokensRemoved);
-			await this.#host.sessionManager.rewriteEntries();
-		} catch (error) {
-			for (const [entry, snapshot] of entrySnapshots) Object.assign(entry, snapshot);
-			// The rewrite just failed, so restore the live history without writing to the session.
-			this.#host.agent.replaceMessages(this.#host.buildDisplaySessionContext().messages);
-			throw error;
+		this.#host.recordAnchoredHistoryRewrite(anchoredTokensRemoved);
+		const patches = elidePatches(items);
+		if (anchoredTokensRemoved > 0) {
+			// The usage anchor now carries the removed tokens. Find it on the live
+			// branch, as `recordAnchoredHistoryRewrite` did: turns may have landed
+			// while the artifact was written.
+			const liveBranch = this.#host.sessionManager.getBranchView();
+			const liveCompaction = getLatestCompactionEntry(liveBranch);
+			const anchor =
+				liveBranch[findUsageAnchorIndex(liveBranch, liveCompaction ? liveBranch.lastIndexOf(liveCompaction) : -1)];
+			if (anchor?.type === "message" && anchor.message.role === "assistant" && anchor.message.contextSnapshot) {
+				patches.push({ entryId: anchor.id, message: { contextSnapshot: anchor.message.contextSnapshot } });
+			}
 		}
+		// Persists the pass as one appended `entry_patch` record; a failed write
+		// keeps it live and the next successful write lands it.
+		await this.#host.sessionManager.patchEntries(patches);
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.replaceMessagesFromSessionContext(sessionContext.messages);
 		this.#host.resetAdvisorRuntimes("shake");
@@ -2257,8 +2307,7 @@ export class SessionMaintenance {
 				const warning = this.#compactionDeadEndWarning("clear large tool output");
 				const entry = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
 				if (entry) {
-					entry.warning = warning;
-					await this.#host.sessionManager.rewriteEntries();
+					await this.#host.sessionManager.patchEntries([{ entryId: entry.id, entry: { warning } }]);
 				}
 				this.#host.emitNotice("warning", warning, "compaction");
 				return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
@@ -2996,6 +3045,7 @@ export class SessionMaintenance {
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.replaceMessagesFromSessionContext(sessionContext.messages);
 		this.#host.rebaseAfterCompaction();
+		this.#host.releaseBeforeCut();
 		// Compaction discarded the conversation history that carried the approved
 		// plan reference. Clear the sent-flag so #buildPlanReferenceMessage re-reads
 		// the plan from disk and re-injects it on the next turn (issue #1246).
@@ -3793,10 +3843,8 @@ export class SessionMaintenance {
 					const attempts = this.#incompleteRecoveryAttempts;
 					this.#incompleteRecoveryAttempts = 0;
 					const droppedEntryId = await this.#host.dropPersistedAssistantTurn(assistantMessage);
-					// Reparenting the live branch is insufficient when this terminal path
-					// appends no successor: on restart, the loader selects the last physical
-					// journal entry and revives the discarded length turn. Persist the branch
-					// marker/rewrite before blocking further continuation.
+					// This terminal path appends no successor. Record the new branch
+					// before blocking continuation so reload does not select the dropped turn.
 					if (droppedEntryId) await this.#host.sessionManager.discardEntryDurably(droppedEntryId);
 					const finalError = `Length-stop recovery gave up after ${attempts} consecutive \`length\` responses from ${assistantMessage.provider}/${assistantMessage.model} with no text or tool call. Try switching models or raising the model's max output tokens.`;
 					logger.warn("response.incomplete recovery cap reached; halting retries", {
@@ -3866,6 +3914,9 @@ export class SessionMaintenance {
 		const supersedeResult = this.#usesExperimentalContextManagement()
 			? undefined
 			: await this.#pruneStaleToolResults();
+		// A pass that blanked a result before the cut made that entry whole; it
+		// goes back to the store holding the blanked value.
+		if (supersedeResult) this.#host.sessionManager.recoolEntries();
 
 		const compactionSettings = this.#compactionSettings;
 		if (
@@ -3878,6 +3929,7 @@ export class SessionMaintenance {
 		// Skip if this was an error (non-overflow errors don't have usage data)
 		if (assistantMessage.stopReason === "error") return COMPACTION_CHECK_NONE;
 		const pruneResult = this.#usesExperimentalContextManagement() ? undefined : await this.#pruneToolOutputs();
+		if (pruneResult) this.#host.sessionManager.recoolEntries();
 		const maintenanceTokensFreed = (supersedeResult?.tokensSaved ?? 0) + (pruneResult?.tokensSaved ?? 0);
 		// `errorIsFromBeforeCompaction` (computed above) is the general
 		// "this assistant message predates the latest compaction" predicate here,
@@ -4882,8 +4934,9 @@ export class SessionMaintenance {
 			// `model` stands on another compaction boundary than the active model
 			// (it cannot replay a provider-native compaction, or can replay one the
 			// active model cannot), so neither the provider usage nor the live
-			// messages describe what it would be sent: count its own context.
-			const readerMessages = this.#host.buildDisplaySessionContext(model).messages;
+			// messages describe what it would be sent: count its own context. Only
+			// counted: the session stays on its model, so the cut stays on it too.
+			const readerMessages = this.#host.buildDisplaySessionContext(model, { measureOnly: true }).messages;
 			// The rebuild can return copies (secret deobfuscation), so the failed turn also matches by what
 			// it holds; at most one message is dropped, newest first, so an earlier reply sharing its
 			// millisecond stays counted.
@@ -4903,10 +4956,10 @@ export class SessionMaintenance {
 				tokenizer.countMessages(sentMessages, { excludeEncryptedReasoning: true });
 			return readerTokens <= fitBudget;
 		}
-		// Provider usage carries the reasoning the active model's request replayed,
-		// so it moves into `model`'s domain by the difference in replayed
-		// reasoning. Usage leaves out the anchor turn's own output, so this may
-		// subtract reasoning it never held; the local floor below still bounds it.
+		// Provider usage, with the anchor turn's own output that `getContextUsage`
+		// adds to it, carries the reasoning the active model's next request
+		// replays, so it moves into `model`'s domain by the difference in replayed
+		// reasoning over the retained turns; the local floor below still bounds it.
 		let replayedReasoningShift = 0;
 		if (tokenizer !== this.#tokenizer) {
 			const retained = activeExcludedMessage ? messages.filter(m => m !== activeExcludedMessage) : messages;
@@ -5103,9 +5156,10 @@ export class SessionMaintenance {
 	 * a maxFrames derived from the trigger threshold instead of the window:
 	 * `planArchive` truncates the oldest chars to fit, so the rebuilt entry
 	 * genuinely shrinks. The rebuilt entry keeps the stale entry's
-	 * `firstKeptEntryId`, so the kept tail is untouched, and persisting
-	 * through `appendCompaction()` lets the write-time superseded-compaction
-	 * elision drop the stale frame payload from the JSONL automatically.
+	 * `firstKeptEntryId`, so the kept tail is untouched. The stale entry stays
+	 * in the JSONL with its frames and archive text (nothing elides it on
+	 * write); in memory it goes to the cold store, since no context build
+	 * reads a compaction older than the one it starts from.
 	 */
 	async #rescueSnapcompactFrameOverflow(
 		branchEntries: SessionEntry[],
@@ -5187,6 +5241,7 @@ export class SessionMaintenance {
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.replaceMessagesFromSessionContext(sessionContext.messages);
 		this.#host.rebaseAfterCompaction();
+		this.#host.releaseBeforeCut();
 		// Same post-rewrite bookkeeping as the regular compaction append: the
 		// rebuilt context no longer carries the transient plan reference (#1246),
 		// and advisor cursors / todo phases were derived from the replaced
@@ -5572,14 +5627,20 @@ export class SessionMaintenance {
 		}
 		const preserveData = entry.preserveData;
 		const slot = preserveData?.[snapcompact.PRESERVE_KEY];
-		entry.preserveData = {
-			...preserveData,
-			[snapcompact.PRESERVE_KEY]: { ...(isRecord(slot) ? slot : {}), withoutThinking: view },
-		};
 		try {
-			await this.#host.sessionManager.rewriteEntries();
+			// Rejects, changing nothing, when the session no longer holds the entry.
+			await this.#host.sessionManager.patchEntries([
+				{
+					entryId: entry.id,
+					entry: {
+						preserveData: {
+							...preserveData,
+							[snapcompact.PRESERVE_KEY]: { ...(isRecord(slot) ? slot : {}), withoutThinking: view },
+						},
+					},
+				},
+			]);
 		} catch (error) {
-			entry.preserveData = preserveData;
 			logger.warn("Persisting the snapcompact archive without reasoning failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});
@@ -5937,8 +5998,9 @@ export class SessionMaintenance {
 					if (deadEndWarning && frameRescueResult) {
 						const stampEntry = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
 						if (stampEntry) {
-							stampEntry.warning = deadEndWarning;
-							await this.#host.sessionManager.rewriteEntries();
+							await this.#host.sessionManager.patchEntries([
+								{ entryId: stampEntry.id, entry: { warning: deadEndWarning } },
+							]);
 						}
 					}
 					// A successful frame rescue rewrote history and activated a new
@@ -6861,8 +6923,9 @@ export class SessionMaintenance {
 					? this.#projectExperimentalContextRolloverTokens(args)
 					: this.#projectCompactedContextTokens(args);
 			if (savedCompactionEntry.tokensAfter !== postRescueTokensAfter) {
-				savedCompactionEntry.tokensAfter = postRescueTokensAfter;
-				await this.#host.sessionManager.rewriteEntries();
+				await this.#host.sessionManager.patchEntries([
+					{ entryId: savedCompactionEntry.id, entry: { tokensAfter: postRescueTokensAfter } },
+				]);
 			}
 		}
 		const deadEndWarning = noProgressDeadEnd ? this.#compactionDeadEndWarning("clear large tool output") : undefined;
@@ -6875,8 +6938,9 @@ export class SessionMaintenance {
 			// collapsed transcript badges only the active entry.
 			const stampEntry = getLatestCompactionEntry(this.#host.sessionManager.getBranch()) ?? savedCompactionEntry;
 			if (stampEntry) {
-				stampEntry.warning = deadEndWarning;
-				await this.#host.sessionManager.rewriteEntries();
+				await this.#host.sessionManager.patchEntries([
+					{ entryId: stampEntry.id, entry: { warning: deadEndWarning } },
+				]);
 			}
 		}
 

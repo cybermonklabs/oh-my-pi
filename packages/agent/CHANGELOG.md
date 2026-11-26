@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Prune passes look up tool calls before the compaction boundary in an index built once per boundary and branch, instead of re-reading that history on every pass that misses a call
+
 ### Fixed
 
 - Counting a tool call whose arguments nest more than 40,000 levels deep (a resumed session can hold one) no longer fails with `Maximum call stack size exceeded`, which failed the first prompt after the resume, each turn's end, compaction and every context-usage reading
@@ -10,6 +14,9 @@
 - With full message-content capture on, a request whose history holds a tool call or result nested more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded` while its input messages are recorded, nor spends 1.5 s or more on each request recording them, and a tool span records such a tool call's arguments and result as JSON instead of `[object Object]`
 - Compaction of a conversation holding a tool call whose arguments nest more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded` while it writes the conversation for the summary or for OpenAI remote compaction
 - Fixed OpenTelemetry chat spans reporting the requested model as `gen_ai.response.model` when the provider recorded the model that actually served the turn ([#20466](https://github.com/can1357/oh-my-pi/pull/20466) by [@byhow](https://github.com/byhow))
+- The context figure that the status line and compaction read now counts `$` Python output, `@file` mentions and a `!` command's terminal images, and no longer counts a `!!` or `$$` output that no request carries
+- Counting a stored custom message whose content is neither text nor blocks no longer throws
+- After a compaction that kept no entry (an Anthropic native compaction that summarizes everything), the prune and shake passes start at that compaction, or at the turns added while it ran, instead of walking, and reading, the whole history on every pass
 
 ## [19.2.1] - 2026-11-25
 

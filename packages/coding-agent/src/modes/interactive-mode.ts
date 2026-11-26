@@ -157,12 +157,8 @@ import { shortenEmbeddedPaths, shortenPath, TRUNCATE_LENGTHS } from "../utils/re
 import { replaceTabs, truncateToWidth } from "../utils/text-width";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
 import { type CfgApproval, type CfgChangeRequest, setCfgApprovalHost } from "../internal-urls/cfg-protocol";
-import {
-	createTodoHudStateData,
-	getTodoHudVisibility,
-	TODO_HUD_STATE_CUSTOM_TYPE,
-	type TodoHudStateEntryData,
-} from "../tools/todo";
+import { GOAL_COMPLETED_CUSTOM_TYPE, TODO_HUD_STATE_CUSTOM_TYPE } from "../session/session-entries";
+import { createTodoHudStateData, getTodoHudVisibility, type TodoHudStateEntryData } from "../tools/todo";
 import { isClosedTodo } from "../tools/details/todo";
 import type { SpotlightDetails } from "../tools/details/spotlight";
 import { readArtifactText } from "../spotlight/sink";
@@ -4994,7 +4990,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (options?.reason === "completed") {
 			this.session.setGoalModeState(undefined);
 			this.sessionManager.appendModeChange("none");
-			this.sessionManager.appendCustomEntry("goal-completed", {
+			this.sessionManager.appendCustomEntry(GOAL_COMPLETED_CUSTOM_TYPE, {
 				objective: currentState?.goal?.objective,
 				tokensUsed: currentState?.goal?.tokensUsed,
 				tokenBudget: currentState?.goal?.tokenBudget,

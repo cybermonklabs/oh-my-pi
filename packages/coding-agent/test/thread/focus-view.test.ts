@@ -31,7 +31,7 @@ import { authService } from "../../src/thread/services/auth";
 import { identityThreadService } from "../../src/thread/services/identity";
 import { SubagentWorker } from "../../src/thread/subagent-worker";
 import { cfgTasksTodoClearDelay } from "../../src/tools/settings";
-import { TODO_HUD_STATE_CUSTOM_TYPE } from "../../src/tools/todo";
+import { TODO_HUD_STATE_CUSTOM_TYPE } from "../../src/session/session-entries";
 import { Composer } from "../../src/ui/composer/composer";
 import { statusSegs } from "../../src/ui/status/status-line";
 import type { FocusProbe, FocusProbeGlobals } from "../fixtures/focus-view-worker";
