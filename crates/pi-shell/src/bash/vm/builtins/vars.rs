@@ -3535,8 +3535,12 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				.as_ref()
 				.is_some_and(|(attrs, ..)| attrs.contains(Attrs::READONLY))
 		{
-			let keep = ctx.option(OptId::LocalvarUnset)?;
-			state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keep);
+			let keeps = if ctx.option(OptId::LocalvarUnset)? {
+				state::UnsetKeeps::AllLocals
+			} else {
+				state::UnsetKeeps::OwnLocals
+			};
+			state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keeps);
 			ctx.k.set_plain(ctx.cx.store, ctx.vp, s);
 			continue;
 		}
@@ -3557,8 +3561,12 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				.as_ref()
 				.is_some_and(|(attrs, ..)| attrs.contains(Attrs::READONLY))
 		{
-			let keep = ctx.option(OptId::LocalvarUnset)?;
-			state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keep);
+			let keeps = if ctx.option(OptId::LocalvarUnset)? {
+				state::UnsetKeeps::AllLocals
+			} else {
+				state::UnsetKeeps::OwnLocals
+			};
+			state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keeps);
 			ctx.k.set_cell_plain(ctx.cx.store, ctx.vp, i);
 			continue;
 		}
@@ -3586,8 +3594,12 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		}
 		match index {
 			None => {
-				let keep = ctx.option(OptId::LocalvarUnset)?;
-				state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keep);
+				let keeps = if ctx.option(OptId::LocalvarUnset)? {
+					state::UnsetKeeps::AllLocals
+				} else {
+					state::UnsetKeeps::OwnLocals
+				};
+				state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keeps);
 				if name == b"PATH" {
 					super::names::flush_hash(&mut ctx.k.root, ctx.cx.store, ctx.vp)?;
 				}

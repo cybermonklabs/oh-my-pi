@@ -1757,20 +1757,36 @@ pub fn store_var_below(
 	}
 }
 
-/// `unset name` with bash's dynamic scoping: a variable local to the
-/// running function stays declared but unset (it keeps hiding outer ones);
-/// one local to a calling function is removed from that scope, revealing
-/// the next outer variable, unless `keep_outer_locals` (`shopt -s
-/// localvar_unset`) treats it like the running function's own.
+/// Which scope bindings [`unset_var`] leaves declared but unset, still
+/// hiding the outer variables until their scope ends; it removes any
+/// other binding it finds, so the next outer variable shows through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsetKeeps {
+	/// bash: a local of the running function. A calling function's local
+	/// is removed, and so is a prefix assignment's temporary, a builtin's
+	/// or a function call's that no `local` names: bash's `makunbound`
+	/// keeps only a variable with the `local` attribute.
+	OwnLocals,
+	/// bash under `shopt -s localvar_unset`: a local of any function; a
+	/// temporary is still removed.
+	AllLocals,
+	/// zsh: every binding of a scope, temporaries too.
+	AllScoped,
+}
+
+/// `unset name` with bash's dynamic scoping: what stays declared but
+/// unset is `keeps` ([`UnsetKeeps`]); a binding it does not keep is
+/// removed from its scope, revealing the next outer variable (`x=1;
+/// x=3 eval 'unset x; echo $x'` prints 1, as in bash).
 pub fn unset_var(
 	root: &mut Root,
 	store: &mut dyn StateStore,
 	vp: &mut Vproc,
 	name: &[u8],
-	keep_outer_locals: bool,
+	keeps: UnsetKeeps,
 ) {
-	match unset_target(root, store, vp, name, keep_outer_locals) {
-		Ok(Some((at, true, var))) => {
+	match unset_target(root, store, vp, name, keeps) {
+		Ok(Unbind::Keep(at, var)) => {
 			// The local stays declared, unset, with its attributes
 			// (`local v=x; unset v; declare -p v` → `declare -- v`).
 			let kept = var.map(|v| {
@@ -1783,40 +1799,93 @@ pub fn unset_var(
 			});
 			put_scope(root, store, vp, at, name, kept);
 		},
-		Ok(Some((In::Vec(i), false, _))) => {
-			vp.scopes[i].vars.remove(name);
+		Ok(Unbind::Remove { at, call }) => {
+			for at in std::iter::once(at).chain(call) {
+				match at {
+					In::Vec(i) => {
+						vp.scopes[i].vars.remove(name);
+					},
+					In::Store(depth) => root.write(store, Change::Del(local_key(depth, name))),
+				}
+			}
 		},
-		Ok(Some((In::Store(depth), false, _))) => {
-			root.write(store, Change::Del(local_key(depth, name)));
-		},
-		Ok(None) => put_outer(root, store, vp, name, None),
+		Ok(Unbind::Outer) => put_outer(root, store, vp, name, None),
 		Err(err) => root.fail(err),
 	}
 }
 
-/// The scope [`unset_var`] acts on, whether the binding stays declared
-/// there, and its variable; `None`: no scope binds `name`.
+/// What [`unset_var`] does to a name.
+enum Unbind {
+	/// Leave the binding in scope `at` declared but unset; its variable.
+	Keep(In, Option<Var>),
+	/// Remove the binding from scope `at`, and from the function call's
+	/// own temporary scope `call` too.
+	Remove { at: In, call: Option<In> },
+	/// No scope binds the name.
+	Outer,
+}
+
+/// The binding [`unset_var`] acts on and what it does to it.
 fn unset_target(
 	root: &Root,
 	store: &mut dyn StateStore,
 	vp: &Vproc,
 	name: &[u8],
-	keep_outer_locals: bool,
-) -> Result<Option<(In, bool, Option<Var>)>, StoreError> {
+	keeps: UnsetKeeps,
+) -> Result<Unbind, StoreError> {
 	let Some(at) = level_at(root, store, vp, name, Level::Dynamic)? else {
-		return Ok(None);
+		return Ok(Unbind::Outer);
 	};
-	let current_func = level_at(root, store, vp, name, Level::Local)?;
-	let temp = !scope_is_func(store, vp, at)?;
-	let keep = Some(at) == current_func || keep_outer_locals || temp;
-	let var = match at {
-		In::Vec(i) => vp.scopes[i].vars.get(name).cloned().flatten(),
-		In::Store(depth) => match store.get(local_key(depth, name))? {
-			Some(Record::Var(v)) => Some(v.clone()),
-			_ => None,
-		},
+	// Read (and copied) only for a binding that stays.
+	let keep = |store: &mut dyn StateStore| -> Result<Unbind, StoreError> {
+		Ok(Unbind::Keep(at, var_at(store, vp, name, At::Scope(at))?.cloned()))
 	};
-	Ok(Some((at, keep, var)))
+	if keeps == UnsetKeeps::AllScoped {
+		return keep(store);
+	}
+	if !scope_is_func(store, vp, at)? {
+		// A temporary scope binds a prefix assignment, removed as bash
+		// removes its temporary environment's variable; or it is a trap's,
+		// whose `BASH_TRAPSIG` stands for bash setting the variable for
+		// the trap and putting the old value back after it (trap.c): that
+		// one stays unset until the trap ends.
+		if name == b"BASH_TRAPSIG" {
+			return keep(store);
+		}
+		return Ok(Unbind::Remove { at, call: None });
+	}
+	if var_at(store, vp, name, At::Scope(at))?.is_some_and(|v| v.attrs.contains(Attrs::TEMP)) {
+		// A function call's prefix assignment (`x=3 f`) that no `local`
+		// named: bash makes the call's temporary environment the
+		// function's scope, so the variable is gone from both. The call
+		// keeps its own copy in its temporary scope, just below.
+		return Ok(Unbind::Remove { at, call: call_copy(store, vp, at, name)? });
+	}
+	if keeps == UnsetKeeps::AllLocals || Some(at) == level_at(root, store, vp, name, Level::Local)? {
+		return keep(store);
+	}
+	Ok(Unbind::Remove { at, call: None })
+}
+
+/// The scope below function scope `at` when it is a temporary one that
+/// binds `name`: the function call's own temporary scope, holding the
+/// copy of the prefix assignment the call gave the function.
+fn call_copy(
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	at: In,
+	name: &[u8],
+) -> Result<Option<In>, StoreError> {
+	let below = match at {
+		In::Vec(0) | In::Store(0) => return Ok(None),
+		In::Vec(i) => In::Vec(i - 1),
+		In::Store(depth) => In::Store(depth - 1),
+	};
+	let binds = match below {
+		In::Vec(i) => vp.scopes[i].vars.contains_key(name),
+		In::Store(depth) => store.get(local_key(depth, name))?.is_some(),
+	};
+	Ok((binds && !scope_is_func(store, vp, below)?).then_some(below))
 }
 
 /// Store `var` (or unset with `None`) at `level` for `vp`.
@@ -3616,7 +3685,7 @@ mod tests {
 			Level::Local,
 		);
 		assert_eq!(get(&root, &mut store, &vp, "q"), Some(b"local".to_vec()));
-		unset_var(&mut root, &mut store, &mut vp, b"a", false);
+		unset_var(&mut root, &mut store, &mut vp, b"a", UnsetKeeps::OwnLocals);
 		assert_eq!(get(&root, &mut store, &vp, "a"), None);
 		assert!(
 			lookup_declared(&root, &mut store, &vp, b"a")
@@ -3686,7 +3755,7 @@ mod tests {
 		assert!(edit_var(&mut root, &mut store, &mut vp, b"LC_CTYPE", Level::Dynamic, edit).unwrap());
 		let t3 = locale_token(&root, &mut store, &vp, names).unwrap();
 		assert_ne!(t3, t2);
-		unset_var(&mut root, &mut store, &mut vp, b"LANG", false);
+		unset_var(&mut root, &mut store, &mut vp, b"LANG", UnsetKeeps::OwnLocals);
 		let t4 = locale_token(&root, &mut store, &vp, names).unwrap();
 		assert_ne!(t4, t3);
 		// Bound in a scope (temporary environment, `local`) or a subshell:
@@ -4036,6 +4105,122 @@ mod tests {
 		assert!(sub.scopes.is_empty());
 		assert_eq!(store.record(Key::Scope(0)), None);
 		assert_eq!(positional(&root, &mut store, &vp).unwrap(), Vec::<BString>::new());
+	}
+
+	/// `unset` removes a prefix assignment's temporary (a builtin's, and
+	/// both copies of a function call's) and a calling function's local;
+	/// it keeps the running function's local, any function's under
+	/// `localvar_unset`, a trap's `BASH_TRAPSIG`, and in zsh every binding;
+	/// in the store's scopes and in a subshell's alike.
+	#[test]
+	fn unset_removes_temporaries_and_keeps_locals() {
+		use UnsetKeeps::{AllLocals, AllScoped, OwnLocals};
+		/// What the name reads after the `unset`.
+		#[derive(Clone, Debug, PartialEq)]
+		enum After {
+			/// The value of the binding that shows through.
+			Shows(&'static str),
+			/// Declared but unset: it still hides the global.
+			Hidden,
+		}
+		use After::{Hidden, Shows};
+		let bound = |func: Option<&str>, value: &str, attrs: Attrs| {
+			let mut vars = VarMap::default();
+			vars.insert(BString::from("x"), Some(Var::scalar(value, attrs)));
+			Scope { vars, func: func.map(BString::from), ..Scope::default() }
+		};
+		let temp = || bound(None, "3", Attrs::EXPORT);
+		let call = || bound(Some("f"), "3", Attrs::EXPORT.with(Attrs::TEMP));
+		let caller = || bound(Some("f"), "2", Attrs::NONE);
+		let callee = || func_scope_named("g");
+		let cases = [
+			("a builtin's temporary", vec![temp()], OwnLocals, Shows("1")),
+			("a builtin's temporary, localvar_unset", vec![temp()], AllLocals, Shows("1")),
+			("a builtin's temporary in zsh", vec![temp()], AllScoped, Hidden),
+			("a call's temporary", vec![temp(), call()], OwnLocals, Shows("1")),
+			("a call's temporary, localvar_unset", vec![temp(), call()], AllLocals, Shows("1")),
+			(
+				"a call's temporary from a callee",
+				vec![temp(), call(), callee()],
+				OwnLocals,
+				Shows("1"),
+			),
+			("a call's temporary in zsh", vec![temp(), call()], AllScoped, Hidden),
+			(
+				"a temporary made local",
+				vec![temp(), bound(Some("f"), "3", Attrs::EXPORT)],
+				OwnLocals,
+				Hidden,
+			),
+			("the function's local", vec![caller()], OwnLocals, Hidden),
+			("a caller's local", vec![caller(), callee()], OwnLocals, Shows("1")),
+			("a caller's local, localvar_unset", vec![caller(), callee()], AllLocals, Hidden),
+			("a temporary over a local", vec![caller(), temp()], OwnLocals, Shows("2")),
+		];
+		let read = |root: &Root, store: &mut crate::bash::MemStore, vp: &Vproc, name: &[u8]| {
+			let value = lookup(root, store, vp, name)
+				.unwrap()
+				.and_then(Var::as_scalar)
+				.map(<[u8]>::to_vec);
+			match value.as_deref() {
+				Some(b"1") => Some(Shows("1")),
+				Some(b"2") => Some(Shows("2")),
+				Some(b"3") => Some(Shows("3")),
+				Some(other) => panic!("{} is {:?}", BStr::new(name), BStr::new(other)),
+				None if lookup_declared(root, store, vp, name).unwrap().is_some() => Some(Hidden),
+				None => None,
+			}
+		};
+		let (mut store, mut root, mut vp) = shell();
+		let mut sub = subshell(&root, &mut store, &vp);
+		for v in [&mut vp, &mut sub] {
+			store_var(
+				&mut root,
+				&mut store,
+				v,
+				b"x",
+				Some(Var::scalar("1", Attrs::NONE)),
+				Level::Global,
+			);
+			for (what, scopes, keeps, after) in cases.clone() {
+				let n = scopes.len();
+				for s in scopes {
+					push_scope(&mut root, &mut store, v, s);
+				}
+				unset_var(&mut root, &mut store, v, b"x", keeps);
+				assert_eq!(read(&root, &mut store, v, b"x"), Some(after), "{what}");
+				for _ in 0..n {
+					assert!(drop_scope(&mut root, &mut store, v));
+				}
+				assert_eq!(read(&root, &mut store, v, b"x"), Some(Shows("1")), "{what}: the global");
+			}
+			// A second `unset` removes the global the first one revealed.
+			push_scope(&mut root, &mut store, v, temp());
+			push_scope(&mut root, &mut store, v, call());
+			unset_var(&mut root, &mut store, v, b"x", OwnLocals);
+			unset_var(&mut root, &mut store, v, b"x", OwnLocals);
+			assert_eq!(read(&root, &mut store, v, b"x"), None, "unset twice");
+			assert!(drop_scope(&mut root, &mut store, v) && drop_scope(&mut root, &mut store, v));
+			assert_eq!(read(&root, &mut store, v, b"x"), None, "unset twice: no global");
+			// A trap's `BASH_TRAPSIG` hides the value from before the trap.
+			let seven = Some(Var::scalar("7", Attrs::NONE));
+			store_var(&mut root, &mut store, v, b"BASH_TRAPSIG", seven, Level::Global);
+			let mut vars = VarMap::default();
+			vars.insert(BString::from("BASH_TRAPSIG"), Some(Var::scalar("10", Attrs::NONE)));
+			push_scope(&mut root, &mut store, v, Scope { vars, ..Scope::default() });
+			unset_var(&mut root, &mut store, v, b"BASH_TRAPSIG", OwnLocals);
+			assert_eq!(lookup(&root, &mut store, v, b"BASH_TRAPSIG").unwrap(), None, "the trap's");
+			assert!(
+				lookup_declared(&root, &mut store, v, b"BASH_TRAPSIG")
+					.unwrap()
+					.is_some()
+			);
+			assert!(drop_scope(&mut root, &mut store, v));
+			let before = lookup(&root, &mut store, v, b"BASH_TRAPSIG")
+				.unwrap()
+				.and_then(Var::as_scalar);
+			assert_eq!(before, Some(&b"7"[..]), "after the trap");
+		}
 	}
 
 	/// The root's scope masks and nameref flag answer as the store does:

@@ -561,7 +561,8 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				ctx.usage(format!("{}: cannot unset: readonly variable", base.as_bstr()));
 				return done(1);
 			}
-			crate::bash::vm::state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, base, false);
+			let keeps = crate::bash::vm::state::UnsetKeeps::OwnLocals;
+			crate::bash::vm::state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, base, keeps);
 		}
 	}
 	let args = o.rest;
