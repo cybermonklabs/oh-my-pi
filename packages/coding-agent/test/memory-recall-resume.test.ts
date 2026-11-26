@@ -471,7 +471,7 @@ describe("Hindsight recall across a resume", () => {
 		mentalModelMaxRenderChars: 16_000,
 	};
 
-	/** What a Hindsight recall reads besides its bank: server, account, and tag filter. */
+	/** What a Hindsight recall reads besides its bank: server and tag filter, and the API token no scope names. */
 	interface HindsightScope {
 		hindsightApiUrl?: string;
 		hindsightApiToken?: string;
@@ -502,7 +502,16 @@ describe("Hindsight recall across a resume", () => {
 		return preparation?.context;
 	}
 
-	it("reuses the transcript's recall for the same server, account, bank and tag filter only", async () => {
+	/** `hindsight.apiUrl` for the test server with a key in its userinfo and in its query. */
+	function keyedApiUrl(user: string, password: string, key: string): string {
+		const url = new URL("http://localhost:8888/");
+		url.username = user;
+		url.password = password;
+		url.searchParams.set("key", key);
+		return url.href;
+	}
+
+	it("reuses the transcript's recall for the same server, bank and tag filter only, whatever the API token", async () => {
 		const dir = tempDir();
 		const live = startHindsight(newSession(dir), "project", "The deploy host is alpha-7.");
 		const sent = await hindsightFirstTurn(live);
@@ -512,10 +521,14 @@ describe("Hindsight recall across a resume", () => {
 		const sessions = dir.join("sessions");
 		const resumed = startHindsight(await SessionManager.open(sessionFile, sessions), "project", "moved to beta-9");
 		expect(await hindsightFirstTurn(resumed)).toBe(sent);
+		// The scope holds nothing derived from the token, so another token alone does not recall again.
+		const otherToken = startHindsight(await SessionManager.open(sessionFile, sessions), "project", "gamma-3", {
+			hindsightApiToken: "token",
+		});
+		expect(await hindsightFirstTurn(otherToken)).toBe(sent);
 
 		const elsewhere: Array<[bankId: string, scope: HindsightScope]> = [
 			["other", {}],
-			["project", { hindsightApiToken: "token" }],
 			["project", { hindsightApiUrl: "http://memory.internal:8888" }],
 			["project", { recallTags: ["project:other"] }],
 		];
@@ -523,5 +536,86 @@ describe("Hindsight recall across a resume", () => {
 			const state = startHindsight(await SessionManager.open(sessionFile, sessions), bankId, "gamma-3", scope);
 			expect(await hindsightFirstTurn(state)).toContain("gamma-3");
 		}
+	});
+
+	it("keeps nothing derived from the API token in the recall entry the session stores", async () => {
+		// The entry is written into the session, which is stored, copied and read wherever the transcript is.
+		const tokens = ["hsk-first-account-token", "hsk-second-account-token"];
+		const scopes: unknown[] = [];
+		for (const token of tokens) {
+			const live = startHindsight(newSession(tempDir()), "project", "alpha-7", { hindsightApiToken: token });
+			await hindsightFirstTurn(live);
+			const sessionFile = await writeTranscript(live.session.sessionManager);
+			const entries = live.session.sessionManager
+				.getEntries()
+				.flatMap(entry => (entry.type === "custom" && entry.customType === "memory_recall" ? [entry.data] : []));
+			expect(entries).toHaveLength(1);
+			const data = entries[0];
+			if (!data || typeof data !== "object" || !("scope" in data)) throw new Error("the recall entry has no scope");
+			scopes.push(data.scope);
+			const text = await Bun.file(sessionFile).text();
+			const hash = Bun.hash(token);
+			for (const derived of [token, hash.toString(16), hash.toString(36), hash.toString(10)]) {
+				expect(text).not.toContain(derived);
+			}
+		}
+		// A field derived from the token in any form differs between the two accounts.
+		expect(scopes[0]).toBe(scopes[1]);
+	});
+
+	it("keeps no key of `hindsight.apiUrl` in the recall entry, and reuses it under a spelling that differs only there", async () => {
+		// A key can sit in the URL's userinfo or query, and the entry is written into the session.
+		const dir = tempDir();
+		const keyed = keyedApiUrl("hs-user", "hs-url-secret", "hs-query-secret");
+		const live = startHindsight(newSession(dir), "project", "The deploy host is alpha-7.", {
+			hindsightApiUrl: keyed,
+		});
+		const sent = await hindsightFirstTurn(live);
+		expect(sent).toContain("alpha-7");
+		const sessionFile = await writeTranscript(live.session.sessionManager);
+		const text = await Bun.file(sessionFile).text();
+		for (const secret of ["hs-user", "hs-url-secret", "hs-query-secret"]) expect(text).not.toContain(secret);
+
+		const sessions = dir.join("sessions");
+		// The same server with no key, and with other keys in the same places.
+		const respelled = ["http://localhost:8888", keyedApiUrl("other", "other-secret", "other-key")];
+		for (const hindsightApiUrl of respelled) {
+			const resumed = startHindsight(await SessionManager.open(sessionFile, sessions), "project", "gamma-3", {
+				hindsightApiUrl,
+			});
+			expect(await hindsightFirstTurn(resumed)).toBe(sent);
+		}
+	});
+
+	it("recalls once afresh over an entry of the earlier scope format (with a token hash), then reuses the new one", async () => {
+		const dir = tempDir();
+		const sessions = dir.join("sessions");
+		const sessionManager = newSession(dir);
+		sessionManager.appendCustomEntry("memory_recall", {
+			version: 1,
+			scope: JSON.stringify([
+				"hindsight",
+				config.hindsightApiUrl,
+				Bun.hash(config.hindsightApiToken ?? "").toString(16),
+				"project",
+				[],
+				null,
+			]),
+			text: "<memories>\nearlier-format block\n</memories>",
+			memories: [],
+		});
+		const sessionFile = await writeTranscript(sessionManager);
+		// Each process ends before the next opens the file, as a resume does.
+		await sessionManager.close();
+
+		const first = startHindsight(await SessionManager.open(sessionFile, sessions), "project", "gamma-3");
+		const fresh = await hindsightFirstTurn(first);
+		expect(fresh).toContain("gamma-3");
+		await writeTranscript(first.session.sessionManager);
+		await first.session.sessionManager.close();
+
+		const second = startHindsight(await SessionManager.open(sessionFile, sessions), "project", "delta-4");
+		expect(await hindsightFirstTurn(second)).toBe(fresh);
+		expect(recallEntryCount(second.session.sessionManager)).toBe(2);
 	});
 });

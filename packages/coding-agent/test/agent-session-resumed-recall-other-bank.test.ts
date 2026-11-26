@@ -1,6 +1,6 @@
 /**
  * A session under Hindsight memory sends its first-turn recall as the system prompt's last block, and records it for
- * the bank it read. Hindsight reuses a recorded recall only for the same server, account, bank and tags. When the
+ * the bank it read. Hindsight reuses a recorded recall only for the same server, bank and tags. When the
  * configuration names another bank before the session is resumed, long after its cache entry lapsed, the resumed
  * process recalls from the new bank: the old bank's memories must not ride every request of the resumed process as
  * well, as they do not at the release.

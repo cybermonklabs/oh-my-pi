@@ -1,6 +1,6 @@
 /**
  * A session under Hindsight memory sends its first-turn recall as the system prompt's last block and records it with
- * the server, account, bank and tags it read. The Hindsight client strips a trailing slash from `hindsight.apiUrl`, so
+ * the server, bank and tags it read. The Hindsight client strips a trailing slash from `hindsight.apiUrl`, so
  * `http://host:port` and `http://host:port/` reach the same server and read the same bank. A process that resumes the
  * session within its cache entry's life under the second spelling, from a server that recalls the same memories, must
  * send the prompt the first process sent, byte for byte, as it does at the release.

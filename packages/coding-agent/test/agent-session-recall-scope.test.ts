@@ -1,6 +1,6 @@
 /**
- * A first-turn memory recall is recorded with the scope it read: the backend, and for Hindsight the server, account,
- * bank and tag filter. A resumed process reuses a recorded recall, as a system block or as a hidden message, only for
+ * A first-turn memory recall is recorded with the scope it read: the backend, and for Hindsight the server, bank and
+ * tag filter. A resumed process reuses a recorded recall, as a system block or as a hidden message, only for
  * the scope its live backend reads, so a configuration that names another bank or backend never sends the other
  * scope's memories again.
  */

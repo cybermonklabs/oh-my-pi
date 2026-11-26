@@ -13,7 +13,7 @@ import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import { type HindsightConfig, loadHindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import { prepareRetentionTranscript, sliceLastTurnsByUserBoundary } from "@oh-my-pi/pi-coding-agent/hindsight/content";
 import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
-import { countUserTurns, extractLastTurns, extractMessages } from "@oh-my-pi/pi-coding-agent/hindsight/transcript";
+import { countUserTurns, extractMessages } from "@oh-my-pi/pi-coding-agent/hindsight/transcript";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -162,21 +162,39 @@ describe("Hindsight per-turn reads of a session whose older bodies are cold", ()
 		expect(cold.coldStoreStats().materializations).toBe(beforeSecondCount);
 	});
 
-	it("slices the last turns from the newest entries only", async () => {
+	it("retains a last-turn window from the newest entries only, before the first marker and after it", async () => {
 		using dir = TempDir.createSync("@omp-hindsight-cold-");
 		const file = await writeSession(dir.path());
 		const cold = await open(file, true);
 		const whole = await open(file, false);
+		const client = new FakeHindsightApi();
+		const state = new HindsightSessionState({
+			sessionId: "cold-session",
+			client,
+			bankId: "bank",
+			config: config({ retainMode: "last-turn" }),
+			session: { sessionManager: cold } as object as AgentSession,
+			banksSet: new Set<string>(),
+			agentDir: dir.path(),
+		});
+		// The turn gate counts user turns, which reads each older question once (the test above); the window reads none.
+		expect(countUserTurns(cold)).toBe(NEWEST);
+		const materializations = cold.coldStoreStats().materializations;
 
-		const lastTurns = extractLastTurns(cold, 2);
-		expect(lastTurns.map(message => message.content.split(" ")[0])).toEqual([
-			`u${KEPT}`,
-			`a${KEPT}`,
-			`u${NEWEST}`,
-			`a${NEWEST}`,
+		// No marker yet: the last user turn, read back to the user turn before it.
+		await state.maybeRetainOnAgentEnd();
+		cold.appendMessage({ role: "user", content: "u-next", timestamp: 5 });
+		cold.appendMessage(assistant("a-next"));
+		// From the marker the first retain left: the turn after it.
+		await state.maybeRetainOnAgentEnd();
+		expect(cold.coldStoreStats().materializations).toBe(materializations);
+
+		expect(client.transcripts).toEqual([
+			prepareRetentionTranscript(sliceLastTurnsByUserBoundary(extractMessages(whole), 1), true, {
+				includeTimestamps: true,
+			}).transcript!,
+			prepareRetentionTranscript(extractMessages(cold).slice(-2), true, { includeTimestamps: true }).transcript!,
 		]);
-		expect(lastTurns).toEqual(sliceLastTurnsByUserBoundary(extractMessages(whole), 2));
-		expect(cold.coldStoreStats().materializations).toBe(0);
 	});
 
 	it("retains the whole session from the messages after the last retained entry, rebuilding after an in-place rewrite", async () => {

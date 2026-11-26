@@ -52,7 +52,7 @@ function memorySettingsValue(): Derived<Record<string, unknown>> {
 
 /**
  * The scope the first-turn recall of the backend `settings` select reads, as its records name it (`findPersistedRecall`):
- * Hindsight's server, account, bank and tag filter for `cwd`, or Mnemopi's banks and databases under `agentDir`, read
+ * Hindsight's server, bank and tag filter for `cwd`, or Mnemopi's banks and databases under `agentDir`, read
  * from the settings that name them alone, without creating anything. Undefined under a backend that recalls nothing
  * into the conversation, under Hindsight with no server, and when the scope cannot be read (a Mnemopi bank name no bank
  * can have): no recorded recall is of it, so none is reused.

@@ -23,7 +23,7 @@
 import * as path from "node:path";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { logger } from "@oh-my-pi/pi-utils";
-import { type HindsightClientApi, hindsightAccountToken, hindsightServer } from "./client";
+import { type HindsightClientApi, hindsightRecordedServer } from "./client";
 import type { HindsightConfig } from "./config";
 
 const DEFAULT_BANK_NAME = "omp";
@@ -123,10 +123,11 @@ export function deriveBankId(config: HindsightConfig, directory: string): string
 }
 
 /**
- * Identifies the server, account, bank and tag filter a first-turn recall reads, so a persisted recall is only reused
- * for the same ones. The server is the base URL the client sends to ({@link hindsightServer}), so spellings of
- * `hindsight.apiUrl` that reach the same server name the same one; the account is a hash of the API token without
- * surrounding whitespace ({@link hindsightAccountToken}).
+ * Identifies the server, bank and tag filter a first-turn recall reads, so a persisted recall is only reused for the
+ * same ones. The server is the base URL the client sends to, without a key the URL's userinfo or query can carry
+ * ({@link hindsightRecordedServer}), so spellings of `hindsight.apiUrl` that reach the same server name the same one.
+ * Nothing in it derives from a credential: the recall entry is written into the session, which is stored, copied and
+ * read wherever the transcript is.
  */
 export function hindsightRecallScope(
 	config: HindsightConfig,
@@ -134,8 +135,7 @@ export function hindsightRecallScope(
 ): string {
 	return JSON.stringify([
 		"hindsight",
-		hindsightServer(config),
-		Bun.hash(hindsightAccountToken(config)).toString(16),
+		hindsightRecordedServer(config),
 		scope.bankId,
 		scope.recallTags ?? [],
 		scope.recallTagsMatch ?? null,

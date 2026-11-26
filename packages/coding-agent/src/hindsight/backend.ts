@@ -388,8 +388,8 @@ async function reconcilePrimaryState(session: AgentSession): Promise<boolean> {
  * Structural compare of two resolved Hindsight configs. Both sides come from
  * `loadHindsightConfig`, so iterating one side's keys covers the whole shape
  * and a newly added config field is picked up without touching this compare.
- * The server and token compare as the client reaches the server and as the
- * recall scope names the account ({@link hindsightServer},
+ * The server and token compare as a request reaches the server and
+ * authenticates with the token ({@link hindsightServer},
  * {@link hindsightAccountToken}).
  */
 function hindsightConfigsEqual(a: HindsightConfig, b: HindsightConfig): boolean {
