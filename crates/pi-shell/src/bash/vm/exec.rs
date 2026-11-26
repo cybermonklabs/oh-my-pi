@@ -652,7 +652,7 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 			Some(r) => r.started && !r.exit_trap_started,
 			// A forked subshell has no run: it is its own exit, and its
 			// own flag is what keeps the trap from starting twice.
-			None => vp.transient && !vp.exit_trap_run,
+			None => vp.transient && vp.exit_trap_due,
 		}
 		&& start_exit_trap_once(k, vp, cx)
 	{
@@ -685,12 +685,14 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 /// `own_traps`, `trap_frames` and the frame scans all return to their
 /// pre-trap values when the trap's frame is popped. A root vproc is
 /// unaffected: its guard is its run's own flag, one per shell invocation.
+/// A fork bash ends with `sh_exit` runs no trap at all
+/// ([`Vproc::exit_trap_due`]).
 fn start_exit_trap_once(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bool {
 	if vp.transient {
-		if vp.exit_trap_run {
+		if !vp.exit_trap_due {
 			return false;
 		}
-		vp.exit_trap_run = true;
+		vp.exit_trap_due = false;
 	}
 	start_trap(k, vp, cx, TrapKey::Exit)
 }
@@ -4061,6 +4063,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					fds.set(0, Some(null.clone()));
 				}
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				child.exit_trap_due = info.stages[0].exit_trap;
 				if info.kind == SpawnKind::Background && !control {
 					ignore_async_signals(k, cx, &mut child);
 				}
@@ -4160,6 +4163,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						stdin = Some(FdRef::mem(r));
 					}
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
+					child.exit_trap_due = stage.exit_trap;
 					let level = stage_level(unit, stage.entry, false);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline
@@ -4370,6 +4374,7 @@ fn start_coproc(
 	fds.set(0, Some(FdRef::mem(in_r)));
 	fds.set(1, Some(FdRef::mem(out_w)));
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	child.exit_trap_due = unit.spawns[op.a as usize].stages[0].exit_trap;
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}

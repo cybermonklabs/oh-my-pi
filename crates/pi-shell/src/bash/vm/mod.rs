@@ -2797,7 +2797,7 @@ impl Vproc {
 			pending_traps: crate::bash::signal::SigSet::EMPTY,
 			stopped: false,
 			transient,
-			exit_trap_run: false,
+			exit_trap_due: true,
 			jobs: proc::JobTable::default(),
 			last_bg: proc::LastBg::default(),
 			getopts: proc::GetoptsState { optind: None, next: None, at: None },

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The embedded shell runs a forked command's own EXIT trap where bash does: a `( … )` subshell, a coprocess, a simple command's fork, a substitution, and a `{ …; }` group that is async with no pipe or in a pipe and not async. A trap set inside a forked `if`, `case`, `while`, `until`, `for`, or inside a group that is both piped and async, no longer runs when that child ends, so a cleanup trap in a piped or backgrounded loop body no longer fires early.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

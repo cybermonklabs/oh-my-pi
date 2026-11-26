@@ -248,9 +248,10 @@ struct ProcImage {
 	pending_traps: SigSet,
 	stopped:       bool,
 	transient:     bool,
-	/// This vproc's EXIT trap has already been started (a forked subshell
-	/// has no `Run` to keep the flag on).
-	exit_trap_run: bool,
+	/// This vproc still runs its EXIT trap when it ends (a forked subshell
+	/// has no `Run` to keep the flag on, and a forked compound bash ends
+	/// with `sh_exit` never runs one).
+	exit_trap_due: bool,
 	procsubs:      Vec<(u32, i32)>,
 	coprocs:       Vec<super::proc::Coproc>,
 	restore_opts:  Vec<BString>,
@@ -608,7 +609,7 @@ impl Shell {
 				pending_traps: p.pending_traps,
 				stopped: p.stopped,
 				transient: p.transient,
-				exit_trap_run: p.exit_trap_run,
+				exit_trap_due: p.exit_trap_due,
 				procsubs: p.procsubs.clone(),
 				coprocs: p.coprocs.clone(),
 				restore_opts: p.restore_opts.clone(),
@@ -840,7 +841,7 @@ impl Shell {
 			vp.out = p.out.into();
 			vp.pending_traps = p.pending_traps;
 			vp.stopped = p.stopped;
-			vp.exit_trap_run = p.exit_trap_run;
+			vp.exit_trap_due = p.exit_trap_due;
 			vp.procsubs = p.procsubs;
 			vp.coprocs = p.coprocs;
 			vp.restore_opts = p.restore_opts;

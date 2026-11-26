@@ -437,6 +437,11 @@ struct Lower {
 	/// substitution body: its words are [`WordKind::Text`] (no tilde
 	/// expansion).
 	text:          bool,
+	/// The and-or list being lowered is the body of a `&`, so bash forks
+	/// its command with `asynchronous` set ([`Lower::forked_exit_trap`]).
+	/// Taken by [`Lower::pipeline`]: a fork turns `asynchronous` off, so
+	/// nothing lowered below the fork is async any more.
+	async_job:     bool,
 }
 
 /// The line starts of a unit's source (unit-relative offsets), scanned on
@@ -506,6 +511,7 @@ impl Lower {
 			cond: 0,
 			features,
 			text: false,
+			async_job: false,
 		}
 	}
 
@@ -579,11 +585,16 @@ impl Lower {
 					self.unit.ops[at as usize].flags |= Op::DISOWN;
 				}
 				let entry = self.here();
-				self.and_or(ao)?;
+				let exit_trap = self.job_exit_trap(ao);
+				self.async_job = true;
+				let res = self.and_or(ao);
+				self.async_job = false;
+				res?;
 				self.emit(Opcode::SubExit, 0, 0, ao_id);
 				let end = self.here();
 				let s = &mut self.unit.spawns[spawn as usize];
-				s.stages.push(StageIr { entry, pipe_stderr: false });
+				s.stages
+					.push(StageIr { entry, pipe_stderr: false, exit_trap });
 				s.end = end;
 			} else {
 				self.and_or(ao)?;
@@ -602,6 +613,10 @@ impl Lower {
 		let n = rest.len();
 		if n > 0 {
 			self.cond += 1;
+			// `a && b &`: bash forks the whole connection
+			// (`CMD_FORCE_SUBSHELL`), so neither pipeline is the async
+			// command.
+			self.async_job = false;
 		}
 		self.pipeline(ao.first())?;
 		for (i, (op, p)) in rest.enumerate() {
@@ -622,6 +637,10 @@ impl Lower {
 
 	fn pipeline(&mut self, p: st::Pipeline<'_>) -> R {
 		let pid = p.id().0;
+		// The fork of a stage is the async command only while this pipeline
+		// is the body of a `&`; anything lowered below it is inside a fork,
+		// where bash has turned `asynchronous` off.
+		let async_job = std::mem::take(&mut self.async_job);
 		self.node(p.id(), NodeKind::Pipeline, p.span());
 		let time = p.time();
 		if time.is_some() {
@@ -643,7 +662,11 @@ impl Lower {
 			self.emit(Opcode::Spawn, spawn, 0, pid);
 			let mut irs = Vec::with_capacity(stages.len());
 			for stage in stages {
-				irs.push(StageIr { entry: self.here(), pipe_stderr: stage.pipe_stderr() });
+				irs.push(StageIr {
+					entry:       self.here(),
+					pipe_stderr: stage.pipe_stderr(),
+					exit_trap:   self.forked_exit_trap(stage, true, async_job),
+				});
 				self.command(stage)?;
 				self.emit(Opcode::SubExit, 0, 0, stage.id().0);
 			}
@@ -660,6 +683,45 @@ impl Lower {
 			self.emit(Opcode::TimeEnd, 0, u32::from(t.posix), pid);
 		}
 		Ok(())
+	}
+
+	/// Whether a fork of `cmd` runs the forked child's own EXIT trap when
+	/// it ends ([`StageIr::exit_trap`]). bash forks a compound command for
+	/// a pipe or a `&` (`shell_control_structure`) and ends that child with
+	/// `subshell_exit`, which runs the trap, only for a `{ …; }` group that
+	/// is either async with no pipe or in a pipe and not async
+	/// (`execute_cmd.c:719-729`); every other forked compound ends with
+	/// `sh_exit`, which runs none. A `( … )` subshell runs it inside
+	/// `execute_in_subshell` (`execute_cmd.c:1841`) whatever its pipes and
+	/// `&` are, and a simple command, which forks in
+	/// `execute_simple_command` instead, runs it too.
+	fn forked_exit_trap(&self, cmd: st::Command<'_>, piped: bool, background: bool) -> bool {
+		if self.unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+			return true;
+		}
+		match cmd.kind() {
+			st::CommandKind::Simple(_) | st::CommandKind::Subshell(_) => true,
+			st::CommandKind::Brace(_) => piped != background,
+			_ => false,
+		}
+	}
+
+	/// Whether the fork of the and-or list a `&` makes asynchronous runs
+	/// the child's own EXIT trap. bash forks a connection (`a && b &`) as a
+	/// whole and a pipeline (`a | b &`) element by element, and neither of
+	/// those forks runs the trap; a lone command decides by its own kind
+	/// ([`Lower::forked_exit_trap`]).
+	fn job_exit_trap(&self, ao: st::AndOr<'_>) -> bool {
+		if self.unit.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+			return true;
+		}
+		if ao.rest().len() > 0 {
+			return false;
+		}
+		ao.first()
+			.stages()
+			.one()
+			.is_some_and(|cmd| self.forked_exit_trap(cmd, false, true))
 	}
 
 	fn cond_list(&mut self, list: st::List<'_>) -> R {
@@ -724,7 +786,9 @@ impl Lower {
 				self.emit(Opcode::SubExit, 0, 0, id);
 				let end = self.here();
 				let s = &mut self.unit.spawns[spawn as usize];
-				s.stages.push(StageIr { entry, pipe_stderr: false });
+				// `execute_in_subshell` runs a `( … )` child's EXIT trap.
+				s.stages
+					.push(StageIr { entry, pipe_stderr: false, exit_trap: true });
 				s.end = end;
 				self.emit(Opcode::Leave, 0, 0, id);
 			},
@@ -1001,7 +1065,9 @@ impl Lower {
 				self.emit(Opcode::SubExit, 0, 0, id);
 				let end = self.here();
 				let s = &mut self.unit.spawns[spawn as usize];
-				s.stages.push(StageIr { entry, pipe_stderr: false });
+				// `execute_coproc` runs the coprocess's EXIT trap.
+				s.stages
+					.push(StageIr { entry, pipe_stderr: false, exit_trap: true });
 				s.end = end;
 			},
 		}
@@ -1038,6 +1104,9 @@ impl Lower {
 			cond:          0,
 			features:      self.features,
 			text:          false,
+			// A function body is never the command a `&` makes asynchronous:
+			// bash's `execute_function` runs it with `asynchronous` off.
+			async_job:     false,
 		};
 		sub.command(cmd)?;
 		sub.emit(Opcode::End, 0, 0, root);
