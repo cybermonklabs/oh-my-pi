@@ -24,6 +24,8 @@ import {
 	parseStreamingJsonThrottled,
 	readSseEvents,
 	runNested,
+	stringifyDeepJson,
+	structuredCloneDeep,
 } from "@oh-my-pi/pi-utils";
 import { NO_AUTH_SENTINEL } from "../auth-retry";
 import { renderDemotedThinking } from "../dialect/demotion";
@@ -1296,7 +1298,8 @@ function withoutDeclinedFallbackOutput(content: AssistantMessage["content"]): As
  * blocks on either side, so the echo must not collapse or move it.
  */
 function refusalContinuationPrefix(content: AssistantMessage["content"]): AssistantMessage["content"] {
-	const prefix = structuredClone(content.filter(block => block.type !== "toolCall"));
+	// The echo keeps the refused turn's server tool calls, whose input the model writes as any JSON.
+	const prefix = structuredCloneDeep(content.filter(block => block.type !== "toolCall"));
 	const last = prefix.at(-1);
 	if (last?.type === "text") last.text = last.text.trimEnd();
 	return prefix;
@@ -1342,7 +1345,7 @@ function fallbackCreditRequestBody(
 	targetModelId: string,
 	continuation: ContentBlockParam[] | undefined,
 ): MessageCreateParamsStreaming {
-	const body = structuredClone(redemption.params);
+	const body = structuredCloneDeep(redemption.params);
 	body.model = targetModelId;
 	body.fallback_credit_token = redemption.token;
 	delete body.fallbacks;
@@ -2508,7 +2511,8 @@ const streamAnthropicOnce = (
 					const finalJson =
 						block[kStreamingPartialJson].length > 0
 							? block[kStreamingPartialJson]
-							: JSON.stringify(block.arguments ?? {});
+							: // Arguments the model sent whole in `content_block_start` are any JSON, as deep as it writes them.
+								(stringifyDeepJson(block.arguments ?? {}, { probeDepth: true }) as string);
 					// Keep malformed calls non-fatal, but never execute their auto-closed previews.
 					block.arguments = parseToolCallArguments(finalJson);
 					if (isRecord(block.arguments) && "__parseError" in block.arguments) {
@@ -3236,11 +3240,11 @@ const streamAnthropicOnce = (
 									output.fallbackCreditHandle = {
 										token: stopDetails.fallback_credit_token,
 										prefillClaim: stopDetails.fallback_has_prefill_claim,
-										params: structuredClone(params),
+										params: structuredCloneDeep(params),
 										betas: Array.from(requestExtraBetas),
 										betaHeader: sentBetaHeader,
 										expiresAt: Date.now() + FALLBACK_CREDIT_TTL_MS,
-										refusedContent: output.content ? structuredClone(output.content) : undefined,
+										refusedContent: output.content ? structuredCloneDeep(output.content) : undefined,
 									};
 								}
 								if (!output.errorMessage) {

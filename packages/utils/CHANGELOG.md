@@ -22,6 +22,7 @@
 - Added `jsonDeepEquals`, `Bun.deepEquals` (not strict) for JSON-shaped data of any depth, which walks arrays and plain objects on its own stack
 - Added a `space` option to `stringifyDeepJson`, which indents as `JSON.stringify` does a value nested at most `INDENTED_JSON_LEVELS` (1,000) levels deep and writes a deeper one without indentation, and `nestsDeeperThan`, the depth check it uses, which imports nothing so a browser bundle can use it
 - Added a `probeDepth` option to `stringifyDeepJson`: it checks the depth first, so a value nested past `DEEP_JSON_LEVELS` (10,000) levels, the new export where a writer should switch to the iterative one, goes straight to it instead of first spending 1.5 s or more in a `JSON.stringify` that runs out of stack; with `space`, a value past `INDENTED_JSON_LEVELS` no longer pays that attempt either
+- Added `structuredCloneDeep`, `structuredClone` that also copies a value nested deeper than its recursion allows (Bun's runs out of stack near 40,000 levels), and `isStackOverflow`, the check of the engine's `Maximum call stack size exceeded` it and `stringifyDeepJson` fall back on. Past that depth the copy keeps less than `structuredClone`: it walks the value's arrays and plain objects itself, so what they share stays shared and a cycle through them stays a cycle, while each other object (a `Map`, `Set`, `Date`, typed array, class instance) is copied by a `structuredClone` call of its own, which keeps its type but not what it shares with the rest, and a value nested past `structuredClone`'s reach inside one still throws
 
 ### Changed
 
@@ -30,6 +31,8 @@
 ### Fixed
 
 - Fixed `cloneJsonTree` failing with `Maximum call stack size exceeded` on a tree nested more than about 22,500 levels deep; it keeps its own stack, and a cycle throws a `TypeError`
+- Fixed `stringifyDeepJson` writing a value a second time, and so calling its `toJSON` methods and getters again, when one of them threw a `RangeError`; only the engine's stack overflow (`Maximum call stack size exceeded`) now falls back to the iterative writer
+- Fixed `nestsDeeperThan`, and so `stringifyDeepJson`'s `space` and `probeDepth`, calling a value's getters: a getter ran twice and a second read could answer differently, one behind a `toJSON` that `JSON.stringify` never reads could throw, and an array was read through an iterator `JSON.stringify` never calls. The check now reads own data properties only, and skips an object whose `toJSON` is a function, as `JSON.stringify` does; a field named `toJSON` that holds data, as `JSON.parse` makes of one, is a key like any other
 - Fixed `extractRetryHint` ignoring a wait or reset window stated as a Go duration such as `try again in 6m0s`, `try again in 1m30s` or `resets in 1h30m`: its parts now add up, so a caller waits the time the provider states instead of its own backoff
 - Fixed test processes (`PI_TEST_RUNTIME=1` or a Bun test entrypoint) loading `~/.env` and the config root's `.env` (`~/.omp/.env`), which put the developer's auth broker, tokens and provider keys back into a test's environment; the agent directory's and project's `.env` files still load
 - Fixed `ChildProcess.kill()` and disposing a `ChildProcess` reporting the process's exit as an unhandled rejection when the process exits before anyone waits on it
