@@ -10,6 +10,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as pluginHelpers from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { clearOmpExtensionCliRoots } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
+import { toExtensionPathEntry } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import {
@@ -131,7 +132,12 @@ describe("outer startup collaboration gate", () => {
 				return {
 					session: testSession.session,
 					setToolUIContext: () => {},
-					extensionsResult: options.preloadedExtensions,
+					extensionsResult: {
+						...options.preloadedExtensions,
+						preparedExtensions: options.preloadedExtensions.preparedExtensions?.map(prepared =>
+							toExtensionPathEntry(prepared),
+						),
+					},
 					eventBus: options.eventBus,
 				};
 			},

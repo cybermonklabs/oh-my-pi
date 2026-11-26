@@ -5,6 +5,7 @@
 ### Breaking Changes
 
 - `providers.fetch` values `native`, `trafilatura`, and `lynx` are replaced by a single `local` value for the in-process reader engine.
+- `discoverExtensionPaths()` and `discoverSessionExtensionPaths()` return `{ path, scope }` entries instead of path strings, as do the `deferredPaths` of `loadSessionExtensions()`; `AgentSession.extensionPaths`, `AgentSessionConfig.extensionPaths` and `ToolSession.extensionPaths` list such entries, and each `PreparedExtension` carries the `scope` its extension was found at (`project`, `user`, `explicit` or `inline`)
 
 ### Added
 
@@ -17,6 +18,7 @@
 - URL reads keep cookies across redirects, follow meta refresh, and fall back to the headless browser when a site blocks plain fetch.
 - URL reads use the native reader for X, YouTube, docs.rs, Discourse, and Mastodon; raw reads still skip site-specific rendering.
 - Debugger attach detects the target executable natively, and Windows eval probes no longer need `taskkill.exe` for cleanup.
+- `loadExtensions()`, `importExtensionModule()`, and the `preloadedExtensionPaths` of `CreateAgentSessionOptions` and of `ExecutorOptions`, also take `{ path, scope }` entries; a bare path is read as `explicit`, and so is a prepared extension without a `scope` given to `bindPreparedExtensions()`, in `CreateAgentSessionOptions.preloadedPreparedExtensions` or `.preloadedExtensions`, or in `ExecutorOptions.preloadedPreparedExtensions`
 
 ### Fixed
 
@@ -38,6 +40,10 @@
 - Renaming a session from `/resume` accepts keyboard input again and returns focus to the picker after saving or cancelling ([#20548](https://github.com/can1357/oh-my-pi/issues/20548)).
 - Custom composer shapes can add blank rows above the input and keep the caret on the text row ([#20532](https://github.com/can1357/oh-my-pi/issues/20532)).
 - Fixed ACP and RPC `/mcp` commands to respect project-server precedence, enable/disable overrides, and the session working directory. ([#20499](https://github.com/can1357/oh-my-pi/pull/20499) by [@eggpeat](https://github.com/eggpeat))
+- Fixed a parked subagent revived from its stored transcript running on other settings than when revived in memory (its model, thinking level, tools, LSP and cache-warming values, and wake-turn time limit); both revives now build from one spawn spec stored in `session_init`
+- Fixed an edited `session_init` record widening what a subagent revived from it may do: its ids and artifacts directory now come from the live registry entry, its credential source and workspace roots from the live parent (the root session where the parent is not live), its cost gate and prepared extensions from that session whatever the record's list of live inputs names, and its extension roots from that session too, without their explicit list where the record leaves them out; its task depth and wake limits are held to the live parent chain and settings, its cache warming is held to `streaming` as every spawn sets it, the workspace roots of its file's header are dropped, and of its stored settings overlay only the settings a spawn writes are restored
+- Fixed a subagent revived from its stored transcript after the root session moved to another directory being built in the root's directory while its tools ran in its own: it now builds in its own directory, where it finds its project's custom tools, MCP servers, extensions, custom commands and memory; where its live parent (or the root) works in another directory, it takes none of that directory's custom-tool paths, MCP manager, or project and user extensions (it discovers those, plugins included, in its own directory under the root session's extension policy, and keeps only that session's explicit and inline extensions), builds on the main thread, and still masks that project's secrets (`.omp/secrets.yml`) beside its own
+- Fixed a session's task tool offering the agents that the first session in the same directory had discovered under other extension roots (such as another session's `--extension` agents under `--no-extensions`); each task tool now lists the agents of its own session's extension roots
 
 ### Removed
 

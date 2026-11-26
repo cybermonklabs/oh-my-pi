@@ -2631,15 +2631,45 @@ export interface Extension {
 }
 
 /**
+ * Where discovery found an extension: a project's own (its native module or hook, a plugin of project scope), the
+ * user's (the agent directory's module or hook, a plugin of user scope), an explicit or configured path or a hook of
+ * such a package root (`--extension`, `additionalExtensionPaths`, the `extensions` setting), or a host's inline
+ * factory. A file found at project level and at another level is not a project's own.
+ */
+export type ExtensionScope = "project" | "user" | "explicit" | "inline";
+
+/** An extension source path with the scope discovery found it at, as sessions forward it to their children. */
+export interface ExtensionPathEntry {
+	path: string;
+	scope: ExtensionScope;
+}
+
+/**
  * Imported extension factory detached from any session runtime. The same
  * prepared module may be rebound to multiple session-scoped ExtensionAPI
- * instances without evaluating its module graph again.
+ * instances without evaluating its module graph again. It keeps the scope of
+ * the entry it was imported from.
  */
-export interface PreparedExtension {
-	path: string;
+export interface PreparedExtension extends ExtensionPathEntry {
 	resolvedPath: string;
 	factory: ExtensionFactory | null;
 	error: string | null;
+}
+
+/** A prepared extension as a host may build it: one with no `scope` is read as `explicit`. */
+export type PreparedExtensionInput = Omit<PreparedExtension, "scope"> & { scope?: ExtensionScope };
+
+/**
+ * The entry of an extension source a caller passed. A bare path, or a host-built prepared extension with no
+ * `scope`, is the caller's own file: `explicit`. A value with a scope is returned as is.
+ */
+export function toExtensionPathEntry(input: PreparedExtensionInput): PreparedExtension;
+export function toExtensionPathEntry(input: string | ExtensionPathEntry): ExtensionPathEntry;
+export function toExtensionPathEntry(
+	input: string | ExtensionPathEntry | PreparedExtensionInput,
+): ExtensionPathEntry | PreparedExtensionInput {
+	if (typeof input === "string") return { path: input, scope: "explicit" };
+	return input.scope === undefined ? { ...input, scope: "explicit" } : input;
 }
 
 /** Result of loading extensions. */

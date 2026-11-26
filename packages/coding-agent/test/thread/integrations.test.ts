@@ -7,11 +7,11 @@ import { logger, removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../../src/config/model-registry";
 import type { CustomTool } from "../../src/extensibility/custom-tools/types";
 import { bindPreparedExtensions, importExtensionModule } from "../../src/extensibility/extensions/loader";
-import type { PreparedExtension } from "../../src/extensibility/extensions/types";
+import type { ExtensionScope, PreparedExtension } from "../../src/extensibility/extensions/types";
 import { type LocalProtocolOptions, resolveLocalRoot } from "../../src/internal-urls/local-protocol";
 import { MCPManager } from "../../src/mcp/manager";
 import type { MCPStdioServerConfig } from "../../src/mcp/types";
-import type { ExecutorOptions } from "../../src/task/executor";
+import type { SubagentRunOptions } from "../../src/task/executor";
 import { isMainThread } from "../../src/thread/identity";
 import { authService } from "../../src/thread/services/auth";
 import {
@@ -190,7 +190,7 @@ describe("integrations thread service", () => {
 		let artifacts = path.join(dir, "artifacts-a");
 		const local: LocalProtocolOptions = { getArtifactsDir: () => artifacts, getSessionId: () => "parent" };
 		const roots = { explicit: ["/ext"], mode: "merge" as const, configured: [], configuredLevel: "user" as const };
-		const options: ExecutorOptions = {
+		const options: SubagentRunOptions = {
 			cwd: dir,
 			agent: { name: "probe", description: "probe", systemPrompt: "", source: "bundled" },
 			task: "t",
@@ -222,7 +222,10 @@ describe("integrations thread service", () => {
 	}, 20_000);
 
 	it("re-binds a parent-prepared extension against the worker's own ExtensionAPI", async () => {
-		const prepared = await importExtensionModule(path.join(FIXTURES, "integrations-extension.ts"), dir);
+		const prepared = await importExtensionModule(
+			{ path: path.join(FIXTURES, "integrations-extension.ts"), scope: "explicit" },
+			dir,
+		);
 		expect(prepared.error).toBeNull();
 		const local = await bindPreparedExtensions([prepared], dir);
 		expect(local.extensions.flatMap(extension => [...extension.commands.keys()])).toEqual(["thread-main"]);
@@ -234,13 +237,17 @@ describe("integrations thread service", () => {
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const inline: PreparedExtension = {
 			path: "<inline-0>",
+			scope: "inline",
 			resolvedPath: "<inline-0>",
 			factory: function sdkInlineFactory(pi) {
 				pi.registerCommand("inline-hook", { description: "SDK inline factory", handler: async () => {} });
 			},
 			error: null,
 		};
-		const fileBacked = await importExtensionModule(path.join(FIXTURES, "integrations-extension.ts"), dir);
+		const fileBacked = await importExtensionModule(
+			{ path: path.join(FIXTURES, "integrations-extension.ts"), scope: "explicit" },
+			dir,
+		);
 
 		// Two worker-hosted spawns: neither treats the `<inline-0>` source id as a module to import.
 		for (let spawn = 0; spawn < 2; spawn++) {
@@ -252,5 +259,29 @@ describe("integrations thread service", () => {
 		// The lost hooks are reported by the parent once, naming the extension, not dropped silently.
 		const reports = warn.mock.calls.filter(([, context]) => context?.extension === inline.path);
 		expect(reports.map(([, context]) => context)).toEqual([{ extension: "<inline-0>", factory: "sdkInlineFactory" }]);
+	}, 20_000);
+
+	it("keeps each prepared extension's scope when it crosses to the worker and back to main", async () => {
+		const prepared = await importExtensionModule(
+			{ path: path.join(FIXTURES, "integrations-extension.ts"), scope: "explicit" },
+			dir,
+		);
+		const scopes: ExtensionScope[] = ["explicit", "user", "inline", "project"];
+		let received: unknown;
+		const tool: CustomTool = {
+			name: "extensions_tool",
+			label: "extensions_tool",
+			description: "Main-defined tool the worker calls with the prepared extensions it was sent.",
+			parameters: { type: "object", properties: {} },
+			async execute(_toolCallId, params) {
+				received = params;
+				return { content: [{ type: "text", text: "done" }], details: undefined };
+			},
+		};
+		// The worker decodes the arguments main sent, then encodes them again for its call of main's tool.
+		const extensions = scopes.map(scope => ({ ...prepared, scope }));
+		const outcome = await probe.customCall(toWorkerCustomTool(tool), registry, { extensions });
+		expect(outcome.error).toBeUndefined();
+		expect(received).toMatchObject({ extensions: scopes.map(scope => ({ path: prepared.path, scope })) });
 	}, 20_000);
 });

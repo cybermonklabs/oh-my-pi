@@ -41,6 +41,9 @@ import {
 import { listOmpExtensionRoots, type OmpExtensionRoot } from "./omp-extension-roots";
 import { resolvePluginStdioPaths } from "./substitute-plugin-root";
 
+// Its own literal, not `OMP_PLUGINS_PROVIDER_ID`: `omp-extension-roots` reaches this module again through its own
+// imports, so the registration below can run while that module is still loading (a test that imports it first read
+// the binding before its initialization).
 const PROVIDER_ID = "omp-plugins";
 const DISPLAY_NAME = "OMP Extension Packages";
 const DESCRIPTION =
@@ -159,6 +162,7 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 	const results = await Promise.all(
 		tasks.map(({ root, hookType }) =>
 			loadFilesFromDir<Hook>(ctx, path.join(root.path, "hooks", hookType), PROVIDER_ID, root.level, {
+				origin: root.origin,
 				transform: (name, _content, filePath, source) => {
 					const baseName = name.includes(".") ? name.slice(0, name.lastIndexOf(".")) : name;
 					const tool = baseName === "*" ? "*" : baseName;

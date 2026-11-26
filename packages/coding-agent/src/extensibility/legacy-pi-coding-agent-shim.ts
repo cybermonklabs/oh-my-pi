@@ -918,7 +918,7 @@ export class DefaultPackageManager {
 			}
 		}
 
-		const extensions = extensionPaths.map(extensionPath => {
+		const extensions = extensionPaths.map(({ path: extensionPath }) => {
 			const resolvedPath = path.resolve(extensionPath);
 			const plugin = pluginByExtensionPath.get(resolvedPath);
 			const agentDirRelative = path.relative(path.resolve(this.#agentDir), resolvedPath);

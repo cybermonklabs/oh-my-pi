@@ -1,11 +1,16 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { Effort, Model } from "@oh-my-pi/pi-ai";
 import type { ModelRegistry } from "../config/model-registry";
 import { cfgModelRoles } from "../config/model-settings";
 import { formatModelSelectorValue, parseModelString } from "../config/model-selector";
 import { formatModelString, formatModelStringWithRouting } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
-import { AUTO_THINKING, concreteThinkingLevel, resolveThinkingLevelForModel } from "../thinking/levels";
+import {
+	AUTO_THINKING,
+	clampThinkingLevelToCeiling,
+	concreteThinkingLevel,
+	resolveThinkingLevelForModel,
+} from "../thinking/levels";
 import { type ConfiguredThinkingLevel } from "../utils/render-utils";
 import {
 	resolveConfiguredModelPatterns,
@@ -157,6 +162,18 @@ export function formatRetryFallbackSelector(model: Model, thinkingLevel: Thinkin
 /** Formats the model-only portion of a parsed fallback selector (`provider/id`, no thinking level). */
 export function formatRetryFallbackBaseSelector(selector: RetryFallbackSelector): string {
 	return `${selector.provider}/${selector.id}`;
+}
+
+/**
+ * The thinking level a retry-fallback hop to `model` asks for: `requested` (the selector's level, else the
+ * session's configured one) held to the session's effort `ceiling`; `auto` stays `auto`.
+ */
+export function retryFallbackThinkingLevel(
+	model: Model,
+	requested: ConfiguredThinkingLevel | undefined,
+	ceiling: Effort | undefined,
+): ConfiguredThinkingLevel | undefined {
+	return requested === AUTO_THINKING ? requested : clampThinkingLevelToCeiling(model, requested, ceiling);
 }
 
 /** Whether a provider is registered or configured for discovery. */
@@ -555,8 +572,8 @@ export function resolveRetryFallbackChainKey(
  * openrouter/google/x). Ids the target provider lacks are skipped by the
  * candidate loop's registry lookup.
  */
-function parseRetryFallbackChainEntry(
-	context: RetryFallbackResolutionContext,
+export function parseRetryFallbackChainEntry(
+	context: Pick<RetryFallbackResolutionContext, "modelLookup">,
 	entry: string,
 	current: RetryFallbackSelector | undefined,
 ): RetryFallbackSelector | undefined {

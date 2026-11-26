@@ -238,7 +238,8 @@ describe("disabledExtensions runtime filtering", () => {
 		const disabledIds = ["extension-module:hello"];
 		const [disabledRow] = await moduleRows(disabledIds);
 		expect([disabledRow?.state, disabledRow?.disabledReason]).toEqual(["disabled", "item-disabled"]);
-		const loaded = await discoverExtensionPaths([...roots.configured], tempDir, disabledIds);
+		const discovered = await discoverExtensionPaths([...roots.configured], tempDir, disabledIds);
+		const loaded = discovered.map(entry => entry.path);
 		expect(loaded).not.toContain(hello);
 		expect(loaded).toContain(loose);
 	});
@@ -265,14 +266,14 @@ describe("disabledExtensions runtime filtering", () => {
 				.map(row => row.id);
 
 		// Hook discovery adds the file first, so the module id cannot unload it: no row.
-		expect(await discoverExtensionPaths([fleet], tempDir, ["extension-module:guard"])).toContain(guard);
+		const hookLoaded = await discoverExtensionPaths([fleet], tempDir, ["extension-module:guard"]);
+		expect(hookLoaded.map(entry => entry.path)).toContain(guard);
 		expect(await moduleIds([])).toEqual([]);
 
 		// With the hook disabled, only the package lane loads the file and the module id gates it.
 		const hookOff = ["hook:pre:guard:guard.ts"];
 		expect(await moduleIds(hookOff)).toEqual(["extension-module:guard"]);
-		expect(await discoverExtensionPaths([fleet], tempDir, [...hookOff, "extension-module:guard"])).not.toContain(
-			guard,
-		);
+		const moduleGated = await discoverExtensionPaths([fleet], tempDir, [...hookOff, "extension-module:guard"]);
+		expect(moduleGated.map(entry => entry.path)).not.toContain(guard);
 	});
 });

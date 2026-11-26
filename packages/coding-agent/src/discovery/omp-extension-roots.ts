@@ -21,10 +21,29 @@ import * as path from "node:path";
 import { getAgentDir, isEnoent, logger, MAIN_CONFIG_FILENAMES, tryParseJson } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { readDirEntries, readFile } from "../capability/fs";
-import type { ExtensionRootMode, LoadContext } from "../capability/types";
+import type { ExtensionRootMode, LoadContext, SourceMeta } from "../capability/types";
 import { getEnabledPlugins } from "../extensibility/plugins/loader";
 import { expandTilde } from "../tools/path-utils";
 import { listClaudePluginRoots } from "./helpers";
+
+/**
+ * The lane that supplied an extension package root: `explicit` (CLI `--extension`, SDK
+ * `additionalExtensionPaths`), `configured` (the `extensions` setting) or `installed` (an npm/link plugin).
+ */
+export type OmpExtensionRootOrigin = "explicit" | "configured" | "installed";
+
+/** Id of the provider that discovers the sub-directories of extension package roots (`omp-plugins.ts`). */
+export const OMP_PLUGINS_PROVIDER_ID = "omp-plugins";
+
+/**
+ * Whether `source`, a hook's, names a hook of the caller's own package root: one the `omp-plugins` provider found
+ * under an explicit or configured root (its origin is the root's lane). Such a hook loads at `explicit` extension
+ * scope; another provider's origin is its own vocabulary.
+ */
+export function isOwnPackageRootHook(source: SourceMeta): boolean {
+	if (source.provider !== OMP_PLUGINS_PROVIDER_ID) return false;
+	return source.origin === "explicit" || source.origin === "configured";
+}
 
 /** A resolved extension package directory wired into the discovery surfaces. */
 export interface OmpExtensionRoot {
@@ -34,6 +53,8 @@ export interface OmpExtensionRoot {
 	name: string;
 	/** Scope from which the path was sourced. */
 	level: "user" | "project";
+	/** Lane that supplied the root; the first lane that names a directory wins. */
+	origin: OmpExtensionRootOrigin;
 }
 
 interface InjectedRoot {
@@ -41,6 +62,7 @@ interface InjectedRoot {
 	/** Relative CLI spelling, rebound against the active project on discovery. */
 	relativePath?: string;
 	level: "user" | "project";
+	origin: OmpExtensionRootOrigin;
 }
 
 /** Extension sub-discovery mode; re-exported alias of {@link ExtensionRootMode}. */
@@ -136,7 +158,9 @@ export function injectOmpExtensionCliRoots(
 	for (const root of injectedCliRoots) merged.set(root.path, root);
 	for (const { path: resolved, relativePath } of expanded) {
 		// CLI scope mirrors how `--extension` is treated elsewhere — user-level overrides win.
-		if (!merged.has(resolved)) merged.set(resolved, { path: resolved, relativePath, level: "user" });
+		if (!merged.has(resolved)) {
+			merged.set(resolved, { path: resolved, relativePath, level: "user", origin: "explicit" });
+		}
 	}
 	injectedCliRoots = [...merged.values()];
 }
@@ -149,7 +173,7 @@ export function clearOmpExtensionCliRoots(): void {
 
 /** Inspect currently-injected CLI roots (read-only). Exposed for diagnostics + tests. */
 export function getInjectedOmpExtensionCliRoots(): readonly OmpExtensionRoot[] {
-	return injectedCliRoots.map(({ path: p, level }) => ({ path: p, level, name: path.basename(p) }));
+	return injectedCliRoots.map(({ path: p, level, origin }) => ({ path: p, level, origin, name: path.basename(p) }));
 }
 
 interface ScopeDirs {
@@ -284,13 +308,12 @@ export async function listOmpExtensionRoots(ctx: LoadContext): Promise<OmpExtens
 	const scopedRoots = invocationRootScope.getStore();
 	// Explicit lane, in precedence order: caller-provided reload value, then the
 	// construction-time invocation scope, then process-level CLI injection.
-	const explicitSeed: InjectedRoot[] = ctx.extensionRoots
-		? ctx.extensionRoots.explicit.map(raw => ({ path: resolveAgainst(raw, ctx), level: "user" }))
-		: scopedRoots
-			? scopedRoots.paths.map(raw => ({ path: resolveAgainst(raw, ctx), level: "user" }))
-			: injectedCliRoots.map(root =>
-					root.relativePath ? { ...root, path: path.resolve(ctx.cwd, root.relativePath) } : root,
-				);
+	const explicitPaths = ctx.extensionRoots ? ctx.extensionRoots.explicit : scopedRoots?.paths;
+	const explicitSeed: InjectedRoot[] = explicitPaths
+		? explicitPaths.map(raw => ({ path: resolveAgainst(raw, ctx), level: "user", origin: "explicit" }))
+		: injectedCliRoots.map(root =>
+				root.relativePath ? { ...root, path: path.resolve(ctx.cwd, root.relativePath) } : root,
+			);
 	const rootMode: OmpExtensionRootMode = ctx.extensionRoots?.mode ?? scopedRoots?.mode ?? injectedCliRootMode;
 	let candidates: InjectedRoot[] = explicitSeed;
 	if (rootMode === "merge") {
@@ -315,6 +338,7 @@ export async function listOmpExtensionRoots(ctx: LoadContext): Promise<OmpExtens
 			...(configured?.entries.map((raw): InjectedRoot => ({
 				path: resolveAgainst(raw, ctx),
 				level: configured.level,
+				origin: "configured",
 			})) ?? []),
 			...installedPlugins,
 		];
@@ -333,8 +357,8 @@ export async function listOmpExtensionRoots(ctx: LoadContext): Promise<OmpExtens
 	const roots: OmpExtensionRoot[] = [];
 	for (let i = 0; i < unique.length; i++) {
 		if (!directoryFlags[i]) continue;
-		const { path: p, level } = unique[i];
-		roots.push({ path: p, level, name: path.basename(p) });
+		const { path: p, level, origin } = unique[i];
+		roots.push({ path: p, level, origin, name: path.basename(p) });
 	}
 	return roots;
 }
@@ -377,7 +401,7 @@ async function listInstalledPluginRoots(ctx: LoadContext): Promise<InjectedRoot[
 		);
 		return installedRoots
 			.filter(root => !marketplaceRealpaths.has(root.realpath))
-			.map(({ path: p, scope }) => ({ path: p, level: scope }));
+			.map(({ path: p, scope }): InjectedRoot => ({ path: p, level: scope, origin: "installed" }));
 	} catch (err) {
 		logger.debug("listInstalledPluginRoots: enumeration failed", { error: String(err) });
 		return [];

@@ -15,6 +15,7 @@ import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type {
 	BeforeSubagentSpawnEvent,
 	BeforeSubagentSpawnEventResult,
+	ExtensionPathEntry,
 	PreparedExtension,
 } from "../extensibility/extensions/types";
 import type { Skill, SkillRediscoveryHost } from "../extensibility/skills";
@@ -298,12 +299,12 @@ export interface ToolSession {
 	 */
 	activeRules?: readonly Rule[];
 	/**
-	 * Pre-discovered extension source paths. Forwarded to subagents so they
-	 * skip the FS scan but still re-bind extensions to their own session-scoped
-	 * `ExtensionAPI` (cwd, eventBus, runtime). Inline extension factories
-	 * (`<inline-N>`) are NOT included — those are session-local.
+	 * Pre-discovered extension source paths, each with its scope. Forwarded to
+	 * subagents so they skip the FS scan but still re-bind extensions to their own
+	 * session-scoped `ExtensionAPI` (cwd, eventBus, runtime). Inline extension
+	 * factories (`<inline-N>`) are NOT included — those are session-local.
 	 */
-	extensionPaths?: string[];
+	extensionPaths?: ExtensionPathEntry[];
 	/** Imported extension factories safe to rebind in child sessions. */
 	preparedExtensions?: PreparedExtension[];
 	/**

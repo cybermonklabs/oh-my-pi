@@ -168,6 +168,7 @@ import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { MCPLoadResult } from "../mcp";
 import type {
 	ExtensionCommandContext,
+	ExtensionPathEntry,
 	ExtensionRunner,
 	ExtensionUIContext,
 	PreparedExtension,
@@ -1119,10 +1120,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/** Source paths of the parent's loaded extensions; forwarded to `/tan` forks as the prepared-extension fallback. */
-	readonly #extensionPaths: readonly string[] | undefined;
+	readonly #extensionPaths: readonly ExtensionPathEntry[] | undefined;
 
-	/** Source paths of loaded extensions, forwarded to child sessions when prepared factories are unavailable. */
-	get extensionPaths(): readonly string[] | undefined {
+	/** Source entries of loaded extensions, forwarded to child sessions when prepared factories are unavailable. */
+	get extensionPaths(): readonly ExtensionPathEntry[] | undefined {
 		return this.#extensionPaths;
 	}
 
@@ -7903,6 +7904,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Base system prompt blocks the next turn builds on, before any `before_agent_start` override. */
 	get baseSystemPrompt(): string[] {
 		return this.#tools.baseSystemPrompt;
+	}
+
+	/**
+	 * The tool session this session was built with. A subagent this session spawns takes its live
+	 * inputs from it (`subagentLiveInputs`), and so does the cold revive of such a subagent while this
+	 * session is its live parent.
+	 */
+	get evalToolSession(): ToolSession | undefined {
+		return this.#evalToolSession;
 	}
 
 	/**
