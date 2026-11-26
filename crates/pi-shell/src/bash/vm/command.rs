@@ -20,9 +20,9 @@ use super::{
 	expand::{CompoundElem, Expander, Stop, compound_text},
 	probe::{self, Search, absolute, candidates},
 	proc::{
-		AssignValue, Awaited, BangStage, BusySpawn, DeferPhase, ExecAs, ExecState, Frame, FrameKind,
-		JobState, Live, PathSearch, PendingWrite, Prefix, Probe, ProbeResult, Scratch, ScriptKind,
-		Slot, Stage, Target, Transfer, Vproc,
+		AssignValue, Awaited, BangStage, BusySpawn, CommandName, DeferPhase, ExecAs, ExecState,
+		Frame, FrameKind, JobState, Live, PathSearch, PendingWrite, Prefix, Probe, ProbeResult,
+		Scratch, Slot, Stage, Target, Transfer, Vproc,
 	},
 	state::{self, Level, Scope, Var, VarMap},
 	xtrace,
@@ -594,6 +594,8 @@ fn assignment_statement(
 			return Some(assign_failed(k, vp, cx, line, d));
 		}
 	}
+	// A simple command ended (bash's `execute_null_command`).
+	vp.command_name = None;
 	vp.status = 0;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(0);
@@ -601,10 +603,12 @@ fn assignment_statement(
 }
 
 /// A failed assignment statement: bash reports it and abandons the rest of
-/// the command line; a posix shell exits ([`exec::jump_out`]: an
-/// arithmetic subscript error's jump comes after `top_level_cleanup`).
-/// Under `set -e` a readonly variable or a bad subscript exits at once
-/// ([`exec::report_error_exits`]).
+/// the command line; a posix shell exits. An arithmetic error in a
+/// subscript (`a[1/0]=v`, bash's `array_expand_index`) or in an integer
+/// variable's value (`x=1/0`, `make_variable_value`) runs
+/// `top_level_cleanup`, then `jump_to_top_level (DISCARD)`
+/// ([`Flow::DiscardTop`]), in posix mode too. Under `set -e` a readonly
+/// variable or a bad subscript exits at once ([`exec::report_error_exits`]).
 fn assign_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: Diag) -> Flow {
 	if exec::report_error_exits(k, cx, vp, &d) {
 		let status = exec::report_error_status(vp, &d);
@@ -612,19 +616,18 @@ fn assign_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: 
 		return Flow::Exit(status, exec::Jump::Direct);
 	}
 	// An integer variable's value that is no valid arithmetic (`local -i n;
-	// n=1/0`): bash's `make_variable_value` runs `top_level_cleanup` and
-	// discards the command whatever the level, also in posix mode, where the
-	// assignment never comes back to exit (variables.c:2944). Its error is
-	// the only arithmetic one an assignment returns: one in the value's
-	// expansion stops before it, a subscript's is `ArithSubscript`.
-	let integer =
-		matches!(d, Diag::Arith { .. }) && vp.mode.dialect() != crate::bash::ids::Dialect::Zsh;
-	let cleanup = integer || exec::cleanup_jump(vp, &d);
+	// n=1/0`) is `Diag::ArithValue`: bash's `make_variable_value` runs
+	// `top_level_cleanup` and discards the command whatever the level, also
+	// in posix mode, where the assignment never comes back to exit
+	// (variables.c:2944).
+	let cleanup = exec::cleanup_jump(vp, &d);
 	k.diag(cx, vp, line, d);
-	let flow = if !integer
-		&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false)
+	let flow = if cleanup {
+		Flow::DiscardTop(1)
+	} else if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+		.unwrap_or(false)
 	{
-		Flow::Exit(1, exec::top_level_jump(cx, vp, cleanup))
+		Flow::Exit(1, exec::top_level_jump(cx, vp, false))
 	} else {
 		Flow::Discard(1)
 	};
@@ -767,6 +770,8 @@ fn plain_statement(
 	};
 	if let (Ok(outcome), Ok(())) = (&res, &written) {
 		state::drop_scope(&mut k.root, cx.store, vp);
+		// A simple command ended: bash's `this_command_name` is empty.
+		vp.command_name = None;
 		vp.status = outcome.status;
 		vp.pipestatus.clear();
 		vp.pipestatus.push(outcome.status);
@@ -1261,12 +1266,16 @@ fn expand(
 				continue;
 			}
 		}
-		// A prefix assignment's value takes the visible variable's attributes
-		// (`-i`, case conversion) and `+=`.
+		// A prefix assignment's value as the command's environment holds it
+		// ([`builtins::prefix_value`]).
 		let value = match (assign_only, &index, value) {
 			(false, None, AssignValue::Scalar(raw)) => {
 				match builtins::prefix_value(k, cx, vp, &name, &raw, append) {
 					Ok(converted) => AssignValue::Scalar(converted),
+					// `x+=1/0 cmd` with an integer `x` abandons the line.
+					Err(diag) if exec::cleanup_jump(vp, &diag) => {
+						return Some(assign_failed(k, vp, cx, line, diag));
+					},
 					Err(diag) => {
 						k.diag(cx, vp, line, diag);
 						// bash does not run the command.
@@ -3337,6 +3346,9 @@ fn call_function(
 	let trace_once = attrs.contains(Attrs::ZSH_TRACE_ONCE);
 	let callee = Callee { name, body, mode, sticky, file, traced, trace_once, warn_nested };
 	let call = Call { args, vars, line, node: op.node, depth, argzero: None };
+	// bash's `this_command_name` names the function while its commands
+	// expand their words, until one of them ends.
+	vp.command_name = Some(CommandName::Function);
 	Some(push_call(k, vp, cx, callee, call))
 }
 
@@ -4608,15 +4620,19 @@ fn settle_builtin(
 			e.stage = Stage::Output;
 			None
 		},
+		// bash's `this_command_name` names the builtin while the commands
+		// it runs (`eval`, `.`) expand their words, until one of them ends.
 		Control::Frame => {
 			e.waiting = Some(Awaited::Frame);
 			e.stage = Stage::Await;
+			vp.command_name = Some(CommandName::Builtin(id));
 			Some(Flow::Call)
 		},
 		Control::Resume => {
 			e.waiting = Some(Awaited::Frame);
 			e.resume = true;
 			e.stage = Stage::Await;
+			vp.command_name = Some(CommandName::Builtin(id));
 			Some(Flow::Call)
 		},
 		Control::Wait(w) => {
@@ -4644,6 +4660,11 @@ fn settle_builtin(
 		},
 		Control::DiscardAll => {
 			e.control = Some(Transfer::DiscardAll(outcome.status));
+			e.stage = Stage::Output;
+			None
+		},
+		Control::Discard => {
+			e.control = Some(Transfer::Discard(outcome.status));
 			e.stage = Stage::Output;
 			None
 		},
@@ -5591,14 +5612,24 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let notice = e.notice.take();
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
-	vp.status = status;
-	// bash's in-shell read of `$(< file)` runs no command: `PIPESTATUS`
-	// stays the last pipeline's (`false | true; echo "$(< f)"
-	// "${PIPESTATUS[@]}"` prints `… 1 0`).
-	if op.flags & ir::Op::CAT == 0 {
-		vp.pipestatus.clear();
-		vp.pipestatus.push(status);
+	// bash's `return` jumps out before its status reaches `$?` or
+	// `PIPESTATUS` (it sets only `return_catch_value`): the function's or
+	// `.` file's RETURN trap sees them as they were ([`Flow::Return`]).
+	let returns = matches!(control, Some(Transfer::Return(_)))
+		&& vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
+	if !returns {
+		vp.status = status;
+		// bash's in-shell read of `$(< file)` runs no command: `PIPESTATUS`
+		// stays the last pipeline's (`false | true; echo "$(< f)"
+		// "${PIPESTATUS[@]}"` prints `… 1 0`).
+		if op.flags & ir::Op::CAT == 0 {
+			vp.pipestatus.clear();
+			vp.pipestatus.push(status);
+		}
 	}
+	// A simple command ended: bash's `this_command_name` is empty
+	// (`execute_simple_command`, execute_cmd.c:4952).
+	vp.command_name = None;
 	if k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
 		// One fresh reading for the duration and the event's stamp; the
 		// next command's `CmdStart` may share it.
@@ -5638,6 +5669,7 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		Some(Transfer::Break { n, cont }) => Flow::Break { n, cont },
 		Some(Transfer::Exit(n, jump)) => Flow::Exit(n, jump),
 		Some(Transfer::DiscardAll(n)) => cleanup_discard(k, vp, cx, n),
+		Some(Transfer::Discard(n)) => plain_discard(k, vp, cx, n),
 		Some(Transfer::Exec) => {
 			// The program replaced the shell (or `exec` failed and the shell
 			// exits, `exit_shell` with no jump): bash's `time` around it
@@ -5650,31 +5682,32 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 
 /// The flow of a command abandoned after bash runs every unwind-protect
 /// (`top_level_cleanup`, or `run_unwind_protects` alone): a builtin's
-/// arithmetic subscript error or `suspend`'s usage error, a function past
-/// `FUNCNEST`. The jump then goes to the outermost catch: the whole `-c`
-/// string when the run's own text is running ([`Flow::Abort`]). zsh: a
-/// builtin's `zerr` (`errflag`) unwinds through `zsh_discard` (always-lists
-/// run, the builtin's status stays); `Abort` is the parse-error path.
+/// arithmetic subscript error, integer value error or extra arguments
+/// (`no_args`), a function past `FUNCNEST`. Running every unwind-protect
+/// restores each `parse_and_execute`'s saved jump target, so the jump passes
+/// every `eval`, `.` and trap action to the run's own top
+/// ([`Flow::DiscardTop`]): a `-c` string ends, a script goes on with its next
+/// line. zsh: a builtin's `zerr` (`errflag`) unwinds through `zsh_discard`
+/// (always-lists run, the builtin's status stays).
 fn cleanup_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: i32) -> Flow {
-	let command = matches!(
-		state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
-		Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
-	);
-	let in_run = vp
-		.frames
-		.iter()
-		.rev()
-		.find(|f| matches!(f.kind, FrameKind::Script { .. }))
-		.is_some_and(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Run, .. }));
-	let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
-	let flow = if command && in_run && !zsh {
-		Flow::Abort(n)
-	} else {
-		Flow::Discard(n)
-	};
-	if !zsh {
-		exec::jump_out(k, cx, vp, true, &flow);
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		return Flow::Discard(n);
 	}
+	let flow = Flow::DiscardTop(n);
+	exec::jump_out(k, cx, vp, true, &flow);
+	flow
+}
+
+/// The flow of a command bash abandons while it still expands its words
+/// (`exp_jump_to_top_level (DISCARD)`: a declaration's compound word whose
+/// `make_internal_declare` or assignment fails). A plain discard, not
+/// [`cleanup_discard`]'s: `top_level_cleanup` runs only at a script's own
+/// level ([`exec::jump_out`]), and the innermost `parse_and_execute` (the
+/// script, `-c`, `eval`, `.`) catches the jump and goes on with its next
+/// command ([`Flow::Discard`]).
+fn plain_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: i32) -> Flow {
+	let flow = Flow::Discard(n);
+	exec::jump_out(k, cx, vp, false, &flow);
 	flow
 }
 

@@ -59,8 +59,9 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
-/// a variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 49;
+/// a variant: an exec target holds it by index. The Cut14 landing resolves
+/// all carried image layouts and takes the release's next number.
+pub const FRAMES_VERSION: u32 = 50;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -287,6 +288,10 @@ struct ProcImage {
 	/// trap action that runs after the restore still names the trapped
 	/// command.
 	command:       Option<(UnitId, u32)>,
+	/// bash's `this_command_name` ([`Vproc::command_name`]).
+	command_name:  Option<super::proc::CommandName>,
+	/// bash's `trap_saved_exit_value` ([`Vproc::trap_saved`]).
+	trap_saved:    i32,
 	/// Pushes onto bash's call-stack arrays.
 	calls:         Vec<super::callstack::Call>,
 	/// The pseudo-signal traps the vproc set itself.
@@ -706,6 +711,8 @@ impl Shell {
 				subshell: p.subshell,
 				outer_loops: p.outer_loops,
 				command,
+				command_name: p.command_name,
+				trap_saved: p.trap_saved,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
 				pending_break: p.pending_break.as_deref().copied(),
@@ -1015,6 +1022,8 @@ impl Shell {
 			vp.zsh = p.zsh;
 			vp.lineage = p.lineage;
 			vp.clock = p.clock;
+			vp.command_name = p.command_name;
+			vp.trap_saved = p.trap_saved;
 			if let Some((id, node)) = p.command {
 				let unit = load_unit(
 					engine,

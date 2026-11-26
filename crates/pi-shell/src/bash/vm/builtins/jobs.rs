@@ -703,7 +703,7 @@ pub fn suspend(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if !o.rest.is_empty() {
 		// bash `no_args`: the rest of the line is abandoned.
 		ctx.usage("too many arguments");
-		return Ok(Outcome { status: 2, control: Control::DiscardAll });
+		return super::flow::too_many(ctx);
 	}
 	if !o.has(b'f') {
 		if !active(ctx)? {
@@ -785,6 +785,7 @@ mod tests {
 			arrayref: Vec::new(),
 			resumed: 0,
 			arith_at: None,
+			discard: false,
 		};
 		assert_eq!(background(&mut ctx, Some(&BString::from("%1"))), 0);
 		std::mem::take(&mut ctx.chunks)

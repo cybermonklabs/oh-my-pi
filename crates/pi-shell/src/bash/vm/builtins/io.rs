@@ -178,7 +178,9 @@ pub fn bind(ctx: &mut Ctx<'_, '_>, name: &[u8], value: AssignValue) -> bool {
 	bind_lhs(ctx, Lhs { name: base, index, append: false }, value)
 }
 
-/// Assign `value` to `lhs` as [`bind`] does.
+/// Assign `value` to `lhs` as [`bind`] does. An arithmetic subscript error
+/// (`read 'a[1/0]'`) also abandons the line once the builtin returns
+/// ([`Ctx::discard`]).
 pub fn bind_lhs(ctx: &mut Ctx<'_, '_>, lhs: Lhs<'_>, value: AssignValue) -> bool {
 	match set_value(ctx.k, ctx.cx, ctx.vp, lhs, value, Level::Dynamic) {
 		Ok(()) => true,
@@ -187,6 +189,7 @@ pub fn bind_lhs(ctx: &mut Ctx<'_, '_>, lhs: Lhs<'_>, value: AssignValue) -> bool
 			false
 		},
 		Err(d) => {
+			ctx.discard |= crate::bash::vm::exec::cleanup_jump(ctx.vp, &d);
 			ctx.err(d);
 			false
 		},

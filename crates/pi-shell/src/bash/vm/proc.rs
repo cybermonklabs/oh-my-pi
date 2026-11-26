@@ -111,6 +111,20 @@ pub struct Vproc {
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
 	pub command:       Option<(Arc<Unit>, u32)>,
+	/// bash's `this_command_name` as a message made while a command's words
+	/// expand names it (a declaration's compound word that fails in
+	/// `make_internal_declare`): the function call, `eval` or `.` that runs
+	/// the commands around it until a simple command inside it ends, then
+	/// none; `((` and `[[` set it, each `for` item clears it. A subshell
+	/// starts with its parent's.
+	pub command_name:  Option<CommandName>,
+	/// bash's `trap_saved_exit_value`: the `$?` saved by the last trap
+	/// action that started (EXIT, a signal, ERR, DEBUG or RETURN), kept after
+	/// it ends and across a fork. `run_exit_trap` ends the shell with it when
+	/// it catches a discard: one in its own action, or one in the body of a
+	/// child forked where it was the outermost level
+	/// ([`ParseLevel::InExitTrap`]).
+	pub trap_saved:    i32,
 	/// Pushes onto bash's call-stack arrays (`FUNCNAME`, `BASH_SOURCE`,
 	/// `BASH_LINENO`, `BASH_ARGC`, `BASH_ARGV`), oldest first; a subshell
 	/// starts with its parent's.
@@ -1387,12 +1401,52 @@ pub enum ParseLevel {
 	Outside,
 	/// A child forked inside an `eval`, `.` or trap action: bash's fork keeps
 	/// `parse_and_execute_level`, but the child's jumps go to its own top
-	/// (`execute_in_subshell`), which is no level of its own.
+	/// (`execute_in_subshell`), which is no level of its own. A discard in the
+	/// child's own EXIT trap passes the trap: `top_level_cleanup` restores
+	/// the outermost level's saved jump target, and the child exits.
 	Kept,
-	/// A command or process substitution, whose text bash runs with
-	/// `parse_and_execute`: a level of its own (`command_substitute`,
-	/// `process_substitute`).
+	/// A command or process substitution forked where no level was running
+	/// (its fork kept none): its text, which bash runs with
+	/// `parse_and_execute`, is a level of its own (`command_substitute`,
+	/// `process_substitute`). A substitution whose fork kept a level keeps
+	/// that one ([`Self::substitution_base`]).
 	Substitution,
+	/// A child forked inside a substitution's text (a subshell, a job or a
+	/// pipeline element): bash's `top_level_cleanup` restores the
+	/// substitution's own jump target, so a `DISCARD` ends it with status 1,
+	/// as it ends the substitution (`command_substitute` and
+	/// `process_substitute` turn it into `EXECUTION_FAILURE`, also in a
+	/// script).
+	InSubstitution,
+	/// A child forked where the outermost running level is an EXIT trap
+	/// action (the shell's own or a subshell's), with no `-c` string still
+	/// running below it: a level as for [`Self::Kept`], but the saved jump
+	/// target `top_level_cleanup` restores is that trap's own
+	/// (`run_exit_trap`). A discard in the child's own EXIT trap ends that
+	/// trap; one in the child's body returns into the trap action it was
+	/// forked in, and does not run the child's own EXIT trap. Either way the
+	/// child exits with bash's `trap_saved_exit_value` then
+	/// ([`Vproc::trap_saved`]).
+	InExitTrap,
+}
+
+impl ParseLevel {
+	/// Whether a `DISCARD` jump that leaves this base frame ends the vproc
+	/// in a substitution's handler (status 1).
+	pub const fn substitution(self) -> bool {
+		matches!(self, Self::Substitution | Self::InSubstitution)
+	}
+
+	/// The base level of a command or process substitution whose fork
+	/// recorded this one: the level its fork kept ([`Self::Kept`],
+	/// [`Self::InSubstitution`], [`Self::InExitTrap`]), the outermost still
+	/// running, else its own text's ([`Self::Substitution`]).
+	pub const fn substitution_base(self) -> Self {
+		match self {
+			Self::Outside | Self::Substitution => Self::Substitution,
+			kept => kept,
+		}
+	}
 }
 
 /// What kind of activation a frame is.
@@ -1499,7 +1553,12 @@ pub enum ScriptKind {
 		key:               crate::bash::store::TrapKey,
 		status:            i32,
 		cancel:            Option<i32>,
-		return_target:     Option<usize>,
+		/// A RETURN trap: the function or `.` frame to unwind to when it
+		/// ends (its index), and the status that returns. The action runs
+		/// with `$?` as it was before the return (bash's `return` sets only
+		/// `return_catch_value`), and `status` is that `$?`. Two 32-bit
+		/// halves keep `Frame` within its size bound.
+		return_target:     Option<(u32, i32)>,
 		/// An ERR trap run by `set -e`, or an EXIT trap `exit_shell`
 		/// started: the shell exits with `status` when the trap ends.
 		exit:              bool,
@@ -1571,8 +1630,8 @@ pub struct FrameFlags(u8);
 impl FrameFlags {
 	const COMMAND_LOOP: u8 = 1;
 	const NO_DEBUG_TRAP: u8 = 2;
-	/// The two bits of [`Self::parse_level`].
-	const PARSE_LEVEL: u8 = 0b1100;
+	/// The three bits of [`Self::parse_level`].
+	const PARSE_LEVEL: u8 = 0b0001_1100;
 	const PARSE_LEVEL_SHIFT: u32 = 2;
 
 	/// The base frame of a fork: a fatal error in it, run as a forked
@@ -1614,7 +1673,9 @@ impl FrameFlags {
 		match (self.0 & Self::PARSE_LEVEL) >> Self::PARSE_LEVEL_SHIFT {
 			0 => ParseLevel::Outside,
 			1 => ParseLevel::Kept,
-			_ => ParseLevel::Substitution,
+			2 => ParseLevel::Substitution,
+			3 => ParseLevel::InSubstitution,
+			_ => ParseLevel::InExitTrap,
 		}
 	}
 
@@ -1624,6 +1685,8 @@ impl FrameFlags {
 			ParseLevel::Outside => 0,
 			ParseLevel::Kept => 1,
 			ParseLevel::Substitution => 2,
+			ParseLevel::InSubstitution => 3,
+			ParseLevel::InExitTrap => 4,
 		};
 		self.0 = (self.0 & !Self::PARSE_LEVEL) | (bits << Self::PARSE_LEVEL_SHIFT);
 	}
@@ -2361,11 +2424,11 @@ pub struct ExecState {
 	pub wait_into:     Option<Box<BString>>,
 	/// Run through `command`: a special builtin's failure does not end a
 	/// posix shell.
-	pub via_command: bool,
+	pub via_command:   bool,
 	/// The prefix the command's words start with, as bash's
 	/// `execute_simple_command` and `execute_builtin` read it: the outer
 	/// one, not the last (`command builtin export` is `command`'s).
-	pub prefix:      Prefix,
+	pub prefix:        Prefix,
 	/// The awaited frame was pushed by the builtin, which runs again when
 	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).
 	pub resume:        bool,
@@ -2451,8 +2514,25 @@ pub enum Transfer {
 	/// The rest of the line is abandoned with this status (a `-c` string
 	/// whole).
 	DiscardAll(i32),
+	/// The command is abandoned with this status by a plain `DISCARD`
+	/// (bash's `exp_jump_to_top_level`): the innermost script (the run's,
+	/// `eval`'s, `.`'s) goes on with its next command.
+	Discard(i32),
 	/// `exec command`: the shell exits with the command's status.
 	Exec,
+}
+
+/// What bash's `this_command_name` names ([`Vproc::command_name`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandName {
+	/// A function call: the innermost function's name.
+	Function,
+	/// A builtin that runs commands of its own (`eval`, `.`, `source`).
+	Builtin(crate::bash::ids::IntrinsicId),
+	/// `((`, also an arithmetic `for`'s expressions.
+	Arith,
+	/// `[[`.
+	Cond,
 }
 
 /// An expanded assignment value.
@@ -2679,7 +2759,8 @@ impl Live {
 // `ScriptKind::Trap::outside_functions`: no growth alone) give Vproc 696 B,
 // Frame 264 B and ExecState 392 B together. The bounds below are those
 // sizes until the structures shrink again; the idle bench has not measured
-// them.
+// them. `Vproc::command_name` (8 B with alignment) and `trap_saved`
+// (4 B in that alignment) fit the same bounds.
 const _: () = assert!(size_of::<Vproc>() <= 696, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 264, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");

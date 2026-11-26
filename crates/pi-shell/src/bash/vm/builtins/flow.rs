@@ -292,8 +292,22 @@ fn source_args(
 enum BadArg {
 	/// Not a number (bash's `EX_USAGE`).
 	NotNumeric,
-	/// More than one argument (status 2).
+	/// More than one argument: bash's `no_args` abandons the line
+	/// ([`too_many`]).
 	TooMany,
+}
+
+/// bash's `no_args` for a builtin given more arguments than it takes
+/// (`return`, `exit`, `break`, `continue`, `shift`, `suspend`):
+/// `top_level_cleanup`, the status `EX_BADUSAGE` (2), then
+/// `jump_to_top_level (DISCARD)` ([`Control::DiscardAll`]), so the rest of
+/// the line is dropped through every function, `eval` and `.`. zsh mode
+/// (`logout`, which runs [`exit`]) goes on with status 2.
+pub(super) fn too_many(ctx: &Ctx<'_, '_>) -> R {
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		return done(2);
+	}
+	Ok(Outcome { status: 2, control: Control::DiscardAll })
 }
 
 /// The numeric argument of `return`, `exit`, `break`, `continue`, after an
@@ -359,10 +373,9 @@ pub fn return_(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				_ => None,
 			})
 			.unwrap_or(ctx.vp.status),
-		// bash returns 2 from the function; extra arguments are only an
-		// error.
+		// bash returns 2 from the function; extra arguments abandon the line.
 		Err(BadArg::NotNumeric) => 2,
-		Err(BadArg::TooMany) => return done(2),
+		Err(BadArg::TooMany) => return too_many(ctx),
 	};
 	Ok(Outcome { status, control: Control::Return })
 }
@@ -378,11 +391,13 @@ pub fn logout(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 
 /// `exit [n]`.
 pub fn exit(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
-	// A bad argument (`exit status`, too many) is reported and the shell
-	// goes on (status 2), as bash 5.3 does outside posix mode.
+	// A non-numeric argument (`exit status`) is reported and the shell goes
+	// on (status 2), as bash 5.3 does outside posix mode; extra arguments
+	// abandon the line.
 	let status = match status_arg(ctx, args) {
 		Ok(n) => n.unwrap_or(ctx.vp.status),
-		Err(_) => return done(2),
+		Err(BadArg::NotNumeric) => return done(2),
+		Err(BadArg::TooMany) => return too_many(ctx),
 	};
 	// An interactive shell with stopped jobs warns once instead.
 	if crate::bash::vm::jobctl::check_before_exit(ctx.k, ctx.cx, ctx.vp) {
@@ -430,6 +445,10 @@ fn bash_logout(ctx: &mut Ctx<'_, '_>, status: i32) -> Result<Option<Outcome>, su
 /// posix mode and succeeds. A count below 1 is reported and leaves every
 /// loop (status 1); a non-numeric one ends the (non-interactive) shell.
 pub fn break_(ctx: &mut Ctx<'_, '_>, args: &[BString], cont: bool) -> R {
+	// bash's `loop_level` in a forked child counts the loops of the shell
+	// it forked from that are in reach
+	// ([`crate::bash::vm::exec::bash_loop_count`]), so a fork with none
+	// (`( break )`, `$(break)`, `break | cat`) is outside every loop too.
 	if crate::bash::vm::exec::bash_loop_count(ctx.vp) == 0 {
 		if !ctx.option(OptId::Posix)? {
 			ctx.err(Diag::Usage {
@@ -448,7 +467,7 @@ pub fn break_(ctx: &mut Ctx<'_, '_>, args: &[BString], cont: bool) -> R {
 		Err(BadArg::NotNumeric) => {
 			return Ok(Outcome { status: 2, control: Control::Exit(Jump::Cleanup) });
 		},
-		Err(BadArg::TooMany) => return done(2),
+		Err(BadArg::TooMany) => return too_many(ctx),
 	};
 	Ok(Outcome { status: 0, control: Control::Break { n, cont } })
 }

@@ -437,13 +437,16 @@ fn deferred_redirections_read_the_descriptors_bash_gives_them() {
 }
 
 /// A redirection the child fails after its FIFO open (`> fifo` comes
-/// first): a dup of a closed fd (`3<&900`, `/dev/fd/900`, `3<&- 4<&3`) or a
-/// target that is no single word. bash's child opens the FIFO and then
-/// fails, so the FIFO's reader (`cat`, or the shell's own `exec 5<`) gets
-/// end of file, and the job's status is 1; it stops there, so no word of a
-/// redirection after it is expanded. The engine knows these are bad before
-/// the child exists; refused in the shell, the FIFO's open never happens,
-/// and its reader waits for ever. The message after `line N: ` is bash's
+/// first): a dup of a closed fd (`3<&900`, `/dev/fd/900`, `3<&- 4<&3`), a
+/// dup of no number (`3<&$y`) or a target that is no single word. bash's
+/// child opens the FIFO and then fails, so the FIFO's reader (`cat`, or the
+/// shell's own `exec 5<`) gets end of file, and the job's status is 1; it
+/// stops there, so no word of a redirection after it is expanded. The
+/// engine knows these are bad before the child exists; refused in the
+/// shell, the FIFO's open never happens, and its reader waits for ever; and
+/// refused in the shell with the child spawned anyway, the program runs
+/// without the failed redirection (status 0). A builtin's same redirections
+/// are the shell's own (controls). The message after `line N: ` is bash's
 /// (bash 3.2, macOS's `/bin/bash`, names no line, so `$0: ` goes too),
 /// but for `/dev/fd/900`: bash opens the path (`No such file or
 /// directory`), and the engine reads it as a dup of fd 900 (`Bad file
@@ -473,6 +476,26 @@ const FAILS: &[(&str, &str, &str)] = &[
 		"a target of two words",
 		r#"two='a b'; /bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3> $two & cat "$D/fifo"; wait $!; echo "status $?"; sed -e 's/^.*line [0-9]*: //' -e "s#^$0: ##" "$D/err""#,
 		"status 1\n$two: ambiguous redirect\n",
+	),
+	(
+		"3<&$y, a dup of no number",
+		r#"y=nofd; /bin/sh -c 'echo ran' > "$D/fifo" 2> "$D/err" 3<&$y & cat "$D/fifo"; wait $!; echo "status $?"; sed -e 's/^.*line [0-9]*: //' -e "s#^$0: ##" "$D/err""#,
+		"status 1\nnofd: ambiguous redirect\n",
+	),
+	(
+		"a builtin's 3<&900 (a control)",
+		r#"echo ran > "$D/fifo" 2> "$D/err" 3<&900 & cat "$D/fifo"; wait $!; echo "status $?"; sed -e 's/^.*line [0-9]*: //' -e "s#^$0: ##" "$D/err""#,
+		"status 1\n900: Bad file descriptor\n",
+	),
+	(
+		"a builtin's 3<&$y (a control)",
+		r#"y=nofd; echo ran > "$D/fifo" 2> "$D/err" 3<&$y & cat "$D/fifo"; wait $!; echo "status $?"; sed -e 's/^.*line [0-9]*: //' -e "s#^$0: ##" "$D/err""#,
+		"status 1\nnofd: ambiguous redirect\n",
+	),
+	(
+		"a builtin's /dev/fd/900 (a control)",
+		r#"echo ran > "$D/fifo" 2> "$D/err" 3< /dev/fd/900 & cat "$D/fifo"; wait $!; echo "status $?"; [ -s "$D/err" ] && echo said"#,
+		"status 1\nsaid\n",
 	),
 	(
 		"a word after it, not expanded",

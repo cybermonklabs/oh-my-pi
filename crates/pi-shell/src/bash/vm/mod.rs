@@ -4862,6 +4862,8 @@ impl Vproc {
 			subshell: 0,
 			outer_loops: 0,
 			command: None,
+			command_name: None,
+			trap_saved: 0,
 			spare: Vec::new(),
 			calls: Vec::new(),
 			own_traps: proc::OwnTraps::EMPTY,
@@ -4973,6 +4975,8 @@ impl Vproc {
 		vp.last_bg = self.last_bg;
 		vp.getopts.clone_from(&self.getopts);
 		vp.command.clone_from(&self.command);
+		vp.command_name = self.command_name;
+		vp.trap_saved = self.trap_saved;
 		vp.rlimits.clone_from(&self.rlimits);
 		vp.lineage = self.lineage;
 		jobctl::inherit(k, vp.vpid, self.vpid);
@@ -5031,10 +5035,10 @@ impl Vproc {
 		frame.ignore_errexit = self.frames.last().is_some_and(exec::errexit_ignored);
 		// bash's fork keeps `parse_and_execute_level`: a child started
 		// inside an `eval`, `.` or trap action (or a child of one) runs
-		// inside that level.
-		if self.frames.iter().any(exec::parse_and_execute) {
-			frame.flags.set_parse_level(proc::ParseLevel::Kept);
-		}
+		// inside that level; one started inside a substitution's text keeps
+		// the substitution's jump target, and one whose outermost level is
+		// an EXIT trap action keeps that trap's ([`exec::fork_level`]).
+		frame.flags.set_parse_level(exec::fork_level(store, self));
 		// Room for exactly this frame: a `Frame` is ~300 bytes and a first
 		// push reserves four (idle vproc ≤ 2 KiB); calls grow it.
 		vp.frames.reserve_exact(1);

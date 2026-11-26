@@ -1558,6 +1558,7 @@ mod tests {
 					arrayref:    Vec::new(),
 					resumed:     0,
 					arith_at:    None,
+					discard:     false,
 				};
 				let mut c = Curses::new(BString::from("xterm"), 24, 80);
 				c.pending = b"abc".to_vec();
