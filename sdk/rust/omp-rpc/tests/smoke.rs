@@ -245,7 +245,6 @@ fn smoke_real_server() {
 		std::thread::sleep(Duration::from_millis(20));
 	}
 	println!("server group gone {:?} after drop", dropped.elapsed());
-	let _ = std::fs::remove_dir_all(&agent_dir);
 }
 
 fn tool_names(turn: &PromptTurn) -> Vec<(&'static str, String)> {
@@ -431,7 +430,6 @@ fn smoke_scripted_model() {
 	drop(client);
 	drop(model.stdin.take());
 	let _ = model.wait();
-	let _ = std::fs::remove_dir_all(&agent_dir);
 }
 
 fn prompt(message: &str) -> PromptCommand {
