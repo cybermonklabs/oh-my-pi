@@ -1355,7 +1355,11 @@ export class TurnRecovery {
 	/**
 	 * Ends a retry saga: records its outcome in the session (the terminal empty
 	 * error turn, the annotations on the attempts it retried), publishes
-	 * `auto_retry_end`, then resets the saga and resolves `retryPromise`.
+	 * `auto_retry_end`, then resolves `retryPromise`. The close takes the saga
+	 * (its attempt count and its pending errors) before its first await: a reply
+	 * that settles while the outcome is written finds no open saga and does not
+	 * close it a second time, and a saga that starts meanwhile keeps its own
+	 * attempt count and errors.
 	 * Publishing and releasing run in `finally`, so a session write that throws
 	 * (a full disk, an unwritable transcript) still ends the saga before its
 	 * error propagates. Left pending, `retryPromise` keeps the in-flight prompt
@@ -1366,10 +1370,15 @@ export class TurnRecovery {
 		end: RetrySagaEnd,
 		record: { terminalTurn?: AssistantMessage; retryErrors?: RetryErrorCompletion },
 	): Promise<void> {
+		this.#retryAttempt = 0;
+		const pendingRetryErrors = this.#pendingRetryErrors;
+		this.#clearPendingRetryErrors();
 		let retryErrors: RetryErrorUpdate[] | undefined;
 		try {
 			if (record.terminalTurn) await this.persistTerminalEmptyErrorTurn(record.terminalTurn);
-			if (record.retryErrors) retryErrors = await this.#markPendingRetryErrors(record.retryErrors);
+			if (record.retryErrors) {
+				retryErrors = await this.#markPendingRetryErrors(pendingRetryErrors, record.retryErrors);
+			}
 		} finally {
 			try {
 				await this.#host.emitSessionEvent({
@@ -1378,8 +1387,6 @@ export class TurnRecovery {
 					...(retryErrors ? { retryErrors } : {}),
 				});
 			} finally {
-				this.#clearPendingRetryErrors();
-				this.#retryAttempt = 0;
 				this.resolveRetry();
 			}
 		}
@@ -1471,11 +1478,14 @@ export class TurnRecovery {
 	 * recovered saga closes on a successful turn, which also continued from the
 	 * kept turns: their `continued` stamps go in the same write.
 	 */
-	async #markPendingRetryErrors(completion: RetryErrorCompletion): Promise<RetryErrorUpdate[]> {
+	async #markPendingRetryErrors(
+		pendingRetryErrors: readonly PendingRetryError[],
+		completion: RetryErrorCompletion,
+	): Promise<RetryErrorUpdate[]> {
 		const stamps = completion.status === "recovered" ? await this.#continuedStamps() : [];
 		const branch = this.#host.sessionManager.getBranchView();
 		const retryErrors: RetryErrorUpdate[] = [];
-		for (const pending of this.#pendingRetryErrors) {
+		for (const pending of pendingRetryErrors) {
 			const target = branchAssistantEntry(branch, pending.entryId, pending.persistenceKey);
 			if (!target) continue;
 			let retryRecovery: AssistantRetryRecovery;

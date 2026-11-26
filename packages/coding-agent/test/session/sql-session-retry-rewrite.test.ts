@@ -13,8 +13,9 @@
  *   not recorded the session kept the size from before it: every later write stated that size and was refused, and
  *   the store took nothing more while the process lived. Appending the outcome as an `entry_patch` record, and an
  *   entry recorded during the session's own full rewrite waiting for it, each keep this from happening.
- * - The retry closes once: while a slow write of the outcome was pending, the next successful reply closed the retry
- *   a second time.
+ * - The retry closes once: the retry's close writes its outcome (an `entry_patch` record), and the test holds that
+ *   write open until the reply after the tool has settled. While the close waited on its write, the retry stayed
+ *   open, and that reply closed it a second time and wrote the outcome again.
  *
  * SQLite always; PostgreSQL and MySQL when `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a database.
  */
@@ -48,6 +49,8 @@ const RATE_LIMITED =
 const TOOL_RESULT = "MARKER-TOOL-RESULT";
 const FIRST_ANSWER = "MARKER-FIRST-TURN-ANSWER";
 const SECOND_ANSWER = "MARKER-SECOND-TURN-ANSWER";
+/** The output tokens the reply after the tool reports, by which the test knows that reply's usage report. */
+const NEXT_REPLY_OUTPUT_TOKENS = 7;
 
 /** A statement of a full write that an append never runs: the full write replaces the session's parts. */
 const FULL_WRITE_STATEMENT = /^DELETE FROM \S+_parts WHERE path = /;
@@ -149,8 +152,13 @@ afterEach(() => {
 
 async function retriedTurnAndNext(
 	db: LeaseDb,
-	options: { failReadBack: boolean },
-): Promise<{ observed: Record<string, unknown>; manager: SessionManager; session: AgentSession }> {
+	options: { failReadBack: boolean; holdOutcome?: boolean },
+): Promise<{
+	observed: Record<string, unknown>;
+	close: { outcomeWrites: number; outcomeHeld: string };
+	manager: SessionManager;
+	session: AgentSession;
+}> {
 	let hold!: Hold;
 	const storage = await db.open({
 		lease: STILL,
@@ -216,6 +224,29 @@ async function retriedTurnAndNext(
 		return id;
 	}) as SessionManager["appendMessage"];
 
+	// With `holdOutcome`, the test counts each write of the retry's outcome (an `entry_patch` record that sets
+	// `retryRecovery` on the refused attempt's entry) and keeps the first one pending, once its write has started,
+	// until the reply after the tool has settled: that reply settles while the retry's close still waits on its
+	// write, as it does on a busy store.
+	let outcomeWrites = 0;
+	let outcomeHeld = "not held";
+	const outcomePending = Promise.withResolvers<void>();
+	const nextReplySettled = Promise.withResolvers<void>();
+	if (options.holdOutcome) {
+		const patchEntries = manager.patchEntries.bind(manager);
+		manager.patchEntries = (async (patches: Parameters<SessionManager["patchEntries"]>[0]) => {
+			const writing = patchEntries(patches);
+			const outcome = armed && patches.some(patch => patch.message?.retryRecovery !== undefined);
+			if (outcome && outcomeWrites++ === 0) {
+				outcomeHeld = "held";
+				outcomePending.resolve();
+				await nextReplySettled.promise;
+				outcomeHeld = "held until the next reply settled";
+			}
+			await writing;
+		}) as SessionManager["patchEntries"];
+	}
+
 	const retryEnded = Promise.withResolvers<void>();
 	let toolRuns = 0;
 	const readTool: AgentTool = {
@@ -225,8 +256,13 @@ async function retriedTurnAndNext(
 		parameters: type({ "path?": "string" }),
 		execute: async () => {
 			// The tool after the retry finishes while the retry's rewrite publishes. A build whose retry makes no
-			// full write closes the retry first, and the tool goes on then.
-			if (toolRuns++ === 0) await Promise.race([rewriteHeld.promise, retryEnded.promise]);
+			// full write closes the retry first, and the tool goes on then. With `holdOutcome` the tool does not wait
+			// for the retry to close: it goes on once the outcome's write is pending (or a full write is held).
+			if (toolRuns++ === 0) {
+				await (options.holdOutcome
+					? Promise.race([outcomePending.promise, rewriteHeld.promise])
+					: Promise.race([rewriteHeld.promise, retryEnded.promise]));
+			}
 			return { content: [{ type: "text" as const, text: TOOL_RESULT }], details: {} };
 		},
 	};
@@ -234,13 +270,27 @@ async function retriedTurnAndNext(
 	if (!model) throw new Error("Expected the bundled anthropic model");
 	const authStorage = createInMemoryAuthStorage();
 	authStorage.keys.setRuntime("anthropic", "test-key");
+	if (options.holdOutcome) {
+		// The session reports each reply's usage right after it settles the reply (closing the retry that reply
+		// ends); the report of the reply after the tool lets the held outcome write go on.
+		const usage = authStorage.usage;
+		const observe = usage.observe.bind(usage);
+		usage.observe = entry => {
+			observe(entry);
+			if (entry.usage.output === NEXT_REPLY_OUTPUT_TOKENS) nextReplySettled.resolve();
+		};
+	}
 	const mock = createMockModel({
 		responses: [
 			{ throw: RATE_LIMITED },
 			{ content: [{ type: "toolCall", name: "read", arguments: { path: "notes.txt" } }] },
 			() => {
 				releaseHold("the model call after the tool");
-				return { content: [FIRST_ANSWER], stopReason: "stop" as const };
+				return {
+					content: [FIRST_ANSWER],
+					stopReason: "stop" as const,
+					usage: { output: NEXT_REPLY_OUTPUT_TOKENS },
+				};
 			},
 			{ content: [SECOND_ANSWER], stopReason: "stop" },
 		],
@@ -292,6 +342,7 @@ async function retriedTurnAndNext(
 	return {
 		manager,
 		session,
+		close: { outcomeWrites, outcomeHeld },
 		observed: {
 			retried: retries,
 			rewriteHeld: held ? `held, let go by ${releasedBy}` : "no full write after the retry",
@@ -341,16 +392,24 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 				await session.dispose();
 				await manager.close();
 			}, 120_000);
-
-			// If this regresses, the retry stays open while its outcome is written, and the next successful reply closes
-			// it a second time: two `auto_retry_end` events for one refused call.
-			it(`closes the retry once, when ${when}`, async () => {
-				await using db = await openLeaseDb(adapter, url ?? "");
-				const { observed, manager, session } = await retriedTurnAndNext(db, { failReadBack });
-				expect({ retried: observed.retried }).toEqual({ retried: [true] });
-				await session.dispose();
-				await manager.close();
-			}, 120_000);
 		}
+
+		// If this regresses, the retry stays open while its close writes the outcome, and the reply after the tool,
+		// settling in that window, closes it a second time: two `auto_retry_end` events and two writes of the outcome
+		// for one refused call.
+		it("closes the retry once, when the next reply settles while the retry's outcome is written", async () => {
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const { observed, close, manager, session } = await retriedTurnAndNext(db, {
+				failReadBack: false,
+				holdOutcome: true,
+			});
+			expect({ retried: observed.retried, ...close }).toEqual({
+				retried: [true],
+				outcomeWrites: 1,
+				outcomeHeld: "held until the next reply settled",
+			});
+			await session.dispose();
+			await manager.close();
+		}, 120_000);
 	});
 }
