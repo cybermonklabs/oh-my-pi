@@ -169,6 +169,11 @@ ROW_KEYS = tuple(k for _, k in ROWS) + tuple(k for _, k in RUST_JOBS)
 WORKFLOW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "sami-checks.yml")
 # The jobs every run has: the plan, and the summary that reads every other job.
 ALWAYS_JOBS = ("plan", "summary")
+# The Rust gate's build seed (the dispatch input `seed`, .github/sami/gate-seed.sh): the newest
+# cut's seed, one this run's own seed jobs build, or none.
+SEEDS = ("auto", "build", "off")
+# The cut whose run also builds the Linux gate cold and compares the two, test by test: every fifth.
+SEED_CONTROL_EVERY = 5
 # The rows whose results hold their passing tests' output (libtest logs, JUnit reports), which the
 # skip prints row's run-time unit reads (sc.py skip-lines, passing_outputs). The gVisor set shards
 # also hold the gVisor lib and map-limit rows' logs.
@@ -239,7 +244,9 @@ def row_work():
         "docs": one("docs"),
         "changelog": one("changelog"),
         "rustfmt": one("rustfmt"),
-        "rust_test": one("rust-test") | one("rust-test-drift"),
+        # rust-test-drift's result is part of this row, and so is the seed's control: the cold run
+        # of the same commit (rust-test-cold) and the comparison of the two (rust-test-compare).
+        "rust_test": one("rust-test") | one("rust-test-drift") | one("rust-test-cold") | one("rust-test-compare"),
         "rust_test_macos": one("rust-test-macos"),
     }
     for r in ("set-runner", "set-root", "lib4"):
@@ -317,10 +324,25 @@ def cmd_plan():
         selected = parse_rows(os.environ.get("SC_INPUT_ROWS", ""))
         silent = os.environ.get("SC_INPUT_SILENT", "")
         plant = os.environ.get("SC_INPUT_PLANT", "")
+        seed = os.environ.get("SC_INPUT_SEED", "") or "auto"
+        if seed not in SEEDS:
+            sys.exit(f"::error::the seed input names no build seed: '{seed}' (one of {', '.join(SEEDS)})")
+        # A dispatch that builds a seed is the seed's own proof, so it runs the cold control and the
+        # comparison beside the seeded jobs, on the one commit.
+        control = seed == "build"
     elif event == "push" and ref == "refs/heads/release-candidate":
         # The cut: every row, and no control, whatever an input says.
         commit = os.environ["GITHUB_SHA"]
         selected, silent, plant = list(ROW_KEYS), "", ""
+        # It builds its own seed from its own commit and reads that one. The seed's cold control
+        # runs on every fifth cut, read from the newest `sami release CutN` commit of this
+        # candidate's history (SC_CUT, which the plan job's step before this one found).
+        seed = "build"
+        cut = os.environ.get("SC_CUT", "").strip()
+        control = cut.isdigit() and int(cut) % SEED_CONTROL_EVERY == 0
+        if not cut.isdigit():
+            print(f"::warning title=The cut of this candidate::UNKNOWN: no 'sami release CutN' commit in this "
+                  f"candidate's last 300 (SC_CUT is '{cut}'), so the seed's cold control does not run", file=sys.stderr)
     else:
         sys.exit(f"::error::sami checks runs on a push of release-candidate or a dispatch, not on {event} of {ref}")
     planned, rows, jobs = plan_rows(selected, workflow_jobs())
@@ -335,7 +357,8 @@ def cmd_plan():
         sys.exit(f"::error::the plant input names no row's control: '{plant}' (one of {', '.join(PLANTS)})")
     if plant and plant not in rows:
         sys.exit(f"::error::the plant input plants a fault in the row '{plant}', which this run does not run (its rows: {', '.join(rows)})")
-    print(f"PLAN rows ({len(rows)} of {len(ROW_KEYS)}): {', '.join(rows)}; jobs: {', '.join(jobs)}", file=sys.stderr)
+    print(f"PLAN rows ({len(rows)} of {len(ROW_KEYS)}): {', '.join(rows)}; jobs: {', '.join(jobs)}; "
+          f"seed: {seed}; the seed's cold control: {'yes' if control else 'no'}", file=sys.stderr)
     if len(rows) < len(ROW_KEYS):
         print(f"::notice title=A subset of the rows::{len(rows)} of {len(ROW_KEYS)} rows run ({', '.join(rows)}); "
               "the summary reads the others NOT RUN", file=sys.stderr)
@@ -363,6 +386,9 @@ def cmd_plan():
         "gvisor": only("gvisor", gvisor_matrix()),
         "gv_set_shards": GV_SET_SHARDS,
         "plant": plant,
+        # The Rust gate jobs' build seed, and whether the cold control runs beside them.
+        "seed": seed,
+        "seed_control": "true" if control else "false",
     }
     for k, v in out.items():
         print(f"{k}={v}")
@@ -2962,9 +2988,10 @@ def selftest():
     check("a control test that did not run is UNKNOWN and named",
           (r["status"], r["note"].endswith(ORPHAN_CONTROL_TESTS[0].rsplit("::", 1)[-1])), ("UNKNOWN", True))
     # The plan: cmd_plan's outputs for a dispatch with these inputs, or the message it stopped with.
-    def plan_out(rows="all", silent="", plant="", event="workflow_dispatch", ref="refs/heads/x"):
+    def plan_out(rows="all", silent="", plant="", event="workflow_dispatch", ref="refs/heads/x", seed="", cut=""):
         env = dict(GITHUB_EVENT_NAME=event, GITHUB_REF=ref, GITHUB_SHA="b" * 40, SC_INPUT_COMMIT="a" * 40,
-                   SC_INPUT_ROWS=rows, SC_INPUT_SILENT=silent, SC_INPUT_PLANT=plant)
+                   SC_INPUT_ROWS=rows, SC_INPUT_SILENT=silent, SC_INPUT_PLANT=plant, SC_INPUT_SEED=seed,
+                   SC_CUT=cut)
         kept_env = {k: os.environ.get(k) for k in env}
         os.environ.update(env)
         buf = io.StringIO()
@@ -2985,6 +3012,21 @@ def selftest():
     for plant_in, ok in (("", True), ("docs", True), ("changelog", True), ("rustfmt", True), ("both", False)):
         r = plan_out(plant=plant_in)
         check(f"plan with plant={plant_in!r}", isinstance(r, dict) and r.get("plant") == plant_in, ok)
+    # The Rust gate's build seed. A dispatch takes auto (the newest cut's), build (this run's own)
+    # or off, and a build is the seed's own proof: it runs the cold control beside the seeded jobs.
+    for seed_in, want in (("", "auto"), ("auto", "auto"), ("build", "build"), ("off", "off")):
+        r = plan_out(seed=seed_in)
+        check(f"plan with seed={seed_in!r}", (r.get("seed"), r.get("seed_control")) if isinstance(r, dict) else r,
+              (want, "true" if want == "build" else "false"))
+    r = plan_out(seed="warm")
+    check("plan: a seed input that is no mode fails, naming it and listing the modes",
+          (isinstance(r, str), "'warm'" in r, all(s in r for s in SEEDS)), (True, True, True))
+    # The cut builds its own seed, and runs the cold control on every fifth cut (SC_CUT, the cut
+    # number of the newest `sami release CutN` commit). No number is no control, and says so.
+    for cut_in, control in (("15", "true"), ("14", "false"), ("20", "true"), ("", "false"), ("none", "false")):
+        r = plan_out(event="push", ref="refs/heads/release-candidate", cut=cut_in)
+        check(f"plan: the cut {cut_in!r} builds its own seed, and runs the cold control on every fifth",
+              (r.get("seed"), r.get("seed_control")) if isinstance(r, dict) else r, ("build", control))
     # The row selection (the dispatch input `rows`). Each job of sami-checks.yml but the plan and the
     # summary runs only when the plan names it in `jobs`, and some row's work reaches it.
     wf = workflow_jobs()
@@ -3000,6 +3042,7 @@ def selftest():
     r = plan_out(rows="all,docs")
     check("plan: all stands alone", (isinstance(r, str), "'all'" in r), (True, True))
     full = dict(commit="a" * 40, rows=",".join(ROW_KEYS), jobs=json.dumps(gated), silent="", plant="",
+                seed="auto", seed_control="false",
                 set=json.dumps(set_matrix()), builtins=json.dumps(builtins_matrix()), workspace=json.dumps(workspace_matrix()),
                 ts=json.dumps(ts_matrix()), gvisor=json.dumps(gvisor_matrix()), platforms=",".join(PLATFORMS))
 
@@ -3008,8 +3051,8 @@ def selftest():
 
     check("plan: a dispatch with rows=all runs every row and every job", picked(plan_out()), full)
     check("plan: the cut tests the pushed commit with every row and no control, whatever the inputs say",
-          picked(plan_out(rows="docs", silent="docs", plant="docs", event="push", ref="refs/heads/release-candidate")),
-          dict(full, commit="b" * 40))
+          picked(plan_out(rows="docs", silent="docs", plant="docs", seed="off", event="push", ref="refs/heads/release-candidate")),
+          dict(full, commit="b" * 40, seed="build"))
     r = plan_out(event="push", ref="refs/heads/feat/sami-checks")
     check("plan: a push of another branch plans nothing", (isinstance(r, str), "not on push of refs/heads/feat/sami-checks" in r), (True, True))
     # A prerequisite build runs only for a row whose job needs it (its needs: in sami-checks.yml).
@@ -3018,8 +3061,9 @@ def selftest():
             ("ts-ca", "ts-ca", ["natives", "ts-ca"]),
             ("set-root", "set-runner,set-root,lib4", ["tools", "build", "set"]),
             ("lib4", "set-runner,set-root,lib4", ["tools", "build", "set"]),
-            ("rust_test", "rust_test", ["build", "natives", "rust-test", "rust-test-drift"]),
-            ("rust_test_macos", "rust_test_macos", ["build", "rust-test-macos"]),
+            ("rust_test", "rust_test", ["build", "natives", "seed-linux", "rust-test", "rust-test-drift",
+                                        "rust-test-cold", "rust-test-compare"]),
+            ("rust_test_macos", "rust_test_macos", ["build", "seed-macos", "rust-test-macos"]),
             ("gv-orphan-root", "gv-set-uid1000,gv-set-root,gv-lib4-uid1000,gv-lib4-root,gv-orphan-uid1000,gv-orphan-root",
              ["tools", "build", "gvisor"]),
             ("skipforms", "set-runner,set-root,lib4,builtins,workspace,ts-small,ts-ca,skipforms," + ",".join(

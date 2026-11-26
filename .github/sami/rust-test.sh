@@ -41,7 +41,10 @@
 # rust-test-drift job compares with the early listings the macOS job's
 # inventory read (.github/sami/rust-test-listings-drift.sh), and cargo's
 # --timings report of each cargo test in $RUNNER_TEMP/rust-test/cargo-timings,
-# with each one's build and test seconds in the job log and the step summary.
+# with each one's build and test seconds in the job log and the step summary,
+# and every test's result in $RUNNER_TEMP/rust-test/results/results.tsv, which
+# sami-checks.yml's rust-test-compare job reads to check that a run from a
+# build seed and a cold run of one commit agree test by test.
 # With RUST_TEST_ONLY naming a list (the macOS job names that inventory), it
 # runs only the tests that list names, each target once with --exact, and
 # fails unless each of them ran here; the failure, skip and output rules are
@@ -1261,6 +1264,59 @@ while IFS=$'\t' read -r label rule status kind log _ inv; do
 		*) error "Rust tests" "$label is a $rule, whose log this step cannot read" ;;
 	esac
 done <"$rows"
+
+# The per-test results of this job, which sami-rust-test.yml uploads and
+# sami-checks.yml's rust-test-compare job reads: one line per test, as
+# `<target> <test name> <final status> <status per invocation>`. The final
+# status is `ok` when the test passed in some invocation or attempt, else
+# `failed` when it failed in one, else `ignored`; the last column names each
+# invocation and what it reported there, sorted. Two runs of one commit, one
+# cold and one from a build seed, must give the same file
+# (.github/sami/rust-test-results-compare.sh): a build cache that changes a
+# test's verdict is a build cache nothing may trust. It is written here, before
+# the accounting below, so that the macOS job (RUST_TEST_ONLY, which returns
+# before it) writes it too.
+results="$tmp/results"
+mkdir -p "$results"
+: >"$tmp/results-raw.tsv"
+while IFS=$'\t' read -r label rule _ _ log _ inv; do
+	[ -f "$log" ] || continue
+	case "$rule" in
+		"rust_doc_test rule")
+			# The doctest runner writes libtest's text, not its record.
+			awk -v t="$label" -v i="$inv" '
+				/^test .* \.\.\. (ok|FAILED|ignored)$/ {
+					s = $NF
+					line = $0
+					sub(/^test /, "", line)
+					sub(/ \.\.\. (ok|FAILED|ignored)$/, "", line)
+					if (s == "FAILED") { s = "failed" }
+					print t "\t" line "\t" i "\t" s
+				}' "$log"
+			;;
+		*)
+			jq -R -r --arg target "$label" --arg inv "$inv" 'fromjson?
+				| select(type == "object" and .type == "test" and (.event == "ok" or .event == "failed" or .event == "ignored"))
+				| [$target, .name, $inv, .event] | @tsv' "$log"
+			;;
+	esac >>"$tmp/results-raw.tsv"
+done <"$rows"
+LC_ALL=C sort -u -o "$tmp/results-raw.tsv" "$tmp/results-raw.tsv"
+awk -F'\t' '
+	{ key = $1 "\t" $2
+	  if (!(key in seen)) { seen[key] = ""; order[++n] = key }
+	  seen[key] = (seen[key] == "" ? "" : seen[key] ",") $3 "=" $4
+	  if ($4 == "ok") { final[key] = "ok" }
+	  else if ($4 == "failed" && final[key] != "ok") { final[key] = "failed" }
+	  else if (!(key in final)) { final[key] = "ignored" }
+	}
+	END { for (i = 1; i <= n; i++) { print order[i] "\t" final[order[i]] "\t" seen[order[i]] } }
+' "$tmp/results-raw.tsv" >"$results/results.tsv"
+if [ ! -s "$results/results.tsv" ]; then
+	error "Rust test results" "no test of any invocation reported a result, so this job's per-test results are empty and nothing can be compared with them"
+else
+	echo "Per-test results: $(count "$results/results.tsv") tests in $results"
+fi
 
 # The #[ignore]d cargo tests: each must be named in
 # .github/sami/rust-test-ignored.txt, which ran it alone above; any other

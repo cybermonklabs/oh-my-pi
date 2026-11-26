@@ -28,6 +28,14 @@
 # restore nor save a GitHub Actions cache entry, so it cannot write one that sami-build.yml's
 # release_binary restores on the same push. Harness cases W6 to W8, W12, W23 to W25, W30, W34,
 # W36, W46, W68 and W69 (.github/sami/tests/run.sh) keep it so.
+#
+# The build seed is how these jobs are faster without a cache: an artifact a seed job of
+# sami-checks.yml built from the commit under test, with no test and no root setup, holding the
+# Bazel disk and repository caches of that build. These jobs download it, check it against the
+# sha256 its seed job published, and unpack it into the disk cache
+# (.github/sami/gate-seed.sh, which writes one GATESEED path=seeded|cold line and builds cold on
+# any doubt). It is never a GitHub Actions cache entry, so no token here can write anything
+# release_binary restores; `actions: read` is all the jobs hold, and the repository is public.
 name: sami rust tests
 
 on:
@@ -57,6 +65,29 @@ on:
         required: false
         default: ""
         type: string
+      # The build seed the Bazel builds start from (.github/sami/gate-seed.sh):
+      # `auto` reads the newest cut's, `build` reads the one the calling run's
+      # own seed job built and names its sha256 in seed-sha256, and `off`
+      # builds cold. A miss or a sha256 that differs builds cold too.
+      seed:
+        description: "The build seed: auto (the newest cut's), build (the calling run's own) or off"
+        required: false
+        default: "off"
+        type: string
+      seed-sha256:
+        description: "With seed=build: the sha256 the calling run's seed job gave"
+        required: false
+        default: ""
+        type: string
+      # The seed's cold control calls this workflow a second time in one run,
+      # on the same job, so every artifact it uploads is named apart: two jobs
+      # that upload one name make one of them fail, and the drift check must
+      # read the listings of the run under test, not the control's.
+      control:
+        description: "This call is the seed's cold control, and its artifacts carry -cold"
+        required: false
+        default: false
+        type: boolean
     # Each job's result (success, failure, cancelled or skipped), for sami-checks' summary rows.
     outputs:
       rust-test:
@@ -114,8 +145,12 @@ jobs:
     timeout-minutes: 150
     # Test code and dev-dependency build scripts run here, so the job gets a
     # read-only token, and checkout keeps no credential in .git/config.
+    # actions: read downloads the seed artifact of this run or of the newest
+    # cut's, and reads that run's seed job log for its sha256; the repository
+    # is public, so it reads nothing private. It grants no write of any kind.
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Check out the gate's scripts and actions
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -192,6 +227,55 @@ jobs:
         run: bash ../tool/.github/sami/tests/run.sh
       - id: bazel
         uses: ./tool/.github/actions/bazel-cache
+      # The build seed (.github/sami/gate-seed.sh): the Bazel disk cache a seed
+      # job built from this commit's own build code, with no test and no root
+      # setup, in this run (seed=build, the sha256 that job gave as its output)
+      # or in the newest cut's run (seed=auto, the sha256 that job wrote in its
+      # own log). The pick step names the run to take it from, the download
+      # step brings the artifact, and the use step checks the bytes against
+      # that sha256 and unpacks them, or leaves this job to build cold; its
+      # GATESEED path= line says which. No GitHub Actions cache is touched
+      # either way, and every test runs whatever the cache holds
+      # (test --cache_test_results=no).
+      - name: Which seed this job reads
+        id: seed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEED_MODE: ${{ inputs.seed }}
+          SEED_SHA256: ${{ inputs.seed-sha256 }}
+          SEED_NAME: sc-seed-linux
+          SEED_JOB: build seed (Linux)
+        run: bash ../tool/.github/sami/gate-seed.sh pick
+      # The seed of this run is this run's artifact, and the cut's is another
+      # run's: that one needs the run's id and a token, and this one must not
+      # name them (download-artifact takes the current run when it is given
+      # neither). A download that fails leaves the job to build cold.
+      - name: Download this run's own seed
+        if: ${{ steps.seed.outputs.run-id == github.run_id }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sc-seed-linux
+          path: ${{ runner.temp }}/gate-seed
+      - name: Download the cut's seed
+        if: ${{ steps.seed.outputs.run-id != '' && steps.seed.outputs.run-id != github.run_id }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sc-seed-linux
+          run-id: ${{ steps.seed.outputs.run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/gate-seed
+      - name: Point Bazel at the seed
+        shell: bash
+        env:
+          RC: ${{ steps.bazel.outputs.rc }}
+          SEED_ARCHIVE: ${{ runner.temp }}/gate-seed/sc-seed.tar.zst
+          SEED_SHA256: ${{ steps.seed.outputs.sha256 }}
+          SEED_REASON: ${{ steps.seed.outputs.reason }}
+          SEED_RUN_ID: ${{ steps.seed.outputs.run-id }}
+        run: bash ../tool/.github/sami/gate-seed.sh use
       # The reference rsync, zsh and bash below are built from pinned
       # tarballs on every run, never restored from a GitHub Actions cache: the
       # tests run in this job, on a runner whose user has passwordless sudo,
@@ -554,7 +638,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: cargo-timings-linux
+          name: cargo-timings-linux${{ inputs.control && '-cold' || '' }}
           path: ${{ runner.temp }}/rust-test/cargo-timings
           retention-days: 14
           if-no-files-found: warn
@@ -564,10 +648,22 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: rust-test-listings
+          name: rust-test-listings${{ inputs.control && '-cold' || '' }}
           path: ${{ runner.temp }}/rust-test/listings
           retention-days: 3
           if-no-files-found: error
+      # Every test's result, which sami-checks.yml's rust-test-compare job
+      # reads to check a seeded run against a cold one of the same commit
+      # (.github/sami/rust-test-results-compare.sh). The cold control's
+      # artifact is this name with -cold, so one run can hold both.
+      - name: The per-test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-test-results-linux${{ inputs.control && '-cold' || '' }}
+          path: ${{ runner.temp }}/rust-test/results
+          retention-days: 3
+          if-no-files-found: warn
       - name: Every Rust test has a Bazel test target
         # `bazel test //crates/...` runs only Bazel test targets, and most of
         # pi-edit's, pi-shell's and pi-vcs's tests/*.rs files, obash's unit
@@ -596,8 +692,12 @@ jobs:
     name: Rust tests (bazel, macOS-only tests)
     runs-on: macos-15
     timeout-minutes: 120
+    # actions: read downloads the seed artifact of this run or of the newest
+    # cut's, and reads that run's seed job log for its sha256; the repository
+    # is public, so it reads nothing private. It grants no write of any kind.
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Check out the gate's scripts and actions
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -658,6 +758,43 @@ jobs:
         run: bash ../tool/.github/sami/tests/run.sh
       - id: bazel
         uses: ./tool/.github/actions/bazel-cache
+      # The build seed, as in rust_test above: here it is the macOS seed job's,
+      # and the inventory's own `bazel build` of every test target reads it too.
+      - name: Which seed this job reads
+        id: seed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEED_MODE: ${{ inputs.seed }}
+          SEED_SHA256: ${{ inputs.seed-sha256 }}
+          SEED_NAME: sc-seed-macos
+          SEED_JOB: build seed (macOS)
+        run: bash ../tool/.github/sami/gate-seed.sh pick
+      - name: Download this run's own seed
+        if: ${{ steps.seed.outputs.run-id == github.run_id }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sc-seed-macos
+          path: ${{ runner.temp }}/gate-seed
+      - name: Download the cut's seed
+        if: ${{ steps.seed.outputs.run-id != '' && steps.seed.outputs.run-id != github.run_id }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sc-seed-macos
+          run-id: ${{ steps.seed.outputs.run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/gate-seed
+      - name: Point Bazel at the seed
+        shell: bash
+        env:
+          RC: ${{ steps.bazel.outputs.rc }}
+          SEED_ARCHIVE: ${{ runner.temp }}/gate-seed/sc-seed.tar.zst
+          SEED_SHA256: ${{ steps.seed.outputs.sha256 }}
+          SEED_REASON: ${{ steps.seed.outputs.reason }}
+          SEED_RUN_ID: ${{ steps.seed.outputs.run-id }}
+        run: bash ../tool/.github/sami/gate-seed.sh use
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: rust-test-early-listings
@@ -691,7 +828,19 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: cargo-timings-macos
+          name: cargo-timings-macos${{ inputs.control && '-cold' || '' }}
           path: ${{ runner.temp }}/rust-test/cargo-timings
           retention-days: 14
+          if-no-files-found: warn
+      # Every test's result, which sami-checks.yml's rust-test-compare job
+      # reads to check a seeded run against a cold one of the same commit
+      # (.github/sami/rust-test-results-compare.sh). The cold control's
+      # artifact is this name with -cold, so one run can hold both.
+      - name: The per-test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-test-results-macos${{ inputs.control && '-cold' || '' }}
+          path: ${{ runner.temp }}/rust-test/results
+          retention-days: 3
           if-no-files-found: warn
