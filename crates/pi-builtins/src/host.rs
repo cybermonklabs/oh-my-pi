@@ -762,11 +762,20 @@ mod msys {
 
 /// Read the calling process's file-creation mask without changing it.
 ///
-/// Linux and Android use `/proc/self/status` when available. Other Unix
-/// systems (and an unavailable `/proc`) require a forked probe: the fork has
-/// a cost in a large multithreaded host, but only the child changes its mask.
-/// Returns `None` if the probe cannot be created or read. The result is not
-/// cached, since another host component may change the process mask.
+/// Linux and Android use `/proc/self/status` when it has the mask. Where it
+/// has not (gVisor's has no `Umask` line, or `/proc` is not mounted), they
+/// read it with a short-lived child that shares this process's memory and
+/// descriptor table but has a file-creation mask of its own
+/// (`umask_without_fork`): its `umask(2)` changes only that copy, nothing of
+/// the address space or the descriptor table is copied, and `CLONE_VFORK`
+/// suspends this thread until the child has exited, so no other thread sees a
+/// changed mask and no descriptor is held in a child a concurrent spawn could
+/// leak. Other Unix systems, and a Linux that refuses that clone (as a seccomp
+/// filter can), fork a probe instead: the fork copies the address space and
+/// every descriptor of a large multithreaded host into a child that holds them
+/// until it exits, but only the child changes its mask. Returns `None` if no
+/// probe can be made or read. The result is not cached, since another host
+/// component may change the process mask.
 #[cfg(unix)]
 pub fn read_process_umask() -> Option<u32> {
 	#[cfg(any(target_os = "linux", target_os = "android"))]
@@ -781,7 +790,81 @@ pub fn read_process_umask() -> Option<u32> {
 	{
 		return Some(mask);
 	}
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	if let Some(mask) = umask_without_fork() {
+		return Some(mask);
+	}
 	probe_process_umask()
+}
+
+/// The entry the clone child runs: it reads the inherited mask (`umask(0)`
+/// returns the previous value and leaves the child's mask at 0, which dies
+/// with the child) and stores it through the shared pointer, then exits
+/// without returning up the shared stack. Async-signal-safe throughout.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+extern "C" fn clone_read_umask(arg: *mut libc::c_void) -> libc::c_int {
+	// SAFETY: arg is the `&mut u32` the parent passed; the child shares the
+	// parent's address space (CLONE_VM), so the write reaches it. umask is
+	// async-signal-safe and changes only this child's own mask.
+	unsafe {
+		*(arg as *mut u32) = u32::from(libc::umask(0)) & 0o7777;
+		libc::syscall(libc::SYS_exit, 0);
+	}
+	0
+}
+
+/// Read the caller's mask with a child that shares this process's memory and
+/// descriptor table (`CLONE_VM | CLONE_FILES`) but has a file-creation mask of
+/// its own, and that this thread waits out (`CLONE_VFORK`). The child copies
+/// neither the address space nor the descriptor table, so it holds no copy of
+/// any descriptor and leaves no window a concurrent spawn could catch. `None`
+/// when the stack cannot be mapped or the clone is refused (a seccomp filter).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn umask_without_fork() -> Option<u32> {
+	const STACK: usize = 64 << 10;
+	// SAFETY: a fresh anonymous mapping for the child's stack; its size and
+	// flags are constants and the result is checked against MAP_FAILED.
+	let stack = unsafe {
+		libc::mmap(
+			std::ptr::null_mut(),
+			STACK,
+			libc::PROT_READ | libc::PROT_WRITE,
+			libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+			-1,
+			0,
+		)
+	};
+	if stack == libc::MAP_FAILED {
+		return None;
+	}
+	let mut mask = u32::MAX;
+	let flags = libc::CLONE_VM | libc::CLONE_FILES | libc::CLONE_VFORK | libc::SIGCHLD;
+	// SAFETY: the child runs clone_read_umask on the top of the mapping above,
+	// reads the mask through &mut mask (shared by CLONE_VM) and exits without
+	// returning; CLONE_VFORK suspends this thread until it has, so mask is set
+	// and the stack is unused before either is touched again.
+	let pid = unsafe {
+		libc::clone(
+			clone_read_umask,
+			(stack as *mut u8).add(STACK).cast(),
+			flags,
+			(&raw mut mask).cast(),
+		)
+	};
+	if pid > 0 {
+		loop {
+			// SAFETY: pid is this thread's child; a null status discards it.
+			if unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) } >= 0 {
+				break;
+			}
+			if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+				break;
+			}
+		}
+	}
+	// SAFETY: the mapping is this function's, and the child no longer runs.
+	unsafe { libc::munmap(stack, STACK) };
+	(pid > 0 && mask != u32::MAX).then_some(mask)
 }
 
 /// Fork a short-lived child that can inspect its inherited mask without
@@ -829,6 +912,97 @@ fn probe_process_umask() -> Option<u32> {
 #[cfg(unix)]
 pub(crate) fn process_umask() -> u32 {
 	read_process_umask().unwrap_or(0o022)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod umask_tests {
+	use std::cell::Cell;
+
+	thread_local! {
+		/// The processes this thread forked while [`forks_while`] watched it.
+		static FORKS: Cell<Option<usize>> = const { Cell::new(None) };
+	}
+
+	/// `pthread_atfork` prepare handler, run by `fork(3)` in the forking
+	/// thread: counts a fork of a watched thread.
+	unsafe extern "C" fn count_fork() {
+		FORKS.with(|forks| {
+			if let Some(n) = forks.get() {
+				forks.set(Some(n + 1));
+			}
+		});
+	}
+
+	/// Runs `f` and counts the processes the current thread forks meanwhile.
+	/// Forks of other threads, other tests' among them, are not counted.
+	fn forks_while<T>(f: impl FnOnce() -> T) -> (T, usize) {
+		static REGISTERED: std::sync::Once = std::sync::Once::new();
+		REGISTERED.call_once(|| {
+			// SAFETY: the handler only reads and writes a thread-local.
+			assert_eq!(unsafe { libc::pthread_atfork(Some(count_fork), None, None) }, 0);
+		});
+		FORKS.with(|forks| forks.set(Some(0)));
+		let out = f();
+		(out, FORKS.with(Cell::take).unwrap_or(0))
+	}
+
+	/// The mask read without a fork is the one the caller has right then, and
+	/// the read makes no fork and leaves the mask as it was. The mask is set in
+	/// an isolated re-exec of this test binary (as the spawner's own umask
+	/// tests do), so no concurrent test sees the change: the child sets `umask
+	/// 027` before `exec` and runs only this test, which then reads it back.
+	#[test]
+	fn the_mask_is_read_right_after_umask_027_without_a_fork() {
+		use std::os::unix::process::CommandExt as _;
+
+		const MARKER: &str = "PI_UMASK_CLONE_ISOLATED";
+		if std::env::var_os(MARKER).is_none() {
+			let exe = std::env::current_exe().expect("test binary path");
+			let mut cmd = std::process::Command::new(exe);
+			cmd.args([
+				"--exact",
+				"host::umask_tests::the_mask_is_read_right_after_umask_027_without_a_fork",
+				"--nocapture",
+				"--test-threads=1",
+			])
+			.env(MARKER, "1");
+			// SAFETY: runs after fork, before exec, and changes only the
+			// isolated child process's own mask.
+			unsafe {
+				cmd.pre_exec(|| {
+					libc::umask(0o027);
+					Ok(())
+				});
+			}
+			let out = cmd.output().expect("run the isolated umask test");
+			assert!(
+				out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+				"isolated umask test: {}{}",
+				String::from_utf8_lossy(&out.stdout),
+				String::from_utf8_lossy(&out.stderr),
+			);
+			return;
+		}
+		let (mask, forks) = forks_while(super::umask_without_fork);
+		// SAFETY: umask cannot fail; this isolated process's mask is its own.
+		let after = unsafe { libc::umask(0o027) };
+		assert_eq!(mask, Some(0o027), "the mask read");
+		assert_eq!(forks, 0, "the read forked a process");
+		assert_eq!(after, 0o027, "the read changed the mask");
+	}
+
+	/// Reading the process's mask makes no fork: it comes from
+	/// `/proc/self/status` where that has it, else (gVisor) from a child that
+	/// copies nothing (`umask_without_fork`), never the address-space-copying
+	/// fork. `forks_while` counts `fork(3)` through a `pthread_atfork` handler,
+	/// which the clone route does not trigger and the fork fallback does.
+	#[test]
+	fn reading_the_process_mask_forks_no_process() {
+		let (mask, forks) = forks_while(super::read_process_umask);
+		assert_eq!(forks, 0, "the read forked a process");
+		assert!(mask.is_some(), "no mask read");
+		assert_eq!(mask, super::umask_without_fork(), "the read and the clone route disagree");
+	}
 }
 
 impl Host {
