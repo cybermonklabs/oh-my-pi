@@ -605,37 +605,37 @@ pub struct Var {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
 	/// Identity in the scheduler and the store key.
-	pub id:        JobId,
+	pub id:         JobId,
 	/// `%n`.
-	pub number:    u32,
+	pub number:     u32,
 	/// The job's root vproc (its process group leader for `jobs -p`, `$!`).
-	pub vpid:      Vpid,
+	pub vpid:       Vpid,
 	/// The command as bash prints it (`jobs`, `fg`, `bg`).
-	pub text:      BString,
+	pub text:       BString,
 	/// State.
-	pub state:     JobState,
+	pub state:      JobState,
 	/// Started while `set -m` was on (bash `J_JOBCONTROL`): only these can
 	/// be moved by `fg`/`bg`.
-	pub control:   bool,
+	pub control:    bool,
 	/// The current state was reported (bash `J_NOTIFIED`): `jobs -n` skips
 	/// the job until its state changes.
-	pub notified:  bool,
+	pub notified:   bool,
 	/// `disown -h`: kept, but marked not to get a `SIGHUP` (bash
 	/// `J_NOHUP`).
-	pub nohup:     bool,
+	pub nohup:      bool,
 	/// Copied from the parent shell into a command substitution (or a
 	/// `jobs` pipeline stage): listed, but not a child of this vproc. Never
 	/// set in the root shell's table.
-	pub inherited: bool,
+	pub inherited:  bool,
 	/// Working directory it started in (`(wd: …)` when it differs).
-	pub wd:        BString,
+	pub wd:         BString,
 	/// The OS pid of the program the job runs, once it spawned it: bash's
 	/// subshell for an asynchronous simple command `exec`s the program, so
 	/// a job whose lone command is an external (or whose body `exec`s one)
 	/// is known by that program's pid (`$!`, `jobs -l`/`-p`; `kill`, `wait`
 	/// and `disown` accept it). `None` for a compound job, a builtin, a
 	/// function, a failed spawn, and while the job has not decided yet.
-	pub os_pid:    Option<u32>,
+	pub os_pid:     Option<u32>,
 	/// The signal that ended the job (bash `WIFSIGNALED` of its status,
 	/// `raw_job_exit_status`), set with [`JobState::Done`]: `None` for one
 	/// that exited, with 137 too. A job of one process takes that process's;
@@ -645,7 +645,7 @@ pub struct Job {
 	/// keeps it in the job's [`Record::JobFacts`] ([`Job::facts`]), the frames
 	/// image next to a subshell's job table.
 	#[serde(skip)]
-	pub signal:    Option<Signal>,
+	pub signal:     Option<Signal>,
 	/// The job's processes (bash's job's `PROCESS` list), when it has
 	/// several: the stages of the pipeline that is the job's whole command
 	/// (`a | b &`), which bash forks as it starts the job. Recorded as the
@@ -656,7 +656,18 @@ pub struct Job {
 	/// stage the job's vproc runs itself (`lastpipe`). Boxed: most jobs have
 	/// none. A fact ([`Job::facts`]), as [`Self::signal`] is.
 	#[serde(skip)]
-	pub procs:     Option<Box<JobProcs>>,
+	pub procs:      Option<Box<JobProcs>>,
+	/// A command the shell forked and waits for (bash `J_FOREGROUND`): bash
+	/// makes each fork a job (`stop_pipeline`) and deletes a foreground one
+	/// as soon as it ended, but none while no job may be deleted
+	/// (`jobs_list_frozen`, `cleanup_dead_jobs`). Made only then
+	/// (`crate::bash::vm::killed::foreground_job`): `%N` names it (`jobs`,
+	/// `wait`, `kill`, `disown`), while `jobs` lists it only as bash's
+	/// `should_notify` says ([`Self::listed_while_frozen`]); `wait`, `wait -n`
+	/// and the notices of background jobs pass it by. A fact
+	/// ([`Job::facts`]), as [`Self::signal`] is.
+	#[serde(skip)]
+	pub foreground: bool,
 	/// This shell's `kill` ended the job with no OS status for obash to reap,
 	/// and nothing showed its end since: bash's process of it is still
 	/// unreaped, so bash's next plain `wait` waits for it, reaps it and
@@ -675,7 +686,7 @@ pub struct Job {
 	/// Kept in memory only: a job restored from the store or the frames image
 	/// counts as reaped.
 	#[serde(skip)]
-	pub unreaped:  bool,
+	pub unreaped:   bool,
 }
 
 impl Job {
@@ -703,13 +714,16 @@ impl Job {
 		if let Some(procs) = &self.procs {
 			facts.push(JobFact::Procs((**procs).clone()));
 		}
+		if self.foreground {
+			facts.push(JobFact::Foreground);
+		}
 		facts
 	}
 
 	/// Whether the job has any facts ([`Job::facts`]). A job's facts never
-	/// go: a job that had some has some.
+	/// go while its record stays the same: a job that had some has some.
 	pub const fn has_facts(&self) -> bool {
-		self.signal.is_some() || self.procs.is_some()
+		self.signal.is_some() || self.procs.is_some() || self.foreground
 	}
 
 	/// Whether `have` are this job's facts ([`Job::facts`]), compared in
@@ -723,6 +737,7 @@ impl Job {
 				.procs
 				.as_deref()
 				.is_none_or(|procs| matches!(have.next(), Some(JobFact::Procs(p)) if p == procs))
+			&& (!self.foreground || have.next() == Some(&JobFact::Foreground))
 			&& have.next().is_none()
 	}
 
@@ -730,10 +745,12 @@ impl Job {
 	pub fn set_facts(&mut self, facts: &[JobFact]) {
 		self.signal = None;
 		self.procs = None;
+		self.foreground = false;
 		for fact in facts {
 			match fact {
 				JobFact::Signal(sig) => self.signal = Some(*sig),
 				JobFact::Procs(procs) => self.procs = Some(Box::new(procs.clone())),
+				JobFact::Foreground => self.foreground = true,
 			}
 		}
 	}
@@ -741,20 +758,21 @@ impl Job {
 	/// The job as its [`Record::Job`] holds it: without its facts.
 	pub fn record(&self) -> Self {
 		Self {
-			id:        self.id,
-			number:    self.number,
-			vpid:      self.vpid,
-			text:      self.text.clone(),
-			state:     self.state,
-			control:   self.control,
-			notified:  self.notified,
-			nohup:     self.nohup,
-			inherited: self.inherited,
-			wd:        self.wd.clone(),
-			os_pid:    self.os_pid,
-			signal:    None,
-			procs:     None,
-			unreaped:  false,
+			id:         self.id,
+			number:     self.number,
+			vpid:       self.vpid,
+			text:       self.text.clone(),
+			state:      self.state,
+			control:    self.control,
+			notified:   self.notified,
+			nohup:      self.nohup,
+			inherited:  self.inherited,
+			wd:         self.wd.clone(),
+			os_pid:     self.os_pid,
+			signal:     None,
+			procs:      None,
+			foreground: false,
+			unreaped:   false,
 		}
 	}
 
@@ -775,10 +793,12 @@ impl Job {
 			os_pid,
 			signal: _,
 			procs: _,
+			foreground: _,
 			unreaped: _,
 		} = self;
 		have.signal.is_none()
 			&& have.procs.is_none()
+			&& !have.foreground
 			&& *id == have.id
 			&& *number == have.number
 			&& *vpid == have.vpid
@@ -790,6 +810,22 @@ impl Job {
 			&& *inherited == have.inherited
 			&& *wd == have.wd
 			&& *os_pid == have.os_pid
+	}
+
+	/// A signal bash reports ended the finished job (bash
+	/// `job_killed_by_signal`): any but `INT`, and but `PIPE` as bash 5.3
+	/// is built (`DONT_REPORT_SIGPIPE`).
+	pub const fn killed_reported(&self) -> bool {
+		matches!(self.state, JobState::Done(_))
+			&& matches!(self.signal, Some(sig) if !matches!(sig, Signal::Int | Signal::Pipe))
+	}
+
+	/// Whether `jobs` lists the job while the job list is frozen (bash
+	/// `pretty_print_job`'s `should_notify`): one in the background, a
+	/// stopped one, or a foreground one a signal bash reports killed
+	/// ([`Self::killed_reported`]).
+	pub const fn listed_while_frozen(&self) -> bool {
+		!self.foreground || matches!(self.state, JobState::Stopped(_)) || self.killed_reported()
 	}
 }
 
@@ -805,6 +841,8 @@ pub enum JobFact {
 	Signal(Signal),
 	/// [`Job::procs`].
 	Procs(JobProcs),
+	/// [`Job::foreground`].
+	Foreground,
 }
 
 /// The processes of a job that has several (bash's job's `PROCESS` list).

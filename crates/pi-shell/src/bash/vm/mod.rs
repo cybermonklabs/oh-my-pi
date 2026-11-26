@@ -1107,7 +1107,7 @@ impl Kernel {
 	/// Write the root vproc's in-place fields ([`state::sync_root`]) and a
 	/// vpid counter advanced without the store (`Shell::submit`): called
 	/// before every engine call returns.
-	pub fn sync_root(&mut self, store: &mut dyn StateStore, root: &Vproc) {
+	pub fn sync_root(&mut self, store: &mut dyn StateStore, root: &mut Vproc) {
 		state::sync_root(&mut self.root, store, root);
 		if self.next_vpid != self.written_vpid {
 			self.written_vpid = self.next_vpid;
@@ -2333,7 +2333,7 @@ impl Shell {
 		self.adopt(cx);
 		self.settle_callouts();
 		let step = self.step_inner(cx, budget);
-		self.k.sync_root(cx.store, &self.procs[0]);
+		self.k.sync_root(cx.store, &mut self.procs[0]);
 		step
 	}
 
@@ -2821,6 +2821,25 @@ impl Shell {
 			return;
 		};
 		let owner = self.process_ended(i, vpid, proc::ProcState::ended(status, died_of));
+		// bash's foreground job of it ([`proc::Job::foreground`]) is done
+		// once it, or each process of the pipeline it is a stage of, ended.
+		// bash's wait for it marks it reported where the list only marks
+		// (`notify_and_cleanup` under -1), but not a `lastpipe` pipeline's,
+		// which it waits for with the list still frozen.
+		if self.procs[i].jobs.iter().any(|j| j.foreground) {
+			let p = &self.procs[i];
+			let inline = p
+				.frames
+				.last()
+				.and_then(|f| f.scratch.as_deref())
+				.is_some_and(|sc| sc.inline().is_some());
+			let notified = !inline && p.freeze() == proc::Freeze::Marks;
+			let platform = self.k.engine.config().platform;
+			let end = proc::ProcState::ended(status, died_of);
+			self.procs[i]
+				.jobs
+				.foreground_reaped(vpid, end, status, pipeline, notified, platform);
+		}
 		let job = self.procs[i].jobs.by_vpid_mut(vpid);
 		let background = job.is_some();
 		// The runs of the `CHLD` trap this end owes: one for the process it
@@ -3636,14 +3655,25 @@ impl Shell {
 			SigTarget::Outside(v) => (SigTarget::Vpid(v), Sender::Process),
 			target => (target, Sender::Shell),
 		};
-		let job_root = match target {
+		// A foreground job's processes are the shell's own children, with no
+		// vproc of the job's: bash's `kill_pid` signals each one still alive
+		// ([`proc::Job::foreground`]).
+		let job_roots: Vec<Vpid> = match target {
 			SigTarget::Job(id) => self
 				.procs
 				.iter()
 				.flat_map(|p| p.jobs.iter())
 				.find(|job| job.id == id)
-				.map(|job| job.vpid),
-			_ => None,
+				.map_or_else(Vec::new, |job| match job.procs.as_deref() {
+					Some(procs) if job.foreground => procs
+						.list
+						.iter()
+						.filter(|p| p.state == proc::ProcState::Running)
+						.map(|p| p.vpid)
+						.collect(),
+					_ => vec![job.vpid],
+				}),
+			_ => Vec::new(),
 		};
 		let mut hits: Vec<usize> = (0..self.procs.len())
 			.filter(|&i| match target {
@@ -3651,7 +3681,9 @@ impl Shell {
 					self.procs[i].vpid == v
 				},
 				SigTarget::All => true,
-				SigTarget::Job(_) => job_root.is_some_and(|v| self.in_job(self.procs[i].vpid, v)),
+				SigTarget::Job(_) => job_roots
+					.iter()
+					.any(|&v| self.in_job(self.procs[i].vpid, v)),
 				SigTarget::Label(l) => l != 0 && self.procs[i].lineage.label == l,
 				SigTarget::Tree(v) => self.in_job(self.procs[i].vpid, v),
 			})
@@ -4749,6 +4781,12 @@ impl Vproc {
 		{
 			vp.jobs = exec::inherited_jobs(self, true);
 		}
+		// bash's fork keeps `jobs_list_frozen` (`execute_in_subshell`'s
+		// `without_job_control` empties the list but leaves the freeze), and
+		// nothing in it ends that freeze: for its whole life it deletes no
+		// job, and a command or process substitution it starts drops none
+		// ([`proc::JobTable::freeze`]).
+		vp.jobs.freeze = self.freeze();
 		// A fork of a command or process substitution is not one (bash
 		// `execute_in_subshell` starts a new `subshell_environment`); the
 		// substitution sets its own process's ([`exec::start_sub`],

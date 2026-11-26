@@ -2612,7 +2612,11 @@ fn break_loops(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: u32, cont: bo
 			return;
 		}
 		let passes = bash_loop_frame(&f.kind);
+		let stage = matches!(f.kind, FrameKind::Stage);
 		if passes && vp.frames.len() > 1 {
+			if stage {
+				lastpipe_stage_left(k, vp);
+			}
 			pop_frame(&mut k.root, cx.store, vp);
 			// The caller's op (`eval`) is abandoned with the loop.
 			clear_scratch(&mut k.root, cx.store, vp);
@@ -2852,6 +2856,29 @@ fn own_loop_takes(
 	vp.status = if until == Some(true) { skipped } else { 0 };
 	break_loops(k, vp, cx, p.levels, p.cont);
 	true
+}
+
+/// A `break` or `continue` leaves the last stage of a `lastpipe` pipeline,
+/// the top frame, with its status: bash's `execute_pipeline` still appends
+/// the stage to the pipeline's job as it ends (`append_process`), as the
+/// stage's normal end does ([`super::proc::JobTable::lastpipe_stage_ended`]),
+/// before the loop goes.
+fn lastpipe_stage_left(k: &Kernel, vp: &mut Vproc) {
+	let n = vp.frames.len();
+	let Some(first) = n
+		.checked_sub(2)
+		.and_then(|i| vp.frames.get(i))
+		.and_then(|f| f.scratch.as_ref())
+		.and_then(|sc| sc.children.first())
+		.map(|&(v, _)| v)
+	else {
+		return;
+	};
+	let text = BString::from(vp.command_text());
+	let platform = k.engine.config().platform;
+	let (shell, status) = (vp.vpid, vp.status);
+	vp.jobs
+		.lastpipe_stage_ended(first, shell, text, status, platform);
 }
 
 /// Whether bash runs `REAP` as `break` or `continue` at `pc` ends the body
@@ -3351,12 +3378,17 @@ pub fn start_sub(
 				}
 			}
 			// bash keeps job control and the job list in `$( )`: `jobs`
-			// lists the parent's jobs, `fg` finds no current job.
+			// lists the parent's jobs, `fg` finds no current job. bash 5.3
+			// drops the finished jobs it would not report there first,
+			// unless the parent's job list is frozen.
 			child.jobs = inherited_jobs(vp, vp.jobs.subshell);
 			// bash and zsh keep the loop level: a `break` ends the substitution.
 			child.outer_loops = fork_loops(vp, true);
 			sub_runs_no_debug_trap(vp, &mut child);
 			child.jobs.comsub = super::proc::Comsub::Own;
+			if child.mode.dialect() != Dialect::Zsh {
+				drop_finished_jobs(k, cx, vp, &mut child);
+			}
 			// Its externals stay in the shell's process group.
 			super::jobctl::set_leader(k, child.vpid, None);
 			let vpid = child.vpid;
@@ -3650,8 +3682,17 @@ pub fn start_procsub(
 	child.outer_loops = fork_loops(vp, true);
 	sub_runs_no_debug_trap(vp, &mut child);
 	// bash's `process_substitute` sets `SUBSHELL_COMSUB` too: it reports no
-	// job a signal killed ([`super::killed`]).
+	// job a signal killed ([`super::killed`]). Its process keeps the job
+	// list (no `without_job_control`), and drops first the finished jobs a
+	// command substitution drops: `cat <(jobs)` lists what `$(jobs)` lists.
+	let bash = child.mode.dialect() != Dialect::Zsh;
+	if bash {
+		child.jobs = inherited_jobs(vp, true);
+	}
 	child.jobs.comsub = super::proc::Comsub::Own;
+	if bash {
+		drop_finished_jobs(k, cx, vp, &mut child);
+	}
 	zsh_subshell_traps(k, cx, &mut child, false);
 	// bash's `process_substitute` calls `setup_async_signals` too: without
 	// job control it ignores `INT` and `QUIT`.
@@ -5561,6 +5602,41 @@ fn pipeline_job(
 	Some(JobProcs { list, pipefail })
 }
 
+/// The job bash makes of the forked stages `children` of the pipeline
+/// `info` of `unit` that the shell waits for
+/// ([`super::killed::foreground_job`]): its processes, each named by its vproc
+/// with its command, the job's text theirs joined as bash prints them
+/// (`print_pipeline`), its status taken under the `pipefail` on now
+/// (`J_PIPEFAIL`). A `lastpipe` pipeline's job has the stages before the one
+/// the shell runs.
+fn pipeline_foreground_job(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	unit: &Unit,
+	info: &ir::SpawnIr,
+	children: &[Vpid],
+) {
+	let Some(&first) = children.first() else {
+		return;
+	};
+	let list: Vec<JobProc> = children
+		.iter()
+		.enumerate()
+		.map(|(i, &v)| JobProc::started(v, super::killed::stage_command(k, cx, vp, unit, info, i)))
+		.collect();
+	let text = BString::from(
+		list
+			.iter()
+			.map(|p| p.text.as_slice())
+			.collect::<Vec<_>>()
+			.join(&b" | "[..]),
+	);
+	let pipefail = state::option(&mut k.root, cx.store, vp, OptId::Pipefail).unwrap_or(false);
+	let id = k.job_id(cx.store);
+	super::killed::foreground_job(vp, id, first, text, Some(JobProcs { list, pipefail }));
+}
+
 /// Whether the `( … )` that `info` spawns at `pc` is the whole body of a
 /// background job (`( … ) &`): zsh runs that as one process, whose
 /// `entersubsh` ran with the job's, so its traps are not unset again (they
@@ -5720,6 +5796,20 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					}
 					forked_for(&mut child, vp, unit, info.stages[0].entry);
 				}
+				// bash forks a background pipeline's stages from the shell itself,
+				// so a stage that expands its words sees the shell's job list
+				// ([`super::proc::JobTable::stage_words`]). The job's vproc stands
+				// between them here: it holds copies (which it neither reports
+				// nor waits for) only to hand them to such a stage.
+				if info.kind == SpawnKind::Background
+					&& vp.mode.dialect() == Dialect::Bash
+					&& !vp.jobs.is_empty()
+					&& job_pipeline(unit, info.stages[0].entry)
+				{
+					let comsub = child.jobs.comsub;
+					child.jobs = inherited_jobs(vp, true);
+					child.jobs.comsub = comsub;
+				}
 				if in_place {
 					child.zsh_state().in_place = true;
 				}
@@ -5768,6 +5858,13 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				children.push(child.vpid);
 				let vpid = child.vpid;
 				k.spawned.push(Box::new(child));
+				// The `( … )` the shell waits for is a job too, one that outlives
+				// the wait while no job may be deleted.
+				if info.kind == SpawnKind::Subshell && super::killed::keeps_foreground(vp) {
+					let text = job_text(k, cx, vp, unit, op.node);
+					let id = k.job_id(cx.store);
+					super::killed::foreground_job(vp, id, vpid, text, None);
+				}
 				if info.kind == SpawnKind::Background {
 					vp.last_bg = LastBg::new(vpid);
 					// Known by its program's OS pid if the first command it runs
@@ -5814,6 +5911,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				if !lastpipe {
 					super::killed::cleanup_dead_jobs(vp);
 				}
+				// The pipeline a background job's vproc runs as the job: each
+				// stage is a process of the job, which is no foreground job.
+				let job_stages = vp.parent.is_some() && job_pipeline(unit, top_frame(vp).pc);
 				let mut stdin = vp.fds.get(0).cloned();
 				// An async pipeline's elements sit at the job's level.
 				let async_elements = async_pipeline(unit, op.a as usize);
@@ -5837,6 +5937,12 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 								.chain([(vp.vpid, stage.entry)])
 								.collect();
 							retarget_bang(k, vp.vpid, unit, &stages);
+						}
+						// bash freezes the job list, then makes the forked stages a
+						// job (`execute_pipeline`'s `freeze_jobs_list (1)` and
+						// `stop_pipeline`): it outlives the pipeline.
+						if vp.mode.dialect() == Dialect::Bash {
+							pipeline_foreground_job(k, cx, vp, unit, info, &children);
 						}
 						k.emit_op(cx, vp, op.node, EventData::Pipeline { stages: &children });
 						let line_shift = top_frame(vp).line_shift;
@@ -5899,15 +6005,28 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						stage_level(unit, stage.entry, false, zsh)
 					};
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
-					// bash keeps the job list for a `jobs` builtin run as a pipeline
-					// stage (`jobs -p | xargs kill`).
-					if !vp.jobs.is_empty() && runs_jobs(unit, stage.entry) {
+					// bash forks a simple command's stage first and expands its
+					// words in the child, which keeps the shell's job list until
+					// it runs its command (`echo "$(jobs)" | cat`, `jobs -p |
+					// xargs kill`; [`super::proc::JobTable::stage_words`]). Only
+					// a substitution in its words or redirections, or the `jobs`
+					// builtin itself (also by a name its expansion gives), can
+					// read the list, so only such a stage gets a copy. zsh keeps
+					// it only for a `jobs` builtin.
+					let bash = vp.mode.dialect() == Dialect::Bash;
+					if !vp.jobs.is_empty()
+						&& (runs_jobs(unit, stage.entry) || bash && substituting_stage(unit, stage.entry))
+					{
 						child.jobs = inherited_jobs(vp, true);
+						child.jobs.stage_words = bash;
 					}
 					k.bang_kin_add(vp.vpid, child.vpid);
 					children.push(child.vpid);
 					entries.push(stage.entry);
 					k.spawned.push(Box::new(child));
+				}
+				if !job_stages && super::killed::keeps_foreground(vp) {
+					pipeline_foreground_job(k, cx, vp, unit, info, &children);
 				}
 				if !k.bangs.is_empty() {
 					let stages: Vec<(Vpid, u32)> = children
@@ -5940,7 +6059,16 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 	if sc.inline() == Some(InlineStage::Running) {
 		// Back from the last stage's frame.
 		sc.pipeline().inline = Some(InlineStage::Done(status));
+		// bash appends the stage to the pipeline's job, named by the last
+		// command it ran ([`super::proc::JobTable::lastpipe_stage_ended`]).
+		if let Some(first) = sc.children.first().map(|&(v, _)| v) {
+			let text = BString::from(vp.command_text());
+			let platform = k.engine.config().platform;
+			vp.jobs
+				.lastpipe_stage_ended(first, vp.vpid, text, status, platform);
+		}
 	}
+	let sc = scratch(vp);
 	for (vpid, status) in &mut sc.children {
 		if status.is_none() {
 			*status = k.proc_collect(cx.store, *vpid);
@@ -6209,39 +6337,193 @@ pub(super) fn fork_async_ignored(
 }
 
 /// The job table a child that lists its parent's jobs starts with (a
-/// command substitution, a `jobs` pipeline stage): copies of them, which
-/// are not its children, and the statuses its parent kept, which a `$( )`
-/// inherits (bash clears them in a `( … )`, not in a substitution);
-/// `subshell` turns job control off.
+/// command or process substitution, a `jobs` pipeline stage): copies of
+/// them, which are not its children, and the statuses its parent kept,
+/// which a `$( )` inherits (bash clears them in a `( … )`, not in a
+/// substitution); `subshell` turns job control off. A fork keeps its
+/// shell's `jobs_list_frozen` ([`Vproc::freeze`]), and the copies include
+/// the foreground jobs kept while no job may be deleted
+/// ([`super::proc::Job::foreground`]).
 pub(super) fn inherited_jobs(vp: &Vproc, subshell: bool) -> super::proc::JobTable {
 	let parent = &vp.jobs;
-	let mut list = parent.list.clone();
+	let mut list = parent.list.to_vec();
 	for job in &mut list {
 		job.inherited = true;
 	}
 	super::proc::JobTable {
-		list,
+		list: list.into(),
 		current: parent.current,
 		previous: parent.previous,
 		chld: 0,
 		subshell,
 		comsub: parent.comsub,
+		freeze: vp.freeze(),
+		stage_words: false,
 		bgp: parent.bgp.clone(),
 	}
 }
 
-/// Whether the pipeline stage starting at `entry` is a simple command
-/// named `jobs` (bash keeps the job list only for that builtin).
+/// bash 5.3 for the process of a command or process substitution of a shell
+/// that is not interactive (`process_substitute` sets `SUBSHELL_COMSUB` and
+/// `startup_state` 2 too): before the child reads its first command,
+/// `shell_getc`'s `notify_and_cleanup` (parse.y) deletes each finished job
+/// that `notify_of_job_status` marks notified there: every one but the job
+/// `$!` names, and not one that a
+/// SIGINT, SIGTERM or SIGPIPE killed, nor one that a signal the shell
+/// ignores with `trap '' SIG` killed (the child's `signal_is_trapped`,
+/// [`super::killed::ignored_by_trap`]); one that a signal the shell traps
+/// with a command killed goes. bash judges that by how the job ended (its
+/// wait status, [`crate::bash::store::Job::signal`]), not by its status: a
+/// job that exited 130, 141 or 143 goes. Without job control a background
+/// job starts with SIGINT ignored, so only one of a shell with job control
+/// (`set -m`) dies of it. Each one deleted keeps its status for `wait PID`
+/// (`delete_job`'s `bgp_add`), but a foreground one
+/// ([`super::proc::Job::foreground`]), which goes however it ended
+/// (`notify_of_job_status` marks it there: `4611-4620`, before the
+/// background-only skips of `4580-4602` could keep it), keeps none;
+/// and the current and previous jobs are chosen again as `delete_job` does.
+/// `vp` dropped its own first, as it expanded the substitution
+/// (`xparse_dolparen` re-parses it through `shell_getc` too,
+/// [`super::killed::expanded`]): a `( … )`, job or stage forked from a `-c`
+/// shell drops every finished job there, `$!`'s too, so the child gets none.
+/// The child is a fork of `vp`, and keeps `vp`'s `jobs_list_frozen`
+/// ([`Vproc::freeze`]: the last stage of a `lastpipe` pipeline, a function
+/// substitution, a trap run with the list frozen, or the freeze `vp` itself
+/// forked with, [`super::proc::JobTable::freeze`], which [`inherited_jobs`]
+/// copied): while it is set, `notify_and_cleanup` returns before
+/// `cleanup_dead_jobs`, and the child keeps every job. An interactive
+/// shell's command substitution reads no line through that path, and keeps
+/// every job too.
+fn drop_finished_jobs(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, child: &mut Vproc) {
+	if child.jobs.freeze != super::proc::Freeze::No || super::jobctl::interactive(k) {
+		return;
+	}
+	let mut kept = |j: &super::proc::Job| {
+		use crate::bash::Signal;
+		if j.foreground {
+			return false;
+		}
+		match j.signal {
+			Some(Signal::Int | Signal::Term | Signal::Pipe) => true,
+			Some(sig) => super::killed::ignored_by_trap(cx, vp, sig),
+			None => false,
+		}
+	};
+	let dropped: Vec<(u32, Vpid, u32, i32, bool)> = child
+		.jobs
+		.iter()
+		.filter_map(|j| match j.state {
+			super::proc::JobState::Done(status) if !kept(j) && !child.last_bg.is(j.vpid) => {
+				Some((j.number, j.vpid, j.pid(), status, j.foreground))
+			},
+			_ => None,
+		})
+		.collect();
+	for (number, vpid, pid, status, foreground) in dropped {
+		child.jobs.remove(number);
+		if !foreground {
+			state::save_status(&mut k.root, cx.store, child, vpid, pid, status);
+		}
+	}
+}
+
+/// Whether the pipeline stage starting at `entry` may run the `jobs`
+/// builtin, which keeps the job list. zsh keeps it only for a stage whose
+/// text starts with the word `jobs`. bash decides on the stage's command
+/// after its prefix assignments and redirections, and runs `command [-p |
+/// --]… jobs` as the `jobs` builtin itself (`execute_simple_command` drops
+/// the `command` word; measured: `2>/dev/null jobs | cat`, `x=1 jobs |
+/// cat`, `command 'jobs' | cat`, `command -p -- jobs | cat` and `command
+/// command jobs | cat` list the running job). A word only its expansion
+/// names (`j=jobs; $j | cat` lists it too) may be `jobs`: such a stage
+/// gets the list and drops it as it runs another command, which is never
+/// on the fast path (`plain_statement` takes a literal name only).
 fn runs_jobs(unit: &Unit, entry: u32) -> bool {
-	let Some(op) = unit.ops.get(skip_blocks(unit, entry) as usize) else {
+	if unit.mode.dialect() != Dialect::Bash {
+		let Some(op) = unit.ops.get(skip_blocks(unit, entry) as usize) else {
+			return false;
+		};
+		let text = node_text(unit, op.node);
+		let text: &[u8] = &text;
+		return text.strip_prefix(b"jobs").is_some_and(|rest| {
+			rest
+				.first()
+				.is_none_or(|c| matches!(c, b' ' | b'\t' | b'\n' | b';' | b'|'))
+		});
+	}
+	let Some(words) = stage_exec(unit, entry)
+		.and_then(|(op, _)| unit.cmds.get(op.a as usize))
+		.and_then(|cmd| unit.lists.get(cmd.words as usize))
+	else {
 		return false;
 	};
-	let text = node_text(unit, op.node);
-	text.strip_prefix(b"jobs").is_some_and(|rest| {
-		rest
-			.first()
-			.is_none_or(|c| matches!(c, b' ' | b'\t' | b'\n' | b';' | b'|'))
-	})
+	// Whether word `i` is the literal text `want`, quoted or not.
+	let is = |i: usize, want: &[u8]| {
+		let Some(word) = words.get(i).and_then(|&w| unit.words.get(w as usize)) else {
+			return false;
+		};
+		let mut rest = want;
+		word.parts.iter().all(|part| match part {
+			ir::Part::Lit(text) | ir::Part::Quoted(text) => {
+				rest.strip_prefix(text.as_slice()).is_some_and(|r| {
+					rest = r;
+					true
+				})
+			},
+			_ => false,
+		}) && rest.is_empty()
+	};
+	let expands = |i: usize| {
+		words
+			.get(i)
+			.and_then(|&w| unit.words.get(w as usize))
+			.is_some_and(|word| {
+				word
+					.parts
+					.iter()
+					.any(|part| !matches!(part, ir::Part::Lit(_) | ir::Part::Quoted(_)))
+			})
+	};
+	let mut i = 0;
+	while is(i, b"command") {
+		i += 1;
+		while is(i, b"-p") || is(i, b"--") {
+			i += 1;
+		}
+	}
+	is(i, b"jobs") || expands(i)
+}
+
+/// The `Exec` of the simple command the pipeline stage starting at `entry`
+/// is, with the number of substitution bodies before it: past the
+/// redirections the stage starts with ([`stage_level`]'s shape), the bodies
+/// of the substitutions in the command's words and redirections sit before
+/// the command, each jumped over (`Lower::block`).
+fn stage_exec(unit: &Unit, entry: u32) -> Option<(&Op, usize)> {
+	let mut pc = entry as usize;
+	if unit.ops.get(pc).is_some_and(|op| op.code == Opcode::Redir) {
+		pc += 1;
+	}
+	let mut bodies = 0;
+	while let Some(op) = unit.ops.get(pc)
+		&& op.code == Opcode::Jmp
+		&& op.a as usize > pc
+	{
+		pc = op.a as usize;
+		bodies += 1;
+	}
+	unit
+		.ops
+		.get(pc)
+		.filter(|op| op.code == Opcode::Exec)
+		.map(|op| (op, bodies))
+}
+
+/// Whether the pipeline stage starting at `entry` is a simple command whose
+/// words or redirections hold a substitution ([`stage_exec`]). bash expands
+/// the words in the stage's child, where such a substitution reads the list.
+fn substituting_stage(unit: &Unit, entry: u32) -> bool {
+	stage_exec(unit, entry).is_some_and(|(_, bodies)| bodies > 0)
 }
 
 /// `coproc NAME cmd`: run the body at `entry` as a background child whose

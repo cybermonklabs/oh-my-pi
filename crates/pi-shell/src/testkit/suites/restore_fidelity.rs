@@ -6,8 +6,16 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::{
-	bash::{SigSet, Signal, SpawnSpec},
-	testkit::{FakeHost, Fault, run_script},
+	bash::{
+		Budget, Cx, Engine, EngineConfig, MemStore, RestoreOpts, Script, Shell, SigSet, Signal,
+		SpawnSpec,
+	},
+	testkit::{
+		FakeHost, Fault,
+		fault::skeleton_init,
+		run::{Stop, advance},
+		run_script,
+	},
 };
 
 fn same_under_snapshots(src: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -108,4 +116,129 @@ fn an_asynchronous_commands_ignored_signals_survive_a_snapshot() {
 		assert!(snapshots > 0, "no snapshot landed: {text}");
 		assert_eq!(masks, vec![want], "{text} under snapshots");
 	}
+}
+
+/// The foreground jobs a function substitution keeps (bash makes each fork
+/// a job, and deletes none while the list is frozen) survive a snapshot as
+/// foreground jobs: the root's through its store records (the job's
+/// foreground fact), a subshell's through the frames image. `jobs` lists
+/// none of them but one a signal killed, `%N` names each, `wait %N` returns
+/// its status, and the next job takes the number after them (read through
+/// a command substitution's copy of the list: a `jobs >/dev/null` that
+/// takes in a background job's end loses its redirection across a snapshot,
+/// at the base too). Goldens: bash 5.3.20.
+#[test]
+fn a_frozen_foreground_job_survives_a_snapshot() {
+	let rows: [(&[u8], &[u8]); 3] = [
+		(
+			b"y=${ ( exit 3 ); ( exit 4 ); jobs; jobs %2; echo \"st=$?\"; wait %1; echo \"w=$?\"; wait %2; \
+			  echo \"w2=$?\"; : & x=$(jobs %3); echo \"n=$?\"; wait; }; echo \"$y\"",
+			b"st=0\nw=3\nw2=4\nn=0\n",
+		),
+		(
+			b"( y=${ ( exit 3 ); jobs; wait %1; echo \"w=$?\"; ( exit 5 ); jobs %2; echo \"st=$?\"; }; echo \"$y\" )",
+			b"w=3\nst=0\n",
+		),
+		(b"y=${ ( kill -TERM $BASHPID ); jobs; }; echo \"$y\"", b"[1]   Terminated                 ( kill -TERM $BASHPID )\n"),
+	];
+	for (src, want) in rows {
+		let (out, err) = same_under_snapshots(src);
+		assert_eq!(
+			String::from_utf8_lossy(&out),
+			String::from_utf8_lossy(want),
+			"{} (stderr {:?})",
+			String::from_utf8_lossy(src),
+			String::from_utf8_lossy(&err)
+		);
+	}
+}
+
+/// The root's job table reaches the store only as it changes (the sync
+/// compares the jobs from the first one that changed, [`JobList`]), so a
+/// snapshot at every op sees each change: a job added, one that ended (an
+/// early one, after later ones were added), one `wait` deleted, many kept
+/// while the list is frozen and deleted after it, and one `disown` deleted
+/// among others. Each row's output is the same with and without snapshots,
+/// and is bash 5.3.20's (measured, `-c` and from a script file).
+///
+/// [`JobList`]: crate::bash::vm::proc::JobList
+#[test]
+fn each_job_change_reaches_a_snapshot() {
+	let count = "n=0; for p in $(jobs -p); do n=$((n+1)); done; echo \"n=$n\"";
+	let rows: [(String, &str); 6] = [
+		(format!(": & wait; {count}; jobs; echo end"), "n=0\nend\n"),
+		(
+			format!(
+				"( exit 3 ) & ( exit 4 ) & wait %1; echo \"a=$?\"; {count}; wait %2; echo \"b=$?\"; \
+				 {count}"
+			),
+			"a=3\nn=1\nb=4\nn=0\n",
+		),
+		(
+			"( exit 7 ) & p=$!; for i in 1 2 3 4; do ( exit $i ) & done; wait $p; echo \"a=$?\"; \
+			 wait $!; echo \"b=$?\"; wait; echo end"
+				.to_owned(),
+			"a=7\nb=4\nend\n",
+		),
+		(
+			"for i in 1 2 3 4 5; do ( exit $i ) & done; wait $!; echo \"c=$?\"; wait; echo \"w=$?\""
+				.to_owned(),
+			"c=5\nw=0\n",
+		),
+		(
+			format!(
+				"y=${{ for i in 1 2 3 4 5 6; do ( exit $i ); done; wait %4; echo \"d=$?\"; ( exit 9 ) \
+				 & {count}; wait %7; echo \"e=$?\"; }}; echo \"$y\"; {count}"
+			),
+			"d=4\nn=1\ne=9\nn=0\n",
+		),
+		(
+			"( exit 1 ) & ( exit 2 ) & ( exit 3 ) & disown %2; x=$(jobs %2); echo \"j=$?\"; wait %3; \
+			 echo \"f=$?\"; wait %1; echo \"g=$?\""
+				.to_owned(),
+			"j=1\nf=3\ng=1\n",
+		),
+	];
+	for (src, want) in rows {
+		let (out, err) = same_under_snapshots(src.as_bytes());
+		assert_eq!(
+			String::from_utf8_lossy(&out),
+			want,
+			"{src} (stderr {:?})",
+			String::from_utf8_lossy(&err)
+		);
+	}
+}
+
+/// A foreground job a function substitution keeps whose command still runs
+/// goes with the frames: restored without them (`drop_frames`), the job is
+/// done as a lost vproc is (137), so it is reported once at most and then
+/// deleted, and a second `jobs` lists nothing.
+#[test]
+fn a_running_foreground_job_ends_when_the_frames_are_lost() {
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let mut store = MemStore::new();
+	let mut shell =
+		Shell::create(&engine, &mut Cx { host: &mut host, store: &mut store }, skeleton_init(&[]))
+			.unwrap();
+	let id = shell.submit(Script::command(&b"y=${ ( while :; do :; done ); }"[..]));
+	let small = Budget { max_ops: 200, max_ns: u64::MAX };
+	assert_eq!(advance(&mut shell, &mut host, &mut store, id, small), Stop::Yield);
+	shell
+		.externalize(&mut Cx { host: &mut host, store: &mut store })
+		.unwrap();
+	drop(shell);
+	let (mut shell, report) =
+		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts {
+			drop_frames: true,
+			..RestoreOpts::default()
+		})
+		.unwrap();
+	assert_eq!(report.abandoned, [id]);
+	let next = shell.submit(Script::command(&b"jobs >/dev/null; jobs; echo end"[..]));
+	let budget = Budget::default();
+	assert_eq!(advance(&mut shell, &mut host, &mut store, id, budget), Stop::Done(255));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, next, budget), Stop::Done(0));
+	assert_eq!(String::from_utf8_lossy(&host.stdout.bytes()), "end\n");
 }

@@ -145,11 +145,16 @@ struct Show<'h> {
 }
 
 /// One `jobs` line for job `number` (bash `pretty_print_job`), marking the
-/// job reported (`-p` does not).
+/// job reported (`-p` does not). While the job list is frozen a foreground
+/// job ([`Job::foreground`]) gets none unless bash's `should_notify` says so
+/// ([`Job::listed_while_frozen`]), `-p` neither, and stays as it was.
 fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 	let Some(job) = ctx.vp.jobs.get(number) else {
 		return;
 	};
+	if !job.listed_while_frozen() && ctx.vp.jobs_kept() {
+		return;
+	}
 	if form == Form::Pids {
 		let line = format!("{}\n", job.pid());
 		ctx.out(line.as_bytes());
@@ -194,25 +199,26 @@ fn print_job(ctx: &mut Ctx<'_, '_>, number: u32, form: Form, show: &Show<'_>) {
 	}
 }
 
-/// Forget finished jobs whose state was reported (bash
-/// `cleanup_dead_jobs`, which deletes none while the job list is frozen);
-/// bash keeps each one's status for `wait PID` (`delete_job`'s `bgp_add`).
+/// Forget finished jobs whose state was reported, and the foreground ones
+/// no signal bash reports killed (bash `cleanup_dead_jobs`, which deletes
+/// none while the job list is frozen: `killed::deletable`); bash keeps each
+/// background one's status for `wait PID` (`delete_job`'s `bgp_add`).
 fn cleanup(ctx: &mut Ctx<'_, '_>) {
 	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash && ctx.vp.jobs_kept() {
 		return;
 	}
-	let dead = |j: &Job| j.notified && matches!(j.state, JobState::Done(_));
+	let dead = super::super::killed::deletable;
 	let kept: Vec<(Vpid, u32, i32, bool)> = ctx
 		.vp
 		.jobs
 		.iter()
-		.filter(|j| dead(j))
+		.filter(|j| dead(j) && !j.foreground)
 		.filter_map(|j| match j.state {
 			JobState::Done(status) => Some((j.vpid, j.pid(), status, j.inherited)),
 			_ => None,
 		})
 		.collect();
-	if kept.is_empty() {
+	if !ctx.vp.jobs.iter().any(dead) {
 		return;
 	}
 	ctx.vp.jobs.remove_where(dead);
@@ -610,9 +616,11 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			.map(|j| j.number)
 			.collect();
 		// bash `delete_all_jobs`: no status is kept for them, and `-a` forgets
-		// those kept before.
+		// those kept before; `-a` frees the whole list even while no job may
+		// be deleted (`delete_job` returns at once there, so it warns of no
+		// stopped job), `-r` deletes none then.
 		for number in picked {
-			drop_job(ctx, number, nohup, false);
+			drop_job(ctx, number, nohup, false, !running_only);
 		}
 		if !nohup && !running_only {
 			state::clear_statuses(&mut ctx.k.root, ctx.cx.store, ctx.vp);
@@ -642,7 +650,7 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				.ok_or(Bad::Missing),
 		};
 		if let Ok(number) = found {
-			drop_job(ctx, number, nohup, true);
+			drop_job(ctx, number, nohup, true, false);
 		} else {
 			no_such_job(ctx, word.map_or(&b"current"[..], |w| w.as_slice()));
 			status = 1;
@@ -655,21 +663,28 @@ pub fn disown(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 /// (bash warns when that drops a stopped job) and is no child of this shell
 /// any more: `wait` neither waits for it nor finds it, except by the status
 /// `keep` keeps (bash `delete_job`'s `bgp_add`, the status it had then: 0
-/// while it runs), but not while no job may be deleted (bash `delete_job`
-/// returns at once, `jobs.c:1492`).
-fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool, keep: bool) {
+/// while it runs; none for a foreground job, [`Job::foreground`], whose
+/// processes the shell already took in); but not while no job may be
+/// deleted (bash `delete_job` returns at once, `jobs.c:1492`), unless
+/// `always` (`disown -a`, whose `delete_all_jobs` frees the list then too,
+/// warning of nothing).
+fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool, keep: bool, always: bool) {
 	if nohup {
 		if let Some(job) = ctx.vp.jobs.get_mut(number) {
 			job.nohup = true;
 		}
 		return;
 	}
-	if ctx.vp.jobs_kept() {
+	let kept = ctx.vp.jobs_kept();
+	if kept && !always {
 		return;
 	}
 	let Some(job) = ctx.vp.jobs.remove(number) else {
 		return;
 	};
+	if job.foreground {
+		return;
+	}
 	if !job.inherited {
 		ctx.k.disown(ctx.cx.store, job.vpid);
 	}
@@ -683,7 +698,7 @@ fn drop_job(ctx: &mut Ctx<'_, '_>, number: u32, nohup: bool, keep: bool) {
 		// No status is kept: an ended job's record goes too.
 		let _ = ctx.k.proc_collect(ctx.cx.store, job.vpid);
 	}
-	if matches!(job.state, JobState::Stopped(_)) && !ctx.vp.jobs.subshell {
+	if matches!(job.state, JobState::Stopped(_)) && !ctx.vp.jobs.subshell && !kept {
 		ctx.diag(Diag::Warning {
 			msg: format!("warning: deleting stopped job {number} with process group {}", job.pid())
 				.into(),
