@@ -4,12 +4,20 @@
 
 ### Added
 
+- Added `stringifyDeepJson`, `JSON.stringify` that also serializes a value nested deeper than the engine's recursion allows, and `stringifyJsonIteratively`, the explicit-stack writer it falls back to on that `RangeError`, which gives `JSON.stringify`'s bytes
+- Added a `bigintAsString` option to `stringifyDeepJson` and `stringifyJsonIteratively`, which writes a bigint as its decimal string, as `stringifyJson` does
+- Added `jsonDeepEquals`, `Bun.deepEquals` (not strict) for JSON-shaped data of any depth, which walks arrays and plain objects on its own stack
+- Added a `space` option to `stringifyDeepJson`, which indents as `JSON.stringify` does a value nested at most `INDENTED_JSON_LEVELS` (1,000) levels deep and writes a deeper one without indentation, and `nestsDeeperThan`, the depth check it uses, which imports nothing so a browser bundle can use it
+- Added a `probeDepth` option to `stringifyDeepJson`: it checks the depth first, so a value nested past `DEEP_JSON_LEVELS` (10,000) levels, the new export where a writer should switch to the iterative one, goes straight to it instead of first spending 1.5 s or more in a `JSON.stringify` that runs out of stack; with `space`, a value past `INDENTED_JSON_LEVELS` no longer pays that attempt either
 - Added `getBunStubDir()`, the cache directory holding the `bun` stub a compiled omp appends to its JS eval kernel's PATH ([#19241](https://github.com/can1357/oh-my-pi/pull/19241) by [@mccraigmccraig](https://github.com/mccraigmccraig))
+
 ### Breaking Changes
 
 - Removed the unused `getToolsDir()` export. Custom tool discovery is unchanged.
+
 ### Fixed
 
+- Fixed `cloneJsonTree` failing with `Maximum call stack size exceeded` on a tree nested more than about 22,500 levels deep; it keeps its own stack, and a cycle throws a `TypeError`
 - Fixed `parseImageMetadata` omitting the dimensions of lossless WebP (VP8L) headers shorter than 30 bytes ([#20521](https://github.com/can1357/oh-my-pi/pull/20521) by [@shgew](https://github.com/shgew))
 
 ## [19.2.1] - 2026-11-25

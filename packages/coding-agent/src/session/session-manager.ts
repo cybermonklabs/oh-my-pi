@@ -11,6 +11,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import {
 	$env,
+	cloneJsonTree,
 	directoryIsEnterable,
 	directoryIsMissing,
 	getBlobsDir,
@@ -24,7 +25,6 @@ import {
 	logger,
 	pathIsWithin,
 	spillIdOfFileName,
-	stringifyJson,
 	toError,
 	withLoopPhase,
 } from "@oh-my-pi/pi-utils";
@@ -129,7 +129,7 @@ import {
 	worktreeSessionDirs,
 	writeTerminalBreadcrumb,
 } from "./session-paths";
-import { forgetExternalizedImages, prepareEntryForPersistence } from "./session-persistence";
+import { forgetExternalizedImages, persistedEntryText } from "./session-persistence";
 import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
@@ -1674,7 +1674,7 @@ export class SessionManager {
 	}
 
 	#lineFor(entry: FileEntry): string {
-		return `${stringifyJson(prepareEntryForPersistence(entry, this.#blobs)) ?? "null"}\n`;
+		return `${persistedEntryText(entry, this.#blobs)}\n`;
 	}
 	#recordDurableAppend(line: string): void {
 		this.#expectedDiskSize = (this.#expectedDiskSize ?? 0) + Buffer.byteLength(line, "utf8");
@@ -2912,7 +2912,8 @@ export class SessionManager {
 		manager.#additionalDirectories = [...this.#additionalDirectories];
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
-		manager.#entries = structuredClone(this.#entries);
+		// Entries are copied on the copy's own stack, as deep as a transcript line holds.
+		manager.#entries = this.#entries.map(entry => cloneJsonTree(entry));
 		manager.#index.rebuild(manager.#entries);
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();

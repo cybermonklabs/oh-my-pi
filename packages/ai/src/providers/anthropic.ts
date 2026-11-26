@@ -15,10 +15,15 @@ import { parseGitHubCopilotApiKey } from "@oh-my-pi/pi-catalog/wire/github-copil
 import {
 	$env,
 	$flag,
+	ContainerPath,
+	cloneJsonTree,
+	jsonDeepEquals,
 	logger,
+	type NestedWalk,
 	parseJsonWithRepair,
 	parseStreamingJsonThrottled,
 	readSseEvents,
+	runNested,
 } from "@oh-my-pi/pi-utils";
 import { NO_AUTH_SENTINEL } from "../auth-retry";
 import { renderDemotedThinking } from "../dialect/demotion";
@@ -3977,11 +3982,16 @@ function experimentalBetasDisabled(model: Model<"anthropic-messages">): boolean 
  * Whether a request body carries a field the kill switch withholds. A frozen
  * fallback-credit body that does cannot be redeemed under the switch. Defined
  * as "the sanitizer would change it" so detection and stripping cannot drift.
+ * Both sides of the comparison are copies: `cloneJsonTree` writes a value that
+ * is not JSON data (a `Date`, a `Map`) as JSON would, so only what the
+ * sanitizer removed can differ. The copies and the comparison keep their own
+ * stack: the body replays the conversation, whose tool calls' arguments are
+ * any JSON.
  */
 function carriesKillSwitchField(params: MessageCreateParamsStreaming): boolean {
-	const sanitized = structuredClone(params);
+	const sanitized = cloneJsonTree(params);
 	withholdKillSwitchFields(sanitized);
-	return !Bun.deepEquals(sanitized, params);
+	return !jsonDeepEquals(sanitized, cloneJsonTree(params));
 }
 
 /**
@@ -5847,35 +5857,58 @@ function buildToolResultBlock(
 export type AnthropicMessageParam = MessageParam;
 
 /**
- * Recursively replace lone surrogates in string leaves. Identity-preserving:
- * returns the input object/array when nothing changed.
+ * Replace lone surrogates in string leaves. Identity-preserving: returns the
+ * input object/array when nothing changed. The walk keeps its own stack
+ * ({@link runNested}): a tool call's arguments are any JSON, as deep as a
+ * transcript line holds.
  */
 function toWellFormedDeep(value: unknown): unknown {
-	if (typeof value === "string") {
-		const wellFormed = value.toWellFormed();
-		return wellFormed === value ? value : wellFormed;
-	}
+	return isWellFormedWalked(value) ? runNested(wellFormedNode(value, new ContainerPath())) : wellFormedLeaf(value);
+}
+
+/** Whether {@link toWellFormedDeep} walks into `value`: an array or a record. */
+function isWellFormedWalked(value: unknown): value is unknown[] | Record<string, unknown> {
+	return Array.isArray(value) || isRecord(value);
+}
+
+/** {@link toWellFormedDeep} of a value it does not walk into: a string well-formed, any other as it is. */
+function wellFormedLeaf(value: unknown): unknown {
+	return typeof value === "string" ? value.toWellFormed() : value;
+}
+
+/** {@link toWellFormedDeep} of `value`, an array or record `path` is inside of; each child array or record is a nested step. */
+function* wellFormedNode(value: unknown[] | Record<string, unknown>, path: ContainerPath): NestedWalk {
+	path.enter(value);
 	if (Array.isArray(value)) {
-		let changed = false;
-		const next = value.map(entry => {
-			const sanitized = toWellFormedDeep(entry);
-			if (sanitized !== entry) changed = true;
-			return sanitized;
-		});
-		return changed ? next : value;
-	}
-	if (isRecord(value)) {
-		let changed = false;
-		const next: Record<string, unknown> = {};
-		for (const [key, entry] of Object.entries(value)) {
-			// The compaction signature covers this opaque list; don't sanitize any nested values.
-			const sanitized = value.type === "compaction" && key === "tool_changes" ? entry : toWellFormedDeep(entry);
-			if (sanitized !== entry) changed = true;
-			next[key] = sanitized;
+		let out: unknown[] | undefined;
+		for (let index = 0; index < value.length; index++) {
+			const entry = value[index];
+			const sanitized = isWellFormedWalked(entry) ? yield wellFormedNode(entry, path) : wellFormedLeaf(entry);
+			if (sanitized === entry) continue;
+			out ??= value.slice();
+			out[index] = sanitized;
 		}
-		return changed ? next : value;
+		path.leave(value);
+		return out ?? value;
 	}
-	return value;
+	// The compaction signature covers this opaque list; don't sanitize any nested values.
+	const opaqueKey = value.type === "compaction" ? "tool_changes" : undefined;
+	let out: Record<string, unknown> | undefined;
+	for (const [key, entry] of Object.entries(value)) {
+		const sanitized =
+			key === opaqueKey
+				? entry
+				: isWellFormedWalked(entry)
+					? yield wellFormedNode(entry, path)
+					: wellFormedLeaf(entry);
+		if (sanitized === entry) continue;
+		// The spread copies a `__proto__` key JSON.parse made as an own key, which this assignment then
+		// writes; assigned to a fresh object, that key would set the copy's prototype instead.
+		out ??= { ...value };
+		out[key] = sanitized;
+	}
+	path.leave(value);
+	return out ?? value;
 }
 
 /**

@@ -4,6 +4,7 @@
 
 ### Breaking Changes
 
+- Rust SDK: `SessionTree::tree` is a `DeepJson<Vec<Map<String, Value>>>`, which derefs to the list of roots and drops a tree of any depth without overflowing the stack; take the list out with `into_inner()` and drop it with `drop_deep`
 - `providers.fetch` values `native`, `trafilatura`, and `lynx` are replaced by a single `local` value for the in-process reader engine.
 
 ### Added
@@ -19,6 +20,26 @@
 
 ### Fixed
 
+- A session holding an entry nested more than about 25,000 levels deep is written and rewritten again, instead of every write failing with `Maximum call stack size exceeded`: the passes that write a line, with `secrets.maskSessionStore` on the masking too, read an entry as deep as a session file can hold (400,000 levels), and a line that deep is written in milliseconds instead of the seconds `JSON.stringify` takes past about 25,000 levels
+- A session whose entries carry a `runtime` nested more than about 25,000 levels deep resumes instead of failing with `Maximum call stack size exceeded`
+- An entry nested more than 10,000 levels deep that holds a bigint (an extension hook can put one in an entry) is written with the bigint as its decimal string, as a shallower entry is, instead of every write of the session failing with `JSON.stringify cannot serialize BigInt`
+- Writing a session that holds an entry nested more than 1,000 levels deep no longer rescans the entry at each of its first 1,000 levels (a 3,000-level entry with 100 fields per level took 605 ms a write, now 10 ms), and resuming a session whose older entry nests 50,000 levels deep takes 36 ms instead of 1.7 s
+- `omp anonymize` and the anonymized session dump write a session holding an entry nested more than about 22,000 levels deep (a tool's `details` or a tool call's arguments) instead of failing with `Maximum call stack size exceeded` and writing nothing
+- Switching to the session already open (a reload) no longer fails with `Maximum call stack size exceeded` when one of its tool calls' arguments nests more than about 8,400 levels deep
+- Choosing a retry fallback model that stands on another compaction boundary no longer fails with `Maximum call stack size exceeded` when the failed turn's tool call has arguments nested more than about 16,000 levels deep
+- `/resume --from-claude` and `--from-codex` import a session holding an entry nested more than 40,000 levels deep instead of failing with `Maximum call stack size exceeded`
+- A side question (`/btw`, the RPC ephemeral turn) asked in a session holding an entry nested more than 40,000 levels deep, or passed such a history, is sent instead of failing with `Maximum call stack size exceeded`
+- `/dump` writes the request JSON of a conversation whose tool call's arguments nest more than 40,000 levels deep instead of leaving it out; a request nested more than 1,000 levels deep is written without indentation, which grows with the square of the depth (30,000 levels made a 1.8 GB file)
+- With secrets configured, a tool call whose arguments nest more than about 22,000 levels deep no longer fails with `Maximum call stack size exceeded` where omp hides the secrets in it: in the request to the provider (an OpenAI Responses replay's own copy of the call, nested past about 40,000 levels, too), in what an advisor reads (a tool result's `details` too), and in the snapshot `/share` uploads
+- `/share` of a session holding an entry nested more than about 40,000 levels deep (a tool's `details`, say), or more than about 22,000 when the snapshot is over the upload limit and has to be trimmed, uploads instead of failing with `Maximum call stack size exceeded`; the trim now copies only what it changes instead of the whole snapshot
+- RPC `get_messages_page` no longer fails with `Maximum call stack size exceeded` at a message nested more than about 40,000 levels deep (a tool result's `details`, say), which stopped every later page at that message; it counts the message's bytes as it counts any other's
+- `omp gc --strip` strips a transcript holding a line nested more than about 40,000 levels deep instead of reporting `Maximum call stack size exceeded` for the file and skipping it
+- Memory extraction no longer marks a session's stage-1 job failed with `Maximum call stack size exceeded` when the session holds a message nested more than about 40,000 levels deep
+- `history://current/full` renders a branch holding an entry nested more than about 40,000 levels deep instead of throwing `Maximum call stack size exceeded` after several seconds; JSON in it nested more than 1,000 levels deep is written on one line, where indentation grows with the square of the depth
+- `/export` and `omp export` write a session holding an entry nested more than 40,000 levels deep instead of failing with `Maximum call stack size exceeded` and removing the file
+- RPC mode sends an event frame over 1 MiB that holds a tool result nested more than about 18,000 levels deep, and an `agent_end` over 1 MiB whose messages nest more than about 10,000 levels deep, instead of failing to encode them with `Maximum call stack size exceeded`
+- RPC `get_tree` no longer fails with `Maximum call stack size exceeded` on a session deeper than about 10,000 entries
+- The Python, Go and Rust RPC SDKs read a `get_tree` answer of any depth: Python no longer raises `RecursionError` or closes the client, Go no longer closes the client or waits out its 30 s timeout (a response that fails to decode now fails its call at once), and Rust no longer closes the client
 - Resuming or rewinding a session with an aborted task result no longer throws while the transcript renders; the card shows the cancellation text ([#20533](https://github.com/can1357/oh-my-pi/pull/20533) by [@g0spel](https://github.com/g0spel))
 - Save in Plan Review now accepts a custom path and shows where the plan was saved without requiring you to dismiss the review ([#20539](https://github.com/can1357/oh-my-pi/issues/20539)).
 - The focused diff in Tern's native `/git` preview now scrolls with the arrow keys, Page Up/Page Down, and Home/End ([#20537](https://github.com/can1357/oh-my-pi/issues/20537)).

@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- An HTML export's trace view shows a span's raw entry nested more than 1,000 levels deep on one line instead of indented; an entry nested past the browser's `JSON.stringify` stack limit is shown, and its copy buttons copy it, instead of failing to render the span's details; a shallower entry is indented as before
 - Fixed web search cards without a synthesized answer displaying raw numbered result lists; they now show a concise excerpt for each source instead.
 
 ## [18.22.0] - 2026-11-16

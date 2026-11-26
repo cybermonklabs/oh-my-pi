@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Counting a tool call whose arguments nest more than 40,000 levels deep (a resumed session can hold one) no longer fails with `Maximum call stack size exceeded`, which failed the first prompt after the resume, each turn's end, compaction and every context-usage reading
+- With `provider.appendOnlyContext` on, a request no longer fails with `Maximum call stack size exceeded` when the conversation holds a tool call whose arguments nest more than 40,000 levels deep
+- With full message-content capture on, a request whose history holds a tool call or result nested more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded` while its input messages are recorded, nor spends 1.5 s or more on each request recording them, and a tool span records such a tool call's arguments and result as JSON instead of `[object Object]`
 - Fixed OpenTelemetry chat spans reporting the requested model as `gen_ai.response.model` when the provider recorded the model that actually served the turn ([#20466](https://github.com/can1357/oh-my-pi/pull/20466) by [@byhow](https://github.com/byhow))
 
 ## [19.2.1] - 2026-11-25
@@ -1348,7 +1351,7 @@
 
 ### Added
 
-- Added a non-interrupting "aside" message channel to the agent loop (`AgentLoopConfig.getAsideMessages` / `Agent.setAsideMessageProvider`). Asides are drained at each step boundary (after a tool batch, before the next model call) and at the yield check, so passive notifications (e.g. background-job completions, late LSP diagnostics) reach the model *between requests* without waiting for the agent to stop and without aborting in-flight tools the way steering does.
+- Added a non-interrupting "aside" message channel to the agent loop (`AgentLoopConfig.getAsideMessages` / `Agent.setAsideMessageProvider`). Asides are drained at each step boundary (after a tool batch, before the next model call) and at the yield check, so passive notifications (e.g. background-job completions, late LSP diagnostics) reach the model _between requests_ without waiting for the agent to stop and without aborting in-flight tools the way steering does.
 
 ### Changed
 
@@ -1944,14 +1947,14 @@ Initial release under @oh-my-pi scope. See previous releases at [badlogic/pi-mon
 ### Breaking Changes
 
 - **Queue API replaced with steer/followUp**: The `queueMessage()` method has been split into two methods with different delivery semantics ([#403](https://github.com/badlogic/pi-mono/issues/403)):
-  - `steer(msg)`: Interrupts the agent mid-run. Delivered after current tool execution, skips remaining tools.
-  - `followUp(msg)`: Waits until the agent finishes. Delivered only when there are no more tool calls or steering messages.
+   - `steer(msg)`: Interrupts the agent mid-run. Delivered after current tool execution, skips remaining tools.
+   - `followUp(msg)`: Waits until the agent finishes. Delivered only when there are no more tool calls or steering messages.
 - **Queue mode renamed**: `queueMode` option renamed to `steeringMode`. Added new `followUpMode` option. Both control whether messages are delivered one-at-a-time or all at once.
 - **AgentLoopConfig callbacks renamed**: `getQueuedMessages` split into `getSteeringMessages` and `getFollowUpMessages`.
 - **Agent methods renamed**:
-  - `queueMessage()` → `steer()` and `followUp()`
-  - `clearMessageQueue()` → `clearSteeringQueue()`, `clearFollowUpQueue()`, `clearAllQueues()`
-  - `setQueueMode()`/`getQueueMode()` → `setSteeringMode()`/`getSteeringMode()` and `setFollowUpMode()`/`getFollowUpMode()`
+   - `queueMessage()` → `steer()` and `followUp()`
+   - `clearMessageQueue()` → `clearSteeringQueue()`, `clearFollowUpQueue()`, `clearAllQueues()`
+   - `setQueueMode()`/`getQueueMode()` → `setSteeringMode()`/`getSteeringMode()` and `setFollowUpMode()`/`getFollowUpMode()`
 
 ### Fixed
 
@@ -1963,9 +1966,9 @@ Initial release under @oh-my-pi scope. See previous releases at [badlogic/pi-mon
 
 - **Transport abstraction removed**: `ProviderTransport`, `AppTransport`, and `AgentTransport` interface have been removed. Use the `streamFn` option directly for custom streaming implementations.
 - **Agent options renamed**:
-  - `transport` → removed (use `streamFn` instead)
-  - `messageTransformer` → `convertToLlm`
-  - `preprocessor` → `transformContext`
+   - `transport` → removed (use `streamFn` instead)
+   - `messageTransformer` → `convertToLlm`
+   - `preprocessor` → `transformContext`
 - **`AppMessage` renamed to `AgentMessage`**: All references to `AppMessage` have been renamed to `AgentMessage` for consistency.
 - **`CustomMessages` renamed to `CustomAgentMessages`**: The declaration merging interface has been renamed.
 - **`UserMessageWithAttachments` and `Attachment` types removed**: Attachment handling is now the responsibility of the `convertToLlm` function.

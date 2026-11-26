@@ -13,6 +13,8 @@
 
 ### Fixed
 
+- A request to Anthropic whose conversation holds a tool call with arguments nested between about 22,500 and 40,000 levels deep is sent instead of failing with `Maximum call stack size exceeded` (past 40,000 the request body's own JSON writer still stops), and a frozen fallback-credit request holding one past about 16,000 levels is redeemed under `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`
+- A request to Anthropic keeps a tool call's `__proto__` argument key when it replaces a lone surrogate in another string of the same object, where it dropped that key from the request
 - Devin sessions now switch to another stored login when the current one's weekly quota is spent and it has no on-demand balance, instead of failing every request on it ([#20524](https://github.com/can1357/oh-my-pi/pull/20524) by [@will-bogusz](https://github.com/will-bogusz))
 - The thinking-loop guard no longer aborts healthy reasoning written in Chinese, Japanese, Thai, or other unspaced scripts when the same English tool or metric names recur, and now also catches loops in that text ([#20096](https://github.com/can1357/oh-my-pi/issues/20096))
 - Pi-native stream requests now use a configured `Authorization` header regardless of its casing and fall back to the API key when the header is empty or absent ([#20472](https://github.com/can1357/oh-my-pi/pull/20472) by [@enieuwy](https://github.com/enieuwy))

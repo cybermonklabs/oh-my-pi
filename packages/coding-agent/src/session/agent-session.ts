@@ -100,6 +100,7 @@ import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
 import { EditStore, type PowerAssertionOptions } from "@oh-my-pi/pi-natives";
 import {
 	$env,
+	cloneJsonTree,
 	escapeXmlText,
 	formatDuration,
 	getAgentDbPath,
@@ -111,6 +112,7 @@ import {
 	postmortem,
 	prompt,
 	Snowflake,
+	stringifyDeepJson,
 	stringProperty,
 	toError,
 	untilAborted,
@@ -14468,7 +14470,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		);
 		if (
 			args.maxContextBytes !== undefined &&
-			Buffer.byteLength(JSON.stringify(context), "utf8") > args.maxContextBytes
+			Buffer.byteLength(stringifyDeepJson(context) ?? "null", "utf8") > args.maxContextBytes
 		) {
 			throw new Error(`Ephemeral turn context exceeds the configured ${args.maxContextBytes}-byte limit.`);
 		}
@@ -14655,8 +14657,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		markPerCallContextMessage(reminder);
 		messages.push(reminder);
 		if (history?.length) {
-			// Detach before the conversion pipeline can await or mutate caller-owned messages.
-			const detachedHistory = structuredClone(history);
+			// Detach before the conversion pipeline can await or mutate caller-owned messages; the copy
+			// keeps its own stack, as deep as a transcript line holds.
+			const detachedHistory = cloneJsonTree(history);
 			if (!conversationKey) for (const message of detachedHistory) markPerCallContextMessage(message);
 			messages.push(...detachedHistory);
 		}
@@ -16830,7 +16833,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			})),
 			messages: llmMessages,
 		};
-		return `${JSON.stringify(payload, null, 2)}\n`;
+		// Indented for a reader; a request nested past 1,000 levels (a tool call's arguments are any JSON) is written
+		// without indentation, which grows with the square of the depth.
+		return `${stringifyDeepJson(payload, { space: 2 })}\n`;
 	}
 
 	/**
