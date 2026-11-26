@@ -14,7 +14,12 @@ import type {
 	UserMessage,
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { GetChatMessageRequestSchema, GetUserJwtResponseSchema } from "@oh-my-pi/pi-catalog/discovery/devin-proto";
+import {
+	AssignModelResponseSchema,
+	GetChatMessageRequestSchema,
+	GetUserJwtResponseSchema,
+	ModelAssignmentSchema,
+} from "@oh-my-pi/pi-catalog/discovery/devin-proto";
 import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 
 /**
@@ -114,7 +119,7 @@ function anthropicTarget(spec: Partial<ModelSpec<"anthropic-messages">>): Model<
 	} as ModelSpec<"anthropic-messages">);
 }
 
-function otherTarget<T extends Api>(api: T, provider: string, id: string): Model<T> {
+function otherTarget<T extends Api>(api: T, provider: string, id: string, compat?: ModelSpec<T>["compat"]): Model<T> {
 	return buildModel({
 		api,
 		provider,
@@ -126,6 +131,7 @@ function otherTarget<T extends Api>(api: T, provider: string, id: string): Model
 		maxTokens: 8_192,
 		contextWindow: 200_000,
 		reasoning: true,
+		...(compat && { compat }),
 	} as ModelSpec<T>);
 }
 
@@ -290,6 +296,24 @@ describe("a Claude target gets none of another model's thinking", () => {
 		expect(wire.assistant).toContainEqual({ type: "text", text: ANSWER });
 		expect(wire.assistant).toContainEqual(expect.objectContaining({ type: "tool_use", id: "call_1" }));
 	});
+
+	it("drops another model's thinking from another wire of the same provider", () => {
+		// One provider id can serve Gemini on chat completions and Claude on
+		// Anthropic Messages. A host set not to replay unsigned thinking would get
+		// that thinking demoted to text, which no later step removes.
+		const target = anthropicTarget({
+			provider: "model-gateway",
+			id: "claude-opus-5-5",
+			baseUrl: "https://gateway.example.com",
+			compat: { replayUnsignedThinking: false },
+		});
+		const gemini: Source = { ...GEMINI_COMPLETIONS, provider: "model-gateway" };
+		const wire = anthropicWire(foreignHistory(gemini), target);
+
+		expect(wire.json).not.toContain(REASONING);
+		expect(wire.assistant).toContainEqual({ type: "text", text: ANSWER });
+		expect(wire.assistant).toContainEqual(expect.objectContaining({ type: "tool_use", id: "call_1" }));
+	});
 });
 
 describe("another Claude model's signed thinking on the same provider is unchanged", () => {
@@ -359,12 +383,19 @@ describe("another Claude model's signed thinking on the same provider is unchang
 	});
 });
 
-/** Captures the Cascade request omp's Devin provider sends, without a model call. */
-async function devinRequest(model: Model<"devin-agent">, messages: Message[]) {
+/**
+ * Captures the Cascade request omp's Devin provider sends, without a model
+ * call. A router's AssignModel call is answered with `routedTo`.
+ */
+async function devinRequest(model: Model<"devin-agent">, messages: Message[], routedTo = "claude-sonnet-4-5") {
 	const authPayload = toBinary(GetUserJwtResponseSchema, create(GetUserJwtResponseSchema, { userJwt: "jwt" }));
+	const assignment = create(AssignModelResponseSchema, {
+		assignment: create(ModelAssignmentSchema, { assignmentJwt: "assign-jwt", modelUid: routedTo }),
+	});
 	let requestPayload: Uint8Array | undefined;
 	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
 		if (String(input).includes("GetUserJwt")) return new Response(authPayload);
+		if (String(input).includes("AssignModel")) return new Response(toBinary(AssignModelResponseSchema, assignment));
 		requestPayload = new Uint8Array(init?.body as ArrayBuffer);
 		return new Response(new Uint8Array());
 	}) as typeof fetch;
@@ -403,6 +434,28 @@ describe("a Claude model behind Devin", () => {
 		const request = await devinRequest(otherTarget("devin-agent", "devin", "gpt-5"), foreignHistory(GEMINI_GOOGLE));
 
 		expect(request.chatMessagePrompts[1]?.prompt).toContain(REASONING);
+	});
+});
+
+describe("a model Devin's router picks", () => {
+	// `adaptive` names no model; the router picks one per request, and the
+	// model it picks may be Claude.
+	const router = otherTarget("devin-agent", "devin", "adaptive", { modelRouter: true });
+
+	it("gets none of another model's thinking in the prompt, and keeps the answer and tool call", async () => {
+		const request = await devinRequest(router, foreignHistory(GEMINI_GOOGLE));
+
+		expect(request.chatModelUid).toBe("claude-sonnet-4-5");
+		expect(request.chatMessagePrompts[1]).toMatchObject({ prompt: ANSWER, thinking: "" });
+		expect(request.chatMessagePrompts[1]?.toolCalls.map(call => call.name)).toEqual(["read"]);
+		for (const prompt of request.chatMessagePrompts) expect(prompt.prompt).not.toContain(REASONING);
+	});
+
+	it("keeps the router's own thinking in the thinking field", async () => {
+		const own: Source = { api: "devin-agent", provider: "devin", model: router.id };
+		const request = await devinRequest(router, foreignHistory(own));
+
+		expect(request.chatMessagePrompts[1]).toMatchObject({ prompt: ANSWER, thinking: REASONING });
 	});
 });
 

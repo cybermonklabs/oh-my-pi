@@ -593,19 +593,22 @@ export function dropsForeignReasoningPayload(
  * the rest, which would reach it as text, or as an unsigned block that a host
  * in front of Anthropic rejects and the encoder then writes as text. That
  * model's answers and tool calls stay. Devin writes this transform's demoted
- * text into the turn's prompt, so its wire counts here too. Context estimates
- * count a turn's thinking by this same answer.
+ * text into the turn's prompt, so its wire counts here too. A model router
+ * (`compat.modelRouter`: Devin's `adaptive`) names no model, and the model it
+ * picks may be Claude, so it counts as one. Context estimates count a turn's
+ * thinking by this same answer.
  */
 export function dropsForeignThinking(
 	turn: Pick<AssistantMessage, "provider" | "api" | "model">,
-	model: CatalogPolicyInputs,
+	model: CatalogPolicyInputs & { compat?: Model["compat"] },
 	signed: boolean,
 ): boolean {
 	if (model.api !== "devin-agent" && (DIRECT_REPLAY_APIS as Partial<Record<Api, boolean>>)[model.api] !== true) {
 		return false;
 	}
 	if (isSameModelTurn(turn, model)) return false;
-	if (resolveCatalogPolicy(model).classifierCotExtraction !== true) return false;
+	const routes = model.compat !== undefined && "modelRouter" in model.compat && model.compat.modelRouter === true;
+	if (!routes && resolveCatalogPolicy(model).classifierCotExtraction !== true) return false;
 	return !(
 		signed &&
 		model.api === "anthropic-messages" &&

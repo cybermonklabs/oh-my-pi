@@ -285,6 +285,7 @@ export class Tokenizer {
 						requestModelId: model.requestModelId,
 						thinking: model.thinking,
 						providerType: model.providerType,
+						compat: model.compat,
 					}
 				: undefined;
 		this.reasoningReplayKey = reasoningReplayKey(model);

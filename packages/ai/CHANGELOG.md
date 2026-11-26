@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed Claude refusing requests (`reasoning_extraction`) after a session moved to another model and back: Claude models, Devin's included, no longer receive another model's thinking as plain assistant text, or as an unsigned thinking block. That model's replies and tool calls are still sent, another model's thinking signed on the same provider's `anthropic-messages` endpoint still replays natively, and Claude's own thinking replays as before. The rule (`dropsForeignThinking`) follows the `classifier-cot-extraction` catalog axis.
+- Fixed Claude refusing requests (`reasoning_extraction`) after a session moved to another model and back: Claude models, Devin's included, and any model Devin's `adaptive` router picks no longer receive another model's thinking as plain assistant text, or as an unsigned thinking block. That model's replies and tool calls are still sent, another model's thinking signed on the same provider's `anthropic-messages` endpoint still replays natively, and Claude's own thinking replays as before. The rule (`dropsForeignThinking`) follows the `classifier-cot-extraction` catalog axis, and treats a model router as possibly Claude.
 
 ## [18.18.4] - 2026-11-09
 
