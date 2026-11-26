@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- bash mode: after `set -e` leaves a function, the EXIT trap no longer sees the function's local variables: bash frees them first (`reset_local_contexts`), keeping `FUNCNAME` and the positional parameters, except where a subshell catches the exit (`( … )`, a compound command's or coprocess's fork) and in a posix-mode script. A freed `local IFS` still splits words and joins `$*` until `IFS` is next assigned or unset or a function returns, as bash's split cache does. An ERR trap that turns `set -e` off (`trap 'set +e' ERR`) no longer ends the shell.
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

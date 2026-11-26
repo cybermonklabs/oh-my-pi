@@ -89,6 +89,14 @@ pub struct Vproc {
 	/// nested shell). A field, not an overlay record: a record would cost
 	/// every subshell a ~530-byte map allocation (idle vproc ≤ 2 KiB).
 	pub subshell:      u32,
+	/// What catches a `set -e` jump once it leaves this vproc's own `eval`,
+	/// `.` and trap-action frames: whether bash frees the functions' local
+	/// variables before the EXIT trap (`reset_local_contexts`). Set when
+	/// the vproc starts ([`Catcher`]).
+	pub catcher:       Catcher,
+	/// The split value a freed `local IFS` left ([`HeldIfs`]); `None` when
+	/// splitting reads `IFS` itself. Boxed: rare, and an idle vproc pays 8 B.
+	pub held_ifs:      Option<Box<HeldIfs>>,
 	/// The command being run (`BASH_COMMAND`): its unit and syntax node.
 	/// Externalized by unit id (a trap action continuing after a restore
 	/// still names the trapped command).
@@ -121,6 +129,46 @@ pub struct Vproc {
 	/// Inherited (copied) by children; never serialized: a restored shell
 	/// starts with zsh's defaults and no line in progress.
 	pub zle:           Option<Box<super::zle::Zle>>,
+}
+
+/// bash's `top_level` for a vproc ([`Vproc::catcher`]): what catches a
+/// `set -e` jump (`ERREXIT`) out of a function once it leaves the vproc's
+/// own `eval`, `.` and trap-action levels, which free the functions' local
+/// variables first themselves (evalstring.c:388). It decides whether bash
+/// frees them before the EXIT trap (`reset_local_contexts`, variables.c:
+/// 5395): the trap then sees no local, and runs in no function. A fork of
+/// a simple command has no `top_level` of its own (`execute_cmd.c:5569`,
+/// `execute_subshell_builtin_or_function` calls the function directly):
+/// it takes the one its shell had when it forked
+/// ([`super::exec::fork_catcher`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Catcher {
+	/// The root's run: a `-c` string is a `parse_and_execute` level, which
+	/// frees them (evalstring.c:388); a script's `reader_loop` frees them
+	/// outside posix mode (eval.c:102).
+	#[default]
+	Run,
+	/// A `parse_and_execute` level: the text of a command or process
+	/// substitution. Frees them.
+	ParseLevel,
+	/// `execute_in_subshell`'s `top_level` (`execute_cmd.c:1811`): the fork
+	/// of a `( … )`, of a compound command or of a coprocess. Keeps them.
+	Subshell,
+}
+
+/// The `IFS` word splitting and the `$*` join use after `set -e` freed a
+/// function's `local IFS` ([`super::state::reset_local_contexts`]): bash's
+/// split cache (`ifs_value`, `ifs_firstc`, set by `setifs`, subst.c) still
+/// names the freed local, and only its next refresh (`sv_ifs`: `IFS`
+/// assigned or unset, a function's return through `pop_context`, a
+/// temporary `IFS`) brings back the visible one. `$IFS`, `declare -p` and
+/// `read` read the visible variable. (bash 5.3.20 keeps a pointer into the
+/// freed value there, so what it splits on depends on that freed memory;
+/// the value the local held is what the cache named.)
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldIfs {
+	/// The freed local's value; `None` when it was unset (default splitting).
+	pub value: Option<BString>,
 }
 
 /// The terminal of the session a vproc runs in when it is not the shell's
@@ -1754,8 +1802,11 @@ impl Live {
 // most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
 // (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
 // vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B.
-const _: () = assert!(size_of::<Vproc>() <= 672, "Vproc grew (idle vproc ≤ 2 KiB)");
+// that to at most 1,840 B. A vproc's `set -e` catcher (`Vproc::catcher`, 1 B,
+// 8 with its alignment) and the boxed split value of a freed `local IFS`
+// (`Vproc::held_ifs`, 8 B) grow Vproc 672 → 688 B; the bench measured
+// 1,856 B per idle vproc with them (1,840 B without), 3 runs each.
+const _: () = assert!(size_of::<Vproc>() <= 688, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");

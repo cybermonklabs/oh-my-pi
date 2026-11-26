@@ -752,15 +752,20 @@ impl<'e, 'c> Expander<'e, 'c> {
 		self.vp.mode
 	}
 
-	/// `IFS`; `None` when unset (default splitting).
+	/// `IFS` as splitting and the `$*` join use it; `None` when unset
+	/// (default splitting). A `local IFS` that `set -e` freed still splits
+	/// ([`super::proc::HeldIfs`]).
 	fn ifs(&mut self) -> X<Option<Ifs>> {
 		match &self.ifs {
 			IfsCache::Unset => return Ok(None),
 			IfsCache::Set(ifs) => return Ok(Some(ifs.clone())),
 			IfsCache::Unknown => {},
 		}
-		let v = state::lookup(&self.k.root, self.cx.store, self.vp, b"IFS")?
-			.map(|v| Ifs::new(v.as_scalar().unwrap_or_default()));
+		let v = match &self.vp.held_ifs {
+			Some(held) => held.value.as_ref().map(|v| Ifs::new(v)),
+			None => state::lookup(&self.k.root, self.cx.store, self.vp, b"IFS")?
+				.map(|v| Ifs::new(v.as_scalar().unwrap_or_default())),
+		};
 		self.ifs = v.clone().map_or(IfsCache::Unset, IfsCache::Set);
 		Ok(v)
 	}

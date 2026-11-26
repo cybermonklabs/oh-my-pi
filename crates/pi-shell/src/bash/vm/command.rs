@@ -4950,7 +4950,10 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 		text.push(b'\'');
 	}
 	text.push(b'\n');
-	let child = vp.child_text(k, cx.store, &text, line, vp.fds.clone());
+	// bash runs the hook in the fork of the command it did not find, which
+	// has no `top_level` of its own (execute_cmd.c:5924).
+	let catcher = super::exec::fork_catcher(vp);
+	let child = vp.child_text(k, cx.store, &text, line, vp.fds.clone(), catcher);
 	let vpid = child.vpid;
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));

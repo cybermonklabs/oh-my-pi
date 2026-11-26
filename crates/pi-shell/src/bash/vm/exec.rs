@@ -15,9 +15,9 @@ use super::{
 	expand::{self, Expander, Stop},
 	is_ident, probe,
 	proc::{
-		AssignValue, Atom, Bang, BangStage, Coproc, Depths, Frame, FrameKind, InlineStage, LastBg,
-		LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe, ProbeResult, Run, Saved,
-		Scratch, ScriptKind, Slot, TryEnd, Vproc,
+		AssignValue, Atom, Bang, BangStage, Catcher, Coproc, Depths, Frame, FrameKind, HeldIfs,
+		InlineStage, LastBg, LoopKind, LoopRec, ParseSnapshot, PendingSub, PendingWrite, Probe,
+		ProbeResult, Run, Saved, Scratch, ScriptKind, Slot, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -470,7 +470,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 			}
 		} else if errexit {
 			let status = vp.status;
-			exit_shell(k, vp, cx, status);
+			errexit_shell(k, vp, cx, status);
 		} else if errreturn_failed && unit.mode.dialect() == Dialect::Zsh && zsh_errreturn(k, cx, vp)
 		{
 			// zsh `ERR_RETURN`: a failed command returns from the function
@@ -677,6 +677,95 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	}
 	if !in_exit_trap && vp.transient && vp.runs.is_empty() {
 		start_exit_trap_once(k, vp, cx);
+	}
+}
+
+/// `set -e` leaves the shell (also once the ERR trap ran): bash's jump
+/// first frees every function's local variables where its catcher does
+/// ([`resets_local_contexts`]), then the shell exits as for `exit`
+/// ([`exit_shell`]). The EXIT trap still runs above the functions' frames:
+/// bash runs no unwind-protect, so `FUNCNAME` and the positional
+/// parameters stay.
+fn errexit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
+	if resets_local_contexts(k, cx, vp) {
+		// bash's split cache keeps naming a `local IFS` the reset frees
+		// ([`HeldIfs`]): its value goes on splitting words.
+		let held = match state::binding_scope(&k.root, cx.store, vp, b"IFS") {
+			Ok(Some(_)) => match state::lookup(&k.root, cx.store, vp, b"IFS") {
+				Ok(v) => {
+					Some(HeldIfs { value: v.map(|v| BString::from(v.as_scalar().unwrap_or_default())) })
+				},
+				Err(err) => {
+					k.fail(err);
+					None
+				},
+			},
+			Ok(None) => None,
+			Err(err) => {
+				k.fail(err);
+				None
+			},
+		};
+		state::reset_local_contexts(&mut k.root, cx.store, vp);
+		if let Some(held) = held {
+			vp.held_ifs = Some(Box::new(held));
+		}
+	}
+	exit_shell(k, vp, cx, status);
+}
+
+/// Whether bash frees every function's local variables on its `set -e`
+/// jump out of `vp` (`reset_local_contexts`): only with a function context
+/// (`variable_context`) and `set -e` still on (`exit_immediately_on_error`,
+/// the ERR trap may turn it off). An `eval`, `.` or trap-action frame of
+/// `vp`'s own is a `parse_and_execute` level, which frees them
+/// (evalstring.c:388); else `vp`'s catcher decides ([`Catcher`]). The
+/// first frame of a child is not one of those levels: its catcher stands
+/// for it.
+fn resets_local_contexts(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	if vp.mode.dialect() == Dialect::Zsh || !errexit_on(k, cx, vp) || !in_function_scope(k, cx, vp) {
+		return false;
+	}
+	own_parse_level(vp) || catcher_resets(k, cx, vp, vp.catcher)
+}
+
+/// Whether `vp` runs an `eval`, `.` or trap action of its own: a
+/// `parse_and_execute` level above its first frame.
+fn own_parse_level(vp: &Vproc) -> bool {
+	vp.frames.iter().skip(1).any(|f| {
+		matches!(f.kind, FrameKind::Script {
+			what: ScriptKind::Eval | ScriptKind::Source | ScriptKind::Trap { .. },
+			..
+		})
+	})
+}
+
+/// Whether catcher `c` of `vp` frees the functions' local variables
+/// ([`Catcher`]): a `-c` string's level and a substitution's always, a
+/// script's `reader_loop` outside posix mode (eval.c:102), a subshell's
+/// never.
+fn catcher_resets(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, c: Catcher) -> bool {
+	match c {
+		Catcher::ParseLevel => true,
+		Catcher::Subshell => false,
+		Catcher::Run => {
+			matches!(
+				state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
+				Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
+			) || !state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false)
+		},
+	}
+}
+
+/// The catcher of a fork of a simple command that `vp` makes ([`Catcher`]):
+/// bash's fork of a simple command sets no `top_level` of its own, so its
+/// `set -e` jump reaches the one its shell had: an `eval`, `.` or trap
+/// action of `vp`'s own, else `vp`'s catcher.
+pub fn fork_catcher(vp: &Vproc) -> Catcher {
+	if own_parse_level(vp) {
+		Catcher::ParseLevel
+	} else {
+		vp.catcher
 	}
 }
 
@@ -1088,13 +1177,15 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			}
 		}
 		let frame = top_frame(vp);
-		let (status, source, cancel, return_target, exit) = match frame.kind {
+		let (status, source, cancel, return_target, exit, key) = match frame.kind {
 			FrameKind::Script {
-				what: ScriptKind::Trap { status, cancel, return_target, exit, .. },
+				what: ScriptKind::Trap { status, cancel, return_target, exit, key, .. },
 				..
-			} => (Some(status), false, cancel, return_target, exit),
-			FrameKind::Script { what: ScriptKind::Source, .. } => (None, true, None, None, false),
-			_ => (None, false, None, None, false),
+			} => (Some(status), false, cancel, return_target, exit, Some(key)),
+			FrameKind::Script { what: ScriptKind::Source, .. } => {
+				(None, true, None, None, false, None)
+			},
+			_ => (None, false, None, None, false, None),
 		};
 		let debug = matches!(frame.kind, FrameKind::Script {
 			what: ScriptKind::Trap { key: TrapKey::Debug, .. },
@@ -1129,8 +1220,19 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			finish_cancel(&mut k.root, cx.store, vp, cancel);
 		} else if let Some(status) = status
 			&& exit
+			&& !(key == Some(TrapKey::Err)
+				&& vp.mode.dialect() == Dialect::Bash
+				&& !errexit_on(k, cx, vp))
 		{
-			exit_shell(k, vp, cx, status);
+			// The ERR trap's end is `set -e`'s exit, unless the trap turned
+			// `set -e` off (bash reads it again after the trap,
+			// execute_cmd.c:1006); any other trap that exits is the EXIT
+			// trap's end.
+			if key == Some(TrapKey::Err) {
+				errexit_shell(k, vp, cx, status);
+			} else {
+				exit_shell(k, vp, cx, status);
+			}
 		} else if func_trap && trap_status != 0 && vp.mode.dialect() == Dialect::Zsh {
 			// zsh `dotrapargs`: a function trap returning non-zero forces
 			// a return from the interrupted code, with the error flag set.
@@ -1708,6 +1810,11 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 			| FrameKind::Script { what: ScriptKind::Trap { .. }, .. }
 	) {
 		state::drop_scope(root, store, vp);
+	}
+	// A function's return refreshes bash's split cache (`pop_context`'s
+	// `sv_ifs`): a held `IFS` goes.
+	if matches!(f.kind, FrameKind::Function { .. }) {
+		vp.held_ifs = None;
 	}
 	if let Some(saved) = zsh_optind
 		&& let Err(err) = super::builtins::zsh_vars::optind_leave(root, store, vp, saved)
@@ -2287,10 +2394,12 @@ pub fn start_sub(
 					&& !cat
 					&& (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))
 			});
+			// The text is a `parse_and_execute` level of the child's own.
 			let mut child = if let Some(src) = reparse {
-				vp.child_text(k, cx.store, src, base, fds)
+				vp.child_text(k, cx.store, src, base, fds, Catcher::ParseLevel)
 			} else {
-				let mut child = vp.child(k, cx.store, Arc::clone(&unit), entry, fds);
+				let mut child =
+					vp.child(k, cx.store, Arc::clone(&unit), entry, fds, Catcher::ParseLevel);
 				if let Some(f) = child.frames.last_mut() {
 					f.line_shift = shift;
 				}
@@ -2398,7 +2507,7 @@ pub fn start_zsh_sub(
 	let capture = Capture::default();
 	let mut fds = vp.fds.clone();
 	fds.set(1, Some(FdRef::mem(capture.clone())));
-	let mut child = vp.child_text(k, cx.store, text, line, fds);
+	let mut child = vp.child_text(k, cx.store, text, line, fds, Catcher::ParseLevel);
 	child.jobs = inherited_jobs(vp, vp.jobs.subshell);
 	// Its externals stay in the shell's process group (zsh
 	// `ESUB_NOMONITOR`).
@@ -2442,7 +2551,7 @@ pub fn start_zsh_procsub(
 	let mut fds = vp.fds.clone();
 	fds.set(their_fd, Some(theirs));
 	let line = line_of(vp, 0);
-	let mut child = vp.child_text(k, cx.store, text, line, fds);
+	let mut child = vp.child_text(k, cx.store, text, line, fds, Catcher::ParseLevel);
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}
@@ -2595,7 +2704,8 @@ pub fn start_procsub(
 			fds.set(sibling, None);
 		}
 	}
-	let child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	// The substitution's text is a `parse_and_execute` level.
+	let child = vp.child(k, cx.store, Arc::clone(unit), entry, fds, Catcher::ParseLevel);
 	let vpid = child.vpid;
 	// Not a job: its externals stay in the shell's group, without the
 	// terminal.
@@ -3886,6 +3996,33 @@ fn bash_case_hit(
 		.any(|p| k.engine.patterns().get(p, opts).matches(subject)))
 }
 
+/// The catcher of the fork that runs a pipeline stage or an async command
+/// starting at `entry` ([`Catcher`]). bash forks a lone simple command
+/// (`f | cat`, `f &`, `! f &`) or the pipeline of an async job without a
+/// `top_level` of its own: its `set -e` jump reaches its shell's
+/// ([`fork_catcher`]). Any other command's fork is `execute_in_subshell`'s:
+/// a `( … )` or compound command, a list, and a timed async job, which
+/// bash forces into a subshell (`CMD_FORCE_SUBSHELL`).
+fn stage_catcher(vp: &Vproc, unit: &Unit, entry: u32) -> Catcher {
+	let op = |at: u32| unit.ops.get(at as usize);
+	let code = |at: u32| op(at).map(|o| o.code);
+	let lone = code(entry) == Some(Opcode::Exec)
+		&& (code(entry + 1) == Some(Opcode::SubExit)
+			|| (code(entry + 1) == Some(Opcode::Not) && code(entry + 2) == Some(Opcode::SubExit)));
+	let pipeline = op(entry).is_some_and(|o| {
+		o.code == Opcode::Spawn
+			&& unit
+				.spawns
+				.get(o.a as usize)
+				.is_some_and(|s| s.kind == SpawnKind::Pipeline)
+	});
+	if lone || pipeline {
+		fork_catcher(vp)
+	} else {
+		Catcher::Subshell
+	}
+}
+
 /// bash's `subshell_level` step for a pipeline stage or (`background`) an
 /// async command starting at `entry`: a `( … )` counts once, at its own
 /// `Spawn`; a simple command in a pipeline expands at the parent's level
@@ -4060,7 +4197,15 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						.get_or_insert_with(|| FdRef::mem(mem::MemBuf::new(Vec::new())));
 					fds.set(0, Some(null.clone()));
 				}
-				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				// A `( … )`'s fork catches its own jumps; a job's fork as its
+				// command has it.
+				let catcher = if info.kind == SpawnKind::Subshell {
+					Catcher::Subshell
+				} else {
+					stage_catcher(vp, unit, info.stages[0].entry)
+				};
+				let mut child =
+					vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds, catcher);
 				if info.kind == SpawnKind::Background && !control {
 					ignore_async_signals(k, cx, &mut child);
 				}
@@ -4159,7 +4304,8 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						}
 						stdin = Some(FdRef::mem(r));
 					}
-					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
+					let catcher = stage_catcher(vp, unit, stage.entry);
+					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds, catcher);
 					let level = stage_level(unit, stage.entry, false);
 					super::set_subshell_depth(&mut child, super::subshell_depth(vp) + level);
 					// bash keeps the job list for a `jobs` builtin run as a pipeline
@@ -4369,7 +4515,8 @@ fn start_coproc(
 	let mut fds = vp.fds.clone();
 	fds.set(0, Some(FdRef::mem(in_r)));
 	fds.set(1, Some(FdRef::mem(out_w)));
-	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	// bash's coprocess runs in `execute_in_subshell`.
+	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds, Catcher::Subshell);
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}
