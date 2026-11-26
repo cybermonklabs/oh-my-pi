@@ -227,7 +227,8 @@ rust_test(
 )
 
 # Two tests of the tokenizer scanners each compare the scanner with its regex
-# on 2000 random strings: about 77 s each on a 4-vCPU runner, side by side, of
+# on random strings (kimi's on 2000, deepseek's on 3200): about 77 s each on a
+# 4-vCPU runner, side by side, of
 # about 90 s for the whole target (sami-checks measurement run 45508657730,
 # GitHub ubuntu-22.04, nothing else running). Beside the gate's other test
 # actions on the same 4 vCPU they once reached Bazel's 300 s limit for a
