@@ -439,6 +439,7 @@
 - `rg --null-data` matches `$` at the end of each record with `-o`, `--count-matches`, `--column`, `--vimgrep` or `--replace`, and ends each record it prints with NUL, as ripgrep does: no newline follows a matched or context record any more, and `-o` matches, counts, file names and the `--` between context groups end with NUL instead of a newline. `rg --files` still ends each path with a newline
 - Fixed a session tool that browser code called (`tool.<name>(…)`) running on after its tab was killed or its tab worker replaced (as after a run timed out): the call is now aborted
 - Fixed host output written while a browser run's tool call ran (in RPC mode a protocol frame, in print mode a record) going into the cmux, Tern or inline-worker run's output instead of omp's stdout, and output from work that call started being lost once the run ended: the embedder's side of a tool call now runs outside the run, so it no longer writes into the run
+- `/resume` of a session from another directory, and `/move`, no longer close the session when Mnemopi memory had already failed to start: the session opens in the new directory with memory off and a warning. When memory was running before, the move is still refused and the session stays where it was
 
 ### Security
 

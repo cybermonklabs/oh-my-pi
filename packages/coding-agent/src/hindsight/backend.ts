@@ -8,6 +8,7 @@
  */
 
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { memoryToolRefs } from "../memory-backend/tool-names";
@@ -221,6 +222,33 @@ async function awaitPrimaryStateRebuild(session: AgentSession): Promise<void> {
 	}
 }
 
+/** Memory state a cwd move starts from; see {@link memoryBeforeCwdMove}. */
+export interface MemoryBeforeCwdMove {
+	/** A memory backend was running, so the move must not take it away. */
+	readonly memoryRan: boolean;
+}
+
+/**
+ * Read whether memory runs before a cwd move reloads settings for its
+ * destination: that reload can already tear the running backend down.
+ * Hindsight and Mnemopi start best-effort and stay off after a failed start;
+ * `local` and `sharpshooter` keep no state to check and count as running.
+ */
+export async function memoryBeforeCwdMove(session: AgentSession): Promise<MemoryBeforeCwdMove> {
+	if (!session.memoryEnabled) return { memoryRan: false };
+	await session.settleMemoryBackend();
+	switch (cfgMemoryBackend.get(session.settings)) {
+		case "off":
+			return { memoryRan: false };
+		case "hindsight":
+			return { memoryRan: session.getHindsightSessionState() !== undefined };
+		case "mnemopi":
+			return { memoryRan: session.getMnemopiSessionState() !== undefined };
+		default:
+			return { memoryRan: true };
+	}
+}
+
 /**
  * Finish the memory rebind that a cwd move started, before the move reports
  * success. The settings reload may already have started a backend switch or a
@@ -232,9 +260,17 @@ async function awaitPrimaryStateRebuild(session: AgentSession): Promise<void> {
  * The rebuild is also requested here rather than only awaited, because the
  * bank scope derives from the cwd itself: a move between projects with
  * identical settings changes no setting, yet must still re-route the bank.
+ *
+ * When Mnemopi does not start in the destination, the move fails only if
+ * memory ran before it (`before`, read by {@link memoryBeforeCwdMove}).
+ * Otherwise the move commits without memory, as startup does, and the
+ * returned warning tells the user memory is off.
  */
-export async function rebindMemoryBackendForCwd(session: AgentSession): Promise<void> {
-	if (!session.memoryEnabled) return;
+export async function rebindMemoryBackendForCwd(
+	session: AgentSession,
+	before: MemoryBeforeCwdMove,
+): Promise<string | undefined> {
+	if (!session.memoryEnabled) return undefined;
 	await session.settleMemoryBackend();
 	// Other backends have no Hindsight rebuild path. Reapply them on an
 	// explicit cwd move, but let an in-flight Hindsight transition finish (or
@@ -248,10 +284,11 @@ export async function rebindMemoryBackendForCwd(session: AgentSession): Promise<
 
 	await awaitPrimaryStateRebuild(session);
 
-	// Startup is best-effort, but a move must not commit an unusable memory backend.
-	if (cfgMemoryBackend.get(session.settings) === "mnemopi" && !session.getMnemopiSessionState()) {
-		throw new Error("Mnemopi backend failed to initialise for the destination cwd.");
-	}
+	if (cfgMemoryBackend.get(session.settings) !== "mnemopi" || session.getMnemopiSessionState()) return undefined;
+	// Startup is best-effort, but a move must not take away memory that ran.
+	if (before.memoryRan) throw new Error("Mnemopi backend failed to initialise for the destination cwd.");
+	// Memory was already off, so the move makes nothing worse.
+	return `Memory is off: Mnemopi did not start in ${shortenPath(session.sessionManager.getCwd())}. The omp log has the cause.`;
 }
 
 /**
