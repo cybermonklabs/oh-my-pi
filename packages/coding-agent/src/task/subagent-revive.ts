@@ -46,6 +46,11 @@ import { captureSubagentSettings, layerWrites, type SubagentSettingsWrites } fro
 export interface SubagentReviveInputs {
 	/** The reopened transcript's latest session_init; null where it holds none. */
 	heldInit: PersistedSessionInit | null;
+	/**
+	 * The held base prompt chosen under the settings the build restores for the revived subagent: a cold revive's
+	 * (`revivedSystemPrompt`). Absent, `heldInit`'s prompt.
+	 */
+	heldSystemPrompt?: (settings: Settings) => string[];
 	expectedAgentRef: AgentRef;
 	/** A warm revive's cache. */
 	cache?: WarmReviveCache;

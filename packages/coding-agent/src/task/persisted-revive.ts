@@ -13,6 +13,7 @@ import {
 	resolveAgentAdvisorRolePattern,
 } from "../config/model-resolver";
 import { formatModelRoleAlias } from "../config/model-roles";
+import { lookup as lookupSetting, settingValuesEqual } from "../config/registry";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import type { KeptOverlayLayers, Settings } from "../config/settings";
 import type { EvalToolDescriptor } from "../eval/types";
@@ -308,6 +309,25 @@ export function persistedAgentDefinition(displayName: string, init: PersistedSes
 		systemPrompt: init.systemPrompt.join("\n\n"),
 		source: "user",
 	};
+}
+
+/**
+ * The prompt a cold revive sends as its fixed prompt: the newest `session_init` prompt, or, when the session parked
+ * holding a settings change that a sync has set back since, the base that change was withheld from
+ * ({@link PersistedSessionInit.heldChangeBase}). Each setting the change held then reads, under `settings`, the value
+ * that base was built with, so the stored build would list tools and agents the revived session's settings no
+ * longer give, on every request it makes. A setting this process does not know, or a credential, keeps the build.
+ */
+export function revivedSystemPrompt(init: PersistedSessionInit, settings: Settings): string[] {
+	const held = init.heldChangeBase;
+	if (!held || held.settings.length === 0) return init.systemPrompt;
+	for (const record of held.settings) {
+		const setting = lookupSetting(record.id);
+		if (!setting || setting.isCredential || !settingValuesEqual(record.value, setting.get(settings))) {
+			return init.systemPrompt;
+		}
+	}
+	return held.systemPrompt;
 }
 
 /**
@@ -1118,6 +1138,8 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		prewalkTarget: prepared.prewalkTarget,
 		revive: {
 			heldInit: init,
+			// Chosen under the settings the build gives the revived subagent.
+			heldSystemPrompt: settings => revivedSystemPrompt(init, settings),
 			expectedAgentRef: expectedRef,
 			legacy,
 			agentActionsScope: { reviverFactory: spec.reviverFactory, idleTtlMs: spec.agentIdleTtlMs },

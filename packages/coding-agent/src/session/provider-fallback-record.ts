@@ -16,8 +16,9 @@ import type { SessionManager } from "./session-manager";
 /**
  * Custom session entry holding `{ version: 1, fallbacks: ProviderFallback[] }`: the fallbacks the session's provider
  * state keeps (an endpoint rejected part of a request with a 400, so the provider leaves it out of that model's
- * requests there), written each time they change. The newest record on any branch is the session's: a process that
- * reads the session's entries in whole puts those fallbacks back before it sends anything.
+ * requests there), written each time they change, but a `cache_control` fallback ({@link outlivesProviderState}). The
+ * newest record on any branch is the session's: a process that reads the session's entries in whole puts those
+ * fallbacks back before it sends anything.
  */
 const PROVIDER_FALLBACKS_ENTRY_TYPE = "provider-fallbacks";
 
@@ -50,7 +51,9 @@ interface NewestRecord {
  * fallbacks in the provider state in place of what it kept, so the first request leaves out what the endpoint
  * rejected, as the last request of the session did; a provider state change since (a fallback turned on, a model
  * switch or `/fresh` that closed the state keeping one) and a copy of the session that lacks a record of what the
- * provider state keeps (a branch into a new file) write a new record.
+ * provider state keeps (a branch into a new file) write a new record. A `cache_control` fallback is the exception: it
+ * stays with the provider state that learned it, through such a read too, and no record holds it
+ * ({@link outlivesProviderState}).
  */
 export class ProviderFallbackRecord {
 	readonly #host: ProviderFallbackRecordHost;
@@ -71,7 +74,7 @@ export class ProviderFallbackRecord {
 		const newest = this.#newestRecord();
 		if (this.#takenRevision !== newest.loadRevision) this.#restore(newest.fallbacks);
 		this.#takenRevision = newest.loadRevision;
-		const held = providerFallbacks(this.#host.providerSessionState);
+		const held = providerFallbacks(this.#host.providerSessionState).filter(outlivesProviderState);
 		const key = fallbacksKey(held);
 		if (key === newest.key) return;
 		this.#host.sessionManager.appendCustomEntry(PROVIDER_FALLBACKS_ENTRY_TYPE, { version: 1, fallbacks: held });
@@ -103,18 +106,22 @@ export class ProviderFallbackRecord {
 			if (entry.type !== "custom" || entry.customType !== PROVIDER_FALLBACKS_ENTRY_TYPE) continue;
 			const data = entry.data;
 			if (!isRecord(data) || data.version !== 1 || !Array.isArray(data.fallbacks)) continue;
-			fallbacks = data.fallbacks.filter(isProviderFallback);
+			fallbacks = data.fallbacks.filter(isProviderFallback).filter(outlivesProviderState);
 		}
 		const read = { sessionId, loadRevision, bodyRevision, fallbacks, key: fallbacksKey(fallbacks) };
 		this.#newest = read;
 		return read;
 	}
 
-	/** Makes the provider state keep `fallbacks` and no other. */
+	/**
+	 * Makes the provider state keep `fallbacks` and no other, but the `cache_control` fallbacks it learned itself, which
+	 * no record holds ({@link outlivesProviderState}).
+	 */
 	#restore(fallbacks: readonly ProviderFallback[]): void {
 		const state = this.#host.providerSessionState;
+		const learned = providerFallbacks(state).filter(fallback => !outlivesProviderState(fallback));
 		clearProviderFallbacks(state);
-		for (const fallback of fallbacks) {
+		for (const fallback of [...fallbacks, ...learned]) {
 			switch (fallback.api) {
 				case "anthropic-messages":
 					restoreAnthropicFallback(state, fallback);
@@ -148,6 +155,23 @@ export class ProviderFallbackRecord {
 		}
 		return undefined;
 	}
+}
+
+/**
+ * Whether the session records `fallback` for a later provider state to take back: every fallback but a `cache_control`
+ * one (no breakpoint, or breakpoints without `ttl` and `scope`), which lasts as long as the provider state that learned
+ * it, as it did before the session recorded fallbacks. Kept, one such 400 would hold every later process of the
+ * session to five-minute breakpoints (or none) for good, a cache write of the whole prompt after each pause of five
+ * minutes, while the 400 that set it may not describe the endpoint: the provider cannot tell a refused option from a
+ * refused breakpoint, and the endpoint may take `ttl` again. Dropped, it costs a later provider state the 400 once
+ * more (twice for an endpoint that takes no breakpoint), and the first request that sends `ttl` again reads none of
+ * the five-minute entries and writes the prompt at the one-hour price.
+ */
+function outlivesProviderState(fallback: ProviderFallback): boolean {
+	return (
+		fallback.api !== "anthropic-messages" ||
+		(fallback.off !== "cache-control" && fallback.off !== "cache-control-options")
+	);
 }
 
 /** A key equal for two lists of the same fallbacks in any order. */

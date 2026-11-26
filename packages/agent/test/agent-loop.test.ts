@@ -5585,15 +5585,16 @@ describe("agentLoop pre-model-call gate", () => {
 
 	it("compares a per-call message with the last request sent, not with one the gate stopped", async () => {
 		const contexts: Context[] = [];
+		// As a provider does, each reply reports its response (`onResponse`), which takes the per-call record.
 		const mock = createMockModel({
 			responses: [
 				context => {
 					contexts.push(context);
-					return { content: ["first"] };
+					return { content: ["first"], responseHeaders: {} };
 				},
 				context => {
 					contexts.push(context);
-					return { content: ["third"] };
+					return { content: ["third"], responseHeaders: {} };
 				},
 			],
 		});
@@ -5601,11 +5602,7 @@ describe("agentLoop pre-model-call gate", () => {
 		let note = "status: idle";
 		const agent = new Agent({
 			initialState: { model: mock.model },
-			// As every transport does, the stream function calls `beforeDispatch` as it sends, which takes the record.
-			streamFn: (model, context, options) => {
-				options?.beforeDispatch?.();
-				return mock.stream(model, context, options);
-			},
+			streamFn: (model, context, options) => mock.stream(model, context, options),
 			transformContext: async messages => {
 				const status: AgentMessage = { role: "user", content: note, timestamp: 0 };
 				markPerCallContextMessage(status);

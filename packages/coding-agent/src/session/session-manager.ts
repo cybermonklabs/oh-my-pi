@@ -92,6 +92,7 @@ import {
 	EPHEMERAL_MODEL_CHANGE_ROLE,
 	PREWALK_MODEL_CHANGE_ROLE,
 	type FileEntry,
+	type HeldChangeBase,
 	type LabelEntry,
 	type ModeChangeEntry,
 	type ModelChangeEntry,
@@ -7589,6 +7590,7 @@ export class SessionManager {
 		workPoolYieldItems?: WorkPoolYieldItem[];
 		spawnSpec?: SubagentSpawnSpec;
 		spawnCallId?: string;
+		heldChangeBase?: HeldChangeBase;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -8946,6 +8948,8 @@ export interface PersistedSessionInit {
 	spawnSpec?: SubagentSpawnSpec;
 	/** The parent's top-level call the spawn was requested under ({@link SessionInitEntry.spawnCallId}). */
 	spawnCallId?: string;
+	/** {@link SessionInitEntry.heldChangeBase}. */
+	heldChangeBase?: HeldChangeBase;
 }
 
 /**
@@ -8980,6 +8984,7 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			...(entry.workPoolYieldItems !== undefined ? { workPoolYieldItems: entry.workPoolYieldItems } : undefined),
 			...(entry.spawnSpec !== undefined ? { spawnSpec: entry.spawnSpec } : undefined),
 			...(entry.spawnCallId !== undefined ? { spawnCallId: entry.spawnCallId } : undefined),
+			...(entry.heldChangeBase !== undefined ? { heldChangeBase: entry.heldChangeBase } : undefined),
 		};
 	}
 	return init;

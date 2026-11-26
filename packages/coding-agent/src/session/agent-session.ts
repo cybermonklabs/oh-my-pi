@@ -535,7 +535,7 @@ import {
 	type SessionDumpLiveState,
 } from "./session-dump-format";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
-import type { BranchSummaryEntry, NewSessionOptions, SessionEntry } from "./session-entries";
+import type { BranchSummaryEntry, HeldChangeBase, NewSessionOptions, SessionEntry } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
 	COMPACTION_CHECK_NONE,
@@ -8248,9 +8248,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#sessionChangeCallbacks.clear();
 		// A cold revive sends the newest `session_init` prompt as a fixed prompt and holds nothing, so a session that
 		// parks or ends while its base withholds a change stores the prompt that goes out with it: the revive sends
-		// what the change's notices said the requests would follow, not the held prompt for good.
+		// what the change's notices said the requests would follow, not the held prompt for good. Beside it goes the
+		// base with the settings the change holds, which the revive sends instead should a sync set the change back.
 		const withheldPromptBuild = this.#tools.withheldPromptBuild;
-		if (withheldPromptBuild) this.#recordModelCallSystemPrompt(withheldPromptBuild);
+		if (withheldPromptBuild) {
+			this.#recordModelCallSystemPrompt(withheldPromptBuild, this.#tools.withheldSettingsBase);
+		}
 
 		// Event handlers can reopen the append writer while they persist their
 		// terminal message; that pipeline has drained (or hit the deadline).
@@ -8819,10 +8822,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * Keeps a subagent transcript's latest `session_init` on the base prompt and work-pool yield items
 	 * its model calls are built from, appending a newer one when either changes: signed thinking is
 	 * bound to the system prompt and tools, so cold revival must replay them. A per-turn override is
-	 * stored as the base its hook was given, since the revived turn re-runs the hook. Transcripts
-	 * without a `session_init` are left alone.
+	 * stored as the base its hook was given, since the revived turn re-runs the hook. `heldChangeBase`
+	 * is given only as the session parks holding a settings change (the entry's `heldChangeBase`); a
+	 * newer entry a model call appends has none. Transcripts without a `session_init` are left alone.
 	 */
-	#recordModelCallSystemPrompt(prompt: string[]): void {
+	#recordModelCallSystemPrompt(prompt: string[], heldChangeBase?: HeldChangeBase): void {
 		const sessionFile = this.sessionManager.getSessionFile();
 		let cached = this.#sessionInit;
 		if (!cached || cached.sessionFile !== sessionFile) {
@@ -8840,11 +8844,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			items.length === persistedItems.length &&
 			items.every(
 				(item, index) => item.id === persistedItems[index]?.id && item.index === persistedItems[index]?.index,
-			)
+			) &&
+			(heldChangeBase === undefined || Bun.deepEquals(heldChangeBase, init.heldChangeBase))
 		) {
 			return;
 		}
-		cached.init = { ...init, systemPrompt: base, workPoolYieldItems: items.length > 0 ? [...items] : undefined };
+		const { heldChangeBase: _earlier, ...kept } = init;
+		cached.init = {
+			...kept,
+			systemPrompt: base,
+			workPoolYieldItems: items.length > 0 ? [...items] : undefined,
+			...(heldChangeBase ? { heldChangeBase } : undefined),
+		};
 		this.sessionManager.appendSessionInit(cached.init);
 	}
 

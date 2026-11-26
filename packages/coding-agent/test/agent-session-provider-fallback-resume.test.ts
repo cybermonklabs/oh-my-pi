@@ -5,8 +5,9 @@
  * process that resumes the transcript must leave it out from its first request, as the transcript's last request did:
  * one that sends it again meets the same 400 and, for strict tools, declares other tool bytes than the transcript's
  * last request, which rewrites the whole cached prompt. Its prompt cache status must judge the tools its first request
- * sends. Each process here is a session of its own on the same session file, as omp opens it when it restarts and
- * resumes it.
+ * sends. A `cache_control` fallback is the exception: it lasts as long as the process that learned it, so one 400 that
+ * did not describe the endpoint cannot hold the session to five-minute breakpoints for good. Each process here is a
+ * session of its own on the same session file, as omp opens it when it restarts and resumes it.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
@@ -81,6 +82,14 @@ function breakpointsOf(value: unknown): Record<string, unknown>[] {
 		key === "cache_control" && isRecord(inner) ? [inner] : breakpointsOf(inner),
 	);
 }
+
+/** Whether `request` sends a breakpoint with `ttl` or `scope`, which an endpoint may take or refuse apart from it. */
+function sendsBreakpointOptions(request: GatewayRequest | undefined): boolean {
+	return breakpointsOf(request).some(breakpoint => breakpoint.ttl !== undefined || breakpoint.scope !== undefined);
+}
+
+const CACHE_CONTROL_REJECTION = rejection("messages.0.content.0.cache_control: Extra inputs are not permitted");
+const TTL_REJECTION = rejection('messages.0.content.0.cache_control.ttl: unsupported value "1h"');
 
 /** A streamed reply of a thinking block, signed `sig-<turn>` when `signed`, then the text `seen <turn>`. */
 function thinkingAnswer(turn: number, signed: boolean): Response {
@@ -295,28 +304,6 @@ describe("a resumed transcript whose Anthropic endpoint rejected part of a reque
 						: undefined,
 			},
 		},
-		{
-			// It takes no `cache_control` at all: after a retry without `ttl` fails too, no breakpoint goes out.
-			fallback: "cache_control breakpoints",
-			endpoint: {
-				modelsYml: gatewayModelsYml(),
-				refuse: request =>
-					breakpointsOf(request).length > 0
-						? rejection("messages.0.content.0.cache_control: Extra inputs are not permitted")
-						: undefined,
-			},
-		},
-		{
-			// It takes breakpoints but not their options: they go out without `ttl` and `scope`.
-			fallback: "cache_control ttl and scope",
-			endpoint: {
-				modelsYml: gatewayModelsYml(),
-				refuse: request =>
-					breakpointsOf(request).some(breakpoint => breakpoint.ttl !== undefined || breakpoint.scope !== undefined)
-						? rejection('messages.0.content.0.cache_control.ttl: unsupported value "1h"')
-						: undefined,
-			},
-		},
 	] satisfies { fallback: string; endpoint: Endpoint }[])(
 		"leaves out the $fallback the endpoint rejected from its first request",
 		async ({ endpoint }) => {
@@ -336,4 +323,65 @@ describe("a resumed transcript whose Anthropic endpoint rejected part of a reque
 		},
 		60_000,
 	);
+});
+
+describe("a resumed transcript whose Anthropic endpoint rejected cache_control", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("sends one-hour breakpoints again from its first request, which an endpoint that takes them again takes", async () => {
+		using tempDir = TempDir.createSync("@pi-provider-fallback-resume-");
+		let refused = false;
+		// One 400 that did not describe the endpoint: it takes `ttl` on every other request.
+		const endpoint: Endpoint = {
+			modelsYml: gatewayModelsYml(),
+			refuse: request => {
+				if (refused || !sendsBreakpointOptions(request)) return undefined;
+				refused = true;
+				return TTL_REJECTION;
+			},
+		};
+		const live = await runProcess(tempDir.path(), endpoint, undefined, ["first", "second"]);
+		const resumed = await runProcess(tempDir.path(), endpoint, live.sessionFile, ["third"]);
+		// Precondition: the live process met the 400 once and sent its breakpoints without `ttl` from then on.
+		expect(live.requests.map(sendsBreakpointOptions)).toEqual([true, false, false]);
+
+		// The resumed process sends the one-hour breakpoints again, and the endpoint takes them.
+		expect(resumed.requests).toHaveLength(1);
+		expect(breakpointsOf(resumed.requests[0]).some(breakpoint => breakpoint.ttl === "1h")).toBe(true);
+	}, 60_000);
+
+	it("meets an endpoint's refusal of `ttl` once more, then leaves it out for the rest of the process", async () => {
+		using tempDir = TempDir.createSync("@pi-provider-fallback-resume-");
+		const endpoint: Endpoint = {
+			modelsYml: gatewayModelsYml(),
+			refuse: request => (sendsBreakpointOptions(request) ? TTL_REJECTION : undefined),
+		};
+		const live = await runProcess(tempDir.path(), endpoint, undefined, ["first", "second"]);
+		const resumed = await runProcess(tempDir.path(), endpoint, live.sessionFile, ["third", "fourth"]);
+		// Precondition: the live process met the 400 on its first request only.
+		expect(live.requests.map(sendsBreakpointOptions)).toEqual([true, false, false]);
+
+		// One refused request, its retry, and the next prompt's request, which keeps breakpoints without `ttl`.
+		expect(resumed.requests.map(sendsBreakpointOptions)).toEqual([true, false, false]);
+		expect(breakpointsOf(resumed.requests[2]).length).toBeGreaterThan(0);
+	}, 60_000);
+
+	it("meets an endpoint's refusal of every breakpoint twice more, then sends none for the rest of the process", async () => {
+		using tempDir = TempDir.createSync("@pi-provider-fallback-resume-");
+		const endpoint: Endpoint = {
+			modelsYml: gatewayModelsYml(),
+			refuse: request => (breakpointsOf(request).length > 0 ? CACHE_CONTROL_REJECTION : undefined),
+		};
+		const live = await runProcess(tempDir.path(), endpoint, undefined, ["first", "second"]);
+		const resumed = await runProcess(tempDir.path(), endpoint, live.sessionFile, ["third", "fourth"]);
+		const breakpoints = (run: ProcessRun) => run.requests.map(request => breakpointsOf(request).length > 0);
+		// Precondition: the live process met the 400 with `ttl` and without, then sent no breakpoint.
+		expect(breakpoints(live)).toEqual([true, true, false, false]);
+
+		// The resumed process climbs the same rungs once, then sends no breakpoint.
+		expect(resumed.requests.map(sendsBreakpointOptions)).toEqual([true, false, false, false]);
+		expect(breakpoints(resumed)).toEqual([true, true, false, false]);
+	}, 60_000);
 });
