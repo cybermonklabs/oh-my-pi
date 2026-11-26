@@ -39,82 +39,28 @@ function tryAcquireLock(lockPath: string): NativeFileLock | null {
 	return null;
 }
 
-/**
- * One attempt of a waiting loop: on Linux, claim the lease unless the native
- * probe finds it held. There a native claim of a lease another process holds
- * blocks the thread for about 50 ms before it answers "taken" with the
- * abstract-socket lock (see {@link tryAcquireFileLock}) and answers at once
- * with the open-file-description lock of newer builds of the addon, while the
- * probe answers at once, so a loop that waits for a holder does not stall its
- * thread on every attempt; elsewhere a claim answers at once, so no probe
- * runs. A wrong "held" (under gVisor a probe of the abstract-socket lock can
- * still reach a just-released name) costs the loop one retry delay, so the
- * loop's last attempt claims without the probe, and a probe that fails leaves
- * the answer to the claim.
- */
-function attemptLock(lockPath: string, lastAttempt: boolean): NativeFileLock | null {
-	if (!lastAttempt && process.platform === "linux") {
-		try {
-			if (NativeFileLock.isHeld(lockPath)) return null;
-		} catch {
-			// The probe failed: the claim decides.
-		}
-	}
-	return tryAcquireLock(lockPath);
-}
-
-/**
- * Acquire an exclusive lease without waiting for its holder to release it;
- * `null` while another holder owns it. The claim answers at once, except with
- * the abstract-socket lock on Linux (newer builds of the addon take an
- * open-file-description lock there, whose claim answers at once): that claim
- * retries a refusal, because under gVisor a probe can make a free lease look
- * taken for a few milliseconds, for at most 200 ms, and for about 50 ms while
- * another process holds the lease, blocking the calling thread meanwhile (a
- * lease this process holds is refused at once there too). `isFileLockHeld`
- * tells whether a lease is held without any wait.
- */
+/** Acquire an exclusive lease without waiting; `null` while another holder owns it. */
 export function tryAcquireFileLock(filePath: string): FileLockHandle | null {
 	return tryAcquireLock(getLockPath(filePath));
 }
 
 /**
- * {@link tryAcquireFileLock} for a caller that tries again later: on Linux,
- * while another holder owns the lease, a probe answers `null` at once, where a
- * claim would block the thread for about 50 ms with the abstract-socket lock
- * (with the open-file-description lock of newer builds of the addon it answers
- * at once); elsewhere a claim answers at once, so no probe runs. The probe can
- * also read a just-released lease as held, which costs such a caller one
- * retry; a probe that fails leaves the answer to the claim.
- */
-export function tryAcquireFileLockUnlessHeld(filePath: string): FileLockHandle | null {
-	return attemptLock(getLockPath(filePath), false);
-}
-
-/**
  * Whether any holder, including this process, owns the lease, observed without
- * taking it. A probe of the open-file-description lock of newer builds of the
- * addon takes nothing; under gVisor a probe of the abstract-socket lock can
- * make a concurrent `tryAcquireFileLock` find the lease in use for a few
- * milliseconds, which that claim retries, so the probe does not make it fail
- * either way. Throws when the lock cannot be probed.
+ * taking it, so a concurrent `tryAcquireFileLock` never meets the probe.
+ * Throws when the lock cannot be probed.
  */
 export function isFileLockHeld(filePath: string): boolean {
 	return NativeFileLock.isHeld(getLockPath(filePath));
 }
 
-/**
- * Acquire an exclusive lease; callers must release it when their operation ends.
- * On Linux, while another holder owns it, each attempt but the last only probes
- * the lease, so the wait does not block the event loop between the retry delays.
- */
+/** Acquire an exclusive lease; callers must release it when their operation ends. */
 export async function acquireFileLock(filePath: string, options: FileLockOptions = {}): Promise<FileLockHandle> {
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
 
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		opts.signal?.throwIfAborted();
-		const lock = attemptLock(lockPath, attempt + 1 === opts.retries);
+		const lock = tryAcquireLock(lockPath);
 		if (lock) return lock;
 		if (attempt + 1 < opts.retries) await scheduler.wait(opts.retryDelayMs, { signal: opts.signal });
 	}
@@ -128,7 +74,7 @@ function acquireLockSync(filePath: string, options: FileLockOptions = {}): Nativ
 
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		opts.signal?.throwIfAborted();
-		const lock = attemptLock(lockPath, attempt + 1 === opts.retries);
+		const lock = tryAcquireLock(lockPath);
 		if (lock) return lock;
 		if (attempt + 1 < opts.retries && opts.retryDelayMs > 0) Bun.sleepSync(opts.retryDelayMs);
 	}
