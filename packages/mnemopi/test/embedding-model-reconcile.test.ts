@@ -446,7 +446,13 @@ describe("reconcileEmbeddingModel on store open", () => {
 			expect(atCap.rows).toHaveLength(10);
 			expect(atCap.summaries).toEqual([]);
 
-			for (let i = 10; i < 25; i += 1) insertBlobContentRow(db, `wm-blob-${i}`);
+			insertBlobContentRow(db, "wm-blob-10");
+			const oneOver = await openAndRebuild(db);
+			expect(storedEmbeddings(db)).toEqual(REBUILT);
+			expect(oneOver.rows).toHaveLength(10);
+			expect(oneOver.summaries).toEqual([{ skipped: 11, logged: 10 }]);
+
+			for (let i = 11; i < 25; i += 1) insertBlobContentRow(db, `wm-blob-${i}`);
 			const pastCap = await openAndRebuild(db);
 			expect(storedEmbeddings(db)).toEqual(REBUILT);
 			expect(pastCap.rows).toHaveLength(10);
