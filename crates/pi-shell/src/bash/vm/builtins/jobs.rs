@@ -747,6 +747,7 @@ mod tests {
 			log_cursor: 0,
 			arrayref: Vec::new(),
 			resumed: 0,
+			arith_at: None,
 		};
 		assert_eq!(background(&mut ctx, Some(&BString::from("%1"))), 0);
 		std::mem::take(&mut ctx.chunks)

@@ -1239,9 +1239,10 @@ pub enum MiscKey {
 	NextJob,
 	/// The next vpid (decimal).
 	NextVpid,
-	/// `$RANDOM` generator state, `seed:last` (decimal).
+	/// The shell's `$RANDOM` generator state, `seed:last` (decimal).
 	Random,
-	/// The host clock reading `$SECONDS` counts from (decimal ns).
+	/// The host clock reading the shell's `$SECONDS` counts from (decimal
+	/// ns).
 	StartNs,
 	/// `getopts` progress between calls (`Record::Words` of three fields,
 	/// each empty when unset and `=`-prefixed otherwise: the `OPTIND` text
@@ -1373,6 +1374,9 @@ pub enum MiscKey {
 	/// (`Record::Misc`); absent for a user's shell. Nested shells see the
 	/// root's record.
 	Profile,
+	/// bash: the value cells `unset` removed from the shell (bits of
+	/// `dynvars::CELLS` indices, decimal; `Record::Misc`); absent: none.
+	CellsPlain,
 }
 
 crate::bash::packed_names::packed_names!(MiscKey);
@@ -1381,11 +1385,12 @@ impl MiscKey {
 	/// Whether a fork copies this value into the child's
 	/// [`crate::bash::Image`]: process state, as `fork(2)` copies memory.
 	/// The others are never a forked vproc's records: kernel state every
-	/// vproc shares (the vpid and job counters, the `$RANDOM` generator, the
-	/// shell's start time, zftp's shared status files) and the root vproc's
-	/// own fields the store persists (cwd, mode, `$?`, `PIPESTATUS`, `$!`,
-	/// the job marks, `getopts` progress, `ulimit` values), which a forked
-	/// vproc keeps as fields of its own.
+	/// vproc shares (the vpid and job counters, zftp's shared status files)
+	/// and the root vproc's own fields the store persists (cwd, mode, `$?`,
+	/// `PIPESTATUS`, `$!`, the job marks, `getopts` progress, `ulimit`
+	/// values, the `$RANDOM` generator, the `$SECONDS` origin, the value
+	/// cells `unset` removed), which a forked vproc keeps as fields of its
+	/// own.
 	pub const fn forked(self) -> bool {
 		match self {
 			Self::Cwd
@@ -1400,6 +1405,7 @@ impl MiscKey {
 			| Self::NextVpid
 			| Self::Random
 			| Self::StartNs
+			| Self::CellsPlain
 			| Self::Getopts
 			| Self::Rlimits
 			| Self::ZftpStatus => false,

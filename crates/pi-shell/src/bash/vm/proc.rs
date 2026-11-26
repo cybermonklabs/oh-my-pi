@@ -5,7 +5,7 @@ use std::{collections::VecDeque, sync::Arc};
 use bstr::BString;
 use serde::{Deserialize, Serialize};
 
-use super::state::Scope;
+use super::state::{Level, Random, Scope, Var};
 pub use crate::bash::store::{Job, JobState};
 use crate::bash::{
 	Image,
@@ -145,6 +145,44 @@ pub struct Vproc {
 	/// Inherited (copied) by children; never serialized: a restored shell
 	/// starts with zsh's defaults and no line in progress.
 	pub zle:           Option<Box<super::zle::Zle>>,
+	/// A forked vproc's `$RANDOM` generator and `$SECONDS` origin
+	/// ([`Clock`]): its parent's at the fork. `None` for the root vproc,
+	/// whose are the kernel's.
+	pub clock:         Option<Clock>,
+}
+
+/// A forked vproc's `$RANDOM` generator and `$SECONDS` clock
+/// ([`Vproc::clock`]). Both are process state that a fork copies, as
+/// `fork(2)` copies memory, so neither side's draws, `RANDOM=` or
+/// `SECONDS=` reach the other. The shell's own are the kernel's
+/// (`Kernel::rand`, `Kernel::start_ns`, `Kernel::seconds`), which the store
+/// keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Clock {
+	pub rand:          Random,
+	/// The generator is reseeded on the vproc's first `$RANDOM` in bash code
+	/// unless `RANDOM` was assigned first, as bash reseeds a subshell's
+	/// (`get_random_number`'s `seeded_subshell`); zsh draws on from the copy.
+	pub reseed:        bool,
+	/// The host clock reading of the shell's start, or of the last
+	/// `SECONDS=` in bash code (bash's `shellstart`, which `assign_seconds`
+	/// resets to now): `printf '%(…)T' -2` and the shell's `time` report
+	/// count from it.
+	pub start_ns:      u64,
+	/// The value of the last `SECONDS=` in bash code (bash's
+	/// `seconds_value_assigned`): `$SECONDS` is it plus the seconds since
+	/// `start_ns`. zsh's `SECONDS=` moves `start_ns` instead and sets it to 0.
+	pub seconds:       i64,
+	/// `unset SECONDS` or an array assignment in bash code removed the
+	/// special meaning of `SECONDS`: a plain variable from then on (bash
+	/// removes the dynamic variable).
+	pub seconds_plain: bool,
+	/// The same for `RANDOM`.
+	pub random_plain:  bool,
+	/// `unset` in bash code removed these value cells (bits of
+	/// `dynvars::CELLS` indices): plain variables from then on (bash removes
+	/// the dynamic variable).
+	pub cells_plain:   u16,
 }
 
 /// A `break` or `continue` that ran inside `${ }` or `${| }`
@@ -1587,6 +1625,31 @@ pub enum Atom {
 	/// assigns again as it replays, so it sees the first pass's state at
 	/// every point.
 	Wrote { name: BString, old: Box<Self>, new: Option<BString> },
+	/// The binding of `name` at `level` an argument of a declaration
+	/// builtin (`declare`, `typeset`, `local`, `export`, `readonly`) was
+	/// about to change, as it was on the builtin's first run (`old`: its
+	/// value, `None` when unset; `bound`: whether the place an assignment at
+	/// `level` lands had the name at all). A run again after a later
+	/// argument's `$(…)` parked it puts the binding back before the
+	/// argument is redone, so each argument applies once (`declare x+=1
+	/// a='($(echo 2))'`); a binding the first run did not have is removed,
+	/// not left declared but unset, so a function's `local x` refused over
+	/// a readonly global `x` is refused again.
+	Bound { name: BString, level: Level, old: Option<Var>, bound: bool },
+	/// No binding to put back at this point of a declaration builtin's
+	/// replay log: on its first run the argument had none there (its name
+	/// is no name reference, no temporary binds it). A run again keeps
+	/// that, because the argument's own effect changes what a run again
+	/// would find (`local r` shadows the global reference `r` whose target
+	/// the first run kept), and a run that logged nothing here would read
+	/// the next point's atom
+	/// ([`Ctx::rollback_point_once`](super::builtins::Ctx::rollback_point_once)).
+	Unbound,
+	/// The results, in order, of the arithmetic an argument of a builtin
+	/// evaluated on its first run (`declare -i y=w++`, `unset 'c[w++]'`): a
+	/// run again takes them and evaluates nothing, so the arithmetic's own
+	/// assignments and `RANDOM` draws happen once.
+	Arith(Vec<i64>),
 }
 
 /// Per-op scratch: expansion replay logs, staged progress and transient

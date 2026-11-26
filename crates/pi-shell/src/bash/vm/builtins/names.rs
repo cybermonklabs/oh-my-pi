@@ -597,14 +597,19 @@ pub fn compgen(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	for action in &actions {
 		match action.as_slice() {
 			b"function" => words.extend(all_functions(ctx)?.into_iter().map(|(n, ..)| n)),
-			b"variable" => words.extend(
-				state::scan(&ctx.k.root, ctx.cx.store, ctx.vp, Table::Var)?
-					.into_iter()
-					.filter_map(|(k, _)| match k {
-						KeyBuf::Var(n) => Some(n),
-						_ => None,
-					}),
-			),
+			b"variable" => {
+				let mut names: Vec<BString> =
+					state::scan(&ctx.k.root, ctx.cx.store, ctx.vp, Table::Var)?
+						.into_iter()
+						.filter_map(|(k, _)| match k {
+							KeyBuf::Var(n) => Some(n),
+							_ => None,
+						})
+						.collect();
+				// bash's dynamic variables this shell keeps no variable for.
+				crate::bash::vm::dynvars::with_listed(ctx.k, ctx.cx.store, ctx.vp, &mut names)?;
+				words.extend(names);
+			},
 			b"alias" => words.extend(all_aliases(ctx)?.into_iter().map(|(n, _)| n)),
 			b"shopt" | b"setopt" => {
 				use strum::IntoEnumIterator;

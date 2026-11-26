@@ -12,6 +12,7 @@ mod builtins;
 mod callstack;
 mod command;
 mod control;
+mod dynvars;
 mod exec;
 mod expand;
 mod fdprobe;
@@ -486,6 +487,52 @@ pub(super) struct TakeIn {
 	owed:  Vec<Vpid>,
 }
 
+/// The shell's `$SECONDS` clock as `MiscKey::StartNs` keeps it: the start
+/// in host clock ns, then `:` and bash's assigned value when it is not 0,
+/// then `:plain` once `unset SECONDS` removed its special meaning (`123`,
+/// `123:5`, `123:0:plain`), so a record no `SECONDS=` in bash code changed
+/// is the plain number it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartRecord {
+	pub start:   u64,
+	pub seconds: i64,
+	pub plain:   bool,
+}
+
+impl std::fmt::Display for StartRecord {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match (self.seconds, self.plain) {
+			(0, false) => write!(f, "{}", self.start),
+			(s, false) => write!(f, "{}:{s}", self.start),
+			(s, true) => write!(f, "{}:{s}:plain", self.start),
+		}
+	}
+}
+
+impl std::str::FromStr for StartRecord {
+	type Err = std::num::ParseIntError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let mut parts = s.splitn(3, ':');
+		let start = parts.next().unwrap_or_default().parse()?;
+		let seconds = parts.next().map_or(Ok(0), str::parse)?;
+		Ok(Self { start, seconds, plain: parts.next() == Some("plain") })
+	}
+}
+
+/// The arithmetic results of one argument of a builtin that runs again
+/// ([`Kernel::arith_replay`]).
+#[derive(Debug, Default)]
+pub struct ArithReplay {
+	/// Each result in the order the argument evaluated them.
+	pub values: Vec<i64>,
+	/// The next result to take.
+	pub next:   usize,
+	/// An evaluation is under way: arithmetic it runs inside (a variable's
+	/// value evaluated as an expression) is its own, not one to take.
+	pub inside: bool,
+}
+
 /// Shell-wide state shared by all vprocs (kept apart from `procs` so ops can
 /// borrow a vproc and the kernel at once).
 pub struct Kernel {
@@ -548,11 +595,47 @@ pub struct Kernel {
 	/// store at hand): `adopt` gives each the root's state then, with its
 	/// script's changes.
 	pending_forks:          Vec<(Vpid, ForkEdits)>,
-	/// `$RANDOM` generator state (written through as `MiscKey::Random` by
-	/// [`Kernel::next_random`] and [`Kernel::seed_random`]).
+	/// The shell's `$RANDOM` generator state (written through as
+	/// `MiscKey::Random` by [`Kernel::next_random`] and
+	/// [`Kernel::seed_random`]); a forked vproc draws from its own copy
+	/// ([`proc::Clock`]).
 	pub rand:               state::Random,
-	/// `now_ns` at shell creation (`$SECONDS`; `MiscKey::StartNs`).
+	/// `unset RANDOM` or an array assignment in bash code removed the
+	/// special meaning of the shell's `RANDOM`: it is a plain variable from
+	/// then on (kept in `MiscKey::Random`, [`state::random_record`]); a
+	/// forked vproc has its own ([`proc::Clock`]).
+	pub random_plain:       bool,
+	/// The host clock reading of the shell's start or of its last `SECONDS=`
+	/// in bash code (bash's `shellstart`; `MiscKey::StartNs`); a forked
+	/// vproc has its own ([`proc::Clock`], [`Kernel::start_of`]).
 	pub start_ns:           u64,
+	/// The shell's last `SECONDS=` value in bash code (bash's
+	/// `seconds_value_assigned`), which `$SECONDS` adds to the seconds since
+	/// `start_ns` (kept in `MiscKey::StartNs` with it, [`StartRecord`]).
+	pub seconds:            i64,
+	/// `unset SECONDS` or an array assignment in bash code removed the
+	/// special meaning of the shell's `SECONDS`: it is a plain variable from
+	/// then on (kept in `MiscKey::StartNs`, [`StartRecord`]); a forked vproc
+	/// has its own ([`proc::Clock`]).
+	pub seconds_plain:      bool,
+	/// `unset` in bash code removed these value cells of the shell (bits of
+	/// `dynvars::CELLS` indices): plain variables from then on (kept in
+	/// `MiscKey::CellsPlain`); a forked vproc has its own ([`proc::Clock`]).
+	pub cells_plain:        u16,
+	/// A subshell's redirections are being expanded
+	/// ([`redir::apply_in_child`]): bash expands them in the child, after
+	/// the fork, so a lookup of the special `RANDOM` or `SECONDS` there
+	/// leaves the shell's value cell alone ([`dynvars::store_value`]); the
+	/// vproc's generator and clock are the child's copy then
+	/// ([`Kernel::fork_clock`]). Set only during that call, which restores
+	/// both before it returns; not imaged.
+	pub redirs_in_child:    bool,
+	/// The arithmetic results a builtin's argument evaluates while
+	/// [`builtins::Ctx::arith_once`] runs ([`expand::arith_value`]): taken
+	/// in order on a run again after a later argument's `$(…)` or a probe,
+	/// logged on the first run. Set only during that call; not imaged (the
+	/// replay log holds the results).
+	pub arith_replay:       Option<ArithReplay>,
 	/// Startup files (`path`, contents) the root vproc sources when its
 	/// first run starts ([`ShellInit::startup`]); not imaged (the first run
 	/// starts at the first step).
@@ -762,7 +845,13 @@ impl Kernel {
 			pending_forks: Vec::new(),
 			async_ignored: None,
 			rand: state::Random::new(1),
+			random_plain: false,
 			start_ns: 0,
+			seconds: 0,
+			seconds_plain: false,
+			cells_plain: 0,
+			redirs_in_child: false,
+			arith_replay: None,
 			startup: Vec::new(),
 			pseudo_traps: exec::PseudoTraps::default(),
 			nofork_units: HashMap::new(),
@@ -925,21 +1014,167 @@ impl Kernel {
 		}
 	}
 
-	/// Next `$RANDOM` (0..=32767); the generator state is written through.
-	pub fn next_random(&mut self, store: &mut dyn StateStore) -> u32 {
+	/// The copy of `p`'s `$RANDOM` generator and `$SECONDS` clock a fork
+	/// gives its child, with whether `unset` removed their special meaning:
+	/// bash code reseeds the generator on the child's first `$RANDOM`
+	/// unless the child assigns `RANDOM` first.
+	pub fn fork_clock(&self, p: &Vproc) -> proc::Clock {
+		proc::Clock {
+			rand:          p.clock.map_or(self.rand, |c| c.rand),
+			reseed:        true,
+			start_ns:      self.start_of(p),
+			seconds:       p.clock.map_or(self.seconds, |c| c.seconds),
+			seconds_plain: self.plain(p, dynvars::Special::Seconds),
+			random_plain:  self.plain(p, dynvars::Special::Random),
+			cells_plain:   p.clock.map_or(self.cells_plain, |c| c.cells_plain),
+		}
+	}
+
+	/// Next `$RANDOM` (0..=32767) of `vp`. A forked vproc draws from its own
+	/// generator ([`proc::Clock`]), which bash code reseeds on the first
+	/// draw unless `RANDOM` was assigned (bash `get_random_number`'s
+	/// `seeded_subshell`) and zsh code draws on from its parent's; the
+	/// shell's own is written through.
+	pub fn next_random(&mut self, cx: &mut Cx<'_>, vp: &mut Vproc) -> u32 {
+		let bash = vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
+		if let Some(clock) = vp.clock.as_mut() {
+			if clock.reseed && bash {
+				clock.rand = state::Random::new((cx.host.random() & 0xffff_ffff) as u32);
+				clock.reseed = false;
+			}
+			return clock.rand.next();
+		}
 		let v = self.rand.next();
-		self
-			.root
-			.set_misc(store, MiscKey::Random, self.rand.encode());
+		self.write_random(cx.store);
 		v
 	}
 
-	/// `RANDOM=seed`; written through.
-	pub fn seed_random(&mut self, store: &mut dyn StateStore, seed: i64) {
+	/// `RANDOM=seed` in `vp`: its own generator when forked (no reseed
+	/// follows), else the shell's, written through.
+	pub fn seed_random(&mut self, store: &mut dyn StateStore, vp: &mut Vproc, seed: i64) {
+		if let Some(clock) = vp.clock.as_mut() {
+			clock.rand.seed(seed);
+			clock.reseed = false;
+			return;
+		}
 		self.rand.seed(seed);
+		self.write_random(store);
+	}
+
+	/// The shell's generator record ([`state::random_record`]).
+	pub fn write_random(&mut self, store: &mut dyn StateStore) {
+		self.root.set_misc(
+			store,
+			MiscKey::Random,
+			state::random_record(self.rand, self.random_plain),
+		);
+	}
+
+	/// The host clock reading of `vp`'s start or last `SECONDS=` in bash
+	/// code (bash's `shellstart`: `printf '%(…)T' -2`, `time`): a forked
+	/// vproc's own ([`proc::Clock`]), else the shell's.
+	pub fn start_of(&self, vp: &Vproc) -> u64 {
+		vp.clock.as_ref().map_or(self.start_ns, |c| c.start_ns)
+	}
+
+	/// The host clock reading `vp`'s `$SECONDS` counts from: its start, moved
+	/// back by the value of its last `SECONDS=` in bash code (zsh code's
+	/// `$SECONDS`).
+	pub fn seconds_origin(&self, vp: &Vproc) -> u64 {
+		let (start, seconds) = vp
+			.clock
+			.as_ref()
+			.map_or((self.start_ns, self.seconds), |c| (c.start_ns, c.seconds));
+		start.wrapping_sub((seconds as u64).wrapping_mul(1_000_000_000))
+	}
+
+	/// `$SECONDS` in bash code at host clock reading `now`: the value of
+	/// `vp`'s last `SECONDS=` plus the whole seconds since its start (bash's
+	/// `get_seconds`, `seconds_value_assigned + time_since_start`).
+	pub fn seconds_now(&self, vp: &Vproc, now: u64) -> i64 {
+		let (start, seconds) = vp
+			.clock
+			.as_ref()
+			.map_or((self.start_ns, self.seconds), |c| (c.start_ns, c.seconds));
+		let since = (now.wrapping_sub(start) as i64).div_euclid(1_000_000_000);
+		seconds.wrapping_add(since)
+	}
+
+	/// Whether `unset`, or an array assignment, removed the special meaning
+	/// of `vp`'s `RANDOM` or `SECONDS` in bash code.
+	pub const fn plain(&self, vp: &Vproc, s: dynvars::Special) -> bool {
+		match (s, vp.clock.as_ref()) {
+			(dynvars::Special::Random, Some(c)) => c.random_plain,
+			(dynvars::Special::Random, None) => self.random_plain,
+			(dynvars::Special::Seconds, Some(c)) => c.seconds_plain,
+			(dynvars::Special::Seconds, None) => self.seconds_plain,
+		}
+	}
+
+	/// `SECONDS=…` in `vp`: its start is `start` and `$SECONDS` adds
+	/// `seconds` (bash code: now and the value, as bash's `assign_seconds`;
+	/// zsh code: the moved origin and 0). The shell's are written through.
+	pub fn set_seconds(
+		&mut self,
+		store: &mut dyn StateStore,
+		vp: &mut Vproc,
+		start: u64,
+		seconds: i64,
+	) {
+		if let Some(clock) = vp.clock.as_mut() {
+			clock.start_ns = start;
+			clock.seconds = seconds;
+			return;
+		}
+		self.start_ns = start;
+		self.seconds = seconds;
+		self.write_start(store);
+	}
+
+	/// `unset` or an array assignment in bash code: `vp`'s `RANDOM` or
+	/// `SECONDS` is a plain variable from now on. The shell's is written
+	/// through.
+	pub fn set_plain(&mut self, store: &mut dyn StateStore, vp: &mut Vproc, s: dynvars::Special) {
+		match (s, vp.clock.as_mut()) {
+			(dynvars::Special::Random, Some(c)) => c.random_plain = true,
+			(dynvars::Special::Seconds, Some(c)) => c.seconds_plain = true,
+			(dynvars::Special::Random, None) => {
+				self.random_plain = true;
+				self.write_random(store);
+			},
+			(dynvars::Special::Seconds, None) => {
+				self.seconds_plain = true;
+				self.write_start(store);
+			},
+		}
+	}
+
+	/// Whether `unset` removed the value cell `dynvars::CELLS[i]` of `vp` in
+	/// bash code.
+	pub fn cell_plain(&self, vp: &Vproc, i: usize) -> bool {
+		(vp.clock.map_or(self.cells_plain, |c| c.cells_plain) & (1 << i)) != 0
+	}
+
+	/// `unset` of the value cell `dynvars::CELLS[i]` in bash code: a plain
+	/// variable of `vp` from now on. The shell's is written through.
+	pub fn set_cell_plain(&mut self, store: &mut dyn StateStore, vp: &mut Vproc, i: usize) {
+		if let Some(c) = vp.clock.as_mut() {
+			c.cells_plain |= 1 << i;
+			return;
+		}
+		self.cells_plain |= 1 << i;
 		self
 			.root
-			.set_misc(store, MiscKey::Random, self.rand.encode());
+			.set_misc(store, MiscKey::CellsPlain, self.cells_plain.to_string());
+	}
+
+	/// The shell's clock record ([`StartRecord`]).
+	fn write_start(&mut self, store: &mut dyn StateStore) {
+		let record =
+			StartRecord { start: self.start_ns, seconds: self.seconds, plain: self.seconds_plain };
+		self
+			.root
+			.set_misc(store, MiscKey::StartNs, record.to_string());
 	}
 
 	/// A fresh vpid; the counter is written through (a shell restored from
@@ -1820,7 +2055,7 @@ impl Shell {
 		let root = Root::load(cx.store).map_err(ShellError::Store)?;
 		let mut k = Kernel::new(engine, root, init.argv0.clone(), shell_pid);
 		k.rand = state::Random::new((cx.host.random() & 0xffff_ffff) as u32);
-		k.root.set_misc(cx.store, MiscKey::Random, k.rand.encode());
+		k.write_random(cx.store);
 		k.start_ns = cx.host.now_ns();
 		k.root
 			.set_misc(cx.store, MiscKey::StartNs, k.start_ns.to_string());
@@ -1871,6 +2106,16 @@ impl Shell {
 			.map_or(0, |v| imported_shlvl(v, zsh));
 		k.root
 			.set_var(cx.store, b"SHLVL", Some(Var::scalar((shlvl + 1).to_string(), Attrs::EXPORT)));
+		// bash's `init_seconds_var`: `SECONDS` from the environment, a
+		// decimal number, is the count's starting value (else 0).
+		if !zsh
+			&& let Some(secs) = state::global(cx.store, b"SECONDS")?
+				.and_then(|v| v.as_scalar())
+				.and_then(builtins::valid_number)
+		{
+			k.seconds = secs;
+			k.write_start(cx.store);
+		}
 		startup_vars(&mut k, cx, &init)?;
 		// bash's `sv_strict_posix` at import: `POSIXLY_CORRECT` (or
 		// `POSIX_PEDANTIC`) in the environment turns POSIX mode on; explicit
@@ -2102,6 +2347,9 @@ impl Shell {
 		}
 		let cwd = script.cwd.unwrap_or_else(|| p.cwd.clone());
 		let status = p.status;
+		// A copy of the parent's `$RANDOM` generator and `$SECONDS` origin,
+		// as a fork makes (`Vproc::child_running`).
+		let clock = self.k.fork_clock(p);
 		// The parent's global state now; a host's submission (no store) to
 		// the root takes it when the scheduler adopts the subshell, before
 		// the root runs again.
@@ -2136,6 +2384,7 @@ impl Shell {
 		vp.lineage = lineage.unwrap_or(parent_lineage);
 		vp.status = status;
 		vp.mode = mode;
+		vp.clock = Some(clock);
 		vp.runs.push_back(run);
 		match base {
 			Some(((image, locale_gen), scopes)) => {
@@ -3573,6 +3822,7 @@ impl Vproc {
 			mode: ModeId::Bash,
 			zsh: None,
 			zle: None,
+			clock: None,
 		}
 	}
 
@@ -3667,6 +3917,10 @@ impl Vproc {
 		jobctl::inherit(k, vp.vpid, self.vpid);
 		vp.mode = self.mode;
 		vp.zle.clone_from(&self.zle);
+		// `$RANDOM`'s generator and `$SECONDS`' origin are process state:
+		// the child gets a copy (bash code reseeds it on first use), and so
+		// is whether `unset` removed their special meaning.
+		vp.clock = Some(k.fork_clock(self));
 		vp.set_sticky(self.sticky().cloned());
 		// zsh forks keep `scriptname`: diagnostics of the child name the
 		// parent's function, `(eval)` or file.

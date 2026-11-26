@@ -239,6 +239,9 @@ pub struct Ctx<'a, 'c> {
 	/// Times the builtin ran again after a frame it pushed returned
 	/// ([`Control::Resume`]).
 	pub resumed:     u32,
+	/// The replay log entry of the argument whose arithmetic
+	/// [`Self::arith_argument`] replays, until [`Self::arith_end`].
+	pub arith_at:    Option<usize>,
 }
 
 impl<'a, 'c> Ctx<'a, 'c> {
@@ -265,6 +268,7 @@ impl<'a, 'c> Ctx<'a, 'c> {
 			log_cursor: 0,
 			arrayref: Vec::new(),
 			resumed: 0,
+			arith_at: None,
 		}
 	}
 
@@ -331,6 +335,151 @@ impl<'a, 'c> Ctx<'a, 'c> {
 			Err(super::expand::Stop::Store(e)) => Err(Need::Store(e)),
 			// A substitution or probe to run first.
 			Err(sub) => Err(Need::Sub(sub)),
+		}
+	}
+
+	/// Run `look` once in this command although the builtin runs again
+	/// after a probe or a command substitution: `look` makes the lookups
+	/// bash makes of a special `RANDOM` or `SECONDS` at one site
+	/// ([`super::dynvars`]), each a `$RANDOM` draw. The first run logs it
+	/// done ([`Atom::Done`](super::proc::Atom::Done)) at this point of the
+	/// replay log, a re-run skips it. Call it where every run of the
+	/// builtin calls it, under a condition no run changes, and let `look`
+	/// decide from the state whether anything is looked up: a re-run that
+	/// does not call it leaves its `Done` to the next logged point, a
+	/// command substitution's output, which then runs again without end.
+	pub fn once<E>(&mut self, look: impl FnOnce(&mut Self) -> Result<(), E>) -> Result<(), Need>
+	where
+		Need: From<E>,
+	{
+		if matches!(self.log.get(self.log_cursor), Some(super::proc::Atom::Done)) {
+			self.log_cursor += 1;
+			return Ok(());
+		}
+		look(self)?;
+		self.log.insert(self.log_cursor, super::proc::Atom::Done);
+		self.log_cursor += 1;
+		Ok(())
+	}
+
+	/// Before an argument changes the binding of `name` at `level`: on the
+	/// builtin's first run, log that binding at this point of the replay
+	/// log ([`Atom::Bound`](super::proc::Atom::Bound)); on a run again
+	/// after a later argument's `$(…)` or a probe parked it, put the logged
+	/// binding back, so the argument is redone from the state it first saw
+	/// and applies once (`declare x+=1 a='($(echo 2))'` adds 1 once, a
+	/// `declare -r x=1` before the park is not refused as readonly).
+	///
+	/// # Errors
+	/// [`Need::Store`] when the store cannot be read.
+	pub fn rollback_point(&mut self, name: &[u8], level: state::Level) -> Result<(), Need> {
+		if self.put_logged_back() {
+			return Ok(());
+		}
+		self.keep_binding(Some((name, level)))
+	}
+
+	/// [`Self::rollback_point`] for a binding only some runs would find:
+	/// `find` names it on the first run, which logs it, or logs that there
+	/// is none ([`Atom::Unbound`](super::proc::Atom::Unbound)); a run again
+	/// puts back what the first run logged and does not look again. Call it
+	/// where every run of the builtin calls it and decide inside `find`:
+	/// the argument's own effect changes what a run again finds (`local r`
+	/// shadows a global reference `r` whose target the first run kept, `+n`
+	/// ends one), and a run that logs nothing here reads the next point's
+	/// atom, which leaves the builtin running again without end (as for
+	/// [`Self::once`]).
+	///
+	/// # Errors
+	/// [`Need::Store`] when the store cannot be read.
+	pub fn rollback_point_once(
+		&mut self,
+		find: impl FnOnce(&mut Self) -> Result<Option<(BString, state::Level)>, Need>,
+	) -> Result<(), Need> {
+		if self.put_logged_back() {
+			return Ok(());
+		}
+		let found = find(self)?;
+		self.keep_binding(
+			found
+				.as_ref()
+				.map(|(name, level)| (name.as_slice(), *level)),
+		)
+	}
+
+	/// Put back the binding logged at the replay cursor, if this run of the
+	/// builtin has a rollback point logged there; whether it had one. A
+	/// binding the first run did not have is removed, not written back as
+	/// declared but unset: every later reader (the readonly-global check of
+	/// `local`, `local -p`, a lookup) sees the name as absent, as it was.
+	fn put_logged_back(&mut self) -> bool {
+		match self.log.get(self.log_cursor).cloned() {
+			Some(super::proc::Atom::Bound { name, level, old, bound }) => {
+				self.log_cursor += 1;
+				if bound {
+					state::store_var(&mut self.k.root, self.cx.store, self.vp, &name, old, level);
+				} else {
+					state::unbind_at(&mut self.k.root, self.cx.store, self.vp, &name, level);
+				}
+				true
+			},
+			Some(super::proc::Atom::Unbound) => {
+				self.log_cursor += 1;
+				true
+			},
+			_ => false,
+		}
+	}
+
+	/// Log the binding of `name` at `level` as it is now, or that this
+	/// point keeps none.
+	fn keep_binding(&mut self, found: Option<(&[u8], state::Level)>) -> Result<(), Need> {
+		let atom = match found {
+			Some((name, level)) => {
+				let old = state::binding(&self.k.root, self.cx.store, self.vp, name, level)?.cloned();
+				// In the global state a binding is its value; a scope can
+				// also declare the name without one.
+				let bound = state::binds_at(&self.k.root, self.cx.store, self.vp, name, level)?
+					.unwrap_or_else(|| old.is_some());
+				super::proc::Atom::Bound { name: BString::from(name), level, old, bound }
+			},
+			None => super::proc::Atom::Unbound,
+		};
+		self.log.insert(self.log_cursor, atom);
+		self.log_cursor += 1;
+		Ok(())
+	}
+
+	/// Start the next argument's arithmetic, done once in this command
+	/// although the builtin runs again (ending the one before): the first
+	/// run logs each result at this point of the replay log
+	/// ([`Atom::Arith`](super::proc::Atom::Arith)), a run again takes them
+	/// in order and evaluates nothing ([`super::expand::arith_value`]), so
+	/// `declare -i y=w++ a='($(echo 2))'` adds 1 to `w` once and a `RANDOM`
+	/// in it draws once. As for [`Self::once`], every run must call it at
+	/// the same points (in `declare` an argument is redone from the binding
+	/// it first saw, [`Self::rollback_point`]). [`run`] ends the last one.
+	pub fn arith_argument(&mut self) {
+		self.arith_end();
+		let values = if let Some(super::proc::Atom::Arith(values)) = self.log.get(self.log_cursor) {
+			values.clone()
+		} else {
+			self
+				.log
+				.insert(self.log_cursor, super::proc::Atom::Arith(Vec::new()));
+			Vec::new()
+		};
+		self.arith_at = Some(self.log_cursor);
+		self.log_cursor += 1;
+		self.k.arith_replay = Some(super::ArithReplay { values, ..Default::default() });
+	}
+
+	/// End the arithmetic [`Self::arith_argument`] started: its results go
+	/// to its replay log entry, and arithmetic is evaluated again.
+	pub fn arith_end(&mut self) {
+		let replay = self.k.arith_replay.take();
+		if let (Some(at), Some(replay)) = (self.arith_at.take(), replay) {
+			self.log[at] = super::proc::Atom::Arith(replay.values);
 		}
 	}
 
@@ -450,6 +599,17 @@ impl<'a, 'c> Ctx<'a, 'c> {
 
 /// Run builtin `id` with `argv` (`argv[0]` is its name).
 pub fn run(id: IntrinsicId, ctx: &mut Ctx<'_, '_>, argv: &[BString]) -> R {
+	let r = dispatch(id, ctx, argv);
+	// A park, an error or the end: the last argument's arithmetic results
+	// go to the replay log before the builtin's run ends. A guard: no
+	// argument of today's builtins reaches it with results still open (the
+	// next argument's `arith_argument` ends the one before, and an argument
+	// parks only after its own arithmetic ended).
+	ctx.arith_end();
+	r
+}
+
+fn dispatch(id: IntrinsicId, ctx: &mut Ctx<'_, '_>, argv: &[BString]) -> R {
 	use IntrinsicId as I;
 	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
 		&& let Some(r) = zsh_args::run(id, ctx, argv)
@@ -641,6 +801,31 @@ pub fn number(arg: &[u8]) -> Option<i64> {
 		v = v.wrapping_mul(10).wrapping_add(i64::from(c - b'0'));
 	}
 	Some(if neg { v.wrapping_neg() } else { v })
+}
+
+/// bash's `valid_number` (general.c): a decimal integer as `strtoimax`
+/// reads it, with blanks before it (C `isspace`) and after it, and an
+/// optional sign; `None` for anything else and for a number out of `i64`'s
+/// range (`strtoimax`'s `ERANGE`), where [`number`] wraps.
+pub fn valid_number(arg: &[u8]) -> Option<i64> {
+	let space = |c: &u8| matches!(c, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r');
+	let start = arg.iter().position(|c| !space(c))?;
+	let end = arg.iter().rposition(|c| !space(c))? + 1;
+	let t = &arg[start..end];
+	let (neg, digits) = match t.first() {
+		Some(b'-') => (true, &t[1..]),
+		Some(b'+') => (false, &t[1..]),
+		_ => (false, t),
+	};
+	if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+		return None;
+	}
+	// Counted down, so `i64::MIN` fits.
+	let mut v: i64 = 0;
+	for &c in digits {
+		v = v.checked_mul(10)?.checked_sub(i64::from(c - b'0'))?;
+	}
+	if neg { Some(v) } else { v.checked_neg() }
 }
 
 /// Leading option words of a builtin's arguments.

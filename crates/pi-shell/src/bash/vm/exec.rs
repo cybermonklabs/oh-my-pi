@@ -3919,7 +3919,15 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			// none (zsh code keeps its own rule).
 			let fork = subshell && !forked && unit.mode.dialect() != Dialect::Zsh;
 			let owner = redir::Owner::Compound { undo: !forked && !subshell, fork };
-			let res = redir::apply(k, vp, cx, unit, op.a, compound_line(vp, line), owner);
+			let line = compound_line(vp, line);
+			// A `( … )`'s own redirections made before its fork are the
+			// child's in bash: a `$RANDOM` they expand draws from a copy of
+			// the generator ([`redir::apply_in_child`]).
+			let res = if subshell && !forked {
+				redir::apply_in_child(k, vp, cx, unit, op.a, line, owner)
+			} else {
+				redir::apply(k, vp, cx, unit, op.a, line, owner)
+			};
 			if forked && !matches!(res, Err(redir::Halt::Flow(_))) {
 				// Past the fork's own redirections, its body runs under bash's
 				// `execute_in_subshell`, which catches its fatal errors.
@@ -4307,7 +4315,7 @@ fn time_end(
 	}
 	let posix = null && state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
 	let start = if posix {
-		super::proc::TimeMark { real: k.start_ns, user: 0, sys: 0 }
+		super::proc::TimeMark { real: k.start_of(vp), user: 0, sys: 0 }
 	} else {
 		start
 	};
@@ -4372,7 +4380,7 @@ fn zsh_time_end(
 		zsh_time_report(&format, desc, times)
 	} else {
 		let cpu = cx.host.cpu_times().unwrap_or_default();
-		let real = end.real.saturating_sub(k.start_ns);
+		let real = end.real.saturating_sub(k.start_of(vp));
 		let mut text = zsh_time_report(&format, b"shell", [real, cpu.user_ns, cpu.sys_ns]);
 		let children = [real, cpu.child_user_ns, cpu.child_sys_ns];
 		text.extend_from_slice(&zsh_time_report(&format, b"children", children));

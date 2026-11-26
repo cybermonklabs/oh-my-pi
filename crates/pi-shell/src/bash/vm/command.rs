@@ -709,11 +709,11 @@ fn plain_statement(
 	let scope =
 		Scope { vars: VarMap::default(), positional: None, func: None, zsh: None };
 	state::push_scope(&mut k.root, cx.store, vp, scope);
-	let (res, chunks) = {
+	let (res, chunks, log) = {
 		let mut ctx = Ctx::new(k, cx, vp, &[], line, id.into());
 		ctx.arrayref.clone_from(&arrayref);
 		let r = builtins::run(id, &mut ctx, &argv);
-		(r, std::mem::take(&mut ctx.chunks))
+		(r, std::mem::take(&mut ctx.chunks), std::mem::take(&mut ctx.log))
 	};
 	let written = match &res {
 		Ok(outcome) if matches!(outcome.control, Control::None) => write_now(k, vp, &chunks),
@@ -737,21 +737,23 @@ fn plain_statement(
 	e.target = Some(Target::Intrinsic(id));
 	e.stage = Stage::Dispatch;
 	sc.exec = Some(e);
-	match res {
-		Ok(outcome) => {
-			if let Some(flow) = settle_builtin(k, vp, cx, line, id, sc, outcome, chunks, false) {
-				return Some(flow);
+	if let Ok(outcome) = res {
+		if let Some(flow) = settle_builtin(k, vp, cx, line, id, sc, outcome, chunks, false) {
+			return Some(flow);
+		}
+		if let Err((done, off, handed)) = written {
+			let writes = &mut st(vp).writes;
+			writes.drain(..done);
+			if let Some(w) = writes.front_mut() {
+				w.off = off;
+				w.handed = handed;
 			}
-			if let Err((done, off, handed)) = written {
-				let writes = &mut st(vp).writes;
-				writes.drain(..done);
-				if let Some(w) = writes.front_mut() {
-					w.off = off;
-					w.handed = handed;
-				}
-			}
-		},
-		Err(_) => vp.frames.last_mut().expect("frame").scratch = Some(sc),
+		}
+	} else {
+		// The re-run replays what this run logged ([`Ctx::once`]'s marks
+		// included), as [`run_builtin`] keeps the log between its runs.
+		sc.logs[Slot::Builtin as usize] = log;
+		vp.frames.last_mut().expect("frame").scratch = Some(sc);
 	}
 	Some(exec(k, vp, cx, unit, op, line))
 }
@@ -1071,8 +1073,16 @@ fn expand(
 				}
 				return Some(Flow::Discard(1));
 			}
+			// bash's `assign_in_env` looks the name up before it expands the
+			// value: a special `RANDOM` or `SECONDS` (or a reference to one)
+			// with no temporary of the name in scope runs its value function
+			// ([`super::dynvars::Site::Temp`]), once although a park replays
+			// the expansion.
 			let record = assign_parks(unit, a);
 			let res = expanding(k, vp, cx, Slot::Assigns, record, line, |ex| {
+				if !assign_only {
+					ex.look_temp(&a.name)?;
+				}
 				let index = match a.index {
 					Some(w) => Some(ex.scalar(unit, &unit.words[w as usize])?),
 					None => None,
@@ -1114,10 +1124,18 @@ fn expand(
 			(a.name.clone(), a.append, a.node, index, value)
 		} else {
 			// A `set -k` word: `name=value` (or `name+=value`), expanded as
-			// the word it is.
+			// the word it is; the name, as written, is looked up first.
 			let word = &unit.words[st(vp).keywords[i - cmd.assigns.len()] as usize];
-			let res =
-				expanding(k, vp, cx, Slot::Assigns, word.parks, line, |ex| ex.scalar(unit, word));
+			let src = unit
+				.nodes
+				.get(word.node as usize)
+				.and_then(|n| unit.source.get(n.lo as usize..n.hi as usize))
+				.unwrap_or_default();
+			let written = &src[..src.iter().position(|&c| c == b'=').unwrap_or(src.len())];
+			let res = expanding(k, vp, cx, Slot::Assigns, word.parks, line, |ex| {
+				ex.look_temp(written.strip_suffix(b"+").unwrap_or(written))?;
+				ex.scalar(unit, word)
+			});
 			let text = match res {
 				Ok(v) => v,
 				Err(flow) => return Some(flow),

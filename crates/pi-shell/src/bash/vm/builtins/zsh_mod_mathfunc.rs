@@ -256,7 +256,7 @@ fn rand48(ex: &mut Expander<'_, '_>, text: &[u8]) -> X<Number> {
 	if do_init {
 		// zsh seeds from `rand()`, the generator behind `$RANDOM`.
 		for slot in &mut seed {
-			*slot = (ex.k.next_random(ex.cx.store) & 0xffff) as u16;
+			*slot = (ex.k.next_random(ex.cx, ex.vp) & 0xffff) as u16;
 		}
 	}
 	let x = u64::from(seed[2]) << 32 | u64::from(seed[1]) << 16 | u64::from(seed[0]);

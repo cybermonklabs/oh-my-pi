@@ -418,8 +418,28 @@ fn fresh_shell(
 			image.set_var(name, Some(var));
 		}
 	}
+	// A new process: a generator of its own, `$SECONDS` counting from zero,
+	// or in bash from `SECONDS` in its environment (`init_seconds_var`).
+	let seconds = if args.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		0
+	} else {
+		image
+			.var(b"SECONDS")
+			.and_then(Var::as_scalar)
+			.and_then(super::builtins::valid_number)
+			.unwrap_or(0)
+	};
 	let mut child =
 		Vproc::new(vpid, Some(vp.vpid), vp.fds.clone(), vp.cwd.clone(), Some(image), true);
+	child.clock = Some(super::proc::Clock {
+		rand: state::Random::new((cx.host.random() & 0xffff_ffff) as u32),
+		reseed: false,
+		start_ns: cx.host.now_ns(),
+		seconds,
+		seconds_plain: false,
+		random_plain: false,
+		cells_plain: 0,
+	});
 	child.rlimits.clone_from(&vp.rlimits);
 	child.lineage = vp.lineage;
 	// A new shell's options, then the invocation's.
