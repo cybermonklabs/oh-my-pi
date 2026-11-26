@@ -1,6 +1,6 @@
 //! Control, restore and store-failure behaviour of the shell.
 
-use std::sync::Arc;
+use std::{fmt::Write as _, sync::Arc};
 
 use bstr::{BStr, BString};
 use strum::IntoEnumIterator as _;
@@ -370,6 +370,21 @@ fn restore_drop_frames_abandons_the_running_script_with_255() {
 /// while run 1, `x=kept; ( { while :; do :; done; } & jobs; wait $! ); echo
 /// after`, had its `( … )` waiting for its running background job.
 const OLD_LAYOUT_STORE: &[u8] = include_bytes!("../fixtures/frames/3444abaa_subshell_job.store");
+const OLD_LAYOUT_STORE_SHA256: &str =
+	"3216b10f9a7ed874f472c9543cf1e2249f25f6ebefc5a9ce249fa70b8983a12e";
+
+/// `bytes`, once their SHA-256 is `sha256`. A fixture that is written again
+/// (after a key moved, say) changes the test's own text, where a reviewer
+/// sees it, and never passes unnoticed.
+fn fixture(bytes: &'static [u8], sha256: &str) -> &'static [u8] {
+	use sha2::{Digest as _, Sha256};
+	let mut hex = String::with_capacity(64);
+	for b in Sha256::digest(bytes) {
+		let _ = write!(hex, "{b:02x}");
+	}
+	assert_eq!(hex, sha256, "a released engine's fixture changed");
+	bytes
+}
 
 /// The IR version of the engine that wrote the `3444abaa` fixtures.
 const OLD_IR: u32 = 19;
@@ -384,7 +399,8 @@ const OLD_IR: u32 = 19;
 fn restore_refuses_frames_of_an_older_layout_and_keeps_their_store() {
 	let engine = Engine::new(EngineConfig::default());
 	let mut host = FakeHost::new();
-	let mut store = MemStore::from_bytes(OLD_LAYOUT_STORE).expect("the old store decodes");
+	let mut store = MemStore::from_bytes(fixture(OLD_LAYOUT_STORE, OLD_LAYOUT_STORE_SHA256))
+		.expect("the old store decodes");
 	assert!(store.get_blob(BlobSlot::Frames).unwrap().is_some(), "the old store holds frames");
 	let err = Shell::restore(
 		&engine,
@@ -398,7 +414,8 @@ fn restore_refuses_frames_of_an_older_layout_and_keeps_their_store() {
 		"an older engine's frames are refused: {err:?}"
 	);
 
-	let mut store = MemStore::from_bytes(OLD_LAYOUT_STORE).expect("the old store decodes");
+	let mut store = MemStore::from_bytes(fixture(OLD_LAYOUT_STORE, OLD_LAYOUT_STORE_SHA256))
+		.expect("the old store decodes");
 	let (mut shell, report) =
 		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts {
 			drop_frames: true,
@@ -419,6 +436,8 @@ fn restore_refuses_frames_of_an_older_layout_and_keeps_their_store() {
 /// job 1: the root's job table holds job 1 running and job 2, which `KILL`
 /// ended, done with 137.
 const OLD_ROOT_JOBS_STORE: &[u8] = include_bytes!("../fixtures/frames/3444abaa_root_jobs.store");
+const OLD_ROOT_JOBS_STORE_SHA256: &str =
+	"94b0ca7c23eaa08387ace7095e767c327ec4aad60fe1c39aff8d77e364a11a1f";
 
 /// A store from before the job's signal was kept decodes: its root's jobs
 /// are in the store's own records, which keep their layout (what came later
@@ -429,7 +448,8 @@ const OLD_ROOT_JOBS_STORE: &[u8] = include_bytes!("../fixtures/frames/3444abaa_r
 fn an_older_store_whose_root_has_jobs_restores() {
 	let engine = Engine::new(EngineConfig::default());
 	let mut host = FakeHost::new();
-	let mut store = MemStore::from_bytes(OLD_ROOT_JOBS_STORE).expect("the old store decodes");
+	let mut store = MemStore::from_bytes(fixture(OLD_ROOT_JOBS_STORE, OLD_ROOT_JOBS_STORE_SHA256))
+		.expect("the old store decodes");
 	let err = Shell::restore(
 		&engine,
 		&mut Cx { host: &mut host, store: &mut store },
@@ -441,7 +461,8 @@ fn an_older_store_whose_root_has_jobs_restores() {
 		matches!(err, Some(RestoreError::Incompatible { why }) if why == older),
 		"an older engine's frames are refused: {err:?}"
 	);
-	let mut store = MemStore::from_bytes(OLD_ROOT_JOBS_STORE).expect("the old store decodes");
+	let mut store = MemStore::from_bytes(fixture(OLD_ROOT_JOBS_STORE, OLD_ROOT_JOBS_STORE_SHA256))
+		.expect("the old store decodes");
 	let (mut shell, report) =
 		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts {
 			drop_frames: true,
@@ -470,16 +491,30 @@ fn an_older_store_whose_root_has_jobs_restores() {
 /// Cut14's order; and one record of each other `KeyBuf` kind but functions
 /// and jobs, which [`CUT14_ROOT_STORE`] holds.
 const CUT14_KEYS_STORE: &[u8] = include_bytes!("../fixtures/frames/34021711_keys.store");
+const CUT14_KEYS_STORE_SHA256: &str =
+	"338ad73fd16ff976f8319dfc671ae6e9c80200837cefb1f02b9435eab286bd3d";
+
+/// Keys renamed since Cut14 without moving: `(name now, name in Cut14)`, by
+/// the variant's `Debug` text. A rename keeps a key's place, so the store
+/// still reads; it is mapped here, never by writing the fixture again.
+const RENAMED: &[(&str, &str)] = &[];
+
+/// The name `now` had in Cut14 ([`RENAMED`]).
+fn released_name(now: &str) -> &str {
+	RENAMED.iter().find(|(n, _)| *n == now).map_or(now, |(_, was)| was)
+}
 
 /// A released store's keys keep their places. A store image numbers a key
 /// by its variant's index, so a key placed before another, or one taken
 /// out, makes every store written before read one key's records as
 /// another's (Cut14 composed `MiscKey::CellsPlain` before `HeldIgnored`,
 /// which a store of `HeldIgnored`'s own branch had one place earlier): a new
-/// key goes last.
+/// key goes last. A key renamed without a move is mapped to its old name in
+/// [`RENAMED`], not handled by writing the fixture again.
 #[test]
 fn a_released_stores_keys_keep_their_places() {
-	let mut store = MemStore::from_bytes(CUT14_KEYS_STORE).expect("Cut14's key store decodes");
+	let mut store = MemStore::from_bytes(fixture(CUT14_KEYS_STORE, CUT14_KEYS_STORE_SHA256))
+		.expect("Cut14's key store decodes");
 	let mut moved = Vec::new();
 	for table in [Table::Misc, Table::Opt, Table::Trap] {
 		store
@@ -490,7 +525,7 @@ fn a_released_stores_keys_keep_their_places() {
 					Key::Trap(t) => format!("{t:?}"),
 					other => format!("{other:?}"),
 				};
-				if *record != Record::Misc(name.as_str().into()) {
+				if *record != Record::Misc(released_name(&name).into()) {
 					moved.push(format!("{name} holds {record:?}"));
 				}
 			})
@@ -500,7 +535,9 @@ fn a_released_stores_keys_keep_their_places() {
 		Some(Record::Var(Var { value: VarValue::Str(names), .. })) => names.to_string(),
 		other => panic!("Cut14's list of zsh options: {other:?}"),
 	};
-	let now: Vec<String> = ZshOpt::iter().map(|z| format!("{z:?}")).collect();
+	let now: Vec<String> = ZshOpt::iter()
+		.map(|z| released_name(&format!("{z:?}")).to_owned())
+		.collect();
 	for (i, was) in released.split(',').enumerate() {
 		if now.get(i).map(String::as_str) != Some(was) {
 			moved.push(format!("ZshOpt {i}: {was} in Cut14, {:?} now", now.get(i)));
@@ -538,6 +575,8 @@ fn a_released_stores_keys_keep_their_places() {
 /// status (`Key::BgPid`), a job a signal ended (`Key::JobFacts`), and the
 /// held ignores every bash root store has (`MiscKey::HeldIgnored`).
 const CUT14_ROOT_STORE: &[u8] = include_bytes!("../fixtures/frames/34021711_root.store");
+const CUT14_ROOT_STORE_SHA256: &str =
+	"3eac3898bdba0f516967eb29c4f4359dd7431ff8e14522e02a2d821ab8ef1efb";
 
 /// A store a released engine wrote restores and runs on: the root's
 /// variable, function, removed value cell and kept status are there, and
@@ -546,7 +585,8 @@ const CUT14_ROOT_STORE: &[u8] = include_bytes!("../fixtures/frames/34021711_root
 fn a_store_cut14_wrote_restores() {
 	let engine = Engine::new(EngineConfig::default());
 	let mut host = FakeHost::new();
-	let mut store = MemStore::from_bytes(CUT14_ROOT_STORE).expect("Cut14's store decodes");
+	let mut store = MemStore::from_bytes(fixture(CUT14_ROOT_STORE, CUT14_ROOT_STORE_SHA256))
+		.expect("Cut14's store decodes");
 	let (mut shell, report) =
 		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts::default())
 			.expect("Cut14's store restores");
