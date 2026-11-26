@@ -8,6 +8,7 @@ use bstr::{BStr, BString, ByteSlice};
 use super::{Ctx, Need, R, done, number, opts};
 use crate::bash::{
 	diag::Diag,
+	engine::{Refusal, TextError},
 	event::{ASSIGN_PREVIEW_BYTES, AssignScope, EventData, EventKind, assign_preview},
 	ids::IntrinsicId,
 	ir::{self, FuncIr},
@@ -3009,10 +3010,19 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					// `expand_compound_array_assignment`), before anything
 					// changes, since a command substitution re-runs `declare`.
 					let assoc = on.contains(Attrs::ASSOC) || matches!(var.value, VarValue::Assoc(_));
-					match compound_from_string(ctx, &value[1..value.len() - 1], assoc)? {
+					let text = &value[1..value.len() - 1];
+					match compound_from_string(ctx, text, assoc)? {
 						Ok(elems) => AssignValue::Array(elems),
-						Err(d) => {
-							ctx.err(d);
+						Err(Refused::Syntax(e))
+							if ctx.vp.mode.dialect() != crate::bash::ids::Dialect::Zsh =>
+						{
+							return Ok(array_assign_refused(ctx, &e, text));
+						},
+						Err(r) => {
+							ctx.err(match r {
+								Refused::Syntax(e) => Diag::Syntax { msg: e.msg },
+								Refused::Diag(d) => d,
+							});
 							status = 1;
 							continue;
 						},
@@ -3142,15 +3152,24 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 /// ([`AssignValue::Array`]).
 type Elems = Vec<(Option<BString>, bool, BString)>;
 
+/// Why a compound value `declare` got as a string was not assigned.
+enum Refused {
+	/// The parser refused the text (bash's `parse_string_to_word_list`).
+	Syntax(TextError),
+	/// Expanding a word failed, or this engine cannot run the text: the
+	/// error to report.
+	Diag(Diag),
+}
+
 /// The elements of a compound value `declare` got as a string (`text`
 /// inside the parentheses), expanded by [`expand::compound_string`]. A
 /// command substitution parks the builtin ([`Need::Sub`]); `Err` inside is
-/// the error to report.
+/// why there are none.
 fn compound_from_string(
 	ctx: &mut Ctx<'_, '_>,
 	text: &[u8],
 	assoc: bool,
-) -> Result<Result<Elems, Diag>, Need> {
+) -> Result<Result<Elems, Refused>, Need> {
 	match expand::compound_string(
 		ctx.k,
 		ctx.cx,
@@ -3161,15 +3180,48 @@ fn compound_from_string(
 		text,
 		assoc,
 	) {
-		Ok(elems) => Ok(Ok(elems
+		Ok(Ok(elems)) => Ok(Ok(elems
 			.into_iter()
 			.map(|e| (e.key, e.append, e.value))
 			.collect())),
-		Err(expand::Stop::Fail(d) | expand::Stop::Fatal(d)) => Ok(Err(d)),
+		Ok(Err(e)) => Ok(Err(Refused::Syntax(e))),
+		Err(expand::Stop::Fail(d) | expand::Stop::Fatal(d)) => Ok(Err(Refused::Diag(d))),
 		Err(expand::Stop::Store(e)) => Err(Need::Store(e)),
 		// A substitution or probe to run first.
 		Err(sub) => Err(Need::Sub(sub)),
 	}
+}
+
+/// A compound value given as a string (`text` inside the parentheses) that
+/// the parser refused (`e`): bash's `parse_string_to_word_list` reports it
+/// under the input name `array assign` ([`Diag::ArrayAssign`]), then echoes
+/// the line of the string that holds a bad token. An end-of-input error
+/// names the string's own line; a token error the command's line plus the
+/// string's, less one (parse.y:7061). Then (parse.y:7086) a non-interactive
+/// posix shell exits (`FORCE_EOF`, with no `top_level_cleanup`:
+/// [`exec::Jump::Other`]); any other shell drops the command by a plain
+/// `DISCARD` (`top_level_cleanup` only at a script's own level, as for
+/// [`expansion_discard`]). Under `set -e`, `parser_error` exits with status
+/// 2 after the first line ([`exec::report_error_status`]).
+fn array_assign_refused(ctx: &mut Ctx<'_, '_>, e: &TextError, text: &[u8]) -> super::Outcome {
+	let (line, echo) = match e.by {
+		Refusal::Token { at } => {
+			let at = at.min(text.len());
+			let start = text[..at].rfind_byte(b'\n').map_or(0, |i| i + 1);
+			let end = text[at..].find_byte(b'\n').map_or(text.len(), |i| at + i);
+			(ctx.line + e.line.saturating_sub(1), Some(BString::from(&text[start..end])))
+		},
+		Refusal::Parser | Refusal::Engine => (e.line, None),
+	};
+	ctx.diag(Diag::ArrayAssign { line, diag: Box::new(Diag::Syntax { msg: e.msg.clone() }) });
+	if let Some(text) = echo {
+		ctx.diag(Diag::ArrayAssign { line, diag: Box::new(Diag::SyntaxContext { text }) });
+	}
+	if exec::posix_exits(ctx.k, ctx.cx, ctx.vp) {
+		let status = exec::force_eof_status(ctx.k, ctx.cx, ctx.vp);
+		return super::Outcome { status, control: super::Control::Exit(exec::Jump::Other) };
+	}
+	super::Outcome { status: 1, control: super::Control::Discard }
 }
 
 /// bash `builtin_find_indexed_array` for `read -a` and `mapfile`: whether
