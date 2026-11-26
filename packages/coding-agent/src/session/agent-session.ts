@@ -6342,7 +6342,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// continuations — except TTSR self-repair, which already scheduled a
 			// hidden retry while #ttsrAbortPending is still true.
 			if (msg.stopReason === "aborted") {
-				this.#recovery.resolveRetry();
+				// A TTSR self-repair retry goes on; any other abort ends the retry saga it cut short.
+				if (ttsrAbortPendingAtAgentEnd) this.#recovery.resolveRetry();
+				else await this.#recovery.resolveAbortedRetry(msg);
 				this.#resetSessionStopContinuationState();
 				await emitAgentEndNotification(ttsrAbortPendingAtAgentEnd ? { willContinue: true } : undefined);
 				return;

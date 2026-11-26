@@ -380,7 +380,7 @@ describe("AgentSession after a cyber_policy refusal", () => {
 		expect(lastAssistant(live).stopReason).toBe("stop");
 	});
 
-	it("still walks a classifier refusal to the next model, OpenAI included, as before", async () => {
+	it("still walks a classifier refusal to the next model, OpenAI included, once its same-model retries are refused", async () => {
 		const { codex, openai, sonnet } = models();
 		const { live, requested, fallbacks } = startSession({
 			primary: codex,
@@ -398,7 +398,7 @@ describe("AgentSession after a cyber_policy refusal", () => {
 		await live.prompt("Review this change");
 		await live.waitForIdle();
 
-		expect(requested).toEqual([selector(codex), selector(openai)]);
+		expect(requested).toEqual([selector(codex), selector(codex), selector(codex), selector(openai)]);
 		expect(fallbacks).toEqual([selector(openai)]);
 		expect(lastAssistant(live).stopReason).toBe("stop");
 	});

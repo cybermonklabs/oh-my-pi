@@ -887,7 +887,9 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			await runTurn(run.session, "Recover from two refusals");
 
+			// The first refusal gets its one same-model retry (`retry.maxRetries: 1`), refused too.
 			expect(requestedModels).toEqual([
+				formatModelString(FALLBACK),
 				formatModelString(FALLBACK),
 				formatModelString(PRIMARY),
 				formatModelString(NEXT_FALLBACK),
@@ -927,6 +929,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			expect(requestedModels).toEqual([
 				formatModelString(VERTEX_PRIMARY),
+				formatModelString(VERTEX_PRIMARY),
 				formatModelString(FALLBACK),
 				formatModelString(NEXT_FALLBACK),
 			]);
@@ -965,6 +968,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			expect(requestedModels).toEqual([
 				formatModelString(opus),
+				formatModelString(opus),
 				formatModelString(FALLBACK),
 				formatModelString(NEXT_FALLBACK),
 			]);
@@ -996,6 +1000,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			await runTurn(run.session, "Recover from two refusals");
 
 			expect(requestedModels).toEqual([
+				formatModelString(PRIMARY),
 				formatModelString(PRIMARY),
 				formatModelString(NEXT_FALLBACK),
 				formatModelString(FALLBACK),
@@ -1049,7 +1054,12 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 				await runTurn(run.session, "Recover from the refusal");
 
-				expect(requestedModels).toEqual([formatModelString(PRIMARY), formatModelString(NEXT_FALLBACK)]);
+				// The refusal gets its one same-model retry (`retry.maxRetries: 1`), refused too.
+				expect(requestedModels).toEqual([
+					formatModelString(PRIMARY),
+					formatModelString(PRIMARY),
+					formatModelString(NEXT_FALLBACK),
+				]);
 				expect(run.fallbacks).toEqual([formatModelString(FALLBACK), formatModelString(NEXT_FALLBACK)]);
 				expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
 				expect(lastAssistant(run.session).stopReason).toBe("stop");
@@ -1094,7 +1104,10 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			await runTurn(run.session, "Recover from the refusal and the server error");
 
+			// The refusal gets its two same-model retries (`retry.maxRetries: 2`), refused too.
 			expect(requestedModels).toEqual([
+				formatModelString(PRIMARY),
+				formatModelString(PRIMARY),
 				formatModelString(PRIMARY),
 				formatModelString(FALLBACK),
 				formatModelString(NEXT_FALLBACK),
@@ -1349,7 +1362,15 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			await runTurn(run.session, "Recover from a classifier refusal");
 
-			expectAnsweredOnFallback(run, requestedModels);
+			// The refusal gets its one same-model retry (`retry.maxRetries: 1`), refused too, then the walk.
+			expect(requestedModels).toEqual([
+				formatModelString(PRIMARY),
+				formatModelString(PRIMARY),
+				formatModelString(FALLBACK),
+			]);
+			expect(run.fallbacks).toEqual([formatModelString(FALLBACK)]);
+			expect(modelOf(run.session)).toBe(formatModelString(FALLBACK));
+			expect(lastAssistant(run.session).stopReason).toBe("stop");
 		});
 
 		it("tries every Codex account on an account-policy denial and then the configured fallback", async () => {
@@ -1485,6 +1506,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 							],
 						},
 						refusalWithCredit(),
+						// Its one same-model retry (`retry.maxRetries: 1`) is refused too.
+						refusalWithCredit(),
 					],
 					handler: { content: ["answered"] },
 				});
@@ -1517,6 +1540,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 				await runTurn(run.session, "Recover from the refusal");
 
 				expect(requestedModels).toEqual([
+					formatModelString(FABLE),
 					formatModelString(FABLE),
 					formatModelString(FABLE),
 					formatModelString(answer),
@@ -1555,6 +1579,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 						],
 					},
 					refusalWithCredit(),
+					// Its one same-model retry (`retry.maxRetries: 1`) is refused too.
+					refusalWithCredit(),
 				],
 				handler: { content: ["answered"] },
 			});
@@ -1592,7 +1618,11 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			// walk passes over the Claude model that cannot redeem it.
 			const { run, requestedModels } = await runCreditRefusal(chainOf(OTHER_CLAUDE), {});
 
-			expect(requestedModels).toEqual([formatModelString(FABLE), formatModelString(FABLE)]);
+			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+			]);
 			expect(run.fallbacks).toEqual([]);
 			expect(modelOf(run.session)).toBe(formatModelString(FABLE));
 			// The refusal ends the turn. The session drops it from the active
@@ -1614,6 +1644,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(requestedModels).toEqual([
 				formatModelString(FABLE),
 				formatModelString(FABLE),
+				formatModelString(FABLE),
 				formatModelString(OTHER_CLAUDE),
 			]);
 			expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
@@ -1625,6 +1656,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			const { run, requestedModels } = await runCreditRefusal(chainOf(OTHER_CLAUDE, CREDIT_TARGET), {});
 
 			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
 				formatModelString(FABLE),
 				formatModelString(FABLE),
 				formatModelString(CREDIT_TARGET),
@@ -1655,6 +1687,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 				);
 
 				expect(requestedModels).toEqual([
+					formatModelString(FABLE),
 					formatModelString(FABLE),
 					formatModelString(FABLE),
 					formatModelString(OTHER_CLAUDE),
@@ -1702,6 +1735,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 				expect(requestedModels).toEqual([
 					formatModelString(FABLE),
 					formatModelString(FABLE),
+					formatModelString(FABLE),
 					formatModelString(OTHER_CLAUDE),
 				]);
 				expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
@@ -1731,6 +1765,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(requestedModels).toEqual([
 				formatModelString(FABLE),
 				formatModelString(FABLE),
+				formatModelString(FABLE),
 				formatModelString(OTHER_CLAUDE),
 			]);
 			expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
@@ -1751,6 +1786,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			const { run, requestedModels } = await runCreditRefusal(chainOf(FALLBACK, CREDIT_TARGET), {});
 
 			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
 				formatModelString(FABLE),
 				formatModelString(FABLE),
 				formatModelString(FALLBACK),
@@ -1780,6 +1816,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(requestedModels).toEqual([
 				formatModelString(FABLE),
 				formatModelString(FABLE),
+				formatModelString(FABLE),
 				formatModelString(CREDIT_TARGET),
 			]);
 			expect(run.fallbacks).toEqual([formatModelString(CREDIT_TARGET)]);
@@ -1803,6 +1840,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			);
 
 			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
 				formatModelString(FABLE),
 				formatModelString(FABLE),
 				formatModelString(OTHER_CLAUDE),
@@ -1832,6 +1870,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(requestedModels).toEqual([
 				formatModelString(FABLE),
 				formatModelString(FABLE),
+				formatModelString(FABLE),
 				formatModelString(OTHER_CLAUDE),
 			]);
 			expect(run.fallbacks).toEqual([formatModelString(OTHER_CLAUDE)]);
@@ -1849,6 +1888,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			});
 
 			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
 				formatModelString(FABLE),
 				formatModelString(FABLE),
 				formatModelString(OTHER_CLAUDE),
@@ -1873,6 +1913,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 							"Seeded turn",
 						],
 					},
+					refusalWithCredit(),
+					// Its one same-model retry (`retry.maxRetries: 1`) is refused too.
 					refusalWithCredit(),
 				],
 				handler: { content: ["answered"] },
@@ -1910,6 +1952,7 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			expect(requests).toEqual([
 				`${formatModelString(FABLE)} at high`,
 				`${formatModelString(FABLE)} at high`,
+				`${formatModelString(FABLE)} at high`,
 				`${formatModelString(OTHER_CLAUDE)} at high`,
 			]);
 			expect(modelOf(run.session)).toBe(formatModelString(OTHER_CLAUDE));
@@ -1929,7 +1972,11 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 				{ [formatModelString(CREDIT_TARGET)]: depletedRead("usage") },
 			);
 
-			expect(requestedModels).toEqual([formatModelString(FABLE), formatModelString(FABLE)]);
+			expect(requestedModels).toEqual([
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+				formatModelString(FABLE),
+			]);
 			expect(run.fallbacks).toEqual([]);
 			expect(modelOf(run.session)).toBe(formatModelString(FABLE));
 			// The session drops the refusal from the active context and keeps it as
@@ -1956,7 +2003,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 			const fableMock = createMockModel({
 				provider: FABLE.provider,
 				id: FABLE.id,
-				responses: [{ content: ["answered"] }, refusalWithCredit()],
+				// Fable refuses the turn and both of its same-model retries.
+				responses: [{ content: ["answered"] }, refusalWithCredit(), refusalWithCredit(), refusalWithCredit()],
 				handler: { content: ["answered"] },
 			});
 			const agent = new Agent({
@@ -1991,6 +2039,8 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			expect(requestedModels).toEqual([
 				formatModelString(PRIMARY),
+				formatModelString(FABLE),
+				formatModelString(FABLE),
 				formatModelString(FABLE),
 				formatModelString(FABLE),
 				formatModelString(PRIMARY),
@@ -2370,7 +2420,12 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 				await runTurn(run.session, "Recover from the refusal");
 
-				expect(requestedModels).toEqual([formatModelString(GPT_5_6), formatModelString(product)]);
+				// The refusal gets its one same-model retry (`retry.maxRetries: 1`), refused too.
+				expect(requestedModels).toEqual([
+					formatModelString(GPT_5_6),
+					formatModelString(GPT_5_6),
+					formatModelString(product),
+				]);
 				expect(run.fallbacks).toEqual([formatModelString(product)]);
 				expect(modelOf(run.session)).toBe(formatModelString(product));
 				expect(lastAssistant(run.session).stopReason).toBe("stop");
@@ -2394,7 +2449,11 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			await runTurn(run.session, "Recover from the refusal");
 
-			expect(requestedModels).toEqual([formatModelString(GPT_5_6), formatModelString(NEXT_FALLBACK)]);
+			expect(requestedModels).toEqual([
+				formatModelString(GPT_5_6),
+				formatModelString(GPT_5_6),
+				formatModelString(NEXT_FALLBACK),
+			]);
 			expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK)]);
 			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
@@ -2418,7 +2477,11 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			await runTurn(run.session, "Recover from the refusal");
 
-			expect(requestedModels).toEqual([formatModelString(OPUS), formatModelString(NEXT_FALLBACK)]);
+			expect(requestedModels).toEqual([
+				formatModelString(OPUS),
+				formatModelString(OPUS),
+				formatModelString(NEXT_FALLBACK),
+			]);
 			expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK)]);
 			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
@@ -2454,7 +2517,11 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 				await runTurn(run.session, "Recover from the refusal");
 
-				expect(requestedModels).toEqual([formatModelString(refusing), formatModelString(NEXT_FALLBACK)]);
+				expect(requestedModels).toEqual([
+					formatModelString(refusing),
+					formatModelString(refusing),
+					formatModelString(NEXT_FALLBACK),
+				]);
 				expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK)]);
 				expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
 				expect(lastAssistant(run.session).stopReason).toBe("stop");
@@ -2474,7 +2541,11 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 			await runTurn(run.session, "Recover from the refusal");
 
-			expect(requestedModels).toEqual([formatModelString(LUNA_PRO), formatModelString(NEXT_FALLBACK)]);
+			expect(requestedModels).toEqual([
+				formatModelString(LUNA_PRO),
+				formatModelString(LUNA_PRO),
+				formatModelString(NEXT_FALLBACK),
+			]);
 			expect(run.fallbacks).toEqual([formatModelString(NEXT_FALLBACK)]);
 			expect(modelOf(run.session)).toBe(formatModelString(NEXT_FALLBACK));
 			expect(lastAssistant(run.session).stopReason).toBe("stop");
@@ -2500,7 +2571,11 @@ describe("AgentSession fallback walk with usage-aware fallback", () => {
 
 				await runTurn(run.session, "Recover from the refusal");
 
-				expect(requestedModels).toEqual([formatModelString(refusing), formatModelString(product)]);
+				expect(requestedModels).toEqual([
+					formatModelString(refusing),
+					formatModelString(refusing),
+					formatModelString(product),
+				]);
 				expect(run.fallbacks).toEqual([formatModelString(product)]);
 				expect(modelOf(run.session)).toBe(formatModelString(product));
 				expect(lastAssistant(run.session).stopReason).toBe("stop");

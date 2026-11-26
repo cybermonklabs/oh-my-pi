@@ -75,6 +75,7 @@ import {
 	isUserAuthoredMessage,
 	operatorTitleText,
 } from "./messages";
+import { CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES } from "./refusal-retries";
 import {
 	type ActiveRetryFallbackState,
 	calculateFullJitterRetryDelayMs,
@@ -737,6 +738,14 @@ export class TurnRecovery {
 	 * as it starts. Each retry policy clears it before its walk, and `resolveRetry()` clears it.
 	 */
 	#walkExcludedProvider: string | undefined;
+	/**
+	 * Same-model retries each model has had for a classifier refusal in the current retry saga,
+	 * keyed as `#refusalWalkKey` keys `#refusalWalkTried`. Cleared when a saga starts (its first
+	 * attempt in `#applyRetryPolicy`), not when one ends: a close that is still writing the
+	 * outcome of the last saga when the next one starts would otherwise clear the new saga's
+	 * counts in its `resolveRetry()`, and give a refused model more retries than the bound.
+	 */
+	readonly #refusalRetries = new Map<string, number>();
 	/** Per-model account walk allowance, snapshotted once and cleared when the retry saga ends. */
 	readonly #accountPolicyRotationsRemaining = new Map<string, number>();
 	#requestBodyReadTimeoutRecoveryPromptSequence: number | undefined;
@@ -1393,6 +1402,20 @@ export class TurnRecovery {
 			this.#retryResolve = undefined;
 			this.#retryPromise = undefined;
 		}
+	}
+
+	/**
+	 * Ends the retry saga an abort cut short while its retried request ran. Nothing else closes it:
+	 * without this the announced retry never gets its `auto_retry_end`, and the next turn's saga
+	 * starts with the aborted one's attempts spent, so a refusal in it gets no same-model retry.
+	 * The aborted request already left its own record, so no stopped-turn record is added.
+	 */
+	async resolveAbortedRetry(aborted: AssistantMessage): Promise<void> {
+		if (this.#retryAttempt === 0) {
+			this.resolveRetry();
+			return;
+		}
+		await this.#endCancelledRetry(aborted, false);
 	}
 
 	/**
@@ -2381,7 +2404,8 @@ export class TurnRecovery {
 	 * Excluded on purpose:
 	 * - capacity (429, 529, overloaded, a usage limit) — the replay re-hits the
 	 *   same cap while a chain entry may sit under a different one;
-	 * - a classifier refusal and an account-policy denial, which reproduce;
+	 * - a classifier refusal, which has its own same-model retries
+	 *   (`CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES`), and an account-policy denial, which reproduces;
 	 * - a timeout ({@link AIError.Flag.Timeout}) — each held replay costs a
 	 *   whole first-event window, minutes against a wedged route, for evidence
 	 *   that already points at the route rather than at the wire.
@@ -3219,10 +3243,10 @@ export class TurnRecovery {
 				// attempt, and, when `retry.rateLimitWalksChain` is on, a rate limit on
 				// the signer makes only a futile one, so the chain moves to the
 				// candidate.
-				// A classifier refusal is one of those: the source model declines the same
-				// request again, and Anthropic's documented retry for a refusal resends
-				// the history unchanged on another Claude model, which drops the thinking
-				// blocks it cannot read (preserved thinking, "Switching models
+				// A classifier refusal is one of those: the walk runs only once the refused
+				// model's own retries are spent, and Anthropic's documented retry for a
+				// refusal resends the history unchanged on another Claude model, which drops
+				// the thinking blocks it cannot read (preserved thinking, "Switching models
 				// mid-conversation").
 				// While the refusal's fallback credit can still be redeemed, only its
 				// targets pass, so an earlier non-target entry cannot forfeit the credit.
@@ -3765,7 +3789,10 @@ export class TurnRecovery {
 		const classifierRefusal = this.isClassifierRefusal(message);
 
 		const generation = this.#host.promptGeneration();
-		if (this.#retryAttempt === 0) this.#genericAbortStreak = 0;
+		if (this.#retryAttempt === 0) {
+			this.#genericAbortStreak = 0;
+			this.#refusalRetries.clear();
+		}
 		this.#retryAttempt++;
 		if (this.#retryAttempt === 1) this.#usageLimitFailedCredentialIds.clear();
 		this.#genericAbortStreak =
@@ -4143,16 +4170,34 @@ export class TurnRecovery {
 		};
 
 		const creditBalanceRejection = AIError.isCreditBalanceTooLow(message.errorStatus, errorMessage);
-		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
-			// The retry budget bounds same-model retries against a failing provider. A
-			// classifier refusal is not that: retrying the same model reproduces it, and
-			// the next model in the chain is one request away and often answers. Stopping
-			// the walk at the budget ends the turn with models left untried.
+		// A classifier refusal is retried on its model before the walk below leaves it, by rule:
+		// up to CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES times for each model, inside the retry
+		// budget. Whether the same request is then answered varies (see refusal-retries.ts for
+		// the measurements and the provider's contrary guidance), so the count stays small.
+		// Every category and shape of refusal takes this path. A model the walk has already
+		// left after a refusal is not asked again in the saga. There is nothing to wait out, so
+		// the retry goes at once.
+		let sameModelRefusalRetry = false;
+		if (classifierRefusal && currentSelector && !retryBudgetExhausted) {
+			const refusalKey = this.#refusalWalkKey(currentSelector);
+			const refusalRetries = this.#refusalRetries.get(refusalKey) ?? 0;
+			if (!this.#refusalWalkTried.has(refusalKey) && refusalRetries < CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES) {
+				this.#refusalRetries.set(refusalKey, refusalRetries + 1);
+				sameModelRefusalRetry = true;
+				delayMs = 0;
+			}
+		}
+
+		if (!staleOpenAIResponsesReplayError && !switchedCredential && !sameModelRefusalRetry && currentSelector) {
+			// The retry budget bounds same-model retries against a failing provider. It does
+			// not bound a classifier refusal's walk: once the refused model's own retries above
+			// are spent, the next model in the chain is one request away and often answers, and
+			// stopping the walk at the budget would end the turn with models left untried.
 			//
 			// The budget was also what terminated the walk: `retryFallbackChainKeys`
 			// consults the current model's own chain as well as the pinned one, so chains
 			// that name each other alternate rather than loop in place, and every hop used
-			// to spend an attempt. The walk is bounded here instead — a refusal visits any
+			// to spend an attempt. The walk is bounded here instead — a refusal walks to any
 			// one model at most once per turn, so A -> B -> A terminates whatever the
 			// chains say.
 			const refusalWalkKey = this.#refusalWalkKey(currentSelector);
@@ -4295,7 +4340,11 @@ export class TurnRecovery {
 				this.#genericAbortStreak = 0;
 			}
 		}
-		if ((classifierRefusal || accountPolicyDenial) && !switchedCredential && !switchedModel) {
+		if (
+			((classifierRefusal && !sameModelRefusalRetry) || accountPolicyDenial) &&
+			!switchedCredential &&
+			!switchedModel
+		) {
 			// A prior attempt in this saga already announced `auto_retry_start`
 			// (retryAttempt was incremented for each call to this method, so > 1
 			// means at least one earlier attempt started the loop) but this
