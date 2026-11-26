@@ -1,9 +1,9 @@
 /**
  * A failed turn the session keeps in context and continues from instead of
- * sending it again (a stream cut after visible text or after a complete tool
- * call, a malformed call), and whose continuation then succeeds, is still in
- * the model context the session rebuilds from its file, as a resume, a reload
- * or a compaction rebuilds it: the continuation
+ * sending it again (a rate limit or a stream cut after visible text, a stream
+ * cut after a complete tool call, a malformed call), and whose continuation
+ * then succeeds, is still in the model context the session rebuilds from its
+ * file, as a resume, a reload or a compaction rebuilds it: the continuation
  * picks up from that turn, so without it the model would never see the first
  * half of the answer, or would see a tool result whose call is gone. The file
  * marks such a turn `continued`; a failed turn the retry replaced, or one whose
@@ -12,7 +12,7 @@
  * where and while the turn does. The primary model's requests run the real
  * provider; only its HTTP client is replaced, so no request leaves the process.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
@@ -128,6 +128,47 @@ describe("a kept and continued turn in the context rebuilt from the session file
 		return geminiPrimary(turns);
 	};
 
+	// Regression: a rate limit cuts off an answer after its text is on screen,
+	// the session waits and the model continues it, and after a resume the
+	// model no longer sees the first half of its own answer.
+	it("keeps the text of a turn a rate limit cut off, before its continuation", async () => {
+		const result = await runAndReopen([
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME },
+			{ stream: CONTINUED_ANSWER },
+		]);
+
+		expect(result.requests).toBe(2);
+		expect(result.rebuilt).toEqual(["user", `assistant[text:${FIRST_TEXT}]`, `assistant[text:${CONTINUED_TEXT}]`]);
+		expect(result.rebuilt).toEqual(result.live);
+		// The transcript still shows the cut-off turn as recovered, and the file says a turn continued from it.
+		expect(result.failedEntry).toMatchObject({
+			message: { continued: true, retryRecovery: { status: "recovered" } },
+		});
+	});
+
+	// Regression: a rate limit cuts off an answer after its text and a complete
+	// tool call, the session waits and the model reissues the call, and after a
+	// resume the model sees a tool result whose call is gone, and no longer the
+	// first half of its answer.
+	it("keeps a turn a rate limit cut off after a complete tool call, with its call and result", async () => {
+		const result = await runAndReopen([
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + COMPLETE_TOOL_CALL_FRAMES + RATE_LIMIT_FRAME },
+			{ stream: CONTINUED_ANSWER },
+		]);
+
+		expect(result.requests).toBe(2);
+		expect(result.rebuilt).toEqual([
+			"user",
+			`assistant[text:${FIRST_TEXT} call:${TOOL_CALL_ID}]`,
+			`result:${TOOL_CALL_ID}`,
+			`assistant[text:${CONTINUED_TEXT}]`,
+		]);
+		expect(result.rebuilt).toEqual(result.live);
+		expect(result.failedEntry).toMatchObject({
+			message: { continued: true, retryRecovery: { status: "recovered" } },
+		});
+	});
+
 	// Regression: the stream is cut after a complete tool call, the session
 	// continues the turn from its tool result, and after a resume the model
 	// sees a tool result whose call is gone.
@@ -199,6 +240,31 @@ describe("a kept and continued turn in the context rebuilt from the session file
 		});
 		// The continuation ran outside any retry: nothing in the file says it was retried.
 		expect(result.failedEntry).not.toMatchObject({ message: { retryRecovery: expect.anything() } });
+	});
+
+	// Regression: a rate limit cuts off an answer and every continuation is
+	// refused until the attempts are spent; the user resumes the session and
+	// retries, and after the next resume the model sees the abandoned first
+	// half of the answer in front of the fresh one.
+	it("leaves out a kept turn whose continuations all failed, after a resume and a retry", async () => {
+		const first = await runAndReopen([
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME },
+			HTTP_RATE_LIMIT,
+		]);
+		expect(first.failedEntry).toMatchObject({ message: { retryRecovery: { status: "superseded" } } });
+		expect(first.failedEntry).not.toMatchObject({ message: { continued: true } });
+
+		sessions.answers = [{ stream: answer(FRESH_TEXT) }];
+		const resumed = await sessions.startSession(first.reopened, {
+			messages: first.reopened.buildSessionContext().messages,
+		});
+		expect(await resumed.retry()).toBe(true);
+		await resumed.waitForIdle();
+		const reopened = await sessions.reopen(first.reopened);
+
+		const rebuilt = conversation(reopened.buildSessionContext().messages);
+		expect(rebuilt).toEqual(["user", `assistant[text:${FRESH_TEXT}]`]);
+		expect(rebuilt).toEqual(conversation(resumed.agent.state.messages));
 	});
 
 	// A cut stream whose continuations are cut too, until the continuation cap
@@ -273,6 +339,84 @@ describe("a kept and continued turn in the context rebuilt from the session file
 		const reopened = await sessions.reopen(sessionManager);
 		expect(conversation(reopened.buildSessionContext().messages)).toEqual(live);
 		expect(continuedTurns(reopened)).toEqual(kept);
+	});
+
+	// Regression: an abort (Esc) lands after a rate limit's wait, once the
+	// continuation it scheduled waits its last tick to start, so the live
+	// context ends on the kept turn and its continue reminder. `/retry` then
+	// dropped the kept turn and sent the reminder alone, asking the model to
+	// continue text it could not see.
+	it("continues from the kept turn and its reminder on a retry after the continuation was cancelled", async () => {
+		sessions.answers = [
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME },
+			{ stream: CONTINUED_ANSWER },
+		];
+		const sessionManager = sessions.createSessionManager();
+		const session = await sessions.startSession(sessionManager);
+		const wait = sessions.schedulerWait;
+		const advance = wait.getMockImplementation();
+		if (!advance) throw new Error("Expected the harness to mock scheduler.wait");
+		let aborted: Promise<void> | undefined;
+		wait.mockImplementation((delayMs, options) => {
+			// The scheduled continuation waits here once the reminder is the live tail.
+			const tail = session.agent.state.messages.at(-1);
+			if (!aborted && tail?.role === "custom" && tail.customType === CONTINUE_REMINDER_MESSAGE_TYPE) {
+				aborted = session.abort();
+			}
+			return advance(delayMs, options);
+		});
+		await session.prompt("Answer in two parts");
+		await session.waitForIdle();
+		await aborted;
+		const keptTurn = `assistant[text:${FIRST_TEXT}]`;
+		const reminder = expect.stringMatching(/^developer:/);
+		expect(sessions.requests).toBe(1);
+		expect(modelConversation(session.agent.state.messages)).toEqual(["user", keptTurn, reminder]);
+
+		expect(await session.retry()).toBe(true);
+		await session.waitForIdle();
+
+		expect(sessions.requests).toBe(2);
+		expect(modelConversation(sessions.requestMessages.at(-1) ?? [])).toEqual(["user", keptTurn, reminder]);
+		const live = modelConversation(session.agent.state.messages);
+		expect(live).toEqual(["user", keptTurn, reminder, `assistant[text:${CONTINUED_TEXT}]`]);
+		const reopened = await sessions.reopen(sessionManager);
+		expect(modelConversation(reopened.buildSessionContext().messages)).toEqual(live);
+		expect(continuedTurns(reopened)).toEqual([keptTurn]);
+	});
+
+	// A stream cut after text is continued outside any retry; that
+	// continuation is cut by a rate limit after its text, which a retry
+	// continues. The one successful turn continued from both and closes the
+	// retry: both marks and the retry's note go to the file in one write (a
+	// rewrite, or one appended `entry_patch` record in a build that has them).
+	it("marks both turns with one write when one turn continues a stream cut and a retry", async () => {
+		sessions.answers = [
+			{ stream: MESSAGE_START_FRAME + textFrames("One.") + OVERLOADED_FRAME },
+			{ stream: MESSAGE_START_FRAME + textFrames("Two.") + RATE_LIMIT_FRAME },
+			{ stream: CONTINUED_ANSWER },
+		];
+		const sessionManager = sessions.createSessionManager();
+		const writes: Array<{ mock: { calls: unknown[] } }> = [vi.spyOn(sessionManager, "rewriteEntries")];
+		const patching = sessionManager as unknown as { patchEntries?: (...args: never[]) => unknown };
+		if (patching.patchEntries) {
+			writes.push(vi.spyOn(patching as { patchEntries: (...args: never[]) => unknown }, "patchEntries"));
+		}
+		const session = await sessions.startSession(sessionManager);
+		await session.prompt("Answer in two parts");
+		await session.waitForIdle();
+
+		expect(writes.reduce((count, spy) => count + spy.mock.calls.length, 0)).toBe(1);
+		const kept = ["assistant[text:One.]", "assistant[text:Two.]"];
+		const live = conversation(session.agent.state.messages);
+		expect(live).toEqual(["user", ...kept, `assistant[text:${CONTINUED_TEXT}]`]);
+		const reopened = await sessions.reopen(sessionManager);
+		expect(conversation(reopened.buildSessionContext().messages)).toEqual(live);
+		expect(continuedTurns(reopened)).toEqual(kept);
+		const retried = reopened
+			.getEntries()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant" && entry.message.retryRecovery);
+		expect(retried).toMatchObject({ message: { content: [{ type: "text", text: "Two." }] } });
 	});
 
 	// Every other end of a run that kept a turn (here a stated wait past
@@ -352,6 +496,11 @@ describe("a kept and continued turn in the context rebuilt from the session file
 			retried: false,
 		},
 		{
+			cut: "a rate limit",
+			primary: (turns: PrimaryTurn[]) => anthropicPrimary(turns, RATE_LIMIT_FRAME),
+			retried: true,
+		},
+		{
 			cut: "a malformed call",
 			primary: malformedCallPrimary,
 			retried: false,
@@ -361,7 +510,7 @@ describe("a kept and continued turn in the context rebuilt from the session file
 
 		// The marker changes nothing on screen: after a reload the transcript
 		// draws the kept turn as it drew it live (a cut stream or a malformed
-		// call as its error).
+		// call as its error, a rate limit as the retried note).
 		it("is drawn after a reload as it was drawn live", async () => {
 			const { answers, options } = primary([CUT, CONTINUED_TEXT]);
 			const result = await runAndReopen(answers, options);
@@ -427,6 +576,10 @@ describe("a kept and continued turn in the context rebuilt from the session file
 		{
 			continuation: "the stream-stall continuation",
 			primary: (turns: PrimaryTurn[]) => anthropicPrimary(turns, OVERLOADED_FRAME),
+		},
+		{
+			continuation: "the rate-limit continuation",
+			primary: (turns: PrimaryTurn[]) => anthropicPrimary(turns, RATE_LIMIT_FRAME),
 		},
 		{
 			continuation: "the malformed-call continuation",

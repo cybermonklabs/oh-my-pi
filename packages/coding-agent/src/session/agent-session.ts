@@ -2546,6 +2546,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			configWarnings: this.configWarnings,
 			model: () => this.model,
 			contextFitsModel: (model, excludedMessage) => this.#maintenance.contextFitsModel(model, excludedMessage),
+			getContextUsage: () => this.getContextUsage(),
 			textOutputCommitted: () => this.#textOutputCommitted,
 			thinkingLevel: () => this.thinkingLevel,
 			configuredThinkingLevel: () => this.configuredThinkingLevel(),
@@ -5703,6 +5704,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				maintenanceRoute("malformed-function-call-handled");
 				endLoop({ continuing: true });
 				return;
+			} else if (!requestBodyTimeoutTerminal && this.#recovery.isCommittedTextRateLimit(msg)) {
+				// A rate limit after text rendered: the turn cannot be sent again, so wait
+				// it out on this model and continue the answer from where it stopped.
+				const didRetry = await this.#recovery.handleRetryableError(msg, { continueCommittedText: true });
+				if (didRetry) {
+					endLoop({ continuing: true });
+					return;
+				}
 			} else if (!requestBodyTimeoutTerminal && this.#recovery.handleCommittedTextStreamStall(msg)) {
 				// The stream died after text rendered: replay would duplicate it and
 				// a trailing assistant prefill is rejected, so keep the partial turn

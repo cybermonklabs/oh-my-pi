@@ -6,7 +6,7 @@
 
 - Added xAI speech-to-text (`xai-stt`) transcription, including through the auth gateway ([#19184](https://github.com/can1357/oh-my-pi/pull/19184) by [@Xytronix](https://github.com/Xytronix))
 - Added an `upstreamModel` option to mock provider responses, so a mocked turn can report a model that served it other than the one requested ([#20466](https://github.com/can1357/oh-my-pi/pull/20466) by [@byhow](https://github.com/byhow))
-- `AssistantMessage.continued` marks a failed turn a later turn continued from instead of sending it again (a cut stream after visible text, a cut stream or a reasonless abort after complete tool calls, a malformed function call), set once the continuation succeeded
+- `AssistantMessage.continued` marks a failed turn a later turn continued from instead of sending it again (a rate limit or a cut stream after visible text, a cut stream or a reasonless abort after complete tool calls, a malformed function call), set once the continuation succeeded
 
 ### Changed
 
@@ -25,6 +25,7 @@
 - Devin sessions now switch to another stored login when the current one's weekly quota is spent and it has no on-demand balance, instead of failing every request on it ([#20524](https://github.com/can1357/oh-my-pi/pull/20524) by [@will-bogusz](https://github.com/will-bogusz))
 - The thinking-loop guard no longer aborts healthy reasoning written in Chinese, Japanese, Thai, or other unspaced scripts when the same English tool or metric names recur, and now also catches loops in that text ([#20096](https://github.com/can1357/oh-my-pi/issues/20096))
 - Pi-native stream requests now use a configured `Authorization` header regardless of its casing and fall back to the API key when the header is empty or absent ([#20472](https://github.com/can1357/oh-my-pi/pull/20472) by [@enieuwy](https://github.com/enieuwy))
+- A rate limit the Anthropic API reports in its stream (an `error` event of type `rate_limit_error`), before or after the response starts, now carries HTTP status 429, and an overload it reports before the response starts (`overloaded_error`) status 529, so each is retried and held on the same model as the HTTP response would be; a streamed rate limit is sent again only by the caller's retry, one request per attempt
 
 ## [19.2.1] - 2026-11-25
 

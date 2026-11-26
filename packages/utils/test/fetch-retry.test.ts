@@ -206,6 +206,17 @@ describe("extractRetryHint", () => {
 		expect(extractRetryHint(undefined, "429 Monthly usage limit reached. Resets in 1 day.")).toBe(24 * 60 * 60_000);
 	});
 
+	// A reset window stated as a Go duration that ends in minutes was read as
+	// its first part only, so the exhausted credential was blocked for less than
+	// the stated window and was picked again while still capped.
+	it.each([
+		["Your limit will reset in 6m0s", 6 * 60_000],
+		["429 usage limit reached. resets in 1h30m.", 90 * 60_000],
+		["429 5-hour usage limit reached. Resets in 2h15m.", (2 * 60 + 15) * 60_000],
+	])("adds the parts of the compound reset window in '%s'", (body, expectedMs) => {
+		expect(extractRetryHint(undefined, body)).toBe(expectedMs);
+	});
+
 	it("keeps a Cloud Code credential blocked for the full 71h48m47s reset instead of retrying it early", () => {
 		expect(
 			extractRetryHint(
@@ -381,5 +392,39 @@ describe("extractRetryHint", () => {
 	it("still returns undefined when only elapsed account resets are present", () => {
 		const past = new Date(Date.now() - 60_000).toISOString();
 		expect(extractRetryHint(undefined, `Your limit will reset at ${past}`)).toBeUndefined();
+	});
+
+	// OpenAI states a rate-limit wait as a Go duration ("Please try again in
+	// 6m0s."). Read as one number and unit, the wait was lost: a 90-second wait
+	// was retried after the short backoff and re-hit the limit, and a six-minute
+	// wait past the caller's cap was retried instead of failing fast.
+	it.each([
+		["6m0s", 6 * 60_000],
+		["1m30s", 90_000],
+		["1m30.5s", 90_500],
+		["1h2m3.5s", (62 * 60 + 3.5) * 1000],
+		["500ms", 500],
+	])("adds the parts of the compound wait 'try again in %s'", (wait, expectedMs) => {
+		expect(
+			extractRetryHint(
+				undefined,
+				`429 Rate limit reached for gpt-5.2 in organization org-test on requests per min (RPM): Limit 500. Please try again in ${wait}. Visit https://platform.openai.com/account/rate-limits to learn more.`,
+			),
+		).toBe(expectedMs);
+	});
+
+	// Each single-unit form a provider sends reads as it did before compound
+	// waits were read; a misread unit sleeps the wrong wait.
+	it.each([
+		["250ms", 250],
+		["12s", 12_000],
+		["12sec", 12_000],
+		["5 min", 5 * 60_000],
+		["~158 min.", 158 * 60_000],
+		["2h", 2 * 60 * 60_000],
+		["90 minutes", 90 * 60_000],
+		["1 hour", 60 * 60_000],
+	])("reads the single-unit wait 'try again in %s'", (wait, expectedMs) => {
+		expect(extractRetryHint(undefined, `Rate limited. Try again in ${wait}`)).toBe(expectedMs);
 	});
 });

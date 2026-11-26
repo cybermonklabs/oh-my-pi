@@ -31,6 +31,7 @@
 - `omp session pack` and `omp session unpack` stream the transcript and its artifacts instead of reading them whole, so moving a long session between machines no longer holds copies of it in memory
 - A turn waits before its next model request or tool result while the session storage has too many transcript appends queued, so a backlogged store slows the turn instead of growing memory
 - On Windows, a session's older entries stay in memory, compressed to about a quarter of their size or less, and a full rewrite on indexed session storage keeps a compressed copy of its body in memory while it is queued, instead of files under the temporary directory: Windows gives no account id to check that directory's owner against, and a file there takes the directory's access list
+- A rate limit now waits on the same model, retrying it after the wait the provider states, before it walks `retry.fallbackChains`, and never moves a session whose context, as the status line shows it (a prompt no request has answered yet included), is larger than the new `retry.rateLimitFallbackMaxContextTokens` (default 100,000 tokens); a rate limit that cuts off an answer already on screen waits the same way and then continues that answer on the same model, never walking the chain; overloads and server errors still walk the chain at once
 
 ### Fixed
 
@@ -84,6 +85,7 @@
 - A subagent's transcript read over RPC (`get_subagent_messages`) or in the Agent Hub now shows a recovered retry as recovered and an elided tool result as its placeholder, as the session itself does
 - A retry marker or other stamp that another process appended to the session file is no longer dropped when this session next rewrites the file, and a stamp whose content does not fit its entry is skipped with a warning instead of corrupting that entry
 - An `omp anonymize` export shows a recovered retry as recovered, and reopens without malformed-record warnings
+- A rate limit that states no wait, under a `retry.maxDelayMs` below the 30-second rate-limit backoff, is retried on the same model after `retry.maxDelayMs`, instead of ending the turn, or walking `retry.fallbackChains` at once, on a `Retry requires 30000ms wait` the provider never stated
 
 ### Removed
 

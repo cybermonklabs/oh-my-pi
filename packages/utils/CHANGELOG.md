@@ -28,6 +28,8 @@
 - Fixed `structuredCloneJSON` failing with `Maximum call stack size exceeded` on a value nested more than about 40,000 levels deep; a shallower value is copied as before
 - Fixed the ACP `ndJsonStream` transport failing with `Maximum call stack size exceeded` on a message nested more than about 40,000 levels deep; it writes the message with `stringifyDeepJson`
 - Fixed `parseImageMetadata` omitting the dimensions of lossless WebP (VP8L) headers shorter than 30 bytes ([#20521](https://github.com/can1357/oh-my-pi/pull/20521) by [@shgew](https://github.com/shgew))
+- Fixed `extractRetryHint` ignoring or cutting short a wait or reset window stated as a Go duration such as `try again in 6m0s`, `try again in 1m30s` or `resets in 1h30m`: its parts now add up, so a caller waits the time the provider states instead of its own backoff
+- Fixed `extractRetryHint` ignoring a wait stated in seconds (`Try again in 90 seconds.`, `try again in 45 secs`) or as `Please retry after 20 seconds.`, so a caller waits the time the provider states instead of its own backoff
 
 ## [19.2.1] - 2026-11-25
 

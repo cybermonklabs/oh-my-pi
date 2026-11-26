@@ -1,14 +1,15 @@
 /**
  * Sessions for the cases where a failed turn is kept in context and continued
- * from (a stream cut after visible text, a malformed call), then read back as
- * a reload, a resume or a compaction reads the session. The primary model's
- * requests run the real `anthropic-messages` provider; only its HTTP client
- * is replaced, so no request leaves the process.
+ * from (a stream cut or a rate limit after visible text, a malformed call),
+ * then read back as a reload, a resume or a compaction reads the session. The
+ * primary model's requests run the real `anthropic-messages` provider; only its
+ * HTTP client is replaced, so no request leaves the process.
  *
  * Call {@link useKeptTurnSessions} inside a `describe`: it registers the hooks
  * that own the temporary directory, the auth store and the mocks.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, type Mock, vi } from "bun:test";
+import { scheduler } from "node:timers/promises";
 import * as path from "node:path";
 import { Agent, type AgentMessage, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
@@ -274,6 +275,11 @@ interface KeptTurnSessions {
 	readonly requestMessages: readonly AgentMessage[][];
 	/** Settles once a `held` answer of this case has sent its frames and waits for the abort. */
 	readonly answerHeld: Promise<void>;
+	/**
+	 * The case's `scheduler.wait`, which ends at once and moves the mocked
+	 * clocks on by its delay; a case may wrap its implementation.
+	 */
+	readonly schedulerWait: Mock<typeof scheduler.wait>;
 	readonly tempDir: TempDir;
 	readonly authStorage: AuthStorage;
 	/** A new persisted session in the case's temporary directory. */
@@ -307,6 +313,7 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 	let requests = 0;
 	let requestMessages: AgentMessage[][] = [];
 	let answerHeld = Promise.withResolvers<void>();
+	let schedulerWait: Mock<typeof scheduler.wait> | undefined;
 	const drawn = new WeakMap<AgentSession, AssistantMessage[]>();
 
 	const setUp = <T>(value: T | undefined, name: string): T => {
@@ -330,6 +337,9 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 		},
 		get authStorage() {
 			return setUp(authStorage, "authStorage");
+		},
+		get schedulerWait() {
+			return setUp(schedulerWait, "schedulerWait");
 		},
 
 		createSessionManager() {
@@ -495,7 +505,7 @@ export function useKeptTurnSessions(): KeptTurnSessions {
 			const held = answerHeld;
 			return { asResponse: () => primaryResponse(next, options?.signal, () => held.resolve()) } as never;
 		});
-		mockSchedulerWaitWithClock();
+		schedulerWait = mockSchedulerWaitWithClock();
 	});
 
 	afterEach(async () => {

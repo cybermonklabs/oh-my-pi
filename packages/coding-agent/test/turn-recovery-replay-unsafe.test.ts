@@ -90,6 +90,7 @@ function createHost(
 		configWarnings: [],
 		model: () => model,
 		contextFitsModel: () => options.contextFits !== false,
+		getContextUsage: () => undefined,
 		textOutputCommitted: () => options.textOutputCommitted !== false,
 		thinkingLevel: () => undefined,
 		configuredThinkingLevel: () => undefined,

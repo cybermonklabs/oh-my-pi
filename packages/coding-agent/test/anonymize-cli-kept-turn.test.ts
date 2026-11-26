@@ -12,6 +12,7 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { runAnonymizeCommand } from "../src/cli/anonymize-cli";
+import { CONTINUE_REMINDER_MESSAGE_TYPE } from "../src/session/session-context";
 import type { SessionEntry } from "../src/session/session-entries";
 import { SessionManager } from "../src/session/session-manager";
 import {
@@ -19,6 +20,7 @@ import {
 	CONTINUED_ANSWER,
 	MESSAGE_START_FRAME,
 	RATE_LIMIT_FRAME,
+	TEXT_FRAMES,
 	useKeptTurnSessions,
 } from "./helpers/kept-turn-session";
 
@@ -60,6 +62,32 @@ describe("omp anonymize on a session with a kept or retried failed turn", () => 
 		await runAnonymizeCommand({ session: sessionFile, out });
 		return SessionManager.open(path.join(out, "session.jsonl"), out, undefined, { suppressBreadcrumb: true });
 	}
+
+	// Regression: a user exports a session with `omp anonymize` in which a rate
+	// limit cut an answer off after its text and the session continued it; the
+	// export, reopened, has lost the first half of the answer, and the cut-off
+	// turn is drawn as a plain failure instead of a recovered one.
+	it("keeps a turn a rate limit cut off after its text, and its marks", async () => {
+		const result = await sessions.runAndReopen([
+			{ stream: MESSAGE_START_FRAME + TEXT_FRAMES + RATE_LIMIT_FRAME },
+			{ stream: CONTINUED_ANSWER },
+		]);
+		const sessionFile = result.session.sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected the session to persist a file");
+		const live = contextShape(result.session.agent.state.messages);
+		expect(live).toEqual(["user", "assistant[text]", `custom:${CONTINUE_REMINDER_MESSAGE_TYPE}`, "assistant[text]"]);
+
+		const anonymized = await anonymizeAndOpen(sessionFile, "text-cut");
+		try {
+			expect(failedMessage(anonymized.getEntries())).toMatchObject({
+				continued: true,
+				retryRecovery: { status: "recovered" },
+			});
+			expect(contextShape(anonymized.buildSessionContext().messages)).toEqual(live);
+		} finally {
+			await anonymized.close();
+		}
+	});
 
 	// Regression: a user exports a session with `omp anonymize` in which a rate
 	// limit ended a turn after a complete tool call and a retry recovered it;
