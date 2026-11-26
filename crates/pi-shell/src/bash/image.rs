@@ -306,6 +306,12 @@ impl ImageDiff {
 	pub fn records(&self) -> impl Iterator<Item = &Record> {
 		self.records.iter().filter_map(|(_, r)| r.as_ref())
 	}
+
+	/// The global variables the diff changes, each with its new record
+	/// (`None`: removed).
+	pub fn vars(&self) -> impl Iterator<Item = (&BString, Option<&Record>)> {
+		self.vars.iter().map(|(n, r)| (n, r.as_ref()))
+	}
 }
 
 #[cfg(test)]

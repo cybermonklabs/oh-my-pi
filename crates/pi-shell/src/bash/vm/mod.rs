@@ -3743,7 +3743,7 @@ impl ForkEdits {
 		for name in self.unexport_env {
 			image.del_var(&name);
 			for scope in &mut vp.scopes {
-				if let Some(Some(var)) = scope.vars.get_mut(&name) {
+				if let Some(var) = scope.vars.var_mut(&name) {
 					var.attrs = var.attrs.without(Attrs::EXPORT);
 				}
 			}

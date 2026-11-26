@@ -716,8 +716,12 @@ fn plain_statement(
 	exec::raise_element_level(vp);
 	catch_builtin(vp);
 	// The temporary scope the staged command gives a builtin.
-	let scope =
-		Scope { vars: VarMap::default(), positional: None, func: None, zsh: None };
+	let scope = Scope {
+		vars:       Default::default(),
+		positional: None,
+		func:       None,
+		zsh:        None,
+	};
 	state::push_scope(&mut k.root, cx.store, vp, scope);
 	let (res, chunks, log) = {
 		let mut ctx = Ctx::new(k, cx, vp, &[], line, id.into());
@@ -1029,7 +1033,7 @@ fn expand(
 		// prefix steers the lookup).
 		st(vp).scoped = true;
 		let scope = Scope {
-			vars:       VarMap::default(),
+			vars:       Default::default(),
 			positional: None,
 			func:       None,
 			zsh:        None,
@@ -3951,7 +3955,8 @@ fn push_call(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, callee: Callee, ca
 	{
 		k.fail(err);
 	}
-	let scope = Scope { vars, positional: Some(args), func: Some(argzero.unwrap_or(name)), zsh };
+	let scope =
+		Scope { vars: vars.into(), positional: Some(args), func: Some(argzero.unwrap_or(name)), zsh };
 	state::push_scope(&mut k.root, cx.store, vp, scope);
 	// `$?` at the function's entry is the caller's (bash's
 	// `execute_function` leaves `last_command_exit_value` alone).
@@ -4311,7 +4316,7 @@ fn run_builtin(
 	if !st(vp).scoped {
 		st(vp).scoped = true;
 		let scope = Scope {
-			vars:       VarMap::default(),
+			vars:       Default::default(),
 			positional: None,
 			func:       None,
 			zsh:        None,

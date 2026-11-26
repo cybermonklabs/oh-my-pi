@@ -43,7 +43,7 @@ use crate::bash::{
 	image::{Image, ImageDiff},
 	ir::{RedirFdIr, RedirIr, RedirTargetIr, SpawnKind, Unit},
 	mem::MemBuf,
-	store::{OptId, VarValue},
+	store::{KeyBuf, OptId, Record, VarValue},
 	zshopt::ZshOpt,
 };
 
@@ -100,11 +100,12 @@ pub enum Owner {
 /// the child's, a later word sees what an earlier one wrote, and a lookup
 /// of `RANDOM` or `SECONDS` leaves the shell's value cell alone
 /// ([`Kernel::redirs_in_child`]). A `${ }` or `${| }` the words hold runs
-/// with the shell's own state, as do the fd install, the `{var}` the shell
-/// keeps, the subshell's own-var save and the pending-break accounting that
-/// follow each word ([`Vproc::vpid`], the deferral and bang paths too). The
-/// shell's state is back before it returns, parked or not. zsh code:
-/// [`apply`].
+/// in the shell, reading what the child wrote before it ([`child_vars`]); it
+/// starts, as do the fd install, the `{var}` the shell keeps, the subshell's
+/// own-var save and the pending-break accounting that follow each word,
+/// with the shell's own state ([`Vproc::vpid`], the deferral and bang paths
+/// too). The shell's state is back before it returns, parked or not. zsh
+/// code: [`apply`].
 pub fn apply_in_child(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -132,15 +133,30 @@ pub fn apply_in_child(
 ///
 /// [`ScratchIo::child`]: super::proc::ScratchIo::child
 pub struct ChildState {
-	/// Global variables and other forked records the child set or removed.
-	image:      ImageDiff,
-	/// Locals the child set: scope index, name, value.
-	locals:     Vec<(usize, BString, Option<state::Var>)>,
-	/// Whether the child assigned a locale variable ([`Vproc::locale_gen`]
-	/// `None`).
-	locale_set: bool,
+	writes: ChildWrites,
 	/// The child's `$RANDOM` generator and `$SECONDS` clock.
-	clock:      super::proc::Clock,
+	clock:  super::proc::Clock,
+}
+
+/// What a command's child wrote, where its vproc keeps its state.
+enum ChildWrites {
+	/// The root vproc's: each store record (`None`: removed), as
+	/// [`state::Root::end_child`] returns them.
+	Root(Vec<(KeyBuf, Option<Record>)>),
+	/// A forked vproc's: its image's changes, the locals it set (scope
+	/// index, name, value), and whether it assigned a locale variable
+	/// ([`Vproc::locale_gen`] `None`).
+	Forked {
+		image:      ImageDiff,
+		locals:     Vec<(usize, BString, Option<state::Var>)>,
+		locale_set: bool,
+	},
+}
+
+impl Default for ChildWrites {
+	fn default() -> Self {
+		Self::Root(Vec::new())
+	}
 }
 
 /// The shell's own state, set aside while an expansion pass of a word of
@@ -148,24 +164,24 @@ pub struct ChildState {
 /// ([`enter_child`]); [`leave_child`] puts it back and keeps what the pass
 /// wrote.
 pub struct ShellState {
-	image:       Option<Image>,
-	locale_gen:  Option<u64>,
-	scopes:      Vec<state::Scope>,
-	clock:       Option<super::proc::Clock>,
-	pid:         Option<crate::bash::ids::Vpid>,
-	/// The shell's state the pass's copy was made from, to tell the child's
-	/// writes from it afterwards.
-	base:        Image,
-	base_scopes: Vec<state::Scope>,
+	clock:  Option<super::proc::Clock>,
+	pid:    Option<crate::bash::ids::Vpid>,
+	/// A forked vproc's image, locale count and scope maps as they were
+	/// (the root vproc's records are put back by [`state::Root::end_child`]).
+	forked: Option<(Image, Option<u64>, Vec<state::ScopeVars>)>,
 	/// The command's [`ChildState`], its box kept for [`leave_child`].
-	child:       Option<Box<ChildState>>,
+	child:  Option<Box<ChildState>>,
 }
 
 /// Start an expansion pass of a word of redirections bash makes in a child
-/// ([`Kernel::redirs_in_child`]) on that child's state: a copy-on-write
-/// image and copied scopes of the shell's state with the child's earlier
-/// writes laid over them ([`ChildState`], kept in `sc`, the scratch of the
-/// command's op), the child's clock, and a reserved pid for `$BASHPID`.
+/// ([`Kernel::redirs_in_child`]) on that child's state: the shell's state
+/// with the child's earlier writes ([`ChildState`], kept in `sc`, the
+/// scratch of the command's op) laid over it, the child's clock, and a
+/// reserved pid for `$BASHPID`. It copies nothing the pass does not write:
+/// the root vproc's pass runs on the store, every record it writes put back
+/// at [`leave_child`] ([`state::Root::begin_child`]); a forked vproc's
+/// image and scope maps are shared with the pass, which copies one only to
+/// write it.
 #[cold]
 #[inline(never)]
 pub fn enter_child(
@@ -174,27 +190,34 @@ pub fn enter_child(
 	cx: &mut Cx<'_>,
 	sc: &mut Scratch,
 ) -> ShellState {
-	let (base, base_locale) = state::fork_image(&k.root, cx.store, vp).unwrap_or_else(|err| {
-		k.fail(err);
-		(Default::default(), None)
-	});
-	let base_scopes = state::copy_scopes(&k.root, cx.store, vp).unwrap_or_else(|err| {
-		k.fail(err);
-		Vec::new()
-	});
 	let mut child = sc.io.as_mut().and_then(|io| io.child.take());
-	let mut scopes = base_scopes.clone();
-	let (image, locale_gen, clock) = match child.as_deref_mut() {
-		Some(c) => {
-			for (i, name, var) in c.locals.drain(..) {
-				if let Some(scope) = scopes.get_mut(i) {
+	let clock = child
+		.as_deref()
+		.map_or_else(|| k.fork_clock(vp), |c| c.clock);
+	let writes = child.as_deref_mut().map(|c| std::mem::take(&mut c.writes));
+	let forked = if vp.image.is_none() {
+		let writes = match writes {
+			Some(ChildWrites::Root(writes)) => writes,
+			_ => Vec::new(),
+		};
+		k.root.begin_child(cx.store, writes);
+		None
+	} else {
+		let base = vp.image.clone().unwrap_or_default();
+		let vars: Vec<state::ScopeVars> = vp.scopes.iter().map(|s| s.vars.clone()).collect();
+		let locale = vp.locale_gen;
+		if let Some(ChildWrites::Forked { image, locals, locale_set }) = writes {
+			vp.image = Some(Image::patched(base.clone(), image));
+			for (i, name, var) in locals {
+				if let Some(scope) = vp.scopes.get_mut(i) {
 					scope.vars.insert(name, var);
 				}
 			}
-			let image = Image::patched(base.clone(), std::mem::take(&mut c.image));
-			(image, if c.locale_set { None } else { base_locale }, c.clock)
-		},
-		None => (base.clone(), base_locale, k.fork_clock(vp)),
+			if locale_set {
+				vp.locale_gen = None;
+			}
+		}
+		Some((base, locale, vars))
 	};
 	// The vpid bash's fork would take, peeked without consuming one: a word
 	// that reads `$BASHPID` needs a value distinct from the shell, and a
@@ -203,13 +226,9 @@ pub fn enter_child(
 	// peeked then.
 	let child_vpid = crate::bash::ids::Vpid(k.next_vpid);
 	ShellState {
-		image: vp.image.replace(image),
-		locale_gen: std::mem::replace(&mut vp.locale_gen, locale_gen),
-		scopes: std::mem::replace(&mut vp.scopes, scopes),
 		clock: vp.clock.replace(clock),
 		pid: k.redirs_child_pid.replace(child_vpid),
-		base,
-		base_scopes,
+		forked,
 		child,
 	}
 }
@@ -219,35 +238,87 @@ pub fn enter_child(
 /// or pass (dropped with the op's scratch).
 #[cold]
 #[inline(never)]
-pub fn leave_child(k: &mut Kernel, vp: &mut Vproc, sc: &mut Scratch, shell: ShellState) {
-	let ShellState { image, locale_gen, scopes, clock, pid, base, base_scopes, child } = shell;
+pub fn leave_child(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	sc: &mut Scratch,
+	shell: ShellState,
+) {
+	let ShellState { clock, pid, forked, child } = shell;
 	k.redirs_child_pid = pid;
 	let child_clock = std::mem::replace(&mut vp.clock, clock);
-	let child_scopes = std::mem::replace(&mut vp.scopes, scopes);
-	let child_locale = std::mem::replace(&mut vp.locale_gen, locale_gen);
-	let child_image = std::mem::replace(&mut vp.image, image);
+	let writes = match forked {
+		None => ChildWrites::Root(k.root.end_child(cx.store)),
+		Some((base, locale, vars)) => {
+			let image = vp.image.as_ref().map_or_default(|image| image.diff(&base));
+			vp.image = Some(base);
+			let mut locals = Vec::new();
+			for (i, shell_vars) in vars.into_iter().enumerate() {
+				let Some(scope) = vp.scopes.get_mut(i) else {
+					continue;
+				};
+				if scope.vars.same(&shell_vars) {
+					continue;
+				}
+				for (name, var) in &scope.vars {
+					if shell_vars.get(name) != Some(var) {
+						locals.push((i, name.clone(), var.clone()));
+					}
+				}
+				scope.vars = shell_vars;
+			}
+			let locale_set = vp.locale_gen.is_none();
+			vp.locale_gen = locale;
+			ChildWrites::Forked { image, locals, locale_set }
+		},
+	};
 	let Some(child_clock) = child_clock else {
 		return;
 	};
 	let mut child = child.unwrap_or_else(|| {
-		Box::new(ChildState {
-			image:      ImageDiff::default(),
-			locals:     Vec::new(),
-			locale_set: false,
-			clock:      child_clock,
-		})
+		Box::new(ChildState { writes: ChildWrites::default(), clock: child_clock })
 	});
-	child.image = child_image.map_or_default(|image| image.diff(&base));
-	for (i, (mine, theirs)) in child_scopes.iter().zip(&base_scopes).enumerate() {
-		for (name, var) in &mine.vars {
-			if theirs.vars.get(name) != Some(var) {
-				child.locals.push((i, name.clone(), var.clone()));
-			}
-		}
-	}
-	child.locale_set = child_locale.is_none();
+	child.writes = writes;
 	child.clock = child_clock;
 	sc.io().child = Some(child);
+}
+
+/// The variables the child of the command whose op scratch is `sc` wrote
+/// in its words so far, with their values (`None`: unset), into `out`: a
+/// `${ }` or `${| }` there, which bash runs in that child, reads them
+/// ([`super::exec::start_sub`]). A local the child wrote hides a global of
+/// its name.
+pub fn child_vars(sc: &Scratch, out: &mut state::VarMap) {
+	let Some(child) = sc.io.as_ref().and_then(|io| io.child.as_deref()) else {
+		return;
+	};
+	let var = |rec: Option<&Record>| match rec {
+		Some(Record::Var(v)) => Some(v.clone()),
+		_ => None,
+	};
+	match &child.writes {
+		ChildWrites::Root(writes) => {
+			for (key, rec) in writes {
+				if let KeyBuf::Var(name) = key {
+					out.insert(name.clone(), var(rec.as_ref()));
+				}
+			}
+			for (key, rec) in writes {
+				if let KeyBuf::Local { name, .. } = key {
+					out.insert(name.clone(), var(rec.as_ref()));
+				}
+			}
+		},
+		ChildWrites::Forked { image, locals, .. } => {
+			for (name, rec) in image.vars() {
+				out.insert(name.clone(), var(rec));
+			}
+			for (_, name, value) in locals {
+				out.insert(name.clone(), value.clone());
+			}
+		},
+	}
 }
 
 /// Apply redirection list `list` of `unit` for `owner`.

@@ -2748,7 +2748,7 @@ pub fn expanding<T>(
 		r.map(|v| (v, st))
 	};
 	if let Some(shell) = shell {
-		redir::leave_child(k, vp, &mut sc, shell);
+		redir::leave_child(k, vp, cx, &mut sc, shell);
 	}
 	// The slot still holds the empty `Vec` `take` left there (the scratch is
 	// out of its frame meanwhile, nothing else fills it): put the log back
@@ -3159,7 +3159,7 @@ pub fn start_sub(
 				child
 			};
 			if let Some(shell) = shell {
-				redir::leave_child(k, vp, sc, shell);
+				redir::leave_child(k, vp, cx, sc, shell);
 			}
 			k.bang_kin_add(vp.vpid, child.vpid);
 			// With `-e` already off in the parent the child sees it off and
@@ -3192,12 +3192,24 @@ pub fn start_sub(
 		},
 		ComsubForm::NoFork | ComsubForm::Value => {
 			// Its own scope for `local` (marked with an empty function name,
-			// which `FUNCNAME` skips); `${| ;}` has a local `REPLY`.
+			// which `FUNCNAME` skips); `${| ;}` has a local `REPLY`. In a word
+			// of redirections bash makes in a child, bash runs the body in that
+			// child: it reads what the command's earlier words wrote there,
+			// which this scope holds for it, so the shell sees none of it and a
+			// write of one of those names stays in the body.
 			let mut vars = VarMap::default();
+			if k.redirs_in_child {
+				redir::child_vars(sc, &mut vars);
+			}
 			if form == ComsubForm::Value {
 				vars.insert(BString::from("REPLY"), None);
 			}
-			let scope = Scope { vars, positional: None, func: Some(BString::default()), zsh: None };
+			let scope = Scope {
+				vars:       vars.into(),
+				positional: None,
+				func:       Some(BString::default()),
+				zsh:        None,
+			};
 			state::push_scope(&mut k.root, cx.store, vp, scope);
 			// Outside posix mode bash parses `${ ;}` without aliases and
 			// re-parses its re-printed text when it runs, with the aliases

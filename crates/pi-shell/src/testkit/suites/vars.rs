@@ -509,6 +509,43 @@ fn a_forked_commands_redirection_words_share_its_child() {
 	}
 }
 
+/// A `${ }` or `${| }` in a forked command's redirection word reads what
+/// the command's child wrote in its earlier words, as bash's does, which
+/// runs it in that child: two redirections naming their files from one
+/// counter name two files, so neither stream is lost, and the shell still
+/// keeps none of it. The same holds in a subshell, whose vproc keeps its
+/// own state. Goldens from bash 5.3.20.
+#[test]
+fn a_substitution_in_a_forked_commands_redirection_reads_its_child() {
+	let files =
+		"for n in e0 e1 e5 e6 f0 f1 f00 f01 g5 g6 h h10; do [ -e $n ] && printf '%s ' $n; done; echo";
+	for (form, want) in [
+		(
+			"x=0; ( echo out; echo err >&2 ) > f$((x++)) 2> f${ echo $x; }; echo \"x=$x [$(< f0)] \
+			 [$(< f1)]\"",
+			"x=0 [out] [err]\nf0 f1 \n",
+		),
+		(
+			"x=0; ( echo out; echo err >&2 ) > f$((x++)) 2> f${| REPLY=$x; }; echo \"x=$x [$(< f0)] \
+			 [$(< f1)]\"",
+			"x=0 [out] [err]\nf0 f1 \n",
+		),
+		("x=0; nosuch > f$((x++)) 2> f${ echo $x; }; echo \"x=$x\"", "x=0\nf0 f1 \n"),
+		("x=0; nosuch > f$((x++))${ echo $x; } 2> e0; echo \"x=$x\"", "x=0\ne0 f01 \n"),
+		(
+			"f() { local x=5; nosuch 2> e$((x++)) > g${ echo $x; }; echo \"x=$x\"; }; f",
+			"x=5\ne5 g6 \n",
+		),
+		// A subshell's own forked redirections.
+		("( x=0; nosuch 2> e$((x++)) > f$((x++)); echo \"x=$x\" )", "x=0\ne0 f1 \n"),
+		("( f() { local x=5; nosuch 2> e$((x++)) > g$x; echo \"x=$x\"; }; f )", "x=5\ne5 g6 \n"),
+		("( x=0; nosuch > f$((x++)) 2> f${ echo $x; }; echo \"x=$x\" )", "x=0\nf0 f1 \n"),
+	] {
+		let src = format!("{form}; {files}");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+}
+
 /// Whether `unset` or an array assignment removed `RANDOM`'s special
 /// meaning is imaged with the generator: a shell snapshotted and restored
 /// at every step keeps a plain `RANDOM` plain. Goldens from bash 5.3.20.
