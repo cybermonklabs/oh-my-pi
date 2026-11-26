@@ -684,14 +684,15 @@ export class TurnRecovery {
 	 * must not walk `retry.fallbackChains` with the cut-off answer. Any other
 	 * refusal of a continuation (an overload, a server error, a usage limit)
 	 * walks the chain as it would after a stream stall.
-	 * Cleared in `resolveRetry()` and wherever `#retryAttempt` goes back to 0.
+	 * Cleared when the saga ends (`resolveRetry()`, `#takeRetrySaga()`) and wherever `#retryAttempt` goes back to 0.
 	 */
 	#continuingCommittedText = false;
 	#genericAbortStreak = 0;
 	/**
 	 * Selectors a classifier refusal has already moved off in the current retry saga; see the walk
-	 * bound below. Cleared in `resolveRetry()`, which every end of a saga goes through (an answer,
-	 * the exhausted budget, a cancelled wait, an abort), so no turn inherits another turn's walk.
+	 * bound below. Cleared when the saga ends: in `resolveRetry()`, which every end of a saga goes through (an
+	 * answer, the exhausted budget, a cancelled wait, an abort), and which an end that awaits calls as it takes the
+	 * saga (`#takeRetrySaga()`), so no turn inherits another turn's walk and no ending saga clears a newer one's.
 	 */
 	readonly #refusalWalkTried = new Set<string>();
 	/**
@@ -975,16 +976,18 @@ export class TurnRecovery {
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
 		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
-		this.#continuingCommittedText = false;
-		await this.#host.emitSessionEvent({
-			type: "auto_retry_end",
-			success: false,
-			attempt,
-			finalError: message.errorMessage,
-			kind: retryFailureKind(message.errorId),
-		});
-		this.#clearPendingRetryErrors();
+		const saga = this.#takeRetrySaga();
+		try {
+			await this.#host.emitSessionEvent({
+				type: "auto_retry_end",
+				success: false,
+				attempt,
+				finalError: message.errorMessage,
+				kind: retryFailureKind(message.errorId),
+			});
+		} finally {
+			saga.release();
+		}
 	}
 
 	/** Persists an otherwise skipped terminal empty error turn. */
@@ -1336,7 +1339,8 @@ export class TurnRecovery {
 
 	/**
 	 * Resolve the pending retry promise; the saga is over, and so are its
-	 * refusal walk and its continuation of a rate-limited answer.
+	 * refusal walk and its continuation of a rate-limited answer. An end of a
+	 * saga that awaits takes the saga first ({@link #takeRetrySaga}).
 	 */
 	resolveRetry(): void {
 		this.#refusalWalkTried.clear();
@@ -1356,10 +1360,10 @@ export class TurnRecovery {
 	 * Ends a retry saga: records its outcome in the session (the terminal empty
 	 * error turn, the annotations on the attempts it retried), publishes
 	 * `auto_retry_end`, then resolves `retryPromise`. The close takes the saga
-	 * (its attempt count and its pending errors) before its first await: a reply
-	 * that settles while the outcome is written finds no open saga and does not
-	 * close it a second time, and a saga that starts meanwhile keeps its own
-	 * attempt count and errors.
+	 * before its first await ({@link #takeRetrySaga}): a reply that settles while
+	 * the outcome is written finds no open saga and does not close it a second
+	 * time, and a saga that starts meanwhile keeps its own attempt count, errors,
+	 * refusal walk and retry promise.
 	 * Publishing and releasing run in `finally`, so a session write that throws
 	 * (a full disk, an unwritable transcript) still ends the saga before its
 	 * error propagates. Left pending, `retryPromise` keeps the in-flight prompt
@@ -1370,14 +1374,12 @@ export class TurnRecovery {
 		end: RetrySagaEnd,
 		record: { terminalTurn?: AssistantMessage; retryErrors?: RetryErrorCompletion },
 	): Promise<void> {
-		this.#retryAttempt = 0;
-		const pendingRetryErrors = this.#pendingRetryErrors;
-		this.#clearPendingRetryErrors();
+		const saga = this.#takeRetrySaga();
 		let retryErrors: RetryErrorUpdate[] | undefined;
 		try {
 			if (record.terminalTurn) await this.persistTerminalEmptyErrorTurn(record.terminalTurn);
 			if (record.retryErrors) {
-				retryErrors = await this.#markPendingRetryErrors(pendingRetryErrors, record.retryErrors);
+				retryErrors = await this.#markPendingRetryErrors(saga.pendingRetryErrors, record.retryErrors);
 			}
 		} finally {
 			try {
@@ -1387,9 +1389,37 @@ export class TurnRecovery {
 					...(retryErrors ? { retryErrors } : {}),
 				});
 			} finally {
-				this.resolveRetry();
+				saga.release();
 			}
 		}
+	}
+
+	/**
+	 * Takes the current retry saga for an end that awaits (a close that writes the
+	 * saga's outcome, a cancelled wait that records the stop, the publishing of
+	 * `auto_retry_end`), before its first await: sets the attempt count to 0,
+	 * takes the pending errors, clears the refusal walk and detaches the retry
+	 * promise. `release` resolves that promise once the end is done. A reply that
+	 * settles meanwhile finds no open saga, and a saga that starts meanwhile makes
+	 * a promise, a walk and an attempt count of its own, which this end neither
+	 * resolves nor clears.
+	 */
+	#takeRetrySaga(): { pendingRetryErrors: PendingRetryError[]; release: () => void } {
+		this.#retryAttempt = 0;
+		const pendingRetryErrors = this.#pendingRetryErrors;
+		this.#clearPendingRetryErrors();
+		const promise = this.#retryPromise;
+		const resolve = this.#retryResolve;
+		// Detached first, so resolveRetry() clears only the walk.
+		this.#retryResolve = undefined;
+		this.resolveRetry();
+		return {
+			pendingRetryErrors,
+			release: () => {
+				resolve?.();
+				if (this.#retryPromise === promise) this.#retryPromise = undefined;
+			},
+		};
 	}
 
 	#clearPendingRetryErrors(): void {
@@ -1641,15 +1671,18 @@ export class TurnRecovery {
 				provider: assistantMessage.provider,
 				outputTokens,
 			});
-			await this.#host.emitSessionEvent({
-				type: "auto_retry_end",
-				success: false,
-				attempt: this.#retryAttempt > 0 ? this.#retryAttempt : attempts,
-				finalError,
-			});
-			this.#clearPendingRetryErrors();
-			this.#retryAttempt = 0;
-			this.resolveRetry();
+			const attempt = this.#retryAttempt > 0 ? this.#retryAttempt : attempts;
+			const saga = this.#takeRetrySaga();
+			try {
+				await this.#host.emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt,
+					finalError,
+				});
+			} finally {
+				saga.release();
+			}
 			// A turn with no actionable output carries no transcript value, while its
 			// provider usage can anchor the next prompt at the full failed-request size
 			// and re-trigger compaction at the same boundary. Remove every capped
@@ -3644,7 +3677,7 @@ export class TurnRecovery {
 			// it. A throw anywhere else on the way, such as recording an attempt
 			// before its retry is scheduled, leaves the saga open, and nothing
 			// else would close it.
-			if (this.#retryPromise) {
+			if (this.#retryResolve) {
 				await this.#closeRetrySaga(
 					{ success: false, attempt: this.#retryAttempt, finalError: message.errorMessage },
 					{},
@@ -3677,9 +3710,10 @@ export class TurnRecovery {
 				? this.#genericAbortStreak + 1
 				: 0;
 
-		// Create retry promise on first attempt so waitForRetry() can await it
-		// Ensure only one promise exists (avoid orphaned promises from concurrent calls)
-		if (!this.#retryPromise) {
+		// The saga's promise, made on its first attempt, which waitForRetry() awaits. One
+		// promise per saga: a saga whose end is still running has given up its resolver
+		// (#takeRetrySaga), so a saga that starts meanwhile makes a promise of its own.
+		if (!this.#retryResolve) {
 			const { promise, resolve } = Promise.withResolvers<void>();
 			this.#retryPromise = promise;
 			this.#retryResolve = resolve;
@@ -4217,9 +4251,10 @@ export class TurnRecovery {
 					},
 					{ terminalTurn: message },
 				);
+			} else {
+				this.#retryAttempt = 0;
+				this.resolveRetry();
 			}
-			this.#retryAttempt = 0;
-			this.resolveRetry();
 			return false;
 		}
 		// A fallback switch was the whole reason we entered (Fast→base degrade or
@@ -4243,9 +4278,10 @@ export class TurnRecovery {
 					},
 					{ terminalTurn: message },
 				);
+			} else {
+				this.#retryAttempt = 0;
+				this.resolveRetry();
 			}
-			this.#retryAttempt = 0;
-			this.resolveRetry();
 			return false;
 		}
 
@@ -4385,19 +4421,21 @@ export class TurnRecovery {
 	 */
 	async #endCancelledRetry(failed: AssistantMessage, stopped: boolean): Promise<false> {
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
 		this.#retryAbortController = undefined;
+		const saga = this.#takeRetrySaga();
 		try {
 			if (stopped) await this.#recordStoppedTurn(failed);
 		} finally {
-			await this.#host.emitSessionEvent({
-				type: "auto_retry_end",
-				success: false,
-				attempt,
-				finalError: RETRY_CANCELLED,
-			});
-			this.#clearPendingRetryErrors();
-			this.resolveRetry();
+			try {
+				await this.#host.emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt,
+					finalError: RETRY_CANCELLED,
+				});
+			} finally {
+				saga.release();
+			}
 		}
 		return false;
 	}

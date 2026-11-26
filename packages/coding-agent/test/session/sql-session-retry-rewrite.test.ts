@@ -6,7 +6,7 @@
  * until the tool's result is recorded, then lets it land. The second case also fails, once, the next read of the
  * whole transcript after that, as a read of a transcript of a few hundred megabytes can fail while the store is busy.
  *
- * Two properties, each its own test:
+ * Three properties, each its own test:
  * - Storage: no failure reported, no write refused, and every entry stored, those of the turn after the retry and of
  *   the next turn included. Where the close rewrote the whole transcript, the tool's result was refused ("Session
  *   file changed before rewrite": the store's index already held the rewrite's body), and when the landed rewrite was
@@ -16,6 +16,8 @@
  * - The retry closes once: the retry's close writes its outcome (an `entry_patch` record), and the test holds that
  *   write open until the reply after the tool has settled. While the close waited on its write, the retry stayed
  *   open, and that reply closed it a second time and wrote the outcome again.
+ * - A retry that starts while an earlier retry's close writes keeps its own retry promise and refusal walk: the
+ *   earlier close's end resolved the promise the new retry had reused, and cleared the new retry's walk.
  *
  * SQLite always; PostgreSQL and MySQL when `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a database.
  */
@@ -272,7 +274,9 @@ async function retriedTurnAndNext(
 	authStorage.keys.setRuntime("anthropic", "test-key");
 	if (options.holdOutcome) {
 		// The session reports each reply's usage right after it settles the reply (closing the retry that reply
-		// ends); the report of the reply after the tool lets the held outcome write go on.
+		// ends): in AgentSession's message_end handler, `authStorage.usage.observe` is the statement after
+		// `await onAssistantSettledSuccessfully(...)`, and no session event follows the settle. The report of the
+		// reply after the tool lets the held outcome write go on.
 		const usage = authStorage.usage;
 		const observe = usage.observe.bind(usage);
 		usage.observe = entry => {
@@ -360,6 +364,154 @@ async function retriedTurnAndNext(
 	};
 }
 
+/** A classifier refusal, as Anthropic's stop details report one. */
+const REFUSAL = {
+	content: [],
+	stopReason: "error" as const,
+	stopDetails: { type: "refusal" as const, category: "cyber", explanation: "Declined." },
+	errorMessage: "Refusal (cyber): Declined.",
+};
+
+/**
+ * The first retry (a 429 on model A, which walks to B) closes while its outcome write is held; meanwhile the reply
+ * after the tool is a classifier refusal on B, which starts a second retry that walks to C. The held write goes on
+ * once the second retry has started, so the first close ends inside the second retry. C refuses too, and its chain
+ * names only B, which the second retry already left: the walk ends there unless the first close cleared it.
+ */
+async function secondRetryDuringClose(db: LeaseDb): Promise<{
+	observed: Record<string, unknown>;
+	manager: SessionManager;
+	session: AgentSession;
+}> {
+	const storage = await db.open({ lease: STILL });
+	const file = path.join(db.dir.path(), "sessions", "-project-", `2026-11-25T00-00-00-000Z_${ID}.jsonl`);
+	await storage.writeText(file, transcript(ID, "the session's earlier turn"));
+	await storage.drain();
+	const manager = await SessionManager.open(file, path.dirname(file), storage, { suppressBreadcrumb: true });
+	await manager.claimOpenedSession();
+
+	const modelA = getBundledModel("anthropic", "claude-sonnet-4-5");
+	const modelB = getBundledModel("openai", "gpt-4o-mini");
+	const modelC = getBundledModel("openai", "gpt-4o");
+	if (!modelA || !modelB || !modelC) throw new Error("Expected the bundled test models");
+	const selectorA = `${modelA.provider}/${modelA.id}`;
+	const selectorB = `${modelB.provider}/${modelB.id}`;
+	const selectorC = `${modelC.provider}/${modelC.id}`;
+
+	// The first retry's outcome write stays pending, once it has started, until the second retry has started.
+	let armed = false;
+	let outcomeWrites = 0;
+	const outcomePending = Promise.withResolvers<void>();
+	const secondRetryStarted = Promise.withResolvers<void>();
+	const firstRetryEnded = Promise.withResolvers<void>();
+	const patchEntries = manager.patchEntries.bind(manager);
+	manager.patchEntries = (async (patches: Parameters<SessionManager["patchEntries"]>[0]) => {
+		const writing = patchEntries(patches);
+		const outcome = armed && patches.some(patch => patch.message?.retryRecovery !== undefined);
+		if (outcome && outcomeWrites++ === 0) {
+			outcomePending.resolve();
+			await secondRetryStarted.promise;
+		}
+		await writing;
+	}) as SessionManager["patchEntries"];
+
+	let toolRuns = 0;
+	const readTool: AgentTool = {
+		name: "read",
+		label: "Read",
+		description: "Reads a file",
+		parameters: type({ "path?": "string" }),
+		execute: async () => {
+			// The tool goes on once the first retry's outcome write is pending; it does not wait for the retry to end.
+			if (toolRuns++ === 0) await outcomePending.promise;
+			return { content: [{ type: "text" as const, text: TOOL_RESULT }], details: {} };
+		},
+	};
+
+	const requested: string[] = [];
+	let retryStarts = 0;
+	let retryingAfterFirstEnded: boolean | undefined;
+	const mock = createMockModel({
+		handler: async () => {
+			const n = requested.length;
+			const model = requested[n - 1];
+			if (n === 1) return { throw: RATE_LIMITED };
+			if (n === 2) return { content: [{ type: "toolCall", name: "read", arguments: { path: "notes.txt" } }] };
+			if (retryStarts >= 2 && retryingAfterFirstEnded === undefined) {
+				// The second retry's first request. The first close has published its end; its `finally` runs
+				// before the next turn of the event loop, and then the second retry must still be open.
+				await firstRetryEnded.promise;
+				const nextTurn = Promise.withResolvers<void>();
+				setImmediate(nextTurn.resolve);
+				await nextTurn.promise;
+				retryingAfterFirstEnded = session.isRetrying;
+			}
+			// B answers only once C was asked, which a walk that kept its record of B never does.
+			if (model === selectorB && requested.includes(selectorC)) {
+				return { content: [FIRST_ANSWER], stopReason: "stop" };
+			}
+			return REFUSAL;
+		},
+	});
+	const authStorage = createInMemoryAuthStorage();
+	authStorage.keys.setRuntime("anthropic", "test-key");
+	authStorage.keys.setRuntime("openai", "test-key");
+	const settings = Settings.isolated({
+		"compaction.enabled": false,
+		"retry.enabled": true,
+		"retry.baseDelayMs": 5,
+		"retry.maxDelayMs": 2_000,
+		"retry.maxRetries": 1,
+		"retry.fallbackChains": { [selectorA]: [selectorB], [selectorB]: [selectorC], [selectorC]: [selectorB] },
+		"features.unexpectedStopDetection": "none",
+		"todo.enabled": false,
+	});
+	settings.setModelRole("default", selectorA);
+	const session = new AgentSession({
+		agent: new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: modelA, systemPrompt: ["Test"], tools: [readTool], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				return mock.stream(model, context, options);
+			},
+			convertToLlm,
+		}),
+		sessionManager: manager,
+		settings,
+		modelRegistry: new ModelRegistry(authStorage),
+	});
+	mockSchedulerWaitWithClock();
+	const retries: boolean[] = [];
+	session.subscribe((event: AgentSessionEvent) => {
+		if (event.type === "auto_retry_start") {
+			armed = true;
+			if (++retryStarts === 2) secondRetryStarted.resolve();
+		}
+		if (event.type === "auto_retry_end") {
+			retries.push(event.success);
+			firstRetryEnded.resolve();
+		}
+	});
+
+	await session.prompt("Read notes.txt, then answer.");
+	// Let a held write go (a build where the second retry never started), so nothing waits on the hold.
+	secondRetryStarted.resolve();
+	await session.waitForIdle();
+	await manager.flush().catch(() => undefined);
+	const firstC = requested.indexOf(selectorC);
+	return {
+		manager,
+		session,
+		observed: {
+			outcomeHeld: outcomeWrites > 0 && retryStarts >= 2,
+			retryingAfterFirstEnded,
+			askedBAfterC: firstC >= 0 && requested.slice(firstC + 1).includes(selectorB),
+			retried: retries,
+		},
+	};
+}
+
 /** The two cases: the landed rewrite reads back, or its next whole read fails once. */
 const CASES = [
 	{ when: "the retry's close publishes while the next tool's result is recorded", failReadBack: false },
@@ -407,6 +559,22 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 				retried: [true],
 				outcomeWrites: 1,
 				outcomeHeld: "held until the next reply settled",
+			});
+			await session.dispose();
+			await manager.close();
+		}, 120_000);
+
+		// If this regresses, the first close's end resolves the retry promise of the retry that started during its
+		// write (the session stops reporting a retry while that retry runs), or clears that retry's refusal walk (the
+		// walk asks a model it already left, B -> C -> B).
+		it("keeps a retry that starts while an earlier retry's close writes open, with its refusal walk", async () => {
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const { observed, manager, session } = await secondRetryDuringClose(db);
+			expect(observed).toEqual({
+				outcomeHeld: true,
+				retryingAfterFirstEnded: true,
+				askedBAfterC: false,
+				retried: [true, false],
 			});
 			await session.dispose();
 			await manager.close();
