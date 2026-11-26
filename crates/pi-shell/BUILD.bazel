@@ -129,9 +129,9 @@ rust_test(
 # them, each with every module under a directory of tests/ (cargo makes a
 # test target of a tests/*.rs file or a tests/<dir>/main.rs, and pi-shell has
 # no such main.rs), such as tests/*_support and tests/zsh_oracle. Many start
-# obash: cargo names its path in CARGO_BIN_EXE_obash, and so does this target,
+# obash: cargo names its path in CARGO_BIN_EXE_obash, and so do these targets,
 # relative to the runfiles root; the support modules make it absolute.
-# The suite and the target below share these values. Bazel refuses **kwargs in
+# The suite and the targets below share these values. Bazel refuses **kwargs in
 # a BUILD file, so each passes them by name.
 _INTEGRATION_SHARED_SRCS = glob(
     ["tests/*/**/*.rs"],
@@ -158,6 +158,33 @@ _INTEGRATION_DEPS = all_crate_deps(normal = True) + all_crate_deps(normal_dev = 
     "//crates/pi-vfs",
 ]
 
+# Tests of the suite that take timeout "long" (900 s), each from a target of
+# its own below. As for pi-shell_test, the gate runs a target's one libtest
+# process under .github/sami/libtest-bound.py, which fails a test that has
+# made no progress within its 240 s bound by name, so Bazel's timeout must be
+# at least max(2L, L + 240) s, for L the target's longest correct gate run.
+# Measured in sami-checks runs 45722788663, 45722800123, 45722811150,
+# 45736348441, 45762739480, 45762775961, 45777174937 and 45821320132
+# (2026-11-26), each needs more than the 300 s of a medium test:
+#
+#   tests/<file>.rs   correct runs   L (its run)             max(2L, L + 240)
+#   zsh_comp_y03      7              284.9 s (45762775961)   569.8 s
+#   zsh_comp_y02      8              211.2 s (45821320132)   451.2 s
+#   zle_vi_pty        7              204.7 s (45722788663)   444.7 s
+#   zle_widgets_pty   8              107.7 s (45722788663)   347.7 s
+#   zsh_comp_y01      8               99.3 s (45762775961)   339.3 s
+#   zle_hist_pty      8               76.9 s (45722811150)   316.9 s
+#
+# zsh_comp_y03 also reached the 300 s timeout in run 45821320132.
+_LONG_INTEGRATION_TESTS = [
+    "zsh_comp_y03",
+    "zsh_comp_y02",
+    "zle_vi_pty",
+    "zle_widgets_pty",
+    "zsh_comp_y01",
+    "zle_hist_pty",
+]
+
 rust_test_suite(
     name = "pi-shell_integration_tests",
     srcs = glob(
@@ -165,9 +192,9 @@ rust_test_suite(
         exclude = [
             "tests/minimizer_fixtures.rs",
             "tests/vfs.rs",
-            # Its own target below.
+            # Their own targets below.
             "tests/zsh_computil_args_pty.rs",
-        ],
+        ] + ["tests/" + f + ".rs" for f in _LONG_INTEGRATION_TESTS],
     ),
     aliases = aliases(),
     data = _INTEGRATION_DATA,
@@ -179,20 +206,20 @@ rust_test_suite(
     deps = _INTEGRATION_DEPS,
 )
 
-# tests/zsh_computil_args_pty.rs as the suite above makes a test (the same
-# label and crate name), with timeout "long" (900 s) in place of the 300 s of
-# a medium test. Measured on 2026-11-24, its cargo test binary run alone at
-# --test-threads=4 on 4 dedicated CPUs, at 85936bf7 and e49ef793: 40 runs,
-# 233 to 283 s each, none with an unfinished test. Its slowest tests,
-# y03_arguments_01 to _09, take 62 to 87 s each: each compinit costs obash
-# 1 to 3 s, and they run about 20 each. Under Bazel, on a 4-vCPU GitHub runner
-# that runs 4 test actions at once, the 300 s timeout stopped it with 13 of
-# its 19 tests done (sami-checks run 45351216411), and that runner ran about
-# twice as slow as an idle one: about 570 s, which 900 s exceeds 1.6 times.
-# Only this target is long, so a hang in any other still stops at 300 s.
+# The tests the suite above leaves out, each as the suite makes a test: for
+# tests/<file>.rs, rules_rust's rust_test_suite names it
+# "<suite>_tests/<file>_test" and its crate that name with "-", "/" and "."
+# made "_", so the labels and crate names stay the same.
+#
+# tests/zsh_computil_args_pty.rs takes timeout "eternal" (3,600 s). It took
+# "long" (900 s) on 2026-11-24, when its cargo test binary took 233 to 283 s
+# in 40 runs alone and Bazel's 300 s stopped it (sami-checks run
+# 45351216411). Measured as _LONG_INTEGRATION_TESTS are, in the same eight
+# gate runs, it needs more: of its 8 correct runs, the longest took 480.5 s
+# (run 45762775961), so max(2 x 480.5, 480.5 + 240) = 961.0 s, past "long".
 rust_test(
     name = "pi-shell_integration_tests_tests/zsh_computil_args_pty_test",
-    timeout = "long",
+    timeout = "eternal",
     srcs = ["tests/zsh_computil_args_pty.rs"] + _INTEGRATION_SHARED_SRCS,
     aliases = aliases(),
     crate_name = "pi_shell_integration_tests_tests_zsh_computil_args_pty_test",
@@ -204,6 +231,24 @@ rust_test(
     rustc_flags = _INTEGRATION_RUSTC_FLAGS,
     deps = _INTEGRATION_DEPS,
 )
+
+[
+    rust_test(
+        name = "pi-shell_integration_tests_tests/" + f + "_test",
+        timeout = "long",
+        srcs = ["tests/" + f + ".rs"] + _INTEGRATION_SHARED_SRCS,
+        aliases = aliases(),
+        crate_name = "pi_shell_integration_tests_tests_" + f + "_test",
+        crate_root = "tests/" + f + ".rs",
+        data = _INTEGRATION_DATA,
+        edition = "2024",
+        proc_macro_deps = _INTEGRATION_PROC_MACRO_DEPS,
+        rustc_env = _INTEGRATION_RUSTC_ENV,
+        rustc_flags = _INTEGRATION_RUSTC_FLAGS,
+        deps = _INTEGRATION_DEPS,
+    )
+    for f in _LONG_INTEGRATION_TESTS
+]
 
 # obash's own unit tests (src/bin/obash), which cargo runs as the bin target.
 rust_test(

@@ -25,8 +25,19 @@ rust_library(
     deps = all_crate_deps(normal = True),
 )
 
+# The gate runs this target's one libtest process under
+# .github/sami/libtest-bound.py, which fails a test that has made no progress
+# within its .config/nextest.toml bound (240 s; no override names a
+# grep-searcher test) by name. Bazel's timeout must leave that bound after the
+# longest correct run, and be at least twice that run: the longest of its 8
+# correct runs in sami-checks runs 45722788663, 45722800123, 45722811150,
+# 45736348441, 45762739480, 45762775961, 45777174937 and 45821320132
+# (2026-11-26) took 70.6 s (run 45821320132), so
+# max(2 x 70.6, 70.6 + 240) = 310.6 s: "long" (900 s), not the 300 s of a
+# medium test.
 rust_test(
     name = "grep-searcher_test",
+    timeout = "long",
     crate = ":grep-searcher",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
