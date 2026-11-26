@@ -2816,7 +2816,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				vpid: vp.vpid,
 				umask,
 				sigmask_ign,
-				rlimits: &vp.rlimits,
+				rlimits: vp.rlimits(),
 				lineage: vp.lineage,
 				redirs,
 				ctty: vp
@@ -3995,8 +3995,8 @@ fn push_call(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, callee: Callee, ca
 				return Flow::Discard(1);
 			},
 		}
-	} else if vp.getopts != super::proc::GetoptsState::default() {
-		frame.getopts = Some(Box::new(vp.getopts.clone()));
+	} else if *vp.getopts() != super::proc::GetoptsState::NONE {
+		frame.getopts = Some(Box::new(vp.getopts().clone()));
 	}
 	// A function with the trace attribute (`declare -ft`) inherits the
 	// DEBUG and RETURN traps.

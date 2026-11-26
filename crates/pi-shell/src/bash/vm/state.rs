@@ -3240,15 +3240,15 @@ pub fn sync_root(root: &mut Root, store: &mut dyn StateStore, vp: &Vproc) {
 	{
 		write_jobs(root, store, &vp.jobs);
 	}
-	if vp.getopts != root.synced.getopts {
-		root.synced.getopts.clone_from(&vp.getopts);
-		let rec = (vp.getopts != GetoptsState::default())
-			.then(|| Record::Words(encode_getopts(&vp.getopts)));
+	if *vp.getopts() != root.synced.getopts {
+		root.synced.getopts.clone_from(vp.getopts());
+		let rec =
+			(*vp.getopts() != GetoptsState::NONE).then(|| Record::Words(encode_getopts(vp.getopts())));
 		root.set_record(store, KeyBuf::Misc(MiscKey::Getopts), rec);
 	}
-	if vp.rlimits != root.synced.rlimits {
-		root.synced.rlimits.clone_from(&vp.rlimits);
-		let rec = (!vp.rlimits.is_empty()).then(|| Record::Words(encode_rlimits(&vp.rlimits)));
+	if vp.rlimits() != root.synced.rlimits.as_slice() {
+		root.synced.rlimits = vp.rlimits().to_vec();
+		let rec = (!vp.rlimits().is_empty()).then(|| Record::Words(encode_rlimits(vp.rlimits())));
 		root.set_record(store, KeyBuf::Misc(MiscKey::Rlimits), rec);
 	}
 }
@@ -3333,16 +3333,16 @@ pub fn load_root(
 		comsub: super::proc::Comsub::No,
 		bgp,
 	};
-	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);
-	vp.rlimits = decode_rlimits(&words(store, MiscKey::Rlimits)?);
+	vp.set_getopts(decode_getopts(&words(store, MiscKey::Getopts)?));
+	vp.set_rlimits(decode_rlimits(&words(store, MiscKey::Rlimits)?));
 	root.synced = Synced {
 		status:     vp.status,
 		pipestatus: vp.pipestatus.clone(),
 		last_bg:    vp.last_bg,
 		job_ids:    vp.jobs.list.iter().map(|j| j.id).collect(),
 		job_marks:  (vp.jobs.current, vp.jobs.previous, vp.jobs.chld),
-		getopts:    vp.getopts.clone(),
-		rlimits:    vp.rlimits.clone(),
+		getopts:    vp.getopts().clone(),
+		rlimits:    vp.rlimits().to_vec(),
 	};
 	Ok(())
 }
@@ -4116,8 +4116,8 @@ mod tests {
 			.add(JobId(4), Vpid(1 << 30), "sleep 1 &".into(), false, "/".into());
 		vp.jobs.get_mut(1).unwrap().os_pid = Some(4242);
 		vp.jobs.chld = 2;
-		vp.getopts = GetoptsState { optind: Some("2".into()), next: Some((1, 2)), at: None };
-		vp.rlimits = vec![(Rlimit::Nofile, Some(64), None)];
+		vp.set_getopts(GetoptsState { optind: Some("2".into()), next: Some((1, 2)), at: None });
+		vp.set_rlimits(vec![(Rlimit::Nofile, Some(64), None)]);
 		sync_root(&mut root, &mut store, &vp);
 		let misc = |store: &crate::bash::MemStore, key| store.record(Key::Misc(key)).cloned();
 		assert_eq!(misc(&store, MiscKey::Status), Some(Record::Misc("3".into())));
@@ -4148,16 +4148,16 @@ mod tests {
 		assert_eq!(fresh.pipestatus, vp.pipestatus);
 		assert_eq!(fresh.last_bg, vp.last_bg);
 		assert_eq!(fresh.jobs, vp.jobs);
-		assert_eq!(fresh.getopts, vp.getopts);
-		assert_eq!(fresh.rlimits, vp.rlimits);
+		assert_eq!(fresh.getopts(), vp.getopts());
+		assert_eq!(fresh.rlimits(), vp.rlimits());
 		// Loaded fields count as written: no rewrite.
 		let before = store.clone();
 		sync_root(&mut root2, &mut store, &fresh);
 		assert_eq!(store, before);
 		vp.jobs.remove(1);
 		vp.jobs.chld = 0;
-		vp.getopts = GetoptsState::default();
-		vp.rlimits.clear();
+		vp.set_getopts(GetoptsState::NONE);
+		vp.set_rlimits(Vec::new());
 		sync_root(&mut root, &mut store, &vp);
 		assert_eq!(store.record(Key::Job(JobId(4))), None);
 		assert_eq!(misc(&store, MiscKey::JobCurrent), None);

@@ -760,7 +760,7 @@ fn install(
 			// bash moves a `{var}` fd to 10 or above with `F_DUPFD`, which
 			// fails past `ulimit -n`.
 			let limit = vp
-				.rlimits
+				.rlimits()
 				.iter()
 				.find(|(res, ..)| *res == crate::bash::host::Rlimit::Nofile)
 				.and_then(|&(_, soft, _)| soft);
@@ -1422,7 +1422,7 @@ fn zsh_install(
 			let output = r.op == RedirKind::DupOut;
 			let src = if target.as_slice() == b"p" {
 				// The coprocess: `>&p` writes its input, `<&p` reads its output.
-				let Some(co) = vp.coprocs.last() else {
+				let Some(co) = vp.coprocs().last() else {
 					return Err(fail(k, vp, cx, line, zsh_msg("no coprocess".into())));
 				};
 				Some(if output { co.write } else { co.read })
