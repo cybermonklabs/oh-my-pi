@@ -50,7 +50,7 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 	}
 	readonly strict = true;
 	readonly loadMode = "discoverable";
-	readonly summary = "Store important facts in long-term memory";
+	readonly summary = "Record what was said or done, by whom and when, in long-term memory";
 
 	constructor(private readonly session: ToolSession) {}
 
