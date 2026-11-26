@@ -50,7 +50,17 @@ use parking_lot::{Condvar, Mutex};
 /// path: a path that no longer names it leaves the helper waiting too, and a
 /// path that another process points at a new FIFO after the drop opened its
 /// end but before the helper's `open(2)` makes the join wait until that new
-/// FIFO's other end opens.
+/// FIFO's other end opens. The helper's own end is in the process's
+/// descriptor table from its `open(2)` returning until it sees the cancel
+/// and drops it: a process another thread forks in that window gets a copy,
+/// which outlives the drop in the child. For a write-only open (a `>` or
+/// `>>` redirection) that copy is a writer, so the FIFO's next reader can
+/// read end of file when the child ends, as with a killed reader's release
+/// before; the window is the helper's few steps between `open(2)` and its
+/// check. Where `close_range` cannot give the drop's thread a descriptor
+/// table of its own (a kernel or seccomp filter that refuses it), the drop
+/// holds its end on the dropping thread, as before, without an error, and a
+/// process forked meanwhile can copy that end too.
 pub struct FifoOpen<T> {
 	shared: Arc<Shared<T>>,
 	node:   Arc<Node>,
