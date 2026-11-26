@@ -26,7 +26,10 @@
   sc.py changelog LOG EXIT SECS FILES DIFF WRITE_EXIT  `fix-changelogs.ts --check`: each CHANGELOG it would rewrite (changelog.sh)
   sc.py plant WHAT TREE                    the docs, changelog or rustfmt row's control: puts its planted fault in TREE
   sc.py rustfmt-workspaces                 the manifests of the cargo workspaces the rustfmt row checks, one a line
-  sc.py rustfmt UNIT LOG EXIT SECS TREE    one workspace's `cargo fmt --all --check -v`: each place rustfmt would change (rustfmt.sh)
+  sc.py rustfmt UNIT LOG EXIT SECS TREE [BASE_LOG BASE_EXIT BASE_TREE BASE_SHA FORK_DIFF]
+                                           one workspace's `cargo fmt --all --check -v -- -v`, each place sorted by the same
+                                           run at the tree's upstream base, through the fork's diff from it, into
+                                           upstream's own and the fork's (rustfmt.sh)
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
 binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 nor 100, a bun run
@@ -48,6 +51,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 import xml.etree.ElementTree as ET
 
 # The plan. One place: the workflow's matrices come from here, and the summary expects exactly
@@ -1527,7 +1531,8 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                  "0/101), when a passing test printed a skip marker and passed as no other user (even when every "
                  "failure of the unit is known), when a clean clippy crate's planted control was not caught, when the "
                  "platform checks gave its platform no verdict, when cargo fmt listed no target root or rustfmt could "
-                 "not read a file, or when no job (or more than one) reported it; its "
+                 "not read a file, when rustfmt's places could not be sorted by its run at the upstream base, or when "
+                 "no job (or more than one) reported it; its "
                  "row is then UNKNOWN too. A test whose only skip lines are sub-cases the partial-skip list names for "
                  "it, with that entry's witness line in its output, passes and is listed as partial. A self-skip the "
                  "known-failure list names (`skips: `, for that row and user) reads KNOWN; a failure with a `flaky: ` "
@@ -1603,6 +1608,11 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}")
             for f in r.get("baseline_fell", []):
                 details.append(f"- **{title}** `{r['unit']}`: fewer here than in the clippy baseline (a change of the baseline, not a failure): {f}")
+            for f in r.get("upstream_places", []):
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): KNOWN `{f}`: upstream's own: the same run fails at "
+                               f"the upstream base `{r.get('upstream_base', '')[:12]}` on lines the fork left as they are")
+            for f in r.get("unsorted_places", []):
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNSORTED `{f}`")
             for f in r.get("self_skipped", []):
                 why = r.get("known_skips", {}).get(f)
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`" + (f": KNOWN ({why})" if why else ""))
@@ -2064,19 +2074,203 @@ def selftest():
            " fn x() {}\n-fn sc_rustfmt_plant(){}\n+fn sc_rustfmt_plant() {}\n")
     crlf = f"Incorrect newline style in {ftree}/sdk/w/src/c.rs\n"
 
-    def fm(text, ex, unit="sdk/w/Cargo.toml"):
-        r = parse_rustfmt(unit, write("fmt.log", text), str(ex), 2, ftree)
+    # The same check at the upstream base runs under a tree of its own and names each file it checked
+    # (rustfmt's own -v); the fork's diff from the base maps the tree's lines to the base's. By default
+    # the base checked only lib.rs, which it has, and is formatted, and the fork changed nothing: a
+    # place in a file the base lacks is then a fork change's.
+    fbase = os.path.join(d, "fbase")
+    os.makedirs(os.path.join(fbase, "sdk", "w", "src"))
+    for m in ("Cargo.toml", "sdk/w/Cargo.toml", "sdk/w/src/lib.rs"):
+        open(os.path.join(fbase, m), "w").write("[workspace]\n")
+    bsha = "e" * 40
+    at_b = "the upstream base `eeeeeeeeeeee`"
+
+    def checked(*paths, config=None):
+        """rustfmt's -v for the files it checked, after the config it took for their target root."""
+        used = f"Using rustfmt config file {ftree}/{config} for {ftree}/sdk/w/src/lib.rs\n" if config else ""
+        return used + "".join(f"Formatting {ftree}/{p}\n" for p in paths)
+
+    def diff(*files, only=False):
+        """rustfmt.sh's record of the fork's changes: a `### <path>` line and its hunk headers per file.
+        Every file the tests use is in it, with no hunk (the fork left it) unless given here; ONLY
+        names just the files given."""
+        given = dict(files)
+        every = list(given) if only else ["sdk/w/src/a.rs", "sdk/w/src/lib.rs", "sdk/w/src/c.rs", "sdk/w/tests/t.rs"]
+        return "".join(f"### {p}\n" + "".join(f"{h}\n" for h in given.get(p, [])) for p in every)
+
+    def fr(text, ex, unit="sdk/w/Cargo.toml", base=roots + checked("sdk/w/src/lib.rs"), bex="0", sha=bsha, fork=None, nofork=False):
+        fork_path = os.path.join(d, "absent.diff") if nofork else write("fork.diff", diff() if fork is None else fork)
+        return parse_rustfmt(unit, write("fmt.log", text), str(ex), 2, ftree, write("fmt-base.log", base.replace(ftree, fbase)),
+                             str(bex), fbase, sha, fork_path)
+
+    def fm(text, ex, unit="sdk/w/Cargo.toml", **kw):
+        r = fr(text, ex, unit, **kw)
         return r["status"], r["failures"], r["note"]
+
+    def told(fork, upstream, unsorted=0):
+        return (f"{fork} a fork change's, {upstream} upstream's own (the same run fails at {at_b} on the lines the fork left as "
+                "they are)" + (f", {unsorted} unsorted" if unsorted else ""))
 
     wrapped = "sdk/w/src/a.rs:477: // A comment past eighty columns, which 'rustfmt' wraps."
     check("rustfmt: formatted", fm(roots, 0), ("PASS", [], "2 target root(s), formatted"))
+    check("rustfmt: formatted needs no read of the upstream base",
+          parse_rustfmt("sdk/w/Cargo.toml", write("fmt.log", roots), "0", 2, ftree)["status"], "PASS")
     check("rustfmt: each place named by path, line and the first line it rewrites, once",
           fm(roots + wrap + added + blank + wrap, 1),
           ("FAIL", [wrapped, "sdk/w/tests/t.rs:10: adds a blank line", "sdk/w/tests/t.rs:21: removes a blank line"],
-           "3 place(s) in 2 file(s) rustfmt would change, from 2 target root(s)"))
+           f"3 place(s) in 2 file(s) rustfmt would change, from 2 target root(s): {told(3, 0)}"))
+    # The line mapping: a hunk that adds lines shifts the lines after it; one that only removes
+    # lines sits after its line; a changed or added line maps to none.
+    check("rustfmt: the fork's lines mapped to the base's",
+          [base_line([(10, 0, 11, 176), (300, 3, 475, 0), (500, 1, 673, 2)], n) for n in (10, 11, 186, 187, 475, 476, 672, 673, 675)],
+          [10, None, None, 11, 299, 303, 499, None, 501])
+    open(os.path.join(fbase, "sdk", "w", "src", "a.rs"), "w").write("x\n")
+    shifted = diff(("sdk/w/src/a.rs", ["@@ -10,0 +11,176 @@"]))
+    moved = wrap.replace("a.rs:476:", "a.rs:300:")
+    at_base = roots + checked("sdk/w/src/a.rs", "sdk/w/src/lib.rs") + moved
+    r = fr(roots + wrap, 1, base=at_base, bex="1", fork=shifted)
+    check("rustfmt: a run on lines the fork left as they are, failing at their line in the base, is upstream's own (KNOWN)",
+          (r["status"], r["failures"], r["upstream_places"], r["upstream_base"], r["note"]),
+          ("KNOWN", [], [wrapped], bsha, f"1 place(s) in 1 file(s) rustfmt would change, from 2 target root(s), each upstream's "
+                                         f"own: the same run fails at {at_b} on the lines the fork left as they are"))
+    r = fr(roots + wrap + two, 1, base=at_base, bex="1", fork=shifted)
+    check("rustfmt: a run the base does not fail on lines the fork left is a fork change's (its config or context), beside upstream's own",
+          (r["status"], r["failures"], r["upstream_places"]),
+          ("FAIL", ["sdk/w/src/lib.rs:1: // a comment past eighty columns", "sdk/w/src/lib.rs:3: fn sc_rustfmt_plant(){}"], [wrapped]))
+    copy = wrap.replace("a.rs:476:", "a.rs:899:")
+    r = fr(roots + wrap + copy, 1, base=at_base, bex="1", fork=diff(("sdk/w/src/a.rs", ["@@ -10,0 +11,176 @@", "@@ -700,0 +877,30 @@"])))
+    check("rustfmt: a copy of upstream's run on lines the fork added is a fork change's",
+          (r["status"], r["failures"], r["upstream_places"]),
+          ("FAIL", ["sdk/w/src/a.rs:900: // A comment past eighty columns, which 'rustfmt' wraps."], [wrapped]))
+    # The fork fixed upstream's run (base line 477) and wrote the same run on a line it added: no
+    # count may let the second hide behind the first.
+    r = fr(roots + wrap.replace("a.rs:476:", "a.rs:599:"), 1, base=roots + checked("sdk/w/src/a.rs") + wrap, bex="1",
+           fork=diff(("sdk/w/src/a.rs", ["@@ -477 +477,2 @@", "@@ -598,0 +600 @@"])))
+    check("rustfmt: upstream's run fixed and the same run written on a fork line is a fork change's",
+          (r["status"], r["failures"], r["upstream_places"]),
+          ("FAIL", ["sdk/w/src/a.rs:600: // A comment past eighty columns, which 'rustfmt' wraps."], []))
+    r = fr(roots + wrap, 1, base=roots + checked("sdk/w/src/a.rs") + wrap.replace("eighty columns", "eighty-one columns"), bex="1")
+    check("rustfmt: another run at the base's line is no match", (r["status"], r["upstream_places"]), ("FAIL", []))
+    r = fr(roots + wrap, 1, base=roots + checked("sdk/w/src/lib.rs"), bex="0")
+    check("rustfmt: a place in a file the base has but did not check is unsorted (UNKNOWN)",
+          (r["status"], r["failures"], r["unsorted_places"], r["note"]),
+          ("UNKNOWN", [], [wrapped + " (the upstream base's run did not check sdk/w/src/a.rs)"],
+           f"1 place(s) in 1 file(s) rustfmt would change, from 2 target root(s): {told(0, 0, 1)}"))
+    r = fr(roots + wrap + two, 1, base=roots + checked("sdk/w/src/lib.rs"), bex="0")
+    check("rustfmt: a fork change's place fails beside an unsorted one, each listed",
+          (r["status"], len(r["failures"]), len(r["unsorted_places"])), ("FAIL", 2, 1))
+    # Forbidden line endings: upstream's own only when each line that has them maps to a base line
+    # that has them, each side's lines read by the newline_style of the config its run reported for
+    # the file's target root (none here: rustfmt's default, Auto).
+    def crlf_run(config=None):
+        return roots + checked("sdk/w/src/c.rs", config=config) + crlf
+
+    for root, body in ((ftree, b"a\nb\r\nc\n"), (fbase, b"a\nb\r\nc\n")):
+        os.makedirs(os.path.join(root, "sdk", "w", "src"), exist_ok=True)
+        open(os.path.join(root, "sdk", "w", "src", "c.rs"), "wb").write(body)
+    at_base_crlf = crlf_run()
+    r = fr(crlf_run(), 1, base=at_base_crlf, bex="1")
+    check("rustfmt: forbidden line endings on lines the fork left, as at the base", (r["status"], r["upstream_places"]),
+          ("KNOWN", ["sdk/w/src/c.rs: newline style (rustfmt.toml's newline_style)"]))
+    open(os.path.join(fbase, "sdk", "w", "src", "c.rs"), "wb").write(b"a\r\nb\nc\n")
+    r = fr(crlf_run(), 1, base=at_base_crlf, bex="1", fork=diff(("sdk/w/src/c.rs", ["@@ -1 +1 @@", "@@ -2 +2 @@"])))
+    check("rustfmt: upstream's forbidden line ending fixed and another written: a fork change's", (r["status"], r["failures"]),
+          ("FAIL", ["sdk/w/src/c.rs: newline style (rustfmt.toml's newline_style)"]))
+    r = fr(roots + crlf, 1, base=at_base_crlf, bex="1")
+    check("rustfmt: line endings in a file the tree's run named no config for are unsorted", (r["status"], r["unsorted_places"]),
+          ("UNKNOWN", ["sdk/w/src/c.rs: newline style (rustfmt.toml's newline_style) (the tree's run named no config for "
+                       "sdk/w/src/c.rs)"]))
+    # The fork's newline_style differs from the base's: the tree's forbidden endings are read by the
+    # tree's style (Windows: a bare LF), the base's by its own (Auto: the first line's).
+    open(os.path.join(ftree, "sdk", "w", "rustfmt.toml"), "w").write('newline_style = "Windows"\n')
+    open(os.path.join(ftree, "sdk", "w", "src", "c.rs"), "wb").write(b"a\nb\n")
+    open(os.path.join(fbase, "sdk", "w", "src", "c.rs"), "wb").write(b"a\r\nb\n")
+    r = fr(crlf_run("sdk/w/rustfmt.toml"), 1, base=at_base_crlf, bex="1", fork=diff(("sdk/w/src/c.rs", ["@@ -1 +1 @@"])))
+    check("rustfmt: line endings the fork's newline_style forbids on a line it changed: a fork change's", (r["status"], r["failures"]),
+          ("FAIL", ["sdk/w/src/c.rs: newline style (rustfmt.toml's newline_style)"]))
+    os.remove(os.path.join(ftree, "sdk", "w", "rustfmt.toml"))
+    # The source is unchanged and mixed; the base's config says Unix, so its forbidden line is the
+    # CR LF one (2). A fork config read as TOML (single-quoted) saying Windows forbids the bare LF one
+    # (1), which the base allows: a fork change's. A config nearer the file than the one rustfmt
+    # reported for its target root is not rustfmt's, so the root's Unix reads as the base's: KNOWN.
+    open(os.path.join(fbase, "sdk", "w", "rustfmt.toml"), "w").write('newline_style = "Unix"\n')
+    for root in (ftree, fbase):
+        open(os.path.join(root, "sdk", "w", "src", "c.rs"), "wb").write(b"a\nb\r\n")
+    unix_base = crlf_run("sdk/w/rustfmt.toml")
+    open(os.path.join(ftree, "sdk", "w", "rustfmt.toml"), "w").write("newline_style = 'Windows'\n")
+    r = fr(crlf_run("sdk/w/rustfmt.toml"), 1, base=unix_base, bex="1")
+    check("rustfmt: the fork's newline_style read as TOML (single-quoted): a fork change's", (r["status"], r["failures"]),
+          ("FAIL", ["sdk/w/src/c.rs: newline style (rustfmt.toml's newline_style)"]))
+    open(os.path.join(ftree, "sdk", "w", "rustfmt.toml"), "w").write('newline_style = "Unix"\n')
+    open(os.path.join(ftree, "sdk", "w", "src", "rustfmt.toml"), "w").write('newline_style = "Windows"\n')
+    r = fr(crlf_run("sdk/w/rustfmt.toml"), 1, base=unix_base, bex="1")
+    check("rustfmt: the config rustfmt reported for the target root, not one nearer the file", (r["status"], r["upstream_places"]),
+          ("KNOWN", ["sdk/w/src/c.rs: newline style (rustfmt.toml's newline_style)"]))
+    os.remove(os.path.join(ftree, "sdk", "w", "src", "rustfmt.toml"))
+    open(os.path.join(ftree, "sdk", "w", "rustfmt.toml"), "w").write("newline_style = Windows\n")
+    r = fr(crlf_run("sdk/w/rustfmt.toml"), 1, base=unix_base, bex="1")
+    check("rustfmt: a config that is no TOML leaves line endings unsorted",
+          (r["status"], len(r["unsorted_places"]), "rustfmt.toml could not be read as TOML" in "".join(r["unsorted_places"])),
+          ("UNKNOWN", 1, True))
+    os.remove(os.path.join(ftree, "sdk", "w", "rustfmt.toml"))
+    os.remove(os.path.join(fbase, "sdk", "w", "rustfmt.toml"))
+    open(os.path.join(ftree, "sdk", "w", "src", "c.rs"), "wb").write(b"a\nb\n")
+    r = fr(crlf_run(), 1, base=at_base_crlf, bex="1")
+    check("rustfmt: a line-ending report with no line of the file it can place is unsorted",
+          (r["status"], r["unsorted_places"]),
+          ("UNKNOWN", ["sdk/w/src/c.rs: newline style (rustfmt.toml's newline_style) (no line of sdk/w/src/c.rs has an ending its "
+                       "newline_style (Auto) forbids)"]))
+    two_runs = (f"rustfmt --edition 2024 -v --check {ftree}/sdk/w/src/lib.rs\nUsing rustfmt config file {ftree}/x.toml for "
+                f"{ftree}/sdk/w/src/lib.rs\nFormatting {ftree}/sdk/w/src/a.rs\nrustfmt --edition 2021 -v --check {ftree}/sdk/w/src/b.rs\n"
+                f"Formatting {ftree}/sdk/w/src/b.rs\n")
+    check("rustfmt: each file's config is its own invocation's, none when that one named none",
+          read_rustfmt(write("fmt-two.log", two_runs), ftree)[3], {"sdk/w/src/a.rs": f"{ftree}/x.toml", "sdk/w/src/b.rs": None})
+    open(os.path.join(ftree, "sdk", "w", "src", "c.rs"), "wb").write(b"a\nb\r\nc\n")
+    r = fr(roots + wrap, 1, base=at_base, bex="1", fork=diff(("sdk/w/src/lib.rs", []), only=True))
+    check("rustfmt: a place in a file the fork's diff does not name is unsorted",
+          (r["status"], r["unsorted_places"]), ("UNKNOWN", [wrapped + " (no diff of sdk/w/src/a.rs from the upstream base)"]))
+    # A run the base passes on lines the fork left, in a file with items rustfmt skips there: the
+    # base's check did not read those items, so the run is unsorted, not the fork's.
+    open(os.path.join(fbase, "sdk", "w", "src", "a.rs"), "w").write("#[rustfmt::skip]\nfn x() {}\n")
+    r = fr(roots + wrap, 1, base=roots + checked("sdk/w/src/a.rs"), bex="0")
+    check("rustfmt: a run on unchanged lines in a base file with skipped items is unsorted",
+          (r["status"], r["unsorted_places"]),
+          ("UNKNOWN", [wrapped + " (the upstream base's sdk/w/src/a.rs has items rustfmt skips, which its check did not read)"]))
+    open(os.path.join(fbase, "sdk", "w", "src", "a.rs"), "w").write("x\n")
+    open(os.path.join(fbase, "sdk", "w", "src", "a.rs"), "w").write("#[rustfmt :: skip]\nfn x() {}\n")
+    r = fr(roots + wrap, 1, base=roots + checked("sdk/w/src/a.rs"), bex="0")
+    check("rustfmt: a skip attribute spelled with spaces is a skip", r["status"], "UNKNOWN")
+    open(os.path.join(fbase, "sdk", "w", "src", "a.rs"), "w").write("x\n")
+    marked = "".join(line + ("⏎" if line[:1] in " -+" else "") + "\n" for line in wrap.splitlines())
+    check("rustfmt: the ⏎ rustfmt's -v ends each diff line with is read away",
+          fm(roots + marked, 1, base=roots + checked("sdk/w/src/a.rs"))[1], [wrapped])
+    check("rustfmt: a workspace the upstream base lacks", fm(roots + wrap, 1, bex="absent"),
+          ("FAIL", [wrapped], f"1 place(s) in 1 file(s) rustfmt would change, from 2 target root(s), each a fork change's: "
+                              f"{at_b} has no sdk/w/Cargo.toml"))
+    unsorted = f"1 place(s) in 1 file(s) rustfmt would change, from 2 target root(s), none sorted into upstream's own or the fork's: "
+    r = parse_rustfmt("sdk/w/Cargo.toml", write("fmt.log", roots + wrap), "1", 2, ftree,
+                      write("setup.log", "Cloning\nfatal: unable to access 'https://github.com/can1357/oh-my-pi.git/'\n"), "-", "-", "-")
+    check("rustfmt: places with no upstream base set up", (r["status"], r["failures"], len(r["unsorted_places"]), r["note"]),
+          ("UNKNOWN", [], 1, unsorted + "the upstream base could not be read (it was not set up: fatal: unable to access "
+                                       "'https://github.com/can1357/oh-my-pi.git/')"))
+    for label, base, bex, nofork, why in (
+            ("killed", at_base, "137", False, "exit 137: the time bound or a signal ended it"),
+            ("an error line", roots + checked("sdk/w/src/a.rs") + unclosed, "1", False,
+             "rustfmt could not read every file there: error: this file contains an unclosed delimiter"),
+            ("no target root", "", "0", False, "cargo fmt listed no target root there"),
+            ("no file named as checked", roots, "0", False, "its run named no file it checked (rustfmt's own -v)"),
+            ("exit 1 with no place", roots + checked("sdk/w/src/a.rs"), "1", False, "exit 1 with 0 place(s) there"),
+            ("exit 0 with a place", at_base, "0", False, "exit 0 with 1 place(s) there"),
+            ("no diff of the fork's changes", at_base, "1", True, "no diff of the fork's changes from it")):
+        check(f"rustfmt: the upstream base's run, {label}", fm(roots + wrap, 1, base=base, bex=bex, nofork=nofork),
+              ("UNKNOWN", [], unsorted + f"{at_b} could not be read ({why})"))
+    r = parse_rustfmt("sdk/w/Cargo.toml", write("fmt.log", roots + wrap), "1", 2, ftree, os.path.join(d, "absent-base.log"), "1", fbase, bsha,
+                      write("fork.diff", ""))
+    check("rustfmt: no log of the upstream base's run", r["note"], unsorted + f"{at_b} could not be read (no log)")
     check("rustfmt: each run of changed lines in one block is a place, at its own line", fm(roots + two, 1)[:2],
           ("FAIL", ["sdk/w/src/lib.rs:1: // a comment past eighty columns", "sdk/w/src/lib.rs:3: fn sc_rustfmt_plant(){}"]))
-    check("rustfmt: a file with forbidden line endings", fm(roots + crlf, 1)[:2],
+    check("rustfmt: a file with forbidden line endings",
+          fm(roots + checked("sdk/w/src/c.rs") + crlf, 1, base=roots + checked("sdk/w/src/c.rs"))[:2],
           ("FAIL", ["sdk/w/src/c.rs: newline style (rustfmt.toml's newline_style)"]))
     check("rustfmt: a module rustfmt could not resolve, beside places it read", fm(roots + wrap + unresolved, 1),
           ("UNKNOWN", [wrapped], f"rustfmt could not read every file: {unresolved.strip()}; 1 place(s) in 1 file(s) rustfmt would change"))
@@ -3130,6 +3324,17 @@ def selftest():
            rc), (True, 1))
     for u, f in fmt_files.items():
         json.dump(result("rustfmt", u, "runner", "PASS", "0", 1, 2), open(os.path.join(res2, f), "w"))
+    # A workspace whose every place is upstream's own reads KNOWN, the row too, and each place is listed.
+    upstream_place = "sdk/rust/omp-rpc/src/client.rs:479: // Host tool and URI frames were consumed above; only malformed ones get here."
+    json.dump(dict(result("rustfmt", fmt_ws[-1], "runner", "KNOWN", "1", 1, 0, 0), upstream_places=[upstream_place],
+                   upstream_base="9058ab9d229663e229e2867824ba6df6f21e9e59"), open(os.path.join(res2, fmt_files[fmt_ws[-1]]), "w"))
+    rc, out = summary2(rows_env="rustfmt")
+    check("summary: upstream's own rustfmt places read KNOWN, each listed with the base",
+          (f"| rustfmt: cargo fmt --check, per cargo workspace | **KNOWN** | {len(fmt_ws) - 1} / 1 / 0 / 0 |" in out,
+           f"`{fmt_ws[-1]}` (runner): KNOWN `{upstream_place}`: upstream's own: the same run fails at the upstream base `9058ab9d2296` "
+           "on lines the fork left as they are"
+           in out, rc), (True, True, 0))
+    json.dump(result("rustfmt", fmt_ws[-1], "runner", "PASS", "0", 1, 2), open(os.path.join(res2, fmt_files[fmt_ws[-1]]), "w"))
     rc, out = summary2(drop=[f for f in docs_i.values() if os.path.exists(os.path.join(res2, f))] + log_i)
     check("summary: no docs or changelog result", ("| rustdoc intra-doc links (pi-shell) | **UNKNOWN** | 0 / 0 / 0 / 2 |" in out,
           "| CHANGELOG format (fix-changelogs --check) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
@@ -3400,6 +3605,13 @@ RUSTFMT_WORKSPACES_LIST = os.path.join(os.path.dirname(os.path.abspath(__file__)
 RUSTFMT_TARGET = re.compile(r'^\[[^\]]+\] "(.+)"$')
 RUSTFMT_DIFF = re.compile(r"^Diff in (.+):(\d+):$")
 RUSTFMT_NEWLINE = re.compile(r"^Incorrect newline style in (.+)$")
+# rustfmt's own -v (`cargo fmt ... -- -v`) names each file it formats or checks: a file its
+# rustfmt.toml ignores, or a module under #[rustfmt::skip], is never named.
+RUSTFMT_FORMATTING = re.compile(r"^Formatting (.+)$")
+# rustfmt's -v names the config it takes for each target root before it checks that root and its
+# modules, which take the root's config, whatever config files lie nearer them.
+RUSTFMT_CONFIG = re.compile(r"^Using rustfmt config file (.+) for (.+)$")
+DIFF_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 def rustfmt_workspaces(path=RUSTFMT_WORKSPACES_LIST):
@@ -3416,27 +3628,19 @@ def rustfmt_workspaces(path=RUSTFMT_WORKSPACES_LIST):
     return out
 
 
-def parse_rustfmt(unit, log, exit_code, secs, tree, row="rustfmt"):
-    """One workspace's `cargo fmt --all --check -v` (LOG: its stdout and stderr), run in the directory
-    of the manifest UNIT under TREE. FAIL names each place rustfmt would change as `path:line: the
-    first line it rewrites` (each run of changed lines in a block is a place, at its line in the
-    file as it is), and each file with forbidden line endings as `path: newline style`, the path
-    from the tree's root. PASS needs exit 0, a target root listed and no place. Anything else is
-    UNKNOWN: a manifest the tree lacks, no log, the time bound or a signal, no target root listed
-    (nothing was checked), an error line (a file or crate rustfmt could not read, so its places are
-    unread; those it read are still named), or an exit that disagrees with the places (0 with some,
-    1 with none). Backticks become ' so that a line reads as one code span."""
-    def r(status, passed=0, failures=(), note=""):
-        return result(row, unit, "runner", status, exit_code, secs, passed, len(failures), failures=failures, note=note)
-
-    if not os.path.isfile(os.path.join(tree, unit)):
-        return r("UNKNOWN", note=f"the tree has no {unit}")
+def read_rustfmt(log, tree):
+    """What one `cargo fmt --all --check -v -- -v` log, run under TREE, says: (target roots, places,
+    error lines, the files rustfmt checked, the log's lines), or None when there is no log. A place is
+    a dict: `name`, `path:line: the first line it rewrites` (each run of changed lines in a block is a
+    place, at its line in the file as it is) or `path: newline style`, with the path from TREE's root
+    and backticks as ' so that it reads as one code span; `path`; and, for a run, `line` (its first
+    line in the file as it is), `removed` (how many of the file's lines it rewrites) and `run` (its
+    `-` and `+` lines)."""
     try:
-        lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
+        # rustfmt's -v marks the end of each line of a diff with ⏎; a line is read without it.
+        lines = [x[:-1] if x.endswith("⏎") else x for x in open(log, encoding="utf-8", errors="replace").read().splitlines()]
     except OSError:
-        return r("UNKNOWN", note="no log")
-    if stopped(exit_code):
-        return r("UNKNOWN", note=f"exit {exit_code}: the time bound or a signal ended it")
+        return None
     prefix = tree.rstrip("/") + "/"
 
     def rel(p):
@@ -3452,23 +3656,32 @@ def parse_rustfmt(unit, log, exit_code, secs, tree, row="rustfmt"):
         new = next((b[1:].strip() for b in run if b.startswith("+") and b[1:].strip()), None)
         return f"adds {new}" if new else "adds a blank line"
 
-    targets, places, errors = [], [], []
+    # checked: {each file rustfmt checked: the config file it took for that file's target root, or
+    # None when it named none (rustfmt's defaults)}. A new rustfmt invocation starts with none.
+    targets, places, errors, checked, config = [], [], [], {}, None
 
     def add(place):
-        place = place.replace("`", "'")
-        if place not in places:
+        place["name"] = place["name"].replace("`", "'")
+        if all(place["name"] != p["name"] for p in places):
             places.append(place)
 
     for i, line in enumerate(lines):
-        t, d, nl = RUSTFMT_TARGET.match(line), RUSTFMT_DIFF.match(line), RUSTFMT_NEWLINE.match(line)
-        if t:
+        t, d, nl, f = RUSTFMT_TARGET.match(line), RUSTFMT_DIFF.match(line), RUSTFMT_NEWLINE.match(line), RUSTFMT_FORMATTING.match(line)
+        c = RUSTFMT_CONFIG.match(line)
+        if line.startswith("rustfmt "):
+            config = None
+        if c:
+            config = c.group(1)
+        elif t:
             targets.append(rel(t.group(1)))
+        elif f:
+            checked[rel(f.group(1))] = config
         elif d:
             # A block holds every change with fewer than three unchanged lines between them, and its
             # number is the original file's line of its first line: each run of changed lines is a
             # place, at the original line its first removed line had (an added run: the line it
             # goes before). Unchanged and removed lines move the original line on; added ones do not.
-            at, run, start = int(d.group(2)), [], None
+            at, run, start, path = int(d.group(2)), [], None, rel(d.group(1))
             for b in lines[i + 1:] + [""]:
                 if b[:1] in ("-", "+") and not RUSTFMT_DIFF.match(b):
                     start = at if start is None else start
@@ -3476,27 +3689,222 @@ def parse_rustfmt(unit, log, exit_code, secs, tree, row="rustfmt"):
                     at += b[:1] == "-"
                     continue
                 if run:
-                    add(f"{rel(d.group(1))}:{start}: {what(run)[:160]}")
+                    add({"name": f"{path}:{start}: {what(run)[:160]}", "path": path, "line": start,
+                         "removed": sum(b[:1] == "-" for b in run), "run": tuple(run)})
                     run, start = [], None
                 if b[:1] != " " or RUSTFMT_DIFF.match(b):
                     break
                 at += 1
         elif nl:
-            add(f"{rel(nl.group(1))}: newline style (rustfmt.toml's newline_style)")
+            add({"name": f"{rel(nl.group(1))}: newline style (rustfmt.toml's newline_style)", "path": rel(nl.group(1))})
         elif line.startswith(("error", "Error")):
             errors.append(line.strip())
-    files = len({p.split(":", 1)[0] for p in places})
-    found = f"{len(places)} place(s) in {files} file(s) rustfmt would change"
+    return targets, places, errors, checked, lines
+
+
+def read_fork_diff(path):
+    """rustfmt.sh's record of the fork's changes from the upstream base: for each file with places, a
+    `### <path>` line (the path as rustfmt printed it, relative to the tree) and then the hunk headers
+    of `git diff -U0 <base> -- <that file>`. {file: [(base start, base count, tree start, tree
+    count), ...]}, or None when it cannot be read. A file with no hunk is the base's, unchanged; a
+    file it does not name was not read."""
+    lines = read_lines(path)
+    if lines is None:
+        return None
+    out, cur = {}, None
+    for line in lines:
+        h = DIFF_HUNK.match(line)
+        if line.startswith("### "):
+            cur = line[4:]
+            out.setdefault(cur, [])
+        elif h and cur is not None:
+            a, b, c, d = (int(x) if x is not None else 1 for x in h.groups())
+            out[cur].append((a, b, c, d))
+    return out
+
+
+def base_line(hunks, n):
+    """The base's line for line N of the file in the tree, through the fork's hunks of that file;
+    None when the fork changed or added line N."""
+    shift = 0
+    for a, b, c, d in hunks:
+        if d and c <= n < c + d:
+            return None
+        # A hunk ends before line N: one that adds lines ends at its last; one that only removes
+        # lines (count 0) sits after line c, so it is before N when c < N.
+        if (d and c + d <= n) or (not d and c < n):
+            shift += b - d
+    return n + shift
+
+
+# What rustfmt skips in a file its check still names: an item under #[rustfmt::skip] (a path, so
+# `rustfmt :: skip` is the same), or the older cfg_attr spelling, whose lines the check never read.
+RUSTFMT_SKIP = re.compile(rb"rustfmt\s*::\s*skip|rustfmt_skip")
+
+
+def newline_violations(root, path, config):
+    """The lines of ROOT/PATH whose ending its newline_style forbids, with the style. The style is the
+    one in CONFIG, the config file rustfmt reported for the file's target root, read as TOML; Auto
+    when CONFIG is None or does not set it. Unix and Native (this runner is Linux) forbid CR LF,
+    Windows forbids a bare LF, and Auto forbids an ending other than the file's first. (None, why)
+    when the file or its config cannot be read."""
+    try:
+        lines = open(os.path.join(root, path), "rb").read().split(b"\n")[:-1]
+    except OSError:
+        return None, f"{path} could not be read"
+    style = "Auto"
+    if config is not None:
+        try:
+            style = tomllib.loads(open(config, encoding="utf-8").read()).get("newline_style", "Auto")
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+            return None, f"{config} could not be read as TOML: {e}"
+    crlf = [line.endswith(b"\r") for line in lines]
+    if style in ("Unix", "Native"):
+        bad = [i for i, c in enumerate(crlf, 1) if c]
+    elif style == "Windows":
+        bad = [i for i, c in enumerate(crlf, 1) if not c]
+    elif style == "Auto":
+        bad = [i for i, c in enumerate(crlf, 1) if crlf and c != crlf[0]]
+    else:
+        return None, f"newline_style {style!r} is no style the row reads"
+    return set(bad), style
+
+
+def sort_rustfmt_places(places, base_places, checked, fork, tree, base_tree, tree_checked):
+    """Each place of the tree as upstream's own, the fork's, or unsorted, with the reason for an
+    unsorted one: ([upstream's], [the fork's], [(place, why)]). A place in a file the base lacks is
+    the fork's. Elsewhere its file must be one the base's run checked (CHECKED) and one the fork's
+    diff names (FORK), or it is unsorted. A run is upstream's own when every line it rewrites is a
+    line of the base the fork left as it is, and the base has the same run at the line they map to;
+    a run on a line the fork changed or added is the fork's, and so is one on unchanged lines the
+    base does not fail (a fork change elsewhere, as in rustfmt.toml, brought it), unless the base's
+    file has items rustfmt skips, which its check did not read: that run is unsorted. Forbidden line
+    endings are upstream's own when the base fails them in that file and each line of the tree whose
+    ending the tree's newline_style forbids maps to a line of the base whose ending the base's
+    forbids, each side's style from the config its run reported for the file (CHECKED and
+    TREE_CHECKED); a report with no such line in the tree is unsorted."""
+    at_base = {(p["path"], p["line"]): p["run"] for p in base_places if "run" in p}
+    newline_at_base = {p["path"] for p in base_places if "run" not in p}
+    upstream, mine, unsorted = [], [], []
+    for p in places:
+        path = p["path"]
+        if not os.path.exists(os.path.join(base_tree, path)):
+            mine.append(p["name"])
+            continue
+        if path not in checked:
+            unsorted.append((p["name"], f"the upstream base's run did not check {path}"))
+            continue
+        if path not in fork:
+            unsorted.append((p["name"], f"no diff of {path} from the upstream base"))
+            continue
+        hunks = fork[path]
+        if "run" not in p:
+            if path not in tree_checked:
+                unsorted.append((p["name"], f"the tree's run named no config for {path}"))
+                continue
+            (here, style), (there, base_why) = newline_violations(tree, path, tree_checked[path]), newline_violations(base_tree, path, checked[path])
+            if here is None or there is None:
+                unsorted.append((p["name"], style if here is None else f"at the upstream base: {base_why}"))
+            elif not here:
+                unsorted.append((p["name"], f"no line of {path} has an ending its newline_style ({style}) forbids"))
+            elif path in newline_at_base and all(base_line(hunks, n) in there for n in here):
+                upstream.append(p["name"])
+            else:
+                mine.append(p["name"])
+            continue
+        rewritten = [p["line"] + k for k in range(max(p["removed"], 1))]
+        mapped = [base_line(hunks, n) for n in rewritten]
+        if None in mapped or mapped != list(range(mapped[0], mapped[0] + len(mapped))):
+            mine.append(p["name"])
+        elif at_base.get((path, mapped[0])) == p["run"]:
+            upstream.append(p["name"])
+        elif RUSTFMT_SKIP.search(open(os.path.join(base_tree, path), "rb").read()):
+            unsorted.append((p["name"], f"the upstream base's {path} has items rustfmt skips, which its check did not read"))
+        else:
+            mine.append(p["name"])
+    return upstream, mine, unsorted
+
+
+def parse_rustfmt(unit, log, exit_code, secs, tree, base_log="-", base_exit="-", base_tree="-", base_sha="-", fork_diff="-",
+                  row="rustfmt"):
+    """One workspace's `cargo fmt --all --check -v -- -v` (LOG: its stdout and stderr), run in the
+    directory of the manifest UNIT under TREE, against the same run at the tree's upstream base
+    (BASE_LOG and BASE_EXIT, run under BASE_TREE, the merge base BASE_SHA of the tree and upstream's
+    main; BASE_EXIT `absent` when the base has no UNIT, `-` when the base could not be set up,
+    BASE_LOG then the setup's log) and the fork's changes from the base (FORK_DIFF, `git diff -U0`
+    of the files with places). Each place rustfmt would change (read_rustfmt) is upstream's own,
+    the fork's or unsorted (sort_rustfmt_places). FAIL names each place of the fork's, and lists the
+    others; KNOWN is a unit whose every place is upstream's own, each listed (upstream_places). PASS
+    needs exit 0, a target root listed and no place; it reads no base. Anything else is UNKNOWN: a
+    manifest the tree lacks, no log, the time bound or a signal, no target root listed (nothing was
+    checked), an error line (a file or crate rustfmt could not read, so its places are unread; those
+    it read are still named), an exit that disagrees with the places (0 with some, 1 with none),
+    places with no clean read of the base or of the fork's diff to sort them by, or a place the base
+    did not check."""
+    def r(status, passed=0, failures=(), note="", upstream=(), unsorted=()):
+        res = result(row, unit, "runner", status, exit_code, secs, passed, len(failures), failures=failures, note=note)
+        res["upstream_places"] = list(upstream)
+        res["unsorted_places"] = [f"{n} ({why})".replace("`", "'") for n, why in unsorted]
+        res["upstream_base"] = "" if base_sha == "-" else base_sha
+        return res
+
+    if not os.path.isfile(os.path.join(tree, unit)):
+        return r("UNKNOWN", note=f"the tree has no {unit}")
+    got = read_rustfmt(log, tree)
+    if got is None:
+        return r("UNKNOWN", note="no log")
+    if stopped(exit_code):
+        return r("UNKNOWN", note=f"exit {exit_code}: the time bound or a signal ended it")
+    targets, places, errors, tree_checked, lines = got
+    names = [p["name"] for p in places]
+    found = f"{len(places)} place(s) in {len({p['path'] for p in places})} file(s) rustfmt would change"
     if errors:
-        return r("UNKNOWN", failures=places, note=f"rustfmt could not read every file: {errors[0][:300]}" + (f"; {found}" if places else ""))
+        return r("UNKNOWN", failures=names, note=f"rustfmt could not read every file: {errors[0][:300]}" + (f"; {found}" if places else ""))
     if not targets:
         said = next((line.strip() for line in lines if line.strip()), "no output")
         return r("UNKNOWN", note=f"exit {exit_code}, and cargo fmt listed no target root, so it checked nothing: {said[:300]}")
     if exit_code == "0" and not places:
         return r("PASS", len(targets), note=f"{len(targets)} target root(s), formatted")
-    if exit_code == "1" and places:
-        return r("FAIL", failures=places, note=f"{found}, from {len(targets)} target root(s)")
-    return r("UNKNOWN", failures=places, note=f"exit {exit_code} with {found}")
+    if exit_code != "1" or not places:
+        return r("UNKNOWN", failures=names, note=f"exit {exit_code} with {found}")
+    # Each place is upstream's own or a fork change's, by the same run at the upstream base.
+    at = "the upstream base" + ("" if base_sha == "-" else f" `{base_sha[:12]}`")
+    found += f", from {len(targets)} target root(s)"
+    if base_exit == "absent":
+        return r("FAIL", failures=names, note=f"{found}, each a fork change's: {at} has no {unit}")
+    why, bgot, fork = None, None, None
+    if base_exit == "-":
+        said = [line.strip() for line in read_lines(base_log) or () if line.strip()]
+        why = "it was not set up: " + (said[-1][:200] if said else "no log")
+    else:
+        bgot = read_rustfmt(base_log, base_tree)
+        fork = read_fork_diff(fork_diff)
+        if bgot is None:
+            why = "no log"
+        elif stopped(base_exit):
+            why = f"exit {base_exit}: the time bound or a signal ended it"
+        elif bgot[2]:
+            why = f"rustfmt could not read every file there: {bgot[2][0][:200]}"
+        elif not bgot[0]:
+            why = "cargo fmt listed no target root there"
+        elif not bgot[3]:
+            why = "its run named no file it checked (rustfmt's own -v)"
+        elif (base_exit, bool(bgot[1])) not in (("0", False), ("1", True)):
+            why = f"exit {base_exit} with {len(bgot[1])} place(s) there"
+        elif fork is None:
+            why = "no diff of the fork's changes from it"
+    if why:
+        return r("UNKNOWN", unsorted=[(n, f"{at} could not be read: {why}") for n in names],
+                 note=f"{found}, none sorted into upstream's own or the fork's: {at} could not be read ({why})")
+    upstream, mine, unsorted = sort_rustfmt_places(places, bgot[1], bgot[3], fork, tree, base_tree, tree_checked)
+    told = f"{len(mine)} a fork change's, {len(upstream)} upstream's own (the same run fails at {at} on the lines the fork left as they are)"
+    if unsorted:
+        told += f", {len(unsorted)} unsorted"
+    if mine:
+        return r("FAIL", failures=mine, upstream=upstream, unsorted=unsorted, note=f"{found}: {told}")
+    if unsorted:
+        return r("UNKNOWN", upstream=upstream, unsorted=unsorted, note=f"{found}: {told}")
+    return r("KNOWN", upstream=upstream, note=f"{found}, each upstream's own: the same run fails at {at} on the lines the fork left as they are")
 
 
 def rustfmt_plant_target(meta, tree):

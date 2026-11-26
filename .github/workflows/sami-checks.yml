@@ -66,7 +66,10 @@
 #     each one .github/sami/rust-test-cargo-workspaces.txt lists (sdk/rust/omp-rpc), one unit per
 #     workspace, each place rustfmt would change named by path and line (.github/sami-checks/
 #     rustfmt.sh). rustfmt reads the rustfmt.toml nearest each file, so those workspaces take the
-#     root's, as a developer's cargo fmt there does.
+#     root's, as a developer's cargo fmt there does. A place on lines the fork left as they are,
+#     whose run fails the same check at the tree's upstream base (its merge base with upstream's
+#     main, fetched in the job), is upstream's own and reads KNOWN; a place a fork change brought
+#     reads FAIL; one in a file the base's check did not read stays UNKNOWN.
 #   - under gVisor (sami-checks-gvisor.yml): the pi-shell set (and so the one-process lib) and
 #     pi-builtins again, from the same archive, in a runsc container, as uid 1000 and as root.
 # The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
@@ -919,8 +922,11 @@ jobs:
           retention-days: 14
 
   rustfmt:
-    # cargo fmt --check in each cargo workspace the gate builds (rustfmt.sh), on the tree's toolchain.
-    # A formatter only: no build and no code of the tree runs, so it needs no cache.
+    # cargo fmt --check in each cargo workspace the gate builds (rustfmt.sh), on the tree's toolchain,
+    # and, for a workspace with places, again at the tree's upstream base (the merge base with
+    # upstream's main, which rustfmt.sh fetches), so that upstream's own places read KNOWN. The
+    # checkout holds the fork's whole history without blobs, for that merge base. A formatter only:
+    # no build and no code of the tree runs, so it needs no cache.
     name: rustfmt
     needs: plan
     if: contains(fromJSON(needs.plan.outputs.jobs), 'rustfmt')
@@ -939,6 +945,8 @@ jobs:
           path: tree
           ref: ${{ needs.plan.outputs.commit }}
           persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
       - name: Toolchain (the tree's rust-toolchain.toml channel, minimal profile, rustfmt)
         run: |
           ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SC_TREE/rust-toolchain.toml" | head -n 1)
