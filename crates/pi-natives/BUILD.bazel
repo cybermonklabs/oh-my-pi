@@ -225,8 +225,19 @@ rust_test(
     rustc_env_files = _DARWIN_RUSTC_ENV_FILES,
 )
 
+# The gate runs this target's one libtest process under
+# .github/sami/libtest-bound.py, which fails a test that has made no progress
+# within its .config/nextest.toml bound (240 s; no override names a pi-natives
+# test) by name. Bazel's timeout must leave that bound after the longest
+# correct run, and be at least twice that run: the longest of its 11 correct
+# runs in sami-checks runs 45722788663, 45722800123, 45722811150,
+# 45736348441, 45762739480, 45762775961, 45777174937 and 45821320132
+# (2026-11-26) took 193.5 s (run 45821320132), so
+# max(2 x 193.5, 193.5 + 240) = 433.5 s: "long" (900 s), not the 300 s of a
+# medium test.
 rust_test(
     name = "pi_natives_test",
+    timeout = "long",
     crate = ":pi_natives",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),

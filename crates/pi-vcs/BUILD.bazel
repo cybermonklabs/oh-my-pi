@@ -26,17 +26,51 @@ rust_test(
     deps = all_crate_deps(normal_dev = True),
 )
 
-# Integration tests: one rust_test per tests/*.rs, as cargo builds them.
+# Integration tests: one rust_test per tests/*.rs, as cargo builds them. The
+# suite and the target below share these values. Bazel refuses **kwargs in a
+# BUILD file, so each passes them by name.
+_INTEGRATION_PROC_MACRO_DEPS = all_crate_deps(proc_macro = True) + all_crate_deps(proc_macro_dev = True)
+
+_INTEGRATION_DEPS = all_crate_deps(normal = True) + all_crate_deps(normal_dev = True) + [
+    ":pi-vcs",
+    "//crates/pi-iso",
+]
+
 rust_test_suite(
     name = "pi-vcs_integration_tests",
-    srcs = glob(["tests/*.rs"]),
+    srcs = glob(
+        ["tests/*.rs"],
+        # Its own target below.
+        exclude = ["tests/worktree_interrupt.rs"],
+    ),
     aliases = aliases(),
     edition = "2024",
-    proc_macro_deps = all_crate_deps(proc_macro = True) + all_crate_deps(proc_macro_dev = True),
-    deps = all_crate_deps(normal = True) + all_crate_deps(normal_dev = True) + [
-        ":pi-vcs",
-        "//crates/pi-iso",
-    ],
+    proc_macro_deps = _INTEGRATION_PROC_MACRO_DEPS,
+    deps = _INTEGRATION_DEPS,
+)
+
+# tests/worktree_interrupt.rs as the suite above makes a test: rules_rust's
+# rust_test_suite names the test of tests/<file>.rs "<suite>_tests/<file>_test"
+# and its crate that name with "-", "/" and "." made "_", so its label and
+# crate name stay the same. It takes timeout "long" (900 s). The gate runs its
+# one libtest process under .github/sami/libtest-bound.py, which fails a test
+# that has made no progress within its .config/nextest.toml bound (240 s; no
+# override names a pi-vcs test) by name. Bazel's timeout must leave that bound
+# after the longest correct run, and be at least twice that run: the longest
+# of its 8 correct runs in sami-checks runs 45722788663, 45722800123,
+# 45722811150, 45736348441, 45762739480, 45762775961, 45777174937 and
+# 45821320132 (2026-11-26) took 61.3 s (run 45722788663), so
+# max(2 x 61.3, 61.3 + 240) = 301.3 s: "long", not the 300 s of a medium test.
+rust_test(
+    name = "pi-vcs_integration_tests_tests/worktree_interrupt_test",
+    timeout = "long",
+    srcs = ["tests/worktree_interrupt.rs"],
+    aliases = aliases(),
+    crate_name = "pi_vcs_integration_tests_tests_worktree_interrupt_test",
+    crate_root = "tests/worktree_interrupt.rs",
+    edition = "2024",
+    proc_macro_deps = _INTEGRATION_PROC_MACRO_DEPS,
+    deps = _INTEGRATION_DEPS,
 )
 
 rust_doc_test(
