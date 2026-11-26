@@ -1102,19 +1102,47 @@ mod tests {
 		assert_eq!(err.code, 5);
 	}
 
+	/// A cancel while the client waits for the daemon's greeting ends the
+	/// handshake with the signal exit, and promptly: the server half never
+	/// writes, so only the cancel ends the wait.
 	#[test]
 	fn cancellation_during_greeting_maps_to_signal() {
 		let cancel = Arc::new(AtomicBool::new(false));
-		let (mut conn, _server) = local_pair(Arc::clone(&cancel));
+		let (mut conn, server) = local_pair(Arc::clone(&cancel));
+		// The server half's writer stays open, so the client's read sees no
+		// end of file.
+		let Connection { reader: mut from_client, writer: _to_client, .. } = server;
 		let fs = pi_vfs::BlockingFs::native();
 		let args = [OsString::from("mod")];
 		let flag = Arc::clone(&cancel);
-		std::thread::spawn(move || {
-			std::thread::sleep(Duration::from_millis(100));
+		// Cancel once the client has sent its own greeting, so it waits for the
+		// server's: a cancel raised before it sends fails its write instead.
+		let canceller = std::thread::spawn(move || {
+			let mut byte = [0u8; 1];
+			while byte != *b"\n" {
+				from_client.read_exact(&mut byte).expect("the client's greeting");
+			}
+			let cancelled_at = Instant::now();
 			flag.store(true, Ordering::Relaxed);
+			(cancelled_at, from_client)
 		});
 		let (logger, ..) = test_logger();
 		let err = daemon_handshake(&mut conn, &base_cfg(&args, &fs), &logger).unwrap_err();
+		let ended = Instant::now();
+		// A client that sent no greeting ends the canceller's read here.
+		drop(conn);
+		let (cancelled_at, _from_client) = canceller.join().unwrap();
 		assert_eq!(err.code, crate::rsync::exit::RERR_SIGNAL);
+		// Within 10 s of the cancel: the test runner's per-test bound fails a
+		// wait that never ends, not one that ends a minute late. Measured from
+		// the cancel to the handshake's return, idle and beside 64 busy loops,
+		// on gVisor and runc, as root and as uid 1000, each test alone (30
+		// runs per case) and in the whole test binary: at most 3.4 s. 10 s is
+		// more than twice that.
+		let took = ended.saturating_duration_since(cancelled_at);
+		assert!(
+			took < Duration::from_secs(10),
+			"the greeting's wait ended {took:?} after the cancel, past 10 s"
+		);
 	}
 }

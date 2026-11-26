@@ -1654,17 +1654,31 @@ mod tests {
 				spawn_shell(&child_env(dir.path()), &base_cfg(&rsh, &logger), Arc::clone(&cancel))
 					.unwrap();
 			let flag = Arc::clone(&cancel);
-			std::thread::spawn(move || {
+			let canceller = std::thread::spawn(move || {
 				std::thread::sleep(Duration::from_millis(150));
+				let cancelled_at = Instant::now();
 				flag.store(true, Ordering::Relaxed);
+				cancelled_at
 			});
 			// The read ends with the cancel's error (a shell left to run to
 			// its end would give end of file instead), and `finish` returns it
-			// once it killed and reaped the shell.
+			// once it killed and reaped the shell. Both within 10 s of the
+			// cancel: the test runner's per-test bound fails a shell that is
+			// never killed, not one killed a minute late. Measured from the
+			// cancel to `finish`'s return, idle and beside 64 busy loops, on
+			// gVisor and runc, as root and as uid 1000, each test alone (30
+			// runs per case) and in the whole test binary: at most 1.6 s. 10 s
+			// is more than six times that.
 			let mut buf = [0u8; 1];
 			let err = conn.reader.read(&mut buf).unwrap_err();
 			assert_eq!(RsyncError::from_io(&err, 12).code, RERR_SIGNAL);
 			assert_eq!(conn.finish().unwrap_err().code, RERR_SIGNAL);
+			let ended = Instant::now();
+			let took = ended.saturating_duration_since(canceller.join().unwrap());
+			assert!(
+				took < Duration::from_secs(10),
+				"the read ended and the shell was killed {took:?} after the cancel, past 10 s"
+			);
 		}
 	}
 }

@@ -1681,23 +1681,36 @@ async fn uutils_head_stdin_read_is_cancellable() {
 	let params = TestStdio::null().stdin(&reader);
 	drop(reader);
 	let token = CancellationToken::new();
-	let cancel = token.clone();
+	let limit = Duration::from_secs(10);
 
-	let canceller = tokio::spawn(async move {
-		time::sleep(Duration::from_millis(150)).await;
-		token.cancel();
-	});
+	let run = session.run_test_with("head -n 1000000", &params, token.clone());
+	tokio::pin!(run);
 	// The pipe's writer stays open, so only the cancel can end `head`.
-	let result = session
-		.run_test_with("head -n 1000000", &params, cancel)
-		.await;
-	let _ = canceller.await;
-
-	let exec = result.expect("run");
-	// Core contract: the return proves the read unblocked and the blocking
-	// task unwound cleanly — no hang, no detached thread. The session cancels a
-	// run with TERM to everything it started and reports the TERM-cancelled run
-	// as 128 + 15.
+	let early = tokio::select! {
+		result = &mut run => Some(result),
+		() = time::sleep(Duration::from_millis(150)) => None,
+	};
+	assert!(early.is_none(), "head ended before the cancel");
+	// Only this limit tells a prompt cancel from a late one: the test
+	// runner's per-test bound fails a run that never ends, not one that ends
+	// a minute late. It counts from the cancel, and the run's end is read
+	// where the run returns, so a late return fails even when it beats the
+	// timeout's own wake-up. Measured from the cancel to the run's end, idle
+	// and beside 64 busy loops, on gVisor and runc, as root and as uid 1000,
+	// each test alone (30 runs per case) and in the whole test binary: at
+	// most 0.25 s. 10 s is 40 times that.
+	let cancelled_at = time::Instant::now();
+	token.cancel();
+	let result = time::timeout(limit, &mut run).await;
+	let took = cancelled_at.elapsed();
+	let exec = result
+		.expect("head must return within 10 s of the cancel, not hang on the open pipe")
+		.expect("run");
+	assert!(took < limit, "head returned {took:?} after the cancel, past the 10 s limit");
+	// Core contract: a prompt return proves the read unblocked and the
+	// blocking task unwound cleanly — no hang, no detached thread. The
+	// session cancels a run with TERM to everything it started and reports
+	// the TERM-cancelled run as 128 + 15.
 	assert!(exec.cancelled, "the run must report that it was cancelled");
 	assert_eq!(exit_code(&exec), 143, "cancelled stdin read should report TERM's status");
 }
