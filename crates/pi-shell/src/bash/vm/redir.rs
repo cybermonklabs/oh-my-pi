@@ -28,8 +28,8 @@ use super::{
 	expand::arith_value,
 	probe::{absolute, dev_fd},
 	proc::{
-		AssignValue, BangStage, DeferPhase, Deferral, FrameKind, Probe, ProbeResult, Saved, Slot,
-		Stage, VarFd, Vproc,
+		AssignValue, BangStage, DeferPhase, Deferral, FrameKind, Probe, ProbeResult, Saved, Scratch,
+		Slot, Stage, VarFd, Vproc,
 	},
 	state::{self, Level},
 };
@@ -40,6 +40,7 @@ use crate::bash::{
 	fs::{File, FileKind, FsOp, FsPoll, Mark, OpenFlags, SeekFrom, StatKind},
 	host::{ChildRedir, OsHandle},
 	ids::Dialect,
+	image::{Image, ImageDiff},
 	ir::{RedirFdIr, RedirIr, RedirTargetIr, SpawnKind, Unit},
 	mem::MemBuf,
 	store::{OptId, VarValue},
@@ -93,17 +94,17 @@ pub enum Owner {
 /// [`apply`] for redirections bash applies in a child after its fork: a
 /// subshell's own, and those of a simple command bash forks for first (an
 /// external, a name not found, `command X`, a null command that
-/// [`null_forks`]). Each expansion pass of their words runs on the child's
-/// copy of the shell's state ([`enter_child`]), so the words' assignments,
-/// arithmetic side effects, `$BASHPID` and `$RANDOM` (drawn from a copy of
-/// the generator, as a fork's: [`Kernel::fork_clock`]) are the child's, and
-/// a lookup of `RANDOM` or `SECONDS` leaves the shell's value cell alone
-/// ([`Kernel::redirs_in_child`]). A command substitution a pass stops for
-/// starts, runs and settles with the shell's own state, as do the fd
-/// install, the `{var}` the shell keeps, the subshell's own-var save and
-/// the pending-break accounting that follow each word ([`Vproc::vpid`], the
-/// deferral and bang paths too). The shell's state is back before it
-/// returns, parked or not. zsh code: [`apply`].
+/// [`null_forks`]). Their words expand in that child ([`enter_child`]): its
+/// assignments, arithmetic side effects, `$BASHPID` and `$RANDOM` (drawn
+/// from the child's generator, a fork's copy: [`Kernel::fork_clock`]) are
+/// the child's, a later word sees what an earlier one wrote, and a lookup
+/// of `RANDOM` or `SECONDS` leaves the shell's value cell alone
+/// ([`Kernel::redirs_in_child`]). A `${ }` or `${| }` the words hold runs
+/// with the shell's own state, as do the fd install, the `{var}` the shell
+/// keeps, the subshell's own-var save and the pending-break accounting that
+/// follow each word ([`Vproc::vpid`], the deferral and bang paths too). The
+/// shell's state is back before it returns, parked or not. zsh code:
+/// [`apply`].
 pub fn apply_in_child(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -122,59 +123,131 @@ pub fn apply_in_child(
 	res
 }
 
+/// The child bash forks for a command's redirections, as one command's
+/// words and their expansion passes share it ([`ScratchIo::child`]): what
+/// the child wrote, laid over the shell's state as it is at each pass, and
+/// the child's generator and clock. Over the shell's current state, not a
+/// copy kept from the first pass: what the shell's own side wrote between
+/// passes (a `{var}` the install assigned, a `${ }` body) still shows.
+///
+/// [`ScratchIo::child`]: super::proc::ScratchIo::child
+pub struct ChildState {
+	/// Global variables and other forked records the child set or removed.
+	image:      ImageDiff,
+	/// Locals the child set: scope index, name, value.
+	locals:     Vec<(usize, BString, Option<state::Var>)>,
+	/// Whether the child assigned a locale variable ([`Vproc::locale_gen`]
+	/// `None`).
+	locale_set: bool,
+	/// The child's `$RANDOM` generator and `$SECONDS` clock.
+	clock:      super::proc::Clock,
+}
+
 /// The shell's own state, set aside while an expansion pass of a word of
-/// redirections bash makes in a child runs on the child's copy
-/// ([`enter_child`]); [`leave_child`] puts it back.
+/// redirections bash makes in a child runs on the child's state
+/// ([`enter_child`]); [`leave_child`] puts it back and keeps what the pass
+/// wrote.
 pub struct ShellState {
-	image:      Option<crate::bash::image::Image>,
-	locale_gen: Option<u64>,
-	scopes:     Vec<state::Scope>,
-	clock:      Option<super::proc::Clock>,
-	pid:        Option<crate::bash::ids::Vpid>,
+	image:       Option<Image>,
+	locale_gen:  Option<u64>,
+	scopes:      Vec<state::Scope>,
+	clock:       Option<super::proc::Clock>,
+	pid:         Option<crate::bash::ids::Vpid>,
+	/// The shell's state the pass's copy was made from, to tell the child's
+	/// writes from it afterwards.
+	base:        Image,
+	base_scopes: Vec<state::Scope>,
+	/// The command's [`ChildState`], its box kept for [`leave_child`].
+	child:       Option<Box<ChildState>>,
 }
 
 /// Start an expansion pass of a word of redirections bash makes in a child
-/// ([`Kernel::redirs_in_child`]): the pass gets a copy-on-write image and
-/// scopes for its assignments and arithmetic, the clock for its
-/// `$RANDOM`/`$SECONDS`, and a reserved pid for `$BASHPID`. Only the pass:
-/// a substitution it stops for and the replay log stay the shell's, so a
-/// pass that parks leaves nothing of the copy behind.
+/// ([`Kernel::redirs_in_child`]) on that child's state: a copy-on-write
+/// image and copied scopes of the shell's state with the child's earlier
+/// writes laid over them ([`ChildState`], kept in `sc`, the scratch of the
+/// command's op), the child's clock, and a reserved pid for `$BASHPID`.
 #[cold]
 #[inline(never)]
-pub fn enter_child(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> ShellState {
-	let (image, locale_gen) = state::fork_image(&k.root, cx.store, vp).unwrap_or_else(|err| {
+pub fn enter_child(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	sc: &mut Scratch,
+) -> ShellState {
+	let (base, base_locale) = state::fork_image(&k.root, cx.store, vp).unwrap_or_else(|err| {
 		k.fail(err);
 		(Default::default(), None)
 	});
-	let scopes = state::copy_scopes(&k.root, cx.store, vp).unwrap_or_else(|err| {
+	let base_scopes = state::copy_scopes(&k.root, cx.store, vp).unwrap_or_else(|err| {
 		k.fail(err);
 		Vec::new()
 	});
+	let mut child = sc.io.as_mut().and_then(|io| io.child.take());
+	let mut scopes = base_scopes.clone();
+	let (image, locale_gen, clock) = match child.as_deref_mut() {
+		Some(c) => {
+			for (i, name, var) in c.locals.drain(..) {
+				if let Some(scope) = scopes.get_mut(i) {
+					scope.vars.insert(name, var);
+				}
+			}
+			let image = Image::patched(base.clone(), std::mem::take(&mut c.image));
+			(image, if c.locale_set { None } else { base_locale }, c.clock)
+		},
+		None => (base.clone(), base_locale, k.fork_clock(vp)),
+	};
 	// The vpid bash's fork would take, peeked without consuming one: a word
 	// that reads `$BASHPID` needs a value distinct from the shell, and a
-	// command with no vpid left still fails to fork as bash's does.
+	// command with no vpid left still fails to fork as bash's does. Peeked
+	// again at each pass: a `$( )` an earlier pass started took the one
+	// peeked then.
 	let child_vpid = crate::bash::ids::Vpid(k.next_vpid);
-	let child_clock = k.fork_clock(vp);
 	ShellState {
-		image:      vp.image.replace(image),
+		image: vp.image.replace(image),
 		locale_gen: std::mem::replace(&mut vp.locale_gen, locale_gen),
-		scopes:     std::mem::replace(&mut vp.scopes, scopes),
-		clock:      vp.clock.replace(child_clock),
-		pid:        k.redirs_child_pid.replace(child_vpid),
+		scopes: std::mem::replace(&mut vp.scopes, scopes),
+		clock: vp.clock.replace(clock),
+		pid: k.redirs_child_pid.replace(child_vpid),
+		base,
+		base_scopes,
+		child,
 	}
 }
 
-/// End the pass [`enter_child`] started: the child's copy is dropped and
-/// the shell's state is back.
+/// End the pass [`enter_child`] started: the shell's state is back, and
+/// what the pass's child wrote is kept in `sc` for the command's next word
+/// or pass (dropped with the op's scratch).
 #[cold]
 #[inline(never)]
-pub fn leave_child(k: &mut Kernel, vp: &mut Vproc, shell: ShellState) {
-	let ShellState { image, locale_gen, scopes, clock, pid } = shell;
+pub fn leave_child(k: &mut Kernel, vp: &mut Vproc, sc: &mut Scratch, shell: ShellState) {
+	let ShellState { image, locale_gen, scopes, clock, pid, base, base_scopes, child } = shell;
 	k.redirs_child_pid = pid;
-	vp.clock = clock;
-	vp.scopes = scopes;
-	vp.locale_gen = locale_gen;
-	vp.image = image;
+	let child_clock = std::mem::replace(&mut vp.clock, clock);
+	let child_scopes = std::mem::replace(&mut vp.scopes, scopes);
+	let child_locale = std::mem::replace(&mut vp.locale_gen, locale_gen);
+	let child_image = std::mem::replace(&mut vp.image, image);
+	let Some(child_clock) = child_clock else {
+		return;
+	};
+	let mut child = child.unwrap_or_else(|| {
+		Box::new(ChildState {
+			image:      ImageDiff::default(),
+			locals:     Vec::new(),
+			locale_set: false,
+			clock:      child_clock,
+		})
+	});
+	child.image = child_image.map_or_default(|image| image.diff(&base));
+	for (i, (mine, theirs)) in child_scopes.iter().zip(&base_scopes).enumerate() {
+		for (name, var) in &mine.vars {
+			if theirs.vars.get(name) != Some(var) {
+				child.locals.push((i, name.clone(), var.clone()));
+			}
+		}
+	}
+	child.locale_set = child_locale.is_none();
+	child.clock = child_clock;
+	sc.io().child = Some(child);
 }
 
 /// Apply redirection list `list` of `unit` for `owner`.

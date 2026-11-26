@@ -1106,6 +1106,8 @@ impl Shell {
 									Box::new(ScratchZsh { more: img.redir_more, ..ScratchZsh::default() })
 								}),
 								var_fds: img.var_fds.map(Box::new),
+								// Not imaged ([`ScratchIo::child`]).
+								child: None,
 							}))
 						};
 						Some(Box::new(Scratch {

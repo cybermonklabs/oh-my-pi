@@ -284,9 +284,9 @@ pub fn exec(
 					let owner = super::redir::Owner::Simple { null_forks };
 					// bash makes the redirections of a command it forks for
 					// first (an external, a name not found, `command X`, a null
-					// command that redirects fd 0 or a `{var}`) in the fork: a
-					// `$RANDOM` they expand draws from the fork's copy of the
-					// generator and leaves the shell's sequence alone
+					// command that redirects fd 0 or a `{var}`) in the fork: what
+					// their words write and the `$RANDOM` they draw are the
+					// fork's, and the shell's state and sequence stay as they were
 					// ([`super::redir::apply_in_child`]).
 					let res = if null_forks || forks_for(k, cx, vp) {
 						super::redir::apply_in_child(k, vp, cx, unit, list, line, owner)

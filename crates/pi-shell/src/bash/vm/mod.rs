@@ -625,17 +625,17 @@ pub struct Kernel {
 	/// Redirections bash makes in a child are being applied (a subshell's
 	/// own, a forked simple command's: [`redir::apply_in_child`]): bash
 	/// expands them in the child, after the fork, so each expansion pass of
-	/// their words runs on a copy of the shell's state, generator and clock
-	/// ([`redir::enter_child`]), and a lookup of the special `RANDOM` or
-	/// `SECONDS` there leaves the shell's value cell alone
+	/// their words runs on that child's state, which the command's words
+	/// share ([`redir::ChildState`]), and a lookup of the special `RANDOM`
+	/// or `SECONDS` there leaves the shell's value cell alone
 	/// ([`dynvars::store_value`]). Set only during that call, which restores
 	/// it before it returns; not imaged.
 	pub redirs_in_child:    bool,
 	/// The virtual pid a `$BASHPID` reads during an expansion pass on that
-	/// copy ([`redir::enter_child`]): bash makes those redirections in the
-	/// command's child, so `$BASHPID` there is the child's, not the shell's.
-	/// The next free vpid, peeked, not taken; set only for the pass, which
-	/// restores it; not imaged.
+	/// child's state ([`redir::enter_child`]): bash makes those redirections
+	/// in the command's child, so `$BASHPID` there is the child's, not the
+	/// shell's. The next free vpid, peeked, not taken; set only for the
+	/// pass, which restores it; not imaged.
 	pub redirs_child_pid:   Option<Vpid>,
 	/// The arithmetic results a builtin's argument evaluates while
 	/// [`builtins::Ctx::arith_once`] runs ([`expand::arith_value`]): taken

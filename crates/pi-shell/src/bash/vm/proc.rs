@@ -1762,12 +1762,17 @@ pub struct ScratchIo {
 	/// ([`Saves::vars`]). No other op takes one. Boxed: few ops have one.
 	#[expect(clippy::box_collection, reason = "8 B where a Vec is 24: the size guard below")]
 	pub var_fds: Option<Box<Vec<VarFd>>>,
+	/// The child bash forks for the op's redirections, which all their
+	/// words and expansion passes share ([`super::redir::ChildState`]).
+	/// Not imaged, like [`Self::walk`]: a restored op starts the child over
+	/// from the shell's state. Boxed: few ops have one.
+	pub child:   Option<Box<super::redir::ChildState>>,
 }
 
 impl ScratchIo {
 	/// Clear for the next op, keeping the vectors' allocations.
 	fn clear(&mut self) {
-		let Self { redir, saved, probes, probing, search, input, walk, zsh, var_fds } = self;
+		let Self { redir, saved, probes, probing, search, input, walk, zsh, var_fds, child } = self;
 		*redir = RedirProgress::default();
 		saved.clear();
 		probes.clear();
@@ -1779,6 +1784,7 @@ impl ScratchIo {
 			z.clear();
 		}
 		*var_fds = None;
+		*child = None;
 	}
 
 	/// The op's zsh I/O progress, created on first use.
