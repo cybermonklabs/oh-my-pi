@@ -17,12 +17,33 @@ answers that option with "warning: `--logfile` is deprecated" before anything el
 drops that warning, which its own option caused (a --logfile the caller gives keeps its warning).
 When libtest has started tests it has not reported, and has reported nothing for the longest bound
 among them, the binary has stopped making progress: every test it is running has run past its bound,
-or libtest
-itself is stuck. The runner then stops the binary (SIGKILL to it and the processes it started),
-waits for it, and ends the record: a `failed` event for each test libtest started and did not
-report, saying why, and one suite end whose counts add up. It runs nothing again: the tests that
-had not started have no result, and the suite end gives their number as `not_run`. The exit code is
-then 101, libtest's code for failed tests.
+or libtest itself is stuck. The runner then stops the binary (below), waits for it, and ends the
+record: a `failed` event for each test libtest started and did not report, saying why, and one
+suite end whose counts add up. A result libtest wrote to the --logfile but whose event on stdout
+was cut (a child of the binary writes to the same pipe) first gets its event in the record, so the
+suite end counts it once. It runs nothing again: the tests that had not started have no result, and
+the suite end gives their number as `not_run`. The exit code is then 101, libtest's code for failed
+tests.
+
+SIGTERM (the caller's bound for the whole run, such as Bazel's test timeout or coreutils timeout,
+or a cancel) ends the record the same way, unless libtest had already ended it, but each `failed`
+event says that the runner was stopped from outside, not by a bound per test, and the exit code is
+143. Under Bazel (TEST_TIMEOUT set), a selected test whose bound is not below the target's timeout
+could never be failed at its bound: the runner then refuses to run, naming the test, before the
+binary starts.
+
+The binary runs in a process group apart from its caller's: the group of a guard process, which
+the runner forks and places in a group of its own before the binary starts. The runner stays in its
+caller's group and session, so the binary's group is not orphaned while the runner lives. To stop
+the binary, the runner sends SIGKILL to the binary, to the group's members and to every process
+descended from them that the process table shows (/proc, or ps where there is no /proc, as on
+macOS), in any group or session, and then to the group, which still holds a descendant whose
+parent ended. A process that left the group and whose parent ended before the stop (setsid, then
+its parent's exit) is reached by neither. A subreaper would keep such a process in reach, but it
+changes the reparenting that pi-shell's proctree tests observe, so the runner takes none. A kill of
+the caller's group (`timeout -k`, Bazel after SIGTERM's grace) does not reach the binary's group;
+the guard, which ignores SIGTERM, SIGINT and SIGHUP, outlives the runner, and when the runner ends
+without saying the run is over, the guard stops the group the same way.
 
 A binary that dies on its own keeps its exit status (128 plus the signal, as a shell reports it),
 and the runner adds nothing to its record. A command that does not ask for JSON runs as it is,
@@ -176,23 +197,33 @@ def bounds_from(config, package):
     return seconds(prof["slow-timeout"]), per_test
 
 
-def count_listed(binary, opts, filters):
-    """How many tests the arguments select (libtest's --list, terse), or None when --list fails."""
+def listed(binary, opts, filters):
+    """The names of the tests the arguments select (libtest's --list, terse), or None when --list fails."""
     sel = [x for x in opts if x[0] in SELECTING or x[0] in ("--skip", "-Z")]
     flat = [y for k, v in sel for y in ((k,) if v is None else (k, v))]
     r = subprocess.run([binary, *flat, *filters, "--list", "--format", "terse"], stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         return None
-    return sum(1 for line in r.stdout.splitlines() if line.endswith((": test", ": benchmark")))
+    return [line.rsplit(": ", 1)[0] for line in r.stdout.splitlines() if line.endswith((": test", ": benchmark"))]
 
 
 def proc_table():
-    """{pid: (ppid, pgrp, state)} from /proc ({} when it cannot be read)."""
+    """{pid: (ppid, pgrp, state)} from /proc, or from ps where /proc cannot be listed (macOS);
+    {} when neither can be read."""
     table = {}
     try:
         entries = os.listdir("/proc")
     except OSError:
+        try:
+            out = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "stat="],
+                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            return table
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) >= 4 and f[0].isdigit() and f[1].isdigit() and f[2].isdigit():
+                table[int(f[0])] = (int(f[1]), int(f[2]), f[3][:1])
         return table
     for e in entries:
         if e.isdigit():
@@ -206,8 +237,10 @@ def proc_table():
     return table
 
 
-def stop(pid):
-    """SIGKILL to pid and every process it started, in any group or session; returns how many."""
+def stop(pgid, pid=None):
+    """SIGKILL to pid, to each process in group pgid, and to every process descended from those that
+    the process table shows, in any group or session; then to the group, which still holds a member
+    whose parent ended. Returns how many it found."""
     me = os.getpid()
     killed = set()
     for _ in range(4):
@@ -215,7 +248,7 @@ def stop(pid):
         kids = {}
         for q, (pp, _, _) in table.items():
             kids.setdefault(pp, []).append(q)
-        todo = [pid, *killed]
+        todo = [*(q for q, (_, g, _) in table.items() if g == pgid), *([pid] if pid else []), *killed]
         found = set()
         while todo:
             q = todo.pop()
@@ -232,15 +265,95 @@ def stop(pid):
             except OSError:
                 pass
         killed |= new
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
     return len(killed)
+
+
+def hold_stdio():
+    """/dev/null on each of fds 0, 1 and 2 the caller left closed, so that no pipe of the runner's
+    lands there (the guard puts /dev/null on its stdio, which would close such a pipe end)."""
+    for fd in (0, 1, 2):
+        try:
+            os.fstat(fd)
+        except OSError:
+            os.open(os.devnull, os.O_RDWR)  # the lowest free fd: this one
+
+
+def guard():
+    """Starts the guard, before the binary: a process that leads a process group of its own, out of
+    reach of a kill of the caller's group, which the binary then joins. When the runner ends without
+    writing to the returned pipe (it was killed), the guard stops the group as the runner would.
+    While the guard lives its pid, the group's id, names no other process. The runner's own stop()
+    kills the guard with the group. Returns (the group's id, the pipe's write end)."""
+    r, w = os.pipe()
+    g = os.fork()
+    if g:
+        os.close(r)
+        try:
+            os.setpgid(g, g)  # here as well as in the guard: the group exists before the binary starts
+        except OSError:
+            pass
+        return g, w
+    try:
+        os.setpgid(0, 0)
+        for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(s, signal.SIG_IGN)
+        os.close(w)
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        # Nothing else of the runner's or its caller's stays open here: a reader of the runner's
+        # output sees its end when the runner ends.
+        try:
+            fds = [int(n) for n in os.listdir("/dev/fd") if n.isdigit()]
+        except OSError:
+            fds = range(3, os.sysconf("SC_OPEN_MAX"))
+        for fd in fds:
+            if fd > 2 and fd != r:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        said = b""
+        while True:
+            try:
+                data = os.read(r, 16)
+            except InterruptedError:
+                continue
+            if not data:
+                break
+            said += data
+        if not said and os.getpgrp() == os.getpid():  # never the caller's group
+            stop(os.getpid())
+    finally:
+        os._exit(0)
+
+
+def release(w):
+    """Tells the guard that the run is over (it has nothing to stop), and lets it end."""
+    try:
+        os.write(w, b"done")
+    except OSError:
+        pass  # the runner's stop() already killed it with the binary's group
+    os.close(w)
 
 
 class Binary:
     """The binary's one run: its output goes to stdout as it comes; its events are read."""
 
-    def __init__(self, cmd, logfile, drop_warning):
+    def __init__(self, cmd, logfile, drop_warning, group):
+        # The guard's process group (or, with no guard, one of its own), which stop() kills whole: a
+        # descendant whose parent ended is still in it. (preexec_fn, not process_group: macOS's
+        # Python 3.9 has no process_group.)
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT)
+                                     stderr=subprocess.STDOUT, preexec_fn=lambda: os.setpgid(0, group))
+        try:
+            self.pgid = os.getpgid(self.proc.pid)
+        except OSError:
+            self.pgid = group or self.proc.pid
         self.fd = self.proc.stdout.fileno()
         os.set_blocking(self.fd, False)
         self.logfile, self.logpos, self.logbuf = logfile, 0, b""
@@ -254,6 +367,7 @@ class Binary:
         self.in_record = {}  # the results stdout's record holds, which the suite end must add up to
         self.last = time.monotonic()
         self.eof = False
+        self.suite_ended = False  # libtest's own suite end is in the record
 
     def read(self):
         try:
@@ -301,6 +415,8 @@ class Binary:
             ev, _ = json.JSONDecoder().raw_decode(text, m.start())
         except ValueError:
             return
+        if isinstance(ev, dict) and ev.get("type") == "suite" and ev.get("event") in ("ok", "failed"):
+            self.suite_ended = True
         if not isinstance(ev, dict) or ev.get("type") != "test":
             return
         name, e = ev.get("name"), ev.get("event")
@@ -339,6 +455,15 @@ class Binary:
     def unreported(self):
         return {n: t for n, t in self.started.items() if n not in self.reported}
 
+    def add_cut_results(self):
+        """An event in the record for each result only the --logfile holds (its event on stdout was
+        cut), so that the record holds each result libtest reported, once. Its stdout does not start
+        with the runner's note, which marks the tests the runner failed."""
+        for name in sorted(n for n in self.reported if n not in self.in_record):
+            e = self.in_record[name] = self.reported[name]
+            emit({"type": "test", "name": name, "event": e,
+                  "stdout": f"This result comes from libtest's --logfile ({NOTE[:-1]}.py): its event on stdout was cut.\n"})
+
     def finish(self):
         """Waits for the process, then reads what is left, for at most GRACE s: a child may hold the pipe."""
         code = self.proc.wait()
@@ -374,11 +499,39 @@ def main(argv):
     opts, filters = split_args(args)
     if not asks_json(opts):
         os.execvp(binary, cmd)
-    selected = count_listed(binary, opts, filters)
-    if selected is None:
+    names = listed(binary, opts, filters)
+    if names is None:
         sys.stderr.write(f"{NOTE} {binary} runs without a bound per test: its --list failed.\n")
         sys.stderr.flush()
         os.execvp(binary, cmd)
+    outer = os.environ.get("TEST_TIMEOUT", "")
+    if outer.isdigit() and int(outer) > 0:
+        # libtest's --list names the #[ignore]d tests too; without --ignored or --include-ignored
+        # they do not run, so their bounds do not count.
+        runs = names
+        if not {"--ignored", "--include-ignored"} & {k for k, _ in opts}:
+            ignored = set(listed(binary, [*opts, ("--ignored", None)], filters) or [])
+            runs = [n for n in names if n not in ignored]
+        over = sorted((per_test.get(n, default), n) for n in runs if per_test.get(n, default) >= int(outer))
+        if over:
+            raise SystemExit(f"{NOTE} Bazel's timeout for this target is {outer} s (TEST_TIMEOUT), and {len(over)} "
+                             f"selected test(s) have a bound of at least that in {conf['--nextest-config']}, "
+                             f"longest {over[-1][1]} ({over[-1][0]} s): Bazel would stop the binary before the "
+                             f"runner could fail them at their bound. Give the target a timeout of at least its "
+                             f"longest correct run plus that bound.")
+    # SIGTERM (Bazel's timeout, coreutils timeout, a cancel) is taken in the loop below: the binary is
+    # stopped, and the record names the tests it was running.
+    term = []
+    signal.signal(signal.SIGTERM, lambda *_: term.append(True))
+    hold_stdio()
+    group, guarded = guard()
+    try:
+        established = os.getpgid(group) == group
+    except OSError:
+        established = False
+    if not established:
+        release(guarded)
+        raise SystemExit(f"{NOTE} the guard process could not take a process group of its own; nothing ran.")
     own_log = [v for k, v in opts if k == "--logfile"]
     tmp = None
     if own_log:
@@ -387,10 +540,9 @@ def main(argv):
         tmp = tempfile.mkdtemp(prefix="libtest-bound.")
         logfile = os.path.join(tmp, "results.log")
         cmd = [*cmd, "--logfile", logfile]
-    run = Binary(cmd, logfile, drop_warning=tmp is not None)
-    signal.signal(signal.SIGTERM, lambda *_: (stop(run.proc.pid), sys.exit(128 + signal.SIGTERM)))
+    run = Binary(cmd, logfile, drop_warning=tmp is not None, group=group)
     t0 = time.monotonic()
-    stalled = None
+    stalled = outside = None
     try:
         while True:
             r, _, _ = select.select([] if run.eof else [run.fd], [], [], 1.0)
@@ -399,41 +551,56 @@ def main(argv):
             run.read_log()
             if run.proc.poll() is not None:
                 break
+            if term:
+                outside = True
+                stop(run.pgid, run.proc.pid)
+                break
             waiting = run.unreported()
             if waiting:
                 quiet = time.monotonic() - run.last
                 if quiet >= max(per_test.get(n, default) for n in waiting):
                     stalled = quiet
-                    stop(run.proc.pid)
+                    stop(run.pgid, run.proc.pid)
                     break
         code = run.finish()
+        release(guarded)
     finally:
         if tmp:
             for f in os.listdir(tmp):
                 os.unlink(os.path.join(tmp, f))
             os.rmdir(tmp)
-    if stalled is None:
+    if stalled is None and outside is None:
         return code if code >= 0 else 128 - code
+    if run.suite_ended:
+        # libtest ended its record before the stop (SIGTERM came as the binary was exiting): the
+        # record holds every result, and a second suite end would count them twice.
+        return 101 if stalled is not None else 128 + signal.SIGTERM
     now = time.monotonic()
     if run.last_byte != b"\n":
         sys.stdout.write("\n")
+    run.add_cut_results()
     waiting = run.unreported()
     for name in sorted(waiting):
-        ran = now - waiting[name]
-        emit({"type": "test", "name": name, "event": "failed", "exec_time": round(ran, 3),
-              "stdout": f"{NOTE} libtest started {name} {ran:.0f} s before the runner stopped the binary, and "
-                        f"had reported no test for {stalled:.0f} s, past the bound of each test it had not "
-                        f"reported (this one's is {per_test.get(name, default)} s, .config/nextest.toml).\n"})
+        ran, bound = now - waiting[name], per_test.get(name, default)
+        if stalled is None:
+            why = (f"{NOTE} SIGTERM stopped the runner (its caller's bound for the whole run, such as Bazel's "
+                   f"test timeout, or a cancel), not a bound per test: libtest had started {name} {ran:.0f} s "
+                   f"before and not reported it (its bound is {bound} s, .config/nextest.toml).\n")
+        else:
+            why = (f"{NOTE} libtest started {name} {ran:.0f} s before the runner stopped the binary, and "
+                   f"had reported no test for {stalled:.0f} s, past the bound of each test it had not "
+                   f"reported (this one's is {bound} s, .config/nextest.toml).\n")
+        emit({"type": "test", "name": name, "event": "failed", "exec_time": round(ran, 3), "stdout": why})
     counts = {"ok": 0, "failed": 0, "ignored": 0}
     for e in run.in_record.values():
         counts[e] += 1
     counts["failed"] += len(waiting)
-    total = count_listed(binary, [x for x in opts if x[0] == "-Z"], [])
+    total = listed(binary, [x for x in opts if x[0] == "-Z"], [])
     emit({"type": "suite", "event": "failed", "passed": counts["ok"], "failed": counts["failed"],
           "ignored": counts["ignored"], "measured": 0,
-          "filtered_out": max(0, total - selected) if total is not None else 0,
-          "exec_time": round(now - t0, 3), "not_run": selected - len(run.reported) - len(waiting)})
-    return 101
+          "filtered_out": max(0, len(total) - len(names)) if total is not None else 0,
+          "exec_time": round(now - t0, 3), "not_run": len(names) - len(run.reported) - len(waiting)})
+    return 101 if stalled is not None else 128 + signal.SIGTERM
 
 
 if __name__ == "__main__":

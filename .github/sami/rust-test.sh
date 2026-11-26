@@ -1045,7 +1045,7 @@ check_libtest() {
 	fi
 	if [ "$reported" != "$planned" ] || [ "$ended" = none ]; then
 		names="$(jq -R -r 'fromjson? | select(type == "object" and .type == "test" and .event == "failed" and ((.stdout // "") | startswith("libtest-bound:"))) | .name' "$log" | paste -s -d, -)"
-		error "Rust tests" "$label is $status, but libtest planned $planned tests and reported $reported, suite end $ended: the test binary ended before its tests did${names:+; libtest-bound.py stopped it while these had run past their bound: $names}"
+		error "Rust tests" "$label is $status, but libtest planned $planned tests and reported $reported, suite end $ended: the test binary ended before its tests did${names:+; libtest-bound.py stopped it and failed these, each saying why (its own bound or SIGTERM): $names}"
 		printf '%s\n' "$log" >>"$incomplete"
 		return 0
 	fi

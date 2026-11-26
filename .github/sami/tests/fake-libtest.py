@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """A stand-in for a libtest binary, for libtest-bound.py's controls.
 
-FAKE_SPEC names a JSON file: {"tests": {name: behaviour}, "segv_after": n?, "plain_lines": bool?}.
-Behaviours: "pass", "fail", "slow:S" (passes after S s), "hang" (never ends), "lockhang" (takes
-the process's lock and never ends), "lock" (takes the lock, passes), "ignored", "orphan" (passes,
-leaving a child that holds stdout open for 30 s), "split" (passes; a child's bytes cut its result
-event in two on stdout, as a child writing to the same pipe can). It reads the options libtest
+FAKE_SPEC names a JSON file: {"tests": {name: behaviour}, "segv_after": n?, "plain_lines": bool?,
+"pids_file": path?}. Behaviours: "pass", "fail", "slow:S" (passes after S s), "hang" (never ends),
+"lockhang" (takes the process's lock and never ends), "lock" (takes the lock, passes), "ignored",
+"orphan" (passes, leaving a child that holds stdout open for 30 s), "split" (passes; a child's bytes
+cut its result event in two on stdout, as a child writing to the same pipe can), "spawnhang"
+(starts a `sleep 300` in a session of its own and, through a shell that exits at once, a
+`sleep 300` left in the binary's process group, then never ends). It reads the options libtest
 reads (--list --format terse, --exact, --skip, --ignored, --include-ignored, --test-threads N,
 -Z unstable-options, --format json, --logfile PATH, filters), writes the events libtest writes, one
 line per result to the logfile, and exits 0, or 101 when a test failed. With segv_after it dies
-of SIGSEGV when it would start test number n. Each run appends its arguments to FAKE_LOG.
+of SIGSEGV when it would start test number n. Each run appends its arguments to FAKE_LOG. With
+pids_file, a run (not a --list) appends "binary <its pid>" to it, spawnhang "child <pid>" and
+"orphan <pid>" as it starts each, and a test that never ends "running <its name>" once libtest's
+started event for it is on stdout.
 """
 import json
 import os
@@ -80,6 +85,13 @@ def emit(ev):
     write(json.dumps(ev) + "\n")
 
 
+def note(line):
+    if spec.get("pids_file"):
+        with open(spec["pids_file"], "a") as f:
+            f.write(line + "\n")
+
+
+note(f"binary {os.getpid()}")
 emit({"type": "suite", "event": "started", "test_count": len(names)})
 results = {"ok": 0, "failed": 0, "ignored": 0}
 gate = threading.Semaphore(int(opts.get("--test-threads", "4")))
@@ -103,9 +115,17 @@ def run(name):
     t0 = time.monotonic()
     if b == "ignored" and "--ignored" not in flags and "--include-ignored" not in flags:
         return result(name, "ignored", t0)
-    if b in ("hang", "lockhang"):
+    if b in ("hang", "lockhang", "spawnhang"):
         if b == "lockhang":
             lock.acquire()
+        if b == "spawnhang":
+            child = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True)
+            note(f"child {child.pid}")
+            orphan = subprocess.run(["sh", "-c", "sleep 300 >/dev/null 2>&1 & echo $!"], stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True).stdout.strip()
+            note(f"orphan {orphan}")
+        note(f"running {name}")
         while True:
             time.sleep(3600)
     if b == "lock":
