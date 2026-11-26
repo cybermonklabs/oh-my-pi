@@ -1,5 +1,5 @@
 /**
- * INFRA-3530 (tester's red test): the committed export viewer manifest pins the viewer that the
+ * The tester's red test: the committed export viewer manifest pins the viewer that the
  * committed sources build. The root package.json's `prepare` runs `gen:export-viewer`, which checks
  * the manifest under CI=true, and `ci:release:build-binaries` checks it with `--check`. So a stale
  * pin fails `bun install` in CI (the sami release workflow's bun-install step among them) and the

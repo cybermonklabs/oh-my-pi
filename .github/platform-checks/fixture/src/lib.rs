@@ -23,7 +23,8 @@ mod tests {
 		}
 	}
 
-	/// Fails on its first run and passes after, through a marker file PC_FIXTURE_MARK names.
+	/// Fails on its first run and passes after, through a marker file
+	/// PC_FIXTURE_MARK names.
 	#[test]
 	fn flaky_once() {
 		let mark = std::env::var("PC_FIXTURE_MARK").expect("PC_FIXTURE_MARK");

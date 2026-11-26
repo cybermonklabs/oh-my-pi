@@ -2591,11 +2591,11 @@ export function convertMessages(
 				// Join ordinary adjacent text blocks with no separator so bridge
 				// stitching, imported transcripts, and streaming chunks keep their
 				// original byte sequence. Demoted-thinking blocks (kDemotedThinking,
-				// synthesized by transformMessages) are the one exception: bare
-				// Anthropic-dialect reasoning would otherwise glue onto the first word
-				// of the visible answer. Insert a paragraph break after them — only
-				// when another block actually follows, so a trailing demoted block
-				// never ships trailing whitespace.
+				// synthesized by transformMessages) are the one exception: a closing
+				// tag would otherwise glue onto the first word of the visible answer.
+				// Insert a paragraph break after them — only when another block
+				// actually follows, so a trailing demoted block never ships trailing
+				// whitespace.
 				assistantMsg.content = nonEmptyTextBlocks
 					.map((b, i) => {
 						const text = b.text.toWellFormed();

@@ -8,6 +8,9 @@
 #     them out, with a test binary beside each log that lists its tests.
 #   - fetch-verified.sh, with a stub in place of curl.
 #   - rust-test-parity.sh, against stubs of cargo and bazelisk query.
+#   - rust-test-early-listings.sh, against stubs of cargo metadata and
+#     bazelisk query, build and info, and test binaries that list their tests
+#     (cases E*); rust-test-listings-drift.sh (cases D*).
 #   - rust-test-tmpdir.sh.
 #   - release-candidate.sh, publish's checks, by release-candidate-harness.sh
 #     with a stub in place of gh (cases RC-*).
@@ -224,8 +227,10 @@ own_default() {
 # --- the test step's cases -------------------------------------------------------
 # run <name> <want: 0 or 1> <message regex or ''> <known failures> <stub body>
 # Environment of a case: KNOWN_SKIPS, KNOWN_OUTPUT, SANCTIONED, OWN, ROOT_ALONE,
-# IGNORED_RUN, IGNORED_ROOT, CHILD_ENTRIES, MACOS, ONLY (lines of `<target>
-# <name>`; ONLY sets RUST_TEST_ONLY, with CANARY as RUST_TEST_CANARY), ROOTS
+# IGNORED_RUN, IGNORED_ROOT, MACOS, ONLY (lines of `<target> <name>`; ONLY sets
+# RUST_TEST_ONLY, with CANARY as RUST_TEST_CANARY), CHILD_ENTRIES (lines of
+# `<target> <name> <why>`, the why written as it is: `<parent>[ and
+# <parent>...]: <reason>`), ROOTS
 # and ROOT_COUNT, ROOT_BODY, OWN_BODY, IGN_BODY, IGN_ROOT_BODY, STICKY_BODY
 # and STICKY_ROOT_BODY (the stub's answer to those invocations), OWN_TESTS and
 # OWN_PRINTS (for own_default), MAIN_MUST_SKIP, CARGO_MODE, CARGO_WS,
@@ -262,7 +267,7 @@ run() {
 	list rust-test-ignored.txt "${IGNORED_RUN:-}" "why"
 	if [ -n "${IGNORED_OPT:-}" ]; then printf '%s\n' "$IGNORED_OPT" | while read -r a b; do printf '%s %s  opt: a sweep\n' "$a" "$b"; done >>"$w/repo/.github/sami/rust-test-ignored.txt"; fi
 	list rust-test-ignored-root.txt "${IGNORED_ROOT:-}" "why"
-	list rust-test-child-entries.txt "${CHILD_ENTRIES:-}" "the parent test"
+	{ echo '# header'; echo; [ -n "${CHILD_ENTRIES:-}" ] && printf '%s\n' "$CHILD_ENTRIES" | while read -r a b c; do [ -n "$a" ] && printf '%s %s  %s\n' "$a" "$b" "$c"; done; } >"$w/repo/.github/sami/rust-test-child-entries.txt"
 	list rust-test-macos.txt "${MACOS:-}" "macOS only"
 	if [ -n "${RAW_LIST:-}" ]; then
 		cp -- "$RAW_LIST" "$w/repo/.github/sami/rust-test-known-raw-output.txt"
@@ -279,6 +284,11 @@ run() {
 	# DOCQ: the doctest targets bazel query names (the macOS job asks it).
 	if [ -n "${DOCQ:-}" ]; then printf '%s\n' "$DOCQ" >"$w/docquery.txt"; fi
 	local opt_build_body="${OPT_BUILD_BODY:-metrics 98765 >\"\$bep\"; exit 0}"
+	# The source of $DOC's crate, which the Linux job's doctest reader reads:
+	# one plain doctest, its fence at line 3 (doc_pass's name). DOC_SRC
+	# replaces it; DOC_SRC=none leaves the crate with no .rs file.
+	mkdir -p "$w/repo/crates/pi-diff/src"
+	[ "${DOC_SRC:-}" = none ] || printf '%s\n' "${DOC_SRC:-$doc_src_plain}" >"$w/repo/crates/pi-diff/src/lib.rs"
 	cat >"$w/bin/bazelisk" <<EOF
 #!/usr/bin/env bash
 set -u
@@ -411,7 +421,10 @@ EOF
 	# metadata and test from CARGO_MODE (pass, fail-lib, partial-test,
 	# meta-fail, empty, stderr-skip, stderr-skip-named, filtered, ignored,
 	# ignored-fails, doc-ignored, doc-skip). With --ignored it runs the
-	# #[ignore]d test a::slow alone.
+	# #[ignore]d test a::slow alone. Its build ends as cargo's does: with
+	# --timings, a report that names the run's arguments, unless
+	# CARGO_NO_REPORT=1; then the Finished line, whose time CARGO_FINISHED
+	# gives (empty: no such line, as after a failed build).
 	cat >"$w/bin/rustup" <<EOF
 #!/usr/bin/env bash
 set -u
@@ -428,11 +441,29 @@ fi
 sel="" ign=0 threads=""
 for a in "\$@"; do case "\$a" in --lib|--doc|--test) sel="\$a" ;; --ignored) ign=1 ;; --test-threads=1) threads=1 ;; esac; done
 echo "   Compiling demo v0.1.0" >&2
+if [ "${CARGO_NO_REPORT:-0}" != 1 ]; then
+	case " \$* " in *" --timings "*)
+		report="\$PWD/target/cargo-timings/cargo-timing-\$\$.html"
+		mkdir -p "\${report%/*}"
+		printf '<html>timing report of %s</html>\n' "\$*" >"\$report"
+		echo "      Timing report saved to \$report" >&2
+		;;
+	esac
+fi
+finished='${CARGO_FINISHED-0.00s}'
+[ -z "\$finished" ] || echo '    Finished \`test\` profile [unoptimized + debuginfo] target(s) in '"\$finished" >&2
 # cargo names each test binary it runs; what follows on stderr is the binary's.
 [ "\$sel" = --doc ] || echo "     Running tests/wire.rs (target/debug/deps/wire-0)" >&2
 if [ "\$sel" = --doc ]; then
 	case " \${RUSTDOCFLAGS:-} " in *" -Zunstable-options --no-capture "*) ;; *) echo "stub: cargo test --doc without RUSTDOCFLAGS --no-capture (\${RUSTDOCFLAGS:-})" >&2; exit 2 ;; esac
 	[ "\$threads" = 1 ] || { echo "stub: cargo test --doc without --test-threads=1" >&2; exit 2; }
+	# A crate's doctests under //crates run under cargo only in the macOS job
+	# (RUST_TEST_ONLY), and build their dependencies with the features of the
+	# whole workspace, so every crate's run reuses them.
+	case " \$* " in *" --manifest-path crates/"*)
+		[ -n "\${RUST_TEST_ONLY:-}" ] || { echo "stub: cargo test --doc of a crate under crates/ in the Linux job, where Bazel's doctest targets run the doctests" >&2; exit 2; }
+		case " \$* " in *' -Zfeature-unification --config resolver.feature-unification="workspace" '*) ;; *) echo "stub: cargo test --doc of a crate under crates/ without workspace feature unification (\$*)" >&2; exit 2 ;; esac ;;
+	esac
 fi
 if [ "\$ign" = 1 ]; then
 	# An #[ignore]d test's run goes --offline, under RUST_TEST_OFFLINE_UNDER.
@@ -479,11 +510,22 @@ EOF
 		printf '#!/bin/sh\n"%s" "$@"; rc=$?\ncase "$*" in *"$(cat "%s")"*) exit 5 ;; esac\nexit $rc\n' "$real_jq" "$w/jq-fail" >"$w/bin/jq"
 		chmod +x "$w/bin/jq"
 	fi
+	# SUMMARY_UNWRITABLE=1: the step summary's path is a directory.
+	[ "${SUMMARY_UNWRITABLE:-}" != 1 ] || mkdir "$w/summary.md"
 	out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null \
 		RUST_TEST_PATH=/stub/rsync-ref/bin:/usr/bin:/bin RUST_TEST_TMPDIR="$w/reflink" PI_TEST_REAL_BASH=/stub/bash-ref/bin/bash PI_AST_REPO_CORPUS="$w/repo" RUST_TEST_OFFLINE_UNDER="$w/bin/offline" \
-		RUST_TEST_STICKY_FIFO="$fifo" \
+		RUST_TEST_STICKY_FIFO="$fifo" GITHUB_STEP_SUMMARY="$w/summary.md" \
 		env ${only_env[@]+"${only_env[@]}"} bash --noprofile --norc -eo pipefail "$step" 2>&1)"
 	rc=$?
+	# What the step leaves for the job beside its log: the step summary, and
+	# the cargo timing reports it copied for upload, each on lines of its own.
+	if [ -f "$w/summary.md" ]; then
+		out+=$'\n'"$(sed 's/^/summary: /' "$w/summary.md")"$'\n'"summary rows: $(grep -c '^| `' "$w/summary.md")"
+	fi
+	local report
+	for report in "$w"/tmp/rust-test/cargo-timings/*; do
+		[ -f "$report" ] && out+=$'\n'"artifact: ${report##*/}: $(cat -- "$report")"
+	done
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
 
@@ -508,6 +550,8 @@ B=//crates/pi-builtins:pi-builtins_test
 D=//crates/pi-diff:pi-diff_test
 V=//crates/pi-vcs:pi-vcs_test
 DOC=//crates/pi-diff:pi-diff_doc_test
+# $DOC's crate source by default: one plain doctest, its fence at line 3.
+doc_src_plain=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\npub fn f() {}'
 RT=//crates/pi-builtins:rsync_root_test
 # A passing test with output the known-output list names: the skip scan's
 # liveness check sees output in every case that expects a pass.
@@ -550,7 +594,7 @@ run J27-planned-more-than-reported 1 'planned 3 tests and reported 1' '' "{ $P; 
 run J28-real-libtest-exit-zero 1 'pi-diff_test is PASSED' '' "{ $P; rt $D PASSED cat $fixtures/early.json; } >\"\$bep\"; exit 0"
 run J29-real-libtest-pass 0 '' '' "{ $P; rt $D PASSED cat $fixtures/fine.json; } >\"\$bep\"; exit 0"
 # fail.json holds an #[ignore]d test, t::c_ignored: named a child entry here.
-CHILD_ENTRIES="$D t::c_ignored" run J30-real-libtest-fail-listed 0 'Known failure, failed as expected: //crates/pi-diff:pi-diff_test t::b_fails' "$D t::b_fails" "{ $P; rt $D FAILED cat $fixtures/fail.json; } >\"\$bep\"; exit 3"
+CHILD_ENTRIES="$D t::c_ignored t::a_passes: the parent test" run J30-real-libtest-fail-listed 0 'Known failure, failed as expected: //crates/pi-diff:pi-diff_test t::b_fails' "$D t::b_fails" "{ $P; rt $D FAILED cat $fixtures/fail.json; } >\"\$bep\"; exit 3"
 run J31-real-libtest-fail-unlisted 1 't::b_fails failed and is not in' '' "{ $P; rt $D FAILED cat $fixtures/fail.json; } >\"\$bep\"; exit 3"
 
 # A test target the query names but bazel test left without a result.
@@ -576,6 +620,20 @@ CARGO_WS='# none' run J46-cargo-list-empty 1 'names no workspace with a test tar
 CARGO_MODE=stderr-skip run J47-cargo-stderr-unnamed-skip 1 "sdk/rust/demo:test:wire printed a skip line outside libtest's record that names no test: skipped: no bun" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 CARGO_MODE=stderr-skip-named run J47b-cargo-stderr-named-skip 1 'sdk/rust/demo:test:wire a::two skipped itself and is not in' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 CARGO_MODE=filtered run J47c-cargo-filtered 1 'sdk/rust/demo:test:wire filtered out 1 tests, though cargo test is given no filter' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+# Each cargo test's timings: a line in the job log and a row in the step
+# summary (build: cargo's own Finished time; test: the rest of the run), and
+# its --timings report copied for the job's artifact. They change no verdict.
+run J159-cargo-timing-line 0 '^Cargo test timing: sdk/rust/demo:lib:demo \(cargo\): build 0\.0 s, test [0-9]+\.[0-9] s, total [0-9]+\.[0-9] s, exit 0, report cargo-timing-1-sdk-rust-demo-lib-demo\.html$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+run J160-cargo-timing-row-per-run 0 '^summary rows: 3$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+run J161-cargo-timing-report-is-the-runs-own 0 '^artifact: cargo-timing-3-sdk-rust-demo-test-wire\.html: <html>timing report of cargo test --locked --timings --manifest-path sdk/rust/demo/Cargo.toml --test wire -- ' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_FINISHED='1m 05s' run J162-cargo-timing-minutes 0 '^Cargo test timing: sdk/rust/demo:lib:demo \(cargo\): build 65\.0 s, test -?[0-9]+\.[0-9] s' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_FINISHED='' run J163-cargo-timing-no-finished-line 0 '^summary: \| `sdk/rust/demo:lib:demo` \| cargo \| UNKNOWN \| UNKNOWN \| [0-9]+\.[0-9] \| 0 \| cargo-timing-1-sdk-rust-demo-lib-demo\.html \|$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_NO_REPORT=1 NOT_MSG='::error|^artifact: ' run J164-cargo-timing-no-report-warns 0 '^::warning title=Cargo timings::sdk/rust/demo:lib:demo \(cargo\): cargo named no timing report' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_MODE=fail-lib run J165-cargo-timing-of-a-failed-run 1 '^summary: \| `sdk/rust/demo:lib:demo` \| cargo \| 0\.0 \| [0-9]+\.[0-9] \| [0-9]+\.[0-9] \| 101 \| cargo-timing-1-' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_MODE=ignored IGNORED_RUN="sdk/rust/demo:test:wire a::slow" NOT_MSG='::warning' run J166-cargo-timing-of-doctest-and-ignored-runs 0 '^summary rows: 4$' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+CARGO_MODE=ignored IGNORED_RUN="sdk/rust/demo:test:wire a::slow" run J167-cargo-timing-of-an-ignored-run 0 '^summary: \| `sdk/rust/demo:test:wire` \| ignored-cargo-0 \| 0\.0 \| [0-9]+\.[0-9] \| [0-9]+\.[0-9] \| 0 \| cargo-timing-[0-9]+-sdk-rust-demo-test-wire\.html \|$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+NOT_MSG='::warning' run J168-cargo-timing-of-a-doctest-run 0 '^summary: \| `sdk/rust/demo:doc:demo` \| cargo \| 0\.0 \| [0-9]+\.[0-9] \| [0-9]+\.[0-9] \| 0 \| cargo-timing-2-sdk-rust-demo-doc-demo\.html \|$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+SUMMARY_UNWRITABLE=1 NOT_MSG='::error' run J169-cargo-timing-summary-unwritable-warns 0 '^::warning title=Cargo timings::could not write the step summary$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 
 # The root-only targets: run in a second invocation under sudo.
 ROOTS=$RT ROOT_BODY="FMT=json; rt $RT PASSED cat $fixtures/root-root.json >\"\$bep\"; exit 0" run J48-root-target-runs-as-root 0 '' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
@@ -665,10 +723,10 @@ NOT_MSG='ran in no invocation|but its binary lists' run J94-timeout-named-once 1
 # or is a child entry point, or runs in the macOS job; any other fails.
 IGN="rt $D PASSED lt_ignored d::one d::needs_network"
 run J93-ignored-test-runs-nowhere 1 "$D d::needs_network is #\\[ignore\\]d and runs in no invocation" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
-CHILD_ENTRIES="$D d::needs_network" run J95-ignored-child-entry 0 "a child process's entry point another test starts: $D d::needs_network" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network d::one: the parent test" run J95-ignored-child-entry 0 "a child process's entry point another test starts: $D d::needs_network" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
 MACOS="$D d::needs_network" run J96-ignored-runs-on-macos 0 "run by the macOS job: $D d::needs_network" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
-CHILD_ENTRIES="$D d::needs_network
-$D d::one" run J97-child-entry-that-ran 1 "$D d::one is in .github/sami/rust-test-child-entries.txt but is no #\\[ignore\\]d test" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network d::one: the parent test
+$D d::one d::needs_network: the parent test" run J97-child-entry-that-ran 1 "$D d::one is in .github/sami/rust-test-child-entries.txt but is no #\\[ignore\\]d test" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
 IGNORED_RUN="$D d::needs_network" OWN_TESTS="d::one d::needs_network" run J98-ignored-test-run-alone 0 "Ignored test ran alone: $D d::needs_network \\(ok\\)" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
 IGNORED_RUN="$D d::renamed" OWN_TESTS="d::one d::needs_network" run J99-ignored-run-matches-nothing 1 "own invocation for d::renamed reported \\[\\]" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
 IGNORED_ROOT="$B r::cycle" OWN_TESTS="a::one r::cycle" run J100-ignored-root-run-alone 0 "Ignored root test ran alone: $B r::cycle \\(ok\\)" '' "{ $P; rt $B PASSED lt_ignored a::one r::cycle; } >\"\$bep\"; exit 0"
@@ -729,20 +787,74 @@ NOT_MSG='::error' run J105-bazel-ignore-doc-block-is-no-test 0 '```ignore doc bl
 CARGO_MODE=doc-ignored NOT_MSG='::error' run J106-cargo-ignore-doc-block-is-no-test 0 'sdk/rust/demo src/lib.rs - g \(line 9\) \(cargo.s log\)' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 run J109-no-ignore-doc-blocks 0 '```ignore doc blocks, not tests, marked ignore by upstream: 0' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 CARGO_MODE=ignored-and-doc-ignored NOT_MSG='ignore doctest|src/lib.rs - g.*(fail|runs in no invocation)' run J112-ignore-doc-block-passes-ignored-cargo-test-fails 1 "sdk/rust/demo:test:wire a::slow is #\\[ignore\\]d and runs in no invocation" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
-# B3: a doctest's output is read: the crate's doctests run again under cargo,
-# with rustdoc's --no-capture and one thread, and the lines printed between a
-# doctest's start and its result are its output (stdout and stderr).
-CARGO_MODE=doc-skip run J107-crate-doctest-skips-itself 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) skipped itself and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-CARGO_MODE=doc-raw-skip run J110-doctest-raw-skip-line 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) skipped itself and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-CARGO_MODE=doc-raw-print run J111-doctest-raw-output 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in .github/sami/rust-test-known-output.txt" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-run J107b-crate-doctests-run-under-cargo 0 '' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# B3: on Linux the crates' doctests run only in Bazel: the stub refuses a
+# cargo test --doc of a crate under crates/ there (D1 shows none ran), and
+# the job reads the doctests from the source instead (D1-D34 below).
 # B4: the listings the macOS job's inventory reads.
 run J108-listings-for-macos 0 'Listings for the macOS inventory: 2 binaries' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
-# R3: cargo's readable doctest run must have run the same doctests as Bazel's
-# doctest target of the crate, both ways.
-CARGO_MODE=doc-empty run J113b-bazel-doctest-without-cargo-counterpart 1 "crates/pi-diff src/lib.rs - f \\(line 3\\) ran in Bazel's doctest target and not in cargo's doctest run" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-CARGO_MODE=doc-extra run J114-cargo-doctest-without-bazel-counterpart 1 "crates/pi-diff src/lib.rs - h \\(line 20\\) ran in cargo's doctest run and not in Bazel's doctest target" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-run J115-doctests-match 0 "Doctests that ran in Bazel and in cargo's readable re-run: 1" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# D1-D34: on Linux each crate with a Bazel doctest target has its doctests
+# read from its source (.github/sami/rust-test-doctest-forms.awk, no build):
+# a line of a doctest rustdoc runs that prints or holds a skip word fails the
+# job, named by file and line; a doc attribute the reader does not read
+# fails as UNKNOWN; and every doctest Bazel ran must be one the reader found
+# at its file and line, or the job fails as UNKNOWN. D1 is the plain
+# doctest, D2 the planted one that prints.
+NOT_MSG='stub:|::error' run D1-plain-doctest-passes 0 'Doctests read from the source of 1 crates: 1; Bazel ran 1; lines that print or skip: 0' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! println!("planted");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D2-doctest-that-prints-fails 1 '::error title=Rust test printed::crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints \(println!\("planted"\);\)' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let why = "skipped: no reference rsync";\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D3-doctest-with-a-skip-word-fails 1 '::error title=Rust test skips::crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs holds a skip word' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! eprintln!("x");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D4-doctest-eprintln-fails 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! dbg!(1);\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D5-doctest-dbg-fails 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! use std::io::Write; writeln!(std::io::stdout(), "x").unwrap();\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D6-doctest-stdout-write-fails 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! # println!("hidden");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D7-hidden-line-that-prints-fails 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n//!\n//! ```ignore\n//! println!("never run");\n//! ```\n//!\n//! ```text\n//! skipped: words, not code\n//! ```\npub fn f() {}' NOT_MSG='stub:|::error' run D8-ignore-and-text-blocks-pass 0 'Doctests read from the source of 1 crates: 1; Bazel ran 1; lines that print or skip: 0' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n//!\n//! Example:\n//!\n//!     println!("indented");\npub fn f() {}' NOT_MSG='stub:' run D9-indented-doctest-that-prints-fails 1 'crates/pi-diff/src/lib.rs:9: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/**\n * ```\n * let _ = 1;\n * println!("x");\n * ```\n */\npub fn f() {}' NOT_MSG='stub:' run D10-block-doc-doctest-that-prints-fails 1 'crates/pi-diff/src/lib.rs:9: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n//!\n//! - an item:\n//!   ```\n//!   println!("x");\n//!   ```\npub fn f() {}' NOT_MSG='stub:' run D11-doctest-in-a-list-item-that-prints-fails 1 'crates/pi-diff/src/lib.rs:9: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc = "```\\nprintln!(\\"x\\");\\n```"]\npub fn f() {}' NOT_MSG='stub:' run D12-literal-doc-attribute-doctest-that-prints-fails 1 'crates/pi-diff/src/lib.rs:6: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#![doc = include_str!("../README.md")]\npub fn f() {}' NOT_MSG='stub:' run D13-include-str-doc-attribute-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute whose value is not a one-line string literal' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! Words.\n//!\n//! ```\n//! assert!(true);\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D14-bazel-doctest-the-reader-did-not-find-fails 1 'UNKNOWN: crates/pi-diff src/lib.rs - f \(line 3\) ran in Bazel.s doctest target, and the doctest reader found no doctest at crates/pi-diff/src/lib.rs line 3' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=none NOT_MSG='stub:' run D15-crate-without-source-fails 1 'UNKNOWN: crates/pi-diff src/lib.rs - f \(line 3\) ran in Bazel.s doctest target, and the doctest reader found no doctest' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let s = "UNCOMPARED: x";\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D16-skip-words-are-the-scans 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs holds a skip word' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# D17-D21, from the GPT-6.1 Sol review of 4379925a: a doctest's text across a
+# blank source line, a nested comment in a block doc, a doc attribute escape,
+# a print split from its `!`, and a doctest still open at its text's end.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D17-doctest-body-after-a-blank-source-line-fails 1 'crates/pi-diff/src/lib.rs:6: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/**\n * ```\n * /* a nested comment */\n * println!("missed");\n * ```\n */\npub fn f() {}' NOT_MSG='stub:' run D18-nested-comment-in-a-block-doc-doctest-fails 1 'crates/pi-diff/src/lib.rs:9: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc = "```\\nprint\\x6cn!(\\"x\\");\\n```"]\npub fn f() {}' NOT_MSG='stub:' run D19-doc-attribute-escape-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute whose value is not a one-line string literal' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! println\n//! !("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D20-println-split-from-its-bang-fails 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/// ```\n/// let _ = 1;\npub fn f() {}' NOT_MSG='stub:' run D21-doctest-open-at-the-end-of-its-text-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doctest still open where the doc text the reader joined ends' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# D22, D23, from the second round of that review: a no_run block whose info
+# string rustdoc reads otherwise is read, and a quoted fence-like line inside
+# a doctest does not end it.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n//! ```rust (reason no_run here)\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D22-no-run-block-that-prints-fails 1 'crates/pi-diff/src/lib.rs:7: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let _ = r#"\n//! > ```\n//! > ```text\n//! "#;\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D23-quoted-fence-inside-a-doctest-fails 1 'crates/pi-diff/src/lib.rs:8: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# D24, D25, from its third round: a fence-like line 4 spaces in, or after a
+# list marker, inside a doctest does not end it either.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let _ = r#"\n//!     ```\n//!     ```text\n//! "#;\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D24-indented-fence-like-lines-inside-a-doctest-fail 1 'crates/pi-diff/src/lib.rs:8: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let _ = r#"\n//! - ```\n//! - ```text\n//! "#;\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D25-list-marked-fence-like-lines-inside-a-doctest-fail 1 'crates/pi-diff/src/lib.rs:8: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# D26, from its fourth round: two doc attributes on one line.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc = "```\\nprintln!(\\"missed\\");\\n```"] #[doc = "<!--\\n```\\nassert!(true);\\n```\\n-->"]\npub fn f() {}' NOT_MSG='stub:' run D26-two-doc-attributes-on-a-line-are-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute this reader does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# D27-D29, from its fifth and sixth rounds: a comment between doc and its
+# `=`, alone or beside another attribute, and comment markers in a string;
+# a doc attribute line with /* or */ on it is unread.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc /* gap */ = "```\\nprintln!(\\"missed\\");\\n```"] #[doc = "<!--\\n```\\nassert!(true);\\n```\\n-->"]\npub fn f() {}' NOT_MSG='stub:' run D27-doc-attribute-with-a-comment-before-its-equals-is-read 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute this reader does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc /* gap */ = "```\\nprintln!(\\"x\\");\\n```"]\npub fn f() {}' NOT_MSG='stub:' run D28-doc-attribute-with-a-comment-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute this reader does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc = "```\\nlet _ = \\"/*\\"; println!(\\"missed\\"); let _ = \\"*/\\";\\n```"]\npub fn f() {}' NOT_MSG='stub:' run D29-comment-markers-in-a-doc-attribute-string-are-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute this reader does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# D30, from its seventh round: an attribute split over lines beside another.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc = "```"] #[doc\n= "println!(\\"missed\\");"] #[doc = "```"]\npub fn f() {}' NOT_MSG='stub:' run D30-split-doc-attribute-beside-another-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute over more than one line' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# D31, from its eighth round: a raw identifier, r#doc.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/// ```\n#[r#doc = "println!(\\"missed\\");"]\n/// ```\npub fn f() {}' NOT_MSG='stub:' run D31-raw-identifier-doc-attribute-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:7: a doc attribute this reader does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# D32, from its ninth round: a doc attribute over lines (its `#[` alone on a
+# line) is unread; D33: an attribute over lines whose doc is doc(cfg(...))
+# carries no doc text, and passes.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/// Example:\n///\n///     assert!(true);\n#[\ndoc = "     println!(\\"missed\\");"\n]\npub fn f() {}' NOT_MSG='stub:' run D32-doc-attribute-over-lines-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:9: a doc attribute over more than one line' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[cfg_attr(\n    docsrs,\n    doc(cfg(feature = \"x\"))\n)]\npub fn f() {}' NOT_MSG='stub:|::error' run D33-attribute-over-lines-with-doc-cfg-passes 0 'Doctests read from the source of 1 crates: 1; Bazel ran 1; lines that print or skip: 0' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# D34, from the fork peer's review of 353156e9 (its case X1): a doctest the
+# reader finds that Bazel's doctest target did not run is UNKNOWN, as the
+# cargo re-run's comparison was, both ways.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n//!\n//! ```\n//! assert_eq!(1, 1);\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D34-doctest-bazel-did-not-run-is-unknown 1 'UNKNOWN: crates/pi-diff/src/lib.rs:7: the doctest reader found a doctest here that no Bazel doctest target ran' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# B4: the listings the drift check compares with the early ones.
+run J108-listings-for-the-drift-check 0 'Listings for the drift check: 2 binaries' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 # R3-1: a line a test binary writes outside libtest's record (a child's or a
 # thread's write to the inherited stream) is a skip if it has a skip word,
 # and must match rust-test-known-raw-output.txt otherwise, or the job fails.
@@ -785,7 +897,6 @@ cl4_raw() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ 
 CL4RAW="$(declare -f cl4_raw)"
 run J127-brace-raw-line-fails 1 "$D wrote 1 lines outside libtest's record .*: \\{ no free port: nothing to test \\}" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '{ no free port: nothing to test }'; } >\"\$bep\"; exit 0"
 run J128-json-raw-line-fails 1 "$D wrote 1 lines outside libtest's record .*status" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '{\"status\": \"no free port: nothing to test\"}'; } >\"\$bep\"; exit 0"
-CARGO_MODE=doc-raw-nonl NOT_MSG='ended before' run J129-doctest-output-without-newline-fails 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in .github/sami/rust-test-known-output.txt" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 cl4_two_children() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n\nrunning 1 test\ntest a::x ... \nrunning 1 test\nok\n{ "type": "test", "name": "wt::carry", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; }
 cl4_two_whole() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n\nrunning 1 test\n\nrunning 1 test\ntest a::x ... ok\n{ "type": "test", "name": "wt::carry", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; }
 CL4TWO="$(declare -f cl4_two_children cl4_two_whole)"
@@ -801,12 +912,9 @@ $D $SN" OWN_TESTS="d::one $SN" STICKY_BODY="FMT=json; FILTERED=1 rt $D PASSED lt
 x_tail() { printf '{ "type": "suite", "event": "started", "test_count": 1 }\n{ "type": "test", "event": "started", "name": "wt::carry" }\nno free port: nothing to test{ "type": "test", "name": "wt::carry", "event": "ok" }\n{ "type": "suite", "event": "ok", "passed": 1, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.1 }\n'; }
 XTAIL="$(declare -f x_tail)"
 NOT_MSG='ended before' run J134-piece-before-the-last-event-is-read 1 "$D wrote 1 lines outside libtest's record .*: no free port: nothing to test" '' "$XTAIL; { $P; rt $D PASSED x_tail; } >\"\$bep\"; exit 0"
-# From the Claude-family review of 6b0eca04: doc_attribute uses the same event
-# test, so a doctest that prints an object that only names its type printed;
-# a bench-typed object with no result's fields, an array and a number are
-# output too.
-CARGO_MODE=doc-typed run J135-doctest-prints-typed-test-object 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
-CARGO_MODE=doc-typed-suite run J136-doctest-prints-typed-suite-object 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in" '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# From the Claude-family review of 6b0eca04: a bench-typed object with no
+# result's fields, an array and a number are output (a doctest's typed
+# objects: K15, K16).
 run J137-bench-typed-object-is-output 1 "$D wrote 1 lines outside libtest's record" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '{\"type\": \"bench\", \"name\": \"x\", \"note\": \"no free port: nothing to test\"}'; } >\"\$bep\"; exit 0"
 run J138-array-line-is-output 1 "$D wrote 1 lines outside libtest's record .*: \\[\"no free port: nothing to test\"\\]" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '[\"no free port: nothing to test\"]'; } >\"\$bep\"; exit 0"
 run J139-number-line-is-output 1 "$D wrote 1 lines outside libtest's record .*: 42" '' "$CL4RAW; { $P; rt $D PASSED cl4_raw '42'; } >\"\$bep\"; exit 0"
@@ -837,10 +945,10 @@ SANCTIONED_LINE="$D a::two ruling" run J147-list-line-without-its-why-stops 1 "r
 # child-entries line (J148), a sanctioned skip (J149), an #[ignore]d root test
 # run alone (J150); and a summary that says FAILED_TO_BUILD (J151).
 UB="unbuilt $B"
-NOT_MSG='rust-test-child-entries.txt but is no' CHILD_ENTRIES="$B b::child" run J148-child-entry-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; $UB; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
+NOT_MSG='rust-test-child-entries.txt but is no|is no test of' CHILD_ENTRIES="$B b::child b::parent: the parent test" run J148-child-entry-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; $UB; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
 NOT_MSG='takes out 0 tests' SANCTIONED="$B s::x::byte_totals" run J149-sanctioned-skip-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so what its skip s::x::byte_totals" '' "{ $P; cfg $B 'rust_test rule'; $UB; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
 NOT_MSG='has no one test log' IGNORED_ROOT="$B r::cycle" IGN_ROOT_BODY="{ cfg $B 'rust_test rule'; $UB; } >\"\$bep\"; exit 1" run J150-ignored-root-test-of-a-target-that-did-not-build 1 "UNKNOWN: $B did not build, so its own invocation for r::cycle" '' "{ $P; cfg $B 'rust_test rule'; $UB; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
-NOT_MSG='rust-test-child-entries.txt but is no' CHILD_ENTRIES="$B b::child" run J151-child-entry-of-a-target-summarized-failed-to-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
+NOT_MSG='rust-test-child-entries.txt but is no|is no test of' CHILD_ENTRIES="$B b::child b::parent: the parent test" run J151-child-entry-of-a-target-summarized-failed-to-build 1 "UNKNOWN: $B did not build, so whether b::child" '' "{ $P; cfg $B 'rust_test rule'; summary $B FAILED_TO_BUILD; rt $D PASSED lt_pass d::one; } >\"\$bep\"; exit 1"
 # A test of rust-test-root-alone.txt is taken out of the main invocation and
 # runs alone as root (J152); one that prints UNKNOWN: there checked nothing
 # (J153); one the main invocation still runs fails (J154).
@@ -858,6 +966,19 @@ NOT_MSG='bazel test exited|reported \[' IGNORED_RUN="//crates/pi-vcs:gone_test x
 FLAKY="$B x::f" MAIN_MUST_FLAKY="$B" run J156-flaky-listed-failed-then-passed 0 "Known flaky test, failed on 1 of 2 attempts and passed on another: $B x::f" '' "f=\"\$(tpath $B)\"; a=\"\$(dirname \"\$f\")/test_attempts/attempt_1.log\"; mkdir -p \"\$(dirname \"\$a\")\"; lt_fail x::f >\"\$a\"; lt_pass x::passes x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B FLAKY \"\$a\" \"\$f\"; } >\"\$bep\"; exit 0"
 NOT_MSG='Known flaky test, failed on' FLAKY="$B x::f" run J157-flaky-listed-failed-every-attempt 1 "$B x::f is listed flaky in .github/sami/rust-test-known-failures.txt, but failed on every attempt \\(2 of 2\\): NEW" '' "f=\"\$(tpath $B)\"; a=\"\$(dirname \"\$f\")/test_attempts/attempt_1.log\"; mkdir -p \"\$(dirname \"\$a\")\"; lt_fail x::f >\"\$a\"; lt_fail x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B FAILED \"\$a \$f\"; } >\"\$bep\"; exit 3"
 NOT_MSG='Known failure did not happen|failed and is not in' FLAKY="$B x::f" run J158-flaky-listed-passed-first 0 "$B x::f is listed flaky in .github/sami/rust-test-known-failures.txt and did not fail" '' "f=\"\$(tpath $B)\"; mkdir -p \"\$(dirname \"\$f\")\"; lt_pass x::passes x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B PASSED '' \"\$f\"; } >\"\$bep\"; exit 0"
+
+# A child entry names the tests that start it (`<parent>[ and <parent>...]:
+# <reason>`), and each must be a test of the binary: a valid pair passes
+# (J159); a parent renamed since the line was written (d::starts_the_child,
+# now d::starts_the_child_now) fails (J160), also as the second of two
+# (J161); a line with no `<parent>: <reason>` stops the job (J162), and so
+# does a parent in prose, which is no test name (J163).
+IGN_RENAMED="rt $D PASSED lt_ignored d::starts_the_child_now d::needs_network"
+NOT_MSG='is no test of' CHILD_ENTRIES="$D d::needs_network d::one: the parent test" run J159-child-entry-parent-is-a-test 0 "Child entry's parent is a test of its binary: $D d::one starts d::needs_network" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network d::starts_the_child: the parent test" run J160-child-entry-parent-renamed 1 "d::starts_the_child, which .github/sami/rust-test-child-entries.txt names as the test that starts $D d::needs_network, is no test of $D \\(renamed or deleted\\)" '' "{ $P; $IGN_RENAMED; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network d::needs_network and d::starts_the_child: the parent tests" run J161-child-entry-second-parent-renamed 1 "d::starts_the_child, which .github/sami/rust-test-child-entries.txt names as the test that starts $D d::needs_network, is no test of $D" '' "{ $P; $IGN_RENAMED; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network d::one" run J162-child-entry-without-a-reason 1 "rust-test-child-entries.txt:3: no \"<parent test>: <reason>\"" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
+CHILD_ENTRIES="$D d::needs_network the parent test: it starts the binary again" run J163-child-entry-parent-in-prose 1 "rust-test-child-entries.txt:3: \"the parent test\" is no full libtest test name" '' "{ $P; $IGN; } >\"\$bep\"; exit 0"
 
 # RUST_TEST_ONLY (the macOS job): only the listed tests and the canary run,
 # and each listed test must run.
@@ -880,6 +1001,17 @@ ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strfti
 # says nothing (sami-checks run 45351216411: the macOS job read each
 # Linux-only flaky line as a target with no result).
 FLAKY="$B x::f" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='listed flaky' run K10-only-flaky-line-of-a-test-not-run-here 0 "Ran here, as .github/sami/only.txt names: $D m::strftime" '' 'exit 9'
+# K12-K17: the macOS job (RUST_TEST_ONLY) still runs the crates' doctests
+# under cargo and reads their output (doc_attribute, one thread), as the
+# Linux job did until its doctests ran only in Bazel: a doctest that skips
+# itself, prints, prints with no newline, or prints an object that only
+# names its type fails; the run builds with workspace feature unification.
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-skip run K12-only-crate-doctest-skips-itself 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) skipped itself and is not in" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-raw-print run K13-only-doctest-raw-output 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in .github/sami/rust-test-known-output.txt" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-raw-nonl NOT_MSG='ended before' run K14-only-doctest-output-without-newline-fails 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in .github/sami/rust-test-known-output.txt" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-typed run K15-only-doctest-prints-typed-test-object 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-typed-suite run K16-only-doctest-prints-typed-suite-object 1 "crates/pi-diff:doc src/lib.rs - f \\(line 3\\) printed and is not in" '' 'exit 9'
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" CARGO_MODE=doc-ignored NOT_MSG='stub:|::error' run K17-only-crate-doctests-unify-features-over-the-workspace 0 'crates/pi-diff src/lib.rs - g \(line 9\) \(cargo.s log\)' '' 'exit 9'
 # X1-X3 (CiReview2 at 32e3af7a): a flaky test the RUST_TEST_ONLY run does run.
 # X1 failed, then passed: KNOWN, and the stub refuses an only-* invocation
 # without the retry flag. X2 failed on every attempt: NEW, exit 1. X3
@@ -889,6 +1021,9 @@ XPRE="if [ \"\$OWN_TARGET\" = $D ]; then has \"--flaky_test_attempts=^$D\\\$@3\"
 FLAKY="$D m::langinfo" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='no result|Known failure, failed as expected' OWN_BODY="$XPRE FILTERED=1 FMT=json lt_out m::langinfo '' m::strftime '' >\"\$f\"; { cfg $D 'rust_test rule'; summary $D FLAKY \"\$a\" \"\$f\"; } >\"\$bep\"; exit 0; fi; own_default" run X1-only-flaky-ran-here-failed-then-passed 0 "Known flaky test, failed on 1 of 2 attempts and passed on another: $D m::langinfo" '' 'exit 9'
 FLAKY="$D m::langinfo" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='no result|Known failure, failed as expected|Known flaky test, failed on' OWN_BODY="$XPRE printf '$FJ' >\"\$f\"; { cfg $D 'rust_test rule'; summary $D FAILED \"\$a \$f\"; } >\"\$bep\"; exit 3; fi; own_default" run X2-only-flaky-ran-here-failed-every-attempt 1 "$D m::langinfo is listed flaky in .github/sami/rust-test-known-failures.txt, but failed on every attempt \\(2 of 2\\): NEW" '' 'exit 9'
 FLAKY="$D m::langinfo" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='no result|::error' run X3-only-flaky-ran-here-passed 0 "$D m::langinfo is listed flaky in .github/sami/rust-test-known-failures.txt and did not fail" '' 'exit 9'
+# K11: with RUST_TEST_ONLY too, each cargo run (the cargo workspace's targets
+# and the doctests) has its row in the step summary.
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" NOT_MSG='::error|::warning' run K11-only-cargo-timing-rows 0 '^summary rows: 4$' '' 'exit 9'
 
 # --- rust-test-macos-inventory.sh ------------------------------------------------
 # irun <name> <want> <message regex> <targets> <mac binaries> <linux listings>
@@ -1675,6 +1810,8 @@ prun() {
 		printf '[package]\nname = "demo"\n' >crates/demo/Cargo.toml
 		printf '[package]\nname = "x"\n' >sdk/rust/x/Cargo.toml
 		printf '# list\n%s\n' "${PARITY_WS:-sdk/rust/x/Cargo.toml  standalone}" >.github/sami/rust-test-cargo-workspaces.txt
+		printf '# list\n%s\n' "${PARITY_UNTESTED:-# none}" >.github/sami/rust-test-untested-manifests.txt
+		if [ -n "${PARITY_FIXTURE:-}" ]; then mkdir -p "$(dirname "$PARITY_FIXTURE")" && printf '[package]\nname = "fixture"\n\n[workspace]\n' >"$PARITY_FIXTURE"; fi
 		{ echo '# sanctioned'; [ -n "${PARITY_SANCTIONED:-}" ] && printf '%s  ruling\n' "$PARITY_SANCTIONED"; [ -n "${PARITY_SANCTIONED_LINE:-}" ] && printf '%s\n' "$PARITY_SANCTIONED_LINE"; } >.github/sami/rust-test-sanctioned-skips.txt
 		git init -q . && git add -A && git -c user.email=h@example.invalid -c user.name=harness commit -qm fixture
 	) || { verdict "$name" "$want" 97 "$msg" "could not make the fixture repository"; return 0; }
@@ -1714,7 +1851,16 @@ $DOCT
 $(rule rust_test //crates/demo:other_test "$(strs srcs //crates/demo:tests/other.rs)")"
 prun P3-doctest-missing 1 "demo's doctest target demo \\(crates/demo/src/lib.rs\\) has no Bazel rust_doc_test" "$LIB
 $(rule rust_test //crates/demo:demo_test "$(str crate //crates/demo:demo)")"
-PARITY_WS='# none' prun P4-cargo-toml-unlisted 1 'sdk/rust/x/Cargo.toml is outside the root workspace and not in' "$(covered)"
+PARITY_WS='# none' prun P4-cargo-toml-unlisted 1 'sdk/rust/x/Cargo.toml is outside the root workspace and in neither' "$(covered)"
+# A manifest outside the root workspace whose tests no job runs, on purpose,
+# is in rust-test-untested-manifests.txt (P14; without its line it fails as
+# P4 does, P15); a line naming no tracked Cargo.toml (P16), one naming the
+# root workspace's (P17), and a manifest in both lists (P18) fail.
+PARITY_FIXTURE=.github/platform-checks/fixture/Cargo.toml PARITY_UNTESTED='.github/platform-checks/fixture/Cargo.toml  the tool fixture' NOT_MSG='and in neither' prun P14-untested-manifest-listed 0 'Cargo manifests: 4 tracked, 0 outside the root workspace and unlisted' "$(covered)"
+PARITY_FIXTURE=.github/platform-checks/fixture/Cargo.toml prun P15-untested-manifest-unlisted 1 '.github/platform-checks/fixture/Cargo.toml is outside the root workspace and in neither' "$(covered)"
+PARITY_UNTESTED='.github/platform-checks/fixture/Cargo.toml  the tool fixture' prun P16-untested-line-names-no-manifest 1 '.github/platform-checks/fixture/Cargo.toml is in .github/sami/rust-test-untested-manifests.txt, but the tree under test tracks no such Cargo.toml' "$(covered)"
+PARITY_UNTESTED='crates/demo/Cargo.toml  a root member' prun P17-untested-line-names-a-root-member 1 'crates/demo/Cargo.toml is in .github/sami/rust-test-untested-manifests.txt, but it is the root workspace.s' "$(covered)"
+PARITY_UNTESTED='sdk/rust/x/Cargo.toml  both' prun P18-manifest-in-both-lists 1 'sdk/rust/x/Cargo.toml is in both' "$(covered)"
 prun P5-skip-covered-by-another-target 0 "Skips in test targets' args: 1, 0 run nowhere" "$(covered "$(strs args --skip ::slow::)")
 $(rule native_test //crates/demo:slow_test "$(str src //crates/demo:demo_test)" "$(strs args ::slow::)")"
 prun P6-skip-uncovered 1 "//crates/demo:demo_test's args skip ::slow::, and no other test target of that binary runs it" "$(covered "$(strs args --skip ::slow::)")"
@@ -1727,6 +1873,191 @@ PARITY_SANCTIONED_LINE='//crates/demo:demo_test x::flaky ruling' prun P13-sancti
 prun P10-filter-of-another-binary-does-not-cover 1 "//crates/demo:demo_test's args skip ::slow::" "$(covered "$(strs args --skip ::slow::)")
 $(rule native_test //crates/demo:slow_test "$(str src //crates/other:other_test)" "$(strs args ::slow::)")"
 prun P11-query-names-no-rust-test 1 'bazel query names no crate root of any rust_test' "$LIB"
+
+# --- rust-test-early-listings.sh -------------------------------------------------
+# erun <name> <want> <message regex> <rules: JSON lines> <binaries>: the early
+# listings in a repository with two packages, demo (a library, and the test
+# target tests/wire.rs) and vendored (a library test:rs leaves out), against
+# stubs of cargo metadata and bazelisk query, build and info. <binaries>:
+# lines of `<binary-id> <package> <kind> <name> <tests...>`, each a test
+# binary of the archive, recorded under another target directory, whose
+# --list names those tests. BAZEL_BIN: lines of `<label> <tests...>`, the
+# binaries a bazel build leaves in bazel-bin; BUILD_RC, that build's exit. The
+# output then names each index.tsv line with its listing (`<label>: <tests>`).
+# EARLY_MODE: both (one call, the default), halves (the Bazel half, then the
+# archive half, as the build job runs them) or unfinished (the archive half
+# beside a Bazel half that has not ended). WIRE_TEST: false makes cargo
+# metadata say cargo does not test tests/wire.rs. RUST_TEST_EARLY_SH runs
+# another copy of the script.
+early_sh="${RUST_TEST_EARLY_SH:-$repo/.github/sami/rust-test-early-listings.sh}"
+erun() {
+	local name="$1" want="$2" msg="$3" rules="$4" bins="$5" w out rc id package kind bname tests t label file
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(cd "$(mktemp -d "$scratch/early.XXXXXX")" && pwd -P)"
+	mkdir -p "$w/bin" "$w/repo/scripts" "$w/target/debug/deps" "$w/binroot"
+	printf 'const VENDORED_FORK_EXCLUDES = [\n\t"--exclude",\n\t"vendored",\n];\n' >"$w/repo/scripts/run-rs-task.ts"
+	printf '%s\n' "$rules" >"$w/rules.json"
+	# fake <path> <tests...>: a test binary that lists these tests, as libtest does.
+	fake() {
+		local f="$1"
+		shift
+		mkdir -p "$(dirname "$f")"
+		{ printf '#!/bin/sh\n[ "$1" = --list ] || exit 2\n'; for t in "$@"; do printf "echo '%s: test'\n" "$t"; done; printf "echo; echo '%s tests, 0 benchmarks'\n" "$#"; } >"$f"
+		chmod +x "$f"
+	}
+	: >"$w/bins.jsonl"
+	while read -r id package kind bname tests; do
+		[ -n "$id" ] || continue
+		# shellcheck disable=SC2086 # one test name a word
+		fake "$w/target/debug/deps/$bname-${id//[^a-z]/x}" $tests
+		jq -cn --arg id "$id" --arg p "path+file://$w/repo/crates/$package#0.1.0" --arg k "$kind" --arg n "$bname" --arg path "/home/runner/target/debug/deps/$bname-${id//[^a-z]/x}" \
+			'{key: $id, value: {"binary-id": $id, "binary-name": $n, "package-id": $p, kind: $k, "binary-path": $path, "build-platform": "target"}}' >>"$w/bins.jsonl"
+	done <<<"$bins"
+	jq -s '{"rust-build-meta": {"target-directory": "/home/runner/target"}, "rust-binaries": from_entries}' "$w/bins.jsonl" >"$w/binaries-metadata.json"
+	while read -r label tests; do
+		[ -n "$label" ] || continue
+		t="${label#//}"
+		# shellcheck disable=SC2086 # one test name a word
+		fake "$w/binroot/${t%%:*}/${t#*:}" $tests
+	done <<<"${BAZEL_BIN-//crates/demo:relay_test r::one tests::two}"
+	cat >"$w/bin/cargo" <<EOF
+#!/bin/sh
+[ "\$1" = metadata ] || exit 2
+r="$w/repo"
+printf '{"packages":[{"id":"path+file://%s/crates/demo#0.1.0","name":"demo","targets":[{"name":"demo","kind":["lib"],"src_path":"%s/crates/demo/src/lib.rs","test":true},{"name":"wire","kind":["test"],"src_path":"%s/crates/demo/tests/wire.rs","test":${WIRE_TEST:-true}}]},{"id":"path+file://%s/crates/vendored#0.1.0","name":"vendored","targets":[{"name":"vendored","kind":["lib"],"src_path":"%s/crates/vendored/src/lib.rs","test":true}]}]}\n' "\$r" "\$r" "\$r" "\$r" "\$r"
+EOF
+	cat >"$w/bin/bazelisk" <<EOF
+#!/bin/sh
+case "\$1" in
+	query) cat "$w/rules.json" ;;
+	build) exit "\${BUILD_RC:-0}" ;;
+	info) echo "$w/binroot" ;;
+	*) echo "stub: bazelisk \$*" >&2; exit 2 ;;
+esac
+EOF
+	chmod +x "$w/bin/cargo" "$w/bin/bazelisk"
+	case "${EARLY_MODE:-both}" in
+	both)
+		out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" bash "$early_sh" "$w/binaries-metadata.json" "$w/target" "$w/out" 2>&1)"
+		rc=$?
+		;;
+	halves)
+		out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" bash "$early_sh" bazel "$w/state" 2>&1; echo "--- bazel half: exit $?, bazel.rc [$(cat "$w/state/bazel.rc" 2>/dev/null)]")"
+		out+=$'\n'"$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" bash "$early_sh" archive "$w/state" "$w/binaries-metadata.json" "$w/target" "$w/out" 2>&1)"
+		rc=$?
+		;;
+	unfinished)
+		mkdir -p "$w/state/bazel"
+		out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" bash "$early_sh" archive "$w/state" "$w/binaries-metadata.json" "$w/target" "$w/out" 2>&1)"
+		rc=$?
+		;;
+	esac
+	if [ -f "$w/out/index.tsv" ]; then
+		out+=$'\n'"--- index"
+		while IFS=$'\t' read -r label file; do out+=$'\n'"$label: $(tr '\n' ' ' <"$w/out/$file" | sed 's/ $//')"; done <"$w/out/index.tsv"
+	fi
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+ELIB="$(rule rust_library //crates/demo:demo "$(strs srcs //crates/demo:src/lib.rs)")"
+EDEMO="$(rule rust_test //crates/demo:demo_test "$(str crate //crates/demo:demo)")"
+EWIRE="$(rule rust_test //crates/demo:wire_test "$(strs srcs //crates/demo:tests/wire.rs)")"
+# The Bazel-only target, as //crates/pi-natives:oauth_callback_relay_test:
+# cargo builds its crate root through build.rs, as no test target.
+ERELAY="$(rule rust_test //crates/demo:relay_test "$(str crate_root //crates/demo:src/relay.rs)" "$(strs srcs //crates/demo:src/relay.rs //crates/demo:src/publication.rs)")"
+ERULES="$ELIB
+$EDEMO
+$EWIRE
+$ERELAY"
+EBINS="demo demo lib demo a::one a::two
+demo::wire demo test wire w::one
+vendored vendored lib vendored v::one"
+# A clean tree: each binary is the one rust_test whose crate root is its
+# source, the Bazel-only target is built and listed, and vendored's binary,
+# which no rust_test is, is left out by name (E1); each listing is the
+# binary's test names, the summary line dropped (E2). A native_test that runs
+# a rust_test's binary (the pi_natives_test scanner split) needs no listing of
+# its own (E3).
+NOT_MSG='::error' erun E1-early-listings-clean 0 "Early listings: 3 of 3 rust_test targets, 2 from the archive's 3 test binaries, 1 Bazel-only built by Bazel \\(//crates/demo:relay_test\\); 1 binaries of packages test:rs leaves out not listed \\(vendored\\)" "$ERULES" "$EBINS"
+erun E2-early-listing-is-the-binarys-names 0 '^//crates/demo:demo_test: a::one a::two$' "$ERULES" "$EBINS"
+NOT_MSG='::error' erun E3-native-test-of-a-listed-binary 0 'Early listings: 3 of 3 rust_test targets' "$ERULES
+$(rule native_test //crates/demo:demo_slow_test "$(str src //crates/demo:demo_test)" "$(strs args --exact a::two)")" "$EBINS"
+# A binary whose source is no rust_test's crate root fails by name (E4),
+# and so does one whose source is two rust_tests' (E5).
+erun E4-binary-maps-to-no-label 1 'test binary demo::wire \(crates/demo/tests/wire.rs\) maps to no Bazel rust_test' "$ELIB
+$EDEMO
+$ERELAY" "$EBINS"
+erun E5-binary-maps-to-two-labels 1 'test binary demo \(crates/demo/src/lib.rs\) maps to 2 Bazel rust_tests, which all have crates/demo/src/lib.rs as their crate root: //crates/demo:demo_again_test //crates/demo:demo_test' "$ERULES
+$(rule rust_test //crates/demo:demo_again_test "$(str crate //crates/demo:demo)")" "$EBINS"
+# A binary that is no cargo target fails (E6). A Bazel-only target whose
+# Linux build fails (E7), or that leaves no binary (E8), fails by its label.
+erun E6-binary-of-no-cargo-target 1 'test binary demo::ghost \(test ghost of .*\) is 0 cargo targets in cargo metadata' "$ERULES" "$EBINS
+demo::ghost demo test ghost g::one"
+BUILD_RC=1 erun E7-bazel-only-build-fails 1 '//crates/demo:relay_test: Bazel-only \(no test binary of the archive is it\), and the bazel build of it for Linux exited 1' "$ERULES" "$EBINS"
+BAZEL_BIN='' erun E8-bazel-only-without-a-binary 1 '//crates/demo:relay_test: its binary .* cannot list its tests' "$ERULES" "$EBINS"
+# Nothing to list is UNKNOWN, never a pass: no rust_test (E9), no binary (E10).
+erun E9-query-names-no-rust-test 1 'UNKNOWN: bazel query names no rust_test under //crates' "$ELIB" "$EBINS"
+erun E10-archive-names-no-binary 1 'UNKNOWN: .*binaries-metadata.json names no test binary' "$ERULES" ''
+# The two halves the build job runs, the Bazel one in the background, give
+# the same listings (E11, E11b). The archive half beside a Bazel half that has
+# not ended is UNKNOWN (E12). A cargo test target with no binary in the
+# archive leaves its rust_test without a listing (E13); a binary of a target
+# cargo metadata says it does not test is the Bazel half's Bazel-only target
+# too, and is listed twice (E14).
+EARLY_MODE=halves NOT_MSG='::error' erun E11-early-listings-in-two-halves 0 "Early listings: 3 of 3 rust_test targets, 2 from the archive's 3 test binaries, 1 Bazel-only built by Bazel \\(//crates/demo:relay_test\\)" "$ERULES" "$EBINS"
+EARLY_MODE=halves erun E11b-two-halves-list-the-bazel-only-target 0 '^//crates/demo:relay_test: r::one tests::two$' "$ERULES" "$EBINS"
+EARLY_MODE=unfinished erun E12-archive-half-before-the-bazel-half-ends 1 'UNKNOWN: the Bazel half has not finished' "$ERULES" "$EBINS"
+erun E13-cargo-test-target-without-a-binary 1 '//crates/demo:wire_test: a rust_test bazel query names, with no listing' "$ERULES" "demo demo lib demo a::one a::two
+vendored vendored lib vendored v::one"
+WIRE_TEST=false BAZEL_BIN='//crates/demo:relay_test r::one
+//crates/demo:wire_test w::one' erun E14-binary-of-a-target-bazel-built-too 1 '//crates/demo:wire_test is listed twice: test binary demo::wire of the archive is it, and the Bazel half built it as Bazel-only' "$ERULES" "$EBINS"
+
+# --- rust-test-listings-drift.sh -------------------------------------------------
+# drun <name> <want> <message regex> <early> <Bazel's>: the drift check of two
+# listings directories, each given as lines of `<label> <tests...>`.
+# EARLY_INDEX=none leaves the early index out. RUST_TEST_DRIFT_SH runs
+# another copy of the script.
+drift_sh="${RUST_TEST_DRIFT_SH:-$repo/.github/sami/rust-test-listings-drift.sh}"
+drun() {
+	local name="$1" want="$2" msg="$3" w out rc side label tests i=0
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/drift.XXXXXX")"
+	for side in early bazel; do
+		mkdir -p "$w/$side"
+		[ "$side" = early ] && [ "${EARLY_INDEX:-}" = none ] && continue
+		: >"$w/$side/index.tsv"
+		while read -r label tests; do
+			[ -n "$label" ] || continue
+			i=$((i + 1))
+			# shellcheck disable=SC2086 # one test name a word
+			if [ -n "$tests" ]; then printf '%s\n' $tests | LC_ALL=C sort -u >"$w/$side/$i.txt"; else : >"$w/$side/$i.txt"; fi
+			printf '%s\t%s.txt\n' "$label" "$i" >>"$w/$side/index.tsv"
+		done <<<"$([ "$side" = early ] && printf '%s' "$4" || printf '%s' "$5")"
+	done
+	out="$(PATH="${TOOLBIN:+$TOOLBIN:}$PATH" bash "$drift_sh" "$w/early" "$w/bazel" 2>&1)"
+	rc=$?
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+DT1=//crates/pi-shell:pi-shell_test
+DT2=//crates/pi-natives:oauth_callback_relay_test
+DT3=//crates/vendor/tree-sitter-go:tree-sitter-go_test
+# The same listings pass, a target with no tests included (D1). A renamed
+# test fails, named on each side (D2, D3); a target on one side only fails
+# (D4, D5); the plant a dispatch makes, one renamed test and one missing
+# target, fails with each named (D6). No early listings is UNKNOWN (D7).
+NOT_MSG='::error' drun D1-drift-clean-pair 0 'Listing drift: 0 differences in 3 targets' "$DT1 a::one a::two
+$DT2 p::one
+$DT3" "$DT1 a::one a::two
+$DT2 p::one
+$DT3"
+drun D2-drift-renamed-test-in-rust-tests 1 "$DT1 a::two: in rust_test's listing, not in the early one the macOS inventory read" "$DT1 a::one a::two_renamed" "$DT1 a::one a::two"
+drun D3-drift-renamed-test-in-early 1 "$DT1 a::two_renamed: in the early listing the macOS inventory read, not in rust_test's" "$DT1 a::one a::two_renamed" "$DT1 a::one a::two"
+drun D4-drift-target-missing-from-early 1 "$DT2 has a listing of rust_test's \\(1 tests\\) and no early listing" "$DT1 a::one" "$DT1 a::one
+$DT2 p::one"
+drun D5-drift-target-only-in-early 1 "$DT2 has an early listing \\(1 tests\\) and no listing of rust_test's" "$DT1 a::one
+$DT2 p::one" "$DT1 a::one"
+drun D6-drift-plant-rename-and-missing-target 1 'Listing drift: 3 differences in 2 targets \(early 1, rust_test.s 2\)' "$DT1 a::one a::two_renamed" "$DT1 a::one a::two
+$DT2 p::one"
+EARLY_INDEX=none drun D7-drift-no-early-listings 1 'UNKNOWN: .*/early/index.tsv \(early\) is missing or empty' '' "$DT1 a::one"
 
 echo "rust_test job scripts: $pass passed, $fail failed, $skip skipped"
 [ "$fail" = 0 ] && [ "$pass" -gt 0 ]

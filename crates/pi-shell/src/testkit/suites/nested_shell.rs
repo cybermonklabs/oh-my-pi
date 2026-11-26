@@ -4,8 +4,12 @@
 //! Goldens from bash 5.3.20 (`bash -c SRC` with `$0` = `bash`, the nested
 //! `bash`/`sh` being 5.3.20 too).
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
 use crate::{
-	bash::SpawnSpec,
+	bash::{SigSet, Signal, SpawnSpec},
 	testkit::{FakeHost, Fault, MemFs, run_script},
 };
 
@@ -46,6 +50,18 @@ fn nested_shells_do_not_reveal_later_root_bindings() {
 	assert_eq!(status, 0);
 	assert_eq!(out, "absent:absent:before\n");
 	assert_eq!(err, "");
+}
+
+/// A new shell is a new process: its `$SECONDS` counts from zero and its
+/// `$RANDOM` generator is its own (it does not continue the shell's
+/// 19344 after `RANDOM=7`); the shell's own go on unmoved.
+#[test]
+fn starts_its_own_random_and_seconds() {
+	let (out, err, status) = run(
+		"SECONDS=5000; RANDOM=7; bash -c 'echo $SECONDS; [ $RANDOM != 19344 ] && echo fresh'; echo \
+		 $SECONDS $RANDOM",
+	);
+	assert_eq!((out.as_str(), err.as_str(), status), ("0\nfresh\n5000 19344\n", "", 0));
 }
 
 #[test]
@@ -102,6 +118,103 @@ fn ignored_signals_stay_ignored() {
 	let (out, ..) = run("trap '' USR1; trap 'echo x' USR2; bash -c trap");
 	assert!(out.contains("trap -- '' SIGUSR1\n"), "{out}");
 	assert!(!out.contains("USR2"), "{out}");
+}
+
+/// A signal the parent ignores, by a subshell's `''` trap or as an
+/// asynchronous command (bash 5.3 `setup_async_signals`), is ignored when
+/// the nested shell starts: it lists it as a `''` trap, ignores it itself,
+/// and starts its programs with it ignored (each spawn fails here: 127,
+/// nothing runs). Goldens: bash 5.3.20, its programs' `SigIgn` 6 (`INT` and
+/// `QUIT`) and 2 (`INT`).
+#[test]
+fn a_signal_its_parent_ignores_is_an_ignoring_trap_in_a_nested_shell() {
+	let both = SigSet::EMPTY.with(Signal::Int).with(Signal::Quit);
+	let int = SigSet::EMPTY.with(Signal::Int);
+	let mut wrong = Vec::new();
+	for (src, want, masks) in [
+		(
+			"( bash -c 'trap -p INT QUIT; /x/p' ) & wait",
+			"trap -- '' SIGINT\ntrap -- '' SIGQUIT\n",
+			vec![both],
+		),
+		("( trap '' INT; bash -c 'trap -p INT; /x/p' )", "trap -- '' SIGINT\n", vec![int]),
+		("( bash -c 'kill -INT $$; echo alive' ) & wait; echo st=$?", "alive\nst=0\n", vec![]),
+	] {
+		let seen = Arc::new(Mutex::new(Vec::new()));
+		let record = Arc::clone(&seen);
+		let host = FakeHost::new().with_spawner(Box::new(move |spec: SpawnSpec<'_>| {
+			record.lock().push(spec.sigmask_ign);
+			Err(std::io::ErrorKind::NotFound.into())
+		}));
+		let out = run_script(host, src.as_bytes(), &[], Fault::None);
+		let text = String::from_utf8_lossy(&out.stdout);
+		let spawned = seen.lock().clone();
+		if text != want || spawned != masks {
+			wrong.push(format!("{src:?}\n  got:  {text:?} {spawned:?}\n  want: {want:?} {masks:?}"));
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the rows differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A script the OS will not execute (`ENOEXEC`) that a background job runs:
+/// bash 5.3.20 starts it in the job's own process, with `INT` and `QUIT`
+/// ignored as an asynchronous command's, only where it is the job's whole
+/// command or a stage of the job's pipeline (substitutions in its words and
+/// a `!` change nothing), or run by `exec` while the process still holds
+/// `INT` ignored itself (not after its own `trap … INT; trap - INT`). Run by
+/// a fork inside the job (a `( … )`, a `{ …; }`, a list), it starts with
+/// `INT` back at its default (the fork's `restore_original_signals`) and
+/// `QUIT` still ignored: it does not list `INT`, starts its programs without
+/// it, and dies of its own `INT`. Goldens: bash 5.3.20 (`SigIgn` 6 and 4).
+#[test]
+fn a_script_without_shebang_in_a_job_ignores_int_only_in_the_jobs_own_process() {
+	let both = SigSet::EMPTY.with(Signal::Int).with(Signal::Quit);
+	let quit = SigSet::EMPTY.with(Signal::Quit);
+	let kept = "trap -- '' SIGINT\ntrap -- '' SIGQUIT\nalive\n";
+	let reset = "trap -- '' SIGQUIT\n";
+	let mut wrong = Vec::new();
+	for (src, want, masks) in [
+		("/w/ns & wait", kept, vec![both]),
+		("/w/ns 2>/dev/null & wait", kept, vec![both]),
+		("true | /w/ns & wait", kept, vec![both]),
+		("( exec /w/ns ) & wait", kept, vec![both]),
+		("( /w/ns ) & wait", reset, vec![quit]),
+		("{ /w/ns; } & wait", reset, vec![quit]),
+		("( :; /w/ns ) & wait", reset, vec![quit]),
+		(": && /w/ns & wait", reset, vec![quit]),
+		("( true | /w/ns ) & wait", reset, vec![quit]),
+		("f() { /w/ns; }; f & wait", reset, vec![quit]),
+		("/w/ns \"$(echo a)\" & wait", kept, vec![both]),
+		("/w/ns `echo a` & wait", kept, vec![both]),
+		("/w/ns <(:) & wait", kept, vec![both]),
+		("/w/ns 2>\"$(echo /dev/null)\" & wait", kept, vec![both]),
+		("true | /w/ns \"$(echo a)\" & wait", kept, vec![both]),
+		("! /w/ns & wait", kept, vec![both]),
+		("( trap '' INT; trap - INT; exec /w/ns ) & wait", reset, vec![quit]),
+		("( trap '' INT; trap - INT; ( exec /w/ns ) ) & wait", reset, vec![quit]),
+		("( trap 'echo x' INT; trap - INT; exec /w/ns ) & wait", reset, vec![quit]),
+	] {
+		let fs = MemFs::new();
+		fs.add_file("/w/ns", b"trap -p INT QUIT; /x/p; kill -INT $$; echo alive\n", 0o755);
+		let seen = Arc::new(Mutex::new(Vec::new()));
+		let record = Arc::clone(&seen);
+		let host = FakeHost::new()
+			.with_fs(fs)
+			.with_spawner(Box::new(move |spec: SpawnSpec<'_>| {
+				if spec.path == "/w/ns" {
+					return Err(std::io::Error::from_raw_os_error(ENOEXEC));
+				}
+				record.lock().push(spec.sigmask_ign);
+				Err(std::io::ErrorKind::NotFound.into())
+			}));
+		let out = run_script(host, src.as_bytes(), &[], Fault::None);
+		let text = String::from_utf8_lossy(&out.stdout);
+		let spawned = seen.lock().clone();
+		if text != want || spawned != masks {
+			wrong.push(format!("{src:?}\n  got:  {text:?} {spawned:?}\n  want: {want:?} {masks:?}"));
+		}
+	}
+	assert!(wrong.is_empty(), "{} of the rows differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
 #[test]

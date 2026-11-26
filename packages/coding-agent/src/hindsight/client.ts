@@ -12,7 +12,7 @@ import { agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import type { DispatchHold } from "@oh-my-pi/pi-ai";
 import { dispatchWhenOpen } from "@oh-my-pi/pi-ai/utils/dispatch-hold";
 import { USER_AGENT, truncate, tryParseJson } from "@oh-my-pi/pi-utils";
-import { endpointUrl } from "../utils/endpoint-url";
+import { endpointUrl, endpointUrlWithoutCredentials } from "../utils/endpoint-url";
 import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
 import type { HindsightConfig } from "./config";
 
@@ -290,15 +290,28 @@ export interface HindsightClientApi {
 }
 
 /**
- * The server `config` names, as the client reaches it ({@link endpointUrl} of `hindsight.apiUrl`): spellings that
- * reach the same server give the same string, which names the server in a recorded recall's scope
- * (`hindsightRecallScope`); null without `hindsight.apiUrl`.
+ * The server `config` names, as the client reaches it ({@link endpointUrl} of `hindsight.apiUrl`), a credential in
+ * its userinfo or query included: spellings that reach the same server give the same string, and a running session
+ * compares servers by it, so a changed credential in the URL installs a new client; null without `hindsight.apiUrl`.
  */
 export function hindsightServer(config: HindsightConfig): string | null {
 	return config.hindsightApiUrl === null ? null : endpointUrl(config.hindsightApiUrl);
 }
 
-/** The API token `config` names, without surrounding whitespace: the account a recall and a running session compare. */
+/**
+ * The server `config` names, as a record written to the session names it ({@link endpointUrlWithoutCredentials} of
+ * `hindsight.apiUrl`): spellings that reach the same server give the same string, and a key in the URL's userinfo
+ * or query is left out. It names the server in a recorded recall's scope (`hindsightRecallScope`) and in a retain
+ * marker's; null without `hindsight.apiUrl`.
+ */
+export function hindsightRecordedServer(config: HindsightConfig): string | null {
+	return config.hindsightApiUrl === null ? null : endpointUrlWithoutCredentials(config.hindsightApiUrl);
+}
+
+/**
+ * The API token `config` names, without surrounding whitespace, as a request authenticates with it: the account a
+ * running session compares.
+ */
 export function hindsightAccountToken(config: HindsightConfig): string {
 	return (config.hindsightApiToken ?? "").trim();
 }

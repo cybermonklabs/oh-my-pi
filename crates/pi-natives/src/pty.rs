@@ -1025,7 +1025,7 @@ mod zombie_repro_tests {
 	}
 
 	#[test]
-	#[ignore]
+	#[ignore = "saturates every core to provoke scheduler races; run it alone"]
 	fn cancelled_pty_sessions_do_not_leak_zombies() {
 		const ITERATIONS: usize = 60;
 		let StormOutcome { leaked, spawned } = run_cancel_storm(ITERATIONS);

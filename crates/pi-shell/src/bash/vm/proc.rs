@@ -5,8 +5,8 @@ use std::{collections::VecDeque, sync::Arc};
 use bstr::BString;
 use serde::{Deserialize, Serialize};
 
-use super::state::Scope;
-pub use crate::bash::store::{Job, JobState};
+use super::state::{Level, Random, Scope, Var};
+pub use crate::bash::store::{Job, JobProc, JobProcs, JobState, ProcState};
 use crate::bash::{
 	Image,
 	event::{OriginChain, ResolvedKind, WaitKey},
@@ -16,7 +16,7 @@ use crate::bash::{
 	ids::{CallId, CmdTag, IntrinsicId, JobId, ModeId, NativeRef, RunId, ToolRef, Vpid},
 	ir::Unit,
 	mem::Capture,
-	signal::SigSet,
+	signal::{SigSet, Signal},
 	syntax::Pos,
 };
 
@@ -120,6 +120,15 @@ pub struct Vproc {
 	/// `errtrace`/`functrace`; bash 5.3 keeps listing inherited signal
 	/// traps until the subshell changes one).
 	pub own_traps:     OwnTraps,
+	/// bash: the signals this vproc ignores as an asynchronous command
+	/// without job control (`INT`, `QUIT`; bash 5.3 `setup_async_signals`,
+	/// `set_signal_async_ignored`), and whether it acts on an ignored `INT`
+	/// itself all the same (a fork of a vproc that named `INT` in `trap`).
+	/// Set by `exec::ignore_async_signals`, read by `exec::async_ignored`;
+	/// its forks inherit it (`exec::fork_async_ignored`). A field, not an
+	/// overlay record: a record would cost every asynchronous vproc a
+	/// ~530-byte map allocation (idle vproc ≤ 2 KiB).
+	pub async_ignored: AsyncIgnored,
 	/// Trap-action frames ([`ScriptKind::Trap`]) on `frames`: zero lets
 	/// the per-op checks (cancellation, `BASH_COMMAND`, a trap inside its
 	/// own action) skip their frame scans. Kept by
@@ -145,6 +154,44 @@ pub struct Vproc {
 	/// Inherited (copied) by children; never serialized: a restored shell
 	/// starts with zsh's defaults and no line in progress.
 	pub zle:           Option<Box<super::zle::Zle>>,
+	/// A forked vproc's `$RANDOM` generator and `$SECONDS` origin
+	/// ([`Clock`]): its parent's at the fork. `None` for the root vproc,
+	/// whose are the kernel's.
+	pub clock:         Option<Clock>,
+}
+
+/// A forked vproc's `$RANDOM` generator and `$SECONDS` clock
+/// ([`Vproc::clock`]). Both are process state that a fork copies, as
+/// `fork(2)` copies memory, so neither side's draws, `RANDOM=` or
+/// `SECONDS=` reach the other. The shell's own are the kernel's
+/// (`Kernel::rand`, `Kernel::start_ns`, `Kernel::seconds`), which the store
+/// keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Clock {
+	pub rand:          Random,
+	/// The generator is reseeded on the vproc's first `$RANDOM` in bash code
+	/// unless `RANDOM` was assigned first, as bash reseeds a subshell's
+	/// (`get_random_number`'s `seeded_subshell`); zsh draws on from the copy.
+	pub reseed:        bool,
+	/// The host clock reading of the shell's start, or of the last
+	/// `SECONDS=` in bash code (bash's `shellstart`, which `assign_seconds`
+	/// resets to now): `printf '%(…)T' -2` and the shell's `time` report
+	/// count from it.
+	pub start_ns:      u64,
+	/// The value of the last `SECONDS=` in bash code (bash's
+	/// `seconds_value_assigned`): `$SECONDS` is it plus the seconds since
+	/// `start_ns`. zsh's `SECONDS=` moves `start_ns` instead and sets it to 0.
+	pub seconds:       i64,
+	/// `unset SECONDS` or an array assignment in bash code removed the
+	/// special meaning of `SECONDS`: a plain variable from then on (bash
+	/// removes the dynamic variable).
+	pub seconds_plain: bool,
+	/// The same for `RANDOM`.
+	pub random_plain:  bool,
+	/// `unset` in bash code removed these value cells (bits of
+	/// `dynvars::CELLS` indices): plain variables from then on (bash removes
+	/// the dynamic variable).
+	pub cells_plain:   u16,
 }
 
 /// A `break` or `continue` that ran inside `${ }` or `${| }`
@@ -342,6 +389,27 @@ pub struct VprocZsh {
 	/// op returned anything else. Never imaged: it lives within one op step.
 	#[serde(skip)]
 	pub glob_hook:          Option<(BString, u32)>,
+	/// A `( … )` the root runs in place of itself, as the last command of
+	/// its `-c` string (zsh's `last1`: no fork). Its own last command runs
+	/// in place of it in turn ([`super::killed::in_place`]). A subshell of
+	/// it starts without.
+	#[serde(default)]
+	pub in_place:           bool,
+	/// The signal (its number) the command this vproc ran in place of
+	/// itself died of: an [`Self::in_place`] subshell's process would have
+	/// been that command, so its parent dies of it too.
+	#[serde(default)]
+	pub died_of:            Option<i32>,
+	/// The background jobs whose end owes a run of the `CHLD` trap, oldest
+	/// first ([`super::owe_chld`]): each run takes the first as its own.
+	#[serde(default)]
+	pub chld_jobs:          VecDeque<Vpid>,
+	/// The job whose end runs the `CHLD` trap now. zsh 5.9 adds its status
+	/// to the background statuses only once the trap is over: while it runs,
+	/// `wait` takes that job for no child of the shell (another finished
+	/// job is one).
+	#[serde(default)]
+	pub chld_own:           Option<Vpid>,
 }
 
 /// A number as zsh's `lastmathval` keeps it ([`VprocZsh::last_math`]); a
@@ -371,10 +439,29 @@ impl VprocZsh {
 			&& !self.exit_from_function
 			&& self.last_math.is_none()
 			&& self.glob_hook.is_none()
+			&& !self.in_place
+			&& self.died_of.is_none()
 	}
 }
 
 impl Vproc {
+	/// zsh: a `( … )` the root runs in place of itself
+	/// ([`VprocZsh::in_place`]).
+	pub fn in_place(&self) -> bool {
+		self.zsh.as_ref().is_some_and(|z| z.in_place)
+	}
+
+	/// The signal the command this vproc ran in place of itself died of
+	/// ([`VprocZsh::died_of`]).
+	pub fn died_of(&self) -> Option<i32> {
+		self.zsh.as_ref().and_then(|z| z.died_of)
+	}
+
+	/// The vproc's zsh state, created on first use.
+	pub fn zsh_state(&mut self) -> &mut VprocZsh {
+		self.zsh.get_or_insert_with(Box::default)
+	}
+
 	/// zsh's current sticky emulation.
 	pub fn sticky(&self) -> Option<&crate::bash::store::Sticky> {
 		self.zsh.as_ref().and_then(|z| z.sticky.as_ref())
@@ -462,6 +549,66 @@ impl OwnTraps {
 			_ => Self { pseudo: self.pseudo | Self::bit(key), signals: self.signals },
 		}
 	}
+
+	/// The set without `key`, a pseudo-signal (a signal key is kept).
+	pub const fn without(self, key: crate::bash::store::TrapKey) -> Self {
+		Self { pseudo: self.pseudo & !Self::bit(key), signals: self.signals }
+	}
+}
+
+/// The signals of [`Vproc::async_ignored`]: `INT` and `QUIT` ignored, one
+/// bit each, and one bit more each for an ignored signal the vproc acts on
+/// itself all the same ([`Self::trapped`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsyncIgnored(u8);
+
+impl AsyncIgnored {
+	/// `INT` and `QUIT`, as an asynchronous command starts.
+	pub const INT_QUIT: Self = Self(Self::bit(Signal::Int) | Self::bit(Signal::Quit));
+	/// Neither signal.
+	pub const NONE: Self = Self(0);
+
+	/// The bit of `sig`: none for a signal other than `INT` and `QUIT`.
+	const fn bit(sig: Signal) -> u8 {
+		match sig {
+			Signal::Int => 1,
+			Signal::Quit => 2,
+			_ => 0,
+		}
+	}
+
+	/// The [`Self::trapped`] bit of `sig`.
+	const fn trapped_bit(sig: Signal) -> u8 {
+		Self::bit(sig) << 2
+	}
+
+	/// Whether `sig` is ignored.
+	pub const fn has(self, sig: Signal) -> bool {
+		self.0 & Self::bit(sig) != 0
+	}
+
+	/// Whether the vproc acts on `sig` itself, while what it starts ignores
+	/// it (kept only while `sig` is ignored): the vproc it forked from had
+	/// named `sig` in `trap`, or had this bit itself; bash's fork keeps its
+	/// parent's own disposition (`exec::fork_async_ignored` sets it for
+	/// `INT`).
+	pub const fn trapped(self, sig: Signal) -> bool {
+		self.0 & Self::trapped_bit(sig) != 0
+	}
+
+	/// The set without `sig`, ignored or trapped.
+	pub const fn without(self, sig: Signal) -> Self {
+		Self(self.0 & !(Self::bit(sig) | Self::trapped_bit(sig)))
+	}
+
+	/// The set with `sig`, if ignored, also [`Self::trapped`].
+	pub const fn with_trapped(self, sig: Signal) -> Self {
+		if self.has(sig) {
+			Self(self.0 | Self::trapped_bit(sig))
+		} else {
+			self
+		}
+	}
 }
 
 /// `getopts` progress between calls (bash's `sh_optind`, `sh_curopt` and
@@ -500,6 +647,9 @@ pub struct JobTable {
 	/// it without job control and with an empty job table. A command
 	/// substitution keeps both (it lists its parent's jobs).
 	pub subshell: bool,
+	/// Where a command or process substitution leaves this shell: which
+	/// background jobs a signal killed it reports ([`super::killed`]).
+	pub comsub:   Comsub,
 	/// The statuses of background jobs that left the table (bash's bgp
 	/// list: `delete_job`'s `bgp_add`), oldest first, at most [`BGP_MAX`]:
 	/// `wait PID` finds one once its job left the table. The root's is in
@@ -526,6 +676,38 @@ pub struct SavedStatus {
 	/// Its place in the list: kept later than every smaller one (a store
 	/// image keeps the order by it).
 	pub seq:    u64,
+}
+
+/// A shell's place under a command or process substitution (bash
+/// `SUBSHELL_COMSUB` and `startup_state`), for its notices of the
+/// background jobs a signal killed ([`super::killed`]). bash's
+/// `command_substitute` and `process_substitute` set both in the
+/// substitution's process (`startup_state` to 2, as a `-c` shell's); each
+/// fork of it starts a new `subshell_environment` without the flag
+/// (`execute_in_subshell` for a `( … )`, a compound command that is a
+/// pipeline stage or runs with `&`; `execute_simple_command`'s child for a
+/// simple one) and keeps `startup_state`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Comsub {
+	/// Neither, nor a fork of one.
+	#[default]
+	No,
+	/// The substitution's own process, with what it runs without a fork
+	/// (a function, `eval`, `.`): it reports none.
+	Own,
+	/// A fork of one: it reports them, but in posix mode none, as a posix
+	/// `-c` shell does not (`startup_state` 2).
+	Fork,
+}
+
+impl Comsub {
+	/// Where a fork of a shell in `self` is.
+	pub const fn forked(self) -> Self {
+		match self {
+			Self::No => Self::No,
+			Self::Own | Self::Fork => Self::Fork,
+		}
+	}
 }
 
 /// What a job spec names (bash `get_job_spec`), without its `%`.
@@ -599,9 +781,25 @@ impl JobTable {
 			inherited: false,
 			wd,
 			os_pid: None,
+			signal: None,
+			procs: None,
+			unreaped: false,
 		});
 		self.reset_current();
 		number
+	}
+
+	/// The process of vproc `vpid` of one of the jobs ([`Job::procs`]) is
+	/// the program of OS pid `pid`.
+	pub fn proc_settled(&mut self, vpid: Vpid, pid: u32) {
+		if let Some(p) = self
+			.list
+			.iter_mut()
+			.filter_map(|j| j.procs.as_deref_mut())
+			.find_map(|procs| procs.get_mut(vpid))
+		{
+			p.os_pid = Some(pid);
+		}
 	}
 
 	/// Remove job `number` (bash `delete_job`); a removed current or
@@ -613,6 +811,15 @@ impl JobTable {
 			self.reset_current();
 		}
 		Some(job)
+	}
+
+	/// bash reaped every child that had ended ([`Job::unreaped`]): it does as
+	/// it waits for a foreground command (`wait_for`'s `waitchld` takes in
+	/// each child that ended, not only the one it waits for).
+	pub fn all_reaped(&mut self) {
+		for job in &mut self.list {
+			job.unreaped = false;
+		}
 	}
 
 	/// Remove every job `pick` selects, as [`Self::remove`] does.
@@ -1068,6 +1275,67 @@ impl Vproc {
 				})
 			})
 	}
+
+	/// Whether it waits for a forked foreground job: a subshell, a
+	/// pipeline stage, an external (bash's `wait_for` of a job, whose
+	/// `set_job_status_and_cleanup` runs the `INT` trap); not a command
+	/// substitution, which is no job, nor a builtin's callout or task.
+	pub fn waiting_for_a_fork(&self) -> bool {
+		self.frames.iter().any(|frame| {
+			frame.scratch.as_ref().is_some_and(|scratch| {
+				!scratch.children.is_empty()
+					|| matches!(
+						scratch.exec.as_ref().and_then(|exec| exec.waiting),
+						Some(Awaited::Ext { .. })
+					)
+			})
+		})
+	}
+
+	/// Whether the `wait` builtin is waiting for its jobs (bash's
+	/// `this_shell_builtin == wait_builtin` while it waits).
+	pub fn in_wait_builtin(&self) -> bool {
+		self.frames.iter().any(|frame| {
+			frame
+				.scratch
+				.as_ref()
+				.and_then(|s| s.exec.as_ref())
+				.is_some_and(|e| {
+					e.target == Some(Target::Intrinsic(crate::bash::ids::IntrinsicId::Wait))
+						&& matches!(
+							e.waiting,
+							Some(Awaited::Jobs { .. } | Awaited::AllJobs | Awaited::AnyJob { .. })
+						)
+						&& !e.wait_for.is_empty()
+				})
+		})
+	}
+
+	/// Whether bash runs with its job list frozen (`jobs_list_frozen` > 0): in
+	/// a trap it runs so ([`ScriptKind::Trap`]'s `frozen`), or in the last
+	/// stage of a pipeline it runs in the shell (`lastpipe`,
+	/// `execute_pipeline`'s `freeze_jobs_list (1)`). No job is reported or
+	/// deleted meanwhile, and `wait -n` returns at once.
+	pub fn jobs_frozen(&self) -> bool {
+		let trap = self.trap_frames != 0
+			&& self.frames.iter().any(|f| {
+				matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { frozen: true, .. }, .. })
+			});
+		trap
+			|| (self.mode.dialect() == crate::bash::ids::Dialect::Bash
+				&& self.frames.iter().any(|f| f.kind == FrameKind::Stage))
+	}
+
+	/// Whether bash deletes no job now (`jobs_list_frozen` ≠ 0): its job list
+	/// is frozen ([`Self::jobs_frozen`]), or it runs a function substitution
+	/// (`${ …; }`, `${| …; }`: `function_substitute`'s `freeze_jobs_list
+	/// (-1)`), where jobs are still reported and marked reported. The next
+	/// cleanup outside deletes what was marked.
+	pub fn jobs_kept(&self) -> bool {
+		self.jobs_frozen()
+			|| (self.mode.dialect() == crate::bash::ids::Dialect::Bash
+				&& self.frames.iter().any(|f| f.kind == FrameKind::NoFork))
+	}
 }
 
 /// Why a vproc is parked, and the wake count it parked at.
@@ -1108,6 +1376,23 @@ pub struct Run {
 	/// `find -exec`): it stands for the external program the callout runs,
 	/// so its frame runs no DEBUG trap ([`FrameFlags::no_debug_trap`]).
 	pub callout:           bool,
+}
+
+/// Where the base frame of a child sits in bash's `parse_and_execute` levels
+/// ([`FrameFlags::parse_level`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParseLevel {
+	/// Outside every level it starts: every frame but such a child's base.
+	#[default]
+	Outside,
+	/// A child forked inside an `eval`, `.` or trap action: bash's fork keeps
+	/// `parse_and_execute_level`, but the child's jumps go to its own top
+	/// (`execute_in_subshell`), which is no level of its own.
+	Kept,
+	/// A command or process substitution, whose text bash runs with
+	/// `parse_and_execute`: a level of its own (`command_substitute`,
+	/// `process_substitute`).
+	Substitution,
 }
 
 /// What kind of activation a frame is.
@@ -1179,6 +1464,10 @@ pub struct ScriptAux {
 	/// text is parsed before any of it runs, so every command parses with
 	/// the features and aliases of the first.
 	pub parse:   Option<ParseSnapshot>,
+	/// The text is a command a builtin built (`jobs -x`), which bash runs
+	/// with `execute_command`: no line of it is read as input, and none
+	/// reports a job ([`super::killed::line_read`]).
+	pub no_line: bool,
 }
 
 /// The parse context a zsh string keeps for all its commands
@@ -1207,18 +1496,28 @@ pub enum ScriptKind {
 	Hook,
 	/// A trap action, restoring the interrupted status when it finishes.
 	Trap {
-		key:           crate::bash::store::TrapKey,
-		status:        i32,
-		cancel:        Option<i32>,
-		return_target: Option<usize>,
-		/// An ERR trap run by `set -e`: the shell exits with `status` when
-		/// the trap ends.
-		exit:          bool,
+		key:               crate::bash::store::TrapKey,
+		status:            i32,
+		cancel:            Option<i32>,
+		return_target:     Option<usize>,
+		/// An ERR trap run by `set -e`, or an EXIT trap `exit_shell`
+		/// started: the shell exits with `status` when the trap ends.
+		exit:              bool,
 		/// zsh: the `TRAPNAL` function this frame called ended by `return`
 		/// (zsh's `trapreturn`). Only such a non-zero status ends the
 		/// interrupted code; a function that falls off its end with one
 		/// does not.
-		returned:      bool,
+		returned:          bool,
+		/// bash runs it with the job list frozen (`jobs_list_frozen`): a
+		/// `CHLD` trap the `wait` builtin runs, an `INT` trap its wait for
+		/// a forked foreground command runs. Nothing reports a job while it
+		/// runs ([`super::killed`]).
+		frozen:            bool,
+		/// An EXIT trap started after `set -e` left a function where bash's
+		/// `reset_local_contexts` ran first (the `-c` string's or an `eval`'s
+		/// `parse_and_execute`, a script's `reader_loop` outside posix
+		/// mode): its jumps see no function context until it calls one.
+		outside_functions: bool,
 	},
 	/// Shell code a builtin runs as zsh's `execode`/`execstring` do with
 	/// a context name (`zstyle -e` values, `zregexparse` guards and
@@ -1265,13 +1564,16 @@ impl FrameKind {
 }
 
 /// Bits of a [`Frame`] that only a vproc's base frame or a run's first frame
-/// sets, two in one byte ([`Frame::flags`]).
+/// sets, in one byte ([`Frame::flags`]): two flags and a [`ParseLevel`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameFlags(u8);
 
 impl FrameFlags {
 	const COMMAND_LOOP: u8 = 1;
 	const NO_DEBUG_TRAP: u8 = 2;
+	/// The two bits of [`Self::parse_level`].
+	const PARSE_LEVEL: u8 = 0b1100;
+	const PARSE_LEVEL_SHIFT: u32 = 2;
 
 	/// The base frame of a fork: a fatal error in it, run as a forked
 	/// simple command, reaches bash's command loop when its forking
@@ -1303,6 +1605,27 @@ impl FrameFlags {
 	/// Sets [`Self::no_debug_trap`].
 	pub const fn set_no_debug_trap(&mut self, on: bool) {
 		self.set(Self::NO_DEBUG_TRAP, on);
+	}
+
+	/// Where the base frame of a child sits in bash's `parse_and_execute`
+	/// levels; every other frame is outside them.
+	#[must_use]
+	pub const fn parse_level(self) -> ParseLevel {
+		match (self.0 & Self::PARSE_LEVEL) >> Self::PARSE_LEVEL_SHIFT {
+			0 => ParseLevel::Outside,
+			1 => ParseLevel::Kept,
+			_ => ParseLevel::Substitution,
+		}
+	}
+
+	/// Sets [`Self::parse_level`].
+	pub const fn set_parse_level(&mut self, level: ParseLevel) {
+		let bits: u8 = match level {
+			ParseLevel::Outside => 0,
+			ParseLevel::Kept => 1,
+			ParseLevel::Substitution => 2,
+		};
+		self.0 = (self.0 & !Self::PARSE_LEVEL) | (bits << Self::PARSE_LEVEL_SHIFT);
 	}
 
 	const fn set(&mut self, bit: u8, on: bool) {
@@ -1360,10 +1683,13 @@ pub struct Frame {
 	/// byte after `Frame`'s fields smaller than 8 B (two `u32`s, two
 	/// `Option<u32>`s and seven `bool`s: 31 B), so `Frame` keeps its size.
 	pub flags:             FrameFlags,
-	/// The base frame of a `( … )` child: the line bash reports for errors
-	/// of the compound commands it runs directly (the subshell's last line,
-	/// where bash's parser recorded it).
-	pub subshell_line:     Option<u32>,
+	/// The base frame of a child vproc: bash's `line_number` as it forked
+	/// the process, which the process names for what it waits for
+	/// ([`super::killed::wait_line`]): the last line of a `( … )`, where
+	/// bash's parser recorded it (`Subshell->line`; also the line of errors
+	/// of the compound commands a `( … )` runs directly), else the line its
+	/// parent had reached.
+	pub fork_line:         Option<u32>,
 	/// A function frame: the getopts state at the call, put back on return
 	/// when the function made `OPTIND` local (bash
 	/// `sh_getopt_save_istate`/`sh_getopt_restore_istate`). `None` is the
@@ -1394,7 +1720,7 @@ impl Frame {
 			err_reported: false,
 			ignore_errexit: false,
 			flags: FrameFlags(0),
-			subshell_line: None,
+			fork_line: None,
 			getopts: None,
 		}
 	}
@@ -1587,6 +1913,31 @@ pub enum Atom {
 	/// assigns again as it replays, so it sees the first pass's state at
 	/// every point.
 	Wrote { name: BString, old: Box<Self>, new: Option<BString> },
+	/// The binding of `name` at `level` an argument of a declaration
+	/// builtin (`declare`, `typeset`, `local`, `export`, `readonly`) was
+	/// about to change, as it was on the builtin's first run (`old`: its
+	/// value, `None` when unset; `bound`: whether the place an assignment at
+	/// `level` lands had the name at all). A run again after a later
+	/// argument's `$(…)` parked it puts the binding back before the
+	/// argument is redone, so each argument applies once (`declare x+=1
+	/// a='($(echo 2))'`); a binding the first run did not have is removed,
+	/// not left declared but unset, so a function's `local x` refused over
+	/// a readonly global `x` is refused again.
+	Bound { name: BString, level: Level, old: Option<Var>, bound: bool },
+	/// No binding to put back at this point of a declaration builtin's
+	/// replay log: on its first run the argument had none there (its name
+	/// is no name reference, no temporary binds it). A run again keeps
+	/// that, because the argument's own effect changes what a run again
+	/// would find (`local r` shadows the global reference `r` whose target
+	/// the first run kept), and a run that logged nothing here would read
+	/// the next point's atom
+	/// ([`Ctx::rollback_point_once`](super::builtins::Ctx::rollback_point_once)).
+	Unbound,
+	/// The results, in order, of the arithmetic an argument of a builtin
+	/// evaluated on its first run (`declare -i y=w++`, `unset 'c[w++]'`): a
+	/// run again takes them and evaluates nothing, so the arithmetic's own
+	/// assignments and `RANDOM` draws happen once.
+	Arith(Vec<i64>),
 }
 
 /// Per-op scratch: expansion replay logs, staged progress and transient
@@ -1607,8 +1958,10 @@ pub struct Scratch {
 	pub live:        Live,
 	/// Children of a `Spawn` op, with their statuses as they exit.
 	pub children:    Vec<(Vpid, Option<i32>)>,
-	/// A `Spawn` running its last stage in this shell (`lastpipe`).
-	pub inline:      Option<InlineStage>,
+	/// A pipeline `Spawn`'s own progress ([`PipelineWait`]), created on
+	/// first use ([`Self::pipeline()`]) and kept, cleared, by
+	/// [`Self::recycle`]: one pointer, most ops have none.
+	pub pipeline:    Option<Box<PipelineWait>>,
 	/// A finished `Exec`'s state kept so the next command reuses its
 	/// allocations; never serialized.
 	pub spare_exec:  Option<Box<ExecState>>,
@@ -1622,7 +1975,7 @@ impl Scratch {
 	/// Clear for the next op, keeping allocations: a finished `Exec`'s
 	/// state becomes the spare.
 	pub fn recycle(&mut self) {
-		let Self { logs, sub, exec, io, live, children, inline, spare_exec, spare_words: _ } = self;
+		let Self { logs, sub, exec, io, live, children, pipeline, spare_exec, spare_words: _ } = self;
 		for log in logs {
 			log.clear();
 		}
@@ -1641,7 +1994,31 @@ impl Scratch {
 			*live = Live::None;
 		}
 		children.clear();
-		*inline = None;
+		if let Some(pipeline) = pipeline {
+			pipeline.inline = None;
+			pipeline.procs.list.clear();
+			pipeline.procs.pipefail = false;
+		}
+	}
+
+	/// A pipeline `Spawn`'s progress, created on first use.
+	pub fn pipeline(&mut self) -> &mut PipelineWait {
+		self.pipeline.get_or_insert_with(Box::default)
+	}
+
+	/// The last stage of a `Spawn`'s pipeline running in this shell
+	/// (`lastpipe`), if any ([`PipelineWait::inline`]).
+	pub fn inline(&self) -> Option<InlineStage> {
+		self.pipeline.as_ref().and_then(|p| p.inline)
+	}
+
+	/// The process of vproc `vpid` of the pipeline the `Spawn` waits for
+	/// ([`PipelineWait::procs`]).
+	pub fn process_mut(&mut self, vpid: Vpid) -> Option<&mut JobProc> {
+		self
+			.pipeline
+			.as_deref_mut()
+			.and_then(|p| p.procs.get_mut(vpid))
 	}
 
 	/// The op's I/O progress, created on first use (the first redirection,
@@ -1663,6 +2040,20 @@ impl Scratch {
 	pub fn probing(&self) -> Option<&Probe> {
 		self.io.as_ref().and_then(|io| io.probing.as_ref())
 	}
+}
+
+/// What a pipeline `Spawn` keeps beside its children ([`Scratch::pipeline`]).
+#[derive(Default)]
+pub struct PipelineWait {
+	/// Its last stage running in this shell (`lastpipe`).
+	pub inline: Option<InlineStage>,
+	/// Its processes, when the shell waits for it (bash's foreground job's
+	/// `PROCESS` list), each with how it ended as it is reaped, and the
+	/// `pipefail` it ended under: the notice of one a signal killed names
+	/// them ([`super::killed::pipeline_ended`]). None under `lastpipe`, nor
+	/// for the pipeline that is a background job's command (that job's,
+	/// [`Job::procs`]).
+	pub procs:  JobProcs,
 }
 
 /// The I/O progress of an op: redirections, the fds they saved, file
@@ -1928,58 +2319,62 @@ pub enum ProbeResult {
 /// Serializable progress of an `Exec` (survives externalize/restore).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecState {
-	pub stage:       Stage,
-	pub tag:         CmdTag,
-	pub t0:          u64,
-	pub argv:        Vec<BString>,
+	pub stage:         Stage,
+	pub tag:           CmdTag,
+	pub t0:            u64,
+	pub argv:          Vec<BString>,
 	/// The words are expanded (`argv`, `compound` are final).
-	pub expanded:    bool,
+	pub expanded:      bool,
 	/// argv indexes of compound-assignment words (`declare a=(…)`).
-	pub compound:    Vec<u32>,
+	pub compound:      Vec<u32>,
 	/// Fields still to pathname-expand: `(argv index, escaped pattern)`.
-	pub globs:       Vec<(u32, BString)>,
+	pub globs:         Vec<(u32, BString)>,
 	/// Prefix assignments as `(name, shown value)` for events.
-	pub assigns:     Vec<(BString, BString)>,
+	pub assigns:       Vec<(BString, BString)>,
 	/// Expanded prefix assignments: subscript and value.
-	pub values:      Vec<(Option<BString>, AssignValue)>,
+	pub values:        Vec<(Option<BString>, AssignValue)>,
 	/// `set -k`: `words` indexes of the assignment words taken out of
 	/// `argv`; their values follow the prefix ones in `values`.
-	pub keywords:    Vec<u32>,
+	pub keywords:      Vec<u32>,
 	/// argv indexes of single fields from words written as array
 	/// references ([`super::builtins::Ctx::arrayref`]).
-	pub arrayref:    Vec<u32>,
-	pub target:      Option<Target>,
-	pub waiting:     Option<Awaited>,
+	pub arrayref:      Vec<u32>,
+	pub target:        Option<Target>,
+	pub waiting:       Option<Awaited>,
 	/// A temporary scope (builtin environment) was pushed for this command.
-	pub scoped:      bool,
+	pub scoped:        bool,
 	/// Control transfer to perform once the output is written.
-	pub control:     Option<Transfer>,
+	pub control:       Option<Transfer>,
 	/// `Task::checkpoint` bytes taken at externalize (a boxed slice: the
 	/// size guard below counts every byte of this state).
-	pub checkpoint:  Option<Box<[u8]>>,
+	pub checkpoint:    Option<Box<[u8]>>,
 	/// Command output still to be written.
-	pub writes:      VecDeque<PendingWrite>,
-	pub status:      i32,
+	pub writes:        VecDeque<PendingWrite>,
+	pub status:        i32,
 	/// Status of the last command substitution (`$?` of `x=$(…)`).
-	pub sub_status:  Option<i32>,
+	pub sub_status:    Option<i32>,
 	/// Children `wait` waits for.
-	pub wait_for:    Vec<Vpid>,
+	pub wait_for:      Vec<Vpid>,
 	/// `exec command`: how the command replaces the shell.
-	pub exec_as:     Option<Box<ExecAs>>,
+	pub exec_as:       Option<Box<ExecAs>>,
 	/// `wait -p var`: the variable that gets the waited child's pid.
-	pub wait_into:   Option<Box<BString>>,
+	pub wait_into:     Option<Box<BString>>,
 	/// Run through `command`: a special builtin's failure does not end a
 	/// posix shell.
 	pub via_command: bool,
+	/// The prefix the command's words start with, as bash's
+	/// `execute_simple_command` and `execute_builtin` read it: the outer
+	/// one, not the last (`command builtin export` is `command`'s).
+	pub prefix:      Prefix,
 	/// The awaited frame was pushed by the builtin, which runs again when
 	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).
-	pub resume:      bool,
+	pub resume:        bool,
 	/// Times the builtin ran again after a frame it pushed returned.
-	pub resumed:     u32,
+	pub resumed:       u32,
 	/// A forked pipeline element's builtin or function was put one
 	/// subshell level down ([`super::exec::raise_element_level`]), once.
 	#[serde(default)]
-	pub raised:      bool,
+	pub raised:        bool,
 	/// The `{var}` redirections made so far of a command bash makes them for
 	/// in its fork (an external, a name not found, a null command that
 	/// forks): neither the fd nor the value reaches the shell, which forgets
@@ -1990,7 +2385,22 @@ pub struct ExecState {
 		clippy::box_collection,
 		reason = "8 B where a Vec is 24: the size guard below counts every byte"
 	)]
-	pub var_fds:     Option<Box<Vec<VarFd>>>,
+	pub var_fds:       Option<Box<Vec<VarFd>>>,
+	/// bash's notice of the command a signal killed, written to the shell's
+	/// own standard error once the command's redirections are undone
+	/// ([`super::killed`]).
+	#[serde(default)]
+	pub notice:        Option<Box<BString>>,
+	/// The external runs in place of the shell: the last command of a `-c`
+	/// string the real shell runs without a fork ([`super::killed::in_place`]).
+	/// A signal sent to the shell is the program's then, as for `exec`.
+	#[serde(default)]
+	pub in_place:      bool,
+	/// bash runs this external with `exec` in the subshell's, job's or
+	/// stage's own process ([`super::killed::subshell_exec`]): its end is
+	/// the process's ([`super::transparent`]).
+	#[serde(default)]
+	pub subshell_exec: bool,
 }
 
 /// A `{var}` redirection bash makes in a fork (a command bash forks for, a
@@ -2001,6 +2411,19 @@ pub struct VarFd {
 	pub fd:    i32,
 	pub name:  BString,
 	pub prior: Option<crate::bash::store::Var>,
+}
+
+/// The prefix word a simple command starts with ([`ExecState::prefix`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Prefix {
+	/// No prefix: the command word itself.
+	#[default]
+	None,
+	/// `command` (bash's `CMD_COMMAND_BUILTIN`, every leading one).
+	Command,
+	/// `builtin`: bash runs `builtin_builtin`, which runs the builtin it
+	/// names.
+	Builtin,
 }
 
 /// Options of `exec [-cl] [-a name] command`.
@@ -2022,7 +2445,9 @@ pub enum Transfer {
 		n:    u32,
 		cont: bool,
 	},
-	Exit(i32),
+	/// The shell exits with this status by this jump (it decides what the
+	/// `time`s the jump leaves report).
+	Exit(i32, super::exec::Jump),
 	/// The rest of the line is abandoned with this status (a `-c` string
 	/// whole).
 	DiscardAll(i32),
@@ -2151,8 +2576,13 @@ pub enum Awaited {
 	},
 	/// Every background child (`wait` without operands); the status is 0.
 	AllJobs,
-	/// The first of the children to finish (`wait -n`); its status.
-	AnyJob,
+	/// The first of the children to finish (`wait -n`); its status. Once it
+	/// waited, `waited` is how many of them had finished then: when one
+	/// more did, bash's second pass takes any finished job, a reported one
+	/// too (`wait_for_any_job`).
+	AnyJob {
+		waited: Option<u32>,
+	},
 }
 
 /// Transient handles; never serialized.
@@ -2234,11 +2664,16 @@ impl Live {
 // in the 4 bytes `trap_frames` had; a `break` waiting in `${ }`
 // (`Vproc::pending_break`, boxed, 8 B) brings it to at most 1,848 B, and
 // bash's kept statuses (`JobTable::bgp`, one pointer, `None` while empty)
-// to at most 1,856 B.
+// to at most 1,856 B. bash's pending notice of a killed command
+// (`ExecState::notice`, 8 B) and bash's asynchronous ignore of `INT` and
+// `QUIT` (`Vproc::async_ignored`, one byte, in place of a store record in
+// each background vproc's image: the bench, a debug build, measured 2,458
+// → 1,879 B per idle vproc for that move alone) fit the bounds below with
+// the rest; the idle bench gives the figure for the whole.
 const _: () = assert!(size_of::<Vproc>() <= 688, "Vproc grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<ExecState>() <= 376, "ExecState grew (idle vproc ≤ 2 KiB)");
+const _: () = assert!(size_of::<ExecState>() <= 384, "ExecState grew (idle vproc ≤ 2 KiB)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one
 // pointer only; `RedirProgress` not at all).

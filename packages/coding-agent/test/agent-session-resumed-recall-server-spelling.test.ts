@@ -1,6 +1,6 @@
 /**
  * A session under Hindsight memory sends its first-turn recall as the system prompt's last block and records it with
- * the server, account, bank and tags it read. `fetch` reads `hindsight.apiUrl` as a URL, so a scheme or host in
+ * the server, bank and tags it read. `fetch` reads `hindsight.apiUrl` as a URL, so a scheme or host in
  * capitals and a default port spelled out reach the server the plain spelling reaches; the request's headers drop the
  * whitespace around the API token, so a token read with a trailing newline (an env file) authenticates as the same
  * account. A process that resumes the session within its cache entry's life under either spelling, from a server that

@@ -350,8 +350,8 @@ fn make_root() -> io::Result<tempfile::TempDir> {
 }
 
 /// Run case `index` of `suite` (see the module docs) and assert every
-/// `comptest` report equals zsh's. Skips (passing) when zsh's completion
-/// functions are not installed.
+/// `comptest` report equals zsh's. Compares nothing when zsh's completion
+/// functions are not installed, and says so ([`compsys_fpath`]).
 ///
 /// # Panics
 ///
@@ -359,7 +359,6 @@ fn make_root() -> io::Result<tempfile::TempDir> {
 /// reports and the raw log.
 pub fn run_case(suite: &Suite, index: usize) {
 	let Some(fpath) = compsys_fpath() else {
-		eprintln!("skipped: zsh 5.9 completion functions are not installed");
 		return;
 	};
 	let root = make_root().expect("temporary work directory");

@@ -19,7 +19,8 @@ export function isNativeShell(word: string | undefined): word is string {
 
 /**
  * Run the shell `argv[0]` names with the rest of `argv` as its command line,
- * then exit the process with its status.
+ * then exit the process with its status. A shell that died of a signal ends
+ * the process by that signal inside `runShellMain`, as the real shell's does.
  */
 export async function runNativeShell(argv: string[]): Promise<never> {
 	// Command boundary: only the shell path loads the native addon here.

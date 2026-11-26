@@ -15,6 +15,7 @@
 ### Fixed
 
 - A remote completion (`llm.mode` remote) and an API embedding request (an API embedding model such as `openai/text-embedding-3-small`) read pi-ai's model-call guards before each attempt, so a hold such as coding-agent's `cyber_policy` hold sends neither. Each also reports an error it meets to the guards, so a `cyber_policy` refusal the endpoint relays starts coding-agent's hold, and never retries a `cyber_policy` refusal, even one relayed as a 5xx. The guards see a model built from the configured name: its family comes from the id (`openai/text-embedding-3-small` is OpenAI's, and an id the catalog cannot place is of an unknown family), and the `<provider>/` part names the route. A held or refused request returns no summary or vector, as a failed one does
+- Fixed a memory store failing to open, or a model-change embedding rebuild aborting, when one memory row holds a non-text id or content (such as a row SQLite's `.recover` restored from a damaged database): the rebuild now skips that row and logs a warning naming its table and rowid, at most 10 such warnings per open and then one line with the total
 
 ## [18.18.4] - 2026-11-09
 

@@ -3608,10 +3608,15 @@ export declare function renderSnapcompactPng(text: string, options: SnapcompactR
  * `argv[0]` naming it (`zsh`, `bash` or `sh` pick the dialect), as a real
  * shell gets it. Synchronous: blocks the calling thread until the shell
  * exits and returns the status the process should exit with (0–255; 101
- * after a panic). The shell uses the process's own stdin, stdout, stderr,
- * terminal and inherited descriptors (duplicated, never taken over); the
- * job-control and termination signals the runtime handles are reset to
- * their defaults for the run and restored after it.
+ * after a panic). A shell that died of a signal (an `INT` it acts on,
+ * `kill -TERM $$`) does not return: the process dies of the same signal,
+ * as the real shell's does, once the runtime has its dispositions back.
+ * Only this entry ends its process so: the in-process shell (`Shell`,
+ * `executeShell`) ends the run with 128 + the signal's number. The shell
+ * uses the process's own stdin, stdout, stderr, terminal and inherited
+ * descriptors (duplicated, never taken over); the job-control and
+ * termination signals the runtime handles are reset to their defaults for
+ * the run and restored after it.
  */
 export declare function runShellMain(argv: Array<string>): number
 

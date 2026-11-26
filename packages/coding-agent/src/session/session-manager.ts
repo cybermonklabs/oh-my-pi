@@ -7410,9 +7410,12 @@ export class SessionManager {
 	/**
 	 * Journal an idle recap for this session in history.db. Recaps never enter
 	 * the session file or LLM context; in-memory sessions are not journaled.
+	 * Every other store journals them, `session.storage: sql` as files do: the
+	 * archive's recap views and a resumed session's recap line read only this
+	 * journal, so a store left out would show no recap at all.
 	 */
 	recordRecap(recap: string): void {
-		if (this.#persist && this.#storage instanceof FileSessionStorage) {
+		if (this.#persist && !(this.#storage instanceof MemorySessionStorage)) {
 			recordMaskedHistory(this, recap, "recap", stored => recordSessionRecap(this.#sessionId, this.#cwd, stored));
 		}
 	}

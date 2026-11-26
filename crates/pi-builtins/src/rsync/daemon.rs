@@ -615,7 +615,7 @@ mod tests {
 	use super::*;
 	use crate::rsync::{
 		log::LogConfig,
-		transport::{Connection, local_pair},
+		transport::{Connection, local_pair, wait},
 	};
 
 	const PASSWORD: &[u8] = b"s3cr3t pw";
@@ -920,12 +920,16 @@ mod tests {
 		assert_eq!(err.code, RERR_CONTIMEOUT);
 		assert_eq!(err.message.as_deref(), Some("[Receiver] connection timed out -- exiting"));
 		assert_eq!(err.site, Some(("io.c", 173)));
-		// The limit is gone once the handshake returned.
+		// The limit is gone once the handshake returned: the read blocks instead of
+		// failing at its first check of the expired deadline.
+		let (tx, rx) = std::sync::mpsc::channel();
 		let probe = std::thread::spawn(move || {
+			tx.send(wait::Sleeper::current()).unwrap();
 			let mut buf = [0u8; 1];
 			let _ = conn.reader.read(&mut buf);
 		});
-		std::thread::sleep(Duration::from_millis(300));
+		let reader = rx.recv().unwrap();
+		reader.wait_asleep("the read after the handshake to block", Duration::from_millis(300));
 		assert!(!probe.is_finished());
 		drop(server);
 		probe.join().unwrap();
@@ -1105,16 +1109,22 @@ mod tests {
 	#[test]
 	fn cancellation_during_greeting_maps_to_signal() {
 		let cancel = Arc::new(AtomicBool::new(false));
-		let (mut conn, _server) = local_pair(Arc::clone(&cancel));
+		let (mut conn, mut server) = local_pair(Arc::clone(&cancel));
 		let fs = pi_vfs::BlockingFs::native();
 		let args = [OsString::from("mod")];
 		let flag = Arc::clone(&cancel);
-		std::thread::spawn(move || {
-			std::thread::sleep(Duration::from_millis(100));
+		let handshake = wait::Sleeper::current();
+		let canceller = std::thread::spawn(move || {
+			// Cancel once the greeting is out and the handshake sleeps waiting for
+			// the daemon's.
+			line(&mut BufReader::new(&mut server.reader));
+			handshake.wait_asleep("the handshake to block on the reply", Duration::from_millis(100));
 			flag.store(true, Ordering::Relaxed);
+			server
 		});
 		let (logger, ..) = test_logger();
 		let err = daemon_handshake(&mut conn, &base_cfg(&args, &fs), &logger).unwrap_err();
+		drop(canceller.join().unwrap());
 		assert_eq!(err.code, crate::rsync::exit::RERR_SIGNAL);
 	}
 }

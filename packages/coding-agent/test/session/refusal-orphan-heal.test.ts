@@ -3,7 +3,7 @@
 // stored the refused assistant turn. Every later request then replayed that
 // orphan as a bare user message, the quoted refusal got the next turn refused,
 // and the session could take no turn again — 14 Legion roles in 13 pods on
-// 2026-11-04 (INFRA-1191, measured in dispatch://INFRA-1182 over 493 replays).
+// 2026-11-04, measured over 493 replays.
 //
 // Three contracts here: the placeholder's model-visible text carries no
 // provider words, an orphan is never stored, and a session that already has
@@ -27,9 +27,9 @@ const REFUSAL_MARKER = "STANDIN-REFUSAL-TEXT-d41d8cd98f00";
 
 const FIXTURES = path.join(import.meta.dir, "..", "fixtures", "refusal-orphans");
 const STUCK_SESSIONS = [
-	{ file: "infra-317-implementer.jsonl", storedOrphans: 12, realResults: 3 },
-	{ file: "infra-771-implementer.jsonl", storedOrphans: 11, realResults: 2 },
-	{ file: "infra-839-tester.jsonl", storedOrphans: 5, realResults: 4 },
+	{ file: "implementer-a.jsonl", storedOrphans: 12, realResults: 3 },
+	{ file: "implementer-b.jsonl", storedOrphans: 11, realResults: 2 },
+	{ file: "tester-a.jsonl", storedOrphans: 5, realResults: 4 },
 ];
 
 const usage = {
@@ -270,7 +270,7 @@ describe("stored stuck sessions heal when they are loaded", () => {
 	}
 
 	it("sends nothing of the provider's refusal in the next request", async () => {
-		const entries = await loadFixture("infra-317-implementer.jsonl");
+		const entries = await loadFixture("implementer-a.jsonl");
 		// The stored file still carries it — the fix rewrites no history.
 		expect(JSON.stringify(entries)).toContain(REFUSAL_MARKER);
 

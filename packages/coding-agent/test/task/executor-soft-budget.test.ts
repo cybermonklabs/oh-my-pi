@@ -343,7 +343,7 @@ describe("runSubprocess soft request budget", () => {
 		expect(JSON.parse(result.output)).toEqual({ report: "partial findings" });
 		// A "completed" result must still say it crossed budget and how to
 		// resume: the parent otherwise has no signal to continue this agent
-		// instead of spawning a successor that rereads its handoff (INFRA-28).
+		// instead of spawning a successor that rereads its handoff.
 		expect(result.budgetCrossed).toBe(true);
 		expect(result.softRequestBudget).toBe(2);
 		// The agent stays a live, adopted peer.

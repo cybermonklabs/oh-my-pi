@@ -150,7 +150,7 @@ describe("pre-response budget", () => {
  * and behind its listeners' closures that call's request body, response queue
  * and stream — unless the listeners come off. Measured on omp at a 382 KiB
  * prompt, that was 8.5 `AbortSignal`s and 447 KiB of live heap retained per
- * model call, 500 calls into a session (INFRA-1876).
+ * model call, 500 calls into a session.
  *
  * The contract is a count, not a call: after N cleared guards the number of
  * signals still live does not grow with N. A test that asserted `clear()`

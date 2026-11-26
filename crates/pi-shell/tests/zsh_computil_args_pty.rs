@@ -18,15 +18,12 @@
 #![cfg(unix)]
 
 mod pty_support;
+mod zsh_oracle;
 
 use std::{io, ops::Range, time::Duration};
 
-use pty_support::{Pty, Spawn, TIMEOUT, have_real_zsh, vt::Screen};
+use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, have_real_zsh, vt::Screen};
 
-/// The pause between keys.
-const KEY: Duration = Duration::from_millis(30);
-/// How long output must stay quiet before the screen is read.
-const QUIET: Duration = Duration::from_millis(300);
 /// The bound of waits that run `compinit` or completion functions.
 const SLOW: Duration = Duration::from_secs(120);
 
@@ -41,17 +38,19 @@ fn spawn(real: bool, rc: &str, rows: u16, cols: u16) -> Spawn {
 		.args(["-f", "-i"])
 		.env("PS1", "%# ")
 		.rc_file(".zshrc", rc)
+		.zle_sync()
 		.size(rows, cols);
 	let home = s.home().to_owned();
 	s.cwd(home)
 }
 
-/// Source the rc file (`-f` skips it) and wait until it ran.
+/// Source the rc file (`-f` skips it) and the [`Pty::zle_sync`] handler,
+/// and wait until they ran.
 fn start(pty: &mut Pty) -> io::Result<()> {
-	pty.settle(QUIET, SLOW)?;
-	pty.type_keys(". ~/.zshrc; print -r READY$((6*7))\r", KEY)?;
+	pty.wait_raw(SLOW)?;
+	pty.write(format!(". ~/.zshrc; . ~/{ZLE_SYNC_SCRIPT}; print -r READY$((6*7))\r"))?;
 	pty.read_until("READY42", SLOW)?;
-	pty.settle(QUIET, TIMEOUT)
+	pty.zle_sync(TIMEOUT)
 }
 
 /// Run `run` on obash and, when installed, on the real zsh; the outputs
@@ -272,9 +271,9 @@ fn unit(lines: &[&str]) {
 		start(&mut pty)?;
 		let mut shots = Vec::new();
 		for (i, line) in lines.iter().enumerate() {
-			pty.type_keys(format!("\x0c{line}\x18\x14\x15p {i}\r"), KEY)?;
+			pty.write(format!("\x0c{line}\x18\x14\x15p {i}\r"))?;
 			pty.read_until(format!("@@{i}@@"), SLOW)?;
-			pty.settle(QUIET, TIMEOUT)?;
+			pty.zle_sync(TIMEOUT)?;
 			shots.push(vec![pty.screen().contents()]);
 		}
 		Ok(shots)
@@ -527,24 +526,36 @@ fn completion_cases(table: &[Case], cases: Range<usize>) {
 		let run = |real: bool| -> io::Result<Vec<String>> {
 			let mut pty = spawn(real, &rc, 24, 80).spawn()?;
 			start(&mut pty)?;
-			pty.type_keys(format!("y{i}\r"), KEY)?;
+			pty.write(format!("y{i}\r"))?;
 			pty.read_until(&mark, SLOW)?;
 			pty.read_until(WIDGET_READY, SLOW)?;
 			for input in table[i].inputs {
-				for key in input.bytes() {
-					pty.type_keys([key], KEY)?;
-					if matches!(key, b'\t' | b'\x04') {
-						// Listing temporarily restores cooked/echoing tty modes.
-						// Do not inject the next key until the widget's final
-						// redraw has restored editing modes; a delay can race.
+				// The keys up to each report widget's key (Tab, `^D`), then that
+				// key, then the rest and `^Z` (`comp-finish`). The editor has
+				// drawn the keys before a widget's key when that key comes, as
+				// it had between a typist's keys: the screen a report widget
+				// leaves shows the line. Each report widget's final redraw has
+				// given the terminal back its editing modes (a listing gives it
+				// cooked, echoing modes for a while) before any later key comes.
+				for part in input.split_inclusive(['\t', '\x04']) {
+					let (keys, widget) = match part.strip_suffix(['\t', '\x04']) {
+						Some(keys) => (keys, &part[keys.len()..]),
+						None => (part, ""),
+					};
+					if !keys.is_empty() {
+						pty.write(keys)?;
+						pty.zle_sync(FINISH)?;
+					}
+					if !widget.is_empty() {
+						pty.write(widget)?;
 						pty.read_until(WIDGET_READY, FINISH)?;
 					}
 				}
-				pty.type_keys([b'\x1a'], KEY)?;
+				pty.write("\x1a")?;
 				pty.read_until("<WIDGET><finish>", FINISH)?;
 				pty.read_until(WIDGET_READY, FINISH)?;
 			}
-			pty.settle(QUIET, TIMEOUT)?;
+			pty.zle_sync(TIMEOUT)?;
 			Ok(case_screens(&pty.output(), 24, 80, &mark))
 		};
 		labels.push(format!("{} {:?}", table[i].name, table[i].inputs));

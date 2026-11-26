@@ -7,7 +7,7 @@ import { logger, setProjectDir } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import { loadSlashCommands } from "../extensibility/slash-commands";
-import { rebindMemoryBackendForCwd } from "../hindsight/backend";
+import { memoryBeforeCwdMove, rebindMemoryBackendForCwd } from "../hindsight/backend";
 import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../memory-backend";
 import { continuesConversation } from "../modes/utils/conversation-position";
 import type { FreshSessionResult, HandoffResult } from "../session/agent-session";
@@ -920,8 +920,11 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 ];
 async function rescopeHeadlessToCwd(runtime: SlashCommandRuntime, cwd: string): Promise<void> {
 	setProjectDir(cwd);
+	// Read before the reload, whose memory scope hooks can already tear the running backend down.
+	const memoryBefore = await memoryBeforeCwdMove(runtime.session);
 	await runtime.settings.reloadForCwd(cwd);
-	await rebindMemoryBackendForCwd(runtime.session);
+	const memoryWarning = await rebindMemoryBackendForCwd(runtime.session, memoryBefore);
+	if (memoryWarning) await runtime.output(memoryWarning);
 	clearClaudePluginRootsCache();
 	const src = discoverTitleSystemPromptFile(cwd);
 	const p = await resolvePromptInput(src, "title system prompt");

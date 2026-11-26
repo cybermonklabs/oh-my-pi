@@ -176,17 +176,30 @@ fn generate_with(
 	multiplex: bool,
 ) -> (Vec<u8>, usize) {
 	let wire = Buf::default();
-	let out = MuxWriter::new(Box::new(wire.clone()), IoCounters::default(), WriteConfig::default());
+	let mut out = generate_to(Box::new(wire.clone()), ctx, trees, flists, xattrs, rx, multiplex);
+	let writes = wire.writes();
+	out.flush().unwrap();
+	(wire.bytes(), writes)
+}
+
+/// Runs the generator writing to `wire`; returns its writer, not flushed yet.
+fn generate_to(
+	wire: Box<dyn Write + Send>,
+	ctx: &Ctx,
+	trees: &DestTrees,
+	flists: &Flists,
+	xattrs: Arc<Mutex<XattrReceiver>>,
+	rx: &SibIn,
+	multiplex: bool,
+) -> MuxWriter {
+	let out = MuxWriter::new(wire, IoCounters::default(), WriteConfig::default());
 	if multiplex {
 		out.start_multiplex().unwrap();
 	}
 	let acls = Arc::new(Mutex::new(AclReceiver::new(AclOpts::default(), 1 << 30)));
 	let filters = Filters::new(FilterConfig::default());
 	run(ctx, trees, flists, xattrs, acls, filters, &out, rx).unwrap();
-	let writes = wire.writes();
-	let mut out = out;
-	out.flush().unwrap();
-	(wire.bytes(), writes)
+	out
 }
 
 /// Splits a multiplexed stream into (message code, payload) frames.
@@ -638,6 +651,21 @@ fn inc_lists(log: &Logger) -> (Arc<Flists>, FileList) {
 /// at once (no lost wake-up, no polling): the generator then finishes the new segment.
 #[test]
 fn generator_wakes_when_a_segment_arrives_while_it_waits() {
+	use std::time::Duration;
+
+	/// The generator's stream: what it wrote, and a signal at each flush of it
+	/// with the number of bytes it held then.
+	struct Wire(Buf, flume::Sender<usize>);
+	impl Write for Wire {
+		fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+			self.0.write(data)
+		}
+
+		fn flush(&mut self) -> io::Result<()> {
+			let _ = self.1.send(self.0.bytes().len());
+			Ok(())
+		}
+	}
 	let tmp = tempfile::tempdir().unwrap();
 	let mut opts = base_opts();
 	opts.dry_run = true;
@@ -647,10 +675,21 @@ fn generator_wakes_when_a_segment_arrives_while_it_waits() {
 	ctx.inc_recurse = true;
 	let (flists, second) = inc_lists(&ctx.logger);
 	let (sib_out, sib_in) = sib_pipe(&flists, true);
+	let wire = Buf::default();
+	let (flush_tx, flushes) = flume::unbounded();
+	let generator = crate::rsync::transport::wait::Sleeper::current();
 	let publisher = {
 		let flists = Arc::clone(&flists);
 		std::thread::spawn(move || {
-			std::thread::sleep(std::time::Duration::from_millis(50));
+			// The output pass before the wait writes list 0's requests, one write
+			// call; the flush queued behind them runs only under the grant the
+			// generator takes after that pass, as it starts waiting for the
+			// receiver. From that flush on, the generator sleeps only in that
+			// wait, and the segment arrives once it does.
+			let held = flushes.recv_timeout(Duration::from_secs(30));
+			let held = held.expect("the generator never flushed its stream");
+			assert!(held > 0, "list 0 wrote nothing, so the flush is inside the output pass");
+			generator.wait_asleep("the generator to wait for the receiver", Duration::from_millis(50));
 			flists.push(second);
 			flists.set_eof();
 			sib_out.data(Sibling::List);
@@ -664,10 +703,12 @@ fn generator_wakes_when_a_segment_arrives_while_it_waits() {
 	};
 	let started = std::time::Instant::now();
 	let xattrs = Arc::new(Mutex::new(XattrReceiver::new(1 << 30)));
-	let (bytes, _) = generate_with(&ctx, &trees_for(tmp.path()), &flists, xattrs, &sib_in, false);
+	let to = Box::new(Wire(wire.clone(), flush_tx));
+	let mut out = generate_to(to, &ctx, &trees_for(tmp.path()), &flists, xattrs, &sib_in, false);
+	out.flush().unwrap();
 	drop(publisher.join().unwrap());
-	assert!(started.elapsed() < std::time::Duration::from_secs(5));
-	let (reqs, dones) = parse_with(&bytes, false);
+	assert!(started.elapsed() < Duration::from_secs(5));
+	let (reqs, dones) = parse_with(&wire.bytes(), false);
 	assert!(reqs.iter().any(|r| r.ndx == 4), "the late segment's file was requested");
 	// One NDX_DONE per list plus the three protocol-31 phase markers.
 	assert_eq!(dones, 2 + 3);

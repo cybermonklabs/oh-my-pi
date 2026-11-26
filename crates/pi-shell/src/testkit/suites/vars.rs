@@ -5,7 +5,12 @@
 //! filled by `mapfile` and its callbacks.
 //! Goldens: bash 5.3.20 (`bash -c`).
 
-use crate::testkit::{FakeHost, Fault, MemFs, run_script};
+use bstr::BString;
+
+use crate::{
+	bash::{EventMask, Script, ShellInit},
+	testkit::{FakeHost, Fault, MemFs, Rig, fault::skeleton_init, run_script},
+};
 
 fn run(src: &str) -> (String, String) {
 	let out = run_script(FakeHost::new(), src.as_bytes(), &[], Fault::None);
@@ -13,6 +18,80 @@ fn run(src: &str) -> (String, String) {
 		String::from_utf8_lossy(&out.stdout).into_owned(),
 		String::from_utf8_lossy(&out.stderr).into_owned(),
 	)
+}
+
+/// How long a script of the run-again tests may take before the test fails:
+/// each takes milliseconds, so this only ends one that would never end.
+const RERUN_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `f` on a thread, ending the test binary with a failure that names the test
+/// when `f` has not returned within [`RERUN_BOUND`]. A builtin that runs
+/// again after a `$(…)` replays its log; a replay that misreads it parks
+/// again without end, and the test should say so by name rather than hang.
+///
+/// On a timeout this writes the test's name and the bound to stderr, past
+/// libtest's output capture, and exits with 101, libtest's failure code. It
+/// does not panic: a panic fails the test and libtest names it, but the
+/// worker thread cannot be stopped and keeps allocating, so a binary that
+/// runs on after the hang aborts at its memory limit before libtest prints
+/// its result line, and the run reads as killed rather than as a failure.
+/// Ending the process at 60 s gives the 101 instead. It also ends the other
+/// tests of the binary, which then read as not run, and it names only the
+/// first test to reach the bound; the abort it replaces lost the other
+/// tests too.
+fn bounded(src: &str, f: fn(&str) -> (String, String)) -> (String, String) {
+	let src = src.to_owned();
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let _ = tx.send(f(&src));
+	});
+	rx.recv_timeout(RERUN_BOUND).unwrap_or_else(|_| {
+		use std::io::Write;
+		let test = std::thread::current()
+			.name()
+			.unwrap_or("<unnamed>")
+			.to_owned();
+		let _ = writeln!(
+			std::io::stderr(),
+			"test {test} ... FAILED: did not end within {RERUN_BOUND:?}, a run again without end; \
+			 ending the test binary"
+		);
+		std::process::exit(101)
+	})
+}
+
+/// [`run`], bounded ([`bounded`]).
+fn run_bounded(src: &str) -> (String, String) {
+	bounded(src, run)
+}
+
+/// `src` with events off (a builtin first runs on the fast path): its
+/// stdout and stderr, bounded ([`bounded`]).
+fn run_events_off_bounded(src: &str) -> (String, String) {
+	bounded(src, |src| {
+		let mut rig = Rig::new(FakeHost::new(), skeleton_init(&[]));
+		rig.shell().set_event_mask(EventMask::NONE);
+		rig.run(Script::command(src.as_bytes().to_vec()), Fault::None);
+		(
+			String::from_utf8_lossy(&rig.host.stdout.bytes()).into_owned(),
+			String::from_utf8_lossy(&rig.host.stderr.bytes()).into_owned(),
+		)
+	})
+}
+
+/// The run-again bound fails a run that never ends, not one that is merely
+/// slow: a run made two seconds slower than it needs still passes it, so
+/// tightening [`RERUN_BOUND`] toward the scripts' real time would be caught
+/// here. The script has no `$(…)` and so never runs again: under a plant
+/// whose replay never ends it adds no runaway of its own, so the test the
+/// bound ends is the one whose replay hangs.
+#[test]
+fn a_harmless_delay_passes_the_rerun_bound() {
+	let (out, err) = bounded("x=1; declare x+=1; echo \"$x\"", |src| {
+		std::thread::sleep(std::time::Duration::from_secs(2));
+		run(src)
+	});
+	assert_eq!((out.as_str(), err.as_str()), ("11\n", ""));
 }
 
 #[test]
@@ -120,6 +199,1435 @@ fn attributes_apply_on_every_assignment() {
 fn random_is_seeded_by_assignment() {
 	let (out, _) = run("RANDOM=42; echo $RANDOM $RANDOM $RANDOM; RANDOM=1+1; echo $RANDOM");
 	assert_eq!(out, "17772 26794 1435\n846\n");
+}
+
+/// A subshell, a background job and a command substitution draw `$RANDOM`
+/// from their own copy of the generator: neither their draws nor their
+/// `RANDOM=` move the shell's sequence (bash keeps it in process memory).
+/// The shell's first value after `RANDOM=7` is 19344 with or without the
+/// child.
+#[test]
+fn random_children_leave_the_shell_sequence() {
+	for child in [
+		"( : $RANDOM $RANDOM )",
+		"( : $RANDOM $RANDOM ) & wait",
+		"x=$(echo $RANDOM $RANDOM)",
+		"( RANDOM=99 ) & wait",
+		"( RANDOM=99; : $RANDOM )",
+	] {
+		let (out, err) = run(&format!("RANDOM=7; {child}; echo $RANDOM"));
+		assert_eq!((out.as_str(), err.as_str()), ("19344\n", ""), "{child}");
+	}
+}
+
+/// bash reseeds a subshell's generator on its first `$RANDOM` unless the
+/// subshell assigned `RANDOM` first (`get_random_number`'s
+/// `seeded_subshell`): an unseeded child does not continue the shell's
+/// sequence (19344 after `RANDOM=7`), a seeded one repeats it.
+#[test]
+fn random_subshell_reseeds_unless_assigned() {
+	let (out, err) = run(
+		"RANDOM=7; u=$(echo $RANDOM); s=$(RANDOM=7; echo $RANDOM); n=$RANDOM; [ \"$u\" != 19344 ] \
+		 && echo own; echo $s $n",
+	);
+	assert_eq!((out.as_str(), err.as_str()), ("own\n19344 19344\n", ""));
+}
+
+/// bash looks a special `RANDOM` up, and so draws, as many times as each
+/// builtin, assignment and expansion looks the name up (`find_variable`
+/// runs `get_random`): `declare -i RANDOM` twice, `${RANDOM:0}` three
+/// times, `let 'RANDOM[1]=8'` four. Each form runs after `RANDOM=5`; the
+/// next `$RANDOM` shows how many it drew (18498, 29338, 982, 6493, 16756
+/// are the first five values after `RANDOM=5`). One form or more per
+/// `dynvars::Site` and per cell of its expansion table. Goldens from bash
+/// 5.3.20.
+#[test]
+fn random_draws_as_often_as_bash_looks_it_up() {
+	for (form, want) in [
+		("declare RANDOM", "[] 29338\n"),
+		("export RANDOM", "[] 29338\n"),
+		("declare -p RANDOM > /dev/null", "[] 29338\n"),
+		("declare -i RANDOM", "[] 982\n"),
+		("declare -g RANDOM", "[] 982\n"),
+		("declare RANDOM+=1", "[] 889\n"),
+		("declare -n RANDOM 2> /dev/null", "[] 6493\n"),
+		("f() { local RANDOM; }; f", "[] 16756\n"),
+		("f() { declare -p RANDOM; }; f", "declare -i RANDOM=\"18498\"\n[] 29338\n"),
+		("export RANDOM+=1", "[] 1187\n"),
+		("declare 'RANDOM[1]=8'", "[] 18498\n"),
+		("RANDOM[1]=8", "[] 29338\n"),
+		("printf -v 'RANDOM[1]' 8", "[] 29338\n"),
+		("RANDOM+=(8)", "[] 18498\n"),
+		("read -a RANDOM <<< 8", "[] 8\n"),
+		("((RANDOM+=1))", "[] 13373\n"),
+		("((RANDOM[1]=8))", "[] 982\n"),
+		("x=$((RANDOM[1]=8))", "[8] 982\n"),
+		("let 'RANDOM[1]=8'", "[] 6493\n"),
+		("x=$((RANDOM[0]))", "[29338] 982\n"),
+		("x=$((RANDOM[1]))", "[0] 982\n"),
+		("declare -n r=RANDOM; r+=1", "[] 889\n"),
+		("declare -n r=RANDOM; ((r=7))", "[] 19344\n"),
+		("declare -n r='RANDOM[1]'; r=8", "[] 982\n"),
+		("RANDOM=7 true", "[] 29338\n"),
+		("f() { :; }; RANDOM=7 f", "[] 29338\n"),
+		("for x in $RANDOM; do :; done", "[18498] 29338\n"),
+		("unset 'RANDOM[1]' 2>/dev/null", "[] 29338\n"),
+		("test -v RANDOM", "[] 29338\n"),
+		("[[ -v RANDOM ]]", "[] 29338\n"),
+		("[[ -v RANDOM[1] ]]", "[] 982\n"),
+		("declare -n r=RANDOM; [[ -v r ]]", "[] 29338\n"),
+		("n=RANDOM; x=${!n}", "[18498] 29338\n"),
+		("declare -n r=RANDOM; x=${!r}", "[RANDOM] 29338\n"),
+		("x=${!RANDOM[@]}", "[0] 29338\n"),
+		("x=$RANDOM", "[18498] 29338\n"),
+		("x=${RANDOM}", "[18498] 29338\n"),
+		("x=${RANDOM:0}", "[18498] 6493\n"),
+		("x=${RANDOM@a}", "[i] 6493\n"),
+		("x=${#RANDOM}", "[5] 29338\n"),
+		("x=${RANDOM[0]-y}", "[29338] 982\n"),
+		("x=${RANDOM[0]:0}", "[6493] 16756\n"),
+		("x=${RANDOM[0]@a}", "[i] 16756\n"),
+		("x=${RANDOM[1]-y}", "[y] 982\n"),
+		("x=${RANDOM[1]:0}", "[] 982\n"),
+		("x=${RANDOM[1]@a}", "[i] 16756\n"),
+		("x=${RANDOM[@]}", "[29338] 982\n"),
+		("x=${RANDOM[@]:0}", "[29338] 6493\n"),
+		("x=${RANDOM[@]@a}", "[i] 6493\n"),
+		("x=${#RANDOM[@]}", "[1] 29338\n"),
+		("declare -n r=RANDOM; x=$r", "[18498] 29338\n"),
+		("declare -n r=RANDOM; x=$((r))", "[18498] 29338\n"),
+		("declare -n r=RANDOM; echo \"$r\" ${r} > /dev/null", "[] 982\n"),
+		("x=${!RANDOM}", "[] 982\n"),
+		("x=$((RANDOM))", "[18498] 29338\n"),
+		// A value that seeds nothing shows the lookups before it.
+		("for RANDOM in '1+'; do :; done 2> /dev/null", "[] 29338\n"),
+		("set -k; true RANDOM=7; set +k", "[] 29338\n"),
+		("set -k; true RANDOM=$RANDOM; set +k", "[] 982\n"),
+		("set -k; true RANDOM+=1; set +k", "[] 29338\n"),
+		// `unset -n` and a `for` over a reference look up the end of the
+		// reference chain (`find_variable_last_nameref`).
+		("unset -n RANDOM", "[] 29338\n"),
+		("unset -n RANDOM RANDOM", "[] 982\n"),
+		("declare -n r=RANDOM; unset -n r", "[] 29338\n"),
+		("declare -n r=RANDOM; for r in 7; do :; done 2>/dev/null", "[] 29338\n"),
+		// A `for` over a reference looks the chain up before it binds the
+		// word: the first word binds an unset reference, a reference to
+		// another name binds RANDOM with no lookup.
+		("declare -n r; for r in RANDOM RANDOM; do :; done", "[] 29338\n"),
+		("declare -n r=x; for r in RANDOM; do :; done", "[] 18498\n"),
+		// `[[ -v ]]` looks up the text before the operand's first `[` as
+		// written when that is a name (bash's `valid_array_reference` with
+		// `VA_NOEXPAND`), whatever follows it, then the expanded operand.
+		("[[ -v 'RANDOM[1]' ]]", "[] 29338\n"),
+		("[[ -v \"RANDOM[0]\" ]]", "[] 29338\n"),
+		("[[ -v RANDOM[\"1\"] ]]", "[] 982\n"),
+		("[[ -v RANDOM[1]\"\" ]]", "[] 982\n"),
+		("e=; [[ -v RANDOM[1]$e ]]", "[] 982\n"),
+		("[[ -v RANDOM[1]x ]]", "[] 29338\n"),
+		// `${r:=RANDOM}` of a reference with no target makes `r` name
+		// `RANDOM` and expands to that name, with no lookup.
+		("declare -n r; x=${r:=RANDOM}", "[RANDOM] 18498\n"),
+	] {
+		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+	// bash's `${#NAME[-1]}` of a scalar fails, naming the subscript, also
+	// before anything assigned or read `RANDOM`.
+	for src in
+		["RANDOM=5; x=${#RANDOM[-1]}; echo \"[${x-}] $RANDOM\"", "x=${#RANDOM[-1]}; echo \"[$x]\""]
+	{
+		let (out, err) = run(src);
+		assert_eq!(out, "", "{src}");
+		assert!(err.ends_with("line 1: [-1]: bad array subscript\n"), "{src}: {err}");
+	}
+}
+
+/// A declaration builtin acting through a name reference looks up the
+/// variable it names: at the global level as often as for the name itself,
+/// none for `-n` or an element; in a function four times through its own
+/// reference (the new local is the variable's) and three through another
+/// (the new local shadows the reference), twice for `local -n`. An
+/// assignment through a reference looks it up only through a global one
+/// (`bind_variable` resolves a function's by name). Each form runs after
+/// `RANDOM=5`, as in [`random_draws_as_often_as_bash_looks_it_up`]. Goldens
+/// from bash 5.3.20 (5.2.21 agrees).
+#[test]
+fn random_declarations_through_a_reference_look_it_up() {
+	for (form, want) in [
+		("declare -n r=RANDOM; declare r", "[] 29338\n"),
+		("declare -n r=RANDOM; declare -i r", "[] 982\n"),
+		("declare -n r=RANDOM; declare -n s=r; declare -x s", "[] 982\n"),
+		("declare -n r=RANDOM; declare r+=1", "[] 889\n"),
+		("declare -n r=RANDOM; export r", "[] 29338\n"),
+		("declare -n r=RANDOM; export r+=1", "[] 1803\n"),
+		("declare -n r=RANDOM; declare +n r", "[] 29338\n"),
+		("declare -n r=RANDOM; declare -n r", "[] 18498\n"),
+		("declare -n r=RANDOM; declare 'r[1]=8' 2>/dev/null", "[] 18498\n"),
+		("declare -n r=RANDOM; f() { local r; }; f", "[] 6493\n"),
+		("declare -n r=RANDOM; f() { local -n r; }; f", "[] 6493\n"),
+		("declare -n r=RANDOM; f() { local -n r=x; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { declare -g r; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { export r+=1; }; f", "[] 1803\n"),
+		("f() { local -n q=RANDOM; local q; }; f", "[] 16756\n"),
+		("f() { local -n q=RANDOM; local -n s=q; declare -i s; }; f", "[] 16756\n"),
+		("f() { local -n q=RANDOM; local -n q; }; f", "[] 982\n"),
+		("f() { local -n q=RANDOM; declare +n q; }; f", "[] 982\n"),
+		// `+n NAME=VALUE` looks the target up as `+n NAME` does. On a
+		// reference the function owns, the value is assigned to the name
+		// as to any reference: an identifier, else refused (below).
+		("declare -n r=RANDOM; f() { local +n r=3; }; f", "[] 982\n"),
+		("f() { local -n q=RANDOM; g; }; g() { local +n q=3; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { declare +n r=3; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { local +n -i r=3; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { local +n r+=3; }; f", "[] 982\n"),
+		("declare -n r=RANDOM; f() { local +n r=3; x=$r; }; f", "[3] 982\n"),
+		(
+			"f() { local -n q=RANDOM; local +n q=zz; declare -p q; }; f",
+			"declare -- q=\"zz\"\n[] 982\n",
+		),
+		("f() { local -n q=RANDOM; export q; }; f", "[] 29338\n"),
+		("f() { local -n q=RANDOM; export q+=1; }; f", "[] 1187\n"),
+		("f() { local -n q=RANDOM; declare -g q; }; f", "[] 18498\n"),
+		("f() { local -n q=RANDOM; g; }; g() { local q; }; f", "[] 6493\n"),
+		("f() { local -n q=RANDOM; q+=1; }; f", "[] 2539\n"),
+		("f() { local -n q=RANDOM; g; }; g() { q+=1; }; f", "[] 2539\n"),
+		("declare -n r=RANDOM; f() { r+=1; }; f", "[] 889\n"),
+		("f() { local -n q='RANDOM[1]'; q=8; }; f", "[] 29338\n"),
+	] {
+		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+	// A refused value names the word as written; `+r` the variable.
+	for (src, diag) in [
+		("declare r=7", "line 1: declare: r: readonly variable\n"),
+		("declare +r r", "line 1: declare: RANDOM: readonly variable\n"),
+	] {
+		let src =
+			format!("RANDOM=7; readonly RANDOM; declare -n r=RANDOM; {src}; echo \"st=$? $RANDOM\"");
+		let (out, err) = run(&src);
+		assert_eq!(out, "st=1 20442\n", "{src}");
+		assert!(err.ends_with(diag), "{src}: {err}");
+	}
+	// `+n NAME=VALUE` on a reference the function owns is an assignment to
+	// the reference: `3` is no identifier, so it is refused and nothing is
+	// drawn beyond the two lookups.
+	let (out, err) =
+		run("RANDOM=5; f() { local -n q=RANDOM; local +n q=3; }; f; echo \"[$RANDOM]\"");
+	assert_eq!(out, "[982]\n");
+	assert!(err.ends_with("local: `3': not a valid identifier\n"), "{err}");
+}
+
+/// bash applies a subshell's redirections in the child, after the fork: a
+/// `$RANDOM` there draws from the child's generator and leaves the shell's
+/// sequence and value cell alone. A group's, a function's and a builtin's
+/// are the shell's. Goldens from bash 5.3.20.
+#[test]
+fn random_in_a_subshells_redirections_is_the_childs() {
+	for (form, want) in [
+		("( : ) > f$RANDOM", "[] 18498\n"),
+		("( : $RANDOM ) > f$RANDOM", "[] 18498\n"),
+		("( : ) > f$RANDOM; RANDOM+=1", "[] 2539\n"),
+		("( : ) > f$RANDOM & wait", "[] 18498\n"),
+		("{ :; } > f$RANDOM & wait", "[] 18498\n"),
+		("true > f$RANDOM", "[] 29338\n"),
+		("{ true; } > f$RANDOM", "[] 29338\n"),
+		("f() { :; }; f > f$RANDOM", "[] 29338\n"),
+	] {
+		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+}
+
+/// Whether `unset` or an array assignment removed `RANDOM`'s special
+/// meaning is imaged with the generator: a shell snapshotted and restored
+/// at every step keeps a plain `RANDOM` plain. Goldens from bash 5.3.20.
+#[test]
+fn random_plain_survives_a_restore() {
+	let wait = "i=0; while [ $i -lt 8 ]; do i=$((i+1)); done";
+	for (src, want) in [
+		(
+			format!("unset RANDOM; {wait}; RANDOM=5; echo $RANDOM $RANDOM; declare -p RANDOM"),
+			"5 5\ndeclare -- RANDOM=\"5\"\n",
+		),
+		(
+			format!(
+				"RANDOM=5; a=$RANDOM; {wait}; b=$RANDOM; RANDOM[1]=3; {wait}; echo $a $b $RANDOM \
+				 $RANDOM; declare -p RANDOM"
+			),
+			"18498 29338 6493 6493\ndeclare -ai RANDOM=([0]=\"6493\" [1]=\"3\")\n",
+		),
+	] {
+		for fault in [Fault::None, Fault::Snapshot { every: 1 }] {
+			let out = run_script(FakeHost::new(), src.as_bytes(), &[], fault);
+			assert_eq!(
+				(
+					String::from_utf8_lossy(&out.stdout).as_ref(),
+					String::from_utf8_lossy(&out.stderr).as_ref()
+				),
+				(want, ""),
+				"{src} {fault:?}"
+			);
+		}
+	}
+}
+
+/// Which value cells `unset` removed is imaged, the shell's in its store and
+/// a forked vproc's in its clock: a shell snapshotted and restored at every
+/// step keeps them removed. bash 5.3.20.
+#[test]
+fn unset_cells_survive_a_restore() {
+	let wait = "i=0; while [ $i -lt 8 ]; do i=$((i+1)); done";
+	for (src, want) in [
+		(
+			format!(
+				"unset LINENO; {wait}; echo \"[$LINENO]\"; declare -p LINENO 2> /dev/null; echo \
+				 \"st=$?\""
+			),
+			"[]\nst=1\n",
+		),
+		(format!("( unset LINENO; {wait}; echo \"[$LINENO]\" ); echo \"[$LINENO]\""), "[]\n[1]\n"),
+	] {
+		for fault in [Fault::None, Fault::Snapshot { every: 1 }] {
+			let out = run_script(FakeHost::new(), src.as_bytes(), &[], fault);
+			assert_eq!(
+				(
+					String::from_utf8_lossy(&out.stdout).as_ref(),
+					String::from_utf8_lossy(&out.stderr).as_ref()
+				),
+				(want, ""),
+				"{src} {fault:?}"
+			);
+		}
+	}
+}
+
+/// A readonly `RANDOM` refuses `((RANDOM=5))`, `unset RANDOM` and
+/// `declare -a RANDOM` (bash 5.3.20) after the lookups bash makes there,
+/// and stays special: after `RANDOM=7` and `readonly RANDOM` (one lookup),
+/// the arithmetic assignment and `unset` look it up once, `declare -a`
+/// twice. Goldens from bash 5.3.20.
+#[test]
+fn random_readonly_refusals_look_it_up_first() {
+	for (src, want, diag) in [
+		(
+			"RANDOM=7; readonly RANDOM; ((RANDOM=5)); echo \"st=$? $RANDOM\"",
+			"st=1 7409\n",
+			"line 1: RANDOM: readonly variable\n",
+		),
+		(
+			"RANDOM=7; readonly RANDOM; unset RANDOM; echo \"st=$? $RANDOM\"",
+			"st=1 7409\n",
+			"line 1: unset: RANDOM: cannot unset: readonly variable\n",
+		),
+		(
+			"RANDOM=7; readonly RANDOM; declare -a RANDOM; echo \"st=$? $RANDOM\"",
+			"st=1 20442\n",
+			"line 1: declare: RANDOM: readonly variable\n",
+		),
+		// `export` and `readonly` look the name up after a refused value
+		// too, through a reference after its two lookups before the value;
+		// `+n` with a value names the reference as written. Goldens from
+		// bash 5.3.20.
+		(
+			"RANDOM=7; readonly RANDOM; export RANDOM=7; echo \"st=$? $RANDOM\"",
+			"st=1 7409\n",
+			"line 1: RANDOM: readonly variable\n",
+		),
+		(
+			"RANDOM=7; readonly RANDOM; readonly RANDOM=7; echo \"st=$? $RANDOM\"",
+			"st=1 7409\n",
+			"line 1: RANDOM: readonly variable\n",
+		),
+		(
+			"RANDOM=7; readonly RANDOM; declare -n r=RANDOM; export r=7; echo \"st=$? $RANDOM\"",
+			"st=1 22989\n",
+			"line 1: RANDOM: readonly variable\n",
+		),
+		(
+			"RANDOM=7; readonly RANDOM; declare -n r=RANDOM; declare +n r=7; echo \"st=$? $RANDOM\"",
+			"st=1 20442\n",
+			"line 1: declare: r: readonly variable\n",
+		),
+		// A plain target too: the word as written, not the target's name.
+		(
+			"y=1; readonly y; declare -n r=y; declare +n r=7; echo \"st=$? $y\"",
+			"st=1 1\n",
+			"line 1: declare: r: readonly variable\n",
+		),
+		(
+			"y=1; readonly y; declare -n r=y; declare +n -i r=7; echo \"st=$? $y\"",
+			"st=1 1\n",
+			"line 1: declare: r: readonly variable\n",
+		),
+		// A refused `+n` through a reference to a readonly `RANDOM` keeps the
+		// reference, so a later argument's `$(…)` parks and the builtin runs
+		// again, refusing again — `$RANDOM` is drawn once, as bash draws it.
+		(
+			"RANDOM=5; declare -n r=RANDOM; readonly RANDOM; a=(0); declare +n r=7 a='($(echo 2))'; \
+			 echo \"st=$? $RANDOM\"; declare -p r",
+			"st=1 6493\ndeclare -n r=\"RANDOM\"\n",
+			"line 1: declare: r: readonly variable\n",
+		),
+	] {
+		// Bounded: the last form parks and runs again ([`bounded`]).
+		let (out, err) = run_bounded(src);
+		assert_eq!(out, want, "{src}");
+		assert!(err.ends_with(diag), "{src}: {err}");
+	}
+}
+
+/// A builtin that a command substitution in text it expands itself, or a
+/// file probe, parks runs again from its start; an assignment's value that
+/// parks is expanded again. The lookups of `RANDOM` before the park are
+/// made once, as bash makes them once. Each form runs with events on and
+/// off: with them off a builtin first runs on the fast path, which hands
+/// its replay log to the staged re-run. Goldens from bash 5.3.20.
+#[test]
+fn random_lookups_happen_once_when_a_command_runs_again() {
+	for (form, want) in [
+		("a=(1); declare RANDOM a='($(echo 2))'", "[] 29338\n"),
+		("declare -a RANDOM='($(echo 7))'", "[] 7\n"),
+		("f() { local -a RANDOM a='($(echo 2))'; }; f", "[] 16756\n"),
+		("test -v RANDOM -a -e /", "[] 29338\n"),
+		("[ -v RANDOM -a -e / ]", "[] 29338\n"),
+		("[[ -v RANDOM && -e / ]]", "[] 29338\n"),
+		("unset 'RANDOM[$(echo 1)]' 2>/dev/null", "[] 29338\n"),
+		("a=(1 2); unset RANDOM 'a[$(echo 1)]'; x=${#a[@]}", "[1] \n"),
+		("[[ -v RANDOM[$(echo 0)] ]]", "[] 982\n"),
+		("RANDOM=7 x=$(echo 1) true", "[] 29338\n"),
+		("RANDOM=$(echo 7) true", "[] 29338\n"),
+		("RANDOM=7 x=$RANDOM true", "[] 29338\n"),
+		("RANDOM=$RANDOM true", "[] 982\n"),
+		("x=${RANDOM}$(echo 1)", "[184981] 29338\n"),
+		("x=$((RANDOM))$(echo 1)", "[184981] 29338\n"),
+		// Through a name reference: the lookups of the variable it names.
+		("a=(0); declare -n r=RANDOM; declare -i r a='($(echo 2))'", "[] 982\n"),
+		("a=(0); declare -n r=RANDOM; declare r a='($(echo 2))'", "[] 29338\n"),
+		("f() { local -n q=RANDOM; local a=(0); local q a='($(echo 2))'; }; f", "[] 16756\n"),
+		("declare -n r=RANDOM; f() { local a=(0); local r a='($(echo 2))'; }; f", "[] 6493\n"),
+		// The first run decides what is looked up, although the declaration
+		// changes what the next run would look through: `local r` shadows
+		// the reference, `+n` ends it.
+		("a=(0); declare -n r=RANDOM; declare +n r a='($(echo 2))'", "[] 29338\n"),
+		("a=(0); declare -n r=RANDOM; declare +n r=7 a='($(echo 2))'", "[] 19344\n"),
+		("f() { local -n q=RANDOM; local a=(0); local +n q a='($(echo 2))'; }; f", "[] 982\n"),
+		// So does a temporary assignment's lookup, decided on the first run:
+		// its value makes `r` a reference to `RANDOM` only then.
+		("declare -n r; r=${r:=RANDOM}$(echo 1) true", "[] 18498\n"),
+	] {
+		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
+		assert_eq!(run_bounded(&src), (want.to_owned(), String::new()), "{form}");
+		let (out, err) = run_events_off_bounded(&src);
+		assert_eq!((out.as_str(), err.as_str()), (want, ""), "{form} (events off)");
+	}
+}
+
+/// A `$(…)` in a later argument's compound string (`a='($(echo 2))'` on an
+/// array) makes `declare`, `local` and `export` run again from their first
+/// argument; each earlier argument still applies once, as in bash: `x+=1`
+/// adds 1, `-r` is not refused as readonly, an integer, exported, element
+/// or reference target adds once. Each form runs with events on and off
+/// (with them off the builtin first runs on the fast path). Goldens from
+/// bash 5.3.20 (5.2.21 agrees).
+#[test]
+fn declaration_applies_each_argument_once_when_it_runs_again() {
+	let a = "a=(0); b=(0); ";
+	for (form, want) in [
+		("x=1; declare x+=1 a='($(echo 2))'; echo \"$x ${a[0]}\"", "11 2\n"),
+		(
+			"x=1; declare x+=1 a='($(echo 2))' x+=1 b='($(echo 3))'; echo \"$x ${a[0]} ${b[0]}\"",
+			"111 2 3\n",
+		),
+		("declare -r x=1 a='($(echo 2))'; echo \"st=$? $x ${a[0]}\"", "st=0 1 2\n"),
+		("declare -i n=1; declare n+=1 a='($(echo 2))'; echo \"$n ${a[0]}\"", "2 2\n"),
+		("X=a; declare -x X+=b a='($(echo 2))'; echo \"$X ${a[0]}\"", "ab 2\n"),
+		("y=1; declare -n r=y; declare r+=1 a='($(echo 2))'; echo \"$y ${a[0]}\"", "11 2\n"),
+		("declare -A h=([k]=a); declare h[k]+=b a='($(echo 2))'; echo \"${h[k]} ${a[0]}\"", "ab 2\n"),
+		("RANDOM=5; declare RANDOM+=1 a='($(echo 2))'; echo $RANDOM", "889\n"),
+		("f() { declare -g g+=1 a='($(echo 2))'; }; f; f; echo \"$g\"", "11\n"),
+		("f() { local x=1 a=(0); local x+=1 a='($(echo 2))'; echo \"$x ${a[0]}\"; }; f", "11 2\n"),
+		(
+			"f() { local a=(0); local -r x=1 a='($(echo 2))'; echo \"st=$? $x ${a[0]}\"; }; f",
+			"st=0 1 2\n",
+		),
+		(
+			"x=g; f() { local a=(0); local x+=1 a='($(echo 2))'; echo \"[$x] ${a[0]}\"; }; f; echo \
+			 \"$x\"",
+			"[1] 2\ng\n",
+		),
+		("X=a; export X+=b; declare -x X+=c a='($(echo 2))'; echo \"$X\"", "abc\n"),
+		("x=1; declare x+=1 a=(2); echo \"$x ${a[0]}\"", "11 2\n"),
+		// A temporary of the name is the binding the argument changes: it
+		// is put back too (`-r` then refuses nothing).
+		("x=1; x=5 declare -x x+=1 a='($(echo 2))'; echo \"[$x]\"", "[51]\n"),
+		("x=1; x=5 declare -r x+=1 a='($(echo 2))'; echo \"[$x]\"", "[51]\n"),
+		("x=1; x=5 declare -x x+=1 x+=2 a='($(echo 2))'; echo \"[$x]\"", "[512]\n"),
+		// `-g` acts on the global past the temporary and copies nothing out
+		// (older than this rollback: the same without a park).
+		("x=1; x=5 declare -gx x+=1; echo \"[$x]\"", "[11]\n"),
+		("x=1; f() { x=5 declare -gx x+=1; echo \"in [$x]\"; }; f; echo \"[$x]\"", "in [11]\n[11]\n"),
+		("x=1; x=5 declare -gx x+=1 a='($(echo 2))'; echo \"[$x]\"", "[11]\n"),
+		// Two arguments that park: every argument is still redone from the
+		// binding and the target the first run kept.
+		("x=1; x=5 declare -x x+=1 b='($(echo 3))' a='($(echo 2))'; echo \"[$x]\"", "[51]\n"),
+		("y=1; declare -n r=y; declare r+=1 b='($(echo 3))' a='($(echo 2))'; echo \"$y\"", "11\n"),
+		// An argument's arithmetic runs once: its own assignments and
+		// `RANDOM` draws, an integer value's, a subscript's, a compound
+		// value's keys.
+		("w=0; declare -i y=w++ a='($(echo 2))'; echo $y $w", "0 1\n"),
+		("declare -i y='z+=1' a='($(echo 2))'; echo \"$y $z\"", "1 1\n"),
+		("i=0; declare 'c[i++]=x' a='($(echo 2))'; echo \"$i ${!c[@]}\"", "1 0\n"),
+		("w=0; declare -ai a2='([w++]=x)' a='($(echo 2))'; echo $w ${!a2[@]}", "1 0\n"),
+		("RANDOM=5; declare -i y=RANDOM a='($(echo 2))'; echo $y $RANDOM", "18498 29338\n"),
+		("w=0; declare -i y='(w+=2)*3' a='($(echo 2))'; echo \"$y $w\"", "6 2\n"),
+		// An assignment the arithmetic itself makes to `RANDOM` is part of
+		// its one evaluation, not a result of its own.
+		("RANDOM=5; declare -i y='(RANDOM=3)+10' a='($(echo 2))'; echo \"$y $RANDOM\"", "13 17653\n"),
+		// `RANDOM+=` adds to the value its lookups (through a reference)
+		// left, kept through the binding put back.
+		("RANDOM=5; declare -n r=RANDOM; declare r+=1 a='($(echo 2))'; echo $RANDOM", "889\n"),
+		("RANDOM=5; declare -n r=RANDOM; declare +n r+=1 a='($(echo 2))'; echo $RANDOM", "889\n"),
+		(
+			"RANDOM=5; declare -n r=RANDOM; declare +i r+=1 a='($(echo 2))'; echo $RANDOM; declare \
+			 -p RANDOM",
+			"31651\ndeclare -i RANDOM=\"20345\"\n",
+		),
+		// `unset` and `test -v` evaluate an index once too.
+		(
+			"w=0; c=(1 2 3); b=(1 2); unset 'c[w++]' 'b[$(echo 1)]'; echo $w ${#c[@]} ${#b[@]}",
+			"1 2 1\n",
+		),
+		("w=0; c=5; b=(1 2); unset 'c[w++]' 'b[$(echo 1)]'; echo $w ${c-u} ${#b[@]}", "1 u 1\n"),
+		("w=0; c=(1 2); test -v 'c[w++]' -a -e /; echo $w", "1\n"),
+	] {
+		let src = format!("{a}{form}");
+		assert_eq!(run_bounded(&src), (want.to_owned(), String::new()), "{form}");
+		let (out, err) = run_events_off_bounded(&src);
+		assert_eq!((out.as_str(), err.as_str()), (want, ""), "{form} (events off)");
+	}
+	// An argument that fails is reported once.
+	let (out, err) = run_bounded("a=(0); declare 1x=2 a='($(echo 2))'; echo \"st=$? ${a[0]}\"");
+	assert_eq!(out, "st=1 2\n");
+	assert_eq!(err.matches("not a valid identifier").count(), 1, "{err}");
+	// A refused argument leaves nothing a run again could find: a function's
+	// local over a readonly global is refused again, and a name it could not
+	// bind is not left declared (`local -p`). Goldens from bash 5.3.20 (5.2.21
+	// agrees).
+	for (form, want, msg) in [
+		(
+			"x=1; readonly x; f() { local a=(0); local x=2 a='($(echo 2))'; echo \"st=$? [$x] \
+			 ${a[0]}\"; }; f; echo \"[$x]\"",
+			"st=1 [1] 2\n[1]\n",
+			"local: x: readonly variable\n",
+		),
+		(
+			"x=1; readonly x; f() { local a=(0); declare x=2 a='($(echo 2))'; echo \"st=$? [$x] \
+			 ${a[0]}\"; }; f; echo \"[$x]\"",
+			"st=1 [1] 2\n[1]\n",
+			"declare: x: readonly variable\n",
+		),
+		(
+			"x=1; readonly x; f() { local a=(0); local x a='($(echo 2))'; echo \"st=$? [$x] \
+			 ${a[0]}\"; declare -p x; }; f; echo \"[$x]\"",
+			"st=1 [1] 2\ndeclare -r x=\"1\"\n[1]\n",
+			"local: x: readonly variable\n",
+		),
+		(
+			"x=1; readonly x; f() { local a=(0); local -i x=2 a='($(echo 2))'; echo \"st=$? [$x]\"; \
+			 }; f",
+			"st=1 [1]\n",
+			"local: x: readonly variable\n",
+		),
+		(
+			"f() { local a=(0); local 1x=2 a='($(echo 2))'; echo \"st=$?\"; local -p; }; f",
+			"st=1\ndeclare -a a=([0]=\"2\")\n",
+			"local: `1x=2': not a valid identifier\n",
+		),
+	] {
+		let (out, err) = run_bounded(form);
+		assert_eq!(out, want, "{form}");
+		assert!(err.ends_with(msg) && err.lines().count() == 1, "{form}: {err}");
+		let (out, err) = run_events_off_bounded(form);
+		assert_eq!(out, want, "{form} (events off)");
+		assert!(err.ends_with(msg) && err.lines().count() == 1, "{form} (events off): {err}");
+	}
+}
+
+/// bash's `RANDOM=` (`assign_random`): the value is arithmetic while
+/// `RANDOM` is integer (it is from the start), else a decimal number; one
+/// that is neither seeds nothing. The variable's value is then the seed,
+/// the text `RANDOM+=` adds to, as it is the last draw after a read. A
+/// temporary or local `RANDOM` is a plain variable; the shell's sequence
+/// goes on after it. Goldens from bash 5.3.20.
+#[test]
+fn random_assignment_seeds_as_bash_does() {
+	for (src, want) in [
+		("RANDOM=abc; echo $RANDOM; RANDOM=0; echo $RANDOM", "20814\n20814\n"),
+		(
+			"RANDOM=5; declare +i RANDOM; RANDOM=1+6; echo $RANDOM; RANDOM=7; echo $RANDOM",
+			"982\n19344\n",
+		),
+		("x=7; RANDOM=x; echo $RANDOM", "19344\n"),
+		(
+			"RANDOM=4294967303; echo $RANDOM; RANDOM=4294967303; declare -p RANDOM",
+			"19344\ndeclare -i RANDOM=\"19344\"\n",
+		),
+		("for RANDOM in 7; do echo $RANDOM; done", "19344\n"),
+		("read RANDOM <<< 7; echo $RANDOM", "19344\n"),
+		("printf -v RANDOM 7; echo $RANDOM", "19344\n"),
+		("declare -n r=RANDOM; r=7; echo $RANDOM", "19344\n"),
+		("declare -i x; x='RANDOM=7'; echo $x $RANDOM", "7 19344\n"),
+		("RANDOM=7; RANDOM+=1; echo $RANDOM", "3386\n"),
+		("RANDOM=7; x=$RANDOM; RANDOM+=1; echo $x $RANDOM", "19344 4086\n"),
+		("RANDOM=7; ((RANDOM+=1)); echo $RANDOM", "4086\n"),
+		("RANDOM=7; declare RANDOM+=1; echo $RANDOM", "9530\n"),
+		("f() { echo $RANDOM $RANDOM; }; RANDOM=7 f; RANDOM=7; echo $RANDOM", "7 7\n19344\n"),
+		("RANDOM=5; RANDOM=7 declare -p RANDOM; echo $RANDOM", "declare -x RANDOM=\"7\"\n29338\n"),
+		("RANDOM=5; RANDOM=$RANDOM eval 'echo $RANDOM'; echo $RANDOM", "29338\n982\n"),
+		("RANDOM=7; readonly RANDOM; echo $RANDOM $RANDOM", "26956 7409\n"),
+		("RANDOM=7; readonly RANDOM; declare -p RANDOM", "declare -ir RANDOM=\"26956\"\n"),
+		("RANDOM=7; readonly RANDOM; unset -n RANDOM 2>/dev/null; echo $RANDOM", "7409\n"),
+		(
+			"f() { local RANDOM; echo \"[$RANDOM]\"; RANDOM=5; echo $RANDOM $RANDOM; }; f; RANDOM=7; \
+			 echo $RANDOM",
+			"[]\n5 5\n19344\n",
+		),
+		(
+			"f() { local RANDOM=5; g; }; g() { echo $RANDOM; RANDOM=6; echo $RANDOM; }; f; RANDOM=7; \
+			 echo $RANDOM",
+			"5\n6\n19344\n",
+		),
+		(
+			"f() { local RANDOM; ((RANDOM=5)); echo $RANDOM $RANDOM; }; f; RANDOM=7; echo $RANDOM",
+			"5 5\n19344\n",
+		),
+		("f() { local RANDOM=5; declare -p RANDOM; }; f", "declare -- RANDOM=\"5\"\n"),
+		("f() { local -i RANDOM=2+3; echo $RANDOM; }; f", "5\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `unset RANDOM` and an element, compound or array-attribute assignment
+/// (bash's `convert_var_to_array`) make the shell's `RANDOM` a plain
+/// variable for good, in children too: an array's element 0 is the last
+/// value and the array is integer. A local's `unset` is only the local's.
+/// Goldens from bash 5.3.20.
+#[test]
+fn random_unset_and_array_forms_make_it_plain() {
+	for (src, want) in [
+		("unset RANDOM; echo \"[$RANDOM]\"; RANDOM=5; echo $RANDOM $RANDOM", "[]\n5 5\n"),
+		("unset RANDOM; (echo \"[$RANDOM]\"); RANDOM=5; (echo $RANDOM)", "[]\n5\n"),
+		("unset RANDOM; declare -i RANDOM; RANDOM=1+1; echo $RANDOM", "2\n"),
+		(
+			"f() { local RANDOM=5; unset RANDOM; echo \"[$RANDOM]\"; }; f; RANDOM=7; echo $RANDOM",
+			"[]\n19344\n",
+		),
+		(
+			"RANDOM[0]=7; echo \"$RANDOM $RANDOM\"; declare -p RANDOM",
+			"7 7\ndeclare -ai RANDOM=([0]=\"7\")\n",
+		),
+		(
+			"RANDOM=7; RANDOM[1]=8; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"26956\" [1]=\"8\")\n",
+		),
+		("RANDOM=7; RANDOM[-1]=8; declare -p RANDOM", "declare -ai RANDOM=([0]=\"8\")\n"),
+		(
+			"RANDOM=(7 8); echo \"$RANDOM\"; declare -p RANDOM",
+			"7\ndeclare -ai RANDOM=([0]=\"7\" [1]=\"8\")\n",
+		),
+		("RANDOM=7; RANDOM=([1]=8); declare -p RANDOM", "declare -ai RANDOM=([1]=\"8\")\n"),
+		(
+			"read -a RANDOM <<< \"7 8\"; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"7\" [1]=\"8\")\n",
+		),
+		(
+			"mapfile -t RANDOM <<< $'7\\n8'; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"7\" [1]=\"8\")\n",
+		),
+		("RANDOM=7; declare -a RANDOM; declare -p RANDOM", "declare -ai RANDOM=([0]=\"26956\")\n"),
+		("RANDOM=7; declare -A RANDOM; declare -p RANDOM", "declare -Ai RANDOM=([0]=\"26956\" )\n"),
+		("((RANDOM[0]=7)); declare -p RANDOM", "declare -ai RANDOM=([0]=\"7\")\n"),
+		(
+			"RANDOM=7; let 'RANDOM[1]=8'; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"20442\" [1]=\"8\")\n",
+		),
+		(
+			"RANDOM=7; declare 'RANDOM[1]=8'; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"19344\" [1]=\"8\")\n",
+		),
+		(
+			"RANDOM=7; : ${RANDOM[1]:=8}; declare -p RANDOM",
+			"declare -ai RANDOM=([0]=\"20442\" [1]=\"8\")\n",
+		),
+		(
+			"f() { local RANDOM; RANDOM[0]=5; echo \"$RANDOM\"; }; f; RANDOM=7; echo $RANDOM",
+			"5\n19344\n",
+		),
+		("RANDOM[0]=5; RANDOM=7; echo $RANDOM $RANDOM", "7 7\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `declare -p`, `set`, `export -p` and the environment show the value the
+/// last lookup or assignment left in `RANDOM` and `SECONDS` (`declare -p
+/// RANDOM` looks it up first; the listings do not); `${RANDOM@a}`,
+/// `${RANDOM@A}` and the keys read it as a scalar; a name reference to it
+/// reads it as the name does. Goldens from bash 5.3.20 and 5.2.21.
+#[test]
+#[expect(
+	clippy::literal_string_with_formatting_args,
+	reason = "Bash parameter expansion is intentional fixture syntax, not Rust formatting."
+)]
+fn random_and_seconds_show_their_last_value() {
+	let set_line = |name: &str| {
+		format!("set | while IFS= read -r l; do [[ $l == {name}=* ]] && echo \"$l\"; done")
+	};
+	// The name after `declare -FLAGS ` (bash's `BASH_EXECUTION_STRING` line
+	// holds the script text, so a substring test would match it too).
+	let declare_line = |name: &str| {
+		format!(
+			"declare -p | while IFS= read -r l; do n=${{l#declare -* }}; [[ ${{n%%=*}} == {name} ]] \
+			 && echo \"$l\"; done"
+		)
+	};
+	for (src, want) in [
+		(
+			"RANDOM=7; declare -p RANDOM; echo $RANDOM".to_owned(),
+			"declare -i RANDOM=\"19344\"\n26956\n",
+		),
+		(
+			"RANDOM=7; echo $RANDOM; declare -p RANDOM".to_owned(),
+			"19344\ndeclare -i RANDOM=\"26956\"\n",
+		),
+		(format!("RANDOM=7; {}; echo $RANDOM", set_line("RANDOM")), "RANDOM=7\n19344\n"),
+		(format!("RANDOM=7; x=$RANDOM; {}", set_line("RANDOM")), "RANDOM=19344\n"),
+		(
+			format!("RANDOM=7; {}; echo $RANDOM", declare_line("RANDOM")),
+			"declare -i RANDOM=\"7\"\n19344\n",
+		),
+		(
+			"RANDOM=7; export RANDOM; export -p | while IFS= read -r l; do [[ $l == *' RANDOM='* ]] \
+			 && echo \"$l\"; done"
+				.to_owned(),
+			"declare -ix RANDOM=\"19344\"\n",
+		),
+		(format!("SECONDS=100; {}", set_line("SECONDS")), "SECONDS=100\n"),
+		(format!("SECONDS=100; {}", declare_line("SECONDS")), "declare -- SECONDS=\"100\"\n"),
+		("RANDOM=7; echo ${RANDOM@a}; readonly RANDOM; echo ${RANDOM@a}".to_owned(), "i\nir\n"),
+		(
+			"RANDOM=7; echo ${RANDOM@A}; export RANDOM; echo ${RANDOM@A}".to_owned(),
+			"declare -i RANDOM='19344'\ndeclare -ix RANDOM='22989'\n",
+		),
+		("RANDOM=7; echo \"${!RANDOM[@]}\" \"${!RANDOM[*]}\"".to_owned(), "0 0\n"),
+		("echo \"${!SECONDS[@]}\" ${SECONDS@a}".to_owned(), "0 i\n"),
+		("RANDOM=7; declare -n r=RANDOM; echo $r $r".to_owned(), "19344 26956\n"),
+		(
+			"RANDOM=7; declare -n r=RANDOM; echo \"$r\" ${r} ${r:-x} ${#r} $RANDOM".to_owned(),
+			"19344 26956 7409 5 22989\n",
+		),
+		("RANDOM=7; declare -n r=RANDOM; echo ${r[0]}".to_owned(), "26956\n"),
+		("declare -n s=SECONDS; s=100; echo $SECONDS $s".to_owned(), "100 100\n"),
+	] {
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `${!prefix@}`, `${!prefix*}` and `compgen -v` list bash's dynamic
+/// variables, which this shell computes on use (`dynvars::LISTED`):
+/// `FUNCNAME` only in a function, `PIPESTATUS` once a command ran,
+/// `RANDOM` and `SECONDS` not after `unset` until they are assigned.
+/// Goldens from bash 5.3.20 and 5.2.21.
+#[test]
+fn dynamic_variables_are_listed_by_name() {
+	let (out, err) = run(
+		"compgen -v PIPESTATUS; echo \"st=$?\"; compgen -v PIPESTATUS; f() { compgen -v FUNCNAME; \
+		 }; f; compgen -v FUNCNAME || echo none; for n in RANDOM SRANDOM SECONDS EPOCHSECONDS \
+		 EPOCHREALTIME LINENO BASH_COMMAND BASH_CMDS BASH_ALIASES DIRSTACK BASHPID BASH_SUBSHELL \
+		 PIPESTATUS BASH_SOURCE BASH_LINENO BASH_ARGC BASH_ARGV; do eval \"set -- \\${!$n@}\"; s=-; \
+		 for v; do [ \"$v\" = $n ] && s=@; done; eval \"set -- \\${!$n*}\"; for v; do [ \"$v\" = $n \
+		 ] && s+=*; done; for v in $(compgen -v $n); do [ \"$v\" = $n ] && s+=c; done; echo \"$n \
+		 $s\"; done; unset RANDOM SECONDS; echo \"[${!RANDOM@}] [${!SECONDS*}]\"; compgen -v \
+		 SECONDS || echo none; RANDOM=1; echo ${!RANDOM@}",
+	);
+	assert_eq!(
+		out,
+		"st=1\nPIPESTATUS\nFUNCNAME\nnone\nRANDOM @*c\nSRANDOM @*c\nSECONDS @*c\nEPOCHSECONDS \
+		 @*c\nEPOCHREALTIME @*c\nLINENO @*c\nBASH_COMMAND @*c\nBASH_CMDS @*c\nBASH_ALIASES \
+		 @*c\nDIRSTACK @*c\nBASHPID @*c\nBASH_SUBSHELL @*c\nPIPESTATUS @*c\nBASH_SOURCE \
+		 @*c\nBASH_LINENO @*c\nBASH_ARGC @*c\nBASH_ARGV @*c\n[] []\nnone\nRANDOM\n"
+	);
+	assert_eq!(err, "");
+}
+
+/// The shell text of a `declare -p` / `set` view of bash's dynamic
+/// variable `v`: `show` prints its `declare -p` line, `showset` its `set`
+/// line, `$PWD` as `<pwd>` and a value that varies from run to run as `<v>`
+/// (the same text as the cluster rows that recorded the goldens).
+fn cell_view(v: &str, body: &str) -> String {
+	let varies =
+		matches!(v, "RANDOM" | "SRANDOM" | "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME" | "BASHPID");
+	let val = if varies { "\"${l%%=*}=<v>\"" } else { "\"$l\"" };
+	format!(
+		"show() {{ while IFS= read -r l; do l=${{l//\\\"\"$PWD\"\\\"/\\\"<pwd>\\\"}}; \
+		 n=${{l#declare -* }}; [[ ${{n%%=*}} == {v} ]] || continue; case $n in *=*) echo {val};; *) \
+		 echo \"$l\";; esac; done; echo \"end\"; }}; showset() {{ while IFS= read -r l; do \
+		 l=${{l//\\\"\"$PWD\"\\\"/\\\"<pwd>\\\"}}; [[ ${{l%%=*}} == {v} ]] || continue; echo {val}; \
+		 done; echo \"end\"; }}; {body}"
+	)
+}
+
+/// bash keeps a value cell for each dynamic variable: a lookup runs its
+/// value function and stores the result, which `declare -p` and `set` list.
+/// Never looked up, `declare -p` lists a scalar by its attributes alone and
+/// `set` not at all; an array is listed empty; `declare -p NAME` looks the
+/// name up first. A subshell's cell is its own. Goldens from bash 5.3.20.
+#[test]
+fn dynamic_variables_keep_their_value_cells() {
+	for (v, view, want) in [
+		("RANDOM", "listing", "declare -i RANDOM\nend\n"),
+		("RANDOM", "set", "end\n"),
+		("RANDOM", "used", "declare -i RANDOM=<v>\nend\nRANDOM=<v>\nend\n"),
+		("RANDOM", "direct", "declare -i RANDOM=<v>\nend\nst=0\n"),
+		("SRANDOM", "listing", "declare -i SRANDOM\nend\n"),
+		("SRANDOM", "set", "end\n"),
+		("SRANDOM", "used", "declare -i SRANDOM=<v>\nend\nSRANDOM=<v>\nend\n"),
+		("SRANDOM", "direct", "declare -i SRANDOM=<v>\nend\nst=0\n"),
+		("SECONDS", "listing", "declare -- SECONDS\nend\n"),
+		("SECONDS", "set", "end\n"),
+		("SECONDS", "used", "declare -i SECONDS=<v>\nend\nSECONDS=<v>\nend\n"),
+		("SECONDS", "direct", "declare -i SECONDS=<v>\nend\nst=0\n"),
+		("EPOCHSECONDS", "listing", "declare -- EPOCHSECONDS\nend\n"),
+		("EPOCHSECONDS", "set", "end\n"),
+		("EPOCHSECONDS", "used", "declare -- EPOCHSECONDS=<v>\nend\nEPOCHSECONDS=<v>\nend\n"),
+		("EPOCHSECONDS", "direct", "declare -- EPOCHSECONDS=<v>\nend\nst=0\n"),
+		("EPOCHREALTIME", "listing", "declare -- EPOCHREALTIME\nend\n"),
+		("EPOCHREALTIME", "set", "end\n"),
+		("EPOCHREALTIME", "used", "declare -- EPOCHREALTIME=<v>\nend\nEPOCHREALTIME=<v>\nend\n"),
+		("EPOCHREALTIME", "direct", "declare -- EPOCHREALTIME=<v>\nend\nst=0\n"),
+		("LINENO", "listing", "declare -- LINENO\nend\n"),
+		("LINENO", "set", "end\n"),
+		("LINENO", "used", "declare -- LINENO=\"1\"\nend\nLINENO=1\nend\n"),
+		("LINENO", "direct", "declare -- LINENO=\"1\"\nend\nst=0\n"),
+		("BASH_COMMAND", "listing", "declare -- BASH_COMMAND\nend\n"),
+		("BASH_COMMAND", "set", "end\n"),
+		(
+			"BASH_COMMAND",
+			"used",
+			"declare -- BASH_COMMAND=\": \\\"\\${BASH_COMMAND}\\\"\"\nend\nBASH_COMMAND=': \
+			 \"${BASH_COMMAND}\"'\nend\n",
+		),
+		(
+			"BASH_COMMAND",
+			"direct",
+			"declare -- BASH_COMMAND=\"declare -p BASH_COMMAND 2>&1\"\nend\nst=0\n",
+		),
+		("BASH_CMDS", "listing", "declare -A BASH_CMDS=()\nend\n"),
+		("BASH_CMDS", "set", "BASH_CMDS=()\nend\n"),
+		("BASH_CMDS", "used", "declare -A BASH_CMDS=()\nend\nend\n"),
+		("BASH_CMDS", "direct", "declare -A BASH_CMDS=()\nend\nst=0\n"),
+		("BASH_ALIASES", "listing", "declare -A BASH_ALIASES=()\nend\n"),
+		("BASH_ALIASES", "set", "BASH_ALIASES=()\nend\n"),
+		("BASH_ALIASES", "used", "declare -A BASH_ALIASES=()\nend\nend\n"),
+		("BASH_ALIASES", "direct", "declare -A BASH_ALIASES=()\nend\nst=0\n"),
+		("DIRSTACK", "listing", "declare -a DIRSTACK=()\nend\n"),
+		("DIRSTACK", "set", "DIRSTACK=()\nend\n"),
+		(
+			"DIRSTACK",
+			"used",
+			"declare -a DIRSTACK=([0]=\"<pwd>\")\nend\nDIRSTACK=([0]=\"<pwd>\")\nend\n",
+		),
+		("DIRSTACK", "direct", "declare -a DIRSTACK=([0]=\"<pwd>\")\nend\nst=0\n"),
+		("BASHPID", "listing", "declare -i BASHPID\nend\n"),
+		("BASHPID", "set", "end\n"),
+		("BASHPID", "used", "declare -i BASHPID=<v>\nend\nBASHPID=<v>\nend\n"),
+		("BASHPID", "direct", "declare -i BASHPID=<v>\nend\nst=0\n"),
+		("BASH_SUBSHELL", "listing", "declare -- BASH_SUBSHELL\nend\n"),
+		("BASH_SUBSHELL", "set", "end\n"),
+		("BASH_SUBSHELL", "used", "declare -- BASH_SUBSHELL=\"0\"\nend\nBASH_SUBSHELL=0\nend\n"),
+		// `declare -p BASH_SUBSHELL | …` prints 1 in bash: a pipeline stage's
+		// builtin runs one level down, which obash does not model.
+		("PIPESTATUS", "listing", "end\n"),
+		("PIPESTATUS", "set", "end\n"),
+		(
+			"PIPESTATUS",
+			"used",
+			"declare -a PIPESTATUS=([0]=\"0\")\nend\nPIPESTATUS=([0]=\"0\" [1]=\"0\")\nend\n",
+		),
+		("PIPESTATUS", "direct", "end\nst=1\n"),
+		("BASH_SOURCE", "listing", "declare -a BASH_SOURCE=()\nend\n"),
+		("BASH_SOURCE", "set", "BASH_SOURCE=()\nend\n"),
+		("BASH_SOURCE", "used", "declare -a BASH_SOURCE=()\nend\nBASH_SOURCE=()\nend\n"),
+		("BASH_SOURCE", "direct", "declare -a BASH_SOURCE=()\nend\nst=0\n"),
+		("BASH_LINENO", "listing", "declare -a BASH_LINENO=()\nend\n"),
+		("BASH_LINENO", "set", "BASH_LINENO=()\nend\n"),
+		("BASH_LINENO", "used", "declare -a BASH_LINENO=()\nend\nBASH_LINENO=()\nend\n"),
+		("BASH_LINENO", "direct", "declare -a BASH_LINENO=()\nend\nst=0\n"),
+		("BASH_ARGC", "listing", "declare -a BASH_ARGC=()\nend\n"),
+		("BASH_ARGC", "set", "BASH_ARGC=()\nend\n"),
+		("BASH_ARGC", "used", "declare -a BASH_ARGC=([0]=\"0\")\nend\nBASH_ARGC=([0]=\"0\")\nend\n"),
+		("BASH_ARGC", "direct", "declare -a BASH_ARGC=([0]=\"0\")\nend\nst=0\n"),
+		("BASH_ARGV", "listing", "declare -a BASH_ARGV=()\nend\n"),
+		("BASH_ARGV", "set", "BASH_ARGV=()\nend\n"),
+		("BASH_ARGV", "used", "declare -a BASH_ARGV=()\nend\nBASH_ARGV=()\nend\n"),
+		("BASH_ARGV", "direct", "declare -a BASH_ARGV=()\nend\nst=0\n"),
+		("FUNCNAME", "listing", "declare -a FUNCNAME\nend\n"),
+		("FUNCNAME", "set", "end\n"),
+		("FUNCNAME", "used", "declare -a FUNCNAME\nend\nend\n"),
+		("FUNCNAME", "direct", "declare -a FUNCNAME\nend\nst=0\n"),
+	] {
+		let body = match view {
+			"listing" => "declare -p | show".to_owned(),
+			"set" => "set | showset".to_owned(),
+			"used" => format!(": \"${{{v}}}\"; declare -p | show; set | showset"),
+			_ => format!("declare -p {v} 2>&1 | show; echo \"st=${{PIPESTATUS[0]}}\""),
+		};
+		assert_eq!(run(&cell_view(v, &body)), (want.to_owned(), String::new()), "{v} {view}");
+	}
+	for (v, body, want) in [
+		(
+			"BASH_CMDS",
+			"hash -p /bin/true t; : \"${BASH_CMDS}\"; declare -p | show; set | showset",
+			"declare -A BASH_CMDS=([t]=\"/bin/true\" )\nend\nBASH_CMDS=([t]=\"/bin/true\" )\nend\n",
+		),
+		(
+			"BASH_CMDS",
+			"hash -p /bin/true t; : \"${BASH_CMDS[t]}\"; declare -p | show; set | showset",
+			"declare -A BASH_CMDS=([t]=\"/bin/true\" )\nend\nBASH_CMDS=([t]=\"/bin/true\" )\nend\n",
+		),
+		(
+			"BASH_CMDS",
+			"hash -p /bin/true t; declare -p | show; set | showset",
+			"declare -A BASH_CMDS=()\nend\nBASH_CMDS=()\nend\n",
+		),
+		(
+			"BASH_ALIASES",
+			"alias a=b; : \"${BASH_ALIASES}\"; declare -p | show; set | showset",
+			"declare -A BASH_ALIASES=([a]=\"b\" )\nend\nBASH_ALIASES=([a]=\"b\" )\nend\n",
+		),
+		(
+			"BASH_ALIASES",
+			"alias a=b; declare -p | show; set | showset",
+			"declare -A BASH_ALIASES=()\nend\nBASH_ALIASES=()\nend\n",
+		),
+		(
+			"FUNCNAME",
+			"f() { declare -p | show; set | showset; }; f",
+			"declare -a FUNCNAME=([0]=\"f\")\nend\nFUNCNAME=([0]=\"f\")\nend\n",
+		),
+		(
+			"LINENO",
+			": \"$LINENO\"\n:\n:\ndeclare -p | show; echo \"$LINENO\"; declare -p | show",
+			"declare -- LINENO=\"1\"\nend\n4\ndeclare -- LINENO=\"4\"\nend\n",
+		),
+		(
+			"BASH_SUBSHELL",
+			"( : \"$BASH_SUBSHELL\"; declare -p | show ); declare -p | show",
+			"declare -- BASH_SUBSHELL=\"1\"\nend\ndeclare -- BASH_SUBSHELL\nend\n",
+		),
+		(
+			"SRANDOM",
+			"x=$((SRANDOM)); declare -p | show; set | showset",
+			"declare -i SRANDOM=<v>\nend\nSRANDOM=<v>\nend\n",
+		),
+		// A declaration before the first lookup keeps the cell's own
+		// attributes, as bash's record has them from its startup.
+		(
+			"SRANDOM",
+			"readonly SRANDOM; : \"$SRANDOM\"; declare -p | show",
+			"declare -ir SRANDOM=<v>\nend\n",
+		),
+		// `declare +i` takes the integer attribute off, but bash's value
+		// functions for SRANDOM and BASHPID set it again on every lookup:
+		// after a read the record is `-i` again, and only a listing with no
+		// lookup between shows it off.
+		(
+			"SRANDOM",
+			"declare +i SRANDOM; : \"$SRANDOM\"; declare -p | show",
+			"declare -i SRANDOM=<v>\nend\n",
+		),
+		("SRANDOM", "declare +i SRANDOM; declare -p | show", "declare -- SRANDOM=<v>\nend\n"),
+		("SRANDOM", "declare +i SRANDOM; declare -p SRANDOM | show", "declare -i SRANDOM=<v>\nend\n"),
+		(
+			"BASHPID",
+			"declare +i BASHPID; x=$BASHPID; declare -p BASHPID | show",
+			"declare -i BASHPID=<v>\nend\n",
+		),
+		("BASHPID", "declare +i BASHPID; declare -p | show", "declare -- BASHPID=<v>\nend\n"),
+		// A visible local or temporary of a cell name is that one's plain
+		// variable: its value is read, not the cell's, and `unset` acts on
+		// it, leaving the cell.
+		(
+			"SRANDOM",
+			"f() { local SRANDOM=5; declare -p SRANDOM; echo \"[$SRANDOM]\"; }; f",
+			"declare -- SRANDOM=\"5\"\n[5]\n",
+		),
+		("BASHPID", "f() { local BASHPID=7; echo \"[$BASHPID]\"; }; f", "[7]\n"),
+		("SRANDOM", "SRANDOM=5 eval 'echo \"[$SRANDOM]\"'", "[5]\n"),
+		(
+			"SRANDOM",
+			"f() { local SRANDOM=5; unset SRANDOM; echo \"st=$?\"; }; f; declare -p SRANDOM > \
+			 /dev/null; echo \"after st=$?\"",
+			"st=0\nafter st=0\n",
+		),
+		(
+			"SRANDOM",
+			"SRANDOM=3 eval 'unset SRANDOM'; declare -p SRANDOM > /dev/null; echo \"after st=$?\"",
+			"after st=0\n",
+		),
+		(
+			"LINENO",
+			"export LINENO; : \"$LINENO\"; declare -p | show",
+			"declare -x LINENO=\"1\"\nend\n",
+		),
+		// `declare -p BASH_ARGV` outside a function pushes the positional
+		// parameters as bash's `get_bashargcv` does, so the listing after it
+		// shows them.
+		(
+			"BASH_ARGV",
+			"set -- a b; declare -p BASH_ARGV > /dev/null; declare -p | show",
+			"declare -a BASH_ARGV=([0]=\"b\" [1]=\"a\")\nend\n",
+		),
+		(
+			"BASH_ARGC",
+			"set -- a b; declare -p BASH_ARGC > /dev/null; set | showset",
+			"BASH_ARGC=([0]=\"2\")\nend\n",
+		),
+		// A function's new local of a cell name is its own plain variable.
+		("SRANDOM", "f() { local SRANDOM; declare -p SRANDOM; }; f", "declare -- SRANDOM\n"),
+		(
+			"BASHPID",
+			"f() { local BASHPID=7+1; declare -p BASHPID; }; f",
+			"declare -- BASHPID=\"7+1\"\n",
+		),
+		("SRANDOM", "f() { local SRANDOM; local -p; }; f", "declare -- SRANDOM\n"),
+		// `export`, `readonly` and `declare` look the name up, which keeps
+		// the cell, as bash's `find_variable` does.
+		(
+			"DIRSTACK",
+			"export DIRSTACK; declare -p | show; set | showset",
+			"declare -ax DIRSTACK=([0]=\"<pwd>\")\nend\nDIRSTACK=([0]=\"<pwd>\")\nend\n",
+		),
+		(
+			"DIRSTACK",
+			"readonly DIRSTACK; declare -p | show",
+			"declare -ar DIRSTACK=([0]=\"<pwd>\")\nend\n",
+		),
+		(
+			"BASH_ALIASES",
+			"export BASH_ALIASES; declare -p | show",
+			"declare -Ax BASH_ALIASES=()\nend\n",
+		),
+		("BASH_CMDS", "readonly BASH_CMDS; declare -p | show", "declare -Ar BASH_CMDS=()\nend\n"),
+		(
+			"LINENO",
+			"export LINENO; declare -p | show; set | showset",
+			"declare -x LINENO=\"1\"\nend\nLINENO=1\nend\n",
+		),
+		// `unset` removes the dynamic variable: no longer listed, no longer
+		// computed, and plain when it is assigned again. A subshell's is its
+		// own.
+		("SRANDOM", "unset SRANDOM; declare -p | show", "end\n"),
+		("LINENO", "unset LINENO; declare -p | show; echo \"[$LINENO]\"", "end\n[]\n"),
+		(
+			"EPOCHSECONDS",
+			"unset EPOCHSECONDS; declare -p EPOCHSECONDS 2> /dev/null; echo \"st=$?\"",
+			"st=1\n",
+		),
+		(
+			"SRANDOM",
+			"unset SRANDOM; declare SRANDOM=5; declare -p | show; echo \"$SRANDOM $SRANDOM\"",
+			"declare -- SRANDOM=<v>\nend\n5 5\n",
+		),
+		("LINENO", "( unset LINENO ); declare -p | show", "declare -- LINENO\nend\n"),
+	] {
+		assert_eq!(run(&cell_view(v, body)), (want.to_owned(), String::new()), "{body}");
+	}
+}
+
+/// `SECONDS=n` restarts the count from n (bash `assign_seconds`; the
+/// fake host's clock moves 1 µs per read); a fork counts from its own copy,
+/// so neither side's assignment reaches the other.
+#[test]
+fn seconds_assignment_counts_from_the_value_in_each_process() {
+	let (out, err) = run(
+		"SECONDS=5000; echo $SECONDS; ( SECONDS=9000; echo c=$SECONDS ); echo p=$SECONDS; x=$( \
+		 SECONDS=1; echo $SECONDS ); echo $x $SECONDS; ( (( SECONDS < 7000 )) && echo kept ) & \
+		 SECONDS=7000; wait; echo $SECONDS; SECONDS=-5; echo $SECONDS",
+	);
+	assert_eq!((out.as_str(), err.as_str()), ("5000\nc=9000\np=5000\n1 5000\nkept\n7000\n-5\n", ""));
+}
+
+/// bash's `SECONDS=` takes a decimal number (`valid_number`, else 0; out of
+/// `i64`'s range too) until the variable is an integer: after `declare -i
+/// SECONDS`, or once `$SECONDS` was read (`get_seconds` sets the
+/// attribute), the value is arithmetic, and an arithmetic error is
+/// reported, counts as 0 and the script goes on with status 0. Each `$(…)`
+/// below is a shell that has not read `$SECONDS` before its assignment.
+/// Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_assignment_takes_a_decimal_number_until_seconds_is_an_integer() {
+	let (out, err) = run(
+		"x=7; for v in 1+1 x 0x10 ' 7 ' abc 5.5 -3 99999999999999999999 -9223372036854775808 \
+		 -9223372036854775809; do r=$(SECONDS=$v; echo \"$SECONDS st=$?\"); echo \"[$v] $r\"; done; \
+		 r=$(: $SECONDS; SECONDS=1+1; a=$SECONDS; SECONDS=x; b=$SECONDS; SECONDS=0x10; echo $a $b \
+		 $SECONDS); echo \"after a read: $r\"; r=$(: $SECONDS; SECONDS=5.5; echo \"st=$? \
+		 $SECONDS\"; f() { SECONDS=5.5; echo \"f st=$?\"; }; f; echo \"after f st=$?\"); echo $r; \
+		 declare -i SECONDS; SECONDS=1+1; echo $SECONDS",
+	);
+	assert_eq!(
+		out,
+		"[1+1] 0 st=0\n[x] 0 st=0\n[0x10] 0 st=0\n[ 7 ] 7 st=0\n[abc] 0 st=0\n[5.5] 0 st=0\n[-3] -3 \
+		 st=0\n[99999999999999999999] 0 st=0\n[-9223372036854775808] -9223372036854775808 \
+		 st=0\n[-9223372036854775809] 0 st=0\nafter a read: 2 7 16\nst=0 0 f st=0 after f st=0\n2\n"
+	);
+	assert_eq!(err.matches("5.5: arithmetic syntax error").count(), 2, "{err}");
+}
+
+/// bash's `SECONDS+=` makes the value first (`make_variable_value`): the old
+/// value's text with the new one after it, or their sum once `SECONDS` is
+/// integer; the old value is the last assignment's or read's.
+#[test]
+fn seconds_append_adds_to_the_last_value() {
+	for (src, want) in [
+		("SECONDS=5; SECONDS+=5; echo $SECONDS", "55\n"),
+		(": $SECONDS; SECONDS=5; SECONDS+=5; echo $SECONDS", "10\n"),
+		("SECONDS+=5; echo $SECONDS", "5\n"),
+		("SECONDS=7; : $SECONDS; SECONDS+=1+1; echo $SECONDS", "9\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// A local or temporary `SECONDS` is a plain variable (bash's
+/// `make_local_variable` copies no dynamic value), and the shell's clock
+/// goes on unmoved; `local`, `declare` and `export` with no value look the
+/// name up first (`find_variable`), which reads the shell's `SECONDS` and
+/// so makes it integer. `unset SECONDS` removes the special meaning for
+/// good unless a local is what it unsets. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_locals_lookups_and_unset() {
+	for (src, want) in [
+		("f() { local SECONDS=3; echo $SECONDS; }; f; echo $SECONDS", "3\n0\n"),
+		(
+			"f() { local SECONDS; echo \"[$SECONDS]\"; SECONDS=7; echo $SECONDS; }; SECONDS=50; f; \
+			 echo $SECONDS",
+			"[]\n7\n50\n",
+		),
+		("f() { local SECONDS=1+1; echo $SECONDS; }; f; SECONDS=1+1; echo $SECONDS", "1+1\n2\n"),
+		("f() { local SECONDS=4; unset SECONDS; }; f; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("declare SECONDS=1+1; echo $SECONDS", "2\n"),
+		("export SECONDS=1+1; echo $SECONDS; SECONDS=1+1; echo $SECONDS", "0\n2\n"),
+		("export SECONDS; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("declare -p SECONDS", "declare -i SECONDS=\"0\"\n"),
+		("SECONDS=5; declare -p SECONDS", "declare -i SECONDS=\"5\"\n"),
+		(
+			"unset SECONDS; echo \"[$SECONDS]\"; SECONDS=1+1; echo $SECONDS; declare -p SECONDS",
+			"[]\n1+1\ndeclare -- SECONDS=\"1+1\"\n",
+		),
+		("f() { unset SECONDS; }; f; SECONDS=1+1; echo $SECONDS", "1+1\n"),
+		("( unset SECONDS; SECONDS=1+1; echo $SECONDS ); SECONDS=1+1; echo $SECONDS", "1+1\n0\n"),
+		("unset -n SECONDS; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("declare -n r=SECONDS; unset -n r; SECONDS=1+1; echo $SECONDS", "2\n"),
+		(
+			"declare -n r=SECONDS; for r in 7; do :; done 2>/dev/null; SECONDS=1+1; echo $SECONDS",
+			"2\n",
+		),
+		// The chain is looked up before the word is bound: `r` names `x`,
+		// so `SECONDS` is not looked up and stays non-integer.
+		("declare -n r=x; for r in SECONDS; do :; done; SECONDS=1+1; echo $SECONDS", "0\n"),
+		// A declaration through a reference looks `SECONDS` up; an
+		// assignment through a function's own reference does not.
+		("declare -n r=SECONDS; declare r; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("declare -n r=SECONDS; f() { local r; }; f; SECONDS=1+1; echo $SECONDS", "2\n"),
+		("f() { local -n q=SECONDS; q+=0; }; f; SECONDS=1+1; echo $SECONDS", "0\n"),
+		// A fork keeps whether `unset` removed the special meaning.
+		(
+			"SECONDS=5; (echo $SECONDS); unset SECONDS; (echo \"[$SECONDS]\"); x=$(echo \
+			 \"[$SECONDS]\"); echo $x",
+			"5\n[]\n[]\n",
+		),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `SECONDS` in the environment is the count's starting value, a decimal
+/// number (bash's `init_seconds_var`), for the shell and for a nested
+/// `bash`. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_from_the_environment() {
+	for (value, want) in [("100", "100\n"), ("abc", "0\n"), (" 7 ", "7\n")] {
+		let init = ShellInit {
+			env: vec![
+				(BString::from("PATH"), BString::from("/usr/bin:/bin")),
+				(BString::from("SECONDS"), BString::from(value)),
+			],
+			..skeleton_init(&[])
+		};
+		let mut rig = Rig::new(FakeHost::new(), init);
+		rig.run(Script::command(b"echo $SECONDS".to_vec()), Fault::None);
+		assert_eq!(String::from_utf8_lossy(&rig.host.stdout.bytes()), want, "{value}");
+	}
+	for (src, want) in [
+		("SECONDS=100 bash -c 'echo $SECONDS'", "100\n"),
+		("SECONDS=100; export SECONDS; bash -c 'echo $SECONDS'", "100\n"),
+		("SECONDS=abc bash -c 'echo $SECONDS'", "0\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// Two seconds pass on the fake host's clock: `read -t 2` from a coproc
+/// that waits for its input blocks until the clock jumps to its deadline,
+/// then the coproc is given its line and reaped.
+const WAIT_2S: &str =
+	"coproc { read x; }; read -t 2 -u ${COPROC[0]} y; echo hi >&${COPROC[1]}; wait $COPROC_PID; ";
+
+/// bash's arithmetic assignment (`bind_int_variable`) runs `SECONDS`'s
+/// assign function as `SECONDS=` does: `((…))`, `let`, `$((…))`, an
+/// integer variable's value and a subscript all set the clock, which then
+/// counts on. A local `SECONDS` is only that local's; after `unset SECONDS`
+/// the name is a plain variable. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_arithmetic_assignment_sets_the_clock() {
+	let counts = format!("((SECONDS=100)); {WAIT_2S}echo $SECONDS");
+	for (src, want) in [
+		("((SECONDS=100)); echo $SECONDS", "100\n"),
+		("let SECONDS=200; echo $SECONDS", "200\n"),
+		(": $((SECONDS=50)); echo $SECONDS", "50\n"),
+		("((SECONDS+=5)); echo $SECONDS", "5\n"),
+		("((SECONDS++)); echo $SECONDS", "1\n"),
+		("declare -i x; x='SECONDS=100'; echo $x $SECONDS", "100 100\n"),
+		("a[SECONDS=100]=1; echo $SECONDS", "100\n"),
+		("f() { local SECONDS; ((SECONDS=7)); echo $SECONDS; }; f; echo $SECONDS", "7\n0\n"),
+		(
+			"unset SECONDS; ((SECONDS=7)); echo $SECONDS; declare -p SECONDS",
+			"7\ndeclare -- SECONDS=\"7\"\n",
+		),
+		(counts.as_str(), "102\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// An element, compound or array-attribute assignment to the shell's
+/// `SECONDS` makes it a plain array (bash's `convert_var_to_array`): the
+/// lookup before it reads the clock, so element 0 is the count and the
+/// variable is integer, and it counts no more. A local `SECONDS` is only
+/// that local's: `local -a`, `local -A`, `declare -a` and a compound value
+/// in a function leave the shell's clock counting. Goldens from bash
+/// 5.2.21 and 5.3.20.
+#[test]
+fn seconds_array_forms_make_it_a_plain_array() {
+	let stopped = format!("SECONDS[0]=60; {WAIT_2S}echo $SECONDS");
+	let counting = format!("SECONDS=60; {WAIT_2S}echo $SECONDS");
+	let local_a =
+		format!("f() {{ local -a SECONDS=(1 2); echo \"$SECONDS\"; }}; f; {WAIT_2S}echo $SECONDS");
+	let declare_a = format!("f() {{ declare -a SECONDS=(1 2); }}; f; {WAIT_2S}echo $SECONDS");
+	let local_assoc = format!("f() {{ local -A SECONDS; }}; f; {WAIT_2S}echo $SECONDS");
+	let local_compound = format!("f() {{ local SECONDS=(1 2); }}; f; {WAIT_2S}echo $SECONDS");
+	for (src, want) in [
+		(
+			"SECONDS[0]=60; echo \"$SECONDS\"; declare -p SECONDS",
+			"60\ndeclare -ai SECONDS=([0]=\"60\")\n",
+		),
+		(
+			"SECONDS[1]=60; echo \"[$SECONDS]\"; declare -p SECONDS",
+			"[0]\ndeclare -ai SECONDS=([0]=\"0\" [1]=\"60\")\n",
+		),
+		("SECONDS=5; SECONDS[0]+=5; echo \"$SECONDS\"", "10\n"),
+		(
+			"SECONDS=(1 2); echo \"$SECONDS\"; declare -p SECONDS",
+			"1\ndeclare -ai SECONDS=([0]=\"1\" [1]=\"2\")\n",
+		),
+		(
+			"SECONDS=5; SECONDS+=(6); declare -p SECONDS",
+			"declare -ai SECONDS=([0]=\"5\" [1]=\"6\")\n",
+		),
+		(
+			"read -a SECONDS <<< \"7 8\"; declare -p SECONDS",
+			"declare -ai SECONDS=([0]=\"7\" [1]=\"8\")\n",
+		),
+		(
+			"mapfile -t SECONDS <<< $'7\\n8'; declare -p SECONDS",
+			"declare -ai SECONDS=([0]=\"7\" [1]=\"8\")\n",
+		),
+		("declare -a SECONDS; declare -p SECONDS", "declare -ai SECONDS=([0]=\"0\")\n"),
+		("declare -A SECONDS; declare -p SECONDS", "declare -Ai SECONDS=([0]=\"0\" )\n"),
+		("((SECONDS[0]=60)); declare -p SECONDS", "declare -ai SECONDS=([0]=\"60\")\n"),
+		("let 'SECONDS[1]=60'; declare -p SECONDS", "declare -ai SECONDS=([0]=\"0\" [1]=\"60\")\n"),
+		("declare 'SECONDS[0]=60'; declare -p SECONDS", "declare -ai SECONDS=([0]=\"60\")\n"),
+		("f() { local SECONDS; SECONDS[0]=60; echo \"$SECONDS\"; }; f; echo \"$SECONDS\"", "60\n0\n"),
+		(stopped.as_str(), "60\n"),
+		(counting.as_str(), "62\n"),
+		(local_a.as_str(), "1\n2\n"),
+		(declare_a.as_str(), "2\n"),
+		(local_assoc.as_str(), "2\n"),
+		(local_compound.as_str(), "2\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `unset 'SECONDS[i]'` looks `SECONDS` up first, so it is an integer
+/// scalar: element 0 unsets it and removes the special meaning, as `unset
+/// SECONDS` does; another index is no element of it. Goldens from bash
+/// 5.2.21 and 5.3.20.
+#[test]
+fn seconds_unset_of_an_element() {
+	for (src, want) in [
+		("unset 'SECONDS[0]'; echo \"[$SECONDS]\"; SECONDS=1+1; echo $SECONDS", "[]\n1+1\n"),
+		("unset 'SECONDS[1-1]'; echo \"[$SECONDS]\"", "[]\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+	let (out, err) = run("unset 'SECONDS[1]'; echo \"st=$? [$SECONDS]\"");
+	assert_eq!(out, "st=1 [0]\n");
+	assert!(err.contains("unset: SECONDS: not an array variable"), "{err}");
+}
+
+/// A readonly `SECONDS` refuses `SECONDS=` and an element assignment, which
+/// end the script, the arithmetic forms, which fail the command with status
+/// 1, and `declare -a`/`-A`, which fail with status 1 (bash 5.3.20; 5.2.21
+/// converts it); the clock is unmoved and counts on. Goldens from bash
+/// 5.3.20 (and 5.2.21 but for `declare`).
+#[test]
+fn seconds_readonly_is_refused() {
+	let element =
+		format!("readonly SECONDS; ((SECONDS[0]=5)); echo \"st=$?\"; {WAIT_2S}echo $SECONDS");
+	let declare_a =
+		format!("readonly SECONDS; declare -a SECONDS; echo \"st=$?\"; {WAIT_2S}echo $SECONDS");
+	let declare_assoc =
+		format!("readonly SECONDS; declare -A SECONDS; echo \"st=$?\"; {WAIT_2S}echo $SECONDS");
+	for (src, want, diag) in [
+		("readonly SECONDS; SECONDS=5; echo next", "", "SECONDS: readonly variable"),
+		(
+			"readonly SECONDS; ((SECONDS=5)); echo \"st=$? $SECONDS\"",
+			"st=1 0\n",
+			"SECONDS: readonly variable",
+		),
+		("readonly SECONDS; SECONDS[0]=60; echo next", "", "SECONDS: readonly variable"),
+		(element.as_str(), "st=1\n2\n", "SECONDS: readonly variable"),
+		(declare_a.as_str(), "st=1\n2\n", "declare: SECONDS: readonly variable"),
+		(declare_assoc.as_str(), "st=1\n2\n", "declare: SECONDS: readonly variable"),
+	] {
+		let (out, err) = run(src);
+		assert_eq!(out, want, "{src}");
+		assert!(err.contains(diag), "{src}: {err}");
+	}
+}
+
+/// `declare` gives or takes no array, integer or case attribute of a
+/// readonly variable (bash 5.3.20's `invalid_readonly_attrs`): it fails
+/// with status 1 and the variable stays as it was; the export and trace
+/// attributes still change. bash 5.2.21 changes them all. Goldens from bash
+/// 5.3.20.
+#[test]
+fn declare_keeps_a_readonly_variables_array_integer_and_case_attributes() {
+	for flag in ["-a", "-A", "-i", "-l", "-u", "-c", "+i", "+a", "-ai"] {
+		let src = format!("readonly x=1; declare {flag} x; echo st=$?; declare -p x");
+		let (out, err) = run(&src);
+		assert_eq!(out, "st=1\ndeclare -r x=\"1\"\n", "{src}");
+		assert!(err.contains("declare: x: readonly variable"), "{src}: {err}");
+	}
+	for (src, want) in [
+		("readonly x=1; declare -x x; echo st=$?; declare -p x", "st=0\ndeclare -rx x=\"1\"\n"),
+		("readonly x=1; declare -t x; echo st=$?; declare -p x", "st=0\ndeclare -rt x=\"1\"\n"),
+		(
+			"readonly -a a=(1); declare -a a; echo st=$?; declare -p a",
+			"st=1\ndeclare -ar a=([0]=\"1\")\n",
+		),
+	] {
+		let (out, err) = run(src);
+		assert_eq!(out, want, "{src}");
+		assert_eq!(err.is_empty(), want.starts_with("st=0"), "{src}: {err}");
+	}
+}
+
+/// `readonly` and `export` take `-a` and `-A` only with a value (bash's
+/// `set_or_show_attributes` then declares the name `-g[rx]a`/`-g[rx]A`);
+/// without one the name gets only the builtin's own attribute, a readonly
+/// one too: status 0, no array made, the value kept. Goldens from bash
+/// 5.3.20, the same in 5.2.21.
+#[test]
+fn readonly_and_export_take_array_flags_only_with_a_value() {
+	for (src, want) in [
+		("readonly x=1; readonly -a x; echo st=$?; declare -p x", "st=0\ndeclare -r x=\"1\"\n"),
+		("readonly x=1; readonly -A x; echo st=$?; declare -p x", "st=0\ndeclare -r x=\"1\"\n"),
+		("readonly x=1; export -a x; echo st=$?; declare -p x", "st=0\ndeclare -rx x=\"1\"\n"),
+		("readonly x=1; export -A x; echo st=$?; declare -p x", "st=0\ndeclare -rx x=\"1\"\n"),
+		("set -o posix; readonly x=1; readonly -a x; echo st=$?", "st=0\n"),
+		(
+			"readonly -a x=(1); export -a x; echo st=$?; declare -p x",
+			"st=0\ndeclare -arx x=([0]=\"1\")\n",
+		),
+		("readonly -a y; echo st=$?; declare -p y", "st=0\ndeclare -r y\n"),
+		("z=5; export -a z; echo st=$?; declare -p z", "st=0\ndeclare -x z=\"5\"\n"),
+		("z=5; readonly -A z; echo st=$?; declare -p z", "st=0\ndeclare -r z=\"5\"\n"),
+		("export -a y=5; echo st=$?; declare -p y", "st=0\ndeclare -ax y=([0]=\"5\")\n"),
+	] {
+		assert_eq!(run(src), (want.to_owned(), String::new()), "{src}");
+	}
+}
+
+/// `SECONDS+=` adds to the value the last lookup stored, as bash's
+/// `make_variable_value` reads the variable's cell: a lookup two seconds
+/// on stores the count then (7); without one, the 5 stored before is what
+/// it adds to. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn seconds_append_adds_to_the_last_lookups_value() {
+	let looked_up = format!("SECONDS=5; : $SECONDS; {WAIT_2S}: $SECONDS; SECONDS+=0; echo $SECONDS");
+	let stale = format!("SECONDS=5; : $SECONDS; {WAIT_2S}SECONDS+=0; echo $SECONDS");
+	assert_eq!(run(&looked_up), ("7\n".to_owned(), String::new()));
+	assert_eq!(run(&stale), ("5\n".to_owned(), String::new()));
+}
+
+/// `export` and `readonly` take no subscript, with a value either (bash's
+/// `legal_identifier` of the name before `=`): nothing is assigned, the
+/// status is 1 and the script goes on. Goldens from bash 5.2.21 and 5.3.20.
+#[test]
+fn export_and_readonly_refuse_a_subscript() {
+	for (src, want, diag) in [
+		(
+			"export 'x[0]=60'; echo st=$?; declare -p x",
+			"st=1\n",
+			"export: `x[0]': not a valid identifier",
+		),
+		(
+			"x=1; readonly 'x[0]=60'; echo st=$?; declare -p x",
+			"st=1\ndeclare -- x=\"1\"\n",
+			"readonly: `x[0]': not a valid identifier",
+		),
+		(
+			"export 'SECONDS[0]=60'; echo $SECONDS; declare -p SECONDS",
+			"0\ndeclare -i SECONDS=\"0\"\n",
+			"export: `SECONDS[0]': not a valid identifier",
+		),
+	] {
+		let (out, err) = run(src);
+		assert_eq!(out, want, "{src}");
+		assert!(err.contains(diag), "{src}: {err}");
+	}
+}
+
+/// bash's `SECONDS=` keeps the value apart and moves the start to now
+/// (`assign_seconds`): `printf '%(%s)T' -2` then gives the assignment's
+/// time, and posix `time` with no pipeline counts from it. The host's clock
+/// starts at 1,000 s: a start moved back by the value would not wrap past
+/// 0, where these readers saturate.
+#[test]
+fn seconds_assignment_moves_the_start_to_now() {
+	let out = run_script(
+		FakeHost::new().with_clock_at(1_000_000_000_000),
+		b"SECONDS=100; a=$(printf '%(%s)T' -2); b=$(printf '%(%s)T' -1); [ \"$a\" = \"$b\" ] && \
+		  echo now; echo $SECONDS; set -o posix; TIMEFORMAT=%0R; SECONDS=100; { time; } 2>&1",
+		&[],
+		Fault::None,
+	);
+	let (out, err) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+	assert_eq!((&*out, &*err), ("now\n100\n0\n", ""));
 }
 
 #[test]
@@ -645,6 +2153,16 @@ fn references_to_elements_of_themselves_and_dangling_references() {
 	);
 }
 
+// Golden: bash 5.3.20 and 5.2.21: `declare` of an element through a
+// reference makes the reference a plain array also when its target exists
+// (outside a function, `declare_internal`'s `array_subscript_assignment`).
+#[test]
+fn an_element_declared_through_a_reference_removes_the_reference() {
+	let (out, err) = run("declare -n x=y; y=(1 2); declare 'x[1]=8'; declare -p x y");
+	assert_eq!(out, "declare -a x=([1]=\"8\")\ndeclare -a y=([0]=\"1\" [1]=\"2\")\n");
+	assert_eq!(err, "bash: line 1: warning: x: removing nameref attribute\n");
+}
+
 #[test]
 fn attributes_given_with_and_without_the_reference() {
 	let (out, err) = run(
@@ -659,6 +2177,250 @@ fn attributes_given_with_and_without_the_reference() {
 	);
 	assert_eq!(out, "declare -a foo=([0]=\"X\")\n");
 	assert_eq!(err, "bash: line 1: declare: var: not found\n");
+	// On a reference the running function owns, `+n NAME=VALUE` assigns
+	// the name itself, as an assignment to a reference does: a value that
+	// is no identifier is refused and the reference stays. Goldens from
+	// bash 5.3.20 (5.2.21 agrees).
+	let (out, err) = run(
+		"y=1; f() { local -n q=y; local +n q=zz; declare -p q; echo \"$y\"; }; f; g() { local -n \
+		 p=y; local +n p=3; declare -p p; echo \"$y\"; }; g",
+	);
+	assert_eq!(out, "declare -- q=\"zz\"\n1\ndeclare -n p=\"y\"\n1\n");
+	assert!(err.ends_with("local: `3': not a valid identifier\n"), "{err}");
+	// The rest of that rule. The value is the reference's own after `+=`
+	// (the target's name, then the word) and the attributes given: `-i`
+	// evaluates it, so a number is refused, silently when the word itself
+	// was a name; `-u`/`-l` change its case. It may name an element
+	// (`valid_nameref_value`). A refusal keeps the reference, with the
+	// attributes given. Goldens from bash 5.3.20 (5.2.21 agrees).
+	for (body, want_out, want_err) in [
+		("local +n q+=zz", "st=0\ndeclare -- q=\"yzz\"\ny=1 w=0\n", ""),
+		("local +n q+=3", "st=0\ndeclare -- q=\"y3\"\ny=1 w=0\n", ""),
+		("local +n q+='[1]'", "st=0\ndeclare -- q=\"y[1]\"\ny=1 w=0\n", ""),
+		(
+			"local +n q+=-",
+			"st=1\ndeclare -n q=\"y\"\ny=1 w=0\n",
+			"local: `-': not a valid identifier\n",
+		),
+		("local +n q='a[1]'", "st=0\ndeclare -- q=\"a[1]\"\ny=1 w=0\n", ""),
+		(
+			"local +n q='a[x'",
+			"st=1\ndeclare -n q=\"y\"\ny=1 w=0\n",
+			"local: `a[x': not a valid identifier\n",
+		),
+		("local +n -i q=zz", "st=1\ndeclare -in q=\"y\"\ny=1 w=0\n", ""),
+		("local +n -i q+=zz", "st=1\ndeclare -in q=\"y\"\ny=1 w=0\n", ""),
+		(
+			"local +n -i q=3+4",
+			"st=1\ndeclare -in q=\"y\"\ny=1 w=0\n",
+			"local: `3+4': not a valid identifier\n",
+		),
+		(
+			"local +n -i q=w++",
+			"st=1\ndeclare -in q=\"y\"\ny=1 w=1\n",
+			"local: `w++': not a valid identifier\n",
+		),
+		("local +n -u q=zz", "st=0\ndeclare -u q=\"ZZ\"\ny=1 w=0\n", ""),
+		("local +n -l q=ZZ", "st=0\ndeclare -l q=\"zz\"\ny=1 w=0\n", ""),
+		(
+			"local +n -u q=3",
+			"st=1\ndeclare -nu q=\"y\"\ny=1 w=0\n",
+			"local: `3': not a valid identifier\n",
+		),
+		(
+			"local +n -r q=3",
+			"st=1\ndeclare -nr q=\"y\"\ny=1 w=0\n",
+			"local: `3': not a valid identifier\n",
+		),
+		("local +n -x q+=zz", "st=0\ndeclare -x q=\"yzz\"\ny=1 w=0\n", ""),
+		("declare +n q+=zz", "st=0\ndeclare -- q=\"yzz\"\ny=1 w=0\n", ""),
+		("typeset +n -r q='a[1]'", "st=0\ndeclare -r q=\"a[1]\"\ny=1 w=0\n", ""),
+	] {
+		let src = format!(
+			"y=1; zz=4; w=0; f() {{ local -n q=y; {body}; echo \"st=$?\"; declare -p q; echo \"y=$y \
+			 w=$w\"; }}; f"
+		);
+		let (out, err) = run(&src);
+		assert_eq!(out, want_out, "{body}");
+		if want_err.is_empty() {
+			assert_eq!(err, "", "{body}");
+		} else {
+			assert!(err.ends_with(want_err), "{body}: {err}");
+		}
+	}
+	// A reference with no target takes the value. A function's own reference
+	// to an element is left as it is; a global one gives the value to the
+	// element and ends (bash 5.3.20, each form at the top level of the
+	// script; 5.2.21 agrees but for the `-c` name in a message).
+	for (src, want_out, want_err) in [
+		(
+			"f() { local -n q; local +n q=zz; echo \"st=$?\"; declare -p q; }; f",
+			"st=0\ndeclare -- q=\"zz\"\n",
+			"",
+		),
+		(
+			"f() { local -n q; local +n q+=zz; echo \"st=$?\"; declare -p q; }; f",
+			"st=0\ndeclare -- q=\"zz\"\n",
+			"",
+		),
+		(
+			"f() { local -n q; local +n q=3; echo \"st=$?\"; declare -p q; }; f",
+			"st=1\ndeclare -n q\n",
+			"bash: line 1: local: `3': not a valid identifier\n",
+		),
+		(
+			"zz=4; f() { local -n q; local +n -i q=zz; echo \"st=$?\"; declare -p q; }; f",
+			"st=1\ndeclare -in q\n",
+			"",
+		),
+		(
+			"declare -n q; declare +n q=zz; echo \"st=$?\"; declare -p q",
+			"st=0\ndeclare -- q=\"zz\"\n",
+			"",
+		),
+		(
+			"declare -n q; declare +n q+=zz; echo \"st=$?\"; declare -p q",
+			"st=0\ndeclare -- q=\"zz\"\n",
+			"",
+		),
+		// A global one that refuses its value is dropped.
+		(
+			"declare -n q; declare +n q=3; echo \"st=$?\"; declare -p q",
+			"st=1\n",
+			"bash: line 1: declare: `3': not a valid identifier\nbash: line 1: declare: q: not \
+			 found\n",
+		),
+		(
+			"zz=4; declare -n q; declare +n -i q=zz; echo \"st=$?\"; declare -p q",
+			"st=1\n",
+			"bash: line 1: declare: q: not found\n",
+		),
+		// A readonly reference refuses `+n` with a value, with or without a
+		// target, and stays as it is: it is neither assigned nor dropped.
+		(
+			"declare -rn q; declare +n q=zz; echo \"st=$?\"; declare -p q",
+			"st=1\ndeclare -nr q\n",
+			"bash: line 1: declare: q: readonly variable\n",
+		),
+		(
+			"declare -rn q; declare +n q=3; echo \"st=$?\"; declare -p q",
+			"st=1\ndeclare -nr q\n",
+			"bash: line 1: declare: q: readonly variable\n",
+		),
+		(
+			"f() { local -rn q; local +n q=zz; echo \"st=$?\"; declare -p q; }; f",
+			"st=1\ndeclare -nr q\n",
+			"bash: line 1: local: q: readonly variable\n",
+		),
+		(
+			"f() { local -rn q; local +n q=3; echo \"st=$?\"; declare -p q; }; f",
+			"st=1\ndeclare -nr q\n",
+			"bash: line 1: local: q: readonly variable\n",
+		),
+		// A chain of the function's own references to an element is left as
+		// it is, as a direct one is.
+		(
+			"a=(1 2); f() { local -n s='a[1]'; local -n q=s; local +n q=zz; declare -p q s; echo \
+			 \"${a[*]}\"; }; f",
+			"declare -n q=\"s\"\ndeclare -n s=\"a[1]\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); f() { local -n q='a[1]'; local +n q=zz; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"; }; f",
+			"st=0\ndeclare -n q=\"a[1]\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); f() { local -n q='a[1]'; local +n q=3; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"; }; f",
+			"st=0\ndeclare -n q=\"a[1]\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); f() { local -n q='a[1]'; local +n q+=zz; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"; }; f",
+			"st=0\ndeclare -n q=\"a[1]\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); f() { local -n q='a[1]'; local +n q; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"; }; f",
+			"st=0\ndeclare -n q=\"a[1]\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); declare -n q='a[1]'; declare +n q=zz; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"",
+			"st=0\ndeclare -- q=\"a[1]\"\n1 zz\n",
+			"",
+		),
+		(
+			"a=(1 2); declare -n q='a[1]'; declare +n q; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"",
+			"st=0\ndeclare -- q=\"a[1]\"\n1 2\n",
+			"",
+		),
+		// The no-value `+n` on a readonly reference drops `-n` and keeps
+		// `-r`, as bash does (st=0), at the global and the local level.
+		("declare -rn q; declare +n q; echo \"st=$?\"; declare -p q", "st=0\ndeclare -r q\n", ""),
+		(
+			"f() { local -rn q; local +n q; echo \"st=$?\"; declare -p q; }; f",
+			"st=0\ndeclare -r q\n",
+			"",
+		),
+		// A function's own reference to an element is left as it is before
+		// the readonly refusal, even readonly.
+		(
+			"a=(1 2); f() { local -rn q='a[1]'; local +n q=zz; echo \"st=$?\"; declare -p q; echo \
+			 \"${a[*]}\"; }; f",
+			"st=0\ndeclare -nr q=\"a[1]\"\n1 2\n",
+			"",
+		),
+		// `+n NAME=VALUE` assigns the reference the running function owns
+		// whatever its chain reaches — a caller's reference, a global one, or
+		// an element through a reference it does not own — and leaves the
+		// chain alone.
+		(
+			"y=1; f() { local -n s=y; g; }; g() { local -n q=s; local +n q=zz; echo \"st=$?\"; \
+			 declare -p q; echo \"y=$y\"; }; f",
+			"st=0\ndeclare -- q=\"zz\"\ny=1\n",
+			"",
+		),
+		(
+			"y=1; declare -n s=y; f() { local -n q=s; local +n q=zz; echo \"st=$?\"; declare -p q; \
+			 echo \"y=$y\"; }; f",
+			"st=0\ndeclare -- q=\"zz\"\ny=1\n",
+			"",
+		),
+		(
+			"RANDOM=5; declare -n g=RANDOM; f() { local -n q=g; local +n q=zz; echo \"st=$?\"; \
+			 declare -p q; echo \"$RANDOM\"; }; f",
+			"st=0\ndeclare -- q=\"zz\"\n982\n",
+			"",
+		),
+		(
+			"a=(1 2); declare -n g='a[1]'; f() { local -n q=g; local +n q=zz; echo \"st=$?\"; \
+			 declare -p q; echo \"${a[*]}\"; }; f",
+			"st=0\ndeclare -- q=\"zz\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); f() { local -n s='a[1]'; g; }; g() { local -n q=s; local +n q=zz; echo \
+			 \"st=$?\"; declare -p q; echo \"${a[*]}\"; }; f",
+			"st=0\ndeclare -- q=\"zz\"\n1 2\n",
+			"",
+		),
+		(
+			"a=(1 2); declare -n g='a[1]'; f() { local -n q=g; local +n q=3; echo \"st=$?\"; declare \
+			 -p q; echo \"${a[*]}\"; }; f",
+			"st=1\ndeclare -n q=\"g\"\n1 2\n",
+			"bash: line 1: local: `3': not a valid identifier\n",
+		),
+	] {
+		let (out, err) = run(src);
+		assert_eq!((out.as_str(), err.as_str()), (want_out, want_err), "{src}");
+	}
 }
 
 // Golden: bash 5.3.20 (upstream exp8.sub, array32.sub): an arithmetic

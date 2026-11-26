@@ -272,11 +272,13 @@ fn spawn(inner: Arc<Inner>) -> io::Result<()> {
 			return Err(io::ErrorKind::WouldBlock.into());
 		}
 	}
-	std::thread::Builder::new()
-		.name("obash-room".into())
-		.stack_size(128 << 10)
-		.spawn(move || run(&inner))
-		.map(drop)
+	crate::sys::thread::spawn_helper(
+		std::thread::Builder::new()
+			.name("obash-room".into())
+			.stack_size(128 << 10),
+		move || run(&inner),
+	)
+	.map(drop)
 }
 
 impl Drop for Room {

@@ -636,6 +636,12 @@ impl<T> Drop for Exit<T> {
 
 /// Starts the thread that opens `node` with `open`, unless the open is
 /// cancelled before it gets there.
+///
+/// The thread starts with every signal blocked but those a fault raises in
+/// the faulting thread itself ([`SignalsBlocked`]): a signal sent to the
+/// process then goes to a thread of the caller's that takes it, never to
+/// this one, which would record it late (a shell's handler only records a
+/// signal, and its main thread may act on later input first).
 fn spawn_helper<T, F>(
 	shared: Arc<Shared<T>>,
 	node: Arc<Node>,
@@ -645,6 +651,9 @@ where
 	T: TruncateRegular + Send + 'static,
 	F: FnOnce(&Path, bool) -> io::Result<T> + Send + 'static,
 {
+	// The new thread inherits the calling thread's mask, so it never runs
+	// with the signals open; the guard restores the caller's mask.
+	let _blocked = SignalsBlocked::new();
 	thread::Builder::new()
 		.name("fifo-open".to_owned())
 		.stack_size(64 << 10)
@@ -741,6 +750,44 @@ where
 /// FIFO ends at once, as the drop holds the FIFO's two ends; one that is
 /// still waiting when this has passed waits on another FIFO.
 pub(crate) const LEAVE_AFTER: Duration = Duration::from_secs(1);
+
+/// Blocks every signal but [`SignalsBlocked::FAULTS`] in the calling thread
+/// until dropped, which restores the mask it found.
+struct SignalsBlocked(libc::sigset_t);
+
+impl SignalsBlocked {
+	/// The signals a fault raises in the thread that faults: never blocked.
+	/// Linux delivers such a signal with its default action when the thread
+	/// blocks it, so the process would die without a crash handler's report.
+	const FAULTS: [libc::c_int; 6] =
+		[libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGTRAP, libc::SIGSYS];
+
+	fn new() -> Self {
+		// SAFETY: plain data, filled by sigfillset / pthread_sigmask.
+		let mut blocked: libc::sigset_t = unsafe { std::mem::zeroed() };
+		// SAFETY: as above.
+		let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
+		// SAFETY: both sets are valid for the calls, and each signal number
+		// is a valid one.
+		unsafe {
+			libc::sigfillset(&raw mut blocked);
+			for sig in Self::FAULTS {
+				libc::sigdelset(&raw mut blocked, sig);
+			}
+			libc::pthread_sigmask(libc::SIG_BLOCK, &raw const blocked, &raw mut old);
+		}
+		Self(old)
+	}
+}
+
+impl Drop for SignalsBlocked {
+	fn drop(&mut self) {
+		// SAFETY: the mask `new` read back from this thread.
+		unsafe {
+			libc::pthread_sigmask(libc::SIG_SETMASK, &raw const self.0, std::ptr::null_mut());
+		}
+	}
+}
 
 impl<T> Drop for FifoOpen<T> {
 	/// See [`FifoOpen`]. A result the helper stored that was not taken is

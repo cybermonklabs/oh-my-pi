@@ -11,7 +11,7 @@ use crate::bash::{
 	ids::Vpid,
 	store::{Key, KeyBuf, MiscKey, OptId, Record},
 	vm::{
-		exec::push_script,
+		exec::{Jump, push_script},
 		locale,
 		probe::{absolute, candidates, dev_fd},
 		proc::{Probe, ProbeResult, ScriptKind},
@@ -106,13 +106,15 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 			ctx.err(Diag::Usage { msg: format!("{}: is a directory", shown.as_bstr()).into() });
 			return done(1);
 		},
+		// bash's `file_error`: a `report_error` (`set -e` exits at once).
 		ProbeResult::Bytes(Err(msg)) => {
-			ctx.diag(Diag::Usage { msg: format!("{}: {}", file.as_bstr(), msg.as_bstr()).into() });
+			ctx.diag(Diag::FileError { path: file.clone(), msg });
 			ctx.usage_error = true;
 			return done(1);
 		},
 		_ => {
-			ctx.diag(Diag::NoSuchFile { name: file.clone() });
+			let msg = BString::from("No such file or directory");
+			ctx.diag(Diag::FileError { path: file.clone(), msg });
 			ctx.usage_error = true;
 			return done(1);
 		},
@@ -393,7 +395,7 @@ pub fn exit(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if let Some(outcome) = bash_logout(ctx, status)? {
 		return Ok(outcome);
 	}
-	Ok(Outcome { status, control: Control::Exit })
+	Ok(Outcome { status, control: Control::Exit(Jump::Exit) })
 }
 
 /// bash's `bash_logout`: `exit`/`logout` in a login shell (not a subshell)
@@ -443,7 +445,9 @@ pub fn break_(ctx: &mut Ctx<'_, '_>, args: &[BString], cont: bool) -> R {
 			ctx.err(Diag::Usage { msg: format!("{n}: loop count out of range").into() });
 			return Ok(Outcome { status: 1, control: Control::Break { n: u32::MAX, cont: false } });
 		},
-		Err(BadArg::NotNumeric) => return Ok(Outcome { status: 2, control: Control::Exit }),
+		Err(BadArg::NotNumeric) => {
+			return Ok(Outcome { status: 2, control: Control::Exit(Jump::Cleanup) });
+		},
 		Err(BadArg::TooMany) => return done(2),
 	};
 	Ok(Outcome { status: 0, control: Control::Break { n, cont } })
@@ -524,7 +528,7 @@ pub fn zsh_exit(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if let Some(o) = crate::bash::vm::zle::reader::logout_on_exit(ctx, status)? {
 		return Ok(o);
 	}
-	Ok(Outcome { status, control: Control::Exit })
+	Ok(Outcome { status, control: Control::Exit(Jump::Exit) })
 }
 
 /// `wait [-fn] [-p var] [id …]` (bash `wait.def`): wait for background
@@ -673,7 +677,17 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 /// record is not collected yet, or the running process substitution or
 /// coprocess `$!` names. A job `disown` dropped is none of these (its
 /// record names no parent).
+/// coprocess `$!` names. zsh 5.9: not the job whose end runs the `CHLD`
+/// trap, while it runs ([`crate::bash::vm::proc::VprocZsh::chld_own`]: its
+/// status reaches zsh's list of background statuses once the trap is over);
+/// another finished job is one.
 fn is_child(ctx: &mut Ctx<'_, '_>, pid: Vpid) -> bool {
+	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
+		&& ctx.vp.zsh.as_ref().is_some_and(|z| z.chld_own == Some(pid))
+		&& in_chld_trap(ctx.vp)
+	{
+		return false;
+	}
 	if ctx.vp.jobs.by_vpid(pid).is_some_and(|j| !j.inherited) {
 		return true;
 	}
@@ -691,10 +705,25 @@ fn is_child(ctx: &mut Ctx<'_, '_>, pid: Vpid) -> bool {
 	}
 }
 
+/// Whether `vp` runs a `CHLD` trap (its action or a `TRAPCHLD` function).
+fn in_chld_trap(vp: &crate::bash::vm::proc::Vproc) -> bool {
+	use crate::bash::vm::proc::{FrameKind, ScriptKind};
+	let chld = crate::bash::store::TrapKey::Signal(crate::bash::signal::Signal::Chld);
+	vp.trap_frames != 0
+		&& vp.frames.iter().any(|f| {
+			matches!(f.kind, FrameKind::Script { what: ScriptKind::Trap { key, .. }, .. } if key == chld)
+		})
+}
+
 /// `wait` without operands: every running job (bash
 /// `wait_for_background_pids`); with job control a stopped job is skipped
 /// with a warning. A command substitution's copies of its parent's jobs
-/// are not its children.
+/// are not its children. A job this shell's `kill` ended with no OS status
+/// for obash to reap is still running for bash, which has not reaped it
+/// ([`crate::bash::store::Job::unreaped`]): it takes its place in the list,
+/// as bash waits for the first job still running. `Awaited::AllJobs`
+/// reports the first job it waits for, drops each other one that ended
+/// meanwhile (bash reaps them as it waits) and keeps `$!`'s.
 fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	let control = super::jobs::active(ctx)?;
 	let foreign: Vec<u32> = ctx
@@ -708,6 +737,14 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 		ctx.usage(format!("pid {pid} is not a child of this shell"));
 	}
 	ctx.vp.jobs.remove_where(|j| j.inherited);
+	let bash = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
+	let held = |j: &crate::bash::vm::proc::Job| {
+		bash
+			&& j.unreaped
+			&& j.signal.is_some()
+			&& !j.notified
+			&& matches!(j.state, crate::bash::vm::proc::JobState::Done(_))
+	};
 	let mut list = Vec::new();
 	let mut stopped = Vec::new();
 	for job in ctx.vp.jobs.iter() {
@@ -715,6 +752,7 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 			crate::bash::vm::proc::JobState::Stopped(_) if control => {
 				stopped.push((job.number, job.pid()));
 			},
+			_ if held(job) => list.push(job.vpid),
 			crate::bash::vm::proc::JobState::Done(_) => {},
 			_ => list.push(job.vpid),
 		}
@@ -740,6 +778,8 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R {
 	let mut list = Vec::new();
 	if args.is_empty() {
+		// bash `wait_for_any_job` takes a finished job already reported only
+		// once it waited for a child (`Awaited::AnyJob`).
 		list.extend(ctx.vp.jobs.iter().filter(|j| !j.inherited).map(|j| j.vpid));
 	} else {
 		// bash `check_nonjobs`: a pid no longer in the job table whose

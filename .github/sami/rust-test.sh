@@ -4,16 +4,14 @@
 # reported there, and holds no release.
 #
 # On Linux (the rust_test job) it runs every Bazel test target under
-# //crates, every test target of the cargo workspaces Bazel does not build,
-# and, under cargo too, the doctests of every crate that has a Bazel doctest
-# target (whose runner shows no passing doctest's output), reads each test
-# log, and fails when:
+# //crates (doctests too) and every test target of the cargo workspaces
+# Bazel does not build, reads each test log, and fails when:
 #   - a test fails that .github/sami/rust-test-known-failures.txt does not
 #     name, or a test it names does not fail;
 #   - a target fails to build or has no result, or its test binary ends
 #     before its tests do;
-#   - a test or doctest skips itself or prints (see "Skips" below), unless a
-#     list names it;
+#   - a test skips itself or prints (see "Skips" below), unless a list names
+#     it; a doctest prints or skips in its source (see "Skips");
 #   - a test of a test binary runs in no invocation (a filter in its target's
 #     args, or a skip this script passes, took it out), unless
 #     .github/sami/rust-test-sanctioned-skips.txt names it;
@@ -22,8 +20,9 @@
 #     Bazel one whose reason starts `opt: ` in a -c opt build; or
 #     as root .github/sami/rust-test-ignored-root.txt), or is a child
 #     process's entry point that another test starts
-#     (.github/sami/rust-test-child-entries.txt), or runs in the macOS job
-#     (.github/sami/rust-test-macos.txt);
+#     (.github/sami/rust-test-child-entries.txt, whose line names each
+#     starting test, and fails when one of them is no test of the binary),
+#     or runs in the macOS job (.github/sami/rust-test-macos.txt);
 #   (An ```ignore doc block is not a test: upstream marks it so that rustdoc
 #   never runs it. It counts neither as run nor against the job; the step
 #   prints how many there are and where.)
@@ -38,8 +37,11 @@
 #     RUST_TEST_STICKY_FIFO names and as root, or prints there (`UNKNOWN:`,
 #     it checked nothing).
 # It leaves each test binary's listing in $RUNNER_TEMP/rust-test/listings
-# (index.tsv names the binary of each), for the macOS job's inventory
-# (.github/sami/rust-test-macos-inventory.sh).
+# (index.tsv names the binary of each), which sami-checks.yml's
+# rust-test-drift job compares with the early listings the macOS job's
+# inventory read (.github/sami/rust-test-listings-drift.sh), and cargo's
+# --timings report of each cargo test in $RUNNER_TEMP/rust-test/cargo-timings,
+# with each one's build and test seconds in the job log and the step summary.
 # With RUST_TEST_ONLY naming a list (the macOS job names that inventory), it
 # runs only the tests that list names, each target once with --exact, and
 # fails unless each of them ran here; the failure, skip and output rules are
@@ -66,6 +68,20 @@
 # the logs can tell it from a test that ran. Every test that can skip prints
 # the marker; one that returns silently is a defect of that test, fixed in it.
 #
+# Doctests. On Linux they run only in Bazel's doctest targets, whose runner
+# shows no passing doctest's output, so the scan above cannot read it, and
+# their source is read instead, with no build
+# (.github/sami/rust-test-doctest-forms.awk): a line of a doctest rustdoc
+# runs that holds the word print, println, eprint, eprintln, dbg, stdout or
+# stderr, or one of the skip words, fails the job, named by file and line,
+# and so does doc text the reader does not read. Every doctest Bazel ran
+# must be one the reader found at its file and line, and every doctest the
+# reader found must be one Bazel ran, or the job fails as UNKNOWN. A
+# doctest that a macro of another crate generates is in
+# no source file the reader reads; Bazel runs it, and the job fails as
+# UNKNOWN for it. The macOS job runs the crates' doctests under cargo, whose
+# output the scan reads.
+#
 # Usage: rust-test.sh, from the repository root, with these set:
 #   RUNNER_TEMP         a scratch directory for the event logs and log copies
 #   OMP_BAZEL_RC        the bazelrc fragment .github/actions/bazel-cache wrote
@@ -77,7 +93,8 @@
 #   RUST_TEST_STICKY_FIFO  (when a sticky-directory FIFO test is in the tree) a
 #                       0666 FIFO of a third user in a world-writable sticky
 #                       directory root owns, with fs.protected_fifos at 1
-# and, for the macOS job, RUST_TEST_ONLY and RUST_TEST_CANARY (above).
+# and, for the macOS job, RUST_TEST_ONLY and RUST_TEST_CANARY (above). When
+# GITHUB_STEP_SUMMARY is set, the cargo tests' timings go there too.
 # .github/sami/tests/run.sh runs this script against stubs of bazelisk and
 # rustup.
 set -euo pipefail
@@ -136,6 +153,13 @@ libtest_event='def libtest_event:
 # rust-test-parity.sh and rust-test-macos-inventory.sh.
 # shellcheck source=.github/sami/rust-test-lists.sh
 . "$(dirname "${BASH_SOURCE[0]}")/rust-test-lists.sh"
+# The doctest reader (Linux; see "Doctests" above).
+doctest_forms="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rust-test-doctest-forms.awk"
+[ -f "$doctest_forms" ] || stop "$doctest_forms is missing"
+# listing_names, the one reading of a binary's `--list`, shared with
+# rust-test-early-listings.sh and rust-test-macos-inventory.sh.
+# shellcheck source=.github/sami/rust-test-targets.sh
+. "$(dirname "${BASH_SOURCE[0]}")/rust-test-targets.sh"
 
 # entries <list> <fields> <tsv>: list_entries of .github/sami/<list>.
 entries() {
@@ -184,6 +208,39 @@ entries rust-test-cargo-workspaces.txt 1 cargo-workspaces.txt
 entries rust-test-ignored.txt 2 ignored-run.tsv
 entries rust-test-ignored-root.txt 2 ignored-root.tsv
 entries rust-test-child-entries.txt 2 child-entries.tsv
+# A child entry's why is `<parent>[ and <parent>...]: <reason>`: each parent
+# is the full libtest name of a test of the same binary that starts the child,
+# and the accounting below fails when a parent is not in that binary's
+# listing (renamed or deleted, it would leave the child running nowhere, with
+# nothing to say so). child-parents.tsv holds one line per parent.
+awk '
+	function malformed(what) {
+		printf "%s:%d: %s: %s\n", FILENAME, FNR, what, $0 > "/dev/stderr"
+		bad = 1
+	}
+	/^[[:space:]]*(#|$)/ { next }
+	{
+		line = $0
+		sub(/[[:space:]]+$/, "", line)
+		i = index(line, " ")
+		target = substr(line, 1, i - 1)
+		rest = substr(line, i + 1)
+		j = index(rest, "  ")
+		child = substr(rest, 1, j - 1)
+		why = substr(rest, j)
+		sub(/^ +/, "", why)
+		k = index(why, ": ")
+		if (!k) { malformed("no \"<parent test>: <reason>\" (a child entry names the test that starts it, and why)"); next }
+		reason = substr(why, k + 2)
+		if (reason ~ /^ *$/) { malformed("no reason after its parent tests"); next }
+		n = split(substr(why, 1, k - 1), parents, / and /)
+		for (p = 1; p <= n; p++) {
+			if (parents[p] !~ /^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$/) { malformed("\"" parents[p] "\" is no full libtest test name"); next }
+		}
+		for (p = 1; p <= n; p++) print target "\t" child "\t" parents[p]
+	}
+	END { exit bad }' "$sami/rust-test-child-entries.txt" >"$tmp/child-parents.tsv" ||
+	stop "$sami/rust-test-child-entries.txt has a line without its parent tests or its reason (above)"
 entries rust-test-macos.txt 2 macos.tsv
 if [ -n "$only" ]; then
 	list_entries "$only" 2 >"$tmp/only.tsv" || stop "$only has a malformed line (above)"
@@ -681,18 +738,97 @@ fi
 # as a rust_test log, with the stderr cargo kept beside it. The target is
 # `<directory>:<kind>:<name>` (kind lib, bin, test, example, bench or doc). A
 # failed cargo metadata stops the step.
-# Then the doctests of each crate with a Bazel doctest target run again under
-# cargo, as `<directory>:doc`: rules_rust's doctest runner takes no test
-# arguments, so its log shows neither a passing doctest's output nor one in
-# JSON. Even under cargo, rustdoc keeps a passing doctest's output out of the
-# record (`--show-output` reaches only libtest), so these run with rustdoc's
-# `--no-capture` and one thread, and doc_attribute gives each doctest the
-# lines printed between its start and its result (run 44889772803: a planted
-# doctest's `skipped:` line reached no record without them).
+# Then, in the macOS job (RUST_TEST_ONLY), the doctests of each crate with a
+# Bazel doctest target run under cargo, as `<directory>:doc`: that job runs
+# no Bazel doctest target, and rules_rust's doctest runner takes no test
+# arguments anyway, so its log shows neither a passing doctest's output nor
+# one in JSON. Even under cargo, rustdoc keeps a passing doctest's output out
+# of the record (`--show-output` reaches only libtest), so these run with
+# rustdoc's `--no-capture` and one thread, and doc_attribute gives each
+# doctest the lines printed between its start and its result (run
+# 44889772803: a planted doctest's `skipped:` line reached no record without
+# them). On Linux the doctests' source is read instead (the doctest reader).
 # Then each #[ignore]d cargo test that .github/sami/rust-test-ignored.txt
 # names runs alone, with --ignored and --exact.
 channel=""
 ncargo=0
+# Each cargo test runs with --timings: cargo writes an HTML report of its
+# build (when each crate compiled, and for how long) and names it on stderr
+# (`Timing report saved to <path>`). cargo_timing copies the report to
+# $timings, which the job uploads, and gives the cargo test one line in the
+# job log and one row in the step summary: its build seconds (cargo's own
+# `Finished ... in` time, from cargo's start to the end of its build) and its
+# test seconds (the rest of the run: the test binary, or for --doc rustdoc
+# building and running the doctests). In run 45001615494 this phase took 17
+# minutes with no line in the job log between the toolchain's install and its
+# end. The figures change no verdict: a run whose `Finished` time cannot be
+# read (a failed build prints none) has UNKNOWN in their place, and a missing
+# report or a step summary that cannot be written is a warning.
+timings="$tmp/cargo-timings"
+mkdir -p "$timings"
+timing_rows=0
+# now: the wall clock in seconds, to the microsecond where bash gives it.
+now() {
+	local t="${EPOCHREALTIME:-}"
+	[ -n "$t" ] || t="$(date +%s)"
+	printf '%s\n' "${t/,/.}"
+}
+# cargo_timing <label> <invocation> <cargo's stderr> <start> <end> <exit code>:
+# the cargo test's line and row (above), and its report copied.
+cargo_timing() {
+	local label="$1" inv="$2" err="$3" code="$6" total build="" spent=UNKNOWN built report copy=none
+	total="$(LC_ALL=C awk -v a="$4" -v b="$5" 'BEGIN { printf "%.1f", b - a }')"
+	# cargo's first `Finished` line: `... target(s) in 5.32s` or `in 1m 05s`.
+	build="$(LC_ALL=C awk '/^ *Finished / {
+		s = $0
+		sub(/.* in /, "", s)
+		n = split(s, t, " ")
+		if (n == 0) exit
+		secs = 0
+		for (i = 1; i <= n; i++) {
+			u = substr(t[i], length(t[i]))
+			v = substr(t[i], 1, length(t[i]) - 1)
+			if (v !~ /^[0-9]+(\.[0-9]+)?$/) exit
+			if (u == "h") secs += v * 3600
+			else if (u == "m") secs += v * 60
+			else if (u == "s") secs += v
+			else exit
+		}
+		printf "%.1f", secs
+		exit
+	}' "$err")" || build=""
+	if [ -n "$build" ]; then
+		spent="$(LC_ALL=C awk -v a="$total" -v b="$build" 'BEGIN { printf "%.1f", a - b }')"
+		built="build $build s, test $spent s"
+	else
+		build=UNKNOWN
+		built="build and test UNKNOWN (no Finished time this script could read)"
+	fi
+	report="$(awk '/^ *Timing report saved to / { sub(/^ *Timing report saved to /, ""); print; exit }' "$err")" || report=""
+	if [ -n "$report" ] && [ -f "$report" ]; then
+		copy="cargo-timing-$ncargo-$(printf '%s' "$label" | sed 's/[^A-Za-z0-9_.-]/-/g').html"
+		cp -- "$report" "$timings/$copy" || copy=none
+	fi
+	if [ "$copy" = none ]; then
+		echo "::warning title=Cargo timings::$label ($inv): cargo named no timing report that could be copied${report:+ (it named $report)}"
+	fi
+	echo "Cargo test timing: $label ($inv): $built, total $total s, exit $code, report $copy"
+	[ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+	if [ "$timing_rows" = 0 ]; then
+		{
+			echo '### Cargo tests: build and test seconds'
+			echo
+			echo "Build: cargo's own \`Finished\` time, from its start to the end of its build. Test: the rest of the run (the test binary; for \`--doc\`, rustdoc building and running the doctests). Each build's \`--timings\` report is in the job's \`cargo-timings-*\` artifact."
+			echo
+			echo '| cargo test | invocation | build (s) | test (s) | total (s) | exit | timing report |'
+			echo '| --- | --- | ---: | ---: | ---: | ---: | --- |'
+		} >>"$GITHUB_STEP_SUMMARY" || echo "::warning title=Cargo timings::could not write the step summary"
+	fi
+	timing_rows=$((timing_rows + 1))
+	# shellcheck disable=SC2016 # the backquotes are Markdown's code marks
+	printf '| `%s` | %s | %s | %s | %s | %s | %s |\n' "$label" "$inv" "$build" "$spent" "$total" "$code" "$copy" >>"$GITHUB_STEP_SUMMARY" ||
+		echo "::warning title=Cargo timings::could not write the step summary"
+}
 # doc_attribute: a doctest record whose output rustdoc's --no-capture printed
 # raw (stdout and stderr, one thread) between each test's `started` event and
 # its result, as libtest's record with that output as the result's stdout. A
@@ -717,7 +853,7 @@ doc_attribute() {
 # command RUST_TEST_OFFLINE_UNDER names when it is set: the rust_test job
 # names .github/sami/rust-test-offline.sh, which takes the network away.
 cargo_test() {
-	local label="$1" manifest="$2" inv="$3" log err code=0 doc=0 a
+	local label="$1" manifest="$2" inv="$3" log err code=0 doc=0 a t0 t1
 	shift 3
 	for a in "$@"; do [ "$a" = --doc ] && doc=1; done
 	local under=() offline=()
@@ -730,14 +866,17 @@ cargo_test() {
 	ncargo=$((ncargo + 1))
 	log="$tmp/logs/cargo-$ncargo.log"
 	err="$log.err"
+	t0="$(now)"
 	if [ "$doc" = 1 ]; then
 		err="$log.raw"
-		RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-Zunstable-options --no-capture" rustup run "$channel" cargo test --locked --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output --test-threads=1 >"$err" 2>&1 || code=$?
+		RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-Zunstable-options --no-capture" rustup run "$channel" cargo test --locked --timings --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output --test-threads=1 >"$err" 2>&1 || code=$?
+		t1="$(now)"
 		untangle "$label" "$err" doc
 		doc_attribute <"$err" >"$log"
 		: >"$log.err"
 	else
-		${under[@]+"${under[@]}"} rustup run "$channel" cargo test --locked ${offline[@]+"${offline[@]}"} --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output >"$log" 2>"$err" || code=$?
+		${under[@]+"${under[@]}"} rustup run "$channel" cargo test --locked --timings ${offline[@]+"${offline[@]}"} --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output >"$log" 2>"$err" || code=$?
+		t1="$(now)"
 		untangle "$label" "$log"
 	fi
 	if [ "$code" = 0 ]; then
@@ -748,6 +887,7 @@ cargo_test() {
 		echo "::endgroup::"
 		printf '%s\tcargo test\tFAILED\tfailed\t%s\t-\t%s\n' "$label" "$log" "$inv" >>"$rows"
 	fi
+	cargo_timing "$label" "$inv" "$err" "$t0" "$t1" "$code"
 }
 run_cargo() {
 	local n=0 manifest dir label selector name kind rest i target test
@@ -772,18 +912,36 @@ run_cargo() {
 		done <"$tmp/cargo-targets.tsv"
 	done <"$tmp/cargo-workspaces.txt"
 	[ "$n" != 0 ] || stop "$sami/rust-test-cargo-workspaces.txt names no workspace with a test target"
-	# The crates whose doctests run again under cargo: those with a Bazel
-	# doctest target, from this run's rows (Linux) or, when this run ran no
-	# doctest target (RUST_TEST_ONLY, the macOS job), from bazel query.
+	# The crates with a Bazel doctest target: from this run's rows (Linux),
+	# or, when this run ran no doctest target (RUST_TEST_ONLY, the macOS
+	# job), from bazel query.
 	if [ -z "$only" ]; then
 		awk -F'\t' '$2 == "rust_doc_test rule" { d = $1; sub(/^\/\//, "", d); sub(/:.*/, "", d); print d }' "$rows" | LC_ALL=C sort -u >"$tmp/doc-dirs.txt"
 	else
 		bazelisk query --output=label 'kind("rust_doc_test rule", //crates/...) - attr(tags, "manual", //crates/...)' >"$tmp/doc-targets.txt" || stop "bazel query for the doctest targets failed"
 		sed -e 's|^//||' -e 's|:.*||' "$tmp/doc-targets.txt" | LC_ALL=C sort -u >"$tmp/doc-dirs.txt"
 	fi
-	while read -r dir; do
-		cargo_test "$dir:doc" "$dir/Cargo.toml" cargo --doc --
-	done <"$tmp/doc-dirs.txt"
+	# Each crate's doctests are a cargo invocation of their own, and cargo
+	# picks the features of the crates they depend on per invocation: a
+	# dependency another crate's run built is built again whenever its
+	# features, or a dependency's, differ (pi-shell, jj-lib, syn and tokio,
+	# among others). In run 45553300236 these 13 runs took 1148.5 s of the
+	# cargo phase's 1181.9 s, all but 12 s of it building. With cargo's
+	# feature unification over the workspace, every invocation resolves a
+	# dependency's features the same way, so the later runs reuse almost
+	# every unit an earlier run built (cold, on 15 CPUs: 495.8 s -> 234.0 s
+	# for the 13 runs). The crates under test keep their own features; on
+	# the tree this was measured on, the same doctests ran, by name, with
+	# and without it.
+	# On Linux the doctests run only in Bazel's doctest targets, and their
+	# source is read for what Bazel's runner does not show (the doctest
+	# reader, below). The macOS job runs no Bazel doctest target, so there
+	# they run here, and the skip scan reads their output.
+	if [ -n "$only" ]; then
+		while read -r dir; do
+			cargo_test "$dir:doc" "$dir/Cargo.toml" cargo --doc -Zfeature-unification --config 'resolver.feature-unification="workspace"' --
+		done <"$tmp/doc-dirs.txt"
+	fi
 	# The #[ignore]d cargo tests run alone on Linux, where the network can be
 	# taken away (rust-test-offline.sh).
 	[ -z "$only" ] || return 0
@@ -826,8 +984,9 @@ check_results_exist() {
 	done < <(LC_ALL=C comm -23 "$tmp/test-targets.txt" "$tmp/with-result.txt")
 }
 
-# The cargo workspaces and the cargo doctests run in both jobs: on macOS,
-# that is how a cargo test or a doctest compiled only there runs.
+# The cargo workspaces run in both jobs; the crates' cargo doctests run only
+# in the macOS job (above): there, that is how a cargo test or a doctest
+# compiled only on macOS runs.
 run_cargo
 if [ -z "$only" ]; then
 	for i in "${!ignored_cargo[@]}"; do
@@ -838,9 +997,11 @@ if [ -z "$only" ]; then
 fi
 
 # The skip scan (see "Skips" above). skip_line matches a skip line in a
-# passing test's output; raw_skip_line matches one outside the record.
-skip_line='^([A-Za-z0-9_:]+: )?(skipped|skipping|SKIP|not run|UNCOMPARED)[ :]'
-raw_skip_line='(^|: )(skipped|skipping|SKIP|not run|UNCOMPARED)[ :]'
+# passing test's output; raw_skip_line matches one outside the record. The
+# doctest reader (below) looks for the same words in a doctest's code.
+skip_words='skipped|skipping|SKIP|not run|UNCOMPARED'
+skip_line="^([A-Za-z0-9_:]+: )?($skip_words)[ :]"
+raw_skip_line="(^|: )($skip_words)[ :]"
 failed="$tmp/failed.tsv"
 : >"$tmp/failed-at.tsv"
 skips="$tmp/skips.tsv"
@@ -1015,13 +1176,6 @@ check_libtest() {
 			# Its #[ignore]d tests (and ```ignore doctests) ran nothing; they
 			# are reconciled below.
 			jq -R -r --arg target "$label" 'fromjson? | select(type == "object" and .type == "test" and .event == "ignored") | "\($target)\t\(.name)"' "$log" >>"$tmp/cargo-ignored.tsv"
-			# A crate's cargo doctests that ran, against its Bazel doctests
-			# (below).
-			case "$label" in
-				*:doc)
-					jq -R -r --arg dir "$(doc_dir "$label")" 'fromjson? | select(type == "object" and .type == "test" and (.event == "ok" or .event == "failed")) | "\($dir)\t\(.name)"' "$log" >>"$tmp/doc-names-cargo.tsv"
-					;;
-			esac
 			;;
 		ignored-cargo-*) scan_output "$label" "$log" "$log.err" ;;
 		*) scan_output "$label" "$log" ;;
@@ -1050,8 +1204,8 @@ check_libtest() {
 # each failed doctest indented four spaces, a blank line and `test result:
 # FAILED.`. No doctest may be filtered out: no list names one. An ```ignore
 # block is no test: each `test <name> ... ignored` line is counted apart (an
-# ignored count whose names the log does not give fails). The doctests that
-# ran are compared with cargo's re-run of the same crate (below).
+# ignored count whose names the log does not give fails). On Linux, each
+# doctest that ran must be one the doctest reader found in the source (below).
 check_doctest() {
 	local label="$1" status="$2" kind="$3" log="$4" counts header summed verdict filtered ignored names name
 	counts="$(awk '
@@ -1191,21 +1345,57 @@ while IFS=$'\t' read -r _ label re; do
 done < <(awk -F'\t' '$1 == "unused"' "$tmp/raw-verdict.tsv")
 echo "Lines outside libtest's record: $(cut -f1,2 "$raw_output" | LC_ALL=C sort -u | awk 'END { print NR }') distinct, $(awk -F'\t' '$1 == "unknown"' "$tmp/raw-verdict.tsv" | awk 'END { print NR }') named by no entry"
 
-# The cargo re-run reads each doctest's output, so it must have run the same
-# doctests as Bazel's doctest target of the crate (whose crate features can
-# differ from cargo's defaults): each crate's names, both ways, without the
-# crate's directory.
+# On Linux the doctests run only in Bazel's doctest targets, whose runner
+# (rules_rust's) takes no test arguments and shows no passing doctest's
+# output, so the skip scan above never reads what a doctest prints. In its
+# place, with no build, each crate with a Bazel doctest target has its
+# doctests read from its source ($doctest_forms): a line of a doctest
+# rustdoc runs that holds the word print, println, eprint, eprintln, dbg,
+# stdout or stderr (a word: a print split from its `!` counts), or one of the
+# skip scan's words, fails the job, named by file and line, and so does doc
+# text the reader does not read (a doc attribute it does not decode, a
+# doctest still open where the text it joined ends). The read and Bazel's
+# run must account for each other, both ways: each doctest Bazel's log names
+# (`<file> - <item> (line <n>)`) must be one the reader found at that file
+# and line, or the reader did not see it; and each doctest the reader found
+# must be one Bazel ran, or nothing on Linux runs it (a doctest the cargo
+# re-run used to run). Either fails the job as UNKNOWN. (Until 2026-11 the
+# doctests ran a second time under
+# cargo, about 576 s a job, to read their output: in the 57 gate jobs from
+# 2026-11-21 to 11-25 where that re-run's comparison with Bazel ran, it saw
+# no doctest, failure, skip or print that Bazel's run did not.)
 if [ -z "$only" ]; then
-	touch "$tmp/doc-names-bazel.tsv" "$tmp/doc-names-cargo.tsv"
-	awk -F'\t' '{ d = $1; n = $2; if (index(n, d "/") == 1) n = substr(n, length(d) + 2); print d "\t" n }' "$tmp/doc-names-cargo.tsv" | LC_ALL=C sort -u >"$tmp/doc-cargo.tsv"
+	: >"$tmp/doc-read.tsv"
+	while read -r dir; do
+		find "$dir" -name '*.rs' -type f -exec env LC_ALL=C awk -v words="$skip_words" -f "$doctest_forms" {} + >>"$tmp/doc-read.tsv" || stop "the doctest reader could not read the source of $dir"
+	done <"$tmp/doc-dirs.txt"
+	awk -F'\t' '$1 == "test" { print $2 ":" $3 }' "$tmp/doc-read.tsv" | LC_ALL=C sort -u >"$tmp/doc-read-tests.txt"
+	touch "$tmp/doc-names-bazel.tsv"
 	LC_ALL=C sort -u "$tmp/doc-names-bazel.tsv" >"$tmp/doc-bazel.tsv"
+	: >"$tmp/doc-bazel-at.txt"
 	while IFS=$'\t' read -r dir name; do
-		error "Rust tests" "$dir $name ran in Bazel's doctest target and not in cargo's doctest run of $dir, whose output the skip scan reads: give cargo the same features"
-	done < <(LC_ALL=C comm -23 "$tmp/doc-bazel.tsv" "$tmp/doc-cargo.tsv")
-	while IFS=$'\t' read -r dir name; do
-		error "Rust tests" "$dir $name ran in cargo's doctest run and not in Bazel's doctest target of $dir"
-	done < <(LC_ALL=C comm -13 "$tmp/doc-bazel.tsv" "$tmp/doc-cargo.tsv")
-	echo "Doctests that ran in Bazel and in cargo's readable re-run: $(LC_ALL=C comm -12 "$tmp/doc-bazel.tsv" "$tmp/doc-cargo.tsv" | awk 'END { print NR }')"
+		file="${name%% - *}"
+		line="$(printf '%s\n' "$name" | sed -n 's/.*(line \([0-9][0-9]*\)).*/\1/p')"
+		[ -z "$line" ] || printf '%s\n' "$dir/$file:$line" >>"$tmp/doc-bazel-at.txt"
+		if [ -z "$line" ] || ! grep -qxF -- "$dir/$file:$line" "$tmp/doc-read-tests.txt"; then
+			error "Rust test skips" "UNKNOWN: $dir $name ran in Bazel's doctest target, and the doctest reader found no doctest at $dir/$file line ${line:-?}, so it could not see whether it prints"
+		fi
+	done <"$tmp/doc-bazel.tsv"
+	# And the other way: a doctest the reader found that no Bazel doctest
+	# target ran is run by nothing on Linux (the cargo re-run did, until this
+	# reader replaced it).
+	LC_ALL=C sort -u -o "$tmp/doc-bazel-at.txt" "$tmp/doc-bazel-at.txt"
+	while read -r at; do
+		error "Rust test skips" "UNKNOWN: $at: the doctest reader found a doctest here that no Bazel doctest target ran, so nothing on Linux runs it"
+	done < <(LC_ALL=C comm -23 "$tmp/doc-read-tests.txt" "$tmp/doc-bazel-at.txt")
+	while IFS=$'\t' read -r what file line text; do
+		case "$what" in
+			print) error "Rust test printed" "$file:$line: a doctest rustdoc runs prints ($text); no record the skip scan reads holds a doctest's output on Linux, so a doctest must not print" ;;
+			skip) error "Rust test skips" "$file:$line: a doctest rustdoc runs holds a skip word ($text); no record the skip scan reads holds a doctest's output on Linux, so a doctest must not skip" ;;
+			unread) error "Rust test skips" "UNKNOWN: $file:$line: $text, so the doctest reader did not read the doctests in it" ;;
+		esac
+	done <"$tmp/doc-read.tsv"
+	echo "Doctests read from the source of $(count "$tmp/doc-dirs.txt") crates: $(count "$tmp/doc-read-tests.txt"); Bazel ran $(count "$tmp/doc-bazel.tsv"); lines that print or skip: $(awk -F'\t' '$1 == "print" || $1 == "skip"' "$tmp/doc-read.tsv" | awk 'END { print NR }')"
 fi
 
 # reconcile <found> <list> <listed> <noun> <verb> <title> <stale>: the tests
@@ -1343,7 +1533,7 @@ while IFS=$'\t' read -r label rule _ _ log bin inv; do
 			error "Rust test skips" "$label's binary $bin cannot list its tests"
 			continue
 		fi
-		sed -n -e 's/: test$//p' -e 's/: benchmark$//p' "$listings/$k.raw" | LC_ALL=C sort -u >"$listings/$k.txt"
+		listing_names "$listings/$k.raw" >"$listings/$k.txt"
 		listing_of["$binary"]="$listings/$k.txt"
 	fi
 	listing="${listing_of[$binary]}"
@@ -1436,11 +1626,28 @@ for list in child-entries macos; do
 		fi
 	done < <(LC_ALL=C comm -13 "$tmp/ignored.tsv" "$tmp/$list.tsv")
 done
+# Each parent a child entry names is a test of the child's binary: a parent
+# renamed or deleted fails here, before the child silently runs nowhere. A
+# binary that did not build, or whose listing could not be read, is not
+# looked in: UNKNOWN, in a notice (the build or listing error fails the job).
+while IFS=$'\t' read -r binary child parent; do
+	if did_not_build "$binary"; then
+		echo "::notice title=Rust test child entry::UNKNOWN: $binary did not build, so whether $parent, which starts $child, is a test of it is not known (the build failure fails the job)"
+	elif ! in_tree "$binary"; then
+		error "Rust test child entry" "$binary $child is in $sami/rust-test-child-entries.txt, but the tree under test has no target $binary: that line is for another tree"
+	elif [ -z "${listing_of[$binary]:-}" ]; then
+		echo "::notice title=Rust test child entry::UNKNOWN: $binary's tests could not be listed, so whether $parent, which starts $child, is a test of it is not known (the listing error fails the job)"
+	elif grep -qxF -- "$parent" "${listing_of[$binary]}"; then
+		echo "Child entry's parent is a test of its binary: $binary $parent starts $child"
+	else
+		error "Rust test child entry" "$parent, which $sami/rust-test-child-entries.txt names as the test that starts $binary $child, is no test of $binary (renamed or deleted), so nothing would show that $child runs nowhere: name the test that starts it now"
+	fi
+done <"$tmp/child-parents.tsv"
 echo "Test binaries listed: ${#listing_of[@]}; #[ignore]d tests no invocation ran: $(count "$tmp/ignored.tsv")"
-# The macOS job's inventory reads each binary's listing: index.tsv names the
+# The listings drift check reads each binary's listing: index.tsv names the
 # listing file of each (a native_test's binary is its src's).
 for binary in "${!listing_of[@]}"; do
 	printf '%s\t%s\n' "$binary" "$(basename "${listing_of[$binary]}")"
 done | LC_ALL=C sort >"$listings/index.tsv"
-echo "Listings for the macOS inventory: $(count "$listings/index.tsv") binaries in $listings"
+echo "Listings for the drift check: $(count "$listings/index.tsv") binaries in $listings"
 exit "$bad"

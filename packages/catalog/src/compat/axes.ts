@@ -397,8 +397,9 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	 * The model's input classifier refuses requests that reproduce assistant
 	 * reasoning as quoted text (`reasoning_extraction`), so reasoning must not
 	 * be replayed as text into its input: compaction archives, summarizer
-	 * transcripts and demoted interrupted turns leave it out. Declared per class
-	 * in `classes/*.kdl`.
+	 * transcripts and demoted interrupted turns leave it out, and a replayed
+	 * turn of another model loses its thinking (`dropsForeignThinking` in
+	 * pi-ai). Declared per class in `classes/*.kdl`.
 	 */
 	"classifier-cot-extraction": {
 		key: "classifierCotExtraction",

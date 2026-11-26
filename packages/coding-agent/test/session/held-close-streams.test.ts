@@ -1,5 +1,5 @@
 /**
- * (R3, check c-no-join on the candidate release cut): a session whose close the SQL store refused
+ * A session whose close the SQL store refused
  * keeps its transcript and sends it once another session's write lands (the held send, SessionManager#hold and
  * #sendHeld). That send reads what the store holds at the session's path first, to compare it with what the
  * close left. No step of a running session builds the whole transcript in memory as one value, so the read

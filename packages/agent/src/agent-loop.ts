@@ -1701,7 +1701,7 @@ async function runLoopBody(
 						// The per-tool label is omp's own (a tool-scoped abort: a steering
 						// rule, an interrupt), so the model sees it. `message.errorMessage`
 						// is the provider's and goes only to `details` — quoting a refusal
-						// into the model's view got the next turn refused too (INFRA-1191).
+						// into the model's view got the next turn refused too.
 						const result = createAbortedToolResult(toolCall, stream, message.stopReason, {
 							localReason: toolCallAbortMessages?.[toolCall.id],
 							upstreamError: message.errorMessage,
@@ -4146,7 +4146,7 @@ async function executeToolCalls(
  * `upstreamError` is whatever the provider reported, when it reported anything.
  * It is local metadata and never reaches a model: the result's `content` is a
  * fixed sentence, because `content` is replayed on every later request and a
- * refusal quoted there makes the next turn be refused too (INFRA-1191).
+ * refusal quoted there makes the next turn be refused too.
  */
 export interface SyntheticToolResultDetails {
 	__synthetic: true;
@@ -4194,7 +4194,7 @@ export function isSyntheticToolResultMessage(
  * the model's view, because it tells the model what to do next. `upstreamError`
  * is whatever the provider said, and must never be model-visible — a refusal
  * quoted into `content` is replayed on every later request and gets the next
- * turn refused too, permanently (INFRA-1191).
+ * turn refused too, permanently.
  *
  * Two fields rather than one string, so no call site can route provider text
  * into the model's view by accident.

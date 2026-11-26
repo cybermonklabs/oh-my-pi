@@ -7,6 +7,7 @@
 
 mod pty_support;
 mod real_bash;
+mod zsh_oracle;
 
 use std::{
 	io::BufRead,

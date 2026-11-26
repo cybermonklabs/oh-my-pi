@@ -1021,6 +1021,14 @@ mod tests {
 		capture(session, RunOptions::new(command)).await
 	}
 
+	/// A shell loop that ends once `go` exists, looking every 10 ms. The
+	/// interval stays: the `sleep` runs in the engine, not as a process, and
+	/// in `background_output_is_captured_when_waited_in_starting_run` the job
+	/// parked in it is the Blocked event the test waits for.
+	fn until_exists(go: &std::path::Path) -> String {
+		format!("while [ ! -e '{}' ]; do sleep 0.01; done", go.display())
+	}
+
 	/// Exercise tracing through the real engine, native tools, spawner and
 	/// capture pipes, never `FakeHost`'s synthetic command implementations.
 	async fn trace_capture(
@@ -1611,10 +1619,18 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn trace_old_background_tool_runs_cannot_claim_the_next_root() {
 		let mut session = session();
-		let (_, old) =
-			trace_capture(&mut session, "{ /bin/sleep 0.05; timeout 1 /usr/bin/printf old; } &").await;
+		let dir = tempfile::tempdir().unwrap();
+		let go = dir.path().join("go");
+		// The old job's tool call comes once the next run has started (it
+		// makes `go`), and that run waits for the job to end.
+		let job = format!("{{ {}; timeout 1 /usr/bin/printf old; }} &", until_exists(&go));
+		let (_, old) = trace_capture(&mut session, &job).await;
 		let old_version = old.version();
-		let (captured, next) = trace_capture(&mut session, "/bin/sleep 0.15; echo next").await;
+		let next_run = format!(": > '{}'; wait; echo next", go.display());
+		let (captured, next) =
+			tokio::time::timeout(Duration::from_secs(20), trace_capture(&mut session, &next_run))
+				.await
+				.expect("the next run's `wait` for the old job never ended");
 		assert_eq!(captured.stdout, "next\n");
 		assert_eq!(trace_output(&next.snapshot()), captured.stdout);
 		assert_eq!(old.version(), old_version);
@@ -1705,9 +1721,18 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn trace_old_background_work_never_enters_a_successive_run() {
 		let mut session = session();
-		let (_, first) = trace_capture(&mut session, "(/bin/sleep 0.1; /usr/bin/printf old) &").await;
+		let dir = tempfile::tempdir().unwrap();
+		let go = dir.path().join("go");
+		// The old job writes once the next run has started (it makes `go`),
+		// and that run waits for the job to end.
+		let job = format!("({}; /usr/bin/printf old) &", until_exists(&go));
+		let (_, first) = trace_capture(&mut session, &job).await;
 		let first_version = first.version();
-		let (captured, second) = trace_capture(&mut session, "/bin/sleep 0.2; echo new").await;
+		let next_run = format!(": > '{}'; wait; echo new", go.display());
+		let (captured, second) =
+			tokio::time::timeout(Duration::from_secs(20), trace_capture(&mut session, &next_run))
+				.await
+				.expect("the next run's `wait` for the old job never ended");
 		assert_eq!(captured.stdout, "new\n");
 		assert_eq!(trace_output(&second.snapshot()), "new\n");
 		assert_eq!(first.version(), first_version, "closed run streams stop observing late output");
@@ -1762,25 +1787,73 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn background_output_stays_with_starting_run() {
-		for command in [
-			"(sleep 0.3; echo late) &",
-			"(sleep 0.3; /bin/echo late) &",
-			"{ sleep 0.3; echo late >&2; } &",
-		] {
+		let dir = tempfile::tempdir().unwrap();
+		for (i, job) in ["(GO; echo late) &", "(GO; /bin/echo late) &", "{ GO; echo late >&2; } &"]
+			.into_iter()
+			.enumerate()
+		{
+			// The job writes once the next run has started (it makes `go`),
+			// and that run waits for the job to end.
+			let go = dir.path().join(i.to_string());
+			let command = job.replace("GO", &until_exists(&go));
 			let mut s = session();
-			s.run(command, RunStdio::default(), CancellationToken::new())
+			s.run(&command, RunStdio::default(), CancellationToken::new())
 				.await
 				.unwrap();
-			let next = sh(&mut s, "sleep 1; echo second").await;
-			assert_eq!(next.stdout, "second\n", "{command}");
-			assert_eq!(next.stderr, "", "{command}");
+			let next_run = format!(": > '{}'; wait; echo second", go.display());
+			let next = tokio::time::timeout(Duration::from_secs(20), sh(&mut s, &next_run))
+				.await
+				.expect("the next run's `wait` for the job never ended");
+			assert_eq!(next.stdout, "second\n", "{job}");
+			assert_eq!(next.stderr, "", "{job}");
 		}
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn background_output_is_captured_when_waited_in_starting_run() {
+		/// Rings once the run's `wait` parks on the job and the job then
+		/// parks in its loop's `sleep 0.01`: with nothing left to run, the
+		/// shell parks too. Limit: a wake that reaches `Shell::step` before
+		/// its next turn (the driver stalled 10 ms or more right after the
+		/// job's park) lets the job see `go` with no park in between.
+		#[derive(Default)]
+		struct Parked {
+			waiting: AtomicBool,
+			rang:    tokio::sync::Notify,
+		}
+		impl EventSink for Parked {
+			fn mask(&self) -> EventMask {
+				EventMask::of(crate::bash::EventKind::Blocked)
+			}
+
+			fn event(&self, ev: &crate::bash::Event<'_>) {
+				use crate::bash::{EventData::Blocked, WaitKey};
+				match ev.data {
+					Blocked { key: WaitKey::Proc(_) } => self.waiting.store(true, Ordering::Release),
+					Blocked { key: WaitKey::Task(_) } if self.waiting.load(Ordering::Acquire) => {
+						self.rang.notify_one();
+					},
+					_ => {},
+				}
+			}
+		}
+
 		let mut s = session();
-		let c = sh(&mut s, "(sleep 0.1; echo job; echo error >&2) & wait").await;
+		let dir = tempfile::tempdir().unwrap();
+		let go = dir.path().join("go");
+		// The job writes once the run waits for it and the shell has parked.
+		let command = format!("({}; echo job; echo error >&2) & wait", until_exists(&go));
+		let parked = Arc::new(Parked::default());
+		let options = RunOptions { events: Some(parked.clone()), ..RunOptions::new(command) };
+		let release = async {
+			tokio::time::timeout(Duration::from_secs(20), parked.rang.notified())
+				.await
+				.expect("the run never parked waiting for its job");
+			std::fs::write(&go, "").unwrap();
+		};
+		let run = tokio::time::timeout(Duration::from_secs(20), capture(&mut s, options));
+		let (c, ()) = tokio::join!(run, release);
+		let c = c.expect("the run's `wait` for its job never ended");
 		assert_eq!((c.outcome.status, c.stdout.as_str(), c.stderr.as_str()), (0, "job\n", "error\n"));
 	}
 

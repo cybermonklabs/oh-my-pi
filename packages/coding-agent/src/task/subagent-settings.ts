@@ -8,7 +8,7 @@ import type { CompactionThresholdPair } from "../config/compaction-threshold";
 import { cfgModelRoles } from "../config/model-settings";
 import { all as allSettings } from "../config/registry";
 import { buildServiceTierByFamily, isServiceTierForFamily, resolveSubagentServiceTier } from "../config/service-tier";
-import { deleteByPath, getByPath, type OverlayLayers, type RawSettings, type Settings } from "../config/settings";
+import { deleteByPath, getByPath, type OverlayLayers, type RawSettings, type Settings, setOwn } from "../config/settings";
 import {
 	cfgCompactionModelThresholdsEnabled,
 	cfgCompactionThresholdPercent,
@@ -262,9 +262,12 @@ export function layerWrites(baseline: RawSettings, layer: RawSettings): Settings
 	let set: Record<string, unknown> | undefined;
 	let removed: string[] | undefined;
 	for (const key of new Set([...Object.keys(baseline), ...Object.keys(layer)])) {
-		if (Bun.deepEquals(baseline[key], layer[key])) continue;
-		if (layer[key] === undefined) (removed ??= []).push(key);
-		else (set ??= {})[key] = layer[key];
+		// Own fields only: a layer without a `__proto__` key would read its prototype there.
+		const before = Object.hasOwn(baseline, key) ? baseline[key] : undefined;
+		const after = Object.hasOwn(layer, key) ? layer[key] : undefined;
+		if (Bun.deepEquals(before, after)) continue;
+		if (after === undefined) (removed ??= []).push(key);
+		else setOwn((set ??= {}), key, after);
 	}
 	return set || removed ? { set, removed } : undefined;
 }
@@ -277,7 +280,7 @@ export function withLayerWrites(layer: RawSettings, writes: SettingsLayerWrites 
 	const written: RawSettings = {};
 	for (const key of new Set([...Object.keys(layer), ...Object.keys(set)])) {
 		const value = Object.hasOwn(set, key) ? set[key] : removed.has(key) ? undefined : layer[key];
-		if (value !== undefined) written[key] = value;
+		if (value !== undefined) setOwn(written, key, value);
 	}
 	return written;
 }

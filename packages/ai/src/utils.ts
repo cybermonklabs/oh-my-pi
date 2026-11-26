@@ -111,13 +111,63 @@ export function stripOpenAIResponsesOutputOnlyStatusesForReplay<TItem extends { 
 	return sanitized ?? items;
 }
 
-/** Remove Codex-rejected backend metadata; preserve clean-item identity by default, or copy while keeping/dropping id. */
+/**
+ * True when an item holds `created_by`, at any value, at its top level or on an
+ * entry of a `shell_call_output` item's `output`.
+ */
+function holdsOpenAIResponsesCreatedBy(item: object): boolean {
+	if (Object.hasOwn(item, "created_by")) return true;
+	const record = item as { type?: unknown; output?: unknown };
+	return record.type === "shell_call_output" && Array.isArray(record.output) && record.output.some(holdsOwnCreatedBy);
+}
+
+function holdsOwnCreatedBy(entry: unknown): boolean {
+	return typeof entry === "object" && entry !== null && Object.hasOwn(entry, "created_by");
+}
+
+/** Delete `created_by` from an item copy and from the entries of its `shell_call_output` output, never in place. */
+function deleteOpenAIResponsesCreatedBy(copy: Record<string, unknown>): void {
+	delete copy.created_by;
+	if (copy.type !== "shell_call_output" || !Array.isArray(copy.output) || !copy.output.some(holdsOwnCreatedBy)) return;
+	copy.output = copy.output.map(entry => {
+		if (!holdsOwnCreatedBy(entry)) return entry;
+		const { created_by: _createdBy, ...withoutCreatedBy } = entry as Record<string, unknown>;
+		return withoutCreatedBy;
+	});
+}
+
+/**
+ * Remove `created_by` from an item replayed as Responses input, whatever its
+ * value (`null` too): the API sets it on output items (and on each entry of a
+ * `shell_call_output` item's `output`) and refuses the request when an input
+ * item holds it. Returns the item itself when it holds none.
+ */
+export function stripOpenAIResponsesCreatedByForReplay<TItem extends object>(item: TItem): TItem {
+	if (!holdsOpenAIResponsesCreatedBy(item)) return item;
+	const sanitized = { ...item };
+	deleteOpenAIResponsesCreatedBy(sanitized as Record<string, unknown>);
+	return sanitized;
+}
+
+/**
+ * Remove backend metadata that input items refuse: Codex's
+ * `internal_chat_message_metadata_passthrough`, and `created_by` (see
+ * {@link stripOpenAIResponsesCreatedByForReplay}). Preserve a clean item's
+ * identity by default, or copy while keeping/dropping id.
+ */
 export function stripOpenAIResponsesInternalMetadataForReplay<
 	TItem extends { id?: unknown; internal_chat_message_metadata_passthrough?: unknown },
 >(item: TItem, mode: "preserve" | "copy" | "drop-id" = "preserve"): TItem {
-	if (mode === "preserve" && !Object.hasOwn(item, "internal_chat_message_metadata_passthrough")) return item;
+	if (
+		mode === "preserve" &&
+		!Object.hasOwn(item, "internal_chat_message_metadata_passthrough") &&
+		!holdsOpenAIResponsesCreatedBy(item)
+	) {
+		return item;
+	}
 	const sanitized = { ...item };
 	delete sanitized.internal_chat_message_metadata_passthrough;
+	deleteOpenAIResponsesCreatedBy(sanitized as Record<string, unknown>);
 	if (mode === "drop-id") delete sanitized.id;
 	return sanitized;
 }

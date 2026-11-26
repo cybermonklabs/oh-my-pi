@@ -90,6 +90,32 @@ pub enum Owner {
 	},
 }
 
+/// [`apply`] for a subshell, whose redirections bash applies in the child
+/// after the fork: a `$RANDOM` they expand draws from a copy of the
+/// generator, as a fork's ([`Kernel::fork_clock`]), and a lookup of
+/// `RANDOM` or `SECONDS` leaves the shell's value cell alone
+/// ([`Kernel::redirs_in_child`]). The shell's generator and clock are back
+/// before it returns, parked or not. zsh code: [`apply`].
+pub fn apply_in_child(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	unit: &Arc<Unit>,
+	list: u32,
+	line: u32,
+	owner: Owner,
+) -> Result<(), Halt> {
+	if unit.mode.dialect() != Dialect::Bash {
+		return apply(k, vp, cx, unit, list, line, owner);
+	}
+	let shell_clock = vp.clock.replace(k.fork_clock(vp));
+	k.redirs_in_child = true;
+	let res = apply(k, vp, cx, unit, list, line, owner);
+	k.redirs_in_child = false;
+	vp.clock = shell_clock;
+	res
+}
+
 /// Apply redirection list `list` of `unit` for `owner`.
 pub fn apply(
 	k: &mut Kernel,

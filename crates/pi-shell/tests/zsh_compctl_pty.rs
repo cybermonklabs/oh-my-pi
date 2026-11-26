@@ -4,25 +4,21 @@
 //!
 //! Each case works in a fixture directory with a few files, directories
 //! and commands (`$PATH` is only its `bin`), so the listings are the same
-//! for both shells.
+//! for both shells. A screen is read once the line editor has handled the
+//! keys and waits for the next one ([`Pty::zle_sync`]).
 
 #![cfg(unix)]
 
 mod pty_support;
+mod zsh_oracle;
 
 use std::{
 	fs, io,
 	os::unix::fs::PermissionsExt,
 	path::{Path, PathBuf},
-	time::Duration,
 };
 
-use pty_support::{Pty, Spawn, TIMEOUT, differential, have_real_zsh};
-
-/// The pause between keys.
-const KEY: Duration = Duration::from_millis(80);
-/// How long output must stay quiet before the screen is read.
-const QUIET: Duration = Duration::from_millis(400);
+use pty_support::{Pty, Spawn, TIMEOUT, ZLE_SYNC_SCRIPT, differential, have_real_zsh};
 
 /// The fixture directory of test `name`: files `file1`, `file2`,
 /// `other.c`, `.hidden`, directories `dir1`, `dir2/sub`, commands
@@ -56,14 +52,15 @@ fn spawn(real: bool, dir: &Path, rc: &str) -> Spawn {
 		.env("PS1", "%# ")
 		.env("RPS1", "[%?]")
 		.cwd(dir)
-		.rc_file(".zshrc", rc)
+		.rc_file(".zshrc", format!("{rc}\n. ~/{ZLE_SYNC_SCRIPT}\nprint -r -- RCDONE\n"))
+		.zle_sync()
 		.size(24, 80)
 }
 
-/// Type `text` key by key.
+/// Type `text`, a line at a time, and wait until the line editor has
+/// handled it ([`Pty::type_lines`]).
 fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
-	pty.type_keys(text, KEY)?;
-	pty.settle(QUIET, TIMEOUT)
+	pty.type_lines(text, TIMEOUT)
 }
 
 /// Both shells, rc sourced and screen cleared, then `drive`: the screens
@@ -71,8 +68,10 @@ fn keys(pty: &mut Pty, text: &str) -> io::Result<()> {
 fn same(name: &str, rc: &str, drive: &str) {
 	let dir = fixture(name);
 	let run = |pty: &mut Pty| -> io::Result<()> {
-		pty.settle(QUIET, TIMEOUT)?;
-		keys(pty, ". ~/.zshrc\r")?;
+		pty.wait_raw(TIMEOUT)?;
+		pty.write(". ~/.zshrc\r")?;
+		pty.read_until("RCDONE", TIMEOUT)?;
+		pty.zle_sync(TIMEOUT)?;
 		keys(pty, "\x0c")?;
 		keys(pty, drive)
 	};

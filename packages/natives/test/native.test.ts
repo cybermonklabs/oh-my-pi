@@ -1,4 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import { spawn } from "node:child_process";
+import { existsSync, watch } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -28,6 +30,7 @@ import {
 	pdfToMarkdown,
 	ReadSkip,
 	readFileBeneath,
+	Shell,
 	summarizeCode,
 	supportsLanguage,
 	truncateToWidth,
@@ -1096,6 +1099,112 @@ try {
 
 			await Bun.sleep(600);
 			expect(await Bun.file(markerPath).exists()).toBe(false);
+		});
+
+		// The in-process shell (the agent's bash tool) ends a run, never this
+		// process, on a signal its shell dies of; the process-shell entry
+		// (`omp bash`, `runShellMain`) dies of it, as bash's process does.
+		it("ends the run, not the process, when the in-process shell dies of a signal", async () => {
+			if (process.platform === "win32") {
+				return;
+			}
+			for (const [command, exitCode, output] of [
+				["kill -TERM $$; echo after", 143, ""],
+				["kill -INT $$; echo after", 130, ""],
+				["trap 'echo x' EXIT; kill -INT $$; echo after", 130, "x\n"],
+			] as const) {
+				let out = "";
+				const result = await executeShell({ command, cwd: testDir }, (error, chunk) => {
+					if (!error) out += chunk;
+				});
+				expect({ command, exitCode: result.exitCode, out }).toEqual({ command, exitCode, out: output });
+			}
+			const shell = new Shell();
+			const died = await shell.run({ command: "kill -TERM $$; echo after", cwd: testDir });
+			expect(died.exitCode).toBe(143);
+			let out = "";
+			const next = await shell.run({ command: "echo alive", cwd: testDir }, (error, chunk) => {
+				if (!error) out += chunk;
+			});
+			expect({ exitCode: next.exitCode, out }).toEqual({ exitCode: 0, out: "alive\n" });
+		});
+
+		it("ends the process-shell entry's process by the signal its shell died of", async () => {
+			if (process.platform === "win32") {
+				return;
+			}
+			const script = path.join(testDir, "run-shell-main.mjs");
+			await fs.writeFile(
+				script,
+				`import { runShellMain } from ${JSON.stringify(addonUrl)};\nprocess.exit(runShellMain(["bash", "-c", process.argv[2]]));\n`,
+			);
+			for (const [command, signalCode, exitCode] of [
+				["kill -TERM $$; echo after", "SIGTERM", null],
+				["kill -INT $$; echo after", "SIGINT", null],
+				["trap 'echo x' EXIT; kill -INT $$", "SIGINT", null],
+				["exit 3", undefined, 3],
+			] as const) {
+				const child = Bun.spawnSync([process.execPath, script, command], { stdout: "pipe", stderr: "pipe" });
+				type End = { command: string; signalCode: string | undefined; exitCode: number | null };
+				const ended: End = { command, signalCode: child.signalCode ?? undefined, exitCode: child.exitCode };
+				const expected: End = { command, signalCode, exitCode };
+				expect(ended).toEqual(expected);
+			}
+		});
+
+		// `omp bash` (runShellMain on the runtime's main thread) dies of an `INT`
+		// to its process group that it acts on, as bash 5.2.21 does: after a
+		// command that died of it, in shell code, and after its EXIT trap. Each
+		// command makes `$F`, and goes on only once the test has sent the signal.
+		it("dies of the INT to its process group that it acts on, as bash", async () => {
+			if (process.platform !== "linux") {
+				return;
+			}
+			const script = path.join(testDir, "run-shell-main-int.mjs");
+			await fs.writeFile(
+				script,
+				`import { runShellMain } from ${JSON.stringify(addonUrl)};\nprocess.exit(runShellMain(["bash", "-c", process.argv[2]]));\n`,
+			);
+			const sent = 'until [ -e "$F.sent" ]; do /bin/sleep 0.01; done';
+			const rows = [
+				[`/bin/sh -c ': > "$F"; ${sent}; exec /bin/sleep 3'; echo after`, ""],
+				[': > "$F"; while :; do :; done', ""],
+				[`trap 'echo x' EXIT; /bin/sh -c ': > "$F"; ${sent}; exec /bin/sleep 3'; echo after`, "x\n"],
+			] as const;
+			const run = async (argv: string[], command: string) => {
+				const dir = await fs.mkdtemp(path.join(testDir, "int-"));
+				const started = path.join(dir, "started");
+				const appeared = Promise.withResolvers<void>();
+				const watcher = watch(dir, () => {
+					if (existsSync(started)) appeared.resolve();
+				});
+				const child = spawn(argv[0], [...argv.slice(1), command], {
+					detached: true,
+					env: { ...process.env, F: started },
+					stdio: ["ignore", "pipe", "ignore"],
+				});
+				let out = "";
+				child.stdout.on("data", chunk => {
+					out += chunk;
+				});
+				const ended = Promise.withResolvers<[number | null, string | null]>();
+				child.on("close", (code, signal) => ended.resolve([code, signal]));
+				if (existsSync(started)) appeared.resolve();
+				await appeared.promise;
+				watcher.close();
+				process.kill(-(child.pid as number), "SIGINT");
+				await fs.writeFile(`${started}.sent`, "");
+				const [exitCode, signalCode] = await ended.promise;
+				return { out, exitCode, signalCode };
+			};
+			type Ended = { command: string; out: string; exitCode: number | null; signalCode: string | null };
+			for (const [command, out] of rows) {
+				const expected: Ended = { command, out, exitCode: null, signalCode: "SIGINT" };
+				const ours: Ended = { command, ...(await run([process.execPath, script], command)) };
+				const theirs: Ended = { command, ...(await run(["/bin/bash", "-c"], command)) };
+				expect(ours).toEqual(expected);
+				expect(theirs).toEqual(expected);
+			}
 		});
 	});
 

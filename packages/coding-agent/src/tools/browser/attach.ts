@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import { getBrowserProfilesDir, isRecord, logger, untilAborted } from "@oh-my-pi/pi-utils";
@@ -370,6 +371,62 @@ function normalizeCandidateArgs(args: string[]): string[] {
 	return split;
 }
 
+/** Whether process `pid` runs as `uid`, real and effective, by `/proc/<pid>/status` (Linux). */
+async function runsAsUid(pid: number, uid: number): Promise<boolean> {
+	const status = await fs.readFile(`/proc/${pid}/status`, "utf8").catch(() => null);
+	const ids = status ? /^Uid:\s+(\d+)\s+(\d+)/m.exec(status) : null;
+	return ids !== null && Number(ids[1]) === uid && Number(ids[2]) === uid;
+}
+
+/** The processes among `candidates` that run as `uid` ({@link runsAsUid}). */
+async function ownedBy(candidates: Process[], uid: number): Promise<Process[]> {
+	const owned = await Promise.all(candidates.map(candidate => runsAsUid(candidate.pid, uid)));
+	return candidates.filter((_, index) => owned[index]);
+}
+
+/**
+ * The live Chromium-family browser holding a profile, whatever executable it
+ * runs: a compiled launcher (Arch's /usr/bin/chromium) execs a binary whose
+ * path neither realpath nor {@link resolveWrapperTarget} can derive. POSIX
+ * Chromium links `<profile>/SingletonLock` to `<hostname>-<pid>`; the owner must
+ * still name the profile in its argv, so a stale lock whose pid was recycled is ignored.
+ *
+ * Only a browser of this user is adopted: the lock must be a symlink this user
+ * owns, the owner process must run as this user (real and effective uid), and
+ * its executable is the one `/proc/<pid>/exe` names, not its argv[0]. Without
+ * these checks another user's browser, on a profile in a shared directory, gives
+ * this user (or root) its CDP port. Linux only, since all three come from
+ * `/proc` and `lstat`; elsewhere no profile lock is adopted.
+ */
+async function findProfileLockOwner(
+	normalizedUserDataDir: string,
+): Promise<{ owner: Process; executable: string } | null> {
+	const uid = process.getuid?.();
+	if (process.platform !== "linux" || uid === undefined) return null;
+	const lockPath = path.join(normalizedUserDataDir, "SingletonLock");
+	const lockStat = await fs.lstat(lockPath).catch(() => null);
+	if (!lockStat?.isSymbolicLink() || lockStat.uid !== uid) return null;
+	const lock = await fs.readlink(lockPath).catch(() => null);
+	const match = lock ? /^(.+)-(\d+)$/.exec(lock) : null;
+	if (!match || match[1] !== os.hostname()) return null;
+	const pid = Number(match[2]);
+	const owner = Process.fromPid(pid);
+	if (!owner || owner.status() !== ProcessStatus.Running) return null;
+	if (!(await runsAsUid(pid, uid))) return null;
+	const executable = await fs.readlink(`/proc/${pid}/exe`).catch(() => null);
+	if (!executable || !isChromiumBrowserExecutable(executable)) return null;
+	let args: string[];
+	try {
+		args = normalizeCandidateArgs(owner.args());
+	} catch {
+		return null;
+	}
+	const profile = findUserDataDirInArgs(args);
+	return profile !== null && path.isAbsolute(profile) && normalizeUserDataDir(profile) === normalizedUserDataDir
+		? { owner, executable }
+		: null;
+}
+
 /**
  * Return a reusable CDP endpoint for `exe`, or null when no instance is
  * running. Refuse to replace an occupied instance unless the caller can
@@ -390,9 +447,29 @@ export async function findReusableCdp(
 	const executablePath = await fs.realpath(exe).catch(() => exe);
 	const isChromium = isChromiumBrowserExecutable(exe);
 	const wrapperTarget = process.platform === "linux" && isChromium ? await resolveWrapperTarget(executablePath) : null;
-	const candidates = Process.fromPath(wrapperTarget ?? executablePath).filter(
+	const running = Process.fromPath(wrapperTarget ?? executablePath).filter(
 		candidate => candidate.status() === ProcessStatus.Running,
 	);
+	// Only this user's browsers are probed or adopted. Root with CAP_SYS_PTRACE resolves every user's
+	// /proc/<pid>/exe, so the lookup by path also finds browsers that other users run.
+	const uid = process.getuid?.();
+	const candidates = process.platform === "linux" && uid !== undefined ? await ownedBy(running, uid) : running;
+	if (isChromium && normalizedRequestedUserDataDir !== null) {
+		const holder = await findProfileLockOwner(normalizedRequestedUserDataDir);
+		if (holder && !candidates.some(candidate => candidate.pid === holder.owner.pid)) {
+			// Adopt only the requested browser under another path; a different browser
+			// on this profile is not what the caller asked for.
+			const [holderName, ...names] = [holder.executable, exe, executablePath, wrapperTarget ?? exe].map(file =>
+				path.basename(file).replace(/\.exe$/i, ""),
+			);
+			if (!names.includes(holderName!)) {
+				throw new ToolError(
+					`Cannot launch ${path.basename(exe)} because its profile ${requestedUserDataDir} is held by another browser, ${holder.executable} (pid ${holder.owner.pid}). Close that browser, choose another --user-data-dir, or pass its CDP endpoint URL as app.`,
+				);
+			}
+			candidates.push(holder.owner);
+		}
+	}
 	const candidateArgs: string[][] = [];
 	let hasUnreadableCandidate = false;
 	for (const process of candidates) {

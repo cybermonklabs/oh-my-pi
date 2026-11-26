@@ -6,6 +6,60 @@
 
 #[cfg(not(unix))]
 use std::io;
+use std::{
+	ptr,
+	sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+};
+
+use crate::bash::ControlHandle;
+
+/// The control word of the shell the OS signals go to ([`WakeOnSignal`]).
+static WAKE: AtomicPtr<AtomicU32> = AtomicPtr::new(ptr::null_mut());
+
+/// The handlers between their load of [`WAKE`] and their mark of it.
+static MARKING: AtomicU32 = AtomicU32::new(0);
+
+/// A handler caught a signal for the shell: the running vproc stops at its
+/// next op, and the host forwards the signal then, so that it is taken
+/// before the next command, as bash takes one, and not only once the
+/// engine's step returns (a script that ended meanwhile never ran its
+/// trap). Atomics only: async-signal-safe.
+fn mark_wake() {
+	MARKING.fetch_add(1, Ordering::SeqCst);
+	let word = WAKE.load(Ordering::SeqCst);
+	if !word.is_null() {
+		// SAFETY: a word stays registered only while its `WakeOnSignal`
+		// lives, whose drop takes it out, then waits for every handler that
+		// may have loaded it to leave.
+		unsafe { (*word).fetch_or(ControlHandle::OS_SIGNAL, Ordering::SeqCst) };
+	}
+	MARKING.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// The shell the caught OS signals wake ([`mark_wake`]), while this lives:
+/// one at a time, as the signals are the process's.
+pub struct WakeOnSignal(ControlHandle);
+
+impl WakeOnSignal {
+	/// Wake the shell `ctl` controls on each OS signal caught from now on.
+	pub fn new(ctl: &ControlHandle) -> Self {
+		let ctl = ctl.clone();
+		WAKE.store(ptr::from_ref(ctl.signal_word()).cast_mut(), Ordering::SeqCst);
+		Self(ctl)
+	}
+}
+
+impl Drop for WakeOnSignal {
+	fn drop(&mut self) {
+		let word = ptr::from_ref(self.0.signal_word()).cast_mut();
+		let _ = WAKE.compare_exchange(word, ptr::null_mut(), Ordering::SeqCst, Ordering::SeqCst);
+		// A handler that loaded the word before it went out is done with it
+		// in a few instructions.
+		while MARKING.load(Ordering::SeqCst) != 0 {
+			std::hint::spin_loop();
+		}
+	}
+}
 
 #[cfg(unix)]
 mod unix {
@@ -23,9 +77,116 @@ mod unix {
 	// lock, or call the shell: the CLI drains the bits at scheduler boundaries.
 	static PENDING: AtomicU64 = AtomicU64::new(0);
 
-	extern "C" fn on_signal(number: libc::c_int) {
+	/// The signals of `PENDING` the kernel itself sent: a terminal's `INT`,
+	/// `QUIT` or hangup `HUP` to its foreground process group, which every
+	/// process of that group gets (Linux `si_code` `SI_KERNEL`). A `kill`
+	/// of the group by another process is `SI_USER`, as a `kill` of this
+	/// process alone is, so it is not told apart.
+	static FROM_KERNEL: AtomicU64 = AtomicU64::new(0);
+
+	/// `PENDING`'s bit of signal `number`.
+	const fn bit(number: libc::c_int) -> u64 {
+		1 << (number - 1)
+	}
+
+	/// The fault signals: the same one again before the shell has handled
+	/// the first ends the process ([`on_signal`]).
+	const FAULTS: u64 = bit(libc::SIGILL)
+		| bit(libc::SIGTRAP)
+		| bit(libc::SIGABRT)
+		| bit(libc::SIGBUS)
+		| bit(libc::SIGFPE)
+		| bit(libc::SIGSEGV)
+		| bit(libc::SIGSYS);
+
+	/// The fault signals an instruction raises before it completes (an
+	/// address it cannot reach, an illegal or a dividing instruction): run
+	/// again on the handler's return, it faults again. Not `TRAP` or `SYS`,
+	/// which an instruction raises once it has run (a breakpoint; a system
+	/// call a seccomp filter traps, `SYS_SECCOMP`), nor `ABRT`, which
+	/// `abort` raises.
+	const REPEATING: u64 =
+		bit(libc::SIGILL) | bit(libc::SIGBUS) | bit(libc::SIGFPE) | bit(libc::SIGSEGV);
+
+	/// Whether a delivery's `si_code` says the kernel sent it ([`FROM_KERNEL`]).
+	#[cfg(target_os = "linux")]
+	const fn sent_by_kernel(code: libc::c_int) -> bool {
+		code == libc::SI_KERNEL
+	}
+
+	/// Other systems give a terminal's signals no code of their own.
+	#[cfg(not(target_os = "linux"))]
+	const fn sent_by_kernel(_code: libc::c_int) -> bool {
+		false
+	}
+
+	/// Whether signal `number`, whose `si_code` is `code`, ends the process
+	/// at once ([`on_signal`]): a fault an instruction of this process raised
+	/// ([`raised_by_a_fault`]) and would raise again ([`REPEATING`]).
+	const fn ends_the_process(number: libc::c_int, code: libc::c_int) -> bool {
+		bit(number) & REPEATING != 0 && raised_by_a_fault(code)
+	}
+
+	/// Whether a fault signal's `si_code` says an instruction of this process
+	/// raised it: a fault's code (`SEGV_MAPERR`, `BUS_ADRALN`, `ILL_ILLOPC`,
+	/// …: the small positive codes, on Linux and the BSDs alike), not a
+	/// `kill`, `sigqueue` or `raise` (`SI_USER`, `SI_QUEUE`, `SI_TKILL`). On
+	/// Linux `SI_KERNEL` too: x86-64 raises a general-protection fault (an
+	/// address that is not canonical, a misaligned `movaps`) as a `SEGV` with
+	/// no fault's code, and the instruction raises it again as any other
+	/// fault. (A terminal's `INT`, `QUIT` or `HUP` is `SI_KERNEL` as well,
+	/// [`sent_by_kernel`]: none of them is a fault signal.)
+	#[cfg(target_os = "linux")]
+	const fn raised_by_a_fault(code: libc::c_int) -> bool {
+		(code > 0 && code < 0x80) || code == libc::SI_KERNEL
+	}
+
+	/// Elsewhere a fault's small positive code alone: the BSDs give
+	/// `SI_USER` and the other senders' codes values above 0x10000.
+	#[cfg(not(target_os = "linux"))]
+	const fn raised_by_a_fault(code: libc::c_int) -> bool {
+		code > 0 && code < 0x80
+	}
+
+	/// bash `termsig_sighandler`: a signal is handed to the shell (pending,
+	/// and the engine woken, [`super::mark_wake`]); the same fault signal
+	/// again before the shell handled it ends the process. A fault an
+	/// instruction of this process raised and would raise again
+	/// ([`ends_the_process`]) is not handed over: it ends the process now, by
+	/// the same signal, whichever thread runs first (its default action
+	/// back, and the signal raised again, which comes as the handler
+	/// returns). Handed over, the shell could run its EXIT trap first or not,
+	/// on its own thread, while the faulting one ran the instruction again.
+	/// A `SYS` or `TRAP` an instruction raised is handed over, as bash takes
+	/// it: the EXIT trap runs, then the shell dies of it.
+	extern "C" fn on_signal(number: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
 		if (1..=64).contains(&number) {
-			PENDING.fetch_or(1u64 << (number - 1), Ordering::Relaxed);
+			let mask = bit(number);
+			let code = if info.is_null() {
+				0
+			} else {
+				// SAFETY: with `SA_SIGINFO` the kernel passes a valid siginfo.
+				unsafe { (*info).si_code }
+			};
+			if ends_the_process(number, code) {
+				// SAFETY: signal and raise are async-signal-safe and take a
+				// valid signal number and disposition; the raised signal waits,
+				// blocked while its handler runs, for the handler's return.
+				unsafe {
+					libc::signal(number, libc::SIG_DFL);
+					libc::raise(number);
+				}
+				return;
+			}
+			if sent_by_kernel(code) {
+				FROM_KERNEL.fetch_or(mask, Ordering::Relaxed);
+			}
+			if PENDING.fetch_or(mask, Ordering::Relaxed) & mask & FAULTS != 0 {
+				// SAFETY: signal is async-signal-safe and takes a valid signal
+				// number and disposition.
+				unsafe { libc::signal(number, libc::SIG_DFL) };
+			}
+			super::mark_wake();
 		}
 	}
 
@@ -104,6 +265,121 @@ mod unix {
 				assert_eq!(ignored_from_status(status), None);
 			}
 		}
+
+		/// The handler marks a delivery the kernel sent (`SI_KERNEL`: a
+		/// terminal's `^C`) and no other (`SI_USER`: a `kill`).
+		#[test]
+		fn the_handler_marks_a_signal_the_kernel_sent() {
+			let deliver = |code| {
+				// SAFETY: a zeroed siginfo is valid; only its code is read.
+				let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+				info.si_code = code;
+				PENDING.fetch_and(!bit(libc::SIGUSR2), Ordering::AcqRel);
+				FROM_KERNEL.fetch_and(!bit(libc::SIGUSR2), Ordering::AcqRel);
+				on_signal(libc::SIGUSR2, &raw mut info, ptr::null_mut());
+				let marked = FROM_KERNEL.fetch_and(!bit(libc::SIGUSR2), Ordering::AcqRel);
+				let pending = PENDING.fetch_and(!bit(libc::SIGUSR2), Ordering::AcqRel);
+				(pending & bit(libc::SIGUSR2) != 0, marked & bit(libc::SIGUSR2) != 0)
+			};
+			assert_eq!(deliver(libc::SI_KERNEL), (true, true));
+			assert_eq!(deliver(libc::SI_USER), (true, false));
+		}
+
+		/// Which deliveries end the process at once ([`ends_the_process`]):
+		/// a fault an instruction raised before it completed (a fault's small
+		/// positive code on `SEGV`, `BUS`, `ILL`, `FPE`, or `SI_KERNEL`: x86-64's
+		/// general-protection fault); not the same signal a `kill` or `raise`
+		/// sent (`SI_USER`, `SI_TKILL`), nor a `SYS` or `TRAP` an instruction
+		/// raised once it had run (`SYS_SECCOMP`, `TRAP_BRKPT`; x86-64's `int3`
+		/// is `SI_KERNEL`), which the shell takes, nor a terminal's `INT`,
+		/// `QUIT` or `HUP` (`SI_KERNEL` too). How the process then ends is
+		/// [`a_real_fault_ends_the_process_though_its_signal_is_caught`]'s,
+		/// and `process_faults`'.
+		#[test]
+		fn only_a_fault_that_repeats_ends_the_process_at_once() {
+			let raised = 1;
+			for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+				assert!(ends_the_process(sig, raised), "{sig} raised by a fault");
+				assert!(ends_the_process(sig, libc::SI_KERNEL), "{sig} raised by a protection fault");
+				assert!(!ends_the_process(sig, libc::SI_USER), "{sig} sent by a kill");
+				assert!(!ends_the_process(sig, libc::SI_TKILL), "{sig} raised by raise");
+			}
+			for sig in [
+				libc::SIGSYS,
+				libc::SIGTRAP,
+				libc::SIGABRT,
+				libc::SIGTERM,
+				libc::SIGINT,
+				libc::SIGQUIT,
+				libc::SIGHUP,
+			] {
+				assert!(!ends_the_process(sig, raised), "{sig}, code 1");
+				assert!(!ends_the_process(sig, libc::SI_KERNEL), "{sig}, SI_KERNEL");
+			}
+		}
+
+		/// A kernel-sent signal reaches the whole process group, but for a
+		/// session leader's `HUP`: a terminal's hangup sends it to the leader
+		/// alone.
+		#[test]
+		fn a_kernel_hup_reaches_the_group_unless_the_shell_leads_its_session() {
+			let pending = bit(libc::SIGHUP) | bit(libc::SIGINT) | bit(libc::SIGTERM);
+			let kernel = bit(libc::SIGHUP) | bit(libc::SIGINT);
+			let (hup, int, term) = (libc::SIGHUP as u8, libc::SIGINT as u8, libc::SIGTERM as u8);
+			assert_eq!(batch(pending, kernel, false).collect::<Vec<_>>(), [
+				(hup, true),
+				(int, true),
+				(term, false)
+			]);
+			assert_eq!(batch(pending, kernel, true).collect::<Vec<_>>(), [
+				(hup, false),
+				(int, true),
+				(term, false)
+			]);
+		}
+
+		/// A real fault ends the process though the shell catches its signal
+		/// (bash's EXIT trap catches `SEGV`): the handler gives the signal its
+		/// default action back at once and raises it again. The
+		/// fault runs in a child, this test binary again with `CHILD` set; the
+		/// bound starts at the fault, which comes as the child starts.
+		#[test]
+		fn a_real_fault_ends_the_process_though_its_signal_is_caught() {
+			const CHILD: &str = "PI_SHELL_SIGNALS_FAULT_CHILD";
+			const NAME: &str =
+				"process::signals::unix::tests::a_real_fault_ends_the_process_though_its_signal_is_caught";
+			if std::env::var_os(CHILD).is_some() {
+				let mut signals = Signals::default();
+				assert!(
+					signals
+						.set(Signal::Segv, Some(BStr::new(b"caught")))
+						.unwrap()
+				);
+				// SAFETY: none: a deliberate fault, a write to an unmapped address.
+				unsafe { ptr::write_volatile(std::hint::black_box(8usize) as *mut u8, 1) };
+				unreachable!("the write faults");
+			}
+			let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+				.args(["--exact", NAME, "--nocapture"])
+				.env(CHILD, "1")
+				.stdout(std::process::Stdio::null())
+				.spawn()
+				.unwrap();
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			let status = loop {
+				if let Some(status) = child.try_wait().unwrap() {
+					break status;
+				}
+				if std::time::Instant::now() > deadline {
+					let _ = child.kill();
+					let _ = child.wait();
+					panic!("the fault repeats: the child still ran 30 s after it started");
+				}
+				std::thread::sleep(std::time::Duration::from_millis(10));
+			};
+			use std::os::unix::process::ExitStatusExt as _;
+			assert_eq!(status.signal(), Some(libc::SIGSEGV), "{status}");
+		}
 	}
 
 	impl Signals {
@@ -169,10 +445,11 @@ mod unix {
 			next.sa_sigaction = if action.is_some_and(|s| s.is_empty()) {
 				libc::SIG_IGN
 			} else {
-				let handler: extern "C" fn(libc::c_int) = on_signal;
+				let handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+					on_signal;
 				handler as libc::sighandler_t
 			};
-			next.sa_flags = libc::SA_RESTART;
+			next.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
 			// SAFETY: next is initialized and the mask is a valid writable
 			// sigset_t.
 			unsafe { libc::sigemptyset(&raw mut next.sa_mask) };
@@ -194,17 +471,55 @@ mod unix {
 			}
 		}
 
-		/// Deliver the OS signals caught since the last call to the root vproc.
+		/// Deliver the OS signals caught since the last call to the root
+		/// vproc: one the kernel sent the whole process group as
+		/// [`SigTarget::Group`] ([`batch`]), any other as
+		/// [`SigTarget::Outside`].
 		pub fn dispatch(ctl: &ControlHandle, root: Vpid) {
-			let mut pending = PENDING.swap(0, Ordering::AcqRel);
-			while pending != 0 {
-				let number = pending.trailing_zeros() as u8 + 1;
-				pending &= pending - 1;
+			let pending = PENDING.swap(0, Ordering::AcqRel);
+			if pending == 0 {
+				return;
+			}
+			// Those of this batch; a later delivery's mark stays for the next.
+			let kernel = FROM_KERNEL.fetch_and(!pending, Ordering::AcqRel) & pending;
+			// SAFETY: getsid and getpid take no pointer and cannot fail here.
+			let leads_session = unsafe { libc::getsid(0) == libc::getpid() };
+			for (number, group) in batch(pending, kernel, leads_session) {
 				if let Some(signal) = Signal::from_number(number, Platform::current()) {
-					ctl.signal(SigTarget::Vpid(root), signal);
+					let target = if group {
+						SigTarget::Group(root)
+					} else {
+						SigTarget::Outside(root)
+					};
+					ctl.signal(target, signal);
 				}
 			}
 		}
+	}
+
+	/// The signal numbers of `pending`, lowest first, each with whether the
+	/// kernel sent it to the whole process group: marked in `kernel`
+	/// ([`FROM_KERNEL`]), except a `HUP` to a shell that leads its session. A
+	/// terminal's hangup sends its `HUP` to the session leader alone (Linux
+	/// `tty_signal_session_leader`); to a shell that does not lead it, a
+	/// kernel's `HUP` is the one the foreground group gets when the leader
+	/// exits (`disassociate_ctty`).
+	fn batch(
+		mut pending: u64,
+		mut kernel: u64,
+		leads_session: bool,
+	) -> impl Iterator<Item = (u8, bool)> {
+		if leads_session {
+			kernel &= !bit(libc::SIGHUP);
+		}
+		std::iter::from_fn(move || {
+			if pending == 0 {
+				return None;
+			}
+			let low = pending.isolate_lowest_one();
+			pending &= pending - 1;
+			Some((low.trailing_zeros() as u8 + 1, kernel & low != 0))
+		})
 	}
 
 	impl Drop for Signals {
@@ -216,6 +531,7 @@ mod unix {
 			}
 			crate::sys::dispositions_changed();
 			PENDING.store(0, Ordering::Relaxed);
+			FROM_KERNEL.store(0, Ordering::Relaxed);
 		}
 	}
 
@@ -235,6 +551,12 @@ mod unix {
 		libc::SIGWINCH,
 		libc::SIGCONT,
 	];
+
+	/// Whether an embedding runtime hands `sig` over to the shell
+	/// ([`SHELL_SET`]): the shell may catch it by its own rules.
+	pub fn handed_over(sig: Signal) -> bool {
+		SHELL_SET.contains(&i32::from(sig.number(Platform::current())))
+	}
 
 	/// The dispositions an embedding runtime (Bun) installed for the
 	/// shell's signals, put back to `SIG_DFL` for the shell's run and
@@ -300,7 +622,49 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{RuntimeSignals, Signals};
+pub use unix::{RuntimeSignals, Signals, handed_over};
+
+/// The signal the shell died of ([`super::Exit`]). Unix only: elsewhere a
+/// process dies of no signal.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub struct Death {
+	/// The signal's number.
+	pub signal:    i32,
+	/// An `exec`ed program died of it
+	/// ([`Shell::exec_signal`](crate::bash::Shell::exec_signal)): the shell
+	/// passes that death on, and dumps no core of its own beside the
+	/// program's (zsh and bash `exec` the program, so one core exists).
+	pub passed_on: bool,
+}
+
+/// End the process by `death`'s signal's default action: the disposition
+/// back to the default, the signal unblocked, then raised. A death passed
+/// on from an `exec`ed program first makes the process dump no core
+/// (`PR_SET_DUMPABLE` 0 on Linux, whatever `core_pattern` says; a core
+/// size limit of 0 elsewhere). Returns only when the signal does not end
+/// the process.
+#[cfg(unix)]
+pub fn die_of(death: Death) {
+	let Death { signal, passed_on } = death;
+	// SAFETY: plain prctl, rlimit, disposition, mask and raise calls on a
+	// valid signal number, an initialized limit and a set initialized by
+	// sigemptyset.
+	unsafe {
+		if passed_on {
+			#[cfg(target_os = "linux")]
+			libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+			#[cfg(not(target_os = "linux"))]
+			libc::setrlimit(libc::RLIMIT_CORE, &libc::rlimit { rlim_cur: 0, rlim_max: 0 });
+		}
+		libc::signal(signal, libc::SIG_DFL);
+		let mut set: libc::sigset_t = std::mem::zeroed();
+		libc::sigemptyset(&raw mut set);
+		libc::sigaddset(&raw mut set, signal);
+		libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+		libc::raise(signal);
+	}
+}
 
 /// Nothing to reset off Unix.
 #[cfg(not(unix))]
@@ -313,6 +677,13 @@ impl RuntimeSignals {
 	pub const fn reset() -> io::Result<Self> {
 		Ok(Self)
 	}
+}
+
+/// Off Unix an embedding runtime keeps no handlers of its own the shell
+/// could replace: every signal is handed over.
+#[cfg(not(unix))]
+pub const fn handed_over(_sig: crate::bash::Signal) -> bool {
+	true
 }
 
 /// Windows has no signals, only console control events: Ctrl-C
@@ -384,6 +755,7 @@ mod windows {
 		}
 		if TRAPPED.load(Ordering::Relaxed) & b != 0 {
 			PENDING.fetch_or(b, Ordering::Relaxed);
+			super::mark_wake();
 			if sig == Signal::Int {
 				crate::sys::console::ctrl_c_claimed();
 			}

@@ -48,22 +48,16 @@ trap 'rm -rf -- "$tmp"' EXIT
 # The lists' one reader, list_entries, shared with rust-test.sh.
 # shellcheck source=.github/sami/rust-test-lists.sh
 . "$(dirname "${BASH_SOURCE[0]}")/rust-test-lists.sh"
+# The test targets' one reader (suite_excludes, bazel_test_query,
+# bazel_test_roots), shared with rust-test-early-listings.sh, which maps the
+# cargo test binaries to Bazel's rust_test targets by the same crate roots.
+# shellcheck source=.github/sami/rust-test-targets.sh
+. "$(dirname "${BASH_SOURCE[0]}")/rust-test-targets.sh"
 
 # The packages test:rs leaves out: the strings of the VENDORED_FORK_EXCLUDES
 # array other than "--exclude".
 [ -f scripts/run-rs-task.ts ] || fail "scripts/run-rs-task.ts is missing, so the suite's excluded packages cannot be read"
-awk '
-	/^const VENDORED_FORK_EXCLUDES = \[/ { inlist = 1; found = 1; next }
-	inlist && /^\]/ { exit }
-	inlist {
-		line = $0
-		while (match(line, /"[^"]+"/)) {
-			word = substr(line, RSTART + 1, RLENGTH - 2)
-			if (word != "--exclude") print word
-			line = substr(line, RSTART + RLENGTH)
-		}
-	}
-' scripts/run-rs-task.ts >"$tmp/excludes"
+suite_excludes >"$tmp/excludes" || true
 [ -s "$tmp/excludes" ] || fail "found no VENDORED_FORK_EXCLUDES array in scripts/run-rs-task.ts"
 echo "Packages test:rs excludes: $(tr '\n' ' ' <"$tmp/excludes")"
 
@@ -88,66 +82,55 @@ jq -r --arg root "$root/" --rawfile excludes "$tmp/excludes" '
 
 # A Cargo.toml outside the root workspace is a workspace Bazel does not
 # build, whose tests the test step runs under cargo only when
-# .github/sami/rust-test-cargo-workspaces.txt lists it. Every tracked
-# Cargo.toml must be the root's, a root member's, or listed.
+# .github/sami/rust-test-cargo-workspaces.txt lists it. One whose tests no job
+# runs, on purpose, is in .github/sami/rust-test-untested-manifests.txt with
+# its reason. Every tracked Cargo.toml must be the root's, a root member's, or
+# in one of the two lists; a line of the second must name a tracked Cargo.toml
+# outside the root workspace, and no manifest may be in both.
 jq -r --arg root "$root/" '.packages[].manifest_path | ltrimstr($root)' "$tmp/metadata.json" >"$tmp/members" ||
 	fail "could not read the root workspace's manifests from cargo metadata"
 echo Cargo.toml >>"$tmp/members"
+LC_ALL=C sort -u -o "$tmp/root-members" "$tmp/members"
 [ -f .github/sami/rust-test-cargo-workspaces.txt ] || fail ".github/sami/rust-test-cargo-workspaces.txt is missing"
-list_entries .github/sami/rust-test-cargo-workspaces.txt 1 >>"$tmp/members" || fail ".github/sami/rust-test-cargo-workspaces.txt has a malformed line (above)"
+list_entries .github/sami/rust-test-cargo-workspaces.txt 1 >"$tmp/cargo-workspaces" || fail ".github/sami/rust-test-cargo-workspaces.txt has a malformed line (above)"
+[ -f .github/sami/rust-test-untested-manifests.txt ] || fail ".github/sami/rust-test-untested-manifests.txt is missing"
+list_entries .github/sami/rust-test-untested-manifests.txt 1 >"$tmp/untested" || fail ".github/sami/rust-test-untested-manifests.txt has a malformed line (above)"
+LC_ALL=C sort -u -o "$tmp/cargo-workspaces" "$tmp/cargo-workspaces"
+LC_ALL=C sort -u -o "$tmp/untested" "$tmp/untested"
+cat "$tmp/cargo-workspaces" "$tmp/untested" >>"$tmp/members"
 LC_ALL=C sort -u -o "$tmp/members" "$tmp/members"
 git ls-files -- 'Cargo.toml' '*/Cargo.toml' >"$tmp/manifests" || fail "git ls-files failed"
 [ -s "$tmp/manifests" ] || fail "git ls-files names no Cargo.toml"
 LC_ALL=C sort -u -o "$tmp/manifests" "$tmp/manifests"
 unlisted=0
 while read -r manifest; do
-	echo "::error title=Rust test parity::$manifest is outside the root workspace and not in .github/sami/rust-test-cargo-workspaces.txt, so no job runs its tests"
+	echo "::error title=Rust test parity::$manifest is outside the root workspace and in neither .github/sami/rust-test-cargo-workspaces.txt nor .github/sami/rust-test-untested-manifests.txt, so no job runs its tests and no line says why"
 	unlisted=$((unlisted + 1))
 done < <(LC_ALL=C comm -23 "$tmp/manifests" "$tmp/members")
+while read -r manifest; do
+	if ! grep -qxF -- "$manifest" "$tmp/manifests"; then
+		echo "::error title=Rust test parity::$manifest is in .github/sami/rust-test-untested-manifests.txt, but the tree under test tracks no such Cargo.toml: that line is for another tree"
+	elif grep -qxF -- "$manifest" "$tmp/root-members"; then
+		echo "::error title=Rust test parity::$manifest is in .github/sami/rust-test-untested-manifests.txt, but it is the root workspace's, whose tests Bazel runs: remove its line"
+	else
+		echo "Untested on purpose, as .github/sami/rust-test-untested-manifests.txt says: $manifest"
+		continue
+	fi
+	unlisted=$((unlisted + 1))
+done <"$tmp/untested"
+while read -r manifest; do
+	echo "::error title=Rust test parity::$manifest is in both .github/sami/rust-test-cargo-workspaces.txt (the job runs its tests) and .github/sami/rust-test-untested-manifests.txt (no job does): keep one line"
+	unlisted=$((unlisted + 1))
+done < <(LC_ALL=C comm -12 "$tmp/cargo-workspaces" "$tmp/untested")
 echo "Cargo manifests: $(awk 'END { print NR }' "$tmp/manifests") tracked, $unlisted outside the root workspace and unlisted"
 
 # The crate roots the Bazel tests build, as repository paths, from each test
 # rule and each crate a test names. One JSON object per rule, with its
 # attributes as written and globs expanded.
-# `$t` is a Bazel query variable (`let t = ... in`), not a shell one.
-# shellcheck disable=SC2016
-expr='let t = kind("^(rust_(doc_)?test|native_test) rule$", //crates/...) - attr(tags, "manual", //crates/...) in $t + labels(crate, $t)'
-bazelisk query --output=streamed_jsonproto "$expr" >"$tmp/rules.json" || fail "bazel query failed: $expr"
-jq -r -s '
-	def attrs($r): ($r.attribute // []);
-	def str($r; $n): [attrs($r)[] | select(.name == $n) | .stringValue // empty] | .[0] // "";
-	def list($r; $n): [attrs($r)[] | select(.name == $n) | (.stringListValue // [])[]];
-	def flag($r; $n): [attrs($r)[] | select(.name == $n) | .booleanValue] | .[0];
-	def path: sub("^@@?"; "") | sub("^//:"; "") | sub("^//"; "") | sub(":"; "/");
-	def base: split("/") | .[-1];
-	def shortest($srcs; $b): [$srcs[] | select(path | base == $b)] | sort_by(path | length) | .[0];
-	def root($r; $type):
-		str($r; "crate_root") as $explicit
-		| if $explicit != "" then $explicit
-		  else list($r; "srcs") as $srcs
-		  | ($r.name | split(":") | .[-1]) as $name
-		  | (str($r; "crate_name") | if . == "" then $name else . end) as $crate_name
-		  | (if ($srcs | length) == 1 then $srcs[0] else null end)
-		    // shortest($srcs; if $type == "bin" then "main.rs" else "lib.rs" end)
-		    // shortest($srcs; $name + ".rs")
-		    // shortest($srcs; $crate_name + ".rs")
-		    // ("NO ROOT FOR " + $r.name)
-		  end
-		| path;
-	def type($r): if $r.ruleClass == "rust_binary" then "bin" else "lib" end;
-	[.[] | select(.type == "RULE") | .rule] as $rules
-	| ($rules | map({key: .name, value: .}) | from_entries) as $by_name
-	| $rules[]
-	| select(.ruleClass == "rust_test" or .ruleClass == "rust_doc_test")
-	| . as $t
-	| str($t; "crate") as $crate
-	| (if $crate != "" then
-	     ($by_name[$crate] // null) as $c
-	     | if $c == null then "NO RULE FOR " + $crate else root($c; type($c)) end
-	   elif .ruleClass == "rust_doc_test" then "NO CRATE FOR " + .name
-	   else root($t; if flag($t; "use_libtest_harness") == false then "bin" else "lib" end) end) as $root
-	| [(if .ruleClass == "rust_test" then "test" else "doctest" end), $root]
-	| @tsv' "$tmp/rules.json" | LC_ALL=C sort -u >"$tmp/roots" || fail "could not read the crate roots from bazel query"
+# The query and the reading of each root are bazel_test_query and
+# bazel_test_roots (rust-test-targets.sh).
+bazelisk query --output=streamed_jsonproto "$bazel_test_query" >"$tmp/rules.json" || fail "bazel query failed: $bazel_test_query"
+bazel_test_roots "$tmp/rules.json" | cut -f 1,3 | LC_ALL=C sort -u >"$tmp/roots" || fail "could not read the crate roots from bazel query"
 if grep -E $'\t''NO (ROOT|RULE|CRATE) FOR ' "$tmp/roots"; then
 	fail "the crate root of a Bazel test above could not be found"
 fi

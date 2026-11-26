@@ -18,7 +18,7 @@ use std::{borrow::Cow, fmt::NumBuffer, sync::Arc};
 use bstr::{BStr, BString, ByteSlice};
 
 use super::{
-	Cx, Kernel, arith,
+	Cx, Kernel, arith, dynvars,
 	proc::{Atom, Vproc},
 	quote,
 	state::{self, Level, Var, VarEdit},
@@ -186,6 +186,9 @@ pub struct Expander<'e, 'c> {
 	/// element up twice (`parameter_brace_transform`), every other
 	/// expansion once.
 	sub_looks:      u8,
+	/// The operator of the parameter expansion being read, for the
+	/// lookups a read of a special variable makes ([`dynvars::Site`]).
+	dyn_op:         dynvars::Op,
 	ifs:            IfsCache,
 	/// `set -f` and `shopt extglob`, looked up once per expansion.
 	glob_opts:      Option<GlobOpts>,
@@ -277,6 +280,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 			sub_status: None,
 			arith_cmd: None,
 			sub_looks: 1,
+			dyn_op: dynvars::Op::Value,
 			ifs: IfsCache::Unknown,
 			glob_opts: None,
 			pool: Vec::new(),
@@ -324,6 +328,21 @@ impl<'e, 'c> Expander<'e, 'c> {
 		f(self)?;
 		self.note(|| Atom::Done);
 		Ok(())
+	}
+
+	/// bash's lookup of a temporary assignment's `name` before its value is
+	/// expanded (`assign_in_env`): a special `RANDOM` or `SECONDS`, or the
+	/// one a reference `name` names ([`dynvars::named`]), at
+	/// [`dynvars::Site::Temp`]. Once although a park replays this
+	/// expansion, and decided on the first run: the value's expansion can
+	/// change what `name` names (`declare -n r; r=${r:=RANDOM}$(…) true`).
+	pub fn look_temp(&mut self, name: &[u8]) -> X<()> {
+		self.effect(|ex| {
+			if let Some(s) = dynvars::named(ex.k, ex.cx.store, ex.vp, name)? {
+				dynvars::look(ex.k, ex.cx, ex.vp, s.name(), dynvars::Site::Temp)?;
+			}
+			Ok(())
+		})
 	}
 
 	fn read_atom(&mut self, f: impl FnOnce(&mut Self) -> X<Val>) -> X<Val> {
@@ -576,6 +595,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 				vp:       &mut *self.vp,
 				prefix:   self.arith_cmd,
 				expanded: false,
+				element:  dynvars::Site::ArithElement,
 			};
 			arith::eval(expanded, &mut env)
 		};
@@ -1065,7 +1085,16 @@ impl<'e, 'c> Expander<'e, 'c> {
 			.and_then(|v| v.as_scalar().map(BString::from));
 		Ok(match (v, user) {
 			(Some(v), _) => Some(v),
-			(None, b"") => Some(self.cx.host.user().home),
+			// bash `sh_get_home_dir`: the password database entry's home, `/`
+			// for a user without one.
+			(None, b"") => {
+				let home = self.cx.host.user().home;
+				Some(if home.is_empty() {
+					BString::from("/")
+				} else {
+					home
+				})
+			},
 			(None, _) => None,
 		})
 	}
@@ -1082,7 +1111,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 			Part::Lit(b) if inq => sink.lit(b, true),
 			Part::Lit(b) => Self::lit_text(sink, b, rhs),
 			Part::Quoted(b) => sink.lit(b, true),
-			Part::Param(p) => self.param(unit, p, sink, inq || p.quoted, rhs)?,
+			Part::Param(p) => {
+				// bash's `extract_dollar_brace_string` re-parses what the
+				// `${ … }` holds even where it does not expand it.
+				if super::killed::reports_due(self.vp) && param_reparsed(unit, p) {
+					super::killed::expanded(self.k, self.cx, self.vp, self.line);
+				}
+				self.param(unit, p, sink, inq || p.quoted, rhs)?;
+			},
 			Part::Comsub { entry, kind, quoted, text } => {
 				let out = self.comsub(unit, *entry, *kind, *text)?;
 				sink.value(&out, inq || *quoted);
@@ -1106,6 +1142,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 				let path = if let Some(Atom::Str(Some(p))) = self.replay() {
 					p
 				} else {
+					super::killed::expanded(self.k, self.cx, self.vp, self.line);
 					let Some(p) =
 						super::exec::start_procsub(self.k, self.vp, self.cx, unit, *entry, *output)
 					else {
@@ -1143,6 +1180,11 @@ impl<'e, 'c> Expander<'e, 'c> {
 		Ok(())
 	}
 
+	/// A command substitution: its finished output on a replay, else
+	/// [`Stop::Sub`] to start it. `text` (`None` for a backquote) is what
+	/// bash re-parses in the shell first, through `shell_getc`
+	/// (`xparse_dolparen`): the background jobs a signal killed are reported
+	/// then ([`super::killed::expanded`]).
 	fn comsub(
 		&mut self,
 		unit: &Arc<Unit>,
@@ -1177,19 +1219,48 @@ impl<'e, 'c> Expander<'e, 'c> {
 			self.cursor += usize::from(atom.is_some());
 			atom
 		};
-		match atom {
-			Some(Atom::Sub { out, status }) => {
-				self.sub_status = Some(status);
-				self.vp.status = status;
-				Ok(out)
-			},
-			_ => Err(Stop::Sub { unit: Arc::clone(unit), entry, form, text }),
+		if let Some(Atom::Sub { out, status }) = atom {
+			self.sub_status = Some(status);
+			self.vp.status = status;
+			Ok(out)
+		} else {
+			if text.is_some() {
+				super::killed::expanded(self.k, self.cx, self.vp, self.line);
+			}
+			Err(Stop::Sub { unit: Arc::clone(unit), entry, form, text })
 		}
 	}
 
 	// ---- parameters --------------------------------------------------------
 
+	/// One parameter expansion, its operator kept in [`Self::dyn_op`]
+	/// while it reads: a read of bash code's special `RANDOM` or `SECONDS`
+	/// makes the lookups bash makes for that operator.
 	fn param(
+		&mut self,
+		unit: &Arc<Unit>,
+		p: &ParamIr,
+		sink: &mut Sink<'_>,
+		quoted: bool,
+		rhs: bool,
+	) -> X<()> {
+		let op = match &p.op {
+			OpIr::Length => dynvars::Op::Length,
+			OpIr::Transform(b'a' | b'A') => dynvars::Op::Attrs,
+			OpIr::Substr { .. }
+			| OpIr::Trim { .. }
+			| OpIr::Replace { .. }
+			| OpIr::Case { .. }
+			| OpIr::Transform(_) => dynvars::Op::Operator,
+			_ => dynvars::Op::Value,
+		};
+		let outer = std::mem::replace(&mut self.dyn_op, op);
+		let res = self.param_op(unit, p, sink, quoted, rhs);
+		self.dyn_op = outer;
+		res
+	}
+
+	fn param_op(
 		&mut self,
 		unit: &Arc<Unit>,
 		p: &ParamIr,
@@ -1262,7 +1333,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 				let names = self.read_atom(|ex| {
 					let vars =
 						state::scan(&ex.k.root, ex.cx.store, ex.vp, crate::bash::store::Table::Var)?;
-					let items = vars
+					let mut items: Vec<BString> = vars
 						.into_iter()
 						.filter_map(|(k, _)| match k {
 							crate::bash::store::KeyBuf::Var(n) if n.starts_with(prefix.as_slice()) => {
@@ -1271,6 +1342,9 @@ impl<'e, 'c> Expander<'e, 'c> {
 							_ => None,
 						})
 						.collect();
+					// bash's dynamic variables this shell keeps no variable for.
+					dynvars::with_listed(ex.k, ex.cx.store, ex.vp, &mut items)?;
+					items.retain(|n| n.starts_with(prefix.as_slice()));
 					Ok(Val::List { items, star: false })
 				})?;
 				let items = match names {
@@ -1339,10 +1413,25 @@ impl<'e, 'c> Expander<'e, 'c> {
 					let name = name.clone();
 					let stored = value.clone();
 					let sub = key.as_ref().map(|k| k.as_slice());
+					// A reference with no target takes the value as the name
+					// it refers to (`declare -n r; ${r:=RANDOM}`), and bash
+					// expands to that name (the reference's own value), not
+					// the variable it now names: no `RANDOM` lookup.
+					let unset_ref = sub.is_none()
+						&& state::lookup_declared(&self.k.root, self.cx.store, self.vp, &name)?
+							.is_some_and(|v| {
+								v.attrs.contains(Attrs::NAMEREF) && v.attrs.contains(Attrs::INVISIBLE)
+							});
 					self.effect(|ex| ex.assign_scalar(&name, sub, stored))?;
 					// The value as stored: attributes may have changed it
 					// (`declare -i a; ${a:=4+3}` is 7).
-					let value = match self.read_atom(|ex| ex.var_value(&name, sub, false))? {
+					let value = match self.read_atom(|ex| {
+						if unset_ref {
+							Ok(Val::Str(value.clone()))
+						} else {
+							ex.var_value(&name, sub, false)
+						}
+					})? {
 						Val::Str(s) => s,
 						_ => value,
 					};
@@ -1785,7 +1874,10 @@ impl<'e, 'c> Expander<'e, 'c> {
 		// arithmetic syntax error). Only such text differs from the word.
 		let src = word_source(unit, wi);
 		if src.iter().any(|c| matches!(c, b'\'' | b'\\')) {
-			let n = self.arith(src)?;
+			// An error of the text's own expansion (`$((1/0))` in it) is not
+			// the subscript's: bash reports it as such.
+			let text = self.expand_text(src)?;
+			let n = self.arith_eval(&text).map_err(subscript_error)?;
 			return Ok(BString::from(n.format_into(&mut NumBuffer::new())));
 		}
 		// bash expands no tilde-prefix in an arithmetic subscript (`${b[~]}`
@@ -1795,7 +1887,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 		let Sink::Scalar(text) = sink else {
 			return Ok(BString::default());
 		};
-		let n = self.arith_eval(&text)?;
+		let n = self.arith_eval(&text).map_err(subscript_error)?;
 		Ok(BString::from(n.format_into(&mut NumBuffer::new())))
 	}
 
@@ -1814,7 +1906,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 			}
 			return self.expand_arith_text(&subscript_as_arith_text(sub));
 		}
-		let n = self.arith(sub)?;
+		let text = self.expand_text(sub)?;
+		let n = self.arith_eval(&text).map_err(subscript_error)?;
 		Ok(BString::from(n.format_into(&mut NumBuffer::new())))
 	}
 
@@ -1888,10 +1981,12 @@ impl<'e, 'c> Expander<'e, 'c> {
 						.and_then(|s| s.parse().ok())
 						.unwrap_or(0);
 					// A scalar has only `[0]`; an unset or empty array reads as
-					// 0 without the warning `${e[-1]}` gives.
+					// 0 without the warning `${e[-1]}` gives. Bash code's
+					// special `RANDOM` and `SECONDS` are scalars.
+					let special = dynvars::visible(self.k, self.cx.store, self.vp, &name)?.is_some();
 					let (before, empty) =
 						match state::lookup(&self.k.root, self.cx.store, self.vp, &name)? {
-							None => (false, !is_dynamic(&name)),
+							None => (special, !is_dynamic(&name)),
 							Some(v) => match &v.value {
 								VarValue::Str(_) => (true, false),
 								_ => (v.next_index() > 0 && v.next_index() + n < 0, v.next_index() == 0),
@@ -1928,14 +2023,23 @@ impl<'e, 'c> Expander<'e, 'c> {
 
 	/// Run `f` on the value of `p` in place when `p` is a plain set scalar
 	/// reference (`$name` or `$1`, no subscript, not indirect, not a dynamic
-	/// variable) and no replay log is recorded; `None` otherwise (the
-	/// general path copies the value).
+	/// variable nor a name reference to `RANDOM` or `SECONDS`) and no replay
+	/// log is recorded; `None` otherwise (the general path copies the value).
 	fn with_scalar<R>(&mut self, p: &ParamIr, f: impl FnOnce(&[u8]) -> R) -> X<Option<R>> {
 		if self.record || p.indirect || p.index.is_some() {
 			return Ok(None);
 		}
 		match &p.param {
 			ParamRef::Var(name) if !is_dynamic(name) => {
+				// A reference to bash code's special `RANDOM` or `SECONDS`
+				// reads it as the name does ([`Self::var_value`]).
+				if state::may_be_nameref(&self.k.root, self.vp)
+					&& let state::Deref::To { name: target, index: None } =
+						state::deref(&self.k.root, self.cx.store, self.vp, name)?
+					&& dynvars::Special::of(&target).is_some()
+				{
+					return Ok(None);
+				}
 				Ok(state::lookup(&self.k.root, self.cx.store, self.vp, name)?
 					.and_then(Var::as_scalar)
 					.map(f))
@@ -1961,6 +2065,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 		out: &mut Vec<CompoundElem>,
 		globs: Option<&mut Vec<(u32, BString)>>,
 	) -> X<()> {
+		// bash re-parses the list (`parse_string_to_word_list`).
+		super::killed::reparsed(self.k, self.cx, self.vp, self.line);
 		if elems.first().is_some_and(|e| e.key.is_none()) {
 			let assoc = match state::deref(&self.k.root, self.cx.store, self.vp, name)? {
 				state::Deref::Plain => self.is_assoc(name)?,
@@ -2108,6 +2214,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 		let (Some(Part::Compound(elems)), WordKind::DeclArg) = (w.parts.last(), w.kind) else {
 			return Ok(false);
 		};
+		// bash re-parses the list (`parse_string_to_word_list`).
+		super::killed::reparsed(self.k, self.cx, self.vp, self.line);
 		let mut sink = Sink::Scalar(Vec::new());
 		for part in &w.parts[..w.parts.len() - 1] {
 			self.part(unit, part, &mut sink, false, false)?;
@@ -2247,7 +2355,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 				},
 				b'u' => {
 					let name = self.cx.host.user().name;
-					lit(&mut out, &name);
+					// bash `get_current_user_info`: a uid without a password
+					// database entry is named so.
+					let shown: &[u8] = if name.is_empty() {
+						b"I have no name!"
+					} else {
+						&name
+					};
+					lit(&mut out, shown);
 				},
 				b'h' | b'H' => {
 					let host = self.cx.host.hostname();
@@ -2585,9 +2700,40 @@ impl<'e, 'c> Expander<'e, 'c> {
 		})
 	}
 
+	/// A read of bash code's special `RANDOM` or `SECONDS` (`index` 0, or
+	/// every element when `list`): the lookups bash 5.3.20 makes before
+	/// and after the read for this subscript and [`Self::dyn_op`]
+	/// ([`dynvars::Site::ExpandBefore`]), the read one lookup more. A
+	/// subscript other than 0 names no element.
+	fn special_value(&mut self, s: dynvars::Special, index: Option<&[u8]>, list: bool) -> X<Val> {
+		let sub = match index {
+			_ if list => dynvars::Sub::All,
+			None => dynvars::Sub::None,
+			Some(b"0") => dynvars::Sub::Zero,
+			Some(_) => dynvars::Sub::Other,
+		};
+		let e = dynvars::Expansion { sub, op: self.dyn_op };
+		for _ in 0..dynvars::Site::ExpandBefore(e).lookups() {
+			dynvars::lookup(self.k, self.cx, self.vp, s)?;
+		}
+		let value = dynvars::lookup(self.k, self.cx, self.vp, s)?;
+		for _ in 0..dynvars::Site::ExpandAfter(e).lookups() {
+			dynvars::lookup(self.k, self.cx, self.vp, s)?;
+		}
+		let text = BString::from(value.format_into(&mut NumBuffer::new()));
+		Ok(match sub {
+			dynvars::Sub::None | dynvars::Sub::Zero => Val::Str(text),
+			dynvars::Sub::Other => Val::Unset,
+			dynvars::Sub::All => Val::List { items: vec![text], star: false },
+		})
+	}
+
 	/// Value of variable `name` (element `index`, or every element when
 	/// `list`), including bash's dynamic variables.
 	fn var_value(&mut self, name: &[u8], index: Option<&[u8]>, list: bool) -> X<Val> {
+		if let Some(s) = dynvars::visible(self.k, self.cx.store, self.vp, name)? {
+			return self.special_value(s, index, list);
+		}
 		if let Some(v) = self.dynamic(name)? {
 			let n: i64 = index
 				.and_then(|i| std::str::from_utf8(i).ok()?.parse().ok())
@@ -2657,6 +2803,13 @@ impl<'e, 'c> Expander<'e, 'c> {
 					BString::from(n.format_into(&mut NumBuffer::new()))
 				};
 				return self.var_value(&target, Some(key.as_slice()), false);
+			},
+			// A reference to bash code's special `RANDOM` or `SECONDS`
+			// reads it as the name does.
+			state::Deref::To { name: target, index: None } => {
+				if let Some(s) = dynvars::visible(self.k, self.cx.store, self.vp, &target)? {
+					return self.special_value(s, index, list);
+				}
 			},
 			state::Deref::To { .. } | state::Deref::Plain => {},
 		}
@@ -2760,16 +2913,21 @@ impl<'e, 'c> Expander<'e, 'c> {
 
 	/// `${!name}` / `${!a[@]}`.
 	fn indirect(&mut self, unit: &Arc<Unit>, p: &ParamIr) -> X<Val> {
-		// `${!ref}` of a nameref is the name it refers to.
+		// `${!ref}` of a nameref is the name it refers to (bash looks that
+		// variable up: a special one's value function runs).
 		if let (ParamRef::Var(name), None) = (&p.param, &p.index)
 			&& state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)?
 				.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF))
 		{
 			let name = name.clone();
 			return self.read_atom(|ex| {
-				Ok(state::lookup_declared(&ex.k.root, ex.cx.store, ex.vp, &name)?
+				let target = state::lookup_declared(&ex.k.root, ex.cx.store, ex.vp, &name)?
 					.and_then(Var::as_scalar)
-					.map_or(Val::Unset, |s| Val::Str(BString::from(s))))
+					.map(BString::from);
+				if let Some(t) = &target {
+					dynvars::look(ex.k, ex.cx, ex.vp, t, dynvars::Site::Indirect)?;
+				}
+				Ok(target.map_or(Val::Unset, Val::Str))
 			});
 		}
 		// `${!a[@]}` lists the keys; with an operator (`${!v[@]@Q}`) it is an
@@ -2780,6 +2938,7 @@ impl<'e, 'c> Expander<'e, 'c> {
 			let name = name.clone();
 			let star = matches!(p.index, Some(SubIr::Star));
 			let v = self.read_atom(|ex| {
+				dynvars::look(ex.k, ex.cx, ex.vp, &name, dynvars::Site::Keys)?;
 				if let Some(table) = dynamic_table(&name) {
 					let items = ex.hash_table(table)?.into_iter().map(|(k, _)| k).collect();
 					return Ok(Val::List { items, star });
@@ -2802,7 +2961,14 @@ impl<'e, 'c> Expander<'e, 'c> {
 			quoted:   p.quoted,
 			braced:   p.braced,
 		};
-		let target = match self.value(unit, &direct)? {
+		let v = self.value(unit, &direct)?;
+		// bash looks a special variable up once more after its value.
+		if let (ParamRef::Var(n), None) = (&p.param, &p.index)
+			&& dynvars::Special::of(n).is_some()
+		{
+			self.effect(|ex| Ok(dynvars::look(ex.k, ex.cx, ex.vp, n, dynvars::Site::Indirect)?))?;
+		}
+		let target = match v {
 			Val::Str(s) => s,
 			Val::List { items, .. } => BString::from(items.join(&b' ')),
 			// bash: an unset variable cannot be followed (`a[7]: invalid
@@ -3085,25 +3251,100 @@ fn hash_table(
 }
 
 /// bash's dynamic variables, computed on every read (`line` is `$LINENO`);
-/// `None` for any other name.
+/// `None` for any other name; for a value cell `unset` removed (a plain
+/// variable from then on, [`Kernel::cell_plain`]); and for a value cell a
+/// visible local or temporary of the name hides, which is that one's plain
+/// variable (`make_local_variable` and `assign_in_env` copy no value
+/// function), as for `RANDOM` and `SECONDS` ([`dynvars::visible`]). A
+/// value-cell variable keeps what was computed as its value, which
+/// `declare -p` and `set` list ([`dynvars::keep_cell`]).
 fn dynamic_value(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
-	vp: &Vproc,
+	vp: &mut Vproc,
+	line: u32,
+	name: &[u8],
+) -> Result<Option<DynVal>, StoreError> {
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Bash
+		&& let Some(i) = dynvars::cell_index(name)
+		&& (k.cell_plain(vp, i)
+			|| state::lookup_declared_scoped(&k.root, cx.store, vp, name)?
+				.1
+				.is_some())
+	{
+		return Ok(None);
+	}
+	let v = dynamic_compute(k, cx, vp, line, name)?;
+	if let Some(v) = &v
+		&& dynvars::cell_attrs(name).is_some()
+	{
+		dynvars::keep_cell(k, cx.store, vp, name, v.to_value())?;
+	}
+	Ok(v)
+}
+
+/// `declare -p NAME` of bash's dynamic variable `name`: its lookup (a
+/// value-cell variable keeps the result, [`dynvars::keep_cell`]), and the
+/// variable to print for one that keeps none (the call-stack arrays,
+/// `PIPESTATUS` once a command's status is recorded). `None` for another
+/// name, in zsh code, and for a value cell (its record is printed).
+///
+/// # Errors
+/// [`StoreError`] when the store cannot be read.
+pub fn look_dynamic(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	name: &[u8],
+) -> Result<Option<Var>, StoreError> {
+	if vp.mode.dialect() != crate::bash::ids::Dialect::Bash || !is_dynamic(name) {
+		return Ok(None);
+	}
+	if matches!(name, b"BASH_ARGC" | b"BASH_ARGV") {
+		super::callstack::read_base(k, cx.store, vp)?;
+	}
+	let line = super::exec::current_line(vp);
+	let v = dynamic_value(k, cx, vp, line, name)?;
+	if dynvars::cell_attrs(name).is_some() {
+		return Ok(None);
+	}
+	Ok(match v {
+		Some(v @ DynVal::List(_))
+			if !(name == b"PIPESTATUS" && matches!(&v, DynVal::List(l) if l.is_empty())) =>
+		{
+			Some(Var { attrs: Attrs::INDEXED, value: v.into_value() })
+		},
+		Some(v @ DynVal::Assoc(_)) => Some(Var { attrs: Attrs::ASSOC, value: v.into_value() }),
+		_ => None,
+	})
+}
+
+/// [`dynamic_value`] without the cell.
+fn dynamic_compute(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
 	line: u32,
 	name: &[u8],
 ) -> Result<Option<DynVal>, StoreError> {
 	Ok(Some(match name {
+		// Bash code's `RANDOM` and `SECONDS` are variables with value
+		// functions: [`Expander::var_value`] reads them while they are
+		// special ([`dynvars`]); after `unset` or an array assignment, or
+		// with a local or temporary of the name in scope, they are plain.
+		b"RANDOM" | b"SECONDS" if vp.mode.dialect() == crate::bash::ids::Dialect::Bash => {
+			return Ok(None);
+		},
 		b"RANDOM" => {
-			DynVal::Str(BString::from(k.next_random(cx.store).format_into(&mut NumBuffer::new())))
+			DynVal::Str(BString::from(k.next_random(cx, vp).format_into(&mut NumBuffer::new())))
 		},
 		b"SRANDOM" => DynVal::Str(BString::from(
 			((cx.host.random() & 0xffff_ffff) as u32).format_into(&mut NumBuffer::new()),
 		)),
-		b"SECONDS" => {
-			let s = cx.host.now_ns().saturating_sub(k.start_ns) / 1_000_000_000;
-			DynVal::Str(BString::from(s.format_into(&mut NumBuffer::new())))
-		},
+		b"SECONDS" => DynVal::Str(BString::from(
+			k.seconds_now(vp, cx.host.now_ns())
+				.format_into(&mut NumBuffer::new()),
+		)),
 		b"EPOCHSECONDS" => {
 			DynVal::Str(BString::from(cx.host.wall().secs.format_into(&mut NumBuffer::new())))
 		},
@@ -3183,6 +3424,35 @@ enum DynVal {
 	List(Vec<BString>),
 	/// `(key, value)` pairs in bash's hash-table order.
 	Assoc(Vec<(BString, BString)>),
+}
+
+impl DynVal {
+	/// The value as a variable holds it.
+	fn into_value(self) -> VarValue {
+		match self {
+			Self::Str(s) => VarValue::Str(s),
+			Self::List(items) => {
+				VarValue::Indexed(items.into_iter().zip(0i64..).map(|(v, i)| (i, v)).collect())
+			},
+			Self::Assoc(pairs) => VarValue::Assoc(pairs.into_iter().collect()),
+		}
+	}
+
+	/// [`Self::into_value`] of a copy.
+	fn to_value(&self) -> VarValue {
+		match self {
+			Self::Str(s) => VarValue::Str(s.clone()),
+			Self::List(items) => VarValue::Indexed(
+				items
+					.iter()
+					.cloned()
+					.zip(0i64..)
+					.map(|(v, i)| (i, v))
+					.collect(),
+			),
+			Self::Assoc(pairs) => VarValue::Assoc(pairs.iter().cloned().collect()),
+		}
+	}
 }
 
 /// The dynamic associative arrays: the table each one shows.
@@ -3586,6 +3856,83 @@ pub struct CompoundElem {
 	pub append: bool,
 	/// The value (one word of an unkeyed element).
 	pub value:  BString,
+}
+
+/// Whether bash re-parses text of `p` through its reader as it expands it,
+/// whether or not it expands that text: `extract_dollar_brace_string` hands
+/// each `$( )`, `${ ;}`, `${| ;}`, `<( )` and `>( )` of the `${ … }` to
+/// `xparse_dolparen`, and each `$( )` of `$(( ))` text through
+/// `extract_delimited_string`, at any depth of nested parameters; a
+/// backquote and `$(( ))` text without one are not ([`Part::Comsub`]'s
+/// `text`). So a job is reported before an operand bash does not expand
+/// (`${x:-$( )}` with `x` set).
+fn param_reparsed(unit: &Unit, p: &ParamIr) -> bool {
+	let index = match p.index {
+		Some(SubIr::Expr(w)) => Some(w),
+		_ => None,
+	};
+	let words: [Option<u32>; 2] = match &p.op {
+		OpIr::Default { word, .. } | OpIr::Assign { word, .. } | OpIr::Alt { word, .. } => {
+			[Some(*word), None]
+		},
+		OpIr::Error { word, .. } => [*word, None],
+		OpIr::Trim { pat, .. } => [Some(*pat), None],
+		OpIr::Replace { pat, rep, .. } => [Some(*pat), *rep],
+		OpIr::Case { pat, .. } => [*pat, None],
+		OpIr::None
+		| OpIr::Length
+		| OpIr::Indirect
+		| OpIr::PrefixNames { .. }
+		| OpIr::Substr { .. }
+		| OpIr::Transform(_) => [None, None],
+	};
+	std::iter::once(index)
+		.chain(words)
+		.flatten()
+		.any(|w| word_reparsed(unit, w))
+}
+
+/// Whether word `w` of `unit` holds text bash re-parses ([`param_reparsed`]).
+fn word_reparsed(unit: &Unit, w: u32) -> bool {
+	unit.words.get(w as usize).is_some_and(|word| {
+		word.parts.iter().any(|part| match part {
+			Part::Comsub { text: Some(_), .. } | Part::ProcSub { .. } => true,
+			Part::Arith { text, .. } => arith_reparsed(text),
+			Part::Param(inner) => param_reparsed(unit, inner),
+			_ => false,
+		})
+	})
+}
+
+/// Whether `$(( ))` text `text` holds a `$( )`, `${ ;}` or `${| ;}`, which
+/// bash re-parses as it extracts the text (`extract_delimited_string`'s
+/// `SX_COMMAND` case); a backslash quotes the next byte, single quotes their
+/// text.
+fn arith_reparsed(text: &[u8]) -> bool {
+	let mut i = 0;
+	while let Some(&c) = text.get(i) {
+		match c {
+			b'\\' => i += 2,
+			b'\'' => {
+				i += 1
+					+ text[i + 1..]
+						.iter()
+						.position(|&b| b == b'\'')
+						.map_or(text.len(), |n| n + 1);
+			},
+			b'$' => {
+				match (text.get(i + 1), text.get(i + 2)) {
+					(Some(b'('), Some(b'(')) => {},
+					(Some(b'('), _) => return true,
+					(Some(b'{'), Some(b' ' | b'\t' | b'\n' | b'|')) => return true,
+					_ => {},
+				}
+				i += 1;
+			},
+			_ => i += 1,
+		}
+	}
+	false
 }
 
 /// The `(…)` text a declaration builtin re-reads: each value (and key)
@@ -4011,15 +4358,55 @@ fn lone_param(w: &Word) -> Option<&ParamIr> {
 	}
 }
 
+/// An indexed array subscript's arithmetic error is a subscript error, as
+/// bash's `array_expand_index` treats it: the same text, but bash runs
+/// `top_level_cleanup` before it jumps ([`Diag::ArithSubscript`]).
+fn subscript_error(e: Stop) -> Stop {
+	match e {
+		Stop::Fail(Diag::Arith { expr, msg, token }) => {
+			Stop::Fail(Diag::ArithSubscript { expr, msg, token })
+		},
+		Stop::Fatal(Diag::Arith { expr, msg, token }) => {
+			Stop::Fatal(Diag::ArithSubscript { expr, msg, token })
+		},
+		other => other,
+	}
+}
+
 /// Evaluate already-expanded arithmetic text (`let`, `declare -i`
-/// values, array subscripts set by builtins).
+/// values, array subscripts set by builtins). Under
+/// [`Ctx::arith_once`](super::builtins::Ctx::arith_once) a run again takes
+/// the first run's result instead, so the text's own assignments
+/// (`w++`) and `RANDOM` draws happen once; a result the first run did
+/// not reach (an error) is evaluated.
 pub fn arith_value(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
 	vp: &mut Vproc,
 	text: &[u8],
 ) -> Result<i64, Diag> {
-	let mut env = Vars { k, cx, vp, prefix: None, expanded: false };
+	let Some(replay) = k.arith_replay.as_mut().filter(|r| !r.inside) else {
+		return arith_eval(k, cx, vp, text);
+	};
+	if let Some(&n) = replay.values.get(replay.next) {
+		replay.next += 1;
+		return Ok(n);
+	}
+	replay.inside = true;
+	let res = arith_eval(k, cx, vp, text);
+	if let Some(replay) = k.arith_replay.as_mut() {
+		replay.inside = false;
+		if let Ok(n) = res {
+			replay.values.push(n);
+			replay.next += 1;
+		}
+	}
+	res
+}
+
+fn arith_eval(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, text: &[u8]) -> Result<i64, Diag> {
+	let mut env =
+		Vars { k, cx, vp, prefix: None, expanded: false, element: dynvars::Site::ArithElement };
 	arith::eval(text, &mut env).map_err(Diag::from)
 }
 
@@ -4086,6 +4473,7 @@ pub fn compound_string(
 	text: &[u8],
 	assoc: bool,
 ) -> Result<Vec<CompoundElem>, Stop> {
+	super::killed::reparsed(k, cx, vp, line);
 	let mode = super::exec::mode_of(vp);
 	let unit = k
 		.engine
@@ -4127,7 +4515,8 @@ pub fn arith_command(
 	vp: &mut Vproc,
 	text: &[u8],
 ) -> Result<i64, Diag> {
-	let mut env = Vars { k, cx, vp, prefix: Some("(("), expanded: false };
+	let mut env =
+		Vars { k, cx, vp, prefix: Some("(("), expanded: false, element: dynvars::Site::ArithElement };
 	arith::eval(text, &mut env).map_err(Diag::from)
 }
 
@@ -4141,7 +4530,7 @@ pub fn arith_let(
 	text: &[u8],
 	expanded: bool,
 ) -> Result<i64, Diag> {
-	let mut env = Vars { k, cx, vp, prefix: None, expanded };
+	let mut env = Vars { k, cx, vp, prefix: None, expanded, element: dynvars::Site::LetElement };
 	arith::eval(text, &mut env).map_err(Diag::from)
 }
 
@@ -4154,6 +4543,9 @@ struct Vars<'v, 'c> {
 	prefix:   Option<&'static str>,
 	/// The text is expanded already (`let` with `assoc_expand_once`).
 	expanded: bool,
+	/// The lookups an element assignment makes of a special variable
+	/// before it becomes a plain array: `let`'s or another evaluation's.
+	element:  dynvars::Site,
 }
 
 impl arith::Env for Vars<'_, '_> {
@@ -4235,8 +4627,13 @@ impl arith::Env for Vars<'_, '_> {
 		name: &[u8],
 		index: Option<&[u8]>,
 	) -> Result<Option<arith::Value>, arith::Error> {
-		// `$((RANDOM))`, `$((LINENO))`: dynamic variables are computed here
-		// too.
+		// Bash code's special `RANDOM` and `SECONDS` ([`dynvars`]).
+		match dynvars::visible(self.k, self.cx.store, self.vp, name) {
+			Ok(Some(s)) => return self.special_read(s, index),
+			Ok(None) => {},
+			Err(e) => return Err(self.store_failed(e)),
+		}
+		// `$((LINENO))`: dynamic variables are computed here too.
 		if is_dynamic(name) {
 			let line = super::exec::current_line(self.vp);
 			if let Ok(Some(v)) = dynamic_value(self.k, self.cx, self.vp, line, name) {
@@ -4305,6 +4702,14 @@ impl arith::Env for Vars<'_, '_> {
 			}
 			return self.unbound_checked(name, value);
 		};
+		// A reference to a special variable reads it as the name does.
+		if let state::Deref::To { name: t, index: None } = &target {
+			match dynvars::visible(self.k, self.cx.store, self.vp, t) {
+				Ok(Some(s)) => return self.special_read(s, index),
+				Ok(None) => {},
+				Err(e) => return Err(self.store_failed(e)),
+			}
+		}
 		let (name, index) = deref_target(&target, name, index);
 		let var = state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
 			.ok()
@@ -4338,6 +4743,29 @@ impl arith::Env for Vars<'_, '_> {
 		};
 		let mut buf = NumBuffer::new();
 		let text = value.format_into(&mut buf).as_bytes();
+		// bash's arithmetic assignment is `bind_int_variable`: it looks a
+		// special `RANDOM` or `SECONDS` up first (through a reference
+		// twice), then runs its assignment function as `NAME=` does; an
+		// element makes it a plain array first ([`dynvars`]).
+		let special = match dynvars::visible(self.k, self.cx.store, self.vp, name) {
+			Ok(s) => s.is_some(),
+			Err(e) => return Err(self.store_failed(e)),
+		};
+		if special {
+			let res = if index.is_some() {
+				dynvars::to_plain(self.k, self.cx, self.vp, name, Some(self.element))
+			} else {
+				let site = if matches!(target, state::Deref::To { .. }) {
+					dynvars::Site::NamerefAssign
+				} else {
+					dynvars::Site::ArithAssign
+				};
+				dynvars::look(self.k, self.cx, self.vp, name, site)
+			};
+			if let Err(e) = res {
+				return Err(self.store_failed(e));
+			}
+		}
 		let cur = state::lookup_declared(&self.k.root, self.cx.store, self.vp, name)
 			.ok()
 			.flatten();
@@ -4352,6 +4780,14 @@ impl arith::Env for Vars<'_, '_> {
 				.is_some_and(|v| v.attrs.contains(Attrs::NAMEREF) && v.attrs.contains(Attrs::INVISIBLE))
 		{
 			arith::Env::warn(self, Diag::InvalidIdent { name: BString::from(text) });
+			return Ok(());
+		}
+		if special && index.is_none() {
+			let lhs = super::builtins::Lhs { name, index: None, append: false };
+			let value = super::proc::AssignValue::Scalar(BString::from(text));
+			super::builtins::set_value(self.k, self.cx, self.vp, lhs, value, Level::Dynamic)
+				.map_err(|d| arith::Error::Expand { diag: Box::new(d) })?;
+			super::builtins::emit_assignment(self.k, self.cx, self.vp, name, Level::Dynamic);
 			return Ok(());
 		}
 		// A negative index counts back from the end of an indexed array; a
@@ -4579,6 +5015,39 @@ fn assign_number(var: &mut Var, index: Option<&[u8]>, text: &[u8]) {
 }
 
 impl Vars<'_, '_> {
+	/// A read of bash code's special `RANDOM` or `SECONDS` in arithmetic:
+	/// one lookup, an element's one more first
+	/// ([`dynvars::Site::ArithElementRead`]); element 0 is the value,
+	/// another is unset.
+	fn special_read(
+		&mut self,
+		s: dynvars::Special,
+		index: Option<&[u8]>,
+	) -> Result<Option<arith::Value>, arith::Error> {
+		let before = if index.is_some() {
+			dynvars::Site::ArithElementRead.lookups()
+		} else {
+			0
+		};
+		let mut value = 0;
+		for _ in 0..=before {
+			value = match dynvars::lookup(self.k, self.cx, self.vp, s) {
+				Ok(v) => v,
+				Err(e) => return Err(self.store_failed(e)),
+			};
+		}
+		let value = index
+			.is_none_or(|i| i == b"0")
+			.then_some(arith::Value::Number(value));
+		self.unbound_checked(s.name(), value)
+	}
+
+	/// A failed store: the kernel takes the error, the evaluation fails.
+	fn store_failed(&mut self, e: StoreError) -> arith::Error {
+		self.k.fail(e);
+		arith::Error::Expand { diag: Box::new(Diag::StoreFailed) }
+	}
+
 	/// `value` as [`arith::Env::get`] returns it: an unset one is an error
 	/// under `set -u`, naming `name` (bash names the array for an unset
 	/// element).
@@ -4621,7 +5090,7 @@ impl Vars<'_, '_> {
 pub fn dynamic_elements(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
-	vp: &Vproc,
+	vp: &mut Vproc,
 	name: &[u8],
 ) -> Result<Option<(Vec<BString>, bool)>, StoreError> {
 	let line = super::exec::current_line(vp);

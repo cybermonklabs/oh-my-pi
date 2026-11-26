@@ -124,6 +124,7 @@ const OPTION_COMPARES = {
 	skipPythonPreflight: "flag",
 	enableMCP: "data",
 	mountedToolNames: "data",
+	exclusiveRetryFallbackRole: "data",
 	// Replaced at a revive by the stored model.
 	modelPattern: "data",
 	modelPatternAuthFallback: "data",
@@ -131,7 +132,7 @@ const OPTION_COMPARES = {
 	modelPatternDefaultFallbackChain: "data",
 	modelPatternChainFallback: "flag",
 	taskEffort: "data",
-	// Derived from the stored per-call flag.
+	// Derived from the stored per-call flag, and server-side fallback from the stored hold too.
 	disableModelFallback: "flag",
 	disableServerSideFallback: "flag",
 	// Set at a cold revive only, to the cwd of the session its live inputs come from (the live parent, else the root)

@@ -268,18 +268,29 @@ pub struct Scope {
 	pub zsh:        Option<Box<ZshScope>>,
 }
 
-impl Random {
-	/// The generator as [`MiscKey::Random`] stores it: `seed:last`.
-	pub fn encode(self) -> BString {
-		BString::from(format!("{}:{}", self.seed, self.last))
+/// The shell's generator as [`MiscKey::Random`] stores it: `seed:last`, and
+/// `:plain` once bash code removed `RANDOM`'s special meaning
+/// (`Kernel::random_plain`).
+pub fn random_record(rand: Random, plain: bool) -> BString {
+	let mut s = BString::from(format!("{}:{}", rand.seed, rand.last));
+	if plain {
+		s.extend_from_slice(b":plain");
 	}
+	s
+}
 
-	/// A generator from [`Random::encode`]'s text.
-	pub fn decode(text: &[u8]) -> Option<Self> {
-		let text = std::str::from_utf8(text).ok()?;
-		let (seed, last) = text.split_once(':')?;
-		Some(Self { seed: seed.parse().ok()?, last: last.parse().ok()? })
-	}
+/// The generator and the plain flag from [`random_record`]'s text.
+pub fn parse_random_record(text: &[u8]) -> Option<(Random, bool)> {
+	let text = std::str::from_utf8(text).ok()?;
+	let mut parts = text.splitn(3, ':');
+	let seed = parts.next()?.parse().ok()?;
+	let last = parts.next()?.parse().ok()?;
+	let plain = match parts.next() {
+		None => false,
+		Some("plain") => true,
+		Some(_) => return None,
+	};
+	Some((Random { seed, last }, plain))
 }
 
 /// What the engine derives from the root state in the store. Kept exact by
@@ -347,6 +358,10 @@ pub struct Root {
 	synced:            Synced,
 	/// zsh's history events as last written (mirrors their store record).
 	pub hist_events:   parking_lot::Mutex<super::builtins::history::model::EventsCache>,
+	/// The engine's platform ([`crate::bash::EngineConfig::platform`]), for
+	/// code that holds the root but not the kernel (a zsh function's trap
+	/// scope ending as its frame pops names its `TRAPNAL` functions by it).
+	platform:          crate::bash::ids::Platform,
 }
 
 /// The root vproc's fields the interpreter updates in place (`vp.status = …`
@@ -491,6 +506,16 @@ impl Root {
 	/// The store epoch these facts were derived at.
 	pub const fn epoch(&self) -> u64 {
 		self.epoch
+	}
+
+	/// The engine's platform ([`Self::set_platform`]).
+	pub const fn platform(&self) -> crate::bash::ids::Platform {
+		self.platform
+	}
+
+	/// Record the engine's platform (the kernel does, as it starts).
+	pub const fn set_platform(&mut self, platform: crate::bash::ids::Platform) {
+		self.platform = platform;
 	}
 
 	/// Write the lazy empty scopes ([`Self::lazy`]) as store records: before
@@ -1026,6 +1051,21 @@ fn var_at<'a>(
 	})
 }
 
+/// Whether an assignment to `name` at `level` sets `vp`'s global variable
+/// (no local or temporary scope of `vp`'s takes it).
+///
+/// # Errors
+/// [`StoreError`] when the store cannot be read.
+pub fn assigns_global(
+	root: &Root,
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	name: &[u8],
+	level: Level,
+) -> Result<bool, StoreError> {
+	Ok(level_at(root, store, vp, name, level)?.is_none())
+}
+
 /// Where an assignment to `name` at `level` lands among `vp`'s scopes;
 /// `None`: its global state.
 #[inline]
@@ -1055,7 +1095,7 @@ fn level_at(
 }
 
 /// Where an assignment lands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Level {
 	/// The innermost scope that declares the name, else global.
 	Dynamic,
@@ -2745,6 +2785,47 @@ pub fn scope_unbind(
 	}
 }
 
+/// Whether the scope an assignment to `name` at `level` lands in binds it,
+/// set or declared but unset; `None`: such an assignment lands in the
+/// global state, which has no declared-but-unset binding.
+///
+/// # Errors
+/// [`StoreError`] when the store cannot be read.
+pub fn binds_at(
+	root: &Root,
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	name: &[u8],
+	level: Level,
+) -> Result<Option<bool>, StoreError> {
+	Ok(match level_at(root, store, vp, name, level)? {
+		Some(In::Vec(i)) => Some(vp.scopes.get(i).is_some_and(|s| s.vars.contains_key(name))),
+		Some(In::Store(depth)) => Some(store.get(local_key(depth, name))?.is_some()),
+		None => None,
+	})
+}
+
+/// Remove `name`'s binding where an assignment at `level` lands: from the
+/// scope, so it is no longer declared there, or unset in the global state.
+pub fn unbind_at(
+	root: &mut Root,
+	store: &mut dyn StateStore,
+	vp: &mut Vproc,
+	name: &[u8],
+	level: Level,
+) {
+	match level_at(root, store, vp, name, level) {
+		Ok(Some(In::Vec(i))) => {
+			if let Some(s) = vp.scopes.get_mut(i) {
+				s.vars.remove(name);
+			}
+		},
+		Ok(Some(In::Store(depth))) => root.write(store, Change::Del(local_key(depth, name))),
+		Ok(None) => put_outer(root, store, vp, name, None),
+		Err(err) => root.fail(err),
+	}
+}
+
 /// Remove every binding of scope `i` of `vp`.
 pub fn scope_clear(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc, i: usize) {
 	match scope_in(vp, i) {
@@ -3015,7 +3096,11 @@ fn decode_rlimits(words: &[BString]) -> Vec<(Rlimit, Option<u64>, Option<u64>)> 
 /// Write the root job table's changes since the last sync: each job is
 /// compared with its store record (the store holds what was written last,
 /// so the engine keeps no copy of the table), jobs gone from the table are
-/// deleted.
+/// deleted. A job's facts ([`Job::facts`]) are a record of their own,
+/// written with the job's record when it changes, and when they change
+/// without it (a pipeline's processes start and end while the job runs,
+/// [`Job::procs`]): those of a job that has any are compared with their
+/// record too. A job's facts never go, so one without any has none written.
 fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	let mut ids = std::mem::take(&mut root.synced.job_ids);
 	let same_ids =
@@ -3024,6 +3109,7 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 		for id in &ids {
 			if !jobs.list.iter().any(|j| j.id == *id) {
 				root.write(store, Change::Del(Key::Job(*id)));
+				root.write(store, Change::Del(Key::JobFacts(*id)));
 			}
 		}
 		ids.clear();
@@ -3032,7 +3118,7 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 	root.synced.job_ids = ids;
 	for job in &jobs.list {
 		let written = match store.get(Key::Job(job.id)) {
-			Ok(Some(Record::Job(have))) => have == job,
+			Ok(Some(Record::Job(have))) => job.same_record(have),
 			Ok(_) => false,
 			Err(err) => {
 				root.fail(err);
@@ -3040,7 +3126,32 @@ fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
 			},
 		};
 		if !written {
-			root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.clone())));
+			root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.record())));
+		}
+		let facts_written = if !written {
+			false
+		} else if !job.has_facts() {
+			true
+		} else {
+			match store.get(Key::JobFacts(job.id)) {
+				Ok(Some(Record::JobFacts(have))) => job.same_facts(have),
+				Ok(_) => false,
+				Err(err) => {
+					root.fail(err);
+					return;
+				},
+			}
+		};
+		if !facts_written {
+			let facts = job.facts();
+			root.write(
+				store,
+				if facts.is_empty() {
+					Change::Del(Key::JobFacts(job.id))
+				} else {
+					Change::Put(Key::JobFacts(job.id), Record::JobFacts(facts))
+				},
+			);
 		}
 	}
 	let (current, previous, chld) = root.synced.job_marks;
@@ -3188,6 +3299,13 @@ pub fn load_root(
 			list.push(job.clone());
 		}
 	})?;
+	store.scan(Table::JobFacts, &mut |key, rec| {
+		if let (Key::JobFacts(id), Record::JobFacts(facts)) = (key, rec)
+			&& let Some(job) = list.iter_mut().find(|j| j.id == id)
+		{
+			job.set_facts(facts);
+		}
+	})?;
 	list.sort_by_key(|j| j.number);
 	let mut bgp = Vec::new();
 	store.scan(Table::BgPid, &mut |key, rec| {
@@ -3212,6 +3330,7 @@ pub fn load_root(
 			.and_then(|s| parse(&s))
 			.unwrap_or(0),
 		subshell: false,
+		comsub: super::proc::Comsub::No,
 		bgp,
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);
@@ -3279,15 +3398,17 @@ mod tests {
 	}
 
 	#[test]
-	fn random_state_round_trips_through_its_text() {
+	fn random_state_round_trips_through_its_record() {
 		let mut r = Random::default();
 		r.seed(42);
 		r.next();
-		let mut back = Random::decode(&r.encode()).unwrap();
-		assert_eq!(back, r);
+		let (mut back, plain) = parse_random_record(&random_record(r, false)).unwrap();
+		assert_eq!((back, plain), (r, false));
 		assert_eq!(back.next(), 26794, "continues the sequence");
-		assert_eq!(Random::decode(b"7"), None);
-		assert_eq!(Random::decode(b"x:1"), None);
+		assert_eq!(parse_random_record(&random_record(r, true)), Some((r, true)));
+		assert_eq!(parse_random_record(b"7"), None);
+		assert_eq!(parse_random_record(b"x:1"), None);
+		assert_eq!(parse_random_record(b"1:2:other"), None);
 	}
 
 	// Golden: 2100 keys `k1`…`k2100` grow bash's table (1024 → 4096 buckets).

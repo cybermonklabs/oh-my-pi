@@ -47,23 +47,21 @@ export function extractMessagesFrom(entries: readonly SessionEntry[], from: numb
 	return messages;
 }
 
+/** A message {@link extractMessages} keeps, with the id of the session entry it came from. */
+export interface HindsightMessageEntry {
+	entryId: string;
+	message: HindsightMessage;
+}
+
 /**
- * `sliceLastTurnsByUserBoundary(extractMessages(sessionManager), turns)`, read
- * from the newest entry back to the `turns`-th last user turn, so the entries
- * before that turn are not read.
+ * The message {@link extractMessages} keeps from `entries[index]`, with that entry's id;
+ * undefined for an entry it leaves out. Reads no other entry, so a reader walking back
+ * from the newest entry reads only the entries it reaches.
  */
-export function extractLastTurns(sessionManager: ReadonlySessionManagerLike, turns: number): HindsightMessage[] {
-	if (turns <= 0) return [];
-	const entries = sessionManager.getEntries();
-	const messages: HindsightMessage[] = [];
-	let userTurns = 0;
-	for (let index = entries.length - 1; index >= 0 && userTurns < turns; index--) {
-		const message = toHindsightMessage(entries[index]!);
-		if (!message) continue;
-		messages.push(message);
-		if (message.role === "user") userTurns++;
-	}
-	return messages.reverse();
+export function messageEntryAt(entries: readonly SessionEntry[], index: number): HindsightMessageEntry | undefined {
+	const entry = entries[index]!;
+	const message = toHindsightMessage(entry);
+	return message ? { entryId: entry.id, message } : undefined;
 }
 
 function toHindsightMessage(entry: SessionEntry): HindsightMessage | undefined {

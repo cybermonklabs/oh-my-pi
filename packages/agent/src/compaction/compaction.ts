@@ -32,7 +32,10 @@ import type { OpenAICodexCompactionBody } from "@oh-my-pi/pi-ai/providers/openai
 import type { InputItem as CodexInputItem } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
 import { buildResponsesInput, resolveOpenAICompatPolicy } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { isSurvivingAssistant } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import { stripOpenAIResponsesOutputOnlyStatusesForReplay } from "@oh-my-pi/pi-ai/utils";
+import {
+	stripOpenAIResponsesCreatedByForReplay,
+	stripOpenAIResponsesOutputOnlyStatusesForReplay,
+} from "@oh-my-pi/pi-ai/utils";
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
@@ -1730,8 +1733,10 @@ function buildOpenAiResponsesCompactionInput(
 		}
 		nativeInput.push(item);
 	}
+	// The stored history holds the previous compaction's output item as the API sent it.
+	const previousInput = previousReplacementHistory?.map(stripOpenAIResponsesCreatedByForReplay);
 	return stripOpenAIResponsesOutputOnlyStatusesForReplay(
-		previousReplacementHistory ? [...previousReplacementHistory, ...nativeInput] : nativeInput,
+		previousInput ? [...previousInput, ...nativeInput] : nativeInput,
 	);
 }
 

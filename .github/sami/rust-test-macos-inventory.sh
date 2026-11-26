@@ -6,21 +6,27 @@
 #     "macos")]`);
 #   - the tests .github/sami/rust-test-macos.txt names, which are #[ignore]d
 #     on other targets.
-# A target with no Linux listing did not build on Linux (the Linux job fails
-# for every target with no result). It is UNKNOWN here: which of its tests
-# only macOS compiles cannot be told, so none of them is taken (running them
-# all would run its Linux tests on macOS and read their failures as macOS
-# ones). The inventory then still lists every other target, writes
-# complete=true to GITHUB_OUTPUT so the job runs the tests it lists, and
-# exits 1, naming each UNKNOWN target.
+# The Linux listings are the early ones the cut checks' build job writes
+# from its cargo test binaries and, for a Bazel-only target, a Linux Bazel
+# build (.github/sami/rust-test-early-listings.sh): every rust_test target or
+# that step fails, and this job does not run. sami-checks.yml's
+# rust-test-drift job compares them with rust_test's own Bazel listings
+# (rust-test-listings-drift.sh) and fails rust_test's row for any difference,
+# since this inventory was then made from a wrong one.
+# A target with no Linux listing (listings from another tree) is UNKNOWN
+# here: which of its tests only macOS compiles cannot be told, so none of them
+# is taken (running them all would run its Linux tests on macOS and read their
+# failures as macOS ones). The inventory then still lists every other target,
+# writes complete=true to GITHUB_OUTPUT so the job runs the tests it lists,
+# and exits 1, naming each UNKNOWN target.
 # It builds every Bazel test target under //crates for macOS, lists each
-# rust_test binary, and compares it with the Linux job's listing of the same
-# target (rust-test.sh leaves them, with index.tsv, in its listings
-# directory). It fails when the Linux listings are missing, when a target
-# fails to build for macOS or has no macOS binary (a compile error only macOS
-# sees would otherwise drop its tests unseen), when a test
-# rust-test-macos.txt names is in no macOS binary's listing, and when no
-# macOS binary could be listed; those leave no complete=true.
+# rust_test binary (listing_names, as the Linux listings are read), and
+# compares it with the Linux listing of the same target. It fails when the
+# Linux listings are missing, when a target fails to build for macOS or has
+# no macOS binary (a compile error only macOS sees would otherwise drop its
+# tests unseen), when a test rust-test-macos.txt names is in no macOS
+# binary's listing, and when no macOS binary could be listed; those leave no
+# complete=true.
 # Usage: rust-test-macos-inventory.sh <Linux listings directory> <output list>
 #   OMP_BAZEL_RC   the bazelrc fragment .github/actions/bazel-cache wrote
 set -euo pipefail
@@ -39,6 +45,8 @@ stop() {
 	echo "::error title=macOS inventory::$1"
 	exit 1
 }
+# shellcheck source=.github/sami/rust-test-targets.sh
+. "$(dirname "${BASH_SOURCE[0]}")/rust-test-targets.sh"
 count() { awk 'END { print NR }' "$1"; }
 
 [ -s "$linux/index.tsv" ] || stop "UNKNOWN: $linux/index.tsv is missing or empty, so no Linux listing can be compared"
@@ -70,7 +78,7 @@ while read -r label; do
 		stop "$label has no macOS binary at $bin, though bazel build passed: its tests cannot be listed"
 	fi
 	"$bin" --list >"$tmp/raw" || stop "$label's macOS binary $bin cannot list its tests"
-	sed -n -e 's/: test$//p' -e 's/: benchmark$//p' "$tmp/raw" | LC_ALL=C sort -u >"$tmp/mac.txt"
+	listing_names "$tmp/raw" >"$tmp/mac.txt"
 	listed=$((listed + 1))
 	while read -r name; do mac_listed["$label"$'\t'"$name"]=1; done <"$tmp/mac.txt"
 	if [ -n "${linux_listing[$label]:-}" ]; then

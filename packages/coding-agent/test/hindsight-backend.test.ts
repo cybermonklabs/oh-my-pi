@@ -15,7 +15,9 @@ import {
 	rebindMemoryBackendForCwd,
 	reloadMentalModelsForSession,
 } from "@oh-my-pi/pi-coding-agent/hindsight/backend";
+import { hindsightRecallScope } from "@oh-my-pi/pi-coding-agent/hindsight/bank";
 import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
+import { loadHindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import { HindsightRetainQueue, type HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
 import type { AgentSessionEventListener } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -749,6 +751,94 @@ describe("hindsightBackend live bank routing", () => {
 		expect(session.withdrawMemoryRecall).not.toHaveBeenCalled();
 	});
 
+	// A key in `hindsight.apiUrl` (its userinfo or a query parameter) reaches the server with each request, so a
+	// running session whose key changes installs a new client. A recorded recall names the server without the key
+	// (`hindsightRecordedServer`), so its scope stays the same. The two server names differ in one call: these tests
+	// fail if `hindsightServer` drops the key, or if the recorded scope keeps it.
+	describe("with a key in hindsight.apiUrl", () => {
+		function keyedApiUrl(user: string, password: string, key: string): string {
+			const url = new URL("http://localhost:8888/");
+			url.username = user;
+			url.password = password;
+			url.searchParams.set("key", key);
+			return url.href;
+		}
+
+		/** A session started with a keyed `hindsight.apiUrl`, and the state it installed. */
+		interface KeyedRun {
+			settings: Settings;
+			session: { getHindsightSessionState(): HindsightSessionState | undefined; withdrawMemoryRecall: unknown };
+			initial: HindsightSessionState | undefined;
+		}
+
+		async function startWith(url: string): Promise<KeyedRun> {
+			vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({} as never);
+			const settings = Settings.isolated({ "memory.backend": "hindsight" });
+			cfgHindsightApiUrl.set(settings, url);
+			const session = makeFakeSession({ sessionId: "s-url-key", settings });
+			await hindsightBackend.start({
+				session: session as never,
+				settings,
+				modelRegistry: {} as never,
+				agentDir: "/tmp",
+				taskDepth: 0,
+			});
+			const initial = session.getHindsightSessionState();
+			expect(initial).toBeDefined();
+			return { settings, session, initial };
+		}
+
+		async function moveTo(run: KeyedRun, url: string): Promise<HindsightSessionState | undefined> {
+			cfgHindsightApiUrl.set(run.settings, url);
+			await hindsightBackend.applySettings!(run.session as never, ["hindsight.apiUrl"]);
+			return run.session.getHindsightSessionState();
+		}
+
+		it("installs a new client when only the query key changes", async () => {
+			const run = await startWith(keyedApiUrl("hs-user", "hs-url-secret", "hs-query-secret"));
+			const next = await moveTo(run, keyedApiUrl("hs-user", "hs-url-secret", "hs-query-other"));
+			expect(next).toBeDefined();
+			expect(next).not.toBe(run.initial);
+		});
+
+		it("installs a new client when only the userinfo password changes", async () => {
+			const run = await startWith(keyedApiUrl("hs-user", "hs-url-secret", "hs-query-secret"));
+			const next = await moveTo(run, keyedApiUrl("hs-user", "hs-url-other", "hs-query-secret"));
+			expect(next).toBeDefined();
+			expect(next).not.toBe(run.initial);
+		});
+
+		it("keeps the client when the URL is respelled with the same key", async () => {
+			const original = keyedApiUrl("hs-user", "hs-url-secret", "hs-query-secret");
+			const run = await startWith(original);
+			// The same server and key, with the scheme and host in capitals and the default path dropped.
+			const respelled = original.replace("http://", "HTTP://").replace("@localhost:8888/", "@LocalHost:8888");
+			expect(respelled).not.toBe(original);
+			expect(await moveTo(run, respelled)).toBe(run.initial);
+			expect(run.session.withdrawMemoryRecall).not.toHaveBeenCalled();
+		});
+
+		it("records a recall scope that holds no key and is the same under another key", () => {
+			const scope = { bankId: "omp", recallTags: undefined, recallTagsMatch: undefined };
+			const configOf = (url: string) => {
+				const settings = Settings.isolated({ "memory.backend": "hindsight" });
+				cfgHindsightApiUrl.set(settings, url);
+				return loadHindsightConfig(settings);
+			};
+			const first = hindsightRecallScope(
+				configOf(keyedApiUrl("hs-user", "hs-url-secret", "hs-query-secret")),
+				scope,
+			);
+			const second = hindsightRecallScope(configOf(keyedApiUrl("other", "other-secret", "other-key")), scope);
+			const plain = hindsightRecallScope(configOf("http://localhost:8888"), scope);
+			for (const secret of ["hs-user", "hs-url-secret", "hs-query-secret"]) expect(first).not.toContain(secret);
+			expect(first).toBe(second);
+			expect(first).toBe(plain);
+			// Another server is another scope.
+			expect(hindsightRecallScope(configOf("http://elsewhere:8888"), scope)).not.toBe(plain);
+		});
+	});
+
 	it("applies a mid-session recall budget change to the next recall", async () => {
 		const recallSpy = vi.spyOn(HindsightApi.prototype, "recall").mockResolvedValue({ results: [] } as never);
 		const settings = Settings.isolated({
@@ -958,6 +1048,9 @@ describe("hindsightBackend live bank routing", () => {
 });
 
 describe("hindsightBackend cwd rebind", () => {
+	// Every move here starts from a running Hindsight state.
+	const hindsightRan = { memoryRan: true };
+
 	beforeEach(() => {
 		resetSettingsForTest();
 	});
@@ -988,7 +1081,7 @@ describe("hindsightBackend cwd rebind", () => {
 		expect(session.getHindsightSessionState()?.bankId).toBe("omp-source");
 
 		deps.cwd = "/work/destination";
-		await rebindMemoryBackendForCwd(session as never);
+		await rebindMemoryBackendForCwd(session as never, hindsightRan);
 
 		const next = session.getHindsightSessionState();
 		expect(next?.bankId).toBe("omp-destination");
@@ -1029,7 +1122,7 @@ describe("hindsightBackend cwd rebind", () => {
 			expect(createBank).toHaveBeenCalledTimes(1);
 
 			missionSetting.override(settings, "destination mission");
-			await rebindMemoryBackendForCwd(session as never);
+			await rebindMemoryBackendForCwd(session as never, hindsightRan);
 			const rebound = session.getHindsightSessionState();
 			if (!rebound) throw new Error("Hindsight fixture lost its state");
 			await rebound.enqueueRetain("call-rebound", [{ content: "destination fact" }]);
@@ -1082,7 +1175,7 @@ describe("hindsightBackend cwd rebind", () => {
 		const secondEdit = hindsightBackend.applySettings!(session as never, ["hindsight.bankId"]);
 		gate.resolve();
 
-		await rebindMemoryBackendForCwd(session as never);
+		await rebindMemoryBackendForCwd(session as never, hindsightRan);
 
 		await Promise.all([firstEdit, secondEdit]);
 		expect(session.getHindsightSessionState()?.bankId).toBe("second");
@@ -1101,7 +1194,7 @@ describe("hindsightBackend cwd rebind", () => {
 			);
 			return settledState;
 		});
-		await rebindMemoryBackendForCwd(session as never);
+		await rebindMemoryBackendForCwd(session as never, hindsightRan);
 		expect(session.getHindsightSessionState()?.bankId).toBe("third");
 		await thirdEdit;
 		session.getHindsightSessionState()?.dispose();
@@ -1143,7 +1236,7 @@ describe("hindsightBackend cwd rebind", () => {
 			await parked.promise;
 			// Requested while the doomed attempt is still in flight, so it
 			// coalesces onto the same task; the retry clears the failure for both.
-			const move = rebindMemoryBackendForCwd(session as never);
+			const move = rebindMemoryBackendForCwd(session as never, hindsightRan);
 			gate.resolve();
 			await Promise.all([edit, move]);
 

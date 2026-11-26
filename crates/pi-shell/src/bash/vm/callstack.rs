@@ -233,8 +233,8 @@ pub(crate) fn hidden_funcname_len(
 
 /// The call-stack arrays as `declare`/`set` list them (bash's real arrays):
 /// `(name, variable)` pairs, `FUNCNAME` invisible (`declare -a FUNCNAME`)
-/// outside functions. bash's `DIRSTACK` shows the value its last read left,
-/// which is empty until a script reads it: listed empty.
+/// outside functions. `DIRSTACK` is a value cell
+/// ([`super::dynvars::with_cells`]).
 ///
 /// # Errors
 ///
@@ -248,7 +248,7 @@ pub fn listed(
 		attrs: Attrs::NONE,
 		value: VarValue::Indexed(items.into_iter().zip(0i64..).map(|(v, i)| (i, v)).collect()),
 	};
-	let mut vars = Vec::with_capacity(6);
+	let mut vars = Vec::with_capacity(5);
 	// bash lists `BASH_ARGC`/`BASH_ARGV` as stored: the top-level base
 	// `get_bashargcv` adds only on a read (`declare -a BASH_ARGC=()`).
 	for name in [&b"BASH_ARGC"[..], b"BASH_ARGV"] {
@@ -258,7 +258,6 @@ pub fn listed(
 		let items = array(k, store, vp, name)?.unwrap_or_default();
 		vars.push((BString::from(name), indexed(items)));
 	}
-	vars.push((BString::from("DIRSTACK"), indexed(Vec::new())));
 	let funcname = array(k, store, vp, b"FUNCNAME")?.map_or_else(
 		|| Var { attrs: Attrs::INDEXED.with(Attrs::INVISIBLE), value: VarValue::Indexed(Vec::new()) },
 		indexed,

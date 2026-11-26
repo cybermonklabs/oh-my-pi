@@ -1320,7 +1320,7 @@ describe("agentLoop with AgentMessage", () => {
 		expect(text.toLowerCase()).toContain("provider");
 		// The provider's own words must NOT be here: `content` is replayed to the
 		// model on every later request, and a refusal quoted there gets the next
-		// turn refused too, permanently (INFRA-1191). `details.upstreamError`
+		// turn refused too, permanently. `details.upstreamError`
 		// below keeps them for the UI, telemetry and ACP.
 		expect(text).not.toContain("Codex websocket transport error: websocket closed (1000)");
 

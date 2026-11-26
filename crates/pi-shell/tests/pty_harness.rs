@@ -5,10 +5,15 @@
 #![cfg(unix)]
 
 mod pty_support;
+mod zsh_oracle;
 
-use std::{io, time::Duration};
+use std::{
+	io,
+	time::{Duration, Instant},
+};
 
-use pty_support::{Screen, Spawn, TIMEOUT, differential, have_real_zsh};
+use pi_shell::sys::proc;
+use pty_support::{Pty, Screen, Spawn, TIMEOUT, differential, have_real_zsh};
 
 #[test]
 fn the_screen_model_prints_wraps_and_erases() {
@@ -56,6 +61,30 @@ fn drives_the_real_zsh_interactively() -> io::Result<()> {
 	Ok(())
 }
 
+/// Readiness requires both non-canonical input and disabled kernel echo;
+/// otherwise a first key can be echoed before the editor draws its prompt.
+#[test]
+fn waits_until_line_editor_disables_echo() -> io::Result<()> {
+	let mut pty = Spawn::new("/bin/sh")
+		.args([
+			"-c",
+			"stty -icanon echo; printf half; read line; stty -icanon -echo; printf ready; read line; \
+			 printf 'got:%s\\n' \"$line\"",
+		])
+		.spawn()?;
+	pty.read_until("half", TIMEOUT)?;
+	let err = pty.wait_raw(Duration::from_millis(100)).unwrap_err();
+	assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+	pty.write("go\r")?;
+	pty.read_until("ready", TIMEOUT)?;
+	pty.wait_raw(TIMEOUT)?;
+	pty.write("last\r")?;
+	pty.read_until("got:last", TIMEOUT)?;
+	assert_eq!(pty.output().matches("last").count(), 1, "the kernel echoed a key");
+	assert!(pty.wait(TIMEOUT)?.success());
+	Ok(())
+}
+
 /// The same `-c` session on obash-as-zsh and the real zsh: a terminal on
 /// stdin, its size, a line read in canonical mode (echoed by the tty)
 /// leave the same screen.
@@ -88,12 +117,16 @@ fn a_resize_is_seen_by_both() -> io::Result<()> {
 	if !have_real_zsh() {
 		return Ok(());
 	}
-	let script = "read x; stty size";
+	// The first size shows the shell has started and run a child: the
+	// resize comes while it runs, not before it has seen the terminal.
+	let script = "stty size; read x; stty size";
 	let (obash, zsh) = differential(
 		Spawn::zsh().args(["-f", "-c", script]),
 		Spawn::real_zsh().args(["-f", "-c", script]),
 		|pty| {
-			pty.settle(Duration::from_millis(200), TIMEOUT)?;
+			// `stty size` reads the size once `read` returns: the resize
+			// may come before the shell even started.
+			pty.read_until("24 80", TIMEOUT)?;
 			pty.resize(30, 100)?;
 			pty.write("\r")?;
 			pty.read_until("30 100", TIMEOUT)?;
@@ -114,10 +147,30 @@ fn ctrl_c_ends_a_foreground_command_like_zsh() -> io::Result<()> {
 	let mut statuses = Vec::new();
 	for spawn in [Spawn::zsh(), Spawn::real_zsh()] {
 		let mut pty = spawn.args(["-f", "-c", "sleep 100"]).spawn()?;
-		std::thread::sleep(Duration::from_millis(300));
+		wait_for_sleep(&pty)?;
 		pty.write("\x03")?;
 		statuses.push(std::os::unix::process::ExitStatusExt::signal(&pty.wait(TIMEOUT)?));
 	}
 	assert_eq!(statuses, [Some(libc::SIGINT), Some(libc::SIGINT)]);
+	Ok(())
+}
+
+/// Wait until `sleep` has exec'd in the terminal's session (forked by the
+/// shell or exec'd in its place): `^C` then comes while the command runs,
+/// not while a shell starts. It looks 1 ms apart at first, at most 20 ms
+/// apart later.
+fn wait_for_sleep(pty: &Pty) -> io::Result<()> {
+	let deadline = Instant::now() + TIMEOUT;
+	let mut pause = Duration::from_millis(1);
+	while !proc::session_members(pty.pid())?
+		.iter()
+		.any(|p| p.name == "sleep" && p.state != proc::ProcState::Zombie)
+	{
+		if Instant::now() >= deadline {
+			return Err(io::Error::new(io::ErrorKind::TimedOut, "sleep never ran on the terminal"));
+		}
+		std::thread::sleep(pause);
+		pause = (pause * 2).min(Duration::from_millis(20));
+	}
 	Ok(())
 }
