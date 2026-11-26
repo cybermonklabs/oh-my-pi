@@ -542,6 +542,12 @@ describe("Claude history estimate", () => {
 		provider: "custom-anthropic",
 		baseUrl: "https://llm.example.com/anthropic",
 	});
+	const gatewayWithoutUnsigned = buildModel({
+		...spec,
+		provider: "model-gateway",
+		baseUrl: "https://gateway.example.com",
+		compat: { replayUnsignedThinking: false },
+	});
 	const floor = { excludeEncryptedReasoning: true };
 	const sonnet = { api: "anthropic-messages", provider: "anthropic", model: "claude-sonnet-4-6" } as const;
 
@@ -579,6 +585,15 @@ describe("Claude history estimate", () => {
 			reader: firstParty,
 			source: { api: "anthropic-messages", provider: "kimi-code", model: "k3" },
 			signature: "kimi-issued-signature",
+			carried: false,
+		},
+		// One provider id can serve Gemini on chat completions and Claude on
+		// Anthropic Messages; this host would get that thinking demoted to text.
+		{
+			name: "another model's turn on another wire of the same provider",
+			reader: gatewayWithoutUnsigned,
+			source: { api: "openai-completions", provider: "model-gateway", model: "google/gemini-3.1-pro-preview" },
+			signature: "reasoning_content",
 			carried: false,
 		},
 		// The replay strips the signature of a turn that abandoned its tool calls,
@@ -653,6 +668,45 @@ describe("Claude history estimate", () => {
 		const counted = tokenizer.countMessage(turn, floor) > toolCallOnly;
 		expect({ sent, counted }).toEqual({ sent: carried, counted: carried });
 		if (!carried) expect(tokenizer.countMessage(turn)).toBe(toolCallOnly);
+	});
+
+	test("counts none of another model's thinking for a model router, which may pick Claude", () => {
+		const router = buildModel({
+			id: "adaptive",
+			name: "Adaptive",
+			api: "devin-agent",
+			provider: "devin",
+			baseUrl: "https://server.codeium.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_000,
+			compat: { modelRouter: true },
+		});
+		const tokenizer = new Tokenizer(router);
+		const gemini: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: THINKING, thinkingSignature: "reasoning_content" }, toolCall],
+			api: "openai-completions",
+			provider: "vertex",
+			model: "google/gemini-3.1-pro-preview",
+			usage: {
+				input: 100,
+				output: 3_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 3_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 1,
+		};
+		const own: AssistantMessage = { ...gemini, api: "devin-agent", provider: "devin", model: "adaptive" };
+		const toolCallOnly = tokenizer.countMessage({ ...gemini, content: [toolCall] });
+
+		expect(tokenizer.countMessage(gemini)).toBe(toolCallOnly);
+		expect(tokenizer.countMessage(own, floor)).toBeGreaterThan(toolCallOnly + 1000);
 	});
 });
 
