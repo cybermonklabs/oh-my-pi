@@ -802,7 +802,10 @@ pub fn suspend(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, sig: Signal) -> 
 	} else {
 		end
 	};
-	let mut job = vp.child(k, cx.store, std::sync::Arc::clone(&unit), pc, vp.fds.clone());
+	// The job goes on with the shell's code: its jumps reach what the
+	// shell's would have.
+	let catcher = exec::fork_catcher(vp);
+	let mut job = vp.child(k, cx.store, std::sync::Arc::clone(&unit), pc, vp.fds.clone(), catcher);
 	set_leader(k, job.vpid, Some(job.vpid));
 	if let Some(whole) = whole {
 		k.jobctl.texts.push((job.vpid, whole));

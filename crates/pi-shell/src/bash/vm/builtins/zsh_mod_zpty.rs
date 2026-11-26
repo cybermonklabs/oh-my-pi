@@ -572,7 +572,10 @@ fn newptycmd(
 		fds.set(fd, Some(slave.clone()));
 	}
 	// zsh's `lineno` runs on from the `zpty` command's line into the text.
-	let mut child = ctx.vp.child_text(ctx.k, ctx.cx.store, &src, ctx.line, fds);
+	let catcher = crate::bash::vm::proc::Catcher::ParseLevel;
+	let mut child = ctx
+		.vp
+		.child_text(ctx.k, ctx.cx.store, &src, ctx.line, fds, catcher);
 	// zsh's zpty child is not a subshell level of its own.
 	set_subshell_depth(&mut child, subshell_depth(ctx.vp));
 	{

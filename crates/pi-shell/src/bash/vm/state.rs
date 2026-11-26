@@ -1607,6 +1607,7 @@ pub fn edit_seen(
 	edit: VarEdit<'_>,
 	seen: Option<Seen>,
 ) -> Result<bool, StoreError> {
+	ifs_written(vp, name);
 	match level_at(root, store, vp, name, level)? {
 		Some(In::Vec(i)) => {
 			return Ok(match vp.scopes[i].vars.get_mut(name).and_then(Option::as_mut) {
@@ -1641,6 +1642,17 @@ pub fn edit_seen(
 	store_edit(root, store, var_key(name), edit, seen)
 }
 
+/// A write or unset of `IFS` refreshes bash's split cache (`sv_ifs`): the
+/// split value a freed `local IFS` left goes ([`Vproc::held_ifs`]). A
+/// temporary `IFS` (`IFS=, read`, `IFS=, f`) is written here too: each
+/// prefix assignment enters the command's temporary scope as it is
+/// expanded.
+fn ifs_written(vp: &mut Vproc, name: &[u8]) {
+	if name == b"IFS" {
+		vp.held_ifs = None;
+	}
+}
+
 /// Write `var` (or a declared-but-unset binding, `None`) into scope `at`.
 fn put_scope(
 	root: &mut Root,
@@ -1650,6 +1662,7 @@ fn put_scope(
 	name: &[u8],
 	var: Option<Var>,
 ) {
+	ifs_written(vp, name);
 	match at {
 		In::Vec(i) => {
 			vp.scopes[i].vars.insert(BString::from(name), var);
@@ -1669,6 +1682,7 @@ fn put_outer(
 	name: &[u8],
 	var: Option<Var>,
 ) {
+	ifs_written(vp, name);
 	match &mut vp.overlay {
 		Some(ov) => {
 			ov.vars.insert(BString::from(name), var);
@@ -1721,6 +1735,7 @@ pub fn unset_var(
 	name: &[u8],
 	keep_outer_locals: bool,
 ) {
+	ifs_written(vp, name);
 	match unset_target(root, store, vp, name, keep_outer_locals) {
 		Ok(Some((at, true, var))) => {
 			// The local stays declared, unset, with its attributes
@@ -2767,6 +2782,7 @@ pub fn scope_unbind(
 	i: usize,
 	name: &[u8],
 ) {
+	ifs_written(vp, name);
 	match scope_in(vp, i) {
 		In::Vec(i) => {
 			if let Some(s) = vp.scopes.get_mut(i) {
@@ -2793,6 +2809,39 @@ pub fn scope_clear(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc, 
 			},
 			Err(err) => root.fail(err),
 		},
+	}
+}
+
+/// bash's `reset_local_contexts` (variables.c:5395), before the EXIT trap
+/// of a `set -e` exit: every local variable context is freed without the
+/// unwind a return runs (`delete_local_contexts`), and the shell is in no
+/// function (`variable_context` 0). Each scope of `vp` loses its bindings,
+/// a temporary environment's too, and none belongs to a function any more
+/// (`local` is refused, `declare` makes globals). The scopes stay for the
+/// frames that pop them, with the positional parameters they hold, which
+/// bash keeps (`pop_dollar_vars` runs only on a return).
+pub fn reset_local_contexts(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
+	if vp.overlay.is_some() {
+		for s in &mut vp.scopes {
+			s.vars.clear();
+			s.func = None;
+		}
+		return;
+	}
+	// The lazy scopes above `depth` hold nothing.
+	for depth in 0..root.depth {
+		scope_clear(root, store, vp, depth as usize);
+		let header = root_scope(store, depth).map(|(func, positional, zsh)| {
+			(func.is_some(), positional.map(<[BString]>::to_vec), zsh.cloned().map(Box::new))
+		});
+		match header {
+			Ok((true, positional, zsh)) => {
+				let rec = Record::Scope { func: None, positional, zsh };
+				root.write(store, Change::Put(Key::Scope(depth), rec));
+			},
+			Ok(_) => {},
+			Err(err) => root.fail(err),
+		}
 	}
 }
 
