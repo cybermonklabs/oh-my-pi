@@ -5269,6 +5269,42 @@ mod tests {
 		}
 	}
 
+	/// Writes `F` into the FIFO `fifo`, which the copy `copy` opens for
+	/// reading, and holds its end until the byte is read or the copy has
+	/// ended. gVisor's blocking opens of a FIFO can miss each other. cp's read
+	/// open can miss a writer that opens, writes and closes while the opener
+	/// gets ready to wait, and then waits for the next writer's open, which
+	/// nothing makes; Linux's open waits on the count of writer opens and sees
+	/// that writer (`wait_for_partner` in fs/pipe.c). A writer's blocking open
+	/// can miss cp's read open the same way, and then both wait for ever. So
+	/// the end is opened for reading and writing, which never waits
+	/// (`fifo(7)`), before cp's open or after it, and is held open, there to
+	/// be seen whenever cp's open looks. As a reader too, it takes no EPIPE
+	/// from a copy that fails and closes the FIFO first.
+	#[cfg(target_os = "linux")]
+	fn feed_until_read<T>(fifo: &std::path::Path, copy: &std::thread::JoinHandle<T>) {
+		let Ok(mut end) = fs::OpenOptions::new().read(true).write(true).open(fifo) else {
+			return;
+		};
+		if std::io::Write::write_all(&mut end, b"F").is_err() {
+			return;
+		}
+		while !copy.is_finished() && unread(&end) > 0 {
+			std::thread::sleep(Duration::from_millis(1));
+		}
+	}
+
+	/// How many bytes the FIFO that `fifo` is an end of holds.
+	#[cfg(target_os = "linux")]
+	fn unread(fifo: &fs::File) -> libc::c_int {
+		use std::os::fd::AsRawFd as _;
+		let mut bytes: libc::c_int = 0;
+		// SAFETY: `fifo` is open, and `FIONREAD` writes one `int` to
+		// `bytes`, which outlives the call.
+		let read = unsafe { libc::ioctl(fifo.as_raw_fd(), libc::FIONREAD, &raw mut bytes) };
+		assert_eq!(read, 0, "FIONREAD of a FIFO: {}", std::io::Error::last_os_error());
+		bytes
+	}
 
 	/// Where the rename back fails too, as GNU 9.4 and 9.7 do as uid 1000 and
 	/// root, on runc and gVisor: once cp has renamed `b` to `b~` and waits for
@@ -5302,7 +5338,7 @@ mod tests {
 		};
 		while !dir.path().join("b~").exists() {
 			if waits_on_a_fifo() && !dir.path().join("b~").exists() {
-				fs::write(&fifo, b"F").unwrap();
+				feed_until_read(&fifo, &copy);
 				let _ = copy.join();
 				panic!("cp opened the FIFO before it backed b up");
 			}
@@ -5310,9 +5346,9 @@ mod tests {
 			std::thread::yield_now();
 		}
 		fs::create_dir(dir.path().join("b")).unwrap();
-		// cp may fail at `b` and close the FIFO before the write lands
-		// (EPIPE); the row is decided by what cp did, not by the write.
-		let _ = fs::write(&fifo, b"F");
+		// cp may fail at `b` and close the FIFO without reading it; the row is
+		// decided by what cp did, not by the write.
+		feed_until_read(&fifo, &copy);
 		let (code, err, out) = copy.join().unwrap();
 		assert_eq!(
 			(code, err.as_str()),
@@ -5496,8 +5532,8 @@ mod tests {
 				"file" => fs::write(dir.path().join("b"), b"new").unwrap(),
 				_ => std::os::unix::fs::symlink("none", dir.path().join("b")).unwrap(),
 			}
-			// cp may fail at `b` and close the FIFO before the write lands.
-			let _ = fs::write(&fifo, b"F");
+			// cp may fail at `b` and close the FIFO without reading it.
+			feed_until_read(&fifo, &copy);
 			let (got, got_err) = copy.join().unwrap();
 			assert_eq!((got, got_err.as_str()), (code, err), "{case}");
 			let mut names: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -8654,16 +8690,6 @@ mod tests {
 					std::thread::sleep(Duration::from_millis(1));
 				}
 			})
-		}
-		// How many bytes the FIFO that `fifo` is an end of holds.
-		fn unread(fifo: &fs::File) -> libc::c_int {
-			use std::os::fd::AsRawFd as _;
-			let mut bytes: libc::c_int = 0;
-			// SAFETY: `fifo` is open, and `FIONREAD` writes one `int` to
-			// `bytes`, which outlives the call.
-			let read = unsafe { libc::ioctl(fifo.as_raw_fd(), libc::FIONREAD, &raw mut bytes) };
-			assert_eq!(read, 0, "FIONREAD of a FIFO: {}", std::io::Error::last_os_error());
-			bytes
 		}
 		// Lets a feeder still waiting in its open go: a reader that does not
 		// wait opens the FIFO.
