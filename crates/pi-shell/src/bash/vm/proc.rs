@@ -52,12 +52,15 @@ pub struct Vproc {
 	pub stopped:       bool,
 	/// Exit once its frames are done (subshell vprocs).
 	pub transient:     bool,
-	/// Set when this vproc's EXIT trap has been started. A root vproc keeps
-	/// the same flag per run ([`Run::exit_trap_started`]); a forked subshell
-	/// has no `Run`, and its `own_traps`, `trap_frames` and the frame scans
-	/// all go back to their pre-trap values once the trap's frame is popped,
-	/// so without this the trap could start a second time.
-	pub exit_trap_run: bool,
+	/// Whether this vproc's own EXIT trap is still due when it ends.
+	/// Cleared when the trap starts: a root vproc keeps that per run
+	/// ([`Run::exit_trap_started`]), while a forked subshell has no `Run`,
+	/// and its `own_traps`, `trap_frames` and the frame scans all go back
+	/// to their pre-trap values once the trap's frame is popped, so without
+	/// this the trap could start a second time. Cleared at the fork for the
+	/// forked compounds bash ends with `sh_exit`, which run no trap however
+	/// the body ends ([`crate::bash::ir::StageIr::exit_trap`]).
+	pub exit_trap_due: bool,
 	/// Background jobs not yet waited for or reported, current/previous
 	/// job and the `SIGCHLD` trap runs owed.
 	pub jobs:          JobTable,
@@ -2361,11 +2364,11 @@ pub struct ExecState {
 	pub wait_into:     Option<Box<BString>>,
 	/// Run through `command`: a special builtin's failure does not end a
 	/// posix shell.
-	pub via_command: bool,
+	pub via_command:   bool,
 	/// The prefix the command's words start with, as bash's
 	/// `execute_simple_command` and `execute_builtin` read it: the outer
 	/// one, not the last (`command builtin export` is `command`'s).
-	pub prefix:      Prefix,
+	pub prefix:        Prefix,
 	/// The awaited frame was pushed by the builtin, which runs again when
 	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).
 	pub resume:        bool,

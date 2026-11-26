@@ -18,8 +18,7 @@ use super::{
 		AssignValue, Atom, Bang, BangStage, Coproc, DebugSkip, Depths, Frame, FrameKind, InlineStage,
 		JobProc, JobProcs, LastBg, LoopKind, LoopRec, ParseLevel, ParseSnapshot, PendingBreak,
 		PendingSub, PendingWrite, Prefix, Probe, ProbeResult, Run, Saved, Saves, Scratch, ScriptKind,
-		Slot, Target, TryEnd,
-		Vproc,
+		Slot, Target, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -804,7 +803,7 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32, jump
 			Some(r) => r.started && !r.exit_trap_started,
 			// A forked subshell has no run: it is its own exit, and its
 			// own flag is what keeps the trap from starting twice.
-			None => vp.transient && !vp.exit_trap_run,
+			None => vp.transient && vp.exit_trap_due,
 		}
 		&& start_exit_trap_once(k, vp, cx)
 	{
@@ -854,7 +853,7 @@ pub(super) fn fork_failure(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line
 			run.exit_trap_started = true;
 		}
 		if vp.transient {
-			vp.exit_trap_run = true;
+			vp.exit_trap_due = false;
 		}
 		return Flow::Discard(1);
 	}
@@ -946,7 +945,7 @@ pub(super) fn spend_exit_trap(vp: &mut Vproc) {
 		run.exit_trap_started = true;
 	}
 	if vp.transient {
-		vp.exit_trap_run = true;
+		vp.exit_trap_due = false;
 	}
 }
 
@@ -1127,12 +1126,14 @@ fn function_context(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 /// `own_traps`, `trap_frames` and the frame scans all return to their
 /// pre-trap values when the trap's frame is popped. A root vproc is
 /// unaffected: its guard is its run's own flag, one per shell invocation.
+/// A fork bash ends with `sh_exit` runs no trap at all
+/// ([`Vproc::exit_trap_due`]).
 fn start_exit_trap_once(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bool {
 	if vp.transient {
-		if vp.exit_trap_run {
+		if !vp.exit_trap_due {
 			return false;
 		}
-		vp.exit_trap_run = true;
+		vp.exit_trap_due = false;
 	}
 	start_trap(k, vp, cx, TrapKey::Exit)
 }
@@ -6490,6 +6491,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					&& vp.mode.dialect() == Dialect::Zsh
 					&& super::killed::in_place(k, cx, vp, op);
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				child.exit_trap_due = info.stages[0].exit_trap;
 				let keeps =
 					info.kind == SpawnKind::Background && bash_job_keeps(unit, info.stages[0].entry);
 				child.outer_loops = fork_loops(vp, keeps);
@@ -6667,6 +6669,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						continue;
 					}
 					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
+					child.exit_trap_due = stage.exit_trap;
 					zsh_subshell_traps(k, cx, &mut child, true);
 					// The shell ran a simple stage's DEBUG trap.
 					mark_debug_done(unit, &mut child.frames, stage.entry);
@@ -7060,6 +7063,7 @@ fn start_coproc(
 	fds.set(0, Some(FdRef::mem(in_r)));
 	fds.set(1, Some(FdRef::mem(out_w)));
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	child.exit_trap_due = unit.spawns[op.a as usize].stages[0].exit_trap;
 	child.outer_loops = fork_loops(vp, false);
 	zsh_subshell_traps(k, cx, &mut child, false);
 	if !job_control(k, cx, vp) {
