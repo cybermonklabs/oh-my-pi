@@ -1,0 +1,99 @@
+{
+	"about": "Session messages in the shape omp stored them before created_by was stripped on replay: each OpenAI Responses output item is kept whole, created_by included (a string on tool items and shell output entries, null on the compaction item).",
+	"messages": [
+		{
+			"role": "user",
+			"content": "Summary of the earlier conversation",
+			"providerPayload": {
+				"type": "openaiResponsesHistory",
+				"provider": "openai",
+				"items": [
+					{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Earlier request" }] },
+					{
+						"id": "cmp_fixture_1",
+						"type": "compaction",
+						"encrypted_content": "enc_fixture_compaction",
+						"created_by": null
+					}
+				]
+			},
+			"timestamp": 1764036000000
+		},
+		{ "role": "user", "content": "Find the readme", "timestamp": 1764036001000 },
+		{
+			"role": "assistant",
+			"content": [
+				{
+					"type": "toolCall",
+					"id": "call_fixture_1|fc_fixture_1",
+					"name": "lookup",
+					"arguments": { "query": "readme" }
+				}
+			],
+			"api": "openai-responses",
+			"provider": "openai",
+			"model": "gpt-5-mini",
+			"responseId": "resp_fixture_1",
+			"usage": {
+				"input": 5,
+				"output": 3,
+				"cacheRead": 0,
+				"cacheWrite": 0,
+				"totalTokens": 8,
+				"cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 }
+			},
+			"stopReason": "toolUse",
+			"providerPayload": {
+				"type": "openaiResponsesHistory",
+				"provider": "openai",
+				"dt": true,
+				"items": [
+					{
+						"id": "sh_fixture_1",
+						"type": "shell_call",
+						"call_id": "call_shell_fixture_1",
+						"action": { "commands": ["ls"], "max_output_length": null, "timeout_ms": null },
+						"environment": null,
+						"status": "completed",
+						"created_by": "resp_fixture_1"
+					},
+					{
+						"id": "sho_fixture_1",
+						"type": "shell_call_output",
+						"call_id": "call_shell_fixture_1",
+						"max_output_length": null,
+						"status": "completed",
+						"output": [
+							{
+								"stdout": "README.md\n",
+								"stderr": "",
+								"outcome": { "type": "exit", "exit_code": 0 },
+								"created_by": "resp_fixture_1"
+							}
+						],
+						"created_by": "resp_fixture_1"
+					},
+					{
+						"id": "fc_fixture_1",
+						"type": "function_call",
+						"call_id": "call_fixture_1",
+						"name": "lookup",
+						"arguments": "{\"query\":\"readme\"}",
+						"status": "completed",
+						"created_by": "resp_fixture_1"
+					}
+				]
+			},
+			"timestamp": 1764036002000
+		},
+		{
+			"role": "toolResult",
+			"toolCallId": "call_fixture_1|fc_fixture_1",
+			"toolName": "lookup",
+			"content": [{ "type": "text", "text": "README.md is at the root" }],
+			"isError": false,
+			"timestamp": 1764036003000
+		},
+		{ "role": "user", "content": "Continue", "timestamp": 1764036004000 }
+	]
+}
