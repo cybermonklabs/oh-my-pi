@@ -1974,7 +1974,8 @@ pub fn unset(ex: &mut Expander<'_, '_>, sp: Special, name: &[u8]) -> X<()> {
 			Ok(())
 		},
 		Special::TiedArray(t) => {
-			state::unset_var(&mut ex.k.root, ex.cx.store, ex.vp, t.scalar().as_bytes(), true);
+			let keeps = state::UnsetKeeps::AllScoped;
+			state::unset_var(&mut ex.k.root, ex.cx.store, ex.vp, t.scalar().as_bytes(), keeps);
 			Ok(())
 		},
 		Special::Mapfile => crate::bash::vm::builtins::zsh_mod_mapfile::unset_whole(ex),

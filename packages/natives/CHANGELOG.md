@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `unset` of a variable that a prefix assignment gave a temporary value (`x=3 eval 'unset x'`, `x=3 . file`, `x=3 f` for a function) removes the temporary, as in bash: the variable it hid shows through, a second `unset` removes that one too, and the name is no longer listed as `declare -x x`; a `local` of the function, and a calling function's under `localvar_unset`, still stays declared but unset
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
