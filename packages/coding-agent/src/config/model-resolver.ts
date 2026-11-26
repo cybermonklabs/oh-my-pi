@@ -1413,6 +1413,8 @@ export interface AgentModelSelection {
 	patterns: string[];
 	/** Role alias the patterns came from (`@task` -> `task`), when the source named one. */
 	role: string | undefined;
+	/** Set when no request, override or agent definition named a model, so the patterns are the parent session's. */
+	inherited?: true;
 }
 
 /**
@@ -1423,6 +1425,7 @@ export interface AgentModelSelection {
  */
 export function resolveAgentModelSelection(options: AgentModelPatternResolutionOptions): AgentModelSelection {
 	const { source, patterns } = resolveEffectiveAgentModelSelection(options);
+	if (source === undefined) return { patterns, role: undefined, inherited: true };
 	return { patterns, role: resolveExplicitModelRole(source, options.settings) };
 }
 
@@ -1854,6 +1857,11 @@ export interface ModelOverrideAuthResolution {
 	authFallbackUsed: boolean;
 	/** The requested model's key was checked and could not serve this spawn. */
 	primaryAuthFailed: boolean;
+	/**
+	 * With `allowParentFallback: false`, each entry of the override list whose key was checked and did not
+	 * work, set when no entry's key works; the resolution then holds no model.
+	 */
+	unauthenticatedModels?: string[];
 	warning?: string;
 }
 
@@ -1893,6 +1901,11 @@ export interface ModelOverrideAuthResolution {
  * was given or could replace it; it stays false when an authenticated later
  * entry of the override list replaces the primary, since that list is the
  * caller's own choice.
+ *
+ * `allowParentFallback: false` (a subagent held to its named models) never
+ * substitutes the parent's model: when no entry of the list has working
+ * credentials, it returns no model and `unauthenticatedModels`, for the
+ * caller to refuse the spawn with.
  */
 export async function resolveModelOverrideWithAuthFallback(
 	modelPatterns: string[],
@@ -1900,8 +1913,9 @@ export async function resolveModelOverrideWithAuthFallback(
 	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
 	settings?: Settings,
 	sessionId?: string,
-	options?: { exactOnly?: boolean },
+	options?: { exactOnly?: boolean; allowParentFallback?: boolean },
 ): Promise<ModelOverrideAuthResolution> {
+	const allowParentFallback = options?.allowParentFallback !== false;
 	const disabledProviders = disabledProviderIds(settings);
 	let lookupRegistry: ModelLookupRegistry = modelRegistry;
 	if (disabledProviders.size > 0) {
@@ -1920,6 +1934,7 @@ export async function resolveModelOverrideWithAuthFallback(
 	// The ordered override list is the caller's own fallback chain: an
 	// authenticated later entry beats the parent's model, and serves when no
 	// parent model is given (a prepared seance passes none).
+	const unauthenticatedModels = [formatModelStringWithRouting(primary.model)];
 	for (const pattern of resolveConfiguredModelPatterns(modelPatterns, settings)) {
 		const candidate = resolveModelOverride([pattern], lookupRegistry, settings);
 		if (!candidate.model || modelsAreEqual(candidate.model, primary.model)) continue;
@@ -1927,6 +1942,18 @@ export async function resolveModelOverrideWithAuthFallback(
 		if (candidateKey === kNoAuth || isAuthenticated(candidateKey)) {
 			return { ...candidate, authFallbackUsed: false, primaryAuthFailed: false };
 		}
+		const selector = formatModelStringWithRouting(candidate.model);
+		if (!unauthenticatedModels.includes(selector)) unauthenticatedModels.push(selector);
+	}
+
+	if (!allowParentFallback) {
+		return {
+			explicitThinkingLevel: false,
+			authFallbackUsed: false,
+			primaryAuthFailed: true,
+			unauthenticatedModels,
+			warning: primary.warning,
+		};
 	}
 	if (!parentActiveModelPattern) {
 		return { ...primary, authFallbackUsed: false, primaryAuthFailed: true };
@@ -1950,6 +1977,11 @@ export async function resolveModelOverrideWithAuthFallback(
 		primaryAuthFailed: true,
 		warning: primary.warning ?? fallback.warning,
 	};
+}
+
+/** Why a subagent held to its named models has none to run on: none of `models` has working credentials. */
+export function formatUnauthenticatedNamedModelsError(models: readonly string[]): string {
+	return `No working credentials for named subagent model${models.length === 1 ? "" : "s"}: ${models.join(", ")}`;
 }
 
 /**

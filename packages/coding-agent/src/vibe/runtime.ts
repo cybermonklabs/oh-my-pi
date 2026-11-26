@@ -124,6 +124,8 @@ interface ResolvedVibeWorker {
 	modelOverride?: string | string[];
 	/** Pre-expansion role alias behind {@link modelOverride}, when the worker agent named one. */
 	modelRole?: string;
+	/** {@link modelOverride} is the parent session's model: no override or agent definition named one. */
+	modelInherited?: true;
 }
 
 interface VibeTurn {
@@ -149,6 +151,8 @@ interface VibeRecord {
 	modelOverride?: string | string[];
 	/** Pre-expansion role alias behind {@link modelOverride}, when the worker agent named one. */
 	modelRole?: string;
+	/** {@link modelOverride} is the parent session's model: no override or agent definition named one. */
+	modelInherited?: true;
 	state: VibeSessionState;
 	createdAt: number;
 	lastActivityAt: number;
@@ -366,14 +370,14 @@ export class VibeSessionRegistry {
 		// Same contract as the task spawn path: the expansion discards the role
 		// alias (`@task`, `@smol`), so patterns and role identity come from one
 		// call — the child's inherited retry-fallback chain is keyed off the role.
-		const { patterns, role } = resolveAgentModelSelection({
+		const { patterns, role, inherited } = resolveAgentModelSelection({
 			settingsOverride: agentModelOverrides[agentName],
 			agentModel: agent.model,
 			settings: session.settings,
 			activeModelPattern: session.getActiveModelString?.(),
 			fallbackModelPattern: session.getModelString?.(),
 		});
-		return { agent, modelOverride: patterns, modelRole: role };
+		return { agent, modelOverride: patterns, modelRole: role, modelInherited: inherited };
 	}
 
 	async #appendLifecycleEvent(
@@ -775,7 +779,7 @@ export class VibeSessionRegistry {
 				existing.sessionFile === childSessionFile &&
 				(existing.status === "idle" || existing.status === "parked");
 			const blockedByCollision = Boolean(existing && !existingIsResumable);
-			const { agent, modelOverride, modelRole } = this.#resolveWorker(session, spawn.cli);
+			const { agent, modelOverride, modelRole, modelInherited } = this.#resolveWorker(session, spawn.cli);
 			if (!existing) {
 				AgentRegistry.global().register({
 					id: spawn.id,
@@ -800,6 +804,7 @@ export class VibeSessionRegistry {
 				agent,
 				modelOverride,
 				modelRole,
+				modelInherited,
 				state: "idle",
 				createdAt: spawn.createdAt,
 				lastActivityAt: candidate.lastActivityAt,
@@ -834,7 +839,7 @@ export class VibeSessionRegistry {
 			throw new ToolError("Vibe mode has exited; enter Vibe mode again before spawning a worker.");
 		}
 		const manager = this.#manager(session);
-		const { agent, modelOverride, modelRole } = this.#resolveWorker(session, args.cli);
+		const { agent, modelOverride, modelRole, modelInherited } = this.#resolveWorker(session, args.cli);
 		if (!session.agentOutputManager) {
 			session.agentOutputManager = new AgentOutputManager(session.getArtifactsDir ?? (() => null), {
 				storage: sessionTreeStorage(session),
@@ -861,6 +866,7 @@ export class VibeSessionRegistry {
 			agent,
 			modelOverride,
 			modelRole,
+			modelInherited,
 			state: "starting",
 			createdAt,
 			lastActivityAt: createdAt,
@@ -1332,6 +1338,7 @@ export class VibeSessionRegistry {
 			detached: true,
 			modelOverride: record.modelOverride,
 			modelRole: record.modelRole,
+			modelInherited: record.modelInherited,
 			parentActiveModelPattern: session.getActiveModelString?.(),
 			thinkingLevel: record.agent.thinkingLevel,
 			sessionFile,

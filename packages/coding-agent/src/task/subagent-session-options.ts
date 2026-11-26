@@ -745,6 +745,10 @@ function subagentBaseOptions(input: SubagentBuildInput): SubagentBaseOptions {
 					disableServerSideFallback: true,
 				}
 			: {}),
+		// A named model held to its own list: no configured chain, promotion target or server-side chain.
+		...(spec.exclusiveRetryFallbackRole !== undefined
+			? { exclusiveRetryFallbackRole: spec.exclusiveRetryFallbackRole, disableServerSideFallback: true }
+			: {}),
 		thinkingLevelCeiling: liveEffortCeiling(spec.thinkingLevelCeiling, live.settingsParent),
 		cacheWarming: policy.cacheWarming,
 		toolNames: tools.toolNames,

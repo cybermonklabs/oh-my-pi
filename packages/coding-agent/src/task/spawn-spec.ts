@@ -162,6 +162,11 @@ export interface SubagentSpawnSpec {
 	thinkingLevelCeiling?: Effort;
 	/** The model came from a per-call `model`. */
 	perCallModel: boolean;
+	/**
+	 * The `subagent:<id>` role a model a selector named is held to (`task.namedModelFallback` off): the session's
+	 * own model walks that chain and no other, with server-side fallback and context promotion off. Absent otherwise.
+	 */
+	exclusiveRetryFallbackRole?: string;
 	/** Absent when the spawn armed no prewalk. */
 	prewalk?: SpawnSpecPrewalk;
 	/**
@@ -255,7 +260,9 @@ const createAgentSessionOptionClasses: InputClasses<CreateAgentSessionOptions> =
 	// The per-call approval closure: the spawn's at a warm revive, one over the live grants at a cold revive.
 	assertDispatchModel: "L",
 	disableModelFallback: "D",
+	// Derived from `perCallModel` and from `exclusiveRetryFallbackRole`.
 	disableServerSideFallback: "D",
+	exclusiveRetryFallbackRole: "S",
 	thinkingLevel: "S",
 	thinkingLevelCeiling: "S",
 	openAIServiceTier: "N",
@@ -466,6 +473,8 @@ export interface SpawnSpecInputs {
 	/** The prewalk hand-off the spawn armed, its target as an identity. */
 	prewalk: SpawnSpecPrewalk | undefined;
 	perCallModel: boolean;
+	/** The role the spawn held its named model to; undefined where it held none. */
+	exclusiveRetryFallbackRole: string | undefined;
 	keepTodo: boolean;
 	/** The overlay's own writes and root thresholds, as the warm capture takes them. */
 	settings: SubagentSettingsSnapshot;
@@ -527,6 +536,7 @@ export function spawnSpecFromSpawn(spawn: SpawnSpecInputs): SubagentSpawnSpec {
 		thinkingLevel: options.thinkingLevel ?? null,
 		thinkingLevelCeiling: options.thinkingLevelCeiling,
 		perCallModel: spawn.perCallModel,
+		exclusiveRetryFallbackRole: spawn.exclusiveRetryFallbackRole,
 		prewalk: prewalk ? definedMembers({ ...prewalk }) : undefined,
 		settings: spawnSpecSettings(spawn.settings),
 		tools: definedMembers({
@@ -617,7 +627,7 @@ export interface SpawnSpecWakeOptions extends Omit<SpawnSpecWake, "agent"> {
 export interface SpawnSpecParts {
 	/** The record holds a spec of {@link SPAWN_SPEC_VERSION}; a spec of another version reads as none. */
 	stored: boolean;
-	model?: { model: string | null; perCallModel: boolean };
+	model?: { model: string | null; perCallModel: boolean; exclusiveRetryFallbackRole?: string };
 	thinking?: { thinkingLevel: ConfiguredThinkingLevel | null; thinkingLevelCeiling?: Effort };
 	/** Absent where the spawn armed no prewalk, as where the part is malformed. */
 	prewalk?: SpawnSpecPrewalk;
@@ -842,11 +852,26 @@ function isLiveInputName(name: string): name is SpawnLiveInputName {
 export function readSpawnSpec(init: PersistedSessionInit): SpawnSpecParts {
 	const spec: unknown = init.spawnSpec;
 	if (!isRecord(spec) || spec.v !== SPAWN_SPEC_VERSION) return { stored: false };
-	const { model, perCallModel, thinkingLevel, thinkingLevelCeiling, prewalk, prompt, wake, liveInputs } = spec;
+	const {
+		model,
+		perCallModel,
+		exclusiveRetryFallbackRole,
+		thinkingLevel,
+		thinkingLevelCeiling,
+		prewalk,
+		prompt,
+		wake,
+		liveInputs,
+	} = spec;
 	const agentSystemPrompt = isRecord(prompt) ? prompt.agentSystemPrompt : undefined;
 	return {
 		stored: true,
-		model: (model === null || isString(model)) && isBoolean(perCallModel) ? { model, perCallModel } : undefined,
+		model:
+			(model === null || isString(model)) &&
+			isBoolean(perCallModel) &&
+			(exclusiveRetryFallbackRole === undefined || isString(exclusiveRetryFallbackRole))
+				? definedMembers({ model, perCallModel, exclusiveRetryFallbackRole })
+				: undefined,
 		thinking:
 			(thinkingLevel === null || isThinkingLevel(thinkingLevel)) &&
 			(thinkingLevelCeiling === undefined || isEffort(thinkingLevelCeiling))

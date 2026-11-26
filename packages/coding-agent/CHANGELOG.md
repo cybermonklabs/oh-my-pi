@@ -43,6 +43,8 @@
 - The SDK exports `applyToolResultPrunes` and `applyEntryPatches`, so a caller of `loadSessionFile` or `loadEntriesFromFile` can apply a session's prune and patch records to the raw entries it reads
 - In RPC mode, `/live on`, `/live off` and `/live status` typed as a `prompt`, or sent through an extension's `sendUserInput` (a chat bridge's), run at once, even during a turn, drive the same live session as `live_start`/`live_stop`, and answer in one `command_output` line (`sendUserInput` also returns it as `output`); the checks `live_start` makes (dictation, a session change or shutdown) now apply to both. A `prompt`'s `/live on` connects in the background, so the input queue stays free while the call connects, and `/live off` or `abort` meanwhile stops it. ACP, print mode and subagents answer `/live` as not available
 - `SessionManager.create()` takes the `{ suppressBreadcrumb }` option `SessionManager.open()` takes, for a session that writes no terminal breadcrumb
+- `task.namedModelFallback` (default `true`): set it to `false` and a subagent whose model is named by selector (agent `model`, `task.agentModelOverrides`, SDK `modelOverride`) runs only on the models it names, in order, and fails instead of substituting the parent's model on missing credentials or moving to a `retry.fallbackChains`, context promotion or prewalk model; role aliases such as `@task` keep their role's chain
+- `retry.fallbackNotice` (default `false`): with it on, a session whose model changed through a retry fallback, or that returned to its primary, gets one hidden notice naming the model now serving it and why, once a turn has been served on it; a running session sees it on its next model request
 
 ### Changed
 
