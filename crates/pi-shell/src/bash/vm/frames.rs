@@ -1386,7 +1386,7 @@ fn valid(u: &Unit) -> bool {
 				Part::Lit(_)
 				| Part::Quoted(_)
 				| Part::Arith { .. }
-				| Part::BadSubst(_)
+				| Part::BadSubst(..)
 				| Part::AnsiC(_)
 				| Part::Zsh(_)
 				| Part::ComsubSyntax { .. } => true,
@@ -1412,7 +1412,8 @@ fn valid(u: &Unit) -> bool {
 						| OpIr::Indirect
 						| OpIr::PrefixNames { .. }
 						| OpIr::Substr { .. }
-						| OpIr::Transform(_) => true,
+						| OpIr::Transform(_)
+						| OpIr::BadTransform(..) => true,
 					};
 					index_ok && op_ok
 				},

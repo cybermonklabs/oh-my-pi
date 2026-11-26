@@ -104,8 +104,14 @@ mod text {
 	/// Kind of text parsed at run time.
 	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 	pub enum TextKind {
-		/// Arithmetic text.
+		/// Arithmetic text (bash expands it as if double-quoted).
 		Arith,
+		/// Arithmetic text bash expands unquoted: an array subscript or an
+		/// associative key (`expand_subscript_string`).
+		ArithUnquoted,
+		/// A `[[ ]]` arithmetic operand with a subscript: bash expands it
+		/// with `Q_ARITH` and not as if double-quoted (`cond_expand_word`).
+		ArithOperand,
 		/// An unquoted here-document body.
 		HereDoc,
 		/// The inside of a compound array value given as a string

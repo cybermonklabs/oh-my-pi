@@ -236,17 +236,25 @@ fn zsh_tails(list: st::List<'_>, out: &mut Vec<u32>) {
 /// Lower a word parsed at run time (`parse_text`: here-document bodies,
 /// arithmetic text) into a unit whose last word is the text's word (nested
 /// operator words precede it) and whose code holds the word's
-/// command-substitution bodies.
+/// command-substitution bodies. `dq`: bash expands the text as if
+/// double-quoted (here-document bodies with `Q_HERE_DOCUMENT`, arithmetic
+/// text and prompts with `Q_DOUBLE_QUOTES`), not an array subscript or a
+/// `[[ ]]` arithmetic operand ([`Lower::dq`]); `arith`: with `Q_ARITH`
+/// (arithmetic text and a `[[ ]]` arithmetic operand, [`Lower::arith`]).
 pub fn lower_text(
 	word: st::Word<'_>,
 	text: &[u8],
 	mode: ModeId,
 	features: syn::Features,
+	dq: bool,
+	arith: bool,
 ) -> Result<Unit, &'static str> {
 	let mut l = Lower::new(Unit::empty(text, mode, features.bits()), 0, features, None);
 	l.text = true;
+	l.dq = dq;
+	l.arith = arith;
 	l.emit(Opcode::End, 0, 0, 0);
-	l.word(word)?;
+	l.word_in(word, WordKind::Plain, Scan::Text)?;
 	// Substitution bodies are blocks skipped by a jump to the code after
 	// them: give that jump a target, or a restored unit fails validation.
 	l.emit(Opcode::End, 0, 0, 0);
@@ -517,6 +525,120 @@ fn take_body(unit: Unit, root: u32) -> Option<Unit> {
 	None
 }
 
+/// What bash's `expand_word_internal` expands when one of its parts fails:
+/// the string its `bad substitution` message names.
+#[derive(Clone, Copy)]
+enum Scan<'t> {
+	/// A word as bash stores it (an operator's word, a brace-expanded word).
+	Word(st::Word<'t>),
+	/// The inside of `"…"` (also of a pair of quotes arithmetic text drops,
+	/// which bash expands as a string of its own, `arith`), and the index of
+	/// the part that fails; `dq_param`: the quotes are in the `-`, `=` or `+`
+	/// word of a `${…}` bash expands as if double-quoted ([`Lower::dq`]).
+	Dq { parts: st::Seq<'t, st::WordPart<'t>>, at: usize, arith: bool, dq_param: bool },
+	/// A keyed array element, `\[key\]=value`.
+	Elem(st::ArrayElem<'t>),
+	/// Text parsed when it runs (a here-document body, arithmetic): all of
+	/// it, the unit's source.
+	Text,
+}
+
+impl Scan<'_> {
+	/// The string, and for a keyed element the offset where its value
+	/// starts (an associative array's element names only the value);
+	/// `source` is the unit's.
+	fn text(self, source: &[u8]) -> (BString, Option<u32>) {
+		let mut out = Vec::new();
+		let mut value = None;
+		match self {
+			Self::Word(w) => syn::word_text(w, &mut out),
+			Self::Dq { parts, at, arith, dq_param } => {
+				// bash's `string_extract_double_quoted` drops the backslash of
+				// an escaped `"` (only of that: `\$`, `\\` keep theirs); with
+				// `SX_STRIPDQ`, in the `-`, `=` or `+` word of a `${…}` it
+				// expands as if double-quoted, it keeps it (`\"${x!}`).
+				let mut quotes = Vec::new();
+				let mut start = 0;
+				for (i, p) in parts.iter().enumerate() {
+					if i == at {
+						start = out.len();
+					}
+					match p.get() {
+						st::Part::Escaped(b"\"") if !dq_param => {
+							quotes.push(out.len());
+							out.push(b'"');
+						},
+						_ => syn::dq_part_text(p, &mut out),
+					}
+				}
+				// In arithmetic such a `"` is a quote again: it opens a string
+				// of its own up to the next one (or the end), and a part that
+				// fails inside it names only that string (`b${x!}` for
+				// `"a\"b${x!}"`); outside one, the whole string.
+				let before = quotes.iter().filter(|&&q| q < start).count();
+				if arith && before % 2 == 1 {
+					let end = quotes.get(before).copied().unwrap_or(out.len());
+					out.truncate(end);
+					out.drain(..=quotes[before - 1]);
+				}
+			},
+			Self::Elem(e) => {
+				out.extend_from_slice(b"\\[");
+				if let Some(key) = e.key() {
+					syn::word_text(key, &mut out);
+				}
+				out.extend_from_slice(if e.append() { b"\\]+=" } else { b"\\]=" });
+				value = Some(out.len() as u32);
+				syn::word_text(e.value(), &mut out);
+			},
+			Self::Text => out.extend_from_slice(source),
+		}
+		(out.into(), value)
+	}
+}
+
+/// A `${…}` the parser rejected that is bash's `parameter_brace_transform`
+/// without a valid operator (`${x@}`, `${x@Z}`, `${a[@]@QQ}`): the
+/// parameter, its `[@]`/`[*]`, and whether the operator starts with `a` or
+/// `A` (bash looks those up even when the value is unset). `None` for any
+/// other bad substitution.
+fn bad_transform(text: &[u8]) -> Option<(ParamRef, Option<SubIr>, bool)> {
+	let body = text.strip_prefix(b"${")?.strip_suffix(b"}")?;
+	let first = *body.first()?;
+	let (param, rest) = if first.is_ascii_alphabetic() || first == b'_' {
+		let n = body
+			.iter()
+			.position(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
+			.unwrap_or(body.len());
+		(ParamRef::Var(body[..n].into()), &body[n..])
+	} else if first.is_ascii_digit() {
+		let n = body
+			.iter()
+			.position(|c| !c.is_ascii_digit())
+			.unwrap_or(body.len());
+		let number = std::str::from_utf8(&body[..n]).ok()?.parse().ok()?;
+		(ParamRef::Positional(number), &body[n..])
+	} else {
+		let param = match first {
+			b'@' => ParamRef::At,
+			b'*' => ParamRef::Star,
+			b'#' => ParamRef::Count,
+			b'?' => ParamRef::Status,
+			b'-' => ParamRef::Flags,
+			b'$' => ParamRef::ShellPid,
+			_ => return None,
+		};
+		(param, &body[1..])
+	};
+	let (index, rest) = match (&param, rest) {
+		(ParamRef::Var(_), [b'[', b'@', b']', rest @ ..]) => (Some(SubIr::At), rest),
+		(ParamRef::Var(_), [b'[', b'*', b']', rest @ ..]) => (Some(SubIr::Star), rest),
+		_ => (None, rest),
+	};
+	let xform = rest.strip_prefix(b"@")?;
+	Some((param, index, matches!(xform.first(), Some(b'a' | b'A'))))
+}
+
 struct Lower {
 	unit:          Unit,
 	source_hash:   blake3::Hasher,
@@ -540,6 +662,18 @@ struct Lower {
 	/// substitution body: its words are [`WordKind::Text`] (no tilde
 	/// expansion).
 	text:          bool,
+	/// Lowering where bash expands a `${…}` as if double-quoted
+	/// (`Q_DOUBLE_QUOTES`, `Q_HERE_DOCUMENT`) outside `"…"` too: run-time
+	/// text (here-document bodies, arithmetic, prompts), and the `-`, `=` or
+	/// `+` word of a `${…}` expanded so, whose quotes also keep the backslash
+	/// of a `\"` when a message names them ([`Scan::Dq`]).
+	dq:            bool,
+	/// Lowering where bash expands a `${…}` with `Q_ARITH`: arithmetic text,
+	/// and the `-`, `=`, `+` or `/` replacement word of a `${…}` expanded so
+	/// (`parameter_brace_patsub` takes away only `Q_DOUBLE_QUOTES`). The
+	/// quotes of a word here are arithmetic's: a `"` a `\"` leaves opens a
+	/// string of its own ([`Scan::Dq`]'s `arith`).
+	arith:         bool,
 }
 
 /// The line starts of a unit's source (unit-relative offsets), scanned on
@@ -610,6 +744,8 @@ impl Lower {
 			async_bang: false,
 			features,
 			text: false,
+			dq: false,
+			arith: false,
 		}
 	}
 
@@ -1171,6 +1307,8 @@ impl Lower {
 			async_bang:    false,
 			features:      self.features,
 			text:          false,
+			dq:            false,
+			arith:         false,
 		};
 		sub.command(cmd)?;
 		sub.emit(Opcode::End, 0, 0, root);
@@ -1221,13 +1359,16 @@ impl Lower {
 	fn cond_expr(&mut self, e: st::CondExpr<'_>, id: u32) -> R {
 		match e.get() {
 			st::Cond::Unary { op, arg } => {
-				let arg = self.word(arg)?;
+				// bash expands `-v`'s operand with `Q_ARITH` (`cond_expand_word`).
+				let arg = self.cond_word(arg, op == b"-v")?;
 				let c = self.cond_ir(CondIr::Unary { op: op.into(), arg });
 				self.emit(Opcode::CondTest, c, 0, id);
 			},
 			st::Cond::Binary { op, lhs, rhs } => {
-				let lhs = self.word(lhs)?;
-				let rhs = self.word(rhs)?;
+				// And an arithmetic comparison's operands.
+				let arith = matches!(op, b"-eq" | b"-ne" | b"-lt" | b"-le" | b"-gt" | b"-ge");
+				let lhs = self.cond_word(lhs, arith)?;
+				let rhs = self.cond_word(rhs, arith)?;
 				let c = self.cond_ir(CondIr::Binary { op: op.into(), lhs, rhs });
 				self.emit(Opcode::CondTest, c, 0, id);
 			},
@@ -1286,6 +1427,15 @@ impl Lower {
 		self.unit.conds.len() as u32 - 1
 	}
 
+	/// A `[[ ]]` operand; `arith`: bash expands it with `Q_ARITH`
+	/// (`cond_expand_word`'s special 3).
+	fn cond_word(&mut self, w: st::Word<'_>, arith: bool) -> Idx {
+		let outer = std::mem::replace(&mut self.arith, arith);
+		let idx = self.word(w);
+		self.arith = outer;
+		idx
+	}
+
 	/// The `ariths` index of `text` and the `Arith` operand `b` it takes.
 	fn arith(&mut self, text: &[u8]) -> (u32, u32) {
 		let literal = !text
@@ -1333,7 +1483,14 @@ impl Lower {
 				} else {
 					WordKind::Plain
 				};
-				Ok(ElemIr { key, append: e.append(), value: self.word_as(e.value(), kind)? })
+				// bash names a keyed element's whole text (brackets quoted)
+				// in a `bad substitution` message.
+				let scan = if key.is_some() {
+					Scan::Elem(e)
+				} else {
+					Scan::Word(e.value())
+				};
+				Ok(ElemIr { key, append: e.append(), value: self.word_in(e.value(), kind, scan)? })
 			})
 			.collect()
 	}
@@ -1438,7 +1595,13 @@ impl Lower {
 
 	/// Lower `w` (and its brace-expansion alternatives) as a `kind` word.
 	fn word_as(&mut self, w: st::Word<'_>, kind: WordKind) -> Idx {
-		let idx = self.plain_word(w, kind)?;
+		self.word_in(w, kind, Scan::Word(w))
+	}
+
+	/// [`Self::word_as`], with `scan` what bash expands the word as (its
+	/// `bad substitution` message names it).
+	fn word_in(&mut self, w: st::Word<'_>, kind: WordKind, scan: Scan<'_>) -> Idx {
+		let idx = self.plain_word(w, kind, scan)?;
 		// Run-time parsed text (here-document bodies, arithmetic) gets no
 		// brace expansion; its unit's last word must stay the text itself.
 		if self.text {
@@ -1448,7 +1611,8 @@ impl Lower {
 			Ok(Some((t, alts))) => {
 				let mut indices = Vec::with_capacity(alts.len());
 				for alt in alts {
-					indices.push(self.plain_word(st::Word::at(&t, alt), kind)?);
+					let alt = st::Word::at(&t, alt);
+					indices.push(self.plain_word(alt, kind, Scan::Word(alt))?);
 				}
 				let parks = indices.iter().any(|&i| self.unit.words[i as usize].parks);
 				let word = &mut self.unit.words[idx as usize];
@@ -1489,13 +1653,39 @@ impl Lower {
 		self.unit.ops[pc as usize].flags |= Op::SYNTAX;
 	}
 
-	/// Lower a word without brace expansion.
-	fn plain_word(&mut self, w: st::Word<'_>, kind: WordKind) -> Idx {
+	/// Lower a word without brace expansion; `scan` is what bash expands it
+	/// as ([`Scan`]).
+	fn plain_word(&mut self, w: st::Word<'_>, kind: WordKind, scan: Scan<'_>) -> Idx {
 		let kind = if self.text { WordKind::Text } else { kind };
 		self.node(w.id(), NodeKind::Word, w.span());
-		let mut parts = Vec::with_capacity(w.parts().len());
-		for part in w.parts() {
-			self.part(part, false, &mut parts)?;
+		let all = w.parts();
+		let mut parts = Vec::with_capacity(all.len());
+		// Arithmetic text keeps the quotes it drops as a pair of
+		// `DroppedQuote` markers: bash expands their inside as a string of
+		// its own, which a `bad substitution` names.
+		// The quoted parts and the index of the first of them.
+		let mut quoted: Option<(st::Seq<'_, st::WordPart<'_>>, usize)> = None;
+		for (i, part) in all.iter().enumerate() {
+			if matches!(scan, Scan::Text) && matches!(part.get(), st::Part::DroppedQuote) {
+				quoted = if quoted.is_some() {
+					None
+				} else {
+					let rest = all.skip(i + 1);
+					let n = rest
+						.iter()
+						.position(|p| matches!(p.get(), st::Part::DroppedQuote))
+						.unwrap_or(rest.len());
+					Some((rest.take(n), i + 1))
+				};
+				continue;
+			}
+			let scan = quoted.map_or(scan, |(parts, first)| Scan::Dq {
+				parts,
+				at: i - first,
+				arith: true,
+				dq_param: false,
+			});
+			self.part(part, false, &mut parts, scan)?;
 		}
 		let parks = parts.iter().any(|p| self.part_parks(p));
 		let idx = self.unit.words.len() as u32;
@@ -1512,7 +1702,7 @@ impl Lower {
 			Part::Lit(_)
 			| Part::Quoted(_)
 			| Part::AnsiC(_)
-			| Part::BadSubst(_)
+			| Part::BadSubst(..)
 			| Part::ComsubSyntax { .. } => false,
 			Part::Comsub { .. } | Part::ProcSub { .. } => true,
 			// zsh words are parsed when they expand: any may substitute.
@@ -1539,7 +1729,8 @@ impl Lower {
 					| OpIr::Length
 					| OpIr::Indirect
 					| OpIr::PrefixNames { .. }
-					| OpIr::Transform(_) => false,
+					| OpIr::Transform(_)
+					| OpIr::BadTransform(..) => false,
 				};
 				// `$!` waits while its job decides on its pid (`Stop::Wait`).
 				let bang = p.param == ParamRef::LastBg;
@@ -1563,7 +1754,12 @@ impl Lower {
 		let entry = self.here();
 		let saved = std::mem::take(&mut self.cond);
 		let text = std::mem::take(&mut self.text);
+		// The body is a script of its own: its `${…}`s expand unquoted.
+		let dq = std::mem::take(&mut self.dq);
+		let arith = std::mem::take(&mut self.arith);
 		self.list(body)?;
+		self.arith = arith;
+		self.dq = dq;
 		self.text = text;
 		self.cond = saved;
 		self.emit(Opcode::SubExit, 0, 0, 0);
@@ -1572,7 +1768,13 @@ impl Lower {
 		Ok(entry)
 	}
 
-	fn part(&mut self, part: st::WordPart<'_>, quoted: bool, out: &mut Vec<Part>) -> R {
+	fn part(
+		&mut self,
+		part: st::WordPart<'_>,
+		quoted: bool,
+		out: &mut Vec<Part>,
+		scan: Scan<'_>,
+	) -> R {
 		match part.get() {
 			st::Part::Lit(b) if quoted => out.push(Part::Quoted(b.into())),
 			st::Part::Lit(b) => out.push(Part::Lit(b.into())),
@@ -1592,8 +1794,11 @@ impl Lower {
 				// drops such a group when the list is empty and the rest is
 				// empty too (`"$xxx$@"` is no word, `"$xxx""$@"` one).
 				let start = out.len();
-				for p in inner {
-					self.part(p, true, out)?;
+				// bash expands the inside of the quotes as a string of its own.
+				let (arith, dq_param) = (self.arith, self.dq);
+				for (j, p) in inner.iter().enumerate() {
+					let scan = Scan::Dq { parts: inner, at: j, arith, dq_param };
+					self.part(p, true, out, scan)?;
 				}
 				let group = &out[start..];
 				let literal = group
@@ -1632,7 +1837,20 @@ impl Lower {
 				out.push(Part::ProcSub { entry, output: p.output() });
 			},
 			st::Part::Compound(elems) => out.push(Part::Compound(self.elems(elems)?)),
-			st::Part::BadSubst(text) => out.push(Part::BadSubst(text.into())),
+			st::Part::BadSubst(raw) => {
+				let (text, value) = scan.text(&self.unit.source);
+				out.push(match bad_transform(raw) {
+					Some((param, index, attrs)) => Part::Param(Box::new(ParamIr {
+						param,
+						index,
+						op: OpIr::BadTransform(text, value, attrs),
+						indirect: false,
+						quoted,
+						braced: true,
+					})),
+					None => Part::BadSubst(text, value),
+				});
+			},
 			st::Part::DroppedQuote => {},
 			st::Part::BadComsub(b) => {
 				out.push(Part::ComsubSyntax { line: b.line(), msg: b.msg().into() });
@@ -1656,6 +1874,32 @@ impl Lower {
 				syn::Special::LastBg => ParamRef::LastBg,
 			},
 		};
+		// bash expands the `-`, `=` and `+` words of a `${…}` it expands as if
+		// double-quoted as one double-quoted string
+		// (`parameter_brace_expand_rhs`'s `SX_STRIPDQ`): a `\"` in their quotes
+		// keeps its backslash, and a `${…}` in them expands the same way. It
+		// expands the other words unquoted: a pattern (`getpattern`'s
+		// `Q_PATQUOTE`), a replacement, a `?` word, an associative subscript.
+		// `Q_ARITH` stays for the `-`, `=`, `+` and replacement words.
+		let dq = quoted || self.dq;
+		let arith = self.arith;
+		let outer = std::mem::replace(&mut self.dq, false);
+		let outer_arith = std::mem::replace(&mut self.arith, false);
+		let words = self.param_words(p, dq, arith);
+		self.arith = outer_arith;
+		self.dq = outer;
+		let (index, op) = words?;
+		Ok(ParamIr { param, index, op, indirect: p.indirect(), quoted, braced: p.braced() })
+	}
+
+	/// The subscript and the operator of `p`, their words lowered; `dq`: bash
+	/// expands `p` as if double-quoted; `arith`: with `Q_ARITH`.
+	fn param_words(
+		&mut self,
+		p: st::Param<'_>,
+		dq: bool,
+		arith: bool,
+	) -> Result<(Option<SubIr>, OpIr), &'static str> {
 		let index = match p.index() {
 			None => None,
 			Some(st::Subscript::At) => Some(SubIr::At),
@@ -1667,12 +1911,18 @@ impl Lower {
 			st::ParamOp::Length => OpIr::Length,
 			st::ParamOp::Indirect => OpIr::Indirect,
 			st::ParamOp::PrefixNames { star } => OpIr::PrefixNames { star },
-			st::ParamOp::Default { colon, word } => OpIr::Default { colon, word: self.word(word)? },
-			st::ParamOp::Assign { colon, word } => OpIr::Assign { colon, word: self.word(word)? },
+			st::ParamOp::Default { colon, word } => {
+				OpIr::Default { colon, word: self.rhs_word(word, dq, arith)? }
+			},
+			st::ParamOp::Assign { colon, word } => {
+				OpIr::Assign { colon, word: self.rhs_word(word, dq, arith)? }
+			},
 			st::ParamOp::Error { colon, word } => {
 				OpIr::Error { colon, word: word.map(|w| self.word(w)).transpose()? }
 			},
-			st::ParamOp::Alt { colon, word } => OpIr::Alt { colon, word: self.word(word)? },
+			st::ParamOp::Alt { colon, word } => {
+				OpIr::Alt { colon, word: self.rhs_word(word, dq, arith)? }
+			},
 			st::ParamOp::Substr { offset, len } => {
 				OpIr::Substr { offset: offset.src().into(), len: len.map(|l| l.src().into()) }
 			},
@@ -1687,7 +1937,7 @@ impl Lower {
 					syn::ReplaceMode::Suffix => ReplaceIr::Suffix,
 				},
 				pat:  self.word(pat)?,
-				rep:  rep.map(|r| self.word(r)).transpose()?,
+				rep:  rep.map(|r| self.rhs_word(r, false, arith)).transpose()?,
 			},
 			st::ParamOp::Case { mode, all, pat } => OpIr::Case {
 				mode: match mode {
@@ -1700,7 +1950,19 @@ impl Lower {
 			},
 			st::ParamOp::Transform(c) => OpIr::Transform(c),
 		};
-		Ok(ParamIr { param, index, op, indirect: p.indirect(), quoted, braced: p.braced() })
+		Ok((index, op))
+	}
+
+	/// The `-`, `=` or `+` word of a `${…}`; `dq`: bash expands the `${…}`
+	/// as if double-quoted, `arith`: with `Q_ARITH`. Also a `/` replacement
+	/// word, which keeps `Q_ARITH` and never the double-quoted context.
+	fn rhs_word(&mut self, w: st::Word<'_>, dq: bool, arith: bool) -> Idx {
+		let outer = std::mem::replace(&mut self.dq, dq);
+		let outer_arith = std::mem::replace(&mut self.arith, arith);
+		let idx = self.word(w);
+		self.arith = outer_arith;
+		self.dq = outer;
+		idx
 	}
 }
 
