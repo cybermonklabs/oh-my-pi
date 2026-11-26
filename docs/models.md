@@ -445,6 +445,12 @@ Remote rows can supply current limits, pricing, modalities, and capability flags
 
 Fresh cached snapshots avoid a network request. If refresh fails, OMP keeps the last usable cached snapshot and marks it stale; without a cache, it falls back to the bundled catalog. Provider discovery state records `source` (`bundled`, `models.dev`, `provider`, or `cache`) and `fetchedAt` so callers can distinguish current remote data from an offline fallback.
 
+When a built-in provider uses a `baseUrl` outside its own catalog endpoints, discovery calls that
+configured endpoint and stores the result under an endpoint-scoped cache key. Its dynamic rows are
+limited to model families the built-in provider owns: an Anthropic entry cannot add a Gemini or GPT
+row, for example. Configure a custom provider with `discovery.type: proxy` or
+`openai-models-list` when an aggregate proxy roster is intentional.
+
 ## Provider and model identity
 
 The registry retains concrete `provider` + `id` identities. Use an exact

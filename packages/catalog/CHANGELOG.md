@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Built-in provider discovery now uses its configured endpoint, keeps proxy model lists within the provider's own model families, and isolates those cached lists from the vendor endpoint
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed
