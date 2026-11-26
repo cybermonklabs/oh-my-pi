@@ -50,10 +50,25 @@ enum Mode {
 /// write files there); each error line's `NAME: line N: ` prefix becomes
 /// `SH: `. Returns the output and the exit status.
 fn run(script: &str, mode: Mode) -> (String, Option<i32>) {
+	let (text, status, _) = run_with(script, mode, false);
+	(text, status)
+}
+
+/// [`run`], under obash's fault injector when `fault`: a snapshot restored
+/// in a new process image at every op (`--fault=1:1 --fault-mode=exec`),
+/// deferred while an external runs. Also returns how many restores the
+/// injector counted (its stats file; 0 without it).
+fn run_with(script: &str, mode: Mode, fault: bool) -> (String, Option<i32>, u64) {
 	let dir = tempfile::tempdir().expect("a row directory");
 	let script = format!("exec 2>&1; {script}");
+	let stats = dir.path().join("fault.stats");
 	let mut cmd = obash_support::obash();
 	cmd.current_dir(dir.path());
+	if fault {
+		cmd.args(["--fault=1:1", "--fault-mode=exec"])
+			.env("PI_SHELL_FAULT_LOST", "defer")
+			.env("PI_SHELL_FAULT_STATS", &stats);
+	}
 	match mode {
 		Mode::C => cmd.args(["-c", &script]),
 		Mode::Script => {
@@ -71,7 +86,13 @@ fn run(script: &str, mode: Mode) -> (String, Option<i32>) {
 			None => format!("{l}\n"),
 		})
 		.collect();
-	(text, out.status.code())
+	let restored = std::fs::read_to_string(&stats)
+		.unwrap_or_default()
+		.split_whitespace()
+		.filter_map(|kv| kv.strip_prefix("restored="))
+		.map(|n| n.parse::<u64>().expect("a restore count"))
+		.sum();
+	(text, out.status.code(), restored)
 }
 
 /// A row: its name, its script, and the output and status bash gives under
@@ -86,6 +107,28 @@ fn assert_rows(rows: &[Row]) {
 			let got = run(script, mode);
 			if got != (want.clone(), Some(*status)) {
 				mismatches.push(format!("{name} ({mode:?}): {got:?}, want ({want:?}, {status})"));
+			}
+		}
+	}
+	assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// [`assert_rows`] with a snapshot restored in a new process image at
+/// every op ([`run_with`]): the same output and status. A run in which the
+/// injector restored nothing is listed too, as it could not have seen a
+/// field lost through a restore.
+fn assert_rows_restored(rows: &[Row]) {
+	let mut mismatches = Vec::new();
+	for (name, script, c, s) in rows {
+		for (mode, (want, status)) in [(Mode::C, c), (Mode::Script, s)] {
+			let (text, got, restored) = run_with(script, mode, true);
+			if restored == 0 {
+				mismatches.push(format!("{name} ({mode:?}): no restore happened"));
+			} else if (&text, got) != (want, Some(*status)) {
+				mismatches.push(format!(
+					"{name} ({mode:?}), {restored} restores: {:?}, want ({want:?}, {status})",
+					(&text, got)
+				));
 			}
 		}
 	}
@@ -1616,12 +1659,25 @@ fn a_discard_in_a_child_forked_in_an_exit_trap_returns_into_the_trap() {
 /// bash keeps one `trap_saved_exit_value`: every trap that starts saves `$?`
 /// there, and nothing restores it when the trap ends. `run_exit_trap` ends
 /// the shell with it when it catches a discard, in its own action or in
-/// the body of a child it forked, so a signal or ERR trap that ran inside
-/// the EXIT trap, or inside the child, decides the status.
+/// the body of a child it forked, so a signal, ERR or RETURN trap that ran
+/// inside the EXIT trap, or inside the child, decides the status.
 #[test]
 fn an_exit_trap_ends_with_the_status_the_last_trap_saved() {
+	assert_rows(&last_trap_rows());
+}
+
+/// The same rows with a snapshot restored in a new process image at every
+/// op: the saved status survives a restore. obash's own fault injector:
+/// bash has none, so this test runs only against obash.
+#[test]
+fn a_restore_keeps_the_status_the_last_trap_saved() {
+	assert_rows_restored(&last_trap_rows());
+}
+
+/// The rows of [`an_exit_trap_ends_with_the_status_the_last_trap_saved`].
+fn last_trap_rows() -> Vec<Row> {
 	const SHIFT: &str = "SH: shift: too many arguments\n";
-	let rows: Vec<Row> = vec![
+	vec![
 		both(
 			"a USR1 trap that ran",
 			r#"trap 'trap "(exit 3)" USR1; false; kill -USR1 $$; FUNCNEST=2; g() { g; }; g; echo in' EXIT; exit 5"#,
@@ -1711,6 +1767,137 @@ fn an_exit_trap_ends_with_the_status_the_last_trap_saved() {
 			r#"trap '( trap "(exit 3)" ERR; false; shift 1 2; echo in ); echo w=$?' EXIT; exit 5"#,
 			&format!("{SHIFT}w=1\n"),
 			5,
+		),
+		// A RETURN trap runs with `$?` as it was before the return, and
+		// saves that.
+		both(
+			"a RETURN trap under set -T",
+			"set -T; trap ':' RETURN; f() { return 5; }; trap 'f; shift 1 2; echo in' EXIT; exit 3",
+			SHIFT,
+			3,
+		),
+		both(
+			"a RETURN trap under declare -ft",
+			"trap ':' RETURN; f() { return 5; }; declare -ft f; trap 'f; shift 1 2; echo in' EXIT; \
+			 exit 3",
+			SHIFT,
+			3,
+		),
+		both(
+			"a RETURN trap of a . file",
+			r"trap ':' RETURN; printf 'return 6\n' > s.sh; trap '. ./s.sh; shift 1 2; echo in' EXIT; exit 3",
+			SHIFT,
+			3,
+		),
+		both(
+			"a RETURN trap the function sets",
+			"f() { trap 'echo R=$?' RETURN; return 5; }; trap 'f; shift 1 2; echo in' EXIT; exit 3",
+			&format!("R=0\n{SHIFT}"),
+			0,
+		),
+		both(
+			"a RETURN trap in a USR1 trap",
+			"set -T; trap ':' RETURN; f() { return 5; }; trap 'f' USR1; trap 'kill -USR1 $$; shift 1 \
+			 2; echo in' EXIT; exit 3",
+			SHIFT,
+			0,
+		),
+		both(
+			"a RETURN trap, then a child",
+			"set -T; trap ':' RETURN; f() { return 5; }; trap 'f; ( shift 1 2; echo in ); echo w=$?' \
+			 EXIT; exit 3",
+			&format!("{SHIFT}w=3\n"),
+			3,
+		),
+	]
+}
+
+/// A RETURN trap runs with `$?` and `PIPESTATUS` as they were before the
+/// function or `.` file returned: bash's `return` sets only
+/// `return_catch_value`. The return status comes after the trap.
+#[test]
+fn a_return_trap_sees_the_status_from_before_the_return() {
+	let t = "set -T; trap 'echo R=$?' RETURN; ";
+	let rows: Vec<Row> = vec![
+		same("return 5", &format!("{t}f() {{ return 5; }}; f; echo top=$?"), "R=0\ntop=5\n"),
+		same(
+			"false, then return 5",
+			&format!("{t}f() {{ false; return 5; }}; f; echo top=$?"),
+			"R=1\ntop=5\n",
+		),
+		same("no return", &format!("{t}f() {{ false; }}; f; echo top=$?"), "R=1\ntop=1\n"),
+		same(
+			"return without a status",
+			&format!("{t}f() {{ (exit 7); return; }}; f; echo top=$?"),
+			"R=7\ntop=7\n",
+		),
+		same(
+			"return in an if",
+			&format!("{t}f() {{ if true; then return 4; fi; }}; f; echo top=$?"),
+			"R=0\ntop=4\n",
+		),
+		same(
+			"after a command substitution",
+			&format!("{t}f() {{ x=$(exit 3); return; }}; f; echo top=$?"),
+			"R=3\ntop=3\n",
+		),
+		same(
+			"a . file returning 6",
+			r"trap 'echo R=$?' RETURN; printf 'return 6\n' > r.sh; false; . ./r.sh; echo top=$?",
+			"R=1\ntop=6\n",
+		),
+		same(
+			"a . file ending in false",
+			r"trap 'echo R=$?' RETURN; printf 'false\n' > r.sh; . ./r.sh; echo top=$?",
+			"R=1\ntop=1\n",
+		),
+		same(
+			"a trap that fails",
+			"set -T; trap '(exit 9)' RETURN; f() { return 5; }; f; echo top=$?",
+			"top=5\n",
+		),
+		same(
+			"the caller's status",
+			&format!("{t}f() {{ return 5; }}; (exit 2); f; echo top=$?"),
+			"R=2\ntop=5\n",
+		),
+		same(
+			"a function returning from a function",
+			&format!("{t}g() {{ return 3; }}; f() {{ g; return 5; }}; f; echo top=$?"),
+			"R=0\nR=3\ntop=5\n",
+		),
+		both(
+			"in the EXIT trap",
+			&format!("{t}f() {{ return 5; }}; trap 'f' EXIT; exit 3"),
+			"R=3\n",
+			3,
+		),
+		same(
+			"PIPESTATUS",
+			"set -T; trap 'echo R=$? s=${PIPESTATUS[*]}' RETURN; f() { false | true; return 5; }; f; \
+			 echo top=$?",
+			"R=0 s=1 0\ntop=5\n",
+		),
+		same(
+			"a trap the function sets",
+			"f() { trap 'echo R=$?' RETURN; return 5; }; f; echo top=$?",
+			"R=0\ntop=5\n",
+		),
+		same(
+			"in a $( )",
+			&format!("{t}f() {{ return 5; }}; x=$(f); echo \"x=[$x] top=$?\""),
+			"x=[R=0] top=5\n",
+		),
+		same(
+			"return after false",
+			&format!("{t}f() {{ return; }}; false; f; echo top=$?"),
+			"R=1\ntop=1\n",
+		),
+		same("exit in a function", &format!("{t}f() {{ exit 4; }}; ( f ); echo top=$?"), "top=4\n"),
+		same(
+			"a function that succeeds",
+			&format!("{t}f() {{ :; }}; false; f; echo top=$?"),
+			"R=0\ntop=0\n",
 		),
 	];
 	assert_rows(&rows);

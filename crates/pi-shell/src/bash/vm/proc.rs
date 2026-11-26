@@ -977,7 +977,12 @@ pub enum ScriptKind {
 		key:               crate::bash::store::TrapKey,
 		status:            i32,
 		cancel:            Option<i32>,
-		return_target:     Option<usize>,
+		/// A RETURN trap: the function or `.` frame to unwind to when it
+		/// ends (its index), and the status that returns. The action runs
+		/// with `$?` as it was before the return (bash's `return` sets only
+		/// `return_catch_value`), and `status` is that `$?`. Two 32-bit
+		/// halves keep `Frame` within its size bound.
+		return_target:     Option<(u32, i32)>,
 		/// An ERR trap run by `set -e`, or an EXIT trap `exit_shell`
 		/// started: the shell exits with `status` when the trap ends.
 		exit:              bool,

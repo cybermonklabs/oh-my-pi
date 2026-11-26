@@ -4788,12 +4788,19 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let e = st(vp);
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
-	vp.status = status;
+	// bash's `return` jumps out before its status reaches `$?` or
+	// `PIPESTATUS` (it sets only `return_catch_value`): the function's or
+	// `.` file's RETURN trap sees them as they were ([`Flow::Return`]).
+	let returns = matches!(control, Some(Transfer::Return(_)))
+		&& vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
+	if !returns {
+		vp.status = status;
+		vp.pipestatus.clear();
+		vp.pipestatus.push(status);
+	}
 	// A simple command ended: bash's `this_command_name` is empty
 	// (`execute_simple_command`, execute_cmd.c:4952).
 	vp.command_name = None;
-	vp.pipestatus.clear();
-	vp.pipestatus.push(status);
 	if k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
 		// One fresh reading for the duration and the event's stamp; the
 		// next command's `CmdStart` may share it.

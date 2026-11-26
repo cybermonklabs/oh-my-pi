@@ -405,7 +405,9 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				zsh_return_flow(k, vp, cx, op, status, ignore_errexit);
 			},
 			Flow::Return(status) => {
-				vp.status = status;
+				// bash's `return` sets only `return_catch_value`: `$?` stays
+				// as it was until the function or `.` file has returned, so
+				// its RETURN trap runs with that `$?` ([`return_trap`]).
 				// `${ ;}` ends like a function; a subshell of a function
 				// (`( return )`, `$( return )`) exits.
 				let target = vp.frames.iter().rposition(|f| {
@@ -417,7 +419,8 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 					)
 				});
 				if let Some(i) = target {
-					if vp.frames[i].kind == FrameKind::NoFork || !return_trap(k, vp, cx, i) {
+					if vp.frames[i].kind == FrameKind::NoFork || !return_trap(k, vp, cx, i, status) {
+						vp.status = status;
 						unwind(&mut k.root, cx.store, vp, i);
 					}
 				} else if vp.parent.is_some() && in_function_scope(k, cx, vp) {
@@ -1332,7 +1335,8 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 		// The text of a zsh command substitution (`child_text`) ends its
 		// child: the child's own EXIT trap runs.
 		let sub_end = eval && top == 0 && vp.parent.is_some() && mode.dialect() == Dialect::Zsh;
-		if source && return_trap(k, vp, cx, top) {
+		let returns = vp.status;
+		if source && return_trap(k, vp, cx, top, returns) {
 			return None;
 		}
 		pop_frame(&mut k.root, cx.store, vp);
@@ -1361,8 +1365,9 @@ fn next_command(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> Option<WaitK
 			zsh_discard(k, vp, cx, trap_status);
 		} else if let Some(status) = status {
 			vp.status = status;
-			if let Some(target) = return_target {
-				unwind(&mut k.root, cx.store, vp, target);
+			if let Some((target, returns)) = return_target {
+				vp.status = returns;
+				unwind(&mut k.root, cx.store, vp, target as usize);
 			} else if debug
 				&& trap_status != 0
 				&& state::option(&mut k.root, cx.store, vp, OptId::Extdebug).unwrap_or(false)
@@ -1845,7 +1850,8 @@ fn end_unit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 		},
 		FrameKind::Function { .. } => {
 			let target = vp.frames.len() - 1;
-			if !return_trap(k, vp, cx, target) {
+			let returns = vp.status;
+			if !return_trap(k, vp, cx, target, returns) {
 				pop_frame(&mut k.root, cx.store, vp);
 			}
 		},
@@ -5893,11 +5899,19 @@ fn note_pseudo_traps(k: &mut Kernel, cx: &mut Cx<'_>) {
 pub const ENTRY_DEBUG: u32 = u32::MAX;
 
 /// Start the RETURN trap of function or `.` frame `target`, the frames
-/// above it to unwind when it ends. Its `$LINENO` is the function body's
-/// line, or the line of the `.` command, whose level of the call-stack
-/// arrays has already ended (bash runs it after `_evalfile`). `false` when
-/// no trap runs.
-fn return_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, target: usize) -> bool {
+/// above it to unwind when it ends, when `returns` is the status that
+/// returns. The action runs with `$?` as it was before the return, and
+/// leaves `returns` ([`ScriptKind::Trap::return_target`]). Its `$LINENO`
+/// is the function body's line, or the line of the `.` command, whose level
+/// of the call-stack arrays has already ended (bash runs it after
+/// `_evalfile`). `false` when no trap runs.
+fn return_trap(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	target: usize,
+	returns: i32,
+) -> bool {
 	let body = match &vp.frames[target] {
 		Frame { kind: FrameKind::Function { .. }, unit: Some(unit), .. } => {
 			Some(super::callstack::body_line(unit))
@@ -5915,17 +5929,17 @@ fn return_trap(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, target: usize) -
 	if let Some(line) = line {
 		set_trap_line(vp, line);
 	}
-	mark_return(vp, target);
+	mark_return(vp, target, returns);
 	true
 }
 
-fn mark_return(vp: &mut Vproc, target: usize) {
+fn mark_return(vp: &mut Vproc, target: usize, returns: i32) {
 	if let Some(Frame {
 		kind: FrameKind::Script { what: ScriptKind::Trap { return_target, .. }, .. },
 		..
 	}) = vp.frames.last_mut()
 	{
-		*return_target = Some(target);
+		*return_target = Some((target as u32, returns));
 	}
 }
 
