@@ -12,3 +12,11 @@ pub mod summary;
 mod testing;
 
 pub use language::SupportLang;
+
+/// A doctest planted on a scratch branch, never a release member: it
+/// prints, and the gate's doctest reader must fail the job naming it.
+///
+/// ```
+/// println!("planted: a doctest that prints");
+/// ```
+pub fn planted_print() {}
