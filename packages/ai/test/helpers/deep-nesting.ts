@@ -1,12 +1,15 @@
 /**
  * Values nested deeper than code that recurses can walk. A tool's arguments and
  * its result are any JSON, and a session line holds what `JSON.parse` reads
- * (about 400,000 levels), while a recursive walk stops near 22,000 and Bun's
+ * (millions of levels), while a recursive walk stops near 22,000 and Bun's
  * `JSON.stringify` near 40,000. This file imports nothing, so a test may also
  * bundle it for the browser.
  */
 
-/** Levels past what a recursive walk (about 22,000) and `JSON.stringify` (40,000) reach; `JSON.parse` reads 400,000. */
+/**
+ * Levels past what a recursive walk (about 22,000) and `JSON.stringify`
+ * (40,000) reach; `JSON.parse` reads millions.
+ */
 export const DEEP_LEVELS = 50_000;
 
 /** `{ next: … }` nested `levels` levels around `bottom`. */

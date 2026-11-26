@@ -63,7 +63,7 @@ describe("RPC message pagination", () => {
 		expect(first.nextCursor).toBeDefined();
 	});
 
-	// A tool result's details nest as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000.
+	// A tool result's details nest as deep as JSON.parse reads (millions of levels); JSON.stringify gives out at 40,000.
 	it("pages past a message nested deeper than JSON.stringify recurses, counting its bytes", () => {
 		const details = nestedChain({ leaf: "bottom" });
 		const deep: AgentMessage = {

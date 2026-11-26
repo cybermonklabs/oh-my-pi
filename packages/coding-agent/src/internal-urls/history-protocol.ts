@@ -203,7 +203,7 @@ function jsonFence(text: string): string {
  * `value`, part of a session entry, as a fenced JSON block: indented, or on
  * one line when it nests past `INDENTED_JSON_LEVELS` levels, where indented
  * text grows with the square of the depth and `JSON.stringify` runs out of
- * stack near 40,000 levels while an entry nests up to 400,000.
+ * stack near 40,000 levels while an entry nests up to millions.
  */
 function entryJsonFence(value: unknown): string {
 	return jsonFence(stringifyDeepJson(value, { space: 2 }) ?? "null");

@@ -10,7 +10,7 @@ export interface JsonBlockProps {
 
 /**
  * Collapsible, copyable pretty-printed JSON. A value nested past `INDENTED_JSON_LEVELS` (1,000) levels, which a
- * transcript entry can be (a line nests up to 400,000), is shown on one line: indented text grows with the square of
+ * transcript entry can be (a line nests up to millions), is shown on one line: indented text grows with the square of
  * the depth, and a browser's `JSON.stringify` runs out of stack long before that depth.
  */
 export function JsonBlock({ data, title = "JSON", initialCollapsed = false }: JsonBlockProps) {

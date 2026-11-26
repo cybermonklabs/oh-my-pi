@@ -40,7 +40,7 @@ export interface RepeatedToolCallDetection {
 /**
  * `value` with each object's keys sorted and its intent fields left out, arrays in order. The walk
  * keeps its own stack ({@link runNested}): a tool call's arguments are any JSON, as deep as
- * `JSON.parse` reads (400,000 levels), where a recursive walk stops near 22,000.
+ * `JSON.parse` reads (millions of levels), where a recursive walk stops near 22,000.
  */
 function canonicalizeToolCallValue(value: unknown): unknown {
 	return value && typeof value === "object" ? runNested(canonicalToolCallNode(value, new ContainerPath())) : value;

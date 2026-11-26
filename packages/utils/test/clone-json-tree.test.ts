@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { cloneJsonTree, structuredCloneDeep } from "@oh-my-pi/pi-utils";
 
-/** Levels past what a recursive copy reaches (about 12,000 for arrays); a transcript line holds 400,000. */
+/** Levels past what a recursive copy reaches (about 12,000 for arrays); a transcript line holds millions. */
 const DEEP_LEVELS = 50_000;
 
 describe("cloneJsonTree", () => {

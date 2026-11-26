@@ -458,7 +458,7 @@ describe("jsonDeepEquals", () => {
 		expect(answers(jsonDeepEquals)).toEqual(answers((a, b) => Bun.deepEquals(a, b)));
 	});
 
-	// A transcript line nests 400,000 levels; `Bun.deepEquals` runs out of stack near 16,000.
+	// A transcript line nests millions of levels; `Bun.deepEquals` runs out of stack near 16,000.
 	it("compares values nested 50,000 levels", () => {
 		const chain = (bottom: unknown): unknown => {
 			let node = bottom;

@@ -79,7 +79,7 @@ function isPlainObject(value: object): value is Record<string, unknown> {
  * `JSON.stringify(value)`, descending `depth` levels into arrays and plain
  * objects. Anything deeper, or with custom serialization, is stringified whole,
  * by {@link stringifyDeepJson}: an entry nests as deep as `JSON.parse` reads a
- * transcript line (400,000 levels), where `JSON.stringify` stops at 40,000.
+ * transcript line (millions of levels), where `JSON.stringify` stops at 40,000.
  */
 function* jsonPieces(value: unknown, depth: number): Generator<string> {
 	if (depth > 0 && typeof value === "object" && value !== null && !("toJSON" in value)) {

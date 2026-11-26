@@ -603,7 +603,7 @@ interface BlobRefSite {
  * Collect the blob references in session image blocks and provider image URLs.
  * Snapcompact frames stay as references until context rebuilding selects them.
  * The walk keeps its own stack ({@link runNested}), so it reads a value as deep
- * as `JSON.parse` reads (about ten times what a recursive walk's stack allows).
+ * as `JSON.parse` reads (over a hundred times what a recursive walk's stack allows).
  * A container met again inside itself (a cycle, never in parsed JSON) is not
  * walked again.
  */

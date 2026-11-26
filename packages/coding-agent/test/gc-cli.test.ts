@@ -3367,7 +3367,7 @@ describe("runGcCommand replay data stripping", () => {
 		expectStripped(lines, replayLines(id));
 	});
 
-	// A line holds JSON as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000.
+	// A line holds JSON as deep as JSON.parse reads (millions of levels); JSON.stringify gives out at 40,000.
 	test("strips a turn whose tool call's arguments nest deeper than JSON.stringify recurses", async () => {
 		const deepArguments = nestedChainJson();
 		const id = Bun.randomUUIDv7();

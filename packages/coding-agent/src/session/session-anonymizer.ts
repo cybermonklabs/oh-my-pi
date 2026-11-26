@@ -1282,7 +1282,7 @@ function looksLikePath(value: string): boolean {
 /**
  * Anonymizes session records. A record's walk keeps its own stack ({@link runNested}): each method
  * that descends is a step that yields the step for a child, so a record nests as deep as `JSON.parse`
- * reads a transcript line (400,000 levels), where a recursive walk stops near 22,000.
+ * reads a transcript line (millions of levels), where a recursive walk stops near 22,000.
  */
 export class SessionAnonymizer {
 	#tokens = new Map<string, number>();

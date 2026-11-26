@@ -366,7 +366,7 @@ describe("history:// protocol", () => {
 		expect(resource.sourcePath).toBeUndefined();
 	});
 
-	// A branch's entries nest as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000.
+	// A branch's entries nest as deep as JSON.parse reads (millions of levels); JSON.stringify gives out at 40,000.
 	it("renders entries nested deeper than JSON.stringify recurses, without indentation", async () => {
 		const deepText = nestedChainJson();
 		const timestamp = new Date(0).toISOString();

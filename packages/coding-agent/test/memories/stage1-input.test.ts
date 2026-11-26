@@ -120,7 +120,7 @@ describe("buildStage1RolloutItems", () => {
 		]);
 	});
 
-	// A transcript line holds JSON as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000.
+	// A transcript line holds JSON as deep as JSON.parse reads (millions of levels); JSON.stringify gives out at 40,000.
 	it("writes a message nested deeper than JSON.stringify recurses, whole and in the tail of a truncated payload", async () => {
 		const deepArguments = nestedChainJson();
 		const messages = [

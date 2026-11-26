@@ -4,8 +4,9 @@
  * yields the child's step, and {@link runNested} runs it and resumes the step
  * with its result. The call stack then stays one step deep however deep the
  * value is: a value parsed from JSON (a session entry read from a transcript
- * line, say) nests as deep as `JSON.parse` reads (400,000 levels), about ten
- * times what a recursive walk's stack allows, and less on a worker thread.
+ * line, say) nests as deep as `JSON.parse` reads (it does not recurse: millions
+ * of levels), over a hundred times what a recursive walk's stack allows, and
+ * less on a worker thread.
  */
 
 /** One step of a walk: it yields each nested step it needs and receives that step's result back. */

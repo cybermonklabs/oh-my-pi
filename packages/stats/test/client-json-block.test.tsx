@@ -1,6 +1,6 @@
 /**
  * The dashboard's JSON view (`JsonBlock`, the span drawer's "Raw entry" and the request drawer's payloads) shows a
- * transcript entry nested as deep as a session line holds (400,000 levels), where `JSON.stringify(data, null, 2)`
+ * transcript entry nested as deep as a session line holds (millions of levels), where `JSON.stringify(data, null, 2)`
  * ran out of stack while rendering, and pi-utils' JSON writer it uses runs in the browser bundle.
  */
 import { afterEach, describe, expect, it } from "bun:test";

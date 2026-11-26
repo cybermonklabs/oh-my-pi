@@ -457,7 +457,7 @@ function isPlainRecord(obj: object): obj is Record<string, unknown> {
  * The regex-protected secret values in every string of `value`, JSON data
  * such as a tool call's arguments. The walk keeps its own stack
  * ({@link runNested}), so it reads a value as deep as `JSON.parse` reads
- * (400,000 levels) where a recursive one stops near 22,000.
+ * (millions of levels) where a recursive one stops near 22,000.
  */
 export function collectJsonRegexSecretValues(obfuscator: SecretObfuscator, value: JsonValue): SecretValueSet {
 	const values = new SecretValueSet();

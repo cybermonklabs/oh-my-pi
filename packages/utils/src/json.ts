@@ -94,14 +94,14 @@ export const INDENTED_JSON_LEVELS = 1_000;
  * Levels past which a value is written by {@link stringifyJsonIteratively}:
  * Bun's `JSON.stringify` takes milliseconds below them, seconds past about
  * 25,000 levels, and runs out of stack at 40,000, while `JSON.parse` reads
- * 400,000.
+ * millions (it does not recurse).
  */
 export const DEEP_JSON_LEVELS = 10_000;
 
 /**
  * `JSON.stringify(value)` ({@link stringifyJson} with `bigintAsString`), also
  * for a value nested deeper than the engine's recursion allows (Bun's throws a
- * `RangeError` at 40,000 levels, while its `JSON.parse` reads 400,000): on that
+ * `RangeError` at 40,000 levels, while its `JSON.parse` reads millions): on that
  * `RangeError` the value is written again by {@link stringifyJsonIteratively},
  * which gives the same bytes. Any value `JSON.stringify` writes gets its
  * result, and any other error is its own. A `RangeError` from elsewhere (a
@@ -309,7 +309,7 @@ export function stableStringifyJson(value: unknown): string {
  * walks arrays and plain or null-prototype objects on its own stack
  * ({@link runNested}), where `Bun.deepEquals` recurses and runs out of stack
  * near 16,000 levels, while a value parsed from a transcript line nests
- * 400,000. It keeps `Bun.deepEquals`' rules: an array equals an array whose
+ * millions. It keeps `Bun.deepEquals`' rules: an array equals an array whose
  * element at each index (a hole and a missing trailing element read as
  * `undefined`) is equal, other keys of an array ignored; an object equals an
  * object with the same own enumerable string and symbol keys holding equal

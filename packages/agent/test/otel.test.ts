@@ -438,8 +438,8 @@ describe("agent-loop OTEL instrumentation", () => {
 		expect(JSON.parse(systemAttr!)).toEqual([{ type: "text", content: "sys-instruction" }]);
 	});
 
-	// A session's messages nest as deep as JSON.parse reads (400,000 levels); JSON.stringify gives out at 40,000, after
-	// 1.5 s or more on such a value, and content capture writes the whole history on every request.
+	// A session's messages nest as deep as JSON.parse reads (millions of levels); JSON.stringify gives out at 40,000,
+	// after 1.5 s or more on such a value, and content capture writes the whole history on every request.
 	it("captures full content of a tool call and result nested deeper than JSON.stringify recurses, never trying JSON.stringify on them", async () => {
 		// The tool call and its result from an earlier turn: the next request sends both back.
 		const history: AgentMessage[] = [

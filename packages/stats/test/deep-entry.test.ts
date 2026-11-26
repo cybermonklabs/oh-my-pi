@@ -1,6 +1,6 @@
 /**
  * Contracts for a transcript holding an entry nested deeper than `JSON.stringify`
- * recurses (Bun's gives out at 40,000 levels; `JSON.parse` reads 400,000): the
+ * recurses (Bun's gives out at 40,000 levels; `JSON.parse` reads millions): the
  * dashboard routes answer with it, the trace and the parser measure it, and the
  * Spotlight ingest reads its tool call.
  */

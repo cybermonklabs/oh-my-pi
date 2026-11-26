@@ -182,7 +182,7 @@ let spotlightQueue: Promise<unknown> = Promise.resolve();
 
 /**
  * `Response.json(value)` for a value that holds a transcript's entries, which
- * nest as deep as a session line (400,000 levels): written by
+ * nest as deep as a session line (millions of levels): written by
  * `stringifyDeepJson`, where `Response.json` runs out of stack at 40,000.
  */
 function sessionContentResponse(value: unknown): Response {

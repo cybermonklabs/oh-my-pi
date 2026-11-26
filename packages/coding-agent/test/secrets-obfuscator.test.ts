@@ -3448,7 +3448,7 @@ describe("SecretObfuscator cross-turn cache stability", () => {
 		expect(JSON.stringify(obfuscateToolArguments(obfuscator, obfuscated))).toEqual(serialized);
 	});
 
-	// A tool call's arguments nest as deep as JSON.parse reads (400,000 levels); a recursive walk stops near 22,000.
+	// A tool call's arguments nest as deep as JSON.parse reads (millions of levels); a recursive walk stops near 22,000.
 	it("hides and restores a secret at the bottom of tool-call arguments nested deeper than a recursive walk reaches", () => {
 		const obfuscator = new SecretObfuscator([{ type: "regex", content: "tok_[a-z0-9]+" }]);
 		const args = { root: nestedChain({ leaf: "tok_abc123" }) };
@@ -4539,7 +4539,7 @@ describe("native replay secret obfuscation", () => {
 			type: "function_call",
 			call_id: "call-deep",
 			name: "inspect",
-			// JSON.parse reads 400,000 levels; JSON.stringify could not have written this text.
+			// JSON.parse reads millions of levels; JSON.stringify could not have written this text.
 			arguments: nestedChainJson({ leaf: "tok_abc123" }),
 		};
 		const messages: Message[] = [

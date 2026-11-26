@@ -37,7 +37,7 @@ describe("writeBase64Json", () => {
 		expect(await streamed(session)).toBe(expected);
 	});
 
-	// A tool returns any JSON, and a transcript line holds it as deep as `JSON.parse` reads (400,000 levels).
+	// A tool returns any JSON, and a transcript line holds it as deep as `JSON.parse` reads (millions of levels).
 	test("writes an entry nested 50,000 levels, past where JSON.stringify stops", async () => {
 		const details = nestedChain({ leaf: "bottom" });
 		const deep = { header: null, entries: [{ id: "1", message: { role: "toolResult", details } }], leafId: "1" };
