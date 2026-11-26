@@ -1228,6 +1228,73 @@ fn spawn_piped(
 	}
 }
 
+/// Test support: bounded waits for what another thread does.
+#[cfg(test)]
+pub(crate) mod wait {
+	use std::time::{Duration, Instant};
+
+	use crate::host::Backoff;
+
+	/// How long a test waits for an event before it fails.
+	const BOUND: Duration = Duration::from_secs(30);
+
+	/// Polls `ready` until it holds, with pauses from 1 ms up to 20 ms; fails
+	/// naming `what` when it does not within 30 s.
+	pub(crate) fn until(what: &str, mut ready: impl FnMut() -> bool) {
+		let deadline = Instant::now() + BOUND;
+		let mut backoff = Backoff::new();
+		while !ready() {
+			assert!(Instant::now() < deadline, "timed out after {BOUND:?} waiting for {what}");
+			std::thread::sleep(backoff.pause());
+		}
+	}
+
+	/// A thread that is about to block, named by its kernel thread id on Linux,
+	/// where `/proc` shows whether it sleeps.
+	#[derive(Clone, Copy)]
+	pub(crate) struct Sleeper {
+		#[cfg(target_os = "linux")]
+		tid: libc::pid_t,
+	}
+
+	impl Sleeper {
+		/// The calling thread.
+		pub(crate) fn current() -> Self {
+			Self {
+				// SAFETY: gettid has no preconditions.
+				#[cfg(target_os = "linux")]
+				tid: unsafe { libc::gettid() },
+			}
+		}
+
+		/// Waits until the thread sleeps in a blocking call (`/proc` state `S`);
+		/// fails when it ends first. Off Linux no thread state can be read: it
+		/// sleeps `fallback`, the fixed wait this replaced.
+		pub(crate) fn wait_asleep(self, what: &str, fallback: Duration) {
+			#[cfg(target_os = "linux")]
+			{
+				let _ = fallback;
+				let path = format!("/proc/self/task/{}/stat", self.tid);
+				let mut ended = false;
+				until(what, || {
+					// The state follows the command name, which may hold spaces
+					// and parentheses.
+					let stat = std::fs::read_to_string(&path).unwrap_or_default();
+					let state = stat.rsplit_once(") ").and_then(|(_, rest)| rest.chars().next());
+					ended = matches!(state, None | Some('Z' | 'X'));
+					ended || state == Some('S')
+				});
+				assert!(!ended, "waiting for {what}: the thread ended");
+			}
+			#[cfg(not(target_os = "linux"))]
+			{
+				let _ = what;
+				std::thread::sleep(fallback);
+			}
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1347,11 +1414,15 @@ mod tests {
 		let (mut client, server) = local_pair(Arc::clone(&cancel));
 		let flag = Arc::clone(&cancel);
 		let started = Instant::now();
+		let (tx, rx) = std::sync::mpsc::channel();
 		let blocked = std::thread::spawn(move || {
+			tx.send(wait::Sleeper::current()).unwrap();
 			let mut buf = [0u8; 1];
 			client.reader.read_exact(&mut buf).unwrap_err()
 		});
-		std::thread::sleep(Duration::from_millis(150));
+		// Cancel once the read sleeps on the empty pipe.
+		let reader = rx.recv().unwrap();
+		reader.wait_asleep("the read to block on the empty pipe", Duration::from_millis(150));
 		flag.store(true, Ordering::Relaxed);
 		let err = blocked.join().unwrap();
 		assert!(started.elapsed() < Duration::from_secs(5));
@@ -1654,8 +1725,10 @@ mod tests {
 				spawn_shell(&child_env(dir.path()), &base_cfg(&rsh, &logger), Arc::clone(&cancel))
 					.unwrap();
 			let flag = Arc::clone(&cancel);
+			let reader = wait::Sleeper::current();
 			std::thread::spawn(move || {
-				std::thread::sleep(Duration::from_millis(150));
+				// Cancel once the read sleeps waiting for the shell's output.
+				reader.wait_asleep("the read to block on the shell", Duration::from_millis(150));
 				flag.store(true, Ordering::Relaxed);
 			});
 			// The read ends with the cancel's error (a shell left to run to

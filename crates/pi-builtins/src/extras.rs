@@ -290,22 +290,67 @@ mod tests {
 		assert!(err.starts_with("cat: /definitely/not/here:"), "stderr: {err:?}");
 	}
 
+	/// The scheduler state of thread `tid` of this process (`S` while it
+	/// sleeps in a blocking call), from `/proc/self/task/<tid>/stat`.
+	#[cfg(all(feature = "util.cat", target_os = "linux"))]
+	fn thread_state(tid: i32) -> Option<char> {
+		let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+		// The state follows the command name in parentheses, which may itself
+		// hold spaces and parentheses.
+		stat.rsplit_once(')')?.1.trim_start().chars().next()
+	}
+
 	#[cfg(feature = "util.cat")]
-	#[tokio::test]
-	async fn cancelling_a_blocked_read_returns_130() {
-		let (mut invocation, stdin, _stdout, _stderr) = piped(&["cat"]);
-		let cancel = CancellationToken::new();
-		invocation.cancel = Some(cancel.clone());
-		let running = tokio::spawn(run(invocation));
-		tokio::time::sleep(Duration::from_millis(100)).await;
-		assert!(!running.is_finished(), "cat must block on its open stdin pipe");
-		cancel.cancel();
-		let code = tokio::time::timeout(Duration::from_secs(10), running)
-			.await
-			.expect("cancelled cat should end promptly")
-			.expect("cat task");
-		assert_eq!(code, 130);
-		drop(stdin);
+	#[test]
+	fn cancelling_a_blocked_read_returns_130() {
+		let mut builder = tokio::runtime::Builder::new_current_thread();
+		builder.enable_all();
+		// cat runs on the runtime's blocking pool, whose threads report their
+		// thread ids as they start.
+		#[cfg(target_os = "linux")]
+		let mut pool_threads = {
+			let (started, pool_threads) = tokio::sync::mpsc::unbounded_channel();
+			builder.on_thread_start(move || {
+				let _ = started.send(nix::unistd::gettid().as_raw());
+			});
+			pool_threads
+		};
+		builder.build().expect("test runtime").block_on(async {
+			let (mut invocation, stdin, _stdout, _stderr) = piped(&["cat"]);
+			let cancel = CancellationToken::new();
+			invocation.cancel = Some(cancel.clone());
+			let running = tokio::spawn(run(invocation));
+			// Cancel only once cat's thread sleeps in its read of the empty
+			// stdin pipe: a cancel that comes before the read stops cat there
+			// and proves nothing about a blocked read.
+			#[cfg(target_os = "linux")]
+			{
+				let tid = tokio::time::timeout(Duration::from_secs(10), pool_threads.recv())
+					.await
+					.ok()
+					.flatten()
+					.expect("cat's blocking-pool thread never started");
+				let mut backoff = crate::host::Backoff::new();
+				tokio::time::timeout(Duration::from_secs(10), async {
+					while thread_state(tid) != Some('S') {
+						tokio::time::sleep(backoff.pause()).await;
+					}
+				})
+				.await
+				.expect("cat's thread never blocked in its stdin read");
+			}
+			// Without `/proc`, give cat time to reach the read.
+			#[cfg(not(target_os = "linux"))]
+			tokio::time::sleep(Duration::from_millis(100)).await;
+			assert!(!running.is_finished(), "cat must block on its open stdin pipe");
+			cancel.cancel();
+			let code = tokio::time::timeout(Duration::from_secs(10), running)
+				.await
+				.expect("cancelled cat should end promptly")
+				.expect("cat task");
+			assert_eq!(code, 130);
+			drop(stdin);
+		});
 	}
 
 	#[cfg(feature = "util.sleep")]
@@ -323,13 +368,14 @@ mod tests {
 		let (mut invocation, _stdin, _stdout, _stderr) = piped(&["sleep", "100"]);
 		let cancel = CancellationToken::new();
 		invocation.cancel = Some(cancel.clone());
-		let running = tokio::spawn(run(invocation));
-		tokio::time::sleep(Duration::from_millis(50)).await;
+		let mut running = std::pin::pin!(run(invocation));
+		// Pending: sleep is past its start-up cancellation check and waits on
+		// its timer, which the cancel must cut short.
+		assert!(futures::poll!(running.as_mut()).is_pending(), "sleep 100 must wait");
 		cancel.cancel();
 		let code = tokio::time::timeout(Duration::from_secs(10), running)
 			.await
-			.expect("cancelled sleep should end promptly")
-			.expect("sleep task");
+			.expect("cancelled sleep should end promptly");
 		assert_eq!(code, 130);
 	}
 

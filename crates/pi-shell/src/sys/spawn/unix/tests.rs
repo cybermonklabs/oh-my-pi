@@ -323,19 +323,53 @@ fn exit_codes_and_group_signals_are_reported() {
 	}
 }
 
+/// Fixture scripts held at their first `read` until the test releases them:
+/// each reads its stdin, a pipe of its own, and the release writes one line
+/// into every pipe. A line, not an end of file: a child that another test of
+/// this binary forks holds a copy of every pipe end until its exec, and may
+/// first wait in a FIFO open (`fork_redirs`), which delays an end of file
+/// but not a line already written.
+#[derive(Default)]
+struct Hold(Vec<(io::PipeReader, io::PipeWriter)>);
+
+impl Hold {
+	/// The stdin of one more held script.
+	fn stdin(&mut self) -> StdioSpec {
+		let (reader, writer) = io::pipe().unwrap();
+		let fd = std::os::fd::AsRawFd::as_raw_fd(&reader);
+		self.0.push((reader, writer));
+		StdioSpec::Inherit(OsHandle(u64::try_from(fd).unwrap()))
+	}
+
+	/// Let every held script go on past its `read`.
+	fn release(&mut self) {
+		for (_, writer) in &mut self.0 {
+			io::Write::write_all(writer, b"\n").unwrap();
+		}
+	}
+}
+
 /// More externals at once than waiters are kept parked, then a sequential
 /// round that reuses the parked ones: every exit reaches its own external.
 #[test]
 fn parked_waiters_report_each_external_its_own_exit() {
 	let env = EnvView::default();
 	let s = spawner(Sessions::Inherit, Duration::from_secs(2));
+	// Every script runs until it is released: more externals at once than
+	// waiters are kept, however slow their spawns.
+	let mut hold = Hold::default();
 	let scripts: Vec<Vec<BString>> = (0..super::IDLE_MAX + 4)
-		.map(|i| sh(&format!("sleep 0.2; exit {i}")))
+		.map(|i| sh(&format!("read x; exit {i}")))
 		.collect();
 	let mut running: Vec<_> = scripts
 		.iter()
-		.map(|a| s.spawn(spec(a, &env, NEW)).unwrap())
+		.map(|a| {
+			let mut sp = spec(a, &env, NEW);
+			sp.stdio[0] = hold.stdin();
+			s.spawn(sp).unwrap()
+		})
 		.collect();
+	hold.release();
 	for (i, p) in running.iter_mut().enumerate().rev() {
 		assert_eq!(wait(p), ExitStatus::Exited(i32::try_from(i).unwrap()));
 	}
@@ -1887,11 +1921,14 @@ fn output_written_after_the_extproc_is_dropped_still_arrives() {
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
 	let out = MemFile::default();
-	let a = sh("/bin/sleep 0.3; echo late");
+	// The script writes once released, after its `ExtProc` is gone.
+	let mut hold = Hold::default();
+	let a = sh("read x; echo late");
 	let mut sp = spec(&a, &env, NEW);
-	sp.stdio = [StdioSpec::Null, out.boxed(), StdioSpec::Null];
+	sp.stdio = [hold.stdin(), out.boxed(), StdioSpec::Null];
 	sp.lineage = crate::bash::Lineage { label: 0, detached: true };
 	drop(s.spawn(sp).unwrap());
+	hold.release();
 	let waker = Waker::from(Arc::new(Unpark(thread::current())));
 	let cx = Context::from_waker(&waker);
 	let mut key = crate::sys::WaitKey::default();
@@ -2045,7 +2082,10 @@ fn exit_is_not_reported_before_the_output_reaches_the_engine() {
 	until("child exited", || proc::info(pid).is_some_and(|i| i.state == ProcState::Zombie));
 	let waker = Waker::from(Arc::new(Unpark(thread::current())));
 	let mut cx = Context::from_waker(&waker);
-	thread::sleep(Duration::from_millis(200));
+	// The waiter thread drops its spawner reference once it has recorded the
+	// exit (`waiter`); the spawner and `p` hold the other two. From then on
+	// only the pump holds the completion back.
+	until("the waiter recorded the exit", || Arc::strong_count(&s.shared) == 2);
 	assert!(p.poll_wait(&mut cx).is_pending(), "the pump still holds the output");
 	let pump = {
 		let mut g = gate.open.lock();
@@ -3050,18 +3090,21 @@ fn parked_externals_deliver_output_and_their_own_exits() {
 	let s = parked_spawner(Duration::from_secs(2));
 	let mut parker = crate::sys::Parker::new();
 	let outs: Vec<MemFile> = (0..6).map(|_| MemFile::default()).collect();
+	// All six run until released, then end at once.
+	let mut hold = Hold::default();
 	let scripts: Vec<Vec<BString>> = (0..6)
-		.map(|i| sh(&format!("sleep 0.{i}; printf out{i}; exit {i}")))
+		.map(|i| sh(&format!("read x; printf out{i}; exit {i}")))
 		.collect();
 	let mut running: Vec<_> = scripts
 		.iter()
 		.zip(&outs)
 		.map(|(a, out)| {
 			let mut sp = spec(a, &env, NEW);
-			sp.stdio = [StdioSpec::Null, out.boxed(), StdioSpec::Null];
+			sp.stdio = [hold.stdin(), out.boxed(), StdioSpec::Null];
 			s.spawn(sp).unwrap()
 		})
 		.collect();
+	hold.release();
 	for (i, p) in running.iter_mut().enumerate().rev() {
 		assert_eq!(wait_parked(&mut parker, p), ExitStatus::Exited(i32::try_from(i).unwrap()));
 		assert_eq!(outs[i].captured(), format!("out{i}").as_bytes());

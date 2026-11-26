@@ -9,7 +9,7 @@ use std::{
 	os::unix::ffi::OsStrExt as _,
 	path::Path,
 	sync::Arc,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -19,7 +19,8 @@ use pi_vfs::{FileHandle, FileSystem, FileType, Metadata, OpenOptions, Permission
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-	session::{RunStdio, Session, SessionConfig},
+	bash::{Event, EventData, EventKind, EventMask, EventSink, WaitKey},
+	session::{RunOptions, RunStdio, Session, SessionConfig},
 	vfs::VfsFs,
 };
 
@@ -63,6 +64,7 @@ struct Ran {
 	cancelled: bool,
 	stdout:    String,
 	stderr:    String,
+	elapsed:   Duration,
 }
 
 fn read_back(mut file: std::fs::File) -> String {
@@ -72,24 +74,26 @@ fn read_back(mut file: std::fs::File) -> String {
 	text
 }
 
-async fn run_with(s: &mut Session, command: &str, cancel: CancellationToken) -> Ran {
+async fn run_with(s: &mut Session, options: RunOptions, cancel: CancellationToken) -> Ran {
 	let (out, err) = (tempfile::tempfile().unwrap(), tempfile::tempfile().unwrap());
 	let stdio = RunStdio {
 		stdin:  Some(std::fs::File::open("/dev/null").unwrap()),
 		stdout: Some(out.try_clone().unwrap()),
 		stderr: Some(err.try_clone().unwrap()),
 	};
-	let outcome = s.run(command, stdio, cancel).await.unwrap();
+	let started = Instant::now();
+	let outcome = s.run_with(options, stdio, cancel).await.unwrap();
 	Ran {
 		status:    outcome.status,
 		cancelled: outcome.cancelled,
 		stdout:    read_back(out),
 		stderr:    read_back(err),
+		elapsed:   started.elapsed(),
 	}
 }
 
 async fn run(s: &mut Session, command: &str) -> Ran {
-	run_with(s, command, CancellationToken::new()).await
+	run_with(s, RunOptions::new(command), CancellationToken::new()).await
 }
 
 /// stdout of `command`, which must succeed.
@@ -167,18 +171,42 @@ async fn background_extras_are_jobs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_ends_an_extra_promptly() {
+	/// Rings when a command of the run parks on a native task: an extra
+	/// runs and the shell waits for it.
+	#[derive(Default)]
+	struct ParkedOnExtra(tokio::sync::Notify);
+	impl EventSink for ParkedOnExtra {
+		fn mask(&self) -> EventMask {
+			EventMask::of(EventKind::Blocked)
+		}
+
+		fn event(&self, ev: &Event<'_>) {
+			if let EventData::Blocked { key: WaitKey::Task(_) } = ev.data {
+				self.0.notify_one();
+			}
+		}
+	}
+
 	let mut s = session();
 	let cancel = CancellationToken::new();
-	let trigger = cancel.clone();
-	tokio::spawn(async move {
-		tokio::time::sleep(Duration::from_millis(200)).await;
-		trigger.cancel();
-	});
+	let parked = Arc::new(ParkedOnExtra::default());
 	// The sleep outlives the runner's bound: only the cancel ends it.
-	let ran =
-		run_with(&mut s, &format!("sleep {}", crate::testkit::child::LIFETIME.as_secs()), cancel)
-			.await;
+	let sleep = format!("sleep {}", crate::testkit::child::LIFETIME.as_secs());
+	let options = RunOptions { events: Some(parked.clone()), ..RunOptions::new(sleep) };
+	let trigger = cancel.clone();
+	// The cancel reaches `sleep` while it runs, not the command before it
+	// starts.
+	let cancelling = async {
+		tokio::time::timeout(Duration::from_secs(20), parked.0.notified())
+			.await
+			.expect("the shell never parked on `sleep`");
+		trigger.cancel();
+	};
+	let (ran, ()) = tokio::join!(run_with(&mut s, options, cancel), cancelling);
 	assert!(ran.cancelled);
+	// The claim is that the cancel ends the extra promptly: the runner's bound
+	// fails a run that never ends, not one that ends late.
+	assert!(ran.elapsed < Duration::from_secs(5), "took {:?}", ran.elapsed);
 	// The session stays usable.
 	assert_eq!(out(&mut s, "echo alive").await, "alive\n");
 }
