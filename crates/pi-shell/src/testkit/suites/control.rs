@@ -3,13 +3,15 @@
 use std::sync::Arc;
 
 use bstr::{BStr, BString};
+use strum::IntoEnumIterator as _;
 
 use crate::{
 	bash::{
-		Attrs, Budget, CallOutcome, Cx, Engine, EngineConfig, Incompatibility, MemStore,
+		Attrs, Budget, CallOutcome, Cx, Engine, EngineConfig, Incompatibility, JobId, MemStore,
 		RestoreError, RestoreOpts, RunId, RunStdio, Script, Shell, ShellApi, ShellError, SigTarget,
 		Signal, StateStore, Step, VarValue, Vpid, VprocSel, ir::IR_VERSION, os_pid_limit,
-		store::BlobSlot,
+		store::{BlobSlot, JobFact, Key, Record, Table, Var},
+		zshopt::ZshOpt,
 	},
 	testkit::{
 		FakeHost, Fault, Rig,
@@ -362,15 +364,15 @@ fn restore_drop_frames_abandons_the_running_script_with_255() {
 	));
 }
 
-/// A store (`MemStore::to_bytes`) whose frames blob the engine of `c55f78f6`
-/// (IR version 17, frames layout 31: no `Job::signal`, no
-/// `JobTable::comsub`) externalized while run 1, `x=kept; ( { while :; do
-/// :; done; } & jobs; wait $! ); echo after`, had its `( … )` waiting for
-/// its running background job.
-const OLD_LAYOUT_STORE: &[u8] = include_bytes!("../fixtures/frames/c55f78f6_subshell_job.store");
+/// A store (`MemStore::to_bytes`) whose frames blob the engine of Cut13
+/// `3444abaa` (released as `v18.18.6-sami.20261125-193459`; IR version 19,
+/// frames layout 37: no `Job::signal`, no `JobTable::comsub`) externalized
+/// while run 1, `x=kept; ( { while :; do :; done; } & jobs; wait $! ); echo
+/// after`, had its `( … )` waiting for its running background job.
+const OLD_LAYOUT_STORE: &[u8] = include_bytes!("../fixtures/frames/3444abaa_subshell_job.store");
 
-/// The IR version of the engine that wrote the `c55f78f6` fixtures.
-const OLD_IR: u32 = 17;
+/// The IR version of the engine that wrote the `3444abaa` fixtures.
+const OLD_IR: u32 = 19;
 
 /// Frames of an older engine are refused (the IR and layout versions are in
 /// the header, and the build id), never decoded as this one's; with
@@ -411,12 +413,12 @@ fn restore_refuses_frames_of_an_older_layout_and_keeps_their_store() {
 	assert_eq!(host.stdout.bytes(), b"kept\nend\n");
 }
 
-/// A store the engine of `c55f78f6` (`store::Job` as it was before the
-/// job's signal was kept) wrote while run 1, `x=kept; { while :; do :;
-/// done; } & { while :; do :; done; } & kill -KILL $!; wait %1; echo
-/// after`, waited for job 1: the root's job table holds job 1 running and
-/// job 2, which `KILL` ended, done with 137.
-const OLD_ROOT_JOBS_STORE: &[u8] = include_bytes!("../fixtures/frames/c55f78f6_root_jobs.store");
+/// A store the engine of Cut13 `3444abaa` (`store::Job` before the job's
+/// signal was kept) wrote while run 1, `x=kept; { while :; do :; done; } & {
+/// while :; do :; done; } & kill -KILL $!; wait %1; echo after`, waited for
+/// job 1: the root's job table holds job 1 running and job 2, which `KILL`
+/// ended, done with 137.
+const OLD_ROOT_JOBS_STORE: &[u8] = include_bytes!("../fixtures/frames/3444abaa_root_jobs.store");
 
 /// A store from before the job's signal was kept decodes: its root's jobs
 /// are in the store's own records, which keep their layout (what came later
@@ -457,6 +459,106 @@ fn an_older_store_whose_root_has_jobs_restores() {
 		String::from_utf8_lossy(&host.stdout.bytes()),
 		format!("kept\n[1]-  {killed:<27}{text}\n[2]+  {killed:<27}{text}\nend\n")
 	);
+}
+
+/// The store image (`MemStore::to_bytes`) Cut14 `34021711` (released as
+/// `v18.18.6-sami.20261126-110039`) wrote with one record under each key
+/// whose place in its enum the image keeps: every `MiscKey`, `OptId` and
+/// `TrapKey` holds its own name (`Record::Misc` of the variant's `Debug`
+/// text); every `ZshOpt` that is not an env option holds `Record::Opt(true)`,
+/// and the variable `RELEASED_ZSH_OPTS` names them all, `,`-separated, in
+/// Cut14's order; and one record of each other `KeyBuf` kind but functions
+/// and jobs, which [`CUT14_ROOT_STORE`] holds.
+const CUT14_KEYS_STORE: &[u8] = include_bytes!("../fixtures/frames/34021711_keys.store");
+
+/// A released store's keys keep their places. A store image numbers a key
+/// by its variant's index, so a key placed before another, or one taken
+/// out, makes every store written before read one key's records as
+/// another's (Cut14 composed `MiscKey::CellsPlain` before `HeldIgnored`,
+/// which a store of `HeldIgnored`'s own branch had one place earlier): a new
+/// key goes last.
+#[test]
+fn a_released_stores_keys_keep_their_places() {
+	let mut store = MemStore::from_bytes(CUT14_KEYS_STORE).expect("Cut14's key store decodes");
+	let mut moved = Vec::new();
+	for table in [Table::Misc, Table::Opt, Table::Trap] {
+		store
+			.scan(table, &mut |key, record| {
+				let name = match key {
+					Key::Misc(k) => format!("{k:?}"),
+					Key::Opt(o) => format!("{o:?}"),
+					Key::Trap(t) => format!("{t:?}"),
+					other => format!("{other:?}"),
+				};
+				if *record != Record::Misc(name.as_str().into()) {
+					moved.push(format!("{name} holds {record:?}"));
+				}
+			})
+			.unwrap();
+	}
+	let released = match store.record(Key::Var(BStr::new("RELEASED_ZSH_OPTS"))) {
+		Some(Record::Var(Var { value: VarValue::Str(names), .. })) => names.to_string(),
+		other => panic!("Cut14's list of zsh options: {other:?}"),
+	};
+	let now: Vec<String> = ZshOpt::iter().map(|z| format!("{z:?}")).collect();
+	for (i, was) in released.split(',').enumerate() {
+		if now.get(i).map(String::as_str) != Some(was) {
+			moved.push(format!("ZshOpt {i}: {was} in Cut14, {:?} now", now.get(i)));
+		}
+	}
+	let text = |s: &str| Record::Var(Var { attrs: Attrs::NONE, value: VarValue::Str(s.into()) });
+	let kinds = [
+		(Key::Alias(BStr::new("pin")), Record::Alias("alias".into())),
+		(Key::Proc(Vpid(9)), Record::Proc { parent: Some(Vpid(1)), status: Some(3) }),
+		(Key::DirStack, Record::DirStack(vec!["/dir".into()])),
+		(Key::CmdHash(BStr::new("pin")), Record::CmdHash { path: "/bin/pin".into(), hits: 2 }),
+		(Key::Scope(0), Record::Scope { func: Some("pin".into()), positional: None, zsh: None }),
+		(Key::Local { depth: 0, name: BStr::new("pin_local") }, text("local")),
+		(Key::ZshAlias { suffix: true, name: BStr::new("pin") }, Record::Alias("suffix".into())),
+		(Key::JobFacts(JobId(5)), Record::JobFacts(vec![JobFact::Signal(Signal::Kill)])),
+		(Key::BgPid(Vpid(7)), Record::Misc("3:7:0".into())),
+	];
+	for (key, want) in kinds {
+		let have = store.record(key);
+		if have != Some(&want) {
+			moved.push(format!("{key:?} holds {have:?}"));
+		}
+	}
+	assert!(
+		moved.is_empty(),
+		"keys of the released Cut14 store moved (a new key goes last):\n{}",
+		moved.join("\n")
+	);
+}
+
+/// A store Cut14 `34021711` wrote, its frames blob taken out, after run 1,
+/// `x=kept; f() { echo "f:$1"; }; unset EPOCHSECONDS; { exit 3; } & p=$!;
+/// wait $p; { while :; do :; done; } & kill -KILL $!`: a variable, a
+/// function, a value cell `unset` removed (`MiscKey::CellsPlain`), a kept
+/// status (`Key::BgPid`), a job a signal ended (`Key::JobFacts`), and the
+/// held ignores every bash root store has (`MiscKey::HeldIgnored`).
+const CUT14_ROOT_STORE: &[u8] = include_bytes!("../fixtures/frames/34021711_root.store");
+
+/// A store a released engine wrote restores and runs on: the root's
+/// variable, function, removed value cell and kept status are there, and
+/// the killed job is reported.
+#[test]
+fn a_store_cut14_wrote_restores() {
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let mut store = MemStore::from_bytes(CUT14_ROOT_STORE).expect("Cut14's store decodes");
+	let (mut shell, report) =
+		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts::default())
+			.expect("Cut14's store restores");
+	assert!(report.abandoned.is_empty(), "no run was in flight: {:?}", report.abandoned);
+	let id = shell.submit(Script::command(
+		&b"echo \"$x\"; f a; echo \"c=${EPOCHSECONDS-unset}\"; wait \"$p\"; echo \"st=$?\""[..],
+	));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, id, Budget::default()), Stop::Done(0));
+	assert_eq!(host.stdout.bytes(), b"kept\nf:a\nc=unset\nst=3\n");
+	let killed = Signal::Kill.description(EngineConfig::default().platform);
+	let err = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+	assert!(err.contains(&*killed), "the killed job is reported: {err:?}");
 }
 
 /// The signal that ended a root job outlives a store image

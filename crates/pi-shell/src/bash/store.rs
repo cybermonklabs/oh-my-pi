@@ -359,7 +359,9 @@ impl hashbrown::Equivalent<KeyBuf> for Key<'_> {
 	}
 }
 
-/// Record key (owned), ordered by table first.
+/// Record key (owned), ordered by table first. A store image
+/// (`MemStore::to_bytes`) keeps it by its variant's index, so a new variant
+/// goes last, as for [`MiscKey`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum KeyBuf {
 	/// See [`Key::Var`].
@@ -1395,7 +1397,12 @@ pub enum TrapKey {
 	Return,
 }
 
-/// Miscellaneous scalar and list state.
+/// Miscellaneous scalar and list state. A store image
+/// (`MemStore::to_bytes`) and the frames keep a key by its index here, so a
+/// new key goes last: one placed before another moves that one's records,
+/// in every store written before, to the new key. A released layout keeps
+/// its order: `testkit::suites::control`'s
+/// `a_released_stores_keys_keep_their_places` reads the store Cut14 wrote.
 #[derive(
 	Clone,
 	Copy,
