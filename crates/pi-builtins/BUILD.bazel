@@ -133,8 +133,18 @@ rust_library(
 # test binary, so the two cannot differ in what they build.
 FOREIGN_OWNER_TESTS = "::foreign_owner::"
 
+# The gate runs this target's one libtest process under
+# .github/sami/libtest-bound.py, which fails a test that has made no progress
+# within its .config/nextest.toml bound by name: 240 s, and 1,200 s for cp's
+# probe matrix, which this target runs. Bazel's timeout must leave the longest
+# bound after the longest correct run, and be at least twice that run: the
+# longest of three gate runs (sami-checks runs 45722788663, 45722800123 and
+# 45722811150, 2026-11-26) took 197.0 s, so max(2 x 197.0, 197.0 + 1,200) =
+# 1,397 s, past "long" (900 s): "eternal" (3,600 s). (The runner refuses to
+# run a target whose timeout is not above each selected test's bound.)
 rust_test(
     name = "pi-builtins_test",
+    timeout = "eternal",
     args = [
         "--skip",
         FOREIGN_OWNER_TESTS,

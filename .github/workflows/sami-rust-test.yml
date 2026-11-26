@@ -21,7 +21,8 @@
 # release-candidate both are the same commit; a dispatch of an older commit (one from before this
 # gate, for example) is judged by the lists at the dispatched ref. tool/ also holds
 # .github/workflows and .github/sami-checks, which the gate's regression tests read (cache_lint,
-# and the candidate branch every one of those files names).
+# and the candidate branch every one of those files names), and .config, whose nextest.toml gives
+# libtest-bound.py its bounds in those tests.
 #
 # Caches: cache-mode is none here and on the calling job. Test code runs here with the runner's
 # passwordless sudo and can read the job's token; with cache-mode none that token can neither
@@ -127,6 +128,7 @@ jobs:
             .github/sami-checks
             .github/actions
             .github/workflows
+            .config
       - name: Check out the tree under test
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -609,6 +611,7 @@ jobs:
             .github/sami-checks
             .github/actions
             .github/workflows
+            .config
       - name: Check out the tree under test
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

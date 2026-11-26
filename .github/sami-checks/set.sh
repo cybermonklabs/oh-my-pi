@@ -2,7 +2,10 @@
 # One shard of the pi-shell set: each of its test binaries (the lib's, obash's and every
 # tests/*.rs one) in a libtest process of its own, straight from the build's archive, as the
 # runner's user or as root, --test-threads=4, with the hang bound SC_BIN_BOUND (seconds) per
-# binary. libtest reports in JSON (nightly's -Z unstable-options --format json --report-time),
+# binary, and each test under the bound the tree's .config/nextest.toml gives it
+# (.github/sami/libtest-bound.py: when no test has started or ended for that long, it stops the
+# binary and fails the tests it was running, by name). libtest reports in JSON (nightly's
+# -Z unstable-options --format json --report-time),
 # with each passing test's output (--show-output) so sc.py libtest can see a test that skipped
 # itself. When a test that known-failures.txt names `flaky: ` for this row, user and binary fails,
 # the whole binary runs again (the same command: --test-threads=4, the same user), at most twice,
@@ -14,6 +17,7 @@
 set -uo pipefail
 who=$1 shard=$2
 tool=$GITHUB_WORKSPACE/tool/.github/sami-checks
+bound=$GITHUB_WORKSPACE/tool/.github/sami/libtest-bound.py
 meta=$CARGO_TARGET_DIR/nextest/binaries-metadata.json
 mkdir -p "$SC/res/logs"
 [ -s "$meta" ] || { echo "::error::no $meta: the archive did not unpack"; exit 1; }
@@ -31,7 +35,8 @@ envv=(HOME="$home" USER="$who" LOGNAME="$who" TMPDIR="$tmp" PATH="$SC_TEST_PATH"
 run() { # <log> <libtest args...>: $bin as this shard's user, in the tests' environment
 	local out=$1
 	shift
-	local cmd=(timeout --verbose -k 10 "$SC_BIN_BOUND" "$bin" -Z unstable-options --format json --report-time --show-output "$@")
+	local cmd=(timeout --verbose -k 10 "$SC_BIN_BOUND" python3 "$bound" --nextest-config "$SC_TREE/.config/nextest.toml"
+		--package pi-shell -- "$bin" -Z unstable-options --format json --report-time --show-output "$@")
 	if [ "$who" = root ]; then
 		(cd "$SC_TREE/crates/pi-shell" && sudo env -i "${envv[@]}" "${cmd[@]}") > "$out" 2>&1 < /dev/null
 	else
