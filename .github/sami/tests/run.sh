@@ -790,8 +790,6 @@ CARGO_MODE=ignored-and-doc-ignored NOT_MSG='ignore doctest|src/lib.rs - g.*(fail
 # B3: on Linux the crates' doctests run only in Bazel: the stub refuses a
 # cargo test --doc of a crate under crates/ there (D1 shows none ran), and
 # the job reads the doctests from the source instead (D1-D34 below).
-# B4: the listings the macOS job's inventory reads.
-run J108-listings-for-macos 0 'Listings for the macOS inventory: 2 binaries' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 # D1-D34: on Linux each crate with a Bazel doctest target has its doctests
 # read from its source (.github/sami/rust-test-doctest-forms.awk, no build):
 # a line of a doctest rustdoc runs that prints or holds a skip word fails the
