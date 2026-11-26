@@ -3320,9 +3320,11 @@ fn dynamic_compute(
 		b"DIRSTACK" => DynVal::List(super::builtins::dirstack::dirstack_value(cx.store, vp)?),
 		// bash: the shell's own process outside a subshell, `$$`; a
 		// subshell's own (here its vpid). A nested in-engine shell's `$$` is
-		// its vpid already.
-		b"BASHPID" => DynVal::Str(match vp.parent {
-			None => match state::record(
+		// its vpid already. While a command's redirections are expanded in
+		// its child ([`Kernel::redirs_child_pid`]), the child's.
+		b"BASHPID" => DynVal::Str(match (k.redirs_child_pid, vp.parent) {
+			(Some(pid), _) => BString::from(pid.0.format_into(&mut NumBuffer::new())),
+			(None, None) => match state::record(
 				cx.store,
 				vp,
 				crate::bash::store::Key::Misc(crate::bash::store::MiscKey::ShellPid),
@@ -3330,7 +3332,7 @@ fn dynamic_compute(
 				Some(crate::bash::store::Record::Misc(v)) => v.clone(),
 				_ => BString::from(k.shell_pid.format_into(&mut NumBuffer::new())),
 			},
-			Some(_) => BString::from(vp.vpid.0.format_into(&mut NumBuffer::new())),
+			(None, Some(_)) => BString::from(vp.vpid.0.format_into(&mut NumBuffer::new())),
 		}),
 		b"BASH_SUBSHELL" => {
 			DynVal::Str(BString::from(super::subshell_depth(vp).format_into(&mut NumBuffer::new())))

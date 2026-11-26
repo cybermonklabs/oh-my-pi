@@ -438,12 +438,14 @@ fn random_in_a_subshells_redirections_is_the_childs() {
 	}
 }
 
-/// bash makes the redirections of a simple command it forks for first in
-/// the fork: a name not found, `command` with one, a null command that
-/// redirects fd 0 or a `{var}` (and an external). A `$RANDOM` there draws
-/// from the child's generator and leaves the shell's sequence alone. A null
-/// command that redirects fd 1, a builtin's, a function's, a subshell's
-/// and a background job's draw as before. Goldens from bash 5.3.20.
+/// bash expands all words of redirections it makes in a child there: a
+/// simple command it forks for first (a name not found, `command` with one,
+/// a null command that redirects fd 0 or a `{var}`) and a subshell's own.
+/// Arithmetic side effects and `${name:=value}` stay in the shell's copy,
+/// and `BASHPID` names the child. A `$RANDOM` there draws from the child's
+/// generator and leaves the shell's sequence alone. A null command that
+/// redirects fd 1, a builtin's, a function's and a background job's draw
+/// as before. Goldens from bash 5.3.20.
 #[test]
 fn random_in_a_forked_commands_redirections_is_the_childs() {
 	for (form, want) in [
@@ -452,6 +454,19 @@ fn random_in_a_forked_commands_redirections_is_the_childs() {
 		(": > f; < f${RANDOM:0:0}", "[] 18498\n"),
 		(": > f; {v}< f${RANDOM:0:0}", "[] 18498\n"),
 		("nosuch 2> e$RANDOM; RANDOM+=1", "[] 2539\n"),
+		("x=0; nosuch 2> e$((x++)); echo \"x=$x\"", "x=0\n[0] 18498\n"),
+		("x=0; command nosuch 2> e$((x++)); echo \"x=$x\"", "x=0\n[0] 18498\n"),
+		(": > f0; x=0; < f$((x++)); echo \"x=$x\"", "x=0\n[0] 18498\n"),
+		("unset y; nosuch > \"f${y:=1}\" 2> e; echo \"y=${y-unset}\"", "y=unset\n[] 18498\n"),
+		(
+			"nosuch > f$BASHPID 2> e; [ -e \"f$BASHPID\" ] && echo same || echo other",
+			"other\n[] 18498\n",
+		),
+		("x=0; ( : ) > f$((x++)); echo \"x=$x\"", "x=0\n[0] 18498\n"),
+		// A `${| }` in such a word keeps its `REPLY` local, and the word's
+		// arithmetic stays the child's across a `$( )` the word waits for.
+		("nosuch > f${| REPLY=1; } 2> e; echo \"[${REPLY-unset}]\"", "[unset]\n[] 18498\n"),
+		("x=0; nosuch > f$((x++))$(:) 2> e; echo \"x=$x\"", "x=0\n[0] 18498\n"),
 		// Drawn in the shell, or in a fork either way.
 		("> f$RANDOM", "[] 29338\n"),
 		("true > f$RANDOM", "[] 29338\n"),

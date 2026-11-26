@@ -2734,12 +2734,20 @@ pub fn expanding<T>(
 		return Err(flow);
 	}
 	let mut log = std::mem::take(&mut sc.logs[slot as usize]);
+	// A word of redirections bash makes in a child: the pass runs on the
+	// child's copy of the shell's state ([`redir::apply_in_child`]). A
+	// substitution it stops for starts below, and settles above, with the
+	// shell's own.
+	let shell = k.redirs_in_child.then(|| redir::enter_child(k, vp, cx));
 	let res = {
 		let mut ex = Expander::new(k, cx, vp, &mut log, record, line);
 		let r = super::zsh::subst::begin_pass(&mut ex).and_then(|()| f(&mut ex));
 		let st = ex.sub_status;
 		r.map(|v| (v, st))
 	};
+	if let Some(shell) = shell {
+		redir::leave_child(k, vp, shell);
+	}
 	// The slot still holds the empty `Vec` `take` left there (the scratch is
 	// out of its frame meanwhile, nothing else fills it): put the log back
 	// without a drop of that placeholder per expansion.

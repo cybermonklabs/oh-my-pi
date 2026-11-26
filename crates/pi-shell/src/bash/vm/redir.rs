@@ -93,11 +93,17 @@ pub enum Owner {
 /// [`apply`] for redirections bash applies in a child after its fork: a
 /// subshell's own, and those of a simple command bash forks for first (an
 /// external, a name not found, `command X`, a null command that
-/// [`null_forks`]). A `$RANDOM` they expand draws from a copy of the
-/// generator, as a fork's ([`Kernel::fork_clock`]), and a lookup of
-/// `RANDOM` or `SECONDS` leaves the shell's value cell alone
-/// ([`Kernel::redirs_in_child`]). The shell's generator and clock are back
-/// before it returns, parked or not. zsh code: [`apply`].
+/// [`null_forks`]). Each expansion pass of their words runs on the child's
+/// copy of the shell's state ([`enter_child`]), so the words' assignments,
+/// arithmetic side effects, `$BASHPID` and `$RANDOM` (drawn from a copy of
+/// the generator, as a fork's: [`Kernel::fork_clock`]) are the child's, and
+/// a lookup of `RANDOM` or `SECONDS` leaves the shell's value cell alone
+/// ([`Kernel::redirs_in_child`]). A command substitution a pass stops for
+/// starts, runs and settles with the shell's own state, as do the fd
+/// install, the `{var}` the shell keeps, the subshell's own-var save and
+/// the pending-break accounting that follow each word ([`Vproc::vpid`], the
+/// deferral and bang paths too). The shell's state is back before it
+/// returns, parked or not. zsh code: [`apply`].
 pub fn apply_in_child(
 	k: &mut Kernel,
 	vp: &mut Vproc,
@@ -110,12 +116,65 @@ pub fn apply_in_child(
 	if unit.mode.dialect() != Dialect::Bash {
 		return apply(k, vp, cx, unit, list, line, owner);
 	}
-	let shell_clock = vp.clock.replace(k.fork_clock(vp));
-	k.redirs_in_child = true;
+	let shell_redirs_in_child = std::mem::replace(&mut k.redirs_in_child, true);
 	let res = apply(k, vp, cx, unit, list, line, owner);
-	k.redirs_in_child = false;
-	vp.clock = shell_clock;
+	k.redirs_in_child = shell_redirs_in_child;
 	res
+}
+
+/// The shell's own state, set aside while an expansion pass of a word of
+/// redirections bash makes in a child runs on the child's copy
+/// ([`enter_child`]); [`leave_child`] puts it back.
+pub struct ShellState {
+	image:      Option<crate::bash::image::Image>,
+	locale_gen: Option<u64>,
+	scopes:     Vec<state::Scope>,
+	clock:      Option<super::proc::Clock>,
+	pid:        Option<crate::bash::ids::Vpid>,
+}
+
+/// Start an expansion pass of a word of redirections bash makes in a child
+/// ([`Kernel::redirs_in_child`]): the pass gets a copy-on-write image and
+/// scopes for its assignments and arithmetic, the clock for its
+/// `$RANDOM`/`$SECONDS`, and a reserved pid for `$BASHPID`. Only the pass:
+/// a substitution it stops for and the replay log stay the shell's, so a
+/// pass that parks leaves nothing of the copy behind.
+#[cold]
+#[inline(never)]
+pub fn enter_child(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> ShellState {
+	let (image, locale_gen) = state::fork_image(&k.root, cx.store, vp).unwrap_or_else(|err| {
+		k.fail(err);
+		(Default::default(), None)
+	});
+	let scopes = state::copy_scopes(&k.root, cx.store, vp).unwrap_or_else(|err| {
+		k.fail(err);
+		Vec::new()
+	});
+	// The vpid bash's fork would take, peeked without consuming one: a word
+	// that reads `$BASHPID` needs a value distinct from the shell, and a
+	// command with no vpid left still fails to fork as bash's does.
+	let child_vpid = crate::bash::ids::Vpid(k.next_vpid);
+	let child_clock = k.fork_clock(vp);
+	ShellState {
+		image:      vp.image.replace(image),
+		locale_gen: std::mem::replace(&mut vp.locale_gen, locale_gen),
+		scopes:     std::mem::replace(&mut vp.scopes, scopes),
+		clock:      vp.clock.replace(child_clock),
+		pid:        k.redirs_child_pid.replace(child_vpid),
+	}
+}
+
+/// End the pass [`enter_child`] started: the child's copy is dropped and
+/// the shell's state is back.
+#[cold]
+#[inline(never)]
+pub fn leave_child(k: &mut Kernel, vp: &mut Vproc, shell: ShellState) {
+	let ShellState { image, locale_gen, scopes, clock, pid } = shell;
+	k.redirs_child_pid = pid;
+	vp.clock = clock;
+	vp.scopes = scopes;
+	vp.locale_gen = locale_gen;
+	vp.image = image;
 }
 
 /// Apply redirection list `list` of `unit` for `owner`.
