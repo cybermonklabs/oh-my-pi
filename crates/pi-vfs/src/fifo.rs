@@ -8,7 +8,7 @@ use std::{
 	},
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Path, PathBuf},
-	sync::Arc,
+	sync::{Arc, mpsc},
 	task::{Context, Poll, Waker},
 	thread,
 	time::Duration,
@@ -30,11 +30,14 @@ use parking_lot::{Condvar, Mutex};
 /// closed. A helper that passed its check is in `open(2)`, or about to enter
 /// it: the drop holds the FIFO open for reading and writing, which never
 /// waits on a FIFO and completes that open whether it waits already or not
-/// yet, until it has joined the helper, which closes what it got. The
-/// FIFO's real other end can observe that brief peer, as it can every
-/// release: a writer that comes and goes reads as end of file, a reader that
-/// comes and goes makes a writer's first write fail with `EPIPE`. Other
-/// opens of the same end waiting at that moment are released with it.
+/// yet, until it has joined the helper, which closes what it got. On Linux it
+/// holds that end on a thread whose descriptor table is its own ([`Peer`]),
+/// so a process another thread forks meanwhile gets no copy of it to keep
+/// past the drop. The FIFO's real other end can observe that brief peer, as
+/// it can every release: a writer that comes and goes reads as end of file,
+/// a reader that comes and goes makes a writer's first write fail with
+/// `EPIPE`. Other opens of the same end waiting at that moment are released
+/// with it.
 ///
 /// On Linux the open pins the FIFO with an `O_PATH` descriptor, which opens
 /// no end of it, and the helper and the drop both open its
@@ -301,22 +304,152 @@ impl<T> Drop for FifoOpen<T> {
 		if !node.is(fs::metadata(&node.path)) {
 			return;
 		}
-		let Ok(peer) = fs::OpenOptions::new()
-			.read(true)
-			.write(true)
-			.custom_flags(libc::O_NONBLOCK)
-			.open(&node.path)
-		else {
+		let Some(peer) = Peer::open(node) else {
 			return;
 		};
-		if node.is(peer.metadata())
-			&& let Some(helper) = self.helper.take()
-		{
+		if let Some(helper) = self.helper.take() {
 			#[cfg(test)]
 			{
 				self.shared.slot.lock().joining = true;
+				hooks::run_when_joining();
 			}
 			let _ = helper.join();
+		}
+		drop(peer);
+	}
+}
+
+/// The drop's own end of the FIFO, opened for reading and writing (which
+/// completes the helper's `open(2)`) and held until the helper has ended.
+///
+/// On Linux it is opened and held on a thread of its own, whose descriptor
+/// table is its own and starts empty (`close_range` with
+/// `CLOSE_RANGE_UNSHARE`). A process another thread forks copies that
+/// thread's table, so it gets no copy of this end. A copy would outlive the
+/// drop in the child, until its `exec` or its exit: the FIFO's next reader
+/// would then open against it as against a writer and read end of file once
+/// it closed, and the next real writer would wait for a reader that has gone.
+/// The table starts empty, so the thread holds no copy of another descriptor
+/// of the process either. Where that table cannot be had (off Linux, a thread
+/// that cannot start, a kernel or filter without `close_range`'s unshare),
+/// the end is opened and held on the dropping thread, open to such a fork.
+enum Peer {
+	/// Held on its own thread; dropping it closes it there and waits.
+	Private { release: Option<mpsc::Sender<()>>, thread: Option<thread::JoinHandle<()>> },
+	/// Held in the process's descriptor table.
+	Shared { _end: fs::File },
+}
+
+impl Peer {
+	/// Opens the drop's end of `node`; `None` when the open fails or reaches
+	/// another file (the path no longer names the node).
+	fn open(node: &Arc<Node>) -> Option<Self> {
+		#[cfg(target_os = "linux")]
+		if let Ok(held) = Self::private(node) {
+			return held;
+		}
+		open_peer(node).map(|end| Self::Shared { _end: end })
+	}
+
+	/// [`Peer::open`] on a thread with a private, empty descriptor table;
+	/// `Err` when that table cannot be had.
+	#[cfg(target_os = "linux")]
+	fn private(node: &Arc<Node>) -> Result<Option<Self>, ()> {
+		/// `CLOSE_RANGE_UNSHARE` (`<linux/close_range.h>`): the caller's
+		/// descriptor table is unshared before the range is closed, and the
+		/// kernel copies none of the range into the new table.
+		const CLOSE_RANGE_UNSHARE: libc::c_uint = 1 << 1;
+		let (opened_tx, opened_rx) = mpsc::channel::<Option<bool>>();
+		let (release, released) = mpsc::channel::<()>();
+		let node = Arc::clone(node);
+		let thread = thread::Builder::new()
+			.name("fifo-release".to_owned())
+			.stack_size(64 << 10)
+			.spawn(move || {
+				// SAFETY: close_range takes scalars; it gives this thread a
+				// descriptor table of its own and closes nothing of the
+				// process's.
+				let own = unsafe {
+					libc::syscall(
+						libc::SYS_close_range,
+						0 as libc::c_uint,
+						libc::c_uint::MAX,
+						CLOSE_RANGE_UNSHARE,
+					)
+				} == 0;
+				if !own {
+					let _ = opened_tx.send(None);
+					return;
+				}
+				let peer = open_peer(&node);
+				if opened_tx.send(Some(peer.is_some())).is_ok() && peer.is_some() {
+					// Until the drop is done with it: the sender's drop ends
+					// the wait.
+					let _ = released.recv();
+				}
+				drop(peer);
+			})
+			.map_err(|_| ())?;
+		match opened_rx.recv() {
+			Ok(Some(true)) => {
+				Ok(Some(Self::Private { release: Some(release), thread: Some(thread) }))
+			},
+			Ok(Some(false)) => {
+				let _ = thread.join();
+				Ok(None)
+			},
+			Ok(None) | Err(_) => {
+				let _ = thread.join();
+				Err(())
+			},
+		}
+	}
+}
+
+impl Drop for Peer {
+	/// Closes the end; a private one is closed by its thread, which this
+	/// waits for, so the end is closed once the drop returns.
+	fn drop(&mut self) {
+		if let Self::Private { release, thread } = self {
+			release.take();
+			if let Some(thread) = thread.take() {
+				let _ = thread.join();
+			}
+		}
+	}
+}
+
+/// Opens `node` for reading and writing without waiting: the drop's end.
+/// `None` when the open fails or reaches another file.
+fn open_peer(node: &Node) -> Option<fs::File> {
+	let peer = fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(&node.path)
+		.ok()?;
+	node.is(peer.metadata()).then_some(peer)
+}
+
+/// Test hook: run by the drop once it holds its end and is about to join
+/// the helper.
+#[cfg(test)]
+mod hooks {
+	use parking_lot::Mutex;
+
+	type Hook = Box<dyn FnOnce() + Send>;
+
+	static WHEN_JOINING: Mutex<Option<Hook>> = Mutex::new(None);
+
+	/// Has the next drop that joins a helper run `hook` first.
+	pub(super) fn when_joining(hook: impl FnOnce() + Send + 'static) {
+		*WHEN_JOINING.lock() = Some(Box::new(hook));
+	}
+
+	pub(super) fn run_when_joining() {
+		let hook = WHEN_JOINING.lock().take();
+		if let Some(hook) = hook {
+			hook();
 		}
 	}
 }
@@ -476,6 +609,62 @@ mod tests {
 			assert_eq!(Arc::strong_count(&shared), 1, "the helper outlived the drop");
 			assert!(!has_reader(&path), "a reader is left");
 			assert!(!has_writer(&path), "a writer is left");
+		}
+	}
+
+	/// A process another thread forks while the drop holds its end of the
+	/// FIFO gets no copy of that end. A copy outlived the drop in the child:
+	/// the FIFO's next reader opened against it as against a writer and read
+	/// end of file once the child ended, while the next real writer waited for
+	/// a reader for ever: pi-shell's `cat < f & kill %%; /bin/cat < f &` then
+	/// `echo hi > f`, while a sibling test forked. The child here is forked
+	/// from the dropping thread once the drop holds its end, and keeps what it
+	/// got until the test has looked at the FIFO.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_process_forked_while_the_drop_holds_its_end_gets_no_copy_of_it() {
+		use std::{
+			io::Write as _,
+			os::fd::AsRawFd as _,
+			sync::atomic::{AtomicI32, Ordering},
+		};
+		for (open, end_left, what) in [
+			(read_end as Open, has_writer as fn(&Path) -> bool, "writer"),
+			(write_end, has_reader, "reader"),
+		] {
+			let (_dir, path) = new_fifo();
+			let opened = helper(&path, Slot { hold: true, ..Slot::default() }, open);
+			while !opened.shared.slot.lock().opening {
+				thread::yield_now();
+			}
+			let (go_r, mut go_w) = std::io::pipe().unwrap();
+			let child = Arc::new(AtomicI32::new(0));
+			let (child_pid, go) = (Arc::clone(&child), go_r.as_raw_fd());
+			hooks::when_joining(move || {
+				// SAFETY: the child only reads one byte and exits, both
+				// async-signal-safe.
+				let pid = unsafe { libc::fork() };
+				if pid == 0 {
+					let mut byte = 0u8;
+					// SAFETY: reads one byte into a local from a descriptor
+					// the child holds.
+					unsafe {
+						libc::read(go, (&raw mut byte).cast(), 1);
+						libc::_exit(0);
+					}
+				}
+				child_pid.store(pid, Ordering::SeqCst);
+			});
+			drop(opened);
+			let pid = child.load(Ordering::SeqCst);
+			assert!(pid > 0, "the hook did not fork: {pid}");
+			let left = end_left(&path);
+			go_w.write_all(&[1]).unwrap();
+			let mut status = 0;
+			// SAFETY: `pid` is this test's child; `status` is writable.
+			assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid, "waitpid");
+			drop(go_r);
+			assert!(!left, "a {what} of the FIFO outlived the drop in a process forked during it");
 		}
 	}
 
