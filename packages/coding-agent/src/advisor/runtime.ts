@@ -1456,12 +1456,12 @@ export class AdvisorRuntime {
 					logger.debug("advisor turn failed", { err: String(err) });
 					if (classifierRefusal) {
 						const refusalModel = this.host.getModelIdentity?.() ?? this.#modelIdentity ?? "";
-						// A classifier refusal usually judges the reply the model sampled
-						// rather than the batch, and the same batch sent again is usually
-						// answered. So the same batch goes to the same model again, up to
-						// CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES times for each model, before the
+						// A classifier refusal is resent, unchanged, to the same model by rule:
+						// up to CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES times for each model, before the
 						// cascade below changes what is sent or which model gets it, as the
 						// primary's turn recovery asks a refused model again before its walk.
+						// Whether the same batch is then answered varies (see refusal-retries.ts for
+						// the measurements and the provider's contrary guidance).
 						// The unchanged resends come first because the strip below lasts: the
 						// advisor reviews without the primary's reasoning from then on. A model
 						// the cascade has already left is not asked again. An OpenAI

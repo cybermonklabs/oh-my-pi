@@ -3027,10 +3027,10 @@ export class TurnRecovery {
 			return maxDelayMs > 0 && waitMs > maxDelayMs && !waitForUsageReset;
 		};
 
-		// A classifier refusal usually judges the reply the model sampled rather than the
-		// request, and the same request sent again is usually answered. So the refused request
-		// goes to the same model again before the walk below leaves it: up to
-		// CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES times for each model, inside the retry budget.
+		// A classifier refusal is retried on its model before the walk below leaves it, by rule:
+		// up to CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES times for each model, inside the retry
+		// budget. Whether the same request is then answered varies (see refusal-retries.ts for
+		// the measurements and the provider's contrary guidance), so the count stays small.
 		// Every category and shape of refusal takes this path. A model the walk has already
 		// left after a refusal is not asked again in the saga. There is nothing to wait out, so
 		// the retry goes at once.
