@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { AssistantMessage, ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { ToolCallLoopGuard } from "@oh-my-pi/pi-ai/utils/tool-call-loop-guard";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { nestedChain, nestedChainJson } from "./helpers/deep-nesting";
 
 const zeroUsage = {
 	input: 0,
@@ -473,5 +474,49 @@ describe("ToolCallLoopGuard multi-call turns", () => {
 		expect(guard.recordTurn(turn(b()))).toBeNull();
 		expect(guard.recordTurn(turn(a()))).toBeNull();
 		expect(guard.recordTurn(turn(b()))).toBeNull();
+	});
+});
+
+describe("ToolCallLoopGuard argument canonicalization", () => {
+	let nextId = 0;
+
+	function turn(args: Record<string, unknown>) {
+		const message = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: `call_${nextId++}`, name: "mcp", arguments: args }],
+			api: "openai-responses",
+			provider: "openai",
+			model: "test-model",
+			usage: zeroUsage,
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		} satisfies AssistantMessage;
+		return { message, toolResults: [] };
+	}
+
+	test("sorts nested keys and drops nested intent fields, keeping array order", () => {
+		const guard = new ToolCallLoopGuard({ threshold: 2, exemptTools: [] });
+		expect(
+			guard.recordTurn(
+				turn({ b: [{ y: 1, x: 2, [INTENT_FIELD]: "one" }, "z"], a: { __intent: "one", d: null, c: "s" } }),
+			),
+		).toBeNull();
+		expect(
+			guard.recordTurn(
+				turn({ [INTENT_FIELD]: "two", a: { c: "s", d: null }, b: [{ x: 2, __intent: "two", y: 1 }, "z"] }),
+			),
+		).toMatchObject({ count: 2, argumentsSummary: '{"a":{"c":"s","d":null},"b":[{"x":2,"y":1},"z"]}' });
+		expect(guard.recordTurn(turn({ a: { c: "s", d: null }, b: ["z", { x: 2, y: 1 }] }))).toBeNull();
+	});
+
+	test("counts a repeated call whose arguments nest past a recursive walk's reach", () => {
+		const guard = new ToolCallLoopGuard({ threshold: 2, exemptTools: [] });
+		expect(guard.recordTurn(turn(nestedChain()))).toBeNull();
+		expect(guard.recordTurn(turn(nestedChain()))).toMatchObject({
+			count: 2,
+			argumentsSummary: `${nestedChainJson().slice(0, 400)}…`,
+		});
+		// The value at the bottom is part of the call: another one is another call.
+		expect(guard.recordTurn(turn(nestedChain({ leaf: "other" })))).toBeNull();
 	});
 });
