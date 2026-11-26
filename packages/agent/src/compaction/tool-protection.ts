@@ -1,6 +1,7 @@
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { parseSpillUrl } from "@oh-my-pi/pi-utils";
 import type { AgentMessage, AgentToolCall } from "../types";
+import { compactionKeptStart } from "./compaction";
 import type { SessionEntry } from "./entries";
 
 export interface ProtectedToolContext {
@@ -29,6 +30,114 @@ export function collectToolCallsById(
 		}
 	}
 	return toolCalls;
+}
+
+/**
+ * Tool calls of a summarized-away prefix `entries[0, length)` by call id: the
+ * assistant entry holding each call, and in `resolved` the calls lookups have
+ * read from those entries, arguments included.
+ */
+interface PrefixToolCalls {
+	readonly length: number;
+	readonly boundary: SessionEntry;
+	readonly entryById: Map<string, SessionEntry>;
+	readonly resolved: Map<string, AgentToolCall>;
+}
+
+/**
+ * The latest prefix index by the first entry of its branch. A branch prefix is
+ * the path from the root to its boundary, so one index serves every pass while
+ * the boundary and the branch stay; a new boundary or another branch replaces
+ * it, so an older compaction's index never outlives the next one built for the
+ * session.
+ */
+const prefixToolCalls = new WeakMap<SessionEntry, PrefixToolCalls>();
+
+function prefixToolCallIndex(entries: readonly SessionEntry[], length: number): PrefixToolCalls {
+	const first = entries[0];
+	const boundary = entries[length];
+	const cached = prefixToolCalls.get(first);
+	if (cached && cached.length === length && cached.boundary === boundary) return cached;
+	const entryById = new Map<string, SessionEntry>();
+	for (let i = 0; i < length; i++) {
+		const entry = entries[i];
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		for (const block of entry.message.content) {
+			if (block.type === "toolCall") entryById.set(block.id, entry);
+		}
+	}
+	const index: PrefixToolCalls = { length, boundary, entryById, resolved: new Map() };
+	prefixToolCalls.set(first, index);
+	return index;
+}
+
+function prefixToolCall(index: PrefixToolCalls, id: string): AgentToolCall | undefined {
+	const resolved = index.resolved.get(id);
+	if (resolved !== undefined) return resolved;
+	const entry = index.entryById.get(id);
+	if (entry?.type !== "message" || entry.message.role !== "assistant") return undefined;
+	const call = entry.message.content.findLast(
+		(block): block is AgentToolCall => block.type === "toolCall" && block.id === id,
+	);
+	if (call !== undefined) index.resolved.set(id, call);
+	return call;
+}
+
+/**
+ * Resolve the array index of the compaction boundary (`keepBoundaryId`, the
+ * `firstKeptEntryId` of the latest compaction). Entries before this index are
+ * summarized away by that compaction and never sent, so the prune and shake
+ * passes neither walk nor mutate them. Returns 0 when there is no boundary (no
+ * compaction → whole branch is sent) or the id is absent from `entries`.
+ *
+ * A compaction that kept no entry (`firstKeptEntryId: ""`, as an Anthropic
+ * native compaction that summarizes everything leaves) puts the boundary
+ * where the context starts for the latest compaction on `entries`
+ * ({@link compactionKeptStart}): the entry after its
+ * `providerReplayThroughEntryId` when turns were appended while it ran, else
+ * that compaction. Reading `""` as no boundary would walk, and read the
+ * bodies of, the whole branch on every pass.
+ */
+export function resolveBoundaryIndex(entries: readonly SessionEntry[], keepBoundaryId: string | undefined): number {
+	if (keepBoundaryId === undefined) return 0;
+	if (keepBoundaryId === "") {
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i];
+			if (entry.type === "compaction") return compactionKeptStart(entries, entry, i);
+		}
+		return 0;
+	}
+	for (let i = entries.length - 1; i >= 0; i--) {
+		if (entries[i].id === keepBoundaryId) return i;
+	}
+	return 0;
+}
+
+/**
+ * Tool-call lookup for results in the sent region `entries[start, end)`.
+ * Calls there are indexed eagerly; the summarized-away prefix is indexed only
+ * on the first miss, once per boundary and branch (see
+ * {@link prefixToolCallIndex}), so lookups match a whole-branch scan while
+ * repeated passes never walk history the boundary already excludes.
+ */
+export class SentToolCalls {
+	readonly #entries: readonly SessionEntry[];
+	readonly #start: number;
+	readonly #sent: Map<string, AgentToolCall>;
+	#prefix: PrefixToolCalls | undefined;
+
+	constructor(entries: readonly SessionEntry[], start: number) {
+		this.#entries = entries;
+		this.#start = start;
+		this.#sent = collectToolCallsById(entries, start);
+	}
+
+	get(id: string): AgentToolCall | undefined {
+		const call = this.#sent.get(id);
+		if (call !== undefined || this.#start === 0) return call;
+		this.#prefix ??= prefixToolCallIndex(this.#entries, this.#start);
+		return prefixToolCall(this.#prefix, id);
+	}
 }
 
 /** Return the tool-result message carried by a session entry, if any. */

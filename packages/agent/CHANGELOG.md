@@ -2,10 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Prune and shake passes look up tool calls before the compaction boundary in an index built once per boundary and branch, and shake starts its walk at the boundary; before, shake re-read that history on every pass and prune on every pass that missed a call
+
 ### Fixed
 
 - Reduced the size of authentication-gateway requests by preventing tool definitions from including internal host state.
 - Corrected OpenTelemetry chat spans to report the model that actually served the response.
+- After a compaction that kept no entry (an Anthropic native compaction that summarizes everything), the prune and shake passes start at that compaction, or at the turns added while it ran, instead of walking, and reading, the whole history on every pass
 
 ## [19.2.1] - 2026-11-25
 
