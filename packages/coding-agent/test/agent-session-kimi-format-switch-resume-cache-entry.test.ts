@@ -4,7 +4,7 @@
  * resumes a session has sent nothing yet: it reads the cache entry off the branch's newest cached reply. When the
  * setting names the other endpoint than the one that reply went to, the next request reads none of what it cached, and
  * the session must read the entry as one the next request cannot read, as after a switch to another model: read as
- * live, the status line shows it warm, the cut rule waits on it, and the resumed process keeps the stored prompt for it.
+ * live, the status line shows it warm and the resumed process keeps the stored prompt for it.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";

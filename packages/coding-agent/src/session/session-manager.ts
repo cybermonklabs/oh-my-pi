@@ -3413,7 +3413,7 @@ export class SessionManager {
 	 * Bumped each time the entries are read in whole: a session file opened, resumed or read again (a `/resume` of the
 	 * session already held, a reload), copied into a new session (`forkFrom`: `omp --fork`, a resume of a session that
 	 * moved away, a `/tan` or task fork; {@link persistCopy}), a captured state restored. Records read from the entries
-	 * and kept by session (image drops, snapcompact refusals, the cut rule's waits) are read again at a new revision:
+	 * and kept by session (image drops, the provider's fallbacks) are read again at a new revision:
 	 * another process may have continued the session file since this one last read it, and the records a read brings
 	 * stand over what this process held before it.
 	 */

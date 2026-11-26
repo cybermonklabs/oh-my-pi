@@ -1421,12 +1421,10 @@ describe("AgentSession shake", () => {
 				content: [{ type: "text", text: "trigger" }],
 				...apiInfo,
 				stopReason: "stop",
-				// Nothing read from or written to the prompt cache: with no cache entry to rewrite, the cut rule
-				// admits the shake, so the case reaches the fallback decision it is about.
 				usage: {
-					input: 90000,
+					input: 5000,
 					output: 1000,
-					cacheRead: 0,
+					cacheRead: 85000,
 					cacheWrite: 0,
 					totalTokens: 91000,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },

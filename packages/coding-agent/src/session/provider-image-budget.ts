@@ -539,7 +539,7 @@ export function carryImageDrops(
  * The count clamp is sticky: it remembers which images it dropped ({@link imageKeys}). While the other images a
  * request sends fit the budget, it drops exactly those again, so the prompt prefix keeps its bytes and the next
  * request reads it from the cache. When a new image would exceed the budget, the request cannot be served without a
- * drop (cut rule condition 1): it drops the oldest images down to half the budget (rounded up) in one step, so the
+ * drop: it drops the oldest images down to half the budget (rounded up) in one step, so the
  * next forced drop is at least half the budget of new images away. It keeps more where the newest message that sends
  * images sends more: as many of them as the budget carries. The images dropped beyond the one the budget needed sit
  * after it, so they add no cache write to the rewrite the forced drop already causes, and they shrink what is

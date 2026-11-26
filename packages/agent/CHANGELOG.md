@@ -4,8 +4,6 @@
 
 ### Added
 
-- Added `decideContextCut()`, which decides whether an automatic context cut runs now or waits until the prompt-cache reads it saves pay for the cache write it causes, and `meanPromptGrowth()` for its prompt-growth input; an unbounded threshold (`Number.POSITIVE_INFINITY`, nothing compacts the context) counts the saved reads over every later request
-- Added an `admit` gate to `pruneToolOutputs()` and `pruneSupersededToolResults()` configs: it sees where a pass would first change the history and what it would save, and a refused pass blanks nothing
 - Added `RepeatedPerCallMessages` and `AgentLoopConfig.repeatedPerCallMessages`, which every `Agent` sets for its own loop; its `settle()` returns the request's messages and a `sent` callback the loop calls once the provider answers the request (its `onResponse`)
 - Added `AgentLoopConfig.getMissingContextMessages` and `Agent.setMissingContextMessageProvider()`: asked before each model call with the call's context, the messages they return join that turn's input messages, emitted and recorded like the others
 - Added `ProviderContextRequest`: `Agent.buildSideRequestContext()` passes `{ sideRequest: true }` as the third argument of `transformProviderContext`, so a transform that keeps state for the conversation's requests can read it there and leave it as the loop's requests left it

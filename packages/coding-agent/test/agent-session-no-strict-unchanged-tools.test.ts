@@ -4,7 +4,7 @@
  * tools include none of them declares the same tool bytes with `PI_NO_STRICT` set or not, so a process that resumes it
  * with the variable toggled reads the whole cache entry the transcript's last request left. Its prompt cache status
  * must say so, and it must keep sending the transcript's stored system prompt rather than its own build: judged as if
- * the tools had changed, the entry looks unreadable, the cut rule treats it as lapsed, and the process's own build goes
+ * the tools had changed, the entry looks unreadable, the hold is released, and the process's own build goes
  * out, which writes the whole cached prompt again. Each process here is a process of its own ({@link ProcessInput}),
  * with `PI_NO_STRICT` set or not.
  */

@@ -372,23 +372,25 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 
 		// A compaction forced by a full window rewrites every message anyway: the next request carries the rebuild.
 		const compactDir = createTempDir();
-		const soft = "compaction:\n  methodOrder: [soft]\n  asyncEnabled: false\n  keepRecentTokens: 1\n";
+		const soft =
+			"compaction:\n  methodOrder: [soft]\n  asyncEnabled: false\n  keepRecentTokens: 1\n  autoContinue: false\n";
 		const compacted = await startSession(compactDir, {
 			toolNames: ["read"],
 			overlay: soft,
 			contextWindow: 100_000,
-			// The second request fills the window past its reserve.
+			// The second request fills the window past its reserve; the third is the compaction's summary request.
 			replies: { 2: turn => textAnswer(turn, 90_000) },
 		});
-		// No model to summarize with: the admitted compaction starts, then ends skipped.
-		vi.spyOn(compacted.modelRegistry, "getAvailable").mockReturnValue([]);
 		await compacted.session.prompt("first");
 		await reloadOverlay(compacted, `${OVERLAY}${soft}personality: pragmatic\n`);
 		await compacted.session.prompt("second");
 		await compacted.session.prompt("third");
-		const [compactFirst, compactSecond, compactThird] = compacted.requests;
-		if (!compactFirst || !compactSecond || !compactThird) throw new Error("Expected three requests");
+		const [compactFirst, compactSecond] = compacted.requests;
+		const afterCompaction = compacted.requests.at(-1);
+		if (!compactFirst || !compactSecond || !afterCompaction)
+			throw new Error("Expected the requests around the compaction");
+		expect(compacted.session.sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
 		expect(withoutCacheControl(compactSecond.system)).toBe(withoutCacheControl(compactFirst.system));
-		expect(withoutCacheControl(compactThird.system)).not.toBe(withoutCacheControl(compactFirst.system));
+		expect(withoutCacheControl(afterCompaction.system)).not.toBe(withoutCacheControl(compactFirst.system));
 	}, 60_000);
 });

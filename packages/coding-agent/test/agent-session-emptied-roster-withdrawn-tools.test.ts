@@ -2,7 +2,7 @@
  * On a model that keeps its tool declaration across a conversation, a tool taken off the roster stays declared while
  * another tool is on the roster. A request with no tool on the roster declares none at all: the provider re-declares a
  * withdrawn tool only beside an active one. The non-message figure (the status line's anchor, the pre-prompt
- * compaction check, the cut rule's prefix) must then count no withdrawn tool: counted, it starts compaction on tools the
+ * compaction check) must then count no withdrawn tool: counted, it starts compaction on tools the
  * request does not send, and leaves the status line below the usage the provider reported for that request.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
