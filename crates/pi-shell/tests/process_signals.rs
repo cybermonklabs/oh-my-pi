@@ -3538,13 +3538,21 @@ fn cores(dir: &Path) -> Vec<String> {
 /// An `exec`ed program that dies of a core-dumping signal ends the shell's
 /// process by that signal with no core of the shell's own: zsh `exec`s the
 /// program, so one process dies and at most its own core exists. The
-/// program here sets its core size limit to 0, so neither shell leaves a
-/// core. The control: `/bin/sh` killed by `SIGQUIT` with the limit raised
-/// dumps a core here; where it does not (no core dump can be seen, as
-/// under gVisor), the test says so.
+/// program here dumps no core either, so neither shell leaves one: on Linux
+/// it runs with a core size limit of 1 byte (`prlimit`), as [`Run`] gives
+/// what a run starts, since a pipe `core_pattern` (systemd-coredump,
+/// apport) ignores a limit of 0; elsewhere no pipe `core_pattern` exists
+/// and `ulimit -c 0` does. The control: `/bin/sh` killed by `SIGQUIT` with
+/// the limit raised dumps a core here; where it does not (no core dump can
+/// be seen, as under gVisor), the test says so.
 #[test]
 fn an_exec_d_programs_core_dump_signal_leaves_no_core_of_the_shell() {
-	let args = ["-f", "-c", "exec /bin/sh -c 'ulimit -c 0; kill -QUIT $$'"];
+	let program = if cfg!(target_os = "linux") {
+		"exec prlimit --core=1 /bin/sh -c 'kill -QUIT $$'"
+	} else {
+		"exec /bin/sh -c 'ulimit -c 0; kill -QUIT $$'"
+	};
+	let args = ["-f", "-c", program];
 	let control_dir = tempfile::tempdir().expect("a directory for the control's core");
 	let control = Run::new("/bin/sh", "sh", &["-c", "kill -QUIT $$"])
 		.dumping_in(control_dir.path())
