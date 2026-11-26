@@ -18,6 +18,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { isSessionSettled } from "@oh-my-pi/pi-coding-agent/session/session-settle";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 
 const REMINDER_MARKER = "todo failed, so todo progress is not visible to the user.";
 
@@ -128,6 +129,18 @@ describe("AgentSession todo-error reminder", () => {
 		const { reminders } = await runTwoPrompts([
 			todoCall("todo-fail", { op: "append", phase: "Build" }),
 			todoCall("todo-retry", { op: "append", phase: "Build", items: ["Add tests"] }),
+			{ content: ["Appended"] },
+		]);
+
+		expect(session?.getTodoPhases()[0]?.tasks.map(task => task.content)).toEqual(["Write code", "Add tests"]);
+		expect(reminders).toEqual([]);
+	});
+
+	// A tool call's arguments are any JSON, as deep as JSON.parse reads; matching a retry to its failure walks them.
+	it("drops the reminder after a retry whose arguments nest past JSON.stringify's reach", async () => {
+		const { reminders } = await runTwoPrompts([
+			todoCall("todo-fail", { note: nestedChain(), op: "append", phase: "Build", items: [] }),
+			todoCall("todo-retry", { note: nestedChain(), op: "append", phase: "Build", items: ["Add tests"] }),
 			{ content: ["Appended"] },
 		]);
 

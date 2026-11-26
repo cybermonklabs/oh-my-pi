@@ -5,8 +5,10 @@
 ### Fixed
 
 - Counting a tool call whose arguments nest more than 40,000 levels deep (a resumed session can hold one) no longer fails with `Maximum call stack size exceeded`, which failed the first prompt after the resume, each turn's end, compaction and every context-usage reading
+- Counting the tokens of a message whose tool call has arguments nested more than 10,000 levels deep no longer spends up to seconds in `JSON.stringify` before the deep writer runs (1.4 s per count at 50,000 levels), a cost every request of such a session paid
 - With `provider.appendOnlyContext` on, a request no longer fails with `Maximum call stack size exceeded` when the conversation holds a tool call whose arguments nest more than 40,000 levels deep
 - With full message-content capture on, a request whose history holds a tool call or result nested more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded` while its input messages are recorded, nor spends 1.5 s or more on each request recording them, and a tool span records such a tool call's arguments and result as JSON instead of `[object Object]`
+- Compaction of a conversation holding a tool call whose arguments nest more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded` while it writes the conversation for the summary or for OpenAI remote compaction
 - Fixed OpenTelemetry chat spans reporting the requested model as `gen_ai.response.model` when the provider recorded the model that actually served the turn ([#20466](https://github.com/can1357/oh-my-pi/pull/20466) by [@byhow](https://github.com/byhow))
 
 ## [19.2.1] - 2026-11-25

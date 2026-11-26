@@ -21,6 +21,11 @@
 ### Fixed
 
 - With TTSR rules loaded (the built-in defaults load some), a tool call whose arguments nest more than about 40,000 levels deep no longer fails its turn with `Maximum call stack size exceeded` when the rules check its finished arguments or a judged rule asks about the call, and a rule still matches text anywhere in them
+- `--mode json` writes an event holding a tool call whose arguments nest more than about 40,000 levels deep instead of failing with `Maximum call stack size exceeded`
+- In ACP mode, a tool call whose arguments nest tens of thousands of levels deep passes the permission gate and reaches the client, instead of failing with `Maximum call stack size exceeded`
+- Shake no longer fails with `Maximum call stack size exceeded` on a session holding a tool call whose arguments nest tens of thousands of levels deep
+- Extension `context` and `assistant_message` handlers run over a conversation holding a tool call whose arguments nest tens of thousands of levels deep, instead of failing with `Maximum call stack size exceeded` or letting a `context` handler's in-place edit reach the stored history
+- A successful `todo` retry clears the failure reminder it corrects even when the calls carry arguments nested tens of thousands of levels deep
 - A session holding an entry nested more than about 25,000 levels deep is written and rewritten again, instead of every write failing with `Maximum call stack size exceeded`: the passes that write a line, with `secrets.maskSessionStore` on the masking too, read an entry as deep as a session file can hold (400,000 levels), and a line that deep is written in milliseconds instead of the seconds `JSON.stringify` takes past about 25,000 levels
 - A session whose entries carry a `runtime` nested more than about 25,000 levels deep resumes instead of failing with `Maximum call stack size exceeded`
 - An entry nested more than 10,000 levels deep that holds a bigint (an extension hook can put one in an entry) is written with the bigint as its decimal string, as a shallower entry is, instead of every write of the session failing with `JSON.stringify cannot serialize BigInt`

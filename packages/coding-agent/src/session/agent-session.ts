@@ -107,6 +107,7 @@ import {
 	isBunTestRuntime,
 	isInteractiveHost,
 	isRecord,
+	jsonDeepEquals,
 	Laps,
 	logger,
 	postmortem,
@@ -4930,9 +4931,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				reminders.push({ message, details: message.details });
 			}
 		}
+		// Both are a todo call's arguments: JSON data, as deep as a transcript line holds.
 		const exact = reminders.filter(({ details }) => {
 			const failed = details.attemptedArgs;
-			return isRecord(failed) && Bun.deepEquals(failed, retry);
+			return isRecord(failed) && jsonDeepEquals(failed, retry);
 		});
 		const superseded =
 			exact.length > 0

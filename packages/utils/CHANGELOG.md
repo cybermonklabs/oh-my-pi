@@ -9,6 +9,7 @@
 - Added `jsonDeepEquals`, `Bun.deepEquals` (not strict) for JSON-shaped data of any depth, which walks arrays and plain objects on its own stack
 - Added a `space` option to `stringifyDeepJson`, which indents as `JSON.stringify` does a value nested at most `INDENTED_JSON_LEVELS` (1,000) levels deep and writes a deeper one without indentation, and `nestsDeeperThan`, the depth check it uses, which imports nothing so a browser bundle can use it
 - Added a `probeDepth` option to `stringifyDeepJson`: it checks the depth first, so a value nested past `DEEP_JSON_LEVELS` (10,000) levels, the new export where a writer should switch to the iterative one, goes straight to it instead of first spending 1.5 s or more in a `JSON.stringify` that runs out of stack; with `space`, a value past `INDENTED_JSON_LEVELS` no longer pays that attempt either
+- Added `structuredCloneDeep`, `structuredClone` that also copies a value nested deeper than its recursion allows (Bun's runs out of stack near 40,000 levels): such a value is copied by `cloneJsonTree`, and any other as `structuredClone` copies it, keeping its `Map`s, `Date`s, typed arrays and cycles
 - Added `getBunStubDir()`, the cache directory holding the `bun` stub a compiled omp appends to its JS eval kernel's PATH ([#19241](https://github.com/can1357/oh-my-pi/pull/19241) by [@mccraigmccraig](https://github.com/mccraigmccraig))
 
 ### Breaking Changes
@@ -18,6 +19,7 @@
 ### Fixed
 
 - Fixed `cloneJsonTree` failing with `Maximum call stack size exceeded` on a tree nested more than about 22,500 levels deep; it keeps its own stack, and a cycle throws a `TypeError`
+- Fixed the ACP `ndJsonStream` transport failing with `Maximum call stack size exceeded` on a message nested more than about 40,000 levels deep; it writes the message with `stringifyDeepJson`
 - Fixed `parseImageMetadata` omitting the dimensions of lossless WebP (VP8L) headers shorter than 30 bytes ([#20521](https://github.com/can1357/oh-my-pi/pull/20521) by [@shgew](https://github.com/shgew))
 
 ## [19.2.1] - 2026-11-25

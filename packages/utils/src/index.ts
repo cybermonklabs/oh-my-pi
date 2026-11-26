@@ -91,6 +91,27 @@ export function cloneJsonTree<T>(value: T): T {
 	return runNested(cloneJsonNode(value, new ContainerPath())) as T;
 }
 
+/**
+ * `structuredClone(value)`, also for a value nested deeper than its recursion
+ * allows: Bun's `structuredClone` throws `Maximum call stack size exceeded`
+ * near 40,000 levels, and sooner on a deep call stack or a worker thread.
+ * Every value `structuredClone` copies is copied by it, with its rules: a
+ * `Map`, `Date` or typed array stays one, a cycle stays a cycle, and a
+ * function throws its `DataCloneError`. Only a value it runs out of stack on
+ * (its `RangeError`) is copied by {@link cloneJsonTree} instead; only data
+ * parsed from JSON nests that deep (a tool call's arguments, a session entry
+ * read from a transcript line). That failed attempt costs tens of
+ * milliseconds, and a shallow value pays no depth check.
+ */
+export function structuredCloneDeep<T>(value: T): T {
+	try {
+		return structuredClone(value);
+	} catch (error) {
+		if (error instanceof RangeError) return cloneJsonTree(value);
+		throw error;
+	}
+}
+
 function isJsonRecord(value: object): value is Record<string, unknown> {
 	const proto = Object.getPrototypeOf(value);
 	return proto === Object.prototype || proto === null;
