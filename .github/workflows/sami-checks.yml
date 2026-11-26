@@ -8,13 +8,13 @@
 #     later, so sami itself is not tested again).
 #   - A dispatch tests any pushed commit, given as a full 40-character id:
 #       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
-#         -f commit=<sha> [-f rows=<row>,<row>...] [-f silent=<job name>] [-f plant=docs|changelog|rustfmt]
+#         -f commit=<sha> [-f rows=<row>,<row>...] [-f silent=<job name>] [-f plant=docs|changelog|rustfmt|membench]
 #     `rows` selects the rows the run runs: all (the default), or a comma list of the summary's row
 #     names (sc.py ROW_KEYS): set-runner, set-root, lib4, builtins, workspace, ts-small, ts-ca,
 #     checkts, macos, windows, clippy, skipforms, gv-set-uid1000, gv-set-root, gv-lib4-uid1000,
 #     gv-lib4-root, gv-builtins-uid1000, gv-builtins-root, gv-orphan-uid1000, gv-orphan-root, docs,
-#     changelog, rustfmt, rust_test, rust_test_macos. A name that is no row fails the plan, which
-#     lists them.
+#     changelog, rustfmt, membench, rust_test, rust_test_macos. A name that is no row fails the plan,
+#     which lists them.
 #     The plan runs the jobs whose results the selected rows read and the jobs those need by their
 #     `needs:` (the reference tools, the test archive, the host addon), and no other job: a proof of
 #     the docs row builds nothing else. A row reads the same alone as in a run of every row, so rows
@@ -27,11 +27,13 @@
 #     `silent` is the summary's control: the named job (for example set-root-2) uploads nothing,
 #     and the summary must then read its units and its row UNKNOWN. `silent=macos-bash` instead
 #     makes the macOS legs skip their bash 5 install, and the macOS row must read UNKNOWN.
-#     `plant` is the docs, changelog or rustfmt row's control: that job first adds a fault to the
-#     tree (sc.py PLANTS: a doc comment with a broken intra-doc link, an empty CHANGELOG heading, or
-#     a function rustfmt would space out at the end of each cargo workspace's first target root),
-#     and the summary says at its top whether the row then read FAIL naming it. A silent or plant
-#     whose job or row the run does not run fails the plan: that control would pass quietly.
+#     `plant` is the docs, changelog, rustfmt or membench row's control: that job first adds a fault
+#     to the tree (sc.py PLANTS: a doc comment with a broken intra-doc link, an empty CHANGELOG
+#     heading, a function rustfmt would space out at the end of each cargo workspace's first target
+#     root, or a 1 MiB reserve in the kernel a pi-shell Shell owns, which the memory bench's shell
+#     line must read as a MISS), and the summary says at its top whether the row then read FAIL
+#     naming it. A silent or plant whose job or row the run does not run fails the plan: that
+#     control would pass quietly.
 #   GitHub dispatches only a workflow it has seen run, and this file is not on the default branch
 #   (main); the pushes of release-candidate run it.
 #
@@ -74,6 +76,12 @@
 #     whose run fails the same check at the tree's upstream base (its merge base with upstream's
 #     main, fetched in the job), is upstream's own and reads KNOWN; a place a fork change brought
 #     reads FAIL; one in a file the base's check did not read stays UNKNOWN.
+#   - membench: pi-shell's memory bench (crates/pi-shell/benches/memory.rs), as `cargo bench -p
+#     pi-shell --bench memory` builds it (cargo's bench profile, which inherits the release profile)
+#     on the tree's toolchain, cold, then run once (.github/sami-checks/membench.sh). One unit: FAIL
+#     when a target line reads MISS or the bench exits other than 0; UNKNOWN when it did not build,
+#     the time bound or a signal ended it, or it printed no target line. The summary lists its exit
+#     and every line it printed. The bench's verdicts were printed only, so nothing read them before.
 #   - under gVisor (sami-checks-gvisor.yml): the pi-shell set (and so the one-process lib) and
 #     pi-builtins again, from the same archive, in a runsc container, as uid 1000 and as root.
 # The tests run against zsh 5.9, rsync 3.5.1 and jj 0.46.0 built or fetched from pinned sources
@@ -163,7 +171,7 @@ on:
         default: ""
         type: string
       plant:
-        description: "Control: docs, changelog or rustfmt, a row whose job first plants a fault the row must name"
+        description: "Control: docs, changelog, rustfmt or membench, a row whose job first plants a fault the row must name"
         required: false
         default: ""
         type: string
@@ -824,7 +832,7 @@ jobs:
     # rust-test, rust-test-macos and rust-test-drift are here so that the summary runs last and
     # reads their results (SC_RUST_TESTS).
     needs: [plan, tools, build, natives, set, builtins, workspace, ts-small, ts-ca, checkts, skip-forms,
-            platforms, clippy, gvisor, docs, changelog, rustfmt, rust-test, rust-test-macos, rust-test-drift]
+            platforms, clippy, gvisor, docs, changelog, rustfmt, membench, rust-test, rust-test-macos, rust-test-drift]
     if: ${{ always() && needs.plan.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1067,5 +1075,42 @@ jobs:
         if: ${{ always() && needs.plan.outputs.silent != 'rustfmt' }}
         with:
           name: sc-res-rustfmt
+          path: ${{ github.workspace }}/sc/res/
+          retention-days: 14
+
+  membench:
+    # pi-shell's memory bench (membench.sh): built by `cargo bench --no-run` (cargo's bench profile,
+    # which inherits the tree's release profile) on the tree's toolchain, cold like every job that
+    # builds code of the tree (the workflow's cache-mode none), then run once, as cargo runs it.
+    name: pi-shell memory bench
+    needs: plan
+    if: contains(fromJSON(needs.plan.outputs.jobs), 'membench')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tool
+          persist-credentials: false
+          sparse-checkout: .github/sami-checks
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tree
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: Toolchain (the tree's rust-toolchain.toml channel, minimal profile)
+        run: |
+          ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$SC_TREE/rust-toolchain.toml" | head -n 1)
+          [ -n "$ch" ] || { echo "::error::no channel in the tree's rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$ch" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$ch" >> "$GITHUB_ENV"
+      - name: cargo bench -p pi-shell --bench memory, built and run once
+        env:
+          SC_PLANT: ${{ needs.plan.outputs.plant }}
+        run: bash tool/.github/sami-checks/membench.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && needs.plan.outputs.silent != 'membench' }}
+        with:
+          name: sc-res-membench
           path: ${{ github.workspace }}/sc/res/
           retention-days: 14
