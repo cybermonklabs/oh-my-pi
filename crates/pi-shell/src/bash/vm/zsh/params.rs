@@ -2101,7 +2101,7 @@ fn unset_pm(ex: &mut Expander<'_, '_>, pm: &Param) -> X<()> {
 		// tied (a local stays declared without `PM_TIED`).
 		drop_attrs(ex, &other, Attrs::ZSH_TIED)?;
 		drop_attrs(ex, &pm.name, Attrs::ZSH_TIED)?;
-		state::unset_var(&mut ex.k.root, ex.cx.store, ex.vp, &other, true);
+		state::unset_var(&mut ex.k.root, ex.cx.store, ex.vp, &other, state::UnsetKeeps::AllScoped);
 	}
 	drop_shadowing_privates(ex, pm)?;
 	// zsh `unsetparam_pm`: a special parameter is never removed; it stays,
@@ -2127,7 +2127,7 @@ fn unset_pm(ex: &mut Expander<'_, '_>, pm: &Param) -> X<()> {
 		)?;
 		return Ok(());
 	}
-	state::unset_var(&mut ex.k.root, ex.cx.store, ex.vp, &pm.name, true);
+	state::unset_var(&mut ex.k.root, ex.cx.store, ex.vp, &pm.name, state::UnsetKeeps::AllScoped);
 	// zsh's `strsetfn(pm, NULL)` empties the variable the other prompt
 	// names share; they stay set. A hidden local (`typeset -h`) is
 	// plain.

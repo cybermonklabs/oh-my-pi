@@ -2898,8 +2898,12 @@ pub fn unset(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		}
 		match index {
 			None => {
-				let keep = ctx.option(OptId::LocalvarUnset)?;
-				state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keep);
+				let keeps = if ctx.option(OptId::LocalvarUnset)? {
+					state::UnsetKeeps::AllLocals
+				} else {
+					state::UnsetKeeps::OwnLocals
+				};
+				state::unset_var(&mut ctx.k.root, ctx.cx.store, ctx.vp, name, keeps);
 				if name == b"PATH" {
 					super::names::flush_hash(&mut ctx.k.root, ctx.cx.store, ctx.vp)?;
 				}
