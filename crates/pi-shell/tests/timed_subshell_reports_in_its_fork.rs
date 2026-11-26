@@ -9,12 +9,15 @@
 //! report. bash's `time_command` gives no report for a jump once the
 //! subshell environment changed under it, which a fork's first `trap` call
 //! with arguments does (it clears `SUBSHELL_RESETTRAP`): after that, a jump
-//! out of a `time` the fork started before reports nothing.
+//! out of a `time` the fork started before reports nothing. A posix special
+//! builtin's error that ends the shell or the fork undoes the builtin's own
+//! redirections before that jump, so its report goes outside them.
 //!
 //! Each row runs twice, as `-c` text and from a script file. Every row was
 //! measured against bash 5.3.20 and 5.2.21 both ways, as uid 1000 and as
 //! root, under runc and gVisor; the bashes agree on each once an error
-//! line's `NAME: line N: ` prefix reads `SH: `.
+//! line's `NAME: line N: ` prefix reads `SH: ` and `trap`'s usage line is
+//! set aside.
 
 #![cfg(unix)]
 
@@ -59,11 +62,36 @@ impl Drop for Place {
 	}
 }
 
+/// A row's output with each error line's `NAME: line N: ` prefix as `SH: `,
+/// a `time -p` line's digits as 0, and `trap`'s usage line as
+/// `trap: usage: ...` (bash 5.3 and 5.2 word it differently).
+fn normalize_output(bytes: &[u8]) -> String {
+	String::from_utf8_lossy(bytes)
+		.lines()
+		.map(|l| {
+			let l = match l.find(": line ") {
+				Some(i) => l[i + 7..]
+					.find(": ")
+					.map_or_else(|| l.to_owned(), |j| format!("SH: {}", &l[i + 7 + j + 2..])),
+				None => l.to_owned(),
+			};
+			if ["real ", "user ", "sys "].iter().any(|p| l.starts_with(p)) {
+				l.replace(|c: char| c.is_ascii_digit(), "0") + "\n"
+			} else if l.starts_with("trap: usage: ") {
+				"trap: usage: ...\n".to_owned()
+			} else {
+				l + "\n"
+			}
+		})
+		.collect()
+}
+
 /// Runs `script` with stderr on stdout and `TIMEFORMAT=report` in a private
-/// directory (a row may write files there); each error line's
-/// `NAME: line N: ` prefix becomes `SH: ` and a `time -p` line's digits
-/// become 0. Returns the output and the exit status.
-fn run(script: &str, mode: Mode) -> (String, Option<i32>) {
+/// directory (a row may write files there); the output is normalized
+/// ([`normalize_output`]). `with_file` appends `f=[…]`, the normalized
+/// contents of the file `f` the row wrote: a row whose shell exits can still
+/// show where its messages went. Returns the output and the exit status.
+fn run(script: &str, mode: Mode, with_file: bool) -> (String, Option<i32>) {
 	let _place = Place::take();
 	let dir = tempfile::tempdir().expect("a row directory");
 	let script = format!("exec 2>&1; TIMEFORMAT=report; {script}");
@@ -77,22 +105,13 @@ fn run(script: &str, mode: Mode) -> (String, Option<i32>) {
 		},
 	};
 	let out = obash_support::output(&mut cmd);
-	let text = String::from_utf8_lossy(&out.stdout)
-		.lines()
-		.map(|l| {
-			let l = match l.find(": line ") {
-				Some(i) => l[i + 7..]
-					.find(": ")
-					.map_or_else(|| l.to_owned(), |j| format!("SH: {}", &l[i + 7 + j + 2..])),
-				None => l.to_owned(),
-			};
-			if ["real ", "user ", "sys "].iter().any(|p| l.starts_with(p)) {
-				l.replace(|c: char| c.is_ascii_digit(), "0") + "\n"
-			} else {
-				l + "\n"
-			}
-		})
-		.collect();
+	let mut text = normalize_output(&out.stdout);
+	if with_file {
+		let file = std::fs::read(dir.path().join("f")).unwrap_or_default();
+		text.push_str("f=[");
+		text.push_str(normalize_output(&file).trim_end());
+		text.push_str("]\n");
+	}
 	(text, out.status.code())
 }
 
@@ -102,8 +121,8 @@ type Row<'a> = (&'a str, &'a str, &'a str, i32);
 
 /// Every row whose output or status differs, in either mode, is listed. The
 /// runs go side by side (each is its own shell), [`SHELLS_AT_ONCE`] at a
-/// time.
-fn assert_rows(rows: &[Row<'_>]) {
+/// time. `with_file`: as [`run`]'s.
+fn check_rows(rows: &[Row<'_>], with_file: bool) {
 	let runs: Vec<_> = rows
 		.iter()
 		.flat_map(|&(name, script, want, status)| {
@@ -113,7 +132,7 @@ fn assert_rows(rows: &[Row<'_>]) {
 	let got: Vec<_> = std::thread::scope(|scope| {
 		let mut handles = Vec::with_capacity(runs.len());
 		for &(_, script, mode, ..) in &runs {
-			handles.push(scope.spawn(move || run(script, mode)));
+			handles.push(scope.spawn(move || run(script, mode, with_file)));
 		}
 		handles
 			.into_iter()
@@ -129,6 +148,101 @@ fn assert_rows(rows: &[Row<'_>]) {
 		})
 		.collect();
 	assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// [`check_rows`] of the output alone.
+fn assert_rows(rows: &[Row<'_>]) {
+	check_rows(rows, false);
+}
+
+/// [`check_rows`] of the output and the file `f`.
+fn assert_rows_with_file(rows: &[Row<'_>]) {
+	check_rows(rows, true);
+}
+
+/// A posix special builtin's error that ends the shell (its usage error, or
+/// a redirection of its that fails) undoes the builtin's own redirections
+/// first, as bash's `execute_builtin_or_function` does before the `ERREXIT`
+/// jump: the `time` around it reports through the redirections outside the
+/// builtin, in a timed `( … )` (the fork exits) and in a timed group (the
+/// shell exits). The error message still goes through them.
+#[test]
+fn a_posix_special_builtins_error_reports_outside_its_redirections() {
+	assert_rows(&[
+		(
+			"trap usage, subshell",
+			"set -o posix; time ( trap INT 2> /dev/null ); echo \"s=$?\"",
+			"report\ns=2\n",
+			0,
+		),
+		(
+			"unset usage, subshell",
+			"set -o posix; time ( unset -x 2> /dev/null ); echo \"s=$?\"",
+			"report\ns=2\n",
+			0,
+		),
+		("trap usage, group", "set -o posix; time { trap INT 2> /dev/null; }", "report\n", 2),
+		("unset usage, group", "set -o posix; time { unset -x 2> /dev/null; }", "report\n", 2),
+		(
+			"failed redirection, subshell",
+			"set -o posix; time ( : 2> /dev/null >&9 ); echo \"s=$?\"",
+			"report\ns=1\n",
+			0,
+		),
+		("failed redirection, group", "set -o posix; time { : 2> /dev/null >&9; }", "report\n", 1),
+	]);
+	let unset = "SH: unset: -x: invalid option\nunset: usage: unset [-f] [-v] [-n] [name ...]";
+	assert_rows_with_file(&[
+		(
+			"trap usage to a file, subshell",
+			"set -o posix; time ( trap INT 2> f ); echo \"s=$?\"",
+			"report\ns=2\nf=[trap: usage: ...]\n",
+			0,
+		),
+		(
+			"unset usage to a file, subshell",
+			"set -o posix; time ( unset -x 2> f ); echo \"s=$?\"",
+			&format!("report\ns=2\nf=[{unset}]\n"),
+			0,
+		),
+		(
+			"trap usage to a file, group",
+			"set -o posix; time { trap INT 2> f; }",
+			"report\nf=[trap: usage: ...]\n",
+			2,
+		),
+		(
+			"unset usage to a file, group",
+			"set -o posix; time { unset -x 2> f; }",
+			&format!("report\nf=[{unset}]\n"),
+			2,
+		),
+		(
+			"failed redirection to a file, subshell",
+			"set -o posix; time ( : 2> f >&9 ); echo \"s=$?\"",
+			"report\ns=1\nf=[SH: 9: Bad file descriptor]\n",
+			0,
+		),
+		(
+			"failed redirection to a file, group",
+			"set -o posix; time { : 2> f >&9; }",
+			"report\nf=[SH: 9: Bad file descriptor]\n",
+			1,
+		),
+	]);
+}
+
+/// The guards of that rule: `exit` jumps from inside the builtin, with its
+/// redirections in effect (no report through `2> /dev/null`), and `set -e`
+/// keeps its own order (the builtin's redirections are undone, a group's
+/// are not).
+#[test]
+fn exit_and_set_e_keep_their_order() {
+	assert_rows(&[
+		("exit", "time ( exit 3 2> /dev/null ); echo \"s=$?\"", "s=3\n", 0),
+		("set -e, builtin", "set -e; time ( false 2> /dev/null; echo no )", "report\n", 1),
+		("set -e, group", "set -e; time ( { false; } 2> /dev/null )", "", 1),
+	]);
 }
 
 /// The report goes through the subshell's own redirections, which bash
@@ -237,8 +351,9 @@ fn the_report_comes_before_the_forks_exit_trap() {
 /// it started before reports nothing: `exit` (also in a function), `set -e`
 /// (also after an ERR trap), a fatal expansion error, nested `( … )`s, a
 /// `time` inside the timed one, and a timed group in a subshell, a command
-/// substitution, a job, a pipeline stage and a process substitution started
-/// in a subshell. A `time` the fork starts after that `trap` call reports.
+/// substitution, a job, a pipeline stage, and a process substitution or the
+/// not-found hook run from a subshell (each keeps the subshell's flag). A
+/// `time` the fork starts after that `trap` call reports.
 #[test]
 fn a_jump_after_the_fork_runs_trap_reports_nothing() {
 	let t = "trap 'echo T >&2' EXIT";
@@ -310,6 +425,12 @@ fn a_jump_after_the_fork_runs_trap_reports_nothing() {
 			"process substitution in a subshell",
 			&format!("( cat <( time {{ {t}; exit 3; }} ); wait $! ); echo \"s=$?\""),
 			"T\ns=3\n",
+			0,
+		),
+		(
+			"not-found hook in a subshell",
+			"( command_not_found_handle() { time { trap '' INT; exit 3; }; }; nosuch ); echo \"s=$?\"",
+			"s=3\n",
 			0,
 		),
 	]);
@@ -436,8 +557,9 @@ fn a_failed_redirection_of_the_subshell_reports_nothing() {
 /// `time -p` keeps its format whatever `TIMEFORMAT` the body sets; an ERR
 /// trap's line comes before the report; and without a `trap` call, or with
 /// one that only lists, or one made before the `time` started, or at the
-/// shell's own top level, or in a process substitution started outside
-/// every fork, a jump still reports.
+/// shell's own top level, or in a process substitution or the not-found
+/// hook run outside every fork (each keeps the shell's flag), a jump still
+/// reports.
 #[test]
 fn the_guards_around_the_move_hold() {
 	let e = "; echo \"s=$?\"; echo \"e=[$(cat e)]\"";
@@ -572,6 +694,12 @@ fn the_guards_around_the_move_hold() {
 				"( trap 'echo A' INT; cat <( time {{ {t}; exit 3; }} ); wait $! ); echo \"s=$?\""
 			),
 			"report\nT\ns=3\n",
+			0,
+		),
+		(
+			"not-found hook",
+			"command_not_found_handle() { time { trap '' INT; exit 3; }; }; nosuch; echo \"s=$?\"",
+			"report\ns=3\n",
 			0,
 		),
 	]);
