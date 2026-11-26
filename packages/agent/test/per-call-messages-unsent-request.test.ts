@@ -1,10 +1,10 @@
 /**
  * A per-call message rebuilt equal to the one the previous request sent at the same position goes out as history.
- * "Previous" must mean a request that reached the provider. The loop records a request's per-call messages as it calls
- * the stream function, before the stream function's own work: an abort that lands there (the transport's dispatch hold
- * throws on the aborted signal) or a refusal there (a spend cap checked again as the request goes out) keeps the
- * request from going out, yet its per-call messages became the record, so the next request sent the new note as
- * history although no request ever carried it.
+ * "Previous" must mean a request that reached the provider. The loop once recorded a request's per-call messages as it
+ * called the stream function, before the stream function's own work: an abort that lands there (the transport's
+ * dispatch hold throws on the aborted signal) or a refusal there (a spend cap checked again as the request goes out)
+ * keeps the request from going out, yet its per-call messages became the record, so the next request sent the new note
+ * as history although no request ever carried it. The record is now taken as the provider reports its response.
  */
 import { describe, expect, it } from "bun:test";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -17,15 +17,16 @@ type Unsent = "abort" | "refuse";
 /** Three prompts; the second request is kept from going out by `unsent`. Returns the contexts the provider received. */
 async function runWithUnsentSecondRequest(unsent: Unsent): Promise<Context[]> {
 	const sent: Context[] = [];
+	// As a provider does, each reply reports its response (`onResponse`), which takes the per-call record.
 	const mock = createMockModel({
 		responses: [
 			context => {
 				sent.push(context);
-				return { content: ["first"] };
+				return { content: ["first"], responseHeaders: {} };
 			},
 			context => {
 				sent.push(context);
-				return { content: ["third"] };
+				return { content: ["third"], responseHeaders: {} };
 			},
 		],
 	});

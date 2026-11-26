@@ -1946,8 +1946,8 @@ interface PreparedProviderCall {
 	/** Steering source offered to the provider for this call. */
 	liveSteering?: LiveSteeringChannel;
 	/**
-	 * Records this call's per-call messages as the previous main request's; called as the provider dispatches the
-	 * request (its `beforeDispatch`), past the stream function's own gates.
+	 * Records this call's per-call messages as the previous main request's; called as the provider reports its
+	 * response to the request (its `onResponse`), so a request stopped before it reached the provider is no record.
 	 */
 	perCallMessagesSent?: () => void;
 }
@@ -2180,11 +2180,19 @@ async function streamAssistantResponse(
 
 	// Wrap the user-supplied onResponse so we always observe response headers
 	// for telemetry (`ChatUsageEvent.headers`, gateway auto-detection) without
-	// stealing them from the configured hook.
+	// stealing them from the configured hook. A response also makes this request
+	// the one the next request compares its per-call messages with: only a request
+	// the provider answered can have left them in its cache. One stopped before it
+	// reached the provider sends nothing: a stream function's own gate (a spend cap
+	// or a model check as the request goes out), or an abort while the provider
+	// still builds the request (its payload hook, image preparation), which comes
+	// after the dispatch hook (`beforeDispatch`) has run.
 	let capturedHeaders: Readonly<Record<string, string>> | undefined;
 	const userOnResponse = config.onResponse;
+	const perCallMessagesSent = providerCall.perCallMessagesSent;
 	const captureOnResponse: AgentLoopConfig["onResponse"] = (response, modelInfo) => {
 		capturedHeaders = response.headers;
+		perCallMessagesSent?.();
 		return userOnResponse?.(response, modelInfo);
 	};
 
@@ -2242,18 +2250,6 @@ async function streamAssistantResponse(
 		});
 	};
 
-	// The provider calls `beforeDispatch` as it sends, past the stream function's own gates (a spend cap or a model
-	// check applied again as the request goes out) and any wait for a provider slot. Only a request that gets there
-	// becomes the one the next request compares its per-call messages with; one aborted by then sends nothing.
-	const callerBeforeDispatch = config.beforeDispatch;
-	const perCallMessagesSent = providerCall.perCallMessagesSent;
-	const beforeDispatch = perCallMessagesSent
-		? () => {
-				callerBeforeDispatch?.();
-				if (!finalRequestSignal?.aborted) perCallMessagesSent();
-			}
-		: callerBeforeDispatch;
-
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
 			onProviderStart?.();
@@ -2271,7 +2267,6 @@ async function streamAssistantResponse(
 				onResponse: captureOnResponse,
 				cursorOnToolResult: collectCursorToolResult,
 				liveSteering: providerCall.liveSteering,
-				beforeDispatch,
 			});
 			if (promptToolWireTools && ownedDialect) {
 				// Re-materialize in-band tool-call text as native toolCall content blocks

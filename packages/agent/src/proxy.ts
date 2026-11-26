@@ -20,6 +20,7 @@ import {
 	type StreamingPartialJsonCarrier,
 	setStreamingPartialJson,
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { notifyProviderResponse } from "@oh-my-pi/pi-ai/utils/provider-response";
 import { parseToolCallArguments } from "@oh-my-pi/pi-ai/utils/tool-call-arguments";
 import { parseStreamingJsonThrottled, readSseJson } from "@oh-my-pi/pi-utils";
 
@@ -170,6 +171,10 @@ export function streamProxy(model: Model, context: Context, options: ProxyStream
 				}
 				throw new Error(errorMessage);
 			}
+
+			// As a provider does once the request it sent is answered: an Agent behind the proxy takes its per-call
+			// record here, so a request stopped before the proxy answered it is no record.
+			await notifyProviderResponse(options, response, model);
 
 			let sawTerminalEvent = false;
 			for await (const event of readSseJson<ProxyAssistantMessageEvent>(
