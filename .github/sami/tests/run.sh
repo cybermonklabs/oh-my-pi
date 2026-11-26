@@ -671,10 +671,10 @@ run J109-no-ignore-doc-blocks 0 '```ignore doc blocks, not tests, marked ignore 
 CARGO_MODE=ignored-and-doc-ignored NOT_MSG='ignore doctest|src/lib.rs - g.*(fail|runs in no invocation)' run J112-ignore-doc-block-passes-ignored-cargo-test-fails 1 "sdk/rust/demo:test:wire a::slow is #\\[ignore\\]d and runs in no invocation" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 # B3: on Linux the crates' doctests run only in Bazel: the stub refuses a
 # cargo test --doc of a crate under crates/ there (D1 shows none ran), and
-# the job reads the doctests from the source instead (D1-D33 below).
+# the job reads the doctests from the source instead (D1-D34 below).
 # B4: the listings the macOS job's inventory reads.
 run J108-listings-for-macos 0 'Listings for the macOS inventory: 2 binaries' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
-# D1-D33: on Linux each crate with a Bazel doctest target has its doctests
+# D1-D34: on Linux each crate with a Bazel doctest target has its doctests
 # read from its source (.github/sami/rust-test-doctest-forms.awk, no build):
 # a line of a doctest rustdoc runs that prints or holds a skip word fails the
 # job, named by file and line; a doc attribute the reader does not read
@@ -731,6 +731,10 @@ DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/// ```\n#[
 # carries no doc text, and passes.
 DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/// Example:\n///\n///     assert!(true);\n#[\ndoc = "     println!(\\"missed\\");"\n]\npub fn f() {}' NOT_MSG='stub:' run D32-doc-attribute-over-lines-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:9: a doc attribute over more than one line' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[cfg_attr(\n    docsrs,\n    doc(cfg(feature = \"x\"))\n)]\npub fn f() {}' NOT_MSG='stub:|::error' run D33-attribute-over-lines-with-doc-cfg-passes 0 'Doctests read from the source of 1 crates: 1; Bazel ran 1; lines that print or skip: 0' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# D34, from the fork peer's review of 353156e9 (its case X1): a doctest the
+# reader finds that Bazel's doctest target did not run is UNKNOWN, as the
+# cargo re-run's comparison was, both ways.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n//!\n//! ```\n//! assert_eq!(1, 1);\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D34-doctest-bazel-did-not-run-is-unknown 1 'UNKNOWN: crates/pi-diff/src/lib.rs:7: the doctest reader found a doctest here that no Bazel doctest target ran' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 # R3-1: a line a test binary writes outside libtest's record (a child's or a
 # thread's write to the inherited stream) is a skip if it has a skip word,
 # and must match rust-test-known-raw-output.txt otherwise, or the job fails.

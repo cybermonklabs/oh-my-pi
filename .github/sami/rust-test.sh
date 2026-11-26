@@ -69,9 +69,10 @@
 # (.github/sami/rust-test-doctest-forms.awk): a line of a doctest rustdoc
 # runs that holds the word print, println, eprint, eprintln, dbg, stdout or
 # stderr, or one of the skip words, fails the job, named by file and line,
-# and so does doc text the reader does not read. Every doctest
-# Bazel ran must be one the reader found at its file and line, or the job
-# fails as UNKNOWN. A doctest that a macro of another crate generates is in
+# and so does doc text the reader does not read. Every doctest Bazel ran
+# must be one the reader found at its file and line, and every doctest the
+# reader found must be one Bazel ran, or the job fails as UNKNOWN. A
+# doctest that a macro of another crate generates is in
 # no source file the reader reads; Bazel runs it, and the job fails as
 # UNKNOWN for it. The macOS job runs the crates' doctests under cargo, whose
 # output the scan reads.
@@ -1161,10 +1162,13 @@ echo "Lines outside libtest's record: $(cut -f1,2 "$raw_output" | LC_ALL=C sort 
 # stdout or stderr (a word: a print split from its `!` counts), or one of the
 # skip scan's words, fails the job, named by file and line, and so does doc
 # text the reader does not read (a doc attribute it does not decode, a
-# doctest still open where the text it joined ends). The read must account for every doctest Bazel ran: each
-# one its log names (`<file> - <item> (line <n>)`) must be a doctest the
-# reader found at that file and line, or the reader did not see it, and the
-# job fails as UNKNOWN. (Until 2026-11 the doctests ran a second time under
+# doctest still open where the text it joined ends). The read and Bazel's
+# run must account for each other, both ways: each doctest Bazel's log names
+# (`<file> - <item> (line <n>)`) must be one the reader found at that file
+# and line, or the reader did not see it; and each doctest the reader found
+# must be one Bazel ran, or nothing on Linux runs it (a doctest the cargo
+# re-run used to run). Either fails the job as UNKNOWN. (Until 2026-11 the
+# doctests ran a second time under
 # cargo, about 576 s a job, to read their output: in the 57 gate jobs from
 # 2026-11-21 to 11-25 where that re-run's comparison with Bazel ran, it saw
 # no doctest, failure, skip or print that Bazel's run did not.)
@@ -1176,13 +1180,22 @@ if [ -z "$only" ]; then
 	awk -F'\t' '$1 == "test" { print $2 ":" $3 }' "$tmp/doc-read.tsv" | LC_ALL=C sort -u >"$tmp/doc-read-tests.txt"
 	touch "$tmp/doc-names-bazel.tsv"
 	LC_ALL=C sort -u "$tmp/doc-names-bazel.tsv" >"$tmp/doc-bazel.tsv"
+	: >"$tmp/doc-bazel-at.txt"
 	while IFS=$'\t' read -r dir name; do
 		file="${name%% - *}"
 		line="$(printf '%s\n' "$name" | sed -n 's/.*(line \([0-9][0-9]*\)).*/\1/p')"
+		[ -z "$line" ] || printf '%s\n' "$dir/$file:$line" >>"$tmp/doc-bazel-at.txt"
 		if [ -z "$line" ] || ! grep -qxF -- "$dir/$file:$line" "$tmp/doc-read-tests.txt"; then
 			error "Rust test skips" "UNKNOWN: $dir $name ran in Bazel's doctest target, and the doctest reader found no doctest at $dir/$file line ${line:-?}, so it could not see whether it prints"
 		fi
 	done <"$tmp/doc-bazel.tsv"
+	# And the other way: a doctest the reader found that no Bazel doctest
+	# target ran is run by nothing on Linux (the cargo re-run did, until this
+	# reader replaced it).
+	LC_ALL=C sort -u -o "$tmp/doc-bazel-at.txt" "$tmp/doc-bazel-at.txt"
+	while read -r at; do
+		error "Rust test skips" "UNKNOWN: $at: the doctest reader found a doctest here that no Bazel doctest target ran, so nothing on Linux runs it"
+	done < <(LC_ALL=C comm -23 "$tmp/doc-read-tests.txt" "$tmp/doc-bazel-at.txt")
 	while IFS=$'\t' read -r what file line text; do
 		case "$what" in
 			print) error "Rust test printed" "$file:$line: a doctest rustdoc runs prints ($text); no record the skip scan reads holds a doctest's output on Linux, so a doctest must not print" ;;
