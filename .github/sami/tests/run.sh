@@ -383,7 +383,10 @@ EOF
 	# metadata and test from CARGO_MODE (pass, fail-lib, partial-test,
 	# meta-fail, empty, stderr-skip, stderr-skip-named, filtered, ignored,
 	# ignored-fails, doc-ignored, doc-skip). With --ignored it runs the
-	# #[ignore]d test a::slow alone.
+	# #[ignore]d test a::slow alone. Its build ends as cargo's does: with
+	# --timings, a report that names the run's arguments, unless
+	# CARGO_NO_REPORT=1; then the Finished line, whose time CARGO_FINISHED
+	# gives (empty: no such line, as after a failed build).
 	cat >"$w/bin/rustup" <<EOF
 #!/usr/bin/env bash
 set -u
@@ -400,6 +403,17 @@ fi
 sel="" ign=0 threads=""
 for a in "\$@"; do case "\$a" in --lib|--doc|--test) sel="\$a" ;; --ignored) ign=1 ;; --test-threads=1) threads=1 ;; esac; done
 echo "   Compiling demo v0.1.0" >&2
+if [ "${CARGO_NO_REPORT:-0}" != 1 ]; then
+	case " \$* " in *" --timings "*)
+		report="\$PWD/target/cargo-timings/cargo-timing-\$\$.html"
+		mkdir -p "\${report%/*}"
+		printf '<html>timing report of %s</html>\n' "\$*" >"\$report"
+		echo "      Timing report saved to \$report" >&2
+		;;
+	esac
+fi
+finished='${CARGO_FINISHED-0.00s}'
+[ -z "\$finished" ] || echo '    Finished \`test\` profile [unoptimized + debuginfo] target(s) in '"\$finished" >&2
 # cargo names each test binary it runs; what follows on stderr is the binary's.
 [ "\$sel" = --doc ] || echo "     Running tests/wire.rs (target/debug/deps/wire-0)" >&2
 if [ "\$sel" = --doc ]; then
@@ -458,11 +472,22 @@ EOF
 		printf '#!/bin/sh\n"%s" "$@"; rc=$?\ncase "$*" in *"$(cat "%s")"*) exit 5 ;; esac\nexit $rc\n' "$real_jq" "$w/jq-fail" >"$w/bin/jq"
 		chmod +x "$w/bin/jq"
 	fi
+	# SUMMARY_UNWRITABLE=1: the step summary's path is a directory.
+	[ "${SUMMARY_UNWRITABLE:-}" != 1 ] || mkdir "$w/summary.md"
 	out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null \
 		RUST_TEST_PATH=/stub/rsync-ref/bin:/usr/bin:/bin RUST_TEST_TMPDIR="$w/reflink" PI_TEST_REAL_BASH=/stub/bash-ref/bin/bash PI_AST_REPO_CORPUS="$w/repo" RUST_TEST_OFFLINE_UNDER="$w/bin/offline" \
-		RUST_TEST_STICKY_FIFO="$fifo" \
+		RUST_TEST_STICKY_FIFO="$fifo" GITHUB_STEP_SUMMARY="$w/summary.md" \
 		env ${only_env[@]+"${only_env[@]}"} bash --noprofile --norc -eo pipefail "$step" 2>&1)"
 	rc=$?
+	# What the step leaves for the job beside its log: the step summary, and
+	# the cargo timing reports it copied for upload, each on lines of its own.
+	if [ -f "$w/summary.md" ]; then
+		out+=$'\n'"$(sed 's/^/summary: /' "$w/summary.md")"$'\n'"summary rows: $(grep -c '^| `' "$w/summary.md")"
+	fi
+	local report
+	for report in "$w"/tmp/rust-test/cargo-timings/*; do
+		[ -f "$report" ] && out+=$'\n'"artifact: ${report##*/}: $(cat -- "$report")"
+	done
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
 
@@ -557,6 +582,20 @@ CARGO_WS='# none' run J46-cargo-list-empty 1 'names no workspace with a test tar
 CARGO_MODE=stderr-skip run J47-cargo-stderr-unnamed-skip 1 "sdk/rust/demo:test:wire printed a skip line outside libtest's record that names no test: skipped: no bun" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 CARGO_MODE=stderr-skip-named run J47b-cargo-stderr-named-skip 1 'sdk/rust/demo:test:wire a::two skipped itself and is not in' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 CARGO_MODE=filtered run J47c-cargo-filtered 1 'sdk/rust/demo:test:wire filtered out 1 tests, though cargo test is given no filter' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+# Each cargo test's timings: a line in the job log and a row in the step
+# summary (build: cargo's own Finished time; test: the rest of the run), and
+# its --timings report copied for the job's artifact. They change no verdict.
+run J159-cargo-timing-line 0 '^Cargo test timing: sdk/rust/demo:lib:demo \(cargo\): build 0\.0 s, test [0-9]+\.[0-9] s, total [0-9]+\.[0-9] s, exit 0, report cargo-timing-1-sdk-rust-demo-lib-demo\.html$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+run J160-cargo-timing-row-per-run 0 '^summary rows: 3$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+run J161-cargo-timing-report-is-the-runs-own 0 '^artifact: cargo-timing-3-sdk-rust-demo-test-wire\.html: <html>timing report of cargo test --locked --timings --manifest-path sdk/rust/demo/Cargo.toml --test wire -- ' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_FINISHED='1m 05s' run J162-cargo-timing-minutes 0 '^Cargo test timing: sdk/rust/demo:lib:demo \(cargo\): build 65\.0 s, test -?[0-9]+\.[0-9] s' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_FINISHED='' run J163-cargo-timing-no-finished-line 0 '^summary: \| `sdk/rust/demo:lib:demo` \| cargo \| UNKNOWN \| UNKNOWN \| [0-9]+\.[0-9] \| 0 \| cargo-timing-1-sdk-rust-demo-lib-demo\.html \|$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_NO_REPORT=1 NOT_MSG='::error|^artifact: ' run J164-cargo-timing-no-report-warns 0 '^::warning title=Cargo timings::sdk/rust/demo:lib:demo \(cargo\): cargo named no timing report' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_MODE=fail-lib run J165-cargo-timing-of-a-failed-run 1 '^summary: \| `sdk/rust/demo:lib:demo` \| cargo \| 0\.0 \| [0-9]+\.[0-9] \| [0-9]+\.[0-9] \| 101 \| cargo-timing-1-' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+CARGO_MODE=ignored IGNORED_RUN="sdk/rust/demo:test:wire a::slow" NOT_MSG='::warning' run J166-cargo-timing-of-doctest-and-ignored-runs 0 '^summary rows: 4$' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+CARGO_MODE=ignored IGNORED_RUN="sdk/rust/demo:test:wire a::slow" run J167-cargo-timing-of-an-ignored-run 0 '^summary: \| `sdk/rust/demo:test:wire` \| ignored-cargo-0 \| 0\.0 \| [0-9]+\.[0-9] \| [0-9]+\.[0-9] \| 0 \| cargo-timing-[0-9]+-sdk-rust-demo-test-wire\.html \|$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+NOT_MSG='::warning' run J168-cargo-timing-of-a-doctest-run 0 '^summary: \| `sdk/rust/demo:doc:demo` \| cargo \| 0\.0 \| [0-9]+\.[0-9] \| [0-9]+\.[0-9] \| 0 \| cargo-timing-2-sdk-rust-demo-doc-demo\.html \|$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+SUMMARY_UNWRITABLE=1 NOT_MSG='::error' run J169-cargo-timing-summary-unwritable-warns 0 '^::warning title=Cargo timings::could not write the step summary$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 
 # The root-only targets: run in a second invocation under sudo.
 ROOTS=$RT ROOT_BODY="FMT=json; rt $RT PASSED cat $fixtures/root-root.json >\"\$bep\"; exit 0" run J48-root-target-runs-as-root 0 '' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
@@ -863,6 +902,9 @@ XPRE="if [ \"\$OWN_TARGET\" = $D ]; then has \"--flaky_test_attempts=^$D\\\$@3\"
 FLAKY="$D m::langinfo" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='no result|Known failure, failed as expected' OWN_BODY="$XPRE FILTERED=1 FMT=json lt_out m::langinfo '' m::strftime '' >\"\$f\"; { cfg $D 'rust_test rule'; summary $D FLAKY \"\$a\" \"\$f\"; } >\"\$bep\"; exit 0; fi; own_default" run X1-only-flaky-ran-here-failed-then-passed 0 "Known flaky test, failed on 1 of 2 attempts and passed on another: $D m::langinfo" '' 'exit 9'
 FLAKY="$D m::langinfo" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='no result|Known failure, failed as expected|Known flaky test, failed on' OWN_BODY="$XPRE printf '$FJ' >\"\$f\"; { cfg $D 'rust_test rule'; summary $D FAILED \"\$a \$f\"; } >\"\$bep\"; exit 3; fi; own_default" run X2-only-flaky-ran-here-failed-every-attempt 1 "$D m::langinfo is listed flaky in .github/sami/rust-test-known-failures.txt, but failed on every attempt \\(2 of 2\\): NEW" '' 'exit 9'
 FLAKY="$D m::langinfo" ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='no result|::error' run X3-only-flaky-ran-here-passed 0 "$D m::langinfo is listed flaky in .github/sami/rust-test-known-failures.txt and did not fail" '' 'exit 9'
+# K11: with RUST_TEST_ONLY too, each cargo run (the cargo workspace's targets
+# and the doctests) has its row in the step summary.
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" DOCQ="$DOC" NOT_MSG='::error|::warning' run K11-only-cargo-timing-rows 0 '^summary rows: 4$' '' 'exit 9'
 
 # --- rust-test-macos-inventory.sh ------------------------------------------------
 # irun <name> <want> <message regex> <targets> <mac binaries> <linux listings>
@@ -1499,9 +1541,9 @@ wlint W67-attest-artifact-ids-quoted-hash-folded 1 "attest's artifact-ids line h
 # is pushed to names one branch. The places: sami-build.yml's push trigger
 # (beside sami), each github.ref test in its jobs and steps (beside sami:
 # release_binary's cache bound and save steps, attest, release_cache_prune),
-# publish's CANDIDATE_BRANCH, sami-checks.yml's push trigger (beside
-# feat/sami-checks) and its run name's github.ref test, sc.py plan's push
-# ref, and release-candidate-harness.sh's CANDIDATE_BRANCH. release-candidate.sh
+# publish's CANDIDATE_BRANCH, sami-checks.yml's push trigger and its run
+# name's github.ref test, sc.py plan's push ref, and
+# release-candidate-harness.sh's CANDIDATE_BRANCH. release-candidate.sh
 # names the branch only as $CANDIDATE_BRANCH: once in its run search, once in
 # its signer and once in its --source-ref, and no refs/heads/<name> literally.
 # A place that names no branch, or a file it cannot read, is UNKNOWN, and
@@ -1540,7 +1582,7 @@ candidate_lint() {
 		push_branches "$build" | grep -vx sami | sed 's/^/sami-build.yml push trigger	/'
 		refs_in "$build" "github[.]ref == ${q}refs/heads/" "$q" | grep -vx sami | sed 's/^/sami-build.yml github.ref tests	/'
 		awk '/^[[:space:]]*#/ { next } /^[[:space:]]+CANDIDATE_BRANCH:[[:space:]]/ { v = $2; gsub(/["'\'']/, "", v); print v }' "$build" | sed 's/^/sami-build.yml CANDIDATE_BRANCH	/'
-		push_branches "$checks" | grep -vx feat/sami-checks | sed 's/^/sami-checks.yml push trigger	/'
+		push_branches "$checks" | sed 's/^/sami-checks.yml push trigger	/'
 		refs_in "$checks" "github[.]ref == ${q}refs/heads/" "$q" | sed 's/^/sami-checks.yml github.ref tests	/'
 		refs_in "$d/.github/sami-checks/sc.py" 'ref == "refs/heads/' '"' | sed 's/^/sc.py plan push ref	/'
 		refs_in "$d/.github/sami/tests/release-candidate-harness.sh" 'CANDIDATE_BRANCH=' ' ' | sed 's/^/release-candidate-harness.sh CANDIDATE_BRANCH	/'

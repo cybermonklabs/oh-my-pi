@@ -36,7 +36,9 @@
 #     it checked nothing).
 # It leaves each test binary's listing in $RUNNER_TEMP/rust-test/listings
 # (index.tsv names the binary of each), for the macOS job's inventory
-# (.github/sami/rust-test-macos-inventory.sh).
+# (.github/sami/rust-test-macos-inventory.sh), and cargo's --timings report of
+# each cargo test in $RUNNER_TEMP/rust-test/cargo-timings, with each one's
+# build and test seconds in the job log and the step summary.
 # With RUST_TEST_ONLY naming a list (the macOS job names that inventory), it
 # runs only the tests that list names, each target once with --exact, and
 # fails unless each of them ran here; the failure, skip and output rules are
@@ -87,7 +89,8 @@
 #   RUST_TEST_STICKY_FIFO  (when a sticky-directory FIFO test is in the tree) a
 #                       0666 FIFO of a third user in a world-writable sticky
 #                       directory root owns, with fs.protected_fifos at 1
-# and, for the macOS job, RUST_TEST_ONLY and RUST_TEST_CANARY (above).
+# and, for the macOS job, RUST_TEST_ONLY and RUST_TEST_CANARY (above). When
+# GITHUB_STEP_SUMMARY is set, the cargo tests' timings go there too.
 # .github/sami/tests/run.sh runs this script against stubs of bazelisk and
 # rustup.
 set -euo pipefail
@@ -640,6 +643,83 @@ fi
 # names runs alone, with --ignored and --exact.
 channel=""
 ncargo=0
+# Each cargo test runs with --timings: cargo writes an HTML report of its
+# build (when each crate compiled, and for how long) and names it on stderr
+# (`Timing report saved to <path>`). cargo_timing copies the report to
+# $timings, which the job uploads, and gives the cargo test one line in the
+# job log and one row in the step summary: its build seconds (cargo's own
+# `Finished ... in` time, from cargo's start to the end of its build) and its
+# test seconds (the rest of the run: the test binary, or for --doc rustdoc
+# building and running the doctests). In run 45001615494 this phase took 17
+# minutes with no line in the job log between the toolchain's install and its
+# end. The figures change no verdict: a run whose `Finished` time cannot be
+# read (a failed build prints none) has UNKNOWN in their place, and a missing
+# report or a step summary that cannot be written is a warning.
+timings="$tmp/cargo-timings"
+mkdir -p "$timings"
+timing_rows=0
+# now: the wall clock in seconds, to the microsecond where bash gives it.
+now() {
+	local t="${EPOCHREALTIME:-}"
+	[ -n "$t" ] || t="$(date +%s)"
+	printf '%s\n' "${t/,/.}"
+}
+# cargo_timing <label> <invocation> <cargo's stderr> <start> <end> <exit code>:
+# the cargo test's line and row (above), and its report copied.
+cargo_timing() {
+	local label="$1" inv="$2" err="$3" code="$6" total build="" spent=UNKNOWN built report copy=none
+	total="$(LC_ALL=C awk -v a="$4" -v b="$5" 'BEGIN { printf "%.1f", b - a }')"
+	# cargo's first `Finished` line: `... target(s) in 5.32s` or `in 1m 05s`.
+	build="$(LC_ALL=C awk '/^ *Finished / {
+		s = $0
+		sub(/.* in /, "", s)
+		n = split(s, t, " ")
+		if (n == 0) exit
+		secs = 0
+		for (i = 1; i <= n; i++) {
+			u = substr(t[i], length(t[i]))
+			v = substr(t[i], 1, length(t[i]) - 1)
+			if (v !~ /^[0-9]+(\.[0-9]+)?$/) exit
+			if (u == "h") secs += v * 3600
+			else if (u == "m") secs += v * 60
+			else if (u == "s") secs += v
+			else exit
+		}
+		printf "%.1f", secs
+		exit
+	}' "$err")" || build=""
+	if [ -n "$build" ]; then
+		spent="$(LC_ALL=C awk -v a="$total" -v b="$build" 'BEGIN { printf "%.1f", a - b }')"
+		built="build $build s, test $spent s"
+	else
+		build=UNKNOWN
+		built="build and test UNKNOWN (no Finished time this script could read)"
+	fi
+	report="$(awk '/^ *Timing report saved to / { sub(/^ *Timing report saved to /, ""); print; exit }' "$err")" || report=""
+	if [ -n "$report" ] && [ -f "$report" ]; then
+		copy="cargo-timing-$ncargo-$(printf '%s' "$label" | sed 's/[^A-Za-z0-9_.-]/-/g').html"
+		cp -- "$report" "$timings/$copy" || copy=none
+	fi
+	if [ "$copy" = none ]; then
+		echo "::warning title=Cargo timings::$label ($inv): cargo named no timing report that could be copied${report:+ (it named $report)}"
+	fi
+	echo "Cargo test timing: $label ($inv): $built, total $total s, exit $code, report $copy"
+	[ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+	if [ "$timing_rows" = 0 ]; then
+		{
+			echo '### Cargo tests: build and test seconds'
+			echo
+			echo "Build: cargo's own \`Finished\` time, from its start to the end of its build. Test: the rest of the run (the test binary; for \`--doc\`, rustdoc building and running the doctests). Each build's \`--timings\` report is in the job's \`cargo-timings-*\` artifact."
+			echo
+			echo '| cargo test | invocation | build (s) | test (s) | total (s) | exit | timing report |'
+			echo '| --- | --- | ---: | ---: | ---: | ---: | --- |'
+		} >>"$GITHUB_STEP_SUMMARY" || echo "::warning title=Cargo timings::could not write the step summary"
+	fi
+	timing_rows=$((timing_rows + 1))
+	# shellcheck disable=SC2016 # the backquotes are Markdown's code marks
+	printf '| `%s` | %s | %s | %s | %s | %s | %s |\n' "$label" "$inv" "$build" "$spent" "$total" "$code" "$copy" >>"$GITHUB_STEP_SUMMARY" ||
+		echo "::warning title=Cargo timings::could not write the step summary"
+}
 # doc_attribute: a doctest record whose output rustdoc's --no-capture printed
 # raw (stdout and stderr, one thread) between each test's `started` event and
 # its result, as libtest's record with that output as the result's stdout. A
@@ -664,7 +744,7 @@ doc_attribute() {
 # command RUST_TEST_OFFLINE_UNDER names when it is set: the rust_test job
 # names .github/sami/rust-test-offline.sh, which takes the network away.
 cargo_test() {
-	local label="$1" manifest="$2" inv="$3" log err code=0 doc=0 a
+	local label="$1" manifest="$2" inv="$3" log err code=0 doc=0 a t0 t1
 	shift 3
 	for a in "$@"; do [ "$a" = --doc ] && doc=1; done
 	local under=() offline=()
@@ -677,14 +757,17 @@ cargo_test() {
 	ncargo=$((ncargo + 1))
 	log="$tmp/logs/cargo-$ncargo.log"
 	err="$log.err"
+	t0="$(now)"
 	if [ "$doc" = 1 ]; then
 		err="$log.raw"
-		RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-Zunstable-options --no-capture" rustup run "$channel" cargo test --locked --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output --test-threads=1 >"$err" 2>&1 || code=$?
+		RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-Zunstable-options --no-capture" rustup run "$channel" cargo test --locked --timings --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output --test-threads=1 >"$err" 2>&1 || code=$?
+		t1="$(now)"
 		untangle "$label" "$err" doc
 		doc_attribute <"$err" >"$log"
 		: >"$log.err"
 	else
-		${under[@]+"${under[@]}"} rustup run "$channel" cargo test --locked ${offline[@]+"${offline[@]}"} --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output >"$log" 2>"$err" || code=$?
+		${under[@]+"${under[@]}"} rustup run "$channel" cargo test --locked --timings ${offline[@]+"${offline[@]}"} --manifest-path "$manifest" "$@" -Zunstable-options --format=json --show-output >"$log" 2>"$err" || code=$?
+		t1="$(now)"
 		untangle "$label" "$log"
 	fi
 	if [ "$code" = 0 ]; then
@@ -695,6 +778,7 @@ cargo_test() {
 		echo "::endgroup::"
 		printf '%s\tcargo test\tFAILED\tfailed\t%s\t-\t%s\n' "$label" "$log" "$inv" >>"$rows"
 	fi
+	cargo_timing "$label" "$inv" "$err" "$t0" "$t1" "$code"
 }
 run_cargo() {
 	local n=0 manifest dir label selector name kind rest i target test

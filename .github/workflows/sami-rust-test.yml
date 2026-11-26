@@ -531,6 +531,19 @@ jobs:
             PI_TEST_REAL_BASH="$HOME/bash-ref/bin/bash" \
             PI_AST_REPO_CORPUS="$GITHUB_WORKSPACE/tree" \
             bash .github/sami/rust-test.sh
+      # cargo's --timings report of each cargo test the step ran (the omp-rpc
+      # workspace's targets, the cargo doctests and the #[ignore]d smoke
+      # tests), each named by its log's number and its label; the step's
+      # summary gives each one's build and test seconds. Kept 14 days, for a
+      # reader of the gate run rather than a later job.
+      - name: The cargo tests' timing reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cargo-timings-linux
+          path: ${{ runner.temp }}/rust-test/cargo-timings
+          retention-days: 14
+          if-no-files-found: warn
       # Each Linux test binary's listing, for rust_test_macos's inventory.
       - name: The test binaries' listings
         if: ${{ !cancelled() }}
@@ -657,3 +670,13 @@ jobs:
             PI_TEST_REAL_BASH=/bin/bash \
             PI_AST_REPO_CORPUS="$GITHUB_WORKSPACE/tree" \
             bash .github/sami/rust-test.sh
+      # As in rust_test: cargo's --timings report of each cargo test the step
+      # ran (the omp-rpc workspace's targets and the cargo doctests).
+      - name: The cargo tests' timing reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cargo-timings-macos
+          path: ${{ runner.temp }}/rust-test/cargo-timings
+          retention-days: 14
+          if-no-files-found: warn
