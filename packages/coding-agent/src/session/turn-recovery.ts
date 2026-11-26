@@ -405,7 +405,10 @@ export class TurnRecovery {
 	readonly #refusalWalkTried = new Set<string>();
 	/**
 	 * Same-model retries each model has had for a classifier refusal in the current retry saga,
-	 * keyed as `#refusalWalkTried` is (`#refusalWalkKey`). Cleared with it in `resolveRetry()`.
+	 * keyed as `#refusalWalkKey` keys `#refusalWalkTried`. Cleared when a saga starts (its first
+	 * attempt in `#applyRetryPolicy`), not when one ends: a close that is still writing the
+	 * outcome of the last saga when the next one starts would otherwise clear the new saga's
+	 * counts in its `resolveRetry()`, and give a refused model more retries than the bound.
 	 */
 	readonly #refusalRetries = new Map<string, number>();
 	/** Per-model account walk allowance, snapshotted once and cleared when the retry saga ends. */
@@ -905,7 +908,6 @@ export class TurnRecovery {
 	/** Resolve the pending retry promise; the saga is over, and so is its refusal walk. */
 	resolveRetry(): void {
 		this.#refusalWalkTried.clear();
-		this.#refusalRetries.clear();
 		this.#accountPolicyRotationsRemaining.clear();
 		if (this.#retryResolve) {
 			this.#retryResolve();
@@ -2701,7 +2703,10 @@ export class TurnRecovery {
 		const classifierRefusal = this.isClassifierRefusal(message);
 
 		const generation = this.#host.promptGeneration();
-		if (this.#retryAttempt === 0) this.#genericAbortStreak = 0;
+		if (this.#retryAttempt === 0) {
+			this.#genericAbortStreak = 0;
+			this.#refusalRetries.clear();
+		}
 		this.#retryAttempt++;
 		this.#genericAbortStreak =
 			message.errorMessage !== undefined && Object.hasOwn(GENERIC_ABORT_MESSAGES, message.errorMessage)
