@@ -25,6 +25,7 @@ use super::{
 };
 use crate::bash::{
 	diag::Diag,
+	engine::{Refusal, TextError},
 	event::WaitKey,
 	ir::{
 		CaseIr, ComsubForm, OpIr, ParamIr, ParamRef, Part, ReplaceIr, SubIr, Unit, Word, WordKind,
@@ -3851,7 +3852,8 @@ pub fn expand_subscript(
 /// and value, an unkeyed word split into fields; for an associative
 /// array (`assoc`) whose list starts without `[key]=`, each word expanded
 /// once and left unkeyed for the builtin to pair (bash defers to
-/// `assign_assoc_from_kvlist`).
+/// `assign_assoc_from_kvlist`). The inner `Err` is the parser's refusal of
+/// the text (bash's `parse_string_to_word_list` fails).
 ///
 /// `log`/`cursor` replay command substitutions as in
 /// [`expand_subscript`]: [`Stop::Sub`] parks the builtin, which re-runs.
@@ -3866,19 +3868,20 @@ pub fn compound_string(
 	cursor: &mut usize,
 	text: &[u8],
 	assoc: bool,
-) -> Result<Vec<CompoundElem>, Stop> {
+) -> Result<Result<Vec<CompoundElem>, TextError>, Stop> {
 	let mode = super::exec::mode_of(vp);
-	let unit = k
-		.engine
-		.text_unit(
-			text,
-			super::TextKind::Compound,
-			mode,
-			k.mask.contains(crate::bash::event::EventKind::UnitCompiled),
-		)
-		.map_err(|e| Stop::Fail(Diag::Syntax { msg: e.msg }))?;
+	let unit = match k.engine.text_unit(
+		text,
+		super::TextKind::Compound,
+		mode,
+		k.mask.contains(crate::bash::event::EventKind::UnitCompiled),
+	) {
+		Ok(unit) => unit,
+		Err(e) if e.by == Refusal::Engine => return Err(Stop::Fail(Diag::Syntax { msg: e.msg })),
+		Err(e) => return Ok(Err(e)),
+	};
 	let Some(Part::Compound(elems)) = unit.words.last().and_then(|w| w.parts.first()) else {
-		return Ok(Vec::new());
+		return Ok(Ok(Vec::new()));
 	};
 	let mut out = Vec::with_capacity(elems.len());
 	let mut globs = Vec::new();
@@ -3896,7 +3899,7 @@ pub fn compound_string(
 			what: "pathname expansion in a compound array value given as a string".into(),
 		}));
 	}
-	Ok(out)
+	Ok(Ok(out))
 }
 
 /// `((…))`'s evaluation of text with nothing to expand (no `$`, backquote,

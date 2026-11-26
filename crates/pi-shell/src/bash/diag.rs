@@ -422,6 +422,17 @@ pub enum Diag {
 		/// Message.
 		msg:  BString,
 	},
+	/// A syntax error in a compound array value a declaration builtin got as
+	/// a string (bash's `parse_string_to_word_list`, whose input is named
+	/// `array assign`): rendered as `NAME: array assign: line N: …`.
+	#[error("{diag}")]
+	ArrayAssign {
+		/// The line bash reports (see the builtin).
+		line: u32,
+		/// The parser's message ([`Diag::Syntax`]) or the line it echoes
+		/// ([`Diag::SyntaxContext`]).
+		diag: Box<Self>,
+	},
 	/// An arithmetic error inside an array subscript: bash reports it
 	/// without the command's name (`let 'a[1+]=1'` → `1+: arithmetic
 	/// syntax error…`), so [`Diag::by`] leaves it as it is.
@@ -630,6 +641,14 @@ pub fn render(diag: &Diag, site: DiagSite<'_>) -> Vec<u8> {
 	if let Diag::Eval { diag } = diag {
 		out.extend_from_slice(b": eval: line ");
 		out.extend_from_slice(site.line.format_into(&mut fmt::NumBuffer::new()).as_bytes());
+		out.extend_from_slice(b": ");
+		write!(out, "{diag}").expect("writing to a Vec cannot fail");
+		out.push(b'\n');
+		return out;
+	}
+	if let Diag::ArrayAssign { line, diag } = diag {
+		out.extend_from_slice(b": array assign: line ");
+		out.extend_from_slice(line.format_into(&mut fmt::NumBuffer::new()).as_bytes());
 		out.extend_from_slice(b": ");
 		write!(out, "{diag}").expect("writing to a Vec cannot fail");
 		out.push(b'\n');

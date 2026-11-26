@@ -2399,8 +2399,9 @@ fn stopped(
 	}
 }
 
-/// Expansion errors end the shell: posix mode, not interactive.
-fn posix_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+/// Expansion errors end the shell, as a syntax error in a compound value
+/// given as a string does: posix mode, not interactive.
+pub(super) fn posix_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false)
 		&& !matches!(
 			state::record(cx.store, vp, Key::Misc(MiscKey::Interactive)),
@@ -2475,30 +2476,7 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			// An arithmetic subscript error took the cleanup arm above.
 			let jump = top_level_jump(cx, vp, false);
 			k.diag(cx, vp, line, d);
-			// The EXIT trap keeps the status the shell was exiting with.
-			// Under `set -e` bash's `report_error` exits on its own (the arm
-			// above); for the other errors bash reaches the same rows
-			// through its own errexit jump, which this change does not
-			// model, so the upstream constant stays whenever errexit is on.
-			let flow = if vp.mode.dialect() != Dialect::Zsh
-				&& let Some(status) = exit_trap_status(vp)
-				&& !errexit_on(k, cx, vp)
-			{
-				Flow::Exit(status, jump)
-			} else {
-				// bash exits 127 from a `-c` string (`run_one_command`), 1
-				// from a script and from a subshell (`execute_in_subshell`
-				// keeps the failure status); a nested shell (depth 0) is its
-				// own `-c` shell. zsh exits 1 from any of them (`errflag`
-				// ends `loop` with 1).
-				let command = vp.mode.dialect() != Dialect::Zsh
-					&& super::subshell_depth(vp) == 0
-					&& matches!(
-						state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
-						Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
-					);
-				Flow::Exit(if command { 127 } else { 1 }, jump)
-			};
+			let flow = Flow::Exit(force_eof_status(k, cx, vp), jump);
 			jump_out(k, cx, vp, false, &flow);
 			flow
 		},
@@ -2507,6 +2485,32 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			Flow::Discard(1)
 		},
 	}
+}
+
+/// The status a fatal error exits a non-interactive posix shell with
+/// (bash's `jump_to_top_level (FORCE_EOF)`). The EXIT trap keeps the status
+/// the shell was exiting with. Under `set -e` bash's `report_error` exits on
+/// its own ([`report_error_exits`]); for the other errors bash reaches the
+/// same rows through its own errexit jump, which is not modelled, so the
+/// constant below stays whenever errexit is on.
+pub(super) fn force_eof_status(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> i32 {
+	if vp.mode.dialect() != Dialect::Zsh
+		&& let Some(status) = exit_trap_status(vp)
+		&& !errexit_on(k, cx, vp)
+	{
+		return status;
+	}
+	// bash exits 127 from a `-c` string (`run_one_command`), 1 from a script
+	// and from a subshell (`execute_in_subshell` keeps the failure status); a
+	// nested shell (depth 0) is its own `-c` shell. zsh exits 1 from any of
+	// them (`errflag` ends `loop` with 1).
+	let command = vp.mode.dialect() != Dialect::Zsh
+		&& super::subshell_depth(vp) == 0
+		&& matches!(
+			state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
+			Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
+		);
+	if command { 127 } else { 1 }
 }
 
 /// Answer the expansion probe `p` ([`Stop::Probe`]) of the op whose scratch
@@ -3949,6 +3953,9 @@ pub(super) fn cleanup_jump(vp: &Vproc, d: &Diag) -> bool {
 /// associative array or with a non-numeric one for an indexed array, and
 /// a file `.` cannot read (`file_error`). A builtin's own message
 /// (`declare: r: readonly variable`) is `builtin_error`, which never exits.
+/// Also bash's `parser_error` while it runs (error.c:324), which makes the
+/// same check: a compound value given as a string that does not parse
+/// ([`Diag::ArrayAssign`]).
 const fn reports_error(d: &Diag) -> bool {
 	matches!(
 		d,
@@ -3965,6 +3972,7 @@ const fn reports_error(d: &Diag) -> bool {
 			| Diag::AssocSubscript { .. }
 			| Diag::NonNumericIndex { .. }
 			| Diag::FileError { .. }
+			| Diag::ArrayAssign { .. }
 	)
 }
 
@@ -4010,7 +4018,8 @@ pub(super) const fn errexit_off(prefix: Prefix, id: IntrinsicId) -> bool {
 }
 
 /// The status [`report_error_exits`] leaves with: 1 for an error bash sets
-/// the status for before the message, else `$?`, or 1 when that is 0.
+/// the status for before the message, else `$?`, or 1 when that is 0; 2
+/// for `parser_error`'s (`exit_shell (last_command_exit_value = 2)`).
 pub(super) const fn report_error_status(vp: &Vproc, d: &Diag) -> i32 {
 	match d {
 		Diag::Readonly { .. }
@@ -4023,6 +4032,7 @@ pub(super) const fn report_error_status(vp: &Vproc, d: &Diag) -> i32 {
 		{
 			vp.status
 		},
+		Diag::ArrayAssign { .. } => 2,
 		_ => 1,
 	}
 }
