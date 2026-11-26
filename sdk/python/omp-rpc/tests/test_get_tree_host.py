@@ -51,9 +51,9 @@ def _write_chain_session(root: Path) -> Path:
     "needs bun on PATH and this repository checkout to start the real omp host",
 )
 class GetTreeHostTests(unittest.TestCase):
-    # If this regresses, `get_tree` on a long session (a long controller session is one chain
-    # of 84,773 entries) raises RecursionError, or the reader fails to decode the answer and
-    # the client closes, failing every later command.
+    # If this regresses, `get_tree` on a long session (a long session can be one chain
+    # of tens of thousands of entries) raises RecursionError, or the reader fails to decode
+    # the answer and the client closes, failing every later command.
     def test_get_tree_reads_a_100000_entry_chain(self) -> None:
         assert _BUN is not None
         with tempfile.TemporaryDirectory(prefix="omp-rpc-tree-") as directory:

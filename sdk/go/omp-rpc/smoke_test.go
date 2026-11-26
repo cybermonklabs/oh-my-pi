@@ -472,9 +472,9 @@ func walkChain(t *testing.T, root map[string]json.RawMessage) (int, string) {
 	return depth, deepest
 }
 
-// If this regresses, get_tree on a long session (a long controller session is
-// one chain of 84,773 entries) fails with "exceeded max depth", or waits out
-// its 30 s timeout while the decode error goes to Frames.
+// If this regresses, get_tree on a long session (a long session can be one
+// chain of tens of thousands of entries) fails with "exceeded max depth", or
+// waits out its 30 s timeout while the decode error goes to Frames.
 func TestSmokeGetTreeDeepChain(t *testing.T) {
 	root := repoRoot(t)
 	dir := t.TempDir()

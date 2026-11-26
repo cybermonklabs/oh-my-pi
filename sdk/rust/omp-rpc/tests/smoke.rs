@@ -479,9 +479,10 @@ fn write_chain_session(dir: &Path) -> PathBuf {
 	file
 }
 
-// If this regresses, `get_tree` on a long session (a long controller session is
-// one chain of 84,773 entries) closes the client with "Failed to decode
-// reassembled RPC frame", or overflows a thread's stack and aborts the process.
+// If this regresses, `get_tree` on a long session (a long session can be one
+// chain of tens of thousands of entries) closes the client with "Failed to
+// decode reassembled RPC frame", or overflows a thread's stack and aborts the
+// process.
 #[test]
 #[ignore = "spawns the real omp server; run with --ignored"]
 fn smoke_get_tree_deep_chain() {

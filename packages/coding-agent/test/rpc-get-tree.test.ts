@@ -56,8 +56,8 @@ describe("RPC get_tree", () => {
 		if (ownDirectory) await removeWithRetries(ownDirectory);
 	});
 
-	// A host that reads the tree of a session longer than about 10,000 entries (a long controller
-	// session is one chain of 84,773) gets `Maximum call stack size exceeded` instead of the tree:
+	// A host that reads the tree of a session longer than about 10,000 entries (a long session can
+	// be one chain of tens of thousands) gets `Maximum call stack size exceeded` instead of the tree:
 	// `getTree()` nests each entry under its parent, deeper than `JSON.stringify` recurses.
 	test("returns the tree of a 100,000-entry chain, which the client reads back whole", async () => {
 		directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rpc-tree-"));
