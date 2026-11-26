@@ -38,9 +38,9 @@ pub struct MemStore {
 	/// functions, options, …, shared with the forks that cloned them.
 	image:       Image,
 	/// The records outside the image: kernel state and the root vproc's
-	/// own fields (job table, process table, `$?`, counters, …). Written
-	/// often while forks live, and never part of one.
-	other:       HashMap<KeyBuf, Record>,
+	/// own fields (job table, process table, `$?`, counters, …), one map
+	/// per table. Written often while forks live, and never part of one.
+	other:       Tables,
 	/// The root shell's scopes, outermost first ([`Key::Scope`],
 	/// [`Key::Local`]).
 	scopes:      Vec<ScopeEntry>,
@@ -60,6 +60,52 @@ struct StoreImage {
 	records: Vec<(KeyBuf, Record)>,
 	blobs:   Vec<(BlobSlot, Vec<u8>)>,
 	epoch:   u64,
+}
+
+/// [`MemStore`]'s other records, one map per table ([`Key::table`]): a scan
+/// reads its table's records alone, not the thousands of job records a
+/// `lastpipe` loop keeps with them (an external's environment scans the
+/// functions, [`Table::Func`]). A map left empty goes, so equal contents
+/// compare equal.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Tables(HashMap<Table, HashMap<KeyBuf, Record>>);
+
+impl Tables {
+	fn get(&self, key: &Key<'_>) -> Option<&Record> {
+		self.0.get(&key.table())?.get(key)
+	}
+
+	fn put(&mut self, key: Key<'_>, record: Record) {
+		let map = self.0.entry(key.table()).or_default();
+		match map.get_mut(&key) {
+			Some(slot) => *slot = record,
+			None => {
+				map.insert(key.to_buf(), record);
+			},
+		}
+	}
+
+	fn remove(&mut self, key: &Key<'_>) {
+		let table = key.table();
+		if let Some(map) = self.0.get_mut(&table) {
+			map.remove(key);
+			if map.is_empty() {
+				self.0.remove(&table);
+			}
+		}
+	}
+
+	fn len(&self) -> usize {
+		self.0.values().map(HashMap::len).sum()
+	}
+
+	fn iter(&self) -> impl Iterator<Item = (&KeyBuf, &Record)> {
+		self.0.values().flatten()
+	}
+
+	fn table(&self, table: Table) -> impl Iterator<Item = (&KeyBuf, &Record)> {
+		self.0.get(&table).into_iter().flatten()
+	}
 }
 
 /// Equal stores hold the same records, blobs and epoch; the local-name
@@ -179,7 +225,7 @@ impl MemStore {
 			}
 		}
 		self.image.each_other(f);
-		for (k, r) in &self.other {
+		for (k, r) in self.other.iter() {
 			f(k.as_key(), r);
 		}
 	}
@@ -233,12 +279,7 @@ impl MemStore {
 				}
 			},
 			_ if key.forked() => self.image.put(key, record),
-			_ => match self.other.get_mut(&key) {
-				Some(slot) => *slot = record,
-				None => {
-					self.other.insert(key.to_buf(), record);
-				},
-			},
+			_ => self.other.put(key, record),
 		}
 		Ok(())
 	}
@@ -261,9 +302,7 @@ impl MemStore {
 			_ if key.forked() => {
 				self.image.del(key);
 			},
-			_ => {
-				self.other.remove(&key);
-			},
+			_ => self.other.remove(&key),
 		}
 	}
 
@@ -359,11 +398,8 @@ impl StateStore for MemStore {
 			},
 			_ => {
 				self.image.each_record(table, f);
-				for (k, r) in &self.other {
-					let key = k.as_key();
-					if key.table() == table {
-						f(key, r);
-					}
+				for (k, r) in self.other.table(table) {
+					f(k.as_key(), r);
 				}
 			},
 		}
@@ -462,7 +498,7 @@ mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	use super::*;
-	use crate::bash::store::Var;
+	use crate::bash::store::{MiscKey, Var};
 
 	#[test]
 	fn deferred_scalars_observe_and_snapshot_as_ordinary_records() {
@@ -534,5 +570,41 @@ mod tests {
 			restored.record(Key::Var(BStr::new(b"DEFAULT"))),
 			Some(&Record::Var(Var { attrs: Attrs::READONLY, value: VarValue::Str("saved".into()) }))
 		);
+	}
+
+	/// A scan of one table visits that table's records alone, beside many
+	/// records of another, and deleting a table's last record leaves the
+	/// store equal to one that never held it.
+	#[test]
+	fn a_scan_reads_its_own_table_only() {
+		let mut store = MemStore::new();
+		let empty = store.clone();
+		for n in 0..100_u32 {
+			let name = format!("v{n}");
+			store
+				.apply(Change::Put(Key::Misc(MiscKey::Cwd), Record::Misc(name.clone().into())))
+				.unwrap();
+			store
+				.apply(Change::Put(
+					Key::CmdHash(BStr::new(name.as_bytes())),
+					Record::Misc(BString::from(name.as_bytes())),
+				))
+				.unwrap();
+		}
+		let mut seen = 0;
+		store.scan(Table::Misc, &mut |_, _| seen += 1).unwrap();
+		assert_eq!(seen, 1);
+		let mut hashed = 0;
+		store.scan(Table::CmdHash, &mut |_, _| hashed += 1).unwrap();
+		assert_eq!(hashed, 100);
+		assert_eq!(store.len(), 101);
+		store.apply(Change::Del(Key::Misc(MiscKey::Cwd))).unwrap();
+		for n in 0..100_u32 {
+			store
+				.apply(Change::Del(Key::CmdHash(BStr::new(format!("v{n}").as_bytes()))))
+				.unwrap();
+		}
+		assert_eq!(store, empty);
+		assert_eq!(MemStore::from_bytes(&store.to_bytes()).unwrap(), empty);
 	}
 }

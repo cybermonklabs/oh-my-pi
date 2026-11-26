@@ -276,6 +276,14 @@ pub fn exec(
 			},
 			Stage::Redirect => {
 				if let Some(list) = cmd.redirs {
+					// bash looks a stage's command up before its redirections and
+					// drops the stage's job list there for a builtin other than
+					// `jobs`, or a function ([`stage_command_runs`]): a
+					// substitution in such a command's redirection sees no job,
+					// one in an external's does.
+					if vp.jobs.stage_words && stage_runs_in_shell(k, cx, vp) {
+						stage_command_runs(vp, false);
+					}
 					// Opens: `CmdExpanded` reads the clock after them.
 					k.clock_stale();
 					// Redirections do not see the command's temporary
@@ -2187,15 +2195,16 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 					return Some(Flow::Discard(1));
 				},
 			};
+			// `builtin …` is a builtin other than `jobs` to bash, which drops a
+			// stage's job list before it runs it, and so the command it names
+			// ([`stage_command_runs`]). `command …` is not: `command jobs | cat`
+			// lists the jobs (measured), so the command it names decides.
+			if matches!(resolved, Resolved::Intrinsic(IntrinsicId::Builtin)) {
+				stage_command_runs(vp, false);
+			}
 			let ExecState { argv, arrayref, .. } = st(vp);
 			match resolved {
-				Resolved::Intrinsic(IntrinsicId::Command)
-					if argv.len() > 1
-						&& argv[1..]
-							.iter()
-							.find(|a| !matches!(a.as_slice(), b"-p" | b"--"))
-							.is_some_and(|a| !a.starts_with(b"-")) =>
-				{
+				Resolved::Intrinsic(IntrinsicId::Command) if command_names(argv).is_some() => {
 					argv.remove(0);
 					shift_arrayref(arrayref);
 					while argv.len() > 1 && matches!(argv[0].as_slice(), b"-p" | b"--") {
@@ -2480,12 +2489,85 @@ fn prefix_var(value: &AssignValue) -> Var {
 	}
 }
 
+/// A pipeline stage's simple command expanded its words with its shell's
+/// job list ([`super::proc::JobTable::stage_words`]) and now runs (`jobs`:
+/// it is the `jobs` builtin): bash's child drops the list there
+/// (`execute_subshell_builtin_or_function`'s `without_job_control`), but for
+/// the `jobs` builtin (`kill_current_pipeline` instead). An external
+/// command replaces bash's child, so dropping the list there too is the
+/// same.
+fn stage_command_runs(vp: &mut Vproc, jobs: bool) {
+	if std::mem::take(&mut vp.jobs.stage_words) && !jobs {
+		let table = &mut vp.jobs;
+		table.list.clear();
+		table.current = None;
+		table.previous = None;
+		table.chld = 0;
+		table.bgp = None;
+	}
+}
+
+/// Where `command [-p | --]… NAME …` names the command it runs: the index
+/// of NAME in `argv` (`argv[0]` is `command`) and whether a `-p` came
+/// before it. `None` when `command` runs as itself: no NAME, or an option
+/// such as `-v` before it.
+fn command_names(argv: &[BString]) -> Option<(usize, bool)> {
+	let rest = argv.get(1..)?;
+	let at = rest
+		.iter()
+		.position(|a| !matches!(a.as_slice(), b"-p" | b"--"))?;
+	(!rest[at].starts_with(b"-")).then(|| (at + 1, rest[..at].iter().any(|a| a.as_slice() == b"-p")))
+}
+
+/// Whether the expanded command of `vp` is a function or a builtin other
+/// than `jobs` (`builtin` is one), as the lookup will find it: what bash
+/// runs in the stage's child itself, after `without_job_control`. Like the
+/// lookup, it looks through `command` to the name it runs, never a
+/// function (measured: `command jobs 2>/dev/null | cat` lists the job). A
+/// name it cannot tell without a probe (a path, a host's answer that needs
+/// one) is not.
+fn stage_runs_in_shell(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> bool {
+	let mode = exec::mode_of(vp);
+	let (mut at, mut std_path, mut via) = (0, false, Via::Plain);
+	loop {
+		let Some(name) = st(vp).argv.get(at).cloned() else {
+			return false;
+		};
+		if name.contains(&b'/') {
+			return false;
+		}
+		if via == Via::Plain
+			&& matches!(state::record(cx.store, vp, Key::Func(BStr::new(&name))), Ok(Some(_)))
+		{
+			return true;
+		}
+		let rctx = ResolveCtx { has_slash: false, via };
+		match resolve(k, cx, vp, &name, mode, rctx) {
+			Ok(Resolved::Intrinsic(IntrinsicId::Command)) => {
+				let Some((skip, p)) = command_names(&st(vp).argv[at..]) else {
+					return true;
+				};
+				at += skip;
+				std_path |= p;
+				via = if std_path {
+					Via::CommandP
+				} else {
+					Via::Command
+				};
+			},
+			Ok(Resolved::Intrinsic(id)) => return id != IntrinsicId::Jobs,
+			_ => return false,
+		}
+	}
+}
+
 /// Start the resolved command.
 fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) -> Option<Flow> {
 	let target = st(vp).target.clone().unwrap_or(Target::NotFound);
 	// The command name, for diagnostics only.
 	let argv0 = |vp: &mut Vproc| st(vp).argv[0].clone();
 	let jobspec = st(vp).exec_as.is_none() && st(vp).argv[0].starts_with(b"%");
+	stage_command_runs(vp, matches!(target, Target::Intrinsic(IntrinsicId::Jobs)));
 	if !k.bangs.is_empty() {
 		let exec = st(vp).exec_as.is_some();
 		bang_dispatch(k, vp.vpid, &target, exec);
@@ -2784,10 +2866,16 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			st(vp).in_place = super::killed::in_place(k, cx, vp, op);
 			st(vp).subshell_exec = super::killed::subshell_exec(k, cx, vp, op);
 			// bash forks the program (`stop_pipeline` first deletes the
-			// finished jobs reported, `jobs.c:572`) unless it runs it with
-			// `exec` in its own process.
+			// finished jobs reported, `jobs.c:572`, and makes it a job) unless
+			// it runs it with `exec` in its own process. A spawn tried again
+			// (the redirections applied here after all) keeps the job it made.
 			if !st(vp).in_place && !st(vp).subshell_exec {
 				super::killed::cleanup_dead_jobs(vp);
+				if super::killed::keeps_foreground(vp) && vp.jobs.pending_external_mut().is_none() {
+					let text = super::killed::external_text(k, cx, vp, op);
+					let own = k.vpid(cx.store);
+					super::killed::foreground_job(vp, job, own, text, None);
+				}
 			}
 			// The root's process becomes the program's: each signal that would
 			// end it is caught, to be the program's
@@ -2945,6 +3033,12 @@ fn spawned_external(
 			k.forget_deferral(vp.vpid);
 			super::jobctl::spawned(k, vp, child.as_ref());
 			let pid = child.pid();
+			// Its foreground job, if it has one, is known by the program's
+			// pid, by which its end finds it
+			// ([`super::proc::JobTable::external_ended`]).
+			if let Some(job) = vp.jobs.pending_external_mut() {
+				job.os_pid = Some(pid);
+			}
 			// The job this vproc may still settle is known by its program
 			// (`bang_dispatch` let only its lone or `exec`'d external
 			// through).
@@ -4981,6 +5075,58 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			let mut waited = None;
 			let keep = keeps_statuses(k, cx, vp);
 			while let Some(&v) = st(vp).wait_for.first() {
+				// A job this shell copied from its parent (a command
+				// substitution's, [`super::proc::Job::inherited`]) is no child
+				// of it. bash's `wait_for_job` answers a finished foreground
+				// one with its status at once, and one still running, foreground
+				// or not, with the -1 of a process it cannot wait for (both
+				// measured in bash 5.3.20). Waiting for its vproc would wait for
+				// ever; a finished background copy goes on below, to the status
+				// kept for it.
+				if let Some(i) = vp.jobs.iter().rposition(|j| {
+					j.vpid == v && j.inherited && (j.foreground || j.state == JobState::Running)
+				}) {
+					last = match vp.jobs.list[i].state {
+						JobState::Done(s) => s,
+						_ => -1,
+					};
+					if let Some(job) = vp.jobs.list.at_mut(i) {
+						job.notified = true;
+					}
+					st(vp).wait_for.remove(0);
+					continue;
+				}
+				// A foreground job (`wait %N`, [`super::proc::Job::foreground`])
+				// ends as its processes, the shell's own children, end: bash's
+				// `wait_for_job` waits for them, returns the job's status and
+				// marks it reported.
+				if let Some(job) = vp.jobs.foreground(v) {
+					let pid = job.pid();
+					let JobState::Done(s) = job.state else {
+						let running = job
+							.procs
+							.as_deref()
+							.and_then(|p| {
+								p.list
+									.iter()
+									.find(|p| p.state == crate::bash::store::ProcState::Running)
+							})
+							.map_or(v, |p| p.vpid);
+						if let Some(flow) = write_out(k, vp, cx, line) {
+							return Some(flow);
+						}
+						return Some(Flow::Block(WaitKey::Proc(running)));
+					};
+					last = s;
+					waited_notice(k, vp, cx, v, line);
+					if let Some(job) = vp.jobs.foreground_mut(v) {
+						job.notified = true;
+					}
+					super::killed::cleanup_dead_jobs(vp);
+					waited = Some(pid);
+					st(vp).wait_for.remove(0);
+					continue;
+				}
 				// `wait -p` names the child by the pid the user knows (its
 				// program's OS pid), read before the job is forgotten.
 				let shown = vp.shown_pid(v);
@@ -5062,7 +5208,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				.jobs
 				.iter()
 				.filter(|j| match j.state {
-					JobState::Done(status) => {
+					JobState::Done(status) if !j.foreground => {
 						!last.is(j.vpid)
 							|| (kept != Some(j.vpid)
 								&& ((if bash { j.notified } else { status > 128 })
@@ -5076,15 +5222,25 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				.map(|j| j.vpid)
 				.collect();
 			// While no job may be deleted, `cleanup_dead_jobs` keeps them
-			// (`jobs.c:1470`).
-			if !vp.jobs_kept() {
-				for v in done {
+			// (`jobs.c:1470`), marked reported as bash marks them
+			// (`mark_dead_jobs_as_notified`, `wait_for_single_pid`): a later
+			// `jobs -n` lists none of them ([`forget_job`]).
+			let kept_list = vp.jobs_kept();
+			for v in done {
+				if !kept_list {
 					k.proc_collect(cx.store, v);
-					forget_job(vp, v);
 				}
+				forget_job(vp, v);
 			}
-			// And bash forgets every status kept (`wait_for_background_pids`'
-			// `bgp_clear`).
+			// `mark_dead_jobs_as_notified` marks the finished foreground jobs
+			// too ([`super::proc::Job::foreground`]), whose processes the
+			// shell took in already; the cleanup deletes them, but none while
+			// no job may be deleted.
+			if bash && vp.jobs.iter().any(|j| j.foreground) {
+				vp.jobs.foreground_done_reported();
+				super::killed::cleanup_dead_jobs(vp);
+			}
+			// And the statuses kept go (`bgp_clear`), frozen or not.
 			state::clear_statuses(&mut k.root, cx.store, vp);
 			st(vp).status
 		},
@@ -5241,6 +5397,12 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				},
 				None => lost(k, vp, cx, op, line, Lost::Ext { vpid: vp.vpid, pid }),
 			};
+			// Its foreground job ([`super::proc::Job::foreground`]) is done,
+			// reported where the list only marks (`notify_and_cleanup` under -1).
+			if vp.jobs.iter().any(|j| j.foreground) {
+				let marks = vp.freeze() == super::proc::Freeze::Marks;
+				vp.jobs.external_ended(pid, status, killed, marks);
+			}
 			// The shell's process was the program it `exec`ed: bash and zsh
 			// run no EXIT trap after it.
 			if replacing && reaped {
@@ -5591,6 +5753,10 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let notice = e.notice.take();
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
+	let external = matches!(
+		e.target,
+		Some(Target::External(_) | Target::Interp(_) | Target::Script(_) | Target::Refused { .. })
+	);
 	vp.status = status;
 	// bash's in-shell read of `$(< file)` runs no command: `PIPESTATUS`
 	// stays the last pipeline's (`false | true; echo "$(< f)"
@@ -5598,6 +5764,16 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	if op.flags & ir::Op::CAT == 0 {
 		vp.pipestatus.clear();
 		vp.pipestatus.push(status);
+	}
+	// An external the host refused, or ran as a script, ended without a
+	// program's end: its foreground job ([`super::proc::Job::foreground`])
+	// ends with the command's status.
+	if external && vp.jobs.pending_external_mut().is_some() {
+		let marks = vp.freeze() == super::proc::Freeze::Marks;
+		if let Some(job) = vp.jobs.pending_external_mut() {
+			job.state = JobState::Done(status);
+			job.notified = marks;
+		}
 	}
 	if k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
 		// One fresh reading for the duration and the event's stamp; the

@@ -48,6 +48,17 @@
 //! - at the end of `jobs` without `-r`, `-s` or `-x`, for the jobs it did not
 //!   list ([`jobs_ended`], through its redirections).
 //!
+//! At the same points bash marks reported, with no notice, each finished
+//! job it gives no notice of ([`mark_unreported`]), and the cleanup deletes
+//! it, its status kept for `wait PID`: in a `( … )`, a background job or a
+//! pipeline's stage of a `-c` shell, every one, `$!`'s too; in a command or
+//! process substitution's own process, and in posix mode in any fork of a
+//! `-c` shell, every one but `$!`'s; in a posix `-c` shell itself, each one a
+//! signal killed but `$!`'s. Never one a SIGINT, SIGTERM or SIGPIPE killed,
+//! nor one a signal the shell traps killed. So `( a & b & …; x=$(jobs);
+//! jobs )` lists no finished job, where the `-c` shell itself keeps them, and
+//! so does a script file's shell, or a fork of it outside a substitution.
+//!
 //! Each of these points, the end of a `wait`, each fork (`stop_pipeline`) and
 //! each loop iteration (`REAP`: also when `break` or `continue` ends the
 //! body; not at a `return`) deletes the finished jobs already reported
@@ -128,11 +139,10 @@ pub(super) fn killed(
 	if vp.parent.is_some() && super::transparent(vp, false) == Some(true) {
 		return quiet;
 	}
-	let Some(unit) = vp.frames.last().and_then(|f| f.unit.clone()) else {
+	if vp.frames.last().and_then(|f| f.unit.as_ref()).is_none() {
 		return quiet;
-	};
-	let redirs = unit.cmds.get(op.a as usize).and_then(|c| c.redirs);
-	let text = command_text(k, cx, vp, &unit, op.node, redirs);
+	}
+	let text = external_text(k, cx, vp, op);
 	Killed {
 		notice:  notice(k, cx, vp, &text, op.node, pid, sig).map(BString::from),
 		no_fork: false,
@@ -531,12 +541,12 @@ fn reports_jobs(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 }
 
 /// The signal that killed job `number` of `vp`, if bash reports it and has
-/// not yet: the job is this shell's own, done, by a signal other than
-/// `INT`, `TERM` and `PIPE` that the shell does not trap. bash leaves a job
-/// another signal killed unreported, for `jobs`.
+/// not yet: the job is this shell's own background job, done, by a signal
+/// other than `INT`, `TERM` and `PIPE` that the shell does not trap. bash
+/// leaves a job another signal killed unreported, for `jobs`.
 fn unreported(cx: &mut Cx<'_>, vp: &Vproc, number: u32) -> Option<Signal> {
 	let job = vp.jobs.get(number)?;
-	if job.inherited || job.notified || !matches!(job.state, JobState::Done(_)) {
+	if job.inherited || job.foreground || job.notified || !matches!(job.state, JobState::Done(_)) {
 		return None;
 	}
 	let sig = job.signal?;
@@ -588,7 +598,9 @@ fn job_line(
 /// `wait` (`wait`, `wait ID`, `wait -n`) waited for the job of vproc `vpid`
 /// at script line `line` (bash `wait_for`'s `notify_and_cleanup (job)`,
 /// `wait_for_any_job`): its notice, for the `wait` command's standard
-/// error, when a signal bash reports killed it ([`unreported`]).
+/// error, when a signal bash reports killed it ([`unreported`]); for a
+/// foreground job ([`super::proc::Job::foreground`]) a signal killed while
+/// the list was frozen, its own notice ([`foreground_line`]).
 pub(super) fn waited(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -596,12 +608,63 @@ pub(super) fn waited(
 	vpid: Vpid,
 	line: u32,
 ) -> Option<Vec<u8>> {
+	if let Some(job) = vp.jobs.foreground(vpid) {
+		let number = job.number;
+		if job.notified || job.signal.is_none() || vp.jobs_frozen() {
+			return None;
+		}
+		return foreground_line(k, cx, vp, number, line);
+	}
 	let number = vp.jobs.by_vpid(vpid)?.number;
 	let sig = unreported(cx, vp, number)?;
 	if !reports_jobs(k, cx, vp) {
 		return None;
 	}
 	job_line(k, cx, vp, number, sig, line)
+}
+
+/// bash's notice of foreground job `number` of `vp`
+/// ([`super::proc::Job::foreground`]) that a signal killed while the job
+/// list was frozen (a command of a `lastpipe` stage), at script line `line`:
+/// `notify_of_job_status` gives it at the first report point outside, as
+/// [`notice_form`] decides for any foreground command: the long one as a
+/// background job's ([`job_line`]), the short one how it ended and its
+/// command (`print_pipeline`). The job is reported now, with a notice or
+/// without one.
+fn foreground_line(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &mut Vproc,
+	number: u32,
+	line: u32,
+) -> Option<Vec<u8>> {
+	let job = vp.jobs.get(number)?;
+	let sig = job.signal?;
+	let last = job
+		.procs
+		.as_deref()
+		.and_then(|p| p.list.last())
+		.map(|p| p.state);
+	let text = job.text.clone();
+	let bytes = match notice_form(k, cx, vp, sig) {
+		Some(Form::Long) => return job_line(k, cx, vp, number, sig, line),
+		Some(Form::Short) => {
+			let platform = k.engine.config().platform;
+			let desc = match last {
+				Some(state) => {
+					let posix = state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
+					ended_text(state, posix, platform)
+				},
+				None => sig.description(platform),
+			};
+			Some(short_notice(&desc, &text))
+		},
+		None => None,
+	};
+	if let Some(job) = vp.jobs.get_mut(number) {
+		job.notified = true;
+	}
+	bytes
 }
 
 /// `vp` reads line `line` of its input next (bash `shell_getc`, which
@@ -642,11 +705,17 @@ pub(super) fn expanded(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u3
 }
 
 /// Whether a report point has work in `vp`: a finished job to report, or a
-/// reported one to delete ([`report_all`]).
+/// reported one to delete ([`report_all`]), or in a bash fork or
+/// substitution's process any finished job, which it may mark reported
+/// without a notice ([`mark_unreported`]; the shell itself marks only one a
+/// signal killed).
 pub(super) fn reports_due(vp: &Vproc) -> bool {
+	let forked =
+		vp.mode.dialect() == Dialect::Bash && (vp.image.is_some() || vp.jobs.comsub != Comsub::No);
+	let due = |j: &super::proc::Job| forked || j.notified || j.signal.is_some();
 	vp.jobs
 		.iter()
-		.any(|j| matches!(j.state, JobState::Done(_)) && (j.notified || j.signal.is_some()))
+		.any(|j| matches!(j.state, JobState::Done(_)) && due(j))
 }
 
 /// The newlines bash's parser passed after the start of the command `vp`
@@ -722,46 +791,183 @@ pub(super) fn jobs_ended(
 }
 
 /// bash's `notify_and_cleanup (-1)` at script line `line`: the notices of
-/// the background jobs a signal bash reports killed ([`unreported`]), in
-/// job order, marked reported, then the finished jobs reported go
-/// ([`cleanup_dead_jobs`]); `None` when nothing is reported.
+/// the background jobs a signal bash reports killed ([`unreported`]) and of
+/// the foreground ones a signal killed while the list was frozen
+/// ([`foreground_line`]), in job order, marked reported, the other finished
+/// jobs bash marks reported without a notice ([`mark_unreported`]) and every
+/// finished foreground job ([`super::proc::Job::foreground`]:
+/// `notify_of_job_status` marks each one it reaches), then the finished jobs
+/// reported go ([`cleanup_dead_jobs`]); `None` when nothing is reported.
 fn report_all(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, line: u32) -> Option<Vec<u8>> {
-	let done: Vec<u32> = vp
+	let done: Vec<(u32, bool)> = vp
 		.jobs
 		.iter()
 		.filter(|j| j.signal.is_some() && !j.notified && !j.inherited)
-		.map(|j| j.number)
+		.map(|j| (j.number, j.foreground))
 		.collect();
 	let mut out = Vec::new();
-	if !done.is_empty() && reports_jobs(k, cx, vp) {
-		for number in done {
-			let Some(sig) = unreported(cx, vp, number) else {
-				continue;
+	if !done.is_empty() {
+		let reports = reports_jobs(k, cx, vp);
+		let frozen = vp.jobs_frozen();
+		for (number, foreground) in done {
+			let bytes = if foreground {
+				if frozen {
+					continue;
+				}
+				foreground_line(k, cx, vp, number, line)
+			} else {
+				let Some(sig) = unreported(cx, vp, number).filter(|_| reports) else {
+					continue;
+				};
+				job_line(k, cx, vp, number, sig, line)
 			};
-			if let Some(bytes) = job_line(k, cx, vp, number, sig, line) {
+			if let Some(bytes) = bytes {
 				out.extend_from_slice(&bytes);
 			}
 		}
+	}
+	mark_unreported(k, cx, vp);
+	if vp.mode.dialect() == Dialect::Bash && !vp.jobs_frozen() {
+		vp.jobs.foreground_done_reported();
 	}
 	cleanup_dead_jobs(vp);
 	(!out.is_empty()).then_some(out)
 }
 
+/// bash's `notify_of_job_status` (`jobs.c:4565-4687`, a non-interactive
+/// shell without job control) for the finished jobs of `vp` it marks
+/// reported with no notice, which the cleanup after deletes, each with its
+/// status kept for `wait PID` (`delete_job`'s `bgp_add`). Never one a
+/// SIGINT, SIGTERM or SIGPIPE killed, nor one a signal the shell traps
+/// killed (`4587-4596`, [`trapped_here`]). bash's `startup_state` is 2 in a
+/// `-c` shell and in a command or process substitution's process and its
+/// forks; in a script file's shell and its other forks it is 0, and that
+/// keeps every one a signal did not kill (`4580`), as the `-c` shell itself
+/// does (`subshell_environment` 0, `4599`). Then a substitution's own
+/// process (`SUBSHELL_COMSUB`), and in posix mode any shell, marks every one
+/// but the job `$!` names (`4611-4620`); any other fork marks each one a
+/// signal did not kill, `$!`'s too (the catch-all, `4683-4687`), and reports
+/// the others ([`unreported`]). None while the job list is frozen
+/// ([`Vproc::jobs_frozen`]: `notify_and_cleanup` returns at once); where
+/// it only marks (a function substitution, or a fork of a shell running
+/// one, [`super::proc::Freeze::Marks`]) bash marks them, and the first
+/// cleanup outside deletes them ([`cleanup_dead_jobs`]). None in an
+/// interactive shell, nor in zsh.
+fn mark_unreported(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) {
+	let open = |j: &super::proc::Job| !j.notified && matches!(j.state, JobState::Done(_));
+	// The scan of the table last: a frozen list keeps thousands of jobs.
+	if vp.mode.dialect() != Dialect::Bash
+		|| vp.jobs_frozen()
+		|| (vp.jobs.comsub == Comsub::No && !misc_is(cx, vp, MiscKey::RunOrigin, b"c"))
+		|| misc_is(cx, vp, MiscKey::Interactive, b"1")
+		|| !vp.jobs.iter().rev().any(open)
+	{
+		return;
+	}
+	let fork = nested::in_subshell(cx.store, vp);
+	let all_but_bang = vp.jobs.comsub == Comsub::Own
+		|| state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
+	let shell: &Vproc = vp;
+	let mut marks = |j: &super::proc::Job| {
+		let quiet = |sig: Signal| matches!(sig, Signal::Int | Signal::Term | Signal::Pipe);
+		if j.foreground
+			|| j
+				.signal
+				.is_some_and(|sig| quiet(sig) || trapped_here(cx, shell, sig))
+		{
+			return false;
+		}
+		if all_but_bang {
+			(fork || j.signal.is_some()) && !shell.last_bg.is(j.vpid)
+		} else {
+			fork && j.signal.is_none()
+		}
+	};
+	let marked: Vec<(u32, Vpid, u32, i32)> = shell
+		.jobs
+		.iter()
+		.filter_map(|j| match j.state {
+			JobState::Done(status) if !j.notified && marks(j) => {
+				Some((j.number, j.vpid, j.pid(), status))
+			},
+			_ => None,
+		})
+		.collect();
+	for (number, vpid, pid, status) in marked {
+		if let Some(job) = vp.jobs.get_mut(number) {
+			job.notified = true;
+		}
+		state::save_status(&mut k.root, cx.store, vp, vpid, pid, status);
+	}
+}
+
 /// bash's `cleanup_dead_jobs`: the finished jobs of `vp` already reported
 /// (`J_NOTIFIED`: listed, waited for while the job list was frozen) go from
-/// the table, but none while no job may be deleted ([`Vproc::jobs_kept`]:
-/// `jobs.c:1310`). A `wait PID` still finds a status `wait` collected
-/// ([`super::proc::JobTable::bgp`]) or the process's own. bash only: zsh
-/// deletes a job as it reports it. bash calls it at each of its cleanup
-/// points: the report points ([`report_all`]), `jobs`, the end of a `wait`,
-/// each fork (`stop_pipeline`, `jobs.c:572`) and each loop iteration (`REAP`,
-/// `execute_cmd.c:3105`, `3267`, `3606`, `3838`, also as `break` or
-/// `continue` ends the body: `exec::break_loops`).
+/// the table, and so does each finished foreground job
+/// ([`super::proc::Job::foreground`]) but one a signal bash reports killed
+/// that is not reported yet ([`deletable`]), but none while no job may be
+/// deleted ([`Vproc::jobs_kept`]: `jobs.c:1310`). A `wait PID` still finds
+/// a status `wait` collected ([`super::proc::JobTable::bgp`]) or the
+/// process's own. bash only: zsh deletes a job as it reports it. bash calls
+/// it at each of its cleanup points: the report points ([`report_all`]),
+/// `jobs`, the end of a `wait`, each fork (`stop_pipeline`, `jobs.c:572`)
+/// and each loop iteration (`REAP`, `execute_cmd.c:3105`, `3267`, `3606`,
+/// `3838`, also as `break` or `continue` ends the body:
+/// `exec::break_loops`).
 pub(super) fn cleanup_dead_jobs(vp: &mut Vproc) {
-	let reported = |j: &super::proc::Job| j.notified && matches!(j.state, JobState::Done(_));
-	if vp.jobs.iter().any(reported) && vp.mode.dialect() == Dialect::Bash && !vp.jobs_kept() {
-		vp.jobs.remove_where(reported);
+	// The scan of the table last: a list no job may leave keeps thousands.
+	if vp.mode.dialect() == Dialect::Bash && !vp.jobs_kept() && vp.jobs.iter().any(deletable) {
+		vp.jobs.remove_where(deletable);
 	}
+}
+
+/// Whether bash's `cleanup_dead_jobs` deletes `job` (`jobs.c:1328-1333`):
+/// it finished, and it was reported, or it ran in the foreground and no
+/// signal bash reports killed it ([`super::proc::Job::killed_reported`]).
+pub(super) const fn deletable(job: &super::proc::Job) -> bool {
+	matches!(job.state, JobState::Done(_))
+		&& (job.notified || (job.foreground && !job.killed_reported()))
+}
+
+/// Whether bash's `stop_pipeline` makes a job of a command `vp` forks and
+/// waits for (an external, a `( … )`, a pipeline) that outlives the wait:
+/// bash makes a job of each, and deletes it as the wait ends
+/// (`notify_and_cleanup`), but not while no job may be deleted
+/// ([`Vproc::jobs_kept`]). Then `vp` gets that job ([`foreground_job`]).
+/// bash only.
+pub(super) fn keeps_foreground(vp: &Vproc) -> bool {
+	vp.mode.dialect() == Dialect::Bash && vp.jobs_kept()
+}
+
+/// The job of a foreground command of `vp` ([`keeps_foreground`]; for a
+/// `lastpipe` pipeline's forked stages always, as bash freezes the list
+/// before it makes their job): job `id`, vproc `vpid` (a `( … )`'s, a
+/// pipeline's first stage, or a fresh one for an external), the command
+/// `text` and a pipeline's processes `procs`, each named by its vproc.
+/// It takes the next number; `%N` names it, and `jobs` hides it while the
+/// list is frozen ([`super::proc::Job::listed_while_frozen`]). It is done as
+/// the shell takes in the command's end
+/// ([`super::proc::JobTable::foreground_reaped`],
+/// [`super::proc::JobTable::external_ended`]).
+pub(super) fn foreground_job(
+	vp: &mut Vproc,
+	id: crate::bash::ids::JobId,
+	vpid: Vpid,
+	text: BString,
+	procs: Option<JobProcs>,
+) {
+	let cwd = vp.cwd.clone();
+	vp.jobs.add_foreground(id, vpid, text, cwd, procs);
+}
+
+/// The command of `op`, an external `vp` runs, as bash prints it for its
+/// job and its notice (`jobs`, [`killed`]).
+pub(super) fn external_text(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, op: Op) -> BString {
+	let Some(unit) = vp.frames.last().and_then(|f| f.unit.clone()) else {
+		return BString::default();
+	};
+	let redirs = unit.cmds.get(op.a as usize).and_then(|c| c.redirs);
+	BString::from(command_text(k, cx, vp, &unit, op.node, redirs))
 }
 
 /// Whether the real shell runs the command of `op`, an external `vp`
@@ -795,6 +1001,35 @@ fn trapped(cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> bool {
 	matches!(
 		state::record(cx.store, vp, Key::Trap(TrapKey::Signal(sig))),
 		Ok(Some(Record::Trap { .. }))
+	) && !cx.host.ignored_signals().contains(sig)
+}
+
+/// bash `signal_is_trapped` in `vp` itself: in a fork (a subshell, a job, a
+/// stage, a substitution's process: bash's `subshell_environment`,
+/// [`nested::in_subshell`]), `reset_signal_handlers` (`trap.c:1448-1456`)
+/// took off every trap but one that ignores its signal, so there only such a
+/// trap counts, or one the fork set itself
+/// ([`super::proc::Vproc::own_traps`]); in the shell itself (a nested
+/// shell's too) every trap counts ([`trapped`]).
+fn trapped_here(cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> bool {
+	let key = TrapKey::Signal(sig);
+	let shell = !nested::in_subshell(cx.store, vp);
+	matches!(
+		state::record(cx.store, vp, Key::Trap(key)),
+		Ok(Some(Record::Trap { action, .. }))
+			if shell || action.is_empty() || vp.own_traps.has(key)
+	) && !cx.host.ignored_signals().contains(sig)
+}
+
+/// bash `signal_is_trapped` in a command substitution's process for `sig`,
+/// as `vp` starts it: the child's `reset_signal_handlers` (`trap.c:1448-1456`)
+/// takes off every trap but one that ignores its signal (`trap '' SIG`), so
+/// only `vp`'s trap with an empty action counts there, unless the signal was
+/// ignored when the shell started ([`trapped`]).
+pub(super) fn ignored_by_trap(cx: &mut Cx<'_>, vp: &Vproc, sig: Signal) -> bool {
+	matches!(
+		state::record(cx.store, vp, Key::Trap(TrapKey::Signal(sig))),
+		Ok(Some(Record::Trap { action, .. })) if action.is_empty()
 	) && !cx.host.ignored_signals().contains(sig)
 }
 
