@@ -2,8 +2,8 @@
  * `omp --session-id <uuid>` resumes the session that holds an id the launcher chose, or starts a new
  * session under it. It refuses, before any model call, while another live omp process has that
  * session open; it refuses a value that is not a canonical UUID, and pairs with no other session
- * flag. `--resume <id>` opens the session that holds exactly that id, never another one whose id
- * merely starts with it.
+ * flag. `--resume <id>` opens the session whose id is exactly that id before one whose id or file
+ * name merely starts with it, and a full id matches a file name as any other key does.
  */
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
@@ -31,10 +31,20 @@ const LATER = new Date("2026-11-02T10:00:00.000Z");
 const OPEN_ELSEWHERE = `Session "${SESSION_ID}" is open in another running omp process.`;
 const settings = () => Settings.isolated({ "marketplace.autoUpdate": "off" });
 
-/** A stored session with one exchange, named the way the session manager names its files. */
-async function storeSession(storage: SessionStorage, dir: string, id: string, cwd: string, at: Date): Promise<string> {
+/**
+ * A stored session with one exchange, named the way the session manager names its files: for its
+ * id, or for `fileId` (a file whose name records one session while its header names another).
+ */
+async function storeSession(
+	storage: SessionStorage,
+	dir: string,
+	id: string,
+	cwd: string,
+	at: Date,
+	fileId = id,
+): Promise<string> {
 	storage.ensureDirSync(dir);
-	const file = path.join(dir, `${at.toISOString().replace(/[:.]/g, "-")}_${id}.jsonl`);
+	const file = path.join(dir, `${at.toISOString().replace(/[:.]/g, "-")}_${fileId}.jsonl`);
 	const stamp = at.toISOString();
 	const lines = [
 		{ type: "session", version: 3, id, cwd, timestamp: stamp },
@@ -425,14 +435,14 @@ describe("omp --resume <id>", () => {
 		expect(match?.session.id).toBe(SESSION_ID);
 	});
 
-	it("never resumes a session whose id only starts with a full id", async () => {
-		const storage = await sqlStorage();
-		const dir = path.resolve("/sessions/session-id-resume-absent");
-		await storeSession(storage, dir, LONGER_ID, "/work", LATER);
-		// A full id names one session; a short prefix still selects by prefix.
-		expect(await resolveResumableSession(SESSION_ID, "/work", dir, storage)).toBeUndefined();
-		const byPrefix = await resolveResumableSession(SESSION_ID.slice(0, 8), "/work", dir, storage);
-		expect(byPrefix?.session.id).toBe(LONGER_ID);
+	it("resumes a full id through a file named for it when no session's id is that id", async () => {
+		using dir = TempDir.createSync("@omp-session-id-resume-name-");
+		const storage = new FileSessionStorage();
+		// The only file named for SESSION_ID holds another session (a copy, or a file replaced under that name).
+		const file = await storeSession(storage, dir.path(), OTHER_ID, dir.path(), EARLIER, SESSION_ID);
+		const match = await resolveResumableSession(SESSION_ID, dir.path(), dir.path(), storage);
+		expect(match?.session.path, "a full id matches a file name as any other key does").toBe(file);
+		expect(match?.session.id).toBe(OTHER_ID);
 	});
 
 	it("resumes an exact id from file storage, never a newer session whose id starts with it", async () => {

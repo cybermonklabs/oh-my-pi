@@ -453,7 +453,7 @@ With an argument:
 2. Else `resolveResumableSession(...)` searches:
    - current scope (`SessionManager.list(cwd, sessionDir)`)
    - global sessions (`SessionManager.listAll()`) only when no explicit `sessionDir` was provided
-3. Matching accepts case-insensitive session id prefixes, full JSONL filename prefixes, and the id suffix after the timestamp in `<timestamp>_<sessionId>.jsonl`. In each scope a session whose id is exactly the value wins over one whose id or file name only starts with it. A value that is a full session id (a lowercase UUID) matches only exactly, in every scope, so it never opens another session whose id extends it.
+3. Matching accepts case-insensitive session id prefixes, full JSONL filename prefixes, and the id suffix after the timestamp in `<timestamp>_<sessionId>.jsonl`. In each scope a session whose id is exactly the value wins over one whose id or file name only starts with it.
 4. When nothing matches, the resolver (`resolveResumeTarget`) looks in the same scopes for a `<timestamp>_<sessionId>.jsonl` file whose name matches but which no longer reads as a session (the listing skips it), and takes the copy that continues it (see below). Otherwise resolution fails with `Session "<value>" not found.`
 
 Both forms then follow the session's continuations (`findSessionContinuation`, through `resolveResumeTarget` for a key): when its conversation went on in another file of the same directory (a sibling whose header names it in `continuationOf`), the copy with the newest turn opens instead, unless the named file has turns of its own that copy lacks, and a notice names both files. A file that no longer holds the session its generated `<timestamp>_<sessionId>.jsonl` name records was replaced under that session (conflict recovery leaves it as it found it); resume then opens the copy that continues the named session, when one exists. That applies to a path whose file no longer parses, and to a key that matched only the file name (the file holds another session) or found an unlisted file in step 4. A path whose file holds another session opens that session; a file without a generated name records no session id and is never taken as replaced.
@@ -487,7 +487,10 @@ arguments are parsed, so no other session flag acts first.
 way `--resume <id>` would find it (`resolveResumeTarget` with `exactId`: the same
 scopes and storage, matched by the exact id rather than a prefix, the
 unlisted-file probe included). It opens that one as `--resume <id>` does,
-continuations and the moved-directory prompt included.
+continuations and the moved-directory prompt included. A session that was packed
+and moved to another machine (`omp session pack`) forks to a copy under a new id
+each time it opens, as with `--resume <id>`: every launch under the id starts
+another copy, and the id no longer names the conversation that goes on.
 
 When no stored session holds the id, `SessionManager.createWithSessionId()`
 creates the session object without touching the terminal's last-session record,
@@ -504,6 +507,12 @@ model call, with exit status 1 and
 `Session "<id>" is open in another running omp process. Stop that process, then run this command again to resume it.`
 A refused launch writes nothing: no session file, no change to the other
 process's file, and no change to the terminal's record that `--continue` reads.
+
+The ownership lease is an OS lock local to one machine and one lease directory
+(`~/.omp/run/session-owners`), so only omp processes that share it exclude each
+other: one user's processes on one machine. Processes with separate homes, or in
+separate containers, that share a session directory each take their own lease,
+and both write.
 
 `--session-id` selects its session itself, so it is refused beside every other
 session selector: `--resume`/`-r`/`--session`, `--restore`, `--continue`/`-c`,
