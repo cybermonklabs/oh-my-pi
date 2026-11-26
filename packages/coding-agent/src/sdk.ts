@@ -236,6 +236,7 @@ import {
 	type RetryFallbackResolutionContext,
 	resolveRetryFallbackChainKey,
 } from "./session/retry-fallback-chains";
+import { resolveRetiredSessionModel, retiredSessionModelMigrationProviders } from "./session/retired-session-model";
 import { describeUsageFallback } from "./session/retry-fallback-reason";
 import { kUsageLimitRequestProvider } from "./session/turn-recovery";
 import { getReadableCompactionEntry, getRestorableSessionModels } from "./session/session-context";
@@ -1026,10 +1027,23 @@ export interface CreateAgentSessionOptions {
 
 /** Saved models were exhausted without permission to substitute another model. */
 export class SessionModelRestoreError extends Error {
-	constructor(modelSelector: string) {
-		super(`Could not restore model ${modelSelector}`);
+	/**
+	 * `removedProvider` names the `retry.fallbackChains` remedy, which only
+	 * applies when the saved selector's provider is gone; a present provider
+	 * whose model is missing has no key to walk, so it is left out.
+	 */
+	constructor(modelSelector: string, removedProvider = false) {
+		super(sessionModelRestoreMessage(modelSelector, removedProvider));
 		this.name = "SessionModelRestoreError";
 	}
+}
+
+/** The refusal text, with the `--model` remedy and, for a removed provider, the key remedy. */
+export function sessionModelRestoreMessage(modelSelector: string, removedProvider: boolean): string {
+	const base = `Could not restore model ${modelSelector}. Use --model to choose a model`;
+	return removedProvider
+		? `${base}, or add a retry.fallbackChains key that maps the old selector to the new one.`
+		: `${base}.`;
 }
 
 /** Result from createAgentSession */
@@ -3134,38 +3148,69 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// honors the last active role in either case.
 		const sessionRetryLimit = restoredSessionModelIndex >= 0 ? restoredSessionModelIndex : sessionModelStrings.length;
 		if (!hasExplicitModel && sessionRetryLimit > 0) {
+			const retryCandidates = sessionModelStrings.slice(0, sessionRetryLimit);
+			const adoptRestoredSessionModel = (
+				restored: { model: Model; thinkingLevel?: ConfiguredThinkingLevel },
+				index: number,
+			): void => {
+				const restoredModel = restored.model;
+				model = restoredModel;
+				modelFallbackMessage = undefined;
+				restoredSessionModelIndex = index;
+				restoredSessionThinkingLevel = restored.thinkingLevel;
+				// Recompute thinking-level from scratch against the reclaimed
+				// model: any value derived from the earlier fallback model's
+				// `thinking.defaultLevel` must not become sticky.
+				adoptThinkingForModel(restoredModel);
+				void prewarmModelConnection(restoredModel);
+			};
 			const restoreSessionModel = (): boolean => {
-				for (let i = 0; i < sessionRetryLimit; i++) {
-					const restored = resolveSessionModelSelector(modelRegistry, sessionModelStrings[i]);
+				for (let i = 0; i < retryCandidates.length; i++) {
+					const restored = resolveSessionModelSelector(modelRegistry, retryCandidates[i]);
 					if (restored) {
-						const restoredModel = restored.model;
-						model = restoredModel;
-						modelFallbackMessage = undefined;
-						restoredSessionModelIndex = i;
-						restoredSessionThinkingLevel = restored.thinkingLevel;
-						// Recompute thinking-level from scratch against the reclaimed
-						// model: any value derived from the earlier fallback model's
-						// `thinking.defaultLevel` must not become sticky.
-						adoptThinkingForModel(restoredModel);
-						void prewarmModelConnection(restoredModel);
+						adoptRestoredSessionModel(restored, i);
 						return true;
+					}
+					// A later saved model cannot bypass a retired preferred selector:
+					// discovery and its exact migration key decide that selector first.
+					if (resolveRetiredSessionModel(modelRegistry, settings, retryCandidates[i]).kind !== "present") {
+						return false;
 					}
 				}
 				return false;
+			};
+			// A retired candidate that neither migrated nor could be skipped refuses
+			// the resume outright, even when a lower-priority candidate restored.
+			const restoreRetiredSessionModel = (): void => {
+				for (let i = 0; i < retryCandidates.length; i++) {
+					const resolution = resolveRetiredSessionModel(modelRegistry, settings, retryCandidates[i]);
+					if (resolution.kind === "present") continue;
+					if (resolution.kind === "refused") throw new SessionModelRestoreError(retryCandidates[i], true);
+					adoptRestoredSessionModel(resolution, i);
+					return;
+				}
 			};
 			if (!restoreSessionModel()) {
 				// The saved candidates weren't in the static+cached catalog. If any
 				// belongs to a discovery-backed provider that hasn't been fetched
 				// yet (models.yml `discovery:` or extension `fetchDynamicModels`),
-				// trigger a cache-aware, provider-scoped discovery pass and retry
-				// before resume silently downgrades to the default role. The
-				// registry coalesces this with any matching request already running
-				// in the SDK's startup background refresh.
+				// trigger a cache-aware, provider-scoped discovery pass and retry.
+				// Only then may a candidate whose provider is gone migrate through
+				// its own `retry.fallbackChains` key; nothing else downgrades to
+				// the default role silently. The registry coalesces this with any
+				// matching request already running in the SDK's startup
+				// background refresh.
 				const candidateProviders = sessionModelDiscoveryProviders(
 					modelRegistry,
-					sessionModelStrings.slice(0, sessionRetryLimit),
+					retryCandidates,
 					disabledProviderIds(settings),
 				);
+				for (const selector of retryCandidates) {
+					for (const provider of retiredSessionModelMigrationProviders(modelRegistry, settings, selector)) {
+						candidateProviders.add(provider);
+					}
+				}
+				let discovered = false;
 				if (candidateProviders.size > 0) {
 					// This skips the static reload and all-other-runtime restore
 					// performed by `refreshProvider`, so unrelated runtime providers
@@ -3173,8 +3218,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					await logger.time("restoreSessionModelDiscoveryFallback", () =>
 						modelRegistry.refreshDiscoverableProviders(candidateProviders, "online-if-uncached"),
 					);
-					restoreSessionModel();
+					discovered = restoreSessionModel();
 				}
+				if (!discovered) restoreRetiredSessionModel();
 			}
 		}
 		// Exhaust persisted candidates (including configured and extension discovery)

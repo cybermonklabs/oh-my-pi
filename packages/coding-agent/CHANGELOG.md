@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Resuming a session whose provider was removed now walks that model's exact `retry.fallbackChains` key to the same model under its new provider, or refuses with a message that names `--model` and the key to add; it no longer silently substitutes the default model
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

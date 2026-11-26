@@ -8092,7 +8092,10 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.fallbackChains": {
-				"nonexistent-provider/nonexistent-model": [`${primaryModel.provider}/${primaryModel.id}`],
+				"nonexistent-provider/nonexistent-model": [
+					`${primaryModel.provider}/${primaryModel.id}`,
+					"openai/missing-model",
+				],
 				[`${primaryModel.provider}/${primaryModel.id}`]: ["openai/gpt-4o"],
 			},
 		});
@@ -8126,7 +8129,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.fallbackChains": {
-				"nonexistent-provider/nonexistent-model": [`${primaryModel.provider}/${primaryModel.id}`],
+				"nonexistent-provider/nonexistent-model": [],
 			},
 		});
 		const agent = new Agent({
