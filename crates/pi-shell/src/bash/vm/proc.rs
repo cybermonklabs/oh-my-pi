@@ -2648,10 +2648,12 @@ impl Live {
 }
 
 // Size guards for the idle-vproc targets (the testkit `memory` bench's
-// `MAX_VPROC_NOWRITE_BYTES`, 2,048 B, and `MAX_RETAINED_BYTES`, which
-// say how they were set): an idle background job holds one boxed `Vproc`,
-// one `Frame`, one boxed `Scratch` and one boxed `ExecState`, so every byte
-// here is a byte per idle vproc.
+// `MAX_VPROC_NOWRITE_BYTES`, a ratchet at the measured value under the
+// 2,048 B `VPROC_CEILING_BYTES`, and `MAX_RETAINED_BYTES`, which say how
+// they were set): an idle background job holds one boxed `Vproc`, one
+// `Frame`, one boxed `Scratch` and one boxed `ExecState`, and its parent's
+// job table one `Job` (a vector that doubles, so up to two `Job`s' room), so
+// every byte here is a byte per idle vproc or more.
 // Raise a bound only with the bench's numbers in hand. Each of these added
 // a pointer or less: the boxed zsh side table `Vproc::zsh` (`Frame` is
 // unchanged, its zsh state lives there and in `FrameKind`), host lineage
@@ -2670,7 +2672,9 @@ impl Live {
 // unused: Vproc 656 → 664 B, ExecState 376 → 384 B) and the EXIT trap's jump
 // kinds (`ExecState::prefix`, `ScriptKind::Trap::outside_functions`: no
 // growth alone) give Vproc 696 B, Frame 264 B and ExecState 392 B; 8 B each
-// of `Frame` and `ExecState` is alignment.
+// of `Frame` and `ExecState` is alignment. `Job` is 96 B: its signal and
+// processes (`Job::signal`, `Job::procs`) and `Job::unreaped` came with
+// bash's kept statuses and killed-job notices (80 B before).
 // The bench with these sizes (release build, x86-64 Linux, at the Cut14
 // landing): 2,004 B per idle vproc forked with no write by the shell between
 // the forks, in every run; retention 318 B per vproc. In the bench's loop,
@@ -2682,6 +2686,7 @@ const _: () =
 	assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2,048 B back to back)");
 const _: () =
 	assert!(size_of::<ExecState>() <= 392, "ExecState grew (idle vproc ≤ 2,048 B back to back)");
+const _: () = assert!(size_of::<Job>() <= 96, "Job grew (idle vproc ≤ 2,048 B back to back)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one
 // pointer only; `RedirProgress` not at all).
@@ -2692,13 +2697,14 @@ const _: () =
 /// `size_of` of the structures an idle vproc holds, by name: the testkit
 /// `memory` bench prints them as its `memory sizes:` line beside the bytes
 /// per idle vproc. Measurement only.
-pub const fn vproc_layout() -> [(&'static str, usize); 5] {
+pub const fn vproc_layout() -> [(&'static str, usize); 6] {
 	[
 		("Vproc", size_of::<Vproc>()),
 		("Frame", size_of::<Frame>()),
 		("Scratch", size_of::<Scratch>()),
 		("ScratchIo", size_of::<ScratchIo>()),
 		("ExecState", size_of::<ExecState>()),
+		("Job", size_of::<Job>()),
 	]
 }
 
