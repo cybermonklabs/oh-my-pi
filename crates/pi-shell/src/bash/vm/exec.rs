@@ -958,6 +958,7 @@ fn zsh_subshell_traps(k: &mut Kernel, cx: &mut Cx<'_>, child: &mut Vproc, keep: 
 	{
 		k.fail(err);
 	}
+}
 /// The EXIT trap [`exit_shell`] just started (the top frame): the shell
 /// exits when it ends (`exit`; a trap started on the unwound frames ends
 /// the vproc anyway), and it runs outside the function context when bash
