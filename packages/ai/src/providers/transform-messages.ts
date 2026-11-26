@@ -602,44 +602,36 @@ export function dropsForeignReasoningPayload(
 }
 
 /**
- * Whether `turn` comes from the same Anthropic Messages deployment as
- * `model`: the same provider on first-party Anthropic or on a prefix-bound
- * host, where another model's signature still verifies.
- */
-function sharesAnthropicDeployment(
-	turn: Pick<AssistantMessage, "provider" | "api">,
-	model: Pick<Model, "provider" | "api" | "thinking"> & { compat?: Model["compat"] },
-): boolean {
-	if (model.api !== "anthropic-messages" || turn.api !== "anthropic-messages") return false;
-	if (turn.provider !== model.provider) return false;
-	const compat = model.compat;
-	return (
-		(compat !== undefined && "officialEndpoint" in compat && compat.officialEndpoint === true) ||
-		model.thinking?.prefixBinding === true
-	);
-}
-
-/**
  * Whether {@link transformMessages} drops a thinking block of `turn` on its
  * way to `model` because `model`'s input classifier refuses reasoning quoted
  * back to it as text (the `classifier-cot-extraction` catalog axis, set for
  * Claude): Claude refuses a request whose earlier turns carry another model's
  * reasoning as plain assistant prose (`reasoning_extraction`). Such a target
- * gets another model's thinking only as a block signed on its own Anthropic
- * deployment (`signed`: the block keeps a signature, or is redacted
- * thinking), which replays natively; anything else of it would arrive as
- * text and is dropped. That model's answers and tool calls stay. Context
- * estimates count a turn's thinking by this same answer.
+ * keeps another model's thinking only as a block signed on its own provider's
+ * Anthropic Messages endpoint (`signed`: the block keeps its signature, or is
+ * redacted thinking), which replays there natively, as it did before. It drops
+ * the rest, which would reach it as text, or as an unsigned block that a host
+ * in front of Anthropic rejects and the encoder then writes as text. That
+ * model's answers and tool calls stay. Devin writes this transform's demoted
+ * text into the turn's prompt, so its wire counts here too. Context estimates
+ * count a turn's thinking by this same answer.
  */
 export function dropsForeignThinking(
 	turn: Pick<AssistantMessage, "provider" | "api" | "model">,
-	model: CatalogPolicyInputs & { compat?: Model["compat"] },
+	model: CatalogPolicyInputs,
 	signed: boolean,
 ): boolean {
-	if ((DIRECT_REPLAY_APIS as Partial<Record<Api, boolean>>)[model.api] !== true) return false;
+	if (model.api !== "devin-agent" && (DIRECT_REPLAY_APIS as Partial<Record<Api, boolean>>)[model.api] !== true) {
+		return false;
+	}
 	if (isSameModelTurn(turn, model)) return false;
 	if (resolveCatalogPolicy(model).classifierCotExtraction !== true) return false;
-	return !signed || !sharesAnthropicDeployment(turn, model);
+	return !(
+		signed &&
+		model.api === "anthropic-messages" &&
+		turn.api === "anthropic-messages" &&
+		turn.provider === model.provider
+	);
 }
 
 /**
@@ -1057,7 +1049,10 @@ export function transformMessages<TApi extends Api>(
 			// anthropic-messages providers configured via `models.yaml` and
 			// session-level model swaps (#2257).
 			const isAnthropicReplay = isAnthropicTarget && assistantMsg.api === "anthropic-messages";
-			const sameAnthropicDeployment = sharesAnthropicDeployment(assistantMsg, model);
+			const sameAnthropicDeployment =
+				isAnthropicReplay &&
+				assistantMsg.provider === model.provider &&
+				(model.compat.officialEndpoint || model.thinking?.prefixBinding === true);
 			const isLatestSurvivingAssistant = index === latestSurvivingAssistantIndex;
 			// Signature policy is a second axis. Anthropic cryptographically
 			// binds reasoning signatures to its deployment and model lineage.
