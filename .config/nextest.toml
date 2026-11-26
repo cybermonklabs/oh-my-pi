@@ -73,3 +73,19 @@ slow-timeout = { period = "60s", terminate-after = 20 }
 [[profile.ci.overrides]]
 filter = 'package(pi-builtins) & test(=cp::tests::cp_does_what_gnu_does_across_the_probe_matrix)'
 slow-timeout = { period = "60s", terminate-after = 20 }
+
+# pi-ast's whole-repository corpus test
+# (`block::tests::pruned_walk_matches_unpruned_on_full_repo_corpus`, ignored:
+# the gate runs it alone in an opt build) sweeps every file of the repository.
+# Its correct gate runs took 152 to 240 s, at the 240 s bound above, which
+# then failed two runs of it (sami-checks runs 45762751760 and 45762775961).
+# Its bound is 10 periods of 60 s (600 s): more than twice its longest correct
+# run, 240.2 s (run 45722788663), and below the 1,200 s Bazel gives the gate's
+# ignored runs.
+[[profile.default.overrides]]
+filter = 'package(pi-ast) & test(=block::tests::pruned_walk_matches_unpruned_on_full_repo_corpus)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+[[profile.ci.overrides]]
+filter = 'package(pi-ast) & test(=block::tests::pruned_walk_matches_unpruned_on_full_repo_corpus)'
+slow-timeout = { period = "60s", terminate-after = 10 }

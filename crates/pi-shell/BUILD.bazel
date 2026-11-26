@@ -73,8 +73,18 @@ rust_binary(
 # Unit tests, including the engine, host and pi-host suites under
 # `src/**/suites`, which read their data at compile time (syntax goldens,
 # zsh glob tables) and at run time (testkit fixtures).
+# The gate runs the target's one libtest process under
+# .github/sami/libtest-bound.py, which fails a test that has made no progress
+# within its .config/nextest.toml bound (240 s; no override names a pi-shell
+# test) by name. Bazel's timeout must leave that bound after the longest
+# correct run, and be at least twice that run: the longest of three gate runs
+# (sami-checks runs 45722788663, 45722800123 and 45722811150, 2026-11-26) took
+# 158.6 s, so max(2 x 158.6, 158.6 + 240) = 398.6 s: "long" (900 s), not the
+# 300 s of a medium test, which a hang that starts after 60 s would reach
+# unnamed.
 rust_test(
     name = "pi-shell_test",
+    timeout = "long",
     compile_data = glob([
         "src/bash/syntax/suites/data/**",
         "src/bash/pattern/zsh/testdata/**",
