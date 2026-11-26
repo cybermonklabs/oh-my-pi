@@ -131,6 +131,18 @@ use crate::file::POLL_SLICE;
 /// `fs.protected_fifos` when the name names a FIFO, and `O_CREAT` creates a
 /// missing file in the same `open(2)`. Removing that file afterwards would
 /// remove by its name a file the helper cannot prove is the one it created.
+///
+/// The helper's own end is in the process's descriptor table from its
+/// `open(2)` returning until it sees the cancel and drops it: a process
+/// another thread forks in that window gets a copy, which outlives the drop
+/// in the child. For a write-only open (a `>` or `>>` redirection) that copy
+/// is a writer, so the FIFO's next reader can read end of file when the child
+/// ends, as with a killed reader's release before; the window is the
+/// helper's few steps between `open(2)` and its check. Where `close_range`
+/// cannot give the drop's thread a descriptor table of its own (a kernel or
+/// seccomp filter that refuses it), the drop holds its end on the dropping
+/// thread, as before, without an error, and a process forked meanwhile can
+/// copy that end too.
 pub struct FifoOpen<T> {
 	shared: Arc<Shared<T>>,
 	node:   Arc<Node>,
