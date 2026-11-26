@@ -4672,8 +4672,9 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					// it runs its command (`echo "$(jobs)" | cat`, `jobs -p |
 					// xargs kill`; [`super::proc::JobTable::stage_words`]). Only
 					// a substitution in its words or redirections, or the `jobs`
-					// builtin itself, can read the list, so only such a stage gets
-					// a copy. zsh keeps it only for a `jobs` builtin.
+					// builtin itself (also by a name its expansion gives), can
+					// read the list, so only such a stage gets a copy. zsh keeps
+					// it only for a `jobs` builtin.
 					let bash = vp.mode.dialect() == Dialect::Bash;
 					if !vp.jobs.is_empty()
 						&& (runs_jobs(unit, stage.entry) || bash && substituting_stage(unit, stage.entry))
@@ -5012,38 +5013,79 @@ fn drop_finished_jobs(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc, child: &mut V
 	}
 }
 
-/// Whether the pipeline stage starting at `entry` is a simple command
-/// named `jobs` (zsh keeps the job list only for that builtin); in bash
-/// also `command jobs`, which bash runs as the `jobs` builtin itself
-/// (`execute_simple_command` drops the `command` word), so it keeps the
-/// list (measured: `command jobs | cat` lists the running job).
+/// Whether the pipeline stage starting at `entry` may run the `jobs`
+/// builtin, which keeps the job list. zsh keeps it only for a stage whose
+/// text starts with the word `jobs`. bash decides on the stage's command
+/// after its prefix assignments and redirections, and runs `command [-p |
+/// --]… jobs` as the `jobs` builtin itself (`execute_simple_command` drops
+/// the `command` word; measured: `2>/dev/null jobs | cat`, `x=1 jobs |
+/// cat`, `command 'jobs' | cat`, `command -p -- jobs | cat` and `command
+/// command jobs | cat` list the running job). A word only its expansion
+/// names (`j=jobs; $j | cat` lists it too) may be `jobs`: such a stage
+/// gets the list and drops it as it runs another command, which is never
+/// on the fast path (`plain_statement` takes a literal name only).
 fn runs_jobs(unit: &Unit, entry: u32) -> bool {
-	let Some(op) = unit.ops.get(entry as usize) else {
-		return false;
-	};
-	let names_jobs = |text: &[u8]| {
-		text.strip_prefix(b"jobs").is_some_and(|rest| {
+	if unit.mode.dialect() != Dialect::Bash {
+		let Some(op) = unit.ops.get(entry as usize) else {
+			return false;
+		};
+		let text = node_text(unit, op.node);
+		let text: &[u8] = &text;
+		return text.strip_prefix(b"jobs").is_some_and(|rest| {
 			rest
 				.first()
 				.is_none_or(|c| matches!(c, b' ' | b'\t' | b'\n' | b';' | b'|'))
-		})
+		});
+	}
+	let Some(words) = stage_exec(unit, entry)
+		.and_then(|(op, _)| unit.cmds.get(op.a as usize))
+		.and_then(|cmd| unit.lists.get(cmd.words as usize))
+	else {
+		return false;
 	};
-	let text = node_text(unit, op.node);
-	let text: &[u8] = &text;
-	names_jobs(text)
-		|| (unit.mode.dialect() == Dialect::Bash
-			&& text
-				.strip_prefix(b"command")
-				.and_then(|rest| rest.strip_prefix(b" ").or_else(|| rest.strip_prefix(b"\t")))
-				.is_some_and(|rest| names_jobs(rest.trim_ascii_start())))
+	// Whether word `i` is the literal text `want`, quoted or not.
+	let is = |i: usize, want: &[u8]| {
+		let Some(word) = words.get(i).and_then(|&w| unit.words.get(w as usize)) else {
+			return false;
+		};
+		let mut rest = want;
+		word.parts.iter().all(|part| match part {
+			ir::Part::Lit(text) | ir::Part::Quoted(text) => {
+				rest.strip_prefix(text.as_slice()).is_some_and(|r| {
+					rest = r;
+					true
+				})
+			},
+			_ => false,
+		}) && rest.is_empty()
+	};
+	let expands = |i: usize| {
+		words
+			.get(i)
+			.and_then(|&w| unit.words.get(w as usize))
+			.is_some_and(|word| {
+				word
+					.parts
+					.iter()
+					.any(|part| !matches!(part, ir::Part::Lit(_) | ir::Part::Quoted(_)))
+			})
+	};
+	let mut i = 0;
+	while is(i, b"command") {
+		i += 1;
+		while is(i, b"-p") || is(i, b"--") {
+			i += 1;
+		}
+	}
+	is(i, b"jobs") || expands(i)
 }
 
-/// Whether the pipeline stage starting at `entry` is a simple command whose
-/// words or redirections hold a substitution: past the redirections it
-/// starts with ([`stage_level`]'s shape), the substitutions' bodies sit
-/// before the command, each jumped over (`Lower::block`). bash expands the
-/// words in the stage's child, where such a substitution reads the list.
-fn substituting_stage(unit: &Unit, entry: u32) -> bool {
+/// The `Exec` of the simple command the pipeline stage starting at `entry`
+/// is, with the number of substitution bodies before it: past the
+/// redirections the stage starts with ([`stage_level`]'s shape), the bodies
+/// of the substitutions in the command's words and redirections sit before
+/// the command, each jumped over (`Lower::block`).
+fn stage_exec(unit: &Unit, entry: u32) -> Option<(&Op, usize)> {
 	let mut pc = entry as usize;
 	if unit.ops.get(pc).is_some_and(|op| op.code == Opcode::Redir) {
 		pc += 1;
@@ -5056,7 +5098,18 @@ fn substituting_stage(unit: &Unit, entry: u32) -> bool {
 		pc = op.a as usize;
 		bodies += 1;
 	}
-	bodies > 0 && unit.ops.get(pc).is_some_and(|op| op.code == Opcode::Exec)
+	unit
+		.ops
+		.get(pc)
+		.filter(|op| op.code == Opcode::Exec)
+		.map(|op| (op, bodies))
+}
+
+/// Whether the pipeline stage starting at `entry` is a simple command whose
+/// words or redirections hold a substitution ([`stage_exec`]). bash expands
+/// the words in the stage's child, where such a substitution reads the list.
+fn substituting_stage(unit: &Unit, entry: u32) -> bool {
+	stage_exec(unit, entry).is_some_and(|(_, bodies)| bodies > 0)
 }
 
 /// `coproc NAME cmd`: run the body at `entry` as a background child whose

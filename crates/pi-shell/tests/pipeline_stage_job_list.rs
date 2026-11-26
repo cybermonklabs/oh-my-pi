@@ -428,11 +428,15 @@ fn a_job_spec_in_a_stage_s_words_names_the_job() {
 /// substitution in the stage's words gave the stage the list (`kill %1
 /// "$(:)"`, `builtin kill …`, a function given `"$(:)"`, `x=$(:) builtin
 /// jobs`), `jobs %1` and `command jobs` do (bash runs the `jobs` builtin
-/// there), a function lists none, `builtin jobs` lists none, and neither
-/// does a substitution in a builtin's redirection, which bash makes
-/// after the drop. A compound command stage (`for`, `while`, `if`) has no
-/// list from the start (`execute_in_subshell`), nor has an assignment-only
-/// stage's value.
+/// there), also as `command -p jobs`, `command -- jobs`, `command command
+/// jobs` or `command 'jobs'`, past a function named `jobs`, after a prefix
+/// redirection or assignment, by a name its expansion gives (`$j`, `$c
+/// jobs`), and with a redirection, which bash makes after the drop. A
+/// function lists none, `builtin jobs` lists none with a redirection or
+/// without, `command kill` with a redirection finds none, and a
+/// substitution in a builtin's redirection sees none. A compound command
+/// stage (`for`, `while`, `if`) has no list from the start
+/// (`execute_in_subshell`), nor has an assignment-only stage's value.
 #[test]
 fn a_stage_drops_the_list_before_a_builtin_or_function() {
 	assert_both(&[
@@ -514,6 +518,120 @@ fn a_stage_drops_the_list_before_a_builtin_or_function() {
 			err:    "",
 		},
 		Both {
+			name:   "command-jobs-with-a-redirection-lists-it",
+			script: "sleep 30 & command jobs 2>/dev/null | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-jobs-into-a-file-lists-it",
+			script: r#"F=$(mktemp); sleep 30 & command jobs >"$F" | cat; cat "$F"; rm -f "$F"; kill %1; echo end"#,
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-p-jobs-lists-it",
+			script: "sleep 30 & command -p jobs | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-p-jobs-with-a-redirection-lists-it",
+			script: "sleep 30 & command -p jobs 2>/dev/null | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-dash-dash-jobs-lists-it",
+			script: "sleep 30 & command -- jobs | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-p-dash-dash-jobs-lists-it",
+			script: "sleep 30 & command -p -- jobs | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-command-jobs-lists-it",
+			script: "sleep 30 & command command jobs 2>/dev/null | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-quoted-jobs-lists-it",
+			script: "sleep 30 & command 'jobs' | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-jobs-past-a-function-lists-it",
+			script: "jobs() { echo fn; }; sleep 30 & command jobs 2>/dev/null | cat; kill %1; echo \
+			         end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "jobs-after-a-redirection-lists-it",
+			script: "sleep 30 & 2>/dev/null jobs | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-jobs-after-a-redirection-lists-it",
+			script: "sleep 30 & 2>/dev/null command jobs | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "jobs-after-an-assignment-lists-it",
+			script: "sleep 30 & x=1 jobs | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-jobs-after-an-assignment-lists-it",
+			script: "sleep 30 & x=1 command jobs | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "jobs-by-an-expansion-lists-it",
+			script: "j=jobs; sleep 30 & $j | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-by-an-expansion-lists-it",
+			script: "c=command; sleep 30 & $c jobs | cat; kill %1; echo end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "command-kill-with-a-redirection-finds-none",
+			script: "sleep 30 & command kill %1 2>/dev/null | cat; jobs; kill %1 2>/dev/null; echo \
+			         end",
+			out:    "[1]+  Running                    sleep 30 &\nend\n",
+			file:   "[1]+  Running                    sleep 30 &\nend\n",
+			err:    "",
+		},
+		Both {
 			name:   "a-function-lists-none",
 			script: "f() { jobs; }; sleep 30 & f | cat; kill %1; echo end",
 			out:    "end\n",
@@ -530,6 +648,13 @@ fn a_stage_drops_the_list_before_a_builtin_or_function() {
 		Both {
 			name:   "builtin-jobs-lists-none",
 			script: "sleep 30 & builtin jobs | cat; kill %1; echo end",
+			out:    "end\n",
+			file:   "end\n",
+			err:    "",
+		},
+		Both {
+			name:   "builtin-jobs-with-a-redirection-lists-none",
+			script: "sleep 30 & builtin jobs 2>/dev/null | cat; kill %1; echo end",
 			out:    "end\n",
 			file:   "end\n",
 			err:    "",

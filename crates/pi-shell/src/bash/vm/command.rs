@@ -1920,13 +1920,7 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 			}
 			let ExecState { argv, arrayref, .. } = st(vp);
 			match resolved {
-				Resolved::Intrinsic(IntrinsicId::Command)
-					if argv.len() > 1
-						&& argv[1..]
-							.iter()
-							.find(|a| !matches!(a.as_slice(), b"-p" | b"--"))
-							.is_some_and(|a| !a.starts_with(b"-")) =>
-				{
+				Resolved::Intrinsic(IntrinsicId::Command) if command_names(argv).is_some() => {
 					argv.remove(0);
 					shift_arrayref(arrayref);
 					while argv.len() > 1 && matches!(argv[0].as_slice(), b"-p" | b"--") {
@@ -2213,26 +2207,58 @@ fn stage_command_runs(vp: &mut Vproc, jobs: bool) {
 	}
 }
 
+/// Where `command [-p | --]… NAME …` names the command it runs: the index
+/// of NAME in `argv` (`argv[0]` is `command`) and whether a `-p` came
+/// before it. `None` when `command` runs as itself: no NAME, or an option
+/// such as `-v` before it.
+fn command_names(argv: &[BString]) -> Option<(usize, bool)> {
+	let rest = argv.get(1..)?;
+	let at = rest
+		.iter()
+		.position(|a| !matches!(a.as_slice(), b"-p" | b"--"))?;
+	(!rest[at].starts_with(b"-")).then(|| (at + 1, rest[..at].iter().any(|a| a.as_slice() == b"-p")))
+}
+
 /// Whether the expanded command of `vp` is a function or a builtin other
-/// than `jobs` (`command` and `builtin` are builtins), as the lookup will
-/// find it: what bash runs in the stage's child itself, after
-/// `without_job_control`. A name it cannot tell without a probe (a path, a
-/// host's answer that needs one) is not.
+/// than `jobs` (`builtin` is one), as the lookup will find it: what bash
+/// runs in the stage's child itself, after `without_job_control`. Like the
+/// lookup, it looks through `command` to the name it runs, never a
+/// function (measured: `command jobs 2>/dev/null | cat` lists the job). A
+/// name it cannot tell without a probe (a path, a host's answer that needs
+/// one) is not.
 fn stage_runs_in_shell(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> bool {
-	let Some(name) = st(vp).argv.first().cloned() else {
-		return false;
-	};
-	if name.contains(&b'/') {
-		return false;
+	let mode = exec::mode_of(vp);
+	let (mut at, mut std_path, mut via) = (0, false, Via::Plain);
+	loop {
+		let Some(name) = st(vp).argv.get(at).cloned() else {
+			return false;
+		};
+		if name.contains(&b'/') {
+			return false;
+		}
+		if via == Via::Plain
+			&& matches!(state::record(cx.store, vp, Key::Func(BStr::new(&name))), Ok(Some(_)))
+		{
+			return true;
+		}
+		let rctx = ResolveCtx { has_slash: false, via };
+		match resolve(k, cx, vp, &name, mode, rctx) {
+			Ok(Resolved::Intrinsic(IntrinsicId::Command)) => {
+				let Some((skip, p)) = command_names(&st(vp).argv[at..]) else {
+					return true;
+				};
+				at += skip;
+				std_path |= p;
+				via = if std_path {
+					Via::CommandP
+				} else {
+					Via::Command
+				};
+			},
+			Ok(Resolved::Intrinsic(id)) => return id != IntrinsicId::Jobs,
+			_ => return false,
+		}
 	}
-	if matches!(state::record(cx.store, vp, Key::Func(BStr::new(&name))), Ok(Some(_))) {
-		return true;
-	}
-	let rctx = ResolveCtx { has_slash: false, via: Via::Plain };
-	matches!(
-		resolve(k, cx, vp, &name, exec::mode_of(vp), rctx),
-		Ok(Resolved::Intrinsic(id)) if id != IntrinsicId::Jobs
-	)
 }
 
 /// Start the resolved command.
