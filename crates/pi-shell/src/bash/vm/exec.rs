@@ -3957,6 +3957,11 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					let _ = flush_queued(k, vp);
 					clear_scratch(&mut k.root, cx.store, vp);
 					vp.status = code;
+					// The fork is the pipeline bash waited for: `PIPESTATUS`
+					// holds its status, not inverted under `!` (a fatal error
+					// ends the fork before `execute_in_subshell`'s inversion).
+					vp.pipestatus.clear();
+					vp.pipestatus.push(code);
 					Flow::Jump(op.b)
 				},
 				// In the job's own fork (an async compound command or pipeline
@@ -3996,7 +4001,25 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 					super::jobctl::drain_shout(k);
 					let _ = flush_queued(k, vp);
 					clear_scratch(&mut k.root, cx.store, vp);
-					vp.status = 1;
+					// A negated bash compound whose own redirections fail ends
+					// with 1: bash returns the failure before the command's `!`
+					// applies (`execute_command_internal`), and a `( … )`'s fork
+					// exits with it inverted, which the shell inverts back
+					// (`exit (invert ? …)`, execute_cmd.c:1762). The `Not` just past
+					// the compound inverts the 0 set here.
+					let negated = unit.mode.dialect() == Dialect::Bash
+						&& unit
+							.ops
+							.get(op.b as usize)
+							.is_some_and(|o| o.code == Opcode::Not);
+					vp.status = i32::from(!negated);
+					// The `( … )`'s fork is the pipeline bash waited for:
+					// `PIPESTATUS` holds its exit status. A compound command's own
+					// redirections fail in the shell, which sets none.
+					if fork {
+						vp.pipestatus.clear();
+						vp.pipestatus.push(vp.status);
+					}
 					Flow::Jump(op.b)
 				},
 			}
