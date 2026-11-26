@@ -143,9 +143,11 @@ pub struct Spawn {
 }
 
 /// The UTF-8 locale the shells run in (`LANG`): `C.UTF-8`, which glibc
-/// 2.35 and later and musl have, else `en_US.UTF-8` (macOS has no
-/// `C.UTF-8`). Both give these tests the same answers: with `C.UTF-8` the
-/// whole pi-shell set passes alike with and without `en_US.UTF-8` installed.
+/// 2.35 and later, musl and macOS 15 have, else `en_US.UTF-8`, for a
+/// machine whose C library has no `C.UTF-8` (no run of these tests has
+/// taken that branch yet). Both give these tests the same answers: with
+/// `C.UTF-8` the whole pi-shell set passes alike with and without
+/// `en_US.UTF-8` installed.
 ///
 /// # Panics
 ///
