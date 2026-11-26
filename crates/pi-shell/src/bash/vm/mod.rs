@@ -2896,6 +2896,9 @@ impl Vproc {
 		// caught-signal traps stay in the overlay: the child lists them but
 		// does not run them (`state::inherited_trap`).
 		set_subshell_depth(&mut vp, subshell_depth(self).saturating_add(1));
+		// A fork whose trap strings are still to reset (bash's
+		// `SUBSHELL_RESETTRAP`, [`proc::OwnTraps::reset_pending`]).
+		vp.own_traps = vp.own_traps.with_reset_pending(true);
 		vp.status = self.status;
 		vp.scopes = state::copy_scopes(&k.root, store, self).unwrap_or_else(|err| {
 			k.fail(err);

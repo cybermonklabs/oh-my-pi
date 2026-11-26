@@ -5042,7 +5042,12 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 		text.push(b'\'');
 	}
 	text.push(b'\n');
-	let child = vp.child_text(k, cx.store, &text, line, vp.fds.clone());
+	let mut child = vp.child_text(k, cx.store, &text, line, vp.fds.clone());
+	// bash runs the hook in `execute_disk_command`'s child, which keeps the
+	// shell's `SUBSHELL_RESETTRAP` as it was (jobs.c:2350 adds another flag).
+	child.own_traps = child
+		.own_traps
+		.with_reset_pending(vp.own_traps.reset_pending());
 	let vpid = child.vpid;
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));

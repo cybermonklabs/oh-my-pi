@@ -621,7 +621,10 @@ pub(super) fn trap(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		None => Vec::new(),
 	};
 	// bash `free_trap_strings`: a subshell that changes a trap stops
-	// listing the caught-signal traps it inherited.
+	// listing the caught-signal traps it inherited, and its trap strings
+	// are no longer to reset (trap.def:205-209,
+	// `OwnTraps::reset_pending`).
+	ctx.vp.own_traps = ctx.vp.own_traps.with_reset_pending(false);
 	if ctx.vp.parent.is_some() {
 		let inherited: Vec<KeyBuf> = state::listed_traps(&ctx.k.root, ctx.cx.store, ctx.vp)?
 			.into_iter()

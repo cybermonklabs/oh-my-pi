@@ -289,16 +289,18 @@ impl Vproc {
 }
 
 /// A set of trap keys ([`Vproc::own_traps`]): the pseudo-signals and the
-/// signals.
+/// signals; and whether the vproc's trap strings are still to reset
+/// ([`Self::reset_pending`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnTraps {
 	pseudo:  u8,
+	reset:   bool,
 	signals: SigSet,
 }
 
 impl OwnTraps {
 	/// The empty set.
-	pub const EMPTY: Self = Self { pseudo: 0, signals: SigSet::EMPTY };
+	pub const EMPTY: Self = Self { pseudo: 0, reset: false, signals: SigSet::EMPTY };
 
 	const fn bit(key: crate::bash::store::TrapKey) -> u8 {
 		use crate::bash::store::TrapKey;
@@ -323,15 +325,32 @@ impl OwnTraps {
 	pub const fn with(self, key: crate::bash::store::TrapKey) -> Self {
 		match key {
 			crate::bash::store::TrapKey::Signal(sig) => {
-				Self { pseudo: self.pseudo, signals: self.signals.with(sig) }
+				Self { signals: self.signals.with(sig), ..self }
 			},
-			_ => Self { pseudo: self.pseudo | Self::bit(key), signals: self.signals },
+			_ => Self { pseudo: self.pseudo | Self::bit(key), ..self },
 		}
 	}
 
 	/// The set without `key`, a pseudo-signal (a signal key is kept).
 	pub const fn without(self, key: crate::bash::store::TrapKey) -> Self {
-		Self { pseudo: self.pseudo & !Self::bit(key), signals: self.signals }
+		Self { pseudo: self.pseudo & !Self::bit(key), ..self }
+	}
+
+	/// bash's `SUBSHELL_RESETTRAP`: a fork whose trap strings no `trap` with
+	/// arguments has reset yet. Set in a subshell, a job, a pipeline stage
+	/// and a command substitution (`execute_cmd.c`:1671, :4834,
+	/// subst.c:7266); a process substitution and the not-found hook keep
+	/// their parent's; `trap` clears it (trap.def:208). A jump out of a
+	/// `time` started while it was set reports nothing once it is clear:
+	/// bash's `time_command` skips the report when `subshell_environment`
+	/// changed under it (`execute_cmd.c`:1499).
+	pub const fn reset_pending(self) -> bool {
+		self.reset
+	}
+
+	/// The set with [`Self::reset_pending`] set to `on`.
+	pub const fn with_reset_pending(self, on: bool) -> Self {
+		Self { reset: on, ..self }
 	}
 }
 
@@ -1066,11 +1085,14 @@ impl Frame {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeMark {
 	/// [`crate::bash::host::Host::now_ns`].
-	pub real: u64,
+	pub real:        u64,
 	/// User CPU time of the shell and its waited-for children.
-	pub user: u64,
+	pub user:        u64,
 	/// System CPU time of the shell and its waited-for children.
-	pub sys:  u64,
+	pub sys:         u64,
+	/// The vproc's [`OwnTraps::reset_pending`] when the `time` started: a
+	/// jump out reports it only while that is unchanged.
+	pub reset_traps: bool,
 }
 
 /// An fd slot saved by a redirection, restored when it ends.
