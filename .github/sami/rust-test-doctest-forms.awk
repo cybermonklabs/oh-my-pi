@@ -226,7 +226,34 @@ function literal(s,    i, c, v, n) {
 	return ""
 }
 
-FNR == 1 { flush(); inblock = 0; plain = 0 }
+# brackets(s): the `[` less the `]` of s, outside its string and char
+# literals.
+function brackets(s,    t, a, b) {
+	t = s
+	gsub(/"([^"\\]|\\.)*"/, "", t)
+	gsub(/'([^'\\]|\\.)'/, "", t)
+	a = gsub(/\[/, "", t)
+	b = gsub(/\]/, "", t)
+	return a - b
+}
+
+# attrdocword(s): s holds the word doc not followed by `(`, `)`, `]` or `,`
+# (doc =, r#doc, a doc whose `=` is on another line), or a doc comment.
+function attrdocword(s) {
+	return (" " s " ") ~ /[^A-Za-z0-9_]doc([ \t]*[^]()A-Za-z0-9_, \t]|[ \t]*$)/ || s ~ /^[ \t]*\/(\/\/|\/!|\*\*|\*!)/
+}
+
+# attrend(): an attribute over more than one line has ended (or its file
+# has): one that holds the word doc is unread.
+function attrend() {
+	if (inattr && attrdoc) {
+		flush()
+		out("unread", attrfile, attrline, "a doc attribute over more than one line, which this reader does not read")
+	}
+	inattr = 0; attrdoc = 0
+}
+
+FNR == 1 { attrend(); flush(); inblock = 0; plain = 0; pendattr = 0 }
 
 # Inside a /** or /*! comment (depth counts nested /* */).
 inblock {
@@ -252,6 +279,33 @@ plain {
 		else if (--plain == 0) break
 		rest = substr(rest, RSTART + 2)
 	}
+	next
+}
+
+# An attribute over more than one line: its `[` and `]` are counted until
+# they balance (or the file ends), and one that holds the word doc (other
+# than doc( ), doc), doc], doc,) or a doc comment is unread: this reader reads
+# a doc attribute only on one line. A `#` alone on its line starts one whose
+# `[` is on the next.
+inattr {
+	if (attrdocword($0)) attrdoc = 1
+	attrdepth += brackets($0)
+	if (attrdepth <= 0) attrend()
+	next
+}
+pendattr && !/^[ \t]*$/ {
+	pendattr = 0
+	if ($0 ~ /^[ \t]*\[/) {
+		inattr = 1; attrfile = FILENAME; attrline = FNR; attrdepth = brackets($0); attrdoc = attrdocword($0)
+		# A `[` line after a lone `#` is read only as an attribute that is
+		# unread when it holds the word doc, closed on this line or not.
+		if (attrdepth <= 0) attrend()
+		next
+	}
+}
+/^[ \t]*#!?[ \t]*$/ { pendattr = 1; next }
+/^[ \t]*#!?[ \t]*\[/ && brackets($0) > 0 {
+	inattr = 1; attrfile = FILENAME; attrline = FNR; attrdepth = brackets($0); attrdoc = attrdocword($0)
 	next
 }
 
@@ -335,4 +389,4 @@ $0 ~ /#[ \t]*!?[ \t]*\[/ && (" " $0 " ") ~ /[^A-Za-z0-9_]doc[^A-Za-z0-9_]/ {
 
 { flush() }
 
-END { flush() }
+END { attrend(); flush() }
