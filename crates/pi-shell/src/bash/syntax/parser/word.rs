@@ -604,10 +604,13 @@ impl<'s> Parser<'s> {
 	/// The quoted construct starting at `c` (`'`, `"` or a backquote).
 	/// `dq`: inside double quotes (single quotes are literal there).
 	fn quoted_part(&mut self, c: u8, dq: bool) -> PResult<Id<Part>> {
+		// bash's `parse_matched_pair` starts at the line `line_number` holds
+		// once the quote is read: the quote's own line, also when it opens
+		// a line.
+		self.bump();
 		let line = self.bash_line();
 		match c {
 			b'\'' if !dq => {
-				self.bump();
 				let mut s = SmallBytes::new();
 				loop {
 					let buf: &'s [u8] = self.buf;
@@ -639,7 +642,6 @@ impl<'s> Parser<'s> {
 				}
 			},
 			b'"' => {
-				self.bump();
 				let parts = self.parts_until_line(Stop::DQuote { all: false }, line)?;
 				Ok(self.t.group_part(GroupPk::DQuote, parts))
 			},
@@ -664,11 +666,10 @@ impl<'s> Parser<'s> {
 		Span::new(at, at)
 	}
 
-	/// `` `…` ``: the raw text (bash keeps it verbatim) and its body, parsed
-	/// from the text with `\$`, `` \` ``, `\\` (and `\"` inside `"…"`)
-	/// unescaped.
+	/// `` `…` `` after its opening backquote: the raw text (bash keeps it
+	/// verbatim) and its body, parsed from the text with `\$`, `` \` ``,
+	/// `\\` (and `\"` inside `"…"`) unescaped.
 	fn backquote(&mut self, line: u32, dq: bool) -> PResult<Id<Part>> {
-		self.bump();
 		let text_lo = self.off();
 		let mut text = Vec::new();
 		loop {

@@ -116,6 +116,21 @@ fn syntax_errors_match_bash_messages_and_lines() {
 	assert_err(b"echo a\nfor x in 1; echo; done", 2, "syntax error near unexpected token `echo'");
 }
 
+/// A quote that opens a line starts on that line: bash's
+/// `parse_matched_pair` takes `line_number` once it has read the quote, and
+/// reading the quote reads its line. Measured with bash 5.3.20 under `-c`
+/// and from a script file (the last two as a compound array value given as
+/// a string, which the engine parses in this wrapper).
+#[test]
+fn a_quote_that_opens_a_line_starts_on_it() {
+	assert_err(b"echo l1\n\"abc", 2, "unexpected EOF while looking for matching `\"'");
+	assert_err(b"echo l1\n'abc", 2, "unexpected EOF while looking for matching `''");
+	assert_err(b"echo l1\n`abc", 2, "unexpected EOF while looking for matching ``'");
+	assert_err(b"echo l1\nx=(1\n\"2)", 3, "unexpected EOF while looking for matching `\"'");
+	assert_err(b"declare __=(1\n'2)\n", 2, "unexpected EOF while looking for matching `''");
+	assert_err(b"declare __=(1\n`2)\n", 2, "unexpected EOF while looking for matching ``'");
+}
+
 #[test]
 fn token_errors_echo_the_line_but_eof_errors_do_not() {
 	assert!(err(b"echo a; fi").echoes_line());
