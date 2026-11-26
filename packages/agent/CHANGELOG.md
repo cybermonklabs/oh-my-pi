@@ -13,6 +13,7 @@
 ### Fixed
 
 - Counting a tool call whose arguments nest more than 40,000 levels deep (a resumed session can hold one) no longer fails with `Maximum call stack size exceeded`, which failed the first prompt after the resume, each turn's end, compaction and every context-usage reading
+- Compaction of a conversation holding a tool call whose arguments nest more than about 40,000 levels deep no longer fails with `Maximum call stack size exceeded` while it writes the conversation for the summary or for OpenAI remote compaction, and counting the tokens of a message whose tool call nests more than 10,000 levels deep no longer first spends up to seconds in a `JSON.stringify` that runs out of stack (1.4 s per count at 50,000 levels), which every request of such a session paid
 - With `provider.appendOnlyContext` on, a request no longer fails with `Maximum call stack size exceeded` when the conversation holds a tool call whose arguments nest more than 40,000 levels deep
 - Steering and follow-ups drained for the next turn now return to their queue when the run is aborted before that turn starts, including while `/pause` holds it, instead of being recorded with no reply ([#17399](https://github.com/can1357/oh-my-pi/pull/17399) by [@sjawhar](https://github.com/sjawhar))
 - A run aborted before its next turn starts, with nothing left to answer once its drained steering or follow-ups go back to their queue, now ends without an empty aborted turn, as it already did when the abort came at the turn boundary

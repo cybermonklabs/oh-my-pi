@@ -10,6 +10,7 @@ import {
 	parseStreamingJson,
 	parseStreamingJsonThrottled,
 	type ServerSentEvent,
+	stringifyDeepJson,
 } from "@oh-my-pi/pi-utils";
 import { renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
@@ -470,10 +471,17 @@ function normalizeStreamingContentText(content: unknown): string {
 	return "";
 }
 
+/**
+ * Each request replays every earlier tool call's arguments, which are any JSON: arguments nested past
+ * `JSON.stringify`'s recursion skip the attempt that would run out of stack (1.5 s or more each time)
+ * and go to the deep writer.
+ */
+const TOOL_ARGUMENTS_JSON = { probeDepth: true } as const;
+
 function serializeToolArguments(value: unknown): string {
 	if (value && typeof value === "object" && !Array.isArray(value)) {
 		try {
-			return JSON.stringify(value);
+			return stringifyDeepJson(value, TOOL_ARGUMENTS_JSON) ?? "{}";
 		} catch {
 			return "{}";
 		}
@@ -485,7 +493,7 @@ function serializeToolArguments(value: unknown): string {
 		try {
 			const parsed = JSON.parse(trimmed);
 			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-				return JSON.stringify(parsed);
+				return stringifyDeepJson(parsed, TOOL_ARGUMENTS_JSON) ?? "{}";
 			}
 		} catch {}
 		return "{}";

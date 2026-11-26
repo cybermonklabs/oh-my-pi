@@ -1,12 +1,13 @@
 import { describe, expect, it, type Mock, vi } from "bun:test";
 import type { Agent, AgentEvent, AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, AssistantMessageEvent } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, AssistantMessageEvent, ToolCall } from "@oh-my-pi/pi-ai";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session-events";
 import { TtsrCoordinator, type TtsrCoordinatorHost } from "@oh-my-pi/pi-coding-agent/session/ttsr-coordinator";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 
 const CONDITION = "FORBIDDEN";
 
@@ -358,6 +359,26 @@ describe("TTSR stream buffers", () => {
 
 		const isTrigger = (event: AgentSessionEvent): boolean => event.type === "ttsr_triggered";
 		expect(emitSessionEvent.mock.calls.filter(([event]) => isTrigger(event))).toHaveLength(1);
+	});
+
+	it("matches a rule at the bottom of toolcall_end arguments nested past JSON.stringify's reach", async () => {
+		const { coordinator, emitSessionEvent } = coordinatorFor("tool:mcp");
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call-1",
+			name: "mcp",
+			arguments: nestedChain({ leaf: CONDITION }),
+		};
+		const message = assistantMessage([toolCall]);
+
+		coordinator.onTurnStart();
+		coordinator.onAssistantMessageStart();
+		// No deltas arrive, so the final arguments alone seed the snapshot.
+		await coordinator.checkMessageUpdate(
+			update(message, { type: "toolcall_end", contentIndex: 0, partial: message as never, toolCall }),
+		);
+
+		expect(emitSessionEvent.mock.calls.filter(([event]) => event.type === "ttsr_triggered")).toHaveLength(1);
 	});
 });
 

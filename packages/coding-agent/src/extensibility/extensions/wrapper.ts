@@ -10,7 +10,7 @@ import {
 	type ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
-import { prompt, sanitizeText, untilAborted, toError } from "@oh-my-pi/pi-utils";
+import { jsonDeepEquals, prompt, sanitizeText, untilAborted, toError } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
 import {
@@ -380,7 +380,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// approval also satisfies explicit prompts, but compares against a deep
 		// snapshot because handlers can mutate the original argument object in
 		// place. Denies were enforced above, and provider safety checks remain
-		// independently required.
+		// independently required. Both sides are JSON data, as deep as a
+		// transcript line holds.
 		const policyKey = resolved.policyKey ?? this.tool.name;
 		const explicitPrompt =
 			resolved.override || (Object.hasOwn(userPolicies, policyKey) && policyKey !== context?.xdevPolicyKey);
@@ -388,7 +389,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const acpBypass =
 			context !== undefined &&
 			Object.hasOwn(context, "acpApprovedArgs") &&
-			Bun.deepEquals(effectiveParams, context.acpApprovedArgs);
+			jsonDeepEquals(effectiveParams, context.acpApprovedArgs);
 		// Only a prompt `always-ask-cached` itself raised can be remembered by target; provider safety
 		// checks are per-call, so they never offer a grant of any kind.
 		const grantable =

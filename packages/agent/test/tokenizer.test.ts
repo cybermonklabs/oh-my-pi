@@ -969,29 +969,41 @@ function inToolResultImageEstimate(tokenizer: Tokenizer): number {
 // A tool call's arguments are any JSON and a transcript line holds them as deep as `JSON.parse` reads; the count
 // runs on the first prompt after a resume, at each turn's end and for every context-usage reading.
 describe("Tokenizer on a tool call nested past where JSON.stringify stops", () => {
+	const call = (args: Record<string, unknown>) =>
+		({
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: args }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 1,
+		}) as AgentMessage;
+
 	test("counts the JSON text of arguments nested 50,000 levels", () => {
 		const deep = nestedChain({ leaf: "bottom" });
-		const call = (args: Record<string, unknown>) =>
-			({
-				role: "assistant",
-				content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: args }],
-				api: "anthropic-messages",
-				provider: "anthropic",
-				model: "claude-sonnet-4-5",
-				usage: {
-					input: 1,
-					output: 1,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 2,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "toolUse",
-				timestamp: 1,
-			}) as AgentMessage;
 		const tokenizer = new Tokenizer();
 		// `{"next":` is 8 bytes a level: 400,000 bytes of JSON text, far more tokens than the shallow call's.
 		expect(tokenizer.countMessage(call(deep))).toBeGreaterThan(50_000);
 		expect(tokenizer.countMessage(call({ leaf: "bottom" }))).toBeLessThan(100);
+	}, 20_000);
+
+	// Every request of such a session counts the message: a `JSON.stringify` attempt on the arguments runs out of
+	// stack only after about 1.4 s at this depth, so the count goes to the deep writer without one.
+	test("writes arguments nested 50,000 levels without a JSON.stringify attempt", () => {
+		const deep = nestedChain({ leaf: "bottom" });
+		const stringify = vi.spyOn(JSON, "stringify");
+
+		new Tokenizer().countMessage(call(deep));
+
+		expect(stringify.mock.calls.some(([value]) => value === deep)).toBe(false);
 	}, 20_000);
 });

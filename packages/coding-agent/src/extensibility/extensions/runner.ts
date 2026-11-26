@@ -30,7 +30,7 @@ import {
 import { addKeyAliases, canonicalKeyId, type KeyId, type Keybinding } from "@oh-my-pi/pi-tui";
 import { KEYBINDINGS, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appApproveKeys, appFollowUpKeys } from "@oh-my-pi/pi-tui/keybinding-matchers";
-import { logger } from "@oh-my-pi/pi-utils";
+import { jsonDeepEquals, logger, structuredCloneDeep } from "@oh-my-pi/pi-utils";
 import { refreshShellConfigCache } from "@oh-my-pi/pi-utils/procmgr";
 import { MAIN_AGENT_RULE_NAME } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
@@ -2186,8 +2186,10 @@ export class ExtensionRunner {
 	 *
 	 * Handlers see a structured clone, but the result is rebuilt from the
 	 * original blocks: unchanged blocks keep their identity and symbol-keyed
-	 * provider markers (e.g. `kCursorExecResolved`, which `structuredClone`
-	 * drops and without which agent-loop re-runs Cursor-settled tool calls).
+	 * provider markers (e.g. `kCursorExecResolved`, which a copy drops and
+	 * without which agent-loop re-runs Cursor-settled tool calls). The copies
+	 * and comparisons reach any depth: a tool call's arguments are any JSON,
+	 * as deep as a transcript line holds.
 	 */
 	async emitAssistantMessage(
 		message: AssistantMessage,
@@ -2220,7 +2222,7 @@ export class ExtensionRunner {
 				if (signal?.aborted) break extensions;
 				// Detach the whole message, not just `content`: in-place edits to `usage`
 				// or other fields must not leak into the finalized message.
-				const presented = structuredClone({ ...message, content: currentContent() });
+				const presented = structuredCloneDeep({ ...message, content: currentContent() });
 				const event: AssistantMessageRewriteEvent = { type: "assistant_message", message: presented };
 				const result = (await this.#runHandlerWithTimeout(
 					handler,
@@ -2235,18 +2237,18 @@ export class ExtensionRunner {
 				if (result?.content === undefined) continue;
 				const replacement = result.content;
 				// Compare against a fresh clone: the handler may have mutated `presented`.
-				const expected = structuredClone(currentContent());
+				const expected = structuredCloneDeep(currentContent());
 				if (
 					!Array.isArray(replacement) ||
 					replacement.length !== expected.length ||
 					replacement.some((block, index) => {
 						const previous = expected[index];
 						if (!block || typeof block !== "object" || block.type !== previous?.type) return true;
-						if (block.type !== "text") return !Bun.deepEquals(block, previous);
+						if (block.type !== "text") return !jsonDeepEquals(block, previous);
 						return (
 							typeof block.text !== "string" ||
 							previous?.type !== "text" ||
-							!Bun.deepEquals(textMetadata(block), textMetadata(previous))
+							!jsonDeepEquals(textMetadata(block), textMetadata(previous))
 						);
 					})
 				) {
@@ -2534,7 +2536,9 @@ export class ExtensionRunner {
 
 		let currentMessages: AgentMessage[];
 		try {
-			currentMessages = structuredClone(messages);
+			// As `structuredClone` copies (a Map in a tool result's details stays one), at any depth a
+			// transcript line holds: a tool call's arguments are any JSON.
+			currentMessages = structuredCloneDeep(messages);
 		} catch {
 			// Messages may contain non-cloneable objects (e.g. in ToolResultMessage.details
 			// or ProviderPayload). Fall back to a shallow array clone — extensions should
@@ -2572,7 +2576,7 @@ export class ExtensionRunner {
 						const historyIndex = getContextHistoryIndex(previousMessage);
 						if (historyIndex === undefined) continue;
 						setContextHistoryIndex(message, historyIndex);
-						if (!Bun.deepEquals(message, previousMessage)) clearContextHistoryIndex(message);
+						if (!jsonDeepEquals(message, previousMessage)) clearContextHistoryIndex(message);
 					}
 					currentMessages = nextMessages;
 				}
@@ -2583,7 +2587,7 @@ export class ExtensionRunner {
 			const historyIndex = getContextHistoryIndex(message);
 			const historyMessage = historyIndex === undefined ? undefined : messages[historyIndex];
 			if (historyMessage && historyIndex !== undefined) setContextHistoryIndex(historyMessage, historyIndex);
-			const unchanged = historyMessage !== undefined && Bun.deepEquals(message, historyMessage);
+			const unchanged = historyMessage !== undefined && jsonDeepEquals(message, historyMessage);
 			clearContextHistoryIndex(message);
 			if (historyMessage) clearContextHistoryIndex(historyMessage);
 			if (!unchanged) markPerCallContextMessage(message);

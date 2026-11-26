@@ -31,6 +31,7 @@
 ### Fixed
 
 - Fixed `cloneJsonTree` failing with `Maximum call stack size exceeded` on a tree nested more than about 22,500 levels deep; it keeps its own stack, and a cycle throws a `TypeError`
+- Fixed the ACP `ndJsonStream` transport failing with `Maximum call stack size exceeded` on a message nested more than about 40,000 levels deep; it writes the message with `stringifyDeepJson`
 - Fixed `stringifyDeepJson` writing a value a second time, and so calling its `toJSON` methods and getters again, when one of them threw a `RangeError`; only the engine's stack overflow (`Maximum call stack size exceeded`) now falls back to the iterative writer
 - Fixed `nestsDeeperThan`, and so `stringifyDeepJson`'s `space` and `probeDepth`, calling a value's getters: a getter ran twice and a second read could answer differently, one behind a `toJSON` that `JSON.stringify` never reads could throw, and an array was read through an iterator `JSON.stringify` never calls. The check now reads own data properties only, and skips an object whose `toJSON` is a function, as `JSON.stringify` does; a field named `toJSON` that holds data, as `JSON.parse` makes of one, is a key like any other
 - Fixed `extractRetryHint` ignoring a wait or reset window stated as a Go duration such as `try again in 6m0s`, `try again in 1m30s` or `resets in 1h30m`: its parts now add up, so a caller waits the time the provider states instead of its own backoff
