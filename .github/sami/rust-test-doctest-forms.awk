@@ -24,14 +24,16 @@
 # and without it, and either reading's finding counts. A doc attribute's
 # one-line string literal is doc text (\n, \t, \\, \" and \' decoded); any
 # other value (include_str!, concat!, a macro's $variable, a literal over
-# lines or with another escape) is `unread`.
+# lines or with another escape), or a second doc attribute on its line, is
+# `unread`.
 # In the doc text, a fenced block (``` or ~~~, after any indent, `>` or list
 # marker) is a doctest unless its info string names only plain lowercase
 # words none of which is a Rust one (text, sh, toml: not Rust to rustdoc),
 # or has a bare `ignore` (rustdoc lists it as ignored and runs nothing).
 # no_run and compile_fail make a doctest that is compiled and not run; its
-# lines are read all the same. A Rust block ends only at a closing fence at
-# its own block quote depth; any other block, at any fence-like line. An
+# lines are read all the same. A Rust block ends only at a closing fence
+# CommonMark takes (at its own block quote depth, at most 3 spaces in, no
+# list marker); any other block, at any fence-like line. An
 # indented code block (4 columns past
 # the text's least indent, after a blank line, a heading or a fence) is a
 # doctest too. Hidden lines (`# ...`) are code, and are read. A runnable
@@ -125,13 +127,35 @@ function quotes(r,    pre) {
 	return gsub(/>/, ">", pre)
 }
 
+# closes(r, base, oq, fch, run): r closes a Rust block opened at block quote
+# depth oq with the fence run: past the text's indent (base) and oq quote
+# markers, at most 3 spaces, then a fence of the same character at least as
+# long, and nothing else. A line with a list marker, 4 or more spaces, a tab
+# or another depth is the block's code.
+function closes(r, base, oq, fch, run,    rr, k, q) {
+	rr = r
+	k = 0
+	while (k < base && substr(rr, 1, 1) == " ") { rr = substr(rr, 2); k++ }
+	q = 0
+	while (match(rr, /^ ? ? ?>/)) {
+		rr = substr(rr, RLENGTH + 1)
+		if (substr(rr, 1, 1) == " ") rr = substr(rr, 2)
+		q++
+	}
+	if (q != oq || rr ~ /^ ? ? ?\t/) return 0
+	k = lead(rr)
+	if (k < 0 || k > 3) return 0
+	rr = substr(rr, k + 1)
+	return substr(rr, 1, length(run)) == run && rr ~ ("^" (fch == "`" ? "`" : "~") "+[ \t]*$")
+}
+
 # readtext(first): read text[1..ndoc] as one Markdown text. A Rust block
-# (one rustdoc runs or compiles) ends only at a closing fence at its own
-# block quote depth, so a fence-like line deeper or shallower in it (in a
-# string, say) is read as its code; any other block ends at any fence-like
-# line, so what follows is read as text. Both read more where they guess.
-# The lines of a block rustdoc compiles and does not run are read too: its
-# info string may say no_run in a comment or a class rustdoc reads as such.
+# (one rustdoc runs or compiles) ends only at a line closes() takes as its
+# closing fence, so a fence-like line in it (in a string, say) is read as
+# its code; any other block ends at any fence-like line, so what follows is
+# read as text. Both read more where they guess. The lines of a block
+# rustdoc compiles and does not run are read too: its info string may say
+# no_run in a comment or a class rustdoc reads as such.
 function readtext(first,    i, r, t, k, base, infence, fch, flen, run, info, kd, prevopen, code, blank, open, oq) {
 	base = -1
 	for (i = 1; i <= ndoc; i++) {
@@ -146,7 +170,7 @@ function readtext(first,    i, r, t, k, base, infence, fch, flen, run, info, kd,
 		sub(/^[ \t>]*/, "", t)
 		while (match(t " ", /^([-*+]|[0-9]+[.)])[ \t]+/)) { t = substr(t, RLENGTH + 1); sub(/^[ \t]+/, "", t) }
 		if (infence) {
-			if (substr(t, 1, flen) == run && t ~ ("^" (fch == "`" ? "`" : "~") "+[ \t]*$") && (!(kd == "run" || kd == "build") || quotes(r) == oq)) { infence = 0; prevopen = 1; continue }
+			if ((kd == "run" || kd == "build") ? closes(r, base, oq, fch, run) : (substr(t, 1, flen) == run && t ~ ("^" (fch == "`" ? "`" : "~") "+[ \t]*$"))) { infence = 0; prevopen = 1; continue }
 			if (kd == "run" || kd == "build") forms(docfile[i], docline[i], r)
 			continue
 		}
@@ -257,10 +281,32 @@ plain {
 	next
 }
 
-# A doc attribute: its one-line string literal is doc text; any other value
-# is unread.
-(" " $0) ~ /[\[(,][ \t]*doc[ \t]*=/ {
+# A doc attribute: a line with `#` and the word doc. A line with /* or */ on
+# it (a comment between tokens, or one in a string: this reader does not
+# tell them apart), with the word doc more than once (another attribute,
+# split or not, may be beside it), or with a doc at its end or before a //
+# comment (its `=` may follow on the next line), is unread; one `doc =` with
+# a one-line string literal is doc text; any other value is unread. Only a
+# lone doc followed by `(`, `)`, `]` or `,` (#[doc(hidden)], #[cfg(doc)])
+# carries no doc text; any other use of the word (r#doc =, say) is unread.
+$0 ~ /#[ \t]*!?[ \t]*\[/ && (" " $0 " ") ~ /[^A-Za-z0-9_]doc[^A-Za-z0-9_]/ {
 	s = $0
+	nd = 0
+	m = split(s, tok, /[^A-Za-z0-9_]+/)
+	for (j = 1; j <= m; j++) if (tok[j] == "doc") nd++
+	t = " " s
+	n = gsub(/[\[(,][ \t]*doc[ \t]*=/, "&", t)
+	if (nd == 1 && n == 0 && (" " s) ~ /[^A-Za-z0-9_#]doc[ \t]*[](),]/ && !index(s, "/*") && !index(s, "*/")) {
+		# No doc text here; an attribute or code line as any other.
+		if ($0 ~ /^[ \t]*#!?[ \t]*\[/) next
+		flush()
+		next
+	}
+	if (nd != 1 || n != 1 || index(s, "/*") || index(s, "*/")) {
+		flush()
+		out("unread", FILENAME, FNR, "a doc attribute this reader does not read (a /* or */ on its line, the word doc more than once, or `doc` and `=` apart)")
+		next
+	}
 	sub(/.*[\[(,][ \t]*doc[ \t]*=[ \t]*/, "", s)
 	k = (" " $0) ~ /#![ \t]*\[/ ? "inner" : "outer"
 	v = literal(s)

@@ -671,10 +671,10 @@ run J109-no-ignore-doc-blocks 0 '```ignore doc blocks, not tests, marked ignore 
 CARGO_MODE=ignored-and-doc-ignored NOT_MSG='ignore doctest|src/lib.rs - g.*(fail|runs in no invocation)' run J112-ignore-doc-block-passes-ignored-cargo-test-fails 1 "sdk/rust/demo:test:wire a::slow is #\\[ignore\\]d and runs in no invocation" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 # B3: on Linux the crates' doctests run only in Bazel: the stub refuses a
 # cargo test --doc of a crate under crates/ there (W1 shows none ran), and
-# the job reads the doctests from the source instead (W1-W23 below).
+# the job reads the doctests from the source instead (W1-W31 below).
 # B4: the listings the macOS job's inventory reads.
 run J108-listings-for-macos 0 'Listings for the macOS inventory: 2 binaries' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
-# W1-W23: on Linux each crate with a Bazel doctest target has its doctests
+# W1-W31: on Linux each crate with a Bazel doctest target has its doctests
 # read from its source (.github/sami/rust-test-doctest-forms.awk, no build):
 # a line of a doctest rustdoc runs that prints or holds a skip word fails the
 # job, named by file and line; a doc attribute the reader does not read
@@ -710,6 +710,22 @@ DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/// ```\n//
 # a doctest does not end it.
 DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n//! ```rust (reason no_run here)\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W22-no-run-block-that-prints-fails 1 'crates/pi-diff/src/lib.rs:7: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let _ = r#"\n//! > ```\n//! > ```text\n//! "#;\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W23-quoted-fence-inside-a-doctest-fails 1 'crates/pi-diff/src/lib.rs:8: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# W24, W25, from its third round: a fence-like line 4 spaces in, or after a
+# list marker, inside a doctest does not end it either.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let _ = r#"\n//!     ```\n//!     ```text\n//! "#;\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W24-indented-fence-like-lines-inside-a-doctest-fail 1 'crates/pi-diff/src/lib.rs:8: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let _ = r#"\n//! - ```\n//! - ```text\n//! "#;\n//! println!("missed");\n//! ```\npub fn f() {}' NOT_MSG='stub:' run W25-list-marked-fence-like-lines-inside-a-doctest-fail 1 'crates/pi-diff/src/lib.rs:8: a doctest rustdoc runs prints' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# W26, from its fourth round: two doc attributes on one line.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc = "```\\nprintln!(\\"missed\\");\\n```"] #[doc = "<!--\\n```\\nassert!(true);\\n```\\n-->"]\npub fn f() {}' NOT_MSG='stub:' run W26-two-doc-attributes-on-a-line-are-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute this reader does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# W27-W29, from its fifth and sixth rounds: a comment between doc and its
+# `=`, alone or beside another attribute, and comment markers in a string;
+# a doc attribute line with /* or */ on it is unread.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc /* gap */ = "```\\nprintln!(\\"missed\\");\\n```"] #[doc = "<!--\\n```\\nassert!(true);\\n```\\n-->"]\npub fn f() {}' NOT_MSG='stub:' run W27-doc-attribute-with-a-comment-before-its-equals-is-read 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute this reader does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc /* gap */ = "```\\nprintln!(\\"x\\");\\n```"]\npub fn f() {}' NOT_MSG='stub:' run W28-doc-attribute-with-a-comment-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute this reader does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc = "```\\nlet _ = \\"/*\\"; println!(\\"missed\\"); let _ = \\"*/\\";\\n```"]\npub fn f() {}' NOT_MSG='stub:' run W29-comment-markers-in-a-doc-attribute-string-are-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute this reader does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# W30, from its seventh round: an attribute split over lines beside another.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#[doc = "```"] #[doc\n= "println!(\\"missed\\");"] #[doc = "```"]\npub fn f() {}' NOT_MSG='stub:' run W30-split-doc-attribute-beside-another-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:6: a doc attribute this reader does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# W31, from its eighth round: a raw identifier, r#doc.
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n/// ```\n#[r#doc = "println!(\\"missed\\");"]\n/// ```\npub fn f() {}' NOT_MSG='stub:' run W31-raw-identifier-doc-attribute-is-unread 1 'UNKNOWN: crates/pi-diff/src/lib.rs:7: a doc attribute this reader does not read' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 # R3-1: a line a test binary writes outside libtest's record (a child's or a
 # thread's write to the inherited stream) is a skip if it has a skip word,
 # and must match rust-test-known-raw-output.txt otherwise, or the job fails.
