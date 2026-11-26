@@ -480,40 +480,55 @@ replaced under a session that went on in a sibling (see above).
 
 ## CLI `--session-id`
 
-`--session-id <uuid>` starts a new session whose header and file name carry that
-id instead of a generated one, for a launcher that records the id before the
-session starts. The value must be a lowercase UUID (`8-4-4-4-12` hex digits).
+`--session-id <uuid>` resumes the session that holds that id, or starts a new
+session whose header and file name carry it instead of a generated id. A
+launcher records the id before the first launch and runs the same command for
+every later one. The value must be a lowercase UUID (`8-4-4-4-12` hex digits).
 Any other value, or the flag with no value, is a usage error raised while the
 arguments are parsed, so no other session flag acts first.
 
-`createSessionManager()` calls `SessionManager.createWithSessionId()`. It creates
-the session object without touching the terminal's last-session record, claims the
-id's ownership lease for this process, and then asks whether a stored session
-already holds the id, the way `--resume <id>` would find it (`resolveResumeTarget`
-with `exactId`: the same scopes and storage, matched by the exact id rather than a
-prefix, the unlisted-file probe and the `gc --archive` archive included). If another
-live process owns the id, or a stored session holds it, startup fails with
-`Session "<id>" already exists; resume it with --resume <id>.` and exit status 1,
-before any model call. A refused launch writes nothing: no session file, and no
-change to the terminal's record that `--continue` reads. Otherwise the session's
-header is written at once, rather than with its first entry, so a later launch
-under the same id finds it taken, and only then is the terminal's record updated.
+`createSessionManager()` first looks for a stored session that holds the id, as
+`--resume <id>` opens a whole id: exactly that session (`resolveResumableSession`
+with `exactId`, the session storage's scopes, no continuation followed), else a
+file named for the id that no longer reads as a session, through the copy that
+continues it (`resolveResumeTarget` with `exactId`). It opens that session as
+`--resume <id>` does, the moved-directory prompt included, and claims it as an
+explicit resume does (`claimOpenedSession`).
+
+When no stored session holds the id, `SessionManager.createWithSessionId()`
+creates the session object without touching the terminal's last-session record,
+claims the id's ownership lease for this process (on SQL storage, the claim the
+database confirms), and asks again whether a stored session holds the id. If one
+does now, the launch resumes it. Otherwise the session's header is written at
+once, rather than with its first entry, so a later launch under the same id finds
+it, and only then is the terminal's record updated.
 
 The header is first published on the condition that its file does not exist yet,
 so a launch that drew the same file name (the same id at the same millisecond)
-fails there with the same message. A store with no ownership lease
-(`session.storage: sql`) still cannot make the held check atomic for two different
-file names: there each launch reads the store again once its own header is
-durable, and withdraws, deleting the header it wrote and failing with the same
-message, when another session is named for the id. At most one of them goes on;
-two that each see the other both fail.
+loses there. A store with no ownership lease (a SQL store built without `claims`)
+still cannot make the held check atomic for two different file names: there each
+launch reads the store again once its own header is durable, and withdraws,
+deleting the header it wrote, when another session is named for the id. At most
+one of them goes on; two that each see the other both lose. A launch that loses
+either way is refused as below: the other launch is creating the session now.
 
-`--session-id` starts a new session, so it is refused beside every other session
-selector: `--resume`/`-r`/`--session`, `--restore`, `--continue`/`-c`, `--fork`,
-`--no-session`, `--from-claude` and `--from-codex`. It is also refused in ACP mode
-(`--mode acp`, `omp acp`), which starts a session for each client request. A
-launcher starts a session with `--session-id <id>` and later resumes it with
-`--resume <id>`.
+Either way the session must be this process's. Before it opens a stored session,
+the launch claims it. While another live omp process owns it (holds its ownership
+lease), a resume would write this process's turns to a new sibling session under
+another id, or, under `OMP_SESSION_EXCLUSIVE=1`, stop at its first write. So the
+launch first waits for a holder that is ending, as an explicit resume does (on
+PostgreSQL and MySQL up to 35 s for its lease row to expire, saying so on stderr;
+on a SQLite file briefly, since its OS lock drops when the holder exits; on file
+storage only under `OMP_SESSION_EXCLUSIVE=1`), and then is refused, before any
+model call, with exit status 1 and
+`Session "<id>" is open in another running omp process. Stop that process, then run this command again to resume it.`
+A refused launch writes nothing: no session file, no change to the other
+process's session, and no change to the terminal's record that `--continue` reads.
+
+`--session-id` selects its session itself, so it is refused beside every other
+session selector: `--resume`/`-r`/`--session`, `--restore`, `--continue`/`-c`,
+`--fork`, `--no-session`, `--from-claude` and `--from-codex`. It is also refused in
+ACP mode (`--mode acp`, `omp acp`), which starts a session for each client request.
 
 ## CLI `--restore`
 

@@ -2,11 +2,12 @@
  * t-e-38's fresh-session row in its `--session-id X` form: a session started
  * with `--session-id` on SQL session storage takes its lease at its first
  * write, so another process's `--resume` of the id waits and moves off, and
- * another process's `--session-id` of the id is refused. `--session-id`
- * comes from 06f00eba, so this file exists only where the claim and it are
- * both present: the cut that composes them adds it. SQLite always;
- * PostgreSQL and MySQL when `OMP_TEST_SQL_POSTGRES_URL` /
- * `OMP_TEST_SQL_MYSQL_URL` name a database.
+ * another process's `--session-id` of the id waits as that resume does and is
+ * then refused, writing nothing. Once the first process lets the session go,
+ * `--session-id` of the id resumes it. `--session-id` comes from 06f00eba, so
+ * this file exists only where the claim and it are both present: the cut that
+ * composes them adds it. SQLite always; PostgreSQL and MySQL when
+ * `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a database.
  */
 import { describe, expect, it } from "bun:test";
 import { LEASE_BACKENDS, LeaseProcess, openLeaseDb } from "./sql-session-lease-fixture";
@@ -41,7 +42,20 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 
 			await using third = await LeaseProcess.start(config, db.dir.join("third"));
 			const refused = await third.run({ op: "resume", args: ["--session-dir", dir, "--session-id", ID], cwd });
-			expect(refused.error).toContain(`Session "${ID}" already exists`);
-		}, 120_000);
+			expect(refused.error).toContain(`Session "${ID}" is open in another running omp process.`);
+			expect(await db.row(started.sessionFile ?? ""), "the refused launch wrote nothing").toEqual(before);
+			expect(await db.paths(), "no session but the two of before").toHaveLength(2);
+
+			// The first process lets the session go: the same command now resumes it under its own id.
+			await first.run({ op: "closeHeld" });
+			await using fourth = await LeaseProcess.start(config, db.dir.join("fourth"));
+			const reopened = await fourth.run({ op: "resume", args: ["--session-dir", dir, "--session-id", ID], cwd });
+			expect([reopened.error, reopened.sessionId, reopened.sessionFile]).toEqual([
+				undefined,
+				ID,
+				started.sessionFile,
+			]);
+			expect((await db.row(started.sessionFile ?? ""))?.content).toContain(`resumed by ${fourth.pid}`);
+		}, 240_000);
 	});
 }

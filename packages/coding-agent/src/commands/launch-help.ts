@@ -72,8 +72,7 @@ export const launchHelp = {
 		"from-codex": Flags.boolean({ description: "Import a Codex session into OMP" }),
 		"session-dir": Flags.string({ description: "Directory for session storage and lookup" }),
 		"session-id": Flags.string({
-			description:
-				"Start a new session under this id (a lowercase UUID); refused when a stored session already holds it",
+			description: "Resume the session with this id (a lowercase UUID), or start a new session under it",
 		}),
 		"no-session": Flags.boolean({ description: "Don't save session (ephemeral)" }),
 		models: Flags.string({ description: `Comma-separated model patterns for ${formatKeyHint("ctrl+p")} cycling` }),
