@@ -90,8 +90,10 @@ pub enum Owner {
 	},
 }
 
-/// [`apply`] for a subshell, whose redirections bash applies in the child
-/// after the fork: a `$RANDOM` they expand draws from a copy of the
+/// [`apply`] for redirections bash applies in a child after its fork: a
+/// subshell's own, and those of a simple command bash forks for first (an
+/// external, a name not found, `command X`, a null command that
+/// [`null_forks`]). A `$RANDOM` they expand draws from a copy of the
 /// generator, as a fork's ([`Kernel::fork_clock`]), and a lookup of
 /// `RANDOM` or `SECONDS` leaves the shell's value cell alone
 /// ([`Kernel::redirs_in_child`]). The shell's generator and clock are back

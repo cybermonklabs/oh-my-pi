@@ -438,6 +438,32 @@ fn random_in_a_subshells_redirections_is_the_childs() {
 	}
 }
 
+/// bash makes the redirections of a simple command it forks for first in
+/// the fork: a name not found, `command` with one, a null command that
+/// redirects fd 0 or a `{var}` (and an external). A `$RANDOM` there draws
+/// from the child's generator and leaves the shell's sequence alone. A null
+/// command that redirects fd 1, a builtin's, a function's, a subshell's
+/// and a background job's draw as before. Goldens from bash 5.3.20.
+#[test]
+fn random_in_a_forked_commands_redirections_is_the_childs() {
+	for (form, want) in [
+		("nosuch 2> e$RANDOM", "[] 18498\n"),
+		("command nosuch 2> e$RANDOM", "[] 18498\n"),
+		(": > f; < f${RANDOM:0:0}", "[] 18498\n"),
+		(": > f; {v}< f${RANDOM:0:0}", "[] 18498\n"),
+		("nosuch 2> e$RANDOM; RANDOM+=1", "[] 2539\n"),
+		// Drawn in the shell, or in a fork either way.
+		("> f$RANDOM", "[] 29338\n"),
+		("true > f$RANDOM", "[] 29338\n"),
+		("f() { :; }; f > f$RANDOM", "[] 29338\n"),
+		("( : ) > f$RANDOM", "[] 18498\n"),
+		("nosuch 2> e$RANDOM & wait", "[] 18498\n"),
+	] {
+		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+}
+
 /// Whether `unset` or an array assignment removed `RANDOM`'s special
 /// meaning is imaged with the generator: a shell snapshotted and restored
 /// at every step keeps a plain `RANDOM` plain. Goldens from bash 5.3.20.

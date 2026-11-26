@@ -622,13 +622,13 @@ pub struct Kernel {
 	/// `dynvars::CELLS` indices): plain variables from then on (kept in
 	/// `MiscKey::CellsPlain`); a forked vproc has its own ([`proc::Clock`]).
 	pub cells_plain:        u16,
-	/// A subshell's redirections are being expanded
-	/// ([`redir::apply_in_child`]): bash expands them in the child, after
-	/// the fork, so a lookup of the special `RANDOM` or `SECONDS` there
-	/// leaves the shell's value cell alone ([`dynvars::store_value`]); the
-	/// vproc's generator and clock are the child's copy then
-	/// ([`Kernel::fork_clock`]). Set only during that call, which restores
-	/// both before it returns; not imaged.
+	/// Redirections bash makes in a child are being expanded (a subshell's
+	/// own, a forked simple command's: [`redir::apply_in_child`]): bash
+	/// expands them in the child, after the fork, so a lookup of the
+	/// special `RANDOM` or `SECONDS` there leaves the shell's value cell
+	/// alone ([`dynvars::store_value`]); the vproc's generator and clock are
+	/// the child's copy then ([`Kernel::fork_clock`]). Set only during that
+	/// call, which restores both before it returns; not imaged.
 	pub redirs_in_child:    bool,
 	/// The arithmetic results a builtin's argument evaluates while
 	/// [`builtins::Ctx::arith_once`] runs ([`expand::arith_value`]): taken

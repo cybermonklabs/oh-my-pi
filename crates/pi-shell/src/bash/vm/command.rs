@@ -282,7 +282,17 @@ pub fn exec(
 						&& op.flags & ir::Op::CAT == 0
 						&& super::redir::null_forks(&unit.redirs[list as usize]);
 					let owner = super::redir::Owner::Simple { null_forks };
-					let res = super::redir::apply(k, vp, cx, unit, list, line, owner);
+					// bash makes the redirections of a command it forks for
+					// first (an external, a name not found, `command X`, a null
+					// command that redirects fd 0 or a `{var}`) in the fork: a
+					// `$RANDOM` they expand draws from the fork's copy of the
+					// generator and leaves the shell's sequence alone
+					// ([`super::redir::apply_in_child`]).
+					let res = if null_forks || forks_for(k, cx, vp) {
+						super::redir::apply_in_child(k, vp, cx, unit, list, line, owner)
+					} else {
+						super::redir::apply(k, vp, cx, unit, list, line, owner)
+					};
 					// Where the hidden scope goes back, for `forget_var_fds`.
 					let scoped = hidden.is_some().then_some(at);
 					if let Some(scope) = hidden {
