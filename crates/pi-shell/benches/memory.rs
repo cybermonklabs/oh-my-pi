@@ -12,16 +12,17 @@
 //!   are measured as above, for [`FEW`] and [`MANY`] vprocs; per vproc is the
 //!   difference over [`MANY`] − [`FEW`] (vproc, job entry, task handle). Back
 //!   to back the shell writes nothing between the forks, so the value is the
-//!   same in every run: target ≤ 2,048 B ([`MAX_VPROC_NOWRITE_BYTES`]), a fixed
-//!   margin that holds in every run: what a fork itself costs. In a loop each
+//!   same in every run, and its target is a ratchet at the measured value
+//!   ([`MAX_VPROC_NOWRITE_BYTES`]) under the 2,048 B ceiling
+//!   ([`VPROC_CEILING_BYTES`]): what a fork itself costs. In a loop each
 //!   vproc also keeps the path to the counter that the shell copied when it
 //!   wrote it after the fork, and the value moves by the shard the hasher puts
 //!   the counter in. The retention line bounds that part alone: the loop value
 //!   that at least [`RETAIN_AT_LEAST`] of [`RETAIN_PROCS`] child processes
 //!   reach (each over [`RETAIN_NAMES`] counter names), less the back-to-back
 //!   value (target [`MAX_RETAINED_BYTES`]). Each target says how it was set.
-//!   The verdicts are printed only: the bench exits 0 on a `MISS`, and nothing
-//!   runs it on its own, so a person or a Job reads them. The line after the
+//!   After its last line the bench exits 1 when it missed a target; nothing
+//!   runs it on its own, so a person or a Job runs it. The line after the
 //!   loop's breaks its difference down by allocation size (8-byte classes, live
 //!   allocations per vproc) to name the structures that cost the bytes, and the
 //!   sizes line gives `size_of` of the engine structures an idle vproc holds
@@ -36,12 +37,12 @@
 //!
 //! ```text
 //! memory shell: … bytes after create + `:` (target ≤ 65536) PASS|MISS; store +… bytes; create + `:` … allocs, … bytes
-//! memory idle vprocs back to back: 16 → … bytes, 272 → … bytes; … bytes per vproc (target ≤ 2048) PASS|MISS
+//! memory idle vprocs back to back: 16 → … bytes, 272 → … bytes; … bytes per vproc (target ≤ 2013, ceiling 2048) PASS|MISS
 //! memory idle vprocs: 16 → … bytes, 272 → … bytes; … bytes per vproc in a loop writing `i` (…)
 //! memory idle vproc allocations by size: 24-31 B ×1.00, …
-//! memory idle vproc retention: … bytes per vproc (loop … B, reached by at least 5 of 128 processes × 16 names, less … B back to back; largest … B; … ms) (target ≤ 682) PASS|MISS
+//! memory idle vproc retention: … bytes per vproc (loop … B, reached by at least 5 of 128 processes × 16 names, less … B back to back; largest … B; … ms) (target ≤ 318) PASS|MISS
 //! memory idle vproc retention classes: per name … B ×…, …; largest per process … B ×…
-//! memory sizes: Vproc … B, Frame … B, Scratch … B, ScratchIo … B, ExecState … B…
+//! memory sizes: Vproc … B, Frame … B, Scratch … B, ScratchIo … B, ExecState … B, Job … B
 //! allocs loop NONE: … allocs/iter, … reallocs/iter, … bytes/iter; per run … allocs
 //! …
 //! ```
@@ -56,7 +57,7 @@ use std::{
 	process::{Command, Stdio},
 	sync::{
 		Arc,
-		atomic::{AtomicUsize, Ordering},
+		atomic::{AtomicBool, AtomicUsize, Ordering},
 	},
 	task::{Context, Poll, Waker},
 	time::Instant,
@@ -188,24 +189,40 @@ impl Counts {
 	}
 }
 
+/// A target was missed: the bench exits 1 after its last line.
+static MISSED: AtomicBool = AtomicBool::new(false);
+
+/// [`verdict`], recording a `MISS` for the exit status.
+fn judged(ok: bool) -> &'static str {
+	if !ok {
+		MISSED.store(true, Ordering::Relaxed);
+	}
+	verdict(ok)
+}
+
 fn live() -> usize {
 	LIVE.load(Ordering::Relaxed)
 }
 
 const MAX_SHELL_BYTES: usize = 64 * 1024;
-/// Bytes per idle vproc forked back to back ([`Fork::Back`]): the measured
-/// value plus a fixed margin of 35 B, so a vproc that grows by more than
-/// 35 B fails it in every run. With no write by the shell between the forks
-/// the value is the same in every run: 2,013 B in 12 of 12 rounds at
-/// 29923cbf and in 3 of 3 at Cut10 chain step 5 (a460228e), whose code it
-/// keeps. Earlier trees, 3 rounds each: 1,921 B at 9058ab9d; 1,889 B once
-/// forked vprocs own copy-on-write images (d2d553c3, Cut7 a72018dd to Cut9
-/// 85936bf7); 1,897 B at chain step 1; 1,909 B at steps 2' to 4. A waiting
-/// `break` (`Vproc::pending_break`, step 1) and bash's kept statuses
-/// (`JobTable::bgp`, step 2), 8 B of `Vproc` each, and each vproc's write
-/// keys (40 B of `Vproc` and one 64-71 B allocation, `Vproc::write_key`,
-/// step 5) added the bytes since d2d553c3.
-const MAX_VPROC_NOWRITE_BYTES: usize = 2048;
+/// The ceiling for [`MAX_VPROC_NOWRITE_BYTES`]: 2 KiB per idle vproc. A raise
+/// of the ratchet never passes it.
+const VPROC_CEILING_BYTES: usize = 2048;
+/// Bytes per idle vproc forked back to back ([`Fork::Back`]): a ratchet at the
+/// measured value, so a vproc that grows by a byte fails it in every run. With
+/// no write by the shell between the forks the value is the same in every
+/// run: 2,013 B in 12 of 12 rounds at 29923cbf and in 3 of 3 at Cut10 chain
+/// step 5 (a460228e), whose code it keeps. Earlier trees, 3 rounds each:
+/// 1,921 B at 9058ab9d; 1,889 B once forked vprocs own copy-on-write images
+/// (d2d553c3, Cut7 a72018dd to Cut9 85936bf7); 1,897 B at chain step 1;
+/// 1,909 B at steps 2' to 4. A waiting `break` (`Vproc::pending_break`, step
+/// 1) and bash's kept statuses (`JobTable::bgp`, step 2), 8 B of `Vproc`
+/// each, and each vproc's write keys (40 B of `Vproc` and one 64-71 B
+/// allocation, `Vproc::write_key`, step 5) added the bytes since d2d553c3. The
+/// commit that adds bytes to a fork raises it, with the bench's numbers, up to
+/// [`VPROC_CEILING_BYTES`].
+const MAX_VPROC_NOWRITE_BYTES: usize = 2013;
+const _: () = assert!(MAX_VPROC_NOWRITE_BYTES <= VPROC_CEILING_BYTES, "past the 2 KiB ceiling");
 /// Bytes per idle vproc that a vproc forked in a loop keeps of the shell's
 /// later writes (the retention line: the loop value its processes reach,
 /// less the back-to-back value). An image shares the shell's maps, and when the
@@ -236,15 +253,13 @@ const MAX_VPROC_NOWRITE_BYTES: usize = 2048;
 /// in one run (a MISS for no change) has a chance near 1e-6, and fewer than
 /// five at the top class (a reading that cannot see) near 4e-7.
 ///
-/// The bound is the top class with one more written variable than the
-/// counter (647 B on this tree's base, 2,660 − 2,013; the same 646 B on
-/// 2de01417, 2,563 − 1,917, as the cause predicts across both bases) plus
-/// the back-to-back margin of 35 B. It allows one more retained entry per
-/// child because #235 writes `_` after every command, so it no longer
-/// catches a second retained entry of up to 337 B at a tree where only the
-/// counter is written (top class 310 B); once #235 is in, it catches any
-/// retention growth over 35 B.
-const MAX_RETAINED_BYTES: usize = 682;
+/// The bound is the measured value plus 8 B, one 8-byte allocation class:
+/// 310 B on this tree's base with the counter alone (2,323 − 2,013), in 40
+/// of 40 runs. A retained allocation that grows by a class, or one more
+/// retained entry (one more variable the shell writes after each fork: 647 B
+/// with one, 2,660 − 2,013), fails it. The commit that adds a retained write
+/// (#235's `_`) raises it, with the bench's numbers.
+const MAX_RETAINED_BYTES: usize = 318;
 /// Child processes the retention line reads.
 const RETAIN_PROCS: usize = 128;
 /// Loop runs, each writing a variable of its own name, in each child.
@@ -450,7 +465,7 @@ fn main() {
 	println!(
 		"memory shell: {shell_bytes} bytes after create + `:` (target ≤ {MAX_SHELL_BYTES}) {}; \
 		 store +{store_bytes} bytes; create + `:` {} allocs, {} reallocs, {} bytes",
-		verdict(shell_bytes <= MAX_SHELL_BYTES),
+		judged(shell_bytes <= MAX_SHELL_BYTES),
 		work.allocs,
 		work.reallocs,
 		work.bytes
@@ -460,8 +475,8 @@ fn main() {
 	let (few, many, back, ..) = per_vproc(&engine, Fork::Back);
 	println!(
 		"memory idle vprocs back to back: {FEW} → {few} bytes, {MANY} → {many} bytes; {back} bytes \
-		 per vproc (target ≤ {MAX_VPROC_NOWRITE_BYTES}) {}",
-		verdict(back <= MAX_VPROC_NOWRITE_BYTES)
+		 per vproc (target ≤ {MAX_VPROC_NOWRITE_BYTES}, ceiling {VPROC_CEILING_BYTES}) {}",
+		judged(back <= MAX_VPROC_NOWRITE_BYTES)
 	);
 	let (few, many, per, few_sizes, many_sizes) = per_vproc(&engine, Fork::Loop("i"));
 	println!(
@@ -501,7 +516,7 @@ fn main() {
 		kids.len(),
 		tops.first().copied().unwrap_or(0),
 		started.elapsed().as_millis(),
-		verdict(retained <= MAX_RETAINED_BYTES)
+		judged(retained <= MAX_RETAINED_BYTES)
 	);
 	println!(
 		"memory idle vproc retention classes: per name {}; largest per process {}",
@@ -542,5 +557,9 @@ fn main() {
 				allocs.mul_add(-f64::from(SHORT), a.allocs as f64)
 			);
 		}
+	}
+	if MISSED.load(Ordering::Relaxed) {
+		eprintln!("memory: a target was missed (MISS above)");
+		std::process::exit(1);
 	}
 }
