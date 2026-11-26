@@ -13,6 +13,7 @@ import {
 	resolveExactModelIdentity,
 } from "../config/model-resolver";
 import { formatModelRoleAlias } from "../config/model-roles";
+import { lookup as lookupSetting, settingValuesEqual } from "../config/registry";
 import type { Settings } from "../config/settings";
 import { MCPManager } from "../mcp/manager";
 import { initializeExtensions } from "../modes/runtime-init";
@@ -143,6 +144,25 @@ export function persistedAgentDefinition(displayName: string, init: PersistedSes
 		systemPrompt: init.systemPrompt.join("\n\n"),
 		source: "user",
 	};
+}
+
+/**
+ * The prompt a cold revive sends as its fixed prompt: the newest `session_init` prompt, or, when the session parked
+ * holding a settings change that a sync has set back since, the base that change was withheld from
+ * ({@link PersistedSessionInit.heldChangeBase}). Each setting the change held then reads, under `settings`, the value
+ * that base was built with, so the stored build would list tools and agents the revived session's settings no
+ * longer give, on every request it makes. A setting this process does not know, or a credential, keeps the build.
+ */
+export function revivedSystemPrompt(init: PersistedSessionInit, settings: Settings): string[] {
+	const held = init.heldChangeBase;
+	if (!held || held.settings.length === 0) return init.systemPrompt;
+	for (const record of held.settings) {
+		const setting = lookupSetting(record.id);
+		if (!setting || setting.isCredential || !settingValuesEqual(record.value, setting.get(settings))) {
+			return init.systemPrompt;
+		}
+	}
+	return held.systemPrompt;
 }
 
 /**
@@ -390,6 +410,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	if (init.retryFallback) {
 		installRetryFallbackRole(subagentSettings, subagentRetryFallbackRole(ref.id), init.retryFallback);
 	}
+	const revivedPrompt = revivedSystemPrompt(init, subagentSettings);
 	// Account pools are owner policy, like the extension roots below: take the
 	// live exact-name `task.agentAccountPools` entry, never a transcript copy.
 	const agentAccountPools = validateAgentAccountPools(cfgTaskAgentAccountPools.get(spec.settings));
@@ -477,7 +498,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			outputSchemaMode: init.outputSchemaMode,
 			restrictToolNames: restrictToolNames || undefined,
 			requireYieldTool: structured,
-			systemPrompt: () => [...init.systemPrompt],
+			systemPrompt: () => [...revivedPrompt],
 			// Inherit current owner policy, never extension authority from a transcript.
 			extensionRoots: () => spec.root.effectiveExtensionRoots,
 			preloadedPreparedExtensions: spec.preparedExtensions,

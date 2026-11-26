@@ -458,7 +458,13 @@ own validated tool contract instead. Anonymized exports treat it like `tools`.
 (`workPoolYieldItems`, restored on revival), and when it parks or ends while its base prompt
 withholds a change (a held settings change, or a kept restored transcript prompt), with the prompt
 that goes out with that change: a cold revive holds nothing, so it sends that prompt rather than
-the held one, as a held settings change's hidden settings notice announced.
+the held one, as a held settings change's hidden settings notice announced. Beside that prompt
+goes `heldChangeBase`: the base prompt the change was withheld from (`systemPrompt`) and each
+setting the change holds with the value that base was built with (`settings`, `{ id, value }`).
+A cold revive whose settings give each of them that value again (a sync set the change back while
+the session was parked) sends that base instead, so its prompt lists the tools and agents its
+settings give; a setting the process does not know, or a credential, keeps the stored build. A
+newer `session_init` a model call appends carries no `heldChangeBase`.
 Older files store one joined string, which revives as a single block.
 `extractSessionInit()` and read-only `peekSessionInit()` expose this contract.
 

@@ -61,6 +61,7 @@ import {
 	EPHEMERAL_MODEL_CHANGE_ROLE,
 	PREWALK_MODEL_CHANGE_ROLE,
 	type FileEntry,
+	type HeldChangeBase,
 	type LabelEntry,
 	type ModeChangeEntry,
 	type ModelChangeEntry,
@@ -3743,6 +3744,7 @@ export class SessionManager {
 		compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 		isolated?: boolean;
 		workPoolYieldItems?: WorkPoolYieldItem[];
+		heldChangeBase?: HeldChangeBase;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -4852,6 +4854,8 @@ export interface PersistedSessionInit {
 	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 	isolated?: boolean;
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/** {@link SessionInitEntry.heldChangeBase}. */
+	heldChangeBase?: HeldChangeBase;
 }
 
 /**
@@ -4884,6 +4888,7 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			isolated: entry.isolated,
 			...(entry.compactionThreshold !== undefined ? { compactionThreshold: entry.compactionThreshold } : undefined),
 			...(entry.workPoolYieldItems !== undefined ? { workPoolYieldItems: entry.workPoolYieldItems } : undefined),
+			...(entry.heldChangeBase !== undefined ? { heldChangeBase: entry.heldChangeBase } : undefined),
 		};
 	}
 	return init;

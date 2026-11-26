@@ -273,6 +273,17 @@ export interface CredentialPinEntry extends SessionEntryBase {
 	hash: string;
 }
 
+/**
+ * The base prompt a session that parks holding a settings change withholds the change from, with each setting the
+ * change holds at the value that base was built with ({@link SessionInitEntry.heldChangeBase}).
+ */
+export interface HeldChangeBase {
+	/** The base prompt's blocks: what the session's requests sent while it held the change. */
+	systemPrompt: string[];
+	/** Each setting the change holds, by id, with the value the base was built with; `value` is absent when unset. */
+	settings: { id: string; value?: unknown }[];
+}
+
 /** Session init entry - captures initial context for subagent sessions (debugging/replay). */
 export interface SessionInitEntry extends SessionEntryBase {
 	type: "session_init";
@@ -318,6 +329,13 @@ export interface SessionInitEntry extends SessionEntryBase {
 	isolated?: boolean;
 	/** Work-pool yield items of the last model call; revival restores them so the yield tool matches. Absent when none. */
 	workPoolYieldItems?: WorkPoolYieldItem[];
+	/**
+	 * Written as the session parks holding a settings change, whose `systemPrompt` is then the build that goes out
+	 * with the change: the base the change was withheld from. A cold revive sends that base instead when each setting
+	 * the change holds has the value the base was built with again (a sync set the change back while the session was
+	 * parked), so its prompt lists the tools and agents its settings give. Absent otherwise.
+	 */
+	heldChangeBase?: HeldChangeBase;
 }
 
 /** Mode change entry - tracks agent mode transitions (e.g. plan mode). */

@@ -113,7 +113,7 @@ import { cfgSystemPromptInputs, toolReadsSkillUris } from "../system-prompt";
 
 import type { CustomMessage } from "./messages";
 import { SESSION_AGENT_NOTICE_TYPE } from "./queued-messages";
-import type { SessionEntry } from "./session-entries";
+import type { HeldChangeBase, SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
 import { cfgDisabledExtensions, cfgSkills, type SkillsSettings } from "../extensibility/settings";
@@ -3706,6 +3706,27 @@ export class SessionTools {
 		const restored = this.#keptRestoredPrompt();
 		const built = standIn?.base === this.#baseSystemPrompt && !(restored && this.#restoredSettingsSetBack(restored));
 		return [...(built ? standIn.build : this.#baseSystemPrompt)];
+	}
+
+	/**
+	 * While the base withholds a change of settings from the build that goes out with it ({@link withheldPromptBuild}
+	 * differs from the base), the base with each setting the change holds at the value the base was built with: a held
+	 * settings rebuild's, else a kept restored transcript prompt's. A session that parks stores it beside that build,
+	 * and a cold revive sends the base instead once each of those settings has that value again (a sync set the change
+	 * back while the session was parked). Undefined otherwise, and for a change of a credential, whose value is never
+	 * recorded. A copy.
+	 */
+	get withheldSettingsBase(): HeldChangeBase | undefined {
+		const build = this.withheldPromptBuild;
+		if (!build || sameItems(build, this.#baseSystemPrompt)) return undefined;
+		const held = this.#heldSettingsRebuild ?? this.#keptRestoredPrompt();
+		if (!held || held.before.size === 0) return undefined;
+		const settings: HeldChangeBase["settings"] = [];
+		for (const [setting, value] of held.before) {
+			if (setting.isCredential) return undefined;
+			settings.push(heldSettingRecord(setting, value));
+		}
+		return { systemPrompt: [...this.#baseSystemPrompt], settings };
 	}
 
 	/**
