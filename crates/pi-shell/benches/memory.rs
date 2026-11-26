@@ -40,7 +40,7 @@
 //! memory idle vprocs back to back: 16 → … bytes, 272 → … bytes; … bytes per vproc (target ≤ 2013, ceiling 2048) PASS|MISS
 //! memory idle vprocs: 16 → … bytes, 272 → … bytes; … bytes per vproc in a loop writing `i` (…)
 //! memory idle vproc allocations by size: 24-31 B ×1.00, …
-//! memory idle vproc retention: … bytes per vproc (loop … B, reached by at least 5 of 128 processes × 16 names, less … B back to back; largest … B; … ms) (target ≤ 318) PASS|MISS
+//! memory idle vproc retention: … bytes per vproc (loop … B, reached by at least 5 of 128 processes × 16 names, less … B back to back; largest … B; … ms) (target ≤ 310) PASS|MISS
 //! memory idle vproc retention classes: per name … B ×…, …; largest per process … B ×…
 //! memory sizes: Vproc … B, Frame … B, Scratch … B, ScratchIo … B, ExecState … B, Job … B
 //! allocs loop NONE: … allocs/iter, … reallocs/iter, … bytes/iter; per run … allocs
@@ -253,13 +253,14 @@ const _: () = assert!(MAX_VPROC_NOWRITE_BYTES <= VPROC_CEILING_BYTES, "past the 
 /// in one run (a MISS for no change) has a chance near 1e-6, and fewer than
 /// five at the top class (a reading that cannot see) near 4e-7.
 ///
-/// The bound is the measured value plus 8 B, one 8-byte allocation class:
-/// 310 B on this tree's base with the counter alone (2,323 − 2,013), in 40
-/// of 40 runs. A retained allocation that grows by a class, or one more
-/// retained entry (one more variable the shell writes after each fork: 647 B
-/// with one, 2,660 − 2,013), fails it. The commit that adds a retained write
-/// (#235's `_`) raises it, with the bench's numbers.
-const MAX_RETAINED_BYTES: usize = 318;
+/// The bound is a ratchet at the measured value, as back to back is: 310 B
+/// on this tree's base with the counter alone (2,323 − 2,013), in 40 of 40
+/// runs. A retained allocation that grows by one 8-byte class (318 B), or
+/// one more retained entry (one more variable the shell writes after each
+/// fork: 647 B with one, 2,660 − 2,013), fails it. The commit that adds a
+/// retained write (#235's `_`) raises it, with the bench's numbers; one that
+/// takes bytes off lowers it.
+const MAX_RETAINED_BYTES: usize = 310;
 /// Child processes the retention line reads.
 const RETAIN_PROCS: usize = 128;
 /// Loop runs, each writing a variable of its own name, in each child.
