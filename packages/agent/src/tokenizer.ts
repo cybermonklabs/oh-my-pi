@@ -499,11 +499,8 @@ export class Tokenizer {
 						fragments.push(block.text);
 					} else if (block.type === "thinking") {
 						// The request carries none of another model's thinking that this
-						// reader would read as text: the rule `transformMessages` applies,
-						// on the signature it keeps (stripped from an untrusted block).
-						const signed =
-							Boolean(block.thinkingSignature?.trim()) && !abandonedToolUse && index !== untrustedIndex;
-						if (thinkingReader && dropsForeignThinking(message, thinkingReader, signed)) continue;
+						// reader drops (`dropsForeignThinking`, the rule `transformMessages` applies).
+						if (thinkingReader && dropsForeignThinking(message, thinkingReader)) continue;
 						// `transformMessages` drops another model's empty thinking and demotes the
 						// rest to visible text; only the reader's own thinking stays native.
 						if (ollamaReader && !ownOllamaTurn) {
@@ -535,6 +532,7 @@ export class Tokenizer {
 						fragments.push(block.name);
 						fragments.push(stringifyJson(block.arguments) ?? "null");
 					} else if (block.type === "redactedThinking") {
+						if (thinkingReader && dropsForeignThinking(message, thinkingReader)) continue;
 						// Encrypted reasoning blob the provider still bills for wherever it
 						// survives replay, as above; excluded from the compaction floor for
 						// the same reason.

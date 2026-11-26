@@ -587,34 +587,24 @@ export function dropsForeignReasoningPayload(
  * back to it as text (the `classifier-cot-extraction` catalog axis, set for
  * Claude): Claude refuses a request whose earlier turns carry another model's
  * reasoning as plain assistant prose (`reasoning_extraction`). Such a target
- * keeps another model's thinking only as a block signed on its own provider's
- * Anthropic Messages endpoint (`signed`: the block keeps its signature, or is
- * redacted thinking), which replays there natively, as it did before. It drops
- * the rest, which would reach it as text, or as an unsigned block that a host
- * in front of Anthropic rejects and the encoder then writes as text. That
- * model's answers and tool calls stay. Devin writes this transform's demoted
- * text into the turn's prompt, so its wire counts here too. A model router
- * (`compat.modelRouter`: Devin's `adaptive`) names no model, and the model it
- * picks may be Claude, so it counts as one. Context estimates count a turn's
- * thinking by this same answer.
+ * keeps only its own thinking: every other model's thinking drops, signed or
+ * not, redacted or not, other Claude models included. That model's answers and
+ * tool calls stay. Devin writes this transform's demoted text into the turn's
+ * prompt, so its wire counts here too. A model router (`compat.modelRouter`:
+ * Devin's `adaptive`) names no model, and the model it picks may be Claude, so
+ * it counts as one. Context estimates count a turn's thinking by this same
+ * answer.
  */
 export function dropsForeignThinking(
 	turn: Pick<AssistantMessage, "provider" | "api" | "model">,
 	model: CatalogPolicyInputs & { compat?: Model["compat"] },
-	signed: boolean,
 ): boolean {
 	if (model.api !== "devin-agent" && (DIRECT_REPLAY_APIS as Partial<Record<Api, boolean>>)[model.api] !== true) {
 		return false;
 	}
 	if (isSameModelTurn(turn, model)) return false;
 	const routes = model.compat !== undefined && "modelRouter" in model.compat && model.compat.modelRouter === true;
-	if (!routes && resolveCatalogPolicy(model).classifierCotExtraction !== true) return false;
-	return !(
-		signed &&
-		model.api === "anthropic-messages" &&
-		turn.api === "anthropic-messages" &&
-		turn.provider === model.provider
-	);
+	return routes || resolveCatalogPolicy(model).classifierCotExtraction === true;
 }
 
 /**
@@ -1131,14 +1121,13 @@ export function transformMessages<TApi extends Api>(
 
 			const transformedContent = assistantMsg.content.flatMap((block, blockIndex) => {
 				if (foreignCredential && (block.type === "thinking" || block.type === "redactedThinking")) return [];
-				// Another model's thinking that a classifier target would read as text.
+				// Another model's thinking, which a classifier target must not get.
 				if (
-					block.type === "thinking" &&
-					dropsForeignThinking(assistantMsg, model, Boolean(block.thinkingSignature?.trim()))
+					(block.type === "thinking" || block.type === "redactedThinking") &&
+					dropsForeignThinking(assistantMsg, model)
 				) {
 					return [];
 				}
-				if (block.type === "redactedThinking" && dropsForeignThinking(assistantMsg, model, true)) return [];
 				if (
 					invalidBoundThinkingAssistantIndexes.has(index) &&
 					(block.type === "thinking" || block.type === "redactedThinking")
@@ -1360,30 +1349,16 @@ export function transformMessages<TApi extends Api>(
 				return block;
 			});
 
-			// A signature stripped above leaves a kept block of another model's to
-			// be written as text by the encoder; `dropsForeignThinking` drops it.
-			const content = isSameModel
-				? transformedContent
-				: transformedContent.filter(
-						block =>
-							block.type !== "thinking" ||
-							!dropsForeignThinking(
-								assistantMsg,
-								model,
-								"thinkingSignature" in block && Boolean(block.thinkingSignature?.trim()),
-							),
-					);
-
 			// Record this turn's tool-call ids into the origin scope. Origin scope
 			// must be complete before dedup reads it: filled here off the SAME
 			// post-transform content this map emits, in document order, and never
 			// read inside the map — so by the time the dedup pass consults it the
 			// sets hold every assistant id, never a partial build.
-			recordToolCallOriginScope(assistantMsg, content, responsesComponents, opaqueCompositeCallIds);
+			recordToolCallOriginScope(assistantMsg, transformedContent, responsesComponents, opaqueCompositeCallIds);
 
 			return {
 				...assistantMsg,
-				content,
+				content: transformedContent,
 			};
 		}
 		return msg;
