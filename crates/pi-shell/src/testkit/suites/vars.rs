@@ -438,6 +438,114 @@ fn random_in_a_subshells_redirections_is_the_childs() {
 	}
 }
 
+/// bash expands all words of redirections it makes in a child there: a
+/// simple command it forks for first (a name not found, `command` with one,
+/// a null command that redirects fd 0 or a `{var}`) and a subshell's own.
+/// Arithmetic side effects and `${name:=value}` stay in the shell's copy,
+/// and `BASHPID` names the child. A `$RANDOM` there draws from the child's
+/// generator and leaves the shell's sequence alone. A null command that
+/// redirects fd 1, a builtin's, a function's and a background job's draw
+/// as before. Goldens from bash 5.3.20.
+#[test]
+fn random_in_a_forked_commands_redirections_is_the_childs() {
+	for (form, want) in [
+		("nosuch 2> e$RANDOM", "[] 18498\n"),
+		("command nosuch 2> e$RANDOM", "[] 18498\n"),
+		(": > f; < f${RANDOM:0:0}", "[] 18498\n"),
+		(": > f; {v}< f${RANDOM:0:0}", "[] 18498\n"),
+		("nosuch 2> e$RANDOM; RANDOM+=1", "[] 2539\n"),
+		("x=0; nosuch 2> e$((x++)); echo \"x=$x\"", "x=0\n[0] 18498\n"),
+		("x=0; command nosuch 2> e$((x++)); echo \"x=$x\"", "x=0\n[0] 18498\n"),
+		(": > f0; x=0; < f$((x++)); echo \"x=$x\"", "x=0\n[0] 18498\n"),
+		("unset y; nosuch > \"f${y:=1}\" 2> e; echo \"y=${y-unset}\"", "y=unset\n[] 18498\n"),
+		(
+			"nosuch > f$BASHPID 2> e; [ -e \"f$BASHPID\" ] && echo same || echo other",
+			"other\n[] 18498\n",
+		),
+		("x=0; ( : ) > f$((x++)); echo \"x=$x\"", "x=0\n[0] 18498\n"),
+		// A `${| }` in such a word keeps its `REPLY` local, and the word's
+		// arithmetic stays the child's across a `$( )` the word waits for.
+		("nosuch > f${| REPLY=1; } 2> e; echo \"[${REPLY-unset}]\"", "[unset]\n[] 18498\n"),
+		("x=0; nosuch > f$((x++))$(:) 2> e; echo \"x=$x\"", "x=0\n[0] 18498\n"),
+		// Drawn in the shell, or in a fork either way.
+		("> f$RANDOM", "[] 29338\n"),
+		("true > f$RANDOM", "[] 29338\n"),
+		("f() { :; }; f > f$RANDOM", "[] 29338\n"),
+		("( : ) > f$RANDOM", "[] 18498\n"),
+		("nosuch 2> e$RANDOM & wait", "[] 18498\n"),
+	] {
+		let src = format!("RANDOM=5; {form}; echo \"[${{x-}}] $RANDOM\"");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+}
+
+/// The redirections bash makes in a child are that one child's: a later
+/// word sees what an earlier word or an earlier part of the same word
+/// wrote, and a `$( )` in a word forks from it, while the shell keeps
+/// none of it. Two redirections that name their files from one counter
+/// name two files, so neither stream is lost. A word reads the locals of
+/// the function it runs in, and a `{var}` an earlier redirection made.
+/// Goldens from bash 5.3.20.
+#[test]
+fn a_forked_commands_redirection_words_share_its_child() {
+	let files =
+		"for n in e0 e1 e5 e6 f0 f1 f00 f01 g5 g6 h h10; do [ -e $n ] && printf '%s ' $n; done; echo";
+	for (form, want) in [
+		(
+			"x=0; ( echo out; echo err >&2 ) > f$((x++)) 2> f$((x++)); echo \"x=$x [$(< f0)] [$(< \
+			 f1)]\"",
+			"x=0 [out] [err]\nf0 f1 \n",
+		),
+		("x=0; nosuch 2> e$((x++)) > f$((x++)); echo \"x=$x\"", "x=0\ne0 f1 \n"),
+		("unset y; nosuch > \"f${y:=1}\" 2> \"e${y-u}\"; echo \"y=${y-unset}\"", "y=unset\ne1 f1 \n"),
+		("x=0; nosuch > f$((x++))$(:)$((x++)) 2> e0; echo \"x=$x\"", "x=0\ne0 f01 \n"),
+		("x=0; nosuch > f$((x++))$(echo $x) 2> e0; echo \"x=$x\"", "x=0\ne0 f01 \n"),
+		("f() { local x=5; nosuch 2> e$x; }; f", "e5 \n"),
+		("f() { local x=5; nosuch 2> e$((x++)) > g$x; echo \"x=$x\"; }; f", "x=5\ne5 g6 \n"),
+		("nosuch {v}> g5 2> h$v; echo \"v=${v-unset}\"", "v=unset\ng5 h10 \n"),
+	] {
+		let src = format!("{form}; {files}");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+}
+
+/// A `${ }` or `${| }` in a forked command's redirection word reads what
+/// the command's child wrote in its earlier words, as bash's does, which
+/// runs it in that child: two redirections naming their files from one
+/// counter name two files, so neither stream is lost, and the shell still
+/// keeps none of it. The same holds in a subshell, whose vproc keeps its
+/// own state. Goldens from bash 5.3.20.
+#[test]
+fn a_substitution_in_a_forked_commands_redirection_reads_its_child() {
+	let files =
+		"for n in e0 e1 e5 e6 f0 f1 f00 f01 g5 g6 h h10; do [ -e $n ] && printf '%s ' $n; done; echo";
+	for (form, want) in [
+		(
+			"x=0; ( echo out; echo err >&2 ) > f$((x++)) 2> f${ echo $x; }; echo \"x=$x [$(< f0)] \
+			 [$(< f1)]\"",
+			"x=0 [out] [err]\nf0 f1 \n",
+		),
+		(
+			"x=0; ( echo out; echo err >&2 ) > f$((x++)) 2> f${| REPLY=$x; }; echo \"x=$x [$(< f0)] \
+			 [$(< f1)]\"",
+			"x=0 [out] [err]\nf0 f1 \n",
+		),
+		("x=0; nosuch > f$((x++)) 2> f${ echo $x; }; echo \"x=$x\"", "x=0\nf0 f1 \n"),
+		("x=0; nosuch > f$((x++))${ echo $x; } 2> e0; echo \"x=$x\"", "x=0\ne0 f01 \n"),
+		(
+			"f() { local x=5; nosuch 2> e$((x++)) > g${ echo $x; }; echo \"x=$x\"; }; f",
+			"x=5\ne5 g6 \n",
+		),
+		// A subshell's own forked redirections.
+		("( x=0; nosuch 2> e$((x++)) > f$((x++)); echo \"x=$x\" )", "x=0\ne0 f1 \n"),
+		("( f() { local x=5; nosuch 2> e$((x++)) > g$x; echo \"x=$x\"; }; f )", "x=5\ne5 g6 \n"),
+		("( x=0; nosuch > f$((x++)) 2> f${ echo $x; }; echo \"x=$x\" )", "x=0\nf0 f1 \n"),
+	] {
+		let src = format!("{form}; {files}");
+		assert_eq!(run(&src), (want.to_owned(), String::new()), "{form}");
+	}
+}
+
 /// Whether `unset` or an array assignment removed `RANDOM`'s special
 /// meaning is imaged with the generator: a shell snapshotted and restored
 /// at every step keeps a plain `RANDOM` plain. Goldens from bash 5.3.20.

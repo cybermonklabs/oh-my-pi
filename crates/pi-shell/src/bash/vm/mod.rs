@@ -629,14 +629,21 @@ pub struct Kernel {
 	/// `dynvars::CELLS` indices): plain variables from then on (kept in
 	/// `MiscKey::CellsPlain`); a forked vproc has its own ([`proc::Clock`]).
 	pub cells_plain:        u16,
-	/// A subshell's redirections are being expanded
-	/// ([`redir::apply_in_child`]): bash expands them in the child, after
-	/// the fork, so a lookup of the special `RANDOM` or `SECONDS` there
-	/// leaves the shell's value cell alone ([`dynvars::store_value`]); the
-	/// vproc's generator and clock are the child's copy then
-	/// ([`Kernel::fork_clock`]). Set only during that call, which restores
-	/// both before it returns; not imaged.
+	/// Redirections bash makes in a child are being applied (a subshell's
+	/// own, a forked simple command's: [`redir::apply_in_child`]): bash
+	/// expands them in the child, after the fork, so each expansion pass of
+	/// their words runs on that child's state, which the command's words
+	/// share ([`redir::ChildState`]), and a lookup of the special `RANDOM`
+	/// or `SECONDS` there leaves the shell's value cell alone
+	/// ([`dynvars::store_value`]). Set only during that call, which restores
+	/// it before it returns; not imaged.
 	pub redirs_in_child:    bool,
+	/// The virtual pid a `$BASHPID` reads during an expansion pass on that
+	/// child's state ([`redir::enter_child`]): bash makes those redirections
+	/// in the command's child, so `$BASHPID` there is the child's, not the
+	/// shell's. The next free vpid, peeked, not taken; set only for the
+	/// pass, which restores it; not imaged.
+	pub redirs_child_pid:   Option<Vpid>,
 	/// The arithmetic results a builtin's argument evaluates while
 	/// [`builtins::Ctx::arith_once`] runs ([`expand::arith_value`]): taken
 	/// in order on a run again after a later argument's `$(…)` or a probe,
@@ -944,6 +951,7 @@ impl Kernel {
 			seconds_plain: false,
 			cells_plain: 0,
 			redirs_in_child: false,
+			redirs_child_pid: None,
 			arith_replay: None,
 			startup: Vec::new(),
 			pseudo_traps: exec::PseudoTraps::default(),
@@ -4783,7 +4791,7 @@ impl ForkEdits {
 		for name in self.unexport_env {
 			image.del_var(&name);
 			for scope in &mut vp.scopes {
-				if let Some(Some(var)) = scope.vars.get_mut(&name) {
+				if let Some(var) = scope.vars.var_mut(&name) {
 					var.attrs = var.attrs.without(Attrs::EXPORT);
 				}
 			}

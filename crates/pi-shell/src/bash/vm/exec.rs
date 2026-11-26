@@ -3218,12 +3218,22 @@ pub fn expanding<T>(
 		return Err(flow);
 	}
 	let mut log = std::mem::take(&mut sc.logs[slot as usize]);
+	// A word of redirections bash makes in a child: the pass runs on that
+	// child's state, which the command's words share ([`redir::enter_child`]).
+	// A substitution it stops for starts below, and settles above, with the
+	// shell's own (a `$( )` forks from the child's: [`start_sub`]).
+	let shell = k
+		.redirs_in_child
+		.then(|| redir::enter_child(k, vp, cx, &mut sc));
 	let res = {
 		let mut ex = Expander::new(k, cx, vp, &mut log, record, line);
 		let r = super::zsh::subst::begin_pass(&mut ex).and_then(|()| f(&mut ex));
 		let st = ex.sub_status;
 		r.map(|v| (v, st))
 	};
+	if let Some(shell) = shell {
+		redir::leave_child(k, vp, cx, &mut sc, shell);
+	}
 	// The slot still holds the empty `Vec` `take` left there (the scratch is
 	// out of its frame meanwhile, nothing else fills it): put the log back
 	// without a drop of that placeholder per expansion.
@@ -3622,6 +3632,10 @@ pub fn start_sub(
 			let reparse = text.and_then(|i| unit.strs.get(i as usize)).filter(|_| {
 				!posix && (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))
 			});
+			// A `$( )` in a word of redirections bash makes in a child forks
+			// from that child, so it sees what the word wrote before it
+			// ([`redir::enter_child`]).
+			let shell = k.redirs_in_child.then(|| redir::enter_child(k, vp, cx, sc));
 			let mut child = if let Some(src) = reparse {
 				vp.child_text(k, cx.store, src, base, fds)
 			} else {
@@ -3644,6 +3658,9 @@ pub fn start_sub(
 				child.trace_base += 1;
 				child
 			};
+			if let Some(shell) = shell {
+				redir::leave_child(k, vp, cx, sc, shell);
+			}
 			k.bang_kin_add(vp.vpid, child.vpid);
 			zsh_subshell_traps(k, cx, &mut child, false);
 			// bash runs the text with `parse_and_execute` (`command_substitute`).
@@ -3682,12 +3699,24 @@ pub fn start_sub(
 		},
 		ComsubForm::NoFork | ComsubForm::Value => {
 			// Its own scope for `local` (marked with an empty function name,
-			// which `FUNCNAME` skips); `${| ;}` has a local `REPLY`.
+			// which `FUNCNAME` skips); `${| ;}` has a local `REPLY`. In a word
+			// of redirections bash makes in a child, bash runs the body in that
+			// child: it reads what the command's earlier words wrote there,
+			// which this scope holds for it, so the shell sees none of it and a
+			// write of one of those names stays in the body.
 			let mut vars = VarMap::default();
+			if k.redirs_in_child {
+				redir::child_vars(sc, &mut vars);
+			}
 			if form == ComsubForm::Value {
 				vars.insert(BString::from("REPLY"), None);
 			}
-			let scope = Scope { vars, positional: None, func: Some(BString::default()), zsh: None };
+			let scope = Scope {
+				vars:       vars.into(),
+				positional: None,
+				func:       Some(BString::default()),
+				zsh:        None,
+			};
 			state::push_scope(&mut k.root, cx.store, vp, scope);
 			// Outside posix mode bash parses `${ ;}` without aliases and
 			// re-parses its re-printed text when it runs, with the aliases

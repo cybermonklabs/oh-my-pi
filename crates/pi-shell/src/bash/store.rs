@@ -1805,6 +1805,22 @@ pub enum Change<'a> {
 	DelElem(Key<'a>, Elem<'a>),
 }
 
+impl<'a> Change<'a> {
+	/// The key of the record the change writes.
+	pub const fn key(&self) -> Key<'a> {
+		match *self {
+			Self::Put(key, _)
+			| Self::Del(key)
+			| Self::SetScalar(key, _)
+			| Self::AppendScalar(key, _)
+			| Self::SetElem(key, ..)
+			| Self::AppendElem(key, ..)
+			| Self::InsertElem(key, ..)
+			| Self::DelElem(key, _) => key,
+		}
+	}
+}
+
 /// An element of an array variable ([`Change::SetElem`],
 /// [`Change::DelElem`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
