@@ -430,8 +430,8 @@ export function flagConsumesValue(flag: string, next: string | undefined): boole
  * One-shot launch selectors dropped when relaunching into an existing
  * session: the relaunch supplies its own session source, and replaying a
  * stale continue/fork/import selector would re-run its one-shot session
- * choice. `--goal` and `--session-id` belong here too: each seeds a fresh
- * session only, and is refused beside any resume/fork selector.
+ * choice. `--goal` and `--session-id` belong here too: each is refused
+ * beside any resume/fork selector, and the relaunch reopens the session itself.
  */
 const ONE_SHOT_LAUNCH_FLAGS: Readonly<Record<string, true>> = {
 	"--resume": true,

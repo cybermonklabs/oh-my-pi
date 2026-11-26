@@ -898,6 +898,17 @@ export class ForkSourceNotFoundError extends Error {
 }
 
 /**
+ * What {@link SessionManager.createWithSessionId} did with a launcher-chosen id. Only `created`
+ * wrote anything.
+ * - `held`: a stored session already holds the id.
+ * - `owned-elsewhere`: another live omp process owns the id.
+ */
+export type SessionIdCreation =
+	| { status: "created"; manager: SessionManager }
+	| { status: "held" }
+	| { status: "owned-elsewhere" };
+
+/**
  * Stores and navigates an append-only conversation journal.
  *
  * A session is a JSONL file: one header line followed by entries. Entries form a
@@ -1164,6 +1175,15 @@ export class SessionManager {
 		this.#claimSession();
 		const claim = this.#sessionClaim;
 		return claim !== undefined && claim.sessionId === this.#sessionId && claim.release === undefined;
+	}
+
+	/**
+	 * Whether another live omp process owns this session, so this process's
+	 * next write would move it to a sibling (`"open-elsewhere"`) instead of
+	 * appending. Claims the session when it is free, as a write would.
+	 */
+	isOwnedElsewhere(): boolean {
+		return this.#sessionOwnedElsewhere();
 	}
 
 	/**
@@ -4214,23 +4234,38 @@ export class SessionManager {
 	 * Create a new session under a launcher-chosen id, reserved for this process. The session claims
 	 * the id's ownership lease first, then asks `isHeld` whether a stored session already holds it,
 	 * and only then writes its header and records itself as the terminal's last session. So a second
-	 * launch under the id, in this process or another live one, finds it taken. Returns `undefined`,
-	 * having written nothing, when another live process owns the id or `isHeld` answers `true`.
+	 * launch under the id, in another live process, finds it taken, and a later one finds it stored.
+	 * Writes nothing when another live process owns the id or `isHeld` answers `true`.
 	 */
 	static async createWithSessionId(
 		cwd: string,
 		sessionDir: string | undefined,
 		sessionId: string,
 		isHeld: () => Promise<boolean>,
-	): Promise<SessionManager | undefined> {
+	): Promise<SessionIdCreation> {
 		const manager = SessionManager.create(cwd, sessionDir, undefined, { sessionId, suppressBreadcrumb: true });
-		if (manager.#sessionOwnedElsewhere() || (await isHeld())) {
+		if (manager.#sessionOwnedElsewhere()) {
 			await manager.close();
-			return undefined;
+			return { status: "owned-elsewhere" };
+		}
+		if (await isHeld()) {
+			await manager.close();
+			return { status: "held" };
 		}
 		manager.#suppressBreadcrumb = false;
 		await manager.ensureOnDisk();
-		return manager;
+		return { status: "created", manager };
+	}
+
+	/**
+	 * Claim this process's ownership of the stored session `sessionId` at `sessionPath` before
+	 * opening it, as {@link renameSessionTitle} does, so a caller can refuse a session another
+	 * live omp process owns before opening it changes anything. Returns the release callback, or
+	 * `null` while another live process owns the session. A manager that opens the session takes
+	 * its own claim at its first write or {@link isOwnedElsewhere}; release this one after that.
+	 */
+	static claimStoredSession(sessionPath: string, sessionId: string): (() => void) | null {
+		return new FileSessionStorage().claimSession(sessionId, sessionPath);
 	}
 
 	/**
