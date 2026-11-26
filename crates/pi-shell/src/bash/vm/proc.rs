@@ -832,7 +832,9 @@ pub enum ParseLevel {
 	Outside,
 	/// A child forked inside an `eval`, `.` or trap action: bash's fork keeps
 	/// `parse_and_execute_level`, but the child's jumps go to its own top
-	/// (`execute_in_subshell`), which is no level of its own.
+	/// (`execute_in_subshell`), which is no level of its own. A discard in the
+	/// child's own EXIT trap passes the trap: `top_level_cleanup` restores
+	/// the outermost level's saved jump target, and the child exits.
 	Kept,
 	/// A command or process substitution, whose text bash runs with
 	/// `parse_and_execute`: a level of its own (`command_substitute`,
@@ -845,6 +847,13 @@ pub enum ParseLevel {
 	/// `process_substitute` turn it into `EXECUTION_FAILURE`, also in a
 	/// script).
 	InSubstitution,
+	/// A child forked where the outermost running level is an EXIT trap
+	/// action (the shell's own or a subshell's), with no `-c` string still
+	/// running below it: a level as for [`Self::Kept`], but the saved jump
+	/// target `top_level_cleanup` restores is that trap's own
+	/// (`run_exit_trap`), so a discard in the child's own EXIT trap keeps
+	/// the trap's saved status.
+	InExitTrap,
 }
 
 impl ParseLevel {

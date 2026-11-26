@@ -2953,16 +2953,9 @@ impl Vproc {
 		// bash's fork keeps `parse_and_execute_level`: a child started
 		// inside an `eval`, `.` or trap action (or a child of one) runs
 		// inside that level; one started inside a substitution's text keeps
-		// the substitution's jump target.
-		if self
-			.frames
-			.first()
-			.is_some_and(|f| f.parse_level.substitution())
-		{
-			frame.parse_level = proc::ParseLevel::InSubstitution;
-		} else if self.frames.iter().any(exec::parse_and_execute) {
-			frame.parse_level = proc::ParseLevel::Kept;
-		}
+		// the substitution's jump target, and one whose outermost level is
+		// an EXIT trap action keeps that trap's ([`exec::fork_level`]).
+		frame.parse_level = exec::fork_level(store, self);
 		// Room for exactly this frame: a `Frame` is ~300 bytes and a first
 		// push reserves four (idle vproc ≤ 2 KiB); calls grow it.
 		vp.frames.reserve_exact(1);

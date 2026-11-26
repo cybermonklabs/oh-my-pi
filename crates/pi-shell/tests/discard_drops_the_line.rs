@@ -24,7 +24,8 @@
 //! compound value, and assigns the elements after the bad one; it drops
 //! the command after a readonly variable's `-a` in a function too, names a
 //! message made while it expands a declaration's words by no command,
-//! keeps an EXIT trap's saved status in a subshell under `-c` too, and
+//! keeps an EXIT trap's saved status in every subshell (also one forked
+//! inside an `eval`, `.` or other trap action, or under `-c`), and
 //! crashes where a function's `time` meets a list for an element in a
 //! script. bash 5.2.21 names the error of a function in a `-c` string
 //! `environment: line 1:`, and bash names an error in a `.` file by the
@@ -1187,6 +1188,201 @@ fn a_discard_in_an_exit_trap_keeps_the_trap_s_status() {
 			"trap 'shift 1 2; echo in-trap' ERR; false; echo after s=$?".into(),
 			(SHIFT.into(), 1),
 			(SHIFT.into(), 2),
+		),
+	];
+	assert_rows(&rows);
+}
+
+/// Whether a discard in a child's own EXIT trap keeps the trap's saved
+/// status depends on the outermost level running where the child was
+/// forked: `top_level_cleanup` restores that level's saved jump target.
+/// Inside an `eval`, `.`, other trap action or substitution's text the
+/// child exits with the discard's status (1 under `-c` or in a
+/// substitution's text), also when its body ended before the trap ran.
+/// Inside an EXIT trap action, the shell's own or a subshell's, with no
+/// older level below it, the child keeps its saved status. The shell's own
+/// `-c` string has ended by the time its EXIT trap runs, also after `exit`
+/// in a function; a subshell of the string kept the string's level.
+#[test]
+fn a_discard_in_an_exit_trap_ends_where_the_child_was_forked() {
+	const SHIFT: &str = "SH: shift: too many arguments\n";
+	let nest = "FUNCNEST=2; g() { g; }; g; echo in-trap";
+	let shift = "shift 1 2; echo in-trap";
+	let t = |trap: &str| format!("t() {{ ( trap \"{trap}\" EXIT; exit 4 ); echo w=$?; }}; ");
+	let by_mode = |name: &str, script: String, c: String, s: String| -> Row {
+		(name.into(), script, (c, 0), (s, 0))
+	};
+	let rows: Vec<Row> = vec![
+		same(
+			"FUNCNEST, forked in eval",
+			&format!("eval \"( trap '{nest}' EXIT; exit 3 ); echo w=\\$?\""),
+			&format!("{NEST}w=1\n"),
+		),
+		by_mode(
+			"too many arguments, forked in eval",
+			format!("eval \"( trap '{shift}' EXIT; exit 3 ); echo w=\\$?\""),
+			format!("{SHIFT}w=1\n"),
+			format!("{SHIFT}w=2\n"),
+		),
+		same(
+			"a subscript error, forked in eval",
+			"eval \"( trap 'a[1/0]=v; echo in-trap' EXIT; exit 3 ); echo w=\\$?\"",
+			&format!("{DIV}w=1\n"),
+		),
+		same(
+			"FUNCNEST, forked in a function eval runs",
+			&format!("f() {{ ( trap '{nest}' EXIT; exit 3 ); echo w=$?; }}; eval f"),
+			&format!("{NEST}w=1\n"),
+		),
+		by_mode(
+			"too many arguments, forked in a function eval runs",
+			format!("f() {{ ( trap '{shift}' EXIT; exit 3 ); echo w=$?; }}; eval f"),
+			format!("{SHIFT}w=1\n"),
+			format!("{SHIFT}w=2\n"),
+		),
+		same(
+			"FUNCNEST, forked in .",
+			&format!("cat > f.sh <<'EOF'\n( trap '{nest}' EXIT; exit 3 ); echo w=$?\nEOF\n. ./f.sh"),
+			&format!("{NEST}w=1\n"),
+		),
+		by_mode(
+			"too many arguments, forked in .",
+			format!("cat > f.sh <<'EOF'\n( trap '{shift}' EXIT; exit 3 ); echo w=$?\nEOF\n. ./f.sh"),
+			format!("{SHIFT}w=1\n"),
+			format!("{SHIFT}w=2\n"),
+		),
+		same(
+			"FUNCNEST, forked in a command substitution",
+			&format!("x=$( ( trap '{nest}' EXIT; exit 3 ); echo w=$? ); echo \"x=[$x]\""),
+			&format!("{NEST}x=[w=1]\n"),
+		),
+		same(
+			"too many arguments, forked in a command substitution",
+			&format!("x=$( ( trap '{shift}' EXIT; exit 3 ); echo w=$? ); echo \"x=[$x]\""),
+			&format!("{SHIFT}x=[w=1]\n"),
+		),
+		same(
+			"FUNCNEST, forked in a signal trap",
+			&format!(
+				"trap '( trap \"{nest}\" EXIT; exit 4 ); echo w=$?' USR1; kill -USR1 $$; echo after"
+			),
+			&format!("{NEST}w=1\nafter\n"),
+		),
+		by_mode(
+			"too many arguments, forked in a signal trap",
+			format!(
+				"trap '( trap \"{shift}\" EXIT; exit 4 ); echo w=$?' USR1; kill -USR1 $$; echo after"
+			),
+			format!("{SHIFT}w=1\nafter\n"),
+			format!("{SHIFT}w=2\nafter\n"),
+		),
+		same(
+			"FUNCNEST, forked in eval, a body that ends",
+			&format!("eval \"( trap '{nest}' EXIT; echo body ); echo w=\\$?\""),
+			&format!("body\n{NEST}w=1\n"),
+		),
+		by_mode(
+			"too many arguments, forked in eval, a body that ends",
+			format!("eval \"( trap '{shift}' EXIT; (exit 5) ); echo w=\\$?\""),
+			format!("{SHIFT}w=1\n"),
+			format!("{SHIFT}w=2\n"),
+		),
+		same(
+			"FUNCNEST, a job forked in eval",
+			&format!("eval \"( trap '{nest}' EXIT; exit 3 ) & wait \\$!; echo w=\\$?\""),
+			&format!("{NEST}w=1\n"),
+		),
+		same(
+			"FUNCNEST, a pipeline stage forked in eval",
+			&format!("eval \"( trap '{nest}' EXIT; exit 3 ) | cat; echo w=\\${{PIPESTATUS[0]}}\""),
+			&format!("{NEST}w=1\n"),
+		),
+		same(
+			"FUNCNEST, a subshell of a subshell forked in eval",
+			&format!("eval \"( ( trap '{nest}' EXIT; exit 3 ); echo v=\\$? ); echo w=\\$?\""),
+			&format!("{NEST}v=1\nw=0\n"),
+		),
+		same(
+			"FUNCNEST, forked in the shell's trap",
+			&format!("trap '( trap \"{nest}\" EXIT; echo body; exit 4 ); echo w=$?' EXIT; echo top"),
+			&format!("top\nbody\n{NEST}w=4\n"),
+		),
+		same(
+			"too many arguments, forked in the shell's trap",
+			&format!("trap '( trap \"{shift}\" EXIT; echo body; exit 4 ); echo w=$?' EXIT; echo top"),
+			&format!("top\nbody\n{SHIFT}w=4\n"),
+		),
+		both(
+			"FUNCNEST, forked in the trap exit starts in a function",
+			&format!("{}f() {{ exit 3; }}; trap t EXIT; f", t(nest)),
+			&format!("{NEST}w=4\n"),
+			3,
+		),
+		same(
+			"FUNCNEST, a subshell of a subshell forked in the shell's trap",
+			&format!("trap '( ( trap \"{nest}\" EXIT; exit 4 ); echo w=$? )' EXIT; echo top"),
+			&format!("top\n{NEST}w=4\n"),
+		),
+		same(
+			"FUNCNEST, forked in eval in the shell's trap",
+			&format!(
+				"h() {{ eval '( trap \"{nest}\" EXIT; exit 4 ); echo w=$?'; }}; trap h EXIT; echo top"
+			),
+			&format!("top\n{NEST}w=4\n"),
+		),
+		same(
+			"FUNCNEST, forked in a function the shell's trap runs",
+			&format!("{}trap t EXIT; echo top", t(nest)),
+			&format!("top\n{NEST}w=4\n"),
+		),
+		same(
+			"too many arguments, forked in a function the shell's trap runs",
+			&format!("{}trap t EXIT; echo top", t(shift)),
+			&format!("top\n{SHIFT}w=4\n"),
+		),
+		by_mode(
+			"FUNCNEST, forked in a subshell's trap",
+			format!(
+				"( trap '( trap \"{nest}\" EXIT; exit 4 ); echo w=$?' EXIT; echo body ); echo v=$?"
+			),
+			format!("body\n{NEST}w=1\nv=0\n"),
+			format!("body\n{NEST}w=4\nv=0\n"),
+		),
+		by_mode(
+			"FUNCNEST, forked in the trap of a subshell",
+			format!("{}( trap t EXIT; echo body ); echo v=$?", t(nest)),
+			format!("body\n{NEST}w=1\nv=0\n"),
+			format!("body\n{NEST}w=4\nv=0\n"),
+		),
+		same(
+			"FUNCNEST, forked in the trap of a subshell forked in eval",
+			&format!("{}eval '( trap t EXIT; echo body ); echo v=$?'", t(nest)),
+			&format!("body\n{NEST}w=1\nv=0\n"),
+		),
+		by_mode(
+			"FUNCNEST, forked in a command substitution's trap",
+			format!("{}x=$( trap t EXIT; echo body ); echo \"x=[$x]\"", t(nest)),
+			format!("{NEST}x=[body\nw=1]\n"),
+			format!("{NEST}x=[body\nw=4]\n"),
+		),
+		// `exit` in a function starts the trap above the function's frames;
+		// bash has left the text's levels first.
+		by_mode(
+			"FUNCNEST, forked in a command substitution's trap exit starts",
+			format!("{}x=$( f() {{ exit 0; }}; trap t EXIT; f ); echo \"x=[$x]\"", t(nest)),
+			format!("{NEST}x=[w=1]\n"),
+			format!("{NEST}x=[w=4]\n"),
+		),
+		by_mode(
+			"FUNCNEST, forked in a subshell's trap exit starts",
+			format!("{}( f() {{ exit 0; }}; trap t EXIT; f ); echo v=$?", t(nest)),
+			format!("{NEST}w=1\nv=0\n"),
+			format!("{NEST}w=4\nv=0\n"),
+		),
+		same(
+			"FUNCNEST, forked in the trap exit starts in a subshell forked in eval",
+			&format!("{}eval '( f() {{ exit 0; }}; trap t EXIT; f ); echo v=$?'", t(nest)),
+			&format!("{NEST}w=1\nv=0\n"),
 		),
 	];
 	assert_rows(&rows);

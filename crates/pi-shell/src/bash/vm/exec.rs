@@ -725,13 +725,15 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32, jump
 		mark_exit_trap(vp, true, outside_functions);
 		return;
 	}
+	let kept = kept_level(vp);
 	unwind(&mut k.root, cx.store, vp, 0);
 	// zsh `exit` in a subshell is its `zexit`: the hooks run after its EXIT
 	// trap (pushed below them).
 	if vp.parent.is_some() && vp.runs.is_empty() && vp.mode.dialect() == Dialect::Zsh {
 		super::zsh::zexit::start(k, cx, vp);
 	}
-	if !in_exit_trap && vp.transient && vp.runs.is_empty() && start_exit_trap_once(k, vp, cx) {
+	if !in_exit_trap && vp.transient && vp.runs.is_empty() && exit_trap_keeps_level(k, vp, cx, kept)
+	{
 		mark_exit_trap(vp, false, outside_functions);
 	}
 }
@@ -1849,8 +1851,9 @@ fn end_unit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 		},
 		FrameKind::NoFork | FrameKind::Stage => pop_frame(&mut k.root, cx.store, vp),
 		FrameKind::Subshell | FrameKind::Job { .. } => {
+			let kept = kept_level(vp);
 			unwind(&mut k.root, cx.store, vp, 0);
-			start_exit_trap_once(k, vp, cx);
+			exit_trap_keeps_level(k, vp, cx, kept);
 		},
 	}
 }
@@ -3353,8 +3356,9 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				pop_frame(&mut k.root, cx.store, vp);
 			} else {
 				// A subshell, pipeline stage or job ends: its EXIT trap runs.
+				let kept = kept_level(vp);
 				unwind(&mut k.root, cx.store, vp, 0);
-				start_exit_trap_once(k, vp, cx);
+				exit_trap_keeps_level(k, vp, cx, kept);
 			}
 			Flow::Call
 		},
@@ -4030,10 +4034,54 @@ fn left_frame(cx: &mut Cx<'_>, vp: &Vproc, flow: &Flow) -> Option<usize> {
 
 /// Whether the run is a `-c` string (its subshells keep the origin).
 fn runs_c(cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+	runs_c_in(cx.store, vp)
+}
+
+/// [`runs_c`] from the store alone.
+fn runs_c_in(store: &mut dyn StateStore, vp: &Vproc) -> bool {
 	matches!(
-		state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
+		state::record(store, vp, Key::Misc(MiscKey::RunOrigin)),
 		Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
 	)
+}
+
+/// The level a child forked from `vp` starts in ([`ParseLevel`]): the
+/// outermost `parse_and_execute` level still running at the fork, whose
+/// saved jump target bash's `top_level_cleanup` restores.
+/// - A level `vp`'s own fork kept is older than any it runs itself.
+/// - A substitution's text is a level while it runs; once the substitution's
+///   EXIT trap runs, the text has ended.
+/// - A subshell of a `-c` string kept the string's level from its fork. The
+///   root's string runs until its EXIT trap starts: bash leaves it (`exit`,
+///   `set -e` and a fatal error jump out of every level) before
+///   `run_exit_trap`.
+/// - Then a running EXIT trap action is the outermost level, as nothing below
+///   it runs any more, and `top_level_cleanup` restores its own jump target
+///   ([`ParseLevel::InExitTrap`]).
+/// - Else any `eval`, `.` or trap action is ([`ParseLevel::Kept`]).
+pub(super) fn fork_level(store: &mut dyn StateStore, vp: &Vproc) -> ParseLevel {
+	let exit_trap = exit_trap_frame(vp).is_some();
+	match vp
+		.frames
+		.first()
+		.map_or(ParseLevel::Outside, |f| f.parse_level)
+	{
+		base @ (ParseLevel::Kept | ParseLevel::InSubstitution | ParseLevel::InExitTrap) => {
+			return base;
+		},
+		ParseLevel::Substitution if !exit_trap => return ParseLevel::InSubstitution,
+		ParseLevel::Outside | ParseLevel::Substitution => {},
+	}
+	let level = vp.frames.iter().any(parse_and_execute);
+	let command =
+		runs_c_in(store, vp) && (vp.runs.is_empty() || (run_frame(vp).is_some() && !exit_trap));
+	if exit_trap && !command {
+		ParseLevel::InExitTrap
+	} else if level {
+		ParseLevel::Kept
+	} else {
+		ParseLevel::Outside
+	}
 }
 
 /// The run's own script frame (`None` in a subshell, which has none).
@@ -4066,10 +4114,11 @@ fn discard_top(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	// bash's `run_exit_trap` sets its own jump target: a discard inside a
 	// running EXIT trap action ends the action, and the shell exits with the
 	// trap's saved status (`trap_saved_exit_value`), not the discard's. A
-	// child whose fork kept a running `parse_and_execute` (a `-c` string,
-	// an `eval`, `.` or trap action, a substitution's text) is the exception:
-	// `top_level_cleanup` restores that level's jump target, which ends the
-	// child with status 1 below.
+	// child whose fork kept an older running `parse_and_execute` (a `-c`
+	// string, an `eval`, `.` or other trap action, a substitution's text) is
+	// the exception: `top_level_cleanup` restores that level's jump target,
+	// which ends the child below with the discard's status (1 under `-c` or
+	// in a substitution's text).
 	if let Some(i) = exit_trap_frame(vp)
 		&& !(super::nested::in_subshell(cx.store, vp) && kept_parse_level(cx, vp))
 	{
@@ -4122,17 +4171,52 @@ fn discard_top(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 	}
 }
 
-/// Whether a child runs inside a `parse_and_execute` level of the shell it
-/// forked from, still running in it: the run's `-c` string, or an `eval`,
-/// `.`, trap action or substitution's text ([`ParseLevel::Kept`],
-/// [`ParseLevel::InSubstitution`]). A command or process substitution's own
-/// text has ended by the time its EXIT trap runs.
+/// Whether a child's fork kept a running `parse_and_execute` level of the
+/// shell it forked from that is older than its own EXIT trap and no EXIT
+/// trap action itself ([`fork_level`]): the run's `-c` string, or an
+/// `eval`, `.`, other trap action or substitution's text
+/// ([`ParseLevel::Kept`], [`ParseLevel::InSubstitution`]). The level is
+/// read from the base frame, which is the trap's own once the child's
+/// frames are gone ([`exit_trap_keeps_level`]). A command or process
+/// substitution's own text has ended by the time its EXIT trap runs.
 fn kept_parse_level(cx: &mut Cx<'_>, vp: &Vproc) -> bool {
-	runs_c(cx, vp)
-		|| vp
-			.frames
-			.first()
-			.is_some_and(|f| matches!(f.parse_level, ParseLevel::Kept | ParseLevel::InSubstitution))
+	match vp
+		.frames
+		.first()
+		.map_or(ParseLevel::Outside, |f| f.parse_level)
+	{
+		ParseLevel::Kept | ParseLevel::InSubstitution => true,
+		ParseLevel::InExitTrap => false,
+		ParseLevel::Outside | ParseLevel::Substitution => runs_c(cx, vp),
+	}
+}
+
+/// The level a child's fork kept ([`fork_level`]), read before its frames
+/// unwind for its EXIT trap: bash's unwind-protects still hold that level
+/// while the trap runs. A substitution's own text level has ended.
+fn kept_level(vp: &Vproc) -> ParseLevel {
+	match vp.frames.first().map(|f| f.parse_level) {
+		Some(level @ (ParseLevel::Kept | ParseLevel::InSubstitution | ParseLevel::InExitTrap)) => {
+			level
+		},
+		_ => ParseLevel::Outside,
+	}
+}
+
+/// Start a child's EXIT trap once its frames are gone
+/// ([`start_exit_trap_once`]); the trap's frame, now the base, takes over
+/// `kept`, the level the child's fork kept ([`kept_level`]).
+fn exit_trap_keeps_level(
+	k: &mut Kernel,
+	vp: &mut Vproc,
+	cx: &mut Cx<'_>,
+	kept: ParseLevel,
+) -> bool {
+	let started = start_exit_trap_once(k, vp, cx);
+	if started && let [frame] = vp.frames.as_mut_slice() {
+		frame.parse_level = kept;
+	}
+	started
 }
 
 /// End the EXIT trap action at frame `i` where bash's `run_exit_trap`
