@@ -2368,7 +2368,6 @@ mod tests {
 	/// drops a stop signal that lands while the child is still in `execve`.
 	#[cfg(target_os = "linux")]
 	fn signals_taken(pid: i32, program: &str) {
-		let deadline = std::time::Instant::now() + Duration::from_secs(20);
 		// Only polling sees the name change: checks 1 ms apart at first, at
 		// most 20 ms apart later.
 		let mut backoff = crate::testkit::Backoff::new();
@@ -2377,30 +2376,16 @@ mod tests {
 			if comm.trim_end() == program || child_event(pid, libc::WEXITED, false) {
 				break;
 			}
-			assert!(
-				std::time::Instant::now() < deadline,
-				"child {pid} never ran {program} in 20 s (comm {comm:?})",
-			);
 			std::thread::sleep(backoff.pause());
 		}
 		// SAFETY: plain syscall; `pid` is the test's own unreaped child.
 		let rc = unsafe { libc::kill(pid, libc::SIGSTOP) };
 		assert_eq!(rc, 0, "SIGSTOP to {pid}: {}", std::io::Error::last_os_error());
-		// A thread blocks in `waitid` until the child is stopped or dead.
-		let (taken, waited) = std::sync::mpsc::channel();
-		std::thread::spawn(move || {
-			let _ = taken.send(child_event(pid, libc::WSTOPPED | libc::WEXITED, true));
-		});
-		match waited.recv_timeout(Duration::from_secs(20)) {
-			Ok(true) => {},
-			Ok(false) => panic!("waitid on {pid} reported no event while it blocked"),
-			Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-				panic!("waitid on {pid} failed (see the helper thread's panic)")
-			},
-			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-				panic!("child {pid} neither stopped nor died in 20 s after SIGSTOP")
-			},
-		}
+		// Blocks in `waitid` until the child is stopped or dead.
+		assert!(
+			child_event(pid, libc::WSTOPPED | libc::WEXITED, true),
+			"waitid on {pid} reported no event while it blocked"
+		);
 	}
 
 	/// Whether child `pid` has an event of `kinds` to report, without reaping

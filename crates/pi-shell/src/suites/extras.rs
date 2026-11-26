@@ -197,9 +197,10 @@ async fn cancel_ends_an_extra_promptly() {
 	// The cancel reaches `sleep` while it runs, not the command before it
 	// starts.
 	let cancelling = async {
-		tokio::time::timeout(Duration::from_secs(20), parked.0.notified())
-			.await
-			.expect("the shell never parked on `sleep`");
+		// A hang here means the shell never parked on `sleep`: the test's bound
+		// in `.config/nextest.toml` fails it by name (nextest, or the gate's
+		// one-process runner).
+		parked.0.notified().await;
 		trigger.cancel();
 	};
 	let (ran, ()) = tokio::join!(run_with(&mut s, options, cancel), cancelling);

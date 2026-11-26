@@ -1718,13 +1718,9 @@ async fn uutils_head_stdin_read_is_cancellable() {
 		// Only polling sees the byte leave: checks 1 ms apart at first, at most
 		// 20 ms apart later.
 		let mut backoff = crate::testkit::Backoff::new();
-		time::timeout(Duration::from_secs(5), async {
-			while queued_in_pipe(&probe) > 0 {
-				time::sleep(backoff.pause()).await;
-			}
-		})
-		.await
-		.expect("head never took the byte waiting in its stdin");
+		while queued_in_pipe(&probe) > 0 {
+			time::sleep(backoff.pause()).await;
+		}
 		token.cancel();
 	});
 	// The pipe's writer stays open, so only the cancel can end `head`.

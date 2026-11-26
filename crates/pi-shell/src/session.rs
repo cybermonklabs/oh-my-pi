@@ -1627,10 +1627,10 @@ mod tests {
 		let (_, old) = trace_capture(&mut session, &job).await;
 		let old_version = old.version();
 		let next_run = format!(": > '{}'; wait; echo next", go.display());
-		let (captured, next) =
-			tokio::time::timeout(Duration::from_secs(20), trace_capture(&mut session, &next_run))
-				.await
-				.expect("the next run's `wait` for the old job never ended");
+		// A hang here means the next run's `wait` for the old job never ended:
+		// the test's bound in `.config/nextest.toml` fails it by name (nextest,
+		// or the gate's one-process runner).
+		let (captured, next) = trace_capture(&mut session, &next_run).await;
 		assert_eq!(captured.stdout, "next\n");
 		assert_eq!(trace_output(&next.snapshot()), captured.stdout);
 		assert_eq!(old.version(), old_version);
@@ -1729,10 +1729,10 @@ mod tests {
 		let (_, first) = trace_capture(&mut session, &job).await;
 		let first_version = first.version();
 		let next_run = format!(": > '{}'; wait; echo new", go.display());
-		let (captured, second) =
-			tokio::time::timeout(Duration::from_secs(20), trace_capture(&mut session, &next_run))
-				.await
-				.expect("the next run's `wait` for the old job never ended");
+		// A hang here means the next run's `wait` for the old job never ended:
+		// the test's bound in `.config/nextest.toml` fails it by name (nextest,
+		// or the gate's one-process runner).
+		let (captured, second) = trace_capture(&mut session, &next_run).await;
 		assert_eq!(captured.stdout, "new\n");
 		assert_eq!(trace_output(&second.snapshot()), "new\n");
 		assert_eq!(first.version(), first_version, "closed run streams stop observing late output");
@@ -1801,9 +1801,10 @@ mod tests {
 				.await
 				.unwrap();
 			let next_run = format!(": > '{}'; wait; echo second", go.display());
-			let next = tokio::time::timeout(Duration::from_secs(20), sh(&mut s, &next_run))
-				.await
-				.expect("the next run's `wait` for the job never ended");
+			// A hang here means the next run's `wait` for the job never ended: the
+			// test's bound in `.config/nextest.toml` fails it by name (nextest, or
+			// the gate's one-process runner).
+			let next = sh(&mut s, &next_run).await;
 			assert_eq!(next.stdout, "second\n", "{job}");
 			assert_eq!(next.stderr, "", "{job}");
 		}
@@ -1846,14 +1847,16 @@ mod tests {
 		let parked = Arc::new(Parked::default());
 		let options = RunOptions { events: Some(parked.clone()), ..RunOptions::new(command) };
 		let release = async {
-			tokio::time::timeout(Duration::from_secs(20), parked.rang.notified())
-				.await
-				.expect("the run never parked waiting for its job");
+			// A hang here means the run never parked waiting for its job: the
+			// test's bound in `.config/nextest.toml` fails it by name (nextest, or
+			// the gate's one-process runner).
+			parked.rang.notified().await;
 			std::fs::write(&go, "").unwrap();
 		};
-		let run = tokio::time::timeout(Duration::from_secs(20), capture(&mut s, options));
-		let (c, ()) = tokio::join!(run, release);
-		let c = c.expect("the run's `wait` for its job never ended");
+		// A hang in `capture` after the release means the run parked but its
+		// `wait` for the job never ended; the test's bound fails that by name
+		// too.
+		let (c, ()) = tokio::join!(capture(&mut s, options), release);
 		assert_eq!((c.outcome.status, c.stdout.as_str(), c.stderr.as_str()), (0, "job\n", "error\n"));
 	}
 

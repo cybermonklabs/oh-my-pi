@@ -325,19 +325,18 @@ mod tests {
 			// and proves nothing about a blocked read.
 			#[cfg(target_os = "linux")]
 			{
-				let tid = tokio::time::timeout(Duration::from_secs(10), pool_threads.recv())
-					.await
-					.ok()
-					.flatten()
-					.expect("cat's blocking-pool thread never started");
+				// A hang here means cat's blocking-pool thread never started: the test's
+				// bound in `.config/nextest.toml` fails it by name (nextest, or the gate's
+				// one-process runner).
+				let tid = pool_threads.recv().await.expect("cat's blocking-pool thread never started");
 				let mut backoff = crate::host::Backoff::new();
-				tokio::time::timeout(Duration::from_secs(10), async {
-					while thread_state(tid) != Some('S') {
-						tokio::time::sleep(backoff.pause()).await;
+				loop {
+					match thread_state(tid) {
+						Some('S') => break,
+						None => panic!("cat's thread never blocked in its stdin read"),
+						Some(_) => tokio::time::sleep(backoff.pause()).await,
 					}
-				})
-				.await
-				.expect("cat's thread never blocked in its stdin read");
+				}
 			}
 			// Without `/proc`, give cat time to reach the read.
 			#[cfg(not(target_os = "linux"))]

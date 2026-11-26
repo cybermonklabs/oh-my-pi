@@ -533,10 +533,9 @@ mod tests {
 
 	/// Returns once this process's thread `tid` sleeps (state `S`), as a
 	/// parked thread does, looking 1 ms apart at first and at most 20 ms apart
-	/// later; fails after 10 seconds.
+	/// later.
 	#[cfg(target_os = "linux")]
 	fn wait_until_asleep(tid: libc::pid_t) {
-		let deadline = std::time::Instant::now() + Duration::from_secs(10);
 		let mut backoff = crate::testkit::Backoff::new();
 		loop {
 			let stat =
@@ -549,7 +548,6 @@ mod tests {
 			{
 				return;
 			}
-			assert!(std::time::Instant::now() < deadline, "the reader never parked");
 			thread::sleep(backoff.pause());
 		}
 	}
@@ -574,14 +572,11 @@ mod tests {
 			w.write_all(b"x").unwrap();
 			w
 		});
-		// The watch's wake ends the park; the deadline only ends a test whose
-		// wake never comes.
-		let deadline = Instant::now() + Duration::from_secs(10);
+		// The watch's wake ends the park. A hang here means the watch never
+		// woke the reader: the test's bound in `.config/nextest.toml` fails it
+		// by name (nextest, or the gate's one-process runner).
 		while !woken.woken.load(Ordering::SeqCst) {
-			let left = deadline
-				.checked_duration_since(Instant::now())
-				.expect("the watch never woke the reader");
-			thread::park_timeout(left);
+			thread::park();
 		}
 		assert!(now(r.as_raw_fd(), READ).unwrap(), "woken once readable");
 		drop(writer.join().unwrap());

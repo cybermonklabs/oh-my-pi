@@ -686,8 +686,7 @@ fn generator_wakes_when_a_segment_arrives_while_it_waits() {
 			// generator takes after that pass, as it starts waiting for the
 			// receiver. From that flush on, the generator sleeps only in that
 			// wait, and the segment arrives once it does.
-			let held = flushes.recv_timeout(Duration::from_secs(30));
-			let held = held.expect("the generator never flushed its stream");
+			let held = flushes.recv().expect("the generator never flushed its stream");
 			assert!(held > 0, "list 0 wrote nothing, so the flush is inside the output pass");
 			generator.wait_asleep("the generator to wait for the receiver", Duration::from_millis(50));
 			flists.push(second);

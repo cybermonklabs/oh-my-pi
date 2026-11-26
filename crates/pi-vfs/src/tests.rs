@@ -791,29 +791,23 @@ impl Drop for OpenMark {
 	}
 }
 
-/// Whether a thread named `name` sleeps within three seconds, polled with
-/// pauses from 1 ms up to 20 ms on the runtime's timer. Without `/proc`,
-/// `true` after 200 ms instead.
+/// Returns once a thread named `name` sleeps, polled with pauses from 1 ms
+/// up to 20 ms on the runtime's timer. Without `/proc`, after 200 ms
+/// instead.
 #[cfg(unix)]
-async fn named_thread_sleeps(name: &str) -> bool {
+async fn named_thread_sleeps(name: &str) {
 	#[cfg(target_os = "linux")]
 	{
-		let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
 		let named_asleep = |tid: libc::pid_t| thread_name(tid) == name && asleep(tid);
 		let mut backoff = Backoff::new();
 		while !thread_ids().into_iter().any(named_asleep) {
-			if tokio::time::Instant::now() >= deadline {
-				return false;
-			}
 			tokio::time::sleep(backoff.pause()).await;
 		}
-		true
 	}
 	#[cfg(not(target_os = "linux"))]
 	{
 		let _ = name;
 		tokio::time::sleep(Duration::from_millis(200)).await;
-		true
 	}
 }
 
@@ -902,14 +896,13 @@ fn unread(file: &std::fs::File) -> libc::c_int {
 	bytes
 }
 
-/// Polls `ready` until it holds, with pauses from 1 ms up to 20 ms; fails
-/// after 20 seconds, naming `what` it never saw.
+/// Polls `ready` until it holds, with pauses from 1 ms up to 20 ms. A wait
+/// for `what` that never comes is failed by name at the test's bound in
+/// `.config/nextest.toml` (nextest, or the gate's one-process runner).
 #[cfg(target_os = "linux")]
-fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-	let deadline = std::time::Instant::now() + Duration::from_secs(20);
+fn wait_for(_what: &str, mut ready: impl FnMut() -> bool) {
 	let mut backoff = Backoff::new();
 	while !ready() {
-		assert!(std::time::Instant::now() < deadline, "never saw {what}");
 		std::thread::sleep(backoff.pause());
 	}
 }
@@ -1101,9 +1094,8 @@ fn async_whole_file_reads_end_at_the_token_on_a_current_thread_runtime() {
 				let canceller = tokio::spawn(async move {
 					// The cancel comes once the read waits on the blocking pool,
 					// for the writer or for its data.
-					let waited = named_thread_sleeps(&pool).await;
+					named_thread_sleeps(&pool).await;
 					task_token.cancel();
-					waited
 				});
 				let read = async {
 					if idle_writer {
@@ -1116,7 +1108,8 @@ fn async_whole_file_reads_end_at_the_token_on_a_current_thread_runtime() {
 					}
 				}
 				.await;
-				(read, canceller.await.unwrap())
+				canceller.await.unwrap();
+				read
 			});
 			let _ = done_tx.send(result);
 		});
@@ -1126,9 +1119,8 @@ fn async_whole_file_reads_end_at_the_token_on_a_current_thread_runtime() {
 		if let Some(writer) = writer {
 			drop(writer.join().unwrap());
 		}
-		let (read, waited) =
+		let read =
 			result.unwrap_or_else(|_| panic!("idle_writer={idle_writer}: the read ignored its token"));
-		assert!(waited, "idle_writer={idle_writer}: the read was never seen waiting");
 		let err = read.unwrap_err();
 		assert!(is_cancelled(&err), "idle_writer={idle_writer}: {err}");
 	}

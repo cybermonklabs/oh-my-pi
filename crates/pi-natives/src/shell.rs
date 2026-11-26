@@ -1095,9 +1095,11 @@ mod tests {
 		assert!(child_sid > 0, "getsid({child_pid}) failed: {}", std::io::Error::last_os_error());
 		// Release the child: the line ends its `read`, so `sh` exits 0.
 		hold.release().expect("release the child");
-		let result = time::timeout(Duration::from_secs(30), handle)
+		// A hang here means the child did not exit after its release: the test's
+		// bound in `.config/nextest.toml` fails it by name (nextest, or the
+		// gate's one-process runner).
+		let result = handle
 			.await
-			.expect("the child did not exit after its release")
 			.expect("shell task panicked")
 			.expect("shell run");
 		drop(hold);
@@ -1108,22 +1110,24 @@ mod tests {
 
 	/// Waits until process `pid` sleeps in a blocking call: state `S` in
 	/// `/proc/<pid>/stat`, looked at 1 ms apart at first and at most 20 ms
-	/// apart later.
+	/// apart later. Fails when the process ends first.
 	#[cfg(target_os = "linux")]
 	async fn wait_until_asleep(pid: i32) {
-		let deadline = time::Instant::now() + Duration::from_secs(30);
 		let mut pause = Duration::from_millis(1);
 		loop {
 			let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
 			// `pid (comm) state ...`: comm may hold spaces and parentheses, so
 			// the state is the first field after the last `)`.
-			if stat
+			match stat
 				.rsplit_once(')')
-				.is_some_and(|(_, rest)| rest.trim_start().starts_with('S'))
+				.and_then(|(_, rest)| rest.trim_start().chars().next())
 			{
-				return;
+				Some('S') => return,
+				None | Some('Z' | 'X') => {
+					panic!("process {pid} never went to sleep: it ended, or its state could not be read")
+				},
+				Some(_) => {},
 			}
-			assert!(time::Instant::now() < deadline, "process {pid} never went to sleep");
 			time::sleep(pause).await;
 			pause = (pause * 2).min(Duration::from_millis(20));
 		}
@@ -1164,9 +1168,9 @@ mod tests {
 
 		// Cancel only once the background job holds the pipe open and `sh`
 		// sleeps in `wait`, so the pipe cannot reach EOF on its own.
-		let sh_pid = time::timeout(Duration::from_secs(30), rx.recv_async())
+		let sh_pid = rx
+			.recv_async()
 			.await
-			.expect("sh never printed its pid")
 			.expect("missing sh pid chunk")
 			.trim()
 			.parse::<i32>()

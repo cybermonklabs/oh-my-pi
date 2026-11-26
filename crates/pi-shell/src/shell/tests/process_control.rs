@@ -1041,16 +1041,14 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 			let waits = Arc::new(WaitsForJob::default());
 			let options = RunOptions { events: Some(waits.clone()), ..RunOptions::new(resume) };
 			let release_stages = async {
-				time::timeout(Duration::from_secs(20), async {
-					while stages.iter().any(is_stopped) {
-						time::sleep(Duration::from_millis(10)).await;
-					}
-				})
-				.await
-				.expect("stopped stages were not continued");
-				time::timeout(Duration::from_secs(20), waits.0.notified())
-					.await
-					.expect("fg never waited for the job");
+				// A hang here means the stopped stages were not continued, or fg
+				// never waited for the job: the test's bound in
+				// `.config/nextest.toml` fails it by name (nextest, or the gate's
+				// one-process runner).
+				while stages.iter().any(is_stopped) {
+					time::sleep(Duration::from_millis(10)).await;
+				}
+				waits.0.notified().await;
 				// The park marks the start of the window, not its end: a
 				// selected stage's stop report may still arrive while fg waits,
 				// and nothing reports that every one has been drained. This
@@ -1058,21 +1056,16 @@ async fn resumed_pipeline_drains_every_selected_stop_report() {
 				time::sleep(Duration::from_millis(200)).await;
 				fs::write(&release, "").expect("release stages");
 			};
-			let run = time::timeout(
-				Duration::from_secs(20),
-				session
-					.session
-					.run_with(options, stdio.run_stdio(), CancellationToken::new()),
-			);
+			let run = session
+				.session
+				.run_with(options, stdio.run_stdio(), CancellationToken::new());
 			tokio::pin!(run);
 			// A fg that ends before it waits (a stale stop) needs no release.
 			let resumed = tokio::select! {
 				resumed = &mut run => resumed,
 				() = release_stages => run.await,
 			};
-			let resumed = resumed
-				.expect("resumed pipeline did not complete")
-				.expect("foreground resumed pipeline");
+			let resumed = resumed.expect("foreground resumed pipeline");
 			assert_eq!(
 				exit_code(&resumed),
 				0,

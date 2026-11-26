@@ -2183,29 +2183,21 @@ mod tests {
 		// This thread reads the reader (so it may serve it while writing).
 		tx.send(frame(MSG_DATA, b"a")).unwrap();
 		r.read_exact(&mut [0u8; 1]).unwrap();
-		let (done_tx, done) = flume::bounded::<()>(1);
-		let late_release = Arc::clone(&release);
 		let sender = thread::spawn(move || {
 			// The write is blocked once the output thread is inside a write call: it
 			// writes only while the waiting writer lets it.
-			let stuck = stuck.recv_timeout(Duration::from_secs(30));
-			stuck.expect("the write never reached the connection");
+			stuck.recv().expect("the write never reached the connection");
 			tx.send(frame(MSG_ERROR_EXIT, &12i32.to_le_bytes())).unwrap();
-			// A write that misses the exit stays blocked: release the connection
-			// after 10 s so the test fails instead of hanging.
-			let missed = done.recv_timeout(Duration::from_secs(10)).is_err();
-			if missed {
-				late_release.store(true, Ordering::Relaxed);
-			}
-			(tx, missed)
+			tx
 		});
 		let start = Instant::now();
+		// A hang here means the blocked write did not end on the peer's exit: the
+		// test's bound in `.config/nextest.toml` fails it by name (nextest, or the
+		// gate's one-process runner).
 		let res = w.write_all(&vec![0u8; 200_000]);
 		let elapsed = start.elapsed();
-		let _ = done_tx.send(());
 		release.store(true, Ordering::Relaxed);
-		let (tx, missed) = sender.join().unwrap();
-		assert!(!missed, "the blocked write did not end on the peer's exit within 10 s");
+		let tx = sender.join().unwrap();
 		let err = res.unwrap_err();
 		assert_eq!(wire_detail(&err).unwrap().code, 12);
 		assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");

@@ -1228,23 +1228,19 @@ fn spawn_piped(
 	}
 }
 
-/// Test support: bounded waits for what another thread does.
+/// Test support: waits for what another thread does.
 #[cfg(test)]
 pub(crate) mod wait {
-	use std::time::{Duration, Instant};
+	use std::time::Duration;
 
 	use crate::host::Backoff;
 
-	/// How long a test waits for an event before it fails.
-	const BOUND: Duration = Duration::from_secs(30);
-
-	/// Polls `ready` until it holds, with pauses from 1 ms up to 20 ms; fails
-	/// naming `what` when it does not within 30 s.
-	pub(crate) fn until(what: &str, mut ready: impl FnMut() -> bool) {
-		let deadline = Instant::now() + BOUND;
+	/// Polls `ready` until it holds, with pauses from 1 ms up to 20 ms. A wait
+	/// for `what` that never comes is failed by name at the test's bound in
+	/// `.config/nextest.toml` (nextest, or the gate's one-process runner).
+	pub(crate) fn until(_what: &str, mut ready: impl FnMut() -> bool) {
 		let mut backoff = Backoff::new();
 		while !ready() {
-			assert!(Instant::now() < deadline, "timed out after {BOUND:?} waiting for {what}");
 			std::thread::sleep(backoff.pause());
 		}
 	}

@@ -677,11 +677,11 @@ async fn dropping_a_walk_cancels_it() {
 	// The workers hold the walk's visitor and with it `counted`: once the
 	// aborted workers are gone, nothing can visit any more.
 	// Only polling sees the count fall: checks 1 ms apart at first, at most
-	// 20 ms apart later.
-	let deadline = std::time::Instant::now() + Duration::from_secs(10);
+	// 20 ms apart later. A hang here means the dropped walk kept its workers:
+	// the test's bound in `.config/nextest.toml` fails it by name (nextest, or
+	// the gate's one-process runner).
 	let mut pause = Duration::from_millis(1);
 	while Arc::strong_count(&visits) > 1 {
-		assert!(std::time::Instant::now() < deadline, "the dropped walk kept its workers");
 		tokio::time::sleep(pause).await;
 		pause = (pause * 2).min(Duration::from_millis(20));
 	}

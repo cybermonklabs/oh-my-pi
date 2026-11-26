@@ -6,10 +6,7 @@
 
 mod pty_support;
 
-use std::{
-	io,
-	time::{Duration, Instant},
-};
+use std::{io, time::Duration};
 
 use pi_shell::sys::proc;
 use pty_support::{Pty, Screen, Spawn, TIMEOUT, differential, have_real_zsh};
@@ -131,17 +128,15 @@ fn ctrl_c_ends_a_foreground_command_like_zsh() -> io::Result<()> {
 /// Wait until `sleep` has exec'd in the terminal's session (forked by the
 /// shell or exec'd in its place): `^C` then comes while the command runs,
 /// not while a shell starts. It looks 1 ms apart at first, at most 20 ms
-/// apart later.
+/// apart later. A hang here means `sleep` never ran on the terminal (or the
+/// shell ended first): the test's bound in `.config/nextest.toml` fails it by
+/// name (nextest, or the gate's one-process runner).
 fn wait_for_sleep(pty: &Pty) -> io::Result<()> {
-	let deadline = Instant::now() + TIMEOUT;
 	let mut pause = Duration::from_millis(1);
 	while !proc::session_members(pty.pid())?
 		.iter()
 		.any(|p| p.name == "sleep" && p.state != proc::ProcState::Zombie)
 	{
-		if Instant::now() >= deadline {
-			return Err(io::Error::new(io::ErrorKind::TimedOut, "sleep never ran on the terminal"));
-		}
 		std::thread::sleep(pause);
 		pause = (pause * 2).min(Duration::from_millis(20));
 	}

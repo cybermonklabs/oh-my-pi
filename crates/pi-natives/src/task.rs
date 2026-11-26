@@ -841,8 +841,6 @@ mod tests {
 	/// abort can drop it.
 	#[test]
 	fn dropping_the_caller_stops_work_on_the_filesystem_runtime() {
-		use std::time::Duration;
-
 		/// Sends on its channel when dropped: the work future that holds it
 		/// was dropped, so it can never run on.
 		struct SignalOnDrop(flume::Sender<()>);
@@ -877,12 +875,13 @@ mod tests {
 			}
 			drop(work.take());
 
-			tokio::time::timeout(Duration::from_secs(10), dropped_rx.recv_async())
+			// A hang here means the work ran on after its caller was dropped, so a
+			// closed session leaves filesystem work running: the test's bound in
+			// `.config/nextest.toml` fails it by name (nextest, or the gate's
+			// one-process runner).
+			dropped_rx
+				.recv_async()
 				.await
-				.expect(
-					"the work ran on after its caller was dropped, so a closed session leaves \
-					 filesystem work running",
-				)
 				.expect("the work's drop signal never arrived");
 		});
 	}

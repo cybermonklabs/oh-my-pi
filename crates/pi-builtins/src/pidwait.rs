@@ -53,9 +53,8 @@ mod tests {
 
 		// Leave the child unreaped so it remains visible in the process snapshot,
 		// and wait until it has exited: `WNOWAIT` sees the exit without reaping.
-		// The wait blocks in `waitid` on a thread of its own: the runtime's
-		// shutdown would wait for a blocking-pool thread, and the timeout would
-		// not end the test.
+		// A child that never exits is failed by name at the test's bound in
+		// `.config/nextest.toml` (nextest, or the gate's one-process runner).
 		#[cfg(target_os = "linux")]
 		{
 			use nix::{
@@ -74,11 +73,7 @@ mod tests {
 				};
 				let _ = sender.send(done);
 			});
-			let Ok(exited) = tokio::time::timeout(Duration::from_secs(10), exited).await else {
-				let _ = child.kill();
-				anyhow::bail!("the child did not exit");
-			};
-			exited??;
+			exited.await??;
 		}
 		// Elsewhere, give the trivial command time to reach its exited state.
 		#[cfg(not(target_os = "linux"))]
