@@ -50,6 +50,7 @@ type TokenizerModel = Pick<Model, "tokenizer"> &
 		thinking?: Model["thinking"];
 		reasoning?: boolean;
 		requestModelId?: string;
+		providerType?: string;
 	};
 
 /** The model an assistant turn's native reasoning (signed thinking, Responses history) is replayed to. */
@@ -283,7 +284,7 @@ export class Tokenizer {
 						reasoning: model.reasoning === true,
 						requestModelId: model.requestModelId,
 						thinking: model.thinking,
-						compat: model.compat,
+						providerType: model.providerType,
 					}
 				: undefined;
 		this.reasoningReplayKey = reasoningReplayKey(model);
@@ -533,7 +534,6 @@ export class Tokenizer {
 						fragments.push(block.name);
 						fragments.push(stringifyJson(block.arguments) ?? "null");
 					} else if (block.type === "redactedThinking") {
-						if (thinkingReader && dropsForeignThinking(message, thinkingReader, true)) continue;
 						// Encrypted reasoning blob the provider still bills for wherever it
 						// survives replay, as above; excluded from the compaction floor for
 						// the same reason.

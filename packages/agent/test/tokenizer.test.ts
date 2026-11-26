@@ -431,31 +431,93 @@ describe("chat-completions history estimate", () => {
 	});
 });
 
-// Contract: Claude gets none of another model's thinking that it would read as
-// text (`dropsForeignThinking`), and the estimate leaves out exactly what the
-// request leaves out; thinking the request carries still counts.
+// Contract: Claude gets another model's thinking only as a block signed on its
+// own provider's Anthropic Messages endpoint (`dropsForeignThinking`), and the
+// estimate leaves out exactly what the request leaves out; thinking the
+// request carries still counts.
 describe("Claude history estimate", () => {
 	const THINKING = "Let me reason about the parser carefully. ".repeat(400);
 	const toolCall = { type: "toolCall", id: "toolu_1", name: "read", arguments: { path: "a.ts" } } as const;
-	const claude = buildModel({
+	const spec = {
 		id: "claude-opus-4-8",
 		name: "Claude Opus 4.8",
-		api: "anthropic-messages",
-		provider: "anthropic",
-		baseUrl: "https://api.anthropic.com",
+		api: "anthropic-messages" as const,
 		reasoning: true,
-		input: ["text"],
+		input: ["text" as const],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 200_000,
 		maxTokens: 32_000,
+	};
+	const firstParty = buildModel({ ...spec, provider: "anthropic", baseUrl: "https://api.anthropic.com" });
+	const customHost = buildModel({
+		...spec,
+		provider: "custom-anthropic",
+		baseUrl: "https://llm.example.com/anthropic",
 	});
-	const tokenizer = new Tokenizer(claude);
 	const floor = { excludeEncryptedReasoning: true };
+	const sonnet = { api: "anthropic-messages", provider: "anthropic", model: "claude-sonnet-4-6" } as const;
 
-	function thinkingTurn(source: Pick<AssistantMessage, "api" | "provider" | "model">, signature: string) {
-		return {
+	test.each([
+		{
+			name: "its own signed turn",
+			reader: firstParty,
+			source: { api: "anthropic-messages", provider: "anthropic", model: "claude-opus-4-8" },
+			signature: "sig_own",
+			carried: true,
+		},
+		{
+			name: "another Claude model's signed turn on the same deployment",
+			reader: firstParty,
+			source: sonnet,
+			signature: "sig_sonnet",
+			carried: true,
+		},
+		{
+			name: "another Claude model's signed turn on the same custom host",
+			reader: customHost,
+			source: { api: "anthropic-messages", provider: "custom-anthropic", model: "claude-sonnet-4-6" },
+			signature: "sig_sonnet",
+			carried: true,
+		},
+		{
+			name: "another model's turn on another wire",
+			reader: firstParty,
+			source: { api: "openai-completions", provider: "vertex", model: "google/gemini-3.1-pro-preview" },
+			signature: "reasoning_content",
+			carried: false,
+		},
+		{
+			name: "another model's signed turn on another Anthropic Messages host",
+			reader: firstParty,
+			source: { api: "anthropic-messages", provider: "kimi-code", model: "k3" },
+			signature: "kimi-issued-signature",
+			carried: false,
+		},
+		// The replay strips the signature of a turn that abandoned its tool calls,
+		// and of an aborted turn's final block; another model's block is then unsigned.
+		{
+			name: "another Claude model's abandoned turn on the same deployment",
+			reader: firstParty,
+			source: sonnet,
+			signature: "sig_sonnet",
+			stop: "stop",
+			carried: false,
+		},
+		{
+			name: "another Claude model's aborted turn whose final block is its thinking",
+			reader: firstParty,
+			source: sonnet,
+			signature: "sig_sonnet",
+			stop: "aborted",
+			carried: false,
+		},
+	] as const)("counts thinking only when a request carries it: $name", row => {
+		const { reader, source, signature, carried } = row;
+		const stopReason: AssistantMessage["stopReason"] = ("stop" in row && row.stop) || "toolUse";
+		const thinking = { type: "thinking", thinking: THINKING, thinkingSignature: signature } as const;
+		const turn: AssistantMessage = {
 			role: "assistant",
-			content: [{ type: "thinking", thinking: THINKING, thinkingSignature: signature }, toolCall],
+			content: stopReason === "aborted" ? [toolCall, thinking] : [thinking, toolCall],
 			...source,
 			usage: {
 				input: 100,
@@ -465,43 +527,20 @@ describe("Claude history estimate", () => {
 				totalTokens: 3_100,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
-			stopReason: "toolUse",
+			stopReason,
 			timestamp: 1,
-		} satisfies AssistantMessage;
-	}
-
-	const toolCallOnly = tokenizer.countMessage({
-		...thinkingTurn({ api: "anthropic-messages", provider: "anthropic", model: claude.id }, "x"),
-		content: [toolCall],
-	});
-
-	test.each([
-		{
-			name: "its own signed turn",
-			source: { api: "anthropic-messages", provider: "anthropic", model: "claude-opus-4-8" },
-			signature: "sig_own",
-			carried: true,
-		},
-		{
-			name: "another Claude model's signed turn on the same deployment",
-			source: { api: "anthropic-messages", provider: "anthropic", model: "claude-sonnet-4-6" },
-			signature: "sig_sonnet",
-			carried: true,
-		},
-		{
-			name: "another model's turn on another wire",
-			source: { api: "openai-completions", provider: "vertex", model: "google/gemini-3.1-pro-preview" },
-			signature: "reasoning_content",
-			carried: false,
-		},
-		{
-			name: "another model's signed turn on another Anthropic Messages host",
-			source: { api: "anthropic-messages", provider: "kimi-code", model: "k3" },
-			signature: "kimi-issued-signature",
-			carried: false,
-		},
-	] as const)("counts thinking only when a request carries it: $name", ({ source, signature, carried }) => {
-		const turn = thinkingTurn(source, signature);
+		};
+		// A later turn of the reader's own, so `turn` is never the latest one,
+		// which the replay keeps byte-for-byte and a one-message count cannot see.
+		const later: AssistantMessage = {
+			...turn,
+			content: [{ type: "text", text: "Next." }],
+			api: reader.api,
+			provider: reader.provider,
+			model: reader.id,
+			stopReason: "stop",
+			timestamp: 4,
+		};
 		const params = convertAnthropicMessages(
 			[
 				{ role: "user", content: "Fix the parser.", timestamp: 0 },
@@ -514,10 +553,14 @@ describe("Claude history estimate", () => {
 					isError: false,
 					timestamp: 2,
 				},
+				{ role: "user", content: "Continue.", timestamp: 3 },
+				later,
 			],
-			claude,
+			reader,
 			false,
 		);
+		const tokenizer = new Tokenizer(reader);
+		const toolCallOnly = tokenizer.countMessage({ ...turn, content: [toolCall] });
 		const sent = JSON.stringify(params).includes(THINKING.trim());
 		const counted = tokenizer.countMessage(turn, floor) > toolCallOnly;
 		expect({ sent, counted }).toEqual({ sent: carried, counted: carried });

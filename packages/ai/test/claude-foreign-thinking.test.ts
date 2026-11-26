@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { gunzipSync } from "node:zlib";
 import { convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { streamDevin } from "@oh-my-pi/pi-ai/providers/devin";
 import { convertMessages } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import type {
@@ -12,15 +14,18 @@ import type {
 	UserMessage,
 } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { GetChatMessageRequestSchema, GetUserJwtResponseSchema } from "@oh-my-pi/pi-catalog/discovery/devin-proto";
+import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 
 /**
  * Claude's input classifier (`reasoning_extraction`) refuses a request whose
  * earlier assistant turns carry another model's reasoning as plain prose. A
  * session that moved from Claude to another model and back sent that model's
  * thinking demoted to text and was refused; the same request with only that
- * thinking removed was served. A Claude target therefore gets none of another
- * model's thinking. The other model's answers and tool calls stay, and
- * Claude's own thinking replays as it did before.
+ * thinking removed was served. A Claude target therefore gets another model's
+ * thinking only as a block signed on its own provider's Anthropic Messages
+ * endpoint, which replays natively as before. The other model's answers and
+ * tool calls stay, and Claude's own thinking replays as it did before.
  */
 
 const REASONING = "Plan: read config.ts first, then patch the parser and rerun the suite.";
@@ -151,6 +156,7 @@ interface WireBlock {
 	text?: string;
 	thinking?: string;
 	signature?: string;
+	data?: string;
 	id?: string;
 	name?: string;
 	input?: unknown;
@@ -222,8 +228,10 @@ describe("a Claude target gets none of another model's thinking", () => {
 
 	it("drops the same Claude model's thinking from another route, in both directions", () => {
 		// A gateway in front of Anthropic and the direct route serve one model,
-		// but a signature from one route does not verify on the other, so that
-		// thinking would arrive as bare prose too.
+		// but a signature from one route does not verify on the other. The
+		// thinking went out as text (to the direct route, and to a gateway set not
+		// to replay unsigned thinking) or, at a gateway's default compat, as an
+		// unsigned block that a host in front of Anthropic rejects.
 		const direct = anthropicTarget({ id: "claude-opus-5-5" });
 		const gateway = anthropicTarget({
 			provider: "model-gateway",
@@ -231,21 +239,62 @@ describe("a Claude target gets none of another model's thinking", () => {
 			baseUrl: "https://gateway.example.com",
 			compat: { replayUnsignedThinking: false },
 		});
+		const gatewayAtDefaultCompat = anthropicTarget({
+			provider: "model-gateway",
+			id: "claude-opus-5-5",
+			baseUrl: "https://gateway.example.com",
+		});
+		expect(gatewayAtDefaultCompat.compat.replayUnsignedThinking).toBe(true);
 		for (const [from, target] of [
 			[direct, gateway],
+			[direct, gatewayAtDefaultCompat],
 			[gateway, direct],
 		]) {
 			const source: Source = { api: "anthropic-messages", provider: from.provider, model: from.id };
 			const wire = anthropicWire(foreignHistory(source, "sig_other_route"), target);
 			expect(wire.json).not.toContain(REASONING);
 			expect(wire.json).not.toContain("sig_other_route");
+			expect(wire.assistant.filter(block => block.type === "thinking")).toEqual([]);
 			expect(wire.assistant).toContainEqual({ type: "text", text: ANSWER });
 			expect(wire.assistant).toContainEqual(expect.objectContaining({ type: "tool_use", id: "call_1" }));
 		}
 	});
 
-	it("drops another model's thinking on a host that signs nothing, signed or not", () => {
-		// Such a host keeps another model's signature as an opaque hint (#2265),
+	it("drops another provider's redacted thinking that a custom host would replay", () => {
+		// At its default compat a custom host replays unsigned and redacted
+		// thinking natively, so the rules for its own signatures keep this block.
+		const kimi: Source = { api: "anthropic-messages", provider: "kimi-code", model: "k3" };
+		const target = anthropicTarget({
+			provider: "custom-anthropic",
+			id: "claude-sonnet-4-6",
+			baseUrl: "https://llm.example.com/anthropic",
+		});
+		const messages: Message[] = [
+			user("Fix the parser."),
+			assistant(
+				[
+					{ type: "thinking", thinking: REASONING, thinkingSignature: "kimi-issued-signature" },
+					{ type: "redactedThinking", data: "kimi-redacted-blob" },
+					{ type: "text", text: ANSWER },
+					{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "config.ts" } },
+				],
+				kimi,
+			),
+			toolResult("call_1"),
+			user("Continue."),
+		];
+
+		const wire = anthropicWire(messages, target);
+		expect(wire.json).not.toContain("kimi-redacted-blob");
+		expect(wire.json).not.toContain(REASONING);
+		expect(wire.assistant).toContainEqual({ type: "text", text: ANSWER });
+		expect(wire.assistant).toContainEqual(expect.objectContaining({ type: "tool_use", id: "call_1" }));
+	});
+});
+
+describe("another Claude model's signed thinking on the same provider is unchanged", () => {
+	it("keeps it as a signed block on a custom host and drops the unsigned block beside it", () => {
+		// The host keeps another model's signature as an opaque hint (#2265),
 		// and a turn that keeps one signed block has its unsigned blocks written
 		// as text.
 		const target = anthropicTarget({
@@ -254,11 +303,12 @@ describe("a Claude target gets none of another model's thinking", () => {
 			baseUrl: "https://llm.example.com/anthropic",
 		});
 		const other: Source = { api: "anthropic-messages", provider: "custom-anthropic", model: "claude-opus-4-8" };
-		const messages: Message[] = [
+		const history: Message[] = [
 			user("Fix the parser."),
 			assistant(
 				[
 					{ type: "thinking", thinking: "Signed plan.", thinkingSignature: "sig_signed" },
+					{ type: "redactedThinking", data: "redacted-on-this-host" },
 					{ type: "thinking", thinking: REASONING },
 					{ type: "text", text: ANSWER },
 					{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "config.ts" } },
@@ -268,15 +318,20 @@ describe("a Claude target gets none of another model's thinking", () => {
 			toolResult("call_1"),
 			user("Continue."),
 		];
+		const latest = history;
+		const earlier = [...history, assistant([{ type: "text", text: "Done." }], other, "stop"), user("Next.")];
 
-		const wire = anthropicWire(messages, target);
-		expect(wire.json).not.toContain(REASONING);
-		expect(wire.json).not.toContain("Signed plan.");
-		expect(wire.assistant).toContainEqual({ type: "text", text: ANSWER });
-		expect(wire.assistant).toContainEqual(expect.objectContaining({ type: "tool_use", id: "call_1" }));
+		for (const messages of [latest, earlier]) {
+			const wire = anthropicWire(messages, target);
+			expect(wire.assistant).toContainEqual({ type: "thinking", thinking: "Signed plan.", signature: "sig_signed" });
+			expect(wire.assistant).toContainEqual({ type: "redacted_thinking", data: "redacted-on-this-host" });
+			expect(wire.json).not.toContain(REASONING);
+			expect(wire.assistant).toContainEqual({ type: "text", text: ANSWER });
+			expect(wire.assistant).toContainEqual(expect.objectContaining({ type: "tool_use", id: "call_1" }));
+		}
 	});
 
-	it("keeps another Claude model's signed block on the same deployment, and drops the one it stops trusting", () => {
+	it("keeps it on first-party Anthropic and drops the block whose signature it stops trusting", () => {
 		// First-party Anthropic verifies another model's signature from its own
 		// deployment, so that block replays natively. An errored turn's final
 		// block holds a partial signature, which is stripped; unsigned, it would
@@ -301,6 +356,53 @@ describe("a Claude target gets none of another model's thinking", () => {
 		expect(wire.assistant).toContainEqual({ type: "thinking", thinking: "Signed plan.", signature: "sig_complete" });
 		expect(wire.assistant).toContainEqual({ type: "text", text: ANSWER });
 		expect(wire.json).not.toContain(REASONING);
+	});
+});
+
+/** Captures the Cascade request omp's Devin provider sends, without a model call. */
+async function devinRequest(model: Model<"devin-agent">, messages: Message[]) {
+	const authPayload = toBinary(GetUserJwtResponseSchema, create(GetUserJwtResponseSchema, { userJwt: "jwt" }));
+	let requestPayload: Uint8Array | undefined;
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		if (String(input).includes("GetUserJwt")) return new Response(authPayload);
+		requestPayload = new Uint8Array(init?.body as ArrayBuffer);
+		return new Response(new Uint8Array());
+	}) as typeof fetch;
+	await streamDevin(model, { messages }, { apiKey: "token", fetch: fetchImpl }).result();
+	if (!requestPayload) throw new Error("Devin chat request was not captured");
+	const view = new DataView(requestPayload.buffer, requestPayload.byteOffset, requestPayload.byteLength);
+	// Connect envelope: flag byte (bit 0 = gzip), u32 length, message.
+	const body = requestPayload.subarray(5, 5 + view.getUint32(1, false));
+	return fromBinary(GetChatMessageRequestSchema, (requestPayload[0] & 1) !== 0 ? gunzipSync(body) : body);
+}
+
+describe("a Claude model behind Devin", () => {
+	// Devin writes the transform's demoted text into the turn's prompt, and its
+	// thinking field into the turn's thinking.
+	const claude = otherTarget("devin-agent", "devin", "claude-opus-5");
+
+	it("gets none of another model's thinking in the prompt, and keeps the answer and tool call", async () => {
+		const request = await devinRequest(claude, foreignHistory(GEMINI_GOOGLE));
+
+		expect(request.chatMessagePrompts[1]).toMatchObject({ prompt: ANSWER, thinking: "" });
+		expect(request.chatMessagePrompts[1]?.toolCalls.map(call => call.name)).toEqual(["read"]);
+		for (const prompt of request.chatMessagePrompts) {
+			expect(prompt.prompt).not.toContain(REASONING);
+			expect(prompt.thinking).not.toContain(REASONING);
+		}
+	});
+
+	it("keeps its own thinking in the thinking field", async () => {
+		const own: Source = { api: "devin-agent", provider: "devin", model: claude.id };
+		const request = await devinRequest(claude, foreignHistory(own));
+
+		expect(request.chatMessagePrompts[1]).toMatchObject({ prompt: ANSWER, thinking: REASONING });
+	});
+
+	it("still sends another model's thinking as text to a model that is not Claude", async () => {
+		const request = await devinRequest(otherTarget("devin-agent", "devin", "gpt-5"), foreignHistory(GEMINI_GOOGLE));
+
+		expect(request.chatMessagePrompts[1]?.prompt).toContain(REASONING);
 	});
 });
 
