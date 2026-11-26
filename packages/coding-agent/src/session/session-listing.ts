@@ -12,7 +12,6 @@ import { parseJsonlLenient } from "@oh-my-pi/pi-utils/stream";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
 import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
 import { findArchivedSessionFiles } from "./session-archive";
-import { CANONICAL_SESSION_ID_RE } from "./session-id-format";
 import { visitEntriesFromFile } from "./session-loader";
 import { computeDefaultSessionDir } from "./session-paths";
 import {
@@ -1240,8 +1239,7 @@ async function findUnlistedSessionContinuation(
 				: await findSessionFiles(prefix, undefined, storage);
 		for (const file of files) {
 			const id = parseSessionFileName(file)?.id;
-			const exactOnly = options.exactId === true || CANONICAL_SESSION_ID_RE.test(prefix);
-			if (!(exactOnly ? id === prefix : id?.startsWith(prefix))) continue;
+			if (!(options.exactId === true ? id === prefix : id?.startsWith(prefix))) continue;
 			const continuation = await findSessionContinuation(file, storage, { matchedByFileName: true });
 			if (continuation) return continuation;
 		}
@@ -1705,13 +1703,12 @@ function sessionMatchesResumeArg(session: SessionInfo, sessionArg: string): bool
 /**
  * The session a resume key selects in one scope's listing: the one whose id is the key,
  * else (unless `exactId`) the first whose id or file name starts with it. An exact id
- * wins over a prefix match, and a key that is a full session id matches only exactly,
- * so it never opens another session whose id extends it.
+ * wins over a prefix match that the listing puts first.
  */
 function findResumeMatch(sessions: SessionInfo[], sessionArg: string, exactId: boolean): SessionInfo | undefined {
 	const normalizedArg = sessionArg.toLowerCase();
 	const exact = sessions.find(session => session.id.toLowerCase() === normalizedArg);
-	if (exact || exactId || CANONICAL_SESSION_ID_RE.test(normalizedArg)) return exact;
+	if (exact || exactId) return exact;
 	return sessions.find(session => sessionMatchesResumeArg(session, sessionArg));
 }
 

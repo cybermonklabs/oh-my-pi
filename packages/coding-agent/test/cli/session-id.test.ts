@@ -1,21 +1,22 @@
 /**
- * `omp --session-id <uuid>` starts a new session under an id the launcher chose. It refuses an
- * id a stored session already holds (before any model call), refuses a value that is not a
- * canonical UUID, and pairs with no other session flag. `--resume <id>` opens the session that
- * holds exactly that id, never another one whose id merely starts with it.
+ * `omp --session-id <uuid>` resumes the session that holds an id the launcher chose, or starts a new
+ * session under it. It refuses, before any model call, while another live omp process has that
+ * session open; it refuses a value that is not a canonical UUID, and pairs with no other session
+ * flag. `--resume <id>` opens the session whose id is exactly that id before one whose id or file
+ * name merely starts with it, and a full id matches a file name as any other key does.
  */
 import { describe, expect, it, setSystemTime } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { gzipSync } from "node:zlib";
-import { type Args, parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
+import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { restartArgv } from "@oh-my-pi/pi-coding-agent/cli/flag-tables";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createSessionManager } from "@oh-my-pi/pi-coding-agent/main";
 import { findArchivedSessionFiles } from "@oh-my-pi/pi-coding-agent/session/session-archive";
 import { resolveResumableSession, resolveResumeTarget } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { readSessionHeaderId } from "@oh-my-pi/pi-coding-agent/session/session-loader";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { type SessionIdCreation, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	defaultSessionStorage,
 	FileSessionStorage,
@@ -34,12 +35,23 @@ const LONGER_ID = `${SESSION_ID}-later`;
 const OTHER_ID = "019ea530-5e55-7000-8000-00000000beef";
 const EARLIER = new Date("2026-11-01T10:00:00.000Z");
 const LATER = new Date("2026-11-02T10:00:00.000Z");
+const OPEN_ELSEWHERE = `Session "${SESSION_ID}" is open in another running omp process.`;
 const settings = () => Settings.isolated({ "marketplace.autoUpdate": "off" });
 
-/** A stored session with one exchange, named the way the session manager names its files. */
-async function storeSession(storage: SessionStorage, dir: string, id: string, cwd: string, at: Date): Promise<string> {
+/**
+ * A stored session with one exchange, named the way the session manager names its files: for its
+ * id, or for `fileId` (a file whose name records one session while its header names another).
+ */
+async function storeSession(
+	storage: SessionStorage,
+	dir: string,
+	id: string,
+	cwd: string,
+	at: Date,
+	fileId = id,
+): Promise<string> {
 	storage.ensureDirSync(dir);
-	const file = path.join(dir, `${at.toISOString().replace(/[:.]/g, "-")}_${id}.jsonl`);
+	const file = path.join(dir, `${at.toISOString().replace(/[:.]/g, "-")}_${fileId}.jsonl`);
 	const stamp = at.toISOString();
 	const lines = [
 		{ type: "session", version: 3, id, cwd, timestamp: stamp },
@@ -64,6 +76,21 @@ async function storeSession(storage: SessionStorage, dir: string, id: string, cw
 
 async function sqlStorage(): Promise<SqlSessionStorage> {
 	return await SqlSessionStorage.create({ client: new SQL("sqlite::memory:") });
+}
+
+/** The session files in `dir`, by name. */
+function sessionFiles(dir: string): string[] {
+	return fs
+		.readdirSync(dir)
+		.filter(name => name.endsWith(".jsonl"))
+		.sort();
+}
+
+/** `--session-id <id>` parsed for a launch whose session directory is `dir`. */
+function sessionIdArgs(dir: string, id = SESSION_ID) {
+	const parsed = parseArgs(["--session-id", id]);
+	parsed.sessionDir = dir;
+	return parsed;
 }
 
 /**
@@ -99,6 +126,74 @@ async function launch(
 	return { exitCode, stderr };
 }
 
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map(part => (typeof part === "object" && part !== null && "text" in part ? String(part.text) : ""))
+		.join("");
+}
+
+/**
+ * An OpenAI-compatible model for CLI launches whose agent directory is `agentDir` (model
+ * `fake/fake-model`): it answers `pong`, and keeps the user messages of every request it gets.
+ */
+function startModel(agentDir: string): { requests: string[][]; [Symbol.dispose](): void } {
+	const requests: string[][] = [];
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(request) {
+			const url = new URL(request.url);
+			if (url.pathname.endsWith("/models")) {
+				return Response.json({ object: "list", data: [{ id: "fake-model", object: "model", owned_by: "fake" }] });
+			}
+			if (!url.pathname.endsWith("/chat/completions")) return new Response("not found", { status: 404 });
+			const body = (await request.json()) as {
+				messages?: Array<{ role?: string; content?: unknown }>;
+				stream?: boolean;
+			};
+			requests.push((body.messages ?? []).filter(m => m.role === "user").map(m => messageText(m.content)));
+			const base = { id: "chatcmpl-fake", created: 0, model: "fake-model" };
+			const usage = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
+			if (!body.stream) {
+				return Response.json({
+					...base,
+					object: "chat.completion",
+					choices: [{ index: 0, message: { role: "assistant", content: "pong" }, finish_reason: "stop" }],
+					usage,
+				});
+			}
+			const chunk = { ...base, object: "chat.completion.chunk" };
+			const events = [
+				{ ...chunk, choices: [{ index: 0, delta: { role: "assistant", content: "pong" }, finish_reason: null }] },
+				{ ...chunk, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+				{ ...chunk, choices: [], usage },
+			].map(event => `data: ${JSON.stringify(event)}\n\n`);
+			return new Response(`${events.join("")}data: [DONE]\n\n`, {
+				headers: { "content-type": "text/event-stream" },
+			});
+		},
+	});
+	fs.mkdirSync(agentDir, { recursive: true });
+	fs.writeFileSync(
+		path.join(agentDir, "models.yml"),
+		[
+			"providers:",
+			"  fake:",
+			`    baseUrl: http://127.0.0.1:${server.port}/v1`,
+			"    auth: none",
+			"    api: openai-completions",
+			"    models:",
+			"      - id: fake-model",
+			"        name: Fake Model",
+			"        reasoning: false",
+			"",
+		].join("\n"),
+	);
+	return { requests, [Symbol.dispose]: () => server.stop(true) };
+}
+
 /** Every file under `dir` whose name is `name`, at any depth. */
 function findFiles(dir: string, name: string): string[] {
 	return fs
@@ -110,61 +205,115 @@ function findFiles(dir: string, name: string): string[] {
 describe("omp --session-id", () => {
 	it("starts a new session under the given id", async () => {
 		using dir = TempDir.createSync("@omp-session-id-new-");
-		const parsed = parseArgs(["--session-id", SESSION_ID]);
-		parsed.sessionDir = dir.path();
-		const manager = await createSessionManager(parsed, dir.path(), settings());
+		const manager = await createSessionManager(sessionIdArgs(dir.path()), dir.path(), settings());
 		if (!manager) throw new Error("--session-id selected no session: the flag was not applied");
 		try {
 			expect(manager.getHeader()?.id, "the new session's header id").toBe(SESSION_ID);
-			await manager.ensureOnDisk();
 			const file = manager.getSessionFile();
 			if (!file) throw new Error("the new session has no file");
 			expect(path.basename(file)).toEndWith(`_${SESSION_ID}.jsonl`);
+			// The header is written at once, so a later launch under the id finds the session.
 			expect(await readSessionHeaderId(file), "the header written to the session file").toBe(SESSION_ID);
 		} finally {
 			await manager.close();
 		}
 	});
 
-	it("reserves the id when it creates the session, so a second launch under it is refused", async () => {
-		using dir = TempDir.createSync("@omp-session-id-reserve-");
-		const launchArgs = (): Args => {
-			const parsed = parseArgs(["--session-id", SESSION_ID]);
-			parsed.sessionDir = dir.path();
-			return parsed;
-		};
-		const first = await createSessionManager(launchArgs(), dir.path(), settings());
+	it("resumes the stored session that holds the id, with its turns", async () => {
+		using dir = TempDir.createSync("@omp-session-id-resume-");
+		const stored = await storeSession(new FileSessionStorage(), dir.path(), SESSION_ID, dir.path(), EARLIER);
+		const manager = await createSessionManager(sessionIdArgs(dir.path()), dir.path(), settings());
+		if (!manager) throw new Error("--session-id selected no session");
 		try {
-			// The first launch has not written a turn yet; the id is already taken.
-			await expect(createSessionManager(launchArgs(), dir.path(), settings())).rejects.toMatchObject({
-				name: "SessionResolutionError",
-				message: `Session "${SESSION_ID}" already exists; resume it with --resume ${SESSION_ID}.`,
-			});
-			expect(fs.readdirSync(dir.path()).filter(name => name.endsWith(".jsonl"))).toEqual([
-				path.basename(first?.getSessionFile() ?? ""),
-			]);
+			expect(manager.getSessionId()).toBe(SESSION_ID);
+			expect(manager.getSessionFile()).toBe(stored);
+			expect(manager.getEntries().map(entry => entry.id)).toEqual(["m1", "m2"]);
+			expect(sessionFiles(dir.path()), "no new session file").toEqual([path.basename(stored)]);
 		} finally {
-			await first?.close();
+			await manager.close();
 		}
 	});
 
-	it("refuses an id another live process has claimed, before that process writes anything", async () => {
+	it("starts a new session when the only stored session's id merely starts with the id", async () => {
+		using dir = TempDir.createSync("@omp-session-id-extends-");
+		const other = await storeSession(new FileSessionStorage(), dir.path(), LONGER_ID, dir.path(), EARLIER);
+		const manager = await createSessionManager(sessionIdArgs(dir.path()), dir.path(), settings());
+		if (!manager) throw new Error("--session-id selected no session");
+		try {
+			expect(manager.getSessionId()).toBe(SESSION_ID);
+			expect(manager.getSessionFile()).not.toBe(other);
+			expect(manager.getEntries()).toEqual([]);
+			expect(sessionFiles(dir.path())).toHaveLength(2);
+		} finally {
+			await manager.close();
+		}
+	});
+
+	it("resumes the session on a later launch, so the model sees the earlier turn", async () => {
+		using home = TempDir.createSync("@omp-session-id-model-home-");
+		using dir = TempDir.createSync("@omp-session-id-model-");
+		using model = startModel(path.join(home.path(), "agent"));
+		const run = (prompt: string) =>
+			launch(["--session-id", SESSION_ID, "--model", "fake/fake-model", "-p", prompt], dir.path(), {
+				home: home.path(),
+				env: { PI_NO_TITLE: "1" },
+			});
+
+		const first = await run("Remember the word pineapple.");
+		expect(first.exitCode, first.stderr).toBe(0);
+		const [file] = sessionFiles(dir.path());
+		if (!file) throw new Error("the first launch wrote no session file");
+		expect(await readSessionHeaderId(path.join(dir.path(), file))).toBe(SESSION_ID);
+
+		const second = await run("Which word did I ask you to remember?");
+		expect(second.exitCode, second.stderr).toBe(0);
+		expect(sessionFiles(dir.path()), "the second launch wrote to the same session").toEqual([file]);
+		const resumed = model.requests.find(request => request.some(text => text.includes("Which word did I ask")));
+		if (!resumed) throw new Error(`no model request carried the second prompt: ${JSON.stringify(model.requests)}`);
+		expect(
+			resumed.some(text => text.includes("Remember the word pineapple.")),
+			"the second launch's request carries the first turn",
+		).toBe(true);
+	}, 60_000);
+
+	it("refuses an id another live process owns while creating the session, before it writes anything", async () => {
 		using dir = TempDir.createSync("@omp-session-id-claimed-");
 		let refused: { exitCode: number; stderr: string; files: string[] } | undefined;
 		// This test process plays the first launch. While it checks the store it owns the id and has
 		// written nothing; a second launch under the id runs in that window.
-		const owner = await SessionManager.createWithSessionId(dir.path(), dir.path(), SESSION_ID, async () => {
+		const creation = await SessionManager.createWithSessionId(dir.path(), dir.path(), SESSION_ID, async () => {
 			const result = await launch(["--session-id", SESSION_ID, "-p", "hello"], dir.path());
 			refused = { ...result, files: fs.readdirSync(dir.path()) };
 			return false;
 		});
+		const owner = creation.status === "created" ? creation.manager : undefined;
 		try {
 			expect(owner?.getSessionId(), "the first launch got the id").toBe(SESSION_ID);
 			expect(refused?.exitCode, refused?.stderr).toBe(1);
-			expect(refused?.stderr).toContain(`Session "${SESSION_ID}" already exists`);
+			expect(refused?.stderr).toContain(OPEN_ELSEWHERE);
 			expect(refused?.files, "nothing was written while the second launch ran").toEqual([]);
 		} finally {
 			await owner?.close();
+		}
+	}, 30_000);
+
+	it("refuses to resume a session another live process has open, and leaves its file alone", async () => {
+		using dir = TempDir.createSync("@omp-session-id-open-");
+		const owner = await createSessionManager(sessionIdArgs(dir.path()), dir.path(), settings());
+		if (!owner) throw new Error("--session-id selected no session");
+		try {
+			const [file] = sessionFiles(dir.path());
+			if (!file) throw new Error("the owner wrote no session file");
+			const before = fs.readFileSync(path.join(dir.path(), file), "utf8");
+
+			const result = await launch(["--session-id", SESSION_ID, "-p", "hello"], dir.path());
+
+			expect(result.exitCode, result.stderr).toBe(1);
+			expect(result.stderr).toContain(OPEN_ELSEWHERE);
+			expect(sessionFiles(dir.path()), "no sibling session was written").toEqual([file]);
+			expect(fs.readFileSync(path.join(dir.path(), file), "utf8"), "the owner's file is unchanged").toBe(before);
+		} finally {
+			await owner.close();
 		}
 	}, 30_000);
 
@@ -182,28 +331,23 @@ describe("omp --session-id", () => {
 		if (!crumb) throw new Error("the first launch recorded no terminal breadcrumb");
 		const before = fs.readFileSync(crumb, "utf8");
 
-		await storeSession(new FileSessionStorage(), dir.path(), SESSION_ID, dir.path(), EARLIER);
-		const refused = await launch(["--session-id", SESSION_ID, "-p", "hello"], dir.path(), {
-			home: home.path(),
-			env: terminal,
-		});
-		expect(refused.exitCode, refused.stderr).toBe(1);
-		expect(fs.readFileSync(crumb, "utf8"), "the refused launch did not replace the terminal's record").toBe(before);
+		const owner = await createSessionManager(sessionIdArgs(dir.path()), dir.path(), settings());
+		try {
+			const refused = await launch(["--session-id", SESSION_ID, "-p", "hello"], dir.path(), {
+				home: home.path(),
+				env: terminal,
+			});
+			expect(refused.exitCode, refused.stderr).toBe(1);
+			expect(refused.stderr).toContain(OPEN_ELSEWHERE);
+			expect(fs.readFileSync(crumb, "utf8"), "the refused launch did not replace the terminal's record").toBe(
+				before,
+			);
+		} finally {
+			await owner?.close();
+		}
 	}, 30_000);
 
-	it("refuses an id a stored session holds, in file storage, before any model call", async () => {
-		using dir = TempDir.createSync("@omp-session-id-held-");
-		await storeSession(new FileSessionStorage(), dir.path(), SESSION_ID, dir.path(), EARLIER);
-		const before = fs.readdirSync(dir.path()).sort();
-
-		const result = await launch(["--session-id", SESSION_ID, "-p", "hello"], dir.path());
-
-		expect(result.exitCode, result.stderr).toBe(1);
-		expect(result.stderr).toContain(`Session "${SESSION_ID}" already exists; resume it with --resume ${SESSION_ID}.`);
-		expect(fs.readdirSync(dir.path()).sort(), "no session file was written").toEqual(before);
-	}, 30_000);
-
-	it("refuses an id a stored session holds, in SQL storage: the held lookup matches the exact id", async () => {
+	it("looks the id up by the exact id in SQL storage, never by prefix", async () => {
 		const storage = await sqlStorage();
 		const dir = path.resolve("/sessions/session-id-held");
 		await storeSession(storage, dir, LONGER_ID, "/work", LATER);
@@ -295,7 +439,7 @@ describe("omp --session-id", () => {
 			if (clock === "the same millisecond") setSystemTime(LATER);
 			const isHeld = async () =>
 				(await resolveResumableSession(SESSION_ID, "/work", dir, storage, { exactId: true })) !== undefined;
-			let second: SessionManager | undefined;
+			let second: SessionIdCreation | undefined;
 			try {
 				const first = await SessionManager.createWithSessionId("/work", dir, SESSION_ID, async () => {
 					const held = await isHeld();
@@ -303,9 +447,12 @@ describe("omp --session-id", () => {
 					second = await SessionManager.createWithSessionId("/work", dir, SESSION_ID, isHeld);
 					return held;
 				});
-				const accepted = [first, second].filter(manager => manager !== undefined);
+				const creations = [first, second];
+				const accepted = creations.flatMap(creation => (creation?.status === "created" ? [creation.manager] : []));
 				try {
 					expect(accepted, "exactly one launch keeps the id").toHaveLength(1);
+					// The other is refused, not sent to resume a session another launch is creating.
+					expect(creations.map(creation => creation?.status).sort()).toEqual(["created", "owned-elsewhere"]);
 					await storage.refresh?.();
 					const holders = storage
 						.listFilesSync(dir, "*.jsonl")
@@ -334,18 +481,18 @@ describe("omp --resume <id>", () => {
 		expect(match?.session.id).toBe(SESSION_ID);
 	});
 
-	it("never resumes a session whose id only starts with a full id", async () => {
-		const storage = await sqlStorage();
-		const dir = path.resolve("/sessions/session-id-resume-absent");
-		await storeSession(storage, dir, LONGER_ID, "/work", LATER);
-		// A full id names one session; a short prefix still selects by prefix.
-		expect(await resolveResumableSession(SESSION_ID, "/work", dir, storage)).toBeUndefined();
-		const byPrefix = await resolveResumableSession(SESSION_ID.slice(0, 8), "/work", dir, storage);
-		expect(byPrefix?.session.id).toBe(LONGER_ID);
+	it("resumes a full id through a file named for it when no session's id is that id", async () => {
+		using dir = TempDir.createSync("@omp-session-id-resume-name-");
+		const storage = new FileSessionStorage();
+		// The only file named for SESSION_ID holds another session (a copy, or a file replaced under that name).
+		const file = await storeSession(storage, dir.path(), OTHER_ID, dir.path(), EARLIER, SESSION_ID);
+		const match = await resolveResumableSession(SESSION_ID, dir.path(), dir.path(), storage);
+		expect(match?.session.path, "a full id matches a file name as any other key does").toBe(file);
+		expect(match?.session.id).toBe(OTHER_ID);
 	});
 
 	it("resumes an exact id from file storage, never a newer session whose id starts with it", async () => {
-		using dir = TempDir.createSync("@omp-session-id-resume-");
+		using dir = TempDir.createSync("@omp-session-id-resume-file-");
 		await storeSession(new FileSessionStorage(), dir.path(), SESSION_ID, dir.path(), EARLIER);
 		await storeSession(new FileSessionStorage(), dir.path(), LONGER_ID, dir.path(), LATER);
 
@@ -383,13 +530,9 @@ describe("an archived session and a full id", () => {
 		}
 	}
 
-	it("resumes only the archive holding exactly that id", async () => {
+	it("resumes the archive holding a full id", async () => {
 		await withAgentDir(async agentDir => {
-			await archiveSession(agentDir, LONGER_ID, LATER);
-			expect(await resolveResumableSession(SESSION_ID, "/work")).toBeUndefined();
-			// A short prefix still selects the archive by prefix.
-			expect((await resolveResumableSession(SESSION_ID.slice(0, 8), "/work"))?.session.id).toBe(LONGER_ID);
-
+			await archiveSession(agentDir, OTHER_ID, LATER);
 			await archiveSession(agentDir, SESSION_ID, EARLIER);
 			const match = await resolveResumableSession(SESSION_ID, "/work");
 			expect(match?.scope).toBe("archive");
@@ -406,15 +549,22 @@ describe("an archived session and a full id", () => {
 		});
 	});
 
-	it("finds only the archive holding exactly a full id, as `omp gc --restore <id>` asks", async () => {
+	it("finds a full id's archive for gc --restore, and every archive a short prefix starts", async () => {
 		await withAgentDir(async agentDir => {
-			await archiveSession(agentDir, LONGER_ID, LATER);
-			expect(await findArchivedSessionFiles(SESSION_ID, agentDir)).toEqual([]);
+			await archiveSession(agentDir, OTHER_ID, LATER);
 			await archiveSession(agentDir, SESSION_ID, EARLIER);
 			const found = (await findArchivedSessionFiles(SESSION_ID, agentDir)).map(file => path.basename(file));
 			expect(found).toEqual([`${EARLIER.toISOString().replace(/[:.]/g, "-")}_${SESSION_ID}.jsonl.gz`]);
-			// A short prefix still lists every archive it starts.
 			expect(await findArchivedSessionFiles(SESSION_ID.slice(0, 8), agentDir)).toHaveLength(2);
+		});
+	});
+
+	it("matches a full id against archive names by prefix, as any other key", async () => {
+		await withAgentDir(async agentDir => {
+			// omp never mints an id that extends another; a full id is a key like any other here.
+			await archiveSession(agentDir, LONGER_ID, LATER);
+			const found = (await findArchivedSessionFiles(SESSION_ID, agentDir)).map(file => path.basename(file));
+			expect(found).toEqual([`${LATER.toISOString().replace(/[:.]/g, "-")}_${LONGER_ID}.jsonl.gz`]);
 		});
 	});
 });
