@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- bash mode: a negated compound command whose own redirection fails (`! { …; } < missing`, `! ( … ) < missing`, `! while …; done < missing`) ends with status 1, as bash's does: the failure comes before the `!` applies. `PIPESTATUS` after a subshell whose own redirection fails holds the subshell's status (1, or 0 when negated).
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

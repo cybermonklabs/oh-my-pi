@@ -3001,7 +3001,26 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 				// it; what would block is written after the restore.
 				let _ = flush_out(k, vp);
 				clear_scratch(&mut k.root, cx.store, vp);
-				vp.status = 1;
+				// A negated bash compound whose own redirections fail ends
+				// with 1: bash returns the failure before the command's `!`
+				// applies (`execute_command_internal`), and a `( … )`'s fork
+				// exits with it inverted, which the shell inverts back
+				// (`exit (invert ? …)`, execute_cmd.c:1762). The `Not` just past
+				// the compound inverts the 0 set here.
+				let bash = unit.mode.dialect() == Dialect::Bash;
+				let negated = bash
+					&& unit
+						.ops
+						.get(op.b as usize)
+						.is_some_and(|o| o.code == Opcode::Not);
+				vp.status = i32::from(!negated);
+				// The `( … )`'s fork is the pipeline bash waited for:
+				// `PIPESTATUS` holds its exit status. A compound command's own
+				// redirections fail in the shell, which sets none.
+				if bash && own_subshell_redirection(unit, top_frame(vp).pc) {
+					vp.pipestatus.clear();
+					vp.pipestatus.push(vp.status);
+				}
 				Flow::Jump(op.b)
 			},
 		},
@@ -3346,6 +3365,22 @@ fn time_end(
 			k.diag(cx, vp, line, Diag::Usage { msg: msg.into() });
 		},
 	}
+}
+
+/// Whether the `Redir` at `pc` is a `( … )`'s own redirection list: the
+/// subshell's `Enter` and `Spawn` follow it ([`ir`] lowers the list just
+/// before them, all three with the subshell's node).
+fn own_subshell_redirection(unit: &Unit, pc: u32) -> bool {
+	let at = pc as usize;
+	matches!(
+		unit.ops.get(at..at + 3),
+		Some([redir, enter, spawn])
+			if redir.code == Opcode::Redir
+				&& enter.code == Opcode::Enter
+				&& spawn.code == Opcode::Spawn
+				&& redir.node == enter.node
+				&& unit.spawns.get(spawn.a as usize).is_some_and(|s| s.kind == SpawnKind::Subshell)
+	)
 }
 
 /// zsh's `time` report (`dumptime`, `shelltime`): the times of the
