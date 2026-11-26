@@ -6,9 +6,10 @@
  * the real values. Provider replay state is never stored half-masked: a
  * changed signed block loses its signature, a changed carrier is dropped, and
  * ciphertext, images and ids are kept byte for byte. Each session file case
- * runs against every session store backend; history.db is written for file
- * storage only. Whether a manager masks is the setting of the session it is
- * bound to, read at each write.
+ * runs against every session store backend; history.db's title index is
+ * written for file storage only, and its recaps for every persisted session
+ * (these cases use file storage). Whether a manager masks is the setting of
+ * the session it is bound to, read at each write.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fsSync from "node:fs";
@@ -773,7 +774,7 @@ describe("session store masking of the history.db title and recaps", () => {
 		}
 	});
 
-	/** history.db is written only for file-backed sessions. */
+	/** history.db's title index is written only for file-backed sessions; these cases use one for the title and the recap. */
 	async function fileSession(): Promise<SessionManager> {
 		const manager = SessionManager.create(cwd, tmp.join("sessions"), new FileSessionStorage());
 		await manager.ensureOnDisk();
