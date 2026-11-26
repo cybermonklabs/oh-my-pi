@@ -95,8 +95,7 @@ pub struct Vproc {
 	/// nested shell) in its low 24 bits ([`super::subshell_depth`]), and the
 	/// vproc's [`Fork`] in its top byte ([`Vproc::fork`]). A field, not an
 	/// image record: a record would cost every subshell a ~530-byte map
-	/// allocation (idle vproc ≤ 2 KiB, which leaves no byte for a field of
-	/// its own).
+	/// allocation (idle vproc ≤ 2,048 B back to back).
 	pub subshell:      u32,
 	/// Loops of the shell that forked this vproc that its code runs inside
 	/// (bash's inherited `loop_level`, zsh's `loops`), set by
@@ -127,7 +126,7 @@ pub struct Vproc {
 	/// Set by `exec::ignore_async_signals`, read by `exec::async_ignored`;
 	/// its forks inherit it (`exec::fork_async_ignored`). A field, not an
 	/// overlay record: a record would cost every asynchronous vproc a
-	/// ~530-byte map allocation (idle vproc ≤ 2 KiB).
+	/// ~530-byte map allocation (idle vproc ≤ 2,048 B back to back).
 	pub async_ignored: AsyncIgnored,
 	/// Trap-action frames ([`ScriptKind::Trap`]) on `frames`: zero lets
 	/// the per-op checks (cancellation, `BASH_COMMAND`, a trap inside its
@@ -1019,7 +1018,7 @@ impl JobTable {
 /// background job, a process substitution, a coprocess) and the
 /// OS pid of the program it runs, once known ([`Job::os_pid`]). Two words,
 /// zero meaning none (no vpid or OS pid is zero): an `Option` pair would
-/// grow every vproc (idle vproc ≤ 2 KiB).
+/// grow every vproc (idle vproc ≤ 2,048 B back to back).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastBg {
 	vpid: u32,
@@ -1694,7 +1693,7 @@ pub struct Frame {
 	/// when the function made `OPTIND` local (bash
 	/// `sh_getopt_save_istate`/`sh_getopt_restore_istate`). `None` is the
 	/// default state: no allocation per call, and 40 bytes less per frame
-	/// (idle vproc ≤ 2 KiB).
+	/// (idle vproc ≤ 2,048 B back to back).
 	pub getopts:           Option<Box<GetoptsState>>,
 }
 
@@ -2060,8 +2059,8 @@ pub struct PipelineWait {
 /// probes, PATH search, fd reads and pathname-expansion walks. Most ops need
 /// none of it (an idle background job's parked `Exec` neither), so a
 /// [`Scratch`] holds it boxed and creates it on first use: 232 bytes less per
-/// scratch (idle vproc ≤ 2 KiB). A recycled scratch keeps it cleared, so
-/// an op that redirects or probes in a loop allocates it once.
+/// scratch (idle vproc ≤ 2,048 B back to back). A recycled scratch keeps it
+/// cleared, so an op that redirects or probes in a loop allocates it once.
 #[derive(Default)]
 pub struct ScratchIo {
 	/// Progress of a `Redir` op or the redirection stage of an `Exec`.
@@ -2648,42 +2647,41 @@ impl Live {
 	}
 }
 
-// Size guards for the idle-vproc target (≤ 2 KiB): an idle background job
-// holds one boxed `Vproc`, one `Frame`, one boxed `Scratch` and one boxed
-// `ExecState`, so every byte here is a byte per idle vproc. Raise a bound
-// only with the testkit `memory` bench's numbers in hand.
-// zsh support added the boxed zsh side table `Vproc::zsh` (8 B; `Frame` is
-// unchanged, its zsh state lives there and in `FrameKind`): the memory
-// bench measured 1,785 B per idle vproc with it (target ≤ 2,048).
-// Host lineage (`Vproc::lineage`, 8 B: a `u32` label and a flag) added at
-// most 8 B to that, still under 2,048. The resumable `mapfile -C` counter
-// (`ExecState::resumed`, 368 → 376 B): the bench measured 1,832 B per idle
-// vproc with both. The line editor's boxed state (`Vproc::zle`, 8 B) brings
-// that to at most 1,840 B. The forking shell's loop count
-// (`Vproc::outer_loops`) is a `u16` beside a `u16` `Vproc::trap_frames`,
-// in the 4 bytes `trap_frames` had; a `break` waiting in `${ }`
-// (`Vproc::pending_break`, boxed, 8 B) brings it to at most 1,848 B, and
-// bash's kept statuses (`JobTable::bgp`, one pointer, `None` while empty)
-// to at most 1,856 B. bash's pending notice of a killed command
-// (`ExecState::notice`, 8 B) and bash's asynchronous ignore of `INT` and
-// `QUIT` (`Vproc::async_ignored`, one byte, in place of a store record in
-// each background vproc's image: the bench, a debug build, measured 2,458
-// → 1,879 B per idle vproc for that move alone) fit the bounds below with
-// the rest; the idle bench gives the figure for the whole. A release that
-// carries three landings, each within the bounds alone, measures more than
-// any of them (rustc `size_of`, x86-64 Linux): a forked vproc's own
-// `$RANDOM` and `$SECONDS` clock (`Vproc::clock`: Vproc 656 → 688 B), bash's
-// kept `wait` statuses and its killed-command notice (`JobTable::bgp`,
-// `ExecState::notice`: Vproc 656 → 664 B, ExecState 376 → 384 B) and the
-// EXIT trap's jump kinds (`ExecState::prefix`,
-// `ScriptKind::Trap::outside_functions`: no growth alone) give Vproc 696 B,
-// Frame 264 B and ExecState 392 B together. The bounds below are those
-// sizes until the structures shrink again; the idle bench has not measured
-// them.
-const _: () = assert!(size_of::<Vproc>() <= 696, "Vproc grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<Frame>() <= 264, "Frame grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<ExecState>() <= 392, "ExecState grew (idle vproc ≤ 2 KiB)");
+// Size guards for the idle-vproc targets (the testkit `memory` bench's
+// `MAX_VPROC_NOWRITE_BYTES`, 2,048 B, and `MAX_RETAINED_BYTES`, which
+// say how they were set): an idle background job holds one boxed `Vproc`,
+// one `Frame`, one boxed `Scratch` and one boxed `ExecState`, so every byte
+// here is a byte per idle vproc.
+// Raise a bound only with the bench's numbers in hand. Each of these added
+// a pointer or less: the boxed zsh side table `Vproc::zsh` (`Frame` is
+// unchanged, its zsh state lives there and in `FrameKind`), host lineage
+// (`Vproc::lineage`, a `u32` label and a flag), the resumable `mapfile -C`
+// counter (`ExecState::resumed`, 368 → 376 B), the line editor's boxed
+// state (`Vproc::zle`), the forking shell's loop count (`Vproc::outer_loops`,
+// a `u16` in the 4 bytes beside `Vproc::trap_frames`), a `break` waiting in
+// `${ }` (`Vproc::pending_break`, boxed), and bash's asynchronous ignore of
+// `INT` and `QUIT` (`Vproc::async_ignored`, one byte, in place of a store
+// record in each background vproc's image).
+// Three landings, each within the bounds alone, measure more together
+// (rustc `size_of`, x86-64 Linux): a forked vproc's own `$RANDOM` and
+// `$SECONDS` clock (`Vproc::clock`, its parent's at the fork: Vproc 656 →
+// 688 B), bash's kept `wait` statuses and its killed-command notice
+// (`JobTable::bgp`, `ExecState::notice`, one pointer each and `None` while
+// unused: Vproc 656 → 664 B, ExecState 376 → 384 B) and the EXIT trap's jump
+// kinds (`ExecState::prefix`, `ScriptKind::Trap::outside_functions`: no
+// growth alone) give Vproc 696 B, Frame 264 B and ExecState 392 B; 8 B each
+// of `Frame` and `ExecState` is alignment.
+// The bench with these sizes (release build, x86-64 Linux, at the Cut14
+// landing): 2,004 B per idle vproc forked with no write by the shell between
+// the forks, in every run; retention 318 B per vproc. In the bench's loop,
+// whose `i` each fork keeps an earlier copy of (its image shares the shell's
+// maps), a process reads 2,214 to 2,322 B.
+const _: () = assert!(size_of::<Vproc>() <= 696, "Vproc grew (idle vproc ≤ 2,048 B back to back)");
+const _: () = assert!(size_of::<Frame>() <= 264, "Frame grew (idle vproc ≤ 2,048 B back to back)");
+const _: () =
+	assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2,048 B back to back)");
+const _: () =
+	assert!(size_of::<ExecState>() <= 392, "ExecState grew (idle vproc ≤ 2,048 B back to back)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one
 // pointer only; `RedirProgress` not at all).

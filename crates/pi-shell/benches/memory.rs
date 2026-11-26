@@ -5,14 +5,26 @@
 //!   measured as the bytes its drop frees (the shared engine's unit cache and
 //!   the store are not the shell's). Target ≤ 64 KiB. The store's growth and
 //!   the allocations of create + `:` are printed beside it.
-//! - **idle vprocs**: `idle &` in a loop, where `idle` is a host task that
-//!   stays pending until signalled (a `sleep` without a timer). Once every
-//!   vproc is blocked, the shell's bytes are measured as above, for [`FEW`] and
-//!   [`MANY`] vprocs; per vproc = difference / ([`MANY`] − [`FEW`]) (vproc, job
-//!   entry, task handle). Target ≤ 2 KiB. The line after it breaks the
-//!   difference down by allocation size (8-byte classes, live allocations per
-//!   vproc), which names the structures that cost the bytes; the `memory
-//!   sizes:` line gives `size_of` of the engine structures an idle vproc holds
+//! - **idle vprocs**: background `idle` vprocs, where `idle` is a host task
+//!   that stays pending until signalled (a `sleep` without a timer), started
+//!   two ways ([`Fork`]): back to back (`idle &` repeated) and in a loop that
+//!   writes `i` after each fork. Once every vproc is blocked, the shell's bytes
+//!   are measured as above, for [`FEW`] and [`MANY`] vprocs; per vproc is the
+//!   difference over [`MANY`] − [`FEW`] (vproc, job entry, task handle). Back
+//!   to back the shell writes nothing between the forks, so the value is the
+//!   same in every run: target ≤ 2,048 B ([`MAX_VPROC_NOWRITE_BYTES`]), a fixed
+//!   margin that holds in every run: what a fork itself costs. In a loop each
+//!   vproc also keeps the path to the counter that the shell copied when it
+//!   wrote it after the fork, and the value moves by the shard the hasher puts
+//!   the counter in. The retention line bounds that part alone: the loop value
+//!   that at least [`RETAIN_AT_LEAST`] of [`RETAIN_PROCS`] child processes
+//!   reach (each over [`RETAIN_NAMES`] counter names), less the back-to-back
+//!   value (target [`MAX_RETAINED_BYTES`]). Each target says how it was set.
+//!   The verdicts are printed only: the bench exits 0 on a `MISS`, and nothing
+//!   runs it on its own, so a person or a Job reads them. The line after the
+//!   loop's breaks its difference down by allocation size (8-byte classes, live
+//!   allocations per vproc) to name the structures that cost the bytes, and the
+//!   sizes line gives `size_of` of the engine structures an idle vproc holds
 //!   (`pi_shell::bash::vproc_layout`), to match against those classes.
 //! - **allocs**: allocations, reallocations and bytes per iteration of the
 //!   loop/func/strops workloads with `EventMask::NONE` (the event-off path) and
@@ -24,8 +36,11 @@
 //!
 //! ```text
 //! memory shell: … bytes after create + `:` (target ≤ 65536) PASS|MISS; store +… bytes; create + `:` … allocs, … bytes
-//! memory idle vprocs: 16 → … bytes, 272 → … bytes; … bytes per vproc (target ≤ 2048) PASS|MISS
+//! memory idle vprocs back to back: 16 → … bytes, 272 → … bytes; … bytes per vproc (target ≤ 2048) PASS|MISS
+//! memory idle vprocs: 16 → … bytes, 272 → … bytes; … bytes per vproc in a loop writing `i` (…)
 //! memory idle vproc allocations by size: 24-31 B ×1.00, …
+//! memory idle vproc retention: … bytes per vproc (loop … B, reached by at least 5 of 128 processes × 16 names, less … B back to back; largest … B; … ms) (target ≤ 682) PASS|MISS
+//! memory idle vproc retention classes: per name … B ×…, …; largest per process … B ×…
 //! memory sizes: Vproc … B, Frame … B, Scratch … B, ScratchIo … B, ExecState … B…
 //! allocs loop NONE: … allocs/iter, … reallocs/iter, … bytes/iter; per run … allocs
 //! …
@@ -36,12 +51,15 @@ mod workloads;
 
 use std::{
 	alloc::{GlobalAlloc, Layout, System},
+	collections::BTreeMap,
 	fmt::Write as _,
+	process::{Command, Stdio},
 	sync::{
 		Arc,
 		atomic::{AtomicUsize, Ordering},
 	},
 	task::{Context, Poll, Waker},
+	time::Instant,
 };
 
 use bstr::BString;
@@ -175,7 +193,75 @@ fn live() -> usize {
 }
 
 const MAX_SHELL_BYTES: usize = 64 * 1024;
-const MAX_VPROC_BYTES: usize = 2 * 1024;
+/// Bytes per idle vproc forked back to back ([`Fork::Back`]): the 2 KiB
+/// target. With no write by the shell between the forks the value is the
+/// same in every run, so a vproc that grows past the margin fails it in
+/// every run. At Cut14 (34021711) it is 2,004 B in 3 of 3 rounds, a margin
+/// of 44 B: planted allocations of 32 and 40 B per vproc pass, one of 96 B
+/// fails. It was 2,013 B in 12 of 12 rounds at 29923cbf and in 3 of 3 at
+/// Cut10 chain step 5 (a460228e), a margin of 35 B. Earlier trees, 3 rounds
+/// each: 1,921 B at 9058ab9d; 1,889 B once forked vprocs own copy-on-write
+/// images (d2d553c3, Cut7 a72018dd to Cut9 85936bf7); 1,897 B at chain step
+/// 1; 1,909 B at steps 2' to 4. A waiting `break` (`Vproc::pending_break`,
+/// step 1) and bash's kept statuses (`JobTable::bgp`, step 2), 8 B of
+/// `Vproc` each, and each vproc's write keys (40 B of `Vproc` and one 64-71
+/// B allocation, `Vproc::write_key`, step 5) added the bytes since d2d553c3.
+/// Cut14's own `size_of` (Vproc 696 B, Frame 264 B, ExecState 392 B) is in
+/// the size-guard comment of `vm/proc.rs`.
+const MAX_VPROC_NOWRITE_BYTES: usize = 2048;
+/// Bytes per idle vproc that a vproc forked in a loop keeps of the shell's
+/// later writes (the retention line: the loop value its processes reach,
+/// less the back-to-back value). An image shares the shell's maps, and when the
+/// shell writes a variable it still shares with a child (the loop's
+/// counter, and any variable the shell writes itself after a command), the
+/// shell copies its path and the child keeps the earlier one: the shard
+/// list, the shard and the entry with its name and value (`CowMap::insert`,
+/// `CowMap::set`; finding: a background child keeps the old shard and
+/// entry). A vproc must keep the state it was forked with, so those bytes
+/// are the image's design; d2d553c3 brought them and took the loop from
+/// 1,840 B (9058ab9d) past 2,048 B.
+///
+/// Their size depends on how full the shard is that the hasher puts the
+/// written variable in. The hasher is one per process (`cow_map::HASHER`),
+/// so one name in one process always gives the same class, and the classes
+/// vary between processes. So the line runs [`RETAIN_PROCS`] child
+/// processes, each running the loop once per name of [`RETAIN_NAMES`]
+/// (each name its own shard), takes each process's largest value, and reads
+/// the largest value that at least [`RETAIN_AT_LEAST`] processes reach.
+/// The single largest is no reading: a rare process holds a fuller shard
+/// (one more bucket class), and the maximum grows with the number of
+/// processes. Measured in 40 runs of 128 processes (20 on runc, 20 on
+/// gVisor; 5.2-5.5 s each): with the counter alone, 5 of 5,120 processes
+/// reached that tail (2,467 B against the top class 2,323), at most one in
+/// a run; with one more written variable, 7 of 5,120 (2,696 or 2,732 B
+/// against 2,660), at most two in a run, while the top class itself was
+/// reached by 16 to 34 processes a run. At those rates five tail processes
+/// in one run (a MISS for no change) has a chance near 1e-6, and fewer than
+/// five at the top class (a reading that cannot see) near 4e-7.
+///
+/// The bound is the top class with one more written variable than the
+/// counter (647 B on this tree's base, 2,660 − 2,013; the same 646 B on
+/// 2de01417, 2,563 − 1,917, as the cause predicts across both bases) plus
+/// a margin of 35 B. It allows one more retained entry per child because
+/// #235 writes `_` after every command, so it no longer catches a second
+/// retained entry of up to 337 B at a tree where only the counter is written
+/// (top class 310 B); once #235 is in, it catches any retention growth over
+/// 35 B. At Cut14 (34021711), with the counter alone, it reads 318 B in 3
+/// of 3 rounds: one retained allocation moved from the 128-135 B class to
+/// 136-143 B with bash's kept `wait` statuses and killed-command notice
+/// (107e2d7b).
+const MAX_RETAINED_BYTES: usize = 682;
+/// Child processes the retention line reads.
+const RETAIN_PROCS: usize = 128;
+/// Loop runs, each writing a variable of its own name, in each child.
+const RETAIN_NAMES: usize = 16;
+/// The retention line reads the largest value at least this many of its
+/// processes reach.
+const RETAIN_AT_LEAST: usize = 5;
+/// Set in a child of the retention line: it prints [`CHILD_LINE`] and ends.
+const CHILD_ENV: &str = "PI_SHELL_MEMORY_BENCH_LOOP_CHILD";
+/// A child's line: each name's bytes per vproc in the loop.
+const CHILD_LINE: &str = "memory loop child:";
 
 /// Idle vprocs in the small and the large case.
 const FEW: u32 = 16;
@@ -224,10 +310,28 @@ fn owned(shell: Shell) -> usize {
 	before.saturating_sub(live())
 }
 
-/// The bytes of a shell after `:` and `n` idle background vprocs, and the
-/// process's live allocations per size class just before its drop.
-fn with_idle(engine: &Arc<Engine>, n: u32) -> (usize, [usize; CLASSES]) {
-	let src = format!(r#"i=0; while [ "$i" -lt {n} ]; do idle & i=$((i+1)); done"#);
+/// How [`with_idle`] starts its idle vprocs.
+#[derive(Clone, Copy)]
+enum Fork<'a> {
+	/// `idle &` repeated: the shell writes nothing between the forks, so each
+	/// vproc holds only what its fork gave it.
+	Back,
+	/// `idle & v=$((v+1))` in a loop, for the variable named here: the shell
+	/// writes it after each fork, so each vproc's image also keeps the path
+	/// to it the shell copied.
+	Loop(&'a str),
+}
+
+/// The bytes of a shell after `:` and `n` idle background vprocs started as
+/// `fork` says, and the process's live allocations per size class just
+/// before its drop.
+fn with_idle(engine: &Arc<Engine>, n: u32, fork: Fork<'_>) -> (usize, [usize; CLASSES]) {
+	let src = match fork {
+		Fork::Back => "idle &\n".repeat(n as usize),
+		Fork::Loop(v) => {
+			format!(r#"{v}=0; while [ "${v}" -lt {n} ]; do idle & {v}=$(({v}+1)); done"#)
+		},
+	};
 	let mut host = idle_host();
 	let mut store = MemStore::new();
 	let mut shell = new_shell(engine, &mut host, &mut store);
@@ -238,7 +342,7 @@ fn with_idle(engine: &Arc<Engine>, n: u32) -> (usize, [usize; CLASSES]) {
 	loop {
 		match shell.step(&mut Cx { host: &mut host, store: &mut store }, UNBOUNDED) {
 			Step::Done { run, status } if run == id => {
-				assert_eq!(status, 0, "the loop succeeds");
+				assert_eq!(status, 0, "the script succeeds");
 				done = true;
 			},
 			Step::Done { .. } | Step::Yield => {},
@@ -253,8 +357,86 @@ fn with_idle(engine: &Arc<Engine>, n: u32) -> (usize, [usize; CLASSES]) {
 	(bytes, live)
 }
 
+/// Bytes per idle vproc started as `fork` says: the bytes at [`FEW`] and at
+/// [`MANY`], the difference per vproc, and each case's live allocations
+/// per size class. Each size runs once untimed first, so its unit is cached.
+fn per_vproc(
+	engine: &Arc<Engine>,
+	fork: Fork<'_>,
+) -> (usize, usize, usize, [usize; CLASSES], [usize; CLASSES]) {
+	with_idle(engine, FEW, fork);
+	with_idle(engine, MANY, fork);
+	let (few, few_sizes) = with_idle(engine, FEW, fork);
+	let (many, many_sizes) = with_idle(engine, MANY, fork);
+	let per = many.saturating_sub(few) / (MANY - FEW) as usize;
+	(few, many, per, few_sizes, many_sizes)
+}
+
+/// A child of the retention line: the loop once per name `v0`.. of
+/// [`RETAIN_NAMES`], each name's bytes per vproc on one [`CHILD_LINE`].
+fn loop_child(engine: &Arc<Engine>) {
+	let mut line = String::from(CHILD_LINE);
+	for k in 0..RETAIN_NAMES {
+		// One width for every name, so a name's length moves no value.
+		let (_, _, per, ..) = per_vproc(engine, Fork::Loop(&format!("v{k:02}")));
+		let _ = write!(line, " {per}");
+	}
+	println!("{line}");
+}
+
+/// The loop values of [`RETAIN_PROCS`] child processes, run at once, one
+/// list per child with one value per name. A child that fails, or prints
+/// no full line, fails the bench: a missing child is no measurement.
+fn loop_children() -> Vec<Vec<usize>> {
+	let exe = std::env::current_exe().expect("the bench's own path");
+	#[expect(
+		clippy::needless_collect,
+		reason = "start every child before waiting on any, so they run at once"
+	)]
+	let kids: Vec<_> = (0..RETAIN_PROCS)
+		.map(|_| {
+			Command::new(&exe)
+				.env(CHILD_ENV, "1")
+				.stdout(Stdio::piped())
+				.spawn()
+				.expect("a child of the bench starts")
+		})
+		.collect();
+	kids
+		.into_iter()
+		.map(|kid| {
+			let out = kid.wait_with_output().expect("a child of the bench ends");
+			assert!(out.status.success(), "a child of the bench failed: {}", out.status);
+			let text = String::from_utf8_lossy(&out.stdout);
+			let values: Vec<usize> = text
+				.lines()
+				.find_map(|l| l.strip_prefix(CHILD_LINE))
+				.expect("a child prints its line")
+				.split_whitespace()
+				.map(|v| v.parse().expect("a child prints byte counts"))
+				.collect();
+			assert_eq!(values.len(), RETAIN_NAMES, "a child measures every name");
+			values
+		})
+		.collect()
+}
+
+/// `values` as `<value> B ×<count>`, smallest first.
+fn histogram(values: impl Iterator<Item = usize>) -> String {
+	let mut counts = BTreeMap::new();
+	for v in values {
+		*counts.entry(v).or_insert(0_usize) += 1;
+	}
+	let parts: Vec<String> = counts.iter().map(|(v, n)| format!("{v} B ×{n}")).collect();
+	parts.join(", ")
+}
+
 fn main() {
 	let engine = Engine::new(EngineConfig::default());
+	if std::env::var_os(CHILD_ENV).is_some() {
+		loop_child(&engine);
+		return;
+	}
 
 	// Shell baseline. Warm first: lazy statics, the engine's unit cache.
 	for _ in 0..2 {
@@ -280,16 +462,17 @@ fn main() {
 		work.bytes
 	);
 
-	// Idle vprocs (each size once untimed, so its loop unit is cached).
-	with_idle(&engine, FEW);
-	with_idle(&engine, MANY);
-	let (few, few_sizes) = with_idle(&engine, FEW);
-	let (many, many_sizes) = with_idle(&engine, MANY);
-	let per = many.saturating_sub(few) / (MANY - FEW) as usize;
+	// Idle vprocs.
+	let (few, many, back, ..) = per_vproc(&engine, Fork::Back);
 	println!(
-		"memory idle vprocs: {FEW} → {few} bytes, {MANY} → {many} bytes; {per} bytes per vproc \
-		 (target ≤ {MAX_VPROC_BYTES}) {}",
-		verdict(per <= MAX_VPROC_BYTES)
+		"memory idle vprocs back to back: {FEW} → {few} bytes, {MANY} → {many} bytes; {back} bytes \
+		 per vproc (target ≤ {MAX_VPROC_NOWRITE_BYTES}) {}",
+		verdict(back <= MAX_VPROC_NOWRITE_BYTES)
+	);
+	let (few, many, per, few_sizes, many_sizes) = per_vproc(&engine, Fork::Loop("i"));
+	println!(
+		"memory idle vprocs: {FEW} → {few} bytes, {MANY} → {many} bytes; {per} bytes per vproc in a \
+		 loop writing `i` (this process's class; the retention line bounds the largest)"
 	);
 	let mut breakdown = String::new();
 	for (c, (&m, &f)) in many_sizes.iter().zip(&few_sizes).enumerate() {
@@ -305,6 +488,32 @@ fn main() {
 		}
 	}
 	println!("memory idle vproc allocations by size:{}", breakdown.trim_end_matches(','));
+	// Retention: each child's largest loop value (the hasher, and so the
+	// class, is one per process), then the largest value at least
+	// RETAIN_AT_LEAST children reach, less back to back.
+	let started = Instant::now();
+	let kids = loop_children();
+	let mut tops: Vec<usize> = kids
+		.iter()
+		.map(|k| k.iter().copied().max().unwrap_or(0))
+		.collect();
+	tops.sort_unstable_by(|a, b| b.cmp(a));
+	let reached = tops.get(RETAIN_AT_LEAST - 1).copied().unwrap_or(0);
+	let retained = reached.saturating_sub(back);
+	println!(
+		"memory idle vproc retention: {retained} bytes per vproc (loop {reached} B, reached by at \
+		 least {RETAIN_AT_LEAST} of {} processes × {RETAIN_NAMES} names, less {back} B back to \
+		 back; largest {} B; {} ms) (target ≤ {MAX_RETAINED_BYTES}) {}",
+		kids.len(),
+		tops.first().copied().unwrap_or(0),
+		started.elapsed().as_millis(),
+		verdict(retained <= MAX_RETAINED_BYTES)
+	);
+	println!(
+		"memory idle vproc retention classes: per name {}; largest per process {}",
+		histogram(kids.iter().flatten().copied()),
+		histogram(tops.iter().copied())
+	);
 	let mut sizes = String::new();
 	for (name, bytes) in vproc_layout() {
 		let _ = write!(sizes, " {name} {bytes} B,");
