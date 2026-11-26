@@ -2312,8 +2312,10 @@ pub fn declare(ctx: &mut Ctx<'_, '_>, args: &[BString], kind: DeclareKind) -> R 
 					let assoc = on.contains(Attrs::ASSOC) || matches!(var.value, VarValue::Assoc(_));
 					match compound_from_string(ctx, &value[1..value.len() - 1], assoc)? {
 						Ok(elems) => AssignValue::Array(elems),
+						// An expansion error is the expansion's message (bash
+						// prints no `declare: ` before it).
 						Err(d) => {
-							ctx.err(d);
+							ctx.diag(d);
 							status = 1;
 							continue;
 						},
