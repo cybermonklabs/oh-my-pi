@@ -1,3 +1,5 @@
+import { isProviderCatalogEndpointUrl } from "../compat/catalog-endpoint";
+import { isGeneratedProvider } from "../models";
 import { CHARM_HYPER_API_BASE_URL, normalizeCharmHyperBaseUrl } from "../wire/charm-hyper";
 import { CODEX_BASE_URL, CODEX_CLIENT_VERSION } from "../wire/codex";
 import { CURSOR_DEFAULT_BASE_URL } from "../wire/cursor";
@@ -245,7 +247,17 @@ export function resolveModelCacheProviderId(providerId: string, options: ModelCa
 			// v3: rows cached before discovery read `ModelInfo.maxTokens` hold a
 			// 200K window on every model.
 			return "devin:models-v3";
-		default:
-			return providerId;
+		default: {
+			const baseUrl = options.baseUrl?.trim().replace(/\/+$/, "");
+			// Only a generated provider pointed away from its own catalog endpoint
+			// gets an endpoint-scoped namespace, so a vendor entry redirected to a
+			// proxy keeps its roster out of the bare cache. A non-generated provider
+			// (a local server, an aggregator) keeps its bare id, matching the id its
+			// own manager writes.
+			if (!baseUrl || !isGeneratedProvider(providerId) || isProviderCatalogEndpointUrl(providerId, baseUrl)) {
+				return providerId;
+			}
+			return `${providerId}:models-v1:${Bun.hash(baseUrl).toString(36)}`;
+		}
 	}
 }

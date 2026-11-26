@@ -1,8 +1,11 @@
 import { getBundledModels, isGeneratedProvider } from "../models";
 import type { Model } from "../types";
 import { resolveCatalogPolicy } from "./catalog-policy";
+import { classifyModel } from "./taxonomy";
 
 const bundledHosts = new Map<string, string | null>();
+
+const bundledModelClasses = new Map<string, ReadonlySet<string>>();
 
 /** Hostname of the provider's bundled base URL; every provider bundles one origin. */
 function bundledHost(provider: string): string | null {
@@ -40,4 +43,30 @@ export function isCatalogEndpointUrl(model: Model, url: string | undefined): boo
 	// The rule compiler validates `endpoint-hosts` as an array of strings.
 	const hosts = resolveCatalogPolicy(model).endpointHosts as readonly string[] | undefined;
 	return hosts?.includes(parsed.hostname) === true;
+}
+
+/** Whether {@link url} is one of {@link provider}'s catalog endpoints. */
+export function isProviderCatalogEndpointUrl(provider: string, url: string | undefined): boolean {
+	if (!isGeneratedProvider(provider)) return false;
+	return getBundledModels(provider).some(model => isCatalogEndpointUrl(model, url));
+}
+
+/**
+ * Whether {@link modelId} is in a model family the provider's bundled catalog
+ * serves. A redirected built-in discovery result must not turn a proxy's
+ * aggregate roster into entries under the wrong provider.
+ */
+export function providerOwnsModelId(provider: string, modelId: string): boolean {
+	if (!isGeneratedProvider(provider)) return false;
+	let classes = bundledModelClasses.get(provider);
+	if (!classes) {
+		classes = new Set(
+			getBundledModels(provider)
+				.map(model => model.identity.class)
+				.filter(modelClass => modelClass !== "unknown"),
+		);
+		bundledModelClasses.set(provider, classes);
+	}
+	const modelClass = classifyModel(provider, modelId, { lenient: true }).class;
+	return modelClass !== "unknown" && classes.has(modelClass);
 }
