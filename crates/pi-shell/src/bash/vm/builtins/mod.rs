@@ -19,7 +19,7 @@ mod getopts;
 mod help;
 pub mod history;
 mod io;
-mod jobs;
+pub mod jobs;
 mod kill;
 mod mapfile;
 pub mod misc;
@@ -151,6 +151,12 @@ pub enum Control {
 	/// subscript), status in [`Outcome::status`]: a `-c` string is abandoned
 	/// whole, a script file goes on with its next command.
 	DiscardAll,
+	/// An error that abandons the command by a plain `DISCARD` (bash's
+	/// `exp_jump_to_top_level (DISCARD)`, `top_level_cleanup` only at a
+	/// script's own level: a declaration's compound word that fails while
+	/// bash expands it), status in [`Outcome::status`]: the innermost
+	/// script (the run's, `eval`'s, `.`'s) goes on with its next command.
+	Discard,
 	/// A frame was pushed (`eval`, `source`): wait for it to return.
 	Frame,
 	/// A frame was pushed (`mapfile`'s callback): wait for it to return,
@@ -228,6 +234,11 @@ pub struct Ctx<'a, 'c> {
 	/// option, a non-numeric argument, an invalid name) or a `.` file that
 	/// cannot be read.
 	pub usage_error: bool,
+	/// A variable the builtin binds (`read`, `printf -v`, `mapfile`) hit an
+	/// arithmetic subscript error ([`io::bind_lhs`]): bash's
+	/// `array_expand_index` abandons the line, so [`run`] turns the
+	/// builtin's outcome into [`Control::DiscardAll`] with status 1.
+	pub discard:     bool,
 	/// Replay log of the substitutions the builtin ran
 	/// ([`Slot::Builtin`](super::proc::Slot)).
 	pub log:         Vec<super::proc::Atom>,
@@ -265,6 +276,7 @@ impl<'a, 'c> Ctx<'a, 'c> {
 			name,
 			compound: Vec::new(),
 			usage_error: false,
+			discard: false,
 			log: Vec::new(),
 			log_cursor: 0,
 			arrayref: Vec::new(),
@@ -607,9 +619,13 @@ pub fn run(id: IntrinsicId, ctx: &mut Ctx<'_, '_>, argv: &[BString]) -> R {
 	// next argument's `arith_argument` ends the one before, and an argument
 	// parks only after its own arithmetic ended).
 	ctx.arith_end();
+	if ctx.discard {
+		return Ok(Outcome { status: 1, control: Control::DiscardAll });
+	}
 	r
 }
 
+/// [`run`]'s dispatch to the builtin's own function.
 fn dispatch(id: IntrinsicId, ctx: &mut Ctx<'_, '_>, argv: &[BString]) -> R {
 	use IntrinsicId as I;
 	if ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Zsh

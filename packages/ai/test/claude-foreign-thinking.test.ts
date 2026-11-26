@@ -27,10 +27,10 @@ import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/pro
  * earlier assistant turns carry another model's reasoning as plain prose. A
  * session that moved from Claude to another model and back sent that model's
  * thinking demoted to text and was refused; the same request with only that
- * thinking removed was served. A Claude target therefore gets another model's
- * thinking only as a block signed on its own provider's Anthropic Messages
- * endpoint, which replays natively as before. The other model's answers and
- * tool calls stay, and Claude's own thinking replays as it did before.
+ * thinking removed was served. A Claude target therefore gets no other model's
+ * thinking, signed or not, other Claude models included. The other model's
+ * answers and tool calls stay, and Claude's own thinking replays as it did
+ * before.
  */
 
 const REASONING = "Plan: read config.ts first, then patch the parser and rerun the suite.";
@@ -316,11 +316,8 @@ describe("a Claude target gets none of another model's thinking", () => {
 	});
 });
 
-describe("another Claude model's signed thinking on the same provider is unchanged", () => {
-	it("keeps it as a signed block on a custom host and drops the unsigned block beside it", () => {
-		// The host keeps another model's signature as an opaque hint (#2265),
-		// and a turn that keeps one signed block has its unsigned blocks written
-		// as text.
+describe("another Claude model's signed thinking on the same provider", () => {
+	it("drops it, with its redacted and unsigned blocks, on a custom host", () => {
 		const target = anthropicTarget({
 			provider: "custom-anthropic",
 			id: "claude-sonnet-4-6",
@@ -347,19 +344,16 @@ describe("another Claude model's signed thinking on the same provider is unchang
 
 		for (const messages of [latest, earlier]) {
 			const wire = anthropicWire(messages, target);
-			expect(wire.assistant).toContainEqual({ type: "thinking", thinking: "Signed plan.", signature: "sig_signed" });
-			expect(wire.assistant).toContainEqual({ type: "redacted_thinking", data: "redacted-on-this-host" });
+			expect(wire.json).not.toContain("Signed plan.");
+			expect(wire.json).not.toContain("sig_signed");
+			expect(wire.json).not.toContain("redacted-on-this-host");
 			expect(wire.json).not.toContain(REASONING);
 			expect(wire.assistant).toContainEqual({ type: "text", text: ANSWER });
 			expect(wire.assistant).toContainEqual(expect.objectContaining({ type: "tool_use", id: "call_1" }));
 		}
 	});
 
-	it("keeps it on first-party Anthropic and drops the block whose signature it stops trusting", () => {
-		// First-party Anthropic verifies another model's signature from its own
-		// deployment, so that block replays natively. An errored turn's final
-		// block holds a partial signature, which is stripped; unsigned, it would
-		// be written as text.
+	it("drops it on first-party Anthropic", () => {
 		const target = anthropicTarget({ id: "claude-opus-4-8" });
 		const sonnet: Source = { api: "anthropic-messages", provider: "anthropic", model: "claude-sonnet-4-6" };
 		const messages: Message[] = [
@@ -377,9 +371,34 @@ describe("another Claude model's signed thinking on the same provider is unchang
 		];
 
 		const wire = anthropicWire(messages, target);
-		expect(wire.assistant).toContainEqual({ type: "thinking", thinking: "Signed plan.", signature: "sig_complete" });
-		expect(wire.assistant).toContainEqual({ type: "text", text: ANSWER });
+		expect(wire.json).not.toContain("Signed plan.");
+		expect(wire.json).not.toContain("sig_complete");
 		expect(wire.json).not.toContain(REASONING);
+		expect(wire.assistant).toContainEqual({ type: "text", text: ANSWER });
+	});
+
+	it("sends a mid-tool-loop switch from another Claude model as it sends a Gemini loop", () => {
+		const target = anthropicTarget({ id: "claude-opus-4-8" });
+		const sonnet: Source = { api: "anthropic-messages", provider: "anthropic", model: "claude-sonnet-4-6" };
+		const loop = (source: Source, signature: string): Message[] => [
+			user("Fix the parser."),
+			assistant(
+				[
+					{ type: "thinking", thinking: REASONING, thinkingSignature: signature },
+					{ type: "toolCall", id: "toolu_loop", name: "read", arguments: { path: "config.ts" } },
+				],
+				source,
+			),
+			toolResult("toolu_loop"),
+		];
+
+		const fromSonnet = anthropicWire(loop(sonnet, "sig_sonnet"), target);
+		const fromGemini = anthropicWire(loop(GEMINI_COMPLETIONS, "reasoning_content"), target);
+		expect(fromSonnet.json).not.toContain(REASONING);
+		expect(fromSonnet.json).not.toContain("sig_sonnet");
+		expect(fromSonnet.assistant.map(block => block.type)).toEqual(["tool_use"]);
+		expect(fromSonnet.user.map(block => block.type)).toContain("tool_result");
+		expect(fromSonnet.json).toBe(fromGemini.json);
 	});
 });
 

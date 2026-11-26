@@ -2014,8 +2014,8 @@ interface PreparedProviderCall {
 	/** Steering source offered to the provider for this call. */
 	liveSteering?: LiveSteeringChannel;
 	/**
-	 * Records this call's per-call messages as the previous main request's; called as the provider dispatches the
-	 * request (its `beforeDispatch`), past the stream function's own gates.
+	 * Records this call's per-call messages as the previous main request's; called as the provider reports its
+	 * response to the request (its `onResponse`), so a request stopped before it reached the provider is no record.
 	 */
 	perCallMessagesSent?: () => void;
 }
@@ -2251,11 +2251,19 @@ async function streamAssistantResponse(
 
 	// Wrap the user-supplied onResponse so we always observe response headers
 	// for telemetry (`ChatUsageEvent.headers`, gateway auto-detection) without
-	// stealing them from the configured hook.
+	// stealing them from the configured hook. A response also makes this request
+	// the one the next request compares its per-call messages with: only a request
+	// the provider answered can have left them in its cache. One stopped before it
+	// reached the provider sends nothing: a stream function's own gate (a spend cap
+	// or a model check as the request goes out), or an abort while the provider
+	// still builds the request (its payload hook, image preparation), which comes
+	// after the dispatch hook (`beforeDispatch`) has run.
 	let capturedHeaders: Readonly<Record<string, string>> | undefined;
 	const userOnResponse = config.onResponse;
+	const perCallMessagesSent = providerCall.perCallMessagesSent;
 	const captureOnResponse: AgentLoopConfig["onResponse"] = (response, modelInfo) => {
 		capturedHeaders = response.headers;
+		perCallMessagesSent?.();
 		return userOnResponse?.(response, modelInfo);
 	};
 
@@ -2320,10 +2328,9 @@ async function streamAssistantResponse(
 	// layer dispatches itself (re-sample, rotated credential). The caller's
 	// own hold is asked again after each wait on the gate, so what it checks
 	// is checked after the pause rather than before it. Past every hold the
-	// provider sends: only a request that gets there becomes the one the next
-	// request compares its per-call messages with, and one a stream function's
-	// own gate stopped (a spend cap, a model check) or an abort ended sends
-	// nothing and leaves that record as it was.
+	// provider sends; the request becomes the one the next request compares
+	// its per-call messages with only once the provider answers it
+	// (`captureOnResponse` above), not here.
 	const callerHold = config.beforeDispatch;
 	const beforeDispatch: DispatchHold = async () => {
 		for (;;) {
@@ -2337,7 +2344,6 @@ async function streamAssistantResponse(
 			await waitForProcessPause(config, finalRequestSignal);
 		}
 		finalRequestSignal?.throwIfAborted();
-		providerCall.perCallMessagesSent?.();
 	};
 	// Awaiting the hold proves only that the gate was open when it answered.
 	// The transport reads this in the same synchronous step that sends, so a

@@ -218,7 +218,7 @@ pub fn size_param(
 	};
 	let name: &[u8] = if save { b"SAVEHIST" } else { b"HISTSIZE" };
 	if unset && let Some(v) = var(root, store, vp, name)? {
-		state::unset_var(root, store, vp, name, true);
+		state::unset_var(root, store, vp, name, state::UnsetKeeps::AllScoped);
 		set_size_param(root, store, vp, save, Some(int_value(&v)))?;
 	}
 	let st = load_state(root, store, vp)?;
@@ -248,7 +248,7 @@ pub fn set_size_param(
 			st.savehist_unset = false;
 		} else {
 			st.savehist_unset = true;
-			state::unset_var(root, store, vp, b"SAVEHIST", true);
+			state::unset_var(root, store, vp, b"SAVEHIST", state::UnsetKeeps::AllScoped);
 		}
 		Hist::save_state(&st, root, store, vp);
 		return Ok(());
@@ -261,7 +261,7 @@ pub fn set_size_param(
 		h.resize(dups_first);
 	} else {
 		h.st.histsiz_unset = true;
-		state::unset_var(root, store, vp, b"HISTSIZE", true);
+		state::unset_var(root, store, vp, b"HISTSIZE", state::UnsetKeeps::AllScoped);
 	}
 	h.save(root, store, vp);
 	Ok(())

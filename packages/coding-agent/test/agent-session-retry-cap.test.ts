@@ -1752,7 +1752,9 @@ describe("AgentSession retry delay cap", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.maxDelayMs": 300_000,
-			"retry.maxRetries": 3,
+			// The 503 spends the one retry, so the refusals get no same-model retry and
+			// walk at once, and the usage limit comes on a spent budget.
+			"retry.maxRetries": 1,
 			"retry.modelFallback": true,
 			"retry.fallbackChains": {
 				default: [
@@ -1798,7 +1800,7 @@ describe("AgentSession retry delay cap", () => {
 		}
 		const last = lastAssistant(session);
 		expect(last.stopReason).toBe("error");
-		expect(last.errorMessage).toStartWith("Retry budget exhausted after 3 retries: ");
+		expect(last.errorMessage).toStartWith("Retry budget exhausted after 1 retry: ");
 		expect(last.errorMessage).toContain("429 Weekly usage limit reached");
 	});
 

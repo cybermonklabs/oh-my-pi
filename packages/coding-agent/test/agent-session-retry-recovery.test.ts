@@ -777,20 +777,24 @@ describe("AgentSession retry recovery", () => {
 		expect(fallbackEvents).toHaveLength(1);
 	});
 
-	it("advances the fallback chain at once for a refusal worded as a wire failure", async () => {
-		// A refusal reproduces on the same model however the stream then died.
-		const { primary, fallback, requestedModels, fallbackEvents } = await runFallbackChainRecovery([
-			{
-				content: [{ type: "thinking", thinking: "partial plan for the edit" }],
-				stopReason: "error",
-				stopDetails: { type: "refusal" },
-				errorMessage: "socket is closed",
-			},
-			{ content: ["recovered on fallback"], stopReason: "stop" },
-		]);
+	it("retries a refusal worded as a wire failure as a refusal: at once on the same model, then the walk", async () => {
+		// A refusal takes the refusal path however the stream then died: its two
+		// same-model retries go at once, not after the wire-failure hold's jittered
+		// backoff (non-zero with `Math.random()` pinned at 0.5), and then the walk.
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
+		const refusal: MockResponse = {
+			content: [{ type: "thinking", thinking: "partial plan for the edit" }],
+			stopReason: "error",
+			stopDetails: { type: "refusal" },
+			errorMessage: "socket is closed",
+		};
+		const { primary, fallback, requestedModels, fallbackEvents, retryStartDelaysMs } = await runFallbackChainRecovery(
+			[refusal, refusal, refusal, { content: ["recovered on fallback"], stopReason: "stop" }],
+		);
 
-		expect(requestedModels).toEqual([primary, fallback]);
+		expect(requestedModels).toEqual([primary, primary, primary, fallback]);
 		expect(fallbackEvents).toHaveLength(1);
+		expect(retryStartDelaysMs).toEqual([0, 0, 0]);
 	});
 
 	it("retries a cut that streamed nothing when no provider loop would have replayed it", async () => {

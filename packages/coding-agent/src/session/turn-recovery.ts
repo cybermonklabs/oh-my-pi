@@ -75,6 +75,7 @@ import {
 	isUserAuthoredMessage,
 	operatorTitleText,
 } from "./messages";
+import { CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES } from "./refusal-retries";
 import {
 	type ActiveRetryFallbackState,
 	calculateFullJitterRetryDelayMs,
@@ -704,14 +705,15 @@ export class TurnRecovery {
 	 * must not walk `retry.fallbackChains` with the cut-off answer. Any other
 	 * refusal of a continuation (an overload, a server error, a usage limit)
 	 * walks the chain as it would after a stream stall.
-	 * Cleared in `resolveRetry()` and wherever `#retryAttempt` goes back to 0.
+	 * Cleared when the saga ends (`resolveRetry()`, `#takeRetrySaga()`) and wherever `#retryAttempt` goes back to 0.
 	 */
 	#continuingCommittedText = false;
 	#genericAbortStreak = 0;
 	/**
 	 * Selectors a classifier refusal has already moved off in the current retry saga; see the walk
-	 * bound below. Cleared in `resolveRetry()`, which every end of a saga goes through (an answer,
-	 * the exhausted budget, a cancelled wait, an abort), so no turn inherits another turn's walk.
+	 * bound below. Cleared when the saga ends: in `resolveRetry()`, which every end of a saga goes through (an
+	 * answer, the exhausted budget, a cancelled wait, an abort), and which an end that awaits calls as it takes the
+	 * saga (`#takeRetrySaga()`), so no turn inherits another turn's walk and no ending saga clears a newer one's.
 	 */
 	readonly #refusalWalkTried = new Set<string>();
 	/**
@@ -737,6 +739,14 @@ export class TurnRecovery {
 	 * as it starts. Each retry policy clears it before its walk, and `resolveRetry()` clears it.
 	 */
 	#walkExcludedProvider: string | undefined;
+	/**
+	 * Same-model retries each model has had for a classifier refusal in the current retry saga,
+	 * keyed as `#refusalWalkKey` keys `#refusalWalkTried`. Cleared when a saga starts (its first
+	 * attempt in `#applyRetryPolicy`), not when one ends: a close that is still writing the
+	 * outcome of the last saga when the next one starts would otherwise clear the new saga's
+	 * counts in its `resolveRetry()`, and give a refused model more retries than the bound.
+	 */
+	readonly #refusalRetries = new Map<string, number>();
 	/** Per-model account walk allowance, snapshotted once and cleared when the retry saga ends. */
 	readonly #accountPolicyRotationsRemaining = new Map<string, number>();
 	#requestBodyReadTimeoutRecoveryPromptSequence: number | undefined;
@@ -1018,16 +1028,18 @@ export class TurnRecovery {
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
 		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
-		this.#continuingCommittedText = false;
-		await this.#host.emitSessionEvent({
-			type: "auto_retry_end",
-			success: false,
-			attempt,
-			finalError: message.errorMessage,
-			kind: retryFailureKind(message.errorId),
-		});
-		this.#clearPendingRetryErrors();
+		const saga = this.#takeRetrySaga();
+		try {
+			await this.#host.emitSessionEvent({
+				type: "auto_retry_end",
+				success: false,
+				attempt,
+				finalError: message.errorMessage,
+				kind: retryFailureKind(message.errorId),
+			});
+		} finally {
+			saga.release();
+		}
 	}
 
 	/** Persists an otherwise skipped terminal empty error turn. */
@@ -1379,7 +1391,8 @@ export class TurnRecovery {
 
 	/**
 	 * Resolve the pending retry promise; the saga is over, and so are its
-	 * refusal walk and its continuation of a rate-limited answer.
+	 * refusal walk and its continuation of a rate-limited answer. An end of a
+	 * saga that awaits takes the saga first ({@link #takeRetrySaga}).
 	 */
 	resolveRetry(): void {
 		this.#refusalWalkTried.clear();
@@ -1396,9 +1409,27 @@ export class TurnRecovery {
 	}
 
 	/**
+	 * Ends the retry saga an abort cut short while its retried request ran. Nothing else closes it:
+	 * without this the announced retry never gets its `auto_retry_end`, and the next turn's saga
+	 * starts with the aborted one's attempts spent, so a refusal in it gets no same-model retry.
+	 * The aborted request already left its own record, so no stopped-turn record is added.
+	 */
+	async resolveAbortedRetry(aborted: AssistantMessage): Promise<void> {
+		if (this.#retryAttempt === 0) {
+			this.resolveRetry();
+			return;
+		}
+		await this.#endCancelledRetry(aborted, false);
+	}
+
+	/**
 	 * Ends a retry saga: records its outcome in the session (the terminal empty
 	 * error turn, the annotations on the attempts it retried), publishes
-	 * `auto_retry_end`, then resets the saga and resolves `retryPromise`.
+	 * `auto_retry_end`, then resolves `retryPromise`. The close takes the saga
+	 * before its first await ({@link #takeRetrySaga}): a reply that settles while
+	 * the outcome is written finds no open saga and does not close it a second
+	 * time, and a saga that starts meanwhile keeps its own attempt count, errors,
+	 * refusal walk and retry promise.
 	 * Publishing and releasing run in `finally`, so a session write that throws
 	 * (a full disk, an unwritable transcript) still ends the saga before its
 	 * error propagates. Left pending, `retryPromise` keeps the in-flight prompt
@@ -1409,10 +1440,13 @@ export class TurnRecovery {
 		end: RetrySagaEnd,
 		record: { terminalTurn?: AssistantMessage; retryErrors?: RetryErrorCompletion },
 	): Promise<void> {
+		const saga = this.#takeRetrySaga();
 		let retryErrors: RetryErrorUpdate[] | undefined;
 		try {
 			if (record.terminalTurn) await this.persistTerminalEmptyErrorTurn(record.terminalTurn);
-			if (record.retryErrors) retryErrors = await this.#markPendingRetryErrors(record.retryErrors);
+			if (record.retryErrors) {
+				retryErrors = await this.#markPendingRetryErrors(saga.pendingRetryErrors, record.retryErrors);
+			}
 		} finally {
 			try {
 				await this.#host.emitSessionEvent({
@@ -1421,11 +1455,37 @@ export class TurnRecovery {
 					...(retryErrors ? { retryErrors } : {}),
 				});
 			} finally {
-				this.#clearPendingRetryErrors();
-				this.#retryAttempt = 0;
-				this.resolveRetry();
+				saga.release();
 			}
 		}
+	}
+
+	/**
+	 * Takes the current retry saga for an end that awaits (a close that writes the
+	 * saga's outcome, a cancelled wait that records the stop, the publishing of
+	 * `auto_retry_end`), before its first await: sets the attempt count to 0,
+	 * takes the pending errors, clears the refusal walk and detaches the retry
+	 * promise. `release` resolves that promise once the end is done. A reply that
+	 * settles meanwhile finds no open saga, and a saga that starts meanwhile makes
+	 * a promise, a walk and an attempt count of its own, which this end neither
+	 * resolves nor clears.
+	 */
+	#takeRetrySaga(): { pendingRetryErrors: PendingRetryError[]; release: () => void } {
+		this.#retryAttempt = 0;
+		const pendingRetryErrors = this.#pendingRetryErrors;
+		this.#clearPendingRetryErrors();
+		const promise = this.#retryPromise;
+		const resolve = this.#retryResolve;
+		// Detached first, so resolveRetry() clears only the walk.
+		this.#retryResolve = undefined;
+		this.resolveRetry();
+		return {
+			pendingRetryErrors,
+			release: () => {
+				resolve?.();
+				if (this.#retryPromise === promise) this.#retryPromise = undefined;
+			},
+		};
 	}
 
 	#clearPendingRetryErrors(): void {
@@ -1514,11 +1574,14 @@ export class TurnRecovery {
 	 * recovered saga closes on a successful turn, which also continued from the
 	 * kept turns: their `continued` stamps go in the same write.
 	 */
-	async #markPendingRetryErrors(completion: RetryErrorCompletion): Promise<RetryErrorUpdate[]> {
+	async #markPendingRetryErrors(
+		pendingRetryErrors: readonly PendingRetryError[],
+		completion: RetryErrorCompletion,
+	): Promise<RetryErrorUpdate[]> {
 		const stamps = completion.status === "recovered" ? await this.#continuedStamps() : [];
 		const branch = this.#host.sessionManager.getBranchView();
 		const retryErrors: RetryErrorUpdate[] = [];
-		for (const pending of this.#pendingRetryErrors) {
+		for (const pending of pendingRetryErrors) {
 			const target = branchAssistantEntry(branch, pending.entryId, pending.persistenceKey);
 			if (!target) continue;
 			let retryRecovery: AssistantRetryRecovery;
@@ -1674,15 +1737,18 @@ export class TurnRecovery {
 				provider: assistantMessage.provider,
 				outputTokens,
 			});
-			await this.#host.emitSessionEvent({
-				type: "auto_retry_end",
-				success: false,
-				attempt: this.#retryAttempt > 0 ? this.#retryAttempt : attempts,
-				finalError,
-			});
-			this.#clearPendingRetryErrors();
-			this.#retryAttempt = 0;
-			this.resolveRetry();
+			const attempt = this.#retryAttempt > 0 ? this.#retryAttempt : attempts;
+			const saga = this.#takeRetrySaga();
+			try {
+				await this.#host.emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt,
+					finalError,
+				});
+			} finally {
+				saga.release();
+			}
 			// A turn with no actionable output carries no transcript value, while its
 			// provider usage can anchor the next prompt at the full failed-request size
 			// and re-trigger compaction at the same boundary. Remove every capped
@@ -2381,7 +2447,8 @@ export class TurnRecovery {
 	 * Excluded on purpose:
 	 * - capacity (429, 529, overloaded, a usage limit) — the replay re-hits the
 	 *   same cap while a chain entry may sit under a different one;
-	 * - a classifier refusal and an account-policy denial, which reproduce;
+	 * - a classifier refusal, which has its own same-model retries
+	 *   (`CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES`), and an account-policy denial, which reproduces;
 	 * - a timeout ({@link AIError.Flag.Timeout}) — each held replay costs a
 	 *   whole first-event window, minutes against a wedged route, for evidence
 	 *   that already points at the route rather than at the wire.
@@ -3219,10 +3286,10 @@ export class TurnRecovery {
 				// attempt, and, when `retry.rateLimitWalksChain` is on, a rate limit on
 				// the signer makes only a futile one, so the chain moves to the
 				// candidate.
-				// A classifier refusal is one of those: the source model declines the same
-				// request again, and Anthropic's documented retry for a refusal resends
-				// the history unchanged on another Claude model, which drops the thinking
-				// blocks it cannot read (preserved thinking, "Switching models
+				// A classifier refusal is one of those: the walk runs only once the refused
+				// model's own retries are spent, and Anthropic's documented retry for a
+				// refusal resends the history unchanged on another Claude model, which drops
+				// the thinking blocks it cannot read (preserved thinking, "Switching models
 				// mid-conversation").
 				// While the refusal's fallback credit can still be redeemed, only its
 				// targets pass, so an earlier non-target entry cannot forfeit the credit.
@@ -3740,7 +3807,7 @@ export class TurnRecovery {
 			// it. A throw anywhere else on the way, such as recording an attempt
 			// before its retry is scheduled, leaves the saga open, and nothing
 			// else would close it.
-			if (this.#retryPromise) {
+			if (this.#retryResolve) {
 				await this.#closeRetrySaga(
 					{ success: false, attempt: this.#retryAttempt, finalError: message.errorMessage },
 					{},
@@ -3765,7 +3832,10 @@ export class TurnRecovery {
 		const classifierRefusal = this.isClassifierRefusal(message);
 
 		const generation = this.#host.promptGeneration();
-		if (this.#retryAttempt === 0) this.#genericAbortStreak = 0;
+		if (this.#retryAttempt === 0) {
+			this.#genericAbortStreak = 0;
+			this.#refusalRetries.clear();
+		}
 		this.#retryAttempt++;
 		if (this.#retryAttempt === 1) this.#usageLimitFailedCredentialIds.clear();
 		this.#genericAbortStreak =
@@ -3773,9 +3843,10 @@ export class TurnRecovery {
 				? this.#genericAbortStreak + 1
 				: 0;
 
-		// Create retry promise on first attempt so waitForRetry() can await it
-		// Ensure only one promise exists (avoid orphaned promises from concurrent calls)
-		if (!this.#retryPromise) {
+		// The saga's promise, made on its first attempt, which waitForRetry() awaits. One
+		// promise per saga: a saga whose end is still running has given up its resolver
+		// (#takeRetrySaga), so a saga that starts meanwhile makes a promise of its own.
+		if (!this.#retryResolve) {
 			const { promise, resolve } = Promise.withResolvers<void>();
 			this.#retryPromise = promise;
 			this.#retryResolve = resolve;
@@ -4143,16 +4214,34 @@ export class TurnRecovery {
 		};
 
 		const creditBalanceRejection = AIError.isCreditBalanceTooLow(message.errorStatus, errorMessage);
-		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
-			// The retry budget bounds same-model retries against a failing provider. A
-			// classifier refusal is not that: retrying the same model reproduces it, and
-			// the next model in the chain is one request away and often answers. Stopping
-			// the walk at the budget ends the turn with models left untried.
+		// A classifier refusal is retried on its model before the walk below leaves it, by rule:
+		// up to CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES times for each model, inside the retry
+		// budget. Whether the same request is then answered varies (see refusal-retries.ts for
+		// the measurements and the provider's contrary guidance), so the count stays small.
+		// Every category and shape of refusal takes this path. A model the walk has already
+		// left after a refusal is not asked again in the saga. There is nothing to wait out, so
+		// the retry goes at once.
+		let sameModelRefusalRetry = false;
+		if (classifierRefusal && currentSelector && !retryBudgetExhausted) {
+			const refusalKey = this.#refusalWalkKey(currentSelector);
+			const refusalRetries = this.#refusalRetries.get(refusalKey) ?? 0;
+			if (!this.#refusalWalkTried.has(refusalKey) && refusalRetries < CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES) {
+				this.#refusalRetries.set(refusalKey, refusalRetries + 1);
+				sameModelRefusalRetry = true;
+				delayMs = 0;
+			}
+		}
+
+		if (!staleOpenAIResponsesReplayError && !switchedCredential && !sameModelRefusalRetry && currentSelector) {
+			// The retry budget bounds same-model retries against a failing provider. It does
+			// not bound a classifier refusal's walk: once the refused model's own retries above
+			// are spent, the next model in the chain is one request away and often answers, and
+			// stopping the walk at the budget would end the turn with models left untried.
 			//
 			// The budget was also what terminated the walk: `retryFallbackChainKeys`
 			// consults the current model's own chain as well as the pinned one, so chains
 			// that name each other alternate rather than loop in place, and every hop used
-			// to spend an attempt. The walk is bounded here instead — a refusal visits any
+			// to spend an attempt. The walk is bounded here instead — a refusal walks to any
 			// one model at most once per turn, so A -> B -> A terminates whatever the
 			// chains say.
 			const refusalWalkKey = this.#refusalWalkKey(currentSelector);
@@ -4295,7 +4384,11 @@ export class TurnRecovery {
 				this.#genericAbortStreak = 0;
 			}
 		}
-		if ((classifierRefusal || accountPolicyDenial) && !switchedCredential && !switchedModel) {
+		if (
+			((classifierRefusal && !sameModelRefusalRetry) || accountPolicyDenial) &&
+			!switchedCredential &&
+			!switchedModel
+		) {
 			// A prior attempt in this saga already announced `auto_retry_start`
 			// (retryAttempt was incremented for each call to this method, so > 1
 			// means at least one earlier attempt started the loop) but this
@@ -4313,9 +4406,10 @@ export class TurnRecovery {
 					},
 					{ terminalTurn: message },
 				);
+			} else {
+				this.#retryAttempt = 0;
+				this.resolveRetry();
 			}
-			this.#retryAttempt = 0;
-			this.resolveRetry();
 			return false;
 		}
 		// A fallback switch was the whole reason we entered (Fast→base degrade or
@@ -4339,9 +4433,10 @@ export class TurnRecovery {
 					},
 					{ terminalTurn: message },
 				);
+			} else {
+				this.#retryAttempt = 0;
+				this.resolveRetry();
 			}
-			this.#retryAttempt = 0;
-			this.resolveRetry();
 			return false;
 		}
 
@@ -4481,19 +4576,21 @@ export class TurnRecovery {
 	 */
 	async #endCancelledRetry(failed: AssistantMessage, stopped: boolean): Promise<false> {
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
 		this.#retryAbortController = undefined;
+		const saga = this.#takeRetrySaga();
 		try {
 			if (stopped) await this.#recordStoppedTurn(failed);
 		} finally {
-			await this.#host.emitSessionEvent({
-				type: "auto_retry_end",
-				success: false,
-				attempt,
-				finalError: RETRY_CANCELLED,
-			});
-			this.#clearPendingRetryErrors();
-			this.resolveRetry();
+			try {
+				await this.#host.emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt,
+					finalError: RETRY_CANCELLED,
+				});
+			} finally {
+				saga.release();
+			}
 		}
 		return false;
 	}

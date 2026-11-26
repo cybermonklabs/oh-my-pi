@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Inside a gVisor job's runsc container (gvisor.sh starts it), as root: one gVisor job's tests as
 # WHO, run the way set.sh and nextest.sh run them on a host, with the same environment. As uid 1000
-# the run starts with setpriv, so timeout, nextest and the test binary are all uid 1000's processes
-# (the gate kit's launcher: under root's timeout, a uid 1000 test's `kill -0 $PPID` gets EPERM).
+# the run starts with setpriv, so timeout, the bound runner, nextest and the test binary are all
+# uid 1000's processes (the gate kit's launcher: under root's timeout, a uid 1000 test's
+# `kill -0 $PPID` gets EPERM).
 #   gvisor-run.sh WHO PART SHARD
 #   - set: shard SHARD (1..SC_GV_SET_SHARDS) of the pi-shell test binaries (sc.py shard, set.sh's
 #     weights), each in a libtest process of its own at --test-threads=4 under the hang bound
-#     SC_BIN_BOUND, with each passing test's output (--show-output) so sc.py sees a test that
-#     skipped itself; the lib binary's run is also the row gv-lib4-WHO.
+#     SC_BIN_BOUND, each test under the bound the tree's .config/nextest.toml gives it
+#     (.github/sami/libtest-bound.py, set.sh's rule), with each passing test's output
+#     (--show-output) so sc.py sees a test that skipped itself; the lib binary's run is also the
+#     row gv-lib4-WHO.
 #   - builtins: pi-builtins under nextest's default profile and the tree's .config/nextest.toml,
 #     from the archive's metadata (no extraction: the archive is mounted read-only); the tests
 #     SC_FOLDED names run in a second pass where names fold (nextest.sh's rule), when they do here.
@@ -18,6 +21,7 @@
 set -uo pipefail
 who=$1 part=$2 shard=$3
 tool=$GITHUB_WORKSPACE/tool/.github/sami-checks
+per_test=$GITHUB_WORKSPACE/tool/.github/sami/libtest-bound.py
 res=/sc/res
 mkdir -p "$res/logs"
 b=$(dmesg 2>&1)
@@ -54,7 +58,8 @@ if [ "$part" = set ]; then
 		shift 2
 		(cd "$SC_TREE/crates/pi-shell" && "${as[@]}" env -i "${envv[@]}" TMPDIR="$tmp" CARGO_PKG_NAME=pi-shell \
 			CARGO_MANIFEST_DIR="$SC_TREE/crates/pi-shell" \
-			timeout --verbose -k 10 "$bound" "$bin" -Z unstable-options --format json --report-time --show-output "$@") > "$out" 2>&1 < /dev/null
+			timeout --verbose -k 10 "$bound" python3 "$per_test" --nextest-config "$SC_TREE/.config/nextest.toml" \
+			--package pi-shell -- "$bin" -Z unstable-options --format json --report-time --show-output "$@") > "$out" 2>&1 < /dev/null
 	}
 	threads=(--test-threads=4)
 	python3 "$tool/sc.py" shard "$who" "$shard" "$SC_GV_SET_SHARDS" /sc/meta/binaries-metadata.json "$tool/pi-shell-seconds.txt" > /scratch/shard.tsv ||

@@ -1,15 +1,19 @@
 //! Control, restore and store-failure behaviour of the shell.
 
-use std::sync::Arc;
+use std::{fmt::Write as _, sync::Arc};
 
 use bstr::{BStr, BString};
+use strum::IntoEnumIterator as _;
 
 use crate::{
 	bash::{
-		Attrs, Budget, CallOutcome, Cx, Engine, EngineConfig, Incompatibility, MemStore,
+		Attrs, Budget, CallOutcome, Cx, Engine, EngineConfig, Incompatibility, JobId, MemStore,
 		RestoreError, RestoreOpts, RunId, RunStdio, Script, Shell, ShellApi, ShellError, SigTarget,
-		Signal, StateStore, Step, VarValue, Vpid, VprocSel, ir::IR_VERSION, os_pid_limit,
-		store::BlobSlot,
+		Signal, StateStore, Step, VarValue, Vpid, VprocSel,
+		ir::IR_VERSION,
+		os_pid_limit,
+		store::{BlobSlot, Change, JobFact, Key, Record, Table, Var},
+		zshopt::ZshOpt,
 	},
 	testkit::{
 		FakeHost, Fault, Rig,
@@ -362,15 +366,30 @@ fn restore_drop_frames_abandons_the_running_script_with_255() {
 	));
 }
 
-/// A store (`MemStore::to_bytes`) whose frames blob the engine of `c55f78f6`
-/// (IR version 17, frames layout 31: no `Job::signal`, no
-/// `JobTable::comsub`) externalized while run 1, `x=kept; ( { while :; do
-/// :; done; } & jobs; wait $! ); echo after`, had its `( … )` waiting for
-/// its running background job.
-const OLD_LAYOUT_STORE: &[u8] = include_bytes!("../fixtures/frames/c55f78f6_subshell_job.store");
+/// A store (`MemStore::to_bytes`) whose frames blob the engine of Cut13
+/// `3444abaa` (released as `v18.18.6-sami.20261125-193459`; IR version 19,
+/// frames layout 37: no `Job::signal`, no `JobTable::comsub`) externalized
+/// while run 1, `x=kept; ( { while :; do :; done; } & jobs; wait $! ); echo
+/// after`, had its `( … )` waiting for its running background job.
+const OLD_LAYOUT_STORE: &[u8] = include_bytes!("../fixtures/frames/3444abaa_subshell_job.store");
+const OLD_LAYOUT_STORE_SHA256: &str =
+	"3216b10f9a7ed874f472c9543cf1e2249f25f6ebefc5a9ce249fa70b8983a12e";
 
-/// The IR version of the engine that wrote the `c55f78f6` fixtures.
-const OLD_IR: u32 = 17;
+/// `bytes`, once their SHA-256 is `sha256`. A fixture that is written again
+/// (after a key moved, say) changes the test's own text, where a reviewer
+/// sees it, and never passes unnoticed.
+fn fixture(bytes: &'static [u8], sha256: &str) -> &'static [u8] {
+	use sha2::{Digest as _, Sha256};
+	let mut hex = String::with_capacity(64);
+	for b in Sha256::digest(bytes) {
+		let _ = write!(hex, "{b:02x}");
+	}
+	assert_eq!(hex, sha256, "a released engine's fixture changed");
+	bytes
+}
+
+/// The IR version of the engine that wrote the `3444abaa` fixtures.
+const OLD_IR: u32 = 19;
 
 /// Frames of an older engine are refused (the IR and layout versions are in
 /// the header, and the build id), never decoded as this one's; with
@@ -382,7 +401,8 @@ const OLD_IR: u32 = 17;
 fn restore_refuses_frames_of_an_older_layout_and_keeps_their_store() {
 	let engine = Engine::new(EngineConfig::default());
 	let mut host = FakeHost::new();
-	let mut store = MemStore::from_bytes(OLD_LAYOUT_STORE).expect("the old store decodes");
+	let mut store = MemStore::from_bytes(fixture(OLD_LAYOUT_STORE, OLD_LAYOUT_STORE_SHA256))
+		.expect("the old store decodes");
 	assert!(store.get_blob(BlobSlot::Frames).unwrap().is_some(), "the old store holds frames");
 	let err = Shell::restore(
 		&engine,
@@ -396,7 +416,8 @@ fn restore_refuses_frames_of_an_older_layout_and_keeps_their_store() {
 		"an older engine's frames are refused: {err:?}"
 	);
 
-	let mut store = MemStore::from_bytes(OLD_LAYOUT_STORE).expect("the old store decodes");
+	let mut store = MemStore::from_bytes(fixture(OLD_LAYOUT_STORE, OLD_LAYOUT_STORE_SHA256))
+		.expect("the old store decodes");
 	let (mut shell, report) =
 		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts {
 			drop_frames: true,
@@ -411,23 +432,31 @@ fn restore_refuses_frames_of_an_older_layout_and_keeps_their_store() {
 	assert_eq!(host.stdout.bytes(), b"kept\nend\n");
 }
 
-/// A store the engine of `c55f78f6` (`store::Job` as it was before the
-/// job's signal was kept) wrote while run 1, `x=kept; { while :; do :;
-/// done; } & { while :; do :; done; } & kill -KILL $!; wait %1; echo
-/// after`, waited for job 1: the root's job table holds job 1 running and
-/// job 2, which `KILL` ended, done with 137.
-const OLD_ROOT_JOBS_STORE: &[u8] = include_bytes!("../fixtures/frames/c55f78f6_root_jobs.store");
+/// A store the engine of Cut13 `3444abaa` (`store::Job` before the job's
+/// signal was kept) wrote while run 1, `x=kept; { while :; do :; done; } & {
+/// while :; do :; done; } & kill -KILL $!; wait %1; echo after`, waited for
+/// job 1: the root's job table holds job 1 running and job 2, which `KILL`
+/// ended, done with 137.
+const OLD_ROOT_JOBS_STORE: &[u8] = include_bytes!("../fixtures/frames/3444abaa_root_jobs.store");
+const OLD_ROOT_JOBS_STORE_SHA256: &str =
+	"94b0ca7c23eaa08387ace7095e767c327ec4aad60fe1c39aff8d77e364a11a1f";
 
 /// A store from before the job's signal was kept decodes: its root's jobs
 /// are in the store's own records, which keep their layout (what came later
 /// is a record of its own, [`crate::bash::store::Record::JobFacts`]). Its
 /// frames are refused; with `drop_frames` it restores, the run abandoned,
-/// the variable kept, job 1 lost (137) and job 2 listed as `KILL` ended it.
+/// the variable kept, job 1 lost (137) and job 2 done with 137, and `jobs`
+/// lists both as `Exit 137`, with no notice. Neither has a signal recorded:
+/// obash did not see job 1 end, and job 2's store kept only its status,
+/// which does not say that a signal ended it
+/// ([`crate::bash::store::Job::set_facts`]); `Killed` would claim a signal
+/// nobody saw.
 #[test]
 fn an_older_store_whose_root_has_jobs_restores() {
 	let engine = Engine::new(EngineConfig::default());
 	let mut host = FakeHost::new();
-	let mut store = MemStore::from_bytes(OLD_ROOT_JOBS_STORE).expect("the old store decodes");
+	let mut store = MemStore::from_bytes(fixture(OLD_ROOT_JOBS_STORE, OLD_ROOT_JOBS_STORE_SHA256))
+		.expect("the old store decodes");
 	let err = Shell::restore(
 		&engine,
 		&mut Cx { host: &mut host, store: &mut store },
@@ -439,7 +468,8 @@ fn an_older_store_whose_root_has_jobs_restores() {
 		matches!(err, Some(RestoreError::Incompatible { why }) if why == older),
 		"an older engine's frames are refused: {err:?}"
 	);
-	let mut store = MemStore::from_bytes(OLD_ROOT_JOBS_STORE).expect("the old store decodes");
+	let mut store = MemStore::from_bytes(fixture(OLD_ROOT_JOBS_STORE, OLD_ROOT_JOBS_STORE_SHA256))
+		.expect("the old store decodes");
 	let (mut shell, report) =
 		Shell::restore(&engine, &mut Cx { host: &mut host, store: &mut store }, RestoreOpts {
 			drop_frames: true,
@@ -451,12 +481,184 @@ fn an_older_store_whose_root_has_jobs_restores() {
 	let budget = Budget::default();
 	assert_eq!(advance(&mut shell, &mut host, &mut store, RunId(1), budget), Stop::Done(255));
 	assert_eq!(advance(&mut shell, &mut host, &mut store, next, budget), Stop::Done(0));
-	let killed = Signal::Kill.description(EngineConfig::default().platform);
 	let text = "{ while :; do\n    :;\ndone; }";
+	let exited = "Exit 137";
 	assert_eq!(
 		String::from_utf8_lossy(&host.stdout.bytes()),
-		format!("kept\n[1]-  {killed:<27}{text}\n[2]+  {killed:<27}{text}\nend\n")
+		format!("kept\n[1]-  {exited:<27}{text}\n[2]+  {exited:<27}{text}\nend\n")
 	);
+	assert_eq!(String::from_utf8_lossy(&host.stderr.bytes()), "");
+}
+
+/// A root job that exited with 137, restored from a store that holds no
+/// facts for it, as a store written before the job's signal was kept holds
+/// none (the store's image, `MemStore::to_bytes` and `from_bytes`, with
+/// each [`crate::bash::store::Record::JobFacts`] deleted): `jobs` lists it
+/// as `Exit 137`, with no notice. Its status alone does not say that a
+/// signal ended it, and `Killed` would claim a signal nobody saw.
+#[test]
+fn an_older_stores_job_that_ended_with_137_lists_exit_137() {
+	let mut r = rig();
+	let job = format!("{{ exit 137; }} & {NONE_RUNNING}");
+	r.run(Script::command(job.as_bytes()), Fault::None);
+	r.snapshot();
+	let mut store = MemStore::from_bytes(&r.store.to_bytes()).expect("the store image decodes");
+	let mut facts = Vec::new();
+	store
+		.scan(Table::JobFacts, &mut |key, _| {
+			if let Key::JobFacts(id) = key {
+				facts.push(id);
+			}
+		})
+		.expect("scan the job facts");
+	for id in facts {
+		store
+			.apply(Change::Del(Key::JobFacts(id)))
+			.expect("delete the job facts");
+	}
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let (mut shell, _) = Shell::restore(
+		&engine,
+		&mut Cx { host: &mut host, store: &mut store },
+		RestoreOpts::default(),
+	)
+	.expect("restore");
+	let next = shell.submit(Script::command(&b"jobs"[..]));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, next, Budget::default()), Stop::Done(0));
+	let out = String::from_utf8_lossy(&host.stdout.bytes()).into_owned();
+	let err = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+	let listed = format!("[1]+  {:<27}{{ exit 137; }}\n", "Exit 137");
+	assert_eq!((out, err), (listed, String::new()));
+}
+
+/// The store image (`MemStore::to_bytes`) Cut14 `34021711` (released as
+/// `v18.18.6-sami.20261126-110039`) wrote with one record under each key
+/// whose place in its enum the image keeps: every `MiscKey`, `OptId` and
+/// `TrapKey` holds its own name (`Record::Misc` of the variant's `Debug`
+/// text); every `ZshOpt` that is not an env option holds `Record::Opt(true)`,
+/// and the variable `RELEASED_ZSH_OPTS` names them all, `,`-separated, in
+/// Cut14's order; and one record of each other `KeyBuf` kind but functions
+/// and jobs, which [`CUT14_ROOT_STORE`] holds.
+const CUT14_KEYS_STORE: &[u8] = include_bytes!("../fixtures/frames/34021711_keys.store");
+const CUT14_KEYS_STORE_SHA256: &str =
+	"338ad73fd16ff976f8319dfc671ae6e9c80200837cefb1f02b9435eab286bd3d";
+
+/// Keys renamed since Cut14 without moving: `(name now, name in Cut14)`, by
+/// the variant's `Debug` text. A rename keeps a key's place, so the store
+/// still reads; it is mapped here, never by writing the fixture again.
+const RENAMED: &[(&str, &str)] = &[];
+
+/// The name `now` had in Cut14 ([`RENAMED`]).
+fn released_name(now: &str) -> &str {
+	RENAMED
+		.iter()
+		.find(|(n, _)| *n == now)
+		.map_or(now, |(_, was)| was)
+}
+
+/// A released store's keys keep their places. A store image numbers a key
+/// by its variant's index, so a key placed before another, or one taken
+/// out, makes every store written before read one key's records as
+/// another's (Cut14 composed `MiscKey::CellsPlain` before `HeldIgnored`,
+/// which a store of `HeldIgnored`'s own branch had one place earlier): a new
+/// key goes last. A key renamed without a move is mapped to its old name in
+/// [`RENAMED`], not handled by writing the fixture again.
+#[test]
+fn a_released_stores_keys_keep_their_places() {
+	let mut store = MemStore::from_bytes(fixture(CUT14_KEYS_STORE, CUT14_KEYS_STORE_SHA256))
+		.expect("Cut14's key store decodes");
+	let mut moved = Vec::new();
+	for table in [Table::Misc, Table::Opt, Table::Trap] {
+		store
+			.scan(table, &mut |key, record| {
+				let name = match key {
+					Key::Misc(k) => format!("{k:?}"),
+					Key::Opt(o) => format!("{o:?}"),
+					Key::Trap(t) => format!("{t:?}"),
+					other => format!("{other:?}"),
+				};
+				if *record != Record::Misc(released_name(&name).into()) {
+					moved.push(format!("{name} holds {record:?}"));
+				}
+			})
+			.unwrap();
+	}
+	let released = match store.record(Key::Var(BStr::new("RELEASED_ZSH_OPTS"))) {
+		Some(Record::Var(Var { value: VarValue::Str(names), .. })) => names.to_string(),
+		other => panic!("Cut14's list of zsh options: {other:?}"),
+	};
+	let now: Vec<String> = ZshOpt::iter()
+		.map(|z| released_name(&format!("{z:?}")).to_owned())
+		.collect();
+	for (i, was) in released.split(',').enumerate() {
+		if now.get(i).map(String::as_str) != Some(was) {
+			moved.push(format!("ZshOpt {i}: {was} in Cut14, {:?} now", now.get(i)));
+		}
+	}
+	let text = |s: &str| Record::Var(Var { attrs: Attrs::NONE, value: VarValue::Str(s.into()) });
+	let kinds = [
+		(Key::Alias(BStr::new("pin")), Record::Alias("alias".into())),
+		(Key::Proc(Vpid(9)), Record::Proc { parent: Some(Vpid(1)), status: Some(3) }),
+		(Key::DirStack, Record::DirStack(vec!["/dir".into()])),
+		(Key::CmdHash(BStr::new("pin")), Record::CmdHash { path: "/bin/pin".into(), hits: 2 }),
+		(Key::Scope(0), Record::Scope {
+			func:       Some("pin".into()),
+			positional: None,
+			zsh:        None,
+		}),
+		(Key::Local { depth: 0, name: BStr::new("pin_local") }, text("local")),
+		(Key::ZshAlias { suffix: true, name: BStr::new("pin") }, Record::Alias("suffix".into())),
+		(Key::JobFacts(JobId(5)), Record::JobFacts(vec![JobFact::Signal(Signal::Kill)])),
+		(Key::BgPid(Vpid(7)), Record::Misc("3:7:0".into())),
+	];
+	for (key, want) in kinds {
+		let have = store.record(key);
+		if have != Some(&want) {
+			moved.push(format!("{key:?} holds {have:?}"));
+		}
+	}
+	assert!(
+		moved.is_empty(),
+		"keys of the released Cut14 store moved (a new key goes last):\n{}",
+		moved.join("\n")
+	);
+}
+
+/// A store Cut14 `34021711` wrote, its frames blob taken out, after run 1,
+/// `x=kept; f() { echo "f:$1"; }; unset EPOCHSECONDS; { exit 3; } & p=$!;
+/// wait $p; { while :; do :; done; } & kill -KILL $!`: a variable, a
+/// function, a value cell `unset` removed (`MiscKey::CellsPlain`), a kept
+/// status (`Key::BgPid`), a job a signal ended (`Key::JobFacts`), and the
+/// held ignores every bash root store has (`MiscKey::HeldIgnored`).
+const CUT14_ROOT_STORE: &[u8] = include_bytes!("../fixtures/frames/34021711_root.store");
+const CUT14_ROOT_STORE_SHA256: &str =
+	"3eac3898bdba0f516967eb29c4f4359dd7431ff8e14522e02a2d821ab8ef1efb";
+
+/// A store a released engine wrote restores and runs on: the root's
+/// variable, function, removed value cell and kept status are there, and
+/// the killed job is reported.
+#[test]
+fn a_store_cut14_wrote_restores() {
+	let engine = Engine::new(EngineConfig::default());
+	let mut host = FakeHost::new();
+	let mut store = MemStore::from_bytes(fixture(CUT14_ROOT_STORE, CUT14_ROOT_STORE_SHA256))
+		.expect("Cut14's store decodes");
+	let (mut shell, report) = Shell::restore(
+		&engine,
+		&mut Cx { host: &mut host, store: &mut store },
+		RestoreOpts::default(),
+	)
+	.expect("Cut14's store restores");
+	assert!(report.abandoned.is_empty(), "no run was in flight: {:?}", report.abandoned);
+	let id = shell.submit(Script::command(
+		&b"echo \"$x\"; f a; echo \"c=${EPOCHSECONDS-unset}\"; wait \"$p\"; echo \"st=$?\""[..],
+	));
+	assert_eq!(advance(&mut shell, &mut host, &mut store, id, Budget::default()), Stop::Done(0));
+	assert_eq!(host.stdout.bytes(), b"kept\nf:a\nc=unset\nst=3\n");
+	let killed = Signal::Kill.description(EngineConfig::default().platform);
+	let err = String::from_utf8_lossy(&host.stderr.bytes()).into_owned();
+	assert!(err.contains(&*killed), "the killed job is reported: {err:?}");
 }
 
 /// The signal that ended a root job outlives a store image
@@ -497,6 +699,50 @@ fn a_subshells_killed_job_keeps_its_signal_across_snapshots() {
 		plain.1 == b"st=137\n" && String::from_utf8_lossy(&plain.2).contains(&*killed),
 		"the uninterrupted run: {plain:?}"
 	);
+	assert_eq!(run(Fault::Snapshot { every: 1 }), plain);
+}
+
+/// Until no job of the shell's table runs (`jobs -r` into `/tmp/running`,
+/// the test host's in-memory file; builtins only, which report nothing), at
+/// most 100,000 passes; then the shell says so on standard error and exits
+/// with 97.
+const NONE_RUNNING: &str = "n=0; while jobs -r >/tmp/running; [ -s /tmp/running ]; do n=$((n + \
+                            1)); [ $n -le 100000 ] || { echo still running >&2; exit 97; }; done";
+
+/// How a root job ended outlives a store image (`MemStore::to_bytes`,
+/// `from_bytes`) and a restore: one that exited with 137 is still listed as
+/// `Exit 137`, with no notice (it has no signal recorded,
+/// [`crate::bash::store::Job::signal`]). bash 5.3.20 lists
+/// `{ exit 137; } &` as `Exit 137`.
+#[test]
+fn a_root_jobs_exit_with_137_outlives_a_store_image() {
+	let mut r = rig();
+	let job = format!("{{ exit 137; }} & {NONE_RUNNING}");
+	r.run(Script::command(job.as_bytes()), Fault::None);
+	r.snapshot();
+	assert_eq!(r.run(Script::command(&b"jobs"[..]), Fault::None), 0);
+	let out = String::from_utf8_lossy(&r.host.stdout.bytes()).into_owned();
+	let err = String::from_utf8_lossy(&r.host.stderr.bytes()).into_owned();
+	let listed = format!("[1]+  {:<27}{{ exit 137; }}\n", "Exit 137");
+	assert_eq!((out, err), (listed, String::new()));
+}
+
+/// How a subshell's job ended outlives every snapshot of a run (a
+/// subshell's job table is in the frames image, its jobs' facts beside it;
+/// a job that exited has no signal recorded): under
+/// `Fault::Snapshot { every: 1 }` the subshell's `jobs` lists the job that
+/// exited with 137 as the uninterrupted run does, as `Exit 137`.
+#[test]
+fn a_subshells_job_that_exited_with_137_keeps_its_end_across_snapshots() {
+	let src = format!("( {{ exit 137; }} & {NONE_RUNNING}; jobs )");
+	let run = |fault| {
+		let mut r = rig();
+		let status = r.run(Script::command(src.as_bytes()), fault);
+		(status, r.host.stdout.bytes(), r.host.stderr.bytes())
+	};
+	let plain = run(Fault::None);
+	let listed = format!("[1]+  {:<27}{{ exit 137; }}\n", "Exit 137");
+	assert_eq!(plain, (0, listed.into_bytes(), Vec::new()), "the uninterrupted run");
 	assert_eq!(run(Fault::Snapshot { every: 1 }), plain);
 }
 
@@ -564,21 +810,22 @@ fn a_killed_externals_death_outlives_every_snapshot() {
 /// The processes of a root pipeline job ([`crate::bash::store::Job::procs`])
 /// outlive a store image (`MemStore::to_bytes`, `from_bytes`) and a
 /// restore: the next run's first line reports the job as the run without
-/// the image does, a line for each process `kill %1` ended. Those the job's
-/// vproc started (`$!` waits for that) are named by their own vprocs; those
-/// it had not started yet ended with it, and name it. The first run ends
-/// once `jobs -r` lists no running job (`GONE`: builtins only, which report
-/// nothing; `/tmp` is the test host's in-memory one): `kill -0 %1`
-/// succeeds for a finished job still listed, in bash 5.3.20 and 5.2.21 too,
-/// so a loop on it never ends there. The loop stops after 100,000 passes,
-/// and says so on standard error.
+/// the image does, a line for each process `kill %1` ended, each with a pid
+/// of its own, as bash forks each stage as it starts the job: those the
+/// job's vproc started (`$!` waits for that) and those it had not started
+/// yet, which ended with it (their vpids reserved as the job started). The
+/// first run ends once `jobs -r` lists no running job (`GONE`: builtins
+/// only, which report nothing; `/tmp` is the test host's in-memory one):
+/// `kill -0 %1` succeeds for a finished job still listed, in bash 5.3.20
+/// and 5.2.21 too, so a loop on it never ends there. The loop stops after
+/// 100,000 passes, and says so on standard error.
 #[test]
 fn a_root_pipeline_jobs_processes_outlive_a_store_image() {
 	const GONE: &str = "n=0; while jobs -r >/tmp/running; [ -s /tmp/running ]; do n=$((n+1)); [ $n \
 	                    -le 100000 ] || { echo still running >&2; exit 97; }; done";
 	let killed = Signal::Kill.description(EngineConfig::default().platform);
 	let text = "{ while :; do\n    :;\ndone; }";
-	for (start, started) in [(": $!; ", true), ("", false)] {
+	for start in [": $!; ", ""] {
 		let run = |snapshot: bool| {
 			let mut r = rig();
 			let job = format!("{text} | {text} & {start}kill -KILL %1; {GONE}");
@@ -602,9 +849,7 @@ fn a_root_pipeline_jobs_processes_outlive_a_store_image() {
 		let first = pid(lines.first(), "bash: line 1: ", &format!(" {killed:<27}{{ while :; do"));
 		let second = pid(lines.get(3), "     ", &format!(" {:<25}| {{ while :; do", ""));
 		assert!(
-			plain.1 == "next\n"
-				&& lines.len() == 6
-				&& first.zip(second).is_some_and(|(a, b)| (a != b) == started),
+			plain.1 == "next\n" && lines.len() == 6 && first.zip(second).is_some_and(|(a, b)| a != b),
 			"{start}without an image: {plain:?}"
 		);
 		assert_eq!(run(true), plain, "{start}");

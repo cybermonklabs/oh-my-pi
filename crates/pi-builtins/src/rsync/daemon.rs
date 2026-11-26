@@ -1106,6 +1106,9 @@ mod tests {
 		assert_eq!(err.code, 5);
 	}
 
+	/// A cancel while the client waits for the daemon's greeting ends the
+	/// handshake with the signal exit, and promptly: the server half never
+	/// writes, so only the cancel ends the wait.
 	#[test]
 	fn cancellation_during_greeting_maps_to_signal() {
 		let cancel = Arc::new(AtomicBool::new(false));
@@ -1119,12 +1122,27 @@ mod tests {
 			// the daemon's.
 			line(&mut BufReader::new(&mut server.reader));
 			handshake.wait_asleep("the handshake to block on the reply", Duration::from_millis(100));
+			let cancelled_at = Instant::now();
 			flag.store(true, Ordering::Relaxed);
-			server
+			(cancelled_at, server)
 		});
 		let (logger, ..) = test_logger();
 		let err = daemon_handshake(&mut conn, &base_cfg(&args, &fs), &logger).unwrap_err();
-		drop(canceller.join().unwrap());
+		let ended = Instant::now();
+		// A client that sent no greeting ends the canceller's read here.
+		drop(conn);
+		let (cancelled_at, _server) = canceller.join().unwrap();
 		assert_eq!(err.code, crate::rsync::exit::RERR_SIGNAL);
+		// Within 10 s of the cancel: the test runner's per-test bound fails a
+		// wait that never ends, not one that ends a minute late. Measured from
+		// the cancel to the handshake's return, idle and beside 64 busy loops,
+		// on gVisor and runc, as root and as uid 1000, each test alone (30
+		// runs per case) and in the whole test binary: at most 3.4 s. 10 s is
+		// more than twice that.
+		let took = ended.saturating_duration_since(cancelled_at);
+		assert!(
+			took < Duration::from_secs(10),
+			"the greeting's wait ended {took:?} after the cancel, past 10 s"
+		);
 	}
 }

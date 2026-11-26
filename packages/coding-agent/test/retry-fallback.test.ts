@@ -417,4 +417,57 @@ describe("retry fallback kind-role validation", () => {
 
 		expect(warnings).toEqual([]);
 	});
+
+	it("accepts a retired selector key when every migration step resolves", () => {
+		const warnings: string[] = [];
+
+		validateRetryFallbackChains(
+			Settings.isolated({
+				"retry.fallbackChains": {
+					"retired-provider/retired-model": ["openai/gpt-4o-mini"],
+				},
+			}),
+			registry,
+			warning => warnings.push(warning),
+		);
+
+		expect(warnings).toEqual([]);
+	});
+
+	it("warns about a present-provider key with valid targets because it is not a migration", () => {
+		const warnings: string[] = [];
+
+		validateRetryFallbackChains(
+			Settings.isolated({
+				"retry.fallbackChains": {
+					"openai/gpt-4o-mini-typo": ["openai/gpt-4o-mini"],
+				},
+			}),
+			registry,
+			warning => warnings.push(warning),
+		);
+
+		expect(warnings).toContain("retry.fallbackChains key references unknown model: openai/gpt-4o-mini-typo");
+	});
+
+	it("warns when a retired selector key has no target or an unresolved target", () => {
+		const warnings: string[] = [];
+
+		validateRetryFallbackChains(
+			Settings.isolated({
+				"retry.fallbackChains": {
+					"retired-provider/empty": [],
+					"retired-provider/mixed": ["openai/gpt-4o-mini", "openai/missing-model"],
+				},
+			}),
+			registry,
+			warning => warnings.push(warning),
+		);
+
+		expect(warnings).toContain("retry.fallbackChains key references unknown model: retired-provider/empty");
+		expect(warnings).toContain("retry.fallbackChains key references unknown model: retired-provider/mixed");
+		expect(warnings).toContain(
+			"Fallback chain for model 'retired-provider/mixed' references unknown model: openai/missing-model",
+		);
+	});
 });

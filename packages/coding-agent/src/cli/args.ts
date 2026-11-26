@@ -73,9 +73,8 @@ export interface Args {
 	noSession?: boolean;
 	sessionDir?: string;
 	/**
-	 * `--session-id`: start a new session under this id (a canonical UUID) instead of a
-	 * minted one. Refused when a stored session already holds it, and beside any other
-	 * session selector.
+	 * `--session-id`: resume the stored session that holds this id (a canonical UUID), or start
+	 * a new session under it instead of a minted one. Refused beside any other session selector.
 	 */
 	sessionId?: string;
 	providerSessionId?: string;
@@ -175,11 +174,12 @@ export function validateRestoreLaunch(args: Args, interactive: boolean): void {
 
 /**
  * Reject a `--session-id` launch that also names another session selector:
- * `--session-id` starts a new session, and every other selector opens, forks,
- * imports or drops one. ACP mode is refused too: it starts a session for each
- * client request, so the id would name none of them. Judged on the startup
- * parse, before session resolution, like {@link validateGoalLaunch}. `-r` and
- * `--session` are spellings of `--resume`, and `-c` of `--continue`.
+ * `--session-id` selects its session itself (the one holding the id, or a new
+ * one under it), and every other selector opens, forks, imports or drops one.
+ * ACP mode is refused too: it starts a session for each client request, so
+ * the id would name none of them. Judged on the startup parse, before session
+ * resolution, like {@link validateGoalLaunch}. `-r` and `--session` are
+ * spellings of `--resume`, and `-c` of `--continue`.
  */
 export function validateSessionIdLaunch(args: Args): void {
 	if (args.sessionId === undefined) return;
@@ -196,7 +196,7 @@ export function validateSessionIdLaunch(args: Args): void {
 	const other = selectors.find(([given]) => given)?.[1];
 	if (other === undefined) return;
 	throw new CliUsageError(
-		`--session-id cannot be combined with ${other}: --session-id starts a new session under that id.`,
+		`--session-id cannot be combined with ${other}: --session-id selects the session itself, resuming or starting it under that id.`,
 	);
 }
 

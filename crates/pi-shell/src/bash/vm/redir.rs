@@ -497,14 +497,15 @@ fn target_fd(
 	closing: bool,
 	record: bool,
 	line: u32,
-) -> Result<i32, Diag> {
+) -> Result<i32, Halt> {
 	match &r.fd {
 		RedirFdIr::Default => Ok(default_fd(r.op)),
 		RedirFdIr::Num(n) => Ok(*n as i32),
 		RedirFdIr::Var(name) => {
 			if closing {
-				return var_fd(k, vp, cx, name)
-					.ok_or_else(|| Diag::AmbiguousRedirect { word: name.clone() });
+				return var_fd(k, vp, cx, name).ok_or_else(|| {
+					fail(k, vp, cx, line, Diag::AmbiguousRedirect { word: name.clone() })
+				});
 			}
 			let fd = super::jobctl::lowest_free_fd(k, vp, 10);
 			assign_fd_var(k, vp, cx, name, fd, record, line)?;
@@ -526,7 +527,7 @@ fn assign_fd_var(
 	fd: i32,
 	record: bool,
 	line: u32,
-) -> Result<(), Diag> {
+) -> Result<(), Halt> {
 	let before = if record {
 		var_before(k, vp, cx, name)
 	} else {
@@ -536,6 +537,21 @@ fn assign_fd_var(
 	let lhs = Lhs { name: base, index, append: false };
 	let value = AssignValue::Scalar(BString::from(fd.to_string()));
 	if let Err(d) = builtins::set_value(k, cx, vp, lhs, value, Level::Dynamic) {
+		// An arithmetic subscript error is bash's `array_expand_index`:
+		// `top_level_cleanup`, then `jump_to_top_level (DISCARD)`, before
+		// the redirection reports anything of its own. Where bash makes the
+		// redirection in a fork of its own (`record`: an external's, a
+		// `( … )`'s), that DISCARD ends only the fork, with status 1: the
+		// command fails and the line goes on.
+		if super::exec::cleanup_jump(vp, &d) {
+			k.diag(cx, vp, line, d);
+			if record {
+				return Err(Halt::Failed);
+			}
+			let flow = Flow::DiscardTop(1);
+			super::exec::jump_out(k, cx, vp, true, &flow);
+			return Err(Halt::Flow(flow));
+		}
 		// bash: the assignment's error, then this one. `sh_invalidid` is a
 		// builtin error, named by the simple command's word if it has one
 		// (`exec: `10': not a valid identifier`).
@@ -550,7 +566,7 @@ fn assign_fd_var(
 		};
 		k.diag(cx, vp, line, d);
 		let msg = format!("{}: cannot assign fd to variable", name.as_bstr()).into();
-		return Err(Diag::Usage { msg });
+		return Err(fail(k, vp, cx, line, Diag::Usage { msg }));
 	}
 	if let Some(var) = before {
 		let var = VarFd { fd, ..var };
@@ -664,8 +680,7 @@ fn install(
 	let record = matches!(r.fd, RedirFdIr::Var(_)) && forgets_vars(k, cx, vp, owner);
 	match r.op {
 		RedirKind::HereDoc | RedirKind::HereString => {
-			let fd =
-				target_fd(k, vp, cx, r, false, record, line).map_err(|d| fail(k, vp, cx, line, d))?;
+			let fd = target_fd(k, vp, cx, r, false, record, line)?;
 			let h = FdRef::mem(MemBuf::new(target.to_vec()));
 			set_fd(vp, fd, Some(h));
 			Ok(())
@@ -673,8 +688,7 @@ fn install(
 		RedirKind::DupIn | RedirKind::DupOut => {
 			let closing = target.as_slice() == b"-";
 			if closing {
-				let fd =
-					target_fd(k, vp, cx, r, true, false, line).map_err(|d| fail(k, vp, cx, line, d))?;
+				let fd = target_fd(k, vp, cx, r, true, false, line)?;
 				set_fd(vp, fd, None);
 				super::exec::coproc_fd_closed(k, vp, cx, fd);
 				return Ok(());
@@ -706,8 +720,7 @@ fn install(
 					let err = std::io::Error::other(crate::bash::fd::BadFd);
 					return Err(fail(k, vp, cx, line, Diag::Io { path, err }));
 				};
-				let fd = target_fd(k, vp, cx, r, false, record, line)
-					.map_err(|d| fail(k, vp, cx, line, d))?;
+				let fd = target_fd(k, vp, cx, r, false, record, line)?;
 				set_fd(vp, fd, Some(h));
 				if moving && src != fd {
 					set_fd(vp, src, None);
@@ -732,8 +745,7 @@ fn install(
 			Err(fail(k, vp, cx, line, Diag::AmbiguousRedirect { word: target.clone() }))
 		},
 		RedirKind::Close => {
-			let fd =
-				target_fd(k, vp, cx, r, true, false, line).map_err(|d| fail(k, vp, cx, line, d))?;
+			let fd = target_fd(k, vp, cx, r, true, false, line)?;
 			set_fd(vp, fd, None);
 			super::exec::coproc_fd_closed(k, vp, cx, fd);
 			Ok(())
@@ -753,9 +765,7 @@ fn install(
 			// its slot free, so the fd is the same on resume.
 			let fd = match &r.fd {
 				RedirFdIr::Var(_) => super::jobctl::lowest_free_fd(k, vp, 10),
-				_ => {
-					target_fd(k, vp, cx, r, false, false, line).map_err(|d| fail(k, vp, cx, line, d))?
-				},
+				_ => target_fd(k, vp, cx, r, false, false, line)?,
 			};
 			// bash moves a `{var}` fd to 10 or above with `F_DUPFD`, which
 			// fails past `ulimit -n`.
@@ -776,10 +786,10 @@ fn install(
 			}
 			open_into(k, vp, cx, &[fd], target, flags, line)?;
 			if let RedirFdIr::Var(name) = &r.fd
-				&& let Err(d) = assign_fd_var(k, vp, cx, name, fd, record, line)
+				&& let Err(halt) = assign_fd_var(k, vp, cx, name, fd, record, line)
 			{
 				set_fd(vp, fd, None);
-				return Err(fail(k, vp, cx, line, d));
+				return Err(halt);
 			}
 			Ok(())
 		},
@@ -977,7 +987,7 @@ fn collecting(k: &Kernel, vp: &Vproc) -> bool {
 /// ([`fail_in_child`]): `false`, and the stage ends ([`end_collect`]).
 fn collect(
 	k: &mut Kernel,
-	vp: &mut Vproc,
+	vp: &Vproc,
 	cx: &mut Cx<'_>,
 	unit: &Unit,
 	r: &RedirIr,
@@ -1002,7 +1012,7 @@ fn collect(
 /// or what makes it bad.
 fn child_steps(
 	k: &mut Kernel,
-	vp: &mut Vproc,
+	vp: &Vproc,
 	cx: &mut Cx<'_>,
 	unit: &Unit,
 	r: &RedirIr,
@@ -1012,10 +1022,10 @@ fn child_steps(
 	let mut add = Vec::with_capacity(2);
 	match r.op {
 		RedirKind::Close => {
-			add.push(ChildRedir::Close { fd: target_fd(k, vp, cx, r, true, false, line)? });
+			add.push(ChildRedir::Close { fd: child_fd(r) });
 		},
 		RedirKind::DupIn | RedirKind::DupOut if target.as_slice() == b"-" => {
-			add.push(ChildRedir::Close { fd: target_fd(k, vp, cx, r, true, false, line)? });
+			add.push(ChildRedir::Close { fd: child_fd(r) });
 		},
 		RedirKind::DupIn | RedirKind::DupOut => {
 			let (digits, moving) = match target.strip_suffix(b"-") {
@@ -1031,7 +1041,7 @@ fn child_steps(
 					let err = std::io::Error::other(crate::bash::fd::BadFd);
 					return Err(Diag::Io { path: dup_name(unit, r, src, target), err });
 				}
-				let fd = target_fd(k, vp, cx, r, false, false, line)?;
+				let fd = child_fd(r);
 				let diag = diag_prefix(k, cx, vp, line, &dup_name(unit, r, src, target));
 				add.push(ChildRedir::Dup { fd, src, diag });
 				if moving && src != fd {
@@ -1054,7 +1064,7 @@ fn child_steps(
 		| RedirKind::Append
 		| RedirKind::Clobber
 		| RedirKind::ReadWrite => {
-			let fd = target_fd(k, vp, cx, r, false, false, line)?;
+			let fd = child_fd(r);
 			let flags = open_flags(k, vp, cx, r.op, target);
 			add.push(child_open(k, vp, cx, vec![fd], target, flags, line)?);
 		},
@@ -1063,6 +1073,17 @@ fn child_steps(
 		},
 	}
 	Ok(add)
+}
+
+/// The fd redirection `r` of the process targets ([`child_steps`]): its
+/// number or the operator's default. Never a `{var}` fd ([`childable`]):
+/// the shell assigns those, so the line discard an arithmetic subscript
+/// error makes there ([`assign_fd_var`]) never reaches the process's steps.
+const fn child_fd(r: &RedirIr) -> i32 {
+	match r.fd {
+		RedirFdIr::Num(n) => n as i32,
+		_ => default_fd(r.op),
+	}
 }
 
 /// A redirection the engine finds bad (`d`) while it collects them for the
@@ -1409,8 +1430,7 @@ fn zsh_install(
 			let h = FdRef::mem(MemBuf::new(target.to_vec()));
 			if let RedirFdIr::Var(name) = &r.fd {
 				set_fd(vp, fd, Some(h));
-				return assign_fd_var(k, vp, cx, name, fd, false, line)
-					.map_err(|d| fail(k, vp, cx, line, d));
+				return assign_fd_var(k, vp, cx, name, fd, false, line);
 			}
 			place_on(k, vp, cx, fd, h, false)
 		},
@@ -1451,8 +1471,7 @@ fn zsh_install(
 			let fd = zsh_target_fd(k, vp, cx, r).map_err(|d| fail(k, vp, cx, line, d))?;
 			if let RedirFdIr::Var(name) = &r.fd {
 				set_fd(vp, fd, Some(h));
-				return assign_fd_var(k, vp, cx, name, fd, false, line)
-					.map_err(|d| fail(k, vp, cx, line, d));
+				return assign_fd_var(k, vp, cx, name, fd, false, line);
 			}
 			place_on(k, vp, cx, fd, h, output)
 		},
@@ -1476,8 +1495,7 @@ fn zsh_install(
 			let h = zsh_open(k, vp, cx, target, flags, line)?;
 			if let RedirFdIr::Var(name) = &r.fd {
 				set_fd(vp, fd, Some(h));
-				return assign_fd_var(k, vp, cx, name, fd, false, line)
-					.map_err(|d| fail(k, vp, cx, line, d));
+				return assign_fd_var(k, vp, cx, name, fd, false, line);
 			}
 			// `<>` is both: never part of a multio.
 			if r.op == RedirKind::ReadWrite {

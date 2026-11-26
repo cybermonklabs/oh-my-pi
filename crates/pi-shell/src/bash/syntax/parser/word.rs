@@ -882,10 +882,16 @@ impl<'s> Parser<'s> {
 				{
 					acc.flush(&mut self.t);
 					if stop == Stop::Text(TextMode::Arith) {
-						// Arithmetic: double quotes are removed.
+						// Arithmetic: double quotes are removed. A
+						// `DroppedQuote` on each side keeps where they were:
+						// bash expands the inside as a string of its own.
 						self.bump();
+						let open = self.t.dropped_quote();
+						acc.push(&mut self.t, open);
 						let inner = self.parts_until_line(Stop::DQuote { all: false }, line)?;
 						self.t.kid_run(acc.mark, inner);
+						let close = self.t.dropped_quote();
+						acc.push(&mut self.t, close);
 					} else if matches!(stop, Stop::Brace { dq: true, pat: false, .. }) {
 						// `"${v:+x="\p"}"`: every backslash in these quotes quotes.
 						self.bump();

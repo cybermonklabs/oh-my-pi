@@ -24,18 +24,23 @@
   sc.py selftest                           the counters and the summary against hand-made inputs
   sc.py docs UNIT STREAM LOG EXIT SECS     `cargo doc --message-format=json -p pi-shell`: each broken intra-doc link (docs.sh)
   sc.py changelog LOG EXIT SECS FILES DIFF WRITE_EXIT  `fix-changelogs.ts --check`: each CHANGELOG it would rewrite (changelog.sh)
-  sc.py plant WHAT TREE                    the docs, changelog or rustfmt row's control: puts its planted fault in TREE
+  sc.py plant WHAT TREE                    the docs, changelog, rustfmt or membench row's control: puts its planted fault in TREE
   sc.py rustfmt-workspaces                 the manifests of the cargo workspaces the rustfmt row checks, one a line
   sc.py rustfmt UNIT LOG EXIT SECS TREE [BASE_LOG BASE_EXIT BASE_TREE BASE_SHA FORK_DIFF]
                                            one workspace's `cargo fmt --all --check -v -- -v`, each place sorted by the same
                                            run at the tree's upstream base, through the fork's diff from it, into
                                            upstream's own and the fork's (rustfmt.sh)
+  sc.py membench-bin STREAM                the memory bench's executable, from `cargo bench --no-run --message-format=json` (membench.sh)
+  sc.py membench UNIT OUT ERR EXIT SECS BUILD_EXIT BUILD_LOG
+                                           one run of pi-shell's memory bench: each PASS/MISS target line, its exit, and every
+                                           line it printed (membench.sh)
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
 binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 nor 100, a bun run
 with no JUnit report or no summary line, a command the time bound or a signal ended, a clippy run
 whose exit is neither 0 nor 101 or whose control was not caught, a platform the platform report
-gives no verdict for, and a unit the plan expects that no job reported, or that two jobs reported,
+gives no verdict for, a memory bench that did not build, did not end on its own or printed no
+target line, and a unit the plan expects that no job reported, or that two jobs reported,
 are UNKNOWN, and so is every row they belong to. A test that passed after printing a skip marker
 compared nothing: it is counted apart, named, and its unit is UNKNOWN, unless each of its skip
 lines is a sub-case that partial-skips.txt lets that test skip and the entry's witness line is in
@@ -156,6 +161,7 @@ ROWS = (
     ("rustdoc intra-doc links (pi-shell)", "docs"),
     ("CHANGELOG format (fix-changelogs --check)", "changelog"),
     ("rustfmt: cargo fmt --check, per cargo workspace", "rustfmt"),
+    ("pi-shell memory bench, release (benches/memory.rs: its PASS/MISS targets)", "membench"),
 )
 # The Rust tests (sami-rust-test.yml) report no units here: each of its two jobs is a row of its own,
 # read from the job's conclusion, which sami-checks.yml passes as SC_RUST_TESTS.
@@ -169,6 +175,11 @@ ROW_KEYS = tuple(k for _, k in ROWS) + tuple(k for _, k in RUST_JOBS)
 WORKFLOW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "sami-checks.yml")
 # The jobs every run has: the plan, and the summary that reads every other job.
 ALWAYS_JOBS = ("plan", "summary")
+# The Rust gate's build seed (the dispatch input `seed`, .github/sami/gate-seed.sh): the newest
+# cut's seed, one this run's own seed jobs build, or none.
+SEEDS = ("auto", "build", "off")
+# The cut whose run also builds the Linux gate cold and compares the two, test by test: every fifth.
+SEED_CONTROL_EVERY = 5
 # The rows whose results hold their passing tests' output (libtest logs, JUnit reports), which the
 # skip prints row's run-time unit reads (sc.py skip-lines, passing_outputs). The gVisor set shards
 # also hold the gVisor lib and map-limit rows' logs.
@@ -207,7 +218,7 @@ def all_job_names():
     # skip_bash_install), whose check must then stop the legs, so the macOS row reads UNKNOWN.
     names += ["ts-small", "checkts", "skip-forms", "platforms", "clippy", "macos-bash"]
     names += [m["name"] for m in gvisor_matrix()]
-    names += ["docs", "changelog", "rustfmt"]
+    names += ["docs", "changelog", "rustfmt", "membench"]
     return names
 
 
@@ -239,7 +250,10 @@ def row_work():
         "docs": one("docs"),
         "changelog": one("changelog"),
         "rustfmt": one("rustfmt"),
-        "rust_test": one("rust-test") | one("rust-test-drift"),
+        "membench": one("membench"),
+        # rust-test-drift's result is part of this row, and so is the seed's control: the cold run
+        # of the same commit (rust-test-cold) and the comparison of the two (rust-test-compare).
+        "rust_test": one("rust-test") | one("rust-test-drift") | one("rust-test-cold") | one("rust-test-compare"),
         "rust_test_macos": one("rust-test-macos"),
     }
     for r in ("set-runner", "set-root", "lib4"):
@@ -317,10 +331,25 @@ def cmd_plan():
         selected = parse_rows(os.environ.get("SC_INPUT_ROWS", ""))
         silent = os.environ.get("SC_INPUT_SILENT", "")
         plant = os.environ.get("SC_INPUT_PLANT", "")
+        seed = os.environ.get("SC_INPUT_SEED", "") or "auto"
+        if seed not in SEEDS:
+            sys.exit(f"::error::the seed input names no build seed: '{seed}' (one of {', '.join(SEEDS)})")
+        # A dispatch that builds a seed is the seed's own proof, so it runs the cold control and the
+        # comparison beside the seeded jobs, on the one commit.
+        control = seed == "build"
     elif event == "push" and ref == "refs/heads/release-candidate":
         # The cut: every row, and no control, whatever an input says.
         commit = os.environ["GITHUB_SHA"]
         selected, silent, plant = list(ROW_KEYS), "", ""
+        # It builds its own seed from its own commit and reads that one. The seed's cold control
+        # runs on every fifth cut, read from the newest `sami release CutN` commit of this
+        # candidate's history (SC_CUT, which the plan job's step before this one found).
+        seed = "build"
+        cut = os.environ.get("SC_CUT", "").strip()
+        control = cut.isdigit() and int(cut) % SEED_CONTROL_EVERY == 0
+        if not cut.isdigit():
+            print(f"::warning title=The cut of this candidate::UNKNOWN: no 'sami release CutN' commit in this "
+                  f"candidate's last 300 (SC_CUT is '{cut}'), so the seed's cold control does not run", file=sys.stderr)
     else:
         sys.exit(f"::error::sami checks runs on a push of release-candidate or a dispatch, not on {event} of {ref}")
     planned, rows, jobs = plan_rows(selected, workflow_jobs())
@@ -335,7 +364,8 @@ def cmd_plan():
         sys.exit(f"::error::the plant input names no row's control: '{plant}' (one of {', '.join(PLANTS)})")
     if plant and plant not in rows:
         sys.exit(f"::error::the plant input plants a fault in the row '{plant}', which this run does not run (its rows: {', '.join(rows)})")
-    print(f"PLAN rows ({len(rows)} of {len(ROW_KEYS)}): {', '.join(rows)}; jobs: {', '.join(jobs)}", file=sys.stderr)
+    print(f"PLAN rows ({len(rows)} of {len(ROW_KEYS)}): {', '.join(rows)}; jobs: {', '.join(jobs)}; "
+          f"seed: {seed}; the seed's cold control: {'yes' if control else 'no'}", file=sys.stderr)
     if len(rows) < len(ROW_KEYS):
         print(f"::notice title=A subset of the rows::{len(rows)} of {len(ROW_KEYS)} rows run ({', '.join(rows)}); "
               "the summary reads the others NOT RUN", file=sys.stderr)
@@ -363,6 +393,9 @@ def cmd_plan():
         "gvisor": only("gvisor", gvisor_matrix()),
         "gv_set_shards": GV_SET_SHARDS,
         "plant": plant,
+        # The Rust gate jobs' build seed, and whether the cold control runs beside them.
+        "seed": seed,
+        "seed_control": "true" if control else "false",
     }
     for k, v in out.items():
         print(f"{k}={v}")
@@ -1142,6 +1175,7 @@ def expected_units(build_dir):
     else:
         for m in ws:
             exp.append(("rustfmt", m, "runner"))
+    exp.append(("membench", MEMBENCH_UNIT, "runner"))
     return exp, notes
 
 
@@ -1702,6 +1736,21 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         if len(details) > 400:
             lines.append(f"- ... and {len(details) - 400} more (sc-report artifact, results.json)")
         lines.append("")
+    # The memory bench: its exit and every line it printed (each number, each PASS and MISS), as read.
+    for title, key in ROWS:
+        for r in verdicts.get(key, ("", []))[1]:
+            if "bench_lines" in r:
+                lines.append(f"### {title}: `{r['unit']}` read {r['status']}, exit {r['exit']}")
+                lines.append("")
+                lines.append(r["note"] or "-")
+                lines.append("")
+                lines.extend(f"- `{line}`" for line in r["bench_lines"])
+                if r.get("bench_stderr"):
+                    lines.append("")
+                    lines.append("Its stderr:")
+                    lines.append("")
+                    lines.extend(f"- `{line}`" for line in r["bench_stderr"])
+                lines.append("")
     slow = []
     for r in results:
         for n, t in r["tests"]:
@@ -2304,11 +2353,85 @@ def selftest():
           rustfmt_plant_target({"packages": [pkg("Cargo.toml", (["bin"], "src/main.rs"), (["test"], "tests/a.rs"))]}, ftree), "src/main.rs")
     check("rustfmt plant: no library or binary", rustfmt_plant_target({"packages": [pkg("Cargo.toml", (["test"], "tests/a.rs"))]}, ftree), None)
 
+    # The memory bench row: one run of benches/memory.rs, read from what it printed and its exit, in
+    # the shape Cut14's bench prints (two targets; exit 0 on a MISS) and in one with more targets that
+    # exits 1 on a MISS.
+    shell_ok = ("memory shell: 41234 bytes after create + `:` (target ≤ 65536) PASS; store +812 bytes; create + `:` "
+                "310 allocs, 12 reallocs, 52011 bytes")
+    shell_miss = shell_ok.replace("41234", "1090002").replace("PASS", "MISS")
+    vproc_ok = "memory idle vprocs: 16 → 9000 bytes, 272 → 300000 bytes; 1136 bytes per vproc (target ≤ 2048) PASS"
+    back_ok = "memory idle vprocs back to back: 16 → 9000 bytes, 272 → 300000 bytes; 1136 bytes per vproc (target ≤ 2048) PASS"
+    loop_line = "memory idle vprocs: 16 → 9100 bytes, 272 → 560000 bytes; 2152 bytes per vproc in a loop writing `i` (this process's class)"
+    retention_miss = ("memory idle vproc retention: 900 bytes per vproc (loop 2036 B, reached by at least 5 of 128 processes × 16 "
+                      "names, less 1136 B back to back; largest 2100 B; 812 ms) (target ≤ 682) MISS")
+    others = ["memory idle vproc allocations by size: 24-31 B ×1.00, 96-103 B ×1.00", "memory sizes: Vproc 512 B, Frame 128 B",
+              "allocs loop NONE: 0.00 allocs/iter, 0.00 reallocs/iter, 0.0 bytes/iter; per run 12 allocs"]
+    panic = ("thread 'main' panicked at crates/pi-shell/benches/memory.rs:249:2:\nassertion `left == right` failed: every idle vproc "
+             "holds its task\n  left: 271\n right: 272\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n")
+    panic_said = "thread 'main' panicked at crates/pi-shell/benches/memory.rs:249:2: assertion 'left == right' failed: every idle vproc holds its task"
+
+    def mb(printed, ex, err="", bex="0", build="", built=True):
+        out = write("mb.out", "".join(f"{line}\n" for line in printed)) if printed is not None else os.path.join(d, "absent-mb.out")
+        r = parse_membench(MEMBENCH_UNIT, out, write("mb.err", err), str(ex) if built else "-", 61, bex, write("mb-build.log", build))
+        return r["status"], r["failures"], r["note"], r["passed"], len(r["bench_lines"])
+
+    check("membench: every target PASS, exit 0", mb([shell_ok, vproc_ok] + others, 0),
+          ("PASS", [], "2 of 2 target(s) PASS, 0 MISS; exit 0", 2, 5))
+    check("membench: a MISS with exit 0 (the bench prints its verdicts only): FAIL, the line named up to its verdict",
+          mb([shell_miss, vproc_ok] + others, 0),
+          ("FAIL", ["memory shell: 1090002 bytes after create + ':' (target ≤ 65536) MISS"], "1 of 2 target(s) PASS, 1 MISS; exit 0", 1, 5))
+    check("membench: a MISS with exit 1 (a bench that exits non-zero on a MISS), among more targets",
+          mb([shell_ok, back_ok, loop_line, retention_miss] + others, 1)[:3],
+          ("FAIL", [retention_miss[:retention_miss.index("MISS") + 4]], "2 of 3 target(s) PASS, 1 MISS; exit 1"))
+    check("membench: every line printed is kept, the line with no verdict too", mb([shell_ok, back_ok, loop_line] + others, 0)[4], 6)
+    check("membench: exit 0 and no target line", mb(others, 0)[:3],
+          ("UNKNOWN", [], "exit 0, and the bench printed no target ('(target …) PASS' or MISS)"))
+    check("membench: a panic before any target line", mb([], 101, panic)[:3],
+          ("UNKNOWN", [], f"exit 101, and the bench printed no target ('(target …) PASS' or MISS): {panic_said}"))
+    # A PASS or MISS outside a `(target …)` is no target: it neither passes nor fails the row, nor
+    # hides a target's MISS on the same line; two targets on one line are two.
+    check("membench: PASS or MISS outside a target is no target",
+          [mb(["diagnostic: the verdict word is PASS"], 0)[0], mb(["diagnostic: the verdict word is MISS"], 0)[0]], ["UNKNOWN", "UNKNOWN"])
+    check("membench: a target's MISS after a PASS outside any target",
+          mb(["memory note: PASS (target ≤ 10) MISS"], 0)[:2], ("FAIL", ["memory note: PASS (target ≤ 10) MISS"]))
+    check("membench: two targets on one line", mb(["memory two: 5 (target ≤ 10) PASS, 20 (target ≤ 10) MISS; 3 more"], 0)[:3],
+          ("FAIL", ["memory two: 5 (target ≤ 10) PASS, 20 (target ≤ 10) MISS"], "1 of 2 target(s) PASS, 1 MISS; exit 0"))
+    pr = parse_membench(MEMBENCH_UNIT, write("mb.out", f"{shell_ok}\n"), write("mb.err", panic), "101", 61, "0", write("mb-build.log", ""))
+    check("membench: the bench's stderr is kept whole, an assertion's values too",
+          pr["bench_stderr"], ["thread 'main' panicked at crates/pi-shell/benches/memory.rs:249:2:",
+                               "assertion 'left == right' failed: every idle vproc holds its task", "  left: 271", " right: 272",
+                               "note: run with 'RUST_BACKTRACE=1' environment variable to display a backtrace"])
+    long_err = "".join(f"line {i}\n" for i in range(300)) + "measured allocation: 987654321 bytes\n"
+    check("membench: a long stderr is kept whole, to its last number",
+          parse_membench(MEMBENCH_UNIT, write("mb.out", f"{shell_ok}\n"), write("mb.err", long_err), "0", 61, "0",
+                         write("mb-build.log", ""))["bench_stderr"][-2:],
+          ["line 299", "measured allocation: 987654321 bytes"])
+    check("membench: a panic after its targets passed: FAIL, the panic named", mb([shell_ok, vproc_ok], 101, panic)[:3],
+          ("FAIL", [f"exit 101: {panic_said}"], f"2 of 2 target(s) PASS, 0 MISS; exit 101 ({panic_said})"))
+    check("membench: killed", mb([shell_ok], 137)[:3], ("UNKNOWN", [], "exit 137: the time bound or a signal ended the bench"))
+    check("membench: the bench did not build",
+          mb(None, "-", bex="101", build="   Compiling pi-shell\nerror[E0425]: cannot find value `y`\nerror: could not compile\n", built=False)[:3],
+          ("UNKNOWN", [], "the bench did not build (cargo bench --no-run, exit 101): error[E0425]: cannot find value `y`"))
+    check("membench: the build's time bound", mb(None, "-", bex="124", built=False)[2],
+          "the bench did not build (cargo bench --no-run, exit 124): the time bound or a signal ended it")
+    check("membench: no executable, nothing ran", mb(None, "-", built=False)[:3],
+          ("UNKNOWN", [], "cargo named no executable of the memory bench, so nothing ran"))
+    check("membench: no log of the run", mb(None, 0)[:3], ("UNKNOWN", [], "no log of the bench's run"))
+
+    def art(name, kind, exe):
+        return json.dumps({"reason": "compiler-artifact", "target": {"name": name, "kind": [kind]}, "executable": exe})
+
+    check("membench: the bench's executable from cargo's messages",
+          bench_executable(write("mb.json", "\n".join([art("memory", "lib", "/t/lib"), art("fork", "bench", "/t/fork"),
+                                                     "not json", art("memory", "bench", "/t/release/deps/memory-1")]))),
+          "/t/release/deps/memory-1")
+    check("membench: no executable of that bench", bench_executable(write("mb.json", art("fork", "bench", "/t/fork"))), None)
+
     # The summary: a unit no job reported is UNKNOWN, and so is its row (the silent-shard control):
-    # a pi-shell binary, a clippy crate, a platform and a cargo workspace of the rustfmt row.
+    # a pi-shell binary, a clippy crate, a platform, a cargo workspace of the rustfmt row and the memory bench.
     fmt_ws = rustfmt_workspaces() or ["Cargo.toml"]
     silent = {("set-root", "pi-shell::zle_pty", "root"), ("clippy", "pi-vfs", "runner"), ("windows", PLATFORM_CRATES, "runner"),
-              ("rustfmt", fmt_ws[-1], "runner")}
+              ("rustfmt", fmt_ws[-1], "runner"), ("membench", MEMBENCH_UNIT, "runner")}
     res = os.path.join(d, "res")
     build = os.path.join(d, "build")
     os.makedirs(res)
@@ -2360,6 +2483,10 @@ def selftest():
     check("summary names the silent rustfmt workspace UNKNOWN", f"`{fmt_ws[-1]}` (runner): UNKNOWN: no result" in out, True)
     check("summary row of the silent rustfmt workspace",
           f"| rustfmt: cargo fmt --check, per cargo workspace | **UNKNOWN** | {len(fmt_ws) - 1} / 0 / 0 / 1 |" in out, True)
+    check("summary row of the silent memory bench",
+          (f"`{MEMBENCH_UNIT}` (runner): UNKNOWN: no result" in out,
+           "| pi-shell memory bench, release (benches/memory.rs: its PASS/MISS targets) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out),
+          (True, True))
     # And the same with every unit present passes.
     for row, unit, who in sorted(silent):
         # The root unit's file is silent.json: a later case replaces it under that name.
@@ -2962,9 +3089,10 @@ def selftest():
     check("a control test that did not run is UNKNOWN and named",
           (r["status"], r["note"].endswith(ORPHAN_CONTROL_TESTS[0].rsplit("::", 1)[-1])), ("UNKNOWN", True))
     # The plan: cmd_plan's outputs for a dispatch with these inputs, or the message it stopped with.
-    def plan_out(rows="all", silent="", plant="", event="workflow_dispatch", ref="refs/heads/x"):
+    def plan_out(rows="all", silent="", plant="", event="workflow_dispatch", ref="refs/heads/x", seed="", cut=""):
         env = dict(GITHUB_EVENT_NAME=event, GITHUB_REF=ref, GITHUB_SHA="b" * 40, SC_INPUT_COMMIT="a" * 40,
-                   SC_INPUT_ROWS=rows, SC_INPUT_SILENT=silent, SC_INPUT_PLANT=plant)
+                   SC_INPUT_ROWS=rows, SC_INPUT_SILENT=silent, SC_INPUT_PLANT=plant, SC_INPUT_SEED=seed,
+                   SC_CUT=cut)
         kept_env = {k: os.environ.get(k) for k in env}
         os.environ.update(env)
         buf = io.StringIO()
@@ -2981,10 +3109,25 @@ def selftest():
                 else:
                     os.environ[k] = v
 
-    # The docs, changelog and rustfmt rows. The plan takes `plant` as docs, changelog, rustfmt or nothing.
-    for plant_in, ok in (("", True), ("docs", True), ("changelog", True), ("rustfmt", True), ("both", False)):
+    # The docs, changelog, rustfmt and membench rows. The plan takes `plant` as one of them or nothing.
+    for plant_in, ok in (("", True), ("docs", True), ("changelog", True), ("rustfmt", True), ("membench", True), ("both", False)):
         r = plan_out(plant=plant_in)
         check(f"plan with plant={plant_in!r}", isinstance(r, dict) and r.get("plant") == plant_in, ok)
+    # The Rust gate's build seed. A dispatch takes auto (the newest cut's), build (this run's own)
+    # or off, and a build is the seed's own proof: it runs the cold control beside the seeded jobs.
+    for seed_in, want in (("", "auto"), ("auto", "auto"), ("build", "build"), ("off", "off")):
+        r = plan_out(seed=seed_in)
+        check(f"plan with seed={seed_in!r}", (r.get("seed"), r.get("seed_control")) if isinstance(r, dict) else r,
+              (want, "true" if want == "build" else "false"))
+    r = plan_out(seed="warm")
+    check("plan: a seed input that is no mode fails, naming it and listing the modes",
+          (isinstance(r, str), "'warm'" in r, all(s in r for s in SEEDS)), (True, True, True))
+    # The cut builds its own seed, and runs the cold control on every fifth cut (SC_CUT, the cut
+    # number of the newest `sami release CutN` commit). No number is no control, and says so.
+    for cut_in, control in (("15", "true"), ("14", "false"), ("20", "true"), ("", "false"), ("none", "false")):
+        r = plan_out(event="push", ref="refs/heads/release-candidate", cut=cut_in)
+        check(f"plan: the cut {cut_in!r} builds its own seed, and runs the cold control on every fifth",
+              (r.get("seed"), r.get("seed_control")) if isinstance(r, dict) else r, ("build", control))
     # The row selection (the dispatch input `rows`). Each job of sami-checks.yml but the plan and the
     # summary runs only when the plan names it in `jobs`, and some row's work reaches it.
     wf = workflow_jobs()
@@ -3000,6 +3143,7 @@ def selftest():
     r = plan_out(rows="all,docs")
     check("plan: all stands alone", (isinstance(r, str), "'all'" in r), (True, True))
     full = dict(commit="a" * 40, rows=",".join(ROW_KEYS), jobs=json.dumps(gated), silent="", plant="",
+                seed="auto", seed_control="false",
                 set=json.dumps(set_matrix()), builtins=json.dumps(builtins_matrix()), workspace=json.dumps(workspace_matrix()),
                 ts=json.dumps(ts_matrix()), gvisor=json.dumps(gvisor_matrix()), platforms=",".join(PLATFORMS))
 
@@ -3008,8 +3152,8 @@ def selftest():
 
     check("plan: a dispatch with rows=all runs every row and every job", picked(plan_out()), full)
     check("plan: the cut tests the pushed commit with every row and no control, whatever the inputs say",
-          picked(plan_out(rows="docs", silent="docs", plant="docs", event="push", ref="refs/heads/release-candidate")),
-          dict(full, commit="b" * 40))
+          picked(plan_out(rows="docs", silent="docs", plant="docs", seed="off", event="push", ref="refs/heads/release-candidate")),
+          dict(full, commit="b" * 40, seed="build"))
     r = plan_out(event="push", ref="refs/heads/feat/sami-checks")
     check("plan: a push of another branch plans nothing", (isinstance(r, str), "not on push of refs/heads/feat/sami-checks" in r), (True, True))
     # A prerequisite build runs only for a row whose job needs it (its needs: in sami-checks.yml).
@@ -3018,15 +3162,17 @@ def selftest():
             ("ts-ca", "ts-ca", ["natives", "ts-ca"]),
             ("set-root", "set-runner,set-root,lib4", ["tools", "build", "set"]),
             ("lib4", "set-runner,set-root,lib4", ["tools", "build", "set"]),
-            ("rust_test", "rust_test", ["build", "natives", "rust-test", "rust-test-drift"]),
-            ("rust_test_macos", "rust_test_macos", ["build", "rust-test-macos"]),
+            ("rust_test", "rust_test", ["build", "natives", "seed-linux", "rust-test", "rust-test-drift",
+                                        "rust-test-cold", "rust-test-compare"]),
+            ("rust_test_macos", "rust_test_macos", ["build", "seed-macos", "rust-test-macos"]),
             ("gv-orphan-root", "gv-set-uid1000,gv-set-root,gv-lib4-uid1000,gv-lib4-root,gv-orphan-uid1000,gv-orphan-root",
              ["tools", "build", "gvisor"]),
             ("skipforms", "set-runner,set-root,lib4,builtins,workspace,ts-small,ts-ca,skipforms," + ",".join(
                 k for k in ROW_KEYS if k.startswith("gv-")),
              ["tools", "build", "natives", "set", "builtins", "workspace", "ts-small", "ts-ca", "gvisor", "skip-forms"]),
             ("windows", "windows", ["platforms"]),
-            ("rustfmt", "rustfmt", ["rustfmt"])):
+            ("rustfmt", "rustfmt", ["rustfmt"]),
+            ("membench", "membench", ["membench"])):
         r = plan_out(rows=rows)
         check(f"plan: rows={rows} runs its rows and the jobs they need, and no other",
               (r.get("rows"), json.loads(r.get("jobs", "null"))) if isinstance(r, dict) else r, (want_rows, want_jobs))
@@ -3049,7 +3195,8 @@ def selftest():
         check(f"plan: rows={rows} with silent={silent!r} plant={plant!r}",
               (r.get("silent"), r.get("plant")) if isinstance(r, dict) else "does not run" in r and repr(silent or plant) in r,
               (silent, plant) if ok else True)
-    check("docs, changelog and rustfmt are job names silent takes", {"docs", "changelog", "rustfmt"} <= set(all_job_names()), True)
+    check("docs, changelog, rustfmt and membench are job names silent takes",
+          {"docs", "changelog", "rustfmt", "membench"} <= set(all_job_names()), True)
     # Each plant lands where the job's tool reads it.
     ptree = os.path.join(d, "ptree")
     for what, body in (("docs", "//! pi-shell\n#![allow(x)]\nmod a;\npub mod bash;\npub mod b;\n"),
@@ -3062,6 +3209,24 @@ def selftest():
         check(f"the {what} plant", open(p).read().split("\n")[3:6],
               {"docs": [PLANTS["docs"][1], "pub mod bash;", "pub mod b;"],
                "changelog": ["", PLANTS["changelog"][1], ""]}[what])
+    # The membench plant goes just after the line that makes the shell's kernel, at its indent; a file
+    # with no such line stops the job (so the control cannot pass quietly).
+    p = os.path.join(ptree, PLANTS["membench"][0])
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    open(p, "w").write("impl Shell {\n\tpub fn create() {\n\t\tlet root = 1;\n\t\tlet mut k = Kernel::new(engine, root);\n\t\tk.rand = 2;\n\t}\n}\n")
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_plant("membench", ptree)
+    check("the membench plant", open(p).read().split("\n")[3:6],
+          ["\t\tlet mut k = Kernel::new(engine, root);", "\t\t" + PLANTS["membench"][1], "\t\tk.rand = 2;"])
+    open(p, "w").write("impl Shell {}\n")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            cmd_plant("membench", ptree)
+        stopped_plant = None
+    except SystemExit as e:
+        stopped_plant = str(e.code)
+    check("the membench plant with no place for it", stopped_plant,
+          f"::error::{PLANTS['membench'][0]} has no place for the membench plant")
     # A unified diff's first change in each file; a removed line that starts `-- ` is no header.
     dfile = os.path.join(d, "c.diff")
     open(dfile, "w").write("--- a/p/x.md\n+++ b/p/x.md\n@@ -3,5 +3,3 @@\n ## [Unreleased]\n \n-### Planted\n--- dashes\n"
@@ -3337,6 +3502,47 @@ def selftest():
            "on lines the fork left as they are"
            in out, rc), (True, True, 0))
     json.dump(result("rustfmt", fmt_ws[-1], "runner", "PASS", "0", 1, 2), open(os.path.join(res2, fmt_files[fmt_ws[-1]]), "w"))
+    # The memory bench: a planted run names the shell line, and the summary lists every line it printed.
+    mb_file = next(f for f in os.listdir(res2) if json.load(open(os.path.join(res2, f)))["row"] == "membench")
+    planted_mb = mb([shell_miss, vproc_ok] + others, 0)
+    json.dump(dict(result("membench", MEMBENCH_UNIT, "runner", "FAIL", "0", 61, 1, 1, failures=planted_mb[1], note=planted_mb[2]),
+                   bench_lines=[line.replace("`", "'") for line in [shell_miss, vproc_ok] + others]),
+              open(os.path.join(res2, mb_file), "w"))
+    rc, out = summary2(rows_env="membench", plant_env="membench")
+    check("summary: a planted membench run whose shell line reads MISS",
+          (f"added `` {PLANTS['membench'][1]} `` to `{PLANTS['membench'][0]}` before it ran. The control caught it: the row reads "
+           f"FAIL, and each of its units (`{MEMBENCH_UNIT}`) names `memory shell:`." in out,
+           f"### pi-shell memory bench, release (benches/memory.rs: its PASS/MISS targets): `{MEMBENCH_UNIT}` read FAIL, exit 0" in out,
+           "1 of 2 target(s) PASS, 1 MISS; exit 0" in out,
+           "- `memory sizes: Vproc 512 B, Frame 128 B`" in out, rc), (True, True, True, True, 1))
+    vproc_miss = vproc_ok.replace("PASS", "MISS")
+    json.dump(dict(result("membench", MEMBENCH_UNIT, "runner", "FAIL", "0", 61, 1, 1, failures=[vproc_miss]), bench_lines=[]),
+              open(os.path.join(res2, mb_file), "w"))
+    rc, out = summary2(rows_env="membench", plant_env="membench")
+    check("summary: a planted membench run whose MISS is not the shell line",
+          (f"**THE CONTROL FAILED**: the row reads FAIL, and these units do not read FAIL naming `memory shell:`: `{MEMBENCH_UNIT}`." in out,
+           rc), (True, 1))
+    # The job uploads cargo's message stream beside the result: as .jsonl the summary does not read it
+    # as a unit's result (as .json, one message is a dict with no row, and the summary stops).
+    mb_logs = os.path.join(res2, "logs")
+    os.makedirs(mb_logs, exist_ok=True)
+    cargo_msg = json.dumps({"reason": "build-finished", "success": False}) + "\n"
+    json.dump(dict(pr, bench_lines=pr["bench_lines"]), open(os.path.join(res2, mb_file), "w"))
+    open(os.path.join(mb_logs, "membench-build.jsonl"), "w").write(cargo_msg)
+    rc, out = summary2(rows_env="membench")
+    check("summary: cargo's stream uploaded as .jsonl, and the bench's stderr listed",
+          ("| pi-shell memory bench, release (benches/memory.rs: its PASS/MISS targets) | **FAIL** |" in out,
+           "Its stderr:" in out, "- `  left: 271`" in out, "- `assertion 'left == right' failed: every idle vproc holds its task`" in out),
+          (True, True, True, True))
+    os.rename(os.path.join(mb_logs, "membench-build.jsonl"), os.path.join(mb_logs, "membench-build.json"))
+    try:
+        summary2(rows_env="membench")
+        as_json = "read"
+    except (KeyError, TypeError) as e:
+        as_json = type(e).__name__
+    check("summary: the same stream as .json is read as a result (why the job names it .jsonl)", as_json, "KeyError")
+    shutil.rmtree(mb_logs)
+    json.dump(result("membench", MEMBENCH_UNIT, "runner", "PASS", "0", 1, 2), open(os.path.join(res2, mb_file), "w"))
     rc, out = summary2(drop=[f for f in docs_i.values() if os.path.exists(os.path.join(res2, f))] + log_i)
     check("summary: no docs or changelog result", ("| rustdoc intra-doc links (pi-shell) | **UNKNOWN** | 0 / 0 / 0 / 2 |" in out,
           "| CHANGELOG format (fix-changelogs --check) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
@@ -3448,12 +3654,24 @@ CHANGELOG_FILE = re.compile(r"^  (\S+): (\d+ promoted item\(s\), .*)$", re.M)
 # gets a doc comment that links to no item; a small CHANGELOG gets an empty category heading after
 # its first `## [` heading ([Unreleased] in this tree), which fix-changelogs removes; each cargo
 # workspace the rustfmt row checks gets a function rustfmt would space out at the end of its first
-# target root (rustfmt_plant_target), so each unit of the row must name it.
+# target root (rustfmt_plant_target), so each unit of the row must name it; the memory bench's shell
+# gets a 1 MiB reserve in a list its kernel keeps (Shell::create, just after the kernel is made),
+# which the shell's drop frees, so the bench's shell line must read MISS.
 PLANTS = {
     "docs": ("crates/pi-shell/src/lib.rs", "/// See [`NoSuchItemPlanted`].", "NoSuchItemPlanted"),
     "changelog": ("packages/browser-relay/CHANGELOG.md", "### Planted empty heading", "Planted empty heading"),
     "rustfmt": ("the first target root of each cargo workspace the row checks", "fn sc_rustfmt_plant(){}", "sc_rustfmt_plant"),
+    "membench": ("crates/pi-shell/src/bash/vm/mod.rs", "k.callout_labels.reserve_exact(1 << 17);", "memory shell:"),
 }
+# The line of Shell::create the membench plant goes after: the kernel the shell owns is made there.
+MEMBENCH_PLANT_AT = "let mut k = Kernel::new("
+# The memory bench row (membench.sh): pi-shell's benches/memory.rs, built by `cargo bench --no-run`
+# (cargo's bench profile, which inherits release) and run once, as `cargo bench` runs it. A target
+# line holds `(target …) PASS` or `(target …) MISS` (benches/common's verdict after the target's
+# bound); the bench's other lines hold numbers too, and the summary lists every line it printed,
+# its stderr too (a panic, an assertion's values).
+MEMBENCH_UNIT = "crates/pi-shell/benches/memory.rs"
+MEMBENCH_TARGET = re.compile(r"\(target\b[^()]*\) (PASS|MISS)\b")
 
 
 def stopped(exit_code):
@@ -3463,6 +3681,69 @@ def stopped(exit_code):
 
 def first_line(text):
     return next((line.strip() for line in text.splitlines() if line.strip()), "")
+
+
+def bench_executable(stream, name="memory"):
+    """The executable of the bench target NAME in `cargo bench --no-run --message-format=json` output
+    (STREAM), or None."""
+    for line in read_lines(stream) or ():
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        t = m.get("target") if isinstance(m, dict) and m.get("reason") == "compiler-artifact" else None
+        if isinstance(t, dict) and t.get("name") == name and "bench" in t.get("kind", []) and m.get("executable"):
+            return m["executable"]
+    return None
+
+
+def parse_membench(unit, out, err, exit_code, secs, build_exit, build_log, row="membench"):
+    """One run of pi-shell's memory bench: OUT its stdout, ERR its stderr, EXIT and SECS the run's;
+    BUILD_EXIT and BUILD_LOG `cargo bench --no-run`'s (EXIT `-` when the build named no executable, so
+    nothing ran). Every line the bench printed is kept, its stdout (bench_lines) and its stderr
+    (bench_stderr), backticks as '. A target is a `(target …) PASS` or
+    `(target …) MISS` (MEMBENCH_TARGET); a PASS or MISS anywhere else is no target. FAIL names each
+    target that reads MISS (its line cut after the word) and, when no target missed, an exit other
+    than 0 with the bench's panic line: so it reads the same whether the bench exits 0 on a MISS or
+    not. PASS needs exit 0 and every target PASS. UNKNOWN: the bench did not build, nothing ran, no
+    log, the time bound or a signal ended it, or it printed no target (its exit and panic line named)."""
+    shown, errs = [], []
+
+    def r(status, passed=0, failures=(), note=""):
+        res = result(row, unit, "runner", status, exit_code, secs, passed, len(failures), failures=failures, note=note)
+        res["bench_lines"] = list(shown)
+        res["bench_stderr"] = list(errs)
+        return res
+
+    if build_exit != "0":
+        said = [line.strip() for line in read_lines(build_log) or () if line.strip()]
+        why = ("the time bound or a signal ended it" if stopped(build_exit)
+               else next((line for line in said if line.startswith("error")), said[-1] if said else "no log"))
+        return r("UNKNOWN", note=f"the bench did not build (cargo bench --no-run, exit {build_exit}): {why[:300]}")
+    if exit_code == "-":
+        return r("UNKNOWN", note="cargo named no executable of the memory bench, so nothing ran")
+    printed = read_lines(out)
+    if printed is None:
+        return r("UNKNOWN", note="no log of the bench's run")
+    shown = [line.replace("`", "'") for line in printed if line.strip()]
+    said = [line.replace("`", "'") for line in read_lines(err) or () if line.strip()]
+    errs = said
+    # A panic prints `thread '…' panicked at <place>:` and then its message on the next line.
+    at = next((i for i, line in enumerate(said) if " panicked at " in line), None)
+    why = (" ".join(s.strip() for s in said[at:at + 2]) if at is not None else said[-1].strip() if said else "")[:300]
+    if stopped(exit_code):
+        return r("UNKNOWN", note=f"exit {exit_code}: the time bound or a signal ended the bench")
+    targets = [(line[:m.end()], m.group(1)) for line in shown for m in MEMBENCH_TARGET.finditer(line)]
+    if not targets:
+        return r("UNKNOWN", note=f"exit {exit_code}, and the bench printed no target ('(target …) PASS' or MISS)"
+                 + (f": {why}" if why else ""))
+    passes = [n for n, v in targets if v == "PASS"]
+    misses = [n for n, v in targets if v == "MISS"]
+    counted = f"{len(passes)} of {len(targets)} target(s) PASS, {len(misses)} MISS; exit {exit_code}"
+    if misses or exit_code != "0":
+        failures = misses or [f"exit {exit_code}: {why or 'no error line'}"]
+        return r("FAIL", len(passes), failures, note=counted + (f" ({why})" if exit_code != "0" and why else ""))
+    return r("PASS", len(passes), note=counted)
 
 
 def parse_docs(unit, stream, log, exit_code, secs, row="docs"):
@@ -3961,6 +4242,10 @@ def cmd_plant(what, tree):
     lines = open(p, encoding="utf-8").read().split("\n")
     if what == "docs":
         at, new = next((i for i, line in enumerate(lines) if line.startswith("pub mod ")), None), [text]
+    elif what == "membench":
+        # After the line that makes the shell's kernel, at that line's indent.
+        at = next((i + 1 for i, line in enumerate(lines) if MEMBENCH_PLANT_AT in line), None)
+        new = [] if at is None else [lines[at - 1][:len(lines[at - 1]) - len(lines[at - 1].lstrip())] + text]
     else:
         at, new = next((i + 1 for i, line in enumerate(lines) if line.startswith("## [")), None), ["", text]
     if at is None:
@@ -4023,6 +4308,13 @@ def main(argv):
         print("\n".join(ws))
     elif c == "rustfmt":
         print(json.dumps(parse_rustfmt(*a)))
+    elif c == "membench-bin":
+        exe = bench_executable(a[0])
+        if exe is None:
+            sys.exit(f"cargo named no executable of the memory bench in {a[0]}")
+        print(exe)
+    elif c == "membench":
+        print(json.dumps(parse_membench(*a)))
     elif c == "plant":
         cmd_plant(*a)
     elif c == "selftest":

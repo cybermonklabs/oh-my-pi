@@ -142,6 +142,7 @@ import {
 	resolveSessionModelSelector,
 	sessionModelDiscoveryProviders,
 } from "../config/model-resolver";
+import { resolveRetiredSessionModel, retiredSessionModelMigrationProviders } from "./retired-session-model";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, isServiceTierForFamily, serviceTierSettingToTier } from "../config/service-tier";
 import { combine, type SettingChange, type SettingsScope } from "../config/registry";
@@ -535,7 +536,7 @@ import {
 	type SessionDumpLiveState,
 } from "./session-dump-format";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
-import type { BranchSummaryEntry, NewSessionOptions, SessionEntry } from "./session-entries";
+import type { BranchSummaryEntry, HeldChangeBase, NewSessionOptions, SessionEntry } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
 	COMPACTION_CHECK_NONE,
@@ -6342,7 +6343,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// continuations — except TTSR self-repair, which already scheduled a
 			// hidden retry while #ttsrAbortPending is still true.
 			if (msg.stopReason === "aborted") {
-				this.#recovery.resolveRetry();
+				// A TTSR self-repair retry goes on; any other abort ends the retry saga it cut short.
+				if (ttsrAbortPendingAtAgentEnd) this.#recovery.resolveRetry();
+				else await this.#recovery.resolveAbortedRetry(msg);
 				this.#resetSessionStopContinuationState();
 				await emitAgentEndNotification(ttsrAbortPendingAtAgentEnd ? { willContinue: true } : undefined);
 				return;
@@ -8248,9 +8251,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#sessionChangeCallbacks.clear();
 		// A cold revive sends the newest `session_init` prompt as a fixed prompt and holds nothing, so a session that
 		// parks or ends while its base withholds a change stores the prompt that goes out with it: the revive sends
-		// what the change's notices said the requests would follow, not the held prompt for good.
+		// what the change's notices said the requests would follow, not the held prompt for good. Beside it goes the
+		// base with the settings the change holds, which the revive sends instead should a sync set the change back.
 		const withheldPromptBuild = this.#tools.withheldPromptBuild;
-		if (withheldPromptBuild) this.#recordModelCallSystemPrompt(withheldPromptBuild);
+		if (withheldPromptBuild) {
+			this.#recordModelCallSystemPrompt(withheldPromptBuild, this.#tools.withheldSettingsBase);
+		}
 
 		// Event handlers can reopen the append writer while they persist their
 		// terminal message; that pipeline has drained (or hit the deadline).
@@ -8819,10 +8825,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * Keeps a subagent transcript's latest `session_init` on the base prompt and work-pool yield items
 	 * its model calls are built from, appending a newer one when either changes: signed thinking is
 	 * bound to the system prompt and tools, so cold revival must replay them. A per-turn override is
-	 * stored as the base its hook was given, since the revived turn re-runs the hook. Transcripts
-	 * without a `session_init` are left alone.
+	 * stored as the base its hook was given, since the revived turn re-runs the hook. `heldChangeBase`
+	 * is given only as the session parks holding a settings change (the entry's `heldChangeBase`); a
+	 * newer entry a model call appends has none. Transcripts without a `session_init` are left alone.
 	 */
-	#recordModelCallSystemPrompt(prompt: string[]): void {
+	#recordModelCallSystemPrompt(prompt: string[], heldChangeBase?: HeldChangeBase): void {
 		const sessionFile = this.sessionManager.getSessionFile();
 		let cached = this.#sessionInit;
 		if (!cached || cached.sessionFile !== sessionFile) {
@@ -8840,11 +8847,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			items.length === persistedItems.length &&
 			items.every(
 				(item, index) => item.id === persistedItems[index]?.id && item.index === persistedItems[index]?.index,
-			)
+			) &&
+			(heldChangeBase === undefined || Bun.deepEquals(heldChangeBase, init.heldChangeBase))
 		) {
 			return;
 		}
-		cached.init = { ...init, systemPrompt: base, workPoolYieldItems: items.length > 0 ? [...items] : undefined };
+		const { heldChangeBase: _earlier, ...kept } = init;
+		cached.init = {
+			...kept,
+			systemPrompt: base,
+			workPoolYieldItems: items.length > 0 ? [...items] : undefined,
+			...(heldChangeBase ? { heldChangeBase } : undefined),
+		};
 		this.sessionManager.appendSessionInit(cached.init);
 	}
 
@@ -16352,19 +16366,22 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.sessionManager.getLastModelChangeRole(),
 			);
 			let targetModel = explicitModel;
+			let migratedThinkingLevel: ConfiguredThinkingLevel | undefined;
 			let modelFallbackWarning: string | undefined;
 			if (!targetModel && !options?.keepModel && targetModelStrings.length > 0) {
-				targetModel = await this.#resolveSessionModel(targetModelStrings);
+				const restored = await this.#resolveSessionModel(targetModelStrings);
+				targetModel = restored?.model;
+				migratedThinkingLevel = restored?.thinkingLevel;
 				if (!targetModel && switchingToDifferentSession) {
 					// Like startup resume: never hand the transcript to a model the
 					// session did not choose unless a UI can say so.
 					if (!this.#allowSessionModelFallback || !cfgRetryModelFallback.get(this.settings)) {
-						throw new Error(`Could not restore model ${targetModelStrings[0]}`);
+						throw new Error(`Could not restore model ${targetModelStrings[0]}. Use --model to choose a model.`);
 					}
 					const currentModel = this.model;
 					modelFallbackWarning = currentModel
 						? `Could not restore model ${targetModelStrings[0]}. Using ${currentModel.provider}/${currentModel.id}`
-						: `Could not restore model ${targetModelStrings[0]}`;
+						: `Could not restore model ${targetModelStrings[0]}. Use --model to choose a model.`;
 				}
 			}
 			// The first build was read by the departing model; rebuild it for the
@@ -16476,7 +16493,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						? AUTO_THINKING
 						: (sessionContext.thinkingLevel as ThinkingLevel | undefined)
 					: defaultThinkingLevel;
-			this.#models.restoreThinkingLevel(restoredThinkingLevel);
+			this.#models.restoreThinkingLevel(migratedThinkingLevel ?? restoredThinkingLevel);
 			this.#models.restoreServiceTiers(
 				hasServiceTierEntry ? (sessionContext.serviceTier ?? {}) : configuredServiceTierByFamily,
 			);
@@ -16649,13 +16666,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/**
 	 * First restorable saved session model, resolved like startup resume: when
 	 * none is in the catalog, refresh the discovery-backed providers among them
-	 * once and retry.
+	 * once and retry, then migrate a removed provider through its model-key chain.
+	 * Only migrations override the session's saved thinking level with a selector suffix.
 	 */
-	async #resolveSessionModel(selectors: readonly string[]): Promise<Model | undefined> {
-		const resolve = (): Model | undefined => {
+	async #resolveSessionModel(
+		selectors: readonly string[],
+	): Promise<{ model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined> {
+		const resolve = (): { model: Model } | undefined => {
 			for (const selector of selectors) {
 				const restored = resolveSessionModelSelector(this.#modelRegistry, selector);
-				if (restored) return restored.model;
+				if (restored) return { model: restored.model };
+				// Do not let an older saved role bypass a retired preferred selector.
+				// Apply its migration only after the discovery pass below settles.
+				if (resolveRetiredSessionModel(this.#modelRegistry, this.settings, selector).kind !== "present") {
+					return undefined;
+				}
 			}
 			return undefined;
 		};
@@ -16666,9 +16691,29 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			selectors,
 			disabledProviderIds(this.settings),
 		);
-		if (providers.size === 0) return undefined;
-		await this.#modelRegistry.refreshDiscoverableProviders(providers, "online-if-uncached");
-		return resolve();
+		for (const selector of selectors) {
+			for (const provider of retiredSessionModelMigrationProviders(this.#modelRegistry, this.settings, selector)) {
+				providers.add(provider);
+			}
+		}
+		if (providers.size > 0) {
+			await this.#modelRegistry.refreshDiscoverableProviders(providers, "online-if-uncached");
+			const discovered = resolve();
+			if (discovered) return discovered;
+		}
+		for (const selector of selectors) {
+			const restored = resolveSessionModelSelector(this.#modelRegistry, selector);
+			if (restored) return { model: restored.model };
+			const resolution = resolveRetiredSessionModel(this.#modelRegistry, this.settings, selector);
+			if (resolution.kind === "present") continue;
+			if (resolution.kind === "refused") {
+				throw new Error(
+					`Could not restore model ${selector}. Use --model to choose a model, or add a retry.fallbackChains key that maps the old selector to the new one.`,
+				);
+			}
+			return resolution;
+		}
+		return undefined;
 	}
 
 	/**

@@ -124,6 +124,7 @@ import {
 	findSessionContinuation,
 	type PickerListing,
 	readSessionInfo,
+	type ResumeTarget,
 	resolveResumeTarget,
 	resolveResumableSession,
 	type SessionContinuation,
@@ -135,7 +136,7 @@ import {
 	SessionManager,
 	SessionMoveRefusedError,
 } from "./session/session-manager";
-import { defaultSessionStorage, setDefaultSessionStorage } from "./session/session-storage";
+import { defaultSessionStorage, type SessionClaimHolder, setDefaultSessionStorage } from "./session/session-storage";
 import { resolveSessionStorage, SessionStorageConfigError } from "./session/session-storage-config";
 import { forkIfMovedAway, lastSessionTransfer } from "./session/session-transfer";
 import { SESSION_OPEN_CLAIM_WAIT_MS } from "./session/sql-session-storage";
@@ -1295,6 +1296,104 @@ export function normalizeContinueSessionArgs(parsed: Args, rawArgs?: readonly st
 const SESSION_NOT_FOUND_HINT =
 	"Run `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one.";
 
+/**
+ * Open the session a resume key resolved to, as `--resume <key>` does: report a newer copy of its
+ * conversation, offer to move a session whose recorded directory is gone, fork a copy whose
+ * conversation moved to another machine (except under `OMP_SESSION_EXCLUSIVE=1`), and claim the
+ * opened session ({@link claimOpenedSession}). `undefined` when the user declines the move.
+ */
+async function openResumeTarget(
+	sessionArg: string,
+	target: ResumeTarget,
+	cwd: string,
+	sessionDir: string | undefined,
+	askToMoveSession: SessionPrompt,
+	onSessionContinuation: ((continuation: SessionContinuation) => void) | undefined,
+): Promise<SessionManager | undefined> {
+	const { session, continuation } = target;
+	if (continuation) onSessionContinuation?.(continuation);
+	const moveResult = await moveMissingCwdSessionIfNeeded(sessionArg, session, cwd, sessionDir, askToMoveSession);
+	if (moveResult.status === "moved") {
+		return await claimOpenedSession(await forkIfMovedAwayUnlessExclusive(moveResult.manager, sessionDir));
+	}
+	if (moveResult.status === "declined") {
+		return undefined;
+	}
+	return await claimOpenedSession(
+		await forkIfMovedAwayUnlessExclusive(await SessionManager.open(session.path, sessionDir), sessionDir),
+	);
+}
+
+function sessionOpenElsewhereError(sessionId: string): SessionResolutionError {
+	return new SessionResolutionError(
+		`Session "${sessionId}" is open in another running omp process. Stop that process, then run this command again to resume it.`,
+	);
+}
+
+/**
+ * `--session-id <id>`: resume the stored session that holds exactly this id, as `--resume <id>`
+ * opens it, else start a new session under the id. Refused while another live omp process owns
+ * the session: this process would then write its turns to a new sibling session under another
+ * id (or, under `OMP_SESSION_EXCLUSIVE=1`, stop at its first write), and the id the launcher
+ * recorded would no longer name the conversation.
+ */
+async function openOrCreateSessionById(
+	sessionId: string,
+	cwd: string,
+	sessionDir: string | undefined,
+	askToMoveSession: SessionPrompt,
+	onSessionContinuation: ((continuation: SessionContinuation) => void) | undefined,
+): Promise<SessionManager | undefined> {
+	// The session `--resume <id>` opens for a whole id: exactly that session, in the same scopes and
+	// storage, with no continuation followed; else a file named for the id that no longer reads as a
+	// session, through the copy that continues it.
+	const findHolder = async (): Promise<ResumeTarget | undefined> =>
+		(await resolveResumableSession(sessionId, cwd, sessionDir, defaultSessionStorage(), { exactId: true })) ??
+		(await resolveResumeTarget(sessionId, cwd, sessionDir, { exactId: true }));
+	let target = await findHolder();
+	if (!target) {
+		const creation = await SessionManager.createWithSessionId(
+			cwd,
+			sessionDir,
+			sessionId,
+			async () => (await findHolder()) !== undefined,
+		);
+		if (creation.status === "created") return creation.manager;
+		if (creation.status === "owned-elsewhere") throw sessionOpenElsewhereError(sessionId);
+		// Another launch stored the session between the lookup and the claim: resume it.
+		target = await findHolder();
+		if (!target) {
+			throw new SessionResolutionError(`Session "${sessionId}" not found.`, SESSION_NOT_FOUND_HINT);
+		}
+	}
+	// Claimed before it is opened: opening records it as the terminal's last session, and a session
+	// another live omp process still owns is refused with nothing written. It first waits for a holder
+	// that is ending, as an explicit `--resume` does ({@link claimOpenedSession}).
+	const claim = await SessionManager.claimStoredSession(target.session.path, target.session.id, {
+		waitMs: SESSION_OPEN_CLAIM_WAIT_MS,
+		onWait: sessionHeldWaitNotice(sessionId),
+	});
+	if (!claim) throw sessionOpenElsewhereError(sessionId);
+	try {
+		const manager = await openResumeTarget(
+			sessionId,
+			target,
+			cwd,
+			sessionDir,
+			askToMoveSession,
+			onSessionContinuation,
+		);
+		// The manager takes its own claim before this one is released, so the session stays this process's.
+		if (manager?.isOwnedElsewhere()) {
+			await manager.close();
+			throw sessionOpenElsewhereError(sessionId);
+		}
+		return manager;
+	} finally {
+		claim();
+	}
+}
+
 function validateSessionPersistenceArgs(parsed: Pick<Args, "continue" | "noSession" | "resume">): void {
 	if (!parsed.noSession) return;
 	if (parsed.resume !== undefined) {
@@ -1323,21 +1422,13 @@ export async function createSessionManager(
 	} = {},
 ): Promise<SessionManager | undefined> {
 	if (parsed.sessionId !== undefined) {
-		const sessionId = parsed.sessionId;
-		// A stored session holds the id when `--resume <id>` would open it: the same scopes and storage,
-		// matched by the exact id.
-		const manager = await SessionManager.createWithSessionId(
+		return await openOrCreateSessionById(
+			parsed.sessionId,
 			cwd,
 			parsed.sessionDir,
-			sessionId,
-			async () => (await resolveResumeTarget(sessionId, cwd, parsed.sessionDir, { exactId: true })) !== undefined,
+			askToMoveSession,
+			options.onSessionContinuation,
 		);
-		if (!manager) {
-			throw new SessionResolutionError(
-				`Session "${sessionId}" already exists; resume it with --resume ${sessionId}.`,
-			);
-		}
-		return manager;
 	}
 	if (parsed.fork) {
 		if (parsed.noSession) {
@@ -1415,27 +1506,13 @@ export async function createSessionManager(
 		if (!target) {
 			throw new SessionResolutionError(`Session "${sessionArg}" not found.`, SESSION_NOT_FOUND_HINT);
 		}
-		const { session } = target;
-		const continuation = "continuation" in target ? target.continuation : undefined;
-		if (continuation) options.onSessionContinuation?.(continuation);
-		const moveResult = await moveMissingCwdSessionIfNeeded(
+		return await openResumeTarget(
 			sessionArg,
-			session,
+			target,
 			cwd,
 			parsed.sessionDir,
 			askToMoveSession,
-		);
-		if (moveResult.status === "moved") {
-			return await claimOpenedSession(await forkIfMovedAwayUnlessExclusive(moveResult.manager, parsed.sessionDir));
-		}
-		if (moveResult.status === "declined") {
-			return undefined;
-		}
-		return await claimOpenedSession(
-			await forkIfMovedAwayUnlessExclusive(
-				await SessionManager.open(session.path, parsed.sessionDir),
-				parsed.sessionDir,
-			),
+			options.onSessionContinuation,
 		);
 	}
 	if (parsed.continue) {
@@ -1523,15 +1600,20 @@ async function claimOpenedSession(manager: SessionManager, options: { wait?: boo
 	}
 	await manager.claimOpenedSession({
 		waitMs: SESSION_OPEN_CLAIM_WAIT_MS,
-		onWait: holder => {
-			const by = holder ? ` (host ${holder.host}, pid ${holder.pid})` : "";
-			process.stderr.write(
-				`Session ${manager.getSessionId()} is held by another omp process${by}; ` +
-					`waiting up to ${SESSION_OPEN_CLAIM_WAIT_MS / 1000} s for its lease to ${holder ? "expire" : "go"}…\n`,
-			);
-		},
+		onWait: sessionHeldWaitNotice(manager.getSessionId()),
 	});
 	return manager;
+}
+
+/** Tell the person on stderr that opening session `sessionId` waits for another holder's lease to go or expire. */
+function sessionHeldWaitNotice(sessionId: string): (holder: SessionClaimHolder | undefined) => void {
+	return holder => {
+		const by = holder ? ` (host ${holder.host}, pid ${holder.pid})` : "";
+		process.stderr.write(
+			`Session ${sessionId} is held by another omp process${by}; ` +
+				`waiting up to ${SESSION_OPEN_CLAIM_WAIT_MS / 1000} s for its lease to ${holder ? "expire" : "go"}…\n`,
+		);
+	};
 }
 
 /** Discover APPEND_SYSTEM.md file if no CLI append system prompt was provided */

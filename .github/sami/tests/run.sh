@@ -11,7 +11,7 @@
 #   - rust-test-early-listings.sh, against stubs of cargo metadata and
 #     bazelisk query, build and info, and test binaries that list their tests
 #     (cases E*); rust-test-listings-drift.sh (cases D*).
-#   - rust-test-tmpdir.sh.
+#   - rust-test-tmpdir.sh, and libtest-bound.py (its own selftest) under it.
 #   - release-candidate.sh, publish's checks, by release-candidate-harness.sh
 #     with a stub in place of gh (cases RC-*).
 #   - sami-build.yml and .github/actions/bun-install: only release_binary
@@ -21,6 +21,13 @@
 #     tests: none of them may use the cache or hold either permission.
 #   - the candidate branch: every file that names the branch a candidate is
 #     pushed to names the same one (candidate_lint, cases C*).
+#   - the build seed: gate-seed.sh, against stubs of bazelisk and gh (its
+#     writer, cases G14 to G16; its reader's every path, cases G1 to G13, with
+#     the planted sha256 mismatch G2), and rust-test-results-compare.sh, which
+#     holds a seeded run's per-test results against a cold one's (cases Z*).
+#   - the seed is the gate's and it is no cache: no job of sami-build.yml names
+#     it, no job of sami-checks.yml holds a cache token, and no two calls of
+#     sami-rust-test.yml share an artifact name (seed_lint, cases Y*).
 # Each case checks an exit code and a message. RUST_TEST_SH runs the cases
 # against another copy of the test step, and LEGACY=1 drops the argument
 # checks that copy predates (to show which cases an older step fails).
@@ -139,6 +146,15 @@ summary() { # label status [failed logs] [passed logs], each list split on space
 }
 # metrics <milliseconds>: the event that gives the invocation's wall time.
 metrics() { jq -cn --arg w "$1" '{id: {buildMetrics: {}}, buildMetrics: {timingMetrics: {wallTimeInMs: $w}}}'; }
+# attempt <label> <status> <attempt> <seconds>: the testResult event of one
+# test attempt, its run time as testAttemptDuration (MILLIS=1: as the older
+# testAttemptDurationMillis, <seconds> then in milliseconds; CACHED=1: a
+# result Bazel reused from an earlier run; SHARD: its shard, 1 by default).
+attempt() {
+	jq -cn --arg l "$1" --arg s "$2" --argjson a "$3" --arg d "$4" --arg m "${MILLIS:-}" --arg c "${CACHED:-}" --argjson sh "${SHARD:-1}" '{id:{testResult:{label:$l,run:1,shard:$sh,attempt:$a,configuration:{id:"c"}}},testResult:({status:$s}
+		+ (if $m != "" then {testAttemptDurationMillis:$d} else {testAttemptDuration:($d + "s")} end)
+		+ (if $c != "" then {cachedLocally:true} else {} end))}'
+}
 # tpath / bpath <label>: a target's test.log and test binary, as Bazel lays
 # them out under bazel-out.
 tpath() { local l="${1#//}"; printf '%s/out/testlogs/%s/%s/test.log' "$logs" "${l%%:*}" "${l#*:}"; }
@@ -296,7 +312,7 @@ W="$w"
 logs="$w/logs"
 OWN_TESTS="${OWN_TESTS:-}"
 OWN_PRINTS="${OWN_PRINTS:-}"
-$(declare -f lt_pass lt_fail lt_out lt_ignored lt_partial lt_child_summary doc_pass doc_fail cfg summary metrics unbuilt tpath bpath fakebin record_names target rt dt nt listed sanct query_names own_default)
+$(declare -f lt_pass lt_fail lt_out lt_ignored lt_partial lt_child_summary doc_pass doc_fail cfg summary metrics attempt unbuilt tpath bpath fakebin record_names target rt dt nt listed sanct query_names own_default)
 args=("\$@")
 if [ "\${args[0]#--bazelrc=}" != "\${args[0]}" ]; then args=("\${args[@]:1}"); fi
 if [ "\${args[0]}" = query ]; then
@@ -526,6 +542,10 @@ EOF
 	for report in "$w"/tmp/rust-test/cargo-timings/*; do
 		[ -f "$report" ] && out+=$'\n'"artifact: ${report##*/}: $(cat -- "$report")"
 	done
+	# The per-test results the compare job reads, one `results: ` line each.
+	if [ -f "$w/tmp/rust-test/results/results.tsv" ]; then
+		out+=$'\n'"$(sed 's/^/results: /' "$w/tmp/rust-test/results/results.tsv")"
+	fi
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
 
@@ -773,6 +793,19 @@ IGNORED_ROOT="$A a::cycle" NOT_MSG='stub:|::error' KNOWN_OUTPUT="$OKNOWN" IGNORE
 # the verdict stays the test's.
 OPT_BUILD_BODY="metrics NaN >\"\$bep\"; exit 0" IGN_OPT_BODY="FMT=json; { RUN_S=-1 FILTERED=1 rt $A PASSED lt_out $SW 'full corpus: 8661 files, 69288 comparisons\\n'; metrics 1e999; } >\"\$bep\"; exit 0" NOT_MSG='::error' o_run O11-opt-malformed-timings-read-unknown 0 "compilation mode opt; build UNKNOWN s \\(bazel build, exit 0\\), test UNKNOWN s \\(bazel test; the test binary's run UNKNOWN s\\)\$" '' "$OMAIN"
 
+# TT: each test attempt's run time, from the build event log's testResult
+# events (Bazel's own summary names only the targets that did not pass): the
+# measure a target's timeout is set from. It changes no verdict.
+NOT_MSG='::error' run TT1-each-attempt-prints-its-run-time 0 "^Test time \\(main\\): $D attempt 1: PASSED in 412\\.3 s\$" '' "{ $P; rt $D PASSED lt_pass a::one; attempt $D PASSED 1 412.345; } >\"\$bep\"; exit 0"
+TT2="{ $P; rt $D PASSED lt_pass a::one; attempt $D FAILED 1 61.5; attempt $D PASSED 2 50.9; } >\"\$bep\"; exit 0"
+NOT_MSG='::error' run TT2a-a-retried-target-prints-its-first-attempt 0 "^Test time \\(main\\): $D attempt 1: FAILED in 61\\.5 s\$" '' "$TT2"
+NOT_MSG='::error' run TT2b-a-retried-target-prints-its-second-attempt 0 "^Test time \\(main\\): $D attempt 2: PASSED in 50\\.9 s\$" '' "$TT2"
+NOT_MSG='::error' run TT3-the-older-millisecond-field-is-read 0 "^Test time \\(main\\): $D attempt 1: PASSED in 212\\.3 s\$" '' "{ $P; rt $D PASSED lt_pass a::one; MILLIS=1 attempt $D PASSED 1 212345; } >\"\$bep\"; exit 0"
+NOT_MSG='::error|in 0\.0 s' run TT4-a-time-that-is-no-finite-number-is-unknown 0 "^Test time \\(main\\): $D attempt 1: PASSED in UNKNOWN s\$" '' "{ $P; rt $D PASSED lt_pass a::one; attempt $D PASSED 1 NaN; } >\"\$bep\"; exit 0"
+NOT_MSG='::error' run TT5-a-reused-result-says-so 0 "^Test time \\(main\\): $D attempt 1: PASSED in 3\\.0 s \\(cached: an earlier run's result\\)\$" '' "{ $P; rt $D PASSED lt_pass a::one; CACHED=1 attempt $D PASSED 1 3; } >\"\$bep\"; exit 0"
+NOT_MSG='::error|^Test time ' run TT6-a-log-without-attempts-says-so 0 "^Test times \\(main\\): the build event log names no test attempt\$" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+NOT_MSG='::error' run TT7-a-shard-is-named 0 "^Test time \\(main\\): $D attempt 1, shard 2: TIMEOUT in 300\\.0 s\$" '' "{ $P; rt $D PASSED lt_pass a::one; SHARD=2 attempt $D TIMEOUT 1 300; } >\"\$bep\"; exit 0"
+
 # B1: an #[ignore]d cargo test runs alone (rust-test-ignored.txt), or fails
 # the job.
 CARGO_MODE=ignored run J102-cargo-ignored-unlisted 1 "sdk/rust/demo:test:wire a::slow is #\\[ignore\\]d and runs in no invocation" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
@@ -790,8 +823,6 @@ CARGO_MODE=ignored-and-doc-ignored NOT_MSG='ignore doctest|src/lib.rs - g.*(fail
 # B3: on Linux the crates' doctests run only in Bazel: the stub refuses a
 # cargo test --doc of a crate under crates/ there (D1 shows none ran), and
 # the job reads the doctests from the source instead (D1-D34 below).
-# B4: the listings the macOS job's inventory reads.
-run J108-listings-for-macos 0 'Listings for the macOS inventory: 2 binaries' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
 # D1-D34: on Linux each crate with a Bazel doctest target has its doctests
 # read from its source (.github/sami/rust-test-doctest-forms.awk, no build):
 # a line of a doctest rustdoc runs that prints or holds a skip word fails the
@@ -1157,6 +1188,32 @@ if [ -z "$only" ] || [[ T1-each-action-its-own-tmpdir =~ $only ]]; then
 	rc=0
 	{ [ "$a" != "$b" ] && [ -d "$a" ] && [ -d "$b" ] && [ "$(dirname "$a")" = "$t" ] && [ "$(dirname "$b")" = "$t" ]; } || rc=1
 	verdict T1-each-action-its-own-tmpdir 0 "$rc" '' "$a $b"
+fi
+
+# T2: a test binary that asks for libtest's JSON runs under libtest-bound.py
+# (shown by its --list, which this one fails); T3: a doctest target does not.
+for c in T2-a-libtest-binary-runs-under-the-bound T3-a-doctest-target-runs-as-it-is; do
+	if [ -n "$only" ] && ! [[ $c =~ $only ]]; then continue; fi
+	t="$(mktemp -d "$scratch/tmpdir.XXXXXX")"
+	target=//crates/demo:demo_test
+	[ "$c" = T3-a-doctest-target-runs-as-it-is ] && target=//crates/demo:demo_doc_test
+	out="$(TEST_TARGET=$target sh "$repo/.github/sami/rust-test-tmpdir.sh" "$t" sh -c 'case "$1" in --list) exit 3 ;; esac; echo ran' _ -Zunstable-options --format=json 2>&1)"
+	rc=$?
+	if [ "$c" = T2-a-libtest-binary-runs-under-the-bound ]; then
+		verdict "$c" 0 "$rc" 'libtest-bound: .* runs without a bound per test: its --list failed' "$out"
+	else
+		NOT_MSG='libtest-bound' verdict "$c" 0 "$rc" '^ran$' "$out"
+	fi
+done
+
+# --- libtest-bound.py ------------------------------------------------------------
+# Its own controls (tests/libtest-bound-selftest.py, against tests/fake-libtest.py),
+# with the tree's .config/nextest.toml for its config reader.
+if [ -z "$only" ] || [[ L1-libtest-bound-selftest =~ $only ]]; then
+	out="$(python3 "$here/libtest-bound-selftest.py" --config "$repo/.config/nextest.toml" 2>&1)"
+	rc=$?
+	verdict L1-libtest-bound-selftest 0 "$rc" '^SELFTEST [0-9]+ of [0-9]+ cases as expected$' "$out"
+	printf '%s\n' "$out" | grep -E '^FAIL ' | sed 's/^/    | /'
 fi
 
 # --- release-candidate.sh ------------------------------------------------------
@@ -2058,6 +2115,405 @@ $DT2 p::one" "$DT1 a::one"
 drun D6-drift-plant-rename-and-missing-target 1 'Listing drift: 3 differences in 2 targets \(early 1, rust_test.s 2\)' "$DT1 a::one a::two_renamed" "$DT1 a::one a::two
 $DT2 p::one"
 EARLY_INDEX=none drun D7-drift-no-early-listings 1 'UNKNOWN: .*/early/index.tsv \(early\) is missing or empty' '' "$DT1 a::one"
+
+# The per-test results the seed's control reads (results.tsv, written whatever
+# the verdict): the final status of each test and what each invocation said,
+# with a flaky target's attempts kept apart, in the Linux job and in the macOS
+# one (RUST_TEST_ONLY), and for a doctest, whose log is libtest's text.
+NOT_MSG='::error' run J170-per-test-results 0 '^results: //crates/pi-diff:pi-diff_test.a::one.ok.main=ok$' '' "{ $P; rt $D PASSED lt_pass a::one a::two; } >\"\$bep\"; exit 0"
+NOT_MSG='::error' run J170b-per-test-results-of-a-cargo-test 0 '^results: sdk/rust/demo:lib:demo.a::one.ok.cargo=ok$' '' "{ $P; rt $D PASSED lt_pass a::one a::two; rt $V PASSED lt_pass v::one; } >\"\$bep\"; exit 0"
+run J170c-per-test-results-of-a-failed-test 0 '^results: //crates/pi-builtins:pi-builtins_test.x::k1.failed.main=failed$' "$B x::k1" "{ $P; rt $B FAILED lt_fail x::k1; } >\"\$bep\"; exit 3"
+run J170d-per-test-results-of-an-ignored-test 1 '^results: //crates/pi-diff:pi-diff_test.d::needs_network.ignored.main=ignored$' '' "{ $P; rt $D PASSED lt_ignored d::one d::needs_network; } >\"\$bep\"; exit 0"
+NOT_MSG='::error' run J170e-per-test-results-of-a-doctest 0 '^results: //crates/pi-diff:pi-diff_doc_test.src/lib.rs - f \(line 3\).ok.main=ok$' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+# A flaky target's test that failed on one attempt and passed on another is `ok`
+# with both attempts named, so the control compares it by that final status.
+FLAKY="$B x::f" MAIN_MUST_FLAKY="$B" run J171-per-test-results-of-a-flaky-test 0 '^results: //crates/pi-builtins:pi-builtins_test.x::f.ok.main=failed,main=ok$' "$B x::f" "f=\"\$(tpath $B)\"; mkdir -p \"\$(dirname \"\$f\")/test_attempts\"; lt_fail x::f >\"\$(dirname \"\$f\")/test_attempts/attempt_1.log\"; lt_pass x::passes x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B FLAKY \"\$(dirname \"\$f\")/test_attempts/attempt_1.log\" \"\$f\"; } >\"\$bep\"; exit 0"
+ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='::error' run J172-per-test-results-in-the-macos-job 0 '^results: //crates/pi-diff:pi-diff_test.m::strftime.ok.only-[0-9]+=ok$' '' 'exit 9'
+
+# --- the build seed: .github/sami/gate-seed.sh ------------------------------------
+# srun <name> <want> <message regex> <body>: the gate's two seed steps, as
+# sami-rust-test.yml runs them, in a workspace of its own. The body runs first,
+# with $w (the workspace), $archive (where the download lands), $gh (the
+# directory the gh stub answers from) and $dir (the seed's cache directory)
+# set; it writes the case's archive and the API's answers. Then the case runs
+# `gate-seed.sh pick`, hands its outputs to `gate-seed.sh use` as the workflow
+# does, and runs that. A case's output holds both steps' lines, the pick's
+# outputs, the bazelrc fragment the build would use (`rc: `) and the files the
+# seed left. Its environment: SEED_MODE, SEED_SHA256 (`archive` for the
+# archive's own, as the seed job's output would give it), CASE_RUN_ID (the run
+# the case runs in, 100 by default; the harness runs inside a run of its own,
+# whose GITHUB_RUN_ID must reach no case), SEED_NAME, SEED_JOB and
+# GH_STUB_FAIL.
+seed_sh="${GATE_SEED_SH:-$repo/.github/sami/gate-seed.sh}"
+sha_of() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | cut -d ' ' -f 1
+	else
+		shasum -a 256 "$1" | cut -d ' ' -f 1
+	fi
+}
+# seed_archive <path>: a seed as the seed job packs it (a disk and a repository cache).
+seed_archive() {
+	local d
+	d="$(mktemp -d "$scratch/seed-src.XXXXXX")"
+	mkdir -p "$d/disk/ac" "$d/repo"
+	echo "an action's output" >"$d/disk/ac/1"
+	echo "a repository rule's download" >"$d/repo/2"
+	mkdir -p "$(dirname "$1")"
+	tar -cf - -C "$d" disk repo | zstd -T0 -3 -q -o "$1"
+	rm -rf -- "$d"
+}
+srun() {
+	local name="$1" want="$2" msg="$3" body="$4" w out rc pick_rc run sum reason given
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/seed.XXXXXX")"
+	mkdir -p "$w/bin" "$w/gh" "$w/temp" "$w/download"
+	local rcf="$w/bazel.rc" archive="$w/download/sc-seed.tar.zst" gh="$w/gh" dir="$w/cache"
+	: >"$rcf"
+	cat >"$w/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+# The harness's gh: it answers `gh api` from this case's files, with the -q
+# filter applied by jq, as gh does.
+set -u
+if [ "${GH_STUB_FAIL:-0}" = 1 ]; then
+	echo "gh: HTTP 403: this token cannot read the repository's runs" >&2
+	exit 1
+fi
+path="" q=""
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	api) ;;
+	-X | -f | -F) shift ;;
+	-q)
+		q="$2"
+		shift
+		;;
+	*) [ -n "$path" ] || path="$1" ;;
+	esac
+	shift
+done
+id="${path%/*}"
+id="${id##*/}"
+case "$path" in
+*/runs) file="$GH_STUB/runs.json" ;;
+*/jobs) file="$GH_STUB/jobs-$id.json" ;;
+*/artifacts) file="$GH_STUB/artifacts-$id.json" ;;
+*/logs)
+	cat "$GH_STUB/log-$id.txt" 2>/dev/null
+	exit 0
+	;;
+*)
+	echo "gh stub: no answer for [$path]" >&2
+	exit 4
+	;;
+esac
+[ -f "$file" ] || { echo "gh stub: this case wrote no ${file##*/}" >&2; exit 4; }
+if [ -n "$q" ]; then jq -r "$q" "$file"; else cat "$file"; fi
+EOF
+	chmod +x "$w/bin/gh"
+	eval "$body"
+	given="${SEED_SHA256:-}"
+	[ "$given" != archive ] || given="$(sha_of "$archive")"
+	out="$(cd "$w" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" \
+		GH_STUB="$gh" GH_STUB_FAIL="${GH_STUB_FAIL:-0}" GITHUB_OUTPUT="$w/pick.out" \
+		GITHUB_REPOSITORY=cybermonklabs/oh-my-pi GITHUB_RUN_ID="${CASE_RUN_ID:-100}" \
+		RUNNER_TEMP="$w/temp" SEED_DIR="$dir" SEED_ARCHIVE="$archive" \
+		SEED_MODE="${SEED_MODE:-off}" SEED_SHA256="$given" \
+		SEED_NAME="${SEED_NAME:-sc-seed-linux}" SEED_JOB="${SEED_JOB:-build seed (Linux)}" \
+		bash --noprofile --norc "$seed_sh" pick 2>&1)"
+	pick_rc=$?
+	run="$(awk -F= '$1 == "run-id" { print $2 }' "$w/pick.out" 2>/dev/null)"
+	sum="$(awk -F= '$1 == "sha256" { print $2 }' "$w/pick.out" 2>/dev/null)"
+	reason="$(awk -F= '$1 == "reason" { print $2 }' "$w/pick.out" 2>/dev/null)"
+	out+=$'\n'"pick exit=$pick_rc outputs: run-id=[$run] sha256=[$sum] reason=[$reason]"
+	# The workflow downloads only when the pick names a run to download from.
+	[ -n "$run" ] || rm -f -- "$archive"
+	out+=$'\n'"$(cd "$w" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" \
+		RUNNER_TEMP="$w/temp" SEED_DIR="$dir" SEED_ARCHIVE="$archive" RC="$rcf" \
+		SEED_SHA256="$sum" SEED_REASON="$reason" SEED_RUN_ID="$run" \
+		bash --noprofile --norc "$seed_sh" use 2>&1)"
+	rc=$?
+	out+=$'\n'"$(sed 's/^/rc: /' "$rcf")"
+	out+=$'\n'"seed files: $( (cd "$dir" 2>/dev/null && find . -type f | LC_ALL=C sort | tr '\n' ' ') || echo none)"
+	[ "$pick_rc" = 0 ] || out+=$'\n'"the pick step failed with $pick_rc"
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+# The gh stub's answers for the auto search: `cut_runs <run>...` the runs of the
+# candidate branch, newest first; `cut_job <run> <job id> <conclusion> [name]`
+# that run's seed job; `cut_control <run> <seed job id> <conclusion>` that run
+# beside its cold control's job; `cut_log <job id> <sha256>` what the seed job
+# printed; `cut_artifact <run> <expired> [name]` its seed artifact.
+cut_runs() { printf '{"workflow_runs":[%s]}\n' "$(for r in "$@"; do printf '{"id":%s},' "$r"; done | sed 's/,$//')" >"$gh/runs.json"; }
+cut_job() { printf '{"jobs":[{"id":%s,"name":"%s","conclusion":"%s"}]}\n' "$2" "${4:-build seed (Linux)}" "$3" >"$gh/jobs-$1.json"; }
+cut_control() { printf '{"jobs":[{"id":%s,"name":"build seed (Linux)","conclusion":"success"},{"id":99,"name":"rust test results, seeded against cold","conclusion":"%s"}]}\n' "$2" "$3" >"$gh/jobs-$1.json"; }
+cut_log() { printf '2026-11-26T09:00:00.0000000Z GATESEED seed build exit=0 in 900 s\n2026-11-26T09:20:00.0000000Z GATESEED seed sha256=%s bytes=42 packed in 60 s, disk 10 KiB, repository 2 KiB\n' "$2" >"$gh/log-$1.txt"; }
+cut_artifact() { printf '{"artifacts":[{"id":9,"name":"%s","expired":%s}]}\n' "${3:-sc-seed-linux}" "$2" >"$gh/artifacts-$1.json"; }
+# G1, G2: the seed this run's own seed job built, taken and refused. G2 is the
+# planted mismatch: the bytes are not what the seed job published, so the job
+# builds cold, says so, and passes.
+SEED_MODE=build SEED_SHA256=archive NOT_MSG='::error|::warning' srun G1-build-seeded 0 '^GATESEED path=seeded reason=this-run-100 run=100 disk=[0-9]+ KiB' 'seed_archive "$archive"'
+SEED_MODE=build SEED_SHA256=archive NOT_MSG='::error' srun G1b-build-seeded-points-bazel-at-it 0 '^rc: common --disk_cache=.*/cache/disk$' 'seed_archive "$archive"'
+SEED_MODE=build SEED_SHA256=archive NOT_MSG='::error' srun G1c-build-seeded-unpacks-it 0 '^seed files: \./disk/ac/1 \./repo/2 $' 'seed_archive "$archive"'
+SEED_MODE=build SEED_SHA256=archive NOT_MSG='::error' srun G1d-build-scripts-outside-the-sandbox 0 '^rc: build --strategy=CargoBuildScriptRun=local$' 'seed_archive "$archive"'
+SEED_MODE=build SEED_SHA256=0000000000000000000000000000000000000000000000000000000000000000 NOT_MSG='::error|disk_cache' srun G2-build-sha256-mismatch-is-cold 0 '^GATESEED path=cold reason=sha256-mismatch' 'seed_archive "$archive"'
+SEED_MODE=build SEED_SHA256=0000000000000000000000000000000000000000000000000000000000000000 NOT_MSG='::error' srun G2b-mismatch-says-both-sums 0 '::warning title=Gate seed::the seed of run 100 has sha256 [0-9a-f]{64}, and its seed job gives 0{64}' 'seed_archive "$archive"'
+# Every path still runs every test.
+SEED_MODE=build SEED_SHA256=archive NOT_MSG='::error' srun G3-seeded-runs-every-test 0 '^rc: test --cache_test_results=no$' 'seed_archive "$archive"'
+NOT_MSG='::error|disk_cache' srun G4-off-is-cold 0 '^GATESEED path=cold reason=off run=none' ':'
+NOT_MSG='::error' srun G4b-cold-runs-every-test 0 '^rc: test --cache_test_results=no$' ':'
+# The cold path runs build scripts where the seed ran them, so that a cold run
+# and a seeded run of one commit differ in the cache and in nothing else.
+NOT_MSG='::error' srun G4c-cold-runs-build-scripts-where-the-seed-did 0 '^rc: build --strategy=CargoBuildScriptRun=local$' ':'
+# A seed job that gave no sha256 (it failed before packing), and a download
+# that did not land: cold, by name.
+SEED_MODE=build NOT_MSG='::error|disk_cache' srun G5-build-without-a-sha256-is-cold 0 '^GATESEED path=cold reason=no-seed-sha256' 'seed_archive "$archive"'
+SEED_MODE=build SEED_SHA256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef NOT_MSG='::error|disk_cache' srun G6-no-archive-is-cold 0 '^GATESEED path=cold reason=no-archive' ':'
+# The auto search: the newest cut run whose seed job passed, printed a sha256
+# and still has its artifact. G7's newest run has no seed job, so the one
+# before it is taken.
+SEED_MODE=auto SEED_SHA256='' NOT_MSG='::error|::warning' srun G7-auto-takes-the-newest-cut-seed 0 '^GATESEED path=seeded reason=cut-run-200 run=200' 'seed_archive "$archive"; cut_runs 300 200; cut_job 300 7 failure; cut_job 200 8 success; cut_log 8 "$(sha_of "$archive")"; cut_artifact 200 false; cut_artifact 300 false'
+SEED_MODE=auto NOT_MSG='::error' srun G7b-auto-says-which-run-it-skipped 0 '^GATESEED auto run 300: no \[build seed \(Linux\)\] job that passed$' 'seed_archive "$archive"; cut_runs 300 200; cut_job 300 7 failure; cut_job 200 8 success; cut_log 8 "$(sha_of "$archive")"; cut_artifact 200 false'
+SEED_MODE=auto NOT_MSG='::error|disk_cache' srun G8-auto-skips-an-expired-artifact 0 '^GATESEED path=cold reason=no-cut-seed' 'seed_archive "$archive"; cut_runs 200; cut_job 200 8 success; cut_log 8 "$(sha_of "$archive")"; cut_artifact 200 true'
+SEED_MODE=auto NOT_MSG='::error|disk_cache' srun G9-auto-skips-a-job-that-printed-no-sha256 0 'GATESEED auto run 200: job 8 printed no seed sha256' 'cut_runs 200; cut_job 200 8 success; : >"$gh/log-8.txt"; cut_artifact 200 false'
+# A seed whose bytes are what its job published, and that is not an archive:
+# the job builds cold rather than build on what it could not read.
+SEED_MODE=build SEED_SHA256=archive NOT_MSG='::error|disk_cache' srun G9b-an-archive-that-does-not-unpack-is-cold 0 '^GATESEED path=cold reason=unpack-failed' 'mkdir -p "$(dirname "$archive")"; printf "not an archive\n" >"$archive"'
+# A cut whose own cold control failed is a cut whose seed says nothing.
+SEED_MODE=auto NOT_MSG='::error|disk_cache' srun G9c-auto-skips-a-cut-whose-control-failed 0 'GATESEED auto run 200: its \[rust test results, seeded against cold\] job failed, so its seed is not read' 'seed_archive "$archive"; cut_runs 200; cut_job 200 8 success; cut_control 200 8 failure; cut_log 8 "$(sha_of "$archive")"; cut_artifact 200 false'
+SEED_MODE=auto NOT_MSG='::error|::warning' srun G9d-auto-takes-a-cut-whose-control-passed 0 '^GATESEED path=seeded reason=cut-run-200 run=200' 'seed_archive "$archive"; cut_runs 200; cut_job 200 8 success; cut_control 200 8 success; cut_log 8 "$(sha_of "$archive")"; cut_artifact 200 false'
+SEED_MODE=auto NOT_MSG='::error|disk_cache' srun G10-auto-with-no-cut-run-is-cold 0 '^GATESEED path=cold reason=no-cut-run' 'printf "{\"workflow_runs\":[]}\n" >"$gh/runs.json"'
+SEED_MODE=auto GH_STUB_FAIL=1 NOT_MSG='::error|disk_cache' srun G11-auto-search-failure-is-cold 0 '^GATESEED path=cold reason=run-search-failed' ':'
+SEED_MODE=auto GH_STUB_FAIL=1 NOT_MSG='::error|disk_cache' srun G11b-auto-search-failure-says-what-gh-said 0 '^GATESEED auto gh: gh: HTTP 403' ':'
+# A seed job of another operating system is not this job's seed.
+SEED_MODE=auto SEED_NAME=sc-seed-macos SEED_JOB='build seed (macOS)' NOT_MSG='::error|disk_cache' srun G12-auto-wants-its-own-seed-job 0 'GATESEED auto run 200: no \[build seed \(macOS\)\] job that passed' 'seed_archive "$archive"; cut_runs 200; cut_job 200 8 success "build seed (Linux)"; cut_log 8 "$(sha_of "$archive")"; cut_artifact 200 false sc-seed-linux'
+SEED_MODE=warm NOT_MSG='::error|disk_cache' srun G13-a-mode-that-is-no-mode-is-cold 0 '^GATESEED path=cold reason=unknown-mode' ':'
+
+# --- the seeded run against the cold one: rust-test-results-compare.sh ------------
+# zrun <name> <want> <message regex> <cold results> <seeded results> [<flaky targets>]:
+# the compare job's script on two results files, each line written as
+# `<target>|<test>|<final>|<per invocation>`; `none` writes no file and `empty`
+# an empty one. The flaky targets are written as `flaky: ` lines of a
+# known-failure list.
+compare_sh="${RUST_TEST_COMPARE_SH:-$repo/.github/sami/rust-test-results-compare.sh}"
+zrun() {
+	local name="$1" want="$2" msg="$3" w out rc side body
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/compare.XXXXXX")"
+	mkdir -p "$w/cold" "$w/seeded"
+	for side in cold seeded; do
+		body="$4"
+		[ "$side" = cold ] || body="$5"
+		case "$body" in
+		none) ;;
+		empty) : >"$w/$side/results.tsv" ;;
+		*) printf '%s\n' "$body" | tr '|' '\t' >"$w/$side/results.tsv" ;;
+		esac
+	done
+	{
+		echo '# known failures'
+		echo
+		[ -z "${6:-}" ] || printf '%s\n' "$6" | while read -r t n; do printf '%s %s  flaky: a race\n' "$t" "$n"; done
+	} >"$w/known-failures.txt"
+	out="$(bash --noprofile --norc "$compare_sh" "$w/cold" "$w/seeded" "$w/known-failures.txt" 2>&1)"
+	rc=$?
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+ZA="//crates/pi-diff:pi-diff_test|a::one|ok|main=ok
+//crates/pi-diff:pi-diff_test|a::two|ignored|main=ignored
+//crates/pi-builtins:pi-builtins_test|x::k1|failed|main=failed"
+NOT_MSG='::error' zrun Z1-the-same-results-pass 0 '^The seeded run.s results are the cold run.s, test by test\.$' "$ZA" "$ZA"
+NOT_MSG='::error' zrun Z1b-the-counts-are-named 0 '^Per-test results: 3 tests cold, 3 seeded, 3 in both; targets listed flaky: 0$' "$ZA" "$ZA"
+zrun Z2-a-status-that-differs-fails 1 'pi-diff_test a::one is ok in the cold run and failed in the seeded run' "$ZA" "//crates/pi-diff:pi-diff_test|a::one|failed|main=failed
+//crates/pi-diff:pi-diff_test|a::two|ignored|main=ignored
+//crates/pi-builtins:pi-builtins_test|x::k1|failed|main=failed"
+zrun Z3-a-test-only-the-seeded-run-ran-fails 1 'pi-diff_test a::three ran in the seeded run and in no invocation of the cold run' "$ZA" "$ZA
+//crates/pi-diff:pi-diff_test|a::three|ok|main=ok"
+zrun Z4-a-test-only-the-cold-run-ran-fails 1 'pi-diff_test a::three ran in the cold run and in no invocation of the seeded run' "$ZA
+//crates/pi-diff:pi-diff_test|a::three|ok|main=ok" "$ZA"
+# The attempts of a test whose target is listed flaky may differ; any other
+# test's may not.
+NOT_MSG='::error' zrun Z5-a-flaky-target-is-compared-by-its-final-status 0 'The seeded run.s results are the cold run.s' "//crates/pi-diff:pi-diff_test|a::one|ok|main=failed,main=ok" "//crates/pi-diff:pi-diff_test|a::one|ok|main=ok" "//crates/pi-diff:pi-diff_test a::one"
+zrun Z6-attempts-that-differ-elsewhere-fail 1 'pi-diff_test a::one is ok in both runs, and ran \[main=failed,main=ok\] cold and \[main=ok\] seeded' "//crates/pi-diff:pi-diff_test|a::one|ok|main=failed,main=ok" "//crates/pi-diff:pi-diff_test|a::one|ok|main=ok"
+zrun Z7-no-results-file-is-unknown 1 'UNKNOWN: .*/seeded/results.tsv is not there' "$ZA" none
+zrun Z8-an-empty-results-file-is-unknown 1 'UNKNOWN: .*/cold/results.tsv is empty' empty "$ZA"
+zrun Z9-a-line-that-is-no-result-is-unknown 1 'UNKNOWN: .*cold/results.tsv has a line that is not' "//crates/pi-diff:pi-diff_test|a::one|ok" "$ZA"
+zrun Z10-a-final-status-that-is-no-status-is-unknown 1 'UNKNOWN: .*cold/results.tsv has a line that is not' "//crates/pi-diff:pi-diff_test|a::one|flaky|main=ok" "$ZA"
+zrun Z11-a-test-named-twice-is-unknown 1 'UNKNOWN: .*seeded/results.tsv names a test twice' "$ZA" "$ZA
+//crates/pi-diff:pi-diff_test|a::one|ok|main=ok"
+zrun Z12-two-files-with-no-test-in-common-are-unknown 1 'UNKNOWN: no test of the cold run is a test of the seeded run' "//crates/pi-diff:pi-diff_test|a::one|ok|main=ok" "//crates/pi-diff:pi-diff_test|b::one|ok|main=ok"
+
+# --- the build seed's writer: gate-seed.sh build ----------------------------------
+# brun <name> <want> <message regex> <bazel exit code> [<body>]: the seed job's
+# step, with a bazelisk stub that checks what the seed must pass it, writes one
+# action into the disk cache and exits with that code. A case's output holds the
+# step's lines, what it wrote to the step's outputs, and the archive it left.
+brun() {
+	local name="$1" want="$2" msg="$3" code="$4" body="${5:-}" w out rc
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/seedbuild.XXXXXX")"
+	mkdir -p "$w/bin" "$w/temp"
+	local rcf="$w/bazel.rc" archive="$w/out/sc-seed.tar.zst" dir="$w/cache"
+	: >"$rcf"
+	cat >"$w/bin/bazelisk" <<EOF
+#!/usr/bin/env bash
+# The harness's bazelisk for the seed's writer.
+set -u
+args=("\$@")
+[ "\${args[0]#--bazelrc=}" != "\${args[0]}" ] || { echo "stub: bazelisk without --bazelrc" >&2; exit 2; }
+[ "\${args[1]}" = build ] || { echo "stub: bazelisk \${args[1]}, not build" >&2; exit 2; }
+case " \${args[*]} " in *" --keep_going "*) ;; *) echo "stub: the seed's build lacks --keep_going" >&2; exit 2 ;; esac
+case " \${args[*]} " in *" //crates/... "*) ;; *) echo "stub: the seed's build takes no pattern (\${args[*]})" >&2; exit 2 ;; esac
+rcf="\${args[0]#--bazelrc=}"
+grep -qF -- "--disk_cache=$dir/disk" "\$rcf" || { echo "stub: the fragment points at no disk cache" >&2; exit 2; }
+grep -qF -- "--repository_cache=$dir/repo" "\$rcf" || { echo "stub: the fragment points at no repository cache" >&2; exit 2; }
+grep -qF -- "--strategy=CargoBuildScriptRun=local" "\$rcf" || { echo "stub: the seed runs build scripts in the sandbox" >&2; exit 2; }
+mkdir -p "$dir/disk/ac" "$dir/repo"
+echo "an action's output" >"$dir/disk/ac/1"
+exit $code
+EOF
+	chmod +x "$w/bin/bazelisk"
+	[ -z "$body" ] || eval "$body"
+	out="$(cd "$w" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" GITHUB_OUTPUT="$w/build.out" RUNNER_TEMP="$w/temp" \
+		SEED_DIR="$dir" SEED_ARCHIVE="$archive" OMP_BAZEL_RC="$rcf" \
+		bash --noprofile --norc "$seed_sh" build //crates/... 2>&1)"
+	rc=$?
+	out+=$'\n'"step outputs: $(tr '\n' ' ' <"$w/build.out" 2>/dev/null)"
+	if [ -f "$archive" ]; then
+		# The number the step published must be the archive's own, in its log and
+		# in its output, not a number of the right shape: every reader checks the
+		# bytes it downloads against it.
+		local real said logged
+		real="$(sha_of "$archive")"
+		said="$(awk -F= '$1 == "sha256" { print $2 }' "$w/build.out" 2>/dev/null)"
+		logged="$(printf '%s\n' "$out" | sed -n 's/.*GATESEED seed sha256=\([0-9a-f]*\) .*/\1/p' | tail -n 1)"
+		if [ "$real" = "$said" ] && [ "$real" = "$logged" ]; then
+			out+=$'\n'"published-matches: yes (sha256 $real)"
+		else
+			out+=$'\n'"published-matches: no (the archive is $real, the step published [$said] and logged [$logged])"
+		fi
+		out+=$'\n'"archive: unpacks [$(zstd -d -q -c "$archive" | tar -tf - | LC_ALL=C sort | tr '\n' ' ')]"
+	else
+		out+=$'\n'"archive: none"
+		out+=$'\n'"published-matches: no archive"
+	fi
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+# The writer packs what the build left and publishes that archive's own sha256,
+# which every reader checks the bytes it downloads against.
+NOT_MSG='::error|::warning' brun G14-the-writer-publishes-the-archives-sha256 0 '^GATESEED seed sha256=([0-9a-f]{64}) bytes=[0-9]+ packed in [0-9]+ s, disk [0-9]+ KiB, repository [0-9]+ KiB$' 0
+NOT_MSG='::error|::warning' brun G14b-the-sha256-it-publishes-is-the-archives 0 '^published-matches: yes \(sha256 [0-9a-f]{64}\)$' 0
+NOT_MSG='::error|::warning' brun G14c-the-writer-packs-both-caches 0 '^archive: unpacks \[disk/ disk/ac/ disk/ac/1 repo/ \]$' 0
+# A target that did not build leaves a seed of what did, with a warning; bazel
+# itself failing leaves no seed at all.
+brun G15-a-target-that-did-not-build-still-seeds 0 '::warning title=Gate seed::a target did not build \(bazel exited 1\)' 1
+brun G16-bazel-failing-publishes-no-seed 37 '::error title=Gate seed::bazel build exited 37' 37
+NOT_MSG='sha256=' brun G16b-no-archive-when-bazel-failed 37 '^archive: none$' 37
+
+# --- the build seed is the gate's, and it is no cache -----------------------------
+# seed_lint <sami-build.yml> <sami-checks.yml>: the seed belongs to the gate's
+# jobs, and it is an artifact, never a GitHub Actions cache entry.
+#   - No job of sami-build.yml names it: release_binary, attest, publish and
+#     release_cache_prune build and publish the release, and none of them may
+#     read bytes a gate run produced. A comment may say the word; a line that
+#     is not a comment may not.
+#   - sami-checks.yml keeps the workflow-level cache-mode: none, no job of it
+#     sets another and no job has an actions/cache step, so neither a seed job
+#     nor a gate job holds a cache token; and each call of sami-rust-test.yml
+#     passes cache-mode: none on, since a called workflow takes the caller's.
+#   - Each seed artifact is kept 3 days: a seed that outlived its cut is bytes
+#     nobody would check against a live seed job's log.
+seed_lint() {
+	local build="$1" checks="$2" rc=0 names jobs bad job modes steps seeds n calls="" dup
+	names="$(awk '!/^[[:space:]]*#/ && (/sc-seed/ || /gate-seed/ || /GATESEED/ || /seed-sha256/ || /SEED_/) { print FNR ": " $0 }' "$build")"
+	if [ -n "$names" ]; then
+		echo "sami-build.yml names the gate's build seed, which no job that builds or publishes the release may read: $(printf '%s\n' "$names" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+		rc=1
+	else
+		echo "sami-build.yml: no line outside a comment names the gate's build seed"
+	fi
+	if ! grep -qxE 'cache-mode: *none' "$checks"; then
+		echo "$checks has no workflow-level cache-mode: none"
+		rc=1
+	fi
+	jobs="$(awk '/^jobs:$/ { on = 1; next } on && /^[^ #]/ { exit } on && /^  [A-Za-z_][A-Za-z0-9_-]*:$/ { sub(/^  /, ""); sub(/:$/, ""); print }' "$checks")"
+	bad="$(awk '/^jobs:$/ { on = 1; next } on && /^[^ #]/ { exit } on && /^  [^ #]/ && !/^  [A-Za-z_][A-Za-z0-9_-]*:$/' "$checks")"
+	if [ -n "$bad" ]; then
+		echo "UNKNOWN: $checks has a job line this lint cannot read: $bad"
+		return 1
+	fi
+	for job in seed-linux seed-macos rust-test rust-test-macos rust-test-cold; do
+		printf '%s\n' "$jobs" | grep -qxF "$job" || { echo "UNKNOWN: $checks has no $job job"; return 1; }
+	done
+	for job in $jobs; do
+		awk -v j="  $job:" '$0 == j { on = 1; next } on && (/^  [A-Za-z_][A-Za-z0-9_-]*:$/ || /^[^ #]/) { exit } on' "$checks" >"$scratch/seed-job.yml"
+		modes="$(grep -vE '^ *#' "$scratch/seed-job.yml" | grep -F 'cache-mode' | grep -vxF '    cache-mode: none' || true)"
+		if [ -n "$modes" ]; then
+			echo "$job has a cache-mode line other than [    cache-mode: none]: $(printf '%s\n' "$modes" | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+			rc=1
+		fi
+		if grep -vE '^ *#' "$scratch/seed-job.yml" | grep -qE 'uses: *actions/cache'; then
+			echo "$job has an actions/cache step"
+			rc=1
+		fi
+		if grep -qF 'uses: ./.github/workflows/sami-rust-test.yml' "$scratch/seed-job.yml"; then
+			if ! grep -qxF '    cache-mode: none' "$scratch/seed-job.yml"; then
+				echo "$job calls the Rust gate's workflow without cache-mode: none, so its jobs would take this run's mode"
+				rc=1
+			fi
+			calls="$calls$(awk '/^      job: / { j = $2 } /^      control: / { c = $2 }
+				END { printf "%s/control=%s", (j == "" ? "none" : j), (c == "" ? "false" : c) }' "$scratch/seed-job.yml")"$'\n'
+		fi
+	done
+	steps="$(awk '/^      - / { if (s != "") print s; s = "" } { s = s $0 "\\n" } END { if (s != "") print s }' "$checks")"
+	seeds="$(printf '%s\n' "$steps" | grep -F 'name: sc-seed-' || true)"
+	n="$(printf '%s' "$seeds" | grep -c . || true)"
+	if [ "$n" != 2 ]; then
+		echo "UNKNOWN: $checks has $n steps naming a sc-seed- artifact, not the two seed uploads"
+		return 1
+	fi
+	# Each step is one line with its own lines joined by a literal \n, so the
+	# day count ends at that separator: `retention-days: 30` is not 3.
+	if printf '%s\n' "$seeds" | grep -vE 'retention-days: 3\\n' | grep -q .; then
+		echo "a seed artifact is not kept 3 days: $(printf '%s\n' "$seeds" | grep -vE 'retention-days: 3\\n' | sed 's/\\n/ /g' | awk '{ printf "%s[%s]", (NR > 1 ? " " : ""), $0 }')"
+		rc=1
+	fi
+	# Two calls of the Rust gate's workflow in one run upload the artifacts of the job they ask
+	# for, so each call's (job, control) pair must be its own: two calls with one pair make one
+	# upload fail, and leave the drift check reading whichever listing landed first.
+	dup="$(printf '%s' "$calls" | grep -v '^$' | LC_ALL=C sort | LC_ALL=C uniq -d || true)"
+	if [ -n "$dup" ]; then
+		echo "two jobs call the Rust gate's workflow with one job and control: $(printf '%s\n' "$dup" | tr '\n' ' '); their artifacts would share a name"
+		rc=1
+	fi
+	if [ "$rc" = 0 ]; then
+		echo "sami-checks.yml: cache-mode none, and no job sets another or has an actions/cache step; each call of the Rust gate passes none on; both seed artifacts are kept 3 days; its calls of the Rust gate are $(printf '%s' "$calls" | grep -v '^$' | tr '\n' ' ')"
+	fi
+	return "$rc"
+}
+# ylint <name> <want> <message regex> <sed for sami-build.yml> <sed for sami-checks.yml>
+ylint() {
+	local name="$1" want="$2" msg="$3" w out rc
+	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
+	w="$(mktemp -d "$scratch/ylint.XXXXXX")"
+	sed -e "${4:-p;d}" "$repo/.github/workflows/sami-build.yml" >"$w/sami-build.yml"
+	sed -e "${5:-p;d}" "$repo/.github/workflows/sami-checks.yml" >"$w/sami-checks.yml"
+	out="$(seed_lint "$w/sami-build.yml" "$w/sami-checks.yml" 2>&1)"
+	rc=$?
+	verdict "$name" "$want" "$rc" "$msg" "$out"
+}
+NOT_MSG='UNKNOWN' ylint Y1-the-release-reads-no-seed 0 'sami-build.yml: no line outside a comment names the gate.s build seed'
+ylint Y2-release-binary-downloads-a-seed 1 'sami-build.yml names the gate.s build seed.*name: sc-seed-linux' 's|^      - name: Restore the release build cache$|      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093\n        with:\n          name: sc-seed-linux\n&|'
+ylint Y3-publish-downloads-a-seed 1 'sami-build.yml names the gate.s build seed.*pattern: sc-seed' 's|^          pattern: mise-\*$|          pattern: sc-seed-*|'
+NOT_MSG='UNKNOWN' ylint Y4-the-checks-run-holds-no-cache-token 0 'sami-checks.yml: cache-mode none, and no job sets another'
+ylint Y5-a-seed-job-with-a-cache-mode 1 'seed-linux has a cache-mode line other than \[    cache-mode: none\]: \[    cache-mode: read\]' '' 's/^  seed-linux:$/&\n    cache-mode: read/'
+ylint Y6-a-gate-call-without-cache-mode 1 'rust-test calls the Rust gate.s workflow without cache-mode: none' '' '/^  rust-test:$/,/^  rust-test-macos:$/{/^    cache-mode: none$/d;}'
+ylint Y7-the-checks-workflow-cache-mode 1 'has no workflow-level cache-mode: none' '' 's/^cache-mode: none$/cache-mode: read/'
+ylint Y8-a-seed-job-with-a-cache-step 1 'seed-macos has an actions/cache step' '' 's|^  seed-macos:$|&\n    steps:\n      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830|'
+ylint Y9-a-seed-artifact-kept-longer 1 'a seed artifact is not kept 3 days' '' '/^  seed-linux:$/,/^  seed-macos:$/s/^          retention-days: 3$/          retention-days: 30/'
+ylint Y10-a-seed-upload-renamed 1 'UNKNOWN: .*has 1 steps naming a sc-seed- artifact, not the two seed uploads' '' 's/^          name: sc-seed-macos$/          name: seed-macos/'
+# The harness runs on macOS too, whose sed reads `d}` as one word: the ; is for it.
+ylint Y11-two-gate-calls-with-one-job-and-control 1 'two jobs call the Rust gate.s workflow with one job and control: linux/control=false' '' '/^  rust-test-cold:$/,/^  rust-test-compare:$/{/^      control: true$/d;}'
+NOT_MSG='UNKNOWN' ylint Y12-the-calls-are-named 0 'its calls of the Rust gate are linux/control=false macos/control=false linux/control=true'
 
 echo "rust_test job scripts: $pass passed, $fail failed, $skip skipped"
 [ "$fail" = 0 ] && [ "$pass" -gt 0 ]

@@ -840,11 +840,20 @@ pub fn cond_test(
 				vp.status = 2;
 				break;
 			},
+			// An arithmetic subscript error (`[[ -v a[1/0] ]]`,
+			// `[[ a[1/0] -eq 1 ]]`) is bash's `array_expand_index`:
+			// `top_level_cleanup`, then `jump_to_top_level (DISCARD)`.
+			Err(Fail::Discard(d) | Fail::Arith(d)) if cleanup_jump(vp, &d) => {
+				report(k, cx, vp, line, chunks);
+				k.diag(cx, vp, line, d);
+				let flow = Flow::DiscardTop(1);
+				jump_out(k, cx, vp, true, &flow);
+				return flow;
+			},
 			Err(Fail::Discard(d)) => {
 				report(k, cx, vp, line, chunks);
-				let cleanup = cleanup_jump(vp, &d);
 				k.diag(cx, vp, line, d);
-				jump_out(k, cx, vp, cleanup, &Flow::Discard(1));
+				jump_out(k, cx, vp, false, &Flow::Discard(1));
 				return Flow::Discard(1);
 			},
 			Err(Fail::Arith(d)) => {

@@ -1014,63 +1014,67 @@ fn a_child_of_an_eval_or_a_substitution_counts_as_inside_it() {
 	]);
 }
 
-/// pi-shell goes on after an arithmetic subscript error in `eval`, `.`,
-/// `[[ ]]` and a `{var}>` redirection, where bash leaves the whole line (it
-/// ends a `-c` string, and in a script drops the rest of the line). Where a
-/// `time` goes on that way, its report counts from its own start.
+/// An arithmetic subscript error leaves the whole line, also through
+/// `eval`, `.`, `[[ ]]` and a `{var}>` redirection: under `-c` the string
+/// ends and every `time` in it is dropped unreported; in a script each of
+/// the script's own `time`s reports, counting from its own start (the shell
+/// slept 2.2 s before it), and the rest of the line is dropped.
 #[test]
-fn a_time_that_goes_on_counts_from_its_own_start() {
+fn a_scripts_own_time_left_by_a_subscript_error_counts_from_its_start() {
 	const ERR: &str = "SH: 1/0: division by 0 (error token is \"0\")\n";
-	let after = format!("{ERR}[short]\nnext\n");
-	let fd = format!("{ERR}SH: a[1/0]: cannot assign fd to variable\n[short]\nnext\n");
-	let group = format!("{ERR}in\n[short]\nnext\n");
-	let nested = format!("{ERR}[short]\nin\n[short]\nnext\n");
-	assert_rows(&[
+	let once = format!("{ERR}[short]\n");
+	let twice = format!("{ERR}[short]\n[short]\n");
+	assert_rows_by_mode(&[
 		(
 			"eval let",
 			"sleep 2.2; TIMEFORMAT='[T%0R]'; time eval 'let \"a[1/0]=1\"'; echo next",
-			&after,
-			0,
+			(ERR, 1),
+			(once.as_str(), 1),
 		),
 		(
 			"eval expansion",
 			"sleep 2.2; TIMEFORMAT='[T%0R]'; time eval 'echo ${a[1/0]}'; echo next",
-			&after,
-			0,
+			(ERR, 1),
+			(once.as_str(), 1),
 		),
-		("[[ ]]", "sleep 2.2; TIMEFORMAT='[T%0R]'; time [[ a[1/0] -eq 1 ]]; echo next", &after, 0),
+		(
+			"[[ ]]",
+			"sleep 2.2; TIMEFORMAT='[T%0R]'; time [[ a[1/0] -eq 1 ]]; echo next",
+			(ERR, 1),
+			(once.as_str(), 1),
+		),
 		(
 			"fd variable",
 			"sleep 2.2; TIMEFORMAT='[T%0R]'; time : {a[1/0]}>/dev/null; echo next",
-			&fd,
-			0,
+			(ERR, 1),
+			(once.as_str(), 1),
 		),
 		(
 			".",
 			"printf 'let \"a[1/0]=1\"\\n' > f; sleep 2.2; TIMEFORMAT='[T%0R]'; time . ./f; echo next",
-			&after,
-			0,
+			(ERR, 1),
+			(once.as_str(), 1),
 		),
 		(
 			"group",
 			"sleep 2.2; TIMEFORMAT='[T%0R]'; time { eval 'a[1/0]=v'; echo in; }; echo next",
-			&group,
-			0,
+			(ERR, 1),
+			(once.as_str(), 1),
 		),
 		(
 			"nested",
 			"sleep 2.2; TIMEFORMAT='[T%0R]'; time { time eval 'let \"a[1/0]=1\"'; echo in; }; echo \
 			 next",
-			&nested,
-			0,
-		),
-		(
-			"no error",
-			"sleep 2.2; TIMEFORMAT='[T%0R]'; time { echo in; }; echo next",
-			"in\n[short]\nnext\n",
-			0,
+			(ERR, 1),
+			(twice.as_str(), 1),
 		),
 	]);
+	assert_rows(&[(
+		"no error",
+		"sleep 2.2; TIMEFORMAT='[T%0R]'; time { echo in; }; echo next",
+		"in\n[short]\nnext\n",
+		0,
+	)]);
 }
 
 /// An error of an array subscript's own text (a `$(( ))` in it) is not a
@@ -1737,17 +1741,18 @@ fn an_empty_key_stops_a_compound_value() {
 	]);
 }
 
-/// In posix mode an integer variable's bad value discards the command and
-/// the script's next line runs: bash's `make_variable_value` jumps before
-/// the assignment can fail and exit (variables.c:2944). Only the script
-/// mode is asserted: under `-c` bash ends the whole string after its
-/// `top_level_cleanup`, which pi-shell does not yet do (the whole-line
-/// discard of #256).
+/// In posix mode an integer variable's bad value discards the command:
+/// bash's `make_variable_value` jumps before the assignment can fail and
+/// exit (variables.c:2944). A script's next line runs; under `-c` the
+/// whole string ends after the `top_level_cleanup`, with status 1.
 #[test]
 fn an_integer_value_error_in_posix_mode_discards_the_line() {
-	let got = run("set -o posix; declare -i n; n=1/0\necho after", Mode::Script);
-	let want = "SH: 1/0: division by 0 (error token is \"0\")\nafter\n";
-	assert_eq!(got, (want.to_owned(), Some(0)), "script mode");
+	const ERR: &str = "SH: 1/0: division by 0 (error token is \"0\")\n";
+	let script = "set -o posix; declare -i n; n=1/0\necho after";
+	let got = run(script, Mode::Script);
+	assert_eq!(got, (format!("{ERR}after\n"), Some(0)), "script mode");
+	let got = run(script, Mode::C);
+	assert_eq!(got, (ERR.to_owned(), Some(1)), "-c mode");
 }
 
 /// `break` or `continue` with a count that is not a number runs bash's

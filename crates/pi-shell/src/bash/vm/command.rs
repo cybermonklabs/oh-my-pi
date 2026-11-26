@@ -20,9 +20,9 @@ use super::{
 	expand::{CompoundElem, Expander, Stop, compound_text},
 	probe::{self, Search, absolute, candidates},
 	proc::{
-		AssignValue, Awaited, BangStage, BusySpawn, DeferPhase, ExecAs, ExecState, Frame, FrameKind,
-		JobState, Live, PathSearch, PendingWrite, Prefix, Probe, ProbeResult, Scratch, ScriptKind,
-		Slot, Stage, Target, Transfer, Vproc,
+		AssignValue, Awaited, BangStage, BusySpawn, CommandName, DeferPhase, ExecAs, ExecState,
+		Frame, FrameKind, JobState, Live, PathSearch, PendingWrite, Prefix, Probe, ProbeResult,
+		Scratch, Slot, Stage, Target, Transfer, Vproc,
 	},
 	state::{self, Level, Scope, Var, VarMap},
 	xtrace,
@@ -211,12 +211,15 @@ pub fn exec(
 	// A resumed command (after a block or a called frame) leaves the clock
 	// alone: a block ended the slice (`run_slice` starts stale), and a called
 	// frame's ops kept it current, so a `FuncExit` shares the reading of the
-	// function's last `CmdEnd`.
+	// function's last `CmdEnd`. A vproc deciding a job's pid for which
+	// `kill` holds signals ([`Kernel::holds`]) takes the stages, where it
+	// decides: the fast paths would run its command first.
 	if vp
 		.frames
 		.last()
 		.and_then(|f| f.scratch.as_ref())
 		.is_none_or(|s| s.exec.is_none())
+		&& (k.bangs.is_empty() || !k.holds(vp.vpid))
 		&& let Some(flow) = assignment_statement(k, vp, cx, unit, op, line)
 			.or_else(|| plain_statement(k, vp, cx, unit, op, line))
 	{
@@ -258,7 +261,18 @@ pub fn exec(
 		let stage = st(vp).stage;
 		match stage {
 			Stage::Expand => {
+				let queued = vp.out.len();
 				if let Some(flow) = expand(k, vp, cx, unit, op, line) {
+					// An expansion error ends the command: a job still deciding its
+					// pid takes the signals `kill` held for it first, and its error
+					// waits for the expansion to run again if it lives on.
+					if matches!(flow, Flow::Discard(_) | Flow::Exit(..) | Flow::Abort(_))
+						&& !k.bangs.is_empty()
+						&& k.take_held(vp.vpid)
+					{
+						vp.out.truncate(queued);
+						return Flow::Block(WaitKey::Signal);
+					}
 					return flow;
 				}
 			},
@@ -275,7 +289,32 @@ pub fn exec(
 				s.stage = Stage::Finish;
 			},
 			Stage::Redirect => {
+				// A take-in builtin (`jobs`, `fg`, `bg`, `disown`) resolves its
+				// job states ([`take_in_before_redirect`]) before its
+				// redirections are applied: a snapshot while it waits for the
+				// answer then strands no redirect to a host file, which a
+				// restore would lose (the builtin writing to that fd on resume
+				// fails with EBADF). The builtin repeats the take-in, answered,
+				// after it dispatches.
+				if let Some(flow) = take_in_before_redirect(k, vp) {
+					return flow;
+				}
 				if let Some(list) = cmd.redirs {
+					// A job still deciding its pid takes the signals `kill` held
+					// for it before it opens anything, as bash's child has them
+					// before its redirections: it is known by its virtual pid
+					// then, and a `kill -KILL` leaves no file behind.
+					if !k.bangs.is_empty() && k.take_held(vp.vpid) {
+						return Flow::Block(WaitKey::Signal);
+					}
+					// bash looks a stage's command up before its redirections and
+					// drops the stage's job list there for a builtin other than
+					// `jobs`, or a function ([`stage_command_runs`]): a
+					// substitution in such a command's redirection sees no job,
+					// one in an external's does.
+					if vp.jobs.stage_words && stage_runs_in_shell(k, cx, vp) {
+						stage_command_runs(vp, false);
+					}
 					// Opens: `CmdExpanded` reads the clock after them.
 					k.clock_stale();
 					// Redirections do not see the command's temporary
@@ -435,7 +474,12 @@ pub fn exec(
 								s.control = Some(Transfer::Exit(1, exec::Jump::Errexit));
 							}
 							// The message goes to stderr as the redirections so far
-							// left it (`2>&1 >&bad`), before they are undone.
+							// left it (`2>&1 >&bad`), before they are undone; after
+							// the signals `kill` held for a job still deciding its
+							// pid, which has no program now.
+							if !k.bangs.is_empty() && k.take_held(vp.vpid) {
+								return Flow::Block(WaitKey::Signal);
+							}
 							if let Some(fd) = exec::flush_out(k, vp) {
 								return Flow::Block(WaitKey::Write { fd });
 							}
@@ -487,7 +531,9 @@ pub fn exec(
 					.iter()
 					.any(|d| d.vproc == vp.vpid && d.phase == DeferPhase::Lookup) =>
 			{
-				deferred_resolved(k, vp);
+				if deferred_resolved(k, vp) {
+					return Flow::Block(WaitKey::Signal);
+				}
 			},
 			Stage::Dispatch => {
 				if matches!(st(vp).target, Some(Target::Intrinsic(_))) {
@@ -508,12 +554,23 @@ pub fn exec(
 				}
 			},
 			Stage::Output => {
+				// A job still deciding its pid takes the signals `kill` held for it
+				// before it writes what it queued: a signal that ends it takes that
+				// output with it, and another lets it write it and go on.
+				if !k.bangs.is_empty() && k.take_held(vp.vpid) {
+					return Flow::Block(WaitKey::Signal);
+				}
 				if let Some(flow) = write_out(k, vp, cx, line) {
 					return flow;
 				}
 				st(vp).stage = Stage::Finish;
 			},
 			Stage::Finish => {
+				// No program ran (no words, or a redirection failed): a job still
+				// deciding its pid takes the signals `kill` held for it first.
+				if !k.bangs.is_empty() && k.take_held(vp.vpid) {
+					return Flow::Block(WaitKey::Signal);
+				}
 				k.forget_deferral(vp.vpid);
 				// A command bash forks for made its `{var}`s in its fork: once
 				// it has run, the shell keeps none (its temporary scope hidden,
@@ -594,6 +651,8 @@ fn assignment_statement(
 			return Some(assign_failed(k, vp, cx, line, d));
 		}
 	}
+	// A simple command ended (bash's `execute_null_command`).
+	vp.command_name = None;
 	vp.status = 0;
 	vp.pipestatus.clear();
 	vp.pipestatus.push(0);
@@ -601,10 +660,12 @@ fn assignment_statement(
 }
 
 /// A failed assignment statement: bash reports it and abandons the rest of
-/// the command line; a posix shell exits ([`exec::jump_out`]: an
-/// arithmetic subscript error's jump comes after `top_level_cleanup`).
-/// Under `set -e` a readonly variable or a bad subscript exits at once
-/// ([`exec::report_error_exits`]).
+/// the command line; a posix shell exits. An arithmetic error in a
+/// subscript (`a[1/0]=v`, bash's `array_expand_index`) or in an integer
+/// variable's value (`x=1/0`, `make_variable_value`) runs
+/// `top_level_cleanup`, then `jump_to_top_level (DISCARD)`
+/// ([`Flow::DiscardTop`]), in posix mode too. Under `set -e` a readonly
+/// variable or a bad subscript exits at once ([`exec::report_error_exits`]).
 fn assign_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: Diag) -> Flow {
 	if exec::report_error_exits(k, cx, vp, &d) {
 		let status = exec::report_error_status(vp, &d);
@@ -612,19 +673,18 @@ fn assign_failed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, d: 
 		return Flow::Exit(status, exec::Jump::Direct);
 	}
 	// An integer variable's value that is no valid arithmetic (`local -i n;
-	// n=1/0`): bash's `make_variable_value` runs `top_level_cleanup` and
-	// discards the command whatever the level, also in posix mode, where the
-	// assignment never comes back to exit (variables.c:2944). Its error is
-	// the only arithmetic one an assignment returns: one in the value's
-	// expansion stops before it, a subscript's is `ArithSubscript`.
-	let integer =
-		matches!(d, Diag::Arith { .. }) && vp.mode.dialect() != crate::bash::ids::Dialect::Zsh;
-	let cleanup = integer || exec::cleanup_jump(vp, &d);
+	// n=1/0`) is `Diag::ArithValue`: bash's `make_variable_value` runs
+	// `top_level_cleanup` and discards the command whatever the level, also
+	// in posix mode, where the assignment never comes back to exit
+	// (variables.c:2944).
+	let cleanup = exec::cleanup_jump(vp, &d);
 	k.diag(cx, vp, line, d);
-	let flow = if !integer
-		&& state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix).unwrap_or(false)
+	let flow = if cleanup {
+		Flow::DiscardTop(1)
+	} else if state::option(&mut k.root, cx.store, vp, crate::bash::store::OptId::Posix)
+		.unwrap_or(false)
 	{
-		Flow::Exit(1, exec::top_level_jump(cx, vp, cleanup))
+		Flow::Exit(1, exec::top_level_jump(cx, vp, false))
 	} else {
 		Flow::Discard(1)
 	};
@@ -767,6 +827,8 @@ fn plain_statement(
 	};
 	if let (Ok(outcome), Ok(())) = (&res, &written) {
 		state::drop_scope(&mut k.root, cx.store, vp);
+		// A simple command ended: bash's `this_command_name` is empty.
+		vp.command_name = None;
 		vp.status = outcome.status;
 		vp.pipestatus.clear();
 		vp.pipestatus.push(outcome.status);
@@ -876,14 +938,13 @@ fn write_now(
 /// wait resolved ([`super::proc::Deferral`]): an external gets the rest of
 /// them to apply itself ([`DeferPhase::Collect`]); anything else keeps the
 /// job's virtual pid and opens them here ([`DeferPhase::Resume`]). The
-/// redirection stage resumes either way.
+/// redirection stage resumes either way, after the signals `kill` held for
+/// the job when it keeps its virtual pid (whether there are any).
 #[cold]
 #[inline(never)]
-fn deferred_resolved(k: &mut Kernel, vp: &mut Vproc) {
+fn deferred_resolved(k: &mut Kernel, vp: &mut Vproc) -> bool {
 	let external = matches!(st(vp).target, Some(Target::External(_)));
-	if !external {
-		k.settle_bang(vp.vpid, None);
-	}
+	let held = !external && k.settle_bang(vp.vpid, None);
 	if let Some(d) = k.deferral(vp.vpid) {
 		d.phase = if external {
 			DeferPhase::Collect
@@ -892,6 +953,7 @@ fn deferred_resolved(k: &mut Kernel, vp: &mut Vproc) {
 		};
 	}
 	st(vp).stage = Stage::Redirect;
+	held
 }
 
 /// bash expands the redirections of a program it runs (an external, or a
@@ -945,7 +1007,8 @@ fn expand(
 		pool_words(&mut pool, &mut argv);
 		// One slot per word (a recycled vector has them already): a first
 		// push would reserve four, 72 bytes of slack in every parked
-		// one-word command (idle vproc ≤ 2 KiB). Splitting grows it.
+		// one-word command (idle vproc ≤ 2,048 B back to back). Splitting grows
+		// it.
 		argv.reserve_exact(words.len());
 		compound.clear();
 		globs.clear();
@@ -1261,12 +1324,16 @@ fn expand(
 				continue;
 			}
 		}
-		// A prefix assignment's value takes the visible variable's attributes
-		// (`-i`, case conversion) and `+=`.
+		// A prefix assignment's value as the command's environment holds it
+		// ([`builtins::prefix_value`]).
 		let value = match (assign_only, &index, value) {
 			(false, None, AssignValue::Scalar(raw)) => {
 				match builtins::prefix_value(k, cx, vp, &name, &raw, append) {
 					Ok(converted) => AssignValue::Scalar(converted),
+					// `x+=1/0 cmd` with an integer `x` abandons the line.
+					Err(diag) if exec::cleanup_jump(vp, &diag) => {
+						return Some(assign_failed(k, vp, cx, line, diag));
+					},
 					Err(diag) => {
 						k.diag(cx, vp, line, diag);
 						// bash does not run the command.
@@ -1379,8 +1446,12 @@ fn expand(
 		} else {
 			trace(k, vp, cx, unit, &cmd.assigns, line);
 		}
-		// Out before the command's redirections move stderr.
-		if let Some(fd) = exec::flush_out(k, vp) {
+		// Out before the command's redirections move stderr; a job holding
+		// signals `kill` sent it writes it only once it took them
+		// (`Kernel::take_held`, before its redirections), if it lives on.
+		if (k.bangs.is_empty() || !k.holds(vp.vpid))
+			&& let Some(fd) = exec::flush_out(k, vp)
+		{
 			return Some(Flow::Block(WaitKey::Write { fd }));
 		}
 	}
@@ -2187,15 +2258,16 @@ fn lookup(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, typeset: bool
 					return Some(Flow::Discard(1));
 				},
 			};
+			// `builtin …` is a builtin other than `jobs` to bash, which drops a
+			// stage's job list before it runs it, and so the command it names
+			// ([`stage_command_runs`]). `command …` is not: `command jobs | cat`
+			// lists the jobs (measured), so the command it names decides.
+			if matches!(resolved, Resolved::Intrinsic(IntrinsicId::Builtin)) {
+				stage_command_runs(vp, false);
+			}
 			let ExecState { argv, arrayref, .. } = st(vp);
 			match resolved {
-				Resolved::Intrinsic(IntrinsicId::Command)
-					if argv.len() > 1
-						&& argv[1..]
-							.iter()
-							.find(|a| !matches!(a.as_slice(), b"-p" | b"--"))
-							.is_some_and(|a| !a.starts_with(b"-")) =>
-				{
+				Resolved::Intrinsic(IntrinsicId::Command) if command_names(argv).is_some() => {
 					argv.remove(0);
 					shift_arrayref(arrayref);
 					while argv.len() > 1 && matches!(argv[0].as_slice(), b"-p" | b"--") {
@@ -2480,15 +2552,92 @@ fn prefix_var(value: &AssignValue) -> Var {
 	}
 }
 
+/// A pipeline stage's simple command expanded its words with its shell's
+/// job list ([`super::proc::JobTable::stage_words`]) and now runs (`jobs`:
+/// it is the `jobs` builtin): bash's child drops the list there
+/// (`execute_subshell_builtin_or_function`'s `without_job_control`), but for
+/// the `jobs` builtin (`kill_current_pipeline` instead). An external
+/// command replaces bash's child, so dropping the list there too is the
+/// same.
+fn stage_command_runs(vp: &mut Vproc, jobs: bool) {
+	if std::mem::take(&mut vp.jobs.stage_words) && !jobs {
+		let table = &mut vp.jobs;
+		table.list.clear();
+		table.current = None;
+		table.previous = None;
+		table.chld = 0;
+		table.bgp = None;
+	}
+}
+
+/// Where `command [-p | --]… NAME …` names the command it runs: the index
+/// of NAME in `argv` (`argv[0]` is `command`) and whether a `-p` came
+/// before it. `None` when `command` runs as itself: no NAME, or an option
+/// such as `-v` before it.
+fn command_names(argv: &[BString]) -> Option<(usize, bool)> {
+	let rest = argv.get(1..)?;
+	let at = rest
+		.iter()
+		.position(|a| !matches!(a.as_slice(), b"-p" | b"--"))?;
+	(!rest[at].starts_with(b"-")).then(|| (at + 1, rest[..at].iter().any(|a| a.as_slice() == b"-p")))
+}
+
+/// Whether the expanded command of `vp` is a function or a builtin other
+/// than `jobs` (`builtin` is one), as the lookup will find it: what bash
+/// runs in the stage's child itself, after `without_job_control`. Like the
+/// lookup, it looks through `command` to the name it runs, never a
+/// function (measured: `command jobs 2>/dev/null | cat` lists the job). A
+/// name it cannot tell without a probe (a path, a host's answer that needs
+/// one) is not.
+fn stage_runs_in_shell(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc) -> bool {
+	let mode = exec::mode_of(vp);
+	let (mut at, mut std_path, mut via) = (0, false, Via::Plain);
+	loop {
+		let Some(name) = st(vp).argv.get(at).cloned() else {
+			return false;
+		};
+		if name.contains(&b'/') {
+			return false;
+		}
+		if via == Via::Plain
+			&& matches!(state::record(cx.store, vp, Key::Func(BStr::new(&name))), Ok(Some(_)))
+		{
+			return true;
+		}
+		let rctx = ResolveCtx { has_slash: false, via };
+		match resolve(k, cx, vp, &name, mode, rctx) {
+			Ok(Resolved::Intrinsic(IntrinsicId::Command)) => {
+				let Some((skip, p)) = command_names(&st(vp).argv[at..]) else {
+					return true;
+				};
+				at += skip;
+				std_path |= p;
+				via = if std_path {
+					Via::CommandP
+				} else {
+					Via::Command
+				};
+			},
+			Ok(Resolved::Intrinsic(id)) => return id != IntrinsicId::Jobs,
+			_ => return false,
+		}
+	}
+}
+
 /// Start the resolved command.
 fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) -> Option<Flow> {
 	let target = st(vp).target.clone().unwrap_or(Target::NotFound);
 	// The command name, for diagnostics only.
 	let argv0 = |vp: &mut Vproc| st(vp).argv[0].clone();
 	let jobspec = st(vp).exec_as.is_none() && st(vp).argv[0].starts_with(b"%");
+	stage_command_runs(vp, matches!(target, Target::Intrinsic(IntrinsicId::Jobs)));
+	// A job that settles here with no program takes the signals `kill` held
+	// for it before its command runs; the op runs again then.
 	if !k.bangs.is_empty() {
 		let exec = st(vp).exec_as.is_some();
-		bang_dispatch(k, vp.vpid, &target, exec);
+		if bang_dispatch(k, vp.vpid, &target, exec) {
+			return Some(Flow::Block(WaitKey::Signal));
+		}
 	}
 	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh
 		&& !matches!(target, Target::Function(_) | Target::Intrinsic(_))
@@ -2784,10 +2933,16 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 			st(vp).in_place = super::killed::in_place(k, cx, vp, op);
 			st(vp).subshell_exec = super::killed::subshell_exec(k, cx, vp, op);
 			// bash forks the program (`stop_pipeline` first deletes the
-			// finished jobs reported, `jobs.c:572`) unless it runs it with
-			// `exec` in its own process.
+			// finished jobs reported, `jobs.c:572`, and makes it a job) unless
+			// it runs it with `exec` in its own process. A spawn tried again
+			// (the redirections applied here after all) keeps the job it made.
 			if !st(vp).in_place && !st(vp).subshell_exec {
 				super::killed::cleanup_dead_jobs(vp);
+				if super::killed::keeps_foreground(vp) && vp.jobs.pending_external_mut().is_none() {
+					let text = super::killed::external_text(k, cx, vp, op);
+					let own = k.vpid(cx.store);
+					super::killed::foreground_job(vp, job, own, text, None);
+				}
 			}
 			// The root's process becomes the program's: each signal that would
 			// end it is caught, to be the program's
@@ -2919,9 +3074,13 @@ fn spawned_external(
 		return busy_bang(k, vp, cx, line, path, interp, err);
 	}
 	// A refused spawn (retried as a script, or reported) never makes the
-	// job a program: its `$!` readers need not wait for the rest.
-	if spawned.is_err() && !k.bangs.is_empty() {
-		k.settle_bang(vp.vpid, None);
+	// job a program: its `$!` readers need not wait for the rest. The
+	// signals `kill` held for the job come first, as they reach bash's child
+	// before its `exec` fails: the job takes them and, if it lives on (a
+	// stop, then a `CONT`), runs the op again, whose spawn fails as this one
+	// did.
+	if spawned.is_err() && !k.bangs.is_empty() && k.settle_bang(vp.vpid, None) {
+		return Some(Flow::Block(WaitKey::Signal));
 	}
 	// No program to give them to: the signals sent while it was spawned go,
 	// and the process is the shell's again
@@ -2945,6 +3104,12 @@ fn spawned_external(
 			k.forget_deferral(vp.vpid);
 			super::jobctl::spawned(k, vp, child.as_ref());
 			let pid = child.pid();
+			// Its foreground job, if it has one, is known by the program's
+			// pid, by which its end finds it
+			// ([`super::proc::JobTable::external_ended`]).
+			if let Some(job) = vp.jobs.pending_external_mut() {
+				job.os_pid = Some(pid);
+			}
 			// The job this vproc may still settle is known by its program
 			// (`bang_dispatch` let only its lone or `exec`'d external
 			// through).
@@ -3337,6 +3502,9 @@ fn call_function(
 	let trace_once = attrs.contains(Attrs::ZSH_TRACE_ONCE);
 	let callee = Callee { name, body, mode, sticky, file, traced, trace_once, warn_nested };
 	let call = Call { args, vars, line, node: op.node, depth, argzero: None };
+	// bash's `this_command_name` names the function while its commands
+	// expand their words, until one of them ends.
+	vp.command_name = Some(CommandName::Function);
 	Some(push_call(k, vp, cx, callee, call))
 }
 
@@ -4608,15 +4776,19 @@ fn settle_builtin(
 			e.stage = Stage::Output;
 			None
 		},
+		// bash's `this_command_name` names the builtin while the commands
+		// it runs (`eval`, `.`) expand their words, until one of them ends.
 		Control::Frame => {
 			e.waiting = Some(Awaited::Frame);
 			e.stage = Stage::Await;
+			vp.command_name = Some(CommandName::Builtin(id));
 			Some(Flow::Call)
 		},
 		Control::Resume => {
 			e.waiting = Some(Awaited::Frame);
 			e.resume = true;
 			e.stage = Stage::Await;
+			vp.command_name = Some(CommandName::Builtin(id));
 			Some(Flow::Call)
 		},
 		Control::Wait(w) => {
@@ -4644,6 +4816,11 @@ fn settle_builtin(
 		},
 		Control::DiscardAll => {
 			e.control = Some(Transfer::DiscardAll(outcome.status));
+			e.stage = Stage::Output;
+			None
+		},
+		Control::Discard => {
+			e.control = Some(Transfer::Discard(outcome.status));
 			e.stage = Stage::Output;
 			None
 		},
@@ -4811,26 +4988,43 @@ fn exec_builtin(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) -> O
 /// spawn ([`spawned_external`]); `eval`, `.` and `source` run their text
 /// as the job's command would; and the job keeps its virtual pid when it
 /// ends, or once it would make a reader of the pid wait
-/// (`Shell::decide_waited_bangs`).
+/// (`Shell::decide_waited_bangs`). A job that holds signals `kill` sent it
+/// ([`Kernel::holds`]) keeps its virtual pid at a builtin too, as bash's
+/// child has them before it runs one. Whether that settle has signals
+/// `kill` held for the job to deliver first ([`Kernel::settle_bang`]).
 #[cold]
 #[inline(never)]
-fn bang_dispatch(k: &mut Kernel, vpid: crate::bash::ids::Vpid, target: &Target, exec: bool) {
+fn bang_dispatch(
+	k: &mut Kernel,
+	vpid: crate::bash::ids::Vpid,
+	target: &Target,
+	exec: bool,
+) -> bool {
 	let Some(bang) = k.bangs.iter_mut().find(|b| b.vproc == vpid) else {
 		if matches!(target, Target::External(_) | Target::Interp(_) | Target::Tool(_))
 			&& let Some(&(_, decider)) = k.bang_kin.iter().find(|&&(child, _)| child == vpid)
 		{
-			k.settle_bang(decider, None);
+			return k.settle_bang(decider, None);
 		}
-		return;
+		return false;
 	};
+	// With signals `kill` held for the job, a builtin decides too.
+	let held = bang.held != crate::bash::SigSet::EMPTY;
 	match (target, bang.stage) {
-		(Target::Function(_), BangStage::Lone) => bang.stage = BangStage::Exec,
-		(Target::Tool(_), BangStage::Lone) if !exec => bang.stage = BangStage::Callout,
+		(Target::Function(_), BangStage::Lone) => {
+			bang.stage = BangStage::Exec;
+			false
+		},
+		(Target::Tool(_), BangStage::Lone) if !exec => {
+			bang.stage = BangStage::Callout;
+			false
+		},
 		// A refused spawn is retried (`Refused`, `Script`): that decides.
 		(Target::Intrinsic(IntrinsicId::Exec) | Target::Refused { .. }, _)
-		| (Target::Intrinsic(_) | Target::Function(_), BangStage::Exec)
-		| (_, BangStage::Lone) => {},
-		(Target::External(_) | Target::Interp(_), _) if exec => {},
+		| (Target::Function(_), BangStage::Exec)
+		| (Target::External(_) | Target::Interp(_), BangStage::Lone) => false,
+		(Target::Intrinsic(_), BangStage::Exec) | (_, BangStage::Lone) if !held => false,
+		(Target::External(_) | Target::Interp(_), _) if exec => false,
 		_ => k.settle_bang(vpid, None),
 	}
 }
@@ -4981,6 +5175,58 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 			let mut waited = None;
 			let keep = keeps_statuses(k, cx, vp);
 			while let Some(&v) = st(vp).wait_for.first() {
+				// A job this shell copied from its parent (a command
+				// substitution's, [`super::proc::Job::inherited`]) is no child
+				// of it. bash's `wait_for_job` answers a finished foreground
+				// one with its status at once, and one still running, foreground
+				// or not, with the -1 of a process it cannot wait for (both
+				// measured in bash 5.3.20). Waiting for its vproc would wait for
+				// ever; a finished background copy goes on below, to the status
+				// kept for it.
+				if let Some(i) = vp.jobs.iter().rposition(|j| {
+					j.vpid == v && j.inherited && (j.foreground || j.state == JobState::Running)
+				}) {
+					last = match vp.jobs.list[i].state {
+						JobState::Done(s) => s,
+						_ => -1,
+					};
+					if let Some(job) = vp.jobs.list.at_mut(i) {
+						job.notified = true;
+					}
+					st(vp).wait_for.remove(0);
+					continue;
+				}
+				// A foreground job (`wait %N`, [`super::proc::Job::foreground`])
+				// ends as its processes, the shell's own children, end: bash's
+				// `wait_for_job` waits for them, returns the job's status and
+				// marks it reported.
+				if let Some(job) = vp.jobs.foreground(v) {
+					let pid = job.pid();
+					let JobState::Done(s) = job.state else {
+						let running = job
+							.procs
+							.as_deref()
+							.and_then(|p| {
+								p.list
+									.iter()
+									.find(|p| p.state == crate::bash::store::ProcState::Running)
+							})
+							.map_or(v, |p| p.vpid);
+						if let Some(flow) = write_out(k, vp, cx, line) {
+							return Some(flow);
+						}
+						return Some(Flow::Block(WaitKey::Proc(running)));
+					};
+					last = s;
+					waited_notice(k, vp, cx, v, line);
+					if let Some(job) = vp.jobs.foreground_mut(v) {
+						job.notified = true;
+					}
+					super::killed::cleanup_dead_jobs(vp);
+					waited = Some(pid);
+					st(vp).wait_for.remove(0);
+					continue;
+				}
 				// `wait -p` names the child by the pid the user knows (its
 				// program's OS pid), read before the job is forgotten.
 				let shown = vp.shown_pid(v);
@@ -5062,7 +5308,7 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				.jobs
 				.iter()
 				.filter(|j| match j.state {
-					JobState::Done(status) => {
+					JobState::Done(status) if !j.foreground => {
 						!last.is(j.vpid)
 							|| (kept != Some(j.vpid)
 								&& ((if bash { j.notified } else { status > 128 })
@@ -5076,15 +5322,25 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				.map(|j| j.vpid)
 				.collect();
 			// While no job may be deleted, `cleanup_dead_jobs` keeps them
-			// (`jobs.c:1470`).
-			if !vp.jobs_kept() {
-				for v in done {
+			// (`jobs.c:1470`), marked reported as bash marks them
+			// (`mark_dead_jobs_as_notified`, `wait_for_single_pid`): a later
+			// `jobs -n` lists none of them ([`forget_job`]).
+			let kept_list = vp.jobs_kept();
+			for v in done {
+				if !kept_list {
 					k.proc_collect(cx.store, v);
-					forget_job(vp, v);
 				}
+				forget_job(vp, v);
 			}
-			// And bash forgets every status kept (`wait_for_background_pids`'
-			// `bgp_clear`).
+			// `mark_dead_jobs_as_notified` marks the finished foreground jobs
+			// too ([`super::proc::Job::foreground`]), whose processes the
+			// shell took in already; the cleanup deletes them, but none while
+			// no job may be deleted.
+			if bash && vp.jobs.iter().any(|j| j.foreground) {
+				vp.jobs.foreground_done_reported();
+				super::killed::cleanup_dead_jobs(vp);
+			}
+			// And the statuses kept go (`bgp_clear`), frozen or not.
 			state::clear_statuses(&mut k.root, cx.store, vp);
 			st(vp).status
 		},
@@ -5241,24 +5497,33 @@ fn await_(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) ->
 				},
 				None => lost(k, vp, cx, op, line, Lost::Ext { vpid: vp.vpid, pid }),
 			};
+			// Its foreground job ([`super::proc::Job::foreground`]) is done,
+			// reported where the list only marks (`notify_and_cleanup` under -1).
+			if vp.jobs.iter().any(|j| j.foreground) {
+				let marks = vp.freeze() == super::proc::Freeze::Marks;
+				vp.jobs.external_ended(pid, status, killed, marks);
+			}
 			// The shell's process was the program it `exec`ed: bash and zsh
 			// run no EXIT trap after it.
 			if replacing && reaped {
 				super::exec::spend_exit_trap(vp);
 			}
 			if reaped && vp.parent.is_none() && k.jobctl.has_pgrp() {
-				let text = vp
-					.frames
-					.last()
-					.and_then(|f| f.unit.as_ref())
-					.and_then(|u| {
-						let n = u.nodes.get(op.node as usize)?;
-						u.source
-							.get(n.lo as usize..n.hi as usize)
-							.map(<[u8]>::to_vec)
-					})
-					.unwrap_or_default();
-				super::jobctl::fg_done(k, cx, vp, killed, &text);
+				// bash prints the command as it prints a job's (`p->command`,
+				// [`super::exec::job_text`]); zsh its source text.
+				let unit = vp.frames.last().and_then(|f| f.unit.clone());
+				let text = match unit {
+					Some(u) if vp.mode.dialect() == crate::bash::ids::Dialect::Bash => {
+						super::exec::job_text(k, cx, vp, &u, op.node)
+					},
+					Some(u) => u
+						.nodes
+						.get(op.node as usize)
+						.and_then(|n| u.source.get(n.lo as usize..n.hi as usize))
+						.map_or_else(BString::default, BString::from),
+					None => BString::default(),
+				};
+				super::jobctl::fg_done(k, cx, vp, killed, &text, None);
 			}
 			let in_place = st(vp).in_place;
 			if let (Some(sig), false) = (killed, replacing) {
@@ -5531,6 +5796,35 @@ fn zsh_write_error(
 	}
 }
 
+/// A take-in builtin (`jobs`, `fg`, `bg`, `disown`) takes in the exits
+/// already available ([`super::builtins::jobs::take_in_exits`]) before the
+/// command's redirections are applied, so a snapshot while it waits for the
+/// answer strands no redirect to a host file: a restore loses such an fd, and
+/// the builtin writing to it on resume would fail with EBADF. It parks on the
+/// first job still to settle, as the builtin does, and leaves the answer for
+/// the builtin's own [`super::builtins::jobs::take_in_exits`] to consume at
+/// dispatch. `None`: nothing to wait for, so the redirections proceed.
+fn take_in_before_redirect(k: &mut Kernel, vp: &mut Vproc) -> Option<Flow> {
+	let takes_in = st(vp).argv.first().is_some_and(|a| {
+		matches!(
+			IntrinsicId::from_name(a),
+			Some(IntrinsicId::Jobs | IntrinsicId::Fg | IntrinsicId::Bg | IntrinsicId::Disown)
+		)
+	});
+	if !takes_in || k.took_exits(vp.vpid) {
+		return None;
+	}
+	let job = vp
+		.jobs
+		.iter()
+		.find(|j| !j.inherited && !matches!(j.state, JobState::Done(_)))
+		.map(|j| j.vpid)?;
+	if !k.exits_asked.contains(&vp.vpid) {
+		k.ask_exits(vp.vpid);
+	}
+	Some(Flow::Block(WaitKey::Proc(job)))
+}
+
 /// A write to `fd` failed: drop what is queued for it, and report the error
 /// as the command's (bash's `write error`, zsh's through
 /// [`zsh_write_error`]), or end the shell on `SIGPIPE`. A failed write to
@@ -5591,14 +5885,38 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	let (status, t0, control) = (e.status, e.t0, e.control);
 	let notice = e.notice.take();
 	let in_shell = matches!(e.target, Some(Target::Function(_) | Target::Intrinsic(_)));
-	vp.status = status;
-	// bash's in-shell read of `$(< file)` runs no command: `PIPESTATUS`
-	// stays the last pipeline's (`false | true; echo "$(< f)"
-	// "${PIPESTATUS[@]}"` prints `… 1 0`).
-	if op.flags & ir::Op::CAT == 0 {
-		vp.pipestatus.clear();
-		vp.pipestatus.push(status);
+	let external = matches!(
+		e.target,
+		Some(Target::External(_) | Target::Interp(_) | Target::Script(_) | Target::Refused { .. })
+	);
+	// bash's `return` jumps out before its status reaches `$?` or
+	// `PIPESTATUS` (it sets only `return_catch_value`): the function's or
+	// `.` file's RETURN trap sees them as they were ([`Flow::Return`]).
+	let returns = matches!(control, Some(Transfer::Return(_)))
+		&& vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
+	if !returns {
+		vp.status = status;
+		// bash's in-shell read of `$(< file)` runs no command: `PIPESTATUS`
+		// stays the last pipeline's (`false | true; echo "$(< f)"
+		// "${PIPESTATUS[@]}"` prints `… 1 0`).
+		if op.flags & ir::Op::CAT == 0 {
+			vp.pipestatus.clear();
+			vp.pipestatus.push(status);
+		}
 	}
+	// An external the host refused, or ran as a script, ended without a
+	// program's end: its foreground job ([`super::proc::Job::foreground`])
+	// ends with the command's status.
+	if external && vp.jobs.pending_external_mut().is_some() {
+		let marks = vp.freeze() == super::proc::Freeze::Marks;
+		if let Some(job) = vp.jobs.pending_external_mut() {
+			job.state = JobState::Done(status);
+			job.notified = marks;
+		}
+	}
+	// A simple command ended: bash's `this_command_name` is empty
+	// (`execute_simple_command`, execute_cmd.c:4952).
+	vp.command_name = None;
 	if k.mask.contains(crate::bash::event::EventKind::CmdEnd) {
 		// One fresh reading for the duration and the event's stamp; the
 		// next command's `CmdStart` may share it.
@@ -5610,9 +5928,17 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	// `exit` jumps while its own redirections are in effect: bash's
 	// `time_command` reports through them (`time exit 3 2>/dev/null` prints
 	// nothing), so the report goes out before they are undone below. A
-	// `break` with a non-numeric count runs bash's `top_level_cleanup` first
-	// ([`exec::Jump::Cleanup`]).
+	// posix special builtin's `ERREXIT` (its usage error, or a redirection
+	// of its that failed) comes after bash's `execute_builtin_or_function`
+	// undid the builtin's redirections (execute_cmd.c:5687-5693, and
+	// `undo_partial_redirects`; the jump is at execute_cmd.c:1004 and 4872):
+	// its report goes through the redirections outside the command. A
+	// `break` with a non-numeric count runs bash's `top_level_cleanup`
+	// first ([`exec::Jump::Cleanup`]).
 	if let Some(Transfer::Exit(_, jump)) = control {
+		if jump == exec::Jump::Errexit {
+			undo_own_redirections(vp);
+		}
 		exec::report_jump(k, vp, cx, 0, jump);
 	}
 	let sc = vp
@@ -5638,6 +5964,7 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 		Some(Transfer::Break { n, cont }) => Flow::Break { n, cont },
 		Some(Transfer::Exit(n, jump)) => Flow::Exit(n, jump),
 		Some(Transfer::DiscardAll(n)) => cleanup_discard(k, vp, cx, n),
+		Some(Transfer::Discard(n)) => plain_discard(k, vp, cx, n),
 		Some(Transfer::Exec) => {
 			// The program replaced the shell (or `exec` failed and the shell
 			// exits, `exit_shell` with no jump): bash's `time` around it
@@ -5648,33 +5975,49 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	}
 }
 
+/// Restore the fds the current command's own redirections replaced
+/// (latest first), before the scratch that saved them is dropped.
+fn undo_own_redirections(vp: &mut Vproc) {
+	if let Some(io) = vp
+		.frames
+		.last_mut()
+		.and_then(|f| f.scratch.as_mut())
+		.and_then(|sc| sc.io.as_mut())
+	{
+		for s in io.saved.drain(..).rev() {
+			vp.fds.set(s.fd, s.prev);
+		}
+	}
+}
+
 /// The flow of a command abandoned after bash runs every unwind-protect
 /// (`top_level_cleanup`, or `run_unwind_protects` alone): a builtin's
-/// arithmetic subscript error or `suspend`'s usage error, a function past
-/// `FUNCNEST`. The jump then goes to the outermost catch: the whole `-c`
-/// string when the run's own text is running ([`Flow::Abort`]). zsh: a
-/// builtin's `zerr` (`errflag`) unwinds through `zsh_discard` (always-lists
-/// run, the builtin's status stays); `Abort` is the parse-error path.
+/// arithmetic subscript error, integer value error or extra arguments
+/// (`no_args`), a function past `FUNCNEST`. Running every unwind-protect
+/// restores each `parse_and_execute`'s saved jump target, so the jump passes
+/// every `eval`, `.` and trap action to the run's own top
+/// ([`Flow::DiscardTop`]): a `-c` string ends, a script goes on with its next
+/// line. zsh: a builtin's `zerr` (`errflag`) unwinds through `zsh_discard`
+/// (always-lists run, the builtin's status stays).
 fn cleanup_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: i32) -> Flow {
-	let command = matches!(
-		state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
-		Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
-	);
-	let in_run = vp
-		.frames
-		.iter()
-		.rev()
-		.find(|f| matches!(f.kind, FrameKind::Script { .. }))
-		.is_some_and(|f| matches!(f.kind, FrameKind::Script { what: ScriptKind::Run, .. }));
-	let zsh = vp.mode.dialect() == crate::bash::ids::Dialect::Zsh;
-	let flow = if command && in_run && !zsh {
-		Flow::Abort(n)
-	} else {
-		Flow::Discard(n)
-	};
-	if !zsh {
-		exec::jump_out(k, cx, vp, true, &flow);
+	if vp.mode.dialect() == crate::bash::ids::Dialect::Zsh {
+		return Flow::Discard(n);
 	}
+	let flow = Flow::DiscardTop(n);
+	exec::jump_out(k, cx, vp, true, &flow);
+	flow
+}
+
+/// The flow of a command bash abandons while it still expands its words
+/// (`exp_jump_to_top_level (DISCARD)`: a declaration's compound word whose
+/// `make_internal_declare` or assignment fails). A plain discard, not
+/// [`cleanup_discard`]'s: `top_level_cleanup` runs only at a script's own
+/// level ([`exec::jump_out`]), and the innermost `parse_and_execute` (the
+/// script, `-c`, `eval`, `.`) catches the jump and goes on with its next
+/// command ([`Flow::Discard`]).
+fn plain_discard(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, n: i32) -> Flow {
+	let flow = Flow::Discard(n);
+	exec::jump_out(k, cx, vp, false, &flow);
 	flow
 }
 
@@ -5882,6 +6225,11 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 	let mut child = vp.child_text(k, cx.store, &text, line, vp.fds.clone());
 	// The command's own fork: bash and zsh keep the loop level.
 	child.outer_loops = super::exec::fork_loops(vp, true);
+	// bash runs the hook in `execute_disk_command`'s child, which keeps the
+	// shell's `SUBSHELL_RESETTRAP` as it was (jobs.c:2350 adds another flag).
+	child.own_traps = child
+		.own_traps
+		.with_reset_pending(vp.own_traps.reset_pending());
 	let vpid = child.vpid;
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));

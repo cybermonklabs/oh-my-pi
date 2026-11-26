@@ -261,10 +261,9 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 		expect(priorBlocks.find(b => b.type === "redacted_thinking")).toBeUndefined();
 	});
 
-	it("preserves official Anthropic prior signatures across a same-deployment model switch", () => {
-		// Official Anthropic can validate signatures minted by another model in
-		// the same deployment and apply its one-way model-compatibility rules.
-		// Keep the native block so the API can retain or drop it authoritatively.
+	it("drops another Claude model's signed thinking across a same-deployment model switch", () => {
+		// Claude receives no other model's thinking, other Claude models
+		// included: the signed block drops, and the tool call and its result stay.
 		const cases = [
 			{ id: "claude-opus-4-8", name: "Claude Opus 4.8" },
 			{ id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
@@ -304,13 +303,10 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 			const assistants = params.filter(p => p.role === "assistant");
 			expect(assistants).toHaveLength(2);
 			const priorBlocks = assistants[0].content as WireBlock[];
-			const thinking = priorBlocks.find(b => b.type === "thinking") as WireThinkingBlock | undefined;
-			expect(thinking).toEqual({
-				type: "thinking",
-				thinking: reasoning,
-				signature: "sig_source",
-			});
-			expect(priorBlocks.find(b => b.type === "text")).toBeUndefined();
+			expect(priorBlocks.map(b => b.type)).toEqual(["tool_use"]);
+			expect(JSON.stringify(params)).not.toContain(reasoning);
+			expect(JSON.stringify(params)).not.toContain("sig_source");
+			expect(JSON.stringify(params)).toContain("notes body");
 		}
 	});
 

@@ -1,8 +1,10 @@
 /**
- * The loop takes a main request's per-call record in the `beforeDispatch` it hands the stream function, which a
- * transport calls as it sends. `streamProxy` is the Agent's proxy stream function, so it must call it too: one that
- * never did left the record empty, and a per-call message the next request repeated at the same position stayed
- * per-call (a rolling cache breakpoint lost), while a refusal raised there never kept a request from the proxy.
+ * The loop takes a main request's per-call record from the `onResponse` it hands the stream function, which a provider
+ * calls once the request it sent is answered. `streamProxy` is the Agent's proxy stream function, so it must report the
+ * proxy's response too: one that never did left the record empty, and a per-call message the next request repeated at
+ * the same position stayed per-call (a rolling cache breakpoint lost). It calls `beforeDispatch` before it sends, as a
+ * transport does, so a refusal raised there keeps the request from the proxy; and a request stopped before the proxy
+ * answered it, after that hook ran, is no record.
  */
 import { describe, expect, it } from "bun:test";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -69,6 +71,51 @@ describe("streamProxy as an Agent's stream function", () => {
 		// The proxy sent the same note at this position last time: the cache holds it as history.
 		expect(second?.messages[0]?.content).toBe("status: idle");
 		expect(isPerCallContextMessage(second?.messages[0])).toBe(false);
+	});
+
+	it("keeps a changed note per-call after a request the user stopped before it reached the proxy", async () => {
+		const server = proxyServer();
+		const sent: Context[] = [];
+		let note = "status: idle";
+		let stopBeforeWire = false;
+		const agent: Agent = new Agent({
+			initialState: { model: createMockModel().model },
+			streamFn: (model, context, options) => {
+				sent.push(context);
+				return streamProxy(model, context, {
+					...options,
+					authToken: "not-a-secret",
+					proxyUrl: PROXY_URL,
+					// The user stops the run while the connection to the proxy opens, after the dispatch hook ran: the
+					// fetch rejects with the abort, and nothing reaches the proxy.
+					fetch: (async (input, init) => {
+						if (!stopBeforeWire) return server.fetch(input, init);
+						agent.abort();
+						throw init?.signal?.reason ?? new DOMException("The operation was aborted.", "AbortError");
+					}) as FetchImpl,
+				});
+			},
+			// A context hook's note ahead of the history, rebuilt for every request.
+			transformContext: async messages => {
+				const status: AgentMessage = { role: "user", content: note, timestamp: 0 };
+				markPerCallContextMessage(status);
+				return [status, ...messages];
+			},
+		});
+
+		await agent.prompt("first");
+		note = "status: busy";
+		stopBeforeWire = true;
+		await agent.prompt("second");
+		stopBeforeWire = false;
+		await agent.prompt("third");
+
+		// Preconditions: three requests were prepared, and the second never reached the proxy.
+		expect(sent).toHaveLength(3);
+		expect(server.requests).toBe(2);
+		expect(sent[2]?.messages[0]?.content).toBe("status: busy");
+		// No request the proxy answered carried the changed note: it stays per-call.
+		expect(isPerCallContextMessage(sent[2]?.messages[0])).toBe(true);
 	});
 
 	it("sends nothing to the proxy when the dispatch hook refuses the request", async () => {

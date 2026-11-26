@@ -92,6 +92,7 @@ import {
 	EPHEMERAL_MODEL_CHANGE_ROLE,
 	PREWALK_MODEL_CHANGE_ROLE,
 	type FileEntry,
+	type HeldChangeBase,
 	type LabelEntry,
 	type ModeChangeEntry,
 	type ModelChangeEntry,
@@ -1560,6 +1561,17 @@ class UnindexedCount {
 }
 
 /**
+ * What {@link SessionManager.createWithSessionId} did with a launcher-chosen id. Only `created`
+ * wrote anything.
+ * - `held`: a stored session already holds the id.
+ * - `owned-elsewhere`: another live omp process owns the id.
+ */
+export type SessionIdCreation =
+	| { status: "created"; manager: SessionManager }
+	| { status: "held" }
+	| { status: "owned-elsewhere" };
+
+/**
  * Stores and navigates an append-only conversation journal.
  *
  * A session is a JSONL file: one header line followed by entries. Entries form a
@@ -2644,6 +2656,16 @@ export class SessionManager {
 		if (!this.#stopLeftEntriesUnsaved(stop)) return;
 		await stop.announced;
 		throw stop.error;
+	}
+
+	/**
+	 * Whether another writer owns this session (a live omp process, or a second
+	 * manager in this process on the same journal), so this process's next write
+	 * would move it to a sibling (`"open-elsewhere"`) instead of appending.
+	 * Claims the session when it is free, as a write would.
+	 */
+	isOwnedElsewhere(): boolean {
+		return this.#sessionOwnedElsewhere();
 	}
 
 	/**
@@ -7589,6 +7611,7 @@ export class SessionManager {
 		workPoolYieldItems?: WorkPoolYieldItem[];
 		spawnSpec?: SubagentSpawnSpec;
 		spawnCallId?: string;
+		heldChangeBase?: HeldChangeBase;
 	}): string {
 		const entry: SessionInitEntry = { type: "session_init", ...this.#freshEntryFields(), ...init };
 		this.#recordEntry(entry);
@@ -8280,27 +8303,39 @@ export class SessionManager {
 	 * Create a new session under a launcher-chosen id, reserved for this process. The session claims
 	 * the id's ownership lease first, then asks `isHeld` whether a stored session already holds it,
 	 * and only then writes its header and records itself as the terminal's last session. So a second
-	 * launch under the id, in this process or another live one, finds it taken. Returns `undefined`,
-	 * having kept nothing, when another live process owns the id or `isHeld` answers `true`.
+	 * launch under the id, in another live process, finds it taken, and a later one finds it stored.
+	 * Writes nothing when another live process owns the id or `isHeld` answers `true`.
+	 *
+	 * On a storage that confirms claims (`acquireSessionClaim`, SQL storage) the claim is the one the
+	 * database confirmed, so two launches on PostgreSQL or MySQL cannot both pass it.
 	 *
 	 * The header is first published on the condition that its file does not exist yet, so a launch
 	 * that drew the same file name (the same id at the same millisecond) loses there instead of
-	 * taking the other launch's identical bytes for its own. A store with no ownership lease
-	 * (`session.storage: sql`) still cannot make the `isHeld` check atomic for two different file
+	 * taking the other launch's identical bytes for its own. A store with no ownership lease (a SQL
+	 * store built without `claims`) still cannot make the `isHeld` check atomic for two different file
 	 * names: there each launch looks again once its own header is durable in the shared store, and
 	 * withdraws (deleting what it wrote) when another session is named for the id, so at most one
-	 * goes on; two that each see the other both withdraw.
+	 * goes on; two that each see the other both withdraw. A launch that loses either way reports
+	 * `owned-elsewhere`: the other launch is creating the session now, so this one must not resume it.
 	 */
 	static async createWithSessionId(
 		cwd: string,
 		sessionDir: string | undefined,
 		sessionId: string,
 		isHeld: () => Promise<boolean>,
-	): Promise<SessionManager | undefined> {
+	): Promise<SessionIdCreation> {
 		const manager = SessionManager.create(cwd, sessionDir, undefined, { sessionId, suppressBreadcrumb: true });
-		if (manager.#sessionOwnedElsewhere() || (await isHeld())) {
+		// SQL storage answers a claim only once the database has; wait for it, as an opened session does.
+		const ownedElsewhere = manager.#storage.acquireSessionClaim
+			? (await manager.#holdClaim()) !== "held"
+			: manager.#sessionOwnedElsewhere();
+		if (ownedElsewhere) {
 			await manager.close();
-			return undefined;
+			return { status: "owned-elsewhere" };
+		}
+		if (await isHeld()) {
+			await manager.close();
+			return { status: "held" };
 		}
 		const sessionFile = manager.#sessionFile;
 		if (sessionFile) {
@@ -8312,7 +8347,7 @@ export class SessionManager {
 			} catch (error) {
 				if (!(error instanceof SessionWriteConflictError)) throw error;
 				await manager.close();
-				return undefined;
+				return { status: "owned-elsewhere" };
 			}
 			manager.#expectedDiskSize = body.bytes;
 		}
@@ -8325,11 +8360,47 @@ export class SessionManager {
 				// Durable before the refusal, so the launch that goes on never sees this one again.
 				await manager.#storage.drain();
 			}
-			return undefined;
+			return { status: "owned-elsewhere" };
 		}
 		manager.#suppressBreadcrumb = false;
 		if (manager.#sessionFile) manager.#rememberBreadcrumb(manager.#cwd, manager.#sessionFile);
-		return manager;
+		return { status: "created", manager };
+	}
+
+	/**
+	 * Claim this process's ownership of the stored session `sessionId` at `sessionPath` before
+	 * opening it, as {@link renameSessionTitle} does, so a caller can refuse a session another
+	 * live omp process owns before opening it changes anything. Resolves to the release callback, or
+	 * `null` while another live process owns the session. The claim is not a writer's, so the
+	 * manager that opens the session takes its own writer claim beside it
+	 * ({@link claimOpenedSession}, {@link isOwnedElsewhere}); release this one after that. A storage
+	 * that claims nothing answers with a no-op release.
+	 *
+	 * It waits for a holder as {@link claimOpenedSession} does: SQL storage answers only once the
+	 * database has, after waiting up to `waitMs` for the holder's lease to go or expire; file storage
+	 * waits only under `OMP_SESSION_EXCLUSIVE=1`, trying the lease again every
+	 * {@link OPEN_FILE_CLAIM_RETRY_MS} until `waitMs` runs out. `onWait` hears once that it waits.
+	 */
+	static async claimStoredSession(
+		sessionPath: string,
+		sessionId: string,
+		options: { waitMs?: number; onWait?: (holder: SessionClaimHolder | undefined) => void } = {},
+	): Promise<(() => void) | null> {
+		const storage = defaultSessionStorage();
+		if (storage.acquireSessionClaim) return await storage.acquireSessionClaim(sessionId, sessionPath, options);
+		if (!storage.claimSession) return () => {};
+		const deadline = Date.now() + (isSessionExclusive() ? (options.waitMs ?? 0) : 0);
+		let waiting = false;
+		for (;;) {
+			const release = storage.claimSession(sessionId, sessionPath);
+			const left = deadline - Date.now();
+			if (release || left <= 0) return release;
+			if (!waiting) {
+				waiting = true;
+				options.onWait?.(undefined);
+			}
+			await Bun.sleep(Math.min(OPEN_FILE_CLAIM_RETRY_MS, left));
+		}
 	}
 
 	/**
@@ -8946,6 +9017,8 @@ export interface PersistedSessionInit {
 	spawnSpec?: SubagentSpawnSpec;
 	/** The parent's top-level call the spawn was requested under ({@link SessionInitEntry.spawnCallId}). */
 	spawnCallId?: string;
+	/** {@link SessionInitEntry.heldChangeBase}. */
+	heldChangeBase?: HeldChangeBase;
 }
 
 /**
@@ -8980,6 +9053,7 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			...(entry.workPoolYieldItems !== undefined ? { workPoolYieldItems: entry.workPoolYieldItems } : undefined),
 			...(entry.spawnSpec !== undefined ? { spawnSpec: entry.spawnSpec } : undefined),
 			...(entry.spawnCallId !== undefined ? { spawnCallId: entry.spawnCallId } : undefined),
+			...(entry.heldChangeBase !== undefined ? { heldChangeBase: entry.heldChangeBase } : undefined),
 		};
 	}
 	return init;

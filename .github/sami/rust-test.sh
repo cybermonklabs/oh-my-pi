@@ -41,7 +41,10 @@
 # rust-test-drift job compares with the early listings the macOS job's
 # inventory read (.github/sami/rust-test-listings-drift.sh), and cargo's
 # --timings report of each cargo test in $RUNNER_TEMP/rust-test/cargo-timings,
-# with each one's build and test seconds in the job log and the step summary.
+# with each one's build and test seconds in the job log and the step summary,
+# and every test's result in $RUNNER_TEMP/rust-test/results/results.tsv, which
+# sami-checks.yml's rust-test-compare job reads to check that a run from a
+# build seed and a cold run of one commit agree test by test.
 # With RUST_TEST_ONLY naming a list (the macOS job names that inventory), it
 # runs only the tests that list names, each target once with --exact, and
 # fails unless each of them ran here; the failure, skip and output rules are
@@ -491,6 +494,44 @@ bep_seconds() {
 	if [ -n "$s" ]; then LC_ALL=C awk -v s="$s" 'BEGIN { printf "%.1f", s }'; else printf 'UNKNOWN'; fi
 }
 
+# test_times <invocation> <event log>: a line for each test attempt Bazel
+# ran in the invocation (its testResult events): the target, the attempt (and
+# its shard and run, when not the first), the attempt's status, and how long
+# it ran in seconds (testAttemptDuration, or the older
+# testAttemptDurationMillis; UNKNOWN where the log holds neither as a finite
+# number of 0 or more), marked when Bazel reused an earlier run's result.
+# Bazel's own summary names only the targets that did not pass, and a
+# target's timeout bounds each attempt, so these lines are what a target's
+# timeout is measured from. A figure for the job log: it changes no verdict.
+test_times() {
+	local inv="$1" label attempt shard run status s cached where
+	if ! jq -r '
+		select(.id.testResult)
+		| .id.testResult as $id
+		| .testResult as $r
+		| ([($r.testAttemptDuration // empty | tostring | rtrimstr("s") | tonumber?),
+		    ($r.testAttemptDurationMillis // empty | tostring | tonumber? | . / 1000)]
+		   | map(select(. >= 0 and . < 1e9)) | .[0]) as $s
+		| [$id.label, ($id.attempt // 1), ($id.shard // 1), ($id.run // 1), ($r.status // "NO_STATUS"),
+		   (if $s == null then "-" else $s end), (if $r.cachedLocally == true then "cached" else "-" end)]
+		| @tsv' "$2" >"$tmp/test-times.tsv" 2>/dev/null; then
+		echo "Test times ($inv): UNKNOWN, jq could not read the build event log"
+		return 0
+	fi
+	if [ ! -s "$tmp/test-times.tsv" ]; then
+		echo "Test times ($inv): the build event log names no test attempt"
+		return 0
+	fi
+	while IFS=$'\t' read -r label attempt shard run status s cached; do
+		where="attempt $attempt"
+		[ "$shard" = 1 ] || where="$where, shard $shard"
+		[ "$run" = 1 ] || where="$where, run $run"
+		if [ "$s" = - ]; then s=UNKNOWN; else s="$(LC_ALL=C awk -v s="$s" 'BEGIN { printf "%.1f", s }')"; fi
+		if [ "$cached" = cached ]; then cached=" (cached: an earlier run's result)"; else cached=""; fi
+		echo "Test time ($inv): $label $where: $status in $s s$cached"
+	done <"$tmp/test-times.tsv"
+}
+
 # bazel_test <invocation> <run_under> <arguments>...: one bazel test, its
 # logs collected. Bazel exits 0 when every test passed, 3 when every target
 # built and a test failed, and 1 when a target failed to build (the others
@@ -513,6 +554,7 @@ bazel_test() {
 			;;
 	esac
 	collect "$inv" "$bep"
+	if [ -f "$bep" ]; then test_times "$inv" "$bep"; fi
 }
 
 # did_not_build <target>: the target has no result but FAILED_TO_BUILD, and
@@ -1141,7 +1183,11 @@ doc_ignored() {
 # doctest that cannot be merged): the planned count is the sum of every
 # suite's test_count, and every started suite must end. The failed tests are
 # its `failed` events. A log that ended early (a timeout, a crash) is named
-# once here; the accounting below leaves its binary out.
+# once here; the accounting below leaves its binary out. When
+# libtest-bound.py (rust-test-tmpdir.sh) stopped a binary that had stopped
+# making progress, the error names the tests it failed (their record's stdout
+# starts `libtest-bound:`); its tests that never started have no result, so
+# the log stays incomplete.
 check_libtest() {
 	local label="$1" status="$2" kind="$3" log="$4" inv="$5" record planned reported ended filtered names
 	record="$(jq -R -s -r '
@@ -1162,7 +1208,8 @@ check_libtest() {
 		return 0
 	fi
 	if [ "$reported" != "$planned" ] || [ "$ended" = none ]; then
-		error "Rust tests" "$label is $status, but libtest planned $planned tests and reported $reported, suite end $ended: the test binary ended before its tests did"
+		names="$(jq -R -r 'fromjson? | select(type == "object" and .type == "test" and .event == "failed" and ((.stdout // "") | startswith("libtest-bound:"))) | .name' "$log" | paste -s -d, -)"
+		error "Rust tests" "$label is $status, but libtest planned $planned tests and reported $reported, suite end $ended: the test binary ended before its tests did${names:+; libtest-bound.py stopped it and failed these, each saying why (its own bound or SIGTERM): $names}"
 		printf '%s\n' "$log" >>"$incomplete"
 		return 0
 	fi
@@ -1261,6 +1308,59 @@ while IFS=$'\t' read -r label rule status kind log _ inv; do
 		*) error "Rust tests" "$label is a $rule, whose log this step cannot read" ;;
 	esac
 done <"$rows"
+
+# The per-test results of this job, which sami-rust-test.yml uploads and
+# sami-checks.yml's rust-test-compare job reads: one line per test, as
+# `<target> <test name> <final status> <status per invocation>`. The final
+# status is `ok` when the test passed in some invocation or attempt, else
+# `failed` when it failed in one, else `ignored`; the last column names each
+# invocation and what it reported there, sorted. Two runs of one commit, one
+# cold and one from a build seed, must give the same file
+# (.github/sami/rust-test-results-compare.sh): a build cache that changes a
+# test's verdict is a build cache nothing may trust. It is written here, before
+# the accounting below, so that the macOS job (RUST_TEST_ONLY, which returns
+# before it) writes it too.
+results="$tmp/results"
+mkdir -p "$results"
+: >"$tmp/results-raw.tsv"
+while IFS=$'\t' read -r label rule _ _ log _ inv; do
+	[ -f "$log" ] || continue
+	case "$rule" in
+		"rust_doc_test rule")
+			# The doctest runner writes libtest's text, not its record.
+			awk -v t="$label" -v i="$inv" '
+				/^test .* \.\.\. (ok|FAILED|ignored)$/ {
+					s = $NF
+					line = $0
+					sub(/^test /, "", line)
+					sub(/ \.\.\. (ok|FAILED|ignored)$/, "", line)
+					if (s == "FAILED") { s = "failed" }
+					print t "\t" line "\t" i "\t" s
+				}' "$log"
+			;;
+		*)
+			jq -R -r --arg target "$label" --arg inv "$inv" 'fromjson?
+				| select(type == "object" and .type == "test" and (.event == "ok" or .event == "failed" or .event == "ignored"))
+				| [$target, .name, $inv, .event] | @tsv' "$log"
+			;;
+	esac >>"$tmp/results-raw.tsv"
+done <"$rows"
+LC_ALL=C sort -u -o "$tmp/results-raw.tsv" "$tmp/results-raw.tsv"
+awk -F'\t' '
+	{ key = $1 "\t" $2
+	  if (!(key in seen)) { seen[key] = ""; order[++n] = key }
+	  seen[key] = (seen[key] == "" ? "" : seen[key] ",") $3 "=" $4
+	  if ($4 == "ok") { final[key] = "ok" }
+	  else if ($4 == "failed" && final[key] != "ok") { final[key] = "failed" }
+	  else if (!(key in final)) { final[key] = "ignored" }
+	}
+	END { for (i = 1; i <= n; i++) { print order[i] "\t" final[order[i]] "\t" seen[order[i]] } }
+' "$tmp/results-raw.tsv" >"$results/results.tsv"
+if [ ! -s "$results/results.tsv" ]; then
+	error "Rust test results" "no test of any invocation reported a result, so this job's per-test results are empty and nothing can be compared with them"
+else
+	echo "Per-test results: $(count "$results/results.tsv") tests in $results"
+fi
 
 # The #[ignore]d cargo tests: each must be named in
 # .github/sami/rust-test-ignored.txt, which ran it alone above; any other

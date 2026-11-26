@@ -60,7 +60,7 @@ use crate::bash::{
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
 /// a variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 49;
+pub const FRAMES_VERSION: u32 = 60;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -109,6 +109,9 @@ struct Image {
 	/// Subshell notices held for a redirection's end
 	/// ([`Kernel::held_notices`]).
 	held:        Vec<(Vpid, u32, BString)>,
+	/// The vpids reserved for the stages of background pipeline jobs
+	/// ([`Kernel::stage_vpids`]).
+	stages:      Vec<(Vpid, Vec<Vpid>)>,
 }
 
 /// The take-in's state, as the image keeps it ([`Image::take_in`]).
@@ -287,6 +290,10 @@ struct ProcImage {
 	/// trap action that runs after the restore still names the trapped
 	/// command.
 	command:       Option<(UnitId, u32)>,
+	/// bash's `this_command_name` ([`Vproc::command_name`]).
+	command_name:  Option<super::proc::CommandName>,
+	/// bash's `trap_saved_exit_value` ([`Vproc::trap_saved`]).
+	trap_saved:    i32,
 	/// Pushes onto bash's call-stack arrays.
 	calls:         Vec<super::callstack::Call>,
 	/// The pseudo-signal traps the vproc set itself.
@@ -546,7 +553,7 @@ impl Shell {
 		// Subshells a host submitted since the last step become vprocs (and
 		// proc records) first.
 		self.adopt(cx);
-		self.k.sync_root(cx.store, &self.procs[0]);
+		self.k.sync_root(cx.store, &mut self.procs[0]);
 		// The root's frames pop every scope they pushed: a restored shell
 		// must count the empty ones too.
 		self.k.root.materialize(cx.store);
@@ -706,6 +713,8 @@ impl Shell {
 				subshell: p.subshell,
 				outer_loops: p.outer_loops,
 				command,
+				command_name: p.command_name,
+				trap_saved: p.trap_saved,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
 				pending_break: p.pending_break.as_deref().copied(),
@@ -751,6 +760,7 @@ impl Shell {
 			},
 			deaths: k.deaths.clone(),
 			held: k.held_notices.clone(),
+			stages: k.stage_vpids.clone(),
 		};
 		let mut bytes = postcard::to_stdvec(&header).map_err(ExtError::Encode)?;
 		bytes.extend_from_slice(&postcard::to_stdvec(&image).map_err(ExtError::Encode)?);
@@ -869,7 +879,7 @@ impl Shell {
 		if !restored {
 			shell.lose_running(cx, &mut report)?;
 		}
-		shell.k.sync_root(cx.store, &shell.procs[0]);
+		shell.k.sync_root(cx.store, &mut shell.procs[0]);
 		if let Some(err) = shell.k.root.take_fault() {
 			return Err(RestoreError::Store(err));
 		}
@@ -914,7 +924,7 @@ impl Shell {
 		k.results = img.results.into_iter().collect();
 		// No vpid twice: the counter starts above every vproc the image brings
 		// back (`restore` raised a stored counter below the base to base + 1;
-		// a live vproc can already hold that or a higher one).
+		// a live vproc or reserved stage can already hold that or a higher one).
 		if let Some(top) = img.procs.iter().map(|p| p.vpid.0).max() {
 			k.next_vpid = k.next_vpid.max(top.saturating_add(1));
 		}
@@ -940,6 +950,21 @@ impl Shell {
 			.into_iter()
 			.filter(|(v, _)| img.procs.iter().any(|p| p.vpid == *v))
 			.collect();
+		// A job's vproc that was not restored starts no stages.
+		k.stage_vpids = img
+			.stages
+			.into_iter()
+			.filter(|(job, _)| img.procs.iter().any(|p| p.vpid == *job))
+			.collect();
+		if let Some(top) = k
+			.stage_vpids
+			.iter()
+			.flat_map(|(_, stages)| stages)
+			.map(|v| v.0)
+			.max()
+		{
+			k.next_vpid = k.next_vpid.max(top.saturating_add(1));
+		}
 		k.held_notices = img
 			.held
 			.into_iter()
@@ -978,8 +1003,17 @@ impl Shell {
 				vp.status = f.status;
 				vp.pipestatus = f.pipestatus;
 				vp.jobs = f.jobs;
+				// Each job found by an index, not a scan per facts record: a
+				// vproc can keep thousands of foreground jobs, each with facts.
+				let at: std::collections::HashMap<_, usize> = vp
+					.jobs
+					.list
+					.iter()
+					.enumerate()
+					.map(|(i, j)| (j.id, i))
+					.collect();
 				for (id, facts) in &f.job_facts {
-					if let Some(job) = vp.jobs.list.iter_mut().find(|j| j.id == *id) {
+					if let Some(job) = at.get(id).and_then(|&i| vp.jobs.list.at_mut(i)) {
 						job.set_facts(facts);
 					}
 				}
@@ -1015,6 +1049,8 @@ impl Shell {
 			vp.zsh = p.zsh;
 			vp.lineage = p.lineage;
 			vp.clock = p.clock;
+			vp.command_name = p.command_name;
+			vp.trap_saved = p.trap_saved;
 			if let Some((id, node)) = p.command {
 				let unit = load_unit(
 					engine,
@@ -1257,10 +1293,12 @@ impl Shell {
 	}
 
 	/// Restored without frames: a child vproc the store lists as running has
-	/// no execution position; it is lost (status 137, its job done, a
-	/// [`Lost::Vproc`] entry). Records of children of vprocs that are gone
-	/// (subshells' children) are dropped, and so are the root's function
-	/// scopes (the calls they belonged to are gone).
+	/// no execution position; it is lost (status 137, its job done with no
+	/// signal recorded, [`super::proc::Job::ended`]: obash did not see how it
+	/// ended, so `jobs` shows `Exit 137`, never `Killed`; a [`Lost::Vproc`]
+	/// entry). Records of children of vprocs that are gone (subshells'
+	/// children) are dropped, and so are the root's function scopes (the
+	/// calls they belonged to are gone).
 	fn lose_running(
 		&mut self,
 		cx: &mut Cx<'_>,
@@ -1282,9 +1320,16 @@ impl Shell {
 				report.lost.push(Lost::Vproc { vpid });
 				self.k.proc_exited(cx.store, vpid, parent, 137);
 				if let Some(job) = self.procs[0].jobs.by_vpid_mut(vpid) {
-					job.state = JobState::Done(137);
-					job.notified = false;
+					job.ended(137, None);
 				}
+			}
+		}
+		// A foreground job's command went with the frames
+		// ([`super::proc::Job::foreground`]): it is done too.
+		for job in self.procs[0].jobs.list.iter_mut() {
+			if job.foreground && job.state == JobState::Running {
+				job.state = JobState::Done(137);
+				job.notified = false;
 			}
 		}
 		Ok(())
@@ -1386,7 +1431,7 @@ fn valid(u: &Unit) -> bool {
 				Part::Lit(_)
 				| Part::Quoted(_)
 				| Part::Arith { .. }
-				| Part::BadSubst(_)
+				| Part::BadSubst(..)
 				| Part::AnsiC(_)
 				| Part::Zsh(_)
 				| Part::ComsubSyntax { .. } => true,
@@ -1412,7 +1457,8 @@ fn valid(u: &Unit) -> bool {
 						| OpIr::Indirect
 						| OpIr::PrefixNames { .. }
 						| OpIr::Substr { .. }
-						| OpIr::Transform(_) => true,
+						| OpIr::Transform(_)
+						| OpIr::BadTransform(..) => true,
 					};
 					index_ok && op_ok
 				},

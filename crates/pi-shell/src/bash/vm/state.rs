@@ -18,7 +18,7 @@ use bstr::{BStr, BString};
 use hashbrown::DefaultHashBuilder;
 use serde::{Deserialize, Serialize};
 
-use super::proc::{GetoptsState, JobTable, LastBg, SavedStatus, Vproc};
+use super::proc::{GetoptsState, JobList, JobTable, LastBg, SavedStatus, Vproc};
 pub use crate::bash::store::Var;
 use crate::bash::{
 	Image,
@@ -1757,20 +1757,36 @@ pub fn store_var_below(
 	}
 }
 
-/// `unset name` with bash's dynamic scoping: a variable local to the
-/// running function stays declared but unset (it keeps hiding outer ones);
-/// one local to a calling function is removed from that scope, revealing
-/// the next outer variable, unless `keep_outer_locals` (`shopt -s
-/// localvar_unset`) treats it like the running function's own.
+/// Which scope bindings [`unset_var`] leaves declared but unset, still
+/// hiding the outer variables until their scope ends; it removes any
+/// other binding it finds, so the next outer variable shows through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsetKeeps {
+	/// bash: a local of the running function. A calling function's local
+	/// is removed, and so is a prefix assignment's temporary, a builtin's
+	/// or a function call's that no `local` names: bash's `makunbound`
+	/// keeps only a variable with the `local` attribute.
+	OwnLocals,
+	/// bash under `shopt -s localvar_unset`: a local of any function; a
+	/// temporary is still removed.
+	AllLocals,
+	/// zsh: every binding of a scope, temporaries too.
+	AllScoped,
+}
+
+/// `unset name` with bash's dynamic scoping: what stays declared but
+/// unset is `keeps` ([`UnsetKeeps`]); a binding it does not keep is
+/// removed from its scope, revealing the next outer variable (`x=1;
+/// x=3 eval 'unset x; echo $x'` prints 1, as in bash).
 pub fn unset_var(
 	root: &mut Root,
 	store: &mut dyn StateStore,
 	vp: &mut Vproc,
 	name: &[u8],
-	keep_outer_locals: bool,
+	keeps: UnsetKeeps,
 ) {
-	match unset_target(root, store, vp, name, keep_outer_locals) {
-		Ok(Some((at, true, var))) => {
+	match unset_target(root, store, vp, name, keeps) {
+		Ok(Unbind::Keep(at, var)) => {
 			// The local stays declared, unset, with its attributes
 			// (`local v=x; unset v; declare -p v` → `declare -- v`).
 			let kept = var.map(|v| {
@@ -1783,40 +1799,93 @@ pub fn unset_var(
 			});
 			put_scope(root, store, vp, at, name, kept);
 		},
-		Ok(Some((In::Vec(i), false, _))) => {
-			vp.scopes[i].vars.remove(name);
+		Ok(Unbind::Remove { at, call }) => {
+			for at in std::iter::once(at).chain(call) {
+				match at {
+					In::Vec(i) => {
+						vp.scopes[i].vars.remove(name);
+					},
+					In::Store(depth) => root.write(store, Change::Del(local_key(depth, name))),
+				}
+			}
 		},
-		Ok(Some((In::Store(depth), false, _))) => {
-			root.write(store, Change::Del(local_key(depth, name)));
-		},
-		Ok(None) => put_outer(root, store, vp, name, None),
+		Ok(Unbind::Outer) => put_outer(root, store, vp, name, None),
 		Err(err) => root.fail(err),
 	}
 }
 
-/// The scope [`unset_var`] acts on, whether the binding stays declared
-/// there, and its variable; `None`: no scope binds `name`.
+/// What [`unset_var`] does to a name.
+enum Unbind {
+	/// Leave the binding in scope `at` declared but unset; its variable.
+	Keep(In, Option<Var>),
+	/// Remove the binding from scope `at`, and from the function call's
+	/// own temporary scope `call` too.
+	Remove { at: In, call: Option<In> },
+	/// No scope binds the name.
+	Outer,
+}
+
+/// The binding [`unset_var`] acts on and what it does to it.
 fn unset_target(
 	root: &Root,
 	store: &mut dyn StateStore,
 	vp: &Vproc,
 	name: &[u8],
-	keep_outer_locals: bool,
-) -> Result<Option<(In, bool, Option<Var>)>, StoreError> {
+	keeps: UnsetKeeps,
+) -> Result<Unbind, StoreError> {
 	let Some(at) = level_at(root, store, vp, name, Level::Dynamic)? else {
-		return Ok(None);
+		return Ok(Unbind::Outer);
 	};
-	let current_func = level_at(root, store, vp, name, Level::Local)?;
-	let temp = !scope_is_func(store, vp, at)?;
-	let keep = Some(at) == current_func || keep_outer_locals || temp;
-	let var = match at {
-		In::Vec(i) => vp.scopes[i].vars.get(name).cloned().flatten(),
-		In::Store(depth) => match store.get(local_key(depth, name))? {
-			Some(Record::Var(v)) => Some(v.clone()),
-			_ => None,
-		},
+	// Read (and copied) only for a binding that stays.
+	let keep = |store: &mut dyn StateStore| -> Result<Unbind, StoreError> {
+		Ok(Unbind::Keep(at, var_at(store, vp, name, At::Scope(at))?.cloned()))
 	};
-	Ok(Some((at, keep, var)))
+	if keeps == UnsetKeeps::AllScoped {
+		return keep(store);
+	}
+	if !scope_is_func(store, vp, at)? {
+		// A temporary scope binds a prefix assignment, removed as bash
+		// removes its temporary environment's variable; or it is a trap's,
+		// whose `BASH_TRAPSIG` stands for bash setting the variable for
+		// the trap and putting the old value back after it (trap.c): that
+		// one stays unset until the trap ends.
+		if name == b"BASH_TRAPSIG" {
+			return keep(store);
+		}
+		return Ok(Unbind::Remove { at, call: None });
+	}
+	if var_at(store, vp, name, At::Scope(at))?.is_some_and(|v| v.attrs.contains(Attrs::TEMP)) {
+		// A function call's prefix assignment (`x=3 f`) that no `local`
+		// named: bash makes the call's temporary environment the
+		// function's scope, so the variable is gone from both. The call
+		// keeps its own copy in its temporary scope, just below.
+		return Ok(Unbind::Remove { at, call: call_copy(store, vp, at, name)? });
+	}
+	if keeps == UnsetKeeps::AllLocals || Some(at) == level_at(root, store, vp, name, Level::Local)? {
+		return keep(store);
+	}
+	Ok(Unbind::Remove { at, call: None })
+}
+
+/// The scope below function scope `at` when it is a temporary one that
+/// binds `name`: the function call's own temporary scope, holding the
+/// copy of the prefix assignment the call gave the function.
+fn call_copy(
+	store: &mut dyn StateStore,
+	vp: &Vproc,
+	at: In,
+	name: &[u8],
+) -> Result<Option<In>, StoreError> {
+	let below = match at {
+		In::Vec(0) | In::Store(0) => return Ok(None),
+		In::Vec(i) => In::Vec(i - 1),
+		In::Store(depth) => In::Store(depth - 1),
+	};
+	let binds = match below {
+		In::Vec(i) => vp.scopes[i].vars.contains_key(name),
+		In::Store(depth) => store.get(local_key(depth, name))?.is_some(),
+	};
+	Ok((binds && !scope_is_func(store, vp, below)?).then_some(below))
 }
 
 /// Store `var` (or unset with `None`) at `level` for `vp`.
@@ -3093,67 +3162,84 @@ fn decode_rlimits(words: &[BString]) -> Vec<(Rlimit, Option<u64>, Option<u64>)> 
 		.collect()
 }
 
-/// Write the root job table's changes since the last sync: each job is
+/// Write the root job table's changes since the last sync: each job from
+/// the lowest index any of them changed at ([`JobList::take_changed`]) is
 /// compared with its store record (the store holds what was written last,
-/// so the engine keeps no copy of the table), jobs gone from the table are
-/// deleted. A job's facts ([`Job::facts`]) are a record of their own,
-/// written with the job's record when it changes, and when they change
-/// without it (a pipeline's processes start and end while the job runs,
-/// [`Job::procs`]): those of a job that has any are compared with their
-/// record too. A job's facts never go, so one without any has none written.
-fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &JobTable) {
+/// so the engine keeps no copy of the table), and jobs gone from there are
+/// deleted; the jobs before it are as they were. So a step costs the jobs
+/// it changed, not every job a `lastpipe` stage or a function substitution
+/// keeps (one more per fork in a loop of externals). A job's facts
+/// ([`Job::facts`]) are a record of their own, written with the job's
+/// record when it changes, and when they change without it (a pipeline's
+/// processes start and end while the job runs, [`Job::procs`]): those of a
+/// job that has any are compared with their record too. A job's facts
+/// never go, so one without any has none written.
+fn write_jobs(root: &mut Root, store: &mut dyn StateStore, jobs: &mut JobTable) {
+	let changed = jobs.list.take_changed();
 	let mut ids = std::mem::take(&mut root.synced.job_ids);
-	let same_ids =
-		ids.len() == jobs.list.len() && ids.iter().zip(&jobs.list).all(|(id, j)| *id == j.id);
-	if !same_ids {
-		for id in &ids {
-			if !jobs.list.iter().any(|j| j.id == *id) {
-				root.write(store, Change::Del(Key::Job(*id)));
-				root.write(store, Change::Del(Key::JobFacts(*id)));
+	if let Some(from) = changed.map(|at| at.min(ids.len()).min(jobs.list.len())) {
+		// Each id written from `from` on that the table no longer holds there
+		// goes: a lookup per id, not a scan of the table per id.
+		if ids.len() > from {
+			let live: std::collections::HashSet<JobId> =
+				jobs.list[from..].iter().map(|j| j.id).collect();
+			for id in &ids[from..] {
+				if !live.contains(id) {
+					root.write(store, Change::Del(Key::Job(*id)));
+					root.write(store, Change::Del(Key::JobFacts(*id)));
+				}
 			}
 		}
-		ids.clear();
-		ids.extend(jobs.list.iter().map(|j| j.id));
-	}
-	root.synced.job_ids = ids;
-	for job in &jobs.list {
-		let written = match store.get(Key::Job(job.id)) {
-			Ok(Some(Record::Job(have))) => job.same_record(have),
-			Ok(_) => false,
-			Err(err) => {
-				root.fail(err);
-				return;
-			},
-		};
-		if !written {
-			root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.record())));
-		}
-		let facts_written = if !written {
-			false
-		} else if !job.has_facts() {
-			true
-		} else {
-			match store.get(Key::JobFacts(job.id)) {
-				Ok(Some(Record::JobFacts(have))) => job.same_facts(have),
+		ids.truncate(from);
+		ids.extend(jobs.list[from..].iter().map(|j| j.id));
+		let mut fault = None;
+		for job in &jobs.list[from..] {
+			let written = match store.get(Key::Job(job.id)) {
+				Ok(Some(Record::Job(have))) => job.same_record(have),
 				Ok(_) => false,
 				Err(err) => {
-					root.fail(err);
-					return;
+					fault = Some(err);
+					break;
 				},
+			};
+			if !written {
+				root.write(store, Change::Put(Key::Job(job.id), Record::Job(job.record())));
 			}
-		};
-		if !facts_written {
-			let facts = job.facts();
-			root.write(
-				store,
-				if facts.is_empty() {
-					Change::Del(Key::JobFacts(job.id))
-				} else {
-					Change::Put(Key::JobFacts(job.id), Record::JobFacts(facts))
-				},
-			);
+			let facts_written = if !written {
+				false
+			} else if !job.has_facts() {
+				true
+			} else {
+				match store.get(Key::JobFacts(job.id)) {
+					Ok(Some(Record::JobFacts(have))) => job.same_facts(have),
+					Ok(_) => false,
+					Err(err) => {
+						fault = Some(err);
+						break;
+					},
+				}
+			};
+			if !facts_written {
+				let facts = job.facts();
+				root.write(
+					store,
+					if facts.is_empty() {
+						Change::Del(Key::JobFacts(job.id))
+					} else {
+						Change::Put(Key::JobFacts(job.id), Record::JobFacts(facts))
+					},
+				);
+			}
+		}
+		if let Some(err) = fault {
+			// Written again in full from `from` at the next sync.
+			root.fail(err);
+			jobs.list.unsynced(from);
+			root.synced.job_ids = ids;
+			return;
 		}
 	}
+	root.synced.job_ids = ids;
 	let (current, previous, chld) = root.synced.job_marks;
 	for (key, new, was) in [
 		(MiscKey::JobCurrent, jobs.current, current),
@@ -3211,8 +3297,9 @@ pub fn clear_statuses(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vpro
 /// (`$?`, `PIPESTATUS`, `$!`, the job table, `getopts` progress, `ulimit`
 /// values). Called at the end of every `step` (the one returning a
 /// `Step::Call` included), by `externalize` and by `restore`: the store
-/// contract's granularity for these fields.
-pub fn sync_root(root: &mut Root, store: &mut dyn StateStore, vp: &Vproc) {
+/// contract's granularity for these fields. `vp` is mutable for its job
+/// table's record of what changed ([`JobList::take_changed`]).
+pub fn sync_root(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 	debug_assert!(vp.image.is_none(), "only the root vproc's fields are in the store");
 	if vp.status != root.synced.status {
 		root.synced.status = vp.status;
@@ -3233,12 +3320,12 @@ pub fn sync_root(root: &mut Root, store: &mut dyn StateStore, vp: &Vproc) {
 		});
 		root.set_record(store, KeyBuf::Misc(MiscKey::LastBg), rec);
 	}
-	// Jobs are compared with their records: only an empty table that was
-	// written empty is skipped without a read.
+	// The jobs that changed are compared with their records: a table
+	// without a change since the last sync costs nothing.
 	let marks = (vp.jobs.current, vp.jobs.previous, vp.jobs.chld);
 	if !vp.jobs.list.is_empty() || !root.synced.job_ids.is_empty() || marks != root.synced.job_marks
 	{
-		write_jobs(root, store, &vp.jobs);
+		write_jobs(root, store, &mut vp.jobs);
 	}
 	if vp.getopts != root.synced.getopts {
 		root.synced.getopts.clone_from(&vp.getopts);
@@ -3299,9 +3386,13 @@ pub fn load_root(
 			list.push(job.clone());
 		}
 	})?;
+	// Each facts record finds its job by an index, not a scan of the jobs:
+	// a store can hold thousands of kept foreground jobs, each with facts.
+	let at: std::collections::HashMap<JobId, usize> =
+		list.iter().enumerate().map(|(i, j)| (j.id, i)).collect();
 	store.scan(Table::JobFacts, &mut |key, rec| {
 		if let (Key::JobFacts(id), Record::JobFacts(facts)) = (key, rec)
-			&& let Some(job) = list.iter_mut().find(|j| j.id == id)
+			&& let Some(job) = at.get(&id).and_then(|&i| list.get_mut(i))
 		{
 			job.set_facts(facts);
 		}
@@ -3323,7 +3414,7 @@ pub fn load_root(
 	bgp.sort_by_key(|s| s.seq);
 	let bgp = (!bgp.is_empty()).then(|| Box::new(bgp.into_iter().collect()));
 	vp.jobs = JobTable {
-		list,
+		list: JobList::synced(list),
 		current: misc(store, MiscKey::JobCurrent)?.and_then(|s| parse(&s)),
 		previous: misc(store, MiscKey::JobPrevious)?.and_then(|s| parse(&s)),
 		chld: misc(store, MiscKey::ChldOwed)?
@@ -3331,6 +3422,8 @@ pub fn load_root(
 			.unwrap_or(0),
 		subshell: false,
 		comsub: super::proc::Comsub::No,
+		freeze: super::proc::Freeze::No,
+		stage_words: false,
 		bgp,
 	};
 	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);
@@ -3616,7 +3709,7 @@ mod tests {
 			Level::Local,
 		);
 		assert_eq!(get(&root, &mut store, &vp, "q"), Some(b"local".to_vec()));
-		unset_var(&mut root, &mut store, &mut vp, b"a", false);
+		unset_var(&mut root, &mut store, &mut vp, b"a", UnsetKeeps::OwnLocals);
 		assert_eq!(get(&root, &mut store, &vp, "a"), None);
 		assert!(
 			lookup_declared(&root, &mut store, &vp, b"a")
@@ -3686,7 +3779,7 @@ mod tests {
 		assert!(edit_var(&mut root, &mut store, &mut vp, b"LC_CTYPE", Level::Dynamic, edit).unwrap());
 		let t3 = locale_token(&root, &mut store, &vp, names).unwrap();
 		assert_ne!(t3, t2);
-		unset_var(&mut root, &mut store, &mut vp, b"LANG", false);
+		unset_var(&mut root, &mut store, &mut vp, b"LANG", UnsetKeeps::OwnLocals);
 		let t4 = locale_token(&root, &mut store, &vp, names).unwrap();
 		assert_ne!(t4, t3);
 		// Bound in a scope (temporary environment, `local`) or a subshell:
@@ -4038,6 +4131,122 @@ mod tests {
 		assert_eq!(positional(&root, &mut store, &vp).unwrap(), Vec::<BString>::new());
 	}
 
+	/// `unset` removes a prefix assignment's temporary (a builtin's, and
+	/// both copies of a function call's) and a calling function's local;
+	/// it keeps the running function's local, any function's under
+	/// `localvar_unset`, a trap's `BASH_TRAPSIG`, and in zsh every binding;
+	/// in the store's scopes and in a subshell's alike.
+	#[test]
+	fn unset_removes_temporaries_and_keeps_locals() {
+		use UnsetKeeps::{AllLocals, AllScoped, OwnLocals};
+		/// What the name reads after the `unset`.
+		#[derive(Clone, Debug, PartialEq)]
+		enum After {
+			/// The value of the binding that shows through.
+			Shows(&'static str),
+			/// Declared but unset: it still hides the global.
+			Hidden,
+		}
+		use After::{Hidden, Shows};
+		let bound = |func: Option<&str>, value: &str, attrs: Attrs| {
+			let mut vars = VarMap::default();
+			vars.insert(BString::from("x"), Some(Var::scalar(value, attrs)));
+			Scope { vars, func: func.map(BString::from), ..Scope::default() }
+		};
+		let temp = || bound(None, "3", Attrs::EXPORT);
+		let call = || bound(Some("f"), "3", Attrs::EXPORT.with(Attrs::TEMP));
+		let caller = || bound(Some("f"), "2", Attrs::NONE);
+		let callee = || func_scope_named("g");
+		let cases = [
+			("a builtin's temporary", vec![temp()], OwnLocals, Shows("1")),
+			("a builtin's temporary, localvar_unset", vec![temp()], AllLocals, Shows("1")),
+			("a builtin's temporary in zsh", vec![temp()], AllScoped, Hidden),
+			("a call's temporary", vec![temp(), call()], OwnLocals, Shows("1")),
+			("a call's temporary, localvar_unset", vec![temp(), call()], AllLocals, Shows("1")),
+			(
+				"a call's temporary from a callee",
+				vec![temp(), call(), callee()],
+				OwnLocals,
+				Shows("1"),
+			),
+			("a call's temporary in zsh", vec![temp(), call()], AllScoped, Hidden),
+			(
+				"a temporary made local",
+				vec![temp(), bound(Some("f"), "3", Attrs::EXPORT)],
+				OwnLocals,
+				Hidden,
+			),
+			("the function's local", vec![caller()], OwnLocals, Hidden),
+			("a caller's local", vec![caller(), callee()], OwnLocals, Shows("1")),
+			("a caller's local, localvar_unset", vec![caller(), callee()], AllLocals, Hidden),
+			("a temporary over a local", vec![caller(), temp()], OwnLocals, Shows("2")),
+		];
+		let read = |root: &Root, store: &mut crate::bash::MemStore, vp: &Vproc, name: &[u8]| {
+			let value = lookup(root, store, vp, name)
+				.unwrap()
+				.and_then(Var::as_scalar)
+				.map(<[u8]>::to_vec);
+			match value.as_deref() {
+				Some(b"1") => Some(Shows("1")),
+				Some(b"2") => Some(Shows("2")),
+				Some(b"3") => Some(Shows("3")),
+				Some(other) => panic!("{} is {:?}", BStr::new(name), BStr::new(other)),
+				None if lookup_declared(root, store, vp, name).unwrap().is_some() => Some(Hidden),
+				None => None,
+			}
+		};
+		let (mut store, mut root, mut vp) = shell();
+		let mut sub = subshell(&root, &mut store, &vp);
+		for v in [&mut vp, &mut sub] {
+			store_var(
+				&mut root,
+				&mut store,
+				v,
+				b"x",
+				Some(Var::scalar("1", Attrs::NONE)),
+				Level::Global,
+			);
+			for (what, scopes, keeps, after) in cases.clone() {
+				let n = scopes.len();
+				for s in scopes {
+					push_scope(&mut root, &mut store, v, s);
+				}
+				unset_var(&mut root, &mut store, v, b"x", keeps);
+				assert_eq!(read(&root, &mut store, v, b"x"), Some(after), "{what}");
+				for _ in 0..n {
+					assert!(drop_scope(&mut root, &mut store, v));
+				}
+				assert_eq!(read(&root, &mut store, v, b"x"), Some(Shows("1")), "{what}: the global");
+			}
+			// A second `unset` removes the global the first one revealed.
+			push_scope(&mut root, &mut store, v, temp());
+			push_scope(&mut root, &mut store, v, call());
+			unset_var(&mut root, &mut store, v, b"x", OwnLocals);
+			unset_var(&mut root, &mut store, v, b"x", OwnLocals);
+			assert_eq!(read(&root, &mut store, v, b"x"), None, "unset twice");
+			assert!(drop_scope(&mut root, &mut store, v) && drop_scope(&mut root, &mut store, v));
+			assert_eq!(read(&root, &mut store, v, b"x"), None, "unset twice: no global");
+			// A trap's `BASH_TRAPSIG` hides the value from before the trap.
+			let seven = Some(Var::scalar("7", Attrs::NONE));
+			store_var(&mut root, &mut store, v, b"BASH_TRAPSIG", seven, Level::Global);
+			let mut vars = VarMap::default();
+			vars.insert(BString::from("BASH_TRAPSIG"), Some(Var::scalar("10", Attrs::NONE)));
+			push_scope(&mut root, &mut store, v, Scope { vars, ..Scope::default() });
+			unset_var(&mut root, &mut store, v, b"BASH_TRAPSIG", OwnLocals);
+			assert_eq!(lookup(&root, &mut store, v, b"BASH_TRAPSIG").unwrap(), None, "the trap's");
+			assert!(
+				lookup_declared(&root, &mut store, v, b"BASH_TRAPSIG")
+					.unwrap()
+					.is_some()
+			);
+			assert!(drop_scope(&mut root, &mut store, v));
+			let before = lookup(&root, &mut store, v, b"BASH_TRAPSIG")
+				.unwrap()
+				.and_then(Var::as_scalar);
+			assert_eq!(before, Some(&b"7"[..]), "after the trap");
+		}
+	}
+
 	/// The root's scope masks and nameref flag answer as the store does:
 	/// past the 64 tracked scopes, after pops, and after writes the engine
 	/// did not make (rebuilt on invalidation).
@@ -4106,7 +4315,7 @@ mod tests {
 	#[test]
 	fn sync_root_writes_what_changed_and_load_root_reads_it_back() {
 		let (mut store, mut root, mut vp) = shell();
-		sync_root(&mut root, &mut store, &vp);
+		sync_root(&mut root, &mut store, &mut vp);
 		assert!(store.is_empty(), "nothing changed since the defaults");
 		vp.status = 3;
 		vp.pipestatus = vec![0, 3];
@@ -4118,7 +4327,7 @@ mod tests {
 		vp.jobs.chld = 2;
 		vp.getopts = GetoptsState { optind: Some("2".into()), next: Some((1, 2)), at: None };
 		vp.rlimits = vec![(Rlimit::Nofile, Some(64), None)];
-		sync_root(&mut root, &mut store, &vp);
+		sync_root(&mut root, &mut store, &mut vp);
 		let misc = |store: &crate::bash::MemStore, key| store.record(Key::Misc(key)).cloned();
 		assert_eq!(misc(&store, MiscKey::Status), Some(Record::Misc("3".into())));
 		// `$!` keeps the OS pid its job is known by.
@@ -4132,7 +4341,7 @@ mod tests {
 		assert!(matches!(store.record(Key::Job(JobId(4))), Some(Record::Job(j)) if j.number == 1));
 		// A job's state change rewrites that job only; a removed job goes.
 		vp.jobs.get_mut(1).unwrap().state = JobState::Stopped(Signal::Tstp);
-		sync_root(&mut root, &mut store, &vp);
+		sync_root(&mut root, &mut store, &mut vp);
 		let stopped = |store: &crate::bash::MemStore| {
 			matches!(
 				store.record(Key::Job(JobId(4))),
@@ -4152,13 +4361,13 @@ mod tests {
 		assert_eq!(fresh.rlimits, vp.rlimits);
 		// Loaded fields count as written: no rewrite.
 		let before = store.clone();
-		sync_root(&mut root2, &mut store, &fresh);
+		sync_root(&mut root2, &mut store, &mut fresh);
 		assert_eq!(store, before);
 		vp.jobs.remove(1);
 		vp.jobs.chld = 0;
 		vp.getopts = GetoptsState::default();
 		vp.rlimits.clear();
-		sync_root(&mut root, &mut store, &vp);
+		sync_root(&mut root, &mut store, &mut vp);
 		assert_eq!(store.record(Key::Job(JobId(4))), None);
 		assert_eq!(misc(&store, MiscKey::JobCurrent), None);
 		assert_eq!(misc(&store, MiscKey::ChldOwed), None);

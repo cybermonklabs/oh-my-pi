@@ -12,6 +12,7 @@ import { unionAccountCatalogs } from "./account-access";
 
 export interface GoogleModelManagerConfig {
 	apiKey?: string;
+	baseUrl?: string;
 	fetch?: FetchImpl;
 }
 
@@ -84,7 +85,10 @@ export function googleModelManagerOptions(
 		providerId: "google",
 		dropCachedModelIdsOnStaticMismatch: GEMINI_FLASH_CACHE_MIGRATION_MODEL_IDS,
 		...(apiKey
-			? { fetchDynamicModels: () => fetchGeminiModels({ apiKey, fetch: toDiscoveryFetch(config?.fetch) }) }
+			? {
+					fetchDynamicModels: () =>
+						fetchGeminiModels({ apiKey, baseUrl: config?.baseUrl, fetch: toDiscoveryFetch(config?.fetch) }),
+				}
 			: undefined),
 	};
 }

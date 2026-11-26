@@ -44,6 +44,7 @@ import type {
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildDiscoveredModel, buildModel, nextBuildPriceChange } from "@oh-my-pi/pi-catalog/build";
 import { collapseBuiltVariantsSteps } from "@oh-my-pi/pi-catalog/compat/collapse";
+import { isProviderCatalogEndpointUrl, providerOwnsModelId } from "@oh-my-pi/pi-catalog/compat/catalog-endpoint";
 import {
 	clampCodexContextWindow,
 	clampsContextOverride,
@@ -62,7 +63,7 @@ import {
 	type ModelManagerOptions,
 	type ModelRefreshStrategy,
 } from "@oh-my-pi/pi-catalog/model-manager";
-import { getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
+import { getBundledModels, getBundledProviders, isGeneratedProvider } from "@oh-my-pi/pi-catalog/models";
 import {
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
@@ -3195,9 +3196,10 @@ export class ModelRegistry {
 				const identity = getOAuthCredentialsForProvider(this.authStorage, descriptor.providerId).find(
 					credential => credential.access === apiKey,
 				);
+				const providerBaseUrl = this.#descriptorBaseUrl(descriptor.providerId);
 				const discoveryConfig = {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,
-					baseUrl: this.#descriptorBaseUrl(descriptor.providerId),
+					baseUrl: providerBaseUrl,
 					fetch: this.#fetch,
 					region: identity?.region,
 					inferenceRegion: identity?.inferenceRegion,
@@ -3206,7 +3208,31 @@ export class ModelRegistry {
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??
 					discoveryConfig;
-				const managerOptions = descriptor.createModelManagerOptions(preparedConfig);
+				let managerOptions = descriptor.createModelManagerOptions(preparedConfig);
+				const fetchVendorModels = managerOptions.fetchDynamicModels;
+				// A built-in generated provider redirected away from its own catalog
+				// endpoint (a vendor pointed at a proxy) filters its discovered roster
+				// to the families it owns and caches under an endpoint-scoped id, so a
+				// proxy's aggregate list cannot pollute the vendor namespace. Only a
+				// manager that sets no cacheProviderId of its own is rescoped here:
+				// a provider that pins its own namespace (an aggregator, a local
+				// server) keeps its full roster and its own cache id.
+				const isRedirectedBuiltIn =
+					providerBaseUrl !== undefined &&
+					fetchVendorModels !== undefined &&
+					managerOptions.cacheProviderId === undefined &&
+					isGeneratedProvider(descriptor.providerId) &&
+					!isProviderCatalogEndpointUrl(descriptor.providerId, providerBaseUrl);
+				if (isRedirectedBuiltIn) {
+					managerOptions = {
+						...managerOptions,
+						cacheProviderId: resolveModelCacheProviderId(descriptor.providerId, { baseUrl: providerBaseUrl }),
+						fetchDynamicModels: async () => {
+							const models = await fetchVendorModels();
+							return models?.filter(model => providerOwnsModelId(descriptor.providerId, model.id)) ?? null;
+						},
+					};
+				}
 				const modelsDev = managerOptions.modelsDev
 					? { ...managerOptions.modelsDev, additiveOnly: true }
 					: modelsDevCatalogFallback(descriptor.providerId, this.#fetch);

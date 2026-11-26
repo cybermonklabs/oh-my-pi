@@ -392,6 +392,7 @@ export async function buildSubagentSession(input: SubagentBuildInput): Promise<A
 				layers: revivedLayers(spec.settings.layers, revive?.cache?.settingsWrites),
 				rootThresholds: spec.settings.rootThresholds,
 			});
+		if (revive?.heldSystemPrompt) held.blocks = revive.heldSystemPrompt(settings);
 		// A revive of a record that holds a spawn spec (the warm revive too) writes its file header's workspace roots
 		// once, before the build, as the roots the build uses: the policy's (at a cold revive, the live parent's, or the
 		// root's where the parent is not live) and the live settings'. A spec whose policy part is missing or malformed

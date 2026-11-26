@@ -564,14 +564,14 @@ describe("Claude history estimate", () => {
 			reader: firstParty,
 			source: sonnet,
 			signature: "sig_sonnet",
-			carried: true,
+			carried: false,
 		},
 		{
 			name: "another Claude model's signed turn on the same custom host",
 			reader: customHost,
 			source: { api: "anthropic-messages", provider: "custom-anthropic", model: "claude-sonnet-4-6" },
 			signature: "sig_sonnet",
-			carried: true,
+			carried: false,
 		},
 		{
 			name: "another model's turn on another wire",
@@ -670,6 +670,30 @@ describe("Claude history estimate", () => {
 		if (!carried) expect(tokenizer.countMessage(turn)).toBe(toolCallOnly);
 	});
 
+	test("counts none of another Claude model's redacted thinking on the same deployment", () => {
+		const tokenizer = new Tokenizer(firstParty);
+		const turn: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "redactedThinking", data: "r".repeat(8_000) }, toolCall],
+			...sonnet,
+			usage: {
+				input: 100,
+				output: 3_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 3_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 1,
+		};
+		const own: AssistantMessage = { ...turn, model: firstParty.id };
+		const toolCallOnly = tokenizer.countMessage({ ...turn, content: [toolCall] });
+
+		expect(tokenizer.countMessage(turn)).toBe(toolCallOnly);
+		expect(tokenizer.countMessage(own)).toBeGreaterThan(toolCallOnly);
+	});
+
 	test("counts none of another model's thinking for a model router, which may pick Claude", () => {
 		const router = buildModel({
 			id: "adaptive",
@@ -764,15 +788,6 @@ describe("countMessage replayed thinking", () => {
 		["on Bedrock", bedrockOpus, bedrockOpus, VISIBLE, "toolUse"],
 		// Omitted display: no visible thinking, the same reasoning billed.
 		["with its thinking omitted", opus, opus, "", "toolUse"],
-		// The Claude API keeps another model's signature from the same deployment,
-		// and Opus 5.5 reads Opus 5's thinking.
-		[
-			"from another Claude model on the same deployment",
-			opus,
-			reader("anthropic", "claude-opus-5"),
-			VISIBLE,
-			"toolUse",
-		],
 		// The thinking finished, signed, before the text hit max_tokens.
 		["that stopped on length", opus, opus, VISIBLE, "length"],
 		// The thinking finished, signed, before the abort cut the text short.
@@ -783,8 +798,10 @@ describe("countMessage replayed thinking", () => {
 
 	test.each([
 		// A signature is bound to the deployment that minted it, and Claude gets
-		// none of that thinking as text (`dropsForeignThinking`).
+		// none of that thinking (`dropsForeignThinking`).
 		["a turn from another host", bedrockOpus, opus],
+		// Claude gets no other model's thinking, other Claude models included.
+		["another Claude model's turn on the same deployment", opus, reader("anthropic", "claude-opus-5")],
 		// Bedrock binds it to the model too.
 		[
 			"another Claude model's turn on Bedrock",

@@ -97,11 +97,12 @@ export async function fetchGeminiModels(
 	let nextPageToken: string | undefined;
 
 	for (let page = 0; page < maxPages; page += 1) {
-		const requestUrl = buildModelsUrl(baseUrl, options.apiKey, pageSize, nextPageToken);
 		let response: Response;
 		try {
+			const requestUrl = buildModelsUrl(baseUrl, pageSize, nextPageToken);
 			response = await fetchImpl(requestUrl, {
 				method: "GET",
+				headers: { "x-goog-api-key": options.apiKey },
 				signal: options.signal,
 			});
 		} catch {
@@ -145,9 +146,8 @@ export async function fetchGeminiModels(
 	return Array.from(modelsById.values()).sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function buildModelsUrl(baseUrl: string, apiKey: string, pageSize: number, pageToken?: string): URL {
+function buildModelsUrl(baseUrl: string, pageSize: number, pageToken?: string): URL {
 	const url = new URL(`${baseUrl}/models`);
-	url.searchParams.set("key", apiKey);
 	url.searchParams.set("pageSize", String(pageSize));
 	if (pageToken) {
 		url.searchParams.set("pageToken", pageToken);
