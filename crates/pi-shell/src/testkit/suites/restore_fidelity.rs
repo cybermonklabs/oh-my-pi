@@ -109,3 +109,36 @@ fn an_asynchronous_commands_ignored_signals_survive_a_snapshot() {
 		assert_eq!(masks, vec![want], "{text} under snapshots");
 	}
 }
+
+/// A vproc's rarely used state ([`crate::bash::vm::proc::VprocRare`]) is in
+/// the frames image, so a snapshot taken while it is set does not lose it.
+/// What it holds is not an answer the shell prints, so each row reads it
+/// through what the shell does next: the process-substitution fds an op
+/// closes when it ends, which the next substitution then gets back, and the
+/// coprocess `wait` reaps, which unsets `COPROC` and `COPROC_PID`. Goldens:
+/// the uninterrupted run, which matches bash 5.3.20 (`/dev/fd` numbers are
+/// this shell's own, counted down from 63).
+#[test]
+fn a_vprocs_rare_state_survives_a_snapshot() {
+	// The two substitutions of the first command are closed when it ends, so
+	// the third gets 63 back. Without the vproc's list the op closes
+	// nothing, and the third would be 61.
+	let (out, _) = same_under_snapshots(b"echo <(:) <(:); :; :; echo <(:)");
+	assert_eq!(out, b"/dev/fd/63 /dev/fd/62\n/dev/fd/63\n");
+	// A coprocess keeps its fds and its name across the snapshot: the
+	// redirection writes its input, `read -u` reads its output, and the
+	// `wait` reaps it, which unsets both its variables.
+	let (out, _) = same_under_snapshots(
+		b"coproc { read x; echo \"got $x\"; }; :; :; echo hi >&${COPROC[1]}; read -u \
+		  ${COPROC[0]} y; echo \"co $y\"; wait \"$COPROC_PID\"; echo \"end $? \
+		  [${COPROC-unset}] [${COPROC_PID-unset}]\"",
+	);
+	assert_eq!(out, b"co got hi\nend 0 [unset] [unset]\n");
+	// `local -` in a function: the shell's `set -o` states come back when
+	// the function returns, also when a snapshot lands inside it.
+	let (out, _) = same_under_snapshots(
+		b"set +u; f() { local -; set -u; :; :; :; case $- in *u*) echo 'in: u';; *) echo 'in: \
+		  none';; esac; }; f; case $- in *u*) echo 'out: u';; *) echo 'out: none';; esac",
+	);
+	assert_eq!(out, b"in: u\nout: none\n");
+}
