@@ -58,7 +58,7 @@ use crate::bash::{
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
 /// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 38;
+pub const FRAMES_VERSION: u32 = 41;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 

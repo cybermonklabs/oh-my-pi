@@ -3651,6 +3651,9 @@ impl Vproc {
 		// A subshell catches its own fatal errors (bash
 		// `execute_in_subshell`); `exec::forked_for` marks a fork's.
 		vp.set_fork(proc::Fork::CHILD);
+		// A fork whose trap strings are still to reset (bash's
+		// `SUBSHELL_RESETTRAP`, [`proc::OwnTraps::reset_pending`]).
+		vp.own_traps = vp.own_traps.with_reset_pending(true);
 		vp.status = self.status;
 		vp.scopes = state::copy_scopes(&k.root, store, self).unwrap_or_else(|err| {
 			k.fail(err);
