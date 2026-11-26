@@ -53,12 +53,13 @@ const MOCK_API_SOURCE = "test/parked-subagent-session-release";
 // so the deadline only bounds how long a real leak takes to fail.
 const COLLECT_DEADLINE_MS = 15_000;
 /**
- * Set only in the process {@link checkRosterInItsOwnProcess} starts: which reference its probe row keeps to the
- * recorded roster (`dropped`: none; `held`: one of its own, the control).
+ * Set only in the process {@link checkReleaseInItsOwnProcess} starts, as `<what>:<reference>`: which release its probe
+ * row checks (`roster`: the peer roster the transcript recorded; `settings`: the run's settings overlay), and which
+ * reference the row keeps to it (`dropped`: none; `held`: one of its own, the control).
  */
-const ROSTER_PROBE = process.env.OMP_TEST_PARKED_ROSTER_PROBE;
-/** The probe row's own reference to the recorded roster, with `held`. */
-const heldRosters: object[] = [];
+const RELEASE_PROBE = process.env.OMP_TEST_PARKED_RELEASE_PROBE;
+/** The probe rows' own references, with `held`. */
+const heldByProbe: object[] = [];
 
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
 let savedEnv: Record<string, string | undefined> = {};
@@ -119,13 +120,13 @@ async function collected(ref: WeakRef<object>, deadlineMs: number): Promise<bool
 }
 
 /**
- * Runs this file's roster probe row in a process of its own with concurrent JIT compilation off, and checks that the
- * row ran and passed. In a process whose earlier test files warmed the subagent code, an optimizing-JIT compile plan
- * on a background thread can keep the parked subagent's roster reachable past any deadline the check sets, so a
- * collection there says nothing about what the parked state holds: in a whole `bun test` run the check failed or
- * passed with the set of test files before it, and it never failed with `BUN_JSC_useConcurrentJIT` off.
+ * Runs this file's probe row for `what` in a process of its own with concurrent JIT compilation off, and checks that
+ * the row ran and passed. In a process whose earlier test files warmed the subagent code, an optimizing-JIT compile
+ * plan on a background thread can keep the parked subagent's roster, or its settings overlay through the extension
+ * runner that holds it, reachable past any deadline the check sets. So a collection there says nothing about what the
+ * parked state holds: in whole `bun test` runs each check failed or passed with the set of test files before it.
  */
-async function checkRosterInItsOwnProcess(reference: "dropped" | "held"): Promise<void> {
+async function checkReleaseInItsOwnProcess(what: "roster" | "settings", reference: "dropped" | "held"): Promise<void> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value;
 	// The probe's own beforeEach makes its own home; it starts from the environment this file's beforeEach replaced.
@@ -135,13 +136,16 @@ async function checkRosterInItsOwnProcess(reference: "dropped" | "held"): Promis
 		else env[key] = value;
 	}
 	env.BUN_JSC_useConcurrentJIT = "0";
-	env.OMP_TEST_PARKED_ROSTER_PROBE = reference;
-	const child = Bun.spawn([process.execPath, "test", import.meta.path, "--test-name-pattern", "parked roster probe"], {
-		cwd: path.join(import.meta.dir, "../.."),
-		env,
-		stdout: "pipe",
-		stderr: "pipe",
-	});
+	env.OMP_TEST_PARKED_RELEASE_PROBE = `${what}:${reference}`;
+	const child = Bun.spawn(
+		[process.execPath, "test", import.meta.path, "--test-name-pattern", `parked ${what} probe`],
+		{
+			cwd: path.join(import.meta.dir, "../.."),
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		},
+	);
 	const [stdout, stderr, exitCode] = await Promise.all([
 		new Response(child.stdout).text(),
 		new Response(child.stderr).text(),
@@ -152,6 +156,16 @@ async function checkRosterInItsOwnProcess(reference: "dropped" | "held"): Promis
 	// Exactly the probe row ran, and passed: a pattern that matched no row would exit 0 too.
 	expect(output).toMatch(/^\s*1 pass$/m);
 	expect(output).toMatch(/^\s*0 fail$/m);
+}
+
+/** A WeakRef target read in a job stays alive until that job ends: collect from fresh event-loop turns. */
+async function collectFromFreshTurns(): Promise<void> {
+	for (let pass = 0; pass < 3; pass++) {
+		const turn = Promise.withResolvers<void>();
+		setImmediate(turn.resolve);
+		await turn.promise;
+		Bun.gc(true);
+	}
 }
 
 /** Makes a settings write in the live session's own overlay, then observes the overlay weakly (outside the test body). */
@@ -336,17 +350,14 @@ it("releases a parked keep-alive subagent's session while the agent stays reviva
 	}
 }, 30_000);
 
-it("parks without retaining the run's settings overlay and revives with the settings it wrote", async () => {
+it("parks and revives with the settings it wrote", async () => {
 	const run = await runKeptAliveSubagent();
 	try {
 		// A write the subagent made to its own settings during the run.
-		const settingsRef = writeAndObserveLiveSettings(AGENT_ID);
+		writeAndObserveLiveSettings(AGENT_ID);
 
 		await AgentLifecycleManager.global().park(AGENT_ID);
 		run.release();
-		// The reviver held the run's whole overlay — merged view, memoized values, listener buckets —
-		// for as long as the parked agent stayed adopted.
-		expect(await collected(settingsRef, COLLECT_DEADLINE_MS)).toBe(true);
 
 		const revived = localSession(await AgentLifecycleManager.global().ensureLive(AGENT_ID));
 		expect(cfgContextPromotionEnabled.get(revived)).toBe(true);
@@ -417,42 +428,74 @@ it("revives with the peer roster its transcript recorded", async () => {
 }, 30_000);
 
 // If this regresses, every parked subagent keeps a copy of its peer roster for the rest of the process.
-it.skipIf(ROSTER_PROBE !== undefined)(
+it.skipIf(RELEASE_PROBE !== undefined)(
 	"keeps no copy of the peer roster its transcript recorded while parked",
 	async () => {
-		await checkRosterInItsOwnProcess("dropped");
+		await checkReleaseInItsOwnProcess("roster", "dropped");
 	},
 	60_000,
 );
 
-it.skipIf(ROSTER_PROBE !== undefined)(
+it.skipIf(RELEASE_PROBE !== undefined)(
 	"finds a recorded roster alive while something else still holds it (control)",
 	async () => {
-		await checkRosterInItsOwnProcess("held");
+		await checkReleaseInItsOwnProcess("roster", "held");
 	},
 	60_000,
 );
 
-// Runs only in the process checkRosterInItsOwnProcess starts. With `held`, the row keeps the roster itself and must
+// Runs only in the process checkReleaseInItsOwnProcess starts. With `held`, the row keeps the roster itself and must
 // find it alive, so a check that cannot see a reference fails.
-it.skipIf(ROSTER_PROBE === undefined)(
+it.skipIf(!RELEASE_PROBE?.startsWith("roster:"))(
 	"parked roster probe",
 	async () => {
 		registerPeer("EarlyPeer");
 		const run = await runKeptAliveSubagent({ tools: ["read", "write"], enableIrc: true });
 		try {
 			const recorded = observeRecordedRoster(AGENT_ID);
-			if (ROSTER_PROBE === "held") heldRosters.push(recorded.roster.deref() ?? {});
+			if (RELEASE_PROBE === "roster:held") heldByProbe.push(recorded.roster.deref() ?? {});
 			await AgentLifecycleManager.global().park(AGENT_ID);
 			run.release();
-			// A WeakRef target read in a job stays alive until that job ends: collect from fresh event-loop turns, then read.
-			for (let pass = 0; pass < 3; pass++) {
-				const turn = Promise.withResolvers<void>();
-				setImmediate(turn.resolve);
-				await turn.promise;
-				Bun.gc(true);
-			}
-			expect(recorded.roster.deref() === undefined).toBe(ROSTER_PROBE === "dropped");
+			await collectFromFreshTurns();
+			expect(recorded.roster.deref() === undefined).toBe(RELEASE_PROBE === "roster:dropped");
+		} finally {
+			run.close();
+		}
+	},
+	30_000,
+);
+
+// If this regresses, every parked subagent keeps its run's whole settings overlay (merged view, memoized values,
+// listener buckets) for as long as it stays adopted.
+it.skipIf(RELEASE_PROBE !== undefined)(
+	"keeps no copy of the run's settings overlay while parked",
+	async () => {
+		await checkReleaseInItsOwnProcess("settings", "dropped");
+	},
+	60_000,
+);
+
+it.skipIf(RELEASE_PROBE !== undefined)(
+	"finds a run's settings overlay alive while something else still holds it (control)",
+	async () => {
+		await checkReleaseInItsOwnProcess("settings", "held");
+	},
+	60_000,
+);
+
+// Runs only in the process checkReleaseInItsOwnProcess starts. With `held`, the row keeps the overlay itself and must
+// find it alive, so a check that cannot see a reference fails.
+it.skipIf(!RELEASE_PROBE?.startsWith("settings:"))(
+	"parked settings probe",
+	async () => {
+		const run = await runKeptAliveSubagent();
+		try {
+			const settingsRef = writeAndObserveLiveSettings(AGENT_ID);
+			if (RELEASE_PROBE === "settings:held") heldByProbe.push(settingsRef.deref() ?? {});
+			await AgentLifecycleManager.global().park(AGENT_ID);
+			run.release();
+			await collectFromFreshTurns();
+			expect(settingsRef.deref() === undefined).toBe(RELEASE_PROBE === "settings:dropped");
 		} finally {
 			run.close();
 		}
