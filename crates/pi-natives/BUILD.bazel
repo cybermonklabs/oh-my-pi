@@ -235,7 +235,9 @@ rust_test(
 # medium test (sami-checks run 45484907076). They run from a target of their
 # own with timeout "long" (900 s), so the main target keeps 300 s and a hang
 # among its tests still fails there. It runs the main target's test binary,
-# so the two cannot differ in what they build.
+# so the two cannot differ in what they build. Its filters match test names
+# by substring, as the main target's skips do, so the two split the binary's
+# tests: each test the main target skips is one the scanner target runs.
 PI_NATIVES_SCANNER_TESTS = [
     "utok::scan::deepseek::tests::deepseek_scanner_matches_regex_on_random_text",
     "utok::scan::kimi::tests::kimi_scanner_matches_regex_on_random_text",
@@ -265,5 +267,5 @@ native_test(
     timeout = "long",
     src = ":pi_natives_test",
     out = "pi_natives_scanner_test.bin",
-    args = ["--exact"] + PI_NATIVES_SCANNER_TESTS,
+    args = PI_NATIVES_SCANNER_TESTS,
 )
