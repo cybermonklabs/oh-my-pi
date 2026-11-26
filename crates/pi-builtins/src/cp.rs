@@ -8426,16 +8426,14 @@ mod tests {
 		// waits for cp's read open; where cp never opens the FIFO, the row's
 		// end releases it with a reader of its own (`release`), and after
 		// `stop` nothing is written. The feeder then holds its end until the
-		// byte is read or the row's cp has ended, and opens another write end
-		// without waiting every millisecond meanwhile. gVisor's blocking open of
-		// a FIFO can miss a writer that opens, writes and closes while the
-		// opener gets ready to wait: it then waits for the next writer's open,
-		// for ever if none comes, where Linux's waits on the count of writer
-		// opens and sees that one (`wait_for_partner` in fs/pipe.c). GNU cp's
-		// open waits there the same way. Each write end opened is that next
-		// writer; one opened while cp's open has already returned changes
-		// nothing cp reads. (A writer opened without waiting, retried until a
-		// reader shows, was missed the same way.)
+		// byte is read or the row's cp has ended. gVisor's blocking open of a
+		// FIFO can miss a writer that opens, writes and closes while the opener
+		// gets ready to wait: it then waits for the next writer's open, for
+		// ever if none comes, where Linux's waits on the count of writer opens
+		// and sees that one (`wait_for_partner` in fs/pipe.c). GNU cp's open
+		// waits there the same way. A writer the feeder still holds open is
+		// there to be seen whenever the opener looks. (A writer opened without
+		// waiting, retried until a reader shows, was missed the same way.)
 		fn feed(path: std::path::PathBuf, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
 			std::thread::spawn(move || {
 				let Ok(mut fifo) = fs::OpenOptions::new().write(true).open(&path) else {
@@ -8447,7 +8445,6 @@ mod tests {
 					return;
 				}
 				while !stop.load(Ordering::Relaxed) && unread(&fifo) > 0 {
-					drop(fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&path));
 					std::thread::sleep(Duration::from_millis(1));
 				}
 			})
