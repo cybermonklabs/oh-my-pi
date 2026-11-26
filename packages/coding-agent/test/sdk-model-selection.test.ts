@@ -1119,7 +1119,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			}),
 		);
 
-		expect(message).toBe("No working credentials for named subagent model: runtime-provider/runtime-model.");
+		expect(message).toBe("No working credentials for named subagent model: runtime-provider/runtime-model");
 	});
 
 	test("starts a held subagent on a later named model, not on its chain, when the first has no working credentials", async () => {
@@ -1586,6 +1586,59 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		} finally {
 			await session.dispose();
 		}
+	});
+
+	/** A held subagent's deferred list of two models, with working credentials for `credentialedIds` only. */
+	function createHeldDeferredSession(credentialedIds: readonly string[]) {
+		const authStorage = createInMemoryAuthStorage();
+		authStoragesToClose.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "held-models.yml"));
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async requested =>
+			requested.provider === "runtime-provider" && credentialedIds.includes(requested.id) ? "test-key" : undefined,
+		);
+		return createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			disableExtensionDiscovery: true,
+			extensions: [providerExtension],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			rules: [],
+			preloadedCustomToolPaths: [],
+			toolNames: ["read"],
+			modelPattern: ["runtime-provider/runtime-model", "runtime-provider/runtime-fallback-model"],
+			modelPatternFallbackRole: "subagent:held",
+			modelPatternDefaultFallbackChain: [],
+			// The hold (`task.namedModelFallback` off) reaches createAgentSession as the subagent's exclusive role.
+			exclusiveRetryFallbackRole: "subagent:held",
+		});
+	}
+
+	test("starts a held deferred list on its first entry with working credentials", async () => {
+		const { session, modelFallbackMessage } = await createHeldDeferredSession(["runtime-fallback-model"]);
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("runtime-fallback-model");
+			expect(modelFallbackMessage).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("starts a held deferred list with no model, naming its entries, when none has working credentials", async () => {
+		// createAgentSession refuses the session itself, naming every entry, instead of starting it with no model.
+		const message = await creationError(createHeldDeferredSession([]));
+		expect(message).toBe(
+			"No working credentials for named subagent models: runtime-provider/runtime-model, runtime-provider/runtime-fallback-model",
+		);
 	});
 
 	test("resolves deferred role-alias modelPattern after extension providers register", async () => {

@@ -1979,9 +1979,9 @@ export async function resolveModelOverrideWithAuthFallback(
 	};
 }
 
-/** The refusal of a subagent held to its named models when none of them has working credentials. */
+/** Why a subagent held to its named models has none to run on: none of `models` has working credentials. */
 export function formatUnauthenticatedNamedModelsError(models: readonly string[]): string {
-	return `No working credentials for named subagent model${models.length === 1 ? "" : "s"}: ${models.join(", ")}.`;
+	return `No working credentials for named subagent model${models.length === 1 ? "" : "s"}: ${models.join(", ")}`;
 }
 
 /**
