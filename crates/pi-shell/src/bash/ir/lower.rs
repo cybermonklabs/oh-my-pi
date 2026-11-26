@@ -517,6 +517,39 @@ fn take_body(unit: Unit, root: u32) -> Option<Unit> {
 	None
 }
 
+/// The `time` of a `( … )`, which bash runs in the subshell's fork: the
+/// fork is made before any `time_command` (`execute_cmd.c`:683, :807), and
+/// `execute_in_subshell` makes the subshell's own redirections, then gives
+/// `CMD_TIME_PIPELINE` and `CMD_TIME_POSIX` to the command inside it
+/// (`execute_cmd.c`:1781). So the times are taken and reported in the fork:
+/// after its redirections (`time ( … ) 2> e` reports into `e`, and one that
+/// fails leaves no report), with the fork's `TIMEFORMAT`, before its EXIT
+/// trap. bash mode only; zsh times the job.
+#[derive(Clone, Copy)]
+struct ForkTime {
+	/// `time -p`.
+	posix: bool,
+	/// The timed pipeline's node (the `TimeStart` and `TimeEnd` ops').
+	node:  u32,
+}
+
+/// The and-or list a `( … )`'s body is when it is one `( … )` alone
+/// (`( ( … ) 2> e )`, `( ! ( … ) )`): `execute_in_subshell` gives the
+/// outer `( … )`'s `time` to that command, which forks again, so the time
+/// moves on into the inner fork.
+fn lone_subshell(body: st::List<'_>) -> Option<st::AndOr<'_>> {
+	let item = body.items().one()?;
+	if matches!(item.sep(), syn::Sep::Amp | syn::Sep::Disown) {
+		return None;
+	}
+	let ao = item.and_or();
+	if ao.rest().len() > 0 {
+		return None;
+	}
+	let stage = ao.first().stages().one()?;
+	matches!(stage.kind(), st::CommandKind::Subshell(_)).then_some(ao)
+}
+
 struct Lower {
 	unit:          Unit,
 	source_hash:   blake3::Hasher,
@@ -736,19 +769,37 @@ impl Lower {
 	}
 
 	fn pipeline(&mut self, p: st::Pipeline<'_>) -> R {
+		self.pipeline_in(p, None)
+	}
+
+	/// `outer`: the `time` of the `( … )` whose whole body this pipeline is
+	/// ([`lone_subshell`]), which bash passes on to this pipeline's own `( … )`.
+	fn pipeline_in(&mut self, p: st::Pipeline<'_>, outer: Option<ForkTime>) -> R {
 		let async_bang = std::mem::take(&mut self.async_bang);
 		let pid = p.id().0;
 		self.node(p.id(), NodeKind::Pipeline, p.span());
-		let time = p.time();
-		if time.is_some() {
-			self.emit(Opcode::TimeStart, 0, 0, pid);
+		let own = p.time().map(|t| ForkTime { posix: t.posix, node: pid });
+		// bash sets an outer `time`'s flags on a command that already has
+		// its own: one report, in `time -p`'s format if either asks for it.
+		let time = match (outer, own) {
+			(Some(o), Some(t)) => Some(ForkTime { posix: o.posix || t.posix, ..o }),
+			(o, t) => o.or(t),
+		};
+		let stages = p.stages();
+		let lone = stages.one();
+		let fork = time.filter(|_| {
+			self.unit.mode.dialect() != crate::bash::ids::Dialect::Zsh
+				&& lone.is_some_and(|s| matches!(s.kind(), st::CommandKind::Subshell(_)))
+		});
+		let here = time.filter(|_| fork.is_none());
+		if let Some(t) = here {
+			self.emit(Opcode::TimeStart, 0, 0, t.node);
 		}
 		if p.bang() {
 			self.cond += 1;
 		}
-		let stages = p.stages();
-		if let Some(stage) = stages.one() {
-			self.command(stage)?;
+		if let Some(stage) = lone {
+			self.command_in(stage, fork)?;
 		} else {
 			let spawn = self.unit.spawns.len() as u32;
 			self.unit.spawns.push(SpawnIr {
@@ -777,8 +828,8 @@ impl Lower {
 				self.emit(Opcode::Not, 0, 0, pid);
 			}
 		}
-		if let Some(t) = time {
-			self.emit(Opcode::TimeEnd, 0, u32::from(t.posix), pid);
+		if let Some(t) = here {
+			self.emit(Opcode::TimeEnd, 0, u32::from(t.posix), t.node);
 		}
 		Ok(())
 	}
@@ -791,6 +842,12 @@ impl Lower {
 	}
 
 	fn command(&mut self, cmd: st::Command<'_>) -> R {
+		self.command_in(cmd, None)
+	}
+
+	/// `time`: the `time` bash moves into the fork of the `( … )` that
+	/// `cmd` is ([`ForkTime`]).
+	fn command_in(&mut self, cmd: st::Command<'_>, time: Option<ForkTime>) -> R {
 		let id = cmd.id().0;
 		let redirs = cmd.redirs();
 		if let st::CommandKind::Simple(s) = cmd.kind() {
@@ -810,7 +867,7 @@ impl Lower {
 			let r = self.redir_list(redirs)?;
 			Some(self.emit(Opcode::Redir, r, 0, id))
 		};
-		self.compound(cmd)?;
+		self.compound(cmd, time)?;
 		if let Some(at) = redir {
 			self.emit(Opcode::PopRedir, 0, 0, id);
 			let after = self.here();
@@ -819,7 +876,7 @@ impl Lower {
 		Ok(())
 	}
 
-	fn compound(&mut self, cmd: st::Command<'_>) -> R {
+	fn compound(&mut self, cmd: st::Command<'_>, time: Option<ForkTime>) -> R {
 		let id = cmd.id().0;
 		let (cid, cspan) = (cmd.id(), cmd.span());
 		match cmd.kind() {
@@ -852,7 +909,7 @@ impl Lower {
 				});
 				self.emit(Opcode::Spawn, spawn, 0, id);
 				let entry = self.here();
-				self.list(body)?;
+				self.subshell_body(body, time)?;
 				self.emit(Opcode::SubExit, 0, 0, id);
 				let end = self.here();
 				let s = &mut self.unit.spawns[spawn as usize];
@@ -1137,6 +1194,23 @@ impl Lower {
 				s.end = end;
 			},
 		}
+		Ok(())
+	}
+
+	/// A `( … )`'s body, run in its fork. The `( … )`'s `time` ([`ForkTime`])
+	/// times the body there, or passes on to a body that is one `( … )`
+	/// alone ([`lone_subshell`]), as `list` would lower it.
+	fn subshell_body(&mut self, body: st::List<'_>, time: Option<ForkTime>) -> R {
+		let Some(t) = time else {
+			return self.list(body);
+		};
+		if let Some(ao) = lone_subshell(body) {
+			self.node(ao.id(), NodeKind::AndOr, ao.span());
+			return self.pipeline_in(ao.first(), Some(t));
+		}
+		self.emit(Opcode::TimeStart, 0, 0, t.node);
+		self.list(body)?;
+		self.emit(Opcode::TimeEnd, 0, u32::from(t.posix), t.node);
 		Ok(())
 	}
 

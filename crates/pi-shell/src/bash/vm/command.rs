@@ -5610,9 +5610,17 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 	// `exit` jumps while its own redirections are in effect: bash's
 	// `time_command` reports through them (`time exit 3 2>/dev/null` prints
 	// nothing), so the report goes out before they are undone below. A
-	// `break` with a non-numeric count runs bash's `top_level_cleanup` first
-	// ([`exec::Jump::Cleanup`]).
+	// posix special builtin's `ERREXIT` (its usage error, or a redirection
+	// of its that failed) comes after bash's `execute_builtin_or_function`
+	// undid the builtin's redirections (execute_cmd.c:5687-5693, and
+	// `undo_partial_redirects`; the jump is at execute_cmd.c:1004 and 4872):
+	// its report goes through the redirections outside the command. A
+	// `break` with a non-numeric count runs bash's `top_level_cleanup`
+	// first ([`exec::Jump::Cleanup`]).
 	if let Some(Transfer::Exit(_, jump)) = control {
+		if jump == exec::Jump::Errexit {
+			undo_own_redirections(vp);
+		}
 		exec::report_jump(k, vp, cx, 0, jump);
 	}
 	let sc = vp
@@ -5645,6 +5653,21 @@ fn finish(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op) -> Flow {
 			exec::drop_times(vp);
 			Flow::Exit(status, exec::Jump::Direct)
 		},
+	}
+}
+
+/// Restore the fds the current command's own redirections replaced
+/// (latest first), before the scratch that saved them is dropped.
+fn undo_own_redirections(vp: &mut Vproc) {
+	if let Some(io) = vp
+		.frames
+		.last_mut()
+		.and_then(|f| f.scratch.as_mut())
+		.and_then(|sc| sc.io.as_mut())
+	{
+		for s in io.saved.drain(..).rev() {
+			vp.fds.set(s.fd, s.prev);
+		}
 	}
 }
 
@@ -5882,6 +5905,11 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 	let mut child = vp.child_text(k, cx.store, &text, line, vp.fds.clone());
 	// The command's own fork: bash and zsh keep the loop level.
 	child.outer_loops = super::exec::fork_loops(vp, true);
+	// bash runs the hook in `execute_disk_command`'s child, which keeps the
+	// shell's `SUBSHELL_RESETTRAP` as it was (jobs.c:2350 adds another flag).
+	child.own_traps = child
+		.own_traps
+		.with_reset_pending(vp.own_traps.reset_pending());
 	let vpid = child.vpid;
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));

@@ -55,7 +55,7 @@
 //! | `Arith` | `ariths` index | [`Op::LITERAL`] or 0 | expand and evaluate arithmetic text; `$?` = 0 when non-zero (an empty text is true) |
 //! | `CondTest` | `conds` index | – | one `[[ ]]` primary (staged: file probes are pollable) |
 //! | `FuncDef` | `funcs` index | – | define a function |
-//! | `TimeStart` | – | – | push the `time` start |
+//! | `TimeStart` | – | – | push the `time` start (bash mode: a `time ( … )`'s pair sits inside the subshell's spawn, around its body, or the body's own lone `( … )`'s) |
 //! | `TimeEnd` | – | `1` for `time -p` | pop the start, print the timing to stderr |
 //! | `Warn` | `strs` index | line | print a parser warning (flag [`Op::SYNTAX`]: a syntax-error detail line; with [`Op::CONTEXT`] then `strs[a+1]`, the offending line: a syntax error bash recovers from) |
 //! | `Abort` | `strs` index | status | print the diagnostic(s) and abandon the script; `node` holds the line; flag [`Op::SYNTAX`]: a syntax error (else `strs[a]` names an unsupported construct), [`Op::CONTEXT`]: `strs[a+1]` is the offending source line |

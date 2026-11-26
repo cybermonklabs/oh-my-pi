@@ -3972,10 +3972,15 @@ pub fn start_procsub(
 	if !job_control(k, cx, vp) {
 		ignore_async_signals(k, cx, &mut child);
 	}
-	// bash runs the text with `parse_and_execute` (`process_substitute`).
+	// bash runs the text with `parse_and_execute` (`process_substitute`),
+	// in a fork that keeps the shell's `SUBSHELL_RESETTRAP` as it was
+	// (subst.c:6433 adds other flags only).
 	child.frames[0]
 		.flags
 		.set_parse_level(ParseLevel::Substitution);
+	child.own_traps = child
+		.own_traps
+		.with_reset_pending(vp.own_traps.reset_pending());
 	let vpid = child.vpid;
 	// Not a job: its externals stay in the shell's group, without the
 	// terminal.
@@ -4696,7 +4701,8 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, o
 			builtins::define_function(k, vp, cx, f, line, op.flags & Op::TRACED != 0)
 		},
 		Opcode::TimeStart => {
-			let mark = time_mark(&*cx.host);
+			let reset_traps = vp.own_traps.reset_pending();
+			let mark = super::proc::TimeMark { reset_traps, ..time_mark(&*cx.host) };
 			top_frame(vp).times.push(mark);
 			Flow::Next
 		},
@@ -4851,9 +4857,10 @@ const BASH_TIMEFORMAT: &[u8] = b"\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS";
 fn time_mark(host: &dyn crate::bash::host::Host) -> super::proc::TimeMark {
 	let cpu = host.cpu_times().unwrap_or_default();
 	super::proc::TimeMark {
-		real: host.now_ns(),
-		user: cpu.user_ns.saturating_add(cpu.child_user_ns),
-		sys:  cpu.sys_ns.saturating_add(cpu.child_sys_ns),
+		real:        host.now_ns(),
+		user:        cpu.user_ns.saturating_add(cpu.child_user_ns),
+		sys:         cpu.sys_ns.saturating_add(cpu.child_sys_ns),
+		reset_traps: false,
 	}
 }
 
@@ -4880,7 +4887,7 @@ fn time_end(
 	}
 	let posix = null && state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
 	let start = if posix {
-		super::proc::TimeMark { real: k.start_of(vp), user: 0, sys: 0 }
+		super::proc::TimeMark { real: k.start_of(vp), ..Default::default() }
 	} else {
 		start
 	};
@@ -4968,13 +4975,36 @@ pub enum Jump {
 /// `exec` replaces the shell, and a jump after `top_level_cleanup` drops
 /// the marks started inside a `parse_and_execute` unreported
 /// ([`jump_out`]). Report, innermost first, the `time` marks of frames
-/// `frame` and up, and drop them. A jump that passes an `eval`, `.` or
-/// trap action (a `parse_and_execute`, which undoes its commands'
-/// redirections as it passes the jump on, except those
-/// [`kept_redirections`] leaves) reports the marks below it through the
-/// redirections in effect outside it.
+/// `frame` and up, and drop them; a mark started in a fork that has run
+/// `trap` since goes unreported
+/// ([`OwnTraps::reset_pending`](super::proc::OwnTraps::reset_pending)). A jump
+/// that passes an `eval`, `.` or trap action (a `parse_and_execute`, which
+/// undoes its commands' redirections as it passes the jump on, except
+/// those [`kept_redirections`] leaves) reports the marks below it through
+/// the redirections in effect outside it.
 fn report_left_times(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, frame: usize, jump: Jump) {
 	if vp.frames.iter().skip(frame).all(|f| f.times.is_empty()) {
+		return;
+	}
+	// Each frame's marks with their `-p` flags, innermost first, less those
+	// bash's `time_command` jumps on from without a report: it skips the
+	// report when `subshell_environment` changed under it
+	// (execute_cmd.c:1499), which in a fork is a `trap` call clearing
+	// `SUBSHELL_RESETTRAP` (trap.def:208).
+	let reset = vp.own_traps.reset_pending();
+	let mut left: Vec<Vec<(super::proc::TimeMark, bool)>> = vp.frames[frame..]
+		.iter_mut()
+		.map(|f| {
+			let ends = pending_time_ends(f, f.times.len());
+			f.times
+				.drain(..)
+				.rev()
+				.zip(ends)
+				.filter(|(start, _)| reset || !start.reset_traps)
+				.collect()
+		})
+		.collect();
+	if left.iter().all(Vec::is_empty) {
 		return;
 	}
 	let kept = kept_redirections(k, vp, cx, frame, jump);
@@ -4985,17 +5015,13 @@ fn report_left_times(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, frame: usi
 		.and_then(|f| f.unit.as_deref().and_then(|u| u.ops.get(f.pc as usize)))
 		.map_or(0, |op| line_of(vp, op.node));
 	for i in (frame..vp.frames.len()).rev() {
-		let f = &vp.frames[i];
-		let ends = pending_time_ends(f, f.times.len());
-		let left: Vec<_> = f.times.iter().rev().copied().zip(ends).collect();
-		vp.frames[i].times.clear();
-		for (start, dash_p) in left {
+		for (start, dash_p) in std::mem::take(&mut left[i - frame]) {
 			bash_time_report(k, vp, cx, dash_p, false, elapsed(start, end), line);
 		}
 		if i > frame
 			&& i < kept
 			&& parse_and_execute(&vp.frames[i])
-			&& vp.frames[frame..i].iter().any(|f| !f.times.is_empty())
+			&& left[..i - frame].iter().any(|l| !l.is_empty())
 		{
 			undo_redirections(k, vp, i, kept);
 		}
