@@ -409,10 +409,10 @@ fn a_login_shell_without_home_reads_the_profile_in_its_password_database_home() 
 /// ([`process_support::BASH_OLDEST`]): an older bash is refused, with a
 /// reason naming the version it found, which [`real_bash`] prints on an
 /// `UNCOMPARED:` line. Here a stand-in reports the bash of Ubuntu 22.04,
-/// 5.1.16; this test prints nothing.
+/// 5.1.16; this test prints nothing. The stand-in is written by a child
+/// `sh` ([`write_program`]), not by this process.
 #[test]
 fn the_real_bash_must_be_5_2_or_later() {
-	use std::os::unix::fs::PermissionsExt;
 	for (line, new_enough) in [
 		("GNU bash, version 5.2.21(1)-release (x86_64-pc-linux-gnu)", true),
 		("GNU bash, version 5.3.0(1)-release (aarch64-apple-darwin24)", true),
@@ -432,14 +432,12 @@ fn the_real_bash_must_be_5_2_or_later() {
 	let dir = tempfile::tempdir().expect("a directory for a stand-in bash");
 	let fake = dir.path().join("bash");
 	for (version, accepted) in [("5.1.16", false), ("5.2.21", true)] {
-		fs::write(
+		write_program(
 			&fake,
-			format!(
+			&format!(
 				"#!/bin/sh\necho 'GNU bash, version {version}(1)-release (x86_64-pc-linux-gnu)'\n"
 			),
-		)
-		.expect("write the stand-in");
-		fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("make it runnable");
+		);
 		match process_support::bash_at(fake.clone()) {
 			Ok(_) => assert!(accepted, "bash {version} was taken"),
 			Err(refusal) => {
@@ -448,6 +446,22 @@ fn the_real_bash_must_be_5_2_or_later() {
 			},
 		}
 	}
+}
+
+/// Writes `text` to `path`, mode 0755, through a child `sh`, as the vfs
+/// tests' `write_program` does. This binary runs its tests as threads of
+/// one process: a child another test's thread forks while this process
+/// holds the program open for writing keeps a copy of that descriptor until
+/// it execs, and running the program meanwhile fails with `ETXTBSY` ("Text
+/// file busy"). A child `sh` that wrote it and exited holds none.
+fn write_program(path: &std::path::Path, text: &str) {
+	let status = Command::new("/bin/sh")
+		.args(["-c", "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"", "sh"])
+		.arg(path)
+		.arg(text)
+		.status()
+		.unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
+	assert!(status.success(), "writing {}: {status}", path.display());
 }
 
 /// A run starts with a core size limit of 1 byte ([`Run`]): a pipe
