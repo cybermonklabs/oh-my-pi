@@ -267,8 +267,8 @@ fn names_the_operator_word() {
 			0,
 			0,
 		),
-		// The word of a `${…}` that is itself inside `"…"` keeps the
-		// backslash (row e12).
+		// The `-`, `=` or `+` word of a `${…}` that is itself inside `"…"`
+		// keeps the backslash (row e12).
 		(
 			"echo \"${y:-\"\\\"${x!}\"}\"\necho \"after $?\"",
 			"after 1\n",
@@ -475,6 +475,517 @@ echo "after $?""#,
 			"echo $(( \"${x!}\\\"\" ))\necho \"after $?\"",
 			"after 1\n",
 			"PFX: line 1: ${x!}\": bad substitution\n",
+			0,
+			0,
+		),
+	]);
+}
+
+/// The `-`, `=` and `+` words of a `${…}` that bash expands as if
+/// double-quoted: inside `"…"`, in a here-document body, in arithmetic
+/// text, in a prompt, and in such a word itself. bash expands such a word
+/// as one double-quoted string (`parameter_brace_expand_rhs`), so a `\"` in
+/// its quotes keeps its backslash.
+#[test]
+fn keeps_the_backslash_where_bash_expands_as_if_double_quoted() {
+	check(&[
+		// A here-document body, a nested `${…}`, arithmetic text.
+		(
+			"cat <<E\n${y:-\"\\\"${x!}\"}\nE\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo \"${y:-${z:-\"\\\"${x!}\"}}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( \"${y:-\"\\\"${x!}\"}\" ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( ${y:-\"\\\"${x!}\"} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"y=1\ncat <<E\n${y:+\"\\\"${x!}\"}\nE\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"cat <<-E\n\t${y:-\"\\\"${x!}\"}\n\tE\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"(( ${y:-\"\\\"${x!}\"} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"for (( i = ${y:-\"\\\"${x!}\"}; i < 1; i++ )); do :; done\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		// A substring offset and an indexed subscript are arithmetic text.
+		(
+			"z=abc\necho ${z:${y:-\"\\\"${x!}\"}}\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"a=(1 2)\necho ${a[${y:-\"\\\"${x!}\"}]}\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"a=(1 2)\necho \"${a[${y:-\"\\\"${x!}\"}]}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"z=abc\necho \"${z:${y:-\"\\\"${x!}\"}}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		// A prompt (`@P`).
+		(
+			"p='${y:-\"\\\"${x!}\"}'\necho \"${p@P}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		// `=` and `+` words, and a here-document's nested `${…}`.
+		(
+			"echo \"${y:=${z:-\"\\\"${x!}\"}}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"y=1\necho \"${y:+${z:-\"\\\"${x!}\"}}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"cat <<E\n${y:-${z:-\"\\\"${x!}\"}}\nE\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		// The context comes back after a `${…}` in the word, and after an
+		// array subscript in arithmetic text; a here-document has none.
+		(
+			"echo \"${y:-${z}${w:-\"\\\"${x!}\"}}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"cat <<E\n${y:-${z}${w:-\"\\\"${x!}\"}}\nE\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( b[1] + ${y:-\"\\\"${x!}\"} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( a[b[1]] + ${y:-\"\\\"${x!}\"} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"cat <<E\na[${y:-\"\\\"${x!}\"}]\nE\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+	]);
+}
+
+/// bash expands a `${…}`'s other words unquoted, inside `"…"`, a
+/// here-document or arithmetic too: a pattern (`getpattern`), a
+/// replacement, a `?` word, an associative subscript, an array subscript in
+/// arithmetic text, and a command substitution's body. A `\"` in their
+/// quotes loses its backslash.
+#[test]
+fn drops_the_backslash_where_bash_expands_unquoted() {
+	check(&[
+		// Patterns and a replacement.
+		(
+			"x=abc\necho \"${x#\"\\\"${y!}\"}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho \"${x/\"\\\"${y!}\"/z}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho \"${x%\"\\\"${y!}\"}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho \"${x/a/\"\\\"${y!}\"}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho \"${x^\"\\\"${y!}\"}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho \"${x,,\"\\\"${y!}\"}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho \"${x#${z:-\"\\\"${y!}\"}}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho \"${x/a/${z:-\"\\\"${y!}\"}}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho $(( ${x#\"\\\"${y!}\"} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		// A `?` word.
+		(
+			"echo \"${u?\"\\\"${x!}\"}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo \"${u?${z:-\"\\\"${x!}\"}}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		// An associative subscript.
+		(
+			"declare -A h=([k]=v)\necho \"${h[\"\\\"${x!}\"]}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"declare -A h=([k]=v)\necho ${h[${y:-\"\\\"${x!}\"}]}\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"declare -A h=([k]=v)\necho \"${h[${y:-\"\\\"${x!}\"}]}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		// An array subscript in arithmetic text (`expand_array_subscript`).
+		(
+			"echo $(( a[${y:-\"\\\"${x!}\"}] ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( a[ ${y:-\"\\\"${x!}\"} ] ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"(( a[${y:-\"\\\"${x!}\"}] ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"z=abc\necho ${z:a[${y:-\"\\\"${x!}\"}]}\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"a=(1 2)\necho $(( a[${y:-\"\\\"${x!}\"}] ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( \"a[${y:-\"\\\"${x!}\"}]\" ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		// In a here-document and in arithmetic too.
+		(
+			"cat <<E\n${u?\"\\\"${x!}\"}\nE\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho $(( ${x%\"\\\"${y!}\"} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( ${u?\"\\\"${x!}\"} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho $(( ${x/\"\\\"${y!}\"/z} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		// An associative subscript of a `${…}` with a `-` word.
+		(
+			"declare -A h=([k]=v)\necho \"${h[\"\\\"${x!}\"]:-d}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		// A command substitution's body.
+		(
+			"echo \"${y:-$(echo \"\\\"${x!}\")}\"\necho \"after $?\"",
+			"\nafter 0\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo \"${y:-$(echo ${z:-\"\\\"${x!}\"})}\"\necho \"after $?\"",
+			"\nafter 0\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"cat <<E\n${y:-$(echo \"\\\"${x!}\")}\nE\necho \"after $?\"",
+			"\nafter 0\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"cat <<E\n$(echo ${y:-\"\\\"${x!}\"})\nE\necho \"after $?\"",
+			"\nafter 0\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"echo $(( $(echo ${y:-\"\\\"${x!}\"}) ))\necho \"after $?\"",
+			"0\nafter 0\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+	]);
+}
+
+/// A `/` replacement word keeps `Q_ARITH` (bash takes away only the
+/// double-quoted context), and so does a `[[ ]]` arithmetic operand: in
+/// arithmetic text, the quote a `\"` leaves in their quotes opens a string
+/// of its own, which is what a part failing after it names.
+#[test]
+fn names_a_replacement_in_arithmetic_as_arithmetic() {
+	check(&[
+		(
+			"x=abc\necho $(( ${x/a/\"\\\"${y!}\"} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho $(( ${x/a/\"a\\\"b${y!}\"} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: b${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho $(( ${x/a/${z:-\"\\\"${y!}\"}} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho $(( \"${x/a/\"\\\"${y!}\"}\" ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\nz=abc\necho ${z:${x/a/\"\\\"${y!}\"}}\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 3: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\n(( ${x/a/\"\\\"${y!}\"} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho $(( ${q:-${x/a/\"\\\"${y!}\"}} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho $(( ${x//a/\"\\\"${y!}\"} ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		// A `[[ ]]` arithmetic operand and `-v`'s (`cond_expand_word`'s
+		// `Q_ARITH`); `==`'s operand is no arithmetic.
+		(
+			"[[ \"\\\"${x!}\" -eq 1 ]]\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: ${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\n[[ -v ${x/a/\"\\\"${y!}\"} ]]\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"[[ \"\\\"${x!}\" == 1 ]]\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\n[[ ${x/a/\"\\\"${y!}\"} -eq 1 ]]\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		// Outside arithmetic, and in an array subscript (which takes
+		// `Q_ARITH` away), the quote stays.
+		(
+			"x=abc\necho ${x/a/\"\\\"${y!}\"}\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho \"${x/a/\"a\\\"b${y!}\"}\"\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: a\"b${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\necho $(( a[${x/a/\"\\\"${y!}\"}] ))\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${y!}: bad substitution\n",
 			0,
 			0,
 		),

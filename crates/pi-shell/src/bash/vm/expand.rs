@@ -607,7 +607,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 		} else {
 			None
 		};
-		let expanded = self.expand_arith_text(quoted.as_deref().unwrap_or(text))?;
+		let expanded =
+			self.expand_arith_text(quoted.as_deref().unwrap_or(text), super::TextKind::Arith)?;
 		Ok(Cow::Owned(expanded.into()))
 	}
 
@@ -654,7 +655,10 @@ impl<'e, 'c> Expander<'e, 'c> {
 								.iter()
 								.any(|c| matches!(c, b'$' | b'`' | b'\\' | b'"' | b'\''))
 							{
-								self.expand_arith_text(&subscript_as_arith_text(sub))?
+								self.expand_arith_text(
+									&subscript_as_arith_text(sub),
+									super::TextKind::ArithUnquoted,
+								)?
 							} else {
 								BString::from(sub)
 							};
@@ -680,17 +684,18 @@ impl<'e, 'c> Expander<'e, 'c> {
 			}
 		}
 		out.extend_from_slice(&subscript_as_arith_text(&src[last.min(src.len())..]));
-		self.expand_arith_text(&out)
+		self.expand_arith_text(&out, super::TextKind::ArithOperand)
 	}
 
-	/// Expand `text` parsed as arithmetic text.
-	fn expand_arith_text(&mut self, text: &[u8]) -> X<BString> {
+	/// Expand `text` parsed as arithmetic text of `kind` (`Arith`,
+	/// `ArithUnquoted` or `ArithOperand`).
+	fn expand_arith_text(&mut self, text: &[u8], kind: super::TextKind) -> X<BString> {
 		let unit = self
 			.k
 			.engine
 			.text_unit(
 				text,
-				super::TextKind::Arith,
+				kind,
 				self.vp_mode(),
 				self
 					.k
@@ -732,7 +737,10 @@ impl<'e, 'c> Expander<'e, 'c> {
 							.iter()
 							.any(|c| matches!(c, b'$' | b'`' | b'\\' | b'"' | b'\''))
 						{
-							self.expand_arith_text(&subscript_as_arith_text(sub))?
+							self.expand_arith_text(
+								&subscript_as_arith_text(sub),
+								super::TextKind::ArithUnquoted,
+							)?
 						} else {
 							BString::from(sub)
 						};
@@ -1707,7 +1715,8 @@ impl<'e, 'c> Expander<'e, 'c> {
 			{
 				return Ok(BString::from(sub));
 			}
-			return self.expand_arith_text(&subscript_as_arith_text(sub));
+			return self
+				.expand_arith_text(&subscript_as_arith_text(sub), super::TextKind::ArithUnquoted);
 		}
 		let n = self.arith(sub)?;
 		Ok(BString::from(n.format_into(&mut NumBuffer::new())))
@@ -3873,7 +3882,7 @@ pub fn expand_subscript(
 	let mut ex = Expander::new(k, cx, vp, log, true, line);
 	ex.cursor = *cursor;
 	let res = if assoc {
-		ex.expand_arith_text(&subscript_as_arith_text(text))
+		ex.expand_arith_text(&subscript_as_arith_text(text), super::TextKind::ArithUnquoted)
 	} else {
 		ex.expand_text(text).map(|t| BString::from(t.into_owned()))
 	};
@@ -4019,7 +4028,9 @@ impl arith::Env for Vars<'_, '_> {
 		let line = super::exec::current_line(self.vp);
 		let mut log = Vec::new();
 		let mut ex = Expander::new(self.k, self.cx, self.vp, &mut log, false, line);
-		let diag = match ex.expand_arith_text(&subscript_as_arith_text(key)) {
+		let diag = match ex
+			.expand_arith_text(&subscript_as_arith_text(key), super::TextKind::ArithUnquoted)
+		{
 			Ok(v) => return Ok(v),
 			Err(Stop::Fail(Diag::Unbound { name }) | Stop::Fatal(Diag::Unbound { name })) => {
 				return Err(arith::Error::Unbound { name });

@@ -234,11 +234,14 @@ impl Engine {
 		if let Some(u) = self.texts.lock().get(&key) {
 			if observed && u.trace_syntax.get().is_none() {
 				let syntax = match kind {
-					TextKind::Arith | TextKind::HereDoc => {
-						let mode = if kind == TextKind::Arith {
-							TextMode::Arith
-						} else {
+					TextKind::Arith
+					| TextKind::ArithUnquoted
+					| TextKind::ArithOperand
+					| TextKind::HereDoc => {
+						let mode = if kind == TextKind::HereDoc {
 							TextMode::HereDoc
+						} else {
+							TextMode::Arith
 						};
 						crate::bash::syntax::parse_text(text, Features::NONE, mode)
 							.ok()
@@ -263,16 +266,21 @@ impl Engine {
 			msg:  BString::from(format!("{what}: not supported by this engine yet")),
 		};
 		let unit = match kind {
-			TextKind::Arith | TextKind::HereDoc => {
-				let tmode = if kind == TextKind::Arith {
-					TextMode::Arith
-				} else {
+			TextKind::Arith | TextKind::ArithUnquoted | TextKind::ArithOperand | TextKind::HereDoc => {
+				let tmode = if kind == TextKind::HereDoc {
 					TextMode::HereDoc
+				} else {
+					TextMode::Arith
 				};
 				let (tree, root) = crate::bash::syntax::parse_text(text, Features::NONE, tmode)
 					.map_err(|e| TextError { line: e.line, msg: BString::from(e.bash_msg()) })?;
 				let word = crate::bash::syntax::tree::Word::at(&tree, root);
-				let unit = ir::lower_text(word, text, mode, Features::NONE).map_err(unsupported)?;
+				// bash's quoting flags for each kind: `Q_DOUBLE_QUOTES` (or
+				// `Q_HERE_DOCUMENT`), `Q_ARITH`.
+				let dq = matches!(kind, TextKind::Arith | TextKind::HereDoc);
+				let arith = matches!(kind, TextKind::Arith | TextKind::ArithOperand);
+				let unit =
+					ir::lower_text(word, text, mode, Features::NONE, dq, arith).map_err(unsupported)?;
 				if observed {
 					let syntax = crate::bash::trace::syntax::UnitSyntax::new(
 						0,
