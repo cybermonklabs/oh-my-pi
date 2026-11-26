@@ -5510,7 +5510,10 @@ fn not_found_hook(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32) ->
 	if let Some(flow) = super::exec::fork_failed(k, vp, cx, 1, line) {
 		return Some(flow);
 	}
-	let mut child = vp.child_text(k, cx.store, &text, line, vp.fds.clone());
+	// bash runs the hook in the fork of the command it did not find, which
+	// has no `top_level` of its own (execute_cmd.c:5924).
+	let catcher = super::exec::fork_catcher(vp);
+	let mut child = vp.child_text(k, cx.store, &text, line, vp.fds.clone(), catcher);
 	// The command's own fork: bash and zsh keep the loop level.
 	child.outer_loops = super::exec::fork_loops(vp, true);
 	let vpid = child.vpid;

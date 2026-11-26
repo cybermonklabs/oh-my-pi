@@ -57,8 +57,9 @@ use crate::bash::{
 
 /// Version of the [`Image`] layout; part of the header and the build id.
 /// Also bumped when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains a
-/// variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 37;
+/// variant: an exec target holds it by index. 39: a vproc's `catcher` and
+/// `held_ifs` (38 is a sibling member's).
+pub const FRAMES_VERSION: u32 = 39;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -276,6 +277,10 @@ struct ProcImage {
 	subshell:      u32,
 	/// The forking shell's loops it runs inside (`Vproc::outer_loops`).
 	outer_loops:   u16,
+	/// What catches a `set -e` jump ([`super::proc::Catcher`]).
+	catcher:       super::proc::Catcher,
+	/// A freed `local IFS`'s split value ([`super::proc::HeldIfs`]).
+	held_ifs:      Option<super::proc::HeldIfs>,
 	/// `BASH_COMMAND`: the unit (written to the store) and syntax node; a
 	/// trap action that runs after the restore still names the trapped
 	/// command.
@@ -678,6 +683,8 @@ impl Shell {
 				trace_base: p.trace_base,
 				subshell: p.subshell,
 				outer_loops: p.outer_loops,
+				catcher: p.catcher,
+				held_ifs: p.held_ifs.as_deref().cloned(),
 				command,
 				calls: p.calls.clone(),
 				own_traps: p.own_traps,
@@ -952,6 +959,8 @@ impl Shell {
 			vp.trace_base = p.trace_base;
 			vp.subshell = p.subshell;
 			vp.outer_loops = p.outer_loops;
+			vp.catcher = p.catcher;
+			vp.held_ifs = p.held_ifs.map(Box::new);
 			vp.calls = p.calls;
 			vp.own_traps = p.own_traps;
 			vp.pending_break = p.pending_break.map(Box::new);

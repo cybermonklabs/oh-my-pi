@@ -3564,6 +3564,8 @@ impl Vproc {
 			trace_base: 0,
 			subshell: 0,
 			outer_loops: 0,
+			catcher: proc::Catcher::Run,
+			held_ifs: None,
 			command: None,
 			spare: Vec::new(),
 			calls: Vec::new(),
@@ -3577,7 +3579,8 @@ impl Vproc {
 	}
 
 	/// A child of `self` (subshell, pipeline stage, background job, command
-	/// substitution) that starts running `unit` at `entry` with `fds`.
+	/// substitution) that starts running `unit` at `entry` with `fds`, its
+	/// `set -e` jumps caught by `catcher` ([`Vproc::catcher`]).
 	pub fn child(
 		&self,
 		k: &mut Kernel,
@@ -3585,6 +3588,7 @@ impl Vproc {
 		unit: Arc<Unit>,
 		entry: u32,
 		fds: FdTable,
+		catcher: proc::Catcher,
 	) -> Self {
 		let line_shift = self.frames.last().map_or(0, |f| f.line_shift);
 		// A `( … )` body follows its `Spawn` op.
@@ -3603,11 +3607,12 @@ impl Vproc {
 		// A subshell runs code of the same unit: it keeps the line numbering.
 		frame.line_shift = line_shift;
 		frame.subshell_line = subshell_line;
-		self.child_running(k, store, fds, frame)
+		self.child_running(k, store, fds, frame, catcher)
 	}
 
 	/// A subshell of `self` that parses and runs `src` from script line
-	/// `line` (a `$( )` re-parsed with the aliases in effect).
+	/// `line` (a `$( )` re-parsed with the aliases in effect), its `set -e`
+	/// jumps caught by `catcher` ([`Vproc::catcher`]).
 	pub fn child_text(
 		&self,
 		k: &mut Kernel,
@@ -3615,13 +3620,14 @@ impl Vproc {
 		src: &[u8],
 		line: u32,
 		fds: FdTable,
+		catcher: proc::Catcher,
 	) -> Self {
 		let kind = proc::FrameKind::script(
 			src,
 			crate::bash::syntax::Pos { offset: 0, line },
 			proc::ScriptKind::Eval,
 		);
-		self.child_running(k, store, fds, Frame::new(None, 0, kind))
+		self.child_running(k, store, fds, Frame::new(None, 0, kind), catcher)
 	}
 
 	/// A subshell of `self` with `fds` whose first frame is `frame`; it
@@ -3633,6 +3639,7 @@ impl Vproc {
 		store: &mut dyn StateStore,
 		fds: FdTable,
 		mut frame: Frame,
+		catcher: proc::Catcher,
 	) -> Self {
 		let vpid = k.vpid(store);
 		let (image, locale_gen) = state::fork_image(&k.root, store, self).unwrap_or_else(|err| {
@@ -3650,6 +3657,7 @@ impl Vproc {
 		// `execute_in_subshell`); `exec::forked_for` marks a fork's.
 		vp.set_fork(proc::Fork::CHILD);
 		vp.status = self.status;
+		vp.catcher = catcher;
 		vp.scopes = state::copy_scopes(&k.root, store, self).unwrap_or_else(|err| {
 			k.fail(err);
 			Vec::new()
