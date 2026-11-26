@@ -875,11 +875,12 @@ fn notice_pid(out: &[u8]) -> Option<u64> {
 /// and `wait` reaps the job killed. So does a job that runs no program at
 /// all: a builtin, an assignment, words that fail to expand, a redirection
 /// that fails, and each stage of a pipeline; under `set -x` it traces
-/// nothing, also when it calls a function, whose call is traced in an op
-/// before the one that takes the signal. The signal waited for the job's
-/// decision, so it also waits across the shell's own snapshot and restore
-/// at every op (the frames image keeps it with the decision; the fault
-/// injector's settings as in
+/// nothing, also when it calls a function whose body only does arithmetic, a
+/// `case`, or another such function, or when it expands a command
+/// substitution. A function's call is traced in an op before the one that
+/// takes the signal. The signal waited for the job's decision, so it also
+/// waits across the shell's own snapshot and restore at every op (the frames
+/// image keeps it with the decision; the fault injector's settings as in
 /// [`a_killed_jobs_notice_survives_a_restore`]). The notice names the pid
 /// `$!` shows for the job afterwards, compared unmasked: bash's, its
 /// child's; obash's, the job's virtual pid, as no process ever existed for
@@ -887,17 +888,17 @@ fn notice_pid(out: &[u8]) -> Option<u64> {
 /// before it opens the file, as bash's child does: no file is left. And a
 /// job stopped before it decided, then continued, runs its command then,
 /// as bash's child does once continued: the error line, status 127. Each
-/// form runs as a `-c` string and in a script file. The first form and the
-/// stopped ones are compared live with bash 5.3.20 (pids masked), bash's
-/// side of a row run until it shows none of bash's own races
-/// ([`bash_without_its_races`]); the others with its goldens only. The real
-/// bash sometimes loses the signal to its child (the error line and no
+/// form runs as a `-c` string and in a script file. The first form, the
+/// function forms and the stopped ones are compared live with bash 5.3.20
+/// (pids masked), bash's side of a row run until it shows none of bash's own
+/// races ([`bash_without_its_races`]); the others with its goldens only. The
+/// real bash sometimes loses the signal to its child (the error line and no
 /// notice; measured over three runs of 10 on gVisor, up to 3 for
 /// `nosuchcmd` and `/no/such/file`, 6 for `./f` and 8 for the pipeline; on
-/// runc, once in 10 for the `set -x` form):
-/// bash's own race, made wider by the gVisor defect of google/gvisor#17983
-/// (a signal sent to a process in `execve` is dropped; filed for
-/// `SIGSTOP`). Compare them live again once gVisor fixes it.
+/// runc, once in 10 for the `set -x` form): bash's own race, made wider by
+/// the gVisor defect of google/gvisor#17983 (a signal sent to a process in
+/// `execve` is dropped; filed for `SIGSTOP`). Compare them live again once
+/// gVisor fixes it.
 #[test]
 fn bash_reports_a_job_killed_before_its_program_fails_to_start() {
 	let dir = tempfile::tempdir().expect("a directory for the scripts");
@@ -999,16 +1000,39 @@ fn bash_reports_a_job_killed_before_its_program_fails_to_start() {
 	);
 	// A function job traces its call in an op before the one that takes the
 	// signal: the trace line waits there, and goes with the job.
+	let killed_with_xtrace = |name: &str, cmd: &str| {
+		let notice = killed(name, cmd);
+		let notice = notice.lines().nth(1).expect("the notice line");
+		format!("+ kill -KILL %1\n+ echo st=0\nst=0\n+ wait\n{notice}\n+ echo w=0\nw=0\n")
+	};
 	check(
 		"f() { nosuchcmd; }; set -x; f & kill -KILL %1; echo \"st=$?\"; wait; echo \"w=$?\"",
-		&|name| {
-			let notice = killed(name, "f");
-			let notice = notice.lines().nth(1).expect("the notice line");
-			format!("+ kill -KILL %1\n+ echo st=0\nst=0\n+ wait\n{notice}\n+ echo w=0\nw=0\n")
-		},
+		&|name| killed_with_xtrace(name, "f"),
 		false,
 		false,
 	);
+	for (before, body) in
+		[("", "(( 1 ))"), ("", "case x in x) ;; esac"), ("g() { (( 1 )); }; ", "g")]
+	{
+		check(
+			&format!(
+				"{before}f() {{ {body}; }}; set -x; f & kill -KILL %1; echo \"st=$?\"; wait; echo \
+				 \"w=$?\""
+			),
+			&|name| killed_with_xtrace(name, "f"),
+			false,
+			true,
+		);
+	}
+	// A job's command substitution takes the signal before it traces.
+	for cmd in [": $(:)", "x=$(:)"] {
+		check(
+			&format!("set -x; {cmd} & kill -KILL %1; echo \"st=$?\"; wait; echo \"w=$?\""),
+			&|name| killed_with_xtrace(name, cmd),
+			false,
+			false,
+		);
+	}
 	let not_found = |name: &str| format!("{name}: line 1: nosuchcmd: command not found\nw=127\n");
 	check(
 		"nosuchcmd & kill -STOP %1; kill -CONT %1; wait %1; echo \"w=$?\"",
@@ -1081,6 +1105,9 @@ enum BashRace {
 	/// `command not found` line comes before its `Stopped` line, or no
 	/// `Stopped` line comes.
 	LostStop,
+	/// The child traced under `set -x` before the parent's `kill` took it: a
+	/// trace line the golden lacks, and then its `Killed` notice.
+	LateTrace,
 }
 
 impl BashRace {
@@ -1102,6 +1129,9 @@ impl BashRace {
 		fn not_found(line: &str) -> bool {
 			line.contains("command not found")
 		}
+		fn traced(line: &str) -> bool {
+			line.starts_with('+')
+		}
 		let text = String::from_utf8_lossy(out);
 		if let Some(notice) = first(want, killed) {
 			let Some(theirs) = first(&text, killed) else {
@@ -1109,6 +1139,12 @@ impl BashRace {
 			};
 			if first(want, not_found).is_none() && first(&text, not_found).is_some() {
 				return Some(Self::LateKill);
+			}
+			if text
+				.lines()
+				.any(|line| traced(line) && !want.lines().any(|wanted| wanted == line))
+			{
+				return Some(Self::LateTrace);
 			}
 			let after = first(want, waited).is_none_or(|w| w > notice);
 			if after && first(&text, waited).is_some_and(|w| w < theirs) {
@@ -1133,6 +1169,10 @@ impl BashRace {
 				"its `command not found` line came with its `Killed` notice: its child reached its \
 				 error before the kill took it"
 			},
+			Self::LateTrace => {
+				"a trace line its golden lacks came with its `Killed` notice: its child traced before \
+				 the kill took it"
+			},
 			Self::LateReap => "its `w=` line came before its `Killed` notice: it reaped the job late",
 			Self::LostStop => {
 				"its `command not found` line came before `Stopped`: its child reached its error \
@@ -1148,11 +1188,12 @@ impl BashRace {
 /// its child in some runs (the child reaches its error before the parent's
 /// `kill`; seen once in 10 runs on runc, and up to 8 in 10 for a pipeline on
 /// gVisor, google/gvisor#17983), its child prints its error before the kill
-/// takes it (seen on runc), and it reaps a killed job before or after `wait`
-/// returns (its notice before or after the `w=` line; seen on runc); a row
-/// compares what bash prints once none of that happened. A bash that
-/// shows a race in all 5 runs fails the test, naming the race: a row never
-/// passes without a run of bash it compared. obash's side runs once and
+/// takes it (seen on runc), its child traces under `set -x` before the kill
+/// takes it (seen on runc and gVisor), and it reaps a killed job before or
+/// after `wait` returns (its notice before or after the `w=` line; seen on
+/// runc); a row compares what bash prints once none of that happened. A bash
+/// that shows a race in all 5 runs fails the test, naming the race: a row
+/// never passes without a run of bash it compared. obash's side runs once and
 /// must equal its golden: its job takes a held signal before it acts, in
 /// every run.
 fn bash_without_its_races(run: &Run, want: &str) -> Outcome {

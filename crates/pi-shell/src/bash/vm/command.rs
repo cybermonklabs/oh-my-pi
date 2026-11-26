@@ -414,6 +414,12 @@ pub fn exec(
 				}
 			},
 			Stage::Output => {
+				// A job still deciding its pid takes the signals `kill` held for it
+				// before it writes what it queued: a signal that ends it takes that
+				// output with it, and another lets it write it and go on.
+				if !k.bangs.is_empty() && k.take_held(vp.vpid) {
+					return Flow::Block(WaitKey::Signal);
+				}
 				if let Some(flow) = write_out(k, vp, cx, line) {
 					return flow;
 				}
