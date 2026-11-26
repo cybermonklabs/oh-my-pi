@@ -3145,12 +3145,23 @@ mod tests {
 	/// bound can end first (the bound counts from the walk's first look);
 	/// and, where masks are shown, with a root that blocks TERM, which a
 	/// cancelled walk does not step.
+	///
+	/// That the polite wave went out is read from the hook the walk runs once
+	/// it has sent that wave's signal, not from how the root died: a
+	/// cancelled call gives it no grace, so the hard wave's KILL follows at
+	/// once and reaches a root that would have died of the TERM. Which of the
+	/// two ends it is a race, and the test asserts only that it is dead of
+	/// one of them.
 	#[cfg(target_os = "linux")]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn a_fired_token_ends_the_walks_waits_and_the_term_is_still_sent() {
 		use std::{
 			os::unix::process::{CommandExt, ExitStatusExt},
 			process::Command,
+			sync::{
+				Arc,
+				atomic::{AtomicBool, Ordering},
+			},
 		};
 
 		for fires_after in [Duration::ZERO, Duration::from_millis(500)] {
@@ -3162,12 +3173,25 @@ mod tests {
 			let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
 			let _guard = GroupGuard(root_pid);
 			let process = Process::from_pid(root_pid).expect("pin the root");
+			let polite = Arc::new(AtomicBool::new(false));
+			{
+				let polite = Arc::clone(&polite);
+				wave_hook::set_after(
+					root_pid,
+					TERM_SIGNAL,
+					Box::new(move || polite.store(true, Ordering::SeqCst)),
+				);
+			}
 			wave_hook::set_runnable(root_pid);
 			let token = CancelToken::with_timeout(Some(fires_after));
 			let result = process.terminate_tree(false, 1000, 5000, token).await;
 			wave_hook::clear_runnable(root_pid);
 			let status = reap(&mut root);
 			assert!(result.is_err(), "{fires_after:?}: the cancelled call reports its cancellation");
+			assert!(
+				polite.load(Ordering::SeqCst),
+				"{fires_after:?}: the polite wave's TERM was never sent"
+			);
 			assert!(
 				wave_hook::events(root_pid, wave_hook::Event::Cancelled) >= 1,
 				"{fires_after:?}: the token did not end the walk's wait"
@@ -3177,10 +3201,9 @@ mod tests {
 				0,
 				"{fires_after:?}: the bound, not the token, ended the walk's wait"
 			);
-			assert_eq!(
-				status.signal(),
-				Some(TERM_SIGNAL),
-				"{fires_after:?}: the root did not die of the polite wave's TERM"
+			assert!(
+				matches!(status.signal(), Some(TERM_SIGNAL | KILL_SIGNAL)),
+				"{fires_after:?}: the root died of neither wave: {status:?}"
 			);
 		}
 		if !masks_shown() {
