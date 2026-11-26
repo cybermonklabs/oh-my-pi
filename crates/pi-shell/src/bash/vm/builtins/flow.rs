@@ -3,10 +3,10 @@
 
 use bstr::{BStr, BString, ByteSlice};
 
-use super::{Control, Ctx, Outcome, R, Wait, done, number, opts};
+use super::{Control, Ctx, Need, Outcome, R, Wait, done, number, opts};
 use crate::bash::{
 	diag::Diag,
-	event::EventData,
+	event::{EventData, WaitKey},
 	fs::{FileKind, FsPoll, StatKind},
 	ids::Vpid,
 	store::{Key, KeyBuf, MiscKey, OptId, Record},
@@ -99,7 +99,9 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	// bash's `_evalfile` names the file it found.
 	let shown = path.clone().unwrap_or_else(|| file.clone());
 	let path = path.unwrap_or_else(|| absolute(&ctx.vp.cwd, file));
-	bang_before_read(ctx, &path);
+	if bang_before_read(ctx, &path) {
+		return Err(Need::Park(WaitKey::Signal));
+	}
 	let text = match ctx.probe(Probe::Read { path: path.clone() })? {
 		ProbeResult::Bytes(Ok(text)) => text,
 		ProbeResult::Bytes(Err(msg)) if msg.as_slice() == b"Is a directory" => {
@@ -156,10 +158,12 @@ pub fn source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 /// that is not a regular file (a FIFO, a pipe as `/dev/stdin`, which is
 /// the shell's own fd 0) may wait for what the shell does after it reads
 /// `$!`, so a background job this vproc decides keeps its virtual pid
-/// before that read, as it does before a redirection's open of a FIFO.
-fn bang_before_read(ctx: &mut Ctx<'_, '_>, path: &BString) {
+/// before that read, as it does before a redirection's open of a FIFO. When
+/// `kill` held signals for that decision, the source builtin parks until
+/// they are delivered, before it reads.
+fn bang_before_read(ctx: &mut Ctx<'_, '_>, path: &BString) -> bool {
 	if !ctx.k.bangs.iter().any(|b| b.vproc == ctx.vp.vpid) {
-		return;
+		return false;
 	}
 	let regular = match dev_fd(path) {
 		Some(fd) => ctx
@@ -172,9 +176,7 @@ fn bang_before_read(ctx: &mut Ctx<'_, '_>, path: &BString) {
 			FsPoll::Ready(Ok(st)) if st.kind == StatKind::File
 		),
 	};
-	if !regular {
-		ctx.k.settle_bang(ctx.vp.vpid, None);
-	}
+	!regular && ctx.k.settle_bang(ctx.vp.vpid, None)
 }
 
 /// zsh `. file [args]` / `source file [args]` (`bin_dot`): `source` tries
@@ -238,7 +240,9 @@ pub fn zsh_source(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		}
 		return done(127);
 	};
-	bang_before_read(ctx, &path);
+	if bang_before_read(ctx, &path) {
+		return Err(Need::Park(WaitKey::Signal));
+	}
 	let ProbeResult::Bytes(Ok(text)) = ctx.probe(Probe::Read { path: path.clone() })? else {
 		ctx.err(Diag::NoSuchFile { name: file.clone() });
 		return done(127);
@@ -595,7 +599,7 @@ pub fn wait(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 				status = 1;
 				break;
 			};
-			let child = ctx.vp.vpid_of(pid);
+			let child = waited_vproc(ctx.vp, pid);
 			if is_child(ctx, child) {
 				list.push(child);
 			} else {
@@ -669,6 +673,22 @@ fn zsh_wait_job(ctx: &mut Ctx<'_, '_>, word: &[u8]) -> Result<Option<Vpid>, supe
 		}
 	}
 	Ok(found)
+}
+
+/// The vproc `wait PID` waits for: the one `pid` names
+/// ([`crate::bash::vm::proc::Vproc::vpid_of`]), else in bash mode the job
+/// one of whose processes it names (bash `find_pipeline`: a pid of any
+/// process of a job waits for the job, and `wait_for` returns the job's
+/// status).
+fn waited_vproc(vp: &crate::bash::vm::proc::Vproc, pid: u32) -> Vpid {
+	let v = vp.vpid_of(pid);
+	if v.0 != pid
+		|| vp.jobs.by_vpid(v).is_some()
+		|| vp.mode.dialect() != crate::bash::ids::Dialect::Bash
+	{
+		return v;
+	}
+	vp.jobs.by_process_pid(pid).map_or(v, |j| j.vpid)
 }
 
 /// Whether `pid` is a child this shell can wait for: a job of its own, a
@@ -785,7 +805,7 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 		// bash `check_nonjobs`: a pid no longer in the job table whose
 		// status is kept.
 		let kept = args.iter().find_map(|a| {
-			let pid = ctx.vp.vpid_of(u32::try_from(number(a)?).ok()?);
+			let pid = waited_vproc(ctx.vp, u32::try_from(number(a)?).ok()?);
 			let kept = ctx.vp.jobs.bgp_search(pid).is_some()
 				|| (matches!(
 					ctx.k.proc_state(ctx.cx.store, pid),
@@ -800,7 +820,7 @@ fn wait_any(ctx: &mut Ctx<'_, '_>, args: &[BString], into: Option<BString>) -> R
 		for a in args {
 			let pid = number(a)
 				.and_then(|n| u32::try_from(n).ok())
-				.map(|n| ctx.vp.vpid_of(n));
+				.map(|n| waited_vproc(ctx.vp, n));
 			let found = match pid {
 				Some(p) => ctx
 					.vp

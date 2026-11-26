@@ -9,7 +9,9 @@ use strum::IntoEnumIterator;
 
 use super::{Ctx, R, done};
 use crate::bash::{
-	ControlHandle, Platform, SigTarget, Signal, Vpid, diag::Diag, vm::proc::JobState,
+	ControlHandle, Platform, SigTarget, Signal, Vpid,
+	diag::Diag,
+	vm::proc::{JobLookup, JobState},
 };
 
 /// What `kill` sends.
@@ -122,7 +124,18 @@ pub fn kill(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	if args[i..].iter().any(|a| a.starts_with(b"%") || is_pid(a)) {
 		super::jobs::take_in_exits(ctx)?;
 	}
+	// A job is signalled as the process bash forked for it at `&`. One whose
+	// pid is still to be settled (obash spawns its program lazily,
+	// [`crate::bash::vm::proc::Bang`]) has no process yet: its signal waits
+	// for that decision ([`held`]), and `kill` goes on. It reaches the
+	// program the job spawns, whose pid the notice names, as bash's does; or,
+	// when the job spawns none (a builtin, a command not found, a program
+	// that cannot run), the job before it runs its command, as bash's child
+	// has it before it `exec`s or fails to.
 	for arg in &args[i..] {
+		if held(ctx, arg, send) {
+			continue;
+		}
 		match target(ctx, arg, send, None) {
 			Ok(Some(target)) => {
 				if let Some(sig) = send.signal() {
@@ -205,7 +218,7 @@ pub(super) fn target(
 		// bash `kill_pid`: continuing a stopped job by `kill` acts like `bg`
 		// (the job runs, the current job stays).
 		if send == Send::Signal(Signal::Cont) && matches!(job.state, JobState::Stopped(_)) {
-			job.state = JobState::Running;
+			job.set_running();
 			job.notified = true;
 		}
 		if ends(send) && !has_program(job) {
@@ -259,6 +272,40 @@ pub(super) fn target(
 			.map(|()| None)
 			.map_err(TargetError::Host),
 	}
+}
+
+/// Leave `send` for the decision of the job `arg` names, when it is a
+/// `%job` whose pid is still to be settled
+/// ([`crate::bash::vm::Kernel::hold_signal`]). Not for a job stopped or done
+/// undecided, which runs to no decision, nor for a pid operand, which names
+/// a job by a pid the shell showed: `$!` and `jobs -l` settle it first.
+/// Whether it did; `kill -0` leaves nothing (the job exists).
+fn held(ctx: &mut Ctx<'_, '_>, arg: &[u8], send: Send) -> bool {
+	let Some(rest) = arg.strip_prefix(b"%") else {
+		return false;
+	};
+	let JobLookup::Job(number) = ctx.vp.jobs.lookup(rest) else {
+		return false;
+	};
+	let Some(job) = ctx.vp.jobs.get_mut(number) else {
+		return false;
+	};
+	if job.os_pid.is_some()
+		|| !ctx.k.bang_pending(job.vpid)
+		|| matches!(job.state, JobState::Stopped(_) | JobState::Done(_))
+	{
+		return false;
+	}
+	if let Some(sig) = send.signal() {
+		ctx.k.hold_signal(job.vpid, sig);
+		// Ended in obash's kernel if it spawns no program
+		// ([`crate::bash::store::Job::unreaped`]); one it spawns ends as the
+		// host reaps it (cleared as the job settles on it).
+		if ends(send) {
+			job.unreaped = true;
+		}
+	}
+	true
 }
 
 /// Whether `send` ends a process that neither traps nor ignores it

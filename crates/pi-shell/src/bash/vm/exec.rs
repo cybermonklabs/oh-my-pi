@@ -18,8 +18,7 @@ use super::{
 		AssignValue, Atom, Bang, BangStage, Coproc, DebugSkip, Depths, Frame, FrameKind, InlineStage,
 		JobProc, JobProcs, LastBg, LoopKind, LoopRec, ParseLevel, ParseSnapshot, PendingBreak,
 		PendingSub, PendingWrite, Prefix, Probe, ProbeResult, Run, Saved, Saves, Scratch, ScriptKind,
-		Slot, Target, TryEnd,
-		Vproc,
+		Slot, Target, TryEnd, Vproc,
 	},
 	redir,
 	state::{self, Level, Root, Scope, Var, VarMap},
@@ -34,6 +33,7 @@ use crate::bash::{
 	ir::{self, ComsubForm, Op, Opcode, SpawnKind, Unit},
 	mem::{self, Capture},
 	pattern::PatOpts,
+	signal::SigSet,
 	store::{Attrs, Key, KeyBuf, MiscKey, OptId, Record, StateStore, StoreError, TrapKey},
 	syntax::{CompleteCommand, Features, ParseError, ParseErrorKind, Parser, Pos, Resume},
 	zshopt::ZshOpt,
@@ -72,6 +72,13 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 	// it instead of an `Arc` increment and decrement per op (xeon profile:
 	// `run_slice` self 6–15 % on loop/func/dbl_bracket).
 	let mut held: Option<Arc<Unit>> = None;
+	// A job that has ended (no run and no frame left) still deciding its pid,
+	// with signals `kill` held for it, writes nothing it queued: the shell's
+	// reap gives it the signals first (`Shell::adopt`), as bash's child took
+	// them before it traced or reported anything.
+	if vp.runs.is_empty() && vp.frames.is_empty() && !k.bangs.is_empty() && k.holds(vp.vpid) {
+		return;
+	}
 	// Time passed since the last turn (`Kernel::clock`).
 	k.clock_stale();
 	// An ended vproc (no run, no frame) gets turns only to finish writing
@@ -96,7 +103,10 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		if k.root.has_fault() {
 			return;
 		}
-		if !vp.out.is_empty() {
+		// A job deciding its pid that holds signals `kill` sent it writes
+		// nothing before it takes them (`Kernel::take_held`): bash's child
+		// had them before it traced or reported anything.
+		if !vp.out.is_empty() && (k.bangs.is_empty() || !k.holds(vp.vpid)) {
 			let at = k.ctl.wakes();
 			match flush_out(k, vp) {
 				Some(fd) => return park(k, cx, vp, WaitKey::Write { fd }, at),
@@ -3337,6 +3347,17 @@ fn exit_trap_status(vp: &Vproc) -> Option<i32> {
 
 /// The flow for an expansion error (the diagnostic is printed).
 pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, stop: Stop) -> Flow {
+	// A background job still deciding its pid takes the signals `kill` held for
+	// it before an expansion error ends its command, as [`command::exec`]'s
+	// expand block does for flows not routed through here, and as `Stop::Wait`
+	// does: the op replays once the signals are taken, and a fatal one ends the
+	// job before its diagnostic. The `Fail`/`Fatal` arms write that
+	// diagnostic (`jump_out`) before the caller could truncate `vp.out`, so the
+	// hold is taken here, ahead of the match.
+	if matches!(stop, Stop::Fail(_) | Stop::Fatal(_)) && !k.bangs.is_empty() && k.take_held(vp.vpid)
+	{
+		return Flow::Block(WaitKey::Signal);
+	}
 	match stop {
 		Stop::Sub { .. } | Stop::ZshSub { .. } => unreachable!("handled by the caller"),
 		// An expansion that cannot park (a glob qualifier's) met a math
@@ -3609,6 +3630,13 @@ pub fn start_sub(
 			Flow::Call
 		},
 		ComsubForm::Fork => {
+			// The job deciding its pid takes the signals `kill` held for it
+			// before it starts this child, as bash's forked job has them before
+			// it forks a command substitution. Without one the child is the
+			// job's kin ([`Kernel::bang_kin`]), below.
+			if k.take_held(vp.vpid) {
+				return Flow::Block(WaitKey::Signal);
+			}
 			if let Some(flow) = fork_failed(k, vp, cx, 1, line) {
 				return flow;
 			}
@@ -6319,12 +6347,14 @@ pub(super) fn job_pipeline(unit: &Unit, pc: u32) -> bool {
 
 /// The processes of the background job of vproc `job` whose command starts
 /// at `entry`, if that command is a pipeline ([`job_pipeline`]): bash forks
-/// each stage as it starts the job, the job's status taken under the
-/// `pipefail` on then (`stop_pipeline`'s `J_PIPEFAIL`). Each names the
-/// job's vproc until that vproc starts the stages
-/// ([`super::Shell::stages_started`]). None for a zsh job whose vproc runs
-/// the last stage itself (`last1`, outside sh emulation, as [`spawn`]
-/// decides `lastpipe`).
+/// each stage as it starts the job, with the job's status taken under
+/// `pipefail` then (`stop_pipeline`'s `J_PIPEFAIL`). When every stage vpid
+/// fits, each gets one now, which its stage's vproc takes when the job's
+/// vproc starts the stages ([`Kernel::stage_vpids`]); otherwise the child's
+/// pipeline fork fails before it starts any stage, as the vpid check in
+/// [`spawn`] makes it, and each remains named by the job's vproc. None for a
+/// zsh job whose vproc runs the last stage itself (`last1`, outside sh
+/// emulation, as [`spawn`] decides `lastpipe`).
 fn pipeline_job(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -6333,17 +6363,47 @@ fn pipeline_job(
 	entry: u32,
 	job: Vpid,
 ) -> Option<JobProcs> {
+	let s = job_stage_spawn(vp, unit, entry)?;
+	let reserve = u32::try_from(s.stages.len()).is_ok_and(|n| k.vpids_left() >= n);
+	let vpids: Vec<Vpid> = if reserve {
+		(0..s.stages.len()).map(|_| k.vpid(cx.store)).collect()
+	} else {
+		Vec::new()
+	};
+	let list = (0..s.stages.len())
+		.map(|i| {
+			let vpid = vpids.get(i).copied().unwrap_or(job);
+			JobProc::started(vpid, super::killed::stage_command(k, cx, vp, unit, s, i))
+		})
+		.collect();
+	if reserve {
+		k.stage_vpids.push((job, vpids));
+	}
+	let pipefail = state::option(&mut k.root, cx.store, vp, OptId::Pipefail).unwrap_or(false);
+	Some(JobProcs { list, pipefail })
+}
+
+/// The pipeline that is the whole command of the background job whose
+/// command starts at `entry` ([`job_pipeline`]), whose stages
+/// [`pipeline_job`] makes the job's processes; none for a zsh job whose
+/// vproc runs the last stage itself (`last1`, outside sh emulation, as
+/// [`spawn`] decides `lastpipe`).
+fn job_stage_spawn<'u>(vp: &Vproc, unit: &'u Unit, entry: u32) -> Option<&'u ir::SpawnIr> {
 	if !job_pipeline(unit, entry)
 		|| (unit.mode.dialect() == Dialect::Zsh && vp.mode != ModeId::ZshSh)
 	{
 		return None;
 	}
-	let s = unit.spawns.get(unit.ops.get(entry as usize)?.a as usize)?;
-	let list = (0..s.stages.len())
-		.map(|i| JobProc::started(job, super::killed::stage_command(k, cx, vp, unit, s, i)))
-		.collect();
-	let pipefail = state::option(&mut k.root, cx.store, vp, OptId::Pipefail).unwrap_or(false);
-	Some(JobProcs { list, pipefail })
+	unit.spawns.get(unit.ops.get(entry as usize)?.a as usize)
+}
+
+/// Whether the pipeline `vp` starts is the whole command of its background
+/// job ([`job_pipeline`]), whose stages got their vpids as the job started
+/// ([`pipeline_job`], [`Kernel::stage_vpids`]).
+fn has_stage_vpids(k: &Kernel, vp: &Vproc, unit: &Unit) -> bool {
+	vp.parent.is_some()
+		&& vp.frames.last().is_some_and(|f| job_pipeline(unit, f.pc))
+		&& k.stage_vpids.iter().any(|(job, _)| *job == vp.vpid)
 }
 
 /// Whether the `( … )` that `info` spawns at `pc` is the whole body of a
@@ -6374,7 +6434,11 @@ fn async_subshell_body(unit: &Unit, pc: u32, info: &crate::bash::ir::SpawnIr) ->
 /// own vproc under `lastpipe`): its last stage decides the job's pid as a
 /// job body of its own would (bash and zsh name the last process in `$!`).
 /// While the job's `[n] pid…` line waits, every earlier stage decides the
-/// pid that line shows for it the same way (zsh names each process).
+/// pid that line shows for it the same way (zsh names each process). The
+/// signals `kill` held for the job ([`Bang::held`]) are each stage's
+/// before it runs, as each of bash's forks has them: one that decides
+/// takes them at its decision, any other at once; under `lastpipe` the
+/// job's own vproc takes them for all at its decision.
 fn retarget_bang(k: &mut Kernel, job_vproc: Vpid, unit: &Unit, stages: &[(Vpid, u32)]) {
 	let Some(i) = k
 		.bangs
@@ -6387,26 +6451,48 @@ fn retarget_bang(k: &mut Kernel, job_vproc: Vpid, unit: &Unit, stages: &[(Vpid, 
 		return;
 	};
 	let lone = |entry: u32| bang_stage(unit, entry).filter(|s| *s != BangStage::Pipeline);
-	if super::jobctl::announcing(k, job_vproc) {
+	let announcing = super::jobctl::announcing(k, job_vproc);
+	let held = if last == job_vproc {
+		SigSet::EMPTY
+	} else {
+		k.bangs[i].held
+	};
+	if announcing || held != SigSet::EMPTY {
 		let mut pids = Vec::with_capacity(stages.len());
 		for &(stage, entry) in stages {
 			let decides = lone(entry);
-			if let Some(kind) = decides
-				&& stage != last
-			{
-				k.bangs.push(Bang { vproc: stage, job: stage, stage: kind });
+			if stage != last {
+				if let Some(kind) = decides {
+					k.bangs
+						.push(Bang { vproc: stage, job: stage, stage: kind, held });
+				} else {
+					send_held(k, stage, held);
+				}
 			}
 			pids.push((stage, decides.is_some()));
 		}
-		super::jobctl::pipeline_started(k, job_vproc, &pids);
+		if announcing {
+			super::jobctl::pipeline_started(k, job_vproc, &pids);
+		}
 	}
-	match lone(last_entry) {
-		Some(stage) => {
-			let bang = &mut k.bangs[i];
-			bang.vproc = last;
-			bang.stage = stage;
-		},
-		None => k.settle_bang(job_vproc, None),
+	if let Some(stage) = lone(last_entry) {
+		let bang = &mut k.bangs[i];
+		bang.vproc = last;
+		bang.stage = stage;
+	} else {
+		if last != job_vproc {
+			let held = std::mem::take(&mut k.bangs[i].held);
+			send_held(k, last, held);
+		}
+		k.settle_bang(job_vproc, None);
+	}
+}
+
+/// Queue the signals `held` for vproc `stage` alone (a stage of a job's
+/// pipeline that has not run yet, [`retarget_bang`]).
+fn send_held(k: &Kernel, stage: Vpid, held: SigSet) {
+	for sig in held.iter() {
+		super::ControlHandle(k.ctl.clone()).signal(crate::bash::SigTarget::Vpid(stage), sig);
 	}
 }
 
@@ -6429,10 +6515,27 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		.as_ref()
 		.is_some_and(|s| !s.children.is_empty());
 	if !started {
+		// A job that forks (a subshell, pipeline, job or coprocess of its
+		// own) before it decides its pid takes the signals `kill` held for
+		// it first, known by its virtual pid ([`Kernel::take_held`]): bash's
+		// child had them before it forked. The pipeline a job's body is
+		// passes the decision to its last stage ([`retarget_bang`]).
+		let own_pipeline = info.kind == SpawnKind::Pipeline
+			&& k
+				.bangs
+				.iter()
+				.any(|b| b.vproc == vp.vpid && b.stage == BangStage::Pipeline);
+		if !k.bangs.is_empty() && !own_pipeline && k.take_held(vp.vpid) {
+			return Flow::Block(WaitKey::Signal);
+		}
 		// Every child it starts needs a vpid: none is built unless all fit
 		// (a pipeline counts each stage but one run in the shell itself).
 		let here = info.kind == SpawnKind::Pipeline && last_stage_here(k, cx, vp, unit);
-		let needed = u32::try_from(info.stages.len() - usize::from(here)).unwrap_or(u32::MAX);
+		let needed = match info.kind {
+			SpawnKind::Pipeline if has_stage_vpids(k, vp, unit) => 0,
+			_ => info.stages.len() - usize::from(here),
+		};
+		let needed = u32::try_from(needed).unwrap_or(u32::MAX);
 		if let Some(flow) = fork_failed(k, vp, cx, needed, line_of(vp, op.node)) {
 			return flow;
 		}
@@ -6559,7 +6662,8 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					// spawns it (bash's subshell `exec`s a lone simple command):
 					// readers of the pid wait for that decision.
 					if let Some(stage) = bang_stage(unit, info.stages[0].entry) {
-						k.bangs.push(Bang { vproc: vpid, job: vpid, stage });
+						k.bangs
+							.push(Bang { vproc: vpid, job: vpid, stage, held: SigSet::EMPTY });
 					}
 					let job = k.job_id(cx.store);
 					// zsh `&|` / `&!`: disowned at once (no job entry).
@@ -6596,6 +6700,15 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 				// as the job here ([`last_stage_here`]); it forks the others
 				// (`stop_pipeline` first deletes the finished jobs reported).
 				let lastpipe = last_stage_here(k, cx, vp, unit);
+				// The pipeline a background job's vproc runs as the job: each
+				// stage is a process of the job. Their vpids, reserved as the
+				// job started ([`pipeline_job`]).
+				let job_stages = vp.parent.is_some() && job_pipeline(unit, top_frame(vp).pc);
+				let reserved = if job_stages {
+					k.take_stage_vpids(vp.vpid)
+				} else {
+					Vec::new()
+				};
 				if !lastpipe {
 					super::killed::cleanup_dead_jobs(vp);
 				}
@@ -6666,7 +6779,8 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 						// Dropping `fds` closes this stage's ends of its pipes.
 						continue;
 					}
-					let mut child = vp.child(k, cx.store, Arc::clone(unit), stage.entry, fds);
+					let vpid = reserved.get(i).copied();
+					let mut child = vp.child_as(k, cx.store, Arc::clone(unit), stage.entry, fds, vpid);
 					zsh_subshell_traps(k, cx, &mut child, true);
 					// The shell ran a simple stage's DEBUG trap.
 					mark_debug_done(unit, &mut child.frames, stage.entry);
@@ -6707,7 +6821,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 		}
 		// A pipeline's stages are the processes of the job the shell waits
 		// for, of which a notice names each; those of a background job's
-		// pipeline are that job's ([`super::Shell::stages_started`]).
+		// pipeline are that job's ([`pipeline_job`]).
 		let waits = info.kind == SpawnKind::Pipeline
 			&& !(vp.parent.is_some() && job_pipeline(unit, top_frame(vp).pc));
 		let sc = scratch(vp);
@@ -6751,7 +6865,26 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 	// The job's end decides on an `INT` the vproc held for it.
 	super::end_held_sigint(k, vp, false);
 	if vp.parent.is_none() && k.jobctl.has_pgrp() {
-		super::jobctl::fg_done(k, cx, vp, None, b"");
+		// bash reports its foreground pipeline a signal ended by how its last
+		// process ended and each process's command (`print_pipeline`,
+		// [`super::jobctl::fg_done`]); zsh's line names no pipeline.
+		let bash = vp.mode.dialect() == Dialect::Bash;
+		let (sig, text, shown) = match &killed {
+			Some((sig, procs)) if bash => {
+				let posix = state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
+				let platform = k.engine.config().platform;
+				let shown = procs
+					.list
+					.last()
+					.map(|p| super::killed::ended_text(p.state, posix, platform));
+				let texts: Vec<BString> = (0..procs.list.len())
+					.map(|i| super::killed::stage_command(k, cx, vp, unit, info, i))
+					.collect();
+				(Some(*sig), bstr::join(" | ", texts), shown)
+			},
+			_ => (None, Vec::new(), None),
+		};
+		super::jobctl::fg_done(k, cx, vp, sig, &text, shown.as_deref());
 	}
 	vp.status = if pipefail {
 		statuses

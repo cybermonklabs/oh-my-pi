@@ -92,8 +92,9 @@ use crate::bash::{
 /// pads to its absolute value: a longer description gets the difference.
 const LONGEST_SIGNAL_DESC: usize = 27;
 
-/// The spaces after the description `desc` ([`LONGEST_SIGNAL_DESC`]).
-const fn padding(desc: &str) -> usize {
+/// The spaces after the description `desc` ([`LONGEST_SIGNAL_DESC`]): a
+/// notice's, and `jobs`'s after a job's status.
+pub(super) const fn padding(desc: &str) -> usize {
 	LONGEST_SIGNAL_DESC.abs_diff(desc.len())
 }
 
@@ -239,7 +240,8 @@ pub(super) fn pipeline_ended(
 			short_notice(&ended_text(last.state, posix, platform), &texts.join(&b" | "[..]))
 		},
 		Form::Long => {
-			let Some((pid, ended, lines)) = process_lines(&procs, posix, platform, b"") else {
+			let shown = |end| ended_text(end, posix, platform);
+			let Some((pid, ended, lines)) = process_lines(&procs, shown, b"") else {
 				return;
 			};
 			long_notice(k, cx, vp, wait_line(vp, node), pid, &ended, &lines)
@@ -269,19 +271,21 @@ pub(super) fn stage_command(
 
 /// bash's short notice: `status` padded ([`padding`]), then `text`
 /// (`print_pipeline` with `JLIST_STANDARD`).
-fn short_notice(status: &str, text: &[u8]) -> Vec<u8> {
+pub(super) fn short_notice(status: &str, text: &[u8]) -> Vec<u8> {
 	let mut bytes = format!("{status}{:w$}", "", w = padding(status)).into_bytes();
 	bytes.extend_from_slice(text);
 	bytes.push(b'\n');
 	bytes
 }
 
-/// How a process of a job that ended shows (bash `printable_job_status` of
-/// a dead job): the description of the signal that killed it, `Done` for an
-/// exit with 0, else `Exit N` (in posix mode `Done(N)`).
-fn ended_text(state: ProcState, posix: bool, platform: Platform) -> String {
+/// How a process of a job shows once it is not running (bash
+/// `printable_job_status` of a dead or stopped job): the description of the
+/// signal that killed or stopped it, `Done` for an exit with 0, else `Exit N`
+/// (in posix mode `Done(N)`). Read from how it ended, never from a status:
+/// an exit with 137 is `Exit 137`.
+pub(super) fn ended_text(state: ProcState, posix: bool, platform: Platform) -> String {
 	match state {
-		ProcState::Killed(sig) => sig.description(platform),
+		ProcState::Killed(sig) | ProcState::Stopped(sig) => sig.description(platform),
 		ProcState::Exited(0) => String::from("Done"),
 		ProcState::Exited(status) if posix => format!("Done({status})"),
 		ProcState::Exited(status) => format!("Exit {status}"),
@@ -289,34 +293,33 @@ fn ended_text(state: ProcState, posix: bool, platform: Platform) -> String {
 	}
 }
 
-/// What bash's long notice ([`long_notice`]) prints of a job of processes
-/// `procs` that ended (`pretty_print_job` with `JLIST_NONINTERACTIVE`:
-/// `print_pipeline` with `JLIST_LONG`), `tail` after the last command: the
-/// first process's pid, how it ended ([`ended_text`]), and its command,
-/// then a line for each other process: five spaces, its pid as `%5ld`, how
-/// it ended (nothing where the first ended so, which pads as `| `'s two
-/// columns) padded ([`padding`]), `| ` and its command. `None` without
-/// processes.
-fn process_lines(
+/// What bash prints of a job of processes `procs` (`print_pipeline` with
+/// `JLIST_LONG`: `jobs -l`, and the long notice [`long_notice`] of
+/// `pretty_print_job` with `JLIST_NONINTERACTIVE`), `tail` after the last
+/// command: the first process's pid, how it shows (`shown` of its state),
+/// and its command, then a line for each other process: five spaces, its
+/// pid as `%5ld`, how it shows (nothing where its state is the first's,
+/// which pads as `| `'s two columns) padded ([`padding`]), `| ` and its
+/// command. `None` without processes.
+pub(super) fn process_lines(
 	procs: &[JobProc],
-	posix: bool,
-	platform: Platform,
+	shown: impl Fn(ProcState) -> String,
 	tail: &[u8],
 ) -> Option<(u32, String, Vec<u8>)> {
 	let (first, rest) = procs.split_first()?;
 	let mut lines = first.text.to_vec();
 	for p in rest {
-		let ended = if p.state == first.state {
+		let status = if p.state == first.state {
 			String::new()
 		} else {
-			ended_text(p.state, posix, platform)
+			shown(p.state)
 		};
-		let w = padding(if ended.is_empty() { "| " } else { &ended });
-		lines.extend_from_slice(format!("\n     {:>5} {ended}{:w$}| ", p.pid(), "").as_bytes());
+		let w = padding(if status.is_empty() { "| " } else { &status });
+		lines.extend_from_slice(format!("\n     {:>5} {status}{:w$}| ", p.pid(), "").as_bytes());
 		lines.extend_from_slice(&p.text);
 	}
 	lines.extend_from_slice(tail);
-	Some((first.pid(), ended_text(first.state, posix, platform), lines))
+	Some((first.pid(), shown(first.state), lines))
 }
 
 /// Whether bash runs the external of `op` (an `Exec` in `vp`'s base frame
@@ -559,23 +562,13 @@ fn job_line(
 	line: u32,
 ) -> Option<Vec<u8>> {
 	let job = vp.jobs.get(number)?;
-	let mut wd = Vec::new();
-	if job.wd != vp.cwd {
-		let home = state::lookup(&k.root, cx.store, vp, b"HOME")
-			.ok()
-			.flatten()
-			.and_then(|v| v.as_scalar().map(BString::from));
-		wd.extend_from_slice(b"  (wd: ");
-		let home = home.as_ref().map(|h| h.as_slice());
-		wd.extend_from_slice(&dirstack::polite(home, &job.wd, false));
-		wd.push(b')');
-	}
+	let wd = wd_note(k, cx, vp, &job.wd);
 	let platform = k.engine.config().platform;
 	let (pid, desc, tail) = match job.procs.as_deref() {
 		None => (job.pid(), sig.description(platform), [job.text.as_slice(), &wd].concat()),
 		Some(procs) => {
 			let posix = state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
-			process_lines(&procs.list, posix, platform, &wd)?
+			process_lines(&procs.list, |end| ended_text(end, posix, platform), &wd)?
 		},
 	};
 	let bytes = long_notice(k, cx, vp, line, pid, &desc, &tail);
@@ -583,6 +576,46 @@ fn job_line(
 		job.notified = true;
 	}
 	Some(bytes)
+}
+
+/// `  (wd: DIR)` when the shell's directory is not `wd`, the one a job
+/// started in (bash `polite_directory_format`), else nothing.
+fn wd_note(k: &Kernel, cx: &mut Cx<'_>, vp: &Vproc, wd: &[u8]) -> Vec<u8> {
+	let mut note = Vec::new();
+	if wd != vp.cwd.as_slice() {
+		let home = state::lookup(&k.root, cx.store, vp, b"HOME")
+			.ok()
+			.flatten()
+			.and_then(|v| v.as_scalar().map(BString::from));
+		note.extend_from_slice(b"  (wd: ");
+		let home = home.as_ref().map(|h| h.as_slice());
+		note.extend_from_slice(&dirstack::polite(home, wd, false));
+		note.push(b')');
+	}
+	note
+}
+
+/// bash's line for job `number` of `vp`, the one `fg` resumed, that a
+/// signal killed (`notify_of_job_status` for a foreground job:
+/// `print_pipeline` with `JLIST_STANDARD`): how its last process ended,
+/// padded, its command and the `  (wd: DIR)` note ([`short_notice`],
+/// [`wd_note`]). `None` for a job that has not ended.
+pub(super) fn fg_job_line(
+	k: &mut Kernel,
+	cx: &mut Cx<'_>,
+	vp: &Vproc,
+	number: u32,
+) -> Option<Vec<u8>> {
+	let posix = state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false);
+	let platform = k.engine.config().platform;
+	let job = vp.jobs.get(number)?;
+	let JobState::Done(status) = job.state else {
+		return None;
+	};
+	let last = job.procs.as_deref().and_then(|procs| procs.list.last());
+	let end = last.map_or_else(|| ProcState::ended(status, job.signal), |p| p.state);
+	let text = [job.text.as_slice(), &wd_note(k, cx, vp, &job.wd)].concat();
+	Some(short_notice(&ended_text(end, posix, platform), &text))
 }
 
 /// `wait` (`wait`, `wait ID`, `wait -n`) waited for the job of vproc `vpid`

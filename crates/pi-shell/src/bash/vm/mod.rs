@@ -811,6 +811,12 @@ pub struct Kernel {
 	/// was busy ([`proc::BusySpawn`]), by deciding vproc; not imaged (a
 	/// restored spawn meets the busy program again).
 	pub busy:               Vec<(Vpid, proc::BusySpawn)>,
+	/// `(job vproc, stage vpids)`: the vpids of the processes of a background
+	/// pipeline job ([`proc::Job::procs`]), reserved as the job starts (bash
+	/// forks each stage then), which that vproc's pipeline gives its stages
+	/// as it starts them ([`Self::take_stage_vpids`]). Dropped when the vproc
+	/// ends; imaged (a restored job still starts its stages).
+	pub stage_vpids:        Vec<(Vpid, Vec<Vpid>)>,
 	/// Job control of the interactive shell (process groups, the
 	/// terminal, stop events); not imaged.
 	pub jobctl:             jobctl::JobCtl,
@@ -981,6 +987,7 @@ impl Kernel {
 			math_opts: None,
 			deferrals: Vec::new(),
 			busy: Vec::new(),
+			stage_vpids: Vec::new(),
 			jobctl: jobctl::JobCtl::default(),
 		}
 	}
@@ -1024,6 +1031,15 @@ impl Kernel {
 		true
 	}
 
+	/// Whether `vpid`'s take-in ask has been answered ([`Self::exits_taken`])
+	/// without consuming the answer, unlike [`Self::exits_taken`]: a check
+	/// before a builtin runs (`command::exec` takes a take-in builtin's exits
+	/// in before its redirections, so a snapshot during the wait strands no
+	/// redirect to a host file).
+	pub fn took_exits(&self, vpid: Vpid) -> bool {
+		self.exits_taken.contains(&vpid)
+	}
+
 	/// `vpid`'s builtin goes on without the answer to its ask: every job of
 	/// its vproc ended before the answer came (a parked asker runs again at
 	/// each wake), so nothing is left to take in, and it asks no more.
@@ -1058,19 +1074,69 @@ impl Kernel {
 	}
 
 	/// The pid of background job `job` is still to be settled
-	/// ([`proc::Bang`]): readers of it wait (`WaitKey::Proc(job)`).
+	/// ([`proc::Bang`]): readers of it wait (`WaitKey::Proc(job)`), and
+	/// `kill` leaves its signal for the decision ([`Self::hold_signal`]).
 	pub fn bang_pending(&self, job: Vpid) -> bool {
 		self.bangs.iter().any(|b| b.job == job)
 	}
 
+	/// Whether vproc `vproc` decides a background job's pid
+	/// ([`proc::Bang`]) for which `kill` holds signals
+	/// ([`Self::hold_signal`]).
+	pub fn holds(&self, vproc: Vpid) -> bool {
+		self
+			.bangs
+			.iter()
+			.any(|b| b.vproc == vproc && b.held != crate::bash::SigSet::EMPTY)
+	}
+
+	/// Vproc `vproc`, still deciding a job's pid ([`proc::Bang`]), acts
+	/// with no program (it reports an error, or ends): if `kill` held
+	/// signals for the job ([`Self::holds`]), the job is known by its
+	/// virtual pid and they go first ([`Self::settle_bang`]). Whether they
+	/// did: the caller returns `Flow::Block(WaitKey::Signal)`, and its op
+	/// runs again after them.
+	pub fn take_held(&mut self, vproc: Vpid) -> bool {
+		self.holds(vproc) && self.settle_bang(vproc, None)
+	}
+
+	/// `kill` sends `sig` to background job `job` while its pid is still to
+	/// be settled ([`Self::bang_pending`]): the signal waits for the decision
+	/// ([`proc::Bang::held`]), and `kill` does not. A stop discards a held
+	/// `CONT`, and a `CONT` the held stops, as the kernel does for the
+	/// signals pending on a process.
+	pub fn hold_signal(&mut self, job: Vpid, sig: Signal) {
+		let Some(bang) = self.bangs.iter_mut().find(|b| b.job == job) else {
+			return;
+		};
+		let mut held = bang.held;
+		match sig.default_action() {
+			DefaultAction::Stop => held = held.without(Signal::Cont),
+			DefaultAction::Continue => {
+				for stop in [Signal::Stop, Signal::Tstp, Signal::Ttin, Signal::Ttou] {
+					held = held.without(stop);
+				}
+			},
+			_ => {},
+		}
+		bang.held = held.with(sig);
+	}
+
 	/// Settle the job vproc `vproc` decides ([`proc::Bang`]): known by the
-	/// OS pid `os`, or by its virtual pid (`None`). Wakes the readers.
-	pub fn settle_bang(&mut self, vproc: Vpid, os: Option<u32>) {
+	/// OS pid `os`, or by its virtual pid (`None`). Wakes the readers. The
+	/// signals `kill` held for the job ([`Self::hold_signal`]) go on the
+	/// bus to the deciding vproc and what it runs, which take them at the
+	/// next safepoint: the program `os` names gets them, or, with no
+	/// program, the vproc before it runs its command. Whether there were
+	/// any: a caller about to run that command returns
+	/// `Flow::Block(WaitKey::Signal)` then, and its op runs again after them
+	/// (as for a signal that comes before a spawn).
+	pub fn settle_bang(&mut self, vproc: Vpid, os: Option<u32>) -> bool {
 		if !self.busy.is_empty() {
 			self.busy.retain(|(v, _)| *v != vproc);
 		}
 		let Some(i) = self.bangs.iter().position(|b| b.vproc == vproc) else {
-			return;
+			return false;
 		};
 		let bang = self.bangs.swap_remove(i);
 		if !self.bang_spent.is_empty() {
@@ -1091,6 +1157,20 @@ impl Kernel {
 		}
 		jobctl::bang_settled(self, bang.vproc, os);
 		self.ctl.notify();
+		for sig in bang.held.iter() {
+			ControlHandle(self.ctl.clone()).signal(SigTarget::Tree(bang.vproc), sig);
+		}
+		bang.held != crate::bash::SigSet::EMPTY
+	}
+
+	/// The vpids reserved for the stages of the pipeline that is job vproc
+	/// `job`'s whole command ([`Self::stage_vpids`]), taken as it starts
+	/// them; none for any other vproc.
+	pub fn take_stage_vpids(&mut self, job: Vpid) -> Vec<Vpid> {
+		match self.stage_vpids.iter().position(|(j, _)| *j == job) {
+			Some(i) => self.stage_vpids.swap_remove(i).1,
+			None => Vec::new(),
+		}
 	}
 
 	/// `parent` started `child`, an in-engine child it waits for (a command
@@ -1389,6 +1469,7 @@ impl Kernel {
 		status: i32,
 	) {
 		self.pid_owners.retain(|&(.., job)| job != vpid);
+		self.stage_vpids.retain(|(job, _)| *job != vpid);
 		let parent = match store.get(Key::Proc(vpid)) {
 			Ok(Some(Record::Proc { parent: None, .. })) => None,
 			_ => parent,
@@ -2307,6 +2388,14 @@ impl Shell {
 			k.root.set_option(cx.store, OptId::Posix, true);
 			k.root.set_option(cx.store, OptId::ExpandAliases, true);
 		}
+		// bash `-i`: job control is on (`set -m`), also after a command-line
+		// `+m`, which only declines to force it on (bash
+		// `initialize_job_control (jobs_m_flag)`: an interactive shell takes
+		// the terminal whatever the flag says); [`jobctl::init_io`] turns it
+		// off again when there is no terminal to take over.
+		if !zsh && init.interactive {
+			k.root.set_option(cx.store, OptId::Monitor, true);
+		}
 		state::init_option_vars(&mut k.root, cx.store)?;
 		k.root
 			.set_misc(cx.store, MiscKey::Argv0, init.argv0.clone());
@@ -2693,12 +2782,24 @@ impl Shell {
 				.write(cx.store, Change::Put(Key::Proc(p.vpid), rec));
 		}
 		self.fresh.extend(self.k.spawned.iter().map(|p| p.vpid));
-		self.stages_started();
 		self.procs.append(&mut self.k.spawned);
 		self.k.disowned.clear();
 		self.apply_settled();
 		let mut i = 0;
 		while i < self.procs.len() {
+			// A job that has ended (no run and no frame left) still deciding its
+			// pid, with signals `kill` held for it, takes them first
+			// ([`Kernel::take_held`]): what it queued waits for them, whatever
+			// it still has to write.
+			let ended = self.procs[i].runs.is_empty() && self.procs[i].frames.is_empty();
+			if self.procs[i].transient
+				&& ended
+				&& !self.k.bangs.is_empty()
+				&& self.k.take_held(self.procs[i].vpid)
+			{
+				i += 1;
+				continue;
+			}
 			let p = &self.procs[i];
 			// A subshell vproc exits once its frames are done and its
 			// diagnostics are out ([`proc::Vproc::has_work`]).
@@ -2745,70 +2846,13 @@ impl Shell {
 		}
 	}
 
-	/// The children the turn spawned may be the stages of the pipeline that
-	/// is the whole command of a background job (`a | b &`), which its vproc
-	/// starts ([`runs_pipeline`]): the job's processes
-	/// ([`proc::Job::procs`], recorded as the job started) are those vprocs
-	/// from now on. Children that are not the pipeline's stages (a trap's
-	/// substitution before it) leave the record waiting: a job's facts never
-	/// go while the job does.
-	fn stages_started(&mut self) {
-		let mut seen = None;
-		for child in &self.k.spawned {
-			let parent = child.parent;
-			if parent == seen {
-				continue;
-			}
-			seen = parent;
-			let Some(j) = parent.and_then(|v| self.procs.iter().position(|p| p.vpid == v)) else {
-				continue;
-			};
-			let jp = &self.procs[j];
-			let Some(s) = jp
-				.parent
-				.and_then(|v| self.procs.iter().position(|p| p.vpid == v))
-			else {
-				continue;
-			};
-			let job = jp.vpid;
-			// Its processes still name the job's vproc ([`exec::pipeline_job`]).
-			let waiting = self.procs[s].jobs.by_vpid(job).is_some_and(|entry| {
-				!entry.inherited
-					&& entry
-						.procs
-						.as_ref()
-						.is_some_and(|procs| procs.list.first().is_some_and(|p| p.vpid == job))
-			});
-			if !waiting {
-				continue;
-			}
-			let stages: Vec<Vpid> = jp
-				.frames
-				.first()
-				.and_then(|f| f.scratch.as_deref())
-				.filter(|_| runs_pipeline(jp))
-				.map_or_else(Vec::new, |sc| sc.children.iter().map(|&(v, _)| v).collect());
-			let Some(procs) = self.procs[s]
-				.jobs
-				.by_vpid_mut(job)
-				.and_then(|entry| entry.procs.as_deref_mut())
-			else {
-				continue;
-			};
-			let n = procs.list.len();
-			if !stages.is_empty() && stages.len() == n {
-				for (p, vpid) in procs.list.iter_mut().zip(stages) {
-					p.vpid = vpid;
-				}
-			}
-		}
-	}
-
 	/// Write the OS pids jobs and processes settled on during the turn
 	/// ([`Kernel::settled`]) into every job table listing them (the
 	/// parent's, a command substitution's copies), every `$!` naming them,
 	/// and the records of the processes of jobs and of the pipelines vprocs
-	/// wait for ([`proc::JobProc`]).
+	/// wait for ([`proc::JobProc`]). A job a `kill` before the decision
+	/// marked as ended with no program ([`proc::Job::unreaped`]) has one now:
+	/// its end comes as the host reaps it.
 	fn apply_settled(&mut self) {
 		for (job, pid) in std::mem::take(&mut self.k.settled) {
 			for p in &mut self.procs {
@@ -2817,6 +2861,7 @@ impl Shell {
 				}
 				if let Some(entry) = p.jobs.by_vpid_mut(job) {
 					entry.os_pid = Some(pid);
+					entry.unreaped = false;
 				}
 				p.jobs.proc_settled(job, pid);
 				let waited = p
@@ -3046,11 +3091,13 @@ impl Shell {
 	/// Child vproc `vpid` of `parent` ended with `status` (`died_of`: by
 	/// that signal, [`Kernel::deaths`]): the record of that process of a
 	/// pipeline says so ([`Self::process_ended`]), the parent's job for it is
-	/// done (`jobs`, `wait` see it, and the notice of a job a signal killed,
-	/// [`killed::waited`], [`killed::line_read`]: by the signal that ended
-	/// the process whose end is the job's status, of a pipeline's job
-	/// [`proc::Job::procs`]; of a job without those, not when `pipeline`, a
-	/// signal ended its vproc as it ran a pipeline, [`runs_pipeline`]), a
+	/// done and keeps how it ended ([`proc::Job::ended`]: `jobs`, `wait` see
+	/// it, and the notice of a job a signal killed, [`killed::waited`],
+	/// [`killed::line_read`]: by the signal that ended the process whose end
+	/// is the job's status, of a pipeline's job [`proc::Job::procs`]; of a job
+	/// without those, the signal that ended its vproc), a foreground subshell
+	/// a signal killed gets its notice (not when `pipeline`, a signal ended
+	/// it as it ran a pipeline, [`runs_pipeline`]), a
 	/// parent trapping `SIGCHLD` owes one more run of the trap for each
 	/// process that ended (bash's `waitchld` counts each child it reaps: a
 	/// pipeline job's own vproc is none of bash's processes, so its end owes
@@ -3082,23 +3129,10 @@ impl Shell {
 		// is, or one for each process of its pipeline job that ended with it.
 		let mut owed = 1;
 		if let Some(job) = job {
-			job.state = proc::JobState::Done(status);
-			job.signal = match job.procs.as_deref_mut() {
-				None => died_of.filter(|_| !pipeline),
-				Some(procs) => {
-					// Processes not reaped as its own (its vproc ended before
-					// it started them, or without them) ended with it.
-					owed = 0;
-					for p in &mut procs.list {
-						if p.state == proc::ProcState::Running {
-							p.state = proc::ProcState::ended(status, died_of);
-							owed += 1;
-						}
-					}
-					procs.signal()
-				},
-			};
-			job.notified = false;
+			let with_it = job.ended(status, died_of);
+			if job.procs.is_some() {
+				owed = with_it;
+			}
 		}
 		let parent = self.procs[i].vpid;
 		if !background && let Some(IntNote::Held(HeldInt::Job { .. })) = self.k.int_note(parent) {
@@ -3168,47 +3202,93 @@ impl Shell {
 	}
 
 	/// Vproc `vpid` stopped (`Some(signal)`) or continued (`None`). If it
-	/// leads a job, the job's state follows, as bash's `waitchld` does: a
-	/// stop makes the job current (`set_current_job`), a stopped job that
-	/// continues makes bash `reset_current`; one `bg` or `kill -CONT`
-	/// already marked running is left alone. Without job control bash never
-	/// learns of stops (`waitpid` without `WUNTRACED`): the job stays
-	/// running. zsh always waits with `WUNTRACED`: its jobs show stops
-	/// with or without `MONITOR`.
+	/// leads a job, or is a process of a pipeline job ([`proc::Job::procs`]),
+	/// the job's state follows, as bash's `waitchld` does: a stop makes the
+	/// job current (`set_current_job`), a stopped job that continues makes
+	/// bash `reset_current`; one `bg` or `kill -CONT` already marked running
+	/// is left alone. A pipeline job's state follows its processes: it stops
+	/// once none of them runs, and runs again once one does
+	/// ([`proc::Job::process_changed`]). Its own vproc is none of bash's
+	/// processes: its stop or continue reaches those it has not started yet
+	/// (no vproc has their vpids), which bash forked with the job. Without job
+	/// control bash never learns of stops (`waitpid` without `WUNTRACED`): the
+	/// job stays running. zsh always waits with `WUNTRACED`: its jobs show
+	/// stops with or without `MONITOR`.
 	fn job_changed(&mut self, cx: &mut Cx<'_>, vpid: Vpid, stop: Option<Signal>) {
-		for p in &mut self.procs {
-			// The owner's entry, not a subshell's copy of it.
-			if p.jobs.by_vpid(vpid).is_none_or(|j| j.inherited) {
-				continue;
+		// The owner's entry, not a subshell's copy of it.
+		let is_its = |j: &proc::Job| {
+			!j.inherited
+				&& (j.vpid == vpid
+					|| j
+						.procs
+						.as_deref()
+						.is_some_and(|procs| procs.list.iter().any(|q| q.vpid == vpid)))
+		};
+		let Some(i) = self.procs.iter().position(|p| p.jobs.iter().any(is_its)) else {
+			return;
+		};
+		let p = &self.procs[i];
+		if p.jobs.subshell
+			|| (p.mode.dialect() != crate::bash::ids::Dialect::Zsh
+				&& !state::option(&mut self.k.root, cx.store, p, OptId::Monitor).unwrap_or(false))
+		{
+			return;
+		}
+		let Some(job) = p.jobs.iter().find(|j| is_its(j)) else {
+			return;
+		};
+		let number = job.number;
+		// The processes of a pipeline job the change reaches.
+		let reached: Option<Vec<Vpid>> = job.procs.as_deref().map(|procs| {
+			if job.vpid == vpid {
+				let live = |v: Vpid| self.procs.iter().any(|r| r.vpid == v);
+				procs
+					.list
+					.iter()
+					.map(|q| q.vpid)
+					.filter(|&v| !live(v))
+					.collect()
+			} else {
+				vec![vpid]
 			}
-			if p.jobs.subshell
-				|| (p.mode.dialect() != crate::bash::ids::Dialect::Zsh
-					&& !state::option(&mut self.k.root, cx.store, p, OptId::Monitor).unwrap_or(false))
-			{
-				return;
+		});
+		let p = &mut self.procs[i];
+		let zsh = p.mode.dialect() == crate::bash::ids::Dialect::Zsh;
+		let Some(job) = p.jobs.get_mut(number) else {
+			return;
+		};
+		if let Some(reached) = reached {
+			let was = job.state;
+			for v in reached {
+				job.process_changed(v, stop);
 			}
-			let Some(job) = p.jobs.by_vpid_mut(vpid) else {
-				return;
-			};
-			let number = job.number;
-			match (stop, job.state) {
-				(_, proc::JobState::Done(_)) => {},
-				(Some(sig), _) => {
-					job.state = proc::JobState::Stopped(sig);
-					job.notified = false;
+			let now = job.state;
+			if now != was {
+				job.notified = false;
+				if matches!(now, proc::JobState::Stopped(_)) {
 					jobctl::stopped_current(p, number);
-				},
-				(None, proc::JobState::Stopped(_)) => {
-					job.state = proc::JobState::Running;
-					job.notified = false;
-					// zsh leaves the current job alone (`update_job`).
-					if p.mode.dialect() != crate::bash::ids::Dialect::Zsh {
-						p.jobs.reset_current();
-					}
-				},
-				(None, proc::JobState::Running) => {},
+				} else if !zsh {
+					p.jobs.reset_current();
+				}
 			}
 			return;
+		}
+		match (stop, job.state) {
+			(_, proc::JobState::Done(_)) => {},
+			(Some(sig), _) => {
+				job.state = proc::JobState::Stopped(sig);
+				job.notified = false;
+				jobctl::stopped_current(p, number);
+			},
+			(None, proc::JobState::Stopped(_)) => {
+				job.state = proc::JobState::Running;
+				job.notified = false;
+				// zsh leaves the current job alone (`update_job`).
+				if !zsh {
+					p.jobs.reset_current();
+				}
+			},
+			(None, proc::JobState::Running) => {},
 		}
 	}
 
@@ -4657,8 +4737,8 @@ fn waits_for_its_subshell(p: &Vproc) -> bool {
 /// Whether `p` is just the job process of a pipeline (`a | b &`): its one
 /// frame waits for the stages and exits after them ([`transparent`]'s
 /// `Some(false)`). bash's job is that pipeline's processes
-/// ([`proc::Job::procs`], [`Shell::stages_started`]): a signal that ends
-/// this vproc itself ends none of them.
+/// ([`proc::Job::procs`]): a signal that ends this vproc itself ends none of
+/// them.
 fn runs_pipeline(p: &Vproc) -> bool {
 	let [frame] = p.frames.as_slice() else {
 		return false;
@@ -4885,6 +4965,20 @@ impl Vproc {
 		entry: u32,
 		fds: FdTable,
 	) -> Self {
+		self.child_as(k, store, unit, entry, fds, None)
+	}
+
+	/// [`Self::child`] with the vpid `vpid` reserved for it (a stage of a
+	/// background pipeline job, [`Kernel::stage_vpids`]), else a new one.
+	pub fn child_as(
+		&self,
+		k: &mut Kernel,
+		store: &mut dyn StateStore,
+		unit: Arc<Unit>,
+		entry: u32,
+		fds: FdTable,
+		vpid: Option<Vpid>,
+	) -> Self {
 		let line_shift = self.frames.last().map_or(0, |f| f.line_shift);
 		// bash's `line_number` as it forks: a `( … )`'s own line, the last
 		// (`Subshell->line`; its body follows its `Spawn` op), else the line
@@ -4914,7 +5008,7 @@ impl Vproc {
 		// A subshell runs code of the same unit: it keeps the line numbering.
 		frame.line_shift = line_shift;
 		frame.fork_line = Some(fork_line);
-		self.child_running(k, store, fds, frame)
+		self.child_running(k, store, fds, frame, vpid)
 	}
 
 	/// A subshell of `self` that parses and runs `src` from script line
@@ -4932,20 +5026,21 @@ impl Vproc {
 			crate::bash::syntax::Pos { offset: 0, line },
 			proc::ScriptKind::Eval,
 		);
-		self.child_running(k, store, fds, Frame::new(None, 0, kind))
+		self.child_running(k, store, fds, Frame::new(None, 0, kind), None)
 	}
 
-	/// A subshell of `self` with `fds` whose first frame is `frame`; it
-	/// starts with a copy of `self`'s function scopes (the root's are read
-	/// from the store).
+	/// A subshell of `self` with `fds` whose first frame is `frame`, of vpid
+	/// `vpid` or a new one; it starts with a copy of `self`'s function scopes
+	/// (the root's are read from the store).
 	fn child_running(
 		&self,
 		k: &mut Kernel,
 		store: &mut dyn StateStore,
 		fds: FdTable,
 		mut frame: Frame,
+		vpid: Option<Vpid>,
 	) -> Self {
-		let vpid = k.vpid(store);
+		let vpid = vpid.unwrap_or_else(|| k.vpid(store));
 		let (image, locale_gen) = state::fork_image(&k.root, store, self).unwrap_or_else(|err| {
 			k.fail(err);
 			(Image::default(), None)

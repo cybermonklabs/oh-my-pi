@@ -19,7 +19,7 @@ mod getopts;
 mod help;
 pub mod history;
 mod io;
-mod jobs;
+pub mod jobs;
 mod kill;
 mod mapfile;
 pub mod misc;

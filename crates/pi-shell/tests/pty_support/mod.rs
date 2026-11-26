@@ -817,6 +817,48 @@ impl Pty {
 		Ok(())
 	}
 
+	/// Wait until `programs` all run, not stopped, in one process group that
+	/// is not the shell's (a job's), then send `signal` to that group: what
+	/// the line discipline does for `^Z` or `^C` once the job has the
+	/// terminal, without reading the terminal's foreground group, which
+	/// gVisor does not answer ([`foreground_group`]), and without waiting
+	/// for the shell to hand the job the terminal after `fg`.
+	///
+	/// # Errors
+	///
+	/// When the group cannot be signalled, or `TimedOut` (with the output so
+	/// far).
+	pub fn signal_job(
+		&mut self,
+		programs: &[&str],
+		signal: i32,
+		timeout: Duration,
+	) -> io::Result<()> {
+		let what = format!("{programs:?} running in a job's process group");
+		let shell = self.pid();
+		let mut group = None;
+		self.wait_processes(timeout, &what, |_, procs| {
+			let runs_all = |g: i32| {
+				programs.iter().all(|p| {
+					procs
+						.iter()
+						.any(|q| q.pgid == g && !q.stopped && q.comm == *p)
+				})
+			};
+			group = procs
+				.iter()
+				.map(|q| q.pgid)
+				.find(|&g| g != shell && runs_all(g));
+			group.is_some()
+		})?;
+		let pgid = group.ok_or_else(|| self.timeout(&what))?;
+		// SAFETY: kill takes integer ids.
+		if unsafe { libc::kill(-pgid, signal) } == -1 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(())
+	}
+
 	/// Wait until `programs` all run in the terminal's foreground process
 	/// group, a job's and not the shell's: the command just typed has
 	/// started every process the keys `^Z` and `^C` are meant to signal.

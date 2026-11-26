@@ -669,7 +669,7 @@ pub const BGP_MAX: usize = 32_768;
 pub struct SavedStatus {
 	/// The child vproc.
 	pub vpid:   Vpid,
-	/// The pid `$!` and `jobs -p` showed for it ([`Job::pid`]).
+	/// The pid `$!` showed for it ([`Job::pid`]).
 	pub pid:    u32,
 	/// How it ended (128 plus the signal's number for one a signal killed).
 	pub status: i32,
@@ -761,6 +761,16 @@ impl JobTable {
 	/// ([`Job::os_pid`]).
 	pub fn by_pid(&self, pid: u32) -> Option<&Job> {
 		self.list.iter().find(|j| j.named_by(pid))
+	}
+
+	/// The job one of whose processes ([`Job::procs`]) `pid` names: its
+	/// program's OS pid or its vproc's virtual pid ([`JobProc::pid`]).
+	pub fn by_process_pid(&self, pid: u32) -> Option<&Job> {
+		self.list.iter().find(|j| {
+			j.procs
+				.as_deref()
+				.is_some_and(|procs| procs.list.iter().any(|p| p.pid() == pid))
+		})
 	}
 
 	/// Add a background job (bash `stop_pipeline` for an async list): it
@@ -1089,7 +1099,10 @@ impl LastBg {
 /// once it would make a reader of the pid (`$!`, `jobs -l`/`-p`/`-x`), who
 /// waits for the decision, wait: it is stopped or waits for something
 /// outside itself, or has run a scheduler slice since the reader parked
-/// (`Shell::decide_waited_bangs`).
+/// (`Shell::decide_waited_bangs`). `kill` does not wait: it leaves its
+/// signal for the decision ([`Self::held`]), and a job that holds one
+/// keeps its virtual pid at the first builtin, fork, redirection or error
+/// it reaches, as bash's child has the signal before it runs anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bang {
 	/// The vproc that decides: the job's own, or the subshell a callout of
@@ -1099,6 +1112,12 @@ pub struct Bang {
 	pub job:   Vpid,
 	/// What may still give the job its program.
 	pub stage: BangStage,
+	/// The signals `kill` sent the job before it decided
+	/// ([`super::Kernel::hold_signal`]). The decision delivers them: to the
+	/// program it spawned, or, when it spawns none, to the vproc before it
+	/// runs its command, as bash's child, forked at `&`, has them before it
+	/// `exec`s its program or fails to.
+	pub held:  SigSet,
 }
 
 /// The redirections of a background job's lone command whose open would
@@ -2361,11 +2380,11 @@ pub struct ExecState {
 	pub wait_into:     Option<Box<BString>>,
 	/// Run through `command`: a special builtin's failure does not end a
 	/// posix shell.
-	pub via_command: bool,
+	pub via_command:   bool,
 	/// The prefix the command's words start with, as bash's
 	/// `execute_simple_command` and `execute_builtin` read it: the outer
 	/// one, not the last (`command builtin export` is `command`'s).
-	pub prefix:      Prefix,
+	pub prefix:        Prefix,
 	/// The awaited frame was pushed by the builtin, which runs again when
 	/// it returns ([`Control::Resume`](super::builtins::Control::Resume)).
 	pub resume:        bool,
