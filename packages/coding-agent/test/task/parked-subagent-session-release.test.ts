@@ -53,6 +53,13 @@ const MOCK_API_SOURCE = "test/parked-subagent-session-release";
 // that window. A healthy release returns on the first poll that sees it collected,
 // so the deadline only bounds how long a real leak takes to fail.
 const COLLECT_DEADLINE_MS = 15_000;
+/**
+ * Set only in the process {@link checkRosterInItsOwnProcess} starts: which reference its probe row keeps to the
+ * recorded roster (`dropped`: none; `held`: one of its own, the control).
+ */
+const ROSTER_PROBE = process.env.OMP_TEST_PARKED_ROSTER_PROBE;
+/** The probe row's own reference to the recorded roster, with `held`. */
+const heldRosters: object[] = [];
 
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
 let savedEnv: Record<string, string | undefined> = {};
@@ -110,6 +117,42 @@ async function collected(ref: WeakRef<object>, deadlineMs: number): Promise<bool
 		if (Date.now() > deadline) return false;
 		await Bun.sleep(100);
 	}
+}
+
+/**
+ * Runs this file's roster probe row in a process of its own with concurrent JIT compilation off, and checks that the
+ * row ran and passed. In a process whose earlier test files warmed the subagent code, an optimizing-JIT compile plan
+ * on a background thread can keep the parked subagent's roster reachable past any deadline the check sets, so a
+ * collection there says nothing about what the parked state holds: in a whole `bun test` run the check failed or
+ * passed with the set of test files before it, and it never failed with `BUN_JSC_useConcurrentJIT` off.
+ */
+async function checkRosterInItsOwnProcess(reference: "dropped" | "held"): Promise<void> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value;
+	// The probe's own beforeEach makes its own home; it starts from the environment this file's beforeEach replaced.
+	for (const key of ENV_KEYS) {
+		const value = savedEnv[key];
+		if (value === undefined) delete env[key];
+		else env[key] = value;
+	}
+	env.BUN_JSC_useConcurrentJIT = "0";
+	env.OMP_TEST_PARKED_ROSTER_PROBE = reference;
+	const child = Bun.spawn([process.execPath, "test", import.meta.path, "--test-name-pattern", "parked roster probe"], {
+		cwd: path.join(import.meta.dir, "../.."),
+		env,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	const output = `${stdout}\n${stderr}`;
+	expect(exitCode, output).toBe(0);
+	// Exactly the probe row ran, and passed: a pattern that matched no row would exit 0 too.
+	expect(output).toMatch(/^\s*1 pass$/m);
+	expect(output).toMatch(/^\s*0 fail$/m);
 }
 
 /** Makes a settings write in the live session's own overlay, then observes the overlay weakly (outside the test body). */
@@ -341,10 +384,10 @@ it("revives a parked subagent that answers a follow-up from its earlier messages
 	}
 }, 30_000);
 
-// If this regresses, every parked subagent keeps a copy of its peer roster for the rest of the process, or a revived
-// one sends a prompt other than the one it parked with and the provider writes its whole conversation to the
-// prompt cache again, or the roster its transcript recorded reaches the model as part of the conversation.
-it("revives with the peer roster its transcript recorded, keeping no copy of it while parked", async () => {
+// If this regresses, a revived subagent sends a prompt other than the one it parked with and the provider writes its
+// whole conversation to the prompt cache again, or the roster its transcript recorded reaches the model as part of the
+// conversation.
+it("revives with the peer roster its transcript recorded", async () => {
 	registerPeer("EarlyPeer");
 	const run = await runKeptAliveSubagent({ tools: ["read", "write"], enableIrc: true });
 	try {
@@ -354,7 +397,6 @@ it("revives with the peer roster its transcript recorded, keeping no copy of it 
 		const recorded = observeRecordedRoster(AGENT_ID);
 		await AgentLifecycleManager.global().park(AGENT_ID);
 		run.release();
-		expect(await collected(recorded.roster, COLLECT_DEADLINE_MS)).toBe(true);
 
 		registerPeer("LatePeer");
 		const followUp = await runSubagentFollowUpTurn({
@@ -378,6 +420,50 @@ it("revives with the peer roster its transcript recorded, keeping no copy of it 
 		run.close();
 	}
 }, 30_000);
+
+// If this regresses, every parked subagent keeps a copy of its peer roster for the rest of the process.
+it.skipIf(ROSTER_PROBE !== undefined)(
+	"keeps no copy of the peer roster its transcript recorded while parked",
+	async () => {
+		await checkRosterInItsOwnProcess("dropped");
+	},
+	60_000,
+);
+
+it.skipIf(ROSTER_PROBE !== undefined)(
+	"finds a recorded roster alive while something else still holds it (control)",
+	async () => {
+		await checkRosterInItsOwnProcess("held");
+	},
+	60_000,
+);
+
+// Runs only in the process checkRosterInItsOwnProcess starts. With `held`, the row keeps the roster itself and must
+// find it alive, so a check that cannot see a reference fails.
+it.skipIf(ROSTER_PROBE === undefined)(
+	"parked roster probe",
+	async () => {
+		registerPeer("EarlyPeer");
+		const run = await runKeptAliveSubagent({ tools: ["read", "write"], enableIrc: true });
+		try {
+			const recorded = observeRecordedRoster(AGENT_ID);
+			if (ROSTER_PROBE === "held") heldRosters.push(recorded.roster.deref() ?? {});
+			await AgentLifecycleManager.global().park(AGENT_ID);
+			run.release();
+			// A WeakRef target read in a job stays alive until that job ends: collect from fresh event-loop turns, then read.
+			for (let pass = 0; pass < 3; pass++) {
+				const turn = Promise.withResolvers<void>();
+				setImmediate(turn.resolve);
+				await turn.promise;
+				Bun.gc(true);
+			}
+			expect(recorded.roster.deref() === undefined).toBe(ROSTER_PROBE === "dropped");
+		} finally {
+			run.close();
+		}
+	},
+	30_000,
+);
 
 /** Data of the newest custom entry of `customType` in the transcript text `stored`. */
 function storedCustomData(stored: string, customType: string): unknown {
