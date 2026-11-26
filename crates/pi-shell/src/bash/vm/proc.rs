@@ -2669,11 +2669,21 @@ impl Live {
 // `QUIT` (`Vproc::async_ignored`, one byte, in place of a store record in
 // each background vproc's image: the bench, a debug build, measured 2,458
 // → 1,879 B per idle vproc for that move alone) fit the bounds below with
-// the rest; the idle bench gives the figure for the whole.
-const _: () = assert!(size_of::<Vproc>() <= 688, "Vproc grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2 KiB)");
+// the rest; the idle bench gives the figure for the whole. A release that
+// carries three landings, each within the bounds alone, measures more than
+// any of them (rustc `size_of`, x86-64 Linux): a forked vproc's own
+// `$RANDOM` and `$SECONDS` clock (`Vproc::clock`: Vproc 656 → 688 B), bash's
+// kept `wait` statuses and its killed-command notice (`JobTable::bgp`,
+// `ExecState::notice`: Vproc 656 → 664 B, ExecState 376 → 384 B) and the
+// EXIT trap's jump kinds (`ExecState::prefix`,
+// `ScriptKind::Trap::outside_functions`: no growth alone) give Vproc 696 B,
+// Frame 264 B and ExecState 392 B together. The bounds below are those
+// sizes until the structures shrink again; the idle bench has not measured
+// them.
+const _: () = assert!(size_of::<Vproc>() <= 696, "Vproc grew (idle vproc ≤ 2 KiB)");
+const _: () = assert!(size_of::<Frame>() <= 264, "Frame grew (idle vproc ≤ 2 KiB)");
 const _: () = assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2 KiB)");
-const _: () = assert!(size_of::<ExecState>() <= 384, "ExecState grew (idle vproc ≤ 2 KiB)");
+const _: () = assert!(size_of::<ExecState>() <= 392, "ExecState grew (idle vproc ≤ 2 KiB)");
 // An op that redirects or probes keeps a `ScratchIo` (cleared per op): its
 // zsh-only progress lives in the boxed `ScratchZsh` (zsh support grew it by one
 // pointer only; `RedirProgress` not at all).

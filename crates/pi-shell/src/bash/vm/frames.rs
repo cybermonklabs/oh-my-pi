@@ -371,7 +371,6 @@ struct FrameImage {
 	command_loop:      bool,
 	fork_line:         Option<u32>,
 	parse_level:       super::proc::ParseLevel,
-	subshell_line:     Option<u32>,
 	getopts:           super::proc::GetoptsState,
 	/// A [`FrameKind::Cat`] frame's capture: its memory object.
 	capture:           Option<u32>,
@@ -639,7 +638,6 @@ impl Shell {
 					command_loop: f.flags.command_loop(),
 					fork_line: f.fork_line,
 					parse_level: f.flags.parse_level(),
-					subshell_line: f.subshell_line,
 					getopts: f.getopts.as_deref().cloned().unwrap_or_default(),
 					capture: match &f.kind {
 						FrameKind::Cat { capture } => Some(fds.capture(capture)),
@@ -1226,7 +1224,6 @@ impl Shell {
 				frame.flags.set_command_loop(f.command_loop);
 				frame.fork_line = f.fork_line;
 				frame.flags.set_parse_level(f.parse_level);
-				frame.subshell_line = f.subshell_line;
 				frame.getopts =
 					(f.getopts != super::proc::GetoptsState::default()).then(|| Box::new(f.getopts));
 				if matches!(frame.kind, FrameKind::Script { what: ScriptKind::Trap { .. }, .. }) {

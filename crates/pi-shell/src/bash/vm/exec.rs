@@ -915,7 +915,7 @@ pub fn zsh_hup_exit(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) {
 		.iter()
 		.any(|f| matches!(f.kind, FrameKind::Function { .. }));
 	release_externals(vp);
-	exit_shell(k, vp, cx, 1);
+	exit_shell(k, vp, cx, 1, Jump::Direct);
 	vp.blocked = None;
 	vp.stopped = false;
 	if in_function {

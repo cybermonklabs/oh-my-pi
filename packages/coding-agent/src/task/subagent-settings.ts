@@ -8,7 +8,14 @@ import type { CompactionThresholdPair } from "../config/compaction-threshold";
 import { cfgModelRoles } from "../config/model-settings";
 import { all as allSettings } from "../config/registry";
 import { buildServiceTierByFamily, isServiceTierForFamily, resolveSubagentServiceTier } from "../config/service-tier";
-import { deleteByPath, getByPath, type OverlayLayers, type RawSettings, type Settings, setOwn } from "../config/settings";
+import {
+	deleteByPath,
+	getByPath,
+	type OverlayLayers,
+	type RawSettings,
+	type Settings,
+	setOwn,
+} from "../config/settings";
 import {
 	cfgCompactionModelThresholdsEnabled,
 	cfgCompactionThresholdPercent,
