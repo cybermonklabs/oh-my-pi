@@ -71,19 +71,6 @@ pub struct Vproc {
 		reason = "the boxes move between frames (`Frame::scratch`) and this pool without copying"
 	)]
 	pub spare:         Vec<Box<Scratch>>,
-	/// `getopts` progress between calls.
-	pub getopts:       GetoptsState,
-	/// Open process-substitution fds: `(frame depth, fd)`, the depth being
-	/// the frame count when the op that opened it ran.
-	pub procsubs:      Vec<(u32, i32)>,
-	/// Coprocesses not reaped yet.
-	pub coprocs:       Vec<Coproc>,
-	/// `set -o` states saved by `local -` in functions that returned, to
-	/// restore before the next op.
-	pub restore_opts:  Vec<BString>,
-	/// Limits `ulimit` set in this vproc or inherited from its parent;
-	/// passed to externals, never applied to the host process.
-	pub rlimits:       Vec<(crate::bash::host::Rlimit, Option<u64>, Option<u64>)>,
 	/// Host lineage, inherited from the parent (set by
 	/// [`super::ShellApi::run_subshell_in`]) and passed to externals.
 	pub lineage:       crate::bash::host::Lineage,
@@ -157,6 +144,95 @@ pub struct Vproc {
 	/// ([`Clock`]): its parent's at the fork. `None` for the root vproc,
 	/// whose are the kernel's.
 	pub clock:         Option<Clock>,
+	/// State most vprocs never use ([`VprocRare`]): `None` until one of it
+	/// is set. Read through [`Vproc::rare`], written through
+	/// [`Vproc::rare_mut`].
+	pub rare:          Option<Box<VprocRare>>,
+}
+
+/// What `ulimit` set ([`VprocRare::rlimits`]): a resource with its soft and
+/// hard limits (`None`: unlimited).
+pub type Rlimits = Vec<(crate::bash::host::Rlimit, Option<u64>, Option<u64>)>;
+
+/// A vproc's state that most vprocs never use: `getopts` progress, process
+/// substitutions, coprocesses, `local -` saves and `ulimit` values
+/// ([`Vproc::rare`]). Boxed, so an idle vproc pays one pointer for it in
+/// place of 144 B. New state that most vprocs leave empty goes here, not in
+/// `Vproc`: a held `local IFS` split value or a job list's kept record, for
+/// instance, each 8 B of every idle vproc as a field of its own.
+#[derive(Clone, Debug, Default)]
+pub struct VprocRare {
+	/// `getopts` progress between calls.
+	pub getopts:      GetoptsState,
+	/// Open process-substitution fds: `(frame depth, fd)`, the depth being
+	/// the frame count when the op that opened it ran.
+	pub procsubs:     Vec<(u32, i32)>,
+	/// Coprocesses not reaped yet.
+	pub coprocs:      Vec<Coproc>,
+	/// `set -o` states saved by `local -` in functions that returned, to
+	/// restore before the next op.
+	pub restore_opts: Vec<BString>,
+	/// Limits `ulimit` set in this vproc or inherited from its parent;
+	/// passed to externals, never applied to the host process.
+	pub rlimits:      Rlimits,
+}
+
+/// [`Vproc::rare`] of a vproc that has none.
+static NO_RARE: VprocRare = VprocRare {
+	getopts:      GetoptsState::NONE,
+	procsubs:     Vec::new(),
+	coprocs:      Vec::new(),
+	restore_opts: Vec::new(),
+	rlimits:      Vec::new(),
+};
+
+impl Vproc {
+	/// The state most vprocs never use ([`VprocRare`]); all empty when the
+	/// vproc has none.
+	pub fn rare(&self) -> &VprocRare {
+		self.rare.as_deref().unwrap_or(&NO_RARE)
+	}
+
+	/// The same, to write: made (empty) on first use.
+	pub fn rare_mut(&mut self) -> &mut VprocRare {
+		self.rare.get_or_insert_with(Box::default)
+	}
+
+	/// `getopts` progress between calls ([`VprocRare::getopts`]).
+	pub fn getopts(&self) -> &GetoptsState {
+		&self.rare().getopts
+	}
+
+	/// Open process-substitution fds ([`VprocRare::procsubs`]).
+	pub fn procsubs(&self) -> &[(u32, i32)] {
+		&self.rare().procsubs
+	}
+
+	/// Coprocesses not reaped yet ([`VprocRare::coprocs`]).
+	pub fn coprocs(&self) -> &[Coproc] {
+		&self.rare().coprocs
+	}
+
+	/// The `ulimit` values externals get ([`VprocRare::rlimits`]).
+	pub fn rlimits(&self) -> &[(crate::bash::host::Rlimit, Option<u64>, Option<u64>)] {
+		&self.rare().rlimits
+	}
+
+	/// Sets the `getopts` progress; a vproc without rare state keeps none
+	/// for the empty progress.
+	pub fn set_getopts(&mut self, getopts: GetoptsState) {
+		if self.rare.is_some() || getopts != GetoptsState::NONE {
+			self.rare_mut().getopts = getopts;
+		}
+	}
+
+	/// Sets the `ulimit` values; a vproc without rare state keeps none for
+	/// no values.
+	pub fn set_rlimits(&mut self, rlimits: Rlimits) {
+		if self.rare.is_some() || !rlimits.is_empty() {
+			self.rare_mut().rlimits = rlimits;
+		}
+	}
 }
 
 /// A forked vproc's `$RANDOM` generator and `$SECONDS` clock
@@ -623,6 +699,11 @@ pub struct GetoptsState {
 	/// The scope holding that `OPTIND` (`None`: the shell's own): a new
 	/// variable (`local OPTIND=1`) restarts the scan even with the same text.
 	pub at:     Option<u32>,
+}
+
+impl GetoptsState {
+	/// No progress: the next `getopts` starts at `OPTIND`.
+	pub const NONE: Self = Self { optind: None, next: None, at: None };
 }
 
 /// The job table of one shell: bash's `jobs` array with `js.j_current` and
@@ -2675,12 +2756,15 @@ impl Live {
 // of `Frame` and `ExecState` is alignment. `Job` is 96 B: its signal and
 // processes (`Job::signal`, `Job::procs`) and `Job::unreaped` came with
 // bash's kept statuses and killed-job notices (80 B before).
+// `getopts` progress, process substitutions, coprocesses, `local -` saves
+// and `ulimit` values, 144 B that most vprocs leave empty, then moved behind
+// one pointer (`Vproc::rare`): Vproc 560 B.
 // The bench with these sizes (release build, x86-64 Linux, at the Cut14
-// landing): 2,004 B per idle vproc forked with no write by the shell between
-// the forks, in every run; retention 318 B per vproc. In the bench's loop,
-// whose `i` each fork keeps an earlier copy of (its image shares the shell's
-// maps), a process reads 2,214 to 2,322 B.
-const _: () = assert!(size_of::<Vproc>() <= 696, "Vproc grew (idle vproc ≤ 2,048 B back to back)");
+// landing): 1,868 B per idle vproc forked with no write by the shell between
+// the forks, in every run (2,004 B with Vproc at 696 B); retention 318 B per
+// vproc. In the bench's loop, whose `i` each fork keeps an earlier copy of
+// (its image shares the shell's maps), a process reads 2,076 to 2,330 B.
+const _: () = assert!(size_of::<Vproc>() <= 560, "Vproc grew (idle vproc ≤ 2,048 B back to back)");
 const _: () = assert!(size_of::<Frame>() <= 264, "Frame grew (idle vproc ≤ 2,048 B back to back)");
 const _: () =
 	assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2,048 B back to back)");

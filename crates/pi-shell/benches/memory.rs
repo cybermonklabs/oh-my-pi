@@ -37,7 +37,7 @@
 //!
 //! ```text
 //! memory shell: … bytes after create + `:` (target ≤ 65536) PASS|MISS; store +… bytes; create + `:` … allocs, … bytes
-//! memory idle vprocs back to back: 16 → … bytes, 272 → … bytes; … bytes per vproc (target ≤ 2004, ceiling 2048) PASS|MISS
+//! memory idle vprocs back to back: 16 → … bytes, 272 → … bytes; … bytes per vproc (target ≤ 1868, ceiling 2048) PASS|MISS
 //! memory idle vprocs: 16 → … bytes, 272 → … bytes; … bytes per vproc in a loop writing `i` (…)
 //! memory idle vproc allocations by size: 24-31 B ×1.00, …
 //! memory idle vproc retention: … bytes per vproc (loop … B, reached by at least 5 of 128 processes × 16 names, less … B back to back; largest … B; … ms) (target ≤ 318) PASS|MISS
@@ -211,8 +211,10 @@ const VPROC_CEILING_BYTES: usize = 2048;
 /// Bytes per idle vproc forked back to back ([`Fork::Back`]): a ratchet at the
 /// measured value, so a vproc that grows by a byte fails it in every run. With
 /// no write by the shell between the forks the value is the same in every
-/// run: 2,004 B in 3 of 3 rounds at Cut14 (34021711; `Vproc` 696 B, `Frame`
-/// 264 B, `ExecState` 392 B, `Job` 96 B). Earlier trees: 2,013 B in 12 of 12
+/// run: 1,868 B in 3 of 3 rounds at Cut14 (34021711) with a vproc's rarely
+/// used state behind one pointer (`Vproc::rare`; `Vproc` 560 B, `Frame`
+/// 264 B, `ExecState` 392 B, `Job` 96 B); 2,004 B with `Vproc` at 696 B.
+/// Earlier trees: 2,013 B in 12 of 12
 /// rounds at 29923cbf and in 3 of 3 at Cut10 chain step 5 (a460228e); 3
 /// rounds each, 1,921 B at 9058ab9d; 1,889 B once forked vprocs own
 /// copy-on-write images (d2d553c3, Cut7 a72018dd to Cut9 85936bf7); 1,897 B
@@ -221,8 +223,9 @@ const VPROC_CEILING_BYTES: usize = 2048;
 /// (`JobTable::bgp`, step 2), 8 B of `Vproc` each, and each vproc's write
 /// keys (40 B of `Vproc` and one 64-71 B allocation, `Vproc::write_key`,
 /// step 5) added the bytes since d2d553c3. The commit that adds bytes to a
-/// fork raises it, with the bench's numbers, up to [`VPROC_CEILING_BYTES`].
-const MAX_VPROC_NOWRITE_BYTES: usize = 2004;
+/// fork raises it, with the bench's numbers, up to [`VPROC_CEILING_BYTES`];
+/// one that takes bytes off lowers it.
+const MAX_VPROC_NOWRITE_BYTES: usize = 1868;
 const _: () = assert!(MAX_VPROC_NOWRITE_BYTES <= VPROC_CEILING_BYTES, "past the 2 KiB ceiling");
 /// Bytes per idle vproc that a vproc forked in a loop keeps of the shell's
 /// later writes (the retention line: the loop value its processes reach,

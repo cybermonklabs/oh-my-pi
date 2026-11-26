@@ -172,7 +172,7 @@ impl State {
 		let limits = RESINFO
 			.iter()
 			.zip(&host)
-			.map(|(r, h)| match ctx.vp.rlimits.iter().find(|(res, ..)| *res == r.res) {
+			.map(|(r, h)| match ctx.vp.rlimits().iter().find(|(res, ..)| *res == r.res) {
 				Some(&(_, s, h)) => Ok(Lim { cur: raw(s), max: raw(h) }),
 				None => *h,
 			})
@@ -199,7 +199,7 @@ impl State {
 			if let Ok(l) = self.limits[i]
 				&& before.limits[i] != Ok(l)
 			{
-				let limits = &mut ctx.vp.rlimits;
+				let limits = &mut ctx.vp.rare_mut().rlimits;
 				limits.retain(|(res, ..)| *res != r.res);
 				limits.push((r.res, unraw(l.cur), unraw(l.max)));
 			}

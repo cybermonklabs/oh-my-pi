@@ -141,8 +141,10 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				}
 			}
 		}
-		if !vp.restore_opts.is_empty() {
-			for saved in std::mem::take(&mut vp.restore_opts) {
+		if let Some(rare) = vp.rare.as_deref_mut()
+			&& !rare.restore_opts.is_empty()
+		{
+			for saved in std::mem::take(&mut rare.restore_opts) {
 				if let Err(err) = state::restore_set_options(&mut k.root, cx.store, vp, &saved) {
 					k.fail(err);
 				}
@@ -218,7 +220,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		{
 			vp.frames[fi].debug_pc = None;
 			unblock(k, cx, vp);
-			if !vp.procsubs.is_empty() {
+			if !vp.procsubs().is_empty() {
 				close_procsubs(vp, fi);
 			}
 			let frame = top_frame(vp);
@@ -2350,7 +2352,8 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 		match state::scope_var(store, vp, top, b"-") {
 			// `local -`: the function's `set -o` changes end with it.
 			Ok(Some(Some(saved))) => {
-				vp.restore_opts
+				vp.rare_mut()
+					.restore_opts
 					.push(BString::from(saved.as_scalar().unwrap_or_default()));
 			},
 			Ok(_) => {},
@@ -2359,7 +2362,7 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 		match state::scope_binds(store, vp, top, b"OPTIND") {
 			// A local `OPTIND`: the caller's getopts scan resumes where it
 			// was.
-			Ok(true) if !zsh_body => vp.getopts = f.getopts.take().map_or_default(|g| *g),
+			Ok(true) if !zsh_body => vp.set_getopts(f.getopts.take().map_or_default(|g| *g)),
 			Ok(_) => {},
 			Err(err) => root.fail(err),
 		}
@@ -3813,7 +3816,8 @@ pub fn start_zsh_procsub(
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));
 	vp.fds.set(fd, Some(mine));
-	vp.procsubs.push((vp.frames.len() as u32, fd));
+	let depth = vp.frames.len() as u32;
+	vp.rare_mut().procsubs.push((depth, fd));
 	vp.last_bg = LastBg::new(vpid);
 	// zsh's `procsubstpid` (`$sysparams[procsubstpid]`).
 	let rec = Record::Misc(BString::from(vpid.0.to_string()));
@@ -3954,7 +3958,7 @@ pub fn start_procsub(
 	// Nor the ends of the substitutions before it (`diff <(a) <(b)`): an
 	// external in `b` would get them as extra fds, and the host pumps an
 	// in-memory pipe it is handed, so it would drain `a`'s output.
-	for &(_, sibling) in &vp.procsubs {
+	for &(_, sibling) in vp.procsubs() {
 		if sibling != their_fd {
 			fds.set(sibling, None);
 		}
@@ -3983,7 +3987,8 @@ pub fn start_procsub(
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));
 	vp.fds.set(fd, Some(mine));
-	vp.procsubs.push((vp.frames.len() as u32, fd));
+	let depth = vp.frames.len() as u32;
+	vp.rare_mut().procsubs.push((depth, fd));
 	// bash: a process substitution sets `$!` (`wait $!` waits for it).
 	vp.last_bg = LastBg::new(vpid);
 	Some(BString::from(format!("/dev/fd/{fd}")))
@@ -3996,7 +4001,7 @@ fn end_op(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, fi: usize) {
 	if let Some(sc) = vp.frames.get_mut(fi).and_then(|f| f.scratch.take()) {
 		drop_scratch(&mut k.root, cx.store, vp, sc);
 	}
-	if !vp.procsubs.is_empty() {
+	if !vp.procsubs().is_empty() {
 		close_procsubs(vp, fi);
 	}
 	if vp.zsh.as_ref().is_some_and(|z| !z.tempfiles.is_empty()) {
@@ -4025,8 +4030,11 @@ fn remove_tempfiles(cx: &mut Cx<'_>, vp: &mut Vproc, keep: usize) {
 /// Close the process-substitution fds opened by ops of frames above the
 /// first `keep` (their commands are over).
 pub fn close_procsubs(vp: &mut Vproc, keep: usize) {
+	let Some(rare) = vp.rare.as_deref_mut() else {
+		return;
+	};
 	let fds = &mut vp.fds;
-	vp.procsubs.retain(|&(depth, fd)| {
+	rare.procsubs.retain(|&(depth, fd)| {
 		let over = depth as usize > keep;
 		if over {
 			fds.set(fd, None);
@@ -7099,7 +7107,9 @@ fn start_coproc(
 			break;
 		}
 	}
-	vp.coprocs.push(Coproc { vpid, name, read, write });
+	vp.rare_mut()
+		.coprocs
+		.push(Coproc { vpid, name, read, write });
 	vp.status = 0;
 }
 
@@ -7110,12 +7120,12 @@ fn start_coproc(
 /// then.)
 pub fn reap_coproc(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, waited: Vpid) {
 	let mut i = 0;
-	while i < vp.coprocs.len() {
-		if vp.coprocs[i].vpid != waited {
+	while i < vp.coprocs().len() {
+		if vp.coprocs()[i].vpid != waited {
 			i += 1;
 			continue;
 		}
-		let co = vp.coprocs.remove(i);
+		let co = vp.rare_mut().coprocs.remove(i);
 		vp.fds.set(co.read, None);
 		vp.fds.set(co.write, None);
 		let mut pid_name = co.name.clone();
@@ -7150,7 +7160,7 @@ pub fn reap_coproc(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, waited: Vpid
 /// coprocess's end, `NAME[0]`/`NAME[1]` becomes -1 (bash `coproc_checkfd`).
 pub fn coproc_fd_closed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, fd: i32) {
 	let mut hits = Vec::new();
-	for co in &mut vp.coprocs {
+	for co in vp.rare.iter_mut().flat_map(|r| r.coprocs.iter_mut()) {
 		if co.read == fd {
 			co.read = -1;
 			hits.push((co.name.clone(), b"0"));

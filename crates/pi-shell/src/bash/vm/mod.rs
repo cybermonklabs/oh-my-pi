@@ -4853,11 +4853,6 @@ impl Vproc {
 			exit_trap_run: false,
 			jobs: proc::JobTable::default(),
 			last_bg: proc::LastBg::default(),
-			getopts: proc::GetoptsState { optind: None, next: None, at: None },
-			procsubs: Vec::new(),
-			coprocs: Vec::new(),
-			restore_opts: Vec::new(),
-			rlimits: Vec::new(),
 			lineage: crate::bash::host::Lineage::default(),
 			trace_base: 0,
 			subshell: 0,
@@ -4873,6 +4868,7 @@ impl Vproc {
 			zsh: None,
 			zle: None,
 			clock: None,
+			rare: None,
 		}
 	}
 
@@ -4972,9 +4968,9 @@ impl Vproc {
 		// `$!` is a parameter every subshell copies; `wait` and `kill`
 		// still check that the child it names is this vproc's own.
 		vp.last_bg = self.last_bg;
-		vp.getopts.clone_from(&self.getopts);
+		vp.set_getopts(self.getopts().clone());
 		vp.command.clone_from(&self.command);
-		vp.rlimits.clone_from(&self.rlimits);
+		vp.set_rlimits(self.rlimits().to_vec());
 		vp.lineage = self.lineage;
 		jobctl::inherit(k, vp.vpid, self.vpid);
 		vp.mode = self.mode;

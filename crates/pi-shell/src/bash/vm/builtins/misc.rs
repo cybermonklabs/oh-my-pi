@@ -363,7 +363,7 @@ fn current(ctx: &Ctx<'_, '_>, l: &Limit) -> std::io::Result<(Value, Value)> {
 	let Some(res) = l.res else {
 		return Ok((Some(PIPE_SIZE), Some(PIPE_SIZE)));
 	};
-	if let Some(&(_, soft, hard)) = ctx.vp.rlimits.iter().find(|(r, ..)| *r == res) {
+	if let Some(&(_, soft, hard)) = ctx.vp.rlimits().iter().find(|(r, ..)| *r == res) {
 		return Ok((soft, hard));
 	}
 	ctx.cx.host.rlimit(res)
@@ -550,7 +550,7 @@ fn limit_one(
 		ctx.usage(format!("{}: cannot modify limit: {err}", l.desc));
 		return false;
 	}
-	let limits = &mut ctx.vp.rlimits;
+	let limits = &mut ctx.vp.rare_mut().rlimits;
 	limits.retain(|(r, ..)| *r != res);
 	limits.push((res, new_soft, new_hard));
 	true

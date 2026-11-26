@@ -515,7 +515,7 @@ fn fresh_shell(
 		random_plain: false,
 		cells_plain: 0,
 	});
-	child.rlimits.clone_from(&vp.rlimits);
+	child.set_rlimits(vp.rlimits().to_vec());
 	child.lineage = vp.lineage;
 	// A new shell's options, then the invocation's.
 	state::reset_options(&mut k.root, cx.store, &mut child);
