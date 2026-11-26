@@ -3816,10 +3816,10 @@ describe("AgentSession retry fallback", () => {
 	});
 
 	// An automatic retry never restores the primary; the cooldown-expiry revert
-	// runs on the next turn. After a retry turn that settles aborted the saga's
-	// attempt counter is still running, and a queued follow-up drains without
-	// a prompt reset, so only the restore's own clear keeps the fallback's
-	// record off the restored primary.
+	// runs on the next turn. A retry turn that settles aborted ends its saga
+	// (`Retry cancelled`), and a queued follow-up drains without a prompt reset
+	// into a new saga; the restore's own clear also keeps the fallback's record
+	// off the restored primary.
 	it("trusts a credential switch on the primary a queued follow-up restores after its cooldown", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("anthropic", "claude-haiku-4-5");
@@ -3881,8 +3881,9 @@ describe("AgentSession retry fallback", () => {
 		// claimed switch is trusted and the retry stays on the primary.
 		expect(requestedModels).toEqual([primary, fallback, fallback, primary, primary]);
 		expect(session.model?.id).toBe(primaryModel.id);
-		expect(retryEndEvents).toHaveLength(1);
-		expect(retryEndEvents[0]).toMatchObject({ success: true });
+		expect(retryEndEvents).toHaveLength(2);
+		expect(retryEndEvents[0]).toMatchObject({ success: false, finalError: "Retry cancelled" });
+		expect(retryEndEvents[1]).toMatchObject({ success: true });
 	});
 	it("rotates sibling credentials on 402 Payment is required and status-only 402 without invoking model fallback", async () => {
 		const primaryModel = getBundledModel("openai", "gpt-4o") ?? getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -4733,7 +4734,7 @@ describe("AgentSession retry fallback", () => {
 		},
 	);
 
-	it.each<{ name: string; failure: MockResponse; settings: Record<string, unknown> }>([
+	it.each<{ name: string; failure: MockResponse; settings: Record<string, unknown>; failedSends?: number }>([
 		{
 			name: "a rate-limit wait past retry.maxDelayMs",
 			failure: {
@@ -4742,13 +4743,14 @@ describe("AgentSession retry fallback", () => {
 			settings: { "retry.maxDelayMs": 100 },
 		},
 		{
-			name: "a classifier refusal",
+			name: "a classifier refusal on each of its same-model retries",
 			failure: {
 				stopReason: "error",
 				stopDetails: { type: "refusal", category: "cyber", explanation: "Classifier declined." },
 				errorMessage: "Refusal (cyber): Classifier declined this turn.",
 			},
 			settings: {},
+			failedSends: 3,
 		},
 		{
 			name: "an account-policy denial and no sibling credential to rotate to",
@@ -4765,8 +4767,8 @@ describe("AgentSession retry fallback", () => {
 			settings: {},
 		},
 	])(
-		"walks the Anthropic chain when the signing model fails with $name, which it does not retry",
-		async ({ failure, settings: extraSettings }) => {
+		"walks the Anthropic chain when the signing model fails with $name, and asks it no more",
+		async ({ failure, settings: extraSettings, failedSends = 1 }) => {
 			const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 			const fallbackModel = getBundledModel("anthropic", "claude-opus-4-5");
 			if (!primaryModel || !fallbackModel) {
@@ -4835,7 +4837,7 @@ describe("AgentSession retry fallback", () => {
 
 			expect(requestedModels).toEqual([
 				`${primaryModel.provider}/${primaryModel.id}`,
-				`${primaryModel.provider}/${primaryModel.id}`,
+				...Array.from({ length: failedSends }, () => `${primaryModel.provider}/${primaryModel.id}`),
 				`${fallbackModel.provider}/${fallbackModel.id}`,
 			]);
 			expect(fallbackAppliedEvents).toEqual([
@@ -5367,7 +5369,9 @@ describe("AgentSession retry fallback", () => {
 		await session.prompt("Recover from classifier refusal");
 		await session.waitForIdle();
 
+		// One same-model retry fits retry.maxRetries: 1, and it is refused too.
 		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
 			`${primaryModel.provider}/${primaryModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
@@ -5395,6 +5399,7 @@ describe("AgentSession retry fallback", () => {
 		await session.waitForIdle();
 
 		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
 			`${primaryModel.provider}/${primaryModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
@@ -5452,7 +5457,8 @@ describe("AgentSession retry fallback", () => {
 								"Seeded turn",
 							],
 						});
-					} else if (requestCount === 2) {
+					} else if (requestCount === 2 || requestCount === 3) {
+						// The refusal, then its one same-model retry (retry.maxRetries: 1), refused too.
 						mock.push({
 							content: [
 								{
@@ -5477,7 +5483,7 @@ describe("AgentSession retry fallback", () => {
 								expiresAt: Date.now() + 60000,
 							},
 						});
-					} else if (requestCount === 3) {
+					} else if (requestCount === 4) {
 						fallbackTurnRedemption = session?.consumeActiveFallbackCreditRedemption(model);
 						mock.push({ content: ["Recovered on Opus with credit"] });
 					} else {
@@ -5532,6 +5538,7 @@ describe("AgentSession retry fallback", () => {
 			await session.waitForIdle();
 
 			expect(requestedModels).toEqual([
+				`${primaryModel.provider}/${primaryModel.id}`,
 				`${primaryModel.provider}/${primaryModel.id}`,
 				`${primaryModel.provider}/${primaryModel.id}`,
 				`${fallbackModel.provider}/${fallbackModel.id}`,
@@ -5659,6 +5666,17 @@ describe("AgentSession retry fallback", () => {
 					stopDetails: { type: "refusal", category: "cyber", explanation: "Declined." },
 					errorMessage: "Refusal (cyber): Declined.",
 				},
+				// Its two same-model retries are refused too.
+				{
+					stopReason: "error",
+					stopDetails: { type: "refusal", category: "cyber", explanation: "Declined." },
+					errorMessage: "Refusal (cyber): Declined.",
+				},
+				{
+					stopReason: "error",
+					stopDetails: { type: "refusal", category: "cyber", explanation: "Declined." },
+					errorMessage: "Refusal (cyber): Declined.",
+				},
 				{ content: ["recovered"] },
 			],
 		});
@@ -5676,7 +5694,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
-			"retry.maxRetries": 1,
+			"retry.maxRetries": 3,
 			"retry.modelFallback": false,
 		});
 		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
@@ -6101,7 +6119,14 @@ describe("AgentSession retry fallback", () => {
 		await session.prompt("Declined by the fallback's classifier");
 		await session.waitForIdle();
 
-		expect(requestedModels).toEqual([requestedSelector, fallbackSelector, fallbackSelector, nextSelector]);
+		// The fallback's one same-model retry (retry.maxRetries: 1) is refused too, then the walk goes on.
+		expect(requestedModels).toEqual([
+			requestedSelector,
+			fallbackSelector,
+			fallbackSelector,
+			fallbackSelector,
+			nextSelector,
+		]);
 		expect(fallbackAppliedEvents.map(event => `${event.from} -> ${event.to}`)).toEqual([
 			`${requestedSelector} -> ${fallbackSelector}`,
 			`${fallbackSelector} -> ${nextSelector}`,
@@ -6127,9 +6152,10 @@ describe("AgentSession retry fallback", () => {
 		const selectorB = `${modelB.provider}/${modelB.id}`;
 
 		const requestedModels: string[] = [];
-		// What each request does, in order: the first prompt is declined and its fallback's request
-		// is still waiting when the user aborts; the next prompt is declined once and then answered.
-		const script = ["decline", "wait", "decline", "answer"];
+		// What each request does, in order: the first prompt is declined on A and on A's two
+		// same-model retries, and its fallback's request is still waiting when the user aborts; the
+		// next prompt is declined on B and B's two retries, and then answered on A.
+		const script = ["decline", "decline", "decline", "wait", "decline", "decline", "decline", "answer"];
 		const fallbackRequestStarted = Promise.withResolvers<void>();
 		const mock = createMockModel();
 		const agent = new Agent({
@@ -6176,7 +6202,7 @@ describe("AgentSession retry fallback", () => {
 		await fallbackRequestStarted.promise;
 		await session.abort();
 		await firstPrompt;
-		expect(requestedModels).toEqual([selectorA, selectorB]);
+		expect(requestedModels).toEqual([selectorA, selectorA, selectorA, selectorB]);
 
 		await session.sendCustomMessage(
 			{ customType: "test-nudge", content: "Carry on", display: false },
@@ -6184,7 +6210,7 @@ describe("AgentSession retry fallback", () => {
 		);
 		await session.waitForIdle();
 
-		expect(requestedModels.slice(2)).toEqual([selectorB, selectorA]);
+		expect(requestedModels.slice(4)).toEqual([selectorB, selectorB, selectorB, selectorA]);
 		const reply = session.agent.state.messages.at(-1);
 		expect(reply?.role === "assistant" ? reply.content : undefined).toEqual([
 			{ type: "text", text: "answered after the abort" },
@@ -6198,10 +6224,11 @@ describe("AgentSession retry fallback", () => {
 		// `auto_retry_start` on an earlier (non-refusal) attempt would then never
 		// get a matching `auto_retry_end` — leaving any subscriber tracking
 		// "retry outstanding" state (e.g. suppressing a duplicate error toast)
-		// latched open forever. With `retry.maxRetries: 2` and no fallback chain
-		// configured, the second attempt's classifier refusal hits that branch
-		// while `retryAttempt (2) <= maxRetries (2)`, so it can't fall through
-		// the pre-existing maxRetries-exceeded path (which already emits
+		// latched open forever. With `retry.maxRetries: 4` and no fallback chain
+		// configured, the classifier refusal on the fourth attempt (its model's
+		// two same-model retries spent) hits that branch while
+		// `retryAttempt (4) <= maxRetries (4)`, so it can't fall through the
+		// pre-existing maxRetries-exceeded path (which already emits
 		// `auto_retry_end`) — isolating the branch this regression covers.
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!primaryModel) {
@@ -6225,7 +6252,7 @@ describe("AgentSession retry fallback", () => {
 				calls += 1;
 				if (calls === 1) {
 					mock.push({ throw: "overloaded_error: provider returned error 503" });
-				} else if (calls === 2) {
+				} else if (calls <= 4) {
 					mock.push({
 						stopReason: "error",
 						stopDetails: { type: "refusal", category: "cyber", explanation: "Classifier declined." },
@@ -6241,7 +6268,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
-			"retry.maxRetries": 2,
+			"retry.maxRetries": 4,
 		});
 		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
 
@@ -6259,14 +6286,15 @@ describe("AgentSession retry fallback", () => {
 		expect(requestedModels).toEqual([
 			`${primaryModel.provider}/${primaryModel.id}`,
 			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
 		]);
-		expect(retryStartEvents).toHaveLength(1);
-		expect(retryStartEvents[0]?.attempt).toBe(1);
+		expect(retryStartEvents.map(event => event.attempt)).toEqual([1, 2, 3]);
 		expect(retryEndEvents).toEqual([
 			{
 				type: "auto_retry_end",
 				success: false,
-				attempt: 1,
+				attempt: 3,
 				finalError: refusalMessage,
 			},
 		]);
@@ -9125,7 +9153,10 @@ describe("AgentSession retry fallback", () => {
 			| "error-turn"
 			// The same append, failing only once the saga announced its first
 			// retry, so the attempt before it still records.
-			| "error-turn-after-first-retry";
+			| "error-turn-after-first-retry"
+			// The same append, failing only once the saga announced its third
+			// retry, so only the turn that closes the saga meets it.
+			| "error-turn-after-third-retry";
 
 		async function expectSagaClosesDespiteFailedWrite(scenario: {
 			responses: MockResponse[];
@@ -9167,8 +9198,10 @@ describe("AgentSession retry fallback", () => {
 				});
 			} else {
 				let armed = scenario.failingWrite === "error-turn";
+				const armAfterRetries = scenario.failingWrite === "error-turn-after-third-retry" ? 3 : 1;
+				let retriesAnnounced = 0;
 				session.subscribe(event => {
-					if (event.type === "auto_retry_start") armed = true;
+					if (event.type === "auto_retry_start" && ++retriesAnnounced >= armAfterRetries) armed = true;
 				});
 				const appendMessage = sessionManager.appendMessage.bind(sessionManager);
 				vi.spyOn(sessionManager, "appendMessage").mockImplementation(message => {
@@ -9238,10 +9271,24 @@ describe("AgentSession retry fallback", () => {
 						stopDetails: { type: "refusal", category: "cyber", explanation: "Classifier declined." },
 						errorMessage: "Refusal (cyber): Classifier declined this retried turn.",
 					},
+					{
+						stopReason: "error",
+						stopDetails: { type: "refusal", category: "cyber", explanation: "Classifier declined." },
+						errorMessage: "Refusal (cyber): Classifier declined this retried turn.",
+					},
+					{
+						stopReason: "error",
+						stopDetails: { type: "refusal", category: "cyber", explanation: "Classifier declined." },
+						errorMessage: "Refusal (cyber): Classifier declined this retried turn.",
+					},
 				],
-				settings: { "retry.maxRetries": 2 },
-				failingWrite: "error-turn-after-first-retry",
-				end: { success: false, attempt: 1, finalError: "Refusal (cyber): Classifier declined this retried turn." },
+				// The refusal's two same-model retries fit, so the saga ends on the third refusal. Each
+				// retry appends its error turn first, so the append fails only after the third retry,
+				// for the turn that closes the saga. A failing append on a retry is the case below
+				// that could not record its attempt.
+				settings: { "retry.maxRetries": 4 },
+				failingWrite: "error-turn-after-third-retry",
+				end: { success: false, attempt: 3, finalError: "Refusal (cyber): Classifier declined this retried turn." },
 			});
 		});
 

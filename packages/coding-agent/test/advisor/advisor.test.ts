@@ -5149,16 +5149,15 @@ describe("advisor", () => {
 			expect(runtime.backlog).toBe(0);
 		});
 
-		it("strips echoed thinking after a classifier refusal and succeeds without a notice", async () => {
+		it("strips echoed thinking once the unchanged resends are refused and succeeds without a notice", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
-			let promptCalls = 0;
 			const agent: AdvisorAgent = {
 				prompt: async input => {
 					promptInputs.push(input);
-					promptCalls++;
-					if (promptCalls === 1) {
+					// The classifier refuses any batch that echoes the primary's reasoning.
+					if (promptText(input).includes("private reasoning")) {
 						state.error = "Refusal (reasoning_extraction): reasoning may not be echoed";
 						state.messages.push({
 							role: "assistant",
@@ -5166,7 +5165,7 @@ describe("advisor", () => {
 							stopReason: "error",
 							stopDetails: { type: "refusal", category: "reasoning_extraction" },
 							errorMessage: state.error,
-							timestamp: 2,
+							timestamp: promptInputs.length + 1,
 						} as unknown as AgentMessage);
 						return;
 					}
@@ -5175,7 +5174,7 @@ describe("advisor", () => {
 						role: "assistant",
 						content: [],
 						stopReason: "stop",
-						timestamp: 3,
+						timestamp: promptInputs.length + 1,
 					} as unknown as AgentMessage);
 				},
 				abort: () => {},
@@ -5208,14 +5207,16 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await settleUntil(() => runtime.backlog === 0);
 
-			expect(promptInputs).toHaveLength(2);
-			expect(promptText(promptInputs[0])).toContain("private reasoning");
-			expect(promptText(promptInputs[1])).not.toContain("private reasoning");
+			// Two unchanged resends to the same model come first, then the strip.
+			expect(promptInputs).toHaveLength(4);
+			for (const input of promptInputs.slice(0, 3)) expect(promptText(input)).toContain("private reasoning");
+			expect(promptText(promptInputs[3])).not.toContain("private reasoning");
+			expect(promptText(promptInputs[3])).toContain("answer");
 			expect(promptText(promptInputs[1])).toContain("answer");
 			expect(failures).toEqual([]);
 		});
 
-		it("surfaces a persistent classifier refusal after one stripped resend", async () => {
+		it("surfaces a persistent classifier refusal after two unchanged resends and one stripped resend", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
@@ -5262,9 +5263,9 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await settleUntil(() => failures.length === 1 && runtime.backlog === 0);
 
-			expect(promptInputs).toHaveLength(2);
-			expect(promptText(promptInputs[0])).toContain("private reasoning");
-			expect(promptText(promptInputs[1])).not.toContain("private reasoning");
+			expect(promptInputs).toHaveLength(4);
+			for (const input of promptInputs.slice(0, 3)) expect(promptText(input)).toContain("private reasoning");
+			expect(promptText(promptInputs[3])).not.toContain("private reasoning");
 			expect(failures).toHaveLength(1);
 		});
 
@@ -5334,13 +5335,14 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await settleUntil(() => runtime.backlog === 0);
 
-			// Refuse, strip-and-resend, refuse again, then the swapped model answers.
+			// Refuse, two unchanged resends refused, strip-and-resend, refuse again,
+			// then the swapped model answers.
 			expect(fallbackCalls).toBe(1);
-			expect(promptInputs).toHaveLength(3);
+			expect(promptInputs).toHaveLength(5);
 			expect(failures).toEqual([]);
 		});
 
-		it("goes straight to the model fallback when the refused batch carried no reasoning", async () => {
+		it("goes to the model fallback after the unchanged resends when the refused batch carried no reasoning", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
@@ -5387,10 +5389,11 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await settleUntil(() => runtime.backlog === 0);
 
-			// Stripping reasoning cannot change this batch, so the refused request is
-			// not resent byte-for-byte: refuse, switch models, the fallback answers.
+			// Stripping reasoning cannot change this batch, so after the two unchanged
+			// resends it is not resent again: refuse three times, switch models, the
+			// fallback answers.
 			expect(fallbackCalls).toBe(1);
-			expect(promptInputs).toHaveLength(2);
+			expect(promptInputs).toHaveLength(4);
 			expect(failures).toEqual([]);
 		});
 
@@ -5446,7 +5449,7 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await settleUntil(() => failures.length === 1 && runtime.backlog === 0);
 
-			expect(promptInputs).toHaveLength(2);
+			expect(promptInputs).toHaveLength(4);
 			expect(fallbackCalls).toBe(1);
 			expect(failures).toHaveLength(1);
 
@@ -5458,8 +5461,9 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await settleUntil(() => fallbackCalls === 2 && runtime.backlog === 0);
 
-			// The earlier terminal cascade must not suppress fallback for a new batch.
-			expect(promptInputs).toHaveLength(3);
+			// The earlier terminal cascade must not suppress fallback for a new batch, and
+			// the new batch gets its own two unchanged resends.
+			expect(promptInputs).toHaveLength(7);
 			expect(fallbackCalls).toBe(2);
 			expect(failures).toHaveLength(1);
 		});
@@ -5586,12 +5590,12 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await settleUntil(() => failures.length === 1 && runtime.backlog === 0);
 
-			// a (refuse, strip) -> b (refuse, strip) -> back to a, already tried: stop.
+			// a (refuse, two resends, strip) -> b (refuse, two resends) -> back to a, already tried: stop.
 			expect(hops).toBe(2);
 			expect(failures).toHaveLength(1);
 		});
 
-		it("degrades on a category-less refusal", async () => {
+		it("resends a category-less refusal unchanged, as any other refusal", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
 			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
@@ -5652,7 +5656,7 @@ describe("advisor", () => {
 
 			expect(promptInputs).toHaveLength(2);
 			expect(promptText(promptInputs[0])).toContain("private reasoning");
-			expect(promptText(promptInputs[1])).not.toContain("private reasoning");
+			expect(promptText(promptInputs[1])).toBe(promptText(promptInputs[0]));
 			expect(failures).toEqual([]);
 		});
 

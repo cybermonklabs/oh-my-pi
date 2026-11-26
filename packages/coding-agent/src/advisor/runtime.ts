@@ -11,6 +11,7 @@ import {
 } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { SecretValueSet } from "../secrets/placeholder";
+import { CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES } from "../session/refusal-retries";
 import {
 	formatExecutionSourcePreview,
 	formatSessionHistoryMarkdown,
@@ -328,6 +329,11 @@ export class AdvisorRuntime {
 	 * terminal turn ends the cascade, or on reset, so a later refusal starts fresh.
 	 */
 	readonly #refusalModelsTried = new Set<string>();
+	/**
+	 * Unchanged resends each advisor model has had in this refusal cascade, by model identity.
+	 * Cleared with {@link #refusalModelsTried}.
+	 */
+	readonly #refusalRetries = new Map<string, number>();
 	readonly #configuredIncludeThinking: boolean;
 	/** Whether primary reasoning is included in advisor deltas for the current model. */
 	#includeThinking: boolean;
@@ -711,6 +717,7 @@ export class AdvisorRuntime {
 		this.#droppedBacklogs = 0;
 		this.#consecutiveQuarantines = 0;
 		this.#refusalModelsTried.clear();
+		this.#refusalRetries.clear();
 		this.#failureNotified = false;
 		this.#resetAdvisorContext(true, true, reason);
 	}
@@ -1436,6 +1443,7 @@ export class AdvisorRuntime {
 					this.#droppedBacklogs = 0;
 					this.#consecutiveQuarantines = 0;
 					this.#refusalModelsTried.clear();
+					this.#refusalRetries.clear();
 					if (this.host.onTurnSuccess) {
 						try {
 							await raceWithSignal(Promise.resolve(this.host.onTurnSuccess()), iterationAbort.signal);
@@ -1483,6 +1491,40 @@ export class AdvisorRuntime {
 					this.#rollbackFailedTurn(messageSnapshot);
 					logger.debug("advisor turn failed", { err: String(err) });
 					if (classifierRefusal) {
+						const refusalModel = this.host.getModelIdentity?.() ?? this.#modelIdentity ?? "";
+						// A classifier refusal usually judges the reply the model sampled
+						// rather than the batch, and the same batch sent again is usually
+						// answered. So the same batch goes to the same model again, up to
+						// CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES times for each model, before the
+						// cascade below changes what is sent or which model gets it, as the
+						// primary's turn recovery asks a refused model again before its walk.
+						// The unchanged resends come first because the strip below lasts: the
+						// advisor reviews without the primary's reasoning from then on. A model
+						// the cascade has already left is not asked again. An OpenAI
+						// `cyber_policy` refusal counts as a refusal here (it is blocked
+						// content), but it is never sent again to the model that refused it:
+						// each copy adds a refusal to the organization's record.
+						const refusalRetries = this.#refusalRetries.get(refusalModel) ?? 0;
+						if (
+							!AIError.isCyberPolicyRefusal(terminalFailure ?? err) &&
+							!this.#refusalModelsTried.has(refusalModel) &&
+							refusalRetries < CLASSIFIER_REFUSAL_SAME_MODEL_RETRIES
+						) {
+							this.#refusalRetries.set(refusalModel, refusalRetries + 1);
+							this.#pending.unshift({
+								text: batch(),
+								rawMessages,
+								renderRevision: this.#renderRevision,
+								turns: finalTurns,
+								wip,
+								overflowRecovery: recoveringOverflow || undefined,
+							});
+							logger.debug("advisor refusal resent to the same model", {
+								model: refusalModel,
+								retry: refusalRetries + 1,
+							});
+							continue;
+						}
 						// Stripping only recovers when it changes what was sent: a batch
 						// without primary reasoning would be resent byte-for-byte and
 						// refused again, so it goes straight to the model fallback. A
@@ -1518,7 +1560,6 @@ export class AdvisorRuntime {
 						// exhaustion (the host returns false once candidates run out); the
 						// tried-set only stops a cyclic chain from revisiting a model. The
 						// primary turn-recovery path already allows fallback on refusals.
-						const refusalModel = this.host.getModelIdentity?.() ?? this.#modelIdentity ?? "";
 						let refusalRecovered = false;
 						try {
 							if (!this.#refusalModelsTried.has(refusalModel)) {
@@ -1556,6 +1597,7 @@ export class AdvisorRuntime {
 						// The batch is terminal, so the next primary update is a new
 						// refusal cascade and must be allowed to try the chain again.
 						this.#refusalModelsTried.clear();
+						this.#refusalRetries.clear();
 						this.#notifyFailureOnce(err);
 						this.#notifyTurnAbandoned();
 						this.#clearSeenContext();
