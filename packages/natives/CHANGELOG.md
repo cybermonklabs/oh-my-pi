@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Starting or restoring an embedded shell session, applying `rsync --chmod`, or running another host that needs the process's file-creation mask no longer forks the whole process where `/proc/self/status` has no `Umask` line, as under gVisor: it is read with a short-lived child that shares this process's memory and descriptor table but has a mask of its own (Linux), so no child copies every open file of the host
+
 ## [18.18.6] - 2026-11-09
 
 ### Fixed

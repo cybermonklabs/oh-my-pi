@@ -808,6 +808,16 @@ extern "C" fn clone_read_umask(arg: *mut libc::c_void) -> libc::c_int {
 /// neither the address space nor the descriptor table, so it holds no copy of
 /// any descriptor and leaves no window a concurrent spawn could catch. `None`
 /// when the stack cannot be mapped or the clone is refused (a seccomp filter).
+///
+/// Every signal is blocked for the calling thread across the clone and the
+/// wait, and the thread's mask is put back afterwards. The child shares this
+/// process's handlers and, under `CLONE_VM`, its memory: a signal that reached
+/// the child would run a handler of this process on the child's small stack,
+/// against the calling thread's thread-local state. glibc's `spawni.c` and
+/// musl's `posix_spawn.c` block every signal across the same clone for the
+/// same reason. The child inherits the blocked mask and never unblocks it, so
+/// nothing is delivered to it; a signal sent meanwhile stays pending for this
+/// thread and arrives once the mask is back.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn umask_without_fork() -> Option<u32> {
 	const STACK: usize = 64 << 10;
@@ -828,6 +838,7 @@ fn umask_without_fork() -> Option<u32> {
 	}
 	let mut mask = u32::MAX;
 	let flags = libc::CLONE_VM | libc::CLONE_FILES | libc::CLONE_VFORK | libc::SIGCHLD;
+	let blocked = block_every_signal();
 	// SAFETY: the child runs clone_read_umask on the top of the mapping above,
 	// reads the mask through &mut mask (shared by CLONE_VM) and exits without
 	// returning; CLONE_VFORK suspends this thread until it has, so mask is set
@@ -851,9 +862,41 @@ fn umask_without_fork() -> Option<u32> {
 			}
 		}
 	}
+	restore_signal_mask(blocked);
 	// SAFETY: the mapping is this function's, and the child no longer runs.
 	unsafe { libc::munmap(stack, STACK) };
 	(pid > 0 && mask != u32::MAX).then_some(mask)
+}
+
+/// Blocks every signal for the calling thread and returns the mask it had, for
+/// [`restore_signal_mask`]. `None` when the mask could not be set, in which
+/// case nothing was changed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn block_every_signal() -> Option<libc::sigset_t> {
+	// SAFETY: sigfillset and pthread_sigmask write through pointers to these
+	// locals, which live until this function returns; both are initialized by
+	// the calls that fill them before any read.
+	unsafe {
+		let mut full = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+		if libc::sigfillset(full.as_mut_ptr()) != 0 {
+			return None;
+		}
+		let mut before = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+		if libc::pthread_sigmask(libc::SIG_SETMASK, full.as_ptr(), before.as_mut_ptr()) != 0 {
+			return None;
+		}
+		Some(before.assume_init())
+	}
+}
+
+/// Puts back the mask [`block_every_signal`] returned; does nothing when it
+/// changed none. Any signal that arrived meanwhile is delivered here.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn restore_signal_mask(before: Option<libc::sigset_t>) {
+	if let Some(before) = before {
+		// SAFETY: `before` is the mask pthread_sigmask gave this thread above.
+		unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &raw const before, std::ptr::null_mut()) };
+	}
 }
 
 /// Fork a short-lived child that can inspect its inherited mask without
@@ -991,6 +1034,106 @@ mod umask_tests {
 		assert_eq!(forks, 0, "the read forked a process");
 		assert!(mask.is_some(), "no mask read");
 		assert_eq!(mask, super::umask_without_fork(), "the read and the clone route disagree");
+	}
+
+	use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+
+	/// This process's pid, for [`count_if_in_child`] to tell the clone child
+	/// (its own pid) from the parent.
+	static MAIN_PID: AtomicI32 = AtomicI32::new(0);
+	/// How many times a SIGUSR1 handler ran in the clone child.
+	static HANDLER_IN_CHILD: AtomicUsize = AtomicUsize::new(0);
+
+	/// SIGUSR1 handler: counts a run whose pid is not the main process's, i.e.
+	/// a run in the clone child (which shares this process's handlers but has a
+	/// pid of its own). Async-signal-safe: `getpid` and an atomic add.
+	extern "C" fn count_if_in_child(_sig: libc::c_int) {
+		// SAFETY: getpid has no preconditions and is async-signal-safe.
+		if unsafe { libc::getpid() } != MAIN_PID.load(Ordering::Relaxed) {
+			HANDLER_IN_CHILD.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// A signal arriving while the clone child lives must not run this
+	/// process's handler in the child: under `CLONE_VM` it would run on the
+	/// child's small stack against the calling thread's thread-local state.
+	/// SIGUSR1 is sent to the process group without pause (the clone child
+	/// shares the group) while the mask is read many times; the handler never
+	/// runs in the child, because the read blocks every signal across the
+	/// clone. Without that block it runs there often.
+	///
+	/// Run in an isolated re-exec of the test binary, so the only processes in
+	/// the group the signal reaches are this one and its clone children, not
+	/// another test's.
+	#[test]
+	fn a_signal_does_not_run_a_handler_in_the_clone_child() {
+		use std::sync::{
+			Arc,
+			atomic::AtomicBool,
+		};
+
+		const MARKER: &str = "PI_UMASK_SIGNAL_ISOLATED";
+		if std::env::var_os(MARKER).is_none() {
+			let exe = std::env::current_exe().expect("test binary path");
+			let out = std::process::Command::new(exe)
+				.args([
+					"--exact",
+					"host::umask_tests::a_signal_does_not_run_a_handler_in_the_clone_child",
+					"--nocapture",
+					"--test-threads=1",
+				])
+				.env(MARKER, "1")
+				.output()
+				.expect("run the isolated signal test");
+			assert!(
+				out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+				"isolated signal test: {}{}",
+				String::from_utf8_lossy(&out.stdout),
+				String::from_utf8_lossy(&out.stderr),
+			);
+			return;
+		}
+
+		// SAFETY: getpid has no preconditions.
+		MAIN_PID.store(unsafe { libc::getpid() }, Ordering::Relaxed);
+		HANDLER_IN_CHILD.store(0, Ordering::Relaxed);
+		// A group of this process's own, so the group signal below reaches
+		// only it and its clone children.
+		// SAFETY: setpgid(0, 0) makes this process its group's leader, or
+		// fails harmlessly when it already is one.
+		unsafe { libc::setpgid(0, 0) };
+		// SAFETY: sigaction installs a handler that only reads a pid and adds
+		// to an atomic; sa_mask is empty and flags are 0, both set here.
+		unsafe {
+			let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed().assume_init();
+			let handler: extern "C" fn(libc::c_int) = count_if_in_child;
+			action.sa_sigaction = handler as libc::sighandler_t;
+			libc::sigemptyset(&raw mut action.sa_mask);
+			assert_eq!(libc::sigaction(libc::SIGUSR1, &raw const action, std::ptr::null_mut()), 0);
+		}
+		let stop = Arc::new(AtomicBool::new(false));
+		let sending = Arc::clone(&stop);
+		let sender = std::thread::spawn(move || {
+			while !sending.load(Ordering::Relaxed) {
+				// SAFETY: sends SIGUSR1 to every process in this group, the
+				// clone child among them; all have the handler. The clone child
+				// lives only microseconds, so this sends without pause to land
+				// one while a child is alive.
+				unsafe { libc::kill(0, libc::SIGUSR1) };
+			}
+		});
+		for _ in 0..20_000 {
+			super::umask_without_fork();
+		}
+		stop.store(true, Ordering::Relaxed);
+		sender.join().unwrap();
+		// SAFETY: restore the default so later tests are unaffected.
+		unsafe { libc::signal(libc::SIGUSR1, libc::SIG_DFL) };
+		assert_eq!(
+			HANDLER_IN_CHILD.load(Ordering::Relaxed),
+			0,
+			"a SIGUSR1 handler ran in the clone child: the read did not block signals across the clone",
+		);
 	}
 }
 
