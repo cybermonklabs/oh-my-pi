@@ -518,6 +518,29 @@ fn keeps_the_backslash_where_bash_expands_as_if_double_quoted() {
 			0,
 			0,
 		),
+		// Arithmetic in a here-document has the here-document's
+		// double-quoted context.
+		(
+			"cat <<E\n$(( ${y:-\"\\\"${x!}\"} ))\nE\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 1: \\\"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"a=(1 2)\ncat <<E\n$(( a[${y:-\"\\\"${x!}\"}] ))\nE\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: \"${x!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\ncat <<E\n$(( ${x/a/\"\\\"${y!}\"} ))\nE\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
 		(
 			"y=1\ncat <<E\n${y:+\"\\\"${x!}\"}\nE\necho \"after $?\"",
 			"after 1\n",
@@ -963,6 +986,13 @@ fn names_a_replacement_in_arithmetic_as_arithmetic() {
 			"x=abc\n[[ ${x/a/\"\\\"${y!}\"} -eq 1 ]]\necho \"after $?\"",
 			"after 1\n",
 			"PFX: line 2: ${y!}: bad substitution\n",
+			0,
+			0,
+		),
+		(
+			"x=abc\n[[ ${x/a/\"a\\\"b${y!}\"} -ne 1 ]]\necho \"after $?\"",
+			"after 1\n",
+			"PFX: line 2: b${y!}: bad substitution\n",
 			0,
 			0,
 		),
