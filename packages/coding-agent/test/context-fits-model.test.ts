@@ -4,7 +4,8 @@
  * model that produced it, and only while its session replays native history,
  * so a different retry candidate is not charged the active model's replayed
  * reasoning, in the local floor or in the provider usage that carried it, while
- * the producing model still is.
+ * the producing model still is. The latest answer the context figure adds to
+ * the provider usage counts as `model`'s request replays it in the same way.
  */
 import { describe, expect, it } from "bun:test";
 import { cloneJsonTree } from "@oh-my-pi/pi-utils";
@@ -15,6 +16,11 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SessionMaintenance, type SessionMaintenanceHost } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	type ContextAnswerReader,
+	SessionStatsTracker,
+	type SessionStatsTrackerHost,
+} from "@oh-my-pi/pi-coding-agent/session/session-stats";
 import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 
 const active = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-6.1-sol");
@@ -55,33 +61,54 @@ function responsesTurn(producer: Model, text: string, timestamp: number): Assist
 const codexTurn = (text: string, timestamp: number) => responsesTurn(active, text, timestamp);
 
 /**
- * Maintenance over `messages`. Without `usageTokens` there is no provider usage,
- * so the local floor decides (rebuilt history); with it, provider usage anchored
- * to the active model's last request competes, as on the live retry path.
+ * Maintenance over `messages` for a session on `activeModel` (the codex model
+ * when omitted). Without `usageTokens` there is no provider usage, so the local
+ * floor decides (rebuilt history); with it, provider usage anchored to the
+ * active model's last request competes, as on the live retry path. With
+ * `tracked`, a real `SessionStatsTracker` reads that usage off the anchor on
+ * `sessionManager`'s branch instead.
  */
 function maintenance(
 	messages: AgentMessage[],
 	options: {
+		activeModel?: Model;
 		usageTokens?: number;
+		tracked?: boolean;
 		providerSessionState?: Map<string, ProviderSessionState>;
 		sessionManager?: SessionManager;
 	} = {},
 ): SessionMaintenance {
-	const agent = new Agent({ initialState: { model: active, systemPrompt: [], tools: [], messages } });
+	const activeModel = options.activeModel ?? active;
+	const agent = new Agent({ initialState: { model: activeModel, systemPrompt: [], tools: [], messages } });
 	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
+	// The tracker reads no model registry for the context figure.
+	const stats = options.tracked
+		? new SessionStatsTracker({
+				session: {},
+				agent,
+				sessionManager,
+				model: () => activeModel,
+			} as unknown as SessionStatsTrackerHost)
+		: undefined;
 	const host = {
 		agent,
 		settings: Settings.isolated({ "compaction.reserveTokens": 200 }),
-		model: () => active,
+		model: () => activeModel,
 		messages: () => agent.state.messages,
 		nonMessageTokenSource: () => ({}),
 		providerSessionState: options.providerSessionState,
 		sessionManager,
-		buildDisplaySessionContext: (model: Model = active) => sessionManager.buildSessionContext({ model }),
+		buildDisplaySessionContext: (model: Model = activeModel) => sessionManager.buildSessionContext({ model }),
 		getContextUsage: ({ contextWindow }: { contextWindow: number }) =>
 			options.usageTokens === undefined
 				? undefined
 				: { tokens: options.usageTokens, contextWindow, percent: (options.usageTokens / contextWindow) * 100 },
+		// Stubbed usage adds no answer to the provider's prompt.
+		getContextAnswer: () => undefined,
+		...(stats && {
+			getContextUsage: (usageOptions: { contextWindow: number }) => stats.getContextUsage(usageOptions),
+			getContextAnswer: (reader: ContextAnswerReader) => stats.getContextAnswer(reader),
+		}),
 	} as unknown as SessionMaintenanceHost;
 	return new SessionMaintenance(host);
 }
@@ -238,4 +265,44 @@ describe("SessionMaintenance.contextFitsModel", () => {
 		expect(maintenance(live, { sessionManager }).contextFitsModel(claude)).toBe(false);
 		expect(maintenance(live, { sessionManager }).contextFitsModel(claude, liveFailed)).toBe(true);
 	}, 30_000);
+
+	it("counts the latest answer in the provider usage as the candidate's request replays it", () => {
+		const claudeApi = getBundledModel("anthropic", "claude-opus-5-5");
+		const bedrock = getBundledModel("amazon-bedrock", "global.anthropic.claude-opus-5-5");
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage({ role: "user", content: "Find the call sites.", timestamp: 1 });
+		// The Claude API bills this turn's signed thinking at its 3,000-token output when the next request replays
+		// it; Bedrock's replay strips the signature, so only the few visible tokens reach it.
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "Check the call sites first.", thinkingSignature: "s".repeat(4_000) },
+				{ type: "text", text: "The call sites are in a.ts." },
+			],
+			api: claudeApi.api,
+			provider: claudeApi.provider,
+			model: claudeApi.id,
+			usage: {
+				input: 10_000,
+				output: 3_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 13_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 2,
+		});
+		// A 14,117-token window less its 15% reserve (2,117) leaves a 12,000-token budget.
+		const fits = (target: Model): boolean =>
+			maintenance(sessionManager.buildSessionContext().messages, {
+				activeModel: claudeApi,
+				tracked: true,
+				sessionManager,
+			}).contextFitsModel({ ...target, contextWindow: 14_117 });
+
+		expect(fits(bedrock)).toBe(true);
+		// Control: the producing model's next request carries the 10,000-token prompt and the 3,000-token answer.
+		expect(fits(claudeApi)).toBe(false);
+	});
 });

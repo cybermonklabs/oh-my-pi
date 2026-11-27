@@ -1,11 +1,11 @@
-import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { Agent, AgentMessage, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import {
 	calculatePromptTokens,
 	findTranscriptUsageAnchor,
 	isTranscriptUsageAnchor,
-	type SessionMessageEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, ProviderResponseMetadata, Usage } from "@oh-my-pi/pi-ai";
+import { isSurvivingAssistant, withoutMalformedToolCalls } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { type } from "@oh-my-pi/omptype";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
@@ -53,9 +53,49 @@ export interface SessionStatsTrackerHost {
 	sessionId(): string;
 }
 
+/**
+ * A request whose replay of the anchor turn {@link SessionStatsTracker.getContextAnswer}
+ * counts: another model's, or a retry that leaves a failed turn out.
+ */
+export interface ContextAnswerReader {
+	/** Counts what the request sends. */
+	tokenizer: Tokenizer;
+	/** The request's model: its tool-name limits decide which tool calls and turns its replay keeps. */
+	model: Model | undefined;
+	/** A transcript message the request leaves out. */
+	excludedMessage?: AgentMessage;
+}
+
+/** The anchor turn's answer that the context figure adds to the provider's prompt. */
+export interface ContextAnswer {
+	/** The anchor turn, as the transcript holds it. */
+	message: AgentMessage;
+	/** The answer in the figure: as the active model's next request replays it. */
+	tokens: number;
+	/** The answer as the reader's request replays it: 0 when that request leaves the turn out or drops it. */
+	readerTokens: number;
+}
+
+/** A provider anchor and its position in the transcript. */
+interface UsageAnchor {
+	message: AssistantMessage;
+	index: number;
+}
+
 function correctedPromptTokens(assistant: AssistantMessage): number {
 	const providerPromptTokens = assistant.contextSnapshot?.promptTokens ?? calculatePromptTokens(assistant.usage);
 	return Math.max(0, providerPromptTokens - (assistant.contextSnapshot?.historyRewriteTokensRemoved ?? 0));
+}
+
+/**
+ * Whether the base {@link correctedPromptTokens} reads from `usage` leaves out
+ * the turn's own answer, which the next request sends: it does unless it is a
+ * provider-reported context occupancy (`contextTokens`) or, with the prompt
+ * buckets (`input`, `cacheRead`, `cacheWrite`) empty, the turn's total (see
+ * `calculatePromptTokens`).
+ */
+function promptOmitsAnswer(usage: Usage): boolean {
+	return usage.contextTokens === undefined && usage.input + usage.cacheRead + usage.cacheWrite > 0;
 }
 
 function isUsageWindowBoundary(entry: SessionEntry): boolean {
@@ -118,20 +158,61 @@ export class SessionStatsTracker {
 	}
 
 	/**
-	 * Provider anchor `anchor`'s base for {@link #anchoredUsedTokens}: its
-	 * corrected prompt, and what the next request carries of its own output:
-	 * its text, the thinking that replays and its tool-call arguments, which its
-	 * prompt buckets do not hold. The output is counted as the request renders
-	 * it, and at most the output the provider reported for the turn, since an
-	 * opaque reasoning payload is billed at the reasoning's size, not its byte
-	 * size. A provider-reported context occupancy (`usage.contextTokens`)
-	 * already holds the turn.
+	 * The answer of provider anchor `anchor`, at `anchor.index` in the
+	 * transcript `messages`, as `reader`'s request replays it: nothing when the
+	 * request leaves the turn out (`reader.excludedMessage`) or its replay drops
+	 * the turn (`isSurvivingAssistant`: a turn cut off with neither text nor a
+	 * valid tool call), else the blocks the replay keeps
+	 * (`withoutMalformedToolCalls`), counted with `countLatestTurn` when no later
+	 * assistant turn survives (an Anthropic Messages replay keeps that turn's
+	 * signatures) and with `countMessage` otherwise. The count is capped at
+	 * `usage.output` when the provider reported an output, since an opaque
+	 * reasoning payload is billed at the reasoning's size, not its byte size.
 	 */
-	#anchorBaseTokens(anchor: AssistantMessage): number {
-		const promptTokens = correctedPromptTokens(anchor);
-		if (anchor.usage.contextTokens !== undefined) return promptTokens;
-		const carried = this.#tokenizer.countMessage(anchor);
-		return promptTokens + (anchor.usage.output > 0 ? Math.min(anchor.usage.output, carried) : carried);
+	#answerTokens(anchor: UsageAnchor, messages: readonly AgentMessage[], reader: ContextAnswerReader): number {
+		const { tokenizer, model, excludedMessage } = reader;
+		if (messages[anchor.index] === excludedMessage || !isSurvivingAssistant(anchor.message, model)) return 0;
+		const latestTurnIndex = messages.findLastIndex(
+			message => message !== excludedMessage && message.role === "assistant" && isSurvivingAssistant(message, model),
+		);
+		const replayed = withoutMalformedToolCalls(anchor.message, model);
+		const answerTokens =
+			latestTurnIndex === anchor.index ? tokenizer.countLatestTurn(replayed) : tokenizer.countMessage(replayed);
+		const output = anchor.message.usage.output;
+		return output > 0 ? Math.min(output, answerTokens) : answerTokens;
+	}
+
+	/**
+	 * The provider anchor the context figure starts from, with its position in
+	 * the transcript `activeMessages`: the newest anchor on the session branch
+	 * `branchEntries` since the latest compaction unless an in-flight snapshot
+	 * outranks it, else, for a session with an empty branch and no snapshot, the
+	 * newest anchor in the transcript. `undefined` when the figure starts from
+	 * the snapshot or from a local count.
+	 */
+	#usageAnchor(
+		branchEntries: readonly SessionEntry[],
+		activeMessages: readonly AgentMessage[],
+	): UsageAnchor | undefined {
+		const pending = this.#pendingContextSnapshot;
+		if (branchEntries.length === 0) return pending ? undefined : findTranscriptUsageAnchor(activeMessages);
+		const latestCompaction = getLatestCompactionEntry(branchEntries);
+		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
+		for (let entryIndex = branchEntries.length - 1; entryIndex > compactionIndex; entryIndex--) {
+			const entry = branchEntries[entryIndex];
+			if (entry.type !== "message" || !isTranscriptUsageAnchor(entry.message)) continue;
+			const message = entry.message;
+			let index = activeMessages.indexOf(message);
+			if (index === -1) {
+				index = activeMessages.findIndex(
+					candidate => candidate.role === "assistant" && candidate.timestamp === message.timestamp,
+				);
+			}
+			const epoch = message.contextSnapshot?.compactionEpoch ?? 0;
+			const outranksPending = !pending || (index >= pending.cutoffCount && epoch >= pending.epoch);
+			return index !== -1 && outranksPending ? { message, index } : undefined;
+		}
+		return undefined;
 	}
 
 	/**
@@ -315,54 +396,31 @@ export class SessionStatsTracker {
 			nonMessageTokens: computeNonMessageTokens(this.#host.session, this.#tokenizer, settings?.revision),
 			toolSchemaTokens: toolsTokens,
 		};
-		const branchEntries = this.#host.sessionManager.getBranchView();
-		const latestCompaction = getLatestCompactionEntry(branchEntries);
-		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
-		let usedTokens = 0;
-		let anchored = false;
 		const pendingMessages = options?.pendingMessages ?? [];
 		const pendingTokens = this.#tokenizer.countMessages(pendingMessages);
-		const pending = this.#pendingContextSnapshot;
-
-		let anchorEntry: SessionMessageEntry | undefined;
-		for (let index = branchEntries.length - 1; index > compactionIndex; index--) {
-			const entry = branchEntries[index];
-			if (entry.type !== "message" || !isTranscriptUsageAnchor(entry.message)) continue;
-			anchorEntry = entry;
-			break;
-		}
-
 		const activeMessages = this.#host.agent.state.messages;
-		let anchorIndex = -1;
-		let anchorAssistant: AssistantMessage | undefined;
-		if (anchorEntry?.message.role === "assistant") {
-			const assistant = anchorEntry.message;
-			anchorAssistant = assistant;
-			anchorIndex = activeMessages.indexOf(assistant);
-			if (anchorIndex === -1) {
-				anchorIndex = activeMessages.findIndex(
-					message => message.role === "assistant" && message.timestamp === assistant.timestamp,
-				);
+		const anchor = this.#usageAnchor(this.#host.sessionManager.getBranchView(), activeMessages);
+		const pending = this.#pendingContextSnapshot;
+		let usedTokens: number;
+		let anchored = true;
+		if (anchor) {
+			// The prompt the provider reported, and the anchor turn's own answer, which the next request sends.
+			let base = correctedPromptTokens(anchor.message);
+			if (promptOmitsAnswer(anchor.message.usage)) {
+				base += this.#answerTokens(anchor, activeMessages, {
+					tokenizer: this.#tokenizer,
+					model: this.#host.model(),
+				});
 			}
-		}
-
-		const anchorEpoch = anchorAssistant?.contextSnapshot?.compactionEpoch ?? 0;
-		const useAnchor =
-			anchorAssistant !== undefined &&
-			anchorIndex !== -1 &&
-			(!pending || (anchorIndex >= pending.cutoffCount && anchorEpoch >= pending.epoch));
-		if (useAnchor && anchorAssistant) {
-			anchored = true;
 			usedTokens = this.#anchoredUsedTokens(
-				this.#anchorBaseTokens(anchorAssistant),
-				anchorAssistant.contextSnapshot ?? current,
+				base,
+				anchor.message.contextSnapshot ?? current,
 				current,
-				anchorIndex + 1,
+				anchor.index + 1,
 				activeMessages,
 				pendingTokens,
 			);
 		} else if (pending) {
-			anchored = true;
 			usedTokens = this.#anchoredUsedTokens(
 				pending.promptTokens,
 				pending,
@@ -371,23 +429,8 @@ export class SessionStatsTracker {
 				activeMessages,
 				pendingTokens,
 			);
-		}
-
-		if (!anchored && !pending && branchEntries.length === 0) {
-			const liveAnchor = findTranscriptUsageAnchor(activeMessages);
-			if (liveAnchor) {
-				usedTokens = this.#anchoredUsedTokens(
-					this.#anchorBaseTokens(liveAnchor.message),
-					liveAnchor.message.contextSnapshot ?? current,
-					current,
-					liveAnchor.index + 1,
-					activeMessages,
-					pendingTokens,
-				);
-				anchored = true;
-			}
-		}
-		if (!anchored) {
+		} else {
+			anchored = false;
 			usedTokens = current.nonMessageTokens + this.#tokenizer.countMessages(activeMessages) + pendingTokens;
 		}
 		return {
@@ -410,6 +453,24 @@ export class SessionStatsTracker {
 			tokens: breakdown.usedTokens,
 			contextWindow: breakdown.contextWindow,
 			percent: breakdown.contextWindow > 0 ? (breakdown.usedTokens / breakdown.contextWindow) * 100 : 0,
+		};
+	}
+
+	/**
+	 * The anchor turn's answer that {@link getContextUsage} adds to the
+	 * provider's prompt, counted as the active model's next request replays it
+	 * and as `reader`'s request does; `undefined` when the figure adds none
+	 * (it starts from an in-flight snapshot or a local count, or its base
+	 * already holds the turn).
+	 */
+	getContextAnswer(reader: ContextAnswerReader): ContextAnswer | undefined {
+		const messages = this.#host.agent.state.messages;
+		const anchor = this.#usageAnchor(this.#host.sessionManager.getBranchView(), messages);
+		if (!anchor || !promptOmitsAnswer(anchor.message.usage)) return undefined;
+		return {
+			message: messages[anchor.index],
+			tokens: this.#answerTokens(anchor, messages, { tokenizer: this.#tokenizer, model: this.#host.model() }),
+			readerTokens: this.#answerTokens(anchor, messages, reader),
 		};
 	}
 

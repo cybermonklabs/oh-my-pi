@@ -123,6 +123,7 @@ import {
 } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
 import type { SessionContextBuildOptions, SessionManager } from "./session-manager";
+import type { ContextAnswer, ContextAnswerReader } from "./session-stats";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { resolveSpeculationLeadTokens, SPECULATION_LEAD_MIN_TOKENS } from "./speculation-lead";
 import { TOOL_RESULT_PRUNE_CUSTOM_TYPE, toToolResultPruneData } from "./tool-result-prunes";
@@ -551,6 +552,8 @@ export interface SessionMaintenanceHost {
 		pendingMessages?: AgentMessage[];
 	}): ContextUsageBreakdown | undefined;
 	getContextUsage(options?: { contextWindow?: number }): ContextUsage | undefined;
+	/** The anchor turn's answer in {@link getContextUsage}, also counted as `reader`'s request replays it. */
+	getContextAnswer(reader: ContextAnswerReader): ContextAnswer | undefined;
 	shake(mode: ShakeMode, options?: { config?: ShakeConfig; signal?: AbortSignal }): Promise<ShakeResult>;
 	dropImages(): Promise<{ removed: number; tokensFreed: number }>;
 	generateHandoffDocument(
@@ -4517,14 +4520,13 @@ export class SessionMaintenance {
 		);
 		const messages = this.#host.messages();
 		const activeExcludedMessage = excludedMessage && messages.includes(excludedMessage) ? excludedMessage : undefined;
-		// Provider usage describes the active model's last request, so the failed
-		// turn comes off it at the active model's count. The local floor counts
-		// what `model` itself would be sent: another reader drops the active
-		// model's natively replayed reasoning, a cold session drops its own, and
-		// a reader without image input gets each archive as text.
-		const providerExcludedTokens = activeExcludedMessage ? this.#tokenizer.countMessage(activeExcludedMessage) : 0;
+		// The local floor counts what `model` itself would be sent: another reader
+		// drops the active model's natively replayed reasoning, a cold session
+		// drops its own, a reader without image input gets each archive as text,
+		// and a request that carries no images sends each as its placeholder text.
 		const tokenizerOptions = {
 			nativeHistoryReplay: openAIResponsesReplaysNativeHistory(model, this.#host.providerSessionState),
+			imagePlaceholder: this.#host.agent.imagePlaceholderFor(model),
 		};
 		const tokenizer = this.#tokenizer.countsAlike(model, tokenizerOptions)
 			? this.#tokenizer
@@ -4562,21 +4564,32 @@ export class SessionMaintenance {
 				tokenizer.countMessages(sentMessages, { excludeEncryptedReasoning: true });
 			return readerTokens <= fitBudget;
 		}
-		// Provider usage, with the anchor turn's own output that `getContextUsage`
-		// adds to it, carries the reasoning the active model's next request
-		// replays, so it moves into `model`'s domain by the difference in replayed
-		// reasoning over the retained turns; the local floor below still bounds it.
+		// Provider usage describes the active model's next request: its last
+		// prompt, with the anchor turn's answer as that request replays it
+		// (`getContextUsage`). `model`'s request replays that answer its own way
+		// (Bedrock strips the signed thinking the Claude API bills at the turn's
+		// output) and leaves it out when it is the failed turn, so the answer is
+		// swapped for `model`'s count of it. The failed turn otherwise comes off at
+		// the active model's count, and the other retained turns move into
+		// `model`'s domain by the difference in replayed reasoning; the local floor
+		// below still bounds it.
+		const answer = this.#host.getContextAnswer({ tokenizer, model, excludedMessage: activeExcludedMessage });
+		const providerExcludedTokens =
+			activeExcludedMessage && activeExcludedMessage !== answer?.message
+				? this.#tokenizer.countMessage(activeExcludedMessage)
+				: 0;
 		let replayedReasoningShift = 0;
 		if (tokenizer !== this.#tokenizer) {
-			const retained = activeExcludedMessage ? messages.filter(m => m !== activeExcludedMessage) : messages;
+			const shifted = messages.filter(message => message !== activeExcludedMessage && message !== answer?.message);
 			replayedReasoningShift =
-				tokenizer.replayedReasoningTokens(retained) - this.#tokenizer.replayedReasoningTokens(retained);
+				tokenizer.replayedReasoningTokens(shifted) - this.#tokenizer.replayedReasoningTokens(shifted);
 		}
 		const residualTokens = compactionContextTokens(
 			Math.max(
 				0,
 				(this.#host.getContextUsage({ contextWindow })?.tokens ?? 0) -
 					providerExcludedTokens +
+					(answer ? answer.readerTokens - answer.tokens : 0) +
 					replayedReasoningShift,
 			),
 			Math.max(

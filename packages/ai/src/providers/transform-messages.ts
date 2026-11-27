@@ -526,6 +526,26 @@ export function isSurvivingAssistant(msg: AssistantMessage, model?: Model): bool
 	);
 }
 
+/**
+ * `msg` with only the blocks {@link sanitizeMalformedToolCalls} replays to
+ * `model`: without the tool calls whose id or name it cannot replay, or `msg`
+ * itself when it has none. Pass the target `model` to apply its tool-name
+ * limits; without one, any provider-declarable name survives.
+ */
+export function withoutMalformedToolCalls(msg: AssistantMessage, model?: Model): AssistantMessage {
+	const { allowedName, maxLength } = toolCallNameLimits(model);
+	let content: AssistantMessage["content"] | undefined;
+	for (let index = 0; index < msg.content.length; index++) {
+		const block = msg.content[index];
+		if (block.type === "toolCall" && isMalformedToolCall(block, allowedName, maxLength)) {
+			content ??= msg.content.slice(0, index);
+		} else {
+			content?.push(block);
+		}
+	}
+	return content ? { ...msg, content } : msg;
+}
+
 /** Whether `msg` carries mid-conversation Anthropic request controls (`clearAt`, `effort`, `toolChanges`). */
 export function hasAnthropicMessageControls(msg: Message): boolean {
 	if (msg.role !== "developer" || msg.providerPayload?.type !== "anthropicMessage") return false;

@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Message, Model, Usage, UserMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Message, Model, ToolResultMessage, Usage, UserMessage } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -242,6 +243,261 @@ describe("AgentSession session stats", () => {
 			percent: (tokens / model.contextWindow) * 100,
 		});
 		expect(stats.contextUsage).toEqual(directUsage);
+	});
+
+	// The context figure is what the next request sends: the provider's prompt for the latest turn, and
+	// that turn's answer, which the prompt did not hold. Leaving the answer out read low by its size
+	// until the next response. A provider-reported context occupancy already holds the answer, and so does
+	// the total the prompt falls back to when the provider reported no prompt tokens.
+	it.each<[string, Partial<Usage>, (answerTokens: number) => number]>([
+		["counts the latest answer on top of the provider's prompt", {}, answerTokens => 10_000 + answerTokens],
+		[
+			"counts the answer at no more than the output the provider reported for it",
+			{ output: 100, totalTokens: 10_100 },
+			() => 10_100,
+		],
+		["takes a provider-reported context occupancy as holding the answer", { contextTokens: 12_000 }, () => 12_000],
+		[
+			"takes the total as holding the answer when the provider reported no prompt tokens",
+			{ input: 0, output: 100, totalTokens: 10_100 },
+			() => 10_100,
+		],
+	])("%s", (_name, overrides, expectedTokens) => {
+		const target = model();
+		const manager = SessionManager.inMemory();
+		manager.appendMessage({ role: "user", content: "Write the migration plan.", timestamp: 1 });
+		const answer: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "Move the table, then backfill its rows in batches. ".repeat(200) }],
+			api: target.api,
+			provider: target.provider,
+			model: target.id,
+			usage: {
+				input: 10_000,
+				output: 5_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 15_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				...overrides,
+			},
+			stopReason: "stop",
+			timestamp: 2,
+		};
+		manager.appendMessage(answer);
+		session = createStatsSession(manager, target);
+
+		const answerTokens = session.agent.tokenizer.countMessage(answer);
+		expect(session.getContextUsage()?.tokens).toBe(expectedTokens(answerTokens));
+	});
+
+	// The next request replays the anchor turn as `transformMessages` sends it. On the Claude API the latest turn to
+	// survive keeps the signed thinking of tool calls that ended without a tool-use stop (`stop` or `length`), and
+	// Claude bills that reasoning at the turn's output; Bedrock's replay strips those signatures, and every replay
+	// strips them from an older turn, so only the visible blocks count there. A turn cut off by `length` with nothing
+	// but thinking is dropped from the replay, so it adds no answer. The cases run on the anchor of the session branch
+	// and on the live anchor of a session whose branch is empty.
+	describe("counts the anchor's answer as the next request replays it", () => {
+		const claudeApi = getBundledModel("anthropic", "claude-opus-5-5");
+		const bedrock = getBundledModel("amazon-bedrock", "global.anthropic.claude-opus-5-5");
+		const signedThinking = {
+			type: "thinking",
+			thinking: "Check the call sites first.",
+			thinkingSignature: "s".repeat(4_000),
+		} as const;
+		const toolCallTurn: AssistantMessage["content"] = [
+			signedThinking,
+			{ type: "text", text: "Reading the file first." },
+			{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } },
+		];
+		const ask: UserMessage = { role: "user", content: "Find the call sites.", timestamp: 1 };
+		// The agent pairs every tool call with a result, a placeholder when `length` cut the turn off.
+		const readResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "read",
+			content: [{ type: "text", text: "export const a = 1;" }],
+			isError: false,
+			timestamp: 3,
+		};
+		const turn = (
+			target: Model,
+			content: AssistantMessage["content"],
+			stopReason: AssistantMessage["stopReason"],
+			timestamp = 2,
+		): AssistantMessage => ({
+			role: "assistant",
+			content,
+			api: target.api,
+			provider: target.provider,
+			model: target.id,
+			usage: {
+				input: 10_000,
+				output: 3_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 13_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason,
+			timestamp,
+		});
+		// A stored anchor is on the session branch; a live one is only in the agent's messages.
+		const anchoredSession = (target: Model, messages: Message[], anchor: "stored" | "live"): AgentSession => {
+			const manager = SessionManager.inMemory();
+			if (anchor === "stored") for (const message of messages) manager.appendMessage(message);
+			const created = createStatsSession(manager, target);
+			if (anchor === "live") created.agent.replaceMessages(messages);
+			return created;
+		};
+
+		type Row = [
+			name: string,
+			target: Model,
+			content: AssistantMessage["content"],
+			stopReason: AssistantMessage["stopReason"],
+			anchor: "stored" | "live",
+			answerTokens: (visibleTokens: number) => number,
+		];
+		it.each<Row>([
+			[
+				"counts the reasoning of a Claude API turn that stopped after its tool call",
+				claudeApi,
+				toolCallTurn,
+				"stop",
+				"stored",
+				() => 3_000,
+			],
+			[
+				"counts the reasoning of a Claude API turn that stopped after its tool call (live anchor)",
+				claudeApi,
+				toolCallTurn,
+				"stop",
+				"live",
+				() => 3_000,
+			],
+			[
+				"counts the reasoning of a Claude API turn cut off after its tool call",
+				claudeApi,
+				toolCallTurn,
+				"length",
+				"stored",
+				() => 3_000,
+			],
+			[
+				"counts the reasoning of a Claude API turn cut off after its tool call (live anchor)",
+				claudeApi,
+				toolCallTurn,
+				"length",
+				"live",
+				() => 3_000,
+			],
+			[
+				"counts only the visible blocks of a Bedrock turn that stopped after its tool call",
+				bedrock,
+				toolCallTurn,
+				"stop",
+				"stored",
+				visible => visible,
+			],
+			[
+				"counts only the visible blocks of a Bedrock turn that stopped after its tool call (live anchor)",
+				bedrock,
+				toolCallTurn,
+				"stop",
+				"live",
+				visible => visible,
+			],
+			[
+				"counts only the visible blocks of a Bedrock turn cut off after its tool call",
+				bedrock,
+				toolCallTurn,
+				"length",
+				"stored",
+				visible => visible,
+			],
+			[
+				"counts only the visible blocks of a Bedrock turn cut off after its tool call (live anchor)",
+				bedrock,
+				toolCallTurn,
+				"length",
+				"live",
+				visible => visible,
+			],
+			[
+				"adds nothing for a thinking-only turn cut off by length, which the replay drops",
+				claudeApi,
+				[signedThinking],
+				"length",
+				"stored",
+				() => 0,
+			],
+			[
+				"adds nothing for a thinking-only turn cut off by length, which the replay drops (live anchor)",
+				claudeApi,
+				[signedThinking],
+				"length",
+				"live",
+				() => 0,
+			],
+		])("%s", (_name, target, content, stopReason, anchor, answerTokens) => {
+			const answer = turn(target, content, stopReason);
+			const tail: Message[] = content.some(block => block.type === "toolCall") ? [readResult] : [];
+			session = anchoredSession(target, [ask, answer, ...tail], anchor);
+
+			const tokenizer = session.agent.tokenizer;
+			const visibleTokens = tokenizer.countMessage(answer, { excludeEncryptedReasoning: true });
+			expect(session.getContextUsage()?.tokens).toBe(
+				10_000 + answerTokens(visibleTokens) + tokenizer.countMessages(tail),
+			);
+		});
+
+		it("counts an anchor that a later surviving turn follows as an older turn", () => {
+			const anchor = turn(claudeApi, toolCallTurn, "stop");
+			// Interrupted while it streamed: an aborted turn anchors nothing, but its text survives the replay, so it
+			// is the latest turn and the anchor replays with its signatures stripped.
+			const interrupted = turn(claudeApi, [{ type: "text", text: "Opening a.ts" }], "aborted", 4);
+			const messages = [ask, anchor, readResult, interrupted];
+			session = anchoredSession(claudeApi, messages, "stored");
+			// The running session's transcript holds the aborted turn; a rebuild from the branch drops it.
+			session.agent.replaceMessages(messages);
+
+			const tokenizer = session.agent.tokenizer;
+			expect(session.getContextUsage()?.tokens).toBe(
+				10_000 +
+					tokenizer.countMessage(anchor, { excludeEncryptedReasoning: true }) +
+					tokenizer.countMessages([readResult, interrupted]),
+			);
+		});
+
+		// The request sanitizer drops a tool call whose id the target cannot replay (an empty one here) and keeps the
+		// rest of the turn, so that call's arguments reach no request, whatever their size.
+		it("charges nothing for a malformed tool call that the replay drops from the answer", async () => {
+			// The meter for an answer of short text, and a call with an empty id and `rejectedArguments` when given.
+			const meter = async (rejectedArguments?: string): Promise<number | undefined> => {
+				const content: AssistantMessage["content"] = [{ type: "text", text: "Writing the plan." }];
+				if (rejectedArguments !== undefined) {
+					content.push({
+						type: "toolCall",
+						id: "",
+						name: "write",
+						arguments: { path: "plan.md", content: rejectedArguments },
+					});
+				}
+				const created = anchoredSession(claudeApi, [ask, turn(claudeApi, content, "toolUse")], "stored");
+				try {
+					return created.getContextUsage()?.tokens;
+				} finally {
+					await created.dispose();
+				}
+			};
+
+			const smallCall = await meter("x");
+			// About 2,000 tokens of arguments, under the turn's 3,000-token output, so the output cap cannot hide them.
+			expect(await meter("x".repeat(8_000))).toBe(smallCall);
+			// The call itself charges nothing either: the turn meters as its text alone.
+			expect(smallCall).toBe(await meter());
+		});
 	});
 
 	it("treats persisted assistant messages without usage as zero-cost history", async () => {
