@@ -2,6 +2,7 @@ export * from "@oh-my-pi/pi-catalog/effort";
 export * from "@oh-my-pi/pi-catalog/types";
 
 import type { Type } from "@oh-my-pi/omptype";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import type { AnthropicSlowModeHooks } from "./providers/anthropic-slow-mode";
 import type {
 	DeleteArgs,
@@ -1091,6 +1092,17 @@ export interface ImageContent {
 	 * turn differs byte-wise).
 	 */
 	url?: string;
+}
+
+/**
+ * Whether `value` is shaped as an image block: the `image` discriminant and a
+ * string `data`. For content the type system cannot vouch for (persisted
+ * entries, app message fields read as data); it checks neither `mimeType` nor
+ * what `data` holds, so a persisted blob reference passes.
+ * `isEmbeddedImageContent` (`images/shared`) validates an embedded image in full.
+ */
+export function isImageBlock(value: unknown): value is ImageContent {
+	return isRecord(value) && value.type === "image" && typeof value.data === "string";
 }
 
 export type ComputerAction =

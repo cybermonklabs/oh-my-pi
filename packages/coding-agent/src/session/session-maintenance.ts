@@ -4867,11 +4867,13 @@ export class SessionMaintenance {
 		// Provider usage describes the active model's last request, so the failed
 		// turn comes off it at the active model's count. The local floor counts
 		// what `model` itself would be sent: another reader drops the active
-		// model's natively replayed reasoning, a cold session drops its own, and
-		// a reader without image input gets each archive as text.
+		// model's natively replayed reasoning, a cold session drops its own, a
+		// reader without image input gets each archive as text, and a request
+		// that carries no images sends each as its placeholder text.
 		const providerExcludedTokens = activeExcludedMessage ? this.#tokenizer.countMessage(activeExcludedMessage) : 0;
 		const tokenizerOptions = {
 			nativeHistoryReplay: openAIResponsesReplaysNativeHistory(model, this.#host.providerSessionState),
+			imagePlaceholder: this.#host.agent.imagePlaceholderFor(model),
 		};
 		const tokenizer = this.#tokenizer.countsAlike(model, tokenizerOptions)
 			? this.#tokenizer

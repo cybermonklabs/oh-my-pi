@@ -4954,20 +4954,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// a provider that 400s on them (#5400) — and routes that strip images,
 		// whose blocks would otherwise be normalized and published for nothing.
 		// Read both dynamically so a `/model` switch or setting change takes
-		// effect on the next turn.
+		// effect on the next turn. The agent's tokenizer reads the same policy,
+		// so the context figure counts each image as the request sends it.
+		const imagePlaceholder = (activeModel: Model | undefined): string | undefined => {
+			if (cfgImagesBlockImages.get(settings)) return "Image reading is disabled.";
+			if (activeModel && !sendsImageInputOnWire(activeModel)) {
+				return "[image omitted: the active model does not support image input]";
+			}
+			return undefined;
+		};
 		const convertToLlmWithBlockImages = (messages: AgentMessage[], reader: Model | undefined): Message[] => {
 			const converted = convertToLlm(messages, reader);
-			if (cfgImagesBlockImages.get(settings)) {
-				return replaceLlmImagesWithText(converted, "Image reading is disabled.");
-			}
-			const activeModel = agent?.state.model ?? model;
-			if (activeModel && !sendsImageInputOnWire(activeModel)) {
-				return replaceLlmImagesWithText(
-					converted,
-					"[image omitted: the active model does not support image input]",
-				);
-			}
-			return converted;
+			const placeholder = imagePlaceholder(agent?.state.model ?? model);
+			return placeholder === undefined ? converted : replaceLlmImagesWithText(converted, placeholder);
 		};
 
 		// Final convertToLlm: live provider replay drops API-level refusal errors,
@@ -5216,6 +5215,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// per turn from the SessionManager.
 			cwdResolver: () => sessionManager.getCwd(),
 			convertToLlm: convertToLlmFinal,
+			imagePlaceholder,
 			onPayload,
 			onResponse,
 			sessionId: providerSessionId,

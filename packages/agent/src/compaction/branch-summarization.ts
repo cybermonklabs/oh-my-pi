@@ -6,6 +6,7 @@
  */
 
 import type { Api, ApiKey, AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { messageContentText } from "@oh-my-pi/pi-ai/dialect/rendering";
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { prompt } from "@oh-my-pi/pi-utils";
@@ -208,10 +209,17 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 }
 
 /**
+ * What the summarizer's transcript carries for an image block: the dialect
+ * renderers write each as an `[Image: <mime>]` marker, never its pixels.
+ */
+const TRANSCRIPT_IMAGE = messageContentText([{ type: "image", mimeType: "image/png" }]);
+
+/**
  * Tokens `message` adds to the summarizer's input, which is the branch
  * serialized as plain text: tool results truncated as serialization truncates
  * them, assistants without their native replay items or opaque reasoning
- * payloads, which the text never carries.
+ * payloads, which the text never carries. Images count as `tokenizer`'s
+ * {@link Tokenizer.imagePlaceholder}.
  */
 function estimateBranchSummaryTokens(message: AgentMessage, tokenizer: Tokenizer): number {
 	if (message.role === "assistant") {
@@ -240,6 +248,8 @@ function estimateBranchSummaryTokens(message: AgentMessage, tokenizer: Tokenizer
  * - Existing branch_summary entries' details (for cumulative tracking)
  *
  * @param entries - Entries in chronological order
+ * @param tokenizer - Counts what the summarizer reads: {@link generateBranchSummary}
+ *   builds one that counts each image as its {@link TRANSCRIPT_IMAGE} marker
  * @param tokenBudget - Maximum tokens to include (0 = no limit)
  */
 export function prepareBranchEntries(
@@ -323,7 +333,7 @@ export async function generateBranchSummary(
 	// Token budget = context window minus reserved space for prompt + response
 	const contextWindow = model.contextWindow || 128000;
 	const tokenBudget = contextWindow - reserveTokens;
-	const tokenizer = new Tokenizer(model);
+	const tokenizer = new Tokenizer(model, { imagePlaceholder: TRANSCRIPT_IMAGE });
 
 	const { messages: branchMessages, fileOps } = prepareBranchEntries(entries, tokenizer, tokenBudget);
 
