@@ -426,6 +426,56 @@ describe("entry patch records and the readers that project a session file", () =
 		expect(rows(patchedActivity)).toEqual(rows(inlineActivity));
 	});
 
+	// A record can come before the turn it names, as the Agent Hub's history of a parked agent reads it.
+	// Agent Activity reads a growing transcript in windows: when the record is in an earlier window than
+	// its turn, without holding it until the turn is read it shows the rows of the content the turn was
+	// written with.
+	it("shows the rows of a turn's content a record read before the turn set, as a transcript with it inline does", async () => {
+		using dir = TempDir.createSync("@omp-patch-projections-");
+		const written = assistant(
+			[
+				{ type: "text", text: HEAVY },
+				{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } },
+			],
+			{ stopReason: "toolUse" },
+		);
+		const patchedContent = [
+			{ type: "text", text: PLACEHOLDER },
+			{ type: "toolCall", id: "call_2", name: "bash", arguments: { command: "pwd" } },
+		];
+		// A turn the first window shows a row for: a later window of a transcript that showed none is read
+		// as if it began mid-line.
+		const before = [
+			message("u1", null, user("do the task")),
+			message("a0", "u1", assistant([{ type: "text", text: "On it" }])),
+		];
+		const record = patchRecord("p1", "a0", [{ entryId: "a1", message: { content: patchedContent } }]);
+		const results = [
+			message("t1", "a1", bashResult("call_1", "out")),
+			message("t2", "t1", bashResult("call_2", "out")),
+		];
+		const patched = await writeTranscript(path.join(dir.path(), "patched.jsonl"), [...before, record]);
+		const inline = await writeTranscript(path.join(dir.path(), "inline.jsonl"), [
+			...before,
+			message("a1", "a0", { ...written, content: patchedContent }),
+			...results,
+		]);
+		const patchedActivity = new AgentActivityIndex();
+		await patchedActivity.sync(AGENT_ID, patched);
+		await Bun.write(patched, jsonl([...before, record, message("a1", "p1", written), ...results]));
+		await patchedActivity.sync(AGENT_ID, patched);
+		const inlineActivity = new AgentActivityIndex();
+		await inlineActivity.sync(AGENT_ID, inline);
+		const rows = (activity: AgentActivityIndex) =>
+			activity.query().map(row => ({ kind: row.kind, title: row.title, summary: row.summary, status: row.status }));
+		expect(rows(patchedActivity)).toEqual([
+			{ kind: "response", title: "Response", summary: "On it", status: "success" },
+			{ kind: "response", title: "Response", summary: PLACEHOLDER, status: "success" },
+			{ kind: "tool", title: "bash", summary: "pwd", status: "success" },
+		]);
+		expect(rows(patchedActivity)).toEqual(rows(inlineActivity));
+	});
+
 	// The Agent Hub's row for a parked agent counts the tool calls of its turns and credits the run
 	// to the model of the newest turn that produced output. Without the records it counts a tool call
 	// a record took out of a turn, and credits the run to a turn a record, here one written before
