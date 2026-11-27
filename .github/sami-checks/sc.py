@@ -43,6 +43,9 @@
                                            the builtins-lint row's units: each finding of `cargo clippy` (every lint a
                                            warning) or `cargo fmt --check` of the crate in DIR, sorted as the rustfmt row
                                            sorts its places, into upstream's own and the fork's (builtins-lint.sh)
+  sc.py previous-report OUT                the previous cut's sc-report (results.json, verdict.json) into OUT, beside
+                                           about.json naming its run, or why none could be read: the summary's
+                                           SC_PREVIOUS, which it compares this run's failures with (first seen at this cut)
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
 binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 nor 100, a bun run
@@ -58,6 +61,13 @@ known-failures.txt names each of its skip lines for that row and user (`skips: `
 KNOWN). A test that started and never ended is named. A failure with a `flaky: ` entry reads KNOWN
 only when the test passed in a retry of its whole unit in the same job (the unit's command again,
 at most twice; on the platform rows, nextest's own retry of the test's own process).
+
+First seen at this cut: the summary compares each failure with the previous cut's report (the newest
+completed push of release-candidate before the run, or the run the dispatch input `previous` names).
+A failure that report does not hold, by its words less the line or column that moves with other
+lines of the tree (FINDING_MOVES), or holds fewer times (finding_keys), heads the summary and is in
+verdict.json's first_seen. A report that could not be read makes first_seen the string UNKNOWN,
+and the summary says why: it never reads as nothing first seen.
 """
 
 import fnmatch
@@ -1512,6 +1522,298 @@ def record_retry(result_path, test, report, shape, scope="whole-unit"):
     return outcome
 
 
+# The summary's comparison with the previous cut ("First seen at this cut"). A failure's words hold
+# parts that move when other lines of the tree move (a line number, a column): each (rows, pattern,
+# replacement) here takes one out in those rows, so that finding_key names the same finding at two
+# cuts, and keeps what tells one finding from another (its file, lint and message; the source line
+# where the row prints it, as builtins-lint does; a panic's assertion). A row this does not name
+# keeps its words whole, so a finding there that only moved reads first seen, never standing. What it
+# cannot tell apart: a finding fixed at one place and made again, with the same words, at another
+# place of the same file in the same cut reads as one that moved. The clippy and docs rows print no
+# source line, so there the same words are a file, a lint (or a link) and a message.
+FINDING_MOVES = (
+    # A lint place, `path:line[:col]: ...` (cargo clippy, rustdoc, rustfmt): its line and column.
+    (("clippy", "builtins-lint", "docs", "rustfmt"), re.compile(r"^([^\s:]+):\d+(?::\d+)?(?=: )"), r"\1"),
+    # The clippy row's count of a finding beyond its baseline, ` (3 here, 1 in the baseline)`: the
+    # comparison counts the places itself.
+    (("clippy",), re.compile(r" \(\d+ here, \d+ in the baseline\)$"), ""),
+    # A skip print of the tree, `...: path:line: 'text'`: its line; a skip line a test printed: how
+    # often, and which test printed it first.
+    (("skipforms",), re.compile(r"^(a skip print the summary does not read: [^\s:]+):\d+(?=: )"), r"\1"),
+    (("skipforms",), re.compile(r", printed \d+ time\(s\), first by .*$"), ""),
+    # A memory bench target that missed: its name, without its measured numbers; the bench's exit
+    # and its panic (`exit 101: thread 'main' panicked at path:line:col: <assertion>`): the panic's
+    # line and column, its assertion kept whole.
+    (("membench",), re.compile(r"^([^:]+): .*\(target\b.*$"), r"\1"),
+    (("membench",), re.compile(r"^(exit [^\s:]+: .*? panicked at [^\s:]+):\d+:\d+(?=:)"), r"\1"),
+    # A command's exit, `unit: exit N: <its last lines>` (check:ts): each error's place in its last
+    # lines (`(line,col)`, `:line:col`), so the same errors elsewhere are standing and another is not.
+    (("checkts",), re.compile(r"^(.*?: exit [^\s:]+: )(.*)$"), lambda m: m[1] + re.sub(r"\(\d+,\d+\)|:\d+:\d+", "(#)", m[2])),
+    # A platform test that did not pass: the verdict the platform checks add to it (` (TIMEOUT)`).
+    (PLATFORMS, re.compile(r" \([A-Z_]+\)$"), ""),
+)
+# A CHANGELOG the check would rewrite, `path: 0 promoted item(s), ..., 28 collapsed release(s); from
+# line N: <its first changed lines>` (parse_changelog): one finding per kind of rewrite, counted.
+CHANGELOG_KINDS = re.compile(r"^([^\s:]+): ([^;]*)(?:; .*)?$")
+# How many of the failures of a unit with no result at the previous cut its first_seen entry names
+# (and each that names a planted run's plant).
+FIRST_SEEN_NAMED = 10
+
+
+def finding_key(row, failure):
+    """A failure's identity across cuts: its words without what FINDING_MOVES says moves in its row."""
+    for rows, pattern, repl in FINDING_MOVES:
+        if row in rows:
+            failure = pattern.sub(repl, failure, count=1)
+    return failure
+
+
+def finding_keys(row, failure):
+    """The findings one failure names, {key: how many}: a CHANGELOG the check would rewrite is one
+    finding per kind of rewrite it needs, `path: <kind>`, as many as the check counts (so one more
+    empty heading in a file that had one is first seen); any other failure is one, finding_key."""
+    m = CHANGELOG_KINDS.match(failure) if row == "changelog" else None
+    kinds = {f"{m[1]}: {k.strip()}": int(n) for n, k in re.findall(r"(\d+) ([^,]+)", m[2]) if n != "0"} if m else {}
+    return kinds or {finding_key(row, failure): 1}
+
+
+def compared_unit(row, unit):
+    """The unit a failure is compared in: its own, or `*`, any unit of its row, in ANY_UNIT_ROWS (a
+    coding-agent test moves to another shard when a file is added before it)."""
+    return "*" if row in ANY_UNIT_ROWS else unit
+
+
+def read_previous(path):
+    """The previous cut's report for "First seen at this cut": PATH, the directory sc.py
+    previous-report fills (that run's sc-report: results.json and verdict.json; about.json naming the
+    run, or why none could be read). Returns (index, rows, against, why). index is {(row, who,
+    compared unit): ({finding key: places}, {test that passed}, {unit status})}, and rows the row
+    verdicts of its verdict.json (None when it has none to read); against names the report. A test
+    that skipped itself did not pass. A unit two jobs reported (which its summary read UNKNOWN)
+    counts each finding at the fewest places either report names, as UNKNOWN, so that a double count
+    never makes a new place of a finding read standing. index is None, and why says why, when there is
+    nothing to compare with: no report named, one the fetch step could not get, a results.json that is
+    missing, does not parse or is no list of unit results, and one that holds no result, since against
+    nothing every failure would read first seen."""
+    if not path:
+        return None, None, "nothing", "no previous report was given to the summary (SC_PREVIOUS is not set)"
+    about = {}
+    about_path = os.path.join(path, "about.json")
+    if os.path.exists(about_path):
+        try:
+            about = json.load(open(about_path, encoding="utf-8"))
+            if not isinstance(about, dict):
+                raise ValueError("it is no JSON object")
+        except (OSError, ValueError) as e:
+            return None, None, path, f"{about_path}, which names the previous report, does not parse ({e})"
+    against = about.get("from") or path
+    if about.get("why"):
+        return None, None, against, about["why"]
+    results_path = os.path.join(path, "results.json")
+    try:
+        prev = json.load(open(results_path, encoding="utf-8"))
+    except FileNotFoundError:
+        return None, None, against, (f"its results.json is not there ({results_path})"
+                                     + ("" if about else "; no about.json says why"))
+    except (OSError, ValueError) as e:
+        return None, None, against, f"its results.json does not parse ({type(e).__name__}: {e})"[:400]
+    if not isinstance(prev, list):
+        return None, None, against, f"its results.json is a JSON {type(prev).__name__}, not a list of unit results"
+    if not prev:
+        return None, None, against, "its results.json holds no unit result, so there is nothing to compare with"
+    shape = {"row": str, "unit": str, "who": str, "status": str, "failures": list, "tests": list}
+    reports = {}
+    for i, r in enumerate(prev):
+        lacks = [k for k, t in shape.items() if not isinstance(r, dict) or not isinstance(r.get(k), t)]
+        if lacks or not all(isinstance(t, list) and t and isinstance(t[0], str) for t in r["tests"]) \
+                or not all(isinstance(f, str) for f in r["failures"]) or not isinstance(r.get("self_skipped", []), list):
+            return None, None, against, (f"its results.json is not a list of unit results: entry {i} has no "
+                                         + (", ".join(lacks) if lacks else "list of test names, failures and self-skips"))
+        fails = {}
+        for f in r["failures"]:
+            for k, n in finding_keys(r["row"], f).items():
+                fails[k] = fails.get(k, 0) + n
+        bad = set(r["failures"]) | set(r.get("self_skipped", []))
+        reports.setdefault((r["row"], r["who"], r["unit"]), []).append(
+            (fails, {t[0] for t in r["tests"] if t[0] not in bad}, r["status"]))
+    index = {}
+    for (row, who, unit), got in reports.items():
+        if len(got) == 1:
+            fails, passed, statuses = got[0][0], got[0][1], {got[0][2]}
+        else:
+            fails = {k: min(f.get(k, 0) for f, _, _ in got) for k in set().union(*(f for f, _, _ in got))}
+            passed = set.intersection(*(p for _, p, _ in got))
+            statuses = {s for _, _, s in got} | {"UNKNOWN"}
+        into = index.setdefault((row, who, compared_unit(row, unit)), ({}, set(), set()))
+        for k, n in fails.items():
+            into[0][k] = into[0].get(k, 0) + n
+        into[1].update(passed)
+        into[2].update(statuses)
+    rows = None
+    try:
+        rows = json.load(open(os.path.join(path, "verdict.json"), encoding="utf-8")).get("rows")
+    except (OSError, ValueError, AttributeError):
+        pass
+    return index, rows if isinstance(rows, dict) else None, against, None
+
+
+def row_first_seen(row, rs, index, reading, keep=None):
+    """The failures of one row's units (RS) that the previous cut's report (read_previous's INDEX)
+    does not hold, as entries of verdict.json's first_seen: each failure naming a finding
+    (finding_keys) its compared unit there lacks, or counts fewer times than this cut (each failure
+    naming it here is then listed), with the evidence in `previous`; and one entry for each unit with
+    failures that has no result there at all, whose failures none could be compared: it counts them
+    (`failed`) and names the first FIRST_SEEN_NAMED and each that KEEP(f) holds (`failures`: a planted
+    run's plant). READING(r, f): the summary's word for a failure, NEW or KNOWN."""
+    groups = {}
+    for r in rs:
+        for f in r["failures"]:
+            groups.setdefault((r["who"], compared_unit(row, r["unit"])), []).append((r, f))
+    out = []
+    for (who, unit), items in groups.items():
+        where = "its row (any unit)" if unit == "*" else "its unit"
+        prev = index.get((row, who, unit))
+        if prev is None:
+            for r in {id(r): r for r, _ in items}.values():
+                mine = [f for s, f in items if s is r]
+                named = mine[:FIRST_SEEN_NAMED] + [f for f in mine[FIRST_SEEN_NAMED:] if keep is not None and keep(f)]
+                out.append({"kind": "unit", "row": row, "who": who, "unit": r["unit"], "finding": f"{len(mine)} failure(s)",
+                            "reading": None, "previous": f"the previous cut's report has no result for {where}",
+                            "failed": len(mine), "failures": named})
+            continue
+        fails, passed, statuses = prev
+        counts, naming = {}, {}
+        for r, f in items:
+            for k, n in finding_keys(row, f).items():
+                counts[k] = counts.get(k, 0) + n
+                naming.setdefault(k, []).append((r, f))
+        marks = {}
+        for k, n in counts.items():
+            m = fails.get(k, 0)
+            if n <= m:
+                continue
+            if m:
+                said = (f"the previous cut counted {m} {k.partition(': ')[2] or k} in it, this cut {n}" if row == "changelog"
+                        else f"the previous cut had it at {m} place(s) of {where}, this cut at {n}")
+            elif k in passed:
+                said = "it passed at the previous cut"
+            elif "UNKNOWN" in statuses:
+                said = f"{where} did not have it at the previous cut, and read UNKNOWN there, so it may have been missed"
+            else:
+                said = f"{where} did not have it at the previous cut"
+            for r, f in naming[k]:
+                marks.setdefault((id(r), f), []).append(said)
+        listed = set()
+        for r, f in items:
+            said = marks.get((id(r), f))
+            if said and (id(r), f) not in listed:
+                listed.add((id(r), f))
+                out.append({"kind": "failure", "row": row, "who": who, "unit": r["unit"], "finding": f, "reading": reading(r, f),
+                            "previous": "; ".join(said)})
+    return out
+
+
+def rust_first_seen(row_verdicts, prev_rows):
+    """The Rust rows (RUST_JOBS), read from their jobs' conclusions, compared by verdict: a FAIL that
+    the previous cut's verdict.json does not give the row is first seen; a FAIL at both cuts is not
+    compared, since the summary reads none of the job's tests. Returns (entries, not compared)."""
+    out, blind = [], []
+    for title, job in RUST_JOBS:
+        if row_verdicts.get(job) != "FAIL":
+            continue
+        before = prev_rows.get(job) if prev_rows is not None else None
+        if prev_rows is None:
+            blind.append(f"{title}: FAIL, and the previous cut's verdict.json gives no row verdicts to compare it with")
+        elif before == "FAIL":
+            blind.append(f"{title}: FAIL at this cut and at the previous one; the summary reads none of its tests, so a test "
+                         "that first failed here is not seen (that job's annotations and log name them)")
+        else:
+            out.append({"kind": "row", "row": job, "who": None, "unit": None, "finding": "the row reads FAIL", "reading": None,
+                        "previous": f"it read {before or 'nothing: the row was not in its report'} at the previous cut"})
+    return out, blind
+
+
+def gh_api(path):
+    """`gh api PATH`'s output, as bytes (GH_TOKEN: the job's token, which holds actions: read)."""
+    try:
+        p = subprocess.run(["gh", "api", path], capture_output=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"gh api {path} did not run ({e})") from e
+    if p.returncode != 0:
+        said = " / ".join((p.stderr or p.stdout).decode("utf-8", "replace").split("\n")).strip(" /")
+        raise RuntimeError(f"gh api {path} exited {p.returncode}: {said[:300] or 'no message'}")
+    return p.stdout
+
+
+# How many of the newest completed release-candidate pushes' runs previous-report reads to find the
+# one before this run (two cuts are seldom more than a few pushes apart).
+PREVIOUS_RUNS = 30
+
+
+def previous_report(out_dir, api=gh_api):
+    """sami-checks.yml's step before the summary: the previous cut's report, for "First seen at this
+    cut". The run is the one the dispatch input `previous` names (SC_INPUT_PREVIOUS), else the newest
+    completed sami-checks run on a push of release-candidate before this one (GITHUB_RUN_ID) whose
+    commit is not this run's (SC_COMMIT). The results.json and verdict.json of its sc-report go to
+    OUT_DIR, beside about.json: {"run", "commit", "url", "from" (the words the summary names it by),
+    "why"}. why is null when results.json was written, else why it could not be, and the summary then
+    reads first seen UNKNOWN. When that run has no report (its sc-report expired, or its summary
+    uploaded none), no older run is tried: against an older cut, a failure first seen at the cut
+    between would read first seen here. API: `gh api`. Returns about."""
+    import io
+    import zipfile
+    os.makedirs(out_dir, exist_ok=True)
+    about = {"run": None, "commit": None, "url": None, "from": None, "why": None}
+
+    def done(why=None):
+        about["why"] = why
+        with open(os.path.join(out_dir, "about.json"), "w", encoding="utf-8") as f:
+            json.dump(about, f)
+        print(f"PREVIOUS {about['from'] or 'no run'}: " + (f"UNKNOWN: {why}" if why else "its results.json is read"))
+        return about
+
+    repo, this_run = os.environ.get("GITHUB_REPOSITORY", ""), os.environ.get("GITHUB_RUN_ID", "")
+    commit, named = os.environ.get("SC_COMMIT", ""), os.environ.get("SC_INPUT_PREVIOUS", "").strip()
+    if not repo or not this_run.isdigit():
+        return done("this run has no GITHUB_REPOSITORY or GITHUB_RUN_ID, so no earlier run could be looked for")
+    try:
+        if named:
+            if not named.isdigit():
+                return done(f"the dispatch input previous ({named!r}) is no run id")
+            run, how = json.loads(api(f"repos/{repo}/actions/runs/{named}")), "the run the dispatch input previous names"
+        else:
+            runs = json.loads(api(f"repos/{repo}/actions/workflows/sami-checks.yml/runs?branch=release-candidate&event=push"
+                                  f"&status=completed&per_page={PREVIOUS_RUNS}"))["workflow_runs"]
+            run = next((r for r in runs if r["id"] < int(this_run) and r["head_sha"] != commit), None)
+            if run is None:
+                return done(f"none of the newest {len(runs)} completed sami-checks runs on a push of release-candidate is "
+                            "a run before this one, of another commit")
+            how = "the newest completed push of release-candidate before this run"
+        about.update(run=run["id"], commit=run["head_sha"], url=run.get("html_url"),
+                     **{"from": f"run {run['id']} ({how}), of {run['head_sha'][:12]}"})
+    except (RuntimeError, ValueError, KeyError, TypeError) as e:
+        return done(f"the previous run could not be found: {e}"[:500])
+    try:
+        arts = json.loads(api(f"repos/{repo}/actions/runs/{run['id']}/artifacts?name=sc-report&per_page=10"))["artifacts"]
+        live = [a for a in arts if a.get("name") == "sc-report" and not a.get("expired")]
+        if not live:
+            gone = [a for a in arts if a.get("name") == "sc-report"]
+            return done(f"run {run['id']}'s sc-report expired at {gone[0].get('expires_at')} (an sc-report is kept 30 days)" if gone
+                        else f"run {run['id']} has no sc-report artifact (its summary job uploaded none)")
+        data = api(f"repos/{repo}/actions/artifacts/{live[0]['id']}/zip")
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = set(z.namelist())
+            if "results.json" not in names:
+                return done(f"run {run['id']}'s sc-report holds no results.json (it holds {', '.join(sorted(names)) or 'nothing'})")
+            for name in ("verdict.json", "results.json"):
+                if name in names:
+                    with open(os.path.join(out_dir, name), "wb") as f:
+                        f.write(z.read(name))
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile) as e:
+        return done(f"run {run['id']}'s sc-report could not be read: {e}"[:500])
+    return done()
+
+
 # A unit that counts its findings (its result's `breakdown`) lists this many of each kind (FAILED,
 # KNOWN, UNSORTED) among the summary's details, and its section lists this many lints and files.
 LISTED_PER_KIND = 25
@@ -1589,6 +1891,15 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         passed_as.setdefault((runtime(r["row"]), r["unit"], r["who"]), set()).update(n for n, _ in r["tests"] if n not in bad)
     exp, notes = expected_units(build_dir)
     exp = [e for e in exp if e[0] in run_rows]
+    # The previous cut's report, for "First seen at this cut" (read_previous): an index of its failures,
+    # or None and the reason it could not be read, which then reads UNKNOWN, never as nothing first seen.
+    # A report-only comparison never stops the summary: a fault in reading the report is that reason.
+    try:
+        prev_index, prev_rows, prev_from, prev_why = read_previous(os.environ.get("SC_PREVIOUS"))
+    except Exception as e:
+        prev_index, prev_rows = None, None
+        prev_from, prev_why = os.environ.get("SC_PREVIOUS") or "nothing", f"reading it failed ({type(e).__name__}: {e})"[:400]
+    first_seen = []
     lines = []
     commit = os.environ.get("SC_COMMIT", "?")
     lines.append(f"## sami checks of `{commit}`")
@@ -1669,6 +1980,14 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         lines.append(f"| {title} | **{verdict}** | {counts} | {tp} / {tf} / {ti} / {ts} | {lu} |")
         verdicts[key] = (verdict, rs)
         row_verdicts[key] = verdict
+        # This row's failures that the previous cut's report does not hold (row_first_seen); on a
+        # planted run, a unit entry of the planted row names the plant among its failures.
+        planted_here = os.environ.get("SC_PLANT", "") == key and key in PLANTS
+        seen_here = [] if prev_index is None else row_first_seen(
+            key, rs, prev_index, lambda r, f: "NEW" if failure_reason(r, key, f)[0] is None else "KNOWN",
+            keep=(lambda f: PLANTS[key][2] in f) if planted_here else None)
+        first_seen += seen_here
+        seen_said = {(e["unit"], e["who"], e["finding"]): e["previous"] for e in seen_here if e["kind"] == "failure"}
         for r in rs:
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
@@ -1682,7 +2001,9 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                                    "below counts them by lint and file; the sc-report artifact's results.json lists each)")
 
             for f in r["failures"][:cap]:
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}")
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}"
+                               + (f"; **first seen at this cut** ({seen_said[(r['unit'], r['who'], f)]})"
+                                  if (r["unit"], r["who"], f) in seen_said else ""))
             more("FAILED", r["failures"])
             for f in r.get("baseline_fell", []):
                 details.append(f"- **{title}** `{r['unit']}`: fewer here than in the clippy baseline (a change of the baseline, not a failure): {f}")
@@ -1731,6 +2052,61 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                    if caught else
                    f"**THE CONTROL FAILED**: the row reads {v}, and these units do not read FAIL naming `{needle}`: "
                    + (", ".join(f"`{u}`" for u in missed) or "the row has no unit") + "."), ""]
+    # First seen at this cut: each failure the previous cut's report does not hold, at the top of the
+    # summary, before the table and the standing failures below it. A report that could not be read
+    # reads UNKNOWN, and says why, never as nothing first seen. On a planted run the plant must be in
+    # the list (plant_first_seen): the comparison's own control.
+    row_title = {k: t for t, k in ROWS + RUST_JOBS}
+    plant_seen = None
+    if prev_index is None:
+        seen_record, blind = "UNKNOWN", []
+        seen_top = ["### First seen at this cut: UNKNOWN", "",
+                    f"The previous cut's report ({prev_from}) could not be read: {prev_why}. No failure below can be told "
+                    "first seen or standing, so any of them may be new at this cut.", ""]
+        if plant:
+            plant_seen = "UNKNOWN"
+    else:
+        rust_seen, blind = rust_first_seen(row_verdicts, prev_rows)
+        first_seen += rust_seen
+        seen_record = first_seen
+        seen_top = [f"### First seen at this cut: {len(first_seen) or 'none'}, against {prev_from}", "",
+                    "Each failure here was not in the previous cut's report; one that was is standing, and is listed "
+                    "only below. A finding's line and column are not compared, so a finding that only moved is standing, "
+                    "and one more of a finding is first seen." if first_seen else
+                    "No failure the comparison could read is new at this cut; it could not compare what is under \"Not "
+                    "compared\" below, and a new failure may be there." if blind else
+                    "Every failure of this run was in the previous cut's report too: none is new at this cut.", ""]
+        for e in first_seen[:200]:
+            name = row_title[e["row"]]
+            if e["kind"] == "failure":
+                said = "**NEW**" if e["reading"] == "NEW" else "KNOWN (on the known-failure list)"
+                seen_top.append(f"- **{name}** `{e['unit']}` ({e['who']}): FAILED `{e['finding']}`: {said}; {e['previous']}")
+            elif e["kind"] == "unit":
+                seen_top.append(f"- **{name}** `{e['unit']}` ({e['who']}): {e['finding']}, none compared: {e['previous']}: "
+                                + ", ".join(f"`{f}`" for f in e["failures"])
+                                + (f", and {e['failed'] - len(e['failures'])} more (the list below, and sc-report's results.json)"
+                                   if e["failed"] > len(e["failures"]) else ""))
+            else:
+                seen_top.append(f"- **{name}**: {e['finding']}; {e['previous']} (its failing tests are in that job's "
+                                "annotations and log)")
+        if len(first_seen) > 200:
+            seen_top.append(f"- ... and {len(first_seen) - 200} more (sc-report's verdict.json, first_seen)")
+        if blind:
+            seen_top += ["", "Not compared with the previous cut:", ""] + [f"- {b}" for b in blind]
+        seen_top.append("")
+        if plant:
+            # The control reads only what first_seen holds: a failure entry naming the plant, or the
+            # entry of a unit with no result at the previous cut whose named failures hold it.
+            plant_rs = verdicts.get(plant, ("", []))[1]
+            unseen = [r["unit"] for r in plant_rs if not any(
+                e["row"] == plant and e["unit"] == r["unit"] and any(needle in f for f in (
+                    [e["finding"]] if e["kind"] == "failure" else e.get("failures", []))) for e in first_seen)]
+            plant_seen = bool(plant_rs) and not unseen
+            seen_top += [("The plant reads first seen at this cut in each unit of its row: the comparison's control caught it."
+                          if plant_seen else
+                          f"**THE FIRST-SEEN CONTROL FAILED**: the plant `{needle}` does not read first seen at this cut in "
+                          + (", ".join(f"`{u}`" for u in unseen) or "any unit: its row has none") + "."), ""]
+    top[:0] = seen_top
     lines.append("")
     # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
     # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
@@ -1847,7 +2223,11 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     record = {"commit": commit, "verdict": verdict, "subset": bool(not_run),
               "rows_run": [k for k in ROW_KEYS if k in run_rows], "rows_not_run": not_run,
               "rows": {k: row_verdicts[k] for k in ROW_KEYS if k in row_verdicts},
-              "plant": plant or None, "plant_caught": caught}
+              "plant": plant or None, "plant_caught": caught,
+              # First seen at this cut: the list of entries, or the string UNKNOWN (never an empty list)
+              # when the previous cut's report could not be read, first_seen_why saying why.
+              "first_seen": seen_record, "first_seen_against": prev_from, "first_seen_why": prev_why,
+              "first_seen_not_compared": blind, "plant_first_seen": plant_seen}
     line = json.dumps(record, separators=(",", ":"))
     if not_run:
         top += [f"**A subset of the rows**: {len(run_rows)} of {len(ROW_KEYS)} rows ran ({', '.join(record['rows_run'])}); "
@@ -4000,6 +4380,320 @@ def selftest():
           ([], ["FAIL", "PASS", "UNKNOWN"]))
     check("summary: the skip prints row's run-time unit read every test row's output in the full run",
           full_v.get("skipforms"), "PASS")
+    # First seen at this cut: the summary against the previous cut's report (SC_PREVIOUS, the
+    # directory sc.py previous-report fills). res3 holds every unit the plan expects; this cut fails
+    # on a new finding (the docs plant's link), on a test that passed at the previous cut, on a kind of
+    # CHANGELOG rewrite new to a file that needed another there, on one more of a rewrite a file needed
+    # there, on a memory bench panic with another assertion, and on findings the previous cut had too:
+    # a set test that failed there, a docs link and a clippy finding at another line, a coding-agent
+    # test that failed in another shard there, and a platform test that failed there and timed out
+    # here. The pi-builtins lint row has no result at the previous cut (a row new at this cut), and
+    # rust_test failed here and passed there. Only the plant, the test that passed, the two CHANGELOG
+    # findings, the other panic, the lint unit and the Rust row are first seen.
+    res3, prev3, known3 = os.path.join(d, "res3"), os.path.join(d, "prev3"), os.path.join(d, "known3.txt")
+    os.makedirs(res3)
+    open(known3, "w").write("# none\n")
+    units3 = expected_units(build2)[0]
+    at3 = {u: os.path.join(res3, f"{i}.json") for i, u in enumerate(units3)}
+    set3 = next(u for u in units3 if u[0] == "set-runner")
+    ca3 = [u for u in units3 if u[0] == "ts-ca"]
+    docs3, docs3p = ("docs", "public", "runner"), ("docs", "private", "runner")
+    link = "crates/pi-shell/src/{}.rs:{}:{}: unresolved link to '{}' (no item named '{}' in scope)"
+    planted3 = link.format("lib", 36, 1, "NoSuchItemPlanted", "NoSuchItemPlanted")
+    log3 = "packages/x/CHANGELOG.md: 0 promoted item(s), {} collapsed release(s); from line {}: -## [1.0.0]"
+    clog3 = ("packages/y/CHANGELOG.md: 0 promoted item(s), 0 merged duplicate heading(s), 0 dropped released duplicate(s), "
+             "{} removed empty heading(s), 3 collapsed release(s); from line 7: -### Planted empty heading")
+    panic3 = "exit 101: thread 'main' panicked at crates/pi-shell/benches/memory.rs:{}:2: assertion failed: {}"
+    bench3 = ("membench", MEMBENCH_UNIT, "runner")
+    lint3 = "crates/pi-vfs/src/lib.rs:{}:{}: clippy::needless_return: unneeded 'return' statement"
+    here3 = {set3: ["standing::t", "newly::t"], docs3: [planted3, link.format("a", 3372, 8, "Job::facts", "Job")],
+             ca3[0]: ["moved::t"], ("changelog", "changelogs", "runner"): [log3.format(29, 1713), clog3.format(1)],
+             bench3: [panic3.format(251, "every idle vproc frees its frame")],
+             ("macos", PLATFORM_CRATES, "runner"): ["pi-shell::slow::t (TIMEOUT)"], ("clippy", "pi-vfs", "runner"): [lint3.format(12, 5)],
+             ("builtins-lint", "clippy", "runner"): ["crates/pi-builtins/src/a.rs:1:1: clippy::x: y", "crates/pi-builtins/src/a.rs:2:1: clippy::x: y"]}
+    there3 = {set3: ["standing::t"], docs3: [link.format("a", 3370, 8, "Job::facts", "Job")], ca3[1]: ["moved::t"],
+              ("changelog", "changelogs", "runner"): [log3.format(28, 1719), clog3.format(0)], ("macos", PLATFORM_CRATES, "runner"): ["pi-shell::slow::t"],
+              ("clippy", "pi-vfs", "runner"): [lint3.format(10, 9)], bench3: [panic3.format(249, "the shell stays under its bound")]}
+
+    def unit3(u, failures, passed=("t",)):
+        return result(*u, "FAIL" if failures else "PASS", 1 if failures else 0, 1, passed=len(passed), failed=len(failures),
+                      failures=failures, tests=[(t, 1.0) for t in list(passed) + list(failures)])
+
+    for u in units3:
+        json.dump(unit3(u, here3.get(u, [])), open(at3[u], "w"))
+    prev_units3 = [unit3(u, there3.get(u, []), ("t", "newly::t") if u == set3 else ("t",)) for u in units3 if u[0] != "builtins-lint"]
+    prev_rows3 = {"rust_test": "PASS", "rust_test_macos": "PASS"}
+    from3 = "run 1 (a hand-made previous cut), of aaaaaaaaaaaa"
+
+    def previous3(results=None, raw=None, rows=prev_rows3, about=None):
+        """A previous cut's report in prev3: results.json (RESULTS, or the text RAW), verdict.json's rows, about.json."""
+        shutil.rmtree(prev3, ignore_errors=True)
+        os.makedirs(prev3)
+        if raw is not None:
+            open(os.path.join(prev3, "results.json"), "w").write(raw)
+        elif results is not None:
+            json.dump(results, open(os.path.join(prev3, "results.json"), "w"))
+        if rows is not None:
+            json.dump({"rows": rows}, open(os.path.join(prev3, "verdict.json"), "w"))
+        if about is not None:
+            json.dump(about, open(os.path.join(prev3, "about.json"), "w"))
+        return prev3
+
+    def summary3(previous, plant_env="", rows_env=None, rust_env="rust_test=failure rust_test_macos=success"):
+        """cmd_summary on res3 against PREVIOUS (SC_PREVIOUS; None: unset): (its summary, its verdict record)."""
+        env = dict(SC_PLANT=plant_env, SC_VERDICT=vfile, SC_ROWS=rows_env, SC_RUST_TESTS=rust_env, SC_PREVIOUS=previous)
+        kept_env = {k: os.environ.get(k) for k in env}
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if os.path.exists(vfile):
+            os.remove(vfile)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                cmd_summary(res3, build2, known3)
+        finally:
+            for k, v in kept_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return buf.getvalue(), verdict_record()
+
+    def seen3(rec):
+        s = rec.get("first_seen")
+        return [(e["kind"], e["row"], e["unit"], e["finding"], e["reading"], e["previous"]) for e in s] if isinstance(s, list) else s
+
+    plant_entry = ("failure", "docs", "public", planted3, "NEW", "its unit did not have it at the previous cut")
+    want3 = [("failure", "set-runner", set3[1], "newly::t", "NEW", "it passed at the previous cut"), plant_entry,
+             ("failure", "changelog", "changelogs", log3.format(29, 1713), "NEW",
+              "the previous cut counted 28 collapsed release(s) in it, this cut 29"),
+             ("failure", "changelog", "changelogs", clog3.format(1), "NEW", "its unit did not have it at the previous cut"),
+             ("failure", "membench", MEMBENCH_UNIT, panic3.format(251, "every idle vproc frees its frame"), "NEW",
+              "its unit did not have it at the previous cut"),
+             ("unit", "builtins-lint", "clippy", "2 failure(s)", None, "the previous cut's report has no result for its unit"),
+             ("row", "rust_test", None, "the row reads FAIL", None, "it read PASS at the previous cut")]
+    out, rec = summary3(previous3(prev_units3, about={"from": from3, "why": None}))
+    check("first seen: a new finding (the plant's link) is in first_seen",
+          (isinstance(seen3(rec), list), plant_entry in (seen3(rec) if isinstance(seen3(rec), list) else [])), (True, True))
+    check("first seen: a finding at both cuts is not (a set test that failed at both, a docs link and a clippy finding at "
+          "another line, a coding-agent test in another shard, a platform test that timed out here): first_seen is the new "
+          "finding, the test that passed there, the new kind and the one more of a CHANGELOG rewrite, the other panic, the "
+          "unit with no result there and the Rust row that passed there",
+          (seen3(rec), rec.get("first_seen_why"), rec.get("first_seen_against")),
+          (want3, None, from3))
+    head = out.find(f"### First seen at this cut: 7, against {from3}")
+    check("first seen: the summary lists them first, before the table and the standing failures",
+          (head > 0, head < out.find("| Row | Verdict |"), head < out.find("### Each failing test"),
+           f"FAILED `{planted3}`: **NEW**; its unit did not have it at the previous cut" in out[head:out.find("| Row | Verdict |")],
+           f"FAILED `{planted3}`: **NEW**; **first seen at this cut** (its unit did not have it at the previous cut)" in out,
+           "FAILED `standing::t`: **NEW**\n" in out),
+          (True, True, True, True, True, True))
+    check("first seen: a unit with no result at the previous cut names its failures",
+          [(e["failed"], e["failures"]) for e in rec.get("first_seen", []) if e["kind"] == "unit"] if isinstance(rec.get("first_seen"), list) else None,
+          [(2, here3[("builtins-lint", "clippy", "runner")])])
+    # What a finding is across cuts (finding_keys): what moves is taken out, what tells two apart is kept.
+    check("finding_keys: the same finding at two cuts",
+          [set(finding_keys(row, a)) == set(finding_keys(row, b)) for row, a, b in (
+              ("clippy", "crates/x/src/a.rs:12: clippy::m: n (3 here, 1 in the baseline)", "crates/x/src/a.rs:40: clippy::m: n (2 here, 1 in the baseline)"),
+              ("docs", "crates/x/src/a.rs:12:5: unresolved link to 'A'", "crates/x/src/a.rs:19:9: unresolved link to 'A'"),
+              ("changelog", log3.format(28, 1719), log3.format(29, 1713)),
+              ("membench", "memory shell: 4194 bytes after create + ':' (target ≤ 4096) MISS",
+               "memory shell: 5000 bytes after create + ':' (target ≤ 4096) MISS"),
+              ("membench", panic3.format(249, "state_bytes <= 256"), panic3.format(251, "state_bytes <= 256")),
+              ("checkts", "check:ts: exit 2: a.ts(3,5): error TS2322: Type 'x' / Found 1 error.",
+               "check:ts: exit 2: a.ts(9,5): error TS2322: Type 'x' / Found 1 error."),
+              ("skipforms", "a skip print the summary does not read: crates/a.rs:3: 'skipped x'", "a skip print the summary does not read: crates/a.rs:9: 'skipped x'"),
+              ("skipforms", "a skip line the summary does not read: 'skipped x', printed 2 time(s), first by r t",
+               "a skip line the summary does not read: 'skipped x', printed 5 time(s), first by r u"),
+              ("macos", "pi-shell::a::b (TIMEOUT)", "pi-shell::a::b"))],
+          [True] * 9)
+    check("finding_keys: two findings stay two",
+          [set(finding_keys(row, a)) == set(finding_keys(row, b)) for row, a, b in (
+              ("docs", "crates/x/src/a.rs:12:5: unresolved link to 'A'", "crates/x/src/b.rs:12:5: unresolved link to 'A'"),
+              ("builtins-lint", "crates/b/src/a.rs:1:1: clippy::x: y (fn a() {)", "crates/b/src/a.rs:1:1: clippy::x: y (fn b() {)"),
+              ("changelog", clog3.format(0), clog3.format(1)),
+              ("membench", panic3.format(249, "the shell stays under its bound"), panic3.format(249, "every idle vproc frees its frame")),
+              ("membench", panic3.format(249, "state_bytes <= 256"), panic3.format(251, "state_bytes <= 128")),
+              ("membench", "exit 101: x", "exit 134: x"),
+              ("checkts", "check:ts: exit 2: a.ts(3,5): error TS2322: Type 'x'", "check:ts: exit 2: a.ts(3,5): error TS2345: Type 'x'"),
+              ("set-runner", "a::b_1", "a::b_2"))],
+          [False] * 8)
+    check("finding_keys: a CHANGELOG counts each kind of rewrite it needs",
+          finding_keys("changelog", clog3.format(2)), {"packages/y/CHANGELOG.md: removed empty heading(s)": 2,
+                                                       "packages/y/CHANGELOG.md: collapsed release(s)": 3})
+    # A previous report that could not be read is UNKNOWN, naming why, never an empty first_seen: none
+    # named, its results.json missing, one that does not parse, one that holds no result or no unit
+    # results, and the fetch step's own reason (about.json).
+    for label, prev, why in (
+            ("no previous report named", lambda: None, "no previous report was given to the summary (SC_PREVIOUS is not set)"),
+            ("a missing previous report", previous3, f"its results.json is not there ({prev3}/results.json); no about.json says why"),
+            ("a previous report that does not parse", lambda: previous3(raw='[{"row": "set-runner", '),
+             "its results.json does not parse (JSONDecodeError: "),
+            ("a previous report that holds no result", lambda: previous3(raw="[]"),
+             "its results.json holds no unit result, so there is nothing to compare with"),
+            ("a previous report that holds no unit results", lambda: previous3(raw='[{"row": "set-runner"}]'),
+             "its results.json is not a list of unit results: entry 0 has no unit, who, status, failures, tests"),
+            ("a previous report the fetch step could not get",
+             lambda: previous3(prev_units3, about={"from": "run 7", "why": "run 7's sc-report expired"}), "run 7's sc-report expired")):
+        out, rec = summary3(prev())
+        check(f"first seen: {label} reads UNKNOWN, naming why",
+              (rec.get("first_seen"), (rec.get("first_seen_why") or "").startswith(why), rec.get("first_seen_why"),
+               "### First seen at this cut: UNKNOWN\n" in out, "**first seen at this cut**" in out),
+              ("UNKNOWN", True, rec.get("first_seen_why"), True, False))
+    # A planted run's plant must read first seen (plant_first_seen): the comparison's own control,
+    # which fails when the previous cut had the plant too.
+    json.dump(unit3(docs3p, [planted3]), open(at3[docs3p], "w"))
+    out, rec = summary3(previous3(prev_units3), plant_env="docs", rows_env="docs")
+    check("first seen: a planted run's plant reads first seen in each unit of its row",
+          (rec.get("plant_caught"), rec.get("plant_first_seen"), "the comparison's control caught it" in out), (True, True, True))
+    out, rec = summary3(previous3([dict(r, failures=[planted3]) if r["row"] == "docs" else r for r in prev_units3]),
+                        plant_env="docs", rows_env="docs")
+    check("first seen: a plant the previous cut had too fails the control",
+          (rec.get("plant_first_seen"), "**THE FIRST-SEEN CONTROL FAILED**: the plant `NoSuchItemPlanted` does not read "
+           "first seen at this cut in `public`, `private`." in out), (False, True))
+    out, rec = summary3(previous3(), plant_env="docs", rows_env="docs")
+    check("first seen: a planted run with no previous report", rec.get("plant_first_seen"), "UNKNOWN")
+    out, rec = summary3(previous3([r for r in prev_units3 if r["row"] != "docs"]), plant_env="docs", rows_env="docs")
+    check("first seen: a plant in a row the previous cut has no result for reads first seen, named in its unit's entry",
+          (rec.get("plant_first_seen"), [(e["kind"], e["unit"], planted3 in e.get("failures", [])) for e in rec.get("first_seen", [])]
+           if isinstance(rec.get("first_seen"), list) else None),
+          (True, [("unit", "public", True), ("unit", "private", True)]))
+    json.dump(unit3(docs3p, []), open(at3[docs3p], "w"))
+    # A planted empty heading in a CHANGELOG that already had an empty heading to remove: one more of
+    # that rewrite, so first seen.
+    cl3 = ("changelog", "changelogs", "runner")
+    relay = ("packages/browser-relay/CHANGELOG.md: 0 promoted item(s), 0 merged duplicate heading(s), 0 dropped released "
+             "duplicate(s), {} removed empty heading(s), 0 collapsed release(s); from line 5: -### {}")
+    json.dump(unit3(cl3, [relay.format(2, "Planted empty heading")]), open(at3[cl3], "w"))
+    out, rec = summary3(previous3([dict(r, failures=[relay.format(1, "Old")]) if r["row"] == "changelog" else r for r in prev_units3]),
+                        plant_env="changelog", rows_env="changelog")
+    check("first seen: a planted empty heading in a CHANGELOG that had one to remove reads first seen",
+          (rec.get("plant_caught"), rec.get("plant_first_seen"), seen3(rec)),
+          (True, True, [("failure", "changelog", "changelogs", relay.format(2, "Planted empty heading"), "NEW",
+                         "the previous cut counted 1 removed empty heading(s) in it, this cut 2")]))
+    json.dump(unit3(cl3, here3[cl3]), open(at3[cl3], "w"))
+    # A plant past the first FIRST_SEEN_NAMED failures of a unit with no result at the previous cut is
+    # named in that unit's entry, and the control reads only the entries.
+    blc, blf = ("builtins-lint", "clippy", "runner"), ("builtins-lint", "rustfmt", "runner")
+    plant_c = f"crates/pi-builtins/src/lib.rs:90:1: clippy::redundant_static_lifetimes: constants have by default a 'static lifetime ({BUILTINS_LINT_PLANT_LINES[0]})"
+    plant_f = f"crates/pi-builtins/src/lib.rs:92: {BUILTINS_LINT_PLANT_LINES[1]}"
+    many = [f"crates/pi-builtins/src/a.rs:{i}:1: clippy::x: y (fn f{i}() {{)" for i in range(1, FIRST_SEEN_NAMED + 2)]
+    json.dump(unit3(blc, many + [plant_c]), open(at3[blc], "w"))
+    json.dump(unit3(blf, [plant_f]), open(at3[blf], "w"))
+    out, rec = summary3(previous3(prev_units3), plant_env="builtins-lint", rows_env="builtins-lint")
+    check("first seen: a plant past the tenth failure of a unit with no previous result is named in its entry",
+          (rec.get("plant_caught"), rec.get("plant_first_seen"),
+           [(e["unit"], e["failed"], e["failures"]) for e in rec.get("first_seen", [])] if isinstance(rec.get("first_seen"), list) else None),
+          (True, True, [("clippy", FIRST_SEEN_NAMED + 2, many[:FIRST_SEEN_NAMED] + [plant_c]), ("rustfmt", 1, [plant_f])]))
+    json.dump(unit3(blc, here3[blc]), open(at3[blc], "w"))
+    json.dump(unit3(blf, []), open(at3[blf], "w"))
+    # A unit two jobs reported at the previous cut counts a finding at the fewer places, so a second
+    # place of a standing link here is first seen; a test that skipped itself there did not pass.
+    moved = link.format("a", 3372, 8, "Job::facts", "Job")
+    again = link.format("a", 3400, 8, "Job::facts", "Job")
+    json.dump(unit3(docs3, [planted3, moved, again]), open(at3[docs3], "w"))
+    doubled = prev_units3 + [r for r in prev_units3 if (r["row"], r["unit"]) == ("docs", "public")]
+    out, rec = summary3(previous3(doubled), rows_env="docs")
+    check("first seen: a previous unit two jobs reported counts a finding at the fewer places",
+          [e[3:] for e in seen3(rec) if e[1] == "docs"] if isinstance(seen3(rec), list) else seen3(rec),
+          [(planted3, "NEW", "its unit did not have it at the previous cut, and read UNKNOWN there, so it may have been missed")]
+          + [(f, "NEW", "the previous cut had it at 1 place(s) of its unit, this cut at 2") for f in (moved, again)])
+    json.dump(unit3(docs3, here3[docs3]), open(at3[docs3], "w"))
+    skipped = [dict(r, status="UNKNOWN", self_skipped=["newly::t"]) if r["unit"] == set3[1] and r["row"] == "set-runner" else r
+               for r in prev_units3]
+    out, rec = summary3(previous3(skipped), rows_env="set-runner,set-root,lib4")
+    check("first seen: a test that skipped itself at the previous cut did not pass there",
+          [e[3:] for e in seen3(rec) if e[3] == "newly::t"] if isinstance(seen3(rec), list) else seen3(rec),
+          [("newly::t", "NEW", "its unit did not have it at the previous cut, and read UNKNOWN there, so it may have been missed")])
+    # Nothing first seen, and a Rust row not compared: the summary says so, never that nothing is new.
+    out, rec = summary3(previous3(load_results(res3), rows=dict(prev_rows3, rust_test="FAIL")))
+    check("first seen: none among what was compared, beside what was not",
+          (rec.get("first_seen"), "### First seen at this cut: none, against" in out,
+           "No failure the comparison could read is new at this cut" in out, "none is new at this cut" in out),
+          ([], True, True, False))
+    # A Rust row that failed at both cuts is not compared: the summary reads none of its tests.
+    out, rec = summary3(previous3(prev_units3, rows=dict(prev_rows3, rust_test="FAIL")))
+    check("first seen: a Rust row that failed at both cuts is named as not compared",
+          ([e for e in seen3(rec) if e[0] == "row"] if isinstance(seen3(rec), list) else seen3(rec),
+           [b.split(":")[0] for b in rec.get("first_seen_not_compared", [])],
+           "Not compared with the previous cut:" in out), ([], [RUST_JOBS[0][0]], True))
+    # previous-report: which run it reads, and why it reads none, with gh api's answers stood in for.
+    def fake_api(routes):
+        def api(path):
+            if path not in routes:
+                raise RuntimeError(f"gh api {path} exited 1: gh: Not Found (HTTP 404)")
+            v = routes[path]
+            return v if isinstance(v, bytes) else json.dumps(v).encode()
+        return api
+
+    def zipped(files):
+        import zipfile
+        b = io.BytesIO()
+        with zipfile.ZipFile(b, "w") as z:
+            for n, t in files.items():
+                z.writestr(n, t)
+        return b.getvalue()
+
+    def gh_run(i, sha):
+        return {"id": i, "head_sha": sha * 40, "html_url": f"https://github.com/o/r/actions/runs/{i}"}
+
+    def gh_arts(i, expired=False):
+        return {"artifacts": [{"id": 50 + i, "name": "sc-report", "expired": expired, "expires_at": "2026-12-01T00:00:00Z"}]}
+
+    runs_at = f"repos/o/r/actions/workflows/sami-checks.yml/runs?branch=release-candidate&event=push&status=completed&per_page={PREVIOUS_RUNS}"
+    arts_at = "repos/o/r/actions/runs/{}/artifacts?name=sc-report&per_page=10"
+    good = {runs_at: {"workflow_runs": [gh_run(100, "c"), gh_run(99, "c"), gh_run(98, "b"), gh_run(97, "a")]},
+            arts_at.format(98): gh_arts(98), arts_at.format(97): gh_arts(97),
+            "repos/o/r/actions/artifacts/148/zip": zipped({"results.json": json.dumps(prev_units3),
+                                                            "verdict.json": json.dumps({"rows": prev_rows3})}),
+            "repos/o/r/actions/artifacts/147/zip": zipped({"results.json": "[]"})}
+    fetched = os.path.join(d, "fetched")
+
+    def fetch(routes, named=""):
+        shutil.rmtree(fetched, ignore_errors=True)
+        env = dict(GITHUB_REPOSITORY="o/r", GITHUB_RUN_ID="100", SC_COMMIT="c" * 40, SC_INPUT_PREVIOUS=named)
+        kept_env = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                about = previous_report(fetched, fake_api(routes))
+        finally:
+            for k, v in kept_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return about["run"], about["why"], sorted(os.listdir(fetched))
+
+    check("previous-report: the newest completed push before this run, of another commit",
+          fetch(good), (98, None, ["about.json", "results.json", "verdict.json"]))
+    out, rec = summary3(fetched)
+    check("previous-report: the summary reads what it fetched", (seen3(rec), rec.get("first_seen_against")),
+          (want3, "run 98 (the newest completed push of release-candidate before this run), of bbbbbbbbbbbb"))
+    expired = dict(good, **{arts_at.format(98): gh_arts(98, expired=True)})
+    check("previous-report: an sc-report that expired, and no older run tried", fetch(expired),
+          (98, "run 98's sc-report expired at 2026-12-01T00:00:00Z (an sc-report is kept 30 days)", ["about.json"]))
+    out, rec = summary3(fetched)
+    check("previous-report: the summary reads an expired report UNKNOWN, naming why",
+          (rec.get("first_seen"), rec.get("first_seen_why")), ("UNKNOWN", "run 98's sc-report expired at 2026-12-01T00:00:00Z (an sc-report is kept 30 days)"))
+    check("previous-report: a run with no sc-report", fetch(dict(good, **{arts_at.format(98): {"artifacts": []}}))[:2],
+          (98, "run 98 has no sc-report artifact (its summary job uploaded none)"))
+    check("previous-report: an sc-report with no results.json",
+          fetch(dict(good, **{"repos/o/r/actions/artifacts/148/zip": zipped({"summary.md": "x"})}))[:2],
+          (98, "run 98's sc-report holds no results.json (it holds summary.md)"))
+    check("previous-report: no run before this one, of another commit",
+          fetch(dict(good, **{runs_at: {"workflow_runs": [gh_run(100, "c"), gh_run(99, "c")]}}))[:2],
+          (None, "none of the newest 2 completed sami-checks runs on a push of release-candidate is a run before this one, of another commit"))
+    check("previous-report: the list of runs could not be read", fetch({})[:2],
+          (None, f"the previous run could not be found: gh api {runs_at} exited 1: gh: Not Found (HTTP 404)"))
+    check("previous-report: the run the dispatch input names", fetch(dict(good, **{"repos/o/r/actions/runs/97": gh_run(97, "a")}), "97"),
+          (97, None, ["about.json", "results.json"]))
+    check("previous-report: a named run that is not there", fetch(good, "7")[:2],
+          (None, "the previous run could not be found: gh api repos/o/r/actions/runs/7 exited 1: gh: Not Found (HTTP 404)"))
+    check("previous-report: a named run that is no run id", fetch(good, "latest")[:2], (None, "the dispatch input previous ('latest') is no run id"))
 
     if fails:
         for f in fails:
@@ -4012,7 +4706,9 @@ def selftest():
           "docs and changelog rows with their planted controls, the builtins-lint row's lift, readers, sorting "
           "and plant, the Rust tests' rows from their jobs' "
           "conclusions, the row selection (its jobs from the workflow's needs, the cut's every row, a control "
-          "on a row that does not run), and the summary's NOT RUN rows and verdict line")
+          "on a row that does not run), the summary's NOT RUN rows and verdict line, and its first-seen comparison "
+          "with the previous cut's report (a new finding listed, one at both cuts not, UNKNOWN for a report that "
+          "is missing or does not parse, the plant's control, and the run previous-report fetches)")
 
 
 # The docs row (docs.sh): `cargo doc --no-deps -p pi-shell` with -D rustdoc::broken_intra_doc_links,
@@ -5128,6 +5824,8 @@ def main(argv):
         print(json.dumps(parse_builtins_rustfmt(*a)))
     elif c == "plant":
         cmd_plant(*a)
+    elif c == "previous-report":
+        previous_report(*a)
     elif c == "selftest":
         selftest()
     else:

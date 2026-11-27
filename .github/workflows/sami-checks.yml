@@ -8,7 +8,7 @@
 #     later, so sami itself is not tested again).
 #   - A dispatch tests any pushed commit, given as a full 40-character id:
 #       gh workflow run sami-checks.yml --repo cybermonklabs/oh-my-pi --ref <branch with this file> \
-#         -f commit=<sha> [-f rows=<row>,<row>...] [-f silent=<job name>] [-f plant=docs|changelog|rustfmt|membench|builtins-lint]
+#         -f commit=<sha> [-f rows=<row>,<row>...] [-f silent=<job name>] [-f plant=docs|changelog|rustfmt|membench|builtins-lint] [-f previous=<run id>]
 #     `rows` selects the rows the run runs: all (the default), or a comma list of the summary's row
 #     names (sc.py ROW_KEYS): set-runner, set-root, lib4, builtins, workspace, ts-small, ts-ca,
 #     checkts, macos, windows, clippy, skipforms, gv-set-uid1000, gv-set-root, gv-lib4-uid1000,
@@ -35,6 +35,10 @@
 #     root, one clippy reports and one rustfmt would space out, each unit's own), and the summary
 #     says at its top whether the row then read FAIL naming it. A silent or plant whose job or row
 #     the run does not run fails the plan: that control would pass quietly.
+#     `previous` names the run whose sc-report the summary compares this run's failures with (first
+#     seen at this cut): a run id. Empty, the default, takes the newest completed run on a push of
+#     release-candidate before this one, of another commit. A run with no sc-report to read (none,
+#     or one past its 30 days) makes first seen read UNKNOWN, and the summary says why.
 #   GitHub dispatches only a workflow it has seen run, and this file is not on the default branch
 #   (main); the pushes of release-candidate run it.
 #
@@ -116,8 +120,22 @@
 # rows passing), `subset` (true unless every row ran), `rows_run`, `rows_not_run`, `rows` (each
 # row's verdict, or NOT RUN), and `plant` and `plant_caught` (null unless a row was planted). Only
 # a run with subset false and verdict PASS is a pass of the cut checks.
-# Artifacts: sc-report (summary.md, verdict.json), sc-res-<job> (each unit's result and log),
-# sc-build, and the platform checks' own (pc-report, pc-results-*, pc-build-*).
+# First seen at this cut: the summary compares each failure with the previous cut's report (the
+# sc-report of the run `previous` names, by default the newest completed push of release-candidate
+# before this run, of another commit: the step "The previous cut's report", sc.py previous-report).
+# Each failure that report does not hold, compared without the line or column that moves when
+# other lines of the tree move (sc.py FINDING_MOVES), or holds fewer times, heads the step
+# summary, before the table and the standing failures, and is an entry of verdict.json's
+# `first_seen` (kind, row, who, unit, finding, reading NEW or KNOWN, and in `previous` the
+# evidence); a unit with failures and no
+# result there is one entry, and a Rust row, compared by its verdict, another. When the previous
+# report cannot be read, `first_seen` is the string UNKNOWN, never an empty list, and
+# `first_seen_why` says why; `first_seen_against` names the report, `first_seen_not_compared` what
+# could not be compared, and on a planted run `plant_first_seen` says whether the plant read first
+# seen: the comparison's own control.
+# Artifacts: sc-report (summary.md, verdict.json, and results.json, each unit's result, which the
+# next cut's summary compares with), sc-res-<job> (each unit's result and log), sc-build, and the
+# platform checks' own (pc-report, pc-results-*, pc-build-*).
 # Known failures: .github/sami-checks/known-failures.txt names tests that fail on every tree for a
 # reason the tree does not own yet; the summary shows each failure KNOWN (with the reason) or NEW, a
 # unit whose only failures are known reads KNOWN unless a test in it skipped itself and passed as no
@@ -171,6 +189,8 @@
 # exception is on paper only: the platforms job grants actions: write, because GitHub checks the
 # called platform-checks.yml's cache-prune job against it before the run starts; that job runs only
 # on a dispatch of platform-checks.yml itself, so no job of this workflow ever holds the grant.
+# The summary job holds actions: read, with which it finds the previous cut's run and downloads its
+# sc-report (sc.py previous-report); the repository is public, so it reads nothing private.
 name: sami checks
 
 run-name: >-
@@ -206,6 +226,11 @@ on:
         description: "The Rust gate's build seed: auto (the newest cut's seed), build (this run builds its own and runs the cold control beside it) or off (every job builds cold)"
         required: false
         default: "auto"
+        type: string
+      previous:
+        description: "The run whose sc-report the summary compares this run's failures with (first seen at this cut): a run id, or empty for the newest completed push of release-candidate before this run"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -1074,8 +1099,14 @@ jobs:
     if: ${{ always() && needs.plan.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # actions: read lists this workflow's runs and downloads the previous cut's sc-report (the step
+    # "The previous cut's report"); the repository is public, so it reads nothing private.
+    permissions:
+      contents: read
+      actions: read
     # The step summary's verdict line as one JSON object (sc.py cmd_summary: verdict, subset, rows_run,
-    # rows_not_run, rows, plant, plant_caught); empty when the summary wrote none.
+    # rows_not_run, rows, plant, plant_caught, and first seen at this cut: first_seen, first_seen_against,
+    # first_seen_why, first_seen_not_compared, plant_first_seen); empty when the summary wrote none.
     outputs:
       verdict: ${{ steps.summary.outputs.verdict }}
     steps:
@@ -1127,6 +1158,19 @@ jobs:
           pattern: pc-build-*
           merge-multiple: true
           path: ${{ github.workspace }}/sc/pc
+      # The report the summary compares this run's failures with (first seen at this cut): the
+      # sc-report of the run the dispatch input `previous` names, else of the newest completed run on
+      # a push of release-candidate before this one, of another commit. sc.py previous-report puts its
+      # results.json and verdict.json in $SC/previous beside about.json, which names the run or says
+      # why none could be read; the summary then reads first seen UNKNOWN, and so it does when this
+      # step fails before it writes about.json.
+      - name: The previous cut's report
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SC_COMMIT: ${{ needs.plan.outputs.commit }}
+          SC_INPUT_PREVIOUS: ${{ inputs.previous }}
+        run: python3 tool/.github/sami-checks/sc.py previous-report "$SC/previous"
       - name: Summary
         id: summary
         env:
@@ -1143,6 +1187,7 @@ jobs:
           SC_SILENT: ${{ needs.plan.outputs.silent }}
           SC_PLANT: ${{ needs.plan.outputs.plant }}
           SC_VERDICT: ${{ github.workspace }}/sc/report/verdict.json
+          SC_PREVIOUS: ${{ github.workspace }}/sc/previous
         run: |
           mkdir -p "$SC/report" "$SC/results/sc-skip-lines" "$SC/build" "$SC/pc"
           # The control `silent=platforms`: the platform results are not read, so both rows must be UNKNOWN.
