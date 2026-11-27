@@ -715,6 +715,8 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 		if (!job) return false;
 		if (!job.foreground) return true;
 		job.foreground = undefined;
+		// A release that came first no longer discards the row once its run settles.
+		this.#releasedForegroundJobs.delete(jobId);
 		this.#suppressedDeliveries.delete(jobId);
 		if (job.status === "completed" || job.status === "failed") {
 			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
@@ -725,13 +727,16 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	/**
 	 * Drop a foreground-backed job whose result the foreground call already
 	 * returned (or whose call aborted). The row is discarded as soon as its run
-	 * settles and never surfaces as a background job.
+	 * settles and never surfaces as a background job, unless
+	 * {@link backgroundJob} promotes it first. Returns whether the release took:
+	 * false for an unknown id or a job that is no longer foreground-backed.
 	 */
-	releaseForegroundJob(jobId: string): void {
+	releaseForegroundJob(jobId: string): boolean {
 		const job = this.#jobs.get(jobId);
-		if (!job?.foreground) return;
+		if (!job?.foreground) return false;
 		if (job.endTime !== undefined) this.#discardForegroundJob(jobId);
 		else this.#releasedForegroundJobs.add(jobId);
+		return true;
 	}
 
 	getDeliveryState(filter?: AsyncJobFilter): AsyncJobDeliveryState {

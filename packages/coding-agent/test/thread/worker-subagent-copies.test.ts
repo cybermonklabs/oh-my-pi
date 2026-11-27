@@ -11,7 +11,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import { __resetDirsFromEnvForTests, removeWithRetries } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, prompt, removeWithRetries } from "@oh-my-pi/pi-utils";
 import { AsyncJobManager } from "../../src/async/job-manager";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
@@ -32,7 +32,14 @@ import {
 import { EventBus } from "../../src/utils/event-bus";
 import type { SubagentHeapRequest, SubagentHeapWritten } from "../fixtures/subagent-heap-hook";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
-import { collectGarbage, HeapGraph, takeV8HeapSnapshot, type V8HeapSnapshot } from "../helpers/heap-snapshot";
+import {
+	collectGarbage,
+	HeapGraph,
+	parseV8HeapSnapshot,
+	takeV8HeapSnapshot,
+	type V8HeapSnapshot,
+} from "../helpers/heap-snapshot";
+import agentPromptTemplate from "./fixtures/worker-subagent-copies-agent.md" with { type: "text" };
 
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
 const MODEL = "fake/fake-model";
@@ -140,7 +147,14 @@ class CopiesModelServer {
 	readonly #release = Promise.withResolvers<void>();
 
 	constructor() {
-		this.#server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => this.#fetch(request) });
+		// No idle timeout: the held final response may wait on slow heap snapshots and walks for well over Bun's
+		// default of 10 seconds, and a reset connection would end the run before the test releases it.
+		this.#server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			idleTimeout: 0,
+			fetch: request => this.#fetch(request),
+		});
 	}
 
 	/** Resolves, with the text length of each tool result the model received, once the final turn is held. */
@@ -241,7 +255,7 @@ async function workerSnapshot(threadId: string, file: string): Promise<V8HeapSna
 		channel.close();
 	}
 	try {
-		return JSON.parse(await Bun.file(file).text()) as V8HeapSnapshot;
+		return parseV8HeapSnapshot(JSON.parse(await Bun.file(file).text()));
 	} finally {
 		await fs.rm(file, { force: true });
 	}
@@ -333,7 +347,7 @@ function recordRunObjects(graph: HeapGraph, record: number): string[] {
 const AGENT: AgentDefinition = {
 	name: "task",
 	description: "copies test agent",
-	systemPrompt: `You are a test agent (${AGENT_MARKER}).`,
+	systemPrompt: prompt.render(agentPromptTemplate, { marker: AGENT_MARKER }),
 	source: "bundled",
 	tools: ["bash"],
 };
@@ -466,7 +480,15 @@ async function runWatched(): Promise<WatchedRun> {
 	if (!worker) throw new Error("the child's worker is not in the pool");
 	const unwatch = mirror.subscribe(() => {});
 
-	const resultLengths = await server.finalHeld();
+	// The final turn is held only if the run reaches it: a run that ends or fails first fails the test now.
+	const resultLengths = await Promise.race([
+		server.finalHeld(),
+		running.then(result => {
+			throw new Error(
+				`The run ended (exit ${result.exitCode}) before its final model call: ${result.error ?? result.output}`,
+			);
+		}),
+	]);
 	// Wait until the mirror holds every result, in its messages and (watched) in its entries.
 	await waitFor(
 		() =>

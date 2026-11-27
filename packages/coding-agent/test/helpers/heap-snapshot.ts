@@ -5,6 +5,7 @@
  * verify that dropped keys or redundant metadata fields are gone from the live
  * heap without reading private fields by name.
  */
+import { isRecord } from "@oh-my-pi/pi-utils";
 
 export interface V8HeapSnapshot {
 	snapshot: {
@@ -31,9 +32,52 @@ export async function collectGarbage(rounds = 4): Promise<void> {
 	}
 }
 
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every(item => typeof item === "string");
+}
+
+function isNumberArray(value: unknown): value is number[] {
+	return Array.isArray(value) && value.every(item => typeof item === "number");
+}
+
+/** A `node_types` / `edge_types` list: each field's type name, or the names of an enum field's values. */
+function isTypeList(value: unknown): value is Array<string | string[]> {
+	return Array.isArray(value) && value.every(item => typeof item === "string" || isStringArray(item));
+}
+
+/**
+ * `raw` (a parsed V8-format heap snapshot, of this thread or written by another) as a {@link V8HeapSnapshot},
+ * once each field the readers here use has its shape.
+ * @throws when a field is missing or has another shape.
+ */
+export function parseV8HeapSnapshot(raw: unknown): V8HeapSnapshot {
+	const snapshot = isRecord(raw) ? raw.snapshot : undefined;
+	const meta = isRecord(snapshot) ? snapshot.meta : undefined;
+	if (!isRecord(raw) || !isRecord(meta)) throw new Error("Not a V8 heap snapshot: it has no snapshot.meta");
+	const nodeFields = meta.node_fields;
+	const nodeTypes = meta.node_types;
+	const edgeFields = meta.edge_fields;
+	const edgeTypes = meta.edge_types;
+	const { nodes, edges, strings } = raw;
+	if (!isStringArray(nodeFields) || !isTypeList(nodeTypes) || !isStringArray(edgeFields) || !isTypeList(edgeTypes)) {
+		throw new Error("Not a V8 heap snapshot: snapshot.meta lacks its node and edge field lists");
+	}
+	if (!isNumberArray(nodes) || !isNumberArray(edges) || !isStringArray(strings)) {
+		throw new Error("Not a V8 heap snapshot: it lacks its nodes, edges or strings");
+	}
+	return {
+		snapshot: {
+			meta: { node_fields: nodeFields, node_types: nodeTypes, edge_fields: edgeFields, edge_types: edgeTypes },
+		},
+		nodes,
+		edges,
+		strings,
+	};
+}
+
 /** Capture and parse a V8-format heap snapshot of the current JS thread. */
 export function takeV8HeapSnapshot(): V8HeapSnapshot {
-	return JSON.parse(Bun.generateHeapSnapshot("v8")) as V8HeapSnapshot;
+	return parseV8HeapSnapshot(JSON.parse(Bun.generateHeapSnapshot("v8")));
 }
 
 /**

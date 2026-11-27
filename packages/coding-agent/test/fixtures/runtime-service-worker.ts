@@ -239,6 +239,22 @@ const probe: RuntimeProbe = async (op, ...args) => {
 			const job = manager(args[0]).getJob(String(args[1]));
 			return { hasWidgetInputs: job?.widgetInputs !== undefined, pids: job?.process?.pids() ?? null };
 		}
+		case "listedInputs": {
+			const job = manager(args[0])
+				.getAllJobs()
+				.find(row => row.id === String(args[1]));
+			return job ? { hasWidgetInputs: job.widgetInputs !== undefined, pids: job.process?.pids() ?? null } : null;
+		}
+		case "publishCompleted":
+			return manager(args[0]).publishCompleted(
+				"task",
+				"fixture result",
+				{ text: String(args[2]) },
+				{
+					id: String(args[1]),
+					ownerId: "Worker",
+				},
+			);
 		case "registerJob":
 			return registerJob(manager(args[0]), String(args[1]), jobOptions(args[2]));
 		case "appendHeld":

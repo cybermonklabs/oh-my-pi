@@ -2,8 +2,7 @@
  * Worker-side {@link AsyncJobManagerApi} over the root's main-thread manager.
  *
  * Every query and command runs on main: synchronous methods through
- * `callSync` (`releaseForegroundJob`, which returns nothing, as an ordered
- * notification), async ones through `call`. Job rows come back as
+ * `callSync`, async ones through `call`. Job rows come back as
  * {@link RemoteAsyncJob}s built from {@link AsyncJobWire} projections, with
  * local equivalents of the live fields:
  *
@@ -20,7 +19,9 @@
  * {@link WireJobFeed} whose pulls and final push this module answers. The
  * exported `run` runs its body once and keeps none of it afterwards, and the
  * feed lets go of the inputs after its final push; only the manager keeps
- * them, for as long as {@link LOCAL_INPUTS_RETENTION_MS} says.
+ * them, for as long as {@link LOCAL_INPUTS_RETENTION_MS} says, and attaches
+ * them only to a row of the registration they came with (its
+ * `registrationId`): a later job main gives the same id gets none of them.
  */
 import type { JobWidgetView } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type {
@@ -39,7 +40,7 @@ import type {
 	AsyncJobType,
 } from "../../async/job-manager";
 import type { JobTextSource, JobWidgetInputs, JobWidgetRegistry } from "../../job-widgets/types";
-import type { RemoteObject } from "../rpc";
+import { type RemoteObject, RpcClosedError } from "../rpc";
 import {
 	type AsyncJobManagerProtocol,
 	type AsyncJobWire,
@@ -58,7 +59,8 @@ import { ignoreSettle, localUnsubscribe } from "./support";
  * How long a settled job's live `process` / `widgetInputs` stay readable here
  * (e.g. `proc://<id>/streams` after the job ended). Longer than main's default
  * row retention, so the row is gone first. A released foreground job's go at
- * the later of its release and its settle, when main discards its row.
+ * the later of its release and its settle, when main discards its row; a
+ * release main did not take (it promoted the job first) leaves them.
  */
 const LOCAL_INPUTS_RETENTION_MS = 10 * 60 * 1000;
 
@@ -70,12 +72,12 @@ interface LocalInputs {
 	readonly widgetInputs?: JobWidgetInputs;
 }
 
-/** A job registered from this worker with live inputs, and what main's foreground rule reads of it. */
+/** A job registered from this worker with live inputs, and which of main's rows they belong to. */
 interface LocalJob {
 	readonly inputs: LocalInputs;
-	/** Registered in the foreground and not promoted since, as main's row's `foreground`. */
-	foreground: boolean;
-	/** Released while it ran: its inputs go when its run settles. */
+	/** Main's {@link AsyncJobWire.registrationId} of the row this worker registered. */
+	readonly registrationId: number;
+	/** Released while it ran, and main took the release: its inputs go when its run settles. */
 	released: boolean;
 }
 
@@ -307,10 +309,10 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 			intent: options?.intent,
 			feed: feed?.wire(),
 		};
-		const id = this.#remote.callSync("register", type, label, wired, wireOptions);
+		const { id, registrationId } = this.#remote.callSync("register", type, label, wired, wireOptions);
 		// A reused id (a released foreground job's, an evicted job's) drops what the earlier job left here.
 		this.#dropLocal(id);
-		if (inputs) this.#local.set(id, { inputs, foreground: options?.foreground === true, released: false });
+		if (inputs) this.#local.set(id, { inputs, registrationId, released: false });
 		return id;
 	}
 
@@ -320,7 +322,10 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 		result: AsyncJobRunResult,
 		options: { id?: string; ownerId?: string; agentId?: string },
 	): string {
-		return this.#remote.callSync("publishCompleted", type, label, result, options);
+		const id = this.#remote.callSync("publishCompleted", type, label, result, options);
+		// A reused id drops what the earlier job left here; a published row has no live inputs.
+		this.#dropLocal(id);
+		return id;
 	}
 
 	cancel(id: string, filter?: AsyncJobFilter, reason?: unknown): boolean {
@@ -349,20 +354,27 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 	}
 
 	backgroundJob(jobId: string): boolean {
-		const known = this.#remote.callSync("backgroundJob", jobId);
-		const local = this.#local.get(jobId);
-		if (local) local.foreground = false;
-		return known;
+		return this.#remote.callSync("backgroundJob", jobId);
 	}
 
 	/**
-	 * A notification: nothing to wait for, and every later call reaches main after it. As main
-	 * discards the row, a foreground job's local inputs go at the later of this release and its settle.
+	 * As main discards the row of a release it takes, a foreground job's local inputs go at the later
+	 * of that release and its settle. A release main does not take (it promoted the job first, or has
+	 * no such row) leaves them, with the background row main keeps. With the link to main closed, main's
+	 * row is gone too, and so are they.
 	 */
 	releaseForegroundJob(jobId: string): void {
-		this.#remote.notify("releaseForegroundJob", jobId);
+		let taken: boolean;
+		try {
+			taken = this.#remote.callSync("releaseForegroundJob", jobId);
+		} catch (error) {
+			if (!(error instanceof RpcClosedError)) throw error;
+			this.#dropLocal(jobId);
+			return;
+		}
+		if (!taken) return;
 		const local = this.#local.get(jobId);
-		if (!local?.foreground) return;
+		if (!local) return;
 		// A retention timer runs only for a settled job.
 		if (this.#expiry.has(jobId)) this.#dropLocal(jobId);
 		else local.released = true;
@@ -482,21 +494,44 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 		this.#remote.notify("setRetainedArtifactsCleanup", jobId, cleanup);
 	}
 
+	/** A row of `wire`, with this worker's live inputs only when it is the row their registration made. */
 	#row(wire: AsyncJobWire): RemoteAsyncJob {
-		return new RemoteAsyncJob(this, wire, this.#local.get(wire.id)?.inputs);
+		let local = this.#local.get(wire.id);
+		if (local && local.registrationId !== wire.registrationId) {
+			// Main gave the id to a later job: the inputs belong to a row that is gone.
+			this.#dropLocal(wire.id);
+			local = undefined;
+		}
+		return new RemoteAsyncJob(this, wire, local?.inputs);
 	}
 
 	#rows(wires: AsyncJobWire[]): AsyncJob[] {
 		return wires.map(wire => this.#row(wire));
 	}
 
-	/** The run of `jobId` settled here: drop its inputs if it was released, else keep them for the retention time. */
+	/**
+	 * The run of `jobId` settled here: keep its inputs for the retention time, unless main took its
+	 * release and still discards its row: no longer has it, or has it still in the foreground. With the
+	 * link to main closed, main's row is gone too; the inputs go without an error that would replace
+	 * the body's own outcome.
+	 */
 	#settleLocal(jobId: string): void {
 		const local = this.#local.get(jobId);
 		if (!local) return;
 		if (local.released) {
-			this.#dropLocal(jobId);
-			return;
+			// Main may have promoted the job after it took the release; it keeps that row, and these stay with it.
+			let row: AsyncJobWire | undefined;
+			try {
+				row = this.#remote.callSync("getJob", jobId);
+			} catch (error) {
+				if (!(error instanceof RpcClosedError)) throw error;
+				this.#dropLocal(jobId);
+				return;
+			}
+			if (row?.registrationId !== local.registrationId || row.foreground === true) {
+				this.#dropLocal(jobId);
+				return;
+			}
 		}
 		const timer = setTimeout(() => this.#dropLocal(jobId), LOCAL_INPUTS_RETENTION_MS);
 		timer.unref();

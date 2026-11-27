@@ -15,6 +15,10 @@
  * pulled (each synchronous read starts one background pull) or the body pushed
  * as it settled, so the widget registry's final read sees the job's last output.
  *
+ * Every row a worker registers carries a `registrationId` no other row has, so
+ * the worker attaches its live inputs only to the row of its own registration,
+ * never to a later job main gives the same id.
+ *
  * The run context's `reportProgress`, `markRunning` and `pushFeed` reach main's
  * job row and its mirror only until the run settles ({@link workerRunContext}):
  * the worker keeps them as long as its body keeps the context, so a released
@@ -139,6 +143,10 @@ class JobFeedMirror implements JobWidgetInputs {
 	}
 }
 
+/** The registration id of each row registered from a worker (see {@link AsyncJobWire.registrationId}). */
+const registrationIds = new WeakMap<AsyncJob, number>();
+let nextRegistrationId = 1;
+
 /** Cloneable projection of a main job row. */
 export function toJobWire(job: AsyncJob): AsyncJobWire {
 	const process = job.process;
@@ -174,6 +182,7 @@ export function toJobWire(job: AsyncJob): AsyncJobWire {
 				}
 			: undefined,
 		hasWidgetInputs: job.widgetInputs !== undefined,
+		registrationId: registrationIds.get(job),
 	};
 }
 
@@ -246,7 +255,7 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 			),
 		register: (manager, type, label, run, options) => {
 			const feed = options?.feed ? new JobFeedMirror(options.feed) : undefined;
-			return manager.register(
+			const id = manager.register(
 				type,
 				label,
 				async ctx => {
@@ -259,6 +268,10 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 				},
 				mainRegisterOptions(options, feed),
 			);
+			const registrationId = nextRegistrationId++;
+			const job = manager.getJob(id);
+			if (job) registrationIds.set(job, registrationId);
+			return { id, registrationId };
 		},
 		publishCompleted: (manager, type, label, result, options) =>
 			manager.publishCompleted(type, label, result, options),

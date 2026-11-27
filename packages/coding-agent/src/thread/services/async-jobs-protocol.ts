@@ -57,6 +57,11 @@ export interface AsyncJobWire {
 	readonly process?: { readonly command: string; readonly cwd: string; readonly pids: readonly number[] };
 	/** Whether the job offers widget inputs on the root's thread. */
 	readonly hasWidgetInputs: boolean;
+	/**
+	 * Which registration from a worker this row is, unique on main for its lifetime (see
+	 * {@link AsyncJobManagerProtocol.register}); absent for a row nothing registered from a worker.
+	 */
+	readonly registrationId?: number;
 }
 
 /** New text of one widget source since the previous delta. */
@@ -119,9 +124,10 @@ export type AsyncJobManagerProtocol = {
 	hasWidgets: RpcMethod<[], boolean>;
 	atCapacity: RpcMethod<[], boolean>;
 	onJobSettled: RpcMethod<[listener: WireCallback<[]>], WireUnsubscribe>;
+	/** The job's id and its {@link AsyncJobWire.registrationId}, which no other row ever carries. */
 	register: RpcMethod<
 		[type: AsyncJobType, label: string, run: WireJobRun, options: WireRegisterOptions | undefined],
-		string
+		{ id: string; registrationId: number }
 	>;
 	publishCompleted: RpcMethod<
 		[
@@ -138,7 +144,8 @@ export type AsyncJobManagerProtocol = {
 	getRecentJobs: RpcMethod<[limit: number | undefined, filter: AsyncJobFilter | undefined], AsyncJobWire[]>;
 	getAllJobs: RpcMethod<[filter: AsyncJobFilter | undefined], AsyncJobWire[]>;
 	backgroundJob: RpcMethod<[jobId: string], boolean>;
-	releaseForegroundJob: RpcMethod<[jobId: string], void>;
+	/** Whether main took the release: the job was still foreground-backed. */
+	releaseForegroundJob: RpcMethod<[jobId: string], boolean>;
 	getDeliveryState: RpcMethod<[filter: AsyncJobFilter | undefined], AsyncJobDeliveryState>;
 	hasPendingDeliveries: RpcMethod<[filter: AsyncJobFilter | undefined], boolean>;
 	watchJobs: RpcMethod<[jobIds: string[]], number>;

@@ -35,7 +35,13 @@ import {
 import { EventBus } from "../../src/utils/event-bus";
 import type { SubagentHeapRequest, SubagentHeapWritten } from "../fixtures/subagent-heap-hook";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
-import { collectGarbage, HeapGraph, takeV8HeapSnapshot, type V8HeapSnapshot } from "../helpers/heap-snapshot";
+import {
+	collectGarbage,
+	HeapGraph,
+	parseV8HeapSnapshot,
+	takeV8HeapSnapshot,
+	type V8HeapSnapshot,
+} from "../helpers/heap-snapshot";
 
 const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
 const MODEL = "fake/fake-model";
@@ -218,7 +224,7 @@ async function workerSnapshot(threadId: string, file: string): Promise<V8HeapSna
 		channel.close();
 	}
 	try {
-		return JSON.parse(await Bun.file(file).text()) as V8HeapSnapshot;
+		return parseV8HeapSnapshot(JSON.parse(await Bun.file(file).text()));
 	} finally {
 		await fs.rm(file, { force: true });
 	}
