@@ -312,4 +312,16 @@ describe("AgentActivityIndex", () => {
 		await activity.sync("Worker", sessionFile);
 		expect(activity.query().map(row => row.summary)).toEqual(["First answer", "ELIDEDMARK answer"]);
 	});
+
+	it("shows the first response a later sync reads when the transcript had no rows yet", async () => {
+		using tempDir = TempDir.createSync("@activity-index-no-rows-");
+		const sessionFile = path.join(tempDir.path(), "worker.jsonl");
+		await Bun.write(sessionFile, `${messageEntry("u1", 1_000, { role: "user", content: "Do the task" })}\n`);
+		const activity = new AgentActivityIndex();
+		await activity.sync("Worker", sessionFile);
+		expect(activity.query()).toEqual([]);
+		await fs.appendFile(sessionFile, `${messageEntry("a1", 2_000, { role: "assistant", content: "Task done" })}\n`);
+		await activity.sync("Worker", sessionFile);
+		expect(activity.query().map(row => row.summary)).toEqual(["Task done"]);
+	});
 });

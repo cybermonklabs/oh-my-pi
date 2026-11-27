@@ -33,6 +33,8 @@ export interface AgentActivityRemote {
 interface TranscriptState {
 	path?: string;
 	offset: number;
+	/** `offset` may fall inside a line: the next read drops the text before its first newline. */
+	midLine: boolean;
 	mtimeMs: number;
 	pending: string;
 	rows: AgentActivityRow[];
@@ -516,9 +518,11 @@ export class AgentActivityIndex {
 			(stat.size === state.offset && stat.mtimeMs !== state.mtimeMs)
 		) {
 			const hadRows = (state?.rows.length ?? 0) > 0;
+			const offset = Math.max(0, stat.size - INITIAL_TAIL_BYTES);
 			state = {
 				path: sessionFile,
-				offset: Math.max(0, stat.size - INITIAL_TAIL_BYTES),
+				offset,
+				midLine: offset > 0,
 				mtimeMs: 0,
 				pending: "",
 				rows: [],
@@ -542,7 +546,7 @@ export class AgentActivityIndex {
 		}
 		state.offset = stat.size;
 		state.mtimeMs = stat.mtimeMs;
-		this.#consume(agentId, state, text, start > 0 && state.rows.length === 0);
+		this.#consume(agentId, state, text);
 	}
 
 	async #syncRemote(agentId: string): Promise<void> {
@@ -550,6 +554,7 @@ export class AgentActivityIndex {
 		if (!state) {
 			state = {
 				offset: 0,
+				midLine: false,
 				mtimeMs: 0,
 				pending: "",
 				rows: [],
@@ -569,6 +574,7 @@ export class AgentActivityIndex {
 			}
 			if (!probe || probe.error) return;
 			state.offset = Math.max(0, probe.newSize - INITIAL_TAIL_BYTES);
+			state.midLine = state.offset > 0;
 		}
 		let result: AgentActivityTranscript | null | undefined;
 		try {
@@ -579,6 +585,7 @@ export class AgentActivityIndex {
 		if (!result || result.error) return;
 		if (result.newSize < state.offset) {
 			state.offset = Math.max(0, result.newSize - INITIAL_TAIL_BYTES);
+			state.midLine = state.offset > 0;
 			state.pending = "";
 			const hadRows = state.rows.length > 0;
 			state.rows = [];
@@ -596,15 +603,17 @@ export class AgentActivityIndex {
 			if (!result || result.error) return;
 		}
 		if (result.newSize === state.offset && !result.text) return;
-		this.#consume(agentId, state, result.text, state.offset > 0 && state.rows.length === 0);
+		this.#consume(agentId, state, result.text);
 		state.offset = result.newSize;
 	}
 
-	#consume(agentId: string, state: TranscriptState, chunk: string, dropLeadingPartial: boolean): void {
+	#consume(agentId: string, state: TranscriptState, chunk: string): void {
 		let text = state.pending + chunk;
-		if (dropLeadingPartial) {
+		if (state.midLine) {
+			// Until the line the read started inside of ends, nothing read is a whole line.
 			const newline = text.indexOf("\n");
-			text = newline >= 0 ? text.slice(newline + 1) : "";
+			state.midLine = newline < 0;
+			text = newline < 0 ? "" : text.slice(newline + 1);
 		}
 		const complete = text.endsWith("\n");
 		const lines = text.split("\n");
