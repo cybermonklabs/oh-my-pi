@@ -303,9 +303,10 @@ describe("headless runtime session switch", () => {
 			const before = await request({ id: "state-before", type: "get_state" });
 
 			const opened = await request({ id: "open", type: "open_session", sessionDir: renamed.dir });
-			expect(opened).toMatchObject({ success: false, error: "Could not restore model local/local-model" });
+			const refusal = "Could not restore model local/local-model. Use --model to choose a model.";
+			expect(opened).toMatchObject({ success: false, error: refusal });
 			const switched = await request({ id: "switch", type: "switch_session", sessionPath: renamed.file });
-			expect(switched).toMatchObject({ success: false, error: "Could not restore model local/local-model" });
+			expect(switched).toMatchObject({ success: false, error: refusal });
 			const after = await request({ id: "state-after", type: "get_state" });
 			expect(after.data).toMatchObject({
 				sessionFile: before.data?.sessionFile,
