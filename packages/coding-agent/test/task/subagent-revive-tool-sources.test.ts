@@ -905,11 +905,14 @@ describe("a nested child of a live subagent that works in its own directory, the
 	let warm: RevivedSubagent | undefined;
 	let cold: RevivedSubagent | undefined;
 	let worktree = "";
+	/** The root session's directory, which the parent masks one way because it works in the worktree. */
+	let rootCwd = "";
 
 	beforeAll(async () => {
 		process = await openToolSourceProcess();
 		const { env, root } = process;
 		worktree = path.join(env.root, "worktree");
+		rootCwd = env.cwd;
 		await fs.mkdir(worktree, { recursive: true });
 		await env.spawn(taskSpawn(env, root.toolSession, parentId, { cwd: worktree }));
 		parent = env.toolSessionOf(parentId);
@@ -943,7 +946,7 @@ describe("a nested child of a live subagent that works in its own directory, the
 			parentCustomToolPaths: true,
 			parentMcpManager: true,
 			parentExtensions: true,
-			secretsProjectDirs: [process?.env.cwd],
+			secretsProjectDirs: [rootCwd],
 		};
 		expect({ cold: observed(cold), warm: observed(warm) }).toEqual({ cold: expected, warm: expected });
 	}, 30_000);
