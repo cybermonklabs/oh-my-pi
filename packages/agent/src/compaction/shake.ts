@@ -21,6 +21,7 @@ import {
 	isArtifactRecoveryToolResult,
 	isProtectedToolResult,
 	isSkillReadToolResult,
+	type PrefixToolCallCache,
 	type ProtectedToolMatcher,
 	resolveBoundaryIndex,
 	SentToolCalls,
@@ -44,6 +45,12 @@ export interface ShakeConfig {
 	 * the boundary — that is its job as a compaction-class reducer.
 	 */
 	keepBoundaryId?: string;
+	/**
+	 * The session's cache of the tool calls before {@link keepBoundaryId}, kept
+	 * across passes (see {@link PrefixToolCallCache}). Undefined = each pass
+	 * indexes those calls itself on its first miss.
+	 */
+	prefixToolCalls?: PrefixToolCallCache;
 }
 
 /** Auto-shake config: protects the live tail, conservative thresholds. */
@@ -328,7 +335,7 @@ export function collectShakeRegions(entries: SessionEntry[], tokenizer: Tokenize
 		acc += entryTokens(entries[i], tokenizer);
 	}
 
-	const toolCalls = new SentToolCalls(entries, boundaryIndex);
+	const toolCalls = new SentToolCalls(entries, boundaryIndex, config.prefixToolCalls);
 
 	const regions: ShakeRegion[] = [];
 	for (let i = boundaryIndex; i < n; i++) {

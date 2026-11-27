@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { type AgentMessage, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import type {
 	BranchSummaryEntry,
+	CompactionEntry,
 	CustomMessageEntry,
 	SessionEntry,
 	SessionMessageEntry,
@@ -20,7 +21,7 @@ import {
 	type SupersedePruneConfig,
 	USELESS_NOTICE,
 } from "@oh-my-pi/pi-agent-core/compaction";
-import type { ProtectedToolContext } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
+import { PrefixToolCallCache, type ProtectedToolContext } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
 import type { AssistantMessage, ImageContent, Message, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -820,31 +821,48 @@ describe("cache-stable boundary — warm prefix protection", () => {
 	});
 });
 
-describe("tool calls before the compaction boundary", () => {
-	/** Count reads of `entry`'s message content, as a body read back from disk would be counted. */
-	function countContentReads(entry: SessionMessageEntry): { reads: number } {
-		const counter = { reads: 0 };
-		const message = entry.message as { content: unknown };
-		const content = message.content;
-		Object.defineProperty(message, "content", {
-			get: () => {
-				counter.reads++;
-				return content;
-			},
-			enumerable: true,
-			configurable: true,
-		});
-		return counter;
+/** Count reads of `entry`'s message content, as a body read back from disk would be counted. */
+function countContentReads(entry: SessionMessageEntry): { reads: number } {
+	const counter = { reads: 0 };
+	const message = entry.message;
+	if (message.role !== "assistant" && message.role !== "toolResult") {
+		throw new Error(`a ${message.role} message has no content blocks to count`);
 	}
+	let content = message.content;
+	Object.defineProperty(message, "content", {
+		get: () => {
+			counter.reads++;
+			return content;
+		},
+		set: (value: typeof content) => {
+			content = value;
+		},
+		enumerable: true,
+		configurable: true,
+	});
+	return counter;
+}
 
-	test("pair a sent result with its call before the boundary and read that prefix once across passes", () => {
+/** A session's prefix cache, and the in-place rewrite that bumps the history revision it reads. */
+function sessionPrefixCache(): { cache: PrefixToolCallCache; rewrite(): void } {
+	let revision = 0;
+	return {
+		cache: new PrefixToolCallCache(() => revision),
+		rewrite: () => {
+			revision++;
+		},
+	};
+}
+
+describe("tool calls before the compaction boundary", () => {
+	test("pair a sent result with its call before the boundary and read that prefix once across a session's passes", () => {
 		const [call1, result1] = readPair("src/foo.ts", FILE_CONTENT, T0);
 		const boundary = textEntry("kept from here", T0 + 500);
 		const [call2, result2] = readPair("src/foo.ts", FILE_CONTENT, T0 + 1_000);
 		const orphan = messageEntry(toolResultMessage("read", "call-missing", FILE_CONTENT, T0 + 1_500), T0 + 1_500);
 		const entries: SessionEntry[] = [call1, boundary, result1, call2, result2, orphan];
 		const prefixReads = countContentReads(call1);
-		const config = cfg({ keepBoundaryId: boundary.id, now: T0 + 2_000 });
+		const config = cfg({ keepBoundaryId: boundary.id, now: T0 + 2_000, prefixToolCalls: sessionPrefixCache().cache });
 
 		// result1's call sits before the boundary: found there, it keys result1, which result2 supersedes.
 		expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(1);
@@ -856,63 +874,147 @@ describe("tool calls before the compaction boundary", () => {
 		expect(prefixReads.reads).toBe(readsAfterFirstPass);
 	});
 
-	test("hold only the latest compaction's prefix index, and still pair each result with its call", async () => {
-		/** Every tool-call block a read of a prefix assistant's content handed out, by call id. */
-		const handedOut: Array<[id: string, block: WeakRef<object>]> = [];
-		/** Give `entry` fresh content on every read, as a body read back from disk has. */
-		const readFresh = (entry: SessionMessageEntry): void => {
-			const message = entry.message as { content: AssistantMessage["content"] };
-			const content = message.content;
-			Object.defineProperty(message, "content", {
-				get: () =>
-					content.map(block => {
-						const copy = { ...block };
-						if (copy.type === "toolCall") handedOut.push([copy.id, new WeakRef(copy)]);
-						return copy;
-					}),
-				enumerable: true,
-				configurable: true,
+	for (const withSessionCache of [false, true]) {
+		test(`${withSessionCache ? "a session's passes pair" : "a pass without a session cache pairs"} a kept result with its call as rewritten before an unchanged boundary`, () => {
+			const session = sessionPrefixCache();
+			const [call1, result1] = readPair("src/a.ts", FILE_CONTENT, T0);
+			const boundary = textEntry("kept from here", T0 + 500);
+			const entries: SessionEntry[] = [call1, boundary, result1];
+			const config = cfg({
+				keepBoundaryId: boundary.id,
+				now: T0 + 2_000,
+				prefixToolCalls: withSessionCache ? session.cache : undefined,
 			});
-		};
-		const calls: SessionMessageEntry[] = [];
-		const results: SessionMessageEntry[] = [];
-		for (let compaction = 0; compaction < 3; compaction++) {
-			const [call, result] = readPair(`src/file-${compaction}.ts`, FILE_CONTENT, T0 + compaction);
-			readFresh(call);
-			calls.push(call);
-			results.push(result);
-		}
 
-		// Each compaction keeps a result whose call lies before its boundary, and a newer read that supersedes it.
-		const entries: SessionEntry[] = [...calls];
-		let config = cfg();
-		for (let compaction = 0; compaction < 3; compaction++) {
-			const at = T0 + 100 * (compaction + 1);
-			const boundary = textEntry(`kept from compaction ${compaction + 1}`, at);
-			const [newerCall, newerResult] = readPair(`src/file-${compaction}.ts`, FILE_CONTENT, at);
-			entries.push(boundary, results[compaction], newerCall, newerResult);
-			config = cfg({ keepBoundaryId: boundary.id, now: at + 1_000 });
-			expect(pruneSupersededToolResults([...entries], tokenizer, config).prunedCount).toBe(1);
-			expect(resultText(results[compaction])).toBe(SUPERSEDED_NOTICE);
-		}
+			// Nothing reads src/a.ts again yet: result1 stays, paired with its call before the boundary.
+			expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
 
-		// A call resolved from a prefix lives only in that prefix's index; only the newest compaction's stays.
-		// A WeakRef keeps its target to the end of the job that made or read it, so each round yields first.
-		let alive: string[] = [];
-		for (let round = 0; round < 20; round++) {
-			await Bun.sleep(0);
-			Bun.gc(true);
-			alive = handedOut.filter(([, block]) => block.deref() !== undefined).map(([id]) => id);
-			if (alive.length <= 1) break;
-		}
-		expect(alive).toEqual([resultMessage(results[2]).toolCallId]);
+			// The session rewrites that call in place to read src/b.ts; then src/a.ts is read again.
+			const { toolCallId } = resultMessage(result1);
+			call1.message = assistantMessage(
+				[{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "src/b.ts" } }],
+				T0,
+			);
+			session.rewrite();
+			entries.push(...readPair("src/a.ts", FILE_CONTENT, T0 + 1_000));
 
-		// The session's entries are all still there, and the newest index still serves its next pass:
-		// a result whose call is nowhere misses without reading the prefix again.
-		const handedOutBefore = handedOut.length;
-		entries.push(messageEntry(toolResultMessage("read", "call-missing", FILE_CONTENT, T0 + 400), T0 + 400));
-		expect(pruneSupersededToolResults([...entries], tokenizer, config).prunedCount).toBe(0);
-		expect(handedOut.length).toBe(handedOutBefore);
+			// result1 shows src/b.ts now, so the newer read of src/a.ts leaves it in context.
+			expect(pruneSupersededToolResults(entries, tokenizer, config).prunedCount).toBe(0);
+			expect(resultText(result1)).toBe(FILE_CONTENT);
+		});
+	}
+
+	test("a session's cache holds one prefix: a compaction on another root replaces it, and the first is indexed again on return", () => {
+		const { cache } = sessionPrefixCache();
+		const pass = (entries: SessionEntry[], boundary: SessionEntry): number =>
+			pruneSupersededToolResults(
+				entries,
+				tokenizer,
+				cfg({ keepBoundaryId: boundary.id, now: T0 + 3_000, prefixToolCalls: cache }),
+			).prunedCount;
+		// Each branch's compaction kept a read and summarized away its call. B starts at another root,
+		// as the next append after `resetLeaf()` does.
+		const [callA, resultA] = readPair("src/a.ts", FILE_CONTENT, T0);
+		const boundaryA = textEntry("kept from here on A", T0 + 100);
+		const branchA: SessionEntry[] = [callA, boundaryA, resultA];
+		const [callB, resultB] = readPair("src/b.ts", FILE_CONTENT, T0 + 1_000);
+		const boundaryB = textEntry("kept from here on B", T0 + 1_100);
+		const aPrefixReads = countContentReads(callA);
+
+		expect(pass(branchA, boundaryA)).toBe(0);
+		const readsWhileIndexed = aPrefixReads.reads;
+		expect(pass([callB, boundaryB, resultB], boundaryB)).toBe(0);
+
+		// Back on A's branch, src/a.ts is read again: A's prefix is read again, and its kept result still pairs.
+		branchA.push(...readPair("src/a.ts", FILE_CONTENT, T0 + 2_000));
+		expect(pass(branchA, boundaryA)).toBe(1);
+		expect(aPrefixReads.reads).toBeGreaterThan(readsWhileIndexed);
+		expect(resultText(resultA)).toBe(SUPERSEDED_NOTICE);
+	});
+});
+
+/** A compaction that kept no entry (`firstKeptEntryId: ""`), as an Anthropic native compaction that summarizes everything leaves. */
+function keptNothingCompaction(timestamp: number, providerReplayThroughEntryId?: string): CompactionEntry {
+	return {
+		type: "compaction",
+		id: nextId(),
+		parentId: null,
+		timestamp: new Date(timestamp).toISOString(),
+		summary: "summary of the turns before",
+		firstKeptEntryId: "",
+		tokensBefore: 10_000,
+		...(providerReplayThroughEntryId === undefined ? {} : { providerReplayThroughEntryId }),
+	};
+}
+
+describe("a compaction that kept no entry (keepBoundaryId is empty)", () => {
+	test("the supersede pass starts at the compaction and reads no entry before it", () => {
+		const summarized = [
+			...readPair("src/foo.ts", FILE_CONTENT, T0),
+			...readPair("src/foo.ts", FILE_CONTENT, T0 + 1_000),
+		];
+		const [call3, result3] = readPair("src/foo.ts", FILE_CONTENT, T0 + 3_000);
+		const [call4, result4] = readPair("src/foo.ts", FILE_CONTENT, T0 + 4_000);
+		const entries: SessionEntry[] = [
+			...summarized,
+			keptNothingCompaction(T0 + 2_000),
+			call3,
+			result3,
+			call4,
+			result4,
+		];
+		const reads = summarized.map(countContentReads);
+
+		const result = pruneSupersededToolResults(entries, tokenizer, cfg({ keepBoundaryId: "", now: T0 + 4_000 }));
+
+		// The newest read supersedes every older read of the file, but only result3 is sent.
+		expect(result.prunedCount).toBe(1);
+		expect(reads.map(({ reads }) => reads)).toEqual([0, 0, 0, 0]);
+		expect(resultText(result3)).toBe(SUPERSEDED_NOTICE);
+		expect(resultText(summarized[1])).toBe(FILE_CONTENT);
+		expect(resultText(summarized[3])).toBe(FILE_CONTENT);
+	});
+
+	test("age pruning leaves what the compaction summarized away alone", () => {
+		const [call1, result1] = readPair("src/old.ts", FILE_CONTENT, T0);
+		const [call2, result2] = readPair("src/new.ts", FILE_CONTENT, T0 + 2_000);
+		const entries: SessionEntry[] = [call1, result1, keptNothingCompaction(T0 + 1_000), call2, result2];
+
+		// protectTokens 0 -> the age path would prune both; only the compaction shields result1.
+		pruneToolOutputs(entries, tokenizer, {
+			protectTokens: 0,
+			minimumSavings: 0,
+			protectedTools: [],
+			keepBoundaryId: "",
+			cacheWarmSuffixTokens: 1_000_000,
+		});
+
+		expect(resultText(result1)).toBe(FILE_CONTENT);
+		expect(resultMessage(result1).prunedAt).toBeUndefined();
+		expect(resultMessage(result2).prunedAt).toBeDefined();
+	});
+
+	test("turns appended while a native compaction ran stay in the pruned region", () => {
+		const [call1, result1] = readPair("src/foo.ts", FILE_CONTENT, T0); // the native replay covers up to result1
+		const [call2, result2] = readPair("src/foo.ts", FILE_CONTENT, T0 + 1_000); // appended while it ran
+		const [call3, result3] = readPair("src/foo.ts", FILE_CONTENT, T0 + 3_000);
+		const entries: SessionEntry[] = [
+			call1,
+			result1,
+			call2,
+			result2,
+			keptNothingCompaction(T0 + 2_000, result1.id),
+			call3,
+			result3,
+		];
+
+		const result = pruneSupersededToolResults(entries, tokenizer, cfg({ keepBoundaryId: "", now: T0 + 3_000 }));
+
+		// result2 is sent and result3 supersedes it; result1 is summarized away and stays.
+		expect(result.prunedCount).toBe(1);
+		expect(resultText(result2)).toBe(SUPERSEDED_NOTICE);
+		expect(resultText(result1)).toBe(FILE_CONTENT);
+		expect(resultText(result3)).toBe(FILE_CONTENT);
 	});
 });
 
