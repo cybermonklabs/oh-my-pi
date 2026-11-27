@@ -379,21 +379,17 @@ describe("retain.execute", () => {
 		await registeredState?.flushRetainQueue();
 
 		expect(retainBatchSpy).toHaveBeenCalledTimes(2);
-		// Same-call items share a publication mtime, so their order within a request is unspecified.
+		// One request per tag set, in the order of each set's first item; items keep the call's order.
 		const requests = retainBatchSpy.mock.calls.map(([, items]) =>
-			items
-				.map(item => ({ content: item.content, tags: item.tags }))
-				.toSorted((a, b) => a.content.localeCompare(b.content)),
+			items.map(item => ({ content: item.content, tags: item.tags })),
 		);
-		expect(requests).toEqual(
-			expect.arrayContaining([
-				[
-					{ content: "pi builds with bun", tags: ["project:pi"] },
-					{ content: "pi uses tabs", tags: ["project:pi"] },
-				],
-				[{ content: "the user prefers zsh across projects", tags: undefined }],
-			]),
-		);
+		expect(requests).toEqual([
+			[
+				{ content: "pi uses tabs", tags: ["project:pi"] },
+				{ content: "pi builds with bun", tags: ["project:pi"] },
+			],
+			[{ content: "the user prefers zsh across projects", tags: undefined }],
+		]);
 	});
 
 	it("sends global and project items in one untagged request when the scope has no project tags", async () => {
@@ -409,14 +405,9 @@ describe("retain.execute", () => {
 		await registeredState?.flushRetainQueue();
 
 		expect(retainBatchSpy).toHaveBeenCalledTimes(1);
-		// Same-call items share a publication mtime, so their order within the request is unspecified.
-		expect(
-			retainBatchSpy.mock.calls[0][1]
-				.map(item => ({ content: item.content, tags: item.tags }))
-				.toSorted((a, b) => a.content.localeCompare(b.content)),
-		).toEqual([
-			{ content: "explicitly global fact", tags: undefined },
+		expect(retainBatchSpy.mock.calls[0][1].map(item => ({ content: item.content, tags: item.tags }))).toEqual([
 			{ content: "shared fact", tags: undefined },
+			{ content: "explicitly global fact", tags: undefined },
 		]);
 	});
 
@@ -513,23 +504,19 @@ describe("retain.execute", () => {
 		const [bankId, items, options] = retainBatchSpy.mock.calls[0];
 		expect(bankId).toBe("test-bank");
 		expect(options).toEqual(expect.objectContaining({ async: true }));
-		// Same-call items share a publication mtime, so their order within the batch is unspecified.
-		expect(items).toHaveLength(2);
-		expect(items).toEqual(
-			expect.arrayContaining([
-				expect.objectContaining({
-					content: "fact one",
-					metadata: { session_id: TEST_SESSION_ID },
-					tags: ["project:pi"],
-				}),
-				expect.objectContaining({
-					content: "fact two",
-					context: "user override",
-					metadata: { session_id: TEST_SESSION_ID },
-					tags: ["project:pi"],
-				}),
-			]),
-		);
+		expect(items).toEqual([
+			expect.objectContaining({
+				content: "fact one",
+				metadata: { session_id: TEST_SESSION_ID },
+				tags: ["project:pi"],
+			}),
+			expect.objectContaining({
+				content: "fact two",
+				context: "user override",
+				metadata: { session_id: TEST_SESSION_ID },
+				tags: ["project:pi"],
+			}),
+		]);
 		expect(await outboxEvents()).toEqual([]);
 	});
 

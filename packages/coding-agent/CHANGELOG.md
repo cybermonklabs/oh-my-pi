@@ -73,6 +73,7 @@
 
 ### Fixed
 
+- The Hindsight retain outbox now sends the memories of each tag set in the order they were queued. It ordered them by file modification time alone, so memories written within one tick of the filesystem's clock (most often the items of one call) went out in the directory's listing order, which differs from one filesystem to the next. Each queued memory now records a sequence one past the highest pending one's; memories an older release queued have none, and go first, by modification time, as before
 - An automatic retry no longer ends twice when the next reply finishes while the retry's outcome is still being saved (as on a busy SQL session store): it published two `auto_retry_end` events for one failed request and saved the outcome on the failed attempt's entry a second time. A retry that starts in that window keeps its own state: the earlier retry's end no longer reports it as finished (`isRetrying` false while it runs) or clears its record of the models a refusal already left, which let the refusal walk ask a model it had left
 - A stop while a live call connects (`/live off`, RPC `abort` or `live_stop`) now cancels the pending session request at once, so the start answers `The live call was stopped while it connected` instead of waiting for the server; and the call ends clean, as an open call's stop does, instead of ending with `Live transport is not connected` (nothing is sent to a call that is not up)
 - ACP clients are no longer offered `/live`, which ACP answers as not available
