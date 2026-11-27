@@ -15,6 +15,12 @@
  * pulled (each synchronous read starts one background pull) or the body pushed
  * as it settled, so the widget registry's final read sees the job's last output.
  *
+ * The run context's `reportProgress`, `markRunning` and `pushFeed` reach main's
+ * job row and its mirror only until the run settles ({@link workerRunContext}):
+ * the worker keeps them as long as its body keeps the context, so a released
+ * row and its mirror stay collectable, and a call made after the result
+ * arrived does nothing.
+ *
  * Worker side: see `./async-jobs-remote`.
  */
 import {
@@ -23,6 +29,7 @@ import {
 	AsyncJobManager,
 	type AsyncJobProcess,
 	type AsyncJobRegisterOptions,
+	type AsyncJobRunContext,
 } from "../../async/job-manager";
 import { TextTap } from "../../job-widgets/text-tap";
 import type { JobTextSource, JobWidgetBrief, JobWidgetInputs } from "../../job-widgets/types";
@@ -190,6 +197,41 @@ function mainRegisterOptions(options: WireRegisterOptions | undefined, feed: Job
 	return result;
 }
 
+/** A worker job's run context as it crosses, and the cut that ends it. */
+interface WorkerRunContext {
+	readonly wire: WireRunContext;
+	/** Cut the wrappers from main's run context and mirror; later calls do nothing. */
+	readonly revoke: () => void;
+}
+
+/**
+ * The run context main hands a worker job body. Its callbacks stay exported for as long as the
+ * worker keeps them, so they reach main's `reportProgress`, `markRunning` (both close over the job
+ * row) and `feed` only through a slot that {@link WorkerRunContext.revoke} empties when the run
+ * settles. Module-level, so no wrapper's scope holds `register`'s `feed` or `run`.
+ */
+function workerRunContext(ctx: AsyncJobRunContext, feed: JobFeedMirror | undefined): WorkerRunContext {
+	let live: { readonly ctx: AsyncJobRunContext; readonly feed: JobFeedMirror | undefined } | undefined = {
+		ctx,
+		feed,
+	};
+	const wire: WireRunContext = {
+		jobId: ctx.jobId,
+		signal: toWireSignal(ctx.signal),
+		reportProgress: async (text, details) => {
+			await live?.ctx.reportProgress(text, details);
+		},
+		markRunning: () => live?.ctx.markRunning(),
+		pushFeed: feed ? delta => live?.feed?.apply(delta, true) : undefined,
+	};
+	return {
+		wire,
+		revoke: () => {
+			live = undefined;
+		},
+	};
+}
+
 /** Everything workers registered on main managers (sinks, listeners, subscriptions). */
 const cleanups = new PeerCleanups(ASYNC_JOB_MANAGER_KIND);
 
@@ -207,15 +249,13 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 			return manager.register(
 				type,
 				label,
-				ctx => {
-					const wire: WireRunContext = {
-						jobId: ctx.jobId,
-						signal: toWireSignal(ctx.signal),
-						reportProgress: ctx.reportProgress,
-						markRunning: ctx.markRunning,
-						pushFeed: feed ? delta => feed.apply(delta, true) : undefined,
-					};
-					return run(wire);
+				async ctx => {
+					const context = workerRunContext(ctx, feed);
+					try {
+						return await run(context.wire);
+					} finally {
+						context.revoke();
+					}
 				},
 				mainRegisterOptions(options, feed),
 			);
