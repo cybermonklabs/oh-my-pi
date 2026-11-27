@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { writeChunksToFile } from "../../src/ar/file-sink";
 import { openArchive } from "../../src/ar/open";
 import { STREAM_CHUNK_SIZE } from "../../src/ar/source";
 import { writeArchive, writeTarArchive } from "../../src/ar/write";
@@ -94,5 +95,26 @@ describe("plain tar written member by member", () => {
 		for await (const chunk of archive.readFileChunks("data.bin")) chunks.push(chunk);
 		expect(chunks.map(chunk => chunk.byteLength)).toEqual([STREAM_CHUNK_SIZE, STREAM_CHUNK_SIZE, 77]);
 		expect(Buffer.concat(chunks).equals(Buffer.from(bytes))).toBe(true);
+	});
+});
+
+describe("chunks written to a file", () => {
+	async function* chunksOf(text: string): AsyncGenerator<Uint8Array> {
+		yield new TextEncoder().encode(text);
+	}
+
+	test("truncates a longer existing file to exactly the chunks written", async () => {
+		using dir = TempDir.createSync("@omp-chunk-file-");
+		const dest = dir.join("dest.bin");
+		await Bun.write(dest, "0123456789abcdef");
+		await writeChunksToFile(dest, chunksOf("AB"));
+		expect(await Bun.file(dest).bytes()).toEqual(new TextEncoder().encode("AB"));
+	});
+
+	test("creates the destination's missing parent directories", async () => {
+		using dir = TempDir.createSync("@omp-chunk-file-");
+		const dest = dir.join("missing", "parent", "dest.bin");
+		await writeChunksToFile(dest, chunksOf("AB"));
+		expect(await Bun.file(dest).text()).toBe("AB");
 	});
 });
