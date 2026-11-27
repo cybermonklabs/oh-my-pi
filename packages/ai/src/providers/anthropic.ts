@@ -1049,7 +1049,7 @@ class AnthropicStreamRateLimitError extends AIError.ProviderHttpError {}
  * wherever it lands, so turn recovery waits on this model for the window to
  * clear instead of re-sending the whole context at once as a resumed truncation.
  */
-function createAnthropicSseStreamError(data: string, midMessage: boolean): Error {
+function createAnthropicSseStreamError(data: string, midMessage: boolean, headers: Headers): Error {
 	let parsed: { error?: { type?: unknown; code?: unknown; message?: unknown } } | undefined;
 	try {
 		parsed = JSON.parse(data) as { error?: { type?: unknown; code?: unknown; message?: unknown } };
@@ -1072,7 +1072,7 @@ function createAnthropicSseStreamError(data: string, midMessage: boolean): Error
 	const rejection =
 		httpStatus === undefined
 			? new AIError.ProviderResponseError(text, { provider: "anthropic", kind: "output" })
-			: new HttpError(text, httpStatus, { code: errorType });
+			: new HttpError(text, httpStatus, { code: errorType, headers });
 	if (!midMessage || httpStatus === 429 || !AIError.isProviderRetryableError(rejection)) {
 		return rejection;
 	}
@@ -1109,7 +1109,11 @@ async function* iterateAnthropicEvents(
 		// complete: classify it as the truncation family so the failure is
 		// retryable/continuable instead of a completed-turn provider rejection.
 		if (sse.event === "error") {
-			throw createAnthropicSseStreamError(sse.data, sawMessageStart && !sawMessageEnd && !sawTerminalDelta);
+			throw createAnthropicSseStreamError(
+				sse.data,
+				sawMessageStart && !sawMessageEnd && !sawTerminalDelta,
+				response.headers,
+			);
 		}
 
 		if (sse.event === "ping") {
