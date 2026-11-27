@@ -1630,26 +1630,25 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	// SAFETY: reading this process's own number.
 	OWNER.store(unsafe { libc::getpid() }, Ordering::Relaxed);
 	RECORD.store(file.as_raw_fd(), Ordering::Relaxed);
-	// SAFETY: this test has a process of its own (`own_process`); the disposition and
-	// the process group are both put back below. `SA_RESTART` keeps the
-	// storm from turning this process's own calls into `EINTR`.
-	let (kept, ignored, grouped) = unsafe {
+	// SAFETY: this test has a process of its own (`own_process`); the process
+	// group is put back below, and both dispositions are left ignored there.
+	// `SA_RESTART` keeps the storm from turning this process's own calls into
+	// `EINTR`.
+	let grouped = unsafe {
 		let mut catching: libc::sigaction = std::mem::zeroed();
 		catching.sa_sigaction = note_whoever_runs_this as extern "C" fn(libc::c_int) as libc::sighandler_t;
 		catching.sa_flags = libc::SA_RESTART;
 		libc::sigemptyset(&raw mut catching.sa_mask);
-		let mut kept: libc::sigaction = std::mem::zeroed();
-		assert_eq!(libc::sigaction(libc::SIGUSR1, &raw const catching, &raw mut kept), 0);
+		assert_eq!(libc::sigaction(libc::SIGUSR1, &raw const catching, std::ptr::null_mut()), 0);
 		// And one the caller *ignores*, which is its own instruction and
 		// has to reach the utility: a child that put it back to default
 		// would die on the storm's own delivery of it.
-		let ignored = libc::signal(libc::SIGUSR2, libc::SIG_IGN);
-		assert_ne!(ignored, libc::SIG_ERR);
+		assert_ne!(libc::signal(libc::SIGUSR2, libc::SIG_IGN), libc::SIG_ERR);
 		let was = libc::getpgrp();
 		// Its own group, so the storm reaches this test and its children
 		// and nothing else the runner has going.
 		assert_eq!(libc::setpgid(0, 0), 0, "a group of this test's own: {}", std::io::Error::last_os_error());
-		(kept, ignored, was)
+		was
 	};
 	let storming = std::sync::Arc::new(AtomicBool::new(true));
 	let until = std::sync::Arc::clone(&storming);
@@ -1716,10 +1715,18 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	);
 	crate::testprog::write(&raises, &script);
 	let ignoring = crate::locale::codeset_from_utility_for_test(&raises, "C.UTF-8", &|_| None);
-	// SAFETY: putting back what this test changed, before it can fail.
+	// Both numbers stay ignored from here, rather than going back to what
+	// they were: a signal of the storm above can still be queued for the
+	// process, waiting for a thread that can take it to run, and where what
+	// they were is the default action — which is what this process inherits
+	// unless its caller ignored the number — that signal would end this
+	// process in the middle of the assertions below. Setting SIG_IGN discards
+	// a pending one as well, and nothing later sees the disposition: this
+	// process runs only this test.
+	// SAFETY: the dispositions and the group are this process's own.
 	unsafe {
-		libc::sigaction(libc::SIGUSR1, &raw const kept, std::ptr::null_mut());
-		libc::signal(libc::SIGUSR2, ignored);
+		libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+		libc::signal(libc::SIGUSR2, libc::SIG_IGN);
 		libc::setpgid(0, grouped);
 	}
 	let ran: Vec<i32> = fs::read(&record)
