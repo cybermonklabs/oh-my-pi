@@ -150,6 +150,13 @@ const SPOTLIGHT_ARG_TOKENS_BACKFILL_KEY = "spotlight_v5_arg_tokens";
 // count only with the arm that shipped. Every transcript that can hold
 // Spotlight entries is re-parsed once by the new rules.
 const SPOTLIGHT_TOGGLE_BACKFILL_KEY = "spotlight_v6_toggle";
+// Rows derived from an entry before an `entry_patch` record set its fields (a
+// tail read that stored the entry's rows, then met the record) are derived
+// again once, from entries carrying those fields. Only files modified since
+// the code that writes the records was committed can hold one, so older
+// cursors stay put.
+const ENTRY_PATCH_BACKFILL_KEY = "entry_patch_v1";
+const ENTRY_PATCH_SINCE_MS = Date.parse("2026-11-15T13:34:58Z");
 function shouldResetBackfill(value: string | undefined): boolean {
 	return value !== BACKFILL_COMPLETE && value !== BACKFILL_PENDING;
 }
@@ -535,11 +542,12 @@ export async function initDb(): Promise<Database> {
 	backfillMissingCatalogCosts(db);
 	backfillNoCacheInputCosts(db);
 	backfillForkDuplicates(db);
-	backfillSpotlight(db, SPOTLIGHT_BACKFILL_KEY);
+	reparseModifiedSince(db, SPOTLIGHT_BACKFILL_KEY, SPOTLIGHT_SINCE_MS);
 	reparseSpotlightSessions(db, SPOTLIGHT_EDITS_BACKFILL_KEY);
 	reparseSpotlightSessions(db, SPOTLIGHT_NEEDS_BACKFILL_KEY);
 	reparseSpotlightSessions(db, SPOTLIGHT_ARG_TOKENS_BACKFILL_KEY);
-	backfillSpotlight(db, SPOTLIGHT_TOGGLE_BACKFILL_KEY);
+	reparseModifiedSince(db, SPOTLIGHT_TOGGLE_BACKFILL_KEY, SPOTLIGHT_SINCE_MS);
+	reparseModifiedSince(db, ENTRY_PATCH_BACKFILL_KEY, ENTRY_PATCH_SINCE_MS);
 	ensureRollupSchema(db);
 	return db;
 }
@@ -777,18 +785,19 @@ function backfillNoCacheInputCosts(database: Database): void {
 }
 
 /**
- * Re-parse, once per key, the transcripts that can hold Spotlight entries
- * (modified since {@link SPOTLIGHT_SINCE_MS}) by dropping their cursors; every
- * older cursor stays, so this never triggers a full-history re-parse. The next
- * sync rebuilds those files from byte zero, replacing their Spotlight rows.
- * Keys: {@link SPOTLIGHT_BACKFILL_KEY} (the tables are new),
- * {@link SPOTLIGHT_TOGGLE_BACKFILL_KEY} (the experiment became a toggle).
+ * Re-parse, once per key, the transcripts modified since `sinceMs` by dropping
+ * their cursors; every older cursor stays, so this never triggers a
+ * full-history re-parse. The next sync rebuilds those files from byte zero,
+ * replacing their rows. Keys: {@link SPOTLIGHT_BACKFILL_KEY} (the Spotlight
+ * tables are new), {@link SPOTLIGHT_TOGGLE_BACKFILL_KEY} (the experiment became
+ * a toggle), both since {@link SPOTLIGHT_SINCE_MS}; {@link ENTRY_PATCH_BACKFILL_KEY}
+ * (entries carry their records' fields) since {@link ENTRY_PATCH_SINCE_MS}.
  */
-function backfillSpotlight(database: Database, key: string): void {
+function reparseModifiedSince(database: Database, key: string, sinceMs: number): void {
 	const row = database.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?").get(key);
 	if (row?.value === BACKFILL_COMPLETE) return;
 	database.transaction(() => {
-		database.query("DELETE FROM file_offsets WHERE last_modified >= ?").run(SPOTLIGHT_SINCE_MS);
+		database.query("DELETE FROM file_offsets WHERE last_modified >= ?").run(sinceMs);
 		database.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run(key, BACKFILL_COMPLETE);
 	})();
 }

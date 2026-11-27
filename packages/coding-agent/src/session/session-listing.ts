@@ -5,11 +5,17 @@ import type { Message } from "@oh-my-pi/pi-ai";
 import { textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import type { SessionListing } from "@oh-my-pi/pi-tui/overlays/session-selector";
 import { getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
+import {
+	applyEntryPatches,
+	ENTRY_PATCH_CUSTOM_TYPE,
+	type EntryPatchRecord,
+	isEntryPatchRecord,
+} from "@oh-my-pi/pi-utils/entry-patches";
 import { hasFsCode, isEacces, isEnoent, isEnotdir } from "@oh-my-pi/pi-utils/fs-error";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { parseJsonlLenient } from "@oh-my-pi/pi-utils/stream";
-import { toError } from "@oh-my-pi/pi-utils/type-guards";
+import { isRecord, toError } from "@oh-my-pi/pi-utils/type-guards";
 import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
 import { findArchivedSessionFiles } from "./session-archive";
 import { CANONICAL_SESSION_ID_RE } from "./session-id-format";
@@ -329,6 +335,26 @@ function parseTurnLine(line: string): Message | undefined {
 	return role === "user" || role === "assistant" ? record.message : undefined;
 }
 
+/**
+ * The `entry_patch` records among the complete lines of `text`, a window of a
+ * session file, in file order. Only lines that name the record's type are parsed.
+ */
+function entryPatchRecordsIn(text: string): EntryPatchRecord[] {
+	const records: EntryPatchRecord[] = [];
+	if (!text.includes(ENTRY_PATCH_CUSTOM_TYPE)) return records;
+	for (const line of text.split("\n")) {
+		if (!line.includes(ENTRY_PATCH_CUSTOM_TYPE)) continue;
+		let value: unknown;
+		try {
+			value = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (isRecord(value) && isEntryPatchRecord(value)) records.push(value);
+	}
+	return records;
+}
+
 function extractFirstDisplayMessageFromPrefix(content: string): string | undefined {
 	let fallback: string | undefined;
 	let index = content.indexOf('"role"');
@@ -433,7 +459,11 @@ function getSessionListWorkerCount(fileCount: number): number {
 /**
  * Scan a single session file into a {@link SessionInfo}. Reads the 4 KB
  * prefix, plus the 32 KB tail when `withStatus` is set; a record the windows
- * miss is recovered by one {@link SessionStorage.scanLines} pass.
+ * miss is recovered by one {@link SessionStorage.scanLines} pass. The
+ * `entry_patch` records the two windows hold apply to the prefix's entries, so
+ * a prompt an elide pass shortened previews and searches as the placeholder;
+ * a record between the windows, or past what the fallback pass reads, is not
+ * read.
  */
 async function scanSessionFile(
 	file: string,
@@ -464,6 +494,9 @@ async function scanSessionFile(
 		);
 		const { size, mtime } = stat;
 		const entries = parseJsonlLenient<Record<string, unknown>>(content);
+		// The prefix's own records, then the tail's, in file order: a tail that overlaps the prefix repeats some, which changes nothing.
+		const tailRecords = entryPatchRecordsIn(suffix);
+		applyEntryPatches<object>(tailRecords.length > 0 ? [...entries, ...tailRecords] : entries);
 		const header = parseSessionListHeader(content, entries);
 		if (!header) {
 			// Cache the negative result too: an unparseable file stays unparseable

@@ -26,6 +26,7 @@ import {
 	stringifyJson,
 	toError,
 } from "@oh-my-pi/pi-utils";
+import { ENTRY_PATCH_CUSTOM_TYPE, entryAcceptsPatch, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
 import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import * as snapcompact from "@oh-my-pi/snapcompact";
@@ -191,10 +192,7 @@ import {
 import { recordSessionRecap, recordSessionTitle } from "./session-index";
 import {
 	applyEntryPatches,
-	ENTRY_PATCH_CUSTOM_TYPE,
 	type EntryPatch,
-	entryAcceptsPatch,
-	isEntryPatchRecord,
 	maskEntryPatchRecord,
 	setPatchedFields,
 	toEntryPatchData,
