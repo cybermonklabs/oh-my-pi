@@ -894,8 +894,10 @@ fn a_locale_lock_another_thread_holds_does_not_reach_the_lookup() {
 		assert!(!holder.is_finished(), "{ended}");
 		let state = match fs::read_to_string(&stat) {
 			Ok(state) => state,
-			// The thread's directory goes only once the thread has ended.
-			Err(_) if holder.is_finished() => panic!("{ended}"),
+			// The thread's directory goes only once the thread has ended: Linux
+			// then answers ENOENT and gVisor ESRCH (`task_has_gone`). Any other
+			// error is named below.
+			Err(error) if task_has_gone(&error) && holder.is_finished() => panic!("{ended}"),
 			Err(error) => panic!("{stat}: {error}"),
 		};
 		if state.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('S')) {
@@ -1627,14 +1629,31 @@ fn a_closed_standard_descriptor_never_becomes_the_answer() {
 		// in this process writes to one.
 		let kept: Vec<(i32, i32)> =
 			wanted.iter().map(|standard| (*standard, unsafe { libc::dup(*standard) })).collect();
-		// SAFETY: as above.
+		assert!(
+			kept.iter().all(|&(_, saved)| saved >= 0),
+			"dup of {wanted:?}: {}",
+			std::io::Error::last_os_error()
+		);
 		for (standard, _) in &kept {
+			// SAFETY: no owner in this process holds a standard descriptor. std
+			// opens 0, 1 and 2 before `main` when they are closed, so no file
+			// opened later has one of those numbers, and std's stdin, stdout and
+			// stderr use them without owning them; this process runs only this
+			// test (`own_process`). So closing one breaks no owner's I/O safety,
+			// and `kept` holds an open duplicate of it (checked above), which the
+			// loop below puts back.
 			unsafe { libc::close(*standard) };
 		}
 		let codeset = crate::locale::loaded_codeset(SHELL_ONLY_LOCALE, &env, None);
 		let loadable = crate::locale::locale_loadable(literal, libc::LC_CTYPE_MASK);
-		// SAFETY: as above; every saved descriptor is this test's own.
 		for (standard, saved) in &kept {
+			// SAFETY: `saved` is the open duplicate `dup` made above, and only
+			// `kept` has its number. The query has returned and keeps no
+			// descriptor past its return (`locale.rs` starts no thread and holds
+			// no descriptor in a static), so no owner holds the standard number:
+			// `dup2` puts the duplicate back there and breaks no owner's I/O
+			// safety, and `close` then releases the duplicate, which nothing else
+			// uses.
 			unsafe {
 				libc::dup2(*saved, *standard);
 				libc::close(*saved);
@@ -1866,12 +1885,17 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 		libc::signal(libc::SIGUSR2, libc::SIG_IGN);
 		libc::setpgid(0, grouped);
 	}
-	let ran: Vec<i32> = fs::read(&record)
-		.unwrap()
-		.chunks_exact(4)
-		.map(|number| i32::from_ne_bytes(number.try_into().unwrap()))
+	let written = fs::read(&record).unwrap();
+	let (numbers, partial) = written.as_chunks::<4>();
+	let ran: Vec<i32> = numbers
+		.iter()
+		.map(|number| i32::from_ne_bytes(*number))
 		.collect();
-	assert!(ran.is_empty(), "the handler ran in the child before its `execve`: {ran:?}");
+	// Only the handler writes the record, so a part of a number is a run too.
+	assert!(
+		ran.is_empty() && partial.is_empty(),
+		"the handler ran in the child before its `execve`: {ran:?}, and part of one: {partial:?}"
+	);
 	assert!(taken.is_some(), "no query took the signal before its `execve`, so nothing was proved: {last}");
 	assert!(
 		died_ignoring.is_none(),
