@@ -3905,6 +3905,8 @@ export class SessionManager {
 	 * longer blob reference). A result that cannot be measured counts as long.
 	 */
 	#replacedLineMayExceedFetchCap({ entryId, replaced }: ToolResultPrune): boolean {
+		const checkPlant: number = "planted type error";
+		void checkPlant;
 		const entry = this.#index.get(entryId);
 		if (entry?.type !== "message" || entry.message.role !== "toolResult") return false;
 		try {
