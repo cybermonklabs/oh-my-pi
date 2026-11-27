@@ -209,6 +209,22 @@ describe("task approval details surface the dispatch", () => {
 		expect(lines).toContain("Task 3 model: mock/other");
 	});
 
+	// Dispatch drops a blank model, so a prompt naming one would describe a model the run never uses.
+	it("omits a blank per-call model, flat or batch", async () => {
+		const tool = await makeTool();
+		const flat = tool.formatApprovalDetails({ task: "review the patch", model: "  " });
+		expect(flat.some(line => line.startsWith("Model:"))).toBe(false);
+		const batch = tool.formatApprovalDetails({
+			context: "review the patch",
+			tasks: [
+				{ task: "review auth", model: "" },
+				{ task: "review storage", model: "mock/other" },
+			],
+		});
+		expect(batch.some(line => line.startsWith("Task 1 model:"))).toBe(false);
+		expect(batch).toContain("Task 2 model: mock/other");
+	});
+
 	it("summarizes a homogeneous batch whose agents use the session default", async () => {
 		const tool = await makeTool("scout,reviewer");
 		const lines = tool.formatApprovalDetails({

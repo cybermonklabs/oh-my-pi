@@ -39,11 +39,11 @@ const sink: SpeculativeOperationSink = {
 	close: () => {},
 };
 
-function createSession(manager: AsyncJobManager): ToolSession {
+function createSession(manager: AsyncJobManager, settings: Record<string, unknown> = {}): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
-		settings: Settings.isolated({ "async.enabled": true, "task.batch": true }),
+		settings: Settings.isolated({ "async.enabled": true, "task.batch": true, ...settings }),
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		getAgentId: () => null,
@@ -145,13 +145,19 @@ describe("task speculative launch", () => {
 		return events;
 	};
 
-	async function openSession(): Promise<{ tool: TaskTool; manager: AsyncJobManager; session: TaskLaunchSession }> {
+	async function openSession(settings: Record<string, unknown> = {}): Promise<{
+		tool: TaskTool;
+		toolSession: ToolSession;
+		manager: AsyncJobManager;
+		session: TaskLaunchSession;
+	}> {
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
 		managers.push(manager);
-		const tool = await TaskTool.create(createSession(manager));
+		const toolSession = createSession(manager, settings);
+		const tool = await TaskTool.create(toolSession);
 		const session = await tool.speculation.stream?.open({ coordinator: sink, parentToolCallId: toolCall.id });
 		if (!session) throw new Error("expected a task launch session");
-		return { tool, manager, session: session as TaskLaunchSession };
+		return { tool, toolSession, manager, session: session as TaskLaunchSession };
 	}
 
 	beforeEach(() => {
@@ -264,6 +270,132 @@ describe("task speculative launch", () => {
 
 		await spawn("Alpha").aborted.promise;
 		expect([...startedIds]).toEqual(["Alpha"]);
+	});
+
+	it("launches nothing for a batch call with a top-level isolated, which dispatch refuses", async () => {
+		const authorize = vi.spyOn(sink, "authorizeLaunch");
+		const { tool, session } = await openSession();
+		const call = { context: "ctx", isolated: true, tasks: args.tasks };
+		const raw = JSON.stringify(call);
+		session.update(toolCall, raw.slice(0, raw.indexOf('{"name":"Beta"') + 10));
+		// `adopt` awaits the launch queue, so a launch `update` scheduled has asked for authorization by now.
+		await session.adopt([]);
+		expect(authorize).not.toHaveBeenCalled();
+
+		const result = await tool.execute(toolCall.id, call);
+		expect(result.isError).toBe(true);
+		expect(result.content.find(part => part.type === "text")?.text).toContain(
+			"Top-level `isolated` is not part of the batch shape",
+		);
+	});
+
+	// The launcher cannot see a key that has not streamed. While the session can isolate, an item
+	// that names no `isolated` of its own therefore waits for dispatch instead of starting in the
+	// user's checkout for a call whose top-level `isolated` may still arrive.
+	it("launches nothing for items that name no isolated of their own while isolation is enabled", async () => {
+		const authorize = vi.spyOn(sink, "authorizeLaunch");
+		const { session } = await openSession({ "task.isolation.enabled": true });
+		const call = { context: "ctx", tasks: args.tasks, isolated: true };
+		const raw = JSON.stringify(call);
+		// Both items have closed; the top-level key has not streamed yet, and cannot be read.
+		session.update(toolCall, raw.slice(0, raw.indexOf(',"isolated"')));
+		// `adopt` awaits the launch queue: anything scheduled has asked for authorization by now.
+		await session.adopt([]);
+		expect(authorize).not.toHaveBeenCalled();
+		expect([...startedIds]).toEqual([]);
+	});
+
+	// The whole order, through dispatch: nothing has started, and the call is refused.
+	it("refuses a batch call whose top-level isolated streams after its items", async () => {
+		const authorize = vi.spyOn(sink, "authorizeLaunch");
+		const { tool, manager, session } = await openSession({ "task.isolation.enabled": true });
+		const call = { context: "ctx", tasks: args.tasks, isolated: true };
+		const raw = JSON.stringify(call);
+		session.update(toolCall, raw.slice(0, raw.indexOf(',"isolated"')));
+		session.update(toolCall, raw);
+		session.finalize({ toolCall, args: call });
+		const result = await tool.execute(toolCall.id, call);
+		await session.adopt([]);
+
+		expect(authorize).not.toHaveBeenCalled();
+		expect(result.isError).toBe(true);
+		expect(result.content.find(part => part.type === "text")?.text).toContain(
+			"Top-level `isolated` is not part of the batch shape",
+		);
+		expect(manager.getJob("Alpha")).toBeUndefined();
+	});
+
+	// With isolation off, no child can be isolated, so items still start early. The trailing key is
+	// refused at dispatch, and the started items are aborted rather than run a second time.
+	it("aborts, and does not re-run, items started before a trailing top-level isolated", async () => {
+		const { tool, manager, session } = await openSession();
+		const call = { context: "ctx", tasks: args.tasks, isolated: true };
+		const raw = JSON.stringify(call);
+		session.update(toolCall, raw.slice(0, raw.indexOf(',"isolated"')));
+		// Both items closed in that chunk, so both launch; awaiting each start leaves nothing in
+		// flight when the test ends, which would otherwise reach a later file's `runSubprocess` spy.
+		await spawn("Alpha").started.promise;
+		await spawn("Beta").started.promise;
+		session.update(toolCall, raw);
+		session.finalize({ toolCall, args: call });
+		await spawn("Alpha").aborted.promise;
+		await spawn("Beta").aborted.promise;
+
+		const result = await tool.execute(toolCall.id, call);
+		expect(result.isError).toBe(true);
+		expect(result.content.find(part => part.type === "text")?.text).toContain(
+			"Top-level `isolated` is not part of the batch shape",
+		);
+		// A re-run would be announced as `Alpha-2`; dispatch starts nothing.
+		expect(manager.getJob("Alpha-2")).toBeUndefined();
+		expect(manager.getJob("Beta-2")).toBeUndefined();
+	});
+
+	// The halt reads the top level only. `isolated` inside an item is the shape the refusal asks for,
+	// so it must keep its early start: a halt on the text anywhere would cost every corrected retry.
+	it("still starts an item that carries its own isolated while isolation is enabled", async () => {
+		const authorize = vi.spyOn(sink, "authorizeLaunch");
+		const { session } = await openSession({ "task.isolation.enabled": true });
+		const call = {
+			context: "ctx",
+			tasks: [
+				{ name: "Alpha", agent: "task", task: "Do A.", isolated: false },
+				{ name: "Beta", agent: "task", task: "Do B." },
+			],
+		};
+		const raw = JSON.stringify(call);
+		session.update(toolCall, raw.slice(0, raw.indexOf('{"name":"Beta"') + 10));
+		// The run reaching the executor is the contract: the item started while Beta still streamed.
+		// Waiting for it also leaves nothing in flight; a bare queue barrier can return before the
+		// run starts, and the run then reaches a later test file's `runSubprocess` spy.
+		await spawn("Alpha").started.promise;
+		expect(authorize).toHaveBeenCalledTimes(1);
+		session.discard("test over");
+		await spawn("Alpha").aborted.promise;
+	});
+
+	// The halt can land while a launch waits for authorization, so the wait is re-checked after it.
+	it("does not start a launch whose authorization returns after the call halted", async () => {
+		const asked = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(sink, "authorizeLaunch").mockImplementation(async () => {
+			asked.resolve();
+			await release.promise;
+			return { allowed: true };
+		});
+		const { toolSession, session } = await openSession();
+		const call = { context: "ctx", tasks: args.tasks, isolated: true };
+		const raw = JSON.stringify(call);
+		session.update(toolCall, raw.slice(0, raw.indexOf(',"isolated"')));
+		await asked.promise;
+		// The key arrives while the first launch is still waiting for its answer.
+		session.update(toolCall, raw);
+		release.resolve();
+		// `adopt` awaits the launch queue, so the answered launch has run to its end by now. Starting
+		// one allocates its agent id, which is the step that puts an output manager on the session.
+		await session.adopt([]);
+		expect(toolSession.agentOutputManager).toBeUndefined();
+		expect([...startedIds]).toEqual([]);
 	});
 });
 

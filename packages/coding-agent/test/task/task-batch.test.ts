@@ -301,6 +301,73 @@ describe("task.batch validation", () => {
 		expect(run).not.toHaveBeenCalled();
 	});
 
+	// Lenient validation keeps unknown root keys, so a top-level `isolated` reaches dispatch. The
+	// speculative launcher plans items without it; inheriting it re-ran its children isolated.
+	it("refuses a top-level isolated on a batch call before spawning any agent", async () => {
+		mockDiscovery();
+		const run = vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("Unexpected"));
+		const tool = await TaskTool.create(
+			createSession({ settings: { "task.batch": true, "async.enabled": false, "task.isolation.enabled": true } }),
+		);
+		const args = validateAgentToolArguments(tool as unknown as AgentTool, {
+			type: "toolCall",
+			id: "batch-isolated",
+			name: tool.name,
+			arguments: { context: "ctx", isolated: true, tasks: [{ agent: "task", task: "Do A.", solutionSpace: "c" }] },
+		});
+		const result = await tool.execute("batch-isolated", args as TaskParams);
+		expect(getFirstText(result)).toContain("Top-level `isolated` is not part of the batch shape");
+		expect(result.isError).toBe(true);
+		expect(run).not.toHaveBeenCalled();
+	});
+
+	// A call that fails the wire schema reaches execute() raw, so nothing coerced `name` or `agent`;
+	// trimming one threw a TypeError out of the tool. The batch row's sibling lacks `solutionSpace`,
+	// which fails the schema; the flat row is an internal caller that bypasses it.
+	it.each([
+		{ field: "name", batch: true },
+		{ field: "agent", batch: false },
+	])("reports a non-string $field as an invalid field instead of throwing", async ({ field, batch }) => {
+		mockDiscovery();
+		const run = vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(makeResult("Unexpected"));
+		const tool = await TaskTool.create(createSession({ settings: { "task.batch": batch, "async.enabled": false } }));
+		const item = { agent: "task", task: "Do A.", solutionSpace: "c", [field]: 7 };
+		const args = batch
+			? validateAgentToolArguments(tool as unknown as AgentTool, {
+					type: "toolCall",
+					id: "non-string-field",
+					name: tool.name,
+					arguments: { context: "ctx", tasks: [item, { agent: "task", task: "Do B.", name: "Sibling" }] },
+				})
+			: item;
+		const result = await tool.execute("non-string-field", args as TaskParams);
+		expect(getFirstText(result)).toContain(`has an invalid \`${field}\` value 7`);
+		expect(result.isError).toBe(true);
+		expect(run).not.toHaveBeenCalled();
+	});
+
+	// The other branch of that check, and the behaviour at `main`: `null` names nothing, so the item
+	// takes the generated name and the session's default agent. Refusing it would refuse calls that
+	// run today.
+	it.each([
+		{ field: "name", value: null },
+		{ field: "agent", value: null },
+	])("dispatches a batch item whose $field is null", async ({ field, value }) => {
+		mockDiscovery();
+		const run = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true, "async.enabled": false } }));
+		const result = await tool.execute("null-field", {
+			context: "ctx",
+			tasks: [{ agent: "task", task: "Do A.", solutionSpace: "c", [field]: value }],
+		} as never);
+		expect(getFirstText(result)).not.toContain("invalid");
+		expect(result.isError).not.toBe(true);
+		expect(run).toHaveBeenCalledTimes(1);
+		expect(run.mock.calls[0]?.[0].agent.name).toBe("task");
+	});
+
 	it("rejects empty task arrays and items without tasks", async () => {
 		const empty = await executeText({ tasks: [] }, { "task.batch": true });
 		expect(empty).toContain("Missing `tasks`");
@@ -473,6 +540,51 @@ describe("task.batch validation", () => {
 			{ model: ["default/route"], grants: undefined },
 			{ model: ["default/route"], grants: undefined },
 		]);
+	});
+
+	// A model that fills every declared field sends `outputSchema: ""` for "no schema". It parses as
+	// no JSON, so preflight refused the whole call; the agent's own schema applies instead.
+	it.each([
+		{ batch: true, outputSchema: "" },
+		{ batch: false, outputSchema: "  " },
+	])("treats a blank outputSchema as omitted (batch: $batch)", async ({ batch, outputSchema }) => {
+		const agentSchema = { type: "object", properties: { verdict: { type: "string" } } };
+		mockDiscovery({ ...taskAgent, output: agentSchema });
+		const run = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+		const tool = await TaskTool.create(
+			createSession({ settings: { "async.enabled": false, "task.batch": batch, "task.structured": true } }),
+		);
+		const item = { agent: "task", task: "Do A.", solutionSpace: "bounded", outputSchema };
+		const args = validateAgentToolArguments(tool as unknown as AgentTool, {
+			type: "toolCall",
+			id: "blank-output-schema",
+			name: tool.name,
+			arguments: batch ? { context: "ctx", tasks: [item] } : item,
+		});
+		const result = await tool.execute("blank-output-schema", args as TaskParams);
+		expect(getFirstText(result)).not.toContain("Invalid caller output schema");
+		expect(result.isError).not.toBe(true);
+		expect(run).toHaveBeenCalledTimes(1);
+		expect(run.mock.calls[0]?.[0]).toMatchObject({ outputSchemaSource: "agent", outputSchema: agentSchema });
+	});
+
+	// Only a blank string is a placeholder: an explicit `null` still overrides the agent's schema.
+	it("keeps an explicit null outputSchema as the caller's override", async () => {
+		mockDiscovery({ ...taskAgent, output: { type: "object" } });
+		const run = vi
+			.spyOn(executorModule, "runSubprocess")
+			.mockImplementation(async options => makeResult(options.id ?? "?"));
+		const tool = await TaskTool.create(
+			createSession({ settings: { "async.enabled": false, "task.batch": true, "task.structured": true } }),
+		);
+		const result = await tool.execute("null-output-schema", {
+			context: "ctx",
+			tasks: [{ agent: "task", task: "Do A.", solutionSpace: "bounded", outputSchema: null }],
+		});
+		expect(result.isError).not.toBe(true);
+		expect(run.mock.calls[0]?.[0]).toMatchObject({ outputSchemaSource: "caller", outputSchema: null });
 	});
 
 	// The agent loop validates arguments against the wire schema before execute(),

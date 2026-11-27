@@ -226,6 +226,11 @@ function validateShapeParams(batchEnabled: boolean, params: TaskParams): string 
 	if (batchEnabled && params.tasks !== undefined && params.model !== undefined) {
 		return "Top-level `model` is not part of the batch shape. Set `tasks[].model` instead.";
 	}
+	// Inheriting it would split the speculative launcher, which plans each streamed item from
+	// `{ context, tasks }` alone, from dispatch: the children started unisolated and ran again.
+	if (batchEnabled && params.tasks !== undefined && params.isolated !== undefined) {
+		return "Top-level `isolated` is not part of the batch shape. Set `tasks[].isolated` instead.";
+	}
 	if (!batchEnabled) {
 		const disallowed = (["tasks", "context"] as const).filter(field => params[field] !== undefined);
 		if (disallowed.length > 0) {
@@ -250,6 +255,21 @@ function validateShapeParams(batchEnabled: boolean, params: TaskParams): string 
 function validateEffort(effort: TaskEffort | undefined, label: string): string | undefined {
 	if (effort === undefined || TASK_EFFORTS.includes(effort)) return undefined;
 	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
+}
+
+/**
+ * Reject a non-string `name` or `agent` before anything trims it. A call that fails the wire
+ * schema reaches dispatch raw (`lenientArgValidation`), so nothing coerced these fields, and
+ * trimming a number threw a `TypeError` out of the tool instead of naming the field.
+ */
+function validateNameAndAgent(item: TaskItem | undefined, label: string): string | undefined {
+	for (const field of ["name", "agent"] as const) {
+		const value: unknown = item?.[field];
+		if (value !== undefined && value !== null && typeof value !== "string") {
+			return `${label} has an invalid \`${field}\` value ${truncateForPrompt(JSON.stringify(value))}. Use a string.`;
+		}
+	}
+	return undefined;
 }
 
 /**
@@ -301,7 +321,9 @@ function validateSpawnParams(
 		}
 		for (let i = 0; i < tasks.length; i++) {
 			const item = tasks[i];
-			const label = `Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""}`;
+			const label = `Task ${i + 1}${typeof item?.name === "string" && item.name ? ` (\`${item.name}\`)` : ""}`;
+			const fieldError = validateNameAndAgent(item, label);
+			if (fieldError) return fieldError;
 			const inputError = validateTaskInput(item, label, stepsEnabled);
 			if (inputError) return inputError;
 			const effortError = validateEffort(item.effort, label);
@@ -329,6 +351,7 @@ function validateSpawnParams(
 		return "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context`.";
 	}
 	return (
+		validateNameAndAgent(params, "The call") ??
 		validateTaskInput(params, "The call", stepsEnabled) ??
 		validateEffort(params.effort, "The call") ??
 		validateModel(params, "The call", settings)
@@ -408,29 +431,42 @@ function isEmptyModelPlaceholder(model: unknown): boolean {
 }
 
 /**
- * Drop empty `model` placeholders from the call and its batch items so they
- * route like an omitted model. Copy-on-write: the submitted arguments are
- * never mutated, and the same reference is returned when nothing changed.
+ * `item` without a placeholder `model` or `outputSchema`; the same reference when it has neither.
+ * A blank-string `outputSchema` is what a model that fills every declared field sends for "no
+ * schema"; it parses as no JSON, so keeping it refused the whole call at preflight. `null` is not
+ * a placeholder: an explicit `null` still overrides the agent's own schema.
  */
-function normalizeTaskModelPlaceholders(params: TaskParams): TaskParams {
+function withoutPlaceholders<T extends TaskItem | TaskParams>(item: T): T {
+	const dropModel = isEmptyModelPlaceholder(item.model);
+	const outputSchema: unknown = item.outputSchema;
+	const dropOutputSchema = typeof outputSchema === "string" && outputSchema.trim() === "";
+	if (!dropModel && !dropOutputSchema) return item;
+	const copy = { ...item };
+	if (dropModel) delete copy.model;
+	if (dropOutputSchema) delete copy.outputSchema;
+	return copy;
+}
+
+/**
+ * Drop empty `model` and `outputSchema` placeholders from the call and its batch
+ * items so they route like omitted fields. Copy-on-write: the submitted arguments
+ * are never mutated, and the same reference is returned when nothing changed.
+ */
+function normalizeTaskPlaceholders(params: TaskParams): TaskParams {
 	const originalTasks = params.tasks;
 	let normalizedTasks: TaskItem[] | undefined;
 	if (Array.isArray(originalTasks)) {
 		for (let i = 0; i < originalTasks.length; i++) {
 			const item = originalTasks[i];
-			if (!isRecord(item) || !isEmptyModelPlaceholder(item.model)) continue;
+			const normalized = isRecord(item) ? withoutPlaceholders(item) : item;
+			if (normalized === item) continue;
 			normalizedTasks ??= originalTasks.slice();
-			const copy = { ...item };
-			delete copy.model;
-			normalizedTasks[i] = copy;
+			normalizedTasks[i] = normalized;
 		}
 	}
-	const emptyRootModel = isEmptyModelPlaceholder(params.model);
-	if (!emptyRootModel && !normalizedTasks) return params;
-	const copy = { ...params };
-	if (emptyRootModel) delete copy.model;
-	if (normalizedTasks) copy.tasks = normalizedTasks;
-	return copy;
+	const root = withoutPlaceholders(params);
+	if (root === params && !normalizedTasks) return params;
+	return normalizedTasks ? { ...root, tasks: normalizedTasks } : root;
 }
 
 /**
@@ -445,7 +481,7 @@ function planSpawns(
 	defaultAgent: string,
 	settings: Settings,
 ): SpawnPlan | string {
-	const params = normalizeTaskModelPlaceholders(repairTaskParams(rawParams as TaskParams));
+	const params = normalizeTaskPlaceholders(repairTaskParams(rawParams as TaskParams));
 	const error =
 		validateShapeParams(batchEnabled, params) ?? validateSpawnParams(params, batchEnabled, stepsEnabled, settings);
 	if (error) return error;
@@ -682,7 +718,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (typeof params.name === "string" && params.name.trim()) {
 			lines.push(`Name: ${truncateForPrompt(params.name)}`);
 		}
-		if (typeof params.model === "string") {
+		// A blank model is dropped before dispatch, so the prompt names no model for it.
+		if (typeof params.model === "string" && params.model.trim()) {
 			lines.push(`Model: ${truncateForPrompt(params.model)}`);
 		}
 		if (typeof params.task === "string") {
@@ -722,7 +759,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				if (isRecord(firstTask)) lines.push(...formatApprovalSteps(firstTask.steps));
 			}
 			for (const [index, item] of tasks.entries()) {
-				if (isRecord(item) && typeof item.model === "string") {
+				if (isRecord(item) && typeof item.model === "string" && item.model.trim()) {
 					lines.push(`Task ${index + 1} model: ${truncateForPrompt(item.model)}`);
 				}
 			}
@@ -792,6 +829,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					sink: context.coordinator,
 					tool: this,
 					launcher: this.#launcher,
+					isolationEnabled:
+						this.session.getPlanModeState?.()?.enabled !== true &&
+						cfgTaskIsolationEnabled.get(this.session.settings),
 					onClose: () => {
 						if (this.#launchSessions.get(id) === session) this.#launchSessions.delete(id);
 					},

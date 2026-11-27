@@ -48,6 +48,7 @@ export class BatchArgsScanner {
 	#items: Record<string, unknown>[] = [];
 	#itemsOpened = 0;
 	#malformed = false;
+	#keys = new Set<string>();
 
 	/** Shared `context`, once its string has closed. */
 	get context(): string | undefined {
@@ -62,6 +63,11 @@ export class BatchArgsScanner {
 	/** `tasks[]` elements whose `{` has streamed, closed or not: the batch's spawn count so far. */
 	get itemsOpened(): number {
 		return this.#itemsOpened;
+	}
+
+	/** Top-level keys whose name has closed, in any position. */
+	get keys(): ReadonlySet<string> {
+		return this.#keys;
 	}
 
 	/** Input left the batch shape (non-object items, non-array `tasks`, unparsable item). */
@@ -158,8 +164,12 @@ export class BatchArgsScanner {
 			this.#malformed = true;
 			return;
 		}
-		if (this.#expectKey) this.#key = typeof value === "string" ? value : undefined;
-		else if (this.#key === "context" && typeof value === "string") this.#context = value;
+		if (this.#expectKey) {
+			this.#key = typeof value === "string" ? value : undefined;
+			if (this.#key !== undefined) this.#keys.add(this.#key);
+		} else if (this.#key === "context" && typeof value === "string") {
+			this.#context = value;
+		}
 	}
 
 	#closeItem(literal: string): void {
@@ -184,6 +194,7 @@ export class BatchArgsScanner {
 		this.#items = [];
 		this.#itemsOpened = 0;
 		this.#malformed = false;
+		this.#keys = new Set();
 	}
 }
 
@@ -199,6 +210,16 @@ export interface TaskLaunchSessionOptions {
 	sink: SpeculativeOperationSink;
 	tool: SpeculativeToolReference;
 	launcher: TaskLauncher;
+	/**
+	 * Whether this session could isolate a child (`task.isolation.enabled`, outside plan mode).
+	 *
+	 * While it can, only an item that carries its own `isolated` starts early. An item that leaves
+	 * the field out is isolated or not by what the finished call says, and the launcher cannot read
+	 * a top-level `isolated` that has not streamed yet: it rebuilds each prefix as
+	 * `{ context, tasks }`. Starting such an item early writes in the user's checkout for a call
+	 * that may be asking for isolation, so it waits for dispatch instead.
+	 */
+	isolationEnabled: boolean;
 	/** Called once when the session stops owning launches (adopted or discarded). */
 	onClose: () => void;
 }
@@ -214,7 +235,7 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 	readonly #runs = new Map<number, SpawnRun>();
 	readonly #controller = new AbortController();
 	#queue: Promise<void> = Promise.resolve();
-	/** Launching stopped for good: authorization, preflight, or start refused an item. */
+	/** Launching stopped for good: authorization, preflight, or start refused an item, or the call carries a top-level `isolated`. */
 	#halted = false;
 	#closed = false;
 
@@ -226,12 +247,21 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 		if (this.#closed || this.#halted || partialJson === undefined) return;
 		const scanner = this.#scanner;
 		scanner.feed(partialJson);
+		// The rebuilt `{ context, tasks }` prefix below cannot carry a top-level `isolated`, which
+		// dispatch refuses on a batch call: planning without it would start children unisolated.
+		if (scanner.keys.has("isolated")) {
+			this.#halted = true;
+			return;
+		}
 		// Items are launchable only once `context` closed before them: every
 		// spawn carries it, and a later `context` would change launched params.
 		const context = scanner.context;
 		if (scanner.malformed || context === undefined) return;
 		const items = scanner.items;
-		for (let index = this.#planned.size; index < items.length; index++) {
+		for (let index = 0; index < items.length; index++) {
+			if (this.#planned.has(index)) continue;
+			// See `isolationEnabled`: an item that names no `isolated` of its own waits for dispatch.
+			if (this.#options.isolationEnabled && items[index]?.isolated === undefined) continue;
 			const batch = { context, tasks: items.slice(0, index + 1) };
 			const spawn = this.#options.launcher.spawns(batch)?.[index];
 			if (!spawn) {
@@ -255,7 +285,10 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 			return;
 		}
 		if (this.#halted) return;
-		for (let index = this.#planned.size; index < spawns.length; index++) {
+		// Every item the stream did not launch, which with `isolationEnabled` is every item that
+		// carried no `isolated` of its own.
+		for (let index = 0; index < spawns.length; index++) {
+			if (this.#planned.has(index)) continue;
 			this.#schedule(context.toolCall, context.args, spawns[index], index);
 		}
 	}
@@ -324,7 +357,8 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 		if (this.#closed || this.#halted) return;
 		const { sink, tool, launcher } = this.#options;
 		const authorization = (await sink.authorizeLaunch?.({ tool, toolCall, args })) ?? { allowed: false };
-		if (this.#closed) return;
+		// The wait is where a later chunk arrives: `update` may have halted the session since.
+		if (this.#closed || this.#halted) return;
 		if (!authorization.allowed) {
 			this.#halted = true;
 			return;
