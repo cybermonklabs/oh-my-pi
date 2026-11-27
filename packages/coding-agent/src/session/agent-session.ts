@@ -3217,16 +3217,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// A request waits for a model switch in progress, so the first request on the new model carries its prompt.
 		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#tools.settleModelSwitch()));
 		// A held settings rebuild, and a kept restored transcript prompt, give way to this process's live build at the
-		// first request after a compaction, which rewrites everything after the system prompt and tools anyway, after
-		// the prompt cache entry lapses, or five minutes after the change they withhold, whichever comes first
-		// ({@link #releaseWithheldPromptChangesIfDue}).
-		this.addDisposer(
-			this.subscribe(event => {
-				if (event.type !== "auto_compaction_end" && event.type !== "manual_compaction_end") return;
-				if (event.aborted || !event.result || !this.#tools.withholdsPromptChange) return;
-				this.#tools.notePromptRewritten();
-			}),
-		);
+		// first request after the prompt cache entry lapses or can no longer be read, or five minutes after the change
+		// they withhold, whichever comes first ({@link #releaseWithheldPromptChangesIfDue}). The lapse check carries
+		// the release at a compaction: the `compaction` entry it writes leaves the entry unreadable.
 		this.addDisposer(
 			this.agent.addBeforeModelCallHook(() => {
 				if (this.#promptSentWithheldChanges) {
@@ -5992,9 +5985,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/**
 	 * Sends what the prompt withholds to keep the cached prefix once it is due, so the request carries the rebuilt
 	 * prompt: a kept restored transcript prompt ({@link SessionTools.replaceRestoredPromptIfDue}) and a held settings
-	 * rebuild ({@link SessionTools.absorbHeldSettingsRebuild}), each at the first request after a compaction, which
-	 * rewrites every message, after the prompt cache entry it reads has lapsed, or five minutes after the change it
-	 * withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before a
+	 * rebuild ({@link SessionTools.absorbHeldSettingsRebuild}), each at the first request after the prompt cache entry
+	 * it reads has lapsed or can no longer be read (a compaction's `compaction` entry leaves it unreadable), or five
+	 * minutes after the change it withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before a
 	 * user prompt takes its hidden notices, and before every main request; the first of the run that prompt starts
 	 * carries those notices, so it calls this only when the entry lapsed since they were written (the request writes
 	 * the whole prompt anyway), and what came due by its time goes out at the run's next request.

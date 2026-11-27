@@ -331,7 +331,7 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 		expect(textOf(fourth.messages.slice(third.messages.length))).not.toContain("`personality`");
 	}, 30_000);
 
-	it("keeps the held prompt across an admitted cut that keeps earlier messages, and sends it rebuilt after a compaction", async () => {
+	it("keeps the held prompt across a shake that keeps earlier messages, and sends it rebuilt after a compaction", async () => {
 		// A forced auto-shake elides old read results and keeps the messages before them cached: the prompt stays held.
 		// (A prefix-bound model prunes nothing inside a warm prefix, so the shake is the partial cut a session can make.)
 		const shakeDir = createTempDir();
@@ -392,5 +392,34 @@ describe("prompt rebuilds a configuration reload starts on a prefix-bound model"
 		expect(compacted.session.sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
 		expect(withoutCacheControl(compactSecond.system)).toBe(withoutCacheControl(compactFirst.system));
 		expect(withoutCacheControl(afterCompaction.system)).not.toBe(withoutCacheControl(compactFirst.system));
+	}, 60_000);
+
+	// A compaction that ends skipped rewrites nothing, so the hold stands: releasing it would rewrite the prompt for nothing.
+	it("keeps the held prompt across a compaction that ends skipped", async () => {
+		const skipDir = createTempDir();
+		const soft = "compaction:\n  methodOrder: [soft]\n  asyncEnabled: false\n  keepRecentTokens: 1\n";
+		const skipped = await startSession(skipDir, {
+			toolNames: ["read"],
+			overlay: soft,
+			contextWindow: 100_000,
+			// The second request fills the window past its reserve.
+			replies: { 2: turn => textAnswer(turn, 90_000) },
+		});
+		// No model to summarize with: the compaction starts, then ends skipped.
+		vi.spyOn(skipped.modelRegistry, "getAvailable").mockReturnValue([]);
+		const ends: Array<{ skipped?: boolean; result?: unknown }> = [];
+		skipped.session.subscribe(event => {
+			if (event.type === "auto_compaction_end") ends.push({ skipped: event.skipped, result: event.result });
+		});
+		await skipped.session.prompt("first");
+		await reloadOverlay(skipped, `${OVERLAY}${soft}personality: pragmatic\n`);
+		await skipped.session.prompt("second");
+		await skipped.session.prompt("third");
+		const [first, second, third] = skipped.requests;
+		if (!first || !second || !third) throw new Error("Expected three requests");
+		expect(ends.some(end => end.skipped === true && end.result === undefined)).toBe(true);
+		expect(skipped.session.sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(false);
+		expect(withoutCacheControl(second.system)).toBe(withoutCacheControl(first.system));
+		expect(withoutCacheControl(third.system)).toBe(withoutCacheControl(first.system));
 	}, 60_000);
 });

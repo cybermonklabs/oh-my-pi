@@ -2,10 +2,6 @@
 
 ## [Unreleased]
 
-### Added
-
-- `SessionManager.create()` takes the `{ suppressBreadcrumb }` option `SessionManager.open()` takes, for a session that writes no terminal breadcrumb
-
 ### Fixed
 
 - A session resumed within the cached prompt's lifetime after `models.yml` points its model at another server, which keeps a prompt cache of its own, no longer restores the transcript's stored system prompt (so a context file edited since reaches the model) or shows the cached prompt warm: each main reply records the model its request went out as, endpoint included (`promptCacheModelKey`), and a resumed process compares it with its own; a reply an earlier release wrote compares by model and API as before
