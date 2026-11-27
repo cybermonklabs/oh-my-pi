@@ -44,6 +44,9 @@ run() { # <log> <libtest args...>: $bin as this shard's user, in the tests' envi
 	fi
 }
 threads=(--test-threads=4)
+# INFRA-5336 measurement: a marker in the process accounting file before and after each binary
+# run (.github/sami/signal-deaths.py), so its records split by binary; nothing when SD_DIR is unset.
+sd() { [ -n "${SD_DIR:-}" ] && python3 "$GITHUB_WORKSPACE/tool/.github/sami/signal-deaths.py" mark "$SD_DIR" "$1"; }
 n=0
 while IFS=$'\t' read -r ident bin; do
 	n=$((n + 1))
@@ -54,8 +57,11 @@ while IFS=$'\t' read -r ident bin; do
 		continue
 	fi
 	s=$(date +%s.%N)
+	[ -n "${SD_DIR:-}" ] && printf '%s\t%s\t%s\n' "b${n}" "$who" "$ident" >> "$SD_DIR/bins.tsv"
+	sd "b${n}s"
 	run "$log" "${threads[@]}"
 	rc=$?
+	sd "b${n}e"
 	secs=$(python3 -c "import time; print(f'{time.time() - $s:.1f}')")
 	python3 "$tool/sc.py" libtest "$log" "$rc" "$secs" "set-$who" "$ident" "$who" > "$SC/res/$safe.json"
 	echo "BIN $ident $who exit=$rc ${secs}s $(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["status"], "passed", r["passed"], "failed", r["failed"], r["note"])' "$SC/res/$safe.json")"
@@ -63,7 +69,9 @@ while IFS=$'\t' read -r ident bin; do
 	for try in 1 2; do
 		[ "${#flaky[@]}" -gt 0 ] || break
 		rlog=$SC/res/logs/$safe.retry$try.log
+		sd "b${n}r${try}s"
 		run "$rlog" "${threads[@]}"
+		sd "b${n}r${try}e"
 		left=()
 		for t in "${flaky[@]}"; do
 			got=$(python3 "$tool/sc.py" retried "$SC/res/$safe.json" "$t" "$rlog" "the binary again, ${threads[*]}, as $who")

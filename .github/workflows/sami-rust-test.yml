@@ -177,6 +177,11 @@ jobs:
           cp -R ../tool/.github/sami .github/sami
           echo "the tree's .github/sami against the gate's ($(git -C ../tool rev-parse HEAD)):"
           git status --short -- .github/sami
+      # INFRA-5336 measurement, not a check: process accounting of every process that ends from
+      # here to the report, the runner's core-dump setup, and the cells (.github/sami/signal-deaths.py).
+      - name: Signal deaths, start
+        continue-on-error: true
+        run: SD_CALLER_CORE_LIMIT="$(ulimit -c)/$(ulimit -Hc)" sudo -E python3 ../tool/.github/sami/signal-deaths.py start "$RUNNER_TEMP/sd"
       # The omp-rpc smoke tests' server loads packages/natives/native's
       # pi_natives.linux-x64-modern.node: the one sami-checks.yml's natives job
       # built from this commit in this run, a cargo build for its host
@@ -609,6 +614,9 @@ jobs:
             exit 1
           fi
           ls -l packages/natives/native
+      - name: Signal deaths, the test step starts
+        continue-on-error: true
+        run: python3 ../tool/.github/sami/signal-deaths.py mark "$RUNNER_TEMP/sd" tests-s
       - name: Rust tests against the known-failure list
         shell: bash
         env:
@@ -631,6 +639,10 @@ jobs:
             PI_TEST_REAL_BASH="$HOME/bash-ref/bin/bash" \
             PI_AST_REPO_CORPUS="$GITHUB_WORKSPACE/tree" \
             bash .github/sami/rust-test.sh
+      - name: Signal deaths, the test step ended
+        if: ${{ always() }}
+        continue-on-error: true
+        run: python3 ../tool/.github/sami/signal-deaths.py mark "$RUNNER_TEMP/sd" tests-e
       # cargo's --timings report of each cargo test the step ran (the omp-rpc
       # workspace's targets, the cargo doctests and the #[ignore]d smoke
       # tests), each named by its log's number and its label; the step's
@@ -676,6 +688,18 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         run: bash .github/sami/rust-test-parity.sh
+      - name: Signal deaths, report
+        if: ${{ always() }}
+        continue-on-error: true
+        run: sudo -E python3 ../tool/.github/sami/signal-deaths.py report "$RUNNER_TEMP/sd"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() }}
+        with:
+          name: sd-rust-test-linux${{ inputs.control && '-cold' || '' }}
+          path: |
+            ${{ runner.temp }}/sd/
+            !${{ runner.temp }}/sd/bin/
+          retention-days: 14
 
   rust_test_macos:
     # The tests only macOS can run: those compiled only on macOS (in a macOS

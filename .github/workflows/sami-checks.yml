@@ -274,6 +274,21 @@ jobs:
             .github/sami-checks
             .github/sami
             .github/workflows
+      # INFRA-5336 measurement, not a check: the time of one crash under each way of sending a dump
+      # nowhere, each checked to have taken, and the control (.github/sami/signal-deaths.py).
+      - name: Signal deaths, the cells
+        continue-on-error: true
+        run: |
+          SD_CALLER_CORE_LIMIT="$(ulimit -c)/$(ulimit -Hc)" sudo -E python3 tool/.github/sami/signal-deaths.py start "$RUNNER_TEMP/sd"
+          sudo -E python3 tool/.github/sami/signal-deaths.py report "$RUNNER_TEMP/sd"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() }}
+        with:
+          name: sd-plan
+          path: |
+            ${{ runner.temp }}/sd/
+            !${{ runner.temp }}/sd/bin/
+          retention-days: 14
       - name: Controls of the counters, the plan and the summary (hand-made inputs)
         run: python3 tool/.github/sami-checks/sc.py selftest
       # The release this candidate carries: the newest `sami release CutN` commit in its history
@@ -510,12 +525,31 @@ jobs:
         with:
           name: sc-archive
           path: ${{ github.workspace }}/sc/archive
+      # INFRA-5336 measurement, not a check: process accounting of every process that ends from
+      # here to the report, the runner's core-dump setup, and the cells (.github/sami/signal-deaths.py).
+      - name: Signal deaths, start
+        continue-on-error: true
+        run: SD_CALLER_CORE_LIMIT="$(ulimit -c)/$(ulimit -Hc)" sudo -E python3 tool/.github/sami/signal-deaths.py start "$RUNNER_TEMP/sd"
       - name: Host
         run: bash tool/.github/sami-checks/host.sh "$SC/tools/sc-tools.tgz"
       - name: Unpack the archive where it was built
         run: tar --zstd -xf "$SC/archive/tests.tar.zst" -C "$GITHUB_WORKSPACE" && du -sh "$CARGO_TARGET_DIR"
       - name: Tests
+        env:
+          SD_DIR: ${{ runner.temp }}/sd
         run: bash tool/.github/sami-checks/set.sh "${{ matrix.who }}" "${{ matrix.shard }}"
+      - name: Signal deaths, report
+        if: ${{ always() }}
+        continue-on-error: true
+        run: sudo -E python3 tool/.github/sami/signal-deaths.py report "$RUNNER_TEMP/sd"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() }}
+        with:
+          name: sd-${{ matrix.name }}
+          path: |
+            ${{ runner.temp }}/sd/
+            !${{ runner.temp }}/sd/bin/
+          retention-days: 14
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ always() && needs.plan.outputs.silent != matrix.name }}
         with:
