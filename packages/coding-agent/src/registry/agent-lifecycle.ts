@@ -70,6 +70,12 @@ export interface LiveAgentTarget {
 export interface AgentReviveState<S = unknown> {
 	// Method syntax: an `AgentReviveState<Inputs>` stands where an `AgentReviveState<unknown>` is expected.
 	reviver(expected: AgentRef, state: S): Promise<AgentSessionHandle>;
+	/**
+	 * Called once with `state` when the adoption stops holding it (released, replaced by a re-adopt, removed from
+	 * the registry, forgotten, or refused), so whoever keeps what `state` names can let go of it. Module-level, as
+	 * `reviver` is.
+	 */
+	dropped?(state: S): void;
 	readonly state: S;
 }
 
@@ -150,12 +156,6 @@ export interface AdoptOptions {
 	revive?: AdoptedReviver;
 	/** Releases resources that must survive parking but end with the agent lifecycle. */
 	onRelease?: () => Promise<void>;
-	/**
-	 * Called once when this adoption stops holding `revive` — released, replaced by
-	 * a re-adopt, removed from the registry, or its reviver forgotten — so whoever
-	 * tracks the reviver can let go of it.
-	 */
-	onReviverDropped?: () => void;
 }
 
 interface AdoptedAgent {
@@ -168,8 +168,9 @@ interface AdoptedAgent {
 	 */
 	reviver?: HeldReviver;
 	reviveState?: unknown;
+	/** A plain-data reviver's {@link AgentReviveState.dropped}, until it is called with {@link reviveState}. */
+	reviveDropped?: (state: unknown) => void;
 	onRelease?: () => Promise<void>;
-	onReviverDropped?: () => void;
 	timer?: NodeJS.Timeout;
 }
 
@@ -196,25 +197,36 @@ function holdsReviver(adopted: AdoptedAgent, reviver: HeldReviver, state: unknow
 	return adopted.reviver === reviver && adopted.reviveState === state;
 }
 
+/** Call a plain-data reviver's {@link AgentReviveState.dropped} hook with its state. */
+function runReviveDropped(dropped: ((state: unknown) => void) | undefined, state: unknown): void {
+	if (!dropped) return;
+	try {
+		dropped(state);
+	} catch (error) {
+		logger.warn("AgentLifecycleManager: a reviver's dropped hook failed", { error: String(error) });
+	}
+}
+
+/** Tell the plain-data reviver of an adoption that was refused that nothing holds its state. */
+function dropRefusedReviver(revive: AdoptedReviver | undefined): void {
+	if (revive !== undefined && typeof revive !== "function") runReviveDropped(revive.dropped, revive.state);
+}
+
 /** Fire (at most once) the adoption's reviver-dropped hook. */
 function dropReviver(adopted: AdoptedAgent | undefined): void {
-	const hook = adopted?.onReviverDropped;
-	if (!adopted || !hook) return;
-	adopted.onReviverDropped = undefined;
-	try {
-		hook();
-	} catch (error) {
-		logger.warn("AgentLifecycleManager: onReviverDropped hook failed", { error: String(error) });
-	}
+	if (!adopted) return;
+	const dropped = adopted.reviveDropped;
+	adopted.reviveDropped = undefined;
+	runReviveDropped(dropped, adopted.reviveState);
 }
 
 /** Make `adopted` let go of its reviver, keeping the adoption: its next revive is cold. */
 function forgetAdoptedReviver(adopted: AdoptedAgent): void {
 	clearTimeout(adopted.timer);
 	adopted.timer = undefined;
+	dropReviver(adopted);
 	adopted.reviver = undefined;
 	adopted.reviveState = undefined;
-	dropReviver(adopted);
 }
 
 interface ParkInFlight {
@@ -414,17 +426,17 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 	 */
 	adopt(id: string, opts: AdoptOptions, expected?: AgentRefExpectation): void {
 		if (id === MAIN_AGENT_ID) {
-			opts.onReviverDropped?.();
+			dropRefusedReviver(opts.revive);
 			return;
 		}
 		const ref = this.#registry.get(id);
 		if (!ref || (expected !== undefined && ref !== expected && ref.session !== expected)) {
 			logger.warn("AgentLifecycleManager.adopt: unknown or replaced agent id", { id });
-			opts.onReviverDropped?.();
+			dropRefusedReviver(opts.revive);
 			return;
 		}
 		if (this.#releasing.has(ref)) {
-			opts.onReviverDropped?.();
+			dropRefusedReviver(opts.revive);
 			if (opts.onRelease) trackLateCleanup(opts.onRelease(), { id, resource: "adopted-agent" });
 			return;
 		}
@@ -436,8 +448,8 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			idleTtlMs: opts.idleTtlMs,
 			reviver: revive === undefined ? undefined : heldReviver(revive),
 			reviveState: revive === undefined ? undefined : heldReviveState(revive),
+			reviveDropped: revive === undefined || typeof revive === "function" ? undefined : revive.dropped,
 			onRelease: opts.onRelease,
-			onReviverDropped: opts.onReviverDropped,
 		};
 		dropReviver(existing);
 		this.#adopted.set(id, adopted);
@@ -456,6 +468,17 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 		if (!adopted || !holdsReviver(adopted, heldReviver(revive), heldReviveState(revive))) return false;
 		forgetAdoptedReviver(adopted);
 		return true;
+	}
+
+	/**
+	 * {@link forgetReviver} for every adoption held by the plain-data `reviver` whose state `matches`: the warm
+	 * revivers of a host thread that died, all at once. Main-thread bridging only.
+	 */
+	forgetRevivers<S>(reviver: AgentReviveState<S>["reviver"], matches: (state: S) => boolean): void {
+		for (const adopted of this.#adopted.values()) {
+			// The reviver is the state's own: an adoption holds the two together.
+			if (adopted.reviver === reviver && matches(adopted.reviveState as S)) forgetAdoptedReviver(adopted);
+		}
 	}
 
 	/** True if the id is adopted (parked or live) — and, when `expected` is given, still bound to that ref. */
@@ -910,7 +933,7 @@ export class AgentLifecycleManager implements AgentLifecycleApi {
 			// A warm reviver revives nothing when its transcript's newest revive inputs are not its last park's: there
 			// are none (written before they were recorded), or they are an earlier park's (a write that failed) or
 			// another subagent's (a seance fork's copy of its source's). Drop it as a dead worker's is dropped
-			// ({@link forgetReviver}), and revive cold from the transcript, through the caller's cold reviver when it
+			// ({@link forgetRevivers}), and revive cold from the transcript, through the caller's cold reviver when it
 			// passed one (ACP installs no global factory).
 			if (
 				error instanceof WarmReviveInputsMissingError &&

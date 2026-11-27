@@ -11,13 +11,18 @@
  *   there (main keeps one `RemoteAgentSession` per open session, strongly,
  *   and retains the worker while any is open), and the worker's peer handles
  *   read and command sessions homed elsewhere through it.
- * - on worker death: adoptions carrying that worker's revivers are dropped
- *   (the next `ensureLive` cold-revives through the persisted factory), every
- *   registry ref holding a session homed there is detached and turns `parked`
- *   (session file on disk) or `aborted`, and the mirrors close, so in-flight
- *   commands reject with an error naming the worker. The thread holds each
- *   such agent's journal until it has stopped, so the lifecycle holds a ref
- *   with a session file as a park in flight until then
+ * - keeps each adoption of a subagent the worker parked as plain data that
+ *   names the worker and the agent's entry in the worker's revive table
+ *   ({@link WorkerAdoption}). One module-level reviver revives every such
+ *   adoption through the table's functions, holding the worker while the
+ *   revive runs; the worker keeps the revive state itself.
+ * - on worker death: every adoption that names that worker drops its warm
+ *   revive (the next `ensureLive` cold-revives through the persisted factory),
+ *   every registry ref holding a session homed there is detached and turns
+ *   `parked` (session file on disk) or `aborted`, and the mirrors close, so
+ *   in-flight commands reject with an error naming the worker. The thread
+ *   holds each such agent's journal until it has stopped, so the lifecycle
+ *   holds a ref with a session file as a park in flight until then
  *   (`AgentLifecycleManager.parkUntil`), and a revive waits for it.
  *
  * Worker side: proxies installed with `installGlobal`, the bridge handed to
@@ -27,13 +32,13 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { IrcBus } from "../../irc/bus";
 import {
 	type AdoptOptions,
-	type AgentReviver,
 	AgentLifecycleManager,
-	runReviver,
+	type AgentReviveState,
 	WarmReviveInputsMissingError,
 } from "../../registry/agent-lifecycle";
-import { AgentRegistry, type RegistryListener } from "../../registry/agent-registry";
+import { type AgentRef, AgentRegistry, type RegistryListener } from "../../registry/agent-registry";
 import { PromptDroppedError, SessionBusyError } from "../../session/agent-session";
+import type { AgentSessionHandle } from "../../session/agent-session-handle";
 import type { WorkerThreadLink } from "../protocol";
 import { installPeerBridge } from "../peer-agent-session";
 import { RemoteAgentSession, SessionHostClient } from "../remote-agent-session";
@@ -59,7 +64,7 @@ import {
 	IRC_BUS_KIND,
 	type IrcBusProtocol,
 } from "./agents-protocol";
-import { RemoteAgentLifecycle, RemoteAgentRegistry, RemoteIrcBus } from "./agents-remote";
+import { type ParkedReviveEntry, RemoteAgentLifecycle, RemoteAgentRegistry, RemoteIrcBus } from "./agents-remote";
 import { trackWorkerSubscription } from "./support";
 
 /** Boot globals of {@link agentsThreadService}: main's singletons and this worker's session bridge. */
@@ -86,6 +91,38 @@ interface OpenSession {
 	readonly release: () => void;
 }
 
+/** Main's adoption of a subagent a worker parked: the worker, and the agent's entry in that worker's revive table. */
+interface WorkerAdoption extends ParkedReviveEntry {
+	readonly threadId: WorkerPeer["threadId"];
+}
+
+/** Whether a worker's adopt named an entry of its revive table (see `RemoteAgentLifecycle.adopt`). */
+function isParkedReviveEntry(value: unknown): value is ParkedReviveEntry {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		typeof Reflect.get(value, "agentId") === "string" &&
+		typeof Reflect.get(value, "token") === "number"
+	);
+}
+
+/**
+ * The reviver of every worker-homed adoption: revives the agent on the worker its adoption names. A worker that
+ * exited took the agent's revive state with it: the lifecycle then revives the agent cold.
+ */
+async function reviveOnWorker(expected: AgentRef, adoption: WorkerAdoption): Promise<AgentSessionHandle> {
+	const bridge = bridges.get(adoption.threadId);
+	if (!bridge) {
+		throw new WarmReviveInputsMissingError(`Subagent worker ${adoption.threadId} exited with ${adoption.agentId}`);
+	}
+	return bridge.revive(expected, adoption);
+}
+
+/** The dropped hook of every worker-homed adoption: the worker drops its table entry; an exited worker has none. */
+function dropOnWorker(adoption: WorkerAdoption): void {
+	bridges.get(adoption.threadId)?.dropParked(adoption);
+}
+
 /**
  * Main-side endpoint of one worker's sessions: mirrors of the sessions homed
  * there, and the peer surface for sessions homed elsewhere. Also the
@@ -95,7 +132,11 @@ export class MainSessionBridge {
 	readonly #peer: WorkerPeer;
 	readonly #open = new Map<string, OpenSession>();
 	readonly #subscriptions = new Set<() => void>();
-	readonly #revivers = new Set<{ lifecycle: AgentLifecycleManager; id: string; revive: AgentReviver }>();
+	/** The lifecycles this worker adopted agents into, where its exit forgets their warm revives. */
+	readonly #lifecycles = new Set<AgentLifecycleManager>();
+	/** The worker's revive table functions, which every adoption from it shares (see `RemoteAgentLifecycle.adopt`). */
+	#reviveParked: ((expected: AgentRef, entry: ParkedReviveEntry) => Promise<AgentSessionHandle>) | undefined;
+	#dropParked: ((entry: ParkedReviveEntry) => unknown) | undefined;
 	/** Aborts IRC waits the worker parked on main. */
 	readonly exited = new AbortController();
 
@@ -164,42 +205,47 @@ export class MainSessionBridge {
 		return stop;
 	}
 
-	/** Live worker revivers adopted on main; test seam for ledger bounds. */
-	get reviverCount(): number {
-		return this.#revivers.size;
-	}
-
 	/**
-	 * Record a reviver this worker handed to `lifecycle` for `id`; returns the adopt options
-	 * to pass on, whose reviver holds the worker (and its idle shutdown off) while a revive
-	 * runs there. The record is dropped when the adoption lets go of the reviver. A worker
-	 * sends even a plain-data reviver as a function it keeps (see `RemoteAgentLifecycle.adopt`):
-	 * main holds that function's proxy, wrapped here, until the adoption drops it or the worker exits.
+	 * Main's form of an adoption this worker sent for `id` into `lifecycle`: in place of the worker's revive table
+	 * functions, plain data naming this worker and the agent's table entry, revived by {@link reviveOnWorker} and
+	 * dropped by {@link dropOnWorker}.
 	 */
 	adopted(lifecycle: AgentLifecycleManager, id: string, opts: AdoptOptions): AdoptOptions {
-		const revive = opts.revive;
-		if (!revive) return opts;
-		const peer = this.#peer;
-		const held: AgentReviver = async expected => {
-			const release = peer.retain?.();
-			try {
-				return await runReviver(revive, expected);
-			} finally {
-				release?.();
-			}
+		const sent = opts.revive;
+		if (!sent) return opts;
+		if (typeof sent === "function" || !sent.dropped || !isParkedReviveEntry(sent.state)) {
+			throw new Error(`Subagent worker ${this.#peer.threadId} adopted ${id} without an entry of its revive table`);
+		}
+		this.#reviveParked = sent.reviver;
+		this.#dropParked = sent.dropped;
+		this.#lifecycles.add(lifecycle);
+		const revive: AgentReviveState<WorkerAdoption> = {
+			reviver: reviveOnWorker,
+			dropped: dropOnWorker,
+			state: { threadId: this.#peer.threadId, agentId: id, token: sent.state.token },
 		};
-		const entry = { lifecycle, id, revive: held };
-		this.#revivers.add(entry);
-		const revivers = this.#revivers;
-		const onReviverDropped = opts.onReviverDropped;
-		return {
-			...opts,
-			revive: held,
-			onReviverDropped: () => {
-				revivers.delete(entry);
-				onReviverDropped?.();
-			},
-		};
+		return { ...opts, revive };
+	}
+
+	/** Revive `expected` from this worker's revive table, holding the worker (and its idle shutdown off) meanwhile. */
+	async revive(expected: AgentRef, adoption: WorkerAdoption): Promise<AgentSessionHandle> {
+		const revive = this.#reviveParked;
+		if (!revive) throw new WarmReviveInputsMissingError(`Subagent worker ${this.#peer.threadId} parked no agent`);
+		const release = this.#peer.retain?.();
+		try {
+			return await revive(expected, adoption);
+		} finally {
+			release?.();
+		}
+	}
+
+	/** Tell the worker its revive table entry `adoption` names is no longer adopted. */
+	dropParked(adoption: WorkerAdoption): void {
+		const drop = this.#dropParked;
+		if (!drop) return;
+		Promise.resolve(drop(adoption)).catch(error => {
+			logger.debug("Dropping a worker's revive table entry failed", { error: String(error) });
+		});
 	}
 
 	/** The worker died: see the module doc for the ordering. */
@@ -212,9 +258,10 @@ export class MainSessionBridge {
 				logger.debug("Dropping a dead worker's subscription failed", { error: String(error) });
 			}
 		}
-		const revivers = [...this.#revivers];
-		this.#revivers.clear();
-		for (const { lifecycle, id, revive } of revivers) lifecycle.forgetReviver(id, revive);
+		const threadId = this.#peer.threadId;
+		for (const lifecycle of this.#lifecycles) {
+			lifecycle.forgetRevivers(reviveOnWorker, adoption => adoption.threadId === threadId);
+		}
 		const registry = AgentRegistry.global();
 		const mainLifecycle = AgentLifecycleManager.global();
 		const ended = this.#peer.ended;

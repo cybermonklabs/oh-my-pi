@@ -8,6 +8,11 @@
  * notifications. Change listeners share one main-side forwarding
  * subscription per proxy, which is dropped once the last local listener
  * unsubscribes; events arrive asynchronously after the main-side change.
+ *
+ * A subagent this thread parks keeps its revive state here, in this thread's
+ * one revive table, keyed by agent id: main's adoption of it names its entry
+ * as plain data, and main revives it and drops the entry through two
+ * module-level functions (see `RemoteAgentLifecycle.adopt`).
  */
 import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -18,11 +23,12 @@ import {
 	type AgentLifecycleApi,
 	type AgentLifecycleDisposeOptions,
 	type AgentReleaseOptions,
-	type AgentReviver,
+	type AgentReviveState,
 	type ColdReviveOptions,
 	type LiveAgentTarget,
 	type PersistedSubagentReviverFactory,
 	runReviver,
+	WarmReviveInputsMissingError,
 } from "../../registry/agent-lifecycle";
 import type {
 	AgentHistorySummary,
@@ -197,14 +203,43 @@ export class RemoteAgentRegistry implements AgentRegistryApi {
 	}
 }
 
+/** Plain data naming one entry of this thread's revive table: the parked agent, and which adoption of it. */
+export interface ParkedReviveEntry {
+	readonly agentId: string;
+	/** Tells this adoption's entry from a later re-adopt's, which replaced it under the same agent id. */
+	readonly token: number;
+}
+
+/** A table entry: the revive state an adopt handed this thread. */
+interface ParkedRevive {
+	readonly token: number;
+	readonly revive: AdoptedReviver;
+}
+
+/** This thread's revive table, by agent id: one entry while main's adoption of the agent holds it. */
+const parkedRevives = new Map<string, ParkedRevive>();
+let nextParkedToken = 0;
+
+/** How many entries this thread's revive table holds for `id` (0 or 1); test seam. */
+export function reviveTableEntriesForTests(id: string): number {
+	return parkedRevives.has(id) ? 1 : 0;
+}
+
 /**
- * `revive` as a function main can call across the link: a plain-data reviver's state holds this
- * thread's live objects, which cannot be copied, so the worker keeps it behind a function. Built
- * here, handed nothing else: JSC keeps an enclosing function's `arguments` reachable from its arrow
- * closures, so one built inside `adopt` would pin all of that call's arguments.
+ * Revive `expected` from the table entry `entry` names. Main calls it for every adoption of this thread's agents.
+ * An entry that is gone (or another adoption's) leaves nothing to revive warm: main's lifecycle then revives cold.
  */
-function crossThreadReviver(revive: AdoptedReviver): AgentReviver {
-	return typeof revive === "function" ? revive : expected => runReviver(revive, expected);
+async function reviveParked(expected: AgentRef, entry: ParkedReviveEntry): Promise<AgentSessionHandle> {
+	const parked = parkedRevives.get(entry.agentId);
+	if (parked?.token !== entry.token) {
+		throw new WarmReviveInputsMissingError(`This worker keeps no revive state of ${entry.agentId}'s adoption`);
+	}
+	return runReviver(parked.revive, expected);
+}
+
+/** Drop the table entry `entry` names, once main's adoption let go of it; a later adopt's entry stays. */
+function dropParked(entry: ParkedReviveEntry): void {
+	if (parkedRevives.get(entry.agentId)?.token === entry.token) parkedRevives.delete(entry.agentId);
 }
 
 /** Worker proxy of main's {@link AgentLifecycleApi}; the reviver factory and the process exit's teardown are main-only. */
@@ -219,10 +254,23 @@ export class RemoteAgentLifecycle implements AgentLifecycleApi {
 		throw new Error("The persisted subagent reviver factory is owned by the main thread");
 	}
 
-	/** A reviver stays on this thread with the session it rebuilds; main holds a proxy of it. */
+	/**
+	 * A reviver stays on this thread with the session it rebuilds, in the revive table; main's adoption names its
+	 * entry, as plain data revived by {@link reviveParked} and dropped by {@link dropParked}.
+	 */
 	adopt(id: string, opts: AdoptOptions, expected?: AgentRefExpectation): void {
-		const revive = opts.revive && crossThreadReviver(opts.revive);
-		this.#remote.notify("adopt", id, revive === opts.revive ? opts : { ...opts, revive }, expected);
+		if (!opts.revive) {
+			this.#remote.notify("adopt", id, opts, expected);
+			return;
+		}
+		const token = nextParkedToken++;
+		parkedRevives.set(id, { token, revive: opts.revive });
+		const revive: AgentReviveState<ParkedReviveEntry> = {
+			reviver: reviveParked,
+			dropped: dropParked,
+			state: { agentId: id, token },
+		};
+		this.#remote.notify("adopt", id, { ...opts, revive }, expected);
 	}
 
 	has(id: string, expected?: AgentRefExpectation): boolean {

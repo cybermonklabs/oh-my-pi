@@ -298,7 +298,10 @@ function isNamedHolder(graph: HeapGraph, node: number): boolean {
 /** What a heap holds for the parked subagent: the objects that are its own data, each with a label. */
 interface ParkedAnchors {
 	readonly labels: Map<number, string>;
-	/** Objects with the fields of a warm revive state (`storage`, `parentSettings`). */
+	/**
+	 * Objects with the fields of a warm revive state: `storage` and `parentSettings`, or the release's `storage`,
+	 * `live`, `cache` and `specDigest`.
+	 */
 	readonly reviveStates: number;
 }
 
@@ -319,7 +322,10 @@ function parkedAnchors(graph: HeapGraph, agentId: string): ParkedAnchors {
 		const naming = edges.find(edge => ids.has(edge.to));
 		if (naming) labels.set(node, `${graph.name(node)}{${naming.name}: "${agentId}"}`);
 		const fields = new Set(edges.map(edge => edge.name));
-		if (fields.has("storage") && fields.has("parentSettings")) {
+		const reviveState =
+			fields.has("storage") &&
+			(fields.has("parentSettings") || (fields.has("live") && fields.has("cache") && fields.has("specDigest")));
+		if (reviveState) {
 			labels.set(node, "WarmReviveState");
 			reviveStates++;
 		}
