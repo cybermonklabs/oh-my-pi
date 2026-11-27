@@ -13955,7 +13955,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * run and any in-flight turn has already been aborted (the target's models are
 	 * only known once its file is loaded). A session created with `allowSessionModelFallback` (and
 	 * `retry.modelFallback` on) instead keeps its current model and reports a
-	 * warning. Reloading the current session keeps the current model.
+	 * warning, except when the saved model's provider was removed and no exact
+	 * `retry.fallbackChains` key migrates it: that switch always refuses.
+	 * Reloading the current session keeps the current model.
 	 * @returns true if switch completed, false if cancelled by hook or cwd change
 	 */
 	async switchSession(
@@ -14126,8 +14128,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			let modelFallbackWarning: string | undefined;
 			if (!targetModel && !options?.keepModel && targetModelStrings.length > 0) {
 				const restored = await this.#resolveSessionModel(targetModelStrings);
-				targetModel = restored?.model;
-				migratedThinkingLevel = restored?.thinkingLevel;
+				if (restored && "refusedSelector" in restored) {
+					// A removed provider with no exact migration key refuses a switch into its
+					// session even where a UI could report a fallback; reloading the current
+					// session keeps the current model, as for any unrestorable saved model.
+					if (switchingToDifferentSession) {
+						throw new Error(
+							`Could not restore model ${restored.refusedSelector}. Use --model to choose a model, or add a retry.fallbackChains key that maps the old selector to the new one.`,
+						);
+					}
+				} else {
+					targetModel = restored?.model;
+					migratedThinkingLevel = restored?.thinkingLevel;
+				}
 				if (!targetModel && switchingToDifferentSession) {
 					// Like startup resume: never hand the transcript to a model the
 					// session did not choose unless a UI can say so.
@@ -14398,10 +14411,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * none is in the catalog, refresh the discovery-backed providers among them
 	 * once and retry, then migrate a removed provider through its model-key chain.
 	 * Only migrations override the session's saved thinking level with a selector suffix.
+	 * A removed provider that no exact key migrates comes back as `refusedSelector`:
+	 * whether that refuses depends on whether the caller switches to another session.
 	 */
 	async #resolveSessionModel(
 		selectors: readonly string[],
-	): Promise<{ model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined> {
+	): Promise<{ model: Model; thinkingLevel?: ConfiguredThinkingLevel } | { refusedSelector: string } | undefined> {
 		const resolve = (): { model: Model } | undefined => {
 			for (const selector of selectors) {
 				const restored = resolveSessionModelSelector(this.#modelRegistry, selector);
@@ -14436,11 +14451,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (restored) return { model: restored.model };
 			const resolution = resolveRetiredSessionModel(this.#modelRegistry, this.settings, selector);
 			if (resolution.kind === "present") continue;
-			if (resolution.kind === "refused") {
-				throw new Error(
-					`Could not restore model ${selector}. Use --model to choose a model, or add a retry.fallbackChains key that maps the old selector to the new one.`,
-				);
-			}
+			if (resolution.kind === "refused") return { refusedSelector: selector };
 			return resolution;
 		}
 		return undefined;

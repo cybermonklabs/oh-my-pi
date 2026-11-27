@@ -2168,6 +2168,22 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("reloads the current session past a retired selector with no migration key and keeps its model", async () => {
+		const { session } = await createAgentSession(buildSwitchOptions());
+		try {
+			const target = await writeSavedModelSession("anthropic/claude-sonnet-4-5");
+			await expect(session.switchSession(target)).resolves.toBe(true);
+			session.sessionManager.appendModelChange("retired-provider/retired-model");
+			// `reload()` is this switch of the current session file onto itself.
+			await expect(session.switchSession(target)).resolves.toBe(true);
+			expect(session.sessionFile).toBe(target);
+			expect(session.model?.provider).toBe("anthropic");
+			expect(session.model?.id).toBe("claude-sonnet-4-5");
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	test("restores an extension-discovered model when switching before discovery ran", async () => {
 		// UI startup defers runtime discovery until after the first paint, so
 		// `/resume` can run before the provider's models exist in the registry.
