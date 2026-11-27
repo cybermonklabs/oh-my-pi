@@ -95,7 +95,8 @@ def scope(env):
         return False, "GITHUB_WORKFLOW_REF is empty, so a dispatch cannot be told from a call"
     if not workflow.endswith("/" + THIS_FILE):
         return True, ""
-    if env.get("GITHUB_REF") != "refs/heads/platform-checks":
+    # THROWAWAY measurement branch (INFRA-5336): this one scratch ref may dispatch too.
+    if env.get("GITHUB_REF") not in ("refs/heads/platform-checks", "refs/heads/scratch/infra-5336-platform-cpu-wall"):
         return False, (f"dispatch this workflow with --ref platform-checks, not {env.get('GITHUB_REF')}: "
                        "its caches and its permissions are scoped to that ref")
     return False, ""
