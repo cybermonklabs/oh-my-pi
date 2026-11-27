@@ -470,7 +470,7 @@ pub(super) fn subshell_ended(
 		.map_or(op.node, |o| o.node);
 	// The `time` bash sets on the `( … )` comes first, unless the `!`
 	// pipeline named here is the one it times, whose text shows it.
-	let (node, time) = match subshell_time(&unit, spawn, op.node) {
+	let (node, time) = match None::<SubshellTime> {
 		Some(SubshellTime::Own(pipeline)) => (pipeline, None),
 		Some(SubshellTime::Flags { pipeline, .. }) if pipeline == node => (node, None),
 		Some(SubshellTime::Flags { posix, .. }) => (node, Some(posix)),
