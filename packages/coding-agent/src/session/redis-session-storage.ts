@@ -141,16 +141,31 @@ const HELD_TOKEN = `local function held_token(meta, generation, path)
 	return nil
 end`;
 
+// KEYS[1] is the file key, KEYS[2] the meta hash, KEYS[3] the generation hash
+// and KEYS[4] the title hash. An append that creates the key first deletes
+// the title metadata its path may hold for no body (one an older build's
+// title update stored after the session there was removed), so the session
+// it starts shows no title it never had.
 const APPEND_SCRIPT = `-- OMP_APPEND
 ${HELD_TOKEN}
 local token = held_token(KEYS[2], KEYS[3], ARGV[2]) or ARGV[4]
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	redis.call("HDEL", KEYS[4], ARGV[2])
+end
 local size = redis.call("APPEND", KEYS[1], ARGV[1])
 redis.call("HSET", KEYS[2], ARGV[2], ARGV[3])
 redis.call("HSET", KEYS[3], ARGV[2], token .. " " .. ARGV[3])
 return size`;
 
+// KEYS[1] is the meta hash, KEYS[2] the title hash, KEYS[3] the generation
+// hash and KEYS[4] the file key. Returns 0, and writes nothing, when the file
+// key is missing: a store whose index still lists a session another store
+// removed stores no title for a body that is gone.
 const UPDATE_TITLE_SCRIPT = `-- OMP_UPDATE_TITLE
 ${HELD_TOKEN}
+if redis.call("EXISTS", KEYS[4]) == 0 then
+	return 0
+end
 local token = held_token(KEYS[1], KEYS[3], ARGV[1]) or ARGV[4]
 redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])
 redis.call("HSET", KEYS[2], ARGV[1], ARGV[3])
@@ -171,8 +186,13 @@ return {text, redis.call("HGET", KEYS[2], ARGV[1])}`;
 // One script, so both windows and the title metadata come from one read.
 // KEYS[2] is the title hash and ARGV[1] the session's path in it; ARGV[2] is
 // the head's byte count and ARGV[3] the tail's, each 0 for none. Returns
-// {head, tail, title metadata or nil}; a missing key reads as two empty windows.
+// {head, tail, title metadata or nil}; nil when the key is missing, which
+// reads as two empty windows and no title: title metadata without a body is
+// no session's.
 const READ_SLICES_SCRIPT = `-- OMP_READ_SLICES
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	return false
+end
 local head = ""
 local prefix = tonumber(ARGV[2])
 if prefix > 0 then
@@ -312,15 +332,18 @@ return 1`;
 // One script, so the key, its mtime, its title and its generation move
 // together: no client's write to either path can land between them. With
 // ARGV[4] == "1" a taken destination leaves everything as it was (returns 0);
-// ARGV[5] is the destination's new generation token.
+// ARGV[5] is the destination's new generation token. Redis keeps what a
+// script wrote before one of its commands failed, so every read comes before
+// the first write: a refused read (the title's HGET) or a missing source (the
+// RENAME) fails the script before it changes anything.
 const MOVE_SCRIPT = `-- OMP_MOVE
 if ARGV[4] == "1" and redis.call("EXISTS", KEYS[2]) == 1 then
 	return 0
 end
+local title = redis.call("HGET", KEYS[4], ARGV[1])
 redis.call("RENAME", KEYS[1], KEYS[2])
 redis.call("HDEL", KEYS[3], ARGV[1])
 redis.call("HSET", KEYS[3], ARGV[2], ARGV[3])
-local title = redis.call("HGET", KEYS[4], ARGV[1])
 redis.call("HDEL", KEYS[4], ARGV[1])
 if title then
 	redis.call("HSET", KEYS[4], ARGV[2], title)
@@ -713,10 +736,11 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 	async append(path: string, line: string, mtimeMs: number): Promise<void> {
 		await this.#client.send("EVAL", [
 			APPEND_SCRIPT,
-			"3",
+			"4",
 			this.#fileKey(path),
 			this.#metaKey(),
 			this.#generationKey(),
+			this.#titleMetaKey(),
 			line,
 			path,
 			String(mtimeMs),
@@ -724,18 +748,21 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 		]);
 	}
 
+	/** Rejects with `ENOENT`, storing nothing, when the store holds no session at `path`. */
 	async updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void> {
-		await this.#client.send("EVAL", [
+		const updated = await this.#client.send("EVAL", [
 			UPDATE_TITLE_SCRIPT,
-			"3",
+			"4",
 			this.#metaKey(),
 			this.#titleMetaKey(),
 			this.#generationKey(),
+			this.#fileKey(path),
 			path,
 			String(mtimeMs),
 			encodeTitleMeta(title),
 			crypto.randomUUID(),
 		]);
+		if (Number(updated) !== 1) throw enoent(path);
 	}
 
 	async truncate(path: string, mtimeMs: number): Promise<void> {

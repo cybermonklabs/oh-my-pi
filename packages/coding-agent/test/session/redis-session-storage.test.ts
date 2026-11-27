@@ -1,6 +1,9 @@
 /**
  * Functional tests for {@link RedisSessionStorage}. Driven by a hand-rolled
- * fake Redis client so the suite runs without a live server.
+ * fake Redis client so the suite runs without a live server. The fake runs the
+ * Lua scripts the storage sends with a small interpreter of the Lua they use
+ * (`test/helpers/fake-redis-windows.ts`), so a test sees what a server does
+ * with each script, down to what it leaves when one of its commands fails.
  *
  * The harness mirrors only the surface the storage actually uses; it is *not*
  * a general-purpose mock. Each test exercises one contract:
@@ -13,7 +16,10 @@
  * - `refresh()` re-loads the keyspace, so a peer process's writes become
  *   visible after an explicit re-scan;
  * - a full rewrite streams in parts to a staging key of its own and swaps it
- *   in, whether or not the local spool can be used.
+ *   in, whether or not the local spool can be used;
+ * - no title is stored or read for a session whose body is gone, and a
+ *   session an append starts at its path shows none;
+ * - a move that fails at its title read changes neither path.
  */
 
 import { RedisClient } from "bun";
@@ -215,6 +221,23 @@ function everywhere(line: string): Record<string, string> {
 	return { readText: line, readTextSlices: line, readTextFrom: line, readChunks: line };
 }
 
+/** What each reader of `storage` gives `path` (a path its index lists): what it read, or the code it failed with. */
+async function readsOf(storage: RedisSessionStorage, path: string): Promise<Record<string, unknown>> {
+	const code = (error: NodeJS.ErrnoException) => error.code;
+	return {
+		readText: await storage.readText(path).then(text => text, code),
+		readTextSlices: await storage.readTextSlices(path, 4096, 0).then(slices => slices, code),
+		readTextFrom: await storage.readTextFrom(path, 0, 4096).then(read => read, code),
+		readChunks: await Array.fromAsync(storage.readChunks(path)).then(
+			chunks => Buffer.concat(chunks).toString("utf8"),
+			code,
+		),
+	};
+}
+
+/** What {@link readsOf} gives a path whose body is gone: no bytes and no title. */
+const GONE_READS = { readText: "ENOENT", readTextSlices: ["", ""], readTextFrom: "ENOENT", readChunks: "ENOENT" };
+
 /** Two stores over one Redis keyspace, and what a client of an older build does to it directly. */
 interface TitledRedis {
 	/** Its next title write fails before the server runs it once {@link refuseNextTitleWrite} is called. */
@@ -228,6 +251,11 @@ interface TitledRedis {
 }
 
 const SESSION_HEADER = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+
+/** A session's header and one entry naming it, so a read shows whose body it got. */
+function bodyOf(name: string): string {
+	return `${SESSION_HEADER}${JSON.stringify({ type: "custom", customType: "body", data: name })}\n`;
+}
 
 /** What the title metadata a Redis store reads with a session's bytes makes its readers give, on the store `open` opens. */
 function titleMetadataCases(open: () => Promise<TitledRedis>): void {
@@ -303,6 +331,75 @@ function titleMetadataCases(open: () => Promise<TitledRedis>): void {
 				target: everywhere(SESSION_HEADER),
 			});
 		}
+	});
+
+	// If this regresses, a move drops the title a session was given after its body was written: another store shows
+	// the moved session under the title its body was written with, or the destination's, instead of its current one.
+	it("carries the title a session was given after its body onto the titled path it moves over, for another store", async () => {
+		const { storage, peer } = await open();
+		const src = "/s/retitled.jsonl";
+		const dst = "/s/replaced.jsonl";
+		const written = serializeTitleSlot({ title: "Written", source: "auto", updatedAt: "t1" });
+		await storage.writeText(src, `${written}${bodyOf("source")}`);
+		const updated: SessionTitleUpdate = { title: "Updated", source: "user", updatedAt: "t2" };
+		await storage.updateSessionTitle(src, updated);
+		const destination = serializeTitleSlot({ title: "Destination", source: "user", updatedAt: "t3" });
+		await storage.writeText(dst, `${destination}${bodyOf("destination")}`);
+		await peer.refresh();
+
+		await storage.rename(src, dst);
+		expect({ text: await peer.readText(dst), heads: await headsOf(peer, dst) }).toEqual({
+			text: `${serializeTitleSlot(updated)}${bodyOf("source")}`,
+			heads: everywhere(serializeTitleSlot(updated)),
+		});
+	});
+
+	// If this regresses, a store whose index still lists a session another store deleted stores its title update for
+	// the missing body: its head read shows that title for a session `readText` reports missing, and a session an
+	// append starts at the path later shows the deleted session's title over its own head.
+	it("refuses a title update for a session another store deleted, and reads the path as gone, then as what an append starts there", async () => {
+		const { storage, peer } = await open();
+		const path = "/s/deleted.jsonl";
+		const deleted = serializeTitleSlot({ title: "Deleted", source: "user", updatedAt: "t1" });
+		await storage.writeText(path, `${deleted}${SESSION_HEADER}`);
+		await peer.refresh();
+		await storage.unlink(path);
+
+		const update = await peer.updateSessionTitle(path, { title: "Stale", source: "user", updatedAt: "t2" }).then(
+			() => "stored",
+			(error: NodeJS.ErrnoException) => error.code,
+		);
+		const gone = await readsOf(peer, path);
+		const writer = storage.openWriter(path);
+		await writer.append(SESSION_HEADER);
+		await writer.close();
+		expect({ update, gone, recreated: await headsOf(peer, path) }).toEqual({
+			update: "ENOENT",
+			gone: GONE_READS,
+			recreated: everywhere(SESSION_HEADER),
+		});
+	});
+
+	// If this regresses, title metadata a path holds for no body (an older build's title update after another store
+	// deleted the session there) shows: a head read gives it for the missing session, and a session an append starts
+	// at the path shows it over its own head.
+	it("shows no title a path holds for a missing body, on the missing session or on one an append starts there", async () => {
+		const { storage, peer, putTitle } = await open();
+		const path = "/s/orphaned.jsonl";
+		await storage.writeText(path, SESSION_HEADER);
+		await peer.refresh();
+		await storage.unlink(path);
+		// What an older build's title update stores for a path whose session is gone.
+		await putTitle(path, JSON.stringify({ title: "Orphaned", source: "user", updatedAt: "t2" }));
+
+		const gone = await readsOf(peer, path);
+		const writer = storage.openWriter(path);
+		await writer.append(SESSION_HEADER);
+		await writer.close();
+		expect({ gone, recreated: await headsOf(peer, path) }).toEqual({
+			gone: GONE_READS,
+			recreated: everywhere(SESSION_HEADER),
+		});
 	});
 
 	// If this regresses, a title update the server never stored shows on this store (or its time does) until a
@@ -436,7 +533,7 @@ interface FakeRedis extends RedisSessionStorageClient {
 	calls: FakeRedisCall[];
 	strings: Map<string, string>;
 	hashes: Map<string, Map<string, string>>;
-	/** Override the next call to `method` to reject with `error`. */
+	/** Fail the next call to `method` (a client method, or a command a script runs, in lower case) with `error`. */
 	failNext(method: string, error: Error): void;
 }
 
@@ -768,6 +865,42 @@ describe("RedisSessionStorage", () => {
 		expect(redis.hashes.get("omp:sessions:meta")?.has("/sessions/p/b.jsonl")).toBe(true);
 	});
 
+	// If this regresses, a move whose title read Redis refuses (an account without HGET) has moved the body before the
+	// script fails: `rename()` rejects, yet the destination session is lost under the source's body and the source is
+	// gone, on this store and on any other.
+	it("leaves both sessions, their times and titles as they were when Redis refuses a move's title read", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const src = "/s/moving.jsonl";
+		const dst = "/s/staying.jsonl";
+		for (const [path, name] of [
+			[src, "Source"],
+			[dst, "Destination"],
+		]) {
+			const written = serializeTitleSlot({ title: `${name} as written`, source: "auto", updatedAt: "t1" });
+			await storage.writeText(path, `${written}${bodyOf(name)}`);
+			await storage.updateSessionTitle(path, { title: `${name} renamed`, source: "user", updatedAt: "t2" });
+		}
+		// What `view` gives of each path: its text (the title laid over its head) and time, or the code its read fails with.
+		const sessionsOf = async (view: RedisSessionStorage): Promise<Record<string, unknown>> => {
+			const sessions: Record<string, unknown> = {};
+			for (const path of [src, dst]) {
+				sessions[path] = await view.readText(path).then(
+					text => ({ text, mtimeMs: view.statSync(path).mtimeMs }),
+					(error: NodeJS.ErrnoException) => error.code,
+				);
+			}
+			return sessions;
+		};
+		const before = await sessionsOf(await RedisSessionStorage.create({ client: redis }));
+
+		redis.failNext("hget", new Error("NOPERM this user has no permissions to run the 'hget' command"));
+		await expect(storage.rename(src, dst)).rejects.toThrow("NOPERM");
+		expect({
+			stored: await sessionsOf(await RedisSessionStorage.create({ client: redis })),
+			local: await sessionsOf(storage),
+		}).toEqual({ stored: before, local: before });
+	});
+
 	it("deleteSessionWithArtifacts removes a child key another client set after the refresh", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
 		await storage.writeText("/sessions/p/s1.jsonl", "session\n");
@@ -986,7 +1119,7 @@ describe("RedisSessionStorage", () => {
 			redis.hashes.set("omp:sessions:title", titles);
 		},
 		refuseNextTitleWrite() {
-			// The title script's first write; the fake fails it before the script changes anything.
+			// The title script's first write: the script fails there, before it changes anything.
 			redis.failNext("hset", new Error("title write refused before it ran"));
 		},
 	}));
@@ -994,8 +1127,9 @@ describe("RedisSessionStorage", () => {
 	titledReadCases(() => RedisSessionStorage.create({ client: redis }));
 });
 
-// The fake above does not run Lua; these run the move and remove scripts on a
-// real server when `OMP_TEST_REDIS_URL` names a throwaway Redis 7.
+// The fake above runs the scripts with an interpreter of the Lua they use;
+// these run them on a real server when `OMP_TEST_REDIS_URL` names a throwaway
+// Redis 7.
 describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis server", () => {
 	const clients: RedisClient[] = [];
 	let prefix = "";
