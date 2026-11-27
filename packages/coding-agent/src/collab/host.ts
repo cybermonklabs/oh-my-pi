@@ -734,7 +734,10 @@ export class CollabHost {
 	 * since a shrunk one would set a truncated value; one past the frame
 	 * ceiling goes as a record that sets nothing, which keeps the guests'
 	 * parent chain, with a notice. The guests get the fields at their next
-	 * resync.
+	 * resync. The frame needs no new `COLLAB_PROTO`: a guest older than the
+	 * record keeps it as a `custom` entry it never shows (the web guest has no
+	 * row for one, the TUI guest no message), so it only misses the patch until
+	 * it rejoins, as before; a new protocol number would turn such a guest away.
 	 */
 	#broadcastEntryPatchRecord(record: StoredSessionEntry & EntryPatchRecord): void {
 		let json = JSON.stringify(record);

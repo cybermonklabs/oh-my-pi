@@ -375,7 +375,10 @@ function pastRecords(id: string | null, recordParents: ReadonlyMap<string, strin
  * `recordParents`, which holds the records of earlier reads of the same
  * transcript.
  */
-function entriesPastRecords<E extends FileEntry>(entries: readonly E[], recordParents: Map<string, string | null>): E[] {
+function entriesPastRecords<E extends FileEntry>(
+	entries: readonly E[],
+	recordParents: Map<string, string | null>,
+): E[] {
 	const kept: E[] = [];
 	for (const entry of entries) {
 		if (entry.type !== "session") {

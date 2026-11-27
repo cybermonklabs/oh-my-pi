@@ -28,7 +28,13 @@ function header(dir: string): SessionHeader {
 }
 
 function userEntry(id: string, parentId: string | null, text: string) {
-	return { type: "message", id, parentId, timestamp: TIMESTAMP, message: { role: "user", content: text, timestamp: 1 } };
+	return {
+		type: "message",
+		id,
+		parentId,
+		timestamp: TIMESTAMP,
+		message: { role: "user", content: text, timestamp: 1 },
+	};
 }
 
 function toolCallEntry(id: string, parentId: string | null, extra: object = {}) {
@@ -69,7 +75,14 @@ function toolResultEntry(id: string, parentId: string, content: object[]) {
 }
 
 function patchRecord(id: string, parentId: string | null, patches: object[]) {
-	return { type: "custom", customType: ENTRY_PATCH_CUSTOM_TYPE, id, parentId, timestamp: TIMESTAMP, data: { patches } };
+	return {
+		type: "custom",
+		customType: ENTRY_PATCH_CUSTOM_TYPE,
+		id,
+		parentId,
+		timestamp: TIMESTAMP,
+		data: { patches },
+	};
 }
 
 function jsonl(entries: readonly object[]): string {
@@ -166,8 +179,10 @@ describe("RpcClient and entry_patch records", () => {
 				userEntry("u2", "t1", "thanks"),
 			]),
 		);
-		const inline = await answered(agent, () => client.getSubagentMessages({ sessionFile: inlineFile }), request =>
-			readRpcSubagentTranscript(inlineFile, typeof request.fromByte === "number" ? request.fromByte : 0),
+		const inline = await answered(
+			agent,
+			() => client.getSubagentMessages({ sessionFile: inlineFile }),
+			request => readRpcSubagentTranscript(inlineFile, typeof request.fromByte === "number" ? request.fromByte : 0),
 		);
 
 		expect({
@@ -405,7 +420,11 @@ describe("RpcClient and entry_patch records", () => {
 		);
 
 		const shapeOf = (nodes: readonly SessionTreeNode[]): unknown[] =>
-			nodes.map(child => ({ id: child.entry.id, parentId: child.entry.parentId, children: shapeOf(child.children) }));
+			nodes.map(child => ({
+				id: child.entry.id,
+				parentId: child.entry.parentId,
+				children: shapeOf(child.children),
+			}));
 		expect(shapeOf(read.tree)).toEqual([
 			{
 				id: "u1",
