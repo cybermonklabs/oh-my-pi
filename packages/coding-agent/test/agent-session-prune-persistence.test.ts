@@ -473,16 +473,15 @@ describe("AgentSession per-turn prune persistence", () => {
 		expect(await rebuiltResultText(secondCallId)).toBe(USELESS_NOTICE);
 	});
 
-	it("writes a pruned result too long for the collab transcript fetch inline", async () => {
-		// Regression: the record landed after the pruned result's original line.
-		// A collab guest fetches the file in TRANSCRIPT_READ_CAP-byte windows and
-		// stops at a longer line, so a cold guest never reached the record. Each
-		// block stays under the per-string persistence limit; their number makes
-		// the line long.
-		const longCallId = "call-long-useless";
+	/** Seeds a useless `mcp_search` result for the next turn's prune pass and writes it to the session file. */
+	async function seedUselessResult(
+		toolCallId: string,
+		content: Array<{ type: "text"; text: string }>,
+		details?: unknown,
+	): Promise<void> {
 		sessionManager.appendMessage({
 			role: "assistant",
-			content: [{ type: "toolCall", id: longCallId, name: "mcp_search", arguments: { query: "LONG" } }],
+			content: [{ type: "toolCall", id: toolCallId, name: "mcp_search", arguments: { query: "LONG" } }],
 			api: "anthropic-messages",
 			provider: "anthropic",
 			model: "claude-sonnet-4-5",
@@ -499,25 +498,44 @@ describe("AgentSession per-turn prune persistence", () => {
 		});
 		sessionManager.appendMessage({
 			role: "toolResult",
-			toolCallId: longCallId,
+			toolCallId,
 			toolName: "mcp_search",
-			content: Array.from({ length: 11 }, (_, block) => ({
-				type: "text" as const,
-				text: `block ${block}\n${"long match\n".repeat(36_000)}`,
-			})),
+			content,
+			...(details === undefined ? {} : { details }),
 			isError: false,
 			useless: true,
 			timestamp: Date.now(),
 		});
 		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
 		await sessionManager.flush();
-		const longestLineBytes = (): number =>
-			Math.max(
-				...fs
-					.readFileSync(persistedSessionFile(), "utf8")
-					.split("\n")
-					.map(line => Buffer.byteLength(line, "utf8") + 1),
-			);
+	}
+
+	/** Bytes of the session file's longest line with its newline: what one collab fetch window must hold. */
+	function longestLineBytes(): number {
+		return Math.max(
+			...fs
+				.readFileSync(persistedSessionFile(), "utf8")
+				.split("\n")
+				.map(line => Buffer.byteLength(line, "utf8") + 1),
+		);
+	}
+
+	/** Eleven text blocks of `repeat` lines each: every block stays under the per-string persistence limit. */
+	function longTextBlocks(repeat: number): Array<{ type: "text"; text: string }> {
+		return Array.from({ length: 11 }, (_, block) => ({
+			type: "text" as const,
+			text: `block ${block}\n${"long match\n".repeat(repeat)}`,
+		}));
+	}
+
+	it("writes a pruned result too long for the collab transcript fetch inline", async () => {
+		// Regression: the record landed after the pruned result's original line.
+		// A collab guest fetches the file in TRANSCRIPT_READ_CAP-byte windows and
+		// stops at a longer line, so a cold guest never reached the record. Each
+		// block stays under the per-string persistence limit; their number makes
+		// the line long.
+		const longCallId = "call-long-useless";
+		await seedUselessResult(longCallId, longTextBlocks(36_000));
 		expect(longestLineBytes()).toBeGreaterThan(TRANSCRIPT_READ_CAP);
 
 		await endTurn();
@@ -526,6 +544,34 @@ describe("AgentSession per-turn prune persistence", () => {
 		expect(liveResultText(longCallId)).toBe(USELESS_NOTICE);
 		expect(longestLineBytes()).toBeLessThanOrEqual(TRANSCRIPT_READ_CAP);
 		expect(await rebuiltResultText(longCallId)).toBe(USELESS_NOTICE);
+	});
+
+	it("writes a pruned result inline when persistence lengthens its line past the collab fetch window", async () => {
+		// Regression: the size check measured the result as plain JSON. Persistence
+		// turns every image data URL into a blob reference, which is longer than a
+		// short URL, so a line that measured under the cap was written over it and
+		// the record again landed behind a line a cold collab guest cannot pass.
+		const grownCallId = "call-grown-useless";
+		const details = {
+			frames: Array.from({ length: 2_000 }, () => ({ image_url: "data:image/png;base64,AA==" })),
+		};
+		// Size the text so the result is 50,000 bytes under the cap as plain JSON;
+		// each of the 2,000 URLs then grows by about 50 bytes on disk.
+		const repeatBytes = 11 * (Buffer.byteLength(JSON.stringify("long match\n"), "utf8") - 2);
+		const detailsBytes = Buffer.byteLength(JSON.stringify(details), "utf8");
+		const content = longTextBlocks(Math.floor((TRANSCRIPT_READ_CAP - 50_000 - detailsBytes) / repeatBytes));
+		const plainBytes = Buffer.byteLength(JSON.stringify({ content, details }), "utf8");
+		expect(plainBytes).toBeLessThan(TRANSCRIPT_READ_CAP - 40_000);
+
+		await seedUselessResult(grownCallId, content, details);
+		expect(longestLineBytes()).toBeGreaterThan(TRANSCRIPT_READ_CAP);
+
+		await endTurn();
+		await sessionManager.flush();
+
+		expect(liveResultText(grownCallId)).toBe(USELESS_NOTICE);
+		expect(longestLineBytes()).toBeLessThanOrEqual(TRANSCRIPT_READ_CAP);
+		expect(await rebuiltResultText(grownCallId)).toBe(USELESS_NOTICE);
 	});
 
 	describe("advisor across the per-turn prune", () => {
