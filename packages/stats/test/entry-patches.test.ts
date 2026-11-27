@@ -11,8 +11,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { syncAllSessions } from "@oh-my-pi/omp-stats/aggregator";
 import { getRequestDetails, getSessionEntryDetail } from "@oh-my-pi/omp-stats/client/api";
-import { closeDb, getRecentRequests, initDb } from "@oh-my-pi/omp-stats/db";
-import { getSessionEntry, parseAllSessionEntries, parseSessionFile } from "@oh-my-pi/omp-stats/parser";
+import { closeDb, getFileOffset, getRecentRequests, initDb } from "@oh-my-pi/omp-stats/db";
+import {
+	getSessionEntry,
+	type ParseSessionResult,
+	parseAllSessionEntries,
+	parseSessionFile,
+} from "@oh-my-pi/omp-stats/parser";
 import { handleApi } from "@oh-my-pi/omp-stats/server";
 import { buildSessionTrace, getTraceEntry } from "@oh-my-pi/omp-stats/trace";
 import { getSessionsDir } from "@oh-my-pi/pi-utils";
@@ -264,6 +269,75 @@ describe("a session whose passes appended entry_patch records reads as with thos
 		await syncAllSessions({ workers: 1 });
 		expect(await stored(file)).toEqual({ userChars: PROMPT_ELIDED.length, resultChars: OUTPUT_ELIDED.length });
 		expect(await stored(inline)).toEqual({ userChars: PROMPT_ELIDED.length, resultChars: OUTPUT_ELIDED.length });
+	});
+
+	// A record in the tail names entries before the cursor: the read derives every row again, so it reads
+	// the bytes before the cursor too, after it read the tail.
+	it("a read from a cursor past the entries a tail record names returns the rows and offset of a read of the whole transcript", async () => {
+		const lines = sessionLines("patched");
+		const firstRecord = lines.findIndex(line => line.includes('"entry_patch"'));
+		const file = sessionPath("tail-patched");
+		await Bun.write(file, `${lines.slice(0, firstRecord).join("\n")}\n`);
+		const { parserState } = await parseSessionFile(file);
+		if (!parserState) throw new Error("fixture transcript disappeared");
+		await fs.appendFile(file, `${lines.slice(firstRecord).join("\n")}\n`);
+		const inline = sessionPath("tail-inline");
+		await Bun.write(inline, `${sessionLines("inline").join("\n")}\n`);
+		const rows = (parsed: ParseSessionResult, form: Form) =>
+			sameIds(
+				{
+					stats: parsed.stats,
+					userStats: parsed.userStats,
+					userLinks: parsed.userLinks,
+					toolCalls: parsed.toolCalls,
+					toolResults: parsed.toolResults,
+					spotlight: parsed.spotlight,
+				},
+				form,
+			);
+
+		const tail = await parseSessionFile(file, parserState.offset, parserState);
+		expect({ reset: tail.reset, rows: rows(tail, "patched"), newOffset: tail.newOffset }).toEqual({
+			reset: true,
+			rows: rows(await parseSessionFile(inline), "inline"),
+			newOffset: (await parseSessionFile(file)).newOffset,
+		});
+	});
+
+	// The live watcher syncs only the files it saw change, and such a sync leaves reconciliation to the
+	// next full sync: the read that meets the record must itself hold every row it replaces.
+	it("a targeted sync that meets a record after it stored its target's rows stores the rows of the transcript with the fields inline", async () => {
+		const lines = sessionLines("patched");
+		const firstRecord = lines.findIndex(line => line.includes('"entry_patch"'));
+		const file = sessionPath("live-patched");
+		await Bun.write(file, `${lines.slice(0, firstRecord).join("\n")}\n`);
+		const inline = sessionPath("live-inline");
+		await Bun.write(inline, `${sessionLines("inline").join("\n")}\n`);
+		await syncAllSessions({ workers: 1 });
+		await fs.appendFile(file, `${lines.slice(firstRecord).join("\n")}\n`);
+
+		await syncAllSessions({ files: [file], workers: 1 });
+		const db = await initDb();
+		const stored = async (sessionFile: string, form: Form) =>
+			sameIds(
+				{
+					requests: db
+						.prepare("SELECT entry_id FROM messages WHERE session_file = ? ORDER BY entry_id")
+						.all(sessionFile),
+					prompts: db
+						.prepare("SELECT entry_id, chars, model FROM user_messages WHERE session_file = ?")
+						.all(sessionFile),
+					calls: db
+						.prepare("SELECT tool_call_id, result_chars FROM tool_calls WHERE session_file = ?")
+						.all(sessionFile),
+					cursorAtEnd: getFileOffset(sessionFile)?.offset === (await fs.stat(sessionFile)).size,
+				},
+				form,
+			);
+		expect({
+			patched: await stored(file, "patched"),
+			reconciliation: db.prepare("SELECT value FROM meta WHERE key = 'session_reconciliation'").get(),
+		}).toEqual({ patched: await stored(inline, "inline"), reconciliation: null });
 	});
 
 	// A database an older build filled holds rows derived from an entry before a record set its fields.

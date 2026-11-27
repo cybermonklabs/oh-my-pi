@@ -664,9 +664,12 @@ export interface ParseSessionResult {
 
 const CHECKPOINT_BYTES = 256;
 
-async function readCheckpoint(handle: fs.FileHandle, end: number): Promise<Uint8Array> {
-	// Positional reads keep the descriptor at zero for Bun.file(fd)'s subsequent tail read.
-	const start = Math.max(0, end - CHECKPOINT_BYTES);
+/**
+ * Bytes `start`..`end` of the file, read by position. `Bun.file(fd).slice(0, n)` reads from the
+ * descriptor's position, not from byte 0, so a second read of the same descriptor gets the bytes after
+ * the first.
+ */
+async function readRange(handle: fs.FileHandle, start: number, end: number): Promise<Uint8Array> {
 	const bytes = new Uint8Array(end - start);
 	let read = 0;
 	while (read < bytes.length) {
@@ -819,7 +822,6 @@ export async function parseSessionFile(
 		const handle = await fs.open(sessionPath, "r");
 		try {
 			info = await handle.stat();
-			const file = Bun.file(handle.fd);
 			let resume = state?.version === 1 && state.offset === fromOffset;
 			if (resume && state) {
 				reset =
@@ -827,7 +829,7 @@ export async function parseSessionFile(
 					info.size < state.size ||
 					(info.size === state.size && info.mtimeMs !== state.mtimeMs);
 				if (!reset) {
-					const previous = await readCheckpoint(handle, fromOffset);
+					const previous = await readRange(handle, Math.max(0, fromOffset - CHECKPOINT_BYTES), fromOffset);
 					reset = Bun.hash(previous).toString(16) !== state.checkpoint;
 				}
 				resume = !reset;
@@ -836,7 +838,7 @@ export async function parseSessionFile(
 			if (replay) resume = false;
 			start = reset || replay ? 0 : Math.max(0, fromOffset);
 			let readStart = resume ? start : 0;
-			let bytes = await file.slice(readStart, info.size).bytes();
+			let bytes = await readRange(handle, readStart, info.size);
 			const tail = bytes.subarray(start - readStart);
 			const tailPatches = collectEntryPatches(tail);
 			// A record in the prefix names entries of the prefix scan, or of the tail.
@@ -862,7 +864,7 @@ export async function parseSessionFile(
 				start = 0;
 				if (readStart > 0) {
 					readStart = 0;
-					bytes = await file.slice(0, info.size).bytes();
+					bytes = await readRange(handle, 0, info.size);
 				}
 				spotlight = new SpotlightCollector(sessionPath, folder, emptySpotlightState());
 				rows = deriveRows(bytes, sessionPath, undefined, spotlight, collectEntryPatches(bytes), new Map());
@@ -872,7 +874,7 @@ export async function parseSessionFile(
 			const previous =
 				checkpointStart >= readStart
 					? bytes.subarray(checkpointStart - readStart, newOffset - readStart)
-					: await readCheckpoint(handle, newOffset);
+					: await readRange(handle, checkpointStart, newOffset);
 			checkpoint = Bun.hash(previous).toString(16);
 		} finally {
 			await handle.close();
