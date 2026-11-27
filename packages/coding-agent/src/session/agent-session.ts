@@ -101,7 +101,6 @@ import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
 import { type EditStore, type PowerAssertionOptions } from "@oh-my-pi/pi-natives";
 import {
 	$env,
-	cloneJsonTree,
 	escapeXmlText,
 	formatDuration,
 	getAgentDbPath,
@@ -115,6 +114,7 @@ import {
 	Snowflake,
 	stringifyDeepJson,
 	stringProperty,
+	structuredCloneDeep,
 	toError,
 	untilAborted,
 	withTimeout,
@@ -15243,9 +15243,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// No breakpoint after it can be read by the next request.
 		let volatileSuffix = false;
 		if (history?.length) {
-			// Detach before the conversion pipeline can await or mutate caller-owned messages; the copy
-			// keeps its own stack, as deep as a transcript line holds.
-			const detachedHistory = cloneJsonTree(history);
+			// Detach before the conversion pipeline can await or mutate caller-owned messages; the copy keeps what
+			// `structuredClone` keeps (a tool call's `Date`, a result's `Map`), as deep as a transcript line holds.
+			const detachedHistory = structuredCloneDeep(history);
 			for (const message of detachedHistory) {
 				if (message.role === "custom" && message.customType === IMAGE_ATTACHMENT_DESCRIPTION_TYPE) {
 					volatileSuffix = true;

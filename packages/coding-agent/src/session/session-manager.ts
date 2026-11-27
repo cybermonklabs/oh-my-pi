@@ -10,7 +10,6 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import {
-	cloneJsonTree,
 	directoryIsEnterable,
 	directoryIsMissing,
 	getBlobsDir,
@@ -24,6 +23,7 @@ import {
 	logger,
 	pathIsWithin,
 	stringifyJson,
+	structuredCloneDeep,
 	toError,
 } from "@oh-my-pi/pi-utils";
 import { ENTRY_PATCH_CUSTOM_TYPE, entryAcceptsPatch, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
@@ -5435,9 +5435,11 @@ export class SessionManager {
 		manager.#additionalDirectories = [...this.#additionalDirectories];
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
-		// A whole entry is copied (as deep as a transcript line holds, on the copy's own stack); a cold
-		// one is copied as a new cold entry over the same record.
-		manager.#entries = this.#entries.map(entry => (isColdEntry(entry) ? copyColdEntry(entry) : cloneJsonTree(entry)));
+		// A whole entry is copied as `structuredClone` copies it (a `Date` or `Map` in a custom entry stays one), as
+		// deep as a transcript line holds; a cold one is copied as a new cold entry over the same record.
+		manager.#entries = this.#entries.map(entry =>
+			isColdEntry(entry) ? copyColdEntry(entry) : structuredCloneDeep(entry),
+		);
 		manager.#adoptColdStore(this.#coldStore);
 		manager.#reindexEntries();
 		manager.#forceFileCreation = true;

@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { Agent, AgentMessage, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { resolveDelegationBias } from "@oh-my-pi/pi-catalog/compat/delegation";
-import { cloneJsonTree, isRecord, logger, prompt, stringProperty, untilAborted } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, prompt, stringProperty, structuredCloneJSON, untilAborted } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { shouldInlineToolDescriptors } from "../config/inline-tool-descriptors-mode";
@@ -1276,8 +1276,10 @@ export class SessionTools {
 					}
 					// Preserve the exact arguments authorized by a selected or
 					// persisted ACP grant; inner handlers may mutate `args` in place.
-					// They are JSON data, as deep as a transcript line holds.
-					const approvedCtx = (ctx ? { ...ctx, acpApprovedArgs: cloneJsonTree(args) } : ctx) as never;
+					// Copied as `structuredClone` copies (an in-process caller's `Date` stays one, so the copy
+					// still equals the call), as deep as a transcript line holds; a member it refuses (a
+					// function) is left out, as the comparison's own JSON reading of the call leaves it out.
+					const approvedCtx = (ctx ? { ...ctx, acpApprovedArgs: structuredCloneJSON(args) } : ctx) as never;
 					const command =
 						target.name === "bash" && args && typeof args === "object" && !Array.isArray(args)
 							? stringProperty(args, "command")

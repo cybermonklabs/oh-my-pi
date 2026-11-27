@@ -118,6 +118,24 @@ describe("Tool argument coercion", () => {
 
 		expect(result.payload).toBe(nestedChainJson());
 	});
+
+	// A repair copies the arguments before it writes: an in-process caller's `Date` beside the repaired field must
+	// reach the tool as a `Date`, not as the string a JSON copy makes of it.
+	it("keeps a Date beside a coerced field", () => {
+		const tool: Tool = { name: "flagged", description: "", parameters: type({ flag: "boolean", when: "unknown" }) };
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-flagged",
+			name: "flagged",
+			arguments: { flag: "true", when: new Date(0) },
+		}) as { flag: unknown; when: unknown };
+
+		expect(result.flag).toBe(true);
+		expect(result.when).toBeInstanceOf(Date);
+		expect((result.when as Date).getTime()).toBe(0);
+	});
+
 	it("stringifies container values when a string union branch matches", () => {
 		const tool: Tool = {
 			name: "union-string",

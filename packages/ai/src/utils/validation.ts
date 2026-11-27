@@ -15,7 +15,6 @@ import { type Type, type } from "@oh-my-pi/omptype";
 import { parseLocalRefPointer } from "@oh-my-pi/omptype";
 import {
 	ContainerPath,
-	cloneJsonTree,
 	isRecord,
 	type NestedWalk,
 	runNested,
@@ -1867,7 +1866,9 @@ function coerceArgsFromIssues(
 		if (coercedValue === undefined) continue;
 
 		if (!owned) {
-			nextArgs = cloneJsonTree(nextArgs);
+			// As `structuredClone` copies (a `Date` or `Map` beside the repaired field stays one), at any depth
+			// `JSON.parse` reads; a member it refuses (a function an in-process caller passed) is left out.
+			nextArgs = structuredCloneJSON(nextArgs);
 			owned = true;
 			changed = true;
 		}

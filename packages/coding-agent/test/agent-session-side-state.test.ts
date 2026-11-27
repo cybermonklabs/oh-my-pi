@@ -496,4 +496,58 @@ describe("one-shot side request state", () => {
 			sent?.messages.some(message => message.role === "user" && message.content === "Earlier side question"),
 		).toBe(true);
 	}, 30_000);
+
+	// The turn copies the history the caller passes, so its pipeline cannot change the caller's messages: the copy must
+	// keep what `structuredClone` keeps, not turn a tool call's `Date` into a string and a result's `Map` into `{}`.
+	it("sends a side question's history with a Date and a Map as the caller passed them", async () => {
+		const usage = {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const call: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-1", name: "inspect", arguments: { since: new Date(0) } }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			timestamp: 2,
+			stopReason: "toolUse",
+			usage,
+		};
+		const result: Message = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "inspect",
+			content: [{ type: "text", text: "ok" }],
+			details: { files: new Map([["a.ts", 1]]) },
+			isError: false,
+			timestamp: 3,
+		};
+		let sent: Context | undefined;
+		const session = createSession((_model, context) => {
+			sent = context;
+			const stream = new AssistantMessageEventStream();
+			const message: AssistantMessage = { ...call, content: [{ type: "text", text: "Answer" }], stopReason: "stop" };
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		});
+
+		await session.runEphemeralTurn({ promptText: "Side question", history: [call, result] });
+
+		const sentCall = sent?.messages.find(message => message.role === "assistant");
+		const sentArguments = sentCall?.role === "assistant" ? sentCall.content[0] : undefined;
+		expect(sentArguments?.type === "toolCall" && sentArguments.arguments.since).toBeInstanceOf(Date);
+		const sentResult = sent?.messages.find(message => message.role === "toolResult");
+		const details = sentResult?.role === "toolResult" ? sentResult.details : undefined;
+		expect(typeof details === "object" && details !== null && "files" in details && details.files).toBeInstanceOf(
+			Map,
+		);
+	});
 });

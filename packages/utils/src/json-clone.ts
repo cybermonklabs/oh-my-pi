@@ -1,9 +1,18 @@
+import { stringifyDeepJson } from "./json";
 import { ContainerPath, isStackOverflow, type NestedWalk, runNested } from "./nested-walk";
 
 function isPlainObject(val: object): val is Record<string, unknown> {
 	return Object.getPrototypeOf(val) === Object.prototype || Array.isArray(val);
 }
 
+/**
+ * A copy of `value`: an array or an object whose prototype is
+ * `Object.prototype` as {@link structuredCloneDeep} copies it, so a `Map` or
+ * `Date` inside stays one; any other object, or one that `structuredClone`
+ * cannot copy (it holds a function or a symbol), as `JSON.parse` reads the
+ * JSON {@link stringifyDeepJson} writes of it, which leaves that member out.
+ * Both copy a value of any depth `JSON.parse` reads.
+ */
 export function structuredCloneJSON<T>(value: T): T {
 	// primitives|null|undefined, copy
 	if (!value || typeof value !== "object") {
@@ -13,12 +22,12 @@ export function structuredCloneJSON<T>(value: T): T {
 	// deep clone
 	if (isPlainObject(value)) {
 		try {
-			return structuredClone(value);
+			return structuredCloneDeep(value);
 		} catch {
-			// might still fail due to nested structures
+			// A function or symbol inside, which the JSON copy leaves out.
 		}
 	}
-	return JSON.parse(JSON.stringify(value)) as T;
+	return JSON.parse(stringifyDeepJson(value) as string) as T;
 }
 
 /**

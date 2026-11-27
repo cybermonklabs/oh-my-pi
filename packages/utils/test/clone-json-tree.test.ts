@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { cloneJsonTree, isStackOverflow, structuredCloneDeep } from "@oh-my-pi/pi-utils";
+import { cloneJsonTree, isStackOverflow, structuredCloneDeep, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 
 /** Levels past what a recursive copy reaches (about 12,000 for arrays); a transcript line holds 400,000. */
 const DEEP_LEVELS = 50_000;
@@ -233,4 +233,46 @@ describe("isStackOverflow", () => {
 		expect(isStackOverflow(new RangeError("first read"))).toBe(false);
 		expect(isStackOverflow(new Error("Maximum call stack size exceeded."))).toBe(false);
 	});
+});
+
+describe("structuredCloneJSON", () => {
+	/** How many `next` levels `value` nests, and what it holds at the bottom. */
+	const nesting = (value: unknown): { levels: number; bottom: unknown } => {
+		let node = value;
+		let levels = 0;
+		while (typeof node === "object" && node !== null && "next" in node) {
+			node = node.next;
+			levels++;
+		}
+		return { levels, bottom: node };
+	};
+
+	// A tool call's arguments are copied before a repair writes to them: arguments nested past `structuredClone`'s
+	// stack must still be copied as it copies them, a Map beside them included, not fail the call.
+	test("copies a value nested 50,000 levels as structuredClone does, keeping a Map beside it", () => {
+		let deep: Record<string, unknown> = { leaf: "bottom" };
+		for (let level = 0; level < DEEP_LEVELS; level++) deep = { next: deep };
+
+		const copy = structuredCloneJSON({ deep, map: new Map([["x", 1]]) });
+
+		expect({ deep: nesting(copy.deep), map: copy.map }).toEqual({
+			deep: { levels: DEEP_LEVELS, bottom: { leaf: "bottom" } },
+			map: new Map([["x", 1]]),
+		});
+		expect(copy.map).toBeInstanceOf(Map);
+	});
+
+	// An in-process caller's arguments can hold a function, which `structuredClone` refuses: the copy leaves it out,
+	// as the JSON copy always has, also when the arguments nest past `JSON.stringify`'s stack.
+	test("copies a value nested 50,000 levels that holds a function, leaving the function out as the JSON copy does", () => {
+		let deep: Record<string, unknown> = { leaf: "bottom" };
+		for (let level = 0; level < DEEP_LEVELS; level++) deep = { next: deep };
+
+		const copy = structuredCloneJSON({ deep, run: () => 1 });
+
+		expect({ deep: nesting(copy.deep), keys: Object.keys(copy) }).toEqual({
+			deep: { levels: DEEP_LEVELS, bottom: { leaf: "bottom" } },
+			keys: ["deep"],
+		});
+	}, 30_000);
 });
