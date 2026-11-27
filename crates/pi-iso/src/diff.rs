@@ -8,8 +8,8 @@
 //!   file. Binary entries surface as `diff: None`.
 //! - **Plain mode.** No `.git`; we walk both trees in parallel, short-circuit
 //!   on `(size, mtime-truncated-to-seconds)` equality, and emit a unified diff
-//!   for each surviving pair via `pi-diff`. NUL within the first 8 KiB
-//!   classifies the file as binary → `diff: None`.
+//!   via `pi-diff` for each surviving pair whose type or bytes differ. NUL
+//!   within the first 8 KiB classifies the file as binary → `diff: None`.
 //!
 //! Per the PAL contract: for binary files we don't materialize the bytes
 //! in the patch — callers that want them read directly from `merged`
@@ -268,18 +268,18 @@ fn walk_diff_blocking(lower: &Path, merged: &Path) -> IsoResult<Diff> {
 
 	for (rel, m_meta) in &merged_index {
 		match lower_index.get(rel) {
-			None => files.push(plain_change(merged, rel, ChangeKind::Added, None)?),
+			None => files.extend(plain_change(merged, rel, ChangeKind::Added, None)?),
 			Some(l_meta) => {
 				if metas_equal(l_meta, m_meta) {
 					continue;
 				}
-				files.push(plain_change(merged, rel, ChangeKind::Modified, Some(lower))?);
+				files.extend(plain_change(merged, rel, ChangeKind::Modified, Some(lower))?);
 			},
 		}
 	}
 	for rel in lower_index.keys() {
 		if !merged_index.contains_key(rel) {
-			files.push(plain_change(lower, rel, ChangeKind::Removed, None)?);
+			files.extend(plain_change(lower, rel, ChangeKind::Removed, None)?);
 		}
 	}
 
@@ -347,12 +347,17 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Metadata>) -> IsoRe
 ///
 /// `op == Modified` requires `peer_root = Some(lower)` so we can read the
 /// counterpart; `Added`/`Removed` only need the side we already know about.
+/// A `Modified` entry whose type and bytes match its counterpart's is no
+/// change and yields `None`: the walk's `(size, mtime)` short-circuit misses
+/// it when the same bytes were written again, or each side's write fell in
+/// another second. A text entry's block would be a bare `diff --git` header,
+/// which `git apply` reads together with the next file's lines.
 fn plain_change(
 	side: &Path,
 	rel: &Path,
 	op: ChangeKind,
 	peer_root: Option<&Path>,
-) -> IsoResult<FileChange> {
+) -> IsoResult<Option<FileChange>> {
 	let full = side.join(rel);
 	let (primary_link, primary) = read_entry(&full)?;
 	let (old_link, new_link, old_bytes, new_bytes) = match op {
@@ -362,28 +367,33 @@ fn plain_change(
 			let peer = peer_root.expect("modified change requires peer root");
 			let peer_full = peer.join(rel);
 			let (pl, peer_bytes) = read_entry(&peer_full)?;
+			if pl == primary_link && peer_bytes == primary {
+				return Ok(None);
+			}
 			(pl, primary_link, peer_bytes, primary)
 		},
 	};
 	let is_link = old_link || new_link;
 	if !is_link && (looks_binary(&old_bytes) || looks_binary(&new_bytes)) {
-		return Ok(FileChange { path: rel.to_path_buf(), op, diff: None });
+		return Ok(Some(FileChange { path: rel.to_path_buf(), op, diff: None }));
 	}
 	let (Ok(old_text), Ok(new_text)) =
 		(std::str::from_utf8(&old_bytes), std::str::from_utf8(&new_bytes))
 	else {
-		return Ok(FileChange { path: rel.to_path_buf(), op, diff: None });
+		return Ok(Some(FileChange { path: rel.to_path_buf(), op, diff: None }));
 	};
-	Ok(FileChange {
+	Ok(Some(FileChange {
 		path: rel.to_path_buf(),
 		op,
 		diff: Some(render_unified(rel, op, old_text, new_text, old_link, new_link)),
-	})
+	}))
 }
 
 /// Read one tree entry without following symlinks: regular files yield their
-/// contents, symlinks yield the link target so an out-of-tree target's data
-/// never lands in the patch (mirroring git's mode-120000 blob).
+/// contents, symlinks yield the link target's bytes so an out-of-tree target's
+/// data never lands in the patch (mirroring git's mode-120000 blob). A target
+/// that is not UTF-8 stays as it is, so two such targets compare by their
+/// bytes and the entry reads as text-unrepresentable.
 fn read_entry(path: &Path) -> IsoResult<(bool, Vec<u8>)> {
 	if std::fs::symlink_metadata(path)
 		.map_err(|err| IsoError::other(format!("metadata {}: {err}", path.display())))?
@@ -391,7 +401,7 @@ fn read_entry(path: &Path) -> IsoResult<(bool, Vec<u8>)> {
 	{
 		let target = std::fs::read_link(path)
 			.map_err(|err| IsoError::other(format!("readlink {}: {err}", path.display())))?;
-		return Ok((true, target.to_string_lossy().into_owned().into_bytes()));
+		return Ok((true, target.into_os_string().into_encoded_bytes()));
 	}
 	let bytes = std::fs::read(path)
 		.map_err(|err| IsoError::other(format!("read {}: {err}", path.display())))?;
@@ -521,7 +531,7 @@ mod tests {
 		path::{Path, PathBuf},
 		process::{Command, Stdio},
 		sync::atomic::{AtomicU64, Ordering},
-		time::{SystemTime, UNIX_EPOCH},
+		time::{Duration, SystemTime, UNIX_EPOCH},
 	};
 
 	use super::*;
@@ -587,11 +597,48 @@ mod tests {
 		lower: &[(&str, Entry)],
 		merged: &[(&str, Entry)],
 	) -> (TempDirGuard, String) {
+		apply_plain_diff_shifted(lower, merged, &[])
+	}
+
+	/// Move `path`'s mtime one second on, not following a symlink: the
+	/// entry reads as written in the second after its counterpart's, as when
+	/// a second boundary falls between a test's two writes of it. Fails when
+	/// the filesystem did not keep the move.
+	fn shift_mtime_a_second(path: &Path) {
+		let mtime = fs::symlink_metadata(path)
+			.and_then(|meta| meta.modified())
+			.expect("read test entry mtime");
+		fs::set_times_nofollow(
+			path,
+			fs::FileTimes::new().set_modified(mtime + Duration::from_secs(1)),
+		)
+		.expect("move test entry mtime");
+		let moved = fs::symlink_metadata(path)
+			.and_then(|meta| meta.modified())
+			.expect("read moved test entry mtime");
+		assert_eq!(
+			moved.duration_since(mtime).ok(),
+			Some(Duration::from_secs(1)),
+			"{} did not move one second on",
+			path.display()
+		);
+	}
+
+	/// [`apply_plain_diff`] with each `shifted` entry of `merged` moved one
+	/// second on ([`shift_mtime_a_second`]) before the walk.
+	fn apply_plain_diff_shifted(
+		lower: &[(&str, Entry)],
+		merged: &[(&str, Entry)],
+		shifted: &[&str],
+	) -> (TempDirGuard, String) {
 		let lower_dir = TempDirGuard::new();
 		let merged_dir = TempDirGuard::new();
 		let target_dir = TempDirGuard::new();
 		write_tree(lower_dir.path(), lower);
 		write_tree(merged_dir.path(), merged);
+		for name in shifted {
+			shift_mtime_a_second(&merged_dir.path().join(name));
+		}
 		// `git apply` starts from the lower state.
 		write_tree(target_dir.path(), lower);
 
@@ -714,6 +761,88 @@ mod tests {
 		);
 		assert_absent(target.path(), "link");
 		assert_entry_matches(target.path(), "keep.txt", &Entry::File("keep\n"));
+	}
+
+	/// The two tests above with `keep.txt`'s merged copy written in the next
+	/// second, as when a second boundary falls between its two writes: the
+	/// same bytes are no change, so the patch holds `link`'s block alone. A
+	/// bare `diff --git a/keep.txt b/keep.txt` block before it made `git apply`
+	/// read `link`'s lines as keep.txt's ("bad git-diff - expected /dev/null,
+	/// got keep.txt on line 4").
+	#[test]
+	fn identical_file_in_another_second_leaves_the_symlink_patch_applying() {
+		let (target, patch) = apply_plain_diff_shifted(
+			&[("keep.txt", Entry::File("keep\n"))],
+			&[("keep.txt", Entry::File("keep\n")), ("link", Entry::Link("data.bin"))],
+			&["keep.txt"],
+		);
+		assert!(patch.starts_with("diff --git a/link b/link\nnew file mode 120000\n"), "{patch}");
+		assert_entry_matches(target.path(), "link", &Entry::Link("data.bin"));
+		assert_entry_matches(target.path(), "keep.txt", &Entry::File("keep\n"));
+
+		let (target, patch) = apply_plain_diff_shifted(
+			&[("keep.txt", Entry::File("keep\n")), ("link", Entry::Link("data.bin"))],
+			&[("keep.txt", Entry::File("keep\n"))],
+			&["keep.txt"],
+		);
+		assert!(patch.starts_with("diff --git a/link b/link\ndeleted file mode 120000\n"), "{patch}");
+		assert_absent(target.path(), "link");
+		assert_entry_matches(target.path(), "keep.txt", &Entry::File("keep\n"));
+	}
+
+	/// A file, a binary file and a symlink with the same type and bytes on
+	/// both sides are no change, whichever second each side was written in;
+	/// only the added file is.
+	#[test]
+	fn identical_entries_in_another_second_are_no_change() {
+		let lower = TempDirGuard::new();
+		let merged = TempDirGuard::new();
+		let same = [
+			("keep.txt", Entry::File("keep\n")),
+			("keep.bin", Entry::File("\0keep")),
+			("link", Entry::Link("data.bin")),
+		];
+		write_tree(lower.path(), &same);
+		write_tree(merged.path(), &same);
+		write_tree(merged.path(), &[("new.txt", Entry::File("new\n"))]);
+		for (name, _) in &same {
+			shift_mtime_a_second(&merged.path().join(name));
+		}
+		let diff =
+			walk_diff_blocking(lower.path(), merged.path()).expect("plain walk should produce a diff");
+		let changes: Vec<_> = diff
+			.files
+			.iter()
+			.map(|change| (change.path.as_path(), change.op))
+			.collect();
+		assert_eq!(changes, [(Path::new("new.txt"), ChangeKind::Added)]);
+	}
+
+	/// Two link targets that differ only in bytes that are not UTF-8 are a
+	/// change, in whichever second each side was written: the walk compares
+	/// the targets' bytes, and such a target has no text.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn link_targets_that_differ_outside_utf8_are_a_change() {
+		use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+		let lower = TempDirGuard::new();
+		let merged = TempDirGuard::new();
+		let link = |dir: &TempDirGuard, target: &[u8]| {
+			std::os::unix::fs::symlink(OsStr::from_bytes(target), dir.path().join("link"))
+				.expect("create test symlink");
+		};
+		link(&lower, b"target\x80");
+		link(&merged, b"target\x81");
+		shift_mtime_a_second(&merged.path().join("link"));
+		let diff =
+			walk_diff_blocking(lower.path(), merged.path()).expect("plain walk should produce a diff");
+		let changes: Vec<_> = diff
+			.files
+			.iter()
+			.map(|change| (change.path.as_path(), change.op, change.diff.is_some()))
+			.collect();
+		assert_eq!(changes, [(Path::new("link"), ChangeKind::Modified, false)]);
 	}
 
 	#[test]
