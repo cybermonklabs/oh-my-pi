@@ -410,7 +410,7 @@ import {
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
 import { approvedPlanFileOf } from "./cold-message";
-import { type ContextCut, promptCacheEntryLapsed } from "./context-cut";
+import { promptCacheEntryLapsed } from "./prompt-cache-entry";
 import { COST_GATE_NOTICE_SOURCE, type CostCapRefusal, CostGate, type CostGateApi } from "./cost-gate";
 import { CREDENTIAL_DISABLED_NOTICE_SOURCE } from "./credential-disabled-notice";
 import { CyberPolicyClosure, type CyberPolicyClosureApi, installCyberPolicyGuard } from "./cyber-policy-closure";
@@ -707,8 +707,7 @@ const deferredExtensionLoadScope = new AsyncLocalStorage<true>();
 /**
  * Entries an entry fork at a branch's newest message carries when they follow it ({@link AgentSession.fork}): records
  * outside the model context that change no model, mode or thinking state, which the session writes after a reply
- * (warm refreshes and other usage, the cut rule's wait and refusal, hold and image-drop records, titles, labels,
- * credential pins).
+ * (warm refreshes and other usage, hold and image-drop records, titles, labels, credential pins).
  */
 const FORK_TRAILING_RECORD_TYPES: Partial<Record<SessionEntry["type"], true>> = {
 	custom: true,
@@ -3947,20 +3946,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// A request waits for a model switch in progress, so the first request on the new model carries its prompt.
 		this.addDisposer(this.agent.addBeforeModelCallHook(() => this.#tools.settleModelSwitch()));
 		// A held settings rebuild, and a kept restored transcript prompt, give way to this process's live build at the
-		// first request after a cut the cut rule admits under them that rewrites everything after the system prompt
-		// and tools anyway (its kept prefix `p` is at most their tokens: a compaction, a forced rescue), after the
-		// prompt cache entry lapses, or five minutes after the change they withhold, whichever comes first
-		// ({@link #releaseWithheldPromptChangesIfDue}). A cheaper cut, such as a tail prune, would turn into a rewrite
-		// of the whole prompt. A provider-context cut (an image clamp) is made in a request whose prompt is already
-		// taken, so it never counts.
-		this.addDisposer(
-			this.#maintenance.onContextCutAdmitted(cut => {
-				if (!this.#tools.withholdsPromptChange || cut.providerContext) return;
-				if (cut.prefixTokens <= computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision)) {
-					this.#tools.noteRewritingCutAdmitted();
-				}
-			}),
-		);
+		// first request after the prompt cache entry lapses or can no longer be read, or five minutes after the change
+		// they withhold, whichever comes first ({@link #releaseWithheldPromptChangesIfDue}). The lapse check carries
+		// the release at a compaction: the `compaction` entry it writes leaves the entry unreadable.
 		this.addDisposer(
 			this.agent.addBeforeModelCallHook(() => {
 				if (this.#promptSentWithheldChanges) {
@@ -6934,9 +6922,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/**
 	 * Sends what the prompt withholds to keep the cached prefix once it is due, so the request carries the rebuilt
 	 * prompt: a kept restored transcript prompt ({@link SessionTools.replaceRestoredPromptIfDue}) and a held settings
-	 * rebuild ({@link SessionTools.absorbHeldSettingsRebuild}), each at the first request after the cut rule admitted a
-	 * cut under it that rewrites every message, after the prompt cache entry it reads has lapsed, or five minutes after
-	 * the change it withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before a
+	 * rebuild ({@link SessionTools.absorbHeldSettingsRebuild}), each at the first request after the prompt cache entry
+	 * it reads has lapsed or can no longer be read (a compaction's `compaction` entry leaves it unreadable), or five
+	 * minutes after the change it withholds, whichever comes first, however warm requests kept the entry meanwhile. Called before a
 	 * user prompt takes its hidden notices, and before every main request; the first of the run that prompt starts
 	 * carries those notices, so it calls this only when the entry lapsed since they were written (the request writes
 	 * the whole prompt anyway), and what came due by its time goes out at the run's next request.
@@ -9392,15 +9380,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	get compactionSpeculation(): "idle" | "running" | "armed" {
 		return this.#maintenance.speculationState;
 	}
-	/**
-	 * Whether an automatic cut of the context runs now, by the cut rule over this session's figures
-	 * (`decideContextCut` in the agent's compaction package); see {@link SessionMaintenance.admitsContextCut}.
-	 * Called by provider-context transforms with a `providerContextCut()` cut, which never runs a held settings rebuild.
-	 */
-	admitsProviderContextCut(cut: ContextCut): boolean {
-		return this.#maintenance.admitsContextCut(cut);
-	}
-
 	/** Strip image content from the current branch and persist the rewrite. */
 	dropImages(): Promise<{ removed: number; tokensFreed: number }> {
 		return this.#maintenance.dropImages();
@@ -14615,9 +14594,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * tool calls whose results exist in the source session. Non-message entries between
 	 * results (labels, custom entries) are kept only when a later result follows them.
 	 * When the kept message is the newest of its branch, the cut goes on through the records
-	 * written after it ({@link FORK_TRAILING_RECORD_TYPES}: warm refreshes, the cut rule's
-	 * wait and refusal, hold records), each the only child of the one before up to the
-	 * branch's end, so the copy reads what the source holds after that message.
+	 * written after it ({@link FORK_TRAILING_RECORD_TYPES}: warm refreshes, hold records),
+	 * each the only child of the one before up to the branch's end, so the copy reads what
+	 * the source holds after that message.
 	 */
 	#resolveForkLeaf(entryId: string): string {
 		const answered = new Set<string>();
@@ -16750,13 +16729,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * The session's transcript was copied into another session file under a new id, which the conversation goes on in
 	 * (a whole-session fork, a fork or branch at an entry, a `/btw` branch, a move off a file another process writes):
 	 * every copy path follows it the same way. The records of a change the prompt withholds follow it
-	 * ({@link SessionTools.followTranscriptCopy}), so do the cut rule's wait and refusal
-	 * ({@link SessionMaintenance.followTranscriptCopy}), and, where `imageDrops` holds the image drops the session
+	 * ({@link SessionTools.followTranscriptCopy}), and, where `imageDrops` holds the image drops the session
 	 * recorded before a copy of part of it, those of the conversations the copy holds ({@link carryImageDrops}).
 	 */
 	#followSessionCopy(fromSessionId: string, imageDrops?: ReadonlyMap<string, RecordedImageDrop>): void {
 		this.#tools.followTranscriptCopy(fromSessionId);
-		this.#maintenance.followTranscriptCopy();
 		if (imageDrops && imageDrops.size > 0) {
 			const messages = this.#providerBoundary.buildDisplaySessionContext(this.model).messages;
 			carryImageDrops(this.sessionManager, imageDrops, convertToLlm(messages));
@@ -16862,8 +16839,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#clearInheritedProviderPromptCacheKey();
 			this.#syncAgentSessionId();
 			// A copy of the path goes on with the conversation, and so do the session's records that sat off it: those of
-			// a change its prompt withholds, the cut rule's wait and refusal, and the image drops of the conversations it
-			// holds.
+			// a change its prompt withholds, and the image drops of the conversations it holds.
 			if (leafId) this.#followSessionCopy(previousSessionId, imageDrops);
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();

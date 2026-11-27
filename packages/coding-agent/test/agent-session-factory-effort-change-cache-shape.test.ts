@@ -3,8 +3,7 @@
  * request-level `reasoning.effort` and carries a later thinking level change as a `configuration_update` item after the
  * newest content: the change leaves every cached message, and the prompt ahead of them, as the request before sent it.
  * The session must not count it as a change of the cache key, as it does not on OpenAI's own Responses API: counted as
- * one, the status line shows an entry the next request reads as cold, the warmer stops refreshing it, and the cut rule
- * admits a cut on an entry it reads as lost.
+ * one, the status line shows an entry the next request reads as cold, and the warmer stops refreshing it.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";

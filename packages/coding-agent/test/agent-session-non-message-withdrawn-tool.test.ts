@@ -1,7 +1,7 @@
 /**
  * On a model that keeps its tool declaration across a conversation, a tool taken off the roster stays declared: every
  * later request sends its definition again. The non-message figure (the status line, the Overview of `/context`, the
- * cut rule's and the compaction projections' fixed prefix) counts the tool definitions; it must count that one too, or
+ * compaction projections' fixed prefix) counts the tool definitions; it must count that one too, or
  * compaction starts late.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";

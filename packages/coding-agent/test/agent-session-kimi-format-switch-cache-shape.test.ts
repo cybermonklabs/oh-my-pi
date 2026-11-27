@@ -4,8 +4,8 @@
  * request after the setting changes reads none of the entry the requests before it wrote. The session's cache
  * decisions read the model a request goes out as, in the format it goes out in; switching the format switches that
  * model, and the session must count it as a change of the cache key, as it counts a switch to another model. Counted as
- * no change, the status line shows a warm entry the next request finds cold, the warmer keeps refreshing an entry no
- * request reads, and the cut rule charges a cut for rewriting an entry already lost.
+ * no change, the status line shows a warm entry the next request finds cold, and the warmer keeps refreshing an entry
+ * no request reads.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";

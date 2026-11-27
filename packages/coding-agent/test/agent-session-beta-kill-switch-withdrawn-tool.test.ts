@@ -2,7 +2,7 @@
  * Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` kill switch turns off mid-conversation tool changes on the
  * `anthropic` provider: a request under it declares the roster alone, and a tool taken off the roster leaves the
  * declaration. A transcript an earlier process recorded without the switch still holds that process's declaration.
- * The non-message figure (the status line, the compaction checks, the cut rule's prefix) must count only what the
+ * The non-message figure (the status line, the compaction checks) must count only what the
  * request declares: a withdrawn tool it counts though the request no longer sends it makes compaction start early.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";

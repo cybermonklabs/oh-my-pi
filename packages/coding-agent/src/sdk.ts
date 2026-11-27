@@ -225,7 +225,6 @@ import {
 	loadEffectiveAuthAccountPolicyConfig,
 } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
-import { providerContextCut } from "./session/context-cut";
 import { CostCapError, type CostGateApi, guardStreamFn } from "./session/cost-gate";
 import type { CyberPolicyClosureApi } from "./session/cyber-policy-closure";
 import {
@@ -5220,9 +5219,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// One transform per conversation: the date/cwd reminder remembers what each
 		// conversation was sent, and the image clamp what each request dropped, so
 		// the main loop and every advisor get their own. Only the main loop
-		// journals its reminders in the session, only its injector hears of the
-		// session's compactions, and only it asks the session's cut rule about its
-		// forced image drops: an advisor's history is not the session's. A side
+		// journals its reminders in the session, and only its injector hears of the
+		// session's compactions: an advisor's history is not the session's. A side
 		// request (`buildSideRequestContext`) is no part of the history either: it
 		// reads the conversation's image drops and changes none.
 		const createTransformProviderContext = (
@@ -5256,12 +5254,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			};
 		};
 		const dateCwdReminder = new DateCwdReminderInjector(createSessionDateCwdReminderJournal(sessionManager));
-		// A request past the image budget cannot be served without the drop, so the rule admits it
-		// as forced; asking it logs the decision. Each forced drop is kept in the session, so a resumed
-		// process drops the same images.
-		const mainImageClamp = new ProviderImageClamp(site => {
-			if (session) session.admitsProviderContextCut(providerContextCut(site));
-		}, sessionImageDropRecord(sessionManager));
+		// Each forced drop is kept in the session, so a resumed process drops the same images.
+		const mainImageClamp = new ProviderImageClamp(undefined, sessionImageDropRecord(sessionManager));
 		const transformProviderContext = createTransformProviderContext(dateCwdReminder, mainImageClamp);
 		const onPayload = async (payload: unknown, model?: Model, signal?: AbortSignal) => {
 			return await extensionRunner.emitBeforeProviderRequest(payload, model, signal);
@@ -6452,7 +6446,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					transformContext: async messages => wrapSteeringForModel(messages),
 					// The primary's chain, reminder placements and count-clamp image drops, so the capture matches its
 					// cached prompt; a drop of its own (a forced count drop, its byte-clamp drops) stays its own, out of
-					// the session's record, and never asks the session's cut rule.
+					// the session's record.
 					transformProviderContext: createTransformProviderContext(
 						new DateCwdReminderInjector({
 							...createSessionDateCwdReminderJournal(sessionManager),
