@@ -204,8 +204,16 @@ pub(super) fn target(
 					ctx.k.proc_state(ctx.cx.store, job.vpid),
 					Some(crate::bash::vm::ProcState::Exited(_))
 				)) {
-			// bash's `kill` finds the job gone once it reaped it.
-			job.unreaped = false;
+			// bash's `kill` finds the job gone only once it reaped it: its
+			// zombies take the signal. With job control `killpg` then finds
+			// no process group, and a zsh `kill` no job, which the script
+			// sees; without job control bash's `kill` succeeds whether it
+			// reaped the job or not, so this one tells nothing of a reap
+			// (three `kill -0 %1` before a plain `wait`, which bash's `wait`
+			// still reports).
+			if zsh.is_some() || job.control {
+				job.unreaped = false;
+			}
 			if zsh.is_some() {
 				return Err(TargetError::NoSuchJob);
 			}

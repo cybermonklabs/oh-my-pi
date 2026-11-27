@@ -693,9 +693,11 @@ pub struct Job {
 	/// unless the held signal ends that program for sure ([`Self::doomed`]);
 	/// cleared where bash would have reaped it: as the shell waits for a
 	/// foreground program or child (bash's `waitchld` takes in every child
-	/// that ended), once a `kill` finds the job gone (bash's `kill -0`
-	/// answers for a zombie until bash reaps it) or `jobs` finds it done
-	/// (bash shows a job done only once it reaped it). Read by `wait`
+	/// that ended), once a `kill` tells the script the job is gone (bash's
+	/// `kill -0` answers for a zombie until bash reaps it: a pid operand, or
+	/// a `%job` under job control; without it bash's `kill %N` succeeds on
+	/// the finished job either way) or `jobs` finds it done (bash shows a
+	/// job done only once it reaped it). Read by `wait`
 	/// (`builtins::flow`'s `wait_all`).
 	/// Kept in memory only: a job restored from the store or the frames image
 	/// counts as reaped.

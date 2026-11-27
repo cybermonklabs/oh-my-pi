@@ -1532,7 +1532,10 @@ fn a_kill_after_a_foreground_command_is_reaped_by_the_next() {
 /// not reaped the job: the plain `wait` waits for it and reports it (its
 /// notice goes to `/dev/null` here), and `jobs` then lists nothing. Reading
 /// `$!` makes obash decide the job's pid, and so spawn its program and end
-/// it, before the `wait`. bash 5.3.20's output, measured.
+/// it, before the `wait`. Nor does a `kill -0 %1` reap it, which succeeds
+/// on bash's unreaped job without job control: three of them let obash
+/// find the job ended (a pipeline's program, a `( … )` at once), and still
+/// the `wait` reports it. bash 5.3.20's output, measured.
 #[test]
 fn a_kill_with_no_foreground_command_after_it_is_waited_for() {
 	assert_both(&[
@@ -1546,6 +1549,20 @@ fn a_kill_with_no_foreground_command_after_it_is_waited_for() {
 		Both {
 			name:   "program",
 			script: r#"sleep 30 & kill -KILL %1; p=$!; wait 2>/dev/null; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\nend\n",
+			file:   "w=0\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "three-kill-0",
+			script: r#"sleep 30 | cat & kill -KILL %1; kill -0 %1; kill -0 %1; kill -0 %1; wait 2>/dev/null; echo "w=$?"; jobs; echo end"#,
+			out:    "w=0\nend\n",
+			file:   "w=0\nend\n",
+			err:    "",
+		},
+		Both {
+			name:   "subshell-three-kill-0",
+			script: r#"( sleep 30 ) & kill -KILL %1; kill -0 %1; kill -0 %1; kill -0 %1; wait 2>/dev/null; echo "w=$?"; jobs; echo end"#,
 			out:    "w=0\nend\n",
 			file:   "w=0\nend\n",
 			err:    "",
