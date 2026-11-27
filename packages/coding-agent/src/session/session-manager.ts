@@ -3889,23 +3889,27 @@ export class SessionManager {
 	 */
 	appendToolResultPrunes(pruned: readonly ToolResultPrune[]): string {
 		this.#bodyRevision++;
-		if (pruned.some(prune => this.#replacedLineMayExceedFetchCap(prune))) this.#rewriteRequired = true;
+		// Measure only when the record would be appended: a pending full rewrite
+		// already writes the blanked content inline.
+		const appends = this.#persist && this.#fileIsCurrent && !this.#rewriteRequired;
+		if (appends && pruned.some(prune => this.#replacedLineMayExceedFetchCap(prune))) this.#rewriteRequired = true;
 		return this.appendCustomEntry(TOOL_RESULT_PRUNE_CUSTOM_TYPE, toToolResultPruneData(pruned));
 	}
 
 	/**
-	 * Whether the result line `prune` blanked could have exceeded
-	 * {@link TRANSCRIPT_READ_CAP}. Measures the entry with its replaced content
-	 * as plain JSON, an upper bound: persistence shortens long strings and moves
-	 * images to the blob store. A result that cannot be measured counts as long.
+	 * Whether the result line `prune` blanked could exceed
+	 * {@link TRANSCRIPT_READ_CAP}. Measures the line `#lineFor` makes for the
+	 * entry with the content the pass replaced: the line in the file plus the
+	 * `prunedAt` the pass added. Plain JSON is not a bound, because persistence
+	 * can lengthen a line as well as shorten it (a short image data URL becomes a
+	 * longer blob reference). A result that cannot be measured counts as long.
 	 */
 	#replacedLineMayExceedFetchCap({ entryId, replaced }: ToolResultPrune): boolean {
 		const entry = this.#index.get(entryId);
-		if (entry?.type !== "message") return false;
+		if (entry?.type !== "message" || entry.message.role !== "toolResult") return false;
 		try {
-			const json = stringifyJson({ ...entry, message: { ...entry.message, content: replaced } }) ?? "";
-			// The line is this JSON and a newline: at TRANSCRIPT_READ_CAP bytes of JSON the newline misses the window.
-			return Buffer.byteLength(json, "utf8") >= TRANSCRIPT_READ_CAP;
+			const line = this.#lineFor({ ...entry, message: { ...entry.message, content: replaced } });
+			return Buffer.byteLength(line, "utf8") > TRANSCRIPT_READ_CAP;
 		} catch {
 			return true;
 		}
