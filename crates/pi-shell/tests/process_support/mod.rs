@@ -267,13 +267,23 @@ impl Run {
 
 	/// Run it and send it `sig` once `started` exists (the file the command
 	/// it waits for makes when it has started): to its process group when
-	/// `group` ([`Self::own_group`]), else to the shell alone. Then make
-	/// `started` with the extension `sent` (`$F.sent`), which a command waits
-	/// for to go on, so the signal comes while it runs however late it is
-	/// sent; and wait for the shell to end. A shell that ends before the
-	/// file exists fails the test; nextest's own timeout bounds one that
-	/// never makes it.
+	/// `group` ([`Self::own_group`]), else to the shell alone. Then release
+	/// both marks of the signal having been sent, so a command waiting for
+	/// one goes on however late the signal is; and wait for the shell to
+	/// end. A shell that ends before the file exists fails the test;
+	/// nextest's own timeout bounds one that never makes it.
+	///
+	/// The marks: `started` with the extension `sent` (`$F.sent`), which a
+	/// command polls for; and the FIFO `started` with the extension `fifo`
+	/// (`$F.fifo`), made before the shell starts and held open here until
+	/// the signal is sent, which a command blocks on and cannot end by
+	/// itself (a poll is a forked `/bin/sleep` of its own, and a shell that
+	/// waits for one reads the signal as that child's business:
+	/// process_signals' `SENT`). A command still running once the mark is
+	/// released reads the end of the FIFO and ends, so a row it fails ends
+	/// at once rather than at a timeout.
 	pub fn go_signalled(&self, started: &Path, sig: libc::c_int, group: bool) -> Outcome {
+		let fifo = make_fifo(&started.with_extension("fifo"));
 		let (mut cmd, _link_dir) = self.command();
 		let mut child = cmd
 			.stdout(Stdio::piped())
@@ -299,6 +309,7 @@ impl Run {
 		let sent = unsafe { libc::kill(if group { -pid } else { pid }, sig) };
 		assert_eq!(sent, 0, "signal the shell: {}", std::io::Error::last_os_error());
 		std::fs::File::create(started.with_extension("sent")).expect("mark the signal sent");
+		drop(fifo);
 		outcome(child.wait_with_output().expect("wait for the shell"))
 	}
 
@@ -372,6 +383,28 @@ pub fn absolute(program: &Path) -> PathBuf {
 	} else {
 		program.to_owned()
 	}
+}
+
+/// Make the FIFO `path` and hold it open: a command that reads it blocks
+/// at once (this end is open, so its own open does not wait) and can end
+/// only by a signal, until the returned handle is dropped, which gives
+/// the end of the file to a reader that has it open by then. One that
+/// opens it later waits for the next writer, so the caller releases the
+/// mark only once the command it waits for has blocked
+/// ([`Run::go_signalled`]).
+fn make_fifo(path: &Path) -> std::fs::File {
+	use std::os::unix::ffi::OsStrExt as _;
+	let name = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path with no NUL");
+	// SAFETY: `name` is a NUL-terminated path that lives across the call.
+	let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+	assert_eq!(made, 0, "make the FIFO {}: {}", path.display(), std::io::Error::last_os_error());
+	// Read and write, so that opening it here does not wait for the other
+	// end and dropping it gives a reader the end of the file.
+	std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.open(path)
+		.expect("open the FIFO")
 }
 
 fn outcome(out: std::process::Output) -> Outcome {
