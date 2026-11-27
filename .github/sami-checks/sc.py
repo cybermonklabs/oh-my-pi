@@ -52,6 +52,10 @@
   sc.py previous-report OUT                the previous cut's sc-report (results.json, verdict.json) into OUT, beside
                                            about.json naming its run, or why none could be read: the summary's
                                            SC_PREVIOUS, which it compares this run's failures with (first seen at this cut)
+  sc.py rust-findings FINDINGS OUT         one unit result per step of the Rust rows that writes a findings file
+                                           (.github/sami/findings.sh), from the sc-findings-<job> artifacts under
+                                           FINDINGS, so that the summary compares each of their findings and not only
+                                           the row's verdict; SC_RUST_JOBS names each job's result
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
 binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 nor 100, a bun run
@@ -76,7 +80,12 @@ completed push of release-candidate before the run, or the run the dispatch inpu
 A failure that report does not hold, by its words less the line or column that moves with other
 lines of the tree (FINDING_MOVES), or holds fewer times (finding_keys), heads the summary and is in
 verdict.json's first_seen. A report that could not be read makes first_seen the string UNKNOWN,
-and the summary says why: it never reads as nothing first seen.
+and the summary says why: it never reads as nothing first seen. Every row is compared finding by
+finding, the Rust rows too: their jobs' scripts write each `::error` they print to a findings file
+(.github/sami/findings.sh), whose records are the row's units here, so that a finding first made at
+a cut is named at that cut even where the row read FAIL at the cut before for other findings. A
+step whose findings file is missing or was cut short reads UNKNOWN, named under "Not compared"; a
+step whose job did not run reads NOT RUN, which is no gap.
 """
 
 import fnmatch
@@ -194,14 +203,30 @@ ROWS = (
     ("pi-builtins lint: clippy at the workspace's lint levels and rustfmt, the crate's opt-outs lifted (failed: a finding the fork "
      "added)", "builtins-lint"),
 )
-# The Rust tests (sami-rust-test.yml) report no units here: each of its two jobs is a row of its own,
-# read from the job's conclusion, which sami-checks.yml passes as SC_RUST_TESTS.
+# The Rust tests (sami-rust-test.yml) report no test units here: each of its two jobs is a row of
+# its own, read from the job's conclusion, which sami-checks.yml passes as SC_RUST_TESTS. The
+# findings of those rows' jobs (each `::error` their scripts wrote, .github/sami/findings.sh) are
+# units of the row all the same, so that the first-seen comparison reads each finding of a row
+# whose verdict is one word over all of them (RUST_FINDING_STEPS, sc.py rust-findings).
 RUST_JOBS = (
     ("Rust tests, Bazel and the other cargo workspaces (sami-rust-test.yml rust_test)", "rust_test"),
     ("Rust tests, macOS only (sami-rust-test.yml rust_test_macos)", "rust_test_macos"),
 )
 # The names the dispatch input `rows` takes, one per row of the summary.
 ROW_KEYS = tuple(k for _, k in ROWS) + tuple(k for _, k in RUST_JOBS)
+# The row keys of the Rust rows, whose findings move between their jobs (FINDING_MOVES, ANY_UNIT_ROWS).
+RUST_ROW_KEYS = tuple(k for _, k in RUST_JOBS)
+# The steps of each Rust row that write a findings file, by the job they run in: the unit of the
+# summary is `<job>/<step>`, and the file is <step>.tsv of the artifact sc-findings-<job>. The jobs
+# are the ones row_work gives the row (the selftest checks that they agree), so a job of a Rust row
+# that writes no findings file is named here all the same, and its unit reads UNKNOWN.
+RUST_FINDING_STEPS = {
+    "rust_test": (("rust-test", ("rust-test", "parity")),
+                  ("rust-test-cold", ("rust-test", "parity")),
+                  ("rust-test-drift", ("drift",)),
+                  ("rust-test-compare", ("verdict", "compare"))),
+    "rust_test_macos": (("rust-test-macos", ("inventory", "rust-test")),),
+}
 # The summary's exit for its verdict: a run that could not look (UNKNOWN) never exits with the code
 # of one that found a fault (FAIL), and a fault outranks a row that could not be read.
 SUMMARY_EXIT = {"PASS": 0, "FAIL": 1, "UNKNOWN": 2}
@@ -1365,9 +1390,12 @@ def fmt_secs(s):
 
 
 # The rows whose units are shards a test moves between (ts-ca: files by sorted index; workspace:
-# nextest's count partitions), where a known-failure entry may name `*` for any unit. On the other
-# rows a unit is a binary or a suite, and a test's name is unique only inside it.
-ANY_UNIT_ROWS = ("ts-ca", "workspace")
+# nextest's count partitions), where a known-failure entry may name `*` for any unit, and the first-
+# seen comparison reads a finding in any unit of the row. The Rust rows are here for the second
+# reason only: one job's step and the cold control's find the same thing, and the control runs every
+# fifth cut, so a finding compared in its own unit would read first seen at each cut that runs it.
+# On the other rows a unit is a binary or a suite, and a test's name is unique only inside it.
+ANY_UNIT_ROWS = ("ts-ca", "workspace") + RUST_ROW_KEYS
 
 
 def known_rows(path):
@@ -1694,29 +1722,59 @@ FINDING_MOVES = (
     (("checkts",), re.compile(r"^(.*?: exit [^\s:]+: )(.*)$"), lambda m: m[1] + re.sub(r"\(\d+,\d+\)|:\d+:\d+", "(#)", m[2])),
     # A platform test that did not pass: the verdict the platform checks add to it (` (TIMEOUT)`).
     (PLATFORMS, re.compile(r" \([A-Z_]+\)$"), ""),
+    # A Rust row's finding (`<title>: <message>`, the annotation its job's script wrote): the sample
+    # of what it found that the message ends with (the first line of many, the line a test printed,
+    # the tests a filter took out, the names libtest-bound stopped), each place's line and column,
+    # and every count. What is left is the title, the target, the test and the complaint, so that a
+    # target that fails to build is one finding at every cut, and one more test of it is not another.
+    # Each rule is applied at every place of the words, not only the first.
+    (RUST_ROW_KEYS, re.compile(r", the first: .*$"), ""),
+    (RUST_ROW_KEYS, re.compile(r"(so it checked nothing): .*$"), r"\1"),
+    (RUST_ROW_KEYS, re.compile(r"(, not exactly that one of \S+): .*$"), r"\1"),
+    (RUST_ROW_KEYS, re.compile(r"(; libtest-bound\.py stopped it and failed these[^:]*): .*$"), r"\1"),
+    (RUST_ROW_KEYS, re.compile(r"(reported )\[[^\]]*\]"), r"\1[the tests it reported]"),
+    (RUST_ROW_KEYS, re.compile(r"([^\s:]+\.(?:rs|ts|toml|tsv|txt|log|json|awk|sh)):\d+(?::\d+)?"), r"\1"),
+    # A count stands alone and is no exit code: a digit joined to a word by `-` or `_` is part of a
+    # name, and an invocation's name (`own-0`, `own-1`, `sticky-root-2`, `ignored-opt-3`) tells one
+    # test's own run from another's where the message names the invocation and not the test; a
+    # number after `exited ` is a command's exit code, and Bazel's 8 (interrupted) and 36 (a local
+    # environment it cannot trust) are different faults.
+    (RUST_ROW_KEYS, re.compile(r"(?<!exited )(?<![\w-])\d+(?![\w-])"), "#"),
 )
 # A CHANGELOG the check would rewrite, `path: 0 promoted item(s), ..., 28 collapsed release(s); from
 # line N: <its first changed lines>` (parse_changelog): one finding per kind of rewrite, counted.
 CHANGELOG_KINDS = re.compile(r"^([^\s:]+): ([^;]*)(?:; .*)?$")
+# check:ts's one failure, `check:ts: exit N: <its last lines, joined by ` / `>` (parse_plain): one
+# finding per type error of those lines, `path: error TSnnnn: <message>`, so that another error
+# among them is first seen. The line and column are left out, as FINDING_MOVES leaves them out of
+# the whole failure. What it cannot see: an error above the last lines parse_plain keeps.
+CHECKTS_ERROR = re.compile(r"(\S+)\(\d+,\d+\): (error TS\d+: .*?)(?= / |$)")
 # How many of the failures of a unit with no result at the previous cut its first_seen entry names
 # (and each that names a planted run's plant).
 FIRST_SEEN_NAMED = 10
 
 
 def finding_key(row, failure):
-    """A failure's identity across cuts: its words without what FINDING_MOVES says moves in its row."""
+    """A failure's identity across cuts: its words without what FINDING_MOVES says moves in its row,
+    taken out at every place of the words (each rule of the rows before the Rust ones can match only
+    once: it is anchored to the start or the end of the failure)."""
     for rows, pattern, repl in FINDING_MOVES:
         if row in rows:
-            failure = pattern.sub(repl, failure, count=1)
+            failure = pattern.sub(repl, failure)
     return failure
 
 
 def finding_keys(row, failure):
     """The findings one failure names, {key: how many}: a CHANGELOG the check would rewrite is one
     finding per kind of rewrite it needs, `path: <kind>`, as many as the check counts (so one more
-    empty heading in a file that had one is first seen); any other failure is one, finding_key."""
+    empty heading in a file that had one is first seen); check:ts's one failure is one finding per
+    type error of the lines it holds, so that another error among them is first seen; any other
+    failure is one, finding_key."""
     m = CHANGELOG_KINDS.match(failure) if row == "changelog" else None
     kinds = {f"{m[1]}: {k.strip()}": int(n) for n, k in re.findall(r"(\d+) ([^,]+)", m[2]) if n != "0"} if m else {}
+    if not kinds and row == "checkts":
+        for path, said in CHECKTS_ERROR.findall(failure):
+            kinds[f"{path}: {said}"] = kinds.get(f"{path}: {said}", 0) + 1
     return kinds or {finding_key(row, failure): 1}
 
 
@@ -1772,6 +1830,11 @@ def read_previous(path):
                 or not all(isinstance(f, str) for f in r["failures"]) or not isinstance(r.get("self_skipped", []), list):
             return None, None, against, (f"its results.json is not a list of unit results: entry {i} has no "
                                          + (", ".join(lacks) if lacks else "list of test names, failures and self-skips"))
+        # A unit whose job did not run at that cut (a Rust row's cold control, which runs every
+        # fifth cut) is left out of the index: it held no finding and it looked for none, so it must
+        # neither let a finding of this cut read standing nor make its row read UNKNOWN there.
+        if r["status"] == "NOT RUN":
+            continue
         fails = {}
         for f in r["failures"]:
             for k, n in finding_keys(r["row"], f).items():
@@ -1807,7 +1870,10 @@ def row_first_seen(row, rs, index, reading, keep=None):
     naming it here is then listed), with the evidence in `previous`; and one entry for each unit with
     failures that has no result there at all, whose failures none could be compared: it counts them
     (`failed`) and names the first FIRST_SEEN_NAMED and each that KEEP(f) holds (`failures`: a planted
-    run's plant). READING(r, f): the summary's word for a failure, NEW or KNOWN."""
+    run's plant). READING(r, f): the summary's word for a failure, NEW or KNOWN. On a Rust row one
+    finding is one fault, which two jobs of the row report when both ran (the cold control is the
+    seeded job again), so there a finding is compared by whether the previous cut had it, not by how
+    many places have it, and one entry names it."""
     groups = {}
     for r in rs:
         for f in r["failures"]:
@@ -1830,6 +1896,9 @@ def row_first_seen(row, rs, index, reading, keep=None):
             for k, n in finding_keys(row, f).items():
                 counts[k] = counts.get(k, 0) + n
                 naming.setdefault(k, []).append((r, f))
+        if row in RUST_ROW_KEYS:
+            counts = {k: 1 for k in counts}
+            naming = {k: v[:1] for k, v in naming.items()}
         marks = {}
         for k, n in counts.items():
             m = fails.get(k, 0)
@@ -1856,23 +1925,112 @@ def row_first_seen(row, rs, index, reading, keep=None):
     return out
 
 
-def rust_first_seen(row_verdicts, prev_rows):
-    """The Rust rows (RUST_JOBS), read from their jobs' conclusions, compared by verdict: a FAIL that
-    the previous cut's verdict.json does not give the row is first seen; a FAIL at both cuts is not
-    compared, since the summary reads none of the job's tests. Returns (entries, not compared)."""
+def read_findings(path):
+    """One findings file (.github/sami/findings.sh, SAMI_FINDINGS): ([(kind, title, message)], why).
+    A line is `finding<TAB><title><TAB><message>`, `stop<TAB><title><TAB><message>` (the step
+    stopped there) or the last line, `end<TAB><how many findings>`. why is None when the file is
+    whole: every line is a record, the end line is its last, and it counts the findings the file
+    holds. Else why says what is wrong with it: the findings it does hold are returned all the same,
+    and its unit reads UNKNOWN, since what the step would have found after is not known."""
+    try:
+        lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError as e:
+        return [], f"it could not be read ({type(e).__name__}: {e})"[:300]
+    out = []
+    for i, line in enumerate(lines):
+        parts = line.split("\t")
+        if parts[0] in ("finding", "stop") and len(parts) == 3:
+            out.append((parts[0], parts[1], parts[2]))
+        elif parts[0] == "end" and len(parts) == 2 and parts[1].isascii() and parts[1].isdigit():
+            held = sum(1 for k, _, _ in out if k == "finding")
+            if i != len(lines) - 1:
+                return out, f"its end line is line {i + 1} of {len(lines)}, and it must be its last"
+            if any(k == "stop" for k, _, _ in out):
+                return out, "it holds both a record of a step that stopped and an end line"
+            if int(parts[1]) != held:
+                return out, f"its end line counts {parts[1]} finding(s), and it holds {held}"
+            return out, None
+        else:
+            return out, f"its line {i + 1} is no record of a findings file: {line[:120]!r}"
+    if out and out[-1][0] == "stop":
+        return out, (f"the step stopped at its last finding ({out[-1][1]}), so what it would have found after it is "
+                     "not known")
+    return out, ("it is empty, so the step wrote no record at all" if not lines else
+                 "it has no end line, so the step was cut short before it had looked at everything")
+
+
+def rust_findings_results(findings_dir, conclusions):
+    """One unit result per step of the Rust rows that writes findings (RUST_FINDING_STEPS), read from
+    FINDINGS_DIR, which holds the artifact sc-findings-<job> of each of their jobs as a directory of
+    that name. CONCLUSIONS is {job: its result} (SC_RUST_JOBS). A step's unit is `<job>/<step>`, and
+    its status is FAIL when it found something, PASS when it looked and found nothing, UNKNOWN when
+    its file is missing, cannot be read whole or holds a step that stopped, and NOT RUN when its job
+    did not run (`skipped`, or no result at all), which is no gap: its findings would be its row's
+    other jobs' too. Only a unit that ran may let a finding of the next cut read standing, so a NOT
+    RUN unit is left out of the next cut's index (read_previous)."""
+    out = []
+    for row, jobs in RUST_FINDING_STEPS.items():
+        for job, steps in jobs:
+            conclusion = conclusions.get(job, "")
+            for step in steps:
+                unit, path = f"{job}/{step}", os.path.join(findings_dir, f"sc-findings-{job}", f"{step}.tsv")
+                if not os.path.exists(path):
+                    if conclusion in ("", "skipped"):
+                        out.append(result(row, unit, "runner", "NOT RUN", "-", 0,
+                                          note=f"the {job} job did not run (its result is [{conclusion or 'none'}])"))
+                    else:
+                        out.append(result(row, unit, "runner", "UNKNOWN", "-", 0,
+                                          note=f"the {job} job ended [{conclusion}] and this step wrote no findings file "
+                                               f"({path}), so what it found is not known"))
+                    continue
+                found, why = read_findings(path)
+                fails = [f"{t}: {m}" for _, t, m in found]
+                out.append(result(row, unit, "runner", "UNKNOWN" if why else ("FAIL" if fails else "PASS"), "-", 0,
+                                  failed=len(fails), failures=fails,
+                                  note=(f"its findings file could not be read whole: {why}; it holds {len(fails)} finding(s)"
+                                        if why else f"the step found {len(fails)} thing(s) and reached its end")))
+    return out
+
+
+def cmd_rust_findings(findings_dir, out_dir):
+    """sami-checks.yml's step before the summary: the Rust rows' findings as unit results, which the
+    summary reads with every other result, so that each of them is compared with the previous cut's
+    (row_first_seen). The row's verdict is still its job's conclusion (SC_RUST_TESTS)."""
+    os.makedirs(out_dir, exist_ok=True)
+    conclusions = dict(p.split("=", 1) for p in os.environ.get("SC_RUST_JOBS", "").split() if "=" in p)
+    for r in rust_findings_results(findings_dir, conclusions):
+        with open(os.path.join(out_dir, r["unit"].replace("/", "_") + ".json"), "w", encoding="utf-8") as f:
+            json.dump(r, f)
+        print(f"RUST FINDINGS {r['row']} {r['unit']}: {r['status']}, {len(r['failures'])} finding(s): {r['note']}")
+
+
+def rust_first_seen(row_verdicts, prev_rows, read):
+    """The Rust rows (RUST_JOBS) beside their findings (row_first_seen reads those): READ is
+    {row: ([the units that looked], [(unit, why it could not be read)])}. A row no unit of which
+    could be read is compared by its verdict alone, as it was before its jobs wrote their findings:
+    a FAIL the previous cut's verdict.json does not give the row is first seen, and a FAIL at both
+    cuts is named as not compared. A unit that could not be read is named as not compared whatever
+    the row's verdict, since a finding of it is in no list. Returns (entries, not compared)."""
     out, blind = [], []
     for title, job in RUST_JOBS:
-        if row_verdicts.get(job) != "FAIL":
+        if row_verdicts.get(job) in (None, "NOT RUN"):
+            continue
+        looked, unread = read.get(job, ([], []))
+        for unit, why in unread:
+            blind.append(f"{title}: `{unit}` could not be read, so its findings are in no list: {why}")
+        if looked or row_verdicts.get(job) != "FAIL":
             continue
         before = prev_rows.get(job) if prev_rows is not None else None
         if prev_rows is None:
-            blind.append(f"{title}: FAIL, and the previous cut's verdict.json gives no row verdicts to compare it with")
+            blind.append(f"{title}: FAIL, no unit of it could be read, and the previous cut's verdict.json gives no row "
+                         "verdicts to compare its verdict with")
         elif before == "FAIL":
-            blind.append(f"{title}: FAIL at this cut and at the previous one; the summary reads none of its tests, so a test "
-                         "that first failed here is not seen (that job's annotations and log name them)")
+            blind.append(f"{title}: FAIL at this cut and at the previous one, and no unit of it could be read, so a finding "
+                         "first made here is not seen (that job's annotations and log name them)")
         else:
             out.append({"kind": "row", "row": job, "who": None, "unit": None, "finding": "the row reads FAIL", "reading": None,
-                        "previous": f"it read {before or 'nothing: the row was not in its report'} at the previous cut"})
+                        "previous": f"it read {before or 'nothing: the row was not in its report'} at the previous cut, and no "
+                                    "unit of it could be read here, so its findings were not compared"})
     return out, blind
 
 
@@ -2182,8 +2340,13 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): `{f}`: partial: {n} sub-cases skipped ({why})")
     # SC_RUST_TESTS is "rust_test=<result> rust_test_macos=<result>". success passes and failure fails;
     # a job with no result (SC_RUST_TESTS absent too), or with any other (cancelled, skipped), is
-    # UNKNOWN. A Rust row this run did not plan reads NOT RUN.
+    # UNKNOWN. A Rust row this run did not plan reads NOT RUN. The row's verdict is that one word
+    # over every finding of its jobs, so the findings themselves are units of the row (sc.py
+    # rust-findings, from each job's sc-findings artifact), read here as any other row's are: each
+    # one compared with the previous cut's, each unit that could not be read named, and each unit
+    # whose job did not run named as that and not as a gap.
     conclusions = dict(p.split("=", 1) for p in os.environ.get("SC_RUST_TESTS", "").split() if "=" in p)
+    rust_read = {}
     for title, job in RUST_JOBS:
         if job not in run_rows:
             lines.append(f"| {title} | **NOT RUN** | - | - | - |")
@@ -2191,11 +2354,38 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             continue
         conclusion = conclusions.get(job, "")
         verdict = {"success": "PASS", "failure": "FAIL"}.get(conclusion, "UNKNOWN")
-        lines.append(f"| {title} | **{verdict}** | - | - | - |")
+        # Every step of the row that writes findings is expected, as expected_units expects every
+        # unit of the other rows: a step sc.py rust-findings wrote no result for (it failed partway,
+        # or its job's artifact never landed) reads UNKNOWN here by name, never as a row that found
+        # less. A result of a step this table does not name is kept as it is.
+        want_rust = [f"{j}/{step}" for j, steps in RUST_FINDING_STEPS[job] for step in steps]
+        got_rust = {r["unit"]: r for r in results if r["row"] == job}
+        rs = [got_rust.get(u) or result(job, u, "runner", "UNKNOWN", "-", 0,
+                                        note="no result: sc.py rust-findings wrote none for this step, so what it found "
+                                             "is not known (that step failed, or the summary job could not read its artifact)")
+              for u in want_rust]
+        rs += [r for u, r in got_rust.items() if u not in set(want_rust)]
+        n = {s: sum(1 for r in rs if r["status"] == s) for s in ("PASS", "FAIL", "UNKNOWN", "NOT RUN")}
+        units = (f"{n['PASS']} / - / {n['FAIL']} / {n['UNKNOWN']}" + (f" ({n['NOT RUN']} did not run)" if n["NOT RUN"] else "")
+                 if rs else "-")
+        lines.append(f"| {title} | **{verdict}** | {units} | {sum(len(r['failures']) for r in rs)} finding(s) | - |")
         row_verdicts[job] = verdict
+        rust_read[job] = ([r["unit"] for r in rs if r["status"] in ("PASS", "FAIL")],
+                          [(r["unit"], r["note"]) for r in rs if r["status"] == "UNKNOWN"])
         if verdict != "PASS":
             details.append(f"- **{title}**: {verdict}: the job's conclusion is [{conclusion or 'none'}]; "
                            "its failing tests are in that job's annotations and log")
+        seen_here = [] if prev_index is None else row_first_seen(
+            job, rs, prev_index, lambda r, f: "NEW" if failure_reason(r, job, f)[0] is None else "KNOWN")
+        first_seen += seen_here
+        seen_said = {(e["unit"], e["who"], e["finding"]): e["previous"] for e in seen_here if e["kind"] == "failure"}
+        for r in rs:
+            if r["status"] in ("UNKNOWN", "NOT RUN"):
+                details.append(f"- **{title}** `{r['unit']}`: {r['status']}: {r['note']}")
+            for f in r["failures"]:
+                details.append(f"- **{title}** `{r['unit']}`: FOUND `{f}`"
+                               + (f": **first seen at this cut** ({seen_said[(r['unit'], r['who'], f)]})"
+                                  if (r["unit"], r["who"], f) in seen_said else ""))
     # A planted run (the dispatch input `plant`) says so first, and whether the control caught its plant.
     plant = os.environ.get("SC_PLANT", "")
     top, caught = [], None
@@ -2227,7 +2417,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         if plant:
             plant_seen = "UNKNOWN"
     else:
-        rust_seen, blind = rust_first_seen(row_verdicts, prev_rows)
+        rust_seen, blind = rust_first_seen(row_verdicts, prev_rows, rust_read)
         first_seen += rust_seen
         seen_record = first_seen
         seen_top = [f"### First seen at this cut: {len(first_seen) or 'none'}, against {prev_from}", "",
@@ -5056,7 +5246,8 @@ def selftest():
              ("failure", "membench", MEMBENCH_UNIT, panic3.format(251, "every idle vproc frees its frame"), "NEW",
               "its unit did not have it at the previous cut"),
              ("unit", "builtins-lint", "clippy", "2 failure(s)", None, "the previous cut's report has no result for its unit"),
-             ("row", "rust_test", None, "the row reads FAIL", None, "it read PASS at the previous cut")]
+             ("row", "rust_test", None, "the row reads FAIL", None, "it read PASS at the previous cut, and no unit of it "
+              "could be read here, so its findings were not compared")]
     out, rec = summary3(previous3(prev_units3, about={"from": from3, "why": None}))
     check("first seen: a new finding (the plant's link) is in first_seen",
           (isinstance(seen3(rec), list), plant_entry in (seen3(rec) if isinstance(seen3(rec), list) else [])), (True, True))
@@ -5090,8 +5281,16 @@ def selftest():
               ("skipforms", "a skip print the summary does not read: crates/a.rs:3: 'skipped x'", "a skip print the summary does not read: crates/a.rs:9: 'skipped x'"),
               ("skipforms", "a skip line the summary does not read: 'skipped x', printed 2 time(s), first by r t",
                "a skip line the summary does not read: 'skipped x', printed 5 time(s), first by r u"),
-              ("macos", "pi-shell::a::b (TIMEOUT)", "pi-shell::a::b"))],
-          [True] * 9)
+              ("macos", "pi-shell::a::b (TIMEOUT)", "pi-shell::a::b"),
+              ("rust_test", "Rust tests: //crates/a:a_test b passed 7 tests, and .github/sami/rust-test-root-targets.txt names 8",
+               "Rust tests: //crates/a:a_test b passed 9 tests, and .github/sami/rust-test-root-targets.txt names 10"),
+              ("rust_test", "Rust test printed: crates/a/src/lib.rs:3: a doctest rustdoc runs prints (println!)",
+               "Rust test printed: crates/a/src/lib.rs:90: a doctest rustdoc runs prints (println!)"),
+              ("rust_test", "Rust tests: //crates/a:a_test wrote 3 lines outside libtest's record that x does not name "
+               "(a skip in other words?), the first: hello",
+               "Rust tests: //crates/a:a_test wrote 5 lines outside libtest's record that x does not name "
+               "(a skip in other words?), the first: goodbye"))],
+          [True] * 12)
     check("finding_keys: two findings stay two",
           [set(finding_keys(row, a)) == set(finding_keys(row, b)) for row, a, b in (
               ("docs", "crates/x/src/a.rs:12:5: unresolved link to 'A'", "crates/x/src/b.rs:12:5: unresolved link to 'A'"),
@@ -5101,8 +5300,18 @@ def selftest():
               ("membench", panic3.format(249, "state_bytes <= 256"), panic3.format(251, "state_bytes <= 128")),
               ("membench", "exit 101: x", "exit 134: x"),
               ("checkts", "check:ts: exit 2: a.ts(3,5): error TS2322: Type 'x'", "check:ts: exit 2: a.ts(3,5): error TS2345: Type 'x'"),
-              ("set-runner", "a::b_1", "a::b_2"))],
-          [False] * 8)
+              ("set-runner", "a::b_1", "a::b_2"),
+              ("rust_test", "Rust tests: //crates/a:a_test b_1 failed and is not in x", "Rust tests: //crates/a:a_test b_2 failed and is not in x"),
+              ("rust_test", "Rust tests: //crates/a:a_test b failed and is not in x", "Rust test skips: //crates/a:a_test b failed and is not in x"),
+              ("rust_test", "Rust tests: //crates/a:a_test b failed and is not in x", "Rust tests: //crates/b:b_test b failed and is not in x"))],
+          [False] * 11)
+    # check:ts's one failure holds every type error of its last lines: another error among them is
+    # first seen, and the same errors at other places are standing.
+    check("finding_keys: check:ts names each type error of its last lines",
+          (finding_keys("checkts", "check:ts: exit 2: a.ts(3,5): error TS2322: Type 'x' / b.ts(9,1): error TS2345: Type 'y' / Found 2 errors."),
+           set(finding_keys("checkts", "check:ts: exit 2: a.ts(3,5): error TS2322: Type 'x' / Found 1 error."))
+           < set(finding_keys("checkts", "check:ts: exit 2: a.ts(4,5): error TS2322: Type 'x' / c.ts(1,1): error TS2300: Type 'z' / Found 2 errors."))),
+          ({"a.ts: error TS2322: Type 'x'": 1, "b.ts: error TS2345: Type 'y'": 1}, True))
     check("finding_keys: a CHANGELOG counts each kind of rewrite it needs",
           finding_keys("changelog", clog3.format(2)), {"packages/y/CHANGELOG.md: removed empty heading(s)": 2,
                                                        "packages/y/CHANGELOG.md: collapsed release(s)": 3})
@@ -5198,10 +5407,14 @@ def selftest():
           ([], True, True, False))
     # A Rust row that failed at both cuts is not compared: the summary reads none of its tests.
     out, rec = summary3(previous3(prev_units3, rows=dict(prev_rows3, rust_test="FAIL")))
-    check("first seen: a Rust row that failed at both cuts is named as not compared",
+    check("first seen: a Rust row that failed at both cuts is named as not compared, with each of its steps",
           ([e for e in seen3(rec) if e[0] == "row"] if isinstance(seen3(rec), list) else seen3(rec),
-           [b.split(":")[0] for b in rec.get("first_seen_not_compared", [])],
-           "Not compared with the previous cut:" in out), ([], [RUST_JOBS[0][0]], True))
+           sorted({b.split(":")[0] for b in rec.get("first_seen_not_compared", [])}),
+           [b for b in rec.get("first_seen_not_compared", []) if "FAIL at this cut and at the previous one" in b][:1],
+           "Not compared with the previous cut:" in out),
+          ([], sorted({RUST_JOBS[0][0], RUST_JOBS[1][0]}),
+           [f"{RUST_JOBS[0][0]}: FAIL at this cut and at the previous one, and no unit of it could be read, so a finding "
+            "first made here is not seen (that job's annotations and log name them)"], True))
     # previous-report: which run it reads, and why it reads none, with gh api's answers stood in for.
     def fake_api(routes):
         def api(path):
@@ -5277,6 +5490,245 @@ def selftest():
           (None, "the previous run could not be found: gh api repos/o/r/actions/runs/7 exited 1: gh: Not Found (HTTP 404)"))
     check("previous-report: a named run that is no run id", fetch(good, "latest")[:2], (None, "the dispatch input previous ('latest') is no run id"))
 
+    # The Rust rows, finding by finding (.github/sami/findings.sh, RUST_FINDING_STEPS). The measured
+    # case: crates/pi-shell/BUILD.bazel named a test file upstream had deleted, so from Cut15 the row
+    # read `a target failed to build` and `zle_vi_pty_test is a test target, but bazel test has no
+    # result for it`; the row read FAIL at Cut14 for other findings, so the row's verdict did not
+    # change and three cuts were published over it. Here each finding of the row is compared.
+    rt_dir = os.path.join(d, "rust-findings")
+
+    def findings_text(*records, end=True):
+        """A findings file: ("finding"|"stop", title, message) records, with the end line unless END."""
+        lines = ["\t".join(r) for r in records]
+        if end:
+            lines.append("end\t%d" % sum(1 for r in records if r[0] == "finding"))
+        return "".join(line + "\n" for line in lines)
+
+    def findings_at(files):
+        """FILES is {(job, step): its text}; a (job, step) it does not name has no file."""
+        shutil.rmtree(rt_dir, ignore_errors=True)
+        for (job, step), text in files.items():
+            os.makedirs(os.path.join(rt_dir, f"sc-findings-{job}"), exist_ok=True)
+            open(os.path.join(rt_dir, f"sc-findings-{job}", f"{step}.tsv"), "w", encoding="utf-8").write(text)
+        return rt_dir
+
+    build_fail = ("finding", "Rust tests", "a target failed to build (Bazel's FAILED TO BUILD lines above name it); no list "
+                  "line can account for that")
+    no_result = ("finding", "Rust tests", "//crates/pi-shell:pi-shell_integration_tests_tests/zle_vi_pty_test is a test target, "
+                 "but bazel test has no result for it: skipped as incompatible with the runner, left out by a test filter, or "
+                 "not built")
+    standing = ("finding", "Rust tests", "//crates/pi-shell:pi-shell_test bash::vm::ended_subshell_output::"
+                "a_cancel_runs_no_trap_in_an_ended_subshell failed and is not in .github/sami/rust-test-known-failures.txt")
+    listed = ("finding", "Rust test skips", "//crates/pi-shell:pi-shell_test (main) reported 4310 tests and filtered out 2, "
+              "but its binary lists 4313")
+    listed_moved = ("finding", "Rust test skips", "//crates/pi-shell:pi-shell_test (main) reported 4330 tests and filtered out "
+                    "3, but its binary lists 4334")
+    printed = ("finding", "Rust test printed", "crates/pi-shell/src/sys/fs.rs:12: a doctest rustdoc runs prints (println!)")
+    printed_moved = ("finding", "Rust test printed", "crates/pi-shell/src/sys/fs.rs:40: a doctest rustdoc runs prints (println!)")
+    check("rust findings: a whole file reads its records",
+          read_findings(findings_at({("rust-test", "rust-test"): findings_text(build_fail, standing)})
+                        + "/sc-findings-rust-test/rust-test.tsv"),
+          ([build_fail, standing], None))
+    for label, text, why in (
+            ("a file with no end line", findings_text(build_fail, end=False),
+             "it has no end line, so the step was cut short before it had looked at everything"),
+            ("an empty file", "", "it is empty, so the step wrote no record at all"),
+            ("a file whose end line counts another number", "finding\tRust tests\tx\nend\t2\n",
+             "its end line counts 2 finding(s), and it holds 1"),
+            ("a file with a line after its end line", "end\t0\nfinding\tRust tests\tx\n",
+             "its end line is line 1 of 2, and it must be its last"),
+            ("a file whose step stopped", findings_text(("stop", "Rust tests", "bazel test exited 8"), end=False),
+             "the step stopped at its last finding (Rust tests), so what it would have found after it is not known"),
+            ("a file with a line that is no record", "what\n", "its line 1 is no record of a findings file: 'what'")):
+        got = read_findings(findings_at({("rust-test", "rust-test"): text}) + "/sc-findings-rust-test/rust-test.tsv")
+        check(f"rust findings: {label} reads UNKNOWN, naming why", got[1], why)
+    check("rust findings: a file that is not there reads UNKNOWN",
+          read_findings(os.path.join(rt_dir, "nothing.tsv"))[1].startswith("it could not be read (FileNotFoundError"), True)
+    # The jobs RUST_FINDING_STEPS names are the jobs row_work gives the row: a job of a Rust row that
+    # writes no findings file would otherwise be a gap nothing names.
+    check("rust findings: its jobs are the row's jobs",
+          {row: sorted(j for j, _ in jobs) for row, jobs in RUST_FINDING_STEPS.items()},
+          {row: sorted(j for j, _ in row_work()[row]) for row in RUST_FINDING_STEPS})
+    # A job that did not run reads NOT RUN, and one that ran and wrote no file reads UNKNOWN: the two
+    # are told apart, and only the second is a gap.
+    ran = {("rust-test", "rust-test"): findings_text(build_fail, no_result, standing),
+           ("rust-test", "parity"): findings_text(),
+           ("rust-test-drift", "drift"): findings_text(("finding", "Listing drift", "//crates/a:a_test has an early listing "
+                                                        "(3 tests) and no listing of rust_test's: the macOS inventory read a "
+                                                        "target Bazel did not list here"))}
+    jobs_ran = {"rust-test": "failure", "rust-test-drift": "failure", "rust-test-cold": "skipped",
+                "rust-test-compare": "skipped", "rust-test-macos": "skipped"}
+    got = {r["unit"]: (r["status"], len(r["failures"])) for r in rust_findings_results(findings_at(ran), jobs_ran)}
+    check("rust findings: a step that found things, one that found none, one whose job did not run, and one whose job ran "
+          "and wrote no file",
+          (got["rust-test/rust-test"], got["rust-test/parity"], got["rust-test-cold/rust-test"], got["rust-test-macos/rust-test"],
+           got["rust-test-compare/verdict"]),
+          (("FAIL", 3), ("PASS", 0), ("NOT RUN", 0), ("NOT RUN", 0), ("NOT RUN", 0)))
+    got = {r["unit"]: (r["status"], r["note"]) for r in rust_findings_results(
+        findings_at(ran), dict(jobs_ran, **{"rust-test-compare": "failure"}))}
+    check("rust findings: a job that ran and wrote no findings file reads UNKNOWN, naming the job's result",
+          (got["rust-test-compare/verdict"][0], "the rust-test-compare job ended [failure] and this step wrote no findings file"
+           in got["rust-test-compare/verdict"][1], got["rust-test-cold/parity"][0],
+           "did not run (its result is [skipped])" in got["rust-test-cold/parity"][1]),
+          ("UNKNOWN", True, "NOT RUN", True))
+    # The summary over those results: a run whose Rust rows are its only rows (SC_ROWS), against a
+    # previous cut that had the row's standing finding and read FAIL too.
+    res4, prev4, vfile4 = os.path.join(d, "res4"), os.path.join(d, "prev4"), os.path.join(d, "verdict4.json")
+
+    def summary4(here, there, jobs=None, rust="rust_test=failure rust_test_macos=skipped", rows="rust_test", convert=True):
+        """cmd_summary on the Rust rows alone: HERE and THERE are {(job, step): findings text} for this
+        cut and the previous one (None: no previous report). With CONVERT false, the results already in
+        res4 are read as they are (a conversion that wrote only some of them). Returns (the summary,
+        its verdict record)."""
+        if convert:
+            shutil.rmtree(res4, ignore_errors=True)
+            os.makedirs(os.path.join(res4, "sc-res-rust-findings"))
+        cmd_rust_findings_env = dict(SC_RUST_JOBS=" ".join(f"{j}={v}" for j, v in (jobs or jobs_ran).items()))
+        kept_env = {k: os.environ.get(k) for k in cmd_rust_findings_env}
+        os.environ.update(cmd_rust_findings_env)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                if convert:
+                    cmd_rust_findings(findings_at(here), os.path.join(res4, "sc-res-rust-findings"))
+        finally:
+            for k, v in kept_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        shutil.rmtree(prev4, ignore_errors=True)
+        os.makedirs(prev4)
+        if there is not None:
+            with contextlib.redirect_stdout(io.StringIO()):
+                there_dir = os.path.join(d, "prev4-findings")
+                shutil.rmtree(there_dir, ignore_errors=True)
+                os.makedirs(there_dir)
+                kept_env = {"SC_RUST_JOBS": os.environ.get("SC_RUST_JOBS")}
+                os.environ["SC_RUST_JOBS"] = " ".join(f"{j}={v}" for j, v in (jobs or jobs_ran).items())
+                try:
+                    cmd_rust_findings(findings_at(there), there_dir)
+                finally:
+                    if kept_env["SC_RUST_JOBS"] is None:
+                        os.environ.pop("SC_RUST_JOBS", None)
+                    else:
+                        os.environ["SC_RUST_JOBS"] = kept_env["SC_RUST_JOBS"]
+            json.dump(load_results(there_dir), open(os.path.join(prev4, "results.json"), "w"))
+            json.dump({"rows": {"rust_test": "FAIL", "rust_test_macos": "UNKNOWN"}},
+                      open(os.path.join(prev4, "verdict.json"), "w"))
+        env = dict(SC_PLANT="", SC_VERDICT=vfile4, SC_ROWS=rows, SC_RUST_TESTS=rust,
+                   SC_PREVIOUS=prev4 if there is not None else None)
+        kept_env = {k: os.environ.get(k) for k in env}
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if os.path.exists(vfile4):
+            os.remove(vfile4)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                cmd_summary(res4, build2, known3)
+        finally:
+            for k, v in kept_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return buf.getvalue(), json.load(open(vfile4, encoding="utf-8"))
+
+    def seen4(rec):
+        s = rec.get("first_seen")
+        return [(e["kind"], e["row"], e["unit"], e["finding"]) for e in s] if isinstance(s, list) else s
+
+    there4 = {("rust-test", "rust-test"): findings_text(standing, listed, printed), ("rust-test", "parity"): findings_text(),
+              ("rust-test-drift", "drift"): findings_text()}
+    here4 = {("rust-test", "rust-test"): findings_text(build_fail, no_result, standing, listed_moved, printed_moved),
+             ("rust-test", "parity"): findings_text(), ("rust-test-drift", "drift"): findings_text()}
+    out, rec = summary4(here4, there4)
+    check("rust findings: a finding first made at this cut is named, though the row read FAIL at both cuts",
+          (seen4(rec), rec.get("first_seen_not_compared"),
+           f"- **{RUST_JOBS[0][0]}** `rust-test/rust-test`: FOUND `{build_fail[1]}: {build_fail[2]}`: **first seen at this cut**"
+           in out),
+          ([("failure", "rust_test", "rust-test/rust-test", f"{build_fail[1]}: {build_fail[2]}"),
+            ("failure", "rust_test", "rust-test/rust-test", f"{no_result[1]}: {no_result[2]}")], [], True))
+    # The identity key: a finding whose counts or whose place moved is the same finding, and one
+    # whose test is another test is not. Without this the list would name every cut's counts.
+    check("rust findings: a finding whose counts and place moved is not first seen, and another test is",
+          (sorted(e[3] for e in seen4(summary4({**here4, ("rust-test", "rust-test"): findings_text(
+              standing, listed_moved, printed_moved)}, there4)[1])),
+           sorted(e[3] for e in seen4(summary4({**here4, ("rust-test", "rust-test"): findings_text(
+               standing, listed, printed,
+               ("finding", "Rust tests", "//crates/pi-shell:pi-shell_test bash::vm::another::test failed and is not in "
+                ".github/sami/rust-test-known-failures.txt"))}, there4)[1]))),
+          ([], ["Rust tests: //crates/pi-shell:pi-shell_test bash::vm::another::test failed and is not in "
+                ".github/sami/rust-test-known-failures.txt"]))
+    # A finding of a job the previous cut did not run is read against the row's other units, which
+    # did look: the cold control runs every fifth cut, and its findings are the seeded job's too.
+    out, rec = summary4({**here4, ("rust-test-cold", "rust-test"): findings_text(standing, listed),
+                         ("rust-test-cold", "parity"): findings_text(),
+                         ("rust-test-compare", "verdict"): findings_text(),
+                         ("rust-test-compare", "compare"): findings_text()},
+                        there4, jobs=dict(jobs_ran, **{"rust-test-cold": "failure", "rust-test-compare": "success"}))
+    check("rust findings: the cold control's own copy of a standing finding is not first seen",
+          sorted(e[3] for e in seen4(rec)),
+          sorted([f"{build_fail[1]}: {build_fail[2]}", f"{no_result[1]}: {no_result[2]}"]))
+    # A step whose file was cut short is named under "Not compared", with the row still read finding
+    # by finding; a row no step of which could be read falls back to its verdict, as before.
+    out, rec = summary4({**here4, ("rust-test-drift", "drift"): findings_text(
+        ("finding", "Listing drift", "//crates/a:a_test x"), end=False)}, there4)
+    check("rust findings: a step whose findings file was cut short is named as not compared",
+          ([b for b in rec.get("first_seen_not_compared", []) if "rust-test-drift/drift" in b][:1],
+           "Not compared with the previous cut:" in out),
+          ([f"{RUST_JOBS[0][0]}: `rust-test-drift/drift` could not be read, so its findings are in no list: its findings file "
+            "could not be read whole: it has no end line, so the step was cut short before it had looked at everything; it "
+            "holds 1 finding(s)"], True))
+    out, rec = summary4({}, there4, jobs=dict(jobs_ran, **{"rust-test": "failure", "rust-test-drift": "failure"}))
+    check("rust findings: a row no step of which could be read is compared by its verdict, and says so",
+          (seen4(rec), [b for b in rec.get("first_seen_not_compared", []) if "FAIL at this cut and at the previous one" in b][:1]),
+          ([], [f"{RUST_JOBS[0][0]}: FAIL at this cut and at the previous one, and no unit of it could be read, so a finding "
+                "first made here is not seen (that job's annotations and log name them)"]))
+    # A unit the previous cut did not run is no evidence: a finding here that the row's other units
+    # also did not have at that cut reads first seen, and the row's report says UNKNOWN nowhere.
+    out, rec = summary4(here4, {("rust-test", "parity"): findings_text()},
+                        jobs=dict(jobs_ran, **{"rust-test-drift": "skipped"}))
+    check("rust findings: a unit that did not run at the previous cut lets no finding read standing",
+          sorted(e[3] for e in seen4(rec)),
+          sorted([f"{build_fail[1]}: {build_fail[2]}", f"{no_result[1]}: {no_result[2]}",
+                  f"{standing[1]}: {standing[2]}", f"{listed_moved[1]}: {listed_moved[2]}",
+                  f"{printed_moved[1]}: {printed_moved[2]}"]))
+    # The sol review of 8b299ece, reproduced as cases. (1) The identity key must keep an
+    # invocation's name: rust-test.sh gives each own-process test an invocation of its own
+    # (`own-0`, `own-1`), and a stop message names the invocation and not the test, so a digit rule
+    # that took the index out made two tests' findings one.
+    stop_own = "Rust tests: bazel test exited {} ({}), which is neither a test nor a build failure"
+    check("rust findings: an invocation's own number and a command's exit code tell two findings apart",
+          (set(finding_keys("rust_test", stop_own.format(8, "own-0"))) == set(finding_keys("rust_test", stop_own.format(8, "own-1"))),
+           set(finding_keys("rust_test", stop_own.format(8, "own-0"))) == set(finding_keys("rust_test", stop_own.format(36, "own-0"))),
+           set(finding_keys("rust_test", "Rust tests: //a:a_test b reported 3 tests")) ==
+           set(finding_keys("rust_test", "Rust tests: //a:a_test b reported 4 tests"))),
+          (False, False, True))
+    out, rec = summary4({**here4, ("rust-test", "parity"): findings_text(
+        ("finding", "Rust test parity", "//crates/a:a_test has no Bazel rust_test"))}, there4)
+    first_seen_whole = sorted(e[3] for e in seen4(rec))
+    os.remove(os.path.join(res4, "sc-res-rust-findings", "rust-test_parity.json"))
+    out, rec = summary4(None, there4, convert=False)
+    check("rust findings: a step sc.py rust-findings wrote no result for reads UNKNOWN, named, and the finding it "
+          "would hold is not read as nothing new",
+          ("Rust test parity: //crates/a:a_test has no Bazel rust_test" in first_seen_whole,
+           "Rust test parity: //crates/a:a_test has no Bazel rust_test" in [e[3] for e in seen4(rec)],
+           [b for b in rec.get("first_seen_not_compared", []) if "rust-test/parity" in b][:1],
+           f"- **{RUST_JOBS[0][0]}** `rust-test/parity`: UNKNOWN: no result: sc.py rust-findings wrote none for this step"
+           in out),
+          (True, False,
+           [f"{RUST_JOBS[0][0]}: `rust-test/parity` could not be read, so its findings are in no list: no result: sc.py "
+            "rust-findings wrote none for this step, so what it found is not known (that step failed, or the summary job "
+            "could not read its artifact)"], True))
+    check("rust findings: an end line whose count is no ASCII number reads UNKNOWN, not a fault of the reader",
+          read_findings(findings_at({("rust-test", "rust-test"): "finding\tt\tm\nend\t\u00b2\n"})
+                        + "/sc-findings-rust-test/rust-test.tsv")[1],
+          "its line 2 is no record of a findings file: 'end\\t\u00b2'")
+
     if fails:
         for f in fails:
             print(f"SELFTEST FAIL {f}")
@@ -5289,9 +5741,13 @@ def selftest():
           "docs and changelog rows with their planted controls, the builtins-lint row's lift, readers, sorting "
           "and plant, the Rust tests' rows from their jobs' "
           "conclusions, the row selection (its jobs from the workflow's needs, the cut's every row, a control "
-          "on a row that does not run), the summary's NOT RUN rows and verdict line, and its first-seen comparison "
+          "on a row that does not run), the summary's NOT RUN rows and verdict line, its first-seen comparison "
           "with the previous cut's report (a new finding listed, one at both cuts not, UNKNOWN for a report that "
-          "is missing or does not parse, the plant's control, and the run previous-report fetches)")
+          "is missing or does not parse, the plant's control, and the run previous-report fetches), and that "
+          "comparison over the Rust rows' own findings (a findings file read whole, or UNKNOWN with the reason; a "
+          "step that did not run told from one that wrote no file; a finding first made at a cut named though the "
+          "row read FAIL at the cut before; one whose counts or place moved not named; and a row no step of which "
+          "could be read compared by its verdict and named as not compared)")
 
 
 # The docs row (docs.sh): `cargo doc --no-deps -p pi-shell` with -D rustdoc::broken_intra_doc_links,
@@ -6411,6 +6867,8 @@ def main(argv):
         cmd_plant(*a)
     elif c == "previous-report":
         previous_report(*a)
+    elif c == "rust-findings":
+        cmd_rust_findings(*a)
     elif c == "selftest":
         selftest()
     else:

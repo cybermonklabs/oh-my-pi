@@ -56,6 +56,20 @@ pass=0
 fail=0
 skip=0
 
+# findings_out <file>: what a script wrote to its findings file (SAMI_FINDINGS,
+# .github/sami/findings.sh), for a case's message check: one `findings: ` line
+# per record, then `findings complete` when its end line is there (the script
+# looked at everything) or `findings cut short` when it is not. A script that
+# wrote no file at all prints `findings: none`, which is the summary's UNKNOWN.
+findings_out() {
+	if [ ! -f "$1" ]; then
+		printf 'findings: none\n'
+		return 0
+	fi
+	sed 's/^/findings: /' "$1"
+	awk -F'\t' '$1 == "end" { end = 1 } END { print (end ? "findings complete" : "findings cut short") }' "$1"
+}
+
 # --- log writers; FMT is json or text ----------------------------------------
 # lt_pass <names...>: a libtest run whose tests all pass; FILTERED sets its
 # filtered_out.
@@ -530,7 +544,7 @@ EOF
 	[ "${SUMMARY_UNWRITABLE:-}" != 1 ] || mkdir "$w/summary.md"
 	out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null \
 		RUST_TEST_PATH=/stub/rsync-ref/bin:/usr/bin:/bin RUST_TEST_TMPDIR="$w/reflink" PI_TEST_REAL_BASH=/stub/bash-ref/bin/bash PI_AST_REPO_CORPUS="$w/repo" RUST_TEST_OFFLINE_UNDER="$w/bin/offline" \
-		RUST_TEST_STICKY_FIFO="$fifo" GITHUB_STEP_SUMMARY="$w/summary.md" \
+		RUST_TEST_STICKY_FIFO="$fifo" GITHUB_STEP_SUMMARY="$w/summary.md" SAMI_FINDINGS="${FINDINGS_FILE:-$w/findings.tsv}" \
 		env ${only_env[@]+"${only_env[@]}"} bash --noprofile --norc -eo pipefail "$step" 2>&1)"
 	rc=$?
 	# What the step leaves for the job beside its log: the step summary, and
@@ -546,6 +560,11 @@ EOF
 	if [ -f "$w/tmp/rust-test/results/results.tsv" ]; then
 		out+=$'\n'"$(sed 's/^/results: /' "$w/tmp/rust-test/results/results.tsv")"
 	fi
+	# Each error annotation, as the summary's first-seen comparison reads it
+	# (SAMI_FINDINGS): one `findings: ` line a record, and whether the step
+	# reached its end. FINDINGS_FILE=none-of-it names a path in no directory, so
+	# the writer cannot write and the case sees what the step does then.
+	out+=$'\n'"$(findings_out "${FINDINGS_FILE:-$w/findings.tsv}")"
 	verdict "$name" "$want" "$rc" "$msg" "$out"
 }
 
@@ -2129,6 +2148,23 @@ NOT_MSG='::error' run J170e-per-test-results-of-a-doctest 0 '^results: //crates/
 # with both attempts named, so the control compares it by that final status.
 FLAKY="$B x::f" MAIN_MUST_FLAKY="$B" run J171-per-test-results-of-a-flaky-test 0 '^results: //crates/pi-builtins:pi-builtins_test.x::f.ok.main=failed,main=ok$' "$B x::f" "f=\"\$(tpath $B)\"; mkdir -p \"\$(dirname \"\$f\")/test_attempts\"; lt_fail x::f >\"\$(dirname \"\$f\")/test_attempts/attempt_1.log\"; lt_pass x::passes x::f >\"\$f\"; fakebin $B x::passes x::f; { $P; cfg $B 'rust_test rule'; summary $B FLAKY \"\$(dirname \"\$f\")/test_attempts/attempt_1.log\" \"\$f\"; } >\"\$bep\"; exit 0"
 ONLY="$ONLYT" CANARY="$CAN" KNOWN_OUTPUT="$CAN" OWN_TESTS="m::langinfo m::strftime p::canary" OWN_PRINTS="p::canary" NOT_MSG='::error' run J172-per-test-results-in-the-macos-job 0 '^results: //crates/pi-diff:pi-diff_test.m::strftime.ok.only-[0-9]+=ok$' '' 'exit 9'
+
+# The findings file (SAMI_FINDINGS, .github/sami/findings.sh), which
+# sami-checks.yml's summary reads so that each finding of this row is compared
+# with the previous cut's and not only the row's verdict: one record a line, an
+# end line counting them, and nothing of what the step did not reach. A step
+# that found nothing writes the end line alone (F1), a failing one a record per
+# error (F2, F3), a step that stops writes that record and no end line, so its
+# unit reads UNKNOWN (F4), and a file the step cannot write is a warning that
+# changes no verdict (F5).
+NOT_MSG='^findings: finding' run F1-findings-of-a-clean-run 0 '^findings: end	0$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 0"
+run F2-findings-of-a-failed-test 1 "^findings: finding	Rust test failed	$B x::k1 failed and is not in \\.github/sami/rust-test-known-failures\\.txt\$" '' "{ $P; rt $B FAILED lt_fail x::k1; } >\"\$bep\"; exit 3"
+run F3-findings-end-counts-them 1 '^findings: end	2$' '' "{ $P; rt $B FAILED lt_fail x::k1 x::k2; } >\"\$bep\"; exit 3"
+run F3b-findings-complete-after-a-failed-run 1 '^findings complete$' '' "{ $P; rt $B FAILED lt_fail x::k1 x::k2; } >\"\$bep\"; exit 3"
+run F4-a-step-that-stops-writes-no-end-line 1 '^findings cut short$' '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 8"
+run F4b-a-step-that-stops-records-where-it-stopped 1 "^findings: stop	Rust tests	bazel test exited 8 \\(main\\), which is neither a test nor a build failure\$" '' "{ $P; rt $D PASSED lt_pass a::one; } >\"\$bep\"; exit 8"
+FINDINGS_FILE=/sc-findings-in-no-directory/findings.tsv run F5-a-findings-file-that-cannot-be-written-changes-no-verdict 1 '^findings: none$' '' "{ $P; rt $B FAILED lt_fail x::k1; } >\"\$bep\"; exit 3"
+FINDINGS_FILE=/sc-findings-in-no-directory/findings.tsv run F5b-and-says-so 1 '::warning title=Findings::/sc-findings-in-no-directory/findings\.tsv could not be written' '' "{ $P; rt $B FAILED lt_fail x::k1; } >\"\$bep\"; exit 3"
 
 # --- the build seed: .github/sami/gate-seed.sh ------------------------------------
 # srun <name> <want> <message regex> <body>: the gate's two seed steps, as
