@@ -22,7 +22,8 @@ set -uo pipefail
 tool=$GITHUB_WORKSPACE/tool/.github/sami-checks
 logs=$SC/res/logs
 mkdir -p "$logs"
-upstream=https://github.com/can1357/oh-my-pi.git
+# shellcheck source=.github/sami-checks/upstream-base.sh
+. "$tool/upstream-base.sh"
 echo "TOOLCHAIN $(cd "$SC_TREE" && rustc -V) | $(cd "$SC_TREE" && cargo fmt --version)"
 mapfile -t manifests < <(python3 "$tool/sc.py" rustfmt-workspaces)
 if [ "${#manifests[@]}" = 0 ]; then
@@ -58,40 +59,17 @@ for m in "${manifests[@]}"; do
 	fi
 done
 
-# The upstream base, only when some workspace has places to sort, and the fork's changes from it
-# (`git diff -U0` of the base and the tree as checked, plant and all) in each file with places: a
-# place on lines the fork left as they are maps to its line at the base.
+# The upstream base (upstream-base.sh), only when some workspace has places to sort, and the fork's
+# changes from it (`git diff -U0` of the base and the tree as checked, plant and all) in each file
+# with places, headed by the path as rustfmt printed it: a place on lines the fork left as they are
+# maps to its line at the base.
 base=- base_tree=$SC/upstream-base setup=$logs/rustfmt-upstream-base.log fork=$logs/rustfmt-fork.diff
 if [ "$places" = 1 ]; then
-	if {
-		git -C "$SC_TREE" remote add upstream "$upstream" &&
-			git -C "$SC_TREE" config remote.upstream.promisor true &&
-			git -C "$SC_TREE" config remote.upstream.partialclonefilter blob:none &&
-			timeout -k 10 900 git -C "$SC_TREE" fetch --no-tags --filter=blob:none upstream main &&
-			b=$(git -C "$SC_TREE" merge-base HEAD FETCH_HEAD) &&
-			timeout -k 10 900 git -C "$SC_TREE" worktree add --detach "$base_tree" "$b"
-	} > "$setup" 2>&1; then
+	if b=$(upstream_base "$SC_TREE" "$base_tree" "$setup"); then
 		base=$b
-		echo "UPSTREAM BASE $base: the merge base of $(git -C "$SC_TREE" rev-parse HEAD) and upstream's main $(git -C "$SC_TREE" rev-parse FETCH_HEAD)"
-		# One section a file, headed by the path as rustfmt printed it (git would quote a path with
-		# other than ASCII in it), with a literal pathspec; a file with no hunk is one the fork left.
 		mapfile -t files < <(sed -n -E 's#^Diff in (.+):[0-9]+:$#\1#p; s#^Incorrect newline style in (.+)$#\1#p' "$logs"/rustfmt-*.log |
 			sed "s#^$SC_TREE/##" | sort -u)
-		: > "$fork"
-		for f in "${files[@]}"; do
-			printf '### %s\n' "$f" >> "$fork"
-			if ! git -C "$SC_TREE" diff -U0 --no-color --no-ext-diff --no-renames --text "$base" -- ":(literal)$f" \
-				> "$fork.one" 2>> "$setup"; then
-				echo "::warning::the fork's diff of $f from the upstream base failed, so the places stay unsorted (UNKNOWN)"
-				rm -f "$fork"
-				break
-			fi
-			grep -E '^@@ ' "$fork.one" >> "$fork"
-		done
-		rm -f "$fork.one"
-		if [ -f "$fork" ]; then
-			echo "FORK DIFF: ${#files[@]} file(s) with places, $(grep -c '^@@ ' "$fork") hunk(s) of the fork's in them"
-		fi
+		fork_diff "$SC_TREE" "$base" "$fork" "$setup" "${files[@]}"
 	else
 		echo "::warning::the upstream base could not be set up, so a workspace's places stay unsorted (UNKNOWN):"
 		tail -n 20 "$setup"

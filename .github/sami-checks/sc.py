@@ -24,7 +24,7 @@
   sc.py selftest                           the counters and the summary against hand-made inputs
   sc.py docs UNIT STREAM LOG EXIT SECS     `cargo doc --message-format=json -p pi-shell`: each broken intra-doc link (docs.sh)
   sc.py changelog LOG EXIT SECS FILES DIFF WRITE_EXIT  `fix-changelogs.ts --check`: each CHANGELOG it would rewrite (changelog.sh)
-  sc.py plant WHAT TREE                    the docs, changelog, rustfmt or membench row's control: puts its planted fault in TREE
+  sc.py plant WHAT TREE                    the docs, changelog, rustfmt, membench or builtins-lint row's control: puts its planted fault in TREE
   sc.py rustfmt-workspaces                 the manifests of the cargo workspaces the rustfmt row checks, one a line
   sc.py rustfmt UNIT LOG EXIT SECS TREE [BASE_LOG BASE_EXIT BASE_TREE BASE_SHA FORK_DIFF]
                                            one workspace's `cargo fmt --all --check -v -- -v`, each place sorted by the same
@@ -34,6 +34,15 @@
   sc.py membench UNIT OUT ERR EXIT SECS BUILD_EXIT BUILD_LOG
                                            one run of pi-shell's memory bench: each PASS/MISS target line, its exit, and every
                                            line it printed (membench.sh)
+  sc.py builtins-lint-lift TREE DIR        lifts the crate in TREE/DIR out of its own lint opt-outs, for the builtins-lint row: its
+                                           Cargo.toml's [lints] becomes the workspace's, and rustfmt.toml ignores it no more
+  sc.py builtins-lint-files TREE DIR CLIPPY_LOG FMT_LOG
+                                           "clippy|rustfmt<TAB>file" for each file under DIR with a finding (builtins-lint.sh)
+  sc.py builtins-clippy LOG EXIT SECS TREE DIR [BASE_LOG BASE_EXIT BASE_TREE BASE_SHA FORK_DIFF]
+  sc.py builtins-rustfmt LOG EXIT SECS TREE DIR [BASE_LOG BASE_EXIT BASE_TREE BASE_SHA FORK_DIFF]
+                                           the builtins-lint row's units: each finding of `cargo clippy` (every lint a
+                                           warning) or `cargo fmt --check` of the crate in DIR, sorted as the rustfmt row
+                                           sorts its places, into upstream's own and the fork's (builtins-lint.sh)
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
 binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 nor 100, a bun run
@@ -51,6 +60,7 @@ only when the test passed in a retry of its whole unit in the same job (the unit
 at most twice; on the platform rows, nextest's own retry of the test's own process).
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -162,6 +172,8 @@ ROWS = (
     ("CHANGELOG format (fix-changelogs --check)", "changelog"),
     ("rustfmt: cargo fmt --check, per cargo workspace", "rustfmt"),
     ("pi-shell memory bench, release (benches/memory.rs: its PASS/MISS targets)", "membench"),
+    ("pi-builtins lint: clippy at the workspace's lint levels and rustfmt, the crate's opt-outs lifted (failed: a finding the fork "
+     "added)", "builtins-lint"),
 )
 # The Rust tests (sami-rust-test.yml) report no units here: each of its two jobs is a row of its own,
 # read from the job's conclusion, which sami-checks.yml passes as SC_RUST_TESTS.
@@ -218,7 +230,7 @@ def all_job_names():
     # skip_bash_install), whose check must then stop the legs, so the macOS row reads UNKNOWN.
     names += ["ts-small", "checkts", "skip-forms", "platforms", "clippy", "macos-bash"]
     names += [m["name"] for m in gvisor_matrix()]
-    names += ["docs", "changelog", "rustfmt", "membench"]
+    names += ["docs", "changelog", "rustfmt", "membench", "builtins-lint"]
     return names
 
 
@@ -251,6 +263,7 @@ def row_work():
         "changelog": one("changelog"),
         "rustfmt": one("rustfmt"),
         "membench": one("membench"),
+        "builtins-lint": one("builtins-lint"),
         # rust-test-drift's result is part of this row, and so is the seed's control: the cold run
         # of the same commit (rust-test-cold) and the comparison of the two (rust-test-compare).
         "rust_test": one("rust-test") | one("rust-test-drift") | one("rust-test-cold") | one("rust-test-compare"),
@@ -845,6 +858,24 @@ def read_lines(path):
 UNCODED_ERROR = "error"
 
 
+def cargo_messages(path):
+    """The cargo messages of a `--message-format=json` log, and the numbers of its lines that look
+    like cargo messages (`{"reason":`) but do not parse: ([message], [line number]). None when there
+    is no log."""
+    lines = read_lines(path)
+    if lines is None:
+        return None
+    out, unread = [], []
+    for n, line in enumerate(lines, 1):
+        if not line.startswith('{"reason":'):
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            unread.append(n)
+    return out, unread
+
+
 def clippy_diagnostics(path):
     """The findings in a `cargo clippy --message-format=json` log, and the numbers of its lines that
     look like cargo messages (`{"reason":`) but do not parse: ({(file, code, message): {(line,
@@ -852,18 +883,12 @@ def clippy_diagnostics(path):
     lint or error code (diagnostic `code.code`), or UNCODED_ERROR for an error with none. The same
     finding in several of a crate's targets (a module that the lib test and a test binary both
     build) is one, by its place. None when there is no log."""
-    lines = read_lines(path)
-    if lines is None:
+    got = cargo_messages(path)
+    if got is None:
         return None
-    out, unread = {}, []
-    for n, line in enumerate(lines, 1):
-        if not line.startswith('{"reason":'):
-            continue
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            unread.append(n)
-            continue
+    events, unread = got
+    out = {}
+    for ev in events:
         if ev.get("reason") != "compiler-message":
             continue
         m = ev.get("message") or {}
@@ -1176,6 +1201,8 @@ def expected_units(build_dir):
         for m in ws:
             exp.append(("rustfmt", m, "runner"))
     exp.append(("membench", MEMBENCH_UNIT, "runner"))
+    for u in BUILTINS_LINT_UNITS:
+        exp.append(("builtins-lint", u, "runner"))
     return exp, notes
 
 
@@ -1485,6 +1512,12 @@ def record_retry(result_path, test, report, shape, scope="whole-unit"):
     return outcome
 
 
+# A unit that counts its findings (its result's `breakdown`) lists this many of each kind (FAILED,
+# KNOWN, UNSORTED) among the summary's details, and its section lists this many lints and files.
+LISTED_PER_KIND = 25
+BREAKDOWN_LISTED = 40
+
+
 def summary_rows():
     """The rows this run planned: SC_ROWS (the plan's output `rows`, a comma list), or every row when
     it is unset. A row it does not name reads NOT RUN."""
@@ -1639,15 +1672,27 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         for r in rs:
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
-            for f in r["failures"]:
+            # A unit that counts its findings (breakdown: the builtins-lint row, thousands of them)
+            # lists the first of each kind here; its section below counts them all by lint and file.
+            cap = LISTED_PER_KIND if "breakdown" in r else None
+
+            def more(kind, items):
+                if cap is not None and len(items) > cap:
+                    details.append(f"- **{title}** `{r['unit']}` ({r['who']}): and {len(items) - cap} more {kind} (the section "
+                                   "below counts them by lint and file; the sc-report artifact's results.json lists each)")
+
+            for f in r["failures"][:cap]:
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}")
+            more("FAILED", r["failures"])
             for f in r.get("baseline_fell", []):
                 details.append(f"- **{title}** `{r['unit']}`: fewer here than in the clippy baseline (a change of the baseline, not a failure): {f}")
-            for f in r.get("upstream_places", []):
+            for f in r.get("upstream_places", [])[:cap]:
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): KNOWN `{f}`: upstream's own: the same run fails at "
                                f"the upstream base `{r.get('upstream_base', '')[:12]}` on lines the fork left as they are")
-            for f in r.get("unsorted_places", []):
+            more("KNOWN", r.get("upstream_places", []))
+            for f in r.get("unsorted_places", [])[:cap]:
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNSORTED `{f}`")
+            more("UNSORTED", r.get("unsorted_places", []))
             for f in r.get("self_skipped", []):
                 why = r.get("known_skips", {}).get(f)
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): SKIPPED ITSELF `{f}`" + (f": KNOWN ({why})" if why else ""))
@@ -1736,6 +1781,28 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         if len(details) > 400:
             lines.append(f"- ... and {len(details) - 400} more (sc-report artifact, results.json)")
         lines.append("")
+    # The units that count their findings (the builtins-lint row): its note, then the count of the
+    # fork's, upstream's own and unsorted findings by lint and by file, the most of the fork's first.
+    for title, key in ROWS:
+        for r in verdicts.get(key, ("", []))[1]:
+            b = r.get("breakdown")
+            if not b:
+                continue
+            lines.append(f"### {title}: `{r['unit']}` read {r['status']}")
+            lines.append("")
+            lines.append(r["note"] or "-")
+            lines.append("")
+            for what, counts in (("Lint", b.get("by_lint", {})), ("File", b.get("by_file", {}))):
+                if not counts:
+                    continue
+                ordered = sorted(counts.items(), key=lambda kv: (-kv[1][0], -kv[1][1], -kv[1][2], kv[0]))
+                lines.append(f"| {what} | FAIL (the fork's) | KNOWN (upstream's own) | UNSORTED |")
+                lines.append("|---|---|---|---|")
+                lines.extend(f"| `{k}` | {v[0]} | {v[1]} | {v[2]} |" for k, v in ordered[:BREAKDOWN_LISTED])
+                if len(ordered) > BREAKDOWN_LISTED:
+                    rest = [sum(v[i] for _, v in ordered[BREAKDOWN_LISTED:]) for i in range(3)]
+                    lines.append(f"| {len(ordered) - BREAKDOWN_LISTED} more | {rest[0]} | {rest[1]} | {rest[2]} |")
+                lines.append("")
     # The memory bench: its exit and every line it printed (each number, each PASS and MISS), as read.
     for title, key in ROWS:
         for r in verdicts.get(key, ("", []))[1]:
@@ -2329,6 +2396,47 @@ def selftest():
     check("rustfmt: a file rustfmt could not read, beside places it read", fm(roots + wrap + unclosed, 1),
           ("UNKNOWN", [wrapped], "rustfmt could not read every file: error: this file contains an unclosed delimiter; "
                                  "1 place(s) in 1 file(s) rustfmt would change"))
+    # rustfmt's error[internal] with a `-->` line is one line it read and could not format cleanly (run
+    # 45915095510: pi-builtins tail.rs, `left behind trailing whitespace`, at the tree and the base
+    # alike): a place sorted like any other, not a file it could not read. One with no `-->` line
+    # stays an error.
+    internal = (f"error[internal]: left behind trailing whitespace\n    --> {ftree}/sdk/w/src/lib.rs:5:5:1\n     |\n"
+                "5 |         \n     | ^^^^^^^^\n     |\n\nwarning: rustfmt has failed to format. See previous 1 errors.\n")
+    trailing = "sdk/w/src/lib.rs:5: left behind trailing whitespace (rustfmt's error[internal], output line 5)"
+    check("rustfmt: a placed error[internal] the base does not have is a fork change's", fm(roots + internal, 1)[:2], ("FAIL", [trailing]))
+    r = fr(roots + internal, 1, base=roots + checked("sdk/w/src/lib.rs") + internal, bex="1")
+    check("rustfmt: a placed error[internal] the base has at the same line is upstream's own",
+          (r["status"], r["upstream_places"]), ("KNOWN", [trailing]))
+    check("rustfmt: an error[internal] with no place is a file rustfmt could not read",
+          fm(roots + "error[internal]: something went wrong\n", 1)[0::2],
+          ("UNKNOWN", "rustfmt could not read every file: error[internal]: something went wrong"))
+    # A diff run and a placed error on one line, at the tree and at the base: both upstream's own (a
+    # map from line to one run kept only one of them, and the other read as a fork change's).
+    run5 = f"Diff in {ftree}/sdk/w/src/lib.rs:5:\n-fn x() {{ }}\n+fn x() {{}}\n"
+    r = fr(roots + run5 + internal, 1, base=roots + checked("sdk/w/src/lib.rs") + run5 + internal, bex="1")
+    check("rustfmt: a diff run and a placed error on one line, both at the base", (r["status"], len(r["upstream_places"])), ("KNOWN", 2))
+    # An error[internal]'s line is a line of rustfmt's output (CiReview at b792893c: one source line the
+    # fork adds, which rustfmt writes as four, moves tail.rs's four errors by four). The fork added a
+    # line at its line 3, which rustfmt writes as four: the base's error at its output line 10 is the
+    # tree's at output line 14, source line 11, the base's 10: upstream's own. One inside the run is
+    # that run's (its first removed line), on the fork's line: a fork change's.
+    grow = (f"Diff in {ftree}/sdk/w/src/lib.rs:3:\n-fn before() {{ let _x = 1; let _y = 2; }}\n+fn before() {{\n"
+            "+\tlet _x = 1;\n+\tlet _y = 2;\n+}\n")
+    at_out = {n: internal.replace("lib.rs:5:5:1", f"lib.rs:{n}:{n}:1") for n in (4, 10, 14)}
+    r = fr(roots + grow + at_out[14] + at_out[4], 1, base=roots + checked("sdk/w/src/lib.rs") + at_out[10], bex="1",
+           fork=diff(("sdk/w/src/lib.rs", ["@@ -2,0 +3 @@"])))
+    check("rustfmt: an error[internal] mapped from rustfmt's output to the file, past a run and inside one",
+          (r["status"], r["failures"], r["upstream_places"]),
+          ("FAIL", ["sdk/w/src/lib.rs:3: fn before() { let _x = 1; let _y = 2; }",
+                    "sdk/w/src/lib.rs:3: left behind trailing whitespace (rustfmt's error[internal], output line 4)"],
+           ["sdk/w/src/lib.rs:11: left behind trailing whitespace (rustfmt's error[internal], output line 14)"]))
+    # Two errors inside one run stay two, by their lines in it: the base has only the first.
+    run3 = f"Diff in {ftree}/sdk/w/src/lib.rs:5:\n-fn x() {{ a(); }}\n+fn x() {{\n+\ta();\n+}}\n"
+    r = fr(roots + run3 + at_out[10].replace(":10:10:", ":5:5:") + at_out[10].replace(":10:10:", ":6:6:"), 1,
+           base=roots + checked("sdk/w/src/lib.rs") + run3 + at_out[10].replace(":10:10:", ":5:5:"), bex="1")
+    check("rustfmt: two errors inside one run, the base with one of them", (r["status"], r["upstream_places"], r["failures"]),
+          ("FAIL", ["sdk/w/src/lib.rs:5: fn x() { a(); }", "sdk/w/src/lib.rs:5: left behind trailing whitespace (rustfmt's error[internal], output line 5)"],
+           ["sdk/w/src/lib.rs:5: left behind trailing whitespace (rustfmt's error[internal], output line 6)"]))
     check("rustfmt: no target root listed", fm("rustfmt --edition 2024 --check\n", 0)[0::2],
           ("UNKNOWN", "exit 0, and cargo fmt listed no target root, so it checked nothing: rustfmt --edition 2024 --check"))
     check("rustfmt: exit 0 with a place", fm(roots + wrap, 0), ("UNKNOWN", [wrapped], "exit 0 with 1 place(s) in 1 file(s) rustfmt would change"))
@@ -2352,6 +2460,221 @@ def selftest():
     check("rustfmt plant: a binary when there is no library",
           rustfmt_plant_target({"packages": [pkg("Cargo.toml", (["bin"], "src/main.rs"), (["test"], "tests/a.rs"))]}, ftree), "src/main.rs")
     check("rustfmt plant: no library or binary", rustfmt_plant_target({"packages": [pkg("Cargo.toml", (["test"], "tests/a.rs"))]}, ftree), None)
+
+    # The builtins-lint row's lift: the crate's own [lints] becomes the workspace's, every other key
+    # kept; a manifest whose result would not read so stops the job (None).
+    own_lints = ('[package]\nname = "b"\n\n[dependencies]\nx = "1"\n\n# Deliberately NOT the workspace\'s.\n[lints.clippy]\n'
+                 'all = { level = "allow", priority = -1 }\npedantic = { level = "allow", priority = -1 }\n\n[lints.rust]\n'
+                 'unfulfilled_lint_expectations = { level = "allow", priority = -1 }\n\n[[bin]]\nname = "b"\npath = "src/main.rs"\n')
+    lifted = builtins_lint_lift_manifest(own_lints)
+    check("builtins-lint lift: the crate's [lints] become the workspace's, every other key kept",
+          (lifted is not None and tomllib.loads(lifted).get("lints"), lifted is not None and tomllib.loads(lifted).get("bin"),
+           lifted is not None and tomllib.loads(lifted).get("dependencies")),
+          ({"workspace": True}, [{"name": "b", "path": "src/main.rs"}], {"x": "1"}))
+    check("builtins-lint lift: lints as a dotted key it cannot leave out stops it",
+          builtins_lint_lift_manifest('lints.clippy.all = "allow"\n[package]\nname = "b"\n'), None)
+    # A table header the filter cannot read (a quoted key with a bracket) would be left out with the
+    # lints before it: the comparison of every other key stops the lift.
+    check("builtins-lint lift: a table it would drop beside the lints stops it",
+          builtins_lint_lift_manifest('[package]\nname = "b"\n\n[lints.clippy]\nall = "allow"\n\n[target."cfg[x]".dependencies]\ny = "1"\n'),
+          None)
+    fmt_cfg = 'max_width = 100\nignore = [\n\t"crates/b/**",\n\t"vendor/**",\n]\nhard_tabs = true\n'
+    check("builtins-lint lift: rustfmt.toml's ignore loses the patterns that hold the crate, keeps the others",
+          builtins_lint_lift_rustfmt(fmt_cfg, ["crates/b/src/lib.rs"]),
+          ('max_width = 100\nignore = ["vendor/**"]\nhard_tabs = true\n', ["crates/b/**"]))
+    check("builtins-lint lift: a pattern naming the crate's directory holds it; the key goes when none is left",
+          builtins_lint_lift_rustfmt('ignore = ["crates/b"]\nmax_width = 100\n', ["crates/b/src/x/y.rs"]),
+          ("max_width = 100\n", ["crates/b"]))
+    check("builtins-lint lift: no pattern holds the crate", builtins_lint_lift_rustfmt(fmt_cfg, ["crates/c/src/lib.rs"]), (fmt_cfg, []))
+
+    # The builtins-lint row's clippy unit: cargo's own JSON lines, cut to the fields lint_read reads,
+    # with the dep-info file rustc writes beside each .rmeta (its prerequisites: the files it read).
+    # The fork added five lines after the base's line 10 of lib.rs (the tree's 11 to 15), and two at
+    # its end (a blank line and the plant), and a file new.rs; other.rs is the base's, unlinted there.
+    btree, bbase, btgt = os.path.join(d, "btree"), os.path.join(d, "bbase"), os.path.join(d, "btarget")
+    base_src = [f"base {i}" for i in range(1, 26)]
+    tree_src = base_src[:10] + [f"fork {i}" for i in range(1, 6)] + base_src[10:] + ["", BUILTINS_LINT_PLANT_LINES[0]]
+    for root, src in ((btree, tree_src), (bbase, base_src)):
+        os.makedirs(os.path.join(root, "crates", "b", "src"))
+        open(os.path.join(root, "crates", "b", "Cargo.toml"), "w").write('[package]\nname = "b"\n')
+        open(os.path.join(root, "crates", "b", "src", "lib.rs"), "w").write("\n".join(src) + "\n")
+        open(os.path.join(root, "crates", "b", "src", "other.rs"), "w").write("o 1\no 2\n")
+    open(os.path.join(btree, "crates", "b", "src", "new.rs"), "w").write("n 1\n")
+    bfork = write("b-fork.diff", "### crates/b/src/lib.rs\n@@ -10,0 +11,5 @@\n@@ -25,0 +31,2 @@\n### crates/b/src/other.rs\n"
+                                 "### crates/b/src/new.rs\n@@ -0,0 +1 @@\n")
+
+    def bmsg(path, line, code, msg, col=1, end=None, level="warning"):
+        span = {"file_name": path, "line_start": line, "line_end": end or line, "column_start": col, "is_primary": True}
+        return json.dumps({"reason": "compiler-message", "message": {"level": level, "code": {"code": code} if code else None,
+                                                                     "message": msg, "spans": [span], "rendered": f"{level}: {msg}"}})
+
+    def bart(root, side, files, test=False):
+        """A compiler-artifact of crate b under ROOT, and its dep-info naming FILES."""
+        out = os.path.join(btgt, side + ("-test" if test else ""))
+        os.makedirs(out, exist_ok=True)
+        rmeta = os.path.join(out, "libb-1.rmeta")
+        open(os.path.join(out, "b-1.d"), "w").write(f"{out}/b-1.d: {' '.join(files)}\n\n{rmeta}: {' '.join(files)} Cargo.toml\n\n"
+                                                    + "".join(f"{f}:\n" for f in files) + "\n# env-dep:CLIPPY_CONF_DIR\n")
+        return json.dumps({"reason": "compiler-artifact", "manifest_path": f"{root}/crates/b/Cargo.toml",
+                           "target": {"kind": ["lib"], "name": "b"}, "profile": {"test": test}, "filenames": [rmeta], "fresh": False})
+
+    every = ["crates/b/src/lib.rs", "crates/b/src/other.rs", "crates/b/src/new.rs"]
+    f_up = bmsg("crates/b/src/lib.rs", 20, "clippy::doc_markdown", "item in documentation is missing backticks", 3)
+    f_added = bmsg("crates/b/src/lib.rs", 12, "clippy::needless_return", "unneeded `return` statement")
+    f_new_here = bmsg("crates/b/src/lib.rs", 5, "clippy::eq_op", "equal expressions as operands to `==`")
+    f_across = bmsg("crates/b/src/lib.rs", 9, "clippy::too_many_lines", "this function has too many lines", end=12)
+    f_moved_col = bmsg("crates/b/src/lib.rs", 21, "clippy::x", "m2", 5)
+    f_newfile = bmsg("crates/b/src/new.rs", 1, "clippy::x", "m3")
+    f_other = bmsg("crates/b/src/other.rs", 2, "clippy::x", "m4")
+    f_plant = bmsg("crates/b/src/lib.rs", 32, "clippy::redundant_static_lifetimes", "constants have by default a `'static` lifetime", 43)
+    noise_b = [bmsg("crates/c/src/lib.rs", 1, "clippy::x", "another crate's"),
+               bmsg("crates/b/src/lib.rs", 2, "clippy::x", "a message at another level is no finding", level="note"),
+               json.dumps({"reason": "compiler-message", "message": {"level": "warning", "code": None, "message": "8 warnings emitted", "spans": []}}),
+               json.dumps({"reason": "compiler-message", "message": {"level": "warning", "code": {"code": "E0602"},
+                                                                     "message": "unknown lint: `clippy::assert_is_empty`", "spans": []}}),
+               "    Checking b v0.1.0", json.dumps({"reason": "build-finished", "success": True})]
+    tree_log = [bart(btree, "tree", every), bart(btree, "tree", every, True), f_up, f_added, f_new_here, f_across, f_moved_col,
+                f_newfile, f_other, f_plant, f_up] + noise_b
+    base_ok = [bart(bbase, "base", ["crates/b/src/lib.rs"]), bmsg("crates/b/src/lib.rs", 15, "clippy::doc_markdown",
+               "item in documentation is missing backticks", 3), bmsg("crates/b/src/lib.rs", 9, "clippy::too_many_lines",
+               "this function has too many lines", end=10), bmsg("crates/b/src/lib.rs", 16, "clippy::x", "m2", 9)]
+    bsha = "9058ab9d229663e229e2867824ba6df6f21e9e59"
+
+    def bc(tree_lines, ex="0", base_lines=None, bex="0", fork=bfork, crate="crates/b"):
+        """parse_builtins_clippy of these log lines, the base's (None: base_ok) under bbase."""
+        blog = write("bc-base.log", "\n".join(base_ok if base_lines is None else base_lines) + "\n")
+        return parse_builtins_clippy(write("bc.log", "\n".join(tree_lines) + "\n"), ex, 7, btree, crate, blog, bex, bbase, bsha, fork)
+
+    def bn(line, code, msg, col=1, text=None):
+        src = tree_src[line - 1] if text is None else text
+        return f"crates/b/src/lib.rs:{line}:{col}: {code}: {msg} ({src})".replace("`", "'")
+
+    r = bc(tree_log)
+    check("builtins-lint clippy: each finding sorted by the same run at the upstream base",
+          (r["row"], r["unit"], r["status"], r["failures"], r["upstream_places"], r["unsorted_places"], r["upstream_base"]),
+          ("builtins-lint", "clippy", "FAIL",
+           [bn(12, "clippy::needless_return", "unneeded `return` statement"),
+            bn(5, "clippy::eq_op", "equal expressions as operands to `==`"),
+            bn(9, "clippy::too_many_lines", "this function has too many lines"),
+            bn(21, "clippy::x", "m2", 5),
+            "crates/b/src/new.rs:1:1: clippy::x: m3 (n 1)",
+            bn(32, "clippy::redundant_static_lifetimes", "constants have by default a `'static` lifetime", 43)],
+           [bn(20, "clippy::doc_markdown", "item in documentation is missing backticks", 3)],
+           ["crates/b/src/other.rs:2:1: clippy::x: m4 (o 2) (the upstream base's run did not lint crates/b/src/other.rs)"], bsha))
+    check("builtins-lint clippy: the note counts each kind",
+          r["note"], "8 finding(s) in 3 file(s), 3 file(s) linted: 6 a fork change's, 1 upstream's own (the same finding at the "
+                     "upstream base `9058ab9d2296` on the lines the fork left as they are), 1 unsorted")
+    check("builtins-lint clippy: the findings counted by lint and by file",
+          (r["breakdown"]["by_lint"]["clippy::x"], r["breakdown"]["by_lint"]["clippy::doc_markdown"],
+           r["breakdown"]["by_file"]["crates/b/src/lib.rs"], r["breakdown"]["by_file"]["crates/b/src/other.rs"]),
+          ([2, 0, 1], [0, 1, 0], [5, 1, 0], [0, 0, 1]))
+    check("builtins-lint clippy: the plant's finding names the plant", any(BUILTINS_LINT_PLANT in f for f in r["failures"]), True)
+    check("builtins-lint clippy: every finding upstream's own reads KNOWN", bc(tree_log[:3] + noise_b)["status"], "KNOWN")
+    check("builtins-lint clippy: upstream's own beside an unsorted one reads UNKNOWN", bc(tree_log[:3] + [f_other])["status"], "UNKNOWN")
+    r = bc(tree_log[:2] + noise_b, base_lines=[])
+    check("builtins-lint clippy: no finding needs no base", (r["status"], r["note"]),
+          ("PASS", "3 file(s) linted at the workspace's lint levels, no finding"))
+    r = bc(tree_log[:3] + [f_added], bex="absent")
+    check("builtins-lint clippy: a base without the crate makes each finding the fork's", (r["status"], len(r["failures"])), ("FAIL", 2))
+    r = parse_builtins_clippy(write("bc.log", "\n".join(tree_log) + "\n"), "0", 7, btree, "crates/b",
+                              write("setup.log", "Cloning\nfatal: unable to access 'https://github.com/can1357/oh-my-pi.git/'\n"), "-", "-", "-")
+    check("builtins-lint clippy: no upstream base set up", (r["status"], r["failures"], len(r["unsorted_places"]), r["note"].split(" (")[-1]),
+          ("UNKNOWN", [], 8, "it was not set up: fatal: unable to access 'https://github.com/can1357/oh-my-pi.git/')"))
+    for label, base_lines, bex, fork, why in (
+            ("an error there", base_ok + [bmsg("crates/b/src/lib.rs", 3, "E0425", "cannot find value `y`", level="error")], "101", bfork,
+             "exit 101 with 1 error(s) there: error: cannot find value `y`"),
+            ("no compiled target there", base_ok[1:], "0", bfork, "no compiled target of the crate there has a dep-info file that can be read"),
+            ("no diff of the fork's", base_ok, "0", os.path.join(d, "absent.diff"), "no diff of the fork's changes from it"),
+            ("the time bound there", base_ok, "124", bfork, "exit 124: the time bound or a signal ended it")):
+        r = bc(tree_log, base_lines=base_lines, bex=bex, fork=fork)
+        check(f"builtins-lint clippy: {label}", (r["status"], r["failures"], r["note"].endswith(f"could not be read ({why})")),
+              ("UNKNOWN", [], True))
+    r = bc(tree_log + [bmsg("crates/b/src/lib.rs", 3, None, "expected expression, found `;`", level="error")], "101")
+    check("builtins-lint clippy: a compile error leaves the crate not linted whole",
+          (r["status"], r["failures"], r["note"].startswith("exit 101 with 1 error(s), so the crate's targets were not all linted")),
+          ("UNKNOWN", [], True))
+    check("builtins-lint clippy: exit 101 with no error message", bc(tree_log, "101")["status"], "UNKNOWN")
+    check("builtins-lint clippy: no dep-info of a compiled target", bc(tree_log[2:])["note"].startswith("exit 0, but no compiled target"), True)
+    os.rename(os.path.join(btgt, "tree-test", "b-1.d"), os.path.join(btgt, "tree-test", "b-1.d.gone"))
+    check("builtins-lint clippy: a compiled target whose dep-info is gone", bc(tree_log)["status"], "UNKNOWN")
+    os.rename(os.path.join(btgt, "tree-test", "b-1.d.gone"), os.path.join(btgt, "tree-test", "b-1.d"))
+    check("builtins-lint clippy: a log line that does not parse", bc(tree_log + [f_up[:40]])["note"].startswith("log line(s) 18 look like"), True)
+    check("builtins-lint clippy: the time bound", bc(tree_log, "124")["note"], "exit 124: the time bound or a signal ended it")
+    check("builtins-lint clippy: no log", parse_builtins_clippy(os.path.join(d, "absent.log"), "0", 1, btree, "crates/b")["note"], "no log")
+    check("builtins-lint clippy: no package", bc(tree_log, crate="-")["note"], f"the tree has no package {BUILTINS_LINT_CRATE}")
+    # The control of the line mapping: with the fork's hunks read as none, the fork-added line maps to
+    # upstream's line 12, which has no finding: still the fork's; and upstream's own at 20 maps to
+    # base 20, where the base has none: the fork's too, so the mapping is what makes it KNOWN.
+    r = bc(tree_log[:4], fork=write("b-fork-none.diff", "### crates/b/src/lib.rs\n"))
+    check("builtins-lint clippy: without the fork's hunks upstream's own is not found", (r["status"], r["upstream_places"]), ("FAIL", []))
+    # A lint can mark more than one place (CiReview at b792893c: twenty such in Cut15's run, among them
+    # clippy::set_contains_or_insert at hostname.rs:208 and :216). Every primary span is read: one on a
+    # fork-added line makes the finding the fork's, though its first is upstream's.
+    def bmulti(*lines, code="clippy::set_contains_or_insert", msg="usage of 'HashSet::insert' after 'HashSet::contains'"):
+        spans = [{"file_name": "crates/b/src/lib.rs", "line_start": n, "line_end": n, "column_start": 5, "is_primary": True} for n in lines]
+        return json.dumps({"reason": "compiler-message", "message": {"level": "warning", "code": {"code": code}, "message": msg, "spans": spans}})
+
+    base_multi = base_ok + [bmulti(15, 18)]
+    r = bc(tree_log[:2] + [bmulti(20, 23)], base_lines=base_multi)
+    check("builtins-lint clippy: a finding with two primary spans, both upstream's", (r["status"], len(r["upstream_places"])), ("KNOWN", 1))
+    r = bc(tree_log[:2] + [bmulti(20, 12)], base_lines=base_multi)
+    check("builtins-lint clippy: a finding whose second primary span is on a fork line", (r["status"], len(r["failures"])), ("FAIL", 1))
+    r = bc(tree_log[:2] + [bmulti(20, 24)], base_lines=base_multi)
+    check("builtins-lint clippy: a finding whose second primary span the base has elsewhere", r["status"], "FAIL")
+    # A compiled target whose dep-info names no file of the crate: nothing is known to be linted.
+    empty = [bart(btree, "empty", ["src/other/lib.rs"])]
+    r = bc(empty)
+    check("builtins-lint clippy: dep-info that names no file of the crate", (r["status"], r["note"].startswith("exit 0, but no compiled")),
+          ("UNKNOWN", True))
+    # The lift reaches each rustfmt config rustfmt could take for the crate: `.rustfmt.toml` beside
+    # `rustfmt.toml` (rustfmt reads it first; CiReview at b792893c: lifting rustfmt.toml alone left the
+    # crate ignored, and the unit read PASS), and one above the crate, its patterns relative to it.
+    ltree = os.path.join(d, "ltree")
+    os.makedirs(os.path.join(ltree, "crates", "b", "src"))
+    open(os.path.join(ltree, "crates", "b", "Cargo.toml"), "w").write(own_lints)
+    open(os.path.join(ltree, "crates", "b", "src", "lib.rs"), "w").write("pub fn b() {}\n")
+    for cfg, body in (("rustfmt.toml", 'ignore = ["crates/b/**"]\n'), (".rustfmt.toml", 'max_width = 90\nignore = ["crates/b/**", "x/**"]\n'),
+                      ("crates/.rustfmt.toml", 'ignore = ["b/src"]\n')):
+        open(os.path.join(ltree, cfg), "w").write(body)
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        cmd_builtins_lint_lift(ltree, "crates/b")
+    check("builtins-lint lift: every config at or above the crate, each read from its own directory",
+          [open(os.path.join(ltree, c)).read() for c in ("rustfmt.toml", ".rustfmt.toml", "crates/.rustfmt.toml")],
+          ["", 'max_width = 90\nignore = ["x/**"]\n', ""])
+    # The rustfmt unit's own check that the lift worked: cargo listed the target root, rustfmt never
+    # named it as checked (an ignore still holds it) and exited 0: UNKNOWN, not PASS.
+    r = parse_builtins_rustfmt(write("bf.log", f'[lib (2024)] "{btree}/crates/b/src/lib.rs"\nrustfmt --check {btree}/crates/b/src/lib.rs\n'),
+                               "0", 3, btree, "crates/b")
+    check("builtins-lint rustfmt: a target root rustfmt did not check", (r["status"], r["note"].startswith("rustfmt did not check the target")),
+          ("UNKNOWN", True))
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        cmd_builtins_lint_files(btree, "crates/b", write("bc.log", "\n".join(tree_log) + "\n"),
+                                write("bf.log", f'[lib (2024)] "{btree}/crates/b/src/lib.rs"\nDiff in {btree}/crates/b/src/lib.rs:32:\n-x\n+y\n'))
+    check("builtins-lint files: each file with a finding, by tool", buf.getvalue().splitlines(),
+          ["clippy\tcrates/b/src/lib.rs", "clippy\tcrates/b/src/new.rs", "clippy\tcrates/b/src/other.rs", "rustfmt\tcrates/b/src/lib.rs"])
+    # A finding whose second primary span is in another file of the crate (CiReview at e3119a58): that
+    # file is selected too, so its diff is recorded and the finding is sorted, not left without one.
+    cross = json.dumps({"reason": "compiler-message", "message": {"level": "warning", "code": {"code": "clippy::x"}, "message": "m6", "spans": [
+        {"file_name": "crates/b/src/lib.rs", "line_start": 1, "line_end": 1, "column_start": 1, "is_primary": True},
+        {"file_name": "crates/b/src/other.rs", "line_start": 2, "line_end": 2, "column_start": 1, "is_primary": True}]}})
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        cmd_builtins_lint_files(btree, "crates/b", write("bc.log", "\n".join(tree_log[:2] + [cross]) + "\n"), os.path.join(d, "absent.log"))
+    check("builtins-lint files: each file a finding's primary spans name", buf.getvalue().splitlines(),
+          ["clippy\tcrates/b/src/lib.rs", "clippy\tcrates/b/src/other.rs"])
+    # The rustfmt unit is the rustfmt row's reading under the row's own names, counted by file.
+    fmt_plant = BUILTINS_LINT_PLANT_LINES[1]
+    r = parse_builtins_rustfmt(write("bf.log", f'[lib (2024)] "{btree}/crates/b/src/lib.rs"\nFormatting {btree}/crates/b/src/lib.rs\n'
+                                               f"Diff in {btree}/crates/b/src/lib.rs:32:\n-{fmt_plant}\n+{fmt_plant.replace(':u8=0', ': u8 = 0')}\n"),
+                               "1", 3, btree, "crates/b", write("bf-base.log", ""), "absent", bbase, bsha, bfork)
+    check("builtins-lint rustfmt: the rustfmt row's reading under the row's names",
+          (r["row"], r["unit"], r["status"], r["failures"], r["breakdown"]), ("builtins-lint", "rustfmt", "FAIL",
+           [f"crates/b/src/lib.rs:32: {fmt_plant}"], {"by_lint": {}, "by_file": {"crates/b/src/lib.rs": [1, 0, 0]}}))
+    r = parse_builtins_rustfmt(write("bf.log", f'[lib (2024)] "{btree}/crates/b/src/lib.rs"\nDiff in {btree}/crates/b/src/lib.rs:32:\n-x\n+y\n'
+                                               f"Error writing files: failed to resolve mod `gone`: {btree}/crates/b/src/gone.rs does not exist\n"),
+                               "1", 3, btree, "crates/b")
+    check("builtins-lint rustfmt: an unread file's places count as unsorted",
+          (r["status"], r["breakdown"]["by_file"]), ("UNKNOWN", {"crates/b/src/lib.rs": [0, 0, 1]}))
+    check("builtins-lint rustfmt: no package", parse_builtins_rustfmt(os.path.join(d, "absent.log"), "-", 0, btree, "-")["status"], "UNKNOWN")
 
     # The memory bench row: one run of benches/memory.rs, read from what it printed and its exit, in
     # the shape Cut14's bench prints (two targets; exit 0 on a MISS) and in one with more targets that
@@ -3109,8 +3432,9 @@ def selftest():
                 else:
                     os.environ[k] = v
 
-    # The docs, changelog, rustfmt and membench rows. The plan takes `plant` as one of them or nothing.
-    for plant_in, ok in (("", True), ("docs", True), ("changelog", True), ("rustfmt", True), ("membench", True), ("both", False)):
+    # The docs, changelog, rustfmt, membench and builtins-lint rows. The plan takes `plant` as one of them or nothing.
+    for plant_in, ok in (("", True), ("docs", True), ("changelog", True), ("rustfmt", True), ("membench", True), ("builtins-lint", True),
+                         ("both", False)):
         r = plan_out(plant=plant_in)
         check(f"plan with plant={plant_in!r}", isinstance(r, dict) and r.get("plant") == plant_in, ok)
     # The Rust gate's build seed. A dispatch takes auto (the newest cut's), build (this run's own)
@@ -3195,8 +3519,8 @@ def selftest():
         check(f"plan: rows={rows} with silent={silent!r} plant={plant!r}",
               (r.get("silent"), r.get("plant")) if isinstance(r, dict) else "does not run" in r and repr(silent or plant) in r,
               (silent, plant) if ok else True)
-    check("docs, changelog, rustfmt and membench are job names silent takes",
-          {"docs", "changelog", "rustfmt", "membench"} <= set(all_job_names()), True)
+    check("docs, changelog, rustfmt, membench and builtins-lint are job names silent takes",
+          {"docs", "changelog", "rustfmt", "membench", "builtins-lint"} <= set(all_job_names()), True)
     # Each plant lands where the job's tool reads it.
     ptree = os.path.join(d, "ptree")
     for what, body in (("docs", "//! pi-shell\n#![allow(x)]\nmod a;\npub mod bash;\npub mod b;\n"),
@@ -3227,6 +3551,17 @@ def selftest():
         stopped_plant = str(e.code)
     check("the membench plant with no place for it", stopped_plant,
           f"::error::{PLANTS['membench'][0]} has no place for the membench plant")
+    # The builtins-lint plant: two consts at the end of pi-builtins' library root, after a blank line
+    # and a blank line apart, so that rustfmt reads each as a place of its own.
+    p = os.path.join(ptree, PLANTS["builtins-lint"][0])
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    open(p, "w").write("//! pi-builtins\npub use a::b;")
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        cmd_plant("builtins-lint", ptree)
+    check("the builtins-lint plant", (open(p).read().split("\n"), buf.getvalue().splitlines()),
+          (["//! pi-builtins", "pub use a::b;", "", BUILTINS_LINT_PLANT_LINES[0], "", BUILTINS_LINT_PLANT_LINES[1], ""],
+           [f"PLANT builtins-lint: {PLANTS['builtins-lint'][0]}:4: {BUILTINS_LINT_PLANT_LINES[0]}",
+            f"PLANT builtins-lint: {PLANTS['builtins-lint'][0]}:6: {BUILTINS_LINT_PLANT_LINES[1]}"]))
     # A unified diff's first change in each file; a removed line that starts `-- ` is no header.
     dfile = os.path.join(d, "c.diff")
     open(dfile, "w").write("--- a/p/x.md\n+++ b/p/x.md\n@@ -3,5 +3,3 @@\n ## [Unreleased]\n \n-### Planted\n--- dashes\n"
@@ -3502,6 +3837,47 @@ def selftest():
            "on lines the fork left as they are"
            in out, rc), (True, True, 0))
     json.dump(result("rustfmt", fmt_ws[-1], "runner", "PASS", "0", 1, 2), open(os.path.join(res2, fmt_files[fmt_ws[-1]]), "w"))
+    # The builtins-lint row: a planted run must find each unit FAIL naming its own plant; a unit that
+    # counts its findings lists the first of each kind among the details, and counts them all by lint
+    # and by file in a section of its own.
+    bl_files = {json.load(open(os.path.join(res2, f)))["unit"]: f for f in os.listdir(res2)
+                if json.load(open(os.path.join(res2, f)))["row"] == "builtins-lint"}
+    check("the builtins-lint row's units", sorted(bl_files), sorted(BUILTINS_LINT_UNITS))
+    bl_title = next(t for t, k in ROWS if k == "builtins-lint")
+    rsync_a, lib_rs = "crates/pi-builtins/src/rsync/a.rs", "crates/pi-builtins/src/lib.rs"
+    many = [f"{rsync_a}:{i}:1: clippy::doc_markdown: item in documentation is missing backticks" for i in range(1, 31)]
+    clip_planted = f"{lib_rs}:256:43: clippy::redundant_static_lifetimes: constants have by default a 'static lifetime ({BUILTINS_LINT_PLANT_LINES[0]})"
+    fmt_planted = f"{lib_rs}:258: {BUILTINS_LINT_PLANT_LINES[1]}"
+
+    def bl_result(unit, failures, known=(), mine_keys=(), known_keys=()):
+        return dict(result("builtins-lint", unit, "runner", "FAIL" if failures else "KNOWN", "0", 1, 0, len(failures), failures=failures,
+                           note=f"{len(failures)} a fork change's, {len(known)} upstream's own"),
+                    upstream_places=list(known), unsorted_places=[], upstream_base=bsha, breakdown=lint_breakdown(list(mine_keys), list(known_keys), []))
+
+    json.dump(bl_result("clippy", many + [clip_planted], ["k1", "k2"], [(rsync_a, "clippy::doc_markdown")] * 30
+                        + [(lib_rs, "clippy::redundant_static_lifetimes")], [("crates/pi-builtins/src/cp.rs", "clippy::x")] * 2),
+              open(os.path.join(res2, bl_files["clippy"]), "w"))
+    json.dump(bl_result("rustfmt", [fmt_planted], (), [(lib_rs, None)]), open(os.path.join(res2, bl_files["rustfmt"]), "w"))
+    rc, out = summary2(rows_env="builtins-lint", plant_env="builtins-lint")
+    check("summary: a planted builtins-lint run that each unit names (the clippy unit past its listed failures)",
+          (f"The control caught it: the row reads FAIL, and each of its units (`clippy`, `rustfmt`) names `{BUILTINS_LINT_PLANT}`." in out,
+           out.count(f"(runner): FAILED `{rsync_a}:"), "`clippy` (runner): and 6 more FAILED (the section below" in out,
+           f"### {bl_title}: `clippy` read FAIL" in out, "| `clippy::doc_markdown` | 30 | 0 | 0 |" in out,
+           "| `crates/pi-builtins/src/cp.rs` | 0 | 2 | 0 |" in out, f"| `{lib_rs}` | 1 | 0 | 0 |" in out, rc),
+          (True, LISTED_PER_KIND, True, True, True, True, True, 1))
+    json.dump(bl_result("rustfmt", [f"{lib_rs}:12: fn x(){{}}"], (), [(lib_rs, None)]), open(os.path.join(res2, bl_files["rustfmt"]), "w"))
+    rc, out = summary2(rows_env="builtins-lint", plant_env="builtins-lint")
+    check("summary: a planted builtins-lint run whose rustfmt unit does not name the plant",
+          (f"**THE CONTROL FAILED**: the row reads FAIL, and these units do not read FAIL naming `{BUILTINS_LINT_PLANT}`: `rustfmt`." in out, rc),
+          (True, 1))
+    json.dump(bl_result("clippy", [], ["k1"], (), [("crates/pi-builtins/src/cp.rs", "clippy::x")]), open(os.path.join(res2, bl_files["clippy"]), "w"))
+    json.dump(dict(result("builtins-lint", "rustfmt", "runner", "PASS", "0", 1, 1), upstream_places=[], unsorted_places=[], upstream_base=""),
+              open(os.path.join(res2, bl_files["rustfmt"]), "w"))
+    rc, out = summary2(rows_env="builtins-lint")
+    check("summary: a builtins-lint row whose findings are each upstream's own reads KNOWN",
+          (f"| {bl_title} | **KNOWN** | 1 / 1 / 0 / 0 |" in out, rc), (True, 0))
+    for u, f in bl_files.items():
+        json.dump(result("builtins-lint", u, "runner", "PASS", "0", 1, 1), open(os.path.join(res2, f), "w"))
     # The memory bench: a planted run names the shell line, and the summary lists every line it printed.
     mb_file = next(f for f in os.listdir(res2) if json.load(open(os.path.join(res2, f)))["row"] == "membench")
     planted_mb = mb([shell_miss, vproc_ok] + others, 0)
@@ -3633,7 +4009,8 @@ def selftest():
           "platform report reader, the tree's real skip lines and partial passes, the shard assignment and "
           "per-user weights, the summary's UNKNOWN for a unit no job or two jobs reported, the known and flaky "
           "entries, skip-forms and skip-lines with their controls, the gVisor rows and their known skips, the "
-          "docs and changelog rows with their planted controls, the Rust tests' rows from their jobs' "
+          "docs and changelog rows with their planted controls, the builtins-lint row's lift, readers, sorting "
+          "and plant, the Rust tests' rows from their jobs' "
           "conclusions, the row selection (its jobs from the workflow's needs, the cut's every row, a control "
           "on a row that does not run), and the summary's NOT RUN rows and verdict line")
 
@@ -3656,12 +4033,25 @@ CHANGELOG_FILE = re.compile(r"^  (\S+): (\d+ promoted item\(s\), .*)$", re.M)
 # workspace the rustfmt row checks gets a function rustfmt would space out at the end of its first
 # target root (rustfmt_plant_target), so each unit of the row must name it; the memory bench's shell
 # gets a 1 MiB reserve in a list its kernel keeps (Shell::create, just after the kernel is made),
-# which the shell's drop frees, so the bench's shell line must read MISS.
+# which the shell's drop frees, so the bench's shell line must read MISS; pi-builtins' library root
+# gets two consts (BUILTINS_LINT_PLANT_LINES), one for each unit of the builtins-lint row.
+# The builtins-lint row (builtins-lint.sh): the crate the clippy row lints only under its own
+# opt-outs and the rustfmt row never reads (rustfmt.toml ignores it), under both tools with those
+# opt-outs lifted for the check (builtins_lint_lift). Two units, clippy and rustfmt.
+BUILTINS_LINT_CRATE = "pi-builtins"
+BUILTINS_LINT_UNITS = ("clippy", "rustfmt")
+# Its control, appended to the crate's library root after a blank line: a const whose `'static`
+# clippy::redundant_static_lifetimes names (a style lint: the clippy::all group, which the crate's own
+# [lints] allows), then one rustfmt would space out. Each names BUILTINS_LINT_PLANT in its line.
+BUILTINS_LINT_PLANT = "SC_BUILTINS_LINT_PLANT"
+BUILTINS_LINT_PLANT_LINES = (f"pub const {BUILTINS_LINT_PLANT}_CLIPPY: &'static str = \"planted\";",
+                             f"pub const {BUILTINS_LINT_PLANT}_FMT:u8=0;")
 PLANTS = {
     "docs": ("crates/pi-shell/src/lib.rs", "/// See [`NoSuchItemPlanted`].", "NoSuchItemPlanted"),
     "changelog": ("packages/browser-relay/CHANGELOG.md", "### Planted empty heading", "Planted empty heading"),
     "rustfmt": ("the first target root of each cargo workspace the row checks", "fn sc_rustfmt_plant(){}", "sc_rustfmt_plant"),
     "membench": ("crates/pi-shell/src/bash/vm/mod.rs", "k.callout_labels.reserve_exact(1 << 17);", "memory shell:"),
+    "builtins-lint": ("crates/pi-builtins/src/lib.rs", " and ".join(BUILTINS_LINT_PLANT_LINES), BUILTINS_LINT_PLANT),
 }
 # The line of Shell::create the membench plant goes after: the kernel the shell owns is made there.
 MEMBENCH_PLANT_AT = "let mut k = Kernel::new("
@@ -3884,10 +4274,15 @@ RUSTFMT_WORKSPACES_LIST = os.path.join(os.path.dirname(os.path.abspath(__file__)
 # `Diff in <path>:<line>:` before each block of changes, then its lines (` `, `-`, `+`), and
 # `Incorrect newline style in <path>` for a file whose line endings rustfmt.toml's newline_style
 # forbids. rustfmt's own errors start `error` or `Error` (`Error writing files: failed to resolve
-# mod ...` skips a whole crate root).
+# mod ...` skips a whole crate root). An `error[internal]: ...` whose next line places it
+# (`--> <path>:<line>:<line>:<column>`) is one line of a file rustfmt read and formatted, but could
+# not format cleanly (`left behind trailing whitespace`; `line formatted, but exceeded maximum
+# width` when the config asks): a place of that line, not a file it could not read.
 RUSTFMT_TARGET = re.compile(r'^\[[^\]]+\] "(.+)"$')
 RUSTFMT_DIFF = re.compile(r"^Diff in (.+):(\d+):$")
 RUSTFMT_NEWLINE = re.compile(r"^Incorrect newline style in (.+)$")
+RUSTFMT_INTERNAL = re.compile(r"^error\[internal\]: (.+)$")
+RUSTFMT_AT = re.compile(r"^\s*--> (.+):(\d+):\d+:\d+$")
 # rustfmt's own -v (`cargo fmt ... -- -v`) names each file it formats or checks: a file its
 # rustfmt.toml ignores, or a module under #[rustfmt::skip], is never named.
 RUSTFMT_FORMATTING = re.compile(r"^Formatting (.+)$")
@@ -3918,7 +4313,12 @@ def read_rustfmt(log, tree):
     place, at its line in the file as it is) or `path: newline style`, with the path from TREE's root
     and backticks as ' so that it reads as one code span; `path`; and, for a run, `line` (its first
     line in the file as it is), `removed` (how many of the file's lines it rewrites) and `run` (its
-    `-` and `+` lines)."""
+    `-` and `+` lines). An `error[internal]` with a `-->` line is a place too. Its line is a line of
+    rustfmt's output, not of the file (one source line rustfmt writes as four moves the errors after
+    it by four), so it is mapped back through the file's runs: a line between runs is the source
+    line as far from them; a line inside a run is that run's (its first removed line, its count of
+    removed lines). Its `run` is the error's words and its line in that run, so two errors in one run
+    stay two: `path:line: <the error> (rustfmt's error[internal], output line N)`."""
     try:
         # rustfmt's -v marks the end of each line of a diff with ⏎; a line is read without it.
         lines = [x[:-1] if x.endswith("⏎") else x for x in open(log, encoding="utf-8", errors="replace").read().splitlines()]
@@ -3942,6 +4342,9 @@ def read_rustfmt(log, tree):
     # checked: {each file rustfmt checked: the config file it took for that file's target root, or
     # None when it named none (rustfmt's defaults)}. A new rustfmt invocation starts with none.
     targets, places, errors, checked, config = [], [], [], {}, None
+    # runs: {path: [(the run's first original line, lines it removes, lines it adds)]}, in order;
+    # internal: [(path, output line, the error's words)], placed once every run is read.
+    runs, internal = {}, []
 
     def add(place):
         place["name"] = place["name"].replace("`", "'")
@@ -3974,6 +4377,7 @@ def read_rustfmt(log, tree):
                 if run:
                     add({"name": f"{path}:{start}: {what(run)[:160]}", "path": path, "line": start,
                          "removed": sum(b[:1] == "-" for b in run), "run": tuple(run)})
+                    runs.setdefault(path, []).append((start, sum(b[:1] == "-" for b in run), sum(b[:1] == "+" for b in run)))
                     run, start = [], None
                 if b[:1] != " " or RUSTFMT_DIFF.match(b):
                     break
@@ -3981,7 +4385,26 @@ def read_rustfmt(log, tree):
         elif nl:
             add({"name": f"{rel(nl.group(1))}: newline style (rustfmt.toml's newline_style)", "path": rel(nl.group(1))})
         elif line.startswith(("error", "Error")):
-            errors.append(line.strip())
+            e, at = RUSTFMT_INTERNAL.match(line), RUSTFMT_AT.match(lines[i + 1]) if i + 1 < len(lines) else None
+            if e and at:
+                internal.append((rel(at.group(1)), int(at.group(2)), e.group(1)))
+            else:
+                errors.append(line.strip())
+    for path, n, words in internal:
+        # Output line n back to the file's line, through the file's runs in order: before a run it
+        # is as far from the run's start as in the output; inside one it is that run's.
+        shift, src, removed, offset = 0, None, 1, 0
+        for start, minus, plus in sorted(runs.get(path, [])):
+            if n < start + shift:
+                break
+            if n < start + shift + plus:
+                src, removed, offset = start, minus, n - (start + shift)
+                break
+            shift += plus - minus
+        if src is None:
+            src = n - shift
+        add({"name": f"{path}:{src}: {words[:160]} (rustfmt's error[internal], output line {n})", "path": path, "line": src,
+             "removed": removed, "run": ("error[internal]", words, offset)})
     return targets, places, errors, checked, lines
 
 
@@ -4066,7 +4489,8 @@ def sort_rustfmt_places(places, base_places, checked, fork, tree, base_tree, tre
     ending the tree's newline_style forbids maps to a line of the base whose ending the base's
     forbids, each side's style from the config its run reported for the file (CHECKED and
     TREE_CHECKED); a report with no such line in the tree is unsorted."""
-    at_base = {(p["path"], p["line"]): p["run"] for p in base_places if "run" in p}
+    # Keyed by line and run together: a diff run and a placed error[internal] can share a line.
+    at_base = {(p["path"], p["line"], p["run"]) for p in base_places if "run" in p}
     newline_at_base = {p["path"] for p in base_places if "run" not in p}
     upstream, mine, unsorted = [], [], []
     for p in places:
@@ -4099,7 +4523,7 @@ def sort_rustfmt_places(places, base_places, checked, fork, tree, base_tree, tre
         mapped = [base_line(hunks, n) for n in rewritten]
         if None in mapped or mapped != list(range(mapped[0], mapped[0] + len(mapped))):
             mine.append(p["name"])
-        elif at_base.get((path, mapped[0])) == p["run"]:
+        elif (path, mapped[0], p["run"]) in at_base:
             upstream.append(p["name"])
         elif RUSTFMT_SKIP.search(open(os.path.join(base_tree, path), "rb").read()):
             unsorted.append((p["name"], f"the upstream base's {path} has items rustfmt skips, which its check did not read"))
@@ -4233,10 +4657,389 @@ def plant_rustfmt(tree):
         print(f"PLANT rustfmt: {m}: {path}:{body.count(chr(10))}: {text}")
 
 
+# A TOML table header (`[a.b]` or `[[a]]`), its name stripped.
+TOML_HEADER = re.compile(r"^\s*\[{1,2}\s*([^\[\]]+?)\s*\]{1,2}\s*(?:#.*)?$")
+
+
+def builtins_lint_lift_manifest(text):
+    """A crate manifest's TEXT with its own lint levels replaced by the workspace's, the levels every
+    other crate of the workspace takes: each [lints] table (`[lints]`, `[lints.<tool>]`) left out, and
+    `[lints] workspace = true` added. None unless the result reads as TOML, sets lints to
+    {workspace = true} and keeps every other key of TEXT as it was."""
+    out, skip = [], False
+    for line in text.splitlines():
+        h = TOML_HEADER.match(line)
+        if h:
+            name = h.group(1).replace(" ", "")
+            skip = name == "lints" or name.startswith("lints.")
+        if not skip:
+            out.append(line)
+    new = "\n".join(out).rstrip("\n") + "\n\n[lints]\nworkspace = true\n"
+    try:
+        before, after = tomllib.loads(text), tomllib.loads(new)
+    except tomllib.TOMLDecodeError:
+        return None
+    before.pop("lints", None)
+    lints = after.pop("lints", None)
+    return new if lints == {"workspace": True} and after == before else None
+
+
+def builtins_lint_lift_rustfmt(text, files):
+    """rustfmt.toml's TEXT with each `ignore` pattern that holds one of FILES (paths relative to the
+    file's directory) left out, the key too when none is left: (the new text, the patterns left out),
+    or (TEXT, []) when no pattern holds one. A pattern holds a file when it matches it as a glob, or
+    as a directory the file is under. None unless the result reads as TOML and keeps every other key
+    and pattern of TEXT as it was."""
+    try:
+        before = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    pats = before.get("ignore", [])
+    if not isinstance(pats, list) or not all(isinstance(p, str) for p in pats):
+        return None
+
+    def holds(p):
+        return any(fnmatch.fnmatchcase(f, p) or fnmatch.fnmatchcase(f, p.rstrip("/") + "/*") for f in files)
+
+    gone = [p for p in pats if holds(p)]
+    if not gone:
+        return text, []
+    kept = [p for p in pats if p not in gone]
+    lines = text.split("\n")
+    start = next((i for i, line in enumerate(lines) if re.match(r"^\s*ignore\s*=", line)), None)
+    end, depth = None, 0
+    for i in range(start if start is not None else len(lines), len(lines)):
+        depth += lines[i].count("[") - lines[i].count("]")
+        if depth <= 0:
+            end = i
+            break
+    if end is None:
+        return None
+    new = "\n".join(lines[:start] + ([f"ignore = {json.dumps(kept)}"] if kept else []) + lines[end + 1:])
+    try:
+        after = tomllib.loads(new)
+    except tomllib.TOMLDecodeError:
+        return None
+    want = {k: v for k, v in before.items() if k != "ignore"}
+    if kept:
+        want["ignore"] = kept
+    return (new, gone) if after == want else None
+
+
+def cmd_builtins_lint_lift(tree, crate_dir):
+    """Lifts the crate at TREE/CRATE_DIR out of its own opt-outs for the builtins-lint row: its
+    Cargo.toml's [lints] (builtins_lint_lift_manifest), and each `ignore` pattern that holds one of
+    its .rs files in every rustfmt config rustfmt could take for them (builtins_lint_lift_rustfmt):
+    `.rustfmt.toml` and `rustfmt.toml` (rustfmt reads the first of the two) in each directory that
+    holds a .rs file of the crate or lies above one, up to TREE, each pattern read relative to its
+    file's directory. Prints what it changed; stops the job when it cannot, so that the row reads
+    UNKNOWN rather than a check of the crate as it opts out. Whether rustfmt then read the crate is
+    the rustfmt unit's own check (parse_builtins_rustfmt: each target root named as checked)."""
+    if crate_dir == "-":
+        sys.exit(f"::error::the tree has no package {BUILTINS_LINT_CRATE} to lift")
+    manifest = os.path.join(tree, crate_dir, "Cargo.toml")
+    new = builtins_lint_lift_manifest(open(manifest, encoding="utf-8").read())
+    if new is None:
+        sys.exit(f"::error::{crate_dir}/Cargo.toml: its [lints] could not be replaced by `[lints] workspace = true`")
+    open(manifest, "w", encoding="utf-8").write(new)
+    print(f"LIFT {crate_dir}/Cargo.toml: [lints] workspace = true, the workspace's lint levels")
+    files = sorted(os.path.relpath(os.path.join(dp, f), tree) for dp, _, fs in os.walk(os.path.join(tree, crate_dir))
+                   for f in fs if f.endswith(".rs"))
+    dirs = set()
+    for f in files:
+        d = os.path.dirname(f)
+        while d not in dirs:
+            dirs.add(d)
+            if not d:
+                break
+            d = os.path.dirname(d)
+    configs = [os.path.join(d, n) for d in sorted(dirs) for n in (".rustfmt.toml", "rustfmt.toml") if os.path.isfile(os.path.join(tree, d, n))]
+    if not configs:
+        print(f"LIFT rustfmt: no rustfmt config at or above {crate_dir}")
+    for config in configs:
+        here = os.path.dirname(config)
+        got = builtins_lint_lift_rustfmt(open(os.path.join(tree, config), encoding="utf-8").read(),
+                                         [os.path.relpath(f, here or ".") for f in files])
+        if got is None:
+            sys.exit(f"::error::{config}: the ignore patterns that hold {crate_dir} could not be left out")
+        new, gone = got
+        if gone:
+            open(os.path.join(tree, config), "w", encoding="utf-8").write(new)
+            print(f"LIFT {config}: ignore no longer holds {', '.join(gone)}")
+        else:
+            print(f"LIFT {config}: no ignore pattern holds {crate_dir}")
+
+
+def read_dep_info(path, target):
+    """The files a rustc dep-info file (PATH) names as TARGET's prerequisites, from its rule for a
+    file of TARGET's name; None when it cannot be read or has no such rule."""
+    lines = read_lines(path)
+    if lines is None:
+        return None
+    name = os.path.basename(target)
+    for line in lines:
+        head, sep, rest = line.partition(": ")
+        if sep and os.path.basename(head) == name:
+            return [p.replace("\\ ", " ") for p in re.split(r"(?<!\\) ", rest.strip()) if p]
+    return None
+
+
+def lint_read(log, tree, crate_dir):
+    """What one `cargo clippy --message-format=json` of the crate in CRATE_DIR says, run under TREE
+    with every lint capped at warn: (findings, errors, the files rustc read, unread line numbers), or
+    None when there is no log. A finding is a warning with a code and a primary span in a file under
+    CRATE_DIR, a dict: path, line and end (its first primary span's first and last lines), col, code,
+    message, and spans (each primary span as [path, first line, last line, column]: a lint can mark
+    more than one place); the same finding in two of the crate's targets (the library and its tests)
+    is one. An error is any message at an error level: with every lint a warning, the compiler's own.
+    The files
+    rustc read are those under CRATE_DIR that the dep-info of each compiled target of the crate names
+    (cargo's compiler-artifact names its .rmeta; rustc writes the .d beside it), relative to TREE: the
+    files it linted. None when no target of the crate was compiled, or one's dep-info cannot be read."""
+    got = cargo_messages(log)
+    if got is None:
+        return None
+    events, unread = got
+    prefix = os.path.realpath(tree).rstrip("/") + "/"
+    crate = crate_dir.rstrip("/") + "/"
+    manifest = os.path.realpath(os.path.join(tree, crate_dir, "Cargo.toml"))
+
+    def rel(p):
+        if os.path.isabs(p):
+            p = os.path.realpath(p)
+            return p[len(prefix):] if p.startswith(prefix) else p
+        return os.path.normpath(p)
+
+    findings, seen, errors, read, targets, unreadable = [], set(), [], set(), 0, False
+    for ev in events:
+        if ev.get("reason") == "compiler-artifact" and os.path.realpath(ev.get("manifest_path") or "/") == manifest:
+            targets += 1
+            rmeta = next((f for f in ev.get("filenames") or () if os.path.basename(f).startswith("lib") and f.endswith(".rmeta")), None)
+            dep = None if rmeta is None else read_dep_info(os.path.join(os.path.dirname(rmeta), os.path.basename(rmeta)[3:-6] + ".d"), rmeta)
+            if dep is None:
+                unreadable = True
+            else:
+                read.update(rel(p) for p in dep)
+        if ev.get("reason") != "compiler-message":
+            continue
+        m = ev.get("message") or {}
+        level = m.get("level") or ""
+        if level.startswith("error"):
+            said = (m.get("rendered") or m.get("message") or level).strip()
+            errors.append(said.splitlines()[0] if said else level)
+            continue
+        code = (m.get("code") or {}).get("code")
+        primary = [s for s in m.get("spans") or () if s.get("is_primary")]
+        if level != "warning" or not code or not primary:
+            continue
+        spans = tuple((rel(s["file_name"]), s["line_start"], s["line_end"], s["column_start"]) for s in primary)
+        key = (spans, code, m.get("message", ""))
+        if spans[0][0].startswith(crate) and key not in seen:
+            seen.add(key)
+            findings.append(dict(zip(("path", "line", "end", "col"), spans[0]), code=code, message=key[2], spans=[list(s) for s in spans]))
+    linted = None if unreadable or not targets else {p for p in read if p.startswith(crate) and p.endswith(".rs")}
+    return findings, errors, linted, unread
+
+
+def sort_lint_findings(findings, base_findings, base_linted, fork, base_tree):
+    """Each clippy finding of the tree as upstream's own, the fork's, or unsorted with the reason, as
+    sort_rustfmt_places sorts rustfmt's places: ([upstream's], [the fork's], [(finding, why)]). A
+    finding in a file the base lacks is the fork's. Elsewhere its file must be one the base's run
+    linted (BASE_LINTED, from its dep-info) and one the fork's diff names (FORK), or it is unsorted.
+    It is upstream's own when every line of each of its primary spans is a line of the base the fork
+    left as it is, and the base has the same finding (lint, message, each span's column) at the lines
+    they map to; one on a line the fork changed or added is the fork's, and so is one on unchanged
+    lines the base lacks (a fork change elsewhere, as in a type or a lint level, brought it). A
+    primary span outside the crate is unsorted: the base's run is not read there."""
+    at_base = {(tuple((p, line, col) for p, line, _, col in f["spans"]), f["code"], f["message"]) for f in base_findings}
+    upstream, mine, unsorted = [], [], []
+    for f in findings:
+        mapped, fork_own, why = [], False, None
+        for path, first, last, col in f["spans"]:
+            if not os.path.exists(os.path.join(base_tree, path)):
+                fork_own = True
+            elif path not in base_linted:
+                why = why or f"the upstream base's run did not lint {path}"
+            elif path not in fork:
+                why = why or f"no diff of {path} from the upstream base"
+            else:
+                lines = [base_line(fork[path], n) for n in range(first, last + 1)]
+                if None in lines or lines != list(range(lines[0], lines[0] + len(lines))):
+                    fork_own = True
+                else:
+                    mapped.append((path, lines[0], col))
+        if fork_own:
+            mine.append(f)
+        elif why:
+            unsorted.append((f, why))
+        elif (tuple(mapped), f["code"], f["message"]) in at_base:
+            upstream.append(f)
+        else:
+            mine.append(f)
+    return upstream, mine, unsorted
+
+
+def lint_breakdown(mine, upstream, unsorted):
+    """The count of findings by lint and by file, each [the fork's, upstream's own, unsorted]:
+    {"by_lint": {lint: counts}, "by_file": {path: counts}}. Each argument is a list of (path, lint);
+    a lint of None is counted by its file only."""
+    out = {"by_lint": {}, "by_file": {}}
+    for i, group in enumerate((mine, upstream, unsorted)):
+        for path, lint in group:
+            out["by_file"].setdefault(path, [0, 0, 0])[i] += 1
+            if lint is not None:
+                out["by_lint"].setdefault(lint, [0, 0, 0])[i] += 1
+    return out
+
+
+def parse_builtins_clippy(log, exit_code, secs, tree, crate_dir, base_log="-", base_exit="-", base_tree="-", base_sha="-",
+                          fork_diff="-", row="builtins-lint"):
+    """The builtins-lint row's clippy unit: `cargo clippy --all-targets --no-deps --keep-going
+    --message-format=json -- --cap-lints warn` of the crate in CRATE_DIR (LOG, its stdout and stderr),
+    run under TREE with the crate's [lints] lifted to the workspace's, against the same run at the
+    tree's upstream base (BASE_LOG and BASE_EXIT, run under BASE_TREE, the merge base BASE_SHA;
+    BASE_EXIT `absent` when the base has no CRATE_DIR, `-` when the base could not be set up and
+    BASE_LOG is then the setup's log) and the fork's changes from the base (FORK_DIFF), as
+    parse_rustfmt reads its places. Each finding (lint_read) is upstream's own, the fork's or unsorted
+    (sort_lint_findings), each named `path:line:col: lint: message (the line's text)`. FAIL names
+    each of the fork's and lists the others; KNOWN is a crate whose every finding is upstream's own;
+    PASS needs exit 0, a compiled target and no finding, and reads no base. Anything else is UNKNOWN:
+    no package, no log, the time bound or a signal, a log line that does not parse, a compile error or
+    an exit other than 0 (its targets were not all linted), no dep-info of a compiled target, or
+    findings with no clean read of the base or of the fork's diff to sort them by, or in a file the
+    base did not lint. The result also counts the findings by lint and by file (breakdown)."""
+    lines_of = {}
+
+    def name(f):
+        if f["path"] not in lines_of:
+            lines_of[f["path"]] = (read_lines(os.path.join(tree, f["path"])) or [])
+        src = lines_of[f["path"]]
+        text = src[f["line"] - 1].strip() if 0 < f["line"] <= len(src) else ""
+        return (f"{f['path']}:{f['line']}:{f['col']}: {f['code']}: {f['message'][:200]}" + (f" ({text[:120]})" if text else "")).replace("`", "'")
+
+    def r(status, mine=(), upstream=(), unsorted=(), note=""):
+        res = result(row, "clippy", "runner", status, exit_code, secs, failed=len(mine), failures=[name(f) for f in mine], note=note)
+        res["upstream_places"] = [name(f) for f in upstream]
+        res["unsorted_places"] = [f"{name(f)} ({why})".replace("`", "'") for f, why in unsorted]
+        res["upstream_base"] = "" if base_sha == "-" else base_sha
+        if mine or upstream or unsorted:
+            res["breakdown"] = lint_breakdown(*[[(f["path"], f["code"]) for f in g] for g in (mine, upstream, [f for f, _ in unsorted])])
+        return res
+
+    if crate_dir == "-":
+        return r("UNKNOWN", note=f"the tree has no package {BUILTINS_LINT_CRATE}")
+    got = lint_read(log, tree, crate_dir)
+    if got is None:
+        return r("UNKNOWN", note="no log")
+    if stopped(exit_code):
+        return r("UNKNOWN", note=f"exit {exit_code}: the time bound or a signal ended it")
+    findings, errors, linted, unread = got
+    found = f"{len(findings)} finding(s) in {len({f['path'] for f in findings})} file(s)"
+    if unread:
+        return r("UNKNOWN", unsorted=[(f, "its log is unread in part") for f in findings],
+                 note=f"log line(s) {', '.join(map(str, unread[:12]))} look like cargo messages and do not parse, so their findings are unread; {found}")
+    if errors or exit_code != "0":
+        return r("UNKNOWN", unsorted=[(f, "the crate's targets did not all compile") for f in findings],
+                 note=f"exit {exit_code} with {len(errors)} error(s), so the crate's targets were not all linted (every lint is "
+                      f"capped at warn, so an error is the compiler's own): {(errors or ['no error message'])[0][:300]}; {found}")
+    if not linted:
+        return r("UNKNOWN", unsorted=[(f, "what clippy read is unknown") for f in findings],
+                 note=f"exit 0, but no compiled target of {crate_dir} has a dep-info file that can be read, or one that names a "
+                      f"file of the crate, so what clippy read is unknown; {found}")
+    if not findings:
+        return r("PASS", note=f"{len(linted)} file(s) linted at the workspace's lint levels, no finding")
+    at = "the upstream base" + ("" if base_sha == "-" else f" `{base_sha[:12]}`")
+    found += f", {len(linted)} file(s) linted"
+    if base_exit == "absent":
+        return r("FAIL", mine=findings, note=f"{found}, each a fork change's: {at} has no {crate_dir}")
+    why, bgot, fork = None, None, None
+    if base_exit == "-":
+        said = [line.strip() for line in read_lines(base_log) or () if line.strip()]
+        why = "it was not set up: " + (said[-1][:200] if said else "no log")
+    else:
+        bgot = lint_read(base_log, base_tree, crate_dir)
+        fork = read_fork_diff(fork_diff)
+        if bgot is None:
+            why = "no log"
+        elif stopped(base_exit):
+            why = f"exit {base_exit}: the time bound or a signal ended it"
+        elif bgot[3]:
+            why = f"log line(s) {', '.join(map(str, bgot[3][:12]))} there do not parse"
+        elif bgot[1] or base_exit != "0":
+            why = f"exit {base_exit} with {len(bgot[1])} error(s) there: {(bgot[1] or ['no error message'])[0][:200]}"
+        elif bgot[2] is None:
+            why = "no compiled target of the crate there has a dep-info file that can be read"
+        elif fork is None:
+            why = "no diff of the fork's changes from it"
+    if why:
+        return r("UNKNOWN", unsorted=[(f, f"{at} could not be read") for f in findings],
+                 note=f"{found}, none sorted into upstream's own or the fork's: {at} could not be read ({why})")
+    upstream, mine, unsorted = sort_lint_findings(findings, bgot[0], bgot[2], fork, base_tree)
+    told = f"{len(mine)} a fork change's, {len(upstream)} upstream's own (the same finding at {at} on the lines the fork left as they are)"
+    if unsorted:
+        told += f", {len(unsorted)} unsorted"
+    return r("FAIL" if mine else "UNKNOWN" if unsorted else "KNOWN", mine, upstream, unsorted, f"{found}: {told}")
+
+
+def parse_builtins_rustfmt(log, exit_code, secs, tree, crate_dir, base_log="-", base_exit="-", base_tree="-", base_sha="-",
+                           fork_diff="-", row="builtins-lint"):
+    """The builtins-lint row's rustfmt unit: `cargo fmt --manifest-path CRATE_DIR/Cargo.toml --check -v
+    -- -v` (LOG), run under TREE with rustfmt.toml's ignore of the crate lifted, read and sorted by the
+    rustfmt row's own reading (parse_rustfmt, the same arguments), and counted by file (breakdown).
+    It is UNKNOWN too when rustfmt's -v does not name each target root cargo listed as a file it
+    checked: an ignore of a config the lift did not reach still holds the crate, and rustfmt then
+    passes a file it never read. The places of an UNKNOWN unit are listed unsorted, never failed."""
+    if crate_dir == "-":
+        res = result(row, "rustfmt", "runner", "UNKNOWN", exit_code, secs, note=f"the tree has no package {BUILTINS_LINT_CRATE}")
+        res.update(upstream_places=[], unsorted_places=[], upstream_base="")
+        return res
+    res = parse_rustfmt(f"{crate_dir}/Cargo.toml", log, exit_code, secs, tree, base_log, base_exit, base_tree, base_sha, fork_diff, row=row)
+    res["unit"] = "rustfmt"
+    got = read_rustfmt(log, tree)
+    unread = [t for t in got[0] if t not in got[3]] if got else []
+    if res["status"] != "UNKNOWN" and unread:
+        res.update(status="UNKNOWN", note=f"rustfmt did not check the target root(s) {', '.join(unread)} (an ignore the lift did not "
+                                          f"reach still holds them), so the crate was not checked: {res['note']}")
+    if res["status"] == "UNKNOWN" and res["failures"]:
+        res["unsorted_places"] = res["unsorted_places"] + [f"{n} (the unit is UNKNOWN)" for n in res["failures"]]
+        res.update(failures=[], failed=0)
+    if res["failures"] or res["upstream_places"] or res["unsorted_places"]:
+        res["breakdown"] = lint_breakdown(*[[(n.split(":", 1)[0], None) for n in res[k]] for k in ("failures", "upstream_places", "unsorted_places")])
+    return res
+
+
+def cmd_builtins_lint_files(tree, crate_dir, clippy_log, fmt_log):
+    """`clippy<TAB>file` for each file under CRATE_DIR with a clippy finding, then `rustfmt<TAB>file`
+    for each with a place rustfmt would change: the files whose diff from the upstream base the row
+    records (builtins-lint.sh)."""
+    got = lint_read(clippy_log, tree, crate_dir) if crate_dir != "-" else None
+    # Each file a primary span of a finding names, in the crate (a lint can mark places in two files).
+    for f in sorted({s[0] for x in got[0] for s in x["spans"] if s[0].startswith(crate_dir.rstrip("/") + "/")} if got else ()):
+        print(f"clippy\t{f}")
+    fgot = read_rustfmt(fmt_log, tree) if crate_dir != "-" else None
+    for f in sorted({p["path"] for p in fgot[1]} if fgot else ()):
+        print(f"rustfmt\t{f}")
+
+
+def plant_builtins_lint(tree):
+    """The builtins-lint row's plant: BUILTINS_LINT_PLANT_LINES appended to pi-builtins' library root,
+    after a blank line and a blank line apart, so that each is a place of its own."""
+    path = PLANTS["builtins-lint"][0]
+    p = os.path.join(tree, path)
+    body = open(p, encoding="utf-8").read()
+    body += ("" if body.endswith("\n") else "\n") + "\n" + "\n\n".join(BUILTINS_LINT_PLANT_LINES) + "\n"
+    open(p, "w", encoding="utf-8").write(body)
+    n = body.count("\n")
+    print(f"PLANT builtins-lint: {path}:{n - 2}: {BUILTINS_LINT_PLANT_LINES[0]}")
+    print(f"PLANT builtins-lint: {path}:{n}: {BUILTINS_LINT_PLANT_LINES[1]}")
+
+
 def cmd_plant(what, tree):
     """Puts a row's planted fault (PLANTS) in TREE and prints where."""
     if what == "rustfmt":
         return plant_rustfmt(tree)
+    if what == "builtins-lint":
+        return plant_builtins_lint(tree)
     path, text, _ = PLANTS[what]
     p = os.path.join(tree, path)
     lines = open(p, encoding="utf-8").read().split("\n")
@@ -4315,6 +5118,14 @@ def main(argv):
         print(exe)
     elif c == "membench":
         print(json.dumps(parse_membench(*a)))
+    elif c == "builtins-lint-lift":
+        cmd_builtins_lint_lift(*a)
+    elif c == "builtins-lint-files":
+        cmd_builtins_lint_files(*a)
+    elif c == "builtins-clippy":
+        print(json.dumps(parse_builtins_clippy(*a)))
+    elif c == "builtins-rustfmt":
+        print(json.dumps(parse_builtins_rustfmt(*a)))
     elif c == "plant":
         cmd_plant(*a)
     elif c == "selftest":
