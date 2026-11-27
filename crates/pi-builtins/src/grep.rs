@@ -2577,6 +2577,43 @@ mod tests {
 		assert_eq!(std::fs::read(&g).unwrap(), b"x\nmid\nx\n");
 	}
 
+	/// GNU grep 3.11 reads an input holding a NUL byte as binary: the NUL
+	/// ends a line, and a match is reported on standard error, as "binary file
+	/// matches", in place of the line, which `-s` does not silence; `-s` does
+	/// silence "Is a directory". In a UTF-8 locale `[[:alpha:]]` holds every
+	/// letter, so `-w` finds the whole word `ß`, where the `regex` crate's
+	/// ASCII class found no line. Here the line was printed with its NUL.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn binary_input_and_silenced_errors_answer_as_gnu() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("bin"), b"x\0y\nz\nw\n").unwrap();
+		std::fs::write(tree.path().join("f1"), "zz\n").unwrap();
+		for (args, stdin, want, err, status) in [
+			(&["x", "bin"][..], "", "", "grep: bin: binary file matches\n", 0),
+			(&["-s", "x", "bin"][..], "", "", "grep: bin: binary file matches\n", 0),
+			(&["x"][..], "x\0y\n", "", "grep: (standard input): binary file matches\n", 0),
+			(&["-c", ".", "bin"][..], "", "4\n", "", 0),
+			(&["-s", "zz", ".", "f1"][..], "", "f1:zz\n", "", 2),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, stdin, tree.path()).await;
+			assert_eq!(
+				(code, capture.out().as_str(), capture.err().as_str()),
+				(status, want, err),
+				"grep {args:?}"
+			);
+		}
+		for (args, stdin) in [
+			(&["-cw", "[[:alpha:]]"][..], "\u{c0}B\n\u{df}\n"),
+			(&["-c", "[[:alpha:]]"][..], "\u{df}\n"),
+			(&["-cE", "[[:alpha:]]"][..], "\u{df}\n"),
+		] {
+			let (mut host, capture) = Host::for_test_async("grep", stdin, tree.path());
+			host.set_test_var("LC_ALL", "C.UTF-8");
+			let code = run_parsed(args, &mut host).await;
+			assert_eq!((code, capture.out().as_str()), (0, "1\n"), "grep {args:?}: {}", capture.err());
+		}
+	}
+
 	/// A file with no line terminator used to make grep buffer it whole: on a
 	/// sparse file that is an endless line of NUL bytes, and the host process
 	/// grew until the kernel killed it. Now that file is a per-file error and
