@@ -8554,9 +8554,30 @@ mod tests {
 	/// on another filesystem (`EXDEV` for a hard link to it), a clone is
 	/// `clonefile`'s, and setting attributes on a device is refused; 5,545
 	/// rows differ there.
+	/// How many pieces the matrix runs in. Each piece is a test of its own
+	/// with its own bound in `.config/nextest.toml`, so a run of the whole
+	/// binary reports a result every piece: the gate's runner fails a test
+	/// only after nothing has been reported for the longest bound among the
+	/// tests it is running (`libtest-bound.py`), and one test that took the
+	/// whole matrix reported nothing for its own 1,200 s bound. Measured on
+	/// runc beside 64 busy loops, the whole matrix took up to 1,413 s and was
+	/// stopped at 1,552 s.
+	///
+	/// Four, not more: libtest runs as many tests at once as it has test
+	/// threads, and eight pieces held every one of them under heavy load,
+	/// leaving no other test to report and so nothing to reset the runner's
+	/// quiet timer — the binary was stopped with every piece named and 2,027
+	/// tests never run. Fewer pieces than the binary has test threads keeps
+	/// the rest of the run reporting while the matrix works.
 	#[cfg(target_os = "linux")]
-	#[test]
-	fn cp_does_what_gnu_does_across_the_probe_matrix() {
+	const MATRIX_PIECES: usize = 4;
+
+	/// The rows of the probe matrix whose place in the file is `piece` of
+	/// [`MATRIX_PIECES`], run as [`cp_does_what_gnu_does_across_the_probe_matrix_1`]
+	/// and its three siblings do. Every row runs in exactly one piece
+	/// (`the_probe_matrix_pieces_run_every_row_exactly_once`).
+	#[cfg(target_os = "linux")]
+	fn probe_matrix_piece(piece: usize) {
 		use std::{
 			collections::{BTreeSet, HashMap},
 			os::unix::{
@@ -8837,168 +8858,202 @@ mod tests {
 			}
 			answers
 		}
-		let root_probe = tempdir().unwrap();
+		// The rows every piece runs, prepared once for the process: decoding and
+		// parsing the matrix, applying the root rows, the kernel and filesystem
+		// overlays and the stated rows, and probing this kernel, cost the same
+		// whichever piece asks for them, and a piece that repeated them took
+		// that work away from the rest of the binary.
+		type Prepared = (String, String, String, String, (i32, String, String, String));
+		static PREPARED: std::sync::OnceLock<Vec<Prepared>> = std::sync::OnceLock::new();
+		let prepared = PREPARED.get_or_init(|| {
+			let root_probe = tempdir().unwrap();
 
-		// SAFETY: `umask` only sets the process's file mode creation mask; the
-		// rows are GNU's under umask 022.
-		unsafe { libc::umask(0o022) };
-		// SAFETY: `geteuid` has no preconditions.
-		let as_root = unsafe { libc::geteuid() } == 0;
-		let mut rows: Vec<Row> = decode(include_bytes!("cp-gnu-matrix.txt.zst")).lines().map(parse).collect();
-		assert!(!rows.is_empty(), "the matrix has no rows");
-		// GNU's answers as the files hold them, before the root rows and the
-		// overlays apply: a stated row shows its row's beside this cp's.
-		let gnu_rows: HashMap<String, (i32, String, String, String)> =
-			rows.iter().map(|row| (row.id.clone(), row.want.clone())).collect();
-		let gnu_root: HashMap<String, (i32, String, String, String)> =
-			decode(include_bytes!("cp-gnu-matrix-root.txt.zst")).lines().map(parse).map(|row| (row.id, row.want)).collect();
-		let mut gnu_overlays: HashMap<(bool, String, String), (i32, String, String, String)> = HashMap::new();
-		for text in [decode(include_bytes!("cp-gnu-matrix-gvisor.txt.zst")), decode(include_bytes!("cp-gnu-matrix-reflink.txt.zst"))] {
-			for line in text.lines() {
-				let (for_root, line) = match line.strip_prefix("root:") {
-					Some(line) => (true, line),
-					None => (false, line),
-				};
-				let (family, line) = line.split_once(':').expect("an overlay row without a family");
-				let row = parse(line);
-				gnu_overlays.insert((for_root, family.to_owned(), row.id), row.want);
-			}
-		}
-		if as_root {
-			let root_rows: HashMap<String, Row> = decode(include_bytes!("cp-gnu-matrix-root.txt.zst"))
-				.lines()
-				.map(|line| {
-					let row = parse(line);
-					(row.id.clone(), row)
-				})
-				.collect();
-			let mut used = 0;
-			for row in &mut rows {
-				if let Some(root_row) = root_rows.get(&row.id) {
-					row.want = root_row.want.clone();
-					used += 1;
-				}
-			}
-			assert_eq!(used, root_rows.len(), "a root row names no row of the matrix");
-		}
-		// Under gVisor four kernel answers can differ from Linux's, and GNU's
-		// own rows with them (`cp-gnu-matrix-gvisor.txt.zst`, GNU 9.7 measured
-		// there): `clone:` rows where a clone from a FIFO answers EOPNOTSUPP
-		// (EINVAL on Linux), `link:` rows where a hard link of a FIFO answers
-		// EOPNOTSUPP (made on Linux), `mknod:` rows where a device node
-		// answers EPERM (made, or EEXIST where a name is, on Linux), and
-		// `rename:` rows where a rename onto another link of the same file
-		// removes the old name (does nothing on Linux; gVisor's overlay root).
-		// Where the filesystem clones, GNU's rows differ where its copy
-		// clones: the `reflink:` rows of `cp-gnu-matrix-reflink.txt.zst` (GNU
-		// 9.7 measured on XFS with reflink), `--reflink` and `--debug` copies.
-		// A family's rows replace the rows above where the kernel and the
-		// filesystem here give its answer; a `root:` row only as root, after
-		// them.
-		let answers = kernel_answers(root_probe.path());
-		let mut overlaid = 0;
-		// The rows the reflink overlay replaced: their stated rows without a
-		// family no longer apply (below).
-		let mut cloned_rows = BTreeSet::new();
-		{
-			let overlays =
-				[decode(include_bytes!("cp-gnu-matrix-gvisor.txt.zst")), decode(include_bytes!("cp-gnu-matrix-reflink.txt.zst"))];
-			let overlay: Vec<(bool, String, Row)> = overlays
-				.iter()
-				.flat_map(|text| text.lines())
-				.map(|line| {
+			// SAFETY: `umask` only sets the process's file mode creation mask; the
+			// rows are GNU's under umask 022.
+			unsafe { libc::umask(0o022) };
+			// SAFETY: `geteuid` has no preconditions.
+			let as_root = unsafe { libc::geteuid() } == 0;
+			let mut rows: Vec<Row> = decode(include_bytes!("cp-gnu-matrix.txt.zst")).lines().map(parse).collect();
+			assert!(!rows.is_empty(), "the matrix has no rows");
+			// GNU's answers as the files hold them, before the root rows and the
+			// overlays apply: a stated row shows its row's beside this cp's.
+			let gnu_rows: HashMap<String, (i32, String, String, String)> =
+				rows.iter().map(|row| (row.id.clone(), row.want.clone())).collect();
+			let gnu_root: HashMap<String, (i32, String, String, String)> =
+				decode(include_bytes!("cp-gnu-matrix-root.txt.zst")).lines().map(parse).map(|row| (row.id, row.want)).collect();
+			let mut gnu_overlays: HashMap<(bool, String, String), (i32, String, String, String)> = HashMap::new();
+			for text in [decode(include_bytes!("cp-gnu-matrix-gvisor.txt.zst")), decode(include_bytes!("cp-gnu-matrix-reflink.txt.zst"))] {
+				for line in text.lines() {
 					let (for_root, line) = match line.strip_prefix("root:") {
 						Some(line) => (true, line),
 						None => (false, line),
 					};
 					let (family, line) = line.split_once(':').expect("an overlay row without a family");
-					(for_root, family.to_owned(), parse(line))
-				})
-				.collect();
-			let index: HashMap<String, usize> =
-				rows.iter().enumerate().map(|(index, row)| (row.id.clone(), index)).collect();
-			for pass_root in [false, true] {
-				for (for_root, family, row) in &overlay {
-					if *for_root != pass_root || (*for_root && !as_root) || !answers.contains(family.as_str()) {
-						continue;
-					}
-					let at = *index.get(&row.id).expect("an overlay row names no row of the matrix");
-					rows[at].want = row.want.clone();
-					overlaid += 1;
-					if family == "reflink" {
-						cloned_rows.insert(row.id.clone());
-					}
+					let row = parse(line);
+					gnu_overlays.insert((for_root, family.to_owned(), row.id), row.want);
 				}
 			}
-		}
-		eprintln!("answers unlike the rows' own (gVisor's, a filesystem that clones): {answers:?}; {overlaid} rows from the overlays");
-		// The stated rows: id, then this cp's exit status, standard error,
-		// standard output and entries, GNU's four, and the reason.
-		// A row whose id starts with `root:` holds root's answer, where root's
-		// differs from another user's; it is used only as root. A family next
-		// (`clone:`, `link:`, `mknod:`, `rename:`, `reflink:`) uses it only
-		// where the kernel and the filesystem here answer as that family says,
-		// after the rows without one. A row without a family states a
-		// difference from the rows measured where the filesystem cannot clone;
-		// where the reflink overlay replaced GNU's row (GNU's copy clones
-		// there), only a `reflink:` row states one.
-		let mut stated: HashMap<&str, (i32, String, String, String)> = HashMap::new();
-		let mut ordered: [Vec<(&str, (i32, String, String, String))>; 4] = Default::default();
-		for line in include_str!("cp-gnu-matrix-stated.txt").lines().filter(|line| !line.starts_with('#')) {
-			let [id, code, err, out, after, gnu_code, gnu_err, gnu_out, gnu_after, reason] =
-				line.split('\t').collect::<Vec<_>>()[..]
-			else {
-				panic!("stated row {line:?}");
-			};
-			assert!(!reason.is_empty(), "{id}: a stated row with no reason");
-			let answer = (code.parse().unwrap(), unescape(err), unescape(out), after.to_owned());
-			let (for_root, id) = match id.strip_prefix("root:") {
-				Some(id) => (true, id),
-				None => (false, id),
-			};
-			let (family, id) = match id.split_once(':') {
-				Some((family, id)) if ["clone", "link", "mknod", "rename", "reflink"].contains(&family) => (Some(family), id),
-				_ => (None, id),
-			};
-			// GNU's answer it shows is the matrix's for its user and family.
-			let mut gnu = gnu_rows.get(id).unwrap_or_else(|| panic!("stated row {line:?} names no row of the matrix")).clone();
-			if for_root && let Some(root) = gnu_root.get(id) {
-				gnu = root.clone();
-			}
-			for overlay_root in [false, true].into_iter().filter(|overlay_root| !overlay_root || for_root) {
-				if let Some(over) = family.and_then(|family| gnu_overlays.get(&(overlay_root, family.to_owned(), id.to_owned()))) {
-					gnu = over.clone();
+			if as_root {
+				let root_rows: HashMap<String, Row> = decode(include_bytes!("cp-gnu-matrix-root.txt.zst"))
+					.lines()
+					.map(|line| {
+						let row = parse(line);
+						(row.id.clone(), row)
+					})
+					.collect();
+				let mut used = 0;
+				for row in &mut rows {
+					if let Some(root_row) = root_rows.get(&row.id) {
+						row.want = root_row.want.clone();
+						used += 1;
+					}
 				}
+				assert_eq!(used, root_rows.len(), "a root row names no row of the matrix");
 			}
-			let shown = (gnu_code.parse().unwrap(), unescape(gnu_err), unescape(gnu_out), gnu_after.to_owned());
-			assert_eq!(shown, gnu, "stated row {line:?}: GNU's answer it shows is not the matrix's");
-			if for_root && !as_root
-				|| family.is_some_and(|family| !answers.contains(family))
-				|| family.is_none() && cloned_rows.contains(id)
+			// Under gVisor four kernel answers can differ from Linux's, and GNU's
+			// own rows with them (`cp-gnu-matrix-gvisor.txt.zst`, GNU 9.7 measured
+			// there): `clone:` rows where a clone from a FIFO answers EOPNOTSUPP
+			// (EINVAL on Linux), `link:` rows where a hard link of a FIFO answers
+			// EOPNOTSUPP (made on Linux), `mknod:` rows where a device node
+			// answers EPERM (made, or EEXIST where a name is, on Linux), and
+			// `rename:` rows where a rename onto another link of the same file
+			// removes the old name (does nothing on Linux; gVisor's overlay root).
+			// Where the filesystem clones, GNU's rows differ where its copy
+			// clones: the `reflink:` rows of `cp-gnu-matrix-reflink.txt.zst` (GNU
+			// 9.7 measured on XFS with reflink), `--reflink` and `--debug` copies.
+			// A family's rows replace the rows above where the kernel and the
+			// filesystem here give its answer; a `root:` row only as root, after
+			// them.
+			let answers = kernel_answers(root_probe.path());
+			let mut overlaid = 0;
+			// The rows the reflink overlay replaced: their stated rows without a
+			// family no longer apply (below).
+			let mut cloned_rows = BTreeSet::new();
 			{
-				continue;
+				let overlays =
+					[decode(include_bytes!("cp-gnu-matrix-gvisor.txt.zst")), decode(include_bytes!("cp-gnu-matrix-reflink.txt.zst"))];
+				let overlay: Vec<(bool, String, Row)> = overlays
+					.iter()
+					.flat_map(|text| text.lines())
+					.map(|line| {
+						let (for_root, line) = match line.strip_prefix("root:") {
+							Some(line) => (true, line),
+							None => (false, line),
+						};
+						let (family, line) = line.split_once(':').expect("an overlay row without a family");
+						(for_root, family.to_owned(), parse(line))
+					})
+					.collect();
+				let index: HashMap<String, usize> =
+					rows.iter().enumerate().map(|(index, row)| (row.id.clone(), index)).collect();
+				for pass_root in [false, true] {
+					for (for_root, family, row) in &overlay {
+						if *for_root != pass_root || (*for_root && !as_root) || !answers.contains(family.as_str()) {
+							continue;
+						}
+						let at = *index.get(&row.id).expect("an overlay row names no row of the matrix");
+						rows[at].want = row.want.clone();
+						overlaid += 1;
+						if family == "reflink" {
+							cloned_rows.insert(row.id.clone());
+						}
+					}
+				}
 			}
-			ordered[usize::from(family.is_some()) * 2 + usize::from(for_root)].push((id, answer));
-		}
-		for (id, answer) in ordered.into_iter().flatten() {
-			stated.insert(id, answer);
-		}
-		let mut stated_rows = 0;
-		for row in &mut rows {
-			if let Some(ours) = stated.get(row.id.as_str()) {
-				assert_ne!(*ours, row.want, "{}: a stated row is GNU's own", row.id);
-				row.want = ours.clone();
-				stated_rows += 1;
+			eprintln!("answers unlike the rows' own (gVisor's, a filesystem that clones): {answers:?}; {overlaid} rows from the overlays");
+			// The stated rows: id, then this cp's exit status, standard error,
+			// standard output and entries, GNU's four, and the reason.
+			// A row whose id starts with `root:` holds root's answer, where root's
+			// differs from another user's; it is used only as root. A family next
+			// (`clone:`, `link:`, `mknod:`, `rename:`, `reflink:`) uses it only
+			// where the kernel and the filesystem here answer as that family says,
+			// after the rows without one. A row without a family states a
+			// difference from the rows measured where the filesystem cannot clone;
+			// where the reflink overlay replaced GNU's row (GNU's copy clones
+			// there), only a `reflink:` row states one.
+			let mut stated: HashMap<&str, (i32, String, String, String)> = HashMap::new();
+			let mut ordered: [Vec<(&str, (i32, String, String, String))>; 4] = Default::default();
+			for line in include_str!("cp-gnu-matrix-stated.txt").lines().filter(|line| !line.starts_with('#')) {
+				let [id, code, err, out, after, gnu_code, gnu_err, gnu_out, gnu_after, reason] =
+					line.split('\t').collect::<Vec<_>>()[..]
+				else {
+					panic!("stated row {line:?}");
+				};
+				assert!(!reason.is_empty(), "{id}: a stated row with no reason");
+				let answer = (code.parse().unwrap(), unescape(err), unescape(out), after.to_owned());
+				let (for_root, id) = match id.strip_prefix("root:") {
+					Some(id) => (true, id),
+					None => (false, id),
+				};
+				let (family, id) = match id.split_once(':') {
+					Some((family, id)) if ["clone", "link", "mknod", "rename", "reflink"].contains(&family) => (Some(family), id),
+					_ => (None, id),
+				};
+				// GNU's answer it shows is the matrix's for its user and family.
+				let mut gnu = gnu_rows.get(id).unwrap_or_else(|| panic!("stated row {line:?} names no row of the matrix")).clone();
+				if for_root && let Some(root) = gnu_root.get(id) {
+					gnu = root.clone();
+				}
+				for overlay_root in [false, true].into_iter().filter(|overlay_root| !overlay_root || for_root) {
+					if let Some(over) = family.and_then(|family| gnu_overlays.get(&(overlay_root, family.to_owned(), id.to_owned()))) {
+						gnu = over.clone();
+					}
+				}
+				let shown = (gnu_code.parse().unwrap(), unescape(gnu_err), unescape(gnu_out), gnu_after.to_owned());
+				assert_eq!(shown, gnu, "stated row {line:?}: GNU's answer it shows is not the matrix's");
+				if for_root && !as_root
+					|| family.is_some_and(|family| !answers.contains(family))
+					|| family.is_none() && cloned_rows.contains(id)
+				{
+					continue;
+				}
+				ordered[usize::from(family.is_some()) * 2 + usize::from(for_root)].push((id, answer));
 			}
-		}
-		assert_eq!(stated_rows, stated.len(), "a stated row names no row of the matrix");
+			for (id, answer) in ordered.into_iter().flatten() {
+				stated.insert(id, answer);
+			}
+			let mut stated_rows = 0;
+			for row in &mut rows {
+				if let Some(ours) = stated.get(row.id.as_str()) {
+					assert_ne!(*ours, row.want, "{}: a stated row is GNU's own", row.id);
+					row.want = ours.clone();
+					stated_rows += 1;
+				}
+			}
+			assert_eq!(stated_rows, stated.len(), "a stated row names no row of the matrix");
 
+			rows.into_iter().map(|row| (row.id, row.setup, row.args, row.input, row.want)).collect()
+		});
+		let whole = prepared.len();
+		let rows: Vec<Row> = prepared
+			.iter()
+			.enumerate()
+			.filter(|(place, _)| place % MATRIX_PIECES == piece)
+			.map(|(_, (id, setup, args, input, want))| Row {
+				id:    id.clone(),
+				setup: setup.clone(),
+				args:  args.clone(),
+				input: input.clone(),
+				want:  want.clone(),
+			})
+			.collect();
 		let total = rows.len();
+		eprintln!("piece {} of {MATRIX_PIECES}: {total} of {whole} rows", piece + 1);
+		static IN_TURN: Mutex<()> = Mutex::new(());
+		let _turn = IN_TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 		let root = tempdir().unwrap();
 		let rows = Arc::new(rows);
 		let next = Arc::new(Mutex::new(0_usize));
 		let running = Arc::new(Mutex::new(BTreeSet::new()));
 		let (done, results) = mpsc::channel();
+		// One piece at a time, each with the machine: pieces that ran together
+		// with a share of the workers each all finished at about the moment the
+		// whole matrix would have, so the run still waited as long for its
+		// first result. Taken in turn, a piece runs its quarter of the rows on
+		// the whole pool and reports in about a quarter of the matrix's time,
+		// and the run gets a result four times rather than once. A piece
+		// waiting its turn reports nothing, which is why there are fewer
+		// pieces than the binary has test threads.
 		let threads = std::thread::available_parallelism().map_or(4, |count| count.get());
 		for _ in 0..threads {
 			let (rows, next, running, done, base) =
@@ -9043,6 +9098,63 @@ mod tests {
 		}
 		let shown = failures.iter().take(300).cloned().collect::<Vec<_>>().join("\n");
 		assert!(failures.is_empty(), "{} of {total} rows differ from GNU (the first 300 by id):\n{shown}", failures.len());
+	}
+
+	/// The four tests and the pieces they run, from one declaration: the
+	/// macro writes each test and the list the coverage test reads, so two
+	/// tests cannot run the same piece without the list saying so.
+	#[cfg(target_os = "linux")]
+	macro_rules! matrix_pieces {
+		($($name:ident runs $piece:literal),+ $(,)?) => {
+			const MATRIX_PIECE_OF_TEST: &[usize] = &[$($piece),+];
+			$(
+				#[cfg(target_os = "linux")]
+				#[test]
+				fn $name() {
+					probe_matrix_piece($piece);
+				}
+			)+
+		};
+	}
+
+	#[cfg(target_os = "linux")]
+	matrix_pieces! {
+		cp_does_what_gnu_does_across_the_probe_matrix_1 runs 0,
+		cp_does_what_gnu_does_across_the_probe_matrix_2 runs 1,
+		cp_does_what_gnu_does_across_the_probe_matrix_3 runs 2,
+		cp_does_what_gnu_does_across_the_probe_matrix_4 runs 3,
+	}
+
+	/// The pieces run every row of the matrix, each in exactly one of them:
+	/// the split moved where a row runs, not which rows run. Counted from the
+	/// file the pieces read.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn the_probe_matrix_pieces_run_every_row_exactly_once() {
+		let text = String::from_utf8(zstd::decode_all(&include_bytes!("cp-gnu-matrix.txt.zst")[..]).unwrap()).unwrap();
+		let ids: Vec<&str> = text.lines().map(|line| line.split('\t').next().expect("a row with no id")).collect();
+		assert!(!ids.is_empty(), "the matrix has no rows");
+		let mut seen: Vec<usize> = MATRIX_PIECE_OF_TEST.to_vec();
+		seen.sort_unstable();
+		assert_eq!(seen, (0..MATRIX_PIECES).collect::<Vec<_>>(), "the tests do not run every piece, each once: {MATRIX_PIECE_OF_TEST:?}");
+		let mut ran: Vec<&str> = Vec::new();
+		for &piece in MATRIX_PIECE_OF_TEST {
+			let of_piece: Vec<&str> =
+				ids.iter().enumerate().filter(|(place, _)| place % MATRIX_PIECES == piece).map(|(_, id)| *id).collect();
+			assert!(!of_piece.is_empty(), "piece {} of {MATRIX_PIECES} has no row", piece + 1);
+			ran.extend(of_piece);
+		}
+		assert_eq!(ran.len(), ids.len(), "the pieces hold {} rows, the file {}", ran.len(), ids.len());
+		let mut sorted = ran.clone();
+		sorted.sort_unstable();
+		let before = sorted.len();
+		sorted.dedup();
+		assert_eq!(sorted.len(), before, "a row runs in more than one piece");
+		let mut whole = ids.clone();
+		whole.sort_unstable();
+		let mut pieces = ran;
+		pieces.sort_unstable();
+		assert_eq!(pieces, whole, "the pieces' rows are not the file's rows");
 	}
 
 	/// `--attributes-only` onto the source's own entry is the same file, as

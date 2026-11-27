@@ -1988,14 +1988,25 @@ mod tests {
 	use super::{Rm, clean_trailing_slashes};
 	use crate::host::{Host, Utility, run_util};
 
-	/// Runs `rm -r root` 2,000 times while `swapped`, the operand `root` or
-	/// `root/sub`, flips between a directory and a symlink to `outside/`.
-	/// Returns how many runs removed a file in `outside/`.
+	/// How many tests each of the swapping runs is split into. Each piece is a
+	/// test of its own with its own bound in `.config/nextest.toml`: a run of
+	/// the whole binary then reports a result every piece, and the gate's
+	/// runner, which fails the tests it is running once nothing has been
+	/// reported for the longest bound among them, sees progress while the
+	/// swapping goes on. The whole 2,000 runs took up to 922 s on runc beside
+	/// 64 busy loops, reporting nothing until they ended.
 	#[cfg(unix)]
-	fn rm_r_while_swapping(swapped: &str) -> usize {
+	const SWAP_PIECES: usize = 4;
+
+	/// Runs `rm -r root` a piece of 2,000 times while `swapped`, the operand
+	/// `root` or `root/sub`, flips between a directory and a symlink to
+	/// `outside/`. Returns how many runs removed a file in `outside/`.
+	#[cfg(unix)]
+	fn rm_r_while_swapping(swapped: &str, piece: usize) -> usize {
 		const RUNS: usize = 2_000;
+		let runs = RUNS / SWAP_PIECES;
 		let (mut escapes, mut refusals) = (0, 0);
-		for _ in 0..RUNS {
+		for _ in 0..runs {
 			let cwd = tempdir().unwrap();
 			let (parked, outside) = (cwd.path().join("parked"), cwd.path().join("outside"));
 			let (sub, flipped) = (cwd.path().join("root/sub"), cwd.path().join(swapped));
@@ -2033,7 +2044,9 @@ mod tests {
 			}
 		}
 		eprintln!(
-			"{RUNS} runs swapping {swapped}: {escapes} removed a file outside the tree, {refusals} refused the swapped directory"
+			"piece {} of {SWAP_PIECES}, {runs} of {RUNS} runs swapping {swapped}: {escapes} removed a file outside the \
+			 tree, {refusals} refused the swapped directory",
+			piece + 1
 		);
 		escapes
 	}
@@ -2047,8 +2060,29 @@ mod tests {
 	/// the one it stat'd.
 	#[cfg(unix)]
 	#[test]
-	fn recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink() {
-		let escapes = rm_r_while_swapping("root/sub");
+	fn recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_1() {
+		let escapes = rm_r_while_swapping("root/sub", 0);
+		assert_eq!(escapes, 0, "rm -r removed files outside the tree through a swapped symlink");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_2() {
+		let escapes = rm_r_while_swapping("root/sub", 1);
+		assert_eq!(escapes, 0, "rm -r removed files outside the tree through a swapped symlink");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_3() {
+		let escapes = rm_r_while_swapping("root/sub", 2);
+		assert_eq!(escapes, 0, "rm -r removed files outside the tree through a swapped symlink");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn recursive_removal_deletes_nothing_through_a_directory_swapped_for_a_symlink_4() {
+		let escapes = rm_r_while_swapping("root/sub", 3);
 		assert_eq!(escapes, 0, "rm -r removed files outside the tree through a swapped symlink");
 	}
 
@@ -2057,8 +2091,29 @@ mod tests {
 	/// since.
 	#[cfg(unix)]
 	#[test]
-	fn recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink() {
-		let escapes = rm_r_while_swapping("root");
+	fn recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_1() {
+		let escapes = rm_r_while_swapping("root", 0);
+		assert_eq!(escapes, 0, "rm -r removed files outside the operand through a swapped symlink");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_2() {
+		let escapes = rm_r_while_swapping("root", 1);
+		assert_eq!(escapes, 0, "rm -r removed files outside the operand through a swapped symlink");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_3() {
+		let escapes = rm_r_while_swapping("root", 2);
+		assert_eq!(escapes, 0, "rm -r removed files outside the operand through a swapped symlink");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn recursive_removal_deletes_nothing_through_an_operand_swapped_for_a_symlink_4() {
+		let escapes = rm_r_while_swapping("root", 3);
 		assert_eq!(escapes, 0, "rm -r removed files outside the operand through a swapped symlink");
 	}
 
