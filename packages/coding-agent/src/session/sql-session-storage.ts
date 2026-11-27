@@ -2679,7 +2679,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	readonly #holder = randomBytes(16).toString("hex");
 	/** The sessions this store claimed, by session id. */
 	readonly #leases = new Map<string, LeaseClaim>();
-	/** The claim each claimed path is written under. */
+	/**
+	 * The claim each claimed path is written under. A path its claim no longer holds leaves at once while other
+	 * references to the claim remain; the claim's last release removes the rest once its queued writes settle.
+	 */
 	readonly #leasedPaths = new Map<string, LeaseClaim>();
 	/** Claim releases in flight, by session id; a new claim of the id waits for its release. */
 	readonly #releases = new Map<string, Promise<void>>();
@@ -2998,11 +3001,16 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	/**
-	 * Drop one reference to `claim`, made at `file`. The last one waits until
-	 * `settle` reports this store's queued writes under the claim settled,
-	 * then deletes the lease row this store holds (or releases the SQLite
-	 * lock), unless a new claim revived it meanwhile; `drain()` waits for
-	 * that delete, so a clean exit frees the session at once.
+	 * Drop one reference to `claim`, made at `file`. Where other references
+	 * to the claim remain and this was the last one made at `file`, the path
+	 * leaves the claim at once: a write still queued there is fenced by the
+	 * session its name belongs to (see {@link sessionLeaseId}), which for a
+	 * subagent transcript under the session's artifacts directory is this
+	 * same claim. The last reference waits until `settle` reports this
+	 * store's queued writes under the claim settled, then deletes the lease
+	 * row this store holds (or releases the SQLite lock), unless a new claim
+	 * revived it meanwhile; `drain()` waits for that delete, so a clean exit
+	 * frees the session at once.
 	 *
 	 * The release callback itself never waits. `SessionManager.close()` gives
 	 * its claim up before it drains, so writes are still queued, and some in
@@ -3023,7 +3031,10 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 			claim.paths.delete(file);
 			claim.headers.delete(file);
 		}
-		if (--claim.refs > 0) return;
+		if (--claim.refs > 0) {
+			if (count <= 0 && this.#leasedPaths.get(file) === claim) this.#leasedPaths.delete(file);
+			return;
+		}
 		const { sessionId } = claim;
 		const previous = this.#releases.get(sessionId) ?? Promise.resolve();
 		const released = previous
@@ -3524,19 +3535,24 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		}
 	}
 
-	/** After a move: the claim `src` was written under now covers `dst`. */
+	/**
+	 * After a move: the claim that holds `src` now covers `dst`. A path its
+	 * claim no longer holds (released, its claim's last release settling)
+	 * leaves the claim instead, and `dst` is left under no claim of this store's.
+	 */
 	#moveLease(src: string, dst: string): void {
 		const from = path.resolve(src);
 		const to = path.resolve(dst);
 		const claim = this.#leasedPaths.get(from);
 		if (!claim) return;
-		const count = claim.paths.get(from) ?? 1;
+		this.#leasedPaths.delete(from);
+		const count = claim.paths.get(from);
+		if (count === undefined) return;
 		const header = claim.headers.get(from);
 		claim.paths.delete(from);
 		claim.headers.delete(from);
 		claim.paths.set(to, (claim.paths.get(to) ?? 0) + count);
 		if (header !== undefined) claim.headers.set(to, header);
-		this.#leasedPaths.delete(from);
 		this.#leasedPaths.set(to, claim);
 	}
 

@@ -168,6 +168,40 @@ type PathMarker = readonly [head: string, tag: string];
 
 const randomTag = (): string => Math.random().toString(36).slice(2, 12);
 
+/**
+ * How long a heap count of a path waits for a transient holder of its string to let it go: JSC can keep a string past
+ * a few full collections (a database client holds its last query's parameters until its next query), while a path
+ * the store's claim records still hold stays counted for the whole wait.
+ */
+const SETTLE_MS = 5_000;
+
+/** Whether `text` holds the path part `marker` names, found without joining its halves: a joined copy would be counted. */
+function namesPath(text: string, [head, tag]: PathMarker): boolean {
+	for (let at = text.indexOf(tag, head.length); at >= 0; at = text.indexOf(tag, at + 1)) {
+		if (text.startsWith(head, at - head.length)) return true;
+	}
+	return false;
+}
+
+/**
+ * How many strings of the heap name each marker's path, after full collections: once each count is at most its
+ * `atMost`, or {@link SETTLE_MS} passed.
+ */
+async function settledPathCounts(bounds: ReadonlyArray<{ marker: PathMarker; atMost: number }>): Promise<number[]> {
+	for (const deadline = Date.now() + SETTLE_MS; ;) {
+		await collectGarbage();
+		const heap = takeV8HeapSnapshot();
+		const counts = bounds.map(({ marker, atMost }) => ({
+			count: countHeapStringsMatching(heap, text => namesPath(text, marker)),
+			atMost,
+		}));
+		if (counts.every(({ count, atMost }) => count <= atMost) || Date.now() >= deadline) {
+			return counts.map(({ count }) => count);
+		}
+		await Bun.sleep(100);
+	}
+}
+
 /** The row of `target` and its parts, removed straight from the database. */
 async function removeRows(db: LeaseDb, target: string): Promise<void> {
 	await db.sql(`DELETE FROM ${db.table}_parts WHERE path = @1`, [target]);
@@ -748,15 +782,17 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 				await runClosedSubagents(db, storage, stem, closed, 5);
 				const moved = await moveSubagentPaths(db, storage, stem, movedClosed, movedHeld);
 				release = moved.release;
-				await collectGarbage();
-				const heap = takeV8HeapSnapshot();
-				const named = (marker: PathMarker): number =>
-					countHeapStringsMatching(heap, text => text.includes(marker.join("")));
+				const [closedPathsHeld, movedClosedPathsHeld, movedHeldPaths] = await settledPathCounts([
+					{ marker: closed, atMost: 0 },
+					{ marker: movedClosed, atMost: 0 },
+					// The held path stays covered: its count has no bound to wait for.
+					{ marker: movedHeld, atMost: Number.POSITIVE_INFINITY },
+				]);
 
 				expect({
-					closedPathsHeld: named(closed),
-					movedClosedPathsHeld: named(movedClosed),
-					movedHeldPathCovered: named(movedHeld) > 0,
+					closedPathsHeld,
+					movedClosedPathsHeld,
+					movedHeldPathCovered: movedHeldPaths > 0,
 					writes: moved.writes,
 				}).toEqual({
 					closedPathsHeld: 0,
