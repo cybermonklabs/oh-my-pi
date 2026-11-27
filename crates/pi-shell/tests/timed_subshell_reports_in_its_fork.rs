@@ -436,9 +436,31 @@ fn a_jump_after_the_fork_runs_trap_reports_nothing() {
 	]);
 }
 
+/// The `case` pattern of bash's notice of a fork's death, by the name the
+/// shell writes it under: by `KILL`, `NAME: line N: PID Killed …`, where
+/// `NAME` is `$0` (a `-c` string's, or the script's); by `TERM`,
+/// `Terminated`, alone in bash 5.2 and with the command after it in bash
+/// 5.3.
+const DEATH_NOTICE: &str = "\"$0: line \"*\" Killed \"* | Terminated | \"Terminated \"*";
+
+/// A row that times `( body )` and prints each line of its stderr but the
+/// shell's notice of the fork's death ([`DEATH_NOTICE`]), then `end`: a
+/// report that is left fails the row however it is spelled, also one joined
+/// to the notice. The notice is found by the name it starts with, not by a
+/// word it holds: `$0` is a path, which may hold any word (a Bazel test's
+/// runfiles path holds this file's name).
+fn left_by(body: &str) -> String {
+	format!(
+		"{{ time ( {body} ); }} 2>&1 | while IFS= read -r l || [ -n \"$l\" ]; do case $l in \
+		 {DEATH_NOTICE}) ;; *) printf '%s\\n' \"$l\" ;; esac; done; echo end"
+	)
+}
+
 /// `exec` and a killed fork leave no report, nor does a closed stderr; a
 /// failed `exec` ends the fork with no report, and `return` passes the
-/// fork's `time` (bash's `return_catch` sits outside `time_command`).
+/// fork's `time` (bash's `return_catch` sits outside `time_command`). A
+/// killed fork leaves nothing but the notice of its death ([`left_by`]);
+/// a report and the fork's own words are left.
 #[test]
 fn exec_a_killed_fork_and_a_closed_stderr_report_nothing() {
 	assert_rows(&[
@@ -450,18 +472,15 @@ fn exec_a_killed_fork_and_a_closed_stderr_report_nothing() {
 			"SH: /no/such/cmd: No such file or directory\ns=127\n",
 			0,
 		),
+		("killed", &left_by("kill -9 $BASHPID"), "end\n", 0),
+		("terminated", &left_by("kill -TERM $BASHPID"), "end\n", 0),
 		(
-			"killed",
-			"{ time ( kill -9 $BASHPID ); } 2>&1 | grep -c report; echo \"s=$?\"",
-			"0\ns=1\n",
+			"a word holding report is left",
+			&left_by("echo noreport >&2; kill -9 $BASHPID"),
+			"noreport\nend\n",
 			0,
 		),
-		(
-			"terminated",
-			"{ time ( kill -TERM $BASHPID ); } 2>&1 | grep -c report; echo \"s=$?\"",
-			"0\ns=1\n",
-			0,
-		),
+		("a report is left", &left_by(":"), "report\nend\n", 0),
 		("stderr closed", "time ( echo in ) 2>&-; echo \"s=$?\"", "in\ns=0\n", 0),
 		("stderr closed, exit", "time ( exit 3 ) 2>&-; echo \"s=$?\"", "s=3\n", 0),
 		("stderr closed inside", "time ( exec 2>&-; echo in ); echo \"s=$?\"", "in\ns=0\n", 0),
