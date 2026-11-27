@@ -333,14 +333,17 @@ return 1`;
 // together: no client's write to either path can land between them. With
 // ARGV[4] == "1" a taken destination leaves everything as it was (returns 0);
 // ARGV[5] is the destination's new generation token. Redis keeps what a
-// script wrote before one of its commands failed, so every read comes before
-// the first write: a refused read (the title's HGET) or a missing source (the
-// RENAME) fails the script before it changes anything.
+// script wrote before one of its commands failed, so the script reads every
+// hash it writes (the title, meta and generation hashes) before its first
+// write: a refused read, a hash key that holds another type, or a missing
+// source (the RENAME) fails it before it changes anything.
 const MOVE_SCRIPT = `-- OMP_MOVE
 if ARGV[4] == "1" and redis.call("EXISTS", KEYS[2]) == 1 then
 	return 0
 end
 local title = redis.call("HGET", KEYS[4], ARGV[1])
+redis.call("HGET", KEYS[3], ARGV[1])
+redis.call("HGET", KEYS[5], ARGV[1])
 redis.call("RENAME", KEYS[1], KEYS[2])
 redis.call("HDEL", KEYS[3], ARGV[1])
 redis.call("HSET", KEYS[3], ARGV[2], ARGV[3])
@@ -393,14 +396,17 @@ function encodeTitleMeta(title: SessionTitleUpdate): string {
 	return JSON.stringify(title);
 }
 
-/** The title metadata a value of the title hash holds, as a script returns it (nil as null): none when malformed. */
+/**
+ * The title metadata a value of the title hash holds, as a script returns it (nil as null): none when malformed or
+ * without a time, as a SQL store's row without a title time has none. An empty title with a time is a clear.
+ */
 function decodeTitleMeta(raw: unknown): SessionTitleUpdate | undefined {
 	if (typeof raw !== "string" || !raw) return undefined;
 	try {
 		const parsed = JSON.parse(raw) as unknown;
 		if (typeof parsed !== "object" || parsed === null) return undefined;
 		const record = parsed as Record<string, unknown>;
-		if (typeof record.updatedAt !== "string") return undefined;
+		if (typeof record.updatedAt !== "string" || record.updatedAt.length === 0) return undefined;
 		const source = record.source === "auto" || record.source === "user" ? record.source : undefined;
 		return {
 			title: typeof record.title === "string" ? record.title : undefined,

@@ -19,7 +19,10 @@
  *   in, whether or not the local spool can be used;
  * - no title is stored or read for a session whose body is gone, and a
  *   session an append starts at its path shows none;
- * - a move that fails at its title read changes neither path.
+ * - a move that fails at its title read, or at a hash key that holds a
+ *   string, changes neither path;
+ * - title metadata without a time is none, and an empty title with one a
+ *   clear.
  */
 
 import { RedisClient } from "bun";
@@ -32,7 +35,7 @@ import {
 import { SessionReadConflictError, SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { type SessionTitleUpdate, serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { byteRange, runSessionScript } from "../helpers/fake-redis-windows";
+import { assertHashKey, byteRange, runSessionScript } from "../helpers/fake-redis-windows";
 
 /** A session body as a full rewrite hands it over: a title slot, a header, then `count` entries carrying `text`. */
 function rewriteLines(text: string, count = 3): string[] {
@@ -238,6 +241,18 @@ async function readsOf(storage: RedisSessionStorage, path: string): Promise<Reco
 /** What {@link readsOf} gives a path whose body is gone: no bytes and no title. */
 const GONE_READS = { readText: "ENOENT", readTextSlices: ["", ""], readTextFrom: "ENOENT", readChunks: "ENOENT" };
 
+/** What `storage` gives of each path: its text (the title laid over its head) and time, or the code its read fails with. */
+async function sessionsOf(storage: RedisSessionStorage, paths: string[]): Promise<Record<string, unknown>> {
+	const sessions: Record<string, unknown> = {};
+	for (const path of paths) {
+		sessions[path] = await storage.readText(path).then(
+			text => ({ text, mtimeMs: storage.statSync(path).mtimeMs }),
+			(error: NodeJS.ErrnoException) => error.code,
+		);
+	}
+	return sessions;
+}
+
 /** Two stores over one Redis keyspace, and what a client of an older build does to it directly. */
 interface TitledRedis {
 	/** Its next title write fails before the server runs it once {@link refuseNextTitleWrite} is called. */
@@ -399,6 +414,34 @@ function titleMetadataCases(open: () => Promise<TitledRedis>): void {
 		expect({ gone, recreated: await headsOf(peer, path) }).toEqual({
 			gone: GONE_READS,
 			recreated: everywhere(SESSION_HEADER),
+		});
+	});
+
+	// If this regresses, title metadata without a time, which SQL session stores and earlier builds ignore, is laid
+	// over the head of a body without a title slot: every reader gives up to its first 256 bytes as a made-up slot.
+	it("reads a legacy body as stored under title metadata without a time, and an empty title with a time as a clear", async () => {
+		const { peer, put, putTitle } = await open();
+		const untimed = "/s/untimed.jsonl";
+		const cleared = "/s/cleared.jsonl";
+		const clear: SessionTitleUpdate = { title: "", updatedAt: "2026-01-01T00:00:00.000Z" };
+		for (const path of [untimed, cleared]) await put(path, bodyOf("legacy"));
+		await putTitle(untimed, JSON.stringify({ title: "Ignored", updatedAt: "" }));
+		await putTitle(cleared, JSON.stringify(clear));
+		await peer.refresh();
+		const viewOf = async (path: string) => {
+			const lines: string[] = [];
+			await peer.scanLines(path, line => {
+				lines.push(line);
+				return false;
+			});
+			return { text: await peer.readText(path), heads: await headsOf(peer, path), scanned: lines.join("\n") };
+		};
+
+		const slot = serializeTitleSlot(clear);
+		expect({ untimed: await viewOf(untimed), cleared: await viewOf(cleared) }).toEqual({
+			untimed: { text: bodyOf("legacy"), heads: everywhere(SESSION_HEADER), scanned: bodyOf("legacy") },
+			// The body is shorter than the slot, so the clear's slot is the whole text.
+			cleared: { text: slot, heads: everywhere(slot), scanned: slot },
 		});
 	});
 
@@ -613,6 +656,7 @@ function createFakeRedis(): FakeRedis {
 		async hgetall(key) {
 			record("hgetall", [key]);
 			checkFailure("hgetall");
+			assertHashKey({ strings, hashes }, key);
 			const h = hashes.get(key);
 			if (!h) return {};
 			const out: Record<string, string> = {};
@@ -880,26 +924,45 @@ describe("RedisSessionStorage", () => {
 			await storage.writeText(path, `${written}${bodyOf(name)}`);
 			await storage.updateSessionTitle(path, { title: `${name} renamed`, source: "user", updatedAt: "t2" });
 		}
-		// What `view` gives of each path: its text (the title laid over its head) and time, or the code its read fails with.
-		const sessionsOf = async (view: RedisSessionStorage): Promise<Record<string, unknown>> => {
-			const sessions: Record<string, unknown> = {};
-			for (const path of [src, dst]) {
-				sessions[path] = await view.readText(path).then(
-					text => ({ text, mtimeMs: view.statSync(path).mtimeMs }),
-					(error: NodeJS.ErrnoException) => error.code,
-				);
-			}
-			return sessions;
-		};
-		const before = await sessionsOf(await RedisSessionStorage.create({ client: redis }));
+		const before = await sessionsOf(await RedisSessionStorage.create({ client: redis }), [src, dst]);
 
 		redis.failNext("hget", new Error("NOPERM this user has no permissions to run the 'hget' command"));
 		await expect(storage.rename(src, dst)).rejects.toThrow("NOPERM");
 		expect({
-			stored: await sessionsOf(await RedisSessionStorage.create({ client: redis })),
-			local: await sessionsOf(storage),
+			stored: await sessionsOf(await RedisSessionStorage.create({ client: redis }), [src, dst]),
+			local: await sessionsOf(storage, [src, dst]),
 		}).toEqual({ stored: before, local: before });
 	});
+
+	for (const hash of ["meta", "generation"]) {
+		// If this regresses, a move whose mtime or generation hash key another client made a string overwrites the
+		// destination's body before the script fails at that hash: `rename()` rejects, yet the source is gone and
+		// another store reads the moved body under the destination's title.
+		it(`leaves both sessions and their titles as they were when a move's ${hash} hash is not a hash`, async () => {
+			const storage = await RedisSessionStorage.create({ client: redis });
+			const peer = await RedisSessionStorage.create({ client: redis });
+			const src = "/s/moving.jsonl";
+			const dst = "/s/staying.jsonl";
+			for (const [path, name] of [
+				[src, "Source"],
+				[dst, "Destination"],
+			]) {
+				const written = serializeTitleSlot({ title: `${name} as written`, source: "auto", updatedAt: "t1" });
+				await storage.writeText(path, `${written}${bodyOf(name)}`);
+				await storage.updateSessionTitle(path, { title: `${name} renamed`, source: "user", updatedAt: "t2" });
+			}
+			await peer.refresh();
+			const before = await sessionsOf(peer, [src, dst]);
+
+			redis.hashes.delete(`omp:sessions:${hash}`);
+			redis.strings.set(`omp:sessions:${hash}`, "not a hash");
+			await expect(storage.rename(src, dst)).rejects.toThrow("WRONGTYPE");
+			expect({
+				peer: await sessionsOf(peer, [src, dst]),
+				local: await sessionsOf(storage, [src, dst]),
+			}).toEqual({ peer: before, local: before });
+		});
+	}
 
 	it("deleteSessionWithArtifacts removes a child key another client set after the refresh", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });

@@ -790,12 +790,19 @@ function globRegExp(glob: string): RegExp {
 	return new RegExp(`^${source}$`);
 }
 
+/** Fail a hash command on `key`, as Redis does, when `key` holds a string. */
+export function assertHashKey({ strings }: FakeRedisKeyspace, key: string): void {
+	if (strings.has(key)) throw new Error("WRONGTYPE Operation against a key holding the wrong kind of value");
+}
+
 /**
  * The commands the storage's scripts run, on `keyspace` as a server runs them: each takes and gives Lua strings, and
- * a missing value replies nil (false to Lua). A hash a command empties stays in the keyspace (a server drops it), so
- * a test's handle on a hash stays the keyspace's; no script tells the two apart.
+ * a missing value replies nil (false to Lua). A hash command on a string key fails as on a server. A hash a command
+ * empties stays in the keyspace (a server drops it), so a test's handle on a hash stays the keyspace's; no script
+ * tells the two apart.
  */
-function keyspaceCommands({ strings, hashes }: FakeRedisKeyspace): Map<string, (args: string[]) => LuaValue> {
+function keyspaceCommands(keyspace: FakeRedisKeyspace): Map<string, (args: string[]) => LuaValue> {
+	const { strings, hashes } = keyspace;
 	// The UTF-8 bytes of each string key the script read, until it writes the key.
 	const encoded = new Map<string, Buffer>();
 	const bytesOf = (key: string): Buffer | undefined => {
@@ -814,6 +821,7 @@ function keyspaceCommands({ strings, hashes }: FakeRedisKeyspace): Map<string, (
 		else strings.set(key, value);
 	};
 	const hash = (key: string): Map<string, string> => {
+		assertHashKey(keyspace, key);
 		let held = hashes.get(key);
 		if (!held) {
 			held = new Map();
@@ -873,6 +881,7 @@ function keyspaceCommands({ strings, hashes }: FakeRedisKeyspace): Map<string, (
 		[
 			"HGET",
 			([key, field]) => {
+				assertHashKey(keyspace, luaText(key));
 				const value = hashes.get(luaText(key))?.get(luaText(field));
 				return value === undefined ? false : luaBytes(value);
 			},
@@ -895,6 +904,7 @@ function keyspaceCommands({ strings, hashes }: FakeRedisKeyspace): Map<string, (
 		[
 			"HDEL",
 			([key, ...fields]) => {
+				assertHashKey(keyspace, luaText(key));
 				const held = hashes.get(luaText(key));
 				return fields.filter(field => held?.delete(luaText(field))).length;
 			},
