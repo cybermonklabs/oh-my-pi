@@ -3848,7 +3848,7 @@ fn on_path(name: &str) -> String {
 	std::env::split_paths(&path)
 		.map(|dir| dir.join(name))
 		.find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
-		.unwrap_or_else(|| panic!("no {name} on PATH {path:?}"))
+		.unwrap_or_else(|| panic!("no {name} on PATH {}", path.display()))
 		.to_string_lossy()
 		.into_owned()
 }
