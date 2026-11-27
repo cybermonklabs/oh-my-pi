@@ -820,13 +820,27 @@ interface RolloutBytes {
 }
 
 /**
- * Open a rollout file for windowed reads: each window is read from disk, so a
- * rollout of hundreds of MB is never held whole. A missing rollout throws.
+ * The rollout open as `handle`, for windowed reads: each window is read from
+ * disk by position, so a rollout of hundreds of MB is never held whole, and
+ * every window comes from the file the handle opened, even when another file
+ * is renamed over its path between two reads. The handle stays the caller's
+ * to close.
  */
-async function openRolloutFile(rolloutPath: string): Promise<RolloutBytes> {
-	const file = Bun.file(rolloutPath);
-	const { size } = await file.stat();
-	return { size, read: (start, end) => file.slice(start, end).bytes() };
+async function heldRolloutFile(handle: fs.FileHandle): Promise<RolloutBytes> {
+	const { size } = await handle.stat();
+	return {
+		size,
+		async read(start, end) {
+			const bytes = new Uint8Array(end - start);
+			let filled = 0;
+			while (filled < bytes.length) {
+				const { bytesRead } = await handle.read(bytes, filled, bytes.length - filled, start + filled);
+				if (bytesRead === 0) break;
+				filled += bytesRead;
+			}
+			return bytes.subarray(0, filled);
+		},
+	};
 }
 
 /** The rollout's bytes from its start, read a window of {@link STAGE1_ROLLOUT_WINDOW_BYTES} at a time. */
@@ -1016,7 +1030,9 @@ async function stage1Items(
  * rollout's messages with its `entry_patch` records applied, but never holds the rollout whole. A
  * first pass finds the records (a record sets fields on messages before it, and an elide pass's
  * placeholder must reach the model in place of what it replaced). A file backend then reads byte
- * windows from the front and back only until the head and tail budgets fill. Any other storage
+ * windows from the front and back only until the head and tail budgets fill, all through the one
+ * descriptor it opened, so the records and the messages come from one file even when another is
+ * renamed over its path between the passes. Any other storage
  * (`session.storage: sql`, Redis, an SDK backend) is read in one more pass from its start, through
  * `readChunks` where it has it, keeping the head and the newest messages that fill the tail:
  * separate window reads could join the head of one body to the tail of another that a rewrite put
@@ -1050,13 +1066,19 @@ export async function buildStage1RolloutItems(
 			return stage1Items(persistableMessagesFromChunks(messages, records), tokenLimit);
 		});
 	}
-	const rollout = await openRolloutFile(rolloutPath);
-	if (tokenLimit <= 0) return "";
-	const records = await rolloutPatchRecords(frontWindows(rollout));
-	return stage1Items(persistableMessagesFromChunks(frontWindows(rollout), records), tokenLimit, {
-		bytes: rollout,
-		records,
-	});
+	const handle = await fs.open(rolloutPath, "r");
+	try {
+		if (tokenLimit <= 0) return "";
+		// The records and the messages are read through one descriptor: both come from the file it opened.
+		const rollout = await heldRolloutFile(handle);
+		const records = await rolloutPatchRecords(frontWindows(rollout));
+		return await stage1Items(persistableMessagesFromChunks(frontWindows(rollout), records), tokenLimit, {
+			bytes: rollout,
+			records,
+		});
+	} finally {
+		await handle.close();
+	}
 }
 
 async function runStage1Job(options: {

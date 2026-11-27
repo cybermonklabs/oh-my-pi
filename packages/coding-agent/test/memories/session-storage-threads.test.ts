@@ -7,7 +7,8 @@
  * session.
  */
 import { SQL } from "bun";
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildStage1RolloutItems, collectThreads } from "@oh-my-pi/pi-coding-agent/memories";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -21,6 +22,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { parseJsonlLenient, TempDir } from "@oh-my-pi/pi-utils";
+import * as utils from "@oh-my-pi/pi-utils";
 import { MemoryBackend } from "../helpers/memory-session-backend";
 import { raceAfterFirstChunk } from "../session/chunked-read-race";
 import { LEASE_BACKENDS, openLeaseDb, STILL } from "../session/sql-session-lease-fixture";
@@ -29,6 +31,7 @@ const previous = defaultSessionStorage();
 const clients: SQL[] = [];
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	setDefaultSessionStorage(previous);
 	for (const client of clients.splice(0)) await client.end();
 });
@@ -207,6 +210,59 @@ describe("memories over the session storage", () => {
 			raced: true,
 			built: referenceItems(body(result("elided")), 10_000_000),
 		});
+	});
+
+	it("builds one file's stage-1 input when another file is renamed over the rollout between its record scan and its message reads", async () => {
+		// If this regresses, a memory extracted from a session file another process replaced meanwhile
+		// applies the old file's records to the new file's messages, and the extraction model gets the
+		// output the new file's record elided.
+		using tmp = TempDir.createSync("@omp-memories-storage-");
+		setDefaultSessionStorage(new FileSessionStorage());
+		const rollout = tmp.join("sessions", "project", "rollout.jsonl");
+		const result = (id: string, text: string) =>
+			JSON.stringify({
+				type: "message",
+				id,
+				message: { role: "toolResult", toolName: "bash", content: [{ type: "text", text }] },
+			});
+		const elide = (recordId: string, entryId: string) =>
+			JSON.stringify({
+				type: "custom",
+				customType: "entry_patch",
+				id: recordId,
+				data: { patches: [{ entryId, message: { content: [{ type: "text", text: "elided" }] } }] },
+			});
+		const body = (...lines: string[]) =>
+			`${['{"type":"session","id":"s"}', messageLine(0, "go"), ...lines].join("\n")}\n`;
+		// The old file is the longer one, so a read sized by it takes all of the new one.
+		const oldFile = body(result("t1", "o".repeat(4096)), elide("p1", "t1"));
+		const newFile = body(result("t1", "fresh output"), result("t2", "HEAVY"), elide("p2", "t2"));
+		const parse = utils.tryParseJson;
+		let replaced = false;
+		// The record scan parses the old file's record, then the new file is renamed over the rollout,
+		// synchronously, before the scan goes on and before any message is read.
+		spyOn(utils, "tryParseJson").mockImplementation((text: string) => {
+			if (!replaced) {
+				replaced = true;
+				fs.writeFileSync(`${rollout}.new`, newFile);
+				fs.renameSync(`${rollout}.new`, rollout);
+			}
+			return parse(text);
+		});
+
+		// The whole input from the front, and a budget whose tail is read from the back.
+		for (const limit of [10_000_000, 20]) {
+			await Bun.write(rollout, oldFile);
+			replaced = false;
+
+			const built = await buildStage1RolloutItems(rollout, limit, new FileSessionStorage());
+
+			expect({ limit, replaced }).toEqual({ limit, replaced: true });
+			expect([
+				referenceItems(body(result("t1", "elided")), limit),
+				referenceItems(body(result("t1", "fresh output"), result("t2", "elided")), limit),
+			]).toContain(built);
+		}
 	});
 });
 
