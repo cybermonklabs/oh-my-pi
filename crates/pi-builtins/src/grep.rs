@@ -649,9 +649,8 @@ fn resolve_follow_links(cli: &GrepArgs, matches: &ArgMatches) -> bool {
 }
 
 fn resolve_binary_files(cli: &GrepArgs, matches: &ArgMatches) -> BinaryFiles {
-	// Preserve the builtin's historical byte-transparent default. Explicit
-	// GNU/BSD binary controls opt into detection.
-	let mut selected = (0, BinaryFiles::Text);
+	// GNU's default: an input holding a NUL byte is binary.
+	let mut selected = (0, BinaryFiles::Binary);
 	choose_latest(&mut selected, last_index(matches, "text"), BinaryFiles::Text);
 	choose_latest(
 		&mut selected,
@@ -794,6 +793,8 @@ fn build_matcher(
 			.map_err(|error| error.to_string());
 	}
 
+	let utf8 = patterns.iter().any(|pattern| pattern.contains("[:alpha:]"))
+		&& crate::locale::ctype_is_utf8(host);
 	if mode == MatchMode::Default {
 		// BRE is a distinct dialect, not ERE with different escaping: `\+` is
 		// the operator and a bare `+` is a literal. Translating through the
@@ -807,7 +808,10 @@ fn build_matcher(
 		// this translation step existed.
 		let translated: Vec<String> = patterns
 			.iter()
-			.map(|pattern| bre::bre_to_ere(pattern, bre::Backrefs::Unsupported))
+			.map(|pattern| {
+				bre::bre_to_ere(pattern, bre::Backrefs::Unsupported)
+					.map(|ere| alpha_by_locale(ere.into(), utf8).into_owned())
+			})
 			.collect::<Result<_, _>>()
 			.map_err(|e: bre::BreError| e.message().to_owned())?;
 		return build_default_matcher(&builder, &translated, patterns).map(Engine::Rust);
@@ -829,11 +833,64 @@ fn build_matcher(
 	{
 		return Err(format!("repetition-operator operand invalid: {bad}"));
 	}
+	let patterns: Vec<std::borrow::Cow<'_, str>> =
+		patterns.into_iter().map(|pattern| alpha_by_locale(pattern, utf8)).collect();
 
 	builder
 		.build_many(&patterns)
 		.map(Engine::Rust)
 		.map_err(|error| error.to_string())
+}
+
+/// `pattern`, in the `regex` crate's syntax, with each `[:alpha:]` of a
+/// bracket expression written as the Unicode letters where `utf8`. GNU grep
+/// reads the class by the locale, so in a UTF-8 one `ß` is a letter (`printf
+/// 'ß\n' | grep -c '[[:alpha:]]'` is 1), and the `regex` crate reads it as
+/// ASCII alone.
+fn alpha_by_locale(
+	pattern: std::borrow::Cow<'_, str>,
+	utf8: bool,
+) -> std::borrow::Cow<'_, str> {
+	if !utf8 || !pattern.contains("[:alpha:]") {
+		return pattern;
+	}
+	let mut out = String::with_capacity(pattern.len() + 8);
+	// How many bracket expressions are open: the `regex` crate nests them.
+	let mut depth = 0usize;
+	let mut chars = pattern.char_indices().peekable();
+	while let Some((at, c)) = chars.next() {
+		match c {
+			'\\' => {
+				out.push(c);
+				if let Some((_, escaped)) = chars.next() {
+					out.push(escaped);
+				}
+			},
+			'[' if depth > 0 && pattern[at..].starts_with("[:alpha:]") => {
+				out.push_str(r"\p{Alphabetic}");
+				for _ in 1.."[:alpha:]".len() {
+					chars.next();
+				}
+			},
+			'[' => {
+				out.push(c);
+				depth += 1;
+				// A `]` first in the expression, after any `^`, is a member.
+				if chars.next_if(|&(_, next)| next == '^').is_some() {
+					out.push('^');
+				}
+				if chars.next_if(|&(_, next)| next == ']').is_some() {
+					out.push(']');
+				}
+			},
+			']' if depth > 0 => {
+				out.push(c);
+				depth -= 1;
+			},
+			_ => out.push(c),
+		}
+	}
+	std::borrow::Cow::Owned(out)
 }
 
 /// What GNU grep 3.11 prints for `-v` with a negative `-m` and a context
@@ -893,6 +950,8 @@ struct GrepSink<'a, M: Matcher, W: Write> {
 	after_left:  usize,
 	/// The context `-v` with a negative `-m` prints, when it does.
 	unselected:  Option<UnselectedContext>,
+	/// What the search reports on standard error.
+	err:         &'a mut Vec<u8>,
 }
 
 impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
@@ -1167,11 +1226,12 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 			return Ok(());
 		}
 		if self.binary_summary() && self.any_match {
-			self.out.write_all(b"Binary file ")?;
-			self.out.write_all(self.display)?;
-			self.out.write_all(b" matches")?;
-			self.out.write_all(&[self.opts.record.terminator])?;
-			return self.flush_record();
+			// GNU grep 3.11 reports it on standard error, so a pipeline reads
+			// no line of a binary file.
+			self.err.extend_from_slice(b"grep: ");
+			self.err.extend_from_slice(self.display);
+			self.err.extend_from_slice(b": binary file matches\n");
+			return Ok(());
 		}
 		if self.opts.files_with_matches {
 			if self.any_match {
@@ -1248,6 +1308,7 @@ struct Worker {
 	searcher: Searcher,
 	buf:      Vec<u8>,
 	out:      Vec<u8>,
+	err:      Vec<u8>,
 	opener:   Option<Opener>,
 	/// Reused for the path of each listed file.
 	path:     PathBuf,
@@ -1336,6 +1397,7 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 			searcher: self.searcher.build(),
 			buf:      vec![0u8; READ_CHUNK],
 			out:      Vec::new(),
+			err:      Vec::new(),
 			opener:   self.listed.as_ref().and_then(|listed| match listed.files.root_dir() {
 				Some(root) => Some(Opener::Beneath(listed.layer.session(), Arc::clone(root))),
 				None => listed
@@ -1349,8 +1411,13 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 	}
 
 	/// Classifies one file's search result; a broken pipe stops the search, any other error is reported per file.
-	fn finish(&self, display_path: &Path, searched: io::Result<bool>, out: Vec<u8>) -> FileSearch {
-		let mut err = Vec::new();
+	fn finish(
+		&self,
+		display_path: &Path,
+		searched: io::Result<bool>,
+		out: Vec<u8>,
+		mut err: Vec<u8>,
+	) -> FileSearch {
 		let mut had_error = false;
 		let matched = match searched {
 			Ok(matched) => Ok(matched),
@@ -1379,7 +1446,7 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 		display: &[u8],
 		worker: &mut Worker,
 	) -> io::Result<bool> {
-		let Worker { searcher, buf, out, .. } = worker;
+		let Worker { searcher, buf, out, err, .. } = worker;
 		let terminator = bound_terminator(searcher, &self.matcher);
 		let mut sink = GrepSink {
 			out,
@@ -1392,6 +1459,7 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 			last_end: None,
 			after_left: 0,
 			unselected: self.opts.unselected_context.then(UnselectedContext::default),
+			err,
 		};
 		let mut search = searcher.search_push(&self.matcher, &mut sink);
 		let mut run = 0;
@@ -1519,7 +1587,8 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 				let searched = self
 					.push_input(&mut input, display_path.as_os_str().as_encoded_bytes(), worker)
 					.await;
-				self.finish(display_path, searched, worker.take_out())
+				let err = std::mem::take(&mut worker.err);
+				self.finish(display_path, searched, worker.take_out(), err)
 			},
 			Err(error) => {
 				let mut err = Vec::new();
@@ -1882,6 +1951,7 @@ async fn search_stdin<M: Matcher + Clone + Send + Sync + 'static>(
 	out: &mut impl Write,
 ) -> io::Result<bool> {
 	let mut searcher = builder.build();
+	let mut err = Vec::new();
 	let terminator = bound_terminator(&searcher, matcher);
 	let mut sink = GrepSink {
 		out,
@@ -1894,6 +1964,7 @@ async fn search_stdin<M: Matcher + Clone + Send + Sync + 'static>(
 		last_end: None,
 		after_left: 0,
 		unselected: opts.unselected_context.then(UnselectedContext::default),
+		err: &mut err,
 	};
 	let mut search = searcher.search_push(matcher, &mut sink);
 	let mut buf = vec![0u8; READ_CHUNK];
@@ -1911,8 +1982,10 @@ async fn search_stdin<M: Matcher + Clone + Send + Sync + 'static>(
 		}
 	}
 	search.finish()?;
+	let any_match = sink.any_match;
+	let _ = host.stderr.write_all(&err);
 	host.flush_output().await?;
-	Ok(sink.any_match)
+	Ok(any_match)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2006,11 +2079,13 @@ async fn execute_search<M: Matcher + Clone + Send + Sync + 'static>(
 				DirectoryAction::Skip => {},
 				DirectoryAction::Read => {
 					had_error = true;
-					let _ = writeln!(
-						host.stderr,
-						"grep: {}: Is a directory",
-						operand.display()
-					);
+					if !opts.no_messages {
+						let _ = writeln!(
+							host.stderr,
+							"grep: {}: Is a directory",
+							operand.display()
+						);
+					}
 				},
 			},
 			Ok(metadata) => {
