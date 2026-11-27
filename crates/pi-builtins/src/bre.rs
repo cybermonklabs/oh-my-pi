@@ -179,6 +179,8 @@ fn fetch_count(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, bre: bool) 
 ///   `+`, `|`, `{` and `}`.
 /// - Puts single-digit back-references in non-capturing groups..
 /// - Escapes ERE-only metacharacters: `+ ? { } | ( )`.
+/// - Reads a backslash before an ordinary character as that character, and
+///   `` \` `` and `\'` as `^` and `$`.
 /// - Leaves all other characters as-is.
 ///
 /// A repetition character with **no preceding atom** is emitted as a literal,
@@ -304,7 +306,7 @@ pub(crate) fn bre_to_ere(
 					result.push_str(r"\}");
 					has_atom = true;
 				},
-				Some(v) if v.is_ascii_digit() => {
+				Some(v @ '1'..='9') => {
 					// Back-reference.  In sed BREs these are single-digit
 					// (\1-\9) whereas fancy_regex supports multi-digit
 					// back-references. Put them in a non-capturing group
@@ -331,6 +333,27 @@ pub(crate) fn bre_to_ere(
 					result.push(next);
 					has_atom = false;
 					anchored = true;
+				},
+				// glibc's start and end of the text: a line to grep and nl, the
+				// pattern space to sed. A repetition after either is text, as
+				// after any anchor, and so is a caret, which anchors only at
+				// the start of a branch.
+				Some('`') => {
+					chars.next();
+					result.push('^');
+					has_atom = false;
+					anchored = true;
+				},
+				Some('\'') => {
+					chars.next();
+					result.push('$');
+					has_atom = false;
+					anchored = true;
+				},
+				Some(&next) if is_ordinary_escape(next) => {
+					chars.next();
+					result.push(next);
+					has_atom = true;
 				},
 				Some(&next) => {
 					// Preserve other escaped characters.
@@ -440,6 +463,16 @@ fn ends_branch(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
 		Some('\\') => matches!(rest.next(), Some('|' | ')')),
 		Some(_) => false,
 	}
+}
+
+/// Whether glibc reads `\c` as `c` itself, as it reads `\d` as `d` and `\x`
+/// as `x`, where the engines read a digit class and a hex escape. GNU's own
+/// escapes (`\w`, `\s`, `\b` and their capitals) and back-references (`\1`
+/// to `\9`) keep their meaning, and so does a backslash before punctuation,
+/// which the engines read as glibc does.
+fn is_ordinary_escape(c: char) -> bool {
+	!c.is_ascii()
+		|| (c.is_ascii_alphanumeric() && !matches!(c, 'w' | 'W' | 's' | 'S' | 'b' | 'B' | '1'..='9'))
 }
 
 /// A bracket expression's body, without the outer `[]`, and what GNU grep
@@ -639,6 +672,8 @@ enum Operand {
 /// - A `?` after another operator repeats it, so `a+?` is `(a+)?`, where the
 ///   engine reads a lazy `+`.
 /// - A `)` that closes no group is text.
+/// - A backslash before an ordinary character is that character, and `` \` ``
+///   and `\'` are `^` and `$`, as in a BRE.
 ///
 /// A bracket expression is copied as it is.
 #[cfg(feature = "util.grep")]
@@ -656,15 +691,28 @@ pub(crate) fn ere_to_rust(pattern: &str) -> Result<std::borrow::Cow<'_, str>, Br
 		let after_repetition = std::mem::replace(&mut repeated, false);
 		let after_skip = std::mem::replace(&mut skipped, false);
 		match c {
-			'\\' => {
-				result.push(c);
-				let next = chars.next();
-				result.extend(next);
-				operand = if matches!(next, Some('b' | 'B' | '<' | '>')) {
-					Operand::Anchor
-				} else {
-					Operand::Atom
-				};
+			'\\' => match chars.next() {
+				Some('`') => {
+					result.push('^');
+					operand = Operand::Anchor;
+				},
+				Some('\'') => {
+					result.push('$');
+					operand = Operand::Anchor;
+				},
+				Some(next) if is_ordinary_escape(next) => {
+					result.push(next);
+					operand = Operand::Atom;
+				},
+				next => {
+					result.push(c);
+					result.extend(next);
+					operand = if matches!(next, Some('b' | 'B' | '<' | '>')) {
+						Operand::Anchor
+					} else {
+						Operand::Atom
+					};
+				},
 			},
 			'[' => {
 				let bracket = take_bracket_expression(&mut chars, false)?;
