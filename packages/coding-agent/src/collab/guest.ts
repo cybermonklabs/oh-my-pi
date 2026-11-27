@@ -23,11 +23,13 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, AssistantMessageEvent, ImageContent } from "@oh-my-pi/pi-ai";
 import { getConfigRootDir, logger, toError } from "@oh-my-pi/pi-utils";
+import { isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
 import { settingsStoreMask } from "../secrets/session-store-mask";
 import type { AgentSessionEvent } from "../session/agent-session";
+import { applyEntryPatches } from "../session/entry-patches";
 import type { SessionEntry } from "../session/session-entries";
 import { maskSessionEntry } from "../session/session-entry-mask";
 import { mintSessionId, SessionManager } from "../session/session-manager";
@@ -655,18 +657,30 @@ export class CollabGuestLink {
 	#applyFrame(frame: CollabFrame): void {
 		switch (frame.t) {
 			case "entry": {
+				const entry = frame.entry;
 				// Entries are never rendered directly — rendering is events-only
 				// (prevents double-render). They keep the replica file, the agent's
 				// message array (/dump, context estimates), and todos current.
-				this.#ctx.sessionManager.ingestReplicatedEntry(frame.entry);
-				if (frame.entry.type === "message") {
-					this.#ctx.session.agent.replaceMessages([...this.#ctx.session.messages, frame.entry.message]);
-				} else if (frame.entry.type === "compaction" || frame.entry.type === "branch_summary") {
-					// Compaction/branch entries rewrite the host's model context: the
-					// pre-boundary transcript collapses behind a summary. Appending
-					// the entry alone leaves the replica holding the stale full
-					// history, so rebuild the message array from the ingested entries
-					// exactly as the host does after appendCompaction/branchWithSummary
+				this.#ctx.sessionManager.ingestReplicatedEntry(entry);
+				if (isEntryPatchRecord(entry)) {
+					// An `entry_patch` record sets fields on entries the replica
+					// holds, as the host's patchEntries did (an elided `content`, a
+					// tool result's `prunedAt`), so the messages built from them
+					// change too. The record is a `custom` entry: never shown.
+					const sessionManager = this.#ctx.sessionManager;
+					if (applyEntryPatches([entry], { get: id => sessionManager.getEntry(id) })) {
+						this.#ctx.session.agent.replaceMessages(this.#ctx.session.buildDisplaySessionContext().messages);
+					}
+				} else if (entry.type === "message") {
+					this.#ctx.session.agent.replaceMessages([...this.#ctx.session.messages, entry.message]);
+				} else if (entry.type !== "model_change" && entry.type !== "thinking_level_change") {
+					// Every other entry changes the host's model context other than
+					// by appending one message: a compaction or branch summary
+					// collapses the history behind it, a `/clear` boundary drops it,
+					// and the builder places or leaves out a custom message and the
+					// context notebook. Appending the entry alone leaves the replica
+					// a stale context, so rebuild the message array from the
+					// ingested entries exactly as the host does after such an entry
 					// (session-maintenance.ts, agent-session.ts).
 					this.#ctx.session.agent.replaceMessages(this.#ctx.session.buildDisplaySessionContext().messages);
 				}

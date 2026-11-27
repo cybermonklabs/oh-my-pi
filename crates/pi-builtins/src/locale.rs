@@ -1800,6 +1800,22 @@ fn start_locale_utility(
 			{
 				libc::_exit(CHILD_NO_DIRECTORY);
 			}
+			// The utility, a process the shell starts for a command, gets
+			// the OOM adjustment of tool processes, 1000, best effort, as the
+			// shell's spawn child gives its externals: a copy of this
+			// process, not a sharer of its memory, so the write changes the
+			// utility's value alone. After the `/dev/null` open closed its
+			// descriptor, so the open has the room that one had.
+			let score = libc::syscall(
+				libc::SYS_openat,
+				libc::AT_FDCWD,
+				c"/proc/self/oom_score_adj".as_ptr(),
+				libc::O_WRONLY | libc::O_CLOEXEC,
+			);
+			if score >= 0 {
+				libc::syscall(libc::SYS_write, score, b"1000".as_ptr(), 4_usize);
+				libc::syscall(libc::SYS_close, score);
+			}
 			libc::execve(program.as_ptr(), argv.as_ptr().cast(), envp.as_ptr().cast());
 			libc::_exit(CHILD_NO_PROGRAM);
 		}

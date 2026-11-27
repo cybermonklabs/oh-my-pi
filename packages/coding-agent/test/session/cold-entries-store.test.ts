@@ -2,9 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, setSystemTime, vi } from "
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { SessionStoreMasker } from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
-import { BLOB_PREFIX, BlobStore, type SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import {
+	BLOB_PREFIX,
+	BlobStore,
+	externalizeImageDataUrlSync,
+	type SessionBlobTier,
+} from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import { convertToColdEntry, isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import { ColdEntryStore } from "@oh-my-pi/pi-coding-agent/session/cold-entry-store";
 import type { RuntimeIdentity } from "@oh-my-pi/pi-coding-agent/session/runtime-identity";
@@ -688,6 +693,47 @@ describe("cold entry store", () => {
 		expect(manager.coldStoreStats().coldEntries).toBe(2);
 	});
 
+	// Re-answering an `ask` from /tree selects the new answer as the leaf; the request its branch reads must not stay compressed.
+	it("makes the entries a re-answered ask's branch reads whole", async () => {
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const request = `request ${BODY}`;
+		const answer = (text: string): ToolResultMessage => ({
+			role: "toolResult",
+			toolCallId: "call-ask",
+			toolName: "ask",
+			content: [{ type: "text", text }],
+			isError: false,
+			timestamp: 3,
+		});
+		const manager = await open(
+			await writeTranscript(dir.path(), [
+				{ type: "message", id: "request", message: { role: "user", content: request, timestamp: 1 } },
+				{
+					type: "message",
+					id: "ask",
+					message: {
+						...assistant("ask"),
+						content: [{ type: "toolCall", id: "call-ask", name: "ask", arguments: { question: "which?" } }],
+						stopReason: "toolUse",
+					},
+				},
+				{ type: "message", id: "old-answer", message: answer("old answer") },
+				{ type: "message", id: "later", message: { role: "user", content: `later ${BODY}`, timestamp: 4 } },
+				{ type: "compaction", id: "cut", summary: `cut ${BODY}`, firstKeptEntryId: "later", tokensBefore: 1000 },
+			]),
+		);
+		manager.buildSessionContext();
+		expect(isColdEntry(entry(manager, "request"))).toBe(true);
+
+		const next = manager.appendMessageToBranch(answer("replacement"), "ask", { preserveActiveLeaf: false });
+		manager.branch(next);
+		const context = manager.buildSessionContext();
+
+		expect(context.messages.map(message => message.role)).toEqual(["user", "assistant", "toolResult"]);
+		expect(context.messages[0]).toMatchObject({ role: "user", content: request });
+		expect(isColdEntry(entry(manager, "request"))).toBe(false);
+	});
+
 	it("applies updateEntryBody to a cold entry's nested values and keeps the entry cold", async () => {
 		using dir = TempDir.createSync("@omp-cold-entries-");
 		const manager = await open(await writeSession(dir.path()));
@@ -770,6 +816,30 @@ describe("cold entry store", () => {
 		const runtimes = ["u1", "a1", "u2", "a2"].map(id => entry(manager, id).runtime);
 		expect(runtimes[0]).toEqual(runtime);
 		for (const shared of runtimes) expect(shared).toBe(runtimes[0]);
+	});
+
+	it("resolves the image reference a loaded entry's small runtime holds, as it does a larger runtime's", async () => {
+		// If this regresses, a resumed entry whose runtime holds a provider image URL keeps that image's
+		// `blob:sha256:` reference in memory when the runtime is small enough to share among the entries,
+		// where a larger runtime, or the same value in any other field, gets its data URL back.
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const dataUrl = `data:image/png;base64,${Buffer.alloc(48, 5).toString("base64")}`;
+		const runtime = {
+			version: "18.18.6",
+			image_url: externalizeImageDataUrlSync(new BlobStore(getBlobsDir()), dataUrl),
+		};
+		const file = await writeTranscript(dir.path(), [
+			{ type: "message", id: "u1", runtime, message: { role: "user", content: "u1", timestamp: 1 } },
+			{ type: "message", id: "u2", runtime, message: { role: "user", content: "u2", timestamp: 2 } },
+		]);
+		const manager = await open(file);
+
+		const imageOf = (id: string): unknown => {
+			const held = entry(manager, id).runtime;
+			return held === undefined ? undefined : Reflect.get(held, "image_url");
+		};
+		expect([imageOf("u1"), imageOf("u2")]).toEqual([dataUrl, dataUrl]);
+		await manager.close();
 	});
 
 	// /resume --from-claude persists an imported in-memory session; that live session must still free older bodies.

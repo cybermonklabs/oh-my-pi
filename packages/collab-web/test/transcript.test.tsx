@@ -2,11 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { AssistantMessage, SessionEntry } from "@oh-my-pi/pi-wire";
 import { renderToStaticMarkup } from "react-dom/server";
 import "./transcript-dom-shim";
-import {
-	followTranscriptTail,
-	Transcript,
-	updateTranscriptTailLock,
-} from "../src/components/transcript/Transcript";
+import { followTranscriptTail, Transcript, updateTranscriptTailLock } from "../src/components/transcript/Transcript";
 import type { ActiveTool } from "../src/lib/client";
 
 const TOOL_CALL_ID = "call-running-tool";
@@ -147,6 +143,36 @@ describe("Transcript message Markdown", () => {
 
 		expect(countElements(html, ".tr-row--user .tr-md code")).toBe(1);
 		expect(countElements(html, ".tr-row--user .tr-md strong")).toBe(1);
+	});
+});
+
+describe("Transcript context-only entries", () => {
+	it("shows no row for a /clear boundary or a context notebook revision a host sends", () => {
+		const user = (id: string, content: string): SessionEntry => ({
+			type: "message",
+			id,
+			parentId: null,
+			timestamp: "2026-07-15T00:00:00Z",
+			message: { role: "user", content, timestamp: 1 },
+		});
+		const contextOnly: SessionEntry[] = [
+			{ type: "reset_boundary", id: "r1", parentId: "m1", timestamp: "2026-07-15T00:00:01Z" },
+			{
+				type: "custom",
+				customType: "experimental_context_notes",
+				id: "n1",
+				parentId: "r1",
+				timestamp: "2026-07-15T00:00:02Z",
+				data: { version: 1, text: "Keep the rollback plan." },
+			},
+		];
+		const shown = renderTranscript({ entries: [user("m1", "before"), user("m2", "after")], working: false });
+		const html = renderTranscript({
+			entries: [user("m1", "before"), ...contextOnly, user("m2", "after")],
+			working: false,
+		});
+		expect(html).toBe(shown);
+		expect(html).not.toContain("rollback plan");
 	});
 });
 

@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- The web view's agent drawer applies a subagent transcript's `entry_patch` records: an entry a later read of the transcript patched (an elided tool output, a corrected compaction) shows its new value instead of the value from before the patch, a record read before its entry applies when the entry arrives, and the record itself is no longer counted as a transcript row
+- A web guest applies an `entry_patch` record the host sends live to the entry on screen, so an entry the host patched after the guest received it (an elided tool output) shows the patched value without a rejoin; a record that arrives while the welcome snapshot loads applies to the snapshot's entries, and no record is listed as an entry
 - Task results from a structured subagent that replied without calling `yield` now show a warning callout in the web view and HTML export; without an output schema such a result succeeds and the footer counts it as succeeded instead of failed, while with an output schema (or with empty output) it fails and counts as failed, as before; report text that only looks like that warning is shown as ordinary output ([#16928](https://github.com/can1357/oh-my-pi/pull/16928) by [@sjawhar](https://github.com/sjawhar))
 - An HTML export's trace view shows a span's raw entry nested more than 1,000 levels deep on one line instead of indented; an entry nested past the browser's `JSON.stringify` stack limit is shown, and its copy buttons copy it, instead of failing to render the span's details; a shallower entry is indented as before
 

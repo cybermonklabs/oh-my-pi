@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import type { Tool, ToolCall } from "@oh-my-pi/pi-ai/types";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
+import { nestedChain, nestedChainJson } from "./helpers/deep-nesting";
 
 function createHistoryTool(keyword: "anyOf" | "oneOf"): Tool {
 	return {
@@ -103,6 +104,38 @@ describe("Tool argument coercion", () => {
 
 		expect(result.payload).toBe('{"a":1,"nested":["x"]}');
 	});
+
+	// A tool call's arguments are any JSON, as deep as JSON.parse reads.
+	it("stringifies an object nested past JSON.stringify's reach when schema expects string", () => {
+		const tool: Tool = { name: "object-string", description: "", parameters: type({ payload: type("string") }) };
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-object-string",
+			name: "object-string",
+			arguments: { payload: nestedChain() },
+		}) as { payload: string };
+
+		expect(result.payload).toBe(nestedChainJson());
+	});
+
+	// A repair copies the arguments before it writes: an in-process caller's `Date` beside the repaired field must
+	// reach the tool as a `Date`, not as the string a JSON copy makes of it.
+	it("keeps a Date beside a coerced field", () => {
+		const tool: Tool = { name: "flagged", description: "", parameters: type({ flag: "boolean", when: "unknown" }) };
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-flagged",
+			name: "flagged",
+			arguments: { flag: "true", when: new Date(0) },
+		}) as { flag: unknown; when: unknown };
+
+		expect(result.flag).toBe(true);
+		expect(result.when).toBeInstanceOf(Date);
+		expect((result.when as Date).getTime()).toBe(0);
+	});
+
 	it("stringifies container values when a string union branch matches", () => {
 		const tool: Tool = {
 			name: "union-string",

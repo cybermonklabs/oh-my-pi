@@ -8,6 +8,7 @@ import {
 	type AnthropicRequestOptions,
 } from "@oh-my-pi/pi-ai/providers/anthropic-client";
 import type {
+	MessageCreateParams,
 	ToolSearchToolResultBlockParam,
 	WebSearchToolResultBlockParam,
 } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
@@ -16,6 +17,7 @@ import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { withEnv, withOfficialAnthropicEndpoint } from "./helpers";
+import { DEEP_LEVELS, nestedChain, nestedChainJson, nestingOf } from "./helpers/deep-nesting";
 
 const model: Model<"anthropic-messages"> = buildModel({
 	id: "claude-sonnet-4-5",
@@ -104,6 +106,19 @@ function createMockRequest(events: MockAnthropicEvent[]): MockAnthropicRequest {
 		},
 	};
 }
+
+/** A client that records the params of each request it is sent and answers it with `events`. */
+function recordingClient(sent: MessageCreateParams[], events: MockAnthropicEvent[]): AnthropicMessagesClientLike {
+	return {
+		messages: {
+			create(params) {
+				sent.push(params);
+				return createMockRequest(events);
+			},
+		},
+	};
+}
+
 function createRawSseRequest(frames: string[]): { asResponse(): Promise<Response> } {
 	const body = new TextEncoder().encode(frames.join(""));
 	return {
@@ -2265,6 +2280,236 @@ describe("anthropic stream envelope handling", () => {
 		expect(result.fallbackCreditHandle?.params).toBeDefined();
 		expect(result.fallbackCreditHandle?.expiresAt).toBeGreaterThan(Date.now());
 	});
+
+	// A refused request replays the conversation, whose tool calls' arguments are any JSON, as deep as a transcript
+	// line holds. The turn freezes its request body and its content for the redemption; a copy that runs out of
+	// stack (`structuredClone` near 40,000 levels) fails the turn with that error and leaves no credit to redeem.
+	it("freezes and redeems a refused request whose history and refused turn hold tool calls nested 50,000 levels", async () => {
+		const deepContext: Context = {
+			messages: [
+				{ role: "user", content: "Inspect it", timestamp: 0 },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "toolu_deep", name: "inspect", arguments: nestedChain() }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 0,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "toolu_deep",
+					toolName: "inspect",
+					content: [{ type: "text", text: "ok" }],
+					isError: false,
+					timestamp: 0,
+				},
+				{ role: "user", content: "Go on", timestamp: 0 },
+			],
+		};
+		const sent: MessageCreateParams[] = [];
+		const refused = await streamAnthropic(model, deepContext, {
+			client: recordingClient(sent, [
+				{
+					type: "message_start",
+					message: { id: "msg_deep_refusal", usage: { input_tokens: 10, output_tokens: 0 } },
+				},
+				{
+					type: "content_block_start",
+					index: 0,
+					content_block: { type: "tool_use", id: "toolu_refused", name: "inspect", input: {} },
+				},
+				{
+					type: "content_block_delta",
+					index: 0,
+					delta: { type: "input_json_delta", partial_json: nestedChainJson() },
+				},
+				{ type: "content_block_stop", index: 0 },
+				{
+					type: "message_delta",
+					delta: {
+						stop_reason: "refusal",
+						stop_sequence: null,
+						stop_details: {
+							type: "refusal",
+							category: "cyber",
+							explanation: null,
+							fallback_credit_token: "fct_deep",
+						},
+					},
+					usage: { input_tokens: 10, output_tokens: 4 },
+				},
+				{ type: "message_stop" },
+			]),
+		}).result();
+
+		const handle = refused.fallbackCreditHandle;
+		expect(handle?.token).toBe("fct_deep");
+		const refusedCall = handle?.refusedContent?.find(block => block.type === "toolCall");
+		expect(refusedCall?.type === "toolCall" && nestingOf(refusedCall.arguments)).toEqual({
+			levels: DEEP_LEVELS,
+			bottom: { leaf: "bottom" },
+		});
+
+		const redeemed = await streamAnthropic({ ...model, id: "claude-opus-4-8" }, deepContext, {
+			client: recordingClient(sent, [
+				{ type: "message_start", message: { id: "msg_redeemed", usage: { input_tokens: 10, output_tokens: 0 } } },
+				{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+				{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Resumed" } },
+				{ type: "content_block_stop", index: 0 },
+				{
+					type: "message_delta",
+					delta: { stop_reason: "end_turn", stop_sequence: null },
+					usage: { input_tokens: 10, output_tokens: 1 },
+				},
+				{ type: "message_stop" },
+			]),
+			fallbackCreditRedemption: handle,
+		}).result();
+
+		expect(redeemed.stopReason).toBe("stop");
+		expect(sent).toHaveLength(2);
+		expect(sent[1]?.fallback_credit_token).toBe("fct_deep");
+		const replayedCall = sent[1]?.messages[1]?.content;
+		const replayedInput = Array.isArray(replayedCall)
+			? replayedCall.find(block => block.type === "tool_use")
+			: undefined;
+		expect(replayedInput?.type === "tool_use" && nestingOf(replayedInput.input)).toEqual({
+			levels: DEEP_LEVELS,
+			bottom: { leaf: "bottom" },
+		});
+	}, 30_000);
+
+	// A refused turn's continuation echoes its server tool calls (`server_tool_use`), whose input the model writes
+	// as any JSON. The redemption copies the echoed prefix, and the stored turn copies it again; a copy that runs out
+	// of stack (`structuredClone` near 40,000 levels) fails the redemption with that error.
+	it("redeems a refused turn whose server tool input nests 50,000 levels, echoing that input", async () => {
+		const sent: MessageCreateParams[] = [];
+		const refused = await streamAnthropic(model, context, {
+			client: recordingClient(sent, [
+				{
+					type: "message_start",
+					message: { id: "msg_server_refusal", usage: { input_tokens: 10, output_tokens: 0 } },
+				},
+				{
+					type: "content_block_start",
+					index: 0,
+					content_block: { type: "server_tool_use", id: "srvtoolu_deep", name: "web_search", input: {} },
+				},
+				{
+					type: "content_block_delta",
+					index: 0,
+					delta: { type: "input_json_delta", partial_json: nestedChainJson() },
+				},
+				{ type: "content_block_stop", index: 0 },
+				{
+					type: "message_delta",
+					delta: {
+						stop_reason: "refusal",
+						stop_sequence: null,
+						stop_details: {
+							type: "refusal",
+							category: "cyber",
+							explanation: null,
+							fallback_credit_token: "fct_server",
+							fallback_has_prefill_claim: true,
+						},
+					},
+					usage: { input_tokens: 10, output_tokens: 4 },
+				},
+				{ type: "message_stop" },
+			]),
+		}).result();
+		expect(refused.fallbackCreditHandle?.token, refused.errorMessage).toBe("fct_server");
+
+		const redeemed = await streamAnthropic({ ...model, id: "claude-opus-4-8" }, context, {
+			client: recordingClient(sent, [
+				{ type: "message_start", message: { id: "msg_resumed", usage: { input_tokens: 10, output_tokens: 0 } } },
+				{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+				{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Resumed" } },
+				{ type: "content_block_stop", index: 0 },
+				{
+					type: "message_delta",
+					delta: { stop_reason: "end_turn", stop_sequence: null },
+					usage: { input_tokens: 10, output_tokens: 1 },
+				},
+				{ type: "message_stop" },
+			]),
+			fallbackCreditRedemption: refused.fallbackCreditHandle,
+		}).result();
+
+		expect(redeemed.stopReason, redeemed.errorMessage).toBe("stop");
+		expect(sent).toHaveLength(2);
+		expect(sent[1]?.fallback_credit_token).toBe("fct_server");
+		const continuation = sent[1]?.messages.at(-1)?.content;
+		const echoed = Array.isArray(continuation)
+			? continuation.find(block => block.type === "server_tool_use")
+			: undefined;
+		expect(echoed?.type === "server_tool_use" && nestingOf(echoed.input)).toEqual({
+			levels: DEEP_LEVELS,
+			bottom: { leaf: "bottom" },
+		});
+		const stored = redeemed.content.find(block => block.type === "anthropicServerTool");
+		expect(
+			stored?.type === "anthropicServerTool" &&
+				stored.block.type === "server_tool_use" &&
+				nestingOf(stored.block.input),
+		).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
+	}, 30_000);
+
+	// A tool call's input can arrive whole in its `content_block_start`, with no `input_json_delta` after it. The
+	// stream writes that input as the call's JSON to parse it, which `JSON.stringify` cannot past 40,000 levels: the
+	// turn failed with that error, and a refused one left no credit to redeem.
+	it("freezes a refused turn whose tool input arrives whole in content_block_start nested 50,000 levels", async () => {
+		const refused = await streamAnthropic(model, context, {
+			client: recordingClient(
+				[],
+				[
+					{
+						type: "message_start",
+						message: { id: "msg_inline_refusal", usage: { input_tokens: 10, output_tokens: 0 } },
+					},
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: { type: "tool_use", id: "toolu_inline", name: "inspect", input: nestedChain() },
+					},
+					{ type: "content_block_stop", index: 0 },
+					{
+						type: "message_delta",
+						delta: {
+							stop_reason: "refusal",
+							stop_sequence: null,
+							stop_details: {
+								type: "refusal",
+								category: "cyber",
+								explanation: null,
+								fallback_credit_token: "fct_inline",
+							},
+						},
+						usage: { input_tokens: 10, output_tokens: 4 },
+					},
+					{ type: "message_stop" },
+				],
+			),
+		}).result();
+
+		expect(refused.fallbackCreditHandle?.token, refused.errorMessage).toBe("fct_inline");
+		const frozen = refused.fallbackCreditHandle?.refusedContent?.find(block => block.type === "toolCall");
+		expect(frozen?.type === "toolCall" && nestingOf(frozen.arguments)).toEqual({
+			levels: DEEP_LEVELS,
+			bottom: { leaf: "bottom" },
+		});
+	}, 30_000);
 
 	it("redeems fallback credit token with frozen request body and continuation prefill", async () => {
 		let capturedParams: any;

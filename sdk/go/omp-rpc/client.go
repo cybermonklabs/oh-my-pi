@@ -161,6 +161,14 @@ type Client struct {
 
 	closeOnce sync.Once
 	closeErr  error
+
+	// entryRecordParents holds each `entry_patch` record GetEntries read since
+	// its last read of the whole history, for the entries of later reads;
+	// subagentRecordParents, by session file, each record GetSubagentMessages
+	// hid since its last read of that transcript from the start.
+	entryPatchMu          sync.Mutex
+	entryRecordParents    recordParents
+	subagentRecordParents map[string]recordParents
 }
 
 // Start starts cmd (for example `exec.Command("omp", "--mode", "rpc")`; set

@@ -389,7 +389,9 @@ describe("SessionManager JSONL software-crash durability", () => {
 		}
 	});
 
-	it("carries metadata children onto the new branch and keeps billed usage when durably discarding an entry", async () => {
+	// If this regresses, discarding a failed turn rewrites the whole session file again, a write that grows with the
+	// session, or the discarded turn's billed usage and the metadata recorded after it leave the reloaded session.
+	it("appends instead of rewriting when durably discarding an entry, carrying metadata children onto the new branch and keeping billed usage", async () => {
 		const cwd = makeTempDir("@pi-discard-metadata-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
 		const manager = SessionManager.create(cwd, sessionDir);
@@ -401,8 +403,19 @@ describe("SessionManager JSONL software-crash durability", () => {
 		const discardedId = manager.appendMessage(discarded);
 		const serviceTierId = manager.appendServiceTierChange(null);
 		const usageBefore = manager.getUsageStatistics();
+		await manager.flush();
+		const bytesBefore = fs.readFileSync(sessionFile, "utf8");
+		const inodeBefore = fs.statSync(sessionFile).ino;
 		await manager.discardEntryDurably(discardedId);
+		// The session's full rewrite stages the new body beside the session file and renames it over the path, so the
+		// path then names a different file. An append writes through the open file, so the path keeps naming the same
+		// one. This catches that rewrite; a rewrite in place (truncate and write the same file) keeps the inode.
+		expect(fs.statSync(sessionFile).ino).toBe(inodeBefore);
 		await manager.close();
+
+		// The file still starts with the bytes written before the discard. A rewrite can keep them too, so this checks
+		// the content only.
+		expect(fs.readFileSync(sessionFile, "utf8").slice(0, bytesBefore.length)).toBe(bytesBefore);
 
 		const reloaded = await SessionManager.open(sessionFile, sessionDir);
 		const branch = reloaded.getBranch();

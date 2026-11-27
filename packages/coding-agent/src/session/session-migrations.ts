@@ -31,7 +31,7 @@ interface V1ToV2State {
 function migrateEntryV1ToV2(
 	entry: FileEntry,
 	state: V1ToV2State,
-	keptEntryId: (index: number) => string | undefined | null,
+	keptEntryId: (compaction: V1Compaction, index: number) => string | null,
 ): void {
 	if (entry.type === "session") {
 		entry.version = 2;
@@ -47,7 +47,7 @@ function migrateEntryV1ToV2(
 	if (entry.type === "compaction") {
 		const comp = entry as V1Compaction;
 		if (typeof comp.firstKeptEntryIndex === "number") {
-			const id = keptEntryId(comp.firstKeptEntryIndex);
+			const id = keptEntryId(comp, comp.firstKeptEntryIndex);
 			if (id !== null) comp.firstKeptEntryId = id;
 			delete comp.firstKeptEntryIndex;
 		}
@@ -89,6 +89,8 @@ export class SessionEntryMigration {
 	readonly #state: V1ToV2State = { ids: new Set(), prevId: null };
 	/** The id each entry seen so far was given, `null` for a header, by file index. */
 	readonly #seenIds: (string | null)[] = [];
+	/** Compactions whose kept index names an entry not read yet, by that index. */
+	readonly #keptAhead = new Map<number, V1Compaction[]>();
 
 	constructor(header: SessionHeader | undefined, unindexed: boolean) {
 		this.#header = header;
@@ -106,12 +108,23 @@ export class SessionEntryMigration {
 		if (!this.needed) return;
 		if (this.#v1ToV2) {
 			const position = this.#seenIds.length;
-			migrateEntryV1ToV2(entry, this.#state, index => {
+			const keeping = this.#keptAhead.get(position);
+			if (keeping) {
+				this.#keptAhead.delete(position);
+				// The id this entry has in the file, before the migration gives it a new one; a
+				// header leaves the field as it is, as does an index past the end that no entry reaches.
+				if (entry.type !== "session") for (const compaction of keeping) compaction.firstKeptEntryId = entry.id;
+			}
+			migrateEntryV1ToV2(entry, this.#state, (compaction, index) => {
 				// The compaction itself, which holds its new id by now.
 				if (index === position) return entry.id;
-				// An entry not read yet. A v1 entry carries no id, and an id it does
-				// carry names no entry once the migration has given each one a new id.
-				if (index > position && Number.isInteger(index)) return undefined;
+				// An entry not read yet, which sets the field when it arrives.
+				if (index > position && Number.isInteger(index)) {
+					const ahead = this.#keptAhead.get(index);
+					if (ahead) ahead.push(compaction);
+					else this.#keptAhead.set(index, [compaction]);
+					return null;
+				}
 				return this.#seenIds[index] ?? null;
 			});
 			this.#seenIds.push(entry.type === "session" ? null : entry.id);

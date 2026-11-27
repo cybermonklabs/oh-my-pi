@@ -14,10 +14,11 @@
  */
 import { editErrorKinds } from "@oh-my-pi/pi-natives";
 import { ContainerPath, logger, type NestedWalk, runNested, stringifyDeepJson } from "@oh-my-pi/pi-utils";
+import { ENTRY_PATCH_CUSTOM_TYPE } from "@oh-my-pi/pi-utils/entry-patches";
 import { getBundledAgentsMap } from "../task/agents";
 import { BUILTIN_TOOL_NAMES, isMCPToolName } from "../tools/builtin-names";
 import { lexShellCommand } from "../tools/shell-tokenize";
-import { ENTRY_PATCH_CUSTOM_TYPE, NO_PATCHES } from "./entry-patches";
+import { NO_PATCHES } from "./entry-patches";
 import type { SessionEntry, SessionHeader } from "./session-entries";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
 import { EMPTY_TOOL_RESULT_PRUNE_DATA, TOOL_RESULT_PRUNE_CUSTOM_TYPE } from "./tool-result-prunes";

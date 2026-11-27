@@ -1,0 +1,234 @@
+"""`entry_patch` records of a session transcript, for the Python readers of the file.
+
+A pass that changes an entry after its line is written (a retry saga's marker, a
+compaction's dead-end `warning` or corrected `tokensAfter`, a snapcompact
+archive, an elide pass's placeholders) appends one `custom` entry with
+`customType` `entry_patch` that names entries already in the file and the fields
+to set on them, instead of rewriting the file. The original lines stay, so a
+reader that shows or derives anything from those fields applies the records
+first: `collect_entry_patches` over the transcript's lines, then `patch_entry`
+on each entry as it reads them again.
+
+This module decides as `@oh-my-pi/pi-utils/entry-patches`
+(`packages/utils/src/entry-patches.ts`) does: records apply in file order, so the
+newest value of a field wins, and a record may precede its target. A malformed
+record is skipped whole; a patch whose target is missing, lacks a field it
+names, or holds `content` of another shape is skipped alone.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import math
+from collections.abc import Iterable
+from typing import Any
+
+ENTRY_PATCH_CUSTOM_TYPE = "entry_patch"
+# Bytes the line of every `entry_patch` record holds: its `customType` as JSON
+# writes it. A scan for records parses only the lines that hold them.
+ENTRY_PATCH_MARKER = json.dumps(ENTRY_PATCH_CUSTOM_TYPE).encode()
+
+# Message roles whose `content` an elide pass shortens, each with whether that
+# `content` may be a string; assistant and tool-result `content` is always a
+# list of blocks.
+_CONTENT_TAKES_STRING = {
+    "user": True,
+    "developer": True,
+    "assistant": False,
+    "toolResult": False,
+}
+# Entry fields only a `compaction` entry has.
+_COMPACTION_FIELDS = ("warning", "tokensAfter", "preserveData")
+# Message fields only an assistant message has.
+_ASSISTANT_FIELDS = ("retryRecovery", "continued", "contextSnapshot", "elidedOutputTokens")
+
+
+def _is_content_block(block: Any) -> bool:
+    """A typed block, with the payload a text or image block carries as a string."""
+    if not isinstance(block, dict) or not isinstance(block.get("type"), str):
+        return False
+    if block["type"] == "text":
+        return isinstance(block.get("text"), str)
+    if block["type"] == "image":
+        return isinstance(block.get("data"), str)
+    return True
+
+
+def _is_content(value: Any) -> bool:
+    return isinstance(value, str) or (
+        isinstance(value, list) and all(_is_content_block(block) for block in value)
+    )
+
+
+def _is_count(value: Any) -> bool:
+    """Whether `value` is a finite number, as every counter a patch sets is."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an integer past float range, which JavaScript reads as Infinity
+        return False
+
+
+def _is_entry_fields(fields: Any) -> bool:
+    return (
+        isinstance(fields, dict)
+        and ("warning" not in fields or isinstance(fields["warning"], str))
+        and ("tokensAfter" not in fields or _is_count(fields["tokensAfter"]))
+        and ("preserveData" not in fields or isinstance(fields["preserveData"], dict))
+        and ("content" not in fields or _is_content(fields["content"]))
+    )
+
+
+def _is_message_fields(fields: Any) -> bool:
+    return (
+        isinstance(fields, dict)
+        and ("retryRecovery" not in fields or isinstance(fields["retryRecovery"], dict))
+        and ("continued" not in fields or fields["continued"] is True)
+        and ("contextSnapshot" not in fields or isinstance(fields["contextSnapshot"], dict))
+        and ("elidedOutputTokens" not in fields or _is_count(fields["elidedOutputTokens"]))
+        and ("prunedAt" not in fields or _is_count(fields["prunedAt"]))
+        and ("content" not in fields or _is_content(fields["content"]))
+    )
+
+
+def _is_entry_patch(patch: Any) -> bool:
+    return (
+        isinstance(patch, dict)
+        and isinstance(patch.get("entryId"), str)
+        and ("entry" not in patch or _is_entry_fields(patch["entry"]))
+        and ("message" not in patch or _is_message_fields(patch["message"]))
+    )
+
+
+def is_entry_patch_record(entry: Any) -> bool:
+    """Whether `entry` is an `entry_patch` record."""
+    return (
+        isinstance(entry, dict)
+        and entry.get("type") == "custom"
+        and entry.get("customType") == ENTRY_PATCH_CUSTOM_TYPE
+    )
+
+
+def entry_patches_of(record: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The patches of `record`, or None when its `data` is malformed."""
+    data = record.get("data")
+    if not isinstance(data, dict):
+        return None
+    patches = data.get("patches")
+    if not isinstance(patches, list) or not all(_is_entry_patch(patch) for patch in patches):
+        return None
+    return patches
+
+
+def _target_id_of(entry: Any) -> str | None:
+    """Id under which `entry` is a patch target: every entry but the session header has one."""
+    if not isinstance(entry, dict) or entry.get("type") == "session":
+        return None
+    entry_id = entry.get("id")
+    return entry_id if isinstance(entry_id, str) else None
+
+
+def entry_accepts_patch(entry: Any, patch: dict[str, Any]) -> bool:
+    """Whether every field `patch` names exists on `entry`'s kind.
+
+    A `content` must also have the shape its role holds.
+    """
+    if not isinstance(entry, dict):
+        return False
+    fields = patch.get("entry")
+    if fields is not None:
+        if any(key in fields for key in _COMPACTION_FIELDS) and entry.get("type") != "compaction":
+            return False
+        if "content" in fields and entry.get("type") != "custom_message":
+            return False
+    patched = patch.get("message")
+    if patched is None:
+        return True
+    message = entry.get("message")
+    if entry.get("type") != "message" or not isinstance(message, dict):
+        return False
+    role = message.get("role")
+    if any(key in patched for key in _ASSISTANT_FIELDS) and role != "assistant":
+        return False
+    if "prunedAt" in patched and role != "toolResult":
+        return False
+    if "content" not in patched:
+        return True
+    return isinstance(role, str) and role in _CONTENT_TAKES_STRING and (
+        _CONTENT_TAKES_STRING[role] or not isinstance(patched["content"], str)
+    )
+
+
+def set_patched_fields(entry: dict[str, Any], patch: dict[str, Any]) -> None:
+    """Set `patch`'s fields on `entry`, which `entry_accepts_patch` accepted.
+
+    Each value is a copy of the record's, so `entry` shares no object with it.
+    """
+    kind = entry.get("type")
+    fields = patch.get("entry")
+    if fields is not None:
+        if kind == "compaction":
+            for key in _COMPACTION_FIELDS:
+                if key in fields:
+                    entry[key] = copy.deepcopy(fields[key])
+        if "content" in fields and kind == "custom_message":
+            entry["content"] = copy.deepcopy(fields["content"])
+    patched = patch.get("message")
+    message = entry.get("message")
+    if patched is None or kind != "message" or not isinstance(message, dict):
+        return
+    if message.get("role") == "assistant":
+        for key in _ASSISTANT_FIELDS:
+            if key in patched:
+                message[key] = copy.deepcopy(patched[key])
+    if "prunedAt" in patched and message.get("role") == "toolResult":
+        message["prunedAt"] = patched["prunedAt"]
+    if "content" in patched and "content" in message:
+        message["content"] = copy.deepcopy(patched["content"])
+
+
+def _reject_constant(name: str) -> Any:
+    """Refuse `NaN`, `Infinity` and `-Infinity`, which JSON lacks and `JSON.parse` rejects.
+
+    A record line that holds one is no record to the TypeScript readers, so it is
+    none here either.
+    """
+    raise ValueError(f"not a JSON value: {name}")
+
+
+def collect_entry_patches(lines: Iterable[bytes]) -> dict[str, list[dict[str, Any]]]:
+    """The patches of the `entry_patch` records among `lines`, by the id of the entry each names.
+
+    `lines` are a transcript's raw lines in file order, so each id's patches are
+    in file order. Only the lines that hold `ENTRY_PATCH_MARKER` are parsed.
+    """
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for raw in lines:
+        if ENTRY_PATCH_MARKER not in raw:
+            continue
+        try:
+            record = json.loads(raw, parse_constant=_reject_constant)
+        except ValueError:
+            continue
+        if not is_entry_patch_record(record):
+            continue
+        for patch in entry_patches_of(record) or ():
+            by_id.setdefault(patch["entryId"], []).append(patch)
+    return by_id
+
+
+def patch_entry(entry: dict[str, Any], by_id: dict[str, list[dict[str, Any]]]) -> bool:
+    """Set on `entry` the fields of each patch `by_id` holds for it that fits it, in file order.
+
+    Returns whether a record names `entry`.
+    """
+    entry_id = _target_id_of(entry)
+    patches = by_id.get(entry_id) if entry_id is not None else None
+    if patches is None:
+        return False
+    for patch in patches:
+        if entry_accepts_patch(entry, patch):
+            set_patched_fields(entry, patch)
+    return True

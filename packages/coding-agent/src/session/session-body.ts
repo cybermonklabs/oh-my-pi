@@ -212,6 +212,27 @@ class LinesHead {
 }
 
 /**
+ * How much a read of a full write's lines passed: its lines, and their
+ * UTF-16 length. The spool's read notes every line it took before it failed;
+ * the read that streams the body in its place must pass at least as much, or
+ * the source gave its lines once and the second read holds only what the
+ * spool left.
+ */
+class LinesRead {
+	lines = 0;
+	length = 0;
+
+	/** `lines` as they are, counting each as it passes. */
+	*note(lines: Iterable<string>): Generator<string> {
+		for (const line of lines) {
+			this.lines++;
+			this.length += line.length;
+			yield line;
+		}
+	}
+}
+
+/**
  * Spool `lines` to a new file of account `uid` under `os.tmpdir()/omp-spool-<uid>/`
  * ({@link openPrivateTempFile}), iterating them once, counting their bytes and
  * reading the title slot from their {@link LinesHead}. Throws when the file
@@ -355,23 +376,33 @@ export class FullBodies {
 	 * written (`os.tmpdir()` read-only or full, or its spool directory not
 	 * private to this account), it is streamed from the lines themselves
 	 * ({@link #streamedBody}), with one warning per store. That reads `lines`
-	 * again, so an iterator, which yields its lines only once, is read into an
-	 * array first. A throw from `lines` itself (an entry that cannot be read or
-	 * serialized) is no spool failure: it propagates as it is, with no second
-	 * read and no warning.
+	 * again, so a source that yields its lines only once (an iterator, or an
+	 * iterable that hands out the same iterator on every call) is read into an
+	 * array first: read again, it would yield none, and the streamed write
+	 * would replace the stored body with an empty one. A source that hides
+	 * being read once (an iterable that hands out a new iterator over one
+	 * shared generator, as `gen.map(f)` gives) is found by its second read:
+	 * one that passes fewer lines, or fewer UTF-16 units, than the spool read
+	 * ({@link LinesRead}) fails the rewrite, which replaces nothing. A throw
+	 * from `lines` itself (an entry that cannot be read or serialized) is no
+	 * spool failure: it propagates as it is, with no second read and no
+	 * warning.
 	 */
 	lines(path: string, lines: Iterable<string>): FullBody {
 		const uid = process.getuid?.();
 		if (uid === undefined) return this.#keptBody(path, snapshotLines(lines));
-		// An iterator is its own iterable, and yields its lines only once.
+		// An iterator is its own iterable, and an iterable can hand out one iterator on every call: either
+		// yields its lines only once.
 		const iterator: unknown = lines[Symbol.iterator]();
-		const readable: Iterable<string> = iterator === lines ? Array.from(lines) : lines;
+		const once = iterator === lines || lines[Symbol.iterator]() === iterator;
+		const readable: Iterable<string> = once ? Array.from(lines) : lines;
 		let linesFailed = false;
+		const pulled = new LinesRead();
 		// Only a throw from `readable` lands in the catch: a throw from the spool's
 		// own writes ends the iteration through `return`, which runs no catch.
 		function* noteLinesFailure(): Generator<string> {
 			try {
-				yield* readable;
+				yield* pulled.note(readable);
 			} catch (err) {
 				linesFailed = true;
 				throw err;
@@ -389,7 +420,7 @@ export class FullBodies {
 					error: spoolError,
 				});
 			}
-			return this.#streamedBody(path, readable, spoolError);
+			return this.#streamedBody(path, readable, spoolError, pulled);
 		}
 	}
 
@@ -398,14 +429,31 @@ export class FullBodies {
 	 * measured now ({@link measureLines}), and read from the lines again when
 	 * it publishes, through the backend's streamed write ({@link streamLines}),
 	 * so it is never one value; a backend without one cannot take it, and its
-	 * rewrite fails without reading the stored copy back. A publish that fails
-	 * replaces nothing, and is logged as an error naming the session, the path
-	 * and the cause, besides failing the write as any publish does; the next
-	 * full rewrite tries the spool, and this, again. A refusal the caller
-	 * resolves (a size conflict, a lost claim) is not logged.
+	 * rewrite fails without reading the stored copy back. A measuring read
+	 * that passes fewer lines, or fewer UTF-16 units, than the failed spool
+	 * read (`pulled`) throws before anything is published, with an error
+	 * logged: the source gave its lines once, and the read holds only what the
+	 * spool left. A publish that fails replaces nothing, and is logged as an
+	 * error naming the session, the path and the cause, besides failing the
+	 * write as any publish does; the next full rewrite tries the spool, and
+	 * this, again. A refusal the caller resolves (a size conflict, a lost
+	 * claim) is not logged.
 	 */
-	#streamedBody(path: string, lines: Iterable<string>, spoolError: string): FullBody {
-		const measured = measureLines(lines);
+	#streamedBody(path: string, lines: Iterable<string>, spoolError: string, pulled: LinesRead): FullBody {
+		const read = new LinesRead();
+		const measured = measureLines(read.note(lines));
+		if (read.lines < pulled.lines || read.length < pulled.length) {
+			const error = new Error(
+				`The lines of a session rewrite could not be read again after its spool failed: the spool read ${pulled.lines} lines, the second read ${read.lines}`,
+			);
+			logger.error("Session rewrite not stored: its spool cannot be used, and its lines cannot be read again", {
+				session: measured.sessionId,
+				path,
+				error: error.message,
+				spoolError,
+			});
+			throw error;
+		}
 		const writeFullStream = this.#backend.writeFullStream;
 		return {
 			byteLength: measured.bytes,

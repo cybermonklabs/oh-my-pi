@@ -13,7 +13,7 @@ use std::{
 use bstr::{BString, ByteSlice};
 use parking_lot::Mutex;
 
-use super::{Scope, State, Sweep, process_umask};
+use super::{Scope, Sweep, process_umask};
 use crate::{
 	bash::{
 		ChildRedir, ChildRedirs, CmdTag, EnvView, ExitStatus, ExtProc, File, FileKind, JobId, OnBusy,
@@ -382,6 +382,78 @@ fn parked_waiters_report_each_external_its_own_exit() {
 	assert!(s.leftovers().unwrap().is_empty());
 }
 
+/// This test process's OOM adjustment, lowered from 1000 to 999 where it
+/// was 1000: a test that a tool process of this build runs (a bash tool
+/// command) starts at 1000 already, so a child reading 1000 would not show
+/// that its own spawn set it. Best effort: the kernel refuses 999 only below
+/// a minimum a privileged writer set.
+#[cfg(target_os = "linux")]
+fn below_tool_score() -> String {
+	let score = "/proc/self/oom_score_adj";
+	if std::fs::read_to_string(score).unwrap().trim() == "1000" {
+		let _ = std::fs::write(score, "999");
+	}
+	std::fs::read_to_string(score).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn check_tool_oom_score(redirs: Option<ChildRedirs>) {
+	let score = "/proc/self/oom_score_adj";
+	let before = below_tool_score();
+	let env = EnvView::default();
+	let a = sh("read -r score < /proc/self/oom_score_adj; printf '%s\\n' \"$score\"; /bin/cat \
+	            /proc/self/oom_score_adj; :");
+	let s = spawner(Sessions::Detach, Duration::from_secs(2));
+	let out = MemFile::default();
+	let mut sp = spec(&a, &env, NEW);
+	sp.stdio = [StdioSpec::Null, out.boxed(), StdioSpec::Null];
+	sp.redirs = redirs;
+	let mut p = s.spawn(sp).unwrap();
+	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+	assert_eq!(std::fs::read_to_string(score).unwrap(), before);
+	assert_eq!(out.captured(), b"1000\n1000\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_spawn_sets_tool_oom_score() {
+	check_tool_oom_score(None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn redirected_spawn_sets_tool_oom_score() {
+	check_tool_oom_score(Some(ChildRedirs {
+		list:      vec![ChildRedir::Close { fd: 9 }],
+		exec_diag: BString::from("test: /bin/sh: "),
+	}));
+}
+
+/// Failure mode: a program under a low open-files limit (`ulimit -n 3`)
+/// starts without the OOM adjustment of tool processes: its child set the
+/// limit before it opened `/proc/self/oom_score_adj`, and the open failed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_low_open_files_limit_keeps_the_tool_oom_score() {
+	below_tool_score();
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let (_, hard) = crate::sys::rlimit::get(Rlimit::Nofile).unwrap();
+	// Fds 0, 1 and 2 are open: no other fd fits under the limit.
+	let limits = [(Rlimit::Nofile, Some(3), hard)];
+	let a = argv(&["/usr/bin/true"]);
+	let mut sp = spec(&a, &env, NEW);
+	sp.rlimits = &limits;
+	let mut p = s.spawn(sp).unwrap();
+	// The spawn returns once the program exec'd, and the process stays
+	// unreaped while `p` lives: its value is final, whether or not its loader
+	// then fails for want of an fd.
+	let path = format!("/proc/{}/oom_score_adj", p.pid());
+	let score = std::fs::read_to_string(path).unwrap();
+	wait(&mut p);
+	assert_eq!(score, "1000\n");
+}
+
 #[test]
 fn missing_program_fails_with_not_found_on_both_paths() {
 	let env = EnvView::default();
@@ -418,6 +490,64 @@ fn shebang_less_script_fails_with_enoexec_on_both_paths() {
 		assert_eq!(err.raw_os_error(), Some(libc::ENOEXEC), "{what}: {err}");
 	}
 	std::fs::remove_file(&path).unwrap();
+}
+
+/// Failure mode: a program that cannot start spawns anyway (the engine then
+/// reports an exit status instead of the OS error bash prints), fails with
+/// another error, or leaves its failed child unreaped (a zombie per
+/// failure). The exec's `EACCES`, and a working directory the child cannot
+/// enter. The body runs again, alone, in a process of its own (`ALONE` set):
+/// the check for a child left asks about every child of the process, and
+/// under libtest (`cargo test`, Bazel) the other tests' children share the
+/// test's process.
+#[test]
+fn exec_and_setup_errors_fail_the_spawn_and_leave_no_child() {
+	use std::os::unix::fs::PermissionsExt;
+
+	const ALONE: &str = "PI_SHELL_FAILED_SPAWN_CHILD";
+	if std::env::var_os(ALONE).is_none() {
+		let output = std::process::Command::new(std::env::current_exe().unwrap())
+			.args([
+				"--exact",
+				"sys::spawn::unix::tests::exec_and_setup_errors_fail_the_spawn_and_leave_no_child",
+			])
+			.env(ALONE, "1")
+			.output()
+			.unwrap();
+		let out = String::from_utf8_lossy(&output.stdout);
+		let err = String::from_utf8_lossy(&output.stderr);
+		assert!(output.status.success(), "the test alone failed: {out}{err}");
+		assert!(out.contains("1 passed"), "the process ran no test: {out}");
+		return;
+	}
+	let dir = tempfile::tempdir().unwrap();
+	let plain = dir.path().join("not-executable");
+	std::fs::write(&plain, b"#!/bin/sh\nexit 0\n").unwrap();
+	std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+	let not_executable = vec![BString::from(plain.as_os_str().as_encoded_bytes())];
+	let runs = argv(&["/usr/bin/true"]);
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	for (what, a, cwd, errno) in [
+		("not executable", &not_executable, "/", libc::EACCES),
+		("missing cwd", &runs, "/nonexistent/dir", libc::ENOENT),
+	] {
+		let mut sp = spec(a, &env, NEW);
+		sp.cwd = cwd.as_bytes().as_bstr();
+		let err = s
+			.spawn(sp)
+			.err()
+			.unwrap_or_else(|| panic!("{what}: spawned"));
+		assert_eq!(err.raw_os_error(), Some(errno), "{what}: {err}");
+	}
+	// This process runs this test alone: it has no other child.
+	// SAFETY: plain syscall; `WNOHANG` does not wait.
+	let rc = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+	assert_eq!(
+		(rc, io::Error::last_os_error().raw_os_error()),
+		(-1, Some(libc::ECHILD)),
+		"a failed child is left unreaped"
+	);
 }
 
 /// A fresh path in the temp directory for test `what`.
@@ -2441,12 +2571,21 @@ fn ignored_realtime_max_reaches_the_child() {
 	assert_eq!(wait(&mut p), ExitStatus::Exited(7));
 }
 
+/// Whether the test process ignores `sig`.
+fn host_ignores(sig: libc::c_int) -> bool {
+	// SAFETY: sigaction is plain data, valid zeroed.
+	let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+	// SAFETY: a null new action only queries; `old` is writable.
+	let rc = unsafe { libc::sigaction(sig, std::ptr::null(), &raw mut old) };
+	rc == 0 && old.sa_sigaction == libc::SIG_IGN
+}
+
 #[test]
 fn ignored_signals_reach_the_child_through_the_fork_path() {
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
 	let a = sh("kill -USR1 $$; exit 7");
-	assert!(!super::host_ignores(Signal::Usr1));
+	assert!(!host_ignores(libc::SIGUSR1));
 	let mut sp = spec(&a, &env, NEW);
 	sp.sigmask_ign = SigSet::EMPTY.with(Signal::Usr1);
 	let mut p = s.spawn(sp).unwrap();
@@ -2477,7 +2616,7 @@ fn signal_the_host_ignores_after_a_spawn_is_reset_in_later_children() {
 }
 
 /// glibc's own signals, 32 and 33 (`super::internal`): an external gets
-/// them as bash's fork and exec leaves them, on each of the three paths.
+/// them as bash's fork and exec leaves them, on each of its paths.
 /// Each test changes them for its whole process, so it runs again in
 /// processes of its own ([`glibc_signals::isolated`]).
 #[cfg(all(
@@ -2486,14 +2625,14 @@ fn signal_the_host_ignores_after_a_spawn_is_reset_in_later_children() {
 	any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod glibc_signals {
-	use std::{io, os::unix::process::CommandExt as _, sync::atomic::Ordering};
+	use std::{ffi::CStr, io, os::unix::process::CommandExt as _, ptr, sync::atomic::Ordering};
 
 	use super::{
 		super::internal::{self, IGNORED_AT_LOAD, READ, SIGNALS},
-		NEW, process_umask, sh, spec, wait,
+		NEW, sh, spec, wait,
 	};
 	use crate::{
-		bash::{ChildRedirs, EnvView, ExitStatus, SigSet},
+		bash::{ChildRedirs, EnvView, ExitStatus},
 		sys::spawn::NativeSpawner,
 	};
 
@@ -2503,12 +2642,13 @@ mod glibc_signals {
 	/// Run test `name` of this module again, alone, in a process of its own
 	/// that starts with both signals' handler `entry`: once as the host
 	/// starts processes, and once under a seccomp filter that answers
-	/// `clone3` with `ENOSYS` ([`refuse_clone3`]), so that glibc's
-	/// `posix_spawn` takes the path that sets both to `SIG_IGN` on any
-	/// machine. True in those processes: the caller runs its body there.
+	/// `clone3` with `ENOSYS` ([`refuse_clone3`]), where glibc's
+	/// `posix_spawn` child would set both to `SIG_IGN`: no path may start an
+	/// external that way. True in those processes: the caller runs its body
+	/// there.
 	fn isolated(name: &str, entry: libc::sighandler_t) -> bool {
 		if let Some(how) = std::env::var_os(CHILD) {
-			assert!(how != "refused" || internal::spawn_ignores(), "clone3 is not refused");
+			assert!(how != "refused" || clone3_refused(), "clone3 is not refused");
 			return true;
 		}
 		let entry = internal::with_handler(entry);
@@ -2581,6 +2721,34 @@ mod glibc_signals {
 		}
 	}
 
+	/// Whether this process's `clone3` is refused with `ENOSYS` (a seccomp
+	/// filter, or a kernel without the call).
+	fn clone3_refused() -> bool {
+		// SAFETY: with no arguments and size 0 the kernel refuses the call
+		// (EINVAL) before it creates anything; a seccomp filter or a kernel
+		// without the call answers ENOSYS.
+		unsafe {
+			libc::syscall(libc::SYS_clone3, ptr::null::<libc::c_void>(), 0usize) == -1
+				&& io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS)
+		}
+	}
+
+	/// Whether the running glibc is at least `major.minor` (`false` when its
+	/// version string does not parse).
+	fn glibc_at_least(major: u32, minor: u32) -> bool {
+		// SAFETY: glibc returns a static NUL-terminated string.
+		let version = unsafe { CStr::from_ptr(libc::gnu_get_libc_version()) };
+		let mut parts = version.to_bytes().split(|&b| b == b'.').map(|p| {
+			std::str::from_utf8(p)
+				.ok()
+				.and_then(|p| p.parse::<u32>().ok())
+		});
+		match (parts.next().flatten(), parts.next().flatten()) {
+			(Some(have_major), Some(have_minor)) => (have_major, have_minor) >= (major, minor),
+			_ => false,
+		}
+	}
+
 	/// Set both signals' handler to `handler` in this process (with the
 	/// system call: glibc refuses).
 	fn set_actions(handler: libc::sighandler_t) {
@@ -2593,9 +2761,9 @@ mod glibc_signals {
 	/// The ways an external starts, each forced but the first.
 	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 	enum Path {
-		/// The spec as given: `posix_spawn` where it can express it.
+		/// The spec as given: the vfork child.
 		Given,
-		/// std's fork: a umask the process does not have.
+		/// A umask the process does not have, which the vfork child sets too.
 		Fork,
 		/// The bare fork: redirections left to the process.
 		BareFork,
@@ -2618,12 +2786,6 @@ mod glibc_signals {
 		wait(&mut s.spawn(sp).unwrap())
 	}
 
-	/// Whether the spec as given takes `posix_spawn`.
-	fn by_posix_spawn(s: &NativeSpawner) -> bool {
-		let state = &s.shared.state;
-		state.add_chdir.is_some() && state.posix_eligible(process_umask().unwrap(), SigSet::EMPTY)
-	}
-
 	/// Each path and signal with `status(path, signal)`.
 	fn rows(mut status: impl FnMut(Path, i32) -> ExitStatus) -> Vec<(Path, i32, ExitStatus)> {
 		PATHS
@@ -2643,7 +2805,6 @@ mod glibc_signals {
 			return;
 		}
 		let s = NativeSpawner::default();
-		assert!(by_posix_spawn(&s), "the spec as given takes posix_spawn");
 		let got = rows(|path, sig| kill_self(&s, path, sig));
 		assert_eq!(got, rows(|_, sig| ExitStatus::SignaledRaw(sig)));
 	}
@@ -2657,7 +2818,6 @@ mod glibc_signals {
 		}
 		set_actions(libc::SIG_IGN);
 		let s = NativeSpawner::default();
-		assert!(by_posix_spawn(&s), "the spec as given takes posix_spawn");
 		let got = rows(|path, sig| kill_self(&s, path, sig));
 		assert_eq!(got, rows(|_, _| ExitStatus::Exited(7)));
 	}
@@ -2668,20 +2828,17 @@ mod glibc_signals {
 	/// ignored after glibc gave `SIGSETXID` a handler of its own at this
 	/// process's first thread. On glibc 2.33 and older, libpthread's preinit
 	/// installs both handlers before the reading, so it sees nothing and the
-	/// children get both at the default (the stated limit). Either way,
-	/// where glibc's child ignores them itself, the spec as given takes
-	/// `posix_spawn`.
+	/// children get both at the default (the stated limit).
 	#[test]
 	fn glibc_signals_ignored_when_the_process_started_stay_ignored() {
 		if !isolated("glibc_signals_ignored_when_the_process_started_stay_ignored", libc::SIG_IGN) {
 			return;
 		}
-		let seen = internal::glibc_at_least(2, 34);
+		let seen = glibc_at_least(2, 34);
 		let at_load = if seen { READ | 0b11 } else { READ };
 		assert_eq!(IGNORED_AT_LOAD.load(Ordering::Relaxed), at_load, "the reading at load");
 		std::thread::spawn(|| {}).join().unwrap();
 		let s = NativeSpawner::default();
-		assert_eq!(by_posix_spawn(&s), internal::spawn_ignores(), "posix_spawn when it can");
 		let got = rows(|path, sig| kill_self(&s, path, sig));
 		let want = if seen {
 			rows(|_, _| ExitStatus::Exited(7))
@@ -2692,8 +2849,8 @@ mod glibc_signals {
 	}
 
 	/// One with a handler stays ignored in a child when the process ignored
-	/// it at load (by a fork where glibc's `posix_spawn` would reset it),
-	/// and goes to its default when the process did not.
+	/// it at load (each path sets it, where glibc's `posix_spawn` would reset
+	/// it), and goes to its default when the process did not.
 	#[test]
 	fn a_glibc_signal_under_a_handler_stays_ignored_only_if_ignored_at_load() {
 		/// Stands in for glibc's handler.
@@ -2710,9 +2867,6 @@ mod glibc_signals {
 		let run = |ignored_at_load: bool| {
 			IGNORED_AT_LOAD.store(if ignored_at_load { READ | 0b11 } else { READ }, Ordering::Relaxed);
 			crate::sys::dispositions_changed();
-			// glibc's own child ignores them where it does not use clone3.
-			let posix = !ignored_at_load || internal::spawn_ignores();
-			assert_eq!(by_posix_spawn(&s), posix, "posix_spawn when it can");
 			rows(|path, sig| kill_self(&s, path, sig))
 		};
 		assert_eq!(run(true), rows(|_, _| ExitStatus::Exited(7)), "ignored at load");
@@ -2720,24 +2874,71 @@ mod glibc_signals {
 	}
 
 	/// The bits set are the ones glibc's own `sigismember` reads as 32 and
-	/// 33, and no other.
+	/// 33, and no other: glibc's `sigset_t` starts with the kernel's set,
+	/// which the vfork child reads.
 	#[test]
 	fn glibc_signal_bits_are_the_ones_glibc_reads() {
+		// glibc's `sigset_t` is `unsigned long[1024 / 64]`: signal n is bit
+		// (n - 1) % 64 of word (n - 1) / 64.
+		const _: () = assert!(
+			size_of::<libc::sigset_t>() == 16 * size_of::<u64>()
+				&& align_of::<libc::sigset_t>() == align_of::<u64>()
+		);
 		if !isolated("glibc_signal_bits_are_the_ones_glibc_reads", libc::SIG_DFL) {
 			return;
 		}
-		set_actions(libc::SIG_DFL);
+		set_actions(libc::SIG_IGN);
 		// SAFETY: sigset_t is plain data, initialized by sigemptyset.
 		let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
 		// SAFETY: `set` is a valid, writable sigset_t.
 		unsafe { libc::sigemptyset(&raw mut set) };
-		internal::add_defaults(&mut set);
+		// SAFETY: the set's first word (layout asserted above).
+		unsafe { *ptr::from_mut(&mut set).cast::<u64>() = internal::ignored_bits() };
 		let members: Vec<i32> = (1..65)
 			// SAFETY: `set` is initialized.
 			.filter(|&n| unsafe { libc::sigismember(&raw const set, n) } == 1)
 			.collect();
 		assert_eq!(members, SIGNALS);
 	}
+}
+
+/// The signals the calling thread blocks.
+fn blocked_here() -> Vec<i32> {
+	// SAFETY: sigset_t is plain data, valid zeroed; a null new set only
+	// queries the mask.
+	unsafe {
+		let mut now = std::mem::zeroed::<libc::sigset_t>();
+		libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &raw mut now);
+		(1..=64)
+			.filter(|&n| libc::sigismember(&raw const now, n) == 1)
+			.collect()
+	}
+}
+
+/// Failure mode: the program starts with the signals its spawning thread
+/// blocks still blocked (a TERM would not end it), or the spawn leaves the
+/// spawning thread with another mask than it had.
+#[test]
+fn the_child_starts_with_no_signal_blocked_and_the_thread_keeps_its_mask() {
+	let (status, blocked) = thread::spawn(|| {
+		// SAFETY: sigset_t is plain data, valid zeroed; the calls only read
+		// and write the sets passed.
+		unsafe {
+			let mut term = std::mem::zeroed::<libc::sigset_t>();
+			libc::sigemptyset(&raw mut term);
+			libc::sigaddset(&raw mut term, libc::SIGTERM);
+			libc::pthread_sigmask(libc::SIG_SETMASK, &raw const term, std::ptr::null_mut());
+		}
+		let env = EnvView::default();
+		let a = argv(&["/bin/sleep", "30"]);
+		let mut p = NativeSpawner::default().spawn(spec(&a, &env, NEW)).unwrap();
+		p.signal(Signal::Term).unwrap();
+		(wait(&mut p), blocked_here())
+	})
+	.join()
+	.unwrap();
+	assert_eq!(status, ExitStatus::Signaled(Signal::Term), "TERM stayed blocked in the child");
+	assert_eq!(blocked, [libc::SIGTERM], "the spawning thread's mask");
 }
 
 #[test]
@@ -2827,10 +3028,12 @@ fn umask_probe_preserves_concurrent_file_creation_mask() {
 fn umask_reaches_the_child_on_both_paths() {
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
-	let state = State::new(None);
+	#[cfg(target_os = "macos")]
+	let state = super::State::new(None);
 	let host = process_umask().unwrap();
 	let a = sh("umask");
 	for mask in [host, 0o027] {
+		#[cfg(target_os = "macos")]
 		assert_eq!(state.posix_eligible(mask, SigSet::EMPTY), mask == host);
 		let out = MemFile::default();
 		let mut sp = spec(&a, &env, NEW);
@@ -2936,7 +3139,7 @@ fn cwd_env_and_argv0_reach_the_child() {
 	assert_eq!(out.captured(), b"/usr\nb a r|name0\n");
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(target_os = "macos")]
 #[test]
 fn missing_spawn_chdir_uses_fork_with_the_requested_cwd() {
 	let mut s = NativeSpawner::default();
@@ -2971,6 +3174,21 @@ fn extra_fds_are_passed_to_the_child() {
 	assert_eq!(pumped.captured(), b"pumped\n", "fd 5 pumped both ways over a socket pair");
 	assert_eq!(std::fs::read(&path).unwrap(), b"direct\ngot back\n", "fd 7 passed through");
 	std::fs::remove_file(&path).unwrap();
+}
+
+/// Failure mode: a stream the spec closes (`>&-`) is still open in the
+/// program, which then writes into the null device instead of failing.
+#[test]
+fn a_closed_stream_is_closed_in_the_child() {
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let err = MemFile::default();
+	let a = sh("if [ -e /dev/fd/1 ]; then echo open >&2; else echo closed >&2; fi");
+	let mut sp = spec(&a, &env, NEW);
+	sp.stdio = [StdioSpec::Null, StdioSpec::Closed, err.boxed()];
+	let mut p = s.spawn(sp).unwrap();
+	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+	assert_eq!(err.captured(), b"closed\n");
 }
 
 /// bash hands one kernel pipe to every process that inherits a procsub fd.

@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getSafeProjectCwd, logger, postmortem } from "@oh-my-pi/pi-utils";
+import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
 import { quotePosixArgument } from "./shell-quote";
 import fnEnvHelper from "./shell-snapshot-fn-env.sh" with { type: "text" };
 
@@ -295,8 +296,10 @@ async function createSnapshot(
 				spawnEnv[key] = value;
 			}
 		}
-		const child = Bun.spawn([shell, "-c", script], {
-			cwd: getSafeProjectCwd(),
+		const cwd = getSafeProjectCwd();
+		// The user's shell runs their rc files for the bash tool: a tool process (see withToolOomScore).
+		const child = Bun.spawn(withToolOomScore([shell, "-c", script], { env: spawnEnv, cwd }), {
+			cwd,
 			env: spawnEnv,
 			stdin: "ignore",
 			stdout: "ignore",

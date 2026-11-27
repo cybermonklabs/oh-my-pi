@@ -193,6 +193,7 @@ rust_test_suite(
             "tests/minimizer_fixtures.rs",
             "tests/vfs.rs",
             # Their own targets below.
+            "tests/vfork_child.rs",
             "tests/zsh_computil_args_pty.rs",
         ] + ["tests/" + f + ".rs" for f in _LONG_INTEGRATION_TESTS],
     ),
@@ -224,6 +225,27 @@ rust_test(
     aliases = aliases(),
     crate_name = "pi_shell_integration_tests_tests_zsh_computil_args_pty_test",
     crate_root = "tests/zsh_computil_args_pty.rs",
+    data = _INTEGRATION_DATA,
+    edition = "2024",
+    proc_macro_deps = _INTEGRATION_PROC_MACRO_DEPS,
+    rustc_env = _INTEGRATION_RUSTC_ENV,
+    rustc_flags = _INTEGRATION_RUSTC_FLAGS,
+    deps = _INTEGRATION_DEPS,
+)
+
+# tests/vfork_child.rs includes the spawner's vfork child as it is
+# (`#[path = "../src/sys/spawn/unix/vfork.rs"]`), a file none of the suite's
+# sources hold, so its target lists that file too: Bazel's sandbox has only a
+# target's inputs, and rustc reads the included file at compile time.
+rust_test(
+    name = "pi-shell_integration_tests_tests/vfork_child_test",
+    srcs = [
+        "src/sys/spawn/unix/vfork.rs",
+        "tests/vfork_child.rs",
+    ] + _INTEGRATION_SHARED_SRCS,
+    aliases = aliases(),
+    crate_name = "pi_shell_integration_tests_tests_vfork_child_test",
+    crate_root = "tests/vfork_child.rs",
     data = _INTEGRATION_DATA,
     edition = "2024",
     proc_macro_deps = _INTEGRATION_PROC_MACRO_DEPS,

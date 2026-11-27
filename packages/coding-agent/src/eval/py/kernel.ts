@@ -10,6 +10,7 @@
  */
 import * as path from "node:path";
 import { $env, $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
 import { Settings } from "../../config/settings";
 import { withTimeoutSignal } from "../../utils/fetch-timeout";
 import {
@@ -382,18 +383,21 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT);
 		const kernel = new PythonKernel(Snowflake.next(), runtime.pythonPath);
 
-		const proc = Bun.spawn([runtime.pythonPath, "-u", scriptPath], {
-			cwd: options.cwd,
-			detached: shouldDetachKernel(process.platform),
-			env: spawnEnv,
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-			windowsHide: shouldHideKernelWindow({
-				platform: process.platform,
-				hostHasInheritableConsole: hostHasInheritableConsole(),
-			}),
-		});
+		const proc = Bun.spawn(
+			withToolOomScore([runtime.pythonPath, "-u", scriptPath], { env: spawnEnv, cwd: options.cwd }),
+			{
+				cwd: options.cwd,
+				detached: shouldDetachKernel(process.platform),
+				env: spawnEnv,
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+				windowsHide: shouldHideKernelWindow({
+					platform: process.platform,
+					hostHasInheritableConsole: hostHasInheritableConsole(),
+				}),
+			},
+		);
 
 		kernel.setProcess(proc);
 

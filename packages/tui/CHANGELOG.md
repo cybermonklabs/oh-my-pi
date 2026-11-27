@@ -29,6 +29,7 @@
 
 ### Fixed
 
+- Fixed the agent transcript viewer showing the original content of an entry that an `entry_patch` record in a later read window or collab host reply changed (an elide pass's placeholder, a recovered attempt's marker): `AgentTranscriptSource.parseEntries` now also returns the records, and the viewer applies them to the messages it rendered from earlier windows and renders those again
 - Fixed quitting a session with a long un-retired transcript (for example after a fullscreen overlay held the screen) rendering the whole history before exit: `TUI.stop({ maxRows })` writes only the newest whole blocks that fit, or the newest block whole when it alone is taller ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar))
 - Fixed finished messages moving into terminal scrollback immediately, instead of staying live until the screen fills, after returning from a suspend or an external editor ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar)).
 - Fixed opening the external editor or suspending from a fullscreen view, such as `/annotate`, stalling for many seconds on a long session ([#13799](https://github.com/can1357/oh-my-pi/pull/13799) by [@sjawhar](https://github.com/sjawhar)).

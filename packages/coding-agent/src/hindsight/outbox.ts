@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, logger, sanitizeText, tryAcquireFileLockUnlessHeld, withFileLock } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger, sanitizeText, tryAcquireFileLock, withFileLock } from "@oh-my-pi/pi-utils";
 import type { MemoryWriteScope } from "../memory-backend/global-scope";
 import { redactMemorySecrets } from "../memory-backend/redact";
 import { writeFileAtomically } from "../utils/atomic-file";
@@ -170,8 +170,7 @@ export class HindsightOutbox {
 			throw error;
 		}
 		for (const dir of destinations) {
-			// A drain another process holds is tried again later, so the lease is probed before it is claimed.
-			const lease = tryAcquireFileLockUnlessHeld(path.join(dir, "drain"));
+			const lease = tryAcquireFileLock(path.join(dir, "drain"));
 			if (!lease) {
 				if (dir === this.#dir) result.busy = true;
 				continue;
@@ -224,7 +223,7 @@ export class HindsightOutbox {
 		// unsent. The queue lock enqueue holds across publication and rollback keeps
 		// this snapshot out of that window; when it is taken, defer like drain-lease
 		// contention, since delivery always retries.
-		const lease = tryAcquireFileLockUnlessHeld(path.join(this.#dir, "queue"));
+		const lease = tryAcquireFileLock(path.join(this.#dir, "queue"));
 		if (!lease) {
 			result.busy = true;
 			return;

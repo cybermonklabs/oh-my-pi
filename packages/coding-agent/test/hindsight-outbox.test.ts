@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { FileLock as NativeFileLock } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../src/config/settings";
 import { hindsightBackend } from "../src/hindsight/backend";
@@ -13,7 +12,6 @@ import type { AgentSession, AgentSessionEventListener } from "../src/session/age
 import type { ToolSession } from "../src/tools";
 import { MemoryRetainTool } from "../src/tools/memory-retain";
 import * as atomicFile from "../src/utils/atomic-file";
-import { startNativeLockHolder } from "./helpers/native-lock-holder";
 
 interface WireItem {
 	document_id: string;
@@ -566,32 +564,6 @@ describe("Hindsight retain outbox", () => {
 		expect(requests).toHaveLength(1);
 		expect(await events()).toHaveLength(0);
 	});
-
-	// If this regresses, every retry of a session's retain drain blocks its event loop for about
-	// 50 ms while another omp process delivers the same destination.
-	it.skipIf(process.platform !== "linux")(
-		"leaves a destination another process drains without a blocking claim, and delivers it once that drain ends",
-		async () => {
-			const { tool, state } = fixture();
-			await tool.execute("held", { items: [{ content: "waits for the other drainer" }] });
-			const [eventFile] = await eventFiles();
-			const drainLock = `${path.join(path.dirname(eventFile!), "drain")}.lock`;
-			const holder = await startNativeLockHolder(drainLock, path.join(temp.path(), "lock-holder-ready"));
-			try {
-				const claim = vi.spyOn(NativeFileLock, "tryAcquire");
-				await state.flushRetainQueue();
-				expect(claim.mock.calls.filter(([claimed]) => claimed === drainLock)).toEqual([]);
-				expect(requests).toHaveLength(0);
-				claim.mockRestore();
-			} finally {
-				holder.kill();
-				await holder.exited;
-			}
-			await state.flushRetainQueue();
-			expect(accepted.map(item => item.content)).toEqual(["waits for the other drainer"]);
-		},
-		10_000,
-	);
 
 	it("delivers nothing from a multi-item call that fails midway, even to a drain running alongside it", async () => {
 		const midBatch = Promise.withResolvers<void>();

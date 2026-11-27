@@ -18,7 +18,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { ENTRY_PATCH_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/entry-patches";
+import { ENTRY_PATCH_CUSTOM_TYPE } from "@oh-my-pi/pi-utils/entry-patches";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	type CompactionEntry,

@@ -1,9 +1,16 @@
+import { ContainerPath, type NestedWalk, runNested, stringifyDeepJson } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { AssistantMessage, ToolCall, ToolResultMessage } from "../types";
 
 const LEGACY_INTENT_FIELD = "__intent";
 const RESULT_SUMMARY_LIMIT = 200;
 const ARGUMENT_SUMMARY_LIMIT = 400;
+
+/**
+ * Each turn writes its calls' arguments: arguments nested past `JSON.stringify`'s recursion skip the
+ * attempt that would run out of stack (1.5 s or more each time) and go to the deep writer.
+ */
+const CANONICAL_JSON = { probeDepth: true } as const;
 
 /** Runtime settings for cross-turn tool-call repetition detection. */
 export interface ToolCallLoopGuardOptions {
@@ -28,20 +35,35 @@ export interface RepeatedToolCallDetection {
 	readonly argumentsSummary: string;
 }
 
+/**
+ * `value` with each object's keys sorted and its intent fields left out, arrays in order. The walk
+ * keeps its own stack ({@link runNested}): a tool call's arguments are any JSON, as deep as
+ * `JSON.parse` reads (400,000 levels), where a recursive walk stops near 22,000.
+ */
 function canonicalizeToolCallValue(value: unknown): unknown {
+	return value && typeof value === "object" ? runNested(canonicalToolCallNode(value, new ContainerPath())) : value;
+}
+
+/** {@link canonicalizeToolCallValue} of `value`, an object `path` is inside of; each child object is a nested step. */
+function* canonicalToolCallNode(value: object, path: ContainerPath): NestedWalk {
+	path.enter(value);
 	if (Array.isArray(value)) {
-		return value.map(item => canonicalizeToolCallValue(item));
-	}
-	if (!value || typeof value !== "object") {
-		return value;
+		const items: unknown[] = [];
+		for (const item of value) {
+			items.push(item && typeof item === "object" ? yield canonicalToolCallNode(item, path) : item);
+		}
+		path.leave(value);
+		return items;
 	}
 
 	const input = value as Record<string, unknown>;
 	const output: Record<string, unknown> = {};
 	for (const key of Object.keys(input).sort()) {
 		if (key === INTENT_FIELD || key === LEGACY_INTENT_FIELD) continue;
-		output[key] = canonicalizeToolCallValue(input[key]);
+		const item = input[key];
+		output[key] = item && typeof item === "object" ? yield canonicalToolCallNode(item, path) : item;
 	}
+	path.leave(value);
 	return output;
 }
 
@@ -103,7 +125,7 @@ export class ToolCallLoopGuard {
 		}
 
 		const canonicalCalls = toolCalls
-			.map(tc => JSON.stringify([tc.name, canonicalizeToolCallValue(tc.arguments)]))
+			.map(tc => stringifyDeepJson([tc.name, canonicalizeToolCallValue(tc.arguments)], CANONICAL_JSON))
 			.sort();
 		const turnHash = JSON.stringify(canonicalCalls);
 		if (turnHash === this.#lastHash) {
@@ -121,7 +143,7 @@ export class ToolCallLoopGuard {
 			count: this.#count,
 			resultSummary: summarizeToolResult(turn.toolResults, reportCall.id),
 			argumentsSummary: summarizeText(
-				JSON.stringify(canonicalizeToolCallValue(reportCall.arguments)),
+				stringifyDeepJson(canonicalizeToolCallValue(reportCall.arguments), CANONICAL_JSON) ?? "",
 				ARGUMENT_SUMMARY_LIMIT,
 			),
 		};

@@ -5,11 +5,17 @@ import type { Message } from "@oh-my-pi/pi-ai";
 import { textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import type { SessionListing } from "@oh-my-pi/pi-tui/overlays/session-selector";
 import { getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
+import {
+	applyEntryPatches,
+	ENTRY_PATCH_CUSTOM_TYPE,
+	type EntryPatchRecord,
+	isEntryPatchRecord,
+} from "@oh-my-pi/pi-utils/entry-patches";
 import { hasFsCode, isEacces, isEnoent, isEnotdir } from "@oh-my-pi/pi-utils/fs-error";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { parseJsonlLenient } from "@oh-my-pi/pi-utils/stream";
-import { toError } from "@oh-my-pi/pi-utils/type-guards";
+import { isRecord, toError } from "@oh-my-pi/pi-utils/type-guards";
 import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
 import { findArchivedSessionFiles } from "./session-archive";
 import { visitEntriesFromFile } from "./session-loader";
@@ -17,7 +23,9 @@ import { computeDefaultSessionDir } from "./session-paths";
 import {
 	defaultSessionStorage,
 	FileSessionStorage,
+	RACED_READ_RETRIES,
 	retryRacedRead,
+	SessionReadConflictError,
 	type SessionStorage,
 	type SessionStorageStat,
 } from "./session-storage";
@@ -171,9 +179,10 @@ export function sessionDisplayName(info: SessionInfo): string {
  * Derive a {@link SessionStatus} from a tail window of a session file. Entries are
  * newline-terminated on write, so within the window only the first line can be a
  * partial fragment — it simply fails to parse and is skipped. We walk backwards to
- * the last `message` entry and classify by its role / stop reason.
+ * the last `message` entry and classify by its role / stop reason, with the
+ * fields `records` (the window's `entry_patch` records, in file order) set on it.
  */
-function deriveSessionStatus(suffix: string): SessionStatus {
+function deriveSessionStatus(suffix: string, records: readonly EntryPatchRecord[]): SessionStatus {
 	if (!suffix) return "unknown";
 	const lines = suffix.split("\n");
 	for (let i = lines.length - 1; i >= 0; i--) {
@@ -189,6 +198,8 @@ function deriveSessionStatus(suffix: string): SessionStatus {
 			continue;
 		}
 		if (entry.type === "message" && entry.message) {
+			// A record that sets the turn's content decides whether it ends in tool calls.
+			if (records.length > 0) applyEntryPatches<object>([entry, ...records]);
 			return statusFromTailMessage(entry.message);
 		}
 	}
@@ -308,14 +319,20 @@ function countAssistantMarkers(content: string): number {
 	return countRoleMarkers(content, "assistant");
 }
 
+/** A `message` entry whose message is a user or assistant turn, as its line holds it. */
+interface TurnEntry {
+	type: "message";
+	message: Message;
+}
+
 /**
- * The message of a complete `message` record line when it is a user or
+ * The entry of a complete `message` record line when it is a user or
  * assistant turn. JSON escapes quotes inside strings, so a bare `"user"` or
  * `"assistant"` can only be a key or value: lines without either skip the
  * parse, and large non-turn records (memory recall, tool results) cost one
  * substring scan. Malformed or partial lines return undefined.
  */
-function parseTurnLine(line: string): Message | undefined {
+function parseTurnLine(line: string): TurnEntry | undefined {
 	if (!line.includes('"user"') && !line.includes('"assistant"')) return undefined;
 	let record: { type?: unknown; message?: Message };
 	try {
@@ -325,7 +342,30 @@ function parseTurnLine(line: string): Message | undefined {
 	}
 	if (record.type !== "message") return undefined;
 	const role = record.message?.role;
-	return role === "user" || role === "assistant" ? record.message : undefined;
+	return role === "user" || role === "assistant" ? (record as TurnEntry) : undefined;
+}
+
+/** The `entry_patch` record of a complete line; only a line that names the record's type is parsed. */
+function parseEntryPatchLine(line: string): EntryPatchRecord | undefined {
+	if (!line.includes(ENTRY_PATCH_CUSTOM_TYPE)) return undefined;
+	let value: unknown;
+	try {
+		value = JSON.parse(line);
+	} catch {
+		return undefined;
+	}
+	return isRecord(value) && isEntryPatchRecord(value) ? value : undefined;
+}
+
+/** The `entry_patch` records among the complete lines of `text`, a window of a session file, in file order. */
+function entryPatchRecordsIn(text: string): EntryPatchRecord[] {
+	const records: EntryPatchRecord[] = [];
+	if (!text.includes(ENTRY_PATCH_CUSTOM_TYPE)) return records;
+	for (const line of text.split("\n")) {
+		const record = parseEntryPatchLine(line);
+		if (record) records.push(record);
+	}
+	return records;
 }
 
 function extractFirstDisplayMessageFromPrefix(content: string): string | undefined {
@@ -432,13 +472,53 @@ function getSessionListWorkerCount(fileCount: number): number {
 /**
  * Scan a single session file into a {@link SessionInfo}. Reads the 4 KB
  * prefix, plus the 32 KB tail when `withStatus` is set; a record the windows
- * miss is recovered by one {@link SessionStorage.scanLines} pass.
+ * miss is recovered by one {@link SessionStorage.scanLines} pass. A full
+ * rewrite between two chunks of that pass fails it: the scan then runs again
+ * from a new stat, so every field of the result, and the stat it is cached
+ * under, come from one body.
+ *
+ * `entry_patch` records apply as follows. The records of the prefix and of
+ * the tail window apply to the entries the prefix holds and to the last turn
+ * the status reads. The records the line pass read, from the file's start to
+ * the line it stopped at, then the tail window's, apply to the prompt that
+ * pass finds. A record past the prefix that the tail window misses and the
+ * pass did not reach is not read. The text cut from the prefix's partial
+ * line, which the prompt falls back to when no pass finds one (a storage
+ * without `scanLines`, or a pass a full rewrite raced past the retries),
+ * takes no record. The search text holds the messages of the file's first
+ * 4 KB as stored, and the prompt the pass finds: a record that shortens an
+ * entry brings no later text into it.
  */
 async function scanSessionFile(
 	file: string,
 	storage: SessionStorage,
 	withStatus: boolean,
 	knownStat?: SessionStorageStat,
+): Promise<SessionInfo | undefined> {
+	let passes = 0;
+	try {
+		return await retryRacedRead(() => {
+			passes++;
+			return scanSessionFileOnce(file, storage, withStatus, passes === 1 ? knownStat : undefined, {
+				lastPass: passes > RACED_READ_RETRIES,
+			});
+		});
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * One pass of {@link scanSessionFile}. A full rewrite that races its line
+ * scan fails the pass with `SessionReadConflictError`, except on the
+ * `lastPass`, which keeps the bounded windows' evidence instead.
+ */
+async function scanSessionFileOnce(
+	file: string,
+	storage: SessionStorage,
+	withStatus: boolean,
+	knownStat: SessionStorageStat | undefined,
+	options: { lastPass: boolean },
 ): Promise<SessionInfo | undefined> {
 	let stat: SessionStorageStat;
 	try {
@@ -463,6 +543,9 @@ async function scanSessionFile(
 		);
 		const { size, mtime } = stat;
 		const entries = parseJsonlLenient<Record<string, unknown>>(content);
+		// The prefix's own records, then the tail's, in file order: a tail that overlaps the prefix repeats some, which changes nothing.
+		const tailRecords = entryPatchRecordsIn(suffix);
+		applyEntryPatches<object>(tailRecords.length > 0 ? [...entries, ...tailRecords] : entries);
 		const header = parseSessionListHeader(content, entries);
 		if (!header) {
 			// Cache the negative result too: an unparseable file stays unparseable
@@ -510,32 +593,51 @@ async function scanSessionFile(
 		const needPrompt = !firstMessage;
 		const needTurn = assistantTurns === 0;
 		if ((needPrompt || needTurn) && size > SESSION_LIST_PREFIX_BYTES && storage.scanLines) {
-			const scanLines = storage.scanLines.bind(storage);
+			let promptEntry: TurnEntry | undefined;
+			// The records the scan read while it looked for the prompt, in file order.
+			const scannedRecords: EntryPatchRecord[] = [];
+			let turn = false;
 			try {
-				// A full rewrite between two chunks fails the scan: scan again from the
-				// start, so the prompt and the reply it finds come from one body.
-				const found = await retryRacedRead(async (): Promise<{ prompt: string; turn: boolean }> => {
-					let prompt = "";
-					let turn = false;
-					await scanLines(file, line => {
-						const message = parseTurnLine(line);
-						if (message?.role === "assistant" && needTurn) {
-							turn = true;
-						} else if (message?.role === "user" && needPrompt && !prompt) {
-							// Cap at what a prompt read from the prefix could hold.
-							prompt = textContent(message.content, " ").slice(0, SESSION_LIST_PREFIX_BYTES);
-						}
-						return (!needPrompt || prompt !== "") && (!needTurn || turn);
-					});
-					return { prompt, turn };
+				await storage.scanLines(file, line => {
+					const record = needPrompt ? parseEntryPatchLine(line) : undefined;
+					if (record) {
+						scannedRecords.push(record);
+						return false;
+					}
+					const entry = parseTurnLine(line);
+					if (entry?.message.role === "assistant" && needTurn) {
+						turn = true;
+					} else if (
+						entry?.message.role === "user" &&
+						needPrompt &&
+						!promptEntry &&
+						textContent(entry.message.content, " ")
+					) {
+						promptEntry = entry;
+					}
+					return (!needPrompt || promptEntry !== undefined) && (!needTurn || turn);
 				});
-				if (found.turn) assistantTurns = 1;
-				if (found.prompt) {
-					firstMessage = found.prompt;
-					allMessages.unshift(found.prompt);
+			} catch (error) {
+				// A full rewrite raced the scan, which may have read two bodies: read the
+				// file again from a new stat (see scanSessionFile), or past the retries
+				// keep only the bounded-window evidence. A backend that fails otherwise
+				// keeps what the scan found before it failed.
+				if (error instanceof SessionReadConflictError) {
+					if (!options.lastPass) throw error;
+					promptEntry = undefined;
+					turn = false;
 				}
-			} catch {
-				// Backend unreadable, or raced past the retries: keep the bounded-window evidence.
+			}
+			if (turn) assistantTurns = 1;
+			if (promptEntry) {
+				// The records the scan read, then the tail's, in file order: a tail the scan reached repeats some, which changes nothing.
+				applyEntryPatches<object>([promptEntry, ...scannedRecords, ...tailRecords]);
+				// Cap at what a prompt read from the prefix could hold.
+				const prompt = textContent(promptEntry.message.content, " ").slice(0, SESSION_LIST_PREFIX_BYTES);
+				if (prompt) {
+					firstMessage = prompt;
+					allMessages.unshift(prompt);
+				}
 			}
 		}
 		firstMessage ||= extractFirstDisplayMessageFromPrefix(content) ?? "";
@@ -554,13 +656,15 @@ async function scanSessionFile(
 			size,
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
-			status: withStatus ? deriveSessionStatus(suffix) : undefined,
+			status: withStatus ? deriveSessionStatus(suffix, tailRecords) : undefined,
 		};
 		// The cache keeps its own shallow copy; hits also hand out copies, so
 		// callers can never mutate the shared cached object.
 		cache.set(cacheKey, { mtimeMs: stat.mtimeMs, size: stat.size, info: { ...info } });
 		return info;
-	} catch {
+	} catch (error) {
+		// A raced read runs the whole scan again from a new stat (see scanSessionFile).
+		if (error instanceof SessionReadConflictError) throw error;
 		return undefined;
 	}
 }
