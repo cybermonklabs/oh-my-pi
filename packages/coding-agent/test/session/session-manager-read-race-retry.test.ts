@@ -8,6 +8,7 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { ColdEntryStore } from "@oh-my-pi/pi-coding-agent/session/cold-entry-store";
+import { loadSessionFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { type ColdStoreStats, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	MemorySessionStorage,
@@ -32,6 +33,8 @@ class RacedStorage extends MemorySessionStorage {
 	passes = 0;
 	/** Called with each stream's 1-based pass number before the stream reads anything. */
 	onPass?: (pass: number) => void;
+	/** Error a raced stream throws after its first chunk; defaults to `SessionReadConflictError`. */
+	conflict?: (file: string) => Error;
 
 	constructor(readonly raced: (pass: number) => boolean) {
 		super();
@@ -42,7 +45,8 @@ class RacedStorage extends MemorySessionStorage {
 		this.onPass?.(pass);
 		const bytes = Buffer.from(super.readTextSync(path), "utf8").subarray(fromByte);
 		for (let start = 0; start < bytes.byteLength; start += MiB) {
-			if (start > 0 && this.raced(pass)) throw new SessionReadConflictError(path);
+			if (start > 0 && this.raced(pass))
+				throw this.conflict ? this.conflict(path) : new SessionReadConflictError(path);
 			yield bytes.subarray(start, start + MiB);
 		}
 	}
@@ -237,5 +241,39 @@ describe("a session manager's load that a full rewrite races", () => {
 			passes: 5,
 		});
 		await manager.close();
+	});
+});
+
+describe("a session file load that a delete races", () => {
+	it("reads the replacement from its start instead of returning the prefix read before ENOENT", async () => {
+		// If this regresses, an export or other read-only load of a long transcript
+		// deleted or replaced mid-read gets its first chunk's entries as the whole session.
+		const shortTranscript = (id: string): string =>
+			[
+				{ type: "session", version: 3, id, timestamp: TIMESTAMP },
+				{ type: "custom", id: `${id}-entry`, parentId: null, customType: "note", timestamp: TIMESTAMP },
+			]
+				.map(record => `${JSON.stringify(record)}\n`)
+				.join("") + "\n".repeat(8 * MiB);
+		const replacement = shortTranscript("replacement");
+		const { storage, wholeReads } = racedStorage(pass => pass === 1, shortTranscript("partial"));
+		storage.conflict = file => {
+			storage.writeTextSync(file, replacement);
+			return Object.assign(new Error("File removed mid-read"), { code: "ENOENT" });
+		};
+
+		const loaded = await loadSessionFile(FILE, storage);
+
+		expect({
+			ids: loaded.entries.map(entry => entry.id),
+			sourceSize: loaded.sourceSize,
+			passes: storage.passes,
+			wholeReads: wholeReads(),
+		}).toEqual({
+			ids: ["replacement", "replacement-entry"],
+			sourceSize: Buffer.byteLength(replacement),
+			passes: 2,
+			wholeReads: 0,
+		});
 	});
 });

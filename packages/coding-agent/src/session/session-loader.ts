@@ -41,7 +41,13 @@ import {
 } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { imageAt, isPersistenceTruncatedString, resolvedImageSiteOf } from "./session-persistence";
-import { defaultSessionStorage, FileSessionStorage, retryRacedRead, type SessionStorage } from "./session-storage";
+import {
+	defaultSessionStorage,
+	FileSessionStorage,
+	retryRacedRead,
+	SessionReadConflictError,
+	type SessionStorage,
+} from "./session-storage";
 import { enotdir } from "./session-storage-errors";
 import {
 	parseTitleSlotFromContent,
@@ -604,7 +610,12 @@ export function visitEntriesFromChunksSync(
 	return parser.titleSlot;
 }
 
-/** The ≥8MiB streaming load (works on any size), of `filePath` or of `options.chunks`. */
+/**
+ * The ≥8MiB streaming load (works on any size), of `filePath` or of `options.chunks`.
+ * ENOENT after bytes were read means a delete or replacement cut the read
+ * short: it raises `SessionReadConflictError`, which {@link loadSessionFile}
+ * answers by reading again from the start, never returning the prefix read.
+ */
 export async function loadEntriesFromFileStream(
 	filePath: string,
 	options?: Pick<LoadSessionOptions, "throwIfMissing" | "digest" | "storage"> &
@@ -614,24 +625,30 @@ export async function loadEntriesFromFileStream(
 	let malformedRecords = 0;
 	let bytesConsumed = 0;
 	const hasher = options?.digest ? new Bun.CryptoHasher(SNAPSHOT_DIGEST_ALGORITHM) : undefined;
-	const titleSlot = await visitEntriesFromFileStream(
-		filePath,
-		entry => {
-			entries.push(entry);
-		},
-		{
-			onMalformedRecord: () => {
-				malformedRecords++;
+	let titleSlot: SessionTitleUpdate | undefined;
+	try {
+		titleSlot = await visitEntriesFromFileStream(
+			filePath,
+			entry => {
+				entries.push(entry);
 			},
-			throwIfMissing: options?.throwIfMissing,
-			chunks: options?.chunks,
-			onChunk: chunk => {
-				bytesConsumed += chunk.byteLength;
-				hasher?.update(chunk);
+			{
+				onMalformedRecord: () => {
+					malformedRecords++;
+				},
+				throwIfMissing: true,
+				chunks: options?.chunks,
+				onChunk: chunk => {
+					bytesConsumed += chunk.byteLength;
+					hasher?.update(chunk);
+				},
+				storage: options?.storage,
 			},
-			storage: options?.storage,
-		},
-	);
+		);
+	} catch (err) {
+		if (bytesConsumed > 0 && isEnoent(err)) throw new SessionReadConflictError(filePath);
+		if (options?.throwIfMissing || !isEnoent(err)) throw err;
+	}
 	return {
 		entries,
 		titleSlot,
