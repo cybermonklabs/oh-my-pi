@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import type { FileEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
@@ -8,6 +8,8 @@ import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-st
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const TIMESTAMP = "2025-01-01T00:00:00.000Z";
+/** Text that puts a session past the 8 MiB from which a manager streams its transcript in. */
+const PAST_STREAM_THRESHOLD = "a".repeat(8 * 1024 * 1024);
 
 function header(id: string, version?: number): Record<string, unknown> {
 	return { type: "session", id, ...(version === undefined ? {} : { version }), timestamp: TIMESTAMP };
@@ -49,8 +51,8 @@ async function loadWhole(file: string): Promise<FileEntry[]> {
 }
 
 /** The session a manager streams in, migrating each line as it arrives: its header, then its entries. */
-async function loadStreamed(file: string): Promise<FileEntry[]> {
-	const manager = await SessionManager.open(file, undefined, new FileSessionStorage(), {
+async function loadStreamed(file: string, storage: FileSessionStorage): Promise<FileEntry[]> {
+	const manager = await SessionManager.open(file, undefined, storage, {
 		suppressBreadcrumb: true,
 		coldStore: false,
 	});
@@ -79,7 +81,13 @@ function shape(entries: readonly FileEntry[]): Record<string, unknown>[] {
 const message = (position: number, parent: number | null) => ({ type: "message", id: position, parentId: parent });
 
 describe("an old session migrates the same streamed in as loaded whole", () => {
-	const cases: { name: string; lines: Record<string, unknown>[]; expected: Record<string, unknown>[] }[] = [
+	const cases: {
+		name: string;
+		lines: Record<string, unknown>[];
+		expected: Record<string, unknown>[];
+		/** Whether the session is large enough that the manager streams it in; a smaller one it loads whole. */
+		streams?: true;
+	}[] = [
 		{
 			name: "a v1 compaction keeping an earlier entry keeps that entry's new id",
 			lines: [header("s1"), user("a"), user("b"), compaction(2), user("c")],
@@ -113,13 +121,14 @@ describe("an old session migrates the same streamed in as loaded whole", () => {
 		},
 		{
 			name: "a v1 compaction whose index names a later entry carrying an id keeps the id that entry has in the file",
-			lines: [header("s1"), user("a", "x1"), compaction(3, "x2"), user("b", "x3")],
+			lines: [header("s1"), user(PAST_STREAM_THRESHOLD, "x1"), compaction(3, "x2"), user("b", "x3")],
 			expected: [
 				{ type: "session", version: 3 },
 				message(1, null),
 				{ type: "compaction", id: 2, parentId: 1, firstKeptEntryId: "unknown x3" },
 				message(3, 2),
 			],
+			streams: true,
 		},
 		{
 			name: "a v1 compaction whose index names no entry keeps its firstKeptEntryId",
@@ -149,13 +158,18 @@ describe("an old session migrates the same streamed in as loaded whole", () => {
 		},
 	];
 
-	for (const { name, lines, expected } of cases) {
+	for (const { name, lines, expected, streams } of cases) {
 		it(name, async () => {
 			using dir = TempDir.createSync("@omp-streamed-migration-");
 			const file = await writeSession(dir.path(), lines);
+			const storage = new FileSessionStorage();
+			const chunkReads = spyOn(storage, "readChunks");
 			const whole = shape(await loadWhole(file));
-			const streamed = shape(await loadStreamed(file));
-			expect(streamed).toEqual(whole);
+			const streamed = shape(await loadStreamed(file, storage));
+			expect({ streamedIn: chunkReads.mock.calls.some(([read]) => read === file), streamed }).toEqual({
+				streamedIn: streams ?? false,
+				streamed: whole,
+			});
 			expect(whole).toEqual(expected);
 		});
 	}

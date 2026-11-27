@@ -39,6 +39,7 @@ import {
 	defaultSessionStorage,
 	FileSessionStorage,
 	retryRacedRead,
+	SessionReadConflictError,
 	type SessionStorage,
 	type SessionStorageStat,
 } from "../session/session-storage";
@@ -917,6 +918,26 @@ async function rolloutPatchRecords(
 	return records;
 }
 
+/**
+ * A read of the rollout at `rolloutPath` from its start, each chunk hashed
+ * into `read` (SHA-256) as it passes. With `sameAs`, the hex digest of an
+ * earlier read of it, a read of another body (a full write that landed
+ * between the two reads) throws {@link SessionReadConflictError} once its
+ * chunks run out, so the caller reads the rollout again from its start.
+ */
+async function* hashedRolloutRead(
+	rolloutPath: string,
+	storage: SessionStorage,
+	read: Bun.CryptoHasher,
+	sameAs?: string,
+): AsyncGenerator<Uint8Array> {
+	for await (const chunk of transcriptByteChunks(rolloutPath, storage)) {
+		read.update(chunk);
+		yield chunk;
+	}
+	if (sameAs !== undefined && read.digest("hex") !== sameAs) throw new SessionReadConflictError(rolloutPath);
+}
+
 /** Each stage-1 run writes the rollout's messages again: a deep one skips the `JSON.stringify` that would fail on it. */
 const STAGE1_MESSAGE_JSON = { probeDepth: true } as const;
 
@@ -999,12 +1020,13 @@ async function stage1Items(
  * (`session.storage: sql`, Redis, an SDK backend) is read in one more pass from its start, through
  * `readChunks` where it has it, keeping the head and the newest messages that fill the tail:
  * separate window reads could join the head of one body to the tail of another that a rewrite put
- * in its place, while a full rewrite between two chunks of one pass fails it, and the passes read
- * the rollout again from its start. Peak memory is bounded by the budgets plus a window, the
- * largest single JSONL record (a record spanning windows is carried until its newline) and the
- * records, not by rollout size (a storage without chunked reads holds the rollout's text once, for
- * both passes). The rollout is read through `storage`, where {@link collectThreads} found it (the
- * current session's).
+ * in its place. A full rewrite between two chunks of one pass fails it, and one between the two
+ * passes fails the second, which reads the whole rollout and compares its SHA-256 with the
+ * first's; the passes then read the rollout again from its start. Peak memory is bounded by the
+ * budgets plus a window, the largest single JSONL record (a record spanning windows is carried
+ * until its newline) and the records, not by rollout size (a storage without chunked reads holds
+ * the rollout's text once, for both passes). The rollout is read through `storage`, where
+ * {@link collectThreads} found it (the current session's).
  */
 export async function buildStage1RolloutItems(
 	rolloutPath: string,
@@ -1017,10 +1039,15 @@ export async function buildStage1RolloutItems(
 		if (tokenLimit <= 0) return "";
 		return retryRacedRead(async () => {
 			// Without chunked reads the text is read whole either way: once, for both passes.
-			const whole = storage.readChunks ? undefined : [new TextEncoder().encode(await storage.readText(rolloutPath))];
-			const chunks = () => whole ?? transcriptByteChunks(rolloutPath, storage);
-			const records = await rolloutPatchRecords(chunks());
-			return stage1Items(persistableMessagesFromChunks(chunks(), records), tokenLimit);
+			if (!storage.readChunks) {
+				const whole = [new TextEncoder().encode(await storage.readText(rolloutPath))];
+				return stage1Items(persistableMessagesFromChunks(whole, await rolloutPatchRecords(whole)), tokenLimit);
+			}
+			const first = new Bun.CryptoHasher("sha256");
+			const records = await rolloutPatchRecords(hashedRolloutRead(rolloutPath, storage, first));
+			// The message pass reads every chunk (no file tail ends it early), so its digest covers the whole body.
+			const messages = hashedRolloutRead(rolloutPath, storage, new Bun.CryptoHasher("sha256"), first.digest("hex"));
+			return stage1Items(persistableMessagesFromChunks(messages, records), tokenLimit);
 		});
 	}
 	const rollout = await openRolloutFile(rolloutPath);

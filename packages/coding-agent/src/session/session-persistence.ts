@@ -269,6 +269,50 @@ type PersistenceScan = "clean" | "dirty" | "deep";
  */
 const PERSISTENCE_SCAN_DEPTH = 1_000;
 
+/**
+ * What {@link persistenceScan} read on its way to the first field it did not
+ * find clean: the value of each field it read of each node on that path, from
+ * the outermost node, a node's own values ending with that field's. A node it
+ * finds clean takes its values back off, so a clean scan leaves this empty, and
+ * the stack is reused: a scan allocates nothing once it has grown.
+ */
+const scanValues: unknown[] = [];
+/** How many of {@link scanValues} each node on that path holds, innermost node first. */
+const scanCounts: number[] = [];
+
+/**
+ * What a scan read of a node it did not find clean and of the nodes on its
+ * path below it, for the rebuild of each to take instead of reading those
+ * fields again: a getter read again could answer otherwise than the value the
+ * scan checked, and a read per level reads a field deep in an entry once for
+ * each level above it.
+ */
+interface ScanReads {
+	readonly values: readonly unknown[];
+	/** How many of `values` each node on the path holds, outermost first. */
+	readonly counts: readonly number[];
+	/** The next of `values` and of `counts` a rebuild takes. */
+	value: number;
+	node: number;
+}
+
+/** {@link persistenceScan} of `value`, a node under `key`, from an empty trail (a scan a getter's throw ended leaves one). */
+function scanForRebuild(value: object, key?: string): PersistenceScan {
+	scanValues.length = 0;
+	scanCounts.length = 0;
+	return persistenceScan(value, key);
+}
+
+/** The trail the last {@link scanForRebuild} left, which found its value not clean, taken off the reused stacks. */
+function takeScanReads(): ScanReads {
+	return { values: scanValues.splice(0), counts: scanCounts.splice(0).reverse(), value: 0, node: 0 };
+}
+
+/** How many of the fields of the node a rebuild starts on the scan read, `0` off the scan's path. */
+function scannedFieldCount(reads: ScanReads | undefined): number {
+	return reads ? (reads.counts[reads.node++] ?? 0) : 0;
+}
+
 /** A session line holds a bigint (an extension hook can put one in an entry) as its decimal string. */
 const BIGINT_AS_STRING = { bigintAsString: true } as const;
 
@@ -287,32 +331,55 @@ function* persistSnapcompactArchive(
 	walk: PersistenceWalk,
 	depth: number,
 	scan: boolean,
+	reads?: ScanReads,
 ): NestedWalk<Record<string, unknown>> {
 	walk.path.enter(archive);
-	const source = archive.frames;
+	// The scan read the frames only (it stopped at them), or also the view and its archive (it stopped in that).
+	const scanned = scannedFieldCount(reads);
+	const source = scanned > 0 ? reads!.values[reads!.value++] : archive.frames;
 	let frames: unknown;
-	if (!isContainer(source)) frames = truncateLeaf(source, SNAPCOMPACT_FRAMES_KEY, walk.blobStore);
+	if (scanned > 1) frames = source;
+	else if (!isContainer(source)) frames = truncateLeaf(source, SNAPCOMPACT_FRAMES_KEY, walk.blobStore);
+	else if (scanned === 1) frames = yield truncateNode(source, SNAPCOMPACT_FRAMES_KEY, walk, depth + 1, scan, reads);
 	else {
 		const step = containerStep(source, SNAPCOMPACT_FRAMES_KEY, walk, depth + 1, scan);
 		frames = step === undefined ? source : yield step;
 	}
 	let persisted = frames === source ? archive : { ...archive, frames };
-	const view = archive.withoutThinking;
-	if (isRecord(view) && isRecord(view.archive)) {
-		const viewArchive = yield persistSnapcompactArchive(view.archive, walk, depth + 1, scan);
-		if (viewArchive !== view.archive)
-			persisted = { ...persisted, withoutThinking: { ...view, archive: viewArchive } };
+	const view = scanned > 1 ? reads!.values[reads!.value++] : archive.withoutThinking;
+	const viewArchive = !isRecord(view) ? undefined : scanned > 1 ? reads!.values[reads!.value++] : view.archive;
+	if (isRecord(view) && isRecord(viewArchive)) {
+		const next = yield persistSnapcompactArchive(viewArchive, walk, depth + 1, scan, scanned > 1 ? reads : undefined);
+		if (next !== viewArchive) persisted = { ...persisted, withoutThinking: { ...view, archive: next } };
 	}
 	walk.path.leave(archive);
 	return persisted;
 }
 
+/** {@link persistenceScan} of a snapcompact archive: its frames, then the archive of its view without reasoning. */
 function snapcompactArchiveScan(archive: Record<string, unknown>, depth: number): PersistenceScan {
-	if (depth >= PERSISTENCE_SCAN_DEPTH) return "deep";
-	const frames = persistenceScan(archive.frames, SNAPCOMPACT_FRAMES_KEY, depth + 1);
-	if (frames !== "clean") return frames;
+	if (depth >= PERSISTENCE_SCAN_DEPTH) {
+		scanCounts.push(0);
+		return "deep";
+	}
+	const mark = scanValues.length;
+	const source = archive.frames;
+	scanValues.push(source);
+	const frames = persistenceScan(source, SNAPCOMPACT_FRAMES_KEY, depth + 1);
+	if (frames !== "clean") {
+		scanCounts.push(1);
+		return frames;
+	}
 	const view = archive.withoutThinking;
-	return isRecord(view) && isRecord(view.archive) ? snapcompactArchiveScan(view.archive, depth + 1) : "clean";
+	const viewArchive = isRecord(view) ? view.archive : undefined;
+	scanValues.push(view, viewArchive);
+	const found = isRecord(viewArchive) ? snapcompactArchiveScan(viewArchive, depth + 1) : "clean";
+	if (found !== "clean") {
+		scanCounts.push(3);
+		return found;
+	}
+	scanValues.length = mark;
+	return "clean";
 }
 
 /**
@@ -326,10 +393,12 @@ function snapcompactArchiveScan(archive: Record<string, unknown>, depth: number)
  * A scan that allocates nothing first finds the common entry clean
  * ({@link persistenceScan}); only a value it finds dirty, or deeper than it
  * scans, is rebuilt ({@link truncateNode}), on an explicit stack, so a value
- * of any depth `JSON.parse` reads is persisted. A subtree the scan finds
- * deeper than it scans is rebuilt without a scan of any node in it, so it
- * costs one pass, not a scan per level. With `shape`, a rebuild past
- * {@link DEEP_JSON_LEVELS} levels sets `shape.deep`.
+ * of any depth `JSON.parse` reads is persisted. The rebuild takes the fields
+ * the scan read on its way from what the scan read ({@link ScanReads}), so
+ * each field is read once. A subtree the scan finds deeper than it scans is
+ * rebuilt without a scan of any node in it, so it costs one pass, not a scan
+ * per level. With `shape`, a rebuild past {@link DEEP_JSON_LEVELS} levels sets
+ * `shape.deep`.
  *
  * Runs in one synchronous tick so an OOM/SIGKILL landing right after a persist
  * call returns cannot lose the entry. Image externalization happens via the
@@ -338,10 +407,11 @@ function snapcompactArchiveScan(archive: Record<string, unknown>, depth: number)
  */
 function truncateForPersistence(value: unknown, blobStore: BlobStore, shape?: PersistedShape): unknown {
 	if (!isContainer(value)) return truncateLeaf(value, undefined, blobStore);
-	const found = Array.isArray(value) ? "dirty" : persistenceScan(value);
+	const found = Array.isArray(value) ? "dirty" : scanForRebuild(value);
 	if (found === "clean") return value;
+	const reads = Array.isArray(value) ? undefined : takeScanReads();
 	const walk: PersistenceWalk = { blobStore, path: new ContainerPath(), deepest: 0 };
-	const persisted = runNested(truncateNode(value, undefined, walk, 0, found === "dirty"));
+	const persisted = runNested(truncateNode(value, undefined, walk, 0, found === "dirty", reads));
 	if (shape && walk.deepest > DEEP_JSON_LEVELS) shape.deep = true;
 	return persisted;
 }
@@ -368,7 +438,9 @@ function truncateLeaf(value: unknown, key: string | undefined, blobStore: BlobSt
  * it, or `obj` itself when nothing in it changes. Each child that is an object
  * is a nested step ({@link runNested}) unless {@link containerStep} keeps it;
  * `scan` false (a scan found `obj` deeper than it scans) rebuilds every child
- * without scanning it.
+ * without scanning it. `reads`, when a scan that found `obj` not clean read
+ * fields of it, holds them: the rebuild keeps those it found clean as read and
+ * goes on down the scan's path from the one it stopped at.
  */
 function* truncateNode(
 	obj: object,
@@ -376,7 +448,9 @@ function* truncateNode(
 	walk: PersistenceWalk,
 	depth: number,
 	scan: boolean,
+	reads?: ScanReads,
 ): NestedWalk {
+	let scanned = scannedFieldCount(reads);
 	if (depth > walk.deepest) walk.deepest = depth;
 	const image = externalizeImageNode(obj, walk.blobStore, key);
 	if (image !== undefined) return image;
@@ -431,14 +505,18 @@ function* truncateNode(
 
 	walk.path.enter(obj);
 	// Each field and element is read once and kept as read: a getter read again for the rebuilt copy could
-	// answer differently from the value the walk checked.
+	// answer differently from the value the walk checked. The ones the scan read come from the scan: those
+	// before the last it read it found clean, and the last is where its path goes on.
 	if (Array.isArray(obj)) {
 		const result: unknown[] = [];
 		let changed = false;
 		for (let i = 0; i < obj.length; i++) {
-			const item: unknown = obj[i];
+			const fromScan = scanned-- > 0;
+			const item: unknown = fromScan ? reads!.values[reads!.value++] : obj[i];
 			let next: unknown;
-			if (!isContainer(item)) next = truncateLeaf(item, key, walk.blobStore);
+			if (fromScan && scanned > 0) next = item;
+			else if (!isContainer(item)) next = truncateLeaf(item, key, walk.blobStore);
+			else if (fromScan) next = yield truncateNode(item, key, walk, depth + 1, scan, reads);
 			else {
 				const step = containerStep(item, key, walk, depth + 1, scan);
 				next = step === undefined ? item : yield step;
@@ -455,17 +533,21 @@ function* truncateNode(
 	let changed = false;
 	for (const childKey in holder) {
 		if (!Object.hasOwn(holder, childKey)) continue;
-		const value = holder[childKey];
 		// Strip transient/redundant properties that shouldn't be persisted.
 		// - jsonlEvents: raw subprocess streaming events (already saved to artifact files)
+		// A scan stops at an object that holds it before it reads any field, so the field is never read.
 		if (childKey === "jsonlEvents") {
 			changed = true;
 			continue;
 		}
+		const fromScan = scanned-- > 0;
+		const value = fromScan ? reads!.values[reads!.value++] : holder[childKey];
 		let next: unknown;
-		if (isSnapcompactArchiveSlot(key, childKey, value))
-			next = yield persistSnapcompactArchive(value, walk, depth + 1, scan);
+		if (fromScan && scanned > 0) next = value;
+		else if (isSnapcompactArchiveSlot(key, childKey, value))
+			next = yield persistSnapcompactArchive(value, walk, depth + 1, scan, fromScan ? reads : undefined);
 		else if (!isContainer(value)) next = truncateLeaf(value, childKey, walk.blobStore);
+		else if (fromScan) next = yield truncateNode(value, childKey, walk, depth + 1, scan, reads);
 		else {
 			const step = containerStep(value, childKey, walk, depth + 1, scan);
 			next = step === undefined ? value : yield step;
@@ -505,8 +587,8 @@ function containerStep(
 	scan: boolean,
 ): NestedWalk | undefined {
 	if (!scan || depth >= PERSISTENCE_SCAN_DEPTH) return truncateNode(value, key, walk, depth, false);
-	const found = persistenceScan(value, key);
-	return found === "clean" ? undefined : truncateNode(value, key, walk, depth, found === "dirty");
+	const found = scanForRebuild(value, key);
+	return found === "clean" ? undefined : truncateNode(value, key, walk, depth, found === "dirty", takeScanReads());
 }
 
 /**
@@ -543,27 +625,47 @@ function persistenceScan(obj: unknown, key?: string, depth = 0): PersistenceScan
 		return externalizedImageSite(obj, key) !== undefined ? "dirty" : "clean";
 	}
 	if (typeof obj !== "object") return "clean";
-	if (depth >= PERSISTENCE_SCAN_DEPTH) return "deep";
+	if (depth >= PERSISTENCE_SCAN_DEPTH) {
+		scanCounts.push(0);
+		return "deep";
+	}
+	// What this node's fields hold stays on the trail while a field is not clean (see scanValues).
+	const mark = scanValues.length;
+	let read = 0;
 	if (Array.isArray(obj)) {
 		for (const item of obj) {
+			scanValues.push(item);
+			read++;
 			const found = persistenceScan(item, key, depth + 1);
-			if (found !== "clean") return found;
+			if (found !== "clean") {
+				scanCounts.push(read);
+				return found;
+			}
 		}
+		scanValues.length = mark;
 		return "clean";
 	}
-	if ("jsonlEvents" in obj) return "dirty";
-	// Externalize shapes rewrite (not verbatim): check before the
-	// atomic/verbatim classification below.
-	if (externalizedImageSite(obj, key) !== undefined) return "dirty";
+	if ("jsonlEvents" in obj || externalizedImageSite(obj, key) !== undefined) {
+		// Externalize shapes rewrite (not verbatim): check before the
+		// atomic/verbatim classification below.
+		scanCounts.push(0);
+		return "dirty";
+	}
 	if (isAtomicPersistenceNode(obj, key)) return "clean";
 	for (const childKey in obj) {
 		if (!Object.hasOwn(obj, childKey)) continue;
 		const value = (obj as Record<string, unknown>)[childKey];
+		scanValues.push(value);
+		read++;
 		const found = isSnapcompactArchiveSlot(key, childKey, value)
 			? snapcompactArchiveScan(value, depth + 1)
 			: persistenceScan(value, childKey, depth + 1);
-		if (found !== "clean") return found;
+		if (found !== "clean") {
+			scanCounts.push(read);
+			return found;
+		}
 	}
+	scanValues.length = mark;
 	return "clean";
 }
 

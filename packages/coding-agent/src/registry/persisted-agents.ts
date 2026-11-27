@@ -2,8 +2,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import { type EntryPatchContent, entryPatchesOf, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
 import { ADVISOR_TRANSCRIPT_FILENAME, isAdvisorTranscriptName } from "../advisor/transcript-recorder";
 import { resolveExplicitModelRole } from "../config/model-resolver";
+import { assistantTurnContent } from "../session/entry-patches";
 import { assistantTurnProducedOutput } from "../session/messages";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, PREWALK_MODEL_CHANGE_ROLE } from "../session/session-entries";
 import { readSessionHeaderId, visitEntriesFromFileStream } from "../session/session-loader";
@@ -198,6 +200,8 @@ interface AssistantMetrics {
 	cost: number;
 	contextTokens?: number;
 	resolvedModel?: string;
+	/** The turn's stop reason, which with its content decides {@link served}. */
+	stopReason: unknown;
 	/**
 	 * True when this turn produced output, making its model the run's. Uses the
 	 * same predicate as the live session, so replaying a transcript reaches the
@@ -209,20 +213,32 @@ interface AssistantMetrics {
 function assistantMetrics(message: Record<string, unknown>): AssistantMetrics {
 	const usage = recordOf(message.usage) ?? {};
 	const cost = recordOf(usage.cost);
-	const content = Array.isArray(message.content) ? message.content : [];
 	const provider = typeof message.provider === "string" ? message.provider : undefined;
 	const model = typeof message.model === "string" ? message.model : undefined;
-	return {
+	const metrics: AssistantMetrics = {
 		tokens: usageTokens(usage),
-		tools: content.filter(part => recordOf(part)?.type === "toolCall").length,
+		tools: 0,
 		cost: finiteNumber(cost?.total),
 		contextTokens: finiteNumber(usage.totalTokens) || undefined,
 		resolvedModel: provider && model ? `${provider}/${model}` : undefined,
-		served: assistantTurnProducedOutput({
-			stopReason: message.stopReason,
-			content,
-		} as Pick<AssistantMessage, "stopReason" | "content">),
+		stopReason: message.stopReason,
+		served: false,
 	};
+	setAssistantContent(metrics, message.content);
+	return metrics;
+}
+
+/**
+ * Set the tool count and the output verdict of `metrics` from `content`: the
+ * turn's content as its line holds it, or as an `entry_patch` record set it.
+ */
+function setAssistantContent(metrics: AssistantMetrics, content: unknown): void {
+	const blocks = Array.isArray(content) ? content : [];
+	metrics.tools = blocks.filter(part => recordOf(part)?.type === "toolCall").length;
+	metrics.served = assistantTurnProducedOutput({
+		stopReason: metrics.stopReason,
+		content: blocks,
+	} as Pick<AssistantMessage, "stopReason" | "content">);
 }
 
 /**
@@ -259,6 +275,8 @@ async function readPersistedAgentHistory(
 	const parents = new Map<string, string | undefined>();
 	const assistantById = new Map<string, AssistantMetrics>();
 	const modelChangeById = new Map<string, { model: string; role?: string; resolvedModelIsFallback: boolean }>();
+	// The content an `entry_patch` record set on a turn read after it, by the turn's id; the later record wins.
+	const contentBeforeTurn = new Map<string, EntryPatchContent>();
 	// Raw-record copy of `sessionEntryLeafId`/`resolveSessionLeafId` (session-entries.ts); keep them in sync.
 	let leafId: string | undefined;
 	let selfSelectedLeafId: string | undefined;
@@ -271,6 +289,7 @@ async function readPersistedAgentHistory(
 			parents.clear();
 			assistantById.clear();
 			modelChangeById.clear();
+			contentBeforeTurn.clear();
 			leafId = undefined;
 			selfSelectedLeafId = undefined;
 			leafTimestamp = undefined;
@@ -311,10 +330,27 @@ async function readPersistedAgentHistory(
 						});
 						return;
 					}
+					if (isEntryPatchRecord(record)) {
+						// A record that sets a turn's content sets its tool calls, and whether it produced output.
+						for (const patch of entryPatchesOf(record) ?? []) {
+							const content = assistantTurnContent(patch);
+							if (content === undefined) continue;
+							const assistant = assistantById.get(patch.entryId);
+							if (assistant) setAssistantContent(assistant, content);
+							// A record may come before the turn it names.
+							else if (!parents.has(patch.entryId)) contentBeforeTurn.set(patch.entryId, content);
+						}
+						return;
+					}
 					if (record.type !== "message") return;
 					const message = recordOf(record.message);
 					if (message?.role === "assistant") {
 						const assistant = assistantMetrics(message);
+						const patched = contentBeforeTurn.get(id);
+						if (patched !== undefined) {
+							contentBeforeTurn.delete(id);
+							setAssistantContent(assistant, patched);
+						}
 						assistantById.set(id, assistant);
 						directCost += assistant.cost;
 					}

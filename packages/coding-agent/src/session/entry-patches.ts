@@ -24,26 +24,30 @@
  *   records among them to the entries it holds.
  * - Memory extraction reads the rollout's records first, then its messages
  *   with them applied, so the extraction model gets an elide pass's
- *   placeholders.
+ *   placeholders; a storage it reads in chunks must give both reads one body.
  * - Readers of windows apply each window's records to its entries (the RPC
  *   subagent transcript, whose entries keep the records for a client that
  *   holds earlier windows) and to entries of earlier windows: the Agent Hub
  *   transcript viewer, local or over a collab host's replies, through an
- *   `EntryPatchReplay`, and Agent Activity, which shows a patched response's
- *   placeholder.
+ *   `EntryPatchReplay`, and Agent Activity, which shows the rows a patched
+ *   turn's content yields ({@link assistantTurnContent}).
+ * - The Agent Hub's history of a parked agent counts the tool calls, and
+ *   finds the turn that produced output, of each turn's patched content.
  * - The session picker applies the records its prefix and tail windows hold
- *   to the entries its prefix holds; a record between the windows is not
- *   read, so a long session whose first prompt an elide pass shortened can
- *   still preview it in full.
+ *   to the entries its prefix holds and to the last turn its status reads,
+ *   and, with the records its line scan read, to the prompt that scan finds;
+ *   a record between the windows past what the scan reads is not read, so a
+ *   long session whose first prompt an elide pass shortened can still preview
+ *   it in full.
  * - `omp gc --strip` strips replay data from a record's patched content as
  *   from the message's own line.
  *
  * The raw loaders (`loadSessionFile`, `loadEntriesFromFile`,
  * `visitEntriesFromFileStream`) return the records unapplied, among the
  * entries; so do `get_entries`, `get_tree` and the RPC window's raw `entries`.
- * Readers of other fields (header and title reads, entry ids, usage and cost,
- * tool-call counts) need no record. Binaries older than the record show the
- * fields as first written.
+ * Readers of other fields (header and title reads, entry ids, usage and cost)
+ * need no record. Binaries older than the record show the fields as first
+ * written.
  *
  * A later full rewrite writes every patched field inline and writes each
  * record with no patches ({@link withoutEntryPatches}), so a field that a
@@ -60,8 +64,10 @@ import type { AssistantRetryRecovery, ContextSnapshot, Message } from "@oh-my-pi
 import { cloneJsonTree, logger } from "@oh-my-pi/pi-utils";
 import {
 	applyEntryPatches as applyPatchRecords,
+	entryAcceptsPatch,
 	type EntryFieldsPatch as StoredEntryFieldsPatch,
 	type EntryPatch as StoredEntryPatch,
+	type EntryPatchContent,
 	type EntryPatchHooks,
 	type EntryPatchSkip,
 	type EntryPatchTargets as StoredEntryPatchTargets,
@@ -212,6 +218,20 @@ export function setPatchedFields(entry: SessionEntry, patch: EntryPatch): void {
  */
 export function applyEntryPatches(entries: readonly FileEntry[], targets?: EntryPatchTargets): boolean {
 	return applyPatchRecords(entries, { ...SESSION_ENTRY_PATCH_HOOKS, targets });
+}
+
+/** What a patch of an assistant turn is checked against: the turn's kind and role. */
+const ASSISTANT_TURN = { type: "message", message: { role: "assistant" } };
+
+/**
+ * The `content` `patch` sets on the assistant turn it names, or `undefined`
+ * when it sets none or names a field an assistant turn lacks: for a reader
+ * that keeps only what it derived from a turn's content (its tool calls, the
+ * rows it shows) and sets that again from a record.
+ */
+export function assistantTurnContent(patch: StoredEntryPatch): EntryPatchContent | undefined {
+	const content = patch.message?.content;
+	return content !== undefined && entryAcceptsPatch(ASSISTANT_TURN, patch) ? content : undefined;
 }
 
 /** `data` of an `entry_patch` record that sets no field. */

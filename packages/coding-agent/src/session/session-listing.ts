@@ -180,9 +180,10 @@ export function sessionDisplayName(info: SessionInfo): string {
  * Derive a {@link SessionStatus} from a tail window of a session file. Entries are
  * newline-terminated on write, so within the window only the first line can be a
  * partial fragment — it simply fails to parse and is skipped. We walk backwards to
- * the last `message` entry and classify by its role / stop reason.
+ * the last `message` entry and classify by its role / stop reason, with the
+ * fields `records` (the window's `entry_patch` records, in file order) set on it.
  */
-function deriveSessionStatus(suffix: string): SessionStatus {
+function deriveSessionStatus(suffix: string, records: readonly EntryPatchRecord[]): SessionStatus {
 	if (!suffix) return "unknown";
 	const lines = suffix.split("\n");
 	for (let i = lines.length - 1; i >= 0; i--) {
@@ -198,6 +199,8 @@ function deriveSessionStatus(suffix: string): SessionStatus {
 			continue;
 		}
 		if (entry.type === "message" && entry.message) {
+			// A record that sets the turn's content decides whether it ends in tool calls.
+			if (records.length > 0) applyEntryPatches<object>([entry, ...records]);
 			return statusFromTailMessage(entry.message);
 		}
 	}
@@ -317,14 +320,20 @@ function countAssistantMarkers(content: string): number {
 	return countRoleMarkers(content, "assistant");
 }
 
+/** A `message` entry whose message is a user or assistant turn, as its line holds it. */
+interface TurnEntry {
+	type: "message";
+	message: Message;
+}
+
 /**
- * The message of a complete `message` record line when it is a user or
+ * The entry of a complete `message` record line when it is a user or
  * assistant turn. JSON escapes quotes inside strings, so a bare `"user"` or
  * `"assistant"` can only be a key or value: lines without either skip the
  * parse, and large non-turn records (memory recall, tool results) cost one
  * substring scan. Malformed or partial lines return undefined.
  */
-function parseTurnLine(line: string): Message | undefined {
+function parseTurnLine(line: string): TurnEntry | undefined {
 	if (!line.includes('"user"') && !line.includes('"assistant"')) return undefined;
 	let record: { type?: unknown; message?: Message };
 	try {
@@ -334,25 +343,28 @@ function parseTurnLine(line: string): Message | undefined {
 	}
 	if (record.type !== "message") return undefined;
 	const role = record.message?.role;
-	return role === "user" || role === "assistant" ? record.message : undefined;
+	return role === "user" || role === "assistant" ? (record as TurnEntry) : undefined;
 }
 
-/**
- * The `entry_patch` records among the complete lines of `text`, a window of a
- * session file, in file order. Only lines that name the record's type are parsed.
- */
+/** The `entry_patch` record of a complete line; only a line that names the record's type is parsed. */
+function parseEntryPatchLine(line: string): EntryPatchRecord | undefined {
+	if (!line.includes(ENTRY_PATCH_CUSTOM_TYPE)) return undefined;
+	let value: unknown;
+	try {
+		value = JSON.parse(line);
+	} catch {
+		return undefined;
+	}
+	return isRecord(value) && isEntryPatchRecord(value) ? value : undefined;
+}
+
+/** The `entry_patch` records among the complete lines of `text`, a window of a session file, in file order. */
 function entryPatchRecordsIn(text: string): EntryPatchRecord[] {
 	const records: EntryPatchRecord[] = [];
 	if (!text.includes(ENTRY_PATCH_CUSTOM_TYPE)) return records;
 	for (const line of text.split("\n")) {
-		if (!line.includes(ENTRY_PATCH_CUSTOM_TYPE)) continue;
-		let value: unknown;
-		try {
-			value = JSON.parse(line);
-		} catch {
-			continue;
-		}
-		if (isRecord(value) && isEntryPatchRecord(value)) records.push(value);
+		const record = parseEntryPatchLine(line);
+		if (record) records.push(record);
 	}
 	return records;
 }
@@ -465,9 +477,10 @@ function getSessionListWorkerCount(fileCount: number): number {
  * rewrite between two chunks of that pass fails it: the scan then runs again
  * from a new stat, so every field of the result, and the stat it is cached
  * under, come from one body. The `entry_patch` records the two windows hold
- * apply to the prefix's entries, so a prompt an elide pass shortened previews
- * and searches as the placeholder; a record between the windows, or past what
- * the fallback pass reads, is not read.
+ * apply to the prefix's entries and to the last turn the status reads, and,
+ * with the records the fallback pass read, to the prompt it finds, so a prompt
+ * an elide pass shortened previews and searches as the placeholder; a record
+ * between the windows past what the fallback pass reads is not read.
  */
 async function scanSessionFile(
 	file: string,
@@ -573,18 +586,29 @@ async function scanSessionFileOnce(
 		const needPrompt = !firstMessage;
 		const needTurn = assistantTurns === 0;
 		if ((needPrompt || needTurn) && size > SESSION_LIST_PREFIX_BYTES && storage.scanLines) {
-			let prompt = "";
+			let promptEntry: TurnEntry | undefined;
+			// The records the scan read while it looked for the prompt, in file order.
+			const scannedRecords: EntryPatchRecord[] = [];
 			let turn = false;
 			try {
 				await storage.scanLines(file, line => {
-					const message = parseTurnLine(line);
-					if (message?.role === "assistant" && needTurn) {
-						turn = true;
-					} else if (message?.role === "user" && needPrompt && !prompt) {
-						// Cap at what a prompt read from the prefix could hold.
-						prompt = textContent(message.content, " ").slice(0, SESSION_LIST_PREFIX_BYTES);
+					const record = needPrompt ? parseEntryPatchLine(line) : undefined;
+					if (record) {
+						scannedRecords.push(record);
+						return false;
 					}
-					return (!needPrompt || prompt !== "") && (!needTurn || turn);
+					const entry = parseTurnLine(line);
+					if (entry?.message.role === "assistant" && needTurn) {
+						turn = true;
+					} else if (
+						entry?.message.role === "user" &&
+						needPrompt &&
+						!promptEntry &&
+						textContent(entry.message.content, " ")
+					) {
+						promptEntry = entry;
+					}
+					return (!needPrompt || promptEntry !== undefined) && (!needTurn || turn);
 				});
 			} catch (error) {
 				// A full rewrite raced the scan, which may have read two bodies: read the
@@ -593,14 +617,20 @@ async function scanSessionFileOnce(
 				// keeps what the scan found before it failed.
 				if (error instanceof SessionReadConflictError) {
 					if (!options.lastPass) throw error;
-					prompt = "";
+					promptEntry = undefined;
 					turn = false;
 				}
 			}
 			if (turn) assistantTurns = 1;
-			if (prompt) {
-				firstMessage = prompt;
-				allMessages.unshift(prompt);
+			if (promptEntry) {
+				// The records the scan read, then the tail's, in file order: a tail the scan reached repeats some, which changes nothing.
+				applyEntryPatches<object>([promptEntry, ...scannedRecords, ...tailRecords]);
+				// Cap at what a prompt read from the prefix could hold.
+				const prompt = textContent(promptEntry.message.content, " ").slice(0, SESSION_LIST_PREFIX_BYTES);
+				if (prompt) {
+					firstMessage = prompt;
+					allMessages.unshift(prompt);
+				}
 			}
 		}
 		firstMessage ||= extractFirstDisplayMessageFromPrefix(content) ?? "";
@@ -619,7 +649,7 @@ async function scanSessionFileOnce(
 			size,
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
-			status: withStatus ? deriveSessionStatus(suffix) : undefined,
+			status: withStatus ? deriveSessionStatus(suffix, tailRecords) : undefined,
 		};
 		// The cache keeps its own shallow copy; hits also hand out copies, so
 		// callers can never mutate the shared cached object.

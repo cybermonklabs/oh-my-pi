@@ -16,6 +16,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { buildStage1RolloutItems } from "@oh-my-pi/pi-coding-agent/memories";
 import { agentTranscriptSource } from "@oh-my-pi/pi-coding-agent/modes/agent-hub-runtime";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { listSessions } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { loadSessionMessagesReadOnly } from "@oh-my-pi/pi-coding-agent/session/session-loader";
@@ -184,6 +185,94 @@ describe("entry patch records and the readers that project a session file", () =
 		expect(shown(fromPatched)).toEqual(shown(fromInline));
 	});
 
+	// The picker marks a session by its last turn: a turn that ends in tool calls it never ran was
+	// cut off. Without the record it reads the tool call the record took out of that turn and lists a
+	// finished session as interrupted.
+	it("lists the status of a last turn a record changed, as a session with the change inline does", async () => {
+		using dir = TempDir.createSync("@omp-patch-projections-");
+		const call = assistant([{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } }]);
+		const patchedDir = path.join(dir.path(), "patched");
+		const inlineDir = path.join(dir.path(), "inline");
+		await writeTranscript(path.join(patchedDir, "session.jsonl"), [
+			header("status-patched"),
+			message("u1", null, user("go")),
+			message("a1", "u1", call),
+			patchRecord("p1", "a1", [{ entryId: "a1", message: { content: [{ type: "text", text: PLACEHOLDER }] } }]),
+		]);
+		await writeTranscript(path.join(inlineDir, "session.jsonl"), [
+			header("status-inline"),
+			message("u1", null, user("go")),
+			message("a1", "u1", assistant([{ type: "text", text: PLACEHOLDER }])),
+		]);
+		const storage = new FileSessionStorage();
+		const [fromPatched] = await listSessions(patchedDir, storage);
+		const [fromInline] = await listSessions(inlineDir, storage);
+		expect(fromPatched?.status).toBe("complete");
+		expect(fromPatched?.status).toBe(fromInline?.status);
+	});
+
+	// A first prompt behind a large leading entry is found only by the picker's line scan. Without
+	// the records it read, or those of its tail window, the picker previews and searches the text an
+	// elide pass replaced.
+	it("previews a prompt only the line scan finds as the placeholder a record set, as a session with it inline does", async () => {
+		using dir = TempDir.createSync("@omp-patch-projections-");
+		// Past the 4 KiB prefix the picker reads, so the prompt is not in it.
+		const pad = {
+			type: "custom",
+			customType: "pad",
+			id: "pad",
+			parentId: null,
+			timestamp: TIMESTAMP,
+			data: "p".repeat(8_192),
+		};
+		// Past the 32 KiB tail window, and no turn: the window holds no record, so the scan reads on to the reply.
+		const filler = Array.from({ length: 5 }, (_, n) => ({
+			type: "custom",
+			customType: "pad",
+			id: `filler${n}`,
+			parentId: n === 0 ? "a1" : `filler${n - 1}`,
+			timestamp: TIMESTAMP,
+			data: "f".repeat(8_192),
+		}));
+		const record = patchRecord("p1", "u1", [{ entryId: "u1", message: { content: PLACEHOLDER } }]);
+		const reply = message("a1", "u1", assistant([{ type: "text", text: "done" }]));
+		const layouts = {
+			// The record is in the tail window, after the reply the scan stops at.
+			"in the tail window": (prompt: string, withRecord: boolean) => [
+				header("scan"),
+				pad,
+				message("u1", null, user(prompt)),
+				reply,
+				...(withRecord ? [record] : []),
+			],
+			// The record is between the prompt and the reply, which the scan reads on to.
+			"among the lines the scan reads": (prompt: string, withRecord: boolean) => [
+				header("scan"),
+				pad,
+				message("u1", null, user(prompt)),
+				...(withRecord ? [record] : []),
+				reply,
+				...filler,
+			],
+		};
+		const storage = new FileSessionStorage();
+		for (const [where, layout] of Object.entries(layouts)) {
+			const shown = async (name: string, prompt: string, withRecord: boolean) => {
+				const sessionDir = path.join(dir.path(), name);
+				await writeTranscript(path.join(sessionDir, "session.jsonl"), layout(prompt, withRecord));
+				const [info] = await listSessions(sessionDir, storage);
+				return {
+					where,
+					firstMessage: info?.firstMessage,
+					searchHasHeavy: info?.allMessagesText.includes("HEAVYMARK"),
+				};
+			};
+			const fromPatched = await shown(`${where}-patched`, HEAVY, true);
+			expect(fromPatched).toEqual({ where, firstMessage: PLACEHOLDER, searchHasHeavy: false });
+			expect(fromPatched).toEqual(await shown(`${where}-inline`, PLACEHOLDER, false));
+		}
+	});
+
 	// Agent Activity reads a growing transcript in windows: a record appended after
 	// it showed a response must replace the text that response showed.
 	it("shows a response an elide pass shortened after it was read as its placeholder, as a transcript with it inline does", async () => {
@@ -209,6 +298,119 @@ describe("entry patch records and the readers that project a session file", () =
 		const summaries = (activity: AgentActivityIndex) => activity.query().map(row => row.summary);
 		expect(summaries(patchedActivity)).toEqual([PLACEHOLDER]);
 		expect(summaries(patchedActivity)).toEqual(summaries(inlineActivity));
+	});
+
+	// A record can set a turn's content to other tool calls, and give text to a turn that had none.
+	// Agent Activity shows a response row for a turn's text and a tool row for each of its tool calls:
+	// without the record it keeps the rows of the content the turn was first written with, and shows
+	// no row for the text and the tool call the record gave it.
+	it("shows the rows of a turn's content a record set after it was read, as a transcript with it inline does", async () => {
+		using dir = TempDir.createSync("@omp-patch-projections-");
+		const written = assistant(
+			[
+				{ type: "thinking", thinking: "reasoning" },
+				{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: HEAVY } },
+				{ type: "toolCall", id: "call_2", name: "bash", arguments: { command: "ls" } },
+			],
+			{ stopReason: "toolUse" },
+		);
+		const patchedContent = [
+			{ type: "text", text: PLACEHOLDER },
+			{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ELIDEDMARK command" } },
+			{ type: "toolCall", id: "call_3", name: "bash", arguments: { command: "pwd" } },
+		];
+		const results = [
+			message("t1", "a1", bashResult("call_1", "out")),
+			message("t2", "t1", bashResult("call_2", "out")),
+			message("t3", "t2", bashResult("call_3", "out")),
+		];
+		const patched = await writeTranscript(path.join(dir.path(), "patched.jsonl"), [
+			message("a1", null, written),
+			...results,
+		]);
+		const inline = await writeTranscript(path.join(dir.path(), "inline.jsonl"), [
+			message("a1", null, { ...written, content: patchedContent }),
+			...results,
+		]);
+		const patchedActivity = new AgentActivityIndex();
+		await patchedActivity.sync(AGENT_ID, patched);
+		await Bun.write(
+			patched,
+			jsonl([
+				message("a1", null, written),
+				...results,
+				patchRecord("p1", "t3", [{ entryId: "a1", message: { content: patchedContent } }]),
+			]),
+		);
+		await patchedActivity.sync(AGENT_ID, patched);
+		const inlineActivity = new AgentActivityIndex();
+		await inlineActivity.sync(AGENT_ID, inline);
+		const rows = (activity: AgentActivityIndex) =>
+			activity.query().map(row => ({ kind: row.kind, title: row.title, summary: row.summary, status: row.status }));
+		expect(rows(patchedActivity)).toEqual([
+			{ kind: "response", title: "Response", summary: PLACEHOLDER, status: "success" },
+			{ kind: "tool", title: "bash", summary: "ELIDEDMARK command", status: "success" },
+			{ kind: "tool", title: "bash", summary: "pwd", status: "success" },
+		]);
+		expect(rows(patchedActivity)).toEqual(rows(inlineActivity));
+	});
+
+	// The Agent Hub's row for a parked agent counts the tool calls of its turns and credits the run
+	// to the model of the newest turn that produced output. Without the records it counts a tool call
+	// a record took out of a turn, and credits the run to a turn a record, here one written before
+	// that turn, left without output.
+	it("counts the tool calls and credits the model of turns a record changed, as a transcript with them inline does", async () => {
+		using dir = TempDir.createSync("@omp-patch-projections-");
+		const fallback = { provider: "openai-codex", model: "gpt-5.6-sol" } as const;
+		const modelChange = (id: string, parentId: string, model: string, role: string, isFallback: boolean) => ({
+			type: "model_change",
+			id,
+			parentId,
+			timestamp: TIMESTAMP,
+			model,
+			role,
+			resolvedModelIsFallback: isFallback,
+		});
+		const head = [
+			header(AGENT_ID),
+			modelChange("m1", AGENT_ID, "anthropic/claude-sonnet-4-5", "task", false),
+			{ type: "session_init", id: "si", parentId: "m1", timestamp: TIMESTAMP, agent: "task", task: "do the task" },
+		];
+		const read = { type: "toolCall", id: "t1", name: "read", arguments: { path: "a.ts" } } as const;
+		const shortened: AssistantMessage["content"] = [{ type: "text", text: PLACEHOLDER }, read];
+		const noOutput: AssistantMessage["content"] = [{ type: "text", text: "  " }];
+		const history = async (name: string, turns: readonly object[]) => {
+			const root = path.join(dir.path(), name);
+			await Bun.write(path.join(root, "main.jsonl"), "");
+			await writeTranscript(path.join(root, "main", `${AGENT_ID}.jsonl`), [...head, ...turns]);
+			const registry = new AgentRegistry();
+			await registerPersistedSubagents(registry, path.join(root, "main.jsonl"));
+			const summary = registry.get(AGENT_ID)?.history;
+			return { tools: summary?.metrics?.tools, resolvedModel: summary?.resolvedModel };
+		};
+		const fromPatched = await history("patched", [
+			message(
+				"a1",
+				"si",
+				assistant([
+					{ type: "text", text: HEAVY },
+					read,
+					{ type: "toolCall", id: "t2", name: "read", arguments: {} },
+				]),
+			),
+			modelChange("m2", "a1", "openai-codex/gpt-5.6-sol", "fallback", true),
+			patchRecord("p0", "m2", [{ entryId: "a2", message: { content: noOutput } }]),
+			message("a2", "m2", assistant([{ type: "text", text: "partial answer" }], fallback)),
+			patchRecord("p1", "a2", [{ entryId: "a1", message: { content: shortened } }]),
+		]);
+		expect(fromPatched).toEqual({ tools: 1, resolvedModel: "anthropic/claude-sonnet-4-5" });
+		expect(fromPatched).toEqual(
+			await history("inline", [
+				message("a1", "si", assistant(shortened)),
+				modelChange("m2", "a1", "openai-codex/gpt-5.6-sol", "fallback", true),
+				message("a2", "m2", assistant(noOutput, fallback)),
+			]),
+		);
 	});
 
 	// `omp gc --strip` removes replay data from old turns. A record that sets an old
@@ -445,6 +647,16 @@ describe("entry patch records and the Agent Hub transcript viewer", () => {
 	// A collab guest reads the host's transcript in replies of at most 4 MiB.
 	it("shows an answer a record in a later host reply shortened as its placeholder, as a transcript with it inline does", async () => {
 		const fromPatched = await renderRemote(transcript(HEAVY, [record, reply]));
+		expect(fromPatched).toEqual({ heavy: false, placeholder: true, nextStep: true });
+		expect(fromPatched).toEqual(await renderRemote(transcript(PLACEHOLDER, [reply])));
+	});
+
+	// A record may come before the entry it names: a guest that applied a reply's records only to
+	// the entries it had read shows the heavy text when the answer arrives in the next reply.
+	it("shows an answer a record in an earlier host reply shortened as its placeholder, as a transcript with it inline does", async () => {
+		const first = jsonl([header(AGENT_ID), message("u1", null, user("do the task")), record]);
+		const rest = jsonl([message("a1", "u1", assistant([{ type: "text", text: HEAVY }])), reply]);
+		const fromPatched = await renderRemote({ content: Buffer.from(first + rest), cut: Buffer.byteLength(first) });
 		expect(fromPatched).toEqual({ heavy: false, placeholder: true, nextStep: true });
 		expect(fromPatched).toEqual(await renderRemote(transcript(PLACEHOLDER, [reply])));
 	});
