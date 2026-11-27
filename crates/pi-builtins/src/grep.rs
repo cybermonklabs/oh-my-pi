@@ -824,7 +824,7 @@ fn build_matcher(
 			.iter()
 			.map(|pattern| {
 				bre::check_brackets(pattern, ignore_case)?;
-				bre::bre_to_ere(pattern, bre::Backrefs::Unsupported)
+				bre::bre_to_ere(pattern, bre::Backrefs::Unsupported, bre::LoneBrace::Literal)
 					.map(|ere| alpha_by_locale(ere.into(), utf8).into_owned())
 			})
 			.collect::<Result<_, _>>()
@@ -834,30 +834,18 @@ fn build_matcher(
 		return Ok((Engine::Rust(matcher), build_longest(prints_matches, compiled, cli, ignore_case)));
 	}
 
-	// A `{` that opens no interval is a literal to GNU and BSD grep, but the
-	// `regex` crate refuses the whole pattern, so `grep -E '{a}'` failed on
-	// patterns real grep matches. An attempted-but-unterminated interval
-	// stays an error in both. A bracket expression GNU refuses is refused
-	// first.
+	// The `regex` crate reads an ERE's repetition otherwise than GNU grep: it
+	// refuses `{a}`, `a{,2}` and `*x`, and reads `a+?` as a lazy `+`. The
+	// translation reads each as GNU does, and a bracket expression GNU
+	// refuses is refused first.
 	let patterns = patterns
 		.iter()
 		.map(|pattern| {
-			bre::check_brackets(pattern, ignore_case).map(|()| bre::ere_literalize_braces(pattern))
+			bre::check_brackets(pattern, ignore_case)?;
+			bre::ere_to_rust(pattern).map(|ere| alpha_by_locale(ere, utf8))
 		})
 		.collect::<Result<Vec<_>, _>>()
-		.map_err(|e| e.message().to_owned())?;
-
-	// `regex` accepts `^+` and compiles it as `(?:^)+`, which matches at every
-	// line start. GNU and BSD grep both reject the pattern, so returning every
-	// line with exit 0 would be a wrong answer reported as success.
-	if let Some(bad) = patterns
-		.iter()
-		.find(|pattern| bre::ere_repetition_operand_missing(pattern))
-	{
-		return Err(format!("repetition-operator operand invalid: {bad}"));
-	}
-	let patterns: Vec<std::borrow::Cow<'_, str>> =
-		patterns.into_iter().map(|pattern| alpha_by_locale(pattern, utf8)).collect();
+		.map_err(|e: bre::BreError| e.message().to_owned())?;
 
 	builder
 		.build_many(&patterns)
@@ -3299,7 +3287,9 @@ mod tests {
 		let (code, out, err) = run(&["-A", "1", "fail)"], "ok\n(1 fail)\nnext\n").await;
 		assert_eq!(code, 0, "{err}");
 		assert_eq!(out, "(1 fail)\nnext\n");
-		let (code, _, err) = run(&["-E", "fail)"], "fail)\n").await;
+		// An ERE group that never closes is refused; a `)` that closes none is
+		// text to GNU grep.
+		let (code, _, err) = run(&["-E", "(fail"], "(fail\n").await;
 		assert_eq!(code, 2);
 		assert!(err.contains("grep:"));
 		// In a BRE a bare `+` is a LITERAL, so `fo+` does not match `foooo`.
@@ -3338,7 +3328,7 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
-	async fn repetition_with_no_operand_is_literal_in_bre_and_invalid_in_ere() {
+	async fn repetition_with_no_operand_is_literal_in_bre_and_skipped_in_ere() {
 		// Measured against GNU/BSD grep 2.6.0 on the same fixture. Before
 		// this, every BRE row below returned 5 - the whole file - because
 		// `^+` reached the engine as an operator and compiled to `(?:^)+`,
@@ -3359,27 +3349,31 @@ mod tests {
 			assert_eq!(out, want, "pattern {pattern}");
 		}
 
-		// ERE rejects it outright, as the real grep does, rather than
-		// silently accepting a repeated anchor. The anchor breaks adjacency
-		// to an earlier atom too: `a^+` repeats `^`, not `a`.
-		for pattern in ["^+", "a^+", "a$*"] {
-			let (code, _, err) = run(&["-Ec", pattern], input).await;
-			assert_eq!(code, 2, "-E {pattern:?} must be rejected");
-			assert!(err.contains("grep:"), "{pattern}: {err}");
+		// An ERE skips it, as GNU grep does with a warning, and after an
+		// anchor it repeats the anchor, as GNU's dfa reads it: `a^+` can
+		// never match, and `a$*` is `a` anywhere.
+		for (pattern, expected) in [("^+", (0, "5\n")), ("a^+", (1, "0\n")), ("a$*", (0, "3\n"))] {
+			let (code, out, err) = run(&["-Ec", pattern], input).await;
+			assert_eq!((code, out.as_str()), expected, "-E {pattern}: {err}");
 		}
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
-	async fn no_operand_brace_interval_is_rejected_through_grep() {
-		// Covered here rather than only in the translator, because the failure
-		// mode was invisible at that level: `^\{2\}` translated to `^{2}`,
-		// which `grep-regex` ACCEPTS as `(?:^){2}` and matches at every line
-		// start, so the whole file came back with exit 0.
+	async fn a_brace_with_nothing_to_repeat_is_text_in_a_bre() {
+		// GNU grep reads a `\{` with nothing to repeat as text. It cannot be
+		// emitted as an operator: `^\{2\}` translated to `^{2}`, which
+		// `grep-regex` ACCEPTS as `(?:^){2}` and matches at every line start,
+		// so the whole file came back with exit 0.
 		let input = "alpha\n+added\n-removed\n context\n+another\n";
-		for pattern in [r"^\{2\}", r"^\{1,4\}", r"\{1,4\}", r"\(\{2\}\)", r"a\|\{2\}"] {
-			let (code, out, err) = run(&["-c", pattern], input).await;
-			assert_eq!(code, 2, "{pattern} must be rejected, got {out:?}");
-			assert!(err.contains("repetition-operator operand invalid"), "{pattern}: {err}");
+		for (pattern, stdin, expected) in [
+			(r"^\{2\}", input, (1, "0\n")),
+			(r"^\{1,4\}", input, (1, "0\n")),
+			(r"\(\{2\}\)", input, (1, "0\n")),
+			(r"a\|\{2\}", input, (0, "3\n")),
+			(r"\{1,4\}", "alpha\n{1,4}\n", (0, "1\n")),
+		] {
+			let (code, out, err) = run(&["-c", pattern], stdin).await;
+			assert_eq!((code, out.as_str()), expected, "{pattern}: {err}");
 		}
 		// With an operand it is an ordinary quantifier and still works.
 		let (code, out, err) = run(&["-c", r"a\{1,2\}"], input).await;
@@ -3508,15 +3502,13 @@ mod tests {
 			assert_eq!(out, want, "-E {pattern}");
 		}
 
-		// The two brace patterns real grep REFUSES must stay refused. A `{`
-		// followed by a digit is an attempted interval: unterminated, it is
-		// "braces not balanced", and with no operand it is "repetition-operator
-		// operand invalid". Escaping those would convert a diagnosed mistake
-		// into a silent literal match.
-		for pattern in ["a{1,2", "{1}"] {
-			let (code, out, _) = run(&["-Ec", pattern], input).await;
-			assert_eq!(code, 2, "-E {pattern} must stay an error, got {out:?}");
-		}
+		// GNU's ERE reads an interval the pattern ends inside of as text too,
+		// and at the start of the pattern it skips the `{` of an interval
+		// and prints the rest for -o.
+		let (code, out, err) = run(&["-Ec", "a{1,2"], input).await;
+		assert_eq!((code, out.as_str()), (1, "0\n"), "{err}");
+		let (code, out, err) = run(&["-Eo", "{1}"], input).await;
+		assert_eq!((code, out.as_str()), (0, "1}\n"), "{err}");
 	}
 }
 
