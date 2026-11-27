@@ -3,9 +3,9 @@
  *
  * `id TEXT PRIMARY KEY` on a rowid table admits NULL, and a database rebuilt by SQLite's `.recover`
  * can hold such a row. By id the trim could not remove one, because `id NOT IN (keep set)` is NULL,
- * never true, for the row itself; and when such a row was inside the keep set, the subquery returned
- * a NULL, which made the test NULL for every other row too, so one damaged row stopped the trim for
- * the whole session and working memory grew past its limit.
+ * never true, for the row itself. While such a row was among the newest `workingMemoryLimit` rows,
+ * the keep set held a NULL, which made the test NULL for every other row too, so the overflow half
+ * trimmed nothing until newer writes pushed the row out of that window.
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
@@ -108,8 +108,8 @@ describe("working-memory trim with a row that has no id", () => {
 	});
 
 	it("still trims the oldest rows when a row with no id is inside the newest N", () => {
-		// The damaging case: by id, one such row in the keep set made the whole anti-join NULL, so
-		// nothing was trimmed at any later write and working memory grew without bound.
+		// By id, one such row in the keep set made the whole anti-join NULL, so this write trimmed
+		// nothing and five rows stayed under a limit of two.
 		const state = makeState(2);
 		for (const id of ["wm-1", "wm-2", "wm-3"]) addMemory(state, id, hoursAgo(2));
 		addRecoveredRow(state, RECOVERED_ROWID, hoursAgo(0));

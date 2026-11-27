@@ -235,13 +235,15 @@ function purgeWorkingMemoryArtifacts(db: BeamMemoryState["db"], ids: readonly st
  *
  * The trim addresses each row by its rowid, never by `id`. `id TEXT PRIMARY KEY`
  * on a rowid table admits NULL, and a database rebuilt by SQLite's `.recover` can
- * hold such a row. By id, one of them stopped this trim: `id NOT IN (keep set)` is
- * NULL, never true, for the row itself, and once the row is inside the keep set the
- * subquery returns a NULL, which makes the test NULL for every other row too, so
- * nothing at all is trimmed and working memory grows past its limit. The rowid of a
- * rowid table is never NULL, and it is read and bound as decimal text because it is a
- * signed 64-bit integer that a JS number would round past 2^53. Only text ids go to
- * `purgeWorkingMemoryArtifacts`, which keys every artifact by the memory id.
+ * hold such a row. By id, `id NOT IN (keep set)` is NULL, never true, for that row,
+ * so it was never trimmed. While the row was among the newest `workingMemoryLimit`
+ * rows, the keep set held a NULL and the test was NULL for every other row as well,
+ * so the overflow half trimmed nothing until enough newer writes pushed the row out,
+ * and never again if its timestamp sorted above every later write. Rows past the TTL
+ * were still removed. The rowid of a rowid table is never NULL, and it is read and
+ * bound as decimal text because it is a signed 64-bit integer that a JS number would
+ * round past 2^53. Only text ids go to `purgeWorkingMemoryArtifacts`, which keys every
+ * artifact by the memory id.
  */
 function trimWorkingMemory(beam: BeamMemoryState): void {
 	const limit = beam.config.workingMemoryLimit;
