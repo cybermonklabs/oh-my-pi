@@ -14,7 +14,10 @@
   sc.py clippy-baseline LOG CRATE DIR      one crate's findings as clippy-baseline.txt lines (to regenerate it)
   sc.py platforms PC OUT                   one result per platform from platform-checks' pc-report under PC
   sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout, its verdict line also to $SC_VERDICT;
-                                           a row SC_ROWS does not name reads NOT RUN; exit 1 unless every row that ran passed
+                                           a row SC_ROWS does not name reads NOT RUN; exit 0 when every row that ran
+                                           passed, 1 when it found a fault, else 2 when a row (or the summary) could not be read
+  sc.py unreadable-pass SUMMARY VERDICT WHY   a passing summary's report that could not be written (WHY): the verdict
+                                           file and SUMMARY read UNKNOWN, and the new exit line on stdout
   sc.py skip-forms TREE NOT_MARKERS        each print of TREE/crates that says skip is read or named (JSON)
   sc.py skip-lines RESULTS NOT_MARKERS     each skip line a passing test printed is read or named (JSON)
   sc.py flaky-failed RESULT KNOWN          the failed tests of one result with a `flaky: ` entry, one a line
@@ -41,7 +44,8 @@ with no JUnit report or no summary line, a command the time bound or a signal en
 whose exit is neither 0 nor 101 or whose control was not caught, a platform the platform report
 gives no verdict for, a memory bench that did not build, did not end on its own or printed no
 target line, and a unit the plan expects that no job reported, or that two jobs reported,
-are UNKNOWN, and so is every row they belong to. A test that passed after printing a skip marker
+are UNKNOWN, and so is every row they belong to unless another unit of it failed (a fault outranks
+a unit that could not be read). A test that passed after printing a skip marker
 compared nothing: it is counted apart, named, and its unit is UNKNOWN, unless each of its skip
 lines is a sub-case that partial-skips.txt lets that test skip and the entry's witness line is in
 its output (then it passes and is listed as partial), it passed as the other user, or
@@ -171,6 +175,9 @@ RUST_JOBS = (
 )
 # The names the dispatch input `rows` takes, one per row of the summary.
 ROW_KEYS = tuple(k for _, k in ROWS) + tuple(k for _, k in RUST_JOBS)
+# The summary's exit for its verdict: a run that could not look (UNKNOWN) never exits with the code
+# of one that found a fault (FAIL), and a fault outranks a row that could not be read.
+SUMMARY_EXIT = {"PASS": 0, "FAIL": 1, "UNKNOWN": 2}
 # sami-checks.yml, whose jobs' `needs:` the plan reads (the plan job checks out .github/workflows too).
 WORKFLOW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "sami-checks.yml")
 # The jobs every run has: the plan, and the summary that reads every other job.
@@ -1499,6 +1506,10 @@ def summary_rows():
 
 
 def cmd_summary(results_dir, build_dir, known_path=None):
+    # A known-failure list the caller names and that is not there is a list the summary could not
+    # read: without it every known failure would read NEW, and no stale entry could be listed.
+    if known_path is not None and not os.path.isfile(known_path):
+        sys.exit(f"::error::the known-failure list {known_path} is not a file, so no failure could be read as known")
     known = read_known(known_path)
     skips = read_known_skips(known_path)
 
@@ -1568,10 +1579,14 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                  "platform checks gave its platform no verdict, when cargo fmt listed no target root or rustfmt could "
                  "not read a file, when rustfmt's places could not be sorted by its run at the upstream base, or when "
                  "no job (or more than one) reported it; its "
-                 "row is then UNKNOWN too. A test whose only skip lines are sub-cases the partial-skip list names for "
+                 "row is then UNKNOWN too, unless another of its units failed: a failure outranks a unit that could not "
+                 "be read. A test whose only skip lines are sub-cases the partial-skip list names for "
                  "it, with that entry's witness line in its output, passes and is listed as partial. A self-skip the "
                  "known-failure list names (`skips: `, for that row and user) reads KNOWN; a failure with a `flaky: ` "
-                 "entry reads KNOWN only when a retry of the test in the same job passed.")
+                 "entry reads KNOWN only when a retry of the test in the same job passed. The summary exits 0 when "
+                 "every row that ran passed, 1 when it found a fault (a row failed, a known-failure entry is to be "
+                 "removed, or the run is planted), and 2 when a row is UNKNOWN and it found no fault: 2 says that "
+                 "the run could not look, not that it found something.")
     lines.append("")
     lines.append("| Row | Verdict | Units: pass / known / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
@@ -1625,7 +1640,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             details.append(f"- **{title}**: UNKNOWN: {notes[key]}")
         else:
             n = {s: sum(1 for r in rs if r["status"] == s) for s in ("PASS", "KNOWN", "FAIL", "UNKNOWN")}
-            verdict = ("UNKNOWN" if n["UNKNOWN"] or not rs else "FAIL" if n["FAIL"] else "KNOWN" if n["KNOWN"] else "PASS")
+            verdict = ("FAIL" if n["FAIL"] else "UNKNOWN" if n["UNKNOWN"] or not rs else "KNOWN" if n["KNOWN"] else "PASS")
             counts = f"{n['PASS']} / {n['KNOWN']} / {n['FAIL']} / {n['UNKNOWN']}"
         tp = sum(r["passed"] for r in rs)
         tf = sum(r["failed"] for r in rs)
@@ -1773,7 +1788,9 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     # line that a reader can parse: the step summary's line here, and the file SC_VERDICT names, which
     # sami-checks.yml gives as the summary job's output `verdict`, a notice and sc-report's verdict.json.
     # A planted run is a control, so it fails whether or not its control caught the plant (plant_caught
-    # says which). A subset run says so: only a run of every row is a pass of the cut checks.
+    # says which). A subset run says so: only a run of every row is a pass of the cut checks. A fault
+    # outranks a row that could not be read: FAIL, then UNKNOWN, then PASS, and the exit says which
+    # (SUMMARY_EXIT), so that a run that could not look never exits as one that found a fault.
     not_run = [k for k in ROW_KEYS if k not in run_rows]
     shown = [v for v in row_verdicts.values() if v != "NOT RUN"]
     verdict = "FAIL" if "FAIL" in shown or stale or plant else "UNKNOWN" if "UNKNOWN" in shown else "PASS"
@@ -1782,17 +1799,109 @@ def cmd_summary(results_dir, build_dir, known_path=None):
               "rows": {k: row_verdicts[k] for k in ROW_KEYS if k in row_verdicts},
               "plant": plant or None, "plant_caught": caught}
     line = json.dumps(record, separators=(",", ":"))
+    title_of = {k: t for t, k in ROWS + RUST_JOBS}
+
+    def named(v):
+        return ", ".join(f"{title_of[k]} (`{k}`)" for k in ROW_KEYS if row_verdicts.get(k) == v)
+
+    # The verdict is reached here. A verdict file or a summary that cannot be written does not undo a
+    # fault the summary found (still FAIL, 1), and a pass that nobody can read is no pass (UNKNOWN, 2).
+    unwritten = ""
+    if os.environ.get("SC_VERDICT"):
+        try:
+            with open(os.environ["SC_VERDICT"], "w", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            unwritten = f"the verdict file {os.environ['SC_VERDICT']} could not be written ({e})"
+            if verdict == "PASS":
+                verdict = record["verdict"] = "UNKNOWN"
+                line = json.dumps(record, separators=(",", ":"))
+            print(f"::error title=sami-checks summary::{'UNKNOWN: ' if verdict == 'UNKNOWN' else ''}{unwritten}; "
+                  f"the summary exits {SUMMARY_EXIT[verdict]}", file=sys.stderr)
+    code = SUMMARY_EXIT[verdict]
+    if verdict == "PASS":
+        said = "every row that ran passed (a KNOWN row, whose only failures are on the known-failure list, passes)."
+    elif verdict == "FAIL":
+        found = ([f"these rows read FAIL: {named('FAIL')}"] if "FAIL" in shown else []) \
+            + ([f"{len(stale)} known-failure entr{'y is' if len(stale) == 1 else 'ies are'} to be removed"] if stale else []) \
+            + (["the run is planted, and a planted run is a control, which always fails"] if plant else [])
+        said = "it found a fault: " + "; ".join(found) + "." + (
+            f" These rows could not be read either and read UNKNOWN: {named('UNKNOWN')}. A fault outranks a row that "
+            "could not be read, so the exit is 1, not 2." if "UNKNOWN" in shown else "")
+    elif "UNKNOWN" in shown:
+        said = (f"it found no fault, but these rows could not be read and read UNKNOWN: {named('UNKNOWN')}. This run did "
+                "not look at everything it was to check; each reason is in the list below. 2 is not the failure code.")
+    else:
+        said = f"every row that ran passed, but {unwritten}, so no reader can see this pass. 2 is not the failure code."
+    top[:0] = [f"**Exit {code} ({verdict})**: {said}", ""]
     if not_run:
         top += [f"**A subset of the rows**: {len(run_rows)} of {len(ROW_KEYS)} rows ran ({', '.join(record['rows_run'])}); "
                 f"the other {len(not_run)} read NOT RUN. The verdict covers only the rows that ran: this run is no pass "
                 "of the cut checks, which only a run of every row gives (the push of release-candidate, or a dispatch "
                 "with rows=all).", ""]
     lines[2:2] = [f"sami-checks verdict: `{line}`", ""] + top
-    if os.environ.get("SC_VERDICT"):
-        with open(os.environ["SC_VERDICT"], "w", encoding="utf-8") as f:
+    try:
+        print("\n".join(lines))
+        sys.stdout.flush()
+    except OSError as e:
+        if verdict == "PASS":
+            verdict = record["verdict"] = "UNKNOWN"
+            if os.environ.get("SC_VERDICT") and not unwritten:
+                try:
+                    with open(os.environ["SC_VERDICT"], "w", encoding="utf-8") as f:
+                        f.write(json.dumps(record, separators=(",", ":")) + "\n")
+                except OSError:
+                    pass
+        code = SUMMARY_EXIT[verdict]
+        print(f"::error title=sami-checks summary::{'UNKNOWN: ' if verdict == 'UNKNOWN' else ''}the summary could not be "
+              f"written ({e}), so the verdict reads {verdict}; the summary exits {code}", file=sys.stderr)
+    return code
+
+
+def summary_main(args):
+    """`sc.py summary`: cmd_summary's exit. A summary that stops before its verdict (an input it
+    cannot read, a result that does not parse, a fault of its own) judged no row: it says so on
+    stderr and exits 2, so that 1 always means a fault it found."""
+    try:
+        return cmd_summary(*args)
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            print(e.code, file=sys.stderr)
+        why = e.code if isinstance(e.code, str) else f"it exited {e.code}"
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        why = f"{type(e).__name__}: {e}"
+    print(f"::error title=sami-checks summary::UNKNOWN: the summary stopped before its verdict ({why}), so it judged no row",
+          file=sys.stderr)
+    return SUMMARY_EXIT["UNKNOWN"]
+
+
+def cmd_unreadable_pass(summary_md, verdict_path, why):
+    """A summary that passed, but part of whose report could not be written after it (sami-checks.yml's
+    Summary step: the step summary, the job's output, results.json): no reader can rely on that pass,
+    so, as cmd_summary does for its own outputs, the verdict file and summary.md read UNKNOWN. Prints
+    the new exit line. A file it cannot rewrite is left as it is; the step still ends 2."""
+    said = f"**Exit 2 (UNKNOWN)**: every row that ran passed, but {why}, so no reader can see this pass. 2 is not the failure code."
+    line = None
+    try:
+        record = json.load(open(verdict_path, encoding="utf-8"))
+        if record.get("verdict") == "PASS":
+            record["verdict"] = "UNKNOWN"
+        line = json.dumps(record, separators=(",", ":"))
+        with open(verdict_path, "w", encoding="utf-8") as f:
             f.write(line + "\n")
-    print("\n".join(lines))
-    return 0 if verdict == "PASS" else 1
+    except (OSError, ValueError, AttributeError) as e:
+        print(f"::error title=sami-checks summary::the verdict file {verdict_path} could not be made UNKNOWN ({e})", file=sys.stderr)
+    try:
+        lines = open(summary_md, encoding="utf-8").read().split("\n")
+        lines = [said if ln.startswith("**Exit 0 (PASS)**") else
+                 f"sami-checks verdict: `{line}`" if line and ln.startswith("sami-checks verdict: ") else ln for ln in lines]
+        with open(summary_md, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+    except OSError as e:
+        print(f"::error title=sami-checks summary::{summary_md} could not be made UNKNOWN ({e})", file=sys.stderr)
+    print(said)
 
 
 def selftest():
@@ -2455,15 +2564,16 @@ def selftest():
     known_file = os.path.join(d, "known.txt")
     open(known_file, "w").write("# none\n")
 
-    def summary(rust="rust_test=success rust_test_macos=success"):
-        """cmd_summary on res, with rust as SC_RUST_TESTS (as sami-checks.yml always passes it), or without it for None."""
+    def summary(rust="rust_test=success rust_test_macos=success", cli=False):
+        """cmd_summary on res, with rust as SC_RUST_TESTS (as sami-checks.yml always passes it), or without it for None;
+        with cli, as `sc.py summary` runs it (summary_main)."""
         kept = os.environ.pop("SC_RUST_TESTS", None)
         if rust is not None:
             os.environ["SC_RUST_TESTS"] = rust
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                rc = cmd_summary(res, build, known_file)
+                rc = summary_main([res, build, known_file]) if cli else cmd_summary(res, build, known_file)
         finally:
             os.environ.pop("SC_RUST_TESTS", None)
             if kept is not None:
@@ -2471,7 +2581,7 @@ def selftest():
         return rc, buf.getvalue()
 
     rc, out = summary()
-    check("summary exit with a silent unit", rc, 1)
+    check("summary exit with a silent unit", rc, 2)
     check("summary names the silent unit UNKNOWN", "`pi-shell::zle_pty` (root): UNKNOWN: no result" in out, True)
     check("summary row of the silent unit", "| pi-shell set (root) | **UNKNOWN** | 1 / 0 / 0 / 1 |" in out, True)
     check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 / 0 |" in out, True)
@@ -2494,10 +2604,199 @@ def selftest():
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1), open(os.path.join(res, name), "w"))
     rc, _ = summary()
     check("summary exit when every unit passed", rc, 0)
+    # The summary's exit (SUMMARY_EXIT), each case planted on the passing results above: a row that
+    # failed exits 1; a row that could not be read, with no fault, exits 2, never 1; both together exit
+    # 1, also as two units of one row, which then reads FAIL; every row passing exits 0. Its first
+    # line under the verdict says which, and why, naming the rows.
+    set_a, set_b = sorted(k for k in paths if k[0] == "set-runner")
+    ck = next(k for k in paths if k[0] == "checkts")
+    passing = {k: open(paths[k]).read() for k in (set_a, set_b, ck)}
+    set_title, ck_title = (next(t for t, k in ROWS if k == key) for key in ("set-runner", "checkts"))
+
+    def planted_unit(k, s):
+        return result(*k, s, 101 if s == "FAIL" else 124, 1, failed=int(s == "FAIL"), failures=["planted::fault"] if s == "FAIL" else [],
+                      note="" if s == "FAIL" else "planted: it could not be read")
+
+    def planted_exit(planted, cli=False):
+        """(the exit, the summary's exit line, the summary) with planted {unit: FAIL or UNKNOWN}."""
+        for k, text in passing.items():
+            open(paths[k], "w").write(text)
+        for k, s in planted.items():
+            json.dump(planted_unit(k, s), open(paths[k], "w"))
+        rc, out = summary(cli=cli)
+        return rc, next((ln for ln in out.splitlines() if ln.startswith("**Exit ")), None), out
+
+    rc, ln, out = planted_exit({set_a: "FAIL"})
+    check("summary exit: a row that failed exits 1", (rc, ln),
+          (1, f"**Exit 1 (FAIL)**: it found a fault: these rows read FAIL: {set_title} (`set-runner`)."))
+    rc, ln, out = planted_exit({ck: "UNKNOWN"})
+    check("summary exit: a row that could not be read, and no fault, exits 2", (rc, ln),
+          (2, f"**Exit 2 (UNKNOWN)**: it found no fault, but these rows could not be read and read UNKNOWN: {ck_title} "
+              "(`checkts`). This run did not look at everything it was to check; each reason is in the list below. "
+              "2 is not the failure code."))
+    rc, ln, out = planted_exit({set_a: "FAIL", ck: "UNKNOWN"})
+    check("summary exit: a row that failed and a row that could not be read exit 1", (rc, ln),
+          (1, f"**Exit 1 (FAIL)**: it found a fault: these rows read FAIL: {set_title} (`set-runner`). These rows could "
+              f"not be read either and read UNKNOWN: {ck_title} (`checkts`). A fault outranks a row that could not be "
+              "read, so the exit is 1, not 2."))
+    rc, ln, out = planted_exit({set_a: "FAIL", set_b: "UNKNOWN"})
+    check("summary exit: a unit that failed beside one that could not be read: the row reads FAIL, exit 1",
+          (rc, f"| {set_title} | **FAIL** | 0 / 0 / 1 / 1 |" in out,
+           f"`{set_b[1]}` (runner): UNKNOWN: planted: it could not be read" in out),
+          (1, True, True))
+    rc, ln, out = planted_exit({})
+    check("summary exit: every row passed exits 0", (rc, ln),
+          (0, "**Exit 0 (PASS)**: every row that ran passed (a KNOWN row, whose only failures are on the known-failure "
+              "list, passes)."))
+    # A summary that stops before its verdict judged no row: `sc.py summary` (summary_main) exits 2,
+    # and says so, for a known-failure list it cannot read and for a result with no row.
+
+    def stopped(results, known):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = summary_main([results, build, known])
+        return rc, "UNKNOWN: the summary stopped before its verdict" in err.getvalue(), err.getvalue()
+
+    bad_known = os.path.join(d, "bad-known.txt")
+    open(bad_known, "w").write("set-runner\trunner\tpi-shell\n")
+    rc, said, err = stopped(res, bad_known)
+    check("summary exit: a known-failure list it cannot read exits 2", (rc, said, "not five tab-separated fields" in err),
+          (2, True, True))
+    no_row = os.path.join(d, "res-no-row")
+    os.makedirs(no_row)
+    json.dump({"reason": "compiler-message"}, open(os.path.join(no_row, "cargo.json"), "w"))
+    rc, said, err = stopped(no_row, known_file)
+    check("summary exit: a result with no row exits 2", (rc, said, "KeyError: 'row'" in err), (2, True, True))
+    rc, said, err = stopped(res, os.path.join(d, "no-such-known.txt"))
+    check("summary exit: a known-failure list that is not there exits 2", (rc, said, "is not a file" in err), (2, True, True))
+    # A summary that cannot write its verdict file, or its summary, keeps a fault it found at FAIL (1)
+    # and turns a pass into UNKNOWN (2): a pass that nobody can read is no pass.
+    @contextlib.contextmanager
+    def environ(**kv):
+        kept = {k: os.environ.get(k) for k in kv}
+        os.environ.update(kv)
+        try:
+            yield
+        finally:
+            for k, v in kept.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    unwritable = os.path.join(d, "verdict-is-a-directory")
+    os.makedirs(unwritable)
+    with environ(SC_VERDICT=unwritable), contextlib.redirect_stderr(io.StringIO()) as err:
+        rc_fail, ln_fail, _ = planted_exit({set_a: "FAIL"}, cli=True)
+        rc_pass, ln_pass, out_pass = planted_exit({}, cli=True)
+    check("summary exit: a fault whose verdict file cannot be written still exits 1",
+          (rc_fail, (ln_fail or "").startswith("**Exit 1 (FAIL)**")), (1, True))
+    check("summary exit: a pass whose verdict file cannot be written reads UNKNOWN and exits 2",
+          (rc_pass, (ln_pass or "").startswith("**Exit 2 (UNKNOWN)**: every row that ran passed, but the verdict file"),
+           '"verdict":"UNKNOWN"' in out_pass, "UNKNOWN: the verdict file" in err.getvalue()), (2, True, True, True))
+
+    class Full(io.StringIO):
+        """A stdout that cannot be written (as /dev/full)."""
+        def write(self, s):
+            raise OSError(28, "No space left on device")
+
+    full_verdict = os.path.join(d, "verdict-of-a-full-stdout.json")
+    full = {}
+    for name, planted in (("fail", {set_a: "FAIL"}), ("pass", {})):
+        planted_exit(planted)
+        with environ(SC_VERDICT=full_verdict, SC_RUST_TESTS="rust_test=success rust_test_macos=success"), \
+                contextlib.redirect_stdout(Full()), contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                rc = cmd_summary(res, build, known_file)
+            except OSError as e:
+                rc = f"raised {e}"
+        full[name] = (rc, json.load(open(full_verdict))["verdict"], "the summary could not be written" in err.getvalue())
+    check("summary exit: a summary that cannot be written keeps a fault at 1 and turns a pass into UNKNOWN, 2",
+          full, {"fail": (1, "FAIL", True), "pass": (2, "UNKNOWN", True)})
+    planted_exit({})
+    # The workflow's own Summary step (sami-checks.yml), run as the summary job runs it: `bash -e -o
+    # pipefail` (its defaults.run.shell), through `sc.py summary`. The step ends with the summary's
+    # exit, also when a command after the summary fails: a result that cannot be opened stops the
+    # summary (2) and the results.json export after it, which must not end the step 1.
+    step_run = subprocess.run(["yq", "-r", '.jobs.summary.steps[] | select(.name == "Summary") | .run', WORKFLOW],
+                              capture_output=True, text=True).stdout
+    check("summary step: the workflow's Summary step is read", ("sc.py summary" in step_run, 'exit "$rc"' in step_run), (True, True))
+    tool_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    def run_step(planted, dangling=False, unwritable=None):
+        """(the step's exit, its output, the verdict file's verdict, summary.md, the step summary, the
+        notice's verdict) of the Summary step on a private copy of the passing results, with planted
+        {unit: FAIL or UNKNOWN}. unwritable names one report the step cannot write: output (the job's
+        output), step-summary, or results-json."""
+        w = tempfile.mkdtemp(prefix="step-run-", dir=d)
+        os.symlink(tool_root, os.path.join(w, "tool"))
+        sc_dir = os.path.join(w, "sc")
+        shutil.copytree(res, os.path.join(sc_dir, "results"))
+        shutil.copytree(build, os.path.join(sc_dir, "build"))
+        for k, s in planted.items():
+            json.dump(planted_unit(k, s), open(os.path.join(sc_dir, "results", os.path.basename(paths[k])), "w"))
+        if dangling:
+            os.symlink(os.path.join(w, "gone.json"), os.path.join(sc_dir, "results", "unreadable.json"))
+        if unwritable == "results-json":
+            os.makedirs(os.path.join(sc_dir, "report", "results.json"))
+        step_summary = "/dev/full" if unwritable == "step-summary" else os.path.join(w, "step-summary.md")
+        env = dict(os.environ, SC=sc_dir, SC_VERDICT=os.path.join(sc_dir, "report", "verdict.json"),
+                   GITHUB_STEP_SUMMARY=step_summary,
+                   GITHUB_OUTPUT="/dev/full" if unwritable == "output" else os.path.join(w, "output"),
+                   SC_PLATFORMS="", SC_SILENT="", SC_PLANT="", SC_COMMIT="selftest", SC_ROWS="set-runner,checkts",
+                   SC_RUST_TESTS="rust_test=success rust_test_macos=success")
+        p = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step_run], cwd=w, env=env,
+                           capture_output=True, text=True)
+
+        def text(path):
+            try:
+                return open(path, encoding="utf-8").read()
+            except OSError:
+                return ""
+
+        out = p.stdout + p.stderr
+        verdict_file = text(env["SC_VERDICT"])
+        notice = next((ln.split("::", 2)[2] for ln in out.splitlines() if ln.startswith("::notice title=sami-checks verdict::")), "")
+        return (p.returncode, out, json.loads(verdict_file)["verdict"] if verdict_file else None,
+                text(os.path.join(sc_dir, "report", "summary.md")), "" if step_summary == "/dev/full" else text(step_summary),
+                json.loads(notice)["verdict"] if notice else None)
+
+    # Each case is a step of its own on its own copy, so they run side by side (4 at a time, the
+    # runner's cores): one after another they would add about 20 s to the plan job.
+    planted_exit({})
+    step_cases = {"pass": ({},), "fail": ({set_a: "FAIL"},), "unknown": ({ck: "UNKNOWN"},),
+                  "fail and unknown": ({set_a: "FAIL", ck: "UNKNOWN"},), "dangling": ({}, True)}
+    for what in ("results-json", "step-summary", "output"):
+        step_cases[what] = ({}, False, what)
+        step_cases[what + ", a fault"] = ({set_a: "FAIL"}, False, what)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        ran = dict(zip(step_cases, pool.map(lambda a: run_step(*a), step_cases.values())))
+    check("summary step: the step ends with the summary's exit", {k: ran[k][0] for k in ("pass", "fail", "unknown", "fail and unknown")},
+          {"pass": 0, "fail": 1, "unknown": 2, "fail and unknown": 1})
+    rc, out = ran["dangling"][:2]
+    check("summary step: a result that cannot be opened ends the step 2, also after the results.json export fails",
+          (rc, "UNKNOWN: the summary stopped before its verdict" in out, "results.json" in out), (2, True, True))
+    # A report the step cannot write after the summary: a pass then reads UNKNOWN everywhere it can
+    # still be read (the verdict file, summary.md, the notice, the step summary when it was written)
+    # and ends 2, with an UNKNOWN annotation; a fault stays FAIL and 1.
+    got_unwritten = {}
+    for what in ("results-json", "step-summary", "output"):
+        rc, out, vf, md, ss, notice = ran[what]
+        got_unwritten[what] = (rc, vf, notice, "**Exit 2 (UNKNOWN)**: every row that ran passed, but" in md, "**Exit 0 (PASS)**" in md,
+                               "::error title=sami-checks summary::UNKNOWN: " in out)
+        got_unwritten[what + ", a fault"] = tuple(ran[what + ", a fault"][i] for i in (0, 2, 5))
+    want_pass = (2, "UNKNOWN", "UNKNOWN", True, False, True)
+    check("summary step: a report the step cannot write turns a pass into UNKNOWN, 2, and keeps a fault at 1", got_unwritten,
+          {"results-json": want_pass, "step-summary": want_pass, "output": want_pass,
+           "results-json, a fault": (1, "FAIL", "FAIL"), "step-summary, a fault": (1, "FAIL", "FAIL"), "output, a fault": (1, "FAIL", "FAIL")})
+    ss = ran["output"][4]
+    check("summary step: a job output it cannot write is named in the step summary written before it",
+          ("**Exit 0 (PASS)**" in ss, ss.rstrip().endswith("so no reader can see this pass. 2 is not the failure code.")), (True, True))
     # A unit two jobs reported is UNKNOWN.
     json.dump(result("checkts", "check:ts", "runner", "PASS", 0, 1, passed=1), open(os.path.join(res, "dup.json"), "w"))
     rc, out = summary()
-    check("summary with a unit reported twice", (rc, "two jobs reported this unit" in out), (1, True))
+    check("summary with a unit reported twice", (rc, "two jobs reported this unit" in out), (2, True))
     os.remove(os.path.join(res, "dup.json"))
     # A test that skipped itself as the runner's user and passed as root is covered; one that
     # skipped itself as both users is not.
@@ -2514,7 +2813,7 @@ def selftest():
     check("a self-skip covered by root", ("| pi-builtins, nextest default profile | **PASS** |" in out, rc), (True, 0))
     json.dump(nx("root", ["c"], ["a"]), open(os.path.join(res, "b-root.json"), "w"))
     rc, out = summary()
-    check("a self-skip as both users", ("| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, 1))
+    check("a self-skip as both users", ("| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, 2))
     json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
     # A partial pass is a pass, listed with its reason.
     for f in os.listdir(res):
@@ -2548,7 +2847,7 @@ def selftest():
               open(os.path.join(res, "zle-runner.json"), "w"))
     rc, out = summary()
     check("known failures and an open self-skip", ("| pi-shell set (runner) | **UNKNOWN** |" in out,
-          "every failure is known, but 1 test(s) skipped themselves here" in out, rc), (True, True, 1))
+          "every failure is known, but 1 test(s) skipped themselves here" in out, rc), (True, True, 2))
     json.dump(result("set-root", "pi-shell::zle_pty", "root", "PASS", 0, 1, passed=1, tests=[("s", 1.0)]),
               open(os.path.join(res, "silent.json"), "w"))
     rc, out = summary()
@@ -2562,13 +2861,13 @@ def selftest():
     open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
     rc, out = summary(rust=None)
     check("Rust rows UNKNOWN without SC_RUST_TESTS", (f"| {RUST_JOBS[0][0]} | **UNKNOWN** |" in out,
-          f"| {RUST_JOBS[1][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, True, 1))
+          f"| {RUST_JOBS[1][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, True, 2))
     rc, out = summary()
     check("both Rust jobs passed", (f"| {RUST_JOBS[0][0]} | **PASS** |" in out, f"| {RUST_JOBS[1][0]} | **PASS** |" in out, rc), (True, True, 0))
     rc, out = summary(rust="rust_test=failure rust_test_macos=cancelled")
     check("a failed and a cancelled Rust job", (f"| {RUST_JOBS[0][0]} | **FAIL** |" in out, f"| {RUST_JOBS[1][0]} | **UNKNOWN** |" in out, rc), (True, True, 1))
     rc, out = summary(rust="rust_test= rust_test_macos=skipped")
-    check("a Rust job with no result", (f"| {RUST_JOBS[0][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, 1))
+    check("a Rust job with no result", (f"| {RUST_JOBS[0][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, 2))
     # A flaky entry (its reason starts `flaky: `): its failure reads KNOWN only when the test passed in
     # a retry of its whole unit in the same job (the unit's command again: the same binary or filter,
     # threads and user), and NEW when no retry ran, every retry failed, or it passed only in a retry
@@ -2687,7 +2986,7 @@ def selftest():
     open(known_file, "w").write(zle_k + need_root)
     rc, out = summary()
     check("a known skip for one user only", ("SKIPPED ITSELF `c`: KNOWN (it needs root)" in out,
-          "| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, True, 1))
+          "| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, True, 2))
     open(known_file, "a").write(no_clone)
     rc, out = summary()
     check("a known skip for each user", ("| pi-builtins, nextest default profile | **KNOWN** |" in out, rc), (True, 0))
@@ -2698,18 +2997,18 @@ def selftest():
     open(known_file, "w").write(zle_k + need_root.replace("builtins", "workspace", 1) + no_clone)
     rc, out = summary()
     check("a known skip listed for another row", ("`pi-builtins` (runner): UNKNOWN: 1 test(s) skipped themselves" in out, rc),
-          (True, 1))
+          (True, 2))
     open(known_file, "w").write(zle_k + need_root + no_clone)
     json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root", "c -p a b: skipped, no FIFO"]),
               open(os.path.join(res, "b-runner.json"), "w"))
     rc, out = summary()
-    check("a self-skip with one line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 1))
+    check("a self-skip with one line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 2))
     # Every skip line counts: twenty lines an entry names and a twenty-first it does not is UNKNOWN
     # (CiReview at 15d6f1a9: only the first 20 lines were kept, so the 21st was never matched).
     json.dump(bx("runner", ["c"], [f"c -p a b: skipped, it needs root ({i})" for i in range(20)] + ["c -p a b: skipped, no FIFO"]),
               open(os.path.join(res, "b-runner.json"), "w"))
     rc, out = summary()
-    check("a self-skip whose 21st line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 1))
+    check("a self-skip whose 21st line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 2))
     json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root"]), open(os.path.join(res, "b-runner.json"), "w"))
     open(known_file, "a").write("builtins\trunner\tpi-builtins\ta\tskips: stale\ta: skipped\n")
     rc, out = summary()
@@ -3420,11 +3719,11 @@ def selftest():
     rec = verdict_record()
     check("summary: a selected Rust row with no conclusion reads UNKNOWN",
           (rec.get("verdict"), rec.get("rows_run"), {k: rec.get("rows", {}).get(k) for k in ("rust_test", "rust_test_macos")}, rc),
-          ("UNKNOWN", ["rust_test", "rust_test_macos"], {"rust_test": "UNKNOWN", "rust_test_macos": "UNKNOWN"}, 1))
+          ("UNKNOWN", ["rust_test", "rust_test_macos"], {"rust_test": "UNKNOWN", "rust_test_macos": "UNKNOWN"}, 2))
     rc, out = summary2(rust_env=None)
     rec = verdict_record()
     check("summary: a run of every row with no Rust conclusion is UNKNOWN, each row named",
-          (rec.get("verdict"), list(rec.get("rows", {})) == list(ROW_KEYS), rc), ("UNKNOWN", True, 1))
+          (rec.get("verdict"), list(rec.get("rows", {})) == list(ROW_KEYS), rc), ("UNKNOWN", True, 2))
     rc, out = summary2(rows_env="docs", plant_env="docs")
     rec = verdict_record()
     check("summary: a planted subset run fails, and its verdict line says whether the control caught the plant",
@@ -3547,7 +3846,7 @@ def selftest():
     check("summary: no docs or changelog result", ("| rustdoc intra-doc links (pi-shell) | **UNKNOWN** | 0 / 0 / 0 / 2 |" in out,
           "| CHANGELOG format (fix-changelogs --check) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
           "`public` (runner): UNKNOWN: no result" in out, "`private` (runner): UNKNOWN: no result" in out,
-          "`changelogs` (runner): UNKNOWN: no result" in out, rc), (True, True, True, True, True, 1))
+          "`changelogs` (runner): UNKNOWN: no result" in out, rc), (True, True, True, True, True, 2))
     # A row reads the same in a run of that row alone as in a run of every row of the same commit. The
     # summary step is run as the workflow runs it, on the results the planned rows' jobs upload: each
     # row's unit results, the passing tests' output of each row that has some (TEST_OUTPUT_ROWS), and
@@ -3631,7 +3930,8 @@ def selftest():
         sys.exit(1)
     print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest, bun and clippy counters, the "
           "platform report reader, the tree's real skip lines and partial passes, the shard assignment and "
-          "per-user weights, the summary's UNKNOWN for a unit no job or two jobs reported, the known and flaky "
+          "per-user weights, the summary's UNKNOWN for a unit no job or two jobs reported, its exit (0 PASS, 1 FAIL, "
+          "2 UNKNOWN, a fault outranking a row that could not be read, 2 for a summary that stopped), the known and flaky "
           "entries, skip-forms and skip-lines with their controls, the gVisor rows and their known skips, the "
           "docs and changelog rows with their planted controls, the Rust tests' rows from their jobs' "
           "conclusions, the row selection (its jobs from the workflow's needs, the cut's every row, a control "
@@ -4285,7 +4585,9 @@ def main(argv):
     elif c == "platforms":
         cmd_platforms(*a)
     elif c == "summary":
-        sys.exit(cmd_summary(*a))
+        sys.exit(summary_main(a))
+    elif c == "unreadable-pass":
+        cmd_unreadable_pass(*a)
     elif c == "skip-forms":
         print(json.dumps(cmd_skip_forms(*a)))
     elif c == "skip-lines":
