@@ -655,7 +655,7 @@ fn a_task_that_has_gone_is_read_as_gone_on_either_kernel() {
 				Ok("4242 ".to_owned())
 			});
 		});
-		let why = left.err().map(why_of).unwrap_or_default();
+		let why = left.err().map_or_default(why_of);
 		assert!(
 			why.contains("children left behind"),
 			"a child listed in the pass of a task that has gone ({gone}) was not reported: {why:?}"
@@ -669,8 +669,10 @@ fn a_task_that_has_gone_is_read_as_gone_on_either_kernel() {
 	// counted those two passes would have returned before the child showed.
 	for gone in [libc::ENOENT, libc::ESRCH] {
 		let first_task = {
-			let mut names: Vec<std::ffi::OsString> =
-				fs::read_dir("/proc/self/task").unwrap().map(|task| task.unwrap().file_name()).collect();
+			let mut names: Vec<std::ffi::OsString> = fs::read_dir("/proc/self/task")
+				.unwrap()
+				.map(|task| task.unwrap().file_name())
+				.collect();
 			names.sort();
 			names.remove(0)
 		};
@@ -683,24 +685,26 @@ fn a_task_that_has_gone_is_read_as_gone_on_either_kernel() {
 				}
 				if pass <= 2 {
 					// The pass a task has gone from, with no child anywhere.
-					return match starts_a_pass {
-						true => Err(std::io::Error::from_raw_os_error(gone)),
-						false => Ok(String::new()),
+					return if starts_a_pass {
+						Err(std::io::Error::from_raw_os_error(gone))
+					} else {
+						Ok(String::new())
 					};
 				}
 				Ok("4242 ".to_owned())
 			});
 		});
-		let why = left.err().map(why_of).unwrap_or_default();
+		let why = left.err().map_or_default(why_of);
 		assert!(
 			why.contains("children left behind"),
-			"the walk ended on two passes a task had gone from ({gone}), before a child showed: {why:?}"
+			"the walk ended on two passes a task had gone from ({gone}), before a child showed: \
+			 {why:?}"
 		);
 	}
 	let refused = std::panic::catch_unwind(|| {
 		assert_no_task_has_children(|_| Err(std::io::Error::from_raw_os_error(libc::EACCES)));
 	});
-	let why = refused.err().map(why_of).unwrap_or_default();
+	let why = refused.err().map_or_default(why_of);
 	assert!(
 		why.contains("the children of task") && why.contains("PermissionDenied"),
 		"a list refused with EACCES was not reported as a failed read naming the error: {why:?}"

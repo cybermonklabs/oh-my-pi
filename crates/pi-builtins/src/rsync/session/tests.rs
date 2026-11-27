@@ -389,7 +389,7 @@ fn local_delete_copies_terminate() {
 /// ends is timing in rsync 3.5.1 itself: whether its generator's reply reaches
 /// the sender before or after the sender's next read decides whether that
 /// read's flush goes out as one frame or as several. With only the generator's
-/// writes delayed (an LD_PRELOAD shim), rsync 3.5.1 copying this tree sent
+/// writes delayed (an `LD_PRELOAD` shim), rsync 3.5.1 copying this tree sent
 /// 803,108 and received 467 bytes with no delay, and sent 803,116 and received
 /// 471 with 2, 20 or 100 ms: two headers more one way, one the other, in 10 of
 /// 10 copies each. The builtin's frame logs under CPU load show the same
