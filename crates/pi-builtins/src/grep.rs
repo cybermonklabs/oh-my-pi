@@ -2689,6 +2689,76 @@ mod tests {
 		}
 	}
 
+	/// With no pattern, as from an empty `-f` file, GNU grep 3.11 selects no
+	/// line, with `-i` as without, and answers without reading its input: it
+	/// prints no count and reports no missing file. `-v` selects every line,
+	/// and `-L` lists every file it reads, unless `-q` stops it. To fold case
+	/// the engine compiled the empty regex, which selected every line, and
+	/// `-c` printed a count.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn an_empty_pattern_list_selects_no_line_with_or_without_case() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("empty"), "").unwrap();
+		std::fs::write(tree.path().join("t"), "a\nB\n").unwrap();
+		for (args, want, status) in [
+			(&["-i", "-f", "empty", "t"][..], "", 1),
+			(&["-c", "-i", "-f", "empty", "t"][..], "", 1),
+			(&["-o", "-i", "-f", "empty", "t"][..], "", 1),
+			(&["-n", "-i", "-f", "empty", "t"][..], "", 1),
+			(&["-c", "-f", "empty", "t"][..], "", 1),
+			(&["-i", "-f", "empty", "t", "nosuch"][..], "", 1),
+			(&["-q", "-L", "-f", "empty", "t", "nosuch"][..], "", 1),
+			(&["-v", "-i", "-f", "empty", "t"][..], "a\nB\n", 0),
+			(&["-L", "-i", "-f", "empty", "t"][..], "t\n", 1),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, "", tree.path()).await;
+			assert_eq!(
+				(code, capture.out().as_str(), capture.err().as_str()),
+				(status, want, ""),
+				"grep {args:?}"
+			);
+		}
+	}
+
+	/// GNU grep 3.11's `-o` prints at each position the longest match of any
+	/// pattern, and of any alternative of one. The engine took the first that
+	/// matches there, so a pattern that matches empty there (`''`, `q\?`,
+	/// `()`, `x*`) hid another pattern's match, and a shorter pattern or
+	/// alternative hid a longer one.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn only_matching_prints_the_longest_match_beside_an_empty_one() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("t"), "zz\nq\n").unwrap();
+		std::fs::write(tree.path().join("in"), "-5\n-1\nx\nzz\nb\n").unwrap();
+		std::fs::write(tree.path().join("pats"), "zz\n\nb\n").unwrap();
+		for (args, stdin, want) in [
+			(&["-o", "-e", "", "-e", "zz", "t"][..], "", "zz\n"),
+			(&["-n", "-o", "-e", "", "-e", "zz", "t"][..], "", "1:zz\n"),
+			(&["-o", "-e", r"q\?", "-e", "zz", "t"][..], "", "zz\nq\n"),
+			(&["-o", "-E", "-e", "()", "-e", "zz", "t"][..], "", "zz\n"),
+			(&["-o", "-e", "x*", "-e", "zz", "t"][..], "", "zz\n"),
+			(&["-o", "-f", "pats", "in"][..], "", "zz\nb\n"),
+			// The first pattern's own match is printed where it is not empty.
+			(&["-o", "-e", "x*", "-e", "zz"][..], "xxzz\n", "xx\nzz\n"),
+			(&["-oE", "(|zz)"][..], "zz\n", "zz\n"),
+			(&["-o", r"q\?\|zz"][..], "zz\n", "zz\n"),
+			(&["-oE", "a||b"][..], "ab\n", "a\nb\n"),
+			(&["-oE", "a|ab"][..], "ab\n", "ab\n"),
+			(&["-o", "-e", "a", "-e", "ab"][..], "ab\n", "ab\n"),
+			(&["-oF", "-e", "a", "-e", "ab"][..], "ab\n", "ab\n"),
+			(&["-o", "-e", "ab", "-e", "abc", "-e", "a"][..], "abcd ab\n", "abc\nab\n"),
+			(&["-oi", "-e", "AB", "-e", "abc", "-e", "a"][..], "abcd ab\n", "abc\nab\n"),
+			(&["-oiF", "-e", "A", "-e", "ABC", "-e", "b"][..], "x ab ABC\n", "a\nb\nABC\n"),
+			(&["-oE", "-e", "a|abc", "-e", "b+c", "-e", "x"][..], "abcd ab\n", "abc\na\n"),
+			(&["-o", "-e", r"a\+", "-e", "ba", "-e", "bab", "-e", "b"][..], "aaa bab\n", "aaa\nbab\n"),
+			// As words, the longest match that is a word.
+			(&["-ow", "-e", "ab", "-e", "abc", "-e", "a"][..], "abcd ab\n", "ab\n"),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, stdin, tree.path()).await;
+			assert_eq!((code, capture.out().as_str()), (0, want), "grep {args:?}: {}", capture.err());
+		}
+	}
+
 	/// A file with no line terminator used to make grep buffer it whole: on a
 	/// sparse file that is an endless line of NUL bytes, and the host process
 	/// grew until the kernel killed it. Now that file is a per-file error and
