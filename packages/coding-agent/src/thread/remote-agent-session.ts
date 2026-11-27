@@ -27,6 +27,13 @@
  *   to the home worker, whose next patch reconciles; asynchronous commands
  *   are RPC to the publisher.
  *
+ * The message list and the entry list share one object for a message both
+ * hold: an incoming message or message entry takes the object the other list
+ * already has when the two have the same persistence key and are deep-equal,
+ * so main keeps one copy of it, as a local session does. An entry whose
+ * secrets the worker restored for display differs from its message and stays
+ * apart. Nothing on main changes a mirrored message in place.
+ *
  * `subscribe` turns the worker's event stream (and view state) on while any
  * listener is attached; run-state listeners are fed by every transition the
  * publisher reports. A closed mirror keeps its last state, rejects commands
@@ -98,6 +105,7 @@ import {
 } from "../session/session-context";
 import type { CustomEntry, SessionEntry } from "../session/session-entries";
 import { conversationTip, lastModelChangeRole, SessionEntryIndex } from "../session/session-manager";
+import { sessionMessagePersistenceKey } from "../session/turn-persistence";
 import type { AgentDefinition } from "../task/types";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import { type ApprovalGrantStore, getApprovalGrants } from "../tools/approval-cache";
@@ -243,6 +251,25 @@ function blobs(): BlobStore {
 /** `list` without the item at `index` (unchanged when out of range). */
 function withoutIndex<T>(list: readonly T[], index: number): T[] {
 	return index < 0 || index >= list.length ? [...list] : [...list.slice(0, index), ...list.slice(index + 1)];
+}
+
+/** The messages of `held` by persistence key, leaving out unkeyed ones and those of `paired`. */
+function messagesByKey<T>(
+	held: readonly T[],
+	messageOf: (item: T) => AgentMessage | undefined,
+	paired: ReadonlySet<AgentMessage> | undefined,
+): Map<string, AgentMessage[]> {
+	const byKey = new Map<string, AgentMessage[]>();
+	for (const item of held) {
+		const message = messageOf(item);
+		if (!message || paired?.has(message)) continue;
+		const key = sessionMessagePersistenceKey(message);
+		if (key === undefined) continue;
+		const list = byKey.get(key);
+		if (list) list.push(message);
+		else byKey.set(key, [message]);
+	}
+	return byKey;
 }
 
 /** {@link AgentViewSession} for a session homed on a subagent worker; see the module doc. */
@@ -888,8 +915,13 @@ export class RemoteAgentSession implements AgentViewSession {
 	/** Bridge only: apply a message-list change in place (the array identity is stable). */
 	applyMessages(delta: SessionMessagesDelta): void {
 		if (this.#closed !== undefined) return;
+		const share = this.#share(
+			this.#entries,
+			entry => (entry.type === "message" ? entry.message : undefined),
+			delta.kind === "replace",
+		);
 		if (delta.kind === "replace") this.#messages.length = 0;
-		for (const message of delta.messages) this.#messages.push(message);
+		for (const message of delta.messages) this.#messages.push(share(message));
 	}
 
 	/**
@@ -902,7 +934,7 @@ export class RemoteAgentSession implements AgentViewSession {
 		this.#pruneSettled(state.restorableQueue);
 		this.#activeUpdates.clear();
 		for (const update of state.activeToolExecutionUpdates) this.#activeUpdates.set(update.toolCallId, update);
-		if (entries) this.applyEntries(entries);
+		if (entries) this.#applyEntries(entries, true);
 		this.#entryIndex.setLeaf(state.leafId);
 		this.#syncViewDerived(state);
 		this.#reseedTokenRate();
@@ -919,7 +951,20 @@ export class RemoteAgentSession implements AgentViewSession {
 
 	/** Bridge only: apply an entry-list change; locally appended entries give way to the worker's. */
 	applyEntries(delta: SessionEntriesDelta): void {
+		this.#applyEntries(delta, delta.kind === "replace");
+	}
+
+	/** {@link applyEntries}; `bulk` for a replace or a watch's catch-up (see `#share`). */
+	#applyEntries(delta: SessionEntriesDelta, bulk: boolean): void {
 		if (this.#closed !== undefined) return;
+		let paired: Set<AgentMessage> | undefined;
+		if (bulk && delta.kind === "append") {
+			// A catch-up keeps the entries main has, and their messages are paired already.
+			paired = new Set();
+			for (const entry of this.#entries) if (entry.type === "message") paired.add(entry.message);
+		}
+		const share = this.#share(this.#messages, message => message, bulk, paired);
+		for (const entry of delta.entries) if (entry.type === "message") entry.message = share(entry.message);
 		if (delta.kind === "append" && this.#provisional.size === 0) {
 			for (const entry of delta.entries) {
 				this.#entries.push(entry);
@@ -932,6 +977,48 @@ export class RemoteAgentSession implements AgentViewSession {
 		this.#entries = [...kept, ...delta.entries];
 		this.#entryIndex.rebuild(this.#entries);
 		this.#entryIndex.setLeaf(this.#view.leafId);
+	}
+
+	/**
+	 * One object for a message both mirrored lists hold: a lookup, for one delta, of the equal object `held` (the
+	 * other list) already has, else the incoming message itself. Equal is the same
+	 * {@link sessionMessagePersistenceKey} and `Bun.deepEquals` (strict), so an entry shown with its secrets
+	 * restored stays apart from its message. Each held object answers at most once. A `bulk` delta (a replace, a
+	 * watch's catch-up) indexes `held` by key on its first lookup, leaving out the `paired` objects; an append
+	 * scans `held` from the tail, where its counterparts are, comparing role and time before keys.
+	 */
+	#share<T>(
+		held: readonly T[],
+		messageOf: (item: T) => AgentMessage | undefined,
+		bulk: boolean,
+		paired?: ReadonlySet<AgentMessage>,
+	): (message: AgentMessage) => AgentMessage {
+		if (bulk) {
+			let byKey: Map<string, AgentMessage[]> | undefined;
+			return message => {
+				const key = sessionMessagePersistenceKey(message);
+				if (key === undefined) return message;
+				byKey ??= messagesByKey(held, messageOf, paired);
+				const candidates = byKey.get(key);
+				const at = candidates?.findIndex(candidate => Bun.deepEquals(candidate, message, true)) ?? -1;
+				return (at < 0 ? undefined : candidates?.splice(at, 1)[0]) ?? message;
+			};
+		}
+		const taken = new Set<AgentMessage>();
+		return message => {
+			const key = sessionMessagePersistenceKey(message);
+			if (key === undefined) return message;
+			for (let i = held.length - 1; i >= 0; i--) {
+				const item = held[i];
+				const candidate = item === undefined ? undefined : messageOf(item);
+				if (!candidate || candidate.role !== message.role || candidate.timestamp !== message.timestamp) continue;
+				if (taken.has(candidate) || sessionMessagePersistenceKey(candidate) !== key) continue;
+				if (!Bun.deepEquals(candidate, message, true)) continue;
+				taken.add(candidate);
+				return candidate;
+			}
+			return message;
+		};
 	}
 
 	/** Bridge only: dispatch one forwarded event to subscribers. */
