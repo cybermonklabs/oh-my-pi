@@ -49,8 +49,6 @@ pi-shell	crates/pi-shell/tests/pty_support/mod.rs	clippy::missing_const_for_fn	3
 pi-shell	crates/pi-shell/tests/pty_support/vt.rs	clippy::map_unwrap_or	1	called `map(_).unwrap_or_default()` on an `Option` value
 pi-shell	crates/pi-shell/tests/pty_support/vt.rs	clippy::semicolon_if_nothing_returned	1	consider adding a `;` to the last statement for consistent formatting
 pi-shell	crates/pi-shell/tests/subshell_exit_trap_frames.rs	clippy::needless_raw_string_hashes	11	unnecessary hashes around raw string literal
-pi-shell	crates/pi-shell/tests/zle_vi_pty.rs	clippy::format_collect	1	use of `format!` to build up a string from an iterator
-pi-shell	crates/pi-shell/tests/zle_vi_pty.rs	clippy::literal_string_with_formatting_args	1	this looks like a formatting argument but it is not part of a formatting macro
 pi-shell	crates/pi-shell/tests/zsh_comp_y01.rs	clippy::literal_string_with_formatting_args	1	this looks like a formatting argument but it is not part of a formatting macro
 pi-shell	crates/pi-shell/tests/zsh_comp_y02.rs	clippy::doc_markdown	9	item in documentation is missing backticks
 pi-shell	crates/pi-shell/tests/zsh_comp_y03.rs	clippy::doc_markdown	4	item in documentation is missing backticks
