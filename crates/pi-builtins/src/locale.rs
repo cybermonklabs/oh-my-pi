@@ -727,12 +727,31 @@ fn needs_working_directory(env: &LocaleEnv) -> bool {
 #[cfg(unix)]
 const LOCALE_UTILITIES: [&str; 2] = ["/usr/bin/locale", "/bin/locale"];
 
-/// How long that utility may take, counted from just before the spawn. A
-/// locale load is a handful of file reads, so this bounds only the case where
-/// it cannot finish at all — a search-path entry whose `LC_CTYPE` is a FIFO
-/// nobody writes to, say, which blocks the reference binary for ever as well.
+/// How long that utility may go without progress before it is ended. A
+/// locale load is a handful of file reads, so a utility that makes no
+/// progress for this long is one that cannot finish at all — a search-path
+/// entry whose `LC_CTYPE` is a FIFO nobody writes to, say, which blocks the
+/// reference binary for ever as well. Time in which a process of the
+/// utility's group runs, waits for a CPU or waits in the kernel (`R` or `D`),
+/// or in which the group uses CPU time, is progress and does not count: a
+/// loaded machine slows a utility that is finishing, and a wall-clock bound
+/// of 5 s ended such utilities, which turned a loadable locale into a
+/// refusal. In the pi-builtins test binary on runc beside 64 busy loops,
+/// utilities that finished took up to 10.2 s, under 20 ms of it on a CPU:
+/// the rest was a runqueue and ext4's journal (`__jbd2_log_wait_for_space`).
 #[cfg(unix)]
-const LOCALE_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const LOCALE_QUERY_STALL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The longest a query may take however its utility progresses, counted from
+/// just before the spawn: a utility that spins, or waits in the kernel for
+/// ever, is ended here. More than five times the longest a utility that
+/// finished took under load (10.2 s, above).
+#[cfg(unix)]
+const LOCALE_QUERY_CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the wait reads whether the utility progresses.
+#[cfg(unix)]
+const LOCALE_PROGRESS_SAMPLE: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// The most the utility may write before its output stops being one codeset.
 #[cfg(unix)]
@@ -1027,12 +1046,13 @@ fn locale_utility_output_at(
 	// to (reproduced with this process's own 1 and 2 closed).
 	let answer = above_standard(answer).map_err(|err| report(format!("no file for the answer: {err}")))?;
 
-	let deadline = std::time::Instant::now() + LOCALE_QUERY_TIMEOUT;
+	let deadline = std::time::Instant::now() + LOCALE_QUERY_CEILING;
 	// The child and the handle on it are made by the same call: a number a
 	// spawn hands back is already recyclable, and opening a handle from it
 	// afterwards can open whatever took it.
-	// The deadline is this query's, and the only one: a wait inside the
-	// spawn that started its own used the whole of it over again.
+	// The deadline is this query's ceiling, and its only wall-clock bound: a
+	// wait inside the spawn that started its own used the whole of it over
+	// again.
 	let child =
 		start_locale_utility(&program_c, &argv, &envp, answer.as_raw_fd(), cwd_c.as_deref(), ask, deadline)
 			.map_err(|err| report(format!("{named} could not be started: {err}")))?;
@@ -2100,16 +2120,48 @@ fn process_threads(number: libc::pid_t) -> Option<u32> {
 	status.lines().find_map(|line| line.strip_prefix("Threads:")).and_then(|count| count.trim().parse().ok())
 }
 
-/// Ends the locale utility and everything left in its process group, within
-/// the deadline the answer had, and reaps it — all through the handle, so
-/// no number of anyone else's can be reached.
+/// Ends the locale utility and everything left in its process group once it
+/// has made no progress for [`LOCALE_QUERY_STALL`], or at `deadline`, the
+/// query's ceiling, and reaps it — all through the handle, so no number of
+/// anyone else's can be reached. Progress is read every
+/// [`LOCALE_PROGRESS_SAMPLE`] ([`group_quiet_ticks`]): the time between two
+/// readings counts toward the stall only when both found no process of the
+/// group running, waiting for a CPU or waiting in the kernel, and the group's
+/// CPU time did not move between them.
 #[cfg(target_os = "linux")]
 fn reap_locale_utility(child: &ChildHandle, deadline: std::time::Instant, kill_now: bool) -> Completion {
 	let mut finished = false;
 	let mut watch_failed = None;
+	let mut stalled = std::time::Duration::ZERO;
+	let mut reading: Option<(std::time::Instant, Option<u64>)> = None;
+	let mut ended_why = "was ended before it finished".to_owned();
 	loop {
 		match child.ended() {
-			Ok(false) if !kill_now && std::time::Instant::now() < deadline => {
+			Ok(false) if !kill_now => {
+				let now = std::time::Instant::now();
+				if now >= deadline {
+					ended_why = format!(
+						"was ended before it finished: it still ran after {} s",
+						LOCALE_QUERY_CEILING.as_secs()
+					);
+					break;
+				}
+				if stalled >= LOCALE_QUERY_STALL {
+					ended_why = format!(
+						"was ended before it finished: it made no progress for {} s",
+						LOCALE_QUERY_STALL.as_secs()
+					);
+					break;
+				}
+				if reading.is_none_or(|(then, _)| now.duration_since(then) >= LOCALE_PROGRESS_SAMPLE) {
+					let quiet = group_quiet_ticks(child.1);
+					if let (Some((then, Some(before))), Some(ticks)) = (reading, quiet)
+						&& ticks == before
+					{
+						stalled += now.duration_since(then);
+					}
+					reading = Some((now, quiet));
+				}
 				std::thread::sleep(std::time::Duration::from_millis(1));
 			},
 			Ok(ended) => {
@@ -2128,12 +2180,95 @@ fn reap_locale_utility(child: &ChildHandle, deadline: std::time::Instant, kill_n
 		return Completion::Ended(format!("could not be waited for: {err}"));
 	}
 	if !finished {
-		return Completion::Ended("was ended before it finished".to_owned());
+		return Completion::Ended(ended_why);
 	}
 	match reaped {
 		Ok(completion) => completion,
 		Err(err) => Completion::Ended(format!("could not be waited for: {err}")),
 	}
+}
+
+/// The CPU time, in clock ticks, that the utility and the processes under it
+/// have used, or `None` while they show progress: one of them running,
+/// waiting for a CPU or waiting in the kernel (`R` or `D` in
+/// `/proc/<n>/stat`), or the utility's own `stat` unreadable. The utility is
+/// read first, and the others are looked for only while it sleeps, so a
+/// utility that starts nothing (the system's `locale`) costs one read per
+/// sample. The others are its descendants, read through each task's
+/// `children`; where the kernel has no such file, the members of its process
+/// group, read through all of `/proc`. Only reads are made by number: a
+/// recycled number misleads one reading and signals nobody.
+#[cfg(target_os = "linux")]
+fn group_quiet_ticks(group: libc::pid_t) -> Option<u64> {
+	let (state, _, mut ticks) = state_group_ticks(group)?;
+	if matches!(state, b'R' | b'D') {
+		return None;
+	}
+	let Some(mut pending) = children_of(group) else {
+		for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+			let Some(number) = entry.file_name().to_str().and_then(|name| name.parse::<libc::pid_t>().ok()) else {
+				continue;
+			};
+			let Some((state, pgrp, used)) = state_group_ticks(number).filter(|_| number != group) else { continue };
+			if pgrp != group {
+				continue;
+			}
+			if matches!(state, b'R' | b'D') {
+				return None;
+			}
+			ticks += used;
+		}
+		return Some(ticks);
+	};
+	// A tree as deep or as wide as this is not a locale utility's; it counts
+	// as progress rather than be read for ever.
+	let mut read = 0;
+	while let Some(number) = pending.pop() {
+		read += 1;
+		if read > 4096 {
+			return None;
+		}
+		let Some((state, _, used)) = state_group_ticks(number) else { continue };
+		if matches!(state, b'R' | b'D') {
+			return None;
+		}
+		ticks += used;
+		pending.extend(children_of(number).unwrap_or_default());
+	}
+	Some(ticks)
+}
+
+/// The children of every thread of the process `number`, from
+/// `/proc/<number>/task/<thread>/children`, or `None` where the process's
+/// own thread has no such file.
+#[cfg(target_os = "linux")]
+fn children_of(number: libc::pid_t) -> Option<Vec<libc::pid_t>> {
+	let mut children = Vec::new();
+	let own = std::fs::read_to_string(format!("/proc/{number}/task/{number}/children")).ok()?;
+	children.extend(own.split_whitespace().filter_map(|child| child.parse::<libc::pid_t>().ok()));
+	for thread in std::fs::read_dir(format!("/proc/{number}/task")).into_iter().flatten().flatten() {
+		if thread.file_name().to_str() == Some(number.to_string().as_str()) {
+			continue;
+		}
+		let listed = std::fs::read_to_string(thread.path().join("children")).unwrap_or_default();
+		children.extend(listed.split_whitespace().filter_map(|child| child.parse::<libc::pid_t>().ok()));
+	}
+	Some(children)
+}
+
+/// The state letter, process group and CPU ticks (`utime` plus `stime`) in
+/// `/proc/<number>/stat`, read after the last `)` as [`live_member`] reads
+/// them, or `None` where it cannot be read.
+#[cfg(target_os = "linux")]
+fn state_group_ticks(number: libc::pid_t) -> Option<(u8, libc::pid_t, u64)> {
+	let stat = std::fs::read(format!("/proc/{number}/stat")).ok()?;
+	let end = stat.iter().rposition(|byte| *byte == b')')?;
+	let fields: Vec<&[u8]> = stat[end + 1..].split(u8::is_ascii_whitespace).filter(|field| !field.is_empty()).collect();
+	let field = |index: usize| std::str::from_utf8(fields.get(index)?).ok();
+	let state = *fields.first()?.first()?;
+	let pgrp = field(2)?.parse().ok()?;
+	let ticks = field(11)?.parse::<u64>().ok()? + field(12)?.parse::<u64>().ok()?;
+	Some((state, pgrp, ticks))
 }
 
 /// Whether this process has asked the kernel to reap its children for it,

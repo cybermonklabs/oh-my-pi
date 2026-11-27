@@ -944,7 +944,7 @@ fn a_locale_utility_that_misbehaves_is_reported() {
 		("diagnostic-first", "printf 'warning: alien\\nUTF-8\\n'\n", "where one codeset was due"),
 		("nul", "printf 'UTF-8\\000junk\\n'\n", "where one codeset was due"),
 		("flood", "dd if=/dev/zero bs=1024 count=4096 2>/dev/null | tr '\\\\0' 'X'\n", "wrote more than"),
-		("closes-and-lingers", "printf 'UTF-8\\n'\nexec 1>&-\nsleep 30\n", "was ended before it finished"),
+		("closes-and-lingers", "printf 'UTF-8\\n'\nexec 1>&-\nsleep 30\n", "it made no progress for 5 s"),
 	];
 	for (name, body, expected) in cases {
 		let program = dir.path().join(name);
@@ -958,6 +958,30 @@ fn a_locale_utility_that_misbehaves_is_reported() {
 			_ => panic!("{name}: {answer:?}"),
 		}
 	}
+}
+
+/// A utility that is still working when the stall bound has passed is
+/// answered: the bound counts only time in which the utility's group makes
+/// no progress. Under load a utility that finishes can take well over 5 s
+/// (10.2 s measured in the pi-builtins test binary beside 64 busy loops,
+/// nearly all of it in a runqueue and in ext4's journal), and the 5 s
+/// wall-clock bound this replaced ended it. This one works on a CPU for
+/// 6 to 7 s, then answers.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_utility_still_working_after_the_stall_bound_is_answered() {
+	let dir = tempfile::tempdir().unwrap();
+	let program = dir.path().join("slow");
+	crate::testprog::write(
+		&program,
+		"#!/bin/bash\nend=$((SECONDS + 7))\nwhile ((SECONDS < end)); do :; done\nprintf 'ISO-8859-1\\n'\n",
+	);
+	let env = |_: &str| None;
+	let answer = crate::locale::codeset_from_utility_for_test(&program, "C.UTF-8", &env);
+	assert!(
+		matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "ISO-8859-1"),
+		"{answer:?}"
+	);
 }
 
 /// A child forked while the utility is written, as another test's thread
