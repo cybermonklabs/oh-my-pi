@@ -29,9 +29,14 @@
 # complete=true.
 # Usage: rust-test-macos-inventory.sh <Linux listings directory> <output list>
 #   OMP_BAZEL_RC   the bazelrc fragment .github/actions/bazel-cache wrote
+#   SAMI_FINDINGS  (optional) each error is also a line of this file
+#                  (.github/sami/findings.sh), for the first-seen comparison
 set -euo pipefail
+# finding, finding_stop and findings_end (SAMI_FINDINGS).
+# shellcheck source=.github/sami/findings.sh
+. "$(dirname "${BASH_SOURCE[0]}")/findings.sh"
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
-	echo "::error title=macOS inventory::bash ${BASH_VERSION} is too old: this script needs bash 4 or later"
+	finding_stop "macOS inventory" "bash ${BASH_VERSION} is too old: this script needs bash 4 or later"
 	exit 1
 fi
 if [ "$#" != 2 ] || [ -z "${OMP_BAZEL_RC:-}" ]; then
@@ -42,7 +47,7 @@ linux="$1" out="$2"
 sami=.github/sami
 tmp="$(mktemp -d "${RUNNER_TEMP:-/tmp}/macos-inventory.XXXXXX")"
 stop() {
-	echo "::error title=macOS inventory::$1"
+	finding_stop "macOS inventory" "$1"
 	exit 1
 }
 # shellcheck source=.github/sami/rust-test-targets.sh
@@ -86,7 +91,7 @@ while read -r label; do
 	else
 		: >"$tmp/only.txt"
 		unknown+=("$label")
-		echo "::error title=macOS inventory::UNKNOWN: $label has no Linux listing: the target did not build on Linux, so which of its $(count "$tmp/mac.txt") macOS tests only macOS compiles cannot be told; none of them runs here"
+		finding "macOS inventory" "UNKNOWN: $label has no Linux listing: the target did not build on Linux, so which of its $(count "$tmp/mac.txt") macOS tests only macOS compiles cannot be told; none of them runs here"
 	fi
 	while read -r name; do
 		printf '%s %s  compiled only on macOS\n' "$label" "$name" >>"$out"
@@ -109,6 +114,8 @@ echo "macOS inventory: $(count "$out") tests ($(awk '/compiled only on macOS$/ {
 [ -s "$out" ] || stop "the macOS inventory is empty"
 echo "complete=true" >>"${GITHUB_OUTPUT:-/dev/null}"
 if [ "${#unknown[@]}" != 0 ]; then
-	echo "::error title=macOS inventory::UNKNOWN: ${#unknown[@]} target(s) with no Linux listing, whose macOS-only tests this job does not run: ${unknown[*]}"
+	finding "macOS inventory" "UNKNOWN: ${#unknown[@]} target(s) with no Linux listing, whose macOS-only tests this job does not run: ${unknown[*]}"
+	findings_end
 	exit 1
 fi
+findings_end

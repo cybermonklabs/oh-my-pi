@@ -959,7 +959,21 @@ jobs:
           name: rust-test-listings
           path: ${{ github.workspace }}/sc/bazel-listings
       - name: The early listings against rust_test's
-        run: bash tool/.github/sami/rust-test-listings-drift.sh "$SC/early-listings" "$SC/bazel-listings"
+        env:
+          # Each error of this check is a finding of the rust_test row, which
+          # the summary compares with the previous cut's (sc.py rust-findings).
+          SAMI_FINDINGS: ${{ github.workspace }}/sc/findings/drift.tsv
+        run: |
+          mkdir -p "$(dirname "$SAMI_FINDINGS")"
+          bash tool/.github/sami/rust-test-listings-drift.sh "$SC/early-listings" "$SC/bazel-listings"
+      - name: The findings the summary compares with the previous cut's
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sc-findings-rust-test-drift
+          path: ${{ github.workspace }}/sc/findings
+          retention-days: 3
+          if-no-files-found: warn
 
   rust-test-cold:
     # The seed's control: the Linux Rust gate again on the same commit with no seed, so that
@@ -1023,21 +1037,41 @@ jobs:
         env:
           SEEDED: ${{ needs.rust-test.result }}
           COLD: ${{ needs.rust-test-cold.result }}
+          # This step's own findings, which the summary compares with the previous cut's
+          # (sc.py rust-findings); the comparison step below writes its own file.
+          SAMI_FINDINGS: ${{ github.workspace }}/sc/findings/verdict.tsv
         run: |
+          mkdir -p "$(dirname "$SAMI_FINDINGS")"
+          # shellcheck source=.github/sami/findings.sh
+          . tool/.github/sami/findings.sh
           echo "the seeded Linux gate: $SEEDED; the cold control: $COLD"
           case "$COLD" in
           success | failure) ;;
           *)
-            echo "::error title=Rust test results::UNKNOWN: the cold control is [$COLD], so it compared nothing"
+            finding_stop "Rust test results" "UNKNOWN: the cold control is [$COLD], so it compared nothing"
             exit 1
             ;;
           esac
           if [ "$SEEDED" != "$COLD" ]; then
-            echo "::error title=Rust test results::the seeded Linux gate is [$SEEDED] and the cold one [$COLD] on this commit: the seed changed what the gate reports"
+            finding "Rust test results" "the seeded Linux gate is [$SEEDED] and the cold one [$COLD] on this commit: the seed changed what the gate reports"
+            findings_end
             exit 1
           fi
+          findings_end
       - name: The seeded results against the cold ones
-        run: bash tool/.github/sami/rust-test-results-compare.sh "$SC/cold" "$SC/seeded" tool/.github/sami/rust-test-known-failures.txt
+        env:
+          SAMI_FINDINGS: ${{ github.workspace }}/sc/findings/compare.tsv
+        run: |
+          mkdir -p "$(dirname "$SAMI_FINDINGS")"
+          bash tool/.github/sami/rust-test-results-compare.sh "$SC/cold" "$SC/seeded" tool/.github/sami/rust-test-known-failures.txt
+      - name: The findings the summary compares with the previous cut's
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sc-findings-rust-test-compare
+          path: ${{ github.workspace }}/sc/findings
+          retention-days: 3
+          if-no-files-found: warn
 
   platforms:
     # macOS and Windows: the fork's platform checks, called on the candidate. Its report job's
@@ -1183,6 +1217,18 @@ jobs:
           pattern: pc-build-*
           merge-multiple: true
           path: ${{ github.workspace }}/sc/pc
+      # What each step of the Rust rows' jobs found (.github/sami/findings.sh), each job's artifact
+      # in a folder of its own name: the summary reads them as units of those rows (sc.py
+      # rust-findings) and compares each finding with the previous cut's, since a Rust row's verdict
+      # is one word over all of them. A missing artifact is that job's UNKNOWN, by name, not a
+      # download error.
+      - name: The Rust rows' findings
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sc-findings-*
+          path: ${{ github.workspace }}/sc/findings
+
       # The report the summary compares this run's failures with (first seen at this cut): the
       # sc-report of the run the dispatch input `previous` names, else of the newest completed run on
       # a push of release-candidate before this one, of another commit. sc.py previous-report puts its
@@ -1213,6 +1259,12 @@ jobs:
           SC_PLANT: ${{ needs.plan.outputs.plant }}
           SC_VERDICT: ${{ github.workspace }}/sc/report/verdict.json
           SC_PREVIOUS: ${{ github.workspace }}/sc/previous
+          # The result of each job whose findings are units of a Rust row (sc.py
+          # RUST_FINDING_STEPS): a job that did not run wrote no findings file and left no gap,
+          # and a job that ran and wrote none is UNKNOWN. The cold control's two jobs run on every
+          # fifth cut only. The seeded call's result is the called workflow's own job result, since
+          # this row's verdict folds in the drift and compare jobs above.
+          SC_RUST_JOBS: "rust-test=${{ needs.rust-test.result }} rust-test-cold=${{ needs.rust-test-cold.result }} rust-test-drift=${{ needs.rust-test-drift.result }} rust-test-compare=${{ needs.rust-test-compare.result }} rust-test-macos=${{ needs.rust-test-macos.result }}"
         run: |
           mkdir -p "$SC/report" "$SC/results/sc-skip-lines" "$SC/build" "$SC/pc"
           # The control `silent=platforms`: the platform results are not read, so both rows must be UNKNOWN.
@@ -1221,6 +1273,11 @@ jobs:
             python3 tool/.github/sami-checks/sc.py platforms "$SC/pc" "$SC/results/sc-res-platforms" ||
               echo "::error::the platform report reader failed, so the platform rows read UNKNOWN"
           fi
+          # The Rust rows' findings as unit results, which the summary reads with every other
+          # result: a step of theirs whose findings file is missing or was cut short reads UNKNOWN,
+          # and so does every one of them when this command fails (no result file is written).
+          python3 tool/.github/sami-checks/sc.py rust-findings "$SC/findings" "$SC/results/sc-res-rust-findings" ||
+            echo "::error title=rust-findings::sc.py rust-findings failed, so the Rust rows' findings were not compared with the previous cut's"
           rc=0
           # The run-time half of skip-forms, a unit of its row: a result the summary reads like any other
           # (no file, as when this command fails, reads UNKNOWN).
