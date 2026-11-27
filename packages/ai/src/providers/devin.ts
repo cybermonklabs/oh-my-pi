@@ -273,7 +273,6 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			if (model.compat.modelRouter) {
 				assignment = await assignDevinModel(model, turn, chatBaseUrl, fetchImpl, options?.signal);
 				output.upstreamModel = assignment.modelUid;
-				turn.messages = keepAssignedModelThinking(turn.messages, model, assignment.modelUid);
 			}
 			// `/fast`: the effort's wire uid swaps for its fast-lane twin, billed at the lane's card.
 			const lane = assignment === undefined && options?.serviceTier === "priority" ? model.priorityLane : undefined;
