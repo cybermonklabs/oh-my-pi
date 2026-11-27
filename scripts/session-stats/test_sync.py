@@ -197,6 +197,66 @@ class EntryPatchSyncTest(unittest.TestCase):
             },
         )
 
+    # A database synced by an older `sync.py` (parser_version 6, before records applied) holds rows derived
+    # from unpatched entries; the next sync must rebuild them even when no new record arrives.
+    def test_rebuilds_rows_synced_at_parser_version_6_before_records_applied(self) -> None:
+        _append(
+            self.path,
+            [
+                _header(),
+                _user("u1", PROMPT),
+                _call("a1", "c1"),
+                _result("r1", "c1", OUTPUT),
+                _record("p1", [_content("u1", PROMPT_ELIDED), _content("r1", OUTPUT_ELIDED)]),
+            ],
+        )
+        with mock.patch.object(sync, "collect_entry_patches", return_value={}), mock.patch.object(
+            sync, "EDIT_PARSER_VERSION", 6
+        ):
+            self._sync()
+        self.assertEqual(self._rows()["users"], [("u1", PROMPT)])
+        self.assertEqual(self._rows()["results"], [("r1", OUTPUT)])
+
+        # Even with a new prompt appended (so the file is dirty without any new record), the bump forces a
+        # full rebuild of the earlier rows rather than an incremental tail read.
+        _append(self.path, [_user("u2", "next prompt")])
+        self._sync()
+        self.assertEqual(
+            self._rows(),
+            {
+                "results": [("r1", OUTPUT_ELIDED)],
+                "users": [("u1", PROMPT_ELIDED), ("u2", "next prompt")],
+                "offset": self.path.stat().st_size,
+            },
+        )
+
+    # When two entries share an id, the TypeScript reader patches only the last entry with that id; patching
+    # every duplicate would alter rows the TypeScript readers leave untouched.
+    def test_duplicate_entry_id_patches_only_the_last_entry(self) -> None:
+        _append(
+            self.path,
+            [
+                _header(),
+                _user("u1", "first prompt"),
+                _user("u1", "second prompt"),
+                _record("p1", [_content("u1", PROMPT_ELIDED)]),
+            ],
+        )
+        self._sync()
+        self.assertEqual(self._rows()["users"], [("u1", "first prompt"), ("u1", PROMPT_ELIDED)])
+
+    # A record whose `customType` is written with a JSON `\u` escape (`"entry\u005fpatch"`) is still an
+    # `entry_patch` record to `JSON.parse`, so the byte prefilter must not skip it.
+    def test_applies_record_whose_custom_type_uses_json_escape(self) -> None:
+        _append(self.path, [_header(), _user("u1", PROMPT)])
+        raw_record = json.dumps(_record("p1", [_content("u1", PROMPT_ELIDED)]), ensure_ascii=False)
+        escaped_record = raw_record.replace('"entry_patch"', '"entry\\u005fpatch"')
+        self.assertIn("\\u005f", escaped_record)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(escaped_record + "\n")
+        self._sync()
+        self.assertEqual(self._rows()["users"], [("u1", PROMPT_ELIDED)])
+
 
 if __name__ == "__main__":
     unittest.main()

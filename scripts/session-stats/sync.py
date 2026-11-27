@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from entry_patches import collect_entry_patches, patch_entry  # noqa: E402
+from entry_patches import collect_entry_patches, last_target_lines, patch_entry  # noqa: E402
 
 try:
     import tiktoken
@@ -59,9 +59,10 @@ DB_PATH = Path.home() / ".omp" / "stats.db"
 TOKENIZER_NAME = "o200k_base"
 SCHEMA_VERSION = 3
 # Bump whenever parse_hashline_input / find_longest_repeat / duplicated_anchors
-# / looks_successful / extract_warnings semantics change. Bump invalidates
-# previously-stored ss_edit_* rows on next sync.
-EDIT_PARSER_VERSION = 6
+# / looks_successful / extract_warnings or session-ingest semantics (e.g.
+# applying `entry_patch` records) change. Bump rebuilds every stored session's
+# rows on next sync.
+EDIT_PARSER_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS ss_sessions (
@@ -757,12 +758,16 @@ def parse_file(
         with path.open("rb") as f:
             # A record names entries before it, or after it: read the records first.
             patches = collect_entry_patches(_read_lines(f, starting_offset, st.st_size))
+            target_lines: dict[str, int] = {}
             # A record's content may hold a lone surrogate, as a line may (below).
             if patches:
+                target_lines = _scrub_surrogates(
+                    last_target_lines(_read_lines(f, starting_offset, st.st_size), patches)
+                )
                 patches = _scrub_surrogates(patches)
             # Ids of this read's entries a record of this read names.
             patched: set[str] = set()
-            for raw in _read_lines(f, starting_offset, st.st_size):
+            for line_no, raw in enumerate(_read_lines(f, starting_offset, st.st_size)):
                 offset += len(raw)
                 if not raw.strip():
                     seq += 1
@@ -780,7 +785,7 @@ def parse_file(
                 kind = ev.get("type")
                 ts = parse_iso_ms(ev.get("timestamp"))
                 entry_id = ev.get("id")
-                if patches and patch_entry(ev, patches):
+                if patches and patch_entry(ev, patches, line_no=line_no, target_lines=target_lines):
                     patched.add(entry_id)
 
                 if kind in ("title", "session") and seq <= 1:

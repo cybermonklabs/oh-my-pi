@@ -84,10 +84,13 @@ class EntryPatchToolIOTest(unittest.TestCase):
         self.path = self.sessions / "--work--" / "session-1.jsonl"
         self.path.parent.mkdir(parents=True)
 
-    def _invocations(self, entries: list[dict]) -> dict:
+    def _invocations(self, entries: list[dict | str]) -> dict:
         header = {"type": "session", "version": 3, "id": "session-1", "timestamp": "2026-11-20T10:00:00.000Z"}
         self.path.write_text(
-            "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in [header, *entries]),
+            "".join(
+                (entry if isinstance(entry, str) else json.dumps(entry, ensure_ascii=False)) + "\n"
+                for entry in [header, *entries]
+            ),
             encoding="utf-8",
         )
         config = ToolIOConfig(sessions_dir=self.sessions, include_unresolved=False)
@@ -148,6 +151,151 @@ class EntryPatchToolIOTest(unittest.TestCase):
             ]
         )
         self.assertEqual(invocations, {"c1": ({"path": "a.log"}, "reasoning one", "output one")})
+
+    # When two entries share an id, `@oh-my-pi/pi-utils/entry-patches` patches only the last entry with
+    # that id; patching every duplicate would disagree with every TypeScript reader.
+    def test_duplicate_entry_id_patches_only_the_last_entry(self) -> None:
+        invocations = self._invocations(
+            [
+                _call("a1", "c1", "a.log", "reasoning one"),
+                _result("r1", "c1", "output one"),
+                _call("a2", "c2", "b.log", "reasoning two"),
+                _result("r1", "c2", "output two"),
+                _record("p1", [_content("r1", _text(OUTPUT_ELIDED))]),
+            ]
+        )
+        self.assertEqual(
+            invocations,
+            {
+                "c1": ({"path": "a.log"}, "reasoning one", "output one"),
+                "c2": ({"path": "b.log"}, "reasoning two", OUTPUT_ELIDED),
+            },
+        )
+
+    # A record line whose `customType` carries a JSON `\u` escape (`"entry\u005fpatch"`) decodes to
+    # `"entry_patch"`, so the byte prefilter must not miss it.
+    def test_applies_record_whose_custom_type_uses_json_escape(self) -> None:
+        raw_record = json.dumps(_record("p1", [_content("r1", _text(OUTPUT_ELIDED))]), ensure_ascii=False)
+        escaped_record = raw_record.replace('"entry_patch"', '"entry\\u005fpatch"')
+        self.assertIn("\\u005f", escaped_record)
+        invocations = self._invocations(
+            [
+                _call("a1", "c1", "a.log", "reasoning one"),
+                _result("r1", "c1", "output one"),
+                escaped_record,
+            ]
+        )
+        self.assertEqual(invocations, {"c1": ({"path": "a.log"}, "reasoning one", OUTPUT_ELIDED)})
+
+    # An image block without string `data` makes the whole record malformed (matching `isContentBlock` in TS),
+    # so sibling patches in the same record do not apply; an image block with string `data` is valid.
+    def test_image_block_without_string_data_makes_the_record_malformed(self) -> None:
+        for bad_block in (
+            {"type": "image", "mimeType": "image/png"},
+            {"type": "image", "data": None, "mimeType": "image/png"},
+            {"type": "image", "data": 42, "mimeType": "image/png"},
+        ):
+            with self.subTest(bad_block=bad_block):
+                invocations = self._invocations(
+                    [
+                        _call("a1", "c1", "a.log", "reasoning one"),
+                        _result("r1", "c1", "output one"),
+                        _call("a2", "c2", "b.log", "reasoning two"),
+                        _result("r2", "c2", "output two"),
+                        _record("p1", [_content("r1", _text("[should-skip]")), _content("r2", [bad_block])]),
+                    ]
+                )
+                self.assertEqual(
+                    invocations,
+                    {
+                        "c1": ({"path": "a.log"}, "reasoning one", "output one"),
+                        "c2": ({"path": "b.log"}, "reasoning two", "output two"),
+                    },
+                )
+
+        valid_invocations = self._invocations(
+            [
+                _call("a1", "c1", "a.log", "reasoning one"),
+                _result("r1", "c1", "output one"),
+                _record(
+                    "p1",
+                    [
+                        _content(
+                            "r1",
+                            [
+                                {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+                                {"type": "text", "text": OUTPUT_ELIDED},
+                            ],
+                        )
+                    ],
+                ),
+            ]
+        )
+        self.assertEqual(valid_invocations, {"c1": ({"path": "a.log"}, "reasoning one", OUTPUT_ELIDED)})
+
+    # Every counter a patch sets (`tokensAfter`, `elidedOutputTokens`, `prunedAt`) must be a finite number
+    # (not bool, string, null, overflow float `1e400`, or integer past float range `10**400`, which JS reads
+    # as Infinity); a non-finite counter makes the whole record malformed.
+    def test_non_finite_or_non_numeric_counter_makes_the_record_malformed(self) -> None:
+        bad_counters = (
+            "1e400",
+            "-1e400",
+            str(10**400),
+            "true",
+            "false",
+            "null",
+            '"5"',
+        )
+        counter_fields = (
+            ("entry", "tokensAfter"),
+            ("message", "elidedOutputTokens"),
+            ("message", "prunedAt"),
+        )
+        for raw_counter in bad_counters:
+            for container, field in counter_fields:
+                with self.subTest(container=container, field=field, value=raw_counter):
+                    raw_record = (
+                        '{"type":"custom","customType":"entry_patch","id":"p1","parentId":null,'
+                        '"timestamp":"2026-11-20T10:00:02.000Z","data":{"patches":['
+                        + json.dumps(_content("r1", _text("[should-skip]")), ensure_ascii=False)
+                        + f',{{"entryId":"r2","{container}":{{"{field}":{raw_counter}}}}}'
+                        + "]}}"
+                    )
+                    invocations = self._invocations(
+                        [
+                            _call("a1", "c1", "a.log", "reasoning one"),
+                            _result("r1", "c1", "output one"),
+                            _call("a2", "c2", "b.log", "reasoning two"),
+                            _result("r2", "c2", "output two"),
+                            raw_record,
+                        ]
+                    )
+                    self.assertEqual(
+                        invocations,
+                        {
+                            "c1": ({"path": "a.log"}, "reasoning one", "output one"),
+                            "c2": ({"path": "b.log"}, "reasoning two", "output two"),
+                        },
+                    )
+
+        # Valid finite numbers (including 0, -0.0, 1e308, underflow 1e-400, 10**300) are accepted.
+        for raw_counter in ("0", "-0.0", "1e308", "1e-400", str(10**300)):
+            with self.subTest(valid_value=raw_counter):
+                raw_record = (
+                    '{"type":"custom","customType":"entry_patch","id":"p1","parentId":null,'
+                    '"timestamp":"2026-11-20T10:00:02.000Z","data":{"patches":['
+                    + json.dumps(_content("r1", _text(OUTPUT_ELIDED)), ensure_ascii=False)
+                    + f',{{"entryId":"r1","message":{{"prunedAt":{raw_counter}}}}}'
+                    + "]}}"
+                )
+                invocations = self._invocations(
+                    [
+                        _call("a1", "c1", "a.log", "reasoning one"),
+                        _result("r1", "c1", "output one"),
+                        raw_record,
+                    ]
+                )
+                self.assertEqual(invocations, {"c1": ({"path": "a.log"}, "reasoning one", OUTPUT_ELIDED)})
 
 
 if __name__ == "__main__":

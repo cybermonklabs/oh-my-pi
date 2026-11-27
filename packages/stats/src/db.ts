@@ -154,8 +154,12 @@ const SPOTLIGHT_TOGGLE_BACKFILL_KEY = "spotlight_v6_toggle";
 // tail read that stored the entry's rows, then met the record) are derived
 // again once, from entries carrying those fields. Only files modified since
 // the code that writes the records was committed can hold one, so older
-// cursors stay put.
+// cursors stay put. `v2`: cursors persisted by an earlier build that already
+// spent `entry_patch_v1` carry no record parents, so a reply appended after a
+// record in a later sync leaves its prompt unlinked; re-derive those files
+// once so their cursors record the parents.
 const ENTRY_PATCH_BACKFILL_KEY = "entry_patch_v1";
+const ENTRY_PATCH_RECORD_PARENTS_BACKFILL_KEY = "entry_patch_v2";
 const ENTRY_PATCH_SINCE_MS = Date.parse("2026-11-15T13:34:58Z");
 function shouldResetBackfill(value: string | undefined): boolean {
 	return value !== BACKFILL_COMPLETE && value !== BACKFILL_PENDING;
@@ -548,6 +552,7 @@ export async function initDb(): Promise<Database> {
 	reparseSpotlightSessions(db, SPOTLIGHT_ARG_TOKENS_BACKFILL_KEY);
 	reparseModifiedSince(db, SPOTLIGHT_TOGGLE_BACKFILL_KEY, SPOTLIGHT_SINCE_MS);
 	reparseModifiedSince(db, ENTRY_PATCH_BACKFILL_KEY, ENTRY_PATCH_SINCE_MS);
+	reparseModifiedSince(db, ENTRY_PATCH_RECORD_PARENTS_BACKFILL_KEY, ENTRY_PATCH_SINCE_MS);
 	ensureRollupSchema(db);
 	return db;
 }
@@ -791,7 +796,8 @@ function backfillNoCacheInputCosts(database: Database): void {
  * replacing their rows. Keys: {@link SPOTLIGHT_BACKFILL_KEY} (the Spotlight
  * tables are new), {@link SPOTLIGHT_TOGGLE_BACKFILL_KEY} (the experiment became
  * a toggle), both since {@link SPOTLIGHT_SINCE_MS}; {@link ENTRY_PATCH_BACKFILL_KEY}
- * (entries carry their records' fields) since {@link ENTRY_PATCH_SINCE_MS}.
+ * (entries carry their records' fields) and {@link ENTRY_PATCH_RECORD_PARENTS_BACKFILL_KEY}
+ * (cursors carry record parents for prompt-to-model links) since {@link ENTRY_PATCH_SINCE_MS}.
  */
 function reparseModifiedSince(database: Database, key: string, sinceMs: number): void {
 	const row = database.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?").get(key);

@@ -472,6 +472,106 @@ describe("a session whose passes appended entry_patch records reads as with thos
 		expect(offsetOnly.userLinks.map(link => link.entryId)).toEqual(["two-user-patched"]);
 	});
 
+	// A database built by an earlier release that already spent `entry_patch_v1` holds cursors without
+	// `recordParents`. Without a second one-time backfill key at the same cutoff, a reply appended after a
+	// record in a later sync leaves the prompt's model null. Files modified before the cutoff keep their
+	// cursors, and a later open derives nothing again.
+	it("re-derives once for cursors that spent entry_patch_v1 without recordParents so a later reply links its prompt", async () => {
+		const patched = sessionPath("m1-cursor-patched");
+		const old = await writeSession("inline");
+		const beforeRecords = new Date("2026-11-01T00:00:00Z");
+		await fs.utimes(old, beforeRecords, beforeRecords);
+
+		const promptAndRecord = [
+			{ type: "session", version: 3, id: "m1-session", timestamp: iso(T), cwd: "/repo" },
+			{
+				type: "message",
+				id: "m1-user",
+				parentId: null,
+				timestamp: iso(T + 1000),
+				message: { role: "user", content: PROMPT, timestamp: T + 1000 },
+			},
+			{
+				type: "custom",
+				customType: "entry_patch",
+				id: "m1-elide",
+				parentId: "m1-user",
+				timestamp: iso(T + 1500),
+				data: { patches: [{ entryId: "m1-user", message: { content: PROMPT_ELIDED } }] },
+			},
+		];
+		const reply = {
+			type: "message",
+			id: "m1-reply",
+			parentId: "m1-elide",
+			timestamp: iso(T + 2000),
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "Done." }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-opus-4-5",
+				stopReason: "stop",
+				timestamp: T + 2000,
+				duration: 500,
+				usage: USAGE,
+			},
+		};
+		await Bun.write(patched, `${promptAndRecord.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		await syncAllSessions({ workers: 1 });
+
+		// Simulate a database built by M1: `entry_patch_v1` is complete, no later `entry_patch_*` key has
+		// been seen, and the saved cursor carries no `recordParents`.
+		let db = await initDb();
+		const cursorRow = db
+			.query<{ parser_state: string }, [string]>("SELECT parser_state FROM file_offsets WHERE session_file = ?")
+			.get(patched);
+		expect(cursorRow?.parser_state).toBeTruthy();
+		const m1State = JSON.parse(cursorRow!.parser_state);
+		delete m1State.recordParents;
+		db.prepare("UPDATE file_offsets SET parser_state = ? WHERE session_file = ?").run(
+			JSON.stringify(m1State),
+			patched,
+		);
+		// Sentinel on the pre-cutoff file: a re-derive of `old` would overwrite it.
+		db.prepare("UPDATE user_messages SET chars = -7 WHERE session_file = ?").run(old);
+		db.prepare("DELETE FROM meta WHERE key LIKE 'entry_patch_%' AND key <> 'entry_patch_v1'").run();
+		closeDb();
+
+		// Append the reply whose parent is the record, then sync.
+		await fs.appendFile(patched, `${JSON.stringify(reply)}\n`);
+		await syncAllSessions({ workers: 1 });
+
+		db = await initDb();
+		const promptRow = db
+			.query<{ entry_id: string; model: string | null; provider: string | null; chars: number }, [string]>(
+				"SELECT entry_id, model, provider, chars FROM user_messages WHERE session_file = ?",
+			)
+			.get(patched);
+		const oldChars = db
+			.query<{ chars: number }, [string]>("SELECT chars FROM user_messages WHERE session_file = ?")
+			.get(old)?.chars;
+		expect({ promptRow, oldChars }).toEqual({
+			promptRow: {
+				entry_id: "m1-user",
+				model: "claude-opus-4-5",
+				provider: "anthropic",
+				chars: PROMPT_ELIDED.length,
+			},
+			oldChars: -7,
+		});
+
+		// A later open does not re-derive again.
+		db.prepare("UPDATE user_messages SET chars = -9 WHERE session_file = ?").run(patched);
+		closeDb();
+		const later = await syncAllSessions({ workers: 1 });
+		db = await initDb();
+		const laterChars = db
+			.query<{ chars: number }, [string]>("SELECT chars FROM user_messages WHERE session_file = ?")
+			.get(patched)?.chars;
+		expect({ later, laterChars }).toEqual({ later: { processed: 0, files: 0 }, laterChars: -9 });
+	});
+
 	it("the prefix scan of an offset-only read reads its entries with the fields the records set", async () => {
 		for (const form of FORMS) {
 			const b = new SpotlightSessionBuilder(T).header("/repo").marker();
