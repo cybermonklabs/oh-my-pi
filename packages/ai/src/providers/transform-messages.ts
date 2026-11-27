@@ -1743,3 +1743,4 @@ function foldUserMessagesIntoToolResults(messages: Message[]): Message[] {
 	}
 	return folded;
 }
+export const plantedCheckControl: number = "the check must fail on this line";
