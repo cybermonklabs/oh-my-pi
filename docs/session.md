@@ -557,10 +557,13 @@ of the file's, so a mask entry is only added. A value only that other project ho
 one way: it never reaches the model, and the subagent's own tool calls get its placeholder
 rather than the value, so nothing it reads in its own directory can ask for that project's
 credential; a placeholder a regex mints over text that takes in such a value is one-way too.
-A value the file's own project, the global file or the environment also holds keeps
-restoring. The directories masked one way carry down the chain: the subagent's transcript
-records them (a custom entry), every later revive loads them again, and a subagent it spawns
-masks them the same way. The stored
+A plain value the file's own project, the global file or the environment names keeps
+restoring. A placeholder whose value one of the other project's regexes matches, whole or in
+part, is one-way, even where the subagent's own regex found it: it stays masked, but an
+exact-match edit of it does not round-trip. The directories masked one way carry down the
+chain: the subagent's transcript records them (a custom entry), every later revive loads them
+again, and a subagent it spawns masks them the same way; a subagent spawned into a directory
+other than its spawner's masks that spawner's project the same way. The stored
 settings overlay restores over the live parent's settings as a derived overlay, whatever
 flag the file holds, so the file's settings never become grant authority, and each stored
 setting is checked as a settings override is; an overlay that fails the check is replaced

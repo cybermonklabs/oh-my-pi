@@ -422,6 +422,13 @@ export interface ExecutorOptions {
 	 * `secretsProjectDirs`): the subagent's mask holds them mask-only too, and so does each of its revives.
 	 */
 	secretsProjectDirs?: readonly string[];
+	/**
+	 * The working directory of the session that spawned this subagent. Where the subagent's own directory is
+	 * another one (`worktree`, or a `cwd` of its own), its mask loads that project's secrets mask-only, as a
+	 * revive into another directory does: the subagent hides its spawner's values, and no tool call of its own
+	 * turns a placeholder of one back into the value.
+	 */
+	spawnerCwd?: string;
 	/** Exact provider credential resolver inherited from the parent session. */
 	getApiKey?: CreateAgentSessionOptions["getApiKey"];
 	/** Parent session's manager; the child and its revived turns use this exact delivery scope. */
@@ -4250,6 +4257,23 @@ function withLocalSignal<T extends { signal?: AbortSignal }>(options: T): T {
 }
 
 /**
+ * The project directories a spawn's mask holds MASK-ONLY ({@link SecretEntry.maskOnly}): those its spawner already
+ * holds that way, and, where the subagent works in another directory than its spawner (a worktree, a cwd of its
+ * own), the spawner's directory. A subagent in its spawner's own directory loads that project as its own, as
+ * before, so its exact-match edits round-trip; one working elsewhere hides those values without being able to hand
+ * them back, which is the rule a revive into another directory follows. Undefined where there is none.
+ */
+function maskOnlySpawnDirs(
+	options: Pick<ExecutorOptions, "secretsProjectDirs" | "spawnerCwd">,
+	effectiveCwd: string,
+): string[] | undefined {
+	const dirs = new Set((options.secretsProjectDirs ?? []).map(dir => path.resolve(dir)));
+	const spawner = options.spawnerCwd === undefined ? undefined : path.resolve(options.spawnerCwd);
+	if (spawner !== undefined && spawner !== path.resolve(effectiveCwd)) dirs.add(spawner);
+	return dirs.size > 0 ? [...dirs] : undefined;
+}
+
+/**
  * Run a single agent on the calling thread: create the child session here, drive and
  * monitor it, and finalize its lifecycle. {@link runSubprocess} routes here.
  */
@@ -4766,6 +4790,10 @@ async function runSubprocessOnThisThread(options: SubagentRunOptions): Promise<S
 			// The spawner's objects: the live inputs of this build and of its warm revives.
 			const live: SubagentLiveInputs = {
 				...spawnerLiveInputs(options, subagentAgentIdentity),
+				// A subagent that works in another directory than its spawner (a worktree, a cwd of its own) hides
+				// that spawner's project secrets as a revive into another directory does: mask-only, so they never
+				// reach its model and no tool call of its own turns a placeholder of one back into the value.
+				secretsProjectDirs: maskOnlySpawnDirs(options, effectiveCwd),
 				authStorage,
 				modelRegistry,
 				oauthAccountPools: options.oauthAccountPools,

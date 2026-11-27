@@ -632,6 +632,7 @@ export type SubagentSpawnerLiveInputs = Pick<
 	| "preloadedCustomToolPaths"
 	| "localProtocolOptions"
 	| "secretsProjectDirs"
+	| "spawnerCwd"
 	| "parentArtifactManager"
 	| "parentHindsightSessionState"
 	| "parentMnemopiSessionState"

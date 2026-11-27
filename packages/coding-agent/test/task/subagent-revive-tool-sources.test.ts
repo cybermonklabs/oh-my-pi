@@ -925,7 +925,7 @@ describe("a nested child of a live subagent that works in its own directory, the
 		await process?.close();
 	}, 30_000);
 
-	it("worktree child: the cold revive takes the live parent's custom-tool paths, MCP manager and extensions, and no secretsProjectDirs, as the warm revive does", () => {
+	it("worktree child: both revives take the live parent's custom-tool paths, MCP manager and extensions, and the root project the parent masks one way", () => {
 		const observed = (revived: RevivedSubagent | undefined) => {
 			const options = revived?.build.options;
 			return {
@@ -933,6 +933,8 @@ describe("a nested child of a live subagent that works in its own directory, the
 				parentCustomToolPaths: options?.preloadedCustomToolPaths === parent?.customToolPaths,
 				parentMcpManager: options?.mcpManager === parent?.mcpManager,
 				parentExtensions: options?.preloadedPreparedExtensions === parent?.preparedExtensions,
+				// The parent was spawned into the worktree, so the root's project is mask-only for it; the child
+				// works in the same worktree, so it takes that one directory and adds none of its own.
 				secretsProjectDirs: options?.secretsProjectDirs,
 			};
 		};
@@ -941,7 +943,7 @@ describe("a nested child of a live subagent that works in its own directory, the
 			parentCustomToolPaths: true,
 			parentMcpManager: true,
 			parentExtensions: true,
-			secretsProjectDirs: undefined,
+			secretsProjectDirs: [process?.env.cwd],
 		};
 		expect({ cold: observed(cold), warm: observed(warm) }).toEqual({ cold: expected, warm: expected });
 	}, 30_000);

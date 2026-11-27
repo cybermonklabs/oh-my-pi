@@ -1926,6 +1926,136 @@ describe("project secrets all down a revive chain", () => {
 	}, 30_000);
 });
 
+/** A secret of the directory a subagent of the cases below works in, which is not its spawner's. */
+const SECRET_W = "fixture-secret-whiskey-61a9c3f0";
+const WHISKEY_FILE = "whiskey.txt";
+const WHISKEY_ROW = "whiskey row:";
+
+/** What one live spawn did with its spawner's secret and its own directory's. */
+interface SpawnStep {
+	/** Where its tools ran. */
+	cwd: string | undefined;
+	/** The mask-only directories its build loaded. */
+	dirs: string[] | undefined;
+	/** The request after it read SA, its spawner's secret, in its own directory. */
+	alphaRequest: RecordedRequest | undefined;
+	/** The request after it read SW, its own directory's secret. */
+	whiskeyRequest: RecordedRequest | undefined;
+	/** What its own write call wrote from SA's placeholder, and from SW's. */
+	wroteAlpha: string | undefined;
+	wroteWhiskey: string | undefined;
+}
+
+describe("a live spawn into another directory and its spawner's project secrets", () => {
+	// The root works in A, whose secrets.yml names SA. A subagent spawned into another directory (an isolated run's
+	// worktree, or a cwd of its own) reads A's values from files it meets there, so they must be masked for it as
+	// they are for a subagent in A; and because that directory is not theirs, its own tool calls must never turn a
+	// placeholder of one back into the value, as a revive into another directory must not.
+	let env: ReviveEnv | undefined;
+	let worktree = "";
+	let other = "";
+	const placeholder = { alpha: "", whiskey: "" };
+	const spawns: Partial<Record<"same" | "worktree" | "cwd", SpawnStep>> = {};
+
+	/** Gives `dir` a project secrets.yml naming SW, and files holding SA and SW. */
+	async function otherProject(dir: string): Promise<void> {
+		await fs.mkdir(path.join(dir, ".omp"), { recursive: true });
+		await Bun.write(path.join(dir, ".omp", "secrets.yml"), `- type: plain\n  content: ${SECRET_W}\n`);
+		await Bun.write(path.join(dir, ALPHA_FILE), `${ALPHA_ROW} ${SECRET_A}\n`);
+		await Bun.write(path.join(dir, WHISKEY_FILE), `${WHISKEY_ROW} ${SECRET_W}\n`);
+	}
+
+	/** `id`'s next turns read SA and SW where its tools run, then write each one's placeholder. */
+	async function spawnStep(id: string, cwd: string): Promise<SpawnStep> {
+		const live = env!;
+		const session = liveSession(id);
+		const build = live.builds.findLast(entry => entry.options.agentId === id);
+		readOnWake(live, ALPHA_FILE);
+		await live.wake(session, id);
+		const alphaRequest = live.requests.at(-1);
+		readOnWake(live, WHISKEY_FILE);
+		await live.wake(session, id);
+		const whiskeyRequest = live.requests.at(-1);
+		const write = async (file: string, content: string): Promise<string | undefined> => {
+			live.turns = { ...live.turns, wakeToolCall: { name: "write", arguments: { path: file, content } } };
+			await live.wake(session, id);
+			return await fs.readFile(path.join(cwd, file), "utf8").catch(() => undefined);
+		};
+		const wroteAlpha = await write(`${id}-alpha.txt`, placeholder.alpha);
+		const wroteWhiskey = await write(`${id}-whiskey.txt`, placeholder.whiskey);
+		readOnWake(live);
+		return {
+			cwd: build?.options.cwd,
+			dirs: build?.options.secretsProjectDirs,
+			alphaRequest,
+			whiskeyRequest,
+			wroteAlpha,
+			wroteWhiskey,
+		};
+	}
+
+	beforeAll(async () => {
+		const opened = await openTestProcess({ "secrets.enabled": true });
+		env = opened.env;
+		await writeSecretProjects(env);
+		worktree = path.join(env.root, "worktree-w");
+		other = path.join(env.root, "dir-v");
+		await otherProject(worktree);
+		await otherProject(other);
+		await Bun.write(path.join(env.cwd, WHISKEY_FILE), `${WHISKEY_ROW} ${SECRET_W}\n`);
+		// The control: a spawn in A, the spawner's own directory.
+		await env.spawn(taskSpawn(env, opened.root.toolSession, "SpawnSame"));
+		const key = await getSecretPlaceholderKey(
+			env.builds.findLast(entry => entry.options.agentId === "SpawnSame")?.options.agentDir,
+		);
+		const placeholderOf = (secret: string): string =>
+			new SecretObfuscator([{ type: "plain", content: secret, mode: "obfuscate" }], key).obfuscate(secret);
+		placeholder.alpha = placeholderOf(SECRET_A);
+		placeholder.whiskey = placeholderOf(SECRET_W);
+		spawns.same = await spawnStep("SpawnSame", env.cwd);
+		// An isolated run works in its worktree (`effectiveCwd = worktree ?? cwd`, executor.ts).
+		await env.spawn(taskSpawn(env, opened.root.toolSession, "SpawnWorktree", { worktree }));
+		spawns.worktree = await spawnStep("SpawnWorktree", worktree);
+		// A spawn whose cwd is another directory.
+		await env.spawn(taskSpawn(env, opened.root.toolSession, "SpawnCwd", { cwd: other }));
+		spawns.cwd = await spawnStep("SpawnCwd", other);
+	}, 180_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	it("live spawn, same directory: the spawner's project is the subagent's own, so SA is masked and restores", () => {
+		expect(spawns.same?.cwd).toBe(env?.cwd);
+		expect(spawns.same?.dirs).toBeUndefined();
+		expect(carries(spawns.same?.alphaRequest, ALPHA_ROW)).toBe(true);
+		expect(carries(spawns.same?.alphaRequest, SECRET_A)).toBe(false);
+		expect(spawns.same?.wroteAlpha).toBe(SECRET_A);
+	}, 30_000);
+
+	for (const [name, where] of [
+		["worktree", () => worktree],
+		["cwd", () => other],
+	] as const) {
+		it(`live spawn, ${name}: the subagent runs in another directory, and its own project's secret restores`, () => {
+			expect(spawns[name]?.cwd).toBe(where());
+			expect(carries(spawns[name]?.whiskeyRequest, WHISKEY_ROW)).toBe(true);
+			expect(carries(spawns[name]?.whiskeyRequest, SECRET_W)).toBe(false);
+			expect(spawns[name]?.wroteWhiskey).toBe(SECRET_W);
+		}, 30_000);
+
+		it(`live spawn, ${name}: its mask holds the spawner's project, and SA never goes out in clear`, () => {
+			expect(spawns[name]?.dirs).toContain(env?.cwd);
+			expect(carries(spawns[name]?.alphaRequest, ALPHA_ROW)).toBe(true);
+			expect(carries(spawns[name]?.alphaRequest, SECRET_A)).toBe(false);
+		}, 30_000);
+
+		it(`live spawn, ${name}: SA's placeholder in its own tool call reaches the tool as the placeholder, never as SA`, () => {
+			expect(spawns[name]?.wroteAlpha).toBe(placeholder.alpha);
+		}, 30_000);
+	}
+});
+
 describe("project secrets after the root session moved, secrets.enabled turned on after the cold revive", () => {
 	const id = "SecretsTurnedOn";
 	let env: ReviveEnv | undefined;

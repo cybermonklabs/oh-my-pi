@@ -1370,8 +1370,9 @@ export class VibeSessionRegistry {
 			preloadedPreparedExtensions: session.preparedExtensions,
 			preloadedCustomToolPaths: session.customToolPaths,
 			localProtocolOptions,
-			// The source projects the spawner masks one way: its workers mask them one way too.
+			// The source projects the spawner masks one way, and its own directory where the worker runs elsewhere.
 			secretsProjectDirs: session.secretsProjectDirs,
+			spawnerCwd: session.cwd,
 			parentArtifactManager: session.getArtifactManager?.() ?? undefined,
 			parentHindsightSessionState: session.getHindsightSessionState?.(),
 			parentMnemopiSessionState: session.getMnemopiSessionState?.(),

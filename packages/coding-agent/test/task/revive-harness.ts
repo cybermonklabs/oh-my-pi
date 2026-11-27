@@ -554,6 +554,7 @@ export function spawnerOptions(session: ToolSession, restrictToolNames = false):
 		parentArtifactManager: session.getArtifactManager?.() ?? undefined,
 		parentHindsightSessionState: session.getHindsightSessionState?.(),
 		secretsProjectDirs: session.secretsProjectDirs,
+		spawnerCwd: session.cwd,
 		parentMnemopiSessionState: session.getMnemopiSessionState?.(),
 		parentTelemetry: session.getTelemetry?.(),
 		parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
