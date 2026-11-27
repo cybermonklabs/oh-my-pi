@@ -45,9 +45,11 @@ if ! { install -d -o root -g root -m 1777 "$(dirname "$fifo")" && mkfifo -m 0666
 	echo "::error::the sticky FIFO $fifo was not made"
 	exit 1
 fi
-# The tests' environment: set.sh's and nextest.sh's, with this user's home and temporary directory.
+# The tests' environment: set.sh's and nextest.sh's, with this user's home and temporary directory,
+# and gvisor for PI_VFS_TEST_KERNEL, the kernel the tests run on: this script has read gVisor's own
+# banner in dmesg above, so runsc runs them, whatever uname says.
 envv=(HOME="$home" USER="$user" LOGNAME="$user" PATH="$SC_TEST_PATH" RUST_BACKTRACE=1 RSYNC_REFERENCE_REQUIRED=1
-	PI_TEST_STICKY_FIFO="$fifo")
+	PI_TEST_STICKY_FIFO="$fifo" PI_VFS_TEST_KERNEL=gvisor)
 pf=$(cat /proc/sys/fs/protected_fifos 2>&1) || true
 echo "GVISOR $who $part $shard: uid=$("${as[@]}" id -u) kernel=$(uname -r) cpus=$(nproc) fs.protected_fifos=[$pf] [${b%%$'\n'*}]"
 
