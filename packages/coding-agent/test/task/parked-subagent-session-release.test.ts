@@ -24,9 +24,11 @@ import { createMockModel, type MockHandler, type MockModel, registerMockApi } fr
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { artifactsDirsFromRegistry } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -38,12 +40,14 @@ import {
 import { cfgSecretsMaskSessionStore } from "@oh-my-pi/pi-coding-agent/secrets/settings";
 import { cfgContextPromotionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
-import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { __resetDirsFromEnvForTests, isRecord, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { localSession } from "../helpers/local-session";
@@ -828,37 +832,39 @@ it("keeps no model the registry replaced after the park, and revives on the regi
 	}
 }, 30_000);
 
+/** Answers `done` (through `yield` when the run offers it), or `label` to the task label call, which offers no tools. */
+const doneHandler: MockHandler = context => {
+	const tools = context.tools ?? [];
+	if (tools.some(tool => tool.name === "yield")) {
+		return { content: [{ type: "toolCall", name: "yield", arguments: { type: "result", data: "done" } }] };
+	}
+	return { content: [tools.some(tool => tool.name === "read") ? "done" : "label"] };
+};
+
+/** A skill the parent session loaded, which each of its spawns passes on. */
 function skillNamed(name: string): Skill {
-	return {
-		name,
-		description: `The ${name} skill`,
-		filePath: `/skills/${name}/SKILL.md`,
-		baseDir: `/skills/${name}`,
-		source: "user",
-	};
+	const baseDir = path.join(root, "skills", name);
+	return { name, description: `The ${name} skill`, filePath: path.join(baseDir, "SKILL.md"), baseDir, source: "user" };
 }
 
-/** A parent session, and the spawns of its kept-alive children. */
-interface SkillParent {
-	/** The skills each child session build was handed, in order. */
-	forwarded: Array<readonly Skill[] | undefined>;
-	/** Runs child `id` to its finished keep-alive state and returns the skills its live session holds. */
-	spawn(id: string): Promise<readonly Skill[]>;
-	close(): void;
+function namesOf(skills: readonly Skill[]): string[] {
+	return skills.map(skill => skill.name);
 }
 
-/** A parent session whose skills are what `skills` returns when a child spawns. */
-async function skillParent(skills: () => Skill[]): Promise<SkillParent> {
-	const cwd = path.join(root, "home", "work");
-	await fs.mkdir(cwd, { recursive: true });
+/** The mock model a parent's children run on, and the auth and model registry that resolve it. */
+interface ChildModel {
+	authStorage: AuthStorage;
+	modelRegistry: ModelRegistry;
+	/** Parent settings that run each child once on the mock model and leave it kept alive until the test parks it. */
+	settings: Settings;
+	/** Drops the mock's recorded calls: their stream options hold closures bound to the children's sessions. */
+	releaseRecordings(): void;
+}
+
+function childModel(): ChildModel {
 	const authStorage = createInMemoryAuthStorage();
 	authStorage.keys.setRuntime("mock", "test-key");
-	const model = createMockModel({
-		handler: context =>
-			(context.tools ?? []).some(tool => tool.name === "yield")
-				? { content: [{ type: "toolCall", name: "yield", arguments: { type: "result", data: "done" } }] }
-				: { content: ["label"] },
-	});
+	const model = createMockModel({ handler: doneHandler });
 	const modelRegistry = new ModelRegistry(authStorage, path.join(root, "models.yml"));
 	const find = modelRegistry.find.bind(modelRegistry);
 	vi.spyOn(modelRegistry, "find").mockImplementation((provider, id) =>
@@ -866,6 +872,35 @@ async function skillParent(skills: () => Skill[]): Promise<SkillParent> {
 	);
 	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(() => [model]);
 	vi.spyOn(modelRegistry, "getAll").mockImplementation(() => [model]);
+	const selector = `mock/${model.id}`;
+	const settings = Settings.isolated({
+		"task.agentIdleTtlMs": 0,
+		"task.isolation.enabled": false,
+		"async.enabled": false,
+		"compaction.enabled": false,
+		"retry.enabled": false,
+		"todo.enabled": false,
+		"todo.reminders": false,
+		"advisor.enabled": false,
+		// Vibe workers select their model by role: `good` ones through `task`, `fast` ones through `smol`.
+		modelRoles: { default: selector, task: selector, smol: selector },
+	});
+	return { authStorage, modelRegistry, settings, releaseRecordings: () => model.reset() };
+}
+
+/** A parent session, and the spawns of its kept-alive children. */
+interface SkillParent {
+	/** Runs child `id` to its finished keep-alive state and returns the names of the skills its live session holds. */
+	spawn(id: string): Promise<string[]>;
+	releaseRecordings(): void;
+	close(): void;
+}
+
+/** A parent session whose skills are what `skills` returns when a child spawns. */
+async function skillParent(skills: () => readonly Skill[]): Promise<SkillParent> {
+	const cwd = path.join(root, "home", "work");
+	await fs.mkdir(cwd, { recursive: true });
+	const { authStorage, modelRegistry, settings, releaseRecordings } = childModel();
 	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 		agents: [
 			{
@@ -879,26 +914,17 @@ async function skillParent(skills: () => Skill[]): Promise<SkillParent> {
 		projectAgentsDir: null,
 	});
 
-	const parent = {
+	const session: ToolSession = {
 		cwd,
 		hasUI: false,
-		settings: Settings.isolated({
-			"task.agentIdleTtlMs": 0,
-			"task.isolation.enabled": false,
-			"async.enabled": false,
-			"compaction.enabled": false,
-			"retry.enabled": false,
-			"todo.enabled": false,
-			"todo.reminders": false,
-			"advisor.enabled": false,
-			modelRoles: { default: `mock/${model.id}` },
-		}),
+		settings,
 		authStorage,
 		modelRegistry,
 		enableMCP: false,
 		enableLsp: false,
 		enableIrc: false,
-		getSessionFile: () => null,
+		// The children's transcripts go next to it, under the test's root, where they outlive each run for a revive.
+		getSessionFile: () => path.join(root, "parent.jsonl"),
 		getSessionSpawns: () => "*",
 		getSessionAgents: () => [],
 		get skills() {
@@ -909,20 +935,11 @@ async function skillParent(skills: () => Skill[]): Promise<SkillParent> {
 		rules: [],
 		extensionPaths: [],
 		customToolPaths: [],
-	} as unknown as ToolSession;
-
-	// What the spawn hands the child's session, and what the live child holds.
-	const forwarded: Array<readonly Skill[] | undefined> = [];
-	const createAgentSession = sdkModule.createAgentSession;
-	vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-		forwarded.push(options?.skills);
-		return createAgentSession(options);
-	});
+	};
 	return {
-		forwarded,
 		spawn: async id => {
 			const { result } = await runStructuredSubagent({
-				session: parent,
+				session,
 				invocationKind: "task",
 				assignment: "report done",
 				agent: "skill-agent",
@@ -930,121 +947,343 @@ async function skillParent(skills: () => Skill[]): Promise<SkillParent> {
 				identity: { id },
 			});
 			expect(result.exitCode, result.error).toBe(0);
-			return localSession(AgentRegistry.global().get(id)?.session).skills;
+			return namesOf(localSession(AgentRegistry.global().get(id)?.session).skills);
 		},
+		releaseRecordings,
 		close: () => authStorage.close(),
 	};
 }
 
-// If this regresses, each child a parent spawns gets a copy of the parent's whole skill list of its own, and a kept-alive
-// one keeps it for as long as it can be revived, so a process that parks many subagents holds a list for each; or a
-// child that is spawned once its parent replaced its list gets the old skills from a copy made before.
-it("gives every child of one parent the same frozen copy of its skills", async () => {
-	let parentSkills: Skill[] = ["alpha", "beta", "gamma"].map(skillNamed);
-	const { forwarded, spawn, close } = await skillParent(() => parentSkills);
-	try {
-		const heldByFirst = await spawn("SkillsFirst");
-		const heldBySecond = await spawn("SkillsSecond");
-		const [shared] = forwarded;
-		expect({
-			spawns: forwarded.length,
-			sameList: forwarded[0] === forwarded[1],
-			childrenHoldIt: heldByFirst === shared && heldBySecond === shared,
-			frozen: Object.isFrozen(shared),
-			parentsSkillsInOrder:
-				shared?.length === parentSkills.length && parentSkills.every((skill, index) => shared[index] === skill),
-		}).toEqual({ spawns: 2, sameList: true, childrenHoldIt: true, frozen: true, parentsSkillsInOrder: true });
+/** A Vibe parent session with a session file under the test's root, and the spawns of its workers. */
+interface VibeParent {
+	/** Spawns a `good` worker named `name`, waits for its first turn to settle, and returns the worker's id. */
+	spawn(name: string): Promise<string>;
+	releaseRecordings(): void;
+	/** The `omp-vibe-*` directories made in the temp dir, and the temp dirs still registered as artifact dirs. */
+	tempArtifactDirs(): Promise<{ made: string[]; registered: string[] }>;
+	close(): Promise<void>;
+}
 
-		// The parent replaces its list, as a skill refresh does: the next child gets a copy of the new one.
+/** A Vibe parent session whose skills are what `skills` returns when a worker spawns. */
+async function vibeParent(skills: () => readonly Skill[]): Promise<VibeParent> {
+	const cwd = path.join(root, "home", "work");
+	await fs.mkdir(cwd, { recursive: true });
+	// A worker spawned without a parent session file gets an `omp-vibe-*` artifact dir in the temp dir, registered for
+	// the life of the process. The temp dir is moved under the test's root so that any such dir is seen and removed.
+	const tmp = path.join(root, "tmp");
+	await fs.mkdir(tmp, { recursive: true });
+	vi.spyOn(os, "tmpdir").mockReturnValue(tmp);
+	const { authStorage, modelRegistry, settings, releaseRecordings } = childModel();
+	// The workers' transcripts and artifacts go next to the parent's session file, under the test's root.
+	const sessionManager = SessionManager.create(cwd, path.join(root, "sessions"));
+	const asyncJobManager = new AsyncJobManager({ onJobComplete: () => {} });
+	const session: ToolSession = {
+		cwd,
+		hasUI: false,
+		settings,
+		authStorage,
+		modelRegistry,
+		asyncJobManager,
+		sessionManager,
+		getSessionId: () => sessionManager.getSessionId(),
+		getSessionFile: () => sessionManager.getSessionFile() ?? null,
+		getSessionSpawns: () => "*",
+		getArtifactsDir: () => null,
+		taskDepth: 0,
+		enableLsp: false,
+		get skills() {
+			return skills();
+		},
+		contextFiles: [],
+		promptTemplates: [],
+		rules: [],
+		extensionPaths: [],
+		customToolPaths: [],
+	};
+	return {
+		spawn: async name => {
+			const { id, jobId } = await VibeSessionRegistry.global().spawn(session, {
+				cli: "good",
+				name,
+				prompt: "report done",
+			});
+			const job = asyncJobManager.getJob(jobId);
+			await job?.promise;
+			expect(job?.status, job?.errorText).toBe("completed");
+			return id;
+		},
+		releaseRecordings,
+		tempArtifactDirs: async () => ({
+			made: (await fs.readdir(tmp)).filter(name => name.startsWith("omp-vibe-")),
+			registered: artifactsDirsFromRegistry().filter(dir => dir.startsWith(tmp)),
+		}),
+		close: async () => {
+			await asyncJobManager.dispose({ timeoutMs: 1_000 });
+			VibeSessionRegistry.resetGlobalForTests();
+			await sessionManager.close();
+			authStorage.close();
+		},
+	};
+}
+
+/** Parks kept-alive child `id` and returns what its registry entry still holds. */
+async function park(id: string): Promise<{ status: string | undefined; live: boolean }> {
+	await AgentLifecycleManager.global().park(id);
+	const ref = AgentRegistry.global().get(id);
+	return { status: ref?.status, live: ref?.session != null };
+}
+
+async function revivedSkillNames(id: string): Promise<string[]> {
+	return namesOf(localSession(await AgentLifecycleManager.global().ensureLive(id)).skills);
+}
+
+/** Observes weakly the skill list child `id`'s live session holds (outside the test body). */
+function weakRefToLiveSkills(id: string): WeakRef<readonly Skill[]> {
+	return new WeakRef(localSession(AgentRegistry.global().get(id)?.session).skills);
+}
+
+// If this regresses, a child spawned once its parent replaced its skill list (as a skill refresh does) gets the old
+// skills, or a parked child comes back with its parent's current skills instead of the ones it was spawned with.
+it("spawns a child with its parent's replaced skill list and revives parked siblings with their own", async () => {
+	let parentSkills = ["alpha", "beta", "gamma"].map(skillNamed);
+	const parent = await skillParent(() => parentSkills);
+	try {
+		const siblings = [await parent.spawn("ReplacedFirst"), await parent.spawn("ReplacedSecond")];
+		const parked = [await park("ReplacedFirst"), await park("ReplacedSecond")];
 		parentSkills = ["delta", "epsilon"].map(skillNamed);
-		const heldByThird = await spawn("SkillsThird");
-		const [, , renewed] = forwarded;
-		expect({
-			spawns: forwarded.length,
-			renewed: renewed !== shared,
-			childHoldsIt: heldByThird === renewed,
-			frozen: Object.isFrozen(renewed),
-			names: renewed?.map(skill => skill.name),
-			earlierChildren: [heldByFirst, heldBySecond].map(list => list.map(skill => skill.name)),
-		}).toEqual({
-			spawns: 3,
-			renewed: true,
-			childHoldsIt: true,
-			frozen: true,
-			names: ["delta", "epsilon"],
-			earlierChildren: [
+		const third = await parent.spawn("ReplacedThird");
+		const revived = [await revivedSkillNames("ReplacedFirst"), await revivedSkillNames("ReplacedSecond")];
+		expect({ siblings, parked, third, revived }).toEqual({
+			siblings: [
+				["alpha", "beta", "gamma"],
+				["alpha", "beta", "gamma"],
+			],
+			parked: [
+				{ status: "parked", live: false },
+				{ status: "parked", live: false },
+			],
+			third: ["delta", "epsilon"],
+			revived: [
 				["alpha", "beta", "gamma"],
 				["alpha", "beta", "gamma"],
 			],
 		});
 	} finally {
-		close();
+		parent.close();
 	}
 }, 60_000);
 
-// If this regresses, an SDK caller that replaces a skill in the array it handed its session still spawns children with
-// the skill it replaced, from the copy made before the edit.
-it("gives a child spawned after its parent's skill list changed in place a copy of the changed list", async () => {
+// If this regresses, an SDK caller that edits the array it handed its session (replaces an entry, or empties and
+// refills it) still spawns children with the skills it held before the edit, or a parked child comes back with the
+// edited skills instead of the ones it was spawned with.
+it("spawns a child with its parent's skill list as edited in place and revives a parked child with its own", async () => {
+	// The SDK keeps the caller's array as the session's skills.
 	const parentSkills = ["alpha", "beta", "gamma"].map(skillNamed);
-	const { forwarded, spawn, close } = await skillParent(() => parentSkills);
+	const parent = await skillParent(() => parentSkills);
 	try {
-		const heldByFirst = await spawn("EditedFirst");
-		const heldBySecond = await spawn("EditedSecond");
-		// Same length, one entry replaced: the SDK keeps the caller's array as the session's skills.
+		const first = await parent.spawn("EditedFirst");
+		const parked = await park("EditedFirst");
 		parentSkills[1] = skillNamed("zeta");
-		const heldByThird = await spawn("EditedThird");
-		const heldByFourth = await spawn("EditedFourth");
-		const [shared, , renewed] = forwarded;
-		expect({
-			spawns: forwarded.length,
-			sharedBefore: heldByFirst === shared && heldBySecond === shared,
-			renewed: renewed !== shared,
-			laterChildrenHoldIt: heldByThird === renewed && heldByFourth === renewed,
-			frozen: Object.isFrozen(renewed),
-			names: renewed?.map(skill => skill.name),
-			earlierChildren: [heldByFirst, heldBySecond].map(list => list.map(skill => skill.name)),
-		}).toEqual({
-			spawns: 4,
-			sharedBefore: true,
-			renewed: true,
-			laterChildrenHoldIt: true,
-			frozen: true,
-			names: ["alpha", "zeta", "gamma"],
-			earlierChildren: [
-				["alpha", "beta", "gamma"],
-				["alpha", "beta", "gamma"],
-			],
-		});
-
-		// Emptied in place, then refilled with the same skills: the next child gets a copy made after the refill.
-		const [alpha, zeta, gamma] = parentSkills;
+		const replacedEntry = await parent.spawn("EditedSecond");
 		parentSkills.length = 0;
-		const heldByFifth = await spawn("EditedFifth");
-		parentSkills.push(alpha, zeta, gamma);
-		const heldBySixth = await spawn("EditedSixth");
-		expect({
-			spawns: forwarded.length,
-			emptied: { names: heldByFifth.map(skill => skill.name), frozen: Object.isFrozen(heldByFifth) },
-			refilled: heldBySixth !== renewed,
-			frozen: Object.isFrozen(heldBySixth),
-			names: heldBySixth.map(skill => skill.name),
-			earlierChildren: [heldByFirst, heldBySecond, heldByThird, heldByFourth].map(list =>
-				list.map(skill => skill.name),
-			),
-		}).toEqual({
-			spawns: 6,
-			emptied: { names: [], frozen: true },
-			refilled: true,
-			frozen: true,
-			names: ["alpha", "zeta", "gamma"],
-			earlierChildren: [
-				["alpha", "beta", "gamma"],
-				["alpha", "beta", "gamma"],
-				["alpha", "zeta", "gamma"],
-				["alpha", "zeta", "gamma"],
-			],
+		const emptied = await parent.spawn("EditedThird");
+		parentSkills.push(skillNamed("alpha"), skillNamed("eta"), skillNamed("gamma"));
+		const refilled = await parent.spawn("EditedFourth");
+		const revived = await revivedSkillNames("EditedFirst");
+		expect({ first, parked, replacedEntry, emptied, refilled, revived }).toEqual({
+			first: ["alpha", "beta", "gamma"],
+			parked: { status: "parked", live: false },
+			replacedEntry: ["alpha", "zeta", "gamma"],
+			emptied: [],
+			refilled: ["alpha", "eta", "gamma"],
+			revived: ["alpha", "beta", "gamma"],
 		});
 	} finally {
-		close();
+		parent.close();
 	}
 }, 60_000);
+
+// If this regresses, a parent that empties its skill list in place keeps its copy of the old list in memory for as long
+// as the list lives, even once no child holds that copy.
+it("lets the copy of a parent's skill list go once a child spawns from the emptied list", async () => {
+	const alpha = skillNamed("alpha");
+	const beta = skillNamed("beta");
+	const parentSkills = [alpha, beta];
+	const parent = await skillParent(() => parentSkills);
+	try {
+		const first = await parent.spawn("EvictedFirst");
+		const copyRef = weakRefToLiveSkills("EvictedFirst");
+		// End the only child holding the copy, with its reviver.
+		const released = await AgentLifecycleManager.global().release("EvictedFirst");
+		parentSkills.length = 0;
+		const emptied = await parent.spawn("EvictedSecond");
+		parent.releaseRecordings();
+		// The parent's list is still live here, so the copy is collected only if nothing keeps it for that list.
+		const copyCollected = await collected(copyRef, COLLECT_DEADLINE_MS);
+		// Refilled with the same skills, in the same order.
+		parentSkills.push(alpha, beta);
+		const refilled = await parent.spawn("EvictedThird");
+		expect({ first, released, emptied, copyCollected, refilled }).toEqual({
+			first: ["alpha", "beta"],
+			released: true,
+			emptied: [],
+			copyCollected: true,
+			refilled: ["alpha", "beta"],
+		});
+	} finally {
+		parent.close();
+	}
+}, 60_000);
+
+/** Skills of the parent in the retention tests: enough that no list in the heap holds as many unless it is a copy. */
+const FIXTURE_SKILLS = 128;
+/** Children parked before the first census, so the second one sees only what further children add. */
+const WARMUP_CHILDREN = 8;
+/** Children parked between the two censuses. */
+const MEASURED_CHILDREN = 32;
+/**
+ * Lists a census may count that no parked child keeps: an object let go just before a census can stay reachable for a
+ * few seconds (see {@link COLLECT_DEADLINE_MS}). A copy for each child adds {@link MEASURED_CHILDREN} lists.
+ */
+const TRANSIENT_LISTS = MEASURED_CHILDREN / 4;
+
+function fixtureSkills(): Skill[] {
+	return Array.from({ length: FIXTURE_SKILLS }, (_, index) => skillNamed(`skill-${index}`));
+}
+
+/**
+ * How many lists in the heap hold {@link FIXTURE_SKILLS} skills or more: the parent's own list and each copy of it.
+ * `Bun.generateHeapSnapshot()` returns JavaScriptCore's heap snapshot, in JavaScriptCore's own format, not V8's: each
+ * node is [id, size, class name index, flags] and each edge is [from id, to id, edge type index, property name index or
+ * element index]. It counts lists, not bytes: the snapshot does not size the storage of a frozen array's entries.
+ */
+function fixtureListCensus(): number {
+	Bun.gc(true);
+	const { edges, edgeTypes, edgeNames } = Bun.generateHeapSnapshot();
+	const property = edgeTypes.indexOf("Property");
+	const baseDir = edgeNames.indexOf("baseDir");
+	expect([property, baseDir]).not.toContain(-1);
+	// A skill is an object with a `baseDir` property.
+	const skills = new Set<number>();
+	for (let at = 0; at < edges.length; at += 4) {
+		if (edges[at + 2] === property && edges[at + 3] === baseDir) skills.add(edges[at]);
+	}
+	// A plain array holds its entries itself; a frozen one, through the sparse map it points to.
+	const skillsHeld = new Map<number, number>();
+	for (let at = 0; at < edges.length; at += 4) {
+		if (skills.has(edges[at + 1])) skillsHeld.set(edges[at], (skillsHeld.get(edges[at]) ?? 0) + 1);
+	}
+	let lists = 0;
+	for (const held of skillsHeld.values()) if (held >= FIXTURE_SKILLS) lists++;
+	return lists;
+}
+
+/** Censuses of the lists that hold the fixture's skills, taken as a parent's children park. */
+interface ParkedRetention {
+	/** After {@link WARMUP_CHILDREN} children parked. */
+	before: number;
+	/** After {@link MEASURED_CHILDREN} more children parked. */
+	after: number;
+	/** Census control: after `after`, while the test also holds one plain and one frozen copy of the fixture. */
+	withTwoKnownLists: number;
+}
+
+/**
+ * Spawns children through `spawnChild`, which returns each child's id, and parks each one: its session is disposed
+ * (`session: null`) and only its reviver keeps what it needs to come back. Takes a census once
+ * {@link WARMUP_CHILDREN} children are parked and again once {@link MEASURED_CHILDREN} more are.
+ */
+async function parkedChildRetention(
+	fixture: readonly Skill[],
+	spawnChild: (name: string) => Promise<string>,
+	releaseRecordings: () => void,
+): Promise<ParkedRetention> {
+	let spawned = 0;
+	const parkChildren = async (count: number) => {
+		const parked: Array<{ status: string | undefined; live: boolean }> = [];
+		for (let child = 0; child < count; child++) parked.push(await park(await spawnChild(`Parked${spawned++}`)));
+		expect(parked).toEqual(Array.from({ length: count }, () => ({ status: "parked", live: false })));
+		releaseRecordings();
+	};
+	await parkChildren(WARMUP_CHILDREN);
+	const before = fixtureListCensus();
+	await parkChildren(MEASURED_CHILDREN);
+	const after = fixtureListCensus();
+	const known = [[...fixture], Object.freeze([...fixture])];
+	const withTwoKnownLists = fixtureListCensus();
+	// Uses `known` after the census, so that the two lists are live while it runs.
+	expect(known).toHaveLength(2);
+	return { before, after, withTwoKnownLists };
+}
+
+/** Requires that the census saw the lists the test held, and that the measured children added no list each. */
+function expectNoListPerChild(retention: ParkedRetention): void {
+	const counts = JSON.stringify(retention);
+	expect(retention.withTwoKnownLists - retention.after, counts).toBe(2);
+	expect(retention.after - retention.before, counts).toBeLessThan(TRANSIENT_LISTS);
+}
+
+/** Requires that the census saw the lists the test held, and one more list for each measured child. */
+function expectListPerChild(retention: ParkedRetention): void {
+	const counts = JSON.stringify(retention);
+	expect(retention.withTwoKnownLists - retention.after, counts).toBe(2);
+	expect(retention.after - retention.before, counts).toBeGreaterThan(MEASURED_CHILDREN - TRANSIENT_LISTS);
+}
+
+// If this regresses, each `task` child a parent spawns on its thread gets a copy of the parent's whole skill list of its
+// own, and a parked one keeps it for as long as it can be revived.
+it("keeps no copy of its parent's skill list for each parked task child", async () => {
+	const fixture = fixtureSkills();
+	const parent = await skillParent(() => fixture);
+	try {
+		const spawnChild = async (id: string) => {
+			await parent.spawn(id);
+			return id;
+		};
+		expectNoListPerChild(await parkedChildRetention(fixture, spawnChild, parent.releaseRecordings));
+	} finally {
+		parent.close();
+	}
+}, 120_000);
+
+// Control for the case above: if the census missed the copies parked children keep, both cases would pass.
+it("counts one skill list for each parked task child given a copy of its own", async () => {
+	const fixture = fixtureSkills();
+	// A new array on each read, as when each spawn copies the list: each child keeps a copy of its own.
+	const parent = await skillParent(() => [...fixture]);
+	try {
+		const spawnChild = async (id: string) => {
+			await parent.spawn(id);
+			return id;
+		};
+		expectListPerChild(await parkedChildRetention(fixture, spawnChild, parent.releaseRecordings));
+	} finally {
+		parent.close();
+	}
+}, 120_000);
+
+// If this regresses, each vibe worker a parent spawns on its thread gets a copy of the parent's whole skill list of its
+// own, and a parked one keeps it for as long as it can be revived.
+it("keeps no copy of its parent's skill list for each parked vibe worker", async () => {
+	const fixture = fixtureSkills();
+	const parent = await vibeParent(() => fixture);
+	try {
+		expectNoListPerChild(await parkedChildRetention(fixture, parent.spawn, parent.releaseRecordings));
+		expect(await parent.tempArtifactDirs()).toEqual({ made: [], registered: [] });
+	} finally {
+		await parent.close();
+	}
+}, 120_000);
+
+// Control for the case above: if the census missed the copies parked workers keep, both cases would pass.
+it("counts one skill list for each parked vibe worker given a copy of its own", async () => {
+	const fixture = fixtureSkills();
+	// A new array on each read, as when each spawn copies the list: each worker keeps a copy of its own.
+	const parent = await vibeParent(() => [...fixture]);
+	try {
+		expectListPerChild(await parkedChildRetention(fixture, parent.spawn, parent.releaseRecordings));
+		expect(await parent.tempArtifactDirs()).toEqual({ made: [], registered: [] });
+	} finally {
+		await parent.close();
+	}
+}, 120_000);

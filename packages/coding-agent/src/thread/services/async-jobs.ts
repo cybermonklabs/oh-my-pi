@@ -270,7 +270,11 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 			);
 			const registrationId = nextRegistrationId++;
 			const job = manager.getJob(id);
-			if (job) registrationIds.set(job, registrationId);
+			if (job) {
+				registrationIds.set(job, registrationId);
+				const onDiscard = options?.onDiscard;
+				if (onDiscard) manager.onForegroundDiscard(job, () => ignoreSettle(onDiscard(id, registrationId)));
+			}
 			return { id, registrationId };
 		},
 		publishCompleted: (manager, type, label, result, options) =>

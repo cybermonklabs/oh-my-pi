@@ -12,9 +12,39 @@ import type { ThreadService, WorkerPeer } from "../../src/thread/services";
 import { asyncJobsThreadService } from "../../src/thread/services/async-jobs";
 import { runtimeThreadService } from "../../src/thread/services/runtime";
 import { settingsThreadService } from "../../src/thread/services/settings";
+import { collectGarbage } from "../helpers/heap-snapshot";
 
 /** Main-side view of the fixture's probe: every call is async across the link. */
 type Probe = (op: string, ...args: unknown[]) => Promise<unknown>;
+
+/** Main's side of a worker link: gets each frame the worker sends, and passes it on with `deliver`, now or later. */
+type Inbound = (frame: RpcFrame, deliver: () => void) => void;
+
+/** Holds, on main's side of a worker link, the worker's replies that carry the job results it is told to hold. */
+class ResultFrames {
+	readonly #holds = new Map<string, PromiseWithResolvers<() => void>>();
+
+	/**
+	 * Hold the reply that carries the job result `text`. Resolves once main has it, with what lets it through: by
+	 * then the worker's run has ended, its `finally` included, and main has not settled the job's row.
+	 */
+	hold(text: string): Promise<() => void> {
+		const hold = Promise.withResolvers<() => void>();
+		this.#holds.set(text, hold);
+		return hold.promise;
+	}
+
+	readonly inbound: Inbound = (frame, deliver) => {
+		const text = frame.t === "ok" && typeof frame.v === "string" ? frame.v : undefined;
+		const hold = text === undefined ? undefined : this.#holds.get(text);
+		if (text === undefined || !hold) {
+			deliver();
+			return;
+		}
+		this.#holds.delete(text);
+		hold.resolve(deliver);
+	};
+}
 
 const SERVICES: readonly ThreadService[] = [settingsThreadService, runtimeThreadService, asyncJobsThreadService];
 
@@ -42,7 +72,7 @@ function newManager(): AsyncJobManager {
 	return manager;
 }
 
-async function startWorker(): Promise<Probe> {
+async function startWorker(inbound?: Inbound): Promise<Probe> {
 	const spawned = new Worker(new URL("../fixtures/runtime-service-worker.ts", import.meta.url).href, {
 		type: "module",
 	});
@@ -63,7 +93,11 @@ async function startWorker(): Promise<Probe> {
 		{
 			send: frame => spawned.postMessage(frame),
 			listen: handler => {
-				const listener = (event: MessageEvent<RpcFrame>): void => handler(event.data);
+				const listener = (event: MessageEvent<RpcFrame>): void => {
+					const frame = event.data;
+					if (inbound) inbound(frame, () => handler(frame));
+					else handler(frame);
+				};
 				spawned.addEventListener("message", listener);
 				return () => spawned.removeEventListener("message", listener);
 			},
@@ -110,6 +144,14 @@ function mainRow(manager: AsyncJobManager, id: string): { status?: string; foreg
 	return row ? { status: row.status, foreground: row.foreground } : null;
 }
 
+/** Full collections in both threads; the second round lets the release frames of the first one land. */
+async function collectBothThreads(probe: Probe): Promise<void> {
+	for (let round = 0; round < 2; round++) {
+		await probe("gc");
+		await collectGarbage();
+	}
+}
+
 describe("a worker's live inputs of its jobs across main's job rows", () => {
 	it("keeps a foreground job's live output on the worker when main promoted the job before the worker released it", async () => {
 		// If this regresses, a worker subagent's foreground bash call that main moved to the background loses its
@@ -151,6 +193,73 @@ describe("a worker's live inputs of its jobs across main's job rows", () => {
 				workerRow: kept,
 				workerListing: kept,
 				workerSources: [{ text: "released first\n", open: false }],
+			},
+		});
+	});
+
+	it("keeps a released foreground job's live output on the worker when main promotes the job after its body ended but before main has its result, and drops it once main discards the row of one it did not promote", async () => {
+		// If this regresses, a worker subagent's foreground bash call that main moves to the background just as the
+		// call ends loses its output on the worker (`proc://<id>/streams`) though main keeps listing the job; or a
+		// call main did not move keeps its output on the worker for ten minutes after main dropped its row.
+		const frames = new ResultFrames();
+		const manager = newManager();
+		const probe = await startWorker(frames.inbound);
+
+		/** Release `id` from the worker's foreground call, then end its body with `text`, held on main's side. */
+		const endReleased = async (id: string, text: string): Promise<() => void> => {
+			await probe("appendHeld", id, `${text}\n`);
+			await probe("releaseForeground", manager, id);
+			const held = frames.hold(text);
+			await probe("finish", id, text);
+			return held;
+		};
+
+		const promoted = await registerJob(probe, manager, { id: "promoted", foreground: true, inputs: true });
+		const promotedSettled = manager.getJob(promoted)?.promise;
+		const deliverPromoted = await endReleased(promoted, "promoted result");
+		const promotedBeforeResult = mainRow(manager, promoted);
+		expect(manager.backgroundJob(promoted)).toBe(true);
+		deliverPromoted();
+		await promotedSettled;
+
+		// The control: released the same way, and main discards its row once the result arrives.
+		const discarded = await registerJob(probe, manager, { id: "discarded", foreground: true, inputs: true });
+		const discardedSettled = manager.getJob(discarded)?.promise;
+		const deliverDiscarded = await endReleased(discarded, "discarded result");
+		const discardedBeforeResult = mainRow(manager, discarded);
+		deliverDiscarded();
+		await discardedSettled;
+
+		// No lookup on the worker before this point: only main's notice that it discarded the row lets the worker
+		// drop the job's inputs, which alone keep its tap (the fixture holds it weakly).
+		await collectBothThreads(probe);
+		expect({
+			promoted: {
+				mainBeforeResult: promotedBeforeResult,
+				main: mainRow(manager, promoted),
+				workerTap: await probe("tapAlive", promoted),
+				workerRow: await probe("localInputs", manager, promoted),
+				workerSources: await probe("localSources", manager, promoted),
+			},
+			discarded: {
+				mainBeforeResult: discardedBeforeResult,
+				main: mainRow(manager, discarded),
+				workerTap: await probe("tapAlive", discarded),
+				workerRow: await probe("localInputs", manager, discarded),
+			},
+		}).toEqual({
+			promoted: {
+				mainBeforeResult: { status: "running", foreground: true },
+				main: { status: "completed", foreground: undefined },
+				workerTap: true,
+				workerRow: { hasWidgetInputs: true, pids: [4242] },
+				workerSources: [{ text: "promoted result\n", open: false }],
+			},
+			discarded: {
+				mainBeforeResult: { status: "running", foreground: true },
+				main: null,
+				workerTap: false,
+				workerRow: { hasWidgetInputs: false, pids: null },
 			},
 		});
 	});

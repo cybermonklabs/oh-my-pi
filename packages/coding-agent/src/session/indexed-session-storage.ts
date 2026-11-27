@@ -3,6 +3,8 @@ import * as path from "node:path";
 import { ConcatSink, logger, toError } from "@oh-my-pi/pi-utils";
 import { type FullBody, FullBodies } from "./session-body";
 import {
+	byteLimit,
+	byteWindow,
 	childDirNames,
 	childKeyName,
 	SessionLeaseLostError,
@@ -46,9 +48,9 @@ export interface SessionStorageFullRead {
 	title: SessionStorageReadTitle;
 }
 
-/** {@link SessionStorageBackend.readFrom}: a stored window as it is, the session's stored size, and its title metadata. */
+/** {@link SessionStorageBackend.readFrom}: stored bytes as they are, the session's stored size, and its title metadata. */
 export interface SessionStorageWindowRead {
-	text: string;
+	bytes: Uint8Array;
 	size: number;
 	title: SessionStorageReadTitle;
 }
@@ -79,7 +81,8 @@ export interface SessionStorageBackend {
 	readFull(path: string): Promise<SessionStorageFullRead | null>;
 	/**
 	 * At most the first `prefixBytes` and the last `suffixBytes` of the
-	 * stored bytes, as text, and the title metadata, from one read.
+	 * stored bytes, as text, and the title metadata, from one read. Each count
+	 * is one {@link byteLimit} gave: a whole number, 0 for no window.
 	 */
 	readSlices(
 		path: string,
@@ -87,13 +90,13 @@ export interface SessionStorageBackend {
 		suffixBytes: number,
 	): Promise<[prefix: string, suffix: string, title: SessionStorageReadTitle]>;
 	/**
-	 * The stored UTF-8 text from byte `offset` to the end, or at most
-	 * `maxBytes` of it, the session's stored size in bytes, and its title
-	 * metadata, all from one read of the backing store; `null` when `path`
-	 * holds no session. A capped read may end inside a character. Optional:
-	 * without it the storage reads the whole session and cuts it.
+	 * The stored bytes from byte `start` to the end, or at most `maxBytes` of
+	 * them (each a whole number {@link byteWindow} gave), the session's stored
+	 * size in bytes, and its title metadata, all from one read of the backing
+	 * store; `null` when `path` holds no session. Optional: without it the
+	 * storage reads the whole session and cuts it.
 	 */
-	readFrom?(path: string, offset: number, maxBytes?: number): Promise<SessionStorageWindowRead | null>;
+	readFrom?(path: string, start: number, maxBytes?: number): Promise<SessionStorageWindowRead | null>;
 	/**
 	 * A {@link SessionStorageChunksStart} with the session's title metadata,
 	 * then the stored bytes from byte `fromByte` to the end, as chunks in
@@ -366,9 +369,27 @@ function byteLength(text: string): number {
 	return Buffer.byteLength(text, "utf-8");
 }
 
-function normalizeByteLimit(maxBytes: number): number {
-	if (!(maxBytes > 0)) return 0;
-	return Math.trunc(maxBytes);
+const utf8Decoder = new TextDecoder("utf-8");
+
+/**
+ * The bytes `[start, end)` of the text {@link IndexedSessionStorage.readText}
+ * gives a session titled `title`, from its stored bytes from byte `storedFrom`
+ * (`stored`): below {@link SESSION_TITLE_SLOT_BYTES} the title slot's (which
+ * stands for the stored head, and for the whole of a shorter body), past it
+ * the stored ones.
+ */
+function titledWindow(
+	stored: Uint8Array,
+	storedFrom: number,
+	start: number,
+	end: number,
+	title: SessionTitleUpdate,
+): Uint8Array {
+	if (start >= end) return stored.subarray(0, 0);
+	const slot = Buffer.from(serializeTitleSlot(title), "utf-8");
+	if (start >= slot.length) return stored.subarray(start - storedFrom, end - storedFrom);
+	if (end <= slot.length) return slot.subarray(start, end);
+	return Buffer.concat([slot.subarray(start), stored.subarray(slot.length - storedFrom, end - storedFrom)]);
 }
 
 function uniquePaths(paths: readonly string[]): string[] {
@@ -682,8 +703,8 @@ export class IndexedSessionStorage implements SessionStorage {
 	 */
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		if (!this.#index.has(path)) throw enoent(path);
-		const prefixLimit = normalizeByteLimit(prefixBytes);
-		const suffixLimit = normalizeByteLimit(suffixBytes);
+		const prefixLimit = byteLimit(prefixBytes);
+		const suffixLimit = byteLimit(suffixBytes);
 		if (prefixLimit === 0 && suffixLimit === 0) return ["", ""];
 		await this.#awaitPath(path);
 		const [prefix, suffix, title] = await this.#backend.readSlices(path, prefixLimit, suffixLimit);
@@ -692,48 +713,41 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	/**
 	 * The text from byte `offset`, at most `maxBytes` of it, and the size the
-	 * read saw: the bytes and the size of what {@link readText} reads. Both come
-	 * from the backend's read, not this storage's index, so an append another
-	 * process made since the index loaded is read too. The title slot the
-	 * read's title makes stands for the first {@link SESSION_TITLE_SLOT_BYTES}
-	 * stored bytes, so a window that starts inside it reads from the start and
-	 * is cut from those bytes; a stored body shorter than the slot reads as the
-	 * slot alone, so with a title the size is never less than the slot's.
+	 * read saw: the window {@link byteWindow} cuts from the bytes
+	 * {@link readText} reads, and their size. Both come from the backend's read,
+	 * not this storage's index, so an append another process made since the
+	 * index loaded is read too. The title slot the read's title makes stands for
+	 * the first {@link SESSION_TITLE_SLOT_BYTES} stored bytes, and for the whole
+	 * of a shorter body, so with a title the size is never less than the slot's.
+	 *
+	 * Each read keeps the answers it has always given: without the backend's
+	 * `readFrom`, a whole read counts a negative offset from the end and
+	 * decodes the window as it is; with it, a read from a stored position takes
+	 * a negative offset as byte 0 and decodes the window with a TextDecoder,
+	 * which drops a byte-order mark that starts it.
 	 */
 	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
 		if (!this.#index.has(path)) throw enoent(path);
 		await this.#awaitPath(path);
-		const clamped = maxBytes === undefined ? undefined : Math.max(0, maxBytes);
-		if (offset >= SESSION_TITLE_SLOT_BYTES) {
-			// Past the slot, the stored bytes are the text's.
-			const read = await this.#readBackendFrom(path, offset, clamped);
-			if (!read) throw enoent(path);
-			return { text: read.text, size: read.title ? Math.max(read.size, SESSION_TITLE_SLOT_BYTES) : read.size };
+		if (!this.#backend.readFrom) {
+			const read = await this.#backend.readFull(path);
+			if (read === null) throw enoent(path);
+			const bytes = Buffer.from(read.title ? overlayTitleSlotContent(read.text, read.title) : read.text, "utf-8");
+			const { start, end } = byteWindow(offset, maxBytes, bytes.length);
+			return { text: bytes.toString("utf-8", start, end), size: bytes.length };
 		}
-		const limit = clamped === undefined ? undefined : offset + clamped;
-		const read = await this.#readBackendFrom(path, 0, limit);
+		// The stored bytes the window can cover, whatever the session's size: the title slot needs none of them.
+		const stored = byteWindow(offset, maxBytes, Number.POSITIVE_INFINITY, "from-start");
+		const read = await this.#backend.readFrom(
+			path,
+			stored.start,
+			stored.end === Number.POSITIVE_INFINITY ? undefined : stored.end - stored.start,
+		);
 		if (!read) throw enoent(path);
-		if (!read.title && offset <= 0) return { text: read.text, size: read.size };
-		// The window of the text's head, cut from its bytes as readText's bytes would be.
-		const head = Buffer.from(read.title ? overlayTitleSlotContent(read.text, read.title) : read.text, "utf-8");
-		return {
-			text: head.subarray(offset, limit).toString("utf-8"),
-			size: read.title ? Math.max(read.size, SESSION_TITLE_SLOT_BYTES) : read.size,
-		};
-	}
-
-	async #readBackendFrom(
-		path: string,
-		offset: number,
-		maxBytes: number | undefined,
-	): Promise<SessionStorageWindowRead | null> {
-		if (this.#backend.readFrom) return this.#backend.readFrom(path, offset, maxBytes);
-		const read = await this.#backend.readFull(path);
-		if (read === null) return null;
-		const bytes = Buffer.from(read.text, "utf-8");
-		if (offset >= bytes.length) return { text: "", size: bytes.length, title: read.title };
-		const end = maxBytes === undefined ? undefined : offset + maxBytes;
-		return { text: bytes.subarray(offset, end).toString("utf-8"), size: bytes.length, title: read.title };
+		if (!read.title) return { text: utf8Decoder.decode(read.bytes), size: read.size };
+		const size = Math.max(read.size, SESSION_TITLE_SLOT_BYTES);
+		const { start, end } = byteWindow(offset, maxBytes, size, "from-start");
+		return { text: utf8Decoder.decode(titledWindow(read.bytes, stored.start, start, end, read.title)), size };
 	}
 
 	/** {@link readChunks}, also on a backend without its own: then one whole read, cut at `fromByte`. */

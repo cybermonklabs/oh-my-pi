@@ -22,7 +22,12 @@
  * - a move that fails at its title read, or at a hash key that holds a
  *   string, changes neither path;
  * - title metadata without a time is none, and an empty title with one a
- *   clear.
+ *   clear;
+ * - every script that writes (a full write, a streamed full write and its
+ *   parts, an append, a title update, a move and a removal) writes nothing
+ *   when a metadata hash it writes holds a string or the ACL denies one of its
+ *   writes, on the fake (whose interpreter runs the script under an ACL of
+ *   the test's) and on a Redis server when `OMP_TEST_REDIS_URL` names one.
  */
 
 import { RedisClient } from "bun";
@@ -35,7 +40,7 @@ import {
 import { SessionReadConflictError, SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { type SessionTitleUpdate, serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { assertHashKey, byteRange, runSessionScript } from "../helpers/fake-redis-windows";
+import { assertHashKey, byteRange, type FakeRedisKeyspace, runSessionScript } from "../helpers/fake-redis-windows";
 
 /** A session body as a full rewrite hands it over: a title slot, a header, then `count` entries carrying `text`. */
 function rewriteLines(text: string, count = 3): string[] {
@@ -580,9 +585,15 @@ interface FakeRedis extends RedisSessionStorageClient {
 	failNext(method: string, error: Error): void;
 }
 
-function createFakeRedis(): FakeRedis {
-	const strings = new Map<string, string>();
-	const hashes = new Map<string, Map<string, string>>();
+/**
+ * A fake client of `keyspace` (a new one without it), whose scripts run under the ACL `permits` gives (see
+ * {@link runSessionScript}); every command it sends outside a script is allowed.
+ */
+function createFakeRedis(
+	keyspace: FakeRedisKeyspace = { strings: new Map(), hashes: new Map() },
+	permits?: (command: string, args: string[]) => boolean,
+): FakeRedis {
+	const { strings, hashes } = keyspace;
 	const calls: FakeRedisCall[] = [];
 	const failures = new Map<string, Error[]>();
 
@@ -608,8 +619,9 @@ function createFakeRedis(): FakeRedis {
 		async send(command, args) {
 			record("send", [command, args]);
 			checkFailure("send");
+			if (command === "DEL") return args.filter(key => strings.delete(key) || hashes.delete(key)).length;
 			if (command !== "EVAL") throw new Error(`Unsupported Redis command: ${command}`);
-			return runSessionScript({ strings, hashes }, args, checkFailure);
+			return runSessionScript({ strings, hashes }, args, checkFailure, permits);
 		},
 		async get(key) {
 			record("get", [key]);
@@ -1467,4 +1479,298 @@ describe.skipIf(!process.env.OMP_TEST_REDIS_URL)("RedisSessionStorage on a Redis
 
 		expect({ chunks: chunks.length, error }).toEqual({ chunks: 1, error: expect.any(SessionReadConflictError) });
 	});
+});
+
+/** A Redis the store of one test runs on, with its keys under a prefix of the test's own. */
+interface RedisUnderTest extends AsyncDisposable {
+	readonly prefix: string;
+	/** A client of the account the test runs as. */
+	readonly client: RedisSessionStorageClient;
+	/** A client of an account that may run every command the store runs but the writes `denial` names. */
+	restricted(denial: WriteDenial): Promise<RedisSessionStorageClient>;
+	/** Every key under the prefix with what it holds: a string's text, a hash's fields. */
+	keys(): Promise<Record<string, string | Record<string, string>>>;
+	/** Make `key` hold the string `value`, as another client's write of the wrong type would. */
+	setString(key: string, value: string): Promise<void>;
+}
+
+/** The hashes a store keeps beside each session's bytes, by the suffix of their key. */
+type MetadataHash = "meta" | "title" | "generation";
+
+/** Writes an account may not make: every run of a command, or every write of one metadata hash. */
+interface WriteDenial {
+	readonly command?: "hset" | "hdel" | "pexpire";
+	readonly hash?: MetadataHash;
+}
+
+/** A store's operation, the script it runs, the metadata hashes that script writes, and a write it runs after its first. */
+interface WriteOperation {
+	readonly script: string;
+	readonly name: string;
+	readonly hashes: readonly MetadataHash[];
+	readonly denial: WriteDenial;
+	run(storage: RedisSessionStorage): Promise<unknown>;
+}
+
+/** The sessions each operation starts from: a titled session with an artifact, and a titled one to move it onto. */
+const CASE_SOURCE = "/s/source.jsonl";
+const CASE_ARTIFACT = "/s/source/artifact.txt";
+const CASE_TARGET = "/s/target.jsonl";
+
+async function arrangeSessions(storage: RedisSessionStorage): Promise<void> {
+	for (const [path, name] of [
+		[CASE_SOURCE, "Source"],
+		[CASE_TARGET, "Target"],
+	]) {
+		const written = serializeTitleSlot({ title: `${name} as written`, source: "auto", updatedAt: "t1" });
+		await storage.writeText(path, `${written}${bodyOf(name)}`);
+		await storage.updateSessionTitle(path, { title: `${name} renamed`, source: "user", updatedAt: "t2" });
+	}
+	await storage.writeText(CASE_ARTIFACT, "artifact\n");
+}
+
+/** Append `line` at `path` with a writer, and wait for the store's writes: this rejects as the append failed. */
+async function appendLine(storage: RedisSessionStorage, path: string, line: string): Promise<void> {
+	void storage
+		.openWriter(path)
+		.append(line)
+		.catch(() => {});
+	await storage.drain();
+}
+
+const WRITE_OPERATIONS: readonly WriteOperation[] = [
+	{
+		script: "WRITE_FULL",
+		name: "a full write",
+		hashes: ["meta", "title", "generation"],
+		denial: { command: "hset" },
+		run: storage => storage.writeText(CASE_SOURCE, bodyOf("Rewritten")),
+	},
+	{
+		script: "WRITE_STAGED",
+		name: "a streamed full write",
+		hashes: ["meta", "title", "generation"],
+		denial: { command: "hset" },
+		run: storage => storage.writeLinesAtomic(CASE_SOURCE, rewriteLines("Rewritten")),
+	},
+	{
+		script: "STAGE_PART",
+		name: "a part of a streamed full write",
+		hashes: [],
+		denial: { command: "pexpire" },
+		run: storage => storage.writeLinesAtomic(CASE_SOURCE, rewriteLines("Rewritten")),
+	},
+	{
+		script: "APPEND",
+		name: "an append",
+		hashes: ["meta", "generation"],
+		denial: { command: "hset" },
+		run: storage => appendLine(storage, CASE_SOURCE, "{}\n"),
+	},
+	{
+		script: "APPEND",
+		name: "an append that starts a session",
+		hashes: ["meta", "title", "generation"],
+		denial: { command: "hset" },
+		run: storage => appendLine(storage, "/s/new.jsonl", SESSION_HEADER),
+	},
+	{
+		script: "UPDATE_TITLE",
+		name: "a title update",
+		hashes: ["meta", "title", "generation"],
+		denial: { hash: "title" },
+		run: storage => storage.updateSessionTitle(CASE_SOURCE, { title: "Retitled", source: "user", updatedAt: "t3" }),
+	},
+	{
+		script: "MOVE",
+		name: "a move onto another session",
+		hashes: ["meta", "title", "generation"],
+		denial: { command: "hdel" },
+		run: storage => storage.rename(CASE_SOURCE, CASE_TARGET),
+	},
+	{
+		script: "REMOVE",
+		name: "a removal of a session and its artifacts",
+		hashes: ["meta", "title", "generation"],
+		denial: { command: "hdel" },
+		run: storage => storage.deleteSessionWithArtifacts(CASE_SOURCE),
+	},
+	{
+		script: "REMOVE",
+		name: "an unlink",
+		hashes: ["meta", "title", "generation"],
+		denial: { command: "hdel" },
+		run: storage => storage.unlink(CASE_SOURCE),
+	},
+];
+
+/**
+ * One row per writing script and metadata hash it writes, and one per writing script whose account may not make a
+ * write the script runs after its first: each operation rejects and leaves every key (bodies, every hash's fields,
+ * artifacts, staging keys) as it was, so a failed removal can be retried and a failed move loses neither session.
+ */
+function writeScriptCases(open: () => Promise<RedisUnderTest>, aclUnavailable: string | undefined): void {
+	for (const operation of WRITE_OPERATIONS) {
+		for (const hash of operation.hashes) {
+			it(`${operation.script}: ${operation.name} writes nothing when the ${hash} hash holds a string`, async () => {
+				await using redis = await open();
+				const storage = await RedisSessionStorage.create({ client: redis.client, prefix: redis.prefix });
+				await arrangeSessions(storage);
+				await redis.setString(`${redis.prefix}${hash}`, "not a hash");
+				const before = await redis.keys();
+
+				await expect(operation.run(storage)).rejects.toThrow("WRONGTYPE");
+				expect(await redis.keys()).toEqual(before);
+			});
+		}
+	}
+	for (const operation of WRITE_OPERATIONS) {
+		const denied = operation.denial.command ?? `write the ${operation.denial.hash} hash`;
+		it.skipIf(aclUnavailable !== undefined)(
+			`${operation.script}: ${operation.name} writes nothing when the account may not ${denied}`,
+			async () => {
+				await using redis = await open();
+				await arrangeSessions(await RedisSessionStorage.create({ client: redis.client, prefix: redis.prefix }));
+				const before = await redis.keys();
+				const client = await redis.restricted(operation.denial);
+				const storage = await RedisSessionStorage.create({ client, prefix: redis.prefix });
+
+				await expect(operation.run(storage)).rejects.toThrow("NOPERM");
+				expect(await redis.keys()).toEqual(before);
+			},
+		);
+	}
+}
+
+/** Every key a store writes under its prefix, by its suffix: each session's bytes, its hashes, and staging keys. */
+const STORE_KEYS = ["file:*", "meta", "title", "generation", "staging:*"];
+
+/** The fake: one keyspace, and a client of it per account, whose scripts run under the ACL `denial` gives. */
+function fakeRedisUnderTest(): () => Promise<RedisUnderTest> {
+	return async () => {
+		const prefix = "omp-test:write-scripts:";
+		const client = createFakeRedis();
+		return {
+			prefix,
+			client,
+			async restricted(denial) {
+				// A denied hash: every write of that hash's key. A denied command: every run of it.
+				return createFakeRedis(
+					client,
+					(command, args) =>
+						command !== denial.command &&
+						!(
+							denial.hash !== undefined &&
+							(command === "hset" || command === "hdel") &&
+							args[0] === `${prefix}${denial.hash}`
+						),
+				);
+			},
+			async keys() {
+				const keys: Record<string, string | Record<string, string>> = {};
+				for (const [key, value] of client.strings) if (key.startsWith(prefix)) keys[key] = value;
+				for (const [key, fields] of client.hashes)
+					if (key.startsWith(prefix)) keys[key] = Object.fromEntries(fields);
+				return keys;
+			},
+			async setString(key, value) {
+				client.hashes.delete(key);
+				client.strings.set(key, value);
+			},
+			async [Symbol.asyncDispose]() {},
+		};
+	};
+}
+
+/** The server `url` names: a key prefix of each test's own, its keys and the users it made deleted at the end. */
+function serverRedisUnderTest(url: string): () => Promise<RedisUnderTest> {
+	return async () => {
+		const prefix = `omp-test:write-scripts:${crypto.randomUUID()}:`;
+		const clients: RedisClient[] = [];
+		const users: string[] = [];
+		const connect = (target: string): RedisClient => {
+			const client = new RedisClient(target);
+			clients.push(client);
+			return client;
+		};
+		const admin = connect(url);
+		return {
+			prefix,
+			client: admin,
+			async restricted(denial) {
+				const user = `omp-test-${crypto.randomUUID()}`;
+				const password = crypto.randomUUID();
+				// A denied hash: reads of every key, writes of every key but that hash. EVAL itself needs both on each key
+				// it is given, so a selector lets it start the script, whose own writes the root rules still check. A
+				// denied command: every key, every command but that one.
+				const rules = denial.hash
+					? [
+							`%R~${prefix}*`,
+							...STORE_KEYS.filter(key => key !== denial.hash).map(key => `%W~${prefix}${key}`),
+							"+@all",
+							`(~${prefix}* +eval)`,
+						]
+					: [`~${prefix}*`, "+@all", `-${denial.command}`];
+				await admin.send("ACL", ["SETUSER", user, "reset", "on", `>${password}`, ...rules]);
+				users.push(user);
+				const target = new URL(url);
+				target.username = user;
+				target.password = password;
+				return connect(target.toString());
+			},
+			async keys() {
+				const keys: Record<string, string | Record<string, string>> = {};
+				for (const key of (await admin.send("KEYS", [`${prefix}*`])) as string[]) {
+					keys[key] =
+						(await admin.send("TYPE", [key])) === "hash"
+							? await admin.hgetall(key)
+							: ((await admin.get(key)) ?? "");
+				}
+				return keys;
+			},
+			async setString(key, value) {
+				await admin.send("DEL", [key]);
+				await admin.send("SET", [key, value]);
+			},
+			async [Symbol.asyncDispose]() {
+				const keys = (await admin.send("KEYS", [`${prefix}*`])) as string[];
+				if (keys.length > 0) await admin.send("DEL", keys);
+				for (const user of users) await admin.send("ACL", ["DELUSER", user]);
+				for (const client of clients) client.close();
+			},
+		};
+	};
+}
+
+const REDIS_URL = process.env.OMP_TEST_REDIS_URL;
+
+/**
+ * Why the ACL rows cannot run on the server `url` names, if they cannot: a server before Redis 7 gives a script no
+ * `redis.acl_check_cmd` (the store skips the check there), and the rows need an account that may make users.
+ */
+async function whyNoAcl(url: string): Promise<string | undefined> {
+	const client = new RedisClient(url);
+	try {
+		const info = String(await client.send("INFO", ["server"]));
+		const major = Number(/redis_version:(\d+)/.exec(info)?.[1] ?? 0);
+		if (major < 7) return `Redis ${major} gives a script no redis.acl_check_cmd`;
+		const probe = `omp-test-probe-${crypto.randomUUID()}`;
+		await client.send("ACL", ["SETUSER", probe, "reset"]);
+		await client.send("ACL", ["DELUSER", probe]);
+		return undefined;
+	} catch (err) {
+		return `the test account may not make ACL users: ${err instanceof Error ? err.message : String(err)}`;
+	} finally {
+		client.close();
+	}
+}
+
+const ACL_UNAVAILABLE = REDIS_URL ? await whyNoAcl(REDIS_URL) : "no server";
+
+describe("RedisSessionStorage write scripts that cannot finish (fake)", () => {
+	writeScriptCases(fakeRedisUnderTest(), undefined);
+});
+
+describe.skipIf(!REDIS_URL)("RedisSessionStorage write scripts that cannot finish (Redis server)", () => {
+	writeScriptCases(serverRedisUnderTest(REDIS_URL ?? ""), ACL_UNAVAILABLE);
 });

@@ -668,9 +668,15 @@ function luaText(bytes: string): string {
 
 /**
  * The globals a script sees: its `KEYS` and `ARGV`, `redis.call` running each command through `call` (its name and
- * its arguments as the server gets them), `redis.sha1hex`, and the library functions the scripts use.
+ * its arguments as the server gets them), `redis.acl_check_cmd` asking `aclCheck` whether the account may run one,
+ * `redis.error_reply`, `redis.sha1hex`, and the library functions the scripts use.
  */
-function luaGlobals(keys: string[], argv: string[], call: (command: string, args: string[]) => LuaValue): LuaScope {
+function luaGlobals(
+	keys: string[],
+	argv: string[],
+	call: (command: string, args: string[]) => LuaValue,
+	aclCheck: (command: string, args: string[]) => boolean,
+): LuaScope {
 	const commandArg = (arg: LuaValue): string => {
 		if (typeof arg === "string") return arg;
 		if (typeof arg === "number") return String(arg);
@@ -687,6 +693,8 @@ function luaGlobals(keys: string[], argv: string[], call: (command: string, args
 				"redis",
 				library({
 					call: (command, ...args) => call(commandArg(command), args.map(commandArg)),
+					acl_check_cmd: (command, ...args) => aclCheck(commandArg(command), args.map(commandArg)),
+					error_reply: message => new Map<LuaValue, LuaValue>([["err", luaString(message)]]),
 					sha1hex: value =>
 						new Bun.CryptoHasher("sha1").update(Buffer.from(luaString(value), "latin1")).digest("hex"),
 				}),
@@ -739,6 +747,14 @@ function luaGlobals(keys: string[], argv: string[], call: (command: string, args
 					for (let index = 1; luaIndex(table, index) !== undefined; index++)
 						entries.push([index, luaIndex(table, index)]);
 					return new LuaPairs(entries);
+				},
+			],
+			[
+				"unpack",
+				table => {
+					const values: LuaValue[] = [];
+					for (let index = 1; luaIndex(table, index) !== undefined; index++) values.push(luaIndex(table, index));
+					return new LuaResults(values);
 				},
 			],
 		]),
@@ -930,23 +946,37 @@ function keyspaceCommands(keyspace: FakeRedisKeyspace): Map<string, (args: strin
  * `RedisSessionStorage` sends them) on `keyspace`, as Redis 7 runs it, and return its reply. Each command the script
  * runs first calls `checkFailure` with the command's name in lower case (`hget`, `rename`, `hset`, ...), so a double
  * can make that command fail: the script fails there, and what its commands before it wrote stays, as on a server.
+ * `permits` is the account's ACL: given a command's name in lower case and its arguments, whether the account may run
+ * it. A command it denies fails with NOPERM, and `redis.acl_check_cmd` answers with it.
  */
 export function runSessionScript(
 	keyspace: FakeRedisKeyspace,
 	args: string[],
 	checkFailure: (command: string) => void = () => undefined,
+	permits: (command: string, args: string[]) => boolean = () => true,
 ): unknown {
 	const [source = "", keyCount = "0"] = args;
 	const values = args.slice(2).map(luaBytes);
 	const commands = keyspaceCommands(keyspace);
+	const known = (command: string): ((args: string[]) => LuaValue) => {
+		const run = commands.get(command.toUpperCase());
+		if (!run) throw new Error(`Unsupported Redis command in a script: ${command}`);
+		return run;
+	};
 	const globals = luaGlobals(
 		values.slice(0, Number(keyCount)),
 		values.slice(Number(keyCount)),
 		(command, commandArgs) => {
-			const run = commands.get(command.toUpperCase());
-			if (!run) throw new Error(`Unsupported Redis command in a script: ${command}`);
+			const run = known(command);
 			checkFailure(command.toLowerCase());
+			if (!permits(command.toLowerCase(), commandArgs.map(luaText))) {
+				throw new Error(`NOPERM User has no permissions to run the '${command.toLowerCase()}' command`);
+			}
 			return run(commandArgs);
+		},
+		(command, commandArgs) => {
+			known(command);
+			return permits(command.toLowerCase(), commandArgs.map(luaText));
 		},
 	);
 	const flow = parsedScript(source)(globals);

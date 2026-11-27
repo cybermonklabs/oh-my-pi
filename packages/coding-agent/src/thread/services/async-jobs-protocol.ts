@@ -100,6 +100,11 @@ export interface WireRegisterOptions {
 	readonly foreground?: boolean;
 	readonly intent?: string;
 	readonly feed?: WireJobFeed;
+	/**
+	 * Called once main discards the row of this foreground job after its release, with its id and
+	 * {@link AsyncJobWire.registrationId}; never once main promoted it.
+	 */
+	readonly onDiscard?: WireCallback<[jobId: string, registrationId: number]>;
 }
 
 /** The run context main hands a worker job body. */
@@ -144,8 +149,7 @@ export type AsyncJobManagerProtocol = {
 	getRecentJobs: RpcMethod<[limit: number | undefined, filter: AsyncJobFilter | undefined], AsyncJobWire[]>;
 	getAllJobs: RpcMethod<[filter: AsyncJobFilter | undefined], AsyncJobWire[]>;
 	backgroundJob: RpcMethod<[jobId: string], boolean>;
-	/** Whether main took the release: the job was still foreground-backed. */
-	releaseForegroundJob: RpcMethod<[jobId: string], boolean>;
+	releaseForegroundJob: RpcMethod<[jobId: string], void>;
 	getDeliveryState: RpcMethod<[filter: AsyncJobFilter | undefined], AsyncJobDeliveryState>;
 	hasPendingDeliveries: RpcMethod<[filter: AsyncJobFilter | undefined], boolean>;
 	watchJobs: RpcMethod<[jobIds: string[]], number>;

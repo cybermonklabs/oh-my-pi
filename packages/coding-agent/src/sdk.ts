@@ -838,7 +838,7 @@ export interface CreateAgentSessionOptions {
 	subagentEventBus?: EventBus;
 
 	/** Skills. Default: discovered from multiple locations */
-	skills?: Skill[];
+	skills?: readonly Skill[];
 	/**
 	 * Forwarded by a parent session when spawning a subagent so the child
 	 * skips full skill discovery (perf only — not an opt-out request). When
@@ -2457,7 +2457,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		);
 	};
 
-	let skills: Skill[];
+	let skills: readonly Skill[];
 	let skillWarnings: SkillWarning[];
 	if (options.skills !== undefined) {
 		skills = options.skills;

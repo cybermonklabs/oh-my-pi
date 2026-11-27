@@ -632,7 +632,7 @@ describe("autoloadSkills through task spawn", () => {
 				customToolPaths: [],
 			} as unknown as ToolSession;
 
-			const forwardedSkills: Array<Skill[] | undefined> = [];
+			const forwardedSkills: Array<readonly Skill[] | undefined> = [];
 			const createAgentSession = sdkModule.createAgentSession;
 			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 				forwardedSkills.push(options?.skills);

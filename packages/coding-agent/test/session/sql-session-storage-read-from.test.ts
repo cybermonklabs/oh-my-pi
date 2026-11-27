@@ -289,7 +289,7 @@ for (const { adapter, url } of BACKENDS) {
 			});
 		});
 
-		it("reads a titled session's window as readText's bytes cut there, where the cut splits a character", async () => {
+		it("reads a titled session's window as its stored bytes with the title's slot laid over them, cut there, where the cut splits a character", async () => {
 			await using db = connect();
 			const storage = await db.open();
 			const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
@@ -302,9 +302,15 @@ for (const { adapter, url } of BACKENDS) {
 				// No slot: the overlay ends inside the "é" at bytes 255-256.
 				{ path: "/sessions/p/split.jsonl", body: `${"a".repeat(255)}é${"b".repeat(40)}\n`, title: "New" },
 			];
+			// The bytes a window is cut from: the slot of the session's title over the stored head, and the stored
+			// bytes past it as they are, a character the slot's end splits included.
+			const texts = new Map<string, Buffer>();
 			for (const { path, body, title } of sessions) {
+				const update = { title, source: "user" as const, updatedAt: "t2" };
 				await storage.writeText(path, body);
-				await storage.updateSessionTitle(path, { title, source: "user", updatedAt: "t2" });
+				await storage.updateSessionTitle(path, update);
+				const slot = Buffer.from(serializeTitleSlot(update));
+				texts.set(path, Buffer.concat([slot, Buffer.from(body).subarray(slot.length)]));
 			}
 
 			// Every window compared at once, so a failure shows each one.
@@ -319,8 +325,8 @@ for (const { adapter, url } of BACKENDS) {
 			] as const) {
 				const { text } = await readSessionTextFrom(storage, path, offset, maxBytes);
 				read.push({ path, offset, maxBytes, text });
-				const whole = Buffer.from(await storage.readText(path));
-				cut.push({ path, offset, maxBytes, text: whole.subarray(offset, offset + maxBytes).toString("utf8") });
+				const titled = texts.get(path) ?? Buffer.alloc(0);
+				cut.push({ path, offset, maxBytes, text: titled.subarray(offset, offset + maxBytes).toString("utf8") });
 			}
 			expect(read).toEqual(cut);
 		});
@@ -342,9 +348,9 @@ for (const { adapter, url } of BACKENDS) {
 		});
 
 		// If this regresses, an untitled row starting with a UTF-8 BOM loses its leading three bytes in the backend's
-		// decode, so `readTextFrom(path, 3, 2)` slices past the decoded text and returns "" instead of "ab", and a
-		// window starting at a BOM past byte 256 drops it too.
-		it("keeps a leading UTF-8 BOM aligned with byte offsets on untitled rows", async () => {
+		// decode, so `readTextFrom(path, 3, 2)` slices past the decoded text and returns "" instead of "ab". A window
+		// that starts at a BOM, at byte 0 or past the slot, decodes as a file read's does, without it.
+		it("keeps byte offsets aligned after a leading UTF-8 BOM on untitled rows", async () => {
 			await using db = connect();
 			const storage = await db.open();
 			const shortPath = "/sessions/p/bom.jsonl";
@@ -358,8 +364,8 @@ for (const { adapter, url } of BACKENDS) {
 				pastSlot: await storage.readTextFrom(longPath, 300, 4),
 			}).toEqual({
 				afterBom: { text: "ab", size: 6 },
-				fromBom: { text: "\uFEFFab", size: 6 },
-				pastSlot: { text: "\uFEFFy", size: 305 },
+				fromBom: { text: "ab", size: 6 },
+				pastSlot: { text: "y", size: 305 },
 			});
 		});
 

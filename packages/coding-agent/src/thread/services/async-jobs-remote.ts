@@ -40,7 +40,7 @@ import type {
 	AsyncJobType,
 } from "../../async/job-manager";
 import type { JobTextSource, JobWidgetInputs, JobWidgetRegistry } from "../../job-widgets/types";
-import { type RemoteObject, RpcClosedError } from "../rpc";
+import type { RemoteObject } from "../rpc";
 import {
 	type AsyncJobManagerProtocol,
 	type AsyncJobWire,
@@ -58,9 +58,9 @@ import { ignoreSettle, localUnsubscribe } from "./support";
 /**
  * How long a settled job's live `process` / `widgetInputs` stay readable here
  * (e.g. `proc://<id>/streams` after the job ended). Longer than main's default
- * row retention, so the row is gone first. A released foreground job's go at
- * the later of its release and its settle, when main discards its row; a
- * release main did not take (it promoted the job first) leaves them.
+ * row retention, so the row is gone first. A released foreground job's inputs
+ * go when main discards its row (at the later of its release and its settle),
+ * as main tells this worker; a job main promoted first keeps them.
  */
 const LOCAL_INPUTS_RETENTION_MS = 10 * 60 * 1000;
 
@@ -77,8 +77,6 @@ interface LocalJob {
 	readonly inputs: LocalInputs;
 	/** Main's {@link AsyncJobWire.registrationId} of the row this worker registered. */
 	readonly registrationId: number;
-	/** Released while it ran, and main took the release: its inputs go when its run settles. */
-	released: boolean;
 }
 
 /** Reads a worker job's live inputs as {@link JobFeedDelta}s: each source's text since the last read. */
@@ -250,6 +248,10 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 	readonly #local = new Map<string, LocalJob>();
 	/** Retention timers of settled jobs' local inputs, by id; each captures only its id. */
 	readonly #expiry = new Map<string, NodeJS.Timeout>();
+	/** Main discarded the row of a released foreground job: its inputs go, if they are still that registration's. */
+	readonly #discarded = (jobId: string, registrationId: number): void => {
+		if (this.#local.get(jobId)?.registrationId === registrationId) this.#dropLocal(jobId);
+	};
 	readonly #settled = new Map<string, Promise<void>>();
 	readonly #controllers = new Map<string, AbortController>();
 	#widgets: RemoteJobWidgets | null | undefined;
@@ -308,11 +310,12 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 			foreground: options?.foreground,
 			intent: options?.intent,
 			feed: feed?.wire(),
+			onDiscard: inputs ? this.#discarded : undefined,
 		};
 		const { id, registrationId } = this.#remote.callSync("register", type, label, wired, wireOptions);
 		// A reused id (a released foreground job's, an evicted job's) drops what the earlier job left here.
 		this.#dropLocal(id);
-		if (inputs) this.#local.set(id, { inputs, registrationId, released: false });
+		if (inputs) this.#local.set(id, { inputs, registrationId });
 		return id;
 	}
 
@@ -358,26 +361,11 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 	}
 
 	/**
-	 * As main discards the row of a release it takes, a foreground job's local inputs go at the later
-	 * of that release and its settle. A release main does not take (it promoted the job first, or has
-	 * no such row) leaves them, with the background row main keeps. With the link to main closed, main's
-	 * row is gone too, and so are they.
+	 * A notification: nothing to wait for, and every later call reaches main after it. Main tells
+	 * this worker once it discards the row, and the job's local inputs go then.
 	 */
 	releaseForegroundJob(jobId: string): void {
-		let taken: boolean;
-		try {
-			taken = this.#remote.callSync("releaseForegroundJob", jobId);
-		} catch (error) {
-			if (!(error instanceof RpcClosedError)) throw error;
-			this.#dropLocal(jobId);
-			return;
-		}
-		if (!taken) return;
-		const local = this.#local.get(jobId);
-		if (!local) return;
-		// A retention timer runs only for a settled job.
-		if (this.#expiry.has(jobId)) this.#dropLocal(jobId);
-		else local.released = true;
+		this.#remote.notify("releaseForegroundJob", jobId);
 	}
 
 	getDeliveryState(filter?: AsyncJobFilter): AsyncJobDeliveryState {
@@ -510,29 +498,11 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 	}
 
 	/**
-	 * The run of `jobId` settled here: keep its inputs for the retention time, unless main took its
-	 * release and still discards its row: no longer has it, or has it still in the foreground. With the
-	 * link to main closed, main's row is gone too; the inputs go without an error that would replace
-	 * the body's own outcome.
+	 * The run of `jobId` settled here: its inputs stay readable for the retention time, unless main
+	 * discards its row first (see {@link #discarded}).
 	 */
 	#settleLocal(jobId: string): void {
-		const local = this.#local.get(jobId);
-		if (!local) return;
-		if (local.released) {
-			// Main may have promoted the job after it took the release; it keeps that row, and these stay with it.
-			let row: AsyncJobWire | undefined;
-			try {
-				row = this.#remote.callSync("getJob", jobId);
-			} catch (error) {
-				if (!(error instanceof RpcClosedError)) throw error;
-				this.#dropLocal(jobId);
-				return;
-			}
-			if (row?.registrationId !== local.registrationId || row.foreground === true) {
-				this.#dropLocal(jobId);
-				return;
-			}
-		}
+		if (!this.#local.has(jobId)) return;
 		const timer = setTimeout(() => this.#dropLocal(jobId), LOCAL_INPUTS_RETENTION_MS);
 		timer.unref();
 		this.#expiry.set(jobId, timer);

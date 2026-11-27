@@ -325,21 +325,6 @@ describe("focused view of a worker-homed agent session", () => {
 		expect(refocus?.kind).toBe("append");
 		const shipped = refocus?.entries.flatMap(entry => (entry.type === "message" ? [textOf(entry.message)] : []));
 		expect(shipped).toEqual(["second question", "ok"]);
-		// The snapshot's entries and the messages share objects once: a message an entry equals is that entry's
-		// object, and no entry, nor any message object, is held twice.
-		const entries = remote.sessionManager.getEntries();
-		const held = entries.flatMap(entry => (entry.type === "message" ? [entry.message] : []));
-		const ids = entries.map(entry => entry.id);
-		expect({
-			copies: remote.messages.filter(
-				message => !held.includes(message) && held.some(entry => Bun.deepEquals(entry, message, true)),
-			).length,
-			usersShared: remote.messages
-				.filter(message => message.role === "user")
-				.every(message => held.includes(message)),
-			duplicateIds: ids.length - new Set(ids).size,
-			duplicateObjects: held.length - new Set(held).size,
-		}).toEqual({ copies: 0, usersShared: true, duplicateIds: 0, duplicateObjects: 0 });
 	});
 
 	it("cycles the thinking level on both sides and redraws the status line from the mirror", async () => {

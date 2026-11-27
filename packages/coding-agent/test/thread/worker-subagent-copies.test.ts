@@ -3,15 +3,17 @@
  * A real child `AgentSession` homed on a pooled worker (the direct-module entry, wrapped by the heap fixture),
  * watched from main as a focused view watches it, runs bash calls that each print a text of its own, against a
  * scripted OpenAI-compatible server. Near the end of its run a heap snapshot of each thread counts the copies of
- * those texts; once it is parked and its worker has stopped, main's snapshot shows what main keeps of it.
+ * those texts; once it is parked and its worker has stopped, main's snapshot shows what main keeps of it. Each wait
+ * of the run has a named deadline; the last cases check those deadlines and the test's own setup and teardown.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import { __resetDirsFromEnvForTests, prompt, removeWithRetries } from "@oh-my-pi/pi-utils";
+import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import { __resetDirsFromEnvForTests, getAgentDir, prompt, removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
 import { AsyncJobManager } from "../../src/async/job-manager";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
@@ -67,6 +69,15 @@ const MIN_HEAP_COPIES = 1;
 const PAYLOAD_SEED = crypto.randomBytes(8).toString("hex");
 /** Named in `test/fixtures/subagent-heap-hook.ts`, which listens on it in each worker. */
 const HEAP_CHANNEL = "omp-test-subagent-heap";
+
+// Deadlines of a run's steps, each well inside TEST_TIMEOUT_MS: a run that stalls fails at the step it stalled in,
+// named in the error, rather than at the test's timeout.
+/** For the run to put its session mirror on main. */
+const MIRROR_STARTUP_MS = 60_000;
+/** For the run to send its final model request, which the server holds. */
+const FINAL_REQUEST_MS = 150_000;
+/** For a worker to write the heap snapshot it was asked for, and say so. */
+const SNAPSHOT_REPLY_MS = 60_000;
 
 interface ChatMessage {
 	role: string;
@@ -166,6 +177,11 @@ class CopiesModelServer {
 		this.#release.resolve();
 	}
 
+	/** The OpenAI-compatible base URL of the scripted provider. */
+	get baseUrl(): string {
+		return `http://127.0.0.1:${this.#server.port}/v1`;
+	}
+
 	async writeModelsYml(agentDir: string): Promise<string> {
 		const file = path.join(agentDir, "models.yml");
 		await Bun.write(
@@ -173,7 +189,7 @@ class CopiesModelServer {
 			[
 				"providers:",
 				"  fake:",
-				`    baseUrl: http://127.0.0.1:${this.#server.port}/v1`,
+				`    baseUrl: ${this.baseUrl}`,
 				"    auth: none",
 				"    api: openai-completions",
 				"    models:",
@@ -230,17 +246,39 @@ class CopiesModelServer {
 	}
 }
 
-/** Poll a condition fed by another thread; waits on the condition itself, never a guessed duration. */
-async function waitFor(check: () => boolean, timeoutMs = 60_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!check()) {
-		if (Date.now() > deadline) throw new Error("condition not met in time");
+/**
+ * `wait(signal)` under a deadline: rejects with an error naming `label` once `ms` passed, and aborts `signal` once
+ * the wait settled or missed its deadline, so a wait that polls stops polling.
+ */
+async function withDeadline<T>(label: string, ms: number, wait: (signal: AbortSignal) => Promise<T>): Promise<T> {
+	const done = new AbortController();
+	try {
+		return await withTimeout(wait(done.signal), ms, `${label}: missed its ${ms} ms deadline`);
+	} finally {
+		done.abort();
+	}
+}
+
+/**
+ * The first value `find` returns, polled every 10 ms until `signal` aborts. `find` reads what another thread feeds,
+ * so this waits on the value itself, never a guessed duration.
+ */
+async function poll<T>(find: () => T | undefined, signal: AbortSignal): Promise<T> {
+	for (;;) {
+		const found = find();
+		if (found !== undefined) return found;
+		signal.throwIfAborted();
 		await Bun.sleep(10);
 	}
 }
 
-/** Ask the worker `threadId` (through the heap fixture) for a heap snapshot of its thread. */
-async function workerSnapshot(threadId: string, file: string): Promise<V8HeapSnapshot> {
+/** Poll a condition fed by another thread until it holds; fails, naming `label`, after `timeoutMs`. */
+async function waitFor(label: string, check: () => boolean, timeoutMs = 60_000): Promise<void> {
+	await withDeadline(label, timeoutMs, signal => poll(() => (check() ? true : undefined), signal));
+}
+
+/** Ask the worker `threadId` (through the heap fixture) for a heap snapshot of its thread, replied within `replyMs`. */
+async function workerSnapshot(threadId: string, file: string, replyMs = SNAPSHOT_REPLY_MS): Promise<V8HeapSnapshot> {
 	const channel = new BroadcastChannel(HEAP_CHANNEL);
 	try {
 		const written = Promise.withResolvers<void>();
@@ -250,7 +288,7 @@ async function workerSnapshot(threadId: string, file: string): Promise<V8HeapSna
 		};
 		const request: SubagentHeapRequest = { path: file, threadId };
 		channel.postMessage(request);
-		await written.promise;
+		await withDeadline(`snapshot reply from worker ${threadId}`, replyMs, () => written.promise);
 	} finally {
 		channel.close();
 	}
@@ -352,15 +390,28 @@ const AGENT: AgentDefinition = {
 	tools: ["bash"],
 };
 
-let root: string;
+/** What a test's setup acquired; each is set once acquired, and {@link tearDown} releases exactly those. */
+interface Acquired {
+	/** Each of {@link ENV_KEYS} as it was before setup changed it. */
+	env: Record<string, string | undefined>;
+	root: string;
+	server: CopiesModelServer;
+	authStorage: AuthStorage;
+	jobs: AsyncJobManager;
+	pool: SubagentWorkerPool;
+}
+
+let acquired: Partial<Acquired> = {};
 let cwd: string;
-let savedEnv: Record<string, string | undefined> = {};
-let server: CopiesModelServer;
-let pool: SubagentWorkerPool;
-let authStorage: AuthStorage;
 let modelRegistry: ModelRegistry;
 let settings: Settings;
-let jobs: AsyncJobManager;
+
+/** `acquired[key]`, which a run needs setup to have acquired. */
+function need<K extends keyof Acquired>(key: K): Acquired[K] {
+	const value = acquired[key];
+	if (value === undefined) throw new Error(`setup has not acquired ${key}`);
+	return value;
+}
 
 function setEnv(key: string, value: string | undefined): void {
 	if (value === undefined) {
@@ -372,9 +423,14 @@ function setEnv(key: string, value: string | undefined): void {
 	}
 }
 
-beforeEach(async () => {
-	savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
-	root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-worker-subagent-copies-"));
+/**
+ * A temp home and work dir holding the payloads, the environment pointed at them, the scripted model server, the
+ * job manager and the worker pool, each recorded in {@link acquired} as soon as it is acquired.
+ */
+async function setUp(): Promise<void> {
+	acquired.env = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-worker-subagent-copies-"));
+	acquired.root = root;
 	const home = path.join(root, "home");
 	const agentDir = path.join(home, ".omp", "agent");
 	cwd = path.join(root, "work");
@@ -391,9 +447,11 @@ beforeEach(async () => {
 	AgentLifecycleManager.resetGlobalForTests();
 	IrcBus.resetGlobalForTests();
 
-	server = new CopiesModelServer();
+	const server = new CopiesModelServer();
+	acquired.server = server;
 	const modelsPath = await server.writeModelsYml(agentDir);
-	authStorage = createInMemoryAuthStorage();
+	const authStorage = createInMemoryAuthStorage();
+	acquired.authStorage = authStorage;
 	modelRegistry = new ModelRegistry(authStorage, modelsPath);
 	await modelRegistry.refresh();
 	settings = Settings.isolated({
@@ -408,33 +466,59 @@ beforeEach(async () => {
 		"async.enabled": true,
 		modelRoles: { default: MODEL },
 	});
-	jobs = new AsyncJobManager({ maxRunningJobs: 4 });
+	acquired.jobs = new AsyncJobManager({ maxRunningJobs: 4 });
 	// Every run goes to the one worker, which stops soon after its last session is gone.
-	pool = new SubagentWorkerPool({
+	const pool = new SubagentWorkerPool({
 		maxWorkers: () => 1,
 		idleMs: 300,
 		hostsOnMain: false,
 		worker: { initTimeoutMs: 60_000, entry: new URL("../fixtures/subagent-heap-worker.ts", import.meta.url) },
 	});
+	acquired.pool = pool;
 	setSubagentWorkerPoolForTests(pool);
-});
+}
 
-afterEach(async () => {
-	await AgentLifecycleManager.global().dispose();
-	setSubagentWorkerPoolForTests(undefined);
-	pool.dispose();
-	server.stop();
-	await jobs.dispose({ timeoutMs: 1_000 });
-	AgentLifecycleManager.resetGlobalForTests();
-	AgentRegistry.resetGlobalForTests();
-	IrcBus.resetGlobalForTests();
-	authStorage.close();
-	AgentStorage.close();
-	closeModelCache();
-	for (const key of ENV_KEYS) setEnv(key, savedEnv[key]);
-	__resetDirsFromEnvForTests();
-	await removeWithRetries(root);
-});
+/** Run every step, each after the one before even when that one threw; then throw what the steps threw. */
+async function runEach(steps: ReadonlyArray<() => unknown>): Promise<void> {
+	const errors: unknown[] = [];
+	for (const step of steps) {
+		try {
+			await step();
+		} catch (error) {
+			errors.push(error);
+		}
+	}
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1) throw new AggregateError(errors, `${errors.length} teardown steps failed`);
+}
+
+/**
+ * Release what setup acquired, each on its own, so a cleanup that throws skips none of the others; then, whatever
+ * threw, restore the environment and the directory caches read from it.
+ */
+async function tearDown(): Promise<void> {
+	const { env, root, server, authStorage, jobs, pool } = acquired;
+	acquired = {};
+	try {
+		await runEach([
+			() => AgentLifecycleManager.global().dispose(),
+			() => setSubagentWorkerPoolForTests(undefined),
+			() => pool?.dispose(),
+			() => server?.stop(),
+			() => jobs?.dispose({ timeoutMs: 1_000 }),
+			() => AgentLifecycleManager.resetGlobalForTests(),
+			() => AgentRegistry.resetGlobalForTests(),
+			() => IrcBus.resetGlobalForTests(),
+			() => authStorage?.close(),
+			() => AgentStorage.close(),
+			() => closeModelCache(),
+			() => (root === undefined ? undefined : removeWithRetries(root)),
+		]);
+	} finally {
+		if (env) for (const key of ENV_KEYS) setEnv(key, env[key]);
+		__resetDirsFromEnvForTests();
+	}
+}
 
 function runOptions(): ExecutorOptions {
 	return {
@@ -447,12 +531,12 @@ function runOptions(): ExecutorOptions {
 		modelOverride: MODEL,
 		structured: false,
 		settings,
-		authStorage,
+		authStorage: need("authStorage"),
 		modelRegistry,
 		costGate: new CostGate(settings, 0, () => {}),
-		asyncJobManager: jobs,
+		asyncJobManager: need("jobs"),
 		eventBus: new EventBus(),
-		artifactsDir: path.join(root, "artifacts"),
+		artifactsDir: path.join(need("root"), "artifacts"),
 		enableLsp: false,
 		enableMCP: false,
 		taskDepth: 0,
@@ -467,48 +551,79 @@ interface WatchedRun {
 	readonly copies: readonly ThreadCopies[];
 }
 
+/** How a run ended, as far as a wait it ended reports it. */
+type RunEnd = Pick<SingleResult, "exitCode" | "error" | "output">;
+
+/** Rejects once `running` settles: the run was to reach `step` before it ended. */
+async function endsBefore(running: Promise<RunEnd>, step: string): Promise<never> {
+	const result = await running;
+	throw new Error(`The run ended (exit ${result.exitCode}) before ${step}: ${result.error ?? result.output}`);
+}
+
+/** The run's session mirror on main, once the run puts it there; a run that ends first fails the wait at once. */
+function mirrorStartup(running: Promise<RunEnd>, ms = MIRROR_STARTUP_MS): Promise<RemoteAgentSession> {
+	return withDeadline("mirror startup", ms, signal =>
+		Promise.race([
+			poll(() => {
+				const session = AgentRegistry.global().get(AGENT_ID)?.session;
+				return session instanceof RemoteAgentSession ? session : undefined;
+			}, signal),
+			endsBefore(running, "its session mirror appeared on main"),
+		]),
+	);
+}
+
+/**
+ * The text length of each tool result the model received, once the server holds the run's final request; a run
+ * that ends first fails the wait at once.
+ */
+function finalRequest(server: CopiesModelServer, running: Promise<RunEnd>, ms = FINAL_REQUEST_MS): Promise<number[]> {
+	return withDeadline("final model request", ms, () =>
+		Promise.race([server.finalHeld(), endsBefore(running, "its final model call")]),
+	);
+}
+
 /**
  * The run, watched from main as a focused view watches it, with both heaps read near its end (every result in,
  * the final model call in flight). Its own frame holds the mirror, so nothing here keeps it once it returns.
  */
 async function runWatched(): Promise<WatchedRun> {
+	const server = need("server");
 	const running = runSubprocess(runOptions());
-	await waitFor(() => AgentRegistry.global().get(AGENT_ID)?.session instanceof RemoteAgentSession);
-	const mirror = AgentRegistry.global().get(AGENT_ID)?.session;
-	if (!(mirror instanceof RemoteAgentSession)) throw new Error("expected a worker-homed session mirror on main");
-	const worker = pool.forThread(mirror.home);
+	const mirror = await mirrorStartup(running);
+	const worker = need("pool").forThread(mirror.home);
 	if (!worker) throw new Error("the child's worker is not in the pool");
 	const unwatch = mirror.subscribe(() => {});
-
-	// The final turn is held only if the run reaches it: a run that ends or fails first fails the test now.
-	const resultLengths = await Promise.race([
-		server.finalHeld(),
-		running.then(result => {
-			throw new Error(
-				`The run ended (exit ${result.exitCode}) before its final model call: ${result.error ?? result.output}`,
-			);
-		}),
-	]);
-	// Wait until the mirror holds every result, in its messages and (watched) in its entries.
-	await waitFor(
-		() =>
-			mirror.messages.filter(message => message.role === "toolResult").length === RESULTS &&
-			mirror.sessionManager
-				.getEntries()
-				.filter(entry => entry.type === "message" && entry.message.role === "toolResult").length === RESULTS,
-	);
-	await collectGarbage();
-	const main = payloadCopies("main", new HeapGraph(takeV8HeapSnapshot()));
-	const file = path.join(root, "worker.heapsnapshot");
-	const inWorker = payloadCopies("worker", new HeapGraph(await workerSnapshot(worker.threadId, file)));
-
-	unwatch();
-	server.release();
+	let resultLengths: number[];
+	let copies: ThreadCopies[];
+	try {
+		// The final turn is held only if the run reaches it: a run that ends or fails first fails the test now.
+		resultLengths = await finalRequest(server, running);
+		// Wait until the mirror holds every result, in its messages and (watched) in its entries.
+		await waitFor(
+			"every result in the mirror",
+			() =>
+				mirror.messages.filter(message => message.role === "toolResult").length === RESULTS &&
+				mirror.sessionManager
+					.getEntries()
+					.filter(entry => entry.type === "message" && entry.message.role === "toolResult").length === RESULTS,
+		);
+		await collectGarbage();
+		const main = payloadCopies("main", new HeapGraph(takeV8HeapSnapshot()));
+		const file = path.join(need("root"), "worker.heapsnapshot");
+		copies = [main, payloadCopies("worker", new HeapGraph(await workerSnapshot(worker.threadId, file)))];
+	} finally {
+		unwatch();
+		server.release();
+	}
 	const result = await running;
-	return { worker, output: result.output, resultLengths, copies: [main, inWorker] };
+	return { worker, output: result.output, resultLengths, copies };
 }
 
 describe("copies of a worker subagent's context", () => {
+	beforeEach(setUp);
+	afterEach(tearDown);
+
 	it(
 		"holds at most five copies of a worker subagent's context across both heaps, and only its registry record once parked and its worker stopped",
 		async () => {
@@ -520,8 +635,8 @@ describe("copies of a worker subagent's context", () => {
 			expect(run.resultLengths.filter(length => length >= LINES * (LINE_CHARS + 1) - 1)).toHaveLength(RESULTS);
 
 			// Parked, and its worker stopped.
-			await waitFor(() => AgentRegistry.global().get(AGENT_ID)?.status === "parked");
-			await waitFor(() => !run.worker.alive);
+			await waitFor("the agent parked", () => AgentRegistry.global().get(AGENT_ID)?.status === "parked");
+			await waitFor("its worker stopped", () => !run.worker.alive);
 			await run.worker.ended;
 			await collectGarbage();
 			const parked = new HeapGraph(takeV8HeapSnapshot());
@@ -561,4 +676,143 @@ describe("copies of a worker subagent's context", () => {
 		},
 		TEST_TIMEOUT_MS,
 	);
+});
+
+/** Whether something still accepts connections at `url`: it answers, or it refuses the connection. */
+async function listening(url: string): Promise<boolean> {
+	try {
+		const response = await withTimeout(fetch(url), 5_000, `request to ${url}: no answer within 5000 ms`);
+		await response.body?.cancel();
+		return true;
+	} catch (error) {
+		if (error instanceof Error && Reflect.get(error, "code") === "ECONNREFUSED") return false;
+		throw error;
+	}
+}
+
+/** Each of {@link ENV_KEYS} as `process.env` and `Bun.env` hold it now. */
+function envNow(): Record<string, Array<string | undefined>> {
+	return Object.fromEntries(ENV_KEYS.map(key => [key, [process.env[key], Bun.env[key]]]));
+}
+
+/** Far below every deadline of a real run: a wait that takes longer did not fail at once. */
+const PROMPT_MS = 5_000;
+
+/** The message `wait` rejected with (or `resolved`), and whether it settled within {@link PROMPT_MS}. */
+async function outcome(wait: Promise<unknown>): Promise<{ message: string; prompt: boolean }> {
+	const start = performance.now();
+	const message = await wait.then(
+		() => "resolved",
+		(error: unknown) => (error instanceof Error ? error.message : String(error)),
+	);
+	return { message, prompt: performance.now() - start < PROMPT_MS };
+}
+
+describe("the copies test's setup, teardown and deadlines", () => {
+	afterEach(tearDown);
+
+	it("stops its model server, removes its temp dir and restores the environment when setup fails part way and a teardown step throws", async () => {
+		// If this regresses, a setup that fails after it changed the environment, or a teardown step that throws,
+		// leaves this file's model server listening, its temp dir on disk, and HOME and the agent dir pointing into
+		// that dir for every later test file in the process.
+		const envBefore = envNow();
+		const agentDirBefore = getAgentDir();
+		const refresh = spyOn(ModelRegistry.prototype, "refresh").mockRejectedValue(
+			new Error("refresh failed in the control"),
+		);
+		try {
+			await expect(setUp()).rejects.toThrow("refresh failed in the control");
+		} finally {
+			refresh.mockRestore();
+		}
+		const { root, server } = acquired;
+		if (root === undefined || server === undefined) {
+			throw new Error("setup failed before it acquired its temp dir and model server");
+		}
+		const modelsUrl = `${server.baseUrl}/models`;
+		const during = {
+			pool: acquired.pool !== undefined,
+			listening: await listening(modelsUrl),
+			rootExists: await fs.exists(root),
+			home: process.env.HOME,
+			agentDirInRoot: getAgentDir().startsWith(root),
+		};
+		// Teardown's first step throws; every later step still runs.
+		const dispose = spyOn(AgentLifecycleManager.prototype, "dispose").mockRejectedValue(
+			new Error("dispose failed in the control"),
+		);
+		try {
+			await expect(tearDown()).rejects.toThrow("dispose failed in the control");
+		} finally {
+			dispose.mockRestore();
+		}
+		expect({
+			during,
+			after: {
+				listening: await listening(modelsUrl),
+				rootExists: await fs.exists(root),
+				env: envNow(),
+				agentDir: getAgentDir(),
+			},
+		}).toEqual({
+			during: {
+				pool: false,
+				listening: true,
+				rootExists: true,
+				home: path.join(root, "home"),
+				agentDirInRoot: true,
+			},
+			after: { listening: false, rootExists: false, env: envBefore, agentDir: agentDirBefore },
+		});
+	});
+
+	it("fails the wait for the run's mirror or its final request at once, naming the step, when the run ends first", async () => {
+		// If this regresses, a heap test whose run fails before its mirror or its final request waits out that step's
+		// deadline or the test's timeout, and then fails without the run's own error.
+		const server = new CopiesModelServer();
+		const ended = Promise.resolve({ exitCode: 1, error: "the model is not found", output: "" });
+		try {
+			expect({
+				mirror: await outcome(mirrorStartup(ended)),
+				finalRequest: await outcome(finalRequest(server, ended)),
+			}).toEqual({
+				mirror: {
+					message: "The run ended (exit 1) before its session mirror appeared on main: the model is not found",
+					prompt: true,
+				},
+				finalRequest: {
+					message: "The run ended (exit 1) before its final model call: the model is not found",
+					prompt: true,
+				},
+			});
+		} finally {
+			server.stop();
+		}
+	});
+
+	it("rejects, naming the step, once the mirror, the final request or a worker's snapshot reply misses its deadline", async () => {
+		// If this regresses, a heap test whose run stalls before its mirror or its final request, or whose worker
+		// never answers a snapshot request, hangs until the test's five-minute timeout without naming the step.
+		const server = new CopiesModelServer();
+		const stalled = Promise.withResolvers<RunEnd>().promise;
+		const file = path.join(os.tmpdir(), `omp-worker-subagent-copies-${SCRIPT_ID}.heapsnapshot`);
+		// Real 50 ms deadlines: these are the heavy test's own waits, and what they wait on (another thread, a
+		// broadcast channel, a server) runs on the real clock, not on fake timers.
+		try {
+			expect({
+				mirror: await outcome(mirrorStartup(stalled, 50)),
+				finalRequest: await outcome(finalRequest(server, stalled, 50)),
+				snapshotReply: await outcome(workerSnapshot("no-such-thread", file, 50)),
+			}).toEqual({
+				mirror: { message: "mirror startup: missed its 50 ms deadline", prompt: true },
+				finalRequest: { message: "final model request: missed its 50 ms deadline", prompt: true },
+				snapshotReply: {
+					message: "snapshot reply from worker no-such-thread: missed its 50 ms deadline",
+					prompt: true,
+				},
+			});
+		} finally {
+			server.stop();
+		}
+	});
 });

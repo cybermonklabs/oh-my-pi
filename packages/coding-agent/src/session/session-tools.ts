@@ -214,7 +214,7 @@ interface SessionToolsOptions {
 	xdev?: XdevState;
 	setActiveToolNames?: (names: Iterable<string>) => void;
 	baseSystemPrompt: string[];
-	skills?: Skill[];
+	skills?: readonly Skill[];
 	skillWarnings?: SkillWarning[];
 	skillsSettings?: SkillsSettings;
 	skillsReloadable?: boolean;
@@ -554,8 +554,8 @@ export class SessionTools {
 	readonly #deviceOnlyWriteTransportAvailable: boolean;
 	#ensureGoalRegistered: SessionToolsOptions["ensureGoalRegistered"];
 	#reconcileSettingsGatedTools: SessionToolsOptions["reconcileSettingsGatedTools"];
-	#skills: Skill[];
-	#promptSkills: Skill[];
+	#skills: readonly Skill[];
+	#promptSkills: readonly Skill[];
 	#skillWarnings: SkillWarning[];
 	#skillsSettings: SkillsSettings | undefined;
 	#skillsReloadable: boolean;
@@ -696,12 +696,12 @@ export class SessionTools {
 	}
 
 	/** The live skill registry: what `skill://` and `/skill:` resolve. */
-	get skills(): Skill[] {
+	get skills(): readonly Skill[] {
 		return this.#skills;
 	}
 
 	/** Skills the system prompt renders; behind {@link skills} after {@link reloadSkills}. */
-	get promptSkills(): Skill[] {
+	get promptSkills(): readonly Skill[] {
 		return this.#promptSkills;
 	}
 

@@ -45,9 +45,15 @@ function isTypeList(value: unknown): value is Array<string | string[]> {
 	return Array.isArray(value) && value.every(item => typeof item === "string" || isStringArray(item));
 }
 
+/** The node fields {@link HeapGraph} reads. */
+const NODE_FIELDS: readonly string[] = ["type", "name", "self_size", "edge_count"];
+/** The edge fields {@link HeapGraph} reads. */
+const EDGE_FIELDS: readonly string[] = ["type", "name_or_index", "to_node"];
+
 /**
  * `raw` (a parsed V8-format heap snapshot, of this thread or written by another) as a {@link V8HeapSnapshot},
- * once each field the readers here use has its shape.
+ * once each field the readers here use has its shape: every node and edge field {@link HeapGraph} reads, a list of
+ * type names for the node and edge `type` fields, and `nodes` and `edges` that hold whole records.
  * @throws when a field is missing or has another shape.
  */
 export function parseV8HeapSnapshot(raw: unknown): V8HeapSnapshot {
@@ -64,6 +70,30 @@ export function parseV8HeapSnapshot(raw: unknown): V8HeapSnapshot {
 	}
 	if (!isNumberArray(nodes) || !isNumberArray(edges) || !isStringArray(strings)) {
 		throw new Error("Not a V8 heap snapshot: it lacks its nodes, edges or strings");
+	}
+	const missingNodeFields = NODE_FIELDS.filter(field => !nodeFields.includes(field));
+	if (missingNodeFields.length > 0) {
+		throw new Error(`V8 heap snapshot schema: snapshot.meta.node_fields lacks ${missingNodeFields.join(", ")}`);
+	}
+	const missingEdgeFields = EDGE_FIELDS.filter(field => !edgeFields.includes(field));
+	if (missingEdgeFields.length > 0) {
+		throw new Error(`V8 heap snapshot schema: snapshot.meta.edge_fields lacks ${missingEdgeFields.join(", ")}`);
+	}
+	if (!isStringArray(nodeTypes[nodeFields.indexOf("type")])) {
+		throw new Error("V8 heap snapshot schema: snapshot.meta.node_types has no list of names for the node type field");
+	}
+	if (!isStringArray(edgeTypes[edgeFields.indexOf("type")])) {
+		throw new Error("V8 heap snapshot schema: snapshot.meta.edge_types has no list of names for the edge type field");
+	}
+	if (nodes.length % nodeFields.length !== 0) {
+		throw new Error(
+			`V8 heap snapshot schema: nodes has ${nodes.length} numbers, not whole records of ${nodeFields.length} node fields`,
+		);
+	}
+	if (edges.length % edgeFields.length !== 0) {
+		throw new Error(
+			`V8 heap snapshot schema: edges has ${edges.length} numbers, not whole records of ${edgeFields.length} edge fields`,
+		);
 	}
 	return {
 		snapshot: {

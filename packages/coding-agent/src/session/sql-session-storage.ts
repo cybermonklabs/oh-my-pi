@@ -4177,18 +4177,15 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		];
 	}
 
-	async readFrom(path: string, offset: number, maxBytes?: number): Promise<SessionStorageWindowRead | null> {
-		const take = Math.min(
-			maxBytes === undefined ? MAX_PIECE_BYTES : Math.max(0, Math.trunc(maxBytes)),
-			MAX_PIECE_BYTES,
-		);
+	async readFrom(path: string, start: number, maxBytes?: number): Promise<SessionStorageWindowRead | null> {
+		const take = Math.min(maxBytes ?? MAX_PIECE_BYTES, MAX_PIECE_BYTES);
 		const rows = (await this.#exclusive(() =>
 			this.#readOne(this.#q.readFrom, {
 				path,
-				offset,
-				end: maxBytes === undefined ? Number.MAX_SAFE_INTEGER : Math.min(offset + take, Number.MAX_SAFE_INTEGER),
+				offset: start,
+				end: maxBytes === undefined ? Number.MAX_SAFE_INTEGER : Math.min(start + take, Number.MAX_SAFE_INTEGER),
 				take,
-				row_from: Math.min(offset, MAX_PIECE_BYTES - 1) + 1,
+				row_from: Math.min(start, MAX_PIECE_BYTES - 1) + 1,
 			}),
 		)) as ReadFromRow[];
 		let size: number | undefined;
@@ -4206,14 +4203,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (size === undefined || session === undefined) return null;
 		const bytes = joinSliceBytes(session.bytes, pieces);
 		// Each piece is capped on its own; the window is capped as a whole.
-		// Buffer.toString preserves a leading U+FEFF (TextDecoder strips it), so
-		// byte offsets stay aligned with the stored bytes.
-		const window = maxBytes === undefined ? bytes : bytes.subarray(0, take);
-		return {
-			text: window.toString("utf-8"),
-			size,
-			title: rowTitle(session),
-		};
+		return { bytes: maxBytes === undefined ? bytes : bytes.subarray(0, take), size, title: rowTitle(session) };
 	}
 
 	/**

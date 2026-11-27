@@ -1558,11 +1558,12 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
+	/** Cut by {@link byteWindow}; a negative offset reads nothing, as Bun's file slice from one always has here. */
 	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
 		const { size } = await fsp.stat(path);
-		if (offset >= size) return { text: "", size };
-		const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
-		return { text: await Bun.file(path).slice(offset, end).text(), size };
+		const { start, end } = byteWindow(offset, maxBytes, size, "empty");
+		if (start >= end) return { text: "", size };
+		return { text: await Bun.file(path).slice(start, end).text(), size };
 	}
 
 	readChunks(path: string, fromByte?: number): AsyncIterable<Uint8Array> {
@@ -1572,17 +1573,19 @@ export class FileSessionStorage implements SessionStorage {
 	}
 
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+		const prefixLimit = byteLimit(prefixBytes);
+		const suffixLimit = byteLimit(suffixBytes);
 		// A gzip member cannot be read end-first, so an archived transcript is
 		// inflated whole and then windowed. Only the listing of an archive hits
 		// this; the live tree keeps the two bounded reads.
 		if (isArchivedSessionPath(path)) {
 			const bytes = await inflateArchivedBytes(path);
-			const head = utf8Decoder.decode(bytes.subarray(0, prefixBytes));
+			const head = utf8Decoder.decode(bytes.subarray(0, prefixLimit));
 			const tail =
-				suffixBytes > 0 ? utf8Decoder.decode(bytes.subarray(Math.max(0, bytes.length - suffixBytes))) : "";
+				suffixLimit > 0 ? utf8Decoder.decode(bytes.subarray(Math.max(0, bytes.length - suffixLimit))) : "";
 			return [head, tail];
 		}
-		return peekFileEnds(path, prefixBytes, suffixBytes, (head, tail) => [
+		return peekFileEnds(path, prefixLimit, suffixLimit, (head, tail) => [
 			utf8Decoder.decode(head),
 			utf8Decoder.decode(tail),
 		]);
@@ -1983,6 +1986,55 @@ export function sessionTreeStorage(session: {
 }
 
 /**
+ * The bytes a prefix or suffix window of at most `maxBytes` holds: the whole
+ * part of `maxBytes`, and 0 for a count that is not positive (negative, zero,
+ * NaN). Every `readTextSlices` (file, memory, indexed) normalises its two
+ * counts here, and {@link byteWindow} its limit; a window holds at most the
+ * text's size besides.
+ */
+export function byteLimit(maxBytes: number): number {
+	return maxBytes > 0 ? Math.trunc(maxBytes) : 0;
+}
+
+/** Where a {@link byteWindow} places a negative offset: each read keeps the rule its answers have always had. */
+export type NegativeByteOffset =
+	/** From the end of the text, as `Uint8Array.subarray` counts it: a read of the whole text (memory storage, a full read). */
+	| "from-end"
+	/** At byte 0, a window that ends at or before byte 0 holding nothing: a read from a stored position (SQL and Redis storage). */
+	| "from-start"
+	/** As a window that holds nothing: file storage, whose file slice reads nothing from a negative start. */
+	| "empty";
+
+/**
+ * The bytes `[start, end)` of a `size`-byte text that a read from byte
+ * `offset` of at most `maxBytes` bytes (to the end without them) covers: the
+ * offset cut to its whole part (0 for NaN), the limit to what
+ * {@link byteLimit} gives, the window clamped to the text, and a negative
+ * offset placed by `negative`. With `"from-end"` it is the window
+ * `Uint8Array.subarray(offset, offset + maxBytes)` takes, whose end counts
+ * from the end too when negative. Every `readTextFrom` and
+ * `readSessionTextFrom` cuts its window here.
+ */
+export function byteWindow(
+	offset: number,
+	maxBytes: number | undefined,
+	size: number,
+	negative: NegativeByteOffset = "from-end",
+): { start: number; end: number } {
+	const from = Math.trunc(offset) || 0;
+	const limit = maxBytes === undefined ? Number.POSITIVE_INFINITY : byteLimit(maxBytes);
+	if (from >= 0) return { start: Math.min(from, size), end: Math.min(from + limit, size) };
+	if (negative === "empty") return { start: 0, end: 0 };
+	if (negative === "from-start") {
+		return { start: 0, end: maxBytes === undefined || from + limit > 0 ? Math.min(limit, size) : 0 };
+	}
+	const start = Math.max(0, size + from);
+	if (maxBytes === undefined) return { start, end: size };
+	const end = from + limit;
+	return { start, end: Math.max(start, end < 0 ? size + end : Math.min(end, size)) };
+}
+
+/**
  * The UTF-8 text of `filePath` in `storage` from byte `offset` to the end, or
  * at most `maxBytes` of it, with the full size the read observed:
  * {@link SessionStorage.readTextFrom} where the backend has it, else a whole
@@ -2000,9 +2052,8 @@ export async function readSessionTextFrom(
 ): Promise<{ text: string; size: number }> {
 	if (storage.readTextFrom) return storage.readTextFrom(filePath, offset, maxBytes);
 	const bytes = Buffer.from(await storage.readText(filePath), "utf8");
-	if (offset >= bytes.length) return { text: "", size: bytes.length };
-	const end = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
-	return { text: bytes.subarray(offset, end).toString("utf8"), size: bytes.length };
+	const { start, end } = byteWindow(offset, maxBytes, bytes.length);
+	return { text: bytes.toString("utf8", start, end), size: bytes.length };
 }
 
 /**
@@ -2190,11 +2241,6 @@ function appendMemoryChunk(entry: MemoryFileEntry, chunk: string): void {
 	entry.cumulativeBytes.push(entry.size);
 }
 
-function normalizeByteLimit(maxBytes: number, size: number): number {
-	if (!(maxBytes > 0) || size === 0) return 0;
-	return Math.min(Math.trunc(maxBytes), size);
-}
-
 function lowerBound(values: readonly number[], target: number): number {
 	let lo = 0;
 	let hi = values.length;
@@ -2255,7 +2301,7 @@ function materializeMemoryEntry(entry: MemoryFileEntry): string {
 }
 
 function sliceChunksHead(entry: MemoryFileEntry, maxBytes: number): string {
-	const limit = normalizeByteLimit(maxBytes, entry.size);
+	const limit = Math.min(byteLimit(maxBytes), entry.size);
 	if (limit === 0) return "";
 	if (limit >= entry.size) return materializeMemoryEntry(entry);
 
@@ -2270,7 +2316,7 @@ function sliceChunksHead(entry: MemoryFileEntry, maxBytes: number): string {
 }
 
 function sliceChunksTail(entry: MemoryFileEntry, maxBytes: number): string {
-	const limit = normalizeByteLimit(maxBytes, entry.size);
+	const limit = Math.min(byteLimit(maxBytes), entry.size);
 	if (limit === 0) return "";
 	if (limit >= entry.size) return materializeMemoryEntry(entry);
 
