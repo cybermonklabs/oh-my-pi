@@ -430,20 +430,26 @@ async function awaitDeliveryTurn(ready: Promise<void>, deadline: number): Promis
  * id, a streamed tool call's parse state on its block) onto `clone`, its `structuredClone`, which drops them.
  * `Bun.deepEquals` compares them: without them a clone a context hook leaves untouched reads as changed and goes out
  * per-call. Binary data is skipped, and each object once (`visited`), as the clone shares what the original shares.
+ * The walk keeps its own stack: a tool call's arguments nest as deep as a transcript line holds, past where a
+ * recursive walk runs out of stack.
  */
 function restoreSymbolTags(original: object, clone: object, visited: Set<object>): void {
-	if (visited.has(original)) return;
-	visited.add(original);
-	for (const key of Object.getOwnPropertySymbols(original)) {
-		if (Object.prototype.propertyIsEnumerable.call(original, key)) {
-			Reflect.set(clone, key, Reflect.get(original, key));
+	const pending: Array<readonly [object, object]> = [[original, clone]];
+	for (let pair = pending.pop(); pair !== undefined; pair = pending.pop()) {
+		const [from, to] = pair;
+		if (visited.has(from)) continue;
+		visited.add(from);
+		for (const key of Object.getOwnPropertySymbols(from)) {
+			if (Object.prototype.propertyIsEnumerable.call(from, key)) {
+				Reflect.set(to, key, Reflect.get(from, key));
+			}
 		}
-	}
-	for (const key of Object.keys(original)) {
-		const value: unknown = Reflect.get(original, key);
-		const copy: unknown = Reflect.get(clone, key);
-		if (typeof value !== "object" || value === null || typeof copy !== "object" || copy === null) continue;
-		if (!ArrayBuffer.isView(value)) restoreSymbolTags(value, copy, visited);
+		for (const key of Object.keys(from)) {
+			const value: unknown = Reflect.get(from, key);
+			const copy: unknown = Reflect.get(to, key);
+			if (typeof value !== "object" || value === null || typeof copy !== "object" || copy === null) continue;
+			if (!ArrayBuffer.isView(value)) pending.push([value, copy]);
+		}
 	}
 }
 
