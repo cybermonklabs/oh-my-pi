@@ -7889,12 +7889,15 @@ fn re_or_saved_re<'a>(
 
 #[cfg(unix)]
 fn shell_command(cmd: &[u8], host: &Host) -> io::Result<ProcessCommand> {
-	use std::os::unix::ffi::OsStrExt as _;
+	use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
 
-	let mut c = ProcessCommand::new("sh");
-	c.arg("-c").arg(std::ffi::OsStr::from_bytes(cmd));
+	let cwd = host.native_cwd()?;
+	let path = host.var("PATH").map(OsStr::new);
+	// On Linux `sh` gets the OOM adjustment of tool processes.
+	let mut c = crate::host::tool_command(OsStr::new("sh"), path, Some(cwd));
+	c.arg("-c").arg(OsStr::from_bytes(cmd));
 	// `output()` captures the child's stdio instead of inheriting the TUI's.
-	c.current_dir(host.native_cwd()?);
+	c.current_dir(cwd);
 	c.env_clear().envs(host.env());
 	Ok(c)
 }
@@ -9433,6 +9436,21 @@ mod tests {
 		assert_eq!(code, 0);
 		assert_eq!(capture.out(), "world\n");
 		assert_eq!(capture.err(), "");
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn builtin_execute_substitution_sets_tool_oom_score() {
+		let score = "/proc/self/oom_score_adj";
+		let before = crate::host::below_tool_score();
+		let (code, capture) = crate::host::run_util::<Sed>(
+			&["s/^run //e"],
+			"run read -r score < /proc/self/oom_score_adj; printf '%s\\n' \"$score\"; \
+			 /bin/cat /proc/self/oom_score_adj; :\n",
+			"/",
+		);
+		assert_eq!(std::fs::read_to_string(score).unwrap(), before);
+		assert_eq!((code, capture.out().as_str(), capture.err().as_str()), (0, "1000\n1000\n", ""));
 	}
 
 	#[test]

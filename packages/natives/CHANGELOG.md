@@ -18,6 +18,7 @@
 - Improved URL reading to preserve model tables, source-code indentation, linked content cards, meaningful button labels, and sign-in instructions while removing unrelated news, footer content, and empty whitespace-only paragraphs.
 - Fixed `Process.terminate` so descendants that start their own sessions are still terminated reliably.
 - Fixed the Linux GNU native addon so it no longer requires `libm.so.6` for the Perl `POSIX` `acosh` and `asinh` builtins.
+- On Linux, external shell commands and the programs that shell utilities start (`rsync`'s remote shell and `RSYNC_CONNECT_PROG`, `sort --compress-program`, `rg -z`'s decompressors, `sed`'s `s///e`, `open`'s applications, `watchexec`'s `notify-send`) are preferred over the host when the kernel selects individual processes to kill for lack of memory (`memory.oom.group=0`); this does not protect the host from group kills.
 
 ## [19.2.1] - 2026-11-25
 

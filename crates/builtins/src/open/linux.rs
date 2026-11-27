@@ -12,6 +12,7 @@
 
 use std::{
 	collections::HashMap,
+	ffi::OsStr,
 	fs::{File, OpenOptions},
 	future::Future,
 	io,
@@ -152,6 +153,28 @@ mod tests {
 		assert_eq!(fs::read_to_string(&out).expect("recorder output"), "https://example.com/a?b=c|\n");
 		// A file is nothing a URL forwarder can show.
 		assert_eq!(run_open(&["/"], &[("PATH", "/usr/bin:/bin"), ("BROWSER", "true")], &dir).0, 3);
+	}
+
+	#[test]
+	fn open_application_and_its_child_inherit_tool_oom_score() {
+		let dir = tempfile::tempdir().unwrap();
+		let score = "/proc/self/oom_score_adj";
+		let before = crate::host::below_tool_score();
+		let script = dir.path().join("browser");
+		fs::write(
+			&script,
+			"read -r score < /proc/self/oom_score_adj; printf '%s\\n' \"$score\"; \
+			 /bin/cat /proc/self/oom_score_adj; :",
+		)
+		.unwrap();
+		let (code, err) = run_open(
+			&["-W", "--stdout", "scores", "https://example.com/"],
+			&[("BROWSER", "/bin/sh ./browser")],
+			dir.path(),
+		);
+		assert_eq!(fs::read_to_string(score).unwrap(), before);
+		assert_eq!((code, err.as_str()), (0, ""));
+		assert_eq!(fs::read_to_string(dir.path().join("scores")).unwrap(), "1000\n1000\n");
 	}
 
 	/// Regression for `zbus::blocking` panicking inside Tokio contexts
@@ -375,6 +398,16 @@ fn no_handler(message: impl Into<String>) -> Failure {
 
 fn failed(message: impl Into<String>) -> Failure {
 	Failure { status: FAILED, message: message.into() }
+}
+
+/// Whether `a` and `b` name the same file.
+fn same_file(a: &Path, b: &Path) -> bool {
+	use std::os::unix::fs::MetadataExt as _;
+
+	match (a.metadata(), b.metadata()) {
+		(Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+		_ => false,
+	}
 }
 
 /// One request against the desktop session of the shell's environment.
@@ -762,13 +795,33 @@ impl<'a> Desktop<'a> {
 		let program = self
 			.executable(name)
 			.ok_or_else(|| no_handler(format!("{name}: command not found")))?;
-		let mut command = Command::new(program);
+		let cwd = directory.or(self.cwd.as_deref()).unwrap_or(Path::new("/"));
+		// The child's `PATH`, which `--env` may set apart from the shell's.
+		let path = self
+			.env
+			.iter()
+			.rev()
+			.find(|(key, _)| key == "PATH")
+			.map(|(_, value)| OsStr::new(value));
+		// The `/bin/sh` of the OOM adjustment of tool processes execs `$0`,
+		// and POSIX `sh` cannot give what it execs another `argv[0]`. `name`
+		// as `$0` keeps both the program and its `argv[0]` when the child's
+		// own lookup of `name` finds `program`; otherwise `program`'s path
+		// keeps the program, and `argv[0]` becomes that path.
+		let zero = match crate::host::resolve_program(OsStr::new(name), path, Some(cwd)) {
+			Some(found) if same_file(&found, &program) => OsStr::new(name),
+			_ => program.as_os_str(),
+		};
+		let mut command = crate::host::tool_shell(zero, path, Some(cwd)).unwrap_or_else(|| {
+			let mut command = Command::new(&program);
+			command.arg0(name);
+			command
+		});
 		command
-			.arg0(name)
 			.args(arguments)
 			.env_clear()
 			.envs(self.env.iter().map(|(name, value)| (name, value)))
-			.current_dir(directory.or(self.cwd.as_deref()).unwrap_or(Path::new("/")))
+			.current_dir(cwd)
 			.setsid(true);
 		for (slot, path) in self.request.stdio.iter().enumerate() {
 			let stream = match path {

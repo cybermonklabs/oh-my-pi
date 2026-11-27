@@ -13,7 +13,7 @@ use std::{
 use bstr::{BString, ByteSlice};
 use parking_lot::Mutex;
 
-use super::{Scope, State, process_umask};
+use super::{Scope, process_umask};
 use crate::{
 	bash::{
 		ChildRedir, ChildRedirs, CmdTag, EnvView, ExitStatus, ExtProc, File, FileKind, JobId,
@@ -299,6 +299,92 @@ fn parked_waiters_report_each_external_its_own_exit() {
 	assert!(s.leftovers().unwrap().is_empty());
 }
 
+/// This test process's OOM adjustment, lowered from 1000 to 999 where it
+/// was 1000: a test that a tool process of this build runs (a bash tool
+/// command) starts at 1000 already, so a child reading 1000 would not show
+/// that its own spawn set it. Best effort: the kernel refuses 999 only below
+/// a minimum a privileged writer set.
+#[cfg(target_os = "linux")]
+fn below_tool_score() -> String {
+	let score = "/proc/self/oom_score_adj";
+	if std::fs::read_to_string(score).unwrap().trim() == "1000" {
+		let _ = std::fs::write(score, "999");
+	}
+	std::fs::read_to_string(score).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn check_tool_oom_score(measured: bool, redirs: Option<ChildRedirs>) {
+	let score = "/proc/self/oom_score_adj";
+	let before = below_tool_score();
+	let env = EnvView::default();
+	let a = sh("read -r score < /proc/self/oom_score_adj; printf '%s\\n' \"$score\"; /bin/cat \
+	            /proc/self/oom_score_adj; :");
+	let s = spawner(Sessions::Detach, Duration::from_secs(2));
+	let out = MemFile::default();
+	let mut sp = spec(&a, &env, NEW);
+	sp.stdio = [StdioSpec::Null, out.boxed(), StdioSpec::Null];
+	sp.redirs = redirs;
+	let mut p = if measured {
+		s.spawn_measured(sp)
+	} else {
+		s.spawn(sp)
+	}
+	.unwrap();
+	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+	assert_eq!(std::fs::read_to_string(score).unwrap(), before);
+	assert_eq!(out.captured(), b"1000\n1000\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_spawn_sets_tool_oom_score() {
+	check_tool_oom_score(false, None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn redirected_spawn_sets_tool_oom_score() {
+	check_tool_oom_score(
+		false,
+		Some(ChildRedirs {
+			list:      vec![ChildRedir::Close { fd: 9 }],
+			exec_diag: BString::from("test: /bin/sh: "),
+		}),
+	);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn measured_spawn_inherits_tool_oom_score() {
+	check_tool_oom_score(true, None);
+}
+
+/// Failure mode: a program under a low open-files limit (`ulimit -n 3`)
+/// starts without the OOM adjustment of tool processes: its child set the
+/// limit before it opened `/proc/self/oom_score_adj`, and the open failed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_low_open_files_limit_keeps_the_tool_oom_score() {
+	below_tool_score();
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let (_, hard) = crate::sys::rlimit::get(Rlimit::Nofile).unwrap();
+	// Fds 0, 1 and 2 are open: no other fd fits under the limit.
+	let limits = [(Rlimit::Nofile, Some(3), hard)];
+	let a = argv(&["/usr/bin/true"]);
+	let mut sp = spec(&a, &env, NEW);
+	sp.rlimits = &limits;
+	let mut p = s.spawn(sp).unwrap();
+	// The spawn returns once the program exec'd, and the process stays
+	// unreaped while `p` lives: its value is final, whether or not its loader
+	// then fails for want of an fd.
+	let path = format!("/proc/{}/oom_score_adj", p.pid());
+	let score = std::fs::read_to_string(path).unwrap();
+	wait(&mut p);
+	assert_eq!(score, "1000\n");
+}
+
 /// A measured spawn (`time`; on Linux the program runs under a helper)
 /// ends as the program did, takes group signals as it would, reports a
 /// usage, and fails like a plain spawn when the program is missing.
@@ -372,6 +458,45 @@ fn shebang_less_script_fails_with_enoexec_on_both_paths() {
 		assert_eq!(err.raw_os_error(), Some(libc::ENOEXEC), "{what}: {err}");
 	}
 	std::fs::remove_file(&path).unwrap();
+}
+
+/// Failure mode: a program that cannot start spawns anyway (the engine then
+/// reports an exit status instead of the OS error bash prints), fails with
+/// another error, or leaves its failed child unreaped (a zombie per
+/// failure). The exec's `EACCES`, and a working directory the child cannot
+/// enter.
+#[test]
+fn exec_and_setup_errors_fail_the_spawn_and_leave_no_child() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let dir = tempfile::tempdir().unwrap();
+	let plain = dir.path().join("not-executable");
+	std::fs::write(&plain, b"#!/bin/sh\nexit 0\n").unwrap();
+	std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+	let not_executable = vec![BString::from(plain.as_os_str().as_encoded_bytes())];
+	let runs = argv(&["/usr/bin/true"]);
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	for (what, a, cwd, errno) in [
+		("not executable", &not_executable, "/", libc::EACCES),
+		("missing cwd", &runs, "/nonexistent/dir", libc::ENOENT),
+	] {
+		let mut sp = spec(a, &env, NEW);
+		sp.cwd = cwd.as_bytes().as_bstr();
+		let err = s
+			.spawn(sp)
+			.err()
+			.unwrap_or_else(|| panic!("{what}: spawned"));
+		assert_eq!(err.raw_os_error(), Some(errno), "{what}: {err}");
+	}
+	// nextest runs each test in its own process: it has no other child.
+	// SAFETY: plain syscall; `WNOHANG` does not wait.
+	let rc = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+	assert_eq!(
+		(rc, io::Error::last_os_error().raw_os_error()),
+		(-1, Some(libc::ECHILD)),
+		"a failed child is left unreaped"
+	);
 }
 
 /// A fresh path in the temp directory for test `what`.
@@ -1129,12 +1254,21 @@ fn ignored_realtime_max_reaches_the_child() {
 	assert_eq!(wait(&mut p), ExitStatus::Exited(7));
 }
 
+/// Whether the test process ignores `sig`.
+fn host_ignores(sig: libc::c_int) -> bool {
+	// SAFETY: sigaction is plain data, valid zeroed.
+	let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+	// SAFETY: a null new action only queries; `old` is writable.
+	let rc = unsafe { libc::sigaction(sig, std::ptr::null(), &raw mut old) };
+	rc == 0 && old.sa_sigaction == libc::SIG_IGN
+}
+
 #[test]
 fn ignored_signals_reach_the_child_through_the_fork_path() {
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
 	let a = sh("kill -USR1 $$; exit 7");
-	assert!(!super::host_ignores(Signal::Usr1));
+	assert!(!host_ignores(libc::SIGUSR1));
 	let mut sp = spec(&a, &env, NEW);
 	sp.sigmask_ign = SigSet::EMPTY.with(Signal::Usr1);
 	let mut p = s.spawn(sp).unwrap();
@@ -1162,6 +1296,45 @@ fn signal_the_host_ignores_after_a_spawn_is_reset_in_later_children() {
 		ExitStatus::Signaled(Signal::Usr2),
 		"the host's new SIG_IGN leaked into the child"
 	);
+}
+
+/// The signals the calling thread blocks.
+fn blocked_here() -> Vec<i32> {
+	// SAFETY: sigset_t is plain data, valid zeroed; a null new set only
+	// queries the mask.
+	unsafe {
+		let mut now = std::mem::zeroed::<libc::sigset_t>();
+		libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &raw mut now);
+		(1..=64)
+			.filter(|&n| libc::sigismember(&raw const now, n) == 1)
+			.collect()
+	}
+}
+
+/// Failure mode: the program starts with the signals its spawning thread
+/// blocks still blocked (a TERM would not end it), or the spawn leaves the
+/// spawning thread with another mask than it had.
+#[test]
+fn the_child_starts_with_no_signal_blocked_and_the_thread_keeps_its_mask() {
+	let (status, blocked) = thread::spawn(|| {
+		// SAFETY: sigset_t is plain data, valid zeroed; the calls only read
+		// and write the sets passed.
+		unsafe {
+			let mut term = std::mem::zeroed::<libc::sigset_t>();
+			libc::sigemptyset(&raw mut term);
+			libc::sigaddset(&raw mut term, libc::SIGTERM);
+			libc::pthread_sigmask(libc::SIG_SETMASK, &raw const term, std::ptr::null_mut());
+		}
+		let env = EnvView::default();
+		let a = argv(&["/bin/sleep", "30"]);
+		let mut p = NativeSpawner::default().spawn(spec(&a, &env, NEW)).unwrap();
+		p.signal(Signal::Term).unwrap();
+		(wait(&mut p), blocked_here())
+	})
+	.join()
+	.unwrap();
+	assert_eq!(status, ExitStatus::Signaled(Signal::Term), "TERM stayed blocked in the child");
+	assert_eq!(blocked, [libc::SIGTERM], "the spawning thread's mask");
 }
 
 #[test]
@@ -1251,10 +1424,12 @@ fn umask_probe_preserves_concurrent_file_creation_mask() {
 fn umask_reaches_the_child_on_both_paths() {
 	let env = EnvView::default();
 	let s = NativeSpawner::default();
-	let state = State::new(None);
+	#[cfg(target_os = "macos")]
+	let state = super::State::new(None);
 	let host = process_umask().unwrap();
 	let a = sh("umask");
 	for mask in [host, 0o027] {
+		#[cfg(target_os = "macos")]
 		assert_eq!(state.posix_eligible(mask, SigSet::EMPTY), mask == host);
 		let out = MemFile::default();
 		let mut sp = spec(&a, &env, NEW);
@@ -1360,7 +1535,7 @@ fn cwd_env_and_argv0_reach_the_child() {
 	assert_eq!(out.captured(), b"/usr\nb a r|name0\n");
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(target_os = "macos")]
 #[test]
 fn missing_spawn_chdir_uses_fork_with_the_requested_cwd() {
 	let mut s = NativeSpawner::default();
@@ -1395,6 +1570,21 @@ fn extra_fds_are_passed_to_the_child() {
 	assert_eq!(pumped.captured(), b"pumped\n", "fd 5 pumped both ways over a socket pair");
 	assert_eq!(std::fs::read(&path).unwrap(), b"direct\ngot back\n", "fd 7 passed through");
 	std::fs::remove_file(&path).unwrap();
+}
+
+/// Failure mode: a stream the spec closes (`>&-`) is still open in the
+/// program, which then writes into the null device instead of failing.
+#[test]
+fn a_closed_stream_is_closed_in_the_child() {
+	let env = EnvView::default();
+	let s = NativeSpawner::default();
+	let err = MemFile::default();
+	let a = sh("if [ -e /dev/fd/1 ]; then echo open >&2; else echo closed >&2; fi");
+	let mut sp = spec(&a, &env, NEW);
+	sp.stdio = [StdioSpec::Null, StdioSpec::Closed, err.boxed()];
+	let mut p = s.spawn(sp).unwrap();
+	assert_eq!(wait(&mut p), ExitStatus::Exited(0));
+	assert_eq!(err.captured(), b"closed\n");
 }
 
 /// bash hands one kernel pipe to every process that inherits a procsub fd.

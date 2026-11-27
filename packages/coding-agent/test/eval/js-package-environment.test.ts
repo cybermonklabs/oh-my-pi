@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -7,7 +7,8 @@ import { Settings } from "../../src/config/settings";
 import { disposeAllVmContexts } from "../../src/eval/js/context-manager";
 import { executeJs } from "../../src/eval/js/executor";
 import type { JsExecutorOptions } from "../../src/eval/js/executor";
-import { resolveJsPackageEnvironment } from "../../src/eval/js/package-installer";
+import { installJsPackages, resolveJsPackageEnvironment } from "../../src/eval/js/package-installer";
+import * as workerClient from "../../src/subprocess/worker-client";
 import type { ToolSession } from "../../src/tools";
 import { beginSettingsTest, restoreSettingsTestState } from "../helpers/settings-test-state";
 
@@ -77,6 +78,45 @@ describe("persistent JavaScript package environments", () => {
 				]),
 		);
 	});
+
+	it.skipIf(process.platform !== "linux")(
+		"sets the score of the package installer and its child, not the host",
+		async () => {
+			using workspace = TempDir.createSync("@omp-js-package-score-");
+			const executable = workspace.join("bun");
+			const score = "/proc/self/oom_score_adj";
+			await fs.writeFile(
+				executable,
+				[
+					"#!/bin/sh",
+					'exec > "$3/installer-scores"',
+					`read -r score < ${score}`,
+					`printf '%s\\n' "$score"`,
+					`/bin/cat ${score}; :`,
+				].join("\n"),
+				{ mode: 0o700 },
+			);
+			// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
+			if ((await Bun.file(score).text()).trim() === "1000") await Bun.write(score, "999").catch(() => 0);
+			const before = await Bun.file(score).text();
+			const state = beginSettingsTest();
+			setAgentDir(workspace.join("agent"));
+			const resolve = spyOn(workerClient, "resolveExecutablePath").mockReturnValue(executable);
+			try {
+				await installJsPackages({
+					packages: ["example-package"],
+					cwd: workspace.path(),
+					environment: "project",
+					autoProvision: false,
+				});
+				expect(await Bun.file(score).text()).toBe(before);
+				expect(await Bun.file(workspace.join("installer-scores")).text()).toBe("1000\n1000\n");
+			} finally {
+				resolve.mockRestore();
+				restoreSettingsTestState(state);
+			}
+		},
+	);
 
 	it("refuses an implicit managed environment bootstrap when auto-provisioning is disabled", async () => {
 		using workspace = TempDir.createSync("@omp-js-package-policy-");

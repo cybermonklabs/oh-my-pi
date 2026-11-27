@@ -11,6 +11,7 @@
 import * as fs from "node:fs/promises";
 import type { ToolTier } from "@oh-my-pi/pi-agent-core";
 import { SHELL_PROCESS_SELECTOR } from "@oh-my-pi/pi-utils";
+import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
 import { getActiveSkills } from "../extensibility/skills";
 import { LocalProtocolHandler, resolveLocalRoot } from "../internal-urls/local-protocol";
 import { InternalUrlRouter } from "../internal-urls/router";
@@ -22,8 +23,12 @@ import { type ShellProcessSpec, shellProcessArgs } from "./shell-process-protoco
 
 /** The program and arguments that run `spec` as a shell process of this build. */
 export function shellProcessCommand(spec: ShellProcessSpec): { application: string; args: string[] } {
-	const [application, ...entry] = resolveCliEntryCmd();
-	return { application, args: [...entry, SHELL_PROCESS_SELECTOR, ...shellProcessArgs(spec)] };
+	const [application, ...args] = withToolOomScore([
+		...resolveCliEntryCmd(),
+		SHELL_PROCESS_SELECTOR,
+		...shellProcessArgs(spec),
+	]);
+	return { application, args };
 }
 
 /** One `urlmap` command mounting `host` at `url`. */

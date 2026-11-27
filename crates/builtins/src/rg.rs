@@ -1390,9 +1390,36 @@ struct Decompressor {
 	feeder: Option<Aborting<io::Result<()>>>,
 }
 
+/// `command` rebuilt through [`crate::host::tool_command`], its program
+/// resolved in the `PATH` it sets, else this process's, as its spawn would;
+/// its arguments, environment changes and working directory carried over.
+#[cfg(target_os = "linux")]
+fn tool_decompressor(command: &std::process::Command) -> std::process::Command {
+	let path = match command.get_envs().find(|(name, _)| *name == "PATH") {
+		Some((_, value)) => value.map(std::ffi::OsStr::to_os_string),
+		None => std::env::var_os("PATH"),
+	};
+	let mut tool =
+		crate::host::tool_command(command.get_program(), path.as_deref(), command.get_current_dir());
+	tool.args(command.get_args());
+	for (name, value) in command.get_envs() {
+		match value {
+			Some(value) => tool.env(name, value),
+			None => tool.env_remove(name),
+		};
+	}
+	if let Some(dir) = command.get_current_dir() {
+		tool.current_dir(dir);
+	}
+	tool
+}
+
 impl Decompressor {
 	/// Spawns `command` with piped output and, when `piped_stdin`, a piped stdin to feed.
+	/// On Linux the decompressor gets the OOM adjustment of tool processes.
 	fn spawn(command: std::process::Command, piped_stdin: bool) -> io::Result<Self> {
+		#[cfg(target_os = "linux")]
+		let command = tool_decompressor(&command);
 		let mut command = tokio::process::Command::from(command);
 		command
 			.stdin(if piped_stdin { Stdio::piped() } else { Stdio::null() })
@@ -2334,6 +2361,25 @@ mod tests {
 	use crate::host::run_async_util;
 	#[cfg(unix)]
 	use crate::host::tree_with_sparse_file;
+
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn decompressor_and_its_child_inherit_tool_oom_score() {
+		let score = "/proc/self/oom_score_adj";
+		let before = crate::host::below_tool_score();
+		let mut command = std::process::Command::new("/bin/sh");
+		command.args([
+			"-c",
+			"read -r score < /proc/self/oom_score_adj; printf '%s\\n' \"$score\"; \
+			 /bin/cat /proc/self/oom_score_adj; :",
+		]);
+		let mut child = Decompressor::spawn(command, false).unwrap();
+		let mut output = Vec::new();
+		child.stdout.as_mut().unwrap().read_to_end(&mut output).await.unwrap();
+		child.close(true).await.unwrap();
+		assert_eq!(std::fs::read_to_string(score).unwrap(), before);
+		assert_eq!(output, b"1000\n1000\n");
+	}
 
 	async fn run(args: &[&str], stdin: &str) -> (i32, String, String) {
 		let (code, capture) = run_async_util::<Rg>(args, stdin, "/").await;

@@ -11,6 +11,7 @@ function workerThreads(): typeof WorkerThreads {
 	return workerThreadsCache;
 }
 import { isRecord, logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
 import {
 	createWorkerHandle,
 	createWorkerSubprocess,
@@ -1123,9 +1124,12 @@ function spawnBunWorker(): JsEvalWorkerHandle {
 }
 
 function spawnJsProcess(sessionId?: string): JsEvalWorkerHandle {
+	const command = resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG, { sameBuild: true });
+	const env = jsKernelEnv(workerEnvFromParent());
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
-		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG, { sameBuild: true }),
-		env: jsKernelEnv(workerEnvFromParent()),
+		// A tool process, as the Python kernel is: every process its cells start inherits the score.
+		spawnCommand: { ...command, cmd: withToolOomScore(command.cmd, { env, cwd: command.cwd }) },
+		env,
 		exitLabel: "JS eval worker",
 		detached: shouldDetachKernel(process.platform),
 		reportCleanExit: true,

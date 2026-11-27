@@ -23,6 +23,7 @@ import { formatTimeoutNotice } from "../tools/details/bash";
 import { formatRawOutputNotice } from "../tools/output-meta-format";
 import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
+import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
 import { Settings } from "../config/settings";
 import type { MinimizedMeta } from "../tools/output-meta-format";
 import { type ArtifactAllocator, OutputSink, type OutputSummary } from "../tools/streaming-output";
@@ -710,10 +711,14 @@ async function executeUserShellPty(run: {
 }): Promise<BashResult> {
 	const session = new PtySession();
 	const newlines = new StreamNewlineNormalizer();
+	const [application, ...args] = withToolOomScore(
+		[run.shell, ...ensureInteractiveShellArgs(run.shell, run.args), run.command],
+		{ env: run.env, cwd: run.cwd },
+	);
 	const result = await session.startArgv(
 		{
-			application: run.shell,
-			args: [...ensureInteractiveShellArgs(run.shell, run.args), run.command],
+			application,
+			args,
 			cwd: run.cwd,
 			env: run.env,
 			timeoutMs: run.timeoutMs,

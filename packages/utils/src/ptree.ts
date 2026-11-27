@@ -21,6 +21,40 @@ const LINUX_SUBREAPER_BUN_BE_BUN_ENV = "OMP_PTREE_SUBREAPER_BUN_BE_BUN";
 const SUBREAPER_KILL_WINDOW_MS = 100;
 const SUBREAPER_KILL_POLL_MS = 5;
 
+/** Where the spawn of a tool process looks its program up: the child's `PATH` and working directory. */
+export interface ToolOomScoreOptions {
+	/** The child's environment; its `PATH` resolves a bare program name. Defaults to this process's. */
+	env?: Record<string, string | undefined>;
+	/** The child's working directory; a relative program path resolves against it. */
+	cwd?: string;
+}
+
+/**
+ * On Linux, set the tool process's OOM adjustment before replacing the shell
+ * with the program. This changes individual victim selection, not group kills
+ * (`memory.oom.group=1`). Keep the original PID and pass arguments literally.
+ *
+ * The wrapper is used only when `/bin/sh` exists and the program resolves, as
+ * the child would resolve it, to an executable file: otherwise the command is
+ * returned as it is, so a missing program still fails the spawn with its own
+ * error instead of `/bin/sh` exiting 127. `/proc/self/exe` (a worker of this
+ * build after an in-place upgrade) would name `/bin/sh` once the shell runs, so
+ * the wrapper execs this process's image as `/proc/<pid>/exe` instead.
+ */
+export function withToolOomScore(command: string[], options?: ToolOomScoreOptions): string[] {
+	if (process.platform !== "linux" || !command[0] || !Bun.which("/bin/sh")) return command;
+	const PATH = options?.env ? (options.env.PATH ?? "") : (Bun.env.PATH ?? "");
+	if (!Bun.which(command[0], { PATH, cwd: options?.cwd })) return command;
+	const [program, ...args] = command;
+	return [
+		"/bin/sh",
+		"-c",
+		'{ printf 1000 > /proc/self/oom_score_adj; } 2>/dev/null || :; exec "$0" "$@"',
+		program === "/proc/self/exe" ? `/proc/${process.pid}/exe` : program,
+		...args,
+	];
+}
+
 /**
  * Build the Linux child-subreaper entrypoint.
  *

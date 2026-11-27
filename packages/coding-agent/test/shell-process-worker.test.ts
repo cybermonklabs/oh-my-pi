@@ -92,7 +92,26 @@ function onTerminal(
 	};
 }
 
+const OOM_SCORE_PATH = "/proc/self/oom_score_adj";
+// Bare cat is an in-process builtin; /bin/cat is a real child.
+const OOM_SCORE_COMMAND = `cat ${OOM_SCORE_PATH}; /bin/cat ${OOM_SCORE_PATH}; :`;
+
 describe("shell process on pipes", () => {
+	it.skipIf(process.platform !== "linux")(
+		"sets the score of the service shell and its child, not the host",
+		async () => {
+			// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
+			if ((await Bun.file(OOM_SCORE_PATH).text()).trim() === "1000")
+				await Bun.write(OOM_SCORE_PATH, "999").catch(() => 0);
+			const before = await Bun.file(OOM_SCORE_PATH).text();
+			const result = await run({ command: OOM_SCORE_COMMAND });
+			expect(await Bun.file(OOM_SCORE_PATH).text()).toBe(before);
+			expect(result.exitCode, result.stderr).toBe(0);
+			expect(result.stdout).toBe("1000\n1000\n");
+		},
+		60_000,
+	);
+
 	it("runs omp's utilities and tools ahead of PATH on its own stdin, and exits with the command's status", async () => {
 		using tempDir = TempDir.createSync("@omp-shell-process-");
 		// No directory on the search path has any of them.
@@ -369,6 +388,22 @@ describe.skipIf(process.platform === "win32")("shell process URL paths", () => {
 });
 
 describe.skipIf(process.platform === "win32")("shell process on a pseudo-terminal", () => {
+	it.skipIf(process.platform !== "linux")(
+		"sets the score of the PTY shell and its child, not the host",
+		async () => {
+			using tempDir = TempDir.createSync("@omp-shell-process-tty-");
+			// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
+			if ((await Bun.file(OOM_SCORE_PATH).text()).trim() === "1000")
+				await Bun.write(OOM_SCORE_PATH, "999").catch(() => 0);
+			const before = await Bun.file(OOM_SCORE_PATH).text();
+			const shell = onTerminal(OOM_SCORE_COMMAND, tempDir.path());
+			expect(await shell.done).toBe(0);
+			expect(await Bun.file(OOM_SCORE_PATH).text()).toBe(before);
+			expect(shell.output().trim()).toBe("1000\n1000");
+		},
+		60_000,
+	);
+
 	it("is the terminal's shell: its programs see a terminal and reach it through /dev/tty", async () => {
 		using tempDir = TempDir.createSync("@omp-shell-process-tty-");
 		const shell = onTerminal(

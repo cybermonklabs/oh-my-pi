@@ -40,6 +40,23 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 }
 
 describe("Shell session commands", () => {
+	it.skipIf(process.platform !== "linux")(
+		"sets the score of an external command and its child, not the host",
+		async () => {
+			const score = "/proc/self/oom_score_adj";
+			// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
+			if ((await Bun.file(score).text()).trim() === "1000") await Bun.write(score, "999").catch(() => 0);
+			const before = await Bun.file(score).text();
+			const { result, output } = await run(
+				new Shell(),
+				`/bin/cat ${score}; /bin/sh -c 'read -r score < ${score}; printf "%s\\n" "$score"; /bin/cat ${score}; :'`,
+			);
+			expect(await Bun.file(score).text()).toBe(before);
+			expect(result.exitCode).toBe(0);
+			expect(output).toBe("1000\n1000\n1000\n");
+		},
+	);
+
 	it("passes name, argv, cwd and dash-requested stdin through the handler", async () => {
 		await withTempDir(async root => {
 			const cwd = path.join(root, "nested");

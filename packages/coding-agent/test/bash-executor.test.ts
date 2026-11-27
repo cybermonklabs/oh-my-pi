@@ -109,6 +109,37 @@ describe("executeBash", () => {
 		}
 	});
 
+	it.skipIf(process.platform !== "linux" || Bun.env.PI_NO_PTY === "1")(
+		"sets the score of the PTY user shell and its child, not the host",
+		async () => {
+			// Use the zsh PTY route without depending on a machine's zsh installation or startup files.
+			const shell = path.join(tempDir, "zsh");
+			await fs.promises.writeFile(shell, '#!/bin/sh\nexec /bin/sh -c "$3"\n', { mode: 0o700 });
+			cfgShellPath.set(Settings.instance, shell);
+			vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
+				shell,
+				args: ["-c"],
+				env: { HOME: tempDir },
+				prefix: undefined,
+			});
+			const score = "/proc/self/oom_score_adj";
+			// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
+			if ((await Bun.file(score).text()).trim() === "1000") await Bun.write(score, "999").catch(() => 0);
+			const before = await Bun.file(score).text();
+			const result = await executeBash(
+				`[ -t 1 ] || exit 1; read -r score < ${score}; printf '%s\\n' "$score"; /bin/cat ${score}; :`,
+				{
+					cwd: tempDir,
+					useUserShell: true,
+					pty: { cols: 80, rows: 24, onChunk: () => {} },
+				},
+			);
+			expect(await Bun.file(score).text()).toBe(before);
+			expect(result.exitCode).toBe(0);
+			expect(result.output.trim()).toBe("1000\n1000");
+		},
+	);
+
 	it("keeps tracing and restores a run whose values are not UTF-8", async () => {
 		const result = await executeBash("v=$(printf '\\377'); : \"$v\"; echo done", {
 			cwd: tempDir,
