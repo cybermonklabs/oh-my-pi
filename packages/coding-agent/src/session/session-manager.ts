@@ -3891,7 +3891,7 @@ export class SessionManager {
 		this.#bodyRevision++;
 		// Measure only when the record would be appended: a pending full rewrite
 		// already writes the blanked content inline.
-		const appends = this.#persist && this.#fileIsCurrent && !this.#rewriteRequired;
+		const appends = this.#persist && !this.#fileIsCurrent && !this.#rewriteRequired;
 		if (appends && pruned.some(prune => this.#replacedLineMayExceedFetchCap(prune))) this.#rewriteRequired = true;
 		return this.appendCustomEntry(TOOL_RESULT_PRUNE_CUSTOM_TYPE, toToolResultPruneData(pruned));
 	}
