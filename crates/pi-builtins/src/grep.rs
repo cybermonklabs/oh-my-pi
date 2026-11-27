@@ -2278,6 +2278,48 @@ mod tests {
 		assert_eq!(capture.out(), "alpha\nbeta\n");
 	}
 
+	/// GNU grep 3.11 reads the argument after `-f` or `-e` as the pattern
+	/// file or the pattern whatever its first character, also where the
+	/// option ends a group of short options: `-f -pats` read `-pats` as the
+	/// options `-p -a -t -s`, and `-ce -5` read `-5` as a context count. It
+	/// reads the context counts as GNU does too: `-A` and `-B` hold beside a
+	/// later `-C` or `-NUM`, a context option of 0 still separates two groups
+	/// with `--`, and so does `-o`, and a line past `-m`'s count is trailing
+	/// context, not one more selected line.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_pattern_file_whose_name_starts_with_a_dash_is_read() {
+		let tree = tempfile::tempdir().unwrap();
+		let ctx: String = (1..=20)
+			.map(|n| if matches!(n, 5 | 13) { "mid\n".to_owned() } else { format!("{n}\n") })
+			.collect();
+		std::fs::write(tree.path().join("ctx"), ctx).unwrap();
+		std::fs::write(tree.path().join("in"), "-5\n-1\nx\nzz\nb\n").unwrap();
+		std::fs::write(tree.path().join("-1"), "-5\n").unwrap();
+		std::fs::write(tree.path().join("-pats"), "x\n").unwrap();
+		std::fs::write(tree.path().join("t"), "x\ny\n-x\n").unwrap();
+		std::fs::write(tree.path().join("xxy"), "x\nx\ny\nz\n").unwrap();
+		for (args, want, status) in [
+			(&["-c", "-f", "-pats", "t"][..], "2\n", 0),
+			(&["-cf", "-pats", "t"][..], "2\n", 0),
+			(&["-o", "-f", "-pats", "t"][..], "x\nx\n", 0),
+			(&["-n", "-f", "-pats", "t"][..], "1:x\n3:-x\n", 0),
+			(&["-cf", "-1", "in"][..], "1\n", 0),
+			(&["-ve", "-5", "in"][..], "-1\nx\nzz\nb\n", 0),
+			(&["-ce", "-5", "in"][..], "1\n", 0),
+			(&["-ne", "-1", "in"][..], "2:-1\n", 0),
+			(&["-ve", "-x", "t"][..], "x\ny\n", 0),
+			(&["-C0", "mid", "ctx"][..], "mid\n--\nmid\n", 0),
+			(&["-o", "-C1", "mid", "ctx"][..], "mid\n--\nmid\n", 0),
+			(&["-v", "-m1", "-A1", "x", "in"][..], "-5\n-1\n", 0),
+			(&["-n", "-m1", "-A2", "x", "xxy"][..], "1:x\n2-x\n3-y\n", 0),
+			(&["-A1", "-5", "mid", "ctx"][..], "1\n2\n3\n4\nmid\n6\n--\n8\n9\n10\n11\n12\nmid\n14\n", 0),
+			(&["-A1", "-C3", "mid", "ctx"][..], "2\n3\n4\nmid\n6\n--\n10\n11\n12\nmid\n14\n", 0),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, "", tree.path()).await;
+			assert_eq!((code, capture.out().as_str()), (status, want), "grep {args:?}: {}", capture.err());
+		}
+	}
+
 	/// A file with no line terminator used to make grep buffer it whole: on a
 	/// sparse file that is an endless line of NUL bytes, and the host process
 	/// grew until the kernel killed it. Now that file is a per-file error and
