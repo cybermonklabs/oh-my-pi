@@ -2367,6 +2367,58 @@ mod tests {
 		}
 	}
 
+	/// GNU grep 3.11 answers `-m 0` without opening any input: it prints no
+	/// line and no count, reports no missing file, and exits 1; only `-L`,
+	/// which lists the files with no selected line, reads them. A negative
+	/// count, refused here unless it was `-1`, GNU reads as its count of lines
+	/// left: no line takes it to zero, so every line is selected and the file
+	/// stdout lands in is read, as with `-m1`, while `-v`, which selects a
+	/// run of lines only while the count is above zero, selects none and still
+	/// prints the context, counted from the last line it printed.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn max_count_zero_reads_no_input() {
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::write(tree.path().join("in"), "-5\n-1\nx\nzz\nb\n").unwrap();
+		std::fs::write(tree.path().join("abc"), "a\nb\nc\n").unwrap();
+		std::fs::write(tree.path().join("e1"), "a\nb\nc\nX\nd\nX\nX\ne\nf\nX\ng\n").unwrap();
+		for (args, want, status) in [
+			(&["-m0", "-c", "x", "in"][..], "", 1),
+			(&["-m0", "-q", "x", "nosuch"][..], "", 1),
+			(&["-m0", "-c", "x", "nosuch"][..], "", 1),
+			(&["-m0", "-o", "x", "nosuch"][..], "", 1),
+			(&["-m0", "-L", "x", "in"][..], "in\n", 1),
+			(&["-m", "-2", "x", "in"][..], "x\n", 0),
+			(&["-v", "-m", "-1", "x", "in"][..], "", 1),
+			(&["-c", "-v", "-m", "-1", "x", "in"][..], "0\n", 1),
+			(&["-v", "-m", "-1", "-A1", "b", "abc"][..], "a\n--\nb\n", 1),
+			(&["-v", "-m", "-2", "-A1", "b", "abc"][..], "a\n--\nb\n", 1),
+			(&["-v", "-m", "-1", "-B1", "b", "abc"][..], "--\nb\n", 1),
+			(&["-v", "-m", "-1", "-A2", "X", "e1"][..], "a\nb\n--\nc\nX\n--\nd\nX\n--\nX\ne\n", 1),
+			(&["-v", "-m", "-1", "-B2", "X", "e1"][..], "--\nc\nX\n--\nX\nX\n--\nf\nX\n", 1),
+			(
+				&["-n", "-v", "-m", "-1", "-A1", "-B1", "X", "e1"][..],
+				"1-a\n--\n4-X\n5-d\n--\n7-X\n8-e\n--\n10-X\n11-g\n",
+				1,
+			),
+			(&["-v", "-m", "-1", "-C2", "X", "e1"][..], "a\nb\nc\nX\nd\nX\nX\ne\nf\nX\ng\n", 1),
+			(&["-v", "-m", "-1", "-C0", "X", "e1"][..], "--\n--\n--\n", 1),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, "", tree.path()).await;
+			assert_eq!(
+				(code, capture.out().as_str(), capture.err().as_str()),
+				(status, want, ""),
+				"grep {args:?}"
+			);
+		}
+
+		// `printf 'x\nmid\n' > g; grep -m -2 x g >>g` reads `g` and appends `x`.
+		let g = tree.path().join("g");
+		std::fs::write(&g, "x\nmid\n").unwrap();
+		let (code, err) = run_with_stdout_file(&["-m", "-2", "x", "g"], tree.path(), &g).await;
+		assert_eq!((code, err.as_str()), (0, ""));
+		assert_eq!(std::fs::read(&g).unwrap(), b"x\nmid\nx\n");
+	}
+
 	/// A file with no line terminator used to make grep buffer it whole: on a
 	/// sparse file that is an endless line of NUL bytes, and the host process
 	/// grew until the kernel killed it. Now that file is a per-file error and
