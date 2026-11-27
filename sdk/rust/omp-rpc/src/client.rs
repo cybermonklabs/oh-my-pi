@@ -32,15 +32,20 @@ use serde_json::{Map, Value};
 
 use crate::{
 	deep::{self, SERDE_JSON_MAX_DEPTH, drop_deep, drop_deep_tree_data, nests_deeper_than},
+	entry_patches::{
+		RecordParents, apply_entry_patches, entries_past_records, is_entry_patch_data,
+		is_entry_patch_record, patch_entry_id, relink, tree_past_records,
+	},
 	frame::{FrameDecoder, MAX_FRAME_BYTES, MAX_REASSEMBLED_BYTES},
 	host_tool::{HostTool, HostToolContext, text_payload},
 	host_uri::{HostUri, HostUriContext, uri_scheme},
 	turn::PromptTurn,
 	wire::{
-		AgentMessage, Command, GetMessagesCommand, GetMessagesPageCommand, GetTreeCommand,
-		HostToolResult, HostUriOperation, HostUriResult, NegotiateProtocolCommand, PromptCommand,
-		PromptResultEvent, ReadyEvent, RpcAgentEvent, RpcInbound, RpcNotification, RpcResponse,
-		RpcServerFrame, SetHostToolsCommand, SetHostUriSchemesCommand,
+		AgentMessage, Command, GetEntriesCommand, GetMessagesCommand, GetMessagesPageCommand,
+		GetSubagentMessagesCommand, GetTreeCommand, HostToolResult, HostUriOperation, HostUriResult,
+		NegotiateProtocolCommand, PromptCommand, PromptResultEvent, ReadyEvent, RpcAgentEvent,
+		RpcInbound, RpcNotification, RpcResponse, RpcServerFrame, SessionEntries, SessionTree,
+		SetHostToolsCommand, SetHostUriSchemesCommand, SubagentMessages,
 	},
 };
 
@@ -778,19 +783,65 @@ impl Drop for Collector<'_> {
 	}
 }
 
+/// A `get_subagent_messages` reply as [`Client::get_subagent_messages`]
+/// returns it: `entry_patch` records applied within the reply and not listed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentTranscriptRead {
+	/// The reply. `entries` lists no record; an entry whose parent is a record
+	/// of the reply takes the record's parent. `messages` are the messages of
+	/// `entries`.
+	pub reply:         SubagentMessages,
+	/// The patches of this reply's records that name an entry not in this
+	/// reply (one an earlier call returned), in file order, as
+	/// [`entry_patches_of`](crate::entry_patches::entry_patches_of) gives them:
+	/// `{ "entryId", "entry"?, "message"? }`.
+	pub entry_patches: Vec<Map<String, Value>>,
+}
+
+/// Takes the array at `key` of `object` when every item is an object.
+fn take_objects(object: &mut Map<String, Value>, key: &str) -> Option<Vec<Map<String, Value>>> {
+	let Value::Array(items) = object.get_mut(key)? else {
+		return None;
+	};
+	if !items.iter().all(Value::is_object) {
+		return None;
+	}
+	let items = std::mem::take(items);
+	Some(
+		items
+			.into_iter()
+			.filter_map(|item| match item {
+				Value::Object(map) => Some(map),
+				_ => None,
+			})
+			.collect(),
+	)
+}
+
+/// The message of `entry`, a `message` entry.
+fn message_of(entry: &Map<String, Value>) -> Option<&Value> {
+	if entry.get("type").and_then(Value::as_str) != Some("message") {
+		return None;
+	}
+	entry.get("message")
+}
+
 /// A connected `omp --mode rpc` server.
 pub struct Client {
-	shared:           Arc<Shared>,
+	shared:               Arc<Shared>,
 	/// The spawned server; its process group is torn down on close.
-	child:            Option<Child>,
-	reader:           Option<JoinHandle<()>>,
-	next_id:          AtomicU64,
-	ready:            ReadyEvent,
-	protocol_version: u32,
-	default_timeout:  Duration,
+	child:                Option<Child>,
+	reader:               Option<JoinHandle<()>>,
+	next_id:              AtomicU64,
+	ready:                ReadyEvent,
+	protocol_version:     u32,
+	default_timeout:      Duration,
 	/// Serializes each host tool / URI replacement with its registration
 	/// round trip, so the server and the dispatch registry agree.
-	registration:     Mutex<()>,
+	registration:         Mutex<()>,
+	/// Each `entry_patch` record [`Client::get_entries`] read since its last
+	/// read of the whole history, with its parent past records.
+	entry_record_parents: Mutex<RecordParents>,
 }
 
 /// Builds the command frame `{"id", "type", ...params}`.
@@ -898,6 +949,7 @@ impl Client {
 			protocol_version: 1,
 			default_timeout: options.default_timeout,
 			registration: Mutex::new(()),
+			entry_record_parents: Mutex::default(),
 		};
 		// From here on an early return drops `client`, which tears everything down.
 		client.ready = match ready_rx.recv_timeout(options.ready_timeout) {
@@ -970,10 +1022,16 @@ impl Client {
 	/// Sends `command` and waits for its response. The deadline covers both
 	/// the write and the response.
 	pub fn call<C: Command>(&self, command: &C) -> Result<C::Output, Error> {
+		Ok(C::decode(self.command_data(command)?)?)
+	}
+
+	/// Sends `command` and waits for its response's `data`, not decoded.
+	fn command_data<C: Command>(&self, command: &C) -> Result<Option<Value>, Error> {
 		let id = self.next_id();
 		let timeout = C::TIMEOUT_MS.map_or(self.default_timeout, Duration::from_millis);
-		let response = self.request(&id, C::NAME, &encode_command(&id, command)?, timeout)?;
-		Ok(C::decode(response.data)?)
+		Ok(self
+			.request(&id, C::NAME, &encode_command(&id, command)?, timeout)?
+			.data)
 	}
 
 	/// Queues `frame` and waits for its successful response.
@@ -1138,6 +1196,138 @@ impl Client {
 			));
 		}
 		Ok(messages)
+	}
+
+	/// `get_entries`: the session's append-history, all of it, or with
+	/// `since` the entries strictly after that durable entry.
+	///
+	/// The session's `entry_patch` records are not listed: an entry whose
+	/// parent is a record, and a `leafId` that names one, take the record's
+	/// parent, also for a record an earlier `since` read returned. The client
+	/// does not apply the records, and must not: the server serves its live
+	/// entries (`packages/coding-agent/src/modes/rpc/rpc-compat.ts:19-22`,
+	/// `packages/coding-agent/src/session/session-manager.ts:6973`), which
+	/// already carry each record's fields. `patchEntries` sets them before it
+	/// appends the record (`session-manager.ts:6667-6669`), and a load applies
+	/// the records it reads (`session-manager.ts:4769`). A record the server
+	/// holds keeps its fields after a later rewrite-only pass replaced them in
+	/// the entry, for example images a later pass dropped from an elided
+	/// result: only the line a full rewrite writes loses them
+	/// (`packages/coding-agent/src/session/entry-patches.ts:33-36`,
+	/// `withoutEntryPatches` at `:207-209`). Applying such a record again would
+	/// bring the replaced values back.
+	///
+	/// [`call`](Self::call) with a [`GetEntriesCommand`] returns the reply as
+	/// the server sent it, records included.
+	pub fn get_entries(&self, command: &GetEntriesCommand) -> Result<SessionEntries, Error> {
+		let mut data = self.command_data(command)?;
+		if let Some(Value::Object(object)) = &mut data {
+			let mut parents = self
+				.entry_record_parents
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner);
+			if command.since.is_none() {
+				parents.clear();
+			}
+			if let Some(entries) = take_objects(object, "entries") {
+				let entries = entries_past_records(entries, &mut parents);
+				object.insert(
+					"entries".to_owned(),
+					Value::Array(entries.into_iter().map(Value::Object).collect()),
+				);
+			}
+			relink(object, "leafId", &parents);
+		}
+		Ok(GetEntriesCommand::decode(data)?)
+	}
+
+	/// `get_tree`: the session tree and the current leaf id.
+	///
+	/// The session's `entry_patch` records are not listed: the children of a
+	/// record node take its place among its parent's children, with the
+	/// record's parent as their entries' parent, and a `leafId` that names a
+	/// record names that parent. The client does not apply the records, and
+	/// must not, for the reason [`get_entries`](Self::get_entries) gives: the
+	/// tree's entries are the server's live entries
+	/// (`packages/coding-agent/src/session/session-manager.ts:7029`), which
+	/// already carry each record's fields.
+	///
+	/// [`call`](Self::call) with a [`GetTreeCommand`] returns the reply as the
+	/// server sent it, records included.
+	pub fn get_tree(&self) -> Result<SessionTree, Error> {
+		let mut data = self.command_data(&GetTreeCommand {})?;
+		if let Some(Value::Object(object)) = &mut data {
+			let mut parents = RecordParents::new();
+			if let Some(tree @ Value::Array(_)) = object.get_mut("tree") {
+				*tree = Value::Array(tree_past_records(tree.take(), &mut parents));
+			}
+			relink(object, "leafId", &parents);
+		}
+		Ok(GetTreeCommand::decode(data)?)
+	}
+
+	/// `get_subagent_messages`: the entries of a subagent transcript from
+	/// `from_byte` (pass the last reply's `next_byte`).
+	///
+	/// The server reads the transcript file in windows. The `entry_patch`
+	/// records of this reply apply to its entries, as the server applies them,
+	/// and are not listed; an entry whose parent is a record of this reply
+	/// takes the record's parent. A patch that names an entry not in this
+	/// reply, one an earlier call returned, is listed in `entry_patches`, in
+	/// file order. The client keeps nothing across calls: a caller that holds
+	/// the entries of earlier calls applies each patch, in order, to the entry
+	/// with its `entryId` when
+	/// [`entry_accepts_patch`](crate::entry_patches::entry_accepts_patch) holds,
+	/// with [`set_patched_fields`](crate::entry_patches::set_patched_fields),
+	/// and decodes that entry's `message` again.
+	///
+	/// [`call`](Self::call) with a [`GetSubagentMessagesCommand`] returns the
+	/// reply as the server sent it.
+	pub fn get_subagent_messages(
+		&self,
+		command: &GetSubagentMessagesCommand,
+	) -> Result<SubagentTranscriptRead, Error> {
+		let mut data = self.command_data(command)?;
+		let mut entry_patches = Vec::new();
+		if let Some(Value::Object(object)) = &mut data
+			&& let Some(mut entries) = take_objects(object, "entries")
+		{
+			apply_entry_patches(&mut entries, |_| {});
+			let ids: HashSet<String> = entries
+				.iter()
+				.filter(|entry| entry.get("type").and_then(Value::as_str) != Some("session"))
+				.filter_map(|entry| entry.get("id").and_then(Value::as_str))
+				.map(str::to_owned)
+				.collect();
+			for entry in &mut entries {
+				if !is_entry_patch_record(entry) || !entry.get("data").is_some_and(is_entry_patch_data)
+				{
+					continue;
+				}
+				// The record is not listed: its patches move out of it.
+				if let Some(Value::Array(patches)) = entry
+					.get_mut("data")
+					.and_then(|data| data.get_mut("patches"))
+				{
+					for patch in std::mem::take(patches) {
+						if let Value::Object(patch) = patch
+							&& !ids.contains(patch_entry_id(&patch))
+						{
+							entry_patches.push(patch);
+						}
+					}
+				}
+			}
+			let entries = entries_past_records(entries, &mut RecordParents::new());
+			let messages = entries.iter().filter_map(message_of).cloned().collect();
+			object.insert("messages".to_owned(), Value::Array(messages));
+			object.insert(
+				"entries".to_owned(),
+				Value::Array(entries.into_iter().map(Value::Object).collect()),
+			);
+		}
+		let reply = GetSubagentMessagesCommand::decode(data)?;
+		Ok(SubagentTranscriptRead { reply, entry_patches })
 	}
 
 	/// Closes the client and tears the server down: cancels host work, closes

@@ -355,17 +355,21 @@ export class FullBodies {
 	 * written (`os.tmpdir()` read-only or full, or its spool directory not
 	 * private to this account), it is streamed from the lines themselves
 	 * ({@link #streamedBody}), with one warning per store. That reads `lines`
-	 * again, so an iterator, which yields its lines only once, is read into an
-	 * array first. A throw from `lines` itself (an entry that cannot be read or
-	 * serialized) is no spool failure: it propagates as it is, with no second
-	 * read and no warning.
+	 * again, so a source that yields its lines only once (an iterator, or an
+	 * iterable that hands out the same iterator on every call) is read into an
+	 * array first: read again, it would yield none, and the streamed write
+	 * would replace the stored body with an empty one. A throw from `lines`
+	 * itself (an entry that cannot be read or serialized) is no spool failure:
+	 * it propagates as it is, with no second read and no warning.
 	 */
 	lines(path: string, lines: Iterable<string>): FullBody {
 		const uid = process.getuid?.();
 		if (uid === undefined) return this.#keptBody(path, snapshotLines(lines));
-		// An iterator is its own iterable, and yields its lines only once.
+		// An iterator is its own iterable, and an iterable can hand out one iterator on every call: either
+		// yields its lines only once.
 		const iterator: unknown = lines[Symbol.iterator]();
-		const readable: Iterable<string> = iterator === lines ? Array.from(lines) : lines;
+		const once = iterator === lines || lines[Symbol.iterator]() === iterator;
+		const readable: Iterable<string> = once ? Array.from(lines) : lines;
 		let linesFailed = false;
 		// Only a throw from `readable` lands in the catch: a throw from the spool's
 		// own writes ends the iteration through `return`, which runs no catch.

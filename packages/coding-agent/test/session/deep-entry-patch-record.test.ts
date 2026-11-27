@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { stringifyJsonIteratively, TempDir } from "@oh-my-pi/pi-utils";
 import { DEEP_LEVELS, nestedChain, nestingOf } from "../../../ai/test/helpers/deep-nesting";
 import { runAnonymizeCommand } from "../../src/cli/anonymize-cli";
-import { ENTRY_PATCH_CUSTOM_TYPE } from "../../src/session/entry-patches";
+import { ENTRY_PATCH_CUSTOM_TYPE } from "@oh-my-pi/pi-utils/entry-patches";
 import { CURRENT_SESSION_VERSION, type SessionEntry } from "../../src/session/session-entries";
 import { SessionManager } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";

@@ -1,7 +1,8 @@
 import { isEnoent } from "@oh-my-pi/pi-utils";
+import { applyEntryPatches } from "@oh-my-pi/pi-utils/entry-patches";
 import { type AgentRef, AgentRegistry } from "../../registry/agent-registry";
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
-import { applyEntryPatchesInWindow } from "../../session/entry-patches";
+import { WINDOW_ENTRY_PATCH_HOOKS } from "../../session/entry-patches";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
 import { defaultSessionStorage, readSessionLinesFrom, type SessionStorage } from "../../session/session-storage";
@@ -76,7 +77,9 @@ function addPruned(set: Set<string>, value: string, maxSize: number): void {
  * rewritten since the caller's last read), reads the transcript again from its
  * start and reports `reset`, so the caller drops what it read before. A
  * rewrite that still ends a record right before the cursor goes unseen: the
- * read then goes on from the cursor in the new body.
+ * read then goes on from the cursor in the new body. The window's
+ * `entry_patch` records are applied to its entries and stay among them, so a
+ * caller that holds entries from earlier windows applies them there.
  */
 export async function readRpcSubagentTranscript(
 	sessionFile: string,
@@ -112,7 +115,7 @@ export async function readRpcSubagentTranscript(
 	const lastNewline = text.lastIndexOf("\n");
 	const completeText = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : "";
 	const entries = completeText.length > 0 ? parseSessionEntries(completeText) : [];
-	applyEntryPatchesInWindow(entries);
+	applyEntryPatches(entries, WINDOW_ENTRY_PATCH_HOOKS);
 	const nextByte = startByte + Buffer.byteLength(completeText, "utf8");
 
 	return {

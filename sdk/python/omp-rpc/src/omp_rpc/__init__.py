@@ -29,6 +29,7 @@ from .client import (
     RpcProcessExitError,
     RpcProtocolError,
     RpcTimeoutError,
+    SubagentTranscriptRead,
     UiRequestListener,
 )
 from .host_tools import (
@@ -88,6 +89,7 @@ __all__ = [
     "RpcProcessExitError",
     "RpcProtocolError",
     "RpcTimeoutError",
+    "SubagentTranscriptRead",
     "UiRequestListener",
     "UnknownNotification",
     "VALUE_EXTENSION_UI_METHODS",

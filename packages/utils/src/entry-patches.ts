@@ -1,0 +1,523 @@
+/**
+ * `entry_patch` records of a session transcript, as every reader of the file
+ * applies them.
+ *
+ * A pass that changes an entry after its line is written (a retry saga's
+ * marker, a compaction's dead-end `warning` or corrected `tokensAfter`, a
+ * snapcompact archive, an elide pass's placeholders) appends one `custom`
+ * entry with `customType` {@link ENTRY_PATCH_CUSTOM_TYPE} that names entries
+ * already in the file and the fields to set on them, instead of rewriting the
+ * file. The original lines stay, so a reader that shows or derives anything
+ * from those fields applies the records first:
+ *
+ * - over the entries of a whole transcript, {@link applyEntryPatches};
+ * - over windows of one transcript read one after another (a tail that grows,
+ *   replies of at most a few MiB), an {@link EntryPatchReplay}, which applies a
+ *   record to a target from an earlier window and holds a record whose target
+ *   has not been read yet until it is;
+ * - over results a reader derived and stored earlier (rows of a database),
+ *   {@link entryPatchesOf} on each record, then {@link entryAcceptsPatch} and
+ *   {@link setPatchedFields} on the stored entry, or the fields themselves.
+ *
+ * Records apply in file order, so the newest value of a field wins, and
+ * applying them again changes nothing. Entries are read as parsed JSON, so any
+ * entry type a reader declares can be patched. The module uses no Node API, so
+ * a browser client imports it as `@oh-my-pi/pi-utils/entry-patches`.
+ */
+import { cloneJsonTree } from "./json-clone";
+import { isRecord } from "./type-guards";
+
+/** `customType` of an `entry_patch` record. */
+export const ENTRY_PATCH_CUSTOM_TYPE = "entry_patch";
+
+/** A content block as a record holds it. */
+export interface EntryPatchContentBlock {
+	readonly type: string;
+}
+
+/** `content` as a record holds it: a string, or a list of typed blocks. */
+export type EntryPatchContent = string | readonly EntryPatchContentBlock[];
+
+/** Top-level entry fields a patch may set. */
+export interface EntryFieldsPatch {
+	/** `warning` of a `compaction` entry: the dead-end warning on its divider. */
+	readonly warning?: string;
+	/** `tokensAfter` of a `compaction` entry, projected again after rescue tiers ran. */
+	readonly tokensAfter?: number;
+	/** `preserveData` of a `compaction` entry (the snapcompact archive without reasoning). */
+	readonly preserveData?: object;
+	/** `content` of a `custom_message` entry an elide pass shortened. */
+	readonly content?: EntryPatchContent;
+}
+
+/** Fields of a `message` entry's message a patch may set. */
+export interface MessageFieldsPatch {
+	/** Assistant `retryRecovery`: how a retry saga settled the attempt. */
+	readonly retryRecovery?: object;
+	/** Assistant `continued`: a later turn continued from this failed turn, which stays in model context. */
+	readonly continued?: true;
+	/** Assistant `contextSnapshot`: the usage anchor's record of tokens a history rewrite removed. */
+	readonly contextSnapshot?: object;
+	/** Assistant `elidedOutputTokens`. */
+	readonly elidedOutputTokens?: number;
+	/** Tool result `prunedAt`. */
+	readonly prunedAt?: number;
+	/** `content` of a user, developer, assistant or tool-result message an elide pass shortened. */
+	readonly content?: EntryPatchContent;
+}
+
+/** Fields to set on one entry. */
+export interface EntryPatch {
+	/** Id of the entry to change. */
+	readonly entryId: string;
+	readonly entry?: EntryFieldsPatch;
+	readonly message?: MessageFieldsPatch;
+}
+
+/** `data` of an `entry_patch` record. */
+export interface EntryPatchData {
+	readonly patches: readonly EntryPatch[];
+}
+
+/** An `entry_patch` record as read from a transcript line. */
+export interface EntryPatchRecord {
+	readonly type: "custom";
+	readonly customType: typeof ENTRY_PATCH_CUSTOM_TYPE;
+	readonly id?: string;
+	readonly data?: unknown;
+}
+
+/** Why a reader left a record, or one patch of it, unapplied. */
+export type EntryPatchSkipReason =
+	/** The record's `data` is not a list of patches of the fields above. */
+	| "malformed"
+	/** No entry has the id the patch names. */
+	| "missing-target"
+	/** The patch names a field its target's kind or role lacks, or `content` of another shape. */
+	| "misfit";
+
+/** A record, or one patch of it, a reader left unapplied. */
+export interface EntryPatchSkip {
+	readonly reason: EntryPatchSkipReason;
+	/** Id of the record. */
+	readonly recordId: string | undefined;
+	/** Id of the entry the patch names; absent for a malformed record. */
+	readonly entryId?: string;
+}
+
+/** What a reader learns as records apply. */
+export interface EntryPatchHooks<E extends object> {
+	/** A record, or one patch of it, was not applied. */
+	readonly onSkip?: (skip: EntryPatchSkip) => void;
+	/**
+	 * A patch replaced the `content` of the message of `entry`, a `message`
+	 * entry, so a value cached on that message object is stale.
+	 */
+	readonly onMessageContentSet?: (entry: E) => void;
+}
+
+/** A transcript's entries by id: where a patch finds the entry it names. */
+export interface EntryPatchTargets<E extends object> {
+	get(entryId: string): E | undefined;
+}
+
+/** Options of {@link applyEntryPatches}. */
+export interface ApplyEntryPatchesOptions<E extends object> extends EntryPatchHooks<E> {
+	/** Where a patch finds the entry it names; by default, the entry with that id among the entries given. */
+	readonly targets?: EntryPatchTargets<E>;
+}
+
+/**
+ * One field a patch sets, by where it lives: `entry.<field>` on the entry,
+ * `message.<field>` on a `message` entry's message.
+ */
+type PatchField = `entry.${keyof EntryFieldsPatch}` | `message.${keyof MessageFieldsPatch}`;
+
+/**
+ * Message roles whose `content` an elide pass shortens, each with whether that
+ * `content` may be a string; assistant and tool-result `content` is always a
+ * list of blocks.
+ */
+const CONTENT_TAKES_STRING: Readonly<Record<string, boolean>> = {
+	user: true,
+	developer: true,
+	assistant: false,
+	toolResult: false,
+};
+
+function isContent(value: unknown): value is EntryPatchContent {
+	return (
+		typeof value === "string" ||
+		(Array.isArray(value) && value.every(block => isRecord(block) && typeof block.type === "string"))
+	);
+}
+
+function isEntryFields(value: unknown): value is EntryFieldsPatch {
+	return (
+		isRecord(value) &&
+		(value.warning === undefined || typeof value.warning === "string") &&
+		(value.tokensAfter === undefined || typeof value.tokensAfter === "number") &&
+		(value.preserveData === undefined || isRecord(value.preserveData)) &&
+		(value.content === undefined || isContent(value.content))
+	);
+}
+
+function isMessageFields(value: unknown): value is MessageFieldsPatch {
+	return (
+		isRecord(value) &&
+		(value.retryRecovery === undefined || isRecord(value.retryRecovery)) &&
+		(value.continued === undefined || value.continued === true) &&
+		(value.contextSnapshot === undefined || isRecord(value.contextSnapshot)) &&
+		(value.elidedOutputTokens === undefined || typeof value.elidedOutputTokens === "number") &&
+		(value.prunedAt === undefined || typeof value.prunedAt === "number") &&
+		(value.content === undefined || isContent(value.content))
+	);
+}
+
+function isEntryPatch(value: unknown): value is EntryPatch {
+	return (
+		isRecord(value) &&
+		typeof value.entryId === "string" &&
+		(value.entry === undefined || isEntryFields(value.entry)) &&
+		(value.message === undefined || isMessageFields(value.message))
+	);
+}
+
+/** Whether `value` is the `data` of a well-formed `entry_patch` record. */
+export function isEntryPatchData(value: unknown): value is EntryPatchData {
+	return isRecord(value) && Array.isArray(value.patches) && value.patches.every(isEntryPatch);
+}
+
+/** Whether `entry` is an `entry_patch` record. */
+export function isEntryPatchRecord<E extends object>(entry: E): entry is E & EntryPatchRecord {
+	return isRecord(entry) && entry.type === "custom" && entry.customType === ENTRY_PATCH_CUSTOM_TYPE;
+}
+
+/** The patches of `record`, or `undefined` when its `data` is malformed. */
+export function entryPatchesOf(record: EntryPatchRecord): readonly EntryPatch[] | undefined {
+	const data = record.data;
+	return isEntryPatchData(data) ? data.patches : undefined;
+}
+
+/** Id of `record`, for a skip report. */
+function recordIdOf(record: EntryPatchRecord): string | undefined {
+	return typeof record.id === "string" ? record.id : undefined;
+}
+
+/** Whether every field `patch` names exists on `entry`'s kind, with a `content` of the shape its role holds. */
+export function entryAcceptsPatch(entry: object, patch: EntryPatch): boolean {
+	if (!isRecord(entry)) return false;
+	const fields = patch.entry;
+	if (fields) {
+		const compactionFields =
+			fields.warning !== undefined || fields.tokensAfter !== undefined || fields.preserveData !== undefined;
+		if (compactionFields && entry.type !== "compaction") return false;
+		if (fields.content !== undefined && entry.type !== "custom_message") return false;
+	}
+	const message = patch.message;
+	if (!message) return true;
+	if (entry.type !== "message" || !isRecord(entry.message)) return false;
+	const role = entry.message.role;
+	const assistantFields =
+		message.retryRecovery !== undefined ||
+		message.continued !== undefined ||
+		message.contextSnapshot !== undefined ||
+		message.elidedOutputTokens !== undefined;
+	if (assistantFields && role !== "assistant") return false;
+	if (message.prunedAt !== undefined && role !== "toolResult") return false;
+	if (message.content === undefined) return true;
+	return (
+		typeof role === "string" &&
+		Object.hasOwn(CONTENT_TAKES_STRING, role) &&
+		(CONTENT_TAKES_STRING[role] === true || typeof message.content !== "string")
+	);
+}
+
+/**
+ * `value` for `holder[key]`: `value` itself when `holder` already holds it
+ * there, else a copy. Reads `key`'s own data descriptor, so no accessor runs
+ * to answer the identity check.
+ */
+function ownCopy<T>(holder: object, key: string, value: T): T {
+	return Object.getOwnPropertyDescriptor(holder, key)?.value === value ? value : cloneJsonTree(value);
+}
+
+const TAKE_EVERY_FIELD = (): boolean => true;
+
+/**
+ * {@link setPatchedFields}, setting only the fields `take` claims; `take` is
+ * asked once for each field the patch sets on `entry`. Returns whether any
+ * field was claimed.
+ */
+function writeFields<E extends object>(
+	entry: E,
+	patch: EntryPatch,
+	hooks: EntryPatchHooks<E> | undefined,
+	take: (field: PatchField) => boolean,
+): boolean {
+	if (!isRecord(entry)) return false;
+	const target: Record<string, unknown> = entry;
+	let claimed = false;
+	const fields = patch.entry;
+	if (fields && target.type === "compaction") {
+		if (fields.warning !== undefined && take("entry.warning")) {
+			target.warning = fields.warning;
+			claimed = true;
+		}
+		if (fields.tokensAfter !== undefined && take("entry.tokensAfter")) {
+			target.tokensAfter = fields.tokensAfter;
+			claimed = true;
+		}
+		if (fields.preserveData !== undefined && take("entry.preserveData")) {
+			target.preserveData = ownCopy(target, "preserveData", fields.preserveData);
+			claimed = true;
+		}
+	}
+	if (fields?.content !== undefined && target.type === "custom_message" && take("entry.content")) {
+		target.content = ownCopy(target, "content", fields.content);
+		claimed = true;
+	}
+	const patched = patch.message;
+	if (!patched || target.type !== "message") return claimed;
+	const message = target.message;
+	if (!isRecord(message)) return claimed;
+	if (message.role === "assistant") {
+		if (patched.retryRecovery !== undefined && take("message.retryRecovery")) {
+			message.retryRecovery = ownCopy(message, "retryRecovery", patched.retryRecovery);
+			claimed = true;
+		}
+		if (patched.continued !== undefined && take("message.continued")) {
+			message.continued = patched.continued;
+			claimed = true;
+		}
+		if (patched.contextSnapshot !== undefined && take("message.contextSnapshot")) {
+			message.contextSnapshot = ownCopy(message, "contextSnapshot", patched.contextSnapshot);
+			claimed = true;
+		}
+		if (patched.elidedOutputTokens !== undefined && take("message.elidedOutputTokens")) {
+			message.elidedOutputTokens = patched.elidedOutputTokens;
+			claimed = true;
+		}
+	}
+	if (patched.prunedAt !== undefined && message.role === "toolResult" && take("message.prunedAt")) {
+		message.prunedAt = patched.prunedAt;
+		claimed = true;
+	}
+	if (patched.content !== undefined && "content" in message && take("message.content")) {
+		claimed = true;
+		if (Object.getOwnPropertyDescriptor(message, "content")?.value !== patched.content) {
+			message.content = cloneJsonTree(patched.content);
+			// The message keeps its identity across context rebuilds; a value cached on it is stale.
+			hooks?.onMessageContentSet?.(entry);
+		}
+	}
+	return claimed;
+}
+
+/**
+ * Set `patch`'s fields on `entry`, which {@link entryAcceptsPatch} accepted.
+ * Each object value is copied ({@link cloneJsonTree}, which shares the
+ * immutable strings) unless `entry` already holds that very value, so `entry`
+ * never shares an object with a record: a later in-place write to `entry`,
+ * such as an elide or prune pass writing into `content`, leaves the record as
+ * written and succeeds when the record's data was read back frozen.
+ */
+export function setPatchedFields<E extends object>(entry: E, patch: EntryPatch, hooks?: EntryPatchHooks<E>): void {
+	writeFields(entry, patch, hooks, TAKE_EVERY_FIELD);
+}
+
+function entriesById<E extends object>(entries: readonly E[]): Map<string, E> {
+	const byId = new Map<string, E>();
+	for (const entry of entries) {
+		const id = targetIdOf(entry);
+		if (id !== undefined) byId.set(id, entry);
+	}
+	return byId;
+}
+
+/** Id under which `entry` is a patch target: every entry but the session header has one. */
+function targetIdOf(entry: object): string | undefined {
+	if (!isRecord(entry) || entry.type === "session") return undefined;
+	return typeof entry.id === "string" ? entry.id : undefined;
+}
+
+/**
+ * Set, in place, every field an `entry_patch` record in `entries` names, so
+ * entries read from a transcript read as the live session's entries did.
+ * `options.targets` finds the entry a patch names; by default it is one of
+ * `entries`. Records apply in file order, so the newest value of a field wins,
+ * and applying them again changes nothing. A record may precede its target. A
+ * malformed record, or a patch whose target is missing, lacks a field it
+ * names, or holds `content` of another shape, is skipped and reported to
+ * `options.onSkip`. Returns whether any field was set.
+ */
+export function applyEntryPatches<E extends object>(
+	entries: readonly E[],
+	options: ApplyEntryPatchesOptions<E> = {},
+): boolean {
+	let lookup = options.targets;
+	let changed = false;
+	for (const entry of entries) {
+		if (!isEntryPatchRecord(entry)) continue;
+		const patches = entryPatchesOf(entry);
+		if (!patches) {
+			options.onSkip?.({ reason: "malformed", recordId: recordIdOf(entry) });
+			continue;
+		}
+		lookup ??= entriesById(entries);
+		for (const patch of patches) {
+			const target = lookup.get(patch.entryId);
+			if (!target) {
+				options.onSkip?.({ reason: "missing-target", recordId: recordIdOf(entry), entryId: patch.entryId });
+				continue;
+			}
+			if (!entryAcceptsPatch(target, patch)) {
+				options.onSkip?.({ reason: "misfit", recordId: recordIdOf(entry), entryId: patch.entryId });
+				continue;
+			}
+			setPatchedFields(target, patch, options);
+			changed = true;
+		}
+	}
+	return changed;
+}
+
+/** Where a record lies in its transcript: the window it was read in, then its place in that window. */
+interface RecordOrder {
+	readonly window: number;
+	readonly index: number;
+}
+
+/** One patch of a record, with where the record lies and its id. */
+interface HeldPatch {
+	readonly patch: EntryPatch;
+	readonly order: RecordOrder;
+	readonly recordId: string | undefined;
+}
+
+/**
+ * The records of one transcript that a reader reads in windows: complete lines
+ * of byte ranges, a tail that grows, replies of a host that serves a few MiB at
+ * a time. {@link add} takes each window's parsed entries, holds them by id, and
+ * applies every record read so far to them: a record to a target from an
+ * earlier window, which {@link add} returns so the reader can show it again,
+ * and a record read before its target (a window read out of file order) as
+ * soon as the target arrives. Of two records that set one field, the later in
+ * the file wins, in whatever order their windows arrive.
+ *
+ * It holds every entry it was given, and each patch whose target it has not
+ * seen, until {@link forget} or {@link clear}; a reader that drops an entry it
+ * shows calls {@link forget}, and one that starts over from the transcript's
+ * start (a rewrite, a truncation) calls {@link clear} first.
+ */
+export class EntryPatchReplay<E extends object> {
+	readonly #hooks: EntryPatchHooks<E>;
+	readonly #held = new Map<string, E>();
+	/** Patches whose target has not been read, by the id they name. */
+	readonly #waiting = new Map<string, HeldPatch[]>();
+	/** Per held entry, where the record lies that set each field it holds from a record. */
+	readonly #setBy = new Map<string, Map<PatchField, RecordOrder>>();
+	#lastWindow = -1;
+
+	/** `hooks.onSkip` hears of malformed records and of patches that do not fit their target; a patch waiting for its target is not skipped. */
+	constructor(hooks: EntryPatchHooks<E> = {}) {
+		this.#hooks = hooks;
+	}
+
+	/** The held entry with id `entryId`. */
+	get(entryId: string): E | undefined {
+		return this.#held.get(entryId);
+	}
+
+	/**
+	 * Take the parsed entries of one window, in file order, and apply the
+	 * records read so far. `start` is where the window starts in the
+	 * transcript (its byte offset), so windows read out of file order apply
+	 * their records in file order; a window without one follows every window
+	 * added before it. An entry with the id of a held one replaces it. Returns
+	 * the entries held from an earlier call that a record in this window
+	 * changed; an entry of this window carries its records when this returns.
+	 */
+	add(entries: readonly E[], start?: number): E[] {
+		const window = start ?? this.#lastWindow + 1;
+		if (window > this.#lastWindow) this.#lastWindow = window;
+		const arrived = new Set<E>();
+		for (const entry of entries) {
+			const id = targetIdOf(entry);
+			if (id === undefined) continue;
+			this.#held.set(id, entry);
+			this.#setBy.delete(id);
+			arrived.add(entry);
+		}
+		const changed = new Set<E>();
+		for (const entry of arrived) {
+			const id = targetIdOf(entry);
+			const waiting = id === undefined ? undefined : this.#waiting.get(id);
+			if (id === undefined || !waiting) continue;
+			this.#waiting.delete(id);
+			for (const held of waiting) this.#apply(entry, id, held, changed);
+		}
+		for (let index = 0; index < entries.length; index++) {
+			const entry = entries[index]!;
+			if (!isEntryPatchRecord(entry)) continue;
+			const recordId = recordIdOf(entry);
+			const patches = entryPatchesOf(entry);
+			if (!patches) {
+				this.#hooks.onSkip?.({ reason: "malformed", recordId });
+				continue;
+			}
+			const order: RecordOrder = { window, index };
+			for (const patch of patches) {
+				const held: HeldPatch = { patch, order, recordId };
+				const target = this.#held.get(patch.entryId);
+				if (target) {
+					this.#apply(target, patch.entryId, held, changed);
+					continue;
+				}
+				const waiting = this.#waiting.get(patch.entryId);
+				if (waiting) waiting.push(held);
+				else this.#waiting.set(patch.entryId, [held]);
+			}
+		}
+		const earlier: E[] = [];
+		for (const entry of changed) if (!arrived.has(entry)) earlier.push(entry);
+		return earlier;
+	}
+
+	/** Stop holding the entry with id `entryId`, and the patches waiting for it. */
+	forget(entryId: string): void {
+		this.#held.delete(entryId);
+		this.#setBy.delete(entryId);
+		this.#waiting.delete(entryId);
+	}
+
+	/** Stop holding every entry and patch, as before the first {@link add}. */
+	clear(): void {
+		this.#held.clear();
+		this.#setBy.clear();
+		this.#waiting.clear();
+		this.#lastWindow = -1;
+	}
+
+	#apply(target: E, id: string, held: HeldPatch, changed: Set<E>): void {
+		const { patch, order, recordId } = held;
+		if (!entryAcceptsPatch(target, patch)) {
+			this.#hooks.onSkip?.({ reason: "misfit", recordId, entryId: id });
+			return;
+		}
+		let setBy = this.#setBy.get(id);
+		const take = (field: PatchField): boolean => {
+			const prior = setBy?.get(field);
+			// A field a record later in the file set keeps that record's value.
+			if (prior && (prior.window > order.window || (prior.window === order.window && prior.index >= order.index)))
+				return false;
+			if (!setBy) {
+				setBy = new Map();
+				this.#setBy.set(id, setBy);
+			}
+			setBy.set(field, order);
+			return true;
+		};
+		if (writeFields(target, patch, this.#hooks, take)) changed.add(target);
+	}
+}

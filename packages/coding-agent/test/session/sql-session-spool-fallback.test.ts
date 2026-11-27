@@ -179,6 +179,44 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 		});
 	});
 
+	// If this regresses, a rewrite handed an iterable that returns the same generator on every call
+	// replaces the stored transcript with an empty body when the spool write fails after reading a
+	// line: the fallback reads the spent generator again, finds no lines, and its size and hash checks
+	// pass on zero bytes.
+	it("stores every line of an iterable that hands out one generator when the spool write fails after its first line", async () => {
+		using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+		process.env.TMPDIR = tmp.path();
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const disk = fillDiskUnder(tmp.path());
+		// A first line as long as the spool's write chunk: the spool writes it alone, and that write fails.
+		const header = { type: "session", version: CURRENT_SESSION_VERSION, id: ID, timestamp: TIMESTAMP };
+		const lines = [
+			`${JSON.stringify({ ...header, cwd: `/${"p".repeat(LINE_STREAM_CHUNK)}` })}\n`,
+			...sessionLines("handed out once").slice(1),
+		];
+		function handedOutOnce(): Iterable<string> {
+			const generator = (function* () {
+				yield* lines;
+			})();
+			return { [Symbol.iterator]: () => generator };
+		}
+
+		await withSqliteStorage(async storage => {
+			const before = sessionLines("before", 1).join("");
+			await storage.writeText(SYNC_FILE, before);
+			await storage.writeText(ATOMIC_FILE, before);
+
+			storage.writeLinesSync(SYNC_FILE, handedOutOnce());
+			await storage.drain();
+			await storage.writeLinesAtomic(ATOMIC_FILE, handedOutOnce());
+
+			expect({
+				refused: disk.refused(),
+				stored: [await storage.readText(SYNC_FILE), await storage.readText(ATOMIC_FILE)],
+			}).toEqual({ refused: 2, stored: [lines.join(""), lines.join("")] });
+		});
+	});
+
 	// If this regresses, full rewrites spool the transcript into a directory other accounts can enter,
 	// or one another account made first and controls, instead of keeping it out of their reach.
 	it.skipIf(process.getuid === undefined)(

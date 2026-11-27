@@ -285,7 +285,13 @@ off) raise `RpcCommandError`.
   objects (raw dicts) in append order plus `leaf_id`. With `since`, only entries
   strictly after that entry id; an unknown id raises `RpcCommandError` with
   `code == "unknown_since"`.
-- `get_tree()` returns the raw session tree as `SessionTree`.
+- `get_tree()` returns the session tree as `SessionTree`, read and walked at any
+  depth.
+- Neither lists the session's `entry_patch` records: an entry whose parent is a
+  record, and a `leaf_id` that names one, take the record's parent, and a record
+  node's children take its place in the tree. The entries already carry each
+  record's fields (the server serves its live entries), and the client never
+  applies a record again.
 - `get_available_commands()` returns typed `AvailableSlashCommand`s;
   `on_available_commands_update()` receives the same catalog at startup and
   whenever it changes.
@@ -297,6 +303,8 @@ off) raise `RpcCommandError`.
 Subagent frames are off by default. Select a level, then subscribe:
 
 ```python
+from omp_rpc.entry_patches import entry_accepts_patch, set_patched_fields
+
 client.set_subagent_subscription("progress")  # or "events" for full session events
 client.on_subagent_lifecycle(lambda e: print(e.payload.id, e.payload.status))
 client.on_subagent_progress(
@@ -308,10 +316,24 @@ for snapshot in client.get_subagents():
     more = client.get_subagent_messages(
         subagent_id=snapshot.id, from_byte=page.next_byte
     )
+    # A record in the later reply that changes an entry the earlier one returned:
+    held = {entry["id"]: entry for entry in page.entries}
+    for patch in more.entry_patches:
+        target = held.get(patch["entryId"])
+        if target is not None and entry_accepts_patch(target, patch):
+            set_patched_fields(target, patch)  # the dict in place, and its "message"
 
 client.steer_subagent("OmpWorker", "Drop the glob, keep the direct path.")
 cancelled = client.cancel_subagent("OmpWorker")  # False when not running
 ```
+
+`get_subagent_messages()` applies each reply's `entry_patch` records to its
+entries, lists no record, and returns the patches of records whose target the
+reply lacks (an entry an earlier reply returned) as `entry_patches`, in file
+order. The client keeps nothing between calls; apply those patches to the
+entries you hold with `entry_accepts_patch` and `set_patched_fields` from
+`omp_rpc.entry_patches`, as above. A message in `messages` is its entry's
+`message` dict, so it changes with it.
 
 At `"events"`, `on_subagent_event()` delivers each subagent's own session
 events as `SubagentEvent.payload.event` (an `UnknownNotification` when it cannot

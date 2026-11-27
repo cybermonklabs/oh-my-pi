@@ -416,6 +416,26 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 		await forkedSessionManager.close();
 	});
 
+	it("counts the stripped replay metadata in a fork's body revision, as a resume of the same session does", async () => {
+		// If this regresses, a fork whose load stripped stale replay metadata reports body revision 0, so a
+		// reader comparing revisions takes the fork's history for the file's unchanged one, while a resume
+		// of that file reports the rewrite.
+		const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-revision-${Snowflake.next()}-`));
+		const forkDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-fork-revision-target-${Snowflake.next()}-`));
+		tempDirs.push(sourceDir, forkDir);
+		const { sessionFile } = await createPersistedSession(sourceDir, sessionManager => {
+			appendStaleAssistantTurn(sessionManager, "Forked revision snapshot");
+		});
+
+		// The fork first: a resume rewrites the source without the stripped metadata.
+		const forked = await SessionManager.forkFrom(sessionFile, forkDir, forkDir);
+		const resumed = await SessionManager.open(sessionFile, sourceDir);
+
+		expect({ forked: forked.bodyRevision, resumed: resumed.bodyRevision }).toEqual({ forked: 1, resumed: 1 });
+		await forked.close();
+		await resumed.close();
+	});
+
 	it("keeps same-file reload safe without resetting live provider state after startup sanitization", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-issue-505-reload-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

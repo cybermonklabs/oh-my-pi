@@ -2488,6 +2488,9 @@ export class SessionTools {
 					}
 					// Preserve the exact arguments authorized by a selected or
 					// persisted ACP grant; inner handlers may mutate `args` in place.
+					// Copied as `structuredClone` copies (an in-process caller's `Date` stays one, so the copy
+					// still equals the call), as deep as a transcript line holds; a member it refuses (a
+					// function) is left out, as the comparison's own JSON reading of the call leaves it out.
 					const approvedCtx = (ctx ? { ...ctx, acpApprovedArgs: structuredCloneJSON(args) } : ctx) as never;
 					const command =
 						target.name === "bash" && args && typeof args === "object" && !Array.isArray(args)

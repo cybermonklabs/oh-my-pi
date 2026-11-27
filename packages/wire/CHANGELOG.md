@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The `entry` host frame's type admits `EntryPatchEntry`, the `entry_patch` record a host now sends live; guests apply it to the entries they hold and never show it
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

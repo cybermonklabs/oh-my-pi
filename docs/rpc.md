@@ -1091,6 +1091,18 @@ recurses once per level can overflow its stack, so a host must read, walk and
 free this answer without recursion. The Python, Go and Rust SDKs read it at
 any depth.
 
+Both answers come from the live `SessionManager`, so they list the session's
+`entry_patch` records (see [session format](./session.md)) among their entries
+and tree nodes, and the entries already carry each record's fields. The
+TypeScript `RpcClient` (`getEntries`, `getTree`) and the Python, Go and Rust
+SDK clients (`get_entries`/`GetEntries`, `get_tree`/`GetTree`) list no record:
+an entry whose parent is a record, and a `leafId` that names one, take the
+record's parent (also for a record an earlier `since` read returned), and a
+record node's children take its place in the tree. They never apply a record
+again: a record the server holds keeps fields a later rewrite-only pass
+replaced in its entry, so applying it would bring the replaced values back.
+Rust `Client::call` and Go `Commands` return the answer as the server sent it.
+
 `get_available_thinking_levels` returns `{ levels }`: the selectable levels
 for the live model with `"off"` first (it is accepted by
 `set_thinking_level` but excluded from the effort-only model helper). OMP-only
@@ -1122,10 +1134,19 @@ message entries. Only complete newline-terminated records are consumed; reuse
 If `fromByte` exceeds the current file size, or no record ends right before it
 (the transcript was rewritten since the last read), reading restarts at byte
 zero and reports `reset: true`; drop what the earlier reads returned.
-Entries and messages carry the fields that the
-`entry_patch` records among the entries read set (see
-[session format](./session.md)); a record that names an entry before
-`fromByte` is listed in `entries` as written, for the client to apply.
+The server applies the `entry_patch` records among the entries it read to
+those entries (see [session format](./session.md)), and lists the records in
+`entries` as written; a record that names an entry before `fromByte` changes
+nothing in this response. The clients (`RpcClient.getSubagentMessages` in
+TypeScript, `get_subagent_messages`/`GetSubagentMessages` in the SDKs) apply
+the response's records to its entries and list no record (an entry whose
+parent is one takes the record's parent), and return each patch whose target
+the response lacks, in file order, as `entryPatches` (`entry_patches` in
+Python and Rust, `EntryPatches` in Go). They keep nothing between calls: a
+caller that holds the entries of earlier responses applies each patch, in
+order, to the entry with its `entryId` when `entryAcceptsPatch` holds, with
+`setPatchedFields` (from `@oh-my-pi/pi-utils/entry-patches`, or the SDK's port
+of them).
 One response returns at most 8 MiB of the transcript (more only when a single
 record is longer than 4 MiB), so a client reading a long transcript repeats
 the request from `nextByte` until `nextByte` stops advancing.

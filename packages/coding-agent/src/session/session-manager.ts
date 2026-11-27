@@ -10,7 +10,6 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import {
-	cloneJsonTree,
 	directoryIsEnterable,
 	directoryIsMissing,
 	getBlobsDir,
@@ -24,8 +23,10 @@ import {
 	logger,
 	pathIsWithin,
 	stringifyJson,
+	structuredCloneDeep,
 	toError,
 } from "@oh-my-pi/pi-utils";
+import { ENTRY_PATCH_CUSTOM_TYPE, entryAcceptsPatch, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
 import { isTaskToolDetails, type StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import * as snapcompact from "@oh-my-pi/snapcompact";
@@ -40,7 +41,7 @@ import {
 	settingsStoreMask,
 } from "../secrets/session-store-mask";
 import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
-import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
+import { type BlobPutOptions, type BlobPutResult, BlobStore, isBlobRef, lazyImageDataSync } from "./blob-store";
 import {
 	coldEntryForPersistence,
 	convertColdEntries,
@@ -196,10 +197,7 @@ import {
 import { recordSessionRecap, recordSessionTitle } from "./session-index";
 import {
 	applyEntryPatches,
-	ENTRY_PATCH_CUSTOM_TYPE,
 	type EntryPatch,
-	entryAcceptsPatch,
-	isEntryPatchRecord,
 	maskEntryPatchRecord,
 	setPatchedFields,
 	toEntryPatchData,
@@ -1108,14 +1106,16 @@ class LoadedValueInterner {
 
 /**
  * The JSON text of `runtime` as the key the loaded entries share it under, or
- * `undefined` when it is longer than {@link INTERNED_RUNTIME_MAX_UNITS} and so
- * shared with nothing. {@link jsonTextMayFit} rejects a large runtime without
- * serializing it, so an entry carrying one nested deeper than `JSON.stringify`
- * recurses (a transcript line can nest 400,000 levels) is read without the
- * `RangeError` serializing it raises, and one it accepts serializes.
+ * `undefined` when it is longer than {@link INTERNED_RUNTIME_MAX_UNITS} or
+ * holds a blob reference, and so is shared with nothing: the load resolves a
+ * reference in place after the stream, which a frozen runtime would refuse.
+ * {@link jsonTextMayFit} rejects a large runtime without serializing it, so
+ * an entry carrying one nested deeper than `JSON.stringify` recurses (a
+ * transcript line can nest 400,000 levels) is read without the `RangeError`
+ * serializing it raises, and one it accepts serializes.
  */
 function internedRuntimeKey(runtime: object): string | undefined {
-	if (!jsonTextMayFit(runtime, INTERNED_RUNTIME_MAX_UNITS)) return undefined;
+	if (!jsonTextMayFit(runtime, INTERNED_RUNTIME_MAX_UNITS, isBlobRef)) return undefined;
 	const key = stringifyJson(runtime);
 	return key !== undefined && key.length <= INTERNED_RUNTIME_MAX_UNITS ? key : undefined;
 }
@@ -4521,7 +4521,10 @@ export class SessionManager {
 			logger.warn("Assistant message recorded with incomplete usage", { id: entry.id });
 		}
 		this.#entries.push(entry);
+		const leafBefore = this.#index.leafId();
 		this.#index.insert(entry);
+		// An insert that selects an off-branch entry moves the leaf as `#setLeaf` does.
+		if (this.#index.leafId() !== leafBefore && entry.parentId !== leafBefore) this.#coldCutStale = true;
 		// A compaction moves the cut once the agent's context is rebuilt from it
 		// (the next context build). A model change moves it at the first build
 		// for the new model, which adopts that model.
@@ -4929,6 +4932,11 @@ export class SessionManager {
 			 * session to a sibling, and that sibling is the session left.
 			 */
 			switched?: { left?: { id: string; file: string } };
+			/**
+			 * {@link open}'s choice of workspace: the cwd of the header it probed, and the session dir
+			 * and launch cwd it chose from. A transcript replaced since records its own, which then chooses.
+			 */
+			opened?: { probedCwd: string | undefined; sessionDir: string | undefined; initialCwd: string | undefined };
 		},
 	): Promise<void> {
 		// An append to this file that is still running (a stopped work pool's discards) lands first,
@@ -4982,15 +4990,9 @@ export class SessionManager {
 			// to it: the writer appends raw JSONL, so a `.jsonl.gz` must never
 			// become this manager's session file.
 			const requestedFile = path.resolve(sessionFile);
-			resolvedSessionFile = requestedFile;
-			if (isArchivedSessionPath(requestedFile)) {
-				resolvedSessionFile = (await restoreArchivedSession(requestedFile)).sessionPath;
-				// `SessionManager.open` derived the session dir from the archive path.
-				// Follow the transcript home, or /new and /branch would write there.
-				if (this.#sessionDir === path.dirname(requestedFile)) {
-					this.#sessionDir = path.dirname(resolvedSessionFile);
-				}
-			}
+			resolvedSessionFile = isArchivedSessionPath(requestedFile)
+				? (await restoreArchivedSession(requestedFile)).sessionPath
+				: requestedFile;
 			loaded = await this.#loadTranscript(resolvedSessionFile, {
 				throwIfMissing: options?.throwIfMissing,
 				preloaded: options?.preloaded,
@@ -5004,12 +5006,16 @@ export class SessionManager {
 			// one step: a write in between would claim the session left's id at the new file's path. The load itself
 			// migrates the entries, applies their prune and patch records, and gives the blobs they name their
 			// reference rows (see #loadTranscript).
-			if (loaded.header) {
-				const cwd = loaded.header.cwd;
-				headerCwd = cwd ? path.resolve(cwd) : undefined;
+			// Another writer can replace the transcript between `open`'s header probe and this load, which reads it
+			// again: the workspace then comes from the header loaded here (#openWorkspace, set with the new file
+			// below), so whether its cwd can be entered is read even when that cwd is this manager's.
+			const opened = options?.opened;
+			const reprobed = opened && loaded.header?.cwd !== opened.probedCwd ? opened : undefined;
+			const recordedCwd = loaded.header?.cwd;
+			if (recordedCwd) {
+				headerCwd = path.resolve(recordedCwd);
 				headerCwdEnterable =
-					headerCwd !== undefined &&
-					headerCwd !== path.resolve(this.#cwd) &&
+					(reprobed !== undefined || headerCwd !== path.resolve(this.#cwd)) &&
 					(await directoryIsEnterable(headerCwd));
 			}
 			// A write while the switch loaded went to the session left, or to the sibling a move off it made: let it
@@ -5036,6 +5042,23 @@ export class SessionManager {
 			if (this.#exclusiveStop) await this.#refuseSwitchAfterStop(this.#exclusiveStop);
 			// A writer a write opened since then is the session left's too: its appends go there.
 			if (this.#writer) this.#closeWriterEventually();
+			if (reprobed) {
+				const workspace = SessionManager.#openWorkspace(
+					recordedCwd,
+					headerCwdEnterable,
+					requestedFile,
+					reprobed.sessionDir,
+					reprobed.initialCwd,
+					this.#storage,
+				);
+				this.#cwd = workspace.cwd;
+				this.#sessionDir = path.resolve(workspace.sessionDir);
+			}
+			// `SessionManager.open` derived the session dir from the archive path.
+			// Follow the transcript home, or /new and /branch would write there.
+			if (resolvedSessionFile !== requestedFile && this.#sessionDir === path.dirname(requestedFile)) {
+				this.#sessionDir = path.dirname(resolvedSessionFile);
+			}
 			this.#sessionFile = resolvedSessionFile;
 			if (switching) {
 				this.#switchGeneration++;
@@ -6023,9 +6046,11 @@ export class SessionManager {
 		manager.#additionalDirectories = [...this.#additionalDirectories];
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
-		// A whole entry is copied (as deep as a transcript line holds, on the copy's own stack); a cold
-		// one is copied as a new cold entry over the same record.
-		manager.#entries = this.#entries.map(entry => (isColdEntry(entry) ? copyColdEntry(entry) : cloneJsonTree(entry)));
+		// A whole entry is copied as `structuredClone` copies it (a `Date` or `Map` in a custom entry stays one), as
+		// deep as a transcript line holds; a cold one is copied as a new cold entry over the same record.
+		manager.#entries = this.#entries.map(entry =>
+			isColdEntry(entry) ? copyColdEntry(entry) : structuredCloneDeep(entry),
+		);
 		manager.#loadRevision++;
 		manager.#adoptColdStore(this.#coldStore);
 		manager.#reindexEntries();
@@ -8519,6 +8544,8 @@ export class SessionManager {
 		manager.#loadRevision++;
 		manager.#index = loaded.index;
 		manager.#resetColdCut(loaded.coldStore, false);
+		// Stripped replay metadata changed loaded entries in place, as a resume counts it.
+		if (loaded.sanitized) manager.#bodyRevision++;
 		SessionManager.#releaseLoadedTranscript(loaded);
 		if (options?.repairInterruptedTail) {
 			const repairedFrom = history.length;
@@ -8653,22 +8680,16 @@ export class SessionManager {
 			throwIfMissing: options?.throwIfMissing,
 			digest: options?.throwIfMissing,
 		});
-		const header = probed.header;
-		// Resume into the session's recorded cwd only when it is verifiably
-		// accessible. A deleted or permission-blocked (macOS TCC denial) project
-		// dir would make the constructor's #cwd — and the `setProjectDir` chdir
-		// interactive mode runs next — fail, so fall back to the launch cwd and
-		// anchor /new and /branch there too, keeping the resumed session where
-		// the user already is.
-		const recordedCwd = header?.cwd;
-		const recordedCwdUsable = !!recordedCwd && (await directoryIsEnterable(recordedCwd));
-		const cwd = recordedCwdUsable ? recordedCwd : (options?.initialCwd ?? getProjectDir());
-		const dir =
-			sessionDir ??
-			(recordedCwd && !recordedCwdUsable
-				? SessionManager.getDefaultSessionDir(cwd, undefined, storage)
-				: path.dirname(path.resolve(filePath)));
-		const manager = new SessionManager(cwd, dir, true, storage, options?.coldStore);
+		const probedCwd = probed.header?.cwd;
+		const workspace = SessionManager.#openWorkspace(
+			probedCwd,
+			!!probedCwd && (await directoryIsEnterable(probedCwd)),
+			filePath,
+			sessionDir,
+			options?.initialCwd,
+			storage,
+		);
+		const manager = new SessionManager(workspace.cwd, workspace.sessionDir, true, storage, options?.coldStore);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		// Fail-closed callers yield while probing the recorded cwd. Before
 		// adoption, digest the current content and parse again only if it
@@ -8685,11 +8706,41 @@ export class SessionManager {
 			newSession: { parentSession: options?.parentSession },
 			preloaded,
 			appendsAwaited: true,
+			opened: { probedCwd, sessionDir, initialCwd: options?.initialCwd },
 		});
 		// A finished async call can stay referenced by an engine cache; drop the
 		// probe's copy of the entries so it cannot outlive the manager's.
 		if (probed.loaded) probed.loaded.entries = [];
 		return manager;
+	}
+
+	/**
+	 * The cwd and session dir {@link open} resumes a session in whose header
+	 * records `recordedCwd`: that cwd only when `recordedCwdUsable`, the
+	 * caller's check that it is verifiably accessible. A deleted or
+	 * permission-blocked (macOS TCC denial) project dir would make the
+	 * constructor's #cwd — and the `setProjectDir` chdir interactive mode runs
+	 * next — fail, so fall back to `initialCwd` (the launch cwd by default) and
+	 * anchor /new and /branch there too, keeping the resumed session where the
+	 * user already is. `sessionDir` when given, else the file's parent.
+	 */
+	static #openWorkspace(
+		recordedCwd: string | undefined,
+		recordedCwdUsable: boolean,
+		filePath: string,
+		sessionDir: string | undefined,
+		initialCwd: string | undefined,
+		storage: SessionStorage,
+	): { cwd: string; sessionDir: string } {
+		const cwd = recordedCwd && recordedCwdUsable ? recordedCwd : (initialCwd ?? getProjectDir());
+		return {
+			cwd,
+			sessionDir:
+				sessionDir ??
+				(recordedCwd && !recordedCwdUsable
+					? SessionManager.getDefaultSessionDir(cwd, undefined, storage)
+					: path.dirname(path.resolve(filePath))),
+		};
 	}
 
 	/**

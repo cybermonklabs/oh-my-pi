@@ -1,5 +1,6 @@
 import { activityOneLine, compareActivityRows } from "@oh-my-pi/pi-tui/overlays/agent-activity";
 import type { AgentActivityRow, AgentActivityQuery } from "@oh-my-pi/pi-tui/overlays/agent-activity";
+import { entryAcceptsPatch, entryPatchesOf, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
 import {
 	defaultSessionStorage,
 	readSessionTextFrom,
@@ -48,6 +49,8 @@ const INITIAL_TAIL_BYTES = 256 * 1024;
 const MAX_ROWS_PER_AGENT = 256;
 const DEFAULT_QUERY_LIMIT = 200;
 const MAX_QUERY_LIMIT = 2_000;
+/** What a response row is read from: an assistant message, whose `content` an `entry_patch` record may set. */
+const RESPONSE_SOURCE = { type: "message", message: { role: "assistant" } };
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -441,6 +444,26 @@ export class AgentActivityIndex {
 			try {
 				entry = recordOf(JSON.parse(line));
 			} catch {
+				continue;
+			}
+			// An `entry_patch` record sets the content a response row read earlier shows: an elide pass's placeholder.
+			if (entry && isEntryPatchRecord(entry)) {
+				for (const patch of entryPatchesOf(entry) ?? []) {
+					const content = patch.message?.content;
+					if (content === undefined || !entryAcceptsPatch(RESPONSE_SOURCE, patch)) continue;
+					const position = index.get(`${agentId}:response:${patch.entryId}`);
+					if (position === undefined) continue;
+					const row = state.rows[position]!;
+					const summary = textContent(content);
+					if (summary === row.summary) continue;
+					// A response without text has no row; a row's text never changes once made, so it is replaced.
+					if (summary) state.rows[position] = { ...row, summary };
+					else {
+						state.rows.splice(position, 1);
+						index = rowIndex(state.rows);
+					}
+					changed = true;
+				}
 				continue;
 			}
 			if (entry?.type !== "message" || typeof entry.id !== "string") continue;

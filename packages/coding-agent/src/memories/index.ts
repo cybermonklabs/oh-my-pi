@@ -9,11 +9,19 @@ import {
 	getAgentDbPath,
 	getMemoriesDir,
 	isEnoent,
+	isRecord,
 	logger,
 	parseJsonlLenient,
 	prompt,
 	stringifyDeepJson,
+	tryParseJson,
 } from "@oh-my-pi/pi-utils";
+import {
+	applyEntryPatches,
+	ENTRY_PATCH_CUSTOM_TYPE,
+	type EntryPatchRecord,
+	isEntryPatchRecord,
+} from "@oh-my-pi/pi-utils/entry-patches";
 
 import { type ModelRegistry, probeModelApiKey } from "../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
@@ -760,13 +768,20 @@ function shouldPersistResponseItemForMemories(message: AgentMessage): boolean {
 	return false;
 }
 
-function extractPersistableMessages(payload: string): AgentMessage[] {
+/**
+ * The persistable messages of `payload`, complete lines of a rollout, each
+ * carrying the fields `records` (the rollout's `entry_patch` records, in file
+ * order) set on it, as a rollout written with those fields inline holds them.
+ */
+function extractPersistableMessages(payload: string, records: readonly EntryPatchRecord[]): AgentMessage[] {
 	const rows = parseJsonlLenient(payload);
 	if (!Array.isArray(rows)) return [];
+	const entries: Record<string, unknown>[] = [];
+	// The records are applied from `records`, which holds every one in file order.
+	for (const row of rows) if (isRecord(row) && !isEntryPatchRecord(row)) entries.push(row);
+	if (records.length > 0) applyEntryPatches<object>([...entries, ...records]);
 	const messages: AgentMessage[] = [];
-	for (const row of rows) {
-		if (!row || typeof row !== "object") continue;
-		const entry = row as Record<string, unknown>;
+	for (const entry of entries) {
 		if (entry.type !== "message") continue;
 		const maybeMessage = entry.message;
 		if (!maybeMessage || typeof maybeMessage !== "object") continue;
@@ -815,7 +830,10 @@ async function* frontWindows(rollout: RolloutBytes): AsyncGenerator<Uint8Array> 
 }
 
 /** Persistable messages from the end of the rollout, in reverse file order, read window by window. */
-async function* persistableMessagesFromBack(rollout: RolloutBytes): AsyncGenerator<AgentMessage> {
+async function* persistableMessagesFromBack(
+	rollout: RolloutBytes,
+	records: readonly EntryPatchRecord[],
+): AsyncGenerator<AgentMessage> {
 	const decoder = new TextDecoder();
 	let carry: Uint8Array | undefined;
 	let end = rollout.size;
@@ -831,18 +849,20 @@ async function* persistableMessagesFromBack(rollout: RolloutBytes): AsyncGenerat
 			continue;
 		}
 		carry = cut > 0 ? bytes.subarray(0, cut) : undefined;
-		const messages = extractPersistableMessages(decoder.decode(bytes.subarray(cut)));
+		const messages = extractPersistableMessages(decoder.decode(bytes.subarray(cut)), records);
 		for (let i = messages.length - 1; i >= 0; i--) yield messages[i];
 	}
 }
 
 /**
- * Persistable messages of a rollout read as `chunks`, in file order, parsed a
- * window of at most {@link STAGE1_ROLLOUT_WINDOW_BYTES} at a time; a record
- * spanning windows is carried until its newline.
+ * The complete lines of a rollout read as `chunks`, in file order, a window of
+ * at most {@link STAGE1_ROLLOUT_WINDOW_BYTES} at a time; a record spanning
+ * windows is carried until its newline, and a last line without one ends the
+ * rollout.
  */
-async function* persistableMessagesFromChunks(chunks: AsyncIterable<Uint8Array>): AsyncGenerator<AgentMessage> {
-	const decoder = new TextDecoder();
+async function* rolloutLineWindows(
+	chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+): AsyncGenerator<Uint8Array> {
 	let carry: Uint8Array | undefined;
 	for await (const chunk of chunks) {
 		for (let start = 0; start < chunk.byteLength; start += STAGE1_ROLLOUT_WINDOW_BYTES) {
@@ -850,10 +870,45 @@ async function* persistableMessagesFromChunks(chunks: AsyncIterable<Uint8Array>)
 			const bytes = carry ? Buffer.concat([carry, window]) : window;
 			const cut = bytes.lastIndexOf(0x0a) + 1;
 			carry = cut < bytes.length ? bytes.subarray(cut) : undefined;
-			if (cut > 0) yield* extractPersistableMessages(decoder.decode(bytes.subarray(0, cut)));
+			if (cut > 0) yield bytes.subarray(0, cut);
 		}
 	}
-	if (carry) yield* extractPersistableMessages(decoder.decode(carry));
+	if (carry) yield carry;
+}
+
+/** Persistable messages of a rollout read as `chunks`, in file order, with `records` applied. */
+async function* persistableMessagesFromChunks(
+	chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+	records: readonly EntryPatchRecord[],
+): AsyncGenerator<AgentMessage> {
+	const decoder = new TextDecoder();
+	for await (const lines of rolloutLineWindows(chunks))
+		yield* extractPersistableMessages(decoder.decode(lines), records);
+}
+
+/** UTF-8 bytes of the `customType` of an `entry_patch` record, as its line holds it. */
+const ENTRY_PATCH_MARKER = new TextEncoder().encode(JSON.stringify(ENTRY_PATCH_CUSTOM_TYPE));
+
+/**
+ * The `entry_patch` records of a rollout read as `chunks`, in file order. A
+ * record sets fields on messages before it, so the messages are read after
+ * every record is known. Only lines that hold the record's custom type are
+ * parsed: the scan reads the rollout but parses none of its messages.
+ */
+async function rolloutPatchRecords(
+	chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>,
+): Promise<EntryPatchRecord[]> {
+	const decoder = new TextDecoder();
+	const records: EntryPatchRecord[] = [];
+	for await (const lines of rolloutLineWindows(chunks)) {
+		if (Buffer.from(lines.buffer, lines.byteOffset, lines.byteLength).indexOf(ENTRY_PATCH_MARKER) === -1) continue;
+		for (const line of decoder.decode(lines).split("\n")) {
+			if (!line.includes(ENTRY_PATCH_CUSTOM_TYPE)) continue;
+			const row = tryParseJson<unknown>(line);
+			if (isRecord(row) && isEntryPatchRecord(row)) records.push(row);
+		}
+	}
+	return records;
 }
 
 /** Each stage-1 run writes the rollout's messages again: a deep one skips the `JSON.stringify` that would fail on it. */
@@ -862,14 +917,15 @@ const STAGE1_MESSAGE_JSON = { probeDepth: true } as const;
 /**
  * The stage-1 payload of the rollout whose persistable messages `messages`
  * gives in file order: the head, and when the whole does not fit, the tail,
- * read from the back windows of `rollout` (a file), or, with no file, kept
- * from `messages` as they pass: the newest, the fewest whose text reaches the
- * tail budget, as the back windows would give them.
+ * read from the back windows of `rollout` (a file) with its `entry_patch`
+ * records applied, or, with no file, kept from `messages` as they pass: the
+ * newest, the fewest whose text reaches the tail budget, as the back windows
+ * would give them.
  */
 async function stage1Items(
 	messages: AsyncIterable<AgentMessage>,
 	tokenLimit: number,
-	rollout?: RolloutBytes,
+	rollout?: { bytes: RolloutBytes; records: readonly EntryPatchRecord[] },
 ): Promise<string> {
 	const maxChars = tokenLimit * 4;
 	const headChars = Math.floor(maxChars * 0.6);
@@ -910,7 +966,7 @@ async function stage1Items(
 	if (rollout) {
 		tail = "]";
 		let exhausted = true;
-		for await (const message of persistableMessagesFromBack(rollout)) {
+		for await (const message of persistableMessagesFromBack(rollout.bytes, rollout.records)) {
 			tail = `,${stringifyDeepJson(message, STAGE1_MESSAGE_JSON)}${tail}`;
 			if (tail.length >= tailChars) {
 				exhausted = false;
@@ -929,17 +985,20 @@ async function stage1Items(
 /**
  * Build the stage-1 `response_items_json` payload for a rollout file.
  *
- * Equivalent to `truncateByApproxTokens(JSON.stringify(persistableMessages), tokenLimit)`, but
- * never holds the rollout whole. A file backend reads byte windows from the front and back only
- * until the head and tail budgets fill. Any other storage (`session.storage: sql`, Redis, an SDK
- * backend) is read in one pass from its start, through `readChunks` where it has it, keeping the
- * head and the newest messages that fill the tail: separate window reads could join the head of
- * one body to the tail of another that a rewrite put in its place, while a full rewrite between
- * two chunks of one pass fails it, and the pass reads the rollout again from its start. Peak
- * memory is bounded by the budgets plus a window and the largest single JSONL record (a record
- * spanning windows is carried until its newline), not by rollout size (a storage without chunked
- * reads holds the rollout's text once). The rollout is read through `storage`, where
- * {@link collectThreads} found it (the current session's).
+ * Equivalent to `truncateByApproxTokens(JSON.stringify(persistableMessages), tokenLimit)` over the
+ * rollout's messages with its `entry_patch` records applied, but never holds the rollout whole. A
+ * first pass finds the records (a record sets fields on messages before it, and an elide pass's
+ * placeholder must reach the model in place of what it replaced). A file backend then reads byte
+ * windows from the front and back only until the head and tail budgets fill. Any other storage
+ * (`session.storage: sql`, Redis, an SDK backend) is read in one more pass from its start, through
+ * `readChunks` where it has it, keeping the head and the newest messages that fill the tail:
+ * separate window reads could join the head of one body to the tail of another that a rewrite put
+ * in its place, while a full rewrite between two chunks of one pass fails it, and the passes read
+ * the rollout again from its start. Peak memory is bounded by the budgets plus a window, the
+ * largest single JSONL record (a record spanning windows is carried until its newline) and the
+ * records, not by rollout size (a storage without chunked reads holds the rollout's text once, for
+ * both passes). The rollout is read through `storage`, where {@link collectThreads} found it (the
+ * current session's).
  */
 export async function buildStage1RolloutItems(
 	rolloutPath: string,
@@ -950,13 +1009,21 @@ export async function buildStage1RolloutItems(
 	if (!(storage instanceof FileSessionStorage)) {
 		storage.statSync(rolloutPath);
 		if (tokenLimit <= 0) return "";
-		return retryRacedRead(() =>
-			stage1Items(persistableMessagesFromChunks(transcriptByteChunks(rolloutPath, storage)), tokenLimit),
-		);
+		return retryRacedRead(async () => {
+			// Without chunked reads the text is read whole either way: once, for both passes.
+			const whole = storage.readChunks ? undefined : [new TextEncoder().encode(await storage.readText(rolloutPath))];
+			const chunks = () => whole ?? transcriptByteChunks(rolloutPath, storage);
+			const records = await rolloutPatchRecords(chunks());
+			return stage1Items(persistableMessagesFromChunks(chunks(), records), tokenLimit);
+		});
 	}
 	const rollout = await openRolloutFile(rolloutPath);
 	if (tokenLimit <= 0) return "";
-	return stage1Items(persistableMessagesFromChunks(frontWindows(rollout)), tokenLimit, rollout);
+	const records = await rolloutPatchRecords(frontWindows(rollout));
+	return stage1Items(persistableMessagesFromChunks(frontWindows(rollout), records), tokenLimit, {
+		bytes: rollout,
+		records,
+	});
 }
 
 async function runStage1Job(options: {

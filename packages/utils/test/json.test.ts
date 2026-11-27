@@ -398,6 +398,61 @@ describe("stringifyDeepJson", () => {
 			stringify.mockRestore();
 		}
 	}, 20_000);
+
+	// The depth check runs before `JSON.stringify` walks the value: a getter it read would run twice (an Anthropic
+	// request sent `{"x":2}`), one behind a `toJSON` that `JSON.stringify` never reads would throw, and an array's
+	// replaced iterator, which `JSON.stringify` never calls, would throw.
+	it("checks the depth without calling a getter, reading past a toJSON or iterating an array", () => {
+		const cases: Record<string, () => unknown> = {
+			getter: () => {
+				let reads = 0;
+				return {
+					get x() {
+						return ++reads;
+					},
+				};
+			},
+			behindToJson: () => ({
+				toJSON: () => ({ shown: true }),
+				get hidden(): never {
+					throw new Error("hidden getter");
+				},
+			}),
+			iterator: () => {
+				const list = [1, { a: 2 }];
+				Object.defineProperty(list, Symbol.iterator, {
+					value: () => {
+						throw new TypeError("iterator called");
+					},
+				});
+				return list;
+			},
+		};
+		// Fresh values for each writer, so neither sees a getter the other already read.
+		const fresh = (): Record<string, unknown> =>
+			Object.fromEntries(Object.entries(cases).map(([name, make]) => [name, make()]));
+		for (const options of [{ probeDepth: true }, { space: 2 }]) {
+			expect(outcomes(fresh(), value => stringifyDeepJson(value, options))).toEqual(
+				outcomes(fresh(), value => JSON.stringify(value, undefined, options.space)),
+			);
+		}
+	});
+
+	// Only the engine's stack overflow is written again: a RangeError a `toJSON` throws is `JSON.stringify`'s
+	// error, where writing again called the `toJSON` a second time and wrote what that returned.
+	it("throws the RangeError a toJSON throws without calling it again", () => {
+		let calls = 0;
+		const value = {
+			toJSON: () => {
+				calls++;
+				if (calls === 1) throw new RangeError("first call");
+				return 7;
+			},
+		};
+
+		expect(thrown(() => stringifyDeepJson(value))).toEqual(["RangeError", "first call"]);
+		expect(calls).toBe(1);
+	});
 });
 
 // Session code compares messages (a reload, the fallback model's fit, an RPC terminal frame, an Anthropic

@@ -178,7 +178,11 @@ interface IndexAppend {
  * frame and its bytes of the process's queued appends ({@link appendAdmission}).
  */
 interface QueuedLine {
-	readonly line: string;
+	/**
+	 * The line. A batch appended one line at a time empties it as its own
+	 * write lands ({@link IndexedSessionStorage}'s `#appendLines`).
+	 */
+	line: string;
 	/** The line's UTF-8 byte length. */
 	readonly bytes: number;
 	readonly frame: IndexAppend;
@@ -1133,8 +1137,11 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * settling with it; else, and again after a batch the backend rolled back,
 	 * one `append` each, each line settling with its own write and the first
 	 * failure failing the rest, as a path's queue fails the operations behind
-	 * a failed one. A batch that fails otherwise fails every line: whether it
-	 * stored them is unknown, so none is appended again.
+	 * a failed one. A line appended alone lets go of its text as it lands: its
+	 * bytes leave the process's queued appends then, so a later write of the
+	 * batch that stalls keeps only the lines they still count. A batch that
+	 * fails otherwise fails every line: whether it stored them is unknown, so
+	 * none is appended again.
 	 */
 	async #appendLines(path: string, lines: readonly QueuedLine[]): Promise<void> {
 		if (this.#backend.appendBatch && lines.length > 1 && appendsChain(lines)) {
@@ -1155,6 +1162,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			const error = queued.getError?.();
 			if (error) throw error;
 			await this.#backend.append(path, queued.line, queued.frame.mtimeMs, queued.frame.previous?.size ?? 0);
+			queued.line = "";
 			queued.settled.resolve();
 		}
 	}

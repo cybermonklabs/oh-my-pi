@@ -3,7 +3,7 @@ import { ArchiveError } from "../../src/ar/error";
 import { DEFAULT_ARCHIVE_LIMITS } from "../../src/ar/limits";
 import { openArchive } from "../../src/ar/open";
 import { ArchiveReader } from "../../src/ar/reader";
-import { type ByteSource, memoryByteSource } from "../../src/ar/source";
+import { type ByteSource, memoryByteSource, STREAM_CHUNK_SIZE } from "../../src/ar/source";
 import { encodeTar, readTar } from "../../src/ar/tar";
 import { arFixture as fixture } from "./fixtures";
 
@@ -93,6 +93,29 @@ describe("plain tar range reads", () => {
 		);
 		shortReads = true;
 		await expect(new ArchiveReader("tar", entries).readFile("hello.txt")).rejects.toThrow("truncated");
+	});
+
+	// If this regresses, a ByteSource that returns one range a byte short and the next a byte long
+	// passes a chunked member read because the lengths still add up: the member's bytes come out
+	// shifted, and a chunk can pass its 1 MiB bound.
+	test("rejects a chunked member read whose ranges are each the wrong length, though their total is right", async () => {
+		const payload = new Uint8Array(STREAM_CHUNK_SIZE + 10).map((_, index) => index % 251);
+		const bytes = await encodeTar([["data.bin", payload]]);
+		let misread = false;
+		const source: ByteSource = {
+			size: bytes.byteLength,
+			async read(start, end) {
+				if (!misread) return bytes.subarray(start, end);
+				// The first range a byte short; the next a byte long, from a byte before it starts.
+				return end - start === STREAM_CHUNK_SIZE ? bytes.subarray(start, end - 1) : bytes.subarray(start - 1, end);
+			},
+		};
+		const entries = await readTar(source, { limits: DEFAULT_ARCHIVE_LIMITS });
+		misread = true;
+
+		await expect(Array.fromAsync(new ArchiveReader("tar", entries).readFileChunks("data.bin"))).rejects.toThrow(
+			"Archive member 'data.bin' is truncated",
+		);
 	});
 
 	test("keeps corrupt-header, entry, path, and metadata limits on the ranged path", async () => {

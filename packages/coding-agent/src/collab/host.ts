@@ -12,6 +12,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import { type EntryPatchRecord, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
 import type {
 	BusChannel,
 	CollabUiRequest,
@@ -24,6 +25,7 @@ import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
+import { withoutEntryPatches } from "../session/entry-patches";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { readSessionTextFrom } from "../session/session-storage";
@@ -504,6 +506,8 @@ export class CollabHost {
 					this.#send({ t: "event", event: oversizedEntryNotice(entry.type) });
 				}
 				this.#socket?.send(encodeEntryFrame(bounded.json));
+			} else if (isEntryPatchRecord(entry) && this.#broadcastAllowed()) {
+				this.#broadcastEntryPatchRecord(entry);
 			}
 			// Model/thinking/title changes land as entries while idle; refresh
 			// guest state promptly (debounce + JSON diff dedupe).
@@ -721,6 +725,27 @@ export class CollabHost {
 		// last update of one message is never superseded by the next one's.
 		if (event.type === "message_update") this.#socket?.sendLatest(`message_update:${this.#messageSeq}`, frame);
 		else this.#socket?.send(frame);
+	}
+
+	/**
+	 * Send an `entry_patch` record live, so each guest sets its fields on the
+	 * entries it holds. The welcome snapshot never carries a record: its
+	 * entries already hold their fields. A record goes whole or not at all,
+	 * since a shrunk one would set a truncated value; one past the frame
+	 * ceiling goes as a record that sets nothing, which keeps the guests'
+	 * parent chain, with a notice. The guests get the fields at their next
+	 * resync. The frame needs no new `COLLAB_PROTO`: a guest older than the
+	 * record keeps it as a `custom` entry it never shows (the web guest has no
+	 * row for one, the TUI guest no message), so it only misses the patch until
+	 * it rejoins, as before; a new protocol number would turn such a guest away.
+	 */
+	#broadcastEntryPatchRecord(record: StoredSessionEntry & EntryPatchRecord): void {
+		let json = JSON.stringify(record);
+		if (Buffer.byteLength(json, "utf-8") > MAX_REPLICATED_PAYLOAD_BYTES) {
+			this.#send({ t: "event", event: oversizedEntryNotice(record.customType) });
+			json = JSON.stringify(withoutEntryPatches(record));
+		}
+		this.#socket?.send(encodeEntryFrame(json));
 	}
 
 	#handleFrame(frame: CollabFrame, fromPeer: number): void {

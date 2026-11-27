@@ -104,19 +104,20 @@ import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
 import { type EditStore, type PowerAssertionOptions } from "@oh-my-pi/pi-natives";
 import {
 	$env,
-	cloneJsonTree,
 	escapeXmlText,
 	formatDuration,
 	getAgentDbPath,
 	isBunTestRuntime,
 	isInteractiveHost,
 	isRecord,
+	jsonDeepEquals,
 	logger,
 	postmortem,
 	prompt,
 	Snowflake,
 	stringifyDeepJson,
 	stringProperty,
+	structuredCloneDeep,
 	toError,
 	untilAborted,
 	withTimeout,
@@ -5662,9 +5663,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				reminders.push({ message, details: message.details });
 			}
 		}
+		// Both are a todo call's arguments: JSON data, as deep as a transcript line holds.
 		const exact = reminders.filter(({ details }) => {
 			const failed = details.attemptedArgs;
-			return isRecord(failed) && Bun.deepEquals(failed, retry);
+			return isRecord(failed) && jsonDeepEquals(failed, retry);
 		});
 		const superseded =
 			exact.length > 0
@@ -6919,16 +6921,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			};
 		}
 		// The loop appends the tool result once this returns: hold it until the storage admits more appends. A
-		// failed wait must not throw here, where the loop would replace a completed tool's result with the error.
-		const admission = this.sessionManager.waitForAppendAdmission(signal);
+		// failed wait, whether its promise rejects or the storage throws before it returns one, must not throw
+		// here, where the loop would replace a completed tool's result with the error.
+		const admissionFailed = (error: unknown): AfterToolCallResult | undefined => {
+			logger.warn("Append admission wait failed", { error: String(error) });
+			return result;
+		};
+		let admission: Promise<void> | undefined;
+		try {
+			admission = this.sessionManager.waitForAppendAdmission(signal);
+		} catch (error) {
+			return admissionFailed(error);
+		}
 		if (!admission) return result;
-		return admission.then(
-			() => result,
-			error => {
-				logger.warn("Append admission wait failed", { error: String(error) });
-				return result;
-			},
-		);
+		return admission.then(() => result, admissionFailed);
 	}
 
 	/**
@@ -16131,9 +16137,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// No breakpoint after it can be read by the next request.
 		let volatileSuffix = false;
 		if (history?.length) {
-			// Detach before the conversion pipeline can await or mutate caller-owned messages; the copy
-			// keeps its own stack, as deep as a transcript line holds.
-			const detachedHistory = cloneJsonTree(history);
+			// Detach before the conversion pipeline can await or mutate caller-owned messages; the copy keeps what
+			// `structuredClone` keeps (a tool call's `Date`, a result's `Map`), as deep as a transcript line holds.
+			const detachedHistory = structuredCloneDeep(history);
 			for (const message of detachedHistory) {
 				if (message.role === "custom" && message.customType === IMAGE_ATTACHMENT_DESCRIPTION_TYPE) {
 					volatileSuffix = true;
