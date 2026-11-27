@@ -576,7 +576,8 @@ export class Tokenizer {
 				const completionsReader = this.#dropsCompletionsThinking ? this.#reasoningReader : undefined;
 				const ownDroppedCompletionsTurn =
 					completionsReader !== undefined && isSameModelTurn(message, completionsReader);
-				const dropsThinking = this.#thinkingReader && thinkingDropsByAuthor(message, this.#thinkingReader);
+				const dropsThinking =
+					this.#thinkingReader && thinkingDropsByAuthor({ ...message, content: [] }, this.#thinkingReader);
 				if (typeof replayedReasoning === "number") extra += replayedReasoning;
 				const signaturesPriced = this.thinkingReplayTokens === "signature";
 				// The replay's signature rule (`transformMessages`): an aborted or
