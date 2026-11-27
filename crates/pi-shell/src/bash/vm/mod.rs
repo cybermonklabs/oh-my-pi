@@ -4671,9 +4671,10 @@ fn signal_lives(p: &mut Vproc, sig: Signal, cont: bool) {
 /// when it only waits for the stages of its pipeline or its `( … )` (with
 /// that command's redirections, `( list ) >file &`) before it exits (the job
 /// vproc of `a | b &`; bash: only a pipeline or a `( … )` that is its whole
-/// command, which bash runs in that process, `( ( … ) )`), and the signal
-/// reaches those too (`children`: a job, label or broadcast target, or a pid
-/// target that [`Shell::deliver`] forwards to its `( … )`); `None` otherwise.
+/// command, which bash runs in that process, `( ( … ) )`, but not a timed
+/// one in a `( … )`), and the signal reaches those too (`children`: a job,
+/// label or broadcast target, or a pid target that [`Shell::deliver`]
+/// forwards to its `( … )`); `None` otherwise.
 pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 	if !p.transient || p.own_traps.has(crate::bash::store::TrapKey::Exit) {
 		return None;
@@ -4718,9 +4719,18 @@ pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 						start -= 1;
 					}
 				}
-				let whole =
-					killed::base_spawn(unit, frame.pc).is_some_and(|(s, i)| s.stages[i].entry == start);
-				if !whole {
+				let (own, i) = killed::base_spawn(unit, frame.pc)?;
+				if own.stages[i].entry != start {
+					return None;
+				}
+				// A `( … )` forks the one its body is when that one is timed:
+				// `CMD_TIME_PIPELINE` keeps `execute_in_subshell` from giving
+				// it `CMD_NO_FORK` (`execute_cmd.c:1799`). A job's or a stage's
+				// `( … )` is that process, timed or not.
+				if own.kind == ir::SpawnKind::Subshell
+					&& spawn.kind == ir::SpawnKind::Subshell
+					&& killed::subshell_time(unit, spawn, op.node).is_some()
+				{
 					return None;
 				}
 			}

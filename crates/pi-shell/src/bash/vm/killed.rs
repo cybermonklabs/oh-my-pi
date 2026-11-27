@@ -19,8 +19,9 @@
 //! forks: a subshell, an asynchronous one or a pipeline's stage reports its
 //! own foreground commands but the one it runs with `exec`
 //! ([`subshell_exec`]); a `( … )`, job or stage whose whole command is a
-//! `( … )` is one process with it; a foreground subshell a signal killed is
-//! reported as a command ([`subshell_ended`]). A foreground pipeline is
+//! `( … )` is one process with it, but a `( … )` forks a timed one
+//! ([`SubshellTime`]); a foreground subshell a signal killed is reported as
+//! a command, with its `time` ([`subshell_ended`]). A foreground pipeline is
 //! reported as its processes ([`pipeline_ended`]), when a signal ended the
 //! one whose end is its status (`raw_job_exit_status`: the last one, or
 //! under `pipefail` the last one that did not succeed): the short notice
@@ -406,12 +407,12 @@ fn forks_for_traps(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> Result<bool, 
 
 /// A foreground subshell (`( … )`) of `vp`, vproc `child`, died of `sig`:
 /// bash reports it as it reports a foreground command ([`notice`]), naming
-/// the subshell's text (with its `!`), from a subshell too (bash 5.3.20:
-/// `( ( kill -QUIT $BASHPID ); : )` prints the inner one's notice), on the
-/// shell's own standard error: once the `( … )`'s own redirections are
-/// undone ([`Kernel::held_notices`], written by its `PopRedir`), at once
-/// without any. A pipeline's stage and a substitution are no such child,
-/// and a substitution's own process says nothing.
+/// the subshell's text (with its `!`, and its `time` first: [`SubshellTime`]),
+/// from a subshell too (bash 5.3.20: `( ( kill -QUIT $BASHPID ); : )` prints
+/// the inner one's notice), on the shell's own standard error: once the `( …
+/// )`'s own redirections are undone ([`Kernel::held_notices`], written by its
+/// `PopRedir`), at once without any. A pipeline's stage and a substitution
+/// are no such child, and a substitution's own process says nothing.
 pub(super) fn subshell_ended(
 	k: &mut Kernel,
 	cx: &mut Cx<'_>,
@@ -467,7 +468,20 @@ pub(super) fn subshell_ended(
 		.get(end as usize)
 		.filter(|o| o.code == Opcode::Not && !whole)
 		.map_or(op.node, |o| o.node);
-	let text = command_text(k, cx, vp, &unit, node, redir.map(|r| r.a));
+	// The `time` bash sets on the `( … )` comes first, unless the `!`
+	// pipeline named here is the one it times, whose text shows it.
+	let (node, time) = match subshell_time(&unit, spawn, op.node) {
+		Some(SubshellTime::Own(pipeline)) => (pipeline, None),
+		Some(SubshellTime::Flags { pipeline, .. }) if pipeline == node => (node, None),
+		Some(SubshellTime::Flags { posix, .. }) => (node, Some(posix)),
+		None => (node, None),
+	};
+	let mut text = match time {
+		Some(true) => b"time -p ".to_vec(),
+		Some(false) => b"time ".to_vec(),
+		None => Vec::new(),
+	};
+	text.extend(command_text(k, cx, vp, &unit, node, redir.map(|r| r.a)));
 	let Some(bytes) = notice(k, cx, vp, &text, op.node, child.0, sig) else {
 		return;
 	};
@@ -476,6 +490,72 @@ pub(super) fn subshell_ended(
 		k.held_notices.push((vp.vpid, depth, BString::from(bytes)));
 	} else {
 		vp.out.push_back(PendingWrite::new(2, bytes.into()));
+	}
+}
+
+/// The `time` bash sets on a `( … )`, which it prints first in the `( …
+/// )`'s text (`make_command_string`: `CMD_TIME_PIPELINE` as `time `, with
+/// `CMD_TIME_POSIX` as `time -p `, `print_cmd.c:189`), and for which it
+/// forks a `( … )` that is a `( … )`'s whole body ([`super::transparent`]).
+#[derive(Clone, Copy)]
+pub(super) enum SubshellTime {
+	/// The `( … )`'s own `time`, which it passed on to the one `( … )` its
+	/// body is: the text of the timed pipeline `pipeline` shows it.
+	Own(u32),
+	/// The `( … )`'s fork times its body: with its own `time` or the one
+	/// an outer `( … )` passed on (`pipeline` is the timed pipeline), `time
+	/// -p` when either is.
+	Flags { pipeline: u32, posix: bool },
+}
+
+/// The [`SubshellTime`] of the `( … )` of `spawn`, syntax node `cmd`, if it
+/// has one. bash forks a `( … )` before it times anything (`execute_cmd.c`
+/// 699, 807) and times its body in the fork, which passes the time on to a
+/// body that is one `( … )` alone (`execute_in_subshell`, 1781): the
+/// lowering puts the `TimeStart` at the spawn's entry, or at that one's,
+/// down such a chain, naming the timed pipeline ([`crate::bash::ir`]).
+/// Only a `TimeStart` whose pipeline holds `cmd` is the `( … )`'s: one of a
+/// pipeline inside its body is not.
+pub(super) fn subshell_time(unit: &Unit, spawn: &SpawnIr, cmd: u32) -> Option<SubshellTime> {
+	let span = |node: u32| unit.nodes.get(node as usize).map(|n| (n.lo, n.hi));
+	let (lo, hi) = span(cmd)?;
+	let mut s = spawn;
+	let mut outer = false;
+	loop {
+		// Past the `[Redir] Enter` of a `( … )` the body starts with.
+		let mut pc = s.stages.first()?.entry;
+		while unit
+			.ops
+			.get(pc as usize)
+			.is_some_and(|op| matches!(op.code, Opcode::Redir | Opcode::Enter))
+		{
+			pc += 1;
+		}
+		let op = unit.ops.get(pc as usize)?;
+		match op.code {
+			Opcode::Spawn => {
+				s = unit
+					.spawns
+					.get(op.a as usize)
+					.filter(|s| s.kind == SpawnKind::Subshell)?;
+				outer = true;
+			},
+			Opcode::TimeStart => {
+				let (time_lo, time_hi) = span(op.node)?;
+				if time_lo > lo || time_hi < hi {
+					return None;
+				}
+				// The pipeline ends with the `( … )`: the `( … )`'s own.
+				if outer && time_hi == hi {
+					return Some(SubshellTime::Own(op.node));
+				}
+				// `TimeStart; body; TimeEnd; SubExit`.
+				let end = unit.ops.get(s.end.checked_sub(2)? as usize)?;
+				let posix = end.code == Opcode::TimeEnd && end.b == 1;
+				return Some(SubshellTime::Flags { pipeline: op.node, posix });
+			},
+			_ => return None,
+		}
 	}
 }
 
