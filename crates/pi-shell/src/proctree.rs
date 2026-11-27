@@ -587,9 +587,13 @@ mod platform {
 				return Pace::Runnable;
 			}
 			if !self.live_identity() {
+				#[cfg(test)]
+				super::wave_hook::count_unread(self.pid);
 				return Pace::Stopped;
 			}
 			let Ok(tasks) = fs::read_dir(format!("/proc/{}/task", self.pid)) else {
+				#[cfg(test)]
+				super::wave_hook::count_unread(self.pid);
 				return Pace::Stopped;
 			};
 			let mut pace = Pace::Stopped;
@@ -1492,9 +1496,12 @@ impl Process {
 	/// Sends `TERM_SIGNAL` to the optional process group, every live descendant,
 	/// and the root, then optionally waits up to `graceful_ms` for the tree to
 	/// exit before escalating to `KILL_SIGNAL`. Pass `graceful_ms < 0` to skip
-	/// the wait entirely (the polite signal is still emitted). The polite wave
-	/// is sent even when `ct` has already fired. Returns `true` when the tree
-	/// has exited by the end of the hard wave's wait window.
+	/// the wait entirely (the polite signal is still emitted). Both waves are
+	/// sent even when `ct` fires: a call cancelled before or during the grace
+	/// period sends the hard wave at once, without waiting out the grace, and
+	/// then fails with the cancellation, without waiting for the exits.
+	/// Returns `true` when the tree has exited by the end of the hard wave's
+	/// wait window.
 	///
 	/// On Linux each wave stops a tree in a process group of its own, top-down,
 	/// before it reads it, and resumes it once signalled, so a process cannot
@@ -1839,6 +1846,8 @@ impl Process {
 							waiting = true;
 						} else {
 							*past = true;
+							#[cfg(all(test, target_os = "linux"))]
+							wave_hook::count_blocked_bound(process.pid());
 						}
 					},
 				}
@@ -1945,18 +1954,25 @@ impl Process {
 
 		// Optional grace wait. A negative `graceful_ms` skips the wait entirely
 		// (we still emit the polite signal so cleanup handlers can run before
-		// KILL). An incomplete walk proves no exit: the hard wave follows.
+		// KILL). An incomplete walk proves no exit: the hard wave follows. A
+		// cancellation ends the grace wait, not the termination: the hard wave
+		// goes out at once, so a process that ignores TERM does not outlive a
+		// cancelled call, and the call then reports the cancellation without
+		// waiting for the exits.
+		let mut cancelled = None;
 		if graceful_ms >= 0 {
-			let exited = wait_for_exit(
+			match wait_for_exit(
 				self,
 				&polite.processes,
 				process_group.map(|pgid| GroupWait { pgid, resend: None }),
 				Some(Duration::from_millis(graceful_ms as u64)),
 				ct.clone(),
 			)
-			.await?;
-			if exited && polite.complete.is_ok() {
-				return Ok(true);
+			.await
+			{
+				Ok(true) if polite.complete.is_ok() => return Ok(true),
+				Ok(_) => {},
+				Err(error) => cancelled = Some(error),
 			}
 		}
 
@@ -1979,6 +1995,10 @@ impl Process {
 			frozen.absorb(subtree, survivor);
 		}
 		let hard = self.signal_wave(frozen, KILL_SIGNAL, process_group, own_group, &protected);
+		if let Some(error) = cancelled {
+			return Err(error);
+		}
+
 		let group = process_group.map(|pgid| GroupWait { pgid, resend: Some(KILL_SIGNAL) });
 		let exited = wait_for_exit(
 			self,
@@ -2293,8 +2313,12 @@ mod wave_hook {
 	#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 	pub enum Event {
 		Bound,
+		BlockedBound,
 		Cancelled,
 		StepBound,
+		/// `pace` could not read the process (it ended, or a read failed)
+		/// and read it as stopped.
+		Unread,
 	}
 
 	fn count(pid: i32, event: Event) {
@@ -2315,6 +2339,25 @@ mod wave_hook {
 
 	pub fn count_step_bound(pid: i32) {
 		count(pid, Event::StepBound);
+	}
+
+	pub fn count_blocked_bound(pid: i32) {
+		count(pid, Event::BlockedBound);
+	}
+
+	pub fn count_unread(pid: i32) {
+		count(pid, Event::Unread);
+	}
+
+	/// What ended the walk's waits on `pid`, for a failure message.
+	pub fn wait_ends(pid: i32) -> String {
+		format!(
+			"runnable bound {}, blocked bound {}, cancelled {}, unread {}",
+			events(pid, Event::Bound),
+			events(pid, Event::BlockedBound),
+			events(pid, Event::Cancelled),
+			events(pid, Event::Unread)
+		)
 	}
 
 	/// How often `event` happened to `pid`.
@@ -4393,7 +4436,12 @@ mod tests {
 	/// children are read could fork once more. A root that spins in user
 	/// space, in a process group of its own, reads stopped when the wave's
 	/// signal goes out, however long a loaded machine keeps it waiting for a
-	/// CPU after the stop is sent.
+	/// CPU after the stop is sent: the runnable bound of 5 s is never reached.
+	/// Under load the root can also sit asleep in the kernel when the walk
+	/// looks (a page fault waiting for its page, in `D`). The walk promises
+	/// such a process 100 ms, then reads it as it runs, so the test accepts a
+	/// root that has not stopped only when the walk's wait on it ended at that
+	/// blocked bound, as the walk's counters at the signal show.
 	#[cfg(target_os = "linux")]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn terminate_waits_until_the_tree_has_stopped() {
@@ -4402,6 +4450,8 @@ mod tests {
 			process::Command,
 			sync::{Arc, Mutex},
 		};
+
+		use wave_hook::{Event, events};
 
 		for run in 0..20 {
 			let mut root = Command::new("/bin/sh")
@@ -4412,12 +4462,20 @@ mod tests {
 			let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
 			let _guard = GroupGuard(root_pid);
 			let process = Process::from_pid(root_pid).expect("pin the root");
-			let state = Arc::new(Mutex::new(None));
+			// A reused pid keeps the counts of an earlier run: count from here.
+			let before = (events(root_pid, Event::Bound), events(root_pid, Event::BlockedBound));
+			let seen = Arc::new(Mutex::new(None));
 			{
-				let state = Arc::clone(&state);
+				let seen = Arc::clone(&seen);
 				wave_hook::set(
 					root_pid,
-					Box::new(move || *state.lock().expect("state") = thread_state(root_pid)),
+					Box::new(move || {
+						*seen.lock().expect("seen") = Some((
+							thread_state(root_pid),
+							events(root_pid, Event::Bound) - before.0,
+							events(root_pid, Event::BlockedBound) - before.1,
+						));
+					}),
 				);
 			}
 			let exited = process
@@ -4425,14 +4483,25 @@ mod tests {
 				.await
 				.expect("terminate");
 			let _ = reap(&mut root);
-			let state = *state.lock().expect("state");
+			let (state, runnable_bound, blocked_bound) =
+				(*seen.lock().expect("seen")).expect("the polite wave ran the hook");
 			assert!(exited, "run {run}: the root must be gone");
-			assert_eq!(state, Some('T'), "run {run}: the root was read before it had stopped");
+			assert_eq!(
+				runnable_bound, 0,
+				"run {run}: the walk read the root as it ran once its runnable bound had passed"
+			);
+			assert!(
+				state == Some('T') || blocked_bound > 0,
+				"run {run}: the root was read in state {state:?} before it had stopped, and the \
+				 walk's wait on it did not end at the blocked bound ({})",
+				wave_hook::wait_ends(root_pid)
+			);
 		}
 	}
 
-	/// A call whose cancellation has already fired still sends the polite
-	/// wave, and leaves nothing stopped: the tree ends of the TERM.
+	/// A call whose cancellation has already fired still sends both waves,
+	/// and leaves nothing stopped: the tree ends of the TERM, or of the KILL
+	/// that follows it at once.
 	#[cfg(target_os = "linux")]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn terminate_sends_the_polite_wave_when_already_cancelled() {
@@ -4456,6 +4525,56 @@ mod tests {
 		let _ = reap(&mut root);
 		wait_until("the sleep ends of the TERM", || child.status() != ProcessStatus::Running);
 		assert!(result.is_err(), "the cancelled call reports its cancellation");
+	}
+
+	/// A token that fires during the grace period ends the grace wait, and
+	/// the hard wave goes out at once: a child that ignores TERM is killed,
+	/// and the call reports its cancellation. Before, the cancelled grace wait
+	/// returned before the hard wave, and that child outlived the
+	/// termination. The token fires from the hook right after the polite
+	/// wave's TERM, so the grace wait is the first to see it; the grace period
+	/// is 60 s, and the child must be gone within the 10 s the test waits.
+	#[cfg(target_os = "linux")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_token_that_fires_in_the_grace_period_still_sends_the_kill() {
+		use std::{os::unix::process::CommandExt, process::Command};
+
+		let mut root = Command::new("/bin/sh")
+			.args(["-c", "(trap '' TERM; exec sleep 1000) & wait"])
+			.process_group(0)
+			.spawn()
+			.expect("spawn the root");
+		let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
+		let _guard = GroupGuard(root_pid);
+		let process = Process::from_pid(root_pid).expect("pin the root");
+		wait_until("the root forked its TERM-ignoring sleep", || {
+			process
+				.children()
+				.unwrap_or_default()
+				.first()
+				.is_some_and(|child| {
+					child
+						.args()
+						.first()
+						.is_some_and(|arg| arg.ends_with("sleep"))
+				})
+		});
+		let child = process.children().unwrap_or_default().remove(0);
+		let _child_guard = KillOnDrop(vec![child.clone()]);
+
+		let mut token = CancelToken::default();
+		let abort = token.emplace_abort_token();
+		wave_hook::set_after(
+			root_pid,
+			TERM_SIGNAL,
+			Box::new(move || abort.abort(crate::cancel::AbortReason::Signal)),
+		);
+		let result = process.terminate_tree(false, 60_000, 5000, token).await;
+		let _ = reap(&mut root);
+		assert!(result.is_err(), "the cancelled call reports its cancellation");
+		wait_until("the TERM-ignoring sleep ends of the hard wave's KILL", || {
+			child.status() != ProcessStatus::Running
+		});
 	}
 
 	/// A process the scheduler never runs reads as runnable at every look
@@ -4506,12 +4625,23 @@ mod tests {
 	/// bound can end first (the bound counts from the walk's first look);
 	/// and, where masks are shown, with a root that blocks TERM, which a
 	/// cancelled walk does not step.
+	///
+	/// That the polite wave went out is read from the hook the walk runs once
+	/// it has sent that wave's signal, not from how the root died: a
+	/// cancelled call gives it no grace, so the hard wave's KILL follows at
+	/// once and reaches a root that would have died of the TERM. Which of the
+	/// two ends it is a race, and the test asserts only that it is dead of
+	/// one of them.
 	#[cfg(target_os = "linux")]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn a_fired_token_ends_the_walks_waits_and_the_term_is_still_sent() {
 		use std::{
 			os::unix::process::{CommandExt, ExitStatusExt},
 			process::Command,
+			sync::{
+				Arc,
+				atomic::{AtomicBool, Ordering},
+			},
 		};
 
 		for fires_after in [Duration::ZERO, Duration::from_millis(500)] {
@@ -4523,12 +4653,25 @@ mod tests {
 			let root_pid = i32::try_from(root.id()).expect("root pid fits in i32");
 			let _guard = GroupGuard(root_pid);
 			let process = Process::from_pid(root_pid).expect("pin the root");
+			let polite = Arc::new(AtomicBool::new(false));
+			{
+				let polite = Arc::clone(&polite);
+				wave_hook::set_after(
+					root_pid,
+					TERM_SIGNAL,
+					Box::new(move || polite.store(true, Ordering::SeqCst)),
+				);
+			}
 			wave_hook::set_runnable(root_pid);
 			let token = CancelToken::with_timeout(Some(fires_after));
 			let result = process.terminate_tree(false, 1000, 5000, token).await;
 			wave_hook::clear_runnable(root_pid);
 			let status = reap(&mut root);
 			assert!(result.is_err(), "{fires_after:?}: the cancelled call reports its cancellation");
+			assert!(
+				polite.load(Ordering::SeqCst),
+				"{fires_after:?}: the polite wave's TERM was never sent"
+			);
 			assert!(
 				wave_hook::events(root_pid, wave_hook::Event::Cancelled) >= 1,
 				"{fires_after:?}: the token did not end the walk's wait"
@@ -4538,10 +4681,9 @@ mod tests {
 				0,
 				"{fires_after:?}: the bound, not the token, ended the walk's wait"
 			);
-			assert_eq!(
-				status.signal(),
-				Some(TERM_SIGNAL),
-				"{fires_after:?}: the root did not die of the polite wave's TERM"
+			assert!(
+				matches!(status.signal(), Some(TERM_SIGNAL | KILL_SIGNAL)),
+				"{fires_after:?}: the root died of neither wave: {status:?}"
 			);
 		}
 		if !masks_shown() {

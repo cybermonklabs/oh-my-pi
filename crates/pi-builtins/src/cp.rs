@@ -8631,18 +8631,39 @@ mod tests {
 		// Writes `F` into the FIFO `path` once a reader has it open. The open
 		// waits for cp's read open; where cp never opens the FIFO, the row's
 		// end releases it with a reader of its own (`release`), and after
-		// `stop` nothing is written. (A writer opened without waiting, retried
-		// until a reader shows, missed cp's open under gVisor now and then.)
+		// `stop` nothing is written. The feeder then holds its end until the
+		// byte is read or the row's cp has ended. gVisor's blocking open of a
+		// FIFO can miss a writer that opens, writes and closes while the opener
+		// gets ready to wait: it then waits for the next writer's open, for
+		// ever if none comes, where Linux's waits on the count of writer opens
+		// and sees that one (`wait_for_partner` in fs/pipe.c). GNU cp's open
+		// waits there the same way. A writer the feeder still holds open is
+		// there to be seen whenever the opener looks. (A writer opened without
+		// waiting, retried until a reader shows, was missed the same way.)
 		fn feed(path: std::path::PathBuf, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
 			std::thread::spawn(move || {
-				if let Ok(mut fifo) = fs::OpenOptions::new().write(true).open(&path)
-					&& !stop.load(Ordering::Relaxed)
-				{
-					// A reader that closed before the write leaves EPIPE, as it
-					// does GNU's feeder.
-					let _ = std::io::Write::write_all(&mut fifo, b"F");
+				let Ok(mut fifo) = fs::OpenOptions::new().write(true).open(&path) else {
+					return;
+				};
+				// A reader that closed before the write leaves EPIPE, as it does
+				// GNU's feeder.
+				if stop.load(Ordering::Relaxed) || std::io::Write::write_all(&mut fifo, b"F").is_err() {
+					return;
+				}
+				while !stop.load(Ordering::Relaxed) && unread(&fifo) > 0 {
+					std::thread::sleep(Duration::from_millis(1));
 				}
 			})
+		}
+		// How many bytes the FIFO that `fifo` is an end of holds.
+		fn unread(fifo: &fs::File) -> libc::c_int {
+			use std::os::fd::AsRawFd as _;
+			let mut bytes: libc::c_int = 0;
+			// SAFETY: `fifo` is open, and `FIONREAD` writes one `int` to
+			// `bytes`, which outlives the call.
+			let read = unsafe { libc::ioctl(fifo.as_raw_fd(), libc::FIONREAD, &raw mut bytes) };
+			assert_eq!(read, 0, "FIONREAD of a FIFO: {}", std::io::Error::last_os_error());
+			bytes
 		}
 		// Lets a feeder still waiting in its open go: a reader that does not
 		// wait opens the FIFO.

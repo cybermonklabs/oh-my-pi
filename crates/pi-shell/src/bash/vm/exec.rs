@@ -156,8 +156,10 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 				}
 			}
 		}
-		if !vp.restore_opts.is_empty() {
-			for saved in std::mem::take(&mut vp.restore_opts) {
+		if let Some(rare) = vp.rare.as_deref_mut()
+			&& !rare.restore_opts.is_empty()
+		{
+			for saved in std::mem::take(&mut rare.restore_opts) {
 				if let Err(err) = state::restore_set_options(&mut k.root, cx.store, vp, &saved) {
 					k.fail(err);
 				}
@@ -233,7 +235,7 @@ pub fn run_slice(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, slice: u32, op
 		{
 			vp.frames[fi].debug_pc = None;
 			unblock(k, cx, vp);
-			if !vp.procsubs.is_empty() {
+			if !vp.procsubs().is_empty() {
 				close_procsubs(vp, fi);
 			}
 			let frame = top_frame(vp);
@@ -829,7 +831,7 @@ fn exit_shell(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32, jump
 			Some(r) => r.started && !r.exit_trap_started,
 			// A forked subshell has no run: it is its own exit, and its
 			// own flag is what keeps the trap from starting twice.
-			None => vp.transient && !vp.exit_trap_run,
+			None => vp.transient && vp.exit_trap_due,
 		}
 		&& start_exit_trap_once(k, vp, cx)
 	{
@@ -881,7 +883,7 @@ pub(super) fn fork_failure(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line
 			run.exit_trap_started = true;
 		}
 		if vp.transient {
-			vp.exit_trap_run = true;
+			vp.exit_trap_due = false;
 		}
 		return Flow::Discard(1);
 	}
@@ -973,7 +975,7 @@ pub(super) fn spend_exit_trap(vp: &mut Vproc) {
 		run.exit_trap_started = true;
 	}
 	if vp.transient {
-		vp.exit_trap_run = true;
+		vp.exit_trap_due = false;
 	}
 }
 
@@ -1154,12 +1156,14 @@ fn function_context(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 /// `own_traps`, `trap_frames` and the frame scans all return to their
 /// pre-trap values when the trap's frame is popped. A root vproc is
 /// unaffected: its guard is its run's own flag, one per shell invocation.
+/// A fork bash ends with `sh_exit` runs no trap at all
+/// ([`Vproc::exit_trap_due`]).
 fn start_exit_trap_once(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>) -> bool {
 	if vp.transient {
-		if vp.exit_trap_run {
+		if !vp.exit_trap_due {
 			return false;
 		}
-		vp.exit_trap_run = true;
+		vp.exit_trap_due = false;
 	}
 	start_trap(k, vp, cx, TrapKey::Exit)
 }
@@ -2381,7 +2385,8 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 		match state::scope_var(store, vp, top, b"-") {
 			// `local -`: the function's `set -o` changes end with it.
 			Ok(Some(Some(saved))) => {
-				vp.restore_opts
+				vp.rare_mut()
+					.restore_opts
 					.push(BString::from(saved.as_scalar().unwrap_or_default()));
 			},
 			Ok(_) => {},
@@ -2390,7 +2395,7 @@ pub fn pop_frame(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 		match state::scope_binds(store, vp, top, b"OPTIND") {
 			// A local `OPTIND`: the caller's getopts scan resumes where it
 			// was.
-			Ok(true) if !zsh_body => vp.getopts = f.getopts.take().map_or_default(|g| *g),
+			Ok(true) if !zsh_body => vp.set_getopts(f.getopts.take().map_or_default(|g| *g)),
 			Ok(_) => {},
 			Err(err) => root.fail(err),
 		}
@@ -3276,12 +3281,22 @@ pub fn expanding<T>(
 		return Err(flow);
 	}
 	let mut log = std::mem::take(&mut sc.logs[slot as usize]);
+	// A word of redirections bash makes in a child: the pass runs on that
+	// child's state, which the command's words share ([`redir::enter_child`]).
+	// A substitution it stops for starts below, and settles above, with the
+	// shell's own (a `$( )` forks from the child's: [`start_sub`]).
+	let shell = k
+		.redirs_in_child
+		.then(|| redir::enter_child(k, vp, cx, &mut sc));
 	let res = {
 		let mut ex = Expander::new(k, cx, vp, &mut log, record, line);
 		let r = super::zsh::subst::begin_pass(&mut ex).and_then(|()| f(&mut ex));
 		let st = ex.sub_status;
 		r.map(|v| (v, st))
 	};
+	if let Some(shell) = shell {
+		redir::leave_child(k, vp, cx, &mut sc, shell);
+	}
 	// The slot still holds the empty `Vec` `take` left there (the scratch is
 	// out of its frame meanwhile, nothing else fills it): put the log back
 	// without a drop of that placeholder per expansion.
@@ -3363,8 +3378,9 @@ fn stopped(
 	}
 }
 
-/// Expansion errors end the shell: posix mode, not interactive.
-fn posix_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
+/// Expansion errors end the shell, as a syntax error in a compound value
+/// given as a string does: posix mode, not interactive.
+pub(super) fn posix_exits(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> bool {
 	state::option(&mut k.root, cx.store, vp, OptId::Posix).unwrap_or(false)
 		&& !matches!(
 			state::record(cx.store, vp, Key::Misc(MiscKey::Interactive)),
@@ -3452,32 +3468,7 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			// An arithmetic subscript error took the cleanup arm above.
 			let jump = top_level_jump(cx, vp, false);
 			k.diag(cx, vp, line, d);
-			// The EXIT trap keeps the status the shell was exiting with.
-			// Under `set -e` bash's `report_error` exits on its own (the arm
-			// above); for the other errors bash reaches the same rows
-			// through its own errexit jump, which this change does not
-			// model, so the upstream constant stays whenever errexit is on.
-			let flow = if vp.mode.dialect() != Dialect::Zsh
-				&& let Some(status) = exit_trap_status(vp)
-				&& !errexit_on(k, cx, vp)
-			{
-				Flow::Exit(status, jump)
-			} else {
-				// bash exits 127 when the error reaches the command loop of a
-				// `-c` string (`run_one_command`), 1 from a script and from a
-				// nearer `top_level` ([`fatal_reaches_command_loop`]). Under
-				// `set -e` bash's `report_error` exits at once with the failure
-				// status. zsh exits 1 from any of them (`errflag` ends `loop`
-				// with 1).
-				let command = vp.mode.dialect() != Dialect::Zsh
-					&& fatal_reaches_command_loop(vp)
-					&& !errexit_on(k, cx, vp)
-					&& matches!(
-						state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
-						Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
-					);
-				Flow::Exit(if command { 127 } else { 1 }, jump)
-			};
+			let flow = Flow::Exit(force_eof_status(k, cx, vp), jump);
 			jump_out(k, cx, vp, false, &flow);
 			flow
 		},
@@ -3486,6 +3477,34 @@ pub fn stop_flow(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, line: u32, sto
 			Flow::Discard(1)
 		},
 	}
+}
+
+/// The status a fatal error exits a non-interactive posix shell with
+/// (bash's `jump_to_top_level (FORCE_EOF)`). The EXIT trap keeps the status
+/// the shell was exiting with. Under `set -e` bash's `report_error` exits on
+/// its own ([`report_error_exits`]); for the other errors bash reaches the
+/// same rows through its own errexit jump, which is not modelled, so the
+/// constant below stays whenever errexit is on.
+pub(super) fn force_eof_status(k: &mut Kernel, cx: &mut Cx<'_>, vp: &Vproc) -> i32 {
+	if vp.mode.dialect() != Dialect::Zsh
+		&& let Some(status) = exit_trap_status(vp)
+		&& !errexit_on(k, cx, vp)
+	{
+		return status;
+	}
+	// bash exits 127 when the error reaches the command loop of a `-c`
+	// string (`run_one_command`), 1 from a script and from a nearer
+	// `top_level` ([`fatal_reaches_command_loop`]). Under `set -e` bash's
+	// `report_error` exits at once with the failure status. zsh exits 1 from
+	// any of them (`errflag` ends `loop` with 1).
+	let command = vp.mode.dialect() != Dialect::Zsh
+		&& fatal_reaches_command_loop(vp)
+		&& !errexit_on(k, cx, vp)
+		&& matches!(
+			state::record(cx.store, vp, Key::Misc(MiscKey::RunOrigin)),
+			Ok(Some(Record::Misc(origin))) if origin.as_slice() == b"c"
+		);
+	if command { 127 } else { 1 }
 }
 
 /// Whether a fatal error here ends at bash's command loop rather than at a
@@ -3706,6 +3725,10 @@ pub fn start_sub(
 			let reparse = text.and_then(|i| unit.strs.get(i as usize)).filter(|_| {
 				!posix && (base != line || matches!(builtins::alias_table(k, cx, vp), Ok(Some(_))))
 			});
+			// A `$( )` in a word of redirections bash makes in a child forks
+			// from that child, so it sees what the word wrote before it
+			// ([`redir::enter_child`]).
+			let shell = k.redirs_in_child.then(|| redir::enter_child(k, vp, cx, sc));
 			let mut child = if let Some(src) = reparse {
 				vp.child_text(k, cx.store, src, base, fds)
 			} else {
@@ -3728,6 +3751,9 @@ pub fn start_sub(
 				child.trace_base += 1;
 				child
 			};
+			if let Some(shell) = shell {
+				redir::leave_child(k, vp, cx, sc, shell);
+			}
 			k.bang_kin_add(vp.vpid, child.vpid);
 			zsh_subshell_traps(k, cx, &mut child, false);
 			// bash runs the text with `parse_and_execute` (`command_substitute`):
@@ -3771,12 +3797,24 @@ pub fn start_sub(
 		},
 		ComsubForm::NoFork | ComsubForm::Value => {
 			// Its own scope for `local` (marked with an empty function name,
-			// which `FUNCNAME` skips); `${| ;}` has a local `REPLY`.
+			// which `FUNCNAME` skips); `${| ;}` has a local `REPLY`. In a word
+			// of redirections bash makes in a child, bash runs the body in that
+			// child: it reads what the command's earlier words wrote there,
+			// which this scope holds for it, so the shell sees none of it and a
+			// write of one of those names stays in the body.
 			let mut vars = VarMap::default();
+			if k.redirs_in_child {
+				redir::child_vars(sc, &mut vars);
+			}
 			if form == ComsubForm::Value {
 				vars.insert(BString::from("REPLY"), None);
 			}
-			let scope = Scope { vars, positional: None, func: Some(BString::default()), zsh: None };
+			let scope = Scope {
+				vars:       vars.into(),
+				positional: None,
+				func:       Some(BString::default()),
+				zsh:        None,
+			};
 			state::push_scope(&mut k.root, cx.store, vp, scope);
 			// Outside posix mode bash parses `${ ;}` without aliases and
 			// re-parses its re-printed text when it runs, with the aliases
@@ -3902,7 +3940,8 @@ pub fn start_zsh_procsub(
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));
 	vp.fds.set(fd, Some(mine));
-	vp.procsubs.push((vp.frames.len() as u32, fd));
+	let depth = vp.frames.len() as u32;
+	vp.rare_mut().procsubs.push((depth, fd));
 	vp.last_bg = LastBg::new(vpid);
 	// zsh's `procsubstpid` (`$sysparams[procsubstpid]`).
 	let rec = Record::Misc(BString::from(vpid.0.to_string()));
@@ -4043,7 +4082,7 @@ pub fn start_procsub(
 	// Nor the ends of the substitutions before it (`diff <(a) <(b)`): an
 	// external in `b` would get them as extra fds, and the host pumps an
 	// in-memory pipe it is handed, so it would drain `a`'s output.
-	for &(_, sibling) in &vp.procsubs {
+	for &(_, sibling) in vp.procsubs() {
 		if sibling != their_fd {
 			fds.set(sibling, None);
 		}
@@ -4086,7 +4125,8 @@ pub fn start_procsub(
 	k.emit_op(cx, vp, 0, EventData::Subshell { child: vpid });
 	k.spawned.push(Box::new(child));
 	vp.fds.set(fd, Some(mine));
-	vp.procsubs.push((vp.frames.len() as u32, fd));
+	let depth = vp.frames.len() as u32;
+	vp.rare_mut().procsubs.push((depth, fd));
 	// bash: a process substitution sets `$!` (`wait $!` waits for it).
 	vp.last_bg = LastBg::new(vpid);
 	Some(BString::from(format!("/dev/fd/{fd}")))
@@ -4099,7 +4139,7 @@ fn end_op(k: &mut Kernel, cx: &mut Cx<'_>, vp: &mut Vproc, fi: usize) {
 	if let Some(sc) = vp.frames.get_mut(fi).and_then(|f| f.scratch.take()) {
 		drop_scratch(&mut k.root, cx.store, vp, sc);
 	}
-	if !vp.procsubs.is_empty() {
+	if !vp.procsubs().is_empty() {
 		close_procsubs(vp, fi);
 	}
 	if vp.zsh.as_ref().is_some_and(|z| !z.tempfiles.is_empty()) {
@@ -4128,8 +4168,11 @@ fn remove_tempfiles(cx: &mut Cx<'_>, vp: &mut Vproc, keep: usize) {
 /// Close the process-substitution fds opened by ops of frames above the
 /// first `keep` (their commands are over).
 pub fn close_procsubs(vp: &mut Vproc, keep: usize) {
+	let Some(rare) = vp.rare.as_deref_mut() else {
+		return;
+	};
 	let fds = &mut vp.fds;
-	vp.procsubs.retain(|&(depth, fd)| {
+	rare.procsubs.retain(|&(depth, fd)| {
 		let over = depth as usize > keep;
 		if over {
 			fds.set(fd, None);
@@ -5324,6 +5367,9 @@ pub(super) fn cleanup_jump(vp: &Vproc, d: &Diag) -> bool {
 /// associative array or with a non-numeric one for an indexed array, and
 /// a file `.` cannot read (`file_error`). A builtin's own message
 /// (`declare: r: readonly variable`) is `builtin_error`, which never exits.
+/// Also bash's `parser_error` while it runs (error.c:324), which makes the
+/// same check: a compound value given as a string that does not parse
+/// ([`Diag::ArrayAssign`]).
 const fn reports_error(d: &Diag) -> bool {
 	matches!(
 		d,
@@ -5340,6 +5386,7 @@ const fn reports_error(d: &Diag) -> bool {
 			| Diag::AssocSubscript { .. }
 			| Diag::NonNumericIndex { .. }
 			| Diag::FileError { .. }
+			| Diag::ArrayAssign { .. }
 	)
 }
 
@@ -5385,7 +5432,8 @@ pub(super) const fn errexit_off(prefix: Prefix, id: IntrinsicId) -> bool {
 }
 
 /// The status [`report_error_exits`] leaves with: 1 for an error bash sets
-/// the status for before the message, else `$?`, or 1 when that is 0.
+/// the status for before the message, else `$?`, or 1 when that is 0; 2
+/// for `parser_error`'s (`exit_shell (last_command_exit_value = 2)`).
 pub(super) const fn report_error_status(vp: &Vproc, d: &Diag) -> i32 {
 	match d {
 		Diag::Readonly { .. }
@@ -5398,6 +5446,7 @@ pub(super) const fn report_error_status(vp: &Vproc, d: &Diag) -> i32 {
 		{
 			vp.status
 		},
+		Diag::ArrayAssign { .. } => 2,
 		_ => 1,
 	}
 }
@@ -5521,7 +5570,7 @@ fn discard_top(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, status: i32) {
 		&& super::nested::in_subshell(cx.store, vp)
 	{
 		report_jump(k, vp, cx, 0, Jump::Cleanup);
-		vp.exit_trap_run = true;
+		vp.exit_trap_due = false;
 		let saved = vp.trap_saved;
 		exit_shell(k, vp, cx, saved, Jump::Cleanup);
 		return;
@@ -6997,6 +7046,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					&& vp.mode.dialect() == Dialect::Zsh
 					&& super::killed::in_place(k, cx, vp, op);
 				let mut child = vp.child(k, cx.store, Arc::clone(unit), info.stages[0].entry, fds);
+				child.exit_trap_due = info.stages[0].exit_trap;
 				let keeps =
 					info.kind == SpawnKind::Background && bash_job_keeps(unit, info.stages[0].entry);
 				child.outer_loops = fork_loops(vp, keeps);
@@ -7215,6 +7265,7 @@ fn spawn(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, unit: &Arc<Unit>, op: 
 					}
 					let vpid = reserved.get(i).copied();
 					let mut child = vp.child_as(k, cx.store, Arc::clone(unit), stage.entry, fds, vpid);
+					child.exit_trap_due = stage.exit_trap;
 					zsh_subshell_traps(k, cx, &mut child, true);
 					// The shell ran a simple stage's DEBUG trap.
 					mark_debug_done(unit, &mut child.frames, stage.entry);
@@ -7803,6 +7854,7 @@ fn start_coproc(
 	fds.set(0, Some(FdRef::mem(in_r)));
 	fds.set(1, Some(FdRef::mem(out_w)));
 	let mut child = vp.child(k, cx.store, Arc::clone(unit), entry, fds);
+	child.exit_trap_due = unit.spawns[op.a as usize].stages[0].exit_trap;
 	child.outer_loops = fork_loops(vp, false);
 	zsh_subshell_traps(k, cx, &mut child, false);
 	if !job_control(k, cx, vp) {
@@ -7842,7 +7894,9 @@ fn start_coproc(
 			break;
 		}
 	}
-	vp.coprocs.push(Coproc { vpid, name, read, write });
+	vp.rare_mut()
+		.coprocs
+		.push(Coproc { vpid, name, read, write });
 	vp.status = 0;
 }
 
@@ -7853,12 +7907,12 @@ fn start_coproc(
 /// then.)
 pub fn reap_coproc(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, waited: Vpid) {
 	let mut i = 0;
-	while i < vp.coprocs.len() {
-		if vp.coprocs[i].vpid != waited {
+	while i < vp.coprocs().len() {
+		if vp.coprocs()[i].vpid != waited {
 			i += 1;
 			continue;
 		}
-		let co = vp.coprocs.remove(i);
+		let co = vp.rare_mut().coprocs.remove(i);
 		vp.fds.set(co.read, None);
 		vp.fds.set(co.write, None);
 		let mut pid_name = co.name.clone();
@@ -7893,7 +7947,7 @@ pub fn reap_coproc(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, waited: Vpid
 /// coprocess's end, `NAME[0]`/`NAME[1]` becomes -1 (bash `coproc_checkfd`).
 pub fn coproc_fd_closed(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, fd: i32) {
 	let mut hits = Vec::new();
-	for co in &mut vp.coprocs {
+	for co in vp.rare.iter_mut().flat_map(|r| r.coprocs.iter_mut()) {
 		if co.read == fd {
 			co.read = -1;
 			hits.push((co.name.clone(), b"0"));

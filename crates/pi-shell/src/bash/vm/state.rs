@@ -253,12 +253,107 @@ impl Var {
 /// assignment, and the default hasher dominated the dispatch loop.
 pub type VarMap = HashMap<BString, Option<Var>, DefaultHashBuilder>;
 
+/// A scope's [`VarMap`], shared until either side writes, as an [`Image`]
+/// is: a copy of a vproc's scopes (a fork's, a child pass's:
+/// [`super::redir::enter_child`]) costs a pointer per scope, and
+/// [`Self::same`] tells an untouched scope from its copy without reading
+/// it. Reads go through `Deref`; every write through the methods here,
+/// which copy the map first when another holder still shares it. Stored and
+/// imaged as the map itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScopeVars(std::sync::Arc<VarMap>);
+
+impl ScopeVars {
+	/// The map, for a write: copied first when it is still shared.
+	pub fn make_mut(&mut self) -> &mut VarMap {
+		std::sync::Arc::make_mut(&mut self.0)
+	}
+
+	/// Whether `self` and `other` are one map, untouched since one was
+	/// copied from the other.
+	pub fn same(&self, other: &Self) -> bool {
+		std::sync::Arc::ptr_eq(&self.0, &other.0)
+	}
+
+	/// Bind `name` to `var` (`None`: declared local, unset).
+	pub fn insert(&mut self, name: BString, var: Option<Var>) {
+		self.make_mut().insert(name, var);
+	}
+
+	/// Remove `name`'s binding; a map that does not bind it is not copied.
+	pub fn remove(&mut self, name: &[u8]) {
+		if self.0.contains_key(name) {
+			self.make_mut().remove(name);
+		}
+	}
+
+	/// `name`'s variable, for a change in place (`None`: not bound, or
+	/// declared and unset); a map that does not bind it is not copied.
+	pub fn var_mut(&mut self, name: &[u8]) -> Option<&mut Var> {
+		if !self.0.contains_key(name) {
+			return None;
+		}
+		self.make_mut().get_mut(name)?.as_mut()
+	}
+
+	/// Remove every binding.
+	pub fn clear(&mut self) {
+		if !self.0.is_empty() {
+			self.make_mut().clear();
+		}
+	}
+}
+
+impl std::ops::Deref for ScopeVars {
+	type Target = VarMap;
+
+	fn deref(&self) -> &VarMap {
+		&self.0
+	}
+}
+
+impl From<VarMap> for ScopeVars {
+	fn from(vars: VarMap) -> Self {
+		Self(std::sync::Arc::new(vars))
+	}
+}
+
+impl<'a> IntoIterator for &'a ScopeVars {
+	type IntoIter = <&'a VarMap as IntoIterator>::IntoIter;
+	type Item = (&'a BString, &'a Option<Var>);
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.0.iter()
+	}
+}
+
+impl IntoIterator for ScopeVars {
+	type IntoIter = <VarMap as IntoIterator>::IntoIter;
+	type Item = (BString, Option<Var>);
+
+	fn into_iter(self) -> Self::IntoIter {
+		std::sync::Arc::unwrap_or_clone(self.0).into_iter()
+	}
+}
+
+impl Serialize for ScopeVars {
+	fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+		self.0.serialize(s)
+	}
+}
+
+impl<'de> Deserialize<'de> for ScopeVars {
+	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+		VarMap::deserialize(d).map(Self::from)
+	}
+}
+
 /// A function's local scope, or the temporary environment of a builtin
 /// (`IFS=: read …`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
 	/// Local variables (`None`: declared local, unset).
-	pub vars:       VarMap,
+	pub vars:       ScopeVars,
 	/// Positional parameters of a function call (`None`: inherited).
 	pub positional: Option<Vec<BString>>,
 	/// Function name (`FUNCNAME`); `None` for a temporary environment.
@@ -362,6 +457,10 @@ pub struct Root {
 	/// code that holds the root but not the kernel (a zsh function's trap
 	/// scope ending as its frame pops names its `TRAPNAL` functions by it).
 	platform:          crate::bash::ids::Platform,
+	/// While a child pass runs on the root vproc ([`Self::begin_child`]):
+	/// each record it wrote, with the value the record had before its first
+	/// write (`None`: absent), to be put back ([`Self::end_child`]).
+	child_pass:        Option<Vec<(KeyBuf, Option<Record>)>>,
 }
 
 /// The root vproc's fields the interpreter updates in place (`vp.status = …`
@@ -576,9 +675,108 @@ impl Root {
 	/// Apply `change` to the store now; a failure is kept
 	/// ([`Self::fail`]).
 	pub fn write(&mut self, store: &mut dyn StateStore, change: Change<'_>) {
+		if self.child_pass.is_some() {
+			debug_assert!(!matches!(change, Change::Del(Key::Scope(_))), "a child pass pops no scope");
+			self.journal_prior(store, change.key());
+		}
 		self.note(&change);
 		if let Err(err) = store.apply(change) {
 			self.fail(err);
+		}
+	}
+
+	/// Keep what `key` holds before a child pass's first write to it
+	/// ([`Self::child_pass`]). A scope record is not kept: a pass pushes and
+	/// pops none, and a lazy scope it made real ([`Self::materialize`])
+	/// holds nothing either way.
+	#[cold]
+	#[inline(never)]
+	fn journal_prior(&mut self, store: &mut dyn StateStore, key: Key<'_>) {
+		if matches!(key, Key::Scope(_))
+			|| self
+				.child_pass
+				.as_ref()
+				.is_some_and(|j| j.iter().any(|(k, _)| key == k.as_key()))
+		{
+			return;
+		}
+		let prior = match store.get(key) {
+			Ok(rec) => rec.cloned(),
+			Err(err) => {
+				self.fail(err);
+				return;
+			},
+		};
+		if let Some(journal) = self.child_pass.as_mut() {
+			journal.push((key.to_buf(), prior));
+		}
+	}
+
+	/// Start a child pass on the root vproc ([`super::redir::enter_child`]):
+	/// the records of `writes`, what the command's child wrote in its
+	/// earlier passes (`None`: removed), are written, and every write until
+	/// [`Self::end_child`] is put back then. The pass reads and writes the
+	/// root's own state, so it copies nothing and costs what it writes.
+	pub fn begin_child(
+		&mut self,
+		store: &mut dyn StateStore,
+		writes: Vec<(KeyBuf, Option<Record>)>,
+	) {
+		debug_assert!(self.child_pass.is_none(), "child passes do not nest");
+		self.child_pass = Some(Vec::with_capacity(writes.len()));
+		for (key, rec) in writes {
+			let change = match rec {
+				Some(r) => Change::Put(key.as_key(), r),
+				None => Change::Del(key.as_key()),
+			};
+			self.write(store, change);
+			self.forget_derived(key.as_key());
+		}
+	}
+
+	/// End the child pass [`Self::begin_child`] started: each record it
+	/// wrote goes back to what it held before, and what the pass left there
+	/// is returned for the next pass.
+	pub fn end_child(&mut self, store: &mut dyn StateStore) -> Vec<(KeyBuf, Option<Record>)> {
+		let Some(journal) = self.child_pass.take() else {
+			return Vec::new();
+		};
+		let mut wrote = Vec::with_capacity(journal.len());
+		for (key, prior) in journal {
+			let now = match store.get(key.as_key()) {
+				Ok(rec) => rec.cloned(),
+				Err(err) => {
+					self.fail(err);
+					None
+				},
+			};
+			let change = match prior {
+				Some(r) => Change::Put(key.as_key(), r),
+				None => Change::Del(key.as_key()),
+			};
+			self.write(store, change);
+			self.forget_derived(key.as_key());
+			wrote.push((key, now));
+		}
+		wrote
+	}
+
+	/// Drop the facts derived from `key`, written as a plain record (a child
+	/// pass's write or its undo): [`Self::set_var`] and [`Self::set_record`]
+	/// keep them for the engine's other writes.
+	fn forget_derived(&mut self, key: Key<'_>) {
+		match key {
+			Key::Var(name) if is_locale_name(name) => self.locale_gen += 1,
+			Key::Opt(opt) => {
+				self.opts_known &= !opt_bit(opt);
+				self.opts_gen += 1;
+			},
+			Key::ZshOpt(opt) => {
+				self.zopts_known.set(opt, false);
+				self.opts_gen += 1;
+			},
+			Key::Misc(MiscKey::DisabledBuiltins) => self.builtins_disabled = None,
+			_ => {},
 		}
 	}
 
@@ -1655,7 +1853,7 @@ pub fn edit_seen(
 ) -> Result<bool, StoreError> {
 	match level_at(root, store, vp, name, level)? {
 		Some(In::Vec(i)) => {
-			return Ok(match vp.scopes[i].vars.get_mut(name).and_then(Option::as_mut) {
+			return Ok(match vp.scopes[i].vars.var_mut(name) {
 				Some(var) => {
 					edit.apply(var);
 					true
@@ -3034,10 +3232,10 @@ fn read_scope(store: &mut dyn StateStore, vp: &Vproc, i: usize) -> Result<Scope,
 		vars.insert(name, var);
 	}
 	Ok(Scope {
-		vars,
+		vars:       vars.into(),
 		positional: scope_positional(store, vp, i)?,
-		func: scope_func(store, vp, i)?,
-		zsh: scope_zsh(store, vp, i)?,
+		func:       scope_func(store, vp, i)?,
+		zsh:        scope_zsh(store, vp, i)?,
 	})
 }
 
@@ -3327,15 +3525,15 @@ pub fn sync_root(root: &mut Root, store: &mut dyn StateStore, vp: &mut Vproc) {
 	{
 		write_jobs(root, store, &mut vp.jobs);
 	}
-	if vp.getopts != root.synced.getopts {
-		root.synced.getopts.clone_from(&vp.getopts);
-		let rec = (vp.getopts != GetoptsState::default())
-			.then(|| Record::Words(encode_getopts(&vp.getopts)));
+	if *vp.getopts() != root.synced.getopts {
+		root.synced.getopts.clone_from(vp.getopts());
+		let rec =
+			(*vp.getopts() != GetoptsState::NONE).then(|| Record::Words(encode_getopts(vp.getopts())));
 		root.set_record(store, KeyBuf::Misc(MiscKey::Getopts), rec);
 	}
-	if vp.rlimits != root.synced.rlimits {
-		root.synced.rlimits.clone_from(&vp.rlimits);
-		let rec = (!vp.rlimits.is_empty()).then(|| Record::Words(encode_rlimits(&vp.rlimits)));
+	if vp.rlimits() != root.synced.rlimits.as_slice() {
+		root.synced.rlimits = vp.rlimits().to_vec();
+		let rec = (!vp.rlimits().is_empty()).then(|| Record::Words(encode_rlimits(vp.rlimits())));
 		root.set_record(store, KeyBuf::Misc(MiscKey::Rlimits), rec);
 	}
 }
@@ -3426,16 +3624,16 @@ pub fn load_root(
 		stage_words: false,
 		bgp,
 	};
-	vp.getopts = decode_getopts(&words(store, MiscKey::Getopts)?);
-	vp.rlimits = decode_rlimits(&words(store, MiscKey::Rlimits)?);
+	vp.set_getopts(decode_getopts(&words(store, MiscKey::Getopts)?));
+	vp.set_rlimits(decode_rlimits(&words(store, MiscKey::Rlimits)?));
 	root.synced = Synced {
 		status:     vp.status,
 		pipestatus: vp.pipestatus.clone(),
 		last_bg:    vp.last_bg,
 		job_ids:    vp.jobs.list.iter().map(|j| j.id).collect(),
 		job_marks:  (vp.jobs.current, vp.jobs.previous, vp.jobs.chld),
-		getopts:    vp.getopts.clone(),
-		rlimits:    vp.rlimits.clone(),
+		getopts:    vp.getopts().clone(),
+		rlimits:    vp.rlimits().to_vec(),
 	};
 	Ok(())
 }
@@ -4151,7 +4349,7 @@ mod tests {
 		let bound = |func: Option<&str>, value: &str, attrs: Attrs| {
 			let mut vars = VarMap::default();
 			vars.insert(BString::from("x"), Some(Var::scalar(value, attrs)));
-			Scope { vars, func: func.map(BString::from), ..Scope::default() }
+			Scope { vars: vars.into(), func: func.map(BString::from), ..Scope::default() }
 		};
 		let temp = || bound(None, "3", Attrs::EXPORT);
 		let call = || bound(Some("f"), "3", Attrs::EXPORT.with(Attrs::TEMP));
@@ -4231,7 +4429,7 @@ mod tests {
 			store_var(&mut root, &mut store, v, b"BASH_TRAPSIG", seven, Level::Global);
 			let mut vars = VarMap::default();
 			vars.insert(BString::from("BASH_TRAPSIG"), Some(Var::scalar("10", Attrs::NONE)));
-			push_scope(&mut root, &mut store, v, Scope { vars, ..Scope::default() });
+			push_scope(&mut root, &mut store, v, Scope { vars: vars.into(), ..Scope::default() });
 			unset_var(&mut root, &mut store, v, b"BASH_TRAPSIG", OwnLocals);
 			assert_eq!(lookup(&root, &mut store, v, b"BASH_TRAPSIG").unwrap(), None, "the trap's");
 			assert!(
@@ -4325,8 +4523,8 @@ mod tests {
 			.add(JobId(4), Vpid(1 << 30), "sleep 1 &".into(), false, "/".into());
 		vp.jobs.get_mut(1).unwrap().os_pid = Some(4242);
 		vp.jobs.chld = 2;
-		vp.getopts = GetoptsState { optind: Some("2".into()), next: Some((1, 2)), at: None };
-		vp.rlimits = vec![(Rlimit::Nofile, Some(64), None)];
+		vp.set_getopts(GetoptsState { optind: Some("2".into()), next: Some((1, 2)), at: None });
+		vp.set_rlimits(vec![(Rlimit::Nofile, Some(64), None)]);
 		sync_root(&mut root, &mut store, &mut vp);
 		let misc = |store: &crate::bash::MemStore, key| store.record(Key::Misc(key)).cloned();
 		assert_eq!(misc(&store, MiscKey::Status), Some(Record::Misc("3".into())));
@@ -4357,16 +4555,16 @@ mod tests {
 		assert_eq!(fresh.pipestatus, vp.pipestatus);
 		assert_eq!(fresh.last_bg, vp.last_bg);
 		assert_eq!(fresh.jobs, vp.jobs);
-		assert_eq!(fresh.getopts, vp.getopts);
-		assert_eq!(fresh.rlimits, vp.rlimits);
+		assert_eq!(fresh.getopts(), vp.getopts());
+		assert_eq!(fresh.rlimits(), vp.rlimits());
 		// Loaded fields count as written: no rewrite.
 		let before = store.clone();
 		sync_root(&mut root2, &mut store, &mut fresh);
 		assert_eq!(store, before);
 		vp.jobs.remove(1);
 		vp.jobs.chld = 0;
-		vp.getopts = GetoptsState::default();
-		vp.rlimits.clear();
+		vp.set_getopts(GetoptsState::NONE);
+		vp.set_rlimits(Vec::new());
 		sync_root(&mut root, &mut store, &mut vp);
 		assert_eq!(store.record(Key::Job(JobId(4))), None);
 		assert_eq!(misc(&store, MiscKey::JobCurrent), None);

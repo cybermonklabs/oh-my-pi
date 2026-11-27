@@ -60,7 +60,7 @@ use crate::bash::{
 /// Raised with every change to it (a field of a serialized type, an enum
 /// variant), and when [`IntrinsicId`](crate::bash::ids::IntrinsicId) gains
 /// a variant: an exec target holds it by index.
-pub const FRAMES_VERSION: u32 = 60;
+pub const FRAMES_VERSION: u32 = 61;
 
 const MAGIC: [u8; 4] = *b"OBF1";
 
@@ -275,9 +275,10 @@ struct ProcImage {
 	pending_traps: SigSet,
 	stopped:       bool,
 	transient:     bool,
-	/// This vproc's EXIT trap has already been started (a forked subshell
-	/// has no `Run` to keep the flag on).
-	exit_trap_run: bool,
+	/// This vproc still runs its EXIT trap when it ends (a forked subshell
+	/// has no `Run` to keep the flag on, and a forked compound bash ends
+	/// with `sh_exit` never runs one).
+	exit_trap_due: bool,
 	procsubs:      Vec<(u32, i32)>,
 	coprocs:       Vec<super::proc::Coproc>,
 	restore_opts:  Vec<BString>,
@@ -691,8 +692,8 @@ impl Shell {
 					.filter(|(_, facts)| !facts.is_empty())
 					.collect(),
 				last_bg: p.last_bg,
-				getopts: p.getopts.clone(),
-				rlimits: p.rlimits.clone(),
+				getopts: p.getopts().clone(),
+				rlimits: p.rlimits().to_vec(),
 			});
 			procs.push(ProcImage {
 				vpid: p.vpid,
@@ -705,10 +706,10 @@ impl Shell {
 				pending_traps: p.pending_traps,
 				stopped: p.stopped,
 				transient: p.transient,
-				exit_trap_run: p.exit_trap_run,
-				procsubs: p.procsubs.clone(),
-				coprocs: p.coprocs.clone(),
-				restore_opts: p.restore_opts.clone(),
+				exit_trap_due: p.exit_trap_due,
+				procsubs: p.procsubs().to_vec(),
+				coprocs: p.coprocs().to_vec(),
+				restore_opts: p.rare().restore_opts.clone(),
 				trace_base: p.trace_base,
 				subshell: p.subshell,
 				outer_loops: p.outer_loops,
@@ -1018,8 +1019,8 @@ impl Shell {
 					}
 				}
 				vp.last_bg = f.last_bg;
-				vp.getopts = f.getopts;
-				vp.rlimits = f.rlimits;
+				vp.set_getopts(f.getopts);
+				vp.set_rlimits(f.rlimits);
 				vp
 			} else {
 				let mut vp = Vproc::new(vpid, p.parent, fds, loaded.cwd.clone(), None, p.transient);
@@ -1027,17 +1028,20 @@ impl Shell {
 				vp.pipestatus.clone_from(&loaded.pipestatus);
 				vp.jobs.clone_from(&loaded.jobs);
 				vp.last_bg = loaded.last_bg;
-				vp.getopts.clone_from(&loaded.getopts);
-				vp.rlimits.clone_from(&loaded.rlimits);
+				vp.set_getopts(loaded.getopts().clone());
+				vp.set_rlimits(loaded.rlimits().to_vec());
 				vp
 			};
 			vp.out = p.out.into();
 			vp.pending_traps = p.pending_traps;
 			vp.stopped = p.stopped;
-			vp.exit_trap_run = p.exit_trap_run;
-			vp.procsubs = p.procsubs;
-			vp.coprocs = p.coprocs;
-			vp.restore_opts = p.restore_opts;
+			vp.exit_trap_due = p.exit_trap_due;
+			if !p.procsubs.is_empty() || !p.coprocs.is_empty() || !p.restore_opts.is_empty() {
+				let rare = vp.rare_mut();
+				rare.procsubs = p.procsubs;
+				rare.coprocs = p.coprocs;
+				rare.restore_opts = p.restore_opts;
+			}
 			vp.trace_base = p.trace_base;
 			vp.subshell = p.subshell;
 			vp.outer_loops = p.outer_loops;
@@ -1192,6 +1196,8 @@ impl Shell {
 									Box::new(ScratchZsh { more: img.redir_more, ..ScratchZsh::default() })
 								}),
 								var_fds: img.var_fds.map(Box::new),
+								// Not imaged ([`ScratchIo::child`]).
+								child: None,
 							}))
 						};
 						Some(Box::new(Scratch {

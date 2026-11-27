@@ -405,14 +405,14 @@ pub fn optind_enter(
 		.and_then(state::Var::as_scalar)
 		.map(BString::from);
 	let fresh = text.as_ref().is_some_and(|t| t.as_slice() == b"1");
-	let saved = if fresh && vp.getopts == GetoptsState::default() {
+	let saved = if fresh && *vp.getopts() == GetoptsState::NONE {
 		None
 	} else {
-		let next = vp.getopts.next.filter(|_| vp.getopts.optind == text);
+		let next = vp.getopts().next.filter(|_| vp.getopts().optind == text);
 		Some(Box::new(GetoptsState { optind: text, next, at: None }))
 	};
 	if !state::zsh_option(root, store, vp, ZshOpt::Posixbuiltins)? {
-		vp.getopts = GetoptsState::default();
+		vp.set_getopts(GetoptsState::NONE);
 		set_optind(root, store, vp, b"1")?;
 	}
 	Ok(saved)
@@ -433,7 +433,7 @@ pub fn optind_leave(
 	let saved = saved.map_or_else(GetoptsState::default, |s| *s);
 	let text = saved.optind.clone().unwrap_or_else(|| BString::from("1"));
 	set_optind(root, store, vp, &text)?;
-	vp.getopts = saved;
+	vp.set_getopts(saved);
 	Ok(())
 }
 
@@ -472,7 +472,7 @@ pub fn getopts(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		.and_then(|v| v.to_str().ok().and_then(|s| s.trim().parse().ok()))
 		.unwrap_or(0);
 	// zsh's `optcind`: kept while `OPTIND` is what the last call left.
-	let state = &ctx.vp.getopts;
+	let state = ctx.vp.getopts();
 	let mut optcind: usize = if zoptind < 1 {
 		zoptind = 1;
 		0
@@ -576,8 +576,9 @@ pub fn getopts(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 		0
 	};
 	let ind_text = BString::from(zoptind.to_string());
-	ctx.vp.getopts.optind = Some(ind_text.clone());
-	ctx.vp.getopts.next =
+	let state = &mut ctx.vp.rare_mut().getopts;
+	state.optind = Some(ind_text.clone());
+	state.next =
 		Some((u32::try_from(zoptind).unwrap_or(u32::MAX), u32::try_from(optcind).unwrap_or(0)));
 	let r = zx(ctx, |ex| {
 		params::assignsparam(ex, b"OPTIND", &ind_text, 0)?;
@@ -850,7 +851,7 @@ pub fn read(ctx: &mut Ctx<'_, '_>, ops: &Ops, args: &[BString]) -> R {
 	let keys = ops.isset(b'k') || ops.isset(b'q');
 	let fd = if ops.isset(b'p') || ops.arg(b'u') == Some(b"p") {
 		// The coprocess's output.
-		let Some(co) = ctx.vp.coprocs.last() else {
+		let Some(co) = ctx.vp.coprocs().last() else {
 			ctx.usage("-p: no coprocess");
 			return done(1);
 		};

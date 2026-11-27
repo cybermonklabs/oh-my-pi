@@ -333,7 +333,17 @@ pub fn exec(
 						&& op.flags & ir::Op::CAT == 0
 						&& super::redir::null_forks(&unit.redirs[list as usize]);
 					let owner = super::redir::Owner::Simple { null_forks };
-					let res = super::redir::apply(k, vp, cx, unit, list, line, owner);
+					// bash makes the redirections of a command it forks for
+					// first (an external, a name not found, `command X`, a null
+					// command that redirects fd 0 or a `{var}`) in the fork: what
+					// their words write and the `$RANDOM` they draw are the
+					// fork's, and the shell's state and sequence stay as they were
+					// ([`super::redir::apply_in_child`]).
+					let res = if null_forks || forks_for(k, cx, vp) {
+						super::redir::apply_in_child(k, vp, cx, unit, list, line, owner)
+					} else {
+						super::redir::apply(k, vp, cx, unit, list, line, owner)
+					};
 					// Where the hidden scope goes back, for `forget_var_fds`.
 					let scoped = hidden.is_some().then_some(at);
 					if let Some(scope) = hidden {
@@ -812,8 +822,12 @@ fn plain_statement(
 	exec::raise_element_level(vp);
 	catch_builtin(vp);
 	// The temporary scope the staged command gives a builtin.
-	let scope =
-		Scope { vars: VarMap::default(), positional: None, func: None, zsh: None };
+	let scope = Scope {
+		vars:       Default::default(),
+		positional: None,
+		func:       None,
+		zsh:        None,
+	};
 	state::push_scope(&mut k.root, cx.store, vp, scope);
 	let (res, chunks, log) = {
 		let mut ctx = Ctx::new(k, cx, vp, &[], line, id.into());
@@ -1128,7 +1142,7 @@ fn expand(
 		// prefix steers the lookup).
 		st(vp).scoped = true;
 		let scope = Scope {
-			vars:       VarMap::default(),
+			vars:       Default::default(),
 			positional: None,
 			func:       None,
 			zsh:        None,
@@ -2971,7 +2985,7 @@ fn dispatch(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, op: Op, line: u32) 
 				vpid: vp.vpid,
 				umask,
 				sigmask_ign,
-				rlimits: &vp.rlimits,
+				rlimits: vp.rlimits(),
 				lineage: vp.lineage,
 				redirs,
 				ctty: vp
@@ -4163,8 +4177,8 @@ fn push_call(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, callee: Callee, ca
 				return Flow::Discard(1);
 			},
 		}
-	} else if vp.getopts != super::proc::GetoptsState::default() {
-		frame.getopts = Some(Box::new(vp.getopts.clone()));
+	} else if *vp.getopts() != super::proc::GetoptsState::NONE {
+		frame.getopts = Some(Box::new(vp.getopts().clone()));
 	}
 	// A function with the trace attribute (`declare -ft`) inherits the
 	// DEBUG and RETURN traps.
@@ -4224,7 +4238,8 @@ fn push_call(k: &mut Kernel, vp: &mut Vproc, cx: &mut Cx<'_>, callee: Callee, ca
 	{
 		k.fail(err);
 	}
-	let scope = Scope { vars, positional: Some(args), func: Some(argzero.unwrap_or(name)), zsh };
+	let scope =
+		Scope { vars: vars.into(), positional: Some(args), func: Some(argzero.unwrap_or(name)), zsh };
 	state::push_scope(&mut k.root, cx.store, vp, scope);
 	// `$?` at the function's entry is the caller's (bash's
 	// `execute_function` leaves `last_command_exit_value` alone).
@@ -4584,7 +4599,7 @@ fn run_builtin(
 	if !st(vp).scoped {
 		st(vp).scoped = true;
 		let scope = Scope {
-			vars:       VarMap::default(),
+			vars:       Default::default(),
 			positional: None,
 			func:       None,
 			zsh:        None,

@@ -62,3 +62,22 @@ fn bad_name_and_usage() {
 		 name [arg ...]\n"
 	);
 }
+
+/// A fork takes the shell's `getopts` progress with it: the next `getopts`
+/// in the child reads the option after the one the shell stopped at, not
+/// the first again. It is the vproc's own state, which the fork copies as
+/// `fork(2)` copies memory, so the child's scan never reaches the shell.
+/// Goldens: bash 5.3.20 (`o=b`, `OPTIND=2`: the child finishes the `-ab`
+/// word the shell was in the middle of).
+#[test]
+fn a_fork_keeps_the_shells_getopts_progress() {
+	// A subshell, a command substitution and a background group; then the
+	// shell's own next call, which the children did not move.
+	let (out, err, _) = run(
+		"set -- -ab; getopts ab o; ( getopts ab o; echo \"sub $o $OPTIND\" ); x=$(getopts ab o; \
+		 echo \"$o $OPTIND\"); echo \"sq $x\"; { getopts ab o; echo \"bg $o $OPTIND\"; } & wait; \
+		 getopts ab o; echo \"shell $o $OPTIND\"",
+	);
+	assert_eq!(out, "sub b 2\nsq b 2\nbg b 2\nshell b 2\n");
+	assert_eq!(err, "");
+}

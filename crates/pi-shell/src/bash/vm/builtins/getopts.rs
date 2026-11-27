@@ -64,7 +64,7 @@ pub fn getopts(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	let current = ctx.scalar(b"OPTIND")?;
 	let value = atoi(current.as_ref().map_or(&[][..], |v| v.as_slice()));
 	let at = optind_scope(ctx)?;
-	let state = &ctx.vp.getopts;
+	let state = ctx.vp.getopts();
 	let (mut optind, mut next) = if current == state.optind && at == state.at {
 		(value, state.next)
 	} else if value < 0 || value == 1 {
@@ -75,12 +75,14 @@ pub fn getopts(ctx: &mut Ctx<'_, '_>, args: &[BString]) -> R {
 	};
 	let found = scan(ctx, spec, operands, opterr, &mut optind, &mut next);
 	let shown = BString::from(optind.to_string());
-	ctx.vp.getopts.optind = Some(shown.clone());
-	ctx.vp.getopts.next = next;
+	let state = &mut ctx.vp.rare_mut().getopts;
+	state.optind = Some(shown.clone());
+	state.next = next;
 	if let Err(d) = assign(ctx.k, ctx.vp, ctx.cx, b"OPTIND", shown, Level::Dynamic) {
 		ctx.diag(d);
 	}
-	ctx.vp.getopts.at = optind_scope(ctx)?;
+	let at = optind_scope(ctx)?;
+	ctx.vp.rare_mut().getopts.at = at;
 	match found {
 		Found::End => {
 			unset_optarg(ctx)?;

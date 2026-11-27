@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use crate::bash::{
 	ids::{ModeId, Platform, UnitId, Vpid},
 	ir::{self, Unit},
-	syntax::{CompleteCommand, Features, NO_ALIASES, TextMode, tree::Tree},
+	syntax::{CompleteCommand, Features, NO_ALIASES, ParseErrorKind, TextMode, tree::Tree},
 	vm::{ArithCache, PatternCache, TextKind, ZshPatternCache},
 };
 
@@ -23,6 +23,38 @@ pub struct TextError {
 	pub line: u32,
 	/// bash's message.
 	pub msg:  BString,
+	/// Who refused the text.
+	pub by:   Refusal,
+}
+
+/// Who refused text parsed at run time ([`TextError::by`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+	/// The parser, where bash prints the message alone (the input ended
+	/// inside a quote or a `$(`).
+	Parser,
+	/// The parser, at a token: bash echoes the line of the text that holds
+	/// it (byte `at` of the text) after the message.
+	Token {
+		/// The token's first byte in the text.
+		at: usize,
+	},
+	/// This engine: a construct it cannot run yet, or a limit met while
+	/// lowering the text.
+	Engine,
+}
+
+impl TextError {
+	/// The parser's refusal `e` of text that starts `skip` bytes into what
+	/// it parsed.
+	fn parse(e: &crate::bash::syntax::ParseError, skip: usize) -> Self {
+		let by = if e.echoes_line() {
+			Refusal::Token { at: (e.span.lo as usize).saturating_sub(skip) }
+		} else {
+			Refusal::Parser
+		};
+		Self { line: e.line, msg: BString::from(e.bash_msg()), by }
+	}
 }
 
 /// Engine-wide settings.
@@ -293,6 +325,7 @@ impl Engine {
 		let unsupported = |what: &str| TextError {
 			line: 1,
 			msg:  BString::from(format!("{what}: not supported by this engine yet")),
+			by:   Refusal::Engine,
 		};
 		let unit = match kind {
 			TextKind::Arith | TextKind::ArithUnquoted | TextKind::ArithOperand | TextKind::HereDoc => {
@@ -302,7 +335,7 @@ impl Engine {
 					TextMode::Arith
 				};
 				let (tree, root) = crate::bash::syntax::parse_text(text, Features::NONE, tmode)
-					.map_err(|e| TextError { line: e.line, msg: BString::from(e.bash_msg()) })?;
+					.map_err(|e| TextError::parse(&e, 0))?;
 				let word = crate::bash::syntax::tree::Word::at(&tree, root);
 				// bash's quoting flags for each kind: `Q_DOUBLE_QUOTES` (or
 				// `Q_HERE_DOCUMENT`), `Q_ARITH`.
@@ -325,16 +358,29 @@ impl Engine {
 				// (`parse_string_to_word_list`); here it is the list of a
 				// declaration argument, so the elements lower as written
 				// ones do.
-				let mut src = Vec::with_capacity(text.len() + 14);
-				src.extend_from_slice(b"declare __=(");
+				const PREFIX: &[u8] = b"declare __=(";
+				let mut src = Vec::with_capacity(text.len() + PREFIX.len() + 2);
+				src.extend_from_slice(PREFIX);
 				src.extend_from_slice(text);
 				src.extend_from_slice(b")\n");
 				let mut parser = crate::bash::syntax::Parser::new(&src, Features::NONE, NO_ALIASES);
 				let cc = match parser.next_command() {
 					Some(Ok(cc)) => cc,
-					Some(Err(e)) => {
-						return Err(TextError { line: e.line, msg: BString::from(e.bash_msg()) });
+					// The text left open a construct the wrapper's `)` closed
+					// (`$(`): bash reaches the end of the text inside it, so the
+					// error is the one the text gives without that `)`.
+					Some(Err(e)) if matches!(e.kind, ParseErrorKind::Unmatched(")")) => {
+						let open = &src[..PREFIX.len() + text.len()];
+						let e = match crate::bash::syntax::Parser::new(open, Features::NONE, NO_ALIASES)
+							.next_command()
+						{
+							Some(Err(inner)) => inner,
+							_ => e,
+						};
+						return Err(TextError::parse(&e, PREFIX.len()));
 					},
+					// Line 1 of `src` is line 1 of the text.
+					Some(Err(e)) => return Err(TextError::parse(&e, PREFIX.len())),
 					None => return Err(unsupported("an empty compound array value")),
 				};
 				if parser.next_command().is_some() {
@@ -342,7 +388,7 @@ impl Engine {
 				}
 				let unit = ir::lower_compound(&cc, &src, mode, Features::NONE).map_err(unsupported)?;
 				if let Some(msg) = unit.syntax_abort() {
-					return Err(TextError { line: 1, msg: msg.clone() });
+					return Err(TextError { line: 1, msg: msg.clone(), by: Refusal::Engine });
 				}
 				if observed {
 					let _ = unit.trace_syntax.set(Arc::new(

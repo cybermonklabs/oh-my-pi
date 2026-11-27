@@ -97,7 +97,7 @@ use crate::bash::{
 
 /// IR version; part of the frames header. Raised with every change to a
 /// serialized IR type.
-pub const IR_VERSION: u32 = 21;
+pub const IR_VERSION: u32 = 22;
 
 /// Opcodes.
 #[derive(
@@ -956,6 +956,15 @@ pub struct StageIr {
 	pub entry:       u32,
 	/// `|&`: stderr joins the pipe to the next stage.
 	pub pipe_stderr: bool,
+	/// A fork of this stage runs the forked child's own EXIT trap when it
+	/// ends (bash's `subshell_exit`); without it the child ends with no
+	/// trap, however its body ends (bash's `sh_exit`). bash runs it for a
+	/// `( … )` subshell (`execute_in_subshell`, `execute_cmd.c:1841`), a
+	/// coprocess, a simple command's own fork, and a `{ …; }` group that is
+	/// either async with no pipe or in a pipe and not async
+	/// (`execute_cmd.c:719-729`); every other forked compound runs no trap.
+	/// Always set in a zsh unit, which runs the trap in every fork.
+	pub exit_trap:   bool,
 }
 
 /// One `[[ ]]` primary.

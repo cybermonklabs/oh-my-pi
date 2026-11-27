@@ -641,7 +641,7 @@ pub fn print(ctx: &mut Ctx<'_, '_>, ops: &mut Ops, args: &[BString], func: Func)
 		let u = ops.arg(b'u').map(<[u8]>::to_vec);
 		let fd = if ops.isset(b'p') || u.as_deref() == Some(b"p") {
 			// The coprocess's input.
-			let Some(co) = ctx.vp.coprocs.last() else {
+			let Some(co) = ctx.vp.coprocs().last() else {
 				ctx.usage("-p: no coprocess");
 				return done(1);
 			};

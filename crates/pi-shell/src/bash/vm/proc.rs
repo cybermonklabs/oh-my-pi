@@ -52,12 +52,15 @@ pub struct Vproc {
 	pub stopped:       bool,
 	/// Exit once its frames are done (subshell vprocs).
 	pub transient:     bool,
-	/// Set when this vproc's EXIT trap has been started. A root vproc keeps
-	/// the same flag per run ([`Run::exit_trap_started`]); a forked subshell
-	/// has no `Run`, and its `own_traps`, `trap_frames` and the frame scans
-	/// all go back to their pre-trap values once the trap's frame is popped,
-	/// so without this the trap could start a second time.
-	pub exit_trap_run: bool,
+	/// Whether this vproc's own EXIT trap is still due when it ends.
+	/// Cleared when the trap starts: a root vproc keeps that per run
+	/// ([`Run::exit_trap_started`]), while a forked subshell has no `Run`,
+	/// and its `own_traps`, `trap_frames` and the frame scans all go back
+	/// to their pre-trap values once the trap's frame is popped, so without
+	/// this the trap could start a second time. Cleared at the fork for the
+	/// forked compounds bash ends with `sh_exit`, which run no trap however
+	/// the body ends ([`crate::bash::ir::StageIr::exit_trap`]).
+	pub exit_trap_due: bool,
 	/// Background jobs not yet waited for or reported (and foreground ones
 	/// while no job may be deleted, [`Job::foreground`]), current/previous
 	/// job and the `SIGCHLD` trap runs owed.
@@ -72,19 +75,6 @@ pub struct Vproc {
 		reason = "the boxes move between frames (`Frame::scratch`) and this pool without copying"
 	)]
 	pub spare:         Vec<Box<Scratch>>,
-	/// `getopts` progress between calls.
-	pub getopts:       GetoptsState,
-	/// Open process-substitution fds: `(frame depth, fd)`, the depth being
-	/// the frame count when the op that opened it ran.
-	pub procsubs:      Vec<(u32, i32)>,
-	/// Coprocesses not reaped yet.
-	pub coprocs:       Vec<Coproc>,
-	/// `set -o` states saved by `local -` in functions that returned, to
-	/// restore before the next op.
-	pub restore_opts:  Vec<BString>,
-	/// Limits `ulimit` set in this vproc or inherited from its parent;
-	/// passed to externals, never applied to the host process.
-	pub rlimits:       Vec<(crate::bash::host::Rlimit, Option<u64>, Option<u64>)>,
 	/// Host lineage, inherited from the parent (set by
 	/// [`super::ShellApi::run_subshell_in`]) and passed to externals.
 	pub lineage:       crate::bash::host::Lineage,
@@ -172,6 +162,95 @@ pub struct Vproc {
 	/// ([`Clock`]): its parent's at the fork. `None` for the root vproc,
 	/// whose are the kernel's.
 	pub clock:         Option<Clock>,
+	/// State most vprocs never use ([`VprocRare`]): `None` until one of it
+	/// is set. Read through [`Vproc::rare`], written through
+	/// [`Vproc::rare_mut`].
+	pub rare:          Option<Box<VprocRare>>,
+}
+
+/// What `ulimit` set ([`VprocRare::rlimits`]): a resource with its soft and
+/// hard limits (`None`: unlimited).
+pub type Rlimits = Vec<(crate::bash::host::Rlimit, Option<u64>, Option<u64>)>;
+
+/// A vproc's state that most vprocs never use: `getopts` progress, process
+/// substitutions, coprocesses, `local -` saves and `ulimit` values
+/// ([`Vproc::rare`]). Boxed, so an idle vproc pays one pointer for it in
+/// place of 144 B. New state that most vprocs leave empty goes here, not in
+/// `Vproc`: a held `local IFS` split value or a job list's kept record, for
+/// instance, each 8 B of every idle vproc as a field of its own.
+#[derive(Clone, Debug, Default)]
+pub struct VprocRare {
+	/// `getopts` progress between calls.
+	pub getopts:      GetoptsState,
+	/// Open process-substitution fds: `(frame depth, fd)`, the depth being
+	/// the frame count when the op that opened it ran.
+	pub procsubs:     Vec<(u32, i32)>,
+	/// Coprocesses not reaped yet.
+	pub coprocs:      Vec<Coproc>,
+	/// `set -o` states saved by `local -` in functions that returned, to
+	/// restore before the next op.
+	pub restore_opts: Vec<BString>,
+	/// Limits `ulimit` set in this vproc or inherited from its parent;
+	/// passed to externals, never applied to the host process.
+	pub rlimits:      Rlimits,
+}
+
+/// [`Vproc::rare`] of a vproc that has none.
+static NO_RARE: VprocRare = VprocRare {
+	getopts:      GetoptsState::NONE,
+	procsubs:     Vec::new(),
+	coprocs:      Vec::new(),
+	restore_opts: Vec::new(),
+	rlimits:      Vec::new(),
+};
+
+impl Vproc {
+	/// The state most vprocs never use ([`VprocRare`]); all empty when the
+	/// vproc has none.
+	pub fn rare(&self) -> &VprocRare {
+		self.rare.as_deref().unwrap_or(&NO_RARE)
+	}
+
+	/// The same, to write: made (empty) on first use.
+	pub fn rare_mut(&mut self) -> &mut VprocRare {
+		self.rare.get_or_insert_with(Box::default)
+	}
+
+	/// `getopts` progress between calls ([`VprocRare::getopts`]).
+	pub fn getopts(&self) -> &GetoptsState {
+		&self.rare().getopts
+	}
+
+	/// Open process-substitution fds ([`VprocRare::procsubs`]).
+	pub fn procsubs(&self) -> &[(u32, i32)] {
+		&self.rare().procsubs
+	}
+
+	/// Coprocesses not reaped yet ([`VprocRare::coprocs`]).
+	pub fn coprocs(&self) -> &[Coproc] {
+		&self.rare().coprocs
+	}
+
+	/// The `ulimit` values externals get ([`VprocRare::rlimits`]).
+	pub fn rlimits(&self) -> &[(crate::bash::host::Rlimit, Option<u64>, Option<u64>)] {
+		&self.rare().rlimits
+	}
+
+	/// Sets the `getopts` progress; a vproc without rare state keeps none
+	/// for the empty progress.
+	pub fn set_getopts(&mut self, getopts: GetoptsState) {
+		if self.rare.is_some() || getopts != GetoptsState::NONE {
+			self.rare_mut().getopts = getopts;
+		}
+	}
+
+	/// Sets the `ulimit` values; a vproc without rare state keeps none for
+	/// no values.
+	pub fn set_rlimits(&mut self, rlimits: Rlimits) {
+		if self.rare.is_some() || !rlimits.is_empty() {
+			self.rare_mut().rlimits = rlimits;
+		}
+	}
 }
 
 /// A forked vproc's `$RANDOM` generator and `$SECONDS` clock
@@ -780,6 +859,11 @@ impl std::ops::DerefMut for JobList {
 		self.reaped = false;
 		&mut self.jobs
 	}
+}
+
+impl GetoptsState {
+	/// No progress: the next `getopts` starts at `OPTIND`.
+	pub const NONE: Self = Self { optind: None, next: None, at: None };
 }
 
 /// The job table of one shell: bash's `jobs` array with `js.j_current` and
@@ -2605,12 +2689,17 @@ pub struct ScratchIo {
 	/// ([`Saves::vars`]). No other op takes one. Boxed: few ops have one.
 	#[expect(clippy::box_collection, reason = "8 B where a Vec is 24: the size guard below")]
 	pub var_fds: Option<Box<Vec<VarFd>>>,
+	/// The child bash forks for the op's redirections, which all their
+	/// words and expansion passes share ([`super::redir::ChildState`]).
+	/// Not imaged, like [`Self::walk`]: a restored op starts the child over
+	/// from the shell's state. Boxed: few ops have one.
+	pub child:   Option<Box<super::redir::ChildState>>,
 }
 
 impl ScratchIo {
 	/// Clear for the next op, keeping the vectors' allocations.
 	fn clear(&mut self) {
-		let Self { redir, saved, probes, probing, search, input, walk, zsh, var_fds } = self;
+		let Self { redir, saved, probes, probing, search, input, walk, zsh, var_fds, child } = self;
 		*redir = RedirProgress::default();
 		saved.clear();
 		probes.clear();
@@ -2622,6 +2711,7 @@ impl ScratchIo {
 			z.clear();
 		}
 		*var_fds = None;
+		*child = None;
 	}
 
 	/// The op's zsh I/O progress, created on first use.
@@ -3223,12 +3313,21 @@ impl Live {
 // `Vproc::command_name` (8 B with alignment) and `trap_saved` (4 B in that
 // alignment) fit the same bounds.
 // Cut15's composition measures (rustc `size_of`, x86-64 Linux) Vproc 704 B,
+// Frame 256 B, Scratch 216 B, ExecState 392 B and Job 96 B. `Frame` reads
+// 8 B less than at Cut14, where the bound was 264 B: the same measurement
+// reads 256 B at the landing of the job-list and command-name changes alone,
+// and 264 B at each other landing of that release. The bench reads 2,028 B
+// per idle vproc back to back.
+// `getopts` progress, process substitutions, coprocesses, `local -` saves
+// and `ulimit` values, 144 B that most vprocs leave empty, then moved behind
+// one pointer (`Vproc::rare`): Vproc 696 → 560 B at its own landing, where
+// the bench reads 1,868 B per idle vproc back to back in every run,
+// retention 318 B, and a process in the loop 2,076 to 2,330 B.
+// Cut16's composition measures (rustc `size_of`, x86-64 Linux) Vproc 568 B,
 // Frame 256 B, Scratch 216 B, ExecState 392 B and Job 96 B, and the bounds
-// below are those sizes. `Frame` reads 8 B less than at Cut14, where the
-// bound was 264 B: the same measurement reads 256 B at the landing of the
-// job-list and command-name changes alone, and 264 B at each other landing
-// of this release. The bench reads 2,028 B per idle vproc back to back.
-const _: () = assert!(size_of::<Vproc>() <= 704, "Vproc grew (idle vproc ≤ 2,048 B back to back)");
+// below are those sizes. The bench reads 1,892 B per idle vproc back to back,
+// in every run, and 318 B of retention.
+const _: () = assert!(size_of::<Vproc>() <= 568, "Vproc grew (idle vproc ≤ 2,048 B back to back)");
 const _: () = assert!(size_of::<Frame>() <= 256, "Frame grew (idle vproc ≤ 2,048 B back to back)");
 const _: () =
 	assert!(size_of::<Scratch>() <= 216, "Scratch grew (idle vproc ≤ 2,048 B back to back)");
