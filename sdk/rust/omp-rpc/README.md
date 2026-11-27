@@ -117,6 +117,14 @@ Once the server sends `host_uri_cancel`, nothing is sent for that request, even 
 
 `call(&GetTreeCommand {})` returns the session tree whatever its depth. Each entry nests two JSON levels under its parent, so the tree of a long session is tens of thousands of levels deep, and a `Value` that deep overflows the thread's stack when it drops by recursion. `SessionTree::tree` is therefore a `DeepJson<Vec<Map<String, Value>>>`: it derefs to the list of roots and drops it with a loop. `into_inner()` takes the list out; drop what you take out with `drop_deep`, one root at a time (`drop_deep(Value::Object(root))`), or take it apart node by node. Only the `tree` in the `data` of a `get_tree` answer may nest deeper than `serde_json` reads (128 levels), and only a successful answer to a `get_tree` call keeps it: a late answer (its call timed out) arrives as `Event::UnmatchedResponse`, and one that does not decode as `Event::Undecodable`, without that `data`, and a failed answer drops it. Any other frame that deep, or a `get_tree` answer that deep anywhere but in `data.tree` (in a member that a later duplicate replaces too), closes the client with `Error::Protocol`.
 
+## Session entries and `entry_patch` records
+
+A session records some changes to an entry after its line (a retry marker, a compaction's corrected `tokensAfter`, an elided tool result) as an `entry_patch` record, a `custom` entry that names the entries and the fields to set. `entry_patches` ports the rules the omp readers use to apply them (`apply_entry_patches`, `entry_patches_of`, `entry_accepts_patch`, `set_patched_fields`).
+
+- `get_entries(&GetEntriesCommand)` and `get_tree()` list no record: an entry whose parent is a record, and a `leaf_id` that names one, take the record's parent, and a record node's children take its place in the tree (walked with a stack of its own, whatever its depth). The entries already carry each record's fields, since the server serves its live entries, and the client never applies a record again: a record the server holds can keep a value a later rewrite-only pass replaced.
+- `get_subagent_messages(&GetSubagentMessagesCommand)` applies each reply's records to its entries, lists no record, and returns the patches of records whose target the reply lacks (an entry an earlier reply returned) in `SubagentTranscriptRead::entry_patches`, in file order. The client keeps nothing between calls: apply each patch to the entry you hold with that `entryId`, when `entry_accepts_patch` holds, with `set_patched_fields`, and decode its `message` again.
+- `call` with `GetEntriesCommand`, `GetTreeCommand` or `GetSubagentMessagesCommand` returns the answer as the server sent it, records included.
+
 ## Tests
 
 `cargo test` runs the wire tests and the transport tests, which use a scripted server on in-memory pipes.

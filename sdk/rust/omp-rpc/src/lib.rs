@@ -3,18 +3,22 @@
 //!
 //! [`wire`] is generated from the wire schema by `bun run gen:rpc`; [`client`]
 //! is a blocking transport (protocol v2 chunking, prompt waits, host tools,
-//! host URIs).
+//! host URIs); [`entry_patches`] applies a session transcript's
+//! `entry_patch` records, as the omp readers do.
 
 #[rustfmt::skip]
 pub mod wire;
 pub mod client;
 mod deep;
+pub mod entry_patches;
 mod frame;
 pub mod host_tool;
 pub mod host_uri;
 pub mod turn;
 
-pub use client::{Client, ClientOptions, DEFAULT_PROMPT_TIMEOUT, Error, Event, encode_command};
+pub use client::{
+	Client, ClientOptions, DEFAULT_PROMPT_TIMEOUT, Error, Event, SubagentTranscriptRead, encode_command,
+};
 pub use deep::{DeepJson, DeepJsonValue, drop_deep};
 pub use host_tool::{HostTool, HostToolContext, HostToolError, HostToolOutput};
 pub use host_uri::{HostUri, HostUriContext, HostUriError, HostUriRead};
