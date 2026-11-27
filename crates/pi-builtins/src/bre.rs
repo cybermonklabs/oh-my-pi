@@ -1154,4 +1154,45 @@ mod tests {
 		let (code, capture) = run_util::<Sed>(&["-E", r"s{a\{1,32768}{Y{"], "a\n", "/");
 		assert_eq!((code, capture.out().as_str()), (1, ""), "{}", capture.err());
 	}
+
+	/// A backslash before a character with no meaning of its own is that
+	/// character, and `` \` `` and `\'` are the start and the end of the
+	/// text, as glibc reads them for GNU grep, nl and sed. Regressed: `\d` was
+	/// a digit, `\x` an error searched as text, and `` \` `` a backtick.
+	#[cfg(all(feature = "util.grep", feature = "util.nl", feature = "util.sed"))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_backslash_before_an_ordinary_character_is_that_character() {
+		use crate::{
+			grep::Grep,
+			host::{run_async_util, run_util},
+			nl::Nl,
+			sed::Sed,
+		};
+
+		for (args, stdin, expected) in [
+			(&["-o", r"\d"][..], "d1\n", (0, "d\n")),
+			(&["-oE", r"\d"], "d1\n", (0, "d\n")),
+			(&["-c", r"\x"], "x\n", (0, "1\n")),
+			(&["-c", r"\0"], "0\n", (0, "1\n")),
+			(&["-c", "\\\u{e9}"], "\u{e9}\n", (0, "1\n")),
+			(&["-c", r"\`a"], "ab\n", (0, "1\n")),
+			(&["-c", r"b\'"], "ab\n", (0, "1\n")),
+			(&["-cE", r"b\'"], "ab\n", (0, "1\n")),
+			// After `` \` `` a BRE caret is text, as it anchors only at the
+			// start of a branch; an ERE caret anchors anywhere.
+			(&["-n", r"\`^a"], "a\n^a\n", (0, "2:^a\n")),
+			(&["-c", r"\`^a"], "ab\n^ab\n", (0, "1\n")),
+			(&["-cE", r"\`^a"], "ab\n^ab\n", (0, "1\n")),
+			// The same after `\<`, which was already GNU's answer.
+			(&["-n", r"\<^a"], "a\n^a\n", (1, "")),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, stdin, "/").await;
+			assert_eq!((code, capture.out().as_str()), expected, "grep {args:?}: {}", capture.err());
+		}
+
+		let (code, capture) = run_util::<Nl>(&[r"-bp\`^a"], "a\n^a\n", "/");
+		assert_eq!((code, capture.out().as_str()), (0, "       a\n     1\t^a\n"), "{}", capture.err());
+		let (code, capture) = run_util::<Sed>(&[r"s/\`^a/X/"], "a\n^a\n", "/");
+		assert_eq!((code, capture.out().as_str()), (0, "a\nX\n"), "{}", capture.err());
+	}
 }
