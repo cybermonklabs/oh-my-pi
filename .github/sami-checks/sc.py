@@ -2045,6 +2045,30 @@ def rust_first_seen(row_verdicts, prev_rows, read):
     return out, blind
 
 
+def stopped_first_seen(row_verdicts, prev_rows):
+    """Each row, of any kind, that read PASS, KNOWN or FAIL in the previous cut's verdict.json and
+    reads UNKNOWN here: the row's checks finished at the previous cut and did not all finish at this
+    one (a job that did not run, a unit that could not be read, a check that did part of its work),
+    so what they would have found is in no list. It is an entry of first_seen of the kind `row`, as
+    a Rust row's verdict is; a row UNKNOWN at both cuts is standing, as a failure at both is.
+    rust_test_macos read FAIL at Cut14 and UNKNOWN from Cut15 to Cut18 (sami-checks runs 45806183844,
+    then 45903894088 to 46036206702), its job skipped, and no entry named it. With no row verdicts
+    from the previous cut a row that reads UNKNOWN is named as not compared. Returns (entries, not
+    compared)."""
+    out, blind = [], []
+    for title, key in ROWS + RUST_JOBS:
+        if row_verdicts.get(key) != "UNKNOWN":
+            continue
+        if prev_rows is None:
+            blind.append(f"{title}: UNKNOWN, and the previous cut's verdict.json gives no row verdicts, so whether the "
+                         "row looked there is not known")
+        elif prev_rows.get(key) in ("PASS", "KNOWN", "FAIL"):
+            out.append({"kind": "row", "row": key, "who": None, "unit": None,
+                        "finding": "the row reads UNKNOWN: its checks did not all finish at this cut", "reading": None,
+                        "previous": f"it read {prev_rows[key]} at the previous cut"})
+    return out, blind
+
+
 def gh_api(path):
     """`gh api PATH`'s output, as bytes (GH_TOKEN: the job's token, which holds actions: read)."""
     try:
@@ -2429,12 +2453,15 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             plant_seen = "UNKNOWN"
     else:
         rust_seen, blind = rust_first_seen(row_verdicts, prev_rows, rust_read)
-        first_seen += rust_seen
+        stopped, stopped_blind = stopped_first_seen(row_verdicts, prev_rows)
+        first_seen += rust_seen + stopped
+        blind += stopped_blind
         seen_record = first_seen
         seen_top = [f"### First seen at this cut: {len(first_seen) or 'none'}, against {prev_from}", "",
                     "Each failure here was not in the previous cut's report; one that was is standing, and is listed "
                     "only below. A finding's line and column are not compared, so a finding that only moved is standing, "
-                    "and one more of a finding is first seen." if first_seen else
+                    "and one more of a finding is first seen. A row here that reads UNKNOWN read a verdict at the previous "
+                    "cut, and its checks did not all finish at this one." if first_seen else
                     "No failure the comparison could read is new at this cut; it could not compare what is under \"Not "
                     "compared\" below, and a new failure may be there." if blind else
                     "Every failure of this run was in the previous cut's report too: none is new at this cut.", ""]
@@ -2449,8 +2476,9 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                                 + (f", and {e['failed'] - len(e['failures'])} more (the list below, and sc-report's results.json)"
                                    if e["failed"] > len(e["failures"]) else ""))
             else:
-                seen_top.append(f"- **{name}**: {e['finding']}; {e['previous']} (its failing tests are in that job's "
-                                "annotations and log)")
+                seen_top.append(f"- **{name}**: {e['finding']}; {e['previous']}"
+                                + (" (its failing tests are in that job's annotations and log)"
+                                   if row_verdicts.get(e["row"]) == "FAIL" else ""))
         if len(first_seen) > 200:
             seen_top.append(f"- ... and {len(first_seen) - 200} more (sc-report's verdict.json, first_seen)")
         if blind:
@@ -5552,6 +5580,35 @@ def selftest():
           ([], sorted({RUST_JOBS[0][0], RUST_JOBS[1][0]}),
            [f"{RUST_JOBS[0][0]}: FAIL at this cut and at the previous one, and no unit of it could be read, so a finding "
             "first made here is not seen (that job's annotations and log name them)"], True))
+    # A row whose checks finished at the previous cut and did not all finish here is first seen
+    # (stopped_first_seen), with no pointer to a log of a job that did not run, as rust_test_macos
+    # should have read at Cut15; UNKNOWN at both cuts, it is standing.
+    out, rec = summary3(previous3(prev_units3, rows=dict(prev_rows3, rust_test_macos="FAIL")),
+                        rust_env="rust_test=failure rust_test_macos=")
+    check("first seen: a row that read a verdict at the previous cut and reads UNKNOWN here",
+          ([e for e in seen3(rec) if e[1] == "rust_test_macos"] if isinstance(seen3(rec), list) else seen3(rec),
+           f"- **{RUST_JOBS[1][0]}**: the row reads UNKNOWN: its checks did not all finish at this cut; it read FAIL at the "
+           "previous cut" in out,
+           "it read FAIL at the previous cut (its failing tests" in out),
+          ([("row", "rust_test_macos", None, "the row reads UNKNOWN: its checks did not all finish at this cut", None,
+             "it read FAIL at the previous cut")], True, False))
+    out, rec = summary3(previous3(prev_units3, rows=dict(prev_rows3, rust_test_macos="UNKNOWN")),
+                        rust_env="rust_test=failure rust_test_macos=")
+    check("first seen: a row UNKNOWN at both cuts is standing",
+          [e for e in seen3(rec) if e[1] == "rust_test_macos"] if isinstance(seen3(rec), list) else seen3(rec), [])
+    # Every kind of row, in the order of the summary's table; a row the previous cut did not give,
+    # or that failed here, is none; with no row verdicts there, each UNKNOWN row is not compared.
+    title_by_key = {k: t for t, k in ROWS + RUST_JOBS}
+    now_rows = {"docs": "UNKNOWN", "set-runner": "UNKNOWN", "lib4": "FAIL", "changelog": "UNKNOWN", "rust_test_macos": "UNKNOWN"}
+    check("first seen: stopped_first_seen reads every kind of row",
+          stopped_first_seen(now_rows, {"docs": "PASS", "set-runner": "KNOWN", "lib4": "PASS", "rust_test_macos": "UNKNOWN"}),
+          ([{"kind": "row", "row": k, "who": None, "unit": None, "finding": "the row reads UNKNOWN: its checks did not all finish at this cut",
+             "reading": None, "previous": f"it read {b} at the previous cut"} for k, b in (("set-runner", "KNOWN"), ("docs", "PASS"))],
+           []))
+    check("first seen: stopped_first_seen with no row verdicts at the previous cut",
+          stopped_first_seen(now_rows, None),
+          ([], [f"{title_by_key[k]}: UNKNOWN, and the previous cut's verdict.json gives no row verdicts, so whether the row "
+                "looked there is not known" for k in ("set-runner", "docs", "changelog", "rust_test_macos")]))
     # previous-report: which run it reads, and why it reads none, with gh api's answers stood in for.
     def fake_api(routes):
         def api(path):
