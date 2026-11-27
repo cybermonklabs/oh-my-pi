@@ -26,7 +26,8 @@ enum Mode {
 
 /// Runs `script` with stderr on stdout in a private directory (a row may
 /// write files there). Returns the output, each line that starts with the
-/// shell's name (`$0` under `-c`, `s.sh` for the script) starting with
+/// shell's name (`$0` under `-c`: the path obash was started by,
+/// [`obash_support::obash_path`]; `s.sh` for the script) starting with
 /// `SH` instead, and the exit status.
 fn run(script: &str, mode: Mode) -> (String, Option<i32>) {
 	let dir = tempfile::tempdir().expect("a row directory");
@@ -36,7 +37,7 @@ fn run(script: &str, mode: Mode) -> (String, Option<i32>) {
 	let name = match mode {
 		Mode::C => {
 			cmd.args(["-c", &script]);
-			env!("CARGO_BIN_EXE_obash")
+			obash_support::obash_path()
 		},
 		Mode::Script => {
 			std::fs::write(dir.path().join("s.sh"), format!("{script}\n")).expect("the script file");
