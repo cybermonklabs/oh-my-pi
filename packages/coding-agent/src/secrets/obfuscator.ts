@@ -322,8 +322,16 @@ export class SecretObfuscator {
 				// Invalid regex — skip silently (validation happens at load time)
 			}
 		}
-		this.#regexEntries = regexEntries;
 		this.#maskOnlyRegexEntries = regexEntries.filter(entry => entry.maskOnly);
+		// The mask-only regexes scan first, so each mints its match mask-only while the match is still raw text with
+		// all the context it needs (a lookbehind, the `api_key=` in front of a value). A restorable regex that runs
+		// after one and takes its placeholder in then takes in a value `#maskOnlySecrets` holds, and its mint is
+		// mask-only too (`#holdsMaskOnlyValue`). The order of the restorable regexes among themselves is unchanged,
+		// and a session with no mask-only regex scans as before.
+		this.#regexEntries =
+			this.#maskOnlyRegexEntries.length > 0
+				? [...this.#maskOnlyRegexEntries, ...regexEntries.filter(entry => !entry.maskOnly)]
+				: regexEntries;
 		this.#rawProbes = regexEntries.flatMap(entry => (entry.ignoreCase ? [] : (entry.probes ?? [])));
 		this.#rawProbeDetector = buildLiteralDetector(this.#rawProbes);
 		const foldedProbes = regexEntries.flatMap(entry => (entry.ignoreCase ? (entry.probes ?? []) : []));

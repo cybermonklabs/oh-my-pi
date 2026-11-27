@@ -1825,17 +1825,21 @@ interface ChainStep {
 
 describe("project secrets all down a revive chain", () => {
 	// A subagent S works in A; the root moves to B and S is revived cold, so S masks B's secrets one way. Then a child
-	// S spawns, S revived again after the root moved on to C (where no secrets.yml is), and the child revived after S
-	// parked: each still masks SB one way, though none of them takes its live inputs from B any more.
+	// S spawns, a child S spawned before that revive and revived cold while S is live with the root moved on to C
+	// (where no secrets.yml is), S revived again, and the child revived after S parked: each still masks SB one way,
+	// though none of them takes its live inputs from B any more.
 	const parentId = "ChainParent";
 	const childId = "ChainChild";
+	// Spawned by the parent before the parent's cold revive, so it holds no mask-only directory of its own.
+	const earlyId = "ChainEarly";
 	let env: ReviveEnv | undefined;
 	let projectB = "";
 	let projectC = "";
 	let bravoPlaceholder = "";
 	let alphaPlaceholder = "";
-	const steps: Record<"child" | "parentAgain" | "childAgain", ChainStep | undefined> = {
+	const steps: Record<"child" | "early" | "parentAgain" | "childAgain", ChainStep | undefined> = {
 		child: undefined,
+		early: undefined,
 		parentAgain: undefined,
 		childAgain: undefined,
 	};
@@ -1859,6 +1863,8 @@ describe("project secrets all down a revive chain", () => {
 		projectC = path.join(env.root, "project-c");
 		await fs.mkdir(projectC, { recursive: true });
 		await env.spawn(taskSpawn(env, opened.root.toolSession, parentId));
+		await env.spawn(taskSpawn(env, env.toolSessionOf(parentId), earlyId));
+		await env.park(earlyId);
 		await env.park(parentId);
 		await opened.root.session.sessionManager.moveTo(projectB);
 		const parent = await reviveCold(env, parentId);
@@ -1872,9 +1878,14 @@ describe("project secrets all down a revive chain", () => {
 		const childBuild = env.builds.findLast(build => build.options.agentId === childId);
 		steps.child = await chainStep(liveSession(childId), childId, childBuild?.options.secretsProjectDirs);
 		await env.park(childId);
-		await env.park(parentId);
-		// The root moves on to C: the parent's next source holds none of B's secrets.
+		// The root moves on to C while the parent is live. The early child, revived cold, takes its live inputs from the
+		// parent through the parent's tool session (`subagentLiveInputs`), in A, its own directory: only the parent's
+		// mask-only directories can give it B, where the root's would give C.
 		await opened.root.session.sessionManager.moveTo(projectC);
+		const early = await reviveCold(env, earlyId);
+		steps.early = await chainStep(early.session, earlyId, early.build.options.secretsProjectDirs);
+		await env.park(earlyId);
+		await env.park(parentId);
 		// A cold-revived subagent parks with no warm reviver, so its next revive is cold too.
 		const parentAgain = await env.revive(parentId);
 		steps.parentAgain = await chainStep(parentAgain.session, parentId, parentAgain.build.options.secretsProjectDirs);
@@ -1888,7 +1899,7 @@ describe("project secrets all down a revive chain", () => {
 		await env?.close();
 	}, 30_000);
 
-	for (const name of ["child", "parentAgain", "childAgain"] as const) {
+	for (const name of ["child", "early", "parentAgain", "childAgain"] as const) {
 		it(`revive chain, ${name}: its mask loads B's secrets, and SB goes out masked`, () => {
 			const step = steps[name];
 			expect(step?.dirs).toContain(projectB);
@@ -1907,6 +1918,11 @@ describe("project secrets all down a revive chain", () => {
 
 	it("revive chain: the parent's second cold revive also loads C, the directory its live inputs now come from", () => {
 		expect(steps.parentAgain?.dirs).toContain(projectC);
+	}, 30_000);
+
+	it("revive chain: the early child does not load C, so its source is its live parent and not the root", () => {
+		// Whether it holds B is the masking row's; this row reads only that C, the root's directory, is not among them.
+		expect(steps.early?.dirs ?? []).not.toContain(projectC);
 	}, 30_000);
 });
 

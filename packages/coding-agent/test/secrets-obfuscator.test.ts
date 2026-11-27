@@ -3370,8 +3370,9 @@ describe("a project secrets.yml of another session's directory is masked one way
 		}
 	});
 
-	it("a restorable regex that runs before the source's regex never mints a placeholder that restores the source's match", async () => {
-		// cwd's own regex comes first in the scan, so it meets the source regex's value still raw.
+	it("a restorable regex listed before the source's regex never mints a placeholder that restores the source's match", async () => {
+		// cwd's own regex comes first in the entries `loadSecrets` gives, so a scan in entry order meets the source
+		// regex's value still raw inside it.
 		const obfuscator = new SecretObfuscator(
 			await load({ own: regex("fakedb://[A-Za-z0-9:@./_-]+"), source: regex(SOURCE_RX) }),
 			KEY,
@@ -3381,6 +3382,42 @@ describe("a project secrets.yml of another session's directory is masked one way
 		const restored = restoredFromEach(obfuscator, masked);
 		expect(restored.length).toBeGreaterThan(0);
 		expect(restored.filter(value => value.includes(SOURCE_RX_VALUE))).toEqual([]);
+	});
+
+	it("a source regex that needs text outside a restorable regex's match is still never restored", async () => {
+		// cwd's own regex matches the value with its host; the source regex needs the text in front of the value (a
+		// lookbehind, or the key name of the `api_key=` shape docs/secrets.md shows), which the own match leaves out.
+		const VALUE = "FakeSrcPwNOTREAL0042";
+		const ownHost = regex("[A-Za-z0-9]{12,}@db[.]fake[.]internal");
+		for (const { name, source, text } of [
+			{
+				name: "a lookbehind",
+				source: regex("(?<=password=)[A-Za-z0-9]{12,}"),
+				text: `password=${VALUE}@db.fake.internal`,
+			},
+			{
+				name: "the api_key= shape",
+				source: regex("api_key=[A-Za-z0-9]{12,}"),
+				text: `api_key=${VALUE}@db.fake.internal`,
+			},
+		]) {
+			const obfuscator = new SecretObfuscator(await load({ own: ownHost, source }), KEY);
+			const masked = obfuscator.obfuscate(text);
+			const restored = restoredFromEach(obfuscator, masked);
+			expect({ name, holds: masked.includes(VALUE), minted: restored.length > 0 }).toEqual({
+				name,
+				holds: false,
+				minted: true,
+			});
+			expect({ name, restoring: restored.filter(value => value.includes(VALUE)) }).toEqual({ name, restoring: [] });
+			// Both regexes in cwd's own project: the same text restores, so the instrument sees a restore.
+			const own = new SecretObfuscator(await load({ own: ownHost + source }), KEY);
+			const ownRestored = restoredFromEach(own, own.obfuscate(text));
+			expect({ name, restoring: ownRestored.some(value => value.includes(VALUE)) }).toEqual({
+				name,
+				restoring: true,
+			});
+		}
 	});
 
 	it("a value a restorable entry also supplies restores under every placeholder, whatever the order and the friendly name", async () => {
