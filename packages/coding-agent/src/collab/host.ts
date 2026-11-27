@@ -12,6 +12,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import { type EntryPatchRecord, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
 import type {
 	BusChannel,
 	CollabUiRequest,
@@ -24,6 +25,7 @@ import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
+import { CONTEXT_NOTES_ENTRY_TYPE } from "../session/context-notes";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { readSessionTextFrom } from "../session/session-storage";
@@ -100,13 +102,15 @@ const WIRE_AGENT_EVENT_TYPES: Record<WireAgentEvent["type"], true> = {
 	thinking_level_changed: true,
 };
 
-const WIRE_SESSION_ENTRY_TYPES: Record<WireSessionEntry["type"], true> = {
+/** The wire entry types the host sends, besides one `custom` kind ({@link isWireSessionEntry}). */
+const WIRE_SESSION_ENTRY_TYPES: Record<Exclude<WireSessionEntry["type"], "custom">, true> = {
 	message: true,
 	custom_message: true,
 	compaction: true,
 	branch_summary: true,
 	model_change: true,
 	thinking_level_change: true,
+	reset_boundary: true,
 };
 const COLLAB_BUS_CHANNELS = [
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
@@ -117,9 +121,102 @@ function isWireAgentEvent(event: AgentSessionEvent): event is AgentSessionEvent 
 	return event.type in WIRE_AGENT_EVENT_TYPES;
 }
 
+/**
+ * An entry the host sends: a wire type. Of the `custom` entries, which are
+ * extension and runtime state, only the context notebook: the model context
+ * reads it, so a guest's context needs it. (An `entry_patch` record goes on
+ * its own path, live only.)
+ */
 function isWireSessionEntry(entry: StoredSessionEntry): entry is StoredSessionEntry & WireSessionEntry {
-	return entry.type in WIRE_SESSION_ENTRY_TYPES;
+	return entry.type === "custom"
+		? entry.customType === CONTEXT_NOTES_ENTRY_TYPE
+		: entry.type in WIRE_SESSION_ENTRY_TYPES;
 }
+
+/** Reads one of the host's entries by id. */
+type EntryLookup = (id: string) => StoredSessionEntry | undefined;
+
+/**
+ * The nearest entry at or above `id` on the host's parent chain that guests
+ * hold (a wire type, {@link isWireSessionEntry}); `null` past the root.
+ *
+ * The host sends no other entry: not the `tool_execution_start` record before
+ * each tool result, model usage, mode changes, nor, in the welcome snapshot,
+ * `entry_patch` records. A guest builds its model context by walking parent
+ * links, so a link to an entry it never got ends that walk and drops all the
+ * history above it. An id the host does not hold, and a cycle, give `id`
+ * back. `anchors` keeps each skipped id's answer for one snapshot.
+ */
+function nearestReplicatedId(
+	id: string | null,
+	getEntry: EntryLookup,
+	anchors?: Map<string, string | null>,
+): string | null {
+	let cursor = id;
+	let skipped: Set<string> | undefined;
+	while (cursor !== null) {
+		const known = anchors?.get(cursor);
+		if (known !== undefined) {
+			cursor = known;
+			break;
+		}
+		const entry = getEntry(cursor);
+		if (!entry || isWireSessionEntry(entry)) break;
+		skipped ??= new Set();
+		if (skipped.has(cursor)) return id;
+		skipped.add(cursor);
+		cursor = entry.parentId;
+	}
+	if (anchors && skipped) for (const skippedId of skipped) anchors.set(skippedId, cursor);
+	return cursor;
+}
+
+/**
+ * The compaction's first kept entry as a guest can find it: the entry itself
+ * when guests hold it, else the nearest one after it on the compaction's path,
+ * since guests hold none of the entries between. A cut can start at an entry
+ * guests never get: it takes in the non-message entries just before it.
+ */
+function firstKeptIdForGuests(compaction: ReplicatedEntry & { type: "compaction" }, getEntry: EntryLookup): string {
+	const { firstKeptEntryId } = compaction;
+	const kept = firstKeptEntryId ? getEntry(firstKeptEntryId) : undefined;
+	if (!kept || isWireSessionEntry(kept)) return firstKeptEntryId;
+	let nearest: string | undefined;
+	const seen = new Set<string>();
+	let cursor = compaction.parentId;
+	while (cursor !== null && !seen.has(cursor)) {
+		if (cursor === firstKeptEntryId) return nearest ?? firstKeptEntryId;
+		seen.add(cursor);
+		const entry = getEntry(cursor);
+		if (!entry) break;
+		if (isWireSessionEntry(entry)) nearest = cursor;
+		cursor = entry.parentId;
+	}
+	return firstKeptEntryId;
+}
+
+/**
+ * `entry` as guests are sent it: its parent, and a compaction's kept-history
+ * ids, name entries guests hold. A changed link goes on a shallow copy; the
+ * host's entry never changes.
+ */
+function entryForGuests(
+	entry: ReplicatedEntry,
+	getEntry: EntryLookup,
+	anchors?: Map<string, string | null>,
+): ReplicatedEntry {
+	const parentId = nearestReplicatedId(entry.parentId, getEntry, anchors);
+	const sent = parentId === entry.parentId ? entry : { ...entry, parentId };
+	if (sent.type !== "compaction") return sent;
+	const firstKeptEntryId = firstKeptIdForGuests(sent, getEntry);
+	const replayThrough = sent.providerReplayThroughEntryId;
+	const providerReplayThroughEntryId = replayThrough
+		? (nearestReplicatedId(replayThrough, getEntry, anchors) ?? replayThrough)
+		: replayThrough;
+	if (firstKeptEntryId === sent.firstKeptEntryId && providerReplayThroughEntryId === replayThrough) return sent;
+	return { ...sent, firstKeptEntryId, providerReplayThroughEntryId };
+}
+
 const CONNECT_TIMEOUT_MS = 15_000;
 /** Max bytes served per fetch-transcript reply (guest re-requests from `newSize`). */
 export const TRANSCRIPT_READ_CAP = 4 * 1024 * 1024;
@@ -252,6 +349,8 @@ export class CollabHost {
 	#stopped = false;
 	/** Bumped on every `message_start`; keys a streaming message's superseding updates. */
 	#messageSeq = 0;
+	/** The host's entries by id, for the links guests are sent. */
+	readonly #hostEntry: EntryLookup = id => this.#ctx.sessionManager.getEntry(id);
 
 	constructor(ctx: InteractiveModeContext, options: CollabHostOptions = {}) {
 		this.#ctx = ctx;
@@ -494,16 +593,18 @@ export class CollabHost {
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
 		this.#ctx.sessionManager.onEntryAppended = entry => {
 			if (isWireSessionEntry(entry) && this.#broadcastAllowed()) {
-				const bounded = serializeReplicatedEntry(entry);
+				const bounded = serializeReplicatedEntry(entryForGuests(entry, this.#hostEntry));
 				const shrunk = bounded.value;
 				if (shrunk.type === "custom_message" && shrunk.customType === COLLAB_ENTRY_OMITTED_CUSTOM_TYPE) {
-					// The live path also emits a guest-visible notice: guests only
-					// apply `message` entries to their agent context, so without
-					// this the substitution would be silently invisible there
-					// (PR #11999 review). Notices never enter agent state.
+					// The live path also emits a guest-visible notice: the TUI
+					// guest draws its transcript from events, not entries, so
+					// without this the substitution would be invisible on its
+					// screen (PR #11999 review). Notices never enter agent state.
 					this.#send({ t: "event", event: oversizedEntryNotice(entry.type) });
 				}
 				this.#socket?.send(encodeEntryFrame(bounded.json));
+			} else if (isEntryPatchRecord(entry) && this.#broadcastAllowed()) {
+				this.#broadcastEntryPatchRecord(entry);
 			}
 			// Model/thinking/title changes land as entries while idle; refresh
 			// guest state promptly (debounce + JSON diff dedupe).
@@ -723,6 +824,29 @@ export class CollabHost {
 		else this.#socket?.send(frame);
 	}
 
+	/**
+	 * Send an `entry_patch` record live, so each guest sets its fields on the
+	 * entries it holds. The welcome snapshot never carries a record: its
+	 * entries already hold their fields. No entry the host sends names a
+	 * record as its parent ({@link nearestReplicatedId}), so a guest that never
+	 * got one keeps its chain whole. A record goes whole or not at all, since a
+	 * shrunk one would set a truncated value: one past the frame ceiling goes
+	 * only as a notice, and the guests get the fields at their next resync. The
+	 * frame needs no new `COLLAB_PROTO`: a guest older than the record keeps it
+	 * as a `custom` entry it never shows (the web guest has no row for one, the
+	 * TUI guest no message), so it only misses the patch until it rejoins, as
+	 * before; a new protocol number would turn such a guest away.
+	 */
+	#broadcastEntryPatchRecord(record: StoredSessionEntry & EntryPatchRecord): void {
+		const parentId = nearestReplicatedId(record.parentId, this.#hostEntry);
+		const json = JSON.stringify(parentId === record.parentId ? record : { ...record, parentId });
+		if (Buffer.byteLength(json, "utf-8") > MAX_REPLICATED_PAYLOAD_BYTES) {
+			this.#send({ t: "event", event: oversizedEntryNotice(record.customType) });
+			return;
+		}
+		this.#socket?.send(encodeEntryFrame(json));
+	}
+
 	#handleFrame(frame: CollabFrame, fromPeer: number): void {
 		// Controls are dispatched synchronously while frames finish decrypting, so
 		// a hello can land after its sender's `peer-left`. The socket settled the
@@ -815,10 +939,14 @@ export class CollabHost {
 		// Serialize the snapshot synchronously: live traffic queued after this
 		// cannot overtake it, and host rewrites of an entry in place cannot leak
 		// into it later, so the live entries are read without a defensive deep
-		// copy. Chunk frames are assembled from these strings only as the
-		// transport drains.
+		// copy (an entry whose links change for guests goes as a shallow copy).
+		// Chunk frames are assembled from these strings only as the transport
+		// drains.
 		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
-		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
+		const anchors = new Map<string, string | null>();
+		const snapshotEntries = this.#serializeSnapshotEntries(
+			snapshot.entries.filter(isWireSessionEntry).map(entry => entryForGuests(entry, this.#hostEntry, anchors)),
+		);
 		const state = this.#buildState();
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome

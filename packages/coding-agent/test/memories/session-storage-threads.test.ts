@@ -7,7 +7,7 @@
  * session.
  */
 import { SQL } from "bun";
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { buildStage1RolloutItems, collectThreads } from "@oh-my-pi/pi-coding-agent/memories";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -165,6 +165,48 @@ describe("memories over the session storage", () => {
 			expect(await buildStage1RolloutItems(rollout, limit, storage)).toBe(referenceItems(raw, limit));
 			expect({ limit, fullReads: backend.readFullPaths.length }).toEqual({ limit, fullReads: 1 });
 		}
+	});
+
+	it("builds one body's stage-1 input when a full write replaces a chunked rollout between its two reads", async () => {
+		// If this regresses, a memory extracted from a session another process rewrote between the
+		// read of its records and the read of its messages applies the old transcript's records to the
+		// new transcript's messages: the extraction model gets the output the new transcript's record elided.
+		const client = new SQL("sqlite::memory:");
+		clients.push(client);
+		const storage = await SqlSessionStorage.create({ client });
+		setDefaultSessionStorage(new FileSessionStorage());
+		const rollout = "/sessions/project/rollout.jsonl";
+		const result = (text: string) =>
+			JSON.stringify({
+				type: "message",
+				id: "t1",
+				message: { role: "toolResult", toolName: "bash", content: [{ type: "text", text }] },
+			});
+		const elided = JSON.stringify({
+			type: "custom",
+			customType: "entry_patch",
+			id: "p1",
+			data: { patches: [{ entryId: "t1", message: { content: [{ type: "text", text: "elided" }] } }] },
+		});
+		const body = (...lines: string[]) =>
+			`${['{"type":"session","id":"s"}', messageLine(0, "go"), ...lines].join("\n")}\n`;
+		await storage.writeText(rollout, body(result("first output")));
+		const readChunks = storage.readChunks.bind(storage);
+		let reads = 0;
+		spyOn(storage, "readChunks").mockImplementation((chunkPath: string, fromByte?: number) =>
+			(async function* () {
+				// The full write lands after the first read of the rollout ends, before the second starts.
+				if (chunkPath === rollout && ++reads === 2) await storage.writeText(rollout, body(result("HEAVY"), elided));
+				yield* readChunks(chunkPath, fromByte);
+			})(),
+		);
+
+		const built = await buildStage1RolloutItems(rollout, 10_000_000, storage);
+
+		expect({ raced: reads > 1, built }).toEqual({
+			raced: true,
+			built: referenceItems(body(result("elided")), 10_000_000),
+		});
 	});
 });
 

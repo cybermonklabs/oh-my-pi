@@ -12,7 +12,9 @@
  * unchanged, only newly appended JSONL is parsed and rendered. A rewrite,
  * truncation, or rotation falls back to a full rebuild so changed historical
  * entries cannot leave stale components behind. Collab guests use the same
- * append path over the host's byte-capped transcript reads.
+ * append path over the host's byte-capped transcript reads. The `entry_patch`
+ * records of every window read apply to the entries of every window read
+ * before it, and an entry a later window patches is shown again.
  */
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { TspSpan, TspTone } from "@oh-my-pi/pi-wire";
@@ -21,6 +23,7 @@ import { Editor } from "../components/editor";
 import { matchesKey } from "../keys";
 import { routeSgrMouseInput } from "../mouse";
 import { formatDuration, formatNumber, logger } from "@oh-my-pi/pi-utils";
+import { EntryPatchReplay, type EntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
 import { formatKeyHint, formatKeyHints, type KeyId } from "../app-keybindings";
 import { editorKey } from "../chrome/keybinding-hints";
 import type { MessageRenderer } from "../chat/extension-types";
@@ -44,8 +47,11 @@ import { node, span, text } from "../native/describe";
 import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "../native/node";
 import { actionHint, escCloseButton, hintsRow, overlayCard } from "../native/overlay";
 
-/** Parsed message and model metadata relevant to a transcript viewer. */
-export type AgentTranscriptEntry = SessionMessageEntryLike | { type: "model_change"; model: string };
+/**
+ * Parsed message and model metadata relevant to a transcript viewer, and the
+ * `entry_patch` records that set fields on messages read before them.
+ */
+export type AgentTranscriptEntry = SessionMessageEntryLike | { type: "model_change"; model: string } | EntryPatchRecord;
 
 /** Size and modification time of a stored transcript. */
 export interface AgentTranscriptStat {
@@ -70,6 +76,11 @@ export interface AgentTranscriptSource {
 	 * brings it a line it has not rendered.
 	 */
 	readFrom(path: string, offset: number): Promise<string>;
+	/**
+	 * The entries of `text`, complete lines of a transcript: its messages and
+	 * model changes, each carrying the `entry_patch` records of `text`, and
+	 * those records, which the viewer applies to messages of earlier windows.
+	 */
 	parseEntries(text: string): AgentTranscriptEntry[];
 }
 
@@ -185,6 +196,10 @@ export class AgentTranscriptViewer implements Component {
 	#initialEntryId: string | undefined;
 	/** Last described node and the visible inputs it was built from. */
 	#nativeCache: { signature: string; node: NativeNode } | undefined;
+	/** The messages rendered, in transcript order. */
+	#messages: SessionMessageEntryLike[] = [];
+	/** Every entry read since the transcript was last read from its start, for the records of later windows. */
+	readonly #patches = new EntryPatchReplay<AgentTranscriptEntry>();
 
 	readonly #deps: AgentTranscriptViewerDeps;
 
@@ -288,6 +303,7 @@ export class AgentTranscriptViewer implements Component {
 		this.#localState = undefined;
 		this.#localUnavailable = reason;
 		this.#model = undefined;
+		this.#patches.clear();
 		this.#rebuild([]);
 	}
 
@@ -338,7 +354,10 @@ export class AgentTranscriptViewer implements Component {
 			...anchorAt(complete, offset),
 		};
 		this.#model = undefined;
-		this.#rebuild(this.#extractMessages(this.#deps.transcript.parseEntries(complete)));
+		this.#patches.clear();
+		const entries = this.#deps.transcript.parseEntries(complete);
+		this.#patches.add(entries, 0);
+		this.#rebuild(this.#extractMessages(entries));
 	}
 
 	/** Render the complete lines of `rest`, the text that follows the rendered end of `state`. */
@@ -346,7 +365,7 @@ export class AgentTranscriptViewer implements Component {
 		const complete = rest.slice(0, rest.lastIndexOf("\n") + 1);
 		const offset = state.offset + Buffer.byteLength(complete, "utf-8");
 		const previousModel = this.#model;
-		const parsed = complete ? this.#extractMessages(this.#deps.transcript.parseEntries(complete)) : [];
+		const entries = complete ? this.#deps.transcript.parseEntries(complete) : [];
 		this.#localState = {
 			path: state.path,
 			seen: { size: stat.size, mtimeMs: stat.mtimeMs },
@@ -354,9 +373,7 @@ export class AgentTranscriptViewer implements Component {
 			// A long append holds the whole anchor; a short one extends the previous one.
 			...anchorAt(complete.length >= ANCHOR_CHARS ? complete : state.anchor + complete, offset),
 		};
-		if (parsed.length > 0) {
-			this.#append(parsed);
-		} else if (this.#model !== previousModel) {
+		if (!this.#renderWindow(entries, state.offset) && this.#model !== previousModel) {
 			this.#deps.requestRender();
 		}
 	}
@@ -396,6 +413,7 @@ export class AgentTranscriptViewer implements Component {
 					this.#remoteError = "";
 					this.#hasRemoteData = false;
 					this.#model = undefined;
+					this.#patches.clear();
 					this.#rebuild([]);
 					this.#fetchRemote();
 					return;
@@ -409,11 +427,7 @@ export class AgentTranscriptViewer implements Component {
 					const completeChunk = result.text.slice(0, lastNewline + 1);
 					this.#remoteBytes = fromByte + Buffer.byteLength(completeChunk, "utf-8");
 					const previousModel = this.#model;
-					const parsed = this.#extractMessages(this.#deps.transcript.parseEntries(completeChunk));
-					if (parsed.length > 0) {
-						this.#append(parsed);
-						return;
-					}
+					if (this.#renderWindow(this.#deps.transcript.parseEntries(completeChunk), fromByte)) return;
 					if (this.#model !== previousModel) {
 						this.#deps.requestRender();
 						return;
@@ -426,6 +440,24 @@ export class AgentTranscriptViewer implements Component {
 				if (token === this.#remoteToken) this.#remoteFetchInFlight = false;
 				logger.warn("transcript viewer: remote fetch failed", { id, error: String(error) });
 			});
+	}
+
+	/**
+	 * Render the entries of the window that starts at byte `start` of the
+	 * transcript: append its messages, or, when one of its records changed a
+	 * message rendered from an earlier window, render every message again.
+	 * Returns whether it rendered anything.
+	 */
+	#renderWindow(entries: AgentTranscriptEntry[], start: number): boolean {
+		const patchedEarlier = this.#patches.add(entries, start).length > 0;
+		const messages = this.#extractMessages(entries);
+		if (patchedEarlier) {
+			this.#rebuild([...this.#messages, ...messages]);
+			return true;
+		}
+		if (messages.length === 0) return false;
+		this.#append(messages);
+		return true;
 	}
 
 	/** Filter to message entries, tracking the model from the first assistant / a model_change. */
@@ -443,11 +475,13 @@ export class AgentTranscriptViewer implements Component {
 	}
 
 	#rebuild(entries: SessionMessageEntryLike[]): void {
+		this.#messages = entries;
 		this.#builder.rebuild(entries);
 		this.#deps.requestRender();
 	}
 
 	#append(entries: SessionMessageEntryLike[]): void {
+		for (const entry of entries) this.#messages.push(entry);
 		this.#builder.append(entries);
 		this.#deps.requestRender();
 	}

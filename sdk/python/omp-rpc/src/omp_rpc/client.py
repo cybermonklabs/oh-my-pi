@@ -29,8 +29,11 @@ from ._wire import (
     ReadyEvent,
     RpcAgentEvent,
     RpcNotification,
+    SessionEntries,
     SessionSettledEvent,
+    SessionTree,
     StreamingBehavior,
+    SubagentMessages,
     ThinkingLevel,
     TodoItem,
     TodoPhase,
@@ -49,6 +52,15 @@ from ._wire_runtime import (
     decode_str,
     expect_object,
     required,
+)
+from .entry_patches import (
+    RecordParents,
+    apply_entry_patches,
+    entries_past_records,
+    entry_patches_of,
+    is_entry_patch_record,
+    past_records,
+    tree_past_records,
 )
 from .host_tools import HostTool, HostToolContext
 from .host_uris import HostUri, HostUriContext, normalize_read_result
@@ -553,6 +565,30 @@ class _PromptLifecycleCoordinator:
                 self.active_operation = None
 
 
+@dataclass(slots=True, frozen=True, kw_only=True)
+class SubagentTranscriptRead(SubagentMessages):
+    """A `get_subagent_messages` reply as `RpcClient.get_subagent_messages` returns it.
+
+    Its `entry_patch` records are applied within the reply and not listed; an
+    entry whose parent is a record takes the record's parent, and `messages`
+    are the `message` objects of `entries`.
+    """
+
+    entry_patches: tuple[JsonObject, ...] = ()
+    """The patches of this reply's records that name an entry not in this reply
+    (one an earlier call returned), in file order, as `entry_patches_of` gives
+    them: `{"entryId", "entry"?, "message"?}`."""
+
+
+def _messages_of(entries: Sequence[JsonObject]) -> tuple[AgentMessage, ...]:
+    """The `message` objects of the `message` entries among `entries`."""
+    return tuple(
+        cast(AgentMessage, entry["message"])
+        for entry in entries
+        if entry.get("type") == "message" and isinstance(entry.get("message"), dict)
+    )
+
+
 class RpcClient(WireClient):
     """Process-backed RPC client.
 
@@ -679,6 +715,14 @@ class RpcClient(WireClient):
         self._protocol_error_listeners: list[ProtocolErrorListener] = []
         self._listener_error_listeners: list[ListenerErrorListener] = []
         self._host_tool_completed_listeners: list[HostToolCompletedListener] = []
+        # The `entry_patch` records `get_entries` read since its last read of
+        # the whole history, for the entries of later `since` reads; and, by
+        # session file, the records `get_subagent_messages` hid since its last
+        # read of that transcript from the start, for the entries of later
+        # reads.
+        self._entry_patch_lock = threading.Lock()
+        self._entry_record_parents: RecordParents = {}
+        self._subagent_record_parents: dict[str, RecordParents] = {}
 
     def __enter__(self) -> RpcClient:
         return self.start()
@@ -1140,6 +1184,110 @@ class RpcClient(WireClient):
             "messages",
             array(parse_agent_message),
             "get_messages",
+        )
+
+    def get_entries(self, since: str | None = None) -> SessionEntries:
+        """Read the append-history; with `since`, only entries strictly after that durable entry id.
+
+        The session's `entry_patch` records are not listed: an entry whose
+        parent is a record, and a `leaf_id` that names one, take the record's
+        parent, also for a record an earlier `since` read returned. The client
+        does not apply the records, and must not: the server serves its live
+        entries (`selectRpcEntries` in
+        `packages/coding-agent/src/modes/rpc/rpc-compat.ts` slices
+        `SessionManager.getEntries`), which already carry each record's
+        fields. `SessionManager.patchEntries` sets them before it appends the
+        record, and a load applies the records it reads (`SessionManager`'s
+        load calls `applyEntryPatches`). A record the server holds keeps its
+        fields after a later rewrite-only pass replaced them in the entry, for
+        example images a later pass dropped from an elided result: only the
+        line a full rewrite writes loses them (`withoutEntryPatches` in
+        `packages/coding-agent/src/session/entry-patches.ts`). Applying such a
+        record again would bring the replaced values back.
+        """
+        read = super().get_entries(since)
+        with self._entry_patch_lock:
+            parents = self._entry_record_parents
+            if since is None:
+                parents.clear()
+            entries = entries_past_records(read.entries, parents)
+            return SessionEntries(
+                entries=tuple(entries), leaf_id=past_records(read.leaf_id, parents)
+            )
+
+    def get_tree(self) -> SessionTree:
+        """Read the session tree.
+
+        The session's `entry_patch` records are not listed: the children of a
+        record node take its place among its parent's children, with the
+        record's parent as their entries' parent, and a `leaf_id` that names a
+        record names that parent. The client does not apply the records, and
+        must not, for the reason `get_entries` gives: the tree's entries are the
+        server's live entries (`SessionManager.getTree`), which already carry
+        each record's fields.
+        """
+        read = super().get_tree()
+        parents: RecordParents = {}
+        roots = tree_past_records(read.tree, parents)
+        return SessionTree(
+            tree=tuple(cast(JsonObject, root) for root in roots),
+            leaf_id=past_records(read.leaf_id, parents),
+        )
+
+    def get_subagent_messages(
+        self,
+        *,
+        subagent_id: str | None = None,
+        session_file: str | None = None,
+        from_byte: int | None = None,
+    ) -> SubagentTranscriptRead:
+        """Read a subagent transcript by id or registered session file (`subagent_id` wins).
+
+        Pass the last reply's `next_byte` as `from_byte` to read on. The server
+        reads the transcript file in windows. The `entry_patch` records of this
+        reply apply to its entries, as the server applies them, and are not
+        listed; an entry whose parent is a record takes the record's parent,
+        also for a record an earlier call returned from the same session file
+        since its last read from the start (`from_byte` 0, or `reset`). For
+        that the client keeps the id and parent of each record it hid, per
+        session file, and no entry. A patch that names an entry not in this
+        reply, one an earlier call returned, is listed in `entry_patches`, in
+        file order: a caller that holds the entries of earlier calls applies
+        each patch, in order, to the entry with its `entryId` when
+        `omp_rpc.entry_patches.entry_accepts_patch(entry, patch)` holds, with
+        `omp_rpc.entry_patches.set_patched_fields(entry, patch)`. That changes
+        the entry in place, and its `message`, the object earlier calls
+        returned in `messages`, with it.
+        """
+        read = super().get_subagent_messages(
+            subagent_id=subagent_id, session_file=session_file, from_byte=from_byte
+        )
+        ids = {
+            entry["id"]
+            for entry in read.entries
+            if entry.get("type") != "session" and isinstance(entry.get("id"), str)
+        }
+        patches = tuple(
+            patch
+            for entry in read.entries
+            if is_entry_patch_record(entry)
+            for patch in entry_patches_of(entry) or ()
+            if patch["entryId"] not in ids
+        )
+        apply_entry_patches(read.entries)
+        with self._entry_patch_lock:
+            if read.from_byte == 0 or read.reset:
+                self._subagent_record_parents.pop(read.session_file, None)
+            parents = self._subagent_record_parents.setdefault(read.session_file, {})
+            entries = tuple(entries_past_records(read.entries, parents))
+        return SubagentTranscriptRead(
+            session_file=read.session_file,
+            from_byte=read.from_byte,
+            next_byte=read.next_byte,
+            reset=read.reset,
+            entries=entries,
+            messages=_messages_of(entries),
+            entry_patches=patches,
         )
 
     def set_custom_tools(self, tools: Sequence[HostTool[Any, Any]]) -> tuple[str, ...]:

@@ -20,9 +20,9 @@ import {
 	SessionReadConflictError,
 	type SessionStorage,
 	SessionWriteConflictError,
-	claimSessionLease,
 	sessionHeaderIdInPrefix,
 	sessionLeaseId,
+	tryAcquireSessionLease,
 } from "./session-storage";
 import { eexist, enoent } from "./session-storage-errors";
 import type { SessionTitleUpdate } from "./session-title-slot";
@@ -3347,9 +3347,9 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (!lock) {
 			let lease: FileLockHandle | null;
 			try {
-				lease = claimSessionLease(key);
+				lease = tryAcquireSessionLease(key);
 			} catch (err) {
-				// As a file claim whose lock cannot be taken: counts as held, guards nothing.
+				// As a file claim that cannot be probed: counts as held, guards nothing.
 				logger.debug("SqlSessionStorage could not take a session lock", { sessionId, error: toError(err).message });
 				lease = { release: () => {} };
 			}

@@ -63,6 +63,37 @@ class CountingFileSessionStorage extends FileSessionStorage {
 	}
 }
 
+/** A session `id` recorded in `cwd`, past the 8 MiB from which a resume streams it. */
+function longTranscript(id: string, cwd: string): string {
+	const timestamp = "2026-11-18T00:00:00.000Z";
+	return [
+		{ type: "session", version: 3, id, timestamp, cwd },
+		{ type: "custom", id: "pad", parentId: null, timestamp, customType: "pad", data: "x".repeat(9 * 1024 * 1024) },
+	]
+		.map(entry => `${JSON.stringify(entry)}\n`)
+		.join("");
+}
+
+/**
+ * File storage on which another writer replaces `file` with `replacement` right before the
+ * second chunked read of it: the read a resume loads from, after the one its header probe made.
+ */
+class ReplacedAfterProbeStorage extends FileSessionStorage {
+	reads = 0;
+
+	constructor(
+		readonly file: string,
+		readonly replacement: string,
+	) {
+		super();
+	}
+
+	override async *readChunks(filePath: string, fromByte?: number): AsyncGenerator<Uint8Array> {
+		if (filePath === this.file && ++this.reads === 2) await Bun.write(filePath, this.replacement);
+		yield* super.readChunks(filePath, fromByte);
+	}
+}
+
 describe("SessionManager cwd adoption on resume", () => {
 	it("adopts the resumed session's own cwd and session directory", async () => {
 		const projectA = makeTempDir("@pi-cwd-a-");
@@ -187,6 +218,35 @@ describe("SessionManager cwd adoption on resume", () => {
 		expect(manager.getSessionDir()).toBe(SessionManager.getDefaultSessionDir(launch));
 		expect(manager.getSessionDir()).not.toBe(path.resolve(store));
 		expect(storage.fullReads).toBe(1);
+	});
+	it("resumes a long transcript replaced after its header was probed in the workspace the replacement records", async () => {
+		// If this regresses, a long session another process replaced between the header probe and the
+		// load resumes as the replacement but in the replaced session's project, though the replacement's
+		// own project is gone, so the resume falls back to the launch directory as it does for that file alone.
+		const launch = makeTempDir("@pi-cwd-launch-");
+		const probedProject = makeTempDir("@pi-cwd-probed-");
+		const store = makeTempDir("@pi-cwd-store-");
+		const file = path.join(store, "long.jsonl");
+		await Bun.write(file, longTranscript("probed", probedProject));
+		const storage = new ReplacedAfterProbeStorage(file, longTranscript("replacement", path.join(store, "gone")));
+
+		const manager = await SessionManager.open(file, undefined, storage, {
+			initialCwd: launch,
+			suppressBreadcrumb: true,
+		});
+
+		expect({
+			sessionId: manager.getSessionId(),
+			cwd: manager.getCwd(),
+			sessionDir: manager.getSessionDir(),
+			chunkedReads: storage.reads,
+		}).toEqual({
+			sessionId: "replacement",
+			cwd: path.resolve(launch),
+			sessionDir: SessionManager.getDefaultSessionDir(launch),
+			chunkedReads: 2,
+		});
+		await manager.close();
 	});
 	it("reads an unchanged fail-closed session once to parse and once to confirm it is unchanged", async () => {
 		const project = makeTempDir("@pi-cwd-fail-closed-");

@@ -15,6 +15,16 @@ import {
 } from "@oh-my-pi/pi-ai";
 import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import { getSessionsDir, isEnoent, readLines, stringifyDeepJson } from "@oh-my-pi/pi-utils";
+import {
+	applyEntryPatches,
+	ENTRY_PATCH_CUSTOM_TYPE,
+	type EntryPatch,
+	type EntryPatchRecord,
+	entryAcceptsPatch,
+	entryPatchesOf,
+	isEntryPatchRecord,
+	setPatchedFields,
+} from "@oh-my-pi/pi-utils/entry-patches";
 import type {
 	AgentType,
 	MessageStatsInput,
@@ -496,19 +506,129 @@ function visitSessionEntriesLenient(bytes: Uint8Array, visit: (entry: SessionEnt
 	return read;
 }
 
-/** Parse every well-formed entry in a transcript buffer (malformed lines skipped). */
+/** Patches of a transcript's `entry_patch` records, by the id of the entry each names, in file order. */
+type EntryPatchesById = Map<string, EntryPatch[]>;
+
+/**
+ * Bytes the line of every `entry_patch` record holds: its `customType` as JSON writes it. A scan for
+ * records parses only the lines that hold them.
+ */
+const ENTRY_PATCH_MARKER = Buffer.from(JSON.stringify(ENTRY_PATCH_CUSTOM_TYPE));
+
+/** Index of the first {@link ENTRY_PATCH_MARKER} in `bytes` at or after `from`, or -1. */
+function entryPatchMarkerAt(bytes: Uint8Array, from = 0): number {
+	return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).indexOf(ENTRY_PATCH_MARKER, from);
+}
+
+/** The patches of `entry` when it is a well-formed `entry_patch` record. */
+function recordPatches(entry: SessionEntry): readonly EntryPatch[] {
+	if (!isEntryPatchRecord(entry)) return [];
+	return entryPatchesOf(entry) ?? [];
+}
+
+/** The patches of the `entry_patch` records in `bytes`, parsing only the lines that hold {@link ENTRY_PATCH_MARKER}. */
+function collectEntryPatches(bytes: Uint8Array): EntryPatchesById {
+	const byId: EntryPatchesById = new Map();
+	let at = entryPatchMarkerAt(bytes);
+	while (at !== -1) {
+		const newline = bytes.indexOf(LF, at);
+		const entry = parseJsonLine(bytes, bytes.lastIndexOf(LF, at) + 1, newline === -1 ? bytes.length : newline);
+		for (const patch of entry ? recordPatches(entry) : []) {
+			const held = byId.get(patch.entryId);
+			if (held) held.push(patch);
+			else byId.set(patch.entryId, [patch]);
+		}
+		at = newline === -1 ? -1 : entryPatchMarkerAt(bytes, newline + 1);
+	}
+	return byId;
+}
+
+/**
+ * Set on `entry` the fields of each patch `byId` holds for it that fits it, in file order, so the
+ * newest value of a field wins. Returns its id when a record names it.
+ */
+function patchEntry(entry: SessionEntry, byId: EntryPatchesById): string | undefined {
+	if (byId.size === 0 || entry.type === "session" || !("id" in entry) || typeof entry.id !== "string")
+		return undefined;
+	const patches = byId.get(entry.id);
+	if (!patches) return undefined;
+	for (const patch of patches) if (entryAcceptsPatch(entry, patch)) setPatchedFields(entry, patch);
+	return entry.id;
+}
+
+/**
+ * `entries` without their `entry_patch` records. The entry appended after a record names it as
+ * parent; it names the record's own parent instead, as the transcript reads when the fields the
+ * record sets are written inline.
+ */
+function withoutEntryPatchRecords(entries: readonly SessionEntry[]): SessionEntry[] {
+	const recordParents = new Map<string, string | null>();
+	const kept: SessionEntry[] = [];
+	for (const entry of entries) {
+		if (!isEntryPatchRecord(entry)) kept.push(entry);
+		else if (typeof entry.id === "string")
+			recordParents.set(entry.id, "parentId" in entry && typeof entry.parentId === "string" ? entry.parentId : null);
+	}
+	if (recordParents.size === 0) return kept;
+	for (const entry of kept) {
+		if (!("parentId" in entry) || typeof entry.parentId !== "string") continue;
+		let parentId: string | null = entry.parentId;
+		// Records of passes that ran back to back chain onto each other; the hop bound stops a cycle.
+		for (let hops = 0; parentId !== null && recordParents.has(parentId) && hops < recordParents.size; hops++) {
+			parentId = recordParents.get(parentId) ?? null;
+		}
+		entry.parentId = parentId;
+	}
+	return kept;
+}
+
+/**
+ * The parents of a transcript's `entry_patch` records read so far, by record id, each through the
+ * records it names as parent. An entry appended after a record names the record as parent; its
+ * parent is the entry the record follows, as the transcript reads with the records' fields inline.
+ */
+type RecordParents = Map<string, string | null>;
+
+/** Note the parent of `record` in `recordParents`, through the records it already holds. */
+function noteRecordParent(recordParents: RecordParents, record: SessionEntry & EntryPatchRecord): void {
+	if (typeof record.id !== "string") return;
+	const parentId = "parentId" in record && typeof record.parentId === "string" ? record.parentId : null;
+	recordParents.set(
+		record.id,
+		parentId !== null && recordParents.has(parentId) ? (recordParents.get(parentId) ?? null) : parentId,
+	);
+}
+
+/**
+ * Parse every well-formed entry in a transcript buffer (malformed lines skipped), with the fields its
+ * `entry_patch` records set. The records themselves are not listed ({@link withoutEntryPatchRecords}).
+ */
 export function parseAllSessionEntries(bytes: Uint8Array): SessionEntry[] {
 	const entries: SessionEntry[] = [];
 	visitSessionEntriesLenient(bytes, entry => entries.push(entry));
-	return entries;
+	applyEntryPatches(entries);
+	return withoutEntryPatchRecords(entries);
 }
 
-/** Rebuild the cursor state of `bytes` (a transcript prefix): the last service tier and the Spotlight state. */
-function scanPrefixState(bytes: Uint8Array, spotlight: SpotlightCollector): ServiceTierByFamily | undefined {
+/**
+ * Rebuild the cursor state of `bytes` (a transcript prefix): the last service tier, the Spotlight
+ * state, from entries carrying the fields `patches` sets, and the parents of its records, noted in
+ * `recordParents`.
+ */
+function scanPrefixState(
+	bytes: Uint8Array,
+	spotlight: SpotlightCollector,
+	patches: EntryPatchesById,
+	recordParents: RecordParents,
+): ServiceTierByFamily | undefined {
 	let currentServiceTier: ServiceTierByFamily | undefined;
 	visitSessionEntriesLenient(bytes, entry => {
 		if (isServiceTierChange(entry)) currentServiceTier = coerceServiceTierByFamily(entry.serviceTier);
-		else spotlight.visit(entry);
+		else if (isEntryPatchRecord(entry)) noteRecordParent(recordParents, entry);
+		else {
+			patchEntry(entry, patches);
+			spotlight.visit(entry);
+		}
 	});
 	return currentServiceTier;
 }
@@ -523,6 +643,11 @@ export interface SessionParserState {
 	serviceTier: ServiceTierByFamily | null;
 	/** Absent in cursors persisted before the Spotlight tables; such a tail parse starts from an empty state. */
 	spotlight?: SpotlightParserState;
+	/**
+	 * The parents of the `entry_patch` records read so far, by record id ({@link RecordParents}); absent
+	 * when there are none, and in cursors persisted before it.
+	 */
+	recordParents?: Array<[string, string | null]>;
 }
 
 export interface ParseSessionResult {
@@ -539,9 +664,12 @@ export interface ParseSessionResult {
 
 const CHECKPOINT_BYTES = 256;
 
-async function readCheckpoint(handle: fs.FileHandle, end: number): Promise<Uint8Array> {
-	// Positional reads keep the descriptor at zero for Bun.file(fd)'s subsequent tail read.
-	const start = Math.max(0, end - CHECKPOINT_BYTES);
+/**
+ * Bytes `start`..`end` of the file, read by position. `Bun.file(fd).slice(0, n)` reads from the
+ * descriptor's position, not from byte 0, so a second read of the same descriptor gets the bytes after
+ * the first.
+ */
+async function readRange(handle: fs.FileHandle, start: number, end: number): Promise<Uint8Array> {
 	const bytes = new Uint8Array(end - start);
 	let read = 0;
 	while (read < bytes.length) {
@@ -561,47 +689,74 @@ export function matchesSessionFile(state: SessionParserState, info: nodeFs.Stats
 	return state.ino === info.ino && state.birthtimeMs === info.birthtimeMs;
 }
 
-/** Offset-only callers reconstruct service-tier state once; persisted cursors read only the appended tail. */
-export async function parseSessionFile(
+/** What a read of transcript entries derives: their rows, and the cursor state they leave. */
+interface DerivedRows {
+	stats: MessageStatsInput[];
+	userStats: UserMessageStats[];
+	userLinks: UserMessageLink[];
+	toolCalls: ToolCallStats[];
+	toolResults: ToolResultLink[];
+	/** The service tier in force after the entries. */
+	serviceTier: ServiceTierByFamily | undefined;
+	/** Bytes read, through the last complete entry. */
+	read: number;
+	/** Ids of the entries a record named. */
+	patched: Set<string>;
+	/** The parents of the records read, and of those `recordParents` held before them. */
+	recordParents: RecordParents;
+}
+
+/**
+ * Derive the rows of the entries in `bytes`, each carrying the fields `patches` sets; `serviceTier`,
+ * `spotlight` and `recordParents` hold the state the entries before them left.
+ */
+function deriveRows(
+	bytes: Uint8Array,
 	sessionPath: string,
-	fromOffset = 0,
-	state?: SessionParserState,
-	replay = false,
-): Promise<ParseSessionResult> {
-	let bytes: Uint8Array;
-	let start = fromOffset;
-	let reset = false;
-	let currentServiceTier: ServiceTierByFamily | undefined;
-	let info: nodeFs.Stats;
-	let checkpoint: string;
-	let read: number;
+	serviceTier: ServiceTierByFamily | undefined,
+	spotlight: SpotlightCollector,
+	patches: EntryPatchesById,
+	recordParents: RecordParents,
+): DerivedRows {
 	const folder = extractFolderFromPath(sessionPath);
 	const agentType = classifyAgentType(sessionPath);
-	const stats: MessageStatsInput[] = [];
-	const userStats: UserMessageStats[] = [];
-	const userLinks: UserMessageLink[] = [];
-	const toolCalls: ToolCallStats[] = [];
-	const toolResults: ToolResultLink[] = [];
+	const rows: DerivedRows = {
+		stats: [],
+		userStats: [],
+		userLinks: [],
+		toolCalls: [],
+		toolResults: [],
+		serviceTier,
+		read: 0,
+		patched: new Set(),
+		recordParents,
+	};
 	// First call per id: the row `INSERT OR IGNORE` keeps, so it can be written with its result.
 	const callsById = new Map<string, ToolCallStats>();
-	let spotlight = new SpotlightCollector(sessionPath, folder, emptySpotlightState());
 
 	// Reduce each entry immediately so full replays do not retain tool-output/message bodies.
-	const visit = (entry: SessionEntry): void => {
+	rows.read = visitSessionEntriesLenient(bytes, entry => {
+		// A record is no entry of the session: the entries it names carry its fields.
+		if (isEntryPatchRecord(entry)) {
+			noteRecordParent(rows.recordParents, entry);
+			return;
+		}
+		const patched = patchEntry(entry, patches);
+		if (patched !== undefined) rows.patched.add(patched);
 		spotlight.visit(entry);
 		if (isServiceTierChange(entry)) {
-			currentServiceTier = coerceServiceTierByFamily(entry.serviceTier);
+			rows.serviceTier = coerceServiceTierByFamily(entry.serviceTier);
 			return;
 		}
 		if (isUserMessage(entry)) {
 			const userMsg = extractUserStats(sessionPath, folder, entry);
-			if (userMsg) userStats.push(userMsg);
+			if (userMsg) rows.userStats.push(userMsg);
 			return;
 		}
 		if (isToolResultMessage(entry)) {
 			const link = extractToolResultLink(sessionPath, entry);
 			if (!link) return;
-			toolResults.push(link);
+			rows.toolResults.push(link);
 			const call = callsById.get(link.toolCallId);
 			if (call && call.resultChars === undefined) {
 				call.resultChars = link.resultChars;
@@ -611,21 +766,25 @@ export async function parseSessionFile(
 		}
 		if (isModelUsage(entry)) {
 			const modelUsageStats = extractModelUsageStats(sessionPath, folder, entry, agentType);
-			if (modelUsageStats) stats.push(modelUsageStats);
+			if (modelUsageStats) rows.stats.push(modelUsageStats);
 			return;
 		}
 		if (isAssistantMessage(entry)) {
-			const msgStats = extractStats(sessionPath, folder, entry, currentServiceTier, agentType);
-			if (msgStats) stats.push(msgStats);
+			const msgStats = extractStats(sessionPath, folder, entry, rows.serviceTier, agentType);
+			if (msgStats) rows.stats.push(msgStats);
 			for (const call of extractToolCalls(sessionPath, folder, entry, agentType)) {
-				toolCalls.push(call);
+				rows.toolCalls.push(call);
 				if (!callsById.has(call.toolCallId)) callsById.set(call.toolCallId, call);
 			}
-			// Persist links even when the user entry was ingested in an earlier tail read.
-			const parentId = entry.parentId;
+			// Persist links even when the user entry was ingested in an earlier tail read. A reply appended
+			// after a record names the record: it answers the entry the record follows.
+			const parentId =
+				entry.parentId && rows.recordParents.has(entry.parentId)
+					? rows.recordParents.get(entry.parentId)
+					: entry.parentId;
 			const msg = entry.message;
 			if (parentId && msg.role === "assistant" && msg.model && msg.provider) {
-				userLinks.push({
+				rows.userLinks.push({
 					sessionFile: sessionPath,
 					entryId: parentId,
 					model: msg.model,
@@ -633,13 +792,36 @@ export async function parseSessionFile(
 				});
 			}
 		}
-	};
+	});
+	return rows;
+}
+
+/**
+ * Offset-only callers reconstruct service-tier state once; persisted cursors read only the appended tail.
+ * Entries carry the fields their `entry_patch` records set. A record in the tail that names an entry
+ * before it makes the read derive the whole transcript again, flagged `reset`, so the rows an earlier
+ * read stored for that entry are replaced. A reply whose parent is a record links the entry the record
+ * follows, as `parseAllSessionEntries` reads it; the cursor keeps the records' parents, so a reply in
+ * a later tail links through a record an earlier read passed.
+ */
+export async function parseSessionFile(
+	sessionPath: string,
+	fromOffset = 0,
+	state?: SessionParserState,
+	replay = false,
+): Promise<ParseSessionResult> {
+	let start = fromOffset;
+	let reset = false;
+	let info: nodeFs.Stats;
+	let checkpoint: string;
+	let rows: DerivedRows;
+	let spotlight: SpotlightCollector;
+	const folder = extractFolderFromPath(sessionPath);
 
 	try {
 		const handle = await fs.open(sessionPath, "r");
 		try {
 			info = await handle.stat();
-			const file = Bun.file(handle.fd);
 			let resume = state?.version === 1 && state.offset === fromOffset;
 			if (resume && state) {
 				reset =
@@ -647,7 +829,7 @@ export async function parseSessionFile(
 					info.size < state.size ||
 					(info.size === state.size && info.mtimeMs !== state.mtimeMs);
 				if (!reset) {
-					const previous = await readCheckpoint(handle, fromOffset);
+					const previous = await readRange(handle, Math.max(0, fromOffset - CHECKPOINT_BYTES), fromOffset);
 					reset = Bun.hash(previous).toString(16) !== state.checkpoint;
 				}
 				resume = !reset;
@@ -655,23 +837,44 @@ export async function parseSessionFile(
 			if (fromOffset > info.size) reset = true;
 			if (replay) resume = false;
 			start = reset || replay ? 0 : Math.max(0, fromOffset);
-			const readStart = resume ? start : 0;
-			bytes = await file.slice(readStart, info.size).bytes();
+			let readStart = resume ? start : 0;
+			let bytes = await readRange(handle, readStart, info.size);
+			const tail = bytes.subarray(start - readStart);
+			const tailPatches = collectEntryPatches(tail);
+			// A record in the prefix names entries of the prefix scan, or of the tail.
+			const patches = readStart === start ? tailPatches : collectEntryPatches(bytes);
+			let serviceTier: ServiceTierByFamily | undefined;
+			let recordParents: RecordParents;
 			if (resume) {
-				currentServiceTier = state?.serviceTier ?? undefined;
+				serviceTier = state?.serviceTier ?? undefined;
 				spotlight = new SpotlightCollector(sessionPath, folder, state?.spotlight ?? emptySpotlightState());
+				recordParents = new Map(state?.recordParents);
 			} else {
 				const prefix = new SpotlightCollector(sessionPath, folder, emptySpotlightState(), false);
-				currentServiceTier = scanPrefixState(bytes.subarray(0, start), prefix);
+				recordParents = new Map();
+				serviceTier = scanPrefixState(bytes.subarray(0, start), prefix, patches, recordParents);
 				spotlight = new SpotlightCollector(sessionPath, folder, prefix.state);
 			}
-			read = visitSessionEntriesLenient(bytes.subarray(start - readStart), visit);
-			const newOffset = start + read;
+			const tailRows = deriveRows(tail, sessionPath, serviceTier, spotlight, patches, recordParents);
+			rows = tailRows;
+			// A record of the tail names an entry before it, whose rows an earlier read stored: derive
+			// every row again, from entries that carry the records' fields, to replace those rows.
+			if (start > 0 && [...tailPatches.keys()].some(id => !tailRows.patched.has(id))) {
+				reset = true;
+				start = 0;
+				if (readStart > 0) {
+					readStart = 0;
+					bytes = await readRange(handle, 0, info.size);
+				}
+				spotlight = new SpotlightCollector(sessionPath, folder, emptySpotlightState());
+				rows = deriveRows(bytes, sessionPath, undefined, spotlight, collectEntryPatches(bytes), new Map());
+			}
+			const newOffset = start + rows.read;
 			const checkpointStart = Math.max(0, newOffset - CHECKPOINT_BYTES);
 			const previous =
 				checkpointStart >= readStart
 					? bytes.subarray(checkpointStart - readStart, newOffset - readStart)
-					: await readCheckpoint(handle, newOffset);
+					: await readRange(handle, checkpointStart, newOffset);
 			checkpoint = Bun.hash(previous).toString(16);
 		} finally {
 			await handle.close();
@@ -691,13 +894,13 @@ export async function parseSessionFile(
 	}
 
 	await spotlight.finish();
-	const newOffset = start + read;
+	const newOffset = start + rows.read;
 	return {
-		stats,
-		userStats,
-		userLinks,
-		toolCalls,
-		toolResults,
+		stats: rows.stats,
+		userStats: rows.userStats,
+		userLinks: rows.userLinks,
+		toolCalls: rows.toolCalls,
+		toolResults: rows.toolResults,
 		spotlight: spotlight.rows,
 		newOffset,
 		reset,
@@ -709,8 +912,9 @@ export async function parseSessionFile(
 			size: info.size,
 			mtimeMs: info.mtimeMs,
 			checkpoint,
-			serviceTier: currentServiceTier ?? null,
+			serviceTier: rows.serviceTier ?? null,
 			spotlight: spotlight.state,
+			recordParents: rows.recordParents.size > 0 ? [...rows.recordParents] : undefined,
 		},
 	};
 }
@@ -770,19 +974,28 @@ export async function listAllSessionFiles(): Promise<string[]> {
 }
 
 /**
- * Find a specific entry in a session file.
+ * Find a specific entry in a session file, carrying the fields its `entry_patch` records set. A record
+ * is no entry of the session: asked for a record's id, this finds nothing.
  */
 export async function getSessionEntry(sessionPath: string, entryId: string): Promise<SessionEntry | null> {
+	let found: SessionEntry | null = null;
+	const held: EntryPatch[] = [];
 	try {
 		for await (const line of readLines(Bun.file(sessionPath).stream())) {
+			// Past the entry, only a record can still change it.
+			if (found && entryPatchMarkerAt(line) === -1) continue;
 			const entry = parseJsonLine(line, 0, line.length);
-			if (entry && "id" in entry && entry.id === entryId) {
-				return entry;
+			if (!entry) continue;
+			if (isEntryPatchRecord(entry)) {
+				for (const patch of recordPatches(entry)) if (patch.entryId === entryId) held.push(patch);
+			} else if (!found && "id" in entry && entry.id === entryId) {
+				found = entry;
 			}
 		}
 	} catch (err) {
 		if (isEnoent(err)) return null;
 		throw err;
 	}
-	return null;
+	if (found) patchEntry(found, new Map([[entryId, held]]));
+	return found;
 }

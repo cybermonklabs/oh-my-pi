@@ -115,6 +115,13 @@ export interface SessionHeader {
 
 export interface EntryBase {
 	id: string;
+	/**
+	 * In an `entry` or `snapshot-chunk` frame: the nearest entry above this one
+	 * on the host's chain that the host sends. It skips each entry the host
+	 * does not send (one this file has no type for, and an `entry_patch`
+	 * record), so a guest that walks up the chain reaches the root. A
+	 * transcript read gives the file's own links.
+	 */
 	parentId: string | null;
 	timestamp: string;
 }
@@ -136,6 +143,7 @@ export interface CompactionEntry extends EntryBase {
 	type: "compaction";
 	summary: string;
 	shortSummary?: string;
+	/** In a frame, an entry the host sends: a cut that starts at one it does not send names the next one it does. */
 	firstKeptEntryId: string;
 	tokensBefore: number;
 }
@@ -158,13 +166,45 @@ export interface ThinkingLevelChangeEntry extends EntryBase {
 	thinkingLevel?: string | null;
 }
 
+/** A `/clear` boundary: the model context starts after the newest one. Guests build their context from it; no row shows it. */
+export interface ResetBoundaryEntry extends EntryBase {
+	type: "reset_boundary";
+}
+
+/**
+ * A revision of the session's context notebook, a `custom` entry the model
+ * context shows (its newest revision after the last `/clear`). Guests build
+ * their context from it; no row shows it. The only `custom` entry besides
+ * {@link EntryPatchEntry} a host sends.
+ */
+export interface ContextNotesEntry extends EntryBase {
+	type: "custom";
+	customType: "experimental_context_notes";
+	data: unknown;
+}
+
 export type SessionEntry =
 	| MessageEntry
 	| CustomMessageEntry
 	| CompactionEntry
 	| BranchSummaryEntry
 	| ModelChangeEntry
-	| ThinkingLevelChangeEntry;
+	| ThinkingLevelChangeEntry
+	| ResetBoundaryEntry
+	| ContextNotesEntry;
+
+/**
+ * An `entry_patch` record (`@oh-my-pi/pi-utils/entry-patches`): a `custom`
+ * entry that sets fields on entries already sent, such as the `content` an
+ * elide pass shortened. A host sends it in an `entry` frame, never in a
+ * snapshot, whose entries already carry their fields. A guest applies it to
+ * the entries it holds and never shows it.
+ */
+export interface EntryPatchEntry extends EntryBase {
+	type: "custom";
+	customType: "entry_patch";
+	data: unknown;
+}
 
 /** customType of collab guest prompts injected on the host. */
 export const COLLAB_PROMPT_MESSAGE_TYPE = "collab-prompt";
@@ -370,7 +410,8 @@ export type HostFrame =
 	 * carries `final: true`; guests finalize the replica on that frame.
 	 */
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
-	| { t: "entry"; entry: SessionEntry }
+	/** One live entry, or a record that sets fields on entries the guest holds. */
+	| { t: "entry"; entry: SessionEntry | EntryPatchEntry }
 	| { t: "event"; event: AgentEvent }
 	| { t: "state"; state: SessionState }
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */

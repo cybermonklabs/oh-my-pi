@@ -4,7 +4,7 @@
  * model request and before the loop appends each tool result, and an abort
  * ends that wait at once.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -15,7 +15,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const CALL_ID = "toolu_append_admission";
@@ -51,6 +51,22 @@ class GatedAdmissionStorage extends MemorySessionStorage {
 			this.#arrival = Promise.withResolvers<void>();
 			await this.#arrival.promise;
 		}
+	}
+}
+
+/**
+ * In-memory storage whose append admission throws before it returns a promise
+ * at its second wait, the one before the loop appends the tool result, as an
+ * SDK storage's method can; every other wait admits at once.
+ */
+class ThrowingAdmissionStorage extends MemorySessionStorage {
+	readonly failure = new Error("admission check failed");
+	#waits = 0;
+
+	waitForAppendAdmission(): Promise<void> {
+		this.#waits++;
+		if (this.#waits === 2) throw this.failure;
+		return Promise.resolve();
 	}
 }
 
@@ -213,5 +229,32 @@ describe("AgentSession waits for its storage's append admission", () => {
 		expect(gated.mock.calls).toHaveLength(0);
 		const lastAssistant = gated.session.agent.state.messages.findLast(message => message.role === "assistant");
 		expect(lastAssistant?.role === "assistant" ? lastAssistant.stopReason : undefined).toBe("aborted");
+	});
+
+	it("keeps a completed tool's result when the storage's admission wait throws before it returns a promise", async () => {
+		// If this regresses, an SDK storage whose admission check throws at once makes the agent loop
+		// save an error in place of the result of a tool that already ran, and the model is told the
+		// tool failed.
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const storage = new ThrowingAdmissionStorage();
+			const throwing = startSession(storage);
+			await throwing.session.prompt("read the fixture");
+			await throwing.session.waitForIdle();
+
+			expect({
+				toolRuns: throwing.toolRuns(),
+				saved: savedToolResults(throwing.sessionManager),
+				requests: throwing.mock.calls.length,
+				warned: warn.mock.calls.filter(([message]) => message === "Append admission wait failed"),
+			}).toEqual({
+				toolRuns: 1,
+				saved: [{ content: TOOL_OUTPUT, isError: false }],
+				requests: 2,
+				warned: [["Append admission wait failed", { error: String(storage.failure) }]],
+			});
+		} finally {
+			warn.mockRestore();
+		}
 	});
 });

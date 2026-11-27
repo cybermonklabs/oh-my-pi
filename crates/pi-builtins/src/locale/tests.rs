@@ -2293,3 +2293,31 @@ fn another_threads_refused_clone3_does_not_choose_this_threads_call() {
 	}
 	assert_no_task_has_children(|task| fs::read_to_string(task.join("children")));
 }
+
+/// Failure mode: the locale utility, a process a command starts, keeps the
+/// host's OOM adjustment, so the kernel kills the host first when memory
+/// runs out; or the child's write changes the host's value. The stand-in
+/// answers its own value and its child's as the codeset.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_utility_and_its_child_get_the_tool_oom_score() {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let score = "/proc/self/oom_score_adj";
+	let before = crate::host::below_tool_score();
+	let dir = tempfile::tempdir().unwrap();
+	let program = dir.path().join("score-locale");
+	fs::write(
+		&program,
+		"#!/bin/sh\nread -r score < /proc/self/oom_score_adj\nprintf '%s-%s\\n' \"$score\" \"$(/bin/cat \
+		 /proc/self/oom_score_adj)\"\n",
+	)
+	.unwrap();
+	fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+	let answer = ask(&program);
+	assert_eq!(fs::read_to_string(score).unwrap(), before);
+	assert!(
+		matches!(&answer, crate::locale::Codeset::Loaded(codeset) if codeset == "1000-1000"),
+		"{answer:?}"
+	);
+}

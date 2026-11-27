@@ -4,7 +4,7 @@ import type { Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { withEnv } from "./helpers";
-import { nestedChain } from "./helpers/deep-nesting";
+import { DEEP_LEVELS, nestedChain, nestingOf } from "./helpers/deep-nesting";
 
 const BINDING_BETA = "thinking-binding-controls-2026-08-01";
 const CONTEXT_MANAGEMENT_BETA = "context-management-2025-06-27";
@@ -36,7 +36,7 @@ interface CapturedRequest {
 		context_management?: unknown;
 		fallback_credit_token?: string;
 		fallbacks?: unknown;
-		messages?: unknown;
+		messages?: Array<{ role: string; content: string | Array<Record<string, unknown>> }>;
 		output_config?: { effort?: string; task_budget?: unknown };
 		tools?: Array<Record<string, unknown>>;
 	};
@@ -209,10 +209,10 @@ describe("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", () => {
 		});
 	});
 
-	// A frozen request replays the conversation, whose tool calls' arguments are any JSON. 30,000 levels: the client
-	// writes the request body with `JSON.stringify`, which stops at 40,000 (anthropic-client.ts, outside this change).
-	it("redeems a frozen fallback-credit request whose tool arguments nest 30,000 levels", async () => {
-		const input = nestedChain({ leaf: "bottom" }, 30_000);
+	// A frozen request replays the conversation, whose tool calls' arguments are any JSON, as deep as a transcript
+	// line holds; `structuredClone` and the client's `JSON.stringify` run out of stack near 40,000 levels.
+	it("redeems a frozen fallback-credit request whose tool arguments nest 50,000 levels", async () => {
+		const input = nestedChain();
 		await withEnv({ ...GATEWAY_ENV, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1" }, async () => {
 			const request = await captureRequest(anthropicModel(), {
 				fallbackCreditRedemption: {
@@ -234,6 +234,11 @@ describe("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", () => {
 			});
 			// The frozen body carries no withheld field, so it is redeemed as frozen.
 			expect(request.body.fallback_credit_token).toBe("fct_frozen");
+			const replayed = request.body.messages?.[1]?.content;
+			expect(nestingOf(typeof replayed === "string" ? undefined : replayed?.[0]?.input)).toEqual({
+				levels: DEEP_LEVELS,
+				bottom: { leaf: "bottom" },
+			});
 		});
 	}, 30_000);
 

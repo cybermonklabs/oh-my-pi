@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { inflateSync } from "node:zlib";
 import { $which, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
 
 /** Default cap on a single `direnv` invocation. The first export for a devenv
  *  `.envrc` can build a shell; callers may raise this via `bash.direnvLoadTimeoutMs`. */
@@ -226,7 +227,7 @@ async function runDirenv(
 	const abortSignal = signal
 		? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
 		: AbortSignal.timeout(timeoutMs);
-	const proc = Bun.spawn([bin, ...args], {
+	const proc = Bun.spawn(withToolOomScore([bin, ...args], { env, cwd }), {
 		cwd,
 		env,
 		stdout: "pipe",

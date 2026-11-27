@@ -1164,29 +1164,13 @@ function sessionLeasePath(sessionId: string, createDir: boolean): string {
 }
 
 /**
- * Take a session's ownership lease without waiting for its holder, or `null`
- * while a process, this one included, holds it. On Linux it probes the lease
- * first (`isFileLockHeld`) and answers `null` when the probe finds a holder,
- * claiming only a lease the probe finds free; elsewhere the claim alone
- * answers. Either answers at once. `omp gc` takes it to delete a session no
- * running process owns; a lease released just after it is probed reads as
- * held, which leaves that session for gc's next run. Throws when the lock
- * cannot be probed or taken.
+ * Take a session's ownership lease without waiting, or `null` while another
+ * process holds it. A process writing the session holds it (see
+ * `FileSessionStorage.claimSession`) until it exits; `omp gc` takes it to
+ * delete a session no running process owns. Throws when the lock cannot be
+ * probed.
  */
 export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null {
-	const lockPath = sessionLeasePath(sessionId, true);
-	if (process.platform === "linux" && isFileLockHeld(lockPath)) return null;
-	return tryAcquireFileLock(lockPath);
-}
-
-/**
- * Claim a session's ownership lease to write the session, or `null` while a
- * process, this one included, holds it. A process writing the session holds
- * it (see `FileSessionStorage.claimSession`) until it exits. It claims without
- * probing first; a concurrent probe takes nothing, so it never makes this
- * claim refuse a free lease. Throws when the lock cannot be taken.
- */
-export function claimSessionLease(sessionId: string): FileLockHandle | null {
 	return tryAcquireFileLock(sessionLeasePath(sessionId, true));
 }
 
@@ -1997,7 +1981,7 @@ export class FileSessionStorage implements SessionStorage {
 		} else {
 			let lease: FileLockHandle | null;
 			try {
-				lease = claimSessionLease(sessionId);
+				lease = tryAcquireSessionLease(sessionId);
 			} catch (err) {
 				logger.debug("Session ownership lease unavailable", { sessionId, error: toError(err).message });
 				return () => {};

@@ -168,6 +168,37 @@ describe("sealToFit", () => {
 		]);
 		expect(nestingOf(source.details)).toEqual({ levels: DEEP_LEVELS, bottom: { leaf: "bottom" } });
 	}, 20_000);
+
+	// A tool result's `details` can be an object that writes itself through `toJSON` (a class instance a tool
+	// returned); the depth check reads no `toJSON`, so the seal must still write what one returns past
+	// `JSON.stringify`'s 40,000 levels.
+	test("seals a tool result whose details write a value nested 50,000 levels through toJSON", async () => {
+		const key = await makeKey();
+		const entry = {
+			type: "message",
+			id: "r1",
+			parentId: null,
+			timestamp: "2026-06-12T00:00:00.000Z",
+			message: {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "inspect",
+				content: [{ type: "text", text: "ok" }],
+				details: { toJSON: () => nestedChain({ leaf: "bottom" }) },
+				isError: false,
+				timestamp: 1,
+			},
+		} as unknown as SessionEntry;
+
+		const { sealed, truncated } = await sealToFit(key, sessionData([entry], "r1"), SERVER_MAX_SEALED_BYTES);
+
+		expect(truncated).toBe(false);
+		const opened = (await open(key, sealed)).entries[0] as Extract<SessionEntry, { type: "message" }>;
+		expect(nestingOf((opened.message as ToolResultMessage).details)).toEqual({
+			levels: DEEP_LEVELS,
+			bottom: { leaf: "bottom" },
+		});
+	}, 30_000);
 });
 
 describe("buildShareSnapshot", () => {

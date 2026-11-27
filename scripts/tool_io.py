@@ -10,6 +10,11 @@ import random
 import time
 from typing import Any, Literal
 
+if __package__ in (None, ""):
+    from entry_patches import collect_entry_patches, patch_entry
+else:
+    from .entry_patches import collect_entry_patches, patch_entry
+
 LimitMode = Literal["calls", "events"]
 
 DEFAULT_MAX_ITEMS = 50_000
@@ -312,7 +317,10 @@ def extract_path(arguments: dict[str, Any]) -> str:
 
 
 def _iter_session_entries(session_file: Path) -> Iterator[dict[str, Any]]:
-    with session_file.open("r", encoding="utf-8") as handle:
+    """The entries of `session_file`, each carrying the fields its `entry_patch` records set."""
+    with session_file.open("rb") as handle:
+        patches = collect_entry_patches(handle)
+        handle.seek(0)
         for line in handle:
             line = line.strip()
             if not line:
@@ -323,6 +331,8 @@ def _iter_session_entries(session_file: Path) -> Iterator[dict[str, Any]]:
                 continue
             payload = _as_record(entry)
             if payload is not None:
+                if patches:
+                    patch_entry(payload, patches)
                 yield payload
 
 

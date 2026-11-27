@@ -183,21 +183,17 @@ class TarSourcePayload implements TarPayload {
 		}
 	}
 
-	/** {@link read} as the bounded reads of {@link readByteSourceChunks}, with the same checks. */
-	async *chunks(offset: number, size: number, memberPath: string): AsyncGenerator<Uint8Array> {
-		let remaining = size;
-		try {
-			for await (const bytes of readByteSourceChunks(this.#source, offset, offset + size)) {
-				remaining -= bytes.byteLength;
-				if (remaining < 0) break;
-				yield bytes;
-			}
-			if (remaining !== 0) {
-				throw new ArchiveError(`Archive member '${formatArchivePathForError(memberPath)}' is truncated`);
-			}
-		} catch (error) {
-			throw tarMemberReadError(error);
-		}
+	/**
+	 * {@link read} as the bounded reads of {@link readByteSourceChunks}: each
+	 * range goes through {@link read}, so each is held to its own length, not
+	 * only their total.
+	 */
+	chunks(offset: number, size: number, memberPath: string): AsyncIterable<Uint8Array> {
+		const ranges: ByteSource = {
+			size: this.#source.size,
+			read: (start, end) => this.read(start, end - start, memberPath),
+		};
+		return readByteSourceChunks(ranges, offset, offset + size);
 	}
 }
 
@@ -940,27 +936,23 @@ export type TarMemberPayload = Uint8Array | Blob;
 
 const EMPTY_PAYLOAD = new Uint8Array(0);
 
-function payloadSize(payload: TarMemberPayload): number {
-	return payload instanceof Uint8Array ? payload.byteLength : payload.size;
-}
-
-/** `payload`, then the zero padding that fills its last block. */
-function* payloadBlocks<P extends TarMemberPayload>(payload: P): Generator<Uint8Array | P> {
+/** `payload`, then the zero padding that fills its last block of `size` bytes, the size its header records. */
+function* payloadBlocks<P extends TarMemberPayload>(payload: P, size: number): Generator<Uint8Array | P> {
 	yield payload;
-	const size = payloadSize(payload);
 	const padding = paddedSize(size) - size;
 	if (padding > 0) yield new Uint8Array(padding);
 }
 
+/** The blocks of one entry; its header records `size` (0 for a directory), and its padding follows from it. */
 function* tarEntryBlocks<P extends TarMemberPayload>(
 	archivePath: string,
 	payload: P,
+	size: number,
 	directory: boolean,
 	sequence: number,
 ): Generator<Uint8Array | P> {
 	const pathBytes = TEXT_ENCODER.encode(directory ? `${archivePath}/` : archivePath);
 	const split = splitUstarPath(pathBytes);
-	const size = directory ? 0 : payloadSize(payload);
 	const mtime = 0;
 	const paxRecords: Uint8Array[] = [];
 	if (!split) paxRecords.push(makePaxRecord("path", directory ? `${archivePath}/` : archivePath));
@@ -970,7 +962,7 @@ function* tarEntryBlocks<P extends TarMemberPayload>(
 		const paxPayload = concatBytes(paxRecords);
 		const paxName = TEXT_ENCODER.encode(`PaxHeaders/${String(sequence).padStart(8, "0")}`);
 		yield makeHeader(paxName, new Uint8Array(0), paxPayload.byteLength, 0, 0o644, 0x78);
-		yield* payloadBlocks(paxPayload);
+		yield* payloadBlocks(paxPayload, paxPayload.byteLength);
 	}
 	const effectiveSplit = split ?? [
 		TEXT_ENCODER.encode(`PaxFile/${String(sequence).padStart(8, "0")}`),
@@ -984,7 +976,7 @@ function* tarEntryBlocks<P extends TarMemberPayload>(
 		directory ? 0o755 : 0o644,
 		directory ? 0x35 : 0x30,
 	);
-	if (!directory) yield* payloadBlocks(payload);
+	if (!directory) yield* payloadBlocks(payload, size);
 }
 
 /** Turns tar members, one at a time, into their blocks; remembers the paths so far to add parent directories once. */
@@ -992,14 +984,18 @@ class TarEncoder {
 	readonly #kinds = new Map<string, "directory" | "file">();
 	#sequence = 0;
 
-	/** The blocks of one member, after those of any parent directory not yet written; the payload is yielded as given. */
-	*member<P extends TarMemberPayload>(rawPath: string, payload: P): Generator<Uint8Array | P> {
+	/**
+	 * The blocks of one member, after those of any parent directory not yet
+	 * written; the payload is yielded as given, and its header and padding
+	 * hold it to `size`, which the caller takes once.
+	 */
+	*member<P extends TarMemberPayload>(rawPath: string, payload: P, size: number): Generator<Uint8Array | P> {
 		const directory = rawPath.endsWith("/") || rawPath.endsWith("\\");
 		const normalized = normalizeArchiveEntryPath(rawPath);
 		if (!normalized) throw new ArchiveError(`Invalid tar member path '${formatArchivePathForError(rawPath)}'`);
 		const pathBytes = TEXT_ENCODER.encode(normalized);
 		if (pathBytes.byteLength === 0) throw new ArchiveError("Invalid empty tar member path");
-		if (directory && payloadSize(payload) !== 0) {
+		if (directory && size !== 0) {
 			throw new ArchiveError(`Tar directory '${formatArchivePathForError(normalized)}' cannot contain file data`);
 		}
 		const segments = normalized.split("/");
@@ -1010,7 +1006,7 @@ class TarEncoder {
 				throw new ArchiveError(`Tar member '${formatArchivePathForError(parent)}' is not a directory`);
 			if (kind === "directory") continue;
 			this.#kinds.set(parent, "directory");
-			yield* tarEntryBlocks(parent, EMPTY_PAYLOAD, true, this.#sequence++);
+			yield* tarEntryBlocks(parent, EMPTY_PAYLOAD, 0, true, this.#sequence++);
 		}
 		const existing = this.#kinds.get(normalized);
 		if (existing) {
@@ -1018,7 +1014,7 @@ class TarEncoder {
 			throw new ArchiveError(`Duplicate tar member path '${formatArchivePathForError(normalized)}'`);
 		}
 		this.#kinds.set(normalized, directory ? "directory" : "file");
-		yield* tarEntryBlocks(normalized, payload, directory, this.#sequence++);
+		yield* tarEntryBlocks(normalized, payload, size, directory, this.#sequence++);
 	}
 }
 
@@ -1027,7 +1023,7 @@ export async function encodeTar(members: Iterable<readonly [string, Uint8Array]>
 	const encoder = new TarEncoder();
 	const parts: Uint8Array[] = [];
 	for (const [rawPath, bytes] of members) {
-		for (const block of encoder.member(rawPath, bytes)) parts.push(block);
+		for (const block of encoder.member(rawPath, bytes, bytes.byteLength)) parts.push(block);
 	}
 	parts.push(new Uint8Array(BLOCK_SIZE * 2));
 	return concatBytes(parts);
@@ -1038,7 +1034,7 @@ export async function encodeTar(members: Iterable<readonly [string, Uint8Array]>
  * directories created, an existing file emptied first, so a failure leaves it
  * truncated) member by member, so the archive is never held in memory: a
  * `Blob` payload streams from its source. A `Blob` whose stream does not yield
- * exactly its `size` bytes fails the write.
+ * exactly the `size` it reported when its header was written fails the write.
  */
 export async function writeTarFile(
 	destPath: string,
@@ -1053,7 +1049,10 @@ export async function writeTarFile(
 async function* tarFileChunks(members: Iterable<readonly [string, TarMemberPayload]>): AsyncGenerator<Uint8Array> {
 	const encoder = new TarEncoder();
 	for (const [rawPath, payload] of members) {
-		for (const block of encoder.member(rawPath, payload)) {
+		// Taken once: the header records it, and the stream and the padding are held to it, whatever a
+		// `Blob` reports later.
+		const size = payload instanceof Uint8Array ? payload.byteLength : payload.size;
+		for (const block of encoder.member(rawPath, payload, size)) {
 			if (block instanceof Uint8Array) {
 				yield block;
 				continue;
@@ -1061,10 +1060,10 @@ async function* tarFileChunks(members: Iterable<readonly [string, TarMemberPaylo
 			let streamed = 0;
 			for await (const chunk of block.stream()) {
 				streamed += chunk.byteLength;
-				if (streamed > block.size) break;
+				if (streamed > size) break;
 				yield chunk;
 			}
-			if (streamed !== block.size) {
+			if (streamed !== size) {
 				throw new ArchiveError(
 					`Tar member '${formatArchivePathForError(rawPath)}' changed size while it was written`,
 				);

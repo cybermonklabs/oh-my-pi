@@ -1,7 +1,8 @@
+import { applyEntryPatches, isEntryPatchRecord } from "@oh-my-pi/pi-utils/entry-patches";
 import type { AgentHubDeps, AgentHubRemote } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import type { AgentRecordLike } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
 import { type AgentCostSnapshot, aggregateCost } from "@oh-my-pi/pi-tui/overlays/agent-hub-projection";
-import type { AgentTranscriptSource } from "@oh-my-pi/pi-tui/overlays/agent-transcript-viewer";
+import type { AgentTranscriptEntry, AgentTranscriptSource } from "@oh-my-pi/pi-tui/overlays/agent-transcript-viewer";
 import type { ObservableSession, SessionObserverRegistry } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import { AgentActivityIndex } from "../activity";
 import { getRoleInfo } from "../config/model-roles";
@@ -10,7 +11,7 @@ import { IrcBus, type IrcBusApi } from "../irc/bus";
 import { type AgentLifecycleApi, AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { registerPersistedSubagents, sessionFileBelongsToRoot } from "../registry/persisted-agents";
-import { applyEntryPatchesInWindow } from "../session/entry-patches";
+import { WINDOW_ENTRY_PATCH_HOOKS } from "../session/entry-patches";
 import { normalizeAssistantUsage, parseSessionEntries } from "../session/session-loader";
 import { defaultSessionStorage, readSessionLinesFrom, type SessionStorage } from "../session/session-storage";
 
@@ -18,7 +19,9 @@ import { defaultSessionStorage, readSessionLinesFrom, type SessionStorage } from
  * Transcript reads and parser used by local and host-backed transcript viewers.
  * Reads go through `storage()`, the session storage holding the transcripts:
  * under `session.storage: sql` a transcript is a row with no file behind it.
- * Each read is a window of at most 8 MiB, which the viewer reads on from.
+ * Each read is a window of at most 8 MiB, which the viewer reads on from. The
+ * parser applies a window's `entry_patch` records to its entries and returns
+ * the records too, for the viewer to apply to entries of earlier windows.
  */
 function transcriptSource(storage: () => SessionStorage): AgentTranscriptSource {
 	return {
@@ -26,10 +29,15 @@ function transcriptSource(storage: () => SessionStorage): AgentTranscriptSource 
 		readFrom: async (file, offset) => (await readSessionLinesFrom(storage(), file, offset)).text,
 		parseEntries: text => {
 			const parsed = parseSessionEntries(text);
-			applyEntryPatchesInWindow(parsed);
-			const entries = parsed.filter(entry => entry.type === "message" || entry.type === "model_change");
-			for (const entry of entries) {
-				if (entry.type === "message" && entry.message.role === "assistant") normalizeAssistantUsage(entry.message);
+			applyEntryPatches(parsed, WINDOW_ENTRY_PATCH_HOOKS);
+			const entries: AgentTranscriptEntry[] = [];
+			for (const entry of parsed) {
+				if (entry.type === "message") {
+					if (entry.message.role === "assistant") normalizeAssistantUsage(entry.message);
+					entries.push(entry);
+				} else if (entry.type === "model_change" || isEntryPatchRecord(entry)) {
+					entries.push(entry);
+				}
 			}
 			return entries;
 		},

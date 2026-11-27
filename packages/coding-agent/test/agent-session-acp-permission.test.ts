@@ -31,6 +31,7 @@ import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { computerTurnInFlight, registerComputerController } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { nestedChain } from "../../ai/test/helpers/deep-nesting";
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -396,6 +397,51 @@ it("always-ask: an ACP grant satisfies the inner wrapper's explicit prompt polic
 	const ctx = { settings: Settings.isolated(approvalSettings) } as never;
 
 	await gatedBash!.execute("call-1", { command: "echo hi" }, undefined, undefined as never, ctx);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(bashTool.executeCalls).toBe(1);
+});
+
+// A tool call's arguments are any JSON, as deep as JSON.parse reads: the gate snapshots them and the inner wrapper compares.
+it("an ACP grant covers a call whose arguments nest past JSON.stringify's reach", async () => {
+	const bashTool = makeFakeTool("bash");
+	const wrapped = new ExtensionToolWrapper(bashTool, noUiRunner()) as unknown as AgentTool;
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	const approvalSettings: Record<string, unknown> = {
+		"tools.approvalMode": "always-ask",
+		"tools.approval": { bash: "prompt" },
+	};
+	session = await createSession([wrapped], bridge, approvalSettings);
+
+	await session.setActiveToolsByName(["bash"]);
+	const gatedBash = session.agent.state.tools.find(t => t.name === "bash");
+	const ctx = { settings: Settings.isolated(approvalSettings) } as never;
+
+	await gatedBash!.execute("call-1", { command: "echo hi", note: nestedChain() }, undefined, undefined as never, ctx);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(bashTool.executeCalls).toBe(1);
+});
+
+// The gate snapshots the approved arguments and the inner wrapper compares the call with them: a snapshot that turns
+// an in-process caller's `Date` into a string no longer equals the call, so the grant stops covering it.
+it("an ACP grant covers a call whose arguments hold a Date", async () => {
+	const bashTool = makeFakeTool("bash");
+	const wrapped = new ExtensionToolWrapper(bashTool, noUiRunner()) as unknown as AgentTool;
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	const approvalSettings: Record<string, unknown> = {
+		"tools.approvalMode": "always-ask",
+		"tools.approval": { bash: "prompt" },
+	};
+	session = await createSession([wrapped], bridge, approvalSettings);
+
+	await session.setActiveToolsByName(["bash"]);
+	const gatedBash = session.agent.state.tools.find(t => t.name === "bash");
+	const ctx = { settings: Settings.isolated(approvalSettings) } as never;
+
+	await gatedBash!.execute("call-1", { command: "echo hi", since: new Date(0) }, undefined, undefined as never, ctx);
 
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(bashTool.executeCalls).toBe(1);

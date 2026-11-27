@@ -159,6 +159,30 @@ cursors stay consistent, and falls back to the monolithic `get_messages` when th
 mid-way (`session_busy`, `stale_cursor`); under v1 it sends `get_messages`.
 `Commands.GetMessages` is always the monolithic command.
 
+### Session entries and `entry_patch` records
+
+A session records some changes to an entry after its line (a retry marker, a compaction's
+corrected `tokensAfter`, an elided tool result) as an `entry_patch` record, a `custom` entry that
+names the entries and the fields to set. `entrypatches.go` ports the rules the omp readers use to
+apply them (`ApplyEntryPatches`, `EntryPatchesOf`, `EntryAcceptsPatch`, `SetPatchedFields`).
+
+- `Client.GetEntries` and `Client.GetTree` list no record: an entry whose parent is a record, and
+  a `LeafID` that names one, take the record's parent, and a record node's children take its
+  place in the tree, which is read and written again once, whatever its depth. The entries
+  already carry each record's fields, since the server serves its live entries, and the client
+  never applies a record again: a record the server holds can keep a value a later rewrite-only
+  pass replaced.
+- `Client.GetSubagentMessages` applies each reply's records to its entries, lists no record, and
+  returns the patches of records whose target the reply lacks (an entry an earlier reply
+  returned) in `SubagentTranscriptRead.EntryPatches`, in file order. An entry whose parent is a
+  record takes the record's parent, also for a record an earlier reply of the same session file
+  returned since its last read from the start (`FromByte` 0, or `Reset`): for that the client
+  keeps the id and parent of each record it hid, per session file, and no entry. Apply each patch
+  to the entry you hold with that `EntryID`, when `EntryAcceptsPatch` holds, with
+  `SetPatchedFields`, and decode its `message` again.
+- `Commands.GetEntries`, `Commands.GetTree` and `Commands.GetSubagentMessages` return the answer
+  as the server sent it, records included.
+
 ## Tests
 
 ```sh

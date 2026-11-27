@@ -45,6 +45,42 @@ describe("plain tar written member by member", () => {
 		);
 	});
 
+	// If this regresses, a file that grows or shrinks while it is packed is written under a header that
+	// records the size it had before: the member reads back padded with zeros or cut short, and the
+	// write reports success.
+	test("fails a member whose reported size changes after its header records it", async () => {
+		using dir = TempDir.createSync("@omp-tar-stream-");
+		/** A source whose first reported size is off by `drift` from its bytes, and every later one is right. */
+		class DriftingBlob extends Blob {
+			readonly #drift: number;
+			#sized = false;
+
+			constructor(text: string, drift: number) {
+				super([text]);
+				this.#drift = drift;
+			}
+
+			override get size(): number {
+				if (this.#sized) return super.size;
+				this.#sized = true;
+				return super.size + this.#drift;
+			}
+		}
+		const outcomes: string[] = [];
+		// Shrank to three bytes after the header recorded four; grew to four after it recorded three.
+		for (const blob of [new DriftingBlob("abc", 1), new DriftingBlob("abcd", -1)]) {
+			outcomes.push(
+				await writeTarArchive(dir.join("out.tar"), [["data.bin", blob]]).then(
+					() => "written",
+					(error: unknown) => String(error),
+				),
+			);
+		}
+
+		const refused = "ArchiveError: Tar member 'data.bin' changed size while it was written";
+		expect(outcomes).toEqual([refused, refused]);
+	});
+
 	test("reads a member of a plain tar on disk back in chunks no larger than the stream chunk", async () => {
 		using dir = TempDir.createSync("@omp-tar-stream-");
 		const bytes = patterned(2 * STREAM_CHUNK_SIZE + 77);

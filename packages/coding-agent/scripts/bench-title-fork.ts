@@ -244,6 +244,9 @@ async function indexSessionFiles(sessionsDir: string): Promise<Map<string, strin
  * Read what the experiment needs from one session file. Forked/handed-off
  * sessions (`parentSession`) start from inherited history rather than a fresh
  * first message, so they are rejected along with sessions lacking typed input.
+ * The entries stay raw: the recorded titles were made from the first message as
+ * typed, which its line holds, not from a placeholder an elide pass's
+ * `entry_patch` record later set on it.
  */
 async function readSampleEntry(sessionId: string, file: string): Promise<SampleEntry | undefined> {
 	const entries = await loadEntriesFromFile(file);

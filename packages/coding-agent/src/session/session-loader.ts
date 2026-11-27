@@ -464,7 +464,12 @@ class TranscriptRecordParser {
 	}
 }
 
-/** Parse session JSONL and visit each entry without retaining prior entries. */
+/**
+ * Parse session JSONL and visit each entry without retaining prior entries.
+ * Entries are visited as written: a `tool_result_prune` or `entry_patch`
+ * record is visited as an entry, and the fields it sets on an earlier entry
+ * are not set on it.
+ */
 export async function visitEntriesFromFileStream(
 	filePath: string,
 	visit: (entry: FileEntry) => void | boolean,
@@ -725,7 +730,13 @@ export async function hasFileAsPathComponent(filePath: string): Promise<boolean>
 	}
 }
 
-/** Load and validate a session while retaining malformed-record diagnostics. */
+/**
+ * Load and validate a session while retaining malformed-record diagnostics.
+ * The entries are the file's lines, raw: its `tool_result_prune` and
+ * `entry_patch` records are among them, unapplied. A caller that shows or
+ * derives from the entries migrates them, then calls `applyToolResultPrunes`
+ * and `applyEntryPatches`, as `loadSessionMessagesReadOnly` does.
+ */
 export async function loadSessionFile(
 	filePath: string,
 	storage: SessionStorage = defaultSessionStorage(),
@@ -921,7 +932,8 @@ export async function probeSessionFile(
 
 /**
  * Load the valid entries from a session file, skipping malformed records.
- * Each call returns freshly parsed entries owned by the caller.
+ * Each call returns freshly parsed entries owned by the caller, raw as
+ * {@link loadSessionFile} returns them: records unapplied.
  */
 export async function loadEntriesFromFile(
 	filePath: string,

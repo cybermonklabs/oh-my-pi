@@ -57,16 +57,30 @@ async function session(content: string): Promise<string> {
 	return file;
 }
 
-/** Counts bytes read through `Bun.file().bytes()` until `restore()`; `reset()` zeroes the count. */
-function observeReads(file: string): { readonly bytes: number; reset(): void; restore(): void } {
+/**
+ * Counts bytes read through `Bun.file().bytes()` and `FileHandle.read()` until `restore()`; `reset()`
+ * zeroes the count.
+ */
+async function observeReads(file: string): Promise<{ readonly bytes: number; reset(): void; restore(): void }> {
 	const prototype: Bun.BunFile = Object.getPrototypeOf(Bun.file(file));
 	const original = prototype.bytes;
+	const handle = await fs.open(file, "r");
+	const handlePrototype: fs.FileHandle = Object.getPrototypeOf(handle);
+	await handle.close();
+	const originalRead = handlePrototype.read;
 	let bytes = 0;
-	const observer = spyOn(prototype, "bytes").mockImplementation(async function (this: Bun.BunFile) {
-		const read = await original.call(this);
-		bytes += read.length;
-		return read;
-	});
+	const observers = [
+		spyOn(prototype, "bytes").mockImplementation(async function (this: Bun.BunFile) {
+			const read = await original.call(this);
+			bytes += read.length;
+			return read;
+		}),
+		spyOn(handlePrototype, "read").mockImplementation(async function (this: fs.FileHandle, ...args: unknown[]) {
+			const result = await Reflect.apply(originalRead, this, args);
+			bytes += result.bytesRead;
+			return result;
+		}),
+	];
 	return {
 		get bytes() {
 			return bytes;
@@ -75,7 +89,7 @@ function observeReads(file: string): { readonly bytes: number; reset(): void; re
 			bytes = 0;
 		},
 		restore() {
-			observer.mockRestore();
+			for (const observer of observers) observer.mockRestore();
 		},
 	};
 }
@@ -208,7 +222,7 @@ describe("incremental stats ingestion", () => {
 		closeDb();
 		const tail = assistant("second");
 		await fs.appendFile(file, tail);
-		const reads = observeReads(file);
+		const reads = await observeReads(file);
 		try {
 			await syncAllSessions({ workers: 1 });
 			expect(reads.bytes).toBeLessThan(Buffer.byteLength(tail) + 4096);
@@ -243,7 +257,7 @@ describe("incremental stats ingestion", () => {
 		const file = await session(content);
 		await syncAllSessions({ workers: 1 });
 
-		const reads = observeReads(file);
+		const reads = await observeReads(file);
 		try {
 			await renumberDevice(file);
 			await syncAllSessions({ workers: 1 });
