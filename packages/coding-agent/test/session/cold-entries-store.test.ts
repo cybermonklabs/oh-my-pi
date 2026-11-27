@@ -4,7 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { SessionStoreMasker } from "@oh-my-pi/pi-coding-agent/secrets/session-store-mask";
-import { BLOB_PREFIX, BlobStore, type SessionBlobTier } from "@oh-my-pi/pi-coding-agent/session/blob-store";
+import {
+	BLOB_PREFIX,
+	BlobStore,
+	externalizeImageDataUrlSync,
+	type SessionBlobTier,
+} from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import { convertToColdEntry, isColdEntry } from "@oh-my-pi/pi-coding-agent/session/cold-entries";
 import { ColdEntryStore } from "@oh-my-pi/pi-coding-agent/session/cold-entry-store";
 import type { RuntimeIdentity } from "@oh-my-pi/pi-coding-agent/session/runtime-identity";
@@ -811,6 +816,30 @@ describe("cold entry store", () => {
 		const runtimes = ["u1", "a1", "u2", "a2"].map(id => entry(manager, id).runtime);
 		expect(runtimes[0]).toEqual(runtime);
 		for (const shared of runtimes) expect(shared).toBe(runtimes[0]);
+	});
+
+	it("resolves the image reference a loaded entry's small runtime holds, as it does a larger runtime's", async () => {
+		// If this regresses, a resumed entry whose runtime holds a provider image URL keeps that image's
+		// `blob:sha256:` reference in memory when the runtime is small enough to share among the entries,
+		// where a larger runtime, or the same value in any other field, gets its data URL back.
+		using dir = TempDir.createSync("@omp-cold-entries-");
+		const dataUrl = `data:image/png;base64,${Buffer.alloc(48, 5).toString("base64")}`;
+		const runtime = {
+			version: "18.18.6",
+			image_url: externalizeImageDataUrlSync(new BlobStore(getBlobsDir()), dataUrl),
+		};
+		const file = await writeTranscript(dir.path(), [
+			{ type: "message", id: "u1", runtime, message: { role: "user", content: "u1", timestamp: 1 } },
+			{ type: "message", id: "u2", runtime, message: { role: "user", content: "u2", timestamp: 2 } },
+		]);
+		const manager = await open(file);
+
+		const imageOf = (id: string): unknown => {
+			const held = entry(manager, id).runtime;
+			return held === undefined ? undefined : Reflect.get(held, "image_url");
+		};
+		expect([imageOf("u1"), imageOf("u2")]).toEqual([dataUrl, dataUrl]);
+		await manager.close();
 	});
 
 	// /resume --from-claude persists an imported in-memory session; that live session must still free older bodies.
