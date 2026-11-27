@@ -14,7 +14,13 @@ import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
 import { parseSessionOrigin, type SessionOrigin } from "./session-entries";
 import { visitEntriesFromFile } from "./session-loader";
 import { computeDefaultSessionDirAsync } from "./session-paths";
-import { FileSessionStorage, type SessionStorage, type SessionStorageStat } from "./session-storage";
+import {
+	FileSessionStorage,
+	retryRacedRead,
+	SessionReadConflictError,
+	type SessionStorage,
+	type SessionStorageStat,
+} from "./session-storage";
 import { listSessionTitles, lookupSessionTitle, recordSessionTitle, recordSessionTitles } from "./session-index";
 import { overlapsWindow, type TimeWindow } from "./time-window";
 
@@ -439,10 +445,36 @@ async function scanSessionFile(
 	withStatus: boolean,
 	knownStat?: SessionStorageStat,
 ): Promise<SessionInfo | undefined> {
+	let stat = knownStat;
+	let windowInfo: SessionInfo | undefined;
+	try {
+		return await retryRacedRead(() => {
+			const attemptStat = stat;
+			stat = undefined;
+			return scanSessionFilePass(file, storage, withStatus, attemptStat, info => {
+				windowInfo ??= info;
+			});
+		});
+	} catch (error) {
+		// After the last conflict, return only evidence from the original
+		// windows. Do not cache it or mix it with a later line scan.
+		if (error instanceof SessionReadConflictError) return windowInfo;
+		throw error;
+	}
+}
+
+async function scanSessionFilePass(
+	file: string,
+	storage: SessionStorage,
+	withStatus: boolean,
+	knownStat: SessionStorageStat | undefined,
+	onScanConflict: (info: SessionInfo) => void,
+): Promise<SessionInfo | undefined> {
 	let stat: SessionStorageStat;
 	try {
 		stat = knownStat ?? storage.statSync(file);
-	} catch {
+	} catch (error) {
+		if (error instanceof SessionReadConflictError) throw error;
 		// Missing/unstatable file: no stat identity to cache under.
 		return undefined;
 	}
@@ -506,28 +538,33 @@ async function scanSessionFile(
 		// large leading entry (memory recall, attachment) or a reply (after a
 		// `/skill:` invocation), and an assistant record that fits in neither
 		// window. Recover both in one line-boundary pass rather than trusting the gap.
-		let needPrompt = !firstMessage;
-		let needTurn = assistantTurns === 0;
+		const needPrompt = !firstMessage;
+		const needTurn = assistantTurns === 0;
+		let scanConflict: SessionReadConflictError | undefined;
 		if ((needPrompt || needTurn) && size > SESSION_LIST_PREFIX_BYTES && storage.scanLines) {
+			let prompt = "";
+			let turn = false;
 			try {
 				await storage.scanLines(file, line => {
 					const message = parseTurnLine(line);
 					if (message?.role === "assistant" && needTurn) {
-						assistantTurns = 1;
-						needTurn = false;
-					} else if (message?.role === "user" && needPrompt) {
+						turn = true;
+					} else if (message?.role === "user" && needPrompt && !prompt) {
 						// Cap at what a prompt read from the prefix could hold.
-						const text = textContent(message.content, " ").slice(0, SESSION_LIST_PREFIX_BYTES);
-						if (text) {
-							firstMessage = text;
-							allMessages.unshift(text);
-							needPrompt = false;
-						}
+						prompt = textContent(message.content, " ").slice(0, SESSION_LIST_PREFIX_BYTES);
 					}
-					return !needPrompt && !needTurn;
+					return (!needPrompt || prompt !== "") && (!needTurn || turn);
 				});
-			} catch {
-				// Backend unreadable: keep the bounded-window evidence.
+			} catch (error) {
+				if (error instanceof SessionReadConflictError) scanConflict = error;
+			}
+			// An ordinary read error doesn't erase the records already seen.
+			if (!scanConflict) {
+				if (turn) assistantTurns = 1;
+				if (prompt) {
+					firstMessage = prompt;
+					allMessages.unshift(prompt);
+				}
 			}
 		}
 		firstMessage ||= extractFirstDisplayMessageFromPrefix(content) ?? "";
@@ -549,11 +586,16 @@ async function scanSessionFile(
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
 			status: withStatus ? deriveSessionStatus(suffix) : undefined,
 		};
+		if (scanConflict) {
+			onScanConflict(info);
+			throw scanConflict;
+		}
 		// The cache keeps its own shallow copy; hits also hand out copies, so
 		// callers can never mutate the shared cached object.
 		cache.set(cacheKey, { mtimeMs: stat.mtimeMs, size: stat.size, info: { ...info } });
 		return info;
-	} catch {
+	} catch (error) {
+		if (error instanceof SessionReadConflictError) throw error;
 		return undefined;
 	}
 }
@@ -1021,16 +1063,20 @@ async function lastActivity(session: SessionInfo, storage: SessionStorage): Prom
 async function holdsEntry(file: string, id: string, storage: SessionStorage): Promise<boolean> {
 	let found = false;
 	try {
-		await visitEntriesFromFile(
-			file,
-			entry => {
-				// The header's id is the session's, never an entry's.
-				if (entry.type === "session" || entry.id !== id) return;
-				found = true;
-				return false;
-			},
-			storage,
-		);
+		// A full rewrite between two chunks of a long transcript fails the read: look again from its start.
+		await retryRacedRead(() => {
+			found = false;
+			return visitEntriesFromFile(
+				file,
+				entry => {
+					// The header's id is the session's, never an entry's.
+					if (entry.type === "session" || entry.id !== id) return;
+					found = true;
+					return false;
+				},
+				storage,
+			);
+		});
 	} catch {
 		return false;
 	}
