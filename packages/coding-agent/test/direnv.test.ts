@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { applyDirenvPreflight, executeBash } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
@@ -9,7 +9,8 @@ import {
 	loadDirenvEnv,
 	parseDirenvExport,
 } from "@oh-my-pi/pi-coding-agent/exec/direnv";
-import { $which, TempDir } from "@oh-my-pi/pi-utils";
+import { $which, logger, TempDir } from "@oh-my-pi/pi-utils";
+import { BELOW_TOOL_SCORE, withBelowToolScore } from "./helpers/oom-score";
 
 /** Real-direnv cases need the binary on PATH; skip cleanly when it's absent so
  *  the graceful-degradation code path (returns `null`) isn't asserted against. */
@@ -99,6 +100,88 @@ describe("parseDirenvExport", () => {
 	it("treats empty / whitespace output as no diff", () => {
 		expect(parseDirenvExport("")).toEqual({ set: {}, unset: [] });
 		expect(parseDirenvExport("  \n")).toEqual({ set: {}, unset: [] });
+	});
+});
+
+describe.skipIf(process.platform !== "linux")("loadDirenvEnv (direnv as a tool process)", () => {
+	const score = "/proc/self/oom_score_adj";
+	let savedPath: string | undefined;
+	beforeEach(() => {
+		savedPath = Bun.env.PATH;
+	});
+	afterEach(() => {
+		if (savedPath === undefined) delete Bun.env.PATH;
+		else Bun.env.PATH = savedPath;
+	});
+
+	/** A project with an `.envrc`, whose load runs `body` as the `direnv` first on PATH; that file. */
+	async function withFakeDirenv(body: string): Promise<{ root: string; direnv: string }> {
+		const root = tmp();
+		await Bun.write(path.join(root, ".envrc"), "\n");
+		const bin = path.join(tmp(), "bin");
+		await fs.mkdir(bin);
+		const direnv = path.join(bin, "direnv");
+		await fs.writeFile(direnv, body, { mode: 0o755 });
+		Bun.env.PATH = `${bin}${path.delimiter}${savedPath ?? ""}`;
+		// Drops the direnv found on the previous PATH.
+		clearDirenvCachesForTests();
+		return { root, direnv };
+	}
+
+	/** The message a direct spawn of `program` fails with. */
+	function spawnFailure(program: string): string {
+		try {
+			Bun.spawn([program], { stdout: "ignore", stderr: "ignore" }).kill();
+		} catch (error) {
+			return (error as Error).message;
+		}
+		throw new Error(`${program} started`);
+	}
+
+	it.skipIf(!BELOW_TOOL_SCORE)("runs direnv and its child with oom_score_adj 1000, not the host", async () => {
+		const body = [
+			"#!/bin/sh",
+			`read -r score < ${score}`,
+			`printf '{"OMP_DIRENV_SCORE":"%s","OMP_DIRENV_CHILD_SCORE":"%s"}\\n' "$score" "$(/bin/cat ${score})"`,
+			"",
+		].join("\n");
+		const { root } = await withFakeDirenv(body);
+		await withBelowToolScore(async before => {
+			const diff = await loadDirenvEnv(root);
+			expect(await Bun.file(score).text()).toBe(before);
+			expect(diff).toEqual({ set: { OMP_DIRENV_SCORE: "1000", OMP_DIRENV_CHILD_SCORE: "1000" }, unset: [] });
+		});
+	});
+
+	// Failure mode: a direnv that cannot start (a script whose `#!` interpreter is missing, a file without `#!`
+	// that the kernel cannot load) is reported as a direnv that ran and exited 127, or runs as shell code and
+	// exports what it prints.
+	it("fails the load of a direnv that cannot exec with the error of its spawn", async () => {
+		for (const body of ["#!/nonexistent/interpreter\n", `echo '{"OMP_DIRENV_RAN":"as shell code"}'\n`]) {
+			const { root, direnv } = await withFakeDirenv(body);
+			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			try {
+				expect(await loadDirenvEnv(root)).toBeNull();
+				expect(warn).toHaveBeenCalledWith(
+					"direnv load failed",
+					expect.objectContaining({ error: spawnFailure(direnv) }),
+				);
+			} finally {
+				warn.mockRestore();
+			}
+		}
+	});
+
+	// Failure mode: a direnv that starts and exits 127 is taken for one that could not start.
+	it("reports a direnv that exits 127 by its exit", async () => {
+		const { root } = await withFakeDirenv("#!/bin/sh\nexit 127\n");
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(await loadDirenvEnv(root)).toBeNull();
+			expect(warn).toHaveBeenCalledWith("direnv export failed", expect.objectContaining({ exitCode: 127 }));
+		} finally {
+			warn.mockRestore();
+		}
 	});
 });
 

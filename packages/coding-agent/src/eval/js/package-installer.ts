@@ -1,7 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, isEnoent, ptree, withFileLock, writeRuntimeManifest } from "@oh-my-pi/pi-utils";
-import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { trackDownload } from "../../downloads/activity";
 import { resolveExecutablePath } from "../../subprocess/worker-client";
@@ -145,9 +144,8 @@ export async function installJsPackages(options: InstallJsPackagesOptions): Prom
 			options.signal?.throwIfAborted();
 			if (mode === "managed") await ensureManagedManifest(environment, options.autoProvision, options.signal);
 			const tracker = trackDownload("npm packages", { detail: packages.join(" ") });
-			const command = [resolveExecutablePath(), "add", "--cwd", environment.root, "--ignore-scripts", ...packages];
 			const result = await ptree
-				.exec(withToolOomScore(command), {
+				.exec([resolveExecutablePath(), "add", "--cwd", environment.root, "--ignore-scripts", ...packages], {
 					// In a compiled distribution the resolved executable is omp.
 					// BUN_BE_BUN re-enters Bun's real package-manager
 					// CLI instead of recursively dispatching omp's command parser.
@@ -155,6 +153,8 @@ export async function installJsPackages(options: InstallJsPackagesOptions): Prom
 					signal: options.signal,
 					allowNonZero: true,
 					stderr: "full",
+					// A tool process: the installer and what it starts run with OOM adjustment 1000.
+					toolOomScore: true,
 				})
 				.catch((error: unknown) => {
 					tracker.fail(error);

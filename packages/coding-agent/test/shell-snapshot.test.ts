@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { procmgr } from "@oh-my-pi/pi-utils";
 import { getOrCreateSnapshot } from "@oh-my-pi/pi-coding-agent/utils/shell-snapshot";
 import fnEnvHelper from "../src/utils/shell-snapshot-fn-env.sh" with { type: "text" };
+import { BELOW_TOOL_SCORE, withBelowToolScore } from "./helpers/oom-score";
 
 // macOS ships bash at `/bin/bash`, not `/usr/bin/bash`; resolve a real bash the
 // same way `bash-executor.test.ts` does so these e2e tests stay portable. The
@@ -342,7 +343,7 @@ describe("getOrCreateSnapshot", () => {
 		expect(stdout).toBe("file\nalias\n");
 	});
 
-	it.skipIf(process.platform !== "linux")(
+	it.skipIf(!BELOW_TOOL_SCORE)(
 		"runs the rc files in a shell and child with OOM score 1000 without changing the host",
 		async () => {
 			const home = await fs.mkdtemp(path.join(os.tmpdir(), "omp-snap-oom-"));
@@ -360,19 +361,15 @@ describe("getOrCreateSnapshot", () => {
 			const shellLink = path.join(home, "bash-omp-oom");
 			await fs.symlink(realBash, shellLink);
 
-			// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
-
-			if ((await Bun.file("/proc/self/oom_score_adj").text()).trim() === "1000")
-				await Bun.write("/proc/self/oom_score_adj", "999").catch(() => 0);
-
-			const before = await Bun.file("/proc/self/oom_score_adj").text();
-			const snapshotPath = await getOrCreateSnapshot(shellLink, { ...process.env, HOME: home });
-			expect(await Bun.file("/proc/self/oom_score_adj").text()).toBe(before);
-			expect(snapshotPath).not.toBeNull();
-			const content = await fs.readFile(snapshotPath!, "utf8");
-			// bash on Ubuntu 24.04 lists `alias -- name='…'`; older versions leave out the `--`.
-			expect(content).toMatch(/^alias (-- )?omp_shell_score='echo 1000'$/m);
-			expect(content).toMatch(/^alias (-- )?omp_child_score='echo 1000'$/m);
+			await withBelowToolScore(async before => {
+				const snapshotPath = await getOrCreateSnapshot(shellLink, { ...process.env, HOME: home });
+				expect(await Bun.file("/proc/self/oom_score_adj").text()).toBe(before);
+				expect(snapshotPath).not.toBeNull();
+				const content = await fs.readFile(snapshotPath!, "utf8");
+				// bash on Ubuntu 24.04 lists `alias -- name='…'`; older versions leave out the `--`.
+				expect(content).toMatch(/^alias (-- )?omp_shell_score='echo 1000'$/m);
+				expect(content).toMatch(/^alias (-- )?omp_child_score='echo 1000'$/m);
+			});
 		},
 	);
 	it("cleans up the empty snapshot file when the shell exits with a non-zero code", async () => {

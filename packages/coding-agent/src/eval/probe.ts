@@ -18,8 +18,6 @@
  * the probe down instead of leaking the subprocess.
  */
 
-import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
-
 /** Wall-clock ceiling for a runtime-availability probe when no smaller bound is supplied. */
 export const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
 
@@ -79,7 +77,7 @@ export async function runBoundedProbe(
 	const ceiling = Math.max(timeoutCeilingMs ?? 0, DEFAULT_PROBE_TIMEOUT_MS);
 	const bound = Math.min(timeoutMs && timeoutMs > 0 ? timeoutMs : ceiling, ceiling);
 	const detached = process.platform !== "win32";
-	const proc = Bun.spawn(withToolOomScore(command, { env, cwd }), {
+	const proc = Bun.spawn(command, {
 		cwd,
 		env,
 		stdin: "ignore",

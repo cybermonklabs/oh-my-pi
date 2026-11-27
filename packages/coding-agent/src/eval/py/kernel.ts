@@ -10,7 +10,6 @@
  */
 import * as path from "node:path";
 import { $env, $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
-import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
 import { Settings } from "../../config/settings";
 import { withTimeoutSignal } from "../../utils/fetch-timeout";
 import {
@@ -178,6 +177,23 @@ function startAbortSignal(options: KernelStartOptions): AbortSignal | undefined 
 	return remainingMs === undefined ? options.signal : withTimeoutSignal(Math.max(1, remainingMs), options.signal);
 }
 
+/**
+ * `code`, Python source for `-c`, run as a tool process: on Linux it first sets the interpreter's own
+ * OOM adjustment to 1000, best effort, so the kernel kills it, and what it starts, before the host when
+ * it picks one process to kill for lack of memory. The runner (`runner.py`) starts the same way.
+ */
+export function toolPythonCode(code: string): string {
+	if (process.platform !== "linux") return code;
+	return [
+		"try:",
+		'    with open("/proc/self/oom_score_adj", "w") as score:',
+		'        score.write("1000")',
+		"except OSError:",
+		"    pass",
+		code,
+	].join("\n");
+}
+
 async function probePythonKernelAvailability(
 	cwd: string,
 	interpreter?: string,
@@ -194,7 +210,7 @@ async function probePythonKernelAvailability(
 		}
 		const result = await probeCandidates(
 			runtimes.map(runtime => ({
-				command: [runtime.pythonPath, "-c", "import sys;sys.exit(0)"],
+				command: [runtime.pythonPath, "-c", toolPythonCode("import sys;sys.exit(0)")],
 				env: runtime.env,
 				label: runtime.pythonPath,
 			})),
@@ -383,21 +399,19 @@ export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
 		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT);
 		const kernel = new PythonKernel(Snowflake.next(), runtime.pythonPath);
 
-		const proc = Bun.spawn(
-			withToolOomScore([runtime.pythonPath, "-u", scriptPath], { env: spawnEnv, cwd: options.cwd }),
-			{
-				cwd: options.cwd,
-				detached: shouldDetachKernel(process.platform),
-				env: spawnEnv,
-				stdin: "pipe",
-				stdout: "pipe",
-				stderr: "pipe",
-				windowsHide: shouldHideKernelWindow({
-					platform: process.platform,
-					hostHasInheritableConsole: hostHasInheritableConsole(),
-				}),
-			},
-		);
+		// A tool process: the runner sets its OOM adjustment first (`runner.py`).
+		const proc = Bun.spawn([runtime.pythonPath, "-u", scriptPath], {
+			cwd: options.cwd,
+			detached: shouldDetachKernel(process.platform),
+			env: spawnEnv,
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+			windowsHide: shouldHideKernelWindow({
+				platform: process.platform,
+				hostHasInheritableConsole: hostHasInheritableConsole(),
+			}),
+		});
 
 		kernel.setProcess(proc);
 

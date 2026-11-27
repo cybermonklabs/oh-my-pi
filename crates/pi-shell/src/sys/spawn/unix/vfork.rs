@@ -10,21 +10,24 @@
 //! and every lock in them, the child makes only system calls on data
 //! prepared before the clone: no allocation, no lock, no formatting and
 //! nothing that can panic. It calls `libc` functions that are plain
-//! system-call wrappers, and makes the calls whose `libc` wrappers are
-//! cancellation points or refuse glibc's internal signals through
-//! `libc::syscall`.
+//! system-call wrappers, and makes through `libc::syscall` the calls whose
+//! `libc` wrappers are cancellation points, refuse glibc's internal signals
+//! or can take a lock (musl's `setrlimit`).
 //!
 //! The caller blocks every signal across the clone, glibc's internal ones
-//! included, so none can run a host handler in the child. The child, in
-//! order: sets every signal's disposition (ignored if the program starts
-//! with it ignored, else the default), leads a new session or process group,
-//! hands a foreground job's terminal to its group, sets the umask, changes to
-//! the working directory, installs the fds and closes the closed ones,
-//! empties its signal mask, sets its OOM adjustment to 1000 (best effort;
-//! before the limits, so a low open-files limit cannot refuse it), sets the
-//! resource limits and execs. A failed step stores its errno for the caller
-//! and exits with status 127; the caller reaps it and fails the spawn with
-//! that error.
+//! included, so none can run a host handler in the child; where the block
+//! is refused, it fails the spawn with that error and does not clone. The
+//! child, in order: sets every signal's disposition (ignored if the program
+//! starts with it ignored, else the default), leads a new session or process
+//! group, hands a foreground job's terminal to its group, sets the umask,
+//! changes to the working directory, installs the fds and closes the closed
+//! ones, empties its signal mask, sets its OOM adjustment to 1000 (best
+//! effort; before the limits, so a low open-files limit cannot refuse it),
+//! sets the resource limits and execs. A failed step, a refused disposition
+//! or mask change included, stores its errno for the caller and exits with
+//! status 127; the caller reaps it and fails the spawn with that error. A
+//! caller that cannot restore its own mask after the clone kills and reaps
+//! the program and fails the spawn with that error (`spawn`).
 //!
 //! This file builds on its own, with `std` and `libc` only: an integration
 //! test (`tests/vfork_child.rs`) includes it to run the clone under an
@@ -32,7 +35,7 @@
 
 use std::{
 	cell::Cell,
-	ffi::{c_char, c_int, c_void},
+	ffi::{c_char, c_int, c_long, c_void},
 	io,
 	sync::atomic::{AtomicI32, Ordering},
 };
@@ -164,8 +167,16 @@ pub(super) fn with_stack<R>(f: impl FnOnce(&Stack) -> io::Result<R>) -> io::Resu
 /// Start a child that sets up and execs `child`, on `stack`; its pid once it
 /// exec'd. When a step fails, the child is reaped and the spawn fails with
 /// that step's error (`ENOENT`, `EACCES`, `ENOEXEC`, `E2BIG` from the exec;
-/// `EPERM` from a refused `setpgid`, …). Neither the caller nor the child
+/// `EPERM` from a refused `setpgid`, …), a disposition or mask change that a
+/// syscall filter refuses included. Neither the caller nor the child
 /// allocates or takes a lock.
+///
+/// Where the calling thread cannot block every signal, the spawn fails with
+/// that error and does not clone. Where it cannot restore its mask after the
+/// clone, the program, which exec'd, is killed and reaped and the spawn
+/// fails with that error; where the kill is refused, the spawn returns the
+/// program's pid, so that nothing is left without an owner. A failed clone
+/// or step decides the error before a failed restore.
 ///
 /// # Safety
 ///
@@ -176,7 +187,9 @@ pub(super) unsafe fn spawn(child: &Child<'_>, stack: &Stack) -> io::Result<c_int
 	let all = !0u64;
 	let mut old = 0u64;
 	// SAFETY: both sets are valid for the call.
-	unsafe { sigprocmask(libc::SIG_BLOCK, &raw const all, &raw mut old) };
+	if unsafe { sigprocmask(libc::SIG_BLOCK, &raw const all, &raw mut old) } != 0 {
+		return Err(io::Error::last_os_error());
+	}
 	// SAFETY: the child runs on `stack`, which nothing else uses (the clone
 	// returns only once the child exec'd or exited), and reads `arg`, which
 	// outlives it for the same reason; the caller vouches for `child`.
@@ -192,20 +205,29 @@ pub(super) unsafe fn spawn(child: &Child<'_>, stack: &Stack) -> io::Result<c_int
 	// written the thread's errno too.
 	let failed = (pid < 0).then(io::Error::last_os_error);
 	// SAFETY: restores the mask saved above.
-	unsafe { sigprocmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut()) };
+	let restored = unsafe { sigprocmask(libc::SIG_SETMASK, &raw const old, std::ptr::null_mut()) };
+	let unrestored = (restored != 0).then(io::Error::last_os_error);
 	if let Some(err) = failed {
 		return Err(err);
 	}
-	match arg.errno.load(Ordering::Relaxed) {
-		0 => Ok(pid),
-		errno => {
-			reap(pid);
-			Err(io::Error::from_raw_os_error(errno))
-		},
+	let errno = arg.errno.load(Ordering::Relaxed);
+	if errno != 0 {
+		reap(pid);
+		return Err(io::Error::from_raw_os_error(errno));
 	}
+	if let Some(err) = unrestored {
+		// The program runs: the spawn fails only once it ended.
+		// SAFETY: a signal to our unreaped child.
+		let killed = unsafe { libc::kill(pid, libc::SIGKILL) } == 0;
+		if killed {
+			reap(pid);
+			return Err(err);
+		}
+	}
+	Ok(pid)
 }
 
-/// Reap `pid`, a child that exited.
+/// Reap `pid`, a child that exited or was sent `SIGKILL`.
 fn reap(pid: c_int) {
 	loop {
 		// SAFETY: no status wanted; the pid is our unreaped child.
@@ -247,7 +269,9 @@ unsafe fn run(child: &Child<'_>) -> c_int {
 				} else {
 					libc::SIG_DFL
 				};
-				set_action(sig, handler);
+				if set_action(sig, handler) != 0 {
+					return errno_now();
+				}
 			}
 		}
 		if child.session && libc::setsid() < 0 {
@@ -282,12 +306,14 @@ unsafe fn run(child: &Child<'_>) -> c_int {
 		}
 		// Only now may pending signals arrive: they act as on the program.
 		let empty = 0u64;
-		sigprocmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut());
+		if sigprocmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut()) != 0 {
+			return errno_now();
+		}
 		// Before the limits: a low `RLIMIT_NOFILE` (`ulimit -n 3`) would
 		// refuse the open.
 		prefer_oom_kill();
 		for (resource, limit) in child.limits {
-			if libc::setrlimit(*resource, limit) != 0 {
+			if set_limit(*resource, limit) != 0 {
 				return errno_now();
 			}
 		}
@@ -324,8 +350,8 @@ pub(super) unsafe fn prefer_oom_kill() {
 }
 
 /// `rt_sigaction(sig, handler)` with no flags and an empty mask; glibc's
-/// `sigaction` refuses its internal signals.
-unsafe fn set_action(sig: c_int, handler: libc::sighandler_t) {
+/// `sigaction` refuses its internal signals. 0, or -1 with errno set.
+unsafe fn set_action(sig: c_int, handler: libc::sighandler_t) -> c_long {
 	// The kernel's `struct sigaction`: the handler, the flags, `sa_restorer`
 	// and the mask (x86-64, 64-bit Arm). Only the handler is set, so an
 	// architecture without `sa_restorer` reads the same action from it.
@@ -339,14 +365,36 @@ unsafe fn set_action(sig: c_int, handler: libc::sighandler_t) {
 			std::ptr::null_mut::<usize>(),
 			size_of::<u64>(),
 		)
-	};
+	}
 }
 
 /// `rt_sigprocmask` on the kernel's 64-signal set; glibc's `sigprocmask`
-/// leaves its internal signals out.
-unsafe fn sigprocmask(how: c_int, set: *const u64, old: *mut u64) {
+/// leaves its internal signals out. 0, or -1 with errno set.
+unsafe fn sigprocmask(how: c_int, set: *const u64, old: *mut u64) -> c_long {
 	// SAFETY: the caller passes sets valid for the call (or null `old`).
-	unsafe { libc::syscall(libc::SYS_rt_sigprocmask, how, set, old, size_of::<u64>()) };
+	unsafe { libc::syscall(libc::SYS_rt_sigprocmask, how, set, old, size_of::<u64>()) }
+}
+
+// `prlimit64` reads the kernel's `struct rlimit64`, two 64-bit values:
+// `libc::rlimit` on the 64-bit targets the child runs on.
+const _: () = assert!(size_of::<libc::rlimit>() == 2 * size_of::<u64>());
+
+/// `prlimit64(0, resource, limit, NULL)`: musl's `setrlimit` answers the
+/// call's `ENOSYS` (a syscall filter's) with `__synccall`, which takes its
+/// threads' lock. 0, or -1 with errno set.
+unsafe fn set_limit(resource: Resource, limit: &libc::rlimit) -> c_long {
+	// This process.
+	let pid: libc::pid_t = 0;
+	// SAFETY: a valid limit, no old limit wanted.
+	unsafe {
+		libc::syscall(
+			libc::SYS_prlimit64,
+			pid,
+			resource,
+			std::ptr::from_ref(limit),
+			std::ptr::null_mut::<libc::rlimit>(),
+		)
+	}
 }
 
 /// The calling thread's errno.

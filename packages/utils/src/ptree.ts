@@ -21,39 +21,45 @@ const LINUX_SUBREAPER_BUN_BE_BUN_ENV = "OMP_PTREE_SUBREAPER_BUN_BE_BUN";
 const SUBREAPER_KILL_WINDOW_MS = 100;
 const SUBREAPER_KILL_POLL_MS = 5;
 
-/** Where the spawn of a tool process looks its program up: the child's `PATH` and working directory. */
-export interface ToolOomScoreOptions {
-	/** The child's environment; its `PATH` resolves a bare program name. Defaults to this process's. */
-	env?: Record<string, string | undefined>;
-	/** The child's working directory; a relative program path resolves against it. */
-	cwd?: string;
-}
+/** Set for the launcher of a tool process: what it writes to stderr when its exec fails. */
+const TOOL_EXEC_FAILED_ENV = "OMP_TOOL_EXEC_FAILED";
+/** The `BUN_BE_BUN` of the command a tool process launcher runs, unset when the key is missing. */
+const TOOL_EXEC_BUN_BE_BUN_ENV = "OMP_TOOL_EXEC_BUN_BE_BUN";
 
 /**
- * On Linux, set the tool process's OOM adjustment before replacing the shell
- * with the program. This changes individual victim selection, not group kills
- * (`memory.oom.group=1`). Keep the original PID and pass arguments literally.
- *
- * The wrapper is used only when `/bin/sh` exists and the program resolves, as
- * the child would resolve it, to an executable file: otherwise the command is
- * returned as it is, so a missing program still fails the spawn with its own
- * error instead of `/bin/sh` exiting 127. `/proc/self/exe` (a worker of this
- * build after an in-place upgrade) would name `/bin/sh` once the shell runs, so
- * the wrapper execs this process's image as `/proc/<pid>/exe` instead.
+ * The launcher of a tool process (`exec`'s `toolOomScore`): this build's
+ * runtime, run as `-e` with `-- <file> <argv0> <args>...`, sets its own OOM
+ * adjustment to 1000 and replaces itself with the file. The program keeps
+ * the pid, inherits the adjustment, and starts with the caller's
+ * environment and with every signal the runtime ignores at its default, as
+ * `Bun.spawn` starts it. A failed exec writes `$OMP_TOOL_EXEC_FAILED` to
+ * stderr and exits 127.
  */
-export function withToolOomScore(command: string[], options?: ToolOomScoreOptions): string[] {
-	if (process.platform !== "linux" || !command[0] || !Bun.which("/bin/sh")) return command;
-	const PATH = options?.env ? (options.env.PATH ?? "") : (Bun.env.PATH ?? "");
-	if (!Bun.which(command[0], { PATH, cwd: options?.cwd })) return command;
-	const [program, ...args] = command;
-	return [
-		"/bin/sh",
-		"-c",
-		'{ printf 1000 > /proc/self/oom_score_adj; } 2>/dev/null || :; exec "$0" "$@"',
-		program === "/proc/self/exe" ? `/proc/${process.pid}/exe` : program,
-		...args,
-	];
-}
+const TOOL_EXEC_SCRIPT = `
+const fs = require("node:fs");
+try {
+	fs.writeFileSync("/proc/self/oom_score_adj", "1000");
+} catch {}
+const env = { ...process.env };
+const failed = env.${TOOL_EXEC_FAILED_ENV} ?? "";
+const callerBunBeBun = env.${TOOL_EXEC_BUN_BE_BUN_ENV};
+delete env.${TOOL_EXEC_FAILED_ENV};
+delete env.${TOOL_EXEC_BUN_BE_BUN_ENV};
+if (callerBunBeBun === undefined) delete env.BUN_BE_BUN;
+else env.BUN_BE_BUN = callerBunBeBun;
+// An exec keeps an ignored signal ignored and resets a handled one.
+process.on("SIGPIPE", () => {});
+process.on("SIGXFSZ", () => {});
+// The experimental execve's warning would otherwise reach the program's stderr, should it print.
+process.removeAllListeners("warning");
+process.on("warning", () => {});
+const [file, ...argv] = process.argv.slice(1);
+try {
+	process.execve(file, argv, env);
+} catch {}
+fs.writeSync(2, failed);
+process.exit(127);
+`;
 
 /**
  * `root`'s children, or `undefined` when the walk could not read every candidate (the natives
@@ -904,15 +910,57 @@ export function spawn<In extends InMask = InMask>(cmd: string[], opts?: ChildSpa
 /** Options for exec. */
 export interface ExecOptions extends Omit<ChildSpawnOptions, "stderr" | "stdin">, WaitOptions {
 	input?: string | Buffer | Uint8Array;
+	/**
+	 * On Linux, run `cmd` as a tool process: with OOM adjustment 1000, which
+	 * what it starts inherits, so the kernel kills it before this process
+	 * when it picks one to kill for lack of memory; this process keeps its
+	 * own value. A launcher, this build's runtime, sets the value and execs
+	 * the program in its place: one runtime start per call. A program that
+	 * cannot exec fails as its spawn fails without the option. Ignored
+	 * elsewhere.
+	 */
+	toolOomScore?: boolean;
 }
 
 /** Spawn, wait, and return captured output. */
 export async function exec(cmd: string[], opts?: ExecOptions): Promise<ExecResult> {
-	const { input, stderr, allowAbort, allowNonZero, ...spawnOpts } = opts ?? {};
+	const { toolOomScore, ...rest } = opts ?? {};
+	if (toolOomScore && process.platform === "linux") return await execToolProcess(cmd, rest);
+	const { input, stderr, allowAbort, allowNonZero, ...spawnOpts } = rest;
 	const stdin = typeof input === "string" ? Buffer.from(input) : input;
 	const resolved: ChildSpawnOptions = stdin === undefined ? spawnOpts : { ...spawnOpts, stdin };
 	using child = spawnInternal(cmd, resolved, stderr === "full");
 	return await child.wait({ stderr, allowAbort, allowNonZero });
+}
+
+/**
+ * {@link exec} of `cmd` through the tool process launcher
+ * ({@link TOOL_EXEC_SCRIPT}), which execs the file `Bun.spawn` would run.
+ * Where there is no such file, or the launcher reports that its exec
+ * failed, `cmd` is spawned itself, so the spawn fails with its own error.
+ */
+async function execToolProcess(cmd: string[], opts: ExecOptions): Promise<ExecResult> {
+	const env = opts.env ?? Bun.env;
+	const file = cmd[0] ? Bun.which(cmd[0], { PATH: env.PATH ?? "", cwd: opts.cwd }) : null;
+	if (!file) return await exec(cmd, opts);
+	const failed = `omp: tool exec failed ${crypto.randomUUID()}`;
+	// This process's image, which `/proc/self/exe` then names in the launcher too.
+	const launcher = [`/proc/${process.pid}/exe`, "-e", TOOL_EXEC_SCRIPT, "--", file, ...cmd];
+	const launched = await exec(launcher, {
+		...opts,
+		env: {
+			...env,
+			BUN_BE_BUN: "1",
+			[TOOL_EXEC_FAILED_ENV]: failed,
+			[TOOL_EXEC_BUN_BE_BUN_ENV]: env.BUN_BE_BUN,
+		},
+	}).then(
+		result => ({ result, stderr: result.stderr }),
+		(error: unknown) => ({ error, stderr: error instanceof Exception ? error.stderr : "" }),
+	);
+	if (launched.stderr.includes(failed)) return await exec(cmd, opts);
+	if ("error" in launched) throw launched.error;
+	return launched.result;
 }
 
 // ── Signal combinators ───────────────────────────────────────────────────────

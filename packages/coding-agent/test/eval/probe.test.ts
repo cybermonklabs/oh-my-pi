@@ -15,19 +15,6 @@ const IGNORE_TERM = [bun, "-e", 'process.on("SIGTERM", () => {}); await Bun.slee
 const baseEnv = (): Record<string, string | undefined> => ({ ...process.env });
 
 describe("runBoundedProbe", () => {
-	test.skipIf(process.platform !== "linux")("sets the score of the probe and its child, not the host", async () => {
-		const score = "/proc/self/oom_score_adj";
-		// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
-		if ((await Bun.file(score).text()).trim() === "1000") await Bun.write(score, "999").catch(() => 0);
-		const before = await Bun.file(score).text();
-		const result = await runBoundedProbe(
-			["/bin/sh", "-c", `read -r score < ${score} && [ "$score" = 1000 ] && [ "$(/bin/cat ${score})" = 1000 ]`],
-			{ cwd: process.cwd(), env: baseEnv() },
-		);
-		expect(await Bun.file(score).text()).toBe(before);
-		expect(result).toEqual({ exitCode: 0, timedOut: false, aborted: false });
-	});
-
 	test("a hung probe is bounded by its timeout instead of hanging (regression: #9466)", async () => {
 		const start = Date.now();
 		const result = await runBoundedProbe(HANG, { cwd: process.cwd(), env: baseEnv(), timeoutMs: 300 });

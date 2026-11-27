@@ -457,32 +457,41 @@ fn shebang_less_script_fails_with_enoexec_on_both_paths() {
 	std::fs::remove_file(&path).unwrap();
 }
 
+/// Set in the process [`alone`] starts.
+const ALONE: &str = "PI_SHELL_TEST_ALONE";
+
+/// Run test `name` (its path below this module) again, alone, in a process
+/// of its own, and fail where it fails there; true in that process, where
+/// the caller runs the test's body. A check for a child left asks about
+/// every child of the process, and under libtest (`cargo test`, Bazel) the
+/// other tests' children share the test's process.
+fn alone(name: &str) -> bool {
+	if std::env::var_os(ALONE).is_some() {
+		return true;
+	}
+	let output = std::process::Command::new(std::env::current_exe().unwrap())
+		.arg("--exact")
+		.arg(format!("sys::spawn::unix::tests::{name}"))
+		.env(ALONE, "1")
+		.output()
+		.unwrap();
+	let out = String::from_utf8_lossy(&output.stdout);
+	let err = String::from_utf8_lossy(&output.stderr);
+	assert!(output.status.success(), "the test alone failed: {out}{err}");
+	assert!(out.contains("1 passed"), "the process ran no test: {out}");
+	false
+}
+
 /// Failure mode: a program that cannot start spawns anyway (the engine then
 /// reports an exit status instead of the OS error bash prints), fails with
 /// another error, or leaves its failed child unreaped (a zombie per
 /// failure). The exec's `EACCES`, and a working directory the child cannot
-/// enter. The body runs again, alone, in a process of its own (`ALONE` set):
-/// the check for a child left asks about every child of the process, and
-/// under libtest (`cargo test`, Bazel) the other tests' children share the
-/// test's process.
+/// enter. The body runs alone in a process of its own ([`alone`]).
 #[test]
 fn exec_and_setup_errors_fail_the_spawn_and_leave_no_child() {
 	use std::os::unix::fs::PermissionsExt;
 
-	const ALONE: &str = "PI_SHELL_FAILED_SPAWN_CHILD";
-	if std::env::var_os(ALONE).is_none() {
-		let output = std::process::Command::new(std::env::current_exe().unwrap())
-			.args([
-				"--exact",
-				"sys::spawn::unix::tests::exec_and_setup_errors_fail_the_spawn_and_leave_no_child",
-			])
-			.env(ALONE, "1")
-			.output()
-			.unwrap();
-		let out = String::from_utf8_lossy(&output.stdout);
-		let err = String::from_utf8_lossy(&output.stderr);
-		assert!(output.status.success(), "the test alone failed: {out}{err}");
-		assert!(out.contains("1 passed"), "the process ran no test: {out}");
+	if !alone("exec_and_setup_errors_fail_the_spawn_and_leave_no_child") {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
@@ -1320,6 +1329,331 @@ fn the_child_starts_with_no_signal_blocked_and_the_thread_keeps_its_mask() {
 	.unwrap();
 	assert_eq!(status, ExitStatus::Signaled(Signal::Term), "TERM stayed blocked in the child");
 	assert_eq!(blocked, [libc::SIGTERM], "the spawning thread's mask");
+}
+
+/// System calls a seccomp filter refuses, as a container's or a sandbox's
+/// syscall filter may. The vfork child shares the host's memory: the spawn
+/// must not clone while the calling thread's signals stay deliverable, nor
+/// start a program whose signal state or limits the child could not set,
+/// nor return one while the thread keeps every signal blocked, nor enter a
+/// libc's thread machinery in the child. Each spawn runs on a thread of its
+/// own, under a filter only that thread and its child have, and each test
+/// runs alone in a process of its own ([`alone`]).
+#[cfg(all(
+	target_os = "linux",
+	target_endian = "little",
+	any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod refused_calls {
+	use std::{ffi::c_int, io, ops::Range, ptr, thread};
+
+	use super::super::vfork;
+
+	/// The errno of a refused call.
+	const REFUSED: c_int = libc::EPERM;
+
+	// Classic BPF (`linux/filter.h`) over `seccomp_data` (`linux/seccomp.h`):
+	// load the word at an offset; jump where it is equal, greater, greater
+	// or equal; return. The filter's two answers; the architecture it reads.
+	const LOAD: u16 = 0x20;
+	const JEQ: u16 = 0x15;
+	const JGT: u16 = 0x25;
+	const JGE: u16 = 0x35;
+	const RET: u16 = 0x06;
+	const ALLOW: u32 = 0x7fff_0000;
+	const ERRNO: u32 = 0x0005_0000;
+	#[cfg(target_arch = "x86_64")]
+	const ARCH: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
+	#[cfg(target_arch = "aarch64")]
+	const ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
+
+	/// Where an instruction jumps: to the next one, over `n` more, past the
+	/// condition it checks (which holds), or past its rule (the call does
+	/// not match it).
+	#[derive(Clone, Copy)]
+	enum To {
+		Next,
+		Skip(u8),
+		Holds,
+		Miss,
+	}
+
+	/// An instruction: its code, its operand and its two jumps.
+	type Op = (u16, u32, To, To);
+
+	/// The offset of argument `n`'s low word in `seccomp_data`; its high
+	/// word follows.
+	const fn arg(n: usize) -> u32 {
+		16 + 8 * n as u32
+	}
+
+	/// A condition on a call: its number, or one of its arguments, which the
+	/// kernel passes as 64 bits.
+	enum Cond {
+		Nr(libc::c_long),
+		/// The argument's low 32 bits are this value.
+		Is(usize, u32),
+		/// The argument lies in the range.
+		In(usize, Range<u64>),
+		/// The argument lies outside the range.
+		Out(usize, Range<u64>),
+	}
+
+	impl Cond {
+		/// The instructions that check the condition: on past them where it
+		/// holds, past the rule (`To::Miss`) where it does not.
+		fn compile(&self) -> Vec<Op> {
+			use To::{Holds, Miss, Next, Skip};
+			let mut ops = match self {
+				Self::Nr(nr) => vec![(LOAD, 0, Next, Next), (JEQ, *nr as u32, Holds, Miss)],
+				Self::Is(n, value) => vec![(LOAD, arg(*n), Next, Next), (JEQ, *value, Holds, Miss)],
+				Self::In(n, range) => within(*n, range, Miss, Holds),
+				Self::Out(n, range) => within(*n, range, Holds, Miss),
+			};
+			let len = ops.len();
+			for (i, op) in ops.iter_mut().enumerate() {
+				for to in [&mut op.2, &mut op.3] {
+					if matches!(to, Holds) {
+						*to = Skip((len - i - 1) as u8);
+					}
+				}
+			}
+			ops
+		}
+	}
+
+	/// The instructions that check whether argument `n` lies in `range`: on
+	/// to `inside` or to `outside`.
+	fn within(n: usize, range: &Range<u64>, outside: To, inside: To) -> Vec<Op> {
+		use To::{Next, Skip};
+		let (start, end) = (range.start, range.end);
+		vec![
+			// At or above the start: the high words decide, or else the low.
+			(LOAD, arg(n) + 4, Next, Next),
+			(JGT, (start >> 32) as u32, Skip(3), Next),
+			(JEQ, (start >> 32) as u32, Next, outside),
+			(LOAD, arg(n), Next, Next),
+			(JGE, start as u32, Next, outside),
+			// Below the end, likewise.
+			(LOAD, arg(n) + 4, Next, Next),
+			(JGT, (end >> 32) as u32, outside, Next),
+			(JEQ, (end >> 32) as u32, Next, inside),
+			(LOAD, arg(n), Next, Next),
+			(JGE, end as u32, outside, inside),
+		]
+	}
+
+	/// A seccomp filter: a call that matches one of its rules fails with
+	/// the rule's errno; every other call runs.
+	#[derive(Default)]
+	struct Filter(Vec<libc::sock_filter>);
+
+	impl Filter {
+		/// Refuse call `nr` with `errno` where every condition holds.
+		fn refuse(mut self, nr: libc::c_long, conds: &[Cond], errno: c_int) -> Self {
+			let mut rule = Cond::Nr(nr).compile();
+			for cond in conds {
+				rule.extend(cond.compile());
+			}
+			rule.push((RET, ERRNO | errno as u32, To::Next, To::Next));
+			let len = rule.len();
+			for (i, (code, k, jt, jf)) in rule.into_iter().enumerate() {
+				let offset = |to: To| match to {
+					To::Next => 0,
+					To::Skip(n) => n,
+					// The instruction after the rule's return.
+					To::Miss => (len - i - 1) as u8,
+					To::Holds => unreachable!("`Cond::compile` resolves it"),
+				};
+				let op = libc::sock_filter { code, jt: offset(jt), jf: offset(jf), k };
+				self.0.push(op);
+			}
+			self
+		}
+
+		/// Install the filter on the calling thread; the children it starts
+		/// inherit it.
+		fn install(self) -> io::Result<()> {
+			let rules = u8::try_from(self.0.len()).unwrap();
+			// Another architecture's calls run: their numbers differ.
+			let load = libc::sock_filter { code: LOAD, jt: 0, jf: 0, k: 4 };
+			let arch = libc::sock_filter { code: JEQ, jt: 0, jf: rules, k: ARCH };
+			let allow = libc::sock_filter { code: RET, jt: 0, jf: 0, k: ALLOW };
+			let mut program = vec![load, arch];
+			program.extend(self.0);
+			program.push(allow);
+			let prog = libc::sock_fprog {
+				len:    u16::try_from(program.len()).unwrap(),
+				filter: program.as_mut_ptr(),
+			};
+			// SAFETY: plain prctl calls; `prog` points at `program`, which the
+			// kernel copies during the call.
+			let rc = unsafe {
+				if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0 {
+					libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const prog)
+				} else {
+					-1
+				}
+			};
+			if rc == 0 {
+				Ok(())
+			} else {
+				Err(io::Error::last_os_error())
+			}
+		}
+	}
+
+	/// The calling thread's stack.
+	fn this_thread_stack() -> Range<u64> {
+		// SAFETY: `attr` is plain data, filled by `pthread_getattr_np` before
+		// it is read and destroyed; the other pointers are writable.
+		unsafe {
+			let mut attr = std::mem::zeroed::<libc::pthread_attr_t>();
+			assert_eq!(libc::pthread_getattr_np(libc::pthread_self(), &raw mut attr), 0);
+			let (mut low, mut size) = (ptr::null_mut(), 0);
+			assert_eq!(libc::pthread_attr_getstack(&raw const attr, &raw mut low, &raw mut size), 0);
+			libc::pthread_attr_destroy(&raw mut attr);
+			let low = low as u64;
+			low..low + size as u64
+		}
+	}
+
+	/// The spawn of `/bin/sh -c :` with `rlimits` on a thread of its own,
+	/// under the filter `refuse` builds from that thread's stack: the pid, or
+	/// the errno.
+	fn spawn_under(
+		rlimits: &[(vfork::Resource, libc::rlimit)],
+		refuse: impl FnOnce(Range<u64>) -> Filter + Send,
+	) -> Result<c_int, c_int> {
+		thread::scope(|scope| {
+			let spawning = scope.spawn(move || {
+				let filter = refuse(this_thread_stack());
+				filter.install().expect("the filter installs");
+				let argv = [c"/bin/sh".as_ptr(), c"-c".as_ptr(), c":".as_ptr(), ptr::null()];
+				let envp = [ptr::null()];
+				let child = vfork::Child {
+					path:    argv[0],
+					argv:    argv.as_ptr(),
+					envp:    envp.as_ptr(),
+					cwd:     c"/".as_ptr(),
+					session: false,
+					group:   None,
+					tty:     None,
+					umask:   0o022,
+					fds:     &[],
+					closed:  &[],
+					ignored: 0,
+					limits:  rlimits,
+				};
+				// SAFETY: `child`'s strings and arrays outlive the spawn.
+				let spawned = vfork::with_stack(|stack| unsafe { vfork::spawn(&child, stack) });
+				spawned.map_err(|err| err.raw_os_error().unwrap())
+			});
+			spawning.join().unwrap()
+		})
+	}
+
+	/// [`super::alone`] for test `name` of this module.
+	fn alone(name: &str) -> bool {
+		super::alone(&format!("refused_calls::{name}"))
+	}
+
+	/// That this process has no child: the test runs alone in it.
+	fn assert_no_child() {
+		// SAFETY: plain syscall; `WNOHANG` does not wait.
+		let rc = unsafe { libc::waitpid(-1, ptr::null_mut(), libc::WNOHANG) };
+		assert_eq!(
+			(rc, io::Error::last_os_error().raw_os_error()),
+			(-1, Some(libc::ECHILD)),
+			"the failed spawn left a child"
+		);
+	}
+
+	/// Failure mode: the spawn clones although the calling thread's signals
+	/// stay deliverable, so one can run a host handler in the child, on the
+	/// host's memory. The filter refuses the clone too, with `ENOTSUP`: a
+	/// spawn that clones fails with that errno instead.
+	#[test]
+	fn a_refused_block_of_the_threads_signals_fails_the_spawn_before_the_clone() {
+		if !alone("a_refused_block_of_the_threads_signals_fails_the_spawn_before_the_clone") {
+			return;
+		}
+		let got = spawn_under(&[], |_| {
+			let block = [Cond::Is(0, libc::SIG_BLOCK as u32)];
+			Filter::default()
+				.refuse(libc::SYS_rt_sigprocmask, &block, REFUSED)
+				.refuse(libc::SYS_clone, &[], libc::ENOTSUP)
+		});
+		assert_eq!(got, Err(REFUSED), "spawned, or failed with another errno");
+		assert_no_child();
+	}
+
+	/// Failure mode: the program starts with a disposition its child could
+	/// not reset: here `SIGPIPE`, which the test harness ignores, so a
+	/// program whose reader is gone fails its writes instead of dying.
+	#[test]
+	fn a_refused_disposition_reset_in_the_child_fails_the_spawn() {
+		if !alone("a_refused_disposition_reset_in_the_child_fails_the_spawn") {
+			return;
+		}
+		let got = spawn_under(&[], |_| {
+			let pipe = [Cond::Is(0, libc::SIGPIPE as u32)];
+			Filter::default().refuse(libc::SYS_rt_sigaction, &pipe, REFUSED)
+		});
+		assert_eq!(got, Err(REFUSED), "spawned, or failed with another errno");
+		assert_no_child();
+	}
+
+	/// Failure mode: the program starts with every signal blocked (a `TERM`
+	/// would not end it), its child's change of the mask the clone left it
+	/// refused. The child's set lies on its own stack, off the thread's,
+	/// whose restore of its own mask runs.
+	#[test]
+	fn a_refused_mask_change_in_the_child_fails_the_spawn() {
+		if !alone("a_refused_mask_change_in_the_child_fails_the_spawn") {
+			return;
+		}
+		let got = spawn_under(&[], |stack| {
+			let childs = [Cond::Is(0, libc::SIG_SETMASK as u32), Cond::Out(1, stack)];
+			Filter::default().refuse(libc::SYS_rt_sigprocmask, &childs, REFUSED)
+		});
+		assert_eq!(got, Err(REFUSED), "spawned, or failed with another errno");
+		assert_no_child();
+	}
+
+	/// Failure mode: the spawn returns the program while the spawning
+	/// thread, its restore refused, keeps every signal blocked; or it fails
+	/// and leaves the program running with nothing to wait for it. The
+	/// thread's set lies on its stack; the child's change of its own mask
+	/// runs.
+	#[test]
+	fn a_refused_restore_of_the_threads_mask_fails_the_spawn_and_ends_the_program() {
+		if !alone("a_refused_restore_of_the_threads_mask_fails_the_spawn_and_ends_the_program") {
+			return;
+		}
+		let got = spawn_under(&[], |stack| {
+			let threads = [Cond::Is(0, libc::SIG_SETMASK as u32), Cond::In(1, stack)];
+			Filter::default().refuse(libc::SYS_rt_sigprocmask, &threads, REFUSED)
+		});
+		assert_eq!(got, Err(REFUSED), "spawned, or failed with another errno");
+		assert_no_child();
+	}
+
+	/// Failure mode: the program starts without a limit its child could not
+	/// set, or the child sets it through musl's `setrlimit`, which answers
+	/// `prlimit64`'s `ENOSYS` with `__synccall`: the threads' lock, taken in
+	/// a child that shares the host's memory.
+	#[test]
+	fn a_refused_limit_fails_the_spawn() {
+		if !alone("a_refused_limit_fails_the_spawn") {
+			return;
+		}
+		let no_core = [(libc::RLIMIT_CORE, libc::rlimit { rlim_cur: 0, rlim_max: 0 })];
+		let filter = Filter::default().refuse(libc::SYS_prlimit64, &[], libc::ENOSYS);
+		let got = spawn_under(&no_core, |_| filter);
+		assert_eq!(got, Err(libc::ENOSYS), "spawned, or failed with another errno");
+		assert_no_child();
+	}
 }
 
 #[test]

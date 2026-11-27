@@ -1,13 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runInteractiveBashPty } from "@oh-my-pi/pi-coding-agent/tools/bash-interactive";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { initTheme, type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import { TUI } from "@oh-my-pi/pi-tui";
+import { PtySession } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { VirtualTerminal } from "../../../tui/test/virtual-terminal";
+import { BELOW_TOOL_SCORE, withBelowToolScore } from "../helpers/oom-score";
 
 type InteractiveUi = Pick<NonNullable<AgentToolContext["ui"]>, "custom">;
 
@@ -112,21 +115,65 @@ describe("runInteractiveBashPty", () => {
 
 	// The shell a pty call starts runs with `oom_score_adj` 1000, as every process a tool starts
 	// does, so a memory cgroup's OOM killer ends it before Oh My Pi; Oh My Pi's own value stays.
-	it.skipIf(ptyUnavailable || process.platform !== "linux")(
-		"starts the shell with oom_score_adj 1000 and leaves this process's own value",
+	it.skipIf(ptyUnavailable || !BELOW_TOOL_SCORE)(
+		"starts the shell and its child with oom_score_adj 1000 and leaves this process's own value",
 		async () => {
 			const score = "/proc/self/oom_score_adj";
-			// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
-			if ((await Bun.file(score).text()).trim() === "1000") await Bun.write(score, "999").catch(() => 0);
-			const before = await Bun.file(score).text();
-			const result = await runInteractiveBashPty(headlessUi(), {
-				command: `printf 'score=%s\\n' "$(cat ${score})"`,
-				cwd: tempDir.path(),
-				timeoutMs: 15_000,
+			await withBelowToolScore(async before => {
+				const result = await runInteractiveBashPty(headlessUi(), {
+					command: `read -r score < ${score}; printf 'score=%s child=%s\\n' "$score" "$(/bin/cat ${score})"`,
+					cwd: tempDir.path(),
+					timeoutMs: 15_000,
+				});
+				expect(result.exitCode).toBe(0);
+				expect(result.output).toContain("score=1000 child=1000");
+				expect(await Bun.file(score).text()).toBe(before);
 			});
-			expect(result.exitCode).toBe(0);
-			expect(result.output).toContain("score=1000");
-			expect(await Bun.file(score).text()).toBe(before);
+		},
+	);
+
+	/** `true` as a pty call of a shell whose file is `body`; that file and the call's outcome. */
+	async function runInShell(body: string): Promise<{ shell: string; outcome: string }> {
+		const shell = path.join(tempDir.path(), "bash");
+		fs.writeFileSync(shell, body, { mode: 0o700 });
+		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
+			shell,
+			args: ["-l", "-c"],
+			env: { PATH: Bun.env.PATH ?? "", HOME: tempDir.path() },
+			prefix: undefined,
+		});
+		const result = await runInteractiveBashPty(headlessUi(), {
+			command: "true",
+			cwd: tempDir.path(),
+			timeoutMs: 15_000,
+		});
+		return { shell, outcome: result.exitCode === undefined ? result.output.trim() : `ran: ${result.exitCode}` };
+	}
+
+	// Failure mode: a shell that cannot start (a script whose `#!` interpreter is missing, a file without
+	// `#!` that the kernel cannot load) is reported as a command that ran and exited 127, or runs as shell
+	// code. The pty call must report what the PTY spawner reports for the shell itself.
+	it.skipIf(ptyUnavailable || process.platform !== "linux")(
+		"reports a shell that cannot exec as its spawn does",
+		async () => {
+			for (const body of ["#!/nonexistent/interpreter\n", "echo ran as shell code\n"]) {
+				const { shell, outcome } = await runInShell(body);
+				const session = new PtySession();
+				const start = session.startArgv({ application: shell, args: ["-lc", "true"], cwd: tempDir.path() });
+				const direct = await start.then(
+					result => `ran: ${result.exitCode}`,
+					(error: Error) => `PTY error: ${error.message}`,
+				);
+				expect(outcome).toBe(direct);
+			}
+		},
+	);
+
+	// Failure mode: a shell that starts and exits 127 is taken for one that could not start.
+	it.skipIf(ptyUnavailable || process.platform !== "linux")(
+		"reports a shell that exits 127 as a command that ran",
+		async () => {
+			expect((await runInShell("#!/bin/sh\nexit 127\n")).outcome).toBe("ran: 127");
 		},
 	);
 });

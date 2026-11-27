@@ -27,6 +27,7 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils/dirs";
 
+import { setToolOomScore } from "@oh-my-pi/pi-utils/oom-score";
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
 import { installSqliteLockShim } from "@oh-my-pi/pi-natives/sqlite-locks";
 import { isNativeShell, runNativeShell } from "./cli/native-shell";
@@ -259,6 +260,8 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 		return true;
 	}
 	if (arg === JS_EVAL_PROCESS_ARG) {
+		// A tool process (`spawnJsProcess`): what its cells start inherits the OOM adjustment.
+		setToolOomScore();
 		// This selector is the synchronous bootstrap boundary: keep the evaluator
 		// runtime and postmortem/inspector graph out of ordinary startup without
 		// putting an await ahead of the subprocess message handler.

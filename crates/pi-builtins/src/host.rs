@@ -2101,150 +2101,215 @@ fn native_working_dir<'a>(filesystem: &BlockingFs, cwd: &'a Path) -> io::Result<
 	}
 }
 
-/// The script `/bin/sh -c` runs before a tool's program (the TypeScript
-/// side's `withToolOomScore`): set its own OOM adjustment to 1000, the
-/// kernel's maximum, best effort, then replace itself with `"$0" "$@"`, the
-/// program and its arguments. The program keeps the pid and inherits the
-/// adjustment, so the kernel kills it, and what it starts, before the host
-/// when it picks one process to kill for lack of memory; a cgroup killed as
-/// a whole (`memory.oom.group=1`) takes the host too.
-#[cfg(target_os = "linux")]
-const TOOL_OOM_SCORE: &str =
-	r#"{ printf 1000 > /proc/self/oom_score_adj; } 2>/dev/null || :; exec "$0" "$@""#;
-
-/// Whether `path` is a regular file this process may run: `access` with
-/// `X_OK` checks what `execve` checks (an execute bit for this user, no
-/// `noexec` mount).
-#[cfg(target_os = "linux")]
-fn runs(path: &Path) -> bool {
-	use std::os::unix::ffi::OsStrExt as _;
-
-	let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-		return false;
-	};
-	// SAFETY: `c_path` is a NUL-terminated string that `access` only reads.
-	let executable = unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0;
-	executable && path.metadata().is_ok_and(|m| m.is_file())
+/// Where the environment of a tool program comes from ([`tool_process`]).
+#[derive(Clone, Copy)]
+pub(crate) enum ToolEnv {
+	/// The command's own variables alone: `env_clear` was called.
+	Cleared,
+	/// This process's environment with the command's changes.
+	Inherited,
 }
 
-/// The file `program` names for a child whose `PATH` is `path` and whose
-/// working directory is `cwd` (`None`: this process's), as the child's
-/// `execvp` resolves it: a name with a `/` from `cwd`, any other the first
-/// file of that name that [`runs`] in `path`'s directories (`/bin:/usr/bin`
-/// when `PATH` is unset; an empty or relative entry, and an empty `PATH`,
-/// from `cwd`). `None` when none runs.
-#[cfg(target_os = "linux")]
-pub(crate) fn resolve_program(
-	program: &std::ffi::OsStr,
-	path: Option<&std::ffi::OsStr>,
-	cwd: Option<&Path>,
-) -> Option<PathBuf> {
-	use std::os::unix::ffi::OsStrExt as _;
-
-	let from_cwd = |candidate: PathBuf| match cwd {
-		Some(cwd) if candidate.is_relative() => cwd.join(candidate),
-		_ => candidate,
-	};
-	if program.as_bytes().contains(&b'/') {
-		return Some(from_cwd(PathBuf::from(program))).filter(|candidate| runs(candidate));
-	}
-	let path = path.unwrap_or_else(|| std::ffi::OsStr::new("/bin:/usr/bin"));
-	if program.is_empty() {
-		return None;
-	}
-	std::env::split_paths(path)
-		.map(|dir| from_cwd(dir.join(program)))
-		.find(|candidate| runs(candidate))
-}
-
-/// `/bin/sh` running [`TOOL_OOM_SCORE`] with `program` as `$0`, for a child
-/// whose `PATH` is `path` and whose working directory is `cwd`; arguments the
-/// caller adds become the program's (`"$@"`), and the working directory,
-/// environment, streams and session it sets apply to the shell and pass to
-/// the program through the `exec`. `None` where `/bin/sh` is missing or
-/// `program` resolves to no file that runs ([`resolve_program`]): the shell
-/// would start and then fail, where a spawn of `program` itself fails with
-/// the OS error the callers report (`rsync`'s remote shell) or act on (`rg`
-/// searching the undecoded bytes when a decompressor is missing).
+/// Gives the program `command` spawns the OOM adjustment of tool processes
+/// on Linux: 1000, the kernel's maximum, so the kernel kills it, and what it
+/// starts, before the host when it picks one process to kill for lack of
+/// memory; a cgroup killed as a whole (`memory.oom.group=1`) takes the host
+/// too. Elsewhere `command` is left as it is.
 ///
-/// The shell resolves `program` as the spawn of it would, so the program and
-/// its `argv[0]` stay the same. Only a name without a `/` and without `PATH`
-/// differs: the shell would search a default path of its own, not
-/// `execvp`'s `/bin:/usr/bin`, so `$0` is the file `execvp` finds. That keeps
-/// the program, with its path as `argv[0]`; POSIX `sh` cannot set another.
-#[cfg(target_os = "linux")]
-pub(crate) fn tool_shell(
-	program: &std::ffi::OsStr,
-	path: Option<&std::ffi::OsStr>,
-	cwd: Option<&Path>,
-) -> Option<std::process::Command> {
-	use std::os::unix::ffi::OsStrExt as _;
-
-	static SH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| runs(Path::new("/bin/sh")));
-	if !*SH {
-		return None;
-	}
-	let found = resolve_program(program, path, cwd)?;
-	let zero = if path.is_none() && !program.as_bytes().contains(&b'/') {
-		found.as_os_str()
-	} else {
-		program
-	};
-	let mut command = std::process::Command::new("/bin/sh");
-	command.arg("-c").arg(TOOL_OOM_SCORE).arg(zero);
-	Some(command)
-}
-
-/// A `Command` for `program`, run by a child whose `PATH` is `path` and whose
-/// working directory is `cwd`: on Linux through [`tool_shell`] where it
-/// applies, so the program gets the OOM adjustment of tool processes; else
-/// `program` itself, as std would spawn it.
-pub(crate) fn tool_command(
-	program: &std::ffi::OsStr,
-	path: Option<&std::ffi::OsStr>,
-	cwd: Option<&Path>,
-) -> std::process::Command {
+/// Call it once the program, its arguments, its `argv[0]` (`arg0`, else the
+/// program) and its environment (`env`) are final: the child execs exactly
+/// these. After the fork the child writes its own value, then execs the
+/// program itself (a `pre_exec` hook): the path it names, else each match in
+/// the `PATH` of its environment (this process's where that sets none), as
+/// `posix_spawnp` does. So the host's value does not change, the program
+/// gets its environment byte for byte and keeps its pid and `argv[0]`, and
+/// the spawn fails with the exec's own error, `ENOEXEC` included, which no
+/// shell turns into a script run or an exit status. The hook makes std fork
+/// instead of using `posix_spawn`, which copies the host's page tables. A
+/// command whose strings hold a NUL byte is left as it is: its spawn fails
+/// as it does without the hook.
+pub(crate) fn tool_process<'a>(
+	command: &'a mut std::process::Command,
+	arg0: Option<&std::ffi::OsStr>,
+	env: ToolEnv,
+) -> &'a mut std::process::Command {
 	#[cfg(target_os = "linux")]
-	if let Some(command) = tool_shell(program, path, cwd) {
-		return command;
+	if let Some(exec) = ToolExec::new(command, arg0, env) {
+		use std::os::unix::process::CommandExt as _;
+
+		// SAFETY: the hook runs in the forked child, before its exec.
+		let hook = move || Err(unsafe { exec.run() });
+		// SAFETY: the hook makes only system calls on data prepared here,
+		// which a forked child of a multithreaded process may make.
+		unsafe { command.pre_exec(hook) };
 	}
 	#[cfg(not(target_os = "linux"))]
-	let _ = (path, cwd);
-	std::process::Command::new(program)
+	let _ = (arg0, env);
+	command
 }
 
-/// This test process's OOM adjustment, lowered from 1000 to 999 where it
-/// was 1000: a test that a tool process of this build runs (a bash tool
-/// command) starts at 1000 already, so a child reading 1000 would not show
-/// that its own spawn set it. Best effort: the kernel refuses 999 only below
-/// a minimum a privileged writer set.
+/// What the child of a tool process execs ([`tool_process`]), prepared
+/// before the fork so that the child only makes system calls.
+#[cfg(target_os = "linux")]
+struct ToolExec {
+	/// The files to exec, in order: the program's path, or its matches in
+	/// `PATH`.
+	files:    Vec<std::ffi::CString>,
+	/// The strings `argv` and `envp` point into.
+	_strings: Vec<std::ffi::CString>,
+	argv:     Vec<*const libc::c_char>,
+	envp:     Vec<*const libc::c_char>,
+}
+
+// SAFETY: `argv` and `envp` point into the heap buffers of `_strings`, which
+// live and stay unchanged as long as the struct; the hook only reads them.
+#[cfg(target_os = "linux")]
+unsafe impl Send for ToolExec {}
+// SAFETY: as above.
+#[cfg(target_os = "linux")]
+unsafe impl Sync for ToolExec {}
+
+#[cfg(target_os = "linux")]
+impl ToolExec {
+	/// `command`'s exec, `None` where one of its strings holds a NUL byte.
+	fn new(command: &std::process::Command, arg0: Option<&std::ffi::OsStr>, env: ToolEnv) -> Option<Self> {
+		use std::{
+			ffi::{CString, OsString},
+			os::unix::ffi::OsStrExt as _,
+		};
+
+		let c_string = |bytes: &[u8]| CString::new(bytes).ok();
+		let program = command.get_program();
+		let mut vars: Vec<(OsString, OsString)> = match env {
+			ToolEnv::Cleared => Vec::new(),
+			ToolEnv::Inherited => std::env::vars_os().collect(),
+		};
+		for (key, value) in command.get_envs() {
+			vars.retain(|(name, _)| name != key);
+			if let Some(value) = value {
+				vars.push((key.to_owned(), value.to_owned()));
+			}
+		}
+		let files = if program.as_bytes().contains(&b'/') {
+			vec![c_string(program.as_bytes())?]
+		} else if program.is_empty() {
+			Vec::new()
+		} else {
+			let path = match vars.iter().find(|(name, _)| name == "PATH") {
+				Some((_, path)) => Some(path.clone()),
+				None => std::env::var_os("PATH"),
+			};
+			let path = path.unwrap_or_else(|| OsString::from("/bin:/usr/bin"));
+			let mut files = Vec::new();
+			// An empty entry is the working directory, as `execvp` reads it.
+			for dir in path.as_bytes().split(|&byte| byte == b':') {
+				let mut file = dir.to_vec();
+				if !dir.is_empty() {
+					file.push(b'/');
+				}
+				file.extend_from_slice(program.as_bytes());
+				files.push(c_string(file.as_slice())?);
+			}
+			files
+		};
+		let mut strings = vec![c_string(arg0.unwrap_or(program).as_bytes())?];
+		for arg in command.get_args() {
+			strings.push(c_string(arg.as_bytes())?);
+		}
+		let argc = strings.len();
+		for (name, value) in &vars {
+			let mut var = name.as_bytes().to_vec();
+			var.push(b'=');
+			var.extend_from_slice(value.as_bytes());
+			strings.push(c_string(var.as_slice())?);
+		}
+		let pointers = |strings: &[CString]| {
+			let mut pointers: Vec<*const libc::c_char> = strings.iter().map(|s| s.as_ptr()).collect();
+			pointers.push(std::ptr::null());
+			pointers
+		};
+		let argv = pointers(&strings[..argc]);
+		let envp = pointers(&strings[argc..]);
+		Some(Self { files, _strings: strings, argv, envp })
+	}
+
+	/// Sets the OOM adjustment, then execs each file in turn; returns the
+	/// error of the exec as `execvp` reports it: the first that is not a
+	/// miss, else `EACCES` if a file was refused, else the last miss.
+	///
+	/// # Safety
+	///
+	/// Only in a forked child before it execs ([`prefer_oom_kill`]).
+	unsafe fn run(&self) -> io::Error {
+		// SAFETY: the caller's contract.
+		unsafe { prefer_oom_kill() };
+		let mut refused = false;
+		let mut last = libc::ENOENT;
+		for file in &self.files {
+			// SAFETY: NUL-terminated strings and NULL-terminated arrays that
+			// `self` owns; `execve` returns only on failure.
+			unsafe { libc::execve(file.as_ptr(), self.argv.as_ptr(), self.envp.as_ptr()) };
+			let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::ENOENT);
+			match errno {
+				libc::EACCES => refused = true,
+				libc::ENOENT | libc::ESTALE | libc::ENOTDIR | libc::ENODEV | libc::ETIMEDOUT => {},
+				_ => return io::Error::from_raw_os_error(errno),
+			}
+			last = errno;
+		}
+		io::Error::from_raw_os_error(if refused { libc::EACCES } else { last })
+	}
+}
+
+/// Sets `/proc/self/oom_score_adj` to 1000, best effort: a refused write
+/// leaves the value as it was. Makes only system calls.
+///
+/// # Safety
+///
+/// Only in a forked child, which has memory of its own, before it execs:
+/// anywhere else it changes the host's value.
+#[cfg(target_os = "linux")]
+unsafe fn prefer_oom_kill() {
+	const VALUE: &[u8] = b"1000";
+	// SAFETY: a static C path and buffer; the fd is checked and closed.
+	unsafe {
+		let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+		if fd >= 0 {
+			libc::write(fd, VALUE.as_ptr().cast(), VALUE.len());
+			libc::close(fd);
+		}
+	}
+}
+
+/// This test process's OOM adjustment, lowered below 1000 where it was
+/// 1000; `None` where the kernel keeps it at 1000 (a privileged writer set
+/// that as the minimum), and a test that reads 1000 in a child cannot tell
+/// whether the child's spawn set it. A test that a tool process of this
+/// build runs (a bash tool command) starts at 1000. nextest runs each test
+/// in a process of its own, so no other test sees the change.
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) fn below_tool_score() -> String {
+pub(crate) fn below_tool_score() -> Option<String> {
 	let score = "/proc/self/oom_score_adj";
-	if std::fs::read_to_string(score).unwrap().trim() == "1000" {
+	if std::fs::read_to_string(score).ok()?.trim() == "1000" {
 		let _ = std::fs::write(score, "999");
 	}
-	std::fs::read_to_string(score).unwrap()
+	let baseline = std::fs::read_to_string(score).ok()?;
+	(baseline.trim() != "1000").then_some(baseline)
 }
 
 impl ChildEnv {
 	/// Builds a `Command` for `program` with the shell's working directory and
 	/// environment, stderr piped, and (unix) in a new session with no
 	/// controlling terminal, so a `/dev/tty` open fails instead of prompting.
-	/// On Linux the program gets the OOM adjustment of tool processes
-	/// ([`tool_command`]).
+	/// Spawn it through [`tool_process`] (`ToolEnv::Cleared`) once its
+	/// arguments and environment are final, so the program gets the OOM
+	/// adjustment of tool processes on Linux.
 	///
 	/// Stdin and stdout are left untouched for the caller to wire; they default
 	/// to inherited, so a caller that leaves them alone MUST redirect them.
 	pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> io::Result<std::process::Command> {
 		let cwd = native_working_dir(&self.filesystem, &self.cwd)?;
-		let path = self
-			.env
-			.iter()
-			.rev()
-			.find(|(name, _)| name == "PATH")
-			.map(|(_, value)| std::ffi::OsStr::new(value));
-		let mut command = tool_command(program.as_ref(), path, Some(cwd));
+		let mut command = std::process::Command::new(program);
 		command
 			.current_dir(cwd)
 			.env_clear()
@@ -3464,92 +3529,188 @@ mod testing {
 		async_out_for, io, openfile, output_handle, run_caught, run_caught_async,
 	};
 
+	/// `command`, a [`super::ChildEnv::command`] whose arguments are final,
+	/// spawned as its callers spawn it and run to the end.
+	#[cfg(target_os = "linux")]
+	fn tool_output(command: &mut std::process::Command) -> io::Result<std::process::Output> {
+		super::tool_process(command, None, super::ToolEnv::Cleared).output()
+	}
+
+	/// An executable file `name` in `dir` holding `body`.
+	#[cfg(target_os = "linux")]
+	fn executable(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let file = dir.join(name);
+		std::fs::write(&file, body).unwrap();
+		std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+		file
+	}
+
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn child_env_sets_oom_score_without_changing_the_host() {
 		let score = "/proc/self/oom_score_adj";
-		let before = super::below_tool_score();
+		let Some(before) = super::below_tool_score() else {
+			eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+			return;
+		};
 		let (host, _) = Host::for_test("oom-score", "", "/");
-		let output = host
-			.child_env()
-			.command("/bin/sh")
-			.unwrap()
-			.args([
-				"-c",
-				"read -r score < /proc/self/oom_score_adj; printf '%s\\n' \"$score\"; \
-				 /bin/cat /proc/self/oom_score_adj; :",
-			])
-			.output()
-			.unwrap();
+		let mut command = host.child_env().command("/bin/sh").unwrap();
+		command.args([
+			"-c",
+			"read -r score < /proc/self/oom_score_adj; printf '%s\\n' \"$score\"; \
+			 /bin/cat /proc/self/oom_score_adj; :",
+		]);
+		let output = tool_output(&mut command).unwrap();
 		assert_eq!(std::fs::read_to_string(score).unwrap(), before);
 		assert!(output.status.success(), "{output:?}");
 		assert_eq!(output.stdout, b"1000\n1000\n");
 	}
 
-	/// Failure mode: a tool program that resolves to no executable file
-	/// starts `/bin/sh` anyway, so its spawn succeeds and the shell exits 127
-	/// where the spawn failed with the OS error before (`rsync`'s "Failed to
-	/// exec", `rg` searching the undecoded bytes); or a program found by its
-	/// bare name in `PATH` runs with another `argv[0]`, or without the OOM
-	/// adjustment; or one named without `PATH` runs what a shell's default
-	/// path finds, not the file `execvp` finds in `/bin:/usr/bin`.
+	/// Failure mode: a tool program that cannot start (a script whose `#!`
+	/// interpreter is missing, a file without `#!` that the kernel cannot
+	/// load) is reported as a program that ran and exited 127, or the file
+	/// runs as shell code, where its spawn failed with the OS error before:
+	/// `rsync` reports a remote shell that exited instead of "Failed to
+	/// exec", `sort` keeps a compressor that cannot run.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_tool_program_that_cannot_exec_fails_its_spawn_as_it_does_unwrapped() {
+		let dir = tempfile::tempdir().unwrap();
+		let (host, _) = Host::for_test("oom-score", "", dir.path());
+		let errno = |spawned: io::Result<std::process::Output>| spawned.err().and_then(|err| err.raw_os_error());
+		for (name, body, expected) in [
+			("no-interpreter", "#!/nonexistent/interpreter\n", libc::ENOENT),
+			("no-shebang", "echo ran as shell code\n", libc::ENOEXEC),
+		] {
+			let script = executable(dir.path(), name, body);
+			let wrapped = errno(tool_output(&mut host.child_env().command(&script).unwrap()));
+			let unwrapped = errno(std::process::Command::new(&script).output());
+			assert_eq!((wrapped, unwrapped), (Some(expected), Some(expected)), "{name}");
+		}
+	}
+
+	/// Failure mode: a tool program that starts and exits 127 is taken for
+	/// one that could not start.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_tool_program_that_exits_127_is_a_program_that_ran() {
+		let dir = tempfile::tempdir().unwrap();
+		let script = executable(dir.path(), "exits-127", "#!/bin/sh\nexit 127\n");
+		let (host, _) = Host::for_test("oom-score", "", dir.path());
+		let output = tool_output(&mut host.child_env().command(&script).unwrap()).unwrap();
+		assert_eq!(output.status.code(), Some(127), "{output:?}");
+	}
+
+	/// Failure mode: the program gets the environment a shell imports
+	/// instead of the shell's own: `dash` drops names that are not shell
+	/// identifiers (an exported Bash function) and resets `IFS` and
+	/// `OPTIND`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_tool_program_gets_its_environment_unchanged() {
+		let vars =
+			[("BASH_FUNC_f%%", "() { echo f; }"), ("a.b", "1"), ("IFS", ":"), ("OPTIND", "5")];
+		let (mut host, _) = Host::for_test("oom-score", "", "/");
+		for (name, value) in vars {
+			host.set_test_var(name, value);
+		}
+		let output = tool_output(&mut host.child_env().command("/usr/bin/env").unwrap()).unwrap();
+		let printed = String::from_utf8_lossy(&output.stdout);
+		let mut lines: Vec<&str> = printed.lines().collect();
+		lines.sort_unstable();
+		let mut expected: Vec<String> = vars.iter().map(|(name, value)| format!("{name}={value}")).collect();
+		expected.sort_unstable();
+		assert_eq!(lines, expected, "{output:?}");
+	}
+
+	/// Failure mode: a tool program whose OOM adjustment the kernel refuses
+	/// to raise does not start. A process that is not dumpable owns none of
+	/// its `/proc` files, so its forked child cannot write its value, and
+	/// the exec makes the program dumpable again.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_tool_program_whose_score_write_is_refused_still_starts() {
+		let score = "/proc/self/oom_score_adj";
+		let Some(before) = super::below_tool_score() else {
+			eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+			return;
+		};
+		// SAFETY: prctl with scalar arguments.
+		unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong) };
+		let refused = std::fs::write(score, before.trim()).is_err();
+		let mut command = std::process::Command::new("/bin/cat");
+		command.arg(score);
+		let output = super::tool_process(&mut command, None, super::ToolEnv::Inherited).output();
+		// SAFETY: as above.
+		unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1 as libc::c_ulong) };
+		if !refused {
+			eprintln!("skipping: a process that is not dumpable still writes its own OOM adjustment here");
+			return;
+		}
+		let output = output.unwrap();
+		assert!(output.status.success(), "{output:?}");
+		assert_eq!(String::from_utf8_lossy(&output.stdout), before);
+	}
+
+	/// Failure mode: a missing or non-executable tool program spawns and
+	/// fails later, or a program found by its bare name runs with another
+	/// `argv[0]`, or without the OOM adjustment, with and without `PATH`.
 	#[cfg(target_os = "linux")]
 	#[test]
 	fn tool_programs_keep_their_spawn_errors_and_argv0() {
-		use std::{ffi::OsStr, os::unix::fs::PermissionsExt as _};
+		use std::{ffi::OsStr, os::unix::fs::PermissionsExt as _, process::Command};
 
-		super::below_tool_score();
+		if super::below_tool_score().is_none() {
+			eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+			return;
+		}
 		let dir = tempfile::tempdir().unwrap();
 		let plain = dir.path().join("plain");
 		std::fs::write(&plain, "exit 0\n").unwrap();
 		std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
-		let path = Some(OsStr::new("/usr/bin:/bin"));
+		let spawn = |command: &mut Command| {
+			super::tool_process(command, None, super::ToolEnv::Inherited).output()
+		};
 		for (program, kind) in [
 			(OsStr::new("/nonexistent/program"), io::ErrorKind::NotFound),
 			(OsStr::new("no-such-program"), io::ErrorKind::NotFound),
 			(plain.as_os_str(), io::ErrorKind::PermissionDenied),
 		] {
-			let spawned = super::tool_command(program, path, Some(dir.path()))
-				.env("PATH", "/usr/bin:/bin")
-				.output();
+			let spawned = spawn(Command::new(program).env("PATH", "/usr/bin:/bin"));
 			assert_eq!(spawned.map_err(|err| err.kind()).err(), Some(kind), "{program:?}");
 		}
-		let output = super::tool_command(OsStr::new("sh"), path, Some(dir.path()))
-			.args(["-c", "printf '%s ' \"$0\"; /bin/cat /proc/self/oom_score_adj"])
-			.env("PATH", "/usr/bin:/bin")
-			.output()
-			.unwrap();
+		let script = ["-c", "printf '%s ' \"$0\"; /bin/cat /proc/self/oom_score_adj"];
+		let output = spawn(Command::new("sh").args(script).env("PATH", "/usr/bin:/bin")).unwrap();
 		assert_eq!(String::from_utf8_lossy(&output.stdout), "sh 1000\n", "{output:?}");
-		// Without `PATH` a shell searches a default path of its own: `$0` is
-		// the file `execvp` finds first in `/bin:/usr/bin`.
-		let output = super::tool_command(OsStr::new("sh"), None, Some(dir.path()))
-			.args(["-c", "printf '%s ' \"$0\"; /bin/cat /proc/self/oom_score_adj"])
-			.env_remove("PATH")
-			.output()
-			.unwrap();
-		assert_eq!(String::from_utf8_lossy(&output.stdout), "/bin/sh 1000\n", "{output:?}");
+		// Without `PATH` the child searches this process's.
+		let output = spawn(Command::new("sh").args(script).env_remove("PATH")).unwrap();
+		assert_eq!(String::from_utf8_lossy(&output.stdout), "sh 1000\n", "{output:?}");
 	}
 
-	/// Failure mode: with an empty `PATH`, the child's `execvp` searches its
-	/// working directory and runs a program found there, but the lookup that
-	/// decides on the OOM wrapper found nothing, so the program ran at the
-	/// host's score (sed's `s///e` runs `sh` that way).
+	/// Failure mode: a program named relative to the child's working
+	/// directory, by a path or through an empty `PATH` entry, which
+	/// `execvp` searches as the working directory, is looked up in this
+	/// process's working directory, or runs without the OOM adjustment
+	/// (sed's `s///e` runs `sh` that way).
 	#[cfg(target_os = "linux")]
 	#[test]
-	fn an_empty_path_finds_the_program_in_the_working_directory() {
-		use std::{ffi::OsStr, os::unix::fs::PermissionsExt as _};
+	fn a_program_relative_to_the_working_directory_runs_there() {
+		use std::process::Command;
 
-		super::below_tool_score();
+		if super::below_tool_score().is_none() {
+			eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+			return;
+		}
 		let dir = tempfile::tempdir().unwrap();
-		let tool = dir.path().join("tool");
-		std::fs::write(&tool, "#!/bin/sh\nprintf '%s ' \"$0\"; /bin/cat /proc/self/oom_score_adj\n").unwrap();
-		std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-		let output = super::tool_command(OsStr::new("tool"), Some(OsStr::new("")), Some(dir.path()))
-			.current_dir(dir.path())
-			.env("PATH", "")
-			.output()
-			.unwrap();
-		assert_eq!(String::from_utf8_lossy(&output.stdout), "tool 1000\n", "{output:?}");
+		executable(dir.path(), "tool", "#!/bin/sh\nprintf '%s ' \"$0\"; /bin/cat /proc/self/oom_score_adj\n");
+		for (program, path) in [("tool", ""), ("tool", "/nonexistent::/bin"), ("./tool", "/bin")] {
+			let mut command = Command::new(program);
+			command.current_dir(dir.path()).env("PATH", path);
+			let output = super::tool_process(&mut command, None, super::ToolEnv::Inherited).output().unwrap();
+			assert_eq!(String::from_utf8_lossy(&output.stdout), format!("{program} 1000\n"), "{path:?}");
+		}
 	}
 
 	/// Captured in-memory output from [`Host::for_test`].
