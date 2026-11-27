@@ -325,7 +325,7 @@ export class AgyHost implements ProviderSessionState {
 				if (forkId) {
 					this.#ownedConversations.add(forkId);
 					loadId = forkId;
-					loadSeed = replayedRange(context.messages, plan.replay, model);
+					loadSeed = undefined;
 				} else plan = { kind: "fresh", replay: [...context.messages] };
 			}
 			if (loadId) {
