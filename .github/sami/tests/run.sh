@@ -259,8 +259,9 @@ own_default() {
 # give --flaky_test_attempts=^<target>$@3), IGNORED_OPT (rust-test-ignored.txt
 # lines whose reason is `opt: a sweep`), IGN_OPT_BODY (the stub's answer to
 # such a test's -c opt bazel test, which must come after a -c opt bazel build
-# of its target) and OPT_BUILD_BODY (its answer to that build: by default an
-# event log with a wall time of 98765 ms, and exit 0).
+# of its target), OPT_BUILD_BODY (its answer to that build: by default an
+# event log with a wall time of 98765 ms, and exit 0) and NO_KERNEL (`1`: the
+# step runs with no PI_VFS_TEST_KERNEL, which every other case sets to linux).
 run() {
 	local name="$1" want="$2" msg="$3" entries="$4" body="$5"
 	if [ -n "$only" ] && ! [[ "$name" =~ $only ]]; then return 0; fi
@@ -295,6 +296,7 @@ run() {
 		list only.txt "$ONLY" "macOS only"
 		only_env=(RUST_TEST_ONLY=.github/sami/only.txt RUST_TEST_CANARY="${CANARY:-}")
 	fi
+	if [ "${NO_KERNEL:-}" = 1 ]; then only_env=(-u PI_VFS_TEST_KERNEL ${only_env[@]+"${only_env[@]}"}); fi
 	printf '[toolchain]\nchannel = "nightly-2026-11-08"\n' >"$w/repo/rust-toolchain.toml"
 	printf '# list\n%s\n' "${CARGO_WS:-sdk/rust/demo/Cargo.toml  standalone}" >"$w/repo/.github/sami/rust-test-cargo-workspaces.txt"
 	# DOCQ: the doctest targets bazel query names (the macOS job asks it).
@@ -392,6 +394,7 @@ if [ "${LEGACY:-0}" != 1 ]; then
 	has --test_env=RSYNC_REFERENCE_REQUIRED=1
 	has --test_env=PI_TEST_REAL_BASH=\$PI_TEST_REAL_BASH
 	has --test_env=PI_AST_REPO_CORPUS=\$PI_AST_REPO_CORPUS
+	has --test_env=PI_VFS_TEST_KERNEL=\$PI_VFS_TEST_KERNEL
 	has --sandbox_writable_path=\$RUST_TEST_TMPDIR
 	want_under="/bin/sh $w/repo/.github/sami/rust-test-tmpdir.sh \$RUST_TEST_TMPDIR"
 	[ "\$inv" = root ] || [ "\$inv" = ignored-root ] || [ "\$inv" = sticky-root ] && want_under="sudo -E env PATH=\$RUST_TEST_PATH \$want_under"
@@ -529,6 +532,7 @@ EOF
 	# SUMMARY_UNWRITABLE=1: the step summary's path is a directory.
 	[ "${SUMMARY_UNWRITABLE:-}" != 1 ] || mkdir "$w/summary.md"
 	out="$(cd "$w/repo" && PATH="$w/bin:${TOOLBIN:+$TOOLBIN:}$PATH" RUNNER_TEMP="$w/tmp" OMP_BAZEL_RC=/dev/null \
+		PI_VFS_TEST_KERNEL=linux \
 		RUST_TEST_PATH=/stub/rsync-ref/bin:/usr/bin:/bin RUST_TEST_TMPDIR="$w/reflink" PI_TEST_REAL_BASH=/stub/bash-ref/bin/bash PI_AST_REPO_CORPUS="$w/repo" RUST_TEST_OFFLINE_UNDER="$w/bin/offline" \
 		RUST_TEST_STICKY_FIFO="$fifo" GITHUB_STEP_SUMMARY="$w/summary.md" \
 		env ${only_env[@]+"${only_env[@]}"} bash --noprofile --norc -eo pipefail "$step" 2>&1)"
@@ -681,6 +685,16 @@ KNOWN_SKIPS="$D z::other" run J62-listed-skip-ran 1 "$D z::other is in .github/s
 run J63-raw-named-skip 1 "$D wt_carry skipped itself and is not in" '' "{ $P; rt $D PASSED cat $fixtures/skip-raw-named.txt; } >\"\$bep\"; exit 0"
 run J64-raw-unnamed-skip 1 "printed a skip line outside libtest's record that names no test" '' "{ $P; rt $D PASSED cat $fixtures/skip-raw-unnamed.txt; } >\"\$bep\"; exit 0"
 run J65-real-skip-binary 1 "t::foreign_owner_refused skipped itself and is not in" '' "{ $P; rt $D PASSED cat $fixtures/root-stderr-nonroot.json; } >\"\$bep\"; exit 0"
+# `UNKNOWN:` is what a test prints when it checked nothing (pi-vfs's and
+# pi-shell's FIFO read-open tests, with no PI_VFS_TEST_KERNEL): a skip, which
+# rust-test-known-output.txt cannot let through (J173), and which outside the
+# record must name its test (J174). A step with no PI_VFS_TEST_KERNEL does not
+# start (J175).
+UNKREC="printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 2 }\n{ \"type\": \"test\", \"name\": \"f::probe\", \"event\": \"ok\", \"stdout\": \"UNKNOWN: PI_VFS_TEST_KERNEL is not set; nothing was checked\\\\n\" }\n{ \"type\": \"test\", \"name\": \"f::other\", \"event\": \"ok\" }\n{ \"type\": \"suite\", \"event\": \"ok\", \"passed\": 2, \"failed\": 0, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 0, \"exec_time\": 0.1 }\n'"
+KNOWN_OUTPUT="$D f::probe" run J173-unknown-is-a-skip-though-listed-as-output 1 "$D f::probe skipped itself and is not in .github/sami/rust-test-known-skips.txt" '' "{ $P; rt $D PASSED $UNKREC; } >\"\$bep\"; exit 0"
+UNKRAW="printf '{ \"type\": \"suite\", \"event\": \"started\", \"test_count\": 1 }\nUNKNOWN: no /proc/self/fd reaches the pin; nothing was checked\n{ \"type\": \"test\", \"name\": \"f::other\", \"event\": \"ok\" }\n{ \"type\": \"suite\", \"event\": \"ok\", \"passed\": 1, \"failed\": 0, \"ignored\": 0, \"measured\": 0, \"filtered_out\": 0, \"exec_time\": 0.1 }\n'"
+run J174-raw-unknown-names-no-test 1 "printed a skip line outside libtest's record that names no test: UNKNOWN: no /proc/self/fd" '' "{ $P; rt $D PASSED $UNKRAW; } >\"\$bep\"; exit 0"
+NO_KERNEL=1 NOT_MSG='stub:' run J175-no-kernel-name-does-not-start 1 '::error title=Rust tests::PI_VFS_TEST_KERNEL is not set' '' "rt $D PASSED lt_pass a::one >\"\$bep\"; exit 0"
 
 # Sanctioned skips (the fork owner's ruling on one rsync test).
 SANCTIONED="$B s::x::byte_totals" MAIN_MUST_SKIP=s::x::byte_totals run J66-sanctioned-took-out-one 0 "Sanctioned skip, taken out of the main invocation: $B s::x::byte_totals" '' "{ $P; sanct a::one s::x::byte_totals -- a::one; } >\"\$bep\"; exit 0"
@@ -846,6 +860,7 @@ DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! assert!(true);\n//! ```\n#![doc = in
 DOC_SRC=$'//! The crate.\n//!\n//! Words.\n//!\n//! ```\n//! assert!(true);\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D14-bazel-doctest-the-reader-did-not-find-fails 1 'UNKNOWN: crates/pi-diff src/lib.rs - f \(line 3\) ran in Bazel.s doctest target, and the doctest reader found no doctest at crates/pi-diff/src/lib.rs line 3' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 DOC_SRC=none NOT_MSG='stub:' run D15-crate-without-source-fails 1 'UNKNOWN: crates/pi-diff src/lib.rs - f \(line 3\) ran in Bazel.s doctest target, and the doctest reader found no doctest' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let s = "UNCOMPARED: x";\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D16-skip-words-are-the-scans 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs holds a skip word' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
+DOC_SRC=$'//! The crate.\n//!\n//! ```\n//! let s = "UNKNOWN: x";\n//! ```\npub fn f() {}' NOT_MSG='stub:' run D16b-unknown-is-a-skip-word 1 'crates/pi-diff/src/lib.rs:4: a doctest rustdoc runs holds a skip word' '' "{ $P; rt $D PASSED lt_pass a::one; dt $DOC PASSED doc_pass; } >\"\$bep\"; exit 0"
 # D17-D21, from the GPT-6.1 Sol review of 4379925a: a doctest's text across a
 # blank source line, a nested comment in a block doc, a doc attribute escape,
 # a print split from its `!`, and a doctest still open at its text's end.

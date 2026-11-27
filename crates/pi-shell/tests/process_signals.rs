@@ -4846,7 +4846,36 @@ fn an_exec_d_programs_core_dump_signal_leaves_no_core_of_the_shell() {
 /// has sent its signal ([`Run::go_signalled`] makes `$F.sent` then), so the
 /// signal comes while the command runs, however late the run sends it, and
 /// not in a time the command allows.
+///
+/// Only for a command that traps an `INT`, or ignores it, or that the
+/// signal does not reach: it is a loop around a forked `/bin/sleep`, so an
+/// `INT` reaches the command's own `/bin/sh` while that `/bin/sh` waits
+/// for a child of its own, and what it then does is that shell's
+/// business. A bash there holds an `INT` that comes while it waits for
+/// its foreground child and acts on it only if that child died of the
+/// `INT` (`wait_sigint_handler` and `set_job_status_and_cleanup`, the
+/// rule this file's bash cases are about): a polled `/bin/sleep 0.01`
+/// that ends by itself in the moment the signal arrives leaves the whole
+/// `INT` swallowed, and the command goes on and exits 0. Measured with
+/// bash 5.2.21: a child that sends its parent an `INT` and exits 0 leaves
+/// bash going on, and the same child killed by the `INT` leaves bash dead
+/// of it. macOS's `/bin/sh` is a bash (Apple's 3.2); the ubuntu runners'
+/// is dash, which takes an untrapped `INT` as the script's end whatever
+/// the child it waits for did (`onsig`, then `onint`), so only the macOS
+/// legs showed it: 10 of 40 runs at Cut18 (platform checks run
+/// 46047970164), every failure a command that had to die of the signal.
+/// The rule is `INT`'s alone: a `TERM` or `HUP` that the command's shell
+/// does not trap ends it wherever it is.
 const SENT: &str = "until [ -e \"$F.sent\" ]; do /bin/sleep 0.01; done";
+
+/// A command that must die of the signal: it reads the FIFO
+/// [`Run::go_signalled`] holds open until the signal is sent, so it
+/// blocks at once, forks nothing, and can end by nothing but the signal
+/// (an untrapped `INT` at its default kills it, wherever the signal finds
+/// it: the `/bin/sh` before its `exec`, or this program after it). No
+/// poll, so no child of its own whose end its shell could read as the
+/// signal's answer ([`SENT`]), and no time bound to outlast the run.
+const BLOCKS: &str = "/bin/cat \"$F.fifo\"";
 
 /// A signal case: `shell` runs `script` with `-c` and gets `sig` from
 /// outside (`group`: sent to its process group, else to the shell alone)
@@ -5143,8 +5172,11 @@ fn an_execd_program_leaves_no_exit_trap_to_run() {
 /// did. Under `set -m` bash holds nothing for a job, which runs in a
 /// process group of its own: neither a `kill` of the shell's pid nor of its
 /// group reaches the job's processes, while its substitutions are in the
-/// shell's group. The command makes `$F` once it has started, and goes on
-/// only once the run has sent the signal ([`SENT`]).
+/// shell's group. The command makes `$F` once it has started, and each
+/// shell is signalled only once it and all it runs have blocked
+/// ([`Run::when_blocked`]); a command that must die of the `INT` blocks
+/// on the run's FIFO and can end by nothing else ([`BLOCKS`]), and one
+/// that catches or ignores it waits for the run to send it ([`SENT`]).
 #[test]
 fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	// A command that catches `INT` and outlives it by a second: it prints
@@ -5156,8 +5188,10 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	let hold = &child;
 	let quiet =
 		format!("/bin/sh -c 'trap : INT; : > \"$F\"; {SENT}; /bin/sleep 1; echo child-done'");
-	// One that dies of `INT` (`sleep` takes it at its default).
-	let dies = format!("/bin/sh -c '{SENT}; exec /bin/sleep 3'");
+	// One that dies of `INT` (`cat` takes it at its default), with no shell
+	// of its own between it and the signal and no end but the signal
+	// ([`BLOCKS`]).
+	let dies = BLOCKS;
 	let script = format!("trap 'echo x' EXIT; {child}; echo after");
 	let case = |script, group, stdout, end| SentCase {
 		shell: "bash",
@@ -5183,18 +5217,14 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 	// process was blocked, 4 runs in 12,600 of this row, 5 in 10,000 with the
 	// last stage reading its input itself and the first waiting on a FIFO.
 	// bash's timing, not the run's; obash prints the golden.
-	let pipeline = format!(
-		"trap 'echo x' EXIT; /bin/sh -c ': > \"$F.a\"; {SENT}; exec /bin/sleep 3' | {last}; echo \
-		 after"
-	);
+	let pipeline =
+		format!("trap 'echo x' EXIT; /bin/sh -c ': > \"$F.a\"; exec {BLOCKS}' | {last}; echo after");
 	let raced = [(pipeline.clone(), &b"after\nx\n"[..], Exit(0))];
 	let cases = vec![
 		case(script.clone(), false, b"child-done\nafter\nx\n", Exit(0)),
 		case(script, true, b"child-int\nchild-done\nafter\nx\n", Exit(0)),
 		case(
-			format!(
-				"trap 'echo x' EXIT; /bin/sh -c ': > \"$F\"; {SENT}; exec /bin/sleep 3'; echo after"
-			),
+			format!("trap 'echo x' EXIT; /bin/sh -c ': > \"$F\"; exec {BLOCKS}'; echo after"),
 			true,
 			b"x\n",
 			died,
@@ -5303,12 +5333,7 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 			b"child-int\nchild-done\nmore\nafter\n",
 			Exit(0),
 		),
-		case(
-			format!("/bin/sh -c ': > \"$F\"; {SENT}; exec /bin/sleep 3'; echo after"),
-			true,
-			b"",
-			died,
-		),
+		case(format!("/bin/sh -c ': > \"$F\"; exec {BLOCKS}'; echo after"), true, b"", died),
 		case(
 			format!("exec 3>&1; v=$({hold} >&3); echo after $v"),
 			true,
@@ -5350,8 +5375,8 @@ fn bash_acts_on_int_only_once_its_foreground_command_died_of_it() {
 		// reads a death by `SIGINT`, also where the trap runs a program.
 		case(
 			format!(
-				"( trap 'echo sub' EXIT; /bin/sh -c ': > \"$F\"; {SENT}; exec /bin/sleep 3'; echo \
-				 more ); echo after"
+				"( trap 'echo sub' EXIT; /bin/sh -c ': > \"$F\"; exec {BLOCKS}'; echo more ); echo \
+				 after"
 			),
 			true,
 			b"sub\n",

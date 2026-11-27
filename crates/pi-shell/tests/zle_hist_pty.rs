@@ -441,10 +441,10 @@ fn edited_history_lines_are_forgotten_after_accept() {
 /// `PROMPT_SP`, then the notice; `zleread` draws the prompt after them):
 /// a mailbox that grows while the shell waits, `MAILCHECK=1`, one empty
 /// line. With `PROMPT_SP` still going out, the notice waited behind it and
-/// went out after the prompt (`% You have new mail.`).
+/// went out after the prompt (`% You have new mail.`). Without the real zsh
+/// obash's screen is checked alone, as [`screens`] does.
 #[test]
 fn the_mail_notice_comes_before_the_prompt() {
-	assert!(have_real_zsh(), "no real zsh");
 	let dir = tempfile::tempdir().unwrap();
 	let mbox = dir.path().join("mbox");
 	std::fs::write(&mbox, "From someone\nhello\n").unwrap();
@@ -476,17 +476,27 @@ fn the_mail_notice_comes_before_the_prompt() {
 		pty.write("\r")?;
 		pty.read_until("You have new mail.", TIMEOUT).map(drop)
 	};
-	let (ours, real) = differential(mk(false), mk(true), run).unwrap();
+	let (ours, real) = if have_real_zsh() {
+		let (ours, real) = differential(mk(false), mk(true), run).unwrap();
+		(ours, Some(real))
+	} else {
+		let mut pty = mk(false).spawn().unwrap();
+		run(&mut pty).unwrap();
+		(pty.screen().contents(), None)
+	};
 	let after_a_prompt = |s: &str| {
 		s.lines().any(|l| {
 			let t = l.trim_start();
 			(t.starts_with('%') || t.starts_with('#')) && t.contains("You have new mail.")
 		})
 	};
-	assert!(real.contains("You have new mail.") && !after_a_prompt(&real), "zsh:\n{real}");
+	if let Some(real) = &real {
+		assert!(real.contains("You have new mail.") && !after_a_prompt(real), "zsh:\n{real}");
+	}
 	assert!(
 		ours.contains("You have new mail.") && !after_a_prompt(&ours),
-		"obash:\n{ours}\n--- zsh:\n{real}"
+		"obash:\n{ours}\n--- zsh:\n{}",
+		real.as_deref().unwrap_or("(not run: no real zsh)")
 	);
 }
 

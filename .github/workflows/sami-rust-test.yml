@@ -624,6 +624,12 @@ jobs:
           # loopback (.github/sami/rust-test-offline.sh).
           ANTHROPIC_API_KEY: placeholder-no-model-call
           RUST_TEST_OFFLINE_UNDER: ${{ github.workspace }}/tree/.github/sami/rust-test-offline.sh
+          # The kernel this job runs the tests on, named from where it runs,
+          # never from uname: runs-on above is a GitHub-hosted ubuntu VM, whose
+          # own Linux kernel runs them, not gVisor. pi-vfs's and pi-shell's FIFO
+          # read-open tests compare pi-vfs's gVisor probe (uname's release) with
+          # it, and without it check nothing (rust-test.sh refuses to start).
+          PI_VFS_TEST_KERNEL: linux
         run: |
           RUST_TEST_PATH="$HOME/rsync-ref/bin:$HOME/jj-ref/bin:/usr/local/bin:/usr/bin:/bin" \
             RUST_TEST_TMPDIR=/mnt/reflink/tmp \
@@ -815,6 +821,8 @@ jobs:
         if: ${{ !cancelled() && steps.inventory.outputs.complete == 'true' }}
         shell: bash
         env:
+          # As in rust_test, from where this job runs: a GitHub-hosted macOS VM.
+          PI_VFS_TEST_KERNEL: darwin
           OMP_BAZEL_RC: ${{ steps.bazel.outputs.rc }}
         run: |
           mkdir -p "$RUNNER_TEMP/tests"

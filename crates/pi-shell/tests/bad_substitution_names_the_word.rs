@@ -9,15 +9,16 @@
 //! Goldens: bash 5.3.20, measured in a cluster Job (bash 5.2.21 agrees but
 //! for `export v=…`, where it names `environment`). Each row runs as `-c`
 //! and as a script file, in a directory of its own: in the expected stderr
-//! `PFX` is the messages' prefix (the shell's name under `-c`, `D/s.sh`
-//! from the script); a row gives its status under `-c` and from a script.
+//! `PFX` is the messages' prefix (the shell's name under `-c`, which is the
+//! path obash was started by, `D/s.sh` from the script); a row gives its
+//! status under `-c` and from a script.
 #![cfg(unix)]
 
 mod obash_support;
 
 use std::fs;
 
-use crate::obash_support::{obash, output};
+use crate::obash_support::{obash, obash_path, output};
 
 /// A row: the script, its stdout, its stderr (`PFX` as above), its status
 /// under `-c` and from a script.
@@ -25,7 +26,7 @@ type Row = (&'static str, &'static str, &'static str, i32, i32);
 
 /// Each row as `-c` and as a script: one line per mismatch.
 fn mismatches(rows: &[Row]) -> Vec<String> {
-	let sh = env!("CARGO_BIN_EXE_obash");
+	let sh = obash_path();
 	let mut out = Vec::new();
 	for &(code, want_out, want_err, status_c, status_script) in rows {
 		for script in [false, true] {

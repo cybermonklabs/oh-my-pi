@@ -57,9 +57,11 @@
 # record):
 #   - a passing test whose output has a line that starts with the marker, or
 #     with a word the tree's tests used before it (`skipping`, `SKIP`,
-#     `not run`, `UNCOMPARED`), alone or after `<test name>: `, skipped
-#     itself. It fails the job unless .github/sami/rust-test-known-skips.txt
-#     names it; that list is empty. The same line outside libtest's record (a
+#     `not run`, `UNCOMPARED`), or with `UNKNOWN:`, which a test prints when
+#     it checked nothing (sami-checks' sc.py reads it so too), alone or after
+#     `<test name>: `, skipped itself. It fails the job unless
+#     .github/sami/rust-test-known-skips.txt names it, whatever
+#     rust-test-known-output.txt says. The same line outside libtest's record (a
 #     write to the inherited stderr) must name its test, and counts the same.
 #   - any other passing test that prints anything fails the job unless
 #     .github/sami/rust-test-known-output.txt names it, since its output can be
@@ -93,6 +95,13 @@
 #                       gets a directory of its own under it, as its TMPDIR
 #   PI_TEST_REAL_BASH   the bash 5.2.21 the bash-oracle tests compare with
 #   PI_AST_REPO_CORPUS  the checkout pi-ast's corpus test walks
+#   PI_VFS_TEST_KERNEL  the kernel the job's runtime runs the tests on, named by
+#                       the workflow from where the job runs, never from uname:
+#                       `linux` on the rust_test job's GitHub-hosted VM,
+#                       `darwin` on the macOS job's. pi-vfs's and pi-shell's
+#                       FIFO read-open tests compare pi-vfs's gVisor probe
+#                       (which reads uname) with it, and without it print
+#                       `UNKNOWN:`, a skip (above), having checked nothing
 #   RUST_TEST_STICKY_FIFO  (when a sticky-directory FIFO test is in the tree) a
 #                       0666 FIFO of a third user in a world-writable sticky
 #                       directory root owns, with fs.protected_fifos at 1
@@ -106,7 +115,7 @@ if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
 	echo "::error title=Rust tests::bash ${BASH_VERSION} is too old: this script needs bash 4 or later"
 	exit 1
 fi
-for v in RUNNER_TEMP OMP_BAZEL_RC RUST_TEST_PATH RUST_TEST_TMPDIR PI_TEST_REAL_BASH PI_AST_REPO_CORPUS; do
+for v in RUNNER_TEMP OMP_BAZEL_RC RUST_TEST_PATH RUST_TEST_TMPDIR PI_TEST_REAL_BASH PI_AST_REPO_CORPUS PI_VFS_TEST_KERNEL; do
 	if [ -z "${!v:-}" ]; then
 		echo "::error title=Rust tests::$v is not set"
 		exit 1
@@ -303,7 +312,7 @@ done <"$tmp/root-alone.tsv"
 # the job made (RUST_TEST_STICKY_FIFO), and as root, which makes its own.
 # Another test with that word in its name is taken out and run the same way;
 # one renamed away from it runs in the main invocation, where it prints
-# `UNKNOWN:` and fails as any unlisted output does.
+# `UNKNOWN:`, a skip, and fails as an unlisted skip does.
 sticky_word=refused_in_a_sticky_directory
 skip_flags+=(--test_arg=--skip --test_arg="$sticky_word")
 # .github/sami/rust-test-ignored.txt names Bazel targets (`//…`) and cargo
@@ -335,15 +344,17 @@ while IFS=$'\t' read -r target name; do ignored_root+=("$target"$'\t'"$name"); d
 
 # PATH: the reference rsync first (the rest is the PATH Bazel's strict action
 # env gives a test); RSYNC_REFERENCE_REQUIRED makes an rsync test without it
-# fail rather than skip. The tests' temporary files go on the reflink
-# filesystem, writable in the sandbox. Bazel drops a TMPDIR that --test_env
-# sets (PosixLocalEnvProvider, run 44807499064), so rust-test-tmpdir.sh, as
-# --run_under, sets one for each test action.
+# fail rather than skip. PI_VFS_TEST_KERNEL is the kernel the workflow names
+# for the job's runtime (Usage, above). The tests' temporary files go on the
+# reflink filesystem, writable in the sandbox. Bazel drops a TMPDIR that
+# --test_env sets (PosixLocalEnvProvider, run 44807499064), so
+# rust-test-tmpdir.sh, as --run_under, sets one for each test action.
 env_flags=(
 	--test_env=PATH="$RUST_TEST_PATH"
 	--test_env=RSYNC_REFERENCE_REQUIRED=1
 	--test_env=PI_TEST_REAL_BASH="$PI_TEST_REAL_BASH"
 	--test_env=PI_AST_REPO_CORPUS="$PI_AST_REPO_CORPUS"
+	--test_env=PI_VFS_TEST_KERNEL="$PI_VFS_TEST_KERNEL"
 	--sandbox_writable_path="$RUST_TEST_TMPDIR"
 )
 # The places pi-vcs's #[ignore]d mount and ownership tests need, which only
@@ -1041,7 +1052,7 @@ fi
 # The skip scan (see "Skips" above). skip_line matches a skip line in a
 # passing test's output; raw_skip_line matches one outside the record. The
 # doctest reader (below) looks for the same words in a doctest's code.
-skip_words='skipped|skipping|SKIP|not run|UNCOMPARED'
+skip_words='skipped|skipping|SKIP|not run|UNCOMPARED|UNKNOWN:'
 skip_line="^([A-Za-z0-9_:]+: )?($skip_words)[ :]"
 raw_skip_line="(^|: )($skip_words)[ :]"
 failed="$tmp/failed.tsv"
@@ -1109,7 +1120,7 @@ scan_output() {
 		| "\($target)\t\(.name)\t\($log)"' "$1" >>"$outputs"
 	raw_lines "$tmp/raw-here.txt" "$@"
 	while IFS= read -r line; do
-		if [[ "$line" =~ ^([A-Za-z0-9_:]+):\ (skipped|skipping|SKIP|not\ run|UNCOMPARED)[\ :] ]]; then
+		if [[ "$line" =~ ^([A-Za-z0-9_:]+):\ (skipped|skipping|SKIP|not\ run|UNCOMPARED|UNKNOWN:)[\ :] ]]; then
 			printf '%s\t%s\n' "$label" "${BASH_REMATCH[1]}" >>"$skips"
 		else
 			error "Rust tests" "$label printed a skip line outside libtest's record that names no test: $line"

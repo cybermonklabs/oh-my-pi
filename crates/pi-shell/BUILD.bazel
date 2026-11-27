@@ -170,7 +170,6 @@ _INTEGRATION_DEPS = all_crate_deps(normal = True) + all_crate_deps(normal_dev = 
 #   tests/<file>.rs   correct runs   L (its run)             max(2L, L + 240)
 #   zsh_comp_y03      7              284.9 s (45762775961)   569.8 s
 #   zsh_comp_y02      8              211.2 s (45821320132)   451.2 s
-#   zle_vi_pty        7              204.7 s (45722788663)   444.7 s
 #   zle_widgets_pty   8              107.7 s (45722788663)   347.7 s
 #   zsh_comp_y01      8               99.3 s (45762775961)   339.3 s
 #   zle_hist_pty      8               76.9 s (45722811150)   316.9 s
@@ -179,7 +178,6 @@ _INTEGRATION_DEPS = all_crate_deps(normal = True) + all_crate_deps(normal_dev = 
 _LONG_INTEGRATION_TESTS = [
     "zsh_comp_y03",
     "zsh_comp_y02",
-    "zle_vi_pty",
     "zle_widgets_pty",
     "zsh_comp_y01",
     "zle_hist_pty",

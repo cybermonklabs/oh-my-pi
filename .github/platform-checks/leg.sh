@@ -7,6 +7,17 @@ set -uo pipefail
 res=$PC/results
 meta=$res/meta.env
 mkdir -p "$res"
+# The kernel the tests run on, named from the platform this leg runs on, never from uname: each
+# platform is a GitHub-hosted VM (pc.py RUNNERS), whose own kernel runs the tests, never gVisor.
+# pi-shell's FIFO read-open test compares pi-vfs's gVisor probe with it, and without it checks
+# nothing. The root runs below pass it on by name, as sudo drops it.
+case "$PC_PLATFORM" in
+	ubuntu) kernel=linux ;;
+	macos) kernel=darwin ;;
+	windows) kernel=windows ;;
+	*) kernel="" ;;
+esac
+export PI_VFS_TEST_KERNEL=$kernel
 {
 	echo "platform=$PC_PLATFORM"
 	echo "tree=$PC_TREE"
@@ -19,12 +30,14 @@ mkdir -p "$res"
 	# The bash the tests compare with when they read PI_TEST_REAL_BASH (the host step sets it on macOS).
 	echo "pi_test_real_bash=${PI_TEST_REAL_BASH:-unset}"
 	if [ -n "${PI_TEST_REAL_BASH:-}" ]; then echo "pi_test_real_bash_version=$("$PI_TEST_REAL_BASH" --version | head -n 1)"; fi
+	echo "pi_vfs_test_kernel=${kernel:-unset}"
 } > "$meta"
 fail() {
 	echo "note=$*" >> "$meta"
 	echo "::error::$*"
 	exit 1
 }
+[ -n "$kernel" ] || fail "no kernel name for platform $PC_PLATFORM, so pi-shell's FIFO read-open test would check nothing"
 
 archive=$PC/archive/$PC_TREE.tar.zst
 [ -s "$archive" ] || fail "no archive of $PC_TREE: its build failed or did not run"
@@ -51,7 +64,7 @@ EOF
 
 as_who() {
 	if [ "$PC_WHO" = root ]; then
-		sudo env "PATH=$PATH" HOME=/root USER=root LOGNAME=root RUST_BACKTRACE=1 "$@"
+		sudo env "PATH=$PATH" HOME=/root USER=root LOGNAME=root RUST_BACKTRACE=1 PI_VFS_TEST_KERNEL="$PI_VFS_TEST_KERNEL" "$@"
 	else
 		"$@"
 	fi
@@ -92,7 +105,7 @@ rm -f "$fired"
 s=$(date +%s)
 (
 	if [ "$PC_WHO" = root ]; then
-		exec sudo env "PATH=$PATH" HOME=/root USER=root LOGNAME=root RUST_BACKTRACE=1 \
+		exec sudo env "PATH=$PATH" HOME=/root USER=root LOGNAME=root RUST_BACKTRACE=1 PI_VFS_TEST_KERNEL="$PI_VFS_TEST_KERNEL" \
 			"$nx" nextest run "${common[@]}" ${stress[@]+"${stress[@]}"} --no-fail-fast --no-tests=pass
 	fi
 	exec "$nx" nextest run "${common[@]}" ${stress[@]+"${stress[@]}"} --no-fail-fast --no-tests=pass

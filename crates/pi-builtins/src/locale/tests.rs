@@ -474,9 +474,10 @@ fn a_locale_missing_a_category_leaves_the_utilities_in_c() {
 			if left.file_name() == keep {
 				continue;
 			}
-			match left.file_type().unwrap().is_dir() {
-				true => fs::remove_dir_all(left.path()).unwrap(),
-				false => fs::remove_file(left.path()).unwrap(),
+			if left.file_type().unwrap().is_dir() {
+				fs::remove_dir_all(left.path()).unwrap();
+			} else {
+				fs::remove_file(left.path()).unwrap();
 			}
 		}
 		true
@@ -590,10 +591,14 @@ fn assert_no_task_has_children(mut read: impl FnMut(&Path) -> std::io::Result<St
 		for name in &before {
 			match read(&Path::new("/proc/self/task").join(name)) {
 				Ok(children) => {
-					assert!(children.trim().is_empty(), "children left behind by {name:?}: {children}");
+					assert!(
+						children.trim().is_empty(),
+						"children left behind by {}: {children}",
+						name.display()
+					);
 				},
 				Err(error) if task_has_gone(&error) => every_task_read = false,
-				Err(error) => panic!("the children of task {name:?}: {error:?}"),
+				Err(error) => panic!("the children of task {}: {error:?}", name.display()),
 			}
 		}
 		let after = list();
@@ -655,7 +660,7 @@ fn a_task_that_has_gone_is_read_as_gone_on_either_kernel() {
 				Ok("4242 ".to_owned())
 			});
 		});
-		let why = left.err().map(why_of).unwrap_or_default();
+		let why = left.err().map_or_default(why_of);
 		assert!(
 			why.contains("children left behind"),
 			"a child listed in the pass of a task that has gone ({gone}) was not reported: {why:?}"
@@ -669,8 +674,10 @@ fn a_task_that_has_gone_is_read_as_gone_on_either_kernel() {
 	// counted those two passes would have returned before the child showed.
 	for gone in [libc::ENOENT, libc::ESRCH] {
 		let first_task = {
-			let mut names: Vec<std::ffi::OsString> =
-				fs::read_dir("/proc/self/task").unwrap().map(|task| task.unwrap().file_name()).collect();
+			let mut names: Vec<std::ffi::OsString> = fs::read_dir("/proc/self/task")
+				.unwrap()
+				.map(|task| task.unwrap().file_name())
+				.collect();
 			names.sort();
 			names.remove(0)
 		};
@@ -683,24 +690,26 @@ fn a_task_that_has_gone_is_read_as_gone_on_either_kernel() {
 				}
 				if pass <= 2 {
 					// The pass a task has gone from, with no child anywhere.
-					return match starts_a_pass {
-						true => Err(std::io::Error::from_raw_os_error(gone)),
-						false => Ok(String::new()),
+					return if starts_a_pass {
+						Err(std::io::Error::from_raw_os_error(gone))
+					} else {
+						Ok(String::new())
 					};
 				}
 				Ok("4242 ".to_owned())
 			});
 		});
-		let why = left.err().map(why_of).unwrap_or_default();
+		let why = left.err().map_or_default(why_of);
 		assert!(
 			why.contains("children left behind"),
-			"the walk ended on two passes a task had gone from ({gone}), before a child showed: {why:?}"
+			"the walk ended on two passes a task had gone from ({gone}), before a child showed: \
+			 {why:?}"
 		);
 	}
 	let refused = std::panic::catch_unwind(|| {
 		assert_no_task_has_children(|_| Err(std::io::Error::from_raw_os_error(libc::EACCES)));
 	});
-	let why = refused.err().map(why_of).unwrap_or_default();
+	let why = refused.err().map_or_default(why_of);
 	assert!(
 		why.contains("the children of task") && why.contains("PermissionDenied"),
 		"a list refused with EACCES was not reported as a failed read naming the error: {why:?}"
@@ -890,8 +899,10 @@ fn a_locale_lock_another_thread_holds_does_not_reach_the_lookup() {
 		assert!(!holder.is_finished(), "{ended}");
 		let state = match fs::read_to_string(&stat) {
 			Ok(state) => state,
-			// The thread's directory goes only once the thread has ended.
-			Err(_) if holder.is_finished() => panic!("{ended}"),
+			// The thread's directory goes only once the thread has ended: Linux
+			// then answers ENOENT and gVisor ESRCH (`task_has_gone`). Any other
+			// error is named below.
+			Err(error) if task_has_gone(&error) && holder.is_finished() => panic!("{ended}"),
 			Err(error) => panic!("{stat}: {error}"),
 		};
 		if state.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('S')) {
@@ -1207,11 +1218,13 @@ fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
 			panic!("the member {member} {why}");
 		}
 		// SAFETY: a handle on this test's own unreaped child, owned from here.
-		let handle = unsafe { libc::syscall(libc::SYS_pidfd_open, number, 0) };
-		let handle = super::ChildHandle(
-			unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::c_int::try_from(handle).unwrap()) },
-			number,
-		);
+		let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, number, 0) };
+		let fd = libc::c_int::try_from(opened).unwrap();
+		assert!(fd >= 0, "pidfd_open of {number}: {}", std::io::Error::last_os_error());
+		// SAFETY: `fd` is the descriptor `pidfd_open` just opened for this test
+		// (not -1, checked above). Nothing else in this process has its number,
+		// so the `OwnedFd` is its one owner and closes it once.
+		let handle = super::ChildHandle(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }, number);
 		if reaped_elsewhere {
 			utility.kill().unwrap();
 			utility.wait().unwrap();
@@ -1313,9 +1326,13 @@ fn a_member_whose_main_thread_exited_is_ended_before_linux_6_9() {
 	}
 	assert!(!super::live_member(zombie, group), "a true zombie counts as a live member");
 	// SAFETY: a handle on this test's own unreaped child, owned from here.
-	let handle = unsafe { libc::syscall(libc::SYS_pidfd_open, group, 0) };
-	let handle =
-		super::ChildHandle(unsafe { std::os::fd::OwnedFd::from_raw_fd(libc::c_int::try_from(handle).unwrap()) }, group);
+	let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, group, 0) };
+	let fd = libc::c_int::try_from(opened).unwrap();
+	assert!(fd >= 0, "pidfd_open of {group}: {}", std::io::Error::last_os_error());
+	// SAFETY: `fd` is the descriptor `pidfd_open` just opened for this test (not
+	// -1, checked above). Nothing else in this process has its number, so the
+	// `OwnedFd` is its one owner and closes it once.
+	let handle = super::ChildHandle(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }, group);
 	handle.end_group();
 	let ended = children.reap_within(member, std::time::Duration::from_secs(2));
 	assert_eq!(children.reap_within(zombie, std::time::Duration::from_secs(2)), Some(0), "the zombie's exit status");
@@ -1337,7 +1354,7 @@ fn a_member_whose_name_is_no_utf8_is_read() {
 	if !crate::own_process::own_process() {
 		return;
 	}
-	let name = std::ffi::CStr::from_bytes_with_nul(b"\xe8x\0").unwrap();
+	let name = c"\xe8x";
 	let utility = Command::new("/bin/sh").args(["-c", "exec sleep 30"]).process_group(0).spawn().unwrap();
 	let group = libc::pid_t::try_from(utility.id()).unwrap();
 	let mut children = Children { utility, forked: Vec::new() };
@@ -1623,14 +1640,31 @@ fn a_closed_standard_descriptor_never_becomes_the_answer() {
 		// in this process writes to one.
 		let kept: Vec<(i32, i32)> =
 			wanted.iter().map(|standard| (*standard, unsafe { libc::dup(*standard) })).collect();
-		// SAFETY: as above.
+		assert!(
+			kept.iter().all(|&(_, saved)| saved >= 0),
+			"dup of {wanted:?}: {}",
+			std::io::Error::last_os_error()
+		);
 		for (standard, _) in &kept {
+			// SAFETY: no owner in this process holds a standard descriptor. std
+			// opens 0, 1 and 2 before `main` when they are closed, so no file
+			// opened later has one of those numbers, and std's stdin, stdout and
+			// stderr use them without owning them; this process runs only this
+			// test (`own_process`). So closing one breaks no owner's I/O safety,
+			// and `kept` holds an open duplicate of it (checked above), which the
+			// loop below puts back.
 			unsafe { libc::close(*standard) };
 		}
 		let codeset = crate::locale::loaded_codeset(SHELL_ONLY_LOCALE, &env, None);
 		let loadable = crate::locale::locale_loadable(literal, libc::LC_CTYPE_MASK);
-		// SAFETY: as above; every saved descriptor is this test's own.
 		for (standard, saved) in &kept {
+			// SAFETY: `saved` is the open duplicate `dup` made above, and only
+			// `kept` has its number. The query has returned and keeps no
+			// descriptor past its return (`locale.rs` starts no thread and holds
+			// no descriptor in a static), so no owner holds the standard number:
+			// `dup2` puts the duplicate back there and breaks no owner's I/O
+			// safety, and `close` then releases the duplicate, which nothing else
+			// uses.
 			unsafe {
 				libc::dup2(*saved, *standard);
 				libc::close(*saved);
@@ -1667,7 +1701,7 @@ fn a_query_leaves_the_callers_signal_settings_alone() {
 	let env = move |key: &str| (key == "LOCPATH").then(|| shell_path.clone());
 	let blocked = |signal| {
 		let mask = nix::sys::signal::SigSet::thread_get_mask();
-		mask.map(|held| held.contains(signal)).unwrap_or_default()
+		mask.is_ok_and(|held| held.contains(signal))
 	};
 	let mut usr1 = nix::sys::signal::SigSet::empty();
 	usr1.add(nix::sys::signal::SIGUSR1);
@@ -1862,12 +1896,17 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 		libc::signal(libc::SIGUSR2, libc::SIG_IGN);
 		libc::setpgid(0, grouped);
 	}
-	let ran: Vec<i32> = fs::read(&record)
-		.unwrap()
-		.chunks_exact(4)
-		.map(|number| i32::from_ne_bytes(number.try_into().unwrap()))
+	let written = fs::read(&record).unwrap();
+	let (numbers, partial) = written.as_chunks::<4>();
+	let ran: Vec<i32> = numbers
+		.iter()
+		.map(|number| i32::from_ne_bytes(*number))
 		.collect();
-	assert!(ran.is_empty(), "the handler ran in the child before its `execve`: {ran:?}");
+	// Only the handler writes the record, so a part of a number is a run too.
+	assert!(
+		ran.is_empty() && partial.is_empty(),
+		"the handler ran in the child before its `execve`: {ran:?}, and part of one: {partial:?}"
+	);
 	assert!(taken.is_some(), "no query took the signal before its `execve`, so nothing was proved: {last}");
 	assert!(
 		died_ignoring.is_none(),
