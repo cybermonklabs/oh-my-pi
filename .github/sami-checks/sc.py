@@ -10,11 +10,17 @@
   sc.py bun JUNIT LOG EXIT SECS ROW UNIT     one `bun test` run's result
   sc.py plain EXIT SECS ROW UNIT LOG         a command whose exit is its verdict (check:ts)
   sc.py clippy-crates METADATA CRATE...     "crate<TAB>dir<TAB>library root" a line, from `cargo metadata`
-  sc.py clippy LOG EXIT SECS CRATE DIR CONTROL_LOG CONTROL_FILE   one crate's clippy result against clippy-baseline.txt
-  sc.py clippy-baseline LOG CRATE DIR      one crate's findings as clippy-baseline.txt lines (to regenerate it)
+  sc.py clippy LOG EXIT SECS CRATE DIR CONTROL_LOG CONTROL_FILE METADATA
+                                           one crate's clippy result against clippy-baseline.txt, each unit of the crate
+                                           (METADATA: `cargo metadata --no-deps`) that it did not lint named UNKNOWN
+  sc.py clippy-baseline LOG CRATE DIR METADATA   one crate's findings as clippy-baseline.txt lines (to regenerate it);
+                                           a crate not linted whole keeps its baseline lines
   sc.py platforms PC OUT                   one result per platform from platform-checks' pc-report under PC
   sc.py summary RESULTS BUILD [KNOWN]      the step summary (markdown) on stdout, its verdict line also to $SC_VERDICT;
-                                           a row SC_ROWS does not name reads NOT RUN; exit 1 unless every row that ran passed
+                                           a row SC_ROWS does not name reads NOT RUN; exit 0 when every row that ran
+                                           passed, 1 when it found a fault, else 2 when a row (or the summary) could not be read
+  sc.py unreadable-pass SUMMARY VERDICT WHY   a passing summary's report that could not be written (WHY): the verdict
+                                           file and SUMMARY read UNKNOWN, and the new exit line on stdout
   sc.py skip-forms TREE NOT_MARKERS        each print of TREE/crates that says skip is read or named (JSON)
   sc.py skip-lines RESULTS NOT_MARKERS     each skip line a passing test printed is read or named (JSON)
   sc.py flaky-failed RESULT KNOWN          the failed tests of one result with a `flaky: ` entry, one a line
@@ -43,14 +49,20 @@
                                            the builtins-lint row's units: each finding of `cargo clippy` (every lint a
                                            warning) or `cargo fmt --check` of the crate in DIR, sorted as the rustfmt row
                                            sorts its places, into upstream's own and the fork's (builtins-lint.sh)
+  sc.py previous-report OUT                the previous cut's sc-report (results.json, verdict.json) into OUT, beside
+                                           about.json naming its run, or why none could be read: the summary's
+                                           SC_PREVIOUS, which it compares this run's failures with (first seen at this cut)
 
 The counter rule (the fork's gate kit): a result is PASS or FAIL only when it was read. A libtest
 binary whose exit is neither 0 nor 101, a nextest run whose exit is neither 0 nor 100, a bun run
 with no JUnit report or no summary line, a command the time bound or a signal ended, a clippy run
-whose exit is neither 0 nor 101 or whose control was not caught, a platform the platform report
+whose exit is neither 0 nor 101 or whose control was not caught, a clippy run that did not lint
+every unit of its crate (each such unit is named; a finding it did read still fails it), a
+platform the platform report
 gives no verdict for, a memory bench that did not build, did not end on its own or printed no
 target line, and a unit the plan expects that no job reported, or that two jobs reported,
-are UNKNOWN, and so is every row they belong to. A test that passed after printing a skip marker
+are UNKNOWN, and so is every row they belong to unless another unit of it failed (a fault outranks
+a unit that could not be read). A test that passed after printing a skip marker
 compared nothing: it is counted apart, named, and its unit is UNKNOWN, unless each of its skip
 lines is a sub-case that partial-skips.txt lets that test skip and the entry's witness line is in
 its output (then it passes and is listed as partial), it passed as the other user, or
@@ -58,6 +70,13 @@ known-failures.txt names each of its skip lines for that row and user (`skips: `
 KNOWN). A test that started and never ended is named. A failure with a `flaky: ` entry reads KNOWN
 only when the test passed in a retry of its whole unit in the same job (the unit's command again,
 at most twice; on the platform rows, nextest's own retry of the test's own process).
+
+First seen at this cut: the summary compares each failure with the previous cut's report (the newest
+completed push of release-candidate before the run, or the run the dispatch input `previous` names).
+A failure that report does not hold, by its words less the line or column that moves with other
+lines of the tree (FINDING_MOVES), or holds fewer times (finding_keys), heads the summary and is in
+verdict.json's first_seen. A report that could not be read makes first_seen the string UNKNOWN,
+and the summary says why: it never reads as nothing first seen.
 """
 
 import fnmatch
@@ -158,7 +177,7 @@ ROWS = (
     ("check:ts", "checkts"),
     ("macOS: pi-shell, platform checks", "macos"),
     ("Windows: pi-shell, platform checks", "windows"),
-    ("clippy --tests -D warnings, per crate (failed: findings beyond clippy-baseline.txt)", "clippy"),
+    ("clippy --tests, every lint a warning, per crate (failed: findings beyond clippy-baseline.txt)", "clippy"),
     ("skip prints the summary reads", "skipforms"),
     ("pi-shell set, gVisor (uid 1000)", "gv-set-uid1000"),
     ("pi-shell set, gVisor (root)", "gv-set-root"),
@@ -183,6 +202,9 @@ RUST_JOBS = (
 )
 # The names the dispatch input `rows` takes, one per row of the summary.
 ROW_KEYS = tuple(k for _, k in ROWS) + tuple(k for _, k in RUST_JOBS)
+# The summary's exit for its verdict: a run that could not look (UNKNOWN) never exits with the code
+# of one that found a fault (FAIL), and a fault outranks a row that could not be read.
+SUMMARY_EXIT = {"PASS": 0, "FAIL": 1, "UNKNOWN": 2}
 # sami-checks.yml, whose jobs' `needs:` the plan reads (the plan job checks out .github/workflows too).
 WORKFLOW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "sami-checks.yml")
 # The jobs every run has: the plan, and the summary that reads every other job.
@@ -918,10 +940,22 @@ def read_clippy_baseline(path):
     return base
 
 
-def clippy_baseline_lines(log, crate, crate_dir):
+def clippy_baseline_lines(log, crate, crate_dir, metadata, baseline_path=CLIPPY_BASELINE):
     """The baseline lines of one crate's findings in its log (the regeneration step's input). A
     compile error with no code is never a baseline line; it and any line that did not parse are
-    named in a comment line instead, so a regenerated baseline cannot take them in unseen."""
+    named in a comment line instead, so a regenerated baseline cannot take them in unseen. A crate
+    the log shows was not linted whole (clippy_not_linted) gives its lines in the baseline at
+    BASELINE_PATH unchanged, after a comment naming the units it did not lint: a regenerated
+    baseline cannot drop a line for a unit that was not linted."""
+    seen = clippy_not_linted(log, crate, metadata)
+    if seen is None or seen[0]:
+        why = (f"the cargo metadata ({metadata}) names no units of {crate}" if seen is None else
+               f"{len(seen[0])} unit(s) were not linted: " + ", ".join(u for u, _ in seen[0][:12]) + (", ..." if len(seen[0]) > 12 else ""))
+        print(f"# {crate}: not linted whole ({why}), so its lines are the baseline's, unchanged")
+        for (c, f, code, msg), n in sorted(read_clippy_baseline(baseline_path).items()):
+            if c == crate:
+                print(f"{c}\t{f}\t{code}\t{n}\t{msg}")
+        return
     diags, unread = clippy_diagnostics(log) or ({}, ["(no log)"])
     own = {k: v for k, v in diags.items() if k[0].startswith(crate_dir.rstrip("/") + "/")}
     for (f, code, msg), locs in sorted(own.items()):
@@ -948,24 +982,134 @@ def clippy_crates(metadata, crates):
         print(f"{c}\t{os.path.relpath(os.path.dirname(p['manifest_path']), root)}\t{os.path.relpath(lib, root) if lib else '-'}")
 
 
-def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, baseline_path=CLIPPY_BASELINE):
+# The kinds of a cargo target that cargo calls "lib" (cargo metadata names a cdylib-only library
+# `cdylib`; cargo's "could not compile" line still says `(lib test)`).
+CLIPPY_LIB_KINDS = ("lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro")
+
+
+def clippy_target(kinds, name):
+    """A cargo target in cargo's own words: `lib`, `build script`, or `<kind> "<name>"`."""
+    if any(k in CLIPPY_LIB_KINDS for k in kinds):
+        return "lib"
+    if "custom-build" in kinds:
+        return "build script"
+    return f'{kinds[0] if kinds else "?"} "{name}"'
+
+
+def clippy_unit(kinds, name, test):
+    """A unit cargo builds, in the words of its `could not compile `crate` (<unit>)` line: the
+    target, and ` test` for one built as a test harness, except a test or bench target (cargo
+    says `lib test`, `bin "obash" test`, `test "comptest"`)."""
+    target = clippy_target(kinds, name)
+    return target + " test" if test and not target.startswith(("test ", "bench ")) else target
+
+
+def clippy_unit_target(unit):
+    """The target of a unit clippy_unit names."""
+    return unit[:-len(" test")] if unit.endswith(" test") and not unit.startswith(("test ", "bench ")) else unit
+
+
+def clippy_units(metadata, crate):
+    """(manifest path, [unit]) for the units `cargo clippy -p CRATE --tests` builds, from `cargo
+    metadata --no-deps`: its build script, each target cargo tests (`test` true in the metadata),
+    built as a test, and `lib` when another of those targets needs the library. None when the
+    metadata cannot be read, names no such package, or names no unit of it: a crate with no unit
+    to compare has not been seen linted, so it can never read clean."""
+    try:
+        pkg = next((p for p in json.load(open(metadata, encoding="utf-8"))["packages"] if p["name"] == crate), None)
+        if pkg is None:
+            return None
+        units, has_lib, needs_lib = [], False, False
+        for t in pkg["targets"]:
+            target = clippy_target(t["kind"], t["name"])
+            has_lib |= target == "lib"
+            if target == "build script":
+                units.append(target)
+            elif t.get("test", target == "lib" or t["kind"][0] in ("bin", "test")):
+                units.append(clippy_unit(t["kind"], t["name"], True))
+                needs_lib |= target != "lib"
+        if has_lib and needs_lib:
+            units.insert(units.index("lib test") if "lib test" in units else len(units), "lib")
+        return (pkg["manifest_path"], units) if units else None
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return None
+
+
+def clippy_not_linted(log, crate, metadata):
+    """Each unit of CRATE that its `cargo clippy --tests --message-format=json` log (stdout and
+    stderr) shows clippy did not lint, with why, and the number it did lint: ([[unit, why]],
+    linted); None when the metadata names no units of the crate. A unit was linted when cargo
+    reports its artifact, or reports that it did not compile while every error rustc gave its
+    target was a lint (rustc runs all of a crate's lints before it stops on lint errors). A unit
+    whose target had another error (a code E0000-E9999 or none) was not linted whole: rustc stops
+    on it before its later lints. A unit cargo neither built nor reported was not linted at all:
+    cargo builds no unit whose dependency did not compile (at Cut15, Cut16 and Cut17, pi-shell's
+    lib failed on one lint under -D warnings, and none of its 71 tests nor obash was linted)."""
+    got = clippy_units(metadata, crate)
+    if got is None:
+        return None
+    manifest, units = got
+    built, failed, others, lint_errors, errors = set(), [], [], set(), {}
+    for ev in (cargo_messages(log) or ([], []))[0]:
+        if ev.get("manifest_path") != manifest or not isinstance(ev.get("target"), dict):
+            continue
+        kinds, name = ev["target"].get("kind") or [], ev["target"].get("name", "")
+        if ev.get("reason") == "compiler-artifact":
+            built.add(clippy_unit(kinds, name, (ev.get("profile") or {}).get("test")))
+        elif ev.get("reason") == "compiler-message" and (ev.get("message") or {}).get("level") == "error":
+            code = ((ev["message"].get("code") or {}).get("code")) or ""
+            if re.fullmatch(r"E\d{4}|", code):
+                errors.setdefault(clippy_target(kinds, name), ev["message"].get("message", ""))
+            else:
+                lint_errors.add(clippy_target(kinds, name))
+    lines = read_lines(log) or []
+    for line in lines:
+        m = re.match(r"error: could not compile `([^`]+)` \((.+?)\)", line)
+        if m and m[1] == crate:
+            failed.append(m[2])
+        elif m:
+            others.append(f"`{m[1]}` ({m[2]})")
+    needed = [f"`{u}`" for u in failed if u in ("lib", "build script")] + others
+    first = next((l for l in lines if l.startswith("error") and "could not compile" not in l), None)
+    skipped = (f"cargo did not build it: {', '.join(needed)} did not compile" if needed else
+               f"cargo did not build it: {first[:300]}" if first else "cargo neither built it nor said that it failed")
+    out = []
+    for u in dict.fromkeys(units + failed):
+        target = clippy_unit_target(u)
+        if u in built or (u in failed and target in lint_errors and target not in errors):
+            continue
+        if u in failed:
+            why = f"error: {errors[target][:300]}" if target in errors else "no error message"
+            out.append([u, f"it did not compile ({why}), so rustc did not run all its lints"])
+        else:
+            out.append([u, skipped])
+    return out, len(dict.fromkeys(units + failed)) - len(out)
+
+
+def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, metadata, baseline_path=CLIPPY_BASELINE):
     """One crate's clippy result, by the cut's rule against the baseline. Its findings are those in
     files under its own directory (a dependency's are not this crate's). FAIL: a finding whose key
     the baseline lacks, a key with more places than the baseline counts, or a compile error with no
     code (UNCODED_ERROR, which no baseline line holds: its target was never linted), each place
     named `file:line: code: message`. KNOWN: findings, each within the baseline. PASS: no finding.
+    Each unit of the crate that it did not lint (clippy_not_linted, from METADATA's targets) is
+    named in not_linted and reads UNKNOWN: the crate cannot read PASS or KNOWN then, a finding it
+    did read still fails it, and no baseline line is listed as fallen (a key with fewer places here
+    may be in a unit it did not lint).
     A baseline key with fewer places here is listed (baseline_fell) with the line that replaces it,
     never a failure. KNOWN and PASS also need the control run to read the unused import clippy.sh
     planted in the crate's library root, a finding the baseline lacks. Anything else is UNKNOWN: no
     log, a log line that looks like a cargo message but does not parse (its finding is unread), an
-    exit other than 0 or 101 (clippy did not finish), exit 101 with no finding of its own, exit 0
-    with findings."""
+    exit other than 0 or 101 (clippy did not finish), exit 101 with no finding of its own. Every
+    lint is a warning (clippy.sh: --cap-lints warn), so a finding comes with exit 0 as with 101."""
     base = {(f, code, msg): n for (c, f, code, msg), n in read_clippy_baseline(baseline_path).items()
             if c == crate and code != UNCODED_ERROR}
+    unlinted = []
 
     def r(status, failures=(), note="", fell=()):
         res = result("clippy", crate, "runner", status, exit_code, secs, failed=len(failures), failures=failures, note=note)
         res["baseline_fell"] = list(fell)
+        res["not_linted"] = list(unlinted)
         return res
 
     if crate_dir == "-":
@@ -975,6 +1119,12 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, base
         return r("UNKNOWN", note="no log")
     diags, unread = got
     own = {k: v for k, v in diags.items() if k[0].startswith(crate_dir.rstrip("/") + "/")}
+    seen = clippy_not_linted(log, crate, metadata)
+    if seen is None:
+        return r("UNKNOWN", note=f"the cargo metadata ({metadata}) names no units of {crate}, so what clippy linted is not known")
+    unlinted[:] = seen[0]
+    gap = (f"{len(unlinted)} of {len(unlinted) + seen[1]} unit(s) of {crate} were not linted, each named UNKNOWN"
+           if unlinted else "")
     try:
         code = int(exit_code)
     except ValueError:
@@ -984,8 +1134,6 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, base
     if code == 101 and not own and not unread:
         first = next((l for l in read_lines(log) or () if l.startswith("error")), "no error line")
         return r("UNKNOWN", note=f"exit 101 and no finding under {crate_dir}/, so it was not linted: {first[:300]}")
-    if code == 0 and own:
-        return r("UNKNOWN", note=f"exit 0 with {sum(map(len, own.values()))} findings under -D warnings")
     beyond, known = [], 0
     for (f, lint, msg), places in sorted(own.items()):
         b = base.get((f, lint, msg), 0)
@@ -1000,6 +1148,9 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, base
         if n < b:
             fix = "delete its line" if n == 0 else f"its line becomes `{crate}\t{f}\t{lint}\t{n}\t{msg}` (tab-separated)"
             fell.append(f"{f}: {lint}: {msg} ({n} here, {b} in the baseline): {fix}")
+    if unlinted and fell:
+        gap += f"; {len(fell)} baseline line(s) with fewer places here are not listed for removal, as a unit not linted may hold them"
+        fell = []
     if unread:
         return r("UNKNOWN", beyond, f"log line(s) {', '.join(map(str, unread[:12]))} look like cargo messages and do not parse, "
                                     "so their findings are unread", fell)
@@ -1008,7 +1159,9 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, base
     said = "the planted control read as a finding beyond the baseline" if caught else (
         "the control left no log" if ctl is None else f"the control's unused import planted in {ctl_file} was not read as a finding")
     if beyond:
-        return r("FAIL", beyond, f"{len(beyond)} finding(s) beyond the baseline; {known} within it; {said}", fell)
+        return r("FAIL", beyond, f"{len(beyond)} finding(s) beyond the baseline; {known} within it; {said}" + (f"; {gap}" if gap else ""), fell)
+    if unlinted:
+        return r("UNKNOWN", note=f"{gap}; in the units it linted, {known} finding(s), each within the baseline; {said}")
     if not caught:
         return r("UNKNOWN", note=f"{said}, so a clean result proves nothing", fell=fell)
     if known:
@@ -1512,6 +1665,298 @@ def record_retry(result_path, test, report, shape, scope="whole-unit"):
     return outcome
 
 
+# The summary's comparison with the previous cut ("First seen at this cut"). A failure's words hold
+# parts that move when other lines of the tree move (a line number, a column): each (rows, pattern,
+# replacement) here takes one out in those rows, so that finding_key names the same finding at two
+# cuts, and keeps what tells one finding from another (its file, lint and message; the source line
+# where the row prints it, as builtins-lint does; a panic's assertion). A row this does not name
+# keeps its words whole, so a finding there that only moved reads first seen, never standing. What it
+# cannot tell apart: a finding fixed at one place and made again, with the same words, at another
+# place of the same file in the same cut reads as one that moved. The clippy and docs rows print no
+# source line, so there the same words are a file, a lint (or a link) and a message.
+FINDING_MOVES = (
+    # A lint place, `path:line[:col]: ...` (cargo clippy, rustdoc, rustfmt): its line and column.
+    (("clippy", "builtins-lint", "docs", "rustfmt"), re.compile(r"^([^\s:]+):\d+(?::\d+)?(?=: )"), r"\1"),
+    # The clippy row's count of a finding beyond its baseline, ` (3 here, 1 in the baseline)`: the
+    # comparison counts the places itself.
+    (("clippy",), re.compile(r" \(\d+ here, \d+ in the baseline\)$"), ""),
+    # A skip print of the tree, `...: path:line: 'text'`: its line; a skip line a test printed: how
+    # often, and which test printed it first.
+    (("skipforms",), re.compile(r"^(a skip print the summary does not read: [^\s:]+):\d+(?=: )"), r"\1"),
+    (("skipforms",), re.compile(r", printed \d+ time\(s\), first by .*$"), ""),
+    # A memory bench target that missed: its name, without its measured numbers; the bench's exit
+    # and its panic (`exit 101: thread 'main' panicked at path:line:col: <assertion>`): the panic's
+    # line and column, its assertion kept whole.
+    (("membench",), re.compile(r"^([^:]+): .*\(target\b.*$"), r"\1"),
+    (("membench",), re.compile(r"^(exit [^\s:]+: .*? panicked at [^\s:]+):\d+:\d+(?=:)"), r"\1"),
+    # A command's exit, `unit: exit N: <its last lines>` (check:ts): each error's place in its last
+    # lines (`(line,col)`, `:line:col`), so the same errors elsewhere are standing and another is not.
+    (("checkts",), re.compile(r"^(.*?: exit [^\s:]+: )(.*)$"), lambda m: m[1] + re.sub(r"\(\d+,\d+\)|:\d+:\d+", "(#)", m[2])),
+    # A platform test that did not pass: the verdict the platform checks add to it (` (TIMEOUT)`).
+    (PLATFORMS, re.compile(r" \([A-Z_]+\)$"), ""),
+)
+# A CHANGELOG the check would rewrite, `path: 0 promoted item(s), ..., 28 collapsed release(s); from
+# line N: <its first changed lines>` (parse_changelog): one finding per kind of rewrite, counted.
+CHANGELOG_KINDS = re.compile(r"^([^\s:]+): ([^;]*)(?:; .*)?$")
+# How many of the failures of a unit with no result at the previous cut its first_seen entry names
+# (and each that names a planted run's plant).
+FIRST_SEEN_NAMED = 10
+
+
+def finding_key(row, failure):
+    """A failure's identity across cuts: its words without what FINDING_MOVES says moves in its row."""
+    for rows, pattern, repl in FINDING_MOVES:
+        if row in rows:
+            failure = pattern.sub(repl, failure, count=1)
+    return failure
+
+
+def finding_keys(row, failure):
+    """The findings one failure names, {key: how many}: a CHANGELOG the check would rewrite is one
+    finding per kind of rewrite it needs, `path: <kind>`, as many as the check counts (so one more
+    empty heading in a file that had one is first seen); any other failure is one, finding_key."""
+    m = CHANGELOG_KINDS.match(failure) if row == "changelog" else None
+    kinds = {f"{m[1]}: {k.strip()}": int(n) for n, k in re.findall(r"(\d+) ([^,]+)", m[2]) if n != "0"} if m else {}
+    return kinds or {finding_key(row, failure): 1}
+
+
+def compared_unit(row, unit):
+    """The unit a failure is compared in: its own, or `*`, any unit of its row, in ANY_UNIT_ROWS (a
+    coding-agent test moves to another shard when a file is added before it)."""
+    return "*" if row in ANY_UNIT_ROWS else unit
+
+
+def read_previous(path):
+    """The previous cut's report for "First seen at this cut": PATH, the directory sc.py
+    previous-report fills (that run's sc-report: results.json and verdict.json; about.json naming the
+    run, or why none could be read). Returns (index, rows, against, why). index is {(row, who,
+    compared unit): ({finding key: places}, {test that passed}, {unit status})}, and rows the row
+    verdicts of its verdict.json (None when it has none to read); against names the report. A test
+    that skipped itself did not pass. A unit two jobs reported (which its summary read UNKNOWN)
+    counts each finding at the fewest places either report names, as UNKNOWN, so that a double count
+    never makes a new place of a finding read standing. index is None, and why says why, when there is
+    nothing to compare with: no report named, one the fetch step could not get, a results.json that is
+    missing, does not parse or is no list of unit results, and one that holds no result, since against
+    nothing every failure would read first seen."""
+    if not path:
+        return None, None, "nothing", "no previous report was given to the summary (SC_PREVIOUS is not set)"
+    about = {}
+    about_path = os.path.join(path, "about.json")
+    if os.path.exists(about_path):
+        try:
+            about = json.load(open(about_path, encoding="utf-8"))
+            if not isinstance(about, dict):
+                raise ValueError("it is no JSON object")
+        except (OSError, ValueError) as e:
+            return None, None, path, f"{about_path}, which names the previous report, does not parse ({e})"
+    against = about.get("from") or path
+    if about.get("why"):
+        return None, None, against, about["why"]
+    results_path = os.path.join(path, "results.json")
+    try:
+        prev = json.load(open(results_path, encoding="utf-8"))
+    except FileNotFoundError:
+        return None, None, against, (f"its results.json is not there ({results_path})"
+                                     + ("" if about else "; no about.json says why"))
+    except (OSError, ValueError) as e:
+        return None, None, against, f"its results.json does not parse ({type(e).__name__}: {e})"[:400]
+    if not isinstance(prev, list):
+        return None, None, against, f"its results.json is a JSON {type(prev).__name__}, not a list of unit results"
+    if not prev:
+        return None, None, against, "its results.json holds no unit result, so there is nothing to compare with"
+    shape = {"row": str, "unit": str, "who": str, "status": str, "failures": list, "tests": list}
+    reports = {}
+    for i, r in enumerate(prev):
+        lacks = [k for k, t in shape.items() if not isinstance(r, dict) or not isinstance(r.get(k), t)]
+        if lacks or not all(isinstance(t, list) and t and isinstance(t[0], str) for t in r["tests"]) \
+                or not all(isinstance(f, str) for f in r["failures"]) or not isinstance(r.get("self_skipped", []), list):
+            return None, None, against, (f"its results.json is not a list of unit results: entry {i} has no "
+                                         + (", ".join(lacks) if lacks else "list of test names, failures and self-skips"))
+        fails = {}
+        for f in r["failures"]:
+            for k, n in finding_keys(r["row"], f).items():
+                fails[k] = fails.get(k, 0) + n
+        bad = set(r["failures"]) | set(r.get("self_skipped", []))
+        reports.setdefault((r["row"], r["who"], r["unit"]), []).append(
+            (fails, {t[0] for t in r["tests"] if t[0] not in bad}, r["status"]))
+    index = {}
+    for (row, who, unit), got in reports.items():
+        if len(got) == 1:
+            fails, passed, statuses = got[0][0], got[0][1], {got[0][2]}
+        else:
+            fails = {k: min(f.get(k, 0) for f, _, _ in got) for k in set().union(*(f for f, _, _ in got))}
+            passed = set.intersection(*(p for _, p, _ in got))
+            statuses = {s for _, _, s in got} | {"UNKNOWN"}
+        into = index.setdefault((row, who, compared_unit(row, unit)), ({}, set(), set()))
+        for k, n in fails.items():
+            into[0][k] = into[0].get(k, 0) + n
+        into[1].update(passed)
+        into[2].update(statuses)
+    rows = None
+    try:
+        rows = json.load(open(os.path.join(path, "verdict.json"), encoding="utf-8")).get("rows")
+    except (OSError, ValueError, AttributeError):
+        pass
+    return index, rows if isinstance(rows, dict) else None, against, None
+
+
+def row_first_seen(row, rs, index, reading, keep=None):
+    """The failures of one row's units (RS) that the previous cut's report (read_previous's INDEX)
+    does not hold, as entries of verdict.json's first_seen: each failure naming a finding
+    (finding_keys) its compared unit there lacks, or counts fewer times than this cut (each failure
+    naming it here is then listed), with the evidence in `previous`; and one entry for each unit with
+    failures that has no result there at all, whose failures none could be compared: it counts them
+    (`failed`) and names the first FIRST_SEEN_NAMED and each that KEEP(f) holds (`failures`: a planted
+    run's plant). READING(r, f): the summary's word for a failure, NEW or KNOWN."""
+    groups = {}
+    for r in rs:
+        for f in r["failures"]:
+            groups.setdefault((r["who"], compared_unit(row, r["unit"])), []).append((r, f))
+    out = []
+    for (who, unit), items in groups.items():
+        where = "its row (any unit)" if unit == "*" else "its unit"
+        prev = index.get((row, who, unit))
+        if prev is None:
+            for r in {id(r): r for r, _ in items}.values():
+                mine = [f for s, f in items if s is r]
+                named = mine[:FIRST_SEEN_NAMED] + [f for f in mine[FIRST_SEEN_NAMED:] if keep is not None and keep(f)]
+                out.append({"kind": "unit", "row": row, "who": who, "unit": r["unit"], "finding": f"{len(mine)} failure(s)",
+                            "reading": None, "previous": f"the previous cut's report has no result for {where}",
+                            "failed": len(mine), "failures": named})
+            continue
+        fails, passed, statuses = prev
+        counts, naming = {}, {}
+        for r, f in items:
+            for k, n in finding_keys(row, f).items():
+                counts[k] = counts.get(k, 0) + n
+                naming.setdefault(k, []).append((r, f))
+        marks = {}
+        for k, n in counts.items():
+            m = fails.get(k, 0)
+            if n <= m:
+                continue
+            if m:
+                said = (f"the previous cut counted {m} {k.partition(': ')[2] or k} in it, this cut {n}" if row == "changelog"
+                        else f"the previous cut had it at {m} place(s) of {where}, this cut at {n}")
+            elif k in passed:
+                said = "it passed at the previous cut"
+            elif "UNKNOWN" in statuses:
+                said = f"{where} did not have it at the previous cut, and read UNKNOWN there, so it may have been missed"
+            else:
+                said = f"{where} did not have it at the previous cut"
+            for r, f in naming[k]:
+                marks.setdefault((id(r), f), []).append(said)
+        listed = set()
+        for r, f in items:
+            said = marks.get((id(r), f))
+            if said and (id(r), f) not in listed:
+                listed.add((id(r), f))
+                out.append({"kind": "failure", "row": row, "who": who, "unit": r["unit"], "finding": f, "reading": reading(r, f),
+                            "previous": "; ".join(said)})
+    return out
+
+
+def rust_first_seen(row_verdicts, prev_rows):
+    """The Rust rows (RUST_JOBS), read from their jobs' conclusions, compared by verdict: a FAIL that
+    the previous cut's verdict.json does not give the row is first seen; a FAIL at both cuts is not
+    compared, since the summary reads none of the job's tests. Returns (entries, not compared)."""
+    out, blind = [], []
+    for title, job in RUST_JOBS:
+        if row_verdicts.get(job) != "FAIL":
+            continue
+        before = prev_rows.get(job) if prev_rows is not None else None
+        if prev_rows is None:
+            blind.append(f"{title}: FAIL, and the previous cut's verdict.json gives no row verdicts to compare it with")
+        elif before == "FAIL":
+            blind.append(f"{title}: FAIL at this cut and at the previous one; the summary reads none of its tests, so a test "
+                         "that first failed here is not seen (that job's annotations and log name them)")
+        else:
+            out.append({"kind": "row", "row": job, "who": None, "unit": None, "finding": "the row reads FAIL", "reading": None,
+                        "previous": f"it read {before or 'nothing: the row was not in its report'} at the previous cut"})
+    return out, blind
+
+
+def gh_api(path):
+    """`gh api PATH`'s output, as bytes (GH_TOKEN: the job's token, which holds actions: read)."""
+    try:
+        p = subprocess.run(["gh", "api", path], capture_output=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"gh api {path} did not run ({e})") from e
+    if p.returncode != 0:
+        said = " / ".join((p.stderr or p.stdout).decode("utf-8", "replace").split("\n")).strip(" /")
+        raise RuntimeError(f"gh api {path} exited {p.returncode}: {said[:300] or 'no message'}")
+    return p.stdout
+
+
+# How many of the newest completed release-candidate pushes' runs previous-report reads to find the
+# one before this run (two cuts are seldom more than a few pushes apart).
+PREVIOUS_RUNS = 30
+
+
+def previous_report(out_dir, api=gh_api):
+    """sami-checks.yml's step before the summary: the previous cut's report, for "First seen at this
+    cut". The run is the one the dispatch input `previous` names (SC_INPUT_PREVIOUS), else the newest
+    completed sami-checks run on a push of release-candidate before this one (GITHUB_RUN_ID) whose
+    commit is not this run's (SC_COMMIT). The results.json and verdict.json of its sc-report go to
+    OUT_DIR, beside about.json: {"run", "commit", "url", "from" (the words the summary names it by),
+    "why"}. why is null when results.json was written, else why it could not be, and the summary then
+    reads first seen UNKNOWN. When that run has no report (its sc-report expired, or its summary
+    uploaded none), no older run is tried: against an older cut, a failure first seen at the cut
+    between would read first seen here. API: `gh api`. Returns about."""
+    import io
+    import zipfile
+    os.makedirs(out_dir, exist_ok=True)
+    about = {"run": None, "commit": None, "url": None, "from": None, "why": None}
+
+    def done(why=None):
+        about["why"] = why
+        with open(os.path.join(out_dir, "about.json"), "w", encoding="utf-8") as f:
+            json.dump(about, f)
+        print(f"PREVIOUS {about['from'] or 'no run'}: " + (f"UNKNOWN: {why}" if why else "its results.json is read"))
+        return about
+
+    repo, this_run = os.environ.get("GITHUB_REPOSITORY", ""), os.environ.get("GITHUB_RUN_ID", "")
+    commit, named = os.environ.get("SC_COMMIT", ""), os.environ.get("SC_INPUT_PREVIOUS", "").strip()
+    if not repo or not this_run.isdigit():
+        return done("this run has no GITHUB_REPOSITORY or GITHUB_RUN_ID, so no earlier run could be looked for")
+    try:
+        if named:
+            if not named.isdigit():
+                return done(f"the dispatch input previous ({named!r}) is no run id")
+            run, how = json.loads(api(f"repos/{repo}/actions/runs/{named}")), "the run the dispatch input previous names"
+        else:
+            runs = json.loads(api(f"repos/{repo}/actions/workflows/sami-checks.yml/runs?branch=release-candidate&event=push"
+                                  f"&status=completed&per_page={PREVIOUS_RUNS}"))["workflow_runs"]
+            run = next((r for r in runs if r["id"] < int(this_run) and r["head_sha"] != commit), None)
+            if run is None:
+                return done(f"none of the newest {len(runs)} completed sami-checks runs on a push of release-candidate is "
+                            "a run before this one, of another commit")
+            how = "the newest completed push of release-candidate before this run"
+        about.update(run=run["id"], commit=run["head_sha"], url=run.get("html_url"),
+                     **{"from": f"run {run['id']} ({how}), of {run['head_sha'][:12]}"})
+    except (RuntimeError, ValueError, KeyError, TypeError) as e:
+        return done(f"the previous run could not be found: {e}"[:500])
+    try:
+        arts = json.loads(api(f"repos/{repo}/actions/runs/{run['id']}/artifacts?name=sc-report&per_page=10"))["artifacts"]
+        live = [a for a in arts if a.get("name") == "sc-report" and not a.get("expired")]
+        if not live:
+            gone = [a for a in arts if a.get("name") == "sc-report"]
+            return done(f"run {run['id']}'s sc-report expired at {gone[0].get('expires_at')} (an sc-report is kept 30 days)" if gone
+                        else f"run {run['id']} has no sc-report artifact (its summary job uploaded none)")
+        data = api(f"repos/{repo}/actions/artifacts/{live[0]['id']}/zip")
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = set(z.namelist())
+            if "results.json" not in names:
+                return done(f"run {run['id']}'s sc-report holds no results.json (it holds {', '.join(sorted(names)) or 'nothing'})")
+            for name in ("verdict.json", "results.json"):
+                if name in names:
+                    with open(os.path.join(out_dir, name), "wb") as f:
+                        f.write(z.read(name))
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile) as e:
+        return done(f"run {run['id']}'s sc-report could not be read: {e}"[:500])
+    return done()
+
+
 # A unit that counts its findings (its result's `breakdown`) lists this many of each kind (FAILED,
 # KNOWN, UNSORTED) among the summary's details, and its section lists this many lints and files.
 LISTED_PER_KIND = 25
@@ -1532,6 +1977,10 @@ def summary_rows():
 
 
 def cmd_summary(results_dir, build_dir, known_path=None):
+    # A known-failure list the caller names and that is not there is a list the summary could not
+    # read: without it every known failure would read NEW, and no stale entry could be listed.
+    if known_path is not None and not os.path.isfile(known_path):
+        sys.exit(f"::error::the known-failure list {known_path} is not a file, so no failure could be read as known")
     known = read_known(known_path)
     skips = read_known_skips(known_path)
 
@@ -1589,6 +2038,15 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         passed_as.setdefault((runtime(r["row"]), r["unit"], r["who"]), set()).update(n for n, _ in r["tests"] if n not in bad)
     exp, notes = expected_units(build_dir)
     exp = [e for e in exp if e[0] in run_rows]
+    # The previous cut's report, for "First seen at this cut" (read_previous): an index of its failures,
+    # or None and the reason it could not be read, which then reads UNKNOWN, never as nothing first seen.
+    # A report-only comparison never stops the summary: a fault in reading the report is that reason.
+    try:
+        prev_index, prev_rows, prev_from, prev_why = read_previous(os.environ.get("SC_PREVIOUS"))
+    except Exception as e:
+        prev_index, prev_rows = None, None
+        prev_from, prev_why = os.environ.get("SC_PREVIOUS") or "nothing", f"reading it failed ({type(e).__name__}: {e})"[:400]
+    first_seen = []
     lines = []
     commit = os.environ.get("SC_COMMIT", "?")
     lines.append(f"## sami checks of `{commit}`")
@@ -1597,14 +2055,19 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                  "and reads KNOWN when its only failures are on the known-failure list. A unit is UNKNOWN when its "
                  "runner did not end normally (libtest 0/101, nextest 0/100, bun 0/1 with its summary line, clippy "
                  "0/101), when a passing test printed a skip marker and passed as no other user (even when every "
-                 "failure of the unit is known), when a clean clippy crate's planted control was not caught, when the "
+                 "failure of the unit is known), when a clean clippy crate's planted control was not caught, when "
+                 "clippy did not lint a unit of its crate (each one named: a finding it read still fails it), when the "
                  "platform checks gave its platform no verdict, when cargo fmt listed no target root or rustfmt could "
                  "not read a file, when rustfmt's places could not be sorted by its run at the upstream base, or when "
                  "no job (or more than one) reported it; its "
-                 "row is then UNKNOWN too. A test whose only skip lines are sub-cases the partial-skip list names for "
+                 "row is then UNKNOWN too, unless another of its units failed: a failure outranks a unit that could not "
+                 "be read. A test whose only skip lines are sub-cases the partial-skip list names for "
                  "it, with that entry's witness line in its output, passes and is listed as partial. A self-skip the "
                  "known-failure list names (`skips: `, for that row and user) reads KNOWN; a failure with a `flaky: ` "
-                 "entry reads KNOWN only when a retry of the test in the same job passed.")
+                 "entry reads KNOWN only when a retry of the test in the same job passed. The summary exits 0 when "
+                 "every row that ran passed, 1 when it found a fault (a row failed, a known-failure entry is to be "
+                 "removed, or the run is planted), and 2 when a row is UNKNOWN and it found no fault: 2 says that "
+                 "the run could not look, not that it found something.")
     lines.append("")
     lines.append("| Row | Verdict | Units: pass / known / fail / UNKNOWN | Tests: passed / failed / ignored / skipped themselves | Longest unit |")
     lines.append("|---|---|---|---|---|")
@@ -1650,6 +2113,9 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                 if unlisted:
                     r = dict(r, status="UNKNOWN", note=f"every failure is known, but {len(unlisted)} test(s) skipped themselves here "
                                                        "and passed as no other user: " + ", ".join(unlisted[:12]))
+                elif r.get("not_linted"):
+                    r = dict(r, status="UNKNOWN", note=f"every failure is known, but {len(r['not_linted'])} unit(s) of the crate "
+                                                       "were not linted, each named below")
                 else:
                     r = dict(r, status="KNOWN")
             rs.append(r)
@@ -1658,7 +2124,7 @@ def cmd_summary(results_dir, build_dir, known_path=None):
             details.append(f"- **{title}**: UNKNOWN: {notes[key]}")
         else:
             n = {s: sum(1 for r in rs if r["status"] == s) for s in ("PASS", "KNOWN", "FAIL", "UNKNOWN")}
-            verdict = ("UNKNOWN" if n["UNKNOWN"] or not rs else "FAIL" if n["FAIL"] else "KNOWN" if n["KNOWN"] else "PASS")
+            verdict = ("FAIL" if n["FAIL"] else "UNKNOWN" if n["UNKNOWN"] or not rs else "KNOWN" if n["KNOWN"] else "PASS")
             counts = f"{n['PASS']} / {n['KNOWN']} / {n['FAIL']} / {n['UNKNOWN']}"
         tp = sum(r["passed"] for r in rs)
         tf = sum(r["failed"] for r in rs)
@@ -1669,6 +2135,14 @@ def cmd_summary(results_dir, build_dir, known_path=None):
         lines.append(f"| {title} | **{verdict}** | {counts} | {tp} / {tf} / {ti} / {ts} | {lu} |")
         verdicts[key] = (verdict, rs)
         row_verdicts[key] = verdict
+        # This row's failures that the previous cut's report does not hold (row_first_seen); on a
+        # planted run, a unit entry of the planted row names the plant among its failures.
+        planted_here = os.environ.get("SC_PLANT", "") == key and key in PLANTS
+        seen_here = [] if prev_index is None else row_first_seen(
+            key, rs, prev_index, lambda r, f: "NEW" if failure_reason(r, key, f)[0] is None else "KNOWN",
+            keep=(lambda f: PLANTS[key][2] in f) if planted_here else None)
+        first_seen += seen_here
+        seen_said = {(e["unit"], e["who"], e["finding"]): e["previous"] for e in seen_here if e["kind"] == "failure"}
         for r in rs:
             if r["status"] == "UNKNOWN":
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {r['note']}")
@@ -1682,10 +2156,18 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                                    "below counts them by lint and file; the sc-report artifact's results.json lists each)")
 
             for f in r["failures"][:cap]:
-                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}")
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): FAILED `{f}`: {failure_reason(r, key, f)[1]}"
+                               + (f"; **first seen at this cut** ({seen_said[(r['unit'], r['who'], f)]})"
+                                  if (r["unit"], r["who"], f) in seen_said else ""))
             more("FAILED", r["failures"])
             for f in r.get("baseline_fell", []):
                 details.append(f"- **{title}** `{r['unit']}`: fewer here than in the clippy baseline (a change of the baseline, not a failure): {f}")
+            not_linted = {}
+            for u, why in r.get("not_linted", []):
+                not_linted.setdefault(why, []).append(u)
+            for why, us in not_linted.items():
+                details.append(f"- **{title}** `{r['unit']}` ({r['who']}): UNKNOWN: {len(us)} unit(s) not linted, so their findings "
+                               f"are not known: {why}: " + ", ".join(f"`{u}`" for u in us))
             for f in r.get("upstream_places", [])[:cap]:
                 details.append(f"- **{title}** `{r['unit']}` ({r['who']}): KNOWN `{f}`: upstream's own: the same run fails at "
                                f"the upstream base `{r.get('upstream_base', '')[:12]}` on lines the fork left as they are")
@@ -1731,6 +2213,61 @@ def cmd_summary(results_dir, build_dir, known_path=None):
                    if caught else
                    f"**THE CONTROL FAILED**: the row reads {v}, and these units do not read FAIL naming `{needle}`: "
                    + (", ".join(f"`{u}`" for u in missed) or "the row has no unit") + "."), ""]
+    # First seen at this cut: each failure the previous cut's report does not hold, at the top of the
+    # summary, before the table and the standing failures below it. A report that could not be read
+    # reads UNKNOWN, and says why, never as nothing first seen. On a planted run the plant must be in
+    # the list (plant_first_seen): the comparison's own control.
+    row_title = {k: t for t, k in ROWS + RUST_JOBS}
+    plant_seen = None
+    if prev_index is None:
+        seen_record, blind = "UNKNOWN", []
+        seen_top = ["### First seen at this cut: UNKNOWN", "",
+                    f"The previous cut's report ({prev_from}) could not be read: {prev_why}. No failure below can be told "
+                    "first seen or standing, so any of them may be new at this cut.", ""]
+        if plant:
+            plant_seen = "UNKNOWN"
+    else:
+        rust_seen, blind = rust_first_seen(row_verdicts, prev_rows)
+        first_seen += rust_seen
+        seen_record = first_seen
+        seen_top = [f"### First seen at this cut: {len(first_seen) or 'none'}, against {prev_from}", "",
+                    "Each failure here was not in the previous cut's report; one that was is standing, and is listed "
+                    "only below. A finding's line and column are not compared, so a finding that only moved is standing, "
+                    "and one more of a finding is first seen." if first_seen else
+                    "No failure the comparison could read is new at this cut; it could not compare what is under \"Not "
+                    "compared\" below, and a new failure may be there." if blind else
+                    "Every failure of this run was in the previous cut's report too: none is new at this cut.", ""]
+        for e in first_seen[:200]:
+            name = row_title[e["row"]]
+            if e["kind"] == "failure":
+                said = "**NEW**" if e["reading"] == "NEW" else "KNOWN (on the known-failure list)"
+                seen_top.append(f"- **{name}** `{e['unit']}` ({e['who']}): FAILED `{e['finding']}`: {said}; {e['previous']}")
+            elif e["kind"] == "unit":
+                seen_top.append(f"- **{name}** `{e['unit']}` ({e['who']}): {e['finding']}, none compared: {e['previous']}: "
+                                + ", ".join(f"`{f}`" for f in e["failures"])
+                                + (f", and {e['failed'] - len(e['failures'])} more (the list below, and sc-report's results.json)"
+                                   if e["failed"] > len(e["failures"]) else ""))
+            else:
+                seen_top.append(f"- **{name}**: {e['finding']}; {e['previous']} (its failing tests are in that job's "
+                                "annotations and log)")
+        if len(first_seen) > 200:
+            seen_top.append(f"- ... and {len(first_seen) - 200} more (sc-report's verdict.json, first_seen)")
+        if blind:
+            seen_top += ["", "Not compared with the previous cut:", ""] + [f"- {b}" for b in blind]
+        seen_top.append("")
+        if plant:
+            # The control reads only what first_seen holds: a failure entry naming the plant, or the
+            # entry of a unit with no result at the previous cut whose named failures hold it.
+            plant_rs = verdicts.get(plant, ("", []))[1]
+            unseen = [r["unit"] for r in plant_rs if not any(
+                e["row"] == plant and e["unit"] == r["unit"] and any(needle in f for f in (
+                    [e["finding"]] if e["kind"] == "failure" else e.get("failures", []))) for e in first_seen)]
+            plant_seen = bool(plant_rs) and not unseen
+            seen_top += [("The plant reads first seen at this cut in each unit of its row: the comparison's control caught it."
+                          if plant_seen else
+                          f"**THE FIRST-SEEN CONTROL FAILED**: the plant `{needle}` does not read first seen at this cut in "
+                          + (", ".join(f"`{u}`" for u in unseen) or "any unit: its row has none") + "."), ""]
+    top[:0] = seen_top
     lines.append("")
     # A known entry whose test passed, or that its unit no longer has, is listed for removal, and the
     # summary fails until it is removed: the list only shrinks. An entry whose unit did not report is
@@ -1840,26 +2377,124 @@ def cmd_summary(results_dir, build_dir, known_path=None):
     # line that a reader can parse: the step summary's line here, and the file SC_VERDICT names, which
     # sami-checks.yml gives as the summary job's output `verdict`, a notice and sc-report's verdict.json.
     # A planted run is a control, so it fails whether or not its control caught the plant (plant_caught
-    # says which). A subset run says so: only a run of every row is a pass of the cut checks.
+    # says which). A subset run says so: only a run of every row is a pass of the cut checks. A fault
+    # outranks a row that could not be read: FAIL, then UNKNOWN, then PASS, and the exit says which
+    # (SUMMARY_EXIT), so that a run that could not look never exits as one that found a fault.
     not_run = [k for k in ROW_KEYS if k not in run_rows]
     shown = [v for v in row_verdicts.values() if v != "NOT RUN"]
     verdict = "FAIL" if "FAIL" in shown or stale or plant else "UNKNOWN" if "UNKNOWN" in shown else "PASS"
     record = {"commit": commit, "verdict": verdict, "subset": bool(not_run),
               "rows_run": [k for k in ROW_KEYS if k in run_rows], "rows_not_run": not_run,
               "rows": {k: row_verdicts[k] for k in ROW_KEYS if k in row_verdicts},
-              "plant": plant or None, "plant_caught": caught}
+              "plant": plant or None, "plant_caught": caught,
+              # First seen at this cut: the list of entries, or the string UNKNOWN (never an empty list)
+              # when the previous cut's report could not be read, first_seen_why saying why.
+              "first_seen": seen_record, "first_seen_against": prev_from, "first_seen_why": prev_why,
+              "first_seen_not_compared": blind, "plant_first_seen": plant_seen}
     line = json.dumps(record, separators=(",", ":"))
+    title_of = {k: t for t, k in ROWS + RUST_JOBS}
+
+    def named(v):
+        return ", ".join(f"{title_of[k]} (`{k}`)" for k in ROW_KEYS if row_verdicts.get(k) == v)
+
+    # The verdict is reached here. A verdict file or a summary that cannot be written does not undo a
+    # fault the summary found (still FAIL, 1), and a pass that nobody can read is no pass (UNKNOWN, 2).
+    unwritten = ""
+    if os.environ.get("SC_VERDICT"):
+        try:
+            with open(os.environ["SC_VERDICT"], "w", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            unwritten = f"the verdict file {os.environ['SC_VERDICT']} could not be written ({e})"
+            if verdict == "PASS":
+                verdict = record["verdict"] = "UNKNOWN"
+                line = json.dumps(record, separators=(",", ":"))
+            print(f"::error title=sami-checks summary::{'UNKNOWN: ' if verdict == 'UNKNOWN' else ''}{unwritten}; "
+                  f"the summary exits {SUMMARY_EXIT[verdict]}", file=sys.stderr)
+    code = SUMMARY_EXIT[verdict]
+    if verdict == "PASS":
+        said = "every row that ran passed (a KNOWN row, whose only failures are on the known-failure list, passes)."
+    elif verdict == "FAIL":
+        found = ([f"these rows read FAIL: {named('FAIL')}"] if "FAIL" in shown else []) \
+            + ([f"{len(stale)} known-failure entr{'y is' if len(stale) == 1 else 'ies are'} to be removed"] if stale else []) \
+            + (["the run is planted, and a planted run is a control, which always fails"] if plant else [])
+        said = "it found a fault: " + "; ".join(found) + "." + (
+            f" These rows could not be read either and read UNKNOWN: {named('UNKNOWN')}. A fault outranks a row that "
+            "could not be read, so the exit is 1, not 2." if "UNKNOWN" in shown else "")
+    elif "UNKNOWN" in shown:
+        said = (f"it found no fault, but these rows could not be read and read UNKNOWN: {named('UNKNOWN')}. This run did "
+                "not look at everything it was to check; each reason is in the list below. 2 is not the failure code.")
+    else:
+        said = f"every row that ran passed, but {unwritten}, so no reader can see this pass. 2 is not the failure code."
+    top[:0] = [f"**Exit {code} ({verdict})**: {said}", ""]
     if not_run:
         top += [f"**A subset of the rows**: {len(run_rows)} of {len(ROW_KEYS)} rows ran ({', '.join(record['rows_run'])}); "
                 f"the other {len(not_run)} read NOT RUN. The verdict covers only the rows that ran: this run is no pass "
                 "of the cut checks, which only a run of every row gives (the push of release-candidate, or a dispatch "
                 "with rows=all).", ""]
     lines[2:2] = [f"sami-checks verdict: `{line}`", ""] + top
-    if os.environ.get("SC_VERDICT"):
-        with open(os.environ["SC_VERDICT"], "w", encoding="utf-8") as f:
+    try:
+        print("\n".join(lines))
+        sys.stdout.flush()
+    except OSError as e:
+        if verdict == "PASS":
+            verdict = record["verdict"] = "UNKNOWN"
+            if os.environ.get("SC_VERDICT") and not unwritten:
+                try:
+                    with open(os.environ["SC_VERDICT"], "w", encoding="utf-8") as f:
+                        f.write(json.dumps(record, separators=(",", ":")) + "\n")
+                except OSError:
+                    pass
+        code = SUMMARY_EXIT[verdict]
+        print(f"::error title=sami-checks summary::{'UNKNOWN: ' if verdict == 'UNKNOWN' else ''}the summary could not be "
+              f"written ({e}), so the verdict reads {verdict}; the summary exits {code}", file=sys.stderr)
+    return code
+
+
+def summary_main(args):
+    """`sc.py summary`: cmd_summary's exit. A summary that stops before its verdict (an input it
+    cannot read, a result that does not parse, a fault of its own) judged no row: it says so on
+    stderr and exits 2, so that 1 always means a fault it found."""
+    try:
+        return cmd_summary(*args)
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            print(e.code, file=sys.stderr)
+        why = e.code if isinstance(e.code, str) else f"it exited {e.code}"
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        why = f"{type(e).__name__}: {e}"
+    print(f"::error title=sami-checks summary::UNKNOWN: the summary stopped before its verdict ({why}), so it judged no row",
+          file=sys.stderr)
+    return SUMMARY_EXIT["UNKNOWN"]
+
+
+def cmd_unreadable_pass(summary_md, verdict_path, why):
+    """A summary that passed, but part of whose report could not be written after it (sami-checks.yml's
+    Summary step: the step summary, the job's output, results.json): no reader can rely on that pass,
+    so, as cmd_summary does for its own outputs, the verdict file and summary.md read UNKNOWN. Prints
+    the new exit line. A file it cannot rewrite is left as it is; the step still ends 2."""
+    said = f"**Exit 2 (UNKNOWN)**: every row that ran passed, but {why}, so no reader can see this pass. 2 is not the failure code."
+    line = None
+    try:
+        record = json.load(open(verdict_path, encoding="utf-8"))
+        if record.get("verdict") == "PASS":
+            record["verdict"] = "UNKNOWN"
+        line = json.dumps(record, separators=(",", ":"))
+        with open(verdict_path, "w", encoding="utf-8") as f:
             f.write(line + "\n")
-    print("\n".join(lines))
-    return 0 if verdict == "PASS" else 1
+    except (OSError, ValueError, AttributeError) as e:
+        print(f"::error title=sami-checks summary::the verdict file {verdict_path} could not be made UNKNOWN ({e})", file=sys.stderr)
+    try:
+        lines = open(summary_md, encoding="utf-8").read().split("\n")
+        lines = [said if ln.startswith("**Exit 0 (PASS)**") else
+                 f"sami-checks verdict: `{line}`" if line and ln.startswith("sami-checks verdict: ") else ln for ln in lines]
+        with open(summary_md, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+    except OSError as e:
+        print(f"::error title=sami-checks summary::{summary_md} could not be made UNKNOWN ({e})", file=sys.stderr)
+    print(said)
 
 
 def selftest():
@@ -2068,8 +2703,30 @@ def selftest():
                f"pi-vfs\tcrates/pi-vfs/src/c.rs\tclippy::doc_markdown\t2\titem in documentation is missing backticks\n"
                f"pi-shell\tcrates/pi-shell/src/b.rs\tunused_variables\t1\tunused variable: `x`\n")
 
-    def cl(text, ex, c=ctl, base=bl):
-        return parse_clippy(write("c.log", text), str(ex), 1, "pi-vfs", "crates/pi-vfs", c, "crates/pi-vfs/src/lib.rs", base)
+    # The crate's targets, as `cargo metadata --no-deps` gives them: a lib, a bin and two tests that
+    # cargo tests, a bench it does not (`test` false), and a build script. An artifact or a "could
+    # not compile" line of a log names one of its units; the forms below are the ones the tree's
+    # pinned nightly-2026-11-08 printed for a scratch crate of these targets.
+    vfs_manifest = "/t/crates/pi-vfs/Cargo.toml"
+
+    def tgt(kind, name, test):
+        return {"kind": [kind], "name": name, "src_path": f"/t/crates/pi-vfs/{name}.rs", "test": test}
+
+    cmeta = write("clippy-metadata.json", json.dumps({"workspace_root": "/t", "packages": [{
+        "name": "pi-vfs", "manifest_path": vfs_manifest, "targets": [
+            tgt("lib", "pi_vfs", True), tgt("bin", "vb", True), tgt("test", "ta", True), tgt("test", "tb", True),
+            tgt("bench", "bb", False), tgt("custom-build", "build-script-build", False)]}]}))
+
+    def art(kind, name, test, manifest=vfs_manifest):
+        return json.dumps({"reason": "compiler-artifact", "manifest_path": manifest, "target": {"kind": [kind], "name": name},
+                           "profile": {"test": test}, "fresh": False}) + "\n"
+
+    build_script = art("custom-build", "build-script-build", False)
+    whole = (build_script + art("lib", "pi_vfs", False) + art("lib", "pi_vfs", True) + art("bin", "vb", True)
+             + art("test", "ta", True) + art("test", "tb", True))
+
+    def cl(text, ex, c=ctl, base=bl, arts=whole):
+        return parse_clippy(write("c.log", arts + text), str(ex), 1, "pi-vfs", "crates/pi-vfs", c, "crates/pi-vfs/src/lib.rs", cmeta, base)
 
     r = cl(noise + dep_f + own_a + again + cast, 101)
     check("clippy: a key the baseline lacks fails, named by place and lint",
@@ -2091,12 +2748,15 @@ def selftest():
     check("clippy: killed", cl(own_a, 137)["status"], "UNKNOWN")
     check("clippy: ended by its bound", "time bound" in cl("", 124)["note"], True)
     check("clippy: 101 with no finding of its own", cl(dep_f + "error: failed to run custom build command for `x`\n", 101)["status"], "UNKNOWN")
-    check("clippy: 0 with a finding", cl(own_a, 0)["status"], "UNKNOWN")
+    check("clippy: a finding at exit 0 (every lint a warning) is read", cl(own_a, 0)["status"], "KNOWN")
+    r = cl(diag("crates/pi-vfs/tests/ta.rs", 4, "clippy::len_zero", "length comparison to zero", "warning"), 0)
+    check("clippy: a test target's finding at warn, at exit 0: FAIL, the place named",
+          (r["status"], r["failures"]), ("FAIL", ["crates/pi-vfs/tests/ta.rs:4: clippy::len_zero: length comparison to zero"]))
     # A missing log is UNKNOWN by itself, at exit 0 as at 101 (at 101 another branch also gives UNKNOWN).
     for ex in ("0", "101"):
-        r = parse_clippy(os.path.join(d, "absent"), ex, 1, "pi-vfs", "crates/pi-vfs", ctl, "crates/pi-vfs/src/lib.rs", bl)
+        r = parse_clippy(os.path.join(d, "absent"), ex, 1, "pi-vfs", "crates/pi-vfs", ctl, "crates/pi-vfs/src/lib.rs", cmeta, bl)
         check(f"clippy: no log, exit {ex}", (r["status"], r["note"]), ("UNKNOWN", "no log"))
-    check("clippy: a crate the tree lacks", parse_clippy(ctl, "0", 1, "pi-x", "-", ctl, "-", bl)["status"], "UNKNOWN")
+    check("clippy: a crate the tree lacks", parse_clippy(ctl, "0", 1, "pi-x", "-", ctl, "-", cmeta, bl)["status"], "UNKNOWN")
     check("clippy: the short format names no lint code, so it reads nothing",
           clippy_diagnostics(write("short.log", "crates/pi-vfs/src/a.rs:3:5: error: unnecessary hashes around raw string literal\n")), ({}, []))
     # A compile error with no code (rustc gives a syntax error code=null) is a finding no baseline
@@ -2117,7 +2777,7 @@ def selftest():
     cut = noise + own_a + broken[:60] + "\n"
     r = cl(cut, 101)
     check("clippy: a cargo message line that does not parse", (r["status"], r["note"]),
-          ("UNKNOWN", "log line(s) 5 look like cargo messages and do not parse, so their findings are unread"))
+          ("UNKNOWN", "log line(s) 11 look like cargo messages and do not parse, so their findings are unread"))
     # A fallen count names the line that replaces it.
     r = cl(own_a, 101, base=write("baseline-3.txt", f"pi-vfs\tcrates/pi-vfs/src/a.rs\tclippy::needless_raw_string_hashes\t3\t{hashes}\n"))
     check("clippy: a fallen count names its replacement line", (r["status"], r["baseline_fell"]),
@@ -2125,7 +2785,7 @@ def selftest():
                      f"`pi-vfs\tcrates/pi-vfs/src/a.rs\tclippy::needless_raw_string_hashes\t1\t{hashes}` (tab-separated)"]))
     # The baseline lines a log gives (the regeneration step), read back as the same baseline.
     with contextlib.redirect_stdout(io.StringIO()) as buf:
-        clippy_baseline_lines(write("c.log", noise + dep_f + own_a + own_b + again + cast + broken), "pi-vfs", "crates/pi-vfs")
+        clippy_baseline_lines(write("c.log", whole + noise + dep_f + own_a + own_b + again + cast + broken), "pi-vfs", "crates/pi-vfs", cmeta, bl)
     check("clippy: a regenerated baseline names a compile error in a comment, not a line",
           "# pi-vfs: a compile error, not a baseline line: crates/pi-vfs/tests/broken.rs:3: expected expression, found `;`" in buf.getvalue(), True)
     regen = write("regen.txt", buf.getvalue())
@@ -2134,6 +2794,98 @@ def selftest():
            ("pi-vfs", "crates/pi-vfs/src/b.rs", "function_casts_as_integer", "direct cast of function item into an integer"): 1})
     check("clippy: against its own regenerated baseline, a log reads KNOWN",
           cl(noise + own_a + own_b + cast, 101, base=regen)["status"], "KNOWN")
+    # The units a crate's log shows linted (clippy_not_linted). cargo builds no unit whose dependency
+    # did not compile: at Cut17 (run 45948734940) pi-shell's lib stopped on one lint under -D
+    # warnings, cargo built none of its 71 tests nor obash, and the crate read FAIL on that one
+    # finding while it listed 16 baseline lines of those tests for deletion.
+    check("clippy units: the build script, the lib its tests and bin need, each target cargo tests, in cargo's words",
+          clippy_units(cmeta, "pi-vfs"), (vfs_manifest, ["lib", "lib test", 'bin "vb" test', 'test "ta"', 'test "tb"', "build script"]))
+    natives = write("clippy-metadata-natives.json", json.dumps({"packages": [{
+        "name": "pi-natives", "manifest_path": "/t/crates/pi-natives/Cargo.toml",
+        "targets": [dict(tgt("lib", "pi_natives", True), kind=["cdylib"]), tgt("example", "ex", False)]}]}))
+    check("clippy units: a cdylib-only crate is its lib test; an example cargo does not test is none",
+          clippy_units(natives, "pi-natives"), ("/t/crates/pi-natives/Cargo.toml", ["lib test"]))
+    no_units = write("clippy-metadata-none.json", json.dumps({"packages": [
+        {"name": "pi-vfs", "manifest_path": vfs_manifest, "targets": []},
+        {"name": "pi-walker", "manifest_path": "/t/crates/pi-walker/Cargo.toml", "targets": [tgt("lib", "pi_walker", False)]}]}))
+    check("clippy units: a package the metadata lacks, no metadata, and a package with no unit `--tests` builds",
+          (clippy_units(cmeta, "pi-x"), clippy_units(os.path.join(d, "absent.json"), "pi-vfs"), clippy_units(no_units, "pi-vfs"),
+           clippy_units(no_units, "pi-walker")), (None, None, None, None))
+    r = parse_clippy(write("c.log", ""), "0", 1, "pi-vfs", "crates/pi-vfs", ctl, "crates/pi-vfs/src/lib.rs", no_units, bl)
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        clippy_baseline_lines(write("c.log", ""), "pi-vfs", "crates/pi-vfs", no_units, bl)
+    check("clippy: a crate whose metadata names no unit reads UNKNOWN, lists no line for removal, and keeps its baseline lines",
+          (r["status"], r["baseline_fell"], read_clippy_baseline(write("regen-none.txt", buf.getvalue()))),
+          ("UNKNOWN", [], {k: v for k, v in read_clippy_baseline(bl).items() if k[0] == "pi-vfs"}))
+
+    def cmsg(f, line, code, msg, kind="lib", name="pi_vfs"):
+        """An error of a unit of pi-vfs as cargo gives it, with its manifest and target."""
+        m = json.loads(diag(f, line, code, msg))
+        m["message"]["code"] = {"code": code} if code else None
+        return json.dumps(dict(m, manifest_path=vfs_manifest, target={"kind": [kind], "name": name})) + "\n"
+
+    def stopped(unit):
+        return f"error: could not compile `pi-vfs` ({unit}) due to 1 previous error\n"
+
+    long_doc = "first doc comment paragraph is too long"
+    lib_lint = cmsg("crates/pi-vfs/src/lib.rs", 12, "clippy::too_long_first_doc_paragraph", long_doc)
+    skipped = "cargo did not build it: `lib` did not compile"
+    bl_t = write("baseline-tests.txt", open(bl).read()
+                 + "pi-vfs\tcrates/pi-vfs/tests/ta.rs\tclippy::doc_markdown\t9\titem in documentation is missing backticks\n")
+    # Cut17's shape: the lib and its test stop on a lint (-D warnings); cargo builds the build script only.
+    cut17 = lib_lint + stopped("lib") + "warning: build failed, waiting for other jobs to finish...\n" + lib_lint + stopped("lib test")
+    lib_stopped = cl(cut17, 101, base=bl_t, arts=build_script)
+    check("clippy: a lib that stops on a lint: each unit cargo skipped is named UNKNOWN, its finding still fails, no line is listed for removal",
+          (lib_stopped["status"], lib_stopped["failures"], lib_stopped["not_linted"], lib_stopped["baseline_fell"],
+           lib_stopped["note"].split("; ")[-2:]),
+          ("FAIL", [f"crates/pi-vfs/src/lib.rs:12: clippy::too_long_first_doc_paragraph: {long_doc}"],
+           [['bin "vb" test', skipped], ['test "ta"', skipped], ['test "tb"', skipped]], [],
+           ["3 of 6 unit(s) of pi-vfs were not linted, each named UNKNOWN",
+            "3 baseline line(s) with fewer places here are not listed for removal, as a unit not linted may hold them"]))
+    mismatched = cmsg("crates/pi-vfs/src/lib.rs", 7, "E0308", "mismatched types")
+    no_lints = "it did not compile (error: mismatched types), so rustc did not run all its lints"
+    r = cl(mismatched + stopped("lib") + mismatched + stopped("lib test"), 101, arts=build_script)
+    check("clippy: a lib that does not compile: it and each unit cargo skipped are named UNKNOWN, its error fails, no line is listed for removal",
+          (r["status"], r["failures"], r["not_linted"], r["baseline_fell"]),
+          ("FAIL", ["crates/pi-vfs/src/lib.rs:7: E0308: mismatched types"],
+           [["lib", no_lints], ["lib test", no_lints], ['bin "vb" test', skipped], ['test "ta"', skipped], ['test "tb"', skipped]], []))
+    # Another crate's artifacts (a dependency's, or a crate with the same target names) count for none of its units.
+    foreign = "".join(art(k, n, t, "/t/crates/pi-walker/Cargo.toml") for k, n, t in (
+        ("lib", "pi_vfs", False), ("lib", "pi_vfs", True), ("bin", "vb", True), ("test", "ta", True), ("test", "tb", True)))
+    r = cl(foreign + mismatched + stopped("lib") + mismatched + stopped("lib test"), 101, arts=build_script)
+    check("clippy: another crate's artifacts of the same names count for none of the crate's units",
+          [u for u, _ in r["not_linted"]], ["lib", "lib test", 'bin "vb" test', 'test "ta"', 'test "tb"'])
+    a_lint = cmsg("crates/pi-vfs/src/a.rs", 3, "clippy::needless_raw_string_hashes", hashes)
+    r = cl(a_lint + stopped("lib") + a_lint + stopped("lib test"), 101, arts=build_script)
+    check("clippy: findings within the baseline beside units not linted read UNKNOWN, not KNOWN, and list no line for removal",
+          (r["status"], r["failed"], len(r["not_linted"]), r["baseline_fell"], r["note"].startswith("3 of 6 unit(s) of pi-vfs were not linted")),
+          ("UNKNOWN", 0, 3, [], True))
+    r = cl("error: could not compile `pi-walker` (lib) due to 2 previous errors\n", 101, arts="")
+    check("clippy: a dependency that does not compile leaves every unit not linted, each named",
+          (r["status"], [u for u, _ in r["not_linted"]], {w for _, w in r["not_linted"]}),
+          ("UNKNOWN", ["lib", "lib test", 'bin "vb" test', 'test "ta"', 'test "tb"', "build script"],
+           {"cargo did not build it: `pi-walker` (lib) did not compile"}))
+    ta_lint = cmsg("crates/pi-vfs/tests/ta.rs", 4, "clippy::len_zero", "length comparison to zero", "test", "ta")
+    r = cl(ta_lint + stopped('test "ta"'), 101, arts=whole.replace(art("test", "ta", True), ""))
+    check("clippy: a lib that compiles with a finding in a test target: FAIL, the place named; that test, stopped on a lint, was linted",
+          (r["status"], r["failures"], r["not_linted"], len(r["baseline_fell"])),
+          ("FAIL", ["crates/pi-vfs/tests/ta.rs:4: clippy::len_zero: length comparison to zero"], [], 2))
+    r = cl(dep_f, 0)
+    check("clippy: a clean crate whose every unit was linted reads PASS and names no unit UNKNOWN", (r["status"], r["not_linted"]), ("PASS", []))
+    r = cl(dep_f, 0, arts=whole.replace(art("test", "tb", True), ""))
+    check("clippy: a unit the metadata names that cargo neither built nor reported is named UNKNOWN",
+          (r["status"], r["not_linted"]), ("UNKNOWN", [['test "tb"', "cargo neither built it nor said that it failed"]]))
+    r = cl(stopped('test "tb"'), 101, arts=whole.replace(art("test", "tb", True), ""))
+    check("clippy: a unit that stopped with no error message was not linted",
+          (r["status"], r["not_linted"]), ("UNKNOWN", [['test "tb"', "it did not compile (no error message), so rustc did not run all its lints"]]))
+    r = parse_clippy(write("c.log", whole + dep_f), "0", 1, "pi-vfs", "crates/pi-vfs", ctl, "crates/pi-vfs/src/lib.rs", os.path.join(d, "absent.json"), bl)
+    check("clippy: no metadata of the crate", (r["status"], r["note"].endswith("so what clippy linted is not known")), ("UNKNOWN", True))
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        clippy_baseline_lines(write("c.log", build_script + cut17), "pi-vfs", "crates/pi-vfs", cmeta, bl_t)
+    check("clippy: a regenerated baseline of a crate not linted whole keeps its baseline lines, after a comment naming its units",
+          (buf.getvalue().splitlines()[0], read_clippy_baseline(write("regen-partial.txt", buf.getvalue()))),
+          ('# pi-vfs: not linted whole (3 unit(s) were not linted: bin "vb" test, test "ta", test "tb"), so its lines are the baseline\'s, unchanged',
+           {k: v for k, v in read_clippy_baseline(bl_t).items() if k[0] == "pi-vfs"}))
 
     # The platform rows: the platform checks' own report, read per platform.
     commit = "c" * 40
@@ -2778,15 +3530,16 @@ def selftest():
     known_file = os.path.join(d, "known.txt")
     open(known_file, "w").write("# none\n")
 
-    def summary(rust="rust_test=success rust_test_macos=success"):
-        """cmd_summary on res, with rust as SC_RUST_TESTS (as sami-checks.yml always passes it), or without it for None."""
+    def summary(rust="rust_test=success rust_test_macos=success", cli=False):
+        """cmd_summary on res, with rust as SC_RUST_TESTS (as sami-checks.yml always passes it), or without it for None;
+        with cli, as `sc.py summary` runs it (summary_main)."""
         kept = os.environ.pop("SC_RUST_TESTS", None)
         if rust is not None:
             os.environ["SC_RUST_TESTS"] = rust
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf):
-                rc = cmd_summary(res, build, known_file)
+                rc = summary_main([res, build, known_file]) if cli else cmd_summary(res, build, known_file)
         finally:
             os.environ.pop("SC_RUST_TESTS", None)
             if kept is not None:
@@ -2794,13 +3547,13 @@ def selftest():
         return rc, buf.getvalue()
 
     rc, out = summary()
-    check("summary exit with a silent unit", rc, 1)
+    check("summary exit with a silent unit", rc, 2)
     check("summary names the silent unit UNKNOWN", "`pi-shell::zle_pty` (root): UNKNOWN: no result" in out, True)
     check("summary row of the silent unit", "| pi-shell set (root) | **UNKNOWN** | 1 / 0 / 0 / 1 |" in out, True)
     check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 / 0 |" in out, True)
     check("summary names the silent clippy crate UNKNOWN", "`pi-vfs` (runner): UNKNOWN: no result" in out, True)
     check("summary row of the silent clippy crate",
-          "| clippy --tests -D warnings, per crate (failed: findings beyond clippy-baseline.txt) | **UNKNOWN** | 5 / 0 / 0 / 1 |" in out, True)
+          "| clippy --tests, every lint a warning, per crate (failed: findings beyond clippy-baseline.txt) | **UNKNOWN** | 5 / 0 / 0 / 1 |" in out, True)
     check("summary row of the silent platform", "| Windows: pi-shell, platform checks | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
     check("summary row of a platform that reported", "| macOS: pi-shell, platform checks | **PASS** | 1 / 0 / 0 / 0 |" in out, True)
     check("summary names the silent rustfmt workspace UNKNOWN", f"`{fmt_ws[-1]}` (runner): UNKNOWN: no result" in out, True)
@@ -2817,10 +3570,199 @@ def selftest():
         json.dump(result(row, unit, who, "PASS", 0, 1, passed=1), open(os.path.join(res, name), "w"))
     rc, _ = summary()
     check("summary exit when every unit passed", rc, 0)
+    # The summary's exit (SUMMARY_EXIT), each case planted on the passing results above: a row that
+    # failed exits 1; a row that could not be read, with no fault, exits 2, never 1; both together exit
+    # 1, also as two units of one row, which then reads FAIL; every row passing exits 0. Its first
+    # line under the verdict says which, and why, naming the rows.
+    set_a, set_b = sorted(k for k in paths if k[0] == "set-runner")
+    ck = next(k for k in paths if k[0] == "checkts")
+    passing = {k: open(paths[k]).read() for k in (set_a, set_b, ck)}
+    set_title, ck_title = (next(t for t, k in ROWS if k == key) for key in ("set-runner", "checkts"))
+
+    def planted_unit(k, s):
+        return result(*k, s, 101 if s == "FAIL" else 124, 1, failed=int(s == "FAIL"), failures=["planted::fault"] if s == "FAIL" else [],
+                      note="" if s == "FAIL" else "planted: it could not be read")
+
+    def planted_exit(planted, cli=False):
+        """(the exit, the summary's exit line, the summary) with planted {unit: FAIL or UNKNOWN}."""
+        for k, text in passing.items():
+            open(paths[k], "w").write(text)
+        for k, s in planted.items():
+            json.dump(planted_unit(k, s), open(paths[k], "w"))
+        rc, out = summary(cli=cli)
+        return rc, next((ln for ln in out.splitlines() if ln.startswith("**Exit ")), None), out
+
+    rc, ln, out = planted_exit({set_a: "FAIL"})
+    check("summary exit: a row that failed exits 1", (rc, ln),
+          (1, f"**Exit 1 (FAIL)**: it found a fault: these rows read FAIL: {set_title} (`set-runner`)."))
+    rc, ln, out = planted_exit({ck: "UNKNOWN"})
+    check("summary exit: a row that could not be read, and no fault, exits 2", (rc, ln),
+          (2, f"**Exit 2 (UNKNOWN)**: it found no fault, but these rows could not be read and read UNKNOWN: {ck_title} "
+              "(`checkts`). This run did not look at everything it was to check; each reason is in the list below. "
+              "2 is not the failure code."))
+    rc, ln, out = planted_exit({set_a: "FAIL", ck: "UNKNOWN"})
+    check("summary exit: a row that failed and a row that could not be read exit 1", (rc, ln),
+          (1, f"**Exit 1 (FAIL)**: it found a fault: these rows read FAIL: {set_title} (`set-runner`). These rows could "
+              f"not be read either and read UNKNOWN: {ck_title} (`checkts`). A fault outranks a row that could not be "
+              "read, so the exit is 1, not 2."))
+    rc, ln, out = planted_exit({set_a: "FAIL", set_b: "UNKNOWN"})
+    check("summary exit: a unit that failed beside one that could not be read: the row reads FAIL, exit 1",
+          (rc, f"| {set_title} | **FAIL** | 0 / 0 / 1 / 1 |" in out,
+           f"`{set_b[1]}` (runner): UNKNOWN: planted: it could not be read" in out),
+          (1, True, True))
+    rc, ln, out = planted_exit({})
+    check("summary exit: every row passed exits 0", (rc, ln),
+          (0, "**Exit 0 (PASS)**: every row that ran passed (a KNOWN row, whose only failures are on the known-failure "
+              "list, passes)."))
+    # A summary that stops before its verdict judged no row: `sc.py summary` (summary_main) exits 2,
+    # and says so, for a known-failure list it cannot read and for a result with no row.
+
+    def stopped(results, known):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = summary_main([results, build, known])
+        return rc, "UNKNOWN: the summary stopped before its verdict" in err.getvalue(), err.getvalue()
+
+    bad_known = os.path.join(d, "bad-known.txt")
+    open(bad_known, "w").write("set-runner\trunner\tpi-shell\n")
+    rc, said, err = stopped(res, bad_known)
+    check("summary exit: a known-failure list it cannot read exits 2", (rc, said, "not five tab-separated fields" in err),
+          (2, True, True))
+    no_row = os.path.join(d, "res-no-row")
+    os.makedirs(no_row)
+    json.dump({"reason": "compiler-message"}, open(os.path.join(no_row, "cargo.json"), "w"))
+    rc, said, err = stopped(no_row, known_file)
+    check("summary exit: a result with no row exits 2", (rc, said, "KeyError: 'row'" in err), (2, True, True))
+    rc, said, err = stopped(res, os.path.join(d, "no-such-known.txt"))
+    check("summary exit: a known-failure list that is not there exits 2", (rc, said, "is not a file" in err), (2, True, True))
+    # A summary that cannot write its verdict file, or its summary, keeps a fault it found at FAIL (1)
+    # and turns a pass into UNKNOWN (2): a pass that nobody can read is no pass.
+    @contextlib.contextmanager
+    def environ(**kv):
+        kept = {k: os.environ.get(k) for k in kv}
+        os.environ.update(kv)
+        try:
+            yield
+        finally:
+            for k, v in kept.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    unwritable = os.path.join(d, "verdict-is-a-directory")
+    os.makedirs(unwritable)
+    with environ(SC_VERDICT=unwritable), contextlib.redirect_stderr(io.StringIO()) as err:
+        rc_fail, ln_fail, _ = planted_exit({set_a: "FAIL"}, cli=True)
+        rc_pass, ln_pass, out_pass = planted_exit({}, cli=True)
+    check("summary exit: a fault whose verdict file cannot be written still exits 1",
+          (rc_fail, (ln_fail or "").startswith("**Exit 1 (FAIL)**")), (1, True))
+    check("summary exit: a pass whose verdict file cannot be written reads UNKNOWN and exits 2",
+          (rc_pass, (ln_pass or "").startswith("**Exit 2 (UNKNOWN)**: every row that ran passed, but the verdict file"),
+           '"verdict":"UNKNOWN"' in out_pass, "UNKNOWN: the verdict file" in err.getvalue()), (2, True, True, True))
+
+    class Full(io.StringIO):
+        """A stdout that cannot be written (as /dev/full)."""
+        def write(self, s):
+            raise OSError(28, "No space left on device")
+
+    full_verdict = os.path.join(d, "verdict-of-a-full-stdout.json")
+    full = {}
+    for name, planted in (("fail", {set_a: "FAIL"}), ("pass", {})):
+        planted_exit(planted)
+        with environ(SC_VERDICT=full_verdict, SC_RUST_TESTS="rust_test=success rust_test_macos=success"), \
+                contextlib.redirect_stdout(Full()), contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                rc = cmd_summary(res, build, known_file)
+            except OSError as e:
+                rc = f"raised {e}"
+        full[name] = (rc, json.load(open(full_verdict))["verdict"], "the summary could not be written" in err.getvalue())
+    check("summary exit: a summary that cannot be written keeps a fault at 1 and turns a pass into UNKNOWN, 2",
+          full, {"fail": (1, "FAIL", True), "pass": (2, "UNKNOWN", True)})
+    planted_exit({})
+    # The workflow's own Summary step (sami-checks.yml), run as the summary job runs it: `bash -e -o
+    # pipefail` (its defaults.run.shell), through `sc.py summary`. The step ends with the summary's
+    # exit, also when a command after the summary fails: a result that cannot be opened stops the
+    # summary (2) and the results.json export after it, which must not end the step 1.
+    step_run = subprocess.run(["yq", "-r", '.jobs.summary.steps[] | select(.name == "Summary") | .run', WORKFLOW],
+                              capture_output=True, text=True).stdout
+    check("summary step: the workflow's Summary step is read", ("sc.py summary" in step_run, 'exit "$rc"' in step_run), (True, True))
+    tool_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    def run_step(planted, dangling=False, unwritable=None):
+        """(the step's exit, its output, the verdict file's verdict, summary.md, the step summary, the
+        notice's verdict) of the Summary step on a private copy of the passing results, with planted
+        {unit: FAIL or UNKNOWN}. unwritable names one report the step cannot write: output (the job's
+        output), step-summary, or results-json."""
+        w = tempfile.mkdtemp(prefix="step-run-", dir=d)
+        os.symlink(tool_root, os.path.join(w, "tool"))
+        sc_dir = os.path.join(w, "sc")
+        shutil.copytree(res, os.path.join(sc_dir, "results"))
+        shutil.copytree(build, os.path.join(sc_dir, "build"))
+        for k, s in planted.items():
+            json.dump(planted_unit(k, s), open(os.path.join(sc_dir, "results", os.path.basename(paths[k])), "w"))
+        if dangling:
+            os.symlink(os.path.join(w, "gone.json"), os.path.join(sc_dir, "results", "unreadable.json"))
+        if unwritable == "results-json":
+            os.makedirs(os.path.join(sc_dir, "report", "results.json"))
+        step_summary = "/dev/full" if unwritable == "step-summary" else os.path.join(w, "step-summary.md")
+        env = dict(os.environ, SC=sc_dir, SC_VERDICT=os.path.join(sc_dir, "report", "verdict.json"),
+                   GITHUB_STEP_SUMMARY=step_summary,
+                   GITHUB_OUTPUT="/dev/full" if unwritable == "output" else os.path.join(w, "output"),
+                   SC_PLATFORMS="", SC_SILENT="", SC_PLANT="", SC_COMMIT="selftest", SC_ROWS="set-runner,checkts",
+                   SC_RUST_TESTS="rust_test=success rust_test_macos=success")
+        p = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step_run], cwd=w, env=env,
+                           capture_output=True, text=True)
+
+        def text(path):
+            try:
+                return open(path, encoding="utf-8").read()
+            except OSError:
+                return ""
+
+        out = p.stdout + p.stderr
+        verdict_file = text(env["SC_VERDICT"])
+        notice = next((ln.split("::", 2)[2] for ln in out.splitlines() if ln.startswith("::notice title=sami-checks verdict::")), "")
+        return (p.returncode, out, json.loads(verdict_file)["verdict"] if verdict_file else None,
+                text(os.path.join(sc_dir, "report", "summary.md")), "" if step_summary == "/dev/full" else text(step_summary),
+                json.loads(notice)["verdict"] if notice else None)
+
+    # Each case is a step of its own on its own copy, so they run side by side (4 at a time, the
+    # runner's cores): one after another they would add about 20 s to the plan job.
+    planted_exit({})
+    step_cases = {"pass": ({},), "fail": ({set_a: "FAIL"},), "unknown": ({ck: "UNKNOWN"},),
+                  "fail and unknown": ({set_a: "FAIL", ck: "UNKNOWN"},), "dangling": ({}, True)}
+    for what in ("results-json", "step-summary", "output"):
+        step_cases[what] = ({}, False, what)
+        step_cases[what + ", a fault"] = ({set_a: "FAIL"}, False, what)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        ran = dict(zip(step_cases, pool.map(lambda a: run_step(*a), step_cases.values())))
+    check("summary step: the step ends with the summary's exit", {k: ran[k][0] for k in ("pass", "fail", "unknown", "fail and unknown")},
+          {"pass": 0, "fail": 1, "unknown": 2, "fail and unknown": 1})
+    rc, out = ran["dangling"][:2]
+    check("summary step: a result that cannot be opened ends the step 2, also after the results.json export fails",
+          (rc, "UNKNOWN: the summary stopped before its verdict" in out, "results.json" in out), (2, True, True))
+    # A report the step cannot write after the summary: a pass then reads UNKNOWN everywhere it can
+    # still be read (the verdict file, summary.md, the notice, the step summary when it was written)
+    # and ends 2, with an UNKNOWN annotation; a fault stays FAIL and 1.
+    got_unwritten = {}
+    for what in ("results-json", "step-summary", "output"):
+        rc, out, vf, md, ss, notice = ran[what]
+        got_unwritten[what] = (rc, vf, notice, "**Exit 2 (UNKNOWN)**: every row that ran passed, but" in md, "**Exit 0 (PASS)**" in md,
+                               "::error title=sami-checks summary::UNKNOWN: " in out)
+        got_unwritten[what + ", a fault"] = tuple(ran[what + ", a fault"][i] for i in (0, 2, 5))
+    want_pass = (2, "UNKNOWN", "UNKNOWN", True, False, True)
+    check("summary step: a report the step cannot write turns a pass into UNKNOWN, 2, and keeps a fault at 1", got_unwritten,
+          {"results-json": want_pass, "step-summary": want_pass, "output": want_pass,
+           "results-json, a fault": (1, "FAIL", "FAIL"), "step-summary, a fault": (1, "FAIL", "FAIL"), "output, a fault": (1, "FAIL", "FAIL")})
+    ss = ran["output"][4]
+    check("summary step: a job output it cannot write is named in the step summary written before it",
+          ("**Exit 0 (PASS)**" in ss, ss.rstrip().endswith("so no reader can see this pass. 2 is not the failure code.")), (True, True))
     # A unit two jobs reported is UNKNOWN.
     json.dump(result("checkts", "check:ts", "runner", "PASS", 0, 1, passed=1), open(os.path.join(res, "dup.json"), "w"))
     rc, out = summary()
-    check("summary with a unit reported twice", (rc, "two jobs reported this unit" in out), (1, True))
+    check("summary with a unit reported twice", (rc, "two jobs reported this unit" in out), (2, True))
     os.remove(os.path.join(res, "dup.json"))
     # A test that skipped itself as the runner's user and passed as root is covered; one that
     # skipped itself as both users is not.
@@ -2837,7 +3779,7 @@ def selftest():
     check("a self-skip covered by root", ("| pi-builtins, nextest default profile | **PASS** |" in out, rc), (True, 0))
     json.dump(nx("root", ["c"], ["a"]), open(os.path.join(res, "b-root.json"), "w"))
     rc, out = summary()
-    check("a self-skip as both users", ("| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, 1))
+    check("a self-skip as both users", ("| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, 2))
     json.dump(nx("root", [], ["a", "c"]), open(os.path.join(res, "b-root.json"), "w"))
     # A partial pass is a pass, listed with its reason.
     for f in os.listdir(res):
@@ -2871,7 +3813,7 @@ def selftest():
               open(os.path.join(res, "zle-runner.json"), "w"))
     rc, out = summary()
     check("known failures and an open self-skip", ("| pi-shell set (runner) | **UNKNOWN** |" in out,
-          "every failure is known, but 1 test(s) skipped themselves here" in out, rc), (True, True, 1))
+          "every failure is known, but 1 test(s) skipped themselves here" in out, rc), (True, True, 2))
     json.dump(result("set-root", "pi-shell::zle_pty", "root", "PASS", 0, 1, passed=1, tests=[("s", 1.0)]),
               open(os.path.join(res, "silent.json"), "w"))
     rc, out = summary()
@@ -2885,13 +3827,13 @@ def selftest():
     open(known_file, "w").write("set-runner\trunner\tpi-shell::zle_pty\tk\tthe host's zsh\n")
     rc, out = summary(rust=None)
     check("Rust rows UNKNOWN without SC_RUST_TESTS", (f"| {RUST_JOBS[0][0]} | **UNKNOWN** |" in out,
-          f"| {RUST_JOBS[1][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, True, 1))
+          f"| {RUST_JOBS[1][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, True, 2))
     rc, out = summary()
     check("both Rust jobs passed", (f"| {RUST_JOBS[0][0]} | **PASS** |" in out, f"| {RUST_JOBS[1][0]} | **PASS** |" in out, rc), (True, True, 0))
     rc, out = summary(rust="rust_test=failure rust_test_macos=cancelled")
     check("a failed and a cancelled Rust job", (f"| {RUST_JOBS[0][0]} | **FAIL** |" in out, f"| {RUST_JOBS[1][0]} | **UNKNOWN** |" in out, rc), (True, True, 1))
     rc, out = summary(rust="rust_test= rust_test_macos=skipped")
-    check("a Rust job with no result", (f"| {RUST_JOBS[0][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, 1))
+    check("a Rust job with no result", (f"| {RUST_JOBS[0][0]} | **UNKNOWN** |" in out, "conclusion is [none]" in out, rc), (True, True, 2))
     # A flaky entry (its reason starts `flaky: `): its failure reads KNOWN only when the test passed in
     # a retry of its whole unit in the same job (the unit's command again: the same binary or filter,
     # threads and user), and NEW when no retry ran, every retry failed, or it passed only in a retry
@@ -3010,7 +3952,7 @@ def selftest():
     open(known_file, "w").write(zle_k + need_root)
     rc, out = summary()
     check("a known skip for one user only", ("SKIPPED ITSELF `c`: KNOWN (it needs root)" in out,
-          "| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, True, 1))
+          "| pi-builtins, nextest default profile | **UNKNOWN** |" in out, rc), (True, True, 2))
     open(known_file, "a").write(no_clone)
     rc, out = summary()
     check("a known skip for each user", ("| pi-builtins, nextest default profile | **KNOWN** |" in out, rc), (True, 0))
@@ -3021,18 +3963,18 @@ def selftest():
     open(known_file, "w").write(zle_k + need_root.replace("builtins", "workspace", 1) + no_clone)
     rc, out = summary()
     check("a known skip listed for another row", ("`pi-builtins` (runner): UNKNOWN: 1 test(s) skipped themselves" in out, rc),
-          (True, 1))
+          (True, 2))
     open(known_file, "w").write(zle_k + need_root + no_clone)
     json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root", "c -p a b: skipped, no FIFO"]),
               open(os.path.join(res, "b-runner.json"), "w"))
     rc, out = summary()
-    check("a self-skip with one line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 1))
+    check("a self-skip with one line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 2))
     # Every skip line counts: twenty lines an entry names and a twenty-first it does not is UNKNOWN
     # (CiReview at 15d6f1a9: only the first 20 lines were kept, so the 21st was never matched).
     json.dump(bx("runner", ["c"], [f"c -p a b: skipped, it needs root ({i})" for i in range(20)] + ["c -p a b: skipped, no FIFO"]),
               open(os.path.join(res, "b-runner.json"), "w"))
     rc, out = summary()
-    check("a self-skip whose 21st line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 1))
+    check("a self-skip whose 21st line no entry starts", ("`pi-builtins` (runner): UNKNOWN" in out, rc), (True, 2))
     json.dump(bx("runner", ["c"], ["c -p a b: skipped, it needs root"]), open(os.path.join(res, "b-runner.json"), "w"))
     open(known_file, "a").write("builtins\trunner\tpi-builtins\ta\tskips: stale\ta: skipped\n")
     rc, out = summary()
@@ -3755,11 +4697,11 @@ def selftest():
     rec = verdict_record()
     check("summary: a selected Rust row with no conclusion reads UNKNOWN",
           (rec.get("verdict"), rec.get("rows_run"), {k: rec.get("rows", {}).get(k) for k in ("rust_test", "rust_test_macos")}, rc),
-          ("UNKNOWN", ["rust_test", "rust_test_macos"], {"rust_test": "UNKNOWN", "rust_test_macos": "UNKNOWN"}, 1))
+          ("UNKNOWN", ["rust_test", "rust_test_macos"], {"rust_test": "UNKNOWN", "rust_test_macos": "UNKNOWN"}, 2))
     rc, out = summary2(rust_env=None)
     rec = verdict_record()
     check("summary: a run of every row with no Rust conclusion is UNKNOWN, each row named",
-          (rec.get("verdict"), list(rec.get("rows", {})) == list(ROW_KEYS), rc), ("UNKNOWN", True, 1))
+          (rec.get("verdict"), list(rec.get("rows", {})) == list(ROW_KEYS), rc), ("UNKNOWN", True, 2))
     rc, out = summary2(rows_env="docs", plant_env="docs")
     rec = verdict_record()
     check("summary: a planted subset run fails, and its verdict line says whether the control caught the plant",
@@ -3878,6 +4820,26 @@ def selftest():
           (f"| {bl_title} | **KNOWN** | 1 / 1 / 0 / 0 |" in out, rc), (True, 0))
     for u, f in bl_files.items():
         json.dump(result("builtins-lint", u, "runner", "PASS", "0", 1, 1), open(os.path.join(res2, f), "w"))
+    # The clippy row: a crate that did not lint every unit names each one UNKNOWN beside the finding
+    # it read; one whose every failure is known reads UNKNOWN, not KNOWN, beside a unit not linted.
+    clippy_title = next(t for t, k in ROWS if k == "clippy")
+    vfs_file = next(f for f in os.listdir(res2) if f.endswith(".json")
+                    and (json.load(open(os.path.join(res2, f)))["row"], json.load(open(os.path.join(res2, f)))["unit"]) == ("clippy", "pi-vfs"))
+    json.dump(lib_stopped, open(os.path.join(res2, vfs_file), "w"))
+    rc, out = summary2(rows_env="clippy")
+    check("summary: a clippy crate whose lib stopped names its finding FAILED and each unit it did not lint UNKNOWN",
+          (f"| {clippy_title} | **FAIL** | 5 / 0 / 1 / 0 |" in out,
+           f"`pi-vfs` (runner): FAILED `crates/pi-vfs/src/lib.rs:12: clippy::too_long_first_doc_paragraph: {long_doc}`" in out,
+           f'`pi-vfs` (runner): UNKNOWN: 3 unit(s) not linted, so their findings are not known: {skipped}: `bin "vb" test`, '
+           '`test "ta"`, `test "tb"`' in out, "fewer here than in the clippy baseline" in out, rc), (True, True, True, False, 1))
+    known_c = write("known-clippy.txt", f"clippy\trunner\tpi-vfs\tcrates/pi-vfs/src/lib.rs:12: clippy::too_long_first_doc_paragraph: "
+                                        f"{long_doc}\tbeing fixed\n")
+    rc, out = summary2(rows_env="clippy", known_path=known_c)
+    check("summary: a clippy crate whose every failure is known reads UNKNOWN beside units it did not lint",
+          (f"| {clippy_title} | **UNKNOWN** | 5 / 0 / 0 / 1 |" in out,
+           "`pi-vfs` (runner): UNKNOWN: every failure is known, but 3 unit(s) of the crate were not linted, each named below" in out),
+          (True, True))
+    json.dump(result("clippy", "pi-vfs", "runner", "PASS", "0", 1, 1), open(os.path.join(res2, vfs_file), "w"))
     # The memory bench: a planted run names the shell line, and the summary lists every line it printed.
     mb_file = next(f for f in os.listdir(res2) if json.load(open(os.path.join(res2, f)))["row"] == "membench")
     planted_mb = mb([shell_miss, vproc_ok] + others, 0)
@@ -3923,7 +4885,7 @@ def selftest():
     check("summary: no docs or changelog result", ("| rustdoc intra-doc links (pi-shell) | **UNKNOWN** | 0 / 0 / 0 / 2 |" in out,
           "| CHANGELOG format (fix-changelogs --check) | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out,
           "`public` (runner): UNKNOWN: no result" in out, "`private` (runner): UNKNOWN: no result" in out,
-          "`changelogs` (runner): UNKNOWN: no result" in out, rc), (True, True, True, True, True, 1))
+          "`changelogs` (runner): UNKNOWN: no result" in out, rc), (True, True, True, True, True, 2))
     # A row reads the same in a run of that row alone as in a run of every row of the same commit. The
     # summary step is run as the workflow runs it, on the results the planned rows' jobs upload: each
     # row's unit results, the passing tests' output of each row that has some (TEST_OUTPUT_ROWS), and
@@ -4000,6 +4962,320 @@ def selftest():
           ([], ["FAIL", "PASS", "UNKNOWN"]))
     check("summary: the skip prints row's run-time unit read every test row's output in the full run",
           full_v.get("skipforms"), "PASS")
+    # First seen at this cut: the summary against the previous cut's report (SC_PREVIOUS, the
+    # directory sc.py previous-report fills). res3 holds every unit the plan expects; this cut fails
+    # on a new finding (the docs plant's link), on a test that passed at the previous cut, on a kind of
+    # CHANGELOG rewrite new to a file that needed another there, on one more of a rewrite a file needed
+    # there, on a memory bench panic with another assertion, and on findings the previous cut had too:
+    # a set test that failed there, a docs link and a clippy finding at another line, a coding-agent
+    # test that failed in another shard there, and a platform test that failed there and timed out
+    # here. The pi-builtins lint row has no result at the previous cut (a row new at this cut), and
+    # rust_test failed here and passed there. Only the plant, the test that passed, the two CHANGELOG
+    # findings, the other panic, the lint unit and the Rust row are first seen.
+    res3, prev3, known3 = os.path.join(d, "res3"), os.path.join(d, "prev3"), os.path.join(d, "known3.txt")
+    os.makedirs(res3)
+    open(known3, "w").write("# none\n")
+    units3 = expected_units(build2)[0]
+    at3 = {u: os.path.join(res3, f"{i}.json") for i, u in enumerate(units3)}
+    set3 = next(u for u in units3 if u[0] == "set-runner")
+    ca3 = [u for u in units3 if u[0] == "ts-ca"]
+    docs3, docs3p = ("docs", "public", "runner"), ("docs", "private", "runner")
+    link = "crates/pi-shell/src/{}.rs:{}:{}: unresolved link to '{}' (no item named '{}' in scope)"
+    planted3 = link.format("lib", 36, 1, "NoSuchItemPlanted", "NoSuchItemPlanted")
+    log3 = "packages/x/CHANGELOG.md: 0 promoted item(s), {} collapsed release(s); from line {}: -## [1.0.0]"
+    clog3 = ("packages/y/CHANGELOG.md: 0 promoted item(s), 0 merged duplicate heading(s), 0 dropped released duplicate(s), "
+             "{} removed empty heading(s), 3 collapsed release(s); from line 7: -### Planted empty heading")
+    panic3 = "exit 101: thread 'main' panicked at crates/pi-shell/benches/memory.rs:{}:2: assertion failed: {}"
+    bench3 = ("membench", MEMBENCH_UNIT, "runner")
+    lint3 = "crates/pi-vfs/src/lib.rs:{}:{}: clippy::needless_return: unneeded 'return' statement"
+    here3 = {set3: ["standing::t", "newly::t"], docs3: [planted3, link.format("a", 3372, 8, "Job::facts", "Job")],
+             ca3[0]: ["moved::t"], ("changelog", "changelogs", "runner"): [log3.format(29, 1713), clog3.format(1)],
+             bench3: [panic3.format(251, "every idle vproc frees its frame")],
+             ("macos", PLATFORM_CRATES, "runner"): ["pi-shell::slow::t (TIMEOUT)"], ("clippy", "pi-vfs", "runner"): [lint3.format(12, 5)],
+             ("builtins-lint", "clippy", "runner"): ["crates/pi-builtins/src/a.rs:1:1: clippy::x: y", "crates/pi-builtins/src/a.rs:2:1: clippy::x: y"]}
+    there3 = {set3: ["standing::t"], docs3: [link.format("a", 3370, 8, "Job::facts", "Job")], ca3[1]: ["moved::t"],
+              ("changelog", "changelogs", "runner"): [log3.format(28, 1719), clog3.format(0)], ("macos", PLATFORM_CRATES, "runner"): ["pi-shell::slow::t"],
+              ("clippy", "pi-vfs", "runner"): [lint3.format(10, 9)], bench3: [panic3.format(249, "the shell stays under its bound")]}
+
+    def unit3(u, failures, passed=("t",)):
+        return result(*u, "FAIL" if failures else "PASS", 1 if failures else 0, 1, passed=len(passed), failed=len(failures),
+                      failures=failures, tests=[(t, 1.0) for t in list(passed) + list(failures)])
+
+    for u in units3:
+        json.dump(unit3(u, here3.get(u, [])), open(at3[u], "w"))
+    prev_units3 = [unit3(u, there3.get(u, []), ("t", "newly::t") if u == set3 else ("t",)) for u in units3 if u[0] != "builtins-lint"]
+    prev_rows3 = {"rust_test": "PASS", "rust_test_macos": "PASS"}
+    from3 = "run 1 (a hand-made previous cut), of aaaaaaaaaaaa"
+
+    def previous3(results=None, raw=None, rows=prev_rows3, about=None):
+        """A previous cut's report in prev3: results.json (RESULTS, or the text RAW), verdict.json's rows, about.json."""
+        shutil.rmtree(prev3, ignore_errors=True)
+        os.makedirs(prev3)
+        if raw is not None:
+            open(os.path.join(prev3, "results.json"), "w").write(raw)
+        elif results is not None:
+            json.dump(results, open(os.path.join(prev3, "results.json"), "w"))
+        if rows is not None:
+            json.dump({"rows": rows}, open(os.path.join(prev3, "verdict.json"), "w"))
+        if about is not None:
+            json.dump(about, open(os.path.join(prev3, "about.json"), "w"))
+        return prev3
+
+    def summary3(previous, plant_env="", rows_env=None, rust_env="rust_test=failure rust_test_macos=success"):
+        """cmd_summary on res3 against PREVIOUS (SC_PREVIOUS; None: unset): (its summary, its verdict record)."""
+        env = dict(SC_PLANT=plant_env, SC_VERDICT=vfile, SC_ROWS=rows_env, SC_RUST_TESTS=rust_env, SC_PREVIOUS=previous)
+        kept_env = {k: os.environ.get(k) for k in env}
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if os.path.exists(vfile):
+            os.remove(vfile)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                cmd_summary(res3, build2, known3)
+        finally:
+            for k, v in kept_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return buf.getvalue(), verdict_record()
+
+    def seen3(rec):
+        s = rec.get("first_seen")
+        return [(e["kind"], e["row"], e["unit"], e["finding"], e["reading"], e["previous"]) for e in s] if isinstance(s, list) else s
+
+    plant_entry = ("failure", "docs", "public", planted3, "NEW", "its unit did not have it at the previous cut")
+    want3 = [("failure", "set-runner", set3[1], "newly::t", "NEW", "it passed at the previous cut"), plant_entry,
+             ("failure", "changelog", "changelogs", log3.format(29, 1713), "NEW",
+              "the previous cut counted 28 collapsed release(s) in it, this cut 29"),
+             ("failure", "changelog", "changelogs", clog3.format(1), "NEW", "its unit did not have it at the previous cut"),
+             ("failure", "membench", MEMBENCH_UNIT, panic3.format(251, "every idle vproc frees its frame"), "NEW",
+              "its unit did not have it at the previous cut"),
+             ("unit", "builtins-lint", "clippy", "2 failure(s)", None, "the previous cut's report has no result for its unit"),
+             ("row", "rust_test", None, "the row reads FAIL", None, "it read PASS at the previous cut")]
+    out, rec = summary3(previous3(prev_units3, about={"from": from3, "why": None}))
+    check("first seen: a new finding (the plant's link) is in first_seen",
+          (isinstance(seen3(rec), list), plant_entry in (seen3(rec) if isinstance(seen3(rec), list) else [])), (True, True))
+    check("first seen: a finding at both cuts is not (a set test that failed at both, a docs link and a clippy finding at "
+          "another line, a coding-agent test in another shard, a platform test that timed out here): first_seen is the new "
+          "finding, the test that passed there, the new kind and the one more of a CHANGELOG rewrite, the other panic, the "
+          "unit with no result there and the Rust row that passed there",
+          (seen3(rec), rec.get("first_seen_why"), rec.get("first_seen_against")),
+          (want3, None, from3))
+    head = out.find(f"### First seen at this cut: 7, against {from3}")
+    check("first seen: the summary lists them first, before the table and the standing failures",
+          (head > 0, head < out.find("| Row | Verdict |"), head < out.find("### Each failing test"),
+           f"FAILED `{planted3}`: **NEW**; its unit did not have it at the previous cut" in out[head:out.find("| Row | Verdict |")],
+           f"FAILED `{planted3}`: **NEW**; **first seen at this cut** (its unit did not have it at the previous cut)" in out,
+           "FAILED `standing::t`: **NEW**\n" in out),
+          (True, True, True, True, True, True))
+    check("first seen: a unit with no result at the previous cut names its failures",
+          [(e["failed"], e["failures"]) for e in rec.get("first_seen", []) if e["kind"] == "unit"] if isinstance(rec.get("first_seen"), list) else None,
+          [(2, here3[("builtins-lint", "clippy", "runner")])])
+    # What a finding is across cuts (finding_keys): what moves is taken out, what tells two apart is kept.
+    check("finding_keys: the same finding at two cuts",
+          [set(finding_keys(row, a)) == set(finding_keys(row, b)) for row, a, b in (
+              ("clippy", "crates/x/src/a.rs:12: clippy::m: n (3 here, 1 in the baseline)", "crates/x/src/a.rs:40: clippy::m: n (2 here, 1 in the baseline)"),
+              ("docs", "crates/x/src/a.rs:12:5: unresolved link to 'A'", "crates/x/src/a.rs:19:9: unresolved link to 'A'"),
+              ("changelog", log3.format(28, 1719), log3.format(29, 1713)),
+              ("membench", "memory shell: 4194 bytes after create + ':' (target ≤ 4096) MISS",
+               "memory shell: 5000 bytes after create + ':' (target ≤ 4096) MISS"),
+              ("membench", panic3.format(249, "state_bytes <= 256"), panic3.format(251, "state_bytes <= 256")),
+              ("checkts", "check:ts: exit 2: a.ts(3,5): error TS2322: Type 'x' / Found 1 error.",
+               "check:ts: exit 2: a.ts(9,5): error TS2322: Type 'x' / Found 1 error."),
+              ("skipforms", "a skip print the summary does not read: crates/a.rs:3: 'skipped x'", "a skip print the summary does not read: crates/a.rs:9: 'skipped x'"),
+              ("skipforms", "a skip line the summary does not read: 'skipped x', printed 2 time(s), first by r t",
+               "a skip line the summary does not read: 'skipped x', printed 5 time(s), first by r u"),
+              ("macos", "pi-shell::a::b (TIMEOUT)", "pi-shell::a::b"))],
+          [True] * 9)
+    check("finding_keys: two findings stay two",
+          [set(finding_keys(row, a)) == set(finding_keys(row, b)) for row, a, b in (
+              ("docs", "crates/x/src/a.rs:12:5: unresolved link to 'A'", "crates/x/src/b.rs:12:5: unresolved link to 'A'"),
+              ("builtins-lint", "crates/b/src/a.rs:1:1: clippy::x: y (fn a() {)", "crates/b/src/a.rs:1:1: clippy::x: y (fn b() {)"),
+              ("changelog", clog3.format(0), clog3.format(1)),
+              ("membench", panic3.format(249, "the shell stays under its bound"), panic3.format(249, "every idle vproc frees its frame")),
+              ("membench", panic3.format(249, "state_bytes <= 256"), panic3.format(251, "state_bytes <= 128")),
+              ("membench", "exit 101: x", "exit 134: x"),
+              ("checkts", "check:ts: exit 2: a.ts(3,5): error TS2322: Type 'x'", "check:ts: exit 2: a.ts(3,5): error TS2345: Type 'x'"),
+              ("set-runner", "a::b_1", "a::b_2"))],
+          [False] * 8)
+    check("finding_keys: a CHANGELOG counts each kind of rewrite it needs",
+          finding_keys("changelog", clog3.format(2)), {"packages/y/CHANGELOG.md: removed empty heading(s)": 2,
+                                                       "packages/y/CHANGELOG.md: collapsed release(s)": 3})
+    # A previous report that could not be read is UNKNOWN, naming why, never an empty first_seen: none
+    # named, its results.json missing, one that does not parse, one that holds no result or no unit
+    # results, and the fetch step's own reason (about.json).
+    for label, prev, why in (
+            ("no previous report named", lambda: None, "no previous report was given to the summary (SC_PREVIOUS is not set)"),
+            ("a missing previous report", previous3, f"its results.json is not there ({prev3}/results.json); no about.json says why"),
+            ("a previous report that does not parse", lambda: previous3(raw='[{"row": "set-runner", '),
+             "its results.json does not parse (JSONDecodeError: "),
+            ("a previous report that holds no result", lambda: previous3(raw="[]"),
+             "its results.json holds no unit result, so there is nothing to compare with"),
+            ("a previous report that holds no unit results", lambda: previous3(raw='[{"row": "set-runner"}]'),
+             "its results.json is not a list of unit results: entry 0 has no unit, who, status, failures, tests"),
+            ("a previous report the fetch step could not get",
+             lambda: previous3(prev_units3, about={"from": "run 7", "why": "run 7's sc-report expired"}), "run 7's sc-report expired")):
+        out, rec = summary3(prev())
+        check(f"first seen: {label} reads UNKNOWN, naming why",
+              (rec.get("first_seen"), (rec.get("first_seen_why") or "").startswith(why), rec.get("first_seen_why"),
+               "### First seen at this cut: UNKNOWN\n" in out, "**first seen at this cut**" in out),
+              ("UNKNOWN", True, rec.get("first_seen_why"), True, False))
+    # A planted run's plant must read first seen (plant_first_seen): the comparison's own control,
+    # which fails when the previous cut had the plant too.
+    json.dump(unit3(docs3p, [planted3]), open(at3[docs3p], "w"))
+    out, rec = summary3(previous3(prev_units3), plant_env="docs", rows_env="docs")
+    check("first seen: a planted run's plant reads first seen in each unit of its row",
+          (rec.get("plant_caught"), rec.get("plant_first_seen"), "the comparison's control caught it" in out), (True, True, True))
+    out, rec = summary3(previous3([dict(r, failures=[planted3]) if r["row"] == "docs" else r for r in prev_units3]),
+                        plant_env="docs", rows_env="docs")
+    check("first seen: a plant the previous cut had too fails the control",
+          (rec.get("plant_first_seen"), "**THE FIRST-SEEN CONTROL FAILED**: the plant `NoSuchItemPlanted` does not read "
+           "first seen at this cut in `public`, `private`." in out), (False, True))
+    out, rec = summary3(previous3(), plant_env="docs", rows_env="docs")
+    check("first seen: a planted run with no previous report", rec.get("plant_first_seen"), "UNKNOWN")
+    out, rec = summary3(previous3([r for r in prev_units3 if r["row"] != "docs"]), plant_env="docs", rows_env="docs")
+    check("first seen: a plant in a row the previous cut has no result for reads first seen, named in its unit's entry",
+          (rec.get("plant_first_seen"), [(e["kind"], e["unit"], planted3 in e.get("failures", [])) for e in rec.get("first_seen", [])]
+           if isinstance(rec.get("first_seen"), list) else None),
+          (True, [("unit", "public", True), ("unit", "private", True)]))
+    json.dump(unit3(docs3p, []), open(at3[docs3p], "w"))
+    # A planted empty heading in a CHANGELOG that already had an empty heading to remove: one more of
+    # that rewrite, so first seen.
+    cl3 = ("changelog", "changelogs", "runner")
+    relay = ("packages/browser-relay/CHANGELOG.md: 0 promoted item(s), 0 merged duplicate heading(s), 0 dropped released "
+             "duplicate(s), {} removed empty heading(s), 0 collapsed release(s); from line 5: -### {}")
+    json.dump(unit3(cl3, [relay.format(2, "Planted empty heading")]), open(at3[cl3], "w"))
+    out, rec = summary3(previous3([dict(r, failures=[relay.format(1, "Old")]) if r["row"] == "changelog" else r for r in prev_units3]),
+                        plant_env="changelog", rows_env="changelog")
+    check("first seen: a planted empty heading in a CHANGELOG that had one to remove reads first seen",
+          (rec.get("plant_caught"), rec.get("plant_first_seen"), seen3(rec)),
+          (True, True, [("failure", "changelog", "changelogs", relay.format(2, "Planted empty heading"), "NEW",
+                         "the previous cut counted 1 removed empty heading(s) in it, this cut 2")]))
+    json.dump(unit3(cl3, here3[cl3]), open(at3[cl3], "w"))
+    # A plant past the first FIRST_SEEN_NAMED failures of a unit with no result at the previous cut is
+    # named in that unit's entry, and the control reads only the entries.
+    blc, blf = ("builtins-lint", "clippy", "runner"), ("builtins-lint", "rustfmt", "runner")
+    plant_c = f"crates/pi-builtins/src/lib.rs:90:1: clippy::redundant_static_lifetimes: constants have by default a 'static lifetime ({BUILTINS_LINT_PLANT_LINES[0]})"
+    plant_f = f"crates/pi-builtins/src/lib.rs:92: {BUILTINS_LINT_PLANT_LINES[1]}"
+    many = [f"crates/pi-builtins/src/a.rs:{i}:1: clippy::x: y (fn f{i}() {{)" for i in range(1, FIRST_SEEN_NAMED + 2)]
+    json.dump(unit3(blc, many + [plant_c]), open(at3[blc], "w"))
+    json.dump(unit3(blf, [plant_f]), open(at3[blf], "w"))
+    out, rec = summary3(previous3(prev_units3), plant_env="builtins-lint", rows_env="builtins-lint")
+    check("first seen: a plant past the tenth failure of a unit with no previous result is named in its entry",
+          (rec.get("plant_caught"), rec.get("plant_first_seen"),
+           [(e["unit"], e["failed"], e["failures"]) for e in rec.get("first_seen", [])] if isinstance(rec.get("first_seen"), list) else None),
+          (True, True, [("clippy", FIRST_SEEN_NAMED + 2, many[:FIRST_SEEN_NAMED] + [plant_c]), ("rustfmt", 1, [plant_f])]))
+    json.dump(unit3(blc, here3[blc]), open(at3[blc], "w"))
+    json.dump(unit3(blf, []), open(at3[blf], "w"))
+    # A unit two jobs reported at the previous cut counts a finding at the fewer places, so a second
+    # place of a standing link here is first seen; a test that skipped itself there did not pass.
+    moved = link.format("a", 3372, 8, "Job::facts", "Job")
+    again = link.format("a", 3400, 8, "Job::facts", "Job")
+    json.dump(unit3(docs3, [planted3, moved, again]), open(at3[docs3], "w"))
+    doubled = prev_units3 + [r for r in prev_units3 if (r["row"], r["unit"]) == ("docs", "public")]
+    out, rec = summary3(previous3(doubled), rows_env="docs")
+    check("first seen: a previous unit two jobs reported counts a finding at the fewer places",
+          [e[3:] for e in seen3(rec) if e[1] == "docs"] if isinstance(seen3(rec), list) else seen3(rec),
+          [(planted3, "NEW", "its unit did not have it at the previous cut, and read UNKNOWN there, so it may have been missed")]
+          + [(f, "NEW", "the previous cut had it at 1 place(s) of its unit, this cut at 2") for f in (moved, again)])
+    json.dump(unit3(docs3, here3[docs3]), open(at3[docs3], "w"))
+    skipped = [dict(r, status="UNKNOWN", self_skipped=["newly::t"]) if r["unit"] == set3[1] and r["row"] == "set-runner" else r
+               for r in prev_units3]
+    out, rec = summary3(previous3(skipped), rows_env="set-runner,set-root,lib4")
+    check("first seen: a test that skipped itself at the previous cut did not pass there",
+          [e[3:] for e in seen3(rec) if e[3] == "newly::t"] if isinstance(seen3(rec), list) else seen3(rec),
+          [("newly::t", "NEW", "its unit did not have it at the previous cut, and read UNKNOWN there, so it may have been missed")])
+    # Nothing first seen, and a Rust row not compared: the summary says so, never that nothing is new.
+    out, rec = summary3(previous3(load_results(res3), rows=dict(prev_rows3, rust_test="FAIL")))
+    check("first seen: none among what was compared, beside what was not",
+          (rec.get("first_seen"), "### First seen at this cut: none, against" in out,
+           "No failure the comparison could read is new at this cut" in out, "none is new at this cut" in out),
+          ([], True, True, False))
+    # A Rust row that failed at both cuts is not compared: the summary reads none of its tests.
+    out, rec = summary3(previous3(prev_units3, rows=dict(prev_rows3, rust_test="FAIL")))
+    check("first seen: a Rust row that failed at both cuts is named as not compared",
+          ([e for e in seen3(rec) if e[0] == "row"] if isinstance(seen3(rec), list) else seen3(rec),
+           [b.split(":")[0] for b in rec.get("first_seen_not_compared", [])],
+           "Not compared with the previous cut:" in out), ([], [RUST_JOBS[0][0]], True))
+    # previous-report: which run it reads, and why it reads none, with gh api's answers stood in for.
+    def fake_api(routes):
+        def api(path):
+            if path not in routes:
+                raise RuntimeError(f"gh api {path} exited 1: gh: Not Found (HTTP 404)")
+            v = routes[path]
+            return v if isinstance(v, bytes) else json.dumps(v).encode()
+        return api
+
+    def zipped(files):
+        import zipfile
+        b = io.BytesIO()
+        with zipfile.ZipFile(b, "w") as z:
+            for n, t in files.items():
+                z.writestr(n, t)
+        return b.getvalue()
+
+    def gh_run(i, sha):
+        return {"id": i, "head_sha": sha * 40, "html_url": f"https://github.com/o/r/actions/runs/{i}"}
+
+    def gh_arts(i, expired=False):
+        return {"artifacts": [{"id": 50 + i, "name": "sc-report", "expired": expired, "expires_at": "2026-12-01T00:00:00Z"}]}
+
+    runs_at = f"repos/o/r/actions/workflows/sami-checks.yml/runs?branch=release-candidate&event=push&status=completed&per_page={PREVIOUS_RUNS}"
+    arts_at = "repos/o/r/actions/runs/{}/artifacts?name=sc-report&per_page=10"
+    good = {runs_at: {"workflow_runs": [gh_run(100, "c"), gh_run(99, "c"), gh_run(98, "b"), gh_run(97, "a")]},
+            arts_at.format(98): gh_arts(98), arts_at.format(97): gh_arts(97),
+            "repos/o/r/actions/artifacts/148/zip": zipped({"results.json": json.dumps(prev_units3),
+                                                            "verdict.json": json.dumps({"rows": prev_rows3})}),
+            "repos/o/r/actions/artifacts/147/zip": zipped({"results.json": "[]"})}
+    fetched = os.path.join(d, "fetched")
+
+    def fetch(routes, named=""):
+        shutil.rmtree(fetched, ignore_errors=True)
+        env = dict(GITHUB_REPOSITORY="o/r", GITHUB_RUN_ID="100", SC_COMMIT="c" * 40, SC_INPUT_PREVIOUS=named)
+        kept_env = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                about = previous_report(fetched, fake_api(routes))
+        finally:
+            for k, v in kept_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return about["run"], about["why"], sorted(os.listdir(fetched))
+
+    check("previous-report: the newest completed push before this run, of another commit",
+          fetch(good), (98, None, ["about.json", "results.json", "verdict.json"]))
+    out, rec = summary3(fetched)
+    check("previous-report: the summary reads what it fetched", (seen3(rec), rec.get("first_seen_against")),
+          (want3, "run 98 (the newest completed push of release-candidate before this run), of bbbbbbbbbbbb"))
+    expired = dict(good, **{arts_at.format(98): gh_arts(98, expired=True)})
+    check("previous-report: an sc-report that expired, and no older run tried", fetch(expired),
+          (98, "run 98's sc-report expired at 2026-12-01T00:00:00Z (an sc-report is kept 30 days)", ["about.json"]))
+    out, rec = summary3(fetched)
+    check("previous-report: the summary reads an expired report UNKNOWN, naming why",
+          (rec.get("first_seen"), rec.get("first_seen_why")), ("UNKNOWN", "run 98's sc-report expired at 2026-12-01T00:00:00Z (an sc-report is kept 30 days)"))
+    check("previous-report: a run with no sc-report", fetch(dict(good, **{arts_at.format(98): {"artifacts": []}}))[:2],
+          (98, "run 98 has no sc-report artifact (its summary job uploaded none)"))
+    check("previous-report: an sc-report with no results.json",
+          fetch(dict(good, **{"repos/o/r/actions/artifacts/148/zip": zipped({"summary.md": "x"})}))[:2],
+          (98, "run 98's sc-report holds no results.json (it holds summary.md)"))
+    check("previous-report: no run before this one, of another commit",
+          fetch(dict(good, **{runs_at: {"workflow_runs": [gh_run(100, "c"), gh_run(99, "c")]}}))[:2],
+          (None, "none of the newest 2 completed sami-checks runs on a push of release-candidate is a run before this one, of another commit"))
+    check("previous-report: the list of runs could not be read", fetch({})[:2],
+          (None, f"the previous run could not be found: gh api {runs_at} exited 1: gh: Not Found (HTTP 404)"))
+    check("previous-report: the run the dispatch input names", fetch(dict(good, **{"repos/o/r/actions/runs/97": gh_run(97, "a")}), "97"),
+          (97, None, ["about.json", "results.json"]))
+    check("previous-report: a named run that is not there", fetch(good, "7")[:2],
+          (None, "the previous run could not be found: gh api repos/o/r/actions/runs/7 exited 1: gh: Not Found (HTTP 404)"))
+    check("previous-report: a named run that is no run id", fetch(good, "latest")[:2], (None, "the dispatch input previous ('latest') is no run id"))
 
     if fails:
         for f in fails:
@@ -4007,12 +5283,15 @@ def selftest():
         sys.exit(1)
     print("SELFTEST OK: libtest (60 s warning, hang, kill, self-skip), nextest, bun and clippy counters, the "
           "platform report reader, the tree's real skip lines and partial passes, the shard assignment and "
-          "per-user weights, the summary's UNKNOWN for a unit no job or two jobs reported, the known and flaky "
+          "per-user weights, the summary's UNKNOWN for a unit no job or two jobs reported, its exit (0 PASS, 1 FAIL, "
+          "2 UNKNOWN, a fault outranking a row that could not be read, 2 for a summary that stopped), the known and flaky "
           "entries, skip-forms and skip-lines with their controls, the gVisor rows and their known skips, the "
           "docs and changelog rows with their planted controls, the builtins-lint row's lift, readers, sorting "
           "and plant, the Rust tests' rows from their jobs' "
           "conclusions, the row selection (its jobs from the workflow's needs, the cut's every row, a control "
-          "on a row that does not run), and the summary's NOT RUN rows and verdict line")
+          "on a row that does not run), the summary's NOT RUN rows and verdict line, and its first-seen comparison "
+          "with the previous cut's report (a new finding listed, one at both cuts not, UNKNOWN for a report that "
+          "is missing or does not parse, the plant's control, and the run previous-report fetches)")
 
 
 # The docs row (docs.sh): `cargo doc --no-deps -p pi-shell` with -D rustdoc::broken_intra_doc_links,
@@ -5088,7 +6367,9 @@ def main(argv):
     elif c == "platforms":
         cmd_platforms(*a)
     elif c == "summary":
-        sys.exit(cmd_summary(*a))
+        sys.exit(summary_main(a))
+    elif c == "unreadable-pass":
+        cmd_unreadable_pass(*a)
     elif c == "skip-forms":
         print(json.dumps(cmd_skip_forms(*a)))
     elif c == "skip-lines":
@@ -5128,6 +6409,8 @@ def main(argv):
         print(json.dumps(parse_builtins_rustfmt(*a)))
     elif c == "plant":
         cmd_plant(*a)
+    elif c == "previous-report":
+        previous_report(*a)
     elif c == "selftest":
         selftest()
     else:

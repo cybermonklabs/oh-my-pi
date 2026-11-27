@@ -592,7 +592,7 @@ fn assert_no_task_has_children(mut read: impl FnMut(&Path) -> std::io::Result<St
 				Ok(children) => {
 					assert!(children.trim().is_empty(), "children left behind by {name:?}: {children}");
 				},
-				Err(error) if error.kind() == std::io::ErrorKind::NotFound => every_task_read = false,
+				Err(error) if task_has_gone(&error) => every_task_read = false,
 				Err(error) => panic!("the children of task {name:?}: {error:?}"),
 			}
 		}
@@ -605,6 +605,106 @@ fn assert_no_task_has_children(mut read: impl FnMut(&Path) -> std::io::Result<St
 		std::thread::yield_now();
 	}
 	panic!("this process's task list did not hold still for two passes in {MAX_PASSES} passes");
+}
+
+/// Whether reading a task's `children` failed because the task has gone:
+/// `ENOENT` on Linux, which no longer finds its directory, or `ESRCH` on
+/// gVisor, which answers so for a task it has destroyed (`taskInode.Lookup`
+/// and `newTaskInode` in `pkg/sentry/fsimpl/proc/task.go`).
+#[cfg(target_os = "linux")]
+fn task_has_gone(error: &std::io::Error) -> bool {
+	error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// [`assert_no_task_has_children`] reads a task that has gone as gone, as
+/// Linux reports it (`ENOENT`) and as gVisor does (`ESRCH`), without losing
+/// the check: a pass in which a task has gone is void, so a child listed in
+/// that same pass is still reported. Any other error reading a task's
+/// children is a failure that names the error.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_task_that_has_gone_is_read_as_gone_on_either_kernel() {
+	if !crate::own_process::own_process() {
+		return;
+	}
+	let why_of = |caught: Box<dyn std::any::Any + Send>| {
+		caught
+			.downcast_ref::<String>()
+			.cloned()
+			.or_else(|| caught.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+			.unwrap_or_default()
+	};
+	for gone in [libc::ENOENT, libc::ESRCH] {
+		// With nothing left behind, the walk ends: the task that has gone
+		// voids its pass, and the passes after it read every task.
+		let mut first = true;
+		assert_no_task_has_children(|task| {
+			if std::mem::take(&mut first) {
+				return Err(std::io::Error::from_raw_os_error(gone));
+			}
+			fs::read_to_string(task.join("children"))
+		});
+		// And a child listed in the same pass is still reported, so reading a
+		// task as gone cannot be a way of passing the check.
+		let left = std::panic::catch_unwind(|| {
+			let mut first = true;
+			assert_no_task_has_children(|_| {
+				if std::mem::take(&mut first) {
+					return Err(std::io::Error::from_raw_os_error(gone));
+				}
+				Ok("4242 ".to_owned())
+			});
+		});
+		let why = left.err().map(why_of).unwrap_or_default();
+		assert!(
+			why.contains("children left behind"),
+			"a child listed in the pass of a task that has gone ({gone}) was not reported: {why:?}"
+		);
+	}
+	// A pass in which a task has gone proves nothing, because a child can be
+	// invisible to it: it moves from a task the pass has not read to one it
+	// has. Such a pass must not count towards the two the walk ends on. Here
+	// the first task of each of the first two passes has gone and nothing is
+	// listed anywhere; from the third pass on a child is listed. A walk that
+	// counted those two passes would have returned before the child showed.
+	for gone in [libc::ENOENT, libc::ESRCH] {
+		let first_task = {
+			let mut names: Vec<std::ffi::OsString> =
+				fs::read_dir("/proc/self/task").unwrap().map(|task| task.unwrap().file_name()).collect();
+			names.sort();
+			names.remove(0)
+		};
+		let left = std::panic::catch_unwind(|| {
+			let mut pass = 0_usize;
+			assert_no_task_has_children(|task| {
+				let starts_a_pass = task.file_name() == Some(first_task.as_os_str());
+				if starts_a_pass {
+					pass += 1;
+				}
+				if pass <= 2 {
+					// The pass a task has gone from, with no child anywhere.
+					return match starts_a_pass {
+						true => Err(std::io::Error::from_raw_os_error(gone)),
+						false => Ok(String::new()),
+					};
+				}
+				Ok("4242 ".to_owned())
+			});
+		});
+		let why = left.err().map(why_of).unwrap_or_default();
+		assert!(
+			why.contains("children left behind"),
+			"the walk ended on two passes a task had gone from ({gone}), before a child showed: {why:?}"
+		);
+	}
+	let refused = std::panic::catch_unwind(|| {
+		assert_no_task_has_children(|_| Err(std::io::Error::from_raw_os_error(libc::EACCES)));
+	});
+	let why = refused.err().map(why_of).unwrap_or_default();
+	assert!(
+		why.contains("the children of task") && why.contains("PermissionDenied"),
+		"a list refused with EACCES was not reported as a failed read naming the error: {why:?}"
+	);
 }
 
 /// [`assert_no_task_has_children`] catches a child whose holder hands it, by
@@ -1663,26 +1763,25 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	// SAFETY: reading this process's own number.
 	OWNER.store(unsafe { libc::getpid() }, Ordering::Relaxed);
 	RECORD.store(file.as_raw_fd(), Ordering::Relaxed);
-	// SAFETY: this test has a process of its own (`own_process`); the disposition and
-	// the process group are both put back below. `SA_RESTART` keeps the
-	// storm from turning this process's own calls into `EINTR`.
-	let (kept, ignored, grouped) = unsafe {
+	// SAFETY: this test has a process of its own (`own_process`); the process
+	// group is put back below, and both dispositions are left ignored there.
+	// `SA_RESTART` keeps the storm from turning this process's own calls into
+	// `EINTR`.
+	let grouped = unsafe {
 		let mut catching: libc::sigaction = std::mem::zeroed();
 		catching.sa_sigaction = note_whoever_runs_this as extern "C" fn(libc::c_int) as libc::sighandler_t;
 		catching.sa_flags = libc::SA_RESTART;
 		libc::sigemptyset(&raw mut catching.sa_mask);
-		let mut kept: libc::sigaction = std::mem::zeroed();
-		assert_eq!(libc::sigaction(libc::SIGUSR1, &raw const catching, &raw mut kept), 0);
+		assert_eq!(libc::sigaction(libc::SIGUSR1, &raw const catching, std::ptr::null_mut()), 0);
 		// And one the caller *ignores*, which is its own instruction and
 		// has to reach the utility: a child that put it back to default
 		// would die on the storm's own delivery of it.
-		let ignored = libc::signal(libc::SIGUSR2, libc::SIG_IGN);
-		assert_ne!(ignored, libc::SIG_ERR);
+		assert_ne!(libc::signal(libc::SIGUSR2, libc::SIG_IGN), libc::SIG_ERR);
 		let was = libc::getpgrp();
 		// Its own group, so the storm reaches this test and its children
 		// and nothing else the runner has going.
 		assert_eq!(libc::setpgid(0, 0), 0, "a group of this test's own: {}", std::io::Error::last_os_error());
-		(kept, ignored, was)
+		was
 	};
 	let storming = std::sync::Arc::new(AtomicBool::new(true));
 	let until = std::sync::Arc::clone(&storming);
@@ -1749,10 +1848,18 @@ fn an_inherited_handler_does_not_run_in_the_child_before_exec() {
 	);
 	crate::testprog::write(&raises, &script);
 	let ignoring = crate::locale::codeset_from_utility_for_test(&raises, "C.UTF-8", &|_| None);
-	// SAFETY: putting back what this test changed, before it can fail.
+	// Both numbers stay ignored from here, rather than going back to what
+	// they were: a signal of the storm above can still be queued for the
+	// process, waiting for a thread that can take it to run, and where what
+	// they were is the default action — which is what this process inherits
+	// unless its caller ignored the number — that signal would end this
+	// process in the middle of the assertions below. Setting SIG_IGN discards
+	// a pending one as well, and nothing later sees the disposition: this
+	// process runs only this test.
+	// SAFETY: the dispositions and the group are this process's own.
 	unsafe {
-		libc::sigaction(libc::SIGUSR1, &raw const kept, std::ptr::null_mut());
-		libc::signal(libc::SIGUSR2, ignored);
+		libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+		libc::signal(libc::SIGUSR2, libc::SIG_IGN);
 		libc::setpgid(0, grouped);
 	}
 	let ran: Vec<i32> = fs::read(&record)

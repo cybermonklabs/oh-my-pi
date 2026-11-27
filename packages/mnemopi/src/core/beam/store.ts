@@ -232,6 +232,18 @@ function purgeWorkingMemoryArtifacts(db: BeamMemoryState["db"], ids: readonly st
  * marker with an old event timestamp (issue #4819). Rows flagged `IMPORTED`
  * are treated as durable and never trimmed, and trimmed rows cascade all linked
  * artifacts via `purgeWorkingMemoryArtifacts`.
+ *
+ * The trim addresses each row by its rowid, never by `id`. `id TEXT PRIMARY KEY`
+ * on a rowid table admits NULL, and a database rebuilt by SQLite's `.recover` can
+ * hold such a row. By id, `id NOT IN (keep set)` is NULL, never true, for that row,
+ * so it was never trimmed. While the row was among the newest `workingMemoryLimit`
+ * rows, the keep set held a NULL and the test was NULL for every other row as well,
+ * so the overflow half trimmed nothing until enough newer writes pushed the row out,
+ * and never again if its timestamp sorted above every later write. Rows past the TTL
+ * were still removed. The rowid of a rowid table is never NULL, and it is read and
+ * bound as decimal text because it is a signed 64-bit integer that a JS number would
+ * round past 2^53. Only text ids go to `purgeWorkingMemoryArtifacts`, which keys every
+ * artifact by the memory id.
  */
 function trimWorkingMemory(beam: BeamMemoryState): void {
 	const limit = beam.config.workingMemoryLimit;
@@ -240,30 +252,35 @@ function trimWorkingMemory(beam: BeamMemoryState): void {
 	const cutoff = toUtcIso(new Date(Date.now() - ttlHours * 3_600_000));
 	transaction(beam.db, () => {
 		using selectStatement = beam.db.prepare(`
-			SELECT id FROM working_memory
+			SELECT CAST(rowid AS TEXT) AS rowid, id FROM working_memory
 			WHERE session_id = ?
 			  AND consolidated_at IS NULL
 			  AND trust_tier IS NOT 'IMPORTED'
 			  AND (
 				timestamp < ? OR
-				id NOT IN (
-					SELECT id FROM working_memory
+				rowid NOT IN (
+					SELECT rowid FROM working_memory
 					WHERE session_id = ? AND consolidated_at IS NULL AND trust_tier IS NOT 'IMPORTED'
 					ORDER BY timestamp DESC
 					LIMIT ?
 				)
 			  )
 		`);
-		const ids = (selectStatement.all(beam.sessionId, cutoff, beam.sessionId, limit) as { id: string }[]).map(
-			row => row.id,
-		);
-		if (ids.length === 0) return;
-		const placeholders = ids.map(() => "?").join(", ");
-		beam.db.run(`DELETE FROM working_memory WHERE id IN (${placeholders}) AND session_id = ?`, [
-			...ids,
+		const trimmed = selectStatement.all(beam.sessionId, cutoff, beam.sessionId, limit) as {
+			rowid: string;
+			id: unknown;
+		}[];
+		if (trimmed.length === 0) return;
+		const rowids = trimmed.map(row => row.rowid);
+		const placeholders = rowids.map(() => "?").join(", ");
+		beam.db.run(`DELETE FROM working_memory WHERE rowid IN (${placeholders}) AND session_id = ?`, [
+			...rowids,
 			beam.sessionId,
 		]);
-		purgeWorkingMemoryArtifacts(beam.db, ids);
+		purgeWorkingMemoryArtifacts(
+			beam.db,
+			trimmed.map(row => row.id).filter(id => typeof id === "string"),
+		);
 	});
 }
 
@@ -352,10 +369,14 @@ function rowToDict(row: Row): Row {
  *  embedding request instead of embedding the whole corpus in one call. */
 const EMBED_REBUILD_BATCH = 128;
 
-/** A live memory row as an embedding rebuild reads it, before its column types are checked. */
+/**
+ * A live memory row as an embedding rebuild reads it, before its column types are checked. The
+ * rowid is read as decimal text: it is a signed 64-bit integer, which a JS number rounds past 2^53,
+ * and for a row with no id it is the only locator.
+ */
 interface LiveMemoryRow {
 	readonly tableName: string;
-	readonly rowid: number;
+	readonly rowid: string;
 	readonly memoryId: unknown;
 	readonly content: unknown;
 }
@@ -463,10 +484,11 @@ export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 				const live = embeddableRows(
 					beam.db
 						.query(`
-							SELECT 'working_memory' AS tableName, rowid, id AS memoryId, COALESCE(embed_text, content) AS content
+							SELECT 'working_memory' AS tableName, CAST(rowid AS TEXT) AS rowid, id AS memoryId,
+								COALESCE(embed_text, content) AS content
 							FROM working_memory WHERE superseded_by IS NULL
 							UNION ALL
-							SELECT 'episodic_memory' AS tableName, rowid, id AS memoryId, content
+							SELECT 'episodic_memory' AS tableName, CAST(rowid AS TEXT) AS rowid, id AS memoryId, content
 							FROM episodic_memory WHERE superseded_by IS NULL
 						`)
 						.all() as LiveMemoryRow[],
@@ -537,17 +559,23 @@ export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 	// No stale embeddings, but a previously-interrupted rebuild (a failed embed or a process
 	// exit after the wipe) can leave live memories with no active-model embedding. Treating an
 	// empty/partial table as "reconciled" would strand them FTS-only, so re-enqueue any live
-	// row still missing an active-model embedding.
+	// row still missing an active-model embedding. The anti-join is NOT EXISTS, not NOT IN:
+	// `x NOT IN (subquery)` is NULL, never true, when x is NULL and the subquery returns a row, or
+	// when the subquery returns a NULL. It would drop a row with no id before embeddableRows()
+	// reports it, and one active-model vector with no memory_id would hide every missing memory.
 	const missing = embeddableRows(
 		beam.db
 			.query(`
-				SELECT 'working_memory' AS tableName, rowid, id AS memoryId, COALESCE(embed_text, content) AS content
-				FROM working_memory
-				WHERE superseded_by IS NULL AND id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)
+				SELECT 'working_memory' AS tableName, CAST(m.rowid AS TEXT) AS rowid, m.id AS memoryId,
+					COALESCE(m.embed_text, m.content) AS content
+				FROM working_memory AS m
+				WHERE m.superseded_by IS NULL
+					AND NOT EXISTS (SELECT 1 FROM memory_embeddings AS e WHERE e.memory_id = m.id AND e.model = ?)
 				UNION ALL
-				SELECT 'episodic_memory' AS tableName, rowid, id AS memoryId, content
-				FROM episodic_memory
-				WHERE superseded_by IS NULL AND id NOT IN (SELECT memory_id FROM memory_embeddings WHERE model = ?)
+				SELECT 'episodic_memory' AS tableName, CAST(m.rowid AS TEXT) AS rowid, m.id AS memoryId, m.content
+				FROM episodic_memory AS m
+				WHERE m.superseded_by IS NULL
+					AND NOT EXISTS (SELECT 1 FROM memory_embeddings AS e WHERE e.memory_id = m.id AND e.model = ?)
 			`)
 			.all(active, active) as LiveMemoryRow[],
 	);

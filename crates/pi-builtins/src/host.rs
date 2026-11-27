@@ -1098,7 +1098,8 @@ mod umask_tests {
 				.expect("run the isolated signal test");
 			assert!(
 				out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
-				"isolated signal test: {}{}",
+				"isolated signal test ({}): {}{}",
+				out.status,
 				String::from_utf8_lossy(&out.stdout),
 				String::from_utf8_lossy(&out.stderr),
 			);
@@ -1138,8 +1139,17 @@ mod umask_tests {
 		}
 		stop.store(true, Ordering::Relaxed);
 		sender.join().unwrap();
-		// SAFETY: restore the default so later tests are unaffected.
-		unsafe { libc::signal(libc::SIGUSR1, libc::SIG_DFL) };
+		// SIGUSR1 is ignored from here, rather than put back to SIG_DFL: the
+		// sender's last SIGUSR1 can still be queued for the process, waiting
+		// for a thread that can take it to run, and the default action would
+		// then end this process at that moment, before libtest reports the
+		// result. Setting SIG_IGN discards a pending SIGUSR1 as well, which
+		// putting the default back does not (Linux `do_sigaction` flushes a
+		// pending signal only for an ignoring action, and gVisor's
+		// `SetSigAction` the same). Nothing later sees the disposition: this
+		// isolated process runs only this test.
+		// SAFETY: changes only this isolated process's own disposition.
+		unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
 		assert_eq!(
 			HANDLER_IN_CHILD.load(Ordering::Relaxed),
 			0,

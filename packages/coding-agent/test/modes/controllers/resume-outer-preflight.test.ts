@@ -125,7 +125,9 @@ describe("/resume <id> switch failures", () => {
 
 			expect(await executeBuiltinSlashCommand("/resume unrestorable", { ctx: mode })).toBe(true);
 
-			expect(showErrorSpy).toHaveBeenCalledWith("Could not restore model missing-provider/missing-model");
+			expect(showErrorSpy).toHaveBeenCalledWith(
+				"Could not restore model missing-provider/missing-model. Use --model to choose a model, or add a retry.fallbackChains key that maps the old selector to the new one.",
+			);
 			expect(session.sessionFile).toBe(previousFile);
 		} finally {
 			await cleanup();
