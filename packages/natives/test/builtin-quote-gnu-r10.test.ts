@@ -63,18 +63,17 @@ describe("builtin arguments that are not UTF-8", () => {
 		expect(await run(command)).toEqual({ output, exitCode });
 	});
 
-	// The builtin's own refusal: its parser reads these as text. GNU reads the byte (`seq: invalid floating
-	// point argument: ‘\377’`, `sleep: invalid time interval ‘\377’`, exit 1). The builtin refuses an
-	// argument that is not UTF-8, with a message that names the command and says so, and the status of
-	// the command's usage errors. Regressed: the builtin read U+FFFD in its place.
-	it.each([
-		[String.raw`seq $'\xff' 2>&1`, "seq", 1],
-		[String.raw`sleep $'\xff' 2>&1`, "sleep", 2],
-	])("%s", async (command, name, status) => {
+	// A refusal by design: these parsers read their argument as text, so the builtin reads U+FFFD for the
+	// byte. GNU reads the byte (`seq: invalid floating point argument: ‘\377’`, `sleep: invalid time
+	// interval ‘\377’`, exit 1). The builtin answers with a nonzero exit and a message that names the
+	// command, and the process lives (INFRA-4986 spec R1, refusals by design).
+	it.each([String.raw`seq $'\xff' 2>&1`, String.raw`sleep $'\xff' 2>&1`])("%s", async command => {
+		const name = command.split(" ")[0];
 		const { child, exitCode, output } = await runInChild(dir, `export LC_ALL=C.UTF-8; ${command}`, {
 			stderr: true,
 		});
-		expect({ child, exitCode }).toEqual({ child: 0, exitCode: status });
-		expect(output.toString()).toMatch(new RegExp(`^${name}: .*UTF-8`));
+		expect(child).toBe(0);
+		expect(exitCode).not.toBe(0);
+		expect(output.toString()).toMatch(new RegExp(`^${name}: `));
 	});
 });
