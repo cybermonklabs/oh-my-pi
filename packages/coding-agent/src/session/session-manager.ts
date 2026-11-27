@@ -3041,6 +3041,15 @@ export class SessionManager {
 	}
 
 	/**
+	 * The storage's {@link SessionStorage.waitForAppendAdmission}: settles once this process may queue more
+	 * transcript appends, or at once when `signal` fires. `undefined` when the storage never makes turns wait on
+	 * queued appends, so a caller has nothing to wait for.
+	 */
+	waitForAppendAdmission(signal?: AbortSignal): Promise<void> | undefined {
+		return this.#storage.waitForAppendAdmission?.(signal);
+	}
+
+	/**
 	 * Drop only session files that this manager saw materialized for a draft and
 	 * that still contain no durable conversation or extension state. Explicit
 	 * ensureOnDisk() records (ACP session/new, handoff) stay resumable.
