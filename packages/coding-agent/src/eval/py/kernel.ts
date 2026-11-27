@@ -146,6 +146,23 @@ const TOO_OLD_EXIT_BASE = 200;
 /** Exits 0 on Python 3.9+, otherwise `200 + 10*major + minor` so the host can name the rejected version. */
 const PYTHON_VERSION_PROBE = `import sys;v=sys.version_info;sys.exit(0 if v>=(3,${MIN_PYTHON_MINOR}) else ${TOO_OLD_EXIT_BASE}+min(v[0],3)*10+min(v[1],9))`;
 
+/**
+ * `code`, Python source for `-c`, run as a tool process: on Linux it first sets the interpreter's own
+ * OOM adjustment to 1000, best effort, so the kernel kills it, and what it starts, before the host when
+ * it picks one process to kill for lack of memory. The runner (`runner.py`) starts the same way.
+ */
+export function toolPythonCode(code: string): string {
+	if (process.platform !== "linux") return code;
+	return [
+		"try:",
+		'    with open("/proc/self/oom_score_adj", "w") as score:',
+		'        score.write("1000")',
+		"except OSError:",
+		"    pass",
+		code,
+	].join("\n");
+}
+
 function describePythonProbeExit(exitCode: number): string | undefined {
 	const encoded = exitCode - TOO_OLD_EXIT_BASE;
 	if (encoded < 20 || encoded > 39) return undefined;
@@ -169,7 +186,7 @@ async function probePythonKernelAvailability(
 		}
 		const result = await probeCandidates(
 			runtimes.map(runtime => ({
-				command: [runtime.pythonPath, "-c", PYTHON_VERSION_PROBE],
+				command: [runtime.pythonPath, "-c", toolPythonCode(PYTHON_VERSION_PROBE)],
 				env: runtime.env,
 				label: runtime.pythonPath,
 				describeExit: describePythonProbeExit,
@@ -347,6 +364,7 @@ export class PythonKernel extends BaseKernel {
 		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT);
 		const kernel = new PythonKernel(Snowflake.next(), runtime.pythonPath);
 
+		// A tool process: the runner sets its OOM adjustment first (`runner.py`).
 		const proc = Bun.spawn([runtime.pythonPath, "-u", scriptPath], {
 			cwd: options.cwd,
 			detached: shouldDetachKernel(process.platform),

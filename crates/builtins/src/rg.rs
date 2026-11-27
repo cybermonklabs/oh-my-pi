@@ -1392,7 +1392,9 @@ struct Decompressor {
 
 impl Decompressor {
 	/// Spawns `command` with piped output and, when `piped_stdin`, a piped stdin to feed.
-	fn spawn(command: std::process::Command, piped_stdin: bool) -> io::Result<Self> {
+	/// On Linux the decompressor gets the OOM adjustment of tool processes.
+	fn spawn(mut command: std::process::Command, piped_stdin: bool) -> io::Result<Self> {
+		crate::host::tool_process(&mut command, None, crate::host::ToolEnv::Inherited);
 		let mut command = tokio::process::Command::from(command);
 		command
 			.stdin(if piped_stdin { Stdio::piped() } else { Stdio::null() })
@@ -2334,6 +2336,78 @@ mod tests {
 	use crate::host::run_async_util;
 	#[cfg(unix)]
 	use crate::host::tree_with_sparse_file;
+
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn decompressor_and_its_child_inherit_tool_oom_score() {
+		let score = "/proc/self/oom_score_adj";
+		let Some(before) = crate::host::below_tool_score() else {
+			eprintln!("skipping: this process's OOM adjustment cannot go below 1000");
+			return;
+		};
+		let mut command = std::process::Command::new("/bin/sh");
+		command.args([
+			"-c",
+			"read -r score < /proc/self/oom_score_adj; printf '%s\\n' \"$score\"; \
+			 /bin/cat /proc/self/oom_score_adj; :",
+		]);
+		let mut child = Decompressor::spawn(command, false).unwrap();
+		let mut output = Vec::new();
+		child.stdout.as_mut().unwrap().read_to_end(&mut output).await.unwrap();
+		child.close(true).await.unwrap();
+		assert_eq!(std::fs::read_to_string(score).unwrap(), before);
+		assert_eq!(output, b"1000\n1000\n");
+	}
+
+	/// A tree holding `sample.gz`, plain text, with a `gzip` that is
+	/// `script` alone on this process's `PATH`, where rg's decompressor
+	/// spawn looks it up.
+	#[cfg(target_os = "linux")]
+	fn plain_gz_with_gzip(script: &str) -> tempfile::TempDir {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let tree = tempfile::tempdir().unwrap();
+		let bin = tree.path().join("bin");
+		std::fs::create_dir(&bin).unwrap();
+		let gzip = bin.join("gzip");
+		std::fs::write(&gzip, script).unwrap();
+		std::fs::set_permissions(&gzip, std::fs::Permissions::from_mode(0o755)).unwrap();
+		std::fs::write(tree.path().join("sample.gz"), "plain needle\n").unwrap();
+		// SAFETY: nextest runs each test in a process of its own, and no
+		// other thread of this one reads the environment yet.
+		unsafe { std::env::set_var("PATH", &bin) };
+		tree
+	}
+
+	/// Failure mode: a decompressor that cannot start (a script whose `#!`
+	/// interpreter is missing, a file without `#!` that the kernel cannot
+	/// load) is reported as a decompressor that failed, or runs as shell
+	/// code, where rg searched the file's undecoded bytes, as it does when
+	/// no decompressor is installed.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn a_decompressor_that_cannot_exec_leaves_the_undecoded_bytes_searched() {
+		for script in ["#!/nonexistent/interpreter\n", "echo decompressed needle\n"] {
+			let tree = plain_gz_with_gzip(script);
+			let (code, capture) =
+				run_async_util::<Rg>(&["--search-zip", "needle", "sample.gz"], "", tree.path()).await;
+			let err = capture.err();
+			assert_eq!((code, err.as_str()), (0, ""), "{script:?}");
+			assert_eq!(capture.out(), "plain needle\n", "{script:?}");
+		}
+	}
+
+	/// Failure mode: a decompressor that starts and exits 127 is taken for
+	/// one that could not start, and the undecoded bytes are searched.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn a_decompressor_that_exits_127_is_reported_as_failing() {
+		let tree = plain_gz_with_gzip("#!/bin/sh\nexit 127\n");
+		let (_, capture) =
+			run_async_util::<Rg>(&["--search-zip", "needle", "sample.gz"], "", tree.path()).await;
+		assert_eq!(capture.out(), "");
+		assert!(capture.err().contains("<stderr is empty>"), "{}", capture.err());
+	}
 
 	async fn run(args: &[&str], stdin: &str) -> (i32, String, String) {
 		let (code, capture) = run_async_util::<Rg>(args, stdin, "/").await;

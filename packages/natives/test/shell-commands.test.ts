@@ -39,7 +39,42 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 	}
 }
 
+const SCORE = "/proc/self/oom_score_adj";
+
+/**
+ * Whether this process can hold an OOM adjustment below 1000, the value of tool processes (Linux): a child
+ * of it tries, so this process keeps its own. A test that a tool process of this build runs starts at 1000,
+ * and an external's 1000 shows that its spawn set it only below that; the test skips where it cannot be.
+ */
+const BELOW_TOOL_SCORE =
+	process.platform === "linux" &&
+	Bun.spawnSync([
+		"/bin/sh",
+		"-c",
+		`{ read -r s < ${SCORE}; [ "$s" -lt 1000 ] || printf 999 > ${SCORE}; read -r s < ${SCORE}; [ "$s" -lt 1000 ]; } 2>/dev/null`,
+	]).exitCode === 0;
+
 describe("Shell session commands", () => {
+	it.skipIf(!BELOW_TOOL_SCORE)("sets the score of an external command and its child, not the host", async () => {
+		const original = await Bun.file(SCORE).text();
+		const lowered = original.trim() === "1000";
+		if (lowered) await Bun.write(SCORE, "999");
+		try {
+			const before = await Bun.file(SCORE).text();
+			expect(before.trim()).not.toBe("1000");
+			const { result, output } = await run(
+				new Shell(),
+				`/bin/cat ${SCORE}; /bin/sh -c 'read -r score < ${SCORE}; printf "%s\\n" "$score"; /bin/cat ${SCORE}; :'`,
+			);
+			expect(await Bun.file(SCORE).text()).toBe(before);
+			expect(result.exitCode).toBe(0);
+			expect(output).toBe("1000\n1000\n1000\n");
+		} finally {
+			// Raising the value back needs no privilege.
+			if (lowered) await Bun.write(SCORE, original);
+		}
+	});
+
 	it("passes name, argv, cwd and dash-requested stdin through the handler", async () => {
 		await withTempDir(async root => {
 			const cwd = path.join(root, "nested");

@@ -316,6 +316,7 @@
 - A long session no longer keeps every finished background job, with its full output, in memory after the job's result reaches the agent ([#20836](https://github.com/can1357/oh-my-pi/pull/20836) by [@sjawhar](https://github.com/sjawhar))
 - Skipped prompt-cache writes for one-off memory extraction and consolidation in the local memory backend ([#20783](https://github.com/can1357/oh-my-pi/pull/20783) by [@farnoy](https://github.com/farnoy))
 - Starting or resuming a session no longer prints a `Tool commands: added mcp__…` line listing every MCP tool; MCP tools mounted later are still shown ([#20643](https://github.com/can1357/oh-my-pi/pull/20643) by [@Petyok](https://github.com/Petyok)).
+- On Linux, bash tool processes and the eval tool's Python and JavaScript kernels, with the processes their cells start, are preferred over Oh My Pi when the kernel selects individual processes to kill for lack of memory (`memory.oom.group=0`); this does not protect Oh My Pi from group kills. ([#20824](https://github.com/can1357/oh-my-pi/pull/20824) by [@sjawhar](https://github.com/sjawhar))
 
 ### Removed
 
