@@ -461,11 +461,30 @@ fn shebang_less_script_fails_with_enoexec_on_both_paths() {
 /// reports an exit status instead of the OS error bash prints), fails with
 /// another error, or leaves its failed child unreaped (a zombie per
 /// failure). The exec's `EACCES`, and a working directory the child cannot
-/// enter.
+/// enter. The body runs again, alone, in a process of its own (`ALONE` set):
+/// the check for a child left asks about every child of the process, and
+/// under libtest (`cargo test`, Bazel) the other tests' children share the
+/// test's process.
 #[test]
 fn exec_and_setup_errors_fail_the_spawn_and_leave_no_child() {
 	use std::os::unix::fs::PermissionsExt;
 
+	const ALONE: &str = "PI_SHELL_FAILED_SPAWN_CHILD";
+	if std::env::var_os(ALONE).is_none() {
+		let output = std::process::Command::new(std::env::current_exe().unwrap())
+			.args([
+				"--exact",
+				"sys::spawn::unix::tests::exec_and_setup_errors_fail_the_spawn_and_leave_no_child",
+			])
+			.env(ALONE, "1")
+			.output()
+			.unwrap();
+		let out = String::from_utf8_lossy(&output.stdout);
+		let err = String::from_utf8_lossy(&output.stderr);
+		assert!(output.status.success(), "the test alone failed: {out}{err}");
+		assert!(out.contains("1 passed"), "the process ran no test: {out}");
+		return;
+	}
 	let dir = tempfile::tempdir().unwrap();
 	let plain = dir.path().join("not-executable");
 	std::fs::write(&plain, b"#!/bin/sh\nexit 0\n").unwrap();
@@ -486,7 +505,7 @@ fn exec_and_setup_errors_fail_the_spawn_and_leave_no_child() {
 			.unwrap_or_else(|| panic!("{what}: spawned"));
 		assert_eq!(err.raw_os_error(), Some(errno), "{what}: {err}");
 	}
-	// nextest runs each test in its own process: it has no other child.
+	// This process runs this test alone: it has no other child.
 	// SAFETY: plain syscall; `WNOHANG` does not wait.
 	let rc = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
 	assert_eq!(
