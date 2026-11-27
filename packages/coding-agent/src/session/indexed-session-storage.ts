@@ -68,9 +68,8 @@ export interface SessionStorageBackend {
 	 * {@link writeFull} of the UTF-8 bytes `chunks` yields, `byteLength` in all,
 	 * without holding them whole; the same size check, and the content replaced
 	 * all at once. A stream that fails, or ends short, replaces nothing.
-	 * Optional: without it the storage reads the spooled body back whole and
-	 * calls {@link writeFull}, and a full rewrite whose spool cannot be used
-	 * fails.
+	 * Optional: without it the storage passes one string to {@link writeFull}
+	 * and keeps no spool for a rewrite.
 	 */
 	writeFullStream?(
 		path: string,
@@ -175,7 +174,7 @@ interface IndexAppend {
 /**
  * A line queued on a path's append batch: its optimistic index frame, the
  * error of the writer that queued it, and its own outcome, which settles its
- * frame and its bytes of the process's queued appends ({@link appendAdmission}).
+ * frame and its bytes of its store's queued appends ({@link AppendAdmission}).
  */
 interface QueuedLine {
 	/**
@@ -211,27 +210,26 @@ function appendsChain(lines: readonly QueuedLine[]): boolean {
 const RESOLVED = Promise.resolve();
 
 /**
- * UTF-8 bytes of appended lines that every {@link IndexedSessionStorage} in
- * this process together holds queued and unsettled past which
+ * UTF-8 bytes of appended lines that one {@link IndexedSessionStorage} holds
+ * queued and unsettled, on all of its paths together, past which its
  * {@link IndexedSessionStorage.waitForAppendAdmission} waits. Not a hard
- * bound: `appendSync` queues its line whatever the queue holds, and an async
- * `append` queues its line before it waits, so the queue passes it by what
- * they add while turns wait.
+ * bound: a writer queues its line whatever the queue holds, so the queue
+ * passes it by what they add while turns wait.
  */
 const APPEND_ADMISSION_BYTES = 64 * 1024 * 1024;
 
 /**
  * How long an admission waits before it logs a warning, once: queued lines
  * that take this long to settle (a backend whose connection hangs) hold every
- * turn of the process before each model request and each tool result.
+ * turn on the store before each model request and each tool result.
  */
 const APPEND_ADMISSION_WARN_MS = 10_000;
 
 /**
- * The process's queued appends: the UTF-8 bytes of the lines every path of
- * every {@link IndexedSessionStorage} queued, each counted from when it
- * queues until its backend write settles, either way; and the admissions
- * waiting for them to fall to {@link APPEND_ADMISSION_BYTES}.
+ * One store's queued appends: the UTF-8 bytes of the lines every path of the
+ * store queued, each counted from when it queues until its backend write
+ * settles, either way; and the admissions waiting for them to fall to
+ * {@link APPEND_ADMISSION_BYTES}.
  */
 class AppendAdmission {
 	#queuedBytes = 0;
@@ -253,9 +251,13 @@ class AppendAdmission {
 		this.#waiters.clear();
 	}
 
-	/** Resolve once the queued bytes are at or under {@link APPEND_ADMISSION_BYTES}, or `signal` fires; at once when either holds now. */
-	wait(signal: AbortSignal | undefined): Promise<void> {
-		if (this.admits || signal?.aborted) return RESOLVED;
+	/**
+	 * `undefined` at once, with nothing to await, while the queued bytes are at
+	 * or under {@link APPEND_ADMISSION_BYTES} or `signal` has fired; else a
+	 * promise that resolves once either holds.
+	 */
+	wait(signal: AbortSignal | undefined): Promise<void> | undefined {
+		if (this.admits || signal?.aborted) return undefined;
 		return this.#waitFor(signal);
 	}
 
@@ -285,8 +287,6 @@ class AppendAdmission {
 		logger.debug("Session append admission waited", { queuedBytes, waitMs: Math.round(performance.now() - started) });
 	}
 }
-
-const appendAdmission = new AppendAdmission();
 
 function matchesGlobSegment(name: string, pattern: string): boolean {
 	if (pattern === "*") return true;
@@ -412,6 +412,8 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * own start, closes it, so later lines start the next batch.
 	 */
 	readonly #gathering = new Map<string, QueuedLine[]>();
+	/** This store's queued appends, which its turns wait on ({@link waitForAppendAdmission}). */
+	readonly #appendAdmission = new AppendAdmission();
 	#nextMtimeMs = 0;
 	/** Paths changed locally while each in-flight {@link refresh} read the backend. */
 	readonly #refreshWindows = new Set<Set<string>>();
@@ -524,19 +526,17 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	/**
 	 * {@link SessionStorage.waitForAppendAdmission}. A wait lasts while the
-	 * lines that every path of every `IndexedSessionStorage` in this process
-	 * has queued to append hold more than 64 MiB, each counted from when it
-	 * queues until its backend write settles, either way; a line a waiting
-	 * caller appends next is not counted, so no caller waits for capacity only
-	 * its own write would free. That is where turns start to wait, not a hard
-	 * bound: `appendSync` never waits, and `append` queues its line, then
-	 * waits. A wait that lasts 10 s logs a warning once, with the bytes queued
-	 * then (`Session append admission still waiting`); a wait that waited logs
-	 * the bytes queued when it began and how long it took (`Session append
+	 * lines that every path of this store has queued to append hold more than
+	 * 64 MiB, each counted from when it queues until its backend write
+	 * settles, either way; another store's queue never holds it. That is where
+	 * turns start to wait, not a hard bound: a writer's appends never wait. A
+	 * wait that lasts 10 s logs a warning once, with the bytes queued then
+	 * (`Session append admission still waiting`); a wait that waited logs the
+	 * bytes queued when it began and how long it took (`Session append
 	 * admission waited`).
 	 */
-	waitForAppendAdmission(signal?: AbortSignal): Promise<void> {
-		return appendAdmission.wait(signal);
+	waitForAppendAdmission(signal?: AbortSignal): Promise<void> | undefined {
+		return this.#appendAdmission.wait(signal);
 	}
 
 	writeTextSync(path: string, content: string, options?: SessionStorageWriteOptions): void {
@@ -545,21 +545,16 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Streaming {@link writeTextSync}: reads `lines` once, into a temporary
-	 * file, or, where the platform has no account ids, into compressed blocks
-	 * in memory, and publishes the body from there, so it is never one string.
-	 * When the spool cannot be used it streams the lines to the backend instead
-	 * (see {@link FullBodies.lines}). A subclass or spy that intercepts
-	 * {@link writeTextSync} still sees every full rewrite: the lines are then
-	 * joined and routed through it.
+	 * Streaming {@link writeTextSync}: for a backend with a streamed write,
+	 * reads `lines` once, into a temporary file, or, where the platform has no
+	 * account ids, into compressed blocks in memory, and publishes the body
+	 * from there, so it is never one string; when the spool cannot be used it
+	 * streams the lines to the backend instead. For one without, publishes the
+	 * joined lines (see {@link FullBodies.linesSync}).
 	 */
 	writeLinesSync(path: string, lines: Iterable<string>, options?: SessionStorageWriteOptions): void {
-		if (this.writeTextSync !== IndexedSessionStorage.prototype.writeTextSync) {
-			this.writeTextSync(path, Array.from(lines).join(""), options);
-			return;
-		}
 		this.#assertExpectedSize(path, options?.expectedSize);
-		this.#queueFullWrite(path, this.#bodies.lines(path, lines), options?.expectedSize);
+		this.#queueFullWrite(path, this.#bodies.linesSync(path, lines), options?.expectedSize);
 	}
 
 	/** Install `body` in the index and queue its publish, tracked by {@link drain}. */
@@ -751,40 +746,41 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	/**
-	 * Streaming {@link writeTextAtomic}: spools `lines` to a temporary file and
+	 * Streaming {@link writeTextAtomic}: for a backend with a streamed write,
+	 * spools `lines` to a temporary file through asynchronous writes and
 	 * publishes it from there, and after a failed publish compares the stored
-	 * bytes with the spool by size and SHA-256. When the spool cannot be used
-	 * it streams the lines to the backend instead (see {@link FullBodies.lines}). A
-	 * subclass or spy that intercepts {@link writeTextAtomic} still sees every
-	 * full rewrite: the lines are then joined and routed through it.
+	 * bytes with the spool by size and SHA-256; when the spool cannot be used
+	 * it streams the lines to the backend instead. For one without, publishes
+	 * the joined lines (see {@link FullBodies.lines}).
 	 */
 	async writeLinesAtomic(path: string, lines: Iterable<string>, options?: WriteTextAtomicOptions): Promise<void> {
-		if (this.writeTextAtomic !== IndexedSessionStorage.prototype.writeTextAtomic) {
-			return this.writeTextAtomic(path, Array.from(lines).join(""), options);
-		}
 		await this.#publishAtomic(path, options, () => this.#bodies.lines(path, lines));
 	}
 
 	/**
-	 * Publish the body `prepare` makes once the guards pass, then settle the
+	 * Publish the body `prepare` makes, prepared while the path's earlier
+	 * operations settle, once the guards pass after both; then settle the
 	 * optimistic index frame: a failed publish whose body the backend holds
-	 * anyway counts as landed.
+	 * anyway counts as landed. A body prepared at once adds no turn before the
+	 * index takes it, as one prepared off the event loop must.
 	 */
 	async #publishAtomic(
 		path: string,
 		options: WriteTextAtomicOptions | undefined,
-		prepare: () => FullBody,
+		prepare: () => FullBody | Promise<FullBody>,
 	): Promise<void> {
 		const commitGuard = options?.commitGuard;
 		if (commitGuard && !commitGuard()) return;
-		await this.#awaitPath(path);
-		// A concurrent flushSync (writeTextSync) may have taken over during the
-		// awaitPath yield and bumped the epoch. Re-check before touching the
-		// index or enqueueing the backend publish.
-		if (commitGuard && !commitGuard()) return;
-		this.#assertExpectedSize(path, options?.expectedSize);
-		const body = prepare();
+		const earlier = this.#awaitPath(path);
+		const prepared = prepare();
+		const body = prepared instanceof Promise ? await prepared : prepared;
 		try {
+			await earlier;
+			// A concurrent flushSync (writeTextSync) may have taken over while the
+			// body was prepared or during the awaitPath yield and bumped the epoch.
+			// Re-check before touching the index or enqueueing the backend publish.
+			if (commitGuard && !commitGuard()) return;
+			this.#assertExpectedSize(path, options?.expectedSize);
 			const previous = this.#index.get(path);
 			const mtimeMs = this.#allocMtimeMs();
 			this.#setIndex(path, body.byteLength, mtimeMs, body.title ?? null);
@@ -980,8 +976,8 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * Queue the publish of `line` on `path`: it joins the path's batch still
 	 * gathering lines ({@link #gathering}), or starts one, which goes to the
 	 * backend once the path's earlier operations settle. The promise is the
-	 * line's own outcome; its index frame and its bytes of the process's
-	 * queued appends ({@link appendAdmission}) settle with it.
+	 * line's own outcome; its index frame and its bytes of this store's
+	 * queued appends ({@link #appendAdmission}) settle with it.
 	 */
 	_queueAppend(path: string, line: string, append: IndexAppend, getError?: () => Error | undefined): Promise<void> {
 		const { mtimeMs } = append;
@@ -991,15 +987,15 @@ export class IndexedSessionStorage implements SessionStorage {
 		const gathering = this.#gathering.get(path);
 		if (gathering) gathering.push(queued);
 		else this.#queueBatch(path, [queued]);
-		appendAdmission.queue(bytes);
+		this.#appendAdmission.queue(bytes);
 		const settled = queued.settled.promise;
 		void settled.then(
 			() => {
-				appendAdmission.settle(bytes);
+				this.#appendAdmission.settle(bytes);
 				this.#dropFrame(path, mtimeMs);
 			},
 			() => {
-				appendAdmission.settle(bytes);
+				this.#appendAdmission.settle(bytes);
 				this.#failFrame(path, mtimeMs);
 			},
 		);
@@ -1042,7 +1038,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * one `append` each, each line settling with its own write and the first
 	 * failure failing the rest, as a path's queue fails the operations behind
 	 * a failed one. A line appended alone lets go of its text as it lands: its
-	 * bytes leave the process's queued appends then, so a later write of the
+	 * bytes leave the store's queued appends then, so a later write of the
 	 * batch that stalls keeps only the lines they still count. A batch that
 	 * fails otherwise fails every line: whether it stored them is unknown, so
 	 * none is appended again.
@@ -1305,19 +1301,11 @@ class IndexedSessionStorageWriter implements SessionStorageWriter {
 		void this.#trackPromise(this.#storage._queueAppend(this.#path, line, append, () => this.#error));
 	}
 
-	/**
-	 * Queue `line` at once, in call order, as {@link appendSync} does; resolve
-	 * once it is stored and the process's queued appends admit more
-	 * ({@link IndexedSessionStorage.waitForAppendAdmission}), so a caller that
-	 * awaits each append queues no more while the queue is past 64 MiB. A
-	 * line that fails rejects as it settles, without waiting for admission.
-	 */
 	async append(line: string): Promise<void> {
 		if (this.#closed) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
 		const append = this.#storage._appendForWriter(this.#path, line);
 		await this.#trackPromise(this.#storage._queueAppend(this.#path, line, append, () => this.#error));
-		await this.#storage.waitForAppendAdmission();
 	}
 
 	async flush(): Promise<void> {

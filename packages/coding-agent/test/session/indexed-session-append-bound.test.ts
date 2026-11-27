@@ -1,9 +1,10 @@
 /**
  * Indexed storage (`IndexedSessionStorage`, which SQL and Redis session
  * storage build on) under a backend that falls behind: a turn waits for
- * admission while every path of every store in the process together holds
- * more than 64 MiB of queued appends, the wait ends once enough of them
- * settle (or the turn is aborted), a wait that lasts 10 s logs one warning,
+ * admission while every path of its store together holds more than 64 MiB
+ * of queued appends, and never for another store's, the wait ends once
+ * enough of them settle (or the turn is aborted), a wait that lasts 10 s
+ * logs one warning, a writer's append resolves once its own line is stored,
  * and a path's lines queued behind an append in flight go to a backend that
  * has `appendBatch` in one call, the index rolling back as it does for
  * failed appends one at a time.
@@ -18,6 +19,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { logger } from "@oh-my-pi/pi-utils";
+import { MemoryBackend } from "../helpers/memory-session-backend";
 
 const MiB = 1024 * 1024;
 /** The queued append bytes past which a turn waits for admission. */
@@ -183,99 +185,181 @@ async function hasSettled(promise: Promise<unknown>): Promise<boolean> {
 	return settled;
 }
 
+/** `wait`, which a store past its threshold answers with a promise to await. */
+function pendingWait(wait: Promise<void> | undefined): Promise<void> {
+	if (!wait) throw new Error("Expected the store to make the turn wait");
+	return wait;
+}
+
 afterEach(() => {
 	vi.restoreAllMocks();
 });
 
 describe("indexed session storage bounds the appends it queues", () => {
-	it("keeps the queued append bytes of every path under the process bound: a writer that would pass it waits until earlier writes settle, and the log records the wait", async () => {
-		// If this regresses, a process whose database falls behind holds every queued transcript line in
-		// memory (159 MB of them at ten subagents), or a waiting turn never resumes after the writes drain.
+	it("shares one store's threshold among its sessions: a turn that would pass it waits until writes on any of the store's paths settle, and the log records the wait", async () => {
+		// If this regresses, a store whose database falls behind holds every queued transcript line of its
+		// sessions in memory (159 MB of them at ten subagents), or a waiting turn never resumes after the
+		// writes drain.
 		const debug = vi.spyOn(logger, "debug").mockImplementation(() => {});
 		const releases = new Releases();
-		const a = { ...(await heldStorage(releases)), paths: ["/s/a.jsonl", "/s/d.jsonl"] };
-		const b = { ...(await heldStorage(releases)), paths: ["/s/b.jsonl", "/s/c.jsonl"] };
-		// The session manager's synchronous writes, which never wait, queue 70 MiB on two stores.
-		const writerA = a.storage.openWriter("/s/a.jsonl");
-		const writerB = b.storage.openWriter("/s/b.jsonl");
+		const store = {
+			...(await heldStorage(releases)),
+			paths: ["/s/a.jsonl", "/s/b.jsonl", "/s/c.jsonl", "/s/d.jsonl"],
+		};
+		// The session manager's synchronous writes, which never wait, queue 70 MiB on two of the store's
+		// paths, each under the threshold alone.
+		const writerA = store.storage.openWriter("/s/a.jsonl");
+		const writerB = store.storage.openWriter("/s/b.jsonl");
 		for (let n = 0; n < 40; n++) writerA.appendSync?.(MIB_LINE);
 		for (let n = 0; n < 30; n++) writerB.appendSync?.(MIB_LINE);
-		// Two sessions run three turns each: a turn waits for admission, then appends a line with the async
-		// writer, which resolves once the line is stored and the bound admits more.
-		const turns = async (storage: IndexedSessionStorage, path: string): Promise<void> => {
-			const writer = storage.openWriter(path);
+		// Two more sessions on the store run three turns each: a turn waits for admission, then appends a
+		// line with the async writer, which resolves once the line is stored.
+		let stopTurns = false;
+		const turns = async (path: string): Promise<void> => {
+			const writer = store.storage.openWriter(path);
 			for (let turn = 0; turn < 3; turn++) {
-				await storage.waitForAppendAdmission();
+				await store.storage.waitForAppendAdmission();
+				if (stopTurns) return;
 				await writer.append(MIB_LINE);
 			}
 		};
-		const sessions = Promise.all([turns(b.storage, "/s/c.jsonl"), turns(a.storage, "/s/d.jsonl")]);
-		const queuedAt = () => ({ c: b.storage.existsSync("/s/c.jsonl"), d: a.storage.existsSync("/s/d.jsonl") });
-		expect({ ...measure([a, b]), waiting: queuedAt() }).toEqual({
-			indexed: 70 * MiB,
-			queued: 70 * MiB,
-			waiting: { c: false, d: false },
-		});
+		const turnsInFlight = [turns("/s/c.jsonl"), turns("/s/d.jsonl")];
+		const sessions = Promise.all(turnsInFlight);
+		const queuedAt = () => ({ c: store.storage.existsSync("/s/c.jsonl"), d: store.storage.existsSync("/s/d.jsonl") });
+		try {
+			expect({ ...measure([store]), waiting: queuedAt() }).toEqual({
+				indexed: 70 * MiB,
+				queued: 70 * MiB,
+				waiting: { c: false, d: false },
+			});
 
-		// Release the held writes one at a time, all 76. A step that admits nothing only lowers the queue by
-		// the write it settled; a step that admits lines admits them only once the queue is at or under the
-		// bound, so what queues past it is what that step admitted.
-		const steps: Array<{ before: number; queued: number; admitted: number }> = [];
-		let { indexed: indexedBefore, queued: queuedBefore } = measure([a, b]);
-		let firstAdmission: { step: number; waiting: { c: boolean; d: boolean } } | undefined;
-		for (let step = 1; step <= 76; step++) {
-			await releases.releaseOne();
-			const { indexed, queued } = measure([a, b]);
-			steps.push({ before: queuedBefore, queued, admitted: indexed - indexedBefore });
-			if (!firstAdmission && indexed > indexedBefore) firstAdmission = { step, waiting: queuedAt() };
-			indexedBefore = indexed;
-			queuedBefore = queued;
+			// Release the held writes one at a time, all 76. A step that admits nothing only lowers the queue by
+			// the write it settled; a step that admits lines admits them only once the queue is at or under the
+			// threshold, so what queues past it is what that step admitted.
+			const steps: Array<{ before: number; queued: number; admitted: number }> = [];
+			let { indexed: indexedBefore, queued: queuedBefore } = measure([store]);
+			let firstAdmission: { step: number; waiting: { c: boolean; d: boolean } } | undefined;
+			for (let step = 1; step <= 76; step++) {
+				await releases.releaseOne();
+				const { indexed, queued } = measure([store]);
+				steps.push({ before: queuedBefore, queued, admitted: indexed - indexedBefore });
+				if (!firstAdmission && indexed > indexedBefore) firstAdmission = { step, waiting: queuedAt() };
+				indexedBefore = indexed;
+				queuedBefore = queued;
+			}
+			await sessions;
+			expect(
+				steps.filter(step =>
+					step.admitted === 0 ? step.queued !== step.before - MiB : step.queued - step.admitted > BOUND,
+				),
+			).toEqual([]);
+			// The sixth write that settles brings the queue to the threshold: both waiting turns are admitted
+			// together, and from then on the queue peaks at the threshold plus their 2 MiB.
+			expect({
+				firstAdmission,
+				peak: Math.max(...steps.slice((firstAdmission?.step ?? 1) - 1).map(step => step.queued)),
+				stored: Object.fromEntries([...store.backend.stored].map(([path, lines]) => [path, lines.length])),
+				queued: queuedBytes([store]),
+			}).toEqual({
+				firstAdmission: { step: 6, waiting: { c: true, d: true } },
+				peak: BOUND + 2 * MiB,
+				stored: { "/s/a.jsonl": 40, "/s/b.jsonl": 30, "/s/c.jsonl": 3, "/s/d.jsonl": 3 },
+				queued: 0,
+			});
+			// Each wait logs the bytes queued when it began, past the threshold, and how long it took: the first
+			// two are the sessions' first turns, which began at 70 MiB.
+			const waits = admissionWaits(debug);
+			expect({
+				first: waits.slice(0, 2),
+				pastBound: waits.every(
+					wait =>
+						typeof wait === "object" &&
+						wait !== null &&
+						"queuedBytes" in wait &&
+						Number(wait.queuedBytes) > BOUND,
+				),
+			}).toEqual({
+				first: [
+					{ queuedBytes: 70 * MiB, waitMs: expect.any(Number) },
+					{ queuedBytes: 70 * MiB, waitMs: expect.any(Number) },
+				],
+				pastBound: true,
+			});
+		} finally {
+			stopTurns = true;
+			const drained = Promise.allSettled(turnsInFlight).then(() => store.storage.drain());
+			await releases.releaseUntil(drained);
+			await drained;
 		}
-		await sessions;
-		expect(
-			steps.filter(step =>
-				step.admitted === 0 ? step.queued !== step.before - MiB : step.queued - step.admitted > BOUND,
-			),
-		).toEqual([]);
-		// The sixth write that settles brings the queue to the bound: both waiting turns are admitted
-		// together, and from then on the queue peaks at the bound plus their 2 MiB.
-		expect({
-			firstAdmission,
-			peak: Math.max(...steps.slice((firstAdmission?.step ?? 1) - 1).map(step => step.queued)),
-			stored: [a.backend, b.backend].map(backend => [...backend.stored.values()].map(lines => lines.length)),
-			queued: queuedBytes([a, b]),
-		}).toEqual({
-			firstAdmission: { step: 6, waiting: { c: true, d: true } },
-			peak: BOUND + 2 * MiB,
-			stored: [
-				[40, 3],
-				[30, 3],
-			],
-			queued: 0,
-		});
-		// Each wait logs the bytes queued when it began, past the bound, and how long it took: the first
-		// two are the sessions' first turns, which began at 70 MiB.
-		const waits = admissionWaits(debug);
-		expect({
-			first: waits.slice(0, 2),
-			pastBound: waits.every(
-				wait =>
-					typeof wait === "object" && wait !== null && "queuedBytes" in wait && Number(wait.queuedBytes) > BOUND,
-			),
-		}).toEqual({
-			first: [
-				{ queuedBytes: 70 * MiB, waitMs: expect.any(Number) },
-				{ queuedBytes: 70 * MiB, waitMs: expect.any(Number) },
-			],
-			pastBound: true,
-		});
-		await Promise.all([a.storage.drain(), b.storage.drain()]);
 	});
 
-	it("keeps a writer's lines in call order past the bound: append(A) then appendSync(B) store A then B, and append(A) resolves only once admitted", async () => {
+	it("never holds a store's turns or appends for another store's backlog", async () => {
+		// If this regresses, one store whose backend hangs (a dropped Redis connection, a locked SQL row)
+		// stalls every turn and every awaited append of the process, sessions on healthy stores included.
+		vi.spyOn(logger, "debug").mockImplementation(() => {});
+		const releases = new Releases();
+		const hung = { ...(await heldStorage(releases)), paths: ["/s/hung.jsonl"] };
+		const hungWriter = hung.storage.openWriter("/s/hung.jsonl");
+		for (let n = 0; n < 65; n++) hungWriter.appendSync?.(MIB_LINE);
+		const healthyBackend = new MemoryBackend();
+		const healthy = new IndexedSessionStorage(healthyBackend);
+		await healthy.initialize();
+		const hungTurn = pendingWait(hung.storage.waitForAppendAdmission());
+		const appended = healthy.openWriter("/s/healthy.jsonl").append(MIB_LINE);
+		try {
+			expect({
+				hungTurnSettled: await hasSettled(hungTurn),
+				healthyTurn: healthy.waitForAppendAdmission(),
+				healthyAppendSettled: await hasSettled(appended),
+				healthyStored: healthyBackend.sessions.get("/s/healthy.jsonl"),
+			}).toEqual({
+				hungTurnSettled: false,
+				healthyTurn: undefined,
+				healthyAppendSettled: true,
+				healthyStored: MIB_LINE,
+			});
+		} finally {
+			const drained = hung.storage.drain();
+			await releases.releaseUntil(drained);
+			await drained;
+			await appended;
+		}
+	});
+
+	it("answers at once, with nothing to await, while the store is at or under its threshold", async () => {
+		// If this regresses, every tool result and model request on indexed storage takes an extra promise hop
+		// even when nothing is queued, or a turn past the threshold no longer waits.
+		vi.spyOn(logger, "debug").mockImplementation(() => {});
+		const releases = new Releases();
+		const session = { ...(await heldStorage(releases)), paths: ["/s/at.jsonl"] };
+		const writer = session.storage.openWriter("/s/at.jsonl");
+		const idle = session.storage.waitForAppendAdmission();
+		for (let n = 0; n < 64; n++) writer.appendSync?.(MIB_LINE);
+		const atThreshold = session.storage.waitForAppendAdmission();
+		writer.appendSync?.(MIB_LINE);
+		const past = session.storage.waitForAppendAdmission();
+		try {
+			expect({ idle, atThreshold, pastIsPromise: past instanceof Promise }).toEqual({
+				idle: undefined,
+				atThreshold: undefined,
+				pastIsPromise: true,
+			});
+			await releases.releaseOne();
+			await past;
+			expect(session.storage.waitForAppendAdmission()).toBeUndefined();
+		} finally {
+			const drained = session.storage.drain();
+			await releases.releaseUntil(drained);
+			await drained;
+		}
+	});
+
+	it("keeps a writer's lines in call order past the threshold: append(A) then appendSync(B) store A then B, and append(A) resolves once A is stored", async () => {
 		// If this regresses, a title change the session manager appends with the async writer while the
 		// database falls behind lands after the entries it wrote synchronously after it, so the stored
-		// transcript's order differs from the session's; or the async append no longer holds its caller back.
+		// transcript's order differs from the session's; or the async append, which the session manager
+		// awaits on its serial disk queue, waits for the store's whole backlog after its own line is stored,
+		// and every flush, dispose and rewrite queued behind it waits too.
 		const debug = vi.spyOn(logger, "debug").mockImplementation(() => {});
 		const releases = new Releases();
 		const store = { ...(await heldStorage(releases)), paths: ["/s/other.jsonl", "/s/order.jsonl"] };
@@ -290,44 +374,42 @@ describe("indexed session storage bounds the appends it queues", () => {
 			settled: false,
 		});
 
-		// The other path's first line, then A, are stored: the queue is still past the bound, so append(A) waits.
+		// The other path's first line, then A, are stored: the store is still past the threshold, and
+		// append(A) has resolved all the same.
 		await releases.releaseOne();
 		await releases.releaseOne();
 		expect({
 			stored: store.backend.stored.get("/s/order.jsonl"),
 			queued: queuedBytes([store]),
 			settled: await hasSettled(appendA),
-		}).toEqual({ stored: ["A\n"], queued: 64 * MiB + 2, settled: false });
-		// One more write settles: the queue is under the bound, and append(A) resolves.
-		await releases.releaseOne();
-		expect(await hasSettled(appendA)).toBe(true);
+		}).toEqual({ stored: ["A\n"], queued: 64 * MiB + 2, settled: true });
 
 		await releases.releaseUntil(Promise.all([writer.flush(), other.flush()]));
 		expect({ stored: store.backend.stored.get("/s/order.jsonl"), waits: admissionWaits(debug) }).toEqual({
 			stored: ["A\n", "B\n"],
-			waits: [{ queuedBytes: 64 * MiB + 2, waitMs: expect.any(Number) }],
+			waits: [],
 		});
 		await store.storage.drain();
 	});
 
 	it("never waits on capacity that only its own later writes would free", async () => {
-		// If this regresses, a session whose own transcript lines fill the bound stalls its next turn until
-		// more of the queue drains than the bound asks for, or its append waits on capacity only the line
-		// it appends would free.
+		// If this regresses, a session whose own transcript lines fill the threshold stalls its next turn
+		// until more of the queue drains than the threshold asks for, or its append waits on capacity only
+		// the line it appends would free.
 		const debug = vi.spyOn(logger, "debug").mockImplementation(() => {});
 		const releases = new Releases();
 		const session = { ...(await heldStorage(releases)), paths: ["/s/own.jsonl"] };
 		const writer = session.storage.openWriter("/s/own.jsonl");
-		// The session's own earlier writes fill the bound.
+		// The session's own earlier writes fill the threshold.
 		for (let n = 0; n < 65; n++) writer.appendSync?.(MIB_LINE);
-		// Its next turn waits only for those writes: once one settles the queue is at the bound, and it goes on.
-		const turn = session.storage.waitForAppendAdmission();
+		// Its next turn waits only for those writes: once one settles the queue is at the threshold, and it goes on.
+		const turn = pendingWait(session.storage.waitForAppendAdmission());
 		expect(await hasSettled(turn)).toBe(false);
 		await releases.releaseOne();
 		expect(await hasSettled(turn)).toBe(true);
 
-		// Its next line, 10 MiB, queues at once behind the rest of its own lines, past the bound. The append
-		// waits for that line alone: once the line is stored nothing it waits on is left, and it resolves.
+		// Its next line, 10 MiB, queues at once behind the rest of its own lines, past the threshold. The
+		// append resolves once that line is stored, as the last of the queue.
 		const ownLine = `${"y".repeat(10 * MiB - 1)}\n`;
 		const own = writer.append(ownLine);
 		expect({ size: session.storage.statSync("/s/own.jsonl").size, queued: queuedBytes([session]) }).toEqual({
@@ -358,16 +440,17 @@ describe("indexed session storage bounds the appends it queues", () => {
 		for (let n = 0; n < 65; n++) writer.appendSync?.(MIB_LINE);
 
 		const turn = new AbortController();
-		const wait = session.storage.waitForAppendAdmission(turn.signal);
-		const unbounded = session.storage.waitForAppendAdmission();
+		const wait = pendingWait(session.storage.waitForAppendAdmission(turn.signal));
+		const unbounded = pendingWait(session.storage.waitForAppendAdmission());
 		expect(await hasSettled(wait)).toBe(false);
 		turn.abort();
 		await expect(wait).resolves.toBeUndefined();
-		// A signal that fired already ends a new wait at once; a wait without one still waits.
+		// A signal that fired already answers a new wait at once, with nothing to await; a wait without
+		// one still waits.
 		expect({
-			aborted: await hasSettled(session.storage.waitForAppendAdmission(turn.signal)),
+			aborted: session.storage.waitForAppendAdmission(turn.signal),
 			unbounded: await hasSettled(unbounded),
-		}).toEqual({ aborted: true, unbounded: false });
+		}).toEqual({ aborted: undefined, unbounded: false });
 		expect(admissionWaits(debug)).toEqual([{ queuedBytes: 65 * MiB, waitMs: expect.any(Number) }]);
 
 		await releases.releaseUntil(Promise.all([unbounded, writer.flush()]));
@@ -375,7 +458,7 @@ describe("indexed session storage bounds the appends it queues", () => {
 	});
 
 	it("logs one warning once an admission has waited 10 s, with the bytes queued, and none for a wait that ends sooner", async () => {
-		// If this regresses, a backend whose connection hangs stops every turn of the process at its next
+		// If this regresses, a backend whose connection hangs stops every turn on its store at the next
 		// model request with nothing in the log until the turn is aborted, or the log takes a line per wait.
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		vi.spyOn(logger, "debug").mockImplementation(() => {});
@@ -391,7 +474,7 @@ describe("indexed session storage bounds the appends it queues", () => {
 
 		vi.useFakeTimers();
 		try {
-			const slow = session.storage.waitForAppendAdmission();
+			const slow = pendingWait(session.storage.waitForAppendAdmission());
 			vi.advanceTimersByTime(9_999);
 			const before = stillWaiting();
 			vi.advanceTimersByTime(1);
@@ -403,7 +486,7 @@ describe("indexed session storage bounds the appends it queues", () => {
 
 			// Past 64 MiB again: this wait ends after 5 s, and its warning never comes.
 			writer.appendSync?.(MIB_LINE);
-			const fast = session.storage.waitForAppendAdmission();
+			const fast = pendingWait(session.storage.waitForAppendAdmission());
 			vi.advanceTimersByTime(5_000);
 			await releases.releaseOneNow();
 			await fast;
@@ -411,7 +494,7 @@ describe("indexed session storage bounds the appends it queues", () => {
 			expect(stillWaiting()).toEqual([warning]);
 		} finally {
 			vi.useRealTimers();
-			// Other tests share the process's queued appends: leave none behind, also when this one fails.
+			// Leave none of this store's appends held, also when this test fails.
 			await releases.releaseUntil(writer.flush());
 			await session.storage.drain();
 		}
@@ -443,7 +526,7 @@ describe("indexed session storage bounds the appends it queues", () => {
 			// The stalled line, not the 39 that landed (40 MiB in all).
 			expect(heapBytes() - before).toBeLessThan(8 * MiB);
 		} finally {
-			// Other tests share the process's queued appends: leave none behind, also when this one fails.
+			// Leave none of this store's appends held, also when this test fails.
 			await releases.releaseUntil(writer.flush());
 			await storage.drain();
 		}

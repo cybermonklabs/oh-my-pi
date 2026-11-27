@@ -1,5 +1,5 @@
 /**
- * The file `openPrivateTempFile` opens, as the older-entry store and the
+ * The file `openPrivateTempFileSync` opens, as the older-entry store and the
  * rewrite spool hold it: its descriptor serves until the file is closed, and
  * only the first close closes it, since after it the process can give the
  * number to another file.
@@ -7,7 +7,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
-import { openPrivateTempFile } from "@oh-my-pi/pi-coding-agent/utils/owner-private-dir";
+import { openPrivateTempFileSync } from "@oh-my-pi/pi-coding-agent/utils/owner-private-dir";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 afterEach(() => {
@@ -19,7 +19,7 @@ function openUnder(tmp: TempDir) {
 	vi.spyOn(os, "tmpdir").mockReturnValue(tmp.path());
 	const uid = process.getuid?.();
 	if (uid === undefined) throw new Error("This platform gives no account id");
-	return openPrivateTempFile("probe", uid, "Probe directory");
+	return openPrivateTempFileSync("probe", uid, "Probe directory");
 }
 
 describe.skipIf(process.getuid === undefined)("a private temporary file", () => {

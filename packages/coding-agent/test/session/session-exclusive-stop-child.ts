@@ -53,6 +53,7 @@ const scripted = storage as unknown as {
 	sessionClaimLost: SessionStorage["sessionClaimLost"];
 	sessionClaimHolder: SessionStorage["sessionClaimHolder"];
 	writeTextAtomic: SessionStorage["writeTextAtomic"];
+	writeLinesAtomic: SessionStorage["writeLinesAtomic"];
 };
 scripted.claimSession = (_sessionId, _sessionPath, options) => {
 	if (!held) return null;
@@ -66,17 +67,23 @@ scripted.sessionClaimHolder = async () => {
 	await Bun.sleep(1500);
 	return undefined;
 };
-/** Refuse the next atomic publish (SQL storage publishes a whole body with `writeTextAtomic`) with `error`, once. */
+/**
+ * Refuse the next atomic publish (SQL storage publishes a rewrite's lines with `writeLinesAtomic`, a whole
+ * body with `writeTextAtomic`) with `error`, once.
+ */
 const refuseNextAtomicPublish = (error: Error): void => {
 	const publish = storage.writeTextAtomic.bind(storage);
+	const publishLines = storage.writeLinesAtomic.bind(storage);
 	let refused = false;
-	scripted.writeTextAtomic = (target, content, options) => {
-		if (!refused) {
-			refused = true;
-			return Promise.reject(error);
-		}
-		return publish(target, content, options);
+	const refuses = (): boolean => {
+		if (refused) return false;
+		refused = true;
+		return true;
 	};
+	scripted.writeTextAtomic = (target, content, options) =>
+		refuses() ? Promise.reject(error) : publish(target, content, options);
+	scripted.writeLinesAtomic = (target, lines, options) =>
+		refuses() ? Promise.reject(error) : publishLines(target, lines, options);
 };
 
 const manager = await SessionManager.open(file, sessions, storage, { suppressBreadcrumb: true });

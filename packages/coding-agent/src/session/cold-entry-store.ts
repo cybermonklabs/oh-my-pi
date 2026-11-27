@@ -7,7 +7,7 @@
 import * as fs from "node:fs";
 import { logger } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
-import { openPrivateTempFile, type PrivateTempFile } from "../utils/owner-private-dir";
+import { openPrivateTempFileSync, type PrivateTempFile } from "../utils/owner-private-dir";
 import { BLOCK_ZSTD_LEVEL } from "./block-zstd-level";
 import type { BlobStore } from "./blob-store";
 import type { SessionEntry } from "./session-entries";
@@ -185,7 +185,7 @@ export class ColdEntryStore {
 
 	/**
 	 * A new store: over a file under `os.tmpdir()/omp-cold-<uid>/`, a directory
-	 * that account `uid` owns alone (`openPrivateTempFile`), or in memory where
+	 * that account `uid` owns alone (`openPrivateTempFileSync`), or in memory where
 	 * the account id cannot be read (Windows) and where its file cannot be made
 	 * (`os.tmpdir()` read-only, under a regular file, full, out of descriptors,
 	 * or its directory not one the account owns alone), which last is logged
@@ -198,7 +198,7 @@ export class ColdEntryStore {
 		const uid = process.getuid?.();
 		if (uid === undefined) return new ColdEntryStore(blobs, undefined);
 		try {
-			return new ColdEntryStore(blobs, openPrivateTempFile("cold", uid, "Older session entry store directory"));
+			return new ColdEntryStore(blobs, openPrivateTempFileSync("cold", uid, "Older session entry store directory"));
 		} catch (error) {
 			if (!openFailureLogged) {
 				openFailureLogged = true;

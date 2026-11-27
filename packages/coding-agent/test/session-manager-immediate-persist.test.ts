@@ -84,21 +84,31 @@ function entryKind(entry: Record<string, unknown>): string {
 }
 
 /**
- * Runs `action` and returns how many bytes node:fs's synchronous writers wrote meanwhile into the file with inode
- * `ino`. A write counts against the file its target names when the call starts: bytes staged in a new file that is
- * then renamed over the path do not count, which the caller's inode check covers.
+ * Runs `action` and returns how many bytes node:fs's synchronous writers (`writeSync`, `writevSync`, `writeFileSync`,
+ * `appendFileSync`) and `Bun.write()` wrote meanwhile into the file with inode `ino`. A write counts against the file
+ * its target names when the call starts: bytes staged in a new file that is then renamed over the path do not count,
+ * which the caller's inode check covers.
  */
 async function bytesWrittenInto(ino: number, action: () => Promise<void>): Promise<number> {
 	let bytes = 0;
-	const targetsFile = (target: fs.PathOrFileDescriptor): boolean => {
+	const targetsFile = (target: unknown): boolean => {
 		try {
-			return (typeof target === "number" ? fs.fstatSync(target) : fs.statSync(target)).ino === ino;
+			if (typeof target === "number") return fs.fstatSync(target).ino === ino;
+			if (typeof target === "string" || target instanceof URL || Buffer.isBuffer(target)) {
+				return fs.statSync(target).ino === ino;
+			}
+			// A `Bun.file(path)` destination names its path.
+			if (target instanceof Blob && "name" in target && typeof target.name === "string") {
+				return fs.statSync(target.name).ino === ino;
+			}
+			return false;
 		} catch {
 			return false;
 		}
 	};
 	const writeSync = fs.writeSync as (fd: number, ...rest: unknown[]) => number;
 	const { writevSync, writeFileSync, appendFileSync } = fs;
+	const bunWrite = Bun.write.bind(Bun) as (destination: unknown, ...rest: unknown[]) => Promise<number>;
 	const spies = [
 		spyOn(fs, "writeSync").mockImplementation((fd: number, ...rest: unknown[]) => {
 			const counted = targetsFile(fd);
@@ -119,6 +129,12 @@ async function bytesWrittenInto(ino: number, action: () => Promise<void>): Promi
 		spyOn(fs, "appendFileSync").mockImplementation((file, data, options) => {
 			if (targetsFile(file)) bytes += typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
 			appendFileSync(file, data, options);
+		}),
+		spyOn(Bun, "write").mockImplementation(async (destination: unknown, ...rest: unknown[]) => {
+			const counted = targetsFile(destination);
+			const written = await bunWrite(destination, ...rest);
+			if (counted) bytes += written;
+			return written;
 		}),
 	];
 	try {

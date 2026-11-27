@@ -4,7 +4,8 @@
  * the scenario, the directory that stands for `os.tmpdir()`, and a session
  * file whose compaction leaves entries before its cut. Resumes the session
  * twice with the older-entry store and rewrites one store's session twice
- * through the spool, then prints, as JSON, what each resume kept and read
+ * through the spool, once atomically and once synchronously, then prints, as
+ * JSON, what each resume kept and read
  * back, the files opened under that directory, and the warnings logged
  * ({@link OlderBodiesProbeResult}). Two scenarios change what the process
  * reads as its account id: `no-account-id` reads none, as on Windows, and
@@ -48,11 +49,20 @@ spyOn(logger, "warn").mockImplementation(message => {
 	warnings.push(message);
 });
 const opened: string[] = [];
+// An atomic rewrite opens its spool with `fs.open`; a synchronous one, and the older-entry store, with `fs.openSync`.
+const noteOpen = (target: fs.PathLike): void => {
+	if (String(target).startsWith(`${tmp}${path.sep}`)) opened.push(path.relative(tmp, String(target)));
+};
 const openSync = fs.openSync;
 spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
-	if (String(target).startsWith(`${tmp}${path.sep}`)) opened.push(path.relative(tmp, String(target)));
+	noteOpen(target);
 	return Reflect.apply(openSync, fs, [target, ...rest]);
 }) as typeof fs.openSync);
+const openAsync = fs.open;
+spyOn(fs, "open").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+	noteOpen(target);
+	return Reflect.apply(openAsync, fs, [target, ...rest]);
+}) as typeof fs.open);
 
 const open = (coldStore: boolean): Promise<SessionManager> =>
 	SessionManager.open(file, undefined, new FileSessionStorage(), { suppressBreadcrumb: true, coldStore });
@@ -72,9 +82,10 @@ const lines = (await Bun.file(file).text()).split(/(?<=\n)/);
 const backend = new StreamingMemoryBackend();
 const storage = new IndexedSessionStorage(backend);
 await storage.initialize();
-for (const target of ["/sessions/one.jsonl", "/sessions/two.jsonl"]) {
-	await storage.writeLinesAtomic(target, lines, { expectedSize: null });
-}
+// One rewrite through each opener: the atomic one opens its spool asynchronously, the synchronous one does not.
+await storage.writeLinesAtomic("/sessions/one.jsonl", lines, { expectedSize: null });
+storage.writeLinesSync("/sessions/two.jsonl", lines, { expectedSize: null });
+await storage.drain();
 const rewritesStored = [...backend.sessions.values()].map(text => text === lines.join(""));
 
 const result: OlderBodiesProbeResult = {

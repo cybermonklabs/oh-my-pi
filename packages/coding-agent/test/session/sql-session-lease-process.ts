@@ -207,6 +207,9 @@ async function contest(file: string): Promise<() => Promise<void>> {
 		if (path.resolve(target) === path.resolve(file)) await foreign();
 		return publish(target, content, options);
 	};
+	// A full rewrite of lines takes the same hook, as one joined body.
+	storage.writeLinesAtomic = (target, lines, options) =>
+		storage.writeTextAtomic(target, Array.from(lines).join(""), options);
 	return foreign;
 }
 

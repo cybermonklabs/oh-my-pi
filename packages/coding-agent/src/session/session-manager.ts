@@ -5708,9 +5708,9 @@ export class SessionManager {
 	}
 
 	/**
-	 * The storage's {@link SessionStorage.waitForAppendAdmission}: settles once this process may queue more
-	 * transcript appends, or at once when `signal` fires. `undefined` when the storage never makes turns wait on
-	 * queued appends, so a caller has nothing to wait for.
+	 * The storage's {@link SessionStorage.waitForAppendAdmission}: settles once the storage may queue more
+	 * transcript appends, or at once when `signal` fires. `undefined` when there is nothing to wait for: the
+	 * storage admits more now, or never makes turns wait on queued appends.
 	 */
 	waitForAppendAdmission(signal?: AbortSignal): Promise<void> | undefined {
 		return this.#storage.waitForAppendAdmission?.(signal);

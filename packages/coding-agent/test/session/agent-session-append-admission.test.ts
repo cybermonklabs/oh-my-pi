@@ -1,8 +1,9 @@
 /**
- * A session storage that bounds this process's queued transcript appends
+ * A session storage that bounds its queued transcript appends
  * (`SessionStorage.waitForAppendAdmission`) holds an agent turn before each
  * model request and before the loop appends each tool result, and an abort
- * ends that wait at once.
+ * ends that wait at once. A storage under its threshold, or one that never
+ * makes turns wait, hands the turn nothing to await.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
@@ -13,10 +14,16 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { IndexedSessionStorage } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import {
+	FileSessionStorage,
+	MemorySessionStorage,
+	type SessionStorage,
+} from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { MemoryBackend } from "../helpers/memory-session-backend";
 
 const CALL_ID = "toolu_append_admission";
 const TOOL_OUTPUT = [{ type: "text" as const, text: "fixture contents" }];
@@ -108,7 +115,7 @@ describe("AgentSession waits for its storage's append admission", () => {
 	});
 
 	/** A session over `storage` whose scripted model calls one tool, then answers. */
-	function startSession(storage: MemorySessionStorage): {
+	function startSession(storage: SessionStorage): {
 		session: AgentSession;
 		sessionManager: SessionManager;
 		mock: MockModel;
@@ -146,6 +153,36 @@ describe("AgentSession waits for its storage's append admission", () => {
 		sessions.push(session);
 		return { session, sessionManager, mock, toolRuns: () => toolRuns };
 	}
+
+	it("hands a tool result back with nothing to await on storage that never waits, and on indexed storage under its threshold", async () => {
+		// If this regresses, every model request and tool result of a session on file storage, or on indexed
+		// storage with nothing queued, goes through an admission promise and an extra await hop.
+		const indexed = new IndexedSessionStorage(new MemoryBackend());
+		await indexed.initialize();
+		const observed: Record<string, { admission: Promise<void> | undefined; afterToolCall: string[] }> = {};
+		for (const [name, storage] of [
+			["file", new FileSessionStorage()],
+			["indexed", indexed],
+		] as const) {
+			const { session, sessionManager } = startSession(storage);
+			const afterToolCall = session.agent.afterToolCall;
+			if (!afterToolCall) throw new Error("Expected the session's afterToolCall hook");
+			const returned: string[] = [];
+			session.agent.afterToolCall = (ctx, signal) => {
+				const result = afterToolCall(ctx, signal);
+				returned.push(result instanceof Promise ? "promise" : "value");
+				return result;
+			};
+			await session.prompt("read the fixture");
+			await session.waitForIdle();
+			expect(savedToolResults(sessionManager)).toEqual([{ content: TOOL_OUTPUT, isError: false }]);
+			observed[name] = { admission: sessionManager.waitForAppendAdmission(), afterToolCall: returned };
+		}
+		expect(observed).toEqual({
+			file: { admission: undefined, afterToolCall: ["value"] },
+			indexed: { admission: undefined, afterToolCall: ["value"] },
+		});
+	});
 
 	it("waits for the storage's append admission before each model request and before it appends each tool result", async () => {
 		// If this regresses, a process whose SQL store falls behind keeps sending model requests and

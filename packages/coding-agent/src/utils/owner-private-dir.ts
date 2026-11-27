@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -27,14 +28,13 @@ export function ownerPrivateDirError(stat: OwnerPrivateDirStat, expectedUid: num
 }
 
 /**
- * Throw unless `dir`, read with `lstat`, is a directory (not a link to one)
- * that account `uid` owns with mode 0700: `mkdirSync` takes a directory that
- * exists as it is, which another account could have made first, or left open
- * to others. Unlike {@link assertOwnerPrivateDir} it changes nothing, so a
- * caller that cannot use the directory can go without it.
+ * Throw unless `stat`, `dir` read with `lstat`, is of a directory (not a link
+ * to one) that account `uid` owns with mode 0700: `mkdir` takes a directory
+ * that exists as it is, which another account could have made first, or left
+ * open to others. Unlike {@link assertOwnerPrivateDir} it changes nothing, so
+ * a caller that cannot use the directory can go without it.
  */
-function assertAccountPrivateDir(dir: string, uid: number, label: string): void {
-	const stat = fs.lstatSync(dir);
+function assertAccountPrivateDir(dir: string, stat: fs.Stats, uid: number, label: string): void {
 	const reason = ownerPrivateDirError(
 		{ isSymlink: stat.isSymbolicLink(), isDir: stat.isDirectory(), uid: stat.uid, mode: stat.mode },
 		uid,
@@ -53,12 +53,13 @@ export function privateTempDir(prefix: string, uid: number): string {
 }
 
 /**
- * A file {@link openPrivateTempFile} opened, read and written through its
- * descriptor until {@link close}. After the close the process can give the
- * number to another file, whose bytes a read would take for this file's, so
- * {@link fd} throws from then on and only the first close closes it. Only
- * {@link openPrivateTempFile} makes one, so the class is exported as a type:
- * no other module can wrap a descriptor of its own as a private file.
+ * A file {@link openPrivateTempFile} or {@link openPrivateTempFileSync}
+ * opened, read and written through its descriptor until {@link close}. After
+ * the close the process can give the number to another file, whose bytes a
+ * read would take for this file's, so {@link fd} throws from then on and only
+ * the first close closes it. Only those two make one, so the class is
+ * exported as a type: no other module can wrap a descriptor of its own as a
+ * private file.
  */
 class PrivateTempFile {
 	readonly #fd: number;
@@ -105,10 +106,10 @@ export type { PrivateTempFile };
  *
  * @param label Human-readable directory role prefixed to a refusal's message.
  */
-export function openPrivateTempFile(prefix: string, uid: number, label: string): PrivateTempFile {
+export function openPrivateTempFileSync(prefix: string, uid: number, label: string): PrivateTempFile {
 	const dir = privateTempDir(prefix, uid);
 	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-	assertAccountPrivateDir(dir, uid, label);
+	assertAccountPrivateDir(dir, fs.lstatSync(dir), uid, label);
 	const file = path.join(dir, `${process.pid}-${crypto.randomUUID()}`);
 	const fd = fs.openSync(file, "wx+", 0o600);
 	try {
@@ -119,6 +120,33 @@ export function openPrivateTempFile(prefix: string, uid: number, label: string):
 		throw error;
 	}
 	return new PrivateTempFile(fd);
+}
+
+/** {@link openPrivateTempFileSync} through asynchronous calls, which leave the event loop free while they run. */
+export async function openPrivateTempFile(prefix: string, uid: number, label: string): Promise<PrivateTempFile> {
+	const dir = privateTempDir(prefix, uid);
+	await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+	assertAccountPrivateDir(dir, await fsp.lstat(dir), uid, label);
+	const file = path.join(dir, `${process.pid}-${crypto.randomUUID()}`);
+	const fd = await openDescriptor(file, "wx+", 0o600);
+	try {
+		await fsp.unlink(file);
+	} catch (error) {
+		fs.closeSync(fd);
+		await fsp.rm(file, { force: true });
+		throw error;
+	}
+	return new PrivateTempFile(fd);
+}
+
+/** `fs.open` of `file`, resolving with its descriptor: a number a {@link PrivateTempFile} can hold and close. */
+function openDescriptor(file: string, flags: string, mode: number): Promise<number> {
+	const { promise, resolve, reject } = Promise.withResolvers<number>();
+	fs.open(file, flags, mode, (err, fd) => {
+		if (err) reject(err);
+		else resolve(fd);
+	});
+	return promise;
 }
 
 /**
