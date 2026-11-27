@@ -297,6 +297,96 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(registry.find("moonshot", "gemini-proxy-model")).toBeUndefined();
 	});
 
+	test("drops a built-in provider's own prefix from a redirected discovery id", async () => {
+		// A gateway lists a Claude model both bare and under the `anthropic/`
+		// prefix. The redirected entry must keep only the bare id, so it never
+		// offers a doubled `anthropic/anthropic/...` selector.
+		const credentials = { ["api" + "Key"]: "gateway-key" };
+		writeRawModelsJson({
+			anthropic: { baseUrl: "https://gateway.example/v1", ...credentials },
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: async (input, init) => {
+				const url = new URL(String(input));
+				if (url.host === "catalog.stencil.so") return Response.json({});
+				if (url.host !== "gateway.example") throw new Error(`Unexpected discovery host: ${url.host}`);
+				if (new Headers(init?.headers).get("x-api-key") === "gateway-key") {
+					return Response.json({
+						data: [{ id: "claude-proxy-model" }, { id: "anthropic/claude-proxy-model" }],
+					});
+				}
+				throw new Error(`Unexpected discovery headers for ${url}`);
+			},
+		});
+
+		await registry.refreshProvider("anthropic", "online");
+		expect(registry.find("anthropic", "claude-proxy-model")).toBeDefined();
+		expect(registry.find("anthropic", "anthropic/claude-proxy-model")).toBeUndefined();
+		expect(getModelsForProvider(registry, "anthropic").every(model => !model.id.startsWith("anthropic/"))).toBe(true);
+	});
+
+	test("keeps the bundled catalog row when a gateway lists only the prefixed id", async () => {
+		// The gateway serves a Claude model only under the `anthropic/` prefix.
+		// The manager maps that prefixed id with its id for a name and text-only
+		// input, so a stripped row would override the bundled catalog row and
+		// take image input away. The bundled row's name and input must survive.
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
+		expect(bundled).toBeDefined();
+		expect(bundled?.input).toContain("image");
+		const credentials = { ["api" + "Key"]: "gateway-key" };
+		writeRawModelsJson({
+			anthropic: { baseUrl: "https://gateway.example/v1", ...credentials },
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: async (input, init) => {
+				const url = new URL(String(input));
+				if (url.host === "catalog.stencil.so") return Response.json({});
+				if (url.host !== "gateway.example") throw new Error(`Unexpected discovery host: ${url.host}`);
+				if (new Headers(init?.headers).get("x-api-key") === "gateway-key") {
+					return Response.json({ data: [{ id: "anthropic/claude-sonnet-4-5" }] });
+				}
+				throw new Error(`Unexpected discovery headers for ${url}`);
+			},
+		});
+
+		await registry.refreshProvider("anthropic", "online");
+		const model = registry.find("anthropic", "claude-sonnet-4-5");
+		expect(model?.name).toBe(bundled?.name);
+		expect(model?.input).toEqual(bundled?.input);
+		expect(registry.find("anthropic", "anthropic/claude-sonnet-4-5")).toBeUndefined();
+	});
+
+	test("drops the prefixed duplicate so the bundled row's image input wins", async () => {
+		// The gateway lists a catalog model both bare and under the `anthropic/`
+		// prefix. Dropping the prefixed duplicate (not the bare row) keeps the
+		// bundled row's image input; keeping the stripped prefixed row would make
+		// the model text-only.
+		const bundled = getBundledModel("anthropic", "claude-opus-5-5");
+		expect(bundled).toBeDefined();
+		expect(bundled?.input).toContain("image");
+		const credentials = { ["api" + "Key"]: "gateway-key" };
+		writeRawModelsJson({
+			anthropic: { baseUrl: "https://gateway.example/v1", ...credentials },
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: async (input, init) => {
+				const url = new URL(String(input));
+				if (url.host === "catalog.stencil.so") return Response.json({});
+				if (url.host !== "gateway.example") throw new Error(`Unexpected discovery host: ${url.host}`);
+				if (new Headers(init?.headers).get("x-api-key") === "gateway-key") {
+					// The prefixed id is listed before the bare one, as the gateway sorts them.
+					return Response.json({ data: [{ id: "anthropic/claude-opus-5-5" }, { id: "claude-opus-5-5" }] });
+				}
+				throw new Error(`Unexpected discovery headers for ${url}`);
+			},
+		});
+
+		await registry.refreshProvider("anthropic", "online");
+		const model = registry.find("anthropic", "claude-opus-5-5");
+		expect(model?.input).toContain("image");
+		expect(registry.find("anthropic", "anthropic/claude-opus-5-5")).toBeUndefined();
+	});
+
 	test("a polluted bare-id cache does not load when the built-in provider is redirected", async () => {
 		// Seed the bare 'anthropic' cache with a foreign model that a gateway
 		// roster would have added before the endpoint-scoped fix.
