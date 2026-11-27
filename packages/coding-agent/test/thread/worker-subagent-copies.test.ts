@@ -51,6 +51,11 @@ const LINE_CHARS = 80;
 const CONTEXT_BYTES = RESULTS * LINES * (LINE_CHARS + 1);
 /** "A subagent that is not yet parked holds at most five copies of its context." */
 const MAX_COPIES = 5;
+/**
+ * At least this many copies in each heap while the subagent still runs: the worker runs on the context and main
+ * mirrors it, so a heap that counts fewer is a snapshot search that missed the payload, not a heap without it.
+ */
+const MIN_HEAP_COPIES = 1;
 /** Every line of every printed text starts with `P<seed>:`; the test builds that marker only to search a snapshot. */
 const PAYLOAD_SEED = crypto.randomBytes(8).toString("hex");
 /** Named in `test/fixtures/subagent-heap-hook.ts`, which listens on it in each worker. */
@@ -261,11 +266,17 @@ interface ThreadCopies {
 /**
  * The copies of the run's printed texts in `graph`: the characters of every distinct string node whose text
  * (its first 1024 characters, all the snapshot keeps) holds the payload marker, over {@link CONTEXT_BYTES}. A
- * string two holders share is one node, counted once; a piece of a text counts for its share.
+ * string two holders share is one node, counted once; a piece of a text counts for its share. A snapshot with no
+ * string text to search is an error, never zero copies.
  */
 function payloadCopies(thread: string, graph: HeapGraph): ThreadCopies {
 	const marker = `P${PAYLOAD_SEED}:`;
-	const nodes = graph.stringNodes(text => text.includes(marker));
+	let searched = 0;
+	const nodes = graph.stringNodes(text => {
+		if (text !== "") searched++;
+		return text.includes(marker);
+	});
+	if (searched === 0) throw new Error(`${thread}: the heap snapshot has no string text to search for the payload`);
 	const paths = graph.retainerPaths(nodes, node => isNamedHolder(graph, node));
 	const byHolder = new Map<string, number>();
 	let bytes = 0;
@@ -499,20 +510,32 @@ describe("copies of a worker subagent's context", () => {
 
 			const running = run.copies.reduce((sum, thread) => sum + thread.copies, 0);
 			const report = [
-				copiesReport(`near the end of its run, in both heaps (at most ${MAX_COPIES})`, run.copies),
+				copiesReport(
+					`near the end of its run, in both heaps (at most ${MAX_COPIES}, at least ${MIN_HEAP_COPIES} in each)`,
+					run.copies,
+				),
 				copiesReport("parked and its worker stopped, in main (none)", [left]),
 			].join("\n");
 			// Printed on every run, pass or fail, so a run's record carries the copies it counted.
 			console.error(`two-heap copies report:\n${report}`);
 			expect(
 				{
+					runningHeapsUnderOneCopy: run.copies
+						.filter(thread => thread.copies < MIN_HEAP_COPIES)
+						.map(thread => `${thread.thread}: ${thread.copies.toFixed(2)}`),
 					runningCopiesAtMostFive: running <= MAX_COPIES,
 					parkedCopies: left.copies,
 					records: records.length,
 					recordRunObjects: records.flatMap(record => recordRunObjects(parked, record)),
 				},
 				report,
-			).toEqual({ runningCopiesAtMostFive: true, parkedCopies: 0, records: 1, recordRunObjects: [] });
+			).toEqual({
+				runningHeapsUnderOneCopy: [],
+				runningCopiesAtMostFive: true,
+				parkedCopies: 0,
+				records: 1,
+				recordRunObjects: [],
+			});
 		},
 		TEST_TIMEOUT_MS,
 	);
