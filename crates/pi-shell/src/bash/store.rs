@@ -689,7 +689,8 @@ pub struct Job {
 	/// names right after `&`, or one that takes the signal bash's `kill`
 	/// left for its pid's decision and spawns no program,
 	/// `crate::bash::vm::proc::Bang::held`) in obash's kernel. Set by that
-	/// `kill`, and cleared if the lone command spawns its program after all;
+	/// `kill`, and cleared if the lone command spawns its program after all,
+	/// unless the held signal ends that program for sure ([`Self::doomed`]);
 	/// cleared where bash would have reaped it: as the shell waits for a
 	/// foreground program or child (bash's `waitchld` takes in every child
 	/// that ended), once a `kill` finds the job gone (bash's `kill -0`
@@ -700,6 +701,24 @@ pub struct Job {
 	/// counts as reaped.
 	#[serde(skip)]
 	pub unreaped:   bool,
+	/// The signal this shell's `kill` held for the job's pid decision
+	/// (`crate::bash::vm::proc::Bang::held`) ends the job whatever it runs:
+	/// `KILL`, or another signal whose default action ends a process and
+	/// that the job does not inherit ignored (`trap '' SIG`, or ignored when
+	/// the shell started; `INT` only in a job started under `set -m`, never
+	/// `QUIT`: `crate::bash::vm::builtins::kill`'s `dooms`). bash's child had
+	/// the signal at the `kill` and was dead by the next foreground command,
+	/// whose wait reaped it; obash's job takes it only at its decision, so
+	/// when that command ends the job's program may still be dying, or its
+	/// end not taken in yet. Such a job stays [`Self::unreaped`] when it
+	/// spawns its program, until bash would have reaped it; once a
+	/// foreground command has, a plain `wait`, `jobs` and `kill` first wait
+	/// for the job's end (`crate::bash::vm::proc::JobTable::dying`), and
+	/// `wait` then passes it by, as bash's passes a job it reaped before the
+	/// `wait`. Set by that `kill`; kept in memory only, as
+	/// [`Self::unreaped`] is.
+	#[serde(skip)]
+	pub doomed:     bool,
 }
 
 impl Job {
@@ -855,6 +874,7 @@ impl Job {
 			procs:      None,
 			foreground: false,
 			unreaped:   false,
+			doomed:     false,
 		}
 	}
 
@@ -877,6 +897,7 @@ impl Job {
 			procs: _,
 			foreground: _,
 			unreaped: _,
+			doomed: _,
 		} = self;
 		have.signal.is_none()
 			&& have.procs.is_none()

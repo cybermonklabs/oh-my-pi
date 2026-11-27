@@ -789,11 +789,19 @@ fn in_chld_trap(vp: &crate::bash::vm::proc::Vproc) -> bool {
 /// job this shell's `kill` ended with no OS status for obash to reap is
 /// still running for bash, which has not reaped it
 /// ([`crate::bash::store::Job::unreaped`]): it takes its place in the list,
-/// as bash waits for the first job still running. `Awaited::AllJobs`
+/// as bash waits for the first job still running. One bash reaped at a
+/// foreground command while obash still runs it
+/// ([`crate::bash::vm::proc::JobTable::dying`]) is no job bash waits for:
+/// the `wait` first waits for its end, which is near, and then passes it
+/// by, as one that ended before the `wait`. `Awaited::AllJobs`
 /// reports the first job it waits for, drops each other one that ended
 /// meanwhile (bash reaps them as it waits) and keeps `$!`'s.
 fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	let control = super::jobs::active(ctx)?;
+	let bash = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
+	if bash && let Some(dying) = ctx.vp.jobs.dying() {
+		return Err(Need::Park(WaitKey::Proc(dying)));
+	}
 	let foreign: Vec<u32> = ctx
 		.vp
 		.jobs
@@ -806,7 +814,6 @@ fn wait_all(ctx: &mut Ctx<'_, '_>, force: bool) -> R {
 	for pid in foreign {
 		ctx.usage(format!("pid {pid} is not a child of this shell"));
 	}
-	let bash = ctx.vp.mode.dialect() == crate::bash::ids::Dialect::Bash;
 	let held = |j: &crate::bash::vm::proc::Job| {
 		bash
 			&& j.unreaped

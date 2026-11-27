@@ -307,14 +307,24 @@ fn held(ctx: &mut Ctx<'_, '_>, arg: &[u8], send: Send) -> bool {
 	{
 		return false;
 	}
-	if let Some(sig) = send.signal() {
-		ctx.k.hold_signal(job.vpid, sig);
-		// Ended in obash's kernel if it spawns no program
-		// ([`crate::bash::store::Job::unreaped`]); one it spawns ends as the
-		// host reaps it (cleared as the job settles on it).
-		if ends(send) {
+	let (vpid, control) = (job.vpid, job.control);
+	let Some(sig) = send.signal() else {
+		return true;
+	};
+	ctx.k.hold_signal(vpid, sig);
+	if ends(send) {
+		// Ended in obash's kernel if it spawns no program; one it spawns ends
+		// as the host reaps it, which may come after the next foreground
+		// command, where bash reaped it ([`crate::bash::store::Job::doomed`]).
+		// The table is told, as at `target`'s marks, so that that command
+		// reaps it also when one ran before this `kill`
+		// ([`crate::bash::vm::proc::JobTable::all_reaped`]).
+		let doomed = dooms(ctx, sig, control);
+		if let Some(job) = ctx.vp.jobs.get_mut(number) {
 			job.unreaped = true;
+			job.doomed |= doomed;
 		}
+		ctx.vp.jobs.unreaped_marked();
 	}
 	true
 }
@@ -323,6 +333,35 @@ fn held(ctx: &mut Ctx<'_, '_>, arg: &[u8], send: Send) -> bool {
 /// ([`crate::bash::store::Job::unreaped`]).
 fn ends(send: Send) -> bool {
 	matches!(send, Send::Signal(sig) if sig.default_action() == crate::bash::signal::DefaultAction::Terminate)
+}
+
+/// Whether `sig`, a signal that ends a process ([`ends`]), held for the
+/// pid decision of a job started with job control on or off (`control`)
+/// ends the job whatever it runs ([`crate::bash::store::Job::doomed`]):
+/// `KILL`, or one the job does not inherit ignored: no `trap '' SIG` here
+/// and not ignored when the shell started. `INT` only for a job started
+/// with job control, which has no asynchronous command's ignore unless this
+/// shell ignores it for what it starts
+/// ([`crate::bash::vm::exec::async_ignored`]); without job control bash's
+/// child dies of it before it sets the ignore on some hosts and not on
+/// others. Never `QUIT`: bash 5.3.20's job outlives it with job control
+/// too.
+fn dooms(ctx: &mut Ctx<'_, '_>, sig: Signal, control: bool) -> bool {
+	if sig == Signal::Kill {
+		return true;
+	}
+	if sig == Signal::Quit
+		|| ctx.cx.host.ignored_signals().contains(sig)
+		|| crate::bash::vm::killed::ignored_by_trap(ctx.cx, ctx.vp, sig)
+	{
+		return false;
+	}
+	sig != Signal::Int
+		|| (control
+			&& matches!(
+				crate::bash::vm::exec::async_ignored(ctx.cx.store, ctx.vp, sig, true),
+				Ok(false)
+			))
 }
 
 /// Whether each process of `job` is a program obash spawned (its OS pid

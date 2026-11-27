@@ -1113,6 +1113,7 @@ impl JobTable {
 			procs: None,
 			foreground: false,
 			unreaped: false,
+			doomed: false,
 		});
 		self.reset_current();
 		number
@@ -1148,6 +1149,7 @@ impl JobTable {
 			procs: procs.map(Box::new),
 			foreground: true,
 			unreaped: false,
+			doomed: false,
 		});
 		number
 	}
@@ -1322,10 +1324,31 @@ impl JobTable {
 		self.list.reaped = true;
 	}
 
-	/// A job was just marked [`Job::unreaped`] (`kill`'s, the one place that
-	/// marks one): [`Self::all_reaped`] has work again.
+	/// A job was just marked [`Job::unreaped`] (by `kill`, the one builtin
+	/// that marks one: a job it signals, the job of a pid it names, or one
+	/// whose signal it holds for the job's pid decision; each mark calls
+	/// this): [`Self::all_reaped`] has work again.
 	pub const fn unreaped_marked(&mut self) {
 		self.list.reaped = false;
+	}
+
+	/// The vproc of a job bash has reaped that obash still runs, if any.
+	///
+	/// Its held signal ends it for sure ([`Job::doomed`]), and a foreground
+	/// command has reaped it for bash since (it is no longer
+	/// [`Job::unreaped`]): bash's child is dead and reaped, and its end here
+	/// is near. A builtin that reports or decides by the job's state waits
+	/// for that end first: a plain `wait` (`builtins::flow`'s `wait_all`),
+	/// and the builtins that take in the exits already available
+	/// (`builtins::jobs`' `take_in_exits`).
+	pub fn dying(&self) -> Option<Vpid> {
+		self
+			.list
+			.iter()
+			.find(|j| {
+				j.doomed && !j.unreaped && !j.inherited && !j.foreground && j.state == JobState::Running
+			})
+			.map(|j| j.vpid)
 	}
 
 	/// Remove every job `pick` selects, as [`Self::remove`] does.
