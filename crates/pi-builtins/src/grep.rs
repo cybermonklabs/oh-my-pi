@@ -187,7 +187,7 @@ struct GrepArgs {
 	patterns: Vec<String>,
 
 	/// Read patterns from FILE, one per line.
-	#[arg(short = 'f', long = "file", value_name = "FILE")]
+	#[arg(short = 'f', long = "file", value_name = "FILE", allow_hyphen_values = true)]
 	pattern_files: Vec<OsString>,
 
 	/// Interpret PATTERN as a strict extended regular expression.
@@ -479,9 +479,13 @@ struct Options {
 	prefix_filename:     bool,
 	initial_tab:         bool,
 	record:              RecordFormat,
+	/// The `--` between two groups of lines; `None` unless a context option
+	/// was given.
 	group_separator:     Option<Vec<u8>>,
 	line_buffered:       bool,
 	binary_files:        BinaryFiles,
+	/// The `-m` count: a line past it is trailing context.
+	max_count:           Option<u64>,
 	/// Whether an input that is the file stdout lands in is refused; see
 	/// [`Grep::run`].
 	refuse_output_file:  bool,
@@ -590,30 +594,12 @@ fn resolve_file_list_modes(matches: &ArgMatches) -> (bool, bool) {
 	}
 }
 
-fn resolve_context(cli: &GrepArgs, matches: &ArgMatches) -> (usize, usize) {
-	let mut events = Vec::with_capacity(3);
-	if let (Some(index), Some(value)) = (last_index(matches, "after_context"), cli.after_context) {
-		events.push((index, false, value));
-	}
-	if let (Some(index), Some(value)) = (last_index(matches, "before_context"), cli.before_context) {
-		events.push((index, true, value));
-	}
-	if let (Some(index), Some(value)) = (last_index(matches, "context"), cli.context) {
-		events.push((index, false, value));
-		events.push((index, true, value));
-	}
-	events.sort_unstable_by_key(|event| event.0);
-
-	let mut before = 0;
-	let mut after = 0;
-	for (_, is_before, value) in events {
-		if is_before {
-			before = value;
-		} else {
-			after = value;
-		}
-	}
-	(before, after)
+/// The leading and trailing context counts: `-B` and `-A` where given,
+/// whatever their order beside `-C` or `-NUM`, which give the other one, as
+/// in GNU grep (`grep -A1 -5` prints five lines before and one after).
+fn resolve_context(cli: &GrepArgs) -> (usize, usize) {
+	let context = cli.context.unwrap_or(0);
+	(cli.before_context.unwrap_or(context), cli.after_context.unwrap_or(context))
 }
 
 fn resolve_group_separator(cli: &GrepArgs, matches: &ArgMatches) -> Option<Vec<u8>> {
@@ -685,9 +671,19 @@ fn resolve_max_count(cli: &GrepArgs) -> Result<Option<u64>, String> {
 	}
 }
 
+/// Whether the argument after `arg` is the value of an option `arg` ends: a
+/// long option that takes one, or a group of short options where the first
+/// option that takes a value comes last (`-ve`, `-cf`), as getopt reads a
+/// group.
 fn option_takes_next_value(arg: &str) -> bool {
-	matches!(arg, "-e" | "-f" | "-m" | "-A" | "-B" | "-C" | "-D" | "-d"
-		| "--regexp" | "--file" | "--max-count" | "--after-context" | "--before-context"
+	if let Some(group) = arg.strip_prefix('-')
+		&& !group.starts_with('-')
+	{
+		return group
+			.find(['e', 'f', 'm', 'A', 'B', 'C', 'D', 'd'])
+			.is_some_and(|at| at + 1 == group.len());
+	}
+	matches!(arg, "--regexp" | "--file" | "--max-count" | "--after-context" | "--before-context"
 		| "--context" | "--label" | "--group-separator" | "--binary-files" | "--devices"
 		| "--directories" | "--include" | "--exclude" | "--exclude-from" | "--exclude-dir"
 		| "--include-dir")
@@ -844,6 +840,11 @@ struct GrepSink<'a, M: Matcher, W: Write> {
 	match_count: u64,
 	any_match:   bool,
 	binary:      bool,
+	/// Where the last line the search reported ends, to tell where a new
+	/// group of lines starts.
+	last_end:    Option<u64>,
+	/// The lines of trailing context left once `-m`'s count is reached.
+	after_left:  usize,
 }
 
 impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
@@ -899,6 +900,54 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 		})
 	}
 
+	/// Writes the group separator before the line at `offset` when it does
+	/// not follow the last line the search reported. GNU grep prints it
+	/// wherever a context option was given, with a count of 0 too, and under
+	/// `-o`, which prints no context line.
+	fn separate(&mut self, offset: u64, length: usize) -> io::Result<()> {
+		let gap = self.last_end.is_some_and(|end| end != offset);
+		self.last_end = Some(offset.saturating_add(length as u64));
+		if gap && let Some(separator) = &self.opts.group_separator {
+			self.out.write_all(separator)?;
+			self.out.write_all(&[self.opts.record.terminator])?;
+			self.flush_record()?;
+		}
+		Ok(())
+	}
+
+	/// Whether `-m`'s count is reached: GNU prints what follows as trailing
+	/// context, selected or not.
+	fn count_reached(&self) -> bool {
+		self.opts.max_count == Some(self.match_count)
+	}
+
+	/// Prints a context line (none under `-o`); returns whether the search
+	/// goes on. Past `-m`'s count only the trailing context it allows is
+	/// printed, and the search stops there: the searcher may offer a line
+	/// again after the sink stopped it, which is then not printed.
+	fn context_line(
+		&mut self,
+		line: &[u8],
+		line_number: Option<u64>,
+		offset: u64,
+	) -> io::Result<bool> {
+		let trailing = self.count_reached();
+		if trailing {
+			if self.after_left == 0 {
+				return Ok(false);
+			}
+			self.after_left -= 1;
+		}
+		if !self.normal_output_is_suppressed() && !self.binary_summary() {
+			self.separate(offset, line.len())?;
+			if !self.opts.only_matching {
+				self.write_prefix(line_number, offset, b'-')?;
+				self.write_record(line)?;
+			}
+		}
+		Ok(!trailing || self.after_left > 0)
+	}
+
 	fn normal_output_is_suppressed(&self) -> bool {
 		self.opts.count
 			|| self.opts.files_with_matches
@@ -920,6 +969,9 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 		if self.binary && self.opts.binary_files == BinaryFiles::WithoutMatch {
 			return Ok(false);
 		}
+		if self.count_reached() {
+			return self.context_line(mat.bytes(), mat.line_number(), mat.absolute_byte_offset());
+		}
 		self.any_match = true;
 		self.match_count += 1;
 		if self.opts.quiet
@@ -932,35 +984,21 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 		if self.opts.count {
 			return Ok(true);
 		}
+		self.separate(mat.absolute_byte_offset(), mat.bytes().len())?;
 		if self.opts.only_matching {
 			self.print_only_matching(mat.bytes(), mat.line_number(), mat.absolute_byte_offset())?;
 		} else {
 			self.write_prefix(mat.line_number(), mat.absolute_byte_offset(), b':')?;
 			self.write_record(mat.bytes())?;
 		}
+		if self.count_reached() {
+			self.after_left = self.opts.after;
+		}
 		Ok(true)
 	}
 
 	fn context(&mut self, _searcher: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, io::Error> {
-		if self.normal_output_is_suppressed() || self.opts.only_matching || self.binary_summary() {
-			return Ok(true);
-		}
-		self.write_prefix(ctx.line_number(), ctx.absolute_byte_offset(), b'-')?;
-		self.write_record(ctx.bytes())?;
-		Ok(true)
-	}
-
-	fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, io::Error> {
-		if !self.normal_output_is_suppressed()
-			&& !self.opts.only_matching
-			&& !self.binary_summary()
-			&& let Some(separator) = &self.opts.group_separator
-		{
-			self.out.write_all(separator)?;
-			self.out.write_all(&[self.opts.record.terminator])?;
-			self.flush_record()?;
-		}
-		Ok(true)
+		self.context_line(ctx.bytes(), ctx.line_number(), ctx.absolute_byte_offset())
 	}
 
 	fn binary_data(
@@ -1204,6 +1242,8 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 			match_count: 0,
 			any_match: false,
 			binary: false,
+			last_end: None,
+			after_left: 0,
 		};
 		let mut search = searcher.search_push(&self.matcher, &mut sink);
 		let mut run = 0;
@@ -1698,6 +1738,8 @@ async fn search_stdin<M: Matcher + Clone + Send + Sync + 'static>(
 		match_count: 0,
 		any_match: false,
 		binary: false,
+		last_end: None,
+		after_left: 0,
 	};
 	let mut search = searcher.search_push(matcher, &mut sink);
 	let mut buf = vec![0u8; READ_CHUNK];
@@ -1957,11 +1999,15 @@ impl AsyncUtility for Grep {
 
 	let (files_with_matches, files_without_match) = resolve_file_list_modes(&matches);
 	let suppress_context =
-		cli.count || files_with_matches || files_without_match || cli.quiet || cli.only_matching;
+		cli.count || files_with_matches || files_without_match || cli.quiet;
+	// GNU prints a `--` between two groups of lines wherever a context option
+	// was given, with a count of 0 too, and under `-o`.
+	let context_given = !suppress_context
+		&& (cli.context.is_some() || cli.before_context.is_some() || cli.after_context.is_some());
 	let (before, after) = if suppress_context {
 		(0, 0)
 	} else {
-		resolve_context(&cli, &matches)
+		resolve_context(&cli)
 	};
 	let prefix_filename = resolve_filename_prefix(&matches)
 		.unwrap_or(directory_action == DirectoryAction::Recurse || files.len() > 1);
@@ -1995,9 +2041,10 @@ impl AsyncUtility for Grep {
 			null_paths:     cli.null_paths,
 			terminator:     if cli.null_data { b'\0' } else { b'\n' },
 		},
-		group_separator: resolve_group_separator(&cli, &matches),
+		group_separator: resolve_group_separator(&cli, &matches).filter(|_| context_given),
 		line_buffered: cli.line_buffered,
 		binary_files: resolve_binary_files(&cli, &matches),
+		max_count,
 		refuse_output_file,
 	};
 	let follow_links = resolve_follow_links(&cli, &matches);
