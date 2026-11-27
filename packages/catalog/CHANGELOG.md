@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Built-in provider discovery now uses its configured endpoint, keeps proxy model lists within the provider's own model families, and isolates those cached lists from the vendor endpoint
 - Provider model resolution no longer holds the event loop while it builds, merges, fingerprints or writes a large catalog: it gives the loop a turn after each 10 ms slice of its work, plus at most one step ([#17121](https://github.com/can1357/oh-my-pi/issues/17121))
 - Model discovery decodes and parses each fetched model list and model metadata response, and maps an OpenAI-compatible endpoint's rows, in slices, so two responses that arrive together no longer hold timers for both parses
 - Provider model resolution reads each cache row and parses it in separate slices, and collapses variants and fills catalog metrics in slices; a corrupt row is deleted only if no write replaced it since it was read

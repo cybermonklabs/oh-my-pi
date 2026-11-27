@@ -11,6 +11,8 @@ import {
 	googleModelManagerOptions,
 	googleVertexModelManagerOptions,
 } from "@oh-my-pi/pi-catalog/provider-models/google";
+import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models/cache-provider-id";
+import { typesafeModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/special";
 import {
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
@@ -73,6 +75,80 @@ function geminiSpec<TApi extends Api>(provider: "google" | "google-vertex", api:
 }
 
 describe("google-vertex model catalog", () => {
+	it("uses the configured Google endpoint and header authentication for discovery", async () => {
+		let requestedUrl: URL | undefined;
+		let requestedKey: string | null | undefined;
+		const credentials = { ["api" + "Key"]: "gateway-key" };
+		const options = googleModelManagerOptions({
+			...credentials,
+			baseUrl: "https://gateway.example/v1beta",
+			fetch: async (input, init) => {
+				requestedUrl = new URL(String(input));
+				requestedKey = new Headers(init?.headers).get("x-goog-api-key");
+				return Response.json({
+					models: [
+						{
+							name: "models/gemini-3.5-flash",
+							supportedGenerationMethods: ["generateContent"],
+						},
+					],
+				});
+			},
+		});
+		if (!options.fetchDynamicModels) throw new Error("Expected Google discovery");
+
+		const models = await options.fetchDynamicModels();
+
+		expect(requestedUrl?.toString()).toBe("https://gateway.example/v1beta/models?pageSize=100");
+		expect(requestedUrl?.searchParams.has("key")).toBe(false);
+		expect(requestedKey).toBe("gateway-key");
+		expect(models?.map(model => model.id)).toEqual(["gemini-3.5-flash"]);
+	});
+
+	it("isolates each redirected built-in provider cache by normalized endpoint", () => {
+		const vendor = resolveModelCacheProviderId("anthropic", { baseUrl: "https://api.anthropic.com" });
+		const firstGateway = resolveModelCacheProviderId("anthropic", { baseUrl: "https://gateway.example/v1/" });
+		const equivalentGateway = resolveModelCacheProviderId("anthropic", { baseUrl: " https://gateway.example/v1 " });
+		const secondGateway = resolveModelCacheProviderId("anthropic", { baseUrl: "https://gateway.example/v2" });
+
+		expect(vendor).toBe("anthropic");
+		expect(firstGateway).toMatch(/^anthropic:models-v1:/);
+		expect(equivalentGateway).toBe(firstGateway);
+		expect(secondGateway).not.toBe(firstGateway);
+	});
+
+	it("scopes a redirected vendor but leaves other providers' cache ids alone", () => {
+		// A generated vendor pointed off its own catalog endpoint scopes by
+		// endpoint, keeping a proxy roster out of the bare cache.
+		expect(resolveModelCacheProviderId("anthropic", { baseUrl: "https://gateway.example/v1" })).toMatch(
+			/^anthropic:models-v1:/,
+		);
+		// A non-generated provider (a local server) keeps its bare id at any
+		// endpoint, so its own manager's cache write is read back at restart.
+		expect(resolveModelCacheProviderId("lm-studio", { baseUrl: "https://gpu.example/v1" })).toBe("lm-studio");
+		// A provider that pins its own namespace keeps it regardless of endpoint.
+		expect(resolveModelCacheProviderId("openrouter", { baseUrl: "https://custom.example/v1" })).toBe(
+			"openrouter:pseudo-api",
+		);
+		// typesafe scopes by its configured endpoint, matching what its own
+		// manager now writes with the same baseUrl.
+		expect(resolveModelCacheProviderId("typesafe", { baseUrl: "https://ts.example/v1" })).toMatch(
+			/^typesafe:models-v1:/,
+		);
+	});
+
+	it("gives typesafe's manager the endpoint-scoped cache id the startup read uses", () => {
+		// The registry reads a provider's startup cache at
+		// `resolveModelCacheProviderId(providerId, { baseUrl })`; typesafe's
+		// manager must write the same id, or a configured endpoint's cache is
+		// never read back.
+		const configured = typesafeModelManagerOptions({ baseUrl: "https://ts.example/v1" });
+		expect(configured.cacheProviderId).toBe(
+			resolveModelCacheProviderId("typesafe", { baseUrl: "https://ts.example/v1" }),
+		);
+		const bare = typesafeModelManagerOptions({});
+		expect(bare.cacheProviderId).toBe(resolveModelCacheProviderId("typesafe", { baseUrl: undefined }));
+	});
 	it("maps the stencil.so Vertex catalog instead of the project discovery endpoint", () => {
 		const models = mapModelsDevToModels(googleVertexModelsDevPayload, MODELS_DEV_PROVIDER_DESCRIPTORS).filter(
 			model => model.provider === "google-vertex",

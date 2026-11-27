@@ -315,6 +315,14 @@ export function validateRetryFallbackChains(
 	for (const key in configuredChains) {
 		const chain = configuredChains[key];
 		const keyKind = isRetryFallbackModelKey(key) ? "model" : "role";
+		const resolvesMigrationTarget =
+			Array.isArray(chain) &&
+			chain.length > 0 &&
+			chain.every(selectorStr => {
+				if (typeof selectorStr !== "string") return false;
+				const parsed = parseRetryFallbackSelector(selectorStr, modelRegistry);
+				return parsed !== undefined && modelRegistry.find(parsed.provider, parsed.id) !== undefined;
+			});
 		if (keyKind === "model") {
 			if (isRetryFallbackWildcardKey(key)) {
 				const { provider } = parseRetryFallbackWildcard(key, candidate =>
@@ -329,7 +337,8 @@ export function validateRetryFallbackChains(
 					report(`Invalid model selector key in retry.fallbackChains: ${key}`);
 				} else if (
 					!modelRegistry.find(parsedKey.provider, parsedKey.id) &&
-					!isDiscoveryPending(parsedKey.provider)
+					!isDiscoveryPending(parsedKey.provider) &&
+					!(resolvesMigrationTarget && !modelRegistry.hasProvider(parsedKey.provider))
 				) {
 					report(`retry.fallbackChains key references unknown model: ${key}`);
 				}

@@ -246,6 +246,238 @@ describe("ModelRegistry runtime discovery", () => {
 		};
 	}
 
+	test("keeps redirected built-in discovery at its endpoint and filters an aggregate roster by vendor", async () => {
+		const credentials = { ["api" + "Key"]: "gateway-key" };
+		writeRawModelsJson({
+			anthropic: { baseUrl: "https://gateway.example/v1", ...credentials },
+			google: { baseUrl: "https://gateway.example/v1beta", ...credentials },
+			moonshot: { baseUrl: "https://gateway.example/v1", ...credentials },
+		});
+		const requests: Array<{ host: string; pathname: string }> = [];
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: async (input, init) => {
+				const url = new URL(String(input));
+				requests.push({ host: url.host, pathname: url.pathname });
+				if (url.host === "catalog.stencil.so") return Response.json({});
+				if (url.host !== "gateway.example") throw new Error(`Unexpected discovery host: ${url.host}`);
+				const headers = new Headers(init?.headers);
+				if (headers.get("x-goog-api-key") === "gateway-key") {
+					return Response.json({
+						models: [
+							{ name: "models/gemini-proxy-model", supportedGenerationMethods: ["generateContent"] },
+							{ name: "models/claude-proxy-model", supportedGenerationMethods: ["generateContent"] },
+						],
+					});
+				}
+				if (headers.get("x-api-key") === "gateway-key") {
+					return Response.json({
+						data: [{ id: "claude-proxy-model" }, { id: "gpt-proxy-model" }],
+					});
+				}
+				if (headers.get("authorization") === "Bearer gateway-key") {
+					return Response.json({
+						data: [{ id: "kimi-proxy-model" }, { id: "gemini-proxy-model" }],
+					});
+				}
+				throw new Error(`Unexpected discovery headers for ${url}`);
+			},
+		});
+
+		await Promise.all([
+			registry.refreshProvider("anthropic", "online"),
+			registry.refreshProvider("google", "online"),
+			registry.refreshProvider("moonshot", "online"),
+		]);
+
+		expect(
+			requests.every(request => request.host === "catalog.stencil.so" || request.host === "gateway.example"),
+		).toBe(true);
+		expect(
+			requests
+				.filter(request => request.host === "gateway.example")
+				.map(request => request.pathname)
+				.sort(),
+		).toEqual(["/v1/models", "/v1/models", "/v1beta/models"]);
+		expect(registry.find("anthropic", "claude-proxy-model")).toBeDefined();
+		expect(registry.find("anthropic", "gpt-proxy-model")).toBeUndefined();
+		expect(registry.find("google", "gemini-proxy-model")).toBeDefined();
+		expect(registry.find("google", "claude-proxy-model")).toBeUndefined();
+		expect(registry.find("moonshot", "kimi-proxy-model")).toBeDefined();
+		expect(registry.find("moonshot", "gemini-proxy-model")).toBeUndefined();
+	});
+
+	test("drops a built-in provider's own prefix from a redirected discovery id", async () => {
+		// A gateway lists a Claude model both bare and under the `anthropic/`
+		// prefix. The redirected entry must keep only the bare id, so it never
+		// offers a doubled `anthropic/anthropic/...` selector.
+		const credentials = { ["api" + "Key"]: "gateway-key" };
+		writeRawModelsJson({
+			anthropic: { baseUrl: "https://gateway.example/v1", ...credentials },
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: async (input, init) => {
+				const url = new URL(String(input));
+				if (url.host === "catalog.stencil.so") return Response.json({});
+				if (url.host !== "gateway.example") throw new Error(`Unexpected discovery host: ${url.host}`);
+				if (new Headers(init?.headers).get("x-api-key") === "gateway-key") {
+					return Response.json({
+						data: [{ id: "claude-proxy-model" }, { id: "anthropic/claude-proxy-model" }],
+					});
+				}
+				throw new Error(`Unexpected discovery headers for ${url}`);
+			},
+		});
+
+		await registry.refreshProvider("anthropic", "online");
+		expect(registry.find("anthropic", "claude-proxy-model")).toBeDefined();
+		expect(registry.find("anthropic", "anthropic/claude-proxy-model")).toBeUndefined();
+		expect(getModelsForProvider(registry, "anthropic").every(model => !model.id.startsWith("anthropic/"))).toBe(true);
+	});
+
+	test("keeps the bundled catalog row when a gateway lists only the prefixed id", async () => {
+		// The gateway serves a Claude model only under the `anthropic/` prefix.
+		// The manager maps that prefixed id with its id for a name and text-only
+		// input, so a stripped row would override the bundled catalog row and
+		// take image input away. The bundled row's name and input must survive.
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
+		expect(bundled).toBeDefined();
+		expect(bundled?.input).toContain("image");
+		const credentials = { ["api" + "Key"]: "gateway-key" };
+		writeRawModelsJson({
+			anthropic: { baseUrl: "https://gateway.example/v1", ...credentials },
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: async (input, init) => {
+				const url = new URL(String(input));
+				if (url.host === "catalog.stencil.so") return Response.json({});
+				if (url.host !== "gateway.example") throw new Error(`Unexpected discovery host: ${url.host}`);
+				if (new Headers(init?.headers).get("x-api-key") === "gateway-key") {
+					return Response.json({ data: [{ id: "anthropic/claude-sonnet-4-5" }] });
+				}
+				throw new Error(`Unexpected discovery headers for ${url}`);
+			},
+		});
+
+		await registry.refreshProvider("anthropic", "online");
+		const model = registry.find("anthropic", "claude-sonnet-4-5");
+		expect(model?.name).toBe(bundled?.name);
+		expect(model?.input).toEqual(bundled?.input);
+		expect(registry.find("anthropic", "anthropic/claude-sonnet-4-5")).toBeUndefined();
+	});
+
+	test("drops the prefixed duplicate so the bundled row's image input wins", async () => {
+		// The gateway lists a catalog model both bare and under the `anthropic/`
+		// prefix. Dropping the prefixed duplicate (not the bare row) keeps the
+		// bundled row's image input; keeping the stripped prefixed row would make
+		// the model text-only.
+		const bundled = getBundledModel("anthropic", "claude-opus-5-5");
+		expect(bundled).toBeDefined();
+		expect(bundled?.input).toContain("image");
+		const credentials = { ["api" + "Key"]: "gateway-key" };
+		writeRawModelsJson({
+			anthropic: { baseUrl: "https://gateway.example/v1", ...credentials },
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: async (input, init) => {
+				const url = new URL(String(input));
+				if (url.host === "catalog.stencil.so") return Response.json({});
+				if (url.host !== "gateway.example") throw new Error(`Unexpected discovery host: ${url.host}`);
+				if (new Headers(init?.headers).get("x-api-key") === "gateway-key") {
+					// The prefixed id is listed before the bare one, as the gateway sorts them.
+					return Response.json({ data: [{ id: "anthropic/claude-opus-5-5" }, { id: "claude-opus-5-5" }] });
+				}
+				throw new Error(`Unexpected discovery headers for ${url}`);
+			},
+		});
+
+		await registry.refreshProvider("anthropic", "online");
+		const model = registry.find("anthropic", "claude-opus-5-5");
+		expect(model?.input).toContain("image");
+		expect(registry.find("anthropic", "anthropic/claude-opus-5-5")).toBeUndefined();
+	});
+
+	test("a polluted bare-id cache does not load when the built-in provider is redirected", async () => {
+		// Seed the bare 'anthropic' cache with a foreign model that a gateway
+		// roster would have added before the endpoint-scoped fix.
+		const foreignModel = {
+			...getBundledModel("anthropic", "claude-sonnet-4-5")!,
+			id: "openai/gpt-6-astra",
+			name: "openai/gpt-6-astra",
+		};
+		writeModelCache("anthropic", Date.now(), [foreignModel], true, "", cacheDbPath);
+
+		const credentials = { ["api" + "Key"]: "gateway-key" };
+		writeRawModelsJson({
+			anthropic: { baseUrl: "https://gateway.example/v1", ...credentials },
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: async () => Response.json({}),
+		});
+
+		// The bare-id cache holds the foreign row, but startup must not read it
+		// because the entry's cache namespace is endpoint-scoped.
+		expect(registry.find("anthropic", "openai/gpt-6-astra")).toBeUndefined();
+	});
+
+	test("a redirected provider that pins its own cache id keeps its full roster", async () => {
+		// commandcode is a generated provider whose manager sets its own
+		// cacheProviderId. A redirected vendor is filtered to its families, but a
+		// provider that pins its own namespace keeps every discovered model, live
+		// and after a restart.
+		const credentials = { ["api" + "Key"]: "cc-key" };
+		writeRawModelsJson({
+			commandcode: { baseUrl: "https://cc.example/v1", ...credentials },
+		});
+		let modelsCalls = 0;
+		const makeRegistry = () =>
+			new ModelRegistry(authStorage, modelsJsonPath, {
+				fetch: async input => {
+					const url = new URL(String(input));
+					if (url.host === "catalog.stencil.so") return Response.json({});
+					if (url.host !== "cc.example") throw new Error(`Unexpected discovery host: ${url.host}`);
+					modelsCalls += 1;
+					return Response.json({ data: [{ id: "my-finetune" }, { id: "deepseek-ai/deepseek-r1" }] });
+				},
+			});
+
+		const registry = makeRegistry();
+		await registry.refreshProvider("commandcode", "online");
+		expect(registry.find("commandcode", "my-finetune")).toBeDefined();
+		expect(registry.find("commandcode", "deepseek-ai/deepseek-r1")).toBeDefined();
+
+		// Restart: a fresh registry with no network reads the cache the first
+		// registry wrote. The models survive only if the write and the startup
+		// read agree on the cache namespace.
+		modelsCalls = 0;
+		const restarted = makeRegistry();
+		expect(restarted.find("commandcode", "my-finetune")).toBeDefined();
+		expect(modelsCalls).toBe(0);
+	});
+
+	test("a non-generated provider at a custom endpoint keeps its discovered model", async () => {
+		// lm-studio is not a generated provider, so the redirect filter must skip
+		// it (the isGeneratedProvider gate). Removing the gate filters its roster
+		// to the vendor families it does not have and loses the model.
+		writeRawModelsJson({
+			"lm-studio": { baseUrl: "https://gpu.example/v1" },
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: async input => {
+				const url = new URL(String(input));
+				if (url.host === "catalog.stencil.so") return Response.json({});
+				if (url.host !== "gpu.example") throw new Error(`Unexpected discovery host: ${url.host}`);
+				if (url.pathname === "/v1/models") {
+					return Response.json({ data: [{ id: "my-finetune" }] });
+				}
+				// Native metadata endpoints: answer 404 so models pass through.
+				return new Response("not found", { status: 404 });
+			},
+		});
+
+		await registry.refreshProvider("lm-studio", "online");
+		expect(registry.find("lm-studio", "my-finetune")).toBeDefined();
+	});
+
 	test("scoped discovery coalesces with an in-flight background refresh", async () => {
 		writeRawModelsJson({
 			gateway: {
