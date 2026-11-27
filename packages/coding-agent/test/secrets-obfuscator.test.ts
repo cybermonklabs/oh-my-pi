@@ -3218,6 +3218,201 @@ describe("loadSecrets with extra project directories", () => {
 	});
 });
 
+describe("a project secrets.yml of another session's directory is masked one way", () => {
+	// A subagent revived into its own directory passes the directory its live inputs come from as an extra
+	// project (`secretsProjectDirs`, persisted-revive.ts). That project's secrets must be hidden on the way out
+	// and never handed back: a placeholder that holds one, in the subagent's OWN tool call, must stay a
+	// placeholder, or a prompt injection in the directory it works in turns the other project's credential back
+	// into bytes. "Own" is the subagent's cwd project, "source" the extra project, "global" the agent dir's file.
+	// Every value here is an obviously fake fixture.
+	const KEY = "mask-only-fixture-key";
+	const OWN = "fake-own-credential-NOT-REAL-9e2a";
+	const SOURCE = "fake-source-credential-NOT-REAL-5c1d";
+	const SHARED = "fake-shared-credential-NOT-REAL-71bd";
+	const SOURCE_RX_VALUE = "fake-srcrx-0badf00d-NOT-REAL";
+	const SOURCE_RX = "fake-srcrx-[0-9a-f]{8}-NOT-REAL";
+	// Not global: a shared `g` regex keeps `lastIndex` between calls, and `matchAll` starts from it.
+	const PLACEHOLDER = /\$\$(?:[A-Z0-9]+_)?[A-Z0-9]{4,}(?::[ULCM])?\$\$/;
+	const placeholdersOf = (text: string): string[] => text.match(new RegExp(PLACEHOLDER.source, "g")) ?? [];
+	const plain = (content: string): string => `- type: plain\n  content: ${content}\n`;
+	const regex = (content: string): string => `- type: regex\n  content: "${content}"\n`;
+
+	/** The entries a revived subagent loads: cwd's project, the source project as an extra directory, the global file. */
+	async function load(files: { own?: string; source?: string; global?: string }): Promise<SecretEntry[]> {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-secret-maskonly-"));
+		try {
+			const dirs = {
+				own: path.join(root, "own"),
+				source: path.join(root, "source"),
+				agent: path.join(root, "agent"),
+			};
+			await fs.mkdir(path.join(dirs.own, ".omp"), { recursive: true });
+			await fs.mkdir(path.join(dirs.source, ".omp"), { recursive: true });
+			await fs.mkdir(dirs.agent, { recursive: true });
+			if (files.own !== undefined) await fs.writeFile(path.join(dirs.own, ".omp", "secrets.yml"), files.own);
+			if (files.source !== undefined)
+				await fs.writeFile(path.join(dirs.source, ".omp", "secrets.yml"), files.source);
+			if (files.global !== undefined) await fs.writeFile(path.join(dirs.agent, "secrets.yml"), files.global);
+			return await loadSecrets(dirs.own, dirs.agent, [dirs.source]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}
+
+	/** What each placeholder of `masked` hands a tool when the subagent's own tool call carries it. */
+	function restoredFromEach(obfuscator: SecretObfuscator, masked: string): string[] {
+		return placeholdersOf(masked).map(placeholder =>
+			String(deobfuscateToolArguments(obfuscator, { content: placeholder }).content),
+		);
+	}
+
+	it("the source project's secret is still masked outbound, as cwd's project's secret is", async () => {
+		const obfuscator = new SecretObfuscator(
+			await load({ own: plain(OWN), source: plain(SOURCE) + plain(SHARED) }),
+			KEY,
+		);
+		const masked = obfuscator.obfuscate(`own ${OWN} source ${SOURCE} shared ${SHARED}`);
+		expect(masked.includes(OWN)).toBe(false);
+		expect(masked.includes(SOURCE)).toBe(false);
+		expect(masked.includes(SHARED)).toBe(false);
+		expect(placeholdersOf(masked).length).toBe(3);
+		// Re-obfuscation of the masked text is a fixed point, and of its restoration still masks the same way.
+		expect(obfuscator.obfuscate(masked)).toBe(masked);
+		expect(obfuscator.obfuscate(obfuscator.deobfuscate(masked))).toBe(masked);
+	});
+
+	it("the source project's placeholder is never restored inbound, while cwd's project's placeholder is", async () => {
+		const obfuscator = new SecretObfuscator(
+			await load({ own: plain(OWN), source: plain(SOURCE) + plain(SHARED) }),
+			KEY,
+		);
+		const ownPlaceholder = obfuscator.obfuscate(OWN);
+		const sourcePlaceholder = obfuscator.obfuscate(SOURCE);
+		const sharedPlaceholder = obfuscator.obfuscate(SHARED);
+		expect(
+			obfuscator.deobfuscate(`own ${ownPlaceholder} source ${sourcePlaceholder} shared ${sharedPlaceholder}`),
+		).toBe(`own ${OWN} source ${sourcePlaceholder} shared ${sharedPlaceholder}`);
+		expect(deobfuscateToolArguments(obfuscator, { content: sourcePlaceholder })).toEqual({
+			content: sourcePlaceholder,
+		});
+		expect(deobfuscateToolArguments(obfuscator, { content: ownPlaceholder })).toEqual({ content: OWN });
+		// Assistant text and a tool call inside assistant content take the same restore.
+		const content = [
+			{ type: "text", text: `a ${sourcePlaceholder} b ${ownPlaceholder}` },
+			{
+				type: "toolCall",
+				id: "call-1",
+				name: "bash",
+				arguments: { command: `echo ${sourcePlaceholder} ${ownPlaceholder}` },
+			},
+		] as unknown as AssistantMessage["content"];
+		const restored = JSON.stringify(deobfuscateAssistantContent(obfuscator, content));
+		// Both of its occurrences stay the placeholder; checked by the placeholder, so this case reads restoration only.
+		expect(restored.split(sourcePlaceholder).length - 1).toBe(2);
+		expect(restored.includes(OWN)).toBe(true);
+		// A forged friendly prefix, a swapped case hint or a dropped hint on the source's base restores nothing.
+		const bare = sourcePlaceholder.slice(2, -2).replace(/^[A-Z0-9]+_/, "");
+		for (const forged of [
+			`$$FORGED_${bare}$$`,
+			`$$${bare.replace(/:[ULCM]$/, ":U")}$$`,
+			`$$${bare.replace(/:[ULCM]$/, "")}$$`,
+		]) {
+			expect(obfuscator.deobfuscate(forged)).toBe(forged);
+		}
+	});
+
+	it("a source project's regex entry masks its match and never restores it; the same regex in cwd's project does", async () => {
+		const source = new SecretObfuscator(await load({ own: plain(OWN), source: regex(SOURCE_RX) }), KEY);
+		const masked = source.obfuscate(`value ${SOURCE_RX_VALUE} and ${OWN}`);
+		expect(masked.includes(SOURCE_RX_VALUE)).toBe(false);
+		expect(restoredFromEach(source, masked)).toEqual([expect.stringMatching(PLACEHOLDER), OWN]);
+		// The second time the value comes back it reuses the same mask-only placeholder.
+		const again = source.obfuscate(`again ${SOURCE_RX_VALUE}`);
+		expect(restoredFromEach(source, again).filter(text => text.includes(SOURCE_RX_VALUE))).toEqual([]);
+		const own = new SecretObfuscator(await load({ own: regex(SOURCE_RX) }), KEY);
+		expect(restoredFromEach(own, own.obfuscate(`value ${SOURCE_RX_VALUE}`))).toEqual([SOURCE_RX_VALUE]);
+	});
+
+	it("a placeholder a restorable regex mints over the source's value is mask-only too", async () => {
+		// A regex match that takes in a value the mask holds mask-only mints a placeholder of its own, whose value
+		// spells the mask-only value out: cwd's own regex, a global regex and a built-in pattern alike.
+		const cases: Array<{ name: string; entries: SecretEntry[]; text: (value: string) => string }> = [
+			{
+				name: "cwd's own regex",
+				entries: await load({ own: plain(OWN) + regex("fakedb://[A-Za-z0-9:@./_-]+"), source: plain(SOURCE) }),
+				text: value => `url fakedb://svc:${value}@db.fake.internal/app end`,
+			},
+			{
+				name: "a global regex",
+				entries: await load({ own: plain(OWN), global: regex("fakekv=[A-Za-z0-9:@./_-]+"), source: plain(SOURCE) }),
+				text: value => `line fakekv=${value}/tail end`,
+			},
+			{
+				name: "the built-in Bearer pattern",
+				entries: [...(await load({ own: plain(OWN), source: plain(SOURCE) })), ...builtinCredentialSecretEntries()],
+				text: value => `Authorization: Bearer ${value}.fakesig-NOT-REAL-0000\n`,
+			},
+		];
+		for (const { name, entries, text } of cases) {
+			const obfuscator = new SecretObfuscator(entries, KEY);
+			const masked = obfuscator.obfuscate(text(SOURCE));
+			const restored = restoredFromEach(obfuscator, masked);
+			expect({ name, holds: masked.includes(SOURCE), minted: restored.length > 0 }).toEqual({
+				name,
+				holds: false,
+				minted: true,
+			});
+			expect({ name, restoring: restored.filter(value => value.includes(SOURCE)) }).toEqual({ name, restoring: [] });
+			expect(obfuscator.obfuscate(masked)).toBe(masked);
+			// The same match over cwd's own value restores it: the rule follows the value, not the regex.
+			const ownRestored = restoredFromEach(obfuscator, obfuscator.obfuscate(text(OWN)));
+			expect({ name, restoring: ownRestored.some(value => value.includes(OWN)) }).toEqual({ name, restoring: true });
+		}
+	});
+
+	it("a restorable regex that runs before the source's regex never mints a placeholder that restores the source's match", async () => {
+		// cwd's own regex comes first in the scan, so it meets the source regex's value still raw.
+		const obfuscator = new SecretObfuscator(
+			await load({ own: regex("fakedb://[A-Za-z0-9:@./_-]+"), source: regex(SOURCE_RX) }),
+			KEY,
+		);
+		const masked = obfuscator.obfuscate(`url fakedb://svc:${SOURCE_RX_VALUE}@db.fake.internal/app end`);
+		expect(masked.includes(SOURCE_RX_VALUE)).toBe(false);
+		const restored = restoredFromEach(obfuscator, masked);
+		expect(restored.length).toBeGreaterThan(0);
+		expect(restored.filter(value => value.includes(SOURCE_RX_VALUE))).toEqual([]);
+	});
+
+	it("a value a restorable entry also supplies restores under every placeholder, whatever the order and the friendly name", async () => {
+		const maskOnly: SecretEntry = { type: "plain", content: SHARED, mode: "obfuscate", maskOnly: true };
+		const own: SecretEntry = { type: "plain", content: SHARED, mode: "obfuscate" };
+		const named: SecretEntry = { ...maskOnly, friendlyName: "SRCDB" };
+		// Environment values come first in `buildSecretObfuscator`, the project files after them.
+		for (const [name, entries] of [
+			["mask-only first", [maskOnly, own]],
+			["own first", [own, maskOnly]],
+			["named mask-only first", [named, own]],
+			["own first, then named mask-only", [own, named]],
+		] as const) {
+			const obfuscator = new SecretObfuscator([...entries], KEY);
+			const placeholder = obfuscator.obfuscate(SHARED);
+			expect({ name, holds: placeholder.includes(SHARED), restored: obfuscator.deobfuscate(placeholder) }).toEqual({
+				name,
+				holds: false,
+				restored: SHARED,
+			});
+		}
+		// Through loadSecrets: a value cwd's project or the global file names as well as the source stays restorable.
+		for (const files of [
+			{ own: plain(OWN) + plain(SHARED), source: plain(SOURCE) + plain(SHARED) },
+			{ global: plain(SHARED), source: plain(SHARED) + plain(SOURCE) },
+		]) {
+			const loaded = new SecretObfuscator(await load(files), KEY);
+			expect(loaded.deobfuscate(loaded.obfuscate(SHARED))).toBe(SHARED);
+		}
+	});
+});
+
 describe("SecretObfuscator cross-turn cache stability", () => {
 	// The provider prompt cache is content-addressed: convertToLlm / transformProviderContext
 	// re-run obfuscation over the WHOLE message array every turn, so a non-deterministic

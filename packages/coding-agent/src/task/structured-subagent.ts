@@ -853,6 +853,8 @@ export function subagentLiveInputs(session: ToolSession): SubagentSpawnerLiveInp
 		preloadedPreparedExtensions: session.preparedExtensions,
 		preloadedCustomToolPaths: session.customToolPaths,
 		localProtocolOptions: sessionLocalProtocolOptions(session),
+		// The source projects the spawner masks one way: its subagents mask them one way too.
+		secretsProjectDirs: session.secretsProjectDirs,
 		parentArtifactManager: session.getArtifactManager?.() ?? undefined,
 		parentHindsightSessionState: session.getHindsightSessionState?.(),
 		parentMnemopiSessionState: session.getMnemopiSessionState?.(),

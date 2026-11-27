@@ -553,7 +553,14 @@ cache-warming value off, and its header's roots are written as above, from the l
 alone. Where the working directory of the session its live inputs come from is not the file's,
 both builds of the secret mask, when the session is created and when `secrets.enabled` turns on
 later, load the project secrets (`.omp/secrets.yml`) of that session's directory beside those
-of the file's, so a mask entry is only added. The stored
+of the file's, so a mask entry is only added. A value only that other project holds is masked
+one way: it never reaches the model, and the subagent's own tool calls get its placeholder
+rather than the value, so nothing it reads in its own directory can ask for that project's
+credential; a placeholder a regex mints over text that takes in such a value is one-way too.
+A value the file's own project, the global file or the environment also holds keeps
+restoring. The directories masked one way carry down the chain: the subagent's transcript
+records them (a custom entry), every later revive loads them again, and a subagent it spawns
+masks them the same way. The stored
 settings overlay restores over the live parent's settings as a derived overlay, whatever
 flag the file holds, so the file's settings never become grant authority, and each stored
 setting is checked as a settings override is; an overlay that fails the check is replaced

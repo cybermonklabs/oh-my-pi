@@ -235,7 +235,8 @@ const createAgentSessionOptionClasses: InputClasses<CreateAgentSessionOptions> =
 	// The stored session's cwd, where its tools run; a cold revive reads it from the reopened session manager.
 	cwd: "S",
 	additionalDirectories: "S, cold L parent",
-	// Set at a cold revive only: the cwd of the session its live inputs came from, where it is not the stored one.
+	// Mask-only project directories: the spawner's (the live parent's, else the root's, at a cold revive), the cwd those
+	// inputs came from at a cold revive where it is not the stored one, and those the transcript records.
 	secretsProjectDirs: "L",
 	agentDir: "N",
 	spawns: "S",

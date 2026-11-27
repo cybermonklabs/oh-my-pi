@@ -25,6 +25,7 @@ import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import * as lspModule from "@oh-my-pi/pi-coding-agent/lsp";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { getSecretPlaceholderKey, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { cfgSecretsEnabled } from "@oh-my-pi/pi-coding-agent/secrets/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -1711,6 +1712,26 @@ function readOnWake(env: ReviveEnv, file?: string): void {
 		: { yieldArguments: env.turns.yieldArguments };
 }
 
+/** A placeholder of the request's text right after `row`: how the mask wrote the secret of that file's row. */
+function placeholderAfter(request: RecordedRequest | undefined, row: string): string | undefined {
+	const text = JSON.stringify(request?.messages.map(message => message.content) ?? []);
+	const at = text.lastIndexOf(row);
+	if (at < 0) return undefined;
+	return /\$\$(?:[A-Z0-9]+_)?[A-Z0-9]{4,}(?::[ULCM])?\$\$/.exec(
+		text.slice(at + row.length, at + row.length + 200),
+	)?.[0];
+}
+
+/**
+ * The subagent's next wake turn writes `content` to `file` in the directory its tools run in; returns what the
+ * tool wrote, which is the argument as the tool received it, after the mask had its say.
+ */
+async function writeOnWake(env: ReviveEnv, session: AgentSession, id: string, file: string, content: string) {
+	env.turns = { ...env.turns, wakeToolCall: { name: "write", arguments: { path: file, content } } };
+	await env.wake(session, id);
+	return await fs.readFile(path.join(env.cwd, file), "utf8").catch(() => undefined);
+}
+
 describe("project secrets after the root session moved to another directory", () => {
 	const id = "SecretsAfterMove";
 	let env: ReviveEnv | undefined;
@@ -1719,6 +1740,10 @@ describe("project secrets after the root session moved to another directory", ()
 	let cold: RevivedSubagent | undefined;
 	let coldFirst: RecordedRequest | undefined;
 	let coldNext: RecordedRequest | undefined;
+	let coldBravoPlaceholder: string | undefined;
+	let coldAlphaPlaceholder: string | undefined;
+	let wroteFromBravo: string | undefined;
+	let wroteFromAlpha: string | undefined;
 
 	beforeAll(async () => {
 		const opened = await openTestProcess({ "secrets.enabled": true });
@@ -1739,6 +1764,19 @@ describe("project secrets after the root session moved to another directory", ()
 		readOnWake(env, BRAVO_FILE);
 		coldFirst = await env.wake(cold.session, id);
 		coldNext = env.requests.at(-1);
+		// The placeholders this install mints for SA and SB, computed APART from the session: the keyed base is
+		// a digest of the value, so an obfuscator on the same key mints the same token. Reading them from the
+		// session's own request would make these cases depend on the masking the case above pins.
+		const key = await getSecretPlaceholderKey(cold.build.options.agentDir);
+		const placeholderOf = (secret: string): string =>
+			new SecretObfuscator([{ type: "plain", content: secret, mode: "obfuscate" }], key).obfuscate(secret);
+		coldBravoPlaceholder = placeholderOf(SECRET_B);
+		coldAlphaPlaceholder = placeholderOf(SECRET_A);
+		// Each placeholder then rides in the subagent's OWN tool call, as a prompt injection in its directory
+		// could ask for: what the tool wrote is what reached the tool's arguments.
+		wroteFromBravo = await writeOnWake(env, cold.session, id, "from-bravo.txt", coldBravoPlaceholder);
+		wroteFromAlpha = await writeOnWake(env, cold.session, id, "from-alpha.txt", coldAlphaPlaceholder);
+		readOnWake(env);
 	}, 60_000);
 
 	afterAll(async () => {
@@ -1759,6 +1797,116 @@ describe("project secrets after the root session moved to another directory", ()
 		expect(coldNext).not.toBe(coldFirst);
 		expect(carries(coldNext, BRAVO_ROW)).toBe(true);
 		expect(carries(coldNext, SECRET_B)).toBe(false);
+		// The mask wrote SB as the token this install mints for it, which the cases below carry in a tool call.
+		expect(placeholderAfter(coldNext, BRAVO_ROW)).toBe(coldBravoPlaceholder);
+	}, 30_000);
+
+	it("project secrets: B's placeholder in the subagent's own tool call reaches the tool as the placeholder, never as SB", () => {
+		expect(wroteFromBravo).toBe(coldBravoPlaceholder);
+		expect(wroteFromBravo).not.toBe(SECRET_B);
+	}, 30_000);
+
+	it("project secrets: A's own placeholder in the same tool call still reaches the tool as SA", () => {
+		expect(wroteFromAlpha).toBe(SECRET_A);
+	}, 30_000);
+});
+
+/** What one session of the chain below did with SB and SA. */
+interface ChainStep {
+	/** The mask-only directories its build loaded. */
+	dirs: string[] | undefined;
+	/** The request after it read SB in A: SB must go out masked. */
+	bravoRequest: RecordedRequest | undefined;
+	/** What its own write call wrote from SB's placeholder: never SB. */
+	wroteFromBravo: string | undefined;
+	/** What its own write call wrote from SA's placeholder: SA. */
+	wroteFromAlpha: string | undefined;
+}
+
+describe("project secrets all down a revive chain", () => {
+	// A subagent S works in A; the root moves to B and S is revived cold, so S masks B's secrets one way. Then a child
+	// S spawns, S revived again after the root moved on to C (where no secrets.yml is), and the child revived after S
+	// parked: each still masks SB one way, though none of them takes its live inputs from B any more.
+	const parentId = "ChainParent";
+	const childId = "ChainChild";
+	let env: ReviveEnv | undefined;
+	let projectB = "";
+	let projectC = "";
+	let bravoPlaceholder = "";
+	let alphaPlaceholder = "";
+	const steps: Record<"child" | "parentAgain" | "childAgain", ChainStep | undefined> = {
+		child: undefined,
+		parentAgain: undefined,
+		childAgain: undefined,
+	};
+
+	/** `id`'s next turns read SB in A, write SB's placeholder, then SA's; `dirs` is its build's. */
+	async function chainStep(session: AgentSession, id: string, dirs: string[] | undefined): Promise<ChainStep> {
+		const live = env!;
+		readOnWake(live, BRAVO_FILE);
+		await live.wake(session, id);
+		const bravoRequest = live.requests.at(-1);
+		const wroteFromBravo = await writeOnWake(live, session, id, `${id}-from-bravo.txt`, bravoPlaceholder);
+		const wroteFromAlpha = await writeOnWake(live, session, id, `${id}-from-alpha.txt`, alphaPlaceholder);
+		readOnWake(live);
+		return { dirs, bravoRequest, wroteFromBravo, wroteFromAlpha };
+	}
+
+	beforeAll(async () => {
+		const opened = await openTestProcess({ "secrets.enabled": true });
+		env = opened.env;
+		projectB = await writeSecretProjects(env);
+		projectC = path.join(env.root, "project-c");
+		await fs.mkdir(projectC, { recursive: true });
+		await env.spawn(taskSpawn(env, opened.root.toolSession, parentId));
+		await env.park(parentId);
+		await opened.root.session.sessionManager.moveTo(projectB);
+		const parent = await reviveCold(env, parentId);
+		const key = await getSecretPlaceholderKey(parent.build.options.agentDir);
+		const placeholderOf = (secret: string): string =>
+			new SecretObfuscator([{ type: "plain", content: secret, mode: "obfuscate" }], key).obfuscate(secret);
+		bravoPlaceholder = placeholderOf(SECRET_B);
+		alphaPlaceholder = placeholderOf(SECRET_A);
+		// The revived parent spawns a child in A, its own directory.
+		await env.spawn(taskSpawn(env, env.toolSessionOf(parentId), childId));
+		const childBuild = env.builds.findLast(build => build.options.agentId === childId);
+		steps.child = await chainStep(liveSession(childId), childId, childBuild?.options.secretsProjectDirs);
+		await env.park(childId);
+		await env.park(parentId);
+		// The root moves on to C: the parent's next source holds none of B's secrets.
+		await opened.root.session.sessionManager.moveTo(projectC);
+		// A cold-revived subagent parks with no warm reviver, so its next revive is cold too.
+		const parentAgain = await env.revive(parentId);
+		steps.parentAgain = await chainStep(parentAgain.session, parentId, parentAgain.build.options.secretsProjectDirs);
+		await env.park(parentId);
+		// The child revived with its parent parked takes its live inputs from the root, in C.
+		const childAgain = await reviveCold(env, childId);
+		steps.childAgain = await chainStep(childAgain.session, childId, childAgain.build.options.secretsProjectDirs);
+	}, 120_000);
+
+	afterAll(async () => {
+		await env?.close();
+	}, 30_000);
+
+	for (const name of ["child", "parentAgain", "childAgain"] as const) {
+		it(`revive chain, ${name}: its mask loads B's secrets, and SB goes out masked`, () => {
+			const step = steps[name];
+			expect(step?.dirs).toContain(projectB);
+			expect(carries(step?.bravoRequest, BRAVO_ROW)).toBe(true);
+			expect(carries(step?.bravoRequest, SECRET_B)).toBe(false);
+		}, 30_000);
+
+		it(`revive chain, ${name}: SB's placeholder in its own tool call reaches the tool as the placeholder, never as SB`, () => {
+			expect(steps[name]?.wroteFromBravo).toBe(bravoPlaceholder);
+		}, 30_000);
+
+		it(`revive chain, ${name}: A's own placeholder still reaches its tool as SA`, () => {
+			expect(steps[name]?.wroteFromAlpha).toBe(SECRET_A);
+		}, 30_000);
+	}
+
+	it("revive chain: the parent's second cold revive also loads C, the directory its live inputs now come from", () => {
+		expect(steps.parentAgain?.dirs).toContain(projectC);
 	}, 30_000);
 });
 

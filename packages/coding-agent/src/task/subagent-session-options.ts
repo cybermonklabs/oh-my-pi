@@ -4,6 +4,7 @@
  * the session options and system prompt the spawn spec (`./spawn-spec`) and those inputs give, and the IRC peer roster
  * the prompt renders, with the transcript records of that roster a warm revive renders again.
  */
+import * as path from "node:path";
 import type { AgentIdentity, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { type Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
@@ -207,6 +208,47 @@ function recordedIrcRosters(
 		if (block !== undefined) renders.set(block, record.roster);
 	}
 	return { renders, recorded };
+}
+
+/**
+ * Custom transcript entry recording project directories whose secrets a subagent's mask holds mask-only
+ * (`secretsProjectDirs`): the directory its live inputs came from at a cold revive in another directory, and
+ * those its spawner held. Every later build of the subagent loads them again, so a revive after that source is
+ * gone (the root moved on, the parent parked) still masks, one way, the values its transcript and its own
+ * reads hold. Custom entries never enter the model's context. A writer of the session store could add a
+ * directory here; that only masks more, since a mask-only value is never restored.
+ */
+const MASK_ONLY_SECRET_DIRS_ENTRY = "subagent-mask-only-secret-dirs";
+
+/** Every directory an {@link MASK_ONLY_SECRET_DIRS_ENTRY} of `entries` records, resolved. */
+function recordedMaskOnlySecretDirs(entries: readonly SessionEntry[]): string[] {
+	const dirs: string[] = [];
+	for (const entry of entries) {
+		if (entry.type !== "custom" || entry.customType !== MASK_ONLY_SECRET_DIRS_ENTRY || !isRecord(entry.data))
+			continue;
+		const recorded = entry.data.dirs;
+		if (!Array.isArray(recorded)) continue;
+		for (const dir of recorded) if (typeof dir === "string") dirs.push(path.resolve(dir));
+	}
+	return dirs;
+}
+
+/**
+ * The mask-only directories of a build: those its transcript records and those its live inputs give, each once;
+ * undefined where there is none.
+ */
+function maskOnlySecretDirs(sessionManager: SessionManager, live: readonly string[] | undefined): string[] | undefined {
+	const dirs = new Set(recordedMaskOnlySecretDirs(sessionManager.getEntries()));
+	for (const dir of live ?? []) dirs.add(path.resolve(dir));
+	return dirs.size > 0 ? [...dirs] : undefined;
+}
+
+/** Records those of `dirs` the transcript does not record yet in one {@link MASK_ONLY_SECRET_DIRS_ENTRY}. */
+function recordMaskOnlySecretDirs(sessionManager: SessionManager, dirs: readonly string[] | undefined): void {
+	if (!dirs) return;
+	const recorded = new Set(recordedMaskOnlySecretDirs(sessionManager.getEntries()));
+	const added = dirs.filter(dir => !recorded.has(dir));
+	if (added.length > 0) sessionManager.appendCustomEntry(MASK_ONLY_SECRET_DIRS_ENTRY, { dirs: added });
 }
 
 /** What a subagent's process allows it, whatever its spawn spec stores; each is allowed where absent. */
@@ -456,6 +498,8 @@ export async function buildSubagentSession(input: SubagentBuildInput): Promise<A
 		});
 		let startupModelFallback: CreateAgentSessionResult["startupModelFallback"];
 		({ session, startupModelFallback } = await settle(creation));
+		// Once the build stands, its transcript records the mask-only directories it loaded, for every later revive.
+		recordMaskOnlySecretDirs(sessionManager, options.secretsProjectDirs);
 		// A revive starts on the model its session started on, as an explicit model, so session creation reports
 		// no startup fallback for it: the one the spawn stored is recorded again for the revived session, and its
 		// runs report that model as the fallback, with the same reason, whenever it serves.
@@ -587,6 +631,7 @@ export type SubagentSpawnerLiveInputs = Pick<
 	| "preloadedPreparedExtensions"
 	| "preloadedCustomToolPaths"
 	| "localProtocolOptions"
+	| "secretsProjectDirs"
 	| "parentArtifactManager"
 	| "parentHindsightSessionState"
 	| "parentMnemopiSessionState"
@@ -612,6 +657,7 @@ type SpawnerLiveInputKeys =
 	| "parentMnemopiSessionState"
 	| "asyncJobManager"
 	| "localProtocolOptions"
+	| "secretsProjectDirs"
 	| "telemetry";
 
 /**
@@ -641,6 +687,7 @@ export function spawnerLiveInputs(
 		parentMnemopiSessionState: inputs.parentMnemopiSessionState,
 		asyncJobManager: inputs.asyncJobManager,
 		localProtocolOptions: inputs.localProtocolOptions,
+		secretsProjectDirs: inputs.secretsProjectDirs && [...inputs.secretsProjectDirs],
 		telemetry: subagentTelemetryConfig(inputs.parentTelemetry, agent),
 	};
 }
@@ -724,8 +771,9 @@ function subagentBaseOptions(input: SubagentBuildInput): SubagentBaseOptions {
 	const enableMCP = restricted ? false : narrowedToLive(policy.enableMCP, live.policy.enableMCP);
 	return {
 		cwd: policy.cwd,
-		// Set by a cold revive only: the cwd of the session its live inputs came from, where it is not the stored one.
-		secretsProjectDirs: live.secretsProjectDirs,
+		// Mask-only: the cwd a cold revive's live inputs came from where it is not the stored one, those the spawner
+		// (or that source) masks one way, and every one the transcript records from an earlier build.
+		secretsProjectDirs: maskOnlySecretDirs(input.sessionManager, live.secretsProjectDirs),
 		costGate: live.costGate,
 		cyberPolicyClosure: live.cyberPolicyClosure,
 		additionalDirectories: policy.additionalDirectories,

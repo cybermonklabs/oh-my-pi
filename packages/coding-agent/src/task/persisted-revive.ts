@@ -755,8 +755,11 @@ const KEPT_LIVE_INPUTS: Partial<Record<SpawnLiveInputName, true>> = {
  * servers in the stored directory; of its extensions only the explicit (configured included) and inline ones stay,
  * beside those discovery finds in the stored directory under the root session's extension policy
  * ({@link moveExtensionsToStoredDirectory}); the secret mask loads that session's project secrets beside the stored
- * directory's; and the revive builds on the main thread. A host's own MCP manager (`hostMcp`) passes in every case:
- * discovery cannot rebuild it.
+ * directory's, as mask-only entries, which the subagent's own tool calls never turn back into their values
+ * (`loadSecrets`, `SecretEntry.maskOnly`); and the revive builds on the main thread. In every case the mask also
+ * loads, mask-only, the project secrets that session itself masks one way (its `secretsProjectDirs`), and the build
+ * adds those the subagent's transcript records, so a source project stays masked all down a revive chain. A host's
+ * own MCP manager (`hostMcp`) passes in every case: discovery cannot rebuild it.
  */
 async function coldReviveLiveInputs(
 	ctx: PersistedSubagentReviveContext,
@@ -828,7 +831,10 @@ async function coldReviveLiveInputs(
 	// host, not from a directory, so it passes where the session the inputs come from works elsewhere too.
 	if (hostMcp) live.mcpManager = hostMcp.manager;
 	if (!elsewhere) return { live, buildsOnMain: false };
-	live.secretsProjectDirs = [sourceCwd];
+	// The source project's secrets, which `loadSecrets` loads mask-only: hidden on the way out of this subagent,
+	// and never restored into a tool call it makes in the directory it works in. Beside those the source session
+	// itself masks one way, which `spawnerLiveInputs` passed.
+	live.secretsProjectDirs = [sourceCwd, ...(live.secretsProjectDirs ?? [])];
 	await moveExtensionsToStoredDirectory(live, root.effectiveExtensionRoots, ctx.settings, storedCwd);
 	return { live, buildsOnMain: true };
 }

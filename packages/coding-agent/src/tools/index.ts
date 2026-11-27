@@ -308,6 +308,12 @@ export interface ToolSession {
 	 * re-bind tools to their own session-scoped `CustomToolAPI`.
 	 */
 	customToolPaths?: ToolPathWithSource[];
+	/**
+	 * Project directories besides cwd whose secrets this session's mask holds mask-only (`secretsProjectDirs`
+	 * of its build). A subagent spawned or revived from this session holds them mask-only too, so a revived
+	 * subagent's source project stays masked one way all down its chain.
+	 */
+	secretsProjectDirs?: readonly string[];
 	/** Whether LSP integrations are enabled */
 	enableLsp?: boolean;
 	/** Whether LSP is limited to navigation and diagnostics. */

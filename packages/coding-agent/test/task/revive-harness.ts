@@ -553,6 +553,7 @@ export function spawnerOptions(session: ToolSession, restrictToolNames = false):
 		localProtocolOptions: sessionLocalProtocolOptions(session),
 		parentArtifactManager: session.getArtifactManager?.() ?? undefined,
 		parentHindsightSessionState: session.getHindsightSessionState?.(),
+		secretsProjectDirs: session.secretsProjectDirs,
 		parentMnemopiSessionState: session.getMnemopiSessionState?.(),
 		parentTelemetry: session.getTelemetry?.(),
 		parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,

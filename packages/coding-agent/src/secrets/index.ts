@@ -160,6 +160,14 @@ export { secretEntriesNeedPlaceholderKey, secretEntryNeedsPlaceholderKey } from 
  * Load secrets from project-local and global secrets.yml files: the project file of `cwd`, and that of each
  * of `extraProjectDirs` (each directory read once). Project-local entries override global entries with
  * matching content, and the entries of `cwd`'s project those of the other projects.
+ *
+ * An entry only an `extraProjectDirs` project holds is MASK-ONLY ({@link SecretEntry.maskOnly}): the session
+ * hides it on the way out, as it hides its own, and never restores its placeholder in a tool call's
+ * arguments. Those directories belong to another session — a subagent revived into its own directory takes
+ * them from the session its live inputs come from — and a value of theirs is not this session's to hand to a
+ * tool, where a prompt injection in the directory it works in could ask for it. A value this session also
+ * holds of its own, in `cwd`'s project or in the global file, keeps its own restorable entry, so an
+ * exact-match edit of it still round-trips.
  */
 export async function loadSecrets(
 	cwd: string,
@@ -167,17 +175,21 @@ export async function loadSecrets(
 	extraProjectDirs: readonly string[] = [],
 ): Promise<SecretEntry[]> {
 	const globalEntries = await loadSecretsFile(globalSecretsFilePath(agentDir));
+	const globalContents = new Set(globalEntries.map(entry => entry.content));
 	// `cwd`'s project first, whole; each other project adds only the contents no project before it holds.
 	const projectEntries: SecretEntry[] = [];
 	const projectContents = new Set<string>();
 	const read = new Set<string>();
+	const ownCwd = path.resolve(cwd);
 	for (const dir of [cwd, ...extraProjectDirs]) {
 		const resolved = path.resolve(dir);
 		if (read.has(resolved)) continue;
 		read.add(resolved);
 		const entries = await loadSecretsFile(projectSecretsFilePath(resolved));
+		const maskOnly = resolved !== ownCwd;
 		for (const entry of entries) {
-			if (!projectContents.has(entry.content)) projectEntries.push(entry);
+			if (projectContents.has(entry.content)) continue;
+			projectEntries.push(maskOnly && !globalContents.has(entry.content) ? { ...entry, maskOnly: true } : entry);
 		}
 		for (const entry of entries) projectContents.add(entry.content);
 	}

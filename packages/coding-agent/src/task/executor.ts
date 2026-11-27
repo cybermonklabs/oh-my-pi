@@ -417,6 +417,11 @@ export interface ExecutorOptions {
 	cyberPolicyClosure?: CyberPolicyClosureApi;
 	/** Additional workspace directories to seed on the subagent session (multi-root). */
 	additionalDirectories?: string[];
+	/**
+	 * Project directories whose secrets the spawner's mask holds mask-only (its tool session's
+	 * `secretsProjectDirs`): the subagent's mask holds them mask-only too, and so does each of its revives.
+	 */
+	secretsProjectDirs?: readonly string[];
 	/** Exact provider credential resolver inherited from the parent session. */
 	getApiKey?: CreateAgentSessionOptions["getApiKey"];
 	/** Parent session's manager; the child and its revived turns use this exact delivery scope. */

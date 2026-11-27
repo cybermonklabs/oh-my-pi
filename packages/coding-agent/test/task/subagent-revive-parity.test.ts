@@ -135,8 +135,8 @@ const OPTION_COMPARES = {
 	// Derived from the stored per-call flag, and server-side fallback from the stored hold too.
 	disableModelFallback: "flag",
 	disableServerSideFallback: "flag",
-	// Set at a cold revive only, to the cwd of the session its live inputs come from (the live parent, else the root)
-	// where it is not the stored session's cwd, so a mask entry is only added: on no route here do the two differ.
+	// The spawner's mask-only directories, the cwd a cold revive's live inputs come from where it is not the stored
+	// session's, and those the transcript records: on no route here does a session hold any.
 	secretsProjectDirs: "data",
 	// Set by no subagent build, so the SDK default holds on every path.
 	additionalExtensionPaths: "data",

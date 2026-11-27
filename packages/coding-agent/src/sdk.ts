@@ -632,7 +632,9 @@ export interface CreateAgentSessionOptions {
 	/**
 	 * Project directories whose `.omp/secrets.yml` the secret mask loads besides cwd's (each directory once, cwd
 	 * included; the global secrets load once either way): a subagent revived from its file whose live inputs come
-	 * from a session in another directory passes that directory, so the secrets of both projects stay masked.
+	 * from a session in another directory passes that directory, so the secrets of both projects stay masked. A
+	 * value only one of these projects holds is masked but never restored: it is hidden on the way out, and the
+	 * session's own tool calls get its placeholder, never the value (`loadSecrets`, `SecretEntry.maskOnly`).
 	 */
 	secretsProjectDirs?: string[];
 	/** Global config directory. Default: ~/.omp/agent */
@@ -2766,6 +2768,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			get additionalDirectories() {
 				return sessionManager.getAdditionalDirectories();
 			},
+			secretsProjectDirs: options.secretsProjectDirs,
 			enableLsp,
 			lspReadOnly,
 			enableIrc: restrictToolNames ? false : options.enableIrc,
