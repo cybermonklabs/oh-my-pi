@@ -4572,8 +4572,8 @@ fn external_ended(k: &mut Kernel, vp: &Vproc, killed: Option<Signal>, replacing:
 /// then it goes on.
 fn end_held_sigint(k: &mut Kernel, vp: &Vproc, comsub: bool) {
 	let act = match k.int_note(vp.vpid) {
-		Some(IntNote::Held(HeldInt::Job { caught })) if !comsub => !caught,
-		Some(IntNote::Held(HeldInt::Comsub)) if comsub => true,
+		Some(IntNote::Held(HeldInt::Job { caught: _ })) if !comsub => false,
+		Some(IntNote::Held(HeldInt::Comsub)) if comsub => false,
 		_ => return,
 	};
 	k.set_int_note(vp.vpid, None);
