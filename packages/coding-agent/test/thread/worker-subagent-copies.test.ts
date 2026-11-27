@@ -498,6 +498,12 @@ describe("copies of a worker subagent's context", () => {
 				.filter(node => parked.edges(node).some(edge => edge.type === "property" && edge.name === "displayName"));
 
 			const running = run.copies.reduce((sum, thread) => sum + thread.copies, 0);
+			const report = [
+				copiesReport(`near the end of its run, in both heaps (at most ${MAX_COPIES})`, run.copies),
+				copiesReport("parked and its worker stopped, in main (none)", [left]),
+			].join("\n");
+			// Printed on every run, pass or fail, so a run's record carries the copies it counted.
+			console.error(`two-heap copies report:\n${report}`);
 			expect(
 				{
 					runningCopiesAtMostFive: running <= MAX_COPIES,
@@ -505,10 +511,7 @@ describe("copies of a worker subagent's context", () => {
 					records: records.length,
 					recordRunObjects: records.flatMap(record => recordRunObjects(parked, record)),
 				},
-				[
-					copiesReport(`near the end of its run, in both heaps (at most ${MAX_COPIES})`, run.copies),
-					copiesReport("parked and its worker stopped, in main (none)", [left]),
-				].join("\n"),
+				report,
 			).toEqual({ runningCopiesAtMostFive: true, parkedCopies: 0, records: 1, recordRunObjects: [] });
 		},
 		TEST_TIMEOUT_MS,
