@@ -1939,7 +1939,8 @@ prun P11-query-names-no-rust-test 1 'bazel query names no crate root of any rust
 # lines of `<binary-id> <package> <kind> <name> <tests...>`, each a test
 # binary of the archive, recorded under another target directory, whose
 # --list names those tests. BAZEL_BIN: lines of `<label> <tests...>`, the
-# binaries a bazel build leaves in bazel-bin; BUILD_RC, that build's exit. The
+# binaries a bazel build leaves in bazel-bin; BUILD_RC, that build's exit;
+# BUILD_FAILS, labels whose build fails (exit 1) when it names any of them. The
 # output then names each index.tsv line with its listing (`<label>: <tests>`).
 # EARLY_MODE: both (one call, the default), halves (the Bazel half, then the
 # archive half, as the build job runs them) or unfinished (the archive half
@@ -1987,7 +1988,7 @@ EOF
 #!/bin/sh
 case "\$1" in
 	query) cat "$w/rules.json" ;;
-	build) exit "\${BUILD_RC:-0}" ;;
+	build) for a in "\$@"; do case " \${BUILD_FAILS:-} " in *" \$a "*) exit 1 ;; esac; done; exit "\${BUILD_RC:-0}" ;;
 	info) echo "$w/binroot" ;;
 	*) echo "stub: bazelisk \$*" >&2; exit 2 ;;
 esac
@@ -2021,6 +2022,9 @@ EWIRE="$(rule rust_test //crates/demo:wire_test "$(strs srcs //crates/demo:tests
 # The Bazel-only target, as //crates/pi-natives:oauth_callback_relay_test:
 # cargo builds its crate root through build.rs, as no test target.
 ERELAY="$(rule rust_test //crates/demo:relay_test "$(str crate_root //crates/demo:src/relay.rs)" "$(strs srcs //crates/demo:src/relay.rs //crates/demo:src/publication.rs)")"
+# A second Bazel-only target, whose source the tree lacks (as
+# zle_vi_pty_test at Cut18 95097f22): its build fails (BUILD_FAILS).
+EGONE="$(rule rust_test //crates/demo:gone_test "$(str crate_root //crates/demo:tests/gone.rs)" "$(strs srcs //crates/demo:tests/gone.rs)")"
 ERULES="$ELIB
 $EDEMO
 $EWIRE
@@ -2047,9 +2051,15 @@ erun E5-binary-maps-to-two-labels 1 'test binary demo \(crates/demo/src/lib.rs\)
 $(rule rust_test //crates/demo:demo_again_test "$(str crate //crates/demo:demo)")" "$EBINS"
 # A binary that is no cargo target fails (E6). A Bazel-only target whose
 # Linux build fails (E7), or that leaves no binary (E8), fails by its label.
+# When one Bazel-only target of two does not build, only it fails, and the
+# other, built alone, is still listed (E7b, E7c; run 46036206702 named both).
 erun E6-binary-of-no-cargo-target 1 'test binary demo::ghost \(test ghost of .*\) is 0 cargo targets in cargo metadata' "$ERULES" "$EBINS
 demo::ghost demo test ghost g::one"
-BUILD_RC=1 erun E7-bazel-only-build-fails 1 '//crates/demo:relay_test: Bazel-only \(no test binary of the archive is it\), and the bazel build of it for Linux exited 1' "$ERULES" "$EBINS"
+BUILD_RC=1 erun E7-bazel-only-build-fails 1 '//crates/demo:relay_test: Bazel-only \(no test binary of the archive is it\), and the bazel build of it alone for Linux exited 1' "$ERULES" "$EBINS"
+EARLY_MODE=halves BUILD_FAILS=//crates/demo:gone_test NOT_MSG='relay_test: (Bazel-only|a rust_test bazel query names)' erun E7b-a-bazel-only-build-failure-names-only-its-target 1 '//crates/demo:gone_test: Bazel-only \(no test binary of the archive is it\), and the bazel build of it alone for Linux exited 1' "$ERULES
+$EGONE" "$EBINS"
+EARLY_MODE=halves BUILD_FAILS=//crates/demo:gone_test erun E7c-the-bazel-only-target-that-built-is-listed 1 '^//crates/demo:relay_test: r::one tests::two$' "$ERULES
+$EGONE" "$EBINS"
 BAZEL_BIN='' erun E8-bazel-only-without-a-binary 1 '//crates/demo:relay_test: its binary .* cannot list its tests' "$ERULES" "$EBINS"
 # Nothing to list is UNKNOWN, never a pass: no rust_test (E9), no binary (E10).
 erun E9-query-names-no-rust-test 1 'UNKNOWN: bazel query names no rust_test under //crates' "$ELIB" "$EBINS"
