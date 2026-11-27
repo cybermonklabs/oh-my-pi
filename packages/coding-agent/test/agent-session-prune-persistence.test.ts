@@ -24,6 +24,77 @@ import {
 import { collectSubSessions } from "@oh-my-pi/pi-coding-agent/session/sub-sessions";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
+// EVIDENCE ONLY (not for push): the real collab host and a raw guest, as test/collab/read-only.test.ts runs them.
+import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
+import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
+import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
+import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { installInMemoryRelay, uninstallInMemoryRelay } from "./collab/helpers/in-memory-relay";
+
+function evidenceHostContext(): InteractiveModeContext {
+	return {
+		settings: Settings.isolated(),
+		sessionManager: {
+			getSessionId: () => "evidence-host",
+			getCwd: () => "/tmp",
+			snapshotForReplication: () => ({
+				header: { type: "session", id: "evidence-host", timestamp: new Date().toISOString(), cwd: "/tmp" },
+				entries: [],
+			}),
+			onEntryAppended: undefined,
+		},
+		session: {
+			isStreaming: false,
+			queuedMessageCount: 0,
+			sessionName: "evidence",
+			model: undefined,
+			thinkingLevel: undefined,
+			subscribe: () => () => {},
+			emitNotice: () => {},
+			promptCustomMessage: () => Promise.resolve(),
+			abort: () => Promise.resolve(),
+			resume: () => Promise.resolve(),
+		},
+		eventBus: undefined,
+		statusLine: {
+			setCollabStatus: () => {},
+			facts: () => ({ context: { tokens: 0, window: 0, percent: null } }),
+		},
+		showStatus: () => {},
+		collabHost: undefined,
+	} as unknown as InteractiveModeContext;
+}
+
+const EVIDENCE_SKIPPED_FRAMES = new Set(["state", "agents", "entry", "event", "bus", "snapshot-chunk"]);
+
+async function evidenceGuest(link: string): Promise<{ socket: CollabSocket; nextFrame(): Promise<CollabFrame> }> {
+	const parsed = parseCollabLink(link);
+	if ("error" in parsed) throw new Error(parsed.error);
+	const key = await importRoomKey(parsed.key);
+	const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+	const queue: CollabFrame[] = [];
+	const waiters: ((frame: CollabFrame) => void)[] = [];
+	socket.onFrame = frame => {
+		if (EVIDENCE_SKIPPED_FRAMES.has(frame.t)) return;
+		const waiter = waiters.shift();
+		if (waiter) waiter(frame);
+		else queue.push(frame);
+	};
+	socket.onOpen = () => socket.send({ t: "hello", proto: COLLAB_PROTO, name: "evidence-reader" });
+	socket.connect();
+	return {
+		socket,
+		nextFrame: () => {
+			const queued = queue.shift();
+			if (queued) return Promise.resolve(queued);
+			const { promise, resolve } = Promise.withResolvers<CollabFrame>();
+			waiters.push(resolve);
+			return promise;
+		},
+	};
+}
 
 /**
  * File storage that counts the bytes the session layer hands it — whole-body
@@ -572,6 +643,73 @@ describe("AgentSession per-turn prune persistence", () => {
 		expect(liveResultText(grownCallId)).toBe(USELESS_NOTICE);
 		expect(longestLineBytes()).toBeLessThanOrEqual(TRANSCRIPT_READ_CAP);
 		expect(await rebuiltResultText(grownCallId)).toBe(USELESS_NOTICE);
+	});
+
+	/** EVIDENCE: ends a turn, then reads the session file from byte 0 as a cold collab guest through CollabHost. */
+	async function evidenceColdGuestRead(): Promise<void> {
+		await endTurn();
+		await sessionManager.flush();
+		const sessionFile = persistedSessionFile();
+		const fileSize = fs.statSync(sessionFile).size;
+
+		installInMemoryRelay();
+		const host = new CollabHost(evidenceHostContext());
+		await host.start("ws://localhost:8787");
+		const id = `evidence-${crypto.randomUUID()}`;
+		const registry = AgentRegistry.global();
+		const ref = registry.register({ id, displayName: id, kind: "sub", session: null, sessionFile });
+		try {
+			const guest = await evidenceGuest(host.viewLink);
+			try {
+				const welcome = await guest.nextFrame();
+				if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
+				let from = 0;
+				let text = "";
+				let replies = 0;
+				const errors: string[] = [];
+				while (from < fileSize && replies < 100) {
+					replies++;
+					guest.socket.send({ t: "fetch-transcript", reqId: replies, agentId: id, fromByte: from });
+					const reply = await guest.nextFrame();
+					if (reply.t !== "transcript") throw new Error(`expected transcript, got ${reply.t}`);
+					if (reply.error) {
+						errors.push(reply.error);
+						break;
+					}
+					text += reply.text;
+					from = reply.newSize;
+				}
+				const records = text.split("\n").filter(line => line.includes('"customType":"tool_result_prune"')).length;
+				console.log(
+					`EVIDENCE-FETCH fileSize=${fileSize} reachedByte=${from} replies=${replies} records=${records} errors=${JSON.stringify(errors)}`,
+				);
+				expect(errors).toEqual([]);
+				expect(from).toBe(fileSize);
+				expect(records).toBeGreaterThan(0);
+			} finally {
+				guest.socket.close();
+			}
+		} finally {
+			registry.unregister(id, ref);
+			await host.stop("evidence done");
+			uninstallInMemoryRelay();
+		}
+	}
+
+	it("EVIDENCE: a cold collab guest reads the pruned transcript to its end through CollabHost", async () => {
+		await seedUselessResult("call-long-useless-evidence", longTextBlocks(36_000));
+		await evidenceColdGuestRead();
+	});
+
+	it("EVIDENCE: a cold collab guest reads a persistence-lengthened pruned transcript to its end", async () => {
+		const details = {
+			frames: Array.from({ length: 2_000 }, () => ({ image_url: "data:image/png;base64,AA==" })),
+		};
+		const repeatBytes = 11 * (Buffer.byteLength(JSON.stringify("long match\n"), "utf8") - 2);
+		const detailsBytes = Buffer.byteLength(JSON.stringify(details), "utf8");
+		const content = longTextBlocks(Math.floor((TRANSCRIPT_READ_CAP - 50_000 - detailsBytes) / repeatBytes));
+		await seedUselessResult("call-grown-useless-evidence", content, details);
+		await evidenceColdGuestRead();
 	});
 
 	describe("advisor across the per-turn prune", () => {
