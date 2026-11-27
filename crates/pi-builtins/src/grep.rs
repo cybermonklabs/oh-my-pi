@@ -34,6 +34,7 @@ use pi_walker::{
 	grep::{Engine, pcre2_jit_enabled},
 	walk,
 };
+use regex_automata::{Anchored, MatchKind, meta, util::syntax};
 use crate::bre;
 use crate::host::{AsyncUtility, Host, StdoutFile};
 use crate::stdio;
@@ -493,6 +494,9 @@ struct Options {
 	/// Whether an input that is the file stdout lands in is refused; see
 	/// [`Grep::run`].
 	refuse_output_file:  bool,
+	/// Extends each match `-o` prints to the longest that starts there; see
+	/// [`build_longest`].
+	longest:             Option<meta::Regex>,
 }
 
 #[derive(Clone)]
@@ -726,15 +730,16 @@ fn normalize_context_args(argv: Vec<OsString>) -> Vec<OsString> {
 /// `grep-regex` at all, and escaping the TRANSLATION would make `\(a\)\1`
 /// match the text `(a)\1` rather than the bytes the user typed. The literal
 /// fallback must reproduce the user's pattern, which is what it did before the
-/// translation step existed.
+/// translation step existed. Returns the patterns that compiled instead of
+/// `patterns` when any fell back.
 fn build_default_matcher<P: AsRef<str>, F: AsRef<str>>(
 	builder: &RegexMatcherBuilder,
 	patterns: &[P],
 	fallbacks: &[F],
-) -> Result<RegexMatcher, String> {
+) -> Result<(RegexMatcher, Option<Vec<String>>), String> {
 	debug_assert_eq!(patterns.len(), fallbacks.len());
 	let error = match builder.build_many(patterns) {
-		Ok(matcher) => return Ok(matcher),
+		Ok(matcher) => return Ok((matcher, None)),
 		Err(error) => error,
 	};
 	let sanitized: Vec<String> = patterns
@@ -751,17 +756,20 @@ fn build_default_matcher<P: AsRef<str>, F: AsRef<str>>(
 		.collect();
 	builder
 		.build_many(&sanitized)
+		.map(|matcher| (matcher, Some(sanitized)))
 		.map_err(|_| error.to_string())
 }
 
-/// Compile all patterns using the last-selected matcher mode.
+/// Compile all patterns using the last-selected matcher mode, and the regex
+/// that extends the matches `-o` prints; see [`build_longest`].
 fn build_matcher(
 	host: &Host,
 	patterns: &[String],
 	cli: &GrepArgs,
 	mode: MatchMode,
 	ignore_case: bool,
-) -> Result<Engine, String> {
+	prints_matches: bool,
+) -> Result<(Engine, Option<meta::Regex>), String> {
 	if mode == MatchMode::Perl {
 		let mut builder = PcreMatcherBuilder::new();
 		builder
@@ -773,13 +781,17 @@ fn build_matcher(
 			.jit_if_available(pcre2_jit_enabled(host.var("OMP_PCRE2_JIT")));
 		return builder
 			.build_many(patterns)
-			.map(Engine::Pcre)
+			.map(|matcher| (Engine::Pcre(matcher), None))
 			.map_err(|error| error.to_string());
 	}
 
+	// Under `-v` or `-L` an empty pattern list (`-f` of an empty file) is still
+	// searched, and must match nothing. `grep-regex` folds case by parsing the
+	// patterns joined by `|`, which for none is the empty regex: it matches
+	// every line. Unfolded, the list compiles to an empty alternation.
 	let mut builder = RegexMatcherBuilder::new();
 	builder
-		.case_insensitive(ignore_case)
+		.case_insensitive(ignore_case && !patterns.is_empty())
 		.word(cli.word && !cli.line_regexp)
 		.whole_line(cli.line_regexp);
 	if cli.null_data {
@@ -789,7 +801,9 @@ fn build_matcher(
 		let escaped: Vec<String> = patterns.iter().map(|pattern| regex::escape(pattern)).collect();
 		return builder
 			.build_many(&escaped)
-			.map(Engine::Rust)
+			.map(|matcher| {
+				(Engine::Rust(matcher), build_longest(prints_matches, &escaped, cli, ignore_case))
+			})
 			.map_err(|error| error.to_string());
 	}
 
@@ -814,7 +828,9 @@ fn build_matcher(
 			})
 			.collect::<Result<_, _>>()
 			.map_err(|e: bre::BreError| e.message().to_owned())?;
-		return build_default_matcher(&builder, &translated, patterns).map(Engine::Rust);
+		let (matcher, sanitized) = build_default_matcher(&builder, &translated, patterns)?;
+		let compiled = sanitized.as_deref().unwrap_or(&translated);
+		return Ok((Engine::Rust(matcher), build_longest(prints_matches, compiled, cli, ignore_case)));
 	}
 
 	// A `{` that opens no interval is a literal to GNU and BSD grep, but the
@@ -838,8 +854,82 @@ fn build_matcher(
 
 	builder
 		.build_many(&patterns)
-		.map(Engine::Rust)
+		.map(|matcher| {
+			(Engine::Rust(matcher), build_longest(prints_matches, &patterns, cli, ignore_case))
+		})
 		.map_err(|error| error.to_string())
+}
+
+/// The regex that extends each match `-o` prints to the longest one that
+/// starts where it does, as GNU grep prints it: the engine takes the first
+/// pattern, and the first alternative, that matches at a position. It is the
+/// alternation of the `patterns` the engine compiled, read as the engine reads
+/// them, under [`MatchKind::All`], so that a search anchored at a match's
+/// start ends at the last match there. `None` where `-o` prints no match
+/// (`!prints_matches`) or no match can be longer than the engine's: under
+/// `-x`, for one pattern with no alternative and no repetition, or when it
+/// does not compile.
+fn build_longest<P: AsRef<str>>(
+	prints_matches: bool,
+	patterns: &[P],
+	cli: &GrepArgs,
+	ignore_case: bool,
+) -> Option<meta::Regex> {
+	if !prints_matches
+		|| cli.line_regexp
+		|| (patterns.len() < 2
+			&& !patterns.iter().any(|pattern| pattern.as_ref().contains(['|', '*', '+', '?', '{'])))
+	{
+		return None;
+	}
+	let alternation = patterns
+		.iter()
+		.map(|pattern| format!("(?:{})", pattern.as_ref()))
+		.collect::<Vec<_>>()
+		.join("|");
+	let pattern = if cli.word {
+		format!(r"\b{{start-half}}(?:{alternation})\b{{end-half}}")
+	} else {
+		alternation
+	};
+	// A literal prefilter would find the literals in priority order. The line
+	// may not be UTF-8, as `grep-regex` allows.
+	let config =
+		meta::Regex::config().match_kind(MatchKind::All).auto_prefilter(false).utf8_empty(false);
+	meta::Regex::builder()
+		.configure(config)
+		.syntax(syntax::Config::new().case_insensitive(ignore_case).utf8(false))
+		.build(&pattern)
+		.ok()
+}
+
+/// `matcher`, each match it finds extended by `longest` (see
+/// [`build_longest`]).
+struct LongestMatch<'a, M> {
+	matcher: &'a M,
+	longest: Option<&'a meta::Regex>,
+}
+
+impl<M: Matcher> Matcher for LongestMatch<'_, M> {
+	type Captures = M::Captures;
+	type Error = M::Error;
+
+	fn find_at(&self, haystack: &[u8], at: usize) -> Result<Option<grep_matcher::Match>, M::Error> {
+		let found = self.matcher.find_at(haystack, at)?;
+		let (Some(first), Some(longest)) = (found, self.longest) else {
+			return Ok(found);
+		};
+		let input =
+			regex_automata::Input::new(haystack).range(first.start()..).anchored(Anchored::Yes);
+		Ok(Some(match longest.search(&input) {
+			Some(last) if last.end() > first.end() => first.with_end(last.end()),
+			_ => first,
+		}))
+	}
+
+	fn new_captures(&self) -> Result<M::Captures, M::Error> {
+		self.matcher.new_captures()
+	}
 }
 
 /// `pattern`, in the `regex` crate's syntax, with each `[:alpha:]` of a
@@ -1001,7 +1091,9 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 		line_number: Option<u64>,
 		line_offset: u64,
 	) -> io::Result<()> {
-		for_each_nonempty_match(self.matcher, line, line_offset, |found, match_offset| {
+		let opts = self.opts;
+		let matcher = LongestMatch { matcher: self.matcher, longest: opts.longest.as_ref() };
+		for_each_nonempty_match(&matcher, line, line_offset, |found, match_offset| {
 			self.write_prefix(line_number, match_offset, b':')?;
 			self.write_record(&line[found.start()..found.end()])
 		})
@@ -2193,21 +2285,34 @@ impl AsyncUtility for Grep {
 			return 2;
 		},
 	};
+	let (files_with_matches, files_without_match) = resolve_file_list_modes(&matches);
 	// GNU answers `-m 0` before it compiles the patterns or opens any input:
 	// no line can be selected, so it prints no count and reports no missing
-	// file. Only `-L`, which lists the files with no selected line, reads
-	// them, unless `-q` overrides it.
-	if cli.max_count == Some(0) && (cli.quiet || !resolve_file_list_modes(&matches).1) {
+	// file. It answers so with no pattern (`-f` of an empty file) too, unless
+	// `-v` selects every line. Only `-L`, which lists the files with no
+	// selected line, reads them, unless `-q` overrides it.
+	if (cli.max_count == Some(0) || (patterns.is_empty() && !cli.invert))
+		&& (cli.quiet || !files_without_match)
+	{
 		return 1;
 	}
-	let matcher = match build_matcher(
+	// The lines `-v` selects hold no match, and `-c`, `-q`, `-l` and `-L`
+	// print none.
+	let prints_matches = cli.only_matching
+		&& !cli.invert
+		&& !cli.count
+		&& !cli.quiet
+		&& !files_with_matches
+		&& !files_without_match;
+	let (matcher, longest) = match build_matcher(
 		host,
 		&patterns,
 		&cli,
 		resolve_match_mode(&matches),
 		resolve_ignore_case(&matches),
+		prints_matches,
 	) {
-		Ok(matcher) => matcher,
+		Ok(built) => built,
 		Err(error) => {
 			let _ = writeln!(host.stderr, "grep: {error}");
 			return 2;
@@ -2227,7 +2332,6 @@ impl AsyncUtility for Grep {
 	let selects_no_record = (zero_patterns && !cli.invert) || inverted_empty_pattern;
 	patterns.clear();
 
-	let (files_with_matches, files_without_match) = resolve_file_list_modes(&matches);
 	let suppress_context =
 		cli.count || files_with_matches || files_without_match || cli.quiet;
 	// GNU prints a `--` between two groups of lines wherever a context option
@@ -2279,6 +2383,7 @@ impl AsyncUtility for Grep {
 			&& cli.max_count.is_some_and(|count| count < 0)
 			&& context_given,
 		refuse_output_file,
+		longest,
 	};
 	let follow_links = resolve_follow_links(&cli, &matches);
 
@@ -3036,9 +3141,10 @@ mod tests {
 	/// Contract: a search with no pattern at all is not reading its own
 	/// output.
 	///
-	/// GNU grep reads a file whose pattern file is empty, reports that no line
-	/// matched, and leaves the file alone: the search selects no record, so it
-	/// writes nothing that could be read back.
+	/// GNU grep answers a search whose pattern file is empty without reading
+	/// its input: it reports that no line matched and leaves the file alone,
+	/// as the search selects no record and writes nothing that could be read
+	/// back.
 	#[tokio::test(flavor = "multi_thread")]
 	async fn a_search_with_no_patterns_is_not_refused_as_the_output_file() {
 		let tree = tempfile::tempdir().unwrap();
@@ -3049,7 +3155,7 @@ mod tests {
 			run_with_stdout_file(&["-f", "patterns", "out.txt"], tree.path(), &path).await;
 		assert_eq!(code, 1, "{err}");
 		assert!(!err.contains("input file is also the output"), "{err}");
-		// The file is read, and left exactly as it was.
+		// The file is left exactly as it was.
 		assert_eq!(std::fs::read(&path).unwrap(), b"needle\n");
 	}
 
