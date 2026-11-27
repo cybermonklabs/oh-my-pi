@@ -434,7 +434,11 @@ export function typesafeModelManagerOptions(config: TypeSafeModelManagerConfig =
 	const staticModels = seedModels<"typesafe">("typesafe").map(model => ({ ...model, baseUrl }));
 	return {
 		providerId: "typesafe",
-		cacheProviderId: resolveModelCacheProviderId("typesafe"),
+		// Scope the cache id by the configured endpoint, matching the registry's
+		// startup read (`resolveModelCacheProviderId(providerId, { baseUrl })` over
+		// the provider's override baseUrl); otherwise a configured endpoint writes
+		// an endpoint-scoped cache the startup read never looks up.
+		cacheProviderId: resolveModelCacheProviderId("typesafe", { baseUrl: config.baseUrl }),
 		staticModels,
 		...(apiKey ? { dynamicModelsAuthoritative: true } : undefined),
 		...(apiKey

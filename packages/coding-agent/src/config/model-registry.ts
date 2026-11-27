@@ -44,6 +44,7 @@ import type {
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildDiscoveredModel, buildModel, nextBuildPriceChange } from "@oh-my-pi/pi-catalog/build";
 import { collapseBuiltVariantsSteps } from "@oh-my-pi/pi-catalog/compat/collapse";
+import { isProviderCatalogEndpointUrl, providerOwnsModelId } from "@oh-my-pi/pi-catalog/compat/catalog-endpoint";
 import {
 	clampCodexContextWindow,
 	clampsContextOverride,
@@ -62,7 +63,7 @@ import {
 	type ModelManagerOptions,
 	type ModelRefreshStrategy,
 } from "@oh-my-pi/pi-catalog/model-manager";
-import { getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
+import { getBundledModels, getBundledProviders, isGeneratedProvider } from "@oh-my-pi/pi-catalog/models";
 import {
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
@@ -3195,9 +3196,10 @@ export class ModelRegistry {
 				const identity = getOAuthCredentialsForProvider(this.authStorage, descriptor.providerId).find(
 					credential => credential.access === apiKey,
 				);
+				const providerBaseUrl = this.#descriptorBaseUrl(descriptor.providerId);
 				const discoveryConfig = {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,
-					baseUrl: this.#descriptorBaseUrl(descriptor.providerId),
+					baseUrl: providerBaseUrl,
 					fetch: this.#fetch,
 					region: identity?.region,
 					inferenceRegion: identity?.inferenceRegion,
@@ -3206,7 +3208,56 @@ export class ModelRegistry {
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??
 					discoveryConfig;
-				const managerOptions = descriptor.createModelManagerOptions(preparedConfig);
+				let managerOptions = descriptor.createModelManagerOptions(preparedConfig);
+				const fetchVendorModels = managerOptions.fetchDynamicModels;
+				// A built-in generated provider redirected away from its own catalog
+				// endpoint (a vendor pointed at a proxy) filters its discovered roster
+				// to the families it owns and caches under an endpoint-scoped id, so a
+				// proxy's aggregate list cannot pollute the vendor namespace. Only a
+				// manager that sets no cacheProviderId of its own is rescoped here:
+				// a provider that pins its own namespace (an aggregator, a local
+				// server) keeps its full roster and its own cache id.
+				const isRedirectedBuiltIn =
+					providerBaseUrl !== undefined &&
+					fetchVendorModels !== undefined &&
+					managerOptions.cacheProviderId === undefined &&
+					isGeneratedProvider(descriptor.providerId) &&
+					!isProviderCatalogEndpointUrl(descriptor.providerId, providerBaseUrl);
+				if (isRedirectedBuiltIn) {
+					managerOptions = {
+						...managerOptions,
+						cacheProviderId: resolveModelCacheProviderId(descriptor.providerId, { baseUrl: providerBaseUrl }),
+						fetchDynamicModels: async () => {
+							const models = await fetchVendorModels();
+							if (!models) return null;
+							// A proxy may list a model under the provider's own prefix
+							// (`anthropic/claude-opus-5-5`) as well as bare, so a redirected
+							// entry must not offer a doubled `anthropic/anthropic/...`
+							// selector. The manager maps a prefixed id with default
+							// text-only metadata and the id for its name, so a prefixed row
+							// renamed to its bare id would override the bundled catalog row
+							// (its real name and image input). Keep the richer row: drop a
+							// prefixed row whose bare id the bundled catalog or a bare
+							// discovered row already carries, and strip the prefix only when
+							// the prefixed row is the sole source of the id.
+							const ownPrefix = `${descriptor.providerId}/`;
+							const bundledIds = new Set(getBundledModels(descriptor.providerId).map(bundled => bundled.id));
+							const bareIds = new Set(
+								models.filter(model => !model.id.startsWith(ownPrefix)).map(model => model.id),
+							);
+							const seen = new Set<string>();
+							return models.flatMap(model => {
+								const prefixed = model.id.startsWith(ownPrefix);
+								const id = prefixed ? model.id.slice(ownPrefix.length) : model.id;
+								if (!providerOwnsModelId(descriptor.providerId, id)) return [];
+								if (prefixed && (bundledIds.has(id) || bareIds.has(id))) return [];
+								if (seen.has(id)) return [];
+								seen.add(id);
+								return [id === model.id ? model : { ...model, id }];
+							});
+						},
+					};
+				}
 				const modelsDev = managerOptions.modelsDev
 					? { ...managerOptions.modelsDev, additiveOnly: true }
 					: modelsDevCatalogFallback(descriptor.providerId, this.#fetch);

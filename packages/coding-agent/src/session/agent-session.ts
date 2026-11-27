@@ -142,6 +142,7 @@ import {
 	resolveSessionModelSelector,
 	sessionModelDiscoveryProviders,
 } from "../config/model-resolver";
+import { resolveRetiredSessionModel, retiredSessionModelMigrationProviders } from "./retired-session-model";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily, isServiceTierForFamily, serviceTierSettingToTier } from "../config/service-tier";
 import { combine, type SettingChange, type SettingsScope } from "../config/registry";
@@ -16352,19 +16353,22 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.sessionManager.getLastModelChangeRole(),
 			);
 			let targetModel = explicitModel;
+			let migratedThinkingLevel: ConfiguredThinkingLevel | undefined;
 			let modelFallbackWarning: string | undefined;
 			if (!targetModel && !options?.keepModel && targetModelStrings.length > 0) {
-				targetModel = await this.#resolveSessionModel(targetModelStrings);
+				const restored = await this.#resolveSessionModel(targetModelStrings);
+				targetModel = restored?.model;
+				migratedThinkingLevel = restored?.thinkingLevel;
 				if (!targetModel && switchingToDifferentSession) {
 					// Like startup resume: never hand the transcript to a model the
 					// session did not choose unless a UI can say so.
 					if (!this.#allowSessionModelFallback || !cfgRetryModelFallback.get(this.settings)) {
-						throw new Error(`Could not restore model ${targetModelStrings[0]}`);
+						throw new Error(`Could not restore model ${targetModelStrings[0]}. Use --model to choose a model.`);
 					}
 					const currentModel = this.model;
 					modelFallbackWarning = currentModel
 						? `Could not restore model ${targetModelStrings[0]}. Using ${currentModel.provider}/${currentModel.id}`
-						: `Could not restore model ${targetModelStrings[0]}`;
+						: `Could not restore model ${targetModelStrings[0]}. Use --model to choose a model.`;
 				}
 			}
 			// The first build was read by the departing model; rebuild it for the
@@ -16476,7 +16480,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						? AUTO_THINKING
 						: (sessionContext.thinkingLevel as ThinkingLevel | undefined)
 					: defaultThinkingLevel;
-			this.#models.restoreThinkingLevel(restoredThinkingLevel);
+			this.#models.restoreThinkingLevel(migratedThinkingLevel ?? restoredThinkingLevel);
 			this.#models.restoreServiceTiers(
 				hasServiceTierEntry ? (sessionContext.serviceTier ?? {}) : configuredServiceTierByFamily,
 			);
@@ -16649,13 +16653,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/**
 	 * First restorable saved session model, resolved like startup resume: when
 	 * none is in the catalog, refresh the discovery-backed providers among them
-	 * once and retry.
+	 * once and retry, then migrate a removed provider through its model-key chain.
+	 * Only migrations override the session's saved thinking level with a selector suffix.
 	 */
-	async #resolveSessionModel(selectors: readonly string[]): Promise<Model | undefined> {
-		const resolve = (): Model | undefined => {
+	async #resolveSessionModel(
+		selectors: readonly string[],
+	): Promise<{ model: Model; thinkingLevel?: ConfiguredThinkingLevel } | undefined> {
+		const resolve = (): { model: Model } | undefined => {
 			for (const selector of selectors) {
 				const restored = resolveSessionModelSelector(this.#modelRegistry, selector);
-				if (restored) return restored.model;
+				if (restored) return { model: restored.model };
+				// Do not let an older saved role bypass a retired preferred selector.
+				// Apply its migration only after the discovery pass below settles.
+				if (resolveRetiredSessionModel(this.#modelRegistry, this.settings, selector).kind !== "present") {
+					return undefined;
+				}
 			}
 			return undefined;
 		};
@@ -16666,9 +16678,29 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			selectors,
 			disabledProviderIds(this.settings),
 		);
-		if (providers.size === 0) return undefined;
-		await this.#modelRegistry.refreshDiscoverableProviders(providers, "online-if-uncached");
-		return resolve();
+		for (const selector of selectors) {
+			for (const provider of retiredSessionModelMigrationProviders(this.#modelRegistry, this.settings, selector)) {
+				providers.add(provider);
+			}
+		}
+		if (providers.size > 0) {
+			await this.#modelRegistry.refreshDiscoverableProviders(providers, "online-if-uncached");
+			const discovered = resolve();
+			if (discovered) return discovered;
+		}
+		for (const selector of selectors) {
+			const restored = resolveSessionModelSelector(this.#modelRegistry, selector);
+			if (restored) return { model: restored.model };
+			const resolution = resolveRetiredSessionModel(this.#modelRegistry, this.settings, selector);
+			if (resolution.kind === "present") continue;
+			if (resolution.kind === "refused") {
+				throw new Error(
+					`Could not restore model ${selector}. Use --model to choose a model, or add a retry.fallbackChains key that maps the old selector to the new one.`,
+				);
+			}
+			return resolution;
+		}
+		return undefined;
 	}
 
 	/**

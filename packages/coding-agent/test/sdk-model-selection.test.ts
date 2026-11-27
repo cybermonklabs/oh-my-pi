@@ -2602,7 +2602,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		authStoragesToClose.push(authStorage);
 		authStorage.keys.setRuntime("anthropic", "test-key");
 		const sessionManager = SessionManager.inMemory();
-		sessionManager.appendModelChange("missing-provider/missing-model");
+		sessionManager.appendModelChange("anthropic/missing-model");
 		return {
 			...buildSessionOptions(""),
 			authStorage,
@@ -2615,13 +2615,13 @@ describe("createAgentSession deferred model pattern resolution", () => {
 
 	test("rejects a headless resume instead of substituting the settings default", async () => {
 		await expect(createAgentSession(buildResumeOptions())).rejects.toThrow(
-			"Could not restore model missing-provider/missing-model",
+			"Could not restore model anthropic/missing-model",
 		);
 	});
 
 	test("rejects a headless resume instead of selecting the first available model", async () => {
 		await expect(createAgentSession({ ...buildResumeOptions(), settings: Settings.isolated() })).rejects.toThrow(
-			"Could not restore model missing-provider/missing-model",
+			"Could not restore model anthropic/missing-model",
 		);
 	});
 
@@ -2635,21 +2635,21 @@ describe("createAgentSession deferred model pattern resolution", () => {
 					retry: { modelFallback: false },
 				}),
 			}),
-		).rejects.toThrow("Could not restore model missing-provider/missing-model");
+		).rejects.toThrow("Could not restore model anthropic/missing-model");
 	});
 
 	test("rejects a resume when tool UI is available but startup fallback warnings are not", async () => {
 		await expect(
 			createAgentSession({ ...buildResumeOptions(), hasUI: true, allowSessionModelFallback: false }),
-		).rejects.toThrow("Could not restore model missing-provider/missing-model");
+		).rejects.toThrow("Could not restore model anthropic/missing-model");
 	});
 
-	test("keeps the fallback warning and settings default for interactive resume", async () => {
+	test("keeps the fallback warning and settings default for an unavailable model of a present provider", async () => {
 		const { session, modelFallbackMessage } = await createAgentSession({ ...buildResumeOptions(), hasUI: true });
 		try {
 			expect(session.model?.provider).toBe("anthropic");
 			expect(session.model?.id).toBe("claude-sonnet-4-5");
-			expect(modelFallbackMessage).toContain("Could not restore model missing-provider/missing-model");
+			expect(modelFallbackMessage).toContain("Could not restore model anthropic/missing-model");
 		} finally {
 			await session.dispose();
 		}
@@ -2663,11 +2663,163 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		});
 		try {
 			expect(session.model).toBeDefined();
-			expect(modelFallbackMessage).toContain("Could not restore model missing-provider/missing-model");
+			expect(modelFallbackMessage).toContain("Could not restore model anthropic/missing-model");
 			expect(modelFallbackMessage).toContain("Default model anthropic/claude-sonnet-9-9 not found");
 		} finally {
 			await session.dispose();
 		}
+	});
+
+	test("migrates a retired saved selector to the same model under its new provider", async () => {
+		const options = buildResumeOptions();
+		options.authStorage.keys.setRuntime("openai", "test-key");
+		options.sessionManager = SessionManager.inMemory();
+		options.sessionManager.appendModelChange("retired-gateway/openai/gpt-4o-mini");
+		options.settings = Settings.isolated({
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"retry.fallbackChains": {
+				"retired-gateway/openai/gpt-4o-mini": ["openai/gpt-4o-mini"],
+			},
+		});
+
+		const { session, modelFallbackMessage } = await createAgentSession({ ...options, hasUI: true });
+		try {
+			expect(session.model?.provider).toBe("openai");
+			expect(session.model?.id).toBe("gpt-4o-mini");
+			expect(modelFallbackMessage).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("refuses a retired selector whose chain leads to a different model", async () => {
+		const options = buildResumeOptions();
+		options.sessionManager = SessionManager.inMemory();
+		options.sessionManager.appendModelChange("retired-gateway/openai/gpt-4o-mini");
+		options.settings = Settings.isolated({
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"retry.fallbackChains": {
+				"retired-gateway/openai/gpt-4o-mini": ["anthropic/claude-sonnet-4-5"],
+			},
+		});
+		// claude-sonnet-4-5 is a different model from gpt-4o-mini: must refuse.
+		await expect(createAgentSession({ ...options, hasUI: true })).rejects.toThrow(
+			"Could not restore model retired-gateway/openai/gpt-4o-mini",
+		);
+	});
+
+	test("migrates a retired preferred role before an older saved default", async () => {
+		const options = buildResumeOptions();
+		options.authStorage.keys.setRuntime("openai", "test-key");
+		options.sessionManager = SessionManager.inMemory();
+		options.sessionManager.appendModelChange("anthropic/claude-sonnet-4-5");
+		options.sessionManager.appendModelChange("retired-gateway/openai/gpt-4o-mini", "task");
+		options.settings = Settings.isolated({
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"retry.fallbackChains": {
+				"retired-gateway/openai/gpt-4o-mini": ["openai/gpt-4o-mini"],
+			},
+		});
+
+		const { session } = await createAgentSession({ ...options, hasUI: true });
+		try {
+			expect(session.model?.provider).toBe("openai");
+			expect(session.model?.id).toBe("gpt-4o-mini");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("discovers a cold migration target before resuming a retired selector", async () => {
+		const options = buildResumeOptions();
+		options.sessionManager = SessionManager.inMemory();
+		options.sessionManager.appendModelChange("retired-provider/cached-runtime-model");
+		options.settings = Settings.isolated({
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"retry.fallbackChains": {
+				"retired-provider/cached-runtime-model": ["runtime-provider/cached-runtime-model"],
+			},
+		});
+
+		const { session } = await createAgentSession({
+			...options,
+			hasUI: true,
+			extensions: [dynamicOnlyProviderExtension],
+		});
+		try {
+			expect(session.model?.provider).toBe("runtime-provider");
+			expect(session.model?.id).toBe("cached-runtime-model");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("refuses a retired selector matched only by a wildcard key", async () => {
+		const options = buildResumeOptions();
+		options.authStorage.keys.setRuntime("openai", "test-key");
+		options.sessionManager = SessionManager.inMemory();
+		options.sessionManager.appendModelChange("retired-gateway/openai/gpt-4o-mini");
+		options.settings = Settings.isolated({
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"retry.fallbackChains": {
+				// Same model name, so the same-name guard would allow it; only a
+				// wildcard key is configured, so migration must refuse.
+				"retired-gateway/*": ["openai/gpt-4o-mini"],
+			},
+		});
+
+		await expect(createAgentSession({ ...options, hasUI: true })).rejects.toThrow(
+			"Could not restore model retired-gateway/openai/gpt-4o-mini",
+		);
+	});
+
+	test("refuses a retired selector matched only by a role key", async () => {
+		const options = buildResumeOptions();
+		options.authStorage.keys.setRuntime("openai", "test-key");
+		options.sessionManager = SessionManager.inMemory();
+		options.sessionManager.appendModelChange("retired-gateway/openai/gpt-4o-mini");
+		options.settings = Settings.isolated({
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"retry.fallbackChains": {
+				// Only the default role chain matches; a role key is not a migration
+				// key even when its target has the saved model's name.
+				default: ["openai/gpt-4o-mini"],
+			},
+		});
+
+		await expect(createAgentSession({ ...options, hasUI: true })).rejects.toThrow(
+			"Could not restore model retired-gateway/openai/gpt-4o-mini",
+		);
+	});
+
+	test("names the migration key only when the saved provider was removed", async () => {
+		const present = buildResumeOptions();
+		present.sessionManager = SessionManager.inMemory();
+		present.sessionManager.appendModelChange("anthropic/missing-model");
+		await expect(createAgentSession(present)).rejects.toThrow(
+			/Could not restore model anthropic\/missing-model\. Use --model to choose a model\.$/,
+		);
+
+		const removed = buildResumeOptions();
+		removed.sessionManager = SessionManager.inMemory();
+		removed.sessionManager.appendModelChange("retired-gateway/openai/gpt-4o-mini");
+		await expect(createAgentSession(removed)).rejects.toThrow(/retry\.fallbackChains/);
+	});
+
+	test("refuses an interactive resume when every exact migration target is unusable", async () => {
+		const options = buildResumeOptions();
+		options.sessionManager = SessionManager.inMemory();
+		options.sessionManager.appendModelChange("retired-provider/retired-model");
+		options.settings = Settings.isolated({
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"retry.fallbackChains": {
+				"retired-provider/retired-model": ["anthropic/missing-model", "google/gemini-2.5-pro"],
+			},
+		});
+
+		await expect(createAgentSession({ ...options, hasUI: true })).rejects.toThrow(
+			"Could not restore model retired-provider/retired-model",
+		);
 	});
 
 	test.each(["model", "modelPattern"] as const)(
@@ -2766,10 +2918,8 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		const { session } = await createAgentSession({ ...buildSwitchOptions(), ...host });
 		try {
 			const previousFile = session.sessionFile;
-			const target = await writeSavedModelSession("missing-provider/missing-model");
-			await expect(session.switchSession(target)).rejects.toThrow(
-				"Could not restore model missing-provider/missing-model",
-			);
+			const target = await writeSavedModelSession("anthropic/missing-model");
+			await expect(session.switchSession(target)).rejects.toThrow("Could not restore model anthropic/missing-model");
 			expect(session.sessionFile).toBe(previousFile);
 			expect(session.messages).toEqual([]);
 			expect(session.model?.id).toBe("claude-sonnet-4-5");
@@ -2785,19 +2935,65 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			if (event.type === "notice") notices.push(`${event.level}: ${event.message}`);
 		});
 		try {
-			const target = await writeSavedModelSession("missing-provider/missing-model");
+			const target = await writeSavedModelSession("anthropic/missing-model");
 			await expect(session.switchSession(target)).resolves.toBe(true);
 			expect(session.sessionFile).toBe(target);
 			expect(session.model?.id).toBe("claude-sonnet-4-5");
-			const warning = "Could not restore model missing-provider/missing-model. Using anthropic/claude-sonnet-4-5";
+			const warning = "Could not restore model anthropic/missing-model. Using anthropic/claude-sonnet-4-5";
 			expect(notices).toEqual([`warning: ${warning}`]);
 
 			// A host that re-renders after switching takes the warning itself.
 			const reported: string[] = [];
-			const next = await writeSavedModelSession("missing-provider/missing-model");
+			const next = await writeSavedModelSession("anthropic/missing-model");
 			await session.switchSession(next, { onModelFallback: message => reported.push(message) });
 			expect(reported).toEqual([warning]);
 			expect(notices).toHaveLength(1);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("switches through a retired selector to the same model under its new provider", async () => {
+		const options = buildSwitchOptions();
+		options.authStorage.keys.setRuntime("openai", "test-key");
+		options.settings = Settings.isolated({
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"retry.fallbackChains": {
+				"retired-gateway/openai/gpt-4o-mini": ["openai/gpt-4o-mini"],
+			},
+		});
+		const { session } = await createAgentSession({ ...options, hasUI: true });
+		try {
+			const target = await writeSavedModelSession("retired-gateway/openai/gpt-4o-mini");
+			await expect(session.switchSession(target)).resolves.toBe(true);
+			expect(session.model?.provider).toBe("openai");
+			expect(session.model?.id).toBe("gpt-4o-mini");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("keeps the current session when a retired selector has no exact migration key", async () => {
+		const options = buildSwitchOptions();
+		options.authStorage.keys.setRuntime("openai", "test-key");
+		options.settings = Settings.isolated({
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"retry.fallbackChains": {
+				default: ["openai/gpt-4o-mini"],
+				"retired-provider/*": ["openai/gpt-4o-mini"],
+			},
+		});
+		const { session } = await createAgentSession({ ...options, hasUI: true });
+		try {
+			const previousFile = session.sessionFile;
+			const target = await writeSavedModelSession("retired-provider/retired-model");
+			await expect(session.switchSession(target)).rejects.toThrow(
+				"Could not restore model retired-provider/retired-model",
+			);
+			expect(session.sessionFile).toBe(previousFile);
+			expect(session.messages).toEqual([]);
+			expect(session.model?.provider).toBe("anthropic");
+			expect(session.model?.id).toBe("claude-sonnet-4-5");
 		} finally {
 			await session.dispose();
 		}
