@@ -360,9 +360,12 @@ jobs:
     if: contains(fromJSON(needs.plan.outputs.jobs), 'build')
     runs-on: ubuntu-24.04
     timeout-minutes: 150
-    # The listing step's outcome: rust-test-macos runs only on a success.
+    # The listing step's outcome: rust-test-macos runs only on a success. The archive upload's
+    # outcome: the jobs that need only the archive (set, builtins, workspace, gvisor) run on its
+    # success, so a failed listing step fails this job and still lets them run.
     outputs:
       listings: ${{ steps.listings.outcome }}
+      archive: ${{ steps.archive.outcome }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -399,7 +402,8 @@ jobs:
           echo "the Bazel half runs as process $(cat "$SC/early-bazel.pid"), into $SC/early-state"
       - name: Build and archive
         run: bash tool/.github/sami-checks/build.sh
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - id: archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sc-archive
           path: ${{ github.workspace }}/sc/up/tests.tar.zst
@@ -411,11 +415,13 @@ jobs:
       # the Bazel half's listings of the rust_tests no binary is
       # (.github/sami/rust-test-early-listings.sh archive). It waits for the Bazel half (at most
       # its 20 min). A binary that maps to no target or to two, or a target left without a
-      # listing, fails the step by name; rust-test-macos then does not run (its row reads UNKNOWN)
-      # and rust-test-drift fails, while every job that needs only the archive still runs.
+      # listing, fails the step by name, and the step fails this job: rust-test-macos then does
+      # not run (its row reads UNKNOWN) and rust-test-drift fails, while every job that needs only
+      # the archive still runs (the output `archive`). From Cut15 to Cut18 (runs 45903894088 to
+      # 46036206702) the step failed under continue-on-error, the job and the API read success,
+      # and the macOS job did not run at four cuts.
       - name: Linux listings for the macOS inventory
         id: listings
-        continue-on-error: true
         timeout-minutes: 20
         working-directory: tree
         run: |
@@ -511,7 +517,7 @@ jobs:
   set:
     name: pi-shell set ${{ matrix.who }} ${{ matrix.shard }}
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'set') && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'set') && needs.build.outputs.archive == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -563,7 +569,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.builtins) }}
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'builtins') && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'builtins') && needs.build.outputs.archive == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -607,7 +613,7 @@ jobs:
   workspace:
     name: workspace ${{ matrix.who }} ${{ matrix.part }}
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'workspace') && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'workspace') && needs.build.outputs.archive == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -1089,7 +1095,7 @@ jobs:
   gvisor:
     name: gVisor
     needs: [plan, tools, build]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'gvisor') && needs.build.result == 'success' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'gvisor') && needs.build.outputs.archive == 'success' }}
     uses: ./.github/workflows/sami-checks-gvisor.yml
     with:
       commit: ${{ needs.plan.outputs.commit }}
