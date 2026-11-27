@@ -1,16 +1,39 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { parseHTML } from "@oh-my-pi/pi-utils/dom";
 import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { getSessionTrace } from "../src/client/api";
 import { LiveProvider } from "../src/client/data/live";
 import { type QueryResult, useQuery } from "../src/client/data/query";
 import { inflightRequest, loadQuery, releaseQuery } from "../src/client/data/query-store";
 import type { SessionTrace } from "../src/client/types";
-import { installGlobal, mountDomRoot, tearDownDomRoot } from "./helpers/dom-root";
 
 type FetchInput = string | URL | Request;
 type FetchInit = RequestInit | BunFetchRequestInit;
 
+const originalGlobals = new Map<string, PropertyDescriptor | undefined>();
+let root: Root | null = null;
 let keySeq = 0;
+
+function installGlobal(name: string, value: unknown): void {
+	originalGlobals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+	Object.defineProperty(globalThis, name, { configurable: true, value, writable: true });
+}
+
+function mount(): Root {
+	const domWindow = parseHTML('<html><body><div id="root"></div></body></html>').window;
+	installGlobal("window", domWindow);
+	installGlobal("document", domWindow.document);
+	installGlobal("navigator", domWindow.navigator);
+	installGlobal("Node", domWindow.Node);
+	installGlobal("Element", domWindow.Element);
+	installGlobal("HTMLElement", domWindow.HTMLElement);
+	installGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+	const container = domWindow.document.getElementById("root");
+	if (!container) throw new Error("Expected test root");
+	root = createRoot(container as unknown as Element);
+	return root;
+}
 
 /** A unique key per test: the query cache is module-global. */
 function freshKey(): string {
@@ -19,8 +42,19 @@ function freshKey(): string {
 }
 
 afterEach(async () => {
-	await tearDownDomRoot();
+	const activeRoot = root;
+	if (activeRoot) {
+		await act(async () => {
+			activeRoot.unmount();
+		});
+		root = null;
+	}
 	vi.restoreAllMocks();
+	for (const [name, descriptor] of originalGlobals) {
+		if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+		else Reflect.deleteProperty(globalThis, name);
+	}
+	originalGlobals.clear();
 });
 
 describe("query store shared requests", () => {
@@ -65,7 +99,7 @@ describe("useQuery request release", () => {
 			return Promise.withResolvers<number>().promise;
 		};
 		const key = freshKey();
-		const view = await mountDomRoot();
+		const view = mount();
 		await act(async () => view.render(<Probe queryKey={key} enabled fetcher={fetcher} />));
 		expect(signals).toHaveLength(1);
 		expect(signals[0].aborted).toBe(false);
@@ -81,7 +115,7 @@ describe("useQuery request release", () => {
 			return Promise.withResolvers<number>().promise;
 		};
 		const key = freshKey();
-		const view = await mountDomRoot();
+		const view = mount();
 		const render = (a: boolean, b: boolean) =>
 			act(async () =>
 				view.render(
@@ -109,7 +143,7 @@ describe("useQuery request release", () => {
 			signals.push(signal);
 			return signals.length === 1 ? Promise.resolve(1) : Promise.withResolvers<number>().promise;
 		};
-		const view = await mountDomRoot();
+		const view = mount();
 		await act(async () => view.render(<Probe queryKey={cachedKey} enabled fetcher={fetcher} />));
 		await act(async () => view.render(<Probe queryKey={pendingKey} enabled fetcher={fetcher} />));
 		expect(signals).toHaveLength(2);
@@ -146,7 +180,7 @@ describe("live query revalidation", () => {
 			return <output>{result.data ?? "loading"}</output>;
 		}
 		try {
-			const view = await mountDomRoot();
+			const view = mount();
 			await act(async () =>
 				view.render(
 					<LiveProvider>
@@ -213,7 +247,7 @@ describe("trace revalidation", () => {
 			return null;
 		}
 		const file = freshKey();
-		const view = await mountDomRoot();
+		const view = mount();
 		await act(async () => view.render(<TraceProbe file={file} />));
 		const first = results.at(-1)?.data;
 		expect(first).not.toBeNull();

@@ -429,6 +429,47 @@
         return p;
       }
 
+      // The start of `JSON.stringify(value)` for `value`, JSON data, cut once it passes
+      // `limit` characters (`Infinity` writes it whole). It keeps its own stack, so a
+      // value nested deeper than the browser's `JSON.stringify` reaches (a session entry
+      // is as deep as `JSON.parse` reads) is still written, and a label stops at its
+      // cut instead of writing the whole value on each render.
+      function jsonHead(value, limit) {
+        if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? '';
+        let text = '';
+        const stack = [];
+        const open = container => {
+          const keys = Array.isArray(container) ? null : Object.keys(container);
+          stack.push({ container, keys, index: 0, written: false });
+          text += keys ? '{' : '[';
+        };
+        open(value);
+        while (stack.length > 0 && text.length <= limit) {
+          const frame = stack[stack.length - 1];
+          if (frame.index === (frame.keys ? frame.keys.length : frame.container.length)) {
+            text += frame.keys ? '}' : ']';
+            stack.pop();
+            continue;
+          }
+          const key = frame.keys ? frame.keys[frame.index] : frame.index;
+          frame.index++;
+          const item = frame.container[key];
+          const prefix = (frame.written ? ',' : '') + (frame.keys ? JSON.stringify(key) + ':' : '');
+          if (item !== null && typeof item === 'object') {
+            text += prefix;
+            frame.written = true;
+            open(item);
+            continue;
+          }
+          // Left out of an object and written `null` in an array, as `JSON.stringify` does.
+          const json = JSON.stringify(item);
+          if (json === undefined && frame.keys) continue;
+          text += prefix + (json ?? 'null');
+          frame.written = true;
+        }
+        return text;
+      }
+
       function formatToolCall(name, args) {
         switch (name) {
           case 'read': {
@@ -461,8 +502,8 @@
           case 'ls':
             return `[ls: ${shortenPath(String(args.path || '.'))}]`;
           default: {
-            const argsStr = JSON.stringify(args).slice(0, 40);
-            return `[${name}: ${argsStr}${JSON.stringify(args).length > 40 ? '...' : ''}]`;
+            const argsHead = jsonHead(args, 40);
+            return `[${name}: ${argsHead.slice(0, 40)}${argsHead.length > 40 ? '...' : ''}]`;
           }
         }
       }
@@ -1268,7 +1309,7 @@
         if (entry.type === 'custom_message' && entry.display) {
           return `<div class="hook-message" id="${entryId}">${tsHtml}
             <div class="hook-type">[${escapeHtml(entry.customType)}]</div>
-            <div class="markdown-content">${safeMarkedParse(typeof entry.content === 'string' ? entry.content : JSON.stringify(entry.content))}</div>
+            <div class="markdown-content">${safeMarkedParse(typeof entry.content === 'string' ? entry.content : jsonHead(entry.content, Infinity))}</div>
           </div>`;
         }
 

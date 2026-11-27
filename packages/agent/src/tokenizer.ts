@@ -24,6 +24,14 @@ import { isEstimateCacheable, messageEstimateVersion } from "./compaction/messag
 import { base64ImageSize, estimateImageTokens, type ImageDetail, type ImageSize } from "./image-tokens";
 import type { AgentMessage } from "./types";
 
+/**
+ * Each count writes a message's tool-call arguments (and replayed server-tool blocks), which are any
+ * JSON, as deep as a transcript line holds: one nested past `JSON.stringify`'s recursion skips the
+ * attempt that would run out of stack (1.5 s or more each time) and goes to the deep writer. A bigint
+ * is written as its decimal string.
+ */
+const COUNTED_JSON = { bigintAsString: true, probeDepth: true } as const;
+
 const testEnv = Bun.env.NODE_ENV === "test";
 
 const NATIVE_ENCODING: Record<ModelTokenizer, natives.Encoding> = {
@@ -549,8 +557,7 @@ export class Tokenizer {
 						if (block.thinkingSignature && !abandonedToolUse && index !== untrustedIndex) signedReasoning = true;
 					} else if (block.type === "toolCall") {
 						fragments.push(block.name);
-						// Arguments are any JSON, as deep as a transcript line holds; a bigint as its decimal string.
-						fragments.push(stringifyDeepJson(block.arguments, { bigintAsString: true }) ?? "null");
+						fragments.push(stringifyDeepJson(block.arguments, COUNTED_JSON) ?? "null");
 					} else if (block.type === "redactedThinking") {
 						// Encrypted reasoning blob the provider still bills for wherever it
 						// survives replay, as above; excluded from the compaction floor for
@@ -566,7 +573,7 @@ export class Tokenizer {
 						// compaction floor like other encrypted reasoning because its local
 						// byte size diverges from provider billing.
 						if (!excludeEncryptedReasoning) {
-							fragments.push(stringifyDeepJson(block.block, { bigintAsString: true }) ?? "null");
+							fragments.push(stringifyDeepJson(block.block, COUNTED_JSON) ?? "null");
 						}
 					}
 				}

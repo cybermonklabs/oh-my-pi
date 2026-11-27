@@ -4499,7 +4499,10 @@ export class SessionManager {
 			logger.warn("Assistant message recorded with incomplete usage", { id: entry.id });
 		}
 		this.#entries.push(entry);
+		const leafBefore = this.#index.leafId();
 		this.#index.insert(entry);
+		// An insert that selects an off-branch entry moves the leaf as `#setLeaf` does.
+		if (this.#index.leafId() !== leafBefore && entry.parentId !== leafBefore) this.#coldCutStale = true;
 		// A compaction moves the cut once the agent's context is rebuilt from it
 		// (the next context build). A model change moves it at the first build
 		// for the new model, which adopts that model.

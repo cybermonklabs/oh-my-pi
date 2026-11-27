@@ -9,13 +9,13 @@ import {
 import type { Model, Tool } from "@oh-my-pi/pi-ai";
 import { resolveDelegationBias } from "@oh-my-pi/pi-catalog/compat/delegation";
 import {
+	cloneJsonTree,
 	isRecord,
 	isStringList,
 	logger,
 	once,
 	prompt,
 	stringProperty,
-	structuredCloneJSON,
 	untilAborted,
 } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
@@ -2488,7 +2488,8 @@ export class SessionTools {
 					}
 					// Preserve the exact arguments authorized by a selected or
 					// persisted ACP grant; inner handlers may mutate `args` in place.
-					const approvedCtx = (ctx ? { ...ctx, acpApprovedArgs: structuredCloneJSON(args) } : ctx) as never;
+					// They are JSON data, as deep as a transcript line holds.
+					const approvedCtx = (ctx ? { ...ctx, acpApprovedArgs: cloneJsonTree(args) } : ctx) as never;
 					const command =
 						target.name === "bash" && args && typeof args === "object" && !Array.isArray(args)
 							? stringProperty(args, "command")
