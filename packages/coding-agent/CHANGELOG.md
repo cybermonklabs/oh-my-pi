@@ -26,7 +26,7 @@
 
 - Under `session.storage: sql`, a subagent session that closes while its parent session stays open no longer leaves its path in the store's lease records until the parent closes, and a move of such a closed path no longer puts it back under the parent's lease
 - SQL and Redis session storage no longer keep a copy of a session's title in memory for each session it wrote, renamed or listed, and every read shows the title the store holds for the bytes it read, so a store that opened a session before another process renamed or rewrote it shows the new title at once, never one version's title over another version's transcript
-- Every subagent spawned from one session's skill list now shares one frozen copy of that list, so a parked subagent no longer keeps a copy of its parent's skills of its own
+- Subagents that start on their parent's thread now share one frozen copy of the parent's skill list while that list holds the same skills, so a parked subagent no longer keeps a copy of its parent's skills of its own
 - A finished job of a worker subagent no longer keeps its job row and its output mirror on the main thread, and a progress call it makes after its result arrived is ignored
 - A worker subagent no longer keeps a released foreground job's live output for 10 minutes after the job settles, and a job id that main gives out again starts with no state of the job that held it before
 - The main thread's mirror of a worker subagent keeps one copy of each message its entries and its message list both hold, instead of two

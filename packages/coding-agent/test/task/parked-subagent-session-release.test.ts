@@ -838,10 +838,17 @@ function skillNamed(name: string): Skill {
 	};
 }
 
-// If this regresses, each child a parent spawns gets a copy of the parent's whole skill list of its own, and a kept-alive
-// one keeps it for as long as it can be revived, so a process that parks many subagents holds a list for each; or a
-// child that is spawned once its parent replaced its list gets the old skills from a copy made before.
-it("gives every child of one parent the same frozen copy of its skills", async () => {
+/** A parent session, and the spawns of its kept-alive children. */
+interface SkillParent {
+	/** The skills each child session build was handed, in order. */
+	forwarded: Array<readonly Skill[] | undefined>;
+	/** Runs child `id` to its finished keep-alive state and returns the skills its live session holds. */
+	spawn(id: string): Promise<readonly Skill[]>;
+	close(): void;
+}
+
+/** A parent session whose skills are what `skills` returns when a child spawns. */
+async function skillParent(skills: () => Skill[]): Promise<SkillParent> {
 	const cwd = path.join(root, "home", "work");
 	await fs.mkdir(cwd, { recursive: true });
 	const authStorage = createInMemoryAuthStorage();
@@ -872,7 +879,6 @@ it("gives every child of one parent the same frozen copy of its skills", async (
 		projectAgentsDir: null,
 	});
 
-	let parentSkills: Skill[] = ["alpha", "beta", "gamma"].map(skillNamed);
 	const parent = {
 		cwd,
 		hasUI: false,
@@ -896,7 +902,7 @@ it("gives every child of one parent the same frozen copy of its skills", async (
 		getSessionSpawns: () => "*",
 		getSessionAgents: () => [],
 		get skills() {
-			return parentSkills;
+			return skills();
 		},
 		contextFiles: [],
 		promptTemplates: [],
@@ -912,19 +918,30 @@ it("gives every child of one parent the same frozen copy of its skills", async (
 		forwarded.push(options?.skills);
 		return createAgentSession(options);
 	});
-	const spawn = async (id: string): Promise<readonly Skill[]> => {
-		const { result } = await runStructuredSubagent({
-			session: parent,
-			invocationKind: "task",
-			assignment: "report done",
-			agent: "skill-agent",
-			structured: false,
-			identity: { id },
-		});
-		expect(result.exitCode, result.error).toBe(0);
-		return localSession(AgentRegistry.global().get(id)?.session).skills;
+	return {
+		forwarded,
+		spawn: async id => {
+			const { result } = await runStructuredSubagent({
+				session: parent,
+				invocationKind: "task",
+				assignment: "report done",
+				agent: "skill-agent",
+				structured: false,
+				identity: { id },
+			});
+			expect(result.exitCode, result.error).toBe(0);
+			return localSession(AgentRegistry.global().get(id)?.session).skills;
+		},
+		close: () => authStorage.close(),
 	};
+}
 
+// If this regresses, each child a parent spawns gets a copy of the parent's whole skill list of its own, and a kept-alive
+// one keeps it for as long as it can be revived, so a process that parks many subagents holds a list for each; or a
+// child that is spawned once its parent replaced its list gets the old skills from a copy made before.
+it("gives every child of one parent the same frozen copy of its skills", async () => {
+	let parentSkills: Skill[] = ["alpha", "beta", "gamma"].map(skillNamed);
+	const { forwarded, spawn, close } = await skillParent(() => parentSkills);
 	try {
 		const heldByFirst = await spawn("SkillsFirst");
 		const heldBySecond = await spawn("SkillsSecond");
@@ -938,7 +955,7 @@ it("gives every child of one parent the same frozen copy of its skills", async (
 				shared?.length === parentSkills.length && parentSkills.every((skill, index) => shared[index] === skill),
 		}).toEqual({ spawns: 2, sameList: true, childrenHoldIt: true, frozen: true, parentsSkillsInOrder: true });
 
-		// The parent replaces its list, as every writer of a session's skills does: the next child gets a copy of the new one.
+		// The parent replaces its list, as a skill refresh does: the next child gets a copy of the new one.
 		parentSkills = ["delta", "epsilon"].map(skillNamed);
 		const heldByThird = await spawn("SkillsThird");
 		const [, , renewed] = forwarded;
@@ -961,6 +978,73 @@ it("gives every child of one parent the same frozen copy of its skills", async (
 			],
 		});
 	} finally {
-		authStorage.close();
+		close();
+	}
+}, 60_000);
+
+// If this regresses, an SDK caller that replaces a skill in the array it handed its session still spawns children with
+// the skill it replaced, from the copy made before the edit.
+it("gives a child spawned after its parent's skill list changed in place a copy of the changed list", async () => {
+	const parentSkills = ["alpha", "beta", "gamma"].map(skillNamed);
+	const { forwarded, spawn, close } = await skillParent(() => parentSkills);
+	try {
+		const heldByFirst = await spawn("EditedFirst");
+		const heldBySecond = await spawn("EditedSecond");
+		// Same length, one entry replaced: the SDK keeps the caller's array as the session's skills.
+		parentSkills[1] = skillNamed("zeta");
+		const heldByThird = await spawn("EditedThird");
+		const heldByFourth = await spawn("EditedFourth");
+		const [shared, , renewed] = forwarded;
+		expect({
+			spawns: forwarded.length,
+			sharedBefore: heldByFirst === shared && heldBySecond === shared,
+			renewed: renewed !== shared,
+			laterChildrenHoldIt: heldByThird === renewed && heldByFourth === renewed,
+			frozen: Object.isFrozen(renewed),
+			names: renewed?.map(skill => skill.name),
+			earlierChildren: [heldByFirst, heldBySecond].map(list => list.map(skill => skill.name)),
+		}).toEqual({
+			spawns: 4,
+			sharedBefore: true,
+			renewed: true,
+			laterChildrenHoldIt: true,
+			frozen: true,
+			names: ["alpha", "zeta", "gamma"],
+			earlierChildren: [
+				["alpha", "beta", "gamma"],
+				["alpha", "beta", "gamma"],
+			],
+		});
+
+		// Emptied in place, then refilled with the same skills: the next child gets a copy made after the refill.
+		const [alpha, zeta, gamma] = parentSkills;
+		parentSkills.length = 0;
+		const heldByFifth = await spawn("EditedFifth");
+		parentSkills.push(alpha, zeta, gamma);
+		const heldBySixth = await spawn("EditedSixth");
+		expect({
+			spawns: forwarded.length,
+			emptied: { names: heldByFifth.map(skill => skill.name), frozen: Object.isFrozen(heldByFifth) },
+			refilled: heldBySixth !== renewed,
+			frozen: Object.isFrozen(heldBySixth),
+			names: heldBySixth.map(skill => skill.name),
+			earlierChildren: [heldByFirst, heldBySecond, heldByThird, heldByFourth].map(list =>
+				list.map(skill => skill.name),
+			),
+		}).toEqual({
+			spawns: 6,
+			emptied: { names: [], frozen: true },
+			refilled: true,
+			frozen: true,
+			names: ["alpha", "zeta", "gamma"],
+			earlierChildren: [
+				["alpha", "beta", "gamma"],
+				["alpha", "beta", "gamma"],
+				["alpha", "zeta", "gamma"],
+				["alpha", "zeta", "gamma"],
+			],
+		});
+	} finally {
+		close();
 	}
 }, 60_000);

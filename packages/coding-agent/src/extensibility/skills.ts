@@ -242,33 +242,35 @@ export function resetActiveSkillsForTests(): void {
 	activeSkills = [];
 }
 
-/**
- * The skill list of every subagent spawned from a session with no skills: one frozen list, since every writer of a
- * session's skills replaces the list rather than changing it in place.
- */
+/** The skill list of every subagent spawned from a session with no skills: one frozen list no holder can change. */
 const NO_SKILLS = Object.freeze<Skill[]>([]) as Skill[];
 
 /**
- * The frozen copy of each parent's skill list that {@link spawnedSubagentSkills} hands its subagents, by the parent's
- * list: a writer of the parent's skills replaces the list, so the next spawn copies the new one, and the old copy goes
- * with the old list once no subagent holds it.
+ * The frozen copy of each parent's skill list that {@link spawnedSubagentSkills} made last, by the parent's list, until
+ * a spawn finds the list empty. The map does not keep the parent's list alive. A child or its reviver can still hold
+ * the copy.
  */
 const spawnedSkillCopies = new WeakMap<readonly Skill[], Skill[]>();
 
 /**
- * The skills of a subagent spawned from a session with `skills`: one frozen copy of the list, shared by every
- * subagent spawned from that same list, or {@link NO_SKILLS} when there are none. A kept-alive subagent keeps the list
- * for as long as it can be revived, so a copy of its own in each would grow with every subagent a parent parks. No
- * holder writes into the list: a subagent's own skill discovery replaces its list, as every writer of a session's
- * skills does.
+ * The skills of a subagent spawned from a session with `skills`: a frozen shallow copy of the list, or
+ * {@link NO_SKILLS} when there are none. A kept-alive subagent keeps the list for as long as it can be revived, so
+ * subagents spawned on one thread from the same list share one copy while the list holds the same skills in the same
+ * order; once the caller changes the list in place, the next spawn gets a fresh copy. A subagent on a worker thread
+ * still receives its own copy: the worker link clones its spawn options. No holder writes into the copy: a subagent's
+ * own skill discovery replaces its list.
  */
 export function spawnedSubagentSkills(skills: readonly Skill[] | undefined): Skill[] {
-	if (!skills?.length) return NO_SKILLS;
-	let copy = spawnedSkillCopies.get(skills);
-	if (!copy) {
-		copy = Object.freeze([...skills]) as Skill[];
-		spawnedSkillCopies.set(skills, copy);
+	if (skills === undefined) return NO_SKILLS;
+	if (skills.length === 0) {
+		// Emptied in place: a copy of what it held before must not outlive the clear or come back once it is refilled.
+		spawnedSkillCopies.delete(skills);
+		return NO_SKILLS;
 	}
+	const cached = spawnedSkillCopies.get(skills);
+	if (cached?.length === skills.length && cached.every((skill, index) => skill === skills[index])) return cached;
+	const copy = Object.freeze([...skills]) as Skill[];
+	spawnedSkillCopies.set(skills, copy);
 	return copy;
 }
 
