@@ -106,24 +106,30 @@
 #                       0666 FIFO of a third user in a world-writable sticky
 #                       directory root owns, with fs.protected_fifos at 1
 # and, for the macOS job, RUST_TEST_ONLY and RUST_TEST_CANARY (above). When
-# GITHUB_STEP_SUMMARY is set, the cargo tests' timings go there too.
+# GITHUB_STEP_SUMMARY is set, the cargo tests' timings go there too. When
+# SAMI_FINDINGS is set, each error annotation is also a line of that file
+# (.github/sami/findings.sh), and its last line says the script reached its
+# end, for sami-checks.yml's first-seen comparison.
 # .github/sami/tests/run.sh runs this script against stubs of bazelisk and
 # rustup.
 set -euo pipefail
+# finding, finding_stop and findings_end (SAMI_FINDINGS).
+# shellcheck source=.github/sami/findings.sh
+. "$(dirname "${BASH_SOURCE[0]}")/findings.sh"
 
 if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
-	echo "::error title=Rust tests::bash ${BASH_VERSION} is too old: this script needs bash 4 or later"
+	finding_stop "Rust tests" "bash ${BASH_VERSION} is too old: this script needs bash 4 or later"
 	exit 1
 fi
 for v in RUNNER_TEMP OMP_BAZEL_RC RUST_TEST_PATH RUST_TEST_TMPDIR PI_TEST_REAL_BASH PI_AST_REPO_CORPUS PI_VFS_TEST_KERNEL; do
 	if [ -z "${!v:-}" ]; then
-		echo "::error title=Rust tests::$v is not set"
+		finding_stop "Rust tests" "$v is not set"
 		exit 1
 	fi
 done
 only="${RUST_TEST_ONLY:-}"
 if [ -n "$only" ] && [ -z "${RUST_TEST_CANARY:-}" ]; then
-	echo "::error title=Rust tests::RUST_TEST_ONLY is set and RUST_TEST_CANARY is not"
+	finding_stop "Rust tests" "RUST_TEST_ONLY is set and RUST_TEST_CANARY is not"
 	exit 1
 fi
 if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
@@ -133,15 +139,17 @@ tmp="$RUNNER_TEMP/rust-test"
 mkdir -p "$tmp/logs"
 bad=0
 
-# error <title> <message>: an error annotation; the step fails at its end.
+# error <title> <message>: an error annotation, recorded (SAMI_FINDINGS); the
+# step fails at its end.
 error() {
-	echo "::error title=$1::$2"
+	finding "$1" "$2"
 	bad=1
 }
 
-# stop <message>: an error annotation, and the step stops here.
+# stop <message>: an error annotation, recorded as where the step stopped, and
+# the step stops here.
 stop() {
-	echo "::error title=Rust tests::$1"
+	finding_stop "Rust tests" "$1"
 	exit 1
 }
 
@@ -560,7 +568,7 @@ bazel_test() {
 		1) rc=1 ;;
 		3) [ "$rc" = 1 ] || rc=3 ;;
 		*)
-			echo "::error title=Rust tests::bazel test exited $code ($inv), which is neither a test nor a build failure"
+			finding_stop "Rust tests" "bazel test exited $code ($inv), which is neither a test nor a build failure"
 			exit "$code"
 			;;
 	esac
@@ -709,7 +717,7 @@ if [ -z "$only" ]; then
 		case "$build_code" in
 			0 | 1) ;;
 			*)
-				echo "::error title=Rust tests::bazel build exited $build_code (ignored-opt-$i), which is neither a success nor a build failure"
+				finding_stop "Rust tests" "bazel build exited $build_code (ignored-opt-$i), which is neither a success nor a build failure"
 				exit "$build_code"
 				;;
 		esac
@@ -1609,6 +1617,7 @@ if [ -n "$only" ]; then
 			error "Rust tests" "$target $name is in $only but did not run here (absent, renamed or #[ignore]d)"
 		fi
 	done <"$tmp/only.tsv"
+	findings_end
 	exit "$bad"
 fi
 
@@ -1774,4 +1783,5 @@ for binary in "${!listing_of[@]}"; do
 	printf '%s\t%s\n' "$binary" "$(basename "${listing_of[$binary]}")"
 done | LC_ALL=C sort >"$listings/index.tsv"
 echo "Listings for the drift check: $(count "$listings/index.tsv") binaries in $listings"
+findings_end
 exit "$bad"
