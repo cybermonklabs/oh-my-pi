@@ -1,6 +1,6 @@
 /**
- * A memory setting changed on a bound prompt is held: the system prompt and tool definitions stay as sent until a cut
- * the cut rule admits, a lapsed cache entry or five minutes on. A `memory.backend` switch to Hindsight, or a
+ * A memory setting changed on a bound prompt is held: the system prompt and tool definitions stay as sent until a
+ * compaction, a lapsed cache entry or five minutes on. A `memory.backend` switch to Hindsight, or a
  * `hindsight.*` edit that moves its bank, installs a Hindsight state at once, and with `hindsight.mentalModelsEnabled`
  * the state loads the bank's mental models in the background and rebuilds the system prompt when the load finishes.
  * That rebuild belongs to the held change: it must not send the held rebuild before it is due, or the next request

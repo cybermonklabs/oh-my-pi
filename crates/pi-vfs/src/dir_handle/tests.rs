@@ -2554,6 +2554,77 @@ mod unix {
 		assert!(opened.is_ok(), "the helper's open was not released");
 	}
 
+	/// A read-only FIFO open through a directory handle, by `open_at` and by
+	/// `open_at_async` under a cancellable facade, goes through
+	/// `FifoOpen::start_pinned_reading`: under gVisor bytes another reader
+	/// left, with no writer, end it (the look's first limit, which only a look
+	/// gives); on Linux it waits for a writer, here until the token fires.
+	/// `PI_VFS_TEST_KERNEL` names the kernel (the Jobs set it from the pod's
+	/// runtime); unset, nothing is checked.
+	#[test]
+	fn a_read_open_at_of_a_fifo_is_looked_at_only_on_gvisor() {
+		use std::os::unix::fs::OpenOptionsExt;
+		let Ok(kernel) = std::env::var("PI_VFS_TEST_KERNEL") else {
+			eprintln!("UNKNOWN: PI_VFS_TEST_KERNEL is not set; nothing was checked");
+			return;
+		};
+		let want = if kernel == "gvisor" {
+			"opened"
+		} else {
+			"waited until the token"
+		};
+		let mut wrong = Vec::new();
+		for flavor in ["sync", "async"] {
+			let tree = Tree::new("fifo-looked");
+			let fifo = tree.at("p");
+			mkfifo(&fifo);
+			let other = std::fs::OpenOptions::new()
+				.read(true)
+				.custom_flags(libc::O_NONBLOCK)
+				.open(&fifo)
+				.unwrap();
+			{
+				// No other test's process spawn is under way while the writer is
+				// open (`crate::tests::SPAWNS`): a child that holds a copy of it
+				// until its `exec` would end the open on Linux too.
+				let _no_spawn = crate::tests::SPAWNS.read();
+				let mut writer = std::fs::OpenOptions::new()
+					.write(true)
+					.custom_flags(libc::O_NONBLOCK)
+					.open(&fifo)
+					.unwrap();
+				writer.write_all(b"ab").unwrap();
+			}
+			let token = tokio_util::sync::CancellationToken::new();
+			let fs = Fs::native().with_cancellation(token.clone());
+			let root = fs.blocking().open_dir(tree.at(""), true).unwrap();
+			let canceller = std::thread::spawn(move || {
+				std::thread::sleep(Duration::from_secs(2));
+				token.cancel();
+			});
+			let mut read = OpenOptions::new();
+			read.read(true);
+			let opened = match flavor {
+				"sync" => root.open_at(n("p"), &read),
+				_ => runtime().block_on(root.open_at_async(n("p"), &read)),
+			};
+			canceller.join().unwrap();
+			drop(other);
+			let got = match &opened {
+				Ok(_) => "opened".to_owned(),
+				Err(err) if crate::error::is_cancelled(err) => "waited until the token".to_owned(),
+				Err(err) => format!("failed: {err:?}"),
+			};
+			if got != want {
+				wrong.push(format!("{flavor}: {got}"));
+			}
+		}
+		assert!(
+			wrong.is_empty(),
+			"with PI_VFS_TEST_KERNEL={kernel} each open should have {want}: {wrong:?}"
+		);
+	}
+
 	/// A directory opened only to reach what is below it needs only its
 	/// search permission on Linux, where it is opened `O_PATH`: by path
 	/// ([`crate::dir_handle::host::open_dir_to_search`]), as `..` of a child

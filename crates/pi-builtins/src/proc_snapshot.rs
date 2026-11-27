@@ -2475,6 +2475,7 @@ mod tests {
 		use std::os::unix::{ffi::OsStrExt as _, process::CommandExt as _};
 
 		let dir = tempfile::tempdir().unwrap();
+		let ready = dir.path().join("ready");
 		let link = dir.path().join(std::ffi::OsStr::from_bytes(b"p\xffq"));
 		std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &link).unwrap();
 		// The kernel names the process after the path it runs (`p\377q`);
@@ -2482,7 +2483,7 @@ mod tests {
 		let mut child = std::process::Command::new(&link)
 			.arg0("threads")
 			.args(["--ignored", "--exact", "proc_snapshot::tests::threads_of_a_process_named_p_377q"])
-			.env("PI_THREADS_NAMED", "1")
+			.env("PI_THREADS_NAMED", &ready)
 			.stdout(std::process::Stdio::null())
 			.stderr(std::process::Stdio::null())
 			.spawn()
@@ -2496,10 +2497,14 @@ mod tests {
 					.all(|task| std::fs::read(task.path().join("comm")).ok().as_deref() == Some(b"p\xffq\n"))
 			})
 		};
-		// Until its three threads run and every thread is named `p\377q`;
-		// the bound only keeps a broken helper from hanging the suite.
+		// Until the child has started its three threads (it makes `ready`
+		// once the third `spawn` has returned, so every thread it will have is
+		// in `/proc/<pid>/task`) and every thread is named `p\377q`. The child
+		// has five: libtest's main thread and the thread it runs the test on,
+		// and the three; a count to wait for would be libtest's to change.
+		// The bound only keeps a broken helper from hanging the suite.
 		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-		while tasks() < 4 || !all_named() {
+		while !ready.exists() || !all_named() {
 			if std::time::Instant::now() >= deadline {
 				let _ = child.kill();
 				let _ = child.wait();
@@ -2523,20 +2528,22 @@ mod tests {
 	/// Run by [`the_threads_of_a_process_whose_name_is_no_utf8_are_listed`]
 	/// as a process named `p\377q`: names its own thread so (libtest named
 	/// it after the test), then starts three more threads, which take that
-	/// name and sleep until the test kills the process.
+	/// name and sleep until the test kills the process, and then makes the
+	/// file `PI_THREADS_NAMED` names.
 	#[cfg(target_os = "linux")]
 	#[test]
 	#[ignore = "run as a child process by the_threads_of_a_process_whose_name_is_no_utf8_are_listed"]
 	fn threads_of_a_process_named_p_377q() {
-		if std::env::var_os("PI_THREADS_NAMED").is_none() {
+		let Some(ready) = std::env::var_os("PI_THREADS_NAMED") else {
 			return;
-		}
+		};
 		// SAFETY: PR_SET_NAME reads the NUL-terminated name passed; it names
 		// the calling thread only.
 		unsafe { libc::prctl(libc::PR_SET_NAME, b"p\xffq\0".as_ptr()) };
 		for _ in 0..3 {
 			std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_secs(600)));
 		}
+		std::fs::write(ready, b"").unwrap();
 		std::thread::sleep(std::time::Duration::from_secs(600));
 	}
 

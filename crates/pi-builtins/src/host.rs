@@ -3971,16 +3971,33 @@ mod testing {
 	#[cfg(unix)]
 	#[test]
 	fn a_widowed_pipe_waits_for_a_child_that_holds_its_read_end() {
+		/// The child holding the read end, killed and reaped however the test
+		/// ends: a step that failed before the kill below left a `sleep 600`
+		/// running for ten minutes.
+		struct Holder(std::process::Child);
+		impl Drop for Holder {
+			fn drop(&mut self) {
+				let _ = self.0.kill();
+				let _ = self.0.wait();
+			}
+		}
+
 		let (reader, writer) = std::io::pipe().unwrap();
-		let mut holder = std::process::Command::new("sleep").arg("600").stdin(reader).spawn().unwrap();
+		let mut holder = Holder(
+			std::process::Command::new("sleep")
+				.arg("600")
+				.stdin(reader)
+				.spawn()
+				.unwrap(),
+		);
 		let mut writer = OpenFile::from(writer);
 		writer.write_all(b"x").expect("the child's copy of the read end keeps the pipe read");
 		let mut waits = 0;
 		let mut writer = widow(writer, || {
 			waits += 1;
 			if waits == 1 {
-				holder.kill().unwrap();
-				holder.wait().unwrap();
+				holder.0.kill().unwrap();
+				holder.0.wait().unwrap();
 			}
 		});
 		assert!(waits >= 1, "widow returned while the child held the read end");

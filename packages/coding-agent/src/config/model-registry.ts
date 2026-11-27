@@ -3229,7 +3229,32 @@ export class ModelRegistry {
 						cacheProviderId: resolveModelCacheProviderId(descriptor.providerId, { baseUrl: providerBaseUrl }),
 						fetchDynamicModels: async () => {
 							const models = await fetchVendorModels();
-							return models?.filter(model => providerOwnsModelId(descriptor.providerId, model.id)) ?? null;
+							if (!models) return null;
+							// A proxy may list a model under the provider's own prefix
+							// (`anthropic/claude-opus-5-5`) as well as bare, so a redirected
+							// entry must not offer a doubled `anthropic/anthropic/...`
+							// selector. The manager maps a prefixed id with default
+							// text-only metadata and the id for its name, so a prefixed row
+							// renamed to its bare id would override the bundled catalog row
+							// (its real name and image input). Keep the richer row: drop a
+							// prefixed row whose bare id the bundled catalog or a bare
+							// discovered row already carries, and strip the prefix only when
+							// the prefixed row is the sole source of the id.
+							const ownPrefix = `${descriptor.providerId}/`;
+							const bundledIds = new Set(getBundledModels(descriptor.providerId).map(bundled => bundled.id));
+							const bareIds = new Set(
+								models.filter(model => !model.id.startsWith(ownPrefix)).map(model => model.id),
+							);
+							const seen = new Set<string>();
+							return models.flatMap(model => {
+								const prefixed = model.id.startsWith(ownPrefix);
+								const id = prefixed ? model.id.slice(ownPrefix.length) : model.id;
+								if (!providerOwnsModelId(descriptor.providerId, id)) return [];
+								if (prefixed && (bundledIds.has(id) || bareIds.has(id))) return [];
+								if (seen.has(id)) return [];
+								seen.add(id);
+								return [id === model.id ? model : { ...model, id }];
+							});
 						},
 					};
 				}

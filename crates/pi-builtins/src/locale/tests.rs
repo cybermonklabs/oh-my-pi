@@ -1030,15 +1030,48 @@ fn a_group_whose_utility_was_reaped_elsewhere_is_left_alone_before_linux_6_9() {
 	use std::os::fd::FromRawFd as _;
 	use std::os::unix::process::CommandExt as _;
 
+	/// The utility, ended with its group however the test ends: a step that
+	/// failed before the cleanup below left the utility and its member
+	/// running, a `sleep 30` each. The group is signalled only while the
+	/// utility is unreaped, so its number is still the utility's own.
+	struct Utility(std::process::Child);
+	impl std::ops::Deref for Utility {
+		type Target = std::process::Child;
+
+		fn deref(&self) -> &std::process::Child {
+			&self.0
+		}
+	}
+	impl std::ops::DerefMut for Utility {
+		fn deref_mut(&mut self) -> &mut std::process::Child {
+			&mut self.0
+		}
+	}
+	impl Drop for Utility {
+		fn drop(&mut self) {
+			if let (Ok(None), Ok(group @ 1..)) =
+				(self.0.try_wait(), libc::pid_t::try_from(self.0.id()))
+			{
+				// SAFETY: the group this test's own unreaped child leads; a
+				// signal is all it does.
+				unsafe { libc::killpg(group, libc::SIGKILL) };
+			}
+			let _ = self.0.kill();
+			let _ = self.0.wait();
+		}
+	}
+
 	as_linux_6_8();
 	for reaped_elsewhere in [true, false] {
 		// The utility leads its own group and leaves a member in it.
-		let mut utility = Command::new("/bin/sh")
-			.args(["-c", "sleep 30 & echo $!; exec sleep 30"])
-			.process_group(0)
-			.stdout(std::process::Stdio::piped())
-			.spawn()
-			.unwrap();
+		let mut utility = Utility(
+			Command::new("/bin/sh")
+				.args(["-c", "sleep 30 & echo $!; exec sleep 30"])
+				.process_group(0)
+				.stdout(std::process::Stdio::piped())
+				.spawn()
+				.unwrap(),
+		);
 		let number = libc::pid_t::try_from(utility.id()).unwrap();
 		let mut line = String::new();
 		std::io::BufReader::new(utility.stdout.take().unwrap()).read_line(&mut line).unwrap();

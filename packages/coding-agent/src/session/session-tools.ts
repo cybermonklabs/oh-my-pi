@@ -582,7 +582,7 @@ interface WithheldChange {
 	 * time the clock has not reached (a clock set back since, a record a clock running fast wrote) to the clock's.
 	 */
 	since: number;
-	/** A cut that rewrites every message, or a move to another transcript, ended the reason to withhold it. */
+	/** A move to another transcript ended the reason to withhold it, or a rebuild that failed is tried again. */
 	due: boolean;
 	/**
 	 * The branch view last found to record the change at {@link since} ({@link SYSTEM_PROMPT_HOLD_CUSTOM_TYPE}) and
@@ -3833,9 +3833,9 @@ export class SessionTools {
 
 	/**
 	 * Replaces the kept restored transcript prompt with this process's own build once keeping it buys nothing or the
-	 * change it withholds has waited long enough: `lapsed` (the prompt cache entry the cut rule reads has lapsed or
-	 * cannot be read, so no cached prefix is left to keep), a cut the cut rule admitted that rewrites every message
-	 * ({@link noteRewritingCutAdmitted}), a move to another transcript ({@link leaveRestoredTranscript}), or
+	 * change it withholds has waited long enough: `lapsed` (the prompt cache entry the next request reads has lapsed
+	 * or cannot be read, a compaction's included, so no cached prefix is left to keep), a move to another transcript
+	 * ({@link leaveRestoredTranscript}), or
 	 * {@link WITHHELD_CHANGE_MAX_AGE_MS} after the change. The rebuild renders the live settings, so a held settings
 	 * rebuild runs with it. A restored prompt whose held settings were all set back ({@link #restoredSettingsSetBack})
 	 * is its own build: the release keeps it as the base, and the change it withheld ends.
@@ -5218,8 +5218,8 @@ export class SessionTools {
 	 * settings that started a tool-set or skill-list step that moves what a request carries. The system prompt keeps
 	 * its bytes and each tool keeps the declaration the last request before the change sent ({@link #declaredAs}),
 	 * {@link takeSettingsNotice} tells the model what changed and when it goes out, and
-	 * {@link absorbHeldSettingsRebuild} runs the rebuild once it is due: at a cut the cut rule admits, once the prompt
-	 * cache entry lapses, or five minutes after the change, whichever comes first. A new hold is recorded on the branch
+	 * {@link absorbHeldSettingsRebuild} runs the rebuild once it is due: once the prompt cache entry lapses or cannot
+	 * be read (a compaction leaves it unreadable), or five minutes after the change, whichever comes first. A new hold is recorded on the branch
 	 * with its start, as on each branch a reply under it goes to ({@link recordReplyPrompt}), and so is each setting
 	 * it holds, so a resumed process that restores the bound prompt keeps the change waiting no longer and tells the
 	 * model of it ({@link #restoreTranscriptPrompt}). A hold on a restored transcript prompt holds the settings the
@@ -5696,17 +5696,6 @@ export class SessionTools {
 		if (this.#heldSettingsRebuild === held) this.#holdMoreSettings(held, movers);
 	}
 
-	/**
-	 * Records that the cut rule admitted a cut that rewrites every message after the system prompt and tools anyway:
-	 * the held settings rebuild and the kept restored transcript prompt, if any, are due, and stay due if a failed
-	 * rebuild restores them.
-	 */
-	noteRewritingCutAdmitted(): void {
-		if (this.#heldSettingsRebuild) this.#heldSettingsRebuild.due = true;
-		const restored = this.#keptRestoredPrompt();
-		if (restored) restored.due = true;
-	}
-
 	/** Whether the held settings rebuild runs now ({@link absorbHeldSettingsRebuild}). */
 	#heldSettingsRebuildDue(lapsed: boolean): boolean {
 		const held = this.#heldSettingsRebuild;
@@ -5714,9 +5703,9 @@ export class SessionTools {
 	}
 
 	/**
-	 * Runs the held settings rebuild once it is due ({@link withheldChangeDue}): the prompt cache entry the cut rule
-	 * reads has `lapsed` or the next request cannot read it, the cut rule admitted a cut under the hold that rewrites
-	 * every message, or the change is five minutes old, however warm the entry stayed. Runs it too when the prompt
+	 * Runs the held settings rebuild once it is due ({@link withheldChangeDue}): the prompt cache entry the next
+	 * request reads has `lapsed` or cannot be read (a compaction under the hold leaves it unreadable), or the change
+	 * is five minutes old, however warm the entry stayed. Runs it too when the prompt
 	 * is no longer bound ({@link #holdSettingsRebuild}).
 	 */
 	absorbHeldSettingsRebuild(lapsed: boolean): Promise<void> {
