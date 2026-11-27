@@ -249,12 +249,27 @@ export function resetActiveSkillsForTests(): void {
 const NO_SKILLS = Object.freeze<Skill[]>([]) as Skill[];
 
 /**
- * The skills of a subagent spawned from a session with `skills`: a copy of the list, or {@link NO_SKILLS} when there
- * are none. A kept-alive subagent keeps the list for as long as it can be revived, so a parent with no skills would
- * otherwise leave an empty list of its own in every subagent it parks.
+ * The frozen copy of each parent's skill list that {@link spawnedSubagentSkills} hands its subagents, by the parent's
+ * list: a writer of the parent's skills replaces the list, so the next spawn copies the new one, and the old copy goes
+ * with the old list once no subagent holds it.
+ */
+const spawnedSkillCopies = new WeakMap<readonly Skill[], Skill[]>();
+
+/**
+ * The skills of a subagent spawned from a session with `skills`: one frozen copy of the list, shared by every
+ * subagent spawned from that same list, or {@link NO_SKILLS} when there are none. A kept-alive subagent keeps the list
+ * for as long as it can be revived, so a copy of its own in each would grow with every subagent a parent parks. No
+ * holder writes into the list: a subagent's own skill discovery replaces its list, as every writer of a session's
+ * skills does.
  */
 export function spawnedSubagentSkills(skills: readonly Skill[] | undefined): Skill[] {
-	return skills?.length ? [...skills] : NO_SKILLS;
+	if (!skills?.length) return NO_SKILLS;
+	let copy = spawnedSkillCopies.get(skills);
+	if (!copy) {
+		copy = Object.freeze([...skills]) as Skill[];
+		spawnedSkillCopies.set(skills, copy);
+	}
+	return copy;
 }
 
 /**
