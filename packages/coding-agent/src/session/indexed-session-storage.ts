@@ -703,13 +703,14 @@ export class IndexedSessionStorage implements SessionStorage {
 	async readTextFrom(path: string, offset: number, maxBytes?: number): Promise<{ text: string; size: number }> {
 		if (!this.#index.has(path)) throw enoent(path);
 		await this.#awaitPath(path);
+		const clamped = maxBytes === undefined ? undefined : Math.max(0, maxBytes);
 		if (offset >= SESSION_TITLE_SLOT_BYTES) {
 			// Past the slot, the stored bytes are the text's.
-			const read = await this.#readBackendFrom(path, offset, maxBytes);
+			const read = await this.#readBackendFrom(path, offset, clamped);
 			if (!read) throw enoent(path);
 			return { text: read.text, size: read.title ? Math.max(read.size, SESSION_TITLE_SLOT_BYTES) : read.size };
 		}
-		const limit = maxBytes === undefined ? undefined : offset + Math.max(0, maxBytes);
+		const limit = clamped === undefined ? undefined : offset + clamped;
 		const read = await this.#readBackendFrom(path, 0, limit);
 		if (!read) throw enoent(path);
 		if (!read.title && offset <= 0) return { text: read.text, size: read.size };

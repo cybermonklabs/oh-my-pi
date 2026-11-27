@@ -788,6 +788,25 @@ describe("IndexedSessionStorage.updateSessionTitle", () => {
 	});
 });
 
+describe("IndexedSessionStorage.readTextFrom", () => {
+	// If this regresses, a negative `maxBytes` at an offset past the 256-byte title slot reaches a fallback backend's
+	// `Buffer.subarray(offset, offset + maxBytes)` as a negative end index and returns bytes past `offset` instead of none.
+	it("clamps a negative maxBytes to zero on a fallback backend, before and past the title slot", async () => {
+		const sessionPath = "/sessions/window.jsonl";
+		const body = "a".repeat(1_000);
+		const storage = new IndexedSessionStorage(new ControlledTitleUpdateBackend(sessionPath, body));
+		await storage.initialize();
+
+		expect({
+			beforeSlot: await storage.readTextFrom(sessionPath, 10, -5),
+			pastSlot: await storage.readTextFrom(sessionPath, 300, -301),
+		}).toEqual({
+			beforeSlot: { text: "", size: 1_000 },
+			pastSlot: { text: "", size: 1_000 },
+		});
+	});
+});
+
 class PausableWriteFullBackend implements SessionStorageBackend {
 	readonly writeFullCalls: Array<{ content: string; mtimeMs: number }> = [];
 	readonly firstWriteStarted = Promise.withResolvers<void>();

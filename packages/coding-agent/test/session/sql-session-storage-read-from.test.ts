@@ -341,6 +341,28 @@ for (const { adapter, url } of BACKENDS) {
 			expect(await readSessionTextFrom(storage, path, 6, 9)).toEqual({ text: "line\npeer", size: 21 });
 		});
 
+		// If this regresses, an untitled row starting with a UTF-8 BOM loses its leading three bytes in the backend's
+		// decode, so `readTextFrom(path, 3, 2)` slices past the decoded text and returns "" instead of "ab", and a
+		// window starting at a BOM past byte 256 drops it too.
+		it("keeps a leading UTF-8 BOM aligned with byte offsets on untitled rows", async () => {
+			await using db = connect();
+			const storage = await db.open();
+			const shortPath = "/sessions/p/bom.jsonl";
+			await storage.writeText(shortPath, "\uFEFFabc");
+			const longPath = "/sessions/p/bom-past-slot.jsonl";
+			await storage.writeText(longPath, `${"x".repeat(300)}\uFEFFyz`);
+
+			expect({
+				afterBom: await storage.readTextFrom(shortPath, 3, 2),
+				fromBom: await storage.readTextFrom(shortPath, 0, 5),
+				pastSlot: await storage.readTextFrom(longPath, 300, 4),
+			}).toEqual({
+				afterBom: { text: "ab", size: 6 },
+				fromBom: { text: "\uFEFFab", size: 6 },
+				pastSlot: { text: "\uFEFFy", size: 305 },
+			});
+		});
+
 		it("rejects a session the store does not hold as missing", async () => {
 			await using db = connect();
 			const storage = await db.open();

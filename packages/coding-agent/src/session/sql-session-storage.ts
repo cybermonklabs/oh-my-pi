@@ -4206,8 +4206,11 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (size === undefined || session === undefined) return null;
 		const bytes = joinSliceBytes(session.bytes, pieces);
 		// Each piece is capped on its own; the window is capped as a whole.
+		// Buffer.toString preserves a leading U+FEFF (TextDecoder strips it), so
+		// byte offsets stay aligned with the stored bytes.
+		const window = maxBytes === undefined ? bytes : bytes.subarray(0, take);
 		return {
-			text: utf8Decoder.decode(maxBytes === undefined ? bytes : bytes.subarray(0, take)),
+			text: window.toString("utf-8"),
 			size,
 			title: rowTitle(session),
 		};
