@@ -823,6 +823,7 @@ fn build_matcher(
 		let translated: Vec<String> = patterns
 			.iter()
 			.map(|pattern| {
+				bre::check_brackets(pattern, ignore_case)?;
 				bre::bre_to_ere(pattern, bre::Backrefs::Unsupported)
 					.map(|ere| alpha_by_locale(ere.into(), utf8).into_owned())
 			})
@@ -836,9 +837,15 @@ fn build_matcher(
 	// A `{` that opens no interval is a literal to GNU and BSD grep, but the
 	// `regex` crate refuses the whole pattern, so `grep -E '{a}'` failed on
 	// patterns real grep matches. An attempted-but-unterminated interval
-	// stays an error in both.
-	let patterns: Vec<std::borrow::Cow<'_, str>> =
-		patterns.iter().map(|p| bre::ere_literalize_braces(p)).collect();
+	// stays an error in both. A bracket expression GNU refuses is refused
+	// first.
+	let patterns = patterns
+		.iter()
+		.map(|pattern| {
+			bre::check_brackets(pattern, ignore_case).map(|()| bre::ere_literalize_braces(pattern))
+		})
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(|e| e.message().to_owned())?;
 
 	// `regex` accepts `^+` and compiles it as `(?:^)+`, which matches at every
 	// line start. GNU and BSD grep both reject the pattern, so returning every
@@ -3474,14 +3481,10 @@ mod tests {
 		}
 
 		// An unterminated bracket expression is not silently swallowed as an
-		// empty class: the engine refuses it. In `grep` it then reaches the
-		// pre-existing literal fallback - the same path back-references take -
-		// so it matches the typed text rather than erroring the way real grep
-		// does. That divergence predates this change and is unchanged by it;
-		// `sed`, which has no such fallback, reports the error.
+		// empty class, nor searched as the text typed: it is refused, as real
+		// grep refuses it.
 		let (code, out, err) = run(&["-c", "a[d"], "a[d\nplain\n").await;
-		assert_eq!(code, 0, "{err}");
-		assert_eq!(out, "1\n", "falls back to the literal text the user typed");
+		assert_eq!((code, out.as_str()), (2, ""), "{err}");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

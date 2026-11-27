@@ -24,13 +24,35 @@ pub(crate) enum BreError {
 	/// A repetition operator with nothing to repeat, where the tools error
 	/// rather than treating the character as a literal.
 	RepetitionOperandMissing,
+	/// A bracket expression with no closing `]`, or a `[:`, `[.` or `[=` in
+	/// one with no closing `:]`, `.]` or `=]`.
+	UnmatchedBracket,
+	/// A `\(` with no `\)`.
+	UnmatchedGroup,
+	/// A `\{` with no `\}`.
+	UnmatchedInterval,
+	/// A collating symbol or equivalence class that is not one byte, such as
+	/// `[[.é.]]`: glibc's C and C.UTF-8 locales collate byte by byte.
+	InvalidCollation,
+	/// A class name without its outer brackets, such as `[:alpha:]`.
+	#[cfg_attr(not(feature = "util.grep"), allow(dead_code, reason = "only grep refuses it"))]
+	MisspelledClass,
+	/// A range whose end sorts before its start, such as `[Z-a]` under `-i`.
+	#[cfg_attr(not(feature = "util.grep"), allow(dead_code, reason = "only grep refuses it"))]
+	InvalidRangeEnd,
 }
 
 impl BreError {
-	/// The message GNU and BSD grep both use for this condition.
+	/// The message for this condition, in GNU's words where GNU refuses it.
 	pub(crate) fn message(self) -> &'static str {
 		match self {
 			Self::RepetitionOperandMissing => "repetition-operator operand invalid",
+			Self::UnmatchedBracket => "Unmatched [, [^, [:, [., or [=",
+			Self::UnmatchedGroup => r"Unmatched ( or \(",
+			Self::UnmatchedInterval => r"Unmatched \{",
+			Self::InvalidCollation => "Invalid collation character",
+			Self::MisspelledClass => "character class syntax is [[:space:]], not [:space:]",
+			Self::InvalidRangeEnd => "Invalid range end",
 		}
 	}
 }
@@ -63,18 +85,23 @@ pub(crate) fn bre_to_ere(pattern: &str, backrefs: Backrefs) -> Result<String, Br
 	// those, so a second caret is an ordinary character. Keyed off `has_atom`
 	// alone, both carets became zero-width anchors and every line matched.
 	let mut anchored = false;
+	// How many `\(` are still open: one never closed is refused, as GNU
+	// refuses it, rather than left to the engine.
+	let mut open_groups = 0usize;
 	while let Some(c) = chars.next() {
 		if c == '\\' {
 			match chars.peek() {
 				Some('(') => {
 					chars.next();
 					result.push('('); // Group start
+					open_groups += 1;
 					has_atom = false;
 					anchored = false;
 				},
 				Some(')') => {
 					chars.next();
 					result.push(')'); // Group end
+					open_groups = open_groups.saturating_sub(1);
 					has_atom = true;
 				},
 				Some('?') => {
@@ -117,6 +144,11 @@ pub(crate) fn bre_to_ere(pattern: &str, backrefs: Backrefs) -> Result<String, Br
 					// has to be refused here because no later layer sees it.
 					if !has_atom {
 						return Err(BreError::RepetitionOperandMissing);
+					}
+					// glibc reads on to the end of the pattern for the `\}`
+					// that closes the interval, so `a\{2` is "Unmatched \{".
+					if !closes_interval(&chars) {
+						return Err(BreError::UnmatchedInterval);
 					}
 					result.push('{'); // Brace quantifier start
 				},
@@ -163,17 +195,12 @@ pub(crate) fn bre_to_ere(pattern: &str, backrefs: Backrefs) -> Result<String, Br
 					// `(`, `|` and `*` are ordinary characters. Translating
 					// through it turned `[\(]` into a group opener and broke
 					// compilation, so the whole expression is scanned as
-					// bracket syntax and copied across.
-					match take_bracket_expression(&mut chars, true) {
-						Some(body) => {
-							result.push('[');
-							result.push_str(&body);
-						},
-						// Unterminated. Measured, both tools reject it -
-						// "brackets ([ ]) not balanced" - so the half-open
-						// `[` is passed through for the engine to refuse.
-						None => result.push('['),
-					}
+					// bracket syntax and copied across. One with no closing
+					// `]` is refused, as GNU refuses it, rather than passed
+					// through for `grep` to search as the text typed.
+					let bracket = take_bracket_expression(&mut chars, true)?;
+					result.push('[');
+					result.push_str(&bracket.body);
 					has_atom = true;
 				},
 				'+' | '?' | '{' | '}' | '|' | '(' | ')' => {
@@ -232,7 +259,21 @@ pub(crate) fn bre_to_ere(pattern: &str, backrefs: Backrefs) -> Result<String, Br
 		}
 	}
 
+	if open_groups > 0 {
+		return Err(BreError::UnmatchedGroup);
+	}
 	Ok(result)
+}
+
+/// Whether a `\}` follows, which closes the interval a `\{` opens.
+fn closes_interval(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+	let mut rest = chars.clone();
+	while let Some(c) = rest.next() {
+		if c == '\\' && rest.next() == Some('}') {
+			return true;
+		}
+	}
+	false
 }
 
 /// Whether the rest of the pattern ends the current branch.
@@ -254,10 +295,27 @@ fn ends_branch(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
 	}
 }
 
-/// Consume a bracket expression's body, returning it without the outer `[]`.
+/// A bracket expression's body, without the outer `[]`, and what GNU grep
+/// refuses in it beyond what glibc refuses ([`check_brackets`]).
+struct Bracket {
+	body:             String,
+	/// A list whose first and last members are `:`, with a member between
+	/// that is not and no class, collating element or range: `[:alpha:]`,
+	/// which GNU's dfa reads as a misspelled `[[:alpha:]]`.
+	#[cfg_attr(not(feature = "util.grep"), allow(dead_code, reason = "only grep refuses it"))]
+	misspelled_class: bool,
+	/// A range whose ends run backwards once upper-cased, as glibc compares
+	/// them under `-i`: `[Z-a]`, where `a` folds to `A`.
+	#[cfg_attr(not(feature = "util.grep"), allow(dead_code, reason = "only grep refuses it"))]
+	folds_backwards:  bool,
+}
+
+/// Consume a bracket expression, returning its body without the outer `[]`.
 ///
-/// The opening `[` is already consumed. Returns `None` - advancing nothing -
-/// when the expression is unterminated.
+/// The opening `[` is already consumed. One with no closing `]` is
+/// [`BreError::UnmatchedBracket`], and one with a collating symbol or
+/// equivalence class that is not one byte [`BreError::InvalidCollation`],
+/// as glibc refuses them; either advances nothing.
 ///
 /// With `normalize`, the body is rewritten so the engine reads it the way
 /// POSIX does: `\` has no special meaning inside a bracket expression, so it
@@ -272,48 +330,138 @@ fn ends_branch(chars: &std::iter::Peekable<std::str::Chars<'_>>) -> bool {
 fn take_bracket_expression(
 	chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
 	normalize: bool,
-) -> Option<String> {
+) -> Result<Bracket, BreError> {
 	let mut probe = chars.clone();
 	let mut body = String::new();
 
 	// A leading `^` negates, and a `]` immediately after that is the literal
 	// `]` rather than the terminator.
-	if probe.peek() == Some(&'^') {
-		body.push(probe.next()?);
+	if let Some(caret) = probe.next_if_eq(&'^') {
+		body.push(caret);
 	}
-	if probe.peek() == Some(&']') {
+	let leading_close = probe.next_if_eq(&']').is_some();
+	if leading_close {
 		body.push_str(if normalize { r"\]" } else { "]" });
-		probe.next();
 	}
 
+	// For `misspelled_class`: whether the first member is `:`, whether the
+	// last one so far is, whether one is not, and whether a class, collating
+	// element or range has been read.
+	let colon_first = !leading_close && probe.peek() == Some(&':');
+	let (mut colon_last, mut other, mut structured) = (false, false, false);
+	let mut folds_backwards = false;
+	// The character the last member stands for, where it may start a range,
+	// and the start of a range whose `-` has been read.
+	let mut endpoint = leading_close.then_some(']');
+	let mut range_start = None;
 	while let Some(c) = probe.next() {
-		match c {
+		// The character this member stands for, where it may end a range.
+		let member = match c {
 			']' => {
 				*chars = probe;
-				return Some(body + "]");
+				body.push(c);
+				let misspelled_class = colon_first && colon_last && other && !structured;
+				return Ok(Bracket { body, misspelled_class, folds_backwards });
+			},
+			'-' if range_start.is_none()
+				&& endpoint.is_some()
+				&& probe.peek().is_some_and(|&next| next != ']') =>
+			{
+				range_start = endpoint;
+				body.push(c);
+				structured = true;
+				continue;
 			},
 			// `\` is an ordinary character here; keep it one.
-			'\\' => body.push_str(if normalize { r"\\" } else { "\\" }),
+			'\\' => {
+				body.push_str(if normalize { r"\\" } else { "\\" });
+				Some(c)
+			},
 			// `[:alpha:]`, `[.x.]` and `[=x=]` carry their own terminators, so
 			// the `]` that closes them does not close the bracket expression.
 			'[' if matches!(probe.peek(), Some(':' | '.' | '=')) => {
-				let kind = probe.next()?;
+				let kind = probe.next().ok_or(BreError::UnmatchedBracket)?;
 				body.push('[');
 				body.push(kind);
+				let element_start = body.len();
 				let mut previous = None;
 				loop {
-					let next = probe.next()?;
+					let next = probe.next().ok_or(BreError::UnmatchedBracket)?;
 					body.push(next);
 					if previous == Some(kind) && next == ']' {
 						break;
 					}
 					previous = Some(next);
 				}
+				structured = true;
+				if kind == ':' {
+					None
+				} else {
+					// glibc's C and C.UTF-8 locales collate byte by byte, so a
+					// collating symbol or equivalence class is one byte:
+					// `[[.é.]]` is "Invalid collation character" there.
+					let mut element = body[element_start..body.len() - 2].chars();
+					match (element.next(), element.next()) {
+						(Some(symbol), None) if symbol.is_ascii() => (kind == '.').then_some(symbol),
+						_ => return Err(BreError::InvalidCollation),
+					}
+				}
 			},
-			_ => body.push(c),
+			_ => {
+				body.push(c);
+				Some(c)
+			},
+		};
+		colon_last = c == ':';
+		other |= c != ':';
+		if let Some(start) = range_start.take() {
+			folds_backwards |= member.is_some_and(|end| simple_upper(start) > simple_upper(end));
+			endpoint = None;
+		} else {
+			endpoint = member;
 		}
 	}
-	None
+	Err(BreError::UnmatchedBracket)
+}
+
+/// `c`'s upper case where that is one character, as glibc's `towupper` maps
+/// it, else `c`.
+fn simple_upper(c: char) -> char {
+	let mut upper = c.to_uppercase();
+	match (upper.next(), upper.next()) {
+		(Some(upper), None) => upper,
+		_ => c,
+	}
+}
+
+/// Refuses what GNU grep refuses in a bracket expression of `pattern`, a BRE
+/// or an ERE: what the translation refuses, and a class name without its
+/// outer brackets (`[:alpha:]`, "character class syntax is [[:space:]], not
+/// [:space:]"), which GNU's dfa checks, and under `-i` (`ignore_case`) a
+/// range whose ends run backwards once upper-cased (`[Z-a]`, "Invalid range
+/// end"). `nl` compiles with glibc's regex alone, which takes `[:alpha:]` as
+/// a list, so the translation does not refuse it.
+#[cfg(feature = "util.grep")]
+pub(crate) fn check_brackets(pattern: &str, ignore_case: bool) -> Result<(), BreError> {
+	let mut chars = pattern.chars().peekable();
+	while let Some(c) = chars.next() {
+		match c {
+			'\\' => {
+				chars.next();
+			},
+			'[' => {
+				let bracket = take_bracket_expression(&mut chars, false)?;
+				if bracket.misspelled_class {
+					return Err(BreError::MisspelledClass);
+				}
+				if ignore_case && bracket.folds_backwards {
+					return Err(BreError::InvalidRangeEnd);
+				}
+			},
+			_ => {},
+		}
+	}
+	Ok(())
 }
 
 /// Make an ERE's non-interval `{` the literal both real tools treat it as.
@@ -355,11 +503,11 @@ pub(crate) fn ere_literalize_braces(pattern: &str) -> std::borrow::Cow<'_, str> 
 			},
 			// A brace inside a bracket expression is already a literal.
 			'[' => match take_bracket_expression(&mut chars, false) {
-				Some(body) => {
+				Ok(bracket) => {
 					result.push('[');
-					result.push_str(&body);
+					result.push_str(&bracket.body);
 				},
-				None => result.push('['),
+				Err(_) => result.push('['),
 			},
 			'{' if !chars.peek().is_some_and(char::is_ascii_digit) => {
 				result.push_str(r"\{");
