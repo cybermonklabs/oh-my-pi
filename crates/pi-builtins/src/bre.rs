@@ -883,4 +883,88 @@ mod tests {
 			assert_eq!((code, capture.out().as_str()), (0, expected), "grep {args:?}: {}", capture.err());
 		}
 	}
+
+	/// Repetition operators and intervals read as glibc reads them, which
+	/// GNU grep, nl and sed share. Regressed: `a+?` was a lazy `+`, a leading
+	/// `*` or `{1}` stopped grep, `{,2}` and `a{1` were text or errors as the
+	/// engine chose, a malformed interval took the engine's message, and a
+	/// count above 32767 was searched.
+	#[cfg(all(feature = "util.grep", feature = "util.nl", feature = "util.sed"))]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn repetition_operators_and_intervals_read_as_glibc_reads_them() {
+		use crate::{
+			grep::Grep,
+			host::{run_async_util, run_util},
+			nl::Nl,
+			sed::Sed,
+		};
+
+		for (args, stdin, expected) in [
+			// A `?` after another operator repeats it: `(a+)?`, not a lazy `+`.
+			(&["-cE", "a+?"][..], "b\n", (0, "1\n")),
+			(&["-c", r"a\+\?"], "b\n", (0, "1\n")),
+			(&["-oE", "a*?"], "aa\n", (0, "aa\n")),
+			// An ERE operator with nothing to repeat is skipped.
+			(&["-cE", "*x"], "x\n", (0, "1\n")),
+			(&["-cE", "(*a)"], "a\nb\n", (0, "1\n")),
+			// `{,2}` is `{0,2}` and `{,}` is `{0,}`, in either dialect.
+			(&["-cE", "a{,2}"], "b\n", (0, "1\n")),
+			(&["-c", r"a\{,2\}"], "b\n", (0, "1\n")),
+			(&["-c", r"a\{,\}"], "b\n", (0, "1\n")),
+			// An ERE brace whose count a character interrupts, or that the
+			// pattern ends inside of, is text; one with no count is refused.
+			(&["-cE", "a{1"], "a{1\n", (0, "1\n")),
+			(&["-cE", "a{1,x"], "a{1,x\nax\n", (0, "1\n")),
+			(&["-cE", "a{1x}"], "a{1x}\n", (0, "1\n")),
+			(&["-cE", "a{}"], "a{}\n", (2, "")),
+			// So is an ERE `)` that closes no group.
+			(&["-cE", "a)"], "a)\n", (0, "1\n")),
+			// A BRE `\{` with nothing to repeat is text, whatever its count.
+			(&["-c", r"\{"], "{\n", (0, "1\n")),
+			(&["-c", r"\{1"], "{1\n", (0, "1\n")),
+			(&["-c", r"\{32768\}"], "{32768}\n", (0, "1\n")),
+			// After an anchor a brace that makes no interval is text.
+			(&["-cE", "^{1,2,3}"], "{1,2,3}\n", (0, "1\n")),
+			(&["-cE", "a${1,2,3}"], "a{1,2,3}\n", (1, "0\n")),
+			(&["-cE", "^*{1,2,3}"], "{1,2,3}\n", (0, "1\n")),
+			(&["-cE", r"\b{1,2,3}"], "x{1,2,3}\n", (0, "1\n")),
+			(&["-c", r"\B\{\}"], "{}\n", (0, "1\n")),
+			// After any other atom it is refused.
+			(&["-cE", r"\w{1,2,3}"], "x{1,2,3}\n", (2, "")),
+			(&["-cE", "(^){1,2,3}"], "x\n", (2, "")),
+			// An ERE that starts with an interval reads its text after `{`.
+			(&["-Eo", "{1}"], "{1}\n", (0, "1}\n")),
+			(&["-Eow", "{1}"], "{1}\n", (0, "1}\n")),
+			(&["-Eo", "{1}y"], "x{1}y\n", (0, "1}y\n")),
+			// A count above 32767 is too big, as GNU's dfa finds after an
+			// anchor too; 32767 is the most.
+			(&["-cE", "a{32768,}"], "a\n", (2, "")),
+			(&["-cE", "^{32768}"], "a\n", (2, "")),
+			(&["-c", r"a\{32767\}"], "a\n", (1, "0\n")),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, stdin, "/").await;
+			assert_eq!((code, capture.out().as_str()), expected, "grep {args:?}: {}", capture.err());
+		}
+
+		for (args, message) in [
+			(&["-E", "a{2,1}"][..], r"Invalid content of \{\}"),
+			(&[r"a\{1,2,3\}"], r"Invalid content of \{\}"),
+			(&[r"a\{\}"], r"Invalid content of \{\}"),
+			(&[r"a\{1,32768\}"], "Regular expression too big"),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, "a\n", "/").await;
+			let err = format!("grep: {message}\n");
+			assert_eq!((code, capture.out(), capture.err()), (2, String::new(), err), "grep {args:?}");
+		}
+		for (spec, message) in
+			[(r"-bpa\{1,2,3\}", r"Invalid content of \{\}"), (r"-bpa\{1,32768\}", "Regular expression too big")]
+		{
+			let (code, capture) = run_util::<Nl>(&[spec], "a\n", "/");
+			let err = format!("nl: {message}\n");
+			assert_eq!((code, capture.out(), capture.err()), (1, String::new(), err), "nl {spec}");
+		}
+		// With `{` the delimiter, `\{` is a brace of the ERE.
+		let (code, capture) = run_util::<Sed>(&["-E", r"s{a\{1,32768}{Y{"], "a\n", "/");
+		assert_eq!((code, capture.out().as_str()), (1, ""), "{}", capture.err());
+	}
 }
