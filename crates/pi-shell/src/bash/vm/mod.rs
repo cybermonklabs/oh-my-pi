@@ -4723,16 +4723,6 @@ pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 				if own.stages[i].entry != start {
 					return None;
 				}
-				// A `( … )` forks the one its body is when that one is timed:
-				// `CMD_TIME_PIPELINE` keeps `execute_in_subshell` from giving
-				// it `CMD_NO_FORK` (`execute_cmd.c:1799`). A job's or a stage's
-				// `( … )` is that process, timed or not.
-				if own.kind == ir::SpawnKind::Subshell
-					&& spawn.kind == ir::SpawnKind::Subshell
-					&& killed::subshell_time(unit, spawn, op.node).is_some()
-				{
-					return None;
-				}
 			}
 			(code_at(end) == Some(ir::Opcode::SubExit)).then_some(false)
 		},
