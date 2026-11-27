@@ -680,4 +680,59 @@ mod tests {
 			assert!(ere_repetition_operand_missing(pattern), "should reject {pattern}");
 		}
 	}
+
+	/// GNU grep refuses each pattern below with exit 2 and prints no line.
+	/// Regressed: grep searched a pattern that is not valid, as the text
+	/// typed or as a list GNU never reads, and a caller took the count or
+	/// the "no match" for a real answer.
+	#[cfg(feature = "util.grep")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn an_unterminated_bracket_is_refused_in_a_bre() {
+		use crate::{grep::Grep, host::run_async_util};
+
+		let lines = "a\n:\nb]\n^\na[b\nx[]\nx\n[x\n";
+		for (args, stdin) in [
+			// A `[` with no closing `]`, so nothing closes the list.
+			(&["-n", "a[b"][..], lines),
+			// A `[` that ends the pattern.
+			(&["-c", "a["], lines),
+			(&["-o", "a["], lines),
+			// A `]` first in the list is a member, so it closes nothing.
+			(&["-n", "x[]"], lines),
+			(&["-n", "[]"], lines),
+			(&["-n", "[^]"], lines),
+			// A valid class, and then no closing `]`.
+			(&["-n", "[[:alpha:]"], lines),
+			// One invalid pattern beside a valid one.
+			(&["-n", "-e", "[x", "-e", "x"], lines),
+			// A group or an interval the pattern never closes.
+			(&["-c", r"\(a"], "x\n"),
+			(&["-c", r"a\{2"], "x\n"),
+			// A class name without its outer brackets: "character class
+			// syntax is [[:space:]], not [:space:]", in an ERE too.
+			(&["-c", "[:alpha:]"], "a:\n"),
+			(&["-cE", "[:alpha:]"], "a:\n"),
+			// Under -i GNU checks a range against the upper case of its
+			// ends, and `a` folds to `A`, before `Z`: "Invalid range end".
+			(&["-ci", "[Z-a]"], "x\n"),
+			// A collating symbol of a multibyte character in C.UTF-8:
+			// "Invalid collation character".
+			(&["-c", "[[.\u{e9}.]]"], "\u{e9}\n"),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, stdin, "/").await;
+			assert_eq!((code, capture.out().as_str()), (2, ""), "grep {args:?}: {}", capture.err());
+		}
+
+		// The forms GNU still takes: a list between colons that holds a
+		// range or a class, and the range `Z-a` read with case.
+		for (args, stdin, expected) in [
+			(&["-c", "[:a-z:]"][..], "a:\n", "1\n"),
+			(&["-c", "[:[:digit:]:]"], "a:\n", "1\n"),
+			(&["-c", "[Z-a]"], "x\nZ\n", "1\n"),
+			(&["-c", "[[.a.]]"], "a\n\u{e9}\n", "1\n"),
+		] {
+			let (code, capture) = run_async_util::<Grep>(args, stdin, "/").await;
+			assert_eq!((code, capture.out().as_str()), (0, expected), "grep {args:?}: {}", capture.err());
+		}
+	}
 }
