@@ -42,7 +42,9 @@ interface ProbeResult {
 	unheldBefore: string[];
 	persistedKeyTargets: number;
 	dateCwdKeyTargets: number;
-	keysUnheldBefore: string[];
+	persistedKeysSeenBefore: number;
+	dateCwdKeysSeenBefore: number;
+	keysUnseenBefore: string[];
 	reachableAtCompaction: string[];
 	agentMessagesAtCompaction: string[];
 	appendOnlyLogAtCompaction: string[];
@@ -64,7 +66,7 @@ interface ProbeResult {
 const LIST_FIELDS = [
 	"preCut",
 	"unheldBefore",
-	"keysUnheldBefore",
+	"keysUnseenBefore",
 	"reachableAtCompaction",
 	"agentMessagesAtCompaction",
 	"appendOnlyLogAtCompaction",
@@ -87,6 +89,8 @@ function isProbeResult(value: unknown): value is ProbeResult {
 		typeof fields.observed === "object" &&
 		typeof fields.persistedKeyTargets === "number" &&
 		typeof fields.dateCwdKeyTargets === "number" &&
+		typeof fields.persistedKeysSeenBefore === "number" &&
+		typeof fields.dateCwdKeysSeenBefore === "number" &&
 		typeof fields.dateCwdInjectionAfterNextRequest === "boolean" &&
 		typeof fields.dateCwdInjectionAtCompaction === "boolean" &&
 		typeof fields.tokenizerChecked === "number" &&
@@ -124,8 +128,10 @@ let probed: Promise<{ output: string; result: ProbeResult }> | undefined;
 
 /**
  * The probe's one run, which every case reads: its reading after the next request follows the one at the
- * compaction in the same session. No reading says anything unless the cut moved past every observed turn
- * and each holder kept values or keys for those turns before it did.
+ * compaction in the same session. No reading says anything unless the cut moved past every observed turn,
+ * each holder kept values for those turns before it did, and the heap snapshot showed all but a couple of
+ * each holder's keys: a key it cannot show is one this precondition does not read as unheld. The readings
+ * after the cut still look for every key, and what they find is held.
  */
 function probeOnce(): Promise<{ output: string; result: ProbeResult }> {
 	probed ??= (async () => {
@@ -149,7 +155,20 @@ function probeOnce(): Promise<{ output: string; result: ProbeResult }> {
 		expect(result.unheldBefore, output).toEqual([]);
 		expect(result.persistedKeyTargets, output).toBeGreaterThan(0);
 		expect(result.dateCwdKeyTargets, output).toBeGreaterThan(0);
-		expect(result.keysUnheldBefore, output).toEqual([]);
+		// Each holder's keys must be ones the snapshot can show, which is what the readings read: it shows a
+		// live string's text only while no other live string of its length hashes to the same 24 bits, and
+		// then only the first of the two it writes (the probe's comment on `seenOf`), so a key it misses is
+		// one the precondition cannot read as unheld. It misses about one key in 11,500, so a holder's dozen
+		// loses exactly two in about 5e-7 of runs, and either holder loses three or more in about 3e-10:
+		// more than two means the holder keys its turns under other strings, or keys none, which is a
+		// change in the product.
+		const unseenAllowed = 2;
+		const persistedUnseen = result.persistedKeyTargets - result.persistedKeysSeenBefore;
+		const dateCwdUnseen = result.dateCwdKeyTargets - result.dateCwdKeysSeenBefore;
+		expect(result.persistedKeysSeenBefore, output).toBeGreaterThan(0);
+		expect(result.dateCwdKeysSeenBefore, output).toBeGreaterThan(0);
+		expect(persistedUnseen, output).toBeLessThanOrEqual(unseenAllowed);
+		expect(dateCwdUnseen, output).toBeLessThanOrEqual(unseenAllowed);
 		return run;
 	})();
 	return probed;

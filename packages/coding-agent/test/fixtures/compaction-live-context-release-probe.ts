@@ -11,12 +11,15 @@
  * session's persisted-message index and the date/cwd reminder injector; the probe reads which of their keys
  * for the messages' assistant turns and tool results the heap holds before the compaction and at each
  * reading. Between the readings it appends a custom entry, so the next request's persistence builds the index
- * again. It prints one JSON line: which of those values and keys were not held before the compaction; at
- * each reading, which of the ones for messages before the cut are still reachable or held and which markers
- * of those messages the heap's large strings still hold; at the compaction, which of those markers the
- * Agent's messages and the append-only log still hold; after the next request, whether the Agent's tokenizer
- * still had an estimate for them. The parent runs this with the JIT off and HOME and PI_CODING_AGENT_DIR
- * under a temp dir.
+ * again. It prints one JSON line: which of those values were not held before the compaction; how many of
+ * each holder's keys the snapshot before the compaction showed, and which it did not (it shows a live
+ * string's text only while no other live string of its length hashes to the same 24 bits, and then only
+ * for the first of the two it writes, so a key it does not show is one no reading can call unheld); at
+ * each reading, which of the ones for messages before the cut are still reachable or held and which
+ * markers of those messages the heap's large strings still hold; at the compaction, which of those
+ * markers the Agent's messages and the append-only log still hold; after the next request, whether the
+ * Agent's tokenizer still had an estimate for them. The parent runs this with the JIT
+ * off and HOME and PI_CODING_AGENT_DIR under a temp dir.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -290,6 +293,19 @@ function ofHolder(labels: readonly string[], holder: string): string[] {
 	return labels.filter(label => label.startsWith(`${holder} `));
 }
 
+/**
+ * How many of a holder's keys the snapshot showed. It shows a live string's text only while no other live
+ * string of its length hashes to the same 24 bits, and then only for the first of the two it writes: Bun's
+ * builder keys its string table on `(hash, length)` and keeps the text first given under that key, with no
+ * comparison of the two (`BunV8HeapSnapshotBuilder::addString`, and `StringHasher::maskHash` for the 24
+ * bits). So a key the snapshot does not show may still be one a holder keeps, and absence tells nothing
+ * while presence tells that something holds it. A run of this loss over live strings of one length measured
+ * 1,208 texts dropped of 200,000, and 0 of 200.
+ */
+function seenOf(labels: readonly string[], holder: string, seen: ReadonlySet<string>): number {
+	return ofHolder(labels, holder).filter(label => seen.has(label)).length;
+}
+
 /** The provider turns of the last request before the compaction. */
 let lastRequestTurns: ProviderTurn[] = [];
 /** The copy of the first turn the date/cwd reminder injector sent, its reminder prepended. */
@@ -417,7 +433,8 @@ const unheldBefore = observed
 	.filter(({ ref }) => ref.deref() === undefined)
 	.map(({ holder, marker }) => `${holder} ${marker}`);
 if (!injectionReachable()) unheldBefore.push("date/cwd reminder injection");
-// The keys each holder kept before the compaction, by label.
+// The keys each holder kept before the compaction that the snapshot showed, by label. A target it did not
+// show is one no reading can judge ({@link seenOf}).
 const keysHeldBefore = new Set(
 	readHeap(new Set(), () =>
 		heldKeyTargets(
@@ -504,9 +521,10 @@ for (const entry of preCutEntries) {
 }
 const transcript = JSON.stringify(sessionManager.getEntries());
 const transcriptMissing = [...preCut].filter(marker => !transcript.includes(`[[${marker}]]`)).sort();
-// Each key looked for at a reading was held before the compaction, or its reading says nothing.
+// Which of the keys a reading looks for the snapshot before the compaction showed: a key it did not show
+// is one that reading cannot call unheld. Every reading still looks for them all.
 const preCutKeys = heldKeyLabels(preCutIds, preCutTurns);
-const keysUnheldBefore = preCutKeys.filter(label => !keysHeldBefore.has(label)).sort();
+const keysUnseenBefore = preCutKeys.filter(label => !keysHeldBefore.has(label)).sort();
 
 liveSession = undefined;
 await session.dispose();
@@ -524,7 +542,9 @@ process.stdout.write(
 		unheldBefore,
 		persistedKeyTargets: ofHolder(preCutKeys, PERSISTED_INDEX).length,
 		dateCwdKeyTargets: ofHolder(preCutKeys, DATE_CWD_REMINDER).length,
-		keysUnheldBefore,
+		persistedKeysSeenBefore: seenOf(preCutKeys, PERSISTED_INDEX, keysHeldBefore),
+		dateCwdKeysSeenBefore: seenOf(preCutKeys, DATE_CWD_REMINDER, keysHeldBefore),
+		keysUnseenBefore,
 		reachableAtCompaction,
 		agentMessagesAtCompaction,
 		appendOnlyLogAtCompaction,
