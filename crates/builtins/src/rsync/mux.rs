@@ -1117,9 +1117,9 @@ impl Write for MuxWriter {
 
 /// The connection's last output (internal monotonic milliseconds, 0 = never).
 /// Output through the linked writer counts even if it was built with its own
-/// counters. The idle check below and the read's postponement of it both read
-/// the connection's last output through this, so they cannot disagree on what
-/// it is.
+/// counters. The idle check below and the read's timing of the next one both
+/// read the connection's last output through this, so they cannot disagree on
+/// what it is.
 fn last_out(counters: &IoCounters, writer: Option<&MuxWriter>) -> u64 {
 	writer
 		.map_or(0, |w| w.shared.counters.last_out.load(Ordering::Relaxed))
@@ -1824,7 +1824,7 @@ impl MuxReader {
 		Ok(more)
 	}
 
-	/// The writer the idle check takes, and so the one the postponement counts.
+	/// The writer the idle check takes, and so the one the next check counts from.
 	/// A hooked reader (the receiving side's receiver) gives it none: upstream's
 	/// receiver writes its keepalives to the generator's pipe, and the generator
 	/// sees socket activity through the shared counters.
@@ -1837,6 +1837,19 @@ impl MuxReader {
 	fn since_output(&self) -> Option<Duration> {
 		let last = last_out(&self.shared.counters, self.timeout_writer());
 		(last != 0).then(|| Duration::from_millis(clock_ms().saturating_sub(last)))
+	}
+
+	/// When the check after the one that just ran is due: a select later, as
+	/// upstream's poll, or sooner, once the connection's last output is a lull
+	/// old, so that check sends the keepalive. A select can pass that moment: the
+	/// output thread writes, and stamps, the keepalive a check queued only after
+	/// `check_timeout` returned, and above `--timeout=120` select is capped below
+	/// the lull. Checking sooner cannot hide a timeout.
+	fn next_check_due(&self, timing: Timing) -> Instant {
+		let select = Duration::from_secs(timing.select);
+		// Read before `Instant::now()`, so the check it arms finds a whole lull.
+		let until_lull = self.since_output().and_then(|since| Duration::from_secs(timing.lull).checked_sub(since));
+		Instant::now() + until_lull.filter(|left| !left.is_zero()).map_or(select, |left| left.min(select))
 	}
 
 	fn read_data(&mut self, buf: &mut [u8], mut idle: Option<IdleWork<'_>>) -> io::Result<usize> {
@@ -1955,28 +1968,13 @@ impl MuxReader {
 			if let Some(timing) = timing {
 				let now = Instant::now();
 				let select = Duration::from_secs(timing.select);
-				let mut due = *next_check.get_or_insert(now + select);
-				// Upstream's poll counts its select timeout again after each write,
-				// so a check comes a whole select after the last output, the
-				// keepalive the previous check queued included. Here the output
-				// thread writes that keepalive, and stamps it, only after
-				// check_timeout has returned, so a check that comes due less than
-				// a select after the last output waits out the rest of it.
-				// Postponing cannot hide a timeout: it happens only while less
-				// than select of silence has passed, and select <= timeout.
-				if now >= due
-					&& let Some(left) = self.since_output().and_then(|since| select.checked_sub(since))
-					&& !left.is_zero()
-				{
-					due = now + left;
-					next_check = Some(due);
-				}
+				let due = *next_check.get_or_insert(now + select);
 				if now >= due {
 					let role = st.role;
 					drop(st);
 					check_timeout(&sh.counters, Some(timing), role, self.timeout_writer(), 0, false)?;
 					st = sh.lock();
-					next_check = Some(Instant::now() + select);
+					next_check = Some(self.next_check_due(timing));
 					continue;
 				}
 				wait = wait.min(due - now);
@@ -2945,7 +2943,7 @@ mod tests {
 	}
 
 	/// `--timeout=10` (lull 5): the connection takes the first keepalive a second
-	/// after it is queued. The next check must still come a whole lull after that
+	/// after it is queued. A check must still come a whole lull after that
 	/// write and send the second keepalive, so the two writes end less than one and a
 	/// half lulls (7.5 s) apart. Counted from the check that queued the first, the
 	/// next check found 4 s of silence and sent none, and the second keepalive came
@@ -2984,6 +2982,50 @@ mod tests {
 		assert!(write_ends.len() >= 2, "the sink took {} writes: {write_ends:?}", write_ends.len());
 		let gap = write_ends[1] - write_ends[0];
 		assert!(gap < lull + lull / 2, "the second keepalive ended {gap:?} after the first");
+	}
+
+	/// Above `--timeout=120` the select between checks is capped below the lull.
+	/// At `--timeout=161` (lull 81 s, select 60 s) a sender that wrote and then
+	/// waits on a quiet peer must send its keepalive once that output is a lull
+	/// old: the check a select after the write finds 60 s of silence and sends
+	/// none. Counted a select from that check instead, the keepalive waits for
+	/// the check at 120 s; at `--timeout=121`, where the lull ends a second
+	/// after that check, a check a second late ended the transfer. The test
+	/// waits the 81 s the lull takes; the cap bites only above `--timeout=120`.
+	#[test]
+	fn capped_select_keepalive_follows_the_lull() {
+		let timeout = Duration::from_secs(161);
+		let lull = Duration::from_secs(81);
+		// Between the lull and the 120 s two selects take.
+		let bound = lull + Duration::from_secs(19);
+		let (mut r, _tx, cancel) = blocking_reader(Some(timeout));
+		let sink = Sink::default();
+		let cfg = WriteConfig { timeout: Some(timeout), ..WriteConfig::default() };
+		// One set of counters for both halves, as `make_streams` builds them.
+		let mut w = MuxWriter::new(Box::new(sink.clone()), r.shared.counters.clone(), cfg);
+		w.start_multiplex().unwrap();
+		w.write_all(b"z").unwrap();
+		w.flush().unwrap();
+		let wrote = Instant::now();
+		assert_eq!(sink.take(), frame(MSG_DATA, b"z"));
+		r.set_role(Role::Sender);
+		r.link_writer(w);
+		let ended = Arc::new(AtomicBool::new(false));
+		let (flag, read_ended, sent) = (Arc::clone(&cancel), Arc::clone(&ended), Arc::clone(&sink.bytes));
+		let deadline = wrote + bound;
+		let t = thread::spawn(move || {
+			while lock(&sent).len() < 4 && !read_ended.load(Ordering::Relaxed) && Instant::now() < deadline {
+				thread::sleep(Duration::from_millis(10));
+			}
+			flag.store(true, Ordering::Relaxed);
+			wrote.elapsed()
+		});
+		let err = r.read(&mut [0u8; 1]).unwrap_err();
+		ended.store(true, Ordering::Relaxed);
+		let waited = t.join().unwrap();
+		assert_eq!(RsyncError::from_io(&err, RERR_STREAMIO).code, RERR_SIGNAL, "{err}");
+		assert_eq!(sink.take(), [0, 0, 0, 7], "the output {waited:?} after the write");
+		assert!(waited < bound, "the keepalive came {waited:?} after the write");
 	}
 
 	#[test]
