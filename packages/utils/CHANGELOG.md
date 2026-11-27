@@ -31,6 +31,8 @@
 
 ### Fixed
 
+- `readByteSourceChunks` rejects a reversed, negative or non-integer range with an `ArchiveError` before any read, instead of yielding nothing, and a chunked read of a plain tar member holds each range to its own length, so a source that returns one range short and the next one long fails the read instead of yielding shifted bytes
+- `writeTarArchive` holds a `Blob` member's stream and padding to the size its header records, so a file that grows or shrinks while it is packed fails the write instead of being written under a header with its old size
 - Fixed `cloneJsonTree` failing with `Maximum call stack size exceeded` on a tree nested more than about 22,500 levels deep; it keeps its own stack, and a cycle throws a `TypeError`
 - Fixed the ACP `ndJsonStream` transport failing with `Maximum call stack size exceeded` on a message nested more than about 40,000 levels deep; it writes the message with `stringifyDeepJson`
 - Fixed `stringifyDeepJson` writing a value a second time, and so calling its `toJSON` methods and getters again, when one of them threw a `RangeError`; only the engine's stack overflow (`Maximum call stack size exceeded`) now falls back to the iterative writer

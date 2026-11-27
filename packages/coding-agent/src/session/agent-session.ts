@@ -6575,16 +6575,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		const result = this.#ttsr.afterToolCall(ctx);
 		// The loop appends the tool result once this returns: hold it until the storage admits more appends. A
-		// failed wait must not throw here, where the loop would replace a completed tool's result with the error.
-		const admission = this.sessionManager.waitForAppendAdmission(signal);
+		// failed wait, whether its promise rejects or the storage throws before it returns one, must not throw
+		// here, where the loop would replace a completed tool's result with the error.
+		const admissionFailed = (error: unknown): AfterToolCallResult | undefined => {
+			logger.warn("Append admission wait failed", { error: String(error) });
+			return result;
+		};
+		let admission: Promise<void> | undefined;
+		try {
+			admission = this.sessionManager.waitForAppendAdmission(signal);
+		} catch (error) {
+			return admissionFailed(error);
+		}
 		if (!admission) return result;
-		return admission.then(
-			() => result,
-			error => {
-				logger.warn("Append admission wait failed", { error: String(error) });
-				return result;
-			},
-		);
+		return admission.then(() => result, admissionFailed);
 	}
 	/**
 	 * Emits the extension `tool_call` event for a loop-dispatched call at

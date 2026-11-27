@@ -1,10 +1,17 @@
 import { afterAll, describe, expect, it } from "bun:test";
-import { cachingByteSource, encodeArchive, httpByteSource, openArchive } from "@oh-my-pi/pi-utils/ar";
+import {
+	cachingByteSource,
+	encodeArchive,
+	httpByteSource,
+	openArchive,
+	readByteSourceChunks,
+} from "@oh-my-pi/pi-utils/ar";
 
 // The remote-source contract: an archive served over HTTP with Range support
 // must be listable and member-readable through ranged requests only (no full
 // download), servers without Range support must fall back to one bounded
 // buffered download, and the block cache must coalesce small header reads.
+// A chunked read of a source refuses a range that is not one before it reads.
 
 const DECODER = new TextDecoder();
 
@@ -97,5 +104,37 @@ describe("ar remote sources", () => {
 		// Huge reads bypass the cache with one direct fetch.
 		await cached.read(0, zipBytes.byteLength);
 		expect(reads).toBe(3);
+	});
+});
+
+describe("readByteSourceChunks", () => {
+	// If this regresses, a caller that computes a reversed or NaN range reads no bytes and takes that
+	// as the whole range, where the source's own range check would have failed the read.
+	it("rejects a reversed or NaN range before any read, and reads nothing for an empty one", async () => {
+		const reads: Array<[number, number]> = [];
+		const source = {
+			size: 16,
+			async read(start: number, end: number) {
+				reads.push([start, end]);
+				return new Uint8Array(end - start);
+			},
+		};
+		const outcome = (start: number, end: number): Promise<number | string> =>
+			Array.fromAsync(readByteSourceChunks(source, start, end)).then(
+				chunks => chunks.length,
+				(error: unknown) => String(error),
+			);
+
+		expect({
+			reversed: await outcome(5, 3),
+			nan: await outcome(Number.NaN, 4),
+			empty: await outcome(3, 3),
+			reads,
+		}).toEqual({
+			reversed: "ArchiveError: Invalid archive range",
+			nan: "ArchiveError: Invalid archive range",
+			empty: 0,
+			reads: [],
+		});
 	});
 });

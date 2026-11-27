@@ -9,6 +9,7 @@
  * failed appends one at a time.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { heapStats } from "bun:jsc";
 import {
 	IndexedSessionStorage,
 	SessionAppendBatchRolledBackError,
@@ -127,6 +128,13 @@ class HeldBackend implements SessionStorageBackend {
 
 	storedBytes(path: string): number {
 		return this.#storedBytes.get(path) ?? 0;
+	}
+}
+
+/** A {@link HeldBackend} that keeps none of the lines it stores, so whatever keeps a stored line is the storage. */
+class ForgetfulBackend extends HeldBackend {
+	override async append(): Promise<void> {
+		await this.releases.hold();
 	}
 }
 
@@ -406,6 +414,38 @@ describe("indexed session storage bounds the appends it queues", () => {
 			// Other tests share the process's queued appends: leave none behind, also when this one fails.
 			await releases.releaseUntil(writer.flush());
 			await session.storage.drain();
+		}
+	});
+
+	it("lets go of each line of a batch a backend without appendBatch stores one at a time once its write lands", async () => {
+		// If this regresses, a backend without appendBatch (Redis session storage, an SDK store) whose
+		// last write of a batch stalls keeps every line of the batch in memory, past the admission count
+		// that stopped counting each as it landed.
+		const releases = new Releases();
+		const storage = new IndexedSessionStorage(new ForgetfulBackend(releases));
+		await storage.initialize();
+		const writer = storage.openWriter("/s/forgetful.jsonl");
+		const heapBytes = (): number => {
+			Bun.gc(true);
+			return heapStats().heapSize;
+		};
+		try {
+			const before = heapBytes();
+			// Queued while none is in flight, the lines make one batch: one append each, in order.
+			for (let n = 0; n < 40; n++) {
+				const line = Buffer.alloc(MiB, 97 + (n % 26));
+				line[MiB - 1] = 0x0a;
+				writer.appendSync?.(line.toString("latin1"));
+			}
+			// Every write but the last lands; the last stalls.
+			for (let n = 0; n < 39; n++) await releases.releaseOne();
+
+			// The stalled line, not the 39 that landed (40 MiB in all).
+			expect(heapBytes() - before).toBeLessThan(8 * MiB);
+		} finally {
+			// Other tests share the process's queued appends: leave none behind, also when this one fails.
+			await releases.releaseUntil(writer.flush());
+			await storage.drain();
 		}
 	});
 });

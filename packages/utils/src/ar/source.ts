@@ -93,12 +93,17 @@ export async function readAllBytes(source: ByteSource): Promise<Uint8Array> {
 /** Chunk size for streamed decompression, on both the compressed and the decompressed side. */
 export const STREAM_CHUNK_SIZE = 1024 * 1024;
 
-/** Bytes `[start, end)` of `source` (all of it by default) as reads of at most {@link STREAM_CHUNK_SIZE} bytes. */
+/**
+ * Bytes `[start, end)` of `source` (all of it by default) as reads of at most
+ * {@link STREAM_CHUNK_SIZE} bytes. A range that is not one (reversed, negative
+ * or not a safe integer) fails before any read; an empty one reads nothing.
+ */
 export async function* readByteSourceChunks(
 	source: ByteSource,
 	start = 0,
 	end = source.size,
 ): AsyncGenerator<Uint8Array> {
+	assertValidRange(start, end);
 	for (let offset = start; offset < end; offset += STREAM_CHUNK_SIZE) {
 		yield await source.read(offset, Math.min(end, offset + STREAM_CHUNK_SIZE));
 	}
