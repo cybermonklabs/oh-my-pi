@@ -83,6 +83,52 @@ function entryKind(entry: Record<string, unknown>): string {
 	return typeof entry.type === "string" ? entry.type : "unknown";
 }
 
+/**
+ * Runs `action` and returns how many bytes node:fs's synchronous writers wrote meanwhile into the file with inode
+ * `ino`. A write counts against the file its target names when the call starts: bytes staged in a new file that is
+ * then renamed over the path do not count, which the caller's inode check covers.
+ */
+async function bytesWrittenInto(ino: number, action: () => Promise<void>): Promise<number> {
+	let bytes = 0;
+	const targetsFile = (target: fs.PathOrFileDescriptor): boolean => {
+		try {
+			return (typeof target === "number" ? fs.fstatSync(target) : fs.statSync(target)).ino === ino;
+		} catch {
+			return false;
+		}
+	};
+	const writeSync = fs.writeSync as (fd: number, ...rest: unknown[]) => number;
+	const { writevSync, writeFileSync, appendFileSync } = fs;
+	const spies = [
+		spyOn(fs, "writeSync").mockImplementation((fd: number, ...rest: unknown[]) => {
+			const counted = targetsFile(fd);
+			const written = writeSync(fd, ...rest);
+			if (counted) bytes += written;
+			return written;
+		}),
+		spyOn(fs, "writevSync").mockImplementation((fd, buffers, position) => {
+			const counted = targetsFile(fd);
+			const written = writevSync(fd, buffers, position);
+			if (counted) bytes += written;
+			return written;
+		}),
+		spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+			if (targetsFile(file)) bytes += typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
+			writeFileSync(file, data, options);
+		}),
+		spyOn(fs, "appendFileSync").mockImplementation((file, data, options) => {
+			if (targetsFile(file)) bytes += typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
+			appendFileSync(file, data, options);
+		}),
+	];
+	try {
+		await action();
+	} finally {
+		for (const spy of spies) spy.mockRestore();
+	}
+	return bytes;
+}
+
 describe("SessionManager JSONL software-crash durability", () => {
 	it("makes completed entries visible on disk without a microtask or flush", () => {
 		const cwd = makeTempDir("@pi-immediate-cwd-");
@@ -405,16 +451,18 @@ describe("SessionManager JSONL software-crash durability", () => {
 		const usageBefore = manager.getUsageStatistics();
 		await manager.flush();
 		const bytesBefore = fs.readFileSync(sessionFile, "utf8");
-		const inodeBefore = fs.statSync(sessionFile).ino;
-		await manager.discardEntryDurably(discardedId);
-		// The session's full rewrite stages the new body beside the session file and renames it over the path, so the
-		// path then names a different file. An append writes through the open file, so the path keeps naming the same
-		// one. This catches that rewrite; a rewrite in place (truncate and write the same file) keeps the inode.
+		const { ino: inodeBefore, size: sizeBefore } = fs.statSync(sessionFile);
+		const bytesWritten = await bytesWrittenInto(inodeBefore, () => manager.discardEntryDurably(discardedId));
+		// The current atomic rewrite path stages a new body and renames it over the session path,
+		// which changes the inode.
 		expect(fs.statSync(sessionFile).ino).toBe(inodeBefore);
+		// The discard only appends: every byte it writes into the session file is one the file grows by. A rewrite in
+		// place keeps the inode but writes the whole body again, so it writes more bytes than the file gains.
+		expect(bytesWritten).toBe(fs.statSync(sessionFile).size - sizeBefore);
 		await manager.close();
 
 		// The file still starts with the bytes written before the discard. A rewrite can keep them too, so this checks
-		// the content only.
+		// the content only. The inode check detects replacement by rename. It does not detect an in-place rewrite.
 		expect(fs.readFileSync(sessionFile, "utf8").slice(0, bytesBefore.length)).toBe(bytesBefore);
 
 		const reloaded = await SessionManager.open(sessionFile, sessionDir);
