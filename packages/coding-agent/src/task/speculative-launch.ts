@@ -217,7 +217,7 @@ export interface TaskLaunchSessionOptions {
 	 * the field out is isolated or not by what the finished call says, and the launcher cannot read
 	 * a top-level `isolated` that has not streamed yet: it rebuilds each prefix as
 	 * `{ context, tasks }`. Starting such an item early writes in the user's checkout for a call
-	 * that may be asking for isolation, so it waits for dispatch instead.
+	 * that may be asking for isolation, so it starts at `finalize`, once the whole call has streamed.
 	 */
 	isolationEnabled: boolean;
 	/** Called once when the session stops owning launches (adopted or discarded). */
@@ -259,8 +259,10 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 		if (scanner.malformed || context === undefined) return;
 		const items = scanner.items;
 		for (let index = 0; index < items.length; index++) {
+			// The loop starts at 0 on every chunk, because an earlier item may still be waiting (see
+			// `isolationEnabled`); an item already planned must not be planned again.
 			if (this.#planned.has(index)) continue;
-			// See `isolationEnabled`: an item that names no `isolated` of its own waits for dispatch.
+			// See `isolationEnabled`: an item that names no `isolated` of its own starts at `finalize`.
 			if (this.#options.isolationEnabled && items[index]?.isolated === undefined) continue;
 			const batch = { context, tasks: items.slice(0, index + 1) };
 			const spawn = this.#options.launcher.spawns(batch)?.[index];
@@ -342,7 +344,7 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 		return true;
 	}
 
-	/** Plan `index` now; authorize and start it behind earlier launches so ids and permits stay in item order. */
+	/** Plan `index` now; authorize and start it behind the launches already queued, so ids and permits follow planning order. */
 	#schedule(toolCall: AgentToolCall, args: Readonly<Record<string, unknown>>, spawn: TaskParams, index: number): void {
 		this.#planned.set(index, canonicalJson(spawn));
 		this.#queue = this.#queue.then(() => this.#launch(toolCall, args, spawn, index));

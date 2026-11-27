@@ -374,6 +374,36 @@ describe("task speculative launch", () => {
 		await spawn("Alpha").aborted.promise;
 	});
 
+	// With an earlier item waiting for `finalize`, `update` scans from the first item on every chunk.
+	// A later item that already started must not start again on each chunk that follows it.
+	it("starts an early item once however many chunks stream after it", async () => {
+		const { tool, manager, session } = await openSession({ "task.isolation.enabled": true });
+		const call = {
+			context: "ctx",
+			tasks: [
+				{ name: "Alpha", agent: "task", task: "Do A." },
+				{ name: "Beta", agent: "task", task: "Do B.", isolated: false },
+			],
+		};
+		const raw = JSON.stringify(call);
+		const betaClosed = raw.indexOf("}]") + 1;
+		session.update(toolCall, raw.slice(0, betaClosed));
+		await spawn("Beta").started.promise;
+		session.update(toolCall, raw.slice(0, betaClosed + 1));
+		session.update(toolCall, raw);
+		session.finalize({ toolCall, args: call });
+		await spawn("Alpha").started.promise;
+
+		const result = await tool.execute(toolCall.id, call);
+		// A second start of Beta would be adopted under a renamed id such as `Beta-2`.
+		expect(result.details?.progress?.map(progress => progress.id)).toEqual(["Alpha", "Beta"]);
+		spawn("Alpha").release.resolve();
+		spawn("Beta").release.resolve();
+		await manager.getJob("Alpha")!.promise;
+		await manager.getJob("Beta")!.promise;
+		expect([...startedIds].sort()).toEqual(["Alpha", "Beta"]);
+	});
+
 	// The halt can land while a launch waits for authorization, so the wait is re-checked after it.
 	it("does not start a launch whose authorization returns after the call halted", async () => {
 		const asked = Promise.withResolvers<void>();
