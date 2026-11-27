@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { USELESS_NOTICE } from "@oh-my-pi/pi-agent-core/compaction/pruning";
-import type { Context } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Context, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AdvisorOutputQuarantinedError, AdvisorRuntime } from "@oh-my-pi/pi-coding-agent/advisor/runtime";
@@ -463,6 +463,87 @@ describe("AgentSession per-turn prune persistence", () => {
 			expect(replayed).toContain("⇒ ok · 1 line");
 			expect(replayed).not.toContain("30 lines");
 			runtime.dispose();
+		});
+	});
+
+	/**
+	 * The stale pass keeps the calls the latest compaction summarized away
+	 * across turns. Once the session rewrites one of them in place, the next
+	 * pass must pair the kept result with the call as rewritten: a stale call
+	 * keys the result by the file it no longer shows, and a newer read of that
+	 * file blanks it.
+	 */
+	describe("across a compaction boundary", () => {
+		const usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const fileBody = "export const value = 1;\n".repeat(200);
+
+		function assistant(content: AssistantMessage["content"]): AssistantMessage {
+			return {
+				role: "assistant",
+				content,
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				stopReason: content.some(block => block.type === "toolCall") ? "toolUse" : "stop",
+				usage,
+				timestamp: Date.now(),
+			};
+		}
+
+		function readCall(toolCallId: string, path: string): AssistantMessage {
+			return assistant([{ type: "toolCall", id: toolCallId, name: "read", arguments: { path } }]);
+		}
+
+		function readResult(toolCallId: string): ToolResultMessage {
+			return {
+				role: "toolResult",
+				toolCallId,
+				toolName: "read",
+				content: [{ type: "text", text: fileBody }],
+				isError: false,
+				timestamp: Date.now(),
+			};
+		}
+
+		/** Commits a turn outside the agent loop; its agent end runs the stale pass. */
+		async function commitTurn(messages: AgentMessage[]): Promise<void> {
+			for (const message of messages) session.agent.emitExternalEvent({ type: "message_end", message });
+			session.agent.emitExternalEvent({ type: "agent_end", messages });
+			await session.waitForIdle();
+		}
+
+		it("pairs a kept read with its summarized-away call as the session rewrote it", async () => {
+			// The compaction keeps a read's result and summarizes away its call.
+			const callEntryId = sessionManager.appendMessage(readCall("call-kept", "src/a.ts"));
+			const keptId = sessionManager.appendMessage(readResult("call-kept"));
+			sessionManager.appendCompaction("Read src/a.ts.", undefined, keptId, 10_000);
+			session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+			// Nothing reads src/a.ts again yet: the stale pass pairs the kept result with that call and keeps it.
+			await commitTurn([assistant([{ type: "text", text: "Read it." }])]);
+
+			// The session rewrites that call in place to read src/b.ts; then src/a.ts is read again.
+			const callEntry = sessionManager.getEntry(callEntryId);
+			if (callEntry?.type !== "message") throw new Error("Expected the kept read's call entry");
+			callEntry.message = readCall("call-kept", "src/b.ts");
+			await sessionManager.rewriteEntries();
+			await commitTurn([
+				readCall("call-newer", "src/a.ts"),
+				readResult("call-newer"),
+				assistant([{ type: "text", text: "Read it again." }]),
+			]);
+
+			// The kept result shows src/b.ts, so the newer read of src/a.ts leaves it in context.
+			const kept = sessionManager.getEntry(keptId);
+			const keptMsg = kept?.type === "message" ? kept.message : undefined;
+			expect(keptMsg).toMatchObject({ content: [{ type: "text", text: fileBody }] });
+			expect(keptMsg && "prunedAt" in keptMsg ? keptMsg.prunedAt : undefined).toBeUndefined();
 		});
 	});
 });

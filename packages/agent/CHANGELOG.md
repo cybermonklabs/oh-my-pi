@@ -12,6 +12,7 @@
 - Fixed the context figure that the status line and compaction read leaving out `$` Python output, `@file` mentions and a `!` command's terminal images, and counting `!!` output that no request carries ([#20834](https://github.com/can1357/oh-my-pi/pull/20834) by [@sjawhar](https://github.com/sjawhar))
 - Fixed token counting throwing on a stored custom message whose content is neither text nor blocks ([#20834](https://github.com/can1357/oh-my-pi/pull/20834) by [@sjawhar](https://github.com/sjawhar))
 - Fixed a failed split-turn compaction leaving its other summary request running after the failure was reported ([#20713](https://github.com/can1357/oh-my-pi/pull/20713) by [@sjawhar](https://github.com/sjawhar))
+- After a compaction that kept no entry (an Anthropic native compaction that summarizes everything), the prune and shake passes start at that compaction, or at the turns added while it ran, instead of walking, and reading, the whole history on every pass ([#20714](https://github.com/can1357/oh-my-pi/pull/20714) by [@sjawhar](https://github.com/sjawhar))
 
 ### Added
 
@@ -20,6 +21,7 @@
 ### Changed
 
 - `resolveThresholdTokens()` caps the reserve-based default trigger at `DEFAULT_THRESHOLD_CEILING_TOKENS` (690,000), so 1M-class windows compact at 690K instead of 85% of the window; a configured percentage, fixed trigger, or `baseWindowTokens` is not capped
+- Lowered prune and shake latency on long compacted branches: shake no longer walks the history a compaction summarized away, and passes given a session's `PrefixToolCallCache` as `prefixToolCalls` read the tool calls there once until that history is rewritten, instead of on every pass ([#20714](https://github.com/can1357/oh-my-pi/pull/20714) by [@sjawhar](https://github.com/sjawhar))
 
 ## [19.2.1] - 2026-11-25
 
