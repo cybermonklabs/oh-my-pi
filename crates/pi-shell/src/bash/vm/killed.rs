@@ -469,19 +469,10 @@ pub(super) fn subshell_ended(
 		.filter(|o| o.code == Opcode::Not && !whole)
 		.map_or(op.node, |o| o.node);
 	// The `time` bash sets on the `( … )` comes first, unless the `!`
-	// pipeline named here is the one it times, whose text shows it. Its own
-	// `time -p` is the timed pipeline's, which a lone `( … )` inside merged
-	// with its own: read it from that pipeline's text.
+	// pipeline named here is the one it times, whose text shows it.
 	let (node, time) = match subshell_time(&unit, spawn, op.node) {
-		Some(SubshellTime::Own(pipeline) | SubshellTime::Flags { pipeline, .. })
-			if pipeline == node =>
-		{
-			(node, None)
-		},
-		Some(SubshellTime::Own(pipeline)) => {
-			let own = exec::job_text(k, cx, vp, &unit, pipeline);
-			(node, Some(own.starts_with(b"time -p ")))
-		},
+		Some(SubshellTime::Own(pipeline)) => (pipeline, None),
+		Some(SubshellTime::Flags { pipeline, .. }) if pipeline == node => (node, None),
 		Some(SubshellTime::Flags { posix, .. }) => (node, Some(posix)),
 		None => (node, None),
 	};
@@ -509,7 +500,7 @@ pub(super) fn subshell_ended(
 #[derive(Clone, Copy)]
 pub(super) enum SubshellTime {
 	/// The `( … )`'s own `time`, which it passed on to the one `( … )` its
-	/// body is: `time -p` if the timed pipeline `pipeline` says so.
+	/// body is: the text of the timed pipeline `pipeline` shows it.
 	Own(u32),
 	/// The `( … )`'s fork times its body: with its own `time` or the one
 	/// an outer `( … )` passed on (`pipeline` is the timed pipeline), `time

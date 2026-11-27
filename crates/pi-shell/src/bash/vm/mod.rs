@@ -4744,11 +4744,10 @@ pub(super) fn transparent(p: &Vproc, children: bool) -> Option<bool> {
 /// subshell, job or pipeline stage that runs it: that body's entry is the
 /// `( … )`'s `Enter`, or the `Redir` of its redirections before it
 /// (`[Redir] Enter Spawn … Leave [PopRedir] SubExit`; [`transparent`]
-/// checks the end, and that a `( … )`'s timed one forks). bash runs such a
-/// `( … )` in the process of that body (`execute_in_subshell` gives a body
-/// that is one untimed `cm_subshell` `CMD_NO_FORK`, and does its
-/// redirections first); after another command, as in `( :; ( list ) )`, it
-/// forks.
+/// checks the end). bash runs such a `( … )` in the process of that body
+/// (`execute_in_subshell` gives a body that is one `cm_subshell`
+/// `CMD_NO_FORK`, and does its redirections first); after another
+/// command, as in `( :; ( list ) )`, it forks.
 fn whole_stage(unit: &Unit, pc: u32) -> bool {
 	let code_at = |pc: u32| unit.ops.get(pc as usize).map(|op| op.code);
 	let Some(enter) = pc
