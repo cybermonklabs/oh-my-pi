@@ -24,6 +24,7 @@ import { createMockModel, type MockHandler, type MockModel, registerMockApi } fr
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -38,6 +39,10 @@ import { cfgSecretsMaskSessionStore } from "@oh-my-pi/pi-coding-agent/secrets/se
 import { cfgContextPromotionEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { runSubagentFollowUpTurn, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
+import { runStructuredSubagent } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { __resetDirsFromEnvForTests, isRecord, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -822,3 +827,140 @@ it("keeps no model the registry replaced after the park, and revives on the regi
 		run.close();
 	}
 }, 30_000);
+
+function skillNamed(name: string): Skill {
+	return {
+		name,
+		description: `The ${name} skill`,
+		filePath: `/skills/${name}/SKILL.md`,
+		baseDir: `/skills/${name}`,
+		source: "user",
+	};
+}
+
+// If this regresses, each child a parent spawns gets a copy of the parent's whole skill list of its own, and a kept-alive
+// one keeps it for as long as it can be revived, so a process that parks many subagents holds a list for each; or a
+// child that is spawned once its parent replaced its list gets the old skills from a copy made before.
+it("gives every child of one parent the same frozen copy of its skills", async () => {
+	const cwd = path.join(root, "home", "work");
+	await fs.mkdir(cwd, { recursive: true });
+	const authStorage = createInMemoryAuthStorage();
+	authStorage.keys.setRuntime("mock", "test-key");
+	const model = createMockModel({
+		handler: context =>
+			(context.tools ?? []).some(tool => tool.name === "yield")
+				? { content: [{ type: "toolCall", name: "yield", arguments: { type: "result", data: "done" } }] }
+				: { content: ["label"] },
+	});
+	const modelRegistry = new ModelRegistry(authStorage, path.join(root, "models.yml"));
+	const find = modelRegistry.find.bind(modelRegistry);
+	vi.spyOn(modelRegistry, "find").mockImplementation((provider, id) =>
+		provider === "mock" && id === model.id ? model : find(provider, id),
+	);
+	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(() => [model]);
+	vi.spyOn(modelRegistry, "getAll").mockImplementation(() => [model]);
+	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+		agents: [
+			{
+				name: "skill-agent",
+				description: "Runs with its parent's skills",
+				systemPrompt: "test",
+				source: "project",
+				tools: ["read"],
+			},
+		],
+		projectAgentsDir: null,
+	});
+
+	let parentSkills: Skill[] = ["alpha", "beta", "gamma"].map(skillNamed);
+	const parent = {
+		cwd,
+		hasUI: false,
+		settings: Settings.isolated({
+			"task.agentIdleTtlMs": 0,
+			"task.isolation.enabled": false,
+			"async.enabled": false,
+			"compaction.enabled": false,
+			"retry.enabled": false,
+			"todo.enabled": false,
+			"todo.reminders": false,
+			"advisor.enabled": false,
+			modelRoles: { default: `mock/${model.id}` },
+		}),
+		authStorage,
+		modelRegistry,
+		enableMCP: false,
+		enableLsp: false,
+		enableIrc: false,
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+		getSessionAgents: () => [],
+		get skills() {
+			return parentSkills;
+		},
+		contextFiles: [],
+		promptTemplates: [],
+		rules: [],
+		extensionPaths: [],
+		customToolPaths: [],
+	} as unknown as ToolSession;
+
+	// What the spawn hands the child's session, and what the live child holds.
+	const forwarded: Array<readonly Skill[] | undefined> = [];
+	const createAgentSession = sdkModule.createAgentSession;
+	vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		forwarded.push(options?.skills);
+		return createAgentSession(options);
+	});
+	const spawn = async (id: string): Promise<readonly Skill[]> => {
+		const { result } = await runStructuredSubagent({
+			session: parent,
+			invocationKind: "task",
+			assignment: "report done",
+			agent: "skill-agent",
+			structured: false,
+			identity: { id },
+		});
+		expect(result.exitCode, result.error).toBe(0);
+		return localSession(AgentRegistry.global().get(id)?.session).skills;
+	};
+
+	try {
+		const heldByFirst = await spawn("SkillsFirst");
+		const heldBySecond = await spawn("SkillsSecond");
+		const [shared] = forwarded;
+		expect({
+			spawns: forwarded.length,
+			sameList: forwarded[0] === forwarded[1],
+			childrenHoldIt: heldByFirst === shared && heldBySecond === shared,
+			frozen: Object.isFrozen(shared),
+			parentsSkillsInOrder:
+				shared?.length === parentSkills.length && parentSkills.every((skill, index) => shared[index] === skill),
+		}).toEqual({ spawns: 2, sameList: true, childrenHoldIt: true, frozen: true, parentsSkillsInOrder: true });
+
+		// The parent replaces its list, as every writer of a session's skills does: the next child gets a copy of the new one.
+		parentSkills = ["delta", "epsilon"].map(skillNamed);
+		const heldByThird = await spawn("SkillsThird");
+		const [, , renewed] = forwarded;
+		expect({
+			spawns: forwarded.length,
+			renewed: renewed !== shared,
+			childHoldsIt: heldByThird === renewed,
+			frozen: Object.isFrozen(renewed),
+			names: renewed?.map(skill => skill.name),
+			earlierChildren: [heldByFirst, heldBySecond].map(list => list.map(skill => skill.name)),
+		}).toEqual({
+			spawns: 3,
+			renewed: true,
+			childHoldsIt: true,
+			frozen: true,
+			names: ["delta", "epsilon"],
+			earlierChildren: [
+				["alpha", "beta", "gamma"],
+				["alpha", "beta", "gamma"],
+			],
+		});
+	} finally {
+		authStorage.close();
+	}
+}, 60_000);

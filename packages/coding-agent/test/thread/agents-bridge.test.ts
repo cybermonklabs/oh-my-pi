@@ -1,22 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { UserMessage } from "@oh-my-pi/pi-ai";
+import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage, ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
 import type { ExtensionRunner } from "../../src/extensibility/extensions/runner";
+import { InternalUrlRouter } from "../../src/internal-urls";
 import { IrcBus } from "../../src/irc/bus";
 import { handleRpcSteerSubagent } from "../../src/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry } from "../../src/modes/rpc/rpc-subagents";
 import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../../src/registry/agent-registry";
+import { deobfuscateAssistantContent } from "../../src/secrets/message-transform";
+import { SecretObfuscator } from "../../src/secrets/obfuscator";
 import { AgentSession } from "../../src/session/agent-session";
 import type { AgentSessionHandle } from "../../src/session/agent-session-handle";
 import type { AgentSessionDisposeOptions } from "../../src/session/agent-session-types";
 import { AuthStorage } from "../../src/session/auth-storage";
 import { convertToLlm } from "../../src/session/messages";
+import type { SessionEntry } from "../../src/session/session-entries";
 import { SessionManager } from "../../src/session/session-manager";
+import { sessionMessagePersistenceKey } from "../../src/session/turn-persistence";
 import { type SubagentLifecyclePayload, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "../../src/task/types";
 import { RemoteAgentSession } from "../../src/thread/remote-agent-session";
 import type { ThreadService } from "../../src/thread/services";
@@ -25,6 +30,7 @@ import { identityThreadService } from "../../src/thread/services/identity";
 import { SubagentWorker } from "../../src/thread/subagent-worker";
 import { EventBus } from "../../src/utils/event-bus";
 import type { AgentsProbe, AgentsProbeGlobals } from "../fixtures/agents-bridge-worker";
+import { createAssistantMessage } from "../helpers/agent-session-setup";
 
 const cleanups: Array<() => unknown> = [];
 
@@ -155,6 +161,71 @@ function liveSubscriptions(roster: RpcSubagentRegistry, shutdown: AbortSignal) {
 	return live;
 }
 
+/** What main receives of `value` in one note: every note is its own structured clone. */
+function note<T>(value: T): T {
+	return structuredClone(value);
+}
+
+function messageEntry(id: string, parentId: string | null, message: AgentMessage): SessionEntry {
+	return { type: "message", id, parentId, timestamp: new Date(message.timestamp).toISOString(), message };
+}
+
+function toolResult(toolCallId: string, text: string, timestamp: number): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName: "bash",
+		content: [{ type: "text", text }],
+		details: { exitCode: 0 },
+		isError: false,
+		timestamp,
+	};
+}
+
+function textOf(message: AgentMessage | null | undefined): string {
+	if (!message || !("content" in message)) return "";
+	const content: unknown = message.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.map(part => (part.type === "text" ? part.text : "")).join("");
+}
+
+/**
+ * For each message of the mirror's list, in order: whether an entry holds an equal message (same
+ * persistence key, deep-equal; each entry taken once, in entry order) and, if so, whether the two
+ * are one object.
+ */
+function sharing(remote: RemoteAgentSession): Array<"shared" | "copy" | "no equal entry"> {
+	const held = remote.sessionManager.getEntries().flatMap(entry => (entry.type === "message" ? [entry.message] : []));
+	let from = 0;
+	return remote.messages.map(message => {
+		const key = sessionMessagePersistenceKey(message);
+		const at = held.findIndex(
+			(candidate, index) =>
+				index >= from &&
+				key !== undefined &&
+				sessionMessagePersistenceKey(candidate) === key &&
+				Bun.deepEquals(candidate, message, true),
+		);
+		if (at < 0) return "no equal entry";
+		from = at + 1;
+		return held[at] === message ? "shared" : "copy";
+	});
+}
+
+function messageEntryCount(remote: RemoteAgentSession): number {
+	return remote.sessionManager.getEntries().filter(entry => entry.type === "message").length;
+}
+
+/** The text the `agent://` and `history://` readers serve for `id`, as a tool reads them. */
+async function readerTexts(id: string): Promise<{ agent: string; history: string }> {
+	const router = InternalUrlRouter.instance();
+	return {
+		agent: (await router.resolve(`agent://${id}`)).content,
+		history: (await router.resolve(`history://${id}`)).content,
+	};
+}
+
 describe("agent bridging across subagent workers", () => {
 	it("mirrors a real worker-homed AgentSession on main: streaming, run state, events, messages", async () => {
 		const { worker, probe } = await startWorker();
@@ -191,6 +262,8 @@ describe("agent bridging across subagent workers", () => {
 		const { probe } = await startWorker();
 		await probe.open("W1", {});
 		const remote = mirrorOf(liveRef("W1").session);
+		// Watched, so the entries reach main too.
+		cleanups.push(remote.subscribe(() => {}));
 		await probe.prompt("W1", "first");
 		await probe.prompt("W1", "second");
 		await waitFor(() => remote.messages.length >= 4);
@@ -202,6 +275,146 @@ describe("agent bridging across subagent workers", () => {
 		await waitFor(() => remote.messages.length >= 6);
 		const interior = remote.messages[1];
 		expect(interior?.role === "assistant" ? interior.content : undefined).toEqual([{ type: "text", text: "pruned" }]);
+		// The replace builds the sharing again: a message equal to its entry is that entry's object. The pruned
+		// one, which its entry no longer equals, has none.
+		await waitFor(() => messageEntryCount(remote) >= 6);
+		const shared = sharing(remote);
+		expect({
+			first: shared[0],
+			pruned: shared[1],
+			second: shared[2],
+			third: shared[4],
+			copies: shared.filter(state => state === "copy").length,
+		}).toEqual({ first: "shared", pruned: "no equal entry", second: "shared", third: "shared", copies: 0 });
+	});
+
+	it("shares one object between a mirrored toolResult entry's message and the mirror's message, and keeps a restored-secret message separate", async () => {
+		// If this regresses, main holds each message of a watched worker subagent twice, once in its message list
+		// and once in its entry list, though the two are equal; or it shows the restored secret in the message list.
+		const { probe } = await startWorker();
+		await probe.open("W1", {});
+		const remote = mirrorOf(liveRef("W1").session);
+		// Idle and unwatched: nothing but the notes below reaches the mirror.
+		await probe.settled("W1");
+		expect(remote.messages).toEqual([]);
+		const base = Date.now();
+
+		// The `messages` note first, then the `entries` note, as one publisher flush sends them.
+		const first = toolResult("call-1", "first output", base);
+		remote.applyMessages({ kind: "append", messages: [note(first)] });
+		remote.applyEntries({ kind: "append", entries: [messageEntry("e1", null, note(first))] });
+		// The `entries` note first: the entry was recorded before its message reached the published list.
+		const second = toolResult("call-2", "second output", base + 1);
+		remote.applyEntries({ kind: "append", entries: [messageEntry("e2", "e1", note(second))] });
+		remote.applyMessages({ kind: "append", messages: [note(second)] });
+		// The entry of an assistant message shows its secret restored for display; the message keeps the placeholder.
+		const secret = "sk-agents-bridge-secret-0042";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const masked: AssistantMessage = {
+			...createAssistantMessage(`the key is ${obfuscator.obfuscate(secret)}`),
+			timestamp: base + 2,
+		};
+		const shown: AssistantMessage = { ...masked, content: deobfuscateAssistantContent(obfuscator, masked.content) };
+		remote.applyMessages({ kind: "append", messages: [note(masked)] });
+		remote.applyEntries({ kind: "append", entries: [messageEntry("e3", "e2", note(shown))] });
+
+		const branch = remote.sessionManager
+			.getBranch("e3")
+			.flatMap(entry => (entry.type === "message" ? [entry.message] : []));
+		const [firstMessage, secondMessage, maskedMessage] = remote.messages;
+		expect({
+			messagesNoteFirst: branch[0] === firstMessage,
+			entriesNoteFirst: branch[1] === secondMessage,
+			restoredSecretShared: branch[2] === maskedMessage,
+			entryShowsSecret: textOf(branch[2]).includes(secret),
+			messageShowsSecret: textOf(maskedMessage).includes(secret),
+		}).toEqual({
+			messagesNoteFirst: true,
+			entriesNoteFirst: true,
+			restoredSecretShared: false,
+			entryShowsSecret: true,
+			messageShowsSecret: false,
+		});
+		expect(remote.messages.map(textOf)).toEqual(["first output", "second output", textOf(masked)]);
+	});
+
+	it("gives the same agent:// and history:// text for a worker subagent's messages before and after its mirror shares entry and message objects", async () => {
+		// If this regresses, a watched worker subagent's mirror serves agent:// and history:// a message list its
+		// sharing changed, as an entry's text in place of the unequal message a pruned turn left.
+		const { probe } = await startWorker();
+		await probe.open("W1", {});
+		const remote = mirrorOf(liveRef("W1").session);
+		await probe.prompt("W1", "first");
+		await probe.prompt("W1", "second");
+		await probe.rewriteInterior("W1", "pruned");
+		await probe.prompt("W1", "third");
+		await waitFor(() => remote.messages.length >= 6);
+
+		// Unwatched: main has no entries, so nothing can be shared yet.
+		expect(messageEntryCount(remote)).toBe(0);
+		const unshared = await readerTexts("W1");
+		expect(unshared.history).toContain("pruned");
+		expect(unshared.agent).toContain("Done");
+
+		// A watch brings the entries, which the mirror may share with the equal messages it holds.
+		const unwatch = remote.subscribe(() => {});
+		await waitFor(() => messageEntryCount(remote) >= 6);
+		expect(await readerTexts("W1")).toEqual(unshared);
+
+		// A history replace while watched: the mirror builds its list again against the entries.
+		unwatch();
+		const before = remote.messages[1];
+		await probe.rewriteInterior("W1", "pruned");
+		cleanups.push(remote.subscribe(() => {}));
+		await waitFor(() => remote.messages[1] !== before);
+		expect(await readerTexts("W1")).toEqual(unshared);
+	});
+
+	it("shares a streamed message's object only once its final message arrives", async () => {
+		// If this regresses, a watched worker subagent's finished reply stays in main twice (its entry and its
+		// message), or its entry keeps the half-streamed text.
+		const { probe } = await startWorker();
+		await probe.open("W1", {});
+		const remote = mirrorOf(liveRef("W1").session);
+		await probe.settled("W1");
+		const final: AssistantMessage = {
+			...createAssistantMessage("Hello"),
+			responseId: "resp-1",
+			timestamp: Date.now(),
+		};
+		const partial: AssistantMessage = { ...final, content: [{ type: "text", text: "Hel" }] };
+
+		// While it streams, the reply is only the mirror's stream message (the forwarded events).
+		remote.applyEvent({ type: "message_start", message: note(partial) });
+		remote.applyEvent({
+			type: "message_update",
+			message: note(partial),
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hel", partial: note(partial) },
+		});
+		const streamed = remote.agent.state.streamMessage;
+		expect(textOf(streamed)).toBe("Hel");
+		// Then its final message, as the publisher sends it: the `messages` note and the `entries` note, ahead of
+		// the forwarded `message_end`.
+		remote.applyMessages({ kind: "append", messages: [note(final)] });
+		remote.applyEntries({ kind: "append", entries: [messageEntry("e1", null, note(final))] });
+		const [entry] = remote.sessionManager.getBranch("e1");
+		const entryMessage = entry?.type === "message" ? entry.message : undefined;
+		const message = remote.messages.at(-1);
+		expect({
+			streamedInEntries: entryMessage === streamed,
+			streamedInMessages: message === streamed,
+			entryText: textOf(entryMessage),
+			messageText: textOf(message),
+			finalShared: entryMessage === message,
+		}).toEqual({
+			streamedInEntries: false,
+			streamedInMessages: false,
+			entryText: "Hello",
+			messageText: "Hello",
+			finalShared: true,
+		});
+		remote.applyEvent({ type: "message_end", message: note(final) });
+		expect(remote.agent.state.streamMessage).toBeNull();
 	});
 
 	it("fails a worker's registry CAS against a stale main ref generation", async () => {

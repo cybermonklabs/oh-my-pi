@@ -20,6 +20,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager, type SessionPersistenceNotice } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	defaultSessionStorage,
+	SessionLeaseLostError,
 	SessionWriteConflictError,
 	setDefaultSessionStorage,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
@@ -30,6 +31,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { collectGarbage, countHeapStringsMatching, takeV8HeapSnapshot } from "../helpers/heap-snapshot";
 import {
 	appendAsOlderBuild,
 	type GatedClient,
@@ -159,6 +161,102 @@ function holdBefore(client: SqlSessionStorageClient, pause: RegExp): GatedClient
 			open = undefined;
 		},
 	};
+}
+
+/** A path's name for a heap count: its two halves, joined only where a path is made, so no frame of a test holds the whole. */
+type PathMarker = readonly [head: string, tag: string];
+
+const randomTag = (): string => Math.random().toString(36).slice(2, 12);
+
+/** The row of `target` and its parts, removed straight from the database. */
+async function removeRows(db: LeaseDb, target: string): Promise<void> {
+	await db.sql(`DELETE FROM ${db.table}_parts WHERE path = @1`, [target]);
+	await db.sql(`DELETE FROM ${db.table} WHERE path = @1`, [target]);
+}
+
+/**
+ * Opens, writes and closes `count` subagent sessions under the artifacts directory `stem` of a session that stays
+ * open, then removes their rows from the database and the store's index, so that only the store's claim records can
+ * still name their paths.
+ */
+async function runClosedSubagents(
+	db: LeaseDb,
+	storage: SqlSessionStorage,
+	stem: string,
+	marker: PathMarker,
+	count: number,
+): Promise<void> {
+	for (let index = 0; index < count; index++) {
+		const target = path.join(stem, `${marker[0]}${marker[1]}-${index}.jsonl`);
+		await storage.writeText(target, transcript(`closed-subagent-${index}`, "its task"));
+		await storage.drain();
+		const child = await SessionManager.open(target, undefined, storage, { suppressBreadcrumb: true });
+		child.appendMessage(userTurn(`its turn ${index}`));
+		await child.flush();
+		await child.close();
+		await removeRows(db, target);
+	}
+	await storage.refresh();
+	await storage.drain();
+}
+
+/** What a write of a moved subagent transcript came to once the database no longer holds the parent's lease. */
+type FencedWrite = "stored" | "lease lost";
+
+async function writeFenced(storage: SqlSessionStorage, target: string): Promise<FencedWrite> {
+	return storage.writeText(target, transcript("moved-subagent", "after the move")).then(
+		() => "stored" as const,
+		(err: unknown) => {
+			if (err instanceof SessionLeaseLostError) return "lease lost" as const;
+			throw err;
+		},
+	);
+}
+
+/**
+ * Moves one closed and one still held subagent transcript of the session at `stem` to paths outside any session's
+ * artifacts directory, so that only the parent's claim can fence a write there. Where the claim is a lease row it
+ * then deletes the parent's row and writes each moved path: the write the claim still fences is refused. Removes the
+ * moved rows and refreshes the index afterwards, as {@link runClosedSubagents} does.
+ */
+async function moveSubagentPaths(
+	db: LeaseDb,
+	storage: SqlSessionStorage,
+	stem: string,
+	closedTo: PathMarker,
+	heldTo: PathMarker,
+): Promise<{ release: () => void; writes: { closed: FencedWrite; held: FencedWrite } | undefined }> {
+	const closedFrom = path.join(stem, "closed-before-move.jsonl");
+	await storage.writeText(closedFrom, transcript("closed-before-move", "its task"));
+	await storage.drain();
+	const closed = await SessionManager.open(closedFrom, undefined, storage, { suppressBreadcrumb: true });
+	closed.appendMessage(userTurn("its turn"));
+	await closed.flush();
+	await closed.close();
+
+	const heldFrom = path.join(stem, "held-through-move.jsonl");
+	await storage.writeText(heldFrom, transcript("held-through-move", "its task"));
+	await storage.drain();
+	// A subagent session still open: the claim it holds on its transcript, as its manager takes it.
+	const release = await storage.acquireSessionClaim?.("held-through-move", heldFrom, { writer: true });
+	if (!release) throw new Error("the store refused the claim of a subagent transcript");
+
+	const closedDst = db.dir.join("outside", `${closedTo[0]}${closedTo[1]}.jsonl`);
+	const heldDst = db.dir.join("outside", `${heldTo[0]}${heldTo[1]}.jsonl`);
+	await storage.rename(closedFrom, closedDst);
+	await storage.rename(heldFrom, heldDst);
+	await storage.drain();
+
+	let writes: { closed: FencedWrite; held: FencedWrite } | undefined;
+	if (db.adapter !== "sqlite") {
+		await db.sql(`DELETE FROM ${db.leaseTable} WHERE session_id = @1`, [ID]);
+		writes = { closed: await writeFenced(storage, closedDst), held: await writeFenced(storage, heldDst) };
+	}
+	await removeRows(db, closedDst);
+	await removeRows(db, heldDst);
+	await storage.refresh();
+	await storage.drain();
+	return { release, writes };
 }
 
 for (const { adapter, url } of LEASE_BACKENDS) {
@@ -629,6 +727,48 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 			await first.manager.close();
 			await second.manager.close();
 		});
+
+		// If this regresses, every subagent session closed while its parent stays open leaves its path in the store's
+		// lease records until the parent closes (a process that runs thousands of subagents under one parent grows with
+		// them), and a move of a closed subagent's path covers the destination with the parent's claim again, so a write
+		// there is refused with the parent's lease while a still held path's move keeps being covered.
+		it("leaves no lease path of a closed subagent session in the parent's claim, and moves only a path the claim still holds", async () => {
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const file = sessionFile(db);
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.drain();
+			const { manager } = await resume(storage, file);
+			const stem = file.slice(0, -".jsonl".length);
+			const closed: PathMarker = ["closed-subagent-", randomTag()];
+			const movedClosed: PathMarker = ["moved-closed-", randomTag()];
+			const movedHeld: PathMarker = ["moved-held-", randomTag()];
+			let release: (() => void) | undefined;
+			try {
+				await runClosedSubagents(db, storage, stem, closed, 5);
+				const moved = await moveSubagentPaths(db, storage, stem, movedClosed, movedHeld);
+				release = moved.release;
+				await collectGarbage();
+				const heap = takeV8HeapSnapshot();
+				const named = (marker: PathMarker): number =>
+					countHeapStringsMatching(heap, text => text.includes(marker.join("")));
+
+				expect({
+					closedPathsHeld: named(closed),
+					movedClosedPathsHeld: named(movedClosed),
+					movedHeldPathCovered: named(movedHeld) > 0,
+					writes: moved.writes,
+				}).toEqual({
+					closedPathsHeld: 0,
+					movedClosedPathsHeld: 0,
+					movedHeldPathCovered: true,
+					writes: adapter === "sqlite" ? undefined : { closed: "stored", held: "lease lost" },
+				});
+			} finally {
+				release?.();
+				await manager.close().catch(() => undefined);
+			}
+		}, 60_000);
 	});
 }
 
