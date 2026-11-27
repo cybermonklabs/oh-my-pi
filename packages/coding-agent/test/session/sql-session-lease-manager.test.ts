@@ -6,7 +6,7 @@
  * then stops instead of writing a sibling. SQLite always; PostgreSQL and MySQL
  * when `OMP_TEST_SQL_POSTGRES_URL` / `OMP_TEST_SQL_MYSQL_URL` name a database.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { SessionManager, type SessionPersistenceNotice } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
@@ -132,11 +132,16 @@ async function runClosedSubagents(
 	await storage.drain();
 }
 
-/** What a write of a moved subagent transcript came to once the database no longer holds the parent's lease. */
+/** What a write of a transcript came to once the database no longer holds the lease row of session {@link ID}. */
 type FencedWrite = "stored" | "lease lost";
 
-async function writeFenced(storage: SqlSessionStorage, target: string): Promise<FencedWrite> {
-	return storage.writeText(target, transcript("moved-subagent", "after the move")).then(
+/** Writes a transcript of session `sessionId` at `target`: the session a later claim of the path finds there. */
+async function writeFenced(
+	storage: SqlSessionStorage,
+	target: string,
+	sessionId = "moved-subagent",
+): Promise<FencedWrite> {
+	return storage.writeText(target, transcript(sessionId, "after the move")).then(
 		() => "stored" as const,
 		(err: unknown) => {
 			if (err instanceof SessionLeaseLostError) return "lease lost" as const;
@@ -403,6 +408,60 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 				await manager.close().catch(() => undefined);
 			}
 		}, 60_000);
+
+		// If this regresses, a write to a file moved as its claim's last release settles is refused as held elsewhere.
+		it("moves a released path out of its claim while the claim's last release settles: a write there lands, and another process claims it once the release ends", async () => {
+			await using db = await openLeaseDb(adapter, url ?? "");
+			const storage = await db.open({ lease: STILL });
+			const file = sessionFile(db);
+			const moved = db.dir.join("outside", "moved-while-released.jsonl");
+			// A subagent transcript's path, which the session's name still puts under its claim.
+			const artifact = path.join(file.slice(0, -".jsonl".length), "queued-subagent.jsonl");
+			await storage.writeText(file, transcript(ID, "before"));
+			await storage.drain();
+			const release = await storage.acquireSessionClaim?.(ID, file);
+			if (!release) throw new Error("the store refused the claim of its session");
+			await using other = await LeaseProcess.start(
+				{ dsn: db.dsn, table: db.table, leaseTable: db.leaseTable, lease: STILL },
+				db.dir.join("other"),
+			);
+			// The claim's last release waits for the store's queued writes under it; here that wait lasts until `settled`.
+			const confirmWrites = storage.confirmWrites.bind(storage);
+			const settled = Promise.withResolvers<void>();
+			let settling = false;
+			const pause = vi.spyOn(storage, "confirmWrites").mockImplementation(async target => {
+				settling = true;
+				await settled.promise;
+				return confirmWrites(target);
+			});
+			let otherHoldsWhileSettling: boolean | undefined;
+			let writes: { moved: FencedWrite; artifact: FencedWrite } | undefined;
+			try {
+				release();
+				await until(() => settling, 10_000, { what: "the last release to wait for the claim's queued writes" });
+				otherHoldsWhileSettling = (await other.run({ op: "claim", sessionId: ID, path: file })).held;
+				await storage.rename(file, moved);
+				if (adapter !== "sqlite") {
+					await db.sql(`DELETE FROM ${db.leaseTable} WHERE session_id = @1`, [ID]);
+					// The moved file goes on holding the session's transcript, as the claim below expects.
+					writes = {
+						moved: await writeFenced(storage, moved, ID),
+						artifact: await writeFenced(storage, artifact),
+					};
+				}
+			} finally {
+				pause.mockRestore();
+				settled.resolve();
+				await storage.drain();
+			}
+			const otherHoldsMoved = (await other.run({ op: "claim", sessionId: ID, path: moved })).held;
+
+			expect({ otherHoldsWhileSettling, writes, otherHoldsMoved }).toEqual({
+				otherHoldsWhileSettling: false,
+				writes: adapter === "sqlite" ? undefined : { moved: "stored", artifact: "lease lost" },
+				otherHoldsMoved: true,
+			});
+		}, 30_000);
 	});
 }
 
