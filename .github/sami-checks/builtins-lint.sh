@@ -24,7 +24,10 @@
 # SC_PLANT=builtins-lint first appends sc.py's two planted consts to the crate's library root, one
 # that clippy reports (under a lint the crate's own [lints] allows) and one rustfmt would space out
 # (in the files rustfmt.toml ignores); each unit must then read FAIL naming its own. The verdicts are
-# the summary's: this script ends 0 once it wrote both results.
+# the summary's: this script ends 0 once it wrote both results. A step it cannot take (sc.py, the
+# tree's metadata, the plant, the lift) writes both units UNKNOWN naming what it could not do, and
+# ends 2: a row that checked nothing reads UNKNOWN, never PASS or FAIL, and its job's exit is never
+# 1, the code a finding would have.
 set -uo pipefail
 tool=$GITHUB_WORKSPACE/tool/.github/sami-checks
 res=$SC/res
@@ -32,12 +35,32 @@ logs=$res/logs
 mkdir -p "$logs"
 # shellcheck source=.github/sami-checks/upstream-base.sh
 . "$tool/upstream-base.sh"
-crate=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import sc; print(sc.BUILTINS_LINT_CRATE)' "$tool") || exit 1
+
+unknown() { # <what the job could not do>: both units UNKNOWN, naming it; ends the job with 2
+	echo "::error title=builtins-lint::UNKNOWN: $1"
+	# sc.py result()'s fields, written without sc.py, which may be what could not be read.
+	for u in clippy rustfmt; do
+		python3 -c 'import json, sys
+r = {"row": "builtins-lint", "unit": sys.argv[1], "who": "runner", "status": "UNKNOWN", "exit": "-", "seconds": 0.0,
+     "passed": 0, "failed": 0, "ignored": 0, "self_skipped": [], "skip_lines": {}, "partial": [], "retries": {},
+     "failures": [], "tests": [], "note": sys.argv[2], "upstream_places": [], "unsorted_places": [], "upstream_base": ""}
+print(json.dumps(r))' "$u" "$1" > "$res/builtins-lint-$u.json"
+	done
+	exit 2
+}
+
+crate=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import sc; print(sc.BUILTINS_LINT_CRATE)' "$tool") ||
+	unknown "sc.py could not be read, so the crate to check is not known"
 echo "TOOLCHAIN $(cd "$SC_TREE" && rustc -V) | $(cd "$SC_TREE" && cargo clippy -V) | $(cd "$SC_TREE" && cargo fmt --version)"
 
 # The crate's directory in the tree, from `cargo metadata --no-deps`; - when the tree has no such package.
-(cd "$SC_TREE" && cargo metadata --no-deps --format-version 1) > "$SC/builtins-metadata.json" || exit 1
-dir=$(python3 "$tool/sc.py" clippy-crates "$SC/builtins-metadata.json" "$crate" | cut -f2)
+(cd "$SC_TREE" && cargo metadata --no-deps --format-version 1) > "$SC/builtins-metadata.json" ||
+	unknown "cargo metadata of the tree failed, so the crate could not be found"
+# `-` where the tree has the metadata but no such package; a lookup that failed is no answer at all.
+python3 "$tool/sc.py" clippy-crates "$SC/builtins-metadata.json" "$crate" > "$SC/builtins-crate.tsv" ||
+	unknown "sc.py clippy-crates failed, so where the crate lies in the tree could not be read"
+dir=$(cut -f2 "$SC/builtins-crate.tsv") ||
+	unknown "the crate's directory could not be read from sc.py's answer, so where it lies is not known"
 echo "CRATE $crate: ${dir:--}"
 dir=${dir:--}
 
@@ -66,9 +89,11 @@ crc=- csecs=0 frc=- fsecs=0
 : > "$flog"
 if [ "$dir" != - ]; then
 	if [ "${SC_PLANT:-}" = builtins-lint ]; then
-		python3 "$tool/sc.py" plant builtins-lint "$SC_TREE" || exit 1
+		python3 "$tool/sc.py" plant builtins-lint "$SC_TREE" ||
+			unknown "the plant could not be put in the tree, so the control could not run"
 	fi
-	python3 "$tool/sc.py" builtins-lint-lift "$SC_TREE" "$dir" || exit 1
+	python3 "$tool/sc.py" builtins-lint-lift "$SC_TREE" "$dir" ||
+		unknown "the crate's lint opt-outs could not be lifted, so it could not be checked at the row's levels"
 	read -r crc csecs < <(clippy "$SC_TREE" "$clog")
 	echo "CLIPPY exit=$crc ${csecs}s; compiler messages: $(grep -c '"reason":"compiler-message"' "$clog")"
 	read -r frc fsecs < <(fmt "$SC_TREE" "$flog")
@@ -108,10 +133,23 @@ if [ "${#found[@]}" -gt 0 ]; then
 	fi
 fi
 
-python3 "$tool/sc.py" builtins-clippy "$clog" "$crc" "$csecs" "$SC_TREE" "$dir" "$cblog" "$cbrc" "$base_tree" "$base" "$fork" \
-	> "$res/builtins-lint-clippy.json"
-python3 "$tool/sc.py" builtins-rustfmt "$flog" "$frc" "$fsecs" "$SC_TREE" "$dir" "$fblog" "$fbrc" "$base_tree" "$base" "$fork" \
-	> "$res/builtins-lint-rustfmt.json"
+# A reader that fails leaves its unit's file empty, which the summary reads as no result at all: so
+# each writes to a temporary file first, and a failure makes both units UNKNOWN naming that reader.
+for u in clippy rustfmt; do
+	if [ "$u" = clippy ]; then
+		set -- "$clog" "$crc" "$csecs" "$SC_TREE" "$dir" "$cblog" "$cbrc"
+	else
+		set -- "$flog" "$frc" "$fsecs" "$SC_TREE" "$dir" "$fblog" "$fbrc"
+	fi
+	if ! python3 "$tool/sc.py" "builtins-$u" "$@" "$base_tree" "$base" "$fork" > "$res/builtins-lint-$u.json.new"; then
+		rm -f "$res/builtins-lint-$u.json.new"
+		unknown "sc.py builtins-$u failed, so the $u unit's run could not be read"
+	fi
+	mv "$res/builtins-lint-$u.json.new" "$res/builtins-lint-$u.json" || {
+		rm -f "$res/builtins-lint-$u.json.new"
+		unknown "the $u unit's result could not be put in place, so what its run said is lost"
+	}
+done
 # Each unit's verdict and note, and its findings by lint and by file (the fork's, upstream's own,
 # unsorted), for the reader of the job log; the result files hold each finding by name.
 for u in clippy rustfmt; do
