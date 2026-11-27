@@ -62,7 +62,7 @@
 #   - macOS and Windows: platform-checks.yml (the fork's platform checks, a called workflow) builds
 #     pi-shell's tests once per platform on macos-15 and windows-2025 and runs them under nextest;
 #     the summary reads its own report (pc-report) as one unit per platform.
-#   - clippy: cargo clippy --tests --no-deps --keep-going --message-format=json -- -D warnings of
+#   - clippy: cargo clippy --tests --no-deps --keep-going --message-format=json -- --cap-lints warn of
 #     pi-shell, pi-vcs, pi-vfs, pi-walker, pi-builtins and pi-natives, one unit per crate, then each
 #     crate again with an unused import planted as its control (.github/sami-checks/clippy.sh). A
 #     crate fails only on findings beyond .github/sami-checks/clippy-baseline.txt, the findings the

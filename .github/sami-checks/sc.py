@@ -163,7 +163,7 @@ ROWS = (
     ("check:ts", "checkts"),
     ("macOS: pi-shell, platform checks", "macos"),
     ("Windows: pi-shell, platform checks", "windows"),
-    ("clippy --tests -D warnings, per crate (failed: findings beyond clippy-baseline.txt)", "clippy"),
+    ("clippy --tests, every lint a warning, per crate (failed: findings beyond clippy-baseline.txt)", "clippy"),
     ("skip prints the summary reads", "skipforms"),
     ("pi-shell set, gVisor (uid 1000)", "gv-set-uid1000"),
     ("pi-shell set, gVisor (root)", "gv-set-root"),
@@ -1083,8 +1083,8 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, meta
     never a failure. KNOWN and PASS also need the control run to read the unused import clippy.sh
     planted in the crate's library root, a finding the baseline lacks. Anything else is UNKNOWN: no
     log, a log line that looks like a cargo message but does not parse (its finding is unread), an
-    exit other than 0 or 101 (clippy did not finish), exit 101 with no finding of its own, exit 0
-    with findings."""
+    exit other than 0 or 101 (clippy did not finish), exit 101 with no finding of its own. Every
+    lint is a warning (clippy.sh: --cap-lints warn), so a finding comes with exit 0 as with 101."""
     base = {(f, code, msg): n for (c, f, code, msg), n in read_clippy_baseline(baseline_path).items()
             if c == crate and code != UNCODED_ERROR}
     unlinted = []
@@ -1117,8 +1117,6 @@ def parse_clippy(log, exit_code, secs, crate, crate_dir, ctl_log, ctl_file, meta
     if code == 101 and not own and not unread:
         first = next((l for l in read_lines(log) or () if l.startswith("error")), "no error line")
         return r("UNKNOWN", note=f"exit 101 and no finding under {crate_dir}/, so it was not linted: {first[:300]}")
-    if code == 0 and own:
-        return r("UNKNOWN", note=f"exit 0 with {sum(map(len, own.values()))} findings under -D warnings")
     beyond, known = [], 0
     for (f, lint, msg), places in sorted(own.items()):
         b = base.get((f, lint, msg), 0)
@@ -2261,7 +2259,10 @@ def selftest():
     check("clippy: killed", cl(own_a, 137)["status"], "UNKNOWN")
     check("clippy: ended by its bound", "time bound" in cl("", 124)["note"], True)
     check("clippy: 101 with no finding of its own", cl(dep_f + "error: failed to run custom build command for `x`\n", 101)["status"], "UNKNOWN")
-    check("clippy: 0 with a finding", cl(own_a, 0)["status"], "UNKNOWN")
+    check("clippy: a finding at exit 0 (every lint a warning) is read", cl(own_a, 0)["status"], "KNOWN")
+    r = cl(diag("crates/pi-vfs/tests/ta.rs", 4, "clippy::len_zero", "length comparison to zero", "warning"), 0)
+    check("clippy: a test target's finding at warn, at exit 0: FAIL, the place named",
+          (r["status"], r["failures"]), ("FAIL", ["crates/pi-vfs/tests/ta.rs:4: clippy::len_zero: length comparison to zero"]))
     # A missing log is UNKNOWN by itself, at exit 0 as at 101 (at 101 another branch also gives UNKNOWN).
     for ex in ("0", "101"):
         r = parse_clippy(os.path.join(d, "absent"), ex, 1, "pi-vfs", "crates/pi-vfs", ctl, "crates/pi-vfs/src/lib.rs", cmeta, bl)
@@ -3062,7 +3063,7 @@ def selftest():
     check("summary other rows pass", "| pi-shell set (runner) | **PASS** | 2 / 0 / 0 / 0 |" in out, True)
     check("summary names the silent clippy crate UNKNOWN", "`pi-vfs` (runner): UNKNOWN: no result" in out, True)
     check("summary row of the silent clippy crate",
-          "| clippy --tests -D warnings, per crate (failed: findings beyond clippy-baseline.txt) | **UNKNOWN** | 5 / 0 / 0 / 1 |" in out, True)
+          "| clippy --tests, every lint a warning, per crate (failed: findings beyond clippy-baseline.txt) | **UNKNOWN** | 5 / 0 / 0 / 1 |" in out, True)
     check("summary row of the silent platform", "| Windows: pi-shell, platform checks | **UNKNOWN** | 0 / 0 / 0 / 1 |" in out, True)
     check("summary row of a platform that reported", "| macOS: pi-shell, platform checks | **PASS** | 1 / 0 / 0 / 0 |" in out, True)
     check("summary names the silent rustfmt workspace UNKNOWN", f"`{fmt_ws[-1]}` (runner): UNKNOWN: no result" in out, True)
