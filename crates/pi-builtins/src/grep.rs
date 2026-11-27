@@ -8,6 +8,7 @@
 
 
 use std::{
+	collections::VecDeque,
 	ffi::{OsStr, OsString},
 	fmt,
 	io::{self, Write},
@@ -486,6 +487,9 @@ struct Options {
 	binary_files:        BinaryFiles,
 	/// The `-m` count: a line past it is trailing context.
 	max_count:           Option<u64>,
+	/// Whether `-v` with a negative `-m` prints its context; see
+	/// [`UnselectedContext`].
+	unselected_context:  bool,
 	/// Whether an input that is the file stdout lands in is refused; see
 	/// [`Grep::run`].
 	refuse_output_file:  bool,
@@ -661,13 +665,14 @@ fn resolve_binary_files(cli: &GrepArgs, matches: &ArgMatches) -> BinaryFiles {
 	selected.1
 }
 
-fn resolve_max_count(cli: &GrepArgs) -> Result<Option<u64>, String> {
+/// The `-m` count the searcher stops at, `None` for none. GNU keeps the
+/// count of lines left in a signed number each selected line takes down: a
+/// negative one never reaches zero, so it stops nothing, while `-v`, which
+/// selects a run of lines only while the number is above zero, selects none.
+fn resolve_max_count(cli: &GrepArgs) -> Option<u64> {
 	match cli.max_count {
-		None | Some(-1) => Ok(None),
-		Some(value) if value >= 0 => u64::try_from(value)
-			.map(Some)
-			.map_err(|_| format!("invalid max count: {value}")),
-		Some(value) => Err(format!("invalid max count: {value}")),
+		Some(count) if count < 0 => cli.invert.then_some(0),
+		count => count.and_then(|count| u64::try_from(count).ok()),
 	}
 }
 
@@ -831,6 +836,47 @@ fn build_matcher(
 		.map_err(|error| error.to_string())
 }
 
+/// What GNU grep 3.11 prints for `-v` with a negative `-m` and a context
+/// option. It selects no line (see [`resolve_max_count`]) and still prints the
+/// context of each run of lines `-v` would select: before a run, the trailing
+/// context the last run left, counted from the last line it printed (from
+/// the start of the input while it printed none), then the leading context
+/// back to that line, with `--` where the two do not meet, so `printf
+/// 'a\nb\nc\n' | grep -v -m -1 -A1 b` prints `a`, `--`, `b`. GNU reaches back
+/// no further than its buffer of input; here what is held is bounded by
+/// [`READ_CHUNK`] bytes, where it ends as GNU ends a buffer.
+#[derive(Default)]
+struct UnselectedContext {
+	/// The lines read since the last line printed, or since the start of
+	/// what is held while none is, oldest first.
+	held:          VecDeque<HeldLine>,
+	held_bytes:    usize,
+	/// Whether `held` starts right after a line printed.
+	after_printed: bool,
+	/// The lines of trailing context still to print, from `held`'s front.
+	pending:       usize,
+	/// Whether a run was met, so the next group is separated from it.
+	used:          bool,
+	/// Whether the last line read is one `-v` would select.
+	in_run:        bool,
+}
+
+/// A line [`UnselectedContext`] may still print.
+struct HeldLine {
+	bytes:       Vec<u8>,
+	line_number: Option<u64>,
+	offset:      u64,
+}
+
+impl UnselectedContext {
+	/// Drops the first `count` lines held.
+	fn drop_front(&mut self, count: usize) {
+		for line in self.held.drain(..count) {
+			self.held_bytes -= line.bytes.len();
+		}
+	}
+}
+
 /// A search sink that renders GNU-compatible records and tracks selection.
 struct GrepSink<'a, M: Matcher, W: Write> {
 	out:         &'a mut W,
@@ -845,6 +891,8 @@ struct GrepSink<'a, M: Matcher, W: Write> {
 	last_end:    Option<u64>,
 	/// The lines of trailing context left once `-m`'s count is reached.
 	after_left:  usize,
+	/// The context `-v` with a negative `-m` prints, when it does.
+	unselected:  Option<UnselectedContext>,
 }
 
 impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
@@ -907,11 +955,98 @@ impl<M: Matcher, W: Write> GrepSink<'_, M, W> {
 	fn separate(&mut self, offset: u64, length: usize) -> io::Result<()> {
 		let gap = self.last_end.is_some_and(|end| end != offset);
 		self.last_end = Some(offset.saturating_add(length as u64));
-		if gap && let Some(separator) = &self.opts.group_separator {
+		if gap {
+			self.write_separator()?;
+		}
+		Ok(())
+	}
+
+	fn write_separator(&mut self) -> io::Result<()> {
+		if let Some(separator) = &self.opts.group_separator {
 			self.out.write_all(separator)?;
 			self.out.write_all(&[self.opts.record.terminator])?;
 			self.flush_record()?;
 		}
+		Ok(())
+	}
+
+	/// Takes a line in the mode of [`UnselectedContext`], `selected` being
+	/// whether `-v` would select it; returns whether the search goes on. A
+	/// binary input prints nothing more, as for GNU.
+	fn unselected_line(
+		&mut self,
+		selected: bool,
+		line: &[u8],
+		line_number: Option<u64>,
+		offset: u64,
+	) -> io::Result<bool> {
+		if self.binary_summary() {
+			return Ok(false);
+		}
+		let mut state = self.unselected.take().unwrap_or_default();
+		let stepped = self.unselected_step(&mut state, selected, line, line_number, offset);
+		self.unselected = Some(state);
+		stepped.map(|()| true)
+	}
+
+	/// GNU's `prtext` where a run of lines `-v` would select starts, then the
+	/// line held, and the end of GNU's buffer where what is held reaches it.
+	fn unselected_step(
+		&mut self,
+		state: &mut UnselectedContext,
+		selected: bool,
+		line: &[u8],
+		line_number: Option<u64>,
+		offset: u64,
+	) -> io::Result<()> {
+		if selected && !state.in_run {
+			// A run starts: the trailing context the last one left, then the
+			// leading context back to the last line printed.
+			self.print_pending(state)?;
+			let lead = self.opts.before.min(state.held.len());
+			if state.used && !(state.after_printed && lead == state.held.len()) {
+				self.write_separator()?;
+			}
+			if lead > 0 {
+				state.drop_front(state.held.len() - lead);
+				self.print_held(state, lead)?;
+			}
+			state.pending = self.opts.after;
+			state.used = true;
+		}
+		state.in_run = selected;
+		state.held_bytes += line.len();
+		state.held.push_back(HeldLine { bytes: line.to_vec(), line_number, offset });
+		if state.held_bytes > READ_CHUNK {
+			// Where GNU's buffer ends: the trailing context due is printed,
+			// and only the leading context the next run may take is kept.
+			self.print_pending(state)?;
+			let keep = self.opts.before.min(state.held.len());
+			state.after_printed &= keep == state.held.len();
+			state.drop_front(state.held.len() - keep);
+			state.in_run = false;
+		}
+		Ok(())
+	}
+
+	/// Prints the trailing context still due, from the front of what is held.
+	fn print_pending(&mut self, state: &mut UnselectedContext) -> io::Result<()> {
+		let count = state.pending.min(state.held.len());
+		state.pending -= count;
+		self.print_held(state, count)
+	}
+
+	/// Prints the first `count` lines held as context (none under `-o`), and
+	/// drops them.
+	fn print_held(&mut self, state: &mut UnselectedContext, count: usize) -> io::Result<()> {
+		for line in state.held.drain(..count) {
+			state.held_bytes -= line.bytes.len();
+			if !self.opts.only_matching {
+				self.write_prefix(line.line_number, line.offset, b'-')?;
+				self.write_record(&line.bytes)?;
+			}
+		}
+		state.after_printed |= count > 0;
 		Ok(())
 	}
 
@@ -969,6 +1104,10 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 		if self.binary && self.opts.binary_files == BinaryFiles::WithoutMatch {
 			return Ok(false);
 		}
+		if self.unselected.is_some() {
+			let offset = mat.absolute_byte_offset();
+			return self.unselected_line(true, mat.bytes(), mat.line_number(), offset);
+		}
 		if self.count_reached() {
 			return self.context_line(mat.bytes(), mat.line_number(), mat.absolute_byte_offset());
 		}
@@ -998,6 +1137,10 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 	}
 
 	fn context(&mut self, _searcher: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, io::Error> {
+		if self.unselected.is_some() {
+			let offset = ctx.absolute_byte_offset();
+			return self.unselected_line(false, ctx.bytes(), ctx.line_number(), offset);
+		}
 		self.context_line(ctx.bytes(), ctx.line_number(), ctx.absolute_byte_offset())
 	}
 
@@ -1016,6 +1159,10 @@ impl<M: Matcher, W: Write> Sink for GrepSink<'_, M, W> {
 	}
 
 	fn finish(&mut self, _searcher: &Searcher, _: &SinkFinish) -> Result<(), io::Error> {
+		if let Some(mut state) = self.unselected.take() {
+			// The trailing context left at the end of the input.
+			return if self.binary_summary() { Ok(()) } else { self.print_pending(&mut state) };
+		}
 		if self.opts.quiet {
 			return Ok(());
 		}
@@ -1244,6 +1391,7 @@ impl<M: Matcher + Send + Sync + 'static> DirSearch<M> {
 			binary: false,
 			last_end: None,
 			after_left: 0,
+			unselected: self.opts.unselected_context.then(UnselectedContext::default),
 		};
 		let mut search = searcher.search_push(&self.matcher, &mut sink);
 		let mut run = 0;
@@ -1715,6 +1863,11 @@ fn build_searcher(cli: &GrepArgs, opts: &Options, max_count: Option<u64>) -> Sea
 	if cli.null_data {
 		builder.line_terminator(LineTerminator::byte(b'\0'));
 	}
+	if opts.unselected_context {
+		// The sink sees every line and prints the context; see
+		// [`UnselectedContext`].
+		builder.passthru(true).max_matches(None);
+	}
 	builder
 }
 
@@ -1740,6 +1893,7 @@ async fn search_stdin<M: Matcher + Clone + Send + Sync + 'static>(
 		binary: false,
 		last_end: None,
 		after_left: 0,
+		unselected: opts.unselected_context.then(UnselectedContext::default),
 	};
 	let mut search = searcher.search_push(matcher, &mut sink);
 	let mut buf = vec![0u8; READ_CHUNK];
@@ -1956,13 +2110,7 @@ impl AsyncUtility for Grep {
 		}));
 	}
 
-	let max_count = match resolve_max_count(&cli) {
-		Ok(max_count) => max_count,
-		Err(error) => {
-			let _ = writeln!(host.stderr, "grep: {error}");
-			return 2;
-		},
-	};
+	let max_count = resolve_max_count(&cli);
 	let rules = match build_path_rules(host, &cli, &matches).await {
 		Ok(rules) => rules,
 		Err(error) => {
@@ -1970,6 +2118,13 @@ impl AsyncUtility for Grep {
 			return 2;
 		},
 	};
+	// GNU answers `-m 0` before it compiles the patterns or opens any input:
+	// no line can be selected, so it prints no count and reports no missing
+	// file. Only `-L`, which lists the files with no selected line, reads
+	// them, unless `-q` overrides it.
+	if cli.max_count == Some(0) && (cli.quiet || !resolve_file_list_modes(&matches).1) {
+		return 1;
+	}
 	let matcher = match build_matcher(
 		host,
 		&patterns,
@@ -2015,13 +2170,13 @@ impl AsyncUtility for Grep {
 	// it writes would be read back and matched again, so the file grows
 	// without bound. It exempts the modes that write at most one line per file
 	// (`-q`, `-c`, `-l`, `-L`) and the bounded `-m1`, which stop before their
-	// output can feed back into the search, and the searches that select no
-	// record at all.
+	// output can feed back into the search, a negative `-m`, as GNU tests the
+	// count alone, and the searches that select no record at all.
 	let refuse_output_file = !cli.quiet
 		&& !cli.count
 		&& !files_with_matches
 		&& !files_without_match
-		&& max_count.is_none_or(|count| count > 1)
+		&& cli.max_count.is_none_or(|count| count > 1)
 		&& !selects_no_record;
 	let opts = Options {
 		line_number: cli.line_number,
@@ -2045,6 +2200,9 @@ impl AsyncUtility for Grep {
 		line_buffered: cli.line_buffered,
 		binary_files: resolve_binary_files(&cli, &matches),
 		max_count,
+		unselected_context: cli.invert
+			&& cli.max_count.is_some_and(|count| count < 0)
+			&& context_given,
 		refuse_output_file,
 	};
 	let follow_links = resolve_follow_links(&cli, &matches);
