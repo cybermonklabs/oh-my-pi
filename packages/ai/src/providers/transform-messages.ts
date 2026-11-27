@@ -652,7 +652,7 @@ export function thinkingDropsByAuthor(
 			author = block.to.model;
 			dropsAuthor = undefined;
 		}
-		dropsAuthor ??= dropsForeignThinking({ provider: turn.provider, api: turn.api, model: author }, reader);
+		dropsAuthor ??= dropsForeignThinking(turn, reader);
 		drops.push(dropsAuthor);
 	}
 	return index => drops[index] === true;
