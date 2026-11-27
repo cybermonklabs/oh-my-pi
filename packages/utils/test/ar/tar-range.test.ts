@@ -3,7 +3,7 @@ import { ArchiveError } from "../../src/ar/error";
 import { DEFAULT_ARCHIVE_LIMITS } from "../../src/ar/limits";
 import { openArchive } from "../../src/ar/open";
 import { ArchiveReader } from "../../src/ar/reader";
-import { type ByteSource, memoryByteSource } from "../../src/ar/source";
+import { type ByteSource, memoryByteSource, readByteSourceChunks, STREAM_CHUNK_SIZE } from "../../src/ar/source";
 import { encodeTar, readTar } from "../../src/ar/tar";
 import { arFixture as fixture } from "./fixtures";
 
@@ -70,6 +70,7 @@ describe("plain tar range reads", () => {
 			expect(new TextDecoder().decode((await archive.readFile(memberPath)).bytes)).toBe(expected);
 			if (name === "tar-sparse-oldgnu.tar") {
 				await expect(archive.readFile("data/sparse.bin")).rejects.toThrow("sparse file");
+				await expect(archive.readFileChunks("data/sparse.bin").next()).rejects.toThrow("sparse file");
 			}
 		}
 	});
@@ -93,6 +94,23 @@ describe("plain tar range reads", () => {
 		);
 		shortReads = true;
 		await expect(new ArchiveReader("tar", entries).readFile("hello.txt")).rejects.toThrow("truncated");
+	});
+
+	test("rejects a short member range before yielding it, even if the next range would be long", async () => {
+		const bytes = await encodeTar([["data.bin", new Uint8Array(STREAM_CHUNK_SIZE + 2)]]);
+		let readingMember = false;
+		let reads = 0;
+		const source: ByteSource = {
+			size: bytes.byteLength,
+			async read(start, end) {
+				// The two wrong lengths add up to the declared member size.
+				return bytes.subarray(start, readingMember ? end + (reads++ === 0 ? -1 : 1) : end);
+			},
+		};
+		const archive = await openArchive({ source, format: "tar" });
+		readingMember = true;
+		await expect(archive.readFileChunks("data.bin").next()).rejects.toThrow("Archive member 'data.bin' is truncated");
+		expect(reads).toBe(1);
 	});
 
 	test("keeps corrupt-header, entry, path, and metadata limits on the ranged path", async () => {
@@ -156,5 +174,25 @@ describe("plain tar range reads", () => {
 				{ limits: DEFAULT_ARCHIVE_LIMITS },
 			),
 		).rejects.toBeInstanceOf(ArchiveError);
+	});
+});
+
+describe("readByteSourceChunks ranges", () => {
+	const source: ByteSource = {
+		size: 10,
+		async read() {
+			throw new Error("This range must not read from the source");
+		},
+	};
+
+	test.each([
+		["a reversed range", 5, 3],
+		["a NaN end", 0, Number.NaN],
+	] as const)("rejects %s", async (_name, start, end) => {
+		await expect(readByteSourceChunks(source, start, end).next()).rejects.toThrow("Invalid archive range");
+	});
+
+	test("yields no chunks for a valid empty range", async () => {
+		expect(await readByteSourceChunks(source, 5, 5).next()).toEqual({ done: true, value: undefined });
 	});
 });
