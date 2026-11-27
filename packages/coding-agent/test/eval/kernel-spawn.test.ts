@@ -1,4 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { Settings } from "../../src/config/settings";
+import { disposeAllVmContexts, executeInVmContext } from "../../src/eval/js/context-manager";
+import { PythonKernel } from "../../src/eval/py/kernel";
 import { consoleAttached, shouldDetachKernel, shouldHideKernelWindow } from "../../src/eval/py/spawn-options";
 
 describe("shouldDetachKernel", () => {
@@ -85,3 +89,94 @@ describe("consoleAttached", () => {
 		).toBe(false);
 	});
 });
+
+const interpreter = Bun.which("python3");
+it.skipIf(process.platform !== "linux" || !interpreter)(
+	"starts the Python kernel and its child with OOM score 1000 without changing the host",
+	async () => {
+		using temp = TempDir.createSync("@python-oom-score-");
+		const score = "/proc/self/oom_score_adj";
+		// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
+		if ((await Bun.file(score).text()).trim() === "1000") await Bun.write(score, "999").catch(() => 0);
+		const before = await Bun.file(score).text();
+		const kernel = await PythonKernel.start({ cwd: temp.path(), interpreter: interpreter ?? undefined });
+		try {
+			let output = "";
+			const result = await kernel.execute(
+				[
+					"import os, subprocess",
+					"assert os.getpid() == os.getsid(0)",
+					`print(open("${score}").read().strip())`,
+					`print(subprocess.check_output(["/bin/cat", "${score}"], text=True).strip())`,
+				].join("\n"),
+				{
+					onChunk: chunk => {
+						output += chunk;
+					},
+				},
+			);
+			expect(await Bun.file(score).text()).toBe(before);
+			expect(result.status).toBe("ok");
+			expect(output).toBe("1000\n1000\n");
+		} finally {
+			await kernel.shutdown();
+		}
+	},
+	20_000,
+);
+
+it.skipIf(process.platform !== "linux")(
+	"starts the JS kernel subprocess and the processes its cells start with OOM score 1000 without changing the host",
+	async () => {
+		using temp = TempDir.createSync("@js-oom-score-");
+		const score = "/proc/self/oom_score_adj";
+		// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
+		if ((await Bun.file(score).text()).trim() === "1000") await Bun.write(score, "999").catch(() => 0);
+		const before = await Bun.file(score).text();
+		const sessionKey = `js-oom-score:${crypto.randomUUID()}`;
+		let output = "";
+		try {
+			await executeInVmContext({
+				sessionKey,
+				sessionId: sessionKey,
+				cwd: temp.path(),
+				session: {
+					cwd: temp.path(),
+					hasUI: false,
+					getSessionFile: () => null,
+					getSessionSpawns: () => null,
+					settings: Settings.isolated(),
+				},
+				code: [
+					// The cell's own module loader in the kernel subprocess, not imports of this test.
+					'const fs = await import("node:fs");',
+					'const { execFileSync } = await import("node:child_process");',
+					`const score = ${JSON.stringify(score)};`,
+					'const spawned = Bun.spawn(["/bin/cat", score], { stdout: "pipe" });',
+					"console.log(JSON.stringify({",
+					"\tpid: process.pid,",
+					'\tkernel: fs.readFileSync(score, "utf8").trim(),',
+					"\tspawn: (await spawned.stdout.text()).trim(),",
+					"\tshell: (await Bun.$`/bin/cat /proc/self/oom_score_adj`.text()).trim(),",
+					'\tchildProcess: execFileSync("/bin/cat", [score], { encoding: "utf8" }).trim(),',
+					"}));",
+				].join("\n"),
+				filename: "oom-score.js",
+				timeoutMs: 30_000,
+				runState: {
+					onText: chunk => {
+						output += chunk;
+					},
+				},
+			});
+		} finally {
+			await disposeAllVmContexts();
+		}
+		expect(await Bun.file(score).text()).toBe(before);
+		const { pid, ...scores } = JSON.parse(output);
+		// Another pid: the cell ran in the kernel subprocess, not in a Worker of this process.
+		expect(pid).not.toBe(process.pid);
+		expect(scores).toEqual({ kernel: "1000", spawn: "1000", shell: "1000", childProcess: "1000" });
+	},
+	30_000,
+);

@@ -18,6 +18,7 @@ import { isShellTrace, type ShellTrace } from "@oh-my-pi/pi-wire";
 import { logger } from "@oh-my-pi/pi-utils";
 import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
+import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
 import { Settings } from "../config/settings";
 import type { MinimizedMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -550,10 +551,14 @@ async function executeUserShellPty(run: {
 	dump: (notice?: string) => Promise<OutputSummary & { images?: ImageContent[] }>;
 }): Promise<BashResult> {
 	const session = new PtySession();
+	const [application, ...args] = withToolOomScore(
+		[run.shell, ...ensureInteractiveShellArgs(run.shell, run.args), run.command],
+		{ env: run.env, cwd: run.cwd },
+	);
 	const result = await session.startArgv(
 		{
-			application: run.shell,
-			args: [...ensureInteractiveShellArgs(run.shell, run.args), run.command],
+			application,
+			args,
 			cwd: run.cwd,
 			env: run.env,
 			timeoutMs: run.timeoutMs,

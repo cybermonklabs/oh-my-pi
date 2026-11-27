@@ -2,6 +2,8 @@ import { BashInteractiveOverlayComponent } from "@oh-my-pi/pi-tui/tools/bash-int
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
+import { isCmdShell, isPowerShell } from "@oh-my-pi/pi-utils/procmgr";
+import { withToolOomScore } from "@oh-my-pi/pi-utils/ptree";
 import { loadXtermTerminal } from "@oh-my-pi/pi-tui/tools/terminal-output";
 import { Settings } from "../config/settings";
 import { OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -103,33 +105,40 @@ export async function runInteractiveBashPty(
 						}
 					},
 				);
-				void session
-					.start(
-						{
-							command: options.command,
-							cwd: options.cwd,
-							timeoutMs: options.timeoutMs,
-							// A real TERM so editors, pagers, and TUIs behave like a normal
-							// terminal; direnv's values win over everything.
-							env: { ...interactiveShellEnv, TERM: "xterm-256color", ...options.env },
-							signal: options.signal,
-							cols,
-							rows,
-							shell: resolvedShell,
-						},
-						(err, chunk) => {
-							if (finished || err || !chunk) return;
-							component.appendOutput(chunk);
-							const clean = graphics.push(chunk);
-							if (clean) sink.push(clean.replace(/\r\n?/gu, "\n"));
-							tui.requestRender();
-						},
-					)
-					.then(finalize)
-					.catch(error => {
-						sink.push(`PTY error: ${error instanceof Error ? error.message : String(error)}\n`);
-						finalize({ exitCode: undefined, cancelled: false, timedOut: false });
+				const run = {
+					cwd: options.cwd,
+					timeoutMs: options.timeoutMs,
+					// A real TERM so editors, pagers, and TUIs behave like a normal
+					// terminal; direnv's values win over everything.
+					env: { ...interactiveShellEnv, TERM: "xterm-256color", ...options.env },
+					signal: options.signal,
+					cols,
+					rows,
+				};
+				const onChunk = (err: Error | null, chunk: string) => {
+					if (finished || err || !chunk) return;
+					component.appendOutput(chunk);
+					const clean = graphics.push(chunk);
+					if (clean) sink.push(clean.replace(/\r\n?/gu, "\n"));
+					tui.requestRender();
+				};
+				// `start` runs `shell -lc command`, or the flag cmd or PowerShell takes. The
+				// `-lc` argv is built here instead, so the shell can start behind the tool
+				// process wrapper, which gives it `oom_score_adj` 1000 on Linux.
+				let started: Promise<PtyRunResult>;
+				if (isCmdShell(resolvedShell) || isPowerShell(resolvedShell)) {
+					started = session.start({ ...run, command: options.command, shell: resolvedShell }, onChunk);
+				} else {
+					const [application, ...args] = withToolOomScore([resolvedShell, "-lc", options.command], {
+						env: run.env,
+						cwd: run.cwd,
 					});
+					started = session.startArgv({ ...run, application, args }, onChunk);
+				}
+				void started.then(finalize).catch(error => {
+					sink.push(`PTY error: ${error instanceof Error ? error.message : String(error)}\n`);
+					finalize({ exitCode: undefined, cancelled: false, timedOut: false });
+				});
 				return component;
 			},
 			{ overlay: true },

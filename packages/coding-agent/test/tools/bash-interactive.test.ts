@@ -109,4 +109,24 @@ describe("runInteractiveBashPty", () => {
 			"term=direnv-term ci=direnv-ci no_color=direnv-no-color git_editor=direnv-git-editor gpg_tty=direnv-gpg-tty",
 		);
 	});
+
+	// The shell a pty call starts runs with `oom_score_adj` 1000, as every process a tool starts
+	// does, so a memory cgroup's OOM killer ends it before Oh My Pi; Oh My Pi's own value stays.
+	it.skipIf(ptyUnavailable || process.platform !== "linux")(
+		"starts the shell with oom_score_adj 1000 and leaves this process's own value",
+		async () => {
+			const score = "/proc/self/oom_score_adj";
+			// A tool process of this build runs this test at 1000 already: start below it, so a 1000 is this spawn's.
+			if ((await Bun.file(score).text()).trim() === "1000") await Bun.write(score, "999").catch(() => 0);
+			const before = await Bun.file(score).text();
+			const result = await runInteractiveBashPty(headlessUi(), {
+				command: `printf 'score=%s\\n' "$(cat ${score})"`,
+				cwd: tempDir.path(),
+				timeoutMs: 15_000,
+			});
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain("score=1000");
+			expect(await Bun.file(score).text()).toBe(before);
+		},
+	);
 });
