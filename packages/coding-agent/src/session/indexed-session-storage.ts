@@ -133,6 +133,15 @@ export class SessionAppendBatchRolledBackError extends Error {
 	}
 }
 
+/**
+ * What the index keeps of a path: its size and time, and only a title update
+ * the stored head may not carry, which the readers lay over the head's title
+ * slot ({@link titleUpdateForIndex}). The title fields are set by
+ * {@link IndexedSessionStorage.updateSessionTitle}, which leaves the stored
+ * head as it was, and by a refreshed row, which describes no head; an append
+ * keeps them. A full write's head carries its own title slot, so its entry
+ * has none, and the readers give that head as it is stored.
+ */
 interface IndexEntry {
 	size: number;
 	mtimeMs: number;
@@ -449,13 +458,19 @@ export class IndexedSessionStorage implements SessionStorage {
 			const rows = await this.#backend.loadIndex();
 			const fresh = new Map<string, IndexEntry>();
 			for (const row of rows) {
-				fresh.set(row.path, {
-					size: row.size,
-					mtimeMs: row.mtimeMs,
-					title: row.titleUpdatedAt ? row.title : undefined,
-					titleSource: row.titleUpdatedAt ? row.titleSource : undefined,
-					titleUpdatedAt: row.titleUpdatedAt,
-				});
+				// A row describes no stored head, so its title is kept to be laid over whatever head the read finds.
+				fresh.set(
+					row.path,
+					row.titleUpdatedAt
+						? {
+								size: row.size,
+								mtimeMs: row.mtimeMs,
+								title: row.title,
+								titleSource: row.titleSource,
+								titleUpdatedAt: row.titleUpdatedAt,
+							}
+						: { size: row.size, mtimeMs: row.mtimeMs },
+				);
 			}
 			const settled = (path: string): boolean => !window.has(path) && !this.#pendingFrames.has(path);
 			for (const path of [...this.#index.keys()]) {
@@ -566,7 +581,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	#queueFullWrite(path: string, body: FullBody, expectedSize: number | null | undefined): void {
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
-		this.#setIndex(path, body.byteLength, mtimeMs, body.title ?? null);
+		this.#setIndex(path, body.byteLength, mtimeMs);
 		this.#pushFrame(path, { mtimeMs, previous });
 		const write = this.#enqueuePath(path, () => body.publish(mtimeMs, expectedSize), { trackDrain: true });
 		this.#trackFrame(path, mtimeMs, write);
@@ -737,7 +752,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
 		const title = titleUpdateFromSlot(parseTitleSlotFromContent(content));
-		this.#setIndex(path, byteLength(content), mtimeMs, title ?? null);
+		this.#setIndex(path, byteLength(content), mtimeMs);
 		this.#pushFrame(path, { mtimeMs, previous });
 		const pending = this.#enqueuePath(path, () => this.#backend.writeFull(path, content, mtimeMs, title), {
 			trackDrain: false,
@@ -787,7 +802,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		try {
 			const previous = this.#index.get(path);
 			const mtimeMs = this.#allocMtimeMs();
-			this.#setIndex(path, body.byteLength, mtimeMs, body.title ?? null);
+			this.#setIndex(path, body.byteLength, mtimeMs);
 			this.#pushFrame(path, { mtimeMs, previous });
 			try {
 				await this.#enqueuePath(
@@ -950,7 +965,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	_truncateForWriter(path: string): number {
 		const mtimeMs = this.#allocMtimeMs();
 		this.#pushFrame(path, { mtimeMs, previous: this.#index.get(path) });
-		this.#setIndex(path, 0, mtimeMs, null);
+		this.#setIndex(path, 0, mtimeMs);
 		return mtimeMs;
 	}
 
@@ -972,7 +987,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		const mtimeMs = this.#allocMtimeMs();
 		const previous = this.#index.get(path);
 		const size = (previous?.size ?? 0) + byteLength(line);
-		this.#setIndex(path, size, mtimeMs);
+		this.#setIndex(path, size, mtimeMs, previous);
 		return { mtimeMs, previous };
 	}
 
@@ -1080,23 +1095,26 @@ export class IndexedSessionStorage implements SessionStorage {
 		}
 	}
 
-	#setIndex(
-		path: string,
-		size: number,
-		mtimeMs: number,
-		title: SessionTitleUpdate | null | undefined = undefined,
-	): void {
+	/**
+	 * Set `path`'s size and time. An append passes the entry it extends,
+	 * whose title update and unconfirmed mark it keeps: it leaves the stored
+	 * head as it was, and does not restore what a failed removal deleted. A
+	 * full write or a truncation passes none: the head it stores carries its
+	 * own title slot, or none, and a full write confirms the path.
+	 */
+	#setIndex(path: string, size: number, mtimeMs: number, extended?: IndexEntry): void {
 		this.#touch(path);
-		const current = title === undefined ? this.#index.get(path) : undefined;
-		this.#index.set(path, {
-			size,
-			mtimeMs,
-			title: title === undefined ? current?.title : (title?.title ?? undefined),
-			titleSource: title === undefined ? current?.titleSource : (title?.source ?? undefined),
-			titleUpdatedAt: title === undefined ? current?.titleUpdatedAt : (title?.updatedAt ?? undefined),
-			// An append extends the current content, so it does not restore what a failed removal deleted.
-			...(current?.unconfirmed ? { unconfirmed: true } : {}),
-		});
+		const entry: IndexEntry = extended?.titleUpdatedAt
+			? {
+					size,
+					mtimeMs,
+					title: extended.title,
+					titleSource: extended.titleSource,
+					titleUpdatedAt: extended.titleUpdatedAt,
+				}
+			: { size, mtimeMs };
+		if (extended?.unconfirmed) entry.unconfirmed = true;
+		this.#index.set(path, entry);
 		if (mtimeMs > this.#nextMtimeMs) this.#nextMtimeMs = mtimeMs;
 	}
 
