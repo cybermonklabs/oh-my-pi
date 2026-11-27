@@ -20,7 +20,7 @@ import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-ti
 import type { SqlSessionStorageClient } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { RedisClient } from "bun";
 import { byteRange, runSessionScript } from "../helpers/fake-redis-windows";
-import { LEASE_BACKENDS, openLeaseDb, STILL } from "./sql-session-lease-fixture";
+import { LEASE_BACKENDS, openLeaseDb, reserveWrapped, STILL } from "./sql-session-lease-fixture";
 
 const MiB = 1024 * 1024;
 const TIMESTAMP = "2026-11-27T00:00:00.000Z";
@@ -124,6 +124,9 @@ function gatedSql(client: SqlSessionStorageClient, gate: Gate): SqlSessionStorag
 				callback({ unsafe: (query, values) => gate.around(() => transaction.unsafe(query, values)) }),
 			),
 		end: () => client.end?.() ?? Promise.resolve(),
+		...reserveWrapped(client, connection => ({
+			unsafe: (query, values) => gate.around(() => connection.unsafe(query, values)),
+		})),
 	};
 }
 
@@ -290,6 +293,9 @@ for (const { adapter, url } of LEASE_BACKENDS) {
 					unsafe: (query, values) => client.unsafe(query, values),
 					transaction: callback => client.transaction(callback),
 					end: () => client.end?.() ?? Promise.resolve(),
+					...reserveWrapped(client, connection => ({
+						unsafe: (query, values) => connection.unsafe(query, values),
+					})),
 				}),
 			});
 			const file = `${db.dir.path()}/sessions/-project-/2026-11-27T00-00-00-000Z_${ID}.jsonl`;

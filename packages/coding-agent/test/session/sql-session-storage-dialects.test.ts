@@ -23,6 +23,7 @@ import {
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 import { dropSessionStoreTables, readStoredParts, readStoredSession } from "../helpers/sql-session-storage";
+import { reserveWrapped } from "./sql-session-lease-fixture";
 
 type SqlClient = InstanceType<typeof SQL>;
 
@@ -223,6 +224,7 @@ function refusingTitleWrites(client: SqlClient, refuse: { next: boolean }): SqlS
 			client.transaction(transaction =>
 				callback({ unsafe: (query, values) => guarded(transaction, query, values) }),
 			),
+		...reserveWrapped(client, connection => ({ unsafe: (query, values) => guarded(connection, query, values) })),
 	};
 }
 
