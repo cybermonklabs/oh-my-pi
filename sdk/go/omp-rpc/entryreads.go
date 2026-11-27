@@ -11,17 +11,17 @@ import (
 // The session's `entry_patch` records are not listed: an entry whose parent
 // is a record, and a LeafID that names one, take the record's parent, also
 // for a record an earlier Since read returned. The client does not apply the
-// records, and must not: the server serves its live entries
-// (packages/coding-agent/src/modes/rpc/rpc-compat.ts:19-22,
-// packages/coding-agent/src/session/session-manager.ts:6973), which already
-// carry each record's fields. patchEntries sets them before it appends the
-// record (session-manager.ts:6667-6669), and a load applies the records it
-// reads (session-manager.ts:4769). A record the server holds keeps its fields
-// after a later rewrite-only pass replaced them in the entry, for example
-// images a later pass dropped from an elided result: only the line a full
-// rewrite writes loses them (packages/coding-agent/src/session/entry-patches.ts:33-36,
-// withoutEntryPatches at :207-209). Applying such a record again would bring
-// the replaced values back.
+// records, and must not: the server serves its live entries (selectRpcEntries
+// in packages/coding-agent/src/modes/rpc/rpc-compat.ts slices
+// SessionManager.getEntries), which already carry each record's fields.
+// SessionManager.patchEntries sets them before it appends the record, and a
+// load applies the records it reads (SessionManager's load calls
+// applyEntryPatches). A record the server holds keeps its fields after a
+// later rewrite-only pass replaced them in the entry, for example images a
+// later pass dropped from an elided result: only the line a full rewrite
+// writes loses them (withoutEntryPatches in
+// packages/coding-agent/src/session/entry-patches.ts). Applying such a record
+// again would bring the replaced values back.
 //
 // c.Commands.GetEntries returns the reply as the server sent it, records
 // included.
@@ -47,9 +47,8 @@ func (c *Client) GetEntries(ctx context.Context, p GetEntriesCommand) (SessionEn
 // parent as their entries' parent, and a LeafID that names a record names
 // that parent. The client does not apply the records, and must not, for the
 // reason GetEntries gives: the tree's entries are the server's live entries
-// (packages/coding-agent/src/session/session-manager.ts:7029), which already
-// carry each record's fields. The tree is read and written again once,
-// however deep it nests.
+// (SessionManager.getTree), which already carry each record's fields. The
+// tree is read and written again once, however deep it nests.
 //
 // c.Commands.GetTree returns the reply as the server sent it, records
 // included.
@@ -70,8 +69,8 @@ func (c *Client) GetTree(ctx context.Context) (SessionTree, error) {
 
 // SubagentTranscriptRead is a get_subagent_messages reply as
 // Client.GetSubagentMessages returns it: `entry_patch` records applied within
-// the reply and not listed. An entry whose parent is a record of the reply
-// takes the record's parent, and Messages are the messages of Entries.
+// the reply and not listed. An entry whose parent is a record takes the
+// record's parent, and Messages are the messages of Entries.
 type SubagentTranscriptRead struct {
 	SubagentMessages
 	// EntryPatches are the patches of this reply's records that name an entry
@@ -85,12 +84,15 @@ type SubagentTranscriptRead struct {
 //
 // The server reads the transcript file in windows. The `entry_patch` records
 // of this reply apply to its entries, as the server applies them, and are not
-// listed; an entry whose parent is a record of this reply takes the record's
-// parent. A patch that names an entry not in this reply, one an earlier call
-// returned, is listed in EntryPatches, in file order. The client keeps nothing
-// across calls: a caller that holds the entries of earlier calls applies each
-// patch, in order, to the entry with its EntryID when EntryAcceptsPatch holds,
-// with SetPatchedFields, and decodes that entry's message again.
+// listed; an entry whose parent is a record takes the record's parent, also
+// for a record an earlier call returned from the same session file since its
+// last read from the start (FromByte 0, or Reset). For that the client keeps
+// the id and parent of each record it hid, per session file, and no entry. A
+// patch that names an entry not in this reply, one an earlier call returned,
+// is listed in EntryPatches, in file order: a caller that holds the entries
+// of earlier calls applies each patch, in order, to the entry with its
+// EntryID when EntryAcceptsPatch holds, with SetPatchedFields, and decodes
+// that entry's message again.
 //
 // c.Commands.GetSubagentMessages returns the reply as the server sent it.
 func (c *Client) GetSubagentMessages(ctx context.Context, p GetSubagentMessagesCommand) (SubagentTranscriptRead, error) {
@@ -117,7 +119,17 @@ func (c *Client) GetSubagentMessages(ctx context.Context, p GetSubagentMessagesC
 		}
 	}
 	changed := ApplyEntryPatches(reply.Entries, nil)
-	reply.Entries = entriesPastRecords(reply.Entries, recordParents{})
+	c.entryPatchMu.Lock()
+	if c.subagentRecordParents == nil {
+		c.subagentRecordParents = map[string]recordParents{}
+	}
+	parents := c.subagentRecordParents[reply.SessionFile]
+	if parents == nil || reply.FromByte == 0 || reply.Reset {
+		parents = recordParents{}
+		c.subagentRecordParents[reply.SessionFile] = parents
+	}
+	reply.Entries = entriesPastRecords(reply.Entries, parents)
+	c.entryPatchMu.Unlock()
 	if changed {
 		messages := make([]AgentMessage, 0, len(reply.Messages))
 		for _, entry := range reply.Entries {

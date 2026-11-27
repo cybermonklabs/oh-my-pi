@@ -361,7 +361,8 @@ export interface RpcSubagentMessagesRead extends RpcSubagentMessagesResult {
 /**
  * The entry that takes the place of `id` once the `entry_patch` records are
  * left out: `id` itself, or the parent of the record it names. Each parent in
- * `recordParents` is already past records.
+ * `recordParents` is already past records, and null for a record at the root
+ * or one with no `parentId`.
  */
 function pastRecords(id: string | null, recordParents: ReadonlyMap<string, string | null>): string | null {
 	if (id === null) return null;
@@ -371,9 +372,9 @@ function pastRecords(id: string | null, recordParents: ReadonlyMap<string, strin
 
 /**
  * `entries`, in file order, without their `entry_patch` records; an entry
- * whose parent is a record takes the record's parent. Adds each record to
- * `recordParents`, which holds the records of earlier reads of the same
- * transcript.
+ * whose parent is a record takes the record's parent (null for a record with
+ * no `parentId`). Adds each record to `recordParents`, which holds the
+ * records of earlier reads of the same transcript.
  */
 function entriesPastRecords<E extends FileEntry>(
 	entries: readonly E[],
@@ -384,7 +385,7 @@ function entriesPastRecords<E extends FileEntry>(
 		if (entry.type !== "session") {
 			entry.parentId = pastRecords(entry.parentId, recordParents);
 			if (isEntryPatchRecord(entry)) {
-				recordParents.set(entry.id, entry.parentId);
+				recordParents.set(entry.id, entry.parentId ?? null);
 				continue;
 			}
 		}
@@ -395,9 +396,10 @@ function entriesPastRecords<E extends FileEntry>(
 
 /**
  * `tree` without its `entry_patch` record nodes: the children of a record node
- * take its place among its parent's children, and its parent as their entries'
- * parent; a `leafId` that names a record names that parent. Walks with a stack
- * of its own, as a session tree nests one level for each entry of a chain.
+ * take its place among its parent's children, and its parent (null for a
+ * record with no `parentId`) as their entries' parent; a `leafId` that names a
+ * record names that parent. Walks with a stack of its own, as a session tree
+ * nests one level for each entry of a chain.
  */
 function treePastRecords(
 	tree: SessionTreeNode[],
@@ -424,8 +426,9 @@ function treePastRecords(
 		const entry = node.entry;
 		if (level.parentId !== undefined) entry.parentId = level.parentId;
 		if (isEntryPatchRecord(entry)) {
-			recordParents.set(entry.id, entry.parentId);
-			stack.push({ nodes: node.children, index: 0, into: level.into, parentId: entry.parentId });
+			const parentId = entry.parentId ?? null;
+			recordParents.set(entry.id, parentId);
+			stack.push({ nodes: node.children, index: 0, into: level.into, parentId });
 			continue;
 		}
 		level.into.push(node);
@@ -470,6 +473,12 @@ export class RpcClient {
 	#abortController = new AbortController();
 	/** Each `entry_patch` record `getEntries` read since its last read of the whole history, with its parent past records. */
 	readonly #entryRecordParents = new Map<string, string | null>();
+	/**
+	 * For each subagent transcript `getSubagentMessages` read, by session file:
+	 * each `entry_patch` record it hid since its last read from the start, with
+	 * its parent past records.
+	 */
+	readonly #subagentRecordParents = new Map<string, Map<string, string | null>>();
 
 	constructor(private options: RpcClientOptions = {}) {
 		this.#customTools = [...(options.customTools ?? [])];
@@ -1073,16 +1082,18 @@ export class RpcClient {
 	 *
 	 * The server reads the transcript file in windows. The `entry_patch`
 	 * records of this reply apply to its entries, as the server applies them,
-	 * and are not listed; an entry whose parent is a record of this reply takes
-	 * the record's parent. `messages` are the `message` objects of `entries`.
-	 * A patch that names an entry not in this reply, one an earlier call
-	 * returned, is listed in `entryPatches`, in file order. The client keeps
-	 * nothing across calls: a caller that holds the entries of earlier calls
-	 * applies each patch, in order, to the entry with its `entryId` when
-	 * `entryAcceptsPatch(entry, patch)` holds, with `setPatchedFields(entry,
-	 * patch)`, both from `@oh-my-pi/pi-utils/entry-patches`. That changes the
-	 * entry in place, and its `message`, the object earlier calls returned in
-	 * `messages`, with it.
+	 * and are not listed; an entry whose parent is a record takes the record's
+	 * parent, also for a record an earlier call returned from the same session
+	 * file since its last read from the start (`fromByte` 0, or `reset`). For
+	 * that the client keeps the id and parent of each record it hid, per
+	 * session file, and no entry. `messages` are the `message` objects of
+	 * `entries`. A patch that names an entry not in this reply, one an earlier
+	 * call returned, is listed in `entryPatches`, in file order: a caller that
+	 * holds the entries of earlier calls applies each patch, in order, to the
+	 * entry with its `entryId` when `entryAcceptsPatch(entry, patch)` holds,
+	 * with `setPatchedFields(entry, patch)`, both from
+	 * `@oh-my-pi/pi-utils/entry-patches`. That changes the entry in place, and
+	 * its `message`, the object earlier calls returned in `messages`, with it.
 	 */
 	async getSubagentMessages(selector: {
 		subagentId?: string;
@@ -1104,7 +1115,12 @@ export class RpcClient {
 			for (const patch of entryPatchesOf(entry) ?? []) if (!ids.has(patch.entryId)) entryPatches.push(patch);
 		}
 		applyEntryPatches(read.entries);
-		const entries = entriesPastRecords(read.entries, new Map());
+		let recordParents = this.#subagentRecordParents.get(read.sessionFile);
+		if (recordParents === undefined || read.fromByte === 0 || read.reset) {
+			recordParents = new Map();
+			this.#subagentRecordParents.set(read.sessionFile, recordParents);
+		}
+		const entries = entriesPastRecords(read.entries, recordParents);
 		return {
 			...read,
 			entries,
@@ -1188,14 +1204,14 @@ export class RpcClient {
 	 * is a record, and a `leafId` that names one, take the record's parent, also
 	 * for a record an earlier `since` read returned. The client does not apply
 	 * the records, and must not: the server serves its live entries
-	 * (`modes/rpc/rpc-compat.ts:19-22`, `session/session-manager.ts:6973`),
-	 * which already carry each record's fields. `patchEntries` sets them before
-	 * it appends the record (`session/session-manager.ts:6667-6669`), and a
-	 * load applies the records it reads (`session/session-manager.ts:4769`). A
-	 * record the server holds keeps its fields after a later rewrite-only pass
-	 * replaced them in the entry, for example images a later pass dropped from
-	 * an elided result: only the line a full rewrite writes loses them
-	 * (`session/entry-patches.ts:33-36`, `withoutEntryPatches` at `:207-209`).
+	 * (`selectRpcEntries` in `modes/rpc/rpc-compat.ts` slices
+	 * `SessionManager.getEntries`), which already carry each record's fields.
+	 * `SessionManager.patchEntries` sets them before it appends the record, and
+	 * a load applies the records it reads (`SessionManager`'s load calls
+	 * `applyEntryPatches`). A record the server holds keeps its fields after a
+	 * later rewrite-only pass replaced them in the entry, for example images a
+	 * later pass dropped from an elided result: only the line a full rewrite
+	 * writes loses them (`withoutEntryPatches` in `session/entry-patches.ts`).
 	 * Applying such a record again would bring the replaced values back.
 	 */
 	async getEntries(since?: string): Promise<{ entries: SessionEntry[]; leafId: string | null }> {
@@ -1214,8 +1230,8 @@ export class RpcClient {
 	 * record's parent as their entries' parent, and a `leafId` that names a
 	 * record names that parent. The client does not apply the records, and
 	 * must not, for the reason {@link getEntries} gives: the tree's entries are
-	 * the server's live entries (`session/session-manager.ts:7029`), which
-	 * already carry each record's fields.
+	 * the server's live entries (`SessionManager.getTree`), which already carry
+	 * each record's fields.
 	 */
 	async getTree(): Promise<{ tree: SessionTreeNode[]; leafId: string | null }> {
 		const response = await this.#send({ type: "get_tree" });

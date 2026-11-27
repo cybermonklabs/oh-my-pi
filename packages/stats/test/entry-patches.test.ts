@@ -6,6 +6,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import type { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { syncAllSessions } from "@oh-my-pi/omp-stats/aggregator";
@@ -265,19 +266,136 @@ describe("a session whose passes appended entry_patch records reads as with thos
 		expect(await stored(inline)).toEqual({ userChars: PROMPT_ELIDED.length, resultChars: OUTPUT_ELIDED.length });
 	});
 
-	it("a database that stored rows before its records applied derives them again once", async () => {
+	// A database an older build filled holds rows derived from an entry before a record set its fields.
+	// The first open derives the rows of each file modified since records were first written again, once:
+	// an older file, which holds no record, keeps its cursor and its rows, and a later open derives
+	// nothing again.
+	it("a database that stored rows before its records applied derives them again once, for the files modified since records were written", async () => {
 		const file = await writeSession("patched");
+		const old = await writeSession("inline");
+		// Before the first build that wrote a record: no file this old holds one.
+		const beforeRecords = new Date("2026-11-01T00:00:00Z");
+		await fs.utimes(old, beforeRecords, beforeRecords);
 		await syncAllSessions({ workers: 1 });
-		const db = await initDb();
-		// As an older build left it: the record read past, the row derived from the original prompt.
-		db.prepare("UPDATE user_messages SET chars = ? WHERE session_file = ?").run(PROMPT.length, file);
+		const setChars = (db: Database, sessionFile: string, chars: number) =>
+			db.prepare("UPDATE user_messages SET chars = ? WHERE session_file = ?").run(chars, sessionFile);
+		const stored = async () => {
+			const db = await initDb();
+			const charsOf = (sessionFile: string) =>
+				db
+					.query<{ chars: number }, [string]>("SELECT chars FROM user_messages WHERE session_file = ?")
+					.get(sessionFile)?.chars;
+			return { patched: charsOf(file), old: charsOf(old) };
+		};
+
+		let db = await initDb();
+		// As an older build left them: the patched file's row derived from the original prompt, past the
+		// record; the older file's row a value no derive gives, which a derive of it would replace.
+		setChars(db, file, PROMPT.length);
+		setChars(db, old, -7);
 		db.prepare("DELETE FROM meta WHERE key = 'entry_patch_v1'").run();
 		closeDb();
 		await syncAllSessions({ workers: 1 });
-		const row = (await initDb()).prepare("SELECT chars FROM user_messages WHERE session_file = ?").get(file) as {
-			chars: number;
+		expect(await stored()).toEqual({ patched: PROMPT_ELIDED.length, old: -7 });
+
+		// A later open: a value no derive gives stays in each row.
+		db = await initDb();
+		setChars(db, file, -7);
+		closeDb();
+		const later = await syncAllSessions({ workers: 1 });
+		expect({ later, stored: await stored() }).toEqual({
+			later: { processed: 0, files: 0 },
+			stored: { patched: -7, old: -7 },
+		});
+	});
+
+	// A reply appended after a record names the record as parent: the prompt it answers is the entry the
+	// record follows. Without mapping the parent through the records, the prompt's row gets no model.
+	it("links a prompt to the model of a reply appended after a record, read in one sync or two, as with the record's fields inline", async () => {
+		/** A prompt, then (patched) a record that shortens it, then the reply, whose parent is the record. */
+		const lines = (sync: string, form: Form): string[] => {
+			const id = (name: string) => `${sync}-${name}-${form}`;
+			const inline = form === "inline";
+			const entries: Record<string, unknown>[] = [
+				{ type: "session", version: 3, id: id("session"), timestamp: iso(T), cwd: "/repo" },
+				{
+					type: "message",
+					id: id("user"),
+					parentId: null,
+					timestamp: iso(T + 1000),
+					message: { role: "user", content: inline ? PROMPT_ELIDED : PROMPT, timestamp: T + 1000 },
+				},
+			];
+			if (!inline) {
+				entries.push({
+					type: "custom",
+					customType: "entry_patch",
+					id: id("elide"),
+					parentId: id("user"),
+					timestamp: iso(T + 1500),
+					data: { patches: [{ entryId: id("user"), message: { content: PROMPT_ELIDED } }] },
+				});
+			}
+			entries.push({
+				type: "message",
+				id: id("reply"),
+				parentId: inline ? id("user") : id("elide"),
+				timestamp: iso(T + 2000),
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Done." }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-opus-4-5",
+					stopReason: "stop",
+					timestamp: T + 2000,
+					duration: 500,
+					usage: USAGE,
+				},
+			});
+			return entries.map(entry => JSON.stringify(entry));
 		};
-		expect(row.chars).toBe(PROMPT_ELIDED.length);
+		const files = new Map<string, string>();
+		for (const sync of ["one", "two"]) {
+			for (const form of FORMS) {
+				const all = lines(sync, form);
+				const file = sessionPath(`link-${sync}-${form}`);
+				files.set(`${sync}-${form}`, file);
+				// Read in two syncs, the reply arrives after the sync that read the record.
+				await Bun.write(file, `${(sync === "one" ? all : all.slice(0, -1)).join("\n")}\n`);
+			}
+		}
+		await syncAllSessions({ workers: 1 });
+		for (const form of FORMS) {
+			await fs.appendFile(files.get(`two-${form}`) ?? "", `${lines("two", form).at(-1)}\n`);
+		}
+		await syncAllSessions({ workers: 1 });
+		const db = await initDb();
+		const prompts = (key: string, form: Form) =>
+			sameIds(
+				db
+					.prepare("SELECT entry_id, model, provider, chars FROM user_messages WHERE session_file = ?")
+					.all(files.get(key) ?? ""),
+				form,
+			);
+		const linked = (sync: string) => [
+			{ entry_id: `${sync}-user-x`, model: "claude-opus-4-5", provider: "anthropic", chars: PROMPT_ELIDED.length },
+		];
+		expect(
+			["one", "two"].map(sync => ({
+				sync,
+				patched: prompts(`${sync}-patched`, "patched"),
+				inline: prompts(`${sync}-inline`, "inline"),
+			})),
+		).toEqual(["one", "two"].map(sync => ({ sync, patched: linked(sync), inline: linked(sync) })));
+
+		// A read from an offset with no cursor state finds the record's parent in the bytes before it.
+		const head = lines("two", "patched").slice(0, -1);
+		const offsetOnly = await parseSessionFile(
+			files.get("two-patched") ?? "",
+			Buffer.byteLength(`${head.join("\n")}\n`),
+		);
+		expect(offsetOnly.userLinks.map(link => link.entryId)).toEqual(["two-user-patched"]);
 	});
 
 	it("the prefix scan of an offset-only read reads its entries with the fields the records set", async () => {
@@ -376,6 +494,28 @@ describe("a session whose passes appended entry_patch records reads as with thos
 			REPLY_ELIDED.replace(/\s+/g, " "),
 			"Done.",
 		]);
+	});
+
+	// The dashboard sends back the trace's ETag; a match answers 304, and the browser keeps the body it
+	// cached. Builds before the records applied tagged their traces with version 5: a body they cached,
+	// which shows the fields as first written, must be sent again for the same transcript.
+	it("sends a trace cached by a build that read past the records again, not as unchanged", async () => {
+		const file = await writeSession("patched");
+		const url = `http://127.0.0.1/api/session/trace?file=${encodeURIComponent(file)}`;
+		const first = await handleApi(new Request(url));
+		const etag = first.headers.get("ETag") ?? "";
+		await first.arrayBuffer();
+		const statusFor = async (ifNoneMatch: string) => {
+			const response = await handleApi(new Request(url, { headers: { "If-None-Match": ifNoneMatch } }));
+			await response.arrayBuffer();
+			return response.status;
+		};
+		// The same transcript under the version of those builds.
+		const olderBuilds = etag.replace(/^"\d+:/, '"5:');
+		expect({ current: await statusFor(etag), olderBuilds: await statusFor(olderBuilds) }).toEqual({
+			current: 304,
+			olderBuilds: 200,
+		});
 	});
 
 	it("the span drawer reads an entry with the fields the records set, and no record", async () => {

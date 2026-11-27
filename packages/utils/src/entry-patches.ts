@@ -145,18 +145,37 @@ const CONTENT_TAKES_STRING: Readonly<Record<string, boolean>> = {
 	toolResult: false,
 };
 
+/**
+ * Whether `block` is a content block a message can hold: a string `type`, and
+ * the payload a text or image block carries (`text`, `data`) as a string, so a
+ * provider request built from it never meets a block without its payload.
+ */
+function isContentBlock(block: unknown): block is EntryPatchContentBlock {
+	if (!isRecord(block) || typeof block.type !== "string") return false;
+	switch (block.type) {
+		case "text":
+			return typeof block.text === "string";
+		case "image":
+			return typeof block.data === "string";
+		default:
+			return true;
+	}
+}
+
 function isContent(value: unknown): value is EntryPatchContent {
-	return (
-		typeof value === "string" ||
-		(Array.isArray(value) && value.every(block => isRecord(block) && typeof block.type === "string"))
-	);
+	return typeof value === "string" || (Array.isArray(value) && value.every(isContentBlock));
+}
+
+/** Whether `value` is absent or a finite number, as every counter a patch sets is. */
+function isCount(value: unknown): value is number | undefined {
+	return value === undefined || (typeof value === "number" && Number.isFinite(value));
 }
 
 function isEntryFields(value: unknown): value is EntryFieldsPatch {
 	return (
 		isRecord(value) &&
 		(value.warning === undefined || typeof value.warning === "string") &&
-		(value.tokensAfter === undefined || typeof value.tokensAfter === "number") &&
+		isCount(value.tokensAfter) &&
 		(value.preserveData === undefined || isRecord(value.preserveData)) &&
 		(value.content === undefined || isContent(value.content))
 	);
@@ -168,8 +187,8 @@ function isMessageFields(value: unknown): value is MessageFieldsPatch {
 		(value.retryRecovery === undefined || isRecord(value.retryRecovery)) &&
 		(value.continued === undefined || value.continued === true) &&
 		(value.contextSnapshot === undefined || isRecord(value.contextSnapshot)) &&
-		(value.elidedOutputTokens === undefined || typeof value.elidedOutputTokens === "number") &&
-		(value.prunedAt === undefined || typeof value.prunedAt === "number") &&
+		isCount(value.elidedOutputTokens) &&
+		isCount(value.prunedAt) &&
 		(value.content === undefined || isContent(value.content))
 	);
 }

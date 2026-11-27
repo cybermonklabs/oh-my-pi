@@ -788,8 +788,7 @@ impl Drop for Collector<'_> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubagentTranscriptRead {
 	/// The reply. `entries` lists no record; an entry whose parent is a record
-	/// of the reply takes the record's parent. `messages` are the messages of
-	/// `entries`.
+	/// takes the record's parent. `messages` are the messages of `entries`.
 	pub reply:         SubagentMessages,
 	/// The patches of this reply's records that name an entry not in this
 	/// reply (one an earlier call returned), in file order, as
@@ -828,20 +827,24 @@ fn message_of(entry: &Map<String, Value>) -> Option<&Value> {
 
 /// A connected `omp --mode rpc` server.
 pub struct Client {
-	shared:               Arc<Shared>,
+	shared:                  Arc<Shared>,
 	/// The spawned server; its process group is torn down on close.
-	child:                Option<Child>,
-	reader:               Option<JoinHandle<()>>,
-	next_id:              AtomicU64,
-	ready:                ReadyEvent,
-	protocol_version:     u32,
-	default_timeout:      Duration,
+	child:                   Option<Child>,
+	reader:                  Option<JoinHandle<()>>,
+	next_id:                 AtomicU64,
+	ready:                   ReadyEvent,
+	protocol_version:        u32,
+	default_timeout:         Duration,
 	/// Serializes each host tool / URI replacement with its registration
 	/// round trip, so the server and the dispatch registry agree.
-	registration:         Mutex<()>,
+	registration:            Mutex<()>,
 	/// Each `entry_patch` record [`Client::get_entries`] read since its last
 	/// read of the whole history, with its parent past records.
-	entry_record_parents: Mutex<RecordParents>,
+	entry_record_parents:    Mutex<RecordParents>,
+	/// By session file, each `entry_patch` record
+	/// [`Client::get_subagent_messages`] hid since its last read of that
+	/// transcript from the start, with its parent past records.
+	subagent_record_parents: Mutex<HashMap<String, RecordParents>>,
 }
 
 /// Builds the command frame `{"id", "type", ...params}`.
@@ -950,6 +953,7 @@ impl Client {
 			default_timeout: options.default_timeout,
 			registration: Mutex::new(()),
 			entry_record_parents: Mutex::default(),
+			subagent_record_parents: Mutex::default(),
 		};
 		// From here on an early return drops `client`, which tears everything down.
 		client.ready = match ready_rx.recv_timeout(options.ready_timeout) {
@@ -1205,17 +1209,17 @@ impl Client {
 	/// parent is a record, and a `leafId` that names one, take the record's
 	/// parent, also for a record an earlier `since` read returned. The client
 	/// does not apply the records, and must not: the server serves its live
-	/// entries (`packages/coding-agent/src/modes/rpc/rpc-compat.ts:19-22`,
-	/// `packages/coding-agent/src/session/session-manager.ts:6973`), which
-	/// already carry each record's fields. `patchEntries` sets them before it
-	/// appends the record (`session-manager.ts:6667-6669`), and a load applies
-	/// the records it reads (`session-manager.ts:4769`). A record the server
-	/// holds keeps its fields after a later rewrite-only pass replaced them in
-	/// the entry, for example images a later pass dropped from an elided
-	/// result: only the line a full rewrite writes loses them
-	/// (`packages/coding-agent/src/session/entry-patches.ts:33-36`,
-	/// `withoutEntryPatches` at `:207-209`). Applying such a record again would
-	/// bring the replaced values back.
+	/// entries (`selectRpcEntries` in
+	/// `packages/coding-agent/src/modes/rpc/rpc-compat.ts` slices
+	/// `SessionManager.getEntries`), which already carry each record's
+	/// fields. `SessionManager.patchEntries` sets them before it appends the
+	/// record, and a load applies the records it reads (`SessionManager`'s
+	/// load calls `applyEntryPatches`). A record the server holds keeps its
+	/// fields after a later rewrite-only pass replaced them in the entry, for
+	/// example images a later pass dropped from an elided result: only the
+	/// line a full rewrite writes loses them (`withoutEntryPatches` in
+	/// `packages/coding-agent/src/session/entry-patches.ts`). Applying such a
+	/// record again would bring the replaced values back.
 	///
 	/// [`call`](Self::call) with a [`GetEntriesCommand`] returns the reply as
 	/// the server sent it, records included.
@@ -1248,9 +1252,8 @@ impl Client {
 	/// record's parent as their entries' parent, and a `leafId` that names a
 	/// record names that parent. The client does not apply the records, and
 	/// must not, for the reason [`get_entries`](Self::get_entries) gives: the
-	/// tree's entries are the server's live entries
-	/// (`packages/coding-agent/src/session/session-manager.ts:7029`), which
-	/// already carry each record's fields.
+	/// tree's entries are the server's live entries (`SessionManager.getTree`),
+	/// which already carry each record's fields.
 	///
 	/// [`call`](Self::call) with a [`GetTreeCommand`] returns the reply as the
 	/// server sent it, records included.
@@ -1271,12 +1274,14 @@ impl Client {
 	///
 	/// The server reads the transcript file in windows. The `entry_patch`
 	/// records of this reply apply to its entries, as the server applies them,
-	/// and are not listed; an entry whose parent is a record of this reply
-	/// takes the record's parent. A patch that names an entry not in this
-	/// reply, one an earlier call returned, is listed in `entry_patches`, in
-	/// file order. The client keeps nothing across calls: a caller that holds
-	/// the entries of earlier calls applies each patch, in order, to the entry
-	/// with its `entryId` when
+	/// and are not listed; an entry whose parent is a record takes the
+	/// record's parent, also for a record an earlier call returned from the
+	/// same session file since its last read from the start (`fromByte` 0, or
+	/// `reset`). For that the client keeps the id and parent of each record it
+	/// hid, per session file, and no entry. A patch that names an entry not in
+	/// this reply, one an earlier call returned, is listed in `entry_patches`,
+	/// in file order: a caller that holds the entries of earlier calls applies
+	/// each patch, in order, to the entry with its `entryId` when
 	/// [`entry_accepts_patch`](crate::entry_patches::entry_accepts_patch) holds,
 	/// with [`set_patched_fields`](crate::entry_patches::set_patched_fields),
 	/// and decodes that entry's `message` again.
@@ -1318,7 +1323,22 @@ impl Client {
 					}
 				}
 			}
-			let entries = entries_past_records(entries, &mut RecordParents::new());
+			let from_start = object.get("fromByte").and_then(Value::as_i64) == Some(0)
+				|| object.get("reset").and_then(Value::as_bool) == Some(true);
+			let file = object
+				.get("sessionFile")
+				.and_then(Value::as_str)
+				.unwrap_or_default();
+			let mut transcripts = self
+				.subagent_record_parents
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner);
+			if from_start {
+				transcripts.remove(file);
+			}
+			let parents = transcripts.entry(file.to_owned()).or_default();
+			let entries = entries_past_records(entries, parents);
+			drop(transcripts);
 			let messages = entries.iter().filter_map(message_of).cloned().collect();
 			object.insert("messages".to_owned(), Value::Array(messages));
 			object.insert(

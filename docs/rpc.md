@@ -1097,10 +1097,11 @@ and tree nodes, and the entries already carry each record's fields. The
 TypeScript `RpcClient` (`getEntries`, `getTree`) and the Python, Go and Rust
 SDK clients (`get_entries`/`GetEntries`, `get_tree`/`GetTree`) list no record:
 an entry whose parent is a record, and a `leafId` that names one, take the
-record's parent (also for a record an earlier `since` read returned), and a
-record node's children take its place in the tree. They never apply a record
-again: a record the server holds keeps fields a later rewrite-only pass
-replaced in its entry, so applying it would bring the replaced values back.
+record's parent (none for a record line with no `parentId`; also for a record
+an earlier `since` read returned), and a record node's children take its place
+in the tree. They never apply a record again: a record the server holds keeps
+fields a later rewrite-only pass replaced in its entry, so applying it would
+bring the replaced values back.
 Rust `Client::call` and Go `Commands` return the answer as the server sent it.
 
 `get_available_thinking_levels` returns `{ levels }`: the selectable levels
@@ -1139,14 +1140,17 @@ those entries (see [session format](./session.md)), and lists the records in
 `entries` as written; a record that names an entry before `fromByte` changes
 nothing in this response. The clients (`RpcClient.getSubagentMessages` in
 TypeScript, `get_subagent_messages`/`GetSubagentMessages` in the SDKs) apply
-the response's records to its entries and list no record (an entry whose
-parent is one takes the record's parent), and return each patch whose target
-the response lacks, in file order, as `entryPatches` (`entry_patches` in
-Python and Rust, `EntryPatches` in Go). They keep nothing between calls: a
-caller that holds the entries of earlier responses applies each patch, in
-order, to the entry with its `entryId` when `entryAcceptsPatch` holds, with
-`setPatchedFields` (from `@oh-my-pi/pi-utils/entry-patches`, or the SDK's port
-of them).
+the response's records to its entries and list no record, and return each
+patch whose target the response lacks, in file order, as `entryPatches`
+(`entry_patches` in Python and Rust, `EntryPatches` in Go). An entry whose
+parent is a record takes the record's parent (none for a record line with no
+`parentId`), also for a record an earlier response of the same session file
+returned since the last response from byte zero or with `reset: true`: for
+that a client keeps the id and parent of each record it hid, per session file,
+and no entry. A caller that holds the entries of earlier responses applies
+each patch, in order, to the entry with its `entryId` when `entryAcceptsPatch`
+holds, with `setPatchedFields` (from `@oh-my-pi/pi-utils/entry-patches`, or
+the SDK's port of them).
 One response returns at most 8 MiB of the transcript (more only when a single
 record is longer than 4 MiB), so a client reading a long transcript repeats
 the request from `nextByte` until `nextByte` stops advancing.

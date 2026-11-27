@@ -353,13 +353,14 @@ function omittedDetail(type: string, bytes: number | null): string {
  * the keys, or a payload that is not serializable at all — the entry is
  * replaced by a `custom_message` that keeps `id`/`parentId`/`timestamp`, so
  * the guest's branch chain stays connected and the substitution is visible in
- * the replica. A `custom_message` is the carrier because the guest's live
- * entry path only special-cases `message`/`compaction`/`branch_summary`, and
- * because it survives the replica JSONL load that the snapshot path performs.
+ * the replica. A `custom_message` is the carrier because the guest stores it
+ * as an ordinary entry, and because it survives the replica JSONL load that
+ * the snapshot path performs.
  *
- * The snapshot path loads the replica through the normal session machinery, so
- * on that path the placeholder does reach the guest's model context. That is
- * deliberate: the guest's model is told the content was dropped instead of
+ * Both paths bring the placeholder into the guest's model context: the
+ * snapshot loads the replica through the normal session machinery, and a live
+ * `custom_message` makes the guest rebuild its context from the replica. That
+ * is deliberate: the guest's model is told the content was dropped instead of
  * silently reasoning over a gap in the transcript.
  *
  * Typed on the host's own entry union rather than the wire skeleton: the

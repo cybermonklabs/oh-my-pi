@@ -1477,6 +1477,120 @@ fn get_subagent_messages_returns_the_patch_of_a_later_record() {
 	assert_eq!(raw.entries[0]["id"], "p1");
 }
 
+// The records of one reply apply to its entries whatever the server did, and
+// only a patch whose target the reply lacks comes back.
+#[test]
+fn get_subagent_messages_applies_a_record_within_its_reply() {
+	let (client, _events, mut server) = connect(ready_v1(), Vec::new());
+	let patches = json!([
+		{"entryId": "t1", "message": {"content": [{"type": "text", "text": "elided"}]}},
+		{"entryId": "a0", "message": {"elidedOutputTokens": 9}},
+	]);
+	let script = thread::spawn(move || {
+		let request = server.expect("get_subagent_messages");
+		server.respond(
+			&request,
+			subagent_reply("/s.jsonl", 100, 200, vec![
+				json!({"type": "message", "id": "a1", "parentId": "a0", "timestamp": "t", "message": assistant("hi")}),
+				tool_result_entry("t1", "a1", "heavy"),
+				patch_record("p1", "t1", patches),
+			]),
+		);
+		server
+	});
+	let command = |file: &str, from_byte| GetSubagentMessagesCommand {
+		subagent_id: None,
+		session_file: Some(file.to_owned()),
+		from_byte,
+	};
+	let read = client
+		.get_subagent_messages(&command("/s.jsonl", Some(100)))
+		.unwrap();
+	drop(script.join().unwrap());
+
+	assert_eq!(ids_and_parents(&read.reply.entries), [
+		(json!("a1"), json!("a0")),
+		(json!("t1"), json!("a1"))
+	]);
+	assert_eq!(
+		read.reply.entries[1]["message"]["content"],
+		json!([{"type": "text", "text": "elided"}])
+	);
+	// The messages are those of the patched entries: the elided result, and an
+	// assistant message the patch for an entry outside the reply left alone.
+	assert_eq!(read.reply.messages, [
+		AgentMessage::from_value(assistant("hi")).unwrap(),
+		AgentMessage::from_value(tool_result_entry("t1", "a1", "elided")["message"].clone()).unwrap(),
+	]);
+	assert_eq!(
+		read
+			.entry_patches
+			.iter()
+			.map(|patch| Value::Object(patch.clone()))
+			.collect::<Vec<_>>(),
+		[json!({"entryId": "a0", "message": {"elidedOutputTokens": 9}})]
+	);
+}
+
+// A poll ends where the file ends, so a record an elide pass appends last ends
+// a reply, and the next entry, whose parent is that record, comes in the next
+// reply. If this regresses, that entry's parent is an id no reply lists.
+#[test]
+fn get_subagent_messages_relinks_past_a_record_that_ended_an_earlier_reply() {
+	let (client, _events, mut server) = connect(ready_v1(), Vec::new());
+	let elide =
+		json!([{"entryId": "t1", "message": {"content": [{"type": "text", "text": "elided"}]}}]);
+	let mut rewritten = subagent_reply("/a.jsonl", 0, 100, vec![user_entry("u1", None, "go")]);
+	rewritten["reset"] = json!(true);
+	let replies = vec![
+		subagent_reply("/a.jsonl", 0, 100, vec![
+			user_entry("u1", None, "go"),
+			tool_result_entry("t1", "u1", "heavy"),
+			patch_record("p1", "t1", elide),
+		]),
+		// /b.jsonl never held the record.
+		subagent_reply("/b.jsonl", 0, 100, vec![user_entry("b1", Some("p1"), "elsewhere")]),
+		subagent_reply("/a.jsonl", 100, 200, vec![user_entry("u2", Some("p1"), "after")]),
+		// The transcript was rewritten: the server reads it again from the start.
+		rewritten,
+		subagent_reply("/a.jsonl", 100, 200, vec![user_entry("u3", Some("p1"), "later")]),
+	];
+	let script = thread::spawn(move || {
+		for reply in replies {
+			let request = server.expect("get_subagent_messages");
+			server.respond(&request, reply);
+		}
+		server
+	});
+	let command = |file: &str, from_byte| GetSubagentMessagesCommand {
+		subagent_id: None,
+		session_file: Some(file.to_owned()),
+		from_byte,
+	};
+	let mut reads = Vec::new();
+	for (file, from_byte) in [
+		("/a.jsonl", None),
+		("/b.jsonl", Some(0)),
+		("/a.jsonl", Some(100)),
+		("/a.jsonl", Some(200)),
+		("/a.jsonl", Some(100)),
+	] {
+		let read = client
+			.get_subagent_messages(&command(file, from_byte))
+			.unwrap();
+		reads.push(ids_and_parents(&read.reply.entries));
+	}
+	drop(script.join().unwrap());
+
+	assert_eq!(reads, [
+		vec![(json!("u1"), Value::Null), (json!("t1"), json!("u1"))],
+		vec![(json!("b1"), json!("p1"))],
+		vec![(json!("u2"), json!("t1"))],
+		vec![(json!("u1"), Value::Null)],
+		vec![(json!("u3"), json!("p1"))],
+	]);
+}
+
 // A host that mirrors the session with get_entries(since) or get_tree sees
 // each record as an entry, and an entry after it whose parent is no entry it
 // lists. The server's live entries already carry each record; a record it
@@ -1551,4 +1665,52 @@ fn get_entries_and_get_tree_list_no_record_and_apply_none_again() {
 	]);
 	let result = &session_tree.tree.first().unwrap()["children"][0]["entry"]["message"]["content"];
 	assert_eq!(result, &json!([{"type": "text", "text": "elided"}]));
+}
+
+// The session manager always writes `parentId`; a record line without one
+// stands for a record at the root, so what it hides takes no parent.
+#[test]
+fn get_entries_and_get_tree_give_no_parent_past_a_record_with_no_parent_id() {
+	let (client, _events, mut server) = connect(ready_v1(), Vec::new());
+	let record = json!({"type": "custom", "customType": "entry_patch", "id": "q1", "timestamp": "t", "data": {"patches": []}});
+	let node = |entry: Value, children: Vec<Value>| json!({"entry": entry, "children": children});
+	let script = thread::spawn(move || {
+		let entries = server.expect("get_entries");
+		server.respond(
+			&entries,
+			json!({"entries": [user_entry("u1", None, "go"), record.clone(), user_entry("q2", Some("q1"), "after")], "leafId": "q1"}),
+		);
+		let tree = server.expect("get_tree");
+		server.respond(
+			&tree,
+			json!({"tree": [
+				node(user_entry("u1", None, "go"), vec![]),
+				node(record, vec![node(user_entry("q2", Some("q1"), "after"), vec![])]),
+			], "leafId": "q1"}),
+		);
+		server
+	});
+	let read = client
+		.get_entries(&GetEntriesCommand { since: None })
+		.unwrap();
+	let session_tree = client.get_tree().unwrap();
+	drop(script.join().unwrap());
+
+	assert_eq!(ids_and_parents(&read.entries), [
+		(json!("u1"), Value::Null),
+		(json!("q2"), Value::Null)
+	]);
+	assert_eq!(read.leaf_id, None);
+	let roots: Vec<_> = session_tree
+		.tree
+		.iter()
+		.map(|node| {
+			(node["entry"]["id"].clone(), node["entry"]["parentId"].clone(), node["children"].clone())
+		})
+		.collect();
+	assert_eq!(roots, [
+		(json!("u1"), Value::Null, json!([])),
+		(json!("q2"), Value::Null, json!([]))
+	]);
+	assert_eq!(session_tree.leaf_id, None);
 }

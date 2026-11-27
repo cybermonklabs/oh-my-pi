@@ -1,12 +1,10 @@
-import { EntryPatchReplay } from "@oh-my-pi/pi-utils/entry-patches";
 import type { AgentSnapshot, SessionEntry, SubagentLifecyclePayload, SubagentProgressPayload } from "@oh-my-pi/pi-wire";
 import { OctagonX, RotateCcw, SendHorizontal, X } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
 import type { GuestClient } from "../../lib/client";
-import { repaintPatchedRows, type TranscriptLine } from "../../lib/entry-patch-rows";
 import { fmtCost, fmtDuration, fmtTokens } from "../../lib/format";
-import { decideTranscriptPoll } from "../../lib/transcript-poll";
+import { startTranscriptPolling } from "../../lib/transcript-poll";
 import type { TranscriptProps } from "../transcript/Transcript";
 import { Transcript } from "../transcript/Transcript";
 
@@ -44,9 +42,9 @@ export function AgentDrawer(props: {
 	}, [onClose]);
 
 	// Live transcript: poll the host-side session file while the drawer is
-	// open, appending parsed JSONL entries. `entry_patch` records apply to the
+	// open (startTranscriptPolling). `entry_patch` records apply to the
 	// entries read so far, and an entry a record changed is shown again. State
-	// resets when the agent changes; the interval and any in-flight reply are
+	// resets when the agent changes; the loop and any in-flight reply are
 	// dropped on cleanup.
 	// Once the agent is not running, no partial JSONL line is pending, and
 	// IDLE_POLLS_BEFORE_STOP consecutive polls find the file unchanged, the
@@ -57,69 +55,18 @@ export function AgentDrawer(props: {
 		setEntries([]);
 		setFetchError(null);
 		if (!agent.hasSessionFile) return;
-		let disposed = false;
-		let failed = false;
-		let inFlight = false;
-		let cursor = 0;
-		let carry = "";
-		let acc: readonly SessionEntry[] = [];
-		const patches = new EntryPatchReplay<TranscriptLine>();
-		let idlePolls = 0;
-		let timer: Timer | null = null;
-		const stopPolling = () => {
-			if (timer !== null) {
-				clearInterval(timer);
-				timer = null;
-			}
-		};
-		const poll = async (): Promise<void> => {
-			if (disposed || failed || inFlight) return;
-			inFlight = true;
-			try {
-				const reply = await client.fetchTranscript(agent.id, cursor);
-				if (disposed) return;
-				const decision = decideTranscriptPoll(reply, carry, patches);
-				switch (decision.action) {
-					case "retry":
-						return; // timeout/transient → keep polling from the same cursor
-					case "stop":
-						failed = true;
-						stopPolling();
-						setFetchError(decision.message);
-						return;
-					case "advance": {
-						const grew = decision.newSize !== cursor;
-						cursor = decision.newSize;
-						carry = decision.carry;
-						if (decision.fresh.length > 0 || decision.changed.length > 0) {
-							const shown = decision.changed.length > 0 ? repaintPatchedRows(acc, decision.changed) : acc;
-							acc = [...shown, ...decision.fresh];
-							setEntries(acc);
-						}
-						idlePolls = grew || !quiescentRef.current ? 0 : idlePolls + 1;
-						if (carry === "" && idlePolls >= IDLE_POLLS_BEFORE_STOP) stopPolling();
-						return;
-					}
-				}
-			} finally {
-				inFlight = false;
-			}
-		};
-		const startPolling = () => {
-			idlePolls = 0;
-			void poll();
-			timer = setInterval(() => {
-				void poll();
-			}, POLL_MS);
-		};
-		resumePollingRef.current = () => {
-			if (!disposed && !failed && timer === null) startPolling();
-		};
-		startPolling();
+		const poller = startTranscriptPolling({
+			fetch: cursor => client.fetchTranscript(agent.id, cursor),
+			onRows: setEntries,
+			onError: setFetchError,
+			quiescent: () => quiescentRef.current,
+			intervalMs: POLL_MS,
+			idlePollsBeforeStop: IDLE_POLLS_BEFORE_STOP,
+		});
+		resumePollingRef.current = poller.resume;
 		return () => {
-			disposed = true;
 			resumePollingRef.current = null;
-			stopPolling();
+			poller.dispose();
 		};
 	}, [agent.id, agent.hasSessionFile, client]);
 

@@ -235,6 +235,106 @@ describe("RpcClient and entry_patch records", () => {
 		expect(read.entryPatches).toEqual([{ entryId: "a0", message: { elidedOutputTokens: 9 } }]);
 	});
 
+	// A poll ends where the file ends, so a record an elide pass appends last
+	// ends a reply, and the next entry, whose parent is that record, comes in
+	// the next reply. If this regresses, that entry's parent is an id no reply
+	// lists.
+	it("relinks an entry to the parent of a record that ended an earlier get_subagent_messages reply", async () => {
+		using dir = TempDir.createSync("@omp-rpc-entry-patch-");
+		const file = path.join(dir.path(), "subagent.jsonl");
+		await Bun.write(
+			file,
+			jsonl([
+				header(dir.path()),
+				userEntry("u1", null, "list the files"),
+				toolCallEntry("a1", "u1"),
+				toolResultEntry("t1", "a1", HEAVY),
+				patchRecord("p1", "t1", [{ entryId: "t1", message: { content: PLACEHOLDER } }]),
+			]),
+		);
+		const agent = fakeRpcAgent();
+		using client = new RpcClient({ spawn: () => agent.proc });
+		await client.start();
+		// The server's own reader answers each request.
+		const serve = (request: FakeRpcRequest) =>
+			readRpcSubagentTranscript(file, typeof request.fromByte === "number" ? request.fromByte : 0);
+
+		const first = await answered(agent, () => client.getSubagentMessages({ sessionFile: file }), serve);
+		await fs.appendFile(file, jsonl([userEntry("u2", "p1", "thanks")]));
+		const second = await answered(
+			agent,
+			() => client.getSubagentMessages({ sessionFile: file, fromByte: first.nextByte }),
+			serve,
+		);
+
+		// Control: the same transcript with the field written inline, read in one reply.
+		const inlineFile = path.join(dir.path(), "inline.jsonl");
+		await Bun.write(
+			inlineFile,
+			jsonl([
+				header(dir.path()),
+				userEntry("u1", null, "list the files"),
+				toolCallEntry("a1", "u1"),
+				toolResultEntry("t1", "a1", PLACEHOLDER),
+				userEntry("u2", "t1", "thanks"),
+			]),
+		);
+		const inline = await answered(
+			agent,
+			() => client.getSubagentMessages({ sessionFile: inlineFile }),
+			request => readRpcSubagentTranscript(inlineFile, typeof request.fromByte === "number" ? request.fromByte : 0),
+		);
+
+		expect(second.entries.map(entry => (entry.type === "session" ? "session" : [entry.id, entry.parentId]))).toEqual([
+			["u2", "t1"],
+		]);
+		expect([...first.entries, ...second.entries]).toEqual(inline.entries);
+	});
+
+	it("keeps each session file's records apart and forgets them on a read from the start", async () => {
+		const agent = fakeRpcAgent();
+		using client = new RpcClient({ spawn: () => agent.proc });
+		await client.start();
+		const reply = (sessionFile: string, fromByte: number, entries: object[], reset = false) => ({
+			sessionFile,
+			fromByte,
+			nextByte: fromByte + 100,
+			reset,
+			entries,
+			messages: entries.flatMap(entry => ("message" in entry ? [entry.message] : [])),
+		});
+		const read = (sessionFile: string, fromByte: number | undefined, data: object) =>
+			answered(
+				agent,
+				() => client.getSubagentMessages({ sessionFile, fromByte }),
+				() => data,
+			);
+		const parents = (entries: readonly { type: string; id?: string; parentId?: string | null }[]) =>
+			entries.map(entry => [entry.id, entry.parentId]);
+
+		await read(
+			"/a.jsonl",
+			undefined,
+			reply("/a.jsonl", 0, [userEntry("u1", null, "go"), patchRecord("p1", "u1", [])]),
+		);
+		// The record ended the read of /a.jsonl; /b.jsonl never held it.
+		const other = await read("/b.jsonl", 0, reply("/b.jsonl", 0, [userEntry("b1", "p1", "elsewhere")]));
+		const next = await read("/a.jsonl", 100, reply("/a.jsonl", 100, [userEntry("u2", "p1", "after")]));
+		// The transcript was rewritten: the server reads it again from the start.
+		await read("/a.jsonl", 200, reply("/a.jsonl", 0, [userEntry("u1", null, "go")], true));
+		const afterReset = await read("/a.jsonl", 100, reply("/a.jsonl", 100, [userEntry("u3", "p1", "later")]));
+
+		expect({
+			other: parents(other.entries),
+			next: parents(next.entries),
+			afterReset: parents(afterReset.entries),
+		}).toEqual({
+			other: [["b1", "p1"]],
+			next: [["u2", "u1"]],
+			afterReset: [["u3", "p1"]],
+		});
+	});
+
 	// A host that mirrors the session with get_entries(since) or get_tree sees
 	// each record as an entry, and an entry after it whose parent is no entry
 	// it lists.
@@ -393,6 +493,50 @@ describe("RpcClient and entry_patch records", () => {
 		]);
 		expect(next.entries.map(entry => [entry.id, entry.parentId])).toEqual([["u2", "u1"]]);
 		expect(leafOnRecord.leafId).toBe("u1");
+	});
+
+	// The session manager always writes `parentId`; a record line without one
+	// stands for a record at the root, so what it hides takes no parent.
+	it("gives an entry and a leaf after a record with no parentId no parent", async () => {
+		const agent = fakeRpcAgent();
+		using client = new RpcClient({ spawn: () => agent.proc });
+		await client.start();
+		const { parentId: _, ...rootRecord } = patchRecord("q1", null, []);
+
+		const read = await answered(
+			agent,
+			() => client.getEntries(),
+			() => ({ entries: [userEntry("u1", null, "go"), rootRecord, userEntry("q2", "q1", "after")], leafId: "q1" }),
+		);
+		const tree = await answered(
+			agent,
+			() => client.getTree(),
+			() => ({
+				tree: [
+					{ entry: userEntry("u1", null, "go"), children: [] },
+					{ entry: rootRecord, children: [{ entry: userEntry("q2", "q1", "after"), children: [] }] },
+				],
+				leafId: "q1",
+			}),
+		);
+
+		expect({
+			entries: read.entries.map(entry => [entry.id, entry.parentId]),
+			leafId: read.leafId,
+			tree: tree.tree.map(node => [node.entry.id, node.entry.parentId, node.children.length]),
+			treeLeafId: tree.leafId,
+		}).toEqual({
+			entries: [
+				["u1", null],
+				["q2", null],
+			],
+			leafId: null,
+			tree: [
+				["u1", null, 0],
+				["q2", null, 0],
+			],
+			treeLeafId: null,
+		});
 	});
 
 	it("splices get_tree record nodes out, a root record and a record under a record among them", async () => {

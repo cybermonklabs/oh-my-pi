@@ -174,9 +174,12 @@ apply them (`ApplyEntryPatches`, `EntryPatchesOf`, `EntryAcceptsPatch`, `SetPatc
   pass replaced.
 - `Client.GetSubagentMessages` applies each reply's records to its entries, lists no record, and
   returns the patches of records whose target the reply lacks (an entry an earlier reply
-  returned) in `SubagentTranscriptRead.EntryPatches`, in file order. The client keeps nothing
-  between calls: apply each patch to the entry you hold with that `EntryID`, when
-  `EntryAcceptsPatch` holds, with `SetPatchedFields`, and decode its `message` again.
+  returned) in `SubagentTranscriptRead.EntryPatches`, in file order. An entry whose parent is a
+  record takes the record's parent, also for a record an earlier reply of the same session file
+  returned since its last read from the start (`FromByte` 0, or `Reset`): for that the client
+  keeps the id and parent of each record it hid, per session file, and no entry. Apply each patch
+  to the entry you hold with that `EntryID`, when `EntryAcceptsPatch` holds, with
+  `SetPatchedFields`, and decode its `message` again.
 - `Commands.GetEntries`, `Commands.GetTree` and `Commands.GetSubagentMessages` return the answer
   as the server sent it, records included.
 

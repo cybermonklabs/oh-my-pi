@@ -19,6 +19,7 @@ import {
 	applyEntryPatches,
 	ENTRY_PATCH_CUSTOM_TYPE,
 	type EntryPatch,
+	type EntryPatchRecord,
 	entryAcceptsPatch,
 	entryPatchesOf,
 	isEntryPatchRecord,
@@ -582,6 +583,23 @@ function withoutEntryPatchRecords(entries: readonly SessionEntry[]): SessionEntr
 }
 
 /**
+ * The parents of a transcript's `entry_patch` records read so far, by record id, each through the
+ * records it names as parent. An entry appended after a record names the record as parent; its
+ * parent is the entry the record follows, as the transcript reads with the records' fields inline.
+ */
+type RecordParents = Map<string, string | null>;
+
+/** Note the parent of `record` in `recordParents`, through the records it already holds. */
+function noteRecordParent(recordParents: RecordParents, record: SessionEntry & EntryPatchRecord): void {
+	if (typeof record.id !== "string") return;
+	const parentId = "parentId" in record && typeof record.parentId === "string" ? record.parentId : null;
+	recordParents.set(
+		record.id,
+		parentId !== null && recordParents.has(parentId) ? (recordParents.get(parentId) ?? null) : parentId,
+	);
+}
+
+/**
  * Parse every well-formed entry in a transcript buffer (malformed lines skipped), with the fields its
  * `entry_patch` records set. The records themselves are not listed ({@link withoutEntryPatchRecords}).
  */
@@ -593,18 +611,21 @@ export function parseAllSessionEntries(bytes: Uint8Array): SessionEntry[] {
 }
 
 /**
- * Rebuild the cursor state of `bytes` (a transcript prefix): the last service tier and the Spotlight
- * state, from entries carrying the fields `patches` sets.
+ * Rebuild the cursor state of `bytes` (a transcript prefix): the last service tier, the Spotlight
+ * state, from entries carrying the fields `patches` sets, and the parents of its records, noted in
+ * `recordParents`.
  */
 function scanPrefixState(
 	bytes: Uint8Array,
 	spotlight: SpotlightCollector,
 	patches: EntryPatchesById,
+	recordParents: RecordParents,
 ): ServiceTierByFamily | undefined {
 	let currentServiceTier: ServiceTierByFamily | undefined;
 	visitSessionEntriesLenient(bytes, entry => {
 		if (isServiceTierChange(entry)) currentServiceTier = coerceServiceTierByFamily(entry.serviceTier);
-		else if (!isEntryPatchRecord(entry)) {
+		else if (isEntryPatchRecord(entry)) noteRecordParent(recordParents, entry);
+		else {
 			patchEntry(entry, patches);
 			spotlight.visit(entry);
 		}
@@ -622,6 +643,11 @@ export interface SessionParserState {
 	serviceTier: ServiceTierByFamily | null;
 	/** Absent in cursors persisted before the Spotlight tables; such a tail parse starts from an empty state. */
 	spotlight?: SpotlightParserState;
+	/**
+	 * The parents of the `entry_patch` records read so far, by record id ({@link RecordParents}); absent
+	 * when there are none, and in cursors persisted before it.
+	 */
+	recordParents?: Array<[string, string | null]>;
 }
 
 export interface ParseSessionResult {
@@ -673,11 +699,13 @@ interface DerivedRows {
 	read: number;
 	/** Ids of the entries a record named. */
 	patched: Set<string>;
+	/** The parents of the records read, and of those `recordParents` held before them. */
+	recordParents: RecordParents;
 }
 
 /**
- * Derive the rows of the entries in `bytes`, each carrying the fields `patches` sets; `serviceTier`
- * and `spotlight` hold the state the entries before them left.
+ * Derive the rows of the entries in `bytes`, each carrying the fields `patches` sets; `serviceTier`,
+ * `spotlight` and `recordParents` hold the state the entries before them left.
  */
 function deriveRows(
 	bytes: Uint8Array,
@@ -685,6 +713,7 @@ function deriveRows(
 	serviceTier: ServiceTierByFamily | undefined,
 	spotlight: SpotlightCollector,
 	patches: EntryPatchesById,
+	recordParents: RecordParents,
 ): DerivedRows {
 	const folder = extractFolderFromPath(sessionPath);
 	const agentType = classifyAgentType(sessionPath);
@@ -697,6 +726,7 @@ function deriveRows(
 		serviceTier,
 		read: 0,
 		patched: new Set(),
+		recordParents,
 	};
 	// First call per id: the row `INSERT OR IGNORE` keeps, so it can be written with its result.
 	const callsById = new Map<string, ToolCallStats>();
@@ -704,7 +734,10 @@ function deriveRows(
 	// Reduce each entry immediately so full replays do not retain tool-output/message bodies.
 	rows.read = visitSessionEntriesLenient(bytes, entry => {
 		// A record is no entry of the session: the entries it names carry its fields.
-		if (isEntryPatchRecord(entry)) return;
+		if (isEntryPatchRecord(entry)) {
+			noteRecordParent(rows.recordParents, entry);
+			return;
+		}
 		const patched = patchEntry(entry, patches);
 		if (patched !== undefined) rows.patched.add(patched);
 		spotlight.visit(entry);
@@ -740,8 +773,12 @@ function deriveRows(
 				rows.toolCalls.push(call);
 				if (!callsById.has(call.toolCallId)) callsById.set(call.toolCallId, call);
 			}
-			// Persist links even when the user entry was ingested in an earlier tail read.
-			const parentId = entry.parentId;
+			// Persist links even when the user entry was ingested in an earlier tail read. A reply appended
+			// after a record names the record: it answers the entry the record follows.
+			const parentId =
+				entry.parentId && rows.recordParents.has(entry.parentId)
+					? rows.recordParents.get(entry.parentId)
+					: entry.parentId;
 			const msg = entry.message;
 			if (parentId && msg.role === "assistant" && msg.model && msg.provider) {
 				rows.userLinks.push({
@@ -760,7 +797,9 @@ function deriveRows(
  * Offset-only callers reconstruct service-tier state once; persisted cursors read only the appended tail.
  * Entries carry the fields their `entry_patch` records set. A record in the tail that names an entry
  * before it makes the read derive the whole transcript again, flagged `reset`, so the rows an earlier
- * read stored for that entry are replaced.
+ * read stored for that entry are replaced. A reply whose parent is a record links the entry the record
+ * follows, as `parseAllSessionEntries` reads it; the cursor keeps the records' parents, so a reply in
+ * a later tail links through a record an earlier read passed.
  */
 export async function parseSessionFile(
 	sessionPath: string,
@@ -803,15 +842,18 @@ export async function parseSessionFile(
 			// A record in the prefix names entries of the prefix scan, or of the tail.
 			const patches = readStart === start ? tailPatches : collectEntryPatches(bytes);
 			let serviceTier: ServiceTierByFamily | undefined;
+			let recordParents: RecordParents;
 			if (resume) {
 				serviceTier = state?.serviceTier ?? undefined;
 				spotlight = new SpotlightCollector(sessionPath, folder, state?.spotlight ?? emptySpotlightState());
+				recordParents = new Map(state?.recordParents);
 			} else {
 				const prefix = new SpotlightCollector(sessionPath, folder, emptySpotlightState(), false);
-				serviceTier = scanPrefixState(bytes.subarray(0, start), prefix, patches);
+				recordParents = new Map();
+				serviceTier = scanPrefixState(bytes.subarray(0, start), prefix, patches, recordParents);
 				spotlight = new SpotlightCollector(sessionPath, folder, prefix.state);
 			}
-			const tailRows = deriveRows(tail, sessionPath, serviceTier, spotlight, patches);
+			const tailRows = deriveRows(tail, sessionPath, serviceTier, spotlight, patches, recordParents);
 			rows = tailRows;
 			// A record of the tail names an entry before it, whose rows an earlier read stored: derive
 			// every row again, from entries that carry the records' fields, to replace those rows.
@@ -823,7 +865,7 @@ export async function parseSessionFile(
 					bytes = await file.slice(0, info.size).bytes();
 				}
 				spotlight = new SpotlightCollector(sessionPath, folder, emptySpotlightState());
-				rows = deriveRows(bytes, sessionPath, undefined, spotlight, collectEntryPatches(bytes));
+				rows = deriveRows(bytes, sessionPath, undefined, spotlight, collectEntryPatches(bytes), new Map());
 			}
 			const newOffset = start + rows.read;
 			const checkpointStart = Math.max(0, newOffset - CHECKPOINT_BYTES);
@@ -870,6 +912,7 @@ export async function parseSessionFile(
 			checkpoint,
 			serviceTier: rows.serviceTier ?? null,
 			spotlight: spotlight.state,
+			recordParents: rows.recordParents.size > 0 ? [...rows.recordParents] : undefined,
 		},
 	};
 }

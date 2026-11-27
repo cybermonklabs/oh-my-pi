@@ -11,7 +11,9 @@
  * stored copy whole; the next rewrite tries again. A store whose backend has
  * no streamed write fails such a rewrite rather than join it, and reads
  * nothing back to check it. A throw from the lines themselves is no spool
- * failure, and fails the rewrite as it is.
+ * failure, and fails the rewrite as it is. Lines that a second read does not
+ * give again as the spool read them fail the rewrite, which keeps the stored
+ * copy.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -214,6 +216,67 @@ describe("SQL session storage full rewrites when the spool cannot be used", () =
 				refused: disk.refused(),
 				stored: [await storage.readText(SYNC_FILE), await storage.readText(ATOMIC_FILE)],
 			}).toEqual({ refused: 2, stored: [lines.join(""), lines.join("")] });
+		});
+	});
+
+	// If this regresses, a rewrite handed an iterable that hands out a new iterator over one shared
+	// generator on every call, passing `return` through (as `generator.map(f)` gives), replaces the
+	// stored transcript with an empty body when the spool write fails, and reports success: closing
+	// the spool's iterator closed the generator, so the fallback's second read finds no lines, and its
+	// size and hash checks pass on zero bytes.
+	it("fails a rewrite of an iterable that hands out new iterators over one generator when the spool write fails, and keeps the stored copy", async () => {
+		using tmp = TempDir.createSync("@omp-spool-fallback-tmp-");
+		process.env.TMPDIR = tmp.path();
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+		const disk = fillDiskUnder(tmp.path());
+		const lines = sessionLines("mapped once");
+		function overOneGenerator(): Iterable<string> {
+			const generator = (function* () {
+				yield* lines;
+			})();
+			return {
+				[Symbol.iterator]: (): Iterator<string> => ({
+					next: () => generator.next(),
+					return: () => generator.return(),
+				}),
+			};
+		}
+		const outcome = async (write: () => unknown) => {
+			try {
+				await write();
+				return "stored";
+			} catch (err) {
+				return err instanceof Error && err.message.includes("could not be read again") ? "refused" : String(err);
+			}
+		};
+
+		await withSqliteStorage(async storage => {
+			const before = sessionLines("before", 1).join("");
+			await storage.writeText(SYNC_FILE, before);
+			await storage.writeText(ATOMIC_FILE, before);
+
+			const sync = await outcome(() => {
+				storage.writeLinesSync(SYNC_FILE, overOneGenerator());
+				return storage.drain();
+			});
+			const atomic = await outcome(() => storage.writeLinesAtomic(ATOMIC_FILE, overOneGenerator()));
+			expect({
+				sync,
+				atomic,
+				refused: disk.refused(),
+				errors: error.mock.calls.filter(([message]) => String(message).includes("cannot be read again")).length,
+				storedBytes: [
+					Buffer.byteLength(await storage.readText(SYNC_FILE)),
+					Buffer.byteLength(await storage.readText(ATOMIC_FILE)),
+				],
+			}).toEqual({
+				sync: "refused",
+				atomic: "refused",
+				refused: 2,
+				errors: 2,
+				storedBytes: [Buffer.byteLength(before), Buffer.byteLength(before)],
+			});
 		});
 	});
 

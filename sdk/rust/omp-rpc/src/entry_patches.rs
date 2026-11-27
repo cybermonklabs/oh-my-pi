@@ -33,7 +33,8 @@ pub const ENTRY_PATCH_CUSTOM_TYPE: &str = "entry_patch";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryPatchSkipReason {
 	/// The record's `data` is not a list of patches of the fields a patch may
-	/// set.
+	/// set; a text block without a string `text`, an image block without
+	/// string `data`, and a counter that is not a finite number make it so.
 	Malformed,
 	/// No entry has the id the patch names.
 	MissingTarget,
@@ -94,15 +95,35 @@ fn content_takes_string(role: &str) -> Option<bool> {
 	}
 }
 
-/// `content` as a record holds it: a string, or a list of typed blocks.
+/// Whether `block` is a content block a message can hold: a string `type`, and
+/// the payload a text or image block carries (`text`, `data`) as a string, so
+/// a provider request built from it never meets a block without its payload.
+fn is_content_block(block: &Value) -> bool {
+	let payload = match block.get("type").and_then(Value::as_str) {
+		None => return false,
+		Some("text") => "text",
+		Some("image") => "data",
+		Some(_) => return true,
+	};
+	block.get(payload).is_some_and(Value::is_string)
+}
+
+/// `content` as a record holds it: a string, or a list of content blocks.
 fn is_content(value: &Value) -> bool {
 	match value {
 		Value::String(_) => true,
-		Value::Array(blocks) => blocks
-			.iter()
-			.all(|block| block.get("type").is_some_and(Value::is_string)),
+		Value::Array(blocks) => blocks.iter().all(is_content_block),
 		_ => false,
 	}
+}
+
+/// Whether `value` is a finite number, as every counter a patch sets is:
+/// `JSON.parse` reads a number past the `f64` range (`1e400`) as Infinity.
+/// serde_json refuses such a number by default; with its `arbitrary_precision`
+/// feature, which any crate in a build can turn on, a [`Value`] holds it, and
+/// [`Value::is_number`] accepts it.
+fn is_count(value: &Value) -> bool {
+	value.as_f64().is_some_and(f64::is_finite)
 }
 
 /// Whether `object` lacks `key`, or holds a value there that `check` accepts.
@@ -113,7 +134,7 @@ fn absent_or(object: &Map<String, Value>, key: &str, check: impl FnOnce(&Value) 
 fn is_entry_fields(value: &Value) -> bool {
 	value.as_object().is_some_and(|fields| {
 		absent_or(fields, "warning", Value::is_string)
-			&& absent_or(fields, "tokensAfter", Value::is_number)
+			&& absent_or(fields, "tokensAfter", is_count)
 			&& absent_or(fields, "preserveData", Value::is_object)
 			&& absent_or(fields, "content", is_content)
 	})
@@ -124,8 +145,8 @@ fn is_message_fields(value: &Value) -> bool {
 		absent_or(fields, "retryRecovery", Value::is_object)
 			&& absent_or(fields, "continued", |continued| continued.as_bool() == Some(true))
 			&& absent_or(fields, "contextSnapshot", Value::is_object)
-			&& absent_or(fields, "elidedOutputTokens", Value::is_number)
-			&& absent_or(fields, "prunedAt", Value::is_number)
+			&& absent_or(fields, "elidedOutputTokens", is_count)
+			&& absent_or(fields, "prunedAt", is_count)
 			&& absent_or(fields, "content", is_content)
 	})
 }
@@ -672,6 +693,87 @@ mod tests {
 			{"entryId": "x", "entry": {"warning": "w", "tokensAfter": 1, "preserveData": {}, "content": "c"}},
 			{"entryId": "y", "message": {"retryRecovery": {}, "continued": true, "contextSnapshot": {}, "elidedOutputTokens": 1, "prunedAt": 2, "content": []}},
 		]})));
+	}
+
+	/// The skips of a record that sets a tool result's `content`, and the
+	/// content it leaves.
+	fn set_result_content(content: Value) -> (Vec<EntryPatchSkip>, Value) {
+		let mut entries = vec![
+			tool_result("t1", "heavy"),
+			record("p1", json!([{"entryId": "t1", "message": {"content": content}}])),
+		];
+		let mut seen = Vec::new();
+		apply_entry_patches(&mut entries, |skip| seen.push(skip));
+		(seen, entries[0]["message"]["content"].clone())
+	}
+
+	fn malformed_p1() -> Vec<EntryPatchSkip> {
+		vec![EntryPatchSkip {
+			reason:    EntryPatchSkipReason::Malformed,
+			record_id: Some("p1".to_owned()),
+			entry_id:  None,
+		}]
+	}
+
+	// A provider request built from a text block without its text fails, so a
+	// record that writes one is skipped whole, as the TypeScript readers skip
+	// it.
+	#[test]
+	fn a_text_block_without_a_string_text_makes_a_record_malformed() {
+		for block in [json!({"type": "text"}), json!({"type": "text", "text": 5})] {
+			assert_eq!(set_result_content(json!([block])), (malformed_p1(), text("heavy")), "{block}");
+		}
+		assert_eq!(set_result_content(text("elided")), (Vec::new(), text("elided")));
+	}
+
+	#[test]
+	fn an_image_block_without_string_data_makes_a_record_malformed() {
+		for block in [
+			json!({"type": "image", "mimeType": "image/png"}),
+			json!({"type": "image", "data": null, "mimeType": "image/png"}),
+		] {
+			assert_eq!(set_result_content(json!([block])), (malformed_p1(), text("heavy")), "{block}");
+		}
+		// A block of another type needs only its string `type`.
+		let blocks = json!([
+			{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+			{"type": "toolCall", "id": "c1"},
+		]);
+		assert_eq!(set_result_content(blocks.clone()), (Vec::new(), blocks));
+	}
+
+	// `JSON.parse` reads `1e400`, and an integer past the `f64` range, as
+	// Infinity, so no reader takes it as a counter.
+	#[test]
+	fn a_counter_that_is_not_a_finite_number_makes_a_record_malformed() {
+		let huge = format!("1{}", "0".repeat(400));
+		for value in ["1e400", "-1e400", huge.as_str()] {
+			for fields in [
+				format!(r#""entry": {{"tokensAfter": {value}}}"#),
+				format!(r#""message": {{"elidedOutputTokens": {value}}}"#),
+				format!(r#""message": {{"prunedAt": {value}}}"#),
+			] {
+				let data = format!(r#"{{"patches": [{{"entryId": "x", {fields}}}]}}"#);
+				match serde_json::from_str::<Value>(&data) {
+					// serde_json refuses the number by default: no record holds it.
+					Err(error) => {
+						assert!(error.to_string().starts_with("number out of range"), "{error}");
+					},
+					// Its `arbitrary_precision` feature keeps the number.
+					Ok(data) => assert!(!is_entry_patch_data(&data), "{data}"),
+				}
+			}
+		}
+		for value in [
+			json!(0),
+			json!(-0.0),
+			json!(1e308),
+			serde_json::from_str::<Value>("1e-400").unwrap(),
+			json!(2.5),
+		] {
+			let data = json!({"patches": [{"entryId": "x", "entry": {"tokensAfter": value}}]});
+			assert!(is_entry_patch_data(&data), "{data}");
+		}
 	}
 
 	#[test]

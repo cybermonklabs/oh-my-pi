@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"maps"
 	"slices"
+	"strconv"
 )
 
 // EntryPatchCustomType is the `customType` of an `entry_patch` record.
@@ -43,7 +44,9 @@ type EntryPatchSkipReason string
 
 const (
 	// EntryPatchMalformed: the record's `data` is not a list of patches of the
-	// fields a patch may set.
+	// fields a patch may set; a text block without a string `text`, an image
+	// block without string `data`, and a counter that is not a finite number
+	// make it so.
 	EntryPatchMalformed EntryPatchSkipReason = "malformed"
 	// EntryPatchMissingTarget: no entry has the id the patch names.
 	EntryPatchMissingTarget EntryPatchSkipReason = "missing-target"
@@ -91,6 +94,27 @@ func isTrue(data json.RawMessage) bool {
 	return string(bytes.TrimSpace(data)) == "true"
 }
 
+// isContentBlock reports whether data holds a content block a message can
+// hold: a string `type`, and the payload a text or image block carries
+// (`text`, `data`) as a string, so a provider request built from it never
+// meets a block without its payload.
+func isContentBlock(data json.RawMessage) bool {
+	members, ok := rawObject(data)
+	if !ok {
+		return false
+	}
+	kind, ok := rawString(members["type"])
+	switch {
+	case !ok:
+		return false
+	case kind == "text":
+		return jsonKind(members["text"]) == '"'
+	case kind == "image":
+		return jsonKind(members["data"]) == '"'
+	}
+	return true
+}
+
 func isRawContent(data json.RawMessage) bool {
 	switch jsonKind(data) {
 	case '"':
@@ -101,14 +125,24 @@ func isRawContent(data json.RawMessage) bool {
 			return false
 		}
 		for _, block := range blocks {
-			members, ok := rawObject(block)
-			if !ok || jsonKind(members["type"]) != '"' {
+			if !isContentBlock(block) {
 				return false
 			}
 		}
 		return true
 	}
 	return false
+}
+
+// isCount reports whether data holds a finite number, as every counter a
+// patch sets is: `JSON.parse` reads a number past the float64 range (1e400)
+// as Infinity, which ParseFloat refuses.
+func isCount(data json.RawMessage) bool {
+	if jsonKind(data) != '0' {
+		return false
+	}
+	_, err := strconv.ParseFloat(string(bytes.TrimSpace(data)), 64)
+	return err == nil
 }
 
 // fieldsOf is the object data holds when each field check names accepts the
@@ -133,7 +167,7 @@ func kindIs(kind byte) func(json.RawMessage) bool {
 var (
 	entryFieldChecks = map[string]func(json.RawMessage) bool{
 		"warning":      kindIs('"'),
-		"tokensAfter":  kindIs('0'),
+		"tokensAfter":  isCount,
 		"preserveData": kindIs('{'),
 		"content":      isRawContent,
 	}
@@ -141,8 +175,8 @@ var (
 		"retryRecovery":      kindIs('{'),
 		"continued":          isTrue,
 		"contextSnapshot":    kindIs('{'),
-		"elidedOutputTokens": kindIs('0'),
-		"prunedAt":           kindIs('0'),
+		"elidedOutputTokens": isCount,
+		"prunedAt":           isCount,
 		"content":            isRawContent,
 	}
 )

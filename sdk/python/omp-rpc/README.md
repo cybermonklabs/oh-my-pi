@@ -330,10 +330,13 @@ cancelled = client.cancel_subagent("OmpWorker")  # False when not running
 `get_subagent_messages()` applies each reply's `entry_patch` records to its
 entries, lists no record, and returns the patches of records whose target the
 reply lacks (an entry an earlier reply returned) as `entry_patches`, in file
-order. The client keeps nothing between calls; apply those patches to the
-entries you hold with `entry_accepts_patch` and `set_patched_fields` from
-`omp_rpc.entry_patches`, as above. A message in `messages` is its entry's
-`message` dict, so it changes with it.
+order. An entry whose parent is a record takes the record's parent, also for a
+record an earlier reply of the same session file returned since its last read
+from the start (`from_byte` 0, or `reset`): for that the client keeps the id
+and parent of each record it hid, per session file, and no entry. Apply the
+patches to the entries you hold with `entry_accepts_patch` and
+`set_patched_fields` from `omp_rpc.entry_patches`, as above. A message in
+`messages` is its entry's `message` dict, so it changes with it.
 
 At `"events"`, `on_subagent_event()` delivers each subagent's own session
 events as `SubagentEvent.payload.event` (an `UnknownNotification` when it cannot

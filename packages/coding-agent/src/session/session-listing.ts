@@ -476,11 +476,19 @@ function getSessionListWorkerCount(fileCount: number): number {
  * miss is recovered by one {@link SessionStorage.scanLines} pass. A full
  * rewrite between two chunks of that pass fails it: the scan then runs again
  * from a new stat, so every field of the result, and the stat it is cached
- * under, come from one body. The `entry_patch` records the two windows hold
- * apply to the prefix's entries and to the last turn the status reads, and,
- * with the records the fallback pass read, to the prompt it finds, so a prompt
- * an elide pass shortened previews and searches as the placeholder; a record
- * between the windows past what the fallback pass reads is not read.
+ * under, come from one body.
+ *
+ * `entry_patch` records apply as follows. The records of the prefix and of
+ * the tail window apply to the entries the prefix holds and to the last turn
+ * the status reads. The records the line pass read, from the file's start to
+ * the line it stopped at, then the tail window's, apply to the prompt that
+ * pass finds. A record past the prefix that the tail window misses and the
+ * pass did not reach is not read. The text cut from the prefix's partial
+ * line, which the prompt falls back to when no pass finds one (a storage
+ * without `scanLines`, or a pass a full rewrite raced past the retries),
+ * takes no record. The search text holds the messages of the file's first
+ * 4 KB as stored, and the prompt the pass finds: a record that shortens an
+ * entry brings no later text into it.
  */
 async function scanSessionFile(
 	file: string,

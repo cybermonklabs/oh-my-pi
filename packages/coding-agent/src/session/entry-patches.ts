@@ -33,21 +33,29 @@
  *   turn's content yields ({@link assistantTurnContent}).
  * - The Agent Hub's history of a parked agent counts the tool calls, and
  *   finds the turn that produced output, of each turn's patched content.
- * - The session picker applies the records its prefix and tail windows hold
- *   to the entries its prefix holds and to the last turn its status reads,
- *   and, with the records its line scan read, to the prompt that scan finds;
- *   a record between the windows past what the scan reads is not read, so a
- *   long session whose first prompt an elide pass shortened can still preview
- *   it in full.
+ * - The session picker applies the records of its 4 KiB prefix and its
+ *   32 KiB tail window to the entries its prefix holds and to the last turn
+ *   its status reads, and the records its line scan read (from the file's
+ *   start to the line it stopped at), then the tail window's, to the prompt
+ *   that scan finds. A record past the prefix that the tail window misses and
+ *   the scan did not reach is not read, so a long session whose first prompt
+ *   an elide pass shortened can still preview it in full; the prompt text the
+ *   picker falls back to when no scan finds one (cut from the prefix's partial
+ *   line) takes no record. Its search holds the messages of the file's first
+ *   4 KiB as stored: a record that shortens an entry brings no later text
+ *   into it.
  * - `omp gc --strip` strips replay data from a record's patched content as
  *   from the message's own line.
  *
- * The raw loaders (`loadSessionFile`, `loadEntriesFromFile`,
- * `visitEntriesFromFileStream`) return the records unapplied, among the
- * entries; so do `get_entries`, `get_tree` and the RPC window's raw `entries`.
- * Readers of other fields (header and title reads, entry ids, usage and cost)
- * need no record. Binaries older than the record show the fields as first
- * written.
+ * The raw readers return the records unapplied, among the entries:
+ * `loadSessionFile`, `loadEntriesFromFile`, `loadEntriesFromFileStream`,
+ * `parseSessionEntries`, `visitSessionFile`, `visitEntriesFromFile`,
+ * `visitEntriesFromFileStream` and `visitEntriesFromChunksSync`; so do
+ * `get_entries`, `get_tree` and the RPC window's raw `entries`.
+ * `scripts/bench-title-fork.ts` reads each session's first prompt raw, as
+ * typed, since the titles it compares were made from that text. Readers of
+ * other fields (header and title reads, entry ids, usage and cost) need no
+ * record. Binaries older than the record show the fields as first written.
  *
  * A later full rewrite writes every patched field inline and writes each
  * record with no patches ({@link withoutEntryPatches}), so a field that a

@@ -24,6 +24,7 @@ them again changes nothing. Entries are parsed JSON objects, changed in place.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -35,9 +36,11 @@ ENTRY_PATCH_CUSTOM_TYPE = "entry_patch"
 
 EntryPatchSkipReason = Literal["malformed", "missing-target", "misfit"]
 """Why a reader left a record, or one patch of it, unapplied: its `data` is not
-a list of patches (`malformed`), no entry has the id the patch names
-(`missing-target`), or the patch names a field its target's kind or role lacks,
-or `content` of another shape (`misfit`)."""
+a list of patches (`malformed`; a text block without a string `text`, an image
+block without string `data`, and a counter that is not a finite number make it
+so), no entry has the id the patch names (`missing-target`), or the patch names
+a field its target's kind or role lacks, or `content` of another shape
+(`misfit`)."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -71,18 +74,36 @@ _CONTENT_TAKES_STRING = {
 }
 
 
-def _is_number(value: object) -> bool:
+def _is_count(value: object) -> bool:
+    """Whether `value` is a finite number, as every counter a patch sets is."""
     # A JSON `true` decodes to a Python bool, which is an int.
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        # An integer past the float range, which `JSON.parse` reads as Infinity.
+        return False
+
+
+def _is_content_block(block: object) -> bool:
+    """Whether `block` is a content block a message can hold: a string `type`,
+    and the payload a text or image block carries (`text`, `data`) as a string,
+    so a provider request built from it never meets a block without its
+    payload."""
+    if not isinstance(block, dict):
+        return False
+    kind = block.get("type")
+    if kind == "text":
+        return isinstance(block.get("text"), str)
+    if kind == "image":
+        return isinstance(block.get("data"), str)
+    return isinstance(kind, str)
 
 
 def _is_content(value: object) -> bool:
     return isinstance(value, str) or (
-        isinstance(value, list)
-        and all(
-            isinstance(block, dict) and isinstance(block.get("type"), str)
-            for block in value
-        )
+        isinstance(value, list) and all(_is_content_block(block) for block in value)
     )
 
 
@@ -94,7 +115,7 @@ def _is_entry_fields(value: object) -> bool:
     return (
         isinstance(value, dict)
         and _absent_or(value, "warning", lambda warning: isinstance(warning, str))
-        and _absent_or(value, "tokensAfter", _is_number)
+        and _absent_or(value, "tokensAfter", _is_count)
         and _absent_or(value, "preserveData", lambda data: isinstance(data, dict))
         and _absent_or(value, "content", _is_content)
     )
@@ -110,8 +131,8 @@ def _is_message_fields(value: object) -> bool:
         and _absent_or(
             value, "contextSnapshot", lambda snapshot: isinstance(snapshot, dict)
         )
-        and _absent_or(value, "elidedOutputTokens", _is_number)
-        and _absent_or(value, "prunedAt", _is_number)
+        and _absent_or(value, "elidedOutputTokens", _is_count)
+        and _absent_or(value, "prunedAt", _is_count)
         and _absent_or(value, "content", _is_content)
     )
 

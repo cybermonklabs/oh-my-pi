@@ -570,8 +570,8 @@ class SubagentTranscriptRead(SubagentMessages):
     """A `get_subagent_messages` reply as `RpcClient.get_subagent_messages` returns it.
 
     Its `entry_patch` records are applied within the reply and not listed; an
-    entry whose parent is a record of the reply takes the record's parent, and
-    `messages` are the `message` objects of `entries`.
+    entry whose parent is a record takes the record's parent, and `messages`
+    are the `message` objects of `entries`.
     """
 
     entry_patches: tuple[JsonObject, ...] = ()
@@ -716,9 +716,13 @@ class RpcClient(WireClient):
         self._listener_error_listeners: list[ListenerErrorListener] = []
         self._host_tool_completed_listeners: list[HostToolCompletedListener] = []
         # The `entry_patch` records `get_entries` read since its last read of
-        # the whole history, for the entries of later `since` reads.
+        # the whole history, for the entries of later `since` reads; and, by
+        # session file, the records `get_subagent_messages` hid since its last
+        # read of that transcript from the start, for the entries of later
+        # reads.
         self._entry_patch_lock = threading.Lock()
         self._entry_record_parents: RecordParents = {}
+        self._subagent_record_parents: dict[str, RecordParents] = {}
 
     def __enter__(self) -> RpcClient:
         return self.start()
@@ -1189,17 +1193,17 @@ class RpcClient(WireClient):
         parent is a record, and a `leaf_id` that names one, take the record's
         parent, also for a record an earlier `since` read returned. The client
         does not apply the records, and must not: the server serves its live
-        entries (`packages/coding-agent/src/modes/rpc/rpc-compat.ts:19-22`,
-        `packages/coding-agent/src/session/session-manager.ts:6973`), which
-        already carry each record's fields. `patchEntries` sets them before it
-        appends the record (`session-manager.ts:6667-6669`), and a load applies
-        the records it reads (`session-manager.ts:4769`). A record the server
-        holds keeps its fields after a later rewrite-only pass replaced them in
-        the entry, for example images a later pass dropped from an elided
-        result: only the line a full rewrite writes loses them
-        (`packages/coding-agent/src/session/entry-patches.ts:33-36`,
-        `withoutEntryPatches` at `:207-209`). Applying such a record again would
-        bring the replaced values back.
+        entries (`selectRpcEntries` in
+        `packages/coding-agent/src/modes/rpc/rpc-compat.ts` slices
+        `SessionManager.getEntries`), which already carry each record's
+        fields. `SessionManager.patchEntries` sets them before it appends the
+        record, and a load applies the records it reads (`SessionManager`'s
+        load calls `applyEntryPatches`). A record the server holds keeps its
+        fields after a later rewrite-only pass replaced them in the entry, for
+        example images a later pass dropped from an elided result: only the
+        line a full rewrite writes loses them (`withoutEntryPatches` in
+        `packages/coding-agent/src/session/entry-patches.ts`). Applying such a
+        record again would bring the replaced values back.
         """
         read = super().get_entries(since)
         with self._entry_patch_lock:
@@ -1219,9 +1223,8 @@ class RpcClient(WireClient):
         record's parent as their entries' parent, and a `leaf_id` that names a
         record names that parent. The client does not apply the records, and
         must not, for the reason `get_entries` gives: the tree's entries are the
-        server's live entries
-        (`packages/coding-agent/src/session/session-manager.ts:7029`), which
-        already carry each record's fields.
+        server's live entries (`SessionManager.getTree`), which already carry
+        each record's fields.
         """
         read = super().get_tree()
         parents: RecordParents = {}
@@ -1243,15 +1246,18 @@ class RpcClient(WireClient):
         Pass the last reply's `next_byte` as `from_byte` to read on. The server
         reads the transcript file in windows. The `entry_patch` records of this
         reply apply to its entries, as the server applies them, and are not
-        listed; an entry whose parent is a record of this reply takes the
-        record's parent. A patch that names an entry not in this reply, one an
-        earlier call returned, is listed in `entry_patches`, in file order. The
-        client keeps nothing across calls: a caller that holds the entries of
-        earlier calls applies each patch, in order, to the entry with its
-        `entryId` when `omp_rpc.entry_patches.entry_accepts_patch(entry, patch)`
-        holds, with `omp_rpc.entry_patches.set_patched_fields(entry, patch)`.
-        That changes the entry in place, and its `message`, the object earlier
-        calls returned in `messages`, with it.
+        listed; an entry whose parent is a record takes the record's parent,
+        also for a record an earlier call returned from the same session file
+        since its last read from the start (`from_byte` 0, or `reset`). For
+        that the client keeps the id and parent of each record it hid, per
+        session file, and no entry. A patch that names an entry not in this
+        reply, one an earlier call returned, is listed in `entry_patches`, in
+        file order: a caller that holds the entries of earlier calls applies
+        each patch, in order, to the entry with its `entryId` when
+        `omp_rpc.entry_patches.entry_accepts_patch(entry, patch)` holds, with
+        `omp_rpc.entry_patches.set_patched_fields(entry, patch)`. That changes
+        the entry in place, and its `message`, the object earlier calls
+        returned in `messages`, with it.
         """
         read = super().get_subagent_messages(
             subagent_id=subagent_id, session_file=session_file, from_byte=from_byte
@@ -1269,7 +1275,11 @@ class RpcClient(WireClient):
             if patch["entryId"] not in ids
         )
         apply_entry_patches(read.entries)
-        entries = tuple(entries_past_records(read.entries, {}))
+        with self._entry_patch_lock:
+            if read.from_byte == 0 or read.reset:
+                self._subagent_record_parents.pop(read.session_file, None)
+            parents = self._subagent_record_parents.setdefault(read.session_file, {})
+            entries = tuple(entries_past_records(read.entries, parents))
         return SubagentTranscriptRead(
             session_file=read.session_file,
             from_byte=read.from_byte,

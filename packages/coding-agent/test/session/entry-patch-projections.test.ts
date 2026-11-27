@@ -149,6 +149,43 @@ describe("entry patch records and the readers that project a session file", () =
 		}
 	});
 
+	// Past its head budget, memory extraction reads the newest messages from the back of a rollout
+	// file, window by window: without the records there, it sends the heavy content of a tool result
+	// in the rollout's tail.
+	it("sends the memory extraction model an elided tool result in the rollout's tail as its placeholder, as a rollout with it inline does", async () => {
+		using dir = TempDir.createSync("@omp-patch-projections-");
+		const call = assistant([{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls -R" } }], {
+			stopReason: "toolUse",
+		});
+		// A first prompt past the head budget: the head ends on it, and the tool result lies in the tail.
+		const rollout = (result: string, withRecord: boolean) => [
+			header("memory-tail"),
+			message("u1", null, user(`list the files ${"y".repeat(10_000)}`)),
+			message("a1", "u1", call),
+			message("t1", "a1", bashResult("call_1", result)),
+			message("u2", "t1", user("ok")),
+			...(withRecord
+				? [
+						patchRecord("p1", "u2", [
+							{ entryId: "t1", message: { content: [{ type: "text", text: PLACEHOLDER }] } },
+						]),
+					]
+				: []),
+		];
+		const patched = await writeTranscript(path.join(dir.path(), "patched.jsonl"), rollout(HEAVY, true));
+		const inline = await writeTranscript(path.join(dir.path(), "inline.jsonl"), rollout(PLACEHOLDER, false));
+		const storage = new FileSessionStorage();
+		const fromPatched = await buildStage1RolloutItems(patched, 1_000, storage);
+		const fromInline = await buildStage1RolloutItems(inline, 1_000, storage);
+		// The tail is what the back windows read: the head ends inside the first prompt.
+		expect(fromInline).toContain("...[truncated]...");
+		expect({ heavy: fromPatched.includes("HEAVYMARK"), placeholder: fromPatched.includes(PLACEHOLDER) }).toEqual({
+			heavy: false,
+			placeholder: true,
+		});
+		expect(fromPatched).toBe(fromInline);
+	});
+
 	// The picker previews and searches the first prompt: without the record it
 	// shows the text an elide pass replaced, which a rewrite of the file would not.
 	it("previews and searches a prompt an elide pass shortened as its placeholder, as a session with it inline does", async () => {
@@ -271,6 +308,40 @@ describe("entry patch records and the readers that project a session file", () =
 			expect(fromPatched).toEqual({ where, firstMessage: PLACEHOLDER, searchHasHeavy: false });
 			expect(fromPatched).toEqual(await shown(`${where}-inline`, PLACEHOLDER, false));
 		}
+	});
+
+	// A first prompt longer than the 4 KiB prefix (a pasted fenced block, what an elide pass shortens)
+	// lies only partly in the prefix, and the picker's line scan reads it whole. Without the record in
+	// the tail window, the picker previews and searches the block as first written. The search covers
+	// the file's first 4 KiB as stored, so the reply past the block's line stays out of it.
+	it("previews a first prompt longer than the prefix as the placeholder a record in the tail window set, as a session with it inline does", async () => {
+		using dir = TempDir.createSync("@omp-patch-projections-");
+		// About 1,100 tokens of fenced log.
+		const block = `HEAVYMARK see the log\n\`\`\`\n${"log line 0123456789\n".repeat(220)}\`\`\``;
+		expect(Buffer.byteLength(block)).toBeGreaterThan(4_096);
+		const reply = message("a1", "u1", assistant([{ type: "text", text: "done" }]));
+		const storage = new FileSessionStorage();
+		const shown = async (name: string, entries: readonly object[]) => {
+			const sessionDir = path.join(dir.path(), name);
+			await writeTranscript(path.join(sessionDir, "session.jsonl"), entries);
+			const [info] = await listSessions(sessionDir, storage);
+			const search = info?.allMessagesText ?? "";
+			return {
+				firstMessage: info?.firstMessage,
+				searchHasPlaceholder: search.includes(PLACEHOLDER),
+				searchHasOriginal: search.includes("HEAVYMARK") || search.includes("log line"),
+			};
+		};
+		const fromPatched = await shown("patched", [
+			header("long-patched"),
+			message("u1", null, user(block)),
+			reply,
+			patchRecord("p1", "a1", [{ entryId: "u1", message: { content: PLACEHOLDER } }]),
+		]);
+		expect(fromPatched).toEqual({ firstMessage: PLACEHOLDER, searchHasPlaceholder: true, searchHasOriginal: false });
+		expect(fromPatched).toEqual(
+			await shown("inline", [header("long-inline"), message("u1", null, user(PLACEHOLDER)), reply]),
+		);
 	});
 
 	// Agent Activity reads a growing transcript in windows: a record appended after
@@ -413,51 +484,53 @@ describe("entry patch records and the readers that project a session file", () =
 		);
 	});
 
-	// `omp gc --strip` removes replay data from old turns. A record that sets an old
-	// turn's content keeps the signature the strip removed from its line, and a
-	// resume sets that content again: the strip must reach the record too.
-	it("strips the replay data of a record's content for an old turn, as it strips the turn written inline", async () => {
+	// `omp gc --strip` removes replay data from old turns and keeps it on the latest turn, which a
+	// resume replays. A record that sets a turn's content keeps the signature of what it set, and a
+	// resume sets that content again: the strip must reach the record of an old turn too, and leave
+	// the record of the latest turn as it leaves that turn's line.
+	it("strips the replay data of a record's content for an old turn and keeps it for the latest turn, as for the turns written inline", async () => {
 		using dir = TempDir.createSync("@omp-patch-projections-");
-		const signed = (text: string, signature: string) =>
-			assistant([
-				{ type: "thinking", thinking: "reasoning", thinkingSignature: signature },
-				{ type: "text", text },
-			]);
-		const tail = [message("u2", "a1", user("and now")), message("a2", "u2", signed("latest answer", "sig-latest"))];
+		const LATEST = "latest placeholder";
+		const content = (text: string, signature: string): AssistantMessage["content"] => [
+			{ type: "thinking", thinking: "reasoning", thinkingSignature: signature },
+			{ type: "text", text },
+		];
+		const signed = (text: string, signature: string) => assistant(content(text, signature));
 		const patched = await writeTranscript(path.join(dir.path(), "patched.jsonl"), [
 			header("strip-patched"),
 			message("u1", null, user("go")),
 			message("a1", "u1", signed(HEAVY, "sig-old")),
-			...tail,
+			message("u2", "a1", user("and now")),
+			message("a2", "u2", signed(`latest ${HEAVY}`, "sig-latest")),
 			patchRecord("p1", "a2", [
-				{
-					entryId: "a1",
-					message: {
-						content: [
-							{ type: "thinking", thinking: "reasoning", thinkingSignature: "sig-old" },
-							{ type: "text", text: PLACEHOLDER },
-						],
-					},
-				},
+				{ entryId: "a1", message: { content: content(PLACEHOLDER, "sig-old") } },
+				{ entryId: "a2", message: { content: content(LATEST, "sig-latest") } },
 			]),
 		]);
 		const inline = await writeTranscript(path.join(dir.path(), "inline.jsonl"), [
 			header("strip-inline"),
 			message("u1", null, user("go")),
 			message("a1", "u1", signed(PLACEHOLDER, "sig-old")),
-			...tail,
+			message("u2", "a1", user("and now")),
+			message("a2", "u2", signed(LATEST, "sig-latest")),
 		]);
 		const storage = new FileSessionStorage();
-		const oldTurnAfterStrip = async (file: string) => {
+		const turnsAfterStrip = async (file: string) => {
 			const plan = await planStrip(file, Date.now() + 60_000);
 			if (plan) await applyStrip(plan, storage);
 			const messages = await loadSessionMessagesReadOnly(file, storage);
-			const old = messages.find(entry => textOf(entry).includes("MARK"));
-			return { text: textOf(old), signature: thinkingSignatureOf(old) };
+			const turn = (text: string) => {
+				const found = messages.find(entry => textOf(entry) === text);
+				return { text: textOf(found), signature: thinkingSignatureOf(found) };
+			};
+			return { old: turn(PLACEHOLDER), latest: turn(LATEST) };
 		};
-		const fromPatched = await oldTurnAfterStrip(patched);
-		expect(fromPatched).toEqual({ text: PLACEHOLDER, signature: undefined });
-		expect(fromPatched).toEqual(await oldTurnAfterStrip(inline));
+		const fromPatched = await turnsAfterStrip(patched);
+		expect(fromPatched).toEqual({
+			old: { text: PLACEHOLDER, signature: undefined },
+			latest: { text: LATEST, signature: "sig-latest" },
+		});
+		expect(fromPatched).toEqual(await turnsAfterStrip(inline));
 	});
 
 	// A failed turn a continuation marked (`continued`) stays in model context and

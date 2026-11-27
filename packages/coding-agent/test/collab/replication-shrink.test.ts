@@ -195,14 +195,17 @@ interface HostHarness {
 interface HostReplicationSource {
 	getSessionId(): string;
 	getCwd(): string;
+	getEntry(id: string): SessionEntry | undefined;
 	snapshotForReplication(): { header: HostSnapshot["header"]; entries: readonly SessionEntry[] };
 	onEntryAppended?: ((entry: SessionEntry) => void) | undefined;
 }
 
 function makeHostContext(snapshot: HostSnapshot): HostHarness {
+	const byId = new Map(snapshot.entries.map(entry => [entry.id, entry]));
 	return makeHostHarness({
 		getSessionId: () => snapshot.header.id,
 		getCwd: () => snapshot.header.cwd,
+		getEntry: id => byId.get(id),
 		snapshotForReplication: () => snapshot,
 		onEntryAppended: undefined,
 	});

@@ -135,6 +135,8 @@ func TestApplyEntryPatchesSkips(t *testing.T) {
 		recordEntry("p2", "", `[{"entryId":"u1","message":{"continued":true}}]`),
 		// An assistant's content is a list of blocks, never a string.
 		recordEntry("p3", "", `[{"entryId":"a1","message":{"content":"flat"}}]`),
+		// `prunedAt` is a tool result's field; an assistant message lacks it.
+		recordEntry("p4", "", `[{"entryId":"a1","message":{"prunedAt":1}}]`),
 		assistantEntry("a1", "", ""),
 	)
 	var skipped []EntryPatchSkip
@@ -146,6 +148,7 @@ func TestApplyEntryPatchesSkips(t *testing.T) {
 		{Reason: EntryPatchMissingTarget, RecordID: "p1", EntryID: "gone"},
 		{Reason: EntryPatchMisfit, RecordID: "p2", EntryID: "u1"},
 		{Reason: EntryPatchMisfit, RecordID: "p3", EntryID: "a1"},
+		{Reason: EntryPatchMisfit, RecordID: "p4", EntryID: "a1"},
 	}
 	if !reflect.DeepEqual(skipped, want) {
 		t.Fatalf("skipped %+v", skipped)
@@ -174,6 +177,79 @@ func TestEntryPatchesOfValidatesEachField(t *testing.T) {
 	]`)))
 	if !ok || len(patches) != 2 || patches[0].EntryID != "x" || patches[1].Message == nil {
 		t.Fatalf("patches %+v, %v", patches, ok)
+	}
+}
+
+// setResultContent applies a record that sets a tool result's content to
+// content, and returns the skips it reported and the content it left.
+func setResultContent(t *testing.T, content string) ([]EntryPatchSkip, json.RawMessage) {
+	t.Helper()
+	list := entries(t,
+		toolResultEntry("t1", "", heavyContent),
+		recordEntry("p1", "t1", `[{"entryId":"t1","message":{"content":`+content+`}}]`),
+	)
+	var skipped []EntryPatchSkip
+	ApplyEntryPatches(list, func(skip EntryPatchSkip) { skipped = append(skipped, skip) })
+	return skipped, messageMember(t, list[0], "content")
+}
+
+var malformedP1 = []EntryPatchSkip{{Reason: EntryPatchMalformed, RecordID: "p1"}}
+
+// A provider request built from a text block without its text fails, so a
+// record that writes one is skipped whole, as the TypeScript readers skip it.
+func TestATextBlockWithoutAStringTextMakesARecordMalformed(t *testing.T) {
+	for _, block := range []string{`{"type":"text"}`, `{"type":"text","text":5}`} {
+		skipped, content := setResultContent(t, "["+block+"]")
+		if !reflect.DeepEqual(skipped, malformedP1) {
+			t.Errorf("%s: skipped %+v", block, skipped)
+		}
+		assertSameJSON(t, content, json.RawMessage(heavyContent))
+	}
+	skipped, content := setResultContent(t, elidedContent)
+	if len(skipped) != 0 {
+		t.Fatalf("skipped %+v", skipped)
+	}
+	assertSameJSON(t, content, json.RawMessage(elidedContent))
+}
+
+func TestAnImageBlockWithoutStringDataMakesARecordMalformed(t *testing.T) {
+	for _, block := range []string{
+		`{"type":"image","mimeType":"image/png"}`,
+		`{"type":"image","data":null,"mimeType":"image/png"}`,
+	} {
+		skipped, content := setResultContent(t, "["+block+"]")
+		if !reflect.DeepEqual(skipped, malformedP1) {
+			t.Errorf("%s: skipped %+v", block, skipped)
+		}
+		assertSameJSON(t, content, json.RawMessage(heavyContent))
+	}
+	// A block of another type needs only its string `type`.
+	blocks := `[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"},{"type":"toolCall","id":"c1"}]`
+	skipped, content := setResultContent(t, blocks)
+	if len(skipped) != 0 {
+		t.Fatalf("skipped %+v", skipped)
+	}
+	assertSameJSON(t, content, json.RawMessage(blocks))
+}
+
+// `JSON.parse` reads 1e400, and an integer past the float64 range, as
+// Infinity, so no reader takes it as a counter.
+func TestACounterThatIsNotAFiniteNumberMakesARecordMalformed(t *testing.T) {
+	for _, value := range []string{"1e400", "-1e400", "1" + strings.Repeat("0", 400)} {
+		for _, fields := range []string{
+			`"entry":{"tokensAfter":` + value + `}`,
+			`"message":{"elidedOutputTokens":` + value + `}`,
+			`"message":{"prunedAt":` + value + `}`,
+		} {
+			if _, ok := EntryPatchesOf(object(t, recordEntry("p1", "", `[{"entryId":"x",`+fields+`}]`))); ok {
+				t.Errorf("accepted %s", fields)
+			}
+		}
+	}
+	for _, value := range []string{"0", "-0", "1e308", "1e-400", "2.5"} {
+		if _, ok := EntryPatchesOf(object(t, recordEntry("p1", "", `[{"entryId":"x","entry":{"tokensAfter":`+value+`}}]`))); !ok {
+			t.Errorf("refused %s", value)
+		}
 	}
 }
 
@@ -453,6 +529,46 @@ func TestGetSubagentMessagesAppliesARecordWithinItsReply(t *testing.T) {
 	assertSameJSON(t, read.EntryPatches, []any{map[string]any{"entryId": "a0", "message": map[string]any{"elidedOutputTokens": 9}}})
 }
 
+// A poll ends where the file ends, so a record an elide pass appends last ends
+// a reply, and the next entry, whose parent is that record, comes in the next
+// reply. If this regresses, that entry's parent is an id no reply lists.
+func TestGetSubagentMessagesRelinksPastARecordThatEndedAnEarlierReply(t *testing.T) {
+	c, s := startFake(t, readyV1, nil)
+	read := func(file string, fromByte *int64, data string) [][2]string {
+		got := answered(t, s, data, func() (SubagentTranscriptRead, error) {
+			return c.GetSubagentMessages(context.Background(), GetSubagentMessagesCommand{SessionFile: &file, FromByte: fromByte})
+		})
+		var ids [][2]string
+		for _, entry := range got.Entries {
+			id, _ := rawString(entry["id"])
+			ids = append(ids, [2]string{id, string(entry["parentId"])})
+		}
+		return ids
+	}
+	reads := [][][2]string{
+		read("/a.jsonl", nil, subagentReply(t, "/a.jsonl", 0, 100,
+			userEntry("u1", "", "go"), toolResultEntry("t1", "u1", heavyContent),
+			recordEntry("p1", "t1", `[{"entryId":"t1","message":{"content":`+elidedContent+`}}]`))),
+		// /b.jsonl never held the record.
+		read("/b.jsonl", Ptr[int64](0), subagentReply(t, "/b.jsonl", 0, 100, userEntry("b1", "p1", "elsewhere"))),
+		read("/a.jsonl", Ptr[int64](100), subagentReply(t, "/a.jsonl", 100, 200, userEntry("u2", "p1", "after"))),
+		// The transcript was rewritten: the server reads it again from the start.
+		read("/a.jsonl", Ptr[int64](200), strings.Replace(
+			subagentReply(t, "/a.jsonl", 0, 100, userEntry("u1", "", "go")), `"reset":false`, `"reset":true`, 1)),
+		read("/a.jsonl", Ptr[int64](100), subagentReply(t, "/a.jsonl", 100, 200, userEntry("u3", "p1", "later"))),
+	}
+	want := [][][2]string{
+		{{"u1", "null"}, {"t1", `"u1"`}},
+		{{"b1", `"p1"`}},
+		{{"u2", `"t1"`}},
+		{{"u1", "null"}},
+		{{"u3", `"p1"`}},
+	}
+	if !reflect.DeepEqual(reads, want) {
+		t.Fatalf("got  %v\nwant %v", reads, want)
+	}
+}
+
 // A host that mirrors the session with GetEntries(Since) or GetTree sees each
 // record as an entry, and an entry after it whose parent is no entry it lists.
 // The server's live entries already carry each record; a record it holds can
@@ -491,6 +607,35 @@ func TestGetEntriesAndGetTreeListNoRecordAndApplyNoneAgain(t *testing.T) {
 	assertSameJSON(t, messageMember(t, whole.Entries[1], "content"), json.RawMessage(elidedContent))
 	want := []any{[]any{"u1", "null", []any{[]any{"t1", `"u1"`, []any{[]any{"u2", `"t1"`, []any(nil)}}}}}}
 	if got := shape(t, tree.Tree); !reflect.DeepEqual(got, want) {
+		t.Fatalf("tree %v", got)
+	}
+}
+
+// The session manager always writes `parentId`; a record line without one
+// stands for a record at the root, so what it hides takes no parent.
+func TestGetEntriesAndGetTreeGiveNoParentPastARecordWithNoParentID(t *testing.T) {
+	c, s := startFake(t, readyV1, nil)
+	ctx := context.Background()
+	record := `{"type":"custom","customType":"entry_patch","id":"q1","timestamp":"t","data":{"patches":[]}}`
+	read := answered(t, s, fmt.Sprintf(`{"entries":[%s,%s,%s],"leafId":"q1"}`,
+		userEntry("u1", "", "go"), record, userEntry("q2", "q1", "after")),
+		func() (SessionEntries, error) { return c.GetEntries(ctx, GetEntriesCommand{}) })
+	tree := answered(t, s, fmt.Sprintf(`{"tree":[{"entry":%s,"children":[]},{"entry":%s,"children":[{"entry":%s,"children":[]}]}],"leafId":"q1"}`,
+		userEntry("u1", "", "go"), record, userEntry("q2", "q1", "after")),
+		func() (SessionTree, error) { return c.GetTree(ctx) })
+
+	var ids [][2]string
+	for _, entry := range read.Entries {
+		id, _ := rawString(entry["id"])
+		ids = append(ids, [2]string{id, string(entry["parentId"])})
+	}
+	if want := [][2]string{{"u1", "null"}, {"q2", "null"}}; !reflect.DeepEqual(ids, want) {
+		t.Fatalf("entries %v", ids)
+	}
+	if read.LeafID != nil || tree.LeafID != nil {
+		t.Fatalf("leaves %v %v", read.LeafID, tree.LeafID)
+	}
+	if got, want := shape(t, tree.Tree), []any{[]any{"u1", "null", []any(nil)}, []any{"q2", "null", []any(nil)}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("tree %v", got)
 	}
 }

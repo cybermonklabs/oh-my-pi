@@ -673,12 +673,14 @@ export class CollabGuestLink {
 					}
 				} else if (entry.type === "message") {
 					this.#ctx.session.agent.replaceMessages([...this.#ctx.session.messages, entry.message]);
-				} else if (entry.type === "compaction" || entry.type === "branch_summary") {
-					// Compaction/branch entries rewrite the host's model context: the
-					// pre-boundary transcript collapses behind a summary. Appending
-					// the entry alone leaves the replica holding the stale full
-					// history, so rebuild the message array from the ingested entries
-					// exactly as the host does after appendCompaction/branchWithSummary
+				} else if (entry.type !== "model_change" && entry.type !== "thinking_level_change") {
+					// Every other entry changes the host's model context other than
+					// by appending one message: a compaction or branch summary
+					// collapses the history behind it, a `/clear` boundary drops it,
+					// and the builder places or leaves out a custom message and the
+					// context notebook. Appending the entry alone leaves the replica
+					// a stale context, so rebuild the message array from the
+					// ingested entries exactly as the host does after such an entry
 					// (session-maintenance.ts, agent-session.ts).
 					this.#ctx.session.agent.replaceMessages(this.#ctx.session.buildDisplaySessionContext().messages);
 				}

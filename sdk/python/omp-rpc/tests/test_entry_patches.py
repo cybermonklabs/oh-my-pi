@@ -247,6 +247,67 @@ class ApplyRulesTests(unittest.TestCase):
             )
         )
 
+    def _set_result_content(
+        self, content: JsonValue
+    ) -> tuple[list[EntryPatchSkip], JsonValue]:
+        """The skips of a record that sets a tool result's `content`, and the content it leaves."""
+        entries = [
+            _tool_result("t1", None, _HEAVY),
+            _record("p1", "t1", [{"entryId": "t1", "message": {"content": content}}]),
+        ]
+        skipped: list[EntryPatchSkip] = []
+        apply_entry_patches(entries, on_skip=skipped.append)
+        return skipped, entries[0]["message"]["content"]  # type: ignore[index]
+
+    # A provider request built from a text block without its text fails, so a
+    # record that writes one is skipped whole, as the TypeScript readers skip it.
+    def test_a_text_block_without_a_string_text_makes_a_record_malformed(
+        self,
+    ) -> None:
+        for block in ({"type": "text"}, {"type": "text", "text": 5}):
+            self.assertEqual(
+                self._set_result_content([block]),
+                ([EntryPatchSkip("malformed", "p1")], _HEAVY),
+                block,
+            )
+        self.assertEqual(self._set_result_content(_ELIDED), ([], _ELIDED))
+
+    def test_an_image_block_without_string_data_makes_a_record_malformed(
+        self,
+    ) -> None:
+        for block in (
+            {"type": "image", "mimeType": "image/png"},
+            {"type": "image", "data": None, "mimeType": "image/png"},
+        ):
+            self.assertEqual(
+                self._set_result_content([block]),
+                ([EntryPatchSkip("malformed", "p1")], _HEAVY),
+                block,
+            )
+        # A block of another type needs only its string `type`.
+        blocks: list[JsonValue] = [
+            {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+            {"type": "toolCall", "id": "c1"},
+        ]
+        self.assertEqual(self._set_result_content(blocks), ([], blocks))
+
+    # `JSON.parse` reads `1e400`, and an integer past the float range, as
+    # Infinity; Python reads them as `inf` and a large `int`.
+    def test_a_counter_that_is_not_a_finite_number_makes_a_record_malformed(
+        self,
+    ) -> None:
+        for value in (json.loads("1e400"), json.loads("-1e400"), float("nan"), 10**400):
+            for fields in (
+                {"entry": {"tokensAfter": value}},
+                {"message": {"elidedOutputTokens": value}},
+                {"message": {"prunedAt": value}},
+            ):
+                data: JsonObject = {"patches": [{"entryId": "x", **fields}]}
+                self.assertFalse(is_entry_patch_data(data), (value, fields))
+        for value in (0, -0.0, 1e308, json.loads("1e-400"), 10**300):
+            data = {"patches": [{"entryId": "x", "entry": {"tokensAfter": value}}]}
+            self.assertTrue(is_entry_patch_data(data), value)
+
     def test_accepts_each_field_on_its_kind_and_role_only(self) -> None:
         custom_message: JsonObject = {
             "type": "custom_message",
@@ -568,6 +629,103 @@ class ClientReadTests(unittest.TestCase):
             read.entry_patches,
             ({"entryId": "a0", "message": {"elidedOutputTokens": 9}},),
         )
+
+    # A poll ends where the file ends, so a record an elide pass appends last
+    # ends a reply, and the next entry, whose parent is that record, comes in
+    # the next reply. If this regresses, that entry's parent is an id no reply
+    # lists.
+    def test_get_subagent_messages_relinks_past_a_record_that_ended_an_earlier_reply(
+        self,
+    ) -> None:
+        elide: list[JsonValue] = [{"entryId": "t1", "message": {"content": _ELIDED}}]
+        client = _ScriptedClient(
+            {
+                "get_subagent_messages": [
+                    _subagent_reply(
+                        "/a.jsonl",
+                        0,
+                        100,
+                        [
+                            _user("u1"),
+                            _tool_result("t1", "u1", _HEAVY),
+                            _record("p1", "t1", elide),
+                        ],
+                    ),
+                    # /b.jsonl never held the record.
+                    _subagent_reply("/b.jsonl", 0, 100, [_user("b1", "p1")]),
+                    _subagent_reply("/a.jsonl", 100, 200, [_user("u2", "p1")]),
+                    # The transcript was rewritten: the server reads it again
+                    # from the start.
+                    _subagent_reply("/a.jsonl", 0, 100, [_user("u1")], reset=True),
+                    _subagent_reply("/a.jsonl", 100, 200, [_user("u3", "p1")]),
+                ]
+            }
+        )
+        reads = [
+            client.get_subagent_messages(session_file=file, from_byte=from_byte)
+            for file, from_byte in (
+                ("/a.jsonl", None),
+                ("/b.jsonl", 0),
+                ("/a.jsonl", 100),
+                ("/a.jsonl", 200),
+                ("/a.jsonl", 100),
+            )
+        ]
+        self.assertEqual(
+            [
+                [(entry["id"], entry["parentId"]) for entry in read.entries]
+                for read in reads
+            ],
+            [
+                [("u1", None), ("t1", "u1")],
+                [("b1", "p1")],
+                [("u2", "t1")],
+                [("u1", None)],
+                [("u3", "p1")],
+            ],
+        )
+        self.assertEqual(_result_content(reads[0].messages), _ELIDED)
+
+    # The session manager always writes `parentId`; a record line without one
+    # stands for a record at the root, so what it hides takes no parent.
+    def test_get_entries_and_get_tree_give_no_parent_past_a_record_with_no_parent_id(
+        self,
+    ) -> None:
+        record = _record("q1", None, [])
+        del record["parentId"]
+        client = _ScriptedClient(
+            {
+                "get_entries": [
+                    {
+                        "entries": [_user("u1"), record, _user("q2", "q1")],
+                        "leafId": "q1",
+                    }
+                ],
+                "get_tree": [
+                    {
+                        "tree": [
+                            {"entry": _user("u1"), "children": []},
+                            {
+                                "entry": record,
+                                "children": [
+                                    {"entry": _user("q2", "q1"), "children": []}
+                                ],
+                            },
+                        ],
+                        "leafId": "q1",
+                    }
+                ],
+            }
+        )
+        entries = client.get_entries()
+        tree = client.get_tree()
+        self.assertEqual(
+            [(entry["id"], entry["parentId"]) for entry in entries.entries],
+            [("u1", None), ("q2", None)],
+        )
+        self.assertIsNone(entries.leaf_id)
+        self.assertEqual(_shape(list(tree.tree)), [("u1", None, []), ("q2", None, [])])
+        self.assertIsNone(tree.leaf_id)
 
     # A host that mirrors the session with get_entries(since) or get_tree sees
     # each record as an entry, and an entry after it whose parent is no entry

@@ -5,6 +5,7 @@
 ### Changed
 
 - The `entry` host frame's type admits `EntryPatchEntry`, the `entry_patch` record a host now sends live; guests apply it to the entries they hold and never show it
+- `SessionEntry` admits `ResetBoundaryEntry` and `ContextNotesEntry`, the `/clear` boundary and the context notebook revision a host now sends; guests build their model context from them, and no transcript row shows them
 
 ## [18.18.6] - 2026-11-09
 
