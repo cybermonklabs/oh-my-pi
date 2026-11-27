@@ -383,31 +383,91 @@ fn local_delete_copies_terminate() {
 	}
 }
 
-/// Byte totals are a function of the transfer, not of thread timing: the same
-/// local copy run repeatedly reports identical `sent`/`received` counts (rsync
-/// 3.5.1 is deterministic here, even under CPU load). Frames meet reads only where
-/// upstream's processes would: reads happen at refills with the socketpair-sized
-/// in-process pipe, never ahead of them. The test runs in a process of its
-/// own, away from the other tests' threads.
+/// Byte totals are a function of the transfer, not of thread timing: copies of
+/// one tree carry the same payload, and their `sent` and `received` totals
+/// differ only by whole 4-byte multiplex headers, a few at most. Where a frame
+/// ends is timing in rsync 3.5.1 itself: whether its generator's reply reaches
+/// the sender before or after the sender's next read decides whether that
+/// read's flush goes out as one frame or as several. With only the generator's
+/// writes delayed (an LD_PRELOAD shim), rsync 3.5.1 copying this tree sent
+/// 803,108 and received 467 bytes with no delay, and sent 803,116 and received
+/// 471 with 2, 20 or 100 ms: two headers more one way, one the other, in 10 of
+/// 10 copies each. The builtin's frame logs under CPU load show the same
+/// split at the same read, and the test this replaced, which wanted equal
+/// totals, failed 17 of 1,416 runs of the whole test binary, each failure a
+/// whole number of headers: in those runs at most two headers on `sent` and
+/// one on `received`, on one copy of five or on several. Each copy must also
+/// be the source tree, because a difference of whole headers alone does not
+/// say the payload is the same: a counter wrong by a whole multiple of four,
+/// within the bound, passes this check, and only `assert_same_tree` sees the
+/// copy itself. The bound is measured headroom, not a guarantee rsync makes.
+/// The test runs in a process of its own, away from the other tests'
+/// threads.
 #[test]
-fn local_copy_byte_totals_are_deterministic() {
+fn local_copy_byte_totals_differ_only_by_frame_headers() {
 	if !crate::own_process::own_process() {
 		return;
 	}
 	let dir = tempfile::tempdir().unwrap();
-	make_tree(&dir.path().join("src"));
+	let src = dir.path().join("src");
+	make_tree(&src);
 	for i in 0..20 {
-		fs::write(dir.path().join(format!("src/sub/f{i}")), format!("file {i}\n").repeat(i + 1)).unwrap();
+		fs::write(src.join(format!("sub/f{i}")), format!("file {i}\n").repeat(i + 1)).unwrap();
 	}
 	let mut totals = Vec::new();
 	for run_no in 0..5 {
 		let dest = format!("d{run_no}/");
 		let (code, out, err) = run(&["-a", "--stats", "src/", &dest], dir.path());
 		assert_eq!((code, err.as_str()), (0, ""), "{out}");
+		assert_same_tree(&src, &dir.path().join(&dest));
 		let summary = out.lines().find(|l| l.starts_with("sent ")).unwrap();
 		totals.push(sent_received(summary));
 	}
-	assert!(totals.windows(2).all(|w| w[0] == w[1]), "{totals:?}");
+	if let Err(why) = header_differences(&totals) {
+		panic!("{why}");
+	}
+}
+
+/// The most multiplex headers by which one copy's total may exceed or fall
+/// short of another's, each way. rsync 3.5.1 and the builtin were measured at
+/// two sent and one received.
+const MAX_HEADER_DIFFERENCE: i64 = 4;
+
+/// Whether every copy's `(sent, received)` differs from the first copy's by
+/// whole 4-byte multiplex headers, at most [`MAX_HEADER_DIFFERENCE`] each way:
+/// only its framing moved. A difference of whole headers inside the bound is
+/// not by itself a payload that agrees: a counter wrong by a whole multiple
+/// of four passes this check, and only the tree comparison sees the copy
+/// itself. The error names the first copy that does not.
+fn header_differences(totals: &[(i64, i64)]) -> Result<(), String> {
+	let Some((first, rest)) = totals.split_first() else {
+		return Err("no copy".to_owned());
+	};
+	for (copy, total) in rest.iter().enumerate() {
+		for (way, diff) in [("sent", total.0 - first.0), ("received", total.1 - first.1)] {
+			if diff % 4 != 0 || diff.abs() > 4 * MAX_HEADER_DIFFERENCE {
+				return Err(format!(
+					"copy {} {way} {diff:+} bytes against copy 0, not a whole number of at most \
+					 {MAX_HEADER_DIFFERENCE} frame headers: {totals:?}",
+					copy + 1
+				));
+			}
+		}
+	}
+	Ok(())
+}
+
+/// The check accepts the splits rsync 3.5.1 and the builtin show (two headers
+/// more sent and one more received, or one header fewer sent), and refuses a
+/// difference that is not whole headers or is more of them than the bound.
+#[test]
+fn header_difference_check_accepts_only_a_few_whole_headers() {
+	assert_eq!(header_differences(&[(803_108, 467), (803_116, 471), (803_108, 467)]), Ok(()));
+	assert_eq!(header_differences(&[(803_116, 471), (803_108, 467)]), Ok(()));
+	assert_eq!(header_differences(&[(803_214, 467), (803_210, 467)]), Ok(()));
+	assert!(header_differences(&[(803_108, 467), (803_109, 467)]).is_err(), "one payload byte");
+	assert!(header_differences(&[(803_108, 467), (803_108, 470)]).is_err(), "three bytes");
+	assert!(header_differences(&[(803_108, 467), (803_128, 467)]).is_err(), "five headers");
 }
 
 /// A server's stdio may be O_NONBLOCK: EAGAIN is retried, not fatal.

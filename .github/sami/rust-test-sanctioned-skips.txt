@@ -6,4 +6,3 @@
 # and the parity check). Add a line only with the ruling: who made it, when,
 # and its words.
 # One per line: <bazel test target> <libtest test path>  <ruling>.
-//crates/pi-builtins:pi-builtins_test rsync::session::tests::local_copy_byte_totals_are_deterministic  the fork owner's ruling of 2026-11-20 (recorded in the fork's tracker): "leave it, and skip that one test so it cannot stop a release"
